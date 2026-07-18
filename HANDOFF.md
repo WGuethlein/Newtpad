@@ -19,7 +19,7 @@ Wyatt's constraints, stated explicitly:
 2. Wyatt supplied two primary-source transcripts of the File Pilot author (Vjekoslav Krajačić):
    - BSC 2025 "Inside the Engine" talk → [research/filepilot-engine-talk-notes.md](research/filepilot-engine-talk-notes.md) (engine: arenas, layers, strings, unity build, codegen, threading).
    - Wookash Podcast interview → [research/filepilot-wookash-interview-notes.md](research/filepilot-wookash-interview-notes.md) (product: five design rules, viewport-first streaming, file-locking trap, batch-rename-as-multi-cursor-spec, Windows API pain map). Raw transcript: [additional-transcripts/wookash.txt](additional-transcripts/wookash.txt).
-3. No code exists yet. Not a git repo yet — `git init` should be step one of the build phase.
+3. ~~No code exists yet. Not a git repo yet.~~ **Build phase started 2026-07-18** — see §10 for toolchain + current state.
 
 ## 3. Decisions and *why* (the part PROJECT-RULES compresses away)
 
@@ -96,7 +96,7 @@ File Pilot's author independently converged on Wyatt's exact plan and his contex
 
 ## 8. Suggested build sequence (after the feature session; not yet approved — ask first)
 
-1. `git init`; scaffold layer skeleton (`base/`, `platform/`, `renderer/`, `ui/`, `program/`), build script, empty window + colored quad on D3D11.
+1. ✅ **DONE (2026-07-18).** `git init`; scaffold layer skeleton, build script, D3D11 window clearing to a color. Next sub-step: the actual instanced colored quad (shaders + vertex/instance buffers).
 2. Week-1 buffer benchmark (piece table vs gap buffer minimal cores) → lock the decision with data.
 3. DirectWrite COM spike → glyph atlas → draw "Hello, 世界" proportionally.
 4. Read-only file viewing end-to-end (mmap, viewport-first layout, scrolling) — the "opens anything instantly" demo.
@@ -110,3 +110,20 @@ File Pilot's author independently converged on Wyatt's exact plan and his contex
 - Flag which claims are verified vs judgment. Use the devil's advocate skill on significant designs before presenting them as recommendations.
 - Wyatt's answers to the original scoping questions: touched all candidate languages remotely, the author codes → the author's recommendation stands; shipped product; Notepad-like with post-V1 plugins; fully handmade.
 - **Git identity:** every commit/push/merge is under Wyatt Guethlein's account only — no third-party attribution anywhere (no Co-Authored-By, no "Generated with" footers; `.local-settings.json` enforces `includeCoAuthoredBy: false`). History should read like a human engineer's: incremental logical commits, plain imperative messages, normal branching. See "Git conventions" in PROJECT-RULES.
+
+## 10. Build environment & current state (as of 2026-07-18)
+
+**Toolchain (Windows, this machine):**
+- **Odin** `dev-2026-07a` installed at `C:\Users\Wyatt\odin\dist`, on user PATH. Prebuilt release (bundles LLVM). `odin root` = that dir.
+- **MSVC** from Visual Studio Community 2026 (v18, `C:\Program Files\Microsoft Visual Studio\18\Community`), toolset 14.51.
+- **Windows SDK** `10.0.28000.0` — was **not** installed with VS initially (Unity bootstrapper skipped the C++ desktop SDK); added later via the VS Installer. Odin needs it for the import libs (`kernel32/user32/d3d11/dxgi/d3dcompiler.lib`). If setting up a fresh machine, install the "Windows 11 SDK" component or the "Desktop development with C++" workload first, or Odin fails with "Windows SDK not found."
+- Note: VS-Installer `modify` needs elevation from the start; `--wait` is not a valid flag on this installer version. Manual install via the VS Installer GUI is the reliable path.
+
+**Repo layout:**
+- `src/{base,platform,renderer,ui,program}` — one Odin package per layer (Odin compiles a package at once → free "unity build"). `program` is `package main`.
+- `build.bat` — the one build script: `odin build src\program -out:build\newtpad.exe -debug -collection:src=src`. Append `run` to launch. Output in `build/` (gitignored).
+- Imports use the `src:` collection (e.g. `import plat "src:platform"`).
+
+**What works:** `build.bat` produces a ~630 KB `newtpad.exe`; it opens a 1280×720 window, creates a D3D11 device + DXGI flip-model swapchain (`B8G8R8A8_UNORM`, `FLIP_DISCARD`, 2 buffers, BGRA_SUPPORT), handles resize (ResizeBuffers + RTV recreate), and clears to slate at vsync. Win32 is isolated in `src/platform/window.odin`; D3D11/COM in `src/platform/gfx.odin`; both use the Odin `core:sys/windows` + `vendor:directx/{d3d11,dxgi}` bindings. COM methods are called via Odin's `->` operator; `D3D11CreateDeviceAndSwapChain` is the one free foreign proc.
+
+**Immediate next sub-steps (renderer layer):** vertex/pixel shaders (compile via `vendor:directx/d3d_compiler` or ship precompiled), a vertex buffer + instance buffer, input layout, and one instanced draw of a colored quad — then the glyph atlas. After that, the §8 build sequence resumes (buffer benchmark, DirectWrite spike).
