@@ -95,6 +95,8 @@ gfx_begin_frame :: proc(gfx: ^Gfx, r, g, b: f32) {
 	gfx.ctx->OMSetRenderTargets(1, &gfx.rtv, nil)
 	gfx.ctx->RSSetViewports(1, &viewport)
 	gfx.ctx->ClearRenderTargetView(gfx.rtv, &color)
+	// Reset to default opaque blend so per-pass blend state never leaks frames.
+	gfx.ctx->OMSetBlendState(nil, nil, 0xFFFFFFFF)
 }
 
 // Present the frame. SyncInterval 1 = vsync; keeps the GPU calm.

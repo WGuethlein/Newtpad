@@ -15,26 +15,15 @@ main :: proc() {
 		return
 	}
 
-	quad_pipe, qok := plat.quads_init(&gfx)
-	if !qok {
-		fmt.eprintln("Newtpad: failed to initialize quad pipeline")
+	text, tok := plat.text_init(&gfx)
+	if !tok {
+		fmt.eprintln("Newtpad: failed to initialize text pipeline")
 		return
 	}
 
-	// SPIKE: de-risk DirectWrite-from-Odin before building the glyph atlas.
-	// Rasterizes one glyph via hand-declared DWrite COM and dumps it as ASCII.
-	// Remove once the atlas/text pipeline lands.
-	plat.glyph_spike('A', 32)
-
 	fmt.println("Newtpad is up. Close the window to exit.")
 
-	// A few rectangles to prove the instanced pipeline draws in one call.
-	rects := []plat.Quad {
-		{pos = {60, 60}, size = {320, 200}, color = {0.90, 0.32, 0.32, 1}},
-		{pos = {420, 120}, size = {260, 320}, color = {0.32, 0.72, 0.46, 1}},
-		{pos = {720, 200}, size = {440, 240}, color = {0.36, 0.56, 0.95, 1}},
-		{pos = {200, 430}, size = {520, 160}, color = {0.95, 0.80, 0.28, 1}},
-	}
+	fg := [4]f32{0.92, 0.94, 0.98, 1} // near-white ink on slate
 
 	for !window.should_close {
 		plat.window_pump_events(window)
@@ -46,7 +35,10 @@ main :: proc() {
 
 		// Calm slate background so it's obvious the pipeline is live.
 		plat.gfx_begin_frame(&gfx, 0.09, 0.11, 0.16)
-		plat.quads_draw(&gfx, &quad_pipe, rects)
+		plat.text_draw(&gfx, &text, "Hello, World", 60, 110, 48, fg)
+		plat.text_draw(&gfx, &text, "Newtpad renders text via DirectWrite + ClearType.", 60, 170, 22, fg)
+		plat.text_draw(&gfx, &text, "The quick brown fox jumps over the lazy dog.", 60, 210, 22, fg)
+		plat.text_draw(&gfx, &text, "0123456789  {}[]()<>  +-*/=  @#$%&", 60, 250, 22, fg)
 		plat.gfx_end_frame(&gfx)
 	}
 }
