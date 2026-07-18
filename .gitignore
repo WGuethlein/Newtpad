@@ -1,0 +1,17 @@
+# Build output
+/build/
+*.exe
+*.pdb
+*.obj
+*.lib
+*.exp
+*.ilk
+
+# Editor/OS cruft
+.vs/
+*.rdbg
+Thumbs.db
+desktop.ini
+
+# Local, machine-specific local tooling settings
+.local-settings.json
