@@ -32,8 +32,20 @@ File Pilot's author's single clearest regret — an unfixable OpenGL driver blac
 ### DirectWrite as rasterizer only → glyph atlas → instanced quads
 Triple-validated: File Pilot (talk), refterm + Microsoft's AtlasEngine (shipped as Windows Terminal's default renderer), Zed's GPUI (alpha-only atlas, OS shaping, single instanced draw, 8.33 ms budget; shipped Windows port on DirectWrite + D3D11). **refterm is GPL-2.0 — study the pattern, never copy code.**
 
-### Piece table over mmapped original + append arena — PENDING BENCHMARK
-The one major decision not locked. Piece table: O(1) open of multi-GB files (original stays mmapped, untouched), free undo, streams on save, arena-friendly. But the extracted (unverified-round) benchmarks say gap buffers beat ropes ~7× on whole-buffer search (35 ms vs 250 ms over 1 GB), and 4coder chose gap buffer for simplicity. **Week-1 task: build both minimal cores, benchmark typing latency / 1 GB regex search / multi-GB open, then lock.** A hybrid (gap buffer under a size threshold, piece table above) is a live option.
+### Piece tree over the original + append arena — BENCHMARK-VALIDATED & LOCKED (2026-07-18)
+Was the one open decision; now settled with data (`bench/`, full numbers in `bench/RESULTS.md`). Decision: **piece TREE (RB-balanced) over the original, copying small files into the add-arena and mmapping large ones; mapped reads are SEH-guarded and run on worker threads.**
+
+Why (measured on real 10/100/1024 MB files, Odin `-o:speed`):
+- Only mmap opens multi-GB instantly (O(1), ~0.1 ms at any size) with ~0 private memory. Gap/naive are O(filesize): ~0.57 ms/MB open + the whole file committed to private RAM (1 GB → 0.6 s + 1 GB; 8 GB → ~5 s + 8 GB). That disqualifies gap/naive for the "opens anything instantly, multi-GB" identity. Gap's only win — 0 ns local typing vs piece's 2.6 µs — is imperceptible.
+- Fragmentation spike: a linear piece *list* is O(n²) insert (dead) → must be a piece *tree*; whole-buffer scan is unaffected by fragmentation (1.03×), so filter-as-you-type over a piece table is fine.
+- Never-lock: **verified** — with the file mmapped, another program can delete AND rename it (modern NTFS POSIX-unlink, Win10 1709+), and our view keeps reading the unlinked data without crashing. The old "mapping blocks delete" claim is false on target Windows. (Caveat: verify FAT32/USB/SMB; treat those as copy-on-open.)
+
+Mandatory mitigations (adversarial pass, `bench/RESULTS.md`), to bake into the real impl:
+- **SEH `__try/__except`-guarded mapped reads on worker threads only** — never fault a mapped page on the UI thread (truncate/shrink-underneath and NTFS-*compressed* files fault routinely; network-drive stalls block the faulting thread for the SMB timeout). Not `AddVectoredExceptionHandler` (global, can't cleanly resume, would see D3D/DWrite COM exceptions).
+- **Empty/zero-byte floor case** (`CreateFileMapping` fails on 0 bytes → copy path).
+- **Remap-on-grow protocol** for live-appended files (feeds the V2 log-tail feature).
+- **Separate background/cancellable line-index subsystem** — the "instant open" *product* promise depends on it (scrollbar extent, go-to-line, viewport line layout), not on the buffer structure; the 1 GB single-line file is its acceptance test.
+- Define save + undo uniformly across the copy-small / mmap-large boundary.
 
 ### Plugin architecture (designed now, shipped V2)
 File Pilot's author independently converged on Wyatt's exact plan and his context-menu horror stories (third-party code initializing on his main thread, users blaming him for hangs) define the rules: **C-ABI versioned function-pointer struct; two plugin kinds only (formatter: bytes→bytes; viewer: bytes→draw-list/text-model); worker threads, never UI thread; timeouts; misbehavior degrades to "plugin failed," never a hang; no generic scripting, ever.** First-party JSON/Markdown tools ship in-exe behind the same API to prove it.
@@ -78,7 +90,7 @@ File Pilot's author independently converged on Wyatt's exact plan and his contex
 
 ## 6. Open questions (ranked)
 
-1. **Buffer benchmark** (blocks core architecture) — see §3.
+1. ~~Buffer benchmark~~ **DONE 2026-07-18** — piece tree over copy-small/mmap-large, validated with data (§3, bench/RESULTS.md).
 2. **Demand-side validation** of V1 list before feature freeze.
 3. **DirectWrite-from-Odin spike** — hand-declare the minimal COM surface (IDWriteFactory → IDWriteFontFace → IDWriteGlyphRunAnalysis) early; it's the recommendation's main risk.
 4. Tree-sitter cost measurement — only if/when plugin story demands it.
@@ -97,7 +109,7 @@ File Pilot's author independently converged on Wyatt's exact plan and his contex
 ## 8. Suggested build sequence (after the feature session; not yet approved — ask first)
 
 1. ✅ **DONE (2026-07-18).** `git init`; scaffold layer skeleton, build script, D3D11 window clearing to a color. Next sub-step: the actual instanced colored quad (shaders + vertex/instance buffers).
-2. Week-1 buffer benchmark (piece table vs gap buffer minimal cores) → lock the decision with data.
+2. ✅ **DONE (2026-07-18).** Buffer benchmark → locked piece tree over copy-small/mmap-large (§3, bench/RESULTS.md).
 3. DirectWrite COM spike → glyph atlas → draw "Hello, 世界" proportionally.
 4. Read-only file viewing end-to-end (mmap, viewport-first layout, scrolling) — the "opens anything instantly" demo.
 5. Editing (piece table mutations, undo), then save pipeline (encodings, atomic write, never-lock rules).
