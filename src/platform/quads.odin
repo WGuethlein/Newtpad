@@ -148,6 +148,7 @@ quads_draw :: proc(gfx: ^Gfx, qp: ^Quad_Pipeline, quads: []Quad) {
 
 	stride := u32(size_of(Quad))
 	offset := u32(0)
+	ctx->OMSetBlendState(nil, nil, 0xFFFFFFFF) // opaque; don't inherit the text pass's blend
 	ctx->IASetInputLayout(qp.layout)
 	ctx->IASetPrimitiveTopology(.TRIANGLESTRIP)
 	ctx->IASetVertexBuffers(0, 1, &qp.instances, &stride, &offset)
