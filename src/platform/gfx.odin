@@ -1,0 +1,101 @@
+// Layer: platform — D3D11 device, DXGI flip-model swapchain, and present.
+// For this first milestone it only clears to a color; the quad pipeline moves
+// into the renderer layer once it exists. COM stays isolated here.
+package platform
+
+import "core:fmt"
+import win "core:sys/windows"
+import d3d "vendor:directx/d3d11"
+import dxgi "vendor:directx/dxgi"
+
+Gfx :: struct {
+	device:    ^d3d.IDevice,
+	ctx:       ^d3d.IDeviceContext,
+	swapchain: ^dxgi.ISwapChain,
+	rtv:       ^d3d.IRenderTargetView,
+	width:     i32,
+	height:    i32,
+}
+
+gfx_init :: proc(w: ^Window) -> (gfx: Gfx, ok: bool) {
+	gfx.width = w.width
+	gfx.height = w.height
+
+	desc := dxgi.SWAP_CHAIN_DESC {
+		BufferDesc = {
+			Width  = u32(w.width),
+			Height = u32(w.height),
+			Format = .B8G8R8A8_UNORM,
+		},
+		SampleDesc   = {Count = 1},
+		BufferUsage  = {.RENDER_TARGET_OUTPUT},
+		BufferCount  = 2,
+		OutputWindow = w.hwnd,
+		Windowed     = win.TRUE,
+		SwapEffect   = .FLIP_DISCARD,
+	}
+
+	flags := d3d.CREATE_DEVICE_FLAGS{.BGRA_SUPPORT}
+	when ODIN_DEBUG {
+		flags |= {.DEBUG}
+	}
+
+	levels := [?]d3d.FEATURE_LEVEL{._11_1, ._11_0}
+
+	hr := d3d.CreateDeviceAndSwapChain(
+		nil,
+		.HARDWARE,
+		nil,
+		flags,
+		raw_data(levels[:]),
+		u32(len(levels)),
+		d3d.SDK_VERSION,
+		&desc,
+		&gfx.swapchain,
+		&gfx.device,
+		nil,
+		&gfx.ctx,
+	)
+	if !win.SUCCEEDED(hr) {
+		fmt.eprintfln("CreateDeviceAndSwapChain failed: 0x%X", u32(hr))
+		return gfx, false
+	}
+
+	gfx_create_rtv(&gfx)
+	return gfx, true
+}
+
+@(private)
+gfx_create_rtv :: proc(gfx: ^Gfx) {
+	backbuffer: ^d3d.ITexture2D
+	gfx.swapchain->GetBuffer(0, d3d.ITexture2D_UUID, (^rawptr)(&backbuffer))
+	gfx.device->CreateRenderTargetView((^d3d.IResource)(backbuffer), nil, &gfx.rtv)
+	backbuffer->Release()
+}
+
+gfx_resize :: proc(gfx: ^Gfx, width, height: i32) {
+	if gfx.swapchain == nil || width == 0 || height == 0 {
+		return
+	}
+	if gfx.rtv != nil {
+		gfx.rtv->Release()
+		gfx.rtv = nil
+	}
+	gfx.swapchain->ResizeBuffers(0, u32(width), u32(height), .UNKNOWN, {})
+	gfx.width = width
+	gfx.height = height
+	gfx_create_rtv(gfx)
+}
+
+// Bind the backbuffer, clear it, and present. Nothing is drawn yet.
+gfx_clear_present :: proc(gfx: ^Gfx, r, g, b: f32) {
+	color := [4]f32{r, g, b, 1}
+	viewport := d3d.VIEWPORT{0, 0, f32(gfx.width), f32(gfx.height), 0, 1}
+
+	gfx.ctx->OMSetRenderTargets(1, &gfx.rtv, nil)
+	gfx.ctx->RSSetViewports(1, &viewport)
+	gfx.ctx->ClearRenderTargetView(gfx.rtv, &color)
+
+	// SyncInterval 1 = vsync; keeps the demo calm and cool on the GPU.
+	gfx.swapchain->Present(1, {})
+}
