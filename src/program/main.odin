@@ -15,7 +15,21 @@ main :: proc() {
 		return
 	}
 
+	quad_pipe, qok := plat.quads_init(&gfx)
+	if !qok {
+		fmt.eprintln("Newtpad: failed to initialize quad pipeline")
+		return
+	}
+
 	fmt.println("Newtpad is up. Close the window to exit.")
+
+	// A few rectangles to prove the instanced pipeline draws in one call.
+	rects := []plat.Quad {
+		{pos = {60, 60}, size = {320, 200}, color = {0.90, 0.32, 0.32, 1}},
+		{pos = {420, 120}, size = {260, 320}, color = {0.32, 0.72, 0.46, 1}},
+		{pos = {720, 200}, size = {440, 240}, color = {0.36, 0.56, 0.95, 1}},
+		{pos = {200, 430}, size = {520, 160}, color = {0.95, 0.80, 0.28, 1}},
+	}
 
 	for !window.should_close {
 		plat.window_pump_events(window)
@@ -26,6 +40,8 @@ main :: proc() {
 		}
 
 		// Calm slate background so it's obvious the pipeline is live.
-		plat.gfx_clear_present(&gfx, 0.09, 0.11, 0.16)
+		plat.gfx_begin_frame(&gfx, 0.09, 0.11, 0.16)
+		plat.quads_draw(&gfx, &quad_pipe, rects)
+		plat.gfx_end_frame(&gfx)
 	}
 }

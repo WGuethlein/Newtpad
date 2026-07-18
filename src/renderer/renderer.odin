@@ -1,7 +1,8 @@
-// Layer: renderer — turns UI intent into GPU work (quads only).
-// Consumes a cached alpha glyph atlas and emits instanced quads via the
-// platform's D3D11 device. Knows nothing about Win32 windows or UI widgets.
+// Layer: renderer — the CPU-side builder that turns UI/text intent into a flat
+// list of quads, then hands them to the platform quad pipeline to draw.
+// It owns glyph-atlas *packing* and layout math, not the GPU device: per the
+// layer rule, all D3D11/COM lives in platform (see platform/quads.odin). This
+// package deals in plain-data quads only and never touches COM.
 //
-// Empty for now; the platform layer currently owns the raw D3D11 device and a
-// clear/present path. This package takes over once we add the quad pipeline.
+// Empty for now; arrives with the glyph atlas and text layout.
 package renderer

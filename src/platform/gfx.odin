@@ -87,15 +87,17 @@ gfx_resize :: proc(gfx: ^Gfx, width, height: i32) {
 	gfx_create_rtv(gfx)
 }
 
-// Bind the backbuffer, clear it, and present. Nothing is drawn yet.
-gfx_clear_present :: proc(gfx: ^Gfx, r, g, b: f32) {
+// Bind the backbuffer, set the viewport, and clear. Draw calls go after this.
+gfx_begin_frame :: proc(gfx: ^Gfx, r, g, b: f32) {
 	color := [4]f32{r, g, b, 1}
 	viewport := d3d.VIEWPORT{0, 0, f32(gfx.width), f32(gfx.height), 0, 1}
 
 	gfx.ctx->OMSetRenderTargets(1, &gfx.rtv, nil)
 	gfx.ctx->RSSetViewports(1, &viewport)
 	gfx.ctx->ClearRenderTargetView(gfx.rtv, &color)
+}
 
-	// SyncInterval 1 = vsync; keeps the demo calm and cool on the GPU.
+// Present the frame. SyncInterval 1 = vsync; keeps the GPU calm.
+gfx_end_frame :: proc(gfx: ^Gfx) {
 	gfx.swapchain->Present(1, {})
 }
