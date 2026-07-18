@@ -5,7 +5,6 @@ package main
 
 import "core:fmt"
 import "core:os"
-import "core:strconv"
 import "core:time"
 import plat "src:platform"
 
@@ -31,7 +30,30 @@ main :: proc() {
 		for !doc_index_done(&doc) {
 			time.sleep(time.Millisecond)
 		}
-		fmt.printfln("indexed %d lines in %.1f ms (%d bytes, %v)", doc_line_count(&doc), time.duration_milliseconds(time.tick_since(t0)), len(doc.content), doc.enc)
+		fmt.printfln("indexed %d lines in %.1f ms (%d bytes, %v)", doc_line_count(&doc), time.duration_milliseconds(time.tick_since(t0)), doc.pt.length, doc.enc)
+		doc_close(&doc)
+		return
+	}
+
+	// Headless edit check: `newtpad <path> edittest` exercises the doc edit path.
+	if len(os.args) > 2 && os.args[2] == "edittest" {
+		doc, _ := doc_open(path)
+		pre :: proc(s: string) -> string {return s[:min(len(s), 8)]}
+		doc.cursor = 0
+		doc_insert_rune(&doc, 'A')
+		doc_insert_rune(&doc, 'B')
+		doc_insert_rune(&doc, '\n')
+		fmt.printfln("insert AB\\n : %q  (%d lines)", pre(doc_debug_string(&doc)), doc.nl_delta)
+		doc_backspace(&doc)
+		fmt.printfln("backspace  : %q", pre(doc_debug_string(&doc)))
+		doc_cursor_right(&doc)
+		doc_delete_fwd(&doc)
+		fmt.printfln("del-fwd @1 : %q", pre(doc_debug_string(&doc)))
+		doc_undo(&doc)
+		doc_undo(&doc)
+		fmt.printfln("undo x2    : %q", pre(doc_debug_string(&doc)))
+		doc_redo(&doc)
+		fmt.printfln("redo x1    : %q", pre(doc_debug_string(&doc)))
 		doc_close(&doc)
 		return
 	}
@@ -63,17 +85,11 @@ main :: proc() {
 	}
 	defer doc_close(&doc)
 	doc_index_start(&doc) // &doc is stable here; safe for the worker to hold
-	fmt.printfln("Newtpad: opened %s (%d bytes, %v). Scroll to read; close to exit.", path, len(doc.content), doc.enc)
+	fmt.printfln("Newtpad: opened %s (%d bytes, %v). Edit; close to exit.", path, doc.pt.length, doc.enc)
 
 	px: f32 = 16
 	line_h := px * 1.5
-
-	// Optional 2nd arg: jump to line N (uses the background index once available).
-	if len(os.args) > 2 {
-		if n, ok := strconv.parse_int(os.args[2]); ok {
-			doc_goto_line(&doc, n)
-		}
-	}
+	char_w := plat.text_char_width(&text, px)
 
 	for !window.should_close {
 		plat.window_pump_events(window)
@@ -82,41 +98,74 @@ main :: proc() {
 			plat.gfx_resize(&gfx, window.width, window.height)
 			window.resized = false
 		}
-
-		// Process queued input once per frame.
 		rows := int(f32(window.height) / line_h)
-		if window.scroll_to_top {
-			doc.top = 0
-			window.scroll_to_top = false
+
+		// Drain input once per frame: typed characters, then editor key commands.
+		for i in 0 ..< window.char_count {
+			doc_insert_rune(&doc, window.chars[i])
 		}
-		if window.scroll_to_end {
-			lc := doc_line_count(&doc)
-			doc_goto_line(&doc, lc - 1) // exact last line via the index
-			doc_scroll(&doc, -(rows - 1)) // back off so the last page is visible
-			window.scroll_to_end = false
+		window.char_count = 0
+		for i in 0 ..< window.key_count {
+			#partial switch window.key_cmds[i] {
+			case .Left:
+				doc_cursor_left(&doc)
+			case .Right:
+				doc_cursor_right(&doc)
+			case .Up:
+				doc_cursor_up(&doc)
+			case .Down:
+				doc_cursor_down(&doc)
+			case .Home:
+				doc_cursor_home(&doc)
+			case .End:
+				doc_cursor_end(&doc)
+			case .PageUp:
+				doc_scroll(&doc, -(rows - 1))
+			case .PageDown:
+				doc_scroll(&doc, rows - 1)
+			case .Backspace:
+				doc_backspace(&doc)
+			case .DeleteFwd:
+				doc_delete_fwd(&doc)
+			case .Enter:
+				doc_insert_rune(&doc, '\n')
+			case .Undo:
+				doc_undo(&doc)
+			case .Redo:
+				doc_redo(&doc)
+			}
 		}
+		window.key_count = 0
 		if window.scroll_delta != 0 {
 			doc_scroll(&doc, window.scroll_delta)
 			window.scroll_delta = 0
 		}
 
-		plat.gfx_begin_frame(&gfx, 0.09, 0.11, 0.16)
-		doc_draw(&gfx, &text, &doc, px, rows)
+		doc_ensure_cursor_visible(&doc, rows)
 
-		// Scrollbar (solid quads) + status line, driven by the background index.
-		lc := doc_line_count(&doc)
-		if lc > 1 {
-			w := f32(window.width)
-			h := f32(window.height)
-			thumb_y := f32(doc.top_line) / f32(lc) * h
-			thumb_h := max(24, f32(rows) / f32(lc) * h)
-			bar := []plat.Quad {
-				{pos = {w - 14, 0}, size = {12, h}, color = {0.16, 0.18, 0.22, 1}},
-				{pos = {w - 13, thumb_y}, size = {10, thumb_h}, color = {0.42, 0.48, 0.60, 1}},
-			}
-			plat.quads_draw(&gfx, &quad_pipe, bar)
+		plat.gfx_begin_frame(&gfx, 0.09, 0.11, 0.16)
+		cx, cy, caret, bottom := doc_draw(&gfx, &text, &doc, px, char_w, rows)
+
+		// Scrollbar (byte-proportional) + caret, both solid quads.
+		bars: [4]plat.Quad
+		nb := 0
+		w := f32(window.width)
+		h := f32(window.height)
+		total := doc.pt.length
+		if total > 0 {
+			ty := f32(doc.top) / f32(total) * h
+			th := max(24, f32(bottom - doc.top) / f32(total) * h)
+			bars[nb] = {pos = {w - 14, 0}, size = {12, h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
+			bars[nb] = {pos = {w - 13, ty}, size = {10, th}, color = {0.42, 0.48, 0.60, 1}};nb += 1
 		}
-		status := fmt.tprintf("line %d / %d%s", doc.top_line + 1, lc, "" if doc_index_done(&doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(&doc) * 100))
+		if caret {
+			bars[nb] = {pos = {cx, cy - px}, size = {2, line_h}, color = {0.95, 0.85, 0.35, 1}};nb += 1
+		}
+		if nb > 0 {
+			plat.quads_draw(&gfx, &quad_pipe, bars[:nb])
+		}
+
+		status := fmt.tprintf("%d lines%s%s", doc_line_count(&doc), " *" if doc.modified else "", "" if doc_index_done(&doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(&doc) * 100))
 		plat.text_draw(&gfx, &text, status, 12, f32(window.height) - 8, 13, {0.55, 0.60, 0.70, 1})
 
 		plat.gfx_end_frame(&gfx)

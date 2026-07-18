@@ -239,6 +239,18 @@ text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
 	return t, true
 }
 
+// Advance width of a representative glyph at size px. Consolas is monospace, so
+// this is the column width — used to place the caret.
+text_char_width :: proc(t: ^Text, px: f32) -> f32 {
+	cp := u32('x')
+	gi: u16
+	t.face->GetGlyphIndices(&cp, 1, &gi)
+	gm: GLYPH_METRICS
+	idx := gi
+	t.face->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
+	return f32(gm.advanceWidth) * px / t.units_per_em
+}
+
 // Draw a UTF-8 string with its baseline at (x, y), left-to-right.
 text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32) {
 	instances := make([dynamic]Text_Instance, 0, len(str))

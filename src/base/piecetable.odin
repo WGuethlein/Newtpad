@@ -138,6 +138,57 @@ pt_read :: proc(pt: ^Piece_Table, pos: int, dst: []u8) -> int {
 	return d
 }
 
+// --- line navigation over the piece table (chunked scans; no materialization) ---
+
+// Start of the line containing pos (scan back to the previous '\n', +1; or 0).
+pt_line_start :: proc(pt: ^Piece_Table, pos: int) -> int {
+	buf: [4096]u8
+	q := clamp(pos, 0, pt.length)
+	for q > 0 {
+		chunk := min(len(buf), q)
+		start := q - chunk
+		pt_read(pt, start, buf[:chunk])
+		for k := chunk - 1; k >= 0; k -= 1 {
+			if buf[k] == '\n' {
+				return start + k + 1
+			}
+		}
+		q = start
+	}
+	return 0
+}
+
+// Index of the '\n' at or after pos, or pt.length (end of this line's content).
+pt_line_end :: proc(pt: ^Piece_Table, pos: int) -> int {
+	buf: [4096]u8
+	p := clamp(pos, 0, pt.length)
+	for p < pt.length {
+		n := pt_read(pt, p, buf[:])
+		for k in 0 ..< n {
+			if buf[k] == '\n' {
+				return p + k
+			}
+		}
+		p += n
+	}
+	return pt.length
+}
+
+// Start of the next line after pos (one past the next '\n'); clamps to length.
+pt_next_line_start :: proc(pt: ^Piece_Table, pos: int) -> int {
+	e := pt_line_end(pt, pos)
+	return e + 1 if e < pt.length else pt.length
+}
+
+// Start of the line above the line containing pos (0 at the top).
+pt_prev_line_start :: proc(pt: ^Piece_Table, pos: int) -> int {
+	ls := pt_line_start(pt, pos)
+	if ls == 0 {
+		return 0
+	}
+	return pt_line_start(pt, ls - 1) // ls-1 is the prev line's '\n'
+}
+
 // Materialize the whole buffer (mainly for tests / small-buffer use). Caller frees.
 pt_collect :: proc(pt: ^Piece_Table, allocator := context.allocator) -> []u8 {
 	out := make([]u8, pt.length, allocator)

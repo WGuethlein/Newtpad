@@ -83,6 +83,24 @@ test_pt_delete_whole_and_edges :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_pt_line_nav :: proc(t: ^testing.T) {
+	pt := pt_init(transmute([]u8)string("alpha\nbeta\ngamma"))
+	defer pt_destroy(&pt)
+	testing.expect_value(t, pt_line_end(&pt, 0), 5) // '\n' after alpha
+	testing.expect_value(t, pt_next_line_start(&pt, 0), 6) // start of beta
+	testing.expect_value(t, pt_line_start(&pt, 8), 6) // pos in beta -> beta start
+	testing.expect_value(t, pt_prev_line_start(&pt, 6), 0) // above beta -> alpha
+	testing.expect_value(t, pt_prev_line_start(&pt, 11), 6) // above gamma -> beta
+	testing.expect_value(t, pt_line_end(&pt, 11), 16) // last line ends at length
+
+	// nav still correct after an edit that fragments pieces
+	ins(&pt, 6, "XYZ\n") // "alpha\nXYZ\nbeta\ngamma"
+	testing.expect_value(t, str(&pt), "alpha\nXYZ\nbeta\ngamma")
+	testing.expect_value(t, pt_next_line_start(&pt, 0), 6) // beta shifted; next after alpha is XYZ line
+	testing.expect_value(t, pt_line_start(&pt, 7), 6) // inside XYZ line
+}
+
+@(test)
 test_pt_mixed_sequence :: proc(t: ^testing.T) {
 	pt := pt_init(transmute([]u8)string("The quick fox"))
 	defer pt_destroy(&pt)

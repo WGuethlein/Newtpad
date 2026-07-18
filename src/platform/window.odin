@@ -6,6 +6,23 @@ import win "core:sys/windows"
 
 // A single top-level OS window. Platform types stay in this layer; upper
 // layers see only this opaque handle and the procs below.
+// Editor key commands queued from the message pump, drained once per frame.
+Key_Cmd :: enum u8 {
+	Left,
+	Right,
+	Up,
+	Down,
+	Home,
+	End,
+	PageUp,
+	PageDown,
+	Backspace,
+	DeleteFwd,
+	Enter,
+	Undo,
+	Redo,
+}
+
 Window :: struct {
 	hwnd:         win.HWND,
 	width:        i32,
@@ -13,9 +30,11 @@ Window :: struct {
 	should_close: bool,
 	resized:      bool,
 	// input, drained once per frame by the program
-	scroll_delta:  int, // lines to scroll this frame (+down / -up)
-	scroll_to_top: bool,
-	scroll_to_end: bool,
+	scroll_delta: int, // mouse-wheel lines this frame (+down / -up)
+	key_cmds:     [64]Key_Cmd,
+	key_count:    int,
+	chars:        [64]rune, // printable characters typed this frame
+	char_count:   int,
 }
 
 window_create :: proc(title: string, width, height: i32) -> ^Window {
@@ -103,20 +122,50 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		if raw >= 0x8000 {raw -= 0x10000}
 		w.scroll_delta -= (raw / 120) * 3 // wheel-up scrolls up
 		return 0
+	case win.WM_CHAR:
+		r := rune(wparam)
+		if r >= 32 && r != 0x7F && w.char_count < len(w.chars) {
+			w.chars[w.char_count] = r
+			w.char_count += 1
+		}
+		return 0
 	case win.WM_KEYDOWN:
+		ctrl := (int(win.GetKeyState(win.VK_CONTROL)) & 0x8000) != 0
+		cmd: Key_Cmd
+		has := true
 		switch wparam {
-		case win.VK_DOWN:
-			w.scroll_delta += 1
+		case win.VK_LEFT:
+			cmd = .Left
+		case win.VK_RIGHT:
+			cmd = .Right
 		case win.VK_UP:
-			w.scroll_delta -= 1
-		case win.VK_NEXT:
-			w.scroll_delta += 30 // page down
-		case win.VK_PRIOR:
-			w.scroll_delta -= 30 // page up
+			cmd = .Up
+		case win.VK_DOWN:
+			cmd = .Down
 		case win.VK_HOME:
-			w.scroll_to_top = true
+			cmd = .Home
 		case win.VK_END:
-			w.scroll_to_end = true
+			cmd = .End
+		case win.VK_PRIOR:
+			cmd = .PageUp
+		case win.VK_NEXT:
+			cmd = .PageDown
+		case win.VK_BACK:
+			cmd = .Backspace
+		case win.VK_DELETE:
+			cmd = .DeleteFwd
+		case win.VK_RETURN:
+			cmd = .Enter
+		case win.VK_Z:
+			cmd = .Undo;has = ctrl
+		case win.VK_Y:
+			cmd = .Redo;has = ctrl
+		case:
+			has = false
+		}
+		if has && w.key_count < len(w.key_cmds) {
+			w.key_cmds[w.key_count] = cmd
+			w.key_count += 1
 		}
 		return 0
 	}
