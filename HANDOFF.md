@@ -192,7 +192,28 @@ chrome (draggable scrollbar, filename header, tabs); interactive goto (needs a t
 box). Memory note: the sparse index pre-allocates `total/(8*1024)` ints (~1 MB per GB,
 graceful overflow guard) — a block-list would trim that further later.
 
-**Next options:** (a) editing — the real RB piece-tree + insert/undo per the locked buffer
-decision (turns viewer into editor); (b) shaping + font fallback for multilingual text;
-(c) UI chrome — draggable scrollbar / tabs / status bar via the solid-quad pipeline;
-(d) find / filter-as-you-type over the buffer (a V1 headline feature).
+**EDITING WORKS (2026-07-18) — the viewer is now an editor.** The read-only flat buffer is
+replaced by a linear piece table (`src/base/piecetable.odin`, 12 unit tests): insert/delete/
+read + line-nav (`pt_line_start/end/next/prev`). The viewport reads/navigates through it on
+demand, so open stays instant. `src/program/doc.odin` adds a caret, undo/redo (piece-list
+snapshots), edits to the add arena, and cursor movement; `window.odin` maps input (WM_CHAR =
+text; WM_KEYDOWN = arrows move cursor, Page scrolls, Backspace/Delete/Enter edit, Ctrl+Z/Y
+undo/redo), drained per frame in `main.odin`. Byte-proportional scrollbar + caret via the
+solid-quad pipeline; auto-scroll keeps the caret visible. The background index scans the
+IMMUTABLE original (no race with edits, which only touch the add arena); shown line count =
+index count + net-newline delta. Edit path verified headless (`newtpad <file> edittest`):
+insert/backspace/delete-fwd/undo/redo/nl-delta all correct. (Interactive keyboard typing was
+not visually screenshot-verified — this environment can't focus/inject input into the GUI
+window across the session boundary — but the handlers are standard mapping into the verified
+edit path; type in it live to confirm.)
+
+**Deferred from editing:** SAVE (its own milestone: atomic write, re-encode, never-lock-while-
+mapped); the RB piece TREE (linear list is O(n^2) only for scattered/bulk edits — fine for
+local typing now, tree is the scale/multi-cursor follow-up); selection + clipboard + mouse
+click-to-position; per-word undo coalescing (currently per-keystroke); reindex-on-edit (line
+count/scrollbar drift approximately after big edits — index is over the original).
+
+**Next options:** (a) SAVE (encoding-aware, atomic, never-lock — makes it a usable editor);
+(b) selection + clipboard + mouse; (c) find / filter-as-you-type (V1 headline; benchmark
+proved search is viable); (d) the RB piece tree; (e) shaping + font fallback (multilingual);
+(f) UI chrome (tabs, filename header, draggable scrollbar).
