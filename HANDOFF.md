@@ -124,6 +124,20 @@ File Pilot's author independently converged on Wyatt's exact plan and his contex
 - `build.bat` — the one build script: `odin build src\program -out:build\newtpad.exe -debug -collection:src=src`. Append `run` to launch. Output in `build/` (gitignored).
 - Imports use the `src:` collection (e.g. `import plat "src:platform"`).
 
+**TEXT RENDERING WORKS (2026-07-18) - supersedes the "next sub-steps" note below.**
+DirectWrite-from-Odin is de-risked; text renders end to end (verified by screenshot).
+- `src/platform/dwrite.odin` hand-declares the minimal DirectWrite COM (IDWriteFactory / IDWriteFontFace / IDWriteGlyphRunAnalysis). Vtable method ORDER is taken from the on-disk SDK `dwrite.h` (10.0.28000.0), NOT MS Learn (whose method tables are alphabetized and would call the wrong slot). Unused slots are `rawptr` placeholders to keep offsets correct.
+- `src/platform/text.odin`: loads a font face (Consolas), reads metrics for advances, rasterizes glyphs to ClearType coverage, packs into a shared `R8G8B8A8` atlas with a shelf packer, caches by `(glyph, px)`, draws cached glyphs as instanced quads. ClearType via DUAL-SOURCE blend (PS emits `SV_Target1` = per-channel coverage; blend `SRC1_COLOR`/`INV_SRC1_COLOR`), so result = ink*coverage + dst*(1-coverage). `gfx_begin_frame` now resets to opaque blend so per-pass state never leaks frames.
+- Spike learning: glyph bounds can be negative (an 'A' returned `L-1`), so the atlas uses the returned bearings; never assume origin (0,0).
+
+**Flagged follow-ups (from the devil's-advocate pass - address before they bite):**
+1. SHAPING + FONT FALLBACK: current text uses `GetGlyphIndices` (cmap 1:1), NOT shaping - no CJK / combining marks / ligatures / bidi / emoji yet. Next real text milestone = `IDWriteTextAnalyzer` shaping + `IDWriteFontFallback`. The glyph-run is already fed by an explicit index list so this slots in without reworking the raster/atlas.
+2. ATLAS EVICTION: atlas is grow-only (violates the PROJECT-RULES "caches need eviction" rule). Add LRU/generational + atlas-full handling before ship. `atlas_pack` currently just logs when full.
+3. PER-FRAME GLYPH WORK: `text_draw` calls `GetGlyphIndices` per char per frame and rasterizes on first sight synchronously - fine now, must be bounded/backgrounded for large files (viewport-first rule).
+4. `quads.odin` (solid rects) is currently unused by `main` but kept for UI backgrounds/cursor/selection.
+
+**Next options:** (a) shaping + font fallback (real multilingual text); (b) resume the build sequence with the week-1 buffer benchmark (piece table vs gap buffer), now higher-stakes since fast never-freeze search-in-huge-files is a first-order V1 promise; (c) read-only file viewing (mmap -> viewport layout -> scroll) toward the "opens anything instantly" demo.
+
 **What works:** `build.bat` produces a ~635 KB `newtpad.exe`; it opens a 1280×720 window, creates a D3D11 device + DXGI flip-model swapchain (`B8G8R8A8_UNORM`, `FLIP_DISCARD`, 2 buffers, BGRA_SUPPORT), handles resize (ResizeBuffers + RTV recreate), and clears to slate at vsync. On top of that, an **instanced quad pipeline** (`src/platform/quads.odin`) draws arbitrary pixel-space rectangles in a single `DrawInstanced` call: embedded HLSL compiled at startup via `vendor:directx/d3d_compiler`, a dynamic per-instance buffer (`Quad{pos,size,color}`), an `SV_VertexID` triangle-strip quad (no vertex buffer), and a screen-size constant buffer. Frame is split `gfx_begin_frame` (clear) → draws → `gfx_end_frame` (present). Win32 is isolated in `window.odin`, all D3D11/COM in `gfx.odin`+`quads.odin`; COM methods called via Odin's `->`.
 
 **Architecture decision (2026-07-18):** the GPU quad pipeline lives in **platform** (honoring the locked "all Win32/COM isolated in platform" rule). The `renderer` package will be the *CPU-side* glyph→quad builder + atlas packer with no COM. Revisit if this split chafes once text lands.
