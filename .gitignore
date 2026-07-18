@@ -15,3 +15,6 @@ desktop.ini
 
 # Local, machine-specific local tooling settings
 .local-settings.json
+
+# Generated benchmark test files
+/bench/data/
