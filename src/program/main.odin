@@ -21,6 +21,11 @@ main :: proc() {
 		return
 	}
 
+	// SPIKE: de-risk DirectWrite-from-Odin before building the glyph atlas.
+	// Rasterizes one glyph via hand-declared DWrite COM and dumps it as ASCII.
+	// Remove once the atlas/text pipeline lands.
+	plat.glyph_spike('A', 32)
+
 	fmt.println("Newtpad is up. Close the window to exit.")
 
 	// A few rectangles to prove the instanced pipeline draws in one call.
