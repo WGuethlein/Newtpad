@@ -156,4 +156,33 @@ DirectWrite-from-Odin is de-risked; text renders end to end (verified by screens
 
 **Shader note:** HLSL is compiled at runtime for dev speed → **d3dcompiler_47.dll** runtime dependency. Locked plan: switch to precompiled `.cso` bytecode (fxc/dxc at build time, embedded via `#load`) before V1 ships to drop that dep.
 
-**Immediate next sub-steps:** the **glyph atlas** — DirectWrite-from-Odin spike (§6.3: hand-declare `IDWriteFactory → IDWriteFontFace → IDWriteGlyphRunAnalysis`), rasterize glyphs into a cached alpha atlas (an `ID3D11Texture2D` in platform), extend the quad shader to sample it, and draw "Hello, 世界". In parallel/after, the §8 sequence resumes (week-1 buffer benchmark).
+**NOTE:** the "What works / Architecture / Shader / Immediate next" paragraphs just
+above are historical (pre-text-rendering). Current state is the newer blocks higher
+in section 10 plus this one.
+
+**FILE VIEWER WORKS (2026-07-18) — read-only, instant multi-GB.**
+`newtpad.exe [path] [scrollLines]` opens a real file and renders it.
+- `src/platform/file.odin`: `file_open_readonly` — copies files < 16 MB into private
+  memory, mmaps larger ones (share-everything, never-lock). A 1 GB file opens in
+  ~0.1 ms (mmap); whole-app cold start on it is ~267 ms.
+- `src/base/encoding.odin` + `lines.odin` (pure, tested in `base_test.odin`, `odin test src/base`):
+  BOM-detect UTF-8 / UTF-16 LE/BE, decode UTF-16 (incl. surrogate pairs) to internal
+  UTF-8; line navigation over bytes.
+- `src/program/doc.odin`: byte-offset viewport that walks line breaks ON DEMAND — no
+  full index needed to render, which is why open is instant at any size. Visible lines
+  draw through the ClearType `text_draw`. `window.odin` queues wheel / arrows / Page /
+  Home-End scroll to per-frame state.
+- Verified by screenshot: HANDOFF.md renders and scrolls (top vs pre-scrolled to §4).
+
+**Scope note / deferred:** I built instant-open + scroll via scan-on-demand (simpler,
+needs no index) rather than the background incremental line-indexer. That means NO exact
+scrollbar extent, total-line-count, or goto-line-N yet — those need the background index
+(the remaining half of the "index visible now, background the rest" plan). Also deferred:
+horizontal scroll / wrap (long lines are clamped to 2000 chars), a real UI chrome
+(status bar, filename header), and tabs. `quads.odin` (solid rects) is still unused,
+ready for that chrome.
+
+**Next options:** (a) background line-index → exact scrollbar + goto-line (finishes the
+viewer's "instant open" story); (b) editing (the real RB piece-tree + insert/undo, per
+the locked buffer decision); (c) shaping + font fallback for multilingual text; (d) UI
+chrome (status bar, tabs) using the solid-quad pipeline.
