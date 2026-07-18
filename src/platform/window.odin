@@ -12,6 +12,10 @@ Window :: struct {
 	height:       i32,
 	should_close: bool,
 	resized:      bool,
+	// input, drained once per frame by the program
+	scroll_delta:  int, // lines to scroll this frame (+down / -up)
+	scroll_to_top: bool,
+	scroll_to_end: bool,
 }
 
 window_create :: proc(title: string, width, height: i32) -> ^Window {
@@ -92,6 +96,28 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		w.width = i32(lparam & 0xFFFF)
 		w.height = i32((lparam >> 16) & 0xFFFF)
 		w.resized = true
+		return 0
+	case win.WM_MOUSEWHEEL:
+		// signed wheel delta lives in the high word of wParam
+		raw := int(wparam >> 16) & 0xFFFF
+		if raw >= 0x8000 {raw -= 0x10000}
+		w.scroll_delta -= (raw / 120) * 3 // wheel-up scrolls up
+		return 0
+	case win.WM_KEYDOWN:
+		switch wparam {
+		case win.VK_DOWN:
+			w.scroll_delta += 1
+		case win.VK_UP:
+			w.scroll_delta -= 1
+		case win.VK_NEXT:
+			w.scroll_delta += 30 // page down
+		case win.VK_PRIOR:
+			w.scroll_delta -= 30 // page up
+		case win.VK_HOME:
+			w.scroll_to_top = true
+		case win.VK_END:
+			w.scroll_to_end = true
+		}
 		return 0
 	}
 	return win.DefWindowProcW(hwnd, msg, wparam, lparam)

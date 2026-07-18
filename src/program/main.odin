@@ -4,9 +4,20 @@
 package main
 
 import "core:fmt"
+import "core:os"
+import "core:strconv"
 import plat "src:platform"
 
 main :: proc() {
+	// Open the file given on the command line; default to the 1GB bench file to
+	// demo instant multi-GB open, falling back to a source file if it's absent.
+	path := "bench/data/test_1024MB.txt"
+	if len(os.args) > 1 {
+		path = os.args[1]
+	} else if !os.exists(path) {
+		path = "src/platform/text.odin"
+	}
+
 	window := plat.window_create("Newtpad", 1280, 720)
 
 	gfx, ok := plat.gfx_init(window)
@@ -21,9 +32,23 @@ main :: proc() {
 		return
 	}
 
-	fmt.println("Newtpad is up. Close the window to exit.")
+	doc, dok := doc_open(path)
+	if !dok {
+		fmt.eprintfln("Newtpad: could not open %s", path)
+		return
+	}
+	defer doc_close(&doc)
+	fmt.printfln("Newtpad: opened %s (%d bytes, %v). Scroll to read; close to exit.", path, len(doc.content), doc.enc)
 
-	fg := [4]f32{0.92, 0.94, 0.98, 1} // near-white ink on slate
+	px: f32 = 16
+	line_h := px * 1.5
+
+	// Optional 2nd arg: start scrolled down N lines (demo + seed of file:line jump).
+	if len(os.args) > 2 {
+		if n, ok := strconv.parse_int(os.args[2]); ok {
+			doc_scroll(&doc, n)
+		}
+	}
 
 	for !window.should_close {
 		plat.window_pump_events(window)
@@ -33,12 +58,23 @@ main :: proc() {
 			window.resized = false
 		}
 
-		// Calm slate background so it's obvious the pipeline is live.
+		// Process queued input once per frame.
+		rows := int(f32(window.height) / line_h)
+		if window.scroll_to_top {
+			doc.top = 0
+			window.scroll_to_top = false
+		}
+		if window.scroll_to_end {
+			doc_scroll(&doc, 1_000_000_000)
+			window.scroll_to_end = false
+		}
+		if window.scroll_delta != 0 {
+			doc_scroll(&doc, window.scroll_delta)
+			window.scroll_delta = 0
+		}
+
 		plat.gfx_begin_frame(&gfx, 0.09, 0.11, 0.16)
-		plat.text_draw(&gfx, &text, "Hello, World", 60, 110, 48, fg)
-		plat.text_draw(&gfx, &text, "Newtpad renders text via DirectWrite + ClearType.", 60, 170, 22, fg)
-		plat.text_draw(&gfx, &text, "The quick brown fox jumps over the lazy dog.", 60, 210, 22, fg)
-		plat.text_draw(&gfx, &text, "0123456789  {}[]()<>  +-*/=  @#$%&", 60, 250, 22, fg)
+		doc_draw(&gfx, &text, &doc, px, rows)
 		plat.gfx_end_frame(&gfx)
 	}
 }
