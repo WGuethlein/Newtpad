@@ -174,15 +174,25 @@ in section 10 plus this one.
   Home-End scroll to per-frame state.
 - Verified by screenshot: HANDOFF.md renders and scrolls (top vs pre-scrolled to §4).
 
-**Scope note / deferred:** I built instant-open + scroll via scan-on-demand (simpler,
-needs no index) rather than the background incremental line-indexer. That means NO exact
-scrollbar extent, total-line-count, or goto-line-N yet — those need the background index
-(the remaining half of the "index visible now, background the rest" plan). Also deferred:
-horizontal scroll / wrap (long lines are clamped to 2000 chars), a real UI chrome
-(status bar, filename header), and tabs. `quads.odin` (solid rects) is still unused,
-ready for that chrome.
+**BACKGROUND LINE INDEX DONE (2026-07-18).** The viewport renders via scan-on-demand
+(instant, no index), and a background worker thread now builds a SPARSE line index (a
+line-start anchor every 1024 lines + exact total count) published via atomics; anchors[]
+is pre-sized so it never reallocates, so the main thread reads it lock-free. This is the
+project's first background job (`src/program/doc.odin`: `Line_Index`, `index_worker`).
+It gives an exact scrollbar (track + thumb drawn with the solid-quad pipeline, now in
+use) and a status line ("line X of N, indexing %"), and `doc_goto_line` jumps to the
+nearest anchor then scans the remainder. Verified headless (`newtpad <file> count`): exact
+line counts (HANDOFF.md 189 = newline count; 1 GB file 18,198,529 lines, ~0.3 s in a
+release build, off the UI thread). Threading gotchas fixed: start the worker only after
+the Document is at its final address (it holds `&doc.idx`), and only clamp goto to the
+total once the index is DONE (a partial count clamps toward 0).
 
-**Next options:** (a) background line-index → exact scrollbar + goto-line (finishes the
-viewer's "instant open" story); (b) editing (the real RB piece-tree + insert/undo, per
-the locked buffer decision); (c) shaping + font fallback for multilingual text; (d) UI
-chrome (status bar, tabs) using the solid-quad pipeline.
+**Deferred:** horizontal scroll / wrap (long lines clamped to 2000 chars); a real UI
+chrome (draggable scrollbar, filename header, tabs); interactive goto (needs a text-input
+box). Memory note: the sparse index pre-allocates `total/(8*1024)` ints (~1 MB per GB,
+graceful overflow guard) — a block-list would trim that further later.
+
+**Next options:** (a) editing — the real RB piece-tree + insert/undo per the locked buffer
+decision (turns viewer into editor); (b) shaping + font fallback for multilingual text;
+(c) UI chrome — draggable scrollbar / tabs / status bar via the solid-quad pipeline;
+(d) find / filter-as-you-type over the buffer (a V1 headline feature).
