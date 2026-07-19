@@ -173,6 +173,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	px, char_w, line_h := rc.px, rc.char_w, rc.line_h
 	doc := app_active(rc.app)
 	rows := int((f32(window.height) - CONTENT_TOP) / line_h)
+	// Recompute the wrap width here (not just in the main loop) so word wrap
+	// re-flows live during a resize, which repaints through this path.
+	doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - 18) / char_w))
 
 	plat.gfx_begin_frame(gfx, 0.09, 0.11, 0.16)
 
