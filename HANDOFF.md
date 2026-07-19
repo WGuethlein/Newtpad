@@ -121,12 +121,19 @@ tracked.
 
 ## 6. Roadmap (prioritized)
 
-1. **[P0] Mapped-read safety** — cap `pt_line_end`/scan work to the viewport; SEH-guard (or
-   worker-copy) reads that can touch the mapped original; size-gate regex materialization. This
-   removes the two live hard-rule violations and unblocks safe growth.
-2. **[P1] Correctness + cleanliness sweep** — Save-As ownership/leak; delete dead anchors; atlas
-   out-of-bounds guard; `CreateFileMapping` null-check; extract the visible-line iterator; move
-   test-modes out of `main.odin`; long-line caret clip.
+1. **[P0] Mapped-read safety — DONE (2026-07-18).** `doc_draw` uses `pt_line_end_cap` (bounded
+   per-frame scan); mmap only for large files on a local fixed drive (network/removable/UNC copy).
+   **SEH guard shipped:** a C shim (`src/platform/guarded_copy.c` → `build/guarded.obj`) wraps reads
+   of the mapped original in `__try/__except`, installed into `base` via the `safe_copy` proc hook;
+   `read_rec` and the index worker both route through it. On a fault the document detaches into a
+   private copy, re-indexes, and flags itself RECOVERED in the status line. Proven by `newtpad
+   sehtest` (catches a real page fault; process survives). **Remaining sliver:** regex still
+   materializes the whole buffer (`find.odin`) — the read is guarded now (won't crash) but can still
+   stall; size-gate/background it before regex-on-huge-files is comfortable.
+2. **[P1] Correctness sweep — DONE.** Save-As ownership/leak, dead anchors, atlas out-of-bounds
+   guard, `CreateFileMapping` null-check, mid-index line-count all fixed. **Cleanliness remaining:**
+   extract the duplicated visible-line iterator (4 sites, magic `12`/`10`/`1.5`); move the 7 headless
+   test-modes out of `main.odin`; clip caret/selection to the drawn extent on long lines.
 3. **[feature] Complex-script shaping + fix the monospace caret** (`IDWriteTextAnalyzer`) — the
    real multilingual correctness, and it fixes caret/selection placement on mixed-width text.
 4. **[feature] Tabs + session restore** — gated on the Document-stability + per-document-arena
