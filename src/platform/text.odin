@@ -365,27 +365,32 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, face: int, index: u16, px: f32) -> Glyph 
 	g.left = left
 	g.top = top
 	if cov != nil && gw > 0 && gh > 0 {
-		rx, ry := atlas_pack(t, gw, gh)
-		// expand 3-channel ClearType coverage to RGBA for the atlas.
-		rgba := make([]u8, int(gw * gh) * 4)
-		defer delete(rgba)
-		for i in 0 ..< int(gw * gh) {
-			rgba[i * 4 + 0] = cov[i * 3 + 0]
-			rgba[i * 4 + 1] = cov[i * 3 + 1]
-			rgba[i * 4 + 2] = cov[i * 3 + 2]
-			rgba[i * 4 + 3] = 255
+		rx, ry, packed := atlas_pack(t, gw, gh)
+		if packed {
+			// expand 3-channel ClearType coverage to RGBA for the atlas.
+			rgba := make([]u8, int(gw * gh) * 4)
+			defer delete(rgba)
+			for i in 0 ..< int(gw * gh) {
+				rgba[i * 4 + 0] = cov[i * 3 + 0]
+				rgba[i * 4 + 1] = cov[i * 3 + 1]
+				rgba[i * 4 + 2] = cov[i * 3 + 2]
+				rgba[i * 4 + 3] = 255
+			}
+			box := d3d.BOX {
+				left   = u32(rx),
+				top    = u32(ry),
+				front  = 0,
+				right  = u32(rx + gw),
+				bottom = u32(ry + gh),
+				back   = 1,
+			}
+			gfx.ctx->UpdateSubresource((^d3d.IResource)(t.atlas), 0, &box, raw_data(rgba), u32(gw * 4), 0)
+			g.uv_min = {f32(rx) / ATLAS_W, f32(ry) / ATLAS_H}
+			g.uv_max = {f32(rx + gw) / ATLAS_W, f32(ry + gh) / ATLAS_H}
+		} else {
+			// atlas full (eviction is a follow-up): don't render this glyph, just advance.
+			g.w, g.h = 0, 0
 		}
-		box := d3d.BOX {
-			left   = u32(rx),
-			top    = u32(ry),
-			front  = 0,
-			right  = u32(rx + gw),
-			bottom = u32(ry + gh),
-			back   = 1,
-		}
-		gfx.ctx->UpdateSubresource((^d3d.IResource)(t.atlas), 0, &box, raw_data(rgba), u32(gw * 4), 0)
-		g.uv_min = {f32(rx) / ATLAS_W, f32(ry) / ATLAS_H}
-		g.uv_max = {f32(rx + gw) / ATLAS_W, f32(ry + gh) / ATLAS_H}
 	}
 	if cov != nil {
 		delete(cov)
@@ -432,9 +437,11 @@ glyph_rasterize :: proc(t: ^Text, face: int, index: u16, px: f32) -> (cov: []u8,
 	return
 }
 
-// Shelf packer: grow-only, no eviction yet (milestone). Pads 1px between glyphs.
+// Shelf packer: grow-only, no eviction yet. Returns ok=false when the atlas is
+// full (caller then skips the glyph rather than writing out of bounds).
+// Eviction / a second atlas page is a follow-up.
 @(private)
-atlas_pack :: proc(t: ^Text, w, h: i32) -> (x, y: i32) {
+atlas_pack :: proc(t: ^Text, w, h: i32) -> (x, y: i32, ok: bool) {
 	PAD :: 1
 	if t.pack_x + w + PAD > ATLAS_W {
 		t.pack_x = 0
@@ -442,7 +449,7 @@ atlas_pack :: proc(t: ^Text, w, h: i32) -> (x, y: i32) {
 		t.shelf_h = 0
 	}
 	if t.pack_y + h > ATLAS_H {
-		fmt.eprintln("glyph atlas full (grow-only not yet implemented)")
+		return 0, 0, false // atlas full
 	}
 	x = t.pack_x
 	y = t.pack_y
@@ -450,5 +457,5 @@ atlas_pack :: proc(t: ^Text, w, h: i32) -> (x, y: i32) {
 	if h > t.shelf_h {
 		t.shelf_h = h
 	}
-	return
+	return x, y, true
 }

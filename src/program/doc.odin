@@ -6,26 +6,23 @@
 package main
 
 import "base:intrinsics"
+import "core:strings"
 import "core:thread"
 import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
 
-ANCHOR_STRIDE :: 1024
-
-// Background index over the immutable original bytes (no race with edits, which
-// only touch the piece table's add arena). Line count during editing is this
-// plus nl_delta (net newlines inserted/deleted).
+// Background job that counts total lines over the immutable original bytes (no
+// race with edits, which only touch the add arena). The status bar shows this
+// plus nl_delta (net newlines from edits). Published via atomics.
 Line_Index :: struct {
-	content:      []u8,
-	anchors:      []int,
-	anchor_count: int, // atomic
-	line_count:   int, // atomic
-	indexed:      int, // atomic
-	total:        int,
-	done:         bool, // atomic
-	cancel:       bool, // atomic
-	th:           ^thread.Thread,
+	content:    []u8,
+	line_count: int, // atomic
+	indexed:    int, // atomic (bytes scanned, for progress)
+	total:      int,
+	done:       bool, // atomic
+	cancel:     bool, // atomic
+	th:         ^thread.Thread,
 }
 
 Snapshot :: struct {
@@ -43,6 +40,7 @@ Document :: struct {
 	enc:        base.Encoding,
 	pt:         base.Piece_Table,
 	path:       string, // "" for an unnamed scratch buffer
+	path_owned: bool, // doc.path is heap-owned (freed on close/re-save)
 	had_bom:    bool, // whether the file opened with a BOM (preserved on save)
 	top:        int, // byte offset of the top visible line
 	cursor:     int, // caret byte offset
@@ -77,8 +75,6 @@ Find :: struct {
 doc_new :: proc() -> (doc: Document) {
 	doc.enc = .UTF8
 	doc.pt = base.pt_init(nil)
-	doc.idx.anchors = make([]int, 16)
-	doc.idx.anchor_count = 1
 	return
 }
 
@@ -88,7 +84,8 @@ doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
 		return
 	}
 	doc.fv = fv
-	doc.path = path
+	doc.path = strings.clone(path)
+	doc.path_owned = true
 	enc, bom := base.detect_encoding(fv.bytes)
 	doc.enc = enc
 	doc.had_bom = bom > 0
@@ -97,8 +94,6 @@ doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
 
 	doc.idx.content = doc.original
 	doc.idx.total = len(doc.original)
-	doc.idx.anchors = make([]int, len(doc.original) / (8 * ANCHOR_STRIDE) + 16)
-	doc.idx.anchor_count = 1
 	return doc, true
 }
 
@@ -112,7 +107,6 @@ doc_close :: proc(doc: ^Document) {
 		thread.join(doc.idx.th)
 		thread.destroy(doc.idx.th)
 	}
-	delete(doc.idx.anchors)
 	for s in doc.undo {base.pt_free_node_tree(s.root)}
 	for s in doc.redo {base.pt_free_node_tree(s.root)}
 	delete(doc.undo)
@@ -125,6 +119,9 @@ doc_close :: proc(doc: ^Document) {
 	base.pt_destroy(&doc.pt)
 	if doc.owned_orig {
 		delete(doc.original)
+	}
+	if doc.path_owned {
+		delete(doc.path)
 	}
 	plat.file_close(&doc.fv)
 }
@@ -142,13 +139,6 @@ index_worker :: proc(data: rawptr) {
 		}
 		if c[i] == '\n' {
 			line += 1
-			if line % ANCHOR_STRIDE == 0 {
-				ai := line / ANCHOR_STRIDE
-				if ai < len(idx.anchors) {
-					idx.anchors[ai] = i + 1
-					intrinsics.atomic_store(&idx.anchor_count, ai + 1)
-				}
-			}
 		}
 		i += 1
 	}
@@ -165,8 +155,13 @@ doc_save :: proc(doc: ^Document, path: string) -> bool {
 	if !plat.file_write_atomic(path, out) {
 		return false
 	}
+	newpath := strings.clone(path) // clone first: path may alias doc.path (re-save)
+	if doc.path_owned {
+		delete(doc.path)
+	}
+	doc.path = newpath
+	doc.path_owned = true
 	doc.modified = false
-	doc.path = path
 	return true
 }
 
@@ -181,7 +176,11 @@ doc_line_text :: proc(doc: ^Document, start: int, allocator := context.allocator
 	return string(buf)
 }
 
-doc_line_count :: proc(doc: ^Document) -> int {return intrinsics.atomic_load(&doc.idx.line_count) + doc.nl_delta}
+doc_line_count :: proc(doc: ^Document) -> int {
+	lc := intrinsics.atomic_load(&doc.idx.line_count)
+	// nl_delta is only meaningful once the base count over the original is done.
+	return lc + doc.nl_delta if intrinsics.atomic_load(&doc.idx.done) else lc
+}
 doc_index_done :: proc(doc: ^Document) -> bool {return intrinsics.atomic_load(&doc.idx.done)}
 doc_index_progress :: proc(doc: ^Document) -> f32 {
 	if doc.idx.total == 0 {return 1}

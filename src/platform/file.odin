@@ -53,9 +53,15 @@ file_open_readonly :: proc(path: string) -> (fv: File_View, ok: bool) {
 		return
 	}
 	fv.hmap = win.CreateFileMappingW(hfile, nil, win.PAGE_READONLY, 0, 0, nil)
+	if fv.hmap == nil {
+		win.CloseHandle(hfile)
+		return
+	}
 	fv.view = win.MapViewOfFile(fv.hmap, win.FILE_MAP_READ, 0, 0, 0)
 	win.CloseHandle(hfile)
 	if fv.view == nil {
+		win.CloseHandle(fv.hmap)
+		fv.hmap = nil
 		return
 	}
 	fv.bytes = (cast([^]u8)fv.view)[:n]
@@ -153,7 +159,8 @@ file_save_dialog :: proc(owner: win.HWND) -> (path: string, ok: bool) {
 	}
 	n := 0
 	for n < len(buf) && buf[n] != 0 {n += 1}
-	s, err := win.utf16_to_utf8(buf[:n], context.allocator)
+	// temp-allocated: the caller (doc_save) clones it into the doc; freed at frame end.
+	s, err := win.utf16_to_utf8(buf[:n], context.temp_allocator)
 	if err != nil {
 		return "", false
 	}
