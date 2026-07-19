@@ -186,18 +186,29 @@ palette_recompute :: proc(app: ^App) {
 	}
 }
 
-palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Text, app: ^App, width, height: f32) {
+PALETTE_MAX_ROWS :: 12
+
+// The palette's geometry, computed once and consumed by the draw, the hit-test
+// and the hover. Two expressions in two procs is how every seam bug in this
+// codebase has started.
+Palette_Layout :: struct {
+	x0, y0, w, h: f32,
+	qh, rowh:     f32, // query field height, row height
+	nres:         int, // result rows actually drawn
+}
+
+palette_layout :: proc(app: ^App, width, height: f32) -> Palette_Layout {
 	p := &app.palette
-	PW := min(sx(720), width - sx(80))
-	x0 := (width - PW) / 2
-	y0 := sx(44)
-	qh := sx(34)
-	rowh := sx(26)
-	nres := min(len(p.results), 12)
-	// Every mode has to contribute its own height. Help draws a fixed list and
-	// produces no results, so sizing purely off nres left its text outside the
-	// box, unreadable against the document.
-	body_rows := f32(nres)
+	l: Palette_Layout
+	l.w = min(sx(720), width - sx(80))
+	l.x0 = (width - l.w) / 2
+	l.y0 = sx(44)
+	l.qh = sx(34)
+	l.rowh = sx(26)
+	l.nres = min(len(p.results), PALETTE_MAX_ROWS)
+	// Every mode contributes its own height. Help draws a fixed list and produces
+	// no results, so sizing purely off nres left its text outside the box.
+	body_rows := f32(l.nres)
 	switch p.mode {
 	case .Goto:
 		body_rows = 1
@@ -205,7 +216,56 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 		body_rows = f32(len(PALETTE_HELP))
 	case .Tabs, .Commands:
 	}
-	boxh := qh + body_rows * rowh
+	l.h = l.qh + body_rows * l.rowh
+	return l
+}
+
+// Result row at client (x, y), or -1. Only the result list is clickable; the
+// query field and the Goto/Help bodies are not rows.
+palette_row_at :: proc(app: ^App, mx, my, width, height: f32) -> int {
+	p := &app.palette
+	if !p.active || (p.mode != .Tabs && p.mode != .Commands) {return -1}
+	l := palette_layout(app, width, height)
+	if mx < l.x0 || mx >= l.x0 + l.w {return -1}
+	top := l.y0 + l.qh
+	if my < top {return -1} // the query field, not a row
+	i := int((my - top) / l.rowh)
+	if i < 0 || i >= l.nres {return -1}
+	return i
+}
+
+// Highlight the row under the pointer. Live cursor, not win.mouse_y, which only
+// updates while a button is held.
+palette_hover :: proc(app: ^App, win: ^plat.Window, width, height: f32) {
+	if !app.palette.active {return}
+	cx, cy := plat.window_cursor_client(win)
+	if r := palette_row_at(app, f32(cx), f32(cy), width, height); r >= 0 {
+		app.palette.selected = r
+	}
+}
+
+// Click inside the palette. Returns whether the click was consumed and whether
+// it chose a result (the caller runs it, so the palette needn't know how).
+palette_click :: proc(app: ^App, mx, my, width, height: f32) -> (chose: bool, consumed: bool) {
+	if !app.palette.active {return false, false}
+	l := palette_layout(app, width, height)
+	inside := mx >= l.x0 && mx < l.x0 + l.w && my >= l.y0 && my < l.y0 + l.h
+	if !inside {
+		palette_close(app) // click-away dismisses, as it always did
+		return false, true
+	}
+	if r := palette_row_at(app, mx, my, width, height); r >= 0 {
+		app.palette.selected = r
+		return true, true
+	}
+	return false, true // inside the box but not on a row: swallow, stay open
+}
+
+palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Text, app: ^App, width, height: f32) {
+	p := &app.palette
+	l := palette_layout(app, width, height)
+	PW, x0, y0, qh, rowh, nres := l.w, l.x0, l.y0, l.qh, l.rowh, l.nres
+	boxh := l.h
 
 	plat.quads_draw(gfx, quad_pipe, []plat.Quad {
 			{pos = {x0 - sx(1), y0 - sx(1)}, size = {PW + sx(2), boxh + sx(2)}, color = {0.30, 0.34, 0.42, 1}}, // border

@@ -198,6 +198,21 @@ visible_begin :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> Visible_Iter 
 // filter armed but nothing matched yet — an empty query, or a worker that hasn't
 // published — the document renders normally instead of showing a blank screen.
 // That is what lets Ctrl+L arm the filter first and narrow as the user types.
+// Height of the bar along the bottom: the find bar when find is open, otherwise
+// the status line. Document rows must stop above it, or text is drawn behind the
+// bar and clicks in that strip land on rows the user cannot see.
+doc_bottom_bar_h :: proc(doc: ^Document) -> f32 {
+	if doc != nil && doc.find.active {
+		return sx(48) if doc.find.replace_mode else sx(26)
+	}
+	return sx(20) // status line
+}
+
+// Visible document rows, excluding the bottom bar.
+doc_visible_rows :: proc(doc: ^Document, height, line_h: f32) -> int {
+	return max(0, int((height - CONTENT_TOP - doc_bottom_bar_h(doc)) / line_h))
+}
+
 // Highest filter_top that still fills the screen. One definition: the wheel, the
 // page keys and the match auto-scroll each had their own, so Page-Down could
 // scroll to a single line above a screen of empty rows while the wheel refused

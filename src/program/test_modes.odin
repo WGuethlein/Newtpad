@@ -964,6 +964,37 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		for r in ":42" {palette_input_rune(&a, r)}
 		fmt.printfln("goto ':42'    -> mode=%v", a.palette.mode)
 
+		// Results must be clickable, and the hit-test must agree with the drawn
+		// box on BOTH axes — the menu's equivalent had no x check at all, which
+		// made every point at a row height a live menu row.
+		clear(&a.palette.query)
+		palette_recompute(&a)
+		a.palette.active = true
+		W, H := f32(1280), f32(720)
+		l := palette_layout(&a, W, H)
+		inx := l.x0 + l.w * 0.5
+		rowtop := l.y0 + l.qh
+		r0 := palette_row_at(&a, inx, rowtop + l.rowh * 0.5, W, H)
+		rq := palette_row_at(&a, inx, l.y0 + l.qh * 0.5, W, H) // the query field
+		rl := palette_row_at(&a, l.x0 - sx(20), rowtop + l.rowh * 0.5, W, H) // left of box
+		rr := palette_row_at(&a, l.x0 + l.w + sx(20), rowtop + l.rowh * 0.5, W, H) // right
+		rb := palette_row_at(&a, inx, rowtop + l.rowh * f32(l.nres + 3), W, H) // below
+		ok := r0 == 0 && rq == -1 && rl == -1 && rr == -1 && rb == -1
+		fmt.printfln("palette rows: first=%d query=%d L=%d R=%d below=%d  %s", r0, rq, rl, rr, rb, "OK" if ok else "FAIL")
+
+		// Clicking away closes; clicking a row selects without closing.
+		_, c1 := palette_click(&a, sx(4), H - sx(4), W, H)
+		away_ok := c1 && !a.palette.active
+		// Reopen properly: palette_close clears the results, so simply setting
+		// `active` would leave no rows to hit.
+		palette_open(&a)
+		l = palette_layout(&a, W, H)
+		rowtop = l.y0 + l.qh
+		chose, c2 := palette_click(&a, l.x0 + l.w * 0.5, rowtop + l.rowh * 0.5, W, H)
+		row_ok := chose && c2
+		fmt.printfln("click away closes=%v, click row chooses=%v  %s", away_ok, row_ok, "OK" if away_ok && row_ok else "FAIL")
+		a.palette.active = false
+
 		app_destroy(&a)
 		return true
 	}

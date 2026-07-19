@@ -146,9 +146,10 @@ main :: proc() {
 			plat.gfx_resize(&gfx, window.width, window.height)
 			window.resized = false
 		}
-		rows := int((f32(window.height) - CONTENT_TOP) / line_h)
-
 		doc := app_active(&app)
+		// Rows stop above the find/status bar, so no row is drawn behind it and
+		// no click in that strip lands on a row the user cannot see.
+		rows := doc_visible_rows(doc, f32(window.height), line_h)
 		// Usable content width in cells (word wrap breaks here).
 		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - SCROLLBAR_W) / char_w))
 		doc.view_rows = rows
@@ -230,13 +231,22 @@ main :: proc() {
 		// A tab switch/close may have changed the active document.
 		doc = app_active(&app)
 
-		// While the palette is open it's modal: a click anywhere dismisses it and
-		// is consumed, so it never falls through to the tabs/caret handlers.
+		// The palette is modal: clicking a result runs it, clicking elsewhere
+		// dismisses, and either way the click is consumed so it never reaches the
+		// tabs or the caret. It used to only ever dismiss, so its results looked
+		// clickable and were not.
+		palette_hover(&app, window, f32(window.width), f32(window.height))
 		if app.palette.active && (window.mouse_pressed || window.mouse_middle_pressed) {
-			palette_close(&app)
-			window.mouse_pressed = false
-			window.mouse_middle_pressed = false
-			window.mouse_down = false
+			chose, consumed := palette_click(&app, f32(window.mouse_x), f32(window.mouse_y), f32(window.width), f32(window.height))
+			if consumed {
+				window.mouse_pressed = false
+				window.mouse_middle_pressed = false
+				window.mouse_down = false
+			}
+			if chose {
+				palette_execute(&app, window, &text, rows)
+				doc = app_active(&app)
+			}
 		}
 
 		// With a dropdown open, sliding across the bar switches menus and moving
@@ -438,7 +448,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	gfx, text, quad_pipe, window := rc.gfx, rc.text, rc.quads, rc.window
 	px, char_w, line_h := rc.px, rc.char_w, rc.line_h
 	doc := app_active(rc.app)
-	rows := int((f32(window.height) - CONTENT_TOP) / line_h)
+	rows := doc_visible_rows(doc, f32(window.height), line_h)
 	// Recompute the wrap width here (not just in the main loop) so word wrap
 	// re-flows live during a resize, which repaints through this path.
 	doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - SCROLLBAR_W) / char_w))

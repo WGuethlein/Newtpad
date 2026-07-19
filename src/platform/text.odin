@@ -154,6 +154,9 @@ Text :: struct {
 	// glyphs cannot all fit, clearing again mid-frame would evict the glyphs
 	// drawn moments ago and thrash without ever making progress.
 	relieved_this_frame: bool,
+	// True while text_draw is accumulating instances. The atlas must not move
+	// under UVs that are already queued — see atlas_relieve.
+	drawing:             bool,
 
 	// pipeline
 	vs:        ^d3d.IVertexShader,
@@ -533,6 +536,9 @@ rune_face :: proc(t: ^Text, r: rune) -> (face: int, gi: u16) {
 text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32) {
 	instances := make([dynamic]Text_Instance, 0, len(str))
 	defer delete(instances)
+	// The atlas must hold still while these UVs are being collected.
+	t.drawing = true
+	defer t.drawing = false
 
 	cell_w := text_char_width(t, px) // same rounded advance the program's grid uses
 	pen := x
@@ -709,6 +715,14 @@ atlas_create :: proc(gfx: ^Gfx, t: ^Text, dim: i32) -> bool {
 // means one screen of text genuinely does not fit.
 @(private = "file")
 atlas_relieve :: proc(gfx: ^Gfx, t: ^Text) -> bool {
+	// Never mid-string. Instances already queued by this text_draw hold UVs
+	// normalised against the current atlas size and pointing at rects that a
+	// grow would discard or a recycle would overwrite — they would all be drawn
+	// against the new texture. The glyph is skipped this call and picked up on
+	// the next frame, when the queue is empty.
+	if t.drawing {
+		return false
+	}
 	if t.atlas_w < ATLAS_MAX {
 		if atlas_create(gfx, t, min(t.atlas_w * 2, ATLAS_MAX)) {
 			clear(&t.cache)
