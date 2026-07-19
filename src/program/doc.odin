@@ -52,6 +52,15 @@ Document :: struct {
 	undo:       [dynamic]Snapshot,
 	redo:       [dynamic]Snapshot,
 	idx:        Line_Index,
+	find:       Find,
+}
+
+// Incremental find state (see find.odin).
+Find :: struct {
+	active:  bool,
+	query:   [dynamic]u8, // UTF-8
+	matches: [dynamic]int, // sorted match start offsets
+	current: int, // index into matches, or -1
 }
 
 // A new empty scratch document (no file). This is what opens when Newtpad is
@@ -99,6 +108,8 @@ doc_close :: proc(doc: ^Document) {
 	for s in doc.redo {delete(s.pieces)}
 	delete(doc.undo)
 	delete(doc.redo)
+	delete(doc.find.query)
+	delete(doc.find.matches)
 	base.pt_destroy(&doc.pt)
 	if doc.owned_orig {
 		delete(doc.original)

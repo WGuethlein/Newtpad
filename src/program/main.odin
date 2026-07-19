@@ -97,6 +97,25 @@ main :: proc() {
 		return
 	}
 
+	// Headless find check: `newtpad <path> findtest <query>`.
+	if len(os.args) > 3 && os.args[2] == "findtest" {
+		doc, _ := doc_open(path)
+		find_open(&doc)
+		for r in os.args[3] {find_input_rune(&doc, r)}
+		fmt.printf("query=%q matches=%d offsets:", string(doc.find.query[:]), len(doc.find.matches))
+		for m in doc.find.matches {fmt.printf(" %d", m)}
+		fmt.printfln("  current=%d", doc.find.current)
+		if len(doc.find.matches) > 0 {
+			find_next(&doc)
+			fmt.printfln("next -> current=%d (cursor %d)", doc.find.current, doc.cursor)
+			find_prev(&doc)
+			find_prev(&doc)
+			fmt.printfln("prev x2 -> current=%d", doc.find.current)
+		}
+		doc_close(&doc)
+		return
+	}
+
 	window := plat.window_create("Newtpad", 1280, 720)
 
 	gfx, ok := plat.gfx_init(window)
@@ -149,11 +168,26 @@ main :: proc() {
 
 		// Drain input once per frame: typed characters, then editor key commands.
 		for i in 0 ..< window.char_count {
-			doc_insert_rune(&doc, window.chars[i])
+			if doc.find.active {
+				find_input_rune(&doc, window.chars[i])
+			} else {
+				doc_insert_rune(&doc, window.chars[i])
+			}
 		}
 		window.char_count = 0
 		for i in 0 ..< window.key_count {
 			ev := window.key_events[i]
+			if doc.find.active {
+				#partial switch ev.cmd {
+				case .Backspace:
+					find_backspace(&doc)
+				case .Enter:
+					if ev.shift {find_prev(&doc)} else {find_next(&doc)}
+				case .Escape, .Find:
+					find_close(&doc)
+				}
+				continue
+			}
 			#partial switch ev.cmd {
 			case .Left:
 				doc_cursor_left(&doc, ev.shift)
@@ -216,6 +250,10 @@ main :: proc() {
 						fmt.eprintfln("Newtpad: failed to save %s", p)
 					}
 				}
+			case .Find:
+				find_open(&doc)
+			case .Escape:
+				doc.anchor = doc.cursor // clear selection
 			}
 		}
 		window.key_count = 0
@@ -235,7 +273,8 @@ main :: proc() {
 				}
 			}
 			window.mouse_pressed = false
-		} else if window.mouse_down {
+		} else if window.mouse_down && window.mouse_count == 1 {
+			// drag extends a single-click selection; word/line selects stay put
 			doc.cursor = doc_pos_at(&doc, window.mouse_x, window.mouse_y, px, char_w, rows)
 		}
 
@@ -248,7 +287,11 @@ main :: proc() {
 
 		plat.gfx_begin_frame(&gfx, 0.09, 0.11, 0.16)
 
-		// Selection highlights, behind the text.
+		// Behind the text: find-match highlights (dim), then the selection (bright).
+		findq: [80]plat.Quad
+		if nfq := find_match_rects(&doc, px, char_w, rows, findq[:]); nfq > 0 {
+			plat.quads_draw(&gfx, &quad_pipe, findq[:nfq])
+		}
 		selq: [80]plat.Quad
 		ns := doc_selection_rects(&doc, px, char_w, rows, selq[:])
 		if ns > 0 {
@@ -276,8 +319,23 @@ main :: proc() {
 			plat.quads_draw(&gfx, &quad_pipe, bars[:nb])
 		}
 
-		status := fmt.tprintf("%d lines%s%s", doc_line_count(&doc), " *" if doc.modified else "", "" if doc_index_done(&doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(&doc) * 100))
-		plat.text_draw(&gfx, &text, status, 12, f32(window.height) - 8, 13, {0.55, 0.60, 0.70, 1})
+		if doc.find.active {
+			bar := plat.Quad{pos = {0, h - 26}, size = {f32(window.width), 26}, color = {0.14, 0.16, 0.20, 1}}
+			plat.quads_draw(&gfx, &quad_pipe, []plat.Quad{bar})
+			info: string
+			if len(doc.find.query) == 0 {
+				info = ""
+			} else if len(doc.find.matches) == 0 {
+				info = "  (no matches)"
+			} else {
+				info = fmt.tprintf("  (%d/%d)", doc.find.current + 1, len(doc.find.matches))
+			}
+			fb := fmt.tprintf("Find: %s%s", string(doc.find.query[:]), info)
+			plat.text_draw(&gfx, &text, fb, 12, h - 8, 14, {0.95, 0.88, 0.55, 1})
+		} else {
+			status := fmt.tprintf("%d lines%s%s", doc_line_count(&doc), " *" if doc.modified else "", "" if doc_index_done(&doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(&doc) * 100))
+			plat.text_draw(&gfx, &text, status, 12, h - 8, 13, {0.55, 0.60, 0.70, 1})
+		}
 
 		plat.gfx_end_frame(&gfx)
 		free_all(context.temp_allocator)

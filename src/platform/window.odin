@@ -42,6 +42,8 @@ Key_Cmd :: enum u8 {
 	WordLeft,
 	WordRight,
 	DeleteWordBack,
+	Find,
+	Escape,
 }
 
 Key_Event :: struct {
@@ -209,6 +211,10 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 			cmd = .Paste;has = ctrl
 		case win.VK_A:
 			cmd = .SelectAll;has = ctrl
+		case win.VK_F:
+			cmd = .Find;has = ctrl
+		case win.VK_ESCAPE:
+			cmd = .Escape
 		case:
 			has = false
 		}
