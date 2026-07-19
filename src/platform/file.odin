@@ -94,12 +94,21 @@ file_open_readonly :: proc(path: string) -> (fv: File_View, ok: bool) {
 // crash mid-write never corrupts the original. Never holds `path` open. Works
 // even when the original is memory-mapped (delete+rename succeed; see bench/).
 file_write_atomic :: proc(path: string, data: []u8) -> bool {
+	err := file_write_atomic_err(path, data)
+	return err == .None
+}
+
+// As file_write_atomic, but says why it failed. The replace step fails with
+// ERROR_ACCESS_DENIED whenever another process holds the target open — which is
+// the normal state of a log being written by a service, i.e. exactly the file a
+// user is most likely to be editing when this matters.
+file_write_atomic_err :: proc(path: string, data: []u8) -> Write_Error {
 	tmp := strings.concatenate({path, ".newtpad~"}, context.temp_allocator)
 	wtmp := win.utf8_to_wstring(tmp, context.temp_allocator)
 
 	h := win.CreateFileW(wtmp, win.GENERIC_WRITE, 0, nil, win.CREATE_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, nil)
 	if h == win.INVALID_HANDLE_VALUE {
-		return false
+		return .Create_Temp
 	}
 	total := 0
 	for total < len(data) {
@@ -115,15 +124,15 @@ file_write_atomic :: proc(path: string, data: []u8) -> bool {
 	win.CloseHandle(h)
 	if total != len(data) {
 		win.DeleteFileW(wtmp)
-		return false
+		return .Write
 	}
 
 	wdst := win.utf8_to_wstring(path, context.temp_allocator)
 	if !win.MoveFileExW(wtmp, wdst, win.MOVEFILE_REPLACE_EXISTING) {
 		win.DeleteFileW(wtmp)
-		return false
+		return .Replace
 	}
-	return true
+	return .None
 }
 
 // Build a comdlg filter string (label\0pattern\0...\0\0) as wide chars.
@@ -232,6 +241,37 @@ Save_Choice :: enum {
 }
 
 // Ask whether to save changes to `name` before closing. Yes/No/Cancel.
+// Report a failure the user must know about. Release builds are -subsystem:windows,
+// so anything printed to stderr is discarded — a failed save reported that way is
+// indistinguishable from a successful one.
+message_error :: proc(owner: win.HWND, text: string) {
+	wmsg := win.utf8_to_wstring(text, context.temp_allocator)
+	wcap := win.utf8_to_wstring("Newtpad", context.temp_allocator)
+	win.MessageBoxW(owner, wmsg, wcap, MB_ICONWARNING)
+}
+
+// Why a write failed, so the caller can say something better than "failed".
+Write_Error :: enum {
+	None,
+	Create_Temp, // couldn't create the temp file (permissions, missing directory)
+	Write, // the write itself failed (disk full)
+	Replace, // couldn't replace the target — usually another process holds it open
+}
+
+write_error_text :: proc(e: Write_Error, path: string) -> string {
+	switch e {
+	case .Create_Temp:
+		return strings.concatenate({"Could not create a temporary file next to\n", path, "\n\nCheck permissions on that folder."}, context.temp_allocator)
+	case .Write:
+		return strings.concatenate({"Could not write all data to\n", path, "\n\nThe disk may be full."}, context.temp_allocator)
+	case .Replace:
+		return strings.concatenate({"Could not replace\n", path, "\n\nAnother program may have the file open. Your changes have NOT been saved."}, context.temp_allocator)
+	case .None:
+		return ""
+	}
+	return ""
+}
+
 confirm_discard :: proc(owner: win.HWND, name: string) -> Save_Choice {
 	msg := strings.concatenate({"Save changes to ", name, "?"}, context.temp_allocator)
 	wmsg := win.utf8_to_wstring(msg, context.temp_allocator)

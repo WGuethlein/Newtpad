@@ -360,6 +360,18 @@ LETTERS := [26]string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L"
 @(private = "file")
 DIGITS := [10]string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
 
+// Show a save failure. Silence here is a data-loss bug: the user believes the
+// file was written, and in a release build (-subsystem:windows) stderr is gone.
+@(private = "file")
+report_save :: proc(err: plat.Write_Error, path: string, w: ^plat.Window) -> bool {
+	if err == .None {
+		fmt.printfln("Newtpad: saved %s", path)
+		return true
+	}
+	plat.message_error(w.hwnd if w != nil else nil, plat.write_error_text(err, path))
+	return false
+}
+
 // Close a tab, prompting to save first if it has unsaved changes. Save-dialog
 // cancel or a failed save aborts the close (keeps the tab).
 request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
@@ -378,7 +390,9 @@ request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
 				if !ok {return}
 				p = np
 			}
-			if !doc_save(d, p) {return}
+			// Aborting the close is right — but say why, or the user sees the tab
+			// simply refuse to close with no explanation and may force-quit.
+			if !report_save(doc_save_err(d, p), p, w) {return}
 		case .Discard:
 		}
 	}
@@ -491,19 +505,11 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			}
 		}
 		if p != "" {
-			if doc_save(doc, p) {
-				fmt.printfln("Newtpad: saved %s", p)
-			} else {
-				fmt.eprintfln("Newtpad: failed to save %s", p)
-			}
+			report_save(doc_save_err(doc, p), p, w)
 		}
 	case .Save_As:
 		if p, ok := plat.file_save_dialog(w.hwnd); ok {
-			if doc_save(doc, p) {
-				fmt.printfln("Newtpad: saved %s", p)
-			} else {
-				fmt.eprintfln("Newtpad: failed to save %s", p)
-			}
+			report_save(doc_save_err(doc, p), p, w)
 		}
 	case .Find_Open:
 		find_open(doc, false)

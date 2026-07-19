@@ -467,8 +467,12 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		lncol := fmt.tprintf("Ln %d, Col %d", ln, doc_cursor_col(doc, text)) if ln > 0 else fmt.tprintf("Col %d", doc_cursor_col(doc, text))
 		recovered := "  [RECOVERED COPY - file changed on disk, not the original]" if doc.recovered else ""
 		indexing := "" if doc_index_done(doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(doc) * 100)
-		status := fmt.tprintf("%s    %s    %d lines%s%s%s%s", lncol, enc_name(doc.enc), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, indexing)
-		col := [4]f32{0.95, 0.55, 0.35, 1} if doc.recovered else {0.55, 0.60, 0.70, 1}
+		// The atlas has no eviction: once full, further glyphs draw as nothing
+		// while the pen still advances, so text goes missing with no other
+		// symptom. Say so rather than let it look like a corrupt file.
+		atlas := "  [GLYPH CACHE FULL - some text may not draw; reduce zoom or font size]" if plat.text_atlas_full(text) else ""
+		status := fmt.tprintf("%s    %s    %d lines%s%s%s%s%s", lncol, enc_name(doc.enc), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, indexing, atlas)
+		col := [4]f32{0.95, 0.55, 0.35, 1} if (doc.recovered || plat.text_atlas_full(text)) else {0.55, 0.60, 0.70, 1}
 		plat.text_draw(gfx, text, status, sx(12), h - sx(8), UI_SMALL_PX, col)
 	}
 

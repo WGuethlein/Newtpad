@@ -153,6 +153,43 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad savefailtest <path>` — a save that fails must say WHY. Release
+	// builds are -subsystem:windows, so the old stderr report was invisible and a
+	// failed save was indistinguishable from a successful one.
+	if os.args[1] == "savefailtest" && len(os.args) > 2 {
+		bad := 0
+		target := os.args[2]
+
+		// A directory that does not exist: the temp file cannot be created.
+		e1 := plat.file_write_atomic_err(fmt.tprintf("%s\\nope\\deep\\x.txt", target), transmute([]u8)string("hi"))
+		fmt.printfln("missing dir      -> %-12v %s", e1, "OK" if e1 == .Create_Temp else "FAIL")
+		if e1 != .Create_Temp {bad += 1}
+
+		// A normal write succeeds.
+		good := fmt.tprintf("%s\\ok.txt", target)
+		e2 := plat.file_write_atomic_err(good, transmute([]u8)string("hello"))
+		fmt.printfln("normal write     -> %-12v %s", e2, "OK" if e2 == .None else "FAIL")
+		if e2 != .None {bad += 1}
+
+		// Every failure must produce a non-empty, specific message. A blank or
+		// generic one is the same bug in a different place.
+		for e in ([]plat.Write_Error{.Create_Temp, .Write, .Replace}) {
+			msg := plat.write_error_text(e, good)
+			ok := len(msg) > 20
+			fmt.printfln("  text(%-12v) %d chars %s", e, len(msg), "OK" if ok else "FAIL")
+			if !ok {bad += 1}
+		}
+		// The locked-file case is the one that matters most; say so explicitly.
+		rep := plat.write_error_text(.Replace, good)
+		mentions := false
+		for i in 0 ..< len(rep) - 8 {if rep[i:i + 8] == "NOT been" {mentions = true}}
+		fmt.printfln("replace text warns changes are unsaved: %v %s", mentions, "OK" if mentions else "FAIL")
+		if !mentions {bad += 1}
+
+		fmt.printfln("savefailtest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad historytest` covers undo coalescing, the entry cap, and jumping to
 	// an arbitrary state.
 	if os.args[1] == "historytest" {

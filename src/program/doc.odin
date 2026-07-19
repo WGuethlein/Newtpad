@@ -482,10 +482,16 @@ doc_fault_pending :: proc(doc: ^Document) -> bool {
 // Save the buffer to `path`, re-encoded to the file's original encoding
 // (UTF-16 files round-trip; UTF-8 keeps/omits its BOM as opened). Atomic write.
 doc_save :: proc(doc: ^Document, path: string) -> bool {
+	return doc_save_err(doc, path) == .None
+}
+
+// Returns why the save failed so the caller can tell the user. A save that fails
+// silently is a data-loss bug: the user believes the file is written.
+doc_save_err :: proc(doc: ^Document, path: string) -> plat.Write_Error {
 	body := base.pt_collect(&doc.pt, context.temp_allocator) // internal UTF-8
 	out := base.encode_from_utf8(body, doc.enc, doc.had_bom, context.temp_allocator)
-	if !plat.file_write_atomic(path, out) {
-		return false
+	if err := plat.file_write_atomic_err(path, out); err != .None {
+		return err
 	}
 	newpath := strings.clone(path) // clone first: path may alias doc.path (re-save)
 	if doc.path_owned {
@@ -494,7 +500,7 @@ doc_save :: proc(doc: ^Document, path: string) -> bool {
 	doc.path = newpath
 	doc.path_owned = true
 	doc.modified = false
-	return true
+	return .None
 }
 
 // Materialize the buffer as a string (debug/test only; leaks).
