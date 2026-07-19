@@ -10,8 +10,11 @@ REM SEH shim (guarded_copy.c) -> build\guarded.obj. Compiled once; it never
 REM changes. If you edit the .c, delete build\guarded.obj to force a rebuild.
 if not exist build\guarded.obj call :build_shim || exit /b 1
 
+REM Release is the shipped app: GUI subsystem, so launching it never flashes a
+REM console window. Debug keeps the console subsystem because the headless test
+REM modes (test_modes.odin) print their results to stdout.
 set "OPT=-debug"
-if "%1"=="release" set "OPT=-o:speed"
+if "%1"=="release" set "OPT=-o:speed -subsystem:windows"
 
 odin build src\program -out:build\newtpad.exe %OPT% -collection:src=src
 if errorlevel 1 exit /b 1
