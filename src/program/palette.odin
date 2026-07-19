@@ -186,7 +186,18 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 	qh := sx(34)
 	rowh := sx(26)
 	nres := min(len(p.results), 12)
-	boxh := qh + (rowh if p.mode == .Goto else f32(nres) * rowh)
+	// Every mode has to contribute its own height. Help draws a fixed list and
+	// produces no results, so sizing purely off nres left its text outside the
+	// box, unreadable against the document.
+	body_rows := f32(nres)
+	switch p.mode {
+	case .Goto:
+		body_rows = 1
+	case .Help:
+		body_rows = f32(len(PALETTE_HELP))
+	case .Tabs, .Commands:
+	}
+	boxh := qh + body_rows * rowh
 
 	plat.quads_draw(gfx, quad_pipe, []plat.Quad {
 			{pos = {x0 - sx(1), y0 - sx(1)}, size = {PW + sx(2), boxh + sx(2)}, color = {0.30, 0.34, 0.42, 1}}, // border

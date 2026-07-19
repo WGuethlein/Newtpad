@@ -260,6 +260,7 @@ Document :: struct {
 	anchor:     int, // other end of the selection (== cursor when none)
 	wrap:       bool, // word-wrap this document at view_cols
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
+	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	status_cursor: int, // cursor pos the cached status line was computed for
 	status_line:   int, // 1-based line of the cursor (0 = beyond the cap / unknown)
 	modified:   bool,

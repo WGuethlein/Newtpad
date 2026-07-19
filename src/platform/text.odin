@@ -337,8 +337,14 @@ is_zero_width :: proc(r: rune) -> bool {
 // relative to one cell, so it matches whatever font renders it (no width tables);
 // width 0 is decided by is_zero_width. Cached; the ratio is px-independent. Tabs
 // are one cell for now (tab stops are a later feature).
+// Cells a tab occupies. Fixed width, not true tab stops (which would advance to
+// the next multiple and so need the column, which this per-rune call doesn't
+// have). Predictable, and it beats the previous behaviour: one cell, rendered as
+// a missing-glyph box because no font has a glyph for U+0009.
+TAB_CELLS :: 4
+
 text_cell_width :: proc(t: ^Text, r: rune) -> int {
-	if r == '\t' {return 1}
+	if r == '\t' {return TAB_CELLS}
 	if c, found := t.cell_cache[r]; found {return int(c)}
 	cells: u8 = 1
 	if is_zero_width(r) {
@@ -409,6 +415,10 @@ text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32
 	pen := x
 	for r in str {
 		cells := text_cell_width(t, r)
+		if r == '\t' {
+			pen += f32(cells) * cell_w // whitespace: advance, draw nothing
+			continue
+		}
 		face, gi := rune_face(t, r)
 		g := glyph_get(gfx, t, face, gi, px)
 		if g.w > 0 && g.h > 0 {

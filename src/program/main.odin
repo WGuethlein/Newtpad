@@ -129,6 +129,7 @@ main :: proc() {
 		doc := app_active(&app)
 		// Usable content width in cells (word wrap breaks here).
 		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - SCROLLBAR_W) / char_w))
+		doc.view_rows = rows
 		// Re-center on the caret only when it actually moves on THIS tab — never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
 		active_before := app.active
@@ -217,7 +218,9 @@ main :: proc() {
 
 		if window.scroll_delta != 0 {
 			if doc.filter {
-				doc.filter_top = clamp(doc.filter_top + window.scroll_delta, 0, max(0, len(doc.filter_lines) - 1))
+				// Stop at the point the list underfills the screen, rather than
+				// letting the last line scroll to the top over empty rows.
+				doc.filter_top = clamp(doc.filter_top + window.scroll_delta, 0, max(0, len(doc.filter_lines) - rows))
 			} else {
 				doc_scroll(doc, &text, window.scroll_delta, rows)
 			}

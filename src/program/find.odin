@@ -248,8 +248,13 @@ find_merge :: proc(doc: ^Document) {
 	if !f.jumped && n > 0 {
 		f.jumped = true
 		f.current = 0
+		// Reference the START of any selection, not the caret. Selecting a match
+		// leaves the caret at its end, so re-running this after a toggle (Ctrl+R,
+		// Ctrl+L) would pick the *next* match every time — the selection walked
+		// forward one match per keypress.
+		from := min(doc.cursor, doc.anchor)
 		for m, i in f.matches {
-			if m >= doc.cursor {
+			if m >= from {
 				f.current = i
 				break
 			}
@@ -448,7 +453,10 @@ find_select_current :: proc(doc: ^Document) {
 		mls := base.pt_line_start(&doc.pt, m)
 		for fl, i in doc.filter_lines {
 			if fl == mls {
-				doc.filter_top = i
+				// Clamp so the screen stays full. Scrolling to the match's index
+				// directly meant a match near the end left the view showing the
+				// last two or three lines with empty rows beneath.
+				doc.filter_top = clamp(i, 0, max(0, len(doc.filter_lines) - max(1, doc.view_rows)))
 				break
 			}
 		}

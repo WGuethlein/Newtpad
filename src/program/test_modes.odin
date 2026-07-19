@@ -249,7 +249,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			fmt.eprintln("celltest: no fonts loaded")
 			return true
 		}
-		samples := "aé中がx́" // ascii, 2-byte latin, CJK x2, kana, ascii, combining acute
+		samples := "aé中がx́\t" // ascii, 2-byte latin, CJK x2, kana, ascii, combining acute, tab
+		fmt.printfln("tab = %d cells (want %d, and must draw no glyph)", plat.text_cell_width(&t, '\t'), plat.TAB_CELLS)
 		fmt.printf("cells: ")
 		for r in samples {fmt.printf("%q=%d ", r, plat.text_cell_width(&t, r))}
 		bytes := transmute([]u8)samples
