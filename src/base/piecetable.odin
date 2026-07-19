@@ -1,121 +1,171 @@
-// Layer: base — a mutable text buffer as a linear piece table over an immutable
-// original + an append-only add arena. Pure (no platform). Edits never touch the
-// original bytes (mmap-friendly, free undo via piece snapshots). Linear piece
-// list is fine for local editing; an RB piece tree is the scale follow-up (the
-// frag spike showed the linear list is O(n^2) only for scattered/bulk edits).
+// Layer: base — a mutable text buffer as a balanced PIECE TREE (an implicit
+// treap keyed by byte position) over an immutable original + append-only add
+// arena. O(log n) insert/delete/read via split/merge; each node caches its
+// subtree byte count. Replaces the earlier linear piece list, whose insert was
+// O(n^2) for scattered edits (the frag spike). Same public API as before, so
+// the document code and the existing tests are unchanged. Undo snapshots the
+// tree by cloning it (see pt_snapshot/pt_restore).
 package base
 
 Piece :: struct {
 	from_add: bool,
-	start:    int, // offset into original or add
+	start:    int,
 	len:      int,
+}
+
+Node :: struct {
+	piece:       Piece,
+	left, right: ^Node,
+	priority:    u32,
+	sub:         int, // total byte length of this subtree
 }
 
 Piece_Table :: struct {
 	original: []u8,
 	add:      [dynamic]u8,
-	pieces:   [dynamic]Piece,
+	root:     ^Node,
 	length:   int,
+}
+
+@(private = "file")
+rng: u64 = 0x243F6A8885A308D3
+
+@(private = "file")
+rprio :: proc() -> u32 {
+	rng ~= rng << 13
+	rng ~= rng >> 7
+	rng ~= rng << 17
+	return u32(rng)
+}
+
+@(private = "file")
+subbytes :: proc(n: ^Node) -> int {return n.sub if n != nil else 0}
+
+@(private = "file")
+upd :: proc(n: ^Node) {
+	if n != nil {
+		n.sub = subbytes(n.left) + n.piece.len + subbytes(n.right)
+	}
+}
+
+@(private = "file")
+mk :: proc(p: Piece) -> ^Node {
+	n := new(Node)
+	n.piece = p
+	n.priority = rprio()
+	n.sub = p.len
+	return n
+}
+
+@(private = "file")
+free_tree :: proc(t: ^Node) {
+	if t == nil {return}
+	free_tree(t.left)
+	free_tree(t.right)
+	free(t)
+}
+
+// merge two treaps: all of `a`'s bytes come before all of `b`'s.
+@(private = "file")
+merge :: proc(a, b: ^Node) -> ^Node {
+	if a == nil {return b}
+	if b == nil {return a}
+	if a.priority > b.priority {
+		a.right = merge(a.right, b)
+		upd(a)
+		return a
+	}
+	b.left = merge(a, b.left)
+	upd(b)
+	return b
+}
+
+// split so `l` holds the first `pos` bytes and `r` the rest (may split a piece).
+@(private = "file")
+split :: proc(t: ^Node, pos: int) -> (l, r: ^Node) {
+	if t == nil {return nil, nil}
+	lb := subbytes(t.left)
+	if pos <= lb {
+		a, b := split(t.left, pos)
+		t.left = b
+		upd(t)
+		return a, t
+	}
+	if pos >= lb + t.piece.len {
+		a, b := split(t.right, pos - lb - t.piece.len)
+		t.right = a
+		upd(t)
+		return t, b
+	}
+	// split point falls inside this node's piece
+	local := pos - lb
+	lp := Piece{t.piece.from_add, t.piece.start, local}
+	rp := Piece{t.piece.from_add, t.piece.start + local, t.piece.len - local}
+	tl, tr := t.left, t.right
+	free(t)
+	return merge(tl, mk(lp)), merge(mk(rp), tr)
 }
 
 pt_init :: proc(original: []u8) -> (pt: Piece_Table) {
 	pt.original = original
 	pt.add = make([dynamic]u8, 0, 1024)
-	pt.pieces = make([dynamic]Piece, 0, 16)
 	if len(original) > 0 {
-		append(&pt.pieces, Piece{false, 0, len(original)})
+		pt.root = mk(Piece{false, 0, len(original)})
 		pt.length = len(original)
 	}
 	return
 }
 
 pt_destroy :: proc(pt: ^Piece_Table) {
+	free_tree(pt.root)
 	delete(pt.add)
-	delete(pt.pieces)
 }
 
 pt_len :: proc(pt: ^Piece_Table) -> int {return pt.length}
 
-@(private = "file")
-piece_src :: proc(pt: ^Piece_Table, p: Piece) -> []u8 {
-	return pt.original[p.start:p.start + p.len] if !p.from_add else pt.add[p.start:p.start + p.len]
-}
-
-// Find the piece index and its starting logical offset such that the piece
-// contains logical position `pos` (or the insertion point at pos).
-@(private = "file")
-locate :: proc(pt: ^Piece_Table, pos: int) -> (i, off: int) {
-	for i < len(pt.pieces) {
-		if off + pt.pieces[i].len > pos {
-			return
-		}
-		off += pt.pieces[i].len
-		i += 1
-	}
-	return
-}
-
 pt_insert :: proc(pt: ^Piece_Table, pos: int, text: []u8) {
-	if len(text) == 0 {
-		return
-	}
+	if len(text) == 0 {return}
 	p := clamp(pos, 0, pt.length)
 	add_start := len(pt.add)
 	append(&pt.add, ..text)
-	newp := Piece{true, add_start, len(text)}
-
-	i, off := locate(pt, p)
-	if i >= len(pt.pieces) {
-		append(&pt.pieces, newp)
-	} else {
-		local := p - off
-		pc := pt.pieces[i]
-		if local == 0 {
-			inject_at(&pt.pieces, i, newp)
-		} else if local == pc.len {
-			inject_at(&pt.pieces, i + 1, newp)
-		} else {
-			pt.pieces[i] = Piece{pc.from_add, pc.start, local}
-			inject_at(&pt.pieces, i + 1, newp, Piece{pc.from_add, pc.start + local, pc.len - local})
-		}
-	}
+	l, r := split(pt.root, p)
+	pt.root = merge(merge(l, mk(Piece{true, add_start, len(text)})), r)
 	pt.length += len(text)
 }
 
 pt_delete :: proc(pt: ^Piece_Table, pos, count: int) {
 	p := clamp(pos, 0, pt.length)
 	n := min(count, pt.length - p)
-	if n <= 0 {
-		return
-	}
-	i, off := locate(pt, p)
-	remaining := n
-	local := p - off
-
-	if local > 0 {
-		pc := pt.pieces[i]
-		deletable := pc.len - local
-		take := min(deletable, remaining)
-		right_len := pc.len - local - take
-		pt.pieces[i] = Piece{pc.from_add, pc.start, local} // keep the left part
-		remaining -= take
-		i += 1
-		if right_len > 0 {
-			inject_at(&pt.pieces, i, Piece{pc.from_add, pc.start + local + take, right_len})
-		}
-	}
-
-	for remaining > 0 && i < len(pt.pieces) {
-		pc := pt.pieces[i]
-		if pc.len <= remaining {
-			remaining -= pc.len
-			ordered_remove(&pt.pieces, i)
-		} else {
-			pt.pieces[i] = Piece{pc.from_add, pc.start + remaining, pc.len - remaining}
-			remaining = 0
-		}
-	}
+	if n <= 0 {return}
+	l, m := split(pt.root, p)
+	mid, r := split(m, n)
+	free_tree(mid)
+	pt.root = merge(l, r)
 	pt.length -= n
+}
+
+@(private = "file")
+piece_src :: proc(pt: ^Piece_Table, p: Piece) -> []u8 {
+	return pt.original[p.start:p.start + p.len] if !p.from_add else pt.add[p.start:p.start + p.len]
+}
+
+@(private = "file")
+read_rec :: proc(pt: ^Piece_Table, t: ^Node, pos: int, dst: []u8, d: ^int) {
+	if t == nil || d^ >= len(dst) {return}
+	lb := subbytes(t.left)
+	if pos < lb {
+		read_rec(pt, t.left, pos, dst, d)
+	}
+	if d^ >= len(dst) {return}
+	piece_off := max(pos, lb) - lb
+	if piece_off < t.piece.len {
+		src := piece_src(pt, t.piece)
+		take := min(t.piece.len - piece_off, len(dst) - d^)
+		copy(dst[d^:d^ + take], src[piece_off:piece_off + take])
+		d^ += take
+	}
+	if d^ >= len(dst) {return}
+	read_rec(pt, t.right, max(pos - lb - t.piece.len, 0), dst, d)
 }
 
 // Copy up to len(dst) logical bytes starting at pos into dst; returns bytes copied.
@@ -123,24 +173,43 @@ pt_read :: proc(pt: ^Piece_Table, pos: int, dst: []u8) -> int {
 	if pos < 0 || pos >= pt.length || len(dst) == 0 {
 		return 0
 	}
-	i, off := locate(pt, pos)
 	d := 0
-	local := pos - off
-	for i < len(pt.pieces) && d < len(dst) {
-		src := piece_src(pt, pt.pieces[i])
-		avail := len(src) - local
-		take := min(avail, len(dst) - d)
-		copy(dst[d:d + take], src[local:local + take])
-		d += take
-		i += 1
-		local = 0
-	}
+	read_rec(pt, pt.root, pos, dst, &d)
 	return d
 }
 
-// --- line navigation over the piece table (chunked scans; no materialization) ---
+pt_collect :: proc(pt: ^Piece_Table, allocator := context.allocator) -> []u8 {
+	out := make([]u8, pt.length, allocator)
+	pt_read(pt, 0, out)
+	return out
+}
 
-// Start of the line containing pos (scan back to the previous '\n', +1; or 0).
+// --- undo support: clone/restore the tree (nodes reference the append-only add
+// arena, which is never truncated, so a cloned old tree stays valid) ---
+
+@(private = "file")
+clone :: proc(t: ^Node) -> ^Node {
+	if t == nil {return nil}
+	n := new(Node)
+	n^ = t^
+	n.left = clone(t.left)
+	n.right = clone(t.right)
+	return n
+}
+
+pt_snapshot :: proc(pt: ^Piece_Table) -> ^Node {return clone(pt.root)}
+
+// Replace the tree with `root` (takes ownership), freeing the old one.
+pt_restore :: proc(pt: ^Piece_Table, root: ^Node, length: int) {
+	free_tree(pt.root)
+	pt.root = root
+	pt.length = length
+}
+
+pt_free_node_tree :: proc(root: ^Node) {free_tree(root)}
+
+// --- line navigation over the buffer (chunked scans via pt_read) ---
+
 pt_line_start :: proc(pt: ^Piece_Table, pos: int) -> int {
 	buf: [4096]u8
 	q := clamp(pos, 0, pt.length)
@@ -158,7 +227,6 @@ pt_line_start :: proc(pt: ^Piece_Table, pos: int) -> int {
 	return 0
 }
 
-// Index of the '\n' at or after pos, or pt.length (end of this line's content).
 pt_line_end :: proc(pt: ^Piece_Table, pos: int) -> int {
 	buf: [4096]u8
 	p := clamp(pos, 0, pt.length)
@@ -174,24 +242,15 @@ pt_line_end :: proc(pt: ^Piece_Table, pos: int) -> int {
 	return pt.length
 }
 
-// Start of the next line after pos (one past the next '\n'); clamps to length.
 pt_next_line_start :: proc(pt: ^Piece_Table, pos: int) -> int {
 	e := pt_line_end(pt, pos)
 	return e + 1 if e < pt.length else pt.length
 }
 
-// Start of the line above the line containing pos (0 at the top).
 pt_prev_line_start :: proc(pt: ^Piece_Table, pos: int) -> int {
 	ls := pt_line_start(pt, pos)
 	if ls == 0 {
 		return 0
 	}
-	return pt_line_start(pt, ls - 1) // ls-1 is the prev line's '\n'
-}
-
-// Materialize the whole buffer (mainly for tests / small-buffer use). Caller frees.
-pt_collect :: proc(pt: ^Piece_Table, allocator := context.allocator) -> []u8 {
-	out := make([]u8, pt.length, allocator)
-	pt_read(pt, 0, out)
-	return out
+	return pt_line_start(pt, ls - 1)
 }

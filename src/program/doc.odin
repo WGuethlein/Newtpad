@@ -29,7 +29,7 @@ Line_Index :: struct {
 }
 
 Snapshot :: struct {
-	pieces:   []base.Piece,
+	root:     ^base.Node, // cloned piece tree
 	length:   int,
 	cursor:   int,
 	anchor:   int,
@@ -113,8 +113,8 @@ doc_close :: proc(doc: ^Document) {
 		thread.destroy(doc.idx.th)
 	}
 	delete(doc.idx.anchors)
-	for s in doc.undo {delete(s.pieces)}
-	for s in doc.redo {delete(s.pieces)}
+	for s in doc.undo {base.pt_free_node_tree(s.root)}
+	for s in doc.redo {base.pt_free_node_tree(s.root)}
 	delete(doc.undo)
 	delete(doc.redo)
 	delete(doc.find.query)
@@ -243,16 +243,12 @@ count_newlines :: proc(doc: ^Document, pos, count: int) -> (c: int) {
 
 @(private = "file")
 snapshot :: proc(doc: ^Document) -> Snapshot {
-	pc := make([]base.Piece, len(doc.pt.pieces))
-	copy(pc, doc.pt.pieces[:])
-	return {pc, doc.pt.length, doc.cursor, doc.anchor, doc.nl_delta}
+	return {base.pt_snapshot(&doc.pt), doc.pt.length, doc.cursor, doc.anchor, doc.nl_delta}
 }
 
 @(private = "file")
-restore :: proc(doc: ^Document, s: Snapshot) {
-	clear(&doc.pt.pieces)
-	append(&doc.pt.pieces, ..s.pieces)
-	doc.pt.length = s.length
+apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
+	base.pt_restore(&doc.pt, s.root, s.length) // takes ownership of s.root
 	doc.cursor = s.cursor
 	doc.anchor = s.anchor
 	doc.nl_delta = s.nl_delta
@@ -261,25 +257,23 @@ restore :: proc(doc: ^Document, s: Snapshot) {
 @(private = "file")
 push_undo :: proc(doc: ^Document) {
 	append(&doc.undo, snapshot(doc))
-	for s in doc.redo {delete(s.pieces)}
+	for s in doc.redo {base.pt_free_node_tree(s.root)}
 	clear(&doc.redo)
 	doc.modified = true
 }
 
 doc_undo :: proc(doc: ^Document) {
 	if len(doc.undo) == 0 {return}
-	append(&doc.redo, snapshot(doc))
+	append(&doc.redo, snapshot(doc)) // clone current for redo
 	s := pop(&doc.undo)
-	restore(doc, s)
-	delete(s.pieces)
+	apply_snapshot(doc, s) // s.root becomes the live tree
 }
 
 doc_redo :: proc(doc: ^Document) {
 	if len(doc.redo) == 0 {return}
 	append(&doc.undo, snapshot(doc))
 	s := pop(&doc.redo)
-	restore(doc, s)
-	delete(s.pieces)
+	apply_snapshot(doc, s)
 }
 
 // --- selection ---
