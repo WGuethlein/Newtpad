@@ -70,3 +70,46 @@ decode_to_utf8 :: proc(data: []u8, enc: Encoding, bom_len: int, allocator := con
 	}
 	return buf[:], true
 }
+
+@(private = "file")
+put_u16 :: proc(b: ^[dynamic]u8, u: u16, le: bool) {
+	if le {
+		append(b, u8(u), u8(u >> 8))
+	} else {
+		append(b, u8(u >> 8), u8(u))
+	}
+}
+
+// Encode internal UTF-8 back to the given encoding for saving. UTF-8 returns the
+// bytes (with a BOM prepended if add_bom); UTF-16 transcodes and always writes a
+// BOM. Always returns a freshly-allocated buffer the caller owns.
+encode_from_utf8 :: proc(data: []u8, enc: Encoding, add_bom: bool, allocator := context.allocator) -> []u8 {
+	if enc == .UTF8 {
+		if add_bom {
+			out := make([]u8, len(data) + 3, allocator)
+			out[0], out[1], out[2] = 0xEF, 0xBB, 0xBF
+			copy(out[3:], data)
+			return out
+		}
+		out := make([]u8, len(data), allocator)
+		copy(out, data)
+		return out
+	}
+
+	le := enc == .UTF16LE
+	b := make([dynamic]u8, 0, len(data) * 2 + 2, allocator)
+	put_u16(&b, 0xFEFF, le) // BOM
+	i := 0
+	for i < len(data) {
+		r, sz := utf8.decode_rune(data[i:])
+		i += max(sz, 1)
+		if r <= 0xFFFF {
+			put_u16(&b, u16(r), le)
+		} else {
+			v := u32(r) - 0x10000
+			put_u16(&b, u16(0xD800 + (v >> 10)), le)
+			put_u16(&b, u16(0xDC00 + (v & 0x3FF)), le)
+		}
+	}
+	return b[:]
+}

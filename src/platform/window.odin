@@ -21,6 +21,7 @@ Key_Cmd :: enum u8 {
 	Enter,
 	Undo,
 	Redo,
+	Save,
 }
 
 Window :: struct {
@@ -160,6 +161,8 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 			cmd = .Undo;has = ctrl
 		case win.VK_Y:
 			cmd = .Redo;has = ctrl
+		case win.VK_S:
+			cmd = .Save;has = ctrl
 		case:
 			has = false
 		}

@@ -47,6 +47,37 @@ test_decode_utf8_nocopy :: proc(t: ^testing.T) {
 }
 
 @(test)
+test_encode_roundtrip :: proc(t: ^testing.T) {
+	orig := "Aß😀 hi\nx" // ASCII + 2-byte + 4-byte (surrogate) + newline
+	utf8_bytes := transmute([]u8)orig
+
+	// UTF-16LE round-trip
+	le := encode_from_utf8(utf8_bytes, .UTF16LE, true)
+	defer delete(le)
+	testing.expect(t, le[0] == 0xFF && le[1] == 0xFE) // BOM
+	enc, bom := detect_encoding(le)
+	testing.expect_value(t, enc, Encoding.UTF16LE)
+	back, alloc := decode_to_utf8(le, enc, bom)
+	defer if alloc {delete(back)}
+	testing.expect_value(t, string(back), orig)
+
+	// UTF-16BE round-trip
+	be := encode_from_utf8(utf8_bytes, .UTF16BE, true)
+	defer delete(be)
+	testing.expect(t, be[0] == 0xFE && be[1] == 0xFF)
+	e2, b2 := detect_encoding(be)
+	back2, a2 := decode_to_utf8(be, e2, b2)
+	defer if a2 {delete(back2)}
+	testing.expect_value(t, string(back2), orig)
+
+	// UTF-8 with BOM
+	u8b := encode_from_utf8(utf8_bytes, .UTF8, true)
+	defer delete(u8b)
+	testing.expect(t, u8b[0] == 0xEF && u8b[1] == 0xBB && u8b[2] == 0xBF)
+	testing.expect_value(t, string(u8b[3:]), orig)
+}
+
+@(test)
 test_line_nav :: proc(t: ^testing.T) {
 	b := transmute([]u8)string("alpha\nbeta\ngamma")
 	testing.expect_value(t, line_end(b, 0), 5) // '\n' after alpha

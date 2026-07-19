@@ -55,6 +55,24 @@ main :: proc() {
 		return
 	}
 
+	// Headless save check: `newtpad <in> savetest <out>` edits, saves, reopens.
+	if len(os.args) > 3 && os.args[2] == "savetest" {
+		outp := os.args[3]
+		doc, _ := doc_open(path)
+		doc.cursor = 0
+		doc_insert_text(&doc, transmute([]u8)string("SAVED:"))
+		ok2 := doc_save(&doc, outp)
+		fmt.printfln("save ok=%v enc=%v had_bom=%v", ok2, doc.enc, doc.had_bom)
+		doc_close(&doc)
+		doc2, r2 := doc_open(outp)
+		if r2 {
+			s := doc_debug_string(&doc2)
+			fmt.printfln("reopened %q (%d bytes, enc=%v)", s[:min(len(s), 16)], doc2.pt.length, doc2.enc)
+			doc_close(&doc2)
+		}
+		return
+	}
+
 	window := plat.window_create("Newtpad", 1280, 720)
 
 	gfx, ok := plat.gfx_init(window)
@@ -138,6 +156,20 @@ main :: proc() {
 				doc_undo(&doc)
 			case .Redo:
 				doc_redo(&doc)
+			case .Save:
+				p := doc.path
+				if p == "" {
+					if np, sok := plat.file_save_dialog(window.hwnd); sok {
+						p = np
+					}
+				}
+				if p != "" {
+					if doc_save(&doc, p) {
+						fmt.printfln("Newtpad: saved %s", p)
+					} else {
+						fmt.eprintfln("Newtpad: failed to save %s", p)
+					}
+				}
 			}
 		}
 		window.key_count = 0

@@ -5,6 +5,7 @@
 package platform
 
 import "core:os"
+import "core:strings"
 import win "core:sys/windows"
 
 FILE_MMAP_THRESHOLD :: 16 * 1024 * 1024 // copy below, mmap above
@@ -60,6 +61,67 @@ file_open_readonly :: proc(path: string) -> (fv: File_View, ok: bool) {
 	fv.bytes = (cast([^]u8)fv.view)[:n]
 	fv.mapped = true
 	return fv, true
+}
+
+// Write data to a sibling temp file then atomically rename it over `path`, so a
+// crash mid-write never corrupts the original. Never holds `path` open. Works
+// even when the original is memory-mapped (delete+rename succeed; see bench/).
+file_write_atomic :: proc(path: string, data: []u8) -> bool {
+	tmp := strings.concatenate({path, ".newtpad~"}, context.temp_allocator)
+	wtmp := win.utf8_to_wstring(tmp, context.temp_allocator)
+
+	h := win.CreateFileW(wtmp, win.GENERIC_WRITE, 0, nil, win.CREATE_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, nil)
+	if h == win.INVALID_HANDLE_VALUE {
+		return false
+	}
+	total := 0
+	for total < len(data) {
+		written: win.DWORD
+		if !win.WriteFile(h, raw_data(data[total:]), win.DWORD(len(data) - total), &written, nil) {
+			break
+		}
+		if written == 0 {
+			break
+		}
+		total += int(written)
+	}
+	win.CloseHandle(h)
+	if total != len(data) {
+		win.DeleteFileW(wtmp)
+		return false
+	}
+
+	wdst := win.utf8_to_wstring(path, context.temp_allocator)
+	if !win.MoveFileExW(wtmp, wdst, win.MOVEFILE_REPLACE_EXISTING) {
+		win.DeleteFileW(wtmp)
+		return false
+	}
+	return true
+}
+
+// Native Save-As dialog. Returns the chosen path (heap-allocated) or ok=false if
+// the user cancelled.
+file_save_dialog :: proc(owner: win.HWND) -> (path: string, ok: bool) {
+	buf: [520]u16
+	filter := [?]u16{'A', 'l', 'l', ' ', 'F', 'i', 'l', 'e', 's', 0, '*', '.', '*', 0, 0}
+	ofn := win.OPENFILENAMEW {
+		lStructSize = size_of(win.OPENFILENAMEW),
+		hwndOwner   = owner,
+		lpstrFile   = win.wstring(&buf[0]),
+		nMaxFile    = u32(len(buf)),
+		lpstrFilter = win.wstring(&filter[0]),
+		Flags       = u32(win.OFN_OVERWRITEPROMPT | win.OFN_EXPLORER | win.OFN_NOCHANGEDIR),
+	}
+	if !win.GetSaveFileNameW(&ofn) {
+		return "", false
+	}
+	n := 0
+	for n < len(buf) && buf[n] != 0 {n += 1}
+	s, err := win.utf16_to_utf8(buf[:n], context.allocator)
+	if err != nil {
+		return "", false
+	}
+	return s, true
 }
 
 file_close :: proc(fv: ^File_View) {

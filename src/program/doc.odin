@@ -41,6 +41,8 @@ Document :: struct {
 	owned_orig: bool,
 	enc:        base.Encoding,
 	pt:         base.Piece_Table,
+	path:       string, // "" for an unnamed scratch buffer
+	had_bom:    bool, // whether the file opened with a BOM (preserved on save)
 	top:        int, // byte offset of the top visible line
 	cursor:     int, // caret byte offset
 	modified:   bool,
@@ -66,8 +68,10 @@ doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
 		return
 	}
 	doc.fv = fv
+	doc.path = path
 	enc, bom := base.detect_encoding(fv.bytes)
 	doc.enc = enc
+	doc.had_bom = bom > 0
 	doc.original, doc.owned_orig = base.decode_to_utf8(fv.bytes, enc, bom)
 	doc.pt = base.pt_init(doc.original)
 
@@ -126,6 +130,19 @@ index_worker :: proc(data: rawptr) {
 	intrinsics.atomic_store(&idx.line_count, line + 1)
 	intrinsics.atomic_store(&idx.indexed, len(c))
 	intrinsics.atomic_store(&idx.done, true)
+}
+
+// Save the buffer to `path`, re-encoded to the file's original encoding
+// (UTF-16 files round-trip; UTF-8 keeps/omits its BOM as opened). Atomic write.
+doc_save :: proc(doc: ^Document, path: string) -> bool {
+	body := base.pt_collect(&doc.pt, context.temp_allocator) // internal UTF-8
+	out := base.encode_from_utf8(body, doc.enc, doc.had_bom, context.temp_allocator)
+	if !plat.file_write_atomic(path, out) {
+		return false
+	}
+	doc.modified = false
+	doc.path = path
+	return true
 }
 
 // Materialize the buffer as a string (debug/test only; leaks).
