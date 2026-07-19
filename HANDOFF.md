@@ -204,10 +204,14 @@ on the architecture. Two locked decisions were refined **with that DA as the new
    Ctrl+Tab, Ctrl+PageUp/Dn) in the table. `ui_tabs.odin` strip: click-switch, ×/middle-click close,
    elided titles, active highlight; content offset below the strip. **Deferred:** overflow
    horizontal scroll, MRU-on-hold (needs key-up), "+" new-tab button.
-3. **Session restore (full)** — session.json + per-buffer backups + off-thread serialize + restore
-   reconciliation + `*.tmp` sweep. ← NEXT
+3. **Session restore — DONE (hot-exit).** `session.odin`: hand-rolled `session.txt` (one line/tab:
+   cursor/anchor/top/wrap/enc/backup-idx/path) + per-buffer content backups for dirty/untitled;
+   atomic writes, referenced-backups-before-pointer ordering, `*.tmp` startup sweep; saves on close +
+   debounced ~2s autosave. **Deferred:** off-thread serialize (still main-thread `pt_collect` — hitch
+   only on a very large dirty buffer), `had_bom` persistence, placeholder tab for a deleted file.
+   Also **word wrap — DONE** (Alt+Z, per-doc, window-edge, live re-flow) landed alongside tabs.
 4. **Command palette + fuzzy finder** — one overlay; fzf-style scoring in a single-alloc matcher;
-   prefix modes (none=files/tabs, `>`=commands, `:`=go-to-line); lists from the command table.
+   prefix modes (none=files/tabs, `>`=commands, `:`=go-to-line); lists from the command table. ← NEXT
 5. **Chrome** — status bar (line/col/enc/progress), filename in window title, draggable scrollbar
    (byte-proportional while indexing, line-proportional after; drag→byte→snap to next line start).
 
