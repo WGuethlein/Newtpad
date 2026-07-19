@@ -130,10 +130,11 @@ tracked.
    sehtest` (catches a real page fault; process survives). **Remaining sliver:** regex still
    materializes the whole buffer (`find.odin`) — the read is guarded now (won't crash) but can still
    stall; size-gate/background it before regex-on-huge-files is comfortable.
-2. **[P1] Correctness sweep — DONE.** Save-As ownership/leak, dead anchors, atlas out-of-bounds
-   guard, `CreateFileMapping` null-check, mid-index line-count all fixed. **Cleanliness remaining:**
-   extract the duplicated visible-line iterator (4 sites, magic `12`/`10`/`1.5`); move the 7 headless
-   test-modes out of `main.odin`; clip caret/selection to the drawn extent on long lines.
+2. **[P1] Correctness + cleanliness sweep — DONE.** Save-As leak, dead anchors, atlas guard,
+   `CreateFileMapping` null-check, mid-index line-count all fixed. Cleanliness landed: the four screen
+   passes now share one capped `Visible_Iter` + layout helpers (killing the `12`/`10`/`1.5` magic and
+   two more lingering uncapped-scan hazards in selection/find-match rects); the 8 headless test-modes
+   moved to `test_modes.odin`; caret/selection/matches clip to `VISIBLE_COLS`.
 3. **[feature] Complex-script shaping + fix the monospace caret** (`IDWriteTextAnalyzer`) — the
    real multilingual correctness, and it fixes caret/selection placement on mixed-width text.
 4. **[feature] Tabs + session restore** — gated on the Document-stability + per-document-arena
