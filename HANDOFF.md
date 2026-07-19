@@ -210,10 +210,11 @@ on the architecture. Two locked decisions were refined **with that DA as the new
    debounced ~2s autosave. **Deferred:** off-thread serialize (still main-thread `pt_collect` — hitch
    only on a very large dirty buffer), `had_bom` persistence, placeholder tab for a deleted file.
    Also **word wrap — DONE** (Alt+Z, per-doc, window-edge, live re-flow) landed alongside tabs.
-4. **Command palette + fuzzy finder** — one overlay; fzf-style scoring in a single-alloc matcher;
-   prefix modes (none=files/tabs, `>`=commands, `:`=go-to-line); lists from the command table. ← NEXT
+4. **Command palette + fuzzy finder — DONE.** `palette.odin`: Ctrl+P overlay, prefix modes
+   (none=tabs, `>`=commands, `:`=go-to-line), fzf-style scoring, `.Palette` input context, lists from
+   the command table. **Deferred:** matched-char highlighting; O(n) goto line walk.
 5. **Chrome** — status bar (line/col/enc/progress), filename in window title, draggable scrollbar
-   (byte-proportional while indexing, line-proportional after; drag→byte→snap to next line start).
+   (byte-proportional while indexing, line-proportional after; drag→byte→snap to next line start). ← LAST
 
 ## 7. Build environment (Windows, this machine)
 
