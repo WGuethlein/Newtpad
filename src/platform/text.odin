@@ -16,8 +16,13 @@ import "core:unicode/utf8"
 import d3d "vendor:directx/d3d11"
 import win "core:sys/windows"
 
-ATLAS_W :: 1024
-ATLAS_H :: 1024
+// Starting atlas size. It grows on demand up to ATLAS_MAX and, once there,
+// recycles — see atlas_relieve. A fixed 1024 was not enough: glyph area grows
+// with the square of the pixel size, so a CJK document (thousands of distinct
+// characters) overflows it at ordinary sizes, and each additional font style
+// multiplies the working set again.
+ATLAS_START :: 1024
+ATLAS_MAX :: 4096
 MAX_TEXT_INSTANCES :: 4096
 MAX_FACES :: 8
 
@@ -67,11 +72,19 @@ Text :: struct {
 	// atlas + cache
 	atlas:     ^d3d.ITexture2D,
 	atlas_srv: ^d3d.IShaderResourceView,
+	atlas_w:   i32, // current atlas dimensions (grows; see atlas_relieve)
+	atlas_h:   i32,
 	pack_x:    i32,
 	pack_y:    i32,
 	shelf_h:   i32,
 	cache:     map[Glyph_Key]Glyph,
-	atlas_full: bool, // a glyph was dropped for want of space (see glyph_get)
+	// A glyph was dropped for want of space even after growing and recycling —
+	// i.e. one screen of text genuinely does not fit. Surfaced to the user.
+	atlas_full: bool,
+	// Guards against recycling more than once per frame: if a single frame's
+	// glyphs cannot all fit, clearing again mid-frame would evict the glyphs
+	// drawn moments ago and thrash without ever making progress.
+	relieved_this_frame: bool,
 
 	// pipeline
 	vs:        ^d3d.IVertexShader,
@@ -182,22 +195,7 @@ text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
 	}
 
 	// --- atlas texture + SRV ---
-	tex_desc := d3d.TEXTURE2D_DESC {
-		Width      = ATLAS_W,
-		Height     = ATLAS_H,
-		MipLevels  = 1,
-		ArraySize  = 1,
-		Format     = .R8G8B8A8_UNORM,
-		SampleDesc = {Count = 1},
-		Usage      = .DEFAULT,
-		BindFlags  = {.SHADER_RESOURCE},
-	}
-	if hr := gfx.device->CreateTexture2D(&tex_desc, nil, &t.atlas); !win.SUCCEEDED(hr) {
-		fmt.eprintfln("CreateTexture2D(atlas) failed: 0x%X", u32(hr))
-		return
-	}
-	if hr := gfx.device->CreateShaderResourceView((^d3d.IResource)(t.atlas), nil, &t.atlas_srv); !win.SUCCEEDED(hr) {
-		fmt.eprintfln("CreateShaderResourceView(atlas) failed: 0x%X", u32(hr))
+	if !atlas_create(gfx, &t, ATLAS_START) {
 		return
 	}
 
@@ -488,6 +486,13 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, face: int, index: u16, px: f32) -> Glyph 
 	g.top = top
 	if cov != nil && gw > 0 && gh > 0 {
 		rx, ry, packed := atlas_pack(t, gw, gh)
+		if !packed {
+			// Out of room: grow or recycle, then try once more. Only if that
+			// fails too is the glyph genuinely undrawable.
+			if atlas_relieve(gfx, t) {
+				rx, ry, packed = atlas_pack(t, gw, gh)
+			}
+		}
 		if packed {
 			// expand 3-channel ClearType coverage to RGBA for the atlas.
 			rgba := make([]u8, int(gw * gh) * 4)
@@ -507,8 +512,8 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, face: int, index: u16, px: f32) -> Glyph 
 				back   = 1,
 			}
 			gfx.ctx->UpdateSubresource((^d3d.IResource)(t.atlas), 0, &box, raw_data(rgba), u32(gw * 4), 0)
-			g.uv_min = {f32(rx) / ATLAS_W, f32(ry) / ATLAS_H}
-			g.uv_max = {f32(rx + gw) / ATLAS_W, f32(ry + gh) / ATLAS_H}
+			g.uv_min = {f32(rx) / f32(t.atlas_w), f32(ry) / f32(t.atlas_h)}
+			g.uv_max = {f32(rx + gw) / f32(t.atlas_w), f32(ry + gh) / f32(t.atlas_h)}
 		} else {
 			// Atlas full. Nothing to draw for this glyph, but do NOT cache that:
 			// a cached miss makes the glyph invisible for the rest of the process
@@ -533,12 +538,104 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, face: int, index: u16, px: f32) -> Glyph 
 // True once a glyph has been dropped for want of atlas space.
 text_atlas_full :: proc(t: ^Text) -> bool {return t.atlas_full}
 
+// (Re)create the atlas texture at `dim` and reset the packer. Any existing
+// texture is released; the glyph cache holds UVs into it and must be cleared by
+// the caller.
+@(private = "file")
+atlas_create :: proc(gfx: ^Gfx, t: ^Text, dim: i32) -> bool {
+	tex_desc := d3d.TEXTURE2D_DESC {
+		Width      = u32(dim),
+		Height     = u32(dim),
+		MipLevels  = 1,
+		ArraySize  = 1,
+		Format     = .R8G8B8A8_UNORM,
+		SampleDesc = {Count = 1},
+		Usage      = .DEFAULT,
+		BindFlags  = {.SHADER_RESOURCE},
+	}
+	tex: ^d3d.ITexture2D
+	if hr := gfx.device->CreateTexture2D(&tex_desc, nil, &tex); !win.SUCCEEDED(hr) {
+		fmt.eprintfln("CreateTexture2D(atlas %d) failed: 0x%X", dim, u32(hr))
+		return false
+	}
+	srv: ^d3d.IShaderResourceView
+	if hr := gfx.device->CreateShaderResourceView((^d3d.IResource)(tex), nil, &srv); !win.SUCCEEDED(hr) {
+		fmt.eprintfln("CreateShaderResourceView(atlas) failed: 0x%X", u32(hr))
+		tex->Release()
+		return false
+	}
+	if t.atlas_srv != nil {t.atlas_srv->Release()}
+	if t.atlas != nil {t.atlas->Release()}
+	t.atlas, t.atlas_srv = tex, srv
+	t.atlas_w, t.atlas_h = dim, dim
+	t.pack_x, t.pack_y, t.shelf_h = 0, 0, 0
+	return true
+}
+
+// The atlas is out of room. Grow it if there is headroom, otherwise recycle it.
+//
+// The packer is a shelf allocator, which cannot free an individual rectangle —
+// so "eviction" here is wholesale. That is affordable because the viewport-first
+// rule bounds what has to come back to roughly one screen of glyphs, which
+// re-rasterizes in milliseconds. Growing first means the common case (a big
+// document, a large font) stops recurring rather than thrashing.
+//
+// Returns false only when even a fresh, maximum-size atlas cannot help, which
+// means one screen of text genuinely does not fit.
+@(private = "file")
+atlas_relieve :: proc(gfx: ^Gfx, t: ^Text) -> bool {
+	if t.atlas_w < ATLAS_MAX {
+		if atlas_create(gfx, t, min(t.atlas_w * 2, ATLAS_MAX)) {
+			clear(&t.cache)
+			return true
+		}
+		return false
+	}
+	// Already at the cap. Recycle, but only once per frame — clearing twice in
+	// one frame would evict glyphs this same frame just drew.
+	if t.relieved_this_frame {
+		return false
+	}
+	t.relieved_this_frame = true
+	clear(&t.cache)
+	t.pack_x, t.pack_y, t.shelf_h = 0, 0, 0
+	return true
+}
+
+// Called once per frame so the recycle guard above can reset.
+text_frame_begin :: proc(t: ^Text) {t.relieved_this_frame = false}
+
+text_atlas_dim :: proc(t: ^Text) -> i32 {return t.atlas_w}
+
+// How many `gw`x`gh` boxes the shelf packer fits in a `dim` square. Pure
+// arithmetic mirroring atlas_pack, so capacity can be checked without a GPU.
+text_atlas_fit_count :: proc(dim, gw, gh: i32) -> int {
+	if gw > dim || gh > dim {return 0}
+	PAD :: 1
+	x, y, shelf, n := i32(0), i32(0), i32(0), 0
+	for {
+		if x + gw + PAD > dim {
+			x = 0
+			y += shelf + PAD
+			shelf = 0
+		}
+		if y + gh > dim {return n}
+		x += gw + PAD
+		if gh > shelf {shelf = gh}
+		n += 1
+	}
+}
+
 // Empty the atlas. Every cached glyph holds UVs into it, so the cache goes too.
 // Used when the rasterization size changes wholesale (a DPI change): keeping
 // entries rasterized for the old size would both mis-render and permanently
 // consume the space the new size needs.
 text_reset_atlas :: proc(t: ^Text) {
 	clear(&t.cache)
+	// Cell widths depend on char_em and on which face serves a rune, so a font
+	// change invalidates them too — a stale entry desyncs the column grid from
+	// what text_draw actually advances.
+	clear(&t.cell_cache)
 	t.pack_x, t.pack_y, t.shelf_h = 0, 0, 0
 	t.atlas_full = false
 }
@@ -587,12 +684,15 @@ glyph_rasterize :: proc(t: ^Text, face: int, index: u16, px: f32) -> (cov: []u8,
 @(private)
 atlas_pack :: proc(t: ^Text, w, h: i32) -> (x, y: i32, ok: bool) {
 	PAD :: 1
-	if t.pack_x + w + PAD > ATLAS_W {
+	if w > t.atlas_w || h > t.atlas_h {
+		return 0, 0, false // single glyph larger than the whole atlas
+	}
+	if t.pack_x + w + PAD > t.atlas_w {
 		t.pack_x = 0
 		t.pack_y += t.shelf_h + PAD
 		t.shelf_h = 0
 	}
-	if t.pack_y + h > ATLAS_H {
+	if t.pack_y + h > t.atlas_h {
 		return 0, 0, false // atlas full
 	}
 	x = t.pack_x

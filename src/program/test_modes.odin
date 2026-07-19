@@ -153,6 +153,50 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad atlastest` — how much text actually fits in the glyph atlas at a
+	// given size. The atlas has no per-glyph eviction (a shelf packer cannot free
+	// one rectangle), so when it fills it grows and ultimately recycles; this
+	// pins the capacity that decision rests on. A CJK document needs thousands of
+	// distinct glyphs, which is what overflowed the old fixed 1024.
+	if os.args[1] == "atlastest" {
+		bad := 0
+		// Distinct glyphs is bounded by the character repertoire in use, not by
+		// cell count: a dense CJK page is ~3000 distinct characters, and Latin
+		// text across 4 font styles is ~400. Viewport-first means only visible
+		// glyphs are ever rasterized, so this is the working set to hold.
+		//
+		// The bar applies to normal sizes (<= 64px effective). Above that the
+		// atlas recycles instead, which is a designed fallback, not a failure —
+		// at 144px a screen holds a few hundred cells anyway.
+		HEAVY :: 3000 // dense CJK page, one style
+		for px in ([]i32{16, 24, 32, 48, 64, 96, 144}) {
+			// Consolas ink box: roughly 0.55*px wide by 1.05*px tall + AA bleed.
+			gw := i32(f32(px) * 0.55) + 4
+			gh := i32(f32(px) * 1.05) + 4
+			c1 := plat.text_atlas_fit_count(1024, gw, gh)
+			c3 := plat.text_atlas_fit_count(plat.ATLAS_MAX, gw, gh)
+			normal := px <= 64
+			ok := !normal || c3 >= HEAVY
+			if !ok {bad += 1}
+			note := "recycles (expected at this size)"
+			if c3 >= HEAVY {note = "holds a heavy page"}
+			fmt.printf("px %v  box %vx%v  1024 fits %v  4096 fits %v  ", px, gw, gh, c1, c3)
+			fmt.printfln("%s  %s", note, "OK" if ok else "FAIL")
+		}
+		// The old fixed 1024 could not hold a heavy page at any usable size —
+		// which is the bug this replaced, and the reason growth exists.
+		small := plat.text_atlas_fit_count(1024, 21, 37) // 32px
+		fmt.printfln("old fixed 1024 at 32px fits %v of %v needed -> growth required  %s", small, HEAVY, "OK" if small < HEAVY else "FAIL")
+		if small >= HEAVY {bad += 1}
+		// A glyph bigger than the atlas can never be packed; that must be
+		// reported rather than looping forever.
+		huge := plat.text_atlas_fit_count(1024, 2000, 2000)
+		fmt.printfln("glyph larger than atlas -> %d (want 0)  %s", huge, "OK" if huge == 0 else "FAIL")
+		if huge != 0 {bad += 1}
+		fmt.printfln("atlastest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad savefailtest <path>` — a save that fails must say WHY. Release
 	// builds are -subsystem:windows, so the old stderr report was invisible and a
 	// failed save was indistinguishable from a successful one.
