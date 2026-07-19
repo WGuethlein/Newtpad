@@ -789,6 +789,43 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !x_ok {bad += 1}
 		menu_close(&a)
 
+		// Drawn rows must equal hit-testable rows. Checking the hit-test against
+		// the model alone missed a real bug: when a dropdown fit exactly, the
+		// draw dropped its last row (measuring the bottom from the box origin
+		// instead of the items origin) while the hit-test kept it, so Edit > Font
+		// was an invisible but clickable strip.
+		fmt.println("--- drawn rows == hit-testable rows ---")
+		dh_bad := 0
+		for mi in 0 ..< len(menus) {
+			items := menus[mi].items
+			content := f32(0)
+			for it in items {content += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
+			// Heights either side of an exact fit, plus a deliberately tight one.
+			for extra in ([]f32{-1, 0, 1, 40}) {
+				HH := TAB_STRIP_H + MENU_BAR_H + sx(1) + content + sx(4) + extra
+				menu_open_at(&a, mi)
+				drawn := menu_visible_rows(&t, &a, 1280, HH)
+				dx2, dw2, hh := menu_dropdown_rect(&t, &a, 1280, HH)
+				// Last hit-testable index, probing every row's midpoint.
+				last_hit := -1
+				y := TAB_STRIP_H + MENU_BAR_H + sx(1)
+				for i := a.menu.top; i < len(items); i += 1 {
+					ih := MENU_ITEM_H if items[i].cmd != .None else MENU_ITEM_H * 0.4
+					if menu_item_at(&t, &a, dx2 + dw2 * 0.5, y + ih * 0.5, 1280, HH) >= 0 {last_hit = i}
+					y += ih
+				}
+				// The last hit-testable row must be within the drawn set.
+				ok := last_hit < a.menu.top + drawn
+				if !ok {
+					dh_bad += 1
+					fmt.printfln("  %-5s h=%.0f drawn=%d last_hit=%d  FAIL", menus[mi].title, hh, drawn, last_hit)
+				}
+			}
+			menu_close(&a)
+		}
+		fmt.printfln("  draw/hit agree at every height: %v %s", dh_bad == 0, "OK" if dh_bad == 0 else "FAIL")
+		bad += dh_bad
+
 		fmt.println("--- global chords survive menu mode ---")
 		for k in ([]plat.Key{.S, .P, .N, .Z}) {
 			got := resolve_key(k, true, false, .Menu)

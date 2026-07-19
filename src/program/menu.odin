@@ -407,17 +407,26 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	more_above := app.menu.top > 0
 	more_below := app.menu.top + app.menu.rows < len(items)
 
-	y := y0 + sx(1)
-	for i := app.menu.top; i < len(items); i += 1 {
+	// Items begin one pixel down, inside the border. The bottom bound must be
+	// measured from THAT origin, not from y0: measuring from y0 gave the items
+	// h-1 of room while the hit-test gave them h, so a dropdown that fit exactly
+	// lost its last row on screen while still being clickable — which is how
+	// Edit > Font became an invisible-but-live strip at the bottom of the menu.
+	// Draw exactly the rows rows_fitting says fit — the same count the hit-test
+	// uses. Deciding independently here (a bound measured from the box origin
+	// rather than the items origin) dropped the last row on screen while it
+	// stayed clickable, which is how Edit > Font became an invisible live strip.
+	items_y0 := y0 + sx(1)
+	y := items_y0
+	last := app.menu.top + app.menu.rows
+	for i := app.menu.top; i < min(last, len(items)); i += 1 {
 		it := items[i]
 		if it.cmd == .None { // separator
 			sh := MENU_ITEM_H * 0.4
-			if y + sh > y0 + h {break}
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + sx(8), y + sh * 0.5}, size = {dw - sx(16), sx(1)}, color = MENU_COL.border}})
 			y += sh
 			continue
 		}
-		if y + MENU_ITEM_H > y0 + h {break}
 		on := item_enabled(app, it)
 		if i == app.menu.item && on {
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y}, size = {dw, MENU_ITEM_H}, color = MENU_COL.hover}})
@@ -467,6 +476,15 @@ item_h :: proc(it: Menu_Item) -> f32 {return MENU_ITEM_H if it.cmd != .None else
 
 // Rows that fit in `h` starting at item `from`, and whether everything from
 // `from` onward fits. One walk, used by both the draw and the hit-test.
+// How many items the draw will emit. Exposed so a test can compare what is
+// drawn against what is hit-testable — the pair disagreeing is the bug class
+// this codebase keeps producing.
+menu_visible_rows :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> int {
+	if app.menu.open < 0 {return 0}
+	_, _, h := menu_dropdown_rect(t, app, width, height)
+	return rows_fitting(menus[app.menu.open].items, app.menu.top, h)
+}
+
 @(private = "file")
 rows_fitting :: proc(items: []Menu_Item, from: int, h: f32) -> (count: int) {
 	used := f32(0)
@@ -510,11 +528,11 @@ menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> in
 	if my < y0 || my >= y0 + h {return -1} // below a clipped dropdown is not a row
 	items := menus[app.menu.open].items
 	y := y0
-	// Starts at the scroll offset, not at 0 — the row drawn k places down is
-	// item top+k.
-	for i := app.menu.top; i < len(items); i += 1 {
+	// Starts at the scroll offset and stops at the same count the draw used, so
+	// a row is clickable exactly when it is visible.
+	last := app.menu.top + rows_fitting(items, app.menu.top, h)
+	for i := app.menu.top; i < min(last, len(items)); i += 1 {
 		ih := item_h(items[i])
-		if y + ih > y0 + h {break} // not drawn, so not selectable
 		if my >= y && my < y + ih {
 			return i if items[i].cmd != .None else -1
 		}
