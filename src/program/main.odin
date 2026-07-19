@@ -335,6 +335,20 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		palette_draw(gfx, quad_pipe, text, rc.app, w, h)
 	}
 
+	// Filter view replaces the document with just the matching lines, which is
+	// disorienting if you don't know why. Say so, unmistakably, and say how to
+	// leave — the previous signal was the word "filter" inside the find line.
+	if doc.filter && doc.find.active {
+		bh := sx(20)
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, CONTENT_TOP - bh}, size = {w, bh}, color = {0.18, 0.26, 0.20, 1}}})
+		msg := fmt.tprintf(
+			"FILTER  %d matching lines%s   —   Ctrl+L shows the whole file",
+			len(doc.filter_lines),
+			"" if doc_filtering(doc) else " (searching...)",
+		)
+		plat.text_draw(gfx, text, msg, sx(12), CONTENT_TOP - sx(6), UI_SMALL_PX, {0.70, 0.90, 0.74, 1})
+	}
+
 	if doc.find.active {
 		f := &doc.find
 		bar_h := sx(48) if f.replace_mode else sx(26)
@@ -356,8 +370,10 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			plat.text_draw(gfx, text, fline, sx(12), h - sx(30), UI_PX, {0.95, 0.88, 0.55, 1})
 			rline := fmt.tprintf("Replace: %s%s", string(f.replace[:]), " _" if f.field == 1 else "")
 			plat.text_draw(gfx, text, rline, sx(12), h - sx(8), UI_PX, {0.82, 0.9, 0.98, 1})
+			hint_find(gfx, text, f, doc, w, h - sx(30))
 		} else {
 			plat.text_draw(gfx, text, fline, sx(12), h - sx(8), UI_PX, {0.95, 0.88, 0.55, 1})
+			hint_find(gfx, text, f, doc, w, h - sx(8))
 		}
 	} else {
 		ln := doc_cursor_line(doc)
@@ -370,6 +386,31 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	}
 
 	plat.gfx_end_frame(gfx, 1 if vsync else 0)
+}
+
+// The find bar's own toggles, right-aligned, active ones lit. These commands
+// exist only inside find mode, so without this the only way to learn Ctrl+R and
+// Ctrl+L was to be told they were there.
+@(private = "file")
+hint_find :: proc(gfx: ^plat.Gfx, text: ^plat.Text, f: ^Find, doc: ^Document, w, y: f32) {
+	on := [4]f32{0.95, 0.88, 0.55, 1}
+	off := [4]f32{0.45, 0.49, 0.57, 1}
+	cw := plat.text_char_width(text, UI_SMALL_PX)
+	hints := [3]struct {
+		label: string,
+		lit:   bool,
+	} {
+		{"Ctrl+R regex", f.regex},
+		{"Ctrl+L filter", doc.filter},
+		{"Tab field", f.replace_mode},
+	}
+	total := 0
+	for h in hints {total += len(h.label) + 3}
+	x := w - sx(12) - f32(total) * cw
+	for h in hints {
+		plat.text_draw(gfx, text, h.label, x, y, UI_SMALL_PX, on if h.lit else off)
+		x += f32(len(h.label) + 3) * cw
+	}
 }
 
 // Scale a 96-DPI design value to this window's DPI. Never returns 0 for a

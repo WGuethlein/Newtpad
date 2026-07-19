@@ -15,6 +15,18 @@ Palette_Mode :: enum {
 	Tabs,
 	Commands,
 	Goto,
+	Help,
+}
+
+// `?` lists the prefixes. One reserved character is the cheapest way for a modal
+// to teach its own grammar — otherwise the only way to discover `>` and `:` is
+// to already know them.
+@(private = "file")
+PALETTE_HELP := []string {
+	"(type)   switch between open tabs",
+	">        run a command  (shows its shortcut)",
+	":        go to a line number",
+	"?        this list",
 }
 
 Palette_Result :: struct {
@@ -67,16 +79,22 @@ is_sep_ascii :: proc(b: u8) -> bool {
 }
 
 // Commands that make sense to run from the palette (not movement/typing/internal).
-@(private = "file")
 command_in_palette :: proc(cmd: Command_Id) -> bool {
+	// Movement, typing and pure plumbing are noise in a command list. The find
+	// *toggles* are deliberately NOT excluded any more: hiding them meant regex
+	// and filter-view appeared in no menu, no palette and no hint anywhere, so
+	// the only way to learn Ctrl+L existed was to be told.
 	#partial switch cmd {
 	case .None,
 	     .Cursor_Left, .Cursor_Right, .Cursor_Up, .Cursor_Down, .Cursor_Home, .Cursor_End,
 	     .Word_Left, .Word_Right, .Page_Up, .Page_Down, .Backspace, .Delete_Fwd, .Delete_Word_Back,
-	     .Insert_Newline, .Clear_Selection,
+	     .Insert_Newline, .Insert_Tab, .Clear_Selection,
 	     .Palette_Open, .Palette_Close, .Palette_Confirm, .Palette_Next, .Palette_Prev, .Palette_Backspace,
-	     .Find_Close, .Find_Backspace, .Find_Confirm, .Find_Field_Toggle, .Find_Toggle_Regex,
-	     .Find_Toggle_Filter, .Find_Toggle_Replace_Mode, .Find_Filter_Page_Up, .Find_Filter_Page_Down:
+	     .Find_Close, .Find_Backspace, .Find_Confirm, .Find_Field_Toggle,
+	     .Find_Filter_Page_Up, .Find_Filter_Page_Down,
+	     // Filter_Open supersedes it here: same key, but it opens find first
+	     // instead of silently toggling a mode with no visible UI.
+	     .Find_Toggle_Filter:
 		return false
 	}
 	return true
@@ -131,6 +149,9 @@ palette_recompute :: proc(app: ^App) {
 	} else if len(q) > 0 && q[0] == ':' {
 		p.mode = .Goto
 		pat = q[1:]
+	} else if len(q) > 0 && q[0] == '?' {
+		p.mode = .Help
+		pat = q[1:]
 	}
 
 	switch p.mode {
@@ -152,6 +173,8 @@ palette_recompute :: proc(app: ^App) {
 		slice.sort_by(p.results[:], by_score)
 	case .Goto:
 	// no list; Enter parses the number
+	case .Help:
+	// static text; nothing to match
 	}
 }
 
@@ -174,13 +197,19 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 	qs := string(p.query[:])
 	qcol := [4]f32{0.92, 0.94, 0.98, 1}
 	if len(qs) == 0 {
-		qs = "Search tabs    ( >  command    :  go to line )"
+		qs = "Search tabs    ( >  command    :  go to line    ?  help )"
 		qcol = {0.45, 0.49, 0.57, 1}
 	}
 	plat.text_draw(gfx, text, qs, x0 + sx(12), y0 + sx(22), UI_PX, qcol)
 
 	if p.mode == .Goto {
 		plat.text_draw(gfx, text, "type a line number, then Enter", x0 + sx(16), y0 + qh + sx(17), UI_PX, {0.6, 0.64, 0.72, 1})
+		return
+	}
+	if p.mode == .Help {
+		for h, i in PALETTE_HELP {
+			plat.text_draw(gfx, text, h, x0 + sx(16), y0 + qh + f32(i) * rowh + sx(17), UI_PX, {0.72, 0.78, 0.88, 1})
+		}
 		return
 	}
 
@@ -195,6 +224,12 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 			plat.text_draw(gfx, text, command_table[r.cmd].title, x0 + sx(16), ry + sx(17), UI_PX, fg)
 			cat := command_table[r.cmd].category
 			plat.text_draw(gfx, text, cat, x0 + PW - sx(130), ry + sx(17), UI_SMALL_PX, {0.5, 0.54, 0.62, 1})
+			// The shortcut, right-aligned. The palette is the one place a user can
+			// learn the keymap, and it was showing title + category only.
+			if chord := command_chord(r.cmd); chord != "" {
+				cw := plat.text_char_width(text, UI_SMALL_PX)
+				plat.text_draw(gfx, text, chord, x0 + PW - sx(16) - f32(len(chord)) * cw, ry + sx(17), UI_SMALL_PX, {0.62, 0.68, 0.80, 1})
+			}
 		} else if r.slot >= 0 && r.slot < len(app.docs) && app.docs[r.slot] != nil {
 			plat.text_draw(gfx, text, doc_display_name(app.docs[r.slot]), x0 + sx(16), ry + sx(17), UI_PX, fg)
 		}
@@ -223,6 +258,8 @@ palette_execute :: proc(app: ^App, w: ^plat.Window, t: ^plat.Text, rows: int) {
 		if n, ok := strconv.parse_int(string(p.query[1:])); ok && n > 0 {
 			if d := app_active(app); d != nil {doc_goto_line(d, n)}
 		}
+	case .Help:
+	// Enter just dismisses the help list.
 	}
 	palette_close(app)
 }

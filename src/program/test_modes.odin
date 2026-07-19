@@ -472,7 +472,14 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// Reported as dead in the GUI (2026-07-19); pin what the keymap resolves.
 		key_chk(resolve_key(.A, true, false, .Editor), .Select_All, "Ctrl+A / Editor")
 		key_chk(resolve_key(.P, true, false, .Editor), .Palette_Open, "Ctrl+P / Editor")
-		key_chk(resolve_key(.L, true, false, .Editor), .Find_Toggle_Filter, "Ctrl+L / Editor")
+		key_chk(resolve_key(.L, true, false, .Editor), .Filter_Open, "Ctrl+L / Editor")
+		// Reported missing by the 2026-07-19 audit as first-hour daily-driver gaps.
+		key_chk(resolve_key(.Tab, false, false, .Editor), .Insert_Tab, "Tab / Editor")
+		key_chk(resolve_key(.Home, true, false, .Editor), .Doc_Start, "Ctrl+Home / Editor")
+		key_chk(resolve_key(.End, true, false, .Editor), .Doc_End, "Ctrl+End / Editor")
+		key_chk(resolve_key(.G, true, false, .Editor), .Goto_Line, "Ctrl+G / Editor")
+		key_chk(resolve_key(.Tab, true, false, .Editor), .Tab_Next, "Ctrl+Tab still switches")
+		key_chk(resolve_key(.Home, false, false, .Editor), .Cursor_Home, "Home still line-start")
 		key_chk(resolve_key(.L, true, false, .Find), .Find_Toggle_Filter, "Ctrl+L / Find")
 		// The real defect: Find context has no fallback to the Editor bindings, so
 		// every editor chord is dead while the find bar is open.
@@ -505,6 +512,18 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		for i in 0 ..< 30 {palette_move(&app, 1)}
 		fmt.printfln("palette Down x30  -> selected=%d of %d (drawn rows=12)", app.palette.selected, len(app.palette.results))
 		palette_close(&app)
+		// Every palette-visible command should teach its shortcut, and the ones
+		// that only exist inside find mode must be listed at all.
+		shown, with_chord := 0, 0
+		for cmd in Command_Id {
+			if !command_in_palette(cmd) {continue}
+			shown += 1
+			if command_chord(cmd) != "" {with_chord += 1}
+		}
+		fmt.printfln("palette lists %d commands, %d show a shortcut", shown, with_chord)
+		for c in ([]Command_Id{.Find_Toggle_Filter, .Find_Toggle_Regex, .Filter_Open, .Goto_Line, .Save_As}) {
+			fmt.printfln("  %-24v in palette=%-5v chord=%q", c, command_in_palette(c), command_chord(c))
+		}
 		// dispatch effects (dummy window/text; these commands don't touch them)
 		app_active(&app).cursor = 0
 		command_dispatch(resolve_key(.Right, false, false, .Editor), {.Right, false, false, false}, &app, &dummy, &dtext, 10)

@@ -737,6 +737,10 @@ doc_goto_line :: proc(doc: ^Document, n: int) {
 
 doc_cursor_home :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_line_start(&doc.pt, doc.cursor), select)}
 doc_cursor_end :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_line_end(&doc.pt, doc.cursor), select)}
+// Ctrl+Home / Ctrl+End. Without these there is no keyboard way to reach the end
+// of a large file at all.
+doc_start :: proc(doc: ^Document, select: bool) {set_cursor(doc, 0, select)}
+doc_end :: proc(doc: ^Document, select: bool) {set_cursor(doc, doc.pt.length, select)}
 
 doc_cursor_up :: proc(doc: ^Document, t: ^plat.Text, select: bool) {
 	if doc.wrap {

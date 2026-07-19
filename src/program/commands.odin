@@ -7,6 +7,7 @@
 package main
 
 import "core:fmt"
+import "core:strings"
 import base "src:base"
 import plat "src:platform"
 
@@ -27,6 +28,8 @@ Command_Id :: enum u8 {
 	Cursor_Down,
 	Cursor_Home,
 	Cursor_End,
+	Doc_Start,
+	Doc_End,
 	Word_Left,
 	Word_Right,
 	Page_Up,
@@ -35,6 +38,7 @@ Command_Id :: enum u8 {
 	Delete_Fwd,
 	Delete_Word_Back,
 	Insert_Newline,
+	Insert_Tab,
 	Undo,
 	Redo,
 	Select_All,
@@ -42,8 +46,11 @@ Command_Id :: enum u8 {
 	Cut,
 	Paste,
 	Save,
+	Save_As,
 	Find_Open,
 	Replace_Open,
+	Filter_Open,
+	Goto_Line,
 	Clear_Selection,
 	Toggle_Wrap,
 	// command palette
@@ -88,6 +95,8 @@ command_table := [Command_Id]Command {
 	.Cursor_Down              = {"Move Down", "Cursor"},
 	.Cursor_Home              = {"Move to Line Start", "Cursor"},
 	.Cursor_End               = {"Move to Line End", "Cursor"},
+	.Doc_Start                = {"Go to Start of File", "Cursor"},
+	.Doc_End                  = {"Go to End of File", "Cursor"},
 	.Word_Left                = {"Move Word Left", "Cursor"},
 	.Word_Right               = {"Move Word Right", "Cursor"},
 	.Page_Up                  = {"Page Up", "Cursor"},
@@ -96,6 +105,7 @@ command_table := [Command_Id]Command {
 	.Delete_Fwd               = {"Delete Forward", "Edit"},
 	.Delete_Word_Back         = {"Delete Word Backward", "Edit"},
 	.Insert_Newline           = {"Insert Newline", "Edit"},
+	.Insert_Tab               = {"Insert Tab", "Edit"},
 	.Undo                     = {"Undo", "Edit"},
 	.Redo                     = {"Redo", "Edit"},
 	.Select_All               = {"Select All", "Edit"},
@@ -103,8 +113,11 @@ command_table := [Command_Id]Command {
 	.Cut                      = {"Cut", "Edit"},
 	.Paste                    = {"Paste", "Edit"},
 	.Save                     = {"Save", "File"},
+	.Save_As                  = {"Save As...", "File"},
 	.Find_Open                = {"Find", "Search"},
 	.Replace_Open             = {"Replace", "Search"},
+	.Filter_Open              = {"Filter to Matching Lines", "Search"},
+	.Goto_Line                = {"Go to Line...", "Cursor"},
 	.Clear_Selection          = {"Clear Selection", "Cursor"},
 	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
 	.Palette_Open             = {"Command Palette", "View"},
@@ -157,6 +170,9 @@ default_bindings := []Binding {
 	{.Backspace, true, false, .Editor, .Delete_Word_Back},
 	{.Delete, false, false, .Editor, .Delete_Fwd},
 	{.Enter, false, false, .Editor, .Insert_Newline},
+	{.Tab, false, false, .Editor, .Insert_Tab},
+	{.Home, true, false, .Editor, .Doc_Start}, // Ctrl+Home
+	{.End, true, false, .Editor, .Doc_End}, // Ctrl+End
 	{.Z, true, false, .Editor, .Undo},
 	{.Y, true, false, .Editor, .Redo},
 	{.A, true, false, .Editor, .Select_All},
@@ -166,6 +182,9 @@ default_bindings := []Binding {
 	{.S, true, false, .Editor, .Save},
 	{.F, true, false, .Editor, .Find_Open},
 	{.H, true, false, .Editor, .Replace_Open},
+	{.L, true, false, .Editor, .Filter_Open}, // Ctrl+L opens find with the filter armed
+	{.G, true, false, .Editor, .Goto_Line}, // Ctrl+G
+	{.S, true, true, .Editor, .Save_As}, // Ctrl+Alt+S (Ctrl+Shift+S can't be expressed: shift isn't part of a chord)
 	{.Escape, false, false, .Editor, .Clear_Selection},
 	{.Z, false, true, .Editor, .Toggle_Wrap}, // Alt+Z
 	{.P, true, false, .Editor, .Palette_Open}, // Ctrl+P
@@ -194,6 +213,76 @@ default_bindings := []Binding {
 	{.Page_Up, false, false, .Find, .Find_Filter_Page_Up},
 	{.Page_Down, false, false, .Find, .Find_Filter_Page_Down},
 }
+
+// Human-readable chord for a command, e.g. "Ctrl+S", or "" if unbound. The first
+// Editor-context binding wins, since that is the one a user would press from the
+// document. Used by the palette and the menu — the keymap is the only place that
+// knows the shortcuts, so anything that teaches them has to read it from here
+// rather than repeat them in a second table that can drift.
+command_chord :: proc(cmd: Command_Id, allocator := context.temp_allocator) -> string {
+	// Editor bindings first — that's the chord a user would press from the
+	// document. Falling back to any context so mode-local commands (the find
+	// toggles) still teach their key instead of showing blank.
+	for pass in 0 ..< 2 {
+		for b in default_bindings {
+			if b.cmd != cmd {continue}
+			if pass == 0 && b.ctx != .Editor {continue}
+			parts: [4]string
+			n := 0
+			if b.ctrl {parts[n] = "Ctrl+";n += 1}
+			if b.alt {parts[n] = "Alt+";n += 1}
+			parts[n] = key_name(b.key)
+			n += 1
+			return strings.concatenate(parts[:n], allocator)
+		}
+	}
+	return ""
+}
+
+@(private = "file")
+key_name :: proc(k: plat.Key) -> string {
+	#partial switch k {
+	case .Left:
+		return "Left"
+	case .Right:
+		return "Right"
+	case .Up:
+		return "Up"
+	case .Down:
+		return "Down"
+	case .Home:
+		return "Home"
+	case .End:
+		return "End"
+	case .Page_Up:
+		return "PgUp"
+	case .Page_Down:
+		return "PgDn"
+	case .Backspace:
+		return "Backspace"
+	case .Delete:
+		return "Del"
+	case .Enter:
+		return "Enter"
+	case .Tab:
+		return "Tab"
+	case .Escape:
+		return "Esc"
+	}
+	// Letters and digits are contiguous in the enum, in order.
+	if k >= .A && k <= .Z {
+		return LETTERS[int(k) - int(plat.Key.A)][:]
+	}
+	if k >= .Num0 && k <= .Num9 {
+		return DIGITS[int(k) - int(plat.Key.Num0)][:]
+	}
+	return ""
+}
+
+@(private = "file")
+LETTERS := [26]string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"}
+@(private = "file")
+DIGITS := [10]string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
 
 // Close a tab, prompting to save first if it has unsaved changes. Save-dialog
 // cancel or a failed save aborts the close (keeps the tab).
@@ -288,6 +377,14 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		doc_delete_word_back(doc)
 	case .Insert_Newline:
 		doc_insert_rune(doc, '\n')
+	case .Insert_Tab:
+		// Tab arrives as WM_CHAR 0x09 too, but the char path filters control
+		// characters, so the binding is what actually inserts it.
+		doc_insert_rune(doc, '\t')
+	case .Doc_Start:
+		doc_start(doc, ev.shift)
+	case .Doc_End:
+		doc_end(doc, ev.shift)
 	case .Undo:
 		doc_undo(doc)
 	case .Redo:
@@ -321,10 +418,31 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				fmt.eprintfln("Newtpad: failed to save %s", p)
 			}
 		}
+	case .Save_As:
+		if p, ok := plat.file_save_dialog(w.hwnd); ok {
+			if doc_save(doc, p) {
+				fmt.printfln("Newtpad: saved %s", p)
+			} else {
+				fmt.eprintfln("Newtpad: failed to save %s", p)
+			}
+		}
 	case .Find_Open:
 		find_open(doc, false)
 	case .Replace_Open:
 		find_open(doc, true)
+	case .Filter_Open:
+		// Arm the filter and open find. With no query yet there is nothing to
+		// filter, so the view stays whole until matches arrive — which is what
+		// makes this filter-as-you-type rather than a blank screen.
+		find_open(doc, false)
+		doc.filter = true
+		doc.filter_top = 0
+	case .Goto_Line:
+		// Go-to-line lives in the palette as its ':' mode. Routing it through a
+		// real command makes it findable by name and bindable; the palette closes
+		// and reopens itself in that mode.
+		palette_open(app)
+		palette_input_rune(app, ':')
 	case .Clear_Selection:
 		doc.anchor = doc.cursor
 	case .Toggle_Wrap:
@@ -375,12 +493,18 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Find_Field_Toggle:
 		if doc.find.replace_mode {find_toggle_field(doc)}
 	case .Find_Toggle_Regex:
+		// Reachable from the palette with find closed, where it would otherwise
+		// flip an invisible mode and start a search worker for a UI that isn't on
+		// screen. Open find so the state it changes is visible.
+		if !doc.find.active {find_open(doc, false)}
 		find_toggle_regex(doc)
 	case .Find_Toggle_Filter:
-		if len(doc.find.matches) > 0 {
-			doc.filter = !doc.filter
-			doc.filter_top = 0
-		}
+		// Deliberately not gated on having matches. The search runs on a worker,
+		// so on a large file there are none for the first frames — gating here
+		// made Ctrl+L do nothing at exactly the moment it was most wanted. The
+		// view falls back to unfiltered until matches exist (doc_filtering).
+		doc.filter = !doc.filter
+		doc.filter_top = 0
 	case .Find_Toggle_Replace_Mode:
 		doc.find.replace_mode = !doc.find.replace_mode
 	case .Find_Filter_Page_Up:
