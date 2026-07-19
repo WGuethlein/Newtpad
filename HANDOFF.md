@@ -142,16 +142,56 @@ tracked.
    cells and the editor's caret/selection/hit-test map offset↔cell through the same primitive, so they
    agree with the glyphs. Verified by `celltest` + a CJK/kana screenshot. **Deferred:** ligatures,
    proportional fonts, RTL/bidi, tab stops, Indic spacing/nonspacing marks.
-4. **[feature] Tabs + session restore** — gated on the Document-stability + per-document-arena
-   decision (P2 above). This is the point to introduce arenas.
-5. **[feature] UI chrome** — command palette (Sublime-style, universal access), status bar,
-   filename in title, draggable scrollbar; introduce the command/keybind data file + codegen here.
+4. **[feature] Tabs + session restore** — see the sequenced plan in §Decisions (2026-07-18).
+   Documents become heap-boxed (stable addresses), NOT arena-owned; full session restore incl.
+   crash-safe unsaved buffers.
+5. **[feature] UI chrome** — command palette (Sublime-style), status bar, filename in title,
+   draggable scrollbar; commands become a runtime enumerated table (no codegen). See §Decisions.
 6. **[polish] Atlas eviction, reindex-on-edit, precompiled shaders, per-frame alloc cleanup,
    renderer/ui extraction** — before/as-part-of the V1 UI rewrite.
 
 Beyond V1 core (from the validated feature list, PROJECT-RULES/§4-of-old): column/block edit,
 go-to-line, word wrap, zoom, themes, Explorer "Open with" + drag-drop + `file.txt:123`; then the
 V2 plugin API + first-party proofs.
+
+## 6b. Decisions — Tabs + UI chrome (2026-07-18)
+
+Preceded by a precedent-scout sweep (4coder/File Pilot/Sublime/VS Code/Notepad++ multi-doc memory,
+session restore, command palette, command codegen, huge-file scrollbar) and a devil's-advocate pass
+on the architecture. Two locked decisions were refined **with that DA as the new evidence**:
+
+- **Per-document arena → deferred.** A bump arena can't own a Document: `pt.add` grows for the life
+  of the doc (geometric realloc series abandoned into the arena = leak) and undo/redo snapshots are
+  freed individually mid-session (an arena frees only wholesale). Tabs actually need **stable
+  Document addresses** — heap-box Documents (slot array of `^Document`); keep the audited `doc_close`
+  frees. Arena is used only for the immutable original-bytes copy. PROJECT-RULES Memory row updated.
+- **Command codegen → runtime enumerated table.** `[Command_Id]Command` enumerated array (compiler
+  forces a row per variant) + `#assert` discharges "declare once, register once" and collapses the
+  two switches (VK→cmd in platform, cmd→action in program) without a second build-time toolchain
+  step. PROJECT-RULES rule updated. Rebindable keys = a runtime user-keymap overlay, not codegen.
+- **Generational handles → deferred** (plain slot array): V1's single cancel-join-on-close index
+  worker has no cross-frame stale-resolve bug; add handles when a job re-resolves a handle across a
+  frame boundary (deferred-merge reindex, background-save-then-notify).
+- **Indexer threads → capped pool (2–4) landing WITH tabs**, and restore indexes lazily (on first
+  view), so reopening N tabs doesn't spawn N workers all faulting mmap pages at once.
+- **Session restore = full & crash-safe:** tiny `%APPDATA%\Newtpad\session.json` (paths + cursor +
+  scroll + encoding + mtime/size + active tab); one backup file per dirty/untitled buffer in
+  `backups\` with an embedded first-line header, written via atomic temp+rename, snapshotted on the
+  main thread (`pt_snapshot`) and serialized **off-thread** (no periodic `pt_collect` hitch);
+  startup sweeps orphan `*.tmp`; clean tabs reopen lazily; missing→placeholder; changed→trust disk
+  for clean, keep backup+flag for dirty; huge/network→defer mmap. Cleanly disable-able.
+
+**Build sequence** (revised per DA; commit incrementally):
+1. **Command table** — collapse the two input switches into `[Command_Id]Command`; keybind lookup +
+   dispatch read it. Foundation for tab commands and the palette; no new user feature.
+2. **Multi-document core + tab strip** — slot array of `^Document`, active doc, tab strip (switch/
+   close/new, MRU Ctrl+Tab, overflow shrink-then-scroll), tab commands into the table, indexer cap.
+3. **Session restore (full)** — session.json + per-buffer backups + off-thread serialize + restore
+   reconciliation + `*.tmp` sweep.
+4. **Command palette + fuzzy finder** — one overlay; fzf-style scoring in a single-alloc matcher;
+   prefix modes (none=files/tabs, `>`=commands, `:`=go-to-line); lists from the command table.
+5. **Chrome** — status bar (line/col/enc/progress), filename in window title, draggable scrollbar
+   (byte-proportional while indexing, line-proportional after; drag→byte→snap to next line start).
 
 ## 7. Build environment (Windows, this machine)
 
