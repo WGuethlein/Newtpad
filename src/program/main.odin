@@ -59,6 +59,7 @@ main :: proc() {
 	// single-instance hand-off already appends a tab rather than replacing the
 	// session, so this also makes both launch paths behave the same.
 	app: App
+	menu_init(&app.menu) // before any frame: the zero value means "File is open"
 	had_session := primary && session_exists()
 	restored := primary && session_restore(&app)
 	// A session we couldn't load still owns its backups; don't sweep them.

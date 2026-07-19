@@ -166,6 +166,18 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		defer app_destroy(&a)
 
 		bad := 0
+		// The zero value of Menu_State means "File dropdown open", so a missed
+		// menu_init shows the app with a menu hanging down on launch.
+		{
+			raw: App
+			closed_after_init: App
+			menu_init(&closed_after_init.menu)
+			zero_open := raw.menu.open >= 0
+			init_closed := !menu_is_active(&closed_after_init)
+			fmt.printfln("--- startup ---")
+			fmt.printfln("  zero value would open menu %d (that's why init exists), after menu_init closed=%v %s", raw.menu.open, init_closed, "OK" if zero_open && init_closed else "FAIL")
+			if !(zero_open && init_closed) {bad += 1}
+		}
 		fmt.println("--- model ---")
 		seen: map[rune]bool;defer delete(seen)
 		for m in menus {

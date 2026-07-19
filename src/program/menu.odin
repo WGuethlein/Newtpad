@@ -134,7 +134,14 @@ Menu_State :: struct {
 	item: int, // highlighted item within the open dropdown
 }
 
-menu_init :: proc(m: ^Menu_State) {m.open = -1}
+// Must be called before the first frame: the zero value of `open` is 0, which
+// means "the File dropdown is open", so an uninitialised Menu_State starts the
+// app with a menu hanging down.
+menu_init :: proc(m: ^Menu_State) {
+	m.open = -1
+	m.item = -1
+	m.mode = false
+}
 
 menu_close :: proc(app: ^App) {
 	app.menu.mode = false
@@ -178,7 +185,7 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 		} else {
 			menu_close(app) // empty bar area: swallow, don't move the caret
 		}
-		win.mouse_pressed = false
+		consume_click(win)
 		return .None, true
 	}
 
@@ -191,10 +198,21 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 		// Any click while a dropdown is open is consumed, as native menus do —
 		// clicking away closes it rather than also moving the caret.
 		menu_close(app)
-		win.mouse_pressed = false
+		consume_click(win)
 		return picked, true
 	}
 	return .None, false
+}
+
+// Take the click entirely. Clearing mouse_down matters as much as mouse_pressed:
+// the caret's drag-to-extend branch runs off mouse_down alone, so leaving it set
+// meant clicking a menu also dragged a selection through the document behind it,
+// and kept highlighting for as long as the button stayed down.
+@(private = "file")
+consume_click :: proc(win: ^plat.Window) {
+	win.mouse_pressed = false
+	win.mouse_middle_pressed = false
+	win.mouse_down = false
 }
 
 item_enabled :: proc(app: ^App, it: Menu_Item) -> bool {
