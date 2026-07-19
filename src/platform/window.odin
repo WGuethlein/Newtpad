@@ -154,6 +154,10 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 	return w
 }
 
+window_set_title :: proc(w: ^Window, title: string) {
+	win.SetWindowTextW(w.hwnd, win.utf8_to_wstring(title, context.temp_allocator))
+}
+
 // Drain the message queue once. Called at the top of each frame.
 window_pump_events :: proc(w: ^Window) {
 	msg: win.MSG

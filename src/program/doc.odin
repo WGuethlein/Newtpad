@@ -203,6 +203,8 @@ Document :: struct {
 	anchor:     int, // other end of the selection (== cursor when none)
 	wrap:       bool, // word-wrap this document at view_cols
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
+	status_cursor: int, // cursor pos the cached status line was computed for
+	status_line:   int, // 1-based line of the cursor (0 = beyond the cap / unknown)
 	modified:   bool,
 	recovered:  bool, // a mapped read faulted; buffer is now a private copy, not the file
 	nl_delta:   int,
@@ -609,6 +611,44 @@ doc_cursor_right :: proc(doc: ^Document, select: bool) {
 		return
 	}
 	set_cursor(doc, next_rune(doc, doc.cursor), select)
+}
+
+enc_name :: proc(e: base.Encoding) -> string {
+	switch e {
+	case .UTF8:
+		return "UTF-8"
+	case .UTF16LE:
+		return "UTF-16 LE"
+	case .UTF16BE:
+		return "UTF-16 BE"
+	}
+	return "?"
+}
+
+// 1-based line number of the caret, or 0 if it's beyond the scan cap (so the
+// status bar never spends an unbounded scan on a huge file). Cached per cursor
+// position, so it costs nothing when the caret isn't moving.
+STATUS_LINE_CAP :: 4 * 1024 * 1024
+doc_cursor_line :: proc(doc: ^Document) -> int {
+	// Recompute on a cursor move, or on the first call (both fields start at 0).
+	if doc.cursor != doc.status_cursor || (doc.status_line == 0 && doc.cursor <= STATUS_LINE_CAP) {
+		doc.status_cursor = doc.cursor
+		doc.status_line = 1 + count_newlines(doc, 0, doc.cursor) if doc.cursor <= STATUS_LINE_CAP else 0
+	}
+	return doc.status_line
+}
+
+// 1-based cell column of the caret within its line.
+doc_cursor_col :: proc(doc: ^Document, t: ^plat.Text) -> int {
+	ls := base.pt_line_start(&doc.pt, doc.cursor)
+	return line_cell_col(doc, t, ls, doc.cursor) + 1
+}
+
+// Scroll so the top of the view is the line start at fraction `frac` of the
+// buffer (byte-proportional; used by the draggable scrollbar).
+doc_scroll_to_fraction :: proc(doc: ^Document, frac: f32) {
+	target := int(clamp(frac, 0, 1) * f32(doc.pt.length))
+	doc.top = base.pt_line_start(&doc.pt, target)
 }
 
 // Move the caret to the start of 1-based line `n` (O(n) line walk from the top).

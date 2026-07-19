@@ -67,6 +67,7 @@ main :: proc() {
 	// Debounced session autosave: save ~2s after input settles (crash safety).
 	session_dirty := false
 	last_input := time.tick_now()
+	scrollbar_drag := false
 
 	for !window.should_close {
 		plat.window_pump_events(window)
@@ -130,6 +131,21 @@ main :: proc() {
 		// The tab strip claims clicks in its region before the caret sees them.
 		tabs_hit_test(&app, window)
 
+		// Scrollbar: a press in the right-edge gutter starts a drag that maps the
+		// pointer's y to a byte-proportional scroll position (consumes the click).
+		if window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - 16 && window.mouse_y >= i32(TAB_STRIP_H) {
+			scrollbar_drag = true
+			window.mouse_pressed = false
+		}
+		if scrollbar_drag {
+			if window.mouse_down {
+				frac := (f32(window.mouse_y) - TAB_STRIP_H) / max(1, f32(window.height) - TAB_STRIP_H)
+				doc_scroll_to_fraction(doc, frac)
+			} else {
+				scrollbar_drag = false
+			}
+		}
+
 		// Mouse: press places/extends the caret (double=word, triple=line); drag extends.
 		if window.mouse_pressed {
 			mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
@@ -145,7 +161,7 @@ main :: proc() {
 				}
 			}
 			window.mouse_pressed = false
-		} else if window.mouse_down && window.mouse_count == 1 {
+		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag {
 			// drag extends a single-click selection; word/line selects stay put.
 			// Auto-scroll when the pointer is dragged past the top/bottom edge.
 			if window.mouse_y < i32(CONTENT_TOP) {
@@ -169,6 +185,19 @@ main :: proc() {
 		doc = app_active(&app)
 		if !doc.filter && app.active == active_before && doc.cursor != cursor_before {
 			doc_ensure_cursor_visible(doc, &text, rows)
+		}
+
+		// Window title = [*]filename - Newtpad, set only when it changes.
+		{
+			@(static) last: [512]u8
+			@(static) last_len: int
+			tbuf: [512]u8
+			title := fmt.bprintf(tbuf[:], "%s%s - Newtpad", "*" if doc.modified else "", doc_display_name(doc))
+			if len(title) != last_len || string(last[:last_len]) != title {
+				plat.window_set_title(window, title)
+				copy(last[:], transmute([]u8)title)
+				last_len = len(title)
+			}
 		}
 
 		render_frame(&rc)
@@ -280,8 +309,11 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			plat.text_draw(gfx, text, fline, 12, h - 8, 14, {0.95, 0.88, 0.55, 1})
 		}
 	} else {
+		ln := doc_cursor_line(doc)
+		lncol := fmt.tprintf("Ln %d, Col %d", ln, doc_cursor_col(doc, text)) if ln > 0 else fmt.tprintf("Col %d", doc_cursor_col(doc, text))
 		recovered := "  [RECOVERED COPY - file changed on disk, not the original]" if doc.recovered else ""
-		status := fmt.tprintf("%d lines%s%s%s", doc_line_count(doc), " *" if doc.modified else "", recovered, "" if doc_index_done(doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(doc) * 100))
+		indexing := "" if doc_index_done(doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(doc) * 100)
+		status := fmt.tprintf("%s    %s    %d lines%s%s%s%s", lncol, enc_name(doc.enc), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, indexing)
 		col := [4]f32{0.95, 0.55, 0.35, 1} if doc.recovered else {0.55, 0.60, 0.70, 1}
 		plat.text_draw(gfx, text, status, 12, h - 8, 13, col)
 	}
