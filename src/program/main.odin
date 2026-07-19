@@ -164,8 +164,9 @@ Render_Ctx :: struct {
 }
 
 // Draw one frame from current state. No input handling — safe to call from the
-// main loop or the WM_SIZE handler.
-render_frame :: proc(rc: ^Render_Ctx) {
+// main loop or the WM_SIZE handler. vsync=false (resize) presents immediately so
+// clustered WM_SIZE repaints don't each stall on vsync.
+render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	gfx, text, quad_pipe, window := rc.gfx, rc.text, rc.quads, rc.window
 	px, char_w, line_h := rc.px, rc.char_w, rc.line_h
 	doc := app_active(rc.app)
@@ -238,7 +239,7 @@ render_frame :: proc(rc: ^Render_Ctx) {
 		plat.text_draw(gfx, text, status, 12, h - 8, 13, col)
 	}
 
-	plat.gfx_end_frame(gfx)
+	plat.gfx_end_frame(gfx, 1 if vsync else 0)
 }
 
 // WM_SIZE calls this so the content re-renders live during a resize. It runs from
@@ -253,5 +254,5 @@ on_resize :: proc "contextless" (user: rawptr) {
 	mem.arena_init(&arena, scratch[:])
 	context.temp_allocator = mem.arena_allocator(&arena)
 	plat.gfx_resize(rc.gfx, rc.window.width, rc.window.height)
-	render_frame(rc)
+	render_frame(rc, false) // immediate present: smooth live resize, no vsync stall
 }

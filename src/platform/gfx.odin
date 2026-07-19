@@ -77,6 +77,9 @@ gfx_resize :: proc(gfx: ^Gfx, width, height: i32) {
 	if gfx.swapchain == nil || width == 0 || height == 0 {
 		return
 	}
+	if width == gfx.width && height == gfx.height {
+		return // WM_SIZE can fire with an unchanged size; skip the buffer churn
+	}
 	if gfx.rtv != nil {
 		gfx.rtv->Release()
 		gfx.rtv = nil
@@ -99,7 +102,8 @@ gfx_begin_frame :: proc(gfx: ^Gfx, r, g, b: f32) {
 	gfx.ctx->OMSetBlendState(nil, nil, 0xFFFFFFFF)
 }
 
-// Present the frame. SyncInterval 1 = vsync; keeps the GPU calm.
-gfx_end_frame :: proc(gfx: ^Gfx) {
-	gfx.swapchain->Present(1, {})
+// Present the frame. sync=1 = vsync (default, calm GPU); sync=0 = immediate,
+// used during a live resize so per-WM_SIZE presents don't each block on vsync.
+gfx_end_frame :: proc(gfx: ^Gfx, sync: u32 = 1) {
+	gfx.swapchain->Present(sync, {})
 }

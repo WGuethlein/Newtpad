@@ -154,6 +154,20 @@ Beyond V1 core (from the validated feature list, PROJECT-RULES/§4-of-old): colu
 go-to-line, word wrap, zoom, themes, Explorer "Open with" + drag-drop + `file.txt:123`; then the
 V2 plugin API + first-party proofs.
 
+hift + up arrow highlight works when there's only one row, but shift + down arrow doesn't quite, it doesn't highlight to the end of the line
+ think a cool feature we could add is the ability to read into java files like jd-gui, where it would have a sidebar tree view type thing... could be used for other containere file formats as well…
+
+      Good idea, and it fits Newtpad's architecture cleanly — I can't edit files from this side response, but here's exactly how it should be captured so it lands in the right place (HANDOFF.md, in the "Beyond V1 core → V2 plugin API + first-party proofs" section):
+
+      Container/archive tree viewer (post-V1, plugin-shaped)
+      - What: open a container file (JAR, ZIP, and other archive/container formats) and show a sidebar tree view of its entries; clicking an entry opens that member in a tab/pane as text. jd-gui-style browsing.
+      - Why it fits: this is exactly the "viewer" half of the locked plugin C-ABI (PROJECT-RULES: "narrow C-ABI (formatters + viewers), worker threads, timeouts"). A container viewer is a canonical first-party proof of that boundary — it reads a file and yields (a) a tree of named entries and (b) byte ranges/streams per entry, without the core knowing the format. Same mechanism generalizes to any container (tar, .docx/.xlsx which are ZIP, .pak, etc.).
+      - Scope boundary to record: the tree + extract-and-view is the in-scope viewer feature. Decompilation (jd-gui turning .class bytecode → Java source) is a much heavier, separate concern — that would be its own formatter/decompiler plugin (likely shelling to or embedding a decompiler), explicitly a later/optional add-on, not part of the base container viewer. Worth noting so the two don't get conflated.
+      - New UI primitive it introduces: a sidebar / tree panel — the first time Newtpad grows a persistent side panel (today it's content-owns-the-screen with only the tab strip + command palette). That's a real design decision to flag against Product Principle #2 (minimal UI, content owns the screen), so the tree should be toggleable / only present when a container is open, not permanent chrome.
+
+      Net: log it as a V2 plugin viewer proof — "container tree viewer (JAR/ZIP/…): sidebar tree of entries → open member as tab; decompilation is a separate later plugin; introduces the first toggleable side panel." It aligns with the plugin decision rather than expanding V1 scope, which is the right way to keep it parked.
+      - New UI primitive it introduces: a sidebar / tree panel — the first time Newtpad grows a persistent side panel (today it's content-owns-the-screen with only the tab strip + command palette). That's a real design decision to flag against Product Principle #2 (minimal UI, content owns the screen), so the tree should be toggleable / only present when a container is open, not permanent chrome.
+
 ## 6b. Decisions — Tabs + UI chrome (2026-07-18)
 
 Preceded by a precedent-scout sweep (4coder/File Pilot/Sublime/VS Code/Notepad++ multi-doc memory,
