@@ -99,18 +99,54 @@ file_write_atomic :: proc(path: string, data: []u8) -> bool {
 	return true
 }
 
-// Native Save-As dialog. Returns the chosen path (heap-allocated) or ok=false if
-// the user cancelled.
+// Build a comdlg filter string (label\0pattern\0...\0\0) as wide chars.
+@(private = "file")
+build_filter :: proc(dst: ^[256]u16, parts: []string) {
+	i := 0
+	for s in parts {
+		for c in s {
+			if i < len(dst) - 2 {
+				dst[i] = u16(c)
+				i += 1
+			}
+		}
+		dst[i] = 0
+		i += 1
+	}
+	dst[i] = 0
+}
+
+// Native Save-As dialog with file-type filters and a default .txt extension
+// (so a name typed without an extension becomes name.txt). Returns the chosen
+// path (heap-allocated) or ok=false if cancelled.
 file_save_dialog :: proc(owner: win.HWND) -> (path: string, ok: bool) {
 	buf: [520]u16
-	filter := [?]u16{'A', 'l', 'l', ' ', 'F', 'i', 'l', 'e', 's', 0, '*', '.', '*', 0, 0}
+	fbuf: [256]u16
+	build_filter(
+		&fbuf,
+		{
+			"Text Documents (*.txt)",
+			"*.txt",
+			"JSON (*.json)",
+			"*.json",
+			"Markdown (*.md)",
+			"*.md",
+			"Log Files (*.log)",
+			"*.log",
+			"All Files (*.*)",
+			"*.*",
+		},
+	)
+	defext := [?]u16{'t', 'x', 't', 0}
 	ofn := win.OPENFILENAMEW {
-		lStructSize = size_of(win.OPENFILENAMEW),
-		hwndOwner   = owner,
-		lpstrFile   = win.wstring(&buf[0]),
-		nMaxFile    = u32(len(buf)),
-		lpstrFilter = win.wstring(&filter[0]),
-		Flags       = u32(win.OFN_OVERWRITEPROMPT | win.OFN_EXPLORER | win.OFN_NOCHANGEDIR),
+		lStructSize  = size_of(win.OPENFILENAMEW),
+		hwndOwner    = owner,
+		lpstrFile    = win.wstring(&buf[0]),
+		nMaxFile     = u32(len(buf)),
+		lpstrFilter  = win.wstring(&fbuf[0]),
+		nFilterIndex = 1,
+		lpstrDefExt  = win.wstring(&defext[0]),
+		Flags        = u32(win.OFN_OVERWRITEPROMPT | win.OFN_EXPLORER | win.OFN_NOCHANGEDIR),
 	}
 	if !win.GetSaveFileNameW(&ofn) {
 		return "", false
