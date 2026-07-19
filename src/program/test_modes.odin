@@ -153,6 +153,81 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad menutest` covers the menu model and keyboard navigation: that every
+	// item names a real command, that mnemonics are unique and don't collide with
+	// an explicit Alt binding, that navigation skips separators and disabled rows,
+	// and that Esc unwinds one level at a time rather than dropping straight out.
+	if os.args[1] == "menutest" {
+		t: plat.Text
+		plat.text_load_faces(&t)
+		a: App
+		menu_init(&a.menu)
+		app_new_scratch(&a)
+		defer app_destroy(&a)
+
+		bad := 0
+		fmt.println("--- model ---")
+		seen: map[rune]bool;defer delete(seen)
+		for m in menus {
+			items, seps := 0, 0
+			for it in m.items {
+				if it.cmd == .None {seps += 1} else {items += 1}
+				// A menu item pointing at .None that isn't a separator, or at a
+				// command with no title, would render as an empty row.
+				if it.cmd != .None && command_table[it.cmd].title == "" {
+					fmt.printfln("  FAIL %v has an untitled command", m.title)
+					bad += 1
+				}
+			}
+			// The mnemonic must not be claimed by an explicit Alt binding, or the
+			// menu becomes unreachable from the keyboard with no diagnostic.
+			clash := resolve_key(char_key(m.mnemonic), false, true, .Editor)
+			dup := seen[m.mnemonic]
+			seen[m.mnemonic] = true
+			if clash != .None || dup {bad += 1}
+			fmt.printfln("  %-6s Alt+%c  %2d items %d separators  alt-clash=%v dup=%v %s", m.title, m.mnemonic, items, seps, clash, dup, "OK" if clash == .None && !dup else "FAIL")
+		}
+
+		fmt.println("--- navigation ---")
+		menu_open_at(&a, 0)
+		first := a.menu.item
+		ok_first := first >= 0 && menus[0].items[first].cmd != .None
+		fmt.printfln("  open File -> item %d (%v) %s", first, menus[0].items[first].cmd, "OK" if ok_first else "FAIL")
+		if !ok_first {bad += 1}
+
+		// Stepping down must never land on a separator or a disabled row.
+		steps_ok := true
+		for _ in 0 ..< 20 {
+			a.menu.item = menu_step(&a, a.menu.open, a.menu.item + 1, 1)
+			if a.menu.item < 0 || !item_enabled(&a, menus[a.menu.open].items[a.menu.item]) {steps_ok = false}
+		}
+		fmt.printfln("  20 steps stay on enabled items: %v %s", steps_ok, "OK" if steps_ok else "FAIL")
+		if !steps_ok {bad += 1}
+
+		// Esc unwinds one level: dropdown -> bar mode -> out.
+		command_dispatch(.Menu_Close, {}, &a, nil, &t, 10)
+		lvl1 := a.menu.open < 0 && a.menu.mode
+		command_dispatch(.Menu_Close, {}, &a, nil, &t, 10)
+		lvl2 := !menu_is_active(&a)
+		fmt.printfln("  Esc: dropdown->bar %v, bar->out %v %s", lvl1, lvl2, "OK" if lvl1 && lvl2 else "FAIL")
+		if !(lvl1 && lvl2) {bad += 1}
+
+		// A global chord must still resolve while the menu is open.
+		fmt.println("--- global chords survive menu mode ---")
+		for k in ([]plat.Key{.S, .P, .N, .Z}) {
+			got := resolve_key(k, true, false, .Menu)
+			if got == .None {bad += 1}
+			fmt.printfln("  Ctrl+%v / Menu -> %-12v %s", k, got, "OK" if got != .None else "FAIL")
+		}
+		// ...but unmodified keys belong to the menu.
+		un := resolve_key(.Down, false, false, .Menu)
+		fmt.printfln("  Down / Menu -> %v %s", un, "OK" if un == .Menu_Item_Next else "FAIL")
+		if un != .Menu_Item_Next {bad += 1}
+
+		fmt.printfln("menutest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad dpitest` guards the identity the whole cell grid rests on: the
 	// column grid the program lays out with (col_x, caret, selection, find rects)
 	// must advance by exactly the same amount as the pen inside text_draw. If a

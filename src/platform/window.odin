@@ -185,6 +185,15 @@ Window :: struct {
 	key_count:     int,
 	chars:         [64]rune, // printable characters typed this frame
 	char_count:    int,
+	// Alt+&lt;char&gt; this frame, layout-translated (menu mnemonics; see WM_SYSCHAR)
+	sys_chars:      [16]rune,
+	sys_char_count: int,
+	// Alt gesture tracking. alt_tapped is set on release of a bare Alt press —
+	// the "enter menu mode" gesture — and cleared by the program once consumed.
+	alt_down:       bool,
+	alt_used:       bool, // another key was pressed while Alt was held
+	alt_tapped:     bool,
+	focus_lost:     bool, // activation lost this frame; close transient UI
 	// mouse (client coords)
 	mouse_x:       i32,
 	mouse_y:       i32,
@@ -279,6 +288,11 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 	// Force the frame to recompute now that our WM_NCCALCSIZE is in effect.
 	win.SetWindowPos(w.hwnd, nil, 0, 0, 0, 0, win.SWP_FRAMECHANGED | win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOZORDER)
 	return w
+}
+
+// Ask the window to close, exactly as the ✕ button does.
+window_request_close :: proc(w: ^Window) {
+	win.PostMessageW(w.hwnd, win.WM_CLOSE, 0, 0)
 }
 
 // Work area (screen minus taskbar) of the monitor this window is on.
@@ -485,12 +499,46 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		}
 		return 0
 	case win.WM_SYSCHAR:
-		// Swallow Alt+key chars so DefWindowProc doesn't do a menu-mnemonic lookup
-		// and beep (we have no menu bar). Alt combos are handled via WM_SYSKEYDOWN.
+		// Still swallowed so DefWindowProc doesn't beep or run its own mnemonic
+		// lookup — but the character is captured first. Mnemonics must match on
+		// the CHARACTER, not the virtual key: VK codes are layout-dependent (the
+		// key printed "A" sends VK_Q on AZERTY), so a VK-based mnemonic would
+		// silently address the wrong menu on non-US keyboards.
+		if r := rune(wparam); r >= 32 && w.sys_char_count < len(w.sys_chars) {
+			w.sys_chars[w.sys_char_count] = r
+			w.sys_char_count += 1
+		}
+		return 0
+	case win.WM_SYSKEYUP:
+		// A bare Alt press-and-release is the "enter menu mode" gesture. It only
+		// counts if no other key was pressed while Alt was held, which is what
+		// separates it from Alt+Z. Returning 0 (rather than falling through)
+		// stops DefWindowProc synthesizing WM_SYSCOMMAND/SC_KEYMENU — otherwise
+		// the OS enters its own system-menu keyboard mode at the same time as
+		// ours and eats the next letter (e.g. "n" = Minimize).
+		if wparam == win.WPARAM(win.VK_MENU) {
+			if !w.alt_used {w.alt_tapped = true}
+			w.alt_down = false
+			return 0
+		}
+	case win.WM_ACTIVATE:
+		// Losing activation must close any open menu. Without this, Alt+Tabbing
+		// away leaves the dropdown drawn and the app in menu mode, tracking a
+		// cursor that is now driving a different window.
+		if (wparam & 0xFFFF) == 0 {
+			w.focus_lost = true
+			w.alt_down, w.alt_used, w.alt_tapped = false, false, false
+		}
 		return 0
 	case win.WM_KEYDOWN, win.WM_SYSKEYDOWN:
 		// WM_SYSKEYDOWN carries Alt combos (e.g. Alt+Z). Translate and queue keys
 		// we recognize; let DefWindowProc handle the rest (Alt+F4, Alt+Space, F10).
+		if wparam == win.WPARAM(win.VK_MENU) {
+			if !w.alt_down {w.alt_used = false} // fresh press
+			w.alt_down = true
+			return 0 // see WM_SYSKEYUP
+		}
+		if w.alt_down {w.alt_used = true} // Alt is a modifier here, not a tap
 		key := vk_to_key(wparam)
 		if key == .None {
 			break

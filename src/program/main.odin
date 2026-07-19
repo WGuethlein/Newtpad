@@ -1,4 +1,4 @@
-// Layer: program — wires the layers together and owns the frame loop. The main
+// Layer: program â€” wires the layers together and owns the frame loop. The main
 // thread builds UI and handles input only: drain events, update the document,
 // draw the viewport, present. Headless argv test modes live in test_modes.odin.
 package main
@@ -24,7 +24,7 @@ main :: proc() {
 	// One instance per user: a second launch hands its file to the running window
 	// and exits, so only one process owns the session file and backups. If the
 	// hand-off fails (owner starting up or shutting down) we run normally rather
-	// than lose the file — see the primary check on session save below.
+	// than lose the file â€” see the primary check on session save below.
 	primary := plat.instance_claim()
 	if !primary && plat.instance_send_open(path) {
 		return
@@ -54,7 +54,7 @@ main :: proc() {
 
 	// Restore the session FIRST, then open any file from the command line as an
 	// extra tab. Opening a file used to skip the restore entirely, and the exit
-	// save then deleted every backup the (single-tab) session didn't reference —
+	// save then deleted every backup the (single-tab) session didn't reference â€”
 	// so launching Newtpad on a file destroyed unsaved scratch buffers. The
 	// single-instance hand-off already appends a tab rather than replacing the
 	// session, so this also makes both launch paths behave the same.
@@ -130,7 +130,7 @@ main :: proc() {
 		// Usable content width in cells (word wrap breaks here).
 		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - SCROLLBAR_W) / char_w))
 		doc.view_rows = rows
-		// Re-center on the caret only when it actually moves on THIS tab — never
+		// Re-center on the caret only when it actually moves on THIS tab â€” never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
 		active_before := app.active
 		cursor_before := doc.cursor
@@ -147,16 +147,53 @@ main :: proc() {
 			}
 		}
 		window.char_count = 0
+
+		// Losing activation closes transient UI — otherwise Alt+Tab leaves a
+		// dropdown drawn and the app in menu mode over another window.
+		if window.focus_lost {
+			window.focus_lost = false
+			menu_close(&app)
+		}
+		// A bare Alt tap toggles menu-bar keyboard mode (no dropdown), matching
+		// Windows. Alt+<key> sets alt_used in the platform layer, so Alt+Z never
+		// reaches here.
+		if window.alt_tapped {
+			window.alt_tapped = false
+			if menu_is_active(&app) {menu_close(&app)} else {app.menu.mode = true}
+		}
+		// Alt+<char> mnemonics, matched on the layout-translated character.
+		// Explicit Alt bindings (Alt+Z) already consumed their press via the key
+		// path, so this only sees letters no binding claimed.
+		for i in 0 ..< window.sys_char_count {
+			r := window.sys_chars[i]
+			if resolve_key(char_key(r), false, true, .Editor) != .None {continue} // an explicit binding owns it
+			for m, mi in menus {
+				if lower_rune(r) == m.mnemonic {
+					menu_open_at(&app, mi)
+					break
+				}
+			}
+		}
+		window.sys_char_count = 0
+
 		for i in 0 ..< window.key_count {
 			ev := window.key_events[i]
-			// Context is per-event; palette/find/tab-switch can change it mid-loop.
+			// Context is per-event; palette/find/menu/tab-switch can change it
+			// mid-loop. Priority: menu > palette > find > editor.
 			ctx := Ctx.Editor
-			if app.palette.active {
+			if menu_is_active(&app) {
+				ctx = .Menu
+			} else if app.palette.active {
 				ctx = .Palette
 			} else if app_active(&app).find.active {
 				ctx = .Find
 			}
-			command_dispatch(resolve_key(ev.key, ev.ctrl, ev.alt, ctx), ev, &app, window, &text, rows)
+			cmd := resolve_key(ev.key, ev.ctrl, ev.alt, ctx)
+			// A global chord taken while the menu is open should close it first.
+			if ctx == .Menu && cmd != .None && !is_menu_cmd(cmd) {
+				menu_close(&app)
+			}
+			command_dispatch(cmd, ev, &app, window, &text, rows)
 		}
 		window.key_count = 0
 
@@ -172,18 +209,27 @@ main :: proc() {
 			window.mouse_down = false
 		}
 
+		// The menu claims clicks first: its bar sits above the scrollbar gutter's
+		// top edge, and an open dropdown overlaps the content.
+		if mcmd, consumed := menu_hit_test(&app, &text, window, f32(window.width), f32(window.height)); consumed {
+			if mcmd != .None {
+				command_dispatch(mcmd, {}, &app, window, &text, rows)
+				doc = app_active(&app)
+			}
+		}
+
 		// The tab strip claims clicks in its region before the caret sees them.
 		tabs_hit_test(&app, window)
 
 		// Scrollbar: a press in the right-edge gutter starts a drag that maps the
 		// pointer's y to a byte-proportional scroll position (consumes the click).
-		if window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - SCROLLBAR_W && window.mouse_y >= i32(TAB_STRIP_H) {
+		if window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - SCROLLBAR_W && window.mouse_y >= i32(CHROME_TOP) {
 			scrollbar_drag = true
 			window.mouse_pressed = false
 		}
 		if scrollbar_drag {
 			if window.mouse_down {
-				frac := (f32(window.mouse_y) - TAB_STRIP_H) / max(1, f32(window.height) - TAB_STRIP_H)
+				frac := (f32(window.mouse_y) - CHROME_TOP) / max(1, f32(window.height) - CHROME_TOP)
 				doc_scroll_to_fraction(doc, &text, frac, rows)
 			} else {
 				scrollbar_drag = false
@@ -284,7 +330,7 @@ Render_Ctx :: struct {
 	px, char_w, line_h: f32,
 }
 
-// Draw one frame from current state. No input handling — safe to call from the
+// Draw one frame from current state. No input handling â€” safe to call from the
 // main loop or the WM_SIZE handler. vsync=false (resize) presents immediately so
 // clustered WM_SIZE repaints don't each stall on vsync.
 render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
@@ -319,10 +365,10 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	h := f32(window.height)
 	total := doc.pt.length
 	if total > 0 && !doc.filter {
-		sb_h := h - TAB_STRIP_H
-		ty := TAB_STRIP_H + f32(doc.top) / f32(total) * sb_h
+		sb_h := h - CHROME_TOP
+		ty := CHROME_TOP + f32(doc.top) / f32(total) * sb_h
 		th := max(sx(24), f32(bottom - doc.top) / f32(total) * sb_h)
-		bars[nb] = {pos = {w - SCROLLBAR_W, TAB_STRIP_H}, size = {SCROLLBAR_W, sb_h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
+		bars[nb] = {pos = {w - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
 		bars[nb] = {pos = {w - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = {0.42, 0.48, 0.60, 1}};nb += 1
 	}
 	if caret {
@@ -333,6 +379,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	}
 
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
+	menu_draw(gfx, quad_pipe, text, rc.app, window, w, h)
 
 	if rc.app.palette.active {
 		palette_draw(gfx, quad_pipe, text, rc.app, w, h)
@@ -340,12 +387,12 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 
 	// Filter view replaces the document with just the matching lines, which is
 	// disorienting if you don't know why. Say so, unmistakably, and say how to
-	// leave — the previous signal was the word "filter" inside the find line.
+	// leave â€” the previous signal was the word "filter" inside the find line.
 	if doc.filter && doc.find.active {
 		bh := sx(20)
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, CONTENT_TOP - bh}, size = {w, bh}, color = {0.18, 0.26, 0.20, 1}}})
 		msg := fmt.tprintf(
-			"FILTER  %d matching lines%s   —   Ctrl+L shows the whole file",
+			"FILTER  %d matching lines%s   â€”   Ctrl+L shows the whole file",
 			len(doc.filter_lines),
 			"" if doc_filtering(doc) else " (searching...)",
 		)
@@ -433,14 +480,18 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	rc.line_h = line_height(rc.px)
 	rc.char_w = plat.text_char_width(rc.text, rc.px)
 
-	// The chrome. Sole writer of these — see the note on their declarations.
+	// The chrome. Sole writer of these â€” see the note on their declarations.
 	UI_SCALE = plat.window_scale(rc.window)
 	UI_PX = dp(rc, UI_PX_96)
 	UI_SMALL_PX = dp(rc, UI_SMALL_PX_96)
 	TEXT_MARGIN_X = dp(rc, TEXT_MARGIN_X_96)
 	TEXT_MARGIN_Y = dp(rc, TEXT_MARGIN_Y_96)
 	TAB_STRIP_H = dp(rc, TAB_STRIP_H_96)
-	CONTENT_TOP = TAB_STRIP_H + TEXT_MARGIN_Y
+	MENU_BAR_H = dp(rc, MENU_BAR_H_96)
+	MENU_ITEM_H = dp(rc, MENU_ITEM_H_96)
+	MENU_PAD = dp(rc, MENU_PAD_96)
+	CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+	CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 	TAB_W = dp(rc, TAB_W_96)
 	TAB_GAP = dp(rc, TAB_GAP_96)
 	TAB_CLOSE_W = dp(rc, TAB_CLOSE_W_96)
@@ -449,7 +500,7 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	SCROLLBAR_W = dp(rc, SCROLLBAR_W_96)
 
 	// The non-client hit-test boundary is derived from the tab strip, so it is
-	// set here rather than at each call site — it was being scaled a second time
+	// set here rather than at each call site â€” it was being scaled a second time
 	// by one of them, squaring it and pushing the OS drag region into the content.
 	rc.window.titlebar_h = i32(TAB_STRIP_H)
 }

@@ -59,8 +59,16 @@ TEXT_MARGIN_Y := TEXT_MARGIN_Y_96
 TAB_STRIP_H := TAB_STRIP_H_96
 SCROLLBAR_W := SCROLLBAR_W_96
 
-// Content-area top edge: below the tab strip. Derived, so it is recomputed too.
-CONTENT_TOP := TAB_STRIP_H_96 + TEXT_MARGIN_Y_96
+// Bottom edge of the chrome: below the tab strip AND the menu bar. Anything
+// positioned against the top of the content area (the scrollbar, its drag
+// mapping) must use this, not TAB_STRIP_H — using the strip alone let the
+// scrollbar gutter extend up into the menu row and swallow clicks meant for it.
+CHROME_TOP := TAB_STRIP_H_96 + MENU_BAR_H_96
+
+// Content-area top edge. Derived, so it is recomputed with the rest; the
+// initialiser here must stay in step with metrics_recompute, since the headless
+// test modes never call that.
+CONTENT_TOP := TAB_STRIP_H_96 + MENU_BAR_H_96 + TEXT_MARGIN_Y_96
 
 // window DPI / 96, written by metrics_recompute. Lets the small one-off offsets
 // inside a widget scale without every draw proc taking a context parameter.

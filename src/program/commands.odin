@@ -17,6 +17,7 @@ Ctx :: enum u8 {
 	Editor,
 	Find,
 	Palette,
+	Menu,
 }
 
 Command_Id :: enum u8 {
@@ -66,6 +67,14 @@ Command_Id :: enum u8 {
 	Tab_Close,
 	Tab_Next,
 	Tab_Prev,
+	Exit,
+	// menu bar navigation
+	Menu_Close,
+	Menu_Next,
+	Menu_Prev,
+	Menu_Item_Next,
+	Menu_Item_Prev,
+	Menu_Activate,
 	// find mode
 	Find_Close,
 	Find_Backspace,
@@ -131,6 +140,13 @@ command_table := [Command_Id]Command {
 	.Tab_Close                = {"Close Tab", "Tabs"},
 	.Tab_Next                 = {"Next Tab", "Tabs"},
 	.Tab_Prev                 = {"Previous Tab", "Tabs"},
+	.Exit                     = {"Exit", "File"},
+	.Menu_Close               = {"Menu: Close", "View"},
+	.Menu_Next                = {"Menu: Next", "View"},
+	.Menu_Prev                = {"Menu: Previous", "View"},
+	.Menu_Item_Next           = {"Menu: Next Item", "View"},
+	.Menu_Item_Prev           = {"Menu: Previous Item", "View"},
+	.Menu_Activate            = {"Menu: Activate Item", "View"},
 	.Find_Close               = {"Close Find", "Search"},
 	.Find_Backspace           = {"Find: Delete Backward", "Search"},
 	.Find_Confirm             = {"Find: Confirm", "Search"},
@@ -201,6 +217,13 @@ default_bindings := []Binding {
 	{.Tab, true, false, .Editor, .Tab_Next}, // Ctrl+Tab (Shift -> previous, in the action)
 	{.Page_Up, true, false, .Editor, .Tab_Prev},
 	{.Page_Down, true, false, .Editor, .Tab_Next},
+	// --- menu context ---
+	{.Escape, false, false, .Menu, .Menu_Close},
+	{.Left, false, false, .Menu, .Menu_Prev},
+	{.Right, false, false, .Menu, .Menu_Next},
+	{.Down, false, false, .Menu, .Menu_Item_Next},
+	{.Up, false, false, .Menu, .Menu_Item_Prev},
+	{.Enter, false, false, .Menu, .Menu_Activate},
 	// --- find context ---
 	{.Escape, false, false, .Find, .Find_Close},
 	{.F, true, false, .Find, .Find_Close},
@@ -336,7 +359,10 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 	if cmd := lookup_binding(key, ctrl, alt, ctx); cmd != .None {
 		return cmd
 	}
-	if ctx == .Find && (ctrl || alt) {
+	// The menu falls back for the same reason find does — a global chord should
+	// not die because a dropdown happens to be open. The palette is the one true
+	// exception, being a text field.
+	if (ctx == .Find || ctx == .Menu) && (ctrl || alt) {
 		return lookup_binding(key, ctrl, alt, .Editor)
 	}
 	return .None
@@ -478,6 +504,41 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		app_switch_relative(app, -1 if ev.shift else 1) // Shift+Ctrl+Tab -> previous
 	case .Tab_Prev:
 		app_switch_relative(app, -1)
+	case .Exit:
+		// No prompt, matching the ✕ button: unsaved buffers are persisted as
+		// session backups on the way out (hot exit). A File>Exit that prompted
+		// would be stricter than the close button, which is worse than either.
+		plat.window_request_close(w)
+
+	// --- menu bar ---
+	case .Menu_Close:
+		// Unwind one level: an open dropdown closes to bar mode, bar mode exits.
+		if app.menu.open >= 0 {
+			app.menu.open = -1
+			app.menu.item = -1
+		} else {
+			menu_close(app)
+		}
+	case .Menu_Next, .Menu_Prev:
+		d := 1 if cmd == .Menu_Next else -1
+		if app.menu.open >= 0 {
+			menu_open_at(app, (app.menu.open + d + len(menus)) % len(menus))
+		} else {
+			menu_open_at(app, 0 if d > 0 else len(menus) - 1)
+		}
+	case .Menu_Item_Next, .Menu_Item_Prev:
+		d := 1 if cmd == .Menu_Item_Next else -1
+		if app.menu.open < 0 {
+			menu_open_at(app, 0) // Down on the bar opens the first menu
+		} else {
+			app.menu.item = menu_step(app, app.menu.open, app.menu.item + d, d)
+		}
+	case .Menu_Activate:
+		if app.menu.open >= 0 && app.menu.item >= 0 {
+			it := menus[app.menu.open].items[app.menu.item]
+			menu_close(app) // close first: the item may open the palette
+			command_dispatch(it.cmd, ev, app, w, t, rows)
+		}
 
 	// --- find mode ---
 	case .Find_Close:

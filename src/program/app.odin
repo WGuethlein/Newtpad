@@ -15,6 +15,7 @@ App :: struct {
 	active:     int, // slot index of the active document
 	mru:        [dynamic]int, // live slots, most-recently-active first
 	tab_scroll: f32, // horizontal scroll of the tab strip (overflow)
+	menu:       Menu_State,
 	palette:    Palette, // command palette overlay (Ctrl+P)
 }
 
