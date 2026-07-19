@@ -4,6 +4,19 @@ package platform
 
 import win "core:sys/windows"
 
+// Not present in core:sys/windows; hand-declare (used for click-count timing).
+foreign import user32_extra "system:User32.lib"
+foreign import kernel32_extra "system:Kernel32.lib"
+
+@(default_calling_convention = "system")
+foreign kernel32_extra {
+	GetTickCount :: proc() -> u32 ---
+}
+@(default_calling_convention = "system")
+foreign user32_extra {
+	GetDoubleClickTime :: proc() -> u32 ---
+}
+
 // A single top-level OS window. Platform types stay in this layer; upper
 // layers see only this opaque handle and the procs below.
 // Editor key commands queued from the message pump, drained once per frame.
@@ -22,6 +35,18 @@ Key_Cmd :: enum u8 {
 	Undo,
 	Redo,
 	Save,
+	Copy,
+	Cut,
+	Paste,
+	SelectAll,
+	WordLeft,
+	WordRight,
+	DeleteWordBack,
+}
+
+Key_Event :: struct {
+	cmd:   Key_Cmd,
+	shift: bool,
 }
 
 Window :: struct {
@@ -31,11 +56,23 @@ Window :: struct {
 	should_close: bool,
 	resized:      bool,
 	// input, drained once per frame by the program
-	scroll_delta: int, // mouse-wheel lines this frame (+down / -up)
-	key_cmds:     [64]Key_Cmd,
-	key_count:    int,
-	chars:        [64]rune, // printable characters typed this frame
-	char_count:   int,
+	scroll_delta:  int, // mouse-wheel lines this frame (+down / -up)
+	key_events:    [64]Key_Event,
+	key_count:     int,
+	chars:         [64]rune, // printable characters typed this frame
+	char_count:    int,
+	// mouse (client coords)
+	mouse_x:       i32,
+	mouse_y:       i32,
+	mouse_pressed: bool, // a press happened this frame
+	mouse_count:   int, // 1 single, 2 double, 3 triple
+	mouse_shift:   bool,
+	mouse_down:    bool, // button held (dragging)
+	// internal click-count tracking
+	last_click_ms: u32,
+	last_click_x:  i32,
+	last_click_y:  i32,
+	click_count:   int,
 }
 
 window_create :: proc(title: string, width, height: i32) -> ^Window {
@@ -132,13 +169,14 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		return 0
 	case win.WM_KEYDOWN:
 		ctrl := (int(win.GetKeyState(win.VK_CONTROL)) & 0x8000) != 0
+		shift := (int(win.GetKeyState(win.VK_SHIFT)) & 0x8000) != 0
 		cmd: Key_Cmd
 		has := true
 		switch wparam {
 		case win.VK_LEFT:
-			cmd = .Left
+			cmd = .WordLeft if ctrl else .Left
 		case win.VK_RIGHT:
-			cmd = .Right
+			cmd = .WordRight if ctrl else .Right
 		case win.VK_UP:
 			cmd = .Up
 		case win.VK_DOWN:
@@ -152,7 +190,7 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		case win.VK_NEXT:
 			cmd = .PageDown
 		case win.VK_BACK:
-			cmd = .Backspace
+			cmd = .DeleteWordBack if ctrl else .Backspace
 		case win.VK_DELETE:
 			cmd = .DeleteFwd
 		case win.VK_RETURN:
@@ -163,13 +201,53 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 			cmd = .Redo;has = ctrl
 		case win.VK_S:
 			cmd = .Save;has = ctrl
+		case win.VK_C:
+			cmd = .Copy;has = ctrl
+		case win.VK_X:
+			cmd = .Cut;has = ctrl
+		case win.VK_V:
+			cmd = .Paste;has = ctrl
+		case win.VK_A:
+			cmd = .SelectAll;has = ctrl
 		case:
 			has = false
 		}
-		if has && w.key_count < len(w.key_cmds) {
-			w.key_cmds[w.key_count] = cmd
+		if has && w.key_count < len(w.key_events) {
+			w.key_events[w.key_count] = {cmd, shift}
 			w.key_count += 1
 		}
+		return 0
+	case win.WM_LBUTTONDOWN:
+		lp := u32(uintptr(lparam))
+		xi := int(lp & 0xFFFF);if xi >= 0x8000 {xi -= 0x10000}
+		yi := int(lp >> 16);if yi >= 0x8000 {yi -= 0x10000}
+		x, y := i32(xi), i32(yi)
+		now := GetTickCount()
+		if now - w.last_click_ms < GetDoubleClickTime() && abs(x - w.last_click_x) < 4 && abs(y - w.last_click_y) < 4 {
+			w.click_count += 1
+			if w.click_count > 3 {w.click_count = 1}
+		} else {
+			w.click_count = 1
+		}
+		w.last_click_ms = now;w.last_click_x = x;w.last_click_y = y
+		w.mouse_x = x;w.mouse_y = y
+		w.mouse_pressed = true
+		w.mouse_count = w.click_count
+		w.mouse_shift = (int(win.GetKeyState(win.VK_SHIFT)) & 0x8000) != 0
+		w.mouse_down = true
+		win.SetCapture(hwnd)
+		return 0
+	case win.WM_MOUSEMOVE:
+		if w.mouse_down {
+			lp := u32(uintptr(lparam))
+			xi := int(lp & 0xFFFF);if xi >= 0x8000 {xi -= 0x10000}
+			yi := int(lp >> 16);if yi >= 0x8000 {yi -= 0x10000}
+			w.mouse_x = i32(xi);w.mouse_y = i32(yi)
+		}
+		return 0
+	case win.WM_LBUTTONUP:
+		w.mouse_down = false
+		win.ReleaseCapture()
 		return 0
 	}
 	return win.DefWindowProcW(hwnd, msg, wparam, lparam)

@@ -32,6 +32,7 @@ Snapshot :: struct {
 	pieces:   []base.Piece,
 	length:   int,
 	cursor:   int,
+	anchor:   int,
 	nl_delta: int,
 }
 
@@ -45,6 +46,7 @@ Document :: struct {
 	had_bom:    bool, // whether the file opened with a BOM (preserved on save)
 	top:        int, // byte offset of the top visible line
 	cursor:     int, // caret byte offset
+	anchor:     int, // other end of the selection (== cursor when none)
 	modified:   bool,
 	nl_delta:   int,
 	undo:       [dynamic]Snapshot,
@@ -212,7 +214,7 @@ count_newlines :: proc(doc: ^Document, pos, count: int) -> (c: int) {
 snapshot :: proc(doc: ^Document) -> Snapshot {
 	pc := make([]base.Piece, len(doc.pt.pieces))
 	copy(pc, doc.pt.pieces[:])
-	return {pc, doc.pt.length, doc.cursor, doc.nl_delta}
+	return {pc, doc.pt.length, doc.cursor, doc.anchor, doc.nl_delta}
 }
 
 @(private = "file")
@@ -221,6 +223,7 @@ restore :: proc(doc: ^Document, s: Snapshot) {
 	append(&doc.pt.pieces, ..s.pieces)
 	doc.pt.length = s.length
 	doc.cursor = s.cursor
+	doc.anchor = s.anchor
 	doc.nl_delta = s.nl_delta
 }
 
@@ -248,14 +251,56 @@ doc_redo :: proc(doc: ^Document) {
 	delete(s.pieces)
 }
 
-// --- edits ---
+// --- selection ---
+// Selection is [min(anchor,cursor), max(anchor,cursor)); active when anchor != cursor.
+
+doc_sel_range :: proc(doc: ^Document) -> (lo, hi: int) {
+	if doc.anchor <= doc.cursor {
+		return doc.anchor, doc.cursor
+	}
+	return doc.cursor, doc.anchor
+}
+
+doc_has_sel :: proc(doc: ^Document) -> bool {return doc.anchor != doc.cursor}
+
+@(private = "file")
+set_cursor :: proc(doc: ^Document, pos: int, select: bool) {
+	doc.cursor = pos
+	if !select {
+		doc.anchor = pos
+	}
+}
+
+@(private = "file")
+del_sel_raw :: proc(doc: ^Document) {
+	lo, hi := doc_sel_range(doc)
+	doc.nl_delta -= count_newlines(doc, lo, hi - lo)
+	base.pt_delete(&doc.pt, lo, hi - lo)
+	doc.cursor = lo
+	doc.anchor = lo
+}
+
+// Selected text as a freshly-allocated UTF-8 string (empty if no selection).
+doc_selected_text :: proc(doc: ^Document, allocator := context.allocator) -> string {
+	lo, hi := doc_sel_range(doc)
+	if lo == hi {
+		return ""
+	}
+	buf := make([]u8, hi - lo, allocator)
+	base.pt_read(&doc.pt, lo, buf)
+	return string(buf)
+}
+
+// --- edits (an active selection is replaced/deleted first, as one undo step) ---
 
 doc_insert_text :: proc(doc: ^Document, text: []u8) {
 	if len(text) == 0 {return}
 	push_undo(doc)
+	if doc_has_sel(doc) {del_sel_raw(doc)}
 	base.pt_insert(&doc.pt, doc.cursor, text)
 	for b in text {if b == '\n' {doc.nl_delta += 1}}
 	doc.cursor += len(text)
+	doc.anchor = doc.cursor
 }
 
 doc_insert_rune :: proc(doc: ^Document, r: rune) {
@@ -264,45 +309,185 @@ doc_insert_rune :: proc(doc: ^Document, r: rune) {
 }
 
 doc_backspace :: proc(doc: ^Document) {
+	if doc_has_sel(doc) {
+		push_undo(doc)
+		del_sel_raw(doc)
+		return
+	}
 	if doc.cursor <= 0 {return}
 	push_undo(doc)
 	p := prev_rune(doc, doc.cursor)
 	doc.nl_delta -= count_newlines(doc, p, doc.cursor - p)
 	base.pt_delete(&doc.pt, p, doc.cursor - p)
-	doc.cursor = p
+	set_cursor(doc, p, false)
 }
 
 doc_delete_fwd :: proc(doc: ^Document) {
+	if doc_has_sel(doc) {
+		push_undo(doc)
+		del_sel_raw(doc)
+		return
+	}
 	if doc.cursor >= doc.pt.length {return}
 	push_undo(doc)
 	n := next_rune(doc, doc.cursor) - doc.cursor
 	doc.nl_delta -= count_newlines(doc, doc.cursor, n)
 	base.pt_delete(&doc.pt, doc.cursor, n)
+	doc.anchor = doc.cursor
 }
 
-// --- cursor movement ---
+// --- cursor movement (select=true extends the selection) ---
 
-doc_cursor_left :: proc(doc: ^Document) {doc.cursor = prev_rune(doc, doc.cursor)}
-doc_cursor_right :: proc(doc: ^Document) {doc.cursor = next_rune(doc, doc.cursor)}
-doc_cursor_home :: proc(doc: ^Document) {doc.cursor = base.pt_line_start(&doc.pt, doc.cursor)}
-doc_cursor_end :: proc(doc: ^Document) {doc.cursor = base.pt_line_end(&doc.pt, doc.cursor)}
+doc_cursor_left :: proc(doc: ^Document, select: bool) {
+	if !select && doc_has_sel(doc) {
+		lo, _ := doc_sel_range(doc)
+		set_cursor(doc, lo, false) // collapse to selection start
+		return
+	}
+	set_cursor(doc, prev_rune(doc, doc.cursor), select)
+}
 
-doc_cursor_up :: proc(doc: ^Document) {
+doc_cursor_right :: proc(doc: ^Document, select: bool) {
+	if !select && doc_has_sel(doc) {
+		_, hi := doc_sel_range(doc)
+		set_cursor(doc, hi, false) // collapse to selection end
+		return
+	}
+	set_cursor(doc, next_rune(doc, doc.cursor), select)
+}
+
+doc_cursor_home :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_line_start(&doc.pt, doc.cursor), select)}
+doc_cursor_end :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_line_end(&doc.pt, doc.cursor), select)}
+
+doc_cursor_up :: proc(doc: ^Document, select: bool) {
 	ls := base.pt_line_start(&doc.pt, doc.cursor)
-	if ls == 0 {return}
+	if ls == 0 {
+		set_cursor(doc, 0, select)
+		return
+	}
 	col := doc.cursor - ls
 	prev := base.pt_prev_line_start(&doc.pt, doc.cursor)
-	doc.cursor = min(prev + col, base.pt_line_end(&doc.pt, prev))
+	set_cursor(doc, min(prev + col, base.pt_line_end(&doc.pt, prev)), select)
 }
 
-doc_cursor_down :: proc(doc: ^Document) {
+doc_cursor_down :: proc(doc: ^Document, select: bool) {
 	ls := base.pt_line_start(&doc.pt, doc.cursor)
 	col := doc.cursor - ls
 	nl := base.pt_next_line_start(&doc.pt, doc.cursor)
 	if nl == doc.pt.length && base.pt_line_end(&doc.pt, nl) == nl && ls == base.pt_line_start(&doc.pt, nl) {
-		return // already on the last line
+		return
 	}
-	doc.cursor = min(nl + col, base.pt_line_end(&doc.pt, nl))
+	set_cursor(doc, min(nl + col, base.pt_line_end(&doc.pt, nl)), select)
+}
+
+// --- word boundaries, word nav, click selection, hit-test ---
+
+@(private = "file")
+is_word :: proc(b: u8) -> bool {
+	return(b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_' || b >= 0x80
+}
+
+@(private = "file")
+word_left_of :: proc(doc: ^Document, pos: int) -> int {
+	p := pos
+	for p > 0 && !is_word(byte_at(doc, p - 1)) {p -= 1}
+	for p > 0 && is_word(byte_at(doc, p - 1)) {p -= 1}
+	return p
+}
+
+@(private = "file")
+word_right_of :: proc(doc: ^Document, pos: int) -> int {
+	L := doc.pt.length
+	p := pos
+	for p < L && !is_word(byte_at(doc, p)) {p += 1}
+	for p < L && is_word(byte_at(doc, p)) {p += 1}
+	return p
+}
+
+doc_word_left :: proc(doc: ^Document, select: bool) {set_cursor(doc, word_left_of(doc, doc.cursor), select)}
+doc_word_right :: proc(doc: ^Document, select: bool) {set_cursor(doc, word_right_of(doc, doc.cursor), select)}
+
+doc_delete_word_back :: proc(doc: ^Document) {
+	if doc_has_sel(doc) {
+		doc_backspace(doc)
+		return
+	}
+	p := word_left_of(doc, doc.cursor)
+	if p == doc.cursor {return}
+	push_undo(doc)
+	doc.nl_delta -= count_newlines(doc, p, doc.cursor - p)
+	base.pt_delete(&doc.pt, p, doc.cursor - p)
+	set_cursor(doc, p, false)
+}
+
+doc_select_all :: proc(doc: ^Document) {
+	doc.anchor = 0
+	doc.cursor = doc.pt.length
+}
+
+doc_select_word_at :: proc(doc: ^Document, pos: int) {
+	L := doc.pt.length
+	if pos < L && is_word(byte_at(doc, pos)) {
+		s, e := pos, pos
+		for s > 0 && is_word(byte_at(doc, s - 1)) {s -= 1}
+		for e < L && is_word(byte_at(doc, e)) {e += 1}
+		doc.anchor, doc.cursor = s, e
+	} else {
+		doc.anchor = pos
+		doc.cursor = next_rune(doc, pos)
+	}
+}
+
+doc_select_line_at :: proc(doc: ^Document, pos: int) {
+	doc.anchor = base.pt_line_start(&doc.pt, pos)
+	doc.cursor = base.pt_next_line_start(&doc.pt, pos) // include the newline
+}
+
+// Byte offset under a client-space pixel (monospace column mapping).
+doc_pos_at :: proc(doc: ^Document, mx, my: i32, px, char_w: f32, rows: int) -> int {
+	line_h := px * 1.5
+	row := int((f32(my) - 10) / line_h) // rows start at y=10 (see doc_draw)
+	row = clamp(row, 0, rows - 1)
+	pos := doc.top
+	for _ in 0 ..< row {
+		nt := base.pt_next_line_start(&doc.pt, pos)
+		if nt == pos {break}
+		pos = nt
+	}
+	end := base.pt_line_end(&doc.pt, pos)
+	col := int((f32(mx) - 12) / char_w + 0.5)
+	if col < 0 {col = 0}
+	return min(pos + col, end)
+}
+
+// Selection highlight rectangles for the visible lines (opaque; drawn behind
+// text). Fills `out`, returns the count.
+doc_selection_rects :: proc(doc: ^Document, px, char_w: f32, rows: int, out: []plat.Quad) -> int {
+	lo, hi := doc_sel_range(doc)
+	if lo == hi {return 0}
+	x0: f32 = 12
+	line_h := px * 1.5
+	y0 := px + 10
+	col := [4]f32{0.20, 0.30, 0.48, 1}
+
+	pos, n := doc.top, 0
+	for r in 0 ..< rows {
+		if pos > doc.pt.length {break}
+		end := base.pt_line_end(&doc.pt, pos)
+		if lo <= end && hi > pos && n < len(out) { // selection overlaps [pos, end]
+			startcol := max(pos, lo) - pos
+			endcol := min(end, hi) - pos
+			sx := x0 + f32(startcol) * char_w
+			ex := x0 + f32(endcol) * char_w
+			if hi > end {ex += char_w * 0.4} // selection continues past EOL: show the newline
+			ry := y0 + f32(r) * line_h - px
+			out[n] = {pos = {sx, ry}, size = {max(ex - sx, 2), line_h}, color = col}
+			n += 1
+		}
+		if end >= doc.pt.length {break}
+		pos = end + 1
+	}
+	return n
 }
 
 // --- viewport ---

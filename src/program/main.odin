@@ -43,7 +43,7 @@ main :: proc() {
 		fmt.printfln("insert AB\\n : %q  (%d lines)", pre(doc_debug_string(&doc)), doc.nl_delta)
 		doc_backspace(&doc)
 		fmt.printfln("backspace  : %q", pre(doc_debug_string(&doc)))
-		doc_cursor_right(&doc)
+		doc_cursor_right(&doc, false)
 		doc_delete_fwd(&doc)
 		fmt.printfln("del-fwd @1 : %q", pre(doc_debug_string(&doc)))
 		doc_undo(&doc)
@@ -70,6 +70,30 @@ main :: proc() {
 			fmt.printfln("reopened %q (%d bytes, enc=%v)", s[:min(len(s), 16)], doc2.pt.length, doc2.enc)
 			doc_close(&doc2)
 		}
+		return
+	}
+
+	// Headless selection/clipboard check: `newtpad <path> seltest`.
+	if len(os.args) > 2 && os.args[2] == "seltest" {
+		p8 :: proc(s: string) -> string {return s[:min(len(s), 14)]}
+		doc, _ := doc_open(path) // e.g. "hello world foo"
+		doc.anchor = 6
+		doc.cursor = 11
+		fmt.printfln("selection [6,11): %q", doc_selected_text(&doc, context.temp_allocator))
+		doc_insert_rune(&doc, 'Z') // replace selection
+		fmt.printfln("replace sel : %q", p8(doc_debug_string(&doc)))
+		doc_undo(&doc)
+		fmt.printfln("undo        : %q sel=%q", p8(doc_debug_string(&doc)), doc_selected_text(&doc, context.temp_allocator))
+		doc_select_word_at(&doc, 2) // inside "hello"
+		lo, hi := doc_sel_range(&doc)
+		fmt.printfln("word@2      : [%d,%d) %q", lo, hi, doc_selected_text(&doc, context.temp_allocator))
+		doc_select_all(&doc)
+		fmt.printfln("select all  : anchor=%d cursor=%d", doc.anchor, doc.cursor)
+		plat.clipboard_set_text(nil, "clip round-trip ✓")
+		if g, gok := plat.clipboard_get_text(nil, context.temp_allocator); gok {
+			fmt.printfln("clipboard   : %q", g)
+		}
+		doc_close(&doc)
 		return
 	}
 
@@ -129,19 +153,24 @@ main :: proc() {
 		}
 		window.char_count = 0
 		for i in 0 ..< window.key_count {
-			#partial switch window.key_cmds[i] {
+			ev := window.key_events[i]
+			#partial switch ev.cmd {
 			case .Left:
-				doc_cursor_left(&doc)
+				doc_cursor_left(&doc, ev.shift)
 			case .Right:
-				doc_cursor_right(&doc)
+				doc_cursor_right(&doc, ev.shift)
 			case .Up:
-				doc_cursor_up(&doc)
+				doc_cursor_up(&doc, ev.shift)
 			case .Down:
-				doc_cursor_down(&doc)
+				doc_cursor_down(&doc, ev.shift)
 			case .Home:
-				doc_cursor_home(&doc)
+				doc_cursor_home(&doc, ev.shift)
 			case .End:
-				doc_cursor_end(&doc)
+				doc_cursor_end(&doc, ev.shift)
+			case .WordLeft:
+				doc_word_left(&doc, ev.shift)
+			case .WordRight:
+				doc_word_right(&doc, ev.shift)
 			case .PageUp:
 				doc_scroll(&doc, -(rows - 1))
 			case .PageDown:
@@ -150,12 +179,29 @@ main :: proc() {
 				doc_backspace(&doc)
 			case .DeleteFwd:
 				doc_delete_fwd(&doc)
+			case .DeleteWordBack:
+				doc_delete_word_back(&doc)
 			case .Enter:
 				doc_insert_rune(&doc, '\n')
 			case .Undo:
 				doc_undo(&doc)
 			case .Redo:
 				doc_redo(&doc)
+			case .SelectAll:
+				doc_select_all(&doc)
+			case .Copy:
+				if s := doc_selected_text(&doc, context.temp_allocator); s != "" {
+					plat.clipboard_set_text(window.hwnd, s)
+				}
+			case .Cut:
+				if s := doc_selected_text(&doc, context.temp_allocator); s != "" {
+					plat.clipboard_set_text(window.hwnd, s)
+					doc_backspace(&doc) // deletes the selection
+				}
+			case .Paste:
+				if s, cok := plat.clipboard_get_text(window.hwnd, context.temp_allocator); cok {
+					doc_insert_text(&doc, transmute([]u8)s)
+				}
 			case .Save:
 				p := doc.path
 				if p == "" {
@@ -173,6 +219,26 @@ main :: proc() {
 			}
 		}
 		window.key_count = 0
+
+		// Mouse: press places/extends the caret (double=word, triple=line); drag extends.
+		if window.mouse_pressed {
+			mp := doc_pos_at(&doc, window.mouse_x, window.mouse_y, px, char_w, rows)
+			switch window.mouse_count {
+			case 2:
+				doc_select_word_at(&doc, mp)
+			case 3:
+				doc_select_line_at(&doc, mp)
+			case:
+				doc.cursor = mp
+				if !window.mouse_shift {
+					doc.anchor = mp
+				}
+			}
+			window.mouse_pressed = false
+		} else if window.mouse_down {
+			doc.cursor = doc_pos_at(&doc, window.mouse_x, window.mouse_y, px, char_w, rows)
+		}
+
 		if window.scroll_delta != 0 {
 			doc_scroll(&doc, window.scroll_delta)
 			window.scroll_delta = 0
@@ -181,6 +247,14 @@ main :: proc() {
 		doc_ensure_cursor_visible(&doc, rows)
 
 		plat.gfx_begin_frame(&gfx, 0.09, 0.11, 0.16)
+
+		// Selection highlights, behind the text.
+		selq: [80]plat.Quad
+		ns := doc_selection_rects(&doc, px, char_w, rows, selq[:])
+		if ns > 0 {
+			plat.quads_draw(&gfx, &quad_pipe, selq[:ns])
+		}
+
 		cx, cy, caret, bottom := doc_draw(&gfx, &text, &doc, px, char_w, rows)
 
 		// Scrollbar (byte-proportional) + caret, both solid quads.
