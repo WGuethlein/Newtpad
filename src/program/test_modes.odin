@@ -139,6 +139,37 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			want := at if i == 0 else later
 			fmt.printfln("  match %d at %d want %d  %s", i, m, want, "OK" if m == want else "FAIL")
 		}
+		// Line numbers for the filter gutter, counted by the worker in the same
+		// pass. Every match here is on its own line, so number == index+1 within
+		// its block of the synthetic file.
+		fmt.printfln("filter line numbers: %d recorded (want %d)", len(doc.filter_line_nos), len(doc.filter_lines))
+		nums_ok := len(doc.filter_line_nos) == len(doc.filter_lines)
+		for ln, i in doc.filter_line_nos {
+			want := doc.filter_lines[i] / len(line) + 1 // fixed-width lines
+			if ln != want {
+				fmt.printfln("  line %d: got %d want %d FAIL", i, ln, want)
+				nums_ok = false
+			}
+		}
+		fmt.printfln("line numbers correct: %v  %s", nums_ok, "OK" if nums_ok else "FAIL")
+
+		// The gutter must widen with the largest number, and col_x/col_at_x must
+		// both shift by it or the caret lands in the wrong column.
+		{
+			t2: plat.Text
+			plat.text_load_faces(&t2)
+			cw := plat.text_char_width(&t2, 16)
+			doc.filter = true
+			doc_update_gutter(&doc, cw)
+			g := GUTTER_W
+			round := col_at_x(cw, col_x(cw, 7)) == 7
+			fmt.printfln("gutter %0.f px, col_x/col_at_x round-trip: %v  %s", g, round, "OK" if g > 0 && round else "FAIL")
+			doc.filter = false
+			doc_update_gutter(&doc, cw)
+			off := GUTTER_W == 0
+			fmt.printfln("no gutter outside filter view: %v  %s", off, "OK" if off else "FAIL")
+		}
+
 		// Line starts drive the filter view; each match is on its own line here.
 		fmt.printfln("filter lines: %d (want 2)", len(doc.filter_lines))
 		for fl, i in doc.filter_lines {

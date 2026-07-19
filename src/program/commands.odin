@@ -562,6 +562,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		find_open(doc, false)
 		doc.filter = true
 		doc.filter_top = 0
+		// Suppress the jump-to-nearest-match. Opening the filter deliberately
+		// means "show me all of them", so the list starts at the top rather than
+		// scrolled to wherever the caret happened to be.
+		doc.find.jumped = true
 	case .Goto_Line:
 		// Go-to-line lives in the palette as its ':' mode. Routing it through a
 		// real command makes it findable by name and bindable; the palette closes

@@ -5,6 +5,7 @@
 // position since the window buttons don't get client mouse messages.
 package main
 
+import "core:fmt"
 import "core:strings"
 import plat "src:platform"
 
@@ -39,6 +40,37 @@ tabs_limit :: proc(win: ^plat.Window, width: f32) -> f32 {
 	return max(MENU_W, width - 3 * f32(plat.window_caption_btn_w(win)))
 }
 
+// Tabs that don't fit. Drawn as a count rather than silently dropped — with no
+// indicator there was nothing to say the other tabs existed at all.
+tabs_hidden_count :: proc(app: ^App, win: ^plat.Window, width: f32) -> int {
+	limit := tabs_limit(win, width)
+	x := MENU_W - app.tab_scroll
+	shown, live := 0, 0
+	for d in app.docs {
+		if d == nil {continue}
+		live += 1
+		if x + TAB_W <= limit {
+			shown += 1
+			x += TAB_W + TAB_GAP
+		}
+	}
+	// Re-run with the indicator's width reserved, or the count itself can be
+	// what pushes a tab out and the number comes out one too low.
+	if shown < live {
+		limit -= sx(52)
+		x = MENU_W - app.tab_scroll
+		shown = 0
+		for d in app.docs {
+			if d == nil {continue}
+			if x + TAB_W <= limit {
+				shown += 1
+				x += TAB_W + TAB_GAP
+			}
+		}
+	}
+	return live - shown
+}
+
 @(private = "file")
 tabs_right :: proc(app: ^App, win: ^plat.Window, width: f32) -> f32 {
 	x := MENU_W
@@ -57,6 +89,17 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window) -> bool {
 
 	consumed := true
 	limit := tabs_limit(win, f32(win.width)) // must match what tabs_draw drew
+	hidden := tabs_hidden_count(app, win, f32(win.width))
+	if hidden > 0 && mx >= limit - sx(52) && mx < limit {
+		// The overflow count opens the palette's tab list, which can reach any
+		// tab regardless of whether the strip has room to show it.
+		palette_open(app)
+		win.mouse_pressed = false
+		win.mouse_middle_pressed = false
+		win.mouse_down = false
+		return true
+	}
+	if hidden > 0 {limit -= sx(52)}
 	if mx < MENU_W { // menu -> command palette
 		palette_open(app)
 		palette_input_rune(app, '>')
@@ -80,7 +123,7 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window) -> bool {
 				app_activate(app, hit_slot)
 			}
 		} else if x + PLUS_W <= limit && mx >= x && mx < x + PLUS_W { // + -> new tab
-			app_new_scratch(app)
+			app_new_scratch(app, true) // always after the last tab
 		}
 	}
 
@@ -123,11 +166,15 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 	// WM_NCHITTEST claims that region first, so a tab drawn under them looks
 	// clickable but sends HT_CLOSE — one click and the app exits.
 	limit := tabs_limit(win, width)
+	// Reserve room for the overflow indicator when not everything fits, so the
+	// count is never itself clipped.
+	hidden := tabs_hidden_count(app, win, width)
+	if hidden > 0 {limit -= sx(52)}
 	max_cells := int((TAB_W - TAB_CLOSE_W - sx(8)) / char_w)
 	x := MENU_W - app.tab_scroll
 	for d, slot in app.docs {
 		if d == nil {continue}
-		if x + TAB_W > limit {break} // overflow; scrolling the strip is a follow-up
+		if x + TAB_W > limit {break} // overflow; the count is drawn below
 		active := slot == app.active
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {TAB_W, TAB_STRIP_H - sx(4)}, color = tab_bg[2 if active else 1]}})
 
@@ -141,6 +188,16 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 		plat.text_draw(gfx, text, title, x + sx(8), base_y, UI_SMALL_PX, fg)
 		plat.text_draw(gfx, text, "×", x + TAB_W - sx(15), base_y, UI_SMALL_PX, {0.60, 0.64, 0.72, 1})
 		x += TAB_W + TAB_GAP
+	}
+
+	// Overflow count, clickable to reach the hidden tabs via the palette.
+	if hidden > 0 {
+		hx := limit
+		hot := in_bar && f32(cx) >= hx && f32(cx) < hx + sx(52)
+		if hot {
+			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {hx, sx(4)}, size = {sx(52), TAB_STRIP_H - sx(4)}, color = {0.20, 0.23, 0.30, 1}}})
+		}
+		plat.text_draw(gfx, text, fmt.tprintf("+%d ▸", hidden), hx + sx(6), base_y, UI_SMALL_PX, {0.75, 0.79, 0.86, 1})
 	}
 
 	// new-tab button, only if it fits clear of the caption buttons

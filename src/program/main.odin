@@ -151,7 +151,8 @@ main :: proc() {
 		// no click in that strip lands on a row the user cannot see.
 		rows := doc_visible_rows(doc, f32(window.height), line_h)
 		// Usable content width in cells (word wrap breaks here).
-		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - SCROLLBAR_W) / char_w))
+		doc_update_gutter(doc, char_w) // before view_cols: the gutter narrows the text
+		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - GUTTER_W - SCROLLBAR_W) / char_w))
 		doc.view_rows = rows
 		// Re-center on the caret only when it actually moves on THIS tab — never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
@@ -311,6 +312,16 @@ main :: proc() {
 			}
 		}
 
+		// The find/status bar owns the bottom strip. Reserving rows keeps text
+		// from being drawn there, but doc_pos_at clamps an out-of-range row onto
+		// the last one, so a click in the bar still moved the caret and a drag
+		// still selected. Consume it instead.
+		if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
+			window.mouse_pressed = false
+			window.mouse_middle_pressed = false
+			window.mouse_down = false
+		}
+
 		// Mouse: press places/extends the caret (double=word, triple=line); drag extends.
 		if window.mouse_pressed {
 			mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
@@ -449,6 +460,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	px, char_w, line_h := rc.px, rc.char_w, rc.line_h
 	doc := app_active(rc.app)
 	rows := doc_visible_rows(doc, f32(window.height), line_h)
+	doc_update_gutter(doc, char_w) // resize repaints come through here too
 	// Recompute the wrap width here (not just in the main loop) so word wrap
 	// re-flows live during a resize, which repaints through this path.
 	doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - SCROLLBAR_W) / char_w))

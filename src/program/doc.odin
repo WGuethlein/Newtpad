@@ -96,10 +96,27 @@ row_baseline_y :: #force_inline proc(px: f32, r: int) -> f32 {return px + CONTEN
 // Top y of a line-height-tall highlight box for row r.
 row_rect_y :: #force_inline proc(px: f32, r: int) -> f32 {return CONTENT_TOP + f32(r) * line_height(px)}
 // Left x of column `col` (monospace).
-col_x :: #force_inline proc(char_w: f32, col: int) -> f32 {return TEXT_MARGIN_X + f32(col) * char_w}
+// Width of the line-number gutter, 0 when there isn't one. Set once per frame
+// (doc_update_gutter) and added by BOTH col_x and col_at_x, so the drawn column
+// and the hit-tested column cannot disagree about where text begins.
+GUTTER_W: f32 = 0
+
+// Recompute the gutter for the active document. Only the filter view has one:
+// its whole purpose is showing lines out of context, which is meaningless
+// without saying which lines they are.
+doc_update_gutter :: proc(doc: ^Document, char_w: f32) {
+	GUTTER_W = 0
+	if doc == nil || !doc_filtering(doc) || len(doc.filter_line_nos) == 0 {return}
+	biggest := doc.filter_line_nos[len(doc.filter_line_nos) - 1]
+	digits := 1
+	for v := biggest; v >= 10; v /= 10 {digits += 1}
+	GUTTER_W = f32(digits + 2) * char_w
+}
+
+col_x :: #force_inline proc(char_w: f32, col: int) -> f32 {return TEXT_MARGIN_X + GUTTER_W + f32(col) * char_w}
 // Inverse mappings for hit-testing a client-space pixel.
 row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - CONTENT_TOP) / line_height(px))}
-col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return max(0, int((mx - TEXT_MARGIN_X) / char_w + 0.5))}
+col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w + 0.5))}
 
 // --- word wrap: break a logical line into visual rows at doc.view_cols cells ---
 
@@ -353,6 +370,10 @@ Document :: struct {
 	// filter-to-matching-lines view (only while find is active)
 	filter:       bool,
 	filter_lines: [dynamic]int, // deduped matching-line starts
+	// 1-based line number for each entry above, counted by the search worker
+	// during its pass. Without it a filtered view shows matching lines with no
+	// indication of where in the file they came from.
+	filter_line_nos: [dynamic]int,
 	filter_top:   int, // index into filter_lines
 }
 
@@ -454,6 +475,7 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.find.query)
 	delete(doc.find.replace)
 	delete(doc.filter_lines)
+	delete(doc.filter_line_nos)
 	base.pt_destroy(&doc.pt)
 	if doc.owned_orig {
 		delete(doc.original)
@@ -1324,6 +1346,16 @@ doc_draw :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, px, char_w: f32,
 		vis := n
 		if vis > 0 && line_buf[vis - 1] == '\r' {vis -= 1}
 		if vis > 0 {
+			// Line number, when the filter view is showing lines out of context.
+			if GUTTER_W > 0 {
+				fi := doc.filter_top + row
+				if fi < len(doc.filter_line_nos) {
+					num := fmt.tprintf("%d", doc.filter_line_nos[fi])
+					// Right-aligned against the gutter's text edge.
+					nx := TEXT_MARGIN_X + GUTTER_W - f32(len(num) + 1) * char_w
+					plat.text_draw(gfx, t, num, nx, row_y, px, {0.42, 0.47, 0.56, 1})
+				}
+			}
 			plat.text_draw(gfx, t, string(line_buf[:vis]), col_x(char_w, 0), row_y, px, fg)
 		}
 

@@ -51,6 +51,7 @@ Search :: struct {
 	matches:    []int, // fixed MAX_MATCHES capacity, written by index
 	match_len:  []int,
 	line_start: []int, // line start of each match, computed here (see below)
+	line_no:    []int, // 1-based line number of each match, counted in the same pass
 	count:      int, // atomic: how many entries are published
 	scanned:    int, // atomic: bytes scanned, for progress
 	total:      int,
@@ -138,7 +139,8 @@ search_release :: proc(doc: ^Document) {
 	delete(s.matches)
 	delete(s.match_len)
 	delete(s.line_start)
-	s.matches, s.match_len, s.line_start = nil, nil, nil
+	delete(s.line_no)
+	s.matches, s.match_len, s.line_start, s.line_no = nil, nil, nil, nil
 	doc.find.matches, doc.find.match_len = nil, nil
 	doc.find.merged = 0
 }
@@ -162,6 +164,7 @@ search_reset :: proc(doc: ^Document) {
 		s.matches = make([]int, MAX_MATCHES)
 		s.match_len = make([]int, MAX_MATCHES)
 		s.line_start = make([]int, MAX_MATCHES)
+		s.line_no = make([]int, MAX_MATCHES)
 	}
 	intrinsics.atomic_store(&s.count, 0)
 	intrinsics.atomic_store(&s.scanned, 0)
@@ -179,6 +182,7 @@ search_reset :: proc(doc: ^Document) {
 	f.dirty = false
 	f.current = -1
 	clear(&doc.filter_lines)
+	clear(&doc.filter_line_nos)
 	doc.filter_top = 0
 }
 
@@ -238,6 +242,7 @@ find_merge :: proc(doc: ^Document) {
 		ls := s.line_start[i]
 		if len(doc.filter_lines) == 0 || doc.filter_lines[len(doc.filter_lines) - 1] != ls {
 			append(&doc.filter_lines, ls)
+			append(&doc.filter_line_nos, s.line_no[i]) // for the filter gutter
 		}
 	}
 	f.merged = n
@@ -302,10 +307,11 @@ scan_all :: proc(s: ^Search, pt: ^base.Piece_Table) {
 
 // Record a match; returns false when the result arrays are full.
 @(private = "file")
-emit :: proc(s: ^Search, n: ^int, at, length, line_start: int) -> bool {
+emit :: proc(s: ^Search, n: ^int, at, length, line_start, line_no: int) -> bool {
 	s.matches[n^] = at
 	s.match_len[n^] = length
 	s.line_start[n^] = line_start
+	s.line_no[n^] = line_no
 	n^ += 1
 	if n^ >= MAX_MATCHES {
 		intrinsics.atomic_store(&s.truncated, true)
@@ -328,7 +334,10 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table) {
 	buf := make([]u8, SEARCH_BLOCK + len(q) - 1)
 	defer delete(buf)
 
-	n, last_nl := 0, -1
+	// nlines counts newlines passed, so the 1-based line number of a match is
+	// nlines+1. Counted here because the scan is already walking every byte —
+	// deriving it later would mean re-scanning the file per match.
+	n, last_nl, nlines := 0, -1, 0
 	pos := 0
 	for pos < L {
 		if intrinsics.atomic_load(&s.cancel) {return}
@@ -352,8 +361,11 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table) {
 			}
 			// Check before updating last_nl: a match starting on a '\n' belongs
 			// to the line that newline terminates, not the one it begins.
-			if hit && !emit(s, &n, pos + k, len(q), last_nl + 1) {return}
-			if buf[k] == '\n' {last_nl = pos + k}
+			if hit && !emit(s, &n, pos + k, len(q), last_nl + 1, nlines + 1) {return}
+			if buf[k] == '\n' {
+				last_nl = pos + k
+				nlines += 1
+			}
 		}
 		pos += SEARCH_BLOCK
 		intrinsics.atomic_store(&s.count, n)
@@ -388,7 +400,7 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table) {
 	ctx.temp_allocator = ctx.allocator
 	context = ctx
 
-	n, last_nl := 0, -1
+	n, last_nl, nlines := 0, -1, 0
 	pos := 0
 	for pos < L {
 		if intrinsics.atomic_load(&s.cancel) {return}
@@ -421,12 +433,18 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table) {
 			}
 			ms, me := cap.pos[0][0], cap.pos[0][1]
 			for ; c < ms; c += 1 {
-				if buf[c] == '\n' {last_nl = pos + c}
+				if buf[c] == '\n' {
+					last_nl = pos + c
+					nlines += 1
+				}
 			}
-			if !emit(s, &n, pos + ms, me - ms, last_nl + 1) {return}
+			if !emit(s, &n, pos + ms, me - ms, last_nl + 1, nlines + 1) {return}
 		}
 		for ; c < got; c += 1 {
-			if buf[c] == '\n' {last_nl = pos + c}
+			if buf[c] == '\n' {
+				last_nl = pos + c
+				nlines += 1
+			}
 		}
 		pos += got
 		intrinsics.atomic_store(&s.count, n)

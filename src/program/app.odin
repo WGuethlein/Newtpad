@@ -48,13 +48,25 @@ app_live_count :: proc(a: ^App) -> (n: int) {
 }
 
 // Place a document in a free slot (reusing a nil one) and return its slot.
-app_add :: proc(a: ^App, d: ^Document) -> int {
+// `at_end` places the tab after all existing ones instead of reusing a freed
+// slot. Reuse keeps the slot array compact, but it makes a new tab appear in the
+// middle of the strip wherever a tab was last closed, which is not where the
+// user just clicked "+".
+app_add :: proc(a: ^App, d: ^Document, at_end := false) -> int {
 	a.next_gen += 1
 	d.gen = a.next_gen // identifies this document across slot reuse
-	for slot, i in a.docs {
-		if slot == nil {
-			a.docs[i] = d
-			return i
+	if !at_end {
+		for slot, i in a.docs {
+			if slot == nil {
+				a.docs[i] = d
+				return i
+			}
+		}
+	} else {
+		// Trailing empty slots would still put it before live tabs; drop them
+		// first so "end" really is the end.
+		for len(a.docs) > 0 && a.docs[len(a.docs) - 1] == nil {
+			pop(&a.docs)
 		}
 	}
 	append(&a.docs, d)
@@ -83,11 +95,11 @@ app_activate :: proc(a: ^App, slot: int) {
 	}
 }
 
-app_new_scratch :: proc(a: ^App) {
+app_new_scratch :: proc(a: ^App, at_end := false) {
 	d := new(Document)
 	d^ = doc_new()
 	d.wrap = a.settings.wrap_default
-	app_activate(a, app_add(a, d))
+	app_activate(a, app_add(a, d, at_end))
 }
 
 // Open a Settings or Font tab, or switch to it if one is already open — these

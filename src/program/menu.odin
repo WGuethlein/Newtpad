@@ -149,6 +149,11 @@ Menu_State :: struct {
 	mode: bool,
 	open: int, // -1 = no dropdown
 	item: int, // highlighted item within the open dropdown
+	// First visible row when the dropdown is taller than the window. Without
+	// scrolling, items past the clip were simply unreachable — on a short window
+	// the last entries of the Edit menu could not be seen or selected at all.
+	top:  int,
+	rows: int, // rows drawn last frame; the hit-test must use the same count
 }
 
 // Must be called before the first frame: the zero value of `open` is 0, which
@@ -158,6 +163,8 @@ menu_init :: proc(m: ^Menu_State) {
 	m.open = -1
 	m.item = -1
 	m.mode = false
+	m.top = 0
+	m.rows = 0
 }
 
 menu_close :: proc(app: ^App) {
@@ -292,6 +299,8 @@ menu_open_at :: proc(app: ^App, mi: int) {
 	app.menu.mode = true
 	app.menu.open = clamp(mi, 0, len(menus) - 1)
 	app.menu.item = menu_step(app, app.menu.open, 0, 1)
+	app.menu.top = 0 // the draw scrolls this to keep the highlight visible
+	app.menu.rows = 0
 }
 
 // --- layout ---
@@ -392,8 +401,15 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 			{pos = {x0, y0 + sx(1)}, size = {dw, h}, color = MENU_COL.drop},
 		})
 
+	// Keep the highlighted item visible, then draw from the scroll offset.
+	menu_scroll_to_item(app, items, h)
+	app.menu.rows = rows_fitting(items, app.menu.top, h)
+	more_above := app.menu.top > 0
+	more_below := app.menu.top + app.menu.rows < len(items)
+
 	y := y0 + sx(1)
-	for it, i in items {
+	for i := app.menu.top; i < len(items); i += 1 {
+		it := items[i]
 		if it.cmd == .None { // separator
 			sh := MENU_ITEM_H * 0.4
 			if y + sh > y0 + h {break}
@@ -416,6 +432,15 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 		}
 		y += MENU_ITEM_H
 	}
+
+	// Say that there is more. Silently truncating is what hid Edit > Font on a
+	// short window.
+	if more_above {
+		plat.text_draw(gfx, t, "▲", x0 + dw - sx(16), y0 + sx(12), UI_SMALL_PX, MENU_COL.chord)
+	}
+	if more_below {
+		plat.text_draw(gfx, t, "▼", x0 + dw - sx(16), y0 + h - sx(4), UI_SMALL_PX, MENU_COL.chord)
+	}
 }
 
 // Geometry of the open dropdown. The single source both the draw and the
@@ -429,10 +454,47 @@ menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0,
 	y0 := TAB_STRIP_H + MENU_BAR_H
 	for it in items {h += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
 	// Clamped to the window: a client-space quad cannot leave it, and items drawn
-	// outside would be invisible but still clickable.
+	// outside would be invisible but still clickable. When it doesn't fit, the
+	// dropdown scrolls rather than truncating (see menu.top).
 	h = min(h, max(MENU_ITEM_H, height - y0 - sx(4)))
 	x0 = min(x0, max(0, width - w))
 	return
+}
+
+// Item height, separators included.
+@(private = "file")
+item_h :: proc(it: Menu_Item) -> f32 {return MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
+
+// Rows that fit in `h` starting at item `from`, and whether everything from
+// `from` onward fits. One walk, used by both the draw and the hit-test.
+@(private = "file")
+rows_fitting :: proc(items: []Menu_Item, from: int, h: f32) -> (count: int) {
+	used := f32(0)
+	for i := from; i < len(items); i += 1 {
+		ih := item_h(items[i])
+		if used + ih > h {return}
+		used += ih
+		count += 1
+	}
+	return
+}
+
+// Scroll the dropdown the minimum needed to bring `app.menu.item` into view.
+// Called from the draw, so the hit-test one frame later agrees with what is on
+// screen.
+@(private = "file")
+menu_scroll_to_item :: proc(app: ^App, items: []Menu_Item, h: f32) {
+	m := &app.menu
+	if m.item < 0 {return}
+	if m.item < m.top {m.top = m.item}
+	// Grow `top` until the highlighted item is within the visible run.
+	for {
+		n := rows_fitting(items, m.top, h)
+		if n == 0 {break}
+		if m.item < m.top + n {break}
+		m.top += 1
+	}
+	m.top = clamp(m.top, 0, max(0, len(items) - 1))
 }
 
 // Row index at client (x, y) within the open dropdown, or -1.
@@ -446,12 +508,15 @@ menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> in
 	if mx < x0 || mx >= x0 + w {return -1}
 	y0 := TAB_STRIP_H + MENU_BAR_H + sx(1)
 	if my < y0 || my >= y0 + h {return -1} // below a clipped dropdown is not a row
+	items := menus[app.menu.open].items
 	y := y0
-	for it, i in menus[app.menu.open].items {
-		ih := MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4
+	// Starts at the scroll offset, not at 0 — the row drawn k places down is
+	// item top+k.
+	for i := app.menu.top; i < len(items); i += 1 {
+		ih := item_h(items[i])
 		if y + ih > y0 + h {break} // not drawn, so not selectable
 		if my >= y && my < y + ih {
-			return i if it.cmd != .None else -1
+			return i if items[i].cmd != .None else -1
 		}
 		y += ih
 	}
