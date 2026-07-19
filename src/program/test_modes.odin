@@ -197,6 +197,14 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("%d of %d curated families installed", found, len(plat.FONT_FAMILIES))
 		if found == 0 {bad += 1}
 
+		// The font page must offer only families that actually loaded, and
+		// cycling must stay in range.
+		font_choices_refresh()
+		fmt.printfln("font page offers %d families", len(font_choices))
+		idx_ok := font_choice_index("Consolas") >= 0 && font_choice_index("Not Installed") == 0
+		fmt.printfln("index lookup: known>=0 and unknown->0: %v  %s", idx_ok, "OK" if idx_ok else "FAIL")
+		if !idx_ok {bad += 1}
+
 		// An unknown family must fall back, not fail — a settings file copied
 		// from another machine can name a font that isn't here.
 		okf := plat.text_load_family(&t, "No Such Font 12345", .Regular)

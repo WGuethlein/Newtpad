@@ -160,7 +160,7 @@ main :: proc() {
 		// Drain input once per frame: typed characters route to the find field or
 		// the document; key chords resolve to a command in the active context.
 		for i in 0 ..< window.char_count {
-			if app.settings_open {
+			if app.font_open || app.settings_open {
 				// the settings page has no text fields; swallow typing
 			} else if app.palette.active {
 				palette_input_rune(&app, window.chars[i])
@@ -205,7 +205,9 @@ main :: proc() {
 			// Context is per-event; palette/find/menu/tab-switch can change it
 			// mid-loop. Priority: menu > palette > find > editor.
 			ctx := Ctx.Editor
-			if app.settings_open {
+			if app.font_open {
+				ctx = .Font
+			} else if app.settings_open {
 				ctx = .Settings
 			} else if app.history.open {
 				ctx = .History
@@ -458,7 +460,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	}
 
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
-	if rc.app.settings_open {
+	if rc.app.font_open {
+		font_page_draw(gfx, quad_pipe, text, rc.app, w, h)
+	} else if rc.app.settings_open {
 		settings_draw(gfx, quad_pipe, text, rc.app, w, h)
 	} else if rc.app.history.open {
 		history_draw(gfx, quad_pipe, text, rc.app, w, h)

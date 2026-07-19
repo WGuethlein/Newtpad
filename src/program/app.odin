@@ -19,6 +19,8 @@ App :: struct {
 	settings:      Settings,
 	settings_open: bool,
 	settings_row:  int,
+	font_open:     bool, // Edit > Font page
+	font_row:      int,
 	history:       History_State,
 	palette:    Palette, // command palette overlay (Ctrl+P)
 	// Monotonic id stamped on each Document. The file watcher is the job the

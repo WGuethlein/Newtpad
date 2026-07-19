@@ -20,6 +20,7 @@ Ctx :: enum u8 {
 	Menu,
 	Settings,
 	History,
+	Font,
 }
 
 Command_Id :: enum u8 {
@@ -92,6 +93,13 @@ Command_Id :: enum u8 {
 	Settings_Toggle,
 	Settings_Inc,
 	Settings_Dec,
+	// font page (Edit > Font)
+	Font_Open,
+	Font_Close,
+	Font_Next,
+	Font_Prev,
+	Font_Inc,
+	Font_Dec,
 	Zoom_In,
 	Zoom_Out,
 	Zoom_Reset,
@@ -186,6 +194,12 @@ command_table := [Command_Id]Command {
 	.Settings_Toggle          = {"Settings: Toggle", "View"},
 	.Settings_Inc             = {"Settings: Increase", "View"},
 	.Settings_Dec             = {"Settings: Decrease", "View"},
+	.Font_Open                = {"Font...", "Edit"},
+	.Font_Close               = {"Font: Close", "Edit"},
+	.Font_Next                = {"Font: Next", "Edit"},
+	.Font_Prev                = {"Font: Previous", "Edit"},
+	.Font_Inc                 = {"Font: Next Value", "Edit"},
+	.Font_Dec                 = {"Font: Previous Value", "Edit"},
 	.Zoom_In                  = {"Zoom In", "View"},
 	.Zoom_Out                 = {"Zoom Out", "View"},
 	.Zoom_Reset               = {"Reset Zoom", "View"},
@@ -272,6 +286,13 @@ default_bindings := []Binding {
 	{.Down, false, false, .History, .History_Next},
 	{.Up, false, false, .History, .History_Prev},
 	{.Enter, false, false, .History, .History_Jump},
+	// --- font page context ---
+	{.Escape, false, false, .Font, .Font_Close},
+	{.Down, false, false, .Font, .Font_Next},
+	{.Up, false, false, .Font, .Font_Prev},
+	{.Right, false, false, .Font, .Font_Inc},
+	{.Left, false, false, .Font, .Font_Dec},
+	{.Enter, false, false, .Font, .Font_Inc},
 	// --- settings context ---
 	{.Escape, false, false, .Settings, .Settings_Close},
 	{.Down, false, false, .Settings, .Settings_Next},
@@ -644,6 +665,21 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Zoom_In, .Zoom_Out, .Zoom_Reset:
 		if rc := active_render_ctx; rc != nil {
 			zoom_adjust(rc, 1 if cmd == .Zoom_In else (-1 if cmd == .Zoom_Out else 0))
+		}
+
+	// --- font page ---
+	case .Font_Open:
+		menu_close(app)
+		font_page_open(app)
+	case .Font_Close:
+		font_page_close(app)
+	case .Font_Next:
+		font_page_move(app, 1)
+	case .Font_Prev:
+		font_page_move(app, -1)
+	case .Font_Inc, .Font_Dec:
+		if rc := active_render_ctx; rc != nil {
+			font_page_adjust(rc, app.font_row, 1 if cmd == .Font_Inc else -1)
 		}
 
 	// --- settings page ---

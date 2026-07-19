@@ -55,7 +55,6 @@ font_choices_refresh :: proc() {
 	if len(font_choices) == 0 {append(&font_choices, "Consolas")}
 }
 
-@(private = "file")
 font_choice_index :: proc(name: string) -> int {
 	for n, i in font_choices {
 		if n == name {return i}
@@ -154,13 +153,12 @@ Setting_Row :: struct {
 	help:  string,
 }
 
+// Font lives under Edit > Font, not here: it is something you reach for while
+// working, not a preference you set once. These are the set-and-forget ones.
 SETTINGS_ROWS := []Setting_Row {
-	{"Font", "Monospaced families found on this machine"},
-	{"Style", "Regular / Bold / Italic; a style the family lacks falls back"},
-	{"Font size", "Left / Right to adjust"},
-	{"Zoom", "Ctrl+= / Ctrl+- / Ctrl+0 anywhere, or Ctrl+wheel"},
 	{"Restore session on launch", "Reopen the tabs you had open, including unsaved ones"},
 	{"Word wrap new documents", "Long lines fold to the window width instead of running off"},
+	{"Zoom", "Ctrl+= / Ctrl+- / Ctrl+0 anywhere, or Ctrl+wheel"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
@@ -192,26 +190,12 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 	s := &rc.app.settings
 	switch row {
 	case 0:
-		if len(font_choices) == 0 {font_choices_refresh()}
-		d := dir if dir != 0 else 1
-		i := (font_choice_index(s.font_family) + d + len(font_choices)) % len(font_choices)
-		s.font_family = font_choices[i]
-		settings_apply_font(rc)
+		if dir == 0 {s.restore_session = !s.restore_session}
 	case 1:
-		d := dir if dir != 0 else 1
-		n := int(max(plat.Font_Style)) + 1
-		s.font_style = plat.Font_Style((int(s.font_style) + d + n) % n)
-		settings_apply_font(rc)
+		if dir == 0 {s.wrap_default = !s.wrap_default}
 	case 2:
-		d := dir if dir != 0 else 1
-		s.font_size = clamp(s.font_size + d, FONT_SIZE_MIN, FONT_SIZE_MAX)
-	case 3:
 		zoom_adjust(rc, dir if dir != 0 else 0) // Enter on this row resets
 		return // zoom_adjust already applied and saved
-	case 4:
-		if dir == 0 {s.restore_session = !s.restore_session}
-	case 5:
-		if dir == 0 {s.wrap_default = !s.wrap_default}
 	}
 	settings_apply(rc)
 	settings_save(s^)
@@ -251,17 +235,11 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 		val: string
 		switch i {
 		case 0:
-			val = app.settings.font_family
-		case 1:
-			val = plat.font_style_name(app.settings.font_style)
-		case 2:
-			val = fmt.tprintf("%d", app.settings.font_size)
-		case 3:
-			val = fmt.tprintf("%d%%", app.settings.zoom_pct)
-		case 4:
 			val = "On" if app.settings.restore_session else "Off"
-		case 5:
+		case 1:
 			val = "On" if app.settings.wrap_default else "Off"
+		case 2:
+			val = fmt.tprintf("%d%%", app.settings.zoom_pct)
 		}
 		vc := [4]f32{0.55, 0.85, 0.60, 1} if val != "Off" else [4]f32{0.55, 0.60, 0.70, 1}
 		plat.text_draw(gfx, t, val, width - sx(220), y, UI_PX, vc)
