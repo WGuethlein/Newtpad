@@ -48,6 +48,42 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad sessiontest` round-trips session save -> restore (clobbers the real
+	// session under %APPDATA%\Newtpad, so only run on a dev machine).
+	if os.args[1] == "sessiontest" {
+		tmpf := fmt.tprintf("%s%cnewtpad_sesstest.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+		plat.file_write_atomic(tmpf, transmute([]u8)string("clean file content\nsecond line"))
+		a: App
+		if fd, ok := doc_open(tmpf); ok { // clean tab from a real file
+			d := new(Document);d^ = fd;d.cursor = 3
+			app_add(&a, d)
+		}
+		raw := "unsaved untitled buffer"
+		content := make([]u8, len(raw));copy(content, transmute([]u8)raw)
+		du := new(Document);du^ = doc_from_content(content, "", .UTF8);du.cursor = 8
+		app_add(&a, du)
+		a.active = 1
+		fmt.printfln("saved %d tabs, active=%d", app_live_count(&a), a.active)
+		session_save(&a)
+		app_destroy(&a)
+
+		b: App
+		ok := session_restore(&b)
+		fmt.printfln("restore ok=%v tabs=%d active=%d", ok, app_live_count(&b), b.active)
+		for d, i in b.docs {
+			if d == nil {continue}
+			s := doc_debug_string(d)
+			fmt.printfln("  tab %d: path=%q modified=%v cursor=%d %q", i, d.path, d.modified, d.cursor, s[:min(len(s), 24)])
+		}
+		app_destroy(&b)
+		// reset the session so the GUI doesn't restore this test's tabs
+		empty: App
+		app_new_scratch(&empty)
+		session_save(&empty)
+		app_destroy(&empty)
+		return true
+	}
+
 	// `newtpad wraptest` prints word-wrap segments for a sample paragraph.
 	if os.args[1] == "wraptest" {
 		t: plat.Text

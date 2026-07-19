@@ -259,6 +259,24 @@ doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
 	return doc, true
 }
 
+// Build an in-memory document from `content` (internal UTF-8, ownership taken)
+// for session restore of a dirty/untitled buffer. `path` is the origin file
+// ("" for untitled); the document is marked modified since it differs from disk.
+doc_from_content :: proc(content: []u8, path: string, enc: base.Encoding) -> (doc: Document) {
+	doc.original = content
+	doc.owned_orig = true
+	doc.enc = enc
+	doc.pt = base.pt_init(content)
+	if path != "" {
+		doc.path = strings.clone(path)
+		doc.path_owned = true
+	}
+	doc.modified = true
+	doc.idx.content = content
+	doc.idx.total = len(content)
+	return
+}
+
 doc_index_start :: proc(doc: ^Document) {
 	doc.idx.th = thread.create_and_start_with_data(&doc.idx, index_worker)
 }

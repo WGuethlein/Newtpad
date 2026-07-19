@@ -32,7 +32,6 @@ app_live_count :: proc(a: ^App) -> (n: int) {
 }
 
 // Place a document in a free slot (reusing a nil one) and return its slot.
-@(private = "file")
 app_add :: proc(a: ^App, d: ^Document) -> int {
 	for slot, i in a.docs {
 		if slot == nil {

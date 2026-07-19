@@ -7,6 +7,7 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:time"
 import plat "src:platform"
 
 main :: proc() {
@@ -40,11 +41,15 @@ main :: proc() {
 		return
 	}
 
+	session_sweep_tmp() // clear orphan atomic-write temp files from a prior crash
+
 	app: App
-	if path == "" {
-		app_new_scratch(&app)
-	} else if !app_open_path(&app, path) {
-		fmt.eprintfln("Newtpad: could not open %q; starting empty", path)
+	if path != "" {
+		if !app_open_path(&app, path) {
+			fmt.eprintfln("Newtpad: could not open %q; starting empty", path)
+			app_new_scratch(&app)
+		}
+	} else if !session_restore(&app) { // bare launch: restore last session
 		app_new_scratch(&app)
 	}
 	defer app_destroy(&app)
@@ -59,8 +64,17 @@ main :: proc() {
 	window.on_resize = on_resize
 	window.resize_user = &rc
 
+	// Debounced session autosave: save ~2s after input settles (crash safety).
+	session_dirty := false
+	last_input := time.tick_now()
+
 	for !window.should_close {
 		plat.window_pump_events(window)
+
+		if window.char_count > 0 || window.key_count > 0 || window.mouse_pressed || window.mouse_middle_pressed {
+			session_dirty = true
+			last_input = time.tick_now()
+		}
 
 		if window.resized {
 			plat.gfx_resize(&gfx, window.width, window.height)
@@ -150,8 +164,16 @@ main :: proc() {
 			doc_recover_from_fault(doc)
 			fmt.eprintln("Newtpad: file changed on disk mid-read; showing a recovered copy")
 		}
+
+		// Autosave the session once input has settled.
+		if session_dirty && time.duration_seconds(time.tick_since(last_input)) > 2 {
+			session_save(&app)
+			session_dirty = false
+		}
 		free_all(context.temp_allocator)
 	}
+
+	session_save(&app) // hot-exit: persist tabs + unsaved buffers on window close
 }
 
 // Everything render_frame needs; built once in main and handed to the resize
