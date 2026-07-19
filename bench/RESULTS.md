@@ -141,6 +141,6 @@ for large files and copied into the add-arena for small ones.**
   only; empty-file floor case; remap-on-grow for tails; a separate background
   line-index subsystem for the "instant open" product promise.
 
-This upgrades the PROJECT-RULES "Piece table over mmapped original + append arena —
+This upgrades the locked decision "Piece table over mmapped original + append arena —
 *pending week-1 benchmark*" line from PENDING to **DATA-VALIDATED**, with the
 piece-tree + copy-small-mmap-large + SEH-worker-reads refinements.

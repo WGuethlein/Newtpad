@@ -2,16 +2,17 @@
 
 Rewritten 2026-07-18 after a mid-project audit (devil's-advocate + code review). This is the
 living state doc: what Newtpad is, what works now, how it's built, the debt we're carrying, and
-the roadmap. PROJECT-RULES is the compressed constitution (principles, hard rules, locked decisions,
-git conventions). Research corpus in [research/](research/); buffer benchmark in [bench/](bench/).
+the roadmap. The compressed constitution — principles, hard rules, locked decisions, git
+conventions — is kept locally, outside the repo. Research corpus in [research/](research/);
+buffer benchmark in [bench/](bench/).
 
 ## 1. What Newtpad is
 
 Wyatt's project: a **notepad replacement for Windows** — the text-editor analog of File Pilot
 (filepilot.tech). Identity: **ultra-fast, ultra-small, fully handmade, shipped commercial
-product.** Scope closer to Windows Notepad than Notepad++, with working plugins post-V1. the author
-writes the code; Wyatt directs. Standing rule: **ask the outcome-changing questions before
-substantial work; never rubber-stamp.**
+product.** Scope closer to Windows Notepad than Notepad++, with working plugins post-V1. Wyatt
+directs the work. Standing rule: **ask the outcome-changing questions before substantial work;
+never rubber-stamp.**
 
 ## 2. Current state — what works (30+ commits, one day)
 
@@ -59,7 +60,7 @@ one background job (line-count worker, cancel flag + atomics); frame = `gfx_begi
 reset blend) → find/selection highlight quads → text → caret/scrollbar quads → find bar/status →
 `gfx_end_frame` → `free_all(temp_allocator)`.
 
-## 4. Locked decisions (see PROJECT-RULES; do not relitigate without new evidence)
+## 4. Locked decisions (do not relitigate without new evidence)
 
 Odin; D3D11 + DXGI flip-model; DirectWrite-as-rasterizer → alpha/ClearType atlas → instanced
 quads; handmade immediate-mode UI; **buffer = piece tree over copy-small / mmap-large**
@@ -174,11 +175,11 @@ on the architecture. Two locked decisions were refined **with that DA as the new
   of the doc (geometric realloc series abandoned into the arena = leak) and undo/redo snapshots are
   freed individually mid-session (an arena frees only wholesale). Tabs actually need **stable
   Document addresses** — heap-box Documents (slot array of `^Document`); keep the audited `doc_close`
-  frees. Arena is used only for the immutable original-bytes copy. PROJECT-RULES Memory row updated.
+  frees. Arena is used only for the immutable original-bytes copy. Memory rule updated to match.
 - **Command codegen → runtime enumerated table.** `[Command_Id]Command` enumerated array (compiler
   forces a row per variant) + `#assert` discharges "declare once, register once" and collapses the
   two switches (VK→cmd in platform, cmd→action in program) without a second build-time toolchain
-  step. PROJECT-RULES rule updated. Rebindable keys = a runtime user-keymap overlay, not codegen.
+  step. Command rule updated to match. Rebindable keys = a runtime user-keymap overlay, not codegen.
 - **Generational handles → deferred** (plain slot array): V1's single cancel-join-on-close index
   worker has no cross-frame stale-resolve bug; add handles when a job re-resolves a handle across a
   frame boundary (deferred-merge reindex, background-save-then-notify).
@@ -296,6 +297,5 @@ the exposure is narrow — but it's the last live piece of roadmap item 1.
 - Distill Wyatt's source material into `research/`; keep the report the single source of truth.
 - Flag verified vs judgment; run devil's-advocate on significant designs before recommending.
 - **Git identity:** every commit/push/merge under Wyatt Guethlein's account only — no third-party
-  attribution anywhere (`.local-settings.json` enforces `includeCoAuthoredBy: false`). History
-  reads like a human engineer's: incremental logical commits, plain imperative messages. See
-  PROJECT-RULES "Git conventions."
+  attribution anywhere. History reads like a human engineer's: incremental logical commits, plain
+  imperative messages.

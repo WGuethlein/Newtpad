@@ -7,7 +7,7 @@
 // lookup, NOT shaping). Shaping + font fallback (IDWriteTextAnalyzer) are the
 // next milestone; keep the glyph-run construction fed by an explicit index list
 // so shaping can replace the cmap path without reworking the raster/atlas.
-// Atlas is grow-only for now; eviction is required before ship (PROJECT-RULES rule).
+// Atlas is grow-only for now; eviction is required before ship (project rule).
 package platform
 
 import "core:fmt"
