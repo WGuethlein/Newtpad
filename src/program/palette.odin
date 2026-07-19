@@ -195,7 +195,7 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 			plat.text_draw(gfx, text, command_table[r.cmd].title, x0 + 16, ry + 17, 15, fg)
 			cat := command_table[r.cmd].category
 			plat.text_draw(gfx, text, cat, x0 + PW - 130, ry + 17, 12, {0.5, 0.54, 0.62, 1})
-		} else {
+		} else if r.slot >= 0 && r.slot < len(app.docs) && app.docs[r.slot] != nil {
 			plat.text_draw(gfx, text, doc_display_name(app.docs[r.slot]), x0 + 16, ry + 17, 15, fg)
 		}
 	}

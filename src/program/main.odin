@@ -118,6 +118,15 @@ main :: proc() {
 		// A tab switch/close may have changed the active document.
 		doc = app_active(&app)
 
+		// While the palette is open it's modal: a click anywhere dismisses it and
+		// is consumed, so it never falls through to the tabs/caret handlers.
+		if app.palette.active && (window.mouse_pressed || window.mouse_middle_pressed) {
+			palette_close(&app)
+			window.mouse_pressed = false
+			window.mouse_middle_pressed = false
+			window.mouse_down = false
+		}
+
 		// The tab strip claims clicks in its region before the caret sees them.
 		tabs_hit_test(&app, window)
 
