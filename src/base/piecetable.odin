@@ -9,7 +9,8 @@ package base
 
 Piece :: struct {
 	from_add: bool,
-	start:    int,
+	chunk:    i32, // index into add_chunks (add pieces only)
+	start:    int, // offset within `original`, or within add_chunks[chunk]
 	len:      int,
 }
 
@@ -20,11 +21,25 @@ Node :: struct {
 	sub:         int, // total byte length of this subtree
 }
 
+// The add arena is a list of chunks that are allocated once and never moved,
+// resized, or freed until pt_destroy. A single insert always lands entirely in
+// one chunk, so a piece never spans chunks. This is what makes a piece tree
+// readable from a worker thread: a `[dynamic]u8` arena reallocs on append and
+// frees the old block, so any slice a reader held became dangling the moment the
+// user typed. Chunks don't move, so they don't.
+//
+// Note the header array itself is still a [dynamic] and does realloc when a
+// chunk is added — a reader must not index it concurrently. pt_view hands a
+// worker its own copy of the headers (16 bytes each, not the bytes).
+ADD_CHUNK_MIN :: 4 << 10
+ADD_CHUNK_MAX :: 1 << 20
+
 Piece_Table :: struct {
-	original: []u8,
-	add:      [dynamic]u8,
-	root:     ^Node,
-	length:   int,
+	original:   []u8,
+	add_chunks: [dynamic][]u8,
+	add_used:   int, // bytes used in the last chunk (only the last is ever written)
+	root:       ^Node,
+	length:     int,
 }
 
 // Copy hook for reads out of the immutable `original`. Defaults to a plain copy;
@@ -126,8 +141,8 @@ split :: proc(t: ^Node, pos: int) -> (l, r: ^Node) {
 	}
 	// split point falls inside this node's piece
 	local := pos - lb
-	lp := Piece{t.piece.from_add, t.piece.start, local}
-	rp := Piece{t.piece.from_add, t.piece.start + local, t.piece.len - local}
+	lp := Piece{t.piece.from_add, t.piece.chunk, t.piece.start, local}
+	rp := Piece{t.piece.from_add, t.piece.chunk, t.piece.start + local, t.piece.len - local}
 	tl, tr := t.left, t.right
 	free(t)
 	return merge(tl, mk(lp)), merge(mk(rp), tr)
@@ -135,9 +150,9 @@ split :: proc(t: ^Node, pos: int) -> (l, r: ^Node) {
 
 pt_init :: proc(original: []u8) -> (pt: Piece_Table) {
 	pt.original = original
-	pt.add = make([dynamic]u8, 0, 1024)
+	pt.add_chunks = make([dynamic][]u8, 0, 8)
 	if len(original) > 0 {
-		pt.root = mk(Piece{false, 0, len(original)})
+		pt.root = mk(Piece{false, 0, 0, len(original)})
 		pt.length = len(original)
 	}
 	return
@@ -145,7 +160,31 @@ pt_init :: proc(original: []u8) -> (pt: Piece_Table) {
 
 pt_destroy :: proc(pt: ^Piece_Table) {
 	free_tree(pt.root)
-	delete(pt.add)
+	for c in pt.add_chunks {delete(c)}
+	delete(pt.add_chunks)
+}
+
+// Reserve `n` contiguous bytes in the add arena, growing by a new chunk when the
+// last one can't hold them. Chunk sizes double up to ADD_CHUNK_MAX so a scratch
+// buffer doesn't pay a megabyte for one keystroke; an insert larger than the max
+// gets an exact-size chunk of its own, so an insert never spans chunks.
+@(private = "file")
+add_reserve :: proc(pt: ^Piece_Table, n: int) -> (chunk: i32, start: int) {
+	if len(pt.add_chunks) > 0 {
+		last := pt.add_chunks[len(pt.add_chunks) - 1]
+		if pt.add_used + n <= len(last) {
+			chunk, start = i32(len(pt.add_chunks) - 1), pt.add_used
+			pt.add_used += n
+			return
+		}
+	}
+	size := ADD_CHUNK_MIN
+	if len(pt.add_chunks) > 0 {
+		size = min(len(pt.add_chunks[len(pt.add_chunks) - 1]) * 2, ADD_CHUNK_MAX)
+	}
+	append(&pt.add_chunks, make([]u8, max(size, n)))
+	pt.add_used = n
+	return i32(len(pt.add_chunks) - 1), 0
 }
 
 pt_len :: proc(pt: ^Piece_Table) -> int {return pt.length}
@@ -153,10 +192,10 @@ pt_len :: proc(pt: ^Piece_Table) -> int {return pt.length}
 pt_insert :: proc(pt: ^Piece_Table, pos: int, text: []u8) {
 	if len(text) == 0 {return}
 	p := clamp(pos, 0, pt.length)
-	add_start := len(pt.add)
-	append(&pt.add, ..text)
+	chunk, start := add_reserve(pt, len(text))
+	copy(pt.add_chunks[chunk][start:], text)
 	l, r := split(pt.root, p)
-	pt.root = merge(merge(l, mk(Piece{true, add_start, len(text)})), r)
+	pt.root = merge(merge(l, mk(Piece{true, chunk, start, len(text)})), r)
 	pt.length += len(text)
 }
 
@@ -173,7 +212,10 @@ pt_delete :: proc(pt: ^Piece_Table, pos, count: int) {
 
 @(private = "file")
 piece_src :: proc(pt: ^Piece_Table, p: Piece) -> []u8 {
-	return pt.original[p.start:p.start + p.len] if !p.from_add else pt.add[p.start:p.start + p.len]
+	if p.from_add {
+		return pt.add_chunks[p.chunk][p.start:p.start + p.len]
+	}
+	return pt.original[p.start:p.start + p.len]
 }
 
 @(private = "file")
@@ -231,6 +273,39 @@ clone :: proc(t: ^Node) -> ^Node {
 }
 
 pt_snapshot :: proc(pt: ^Piece_Table) -> ^Node {return clone(pt.root)}
+
+// --- worker views ---
+
+// An immutable read-only view of the buffer as it is right now, safe to hand to
+// another thread and to keep reading while the main thread edits. Cloning the
+// tree is not sufficient on its own: pieces name bytes in `original` and in the
+// add chunks, and readers reach the chunks *through* the header array, which
+// reallocs when a chunk is added. So the view copies the tree and the headers —
+// both proportional to piece/chunk count, never to file size — while the bytes
+// themselves are aliased, because neither `original` nor a chunk ever moves.
+//
+// The view therefore stays valid across any number of edits. It does NOT survive
+// pt_destroy (frees the chunks) or the owning document detaching from a mapped
+// `original`; a worker holding one must be cancelled and joined before either.
+pt_view :: proc(pt: ^Piece_Table, allocator := context.allocator) -> Piece_Table {
+	v: Piece_Table
+	v.original = pt.original
+	v.add_chunks = make([dynamic][]u8, len(pt.add_chunks), allocator)
+	copy(v.add_chunks[:], pt.add_chunks[:])
+	v.add_used = pt.add_used
+	v.root = clone(pt.root)
+	v.length = pt.length
+	return v
+}
+
+// Free a view. Releases only what pt_view allocated — the cloned tree and the
+// header array — never the chunks or `original`, which the document owns.
+pt_view_destroy :: proc(v: ^Piece_Table) {
+	free_tree(v.root)
+	delete(v.add_chunks)
+	v.root = nil
+	v.length = 0
+}
 
 // Replace the tree with `root` (takes ownership), freeing the old one.
 pt_restore :: proc(pt: ^Piece_Table, root: ^Node, length: int) {

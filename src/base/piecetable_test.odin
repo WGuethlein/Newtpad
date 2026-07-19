@@ -100,6 +100,59 @@ test_pt_line_nav :: proc(t: ^testing.T) {
 	testing.expect_value(t, pt_line_start(&pt, 7), 6) // inside XYZ line
 }
 
+// The add arena must survive being written past a chunk boundary: pieces from
+// before the boundary still have to read back correctly.
+@(test)
+test_pt_add_chunk_growth :: proc(t: ^testing.T) {
+	pt := pt_init(transmute([]u8)string("|"))
+	defer pt_destroy(&pt)
+	// Well past ADD_CHUNK_MIN, so several chunks get allocated.
+	for i in 0 ..< 4000 {ins(&pt, pt_len(&pt), "abcdefghij")}
+	testing.expect_value(t, pt_len(&pt), 1 + 4000 * 10)
+	testing.expect(t, len(pt.add_chunks) > 1, "expected multiple add chunks")
+
+	// A read spanning the very first add bytes and the latest ones.
+	dst := make([]u8, 10);defer delete(dst)
+	pt_read(&pt, 1, dst)
+	testing.expect_value(t, string(dst), "abcdefghij")
+	pt_read(&pt, pt_len(&pt) - 10, dst)
+	testing.expect_value(t, string(dst), "abcdefghij")
+
+	// An insert larger than a chunk gets its own chunk and stays contiguous.
+	big := make([]u8, ADD_CHUNK_MAX + 777);defer delete(big)
+	for i in 0 ..< len(big) {big[i] = u8('A' + i % 26)}
+	pt_insert(&pt, 0, big)
+	got := make([]u8, len(big));defer delete(got)
+	pt_read(&pt, 0, got)
+	testing.expect(t, string(got) == string(big), "oversized insert read back wrong")
+}
+
+// A view is the whole reason the add arena is chunked: a worker holds one while
+// the main thread keeps editing, and it must keep reading the buffer as it was.
+@(test)
+test_pt_view_survives_edits :: proc(t: ^testing.T) {
+	pt := pt_init(transmute([]u8)string("hello"))
+	defer pt_destroy(&pt)
+	ins(&pt, 5, " world")
+	before := str(&pt)
+
+	v := pt_view(&pt)
+	defer pt_view_destroy(&v)
+	testing.expect_value(t, v.length, pt_len(&pt))
+
+	// Edit hard enough to allocate new chunks and to free tree nodes the view
+	// also referenced. With a [dynamic]u8 arena this is where the view's bytes
+	// got reallocated out from under it.
+	for i in 0 ..< 5000 {ins(&pt, pt_len(&pt), "0123456789")}
+	pt_delete(&pt, 0, 5)
+
+	// The view still reads the pre-edit buffer.
+	got := make([]u8, v.length);defer delete(got)
+	n := pt_read(&v, 0, got)
+	testing.expect_value(t, n, len(before))
+	testing.expect_value(t, string(got), before)
+}
+
 @(test)
 test_pt_mixed_sequence :: proc(t: ^testing.T) {
 	pt := pt_init(transmute([]u8)string("The quick fox"))
