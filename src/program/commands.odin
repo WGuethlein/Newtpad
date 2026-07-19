@@ -71,6 +71,12 @@ Command_Id :: enum u8 {
 	Tab_Prev,
 	Exit,
 	Reload,
+	// encoding / line endings
+	Enc_UTF8,
+	Enc_UTF16LE,
+	Enc_CP1252,
+	Eol_LF,
+	Eol_CRLF,
 	// menu bar navigation
 	Menu_Close,
 	Menu_Next,
@@ -162,6 +168,11 @@ command_table := [Command_Id]Command {
 	.Tab_Prev                 = {"Previous Tab", "Tabs"},
 	.Exit                     = {"Exit", "File"},
 	.Reload                   = {"Reload from Disk", "File"},
+	.Enc_UTF8                 = {"Save as UTF-8", "Encoding"},
+	.Enc_UTF16LE              = {"Save as UTF-16 LE", "Encoding"},
+	.Enc_CP1252               = {"Save as Windows-1252", "Encoding"},
+	.Eol_LF                   = {"Line Endings: LF (Unix)", "Encoding"},
+	.Eol_CRLF                 = {"Line Endings: CRLF (Windows)", "Encoding"},
 	.Menu_Close               = {"Menu: Close", "View"},
 	.Menu_Next                = {"Menu: Next", "View"},
 	.Menu_Prev                = {"Menu: Previous", "View"},
@@ -565,6 +576,17 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		app_switch_relative(app, -1 if ev.shift else 1) // Shift+Ctrl+Tab -> previous
 	case .Tab_Prev:
 		app_switch_relative(app, -1)
+	case .Enc_UTF8:
+		doc_set_encoding(doc, .UTF8)
+	case .Enc_UTF16LE:
+		doc_set_encoding(doc, .UTF16LE)
+	case .Enc_CP1252:
+		doc_set_encoding(doc, .CP1252)
+	case .Eol_LF:
+		doc_set_line_ending(doc, .LF)
+	case .Eol_CRLF:
+		doc_set_line_ending(doc, .CRLF)
+
 	case .Reload:
 		// Discards unsaved edits, so confirm when there are any. The buffer is
 		// still in the session backup at this point, which is what makes the

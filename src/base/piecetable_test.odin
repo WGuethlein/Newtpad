@@ -153,6 +153,91 @@ test_pt_view_survives_edits :: proc(t: ^testing.T) {
 	testing.expect_value(t, string(got), before)
 }
 
+// A Windows-1252 file must be recognised as such, not passed through as UTF-8.
+// Read as UTF-8 its high bytes are invalid, so the text renders as garbage and —
+// worse — saving writes that garbage back, corrupting the user's file.
+@(test)
+test_encoding_cp1252 :: proc(t: ^testing.T) {
+	// "caf<e9> na<efve" — 0xE9/0xEF are valid CP1252 but invalid UTF-8.
+	raw := []u8{'c', 'a', 'f', 0xE9, ' ', 'n', 'a', 0xEF, 'v', 'e'}
+	enc, bom := detect_encoding(raw)
+	testing.expect_value(t, enc, Encoding.CP1252)
+	testing.expect_value(t, bom, 0)
+
+	out, alloc := decode_to_utf8(raw, enc, bom)
+	defer if alloc {delete(out)}
+	testing.expect(t, alloc, "CP1252 must be transcoded, not aliased")
+	testing.expect_value(t, string(out), "café naïve")
+
+	// And it must round-trip back to the original bytes on save.
+	back := encode_from_utf8(out, .CP1252, false)
+	defer delete(back)
+	testing.expect_value(t, len(back), len(raw))
+	for b, i in back {testing.expect_value(t, b, raw[i])}
+}
+
+// The Windows-1252 range 0x80..0x9F is where it differs from Latin-1 — those
+// bytes are punctuation, not control codes.
+@(test)
+test_encoding_cp1252_high :: proc(t: ^testing.T) {
+	testing.expect_value(t, cp1252_to_rune(0x80), rune(0x20AC)) // euro
+	testing.expect_value(t, cp1252_to_rune(0x93), rune(0x201C)) // left double quote
+	testing.expect_value(t, cp1252_to_rune(0xE9), rune(0xE9)) // e-acute, Latin-1 range
+	b, ok := rune_to_cp1252('€')
+	testing.expect(t, ok, "euro is representable")
+	testing.expect_value(t, b, u8(0x80))
+	_, no := rune_to_cp1252('中') // outside the codepage
+	testing.expect(t, !no, "CJK is not representable in CP1252")
+}
+
+// PowerShell's `>` redirection writes BOM-less UTF-16LE, which read as UTF-8
+// displays as "h\0e\0l\0l\0o\0".
+@(test)
+test_encoding_bomless_utf16 :: proc(t: ^testing.T) {
+	le: [dynamic]u8;defer delete(le)
+	for c in "hello world, a longer line to sniff" {
+		append(&le, u8(c), 0)
+	}
+	enc, bom := detect_encoding(le[:])
+	testing.expect_value(t, enc, Encoding.UTF16LE)
+	testing.expect_value(t, bom, 0)
+
+	be: [dynamic]u8;defer delete(be)
+	for c in "hello world, a longer line to sniff" {
+		append(&be, 0, u8(c))
+	}
+	enc2, _ := detect_encoding(be[:])
+	testing.expect_value(t, enc2, Encoding.UTF16BE)
+
+	// Plain ASCII must NOT be mistaken for UTF-16.
+	enc3, _ := detect_encoding(transmute([]u8)string("just ordinary ascii text here"))
+	testing.expect_value(t, enc3, Encoding.UTF8)
+	// Nor must valid UTF-8 with multi-byte characters.
+	enc4, _ := detect_encoding(transmute([]u8)string("héllo wörld — em dash and 中文"))
+	testing.expect_value(t, enc4, Encoding.UTF8)
+}
+
+@(test)
+test_line_endings :: proc(t: ^testing.T) {
+	testing.expect_value(t, detect_line_ending(transmute([]u8)string("a\nb\nc")), Line_Ending.LF)
+	testing.expect_value(t, detect_line_ending(transmute([]u8)string("a\r\nb\r\n")), Line_Ending.CRLF)
+	testing.expect_value(t, detect_line_ending(transmute([]u8)string("a\r\nb\nc")), Line_Ending.Mixed)
+	testing.expect_value(t, detect_line_ending(transmute([]u8)string("no breaks")), Line_Ending.LF)
+
+	to_crlf := convert_line_endings(transmute([]u8)string("a\nb\nc"), .CRLF)
+	defer delete(to_crlf)
+	testing.expect_value(t, string(to_crlf), "a\r\nb\r\nc")
+
+	to_lf := convert_line_endings(transmute([]u8)string("a\r\nb\r\nc"), .LF)
+	defer delete(to_lf)
+	testing.expect_value(t, string(to_lf), "a\nb\nc")
+
+	// Mixed input normalises cleanly, and a lone CR counts as a break.
+	mixed := convert_line_endings(transmute([]u8)string("a\r\nb\nc\rd"), .LF)
+	defer delete(mixed)
+	testing.expect_value(t, string(mixed), "a\nb\nc\nd")
+}
+
 @(test)
 test_pt_mixed_sequence :: proc(t: ^testing.T) {
 	pt := pt_init(transmute([]u8)string("The quick fox"))

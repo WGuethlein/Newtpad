@@ -6,12 +6,71 @@ package base
 import "core:unicode/utf8"
 
 Encoding :: enum {
-	UTF8,    // also the fallback for BOM-less / ANSI (treated as UTF-8/Latin-ish bytes)
+	UTF8,
 	UTF16LE,
 	UTF16BE,
+	CP1252, // Windows-1252, the Windows "ANSI" codepage
 }
 
-// Sniff a byte-order mark. Returns the encoding and the BOM length to skip.
+encoding_name :: proc(e: Encoding) -> string {
+	switch e {
+	case .UTF8:
+		return "UTF-8"
+	case .UTF16LE:
+		return "UTF-16 LE"
+	case .UTF16BE:
+		return "UTF-16 BE"
+	case .CP1252:
+		return "Windows-1252"
+	}
+	return "?"
+}
+
+// How many bytes to sniff when there is no BOM. Enough to be confident without
+// touching more than the first page of a multi-GB file.
+SNIFF :: 4096
+
+// Is `data` valid UTF-8? Used to tell UTF-8 from Windows-1252, which are
+// indistinguishable by BOM (neither has one) but easy to separate structurally:
+// CP1252's high bytes almost never form valid UTF-8 sequences.
+@(private = "file")
+looks_utf8 :: proc(data: []u8) -> bool {
+	i := 0
+	for i < len(data) {
+		c := data[i]
+		if c < 0x80 {
+			i += 1
+			continue
+		}
+		n := 0
+		switch {
+		case c >= 0xC2 && c <= 0xDF:
+			n = 1
+		case c >= 0xE0 && c <= 0xEF:
+			n = 2
+		case c >= 0xF0 && c <= 0xF4:
+			n = 3
+		case:
+			return false // invalid lead byte (includes 0xC0/0xC1 overlongs)
+		}
+		if i + n >= len(data) {
+			return true // truncated at the sniff boundary; don't judge on a partial
+		}
+		for k in 1 ..= n {
+			if data[i + k] < 0x80 || data[i + k] > 0xBF {return false}
+		}
+		i += n + 1
+	}
+	return true
+}
+
+// Sniff the encoding. Returns it plus the BOM length to skip.
+//
+// Without a BOM there are three candidates and all three matter in practice:
+// UTF-8 (the common case), UTF-16 (PowerShell's `>` redirection writes BOM-less
+// UTF-16LE), and Windows-1252 (anything produced by older Windows tools). Getting
+// this wrong is not cosmetic — a CP1252 file read as UTF-8 renders as garbage and
+// is written back as garbage on save, corrupting the user's file.
 detect_encoding :: proc(data: []u8) -> (enc: Encoding, bom_len: int) {
 	if len(data) >= 3 && data[0] == 0xEF && data[1] == 0xBB && data[2] == 0xBF {
 		return .UTF8, 3
@@ -22,7 +81,122 @@ detect_encoding :: proc(data: []u8) -> (enc: Encoding, bom_len: int) {
 	if len(data) >= 2 && data[0] == 0xFE && data[1] == 0xFF {
 		return .UTF16BE, 2
 	}
-	return .UTF8, 0
+
+	n := min(len(data), SNIFF)
+	if n == 0 {
+		return .UTF8, 0
+	}
+	head := data[:n]
+
+	// BOM-less UTF-16: Latin text alternates a character byte with a NUL, so one
+	// parity position is overwhelmingly NUL and the other almost never is. Plain
+	// UTF-8 text has essentially no NULs at all.
+	even_nul, odd_nul := 0, 0
+	for b, i in head {
+		if b == 0 {
+			if i % 2 == 0 {even_nul += 1} else {odd_nul += 1}
+		}
+	}
+	pairs := n / 2
+	if pairs >= 8 {
+		// >30% of one parity being NUL, and the other essentially clear.
+		if odd_nul * 10 > pairs * 3 && even_nul * 20 < pairs {
+			return .UTF16LE, 0 // "a\0b\0" — NULs in odd positions
+		}
+		if even_nul * 10 > pairs * 3 && odd_nul * 20 < pairs {
+			return .UTF16BE, 0 // "\0a\0b" — NULs in even positions
+		}
+	}
+
+	if looks_utf8(head) {
+		return .UTF8, 0
+	}
+	// High bytes that aren't valid UTF-8: treat as the Windows codepage rather
+	// than passing invalid bytes through as if they were text.
+	return .CP1252, 0
+}
+
+// Line ending style. Newtpad stores text with whatever the file had; this is
+// what it reports and what a conversion targets.
+Line_Ending :: enum {
+	LF, // Unix
+	CRLF, // Windows
+	Mixed, // both present — worth telling the user, since tools disagree about it
+}
+
+line_ending_name :: proc(e: Line_Ending) -> string {
+	switch e {
+	case .LF:
+		return "LF"
+	case .CRLF:
+		return "CRLF"
+	case .Mixed:
+		return "Mixed"
+	}
+	return "?"
+}
+
+// Sniff line endings from the head of the buffer. Bounded, like encoding
+// detection: a multi-GB file must not be scanned to report a status-bar field.
+detect_line_ending :: proc(data: []u8) -> Line_Ending {
+	n := min(len(data), SNIFF)
+	crlf, lf := 0, 0
+	for i in 0 ..< n {
+		if data[i] != '\n' {continue}
+		if i > 0 && data[i - 1] == '\r' {crlf += 1} else {lf += 1}
+	}
+	if crlf > 0 && lf > 0 {return .Mixed}
+	if crlf > 0 {return .CRLF}
+	return .LF // no newlines at all: LF is the harmless default
+}
+
+// Rewrite line endings. Returns a fresh buffer.
+convert_line_endings :: proc(data: []u8, to: Line_Ending, allocator := context.allocator) -> []u8 {
+	out := make([dynamic]u8, 0, len(data) + len(data) / 16, allocator)
+	for i := 0; i < len(data); i += 1 {
+		c := data[i]
+		if c == '\r' {
+			// Normalise CR and CRLF alike; a lone CR is treated as a line break.
+			if i + 1 < len(data) && data[i + 1] == '\n' {i += 1}
+			if to == .CRLF {append(&out, '\r')}
+			append(&out, '\n')
+			continue
+		}
+		if c == '\n' {
+			if to == .CRLF {append(&out, '\r')}
+			append(&out, '\n')
+			continue
+		}
+		append(&out, c)
+	}
+	return out[:]
+}
+
+// Windows-1252 differs from Latin-1 only in 0x80..0x9F, where Latin-1 has unused
+// control codes. Everything else maps to the same codepoint as its byte value.
+@(private = "file")
+CP1252_HIGH := [32]rune {
+	0x20AC, 0x0081, 0x201A, 0x0192, 0x201E, 0x2026, 0x2020, 0x2021,
+	0x02C6, 0x2030, 0x0160, 0x2039, 0x0152, 0x008D, 0x017D, 0x008F,
+	0x0090, 0x2018, 0x2019, 0x201C, 0x201D, 0x2022, 0x2013, 0x2014,
+	0x02DC, 0x2122, 0x0161, 0x203A, 0x0153, 0x009D, 0x017E, 0x0178,
+}
+
+cp1252_to_rune :: proc(b: u8) -> rune {
+	if b < 0x80 {return rune(b)}
+	if b < 0xA0 {return CP1252_HIGH[b - 0x80]}
+	return rune(b) // 0xA0..0xFF match Latin-1 / Unicode
+}
+
+// Reverse of cp1252_to_rune. ok=false when the character has no representation
+// in the codepage, so the caller can warn instead of silently writing '?'.
+rune_to_cp1252 :: proc(r: rune) -> (u8, bool) {
+	if r < 0x80 {return u8(r), true}
+	if r >= 0xA0 && r <= 0xFF {return u8(r), true}
+	for h, i in CP1252_HIGH {
+		if h == r {return u8(0x80 + i), true}
+	}
+	return '?', false
 }
 
 // Decode to UTF-8. UTF-8 input returns the same bytes (BOM stripped), no copy
@@ -33,6 +207,17 @@ decode_to_utf8 :: proc(data: []u8, enc: Encoding, bom_len: int, allocator := con
 	body := data[bom_len:]
 	if enc == .UTF8 {
 		return body, false
+	}
+
+	if enc == .CP1252 {
+		// Every byte is one character, and the high half expands to 2-3 UTF-8
+		// bytes, so reserve generously rather than growing repeatedly.
+		buf := make([dynamic]u8, 0, len(body) + len(body) / 2, allocator)
+		for b in body {
+			bytes, n := utf8.encode_rune(cp1252_to_rune(b))
+			append(&buf, ..bytes[:n])
+		}
+		return buf[:], true
 	}
 
 	buf := make([dynamic]u8, 0, len(body), allocator)
@@ -94,6 +279,18 @@ encode_from_utf8 :: proc(data: []u8, enc: Encoding, add_bom: bool, allocator := 
 		out := make([]u8, len(data), allocator)
 		copy(out, data)
 		return out
+	}
+
+	if enc == .CP1252 {
+		out := make([dynamic]u8, 0, len(data), allocator)
+		i := 0
+		for i < len(data) {
+			r, sz := utf8.decode_rune(data[i:])
+			i += max(sz, 1)
+			b, _ := rune_to_cp1252(r) // unrepresentable characters become '?'
+			append(&out, b)
+		}
+		return out[:]
 	}
 
 	le := enc == .UTF16LE

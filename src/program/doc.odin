@@ -281,6 +281,7 @@ Document :: struct {
 	path:       string, // "" for an unnamed scratch buffer
 	path_owned: bool, // doc.path is heap-owned (freed on close/re-save)
 	had_bom:    bool, // whether the file opened with a BOM (preserved on save)
+	eol:        base.Line_Ending, // as opened; what a save writes back
 	top:        int, // byte offset of the top visible (visual) row
 	cursor:     int, // caret byte offset
 	anchor:     int, // other end of the selection (== cursor when none)
@@ -361,6 +362,7 @@ doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
 	// Guard the scan only when content aliases the mapping (UTF-8, no transcode);
 	// a transcoded or copied original is private memory and can't fault.
 	doc.idx.guard = doc.fv.mapped && !doc.owned_orig
+	doc.eol = base.detect_line_ending(doc.original)
 	doc.disk_stamp = plat.file_stamp(path) // baseline for change detection
 	return doc, true
 }
@@ -675,6 +677,38 @@ doc_redo :: proc(doc: ^Document) {
 	doc.last_edit = .None
 }
 
+// Change the encoding the document will be SAVED as. The buffer is already
+// internal UTF-8, so nothing is re-decoded — only the target changes.
+doc_set_encoding :: proc(doc: ^Document, enc: base.Encoding) {
+	if doc.enc == enc {return}
+	doc.enc = enc
+	if enc != .UTF8 {doc.had_bom = enc == .UTF16LE || enc == .UTF16BE}
+	doc.modified = true // it now differs from what is on disk
+}
+
+// Rewrite the buffer's line endings. A real edit, so it goes through the undo
+// path and can be reverted.
+doc_set_line_ending :: proc(doc: ^Document, eol: base.Line_Ending) {
+	if eol == .Mixed || doc.eol == eol {return}
+	body := base.pt_collect(&doc.pt, context.temp_allocator)
+	converted := base.convert_line_endings(body, eol, context.temp_allocator)
+	if len(converted) == len(body) {
+		doc.eol = eol // nothing actually changed (no line breaks)
+		return
+	}
+	push_undo(doc, .Replace)
+	base.pt_delete(&doc.pt, 0, doc.pt.length)
+	base.pt_insert(&doc.pt, 0, converted)
+	doc.eol = eol
+	doc.cursor = clamp(doc.cursor, 0, doc.pt.length)
+	doc.anchor = doc.cursor
+	doc.nl_delta = 0
+	doc_index_stop(doc)
+	doc.idx.content = doc.original
+	doc.idx.total = len(doc.original)
+	doc_index_start(doc)
+}
+
 // --- external changes ---
 
 // Copy the mapped bytes into private memory and drop the mapping.
@@ -939,17 +973,7 @@ doc_cursor_right :: proc(doc: ^Document, select: bool) {
 	set_cursor(doc, next_rune(doc, doc.cursor), select)
 }
 
-enc_name :: proc(e: base.Encoding) -> string {
-	switch e {
-	case .UTF8:
-		return "UTF-8"
-	case .UTF16LE:
-		return "UTF-16 LE"
-	case .UTF16BE:
-		return "UTF-16 BE"
-	}
-	return "?"
-}
+enc_name :: proc(e: base.Encoding) -> string {return base.encoding_name(e)}
 
 // 1-based line number of the caret, or 0 if it's beyond the scan cap (so the
 // status bar never spends an unbounded scan on a huge file). Cached per cursor

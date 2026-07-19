@@ -8,6 +8,7 @@ import "core:fmt"
 import "core:mem"
 import "core:os"
 import "core:time"
+import base "src:base"
 import plat "src:platform"
 
 main :: proc() {
@@ -518,7 +519,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// while the pen still advances, so text goes missing with no other
 		// symptom. Say so rather than let it look like a corrupt file.
 		atlas := "  [GLYPH CACHE FULL - some text may not draw; reduce zoom or font size]" if plat.text_atlas_full(text) else ""
-		status := fmt.tprintf("%s    %s    %d lines%s%s%s%s%s%s", lncol, enc_name(doc.enc), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, disk, indexing, atlas)
+		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, disk, indexing, atlas)
 		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text)
 		col := [4]f32{0.95, 0.55, 0.35, 1} if warn else {0.55, 0.60, 0.70, 1}
 		plat.text_draw(gfx, text, status, sx(12), h - sx(8), UI_SMALL_PX, col)
