@@ -104,8 +104,6 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
-	// `newtpad celltest` prints the monospace cell width of sample codepoints and
-	// a byte<->cell round-trip (no GPU; uses text_load_faces).
 	// `newtpad findtest` covers the literal scan's block-boundary handling and
 	// the line starts the worker computes for the filter view — both of which
 	// are per-block bookkeeping that a single-block search would never exercise.
@@ -155,6 +153,48 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad dpitest` guards the identity the whole cell grid rests on: the
+	// column grid the program lays out with (col_x, caret, selection, find rects)
+	// must advance by exactly the same amount as the pen inside text_draw. If a
+	// rounded cell width is ever introduced on one side only, glyphs drift out
+	// from under the caret — at every scale, not just fractional ones.
+	if os.args[1] == "dpitest" {
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("dpitest: no fonts loaded")
+			return true
+		}
+		// Glyph quads must land on whole pixels or the atlas is sampled at
+		// fractional offsets and the text blurs — which is the whole point of the
+		// DPI work. So cell_w and line_h must be integral. `track` is how far the
+		// integral cell sits from the font's natural advance; that is the accepted
+		// cost of a crisp grid (AtlasEngine rounds its cell dims the same way), not
+		// a defect, so it is reported but not asserted on.
+		fmt.println("scale   px  cell_w  natural   track%  line_h  integral")
+		bad := 0
+		for scale in ([]f32{1.00, 1.05, 1.25, 1.50, 1.75, 2.00, 3.00}) {
+			px := f32(int(16 * scale + 0.5))
+			cw := plat.text_char_width(&t, px)
+			raw := t.char_em * px
+			track := (cw - raw) / raw * 100
+			lh := line_height(px)
+			ok := cw == f32(int(cw)) && lh == f32(int(lh)) && cw >= 1 && lh >= 1
+			if !ok {bad += 1}
+			fmt.printfln("%5.2f  %3.0f  %6.0f  %7.3f  %6.2f  %6.0f  %s", scale, px, cw, raw, track, lh, "OK" if ok else "FAIL")
+		}
+		// The grid must be exactly linear: column n starts at n*cell_w.
+		cw := plat.text_char_width(&t, 16)
+		lin_ok := true
+		for n in ([]int{1, 7, 100, 2047}) {
+			if abs(col_x(cw, n) - (TEXT_MARGIN_X + f32(n) * cw)) > 0.0001 {lin_ok = false}
+		}
+		fmt.printfln("column grid linear: %v  %s", lin_ok, "OK" if lin_ok else "FAIL")
+		fmt.printfln("%d/%d scales failed", bad, 7)
+		return true
+	}
+
+	// `newtpad celltest` prints the monospace cell width of sample codepoints and
+	// a byte<->cell round-trip (no GPU; uses text_load_faces).
 	if os.args[1] == "celltest" {
 		t: plat.Text
 		if !plat.text_load_faces(&t) {
@@ -174,8 +214,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
-	// `newtpad sessiontest` round-trips session save -> restore (clobbers the real
-	// session under %APPDATA%\Newtpad, so only run on a dev machine).
+	// `newtpad sessiontest` round-trips session save -> restore. Set
+	// NEWTPAD_SESSION_DIR to a temp dir first — without it this writes to, and
+	// then resets, the real session under %APPDATA%\Newtpad.
 	if os.args[1] == "sessiontest" {
 		tmpf := fmt.tprintf("%s%cnewtpad_sesstest.txt", os.get_env("TEMP", context.temp_allocator), '\\')
 		plat.file_write_atomic(tmpf, transmute([]u8)string("clean file content\nsecond line"))

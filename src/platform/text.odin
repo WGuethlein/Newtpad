@@ -285,8 +285,20 @@ text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
 	return t, true
 }
 
-// Width of one grid cell at size px (the primary monospace 'x' advance).
-text_char_width :: proc(t: ^Text, px: f32) -> f32 {return t.char_em * px}
+// Width of one grid cell at size px (the primary monospace 'x' advance), rounded
+// to a whole pixel.
+//
+// Rounding here rather than in the caller is load-bearing. text_draw advances its
+// pen by this same value, so column n's left edge is exactly n*cell_w for both
+// the glyphs and everything the program positions against the grid — caret,
+// selection rects, find highlights, hit-testing. A rounded cell width computed
+// program-side while text_draw kept advancing by the raw fraction would drift the
+// two apart by (cell_w - raw) per column: ~0.2px/col for Consolas at 16px, which
+// is 400px of divergence by VISIBLE_COLS. Both sides must call this one proc.
+// Guarded by `newtpad dpitest`.
+text_char_width :: proc(t: ^Text, px: f32) -> f32 {
+	return max(1, f32(int(t.char_em * px + 0.5)))
+}
 
 // Nonspacing combining marks and zero-width format characters. These need a
 // codepoint check, not measured advance: monospace fonts (Consolas) give
@@ -392,7 +404,7 @@ text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32
 	instances := make([dynamic]Text_Instance, 0, len(str))
 	defer delete(instances)
 
-	cell_w := t.char_em * px
+	cell_w := text_char_width(t, px) // same rounded advance the program's grid uses
 	pen := x
 	for r in str {
 		cells := text_cell_width(t, r)

@@ -31,7 +31,13 @@ LINE_SPACING :: f32(1.5) // line height = font px * this
 // Content-area top edge: below the tab strip.
 CONTENT_TOP :: TAB_STRIP_H + TEXT_MARGIN_Y
 
-line_height :: #force_inline proc(px: f32) -> f32 {return px * LINE_SPACING}
+// Rounded to a whole pixel for the same reason cell width is (see
+// plat.text_char_width): row r's top is r*line_height, and every pass that
+// positions against rows — draw, caret, selection, find rects, hit-testing, and
+// the `rows` count in the frame loop — must agree exactly. At an odd px (105%
+// scale gives px=17) an unrounded px*1.5 is fractional, drifting half a pixel
+// per row: a full row off by row 40.
+line_height :: #force_inline proc(px: f32) -> f32 {return f32(int(px * LINE_SPACING + 0.5))}
 // Text baseline y for visible row r (what text_draw wants).
 row_baseline_y :: #force_inline proc(px: f32, r: int) -> f32 {return px + CONTENT_TOP + f32(r) * line_height(px)}
 // Top y of a line-height-tall highlight box for row r.
