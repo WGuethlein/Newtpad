@@ -93,7 +93,9 @@ main :: proc() {
 		// Drain input once per frame: typed characters route to the find field or
 		// the document; key chords resolve to a command in the active context.
 		for i in 0 ..< window.char_count {
-			if doc.find.active {
+			if app.palette.active {
+				palette_input_rune(&app, window.chars[i])
+			} else if doc.find.active {
 				find_input_rune(doc, window.chars[i])
 			} else {
 				doc_insert_rune(doc, window.chars[i])
@@ -102,8 +104,13 @@ main :: proc() {
 		window.char_count = 0
 		for i in 0 ..< window.key_count {
 			ev := window.key_events[i]
-			// Context is per-event; the active doc may change (tab switch) mid-loop.
-			ctx := Ctx.Find if app_active(&app).find.active else Ctx.Editor
+			// Context is per-event; palette/find/tab-switch can change it mid-loop.
+			ctx := Ctx.Editor
+			if app.palette.active {
+				ctx = .Palette
+			} else if app_active(&app).find.active {
+				ctx = .Find
+			}
 			command_dispatch(resolve_key(ev.key, ev.ctrl, ev.alt, ctx), ev, &app, window, &text, rows)
 		}
 		window.key_count = 0
@@ -236,6 +243,10 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	}
 
 	tabs_draw(gfx, quad_pipe, text, rc.app, w)
+
+	if rc.app.palette.active {
+		palette_draw(gfx, quad_pipe, text, rc.app, w, h)
+	}
 
 	if doc.find.active {
 		f := &doc.find

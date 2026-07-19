@@ -84,6 +84,36 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad palettetest` exercises the command palette's fuzzy match + modes.
+	if os.args[1] == "palettetest" {
+		a: App
+		mk :: proc(a: ^App, name: string) {
+			c := make([]u8, 4);copy(c, transmute([]u8)string("data"))
+			d := new(Document);d^ = doc_from_content(c, name, .UTF8)
+			app_add(a, d)
+		}
+		mk(&a, "notes.txt")
+		mk(&a, "config.json")
+		mk(&a, "readme.md")
+
+		palette_open(&a)
+		for r in "conf" {palette_input_rune(&a, r)}
+		top := a.palette.results[0].slot if len(a.palette.results) > 0 else -1
+		fmt.printfln("tabs 'conf'   -> %d results, top=%q", len(a.palette.results), doc_display_name(a.docs[top]) if top >= 0 else "")
+
+		palette_close(&a);palette_open(&a)
+		for r in ">wrap" {palette_input_rune(&a, r)}
+		tc := a.palette.results[0].cmd if len(a.palette.results) > 0 else Command_Id.None
+		fmt.printfln("cmd  '>wrap'  -> %d results, top=%q (mode=%v)", len(a.palette.results), command_table[tc].title, a.palette.mode)
+
+		palette_close(&a);palette_open(&a)
+		for r in ":42" {palette_input_rune(&a, r)}
+		fmt.printfln("goto ':42'    -> mode=%v", a.palette.mode)
+
+		app_destroy(&a)
+		return true
+	}
+
 	// `newtpad wraptest` prints word-wrap segments for a sample paragraph.
 	if os.args[1] == "wraptest" {
 		t: plat.Text

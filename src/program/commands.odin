@@ -15,6 +15,7 @@ import plat "src:platform"
 Ctx :: enum u8 {
 	Editor,
 	Find,
+	Palette,
 }
 
 Command_Id :: enum u8 {
@@ -45,6 +46,13 @@ Command_Id :: enum u8 {
 	Replace_Open,
 	Clear_Selection,
 	Toggle_Wrap,
+	// command palette
+	Palette_Open,
+	Palette_Close,
+	Palette_Confirm,
+	Palette_Next,
+	Palette_Prev,
+	Palette_Backspace,
 	// tabs
 	Tab_New,
 	Tab_Open,
@@ -99,6 +107,12 @@ command_table := [Command_Id]Command {
 	.Replace_Open             = {"Replace", "Search"},
 	.Clear_Selection          = {"Clear Selection", "Cursor"},
 	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
+	.Palette_Open             = {"Command Palette", "View"},
+	.Palette_Close            = {"Palette: Close", "View"},
+	.Palette_Confirm          = {"Palette: Confirm", "View"},
+	.Palette_Next             = {"Palette: Next", "View"},
+	.Palette_Prev             = {"Palette: Previous", "View"},
+	.Palette_Backspace        = {"Palette: Delete Backward", "View"},
 	.Tab_New                  = {"New Tab", "Tabs"},
 	.Tab_Open                 = {"Open File...", "Tabs"},
 	.Tab_Close                = {"Close Tab", "Tabs"},
@@ -154,6 +168,14 @@ default_bindings := []Binding {
 	{.H, true, false, .Editor, .Replace_Open},
 	{.Escape, false, false, .Editor, .Clear_Selection},
 	{.Z, false, true, .Editor, .Toggle_Wrap}, // Alt+Z
+	{.P, true, false, .Editor, .Palette_Open}, // Ctrl+P
+	// --- palette context ---
+	{.P, true, false, .Palette, .Palette_Close},
+	{.Escape, false, false, .Palette, .Palette_Close},
+	{.Enter, false, false, .Palette, .Palette_Confirm},
+	{.Up, false, false, .Palette, .Palette_Prev},
+	{.Down, false, false, .Palette, .Palette_Next},
+	{.Backspace, false, false, .Palette, .Palette_Backspace},
 	{.N, true, false, .Editor, .Tab_New},
 	{.O, true, false, .Editor, .Tab_Open},
 	{.W, true, false, .Editor, .Tab_Close},
@@ -286,6 +308,20 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Toggle_Wrap:
 		doc.wrap = !doc.wrap
 		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start
+
+	// --- command palette ---
+	case .Palette_Open:
+		palette_open(app)
+	case .Palette_Close:
+		palette_close(app)
+	case .Palette_Confirm:
+		palette_execute(app, w, t, rows)
+	case .Palette_Next:
+		palette_move(app, 1)
+	case .Palette_Prev:
+		palette_move(app, -1)
+	case .Palette_Backspace:
+		palette_backspace(app)
 
 	// --- tabs ---
 	case .Tab_New:

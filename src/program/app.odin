@@ -15,6 +15,7 @@ App :: struct {
 	active:     int, // slot index of the active document
 	mru:        [dynamic]int, // live slots, most-recently-active first
 	tab_scroll: f32, // horizontal scroll of the tab strip (overflow)
+	palette:    Palette, // command palette overlay (Ctrl+P)
 }
 
 app_active :: proc(a: ^App) -> ^Document {
@@ -145,6 +146,8 @@ app_destroy :: proc(a: ^App) {
 	}
 	delete(a.docs)
 	delete(a.mru)
+	delete(a.palette.query)
+	delete(a.palette.results)
 }
 
 // The document's display name: file base name, or "untitled" for a scratch.

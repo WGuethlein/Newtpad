@@ -611,6 +611,18 @@ doc_cursor_right :: proc(doc: ^Document, select: bool) {
 	set_cursor(doc, next_rune(doc, doc.cursor), select)
 }
 
+// Move the caret to the start of 1-based line `n` (O(n) line walk from the top).
+doc_goto_line :: proc(doc: ^Document, n: int) {
+	p := 0
+	for _ in 1 ..< max(n, 1) {
+		np := base.pt_next_line_start(&doc.pt, p)
+		if np == p {break}
+		p = np
+	}
+	doc.cursor = p
+	doc.anchor = p
+}
+
 doc_cursor_home :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_line_start(&doc.pt, doc.cursor), select)}
 doc_cursor_end :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_line_end(&doc.pt, doc.cursor), select)}
 
