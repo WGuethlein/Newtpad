@@ -53,6 +53,10 @@ Document :: struct {
 	redo:       [dynamic]Snapshot,
 	idx:        Line_Index,
 	find:       Find,
+	// filter-to-matching-lines view (only while find is active)
+	filter:       bool,
+	filter_lines: [dynamic]int, // deduped matching-line starts
+	filter_top:   int, // index into filter_lines
 }
 
 // Incremental find/replace state (see find.odin).
@@ -117,6 +121,7 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.find.replace)
 	delete(doc.find.matches)
 	delete(doc.find.match_len)
+	delete(doc.filter_lines)
 	base.pt_destroy(&doc.pt)
 	if doc.owned_orig {
 		delete(doc.original)
@@ -167,6 +172,14 @@ doc_save :: proc(doc: ^Document, path: string) -> bool {
 
 // Materialize the buffer as a string (debug/test only; leaks).
 doc_debug_string :: proc(doc: ^Document) -> string {return string(base.pt_collect(&doc.pt))}
+
+// The text of the line starting at `start` (no trailing newline).
+doc_line_text :: proc(doc: ^Document, start: int, allocator := context.allocator) -> string {
+	end := base.pt_line_end(&doc.pt, start)
+	buf := make([]u8, end - start, allocator)
+	base.pt_read(&doc.pt, start, buf)
+	return string(buf)
+}
 
 doc_line_count :: proc(doc: ^Document) -> int {return intrinsics.atomic_load(&doc.idx.line_count) + doc.nl_delta}
 doc_index_done :: proc(doc: ^Document) -> bool {return intrinsics.atomic_load(&doc.idx.done)}
@@ -552,26 +565,37 @@ doc_draw :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, px, char_w: f32,
 	y0 := px + 10
 
 	line_buf: [2048]u8
-	pos := doc.top
+	pos := doc.top // consecutive-line cursor (non-filter mode)
 	bottom = doc.top
 	for r in 0 ..< rows {
-		if pos > doc.pt.length {break}
-		end := base.pt_line_end(&doc.pt, pos)
+		start: int
+		if doc.filter {
+			fi := doc.filter_top + r
+			if fi >= len(doc.filter_lines) {break}
+			start = doc.filter_lines[fi]
+		} else {
+			if pos > doc.pt.length {break}
+			start = pos
+		}
+		end := base.pt_line_end(&doc.pt, start)
 		bottom = end
 		row_y := y0 + f32(r) * line_h
 
-		draw_len := min(end - pos, len(line_buf))
-		n := base.pt_read(&doc.pt, pos, line_buf[:draw_len])
+		draw_len := min(end - start, len(line_buf))
+		n := base.pt_read(&doc.pt, start, line_buf[:draw_len])
 		vis := n
 		if vis > 0 && line_buf[vis - 1] == '\r' {vis -= 1}
 		if vis > 0 {
 			plat.text_draw(gfx, t, string(line_buf[:vis]), x0, row_y, px, fg)
 		}
 
-		if doc.cursor >= pos && doc.cursor <= end {
-			cx = x0 + f32(doc.cursor - pos) * char_w
+		if doc.cursor >= start && doc.cursor <= end {
+			cx = x0 + f32(doc.cursor - start) * char_w
 			cy = row_y
 			caret = true
+		}
+		if doc.filter {
+			continue
 		}
 		if end >= doc.pt.length {break}
 		pos = end + 1

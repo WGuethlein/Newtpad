@@ -112,6 +112,17 @@ main :: proc() {
 		doc_close(&doc)
 		return
 	}
+	if len(os.args) > 3 && os.args[2] == "filtertest" {
+		doc, _ := doc_open(path)
+		find_open(&doc, false)
+		for r in os.args[3] {find_input_rune(&doc, r)}
+		fmt.printfln("query=%q matches=%d filter_lines=%d", os.args[3], len(doc.find.matches), len(doc.filter_lines))
+		for ls in doc.filter_lines {
+			fmt.printfln("  %q", doc_line_text(&doc, ls, context.temp_allocator))
+		}
+		doc_close(&doc)
+		return
+	}
 	if len(os.args) > 3 && os.args[2] == "findtest" {
 		doc, _ := doc_open(path)
 		find_open(&doc, false)
@@ -200,6 +211,15 @@ main :: proc() {
 					if doc.find.replace_mode {find_toggle_field(&doc)}
 				case .ToggleRegex:
 					find_toggle_regex(&doc)
+				case .ToggleFilter:
+					if len(doc.find.matches) > 0 {
+						doc.filter = !doc.filter
+						doc.filter_top = 0
+					}
+				case .PageUp:
+					if doc.filter {doc.filter_top = max(0, doc.filter_top - (rows - 1))}
+				case .PageDown:
+					if doc.filter {doc.filter_top = min(max(0, len(doc.filter_lines) - 1), doc.filter_top + (rows - 1))}
 				case .Replace:
 					doc.find.replace_mode = !doc.find.replace_mode // Ctrl+H toggles the replace field
 				case .Enter:
@@ -306,23 +326,31 @@ main :: proc() {
 		}
 
 		if window.scroll_delta != 0 {
-			doc_scroll(&doc, window.scroll_delta)
+			if doc.filter {
+				doc.filter_top = clamp(doc.filter_top + window.scroll_delta, 0, max(0, len(doc.filter_lines) - 1))
+			} else {
+				doc_scroll(&doc, window.scroll_delta)
+			}
 			window.scroll_delta = 0
 		}
 
-		doc_ensure_cursor_visible(&doc, rows)
+		if !doc.filter {
+			doc_ensure_cursor_visible(&doc, rows)
+		}
 
 		plat.gfx_begin_frame(&gfx, 0.09, 0.11, 0.16)
 
 		// Behind the text: find-match highlights (dim), then the selection (bright).
-		findq: [80]plat.Quad
-		if nfq := find_match_rects(&doc, px, char_w, rows, findq[:]); nfq > 0 {
-			plat.quads_draw(&gfx, &quad_pipe, findq[:nfq])
-		}
-		selq: [80]plat.Quad
-		ns := doc_selection_rects(&doc, px, char_w, rows, selq[:])
-		if ns > 0 {
-			plat.quads_draw(&gfx, &quad_pipe, selq[:ns])
+		// (Skipped in filter view, whose lines aren't consecutive.)
+		if !doc.filter {
+			findq: [80]plat.Quad
+			if nfq := find_match_rects(&doc, px, char_w, rows, findq[:]); nfq > 0 {
+				plat.quads_draw(&gfx, &quad_pipe, findq[:nfq])
+			}
+			selq: [80]plat.Quad
+			if ns := doc_selection_rects(&doc, px, char_w, rows, selq[:]); ns > 0 {
+				plat.quads_draw(&gfx, &quad_pipe, selq[:ns])
+			}
 		}
 
 		cx, cy, caret, bottom := doc_draw(&gfx, &text, &doc, px, char_w, rows)
@@ -333,7 +361,7 @@ main :: proc() {
 		w := f32(window.width)
 		h := f32(window.height)
 		total := doc.pt.length
-		if total > 0 {
+		if total > 0 && !doc.filter {
 			ty := f32(doc.top) / f32(total) * h
 			th := max(24, f32(bottom - doc.top) / f32(total) * h)
 			bars[nb] = {pos = {w - 14, 0}, size = {12, h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
@@ -360,7 +388,7 @@ main :: proc() {
 				info = fmt.tprintf("  (%d/%d)", f.current + 1, len(f.matches))
 			}
 			mode := "regex" if f.regex else "text"
-			fline := fmt.tprintf("Find [%s]: %s%s%s", mode, string(f.query[:]), " _" if f.field == 0 else "", info)
+			fline := fmt.tprintf("Find [%s]%s: %s%s%s", mode, " filter" if doc.filter else "", string(f.query[:]), " _" if f.field == 0 else "", info)
 			if f.replace_mode {
 				plat.text_draw(&gfx, &text, fline, 12, h - 30, 14, {0.95, 0.88, 0.55, 1})
 				rline := fmt.tprintf("Replace: %s%s", string(f.replace[:]), " _" if f.field == 1 else "")

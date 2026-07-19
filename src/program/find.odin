@@ -32,7 +32,10 @@ find_open :: proc(doc: ^Document, replace_mode: bool) {
 	find_recompute(doc)
 }
 
-find_close :: proc(doc: ^Document) {doc.find.active = false}
+find_close :: proc(doc: ^Document) {
+	doc.find.active = false
+	doc.filter = false
+}
 find_toggle_field :: proc(doc: ^Document) {doc.find.field = 1 - doc.find.field}
 find_toggle_regex :: proc(doc: ^Document) {doc.find.regex = !doc.find.regex;find_recompute(doc)}
 
@@ -67,6 +70,20 @@ find_recompute :: proc(doc: ^Document) {
 		recompute_regex(doc)
 	} else {
 		recompute_literal(doc)
+	}
+
+	// Rebuild the filter-view line list: one entry per matching line (deduped).
+	clear(&doc.filter_lines)
+	last_end := -1
+	for m in f.matches {
+		if m < last_end {
+			continue // same line as the previous match
+		}
+		append(&doc.filter_lines, base.pt_line_start(&doc.pt, m))
+		last_end = base.pt_next_line_start(&doc.pt, m)
+	}
+	if doc.filter_top >= len(doc.filter_lines) {
+		doc.filter_top = 0
 	}
 
 	if len(f.matches) > 0 {
@@ -148,6 +165,15 @@ find_select_current :: proc(doc: ^Document) {
 	m := f.matches[f.current]
 	doc.anchor = m // select the match: highlights it + scrolls it into view
 	doc.cursor = m + f.match_len[f.current]
+	if doc.filter { // keep the current match's line in the filtered view
+		mls := base.pt_line_start(&doc.pt, m)
+		for fl, i in doc.filter_lines {
+			if fl == mls {
+				doc.filter_top = i
+				break
+			}
+		}
+	}
 }
 
 find_next :: proc(doc: ^Document) {

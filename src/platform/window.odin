@@ -47,6 +47,7 @@ Key_Cmd :: enum u8 {
 	Replace,
 	Tab,
 	ToggleRegex,
+	ToggleFilter,
 }
 
 Key_Event :: struct {
@@ -223,6 +224,8 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 			cmd = .Tab
 		case win.VK_R:
 			cmd = .ToggleRegex;has = ctrl
+		case win.VK_L:
+			cmd = .ToggleFilter;has = ctrl
 		case win.VK_ESCAPE:
 			cmd = .Escape
 		case:
