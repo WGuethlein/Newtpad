@@ -457,6 +457,25 @@ three files (UTF-8 read as CP1252, written back as UTF-8), double-encoding every
 character and adding a BOM — the tab close glyph `×` rendered as `Ã—`. Use the editor for files
 with non-ASCII content.
 
+## 6h. Filter view — wanted next (Wyatt, 2026-07-19)
+
+Filter-to-matching-lines is a V1 headline feature and the one Wyatt singled out as liking. Three
+requests from live use, none urgent:
+
+1. **Line numbers in a gutter.** A filtered view is disorienting without them — you can see the
+   matching lines but not where they are in the file. There is no gutter at all today
+   (`TEXT_MARGIN_X` is bare), so this is the first real use for one, and it would carry over to
+   normal editing.
+2. **Select a line to jump to it** in the unfiltered document. Cheap: `filter_lines[i]` is already
+   the byte offset of the line start, so it is a click-to-`set_cursor` plus leaving filter mode.
+3. **Edit text while filtered.** Genuinely harder: edits shift every offset after them, so
+   `filter_lines` and the match list both invalidate on each keystroke — the same invalidation the
+   search worker already handles (`find_invalidate`), but the *view* must also stay stable so the
+   line you are typing on doesn't move out from under you. Needs a design pass.
+
+Also fixed in passing (2026-07-19): filter used to scroll to the caret-nearest match unclamped, so
+a match near the end of the file showed two or three lines above a screen of empty rows.
+
 ## 7. Build environment (Windows, this machine)
 
 - **Headless test modes** (run against the debug exe): `sehtest`, `dpitest`, `regextest <mb>`,
