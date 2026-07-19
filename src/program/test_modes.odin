@@ -153,6 +153,60 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad fonttest` — which curated families are installed, and whether each
+	// style keeps the same advance. The whole renderer is a cell grid built on
+	// one advance width, so a style that differs would slide glyphs out from
+	// under the caret.
+	if os.args[1] == "fonttest" {
+		bad := 0
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("fonttest: no fonts loaded")
+			return true
+		}
+		base_em := plat.text_char_em(&t)
+		fmt.printfln("default Consolas char_em %.4f", base_em)
+		if base_em <= 0 {bad += 1}
+
+		fmt.println("--- curated families ---")
+		found := 0
+		for f in plat.FONT_FAMILIES {
+			avail := plat.font_family_available(f)
+			if !avail {
+				fmt.printfln("  %-24s not installed", f.name)
+				continue
+			}
+			found += 1
+			// Every style must load and keep the family's advance.
+			ems: [4]f32
+			consistent := true
+			for st, si in ([]plat.Font_Style{.Regular, .Bold, .Italic, .Bold_Italic}) {
+				if !plat.text_load_family(&t, f.name, st) {
+					fmt.printfln("  %-24s FAILED to load %v", f.name, st)
+					bad += 1
+					consistent = false
+					break
+				}
+				ems[si] = plat.text_char_em(&t)
+				if ems[si] <= 0 {consistent = false}
+				if si > 0 && abs(ems[si] - ems[0]) > 0.0001 {consistent = false}
+			}
+			fmt.printfln("  %-24s em %.4f  styles consistent=%v %s", f.name, ems[0], consistent, "OK" if consistent else "FAIL")
+			if !consistent {bad += 1}
+		}
+		fmt.printfln("%d of %d curated families installed", found, len(plat.FONT_FAMILIES))
+		if found == 0 {bad += 1}
+
+		// An unknown family must fall back, not fail — a settings file copied
+		// from another machine can name a font that isn't here.
+		okf := plat.text_load_family(&t, "No Such Font 12345", .Regular)
+		fmt.printfln("unknown family falls back: %v  %s", okf, "OK" if okf else "FAIL")
+		if !okf {bad += 1}
+
+		fmt.printfln("fonttest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad watchtest <dir>` — external-change detection and reconciliation.
 	// This feature changes the document without the user asking, so the failure
 	// mode is data loss rather than a wrong pixel.
@@ -389,12 +443,28 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 
 		// Round-trip non-default values.
-		w := Settings{restore_session = false, wrap_default = true, font_size = 22, zoom_pct = 125}
+		w := Settings {
+			restore_session = false,
+			wrap_default    = true,
+			font_size       = 22,
+			zoom_pct        = 125,
+			font_family     = "Courier New",
+			font_style      = .Italic,
+		}
 		settings_save(w)
 		r := settings_load()
 		ok := r == w
-		fmt.printfln("round-trip: restore=%v wrap=%v font=%d  %s", r.restore_session, r.wrap_default, r.font_size, "OK" if ok else "FAIL")
+		fmt.printfln("round-trip: restore=%v wrap=%v font=%d zoom=%d family=%q style=%v  %s", r.restore_session, r.wrap_default, r.font_size, r.zoom_pct, r.font_family, r.font_style, "OK" if ok else "FAIL")
 		if !ok {bad += 1}
+
+		// An empty family must normalise on the way out, not persist as blank —
+		// a blank family would resolve to the first curated entry on next load
+		// and look like the setting silently changed.
+		settings_save(Settings{font_size = 16, zoom_pct = 100})
+		blank := settings_load()
+		bok := blank.font_family == "Consolas"
+		fmt.printfln("blank family normalises to %q  %s", blank.font_family, "OK" if bok else "FAIL")
+		if !bok {bad += 1}
 
 		// An out-of-range font size on disk must clamp, not propagate.
 		settings_save(Settings{restore_session = true, font_size = 9999})

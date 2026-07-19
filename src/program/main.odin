@@ -84,6 +84,13 @@ main :: proc() {
 	rc := Render_Ctx{&gfx, &text, &quad_pipe, &app, window, 0, 0, 0}
 	active_render_ctx = &rc
 	BASE_PX = f32(clamp(app.settings.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX))
+	// Apply the saved font before the first frame. A family that is no longer
+	// installed leaves the default in place rather than failing to start.
+	if app.settings.font_family != "" && app.settings.font_family != "Consolas" {
+		plat.text_load_family(&text, app.settings.font_family, app.settings.font_style)
+	} else if app.settings.font_style != .Regular {
+		plat.text_load_family(&text, "Consolas", app.settings.font_style)
+	}
 	metrics_recompute(&rc)
 	window.on_resize = on_resize
 	window.resize_user = &rc

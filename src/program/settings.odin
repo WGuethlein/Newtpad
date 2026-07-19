@@ -38,6 +38,29 @@ Settings :: struct {
 	wrap_default:    bool, // new documents start word-wrapped
 	font_size:       int, // document text size at 96 DPI
 	zoom_pct:        int, // viewport zoom, applied on top of font_size
+	font_family:     string, // family NAME, not a path — paths differ per machine
+	font_style:      plat.Font_Style,
+}
+
+// Families present on this machine, in the curated order. Recomputed when the
+// settings page opens rather than at startup: it is a handful of file-exists
+// checks, but none of them are needed to draw the first frame.
+font_choices: [dynamic]string
+
+font_choices_refresh :: proc() {
+	clear(&font_choices)
+	for f in plat.FONT_FAMILIES {
+		if plat.font_family_available(f) {append(&font_choices, f.name)}
+	}
+	if len(font_choices) == 0 {append(&font_choices, "Consolas")}
+}
+
+@(private = "file")
+font_choice_index :: proc(name: string) -> int {
+	for n, i in font_choices {
+		if n == name {return i}
+	}
+	return 0
 }
 
 settings_default :: proc() -> Settings {
@@ -46,6 +69,8 @@ settings_default :: proc() -> Settings {
 		wrap_default = false,
 		font_size = int(BASE_PX_96),
 		zoom_pct = ZOOM_DEFAULT,
+		font_family = "Consolas",
+		font_style = .Regular,
 	}
 }
 
@@ -87,6 +112,12 @@ settings_load :: proc() -> Settings {
 			if n, pok := strconv.parse_int(parts[1]); pok {
 				s.zoom_pct = clamp(n, ZOOM_STEPS[0], ZOOM_STEPS[len(ZOOM_STEPS) - 1])
 			}
+		case "font_family":
+			s.font_family = strings.clone(parts[1])
+		case "font_style":
+			if n, pok := strconv.parse_int(parts[1]); pok && n >= 0 && n <= int(max(plat.Font_Style)) {
+				s.font_style = plat.Font_Style(n)
+			}
 		}
 	}
 	return s
@@ -105,11 +136,13 @@ settings_save :: proc(s: Settings) -> bool {
 	if s.zoom_pct == 0 {s.zoom_pct = ZOOM_DEFAULT}
 	s.zoom_pct = clamp(s.zoom_pct, ZOOM_STEPS[0], ZOOM_STEPS[len(ZOOM_STEPS) - 1])
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\nfont_family %s\nfont_style %d\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
 		s.zoom_pct,
+		s.font_family if s.font_family != "" else "Consolas",
+		int(s.font_style),
 	)
 	return plat.file_write_atomic(path, transmute([]u8)body)
 }
@@ -122,10 +155,12 @@ Setting_Row :: struct {
 }
 
 SETTINGS_ROWS := []Setting_Row {
-	{"Restore session on launch", "Reopen the tabs you had open, including unsaved ones"},
-	{"Word wrap new documents", "Long lines fold to the window width instead of running off"},
+	{"Font", "Monospaced families found on this machine"},
+	{"Style", "Regular / Bold / Italic; a style the family lacks falls back"},
 	{"Font size", "Left / Right to adjust"},
 	{"Zoom", "Ctrl+= / Ctrl+- / Ctrl+0 anywhere, or Ctrl+wheel"},
+	{"Restore session on launch", "Reopen the tabs you had open, including unsaved ones"},
+	{"Word wrap new documents", "Long lines fold to the window width instead of running off"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
@@ -157,18 +192,40 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 	s := &rc.app.settings
 	switch row {
 	case 0:
-		if dir == 0 {s.restore_session = !s.restore_session}
+		if len(font_choices) == 0 {font_choices_refresh()}
+		d := dir if dir != 0 else 1
+		i := (font_choice_index(s.font_family) + d + len(font_choices)) % len(font_choices)
+		s.font_family = font_choices[i]
+		settings_apply_font(rc)
 	case 1:
-		if dir == 0 {s.wrap_default = !s.wrap_default}
+		d := dir if dir != 0 else 1
+		n := int(max(plat.Font_Style)) + 1
+		s.font_style = plat.Font_Style((int(s.font_style) + d + n) % n)
+		settings_apply_font(rc)
 	case 2:
 		d := dir if dir != 0 else 1
 		s.font_size = clamp(s.font_size + d, FONT_SIZE_MIN, FONT_SIZE_MAX)
 	case 3:
 		zoom_adjust(rc, dir if dir != 0 else 0) // Enter on this row resets
 		return // zoom_adjust already applied and saved
+	case 4:
+		if dir == 0 {s.restore_session = !s.restore_session}
+	case 5:
+		if dir == 0 {s.wrap_default = !s.wrap_default}
 	}
 	settings_apply(rc)
 	settings_save(s^)
+}
+
+// Load the chosen family/style. The cell width comes from the new face, so the
+// layout metrics and the glyph cache both have to follow.
+settings_apply_font :: proc(rc: ^Render_Ctx) {
+	s := rc.app.settings
+	if !plat.text_load_family(rc.text, s.font_family, s.font_style) {
+		// Keep the previous face rather than leaving nothing to draw with.
+		return
+	}
+	metrics_recompute(rc)
 }
 
 settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^App, width, height: f32) {
@@ -194,16 +251,20 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 		val: string
 		switch i {
 		case 0:
-			val = "On" if app.settings.restore_session else "Off"
+			val = app.settings.font_family
 		case 1:
-			val = "On" if app.settings.wrap_default else "Off"
+			val = plat.font_style_name(app.settings.font_style)
 		case 2:
 			val = fmt.tprintf("%d", app.settings.font_size)
 		case 3:
 			val = fmt.tprintf("%d%%", app.settings.zoom_pct)
+		case 4:
+			val = "On" if app.settings.restore_session else "Off"
+		case 5:
+			val = "On" if app.settings.wrap_default else "Off"
 		}
 		vc := [4]f32{0.55, 0.85, 0.60, 1} if val != "Off" else [4]f32{0.55, 0.60, 0.70, 1}
-		plat.text_draw(gfx, t, val, width - sx(120), y, UI_PX, vc)
+		plat.text_draw(gfx, t, val, width - sx(220), y, UI_PX, vc)
 		y += rowh
 	}
 

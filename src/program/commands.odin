@@ -649,6 +649,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	// --- settings page ---
 	case .Settings_Open:
 		menu_close(app)
+		font_choices_refresh() // a handful of file checks, not needed before this
 		app.settings_open = true
 		app.settings_row = 0
 	case .Settings_Close:

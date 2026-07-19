@@ -12,6 +12,8 @@ package platform
 
 import "core:fmt"
 import "core:mem"
+import "core:os"
+import "core:strings"
 import "core:unicode/utf8"
 import d3d "vendor:directx/d3d11"
 import win "core:sys/windows"
@@ -26,17 +28,84 @@ ATLAS_MAX :: 4096
 MAX_TEXT_INSTANCES :: 4096
 MAX_FACES :: 8
 
-// Primary font first, then per-codepoint fallbacks. Missing files are skipped.
+Font_Style :: enum u8 {
+	Regular,
+	Bold,
+	Italic,
+	Bold_Italic,
+}
+
+font_style_name :: proc(s: Font_Style) -> string {
+	switch s {
+	case .Regular:
+		return "Regular"
+	case .Bold:
+		return "Bold"
+	case .Italic:
+		return "Italic"
+	case .Bold_Italic:
+		return "Bold Italic"
+	}
+	return "?"
+}
+
+// A selectable family, with the file for each style. Empty means the family has
+// no such style and the regular file is used instead.
+//
+// A curated list of known code fonts, resolved by filename, rather than
+// enumerating the system font collection. Enumeration costs over a second on a
+// machine with many fonts — on the main thread, before the first frame — and
+// then needs filtering, because "monospaced" by the font's own metrics includes
+// Marlett, Wingdings, AutoCAD shape fonts and CJK faces, most of which would
+// wreck the cell grid if chosen. It also avoids six COM interfaces and the
+// localized-family-name problem entirely.
+Font_Family :: struct {
+	name:                              string,
+	regular, bold, italic, bolditalic: string,
+}
+
+FONT_FAMILIES := [?]Font_Family {
+	{"Consolas", "consola.ttf", "consolab.ttf", "consolai.ttf", "consolaz.ttf"},
+	{"Cascadia Mono", "CascadiaMono.ttf", "", "", ""},
+	{"Cascadia Code", "CascadiaCode.ttf", "", "", ""},
+	{"Courier New", "cour.ttf", "courbd.ttf", "couri.ttf", "courbi.ttf"},
+	{"Lucida Console", "lucon.ttf", "", "", ""},
+	{"Lucida Sans Typewriter", "LTYPE.TTF", "LTYPEB.TTF", "LTYPEO.TTF", ""},
+	{"DejaVu Sans Mono", "DejaVuSansMono.ttf", "DejaVuSansMono-Bold.ttf", "DejaVuSansMono-Oblique.ttf", ""},
+	{"JetBrains Mono", "JetBrainsMono-Regular.ttf", "JetBrainsMono-Bold.ttf", "JetBrainsMono-Italic.ttf", ""},
+	{"Fira Code", "FiraCode-Regular.ttf", "FiraCode-Bold.ttf", "", ""},
+	{"Source Code Pro", "SourceCodePro-Regular.ttf", "SourceCodePro-Bold.ttf", "SourceCodePro-It.ttf", ""},
+	{"IBM Plex Mono", "IBMPlexMono-Regular.ttf", "IBMPlexMono-Bold.ttf", "IBMPlexMono-Italic.ttf", ""},
+	{"Hack", "Hack-Regular.ttf", "Hack-Bold.ttf", "Hack-Italic.ttf", ""},
+	{"Iosevka", "iosevka-regular.ttf", "iosevka-bold.ttf", "iosevka-italic.ttf", ""},
+	{"Ubuntu Mono", "UbuntuMono-R.ttf", "UbuntuMono-B.ttf", "UbuntuMono-RI.ttf", ""},
+}
+
+// The Windows font directory. Read from the environment rather than hardcoded:
+// %SystemRoot% is not C:\Windows on every machine (imaged corporate builds,
+// multi-boot), and a wrong path meant no faces loaded at all and the app failed
+// to start.
+@(private = "file")
+fonts_dir :: proc(allocator := context.temp_allocator) -> string {
+	root := os.get_env("SystemRoot", context.temp_allocator)
+	if root == "" {root = "C:\\Windows"}
+	return strings.concatenate({root, "\\Fonts\\"}, allocator)
+}
+
+font_family_available :: proc(f: Font_Family) -> bool {
+	return os.exists(strings.concatenate({fonts_dir(), f.regular}, context.temp_allocator))
+}
+
+// Fallbacks appended after the chosen family, for codepoints it lacks.
 @(private)
 FALLBACK_FONTS := [?]struct {
-	path: string,
+	file: string,
 	kind: FONT_FACE_TYPE,
 	face: u32,
 }{
-	{"C:\\Windows\\Fonts\\consola.ttf", .TRUETYPE, 0}, // primary: code / Latin / Cyrillic / Greek
-	{"C:\\Windows\\Fonts\\seguisym.ttf", .TRUETYPE, 0}, // symbols
-	{"C:\\Windows\\Fonts\\msyh.ttc", .OPENTYPE_COLLECTION, 0}, // CJK (Microsoft YaHei)
-	{"C:\\Windows\\Fonts\\segoeui.ttf", .TRUETYPE, 0}, // general Latin / misc
+	{"seguisym.ttf", .TRUETYPE, 0}, // symbols
+	{"msyh.ttc", .OPENTYPE_COLLECTION, 0}, // CJK (Microsoft YaHei)
+	{"segoeui.ttf", .TRUETYPE, 0}, // general Latin / misc
 }
 
 Glyph_Key :: struct {
@@ -147,45 +216,101 @@ PSOut ps_main(VSOut i) {
 // so this can run headless (see the `celltest` mode). text_init calls it before
 // building the GPU pipeline.
 text_load_faces :: proc(t: ^Text) -> (ok: bool) {
-	if hr := DWriteCreateFactory(.SHARED, &IID_IFactory, &t.factory); !win.SUCCEEDED(hr) {
-		fmt.eprintfln("DWriteCreateFactory failed: 0x%X", u32(hr))
-		return
-	}
-	for fdef in FALLBACK_FONTS {
-		if t.nfaces >= MAX_FACES {
-			break
-		}
-		wpath := win.utf8_to_wstring(fdef.path, context.temp_allocator)
-		file: ^IFontFile
-		if hr := t.factory->CreateFontFileReference(wpath, nil, &file); !win.SUCCEEDED(hr) {
-			continue // font not present on this machine; skip
-		}
-		face: ^IFontFace
-		if hr := t.factory->CreateFontFace(fdef.kind, 1, &file, fdef.face, .NONE, &face); !win.SUCCEEDED(hr) {
-			file->Release()
-			continue
-		}
-		file->Release() // the face keeps its own reference
-		fm: FONT_METRICS
-		face->GetMetrics(&fm)
-		t.faces[t.nfaces] = face
-		t.units[t.nfaces] = f32(fm.designUnitsPerEm)
-		t.nfaces += 1
-	}
-	if t.nfaces == 0 {
-		fmt.eprintln("text_load_faces: no fonts could be loaded")
-		return
-	}
+	return text_load_family(t, "Consolas", .Regular)
+}
 
-	// One cell = the primary face's 'x' advance (Consolas is monospace). Stored as
-	// a fraction of em so it scales with any pixel size.
+// The 'x' advance of a face as a fraction of em — one cell's width.
+@(private = "file")
+face_char_em :: proc(face: ^IFontFace, units: f32) -> f32 {
 	cp := u32('x')
 	gi: u16
-	t.faces[0]->GetGlyphIndices(&cp, 1, &gi)
+	face->GetGlyphIndices(&cp, 1, &gi)
 	gm: GLYPH_METRICS
 	idx := gi
-	t.faces[0]->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
-	t.char_em = f32(gm.advanceWidth) / t.units[0]
+	face->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
+	return f32(gm.advanceWidth) / units
+}
+
+@(private = "file")
+add_face :: proc(t: ^Text, file_name: string, kind: FONT_FACE_TYPE, index: u32) -> bool {
+	if t.nfaces >= MAX_FACES {return false}
+	path := strings.concatenate({fonts_dir(), file_name}, context.temp_allocator)
+	wpath := win.utf8_to_wstring(path, context.temp_allocator)
+	file: ^IFontFile
+	if hr := t.factory->CreateFontFileReference(wpath, nil, &file); !win.SUCCEEDED(hr) {
+		return false // not present on this machine
+	}
+	face: ^IFontFace
+	if hr := t.factory->CreateFontFace(kind, 1, &file, index, .NONE, &face); !win.SUCCEEDED(hr) {
+		file->Release()
+		return false
+	}
+	file->Release() // the face keeps its own reference
+	fm: FONT_METRICS
+	face->GetMetrics(&fm)
+	t.faces[t.nfaces] = face
+	t.units[t.nfaces] = f32(fm.designUnitsPerEm)
+	t.nfaces += 1
+	return true
+}
+
+// Load `family` in `style` as the primary face, then the fallback chain.
+// Returns false and leaves the previous faces in place if the family cannot be
+// loaded, so a missing font never leaves the app with nothing to draw with.
+text_load_family :: proc(t: ^Text, family: string, style: Font_Style) -> bool {
+	if t.factory == nil {
+		if hr := DWriteCreateFactory(.SHARED, &IID_IFactory, &t.factory); !win.SUCCEEDED(hr) {
+			fmt.eprintfln("DWriteCreateFactory failed: 0x%X", u32(hr))
+			return false
+		}
+	}
+
+	chosen := FONT_FAMILIES[0]
+	for f in FONT_FAMILIES {
+		if f.name == family {
+			chosen = f
+			break
+		}
+	}
+	// A style the family doesn't ship falls back to regular rather than letting
+	// DirectWrite synthesise one: algorithmic bold/oblique changes the advance,
+	// and the pen steps by a single cell width, so glyphs would bleed into the
+	// next column.
+	file := chosen.regular
+	switch style {
+	case .Bold:
+		if chosen.bold != "" {file = chosen.bold}
+	case .Italic:
+		if chosen.italic != "" {file = chosen.italic}
+	case .Bold_Italic:
+		if chosen.bolditalic != "" {file = chosen.bolditalic} else if chosen.bold != "" {file = chosen.bold}
+	case .Regular:
+	}
+
+	// Build into a scratch Text so a failure can't strand us faceless.
+	fresh: Text
+	fresh.factory = t.factory
+	if !add_face(&fresh, file, .TRUETYPE, 0) {
+		if file == chosen.regular || !add_face(&fresh, chosen.regular, .TRUETYPE, 0) {
+			for i in 0 ..< fresh.nfaces {fresh.faces[i]->Release()}
+			return false
+		}
+	}
+	for fdef in FALLBACK_FONTS {
+		add_face(&fresh, fdef.file, fdef.kind, fdef.face)
+	}
+
+	// Release the faces we are replacing, then adopt the new ones.
+	for i in 0 ..< t.nfaces {
+		if t.faces[i] != nil {t.faces[i]->Release()}
+		t.faces[i] = nil
+	}
+	t.faces = fresh.faces
+	t.units = fresh.units
+	t.nfaces = fresh.nfaces
+	t.char_em = face_char_em(t.faces[0], t.units[0])
+	// Every cached glyph and cell width belongs to the old face.
+	text_reset_atlas(t)
 	return true
 }
 
@@ -606,6 +731,10 @@ atlas_relieve :: proc(gfx: ^Gfx, t: ^Text) -> bool {
 text_frame_begin :: proc(t: ^Text) {t.relieved_this_frame = false}
 
 text_atlas_dim :: proc(t: ^Text) -> i32 {return t.atlas_w}
+
+// The primary face's cell width as a fraction of em. Exposed so a test can check
+// that a family's styles agree — the cell grid assumes one advance for all text.
+text_char_em :: proc(t: ^Text) -> f32 {return t.char_em}
 
 // How many `gw`x`gh` boxes the shelf packer fits in a `dim` square. Pure
 // arithmetic mirroring atlas_pack, so capacity can be checked without a GPU.
