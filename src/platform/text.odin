@@ -18,8 +18,23 @@ import win "core:sys/windows"
 ATLAS_W :: 1024
 ATLAS_H :: 1024
 MAX_TEXT_INSTANCES :: 4096
+MAX_FACES :: 8
+
+// Primary font first, then per-codepoint fallbacks. Missing files are skipped.
+@(private)
+FALLBACK_FONTS := [?]struct {
+	path: string,
+	kind: FONT_FACE_TYPE,
+	face: u32,
+}{
+	{"C:\\Windows\\Fonts\\consola.ttf", .TRUETYPE, 0}, // primary: code / Latin / Cyrillic / Greek
+	{"C:\\Windows\\Fonts\\seguisym.ttf", .TRUETYPE, 0}, // symbols
+	{"C:\\Windows\\Fonts\\msyh.ttc", .OPENTYPE_COLLECTION, 0}, // CJK (Microsoft YaHei)
+	{"C:\\Windows\\Fonts\\segoeui.ttf", .TRUETYPE, 0}, // general Latin / misc
+}
 
 Glyph_Key :: struct {
+	face:  u8,
 	index: u16,
 	px:    u16,
 }
@@ -40,13 +55,11 @@ Text_Instance :: struct {
 }
 
 Text :: struct {
-	// DirectWrite font
-	factory:      ^IFactory,
-	file:         ^IFontFile,
-	face:         ^IFontFace,
-	units_per_em: f32,
-	ascent_du:    f32, // ascent in design units (scale by px/units_per_em)
-	descent_du:   f32,
+	// DirectWrite fonts: [0] primary, [1..] fallbacks
+	factory: ^IFactory,
+	faces:   [MAX_FACES]^IFontFace,
+	units:   [MAX_FACES]f32, // designUnitsPerEm per face
+	nfaces:  int,
 
 	// atlas + cache
 	atlas:     ^d3d.ITexture2D,
@@ -119,20 +132,31 @@ text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
 		fmt.eprintfln("DWriteCreateFactory failed: 0x%X", u32(hr))
 		return
 	}
-	font_path := win.utf8_to_wstring("C:\\Windows\\Fonts\\consola.ttf")
-	if hr := t.factory->CreateFontFileReference(font_path, nil, &t.file); !win.SUCCEEDED(hr) {
-		fmt.eprintfln("CreateFontFileReference failed: 0x%X", u32(hr))
+	for fdef in FALLBACK_FONTS {
+		if t.nfaces >= MAX_FACES {
+			break
+		}
+		wpath := win.utf8_to_wstring(fdef.path, context.temp_allocator)
+		file: ^IFontFile
+		if hr := t.factory->CreateFontFileReference(wpath, nil, &file); !win.SUCCEEDED(hr) {
+			continue // font not present on this machine; skip
+		}
+		face: ^IFontFace
+		if hr := t.factory->CreateFontFace(fdef.kind, 1, &file, fdef.face, .NONE, &face); !win.SUCCEEDED(hr) {
+			file->Release()
+			continue
+		}
+		file->Release() // the face keeps its own reference
+		fm: FONT_METRICS
+		face->GetMetrics(&fm)
+		t.faces[t.nfaces] = face
+		t.units[t.nfaces] = f32(fm.designUnitsPerEm)
+		t.nfaces += 1
+	}
+	if t.nfaces == 0 {
+		fmt.eprintln("text_init: no fonts could be loaded")
 		return
 	}
-	if hr := t.factory->CreateFontFace(.TRUETYPE, 1, &t.file, 0, .NONE, &t.face); !win.SUCCEEDED(hr) {
-		fmt.eprintfln("CreateFontFace failed: 0x%X", u32(hr))
-		return
-	}
-	fm: FONT_METRICS
-	t.face->GetMetrics(&fm)
-	t.units_per_em = f32(fm.designUnitsPerEm)
-	t.ascent_du = f32(fm.ascent)
-	t.descent_du = f32(fm.descent)
 
 	// --- atlas texture + SRV ---
 	tex_desc := d3d.TEXTURE2D_DESC {
@@ -244,11 +268,28 @@ text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
 text_char_width :: proc(t: ^Text, px: f32) -> f32 {
 	cp := u32('x')
 	gi: u16
-	t.face->GetGlyphIndices(&cp, 1, &gi)
+	t.faces[0]->GetGlyphIndices(&cp, 1, &gi)
 	gm: GLYPH_METRICS
 	idx := gi
-	t.face->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
-	return f32(gm.advanceWidth) * px / t.units_per_em
+	t.faces[0]->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
+	return f32(gm.advanceWidth) * px / t.units[0]
+}
+
+// Pick the first loaded face that has a glyph for r; fall back to the primary
+// (which renders .notdef) if none does. Per-codepoint fallback, no shaping.
+@(private)
+rune_face :: proc(t: ^Text, r: rune) -> (face: int, gi: u16) {
+	cp := u32(r)
+	for fi in 0 ..< t.nfaces {
+		g: u16
+		t.faces[fi]->GetGlyphIndices(&cp, 1, &g)
+		if g != 0 {
+			return fi, g
+		}
+	}
+	g: u16
+	t.faces[0]->GetGlyphIndices(&cp, 1, &g)
+	return 0, g
 }
 
 // Draw a UTF-8 string with its baseline at (x, y), left-to-right.
@@ -258,10 +299,8 @@ text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32
 
 	pen := x
 	for r in str {
-		cp := u32(r)
-		gi: u16
-		t.face->GetGlyphIndices(&cp, 1, &gi)
-		g := glyph_get(gfx, t, gi, px)
+		face, gi := rune_face(t, r)
+		g := glyph_get(gfx, t, face, gi, px)
 		if g.w > 0 && g.h > 0 {
 			append(&instances, Text_Instance {
 				pos    = {pen + f32(g.left), y + f32(g.top)},
@@ -307,8 +346,8 @@ text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32
 }
 
 @(private)
-glyph_get :: proc(gfx: ^Gfx, t: ^Text, index: u16, px: f32) -> Glyph {
-	key := Glyph_Key{index, u16(px)}
+glyph_get :: proc(gfx: ^Gfx, t: ^Text, face: int, index: u16, px: f32) -> Glyph {
+	key := Glyph_Key{u8(face), index, u16(px)}
 	if g, found := t.cache[key]; found {
 		return g
 	}
@@ -317,10 +356,10 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, index: u16, px: f32) -> Glyph {
 	// advance from design metrics
 	gm: GLYPH_METRICS
 	idx := index
-	t.face->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
-	g.advance = f32(gm.advanceWidth) * px / t.units_per_em
+	t.faces[face]->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
+	g.advance = f32(gm.advanceWidth) * px / t.units[face]
 
-	cov, gw, gh, left, top := glyph_rasterize(t, index, px)
+	cov, gw, gh, left, top := glyph_rasterize(t, face, index, px)
 	g.w = gw
 	g.h = gh
 	g.left = left
@@ -358,10 +397,10 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, index: u16, px: f32) -> Glyph {
 // Returns the 3-channel ClearType coverage (caller frees) and placement, with
 // the run's baseline origin at (0,0) so left/top are pen-relative bearings.
 @(private)
-glyph_rasterize :: proc(t: ^Text, index: u16, px: f32) -> (cov: []u8, gw, gh, left, top: i32) {
+glyph_rasterize :: proc(t: ^Text, face: int, index: u16, px: f32) -> (cov: []u8, gw, gh, left, top: i32) {
 	idx := index
 	run := GLYPH_RUN {
-		fontFace     = t.face,
+		fontFace     = t.faces[face],
 		fontEmSize   = px,
 		glyphCount   = 1,
 		glyphIndices = &idx,
