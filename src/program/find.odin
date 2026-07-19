@@ -1,35 +1,65 @@
 // Layer: program — incremental find & replace. Literal (case-insensitive,
-// ASCII-fold, chunked scan over the piece table) or regex (core:text/regex over
-// line-aligned blocks). Replace reuses the doc's public edit path (undo +
-// nl-delta handled). Group substitution ($1) and background search for huge
-// files are follow-ups.
+// ASCII-fold) or regex (core:text/regex over line-aligned blocks), scanned in
+// blocks over the piece table. Small buffers scan inline; larger ones scan on a
+// worker thread that publishes results incrementally, so a keystroke never waits
+// on the file size. Replace reuses the doc's public edit path (undo + nl-delta
+// handled). Group substitution ($1) is a follow-up.
 package main
 
+import "base:intrinsics"
+import "core:mem"
 import "core:text/regex"
+import "core:thread"
 import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
 
 MAX_MATCHES :: 100_000
-FIND_CHUNK :: 1 << 16
 
-// Regex scans line-aligned blocks rather than materializing the document: a
-// whole-buffer pt_collect ran per keystroke, so a large file froze the UI (and
-// could fail the allocation outright). Cost per keystroke is now bounded by
-// REGEX_SCAN_CAP regardless of file size.
-//
-// Trade-off: a pattern spanning a block boundary won't match. Blocks end just
-// past a newline, so line-scoped patterns — what people actually type into a
-// find bar — are unaffected.
-// Measured ~16-19 ms/MB for core:text/regex on this machine (`newtpad regextest
-// <mb>`), so the cap is a directly chosen latency budget: 8 MB ~= 130 ms on the
-// worst keystroke. One frame's worth would be about 1 MB, which is too little to
-// be useful — synchronous regex simply cannot be instant on a large file, so the
-// cap buys a bounded stall and an honest "+" rather than a fix. The real fix is
-// to run the search on a worker over a snapshot; see HANDOFF.
-REGEX_BLOCK :: 1 << 20 // bytes scanned per block
+// Bytes read per block. Cancel is polled per block (and, for regex, per match),
+// so this also sets how long a cancel takes to land — which is paid on any edit
+// made while a search is running. 256 KB is ~5 ms of regex at the measured
+// 16-19 ms/MB, comfortably inside a frame.
+SEARCH_BLOCK :: 256 << 10
 REGEX_LINE_SLACK :: 1 << 16 // extra bytes allowed to reach the block's line end
-REGEX_SCAN_CAP :: 8 << 20 // total bytes scanned per recompute
+
+// At or below this, scan inline and finish before returning: a worker would cost
+// a thread spawn and a pt_view (a tree clone) per keystroke to save well under a
+// frame. Above it, the worker earns its keep.
+SEARCH_SYNC_MAX :: 256 << 10
+
+// A background search over a private view of the buffer.
+//
+// Mirrors Line_Index's lifecycle (done/cancel/fault as atomics, cancel-store +
+// join + destroy on teardown) but differs in one way that matters: the line
+// indexer scans the immutable `original`, while search must see edits, so it
+// reads a pt_view — a cloned tree over aliased, never-moving bytes.
+//
+// The result arrays are allocated once at MAX_MATCHES and never grown. That is
+// load-bearing, not a micro-optimisation: appending to a [dynamic] moves the
+// base pointer and frees the old block, so a main thread reading match i while
+// the worker appended would read freed memory. Fixed capacity makes the
+// publication protocol — worker writes by index, then stores `count`; reader
+// loads `count` and touches only indices below it — actually sound, with a
+// single writer and no lock. (Odin's intrinsics.atomic_store/load are
+// sequentially consistent, so the release/acquire pairing this needs is
+// implied; the entries are written before the count that publishes them.)
+Search :: struct {
+	view:       base.Piece_Table, // worker's private read view (worker only)
+	query:      []u8, // private copy; the find bar's buffer keeps mutating
+	regex:      bool,
+	matches:    []int, // fixed MAX_MATCHES capacity, written by index
+	match_len:  []int,
+	line_start: []int, // line start of each match, computed here (see below)
+	count:      int, // atomic: how many entries are published
+	scanned:    int, // atomic: bytes scanned, for progress
+	total:      int,
+	done:       bool, // atomic
+	cancel:     bool, // atomic
+	fault:      bool, // atomic: a read faulted (mapped file changed underneath)
+	truncated:  bool, // atomic: hit MAX_MATCHES
+	th:         ^thread.Thread,
+}
 
 @(private = "file")
 lower :: proc(b: u8) -> u8 {return b + 32 if b >= 'A' && b <= 'Z' else b}
@@ -53,7 +83,9 @@ find_open :: proc(doc: ^Document, replace_mode: bool) {
 find_close :: proc(doc: ^Document) {
 	doc.find.active = false
 	doc.filter = false
+	search_release(doc)
 }
+
 find_toggle_field :: proc(doc: ^Document) {doc.find.field = 1 - doc.find.field}
 find_toggle_regex :: proc(doc: ^Document) {doc.find.regex = !doc.find.regex;find_recompute(doc)}
 
@@ -77,37 +109,146 @@ find_backspace :: proc(doc: ^Document) {
 	if doc.find.field == 0 {find_recompute(doc)}
 }
 
-find_recompute :: proc(doc: ^Document) {
+// --- search lifecycle ---
+
+// Stop the worker and wait for it. Must complete before anything the worker's
+// view points into goes away (pt_destroy's chunks, or a mapped `original` being
+// detached), and before results are consumed as final.
+@(private = "file")
+search_stop :: proc(doc: ^Document) {
+	s := &doc.search
+	if s.th != nil {
+		intrinsics.atomic_store(&s.cancel, true)
+		thread.join(s.th)
+		thread.destroy(s.th)
+		s.th = nil
+		base.pt_view_destroy(&s.view)
+	}
+	if s.query != nil {
+		delete(s.query)
+		s.query = nil
+	}
+}
+
+// Stop the worker and free the result arrays. Only on find close / doc close —
+// an edit must not free arrays that f.matches still slices.
+search_release :: proc(doc: ^Document) {
+	search_stop(doc)
+	s := &doc.search
+	delete(s.matches)
+	delete(s.match_len)
+	delete(s.line_start)
+	s.matches, s.match_len, s.line_start = nil, nil, nil
+	doc.find.matches, doc.find.match_len = nil, nil
+	doc.find.merged = 0
+}
+
+// An edit invalidates every match offset. Stop the worker but defer the restart
+// to the next frame, so find_replace_all's edit-per-match loop costs one restart
+// instead of one per match.
+// Deliberately not gated on find.active: doc_recover_from_fault calls this to
+// guarantee the worker is joined before the mapping goes away, and that must
+// hold regardless of what the find bar is doing.
+find_invalidate :: proc(doc: ^Document) {
+	search_stop(doc)
+	doc.find.dirty = true
+}
+
+@(private = "file")
+search_reset :: proc(doc: ^Document) {
+	s := &doc.search
+	search_stop(doc)
+	if s.matches == nil {
+		s.matches = make([]int, MAX_MATCHES)
+		s.match_len = make([]int, MAX_MATCHES)
+		s.line_start = make([]int, MAX_MATCHES)
+	}
+	intrinsics.atomic_store(&s.count, 0)
+	intrinsics.atomic_store(&s.scanned, 0)
+	intrinsics.atomic_store(&s.done, false)
+	intrinsics.atomic_store(&s.cancel, false)
+	intrinsics.atomic_store(&s.fault, false)
+	intrinsics.atomic_store(&s.truncated, false)
+	s.total = doc.pt.length
+	s.regex = doc.find.regex
+
 	f := &doc.find
-	clear(&f.matches)
-	clear(&f.match_len)
+	f.matches, f.match_len = s.matches[:0], s.match_len[:0]
+	f.merged = 0
+	f.jumped = false
+	f.dirty = false
 	f.current = -1
-	f.truncated = false
-	if len(f.query) == 0 {return}
-
-	if f.regex {
-		recompute_regex(doc)
-	} else {
-		recompute_literal(doc)
-	}
-
-	// Rebuild the filter-view line list: one entry per matching line (deduped).
 	clear(&doc.filter_lines)
-	last_end := -1
-	for m in f.matches {
-		if m < last_end {
-			continue // same line as the previous match
-		}
-		append(&doc.filter_lines, base.pt_line_start(&doc.pt, m))
-		last_end = base.pt_next_line_start(&doc.pt, m)
-	}
-	if doc.filter_top >= len(doc.filter_lines) {
-		doc.filter_top = 0
-	}
+	doc.filter_top = 0
+}
 
-	if len(f.matches) > 0 {
+find_recompute :: proc(doc: ^Document) {
+	search_reset(doc)
+	f := &doc.find
+	s := &doc.search
+	if len(f.query) == 0 {
+		intrinsics.atomic_store(&s.done, true)
+		return
+	}
+	s.query = make([]u8, len(f.query))
+	copy(s.query, f.query[:])
+
+	if doc.pt.length <= SEARCH_SYNC_MAX {
+		// Small buffer: scan the live tree inline. No view, no thread.
+		scan_all(s, &doc.pt)
+	} else {
+		s.view = base.pt_view(&doc.pt)
+		s.th = thread.create_and_start_with_data(s, search_worker)
+	}
+	find_merge(doc)
+}
+
+@(private = "file")
+search_worker :: proc(data: rawptr) {
+	s := (^Search)(data)
+	scan_all(s, &s.view)
+}
+
+// Take whatever the worker has published into the document's view of the
+// results. Runs once per frame; single reader, and it only ever reads indices
+// the worker has released.
+find_merge :: proc(doc: ^Document) {
+	f := &doc.find
+	s := &doc.search
+	if !f.active {return}
+	if f.dirty && s.th == nil {
+		find_recompute(doc) // an edit landed; restart once, here
+		return
+	}
+	if s.matches == nil {return}
+
+	n := intrinsics.atomic_load(&s.count)
+	f.truncated = intrinsics.atomic_load(&s.truncated)
+	if n == f.merged {return}
+
+	f.matches = s.matches[:n]
+	f.match_len = s.match_len[:n]
+
+	// Filter view: one entry per matching line. Built from line starts the
+	// worker computed during its linear pass — deriving them here would mean
+	// pt_line_start per match, an uncapped backward scan on the main thread.
+	// Matches are sorted, so same-line matches are adjacent and dedupe is a
+	// comparison against the last line appended.
+	for i in f.merged ..< n {
+		ls := s.line_start[i]
+		if len(doc.filter_lines) == 0 || doc.filter_lines[len(doc.filter_lines) - 1] != ls {
+			append(&doc.filter_lines, ls)
+		}
+	}
+	f.merged = n
+
+	// Select the caret-nearest match exactly once per query. Re-running this on
+	// every merge would yank the viewport around as later results arrive while
+	// the user is still typing.
+	if !f.jumped && n > 0 {
+		f.jumped = true
 		f.current = 0
-		for m, i in f.matches { // first match at/after the caret
+		for m, i in f.matches {
 			if m >= doc.cursor {
 				f.current = i
 				break
@@ -117,21 +258,85 @@ find_recompute :: proc(doc: ^Document) {
 	}
 }
 
+// Block until the running search finishes, merging as it goes. Headless-test
+// support only — the app never waits, it merges once per frame.
+find_wait :: proc(doc: ^Document) {
+	for !intrinsics.atomic_load(&doc.search.done) || doc.find.dirty {
+		find_merge(doc)
+	}
+	find_merge(doc)
+}
+
+// Bytes scanned so far, for progress reporting.
+find_scanned :: proc(doc: ^Document) -> int {
+	return intrinsics.atomic_load(&doc.search.scanned)
+}
+
+search_faulted :: proc(doc: ^Document) -> bool {
+	return intrinsics.atomic_load(&doc.search.fault)
+}
+
+// --- the scan itself (shared by the inline and worker paths) ---
+
+// Scan `pt` for s.query, publishing after each block. Tracks the most recent
+// newline as it goes so every match carries its line start; that costs nothing
+// here (the bytes are already in hand) and saves the main thread an unbounded
+// backward scan per match at merge time.
 @(private = "file")
-recompute_literal :: proc(doc: ^Document) {
-	f := &doc.find
-	q := f.query[:]
-	ql := make([]u8, len(q), context.temp_allocator)
+scan_all :: proc(s: ^Search, pt: ^base.Piece_Table) {
+	if pt.length == 0 || len(s.query) == 0 {
+		intrinsics.atomic_store(&s.done, true)
+		return
+	}
+	if s.regex {
+		scan_regex(s, pt)
+	} else {
+		scan_literal(s, pt)
+	}
+}
+
+// Record a match; returns false when the result arrays are full.
+@(private = "file")
+emit :: proc(s: ^Search, n: ^int, at, length, line_start: int) -> bool {
+	s.matches[n^] = at
+	s.match_len[n^] = length
+	s.line_start[n^] = line_start
+	n^ += 1
+	if n^ >= MAX_MATCHES {
+		intrinsics.atomic_store(&s.truncated, true)
+		intrinsics.atomic_store(&s.count, n^)
+		intrinsics.atomic_store(&s.done, true)
+		return false
+	}
+	return true
+}
+
+@(private = "file")
+scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table) {
+	q := s.query
+	L := pt.length
+	ql := make([]u8, len(q))
+	defer delete(ql)
 	for i in 0 ..< len(q) {ql[i] = lower(q[i])}
 
-	L := doc.pt.length
-	buf := make([]u8, FIND_CHUNK + len(q) - 1, context.temp_allocator)
+	// Overlap by len(q)-1 so a match spanning a block boundary is still found.
+	buf := make([]u8, SEARCH_BLOCK + len(q) - 1)
+	defer delete(buf)
+
+	n, last_nl := 0, -1
 	pos := 0
 	for pos < L {
-		readlen := base.pt_read(&doc.pt, pos, buf[:min(len(buf), L - pos)])
-		last := pos + FIND_CHUNK >= L
-		scan_end := readlen - len(q) + 1
-		limit := scan_end if last else min(FIND_CHUNK, scan_end)
+		if intrinsics.atomic_load(&s.cancel) {return}
+		got := base.pt_read(pt, pos, buf[:min(len(buf), L - pos)])
+		if got == 0 {break}
+		if pt.fault {
+			pt.fault = false
+			intrinsics.atomic_store(&s.fault, true)
+			return
+		}
+		last := pos + SEARCH_BLOCK >= L
+		limit := got - len(q) + 1
+		if !last {limit = min(SEARCH_BLOCK, limit)}
 		for k := 0; k < limit; k += 1 {
 			hit := true
 			for j in 0 ..< len(q) {
@@ -140,65 +345,95 @@ recompute_literal :: proc(doc: ^Document) {
 					break
 				}
 			}
-			if hit {
-				append(&f.matches, pos + k)
-				append(&f.match_len, len(q))
-				if len(f.matches) >= MAX_MATCHES {
-					f.truncated = true
-					return
-				}
-			}
+			// Check before updating last_nl: a match starting on a '\n' belongs
+			// to the line that newline terminates, not the one it begins.
+			if hit && !emit(s, &n, pos + k, len(q), last_nl + 1) {return}
+			if buf[k] == '\n' {last_nl = pos + k}
 		}
-		pos += FIND_CHUNK
+		pos += SEARCH_BLOCK
+		intrinsics.atomic_store(&s.count, n)
+		intrinsics.atomic_store(&s.scanned, min(pos, L))
 	}
+	intrinsics.atomic_store(&s.count, n)
+	intrinsics.atomic_store(&s.scanned, L)
+	intrinsics.atomic_store(&s.done, true)
 }
 
 @(private = "file")
-recompute_regex :: proc(doc: ^Document) {
-	f := &doc.find
-	L := doc.pt.length
-	// One reusable block buffer: captures are slices into it, but we copy the
-	// offsets out before the next block overwrites it.
-	buf := make([]u8, REGEX_BLOCK + REGEX_LINE_SLACK + 1, context.temp_allocator)
+scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table) {
+	L := pt.length
+	heap := context.allocator
+	// One reusable block buffer: captures are slices into it, but the offsets are
+	// copied out before the next block overwrites it. Deliberately NOT from the
+	// arena below — it has to survive that arena's per-block reset.
+	buf := make([]u8, SEARCH_BLOCK + REGEX_LINE_SLACK + 1, heap)
+	defer delete(buf, heap)
 
-	pos, scanned := 0, 0
+	// core:text/regex allocates its per-match `saved` arrays from the ambient
+	// context.allocator and never frees them. Give the scan a private arena and
+	// reset it per block, so that churn neither leaks nor hammers the process
+	// heap lock while the UI thread is trying to allocate. A private arena
+	// rather than context.temp_allocator because the inline path runs on the
+	// main thread, where temp holds other live allocations for the frame.
+	arena: mem.Dynamic_Arena
+	mem.dynamic_arena_init(&arena)
+	defer mem.dynamic_arena_destroy(&arena)
+	ctx := context
+	ctx.allocator = mem.dynamic_arena_allocator(&arena)
+	ctx.temp_allocator = ctx.allocator
+	context = ctx
+
+	n, last_nl := 0, -1
+	pos := 0
 	for pos < L {
-		if scanned >= REGEX_SCAN_CAP {
-			f.truncated = true
-			return
-		}
-		end := pos + min(REGEX_BLOCK, L - pos)
+		if intrinsics.atomic_load(&s.cancel) {return}
+		end := pos + min(SEARCH_BLOCK, L - pos)
 		if end < L {
 			// Never split a line: run on to the next newline (bounded), and keep
 			// that newline with its line so end-of-line patterns still match.
-			end = min(base.pt_line_end_cap(&doc.pt, end, REGEX_LINE_SLACK) + 1, L)
+			end = min(base.pt_line_end_cap(pt, end, REGEX_LINE_SLACK) + 1, L)
 		}
-		got := base.pt_read(&doc.pt, pos, buf[:end - pos])
+		got := base.pt_read(pt, pos, buf[:end - pos])
 		if got == 0 {break}
+		if pt.fault {
+			pt.fault = false
+			intrinsics.atomic_store(&s.fault, true)
+			return
+		}
 
 		// Recompiled per block: compilation scales with the pattern, not the
 		// file, so it stays negligible next to the scan itself.
-		it, err := regex.create_iterator(string(buf[:got]), string(f.query[:]), {.Case_Insensitive}, context.temp_allocator, context.temp_allocator)
+		it, err := regex.create_iterator(string(buf[:got]), string(s.query), {.Case_Insensitive}, context.temp_allocator, context.temp_allocator)
 		if err != nil {
-			return // invalid pattern -> no matches
+			break // invalid pattern -> no matches
 		}
+		c := 0 // newline-tracking cursor, walked forward to each match
 		for {
+			if intrinsics.atomic_load(&s.cancel) {return}
 			cap, _, ok := regex.match_iterator(&it)
 			if !ok || len(cap.pos) == 0 {
 				break
 			}
-			s, e := cap.pos[0][0], cap.pos[0][1]
-			append(&f.matches, pos + s)
-			append(&f.match_len, e - s)
-			if len(f.matches) >= MAX_MATCHES {
-				f.truncated = true
-				return
+			ms, me := cap.pos[0][0], cap.pos[0][1]
+			for ; c < ms; c += 1 {
+				if buf[c] == '\n' {last_nl = pos + c}
 			}
+			if !emit(s, &n, pos + ms, me - ms, last_nl + 1) {return}
 		}
-		scanned += got
+		for ; c < got; c += 1 {
+			if buf[c] == '\n' {last_nl = pos + c}
+		}
 		pos += got
+		intrinsics.atomic_store(&s.count, n)
+		intrinsics.atomic_store(&s.scanned, min(pos, L))
+		mem.dynamic_arena_free_all(&arena)
 	}
+	intrinsics.atomic_store(&s.count, n)
+	intrinsics.atomic_store(&s.scanned, L)
+	intrinsics.atomic_store(&s.done, true)
 }
+
+// --- navigation & replace ---
 
 @(private = "file")
 find_select_current :: proc(doc: ^Document) {
@@ -248,6 +483,8 @@ find_replace_current :: proc(doc: ^Document) {
 }
 
 // Replace every match. Applied last->first so earlier offsets stay valid.
+// Each edit invalidates the search, but find_invalidate only marks it dirty, so
+// this costs one restart at the end rather than one per match.
 find_replace_all :: proc(doc: ^Document) {
 	f := &doc.find
 	for i := len(f.matches) - 1; i >= 0; i -= 1 {

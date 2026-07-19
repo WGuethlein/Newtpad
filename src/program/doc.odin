@@ -212,6 +212,7 @@ Document :: struct {
 	redo:       [dynamic]Snapshot,
 	idx:        Line_Index,
 	find:       Find,
+	search:     Search, // background find worker (see find.odin)
 	// filter-to-matching-lines view (only while find is active)
 	filter:       bool,
 	filter_lines: [dynamic]int, // deduped matching-line starts
@@ -226,10 +227,15 @@ Find :: struct {
 	regex:        bool, // regex vs literal substring
 	query:        [dynamic]u8, // UTF-8
 	replace:      [dynamic]u8,
-	matches:      [dynamic]int, // sorted match start offsets
-	match_len:    [dynamic]int, // length of each match (regex matches vary)
+	// Slices into the Search arrays, re-sliced once per frame to whatever the
+	// worker has published. Not owned here — see Search.
+	matches:      []int, // sorted match start offsets
+	match_len:    []int, // length of each match (regex matches vary)
+	merged:       int, // entries already folded into filter_lines
 	current:      int, // index into matches, or -1
-	truncated:    bool, // hit MAX_MATCHES or the regex scan cap; results are partial
+	jumped:       bool, // already auto-selected a match for this query
+	dirty:        bool, // an edit invalidated the results; restart next frame
+	truncated:    bool, // hit MAX_MATCHES; results are partial
 }
 
 // A new empty scratch document (no file). This is what opens when Newtpad is
@@ -290,14 +296,14 @@ doc_close :: proc(doc: ^Document) {
 		thread.join(doc.idx.th)
 		thread.destroy(doc.idx.th)
 	}
+	// Before pt_destroy: the worker's view aliases the add chunks it frees.
+	search_release(doc)
 	for s in doc.undo {base.pt_free_node_tree(s.root)}
 	for s in doc.redo {base.pt_free_node_tree(s.root)}
 	delete(doc.undo)
 	delete(doc.redo)
 	delete(doc.find.query)
 	delete(doc.find.replace)
-	delete(doc.find.matches)
-	delete(doc.find.match_len)
 	delete(doc.filter_lines)
 	base.pt_destroy(&doc.pt)
 	if doc.owned_orig {
@@ -353,6 +359,9 @@ doc_recover_from_fault :: proc(doc: ^Document) {
 		thread.destroy(doc.idx.th)
 		doc.idx.th = nil
 	}
+	// Same for the search worker: its view aliases the mapping about to be
+	// unmapped. Restart it next frame against the recovered buffer.
+	find_invalidate(doc)
 	// Guarded copy of the mapped original into private memory (bad pages -> zeros).
 	priv := make([]u8, len(doc.original))
 	base.safe_copy(priv, doc.original)
@@ -379,7 +388,7 @@ doc_recover_from_fault :: proc(doc: ^Document) {
 // The buffer flag is this document's own, so a fault on a background tab no
 // longer recovers whichever document happens to be active.
 doc_fault_pending :: proc(doc: ^Document) -> bool {
-	return base.pt_take_fault(&doc.pt) || intrinsics.atomic_load(&doc.idx.fault)
+	return base.pt_take_fault(&doc.pt) || intrinsics.atomic_load(&doc.idx.fault) || search_faulted(doc)
 }
 
 // Save the buffer to `path`, re-encoded to the file's original encoding
@@ -483,6 +492,7 @@ snapshot :: proc(doc: ^Document) -> Snapshot {
 
 @(private = "file")
 apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
+	find_invalidate(doc) // undo/redo don't go through push_undo
 	base.pt_restore(&doc.pt, s.root, s.length) // takes ownership of s.root
 	doc.cursor = s.cursor
 	doc.anchor = s.anchor
@@ -491,6 +501,7 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 
 @(private = "file")
 push_undo :: proc(doc: ^Document) {
+	find_invalidate(doc) // every edit path routes through here; match offsets shift
 	append(&doc.undo, snapshot(doc))
 	for s in doc.redo {base.pt_free_node_tree(s.root)}
 	clear(&doc.redo)

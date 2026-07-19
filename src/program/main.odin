@@ -205,8 +205,12 @@ main :: proc() {
 			window.scroll_delta = 0
 		}
 
-		// Keep the caret on screen only when it moved on this tab this frame.
+		// Take whatever the search worker published since the last frame (and
+		// restart it if an edit invalidated the results).
 		doc = app_active(&app)
+		find_merge(doc)
+
+		// Keep the caret on screen only when it moved on this tab this frame.
 		if !doc.filter && app.active == active_before && doc.cursor != cursor_before {
 			doc_ensure_cursor_visible(doc, &text, rows)
 		}

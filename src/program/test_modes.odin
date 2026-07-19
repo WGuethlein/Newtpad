@@ -54,20 +54,51 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 
 		doc.find.regex = true
 		find_open(&doc, false)
-		// type the pattern one rune at a time: every keystroke recomputes, which
-		// is exactly what used to copy the whole buffer per press.
+		// Type the pattern one rune at a time. Each keystroke restarts the
+		// search; on a buffer this size that hands off to the worker, so the
+		// keystroke itself must return well inside a 16 ms frame no matter how
+		// big the file is. The "settled" column is the worker's full pass.
 		pattern := "NEEDLE-[A-Z]+"
+		worst := 0.0
 		for r in pattern {
 			t0 := time.tick_now()
 			find_input_rune(&doc, r)
-			ms := time.duration_milliseconds(time.tick_since(t0))
-			fmt.printfln("  %-15q %7.1f ms  %6d matches%s", string(doc.find.query[:]), ms, len(doc.find.matches), " (truncated)" if doc.find.truncated else "")
+			key_ms := time.duration_milliseconds(time.tick_since(t0))
+			worst = max(worst, key_ms)
+			t1 := time.tick_now()
+			find_wait(&doc)
+			settled_ms := time.duration_milliseconds(time.tick_since(t1))
+			fmt.printfln("  %-15q key %6.2f ms  settled %7.1f ms  %6d matches%s", string(doc.find.query[:]), key_ms, settled_ms, len(doc.find.matches), " (truncated)" if doc.find.truncated else "")
 		}
+		fmt.printfln("worst keystroke: %.2f ms (frame budget 16.7)", worst)
 		if len(doc.find.matches) > 0 {
 			m := doc.find.matches[0]
 			fmt.printfln("planted needle found at %d (%.1f MB in), len=%d", m, f64(m) / (1024 * 1024), doc.find.match_len[0])
 		} else {
 			fmt.println("planted needle NOT found")
+		}
+
+		// Edit the document while a search is in flight. This is the path that
+		// used to be a use-after-free: the worker is mid-read of the piece tree
+		// and the add arena while the main thread mutates both. The edit must
+		// cancel the worker, and the restarted search must still be correct.
+		clear(&doc.find.query)
+		find_recompute(&doc) // restart, then edit immediately without waiting
+		append(&doc.find.query, ..transmute([]u8)string("NEEDLE-[A-Z]+"))
+		find_recompute(&doc)
+		edits := 0
+		for i in 0 ..< 200 { // typing while the worker scans
+			doc.cursor = 0
+			doc.anchor = 0
+			doc_insert_text(&doc, transmute([]u8)string("x"))
+			edits += 1
+		}
+		find_wait(&doc)
+		fmt.printfln("edited %d times mid-search; survived, %d matches after", edits, len(doc.find.matches))
+		if len(doc.find.matches) > 0 {
+			// Every inserted byte landed at offset 0, so the needle shifted right.
+			m := doc.find.matches[0]
+			fmt.printfln("needle re-found at %d (shifted by %d)", m, edits)
 		}
 		find_close(&doc)
 		return true
@@ -75,6 +106,55 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 
 	// `newtpad celltest` prints the monospace cell width of sample codepoints and
 	// a byte<->cell round-trip (no GPU; uses text_load_faces).
+	// `newtpad findtest` covers the literal scan's block-boundary handling and
+	// the line starts the worker computes for the filter view — both of which
+	// are per-block bookkeeping that a single-block search would never exercise.
+	if os.args[1] == "findtest" {
+		line := "0123456789abcdefghijklmnopqrstuvwxyz-------------\n" // 50 bytes
+		reps := (3 * SEARCH_BLOCK) / len(line)
+		content := make([]u8, reps * len(line))
+		defer delete(content)
+		for i in 0 ..< reps {copy(content[i * len(line):], transmute([]u8)line)}
+
+		// Straddle the first block boundary: half the needle in block 0, half in
+		// block 1. Found only if the scan overlaps blocks by len(query)-1.
+		straddle := "STRADDLE"
+		at := SEARCH_BLOCK - 4
+		copy(content[at:], transmute([]u8)straddle)
+		// And one wholly inside the second block, to prove the boundary case
+		// isn't the only thing that works.
+		later := SEARCH_BLOCK + 12345
+		copy(content[later:], transmute([]u8)straddle)
+
+		doc: Document
+		doc.pt = base.pt_init(content)
+		defer base.pt_destroy(&doc.pt)
+		defer find_close(&doc)
+
+		find_open(&doc, false)
+		for r in straddle {find_input_rune(&doc, r)}
+		find_wait(&doc)
+		fmt.printfln("buffer %d KB, block %d KB", doc.pt.length / 1024, SEARCH_BLOCK / 1024)
+		fmt.printfln("straddling match: %d found, want 2", len(doc.find.matches))
+		for m, i in doc.find.matches {
+			want := at if i == 0 else later
+			fmt.printfln("  match %d at %d want %d  %s", i, m, want, "OK" if m == want else "FAIL")
+		}
+		// Line starts drive the filter view; each match is on its own line here.
+		fmt.printfln("filter lines: %d (want 2)", len(doc.filter_lines))
+		for fl, i in doc.filter_lines {
+			m := doc.find.matches[i]
+			want := (m / len(line)) * len(line)
+			fmt.printfln("  line %d start %d want %d  %s", i, fl, want, "OK" if fl == want else "FAIL")
+		}
+		// Case-insensitive, matching the find bar's behaviour.
+		clear(&doc.find.query)
+		for r in "straddle" {find_input_rune(&doc, r)}
+		find_wait(&doc)
+		fmt.printfln("case-insensitive: %d found, want 2", len(doc.find.matches))
+		return true
+	}
+
 	if os.args[1] == "celltest" {
 		t: plat.Text
 		if !plat.text_load_faces(&t) {
@@ -336,6 +416,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		doc.find.field = 1
 		for r in os.args[4] {find_input_rune(&doc, r)} // replacement
 		doc.find.field = 0
+		find_wait(&doc)
 		fmt.printfln("query=%q replace=%q matches=%d", os.args[3], os.args[4], len(doc.find.matches))
 		find_replace_all(&doc)
 		s := doc_debug_string(&doc)
@@ -346,6 +427,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		doc, _ := doc_open(path)
 		find_open(&doc, false)
 		for r in os.args[3] {find_input_rune(&doc, r)}
+		find_wait(&doc)
 		fmt.printfln("query=%q matches=%d filter_lines=%d", os.args[3], len(doc.find.matches), len(doc.filter_lines))
 		for ls in doc.filter_lines {
 			fmt.printfln("  %q", doc_line_text(&doc, ls, context.temp_allocator))
@@ -357,6 +439,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		find_open(&doc, false)
 		if len(os.args) > 4 && os.args[4] == "rx" {doc.find.regex = true}
 		for r in os.args[3] {find_input_rune(&doc, r)}
+		find_wait(&doc)
 		fmt.printf("query=%q matches=%d offsets:", string(doc.find.query[:]), len(doc.find.matches))
 		for m in doc.find.matches {fmt.printf(" %d", m)}
 		fmt.printfln("  current=%d", doc.find.current)
