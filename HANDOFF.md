@@ -457,15 +457,78 @@ three files (UTF-8 read as CP1252, written back as UTF-8), double-encoding every
 character and adding a BOM — the tab close glyph `×` rendered as `Ã—`. Use the editor for files
 with non-ASCII content.
 
+## 6j. UI build-out + the seam-bug class (2026-07-19)
+
+24 commits: menu bar, settings, font selection, undo history, zoom, external-change
+detection, encoding. Most of the *bugs* found were one class, which is the part worth
+carrying forward.
+
+**Shipped:** menu bar (File/Edit/View + gear, full Alt mnemonics, scrolling dropdowns,
+hover-to-switch); Settings and Font as **tabs**, not full-window takeovers; font
+family/style/size from a curated list; undo history panel with jump-to-state; Ctrl+/- zoom;
+external-change detection + log tailing; Windows-1252 and BOM-less UTF-16 detection; filter
+line numbers; palette showing shortcuts, `?` help, and clickable results.
+
+### The seam-bug class — read this before adding a widget
+
+Sixteen bugs this session were **the same shape: a correct, tested function fed the wrong
+input, or its result read in the wrong space.** Never a wrong algorithm. Examples:
+
+- `menu_item_at` had **no x parameter** — every point at a row's height was a live menu row
+  across the whole window, so clicking into the document to dismiss a menu ran Save/Reload/Exit.
+- Menu draw measured its bottom from the box origin, hit-test from the items origin (1px apart).
+  A dropdown that fit exactly lost its last row on screen while it stayed clickable — Edit > Font
+  was an invisible live strip.
+- `metrics_recompute` scaled `TAB_STRIP_H`, then two call sites `dp()`'d the result. Scale
+  squared. Invisible at 100%.
+- `history_row_at` returned a screen-relative index while the panel scrolls by `top`.
+- `doc_absorb_append` derived a file offset from `len(original)+appended`, which is wrong after a
+  save — it re-read the user's own saved edits and duplicated them into their file.
+- Hover read `win.mouse_y`, which `WM_MOUSEMOVE` only updates **while a button is held**.
+
+**Countermeasure, now applied:** one `*_layout()` per widget, consumed by the draw *and* the
+hit-test *and* the hover. `menu_dropdown_rect`, `palette_layout`, `history` (stored `rows`/`top`),
+`doc_visible_rows`/`doc_filter_max_top`/`GUTTER_W`. If you add a widget, do this first.
+
+**And test the seam, not the unit.** These tests all passed while the bugs shipped, because they
+verified one function against another *that already agreed*. The menu test compared the hit-test
+to `rows_fitting` — but there were **three** expressions for "rows that fit" and the draw was the
+odd one out. A seam test must compare *what is drawn* to *what is clickable*, at boundary sizes,
+and be verified by reintroducing the divergence and watching it fail. `menutest` does this now.
+
+### Also fixed (live bugs, found by red-teaming designs not yet written)
+
+- **Save failures were silent** in release: reported via `eprintfln`, but release is
+  `-subsystem:windows` so stderr is discarded. Ctrl+S on a file held open by another process did
+  nothing and said nothing. Now a dialog naming the cause.
+- **Glyph atlas dropped glyphs silently** — text vanished while the pen advanced. Now grows to
+  4096², recycles, and says so in the status bar. A CJK page needs ~3000 glyphs and 1024² held
+  1196: reachable before any font work.
+- **mmap locks the file** (`ERROR_USER_MAPPED_FILE`), so a service could not rotate a log we had
+  open — a silent violation of "never lock the user's file". Detaches to a private copy on any
+  detected change.
+- `WM_CAPTURECHANGED` never cleared `mouse_down`, so a drag interrupted by a dialog left the caret
+  being dragged every frame.
+
+### Known-good process notes
+
+- **Never edit source through shell text round-trips.** `Get-Content`/`Set-Content` re-encoded three
+  files (UTF-8 read as CP1252, written back as UTF-8), double-encoding every non-ASCII character —
+  the tab close glyph `×` became `Ã—`. It was committed and rode along for two more commits. Use the
+  editor for anything with non-ASCII content.
+- Odin's exhaustive `switch` over an enum is a genuine safety net — adding a `Command_Id`,
+  `Palette_Mode` or `Encoding` fails the build at every site that must handle it. Don't reach for
+  `#partial` to silence it.
+
 ## 6h. Filter view — wanted next (Wyatt, 2026-07-19)
 
 Filter-to-matching-lines is a V1 headline feature and the one Wyatt singled out as liking. Three
 requests from live use, none urgent:
 
-1. **Line numbers in a gutter.** A filtered view is disorienting without them — you can see the
-   matching lines but not where they are in the file. There is no gutter at all today
-   (`TEXT_MARGIN_X` is bare), so this is the first real use for one, and it would carry over to
-   normal editing.
+1. ~~**Line numbers in a gutter.**~~ **DONE (2026-07-19).** The search worker counts newlines during
+   the pass it already makes, so the numbers are free; `filter_line_nos` parallels `filter_lines`.
+   `GUTTER_W` is one value added by both `col_x` and `col_at_x`, so the drawn column and the
+   hit-tested column cannot disagree. Generalising it to normal editing is now a small step.
 2. **Select a line to jump to it** in the unfiltered document. Cheap: `filter_lines[i]` is already
    the byte offset of the line start, so it is a click-to-`set_cursor` plus leaving filter mode.
 3. **Edit text while filtered.** Genuinely harder: edits shift every offset after them, so
@@ -519,7 +582,8 @@ not a feature.
 ## 7. Build environment (Windows, this machine)
 
 - **Headless test modes** (run against the debug exe): `sehtest`, `dpitest`, `menutest`,
-  `settingstest`, `regextest <mb>`, `findtest`, `celltest`, `sessiontest`,
+  `settingstest`, `fonttest`, `historytest`, `watchtest <dir>`, `atlastest`, `savefailtest <dir>`,
+  `regextest <mb>`, `findtest`, `celltest`, `sessiontest`,
   `sessionlosstest <file> [old]`, `palettetest`, `vnavtest`, `wraptest`, plus file-argument modes (`<file> keytest|findtest|filtertest|repltest|edittest`).
   **Set `NEWTPAD_SESSION_DIR` to a temp dir first** — the session modes otherwise write to the real
   store. Note a bare `odin build` omits the DPI manifest; use `build.bat` for anything visual.
