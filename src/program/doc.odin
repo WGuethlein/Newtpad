@@ -590,8 +590,27 @@ doc_select_line_at :: proc(doc: ^Document, pos: int) {
 	doc.cursor = base.pt_next_line_start(&doc.pt, pos) // include the newline
 }
 
-// Byte offset under a client-space pixel (monospace column mapping).
-doc_pos_at :: proc(doc: ^Document, mx, my: i32, px, char_w: f32, rows: int) -> int {
+// Cell column of byte offset `off` measured from line start `ls` (off >= ls),
+// via the text layer's per-codepoint cell widths. Bounded to the drawn extent.
+line_cell_col :: proc(doc: ^Document, t: ^plat.Text, ls, off: int) -> int {
+	if off <= ls {return 0}
+	buf: [VISIBLE_COLS * 4]u8 // <=4 bytes per cell, <=VISIBLE_COLS cells
+	n := min(off - ls, len(buf))
+	got := base.pt_read(&doc.pt, ls, buf[:n])
+	return plat.text_cells(t, buf[:got])
+}
+
+// Inverse: byte offset within line [ls, le] at cell column `col` (rune-rounded).
+@(private = "file")
+line_offset_at_cell :: proc(doc: ^Document, t: ^plat.Text, ls, le, col: int) -> int {
+	buf: [VISIBLE_COLS * 4]u8
+	n := min(le - ls, len(buf))
+	got := base.pt_read(&doc.pt, ls, buf[:n])
+	return min(ls + plat.text_bytes_for_cells(t, buf[:got], col), le)
+}
+
+// Byte offset under a client-space pixel (cell-grid column mapping).
+doc_pos_at :: proc(doc: ^Document, t: ^plat.Text, mx, my: i32, px, char_w: f32, rows: int) -> int {
 	target := clamp(row_at_y(px, f32(my)), 0, rows - 1)
 	col := col_at_x(char_w, f32(mx))
 	it := visible_begin(doc, rows)
@@ -601,15 +620,15 @@ doc_pos_at :: proc(doc: ^Document, mx, my: i32, px, char_w: f32, rows: int) -> i
 		if !ok {break}
 		last_start, last_end = start, end
 		if row == target {
-			return min(start + col, end)
+			return line_offset_at_cell(doc, t, start, end, col)
 		}
 	}
-	return min(last_start + col, last_end) // click below the last line -> its end
+	return line_offset_at_cell(doc, t, last_start, last_end, col) // click below last line
 }
 
 // Selection highlight rectangles for the visible lines (opaque; drawn behind
 // text). Fills `out`, returns the count.
-doc_selection_rects :: proc(doc: ^Document, px, char_w: f32, rows: int, out: []plat.Quad) -> int {
+doc_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: int, out: []plat.Quad) -> int {
 	lo, hi := doc_sel_range(doc)
 	if lo == hi {return 0}
 	col := [4]f32{0.20, 0.30, 0.48, 1}
@@ -620,8 +639,8 @@ doc_selection_rects :: proc(doc: ^Document, px, char_w: f32, rows: int, out: []p
 		row, start, end, ok := visible_next(&it)
 		if !ok {break}
 		if lo <= end && hi > start { // selection overlaps [start, end]
-			startcol := min(max(start, lo) - start, VISIBLE_COLS) // clip to drawn extent
-			endcol := min(min(end, hi) - start, VISIBLE_COLS)
+			startcol := min(line_cell_col(doc, t, start, max(start, lo)), VISIBLE_COLS)
+			endcol := min(line_cell_col(doc, t, start, min(end, hi)), VISIBLE_COLS)
 			sx := col_x(char_w, startcol)
 			ex := col_x(char_w, endcol)
 			if hi > end {ex += char_w * 0.4} // continues past EOL: hint the newline
@@ -692,7 +711,8 @@ doc_draw :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, px, char_w: f32,
 		}
 
 		if doc.cursor >= start && doc.cursor <= end {
-			cx = col_x(char_w, min(doc.cursor - start, len(line_buf))) // clip caret to drawn extent
+			cprefix := min(doc.cursor - start, n) // caret column = cells before it, clipped to drawn text
+			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix]))
 			cy = row_y
 			caret = true
 		}

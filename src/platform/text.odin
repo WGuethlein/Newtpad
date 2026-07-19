@@ -12,6 +12,7 @@ package platform
 
 import "core:fmt"
 import "core:mem"
+import "core:unicode/utf8"
 import d3d "vendor:directx/d3d11"
 import win "core:sys/windows"
 
@@ -56,10 +57,12 @@ Text_Instance :: struct {
 
 Text :: struct {
 	// DirectWrite fonts: [0] primary, [1..] fallbacks
-	factory: ^IFactory,
-	faces:   [MAX_FACES]^IFontFace,
-	units:   [MAX_FACES]f32, // designUnitsPerEm per face
-	nfaces:  int,
+	factory:    ^IFactory,
+	faces:      [MAX_FACES]^IFontFace,
+	units:      [MAX_FACES]f32, // designUnitsPerEm per face
+	nfaces:     int,
+	char_em:    f32, // primary 'x' advance as a fraction of em == one cell's width
+	cell_cache: map[rune]u8, // codepoint -> monospace cells (0 combining / 1 / 2 wide)
 
 	// atlas + cache
 	atlas:     ^d3d.ITexture2D,
@@ -126,8 +129,10 @@ PSOut ps_main(VSOut i) {
 }
 `
 
-text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
-	// --- font ---
+// Load the DirectWrite factory + font faces and compute the cell width. No D3D,
+// so this can run headless (see the `celltest` mode). text_init calls it before
+// building the GPU pipeline.
+text_load_faces :: proc(t: ^Text) -> (ok: bool) {
 	if hr := DWriteCreateFactory(.SHARED, &IID_IFactory, &t.factory); !win.SUCCEEDED(hr) {
 		fmt.eprintfln("DWriteCreateFactory failed: 0x%X", u32(hr))
 		return
@@ -154,7 +159,24 @@ text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
 		t.nfaces += 1
 	}
 	if t.nfaces == 0 {
-		fmt.eprintln("text_init: no fonts could be loaded")
+		fmt.eprintln("text_load_faces: no fonts could be loaded")
+		return
+	}
+
+	// One cell = the primary face's 'x' advance (Consolas is monospace). Stored as
+	// a fraction of em so it scales with any pixel size.
+	cp := u32('x')
+	gi: u16
+	t.faces[0]->GetGlyphIndices(&cp, 1, &gi)
+	gm: GLYPH_METRICS
+	idx := gi
+	t.faces[0]->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
+	t.char_em = f32(gm.advanceWidth) / t.units[0]
+	return true
+}
+
+text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
+	if !text_load_faces(&t) {
 		return
 	}
 
@@ -263,16 +285,89 @@ text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
 	return t, true
 }
 
-// Advance width of a representative glyph at size px. Consolas is monospace, so
-// this is the column width — used to place the caret.
-text_char_width :: proc(t: ^Text, px: f32) -> f32 {
-	cp := u32('x')
-	gi: u16
-	t.faces[0]->GetGlyphIndices(&cp, 1, &gi)
-	gm: GLYPH_METRICS
-	idx := gi
-	t.faces[0]->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
-	return f32(gm.advanceWidth) * px / t.units[0]
+// Width of one grid cell at size px (the primary monospace 'x' advance).
+text_char_width :: proc(t: ^Text, px: f32) -> f32 {return t.char_em * px}
+
+// Nonspacing combining marks and zero-width format characters. These need a
+// codepoint check, not measured advance: monospace fonts (Consolas) give
+// combining marks a FULL advance so they're visible standalone, so measuring
+// can't detect them. Covers the common unambiguous blocks (decomposed accents,
+// Hebrew niqqud, Arabic harakat, variation selectors, zero-width format); Indic
+// spacing/nonspacing ambiguity is left to the deferred shaping work.
+@(private = "file")
+is_zero_width :: proc(r: rune) -> bool {
+	switch r {
+	case 0x00AD: // soft hyphen
+		return true
+	case 0x0300 ..= 0x036F, 0x0483 ..= 0x0489: // combining diacritical, Cyrillic
+		return true
+	case 0x0591 ..= 0x05BD, 0x05BF, 0x05C1, 0x05C2, 0x05C4, 0x05C5, 0x05C7: // Hebrew
+		return true
+	case 0x0610 ..= 0x061A, 0x064B ..= 0x065F, 0x0670: // Arabic harakat
+		return true
+	case 0x06D6 ..= 0x06DC, 0x06DF ..= 0x06E4, 0x06E7, 0x06E8, 0x06EA ..= 0x06ED: // Arabic
+		return true
+	case 0x0711, 0x0730 ..= 0x074A, 0x07A6 ..= 0x07B0: // Syriac, Thaana
+		return true
+	case 0x1AB0 ..= 0x1AFF, 0x1DC0 ..= 0x1DFF, 0x20D0 ..= 0x20FF: // combining supplements
+		return true
+	case 0x200B ..= 0x200F, 0x202A ..= 0x202E, 0x2060 ..= 0x206F: // zero-width / bidi format
+		return true
+	case 0xFE00 ..= 0xFE0F, 0xFE20 ..= 0xFE2F, 0xFEFF: // variation selectors, half marks, ZWNBSP
+		return true
+	}
+	return false
+}
+
+// Monospace cells a codepoint occupies: 0 (combining / zero-width), 1 (normal),
+// or 2 (wide / full-width CJK). Width 2 is decided by the glyph's real advance
+// relative to one cell, so it matches whatever font renders it (no width tables);
+// width 0 is decided by is_zero_width. Cached; the ratio is px-independent. Tabs
+// are one cell for now (tab stops are a later feature).
+text_cell_width :: proc(t: ^Text, r: rune) -> int {
+	if r == '\t' {return 1}
+	if c, found := t.cell_cache[r]; found {return int(c)}
+	cells: u8 = 1
+	if is_zero_width(r) {
+		cells = 0
+	} else {
+		face, gi := rune_face(t, r)
+		if gi != 0 {
+			gm: GLYPH_METRICS
+			idx := gi
+			t.faces[face]->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
+			adv_em := f32(gm.advanceWidth) / t.units[face]
+			if adv_em < 0.01 * t.char_em {
+				cells = 0 // font reports zero advance
+			} else if adv_em > 1.5 * t.char_em {
+				cells = 2 // wide / full-width
+			}
+		}
+	}
+	t.cell_cache[r] = cells
+	return int(cells)
+}
+
+// Total cells spanned by a UTF-8 slice (sum of per-rune cell widths).
+text_cells :: proc(t: ^Text, s: []u8) -> int {
+	col := 0
+	for r in string(s) {col += text_cell_width(t, r)}
+	return col
+}
+
+// Bytes of `s` that fill up to `target` cells, rounded to a rune boundary. Maps a
+// click's cell column back to a byte offset (inverse of text_cells).
+text_bytes_for_cells :: proc(t: ^Text, s: []u8, target: int) -> int {
+	str := string(s)
+	col, i := 0, 0
+	for i < len(str) {
+		r, w := utf8.decode_rune(str[i:])
+		cw := text_cell_width(t, r)
+		if col + cw > target {break} // target lands within this rune's cell span
+		col += cw
+		i += w
+	}
+	return i
 }
 
 // Pick the first loaded face that has a glyph for r; fall back to the primary
@@ -297,20 +392,24 @@ text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32
 	instances := make([dynamic]Text_Instance, 0, len(str))
 	defer delete(instances)
 
+	cell_w := t.char_em * px
 	pen := x
 	for r in str {
+		cells := text_cell_width(t, r)
 		face, gi := rune_face(t, r)
 		g := glyph_get(gfx, t, face, gi, px)
 		if g.w > 0 && g.h > 0 {
+			// Combining marks (0 cells) sit over the previous cell, not after it.
+			glyph_x := pen - cell_w if cells == 0 else pen
 			append(&instances, Text_Instance {
-				pos    = {pen + f32(g.left), y + f32(g.top)},
+				pos    = {glyph_x + f32(g.left), y + f32(g.top)},
 				size   = {f32(g.w), f32(g.h)},
 				color  = color,
 				uv_min = g.uv_min,
 				uv_max = g.uv_max,
 			})
 		}
-		pen += g.advance
+		pen += f32(cells) * cell_w // grid advance, not the glyph's natural advance
 	}
 	if len(instances) == 0 {
 		return

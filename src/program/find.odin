@@ -216,7 +216,7 @@ find_replace_all :: proc(doc: ^Document) {
 }
 
 // Highlight rectangles for visible matches (dim; behind text and the selection).
-find_match_rects :: proc(doc: ^Document, px, char_w: f32, rows: int, out: []plat.Quad) -> int {
+find_match_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: int, out: []plat.Quad) -> int {
 	f := &doc.find
 	if !f.active || len(f.matches) == 0 {
 		return 0
@@ -235,8 +235,8 @@ find_match_rects :: proc(doc: ^Document, px, char_w: f32, rows: int, out: []plat
 		ry := row_rect_y(px, row)
 		for mi < len(f.matches) && f.matches[mi] <= end && n < len(out) {
 			m := f.matches[mi]
-			startcol := min(max(m, start) - start, VISIBLE_COLS) // clip to drawn extent
-			endcol := min(min(m + f.match_len[mi], end) - start, VISIBLE_COLS)
+			startcol := min(line_cell_col(doc, t, start, max(m, start)), VISIBLE_COLS)
+			endcol := min(line_cell_col(doc, t, start, min(m + f.match_len[mi], end)), VISIBLE_COLS)
 			sx := col_x(char_w, startcol)
 			ex := col_x(char_w, endcol)
 			out[n] = {pos = {sx, ry}, size = {max(ex - sx, 2), lh}, color = col}

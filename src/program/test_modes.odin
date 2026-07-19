@@ -20,6 +20,27 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad celltest` prints the monospace cell width of sample codepoints and
+	// a byte<->cell round-trip (no GPU; uses text_load_faces).
+	if os.args[1] == "celltest" {
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("celltest: no fonts loaded")
+			return true
+		}
+		samples := "aé中がx́" // ascii, 2-byte latin, CJK x2, kana, ascii, combining acute
+		fmt.printf("cells: ")
+		for r in samples {fmt.printf("%q=%d ", r, plat.text_cell_width(&t, r))}
+		bytes := transmute([]u8)samples
+		fmt.printfln(" | total=%d cells over %d bytes", plat.text_cells(&t, bytes), len(bytes))
+		// inverse: the byte offset at each cell column should round-trip.
+		total := plat.text_cells(&t, bytes)
+		fmt.printf("col->byte: ")
+		for c in 0 ..= total {fmt.printf("%d:%d ", c, plat.text_bytes_for_cells(&t, bytes, c))}
+		fmt.println()
+		return true
+	}
+
 	if len(os.args) < 3 {return false}
 	path, mode := os.args[1], os.args[2]
 

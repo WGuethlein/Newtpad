@@ -183,7 +183,7 @@ main :: proc() {
 
 		// Mouse: press places/extends the caret (double=word, triple=line); drag extends.
 		if window.mouse_pressed {
-			mp := doc_pos_at(&doc, window.mouse_x, window.mouse_y, px, char_w, rows)
+			mp := doc_pos_at(&doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
 			switch window.mouse_count {
 			case 2:
 				doc_select_word_at(&doc, mp)
@@ -198,7 +198,7 @@ main :: proc() {
 			window.mouse_pressed = false
 		} else if window.mouse_down && window.mouse_count == 1 {
 			// drag extends a single-click selection; word/line selects stay put
-			doc.cursor = doc_pos_at(&doc, window.mouse_x, window.mouse_y, px, char_w, rows)
+			doc.cursor = doc_pos_at(&doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
 		}
 
 		if window.scroll_delta != 0 {
@@ -220,11 +220,11 @@ main :: proc() {
 		// (Skipped in filter view, whose lines aren't consecutive.)
 		if !doc.filter {
 			findq: [80]plat.Quad
-			if nfq := find_match_rects(&doc, px, char_w, rows, findq[:]); nfq > 0 {
+			if nfq := find_match_rects(&doc, &text, px, char_w, rows, findq[:]); nfq > 0 {
 				plat.quads_draw(&gfx, &quad_pipe, findq[:nfq])
 			}
 			selq: [80]plat.Quad
-			if ns := doc_selection_rects(&doc, px, char_w, rows, selq[:]); ns > 0 {
+			if ns := doc_selection_rects(&doc, &text, px, char_w, rows, selq[:]); ns > 0 {
 				plat.quads_draw(&gfx, &quad_pipe, selq[:ns])
 			}
 		}
