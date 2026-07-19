@@ -84,7 +84,8 @@ main :: proc() {
 	// nested WM_SIZE which repaints through on_resize.
 	window.on_dpi = on_dpi
 	window.dpi_user = &rc
-	window.titlebar_h = i32(dp(&rc, TAB_STRIP_H)) // valid before the first render (NC hit-test)
+	// (metrics_recompute above already set window.titlebar_h, which the NC
+	// hit-test needs valid before the first render.)
 
 	// Debounced session autosave: save ~2s after input settles (crash safety).
 	session_dirty := false
@@ -402,6 +403,11 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	MENU_W = dp(rc, MENU_W_96)
 	PLUS_W = dp(rc, PLUS_W_96)
 	SCROLLBAR_W = dp(rc, SCROLLBAR_W_96)
+
+	// The non-client hit-test boundary is derived from the tab strip, so it is
+	// set here rather than at each call site — it was being scaled a second time
+	// by one of them, squaring it and pushing the OS drag region into the content.
+	rc.window.titlebar_h = i32(TAB_STRIP_H)
 }
 
 // WM_DPICHANGED calls this, before the window is resized. Glyphs cached at the
@@ -411,9 +417,8 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 on_dpi :: proc "contextless" (user: rawptr) {
 	context = runtime.default_context()
 	rc := (^Render_Ctx)(user)
-	metrics_recompute(rc)
+	metrics_recompute(rc) // also refreshes window.titlebar_h
 	plat.text_reset_atlas(rc.text)
-	rc.window.titlebar_h = i32(dp(rc, TAB_STRIP_H))
 }
 
 // WM_SIZE calls this so the content re-renders live during a resize. It runs from

@@ -201,6 +201,35 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 		fmt.printfln("metric floors: %d failures", zero_bad)
 
+		// Scaling a metric twice squares it, which is invisible at 100% (1*1==1)
+		// and wrong everywhere else. metrics_recompute must leave each variable at
+		// exactly its 96-DPI value times the scale.
+		fmt.println("--- single-scaling (a value scaled twice would square) ---")
+		sq_bad := 0
+		for dpi in ([]u32{96, 120, 144, 192, 288}) {
+			w: plat.Window
+			w.dpi = dpi
+			rc := Render_Ctx{window = &w, text = &t}
+			metrics_recompute(&rc)
+			s := f32(dpi) / 96
+			want_strip := f32(int(TAB_STRIP_H_96 * s + 0.5))
+			want_menu := f32(int(TEXT_MARGIN_X_96 * s + 0.5))
+			// titlebar_h is what WM_NCHITTEST uses to split client from OS drag.
+			tb := f32(w.titlebar_h)
+			ok := TAB_STRIP_H == want_strip && TEXT_MARGIN_X == want_menu && tb == want_strip
+			if !ok {sq_bad += 1}
+			fmt.printfln("  dpi %3d (x%.2f)  strip %5.0f want %5.0f   margin %4.0f want %4.0f   titlebar_h %5.0f  %s", dpi, s, TAB_STRIP_H, want_strip, TEXT_MARGIN_X, want_menu, tb, "OK" if ok else "FAIL")
+		}
+		fmt.printfln("single-scaling: %d failures", sq_bad)
+		// Leave the globals at 96 DPI so later modes in the same process aren't
+		// affected by whatever the loop last set.
+		{
+			w: plat.Window
+			w.dpi = 96
+			rc := Render_Ctx{window = &w, text = &t}
+			metrics_recompute(&rc)
+		}
+
 		// The grid must be exactly linear: column n starts at n*cell_w.
 		cw := plat.text_char_width(&t, 16)
 		lin_ok := true
