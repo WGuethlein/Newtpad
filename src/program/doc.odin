@@ -55,12 +55,17 @@ Document :: struct {
 	find:       Find,
 }
 
-// Incremental find state (see find.odin).
+// Incremental find/replace state (see find.odin).
 Find :: struct {
-	active:  bool,
-	query:   [dynamic]u8, // UTF-8
-	matches: [dynamic]int, // sorted match start offsets
-	current: int, // index into matches, or -1
+	active:       bool,
+	replace_mode: bool, // Ctrl+H shows the replace field
+	field:        int, // 0 = query field, 1 = replace field (Tab toggles)
+	regex:        bool, // regex vs literal substring
+	query:        [dynamic]u8, // UTF-8
+	replace:      [dynamic]u8,
+	matches:      [dynamic]int, // sorted match start offsets
+	match_len:    [dynamic]int, // length of each match (regex matches vary)
+	current:      int, // index into matches, or -1
 }
 
 // A new empty scratch document (no file). This is what opens when Newtpad is
@@ -109,7 +114,9 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.undo)
 	delete(doc.redo)
 	delete(doc.find.query)
+	delete(doc.find.replace)
 	delete(doc.find.matches)
+	delete(doc.find.match_len)
 	base.pt_destroy(&doc.pt)
 	if doc.owned_orig {
 		delete(doc.original)

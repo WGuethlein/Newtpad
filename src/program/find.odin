@@ -1,8 +1,11 @@
-// Layer: program — incremental literal find (case-insensitive, ASCII-fold).
-// Scans the piece table in overlapping chunks (no full materialization), so it
-// stays low-memory; a background search for huge files is a follow-up.
+// Layer: program — incremental find & replace. Literal (case-insensitive,
+// ASCII-fold, chunked scan over the piece table) or regex (core:text/regex over
+// a materialized snapshot). Replace reuses the doc's public edit path (undo +
+// nl-delta handled). Group substitution ($1) and background search for huge
+// files are follow-ups.
 package main
 
+import "core:text/regex"
 import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
@@ -13,12 +16,14 @@ FIND_CHUNK :: 1 << 16
 @(private = "file")
 lower :: proc(b: u8) -> u8 {return b + 32 if b >= 'A' && b <= 'Z' else b}
 
-find_open :: proc(doc: ^Document) {
+find_open :: proc(doc: ^Document, replace_mode: bool) {
 	doc.find.active = true
+	doc.find.replace_mode = replace_mode
+	doc.find.field = 0
 	if doc_has_sel(doc) { // seed with the current selection
-		clear(&doc.find.query)
 		lo, hi := doc_sel_range(doc)
 		if hi - lo < 256 {
+			clear(&doc.find.query)
 			buf := make([]u8, hi - lo, context.temp_allocator)
 			base.pt_read(&doc.pt, lo, buf)
 			append(&doc.find.query, ..buf)
@@ -28,32 +33,58 @@ find_open :: proc(doc: ^Document) {
 }
 
 find_close :: proc(doc: ^Document) {doc.find.active = false}
+find_toggle_field :: proc(doc: ^Document) {doc.find.field = 1 - doc.find.field}
+find_toggle_regex :: proc(doc: ^Document) {doc.find.regex = !doc.find.regex;find_recompute(doc)}
+
+@(private = "file")
+active_buf :: proc(doc: ^Document) -> ^[dynamic]u8 {
+	return &doc.find.query if doc.find.field == 0 else &doc.find.replace
+}
 
 find_input_rune :: proc(doc: ^Document, r: rune) {
 	bytes, n := utf8.encode_rune(r)
-	append(&doc.find.query, ..bytes[:n])
-	find_recompute(doc)
+	append(active_buf(doc), ..bytes[:n])
+	if doc.find.field == 0 {find_recompute(doc)}
 }
 
 find_backspace :: proc(doc: ^Document) {
-	q := &doc.find.query
-	if len(q) == 0 {
-		return
-	}
-	i := len(q) - 1
-	for i > 0 && (q[i] & 0xC0) == 0x80 {i -= 1} // whole rune
-	resize(q, i)
-	find_recompute(doc)
+	buf := active_buf(doc)
+	if len(buf) == 0 {return}
+	i := len(buf) - 1
+	for i > 0 && (buf[i] & 0xC0) == 0x80 {i -= 1} // whole rune
+	resize(buf, i)
+	if doc.find.field == 0 {find_recompute(doc)}
 }
 
 find_recompute :: proc(doc: ^Document) {
 	f := &doc.find
 	clear(&f.matches)
+	clear(&f.match_len)
 	f.current = -1
-	q := f.query[:]
-	if len(q) == 0 {
-		return
+	if len(f.query) == 0 {return}
+
+	if f.regex {
+		recompute_regex(doc)
+	} else {
+		recompute_literal(doc)
 	}
+
+	if len(f.matches) > 0 {
+		f.current = 0
+		for m, i in f.matches { // first match at/after the caret
+			if m >= doc.cursor {
+				f.current = i
+				break
+			}
+		}
+		find_select_current(doc)
+	}
+}
+
+@(private = "file")
+recompute_literal :: proc(doc: ^Document) {
+	f := &doc.find
+	q := f.query[:]
 	ql := make([]u8, len(q), context.temp_allocator)
 	for i in 0 ..< len(q) {ql[i] = lower(q[i])}
 
@@ -75,24 +106,36 @@ find_recompute :: proc(doc: ^Document) {
 			}
 			if hit {
 				append(&f.matches, pos + k)
+				append(&f.match_len, len(q))
 				if len(f.matches) >= MAX_MATCHES {
-					pos = L
-					break
+					return
 				}
 			}
 		}
 		pos += FIND_CHUNK
 	}
+}
 
-	if len(f.matches) > 0 {
-		f.current = 0
-		for m, i in f.matches { // first match at/after the caret
-			if m >= doc.cursor {
-				f.current = i
-				break
-			}
+@(private = "file")
+recompute_regex :: proc(doc: ^Document) {
+	f := &doc.find
+	str := string(base.pt_collect(&doc.pt, context.temp_allocator))
+	it, err := regex.create_iterator(str, string(f.query[:]), {.Case_Insensitive}, context.temp_allocator, context.temp_allocator)
+	if err != nil {
+		return // invalid pattern -> no matches
+	}
+	// iterator allocations are in the temp allocator; freed at frame end.
+	for {
+		cap, _, ok := regex.match_iterator(&it)
+		if !ok || len(cap.pos) == 0 {
+			break
 		}
-		find_select_current(doc)
+		s, e := cap.pos[0][0], cap.pos[0][1]
+		append(&f.matches, s)
+		append(&f.match_len, e - s)
+		if len(f.matches) >= MAX_MATCHES {
+			break
+		}
 	}
 }
 
@@ -103,8 +146,8 @@ find_select_current :: proc(doc: ^Document) {
 		return
 	}
 	m := f.matches[f.current]
-	doc.anchor = m // select the match so it highlights + the view scrolls to it
-	doc.cursor = m + len(f.query)
+	doc.anchor = m // select the match: highlights it + scrolls it into view
+	doc.cursor = m + f.match_len[f.current]
 }
 
 find_next :: proc(doc: ^Document) {
@@ -121,13 +164,37 @@ find_prev :: proc(doc: ^Document) {
 	find_select_current(doc)
 }
 
+// Replace the current match with the replace text, then re-find.
+find_replace_current :: proc(doc: ^Document) {
+	f := &doc.find
+	if f.current < 0 || f.current >= len(f.matches) {
+		return
+	}
+	m := f.matches[f.current]
+	doc.anchor = m
+	doc.cursor = m + f.match_len[f.current]
+	doc_insert_text(doc, f.replace[:]) // deletes the selected match, inserts replacement (undo-aware)
+	find_recompute(doc)
+}
+
+// Replace every match. Applied last->first so earlier offsets stay valid.
+find_replace_all :: proc(doc: ^Document) {
+	f := &doc.find
+	for i := len(f.matches) - 1; i >= 0; i -= 1 {
+		m := f.matches[i]
+		doc.anchor = m
+		doc.cursor = m + f.match_len[i]
+		doc_insert_text(doc, f.replace[:])
+	}
+	find_recompute(doc)
+}
+
 // Highlight rectangles for visible matches (dim; behind text and the selection).
 find_match_rects :: proc(doc: ^Document, px, char_w: f32, rows: int, out: []plat.Quad) -> int {
 	f := &doc.find
-	if !f.active || len(f.matches) == 0 || len(f.query) == 0 {
+	if !f.active || len(f.matches) == 0 {
 		return 0
 	}
-	qlen := len(f.query)
 	x0: f32 = 12
 	line_h := px * 1.5
 	y0 := px + 10
@@ -143,7 +210,7 @@ find_match_rects :: proc(doc: ^Document, px, char_w: f32, rows: int, out: []plat
 		for mi < len(f.matches) && f.matches[mi] <= end && n < len(out) {
 			m := f.matches[mi]
 			sx := x0 + f32(m - pos) * char_w
-			ex := x0 + f32(min(m + qlen, end) - pos) * char_w
+			ex := x0 + f32(min(m + f.match_len[mi], end) - pos) * char_w
 			ry := y0 + f32(r) * line_h - px
 			out[n] = {pos = {sx, ry}, size = {max(ex - sx, 2), line_h}, color = col}
 			n += 1

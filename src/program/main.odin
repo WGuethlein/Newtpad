@@ -98,9 +98,24 @@ main :: proc() {
 	}
 
 	// Headless find check: `newtpad <path> findtest <query>`.
+	if len(os.args) > 4 && os.args[2] == "repltest" {
+		doc, _ := doc_open(path)
+		find_open(&doc, true)
+		for r in os.args[3] {find_input_rune(&doc, r)} // query (field 0)
+		doc.find.field = 1
+		for r in os.args[4] {find_input_rune(&doc, r)} // replacement
+		doc.find.field = 0
+		fmt.printfln("query=%q replace=%q matches=%d", os.args[3], os.args[4], len(doc.find.matches))
+		find_replace_all(&doc)
+		s := doc_debug_string(&doc)
+		fmt.printfln("after replace all: %q", s[:min(len(s), 40)])
+		doc_close(&doc)
+		return
+	}
 	if len(os.args) > 3 && os.args[2] == "findtest" {
 		doc, _ := doc_open(path)
-		find_open(&doc)
+		find_open(&doc, false)
+		if len(os.args) > 4 && os.args[4] == "rx" {doc.find.regex = true}
 		for r in os.args[3] {find_input_rune(&doc, r)}
 		fmt.printf("query=%q matches=%d offsets:", string(doc.find.query[:]), len(doc.find.matches))
 		for m in doc.find.matches {fmt.printf(" %d", m)}
@@ -181,8 +196,18 @@ main :: proc() {
 				#partial switch ev.cmd {
 				case .Backspace:
 					find_backspace(&doc)
+				case .Tab:
+					if doc.find.replace_mode {find_toggle_field(&doc)}
+				case .ToggleRegex:
+					find_toggle_regex(&doc)
+				case .Replace:
+					doc.find.replace_mode = !doc.find.replace_mode // Ctrl+H toggles the replace field
 				case .Enter:
-					if ev.shift {find_prev(&doc)} else {find_next(&doc)}
+					if doc.find.field == 1 {
+						if ev.ctrl {find_replace_all(&doc)} else {find_replace_current(&doc)}
+					} else {
+						if ev.shift {find_prev(&doc)} else {find_next(&doc)}
+					}
 				case .Escape, .Find:
 					find_close(&doc)
 				}
@@ -251,7 +276,9 @@ main :: proc() {
 					}
 				}
 			case .Find:
-				find_open(&doc)
+				find_open(&doc, false)
+			case .Replace:
+				find_open(&doc, true)
 			case .Escape:
 				doc.anchor = doc.cursor // clear selection
 			}
@@ -320,18 +347,27 @@ main :: proc() {
 		}
 
 		if doc.find.active {
-			bar := plat.Quad{pos = {0, h - 26}, size = {f32(window.width), 26}, color = {0.14, 0.16, 0.20, 1}}
+			f := &doc.find
+			bar_h: f32 = 48 if f.replace_mode else 26
+			bar := plat.Quad{pos = {0, h - bar_h}, size = {f32(window.width), bar_h}, color = {0.14, 0.16, 0.20, 1}}
 			plat.quads_draw(&gfx, &quad_pipe, []plat.Quad{bar})
 			info: string
-			if len(doc.find.query) == 0 {
+			if len(f.query) == 0 {
 				info = ""
-			} else if len(doc.find.matches) == 0 {
+			} else if len(f.matches) == 0 {
 				info = "  (no matches)"
 			} else {
-				info = fmt.tprintf("  (%d/%d)", doc.find.current + 1, len(doc.find.matches))
+				info = fmt.tprintf("  (%d/%d)", f.current + 1, len(f.matches))
 			}
-			fb := fmt.tprintf("Find: %s%s", string(doc.find.query[:]), info)
-			plat.text_draw(&gfx, &text, fb, 12, h - 8, 14, {0.95, 0.88, 0.55, 1})
+			mode := "regex" if f.regex else "text"
+			fline := fmt.tprintf("Find [%s]: %s%s%s", mode, string(f.query[:]), " _" if f.field == 0 else "", info)
+			if f.replace_mode {
+				plat.text_draw(&gfx, &text, fline, 12, h - 30, 14, {0.95, 0.88, 0.55, 1})
+				rline := fmt.tprintf("Replace: %s%s", string(f.replace[:]), " _" if f.field == 1 else "")
+				plat.text_draw(&gfx, &text, rline, 12, h - 8, 14, {0.82, 0.9, 0.98, 1})
+			} else {
+				plat.text_draw(&gfx, &text, fline, 12, h - 8, 14, {0.95, 0.88, 0.55, 1})
+			}
 		} else {
 			status := fmt.tprintf("%d lines%s%s", doc_line_count(&doc), " *" if doc.modified else "", "" if doc_index_done(&doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(&doc) * 100))
 			plat.text_draw(&gfx, &text, status, 12, h - 8, 13, {0.55, 0.60, 0.70, 1})

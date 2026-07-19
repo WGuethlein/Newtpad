@@ -44,11 +44,15 @@ Key_Cmd :: enum u8 {
 	DeleteWordBack,
 	Find,
 	Escape,
+	Replace,
+	Tab,
+	ToggleRegex,
 }
 
 Key_Event :: struct {
 	cmd:   Key_Cmd,
 	shift: bool,
+	ctrl:  bool,
 }
 
 Window :: struct {
@@ -213,13 +217,19 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 			cmd = .SelectAll;has = ctrl
 		case win.VK_F:
 			cmd = .Find;has = ctrl
+		case win.VK_H:
+			cmd = .Replace;has = ctrl
+		case win.VK_TAB:
+			cmd = .Tab
+		case win.VK_R:
+			cmd = .ToggleRegex;has = ctrl
 		case win.VK_ESCAPE:
 			cmd = .Escape
 		case:
 			has = false
 		}
 		if has && w.key_count < len(w.key_events) {
-			w.key_events[w.key_count] = {cmd, shift}
+			w.key_events[w.key_count] = {cmd, shift, ctrl}
 			w.key_count += 1
 		}
 		return 0
