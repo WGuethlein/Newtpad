@@ -323,7 +323,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		} else if len(f.matches) == 0 {
 			info = "  (no matches)"
 		} else {
-			info = fmt.tprintf("  (%d/%d)", f.current + 1, len(f.matches))
+			// "+" marks a partial result: we stopped at the match limit or the
+			// regex scan cap, so there may be more further down the file.
+			info = fmt.tprintf("  (%d/%d%s)", f.current + 1, len(f.matches), "+" if f.truncated else "")
 		}
 		mode := "regex" if f.regex else "text"
 		fline := fmt.tprintf("Find [%s]%s: %s%s%s", mode, " filter" if doc.filter else "", string(f.query[:]), " _" if f.field == 0 else "", info)

@@ -6,6 +6,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import "core:strconv"
 import "core:time"
 import base "src:base"
 import plat "src:platform"
@@ -24,6 +25,51 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// `newtpad sehtest` proves the SEH guard catches a real page fault.
 	if os.args[1] == "sehtest" {
 		fmt.printfln("seh guard caught + zero-filled a page fault: %v", plat.seh_selftest())
+		return true
+	}
+
+	// `newtpad regextest` times an incremental regex find over a synthetic buffer
+	// large enough that the old materialize-the-whole-document path stalled, and
+	// checks the matches are the ones we planted.
+	if os.args[1] == "regextest" {
+		mb := 64
+		if len(os.args) > 2 {
+			n, _ := strconv.parse_int(os.args[2])
+			mb = max(1, n)
+		}
+		line := "2026-07-19 INFO  request served in 12ms path=/health\n" // 52 bytes
+		reps := (mb * 1024 * 1024) / len(line)
+		content := make([]u8, reps * len(line))
+		defer delete(content)
+		for i in 0 ..< reps {copy(content[i * len(line):], transmute([]u8)line)}
+		// Plant a distinctive match in the final line, past every block boundary.
+		// Overwrite only the head of that line so its trailing newline survives.
+		plant := "2026-07-19 ERROR boom path=/NEEDLE-ZZZ"
+		copy(content[len(content) - len(line):], transmute([]u8)plant)
+
+		doc: Document
+		doc.pt = base.pt_init(content)
+		defer base.pt_destroy(&doc.pt)
+		fmt.printfln("buffer: %.1f MB", f64(doc.pt.length) / (1024 * 1024))
+
+		doc.find.regex = true
+		find_open(&doc, false)
+		// type the pattern one rune at a time: every keystroke recomputes, which
+		// is exactly what used to copy the whole buffer per press.
+		pattern := "NEEDLE-[A-Z]+"
+		for r in pattern {
+			t0 := time.tick_now()
+			find_input_rune(&doc, r)
+			ms := time.duration_milliseconds(time.tick_since(t0))
+			fmt.printfln("  %-15q %7.1f ms  %6d matches%s", string(doc.find.query[:]), ms, len(doc.find.matches), " (truncated)" if doc.find.truncated else "")
+		}
+		if len(doc.find.matches) > 0 {
+			m := doc.find.matches[0]
+			fmt.printfln("planted needle found at %d (%.1f MB in), len=%d", m, f64(m) / (1024 * 1024), doc.find.match_len[0])
+		} else {
+			fmt.println("planted needle NOT found")
+		}
+		find_close(&doc)
 		return true
 	}
 

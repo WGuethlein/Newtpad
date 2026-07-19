@@ -229,6 +229,7 @@ Find :: struct {
 	matches:      [dynamic]int, // sorted match start offsets
 	match_len:    [dynamic]int, // length of each match (regex matches vary)
 	current:      int, // index into matches, or -1
+	truncated:    bool, // hit MAX_MATCHES or the regex scan cap; results are partial
 }
 
 // A new empty scratch document (no file). This is what opens when Newtpad is

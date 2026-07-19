@@ -1,6 +1,6 @@
 // Layer: program — incremental find & replace. Literal (case-insensitive,
 // ASCII-fold, chunked scan over the piece table) or regex (core:text/regex over
-// a materialized snapshot). Replace reuses the doc's public edit path (undo +
+// line-aligned blocks). Replace reuses the doc's public edit path (undo +
 // nl-delta handled). Group substitution ($1) and background search for huge
 // files are follow-ups.
 package main
@@ -12,6 +12,24 @@ import plat "src:platform"
 
 MAX_MATCHES :: 100_000
 FIND_CHUNK :: 1 << 16
+
+// Regex scans line-aligned blocks rather than materializing the document: a
+// whole-buffer pt_collect ran per keystroke, so a large file froze the UI (and
+// could fail the allocation outright). Cost per keystroke is now bounded by
+// REGEX_SCAN_CAP regardless of file size.
+//
+// Trade-off: a pattern spanning a block boundary won't match. Blocks end just
+// past a newline, so line-scoped patterns — what people actually type into a
+// find bar — are unaffected.
+// Measured ~16-19 ms/MB for core:text/regex on this machine (`newtpad regextest
+// <mb>`), so the cap is a directly chosen latency budget: 8 MB ~= 130 ms on the
+// worst keystroke. One frame's worth would be about 1 MB, which is too little to
+// be useful — synchronous regex simply cannot be instant on a large file, so the
+// cap buys a bounded stall and an honest "+" rather than a fix. The real fix is
+// to run the search on a worker over a snapshot; see HANDOFF.
+REGEX_BLOCK :: 1 << 20 // bytes scanned per block
+REGEX_LINE_SLACK :: 1 << 16 // extra bytes allowed to reach the block's line end
+REGEX_SCAN_CAP :: 8 << 20 // total bytes scanned per recompute
 
 @(private = "file")
 lower :: proc(b: u8) -> u8 {return b + 32 if b >= 'A' && b <= 'Z' else b}
@@ -64,6 +82,7 @@ find_recompute :: proc(doc: ^Document) {
 	clear(&f.matches)
 	clear(&f.match_len)
 	f.current = -1
+	f.truncated = false
 	if len(f.query) == 0 {return}
 
 	if f.regex {
@@ -125,6 +144,7 @@ recompute_literal :: proc(doc: ^Document) {
 				append(&f.matches, pos + k)
 				append(&f.match_len, len(q))
 				if len(f.matches) >= MAX_MATCHES {
+					f.truncated = true
 					return
 				}
 			}
@@ -136,23 +156,47 @@ recompute_literal :: proc(doc: ^Document) {
 @(private = "file")
 recompute_regex :: proc(doc: ^Document) {
 	f := &doc.find
-	str := string(base.pt_collect(&doc.pt, context.temp_allocator))
-	it, err := regex.create_iterator(str, string(f.query[:]), {.Case_Insensitive}, context.temp_allocator, context.temp_allocator)
-	if err != nil {
-		return // invalid pattern -> no matches
-	}
-	// iterator allocations are in the temp allocator; freed at frame end.
-	for {
-		cap, _, ok := regex.match_iterator(&it)
-		if !ok || len(cap.pos) == 0 {
-			break
+	L := doc.pt.length
+	// One reusable block buffer: captures are slices into it, but we copy the
+	// offsets out before the next block overwrites it.
+	buf := make([]u8, REGEX_BLOCK + REGEX_LINE_SLACK + 1, context.temp_allocator)
+
+	pos, scanned := 0, 0
+	for pos < L {
+		if scanned >= REGEX_SCAN_CAP {
+			f.truncated = true
+			return
 		}
-		s, e := cap.pos[0][0], cap.pos[0][1]
-		append(&f.matches, s)
-		append(&f.match_len, e - s)
-		if len(f.matches) >= MAX_MATCHES {
-			break
+		end := pos + min(REGEX_BLOCK, L - pos)
+		if end < L {
+			// Never split a line: run on to the next newline (bounded), and keep
+			// that newline with its line so end-of-line patterns still match.
+			end = min(base.pt_line_end_cap(&doc.pt, end, REGEX_LINE_SLACK) + 1, L)
 		}
+		got := base.pt_read(&doc.pt, pos, buf[:end - pos])
+		if got == 0 {break}
+
+		// Recompiled per block: compilation scales with the pattern, not the
+		// file, so it stays negligible next to the scan itself.
+		it, err := regex.create_iterator(string(buf[:got]), string(f.query[:]), {.Case_Insensitive}, context.temp_allocator, context.temp_allocator)
+		if err != nil {
+			return // invalid pattern -> no matches
+		}
+		for {
+			cap, _, ok := regex.match_iterator(&it)
+			if !ok || len(cap.pos) == 0 {
+				break
+			}
+			s, e := cap.pos[0][0], cap.pos[0][1]
+			append(&f.matches, pos + s)
+			append(&f.match_len, e - s)
+			if len(f.matches) >= MAX_MATCHES {
+				f.truncated = true
+				return
+			}
+		}
+		scanned += got
+		pos += got
 	}
 }
 
