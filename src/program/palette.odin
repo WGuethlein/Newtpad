@@ -157,16 +157,16 @@ palette_recompute :: proc(app: ^App) {
 
 palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Text, app: ^App, width, height: f32) {
 	p := &app.palette
-	PW := min(f32(720), width - 80)
+	PW := min(sx(720), width - sx(80))
 	x0 := (width - PW) / 2
-	y0 := f32(44)
-	qh := f32(34)
-	rowh := f32(26)
+	y0 := sx(44)
+	qh := sx(34)
+	rowh := sx(26)
 	nres := min(len(p.results), 12)
 	boxh := qh + (rowh if p.mode == .Goto else f32(nres) * rowh)
 
 	plat.quads_draw(gfx, quad_pipe, []plat.Quad {
-			{pos = {x0 - 1, y0 - 1}, size = {PW + 2, boxh + 2}, color = {0.30, 0.34, 0.42, 1}}, // border
+			{pos = {x0 - sx(1), y0 - sx(1)}, size = {PW + sx(2), boxh + sx(2)}, color = {0.30, 0.34, 0.42, 1}}, // border
 			{pos = {x0, y0}, size = {PW, boxh}, color = {0.11, 0.13, 0.17, 1}}, // body
 			{pos = {x0, y0}, size = {PW, qh}, color = {0.15, 0.17, 0.22, 1}}, // query field
 		})
@@ -177,10 +177,10 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 		qs = "Search tabs    ( >  command    :  go to line )"
 		qcol = {0.45, 0.49, 0.57, 1}
 	}
-	plat.text_draw(gfx, text, qs, x0 + 12, y0 + 22, UI_PX, qcol)
+	plat.text_draw(gfx, text, qs, x0 + sx(12), y0 + sx(22), UI_PX, qcol)
 
 	if p.mode == .Goto {
-		plat.text_draw(gfx, text, "type a line number, then Enter", x0 + 16, y0 + qh + 17, UI_PX, {0.6, 0.64, 0.72, 1})
+		plat.text_draw(gfx, text, "type a line number, then Enter", x0 + sx(16), y0 + qh + sx(17), UI_PX, {0.6, 0.64, 0.72, 1})
 		return
 	}
 
@@ -192,11 +192,11 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 		r := p.results[i]
 		fg := [4]f32{0.95, 0.96, 0.99, 1} if i == p.selected else {0.80, 0.84, 0.90, 1}
 		if p.mode == .Commands {
-			plat.text_draw(gfx, text, command_table[r.cmd].title, x0 + 16, ry + 17, UI_PX, fg)
+			plat.text_draw(gfx, text, command_table[r.cmd].title, x0 + sx(16), ry + sx(17), UI_PX, fg)
 			cat := command_table[r.cmd].category
-			plat.text_draw(gfx, text, cat, x0 + PW - 130, ry + 17, UI_SMALL_PX, {0.5, 0.54, 0.62, 1})
+			plat.text_draw(gfx, text, cat, x0 + PW - sx(130), ry + sx(17), UI_SMALL_PX, {0.5, 0.54, 0.62, 1})
 		} else if r.slot >= 0 && r.slot < len(app.docs) && app.docs[r.slot] != nil {
-			plat.text_draw(gfx, text, doc_display_name(app.docs[r.slot]), x0 + 16, ry + 17, UI_PX, fg)
+			plat.text_draw(gfx, text, doc_display_name(app.docs[r.slot]), x0 + sx(16), ry + sx(17), UI_PX, fg)
 		}
 	}
 }

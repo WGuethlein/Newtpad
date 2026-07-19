@@ -28,17 +28,51 @@ VISIBLE_COLS :: 2048
 // the DPI scale — six chrome sizes (15/17/14/13/12 plus the body's 16) meant six
 // copies of ASCII, which at 300% is most of a 1024^2 atlas before a single CJK
 // character. Two is also simply less to keep consistent.
-BASE_PX :: f32(16) // document text size at 96 DPI (scaled by dp())
-UI_PX :: f32(15) // chrome: menu/caption glyphs, palette rows, find bar
-UI_SMALL_PX :: f32(13) // secondary: tab labels, status bar, category labels
+BASE_PX :: f32(16) // document text size at 96 DPI
+UI_PX_96 :: f32(15) // chrome: menu/caption glyphs, palette rows, find bar
+UI_SMALL_PX_96 :: f32(13) // secondary: tab labels, status bar, category labels
+TEXT_MARGIN_X_96 :: f32(12) // left gutter before text
+TEXT_MARGIN_Y_96 :: f32(10) // top gutter above the first line
+TAB_STRIP_H_96 :: f32(36) // height of the custom title bar (tabs + window buttons)
 
-TEXT_MARGIN_X :: f32(12) // left gutter before text (px)
-TEXT_MARGIN_Y :: f32(10) // top gutter above the first line (px)
-TAB_STRIP_H :: f32(36) // height of the custom title bar (tabs + window buttons)
-LINE_SPACING :: f32(1.5) // line height = font px * this
+LINE_SPACING :: f32(1.5) // line height = font px * this (a ratio; DPI-independent)
 
-// Content-area top edge: below the tab strip.
-CONTENT_TOP :: TAB_STRIP_H + TEXT_MARGIN_Y
+// --- the same values at the current DPI ---
+//
+// These are variables, not constants, because every one of them is a pixel
+// measurement and the window's DPI is only known at runtime — and can change
+// while running, when the window is dragged to another monitor. They are written
+// in exactly one place (metrics_recompute, main.odin) before any frame is drawn,
+// and read everywhere else. Newtpad is a single-window app, so there is exactly
+// one DPI in play at a time and no need to thread a context object through every
+// draw call.
+// One width for the scrollbar. It used to be three disagreeing numbers — the
+// hit-test gutter, the drawn track, and the width reserved when wrapping — which
+// merely looked sloppy at 96 DPI but would have rendered wrapped text underneath
+// the bar once they scaled independently.
+SCROLLBAR_W_96 :: f32(16)
+
+UI_PX := UI_PX_96
+UI_SMALL_PX := UI_SMALL_PX_96
+TEXT_MARGIN_X := TEXT_MARGIN_X_96
+TEXT_MARGIN_Y := TEXT_MARGIN_Y_96
+TAB_STRIP_H := TAB_STRIP_H_96
+SCROLLBAR_W := SCROLLBAR_W_96
+
+// Content-area top edge: below the tab strip. Derived, so it is recomputed too.
+CONTENT_TOP := TAB_STRIP_H_96 + TEXT_MARGIN_Y_96
+
+// window DPI / 96, written by metrics_recompute. Lets the small one-off offsets
+// inside a widget scale without every draw proc taking a context parameter.
+UI_SCALE: f32 = 1
+
+// Scale a 96-DPI offset. Sign-preserving, and never rounds a non-zero value away
+// to nothing (a 1px gap must stay visible).
+sx :: #force_inline proc(v: f32) -> f32 {
+	if v == 0 {return 0}
+	r := f32(int(v * UI_SCALE + (0.5 if v > 0 else -0.5)))
+	return r if r != 0 else (1 if v > 0 else -1)
+}
 
 // Rounded to a whole pixel for the same reason cell width is (see
 // plat.text_char_width): row r's top is r*line_height, and every pass that

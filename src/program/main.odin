@@ -127,7 +127,7 @@ main :: proc() {
 
 		doc := app_active(&app)
 		// Usable content width in cells (word wrap breaks here).
-		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - 18) / char_w))
+		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - SCROLLBAR_W) / char_w))
 		// Re-center on the caret only when it actually moves on THIS tab â€” never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
 		active_before := app.active
@@ -175,7 +175,7 @@ main :: proc() {
 
 		// Scrollbar: a press in the right-edge gutter starts a drag that maps the
 		// pointer's y to a byte-proportional scroll position (consumes the click).
-		if window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - 16 && window.mouse_y >= i32(TAB_STRIP_H) {
+		if window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - SCROLLBAR_W && window.mouse_y >= i32(TAB_STRIP_H) {
 			scrollbar_drag = true
 			window.mouse_pressed = false
 		}
@@ -290,7 +290,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	rows := int((f32(window.height) - CONTENT_TOP) / line_h)
 	// Recompute the wrap width here (not just in the main loop) so word wrap
 	// re-flows live during a resize, which repaints through this path.
-	doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - 18) / char_w))
+	doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - SCROLLBAR_W) / char_w))
 
 	plat.gfx_begin_frame(gfx, 0.09, 0.11, 0.16)
 
@@ -317,12 +317,12 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	if total > 0 && !doc.filter {
 		sb_h := h - TAB_STRIP_H
 		ty := TAB_STRIP_H + f32(doc.top) / f32(total) * sb_h
-		th := max(24, f32(bottom - doc.top) / f32(total) * sb_h)
-		bars[nb] = {pos = {w - 14, TAB_STRIP_H}, size = {12, sb_h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
-		bars[nb] = {pos = {w - 13, ty}, size = {10, th}, color = {0.42, 0.48, 0.60, 1}};nb += 1
+		th := max(sx(24), f32(bottom - doc.top) / f32(total) * sb_h)
+		bars[nb] = {pos = {w - SCROLLBAR_W, TAB_STRIP_H}, size = {SCROLLBAR_W, sb_h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
+		bars[nb] = {pos = {w - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = {0.42, 0.48, 0.60, 1}};nb += 1
 	}
 	if caret {
-		bars[nb] = {pos = {cx, cy - px}, size = {2, line_h}, color = {0.95, 0.85, 0.35, 1}};nb += 1
+		bars[nb] = {pos = {cx, cy - px}, size = {sx(2), line_h}, color = {0.95, 0.85, 0.35, 1}};nb += 1
 	}
 	if nb > 0 {
 		plat.quads_draw(gfx, quad_pipe, bars[:nb])
@@ -336,7 +336,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 
 	if doc.find.active {
 		f := &doc.find
-		bar_h: f32 = 48 if f.replace_mode else 26
+		bar_h := sx(48) if f.replace_mode else sx(26)
 		bar := plat.Quad{pos = {0, h - bar_h}, size = {w, bar_h}, color = {0.14, 0.16, 0.20, 1}}
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{bar})
 		info: string
@@ -352,11 +352,11 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		mode := "regex" if f.regex else "text"
 		fline := fmt.tprintf("Find [%s]%s: %s%s%s", mode, " filter" if doc.filter else "", string(f.query[:]), " _" if f.field == 0 else "", info)
 		if f.replace_mode {
-			plat.text_draw(gfx, text, fline, 12, h - 30, UI_PX, {0.95, 0.88, 0.55, 1})
+			plat.text_draw(gfx, text, fline, sx(12), h - sx(30), UI_PX, {0.95, 0.88, 0.55, 1})
 			rline := fmt.tprintf("Replace: %s%s", string(f.replace[:]), " _" if f.field == 1 else "")
-			plat.text_draw(gfx, text, rline, 12, h - 8, UI_PX, {0.82, 0.9, 0.98, 1})
+			plat.text_draw(gfx, text, rline, sx(12), h - sx(8), UI_PX, {0.82, 0.9, 0.98, 1})
 		} else {
-			plat.text_draw(gfx, text, fline, 12, h - 8, UI_PX, {0.95, 0.88, 0.55, 1})
+			plat.text_draw(gfx, text, fline, sx(12), h - sx(8), UI_PX, {0.95, 0.88, 0.55, 1})
 		}
 	} else {
 		ln := doc_cursor_line(doc)
@@ -365,7 +365,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		indexing := "" if doc_index_done(doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(doc) * 100)
 		status := fmt.tprintf("%s    %s    %d lines%s%s%s%s", lncol, enc_name(doc.enc), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, indexing)
 		col := [4]f32{0.95, 0.55, 0.35, 1} if doc.recovered else {0.55, 0.60, 0.70, 1}
-		plat.text_draw(gfx, text, status, 12, h - 8, UI_SMALL_PX, col)
+		plat.text_draw(gfx, text, status, sx(12), h - sx(8), UI_SMALL_PX, col)
 	}
 
 	plat.gfx_end_frame(gfx, 1 if vsync else 0)
@@ -387,6 +387,21 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	rc.px = dp(rc, BASE_PX)
 	rc.line_h = line_height(rc.px)
 	rc.char_w = plat.text_char_width(rc.text, rc.px)
+
+	// The chrome. Sole writer of these — see the note on their declarations.
+	UI_SCALE = plat.window_scale(rc.window)
+	UI_PX = dp(rc, UI_PX_96)
+	UI_SMALL_PX = dp(rc, UI_SMALL_PX_96)
+	TEXT_MARGIN_X = dp(rc, TEXT_MARGIN_X_96)
+	TEXT_MARGIN_Y = dp(rc, TEXT_MARGIN_Y_96)
+	TAB_STRIP_H = dp(rc, TAB_STRIP_H_96)
+	CONTENT_TOP = TAB_STRIP_H + TEXT_MARGIN_Y
+	TAB_W = dp(rc, TAB_W_96)
+	TAB_GAP = dp(rc, TAB_GAP_96)
+	TAB_CLOSE_W = dp(rc, TAB_CLOSE_W_96)
+	MENU_W = dp(rc, MENU_W_96)
+	PLUS_W = dp(rc, PLUS_W_96)
+	SCROLLBAR_W = dp(rc, SCROLLBAR_W_96)
 }
 
 // WM_DPICHANGED calls this, before the window is resized. Glyphs cached at the
