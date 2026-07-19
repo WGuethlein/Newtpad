@@ -153,6 +153,71 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad historytest` covers undo coalescing, the entry cap, and jumping to
+	// an arbitrary state.
+	if os.args[1] == "historytest" {
+		bad := 0
+		doc: Document
+		doc.pt = base.pt_init(nil)
+		defer base.pt_destroy(&doc.pt)
+
+		// A typing run is one entry, not one per character.
+		for r in "hello" {doc_insert_rune(&doc, r)}
+		one := len(doc.undo)
+		fmt.printfln("typed 5 chars -> %d undo entries (want 1)  %s", one, "OK" if one == 1 else "FAIL")
+		if one != 1 {bad += 1}
+
+		// A caret jump breaks the run.
+		doc.cursor = 0
+		doc.anchor = 0
+		doc_insert_rune(&doc, 'X')
+		two := len(doc.undo)
+		fmt.printfln("caret jump then type -> %d entries (want 2)  %s", two, "OK" if two == 2 else "FAIL")
+		if two != 2 {bad += 1}
+
+		// A newline breaks it too, so undo stops at line boundaries.
+		doc.cursor = doc.pt.length
+		doc.anchor = doc.cursor
+		doc_insert_rune(&doc, '\n')
+		doc_insert_rune(&doc, 'a')
+		fmt.printfln("newline splits run -> %d entries (want 4)  %s", len(doc.undo), "OK" if len(doc.undo) == 4 else "FAIL")
+		if len(doc.undo) != 4 {bad += 1}
+
+		// Undo walks whole runs: one Ctrl+Z should remove "hello", not "o".
+		before := doc_debug_string(&doc)
+		for len(doc.undo) > 0 {doc_undo(&doc)}
+		empty := doc.pt.length == 0
+		fmt.printfln("undo to start: %q -> len %d  %s", before[:min(len(before), 12)], doc.pt.length, "OK" if empty else "FAIL")
+		if !empty {bad += 1}
+
+		// Jump forward to the newest state, then back to the middle.
+		n := doc_history_len(&doc)
+		doc_history_goto(&doc, n - 1)
+		newest := doc_debug_string(&doc)
+		doc_history_goto(&doc, 1)
+		mid := doc_history_current(&doc)
+		fmt.printfln("goto newest %q then state 1 -> current %d  %s", newest[:min(len(newest), 12)], mid, "OK" if mid == 1 else "FAIL")
+		if mid != 1 {bad += 1}
+
+		// The cap must hold, and dropping the oldest must not corrupt the rest.
+		doc2: Document
+		doc2.pt = base.pt_init(nil)
+		defer base.pt_destroy(&doc2.pt)
+		for i in 0 ..< UNDO_MAX + 50 {
+			doc2.cursor = 0 // force a new entry every time
+			doc2.anchor = 0
+			doc_insert_rune(&doc2, 'z')
+		}
+		capped := len(doc2.undo) <= UNDO_MAX
+		fmt.printfln("%d edits -> %d entries (cap %d)  %s", UNDO_MAX + 50, len(doc2.undo), UNDO_MAX, "OK" if capped else "FAIL")
+		if !capped {bad += 1}
+		doc_history_goto(&doc2, 0) // walk to the oldest surviving state
+		fmt.printfln("walk to oldest after eviction: len %d  OK", doc2.pt.length)
+
+		fmt.printfln("historytest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad settingstest` round-trips settings.txt and checks the defaults and
 	// clamps. Set NEWTPAD_SESSION_DIR first — it writes to the session store.
 	if os.args[1] == "settingstest" {

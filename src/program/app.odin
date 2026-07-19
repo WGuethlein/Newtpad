@@ -19,6 +19,7 @@ App :: struct {
 	settings:      Settings,
 	settings_open: bool,
 	settings_row:  int,
+	history:       History_State,
 	palette:    Palette, // command palette overlay (Ctrl+P)
 }
 

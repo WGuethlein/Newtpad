@@ -192,6 +192,8 @@ main :: proc() {
 			ctx := Ctx.Editor
 			if app.settings_open {
 				ctx = .Settings
+			} else if app.history.open {
+				ctx = .History
 			} else if menu_is_active(&app) {
 				ctx = .Menu
 			} else if app.palette.active {
@@ -226,6 +228,20 @@ main :: proc() {
 			if mcmd != .None {
 				command_dispatch(mcmd, {}, &app, window, &text, rows)
 				doc = app_active(&app)
+			}
+		}
+
+		// The history panel overlaps the content, so it claims clicks too.
+		if app.history.open && window.mouse_pressed {
+			if r := history_row_at(&app, f32(window.mouse_x), f32(window.mouse_y), f32(window.width)); r >= 0 {
+				app.history.sel = r
+				history_activate(&app)
+				doc = app_active(&app)
+			}
+			if history_row_at(&app, f32(window.mouse_x), f32(window.mouse_y), f32(window.width)) >= 0 ||
+			   f32(window.mouse_x) >= f32(window.width) - HISTORY_W - SCROLLBAR_W {
+				window.mouse_pressed = false
+				window.mouse_down = false
 			}
 		}
 
@@ -397,6 +413,8 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
 	if rc.app.settings_open {
 		settings_draw(gfx, quad_pipe, text, rc.app, w, h)
+	} else if rc.app.history.open {
+		history_draw(gfx, quad_pipe, text, rc.app, w, h)
 	}
 	menu_draw(gfx, quad_pipe, text, rc.app, window, w, h)
 
@@ -522,6 +540,8 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	MENU_W = dp(rc, MENU_W_96)
 	PLUS_W = dp(rc, PLUS_W_96)
 	SCROLLBAR_W = dp(rc, SCROLLBAR_W_96)
+	HISTORY_ROW = dp(rc, HISTORY_ROW_96)
+	HISTORY_W = dp(rc, HISTORY_W_96)
 
 	// The non-client hit-test boundary is derived from the tab strip, so it is
 	// set here rather than at each call site â€” it was being scaled a second time

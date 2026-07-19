@@ -96,6 +96,8 @@ command_in_palette :: proc(cmd: Command_Id) -> bool {
 	     .Menu_Close, .Menu_Next, .Menu_Prev, .Menu_Item_Next, .Menu_Item_Prev, .Menu_Activate,
 	     // Settings navigation likewise. Settings_Open stays — a real destination.
 	     .Settings_Close, .Settings_Next, .Settings_Prev, .Settings_Toggle, .Settings_Inc, .Settings_Dec,
+	     // History navigation likewise; History_Open stays.
+	     .History_Close, .History_Next, .History_Prev, .History_Jump,
 	     // Filter_Open supersedes it here: same key, but it opens find first
 	     // instead of silently toggling a mode with no visible UI.
 	     .Find_Toggle_Filter:

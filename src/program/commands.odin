@@ -1,4 +1,4 @@
-// Layer: program — the command table: every editor action declared once. The
+// Layer: program â€” the command table: every editor action declared once. The
 // enumerated `command_table` (compiler forces a row per Command_Id) holds palette
 // metadata; `default_bindings` is the keymap (key chord + context -> command),
 // separated from the metadata so keys are rebindable later (a user overlay);
@@ -19,6 +19,7 @@ Ctx :: enum u8 {
 	Palette,
 	Menu,
 	Settings,
+	History,
 }
 
 Command_Id :: enum u8 {
@@ -87,6 +88,12 @@ Command_Id :: enum u8 {
 	Zoom_In,
 	Zoom_Out,
 	Zoom_Reset,
+	// undo history panel
+	History_Open,
+	History_Close,
+	History_Next,
+	History_Prev,
+	History_Jump,
 	// find mode
 	Find_Close,
 	Find_Backspace,
@@ -106,7 +113,7 @@ Command :: struct {
 	category: string,
 }
 
-// One row per Command_Id — the array is total over the enum, so a new command
+// One row per Command_Id â€” the array is total over the enum, so a new command
 // can't be forgotten here. `.None` is the unbound sentinel.
 command_table := [Command_Id]Command {
 	.None                     = {},
@@ -169,6 +176,11 @@ command_table := [Command_Id]Command {
 	.Zoom_In                  = {"Zoom In", "View"},
 	.Zoom_Out                 = {"Zoom Out", "View"},
 	.Zoom_Reset               = {"Reset Zoom", "View"},
+	.History_Open             = {"Undo History", "Edit"},
+	.History_Close            = {"History: Close", "Edit"},
+	.History_Next             = {"History: Next", "Edit"},
+	.History_Prev             = {"History: Previous", "Edit"},
+	.History_Jump             = {"History: Jump to State", "Edit"},
 	.Find_Close               = {"Close Find", "Search"},
 	.Find_Backspace           = {"Find: Delete Backward", "Search"},
 	.Find_Confirm             = {"Find: Confirm", "Search"},
@@ -182,7 +194,7 @@ command_table := [Command_Id]Command {
 
 // A default key binding. Matching uses (key, ctrl) within a context; shift is a
 // modifier the action reads (selection extend, search direction), never part of
-// the chord — no command distinguishes on shift. A command may have several
+// the chord â€” no command distinguishes on shift. A command may have several
 // bindings (e.g. Find_Close on Esc and Ctrl+F).
 Binding :: struct {
 	key:  plat.Key,
@@ -242,6 +254,11 @@ default_bindings := []Binding {
 	{.Tab, true, false, .Editor, .Tab_Next}, // Ctrl+Tab (Shift -> previous, in the action)
 	{.Page_Up, true, false, .Editor, .Tab_Prev},
 	{.Page_Down, true, false, .Editor, .Tab_Next},
+	// --- history context ---
+	{.Escape, false, false, .History, .History_Close},
+	{.Down, false, false, .History, .History_Next},
+	{.Up, false, false, .History, .History_Prev},
+	{.Enter, false, false, .History, .History_Jump},
 	// --- settings context ---
 	{.Escape, false, false, .Settings, .Settings_Close},
 	{.Down, false, false, .Settings, .Settings_Next},
@@ -271,11 +288,11 @@ default_bindings := []Binding {
 
 // Human-readable chord for a command, e.g. "Ctrl+S", or "" if unbound. The first
 // Editor-context binding wins, since that is the one a user would press from the
-// document. Used by the palette and the menu — the keymap is the only place that
+// document. Used by the palette and the menu â€” the keymap is the only place that
 // knows the shortcuts, so anything that teaches them has to read it from here
 // rather than repeat them in a second table that can drift.
 command_chord :: proc(cmd: Command_Id, allocator := context.temp_allocator) -> string {
-	// Editor bindings first — that's the chord a user would press from the
+	// Editor bindings first â€” that's the chord a user would press from the
 	// document. Falling back to any context so mode-local commands (the find
 	// toggles) still teach their key instead of showing blank.
 	for pass in 0 ..< 2 {
@@ -382,7 +399,7 @@ lookup_binding :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 // action reads it). First matching binding wins; a user overlay would prepend.
 //
 // Find falls back to the editor keymap for *modified* chords only. Without the
-// fallback, opening the find bar killed every global chord — Ctrl+S, Ctrl+P,
+// fallback, opening the find bar killed every global chord â€” Ctrl+S, Ctrl+P,
 // Ctrl+A, Ctrl+C, Ctrl+Z, Ctrl+N all resolved to nothing, which is what made
 // Ctrl+A and Ctrl+P look broken. The ctrl/alt restriction is the important half:
 // an unmodified fallback would send plain Delete to Delete_Fwd and the arrows to
@@ -395,7 +412,7 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 	if cmd := lookup_binding(key, ctrl, alt, ctx); cmd != .None {
 		return cmd
 	}
-	// The menu falls back for the same reason find does — a global chord should
+	// The menu falls back for the same reason find does â€” a global chord should
 	// not die because a dropdown happens to be open. The palette is the one true
 	// exception, being a text field.
 	if (ctx == .Find || ctx == .Menu) && (ctrl || alt) {
@@ -494,7 +511,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		find_open(doc, true)
 	case .Filter_Open:
 		// Arm the filter and open find. With no query yet there is nothing to
-		// filter, so the view stays whole until matches arrive — which is what
+		// filter, so the view stays whole until matches arrive â€” which is what
 		// makes this filter-as-you-type rather than a blank screen.
 		find_open(doc, false)
 		doc.filter = true
@@ -541,7 +558,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Tab_Prev:
 		app_switch_relative(app, -1)
 	case .Exit:
-		// No prompt, matching the ✕ button: unsaved buffers are persisted as
+		// No prompt, matching the âœ• button: unsaved buffers are persisted as
 		// session backups on the way out (hot exit). A File>Exit that prompted
 		// would be stricter than the close button, which is worse than either.
 		plat.window_request_close(w)
@@ -569,6 +586,19 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		} else {
 			app.menu.item = menu_step(app, app.menu.open, app.menu.item + d, d)
 		}
+	// --- undo history ---
+	case .History_Open:
+		menu_close(app)
+		history_open(app)
+	case .History_Close:
+		history_close(app)
+	case .History_Next:
+		history_move(app, 1)
+	case .History_Prev:
+		history_move(app, -1)
+	case .History_Jump:
+		history_activate(app)
+
 	case .Zoom_In, .Zoom_Out, .Zoom_Reset:
 		if rc := active_render_ctx; rc != nil {
 			zoom_adjust(rc, 1 if cmd == .Zoom_In else (-1 if cmd == .Zoom_Out else 0))
@@ -621,7 +651,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		find_toggle_regex(doc)
 	case .Find_Toggle_Filter:
 		// Deliberately not gated on having matches. The search runs on a worker,
-		// so on a large file there are none for the first frames — gating here
+		// so on a large file there are none for the first frames â€” gating here
 		// made Ctrl+L do nothing at exactly the moment it was most wanted. The
 		// view falls back to unfiltered until matches exist (doc_filtering).
 		doc.filter = !doc.filter

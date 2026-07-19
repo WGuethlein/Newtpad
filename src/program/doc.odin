@@ -7,6 +7,7 @@
 package main
 
 import "base:intrinsics"
+import "core:fmt"
 import "core:strings"
 import "core:thread"
 import "core:unicode/utf8"
@@ -247,12 +248,28 @@ Line_Index :: struct {
 	th:         ^thread.Thread,
 }
 
+// What produced an edit. Used to decide whether the next one continues it (so a
+// typing run is one undo step, not one per character) and to label the entry in
+// the history list.
+Edit_Kind :: enum u8 {
+	None,
+	Type, // consecutive character inserts
+	Delete,
+	Paste,
+	Replace, // find & replace
+	Newline,
+}
+
+UNDO_MAX :: 200 // entries kept; oldest dropped. Each holds a cloned piece tree.
+
 Snapshot :: struct {
 	root:     ^base.Node, // cloned piece tree
 	length:   int,
 	cursor:   int,
 	anchor:   int,
 	nl_delta: int,
+	kind:     Edit_Kind, // what the edit AFTER this state was
+	count:    int, // characters/lines involved, for the label
 }
 
 Document :: struct {
@@ -277,6 +294,10 @@ Document :: struct {
 	nl_delta:   int,
 	undo:       [dynamic]Snapshot,
 	redo:       [dynamic]Snapshot,
+	// Coalescing state: what the last edit was and where it left the caret. A
+	// run of typing continues only while both still match.
+	last_edit:    Edit_Kind,
+	last_edit_at: int,
 	idx:        Line_Index,
 	find:       Find,
 	search:     Search, // background find worker (see find.odin)
@@ -554,7 +575,13 @@ count_newlines :: proc(doc: ^Document, pos, count: int) -> (c: int) {
 
 @(private = "file")
 snapshot :: proc(doc: ^Document) -> Snapshot {
-	return {base.pt_snapshot(&doc.pt), doc.pt.length, doc.cursor, doc.anchor, doc.nl_delta}
+	return {
+		root = base.pt_snapshot(&doc.pt),
+		length = doc.pt.length,
+		cursor = doc.cursor,
+		anchor = doc.anchor,
+		nl_delta = doc.nl_delta,
+	}
 }
 
 @(private = "file")
@@ -567,12 +594,39 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 }
 
 @(private = "file")
-push_undo :: proc(doc: ^Document) {
+// Record the state BEFORE an edit of `kind`.
+//
+// Consecutive typing coalesces into one entry: if the previous edit was also
+// typing and the caret is exactly where it left off, the existing snapshot still
+// describes the state before the whole run, so no new one is needed. Without
+// this, "hello" is five undo steps and the history list is unreadable.
+// A caret jump, a different kind of edit, or a newline breaks the run.
+push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
 	find_invalidate(doc) // every edit path routes through here; match offsets shift
-	append(&doc.undo, snapshot(doc))
+	doc.modified = true
 	for s in doc.redo {base.pt_free_node_tree(s.root)}
 	clear(&doc.redo)
-	doc.modified = true
+
+	continues := kind == .Type &&
+		doc.last_edit == .Type &&
+		doc.cursor == doc.last_edit_at &&
+		len(doc.undo) > 0 &&
+		!doc_has_sel(doc)
+	if continues {
+		doc.undo[len(doc.undo) - 1].count += 1
+		return
+	}
+
+	s := snapshot(doc)
+	s.kind = kind
+	s.count = 1
+	append(&doc.undo, s)
+	// Bounded: this is a long-lived process and every entry holds a cloned tree.
+	if len(doc.undo) > UNDO_MAX {
+		base.pt_free_node_tree(doc.undo[0].root)
+		ordered_remove(&doc.undo, 0)
+	}
+	doc.last_edit = kind
 }
 
 doc_undo :: proc(doc: ^Document) {
@@ -587,6 +641,60 @@ doc_redo :: proc(doc: ^Document) {
 	append(&doc.undo, snapshot(doc))
 	s := pop(&doc.redo)
 	apply_snapshot(doc, s)
+	doc.last_edit = .None
+}
+
+// --- history list ---
+
+// Total states the history can show: every undo entry, the current state, and
+// everything on the redo stack (which is stored newest-last, so it reads
+// backwards relative to the timeline).
+doc_history_len :: proc(doc: ^Document) -> int {
+	return len(doc.undo) + 1 + len(doc.redo)
+}
+
+// Index of the state the document is currently at.
+doc_history_current :: proc(doc: ^Document) -> int {return len(doc.undo)}
+
+// Label for history entry `i`. Index len(undo) is the present.
+doc_history_label :: proc(doc: ^Document, i: int) -> string {
+	if i == len(doc.undo) {return "(current state)"}
+	// An undo entry records the state BEFORE its edit, so entry i is described
+	// by the edit that produced state i+1.
+	kind: Edit_Kind
+	count := 0
+	if i < len(doc.undo) {
+		kind, count = doc.undo[i].kind, doc.undo[i].count
+	} else {
+		j := len(doc.redo) - 1 - (i - len(doc.undo) - 1)
+		if j < 0 || j >= len(doc.redo) {return "?"}
+		kind, count = doc.redo[j].kind, doc.redo[j].count
+	}
+	switch kind {
+	case .Type:
+		return fmt.tprintf("Typed %d character%s", count, "" if count == 1 else "s")
+	case .Newline:
+		return "New line"
+	case .Delete:
+		return fmt.tprintf("Deleted %d time%s", count, "" if count == 1 else "s")
+	case .Paste:
+		return "Inserted text"
+	case .Replace:
+		return "Replaced"
+	case .None:
+		return "Opened"
+	}
+	return "Edit"
+}
+
+// Move the document to history state `target` by walking undo/redo. Walking
+// rather than jumping directly keeps both stacks consistent, and each step is a
+// tree swap, not a copy of the text.
+doc_history_goto :: proc(doc: ^Document, target: int) {
+	t := clamp(target, 0, doc_history_len(doc) - 1)
+	for doc_history_current(doc) > t && len(doc.undo) > 0 {doc_undo(doc)}
+	for doc_history_current(doc) < t && len(doc.redo) > 0 {doc_redo(doc)}
+	doc.last_edit = .None // a jump always breaks a typing run
 }
 
 // --- selection ---
@@ -631,43 +739,51 @@ doc_selected_text :: proc(doc: ^Document, allocator := context.allocator) -> str
 
 // --- edits (an active selection is replaced/deleted first, as one undo step) ---
 
-doc_insert_text :: proc(doc: ^Document, text: []u8) {
+// `kind` labels the entry in the history and decides coalescing: a single typed
+// character continues a run, a paste or a newline always starts a new entry.
+doc_insert_text :: proc(doc: ^Document, text: []u8, kind: Edit_Kind = .Paste) {
 	if len(text) == 0 {return}
-	push_undo(doc)
+	push_undo(doc, kind)
 	if doc_has_sel(doc) {del_sel_raw(doc)}
 	base.pt_insert(&doc.pt, doc.cursor, text)
 	for b in text {if b == '\n' {doc.nl_delta += 1}}
 	doc.cursor += len(text)
 	doc.anchor = doc.cursor
+	doc.last_edit_at = doc.cursor
 }
 
+// A single typed character: the one case that coalesces into a run. A newline
+// breaks the run so undo stops at line boundaries, which is what people expect.
 doc_insert_rune :: proc(doc: ^Document, r: rune) {
 	bytes, n := utf8.encode_rune(r)
-	doc_insert_text(doc, bytes[:n])
+	doc_insert_text(doc, bytes[:n], .Newline if r == '\n' else .Type)
 }
 
 doc_backspace :: proc(doc: ^Document) {
 	if doc_has_sel(doc) {
-		push_undo(doc)
+		push_undo(doc, .Delete)
 		del_sel_raw(doc)
+		doc.last_edit_at = doc.cursor
 		return
 	}
 	if doc.cursor <= 0 {return}
-	push_undo(doc)
+	push_undo(doc, .Delete)
 	p := prev_rune(doc, doc.cursor)
 	doc.nl_delta -= count_newlines(doc, p, doc.cursor - p)
 	base.pt_delete(&doc.pt, p, doc.cursor - p)
 	set_cursor(doc, p, false)
+	doc.last_edit_at = doc.cursor
 }
 
 doc_delete_fwd :: proc(doc: ^Document) {
 	if doc_has_sel(doc) {
-		push_undo(doc)
+		push_undo(doc, .Delete)
 		del_sel_raw(doc)
+		doc.last_edit_at = doc.cursor
 		return
 	}
 	if doc.cursor >= doc.pt.length {return}
-	push_undo(doc)
+	push_undo(doc, .Delete)
 	n := next_rune(doc, doc.cursor) - doc.cursor
 	doc.nl_delta -= count_newlines(doc, doc.cursor, n)
 	base.pt_delete(&doc.pt, doc.cursor, n)
@@ -833,10 +949,11 @@ doc_delete_word_back :: proc(doc: ^Document) {
 	}
 	p := word_left_of(doc, doc.cursor)
 	if p == doc.cursor {return}
-	push_undo(doc)
+	push_undo(doc, .Delete)
 	doc.nl_delta -= count_newlines(doc, p, doc.cursor - p)
 	base.pt_delete(&doc.pt, p, doc.cursor - p)
 	set_cursor(doc, p, false)
+	doc.last_edit_at = doc.cursor
 }
 
 doc_select_all :: proc(doc: ^Document) {

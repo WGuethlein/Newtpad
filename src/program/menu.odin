@@ -101,6 +101,7 @@ menus := []Menu {
 		[]Menu_Item {
 			{cmd = .Undo, enabled = can_undo},
 			{cmd = .Redo, enabled = can_redo},
+			{cmd = .History_Open, enabled = has_doc},
 			sep,
 			{cmd = .Cut, enabled = has_sel},
 			{cmd = .Copy, enabled = has_sel},
