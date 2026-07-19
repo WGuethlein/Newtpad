@@ -213,7 +213,21 @@ local typing now, tree is the scale/multi-cursor follow-up); selection + clipboa
 click-to-position; per-word undo coalescing (currently per-keystroke); reindex-on-edit (line
 count/scrollbar drift approximately after big edits — index is over the original).
 
-**Next options:** (a) SAVE (encoding-aware, atomic, never-lock — makes it a usable editor);
-(b) selection + clipboard + mouse; (c) find / filter-as-you-type (V1 headline; benchmark
-proved search is viable); (d) the RB piece tree; (e) shaping + font fallback (multilingual);
-(f) UI chrome (tabs, filename header, draggable scrollbar).
+**SAVE WORKS (2026-07-18).** Ctrl+S saves; an unnamed/scratch buffer opens the native
+Save-As dialog (`GetSaveFileNameW`, in `platform/file.odin`). Content re-encodes to the
+file's ORIGINAL encoding — UTF-8 keeps/omits its BOM as opened, UTF-16 LE/BE round-trip
+with a BOM (`base.encode_from_utf8`, tested). Atomic write: temp sibling file →
+`MoveFileEx` rename over the target, so a crash never corrupts the original and the target
+is never held open (works even when the original is mmapped — temp+rename, per the lock
+test). CRLF preserved (buffer keeps `\r`). Verified headless (`newtpad <in> savetest <out>`):
+UTF-8 and UTF-16LE edit/save/reopen with content + encoding intact. Also fixed: no-arg
+launch now opens a scratch buffer instead of exiting (the "closes immediately" bug — the old
+default file paths were relative to the project root).
+
+**Next options:** (a) selection + clipboard + mouse click-to-position (the other half of
+"feels like an editor"); (b) find / filter-as-you-type (V1 headline; benchmark proved search
+is viable); (c) the RB piece tree (scale/multi-cursor); (d) shaping + font fallback
+(multilingual); (e) UI chrome (tabs, filename in title bar, draggable scrollbar); (f) reindex-
+on-edit + per-word undo coalescing (polish). Not yet verified interactively (environment
+can't inject keyboard/focus): live typing, Ctrl+S/dialog, undo — all use headless-verified
+paths, but worth a manual pass.
