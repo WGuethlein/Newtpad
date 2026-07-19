@@ -165,7 +165,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 
 		// Round-trip non-default values.
-		w := Settings{restore_session = false, wrap_default = true, font_size = 22}
+		w := Settings{restore_session = false, wrap_default = true, font_size = 22, zoom_pct = 125}
 		settings_save(w)
 		r := settings_load()
 		ok := r == w
@@ -186,6 +186,40 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		mok := m == settings_default() && m.font_size > 0
 		fmt.printfln("missing file -> defaults (font=%d)  %s", m.font_size, "OK" if mok else "FAIL")
 		if !mok {bad += 1}
+
+		// Zoom must land on the steps, clamp at both ends, and compose with the
+		// font size rather than replacing it.
+		fmt.println("--- zoom ---")
+		t2: plat.Text
+		plat.text_load_faces(&t2)
+		wz: plat.Window
+		wz.dpi = 96
+		az: App
+		az.settings = settings_default()
+		rcz := Render_Ctx{window = &wz, text = &t2, app = &az}
+		for _ in 0 ..< 20 {zoom_adjust(&rcz, 1)}
+		hi := az.settings.zoom_pct
+		for _ in 0 ..< 40 {zoom_adjust(&rcz, -1)}
+		lo := az.settings.zoom_pct
+		zoom_adjust(&rcz, 0)
+		rst := az.settings.zoom_pct
+		zok := hi == ZOOM_STEPS[len(ZOOM_STEPS) - 1] && lo == ZOOM_STEPS[0] && rst == ZOOM_DEFAULT
+		fmt.printfln("  clamp hi=%d lo=%d reset=%d  %s", hi, lo, rst, "OK" if zok else "FAIL")
+		if !zok {bad += 1}
+		// font_size 20 at 150% zoom must give px 30, not 20 or 150.
+		az.settings.font_size = 20
+		az.settings.zoom_pct = 150
+		settings_apply(&rcz)
+		pok := int(BASE_PX) == 30 && int(rcz.px) == 30
+		fmt.printfln("  font 20 @150%% -> BASE_PX %.0f px %.0f (want 30)  %s", BASE_PX, rcz.px, "OK" if pok else "FAIL")
+		if !pok {bad += 1}
+		// ...and DPI still multiplies on top of that.
+		wz.dpi = 192
+		metrics_recompute(&rcz)
+		dok := int(rcz.px) == 60
+		fmt.printfln("  ...at 200%% DPI -> px %.0f (want 60)  %s", rcz.px, "OK" if dok else "FAIL")
+		if !dok {bad += 1}
+		BASE_PX = BASE_PX_96 // leave globals alone for later modes
 
 		fmt.printfln("settingstest: %d failures", bad)
 		return true

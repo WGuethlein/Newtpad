@@ -15,6 +15,7 @@ import plat "src:platform"
 MENU_BAR_H_96 :: f32(26)
 MENU_ITEM_H_96 :: f32(24)
 MENU_PAD_96 :: f32(12) // horizontal padding around a top-level title
+GEAR_W_96 :: f32(34) // settings gear hit box (wider than the glyph, so it's clickable)
 MENU_BAR_H := MENU_BAR_H_96
 MENU_ITEM_H := MENU_ITEM_H_96
 MENU_PAD := MENU_PAD_96
@@ -121,6 +122,10 @@ menus := []Menu {
 			{cmd = .Filter_Open, checked = is_filtered, enabled = has_doc},
 			{cmd = .Find_Toggle_Regex, checked = is_regex, enabled = has_doc},
 			sep,
+			{cmd = .Zoom_In},
+			{cmd = .Zoom_Out},
+			{cmd = .Zoom_Reset},
+			sep,
 			{cmd = .Palette_Open},
 			{cmd = .Settings_Open},
 		},
@@ -181,8 +186,8 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 	mx, my := f32(win.mouse_x), f32(win.mouse_y)
 
 	if my >= TAB_STRIP_H && my < TAB_STRIP_H + MENU_BAR_H {
-		gx := w - SCROLLBAR_W - sx(26)
-		if mx >= gx && mx < gx + sx(26) {
+		gx := w - SCROLLBAR_W - sx(GEAR_W_96)
+		if mx >= gx && mx < gx + sx(GEAR_W_96) {
 			menu_close(app)
 			consume_click(win)
 			return .Settings_Open if !app.settings_open else .Settings_Close, true
@@ -313,12 +318,17 @@ menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^
 		}
 	}
 
-	// Settings gear, right-aligned and clear of the scrollbar gutter.
-	gx := width - SCROLLBAR_W - sx(26)
-	if in_bar && f32(cx) >= gx && f32(cx) < gx + sx(26) {
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {gx, TAB_STRIP_H}, size = {sx(26), MENU_BAR_H}, color = MENU_COL.hover}})
+	// Settings gear, right-aligned and clear of the scrollbar gutter. Drawn
+	// larger than the menu text: at UI_PX the glyph reads as a speck rather than
+	// a button, and it is the only icon-only control in the bar.
+	gw := sx(GEAR_W_96)
+	gx := width - SCROLLBAR_W - gw
+	if in_bar && f32(cx) >= gx && f32(cx) < gx + gw {
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {gx, TAB_STRIP_H}, size = {gw, MENU_BAR_H}, color = MENU_COL.hover}})
 	}
-	plat.text_draw(gfx, t, "⚙", gx + sx(7), base_y, UI_PX, MENU_COL.fg if !app.settings_open else MENU_COL.check)
+	gpx := UI_PX * 1.35
+	gcw := plat.text_char_width(t, gpx)
+	plat.text_draw(gfx, t, "⚙", gx + (gw - gcw) * 0.5, base_y + sx(2), gpx, MENU_COL.fg if !app.settings_open else MENU_COL.check)
 
 	if app.menu.open < 0 {return}
 	menu_draw_dropdown(gfx, qp, t, app, width, height)

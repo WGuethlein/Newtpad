@@ -273,6 +273,11 @@ main :: proc() {
 			doc.cursor = doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
 		}
 
+		// Ctrl+wheel zooms rather than scrolls, as everywhere else.
+		if window.scroll_delta != 0 && plat.key_ctrl_down() {
+			zoom_adjust(&rc, -1 if window.scroll_delta > 0 else 1)
+			window.scroll_delta = 0
+		}
 		if window.scroll_delta != 0 {
 			if doc.filter {
 				// Stop at the point the list underfills the screen, rather than

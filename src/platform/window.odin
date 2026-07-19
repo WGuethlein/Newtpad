@@ -103,6 +103,7 @@ Key :: enum u16 {
 	Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9,
 	Left, Right, Up, Down, Home, End, Page_Up, Page_Down,
 	Backspace, Delete, Enter, Tab, Escape,
+	Plus, Minus, // the =/+ and -/_ keys, and their numpad twins (zoom)
 }
 
 // A raw key press, drained once per frame. The program maps (key, modifiers) to
@@ -143,6 +144,10 @@ vk_to_key :: proc "contextless" (vk: win.WPARAM) -> Key {
 		return .Tab
 	case win.VK_ESCAPE:
 		return .Escape
+	case win.VK_OEM_PLUS, win.VK_ADD:
+		return .Plus
+	case win.VK_OEM_MINUS, win.VK_SUBTRACT:
+		return .Minus
 	}
 	if vk >= win.WPARAM('A') && vk <= win.WPARAM('Z') {
 		return Key(u16(Key.A) + u16(vk - win.WPARAM('A')))
@@ -288,6 +293,11 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 	// Force the frame to recompute now that our WM_NCCALCSIZE is in effect.
 	win.SetWindowPos(w.hwnd, nil, 0, 0, 0, 0, win.SWP_FRAMECHANGED | win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOZORDER)
 	return w
+}
+
+// Live Ctrl state, for gestures that aren't key presses (Ctrl+wheel).
+key_ctrl_down :: proc() -> bool {
+	return (int(win.GetKeyState(win.VK_CONTROL)) & 0x8000) != 0
 }
 
 // Ask the window to close, exactly as the ✕ button does.

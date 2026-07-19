@@ -84,6 +84,9 @@ Command_Id :: enum u8 {
 	Settings_Toggle,
 	Settings_Inc,
 	Settings_Dec,
+	Zoom_In,
+	Zoom_Out,
+	Zoom_Reset,
 	// find mode
 	Find_Close,
 	Find_Backspace,
@@ -163,6 +166,9 @@ command_table := [Command_Id]Command {
 	.Settings_Toggle          = {"Settings: Toggle", "View"},
 	.Settings_Inc             = {"Settings: Increase", "View"},
 	.Settings_Dec             = {"Settings: Decrease", "View"},
+	.Zoom_In                  = {"Zoom In", "View"},
+	.Zoom_Out                 = {"Zoom Out", "View"},
+	.Zoom_Reset               = {"Reset Zoom", "View"},
 	.Find_Close               = {"Close Find", "Search"},
 	.Find_Backspace           = {"Find: Delete Backward", "Search"},
 	.Find_Confirm             = {"Find: Confirm", "Search"},
@@ -219,6 +225,9 @@ default_bindings := []Binding {
 	{.S, true, true, .Editor, .Save_As}, // Ctrl+Alt+S (Ctrl+Shift+S can't be expressed: shift isn't part of a chord)
 	{.Escape, false, false, .Editor, .Clear_Selection},
 	{.Z, false, true, .Editor, .Toggle_Wrap}, // Alt+Z
+	{.Plus, true, false, .Editor, .Zoom_In}, // Ctrl+= / Ctrl+numpad+
+	{.Minus, true, false, .Editor, .Zoom_Out}, // Ctrl+- / Ctrl+numpad-
+	{.Num0, true, false, .Editor, .Zoom_Reset}, // Ctrl+0
 	{.P, true, false, .Editor, .Palette_Open}, // Ctrl+P
 	// --- palette context ---
 	{.P, true, false, .Palette, .Palette_Close},
@@ -314,6 +323,10 @@ key_name :: proc(k: plat.Key) -> string {
 		return "Tab"
 	case .Escape:
 		return "Esc"
+	case .Plus:
+		return "+"
+	case .Minus:
+		return "-"
 	}
 	// Letters and digits are contiguous in the enum, in order.
 	if k >= .A && k <= .Z {
@@ -556,6 +569,11 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		} else {
 			app.menu.item = menu_step(app, app.menu.open, app.menu.item + d, d)
 		}
+	case .Zoom_In, .Zoom_Out, .Zoom_Reset:
+		if rc := active_render_ctx; rc != nil {
+			zoom_adjust(rc, 1 if cmd == .Zoom_In else (-1 if cmd == .Zoom_Out else 0))
+		}
+
 	// --- settings page ---
 	case .Settings_Open:
 		menu_close(app)
