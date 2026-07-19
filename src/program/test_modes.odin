@@ -114,6 +114,46 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad vnavtest` checks vertical caret nav at the document edges: Up on the
+	// first row and Down on the last must still move the caret to the document edge
+	// (so shift+Up/shift+Down select to it), wrapped and unwrapped.
+	if os.args[1] == "vnavtest" {
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("vnavtest: no fonts loaded")
+			return true
+		}
+		chk :: proc(got, want: int, what: string) {
+			fmt.printfln("%-32s cursor=%d want=%d  %s", what, got, want, "ok" if got == want else "FAIL")
+		}
+		one :: proc(content: string, wrap: bool, cols: int, start: int, down: bool, t: ^plat.Text) -> (int, int) {
+			doc: Document
+			doc.pt = base.pt_init(transmute([]u8)content)
+			doc.wrap, doc.view_cols = wrap, cols
+			doc.cursor, doc.anchor = start, start
+			if down {doc_cursor_down(&doc, t, true)} else {doc_cursor_up(&doc, t, true)}
+			c, a := doc.cursor, doc.anchor
+			base.pt_destroy(&doc.pt)
+			return c, a
+		}
+		single := "hello world foo" // one line, no trailing newline
+		c, _ := one(single, false, 0, 6, true, &t)
+		chk(c, len(single), "single line, shift+Down")
+		c, _ = one(single, false, 0, 6, false, &t)
+		chk(c, 0, "single line, shift+Up")
+		multi := "first line\nsecond line\nlast line here"
+		c, _ = one(multi, false, 0, 28, true, &t) // on the last line, col 5
+		chk(c, len(multi), "last line, shift+Down")
+		c, _ = one(multi, false, 0, 3, false, &t)
+		chk(c, 0, "first line, shift+Up")
+		wrapped := "the quick brown fox jumps over the lazy dog"
+		c, _ = one(wrapped, true, 20, len(wrapped) - 2, true, &t) // squarely on the last visual row
+		chk(c, len(wrapped), "wrapped, last row shift+Down")
+		c, _ = one(wrapped, true, 20, 3, false, &t)
+		chk(c, 0, "wrapped, first row shift+Up")
+		return true
+	}
+
 	// `newtpad wraptest` prints word-wrap segments for a sample paragraph.
 	if os.args[1] == "wraptest" {
 		t: plat.Text

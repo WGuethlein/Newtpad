@@ -694,7 +694,10 @@ doc_cursor_down :: proc(doc: ^Document, t: ^plat.Text, select: bool) {
 	if doc.wrap {
 		vs := visual_row_start(doc, t, doc.cursor, doc.view_cols)
 		e, le := wrap_row_end(doc, t, vs, doc.view_cols)
-		if le && e >= doc.pt.length {return} // already the last visual row
+		if le && e >= doc.pt.length { // already the last visual row
+			set_cursor(doc, doc.pt.length, select) // clamp to the doc end, mirroring Up's clamp to 0
+			return
+		}
 		col := line_cell_col(doc, t, vs, doc.cursor)
 		nv := next_visual_row(doc, t, vs, doc.view_cols)
 		ne, _ := wrap_row_end(doc, t, nv, doc.view_cols)
@@ -705,6 +708,7 @@ doc_cursor_down :: proc(doc: ^Document, t: ^plat.Text, select: bool) {
 	col := doc.cursor - ls
 	nl := base.pt_next_line_start(&doc.pt, doc.cursor)
 	if nl == doc.pt.length && base.pt_line_end(&doc.pt, nl) == nl && ls == base.pt_line_start(&doc.pt, nl) {
+		set_cursor(doc, doc.pt.length, select) // no line below: clamp to the doc end, mirroring Up's clamp to 0
 		return
 	}
 	set_cursor(doc, min(nl + col, base.pt_line_end(&doc.pt, nl)), select)
