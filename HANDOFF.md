@@ -213,8 +213,15 @@ on the architecture. Two locked decisions were refined **with that DA as the new
 4. **Command palette + fuzzy finder — DONE.** `palette.odin`: Ctrl+P overlay, prefix modes
    (none=tabs, `>`=commands, `:`=go-to-line), fzf-style scoring, `.Palette` input context, lists from
    the command table. **Deferred:** matched-char highlighting; O(n) goto line walk.
-5. **Chrome** — status bar (line/col/enc/progress), filename in window title, draggable scrollbar
-   (byte-proportional while indexing, line-proportional after; drag→byte→snap to next line start). ← LAST
+5. **Chrome — DONE.** Status bar (Ln/Col + encoding + lines/*/Wrap; line number cached + 4MB-capped
+   so no unbounded per-frame scan), window title = `[*]filename - Newtpad`, draggable scrollbar
+   (byte-proportional, snap to line start). **Deferred:** O(log n) line numbers via treap newline
+   counts (currently capped); line-proportional scrollbar after index; matched-char highlight in
+   palette.
+
+**Tabs + UI-chrome roadmap COMPLETE (2026-07-19).** Command table · tabs (strip, MRU, session) ·
+word wrap · command palette · chrome. Next natural work: pay down the deferred items above, or a
+fresh feature pass.
 
 ## 7. Build environment (Windows, this machine)
 
