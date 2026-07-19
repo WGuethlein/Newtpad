@@ -27,6 +27,33 @@ Piece_Table :: struct {
 	length:   int,
 }
 
+// Copy hook for reads out of the immutable `original`. Defaults to a plain copy;
+// the platform layer overrides it (seh.odin) with an SEH-guarded copy so a read
+// from a memory-mapped file that faults - truncated or decompression-broken
+// underneath us - is caught instead of crashing. Returns false if any source
+// bytes were unreadable (they come back zero-filled); the owning document then
+// detaches from the mapping. Reads out of the `add` arena are always plain (heap
+// memory can't fault). The proc value is set once at startup, before threads, so
+// concurrent reads of it are safe.
+safe_copy: proc(dst, src: []u8) -> bool = default_copy
+
+default_copy :: proc(dst, src: []u8) -> bool {
+	copy(dst, src)
+	return true
+}
+
+// Set when a read from `original` faulted; the document polls this once per frame
+// (pt_take_fault) and detaches from the mapping. Written only by the main thread
+// (read_rec); the index worker tracks its own fault flag.
+@(private = "file")
+orig_fault: bool
+
+pt_take_fault :: proc() -> bool {
+	f := orig_fault
+	orig_fault = false
+	return f
+}
+
 @(private = "file")
 rng: u64 = 0x243F6A8885A308D3
 
@@ -161,7 +188,13 @@ read_rec :: proc(pt: ^Piece_Table, t: ^Node, pos: int, dst: []u8, d: ^int) {
 	if piece_off < t.piece.len {
 		src := piece_src(pt, t.piece)
 		take := min(t.piece.len - piece_off, len(dst) - d^)
-		copy(dst[d^:d^ + take], src[piece_off:piece_off + take])
+		dsub := dst[d^:d^ + take]
+		ssub := src[piece_off:piece_off + take]
+		if t.piece.from_add {
+			copy(dsub, ssub)
+		} else if !safe_copy(dsub, ssub) {
+			orig_fault = true // read faulted on the mapped original
+		}
 		d^ += take
 	}
 	if d^ >= len(dst) {return}

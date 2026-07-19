@@ -25,6 +25,8 @@ Line_Index :: struct {
 	total:      int,
 	done:       bool, // atomic
 	cancel:     bool, // atomic
+	fault:      bool, // atomic: a read faulted (mapped file changed underneath)
+	guard:      bool, // scan through the SEH guard (content is mapped, not private)
 	th:         ^thread.Thread,
 }
 
@@ -49,6 +51,7 @@ Document :: struct {
 	cursor:     int, // caret byte offset
 	anchor:     int, // other end of the selection (== cursor when none)
 	modified:   bool,
+	recovered:  bool, // a mapped read faulted; buffer is now a private copy, not the file
 	nl_delta:   int,
 	undo:       [dynamic]Snapshot,
 	redo:       [dynamic]Snapshot,
@@ -97,6 +100,9 @@ doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
 
 	doc.idx.content = doc.original
 	doc.idx.total = len(doc.original)
+	// Guard the scan only when content aliases the mapping (UTF-8, no transcode);
+	// a transcoded or copied original is private memory and can't fault.
+	doc.idx.guard = doc.fv.mapped && !doc.owned_orig
 	return doc, true
 }
 
@@ -133,21 +139,71 @@ doc_close :: proc(doc: ^Document) {
 index_worker :: proc(data: rawptr) {
 	idx := (^Line_Index)(data)
 	c := idx.content
+	CHUNK :: 64 * 1024
+	buf: [CHUNK]u8
 	line, i := 0, 0
 	for i < len(c) {
-		if i & 0xFFFFF == 0 {
-			if intrinsics.atomic_load(&idx.cancel) {return}
-			intrinsics.atomic_store(&idx.indexed, i)
-			intrinsics.atomic_store(&idx.line_count, line + 1)
+		if intrinsics.atomic_load(&idx.cancel) {return}
+		end := min(i + CHUNK, len(c))
+		scan := c[i:end]
+		if idx.guard {
+			// c aliases a memory map: copy through the SEH guard first, so a
+			// truncated/decompression-broken page stops the scan instead of
+			// crashing. The main thread sees idx.fault and detaches the mapping.
+			if !base.safe_copy(buf[:end - i], scan) {
+				intrinsics.atomic_store(&idx.fault, true)
+				return
+			}
+			scan = buf[:end - i]
 		}
-		if c[i] == '\n' {
-			line += 1
-		}
-		i += 1
+		for b in scan {if b == '\n' {line += 1}}
+		i = end
+		intrinsics.atomic_store(&idx.indexed, i)
+		intrinsics.atomic_store(&idx.line_count, line + 1)
 	}
 	intrinsics.atomic_store(&idx.line_count, line + 1)
 	intrinsics.atomic_store(&idx.indexed, len(c))
 	intrinsics.atomic_store(&idx.done, true)
+}
+
+// A mapped read faulted (the file was truncated or its NTFS decompression failed
+// underneath us). Copy whatever pages are still readable into private memory,
+// detach from the mapping, and mark the document recovered so the user knows the
+// content is no longer the file on disk. Main thread only; idempotent.
+doc_recover_from_fault :: proc(doc: ^Document) {
+	if doc.recovered || !doc.fv.mapped {return}
+	// Stop the index worker before touching/unmapping the shared mapped bytes.
+	if doc.idx.th != nil {
+		intrinsics.atomic_store(&doc.idx.cancel, true)
+		thread.join(doc.idx.th)
+		thread.destroy(doc.idx.th)
+		doc.idx.th = nil
+	}
+	// Guarded copy of the mapped original into private memory (bad pages -> zeros).
+	priv := make([]u8, len(doc.original))
+	base.safe_copy(priv, doc.original)
+	doc.original = priv
+	doc.owned_orig = true
+	doc.pt.original = priv // pieces index by offset, so this repoint is transparent
+	plat.file_close(&doc.fv) // unmaps and zeroes fv
+	doc.recovered = true
+	doc.modified = true // buffer differs from disk; don't let a save look clean
+
+	// Re-index over the now-private buffer for a correct final line count.
+	doc.idx.content = priv
+	doc.idx.total = len(priv)
+	doc.idx.guard = false
+	intrinsics.atomic_store(&doc.idx.done, false)
+	intrinsics.atomic_store(&doc.idx.fault, false)
+	intrinsics.atomic_store(&doc.idx.cancel, false)
+	intrinsics.atomic_store(&doc.idx.indexed, 0)
+	intrinsics.atomic_store(&doc.idx.line_count, 0)
+	doc_index_start(doc)
+}
+
+// True if a mapped read faulted on either the main thread or the index worker.
+doc_fault_pending :: proc(doc: ^Document) -> bool {
+	return base.pt_take_fault() || intrinsics.atomic_load(&doc.idx.fault)
 }
 
 // Save the buffer to `path`, re-encoded to the file's original encoding
@@ -185,6 +241,7 @@ doc_line_count :: proc(doc: ^Document) -> int {
 	return lc + doc.nl_delta if intrinsics.atomic_load(&doc.idx.done) else lc
 }
 doc_index_done :: proc(doc: ^Document) -> bool {return intrinsics.atomic_load(&doc.idx.done)}
+doc_index_faulted :: proc(doc: ^Document) -> bool {return intrinsics.atomic_load(&doc.idx.fault)}
 doc_index_progress :: proc(doc: ^Document) -> f32 {
 	if doc.idx.total == 0 {return 1}
 	return f32(intrinsics.atomic_load(&doc.idx.indexed)) / f32(doc.idx.total)

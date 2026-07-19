@@ -9,6 +9,14 @@ import "core:time"
 import plat "src:platform"
 
 main :: proc() {
+	plat.seh_install() // arm the mapped-read fault guard before any file opens
+
+	// Headless: `newtpad sehtest` proves the SEH guard catches a real page fault.
+	if len(os.args) > 1 && os.args[1] == "sehtest" {
+		fmt.printfln("seh guard caught + zero-filled a page fault: %v", plat.seh_selftest())
+		return
+	}
+
 	// Open the file given on the command line; with no argument, start empty.
 	path := ""
 	if len(os.args) > 1 {
@@ -24,9 +32,10 @@ main :: proc() {
 		}
 		doc_index_start(&doc)
 		t0 := time.tick_now()
-		for !doc_index_done(&doc) {
+		for !doc_index_done(&doc) && !doc_index_faulted(&doc) {
 			time.sleep(time.Millisecond)
 		}
+		if doc_index_faulted(&doc) {fmt.eprintln("warning: mapped read faulted mid-index (file changed on disk)")}
 		fmt.printfln("indexed %d lines in %.1f ms (%d bytes, %v)", doc_line_count(&doc), time.duration_milliseconds(time.tick_since(t0)), doc.pt.length, doc.enc)
 		doc_close(&doc)
 		return
@@ -397,11 +406,21 @@ main :: proc() {
 				plat.text_draw(&gfx, &text, fline, 12, h - 8, 14, {0.95, 0.88, 0.55, 1})
 			}
 		} else {
-			status := fmt.tprintf("%d lines%s%s", doc_line_count(&doc), " *" if doc.modified else "", "" if doc_index_done(&doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(&doc) * 100))
-			plat.text_draw(&gfx, &text, status, 12, h - 8, 13, {0.55, 0.60, 0.70, 1})
+			recovered := "  [RECOVERED COPY - file changed on disk, not the original]" if doc.recovered else ""
+			status := fmt.tprintf("%d lines%s%s%s", doc_line_count(&doc), " *" if doc.modified else "", recovered, "" if doc_index_done(&doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(&doc) * 100))
+			col := [4]f32{0.95, 0.55, 0.35, 1} if doc.recovered else {0.55, 0.60, 0.70, 1}
+			plat.text_draw(&gfx, &text, status, 12, h - 8, 13, col)
 		}
 
 		plat.gfx_end_frame(&gfx)
+
+		// A mapped read may have faulted during this frame's draw/search (file
+		// truncated or decompression-broken underneath us). Detach from the map
+		// into a private copy so we never fault again; next frame draws that.
+		if doc_fault_pending(&doc) {
+			doc_recover_from_fault(&doc)
+			fmt.eprintln("Newtpad: file changed on disk mid-read; showing a recovered copy")
+		}
 		free_all(context.temp_allocator)
 	}
 }
