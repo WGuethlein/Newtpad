@@ -128,9 +128,9 @@ tracked.
    of the mapped original in `__try/__except`, installed into `base` via the `safe_copy` proc hook;
    `read_rec` and the index worker both route through it. On a fault the document detaches into a
    private copy, re-indexes, and flags itself RECOVERED in the status line. Proven by `newtpad
-   sehtest` (catches a real page fault; process survives). **Remaining sliver:** regex still
-   materializes the whole buffer (`find.odin`) — the read is guarded now (won't crash) but can still
-   stall; size-gate/background it before regex-on-huge-files is comfortable.
+   sehtest` (catches a real page fault; process survives). **Sliver closed (2026-07-19):** search now
+   runs on a worker (§6e), so nothing on the main thread scans unboundedly. Roadmap item 1 is fully
+   done.
 2. **[P1] Correctness + cleanliness sweep — DONE.** Save-As leak, dead anchors, atlas guard,
    `CreateFileMapping` null-check, mid-index line-count all fixed. Cleanliness landed: the four screen
    passes now share one capped `Visible_Iter` + layout helpers (killing the `12`/`10`/`1.5` magic and
@@ -256,7 +256,11 @@ the `SendMessage`, and the second launch falls through to its own non-session-ow
 launching the app also opened a console window. Debug stays console so `test_modes.odin` can print;
 **run headless modes against the debug exe**, not the installed one.
 
-## 6d. Regex on large files — bounded, not fixed (2026-07-19)
+## 6d. Regex on large files — bounded, not fixed (2026-07-19) — SUPERSEDED by §6e
+
+Kept for the measurements (~16–19 ms/MB for `core:text/regex`, which is why no synchronous cap could
+be both responsive and useful). `REGEX_SCAN_CAP` and the block-scan cap are gone; the line-aligned
+block structure survives inside the worker, so the block-boundary caveat below still applies.
 
 `recompute_regex` called `pt_collect` per keystroke, materializing the whole document to hand
 `core:text/regex` a string — a full copy per keypress, and on a multi-GB file the allocation itself
@@ -277,9 +281,63 @@ line-count indexer. The open design question is snapshot cost vs. reading a piec
 main thread may be editing. Literal search is chunked and fast, and regex is opt-in (Ctrl+R), so
 the exposure is narrow — but it's the last live piece of roadmap item 1.
 
-## 6e. NEXT TASK — background the search worker (spec, 2026-07-19)
+## 6e. Background search worker — DONE (2026-07-19)
 
-Approved approach; closes §6d and the last of roadmap item 1. Implement this first.
+Closed §6d and the last of roadmap item 1. Landed as three commits, because a devil's-advocate pass
+on the spec below found that three of its mechanisms didn't hold. **The spec as written would have
+shipped a use-after-free and a P0 regression** — worth remembering as evidence for why the
+red-team step is not optional.
+
+**What the DA overturned:**
+- *"Clone the piece tree"* protected nothing. `piece_src` indexes `pt.add`, a `[dynamic]u8` whose
+  `append` reallocs and frees the old block; cloning `root` clones nodes only. Add-sourced reads also
+  bypass `safe_copy`, so the SEH guard wouldn't have caught it. The cited precedent was false too:
+  `index_worker` never calls `pt_read` — it scans the immutable `original`, which is exactly why it
+  needs no join. **Fix: chunk the add arena** (commit 1). Chunks are allocated once and never move,
+  an insert never spans one, and `pt_view` copies the tree + chunk *headers* while aliasing the bytes.
+  A view now stays valid across any number of edits, so the worker is safe by construction rather
+  than by auditing join sites forever.
+- *"Append to dynamic arrays, publish an atomic count"* is not a valid protocol — `append` moves the
+  base pointer under the reader. **Fix:** arrays preallocated at `MAX_MATCHES`, written by index.
+- *"Delete `REGEX_SCAN_CAP`"* would have un-bounded the **main thread**: `find_recompute` built
+  `filter_lines` with `pt_line_start`/`pt_next_line_start`, both uncapped backward scans, and the
+  8 MB cap had been bounding them by accident. A match at 2 GB in a single-line file would scan 2 GB
+  backward on the main thread — re-opening the P0 roadmap item 1 had just closed. **Fix:** the worker
+  computes each match's line start during its linear pass, and the merge is incremental.
+- `orig_fault` was a non-atomic **global**, so a background tab's fault recovered whichever document
+  was active — unmapping an innocent file and marking it modified. Pre-existing tabs bug; fixed
+  per-`Piece_Table` in commit 2, which also gives the worker its own fault sink.
+- `truncated` **cannot** be deleted: `MAX_MATCHES` is orthogonal to the scan cap and still saturates.
+  Only `REGEX_SCAN_CAP` is gone. §6e's original done-criterion was wrong on this point.
+
+**As built.** Buffers ≤ `SEARCH_SYNC_MAX` (256 KB) scan inline — a thread spawn plus a tree clone per
+keystroke would cost more than the scan. Larger ones scan on a worker over a `pt_view`, publishing
+per 256 KB block. Every edit path (`push_undo`, `apply_snapshot`) stops the worker and sets `dirty`;
+the restart happens once at the next `find_merge`, so replace-all's edit-per-match loop costs one
+restart, not one per match. Auto-select fires once per query, so late results never yank the
+viewport. Regex churn goes to a private `Dynamic_Arena` reset per block — `core:text/regex` allocates
+its `saved` arrays from the ambient allocator and never frees them, which on a 64 MB scan would both
+leak and contend with the UI thread's heap lock.
+
+**Measured (`newtpad regextest 64`):** worst keystroke **0.45 ms** (was ~130 ms at the cap), needle at
+64 MB **found** (was not found at all), 200 edits mid-search survive and the needle re-finds at the
+correct shifted offset. `newtpad findtest` covers the literal path's block-boundary overlap and the
+worker-computed line starts.
+
+**Known gaps, deliberately deferred:**
+- **No viewport-first synchronous pass** (the spec's pass 1). Chosen to keep the concurrency change
+  reviewable on its own. Consequence: on a large file, matches stream in rather than appearing
+  instantly, and **filter view (Ctrl+L) shows an empty screen** until the worker finds the first
+  match — it renders `filter_lines`, so a viewport-scoped pass wouldn't help it anyway; it needs a
+  from-offset-0 pass that fills `rows`. This is the main thing still owed against "no frame ever
+  shows emptiness."
+- **A background tab's worker keeps running** after a tab switch. Harmless (it terminates on its own
+  and its results merge when you return) but it burns a core.
+- **`pt_view` clones the tree per restart**, i.e. per find-bar keystroke. Proportional to piece count,
+  so a session with tens of thousands of scattered edits makes this expensive; debouncing the restart
+  by ~50 ms of idle is the fix if it ever shows up.
+
+<details><summary>Original spec, for the record</summary>
 
 **Shape: viewport-first + background fill.** Two passes, because they solve different problems.
 1. *Synchronous, bounded:* search the visible byte range + a margin and publish immediately, so
@@ -318,6 +376,8 @@ edits the document mid-search to prove the cancel-join path.
 **Worth doing first:** run `/devils-advocate` on this design before writing code. It is a
 concurrency change against a buffer the main thread mutates, which is exactly where an unchallenged
 plan ships a use-after-free.
+
+</details>
 
 ## 7. Build environment (Windows, this machine)
 
