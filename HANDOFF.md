@@ -379,8 +379,91 @@ plan ships a use-after-free.
 
 </details>
 
+## 6f. Session data loss + input fixes (2026-07-19)
+
+**Data loss, fixed.** Launching with a file argument skipped `session_restore` entirely; the exit
+save then wrote a one-tab session and **deleted every backup it didn't reference**. Leaving a dirty
+scratch tab, closing, then opening any file from Explorer destroyed that scratch. The
+single-instance hand-off masked it whenever an instance was already running, so it was
+*intermittent*. Now: restore first, then open the argument as an extra tab (matching what the
+hand-off path always did). A session that exists but fails to load also suppresses the backup
+sweep — those backups belong to tabs we never adopted. `newtpad sessionlosstest <file> [old]`
+reproduces both behaviours.
+
+**Tests no longer stomp the real session.** `session_dir` honours `NEWTPAD_SESSION_DIR`; without it
+`sessiontest` wrote to, and then reset, `%APPDATA%\Newtpad` — i.e. a daily driver's live tabs.
+
+**Find swallowed every editor chord.** `resolve_key` had no context fallback, so with the find bar
+open Ctrl+S/P/A/C/Z/N all resolved to `.None` — which is why Ctrl+A and Ctrl+P looked broken.
+Find now falls back to the editor keymap **for ctrl/alt chords only**: an unmodified fallback would
+send plain Delete to `Delete_Fwd` and the arrows to the caret, so typing a query would quietly edit
+the document. The palette deliberately does not fall back at all — it is a text field first.
+
+## 6g. Per-monitor DPI v2 (2026-07-19)
+
+Roadmap/V1 item: "crisp per-monitor DPI as an explicit V1 quality goal." The process was
+DPI-unaware, so on any non-96-DPI display the compositor bitmap-stretched the window — swapchain
+included — and every glyph the ClearType atlas rasterizes was resampled to mush.
+
+**Verified on hardware:** dragging between monitors of different DPI works. `newtpad dpitest`
+covers 100–300% plus clamping from `dpi=0` to `dpi=100000`.
+
+**What the red-team pass overturned in the design** (it found a fatal flaw *in the plan*, not the
+code — the second time that has paid for itself):
+- **Integer `char_w` computed program-side was a regression at every scale, including 100%.**
+  `text_draw` advances its own pen by `t.char_em * px` and takes no cell-width parameter; the
+  program's `col_x` grid used `text_char_width`. They agreed only because both were the same
+  unrounded fraction. Rounding one side drifts them ~0.2px/column for Consolas at 16px — ~400px
+  across a full `VISIBLE_COLS` line, sliding find highlights and the caret off the glyphs.
+  **Fix: round inside `text_char_width` and have `text_draw` call it**, so there is one definition.
+  `line_height` rounds for the same reason (at 105%, px=17 makes px*1.5 fractional → half a pixel
+  of drift per row, a full row by row 40).
+- **`dpi == 0` crashes.** `GetDpiForWindow` returns 0 for a bad HWND; a zero scale divides into
+  `+Inf`, and Odin's f32→int on Inf is poison — negative `rows` indexing the visible-line iterator.
+  Clamped to [96, 960]; `dp()` floors at 1px.
+- **Atlas discard does not defuse exhaustion, it amplifies it.** Glyph area grows with scale², and
+  six distinct chrome font sizes meant six independent ASCII sets — most of a 1024² atlas at 300%
+  before one CJK character. Chrome collapsed to **two** sizes (`UI_PX`, `UI_SMALL_PX`). A full
+  atlas no longer caches the miss (so a reset recovers) and sets a flag instead of silently
+  drawing holes while the pen advances.
+- **`WM_NCCREATE` DPI capture was unnecessary**; capture after `CreateWindowExW` instead, avoiding
+  the `CW_USEDEFAULT` quirk and `w.hwnd` still being nil that early.
+- **Virtual-screen swapchain sizing would cost ~199 MB** on triple-4K, for a bug `gfx_resize`
+  already handles by growing. Dropped.
+
+**As built.** Manifest (`src/platform/newtpad.manifest` → `.rc` → `.res` via `-resource:`) declares
+`PerMonitorV2` — the manifest applies before the loader, and the API form is refused once a
+manifest sets it. `build.bat` builds the `.res` beside the SEH shim under one vcvars call.
+**A bare `odin build` skips `-resource:` and produces a DPI-unaware exe** — fine for headless
+modes, wrong for anything you look at. `WM_DPICHANGED` updates the DPI and runs the program
+callback *before* honouring the suggested rect, because that `SetWindowPos` sends a nested
+`WM_SIZE` that repaints; ignoring the suggested rect breaks cursor-relative drag and risks a
+recursive DPI-change cycle. Non-client metrics are computed in the platform from `w.dpi` rather
+than mirrored from the program, so they're right during window creation instead of zero for a
+frame. `WM_NCCALCSIZE` uses `GetSystemMetricsForDpi` — the plain call returns primary-monitor
+values once per-monitor aware, so a window maximized on a second monitor inset wrongly.
+
+Layout constants became **runtime variables** written once in `metrics_recompute` (single window →
+one DPI in play, so no context object threaded through every draw call). The scrollbar's three
+disagreeing widths (16 hit-test / 14+12 drawn / 18 reserved) collapsed to one `SCROLLBAR_W`;
+scaled independently the reservation would have let wrapped text render under the bar.
+
+**Still open:** `WM_GETDPISCALEDSIZE` for cell-aligned window sizing (a partial cell column at the
+edge is cosmetic); atlas dimension still fixed at 1024² regardless of DPI; per-DPI atlas
+coexistence deliberately not done (discard-and-rebuild instead).
+
+**Process note:** editing source through shell `Get-Content`/`Set-Content` pipelines re-encoded
+three files (UTF-8 read as CP1252, written back as UTF-8), double-encoding every non-ASCII
+character and adding a BOM — the tab close glyph `×` rendered as `Ã—`. Use the editor for files
+with non-ASCII content.
+
 ## 7. Build environment (Windows, this machine)
 
+- **Headless test modes** (run against the debug exe): `sehtest`, `dpitest`, `regextest <mb>`,
+  `findtest`, `celltest`, `sessiontest`, `sessionlosstest <file> [old]`, `palettetest`, `vnavtest`,
+  `wraptest`, plus file-argument modes (`<file> keytest|findtest|filtertest|repltest|edittest`).
+  **Set `NEWTPAD_SESSION_DIR` to a temp dir first** — the session modes otherwise write to the real
+  store. Note a bare `odin build` omits the DPI manifest; use `build.bat` for anything visual.
 - **Odin** `dev-2026-07a` at `C:\Users\Wyatt\odin\dist`, on user PATH. **MSVC** from VS Community
   2026 (v18). **Windows SDK** `10.0.28000.0` (had to be added via the VS Installer — VS shipped
   without the C++ desktop SDK; Odin needs the import libs, else "Windows SDK not found").
