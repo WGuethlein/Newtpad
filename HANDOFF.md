@@ -182,12 +182,16 @@ on the architecture. Two locked decisions were refined **with that DA as the new
   for clean, keep backup+flag for dirty; huge/network→defer mmap. Cleanly disable-able.
 
 **Build sequence** (revised per DA; commit incrementally):
-1. **Command table** — collapse the two input switches into `[Command_Id]Command`; keybind lookup +
-   dispatch read it. Foundation for tab commands and the palette; no new user feature.
-2. **Multi-document core + tab strip** — slot array of `^Document`, active doc, tab strip (switch/
-   close/new, MRU Ctrl+Tab, overflow shrink-then-scroll), tab commands into the table, indexer cap.
+1. **Command table — DONE.** Platform emits OS-neutral `plat.Key` codes; `commands.odin` holds the
+   `[Command_Id]Command` metadata table, `default_bindings` keymap (chord+context→command), and one
+   `command_dispatch`. `keytest` verifies resolution + dispatch.
+2. **Multi-document core + tab strip — DONE (core).** `app.odin` = slot array of `^Document` (stable
+   addresses, nil slots reused), MRU-on-close, lazy-on-activate indexing. Tab commands (Ctrl+N/O/W,
+   Ctrl+Tab, Ctrl+PageUp/Dn) in the table. `ui_tabs.odin` strip: click-switch, ×/middle-click close,
+   elided titles, active highlight; content offset below the strip. **Deferred:** overflow
+   horizontal scroll, MRU-on-hold (needs key-up), "+" new-tab button.
 3. **Session restore (full)** — session.json + per-buffer backups + off-thread serialize + restore
-   reconciliation + `*.tmp` sweep.
+   reconciliation + `*.tmp` sweep. ← NEXT
 4. **Command palette + fuzzy finder** — one overlay; fzf-style scoring in a single-alloc matcher;
    prefix modes (none=files/tabs, `>`=commands, `:`=go-to-line); lists from the command table.
 5. **Chrome** — status bar (line/col/enc/progress), filename in window title, draggable scrollbar
