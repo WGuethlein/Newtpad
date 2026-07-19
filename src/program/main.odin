@@ -9,13 +9,10 @@ import "core:time"
 import plat "src:platform"
 
 main :: proc() {
-	// Open the file given on the command line; default to the 1GB bench file to
-	// demo instant multi-GB open, falling back to a source file if it's absent.
-	path := "bench/data/test_1024MB.txt"
+	// Open the file given on the command line; with no argument, start empty.
+	path := ""
 	if len(os.args) > 1 {
 		path = os.args[1]
-	} else if !os.exists(path) {
-		path = "src/platform/text.odin"
 	}
 
 	// Headless verification: `newtpad <path> count` indexes and prints stats.
@@ -78,14 +75,22 @@ main :: proc() {
 		return
 	}
 
-	doc, dok := doc_open(path)
-	if !dok {
-		fmt.eprintfln("Newtpad: could not open %s", path)
-		return
+	doc: Document
+	if path == "" {
+		doc = doc_new()
+		fmt.println("Newtpad: new scratch buffer. Type; close to exit.")
+	} else {
+		ok2: bool
+		doc, ok2 = doc_open(path)
+		if !ok2 {
+			fmt.eprintfln("Newtpad: could not open %q; starting empty", path)
+			doc = doc_new()
+		} else {
+			fmt.printfln("Newtpad: opened %s (%d bytes, %v). Edit; close to exit.", path, doc.pt.length, doc.enc)
+		}
 	}
 	defer doc_close(&doc)
 	doc_index_start(&doc) // &doc is stable here; safe for the worker to hold
-	fmt.printfln("Newtpad: opened %s (%d bytes, %v). Edit; close to exit.", path, doc.pt.length, doc.enc)
 
 	px: f32 = 16
 	line_h := px * 1.5

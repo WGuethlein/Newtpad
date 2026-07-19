@@ -50,6 +50,16 @@ Document :: struct {
 	idx:        Line_Index,
 }
 
+// A new empty scratch document (no file). This is what opens when Newtpad is
+// launched with no argument — never fail to a closed window.
+doc_new :: proc() -> (doc: Document) {
+	doc.enc = .UTF8
+	doc.pt = base.pt_init(nil)
+	doc.idx.anchors = make([]int, 16)
+	doc.idx.anchor_count = 1
+	return
+}
+
 doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
 	fv, fok := plat.file_open_readonly(path)
 	if !fok {
