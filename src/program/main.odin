@@ -69,6 +69,8 @@ main :: proc() {
 		rows := int((f32(window.height) - CONTENT_TOP) / line_h)
 
 		doc := app_active(&app)
+		// Usable content width in cells (word wrap breaks here).
+		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - 18) / char_w))
 		// Re-center on the caret only when it actually moves on THIS tab — never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
 		active_before := app.active
@@ -88,7 +90,7 @@ main :: proc() {
 			ev := window.key_events[i]
 			// Context is per-event; the active doc may change (tab switch) mid-loop.
 			ctx := Ctx.Find if app_active(&app).find.active else Ctx.Editor
-			command_dispatch(resolve_key(ev.key, ev.ctrl, ctx), ev, &app, window, rows)
+			command_dispatch(resolve_key(ev.key, ev.ctrl, ev.alt, ctx), ev, &app, window, &text, rows)
 		}
 		window.key_count = 0
 
@@ -117,9 +119,9 @@ main :: proc() {
 			// drag extends a single-click selection; word/line selects stay put.
 			// Auto-scroll when the pointer is dragged past the top/bottom edge.
 			if window.mouse_y < i32(CONTENT_TOP) {
-				doc_scroll(doc, -1)
+				doc_scroll(doc, &text, -1)
 			} else if window.mouse_y > window.height - i32(line_h) {
-				doc_scroll(doc, 1)
+				doc_scroll(doc, &text, 1)
 			}
 			doc.cursor = doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
 		}
@@ -128,7 +130,7 @@ main :: proc() {
 			if doc.filter {
 				doc.filter_top = clamp(doc.filter_top + window.scroll_delta, 0, max(0, len(doc.filter_lines) - 1))
 			} else {
-				doc_scroll(doc, window.scroll_delta)
+				doc_scroll(doc, &text, window.scroll_delta)
 			}
 			window.scroll_delta = 0
 		}
@@ -136,7 +138,7 @@ main :: proc() {
 		// Keep the caret on screen only when it moved on this tab this frame.
 		doc = app_active(&app)
 		if !doc.filter && app.active == active_before && doc.cursor != cursor_before {
-			doc_ensure_cursor_visible(doc, rows)
+			doc_ensure_cursor_visible(doc, &text, rows)
 		}
 
 		render_frame(&rc)

@@ -7,6 +7,7 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:time"
+import base "src:base"
 import plat "src:platform"
 
 @(private = "file")
@@ -47,6 +48,28 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad wraptest` prints word-wrap segments for a sample paragraph.
+	if os.args[1] == "wraptest" {
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("wraptest: no fonts loaded")
+			return true
+		}
+		content := "the quick brown fox jumps over the lazy dog\nshort line\nsupercalifragilisticexpialidocious_longword"
+		doc: Document
+		doc.pt = base.pt_init(transmute([]u8)content)
+		cols := 20
+		fmt.printfln("wrap at %d cells:", cols)
+		p := 0
+		for p < doc.pt.length {
+			e, le := wrap_row_end(&doc, &t, p, cols)
+			fmt.printfln("  [%2d,%2d) line_end=%-5v %q", p, e, le, content[p:e])
+			p = e + 1 if le else e
+		}
+		base.pt_destroy(&doc.pt)
+		return true
+	}
+
 	if len(os.args) < 3 {return false}
 	path, mode := os.args[1], os.args[2]
 
@@ -70,27 +93,31 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		app: App
 		if !app_open_path(&app, path) {app_new_scratch(&app)} // e.g. "hello world foo"
 		dummy: plat.Window
-		key_chk(resolve_key(.Left, false, .Editor), .Cursor_Left, "Left / Editor")
-		key_chk(resolve_key(.Left, true, .Editor), .Word_Left, "Ctrl+Left / Editor")
-		key_chk(resolve_key(.F, true, .Editor), .Find_Open, "Ctrl+F / Editor")
-		key_chk(resolve_key(.Enter, false, .Editor), .Insert_Newline, "Enter / Editor")
-		key_chk(resolve_key(.Enter, false, .Find), .Find_Confirm, "Enter / Find")
-		key_chk(resolve_key(.Escape, false, .Find), .Find_Close, "Esc / Find")
-		key_chk(resolve_key(.H, true, .Editor), .Replace_Open, "Ctrl+H / Editor")
-		key_chk(resolve_key(.H, true, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find")
-		key_chk(resolve_key(.A, false, .Editor), .None, "a (unbound)")
-		// dispatch effects (dummy window; these commands don't touch the HWND)
+		dtext: plat.Text // these commands don't measure text
+		key_chk(resolve_key(.Left, false, false, .Editor), .Cursor_Left, "Left / Editor")
+		key_chk(resolve_key(.Left, true, false, .Editor), .Word_Left, "Ctrl+Left / Editor")
+		key_chk(resolve_key(.F, true, false, .Editor), .Find_Open, "Ctrl+F / Editor")
+		key_chk(resolve_key(.Z, false, true, .Editor), .Toggle_Wrap, "Alt+Z / Editor")
+		key_chk(resolve_key(.Enter, false, false, .Editor), .Insert_Newline, "Enter / Editor")
+		key_chk(resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find")
+		key_chk(resolve_key(.Escape, false, false, .Find), .Find_Close, "Esc / Find")
+		key_chk(resolve_key(.H, true, false, .Editor), .Replace_Open, "Ctrl+H / Editor")
+		key_chk(resolve_key(.H, true, false, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find")
+		key_chk(resolve_key(.A, false, false, .Editor), .None, "a (unbound)")
+		// dispatch effects (dummy window/text; these commands don't touch them)
 		app_active(&app).cursor = 0
-		command_dispatch(resolve_key(.Right, false, .Editor), {.Right, false, false, false}, &app, &dummy, 10)
+		command_dispatch(resolve_key(.Right, false, false, .Editor), {.Right, false, false, false}, &app, &dummy, &dtext, 10)
 		fmt.printfln("dispatch Right    -> cursor=%d", app_active(&app).cursor)
-		command_dispatch(resolve_key(.F, true, .Editor), {.F, true, false, false}, &app, &dummy, 10)
+		command_dispatch(.Toggle_Wrap, {}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Alt+Z    -> wrap=%v", app_active(&app).wrap)
+		command_dispatch(resolve_key(.F, true, false, .Editor), {.F, true, false, false}, &app, &dummy, &dtext, 10)
 		fmt.printfln("dispatch Ctrl+F   -> find.active=%v", app_active(&app).find.active)
-		command_dispatch(resolve_key(.Escape, false, .Find), {.Escape, false, false, false}, &app, &dummy, 10)
+		command_dispatch(resolve_key(.Escape, false, false, .Find), {.Escape, false, false, false}, &app, &dummy, &dtext, 10)
 		fmt.printfln("dispatch Esc      -> find.active=%v", app_active(&app).find.active)
 		// tab commands
-		command_dispatch(.Tab_New, {}, &app, &dummy, 10)
+		command_dispatch(.Tab_New, {}, &app, &dummy, &dtext, 10)
 		fmt.printfln("Tab_New           -> live tabs=%d active=%d", app_live_count(&app), app.active)
-		command_dispatch(.Tab_Close, {}, &app, &dummy, 10)
+		command_dispatch(.Tab_Close, {}, &app, &dummy, &dtext, 10)
 		fmt.printfln("Tab_Close         -> live tabs=%d", app_live_count(&app))
 		app_destroy(&app)
 

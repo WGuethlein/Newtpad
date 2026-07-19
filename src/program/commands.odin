@@ -7,6 +7,7 @@
 package main
 
 import "core:fmt"
+import base "src:base"
 import plat "src:platform"
 
 // Where a binding is active. Find mode is modal (doc.find.active); the same chord
@@ -43,6 +44,7 @@ Command_Id :: enum u8 {
 	Find_Open,
 	Replace_Open,
 	Clear_Selection,
+	Toggle_Wrap,
 	// tabs
 	Tab_New,
 	Tab_Open,
@@ -96,6 +98,7 @@ command_table := [Command_Id]Command {
 	.Find_Open                = {"Find", "Search"},
 	.Replace_Open             = {"Replace", "Search"},
 	.Clear_Selection          = {"Clear Selection", "Cursor"},
+	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
 	.Tab_New                  = {"New Tab", "Tabs"},
 	.Tab_Open                 = {"Open File...", "Tabs"},
 	.Tab_Close                = {"Close Tab", "Tabs"},
@@ -119,53 +122,55 @@ command_table := [Command_Id]Command {
 Binding :: struct {
 	key:  plat.Key,
 	ctrl: bool,
+	alt:  bool,
 	ctx:  Ctx,
 	cmd:  Command_Id,
 }
 
 default_bindings := []Binding {
-	// --- editor context ---
-	{.Left, false, .Editor, .Cursor_Left},
-	{.Right, false, .Editor, .Cursor_Right},
-	{.Up, false, .Editor, .Cursor_Up},
-	{.Down, false, .Editor, .Cursor_Down},
-	{.Home, false, .Editor, .Cursor_Home},
-	{.End, false, .Editor, .Cursor_End},
-	{.Left, true, .Editor, .Word_Left},
-	{.Right, true, .Editor, .Word_Right},
-	{.Page_Up, false, .Editor, .Page_Up},
-	{.Page_Down, false, .Editor, .Page_Down},
-	{.Backspace, false, .Editor, .Backspace},
-	{.Backspace, true, .Editor, .Delete_Word_Back},
-	{.Delete, false, .Editor, .Delete_Fwd},
-	{.Enter, false, .Editor, .Insert_Newline},
-	{.Z, true, .Editor, .Undo},
-	{.Y, true, .Editor, .Redo},
-	{.A, true, .Editor, .Select_All},
-	{.C, true, .Editor, .Copy},
-	{.X, true, .Editor, .Cut},
-	{.V, true, .Editor, .Paste},
-	{.S, true, .Editor, .Save},
-	{.F, true, .Editor, .Find_Open},
-	{.H, true, .Editor, .Replace_Open},
-	{.Escape, false, .Editor, .Clear_Selection},
-	{.N, true, .Editor, .Tab_New},
-	{.O, true, .Editor, .Tab_Open},
-	{.W, true, .Editor, .Tab_Close},
-	{.Tab, true, .Editor, .Tab_Next}, // Ctrl+Tab (Shift -> previous, read in the action)
-	{.Page_Up, true, .Editor, .Tab_Prev},
-	{.Page_Down, true, .Editor, .Tab_Next},
+	// --- editor context ---   {key, ctrl, alt, ctx, cmd}
+	{.Left, false, false, .Editor, .Cursor_Left},
+	{.Right, false, false, .Editor, .Cursor_Right},
+	{.Up, false, false, .Editor, .Cursor_Up},
+	{.Down, false, false, .Editor, .Cursor_Down},
+	{.Home, false, false, .Editor, .Cursor_Home},
+	{.End, false, false, .Editor, .Cursor_End},
+	{.Left, true, false, .Editor, .Word_Left},
+	{.Right, true, false, .Editor, .Word_Right},
+	{.Page_Up, false, false, .Editor, .Page_Up},
+	{.Page_Down, false, false, .Editor, .Page_Down},
+	{.Backspace, false, false, .Editor, .Backspace},
+	{.Backspace, true, false, .Editor, .Delete_Word_Back},
+	{.Delete, false, false, .Editor, .Delete_Fwd},
+	{.Enter, false, false, .Editor, .Insert_Newline},
+	{.Z, true, false, .Editor, .Undo},
+	{.Y, true, false, .Editor, .Redo},
+	{.A, true, false, .Editor, .Select_All},
+	{.C, true, false, .Editor, .Copy},
+	{.X, true, false, .Editor, .Cut},
+	{.V, true, false, .Editor, .Paste},
+	{.S, true, false, .Editor, .Save},
+	{.F, true, false, .Editor, .Find_Open},
+	{.H, true, false, .Editor, .Replace_Open},
+	{.Escape, false, false, .Editor, .Clear_Selection},
+	{.Z, false, true, .Editor, .Toggle_Wrap}, // Alt+Z
+	{.N, true, false, .Editor, .Tab_New},
+	{.O, true, false, .Editor, .Tab_Open},
+	{.W, true, false, .Editor, .Tab_Close},
+	{.Tab, true, false, .Editor, .Tab_Next}, // Ctrl+Tab (Shift -> previous, in the action)
+	{.Page_Up, true, false, .Editor, .Tab_Prev},
+	{.Page_Down, true, false, .Editor, .Tab_Next},
 	// --- find context ---
-	{.Escape, false, .Find, .Find_Close},
-	{.F, true, .Find, .Find_Close},
-	{.Backspace, false, .Find, .Find_Backspace},
-	{.Enter, false, .Find, .Find_Confirm},
-	{.Tab, false, .Find, .Find_Field_Toggle},
-	{.R, true, .Find, .Find_Toggle_Regex},
-	{.L, true, .Find, .Find_Toggle_Filter},
-	{.H, true, .Find, .Find_Toggle_Replace_Mode},
-	{.Page_Up, false, .Find, .Find_Filter_Page_Up},
-	{.Page_Down, false, .Find, .Find_Filter_Page_Down},
+	{.Escape, false, false, .Find, .Find_Close},
+	{.F, true, false, .Find, .Find_Close},
+	{.Backspace, false, false, .Find, .Find_Backspace},
+	{.Enter, false, false, .Find, .Find_Confirm},
+	{.Tab, false, false, .Find, .Find_Field_Toggle},
+	{.R, true, false, .Find, .Find_Toggle_Regex},
+	{.L, true, false, .Find, .Find_Toggle_Filter},
+	{.H, true, false, .Find, .Find_Toggle_Replace_Mode},
+	{.Page_Up, false, false, .Find, .Find_Filter_Page_Up},
+	{.Page_Down, false, false, .Find, .Find_Filter_Page_Down},
 }
 
 // Close a tab, prompting to save first if it has unsaved changes. Save-dialog
@@ -195,9 +200,9 @@ request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
 
 // Map a key press to a command within the active context (shift ignored here; the
 // action reads it). First matching binding wins; a user overlay would prepend.
-resolve_key :: proc(key: plat.Key, ctrl: bool, ctx: Ctx) -> Command_Id {
+resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 	for b in default_bindings {
-		if b.key == key && b.ctrl == ctrl && b.ctx == ctx {
+		if b.key == key && b.ctrl == ctrl && b.alt == alt && b.ctx == ctx {
 			return b.cmd
 		}
 	}
@@ -207,7 +212,7 @@ resolve_key :: proc(key: plat.Key, ctrl: bool, ctx: Ctx) -> Command_Id {
 // Run a command. `rows` is the visible row count (page moves); `w` supplies the
 // HWND for clipboard / Save-dialog. The active-context split means each command
 // is unambiguous here.
-command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^plat.Window, rows: int) {
+command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^plat.Window, t: ^plat.Text, rows: int) {
 	doc := app_active(app)
 	switch cmd {
 	// --- editor ---
@@ -216,9 +221,9 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Cursor_Right:
 		doc_cursor_right(doc, ev.shift)
 	case .Cursor_Up:
-		doc_cursor_up(doc, ev.shift)
+		doc_cursor_up(doc, t, ev.shift)
 	case .Cursor_Down:
-		doc_cursor_down(doc, ev.shift)
+		doc_cursor_down(doc, t, ev.shift)
 	case .Cursor_Home:
 		doc_cursor_home(doc, ev.shift)
 	case .Cursor_End:
@@ -228,9 +233,9 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Word_Right:
 		doc_word_right(doc, ev.shift)
 	case .Page_Up:
-		doc_scroll(doc, -(rows - 1))
+		doc_scroll(doc, t, -(rows - 1))
 	case .Page_Down:
-		doc_scroll(doc, rows - 1)
+		doc_scroll(doc, t, rows - 1)
 	case .Backspace:
 		doc_backspace(doc)
 	case .Delete_Fwd:
@@ -278,6 +283,9 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		find_open(doc, true)
 	case .Clear_Selection:
 		doc.anchor = doc.cursor
+	case .Toggle_Wrap:
+		doc.wrap = !doc.wrap
+		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start
 
 	// --- tabs ---
 	case .Tab_New:

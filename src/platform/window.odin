@@ -206,10 +206,12 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 			w.char_count += 1
 		}
 		return 0
-	case win.WM_KEYDOWN:
+	case win.WM_KEYDOWN, win.WM_SYSKEYDOWN:
+		// WM_SYSKEYDOWN carries Alt combos (e.g. Alt+Z). Translate and queue keys
+		// we recognize; let DefWindowProc handle the rest (Alt+F4, Alt+Space, F10).
 		key := vk_to_key(wparam)
 		if key == .None {
-			return 0
+			break
 		}
 		ctrl := (int(win.GetKeyState(win.VK_CONTROL)) & 0x8000) != 0
 		shift := (int(win.GetKeyState(win.VK_SHIFT)) & 0x8000) != 0

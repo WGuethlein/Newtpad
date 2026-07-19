@@ -227,10 +227,10 @@ find_match_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: i
 	mi := 0
 	for mi < len(f.matches) && f.matches[mi] < doc.top {mi += 1}
 
-	it := visible_begin(doc, rows)
+	it := visible_begin(doc, t, rows)
 	n := 0
 	for n < len(out) {
-		row, start, end, ok := visible_next(&it)
+		row, start, end, _, ok := visible_next(&it)
 		if !ok {break}
 		ry := row_rect_y(px, row)
 		for mi < len(f.matches) && f.matches[mi] <= end && n < len(out) {

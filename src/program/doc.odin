@@ -42,23 +42,100 @@ col_x :: #force_inline proc(char_w: f32, col: int) -> f32 {return TEXT_MARGIN_X 
 row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - CONTENT_TOP) / line_height(px))}
 col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return max(0, int((mx - TEXT_MARGIN_X) / char_w + 0.5))}
 
-// Walks the visible lines (filter view or consecutive) yielding each row's
-// [start, end) byte range, with `end` capped to RENDER_LINE_CAP so no screen
-// pass ever scans a pathological long line. Every pass (draw, selection, find
-// highlights) shares this so they agree on geometry and stay bounded.
+// --- word wrap: break a logical line into visual rows at doc.view_cols cells ---
+
+// End of the visual row starting at `p` (which must be a visual-row start).
+// Returns the break offset and whether it's the logical line end. Breaks after
+// the last word boundary that fits; a single word wider than the row char-breaks.
+// When wrap is off, callers use pt_line_end_cap instead.
+wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (end: int, line_end: bool) {
+	c := max(cols, 1)
+	L := doc.pt.length
+	buf: [512]u8
+	pos := p
+	col := 0
+	last_break := -1 // offset just after the most recent space/tab that fit
+	for pos < L {
+		n := base.pt_read(&doc.pt, pos, buf[:min(len(buf), L - pos)])
+		if n == 0 {break}
+		i := 0
+		for i < n {
+			if buf[i] == '\n' {return pos + i, true}
+			r, sz := utf8.decode_rune(buf[i:n])
+			if sz == 0 {sz = 1}
+			if i + sz > n && pos + n < L {break} // rune straddles the chunk; refill
+			cw := plat.text_cell_width(t, r)
+			if col + cw > c && col > 0 {
+				if last_break > p {return last_break, false}
+				return pos + i, false // char-break an over-long word
+			}
+			col += cw
+			if buf[i] == ' ' || buf[i] == '\t' {last_break = pos + i + sz}
+			i += sz
+		}
+		if i == 0 {break}
+		pos += i
+	}
+	return L, true
+}
+
+// Start of the visual row after the one starting at `p`.
+next_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
+	e, le := wrap_row_end(doc, t, p, cols)
+	if le {return e + 1 if e < doc.pt.length else doc.pt.length}
+	return e
+}
+
+// Start of the visual row containing byte `off`.
+visual_row_start :: proc(doc: ^Document, t: ^plat.Text, off, cols: int) -> int {
+	s := base.pt_line_start(&doc.pt, off)
+	for {
+		e, le := wrap_row_end(doc, t, s, cols)
+		if le || off < e {return s}
+		s = e
+	}
+}
+
+// Start of the visual row before the one starting at `p`.
+prev_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
+	if p <= 0 {return 0}
+	ls := base.pt_line_start(&doc.pt, p)
+	if ls < p { // p is mid logical line: the segment just before it
+		s := ls
+		for {
+			ns := next_visual_row(doc, t, s, cols)
+			if ns >= p {return s}
+			s = ns
+		}
+	}
+	// p is a logical line start: last segment of the previous logical line
+	s := base.pt_prev_line_start(&doc.pt, p)
+	for {
+		e, le := wrap_row_end(doc, t, s, cols)
+		if le {return s}
+		s = e
+	}
+}
+
+// Walks the visible rows (filter view, wrapped, or consecutive) yielding each
+// row's [start, end) byte range plus whether it ends a logical line. Wrap-aware,
+// so every screen pass (draw, selection, find highlights) sharing it stays
+// consistent; `end` is capped to RENDER_LINE_CAP when not wrapping so no pass
+// scans a pathological long line.
 Visible_Iter :: struct {
 	doc:  ^Document,
+	t:    ^plat.Text,
 	rows: int,
 	r:    int,
 	pos:  int,
 	done: bool,
 }
 
-visible_begin :: proc(doc: ^Document, rows: int) -> Visible_Iter {
-	return {doc = doc, rows = rows, pos = doc.top}
+visible_begin :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> Visible_Iter {
+	return {doc = doc, t = t, rows = rows, pos = doc.top}
 }
 
-visible_next :: proc(it: ^Visible_Iter) -> (row, start, end: int, ok: bool) {
+visible_next :: proc(it: ^Visible_Iter) -> (row, start, end: int, line_end, ok: bool) {
 	if it.done || it.r >= it.rows {return}
 	d := it.doc
 	if d.filter {
@@ -66,14 +143,21 @@ visible_next :: proc(it: ^Visible_Iter) -> (row, start, end: int, ok: bool) {
 		if fi >= len(d.filter_lines) {return}
 		start = d.filter_lines[fi]
 		end = base.pt_line_end_cap(&d.pt, start, RENDER_LINE_CAP)
+		line_end = true
 	} else {
 		if it.pos > d.pt.length {return}
 		start = it.pos
-		end = base.pt_line_end_cap(&d.pt, start, RENDER_LINE_CAP)
-		if end >= d.pt.length {
-			it.done = true // last line: yield it, then stop
+		if d.wrap {
+			end, line_end = wrap_row_end(d, it.t, start, d.view_cols)
+			if line_end {
+				if end >= d.pt.length {it.done = true} else {it.pos = end + 1}
+			} else {
+				it.pos = end // next visual row continues the same logical line
+			}
 		} else {
-			it.pos = end + 1
+			end = base.pt_line_end_cap(&d.pt, start, RENDER_LINE_CAP)
+			line_end = true
+			if end >= d.pt.length {it.done = true} else {it.pos = end + 1}
 		}
 	}
 	row = it.r
@@ -114,9 +198,11 @@ Document :: struct {
 	path:       string, // "" for an unnamed scratch buffer
 	path_owned: bool, // doc.path is heap-owned (freed on close/re-save)
 	had_bom:    bool, // whether the file opened with a BOM (preserved on save)
-	top:        int, // byte offset of the top visible line
+	top:        int, // byte offset of the top visible (visual) row
 	cursor:     int, // caret byte offset
 	anchor:     int, // other end of the selection (== cursor when none)
+	wrap:       bool, // word-wrap this document at view_cols
+	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	modified:   bool,
 	recovered:  bool, // a mapped read faulted; buffer is now a private copy, not the file
 	nl_delta:   int,
@@ -510,7 +596,19 @@ doc_cursor_right :: proc(doc: ^Document, select: bool) {
 doc_cursor_home :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_line_start(&doc.pt, doc.cursor), select)}
 doc_cursor_end :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_line_end(&doc.pt, doc.cursor), select)}
 
-doc_cursor_up :: proc(doc: ^Document, select: bool) {
+doc_cursor_up :: proc(doc: ^Document, t: ^plat.Text, select: bool) {
+	if doc.wrap {
+		vs := visual_row_start(doc, t, doc.cursor, doc.view_cols)
+		if vs == 0 {
+			set_cursor(doc, 0, select)
+			return
+		}
+		col := line_cell_col(doc, t, vs, doc.cursor)
+		pv := prev_visual_row(doc, t, vs, doc.view_cols)
+		pe, _ := wrap_row_end(doc, t, pv, doc.view_cols)
+		set_cursor(doc, line_offset_at_cell(doc, t, pv, pe, col), select)
+		return
+	}
 	ls := base.pt_line_start(&doc.pt, doc.cursor)
 	if ls == 0 {
 		set_cursor(doc, 0, select)
@@ -521,7 +619,17 @@ doc_cursor_up :: proc(doc: ^Document, select: bool) {
 	set_cursor(doc, min(prev + col, base.pt_line_end(&doc.pt, prev)), select)
 }
 
-doc_cursor_down :: proc(doc: ^Document, select: bool) {
+doc_cursor_down :: proc(doc: ^Document, t: ^plat.Text, select: bool) {
+	if doc.wrap {
+		vs := visual_row_start(doc, t, doc.cursor, doc.view_cols)
+		e, le := wrap_row_end(doc, t, vs, doc.view_cols)
+		if le && e >= doc.pt.length {return} // already the last visual row
+		col := line_cell_col(doc, t, vs, doc.cursor)
+		nv := next_visual_row(doc, t, vs, doc.view_cols)
+		ne, _ := wrap_row_end(doc, t, nv, doc.view_cols)
+		set_cursor(doc, line_offset_at_cell(doc, t, nv, ne, col), select)
+		return
+	}
 	ls := base.pt_line_start(&doc.pt, doc.cursor)
 	col := doc.cursor - ls
 	nl := base.pt_next_line_start(&doc.pt, doc.cursor)
@@ -617,17 +725,17 @@ line_offset_at_cell :: proc(doc: ^Document, t: ^plat.Text, ls, le, col: int) -> 
 doc_pos_at :: proc(doc: ^Document, t: ^plat.Text, mx, my: i32, px, char_w: f32, rows: int) -> int {
 	target := clamp(row_at_y(px, f32(my)), 0, rows - 1)
 	col := col_at_x(char_w, f32(mx))
-	it := visible_begin(doc, rows)
+	it := visible_begin(doc, t, rows)
 	last_start, last_end := doc.top, doc.top
 	for {
-		row, start, end, ok := visible_next(&it)
+		row, start, end, _, ok := visible_next(&it)
 		if !ok {break}
 		last_start, last_end = start, end
 		if row == target {
 			return line_offset_at_cell(doc, t, start, end, col)
 		}
 	}
-	return line_offset_at_cell(doc, t, last_start, last_end, col) // click below last line
+	return line_offset_at_cell(doc, t, last_start, last_end, col) // click below last row
 }
 
 // Selection highlight rectangles for the visible lines (opaque; drawn behind
@@ -637,10 +745,10 @@ doc_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows
 	if lo == hi {return 0}
 	col := [4]f32{0.20, 0.30, 0.48, 1}
 	lh := line_height(px)
-	it := visible_begin(doc, rows)
+	it := visible_begin(doc, t, rows)
 	n := 0
 	for n < len(out) {
-		row, start, end, ok := visible_next(&it)
+		row, start, end, _, ok := visible_next(&it)
 		if !ok {break}
 		if lo <= end && hi > start { // selection overlaps [start, end]
 			startcol := min(line_cell_col(doc, t, start, max(start, lo)), VISIBLE_COLS)
@@ -657,37 +765,39 @@ doc_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows
 
 // --- viewport ---
 
-doc_scroll :: proc(doc: ^Document, delta: int) {
+// Scroll the viewport by `delta` visual rows (up when negative). Visual rows are
+// wrap segments when wrapping, otherwise logical lines.
+doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta: int) {
 	if delta > 0 {
 		for _ in 0 ..< delta {
-			nt := base.pt_next_line_start(&doc.pt, doc.top)
+			nt := next_visual_row(doc, t, doc.top, doc.view_cols) if doc.wrap else base.pt_next_line_start(&doc.pt, doc.top)
 			if nt == doc.top {break}
 			doc.top = nt
 		}
 	} else if delta < 0 {
 		for _ in 0 ..< -delta {
 			if doc.top == 0 {break}
-			doc.top = base.pt_prev_line_start(&doc.pt, doc.top)
+			doc.top = prev_visual_row(doc, t, doc.top, doc.view_cols) if doc.wrap else base.pt_prev_line_start(&doc.pt, doc.top)
 		}
 	}
 }
 
-// Keep the caret on screen: scroll so cursor's line is within [top, top+rows).
-doc_ensure_cursor_visible :: proc(doc: ^Document, rows: int) {
-	cls := base.pt_line_start(&doc.pt, doc.cursor)
+// Keep the caret on screen: scroll so its visual row is within [top, top+rows).
+doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
+	cls := visual_row_start(doc, t, doc.cursor, doc.view_cols) if doc.wrap else base.pt_line_start(&doc.pt, doc.cursor)
 	if cls < doc.top {
 		doc.top = cls
 		return
 	}
-	// walk `rows` lines from top; if we pass cursor's line, it's visible
+	// walk `rows` visual rows from top; if we pass the caret's row, it's visible
 	p := doc.top
 	for _ in 0 ..< rows {
-		if p >= cls {return} // cursor line at/above bottom edge -> visible
-		p = base.pt_next_line_start(&doc.pt, p)
+		if p >= cls {return}
+		p = next_visual_row(doc, t, p, doc.view_cols) if doc.wrap else base.pt_next_line_start(&doc.pt, p)
 	}
-	// cursor is below the viewport: put its line at the bottom row
+	// caret is below the viewport: put its row at the bottom
 	doc.top = cls
-	doc_scroll(doc, -(rows - 1))
+	doc_scroll(doc, t, -(rows - 1))
 }
 
 // Draw visible lines; return the caret's screen rect (if visible) and the byte
@@ -699,9 +809,9 @@ doc_draw :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, px, char_w: f32,
 	// scroll is a follow-up).
 	line_buf: [VISIBLE_COLS]u8
 	bottom = doc.top
-	it := visible_begin(doc, rows)
+	it := visible_begin(doc, t, rows)
 	for {
-		row, start, end, ok := visible_next(&it)
+		row, start, end, line_end, ok := visible_next(&it)
 		if !ok {break}
 		bottom = end
 		row_y := row_baseline_y(px, row)
@@ -714,8 +824,10 @@ doc_draw :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, px, char_w: f32,
 			plat.text_draw(gfx, t, string(line_buf[:vis]), col_x(char_w, 0), row_y, px, fg)
 		}
 
-		if doc.cursor >= start && doc.cursor <= end {
-			cprefix := min(doc.cursor - start, n) // caret column = cells before it, clipped to drawn text
+		// Caret on this row: [start, end], but a wrap point (non-line-end `end`)
+		// belongs to the next visual row's start, so exclude it here.
+		if doc.cursor >= start && doc.cursor <= end && (line_end || doc.cursor < end) {
+			cprefix := min(doc.cursor - start, n) // cells before caret, clipped to drawn text
 			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix]))
 			cy = row_y
 			caret = true
