@@ -251,6 +251,31 @@ extension. IFEO `notepad.exe` hijack was considered and rejected (system-wide HK
 **Known gap:** if a Newtpad instance is elevated and a launch isn't (or vice versa), UIPI blocks
 the `SendMessage`, and the second launch falls through to its own non-session-owning process.
 
+**GUI subsystem.** Release builds with `-subsystem:windows` — Odin defaults to console, so
+launching the app also opened a console window. Debug stays console so `test_modes.odin` can print;
+**run headless modes against the debug exe**, not the installed one.
+
+## 6d. Regex on large files — bounded, not fixed (2026-07-19)
+
+`recompute_regex` called `pt_collect` per keystroke, materializing the whole document to hand
+`core:text/regex` a string — a full copy per keypress, and on a multi-GB file the allocation itself
+is the failure. Now it scans **line-aligned blocks** (`REGEX_BLOCK` 1 MB, `REGEX_LINE_SLACK` 64 KB
+to reach a line end, keeping the newline with its line), bounded by `REGEX_SCAN_CAP`. Partial
+results set `find.truncated`, shown as a trailing `+` on the match counter. Cost: a pattern
+spanning a block boundary won't match; line-scoped patterns are unaffected.
+
+**This bounds the stall; it does not make regex fast.** `newtpad regextest <mb>` measures
+**~16–19 ms/MB** for the Odin regex engine, so one 16 ms frame buys ~1 MB — no cap is both
+responsive and useful. 8 MB was chosen as a latency budget (~130 ms worst keystroke, down from
+~620 ms at a 32 MB cap). Verified correct where fully scanned (needle at 4 MB / 8 MB found; 64 MB
+correctly reports truncated).
+
+**The actual fix, still open:** run the search on a worker over a `pt_snapshot`, cancel on query
+change, merge results once per frame — the locked job pattern, and the same shape as the existing
+line-count indexer. The open design question is snapshot cost vs. reading a piece table that the
+main thread may be editing. Literal search is chunked and fast, and regex is opt-in (Ctrl+R), so
+the exposure is narrow — but it's the last live piece of roadmap item 1.
+
 ## 7. Build environment (Windows, this machine)
 
 - **Odin** `dev-2026-07a` at `C:\Users\Wyatt\odin\dist`, on user PATH. **MSVC** from VS Community
