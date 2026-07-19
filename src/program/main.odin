@@ -254,5 +254,5 @@ on_resize :: proc "contextless" (user: rawptr) {
 	mem.arena_init(&arena, scratch[:])
 	context.temp_allocator = mem.arena_allocator(&arena)
 	plat.gfx_resize(rc.gfx, rc.window.width, rc.window.height)
-	render_frame(rc, false) // immediate present: smooth live resize, no vsync stall
+	render_frame(rc, false) // immediate (allow-tearing) present: smooth live resize
 }

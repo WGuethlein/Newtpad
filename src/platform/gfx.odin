@@ -15,11 +15,30 @@ Gfx :: struct {
 	rtv:       ^d3d.IRenderTargetView,
 	width:     i32,
 	height:    i32,
+	tearing:   bool, // allow-tearing supported → immediate present for smooth resize
+}
+
+// Whether the OS/driver supports DXGI allow-tearing (Win10 1607+). Needed so a
+// sync-interval-0 present is truly immediate instead of vblank-locked (a flip-
+// model present can't tear without this flag, which is what made resize stutter).
+@(private)
+gfx_check_tearing :: proc() -> bool {
+	factory: ^dxgi.IFactory5
+	if !win.SUCCEEDED(dxgi.CreateDXGIFactory1(dxgi.IFactory5_UUID, (^rawptr)(&factory))) || factory == nil {
+		return false
+	}
+	defer factory->Release()
+	allow: win.BOOL
+	if !win.SUCCEEDED(factory->CheckFeatureSupport(.PRESENT_ALLOW_TEARING, &allow, size_of(allow))) {
+		return false
+	}
+	return bool(allow)
 }
 
 gfx_init :: proc(w: ^Window) -> (gfx: Gfx, ok: bool) {
 	gfx.width = w.width
 	gfx.height = w.height
+	gfx.tearing = gfx_check_tearing()
 
 	desc := dxgi.SWAP_CHAIN_DESC {
 		BufferDesc = {
@@ -33,6 +52,7 @@ gfx_init :: proc(w: ^Window) -> (gfx: Gfx, ok: bool) {
 		OutputWindow = w.hwnd,
 		Windowed     = win.TRUE,
 		SwapEffect   = .FLIP_DISCARD,
+		Flags        = {.ALLOW_TEARING} if gfx.tearing else {},
 	}
 
 	// The D3D11 debug layer validates every API call — a large per-call overhead
@@ -88,7 +108,7 @@ gfx_resize :: proc(gfx: ^Gfx, width, height: i32) {
 		gfx.rtv->Release()
 		gfx.rtv = nil
 	}
-	gfx.swapchain->ResizeBuffers(0, u32(width), u32(height), .UNKNOWN, {})
+	gfx.swapchain->ResizeBuffers(0, u32(width), u32(height), .UNKNOWN, {.ALLOW_TEARING} if gfx.tearing else {})
 	gfx.width = width
 	gfx.height = height
 	gfx_create_rtv(gfx)
@@ -107,7 +127,13 @@ gfx_begin_frame :: proc(gfx: ^Gfx, r, g, b: f32) {
 }
 
 // Present the frame. sync=1 = vsync (default, calm GPU); sync=0 = immediate,
-// used during a live resize so per-WM_SIZE presents don't each block on vsync.
+// used during a live resize so per-WM_SIZE presents don't each block on vblank.
+// Sync-0 needs the ALLOW_TEARING present flag to actually be immediate (otherwise
+// a flip-model present stays vblank-locked).
 gfx_end_frame :: proc(gfx: ^Gfx, sync: u32 = 1) {
-	gfx.swapchain->Present(sync, {})
+	flags: dxgi.PRESENT
+	if sync == 0 && gfx.tearing {
+		flags = {.ALLOW_TEARING}
+	}
+	gfx.swapchain->Present(sync, flags)
 }
