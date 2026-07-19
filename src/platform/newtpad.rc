@@ -1,0 +1,4 @@
+// Embeds the application manifest as resource id 1, type 24 (RT_MANIFEST) —
+// the standard way to attach a manifest without linker-specific flags. Odin
+// takes this via -resource: (see build.bat).
+1 24 "newtpad.manifest"

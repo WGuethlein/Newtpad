@@ -37,8 +37,37 @@ NCCALCSIZE_PARAMS :: struct {
 }
 DWMWA_WINDOW_CORNER_PREFERENCE :: 33
 DWMWCP_ROUND: i32 : 2
-RESIZE_BORDER :: i32(6) // hit-test thickness of the resize edges
-CAPTION_BTN_W :: i32(46) // width of each min/max/close button
+RESIZE_BORDER_96 :: i32(6) // hit-test thickness of the resize edges, at 96 DPI
+CAPTION_BTN_W_96 :: i32(46) // width of each min/max/close button, at 96 DPI
+
+// Non-client metrics are pure functions of this window's DPI, so the platform
+// computes them itself rather than having the program mirror them in (the way
+// titlebar_h/tabs_right are). Mirroring would leave them zero on the first frame
+// and stale for a frame after every DPI change — and wnd_proc needs them correct
+// during window creation, before the program has drawn anything.
+window_resize_border :: proc "contextless" (w: ^Window) -> i32 {
+	return max(1, RESIZE_BORDER_96 * i32(w.dpi) / 96)
+}
+window_caption_btn_w :: proc "contextless" (w: ^Window) -> i32 {
+	return max(1, CAPTION_BTN_W_96 * i32(w.dpi) / 96)
+}
+
+// Scale factor for the program's layout. Always >= 1.0: dpi is clamped at the
+// capture site, because GetDpiForWindow returns 0 for an invalid HWND and a zero
+// scale propagates into divisions (char_w, line_h) whose +Inf result is poison
+// when converted to int — negative row counts and out-of-range indices.
+window_scale :: proc "contextless" (w: ^Window) -> f32 {return f32(w.dpi) / 96}
+
+DPI_MIN :: u32(96)
+DPI_MAX :: u32(960) // 1000% — well past what Windows offers
+
+@(private)
+clamp_dpi :: proc "contextless" (dpi: u32) -> u32 {
+	return DPI_MIN if dpi < DPI_MIN else (DPI_MAX if dpi > DPI_MAX else dpi)
+}
+
+// Exposed so `newtpad dpitest` can exercise the clamp without a real window.
+clamp_dpi_for_test :: proc "contextless" (dpi: u32) -> u32 {return clamp_dpi(dpi)}
 // hit-test codes (not all in core:sys/windows)
 HT_CLIENT :: 1
 HT_CAPTION :: 2
@@ -136,6 +165,16 @@ Window :: struct {
 	// is client, right of it up to the window buttons is a drag region).
 	titlebar_h:   i32,
 	tabs_right:   i32,
+	// This window's DPI (clamped, never 0). 96 == 100%.
+	dpi:          u32,
+	// Set when the DPI changed this frame; the program recomputes its layout
+	// metrics and re-rasterizes glyphs, then clears it.
+	dpi_changed:  bool,
+	// Invoked from WM_DPICHANGED *before* the window is resized, so the nested
+	// WM_SIZE repaint already uses the new scale. A poll-only flag would repaint
+	// a whole cross-monitor drag at the old scale, since the OS runs a modal loop.
+	on_dpi:       proc "contextless" (user: rawptr),
+	dpi_user:     rawptr,
 	// optional repaint callback, invoked from WM_SIZE so the app can render live
 	// during the OS modal resize loop (which blocks the main loop).
 	on_resize:    proc "contextless" (user: rawptr),
@@ -188,9 +227,14 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 	}
 	win.RegisterClassExW(&wc)
 
-	// Size the window so the *client* area is width x height.
-	rect := win.RECT{0, 0, width, height}
-	win.AdjustWindowRectEx(&rect, win.WS_OVERLAPPEDWINDOW, win.BOOL(false), 0)
+	// No AdjustWindowRectEx: WM_NCCALCSIZE gives this window a client area equal
+	// to its whole window rect, so there is no frame to add. (It was also the
+	// non-DPI variant, returning primary-monitor frame metrics.)
+	//
+	// The size here is provisional. CW_USEDEFAULT means the target monitor — and
+	// therefore the DPI — isn't knowable until the window exists, so we create at
+	// the 96-DPI size and rescale immediately below.
+	w.dpi = DPI_MIN
 
 	title_w := win.utf8_to_wstring(title)
 	w.hwnd = win.CreateWindowExW(
@@ -200,13 +244,31 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 		win.WS_OVERLAPPEDWINDOW | win.WS_VISIBLE,
 		win.CW_USEDEFAULT,
 		win.CW_USEDEFAULT,
-		rect.right - rect.left,
-		rect.bottom - rect.top,
+		width,
+		height,
 		nil,
 		nil,
 		hinstance,
 		w, // handed to WM_NCCREATE so wnd_proc can find this Window
 	)
+
+	// Now the window exists, so its monitor's DPI is knowable. Capturing here
+	// rather than in WM_NCCREATE avoids the CW_USEDEFAULT position quirk and the
+	// fact that w.hwnd is still nil that early; nothing before this point needs
+	// the DPI (WM_NCCALCSIZE only reads system metrics when maximized, which a
+	// freshly created WS_OVERLAPPEDWINDOW is not).
+	w.dpi = clamp_dpi(win.GetDpiForWindow(w.hwnd))
+	if w.dpi != DPI_MIN {
+		sw := width * i32(w.dpi) / 96
+		sh := height * i32(w.dpi) / 96
+		// Don't hand back a window bigger than the monitor: at 300% a 1280x720
+		// default becomes 3840x2160, which is the whole screen on a 4K laptop.
+		if mi, ok := monitor_work_area(w.hwnd); ok {
+			sw = min(sw, mi.right - mi.left)
+			sh = min(sh, mi.bottom - mi.top)
+		}
+		win.SetWindowPos(w.hwnd, nil, 0, 0, sw, sh, win.SWP_NOMOVE | win.SWP_NOZORDER | win.SWP_NOACTIVATE)
+	}
 
 	// Custom frame: keep a 1px DWM frame extension for the drop shadow, and force
 	// Win11 rounded corners. The caption itself is removed in WM_NCCALCSIZE.
@@ -217,6 +279,21 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 	// Force the frame to recompute now that our WM_NCCALCSIZE is in effect.
 	win.SetWindowPos(w.hwnd, nil, 0, 0, 0, 0, win.SWP_FRAMECHANGED | win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOZORDER)
 	return w
+}
+
+// Work area (screen minus taskbar) of the monitor this window is on.
+@(private)
+monitor_work_area :: proc(hwnd: win.HWND) -> (win.RECT, bool) {
+	mon := win.MonitorFromWindow(hwnd, .MONITOR_DEFAULTTONEAREST)
+	if mon == nil {
+		return {}, false
+	}
+	mi: win.MONITORINFO
+	mi.cbSize = size_of(mi)
+	if !win.GetMonitorInfoW(mon, &mi) {
+		return {}, false
+	}
+	return mi.rcWork, true
 }
 
 // Cursor position in this window's client coordinates (for title-bar button
@@ -294,12 +371,42 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		// maximized, inset by the frame so we don't overflow the monitor/taskbar.
 		if bool(win.IsZoomed(hwnd)) {
 			p := (^NCCALCSIZE_PARAMS)(uintptr(lparam))
-			fx := win.GetSystemMetrics(win.SM_CXFRAME) + win.GetSystemMetrics(win.SM_CXPADDEDBORDER)
-			fy := win.GetSystemMetrics(win.SM_CYFRAME) + win.GetSystemMetrics(win.SM_CXPADDEDBORDER)
+			// ...ForDpi: the plain GetSystemMetrics returns primary-monitor values
+			// once the process is per-monitor aware, so a window maximized on a
+			// different-DPI monitor would inset by the wrong amount and either
+			// overflow the taskbar or fall short of it.
+			fx := win.GetSystemMetricsForDpi(win.SM_CXFRAME, w.dpi) + win.GetSystemMetricsForDpi(win.SM_CXPADDEDBORDER, w.dpi)
+			fy := win.GetSystemMetricsForDpi(win.SM_CYFRAME, w.dpi) + win.GetSystemMetricsForDpi(win.SM_CXPADDEDBORDER, w.dpi)
 			p.rgrc[0].left += fx
 			p.rgrc[0].right -= fx
 			p.rgrc[0].top += fy
 			p.rgrc[0].bottom -= fy
+		}
+		return 0
+	case win.WM_DPICHANGED:
+		// Order matters. The SetWindowPos below sends WM_NCCALCSIZE and WM_SIZE
+		// nested, and WM_SIZE runs the program's repaint callback — so the DPI and
+		// the program's layout metrics must both already be current, or that
+		// nested frame draws at the old scale against the new physical size and
+		// WM_NCCALCSIZE insets using the old DPI.
+		w.dpi = clamp_dpi(u32(wparam & 0xFFFF)) // LOWORD; X and Y are equal on Windows
+		w.dpi_changed = true
+		if w.on_dpi != nil {
+			w.on_dpi(w.dpi_user)
+		}
+		// Honouring the suggested rect is not optional: ignoring it breaks
+		// cursor-relative position when dragging across monitors and can put the
+		// window into a recursive DPI-change cycle.
+		if sug := (^win.RECT)(uintptr(lparam)); sug != nil {
+			win.SetWindowPos(
+				hwnd,
+				nil,
+				sug.left,
+				sug.top,
+				sug.right - sug.left,
+				sug.bottom - sug.top,
+				win.SWP_NOZORDER | win.SWP_NOACTIVATE,
+			)
 		}
 		return 0
 	case win.WM_NCHITTEST:
@@ -307,7 +414,7 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		win.ScreenToClient(hwnd, &pt)
 		x, y, W, H := pt.x, pt.y, w.width, w.height
 		if !bool(win.IsZoomed(hwnd)) {
-			rb := RESIZE_BORDER
+			rb := window_resize_border(w)
 			top, bot, lft, rgt := y < rb, y >= H - rb, x < rb, x >= W - rb
 			switch {
 			case top && lft:
@@ -330,11 +437,11 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		}
 		if y < w.titlebar_h {
 			switch {
-			case x >= W - CAPTION_BTN_W:
+			case x >= W - window_caption_btn_w(w):
 				return HT_CLOSE
-			case x >= W - 2 * CAPTION_BTN_W:
+			case x >= W - 2 * window_caption_btn_w(w):
 				return HT_MAXBUTTON
-			case x >= W - 3 * CAPTION_BTN_W:
+			case x >= W - 3 * window_caption_btn_w(w):
 				return HT_MINBUTTON
 			case x < w.tabs_right:
 				return HT_CLIENT // tabs / menu / + : the program handles the click

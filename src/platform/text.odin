@@ -71,6 +71,7 @@ Text :: struct {
 	pack_y:    i32,
 	shelf_h:   i32,
 	cache:     map[Glyph_Key]Glyph,
+	atlas_full: bool, // a glyph was dropped for want of space (see glyph_get)
 
 	// pipeline
 	vs:        ^d3d.IVertexShader,
@@ -499,8 +500,17 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, face: int, index: u16, px: f32) -> Glyph 
 			g.uv_min = {f32(rx) / ATLAS_W, f32(ry) / ATLAS_H}
 			g.uv_max = {f32(rx + gw) / ATLAS_W, f32(ry + gh) / ATLAS_H}
 		} else {
-			// atlas full (eviction is a follow-up): don't render this glyph, just advance.
+			// Atlas full. Nothing to draw for this glyph, but do NOT cache that:
+			// a cached miss makes the glyph invisible for the rest of the process
+			// even after text_reset_atlas frees space. Flag it so the program can
+			// say so — the pen still advances, so the silent failure looks like
+			// holes punched in the user's file, with no way to tell why.
+			t.atlas_full = true
 			g.w, g.h = 0, 0
+			if cov != nil {
+				delete(cov)
+			}
+			return g
 		}
 	}
 	if cov != nil {
@@ -508,6 +518,19 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, face: int, index: u16, px: f32) -> Glyph 
 	}
 	t.cache[key] = g
 	return g
+}
+
+// True once a glyph has been dropped for want of atlas space.
+text_atlas_full :: proc(t: ^Text) -> bool {return t.atlas_full}
+
+// Empty the atlas. Every cached glyph holds UVs into it, so the cache goes too.
+// Used when the rasterization size changes wholesale (a DPI change): keeping
+// entries rasterized for the old size would both mis-render and permanently
+// consume the space the new size needs.
+text_reset_atlas :: proc(t: ^Text) {
+	clear(&t.cache)
+	t.pack_x, t.pack_y, t.shelf_h = 0, 0, 0
+	t.atlas_full = false
 }
 
 // Returns the 3-channel ClearType coverage (caller frees) and placement, with

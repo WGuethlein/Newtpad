@@ -1,4 +1,4 @@
-// Layer: program — the command palette (Ctrl+P): the universal access point. One
+﻿// Layer: program â€” the command palette (Ctrl+P): the universal access point. One
 // overlay widget, three modes chosen by a leading prefix:
 //   (none) fuzzy-switch open tabs
 //   >      fuzzy-run a command from the command table
@@ -177,10 +177,10 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 		qs = "Search tabs    ( >  command    :  go to line )"
 		qcol = {0.45, 0.49, 0.57, 1}
 	}
-	plat.text_draw(gfx, text, qs, x0 + 12, y0 + 22, 15, qcol)
+	plat.text_draw(gfx, text, qs, x0 + 12, y0 + 22, UI_PX, qcol)
 
 	if p.mode == .Goto {
-		plat.text_draw(gfx, text, "type a line number, then Enter", x0 + 16, y0 + qh + 17, 14, {0.6, 0.64, 0.72, 1})
+		plat.text_draw(gfx, text, "type a line number, then Enter", x0 + 16, y0 + qh + 17, UI_PX, {0.6, 0.64, 0.72, 1})
 		return
 	}
 
@@ -192,11 +192,11 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 		r := p.results[i]
 		fg := [4]f32{0.95, 0.96, 0.99, 1} if i == p.selected else {0.80, 0.84, 0.90, 1}
 		if p.mode == .Commands {
-			plat.text_draw(gfx, text, command_table[r.cmd].title, x0 + 16, ry + 17, 15, fg)
+			plat.text_draw(gfx, text, command_table[r.cmd].title, x0 + 16, ry + 17, UI_PX, fg)
 			cat := command_table[r.cmd].category
-			plat.text_draw(gfx, text, cat, x0 + PW - 130, ry + 17, 12, {0.5, 0.54, 0.62, 1})
+			plat.text_draw(gfx, text, cat, x0 + PW - 130, ry + 17, UI_SMALL_PX, {0.5, 0.54, 0.62, 1})
 		} else if r.slot >= 0 && r.slot < len(app.docs) && app.docs[r.slot] != nil {
-			plat.text_draw(gfx, text, doc_display_name(app.docs[r.slot]), x0 + 16, ry + 17, 15, fg)
+			plat.text_draw(gfx, text, doc_display_name(app.docs[r.slot]), x0 + 16, ry + 17, UI_PX, fg)
 		}
 	}
 }

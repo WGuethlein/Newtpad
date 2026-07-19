@@ -23,6 +23,15 @@ VISIBLE_COLS :: 2048
 // --- shared screen layout (one home for the margins/spacing every pass used to
 // hardcode as 12 / 10 / 1.5) ---
 
+// Chrome text comes in exactly two sizes. Every distinct px is an independent
+// set of rasterized glyphs in the atlas, and glyph area grows with the square of
+// the DPI scale — six chrome sizes (15/17/14/13/12 plus the body's 16) meant six
+// copies of ASCII, which at 300% is most of a 1024^2 atlas before a single CJK
+// character. Two is also simply less to keep consistent.
+BASE_PX :: f32(16) // document text size at 96 DPI (scaled by dp())
+UI_PX :: f32(15) // chrome: menu/caption glyphs, palette rows, find bar
+UI_SMALL_PX :: f32(13) // secondary: tab labels, status bar, category labels
+
 TEXT_MARGIN_X :: f32(12) // left gutter before text (px)
 TEXT_MARGIN_Y :: f32(10) // top gutter above the first line (px)
 TAB_STRIP_H :: f32(36) // height of the custom title bar (tabs + window buttons)

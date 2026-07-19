@@ -182,6 +182,25 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			if !ok {bad += 1}
 			fmt.printfln("%5.2f  %3.0f  %6.0f  %7.3f  %6.2f  %6.0f  %s", scale, px, cw, raw, track, lh, "OK" if ok else "FAIL")
 		}
+		// Every scaled metric must stay >= 1px. A metric reaching 0 divides into
+		// +Inf downstream (rows, columns), and Odin's f32->int on Inf is poison —
+		// negative row counts indexing the visible-line iterator.
+		fmt.println("--- metric floors (thinnest values, incl. out-of-range DPI) ---")
+		zero_bad := 0
+		for dpi in ([]u32{0, 1, 48, 96, 120, 144, 240, 384, 960, 100000}) {
+			w: plat.Window
+			w.dpi = plat.clamp_dpi_for_test(dpi)
+			rc := Render_Ctx{window = &w, text = &t}
+			// TAB_GAP is the thinnest design value in the app at 1px.
+			gap := dp(&rc, TAB_GAP)
+			caret := dp(&rc, 2)
+			pxv := dp(&rc, BASE_PX)
+			ok := gap >= 1 && caret >= 1 && pxv >= 1 && w.dpi >= 96 && w.dpi <= 960
+			if !ok {zero_bad += 1}
+			fmt.printfln("  dpi %6d -> clamped %4d  scale %5.2f  gap %3.0f  caret %3.0f  px %3.0f  %s", dpi, w.dpi, plat.window_scale(&w), gap, caret, pxv, "OK" if ok else "FAIL")
+		}
+		fmt.printfln("metric floors: %d failures", zero_bad)
+
 		// The grid must be exactly linear: column n starts at n*cell_w.
 		cw := plat.text_char_width(&t, 16)
 		lin_ok := true

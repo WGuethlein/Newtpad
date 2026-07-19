@@ -1,4 +1,4 @@
-// Layer: program — wires the layers together and owns the frame loop. The main
+﻿// Layer: program â€” wires the layers together and owns the frame loop. The main
 // thread builds UI and handles input only: drain events, update the document,
 // draw the viewport, present. Headless argv test modes live in test_modes.odin.
 package main
@@ -24,7 +24,7 @@ main :: proc() {
 	// One instance per user: a second launch hands its file to the running window
 	// and exits, so only one process owns the session file and backups. If the
 	// hand-off fails (owner starting up or shutting down) we run normally rather
-	// than lose the file — see the primary check on session save below.
+	// than lose the file â€” see the primary check on session save below.
 	primary := plat.instance_claim()
 	if !primary && plat.instance_send_open(path) {
 		return
@@ -54,7 +54,7 @@ main :: proc() {
 
 	// Restore the session FIRST, then open any file from the command line as an
 	// extra tab. Opening a file used to skip the restore entirely, and the exit
-	// save then deleted every backup the (single-tab) session didn't reference —
+	// save then deleted every backup the (single-tab) session didn't reference â€”
 	// so launching Newtpad on a file destroyed unsaved scratch buffers. The
 	// single-instance hand-off already appends a tab rather than replacing the
 	// session, so this also makes both launch paths behave the same.
@@ -73,16 +73,18 @@ main :: proc() {
 	}
 	defer app_destroy(&app)
 
-	px: f32 = 16
-	line_h := line_height(px)
-	char_w := plat.text_char_width(&text, px)
-
 	// The renderer is reusable so the WM_SIZE handler can repaint live during a
 	// window resize (the OS runs a modal loop that otherwise freezes this one).
-	rc := Render_Ctx{&gfx, &text, &quad_pipe, &app, window, px, char_w, line_h}
+	rc := Render_Ctx{&gfx, &text, &quad_pipe, &app, window, 0, 0, 0}
+	metrics_recompute(&rc)
 	window.on_resize = on_resize
 	window.resize_user = &rc
-	window.titlebar_h = i32(TAB_STRIP_H) // valid before the first render (NC hit-test)
+	// Both callbacks take rc: a DPI change has to update the layout metrics and
+	// re-rasterize glyphs BEFORE the window resizes, because that resize sends a
+	// nested WM_SIZE which repaints through on_resize.
+	window.on_dpi = on_dpi
+	window.dpi_user = &rc
+	window.titlebar_h = i32(dp(&rc, TAB_STRIP_H)) // valid before the first render (NC hit-test)
 
 	// Debounced session autosave: save ~2s after input settles (crash safety).
 	session_dirty := false
@@ -91,6 +93,12 @@ main :: proc() {
 
 	for !window.should_close {
 		plat.window_pump_events(window)
+
+		// Re-read the layout metrics every frame: a DPI change rewrites them via
+		// on_dpi, and the whole frame -- hit-testing included -- must use the new
+		// values, not ones captured before the loop.
+		px, char_w, line_h := rc.px, rc.char_w, rc.line_h
+		window.dpi_changed = false
 
 		if window.char_count > 0 || window.key_count > 0 || window.mouse_pressed || window.mouse_middle_pressed {
 			session_dirty = true
@@ -120,7 +128,7 @@ main :: proc() {
 		doc := app_active(&app)
 		// Usable content width in cells (word wrap breaks here).
 		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - 18) / char_w))
-		// Re-center on the caret only when it actually moves on THIS tab — never
+		// Re-center on the caret only when it actually moves on THIS tab â€” never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
 		active_before := app.active
 		cursor_before := doc.cursor
@@ -272,7 +280,7 @@ Render_Ctx :: struct {
 	px, char_w, line_h: f32,
 }
 
-// Draw one frame from current state. No input handling — safe to call from the
+// Draw one frame from current state. No input handling â€” safe to call from the
 // main loop or the WM_SIZE handler. vsync=false (resize) presents immediately so
 // clustered WM_SIZE repaints don't each stall on vsync.
 render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
@@ -344,11 +352,11 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		mode := "regex" if f.regex else "text"
 		fline := fmt.tprintf("Find [%s]%s: %s%s%s", mode, " filter" if doc.filter else "", string(f.query[:]), " _" if f.field == 0 else "", info)
 		if f.replace_mode {
-			plat.text_draw(gfx, text, fline, 12, h - 30, 14, {0.95, 0.88, 0.55, 1})
+			plat.text_draw(gfx, text, fline, 12, h - 30, UI_PX, {0.95, 0.88, 0.55, 1})
 			rline := fmt.tprintf("Replace: %s%s", string(f.replace[:]), " _" if f.field == 1 else "")
-			plat.text_draw(gfx, text, rline, 12, h - 8, 14, {0.82, 0.9, 0.98, 1})
+			plat.text_draw(gfx, text, rline, 12, h - 8, UI_PX, {0.82, 0.9, 0.98, 1})
 		} else {
-			plat.text_draw(gfx, text, fline, 12, h - 8, 14, {0.95, 0.88, 0.55, 1})
+			plat.text_draw(gfx, text, fline, 12, h - 8, UI_PX, {0.95, 0.88, 0.55, 1})
 		}
 	} else {
 		ln := doc_cursor_line(doc)
@@ -357,10 +365,40 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		indexing := "" if doc_index_done(doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(doc) * 100)
 		status := fmt.tprintf("%s    %s    %d lines%s%s%s%s", lncol, enc_name(doc.enc), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, indexing)
 		col := [4]f32{0.95, 0.55, 0.35, 1} if doc.recovered else {0.55, 0.60, 0.70, 1}
-		plat.text_draw(gfx, text, status, 12, h - 8, 13, col)
+		plat.text_draw(gfx, text, status, 12, h - 8, UI_SMALL_PX, col)
 	}
 
 	plat.gfx_end_frame(gfx, 1 if vsync else 0)
+}
+
+// Scale a 96-DPI design value to this window's DPI. Never returns 0 for a
+// positive input: a metric collapsing to zero divides into +Inf downstream
+// (rows, columns), and Odin's f32->int on Inf is poison.
+dp :: proc(rc: ^Render_Ctx, v: f32) -> f32 {
+	s := plat.window_scale(rc.window)
+	r := f32(int(v * s + 0.5))
+	return max(1, r) if v > 0 else r
+}
+
+// Recompute everything derived from the window's DPI. px is rounded so it stays
+// an exact key into the glyph cache (Glyph_Key.px is u16) and so char_w/line_h,
+// which round off it, land on whole pixels.
+metrics_recompute :: proc(rc: ^Render_Ctx) {
+	rc.px = dp(rc, BASE_PX)
+	rc.line_h = line_height(rc.px)
+	rc.char_w = plat.text_char_width(rc.text, rc.px)
+}
+
+// WM_DPICHANGED calls this, before the window is resized. Glyphs cached at the
+// old pixel size are wrong at the new one and would also hold atlas space the
+// new size needs, so the atlas is dropped wholesale; the viewport-first rule
+// bounds what gets re-rasterized to roughly the visible glyph set.
+on_dpi :: proc "contextless" (user: rawptr) {
+	context = runtime.default_context()
+	rc := (^Render_Ctx)(user)
+	metrics_recompute(rc)
+	plat.text_reset_atlas(rc.text)
+	rc.window.titlebar_h = i32(dp(rc, TAB_STRIP_H))
 }
 
 // WM_SIZE calls this so the content re-renders live during a resize. It runs from
