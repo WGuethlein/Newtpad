@@ -255,3 +255,21 @@ title bar, draggable scrollbar); (e) editor polish (reindex-on-edit for exact li
 scrollbar; per-word undo coalescing; goal-column for up/down; horizontal scroll for long
 lines). Wyatt confirmed live: open/save/undo/mouse-select work; keep giving new features a
 quick live pass.
+
+**UPDATE - the (a)/(b)/(c) above are all DONE (2026-07-18):**
+- (a) Find follow-ups: Replace + regex (Ctrl+H / Ctrl+R, via `core:text/regex`) and
+  filter-to-matching-lines (Ctrl+L). See `find.odin`.
+- (b) The linear piece list is now a balanced piece TREE - an implicit treap keyed by byte
+  position (O(log n), kills the O(n^2) scattered-edit cost). A treap not red-black (Wyatt's
+  call): same asymptotics, far less code/bug-risk. Undo clones the tree. All base tests +
+  edittest/seltest pass unchanged. See `base/piecetable.odin`.
+- (c) Per-codepoint font fallback (`text.odin`): primary Consolas + fallbacks (Segoe UI Symbol,
+  Microsoft YaHei CJK, Segoe UI); atlas keyed by (face,glyph,size). Screenshot-verified
+  Latin/Cyrillic/Greek/CJK/accents/symbols all render.
+
+**Remaining next options:** complex-script SHAPING (Arabic/Indic/ligatures via
+`IDWriteTextAnalyzer` - the chosen follow-up); color EMOJI (needs a color-glyph path); caret/
+hit-test still assume a monospace column (mixed-width lines place the caret approximately - real
+fix needs per-glyph x positions); UI chrome (tabs, filename in title bar, draggable scrollbar);
+editor polish (reindex-on-edit, per-word undo coalescing, goal-column for up/down, horizontal
+scroll); background/incremental find+regex for huge files; group substitution ($1) in replace.
