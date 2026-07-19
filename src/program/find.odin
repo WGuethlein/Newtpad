@@ -221,29 +221,28 @@ find_match_rects :: proc(doc: ^Document, px, char_w: f32, rows: int, out: []plat
 	if !f.active || len(f.matches) == 0 {
 		return 0
 	}
-	x0: f32 = 12
-	line_h := px * 1.5
-	y0 := px + 10
 	col := [4]f32{0.42, 0.38, 0.16, 1} // muted amber
+	lh := line_height(px)
 
 	mi := 0
 	for mi < len(f.matches) && f.matches[mi] < doc.top {mi += 1}
 
-	pos, n := doc.top, 0
-	for r in 0 ..< rows {
-		if pos > doc.pt.length {break}
-		end := base.pt_line_end(&doc.pt, pos)
+	it := visible_begin(doc, rows)
+	n := 0
+	for n < len(out) {
+		row, start, end, ok := visible_next(&it)
+		if !ok {break}
+		ry := row_rect_y(px, row)
 		for mi < len(f.matches) && f.matches[mi] <= end && n < len(out) {
 			m := f.matches[mi]
-			sx := x0 + f32(m - pos) * char_w
-			ex := x0 + f32(min(m + f.match_len[mi], end) - pos) * char_w
-			ry := y0 + f32(r) * line_h - px
-			out[n] = {pos = {sx, ry}, size = {max(ex - sx, 2), line_h}, color = col}
+			startcol := min(max(m, start) - start, VISIBLE_COLS) // clip to drawn extent
+			endcol := min(min(m + f.match_len[mi], end) - start, VISIBLE_COLS)
+			sx := col_x(char_w, startcol)
+			ex := col_x(char_w, endcol)
+			out[n] = {pos = {sx, ry}, size = {max(ex - sx, 2), lh}, color = col}
 			n += 1
 			mi += 1
 		}
-		if end >= doc.pt.length {break}
-		pos = end + 1
 	}
 	return n
 }

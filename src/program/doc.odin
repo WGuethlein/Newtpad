@@ -2,7 +2,8 @@
 // (immutable) original bytes, a caret, undo/redo via piece snapshots, and a
 // background line index over the original for the scrollbar. The viewport reads
 // through the piece table on demand, so it stays instant regardless of size.
-// Save is a separate milestone; edits live in memory.
+// Every screen pass shares one capped line iterator (visible_begin/next) and the
+// layout helpers below, so geometry stays consistent and bounded.
 package main
 
 import "base:intrinsics"
@@ -14,6 +15,68 @@ import plat "src:platform"
 
 // Max bytes scanned per visible line for its end (bounds per-frame work).
 RENDER_LINE_CAP :: 8192
+// Max columns any screen pass computes geometry for; caret/selection/text are
+// all clipped to this so a long line can't produce off-screen quads or place the
+// caret past the rendered glyphs. Real horizontal scroll is a later feature.
+VISIBLE_COLS :: 2048
+
+// --- shared screen layout (one home for the margins/spacing every pass used to
+// hardcode as 12 / 10 / 1.5) ---
+
+TEXT_MARGIN_X :: f32(12) // left gutter before text (px)
+TEXT_MARGIN_Y :: f32(10) // top gutter above the first line (px)
+LINE_SPACING :: f32(1.5) // line height = font px * this
+
+line_height :: #force_inline proc(px: f32) -> f32 {return px * LINE_SPACING}
+// Text baseline y for visible row r (what text_draw wants).
+row_baseline_y :: #force_inline proc(px: f32, r: int) -> f32 {return px + TEXT_MARGIN_Y + f32(r) * line_height(px)}
+// Top y of a line-height-tall highlight box for row r.
+row_rect_y :: #force_inline proc(px: f32, r: int) -> f32 {return TEXT_MARGIN_Y + f32(r) * line_height(px)}
+// Left x of column `col` (monospace).
+col_x :: #force_inline proc(char_w: f32, col: int) -> f32 {return TEXT_MARGIN_X + f32(col) * char_w}
+// Inverse mappings for hit-testing a client-space pixel.
+row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - TEXT_MARGIN_Y) / line_height(px))}
+col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return max(0, int((mx - TEXT_MARGIN_X) / char_w + 0.5))}
+
+// Walks the visible lines (filter view or consecutive) yielding each row's
+// [start, end) byte range, with `end` capped to RENDER_LINE_CAP so no screen
+// pass ever scans a pathological long line. Every pass (draw, selection, find
+// highlights) shares this so they agree on geometry and stay bounded.
+Visible_Iter :: struct {
+	doc:  ^Document,
+	rows: int,
+	r:    int,
+	pos:  int,
+	done: bool,
+}
+
+visible_begin :: proc(doc: ^Document, rows: int) -> Visible_Iter {
+	return {doc = doc, rows = rows, pos = doc.top}
+}
+
+visible_next :: proc(it: ^Visible_Iter) -> (row, start, end: int, ok: bool) {
+	if it.done || it.r >= it.rows {return}
+	d := it.doc
+	if d.filter {
+		fi := d.filter_top + it.r
+		if fi >= len(d.filter_lines) {return}
+		start = d.filter_lines[fi]
+		end = base.pt_line_end_cap(&d.pt, start, RENDER_LINE_CAP)
+	} else {
+		if it.pos > d.pt.length {return}
+		start = it.pos
+		end = base.pt_line_end_cap(&d.pt, start, RENDER_LINE_CAP)
+		if end >= d.pt.length {
+			it.done = true // last line: yield it, then stop
+		} else {
+			it.pos = end + 1
+		}
+	}
+	row = it.r
+	it.r += 1
+	ok = true
+	return
+}
 
 // Background job that counts total lines over the immutable original bytes (no
 // race with edits, which only touch the add arena). The status bar shows this
@@ -529,19 +592,19 @@ doc_select_line_at :: proc(doc: ^Document, pos: int) {
 
 // Byte offset under a client-space pixel (monospace column mapping).
 doc_pos_at :: proc(doc: ^Document, mx, my: i32, px, char_w: f32, rows: int) -> int {
-	line_h := px * 1.5
-	row := int((f32(my) - 10) / line_h) // rows start at y=10 (see doc_draw)
-	row = clamp(row, 0, rows - 1)
-	pos := doc.top
-	for _ in 0 ..< row {
-		nt := base.pt_next_line_start(&doc.pt, pos)
-		if nt == pos {break}
-		pos = nt
+	target := clamp(row_at_y(px, f32(my)), 0, rows - 1)
+	col := col_at_x(char_w, f32(mx))
+	it := visible_begin(doc, rows)
+	last_start, last_end := doc.top, doc.top
+	for {
+		row, start, end, ok := visible_next(&it)
+		if !ok {break}
+		last_start, last_end = start, end
+		if row == target {
+			return min(start + col, end)
+		}
 	}
-	end := base.pt_line_end(&doc.pt, pos)
-	col := int((f32(mx) - 12) / char_w + 0.5)
-	if col < 0 {col = 0}
-	return min(pos + col, end)
+	return min(last_start + col, last_end) // click below the last line -> its end
 }
 
 // Selection highlight rectangles for the visible lines (opaque; drawn behind
@@ -549,27 +612,22 @@ doc_pos_at :: proc(doc: ^Document, mx, my: i32, px, char_w: f32, rows: int) -> i
 doc_selection_rects :: proc(doc: ^Document, px, char_w: f32, rows: int, out: []plat.Quad) -> int {
 	lo, hi := doc_sel_range(doc)
 	if lo == hi {return 0}
-	x0: f32 = 12
-	line_h := px * 1.5
-	y0 := px + 10
 	col := [4]f32{0.20, 0.30, 0.48, 1}
-
-	pos, n := doc.top, 0
-	for r in 0 ..< rows {
-		if pos > doc.pt.length {break}
-		end := base.pt_line_end(&doc.pt, pos)
-		if lo <= end && hi > pos && n < len(out) { // selection overlaps [pos, end]
-			startcol := max(pos, lo) - pos
-			endcol := min(end, hi) - pos
-			sx := x0 + f32(startcol) * char_w
-			ex := x0 + f32(endcol) * char_w
-			if hi > end {ex += char_w * 0.4} // selection continues past EOL: show the newline
-			ry := y0 + f32(r) * line_h - px
-			out[n] = {pos = {sx, ry}, size = {max(ex - sx, 2), line_h}, color = col}
+	lh := line_height(px)
+	it := visible_begin(doc, rows)
+	n := 0
+	for n < len(out) {
+		row, start, end, ok := visible_next(&it)
+		if !ok {break}
+		if lo <= end && hi > start { // selection overlaps [start, end]
+			startcol := min(max(start, lo) - start, VISIBLE_COLS) // clip to drawn extent
+			endcol := min(min(end, hi) - start, VISIBLE_COLS)
+			sx := col_x(char_w, startcol)
+			ex := col_x(char_w, endcol)
+			if hi > end {ex += char_w * 0.4} // continues past EOL: hint the newline
+			out[n] = {pos = {sx, row_rect_y(px, row)}, size = {max(ex - sx, 2), lh}, color = col}
 			n += 1
 		}
-		if end >= doc.pt.length {break}
-		pos = end + 1
 	}
 	return n
 }
@@ -613,48 +671,31 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, rows: int) {
 // offset just past the last visible line (for the scrollbar).
 doc_draw :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, px, char_w: f32, rows: int) -> (cx, cy: f32, caret: bool, bottom: int) {
 	fg := [4]f32{0.86, 0.90, 0.96, 1}
-	x0: f32 = 12
-	line_h := px * 1.5
-	y0 := px + 10
-
-	line_buf: [2048]u8
-	pos := doc.top // consecutive-line cursor (non-filter mode)
+	// A line longer than the cap renders as successive capped rows and columns
+	// past VISIBLE_COLS aren't drawn (crude long-line handling; proper horizontal
+	// scroll is a follow-up).
+	line_buf: [VISIBLE_COLS]u8
 	bottom = doc.top
-	for r in 0 ..< rows {
-		start: int
-		if doc.filter {
-			fi := doc.filter_top + r
-			if fi >= len(doc.filter_lines) {break}
-			start = doc.filter_lines[fi]
-		} else {
-			if pos > doc.pt.length {break}
-			start = pos
-		}
-		// Capped so a multi-GB single-line file doesn't scan gigabytes per frame.
-		// A line longer than the cap renders as successive capped rows (crude
-		// long-line handling; proper horizontal scroll is a follow-up).
-		end := base.pt_line_end_cap(&doc.pt, start, RENDER_LINE_CAP)
+	it := visible_begin(doc, rows)
+	for {
+		row, start, end, ok := visible_next(&it)
+		if !ok {break}
 		bottom = end
-		row_y := y0 + f32(r) * line_h
+		row_y := row_baseline_y(px, row)
 
 		draw_len := min(end - start, len(line_buf))
 		n := base.pt_read(&doc.pt, start, line_buf[:draw_len])
 		vis := n
 		if vis > 0 && line_buf[vis - 1] == '\r' {vis -= 1}
 		if vis > 0 {
-			plat.text_draw(gfx, t, string(line_buf[:vis]), x0, row_y, px, fg)
+			plat.text_draw(gfx, t, string(line_buf[:vis]), col_x(char_w, 0), row_y, px, fg)
 		}
 
 		if doc.cursor >= start && doc.cursor <= end {
-			cx = x0 + f32(doc.cursor - start) * char_w
+			cx = col_x(char_w, min(doc.cursor - start, len(line_buf))) // clip caret to drawn extent
 			cy = row_y
 			caret = true
 		}
-		if doc.filter {
-			continue
-		}
-		if end >= doc.pt.length {break}
-		pos = end + 1
 	}
 	return
 }
