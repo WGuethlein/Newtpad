@@ -40,6 +40,7 @@ Piece_Table :: struct {
 	add_used:   int, // bytes used in the last chunk (only the last is ever written)
 	root:       ^Node,
 	length:     int,
+	fault:      bool, // a read out of `original` faulted (see pt_take_fault)
 }
 
 // Copy hook for reads out of the immutable `original`. Defaults to a plain copy;
@@ -57,15 +58,20 @@ default_copy :: proc(dst, src: []u8) -> bool {
 	return true
 }
 
-// Set when a read from `original` faulted; the document polls this once per frame
-// (pt_take_fault) and detaches from the mapping. Written only by the main thread
-// (read_rec); the index worker tracks its own fault flag.
-@(private = "file")
-orig_fault: bool
-
-pt_take_fault :: proc() -> bool {
-	f := orig_fault
-	orig_fault = false
+// Set on the Piece_Table whose read faulted; the owning document polls it once
+// per frame (pt_take_fault) and detaches from the mapping.
+//
+// This is per-table, not global: each document has its own `original`, and a
+// worker reading a pt_view gets the flag on its own copy of the struct. A global
+// would let one document's fault trigger recovery on whichever document happened
+// to be active — unmapping a file that never faulted and marking it modified,
+// while the real fault went unnoticed.
+//
+// Only ever touched by the one thread reading that table, so it needs no atomic;
+// a worker mirrors it into its own atomic flag for the main thread to observe.
+pt_take_fault :: proc(pt: ^Piece_Table) -> bool {
+	f := pt.fault
+	pt.fault = false
 	return f
 }
 
@@ -235,7 +241,7 @@ read_rec :: proc(pt: ^Piece_Table, t: ^Node, pos: int, dst: []u8, d: ^int) {
 		if t.piece.from_add {
 			copy(dsub, ssub)
 		} else if !safe_copy(dsub, ssub) {
-			orig_fault = true // read faulted on the mapped original
+			pt.fault = true // read faulted on the mapped original
 		}
 		d^ += take
 	}

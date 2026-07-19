@@ -376,8 +376,10 @@ doc_recover_from_fault :: proc(doc: ^Document) {
 }
 
 // True if a mapped read faulted on either the main thread or the index worker.
+// The buffer flag is this document's own, so a fault on a background tab no
+// longer recovers whichever document happens to be active.
 doc_fault_pending :: proc(doc: ^Document) -> bool {
-	return base.pt_take_fault() || intrinsics.atomic_load(&doc.idx.fault)
+	return base.pt_take_fault(&doc.pt) || intrinsics.atomic_load(&doc.idx.fault)
 }
 
 // Save the buffer to `path`, re-encoded to the file's original encoding
