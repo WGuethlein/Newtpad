@@ -239,9 +239,19 @@ round-trip.
 The Save dialog also got Text/JSON/Markdown/Log/All filters + default `.txt`; the no-file
 crash was fixed (opens a scratch buffer). Wyatt confirmed live: open/save/undo work.
 
-**Next options:** (a) find / filter-as-you-type (V1 headline; benchmark proved search is
-viable); (b) the RB piece tree (scale / multi-cursor); (c) shaping + font fallback
-(multilingual); (d) UI chrome (tabs, filename in title bar, draggable scrollbar); (e) polish
-(reindex-on-edit so line count/scrollbar stay exact; per-word undo coalescing; goal-column for
-up/down; horizontal scroll for long lines). Interactive paths are headless-verified but a live
-pass (type, select with mouse+shift, Ctrl+C/V, Ctrl+Z) is always worth it.
+**FIND DONE (2026-07-18).** Ctrl+F opens a find bar (`src/program/find.odin`; seeded with the
+selection). Typing filters live: all matches highlight (dim amber, `find_match_rects`), the
+nearest is selected + scrolled to; Enter / Shift+Enter cycle next/prev (wrapping), Esc closes.
+Case-insensitive literal substring, scanned through the piece table in overlapping chunks (no
+full materialization; a background search for huge files is a follow-up). When `doc.find.active`,
+char/Backspace/Enter/Esc route to the query instead of the doc. Verified headless
+(`findtest`): case-insensitive offsets, overlapping matches, next/prev wrap, no-match. Also
+fixed the double/triple-click bug (held-button drag was collapsing the word/line selection).
+
+**Next options:** (a) find polish — regex (locked V1; needs an engine decision), Replace, and
+filter-to-matching-lines (the log feature, reuses this search); (b) RB piece tree (scale /
+multi-cursor); (c) shaping + font fallback (multilingual); (d) UI chrome (tabs, filename in
+title bar, draggable scrollbar); (e) editor polish (reindex-on-edit for exact line count/
+scrollbar; per-word undo coalescing; goal-column for up/down; horizontal scroll for long
+lines). Wyatt confirmed live: open/save/undo/mouse-select work; keep giving new features a
+quick live pass.
