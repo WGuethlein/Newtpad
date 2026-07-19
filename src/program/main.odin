@@ -52,14 +52,24 @@ main :: proc() {
 
 	session_sweep_tmp() // clear orphan atomic-write temp files from a prior crash
 
+	// Restore the session FIRST, then open any file from the command line as an
+	// extra tab. Opening a file used to skip the restore entirely, and the exit
+	// save then deleted every backup the (single-tab) session didn't reference —
+	// so launching Newtpad on a file destroyed unsaved scratch buffers. The
+	// single-instance hand-off already appends a tab rather than replacing the
+	// session, so this also makes both launch paths behave the same.
 	app: App
+	had_session := primary && session_exists()
+	restored := primary && session_restore(&app)
+	// A session we couldn't load still owns its backups; don't sweep them.
+	session_can_sweep := !had_session || restored
 	if path != "" {
 		if !app_open_path(&app, path) {
-			fmt.eprintfln("Newtpad: could not open %q; starting empty", path)
-			app_new_scratch(&app)
+			fmt.eprintfln("Newtpad: could not open %q", path)
 		}
-	} else if !(primary && session_restore(&app)) { // bare launch: restore last session
-		app_new_scratch(&app) // a non-primary fallback never touches the session
+	}
+	if app_live_count(&app) == 0 {
+		app_new_scratch(&app) // never fail to a closed window
 	}
 	defer app_destroy(&app)
 
@@ -240,14 +250,14 @@ main :: proc() {
 
 		// Autosave the session once input has settled (primary instance only).
 		if primary && session_dirty && time.duration_seconds(time.tick_since(last_input)) > 2 {
-			session_save(&app)
+			session_save(&app, session_can_sweep)
 			session_dirty = false
 		}
 		free_all(context.temp_allocator)
 	}
 
 	if primary {
-		session_save(&app) // hot-exit: persist tabs + unsaved buffers on window close
+		session_save(&app, session_can_sweep) // hot-exit: persist tabs + unsaved buffers
 	}
 }
 

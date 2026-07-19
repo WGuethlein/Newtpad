@@ -37,7 +37,15 @@ pint :: proc(s: string) -> int {
 
 // %APPDATA%\Newtpad, created if missing. temp-allocated.
 @(private = "file")
+// NEWTPAD_SESSION_DIR redirects the session store. Headless tests set it so they
+// exercise save/restore against a temp dir instead of stomping the real session
+// — these tests write backups and reset the session, which is destructive to a
+// daily driver's unsaved tabs.
 session_dir :: proc() -> (dir: string, ok: bool) {
+	if over := os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator); over != "" {
+		os.make_directory(over)
+		return over, true
+	}
 	appdata := os.get_env("APPDATA", context.temp_allocator)
 	if appdata == "" {
 		return "", false
@@ -68,7 +76,22 @@ session_sweep_tmp :: proc() {
 
 // Persist the open tabs + view state, backing up unsaved/untitled buffers. Skips
 // the empty scratch buffer. Safe to call on exit or periodically.
-session_save :: proc(a: ^App) -> bool {
+// True if a previous session file exists. Used to tell "first ever run" apart
+// from "a session is there but we failed to load it" — in the second case the
+// backups on disk belong to tabs we never adopted, and sweeping them would
+// destroy unsaved work.
+session_exists :: proc() -> bool {
+	dir, ok := session_dir()
+	if !ok {
+		return false
+	}
+	return os.exists(pjoin({dir, "session.txt"}))
+}
+
+// `sweep_backups` deletes backup files the new session doesn't reference. Only
+// safe when this process actually owns the previous session's tabs; pass false
+// when a session existed but could not be restored.
+session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 	dir, ok := session_dir()
 	if !ok {
 		return false
@@ -104,8 +127,10 @@ session_save :: proc(a: ^App) -> bool {
 		return false
 	}
 	// session.txt now points only at backups we just wrote; delete the rest.
-	for i in 0 ..< MAX_SESSION_TABS {
-		if !used[i] {os.remove(backup_path(backups, i))}
+	if sweep_backups {
+		for i in 0 ..< MAX_SESSION_TABS {
+			if !used[i] {os.remove(backup_path(backups, i))}
+		}
 	}
 	return true
 }

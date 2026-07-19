@@ -210,6 +210,50 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad sessionlosstest <file>` — launching on a file used to skip session
+	// restore, and the exit save then deleted every backup the resulting one-tab
+	// session didn't reference, destroying unsaved scratch buffers. Set
+	// NEWTPAD_SESSION_DIR to a temp dir before running.
+	if os.args[1] == "sessionlosstest" && len(os.args) > 2 {
+		file := os.args[2]
+		SCRATCH :: "precious unsaved work"
+
+		// A prior session with one dirty, untitled scratch tab.
+		a: App
+		content := make([]u8, len(SCRATCH));copy(content, SCRATCH)
+		d := new(Document);d^ = doc_from_content(content, "", .UTF8)
+		app_add(&a, d)
+		session_save(&a)
+		app_destroy(&a)
+		fmt.printfln("saved prior session: 1 dirty scratch tab")
+
+		// Now "launch with a file argument", the way main does. Pass "old" to
+		// reproduce the pre-fix path (skip restore entirely) and confirm this
+		// test actually detects the data loss.
+		old_behavior := len(os.args) > 3 && os.args[3] == "old"
+		b: App
+		had := session_exists()
+		restored := !old_behavior && session_restore(&b)
+		can_sweep := old_behavior || !had || restored
+		if !app_open_path(&b, file) {fmt.println("  (could not open file arg)")}
+		if app_live_count(&b) == 0 {app_new_scratch(&b)}
+		fmt.printfln("launch w/ file: had_session=%v restored=%v tabs=%d sweep=%v", had, restored, app_live_count(&b), can_sweep)
+		session_save(&b, can_sweep)
+		app_destroy(&b)
+
+		// Relaunch bare: the scratch buffer must still be there.
+		c: App
+		session_restore(&c)
+		found := false
+		for dd in c.docs {
+			if dd == nil {continue}
+			if dd.path == "" && doc_debug_string(dd) == SCRATCH {found = true}
+		}
+		fmt.printfln("after relaunch: tabs=%d scratch survived=%v  %s", app_live_count(&c), found, "OK" if found else "FAIL - unsaved work destroyed")
+		app_destroy(&c)
+		return true
+	}
+
 	// `newtpad palettetest` exercises the command palette's fuzzy match + modes.
 	if os.args[1] == "palettetest" {
 		a: App
