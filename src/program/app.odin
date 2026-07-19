@@ -16,6 +16,9 @@ App :: struct {
 	mru:        [dynamic]int, // live slots, most-recently-active first
 	tab_scroll: f32, // horizontal scroll of the tab strip (overflow)
 	menu:       Menu_State,
+	settings:      Settings,
+	settings_open: bool,
+	settings_row:  int,
 	palette:    Palette, // command palette overlay (Ctrl+P)
 }
 
@@ -70,6 +73,7 @@ app_activate :: proc(a: ^App, slot: int) {
 app_new_scratch :: proc(a: ^App) {
 	d := new(Document)
 	d^ = doc_new()
+	d.wrap = a.settings.wrap_default
 	app_activate(a, app_add(a, d))
 }
 

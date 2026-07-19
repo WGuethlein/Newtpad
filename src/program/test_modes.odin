@@ -153,6 +153,44 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad settingstest` round-trips settings.txt and checks the defaults and
+	// clamps. Set NEWTPAD_SESSION_DIR first — it writes to the session store.
+	if os.args[1] == "settingstest" {
+		bad := 0
+		d := settings_default()
+		fmt.printfln("defaults: restore=%v wrap=%v font=%d", d.restore_session, d.wrap_default, d.font_size)
+		if !d.restore_session {
+			fmt.println("  FAIL restore should default on")
+			bad += 1
+		}
+
+		// Round-trip non-default values.
+		w := Settings{restore_session = false, wrap_default = true, font_size = 22}
+		settings_save(w)
+		r := settings_load()
+		ok := r == w
+		fmt.printfln("round-trip: restore=%v wrap=%v font=%d  %s", r.restore_session, r.wrap_default, r.font_size, "OK" if ok else "FAIL")
+		if !ok {bad += 1}
+
+		// An out-of-range font size on disk must clamp, not propagate.
+		settings_save(Settings{restore_session = true, font_size = 9999})
+		c := settings_load()
+		cok := c.font_size <= FONT_SIZE_MAX && c.font_size >= FONT_SIZE_MIN
+		fmt.printfln("clamp 9999 -> %d  %s", c.font_size, "OK" if cok else "FAIL")
+		if !cok {bad += 1}
+
+		// A missing file must give defaults rather than zeroes (font_size 0 would
+		// divide into the cell grid).
+		if p, pok := session_dir(); pok {os.remove(fmt.tprintf("%s%csettings.txt", p, '\\'))}
+		m := settings_load()
+		mok := m == settings_default() && m.font_size > 0
+		fmt.printfln("missing file -> defaults (font=%d)  %s", m.font_size, "OK" if mok else "FAIL")
+		if !mok {bad += 1}
+
+		fmt.printfln("settingstest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad menutest` covers the menu model and keyboard navigation: that every
 	// item names a real command, that mnemonics are unique and don't collide with
 	// an explicit Alt binding, that navigation skips separators and disabled rows,

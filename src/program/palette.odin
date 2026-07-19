@@ -94,6 +94,8 @@ command_in_palette :: proc(cmd: Command_Id) -> bool {
 	     .Find_Filter_Page_Up, .Find_Filter_Page_Down,
 	     // Menu navigation verbs are plumbing, not commands a user runs.
 	     .Menu_Close, .Menu_Next, .Menu_Prev, .Menu_Item_Next, .Menu_Item_Prev, .Menu_Activate,
+	     // Settings navigation likewise. Settings_Open stays — a real destination.
+	     .Settings_Close, .Settings_Next, .Settings_Prev, .Settings_Toggle, .Settings_Inc, .Settings_Dec,
 	     // Filter_Open supersedes it here: same key, but it opens find first
 	     // instead of silently toggling a mode with no visible UI.
 	     .Find_Toggle_Filter:

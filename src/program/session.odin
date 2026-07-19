@@ -36,11 +36,12 @@ pint :: proc(s: string) -> int {
 }
 
 // %APPDATA%\Newtpad, created if missing. temp-allocated.
-@(private = "file")
+//
 // NEWTPAD_SESSION_DIR redirects the session store. Headless tests set it so they
 // exercise save/restore against a temp dir instead of stomping the real session
 // — these tests write backups and reset the session, which is destructive to a
 // daily driver's unsaved tabs.
+// Also used by settings.odin, which stores settings.txt alongside session.txt.
 session_dir :: proc() -> (dir: string, ok: bool) {
 	if over := os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator); over != "" {
 		os.make_directory(over)

@@ -18,6 +18,7 @@ Ctx :: enum u8 {
 	Find,
 	Palette,
 	Menu,
+	Settings,
 }
 
 Command_Id :: enum u8 {
@@ -75,6 +76,14 @@ Command_Id :: enum u8 {
 	Menu_Item_Next,
 	Menu_Item_Prev,
 	Menu_Activate,
+	// settings page
+	Settings_Open,
+	Settings_Close,
+	Settings_Next,
+	Settings_Prev,
+	Settings_Toggle,
+	Settings_Inc,
+	Settings_Dec,
 	// find mode
 	Find_Close,
 	Find_Backspace,
@@ -147,6 +156,13 @@ command_table := [Command_Id]Command {
 	.Menu_Item_Next           = {"Menu: Next Item", "View"},
 	.Menu_Item_Prev           = {"Menu: Previous Item", "View"},
 	.Menu_Activate            = {"Menu: Activate Item", "View"},
+	.Settings_Open            = {"Settings", "View"},
+	.Settings_Close           = {"Settings: Close", "View"},
+	.Settings_Next            = {"Settings: Next", "View"},
+	.Settings_Prev            = {"Settings: Previous", "View"},
+	.Settings_Toggle          = {"Settings: Toggle", "View"},
+	.Settings_Inc             = {"Settings: Increase", "View"},
+	.Settings_Dec             = {"Settings: Decrease", "View"},
 	.Find_Close               = {"Close Find", "Search"},
 	.Find_Backspace           = {"Find: Delete Backward", "Search"},
 	.Find_Confirm             = {"Find: Confirm", "Search"},
@@ -217,6 +233,13 @@ default_bindings := []Binding {
 	{.Tab, true, false, .Editor, .Tab_Next}, // Ctrl+Tab (Shift -> previous, in the action)
 	{.Page_Up, true, false, .Editor, .Tab_Prev},
 	{.Page_Down, true, false, .Editor, .Tab_Next},
+	// --- settings context ---
+	{.Escape, false, false, .Settings, .Settings_Close},
+	{.Down, false, false, .Settings, .Settings_Next},
+	{.Up, false, false, .Settings, .Settings_Prev},
+	{.Enter, false, false, .Settings, .Settings_Toggle},
+	{.Right, false, false, .Settings, .Settings_Inc},
+	{.Left, false, false, .Settings, .Settings_Dec},
 	// --- menu context ---
 	{.Escape, false, false, .Menu, .Menu_Close},
 	{.Left, false, false, .Menu, .Menu_Prev},
@@ -533,6 +556,25 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		} else {
 			app.menu.item = menu_step(app, app.menu.open, app.menu.item + d, d)
 		}
+	// --- settings page ---
+	case .Settings_Open:
+		menu_close(app)
+		app.settings_open = true
+		app.settings_row = 0
+	case .Settings_Close:
+		app.settings_open = false
+	case .Settings_Next:
+		app.settings_row = min(app.settings_row + 1, settings_row_count() - 1)
+	case .Settings_Prev:
+		app.settings_row = max(app.settings_row - 1, 0)
+	case .Settings_Toggle, .Settings_Inc, .Settings_Dec:
+		if rc := active_render_ctx; rc != nil {
+			d := 0
+			if cmd == .Settings_Inc {d = 1}
+			if cmd == .Settings_Dec {d = -1}
+			settings_toggle_row(rc, app.settings_row, d)
+		}
+
 	case .Menu_Activate:
 		if app.menu.open >= 0 && app.menu.item >= 0 {
 			it := menus[app.menu.open].items[app.menu.item]

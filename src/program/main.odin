@@ -60,8 +60,12 @@ main :: proc() {
 	// session, so this also makes both launch paths behave the same.
 	app: App
 	menu_init(&app.menu) // before any frame: the zero value means "File is open"
+	app.settings = settings_load()
 	had_session := primary && session_exists()
-	restored := primary && session_restore(&app)
+	// Restore is opt-out. Note the sweep guard below still protects the backups
+	// when it is off: they belong to tabs we chose not to adopt, so turning
+	// restore off hides the old session rather than destroying it.
+	restored := primary && app.settings.restore_session && session_restore(&app)
 	// A session we couldn't load still owns its backups; don't sweep them.
 	session_can_sweep := !had_session || restored
 	if path != "" {
@@ -77,6 +81,8 @@ main :: proc() {
 	// The renderer is reusable so the WM_SIZE handler can repaint live during a
 	// window resize (the OS runs a modal loop that otherwise freezes this one).
 	rc := Render_Ctx{&gfx, &text, &quad_pipe, &app, window, 0, 0, 0}
+	active_render_ctx = &rc
+	BASE_PX = f32(clamp(app.settings.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX))
 	metrics_recompute(&rc)
 	window.on_resize = on_resize
 	window.resize_user = &rc
@@ -139,7 +145,9 @@ main :: proc() {
 		// Drain input once per frame: typed characters route to the find field or
 		// the document; key chords resolve to a command in the active context.
 		for i in 0 ..< window.char_count {
-			if app.palette.active {
+			if app.settings_open {
+				// the settings page has no text fields; swallow typing
+			} else if app.palette.active {
 				palette_input_rune(&app, window.chars[i])
 			} else if doc.find.active {
 				find_input_rune(doc, window.chars[i])
@@ -182,7 +190,9 @@ main :: proc() {
 			// Context is per-event; palette/find/menu/tab-switch can change it
 			// mid-loop. Priority: menu > palette > find > editor.
 			ctx := Ctx.Editor
-			if menu_is_active(&app) {
+			if app.settings_open {
+				ctx = .Settings
+			} else if menu_is_active(&app) {
 				ctx = .Menu
 			} else if app.palette.active {
 				ctx = .Palette
@@ -380,6 +390,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	}
 
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
+	if rc.app.settings_open {
+		settings_draw(gfx, quad_pipe, text, rc.app, w, h)
+	}
 	menu_draw(gfx, quad_pipe, text, rc.app, window, w, h)
 
 	if rc.app.palette.active {
@@ -463,6 +476,11 @@ hint_find :: proc(gfx: ^plat.Gfx, text: ^plat.Text, f: ^Find, doc: ^Document, w,
 		x += f32(len(h.label) + 3) * cw
 	}
 }
+
+// The live render context. command_dispatch needs it for commands that change
+// layout-affecting state (font size), and it takes no rc parameter — the same
+// single-window assumption the layout metrics already rest on.
+active_render_ctx: ^Render_Ctx
 
 // Scale a 96-DPI design value to this window's DPI. Never returns 0 for a
 // positive input: a metric collapsing to zero divides into +Inf downstream

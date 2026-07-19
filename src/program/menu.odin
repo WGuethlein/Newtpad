@@ -122,6 +122,7 @@ menus := []Menu {
 			{cmd = .Find_Toggle_Regex, checked = is_regex, enabled = has_doc},
 			sep,
 			{cmd = .Palette_Open},
+			{cmd = .Settings_Open},
 		},
 	},
 }
@@ -180,6 +181,12 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 	mx, my := f32(win.mouse_x), f32(win.mouse_y)
 
 	if my >= TAB_STRIP_H && my < TAB_STRIP_H + MENU_BAR_H {
+		gx := w - SCROLLBAR_W - sx(26)
+		if mx >= gx && mx < gx + sx(26) {
+			menu_close(app)
+			consume_click(win)
+			return .Settings_Open if !app.settings_open else .Settings_Close, true
+		}
 		if i := menu_title_at(t, mx); i >= 0 {
 			if app.menu.open == i {menu_close(app)} else {menu_open_at(app, i)}
 		} else {
@@ -306,9 +313,12 @@ menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^
 		}
 	}
 
-	// The settings gear belongs here, right-aligned and clear of the scrollbar
-	// gutter. It lands with the settings page rather than before it — a gear that
-	// opens nothing is exactly the dead control this menu is meant to avoid.
+	// Settings gear, right-aligned and clear of the scrollbar gutter.
+	gx := width - SCROLLBAR_W - sx(26)
+	if in_bar && f32(cx) >= gx && f32(cx) < gx + sx(26) {
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {gx, TAB_STRIP_H}, size = {sx(26), MENU_BAR_H}, color = MENU_COL.hover}})
+	}
+	plat.text_draw(gfx, t, "⚙", gx + sx(7), base_y, UI_PX, MENU_COL.fg if !app.settings_open else MENU_COL.check)
 
 	if app.menu.open < 0 {return}
 	menu_draw_dropdown(gfx, qp, t, app, width, height)
