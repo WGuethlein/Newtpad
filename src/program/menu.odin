@@ -206,9 +206,14 @@ menu_hover_update :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window) {
 
 // Highlight the dropdown row under the pointer, so the mouse and the keyboard
 // agree about what is selected before a click lands.
+//
+// Queries the cursor rather than reading win.mouse_y: WM_MOUSEMOVE only records
+// a position while a button is held (it exists for drag-select), so mouse_y is
+// wherever the last click landed and never moves during a plain hover.
 menu_hover_item :: proc(app: ^App, win: ^plat.Window) {
 	if app.menu.open < 0 {return}
-	if r := menu_item_at(app, f32(win.mouse_y)); r >= 0 {
+	_, cy := plat.window_cursor_client(win)
+	if r := menu_item_at(app, f32(cy)); r >= 0 {
 		if item_enabled(app, menus[app.menu.open].items[r]) {app.menu.item = r}
 	}
 }
