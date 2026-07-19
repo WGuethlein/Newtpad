@@ -291,6 +291,14 @@ Document :: struct {
 	status_line:   int, // 1-based line of the cursor (0 = beyond the cap / unknown)
 	modified:   bool,
 	recovered:  bool, // a mapped read faulted; buffer is now a private copy, not the file
+	// External-change detection (watch.odin). `gen` distinguishes this document
+	// from a later one reusing the same tab slot, so a stat result that arrives
+	// after a close is discarded instead of applied to a stranger.
+	gen:          u64,
+	disk_stamp:   plat.File_Stamp, // the file as we last saw it
+	disk_changed: bool, // changed underneath us and we have not reconciled
+	disk_gone:    bool, // it stopped existing
+	appended:     int, // bytes absorbed from the file's tail since it was opened
 	nl_delta:   int,
 	undo:       [dynamic]Snapshot,
 	redo:       [dynamic]Snapshot,
@@ -353,6 +361,7 @@ doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
 	// Guard the scan only when content aliases the mapping (UTF-8, no transcode);
 	// a transcoded or copied original is private memory and can't fault.
 	doc.idx.guard = doc.fv.mapped && !doc.owned_orig
+	doc.disk_stamp = plat.file_stamp(path) // baseline for change detection
 	return doc, true
 }
 
@@ -372,6 +381,16 @@ doc_from_content :: proc(content: []u8, path: string, enc: base.Encoding) -> (do
 	doc.idx.content = content
 	doc.idx.total = len(content)
 	return
+}
+
+// Cancel and join the line indexer. Must happen before anything the worker's
+// `content` slice points into is freed or unmapped.
+doc_index_stop :: proc(doc: ^Document) {
+	if doc.idx.th == nil {return}
+	intrinsics.atomic_store(&doc.idx.cancel, true)
+	thread.join(doc.idx.th)
+	thread.destroy(doc.idx.th)
+	doc.idx.th = nil
 }
 
 doc_index_start :: proc(doc: ^Document) {
@@ -500,6 +519,12 @@ doc_save_err :: proc(doc: ^Document, path: string) -> plat.Write_Error {
 	doc.path = newpath
 	doc.path_owned = true
 	doc.modified = false
+	// Record the file as we just left it, or the watcher reports our own write
+	// as an external change on its next pass.
+	doc.disk_stamp = plat.file_stamp(path)
+	doc.disk_changed = false
+	doc.disk_gone = false
+	doc.appended = 0
 	return .None
 }
 
@@ -648,6 +673,104 @@ doc_redo :: proc(doc: ^Document) {
 	s := pop(&doc.redo)
 	apply_snapshot(doc, s)
 	doc.last_edit = .None
+}
+
+// --- external changes ---
+
+// Copy the mapped bytes into private memory and drop the mapping.
+//
+// This is the "never lock the user's file" rule made real. A user-mapped section
+// makes Windows refuse truncation, deletion and replacement of the file
+// (ERROR_USER_MAPPED_FILE), so a service cannot roll a log while we hold it
+// mapped. As soon as the file starts changing we get out of the way.
+//
+// Also removes the moving-target problem: an external in-place write changes the
+// bytes under a mapping with no size change and no fault, so every offset the
+// buffer derived from them would silently describe different content.
+doc_detach_mapping :: proc(doc: ^Document) {
+	if !doc.fv.mapped {return}
+	find_invalidate(doc) // the search worker holds a view aliasing the mapping
+	doc_index_stop(doc)
+
+	priv := make([]u8, len(doc.original))
+	base.safe_copy(priv, doc.original)
+	doc.original = priv
+	doc.owned_orig = true
+	doc.pt.original = priv // pieces index by offset, so the repoint is transparent
+	plat.file_close(&doc.fv)
+
+	doc.idx.content = priv
+	doc.idx.total = len(priv)
+	doc.idx.guard = false
+	intrinsics.atomic_store(&doc.idx.done, false)
+	intrinsics.atomic_store(&doc.idx.fault, false)
+	intrinsics.atomic_store(&doc.idx.cancel, false)
+	intrinsics.atomic_store(&doc.idx.indexed, 0)
+	intrinsics.atomic_store(&doc.idx.line_count, 0)
+	doc_index_start(doc)
+}
+
+// Bytes appended to the file since we last looked, pulled in without remapping.
+// Returns false if the change was not a pure append (the file shrank, or the
+// read came up short because it is mid-write — retried on the next poll).
+//
+// Appending through the add arena rather than remapping is what makes this safe
+// against the search worker: arena chunks never move, so a pt_view stays valid
+// by construction. No cancel, no join, no unmap window.
+doc_absorb_append :: proc(doc: ^Document, new_size: i64) -> bool {
+	// Only for documents whose bytes correspond 1:1 with file bytes. A BOM
+	// shifts every offset by 3 and UTF-16 is transcoded, so "file grew by N"
+	// says nothing about how many document bytes to add.
+	if doc.enc != .UTF8 || doc.had_bom {return false}
+	old := i64(len(doc.original)) + i64(doc.appended)
+	if new_size <= old {return false}
+
+	chunk, ok := plat.file_read_range(doc.path, old, int(new_size - old))
+	defer delete(chunk)
+	if !ok || len(chunk) == 0 {return false}
+
+	// Appending at the end never disturbs earlier offsets, so the caret,
+	// selection and search results all stay meaningful.
+	at_end := doc.cursor >= doc.pt.length
+	base.pt_insert(&doc.pt, doc.pt.length, chunk)
+	for b in chunk {if b == '\n' {doc.nl_delta += 1}}
+	doc.appended += len(chunk)
+	if at_end { // follow the tail, like tail -f
+		doc.cursor = doc.pt.length
+		doc.anchor = doc.cursor
+	}
+	find_invalidate(doc) // match offsets past the old end are now stale
+	return true
+}
+
+// Re-open from disk, discarding the buffer. Used when the change was not a
+// simple append. Undo states describe a document that no longer exists, so they
+// go; keeping them would let Ctrl+Z resurrect a file that was never on disk.
+doc_reload :: proc(doc: ^Document) -> bool {
+	if doc.path == "" {return false}
+	fresh, ok := doc_open(doc.path)
+	if !ok {return false}
+
+	cursor, anchor, top := doc.cursor, doc.anchor, doc.top
+	wrap := doc.wrap
+	path := strings.clone(doc.path)
+
+	doc_close(doc) // stops both workers, frees the trees and the old original
+	doc^ = fresh
+	if doc.path_owned {delete(doc.path)}
+	doc.path = path
+	doc.path_owned = true
+	doc.wrap = wrap
+	// Preserve position by byte offset, clamped — the file may have shrunk.
+	L := doc.pt.length
+	doc.cursor = clamp(cursor, 0, L)
+	doc.anchor = clamp(anchor, 0, L)
+	doc.top = clamp(top, 0, L)
+	doc.disk_stamp = plat.file_stamp(doc.path)
+	doc.disk_changed = false
+	doc.disk_gone = false
+	doc.recovered = false // freshly read; no longer a salvaged copy
+	return true
 }
 
 // --- history list ---

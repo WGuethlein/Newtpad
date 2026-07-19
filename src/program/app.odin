@@ -21,7 +21,15 @@ App :: struct {
 	settings_row:  int,
 	history:       History_State,
 	palette:    Palette, // command palette overlay (Ctrl+P)
+	// Monotonic id stamped on each Document. The file watcher is the job the
+	// header note anticipated — it re-resolves a slot across frames, so a slot
+	// index alone is no longer enough to prove a result belongs to the document
+	// that asked for it.
+	next_gen:   u64,
 }
+
+// Upper bound on watched files; matches the session's tab limit.
+MAX_TABS :: 32
 
 app_active :: proc(a: ^App) -> ^Document {
 	if a.active >= 0 && a.active < len(a.docs) {
@@ -39,6 +47,8 @@ app_live_count :: proc(a: ^App) -> (n: int) {
 
 // Place a document in a free slot (reusing a nil one) and return its slot.
 app_add :: proc(a: ^App, d: ^Document) -> int {
+	a.next_gen += 1
+	d.gen = a.next_gen // identifies this document across slot reuse
 	for slot, i in a.docs {
 		if slot == nil {
 			a.docs[i] = d

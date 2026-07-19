@@ -1,4 +1,4 @@
-// Layer: program â€” wires the layers together and owns the frame loop. The main
+// Layer: program — wires the layers together and owns the frame loop. The main
 // thread builds UI and handles input only: drain events, update the document,
 // draw the viewport, present. Headless argv test modes live in test_modes.odin.
 package main
@@ -24,7 +24,7 @@ main :: proc() {
 	// One instance per user: a second launch hands its file to the running window
 	// and exits, so only one process owns the session file and backups. If the
 	// hand-off fails (owner starting up or shutting down) we run normally rather
-	// than lose the file â€” see the primary check on session save below.
+	// than lose the file — see the primary check on session save below.
 	primary := plat.instance_claim()
 	if !primary && plat.instance_send_open(path) {
 		return
@@ -54,7 +54,7 @@ main :: proc() {
 
 	// Restore the session FIRST, then open any file from the command line as an
 	// extra tab. Opening a file used to skip the restore entirely, and the exit
-	// save then deleted every backup the (single-tab) session didn't reference â€”
+	// save then deleted every backup the (single-tab) session didn't reference —
 	// so launching Newtpad on a file destroyed unsaved scratch buffers. The
 	// single-instance hand-off already appends a tab rather than replacing the
 	// session, so this also makes both launch paths behave the same.
@@ -93,6 +93,13 @@ main :: proc() {
 	window.dpi_user = &rc
 	// (metrics_recompute above already set window.titlebar_h, which the NC
 	// hit-test needs valid before the first render.)
+
+	// Watch open files for external changes (see watch.odin).
+	watcher: Watcher
+	watcher_start(&watcher)
+	defer watcher_stop(&watcher)
+	disk_changes: [dynamic]Watch_Entry
+	defer delete(disk_changes)
 
 	// Debounced session autosave: save ~2s after input settles (crash safety).
 	session_dirty := false
@@ -137,7 +144,7 @@ main :: proc() {
 		// Usable content width in cells (word wrap breaks here).
 		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - SCROLLBAR_W) / char_w))
 		doc.view_rows = rows
-		// Re-center on the caret only when it actually moves on THIS tab â€” never
+		// Re-center on the caret only when it actually moves on THIS tab — never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
 		active_before := app.active
 		cursor_before := doc.cursor
@@ -305,6 +312,37 @@ main :: proc() {
 			window.scroll_delta = 0
 		}
 
+		// External changes, merged once per frame. The worker only reports; every
+		// decision about what to do with a document is made here, on the thread
+		// that owns it.
+		watcher_publish(&watcher, &app)
+		clear(&disk_changes)
+		watcher_take(&watcher, &disk_changes)
+		for c in disk_changes {
+			defer delete(c.path)
+			if c.slot < 0 || c.slot >= len(app.docs) {continue}
+			d := app.docs[c.slot]
+			// The slot may have been closed and reused since the stat began.
+			if d == nil || d.gen != c.gen {continue}
+			if !c.stamp.ok {
+				d.disk_gone = true
+				continue
+			}
+			d.disk_gone = false
+			// Get off the mapping before anything else: while we hold it, the
+			// other writer cannot rotate or replace the file.
+			doc_detach_mapping(d)
+			if d.modified {
+				// Never discard the user's edits silently. Mark and let them choose.
+				d.disk_changed = true
+			} else if doc_absorb_append(d, c.stamp.size) {
+				d.disk_stamp = c.stamp
+			} else if !doc_reload(d) {
+				d.disk_changed = true
+			}
+			session_dirty = true
+		}
+
 		// Take whatever the search worker published since the last frame (and
 		// restart it if an edit invalidated the results).
 		doc = app_active(&app)
@@ -362,7 +400,7 @@ Render_Ctx :: struct {
 	px, char_w, line_h: f32,
 }
 
-// Draw one frame from current state. No input handling â€” safe to call from the
+// Draw one frame from current state. No input handling — safe to call from the
 // main loop or the WM_SIZE handler. vsync=false (resize) presents immediately so
 // clustered WM_SIZE repaints don't each stall on vsync.
 render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
@@ -425,12 +463,12 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 
 	// Filter view replaces the document with just the matching lines, which is
 	// disorienting if you don't know why. Say so, unmistakably, and say how to
-	// leave â€” the previous signal was the word "filter" inside the find line.
+	// leave — the previous signal was the word "filter" inside the find line.
 	if doc.filter && doc.find.active {
 		bh := sx(20)
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, CONTENT_TOP - bh}, size = {w, bh}, color = {0.18, 0.26, 0.20, 1}}})
 		msg := fmt.tprintf(
-			"FILTER  %d matching lines%s   â€”   Ctrl+L shows the whole file",
+			"FILTER  %d matching lines%s   —   Ctrl+L shows the whole file",
 			len(doc.filter_lines),
 			"" if doc_filtering(doc) else " (searching...)",
 		)
@@ -467,13 +505,22 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		ln := doc_cursor_line(doc)
 		lncol := fmt.tprintf("Ln %d, Col %d", ln, doc_cursor_col(doc, text)) if ln > 0 else fmt.tprintf("Col %d", doc_cursor_col(doc, text))
 		recovered := "  [RECOVERED COPY - file changed on disk, not the original]" if doc.recovered else ""
+		// Only ever shown for a modified document: a clean one is reloaded
+		// silently, so a marker here always means there is a real choice to make.
+		disk := ""
+		if doc.disk_gone {
+			disk = "  [FILE DELETED ON DISK - your text is still here; Save to write it back]"
+		} else if doc.disk_changed {
+			disk = "  [CHANGED ON DISK - you have unsaved edits. File > Reload to discard yours]"
+		}
 		indexing := "" if doc_index_done(doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(doc) * 100)
 		// The atlas has no eviction: once full, further glyphs draw as nothing
 		// while the pen still advances, so text goes missing with no other
 		// symptom. Say so rather than let it look like a corrupt file.
 		atlas := "  [GLYPH CACHE FULL - some text may not draw; reduce zoom or font size]" if plat.text_atlas_full(text) else ""
-		status := fmt.tprintf("%s    %s    %d lines%s%s%s%s%s", lncol, enc_name(doc.enc), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, indexing, atlas)
-		col := [4]f32{0.95, 0.55, 0.35, 1} if (doc.recovered || plat.text_atlas_full(text)) else {0.55, 0.60, 0.70, 1}
+		status := fmt.tprintf("%s    %s    %d lines%s%s%s%s%s%s", lncol, enc_name(doc.enc), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, disk, indexing, atlas)
+		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text)
+		col := [4]f32{0.95, 0.55, 0.35, 1} if warn else {0.55, 0.60, 0.70, 1}
 		plat.text_draw(gfx, text, status, sx(12), h - sx(8), UI_SMALL_PX, col)
 	}
 
@@ -527,7 +574,7 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	rc.line_h = line_height(rc.px)
 	rc.char_w = plat.text_char_width(rc.text, rc.px)
 
-	// The chrome. Sole writer of these â€” see the note on their declarations.
+	// The chrome. Sole writer of these — see the note on their declarations.
 	UI_SCALE = plat.window_scale(rc.window)
 	UI_PX = dp(rc, UI_PX_96)
 	UI_SMALL_PX = dp(rc, UI_SMALL_PX_96)
@@ -549,7 +596,7 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	HISTORY_W = dp(rc, HISTORY_W_96)
 
 	// The non-client hit-test boundary is derived from the tab strip, so it is
-	// set here rather than at each call site â€” it was being scaled a second time
+	// set here rather than at each call site — it was being scaled a second time
 	// by one of them, squaring it and pushing the OS drag region into the content.
 	rc.window.titlebar_h = i32(TAB_STRIP_H)
 }

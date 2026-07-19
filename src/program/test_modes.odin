@@ -153,6 +153,84 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad watchtest <dir>` — external-change detection and reconciliation.
+	// This feature changes the document without the user asking, so the failure
+	// mode is data loss rather than a wrong pixel.
+	if os.args[1] == "watchtest" && len(os.args) > 2 {
+		bad := 0
+		dir := os.args[2]
+		path := fmt.tprintf("%s\\watch.txt", dir)
+
+		plat.file_write_atomic(path, transmute([]u8)string("line one\nline two\n"))
+		doc, ok := doc_open(path)
+		if !ok {
+			fmt.println("watchtest: could not open")
+			return true
+		}
+		defer doc_close(&doc)
+		s0 := doc.disk_stamp
+		fmt.printfln("opened: %d bytes, stamp ok=%v", doc.pt.length, s0.ok)
+		if !s0.ok {bad += 1}
+
+		// A service appends. The tail must be absorbed without re-reading the
+		// whole file and without disturbing offsets before the old end.
+		f, _ := os.open(path, os.O_WRONLY | os.O_APPEND)
+		os.write(f, transmute([]u8)string("line three\n"))
+		os.close(f)
+		s1 := plat.file_stamp(path)
+		changed := s1 != s0
+		fmt.printfln("after append: detected=%v size %d -> %d", changed, s0.size, s1.size)
+		if !changed {bad += 1}
+
+		doc.cursor = doc.pt.length // pretend the caret was at EOF, as when tailing
+		doc.anchor = doc.cursor
+		absorbed := doc_absorb_append(&doc, s1.size)
+		txt := doc_debug_string(&doc)
+		tail_ok := absorbed && doc.pt.length == int(s1.size) && doc.cursor == doc.pt.length
+		fmt.printfln("absorbed=%v len=%d (want %d) caret follows=%v  %s", absorbed, doc.pt.length, s1.size, doc.cursor == doc.pt.length, "OK" if tail_ok else "FAIL")
+		if !tail_ok {bad += 1}
+		fmt.printfln("  content: %q", txt)
+
+		// Shrinking is not an append: it must be refused so the caller reloads.
+		refused := !doc_absorb_append(&doc, 5)
+		fmt.printfln("shrink refused by append path: %v  %s", refused, "OK" if refused else "FAIL")
+		if !refused {bad += 1}
+
+		// A rewrite that is not an append -> full reload, position preserved.
+		plat.file_write_atomic(path, transmute([]u8)string("completely different\ncontent here\n"))
+		doc.cursor = 5
+		doc.anchor = 5
+		rok := doc_reload(&doc)
+		after := doc_debug_string(&doc)
+		reload_ok := rok && doc.cursor == 5 && !doc.disk_changed
+		fmt.printfln("reload=%v caret=%d stamp refreshed=%v  %s", rok, doc.cursor, doc.disk_stamp.ok, "OK" if reload_ok else "FAIL")
+		if !reload_ok {bad += 1}
+		fmt.printfln("  content: %q", after[:min(len(after), 24)])
+
+		// A caret past the new end must clamp, not index out of bounds.
+		plat.file_write_atomic(path, transmute([]u8)string("tiny\n"))
+		doc.cursor = 999
+		doc.anchor = 999
+		doc_reload(&doc)
+		clamped := doc.cursor <= doc.pt.length
+		fmt.printfln("caret clamped after shrink: %d <= %d  %s", doc.cursor, doc.pt.length, "OK" if clamped else "FAIL")
+		if !clamped {bad += 1}
+
+		// Encodings whose bytes do not map 1:1 to document bytes must never take
+		// the append fast path: a BOM shifts every offset, UTF-16 is transcoded.
+		doc.enc = .UTF16LE
+		u16_refused := !doc_absorb_append(&doc, i64(doc.pt.length + 10))
+		doc.enc = .UTF8
+		doc.had_bom = true
+		bom_refused := !doc_absorb_append(&doc, i64(doc.pt.length + 10))
+		doc.had_bom = false
+		fmt.printfln("append refused for UTF-16=%v and BOM=%v  %s", u16_refused, bom_refused, "OK" if u16_refused && bom_refused else "FAIL")
+		if !(u16_refused && bom_refused) {bad += 1}
+
+		fmt.printfln("watchtest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad atlastest` — how much text actually fits in the glyph atlas at a
 	// given size. The atlas has no per-glyph eviction (a shelf packer cannot free
 	// one rectangle), so when it fills it grows and ultimately recycles; this

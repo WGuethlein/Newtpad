@@ -58,8 +58,15 @@ file_open_readonly :: proc(path: string) -> (fv: File_View, ok: bool) {
 		return fv, true
 	}
 
-	// Large: memory-map, share everything, then close the file handle. The
-	// mapping keeps its own reference; other programs can still delete/rename.
+	// Large: memory-map, share everything, then close the file handle.
+	//
+	// CAUTION: a mapping is NOT free of consequences for other programs. While a
+	// user-mapped section is open, Windows fails truncation, deletion and
+	// replacement of that file with ERROR_USER_MAPPED_FILE (1224) regardless of
+	// the sharing mode requested here. A service rotating a log therefore cannot
+	// roll it while we hold the mapping. The document layer detaches to a private
+	// copy as soon as it detects the file changing (see doc_detach_mapping), which
+	// is what keeps "never lock the user's file" true in practice.
 	wpath := win.utf8_to_wstring(path)
 	hfile := win.CreateFileW(
 		wpath,
@@ -93,6 +100,73 @@ file_open_readonly :: proc(path: string) -> (fv: File_View, ok: bool) {
 // Write data to a sibling temp file then atomically rename it over `path`, so a
 // crash mid-write never corrupts the original. Never holds `path` open. Works
 // even when the original is memory-mapped (delete+rename succeed; see bench/).
+// An opaque identity for "the file as we last saw it". Compared with ==; the
+// program layer never sees a FILETIME (platform types don't leak upward).
+File_Stamp :: struct {
+	mtime: u64,
+	size:  i64,
+	ok:    bool, // false when the file could not be stat'd (missing, unreachable)
+}
+
+// Cheap stat with no handle held open. Safe to call from a worker: on a dropped
+// network share this blocks for the redirector timeout, which is exactly why it
+// must not run on the UI thread.
+file_stamp :: proc(path: string) -> File_Stamp {
+	wpath := win.utf8_to_wstring(path, context.temp_allocator)
+	d: win.WIN32_FILE_ATTRIBUTE_DATA
+	if !win.GetFileAttributesExW(wpath, win.GetFileExInfoStandard, &d) {
+		return File_Stamp{}
+	}
+	return File_Stamp {
+		mtime = (u64(d.ftLastWriteTime.dwHighDateTime) << 32) | u64(d.ftLastWriteTime.dwLowDateTime),
+		size = (i64(d.nFileSizeHigh) << 32) | i64(d.nFileSizeLow),
+		ok = true,
+	}
+}
+
+// Read [offset, offset+count) with no handle retained. Used to pick up bytes
+// appended to a file we already have open — cheaper and safer than remapping,
+// and it holds no lock.
+file_read_range :: proc(path: string, offset: i64, count: int, allocator := context.allocator) -> ([]u8, bool) {
+	if count <= 0 {
+		return nil, true
+	}
+	wpath := win.utf8_to_wstring(path, context.temp_allocator)
+	h := win.CreateFileW(
+		wpath,
+		win.GENERIC_READ,
+		win.FILE_SHARE_READ | win.FILE_SHARE_WRITE | win.FILE_SHARE_DELETE,
+		nil,
+		win.OPEN_EXISTING,
+		win.FILE_ATTRIBUTE_NORMAL,
+		nil,
+	)
+	if h == win.INVALID_HANDLE_VALUE {
+		return nil, false
+	}
+	defer win.CloseHandle(h)
+	lo := win.LONG(offset & 0xFFFFFFFF)
+	hi := win.LONG(offset >> 32)
+	if win.SetFilePointer(h, lo, &hi, win.FILE_BEGIN) == win.INVALID_SET_FILE_POINTER {
+		return nil, false
+	}
+	buf := make([]u8, count, allocator)
+	total := 0
+	for total < count {
+		got: win.DWORD
+		if !win.ReadFile(h, raw_data(buf[total:]), win.DWORD(count - total), &got, nil) || got == 0 {
+			break
+		}
+		total += int(got)
+	}
+	if total != count {
+		// Short read: the file shrank or is mid-write. Return what we got so the
+		// caller can decide, rather than pretending we have the whole range.
+		return buf[:total], false
+	}
+	return buf, true
+}
+
 file_write_atomic :: proc(path: string, data: []u8) -> bool {
 	err := file_write_atomic_err(path, data)
 	return err == .None

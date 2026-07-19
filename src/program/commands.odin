@@ -1,4 +1,4 @@
-// Layer: program â€” the command table: every editor action declared once. The
+// Layer: program — the command table: every editor action declared once. The
 // enumerated `command_table` (compiler forces a row per Command_Id) holds palette
 // metadata; `default_bindings` is the keymap (key chord + context -> command),
 // separated from the metadata so keys are rebindable later (a user overlay);
@@ -70,6 +70,7 @@ Command_Id :: enum u8 {
 	Tab_Next,
 	Tab_Prev,
 	Exit,
+	Reload,
 	// menu bar navigation
 	Menu_Close,
 	Menu_Next,
@@ -113,7 +114,7 @@ Command :: struct {
 	category: string,
 }
 
-// One row per Command_Id â€” the array is total over the enum, so a new command
+// One row per Command_Id — the array is total over the enum, so a new command
 // can't be forgotten here. `.None` is the unbound sentinel.
 command_table := [Command_Id]Command {
 	.None                     = {},
@@ -160,6 +161,7 @@ command_table := [Command_Id]Command {
 	.Tab_Next                 = {"Next Tab", "Tabs"},
 	.Tab_Prev                 = {"Previous Tab", "Tabs"},
 	.Exit                     = {"Exit", "File"},
+	.Reload                   = {"Reload from Disk", "File"},
 	.Menu_Close               = {"Menu: Close", "View"},
 	.Menu_Next                = {"Menu: Next", "View"},
 	.Menu_Prev                = {"Menu: Previous", "View"},
@@ -194,7 +196,7 @@ command_table := [Command_Id]Command {
 
 // A default key binding. Matching uses (key, ctrl) within a context; shift is a
 // modifier the action reads (selection extend, search direction), never part of
-// the chord â€” no command distinguishes on shift. A command may have several
+// the chord — no command distinguishes on shift. A command may have several
 // bindings (e.g. Find_Close on Esc and Ctrl+F).
 Binding :: struct {
 	key:  plat.Key,
@@ -288,11 +290,11 @@ default_bindings := []Binding {
 
 // Human-readable chord for a command, e.g. "Ctrl+S", or "" if unbound. The first
 // Editor-context binding wins, since that is the one a user would press from the
-// document. Used by the palette and the menu â€” the keymap is the only place that
+// document. Used by the palette and the menu — the keymap is the only place that
 // knows the shortcuts, so anything that teaches them has to read it from here
 // rather than repeat them in a second table that can drift.
 command_chord :: proc(cmd: Command_Id, allocator := context.temp_allocator) -> string {
-	// Editor bindings first â€” that's the chord a user would press from the
+	// Editor bindings first — that's the chord a user would press from the
 	// document. Falling back to any context so mode-local commands (the find
 	// toggles) still teach their key instead of showing blank.
 	for pass in 0 ..< 2 {
@@ -413,7 +415,7 @@ lookup_binding :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 // action reads it). First matching binding wins; a user overlay would prepend.
 //
 // Find falls back to the editor keymap for *modified* chords only. Without the
-// fallback, opening the find bar killed every global chord â€” Ctrl+S, Ctrl+P,
+// fallback, opening the find bar killed every global chord — Ctrl+S, Ctrl+P,
 // Ctrl+A, Ctrl+C, Ctrl+Z, Ctrl+N all resolved to nothing, which is what made
 // Ctrl+A and Ctrl+P look broken. The ctrl/alt restriction is the important half:
 // an unmodified fallback would send plain Delete to Delete_Fwd and the arrows to
@@ -426,7 +428,7 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 	if cmd := lookup_binding(key, ctrl, alt, ctx); cmd != .None {
 		return cmd
 	}
-	// The menu falls back for the same reason find does â€” a global chord should
+	// The menu falls back for the same reason find does — a global chord should
 	// not die because a dropdown happens to be open. The palette is the one true
 	// exception, being a text field.
 	if (ctx == .Find || ctx == .Menu) && (ctrl || alt) {
@@ -517,7 +519,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		find_open(doc, true)
 	case .Filter_Open:
 		// Arm the filter and open find. With no query yet there is nothing to
-		// filter, so the view stays whole until matches arrive â€” which is what
+		// filter, so the view stays whole until matches arrive — which is what
 		// makes this filter-as-you-type rather than a blank screen.
 		find_open(doc, false)
 		doc.filter = true
@@ -563,8 +565,20 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		app_switch_relative(app, -1 if ev.shift else 1) // Shift+Ctrl+Tab -> previous
 	case .Tab_Prev:
 		app_switch_relative(app, -1)
+	case .Reload:
+		// Discards unsaved edits, so confirm when there are any. The buffer is
+		// still in the session backup at this point, which is what makes the
+		// choice recoverable rather than terminal.
+		if doc.path == "" {break}
+		if doc.modified {
+			if plat.confirm_discard(w.hwnd, doc_display_name(doc)) != .Discard {break}
+		}
+		if !doc_reload(doc) {
+			plat.message_error(w.hwnd, "Could not re-read the file from disk.")
+		}
+
 	case .Exit:
-		// No prompt, matching the âœ• button: unsaved buffers are persisted as
+		// No prompt, matching the close button: unsaved buffers are persisted as
 		// session backups on the way out (hot exit). A File>Exit that prompted
 		// would be stricter than the close button, which is worse than either.
 		plat.window_request_close(w)
@@ -657,7 +671,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		find_toggle_regex(doc)
 	case .Find_Toggle_Filter:
 		// Deliberately not gated on having matches. The search runs on a worker,
-		// so on a large file there are none for the first frames â€” gating here
+		// so on a large file there are none for the first frames — gating here
 		// made Ctrl+L do nothing at exactly the moment it was most wanted. The
 		// view falls back to unfiltered until matches exist (doc_filtering).
 		doc.filter = !doc.filter

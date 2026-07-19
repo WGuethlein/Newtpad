@@ -41,6 +41,13 @@ Menu :: struct {
 @(private = "file")
 has_doc :: proc(app: ^App) -> bool {return app_active(app) != nil}
 
+// Reload needs a file on disk to reload from; an untitled buffer has none.
+@(private = "file")
+has_file :: proc(app: ^App) -> bool {
+	d := app_active(app)
+	return d != nil && d.path != ""
+}
+
 @(private = "file")
 has_sel :: proc(app: ^App) -> bool {
 	d := app_active(app)
@@ -90,6 +97,7 @@ menus := []Menu {
 			sep,
 			{cmd = .Save, enabled = has_doc},
 			{cmd = .Save_As, enabled = has_doc},
+			{cmd = .Reload, enabled = has_file},
 			sep,
 			{cmd = .Tab_Close, enabled = has_doc},
 			{cmd = .Exit},
