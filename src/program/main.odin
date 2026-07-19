@@ -243,6 +243,7 @@ main :: proc() {
 		// down the list highlights rows — before any click is considered.
 		menu_hover_update(&app, &text, window)
 		menu_hover_item(&app, window)
+		history_hover_update(&app, window, f32(window.width))
 
 		// The menu claims clicks first: its bar sits above the scrollbar gutter's
 		// top edge, and an open dropdown overlaps the content.

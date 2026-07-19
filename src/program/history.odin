@@ -17,13 +17,21 @@ HISTORY_W := HISTORY_W_96
 
 History_State :: struct {
 	open: bool,
-	sel:  int, // highlighted row; -1 means follow the current state
+	sel:  int, // highlighted row
+	// First visible row. A stored scroll offset, not derived from `sel`:
+	// centring on the selection would make the list chase the pointer, since
+	// hovering sets the selection. It moves only when the selection would
+	// otherwise leave the view.
+	top:  int,
+	rows: int, // rows drawn last frame; hit-testing needs the same number
 }
 
 history_open :: proc(app: ^App) {
 	d := app_active(app)
 	app.history.open = true
 	app.history.sel = doc_history_current(d) if d != nil else 0
+	app.history.top = 0 // draw clamps this to bring the selection into view
+	app.history.rows = 0
 }
 
 history_close :: proc(app: ^App) {app.history.open = false}
@@ -42,14 +50,31 @@ history_activate :: proc(app: ^App) {
 	doc_history_goto(d, app.history.sel)
 }
 
-// Row at client y, or -1.
+// Move the highlight to the row under the pointer. Uses the live cursor, not
+// win.mouse_y: WM_MOUSEMOVE only records a position while a button is held, so
+// the stored one is wherever the last click landed.
+history_hover_update :: proc(app: ^App, win: ^plat.Window, width: f32) {
+	if !app.history.open {return}
+	cx, cy := plat.window_cursor_client(win)
+	if r := history_row_at(app, f32(cx), f32(cy), width); r >= 0 {
+		app.history.sel = r
+	}
+}
+
+// History index at client (x, y), or -1. Accounts for the scroll offset: the
+// row drawn k places down is entry top+k, not entry k.
 history_row_at :: proc(app: ^App, mx, my, width: f32) -> int {
 	d := app_active(app)
 	if d == nil || !app.history.open {return -1}
 	x0 := width - HISTORY_W - SCROLLBAR_W
 	if mx < x0 || mx >= width - SCROLLBAR_W {return -1}
 	y := CONTENT_TOP + sx(28)
-	i := int((my - y) / HISTORY_ROW)
+	// Reject above the first row explicitly: integer division truncates toward
+	// zero, so a small negative offset yields row 0 rather than -1.
+	if my < y {return -1}
+	k := int((my - y) / HISTORY_ROW)
+	if k < 0 || k >= app.history.rows {return -1}
+	i := app.history.top + k
 	if i < 0 || i >= doc_history_len(d) {return -1}
 	return i
 }
@@ -65,9 +90,14 @@ history_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app
 	// Clamp to the window: the panel is a client-space quad, not a popup, so a
 	// long history must scroll rather than run off the bottom.
 	max_rows := max(1, int((height - y0 - sx(36)) / HISTORY_ROW))
-	first := 0
-	if n > max_rows {first = clamp(app.history.sel - max_rows / 2, 0, n - max_rows)}
+	// Scroll the minimum needed to keep the selection visible. Recentring on it
+	// every frame would drag the list under the pointer while hovering.
+	if app.history.sel < app.history.top {app.history.top = app.history.sel}
+	if app.history.sel >= app.history.top + max_rows {app.history.top = app.history.sel - max_rows + 1}
+	app.history.top = clamp(app.history.top, 0, max(0, n - max_rows))
+	first := app.history.top
 	shown := min(max_rows, n - first)
+	app.history.rows = shown // hit-testing must use the count actually drawn
 	h := sx(28) + f32(shown) * HISTORY_ROW + sx(8)
 
 	plat.quads_draw(gfx, qp, []plat.Quad {

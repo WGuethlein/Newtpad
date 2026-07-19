@@ -435,6 +435,35 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		doc_history_goto(&doc2, 0) // walk to the oldest surviving state
 		fmt.printfln("walk to oldest after eviction: len %d  OK", doc2.pt.length)
 
+		// Row hit-testing must account for the scroll offset: with more entries
+		// than fit, the row drawn k places down is entry top+k. Reading it as
+		// entry k picks the wrong state to jump to.
+		{
+			a: App
+			app_add(&a, &doc2)
+			a.active = 0
+			history_open(&a)
+			W := f32(1200)
+			x := W - HISTORY_W - SCROLLBAR_W + sx(10) // inside the panel
+			y0 := CONTENT_TOP + sx(28)
+
+			a.history.rows = 10
+			a.history.top = 0
+			r0 := history_row_at(&a, x, y0 + HISTORY_ROW * 0.5, W)
+			r3 := history_row_at(&a, x, y0 + HISTORY_ROW * 3.5, W)
+			a.history.top = 25 // scrolled down
+			s0 := history_row_at(&a, x, y0 + HISTORY_ROW * 0.5, W)
+			s3 := history_row_at(&a, x, y0 + HISTORY_ROW * 3.5, W)
+			off := history_row_at(&a, x, y0 - sx(4), W) // above the first row
+			out := history_row_at(&a, x, y0 + HISTORY_ROW * 50, W) // past the last drawn
+			left := history_row_at(&a, sx(4), y0 + HISTORY_ROW * 0.5, W) // outside the panel
+
+			ok := r0 == 0 && r3 == 3 && s0 == 25 && s3 == 28 && off == -1 && out == -1 && left == -1
+			fmt.printfln("row hit-test: top0->%d,%d top25->%d,%d  edges %d,%d,%d  %s", r0, r3, s0, s3, off, out, left, "OK" if ok else "FAIL")
+			if !ok {bad += 1}
+			a.docs[0] = nil // doc2 is stack-owned here; don't let app_destroy free it
+		}
+
 		fmt.printfln("historytest: %d failures", bad)
 		return true
 	}
