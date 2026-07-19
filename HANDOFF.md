@@ -223,9 +223,33 @@ last line did nothing instead of clamping to the document end, so shift+Down nev
 end of the last line (`newtpad vnavtest` covers both wrapped and unwrapped edges).
 
 **Next up (2026-07-19):** Wyatt is daily-driving Newtpad as his Notepad replacement, so the
-priority order is (1) make it installable/usable as the default text editor, (2) pay down the
-deferred items above, (3) fresh feature pass, (4) ship-readiness. Live use is now the main bug
-source — this environment can't inject GUI input, so Wyatt's real-world passes are the signal.
+priority order is (1) make it installable/usable as the default text editor — **DONE**, (2) pay
+down the deferred items above, (3) fresh feature pass, (4) ship-readiness. Live use is now the main
+bug source — this environment can't inject GUI input, so Wyatt's real-world passes are the signal.
+
+## 6c. Daily-driver install (2026-07-19)
+
+**Single instance.** A second launch used to fork a second process, and two processes race on the
+one `session.txt` + shared `backups\` — last writer wins and the other's unsaved buffers are gone
+(`session_save` deletes unreferenced backups). Now `platform/instance.odin` takes a session-local
+named mutex; a non-owner resolves its path to absolute (the running instance has a different CWD),
+hands it over via `WM_COPYDATA`, focuses that window and exits. `main` drains the queue each frame
+into `app_open_path`, which activates an existing tab if the file is already open. Hand-off failure
+(owner starting/stopping) falls through to running normally but **skips session save**, so the
+primary keeps sole ownership. Verified: 3 launches → 1 process/3 tabs, relative paths, bare
+relaunch = focus only, reopen = no duplicate.
+
+**`install.ps1`** — builds release (**0.69 MB**), copies to `%LOCALAPPDATA%\Newtpad`, registers
+`HKCU\...\Applications\newtpad.exe` (command / FriendlyAppName / DefaultIcon / SupportedTypes +
+per-extension `OpenWithList`) for ~24 text-ish extensions, adds the dir to user PATH. Installing
+to a separate dir from `build\` matters: a rebuild can't yank the binary out from under the running
+copy. `-Uninstall` fully reverses (verified: keys, dir, PATH all gone); `-Force` stops a running
+instance; `-SkipBuild` reuses `build\`. **Deliberately does not seize the default `.txt` handler** —
+Win10/11 tamper-check the UserChoice hash, so "Open with → Always" is a manual one-time click per
+extension. IFEO `notepad.exe` hijack was considered and rejected (system-wide HKLM).
+
+**Known gap:** if a Newtpad instance is elevated and a launch isn't (or vice versa), UIPI blocks
+the `SendMessage`, and the second launch falls through to its own non-session-owning process.
 
 ## 7. Build environment (Windows, this machine)
 
