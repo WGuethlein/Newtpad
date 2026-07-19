@@ -19,41 +19,64 @@ foreign user32_extra {
 
 // A single top-level OS window. Platform types stay in this layer; upper
 // layers see only this opaque handle and the procs below.
-// Editor key commands queued from the message pump, drained once per frame.
-Key_Cmd :: enum u8 {
-	Left,
-	Right,
-	Up,
-	Down,
-	Home,
-	End,
-	PageUp,
-	PageDown,
-	Backspace,
-	DeleteFwd,
-	Enter,
-	Undo,
-	Redo,
-	Save,
-	Copy,
-	Cut,
-	Paste,
-	SelectAll,
-	WordLeft,
-	WordRight,
-	DeleteWordBack,
-	Find,
-	Escape,
-	Replace,
-	Tab,
-	ToggleRegex,
-	ToggleFilter,
+
+// OS-neutral key codes. The message pump translates Win32 VK codes to these so
+// the program layer binds keys without touching Win32 (semantics live above the
+// platform seam). Letters/digits are contiguous for range translation.
+Key :: enum u16 {
+	None = 0,
+	A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z,
+	Num0, Num1, Num2, Num3, Num4, Num5, Num6, Num7, Num8, Num9,
+	Left, Right, Up, Down, Home, End, Page_Up, Page_Down,
+	Backspace, Delete, Enter, Tab, Escape,
 }
 
+// A raw key press, drained once per frame. The program maps (key, modifiers) to
+// a command via its keymap — the platform assigns no meaning.
 Key_Event :: struct {
-	cmd:   Key_Cmd,
-	shift: bool,
+	key:   Key,
 	ctrl:  bool,
+	shift: bool,
+	alt:   bool,
+}
+
+@(private)
+vk_to_key :: proc "contextless" (vk: win.WPARAM) -> Key {
+	switch vk {
+	case win.VK_LEFT:
+		return .Left
+	case win.VK_RIGHT:
+		return .Right
+	case win.VK_UP:
+		return .Up
+	case win.VK_DOWN:
+		return .Down
+	case win.VK_HOME:
+		return .Home
+	case win.VK_END:
+		return .End
+	case win.VK_PRIOR:
+		return .Page_Up
+	case win.VK_NEXT:
+		return .Page_Down
+	case win.VK_BACK:
+		return .Backspace
+	case win.VK_DELETE:
+		return .Delete
+	case win.VK_RETURN:
+		return .Enter
+	case win.VK_TAB:
+		return .Tab
+	case win.VK_ESCAPE:
+		return .Escape
+	}
+	if vk >= win.WPARAM('A') && vk <= win.WPARAM('Z') {
+		return Key(u16(Key.A) + u16(vk - win.WPARAM('A')))
+	}
+	if vk >= win.WPARAM('0') && vk <= win.WPARAM('9') {
+		return Key(u16(Key.Num0) + u16(vk - win.WPARAM('0')))
+	}
+	return .None
 }
 
 Window :: struct {
@@ -175,64 +198,15 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		}
 		return 0
 	case win.WM_KEYDOWN:
+		key := vk_to_key(wparam)
+		if key == .None {
+			return 0
+		}
 		ctrl := (int(win.GetKeyState(win.VK_CONTROL)) & 0x8000) != 0
 		shift := (int(win.GetKeyState(win.VK_SHIFT)) & 0x8000) != 0
-		cmd: Key_Cmd
-		has := true
-		switch wparam {
-		case win.VK_LEFT:
-			cmd = .WordLeft if ctrl else .Left
-		case win.VK_RIGHT:
-			cmd = .WordRight if ctrl else .Right
-		case win.VK_UP:
-			cmd = .Up
-		case win.VK_DOWN:
-			cmd = .Down
-		case win.VK_HOME:
-			cmd = .Home
-		case win.VK_END:
-			cmd = .End
-		case win.VK_PRIOR:
-			cmd = .PageUp
-		case win.VK_NEXT:
-			cmd = .PageDown
-		case win.VK_BACK:
-			cmd = .DeleteWordBack if ctrl else .Backspace
-		case win.VK_DELETE:
-			cmd = .DeleteFwd
-		case win.VK_RETURN:
-			cmd = .Enter
-		case win.VK_Z:
-			cmd = .Undo;has = ctrl
-		case win.VK_Y:
-			cmd = .Redo;has = ctrl
-		case win.VK_S:
-			cmd = .Save;has = ctrl
-		case win.VK_C:
-			cmd = .Copy;has = ctrl
-		case win.VK_X:
-			cmd = .Cut;has = ctrl
-		case win.VK_V:
-			cmd = .Paste;has = ctrl
-		case win.VK_A:
-			cmd = .SelectAll;has = ctrl
-		case win.VK_F:
-			cmd = .Find;has = ctrl
-		case win.VK_H:
-			cmd = .Replace;has = ctrl
-		case win.VK_TAB:
-			cmd = .Tab
-		case win.VK_R:
-			cmd = .ToggleRegex;has = ctrl
-		case win.VK_L:
-			cmd = .ToggleFilter;has = ctrl
-		case win.VK_ESCAPE:
-			cmd = .Escape
-		case:
-			has = false
-		}
-		if has && w.key_count < len(w.key_events) {
-			w.key_events[w.key_count] = {cmd, shift, ctrl}
+		alt := (int(win.GetKeyState(win.VK_MENU)) & 0x8000) != 0
+		if w.key_count < len(w.key_events) {
+			w.key_events[w.key_count] = {key, ctrl, shift, alt}
 			w.key_count += 1
 		}
 		return 0

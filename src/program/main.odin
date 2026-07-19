@@ -68,7 +68,8 @@ main :: proc() {
 		}
 		rows := int(f32(window.height) / line_h)
 
-		// Drain input once per frame: typed characters, then editor key commands.
+		// Drain input once per frame: typed characters route to the find field or
+		// the document; key chords resolve to a command in the active context.
 		for i in 0 ..< window.char_count {
 			if doc.find.active {
 				find_input_rune(&doc, window.chars[i])
@@ -79,105 +80,9 @@ main :: proc() {
 		window.char_count = 0
 		for i in 0 ..< window.key_count {
 			ev := window.key_events[i]
-			if doc.find.active {
-				#partial switch ev.cmd {
-				case .Backspace:
-					find_backspace(&doc)
-				case .Tab:
-					if doc.find.replace_mode {find_toggle_field(&doc)}
-				case .ToggleRegex:
-					find_toggle_regex(&doc)
-				case .ToggleFilter:
-					if len(doc.find.matches) > 0 {
-						doc.filter = !doc.filter
-						doc.filter_top = 0
-					}
-				case .PageUp:
-					if doc.filter {doc.filter_top = max(0, doc.filter_top - (rows - 1))}
-				case .PageDown:
-					if doc.filter {doc.filter_top = min(max(0, len(doc.filter_lines) - 1), doc.filter_top + (rows - 1))}
-				case .Replace:
-					doc.find.replace_mode = !doc.find.replace_mode // Ctrl+H toggles the replace field
-				case .Enter:
-					if doc.find.field == 1 {
-						if ev.ctrl {find_replace_all(&doc)} else {find_replace_current(&doc)}
-					} else {
-						if ev.shift {find_prev(&doc)} else {find_next(&doc)}
-					}
-				case .Escape, .Find:
-					find_close(&doc)
-				}
-				continue
-			}
-			#partial switch ev.cmd {
-			case .Left:
-				doc_cursor_left(&doc, ev.shift)
-			case .Right:
-				doc_cursor_right(&doc, ev.shift)
-			case .Up:
-				doc_cursor_up(&doc, ev.shift)
-			case .Down:
-				doc_cursor_down(&doc, ev.shift)
-			case .Home:
-				doc_cursor_home(&doc, ev.shift)
-			case .End:
-				doc_cursor_end(&doc, ev.shift)
-			case .WordLeft:
-				doc_word_left(&doc, ev.shift)
-			case .WordRight:
-				doc_word_right(&doc, ev.shift)
-			case .PageUp:
-				doc_scroll(&doc, -(rows - 1))
-			case .PageDown:
-				doc_scroll(&doc, rows - 1)
-			case .Backspace:
-				doc_backspace(&doc)
-			case .DeleteFwd:
-				doc_delete_fwd(&doc)
-			case .DeleteWordBack:
-				doc_delete_word_back(&doc)
-			case .Enter:
-				doc_insert_rune(&doc, '\n')
-			case .Undo:
-				doc_undo(&doc)
-			case .Redo:
-				doc_redo(&doc)
-			case .SelectAll:
-				doc_select_all(&doc)
-			case .Copy:
-				if s := doc_selected_text(&doc, context.temp_allocator); s != "" {
-					plat.clipboard_set_text(window.hwnd, s)
-				}
-			case .Cut:
-				if s := doc_selected_text(&doc, context.temp_allocator); s != "" {
-					plat.clipboard_set_text(window.hwnd, s)
-					doc_backspace(&doc) // deletes the selection
-				}
-			case .Paste:
-				if s, cok := plat.clipboard_get_text(window.hwnd, context.temp_allocator); cok {
-					doc_insert_text(&doc, transmute([]u8)s)
-				}
-			case .Save:
-				p := doc.path
-				if p == "" {
-					if np, sok := plat.file_save_dialog(window.hwnd); sok {
-						p = np
-					}
-				}
-				if p != "" {
-					if doc_save(&doc, p) {
-						fmt.printfln("Newtpad: saved %s", p)
-					} else {
-						fmt.eprintfln("Newtpad: failed to save %s", p)
-					}
-				}
-			case .Find:
-				find_open(&doc, false)
-			case .Replace:
-				find_open(&doc, true)
-			case .Escape:
-				doc.anchor = doc.cursor // clear selection
-			}
+			// Context is per-event: a chord this frame (Ctrl+F) can open/close find.
+			ctx := Ctx.Find if doc.find.active else Ctx.Editor
+			command_dispatch(resolve_key(ev.key, ev.ctrl, ctx), ev, &doc, window, rows)
 		}
 		window.key_count = 0
 

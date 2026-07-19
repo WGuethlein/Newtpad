@@ -9,6 +9,12 @@ import "core:os"
 import "core:time"
 import plat "src:platform"
 
+@(private = "file")
+key_chk :: proc(got, want: Command_Id, label: string) {
+	ok := "OK" if got == want else fmt.tprintf("FAIL want=%v", want)
+	fmt.printfln("%-22s -> %-16v %s", label, got, ok)
+}
+
 // Run a headless test mode if argv selects one. Returns true if a mode ran (the
 // caller should then exit). `seh_install` has already run in main.
 test_mode_dispatch :: proc() -> (handled: bool) {
@@ -58,6 +64,28 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 		if doc_index_faulted(&doc) {fmt.eprintln("warning: mapped read faulted mid-index (file changed on disk)")}
 		fmt.printfln("indexed %d lines in %.1f ms (%d bytes, %v)", doc_line_count(&doc), time.duration_milliseconds(time.tick_since(t0)), doc.pt.length, doc.enc)
+		doc_close(&doc)
+
+	case mode == "keytest":
+		doc, _ := doc_open(path) // e.g. "hello world foo"
+		dummy: plat.Window
+		key_chk(resolve_key(.Left, false, .Editor), .Cursor_Left, "Left / Editor")
+		key_chk(resolve_key(.Left, true, .Editor), .Word_Left, "Ctrl+Left / Editor")
+		key_chk(resolve_key(.F, true, .Editor), .Find_Open, "Ctrl+F / Editor")
+		key_chk(resolve_key(.Enter, false, .Editor), .Insert_Newline, "Enter / Editor")
+		key_chk(resolve_key(.Enter, false, .Find), .Find_Confirm, "Enter / Find")
+		key_chk(resolve_key(.Escape, false, .Find), .Find_Close, "Esc / Find")
+		key_chk(resolve_key(.H, true, .Editor), .Replace_Open, "Ctrl+H / Editor")
+		key_chk(resolve_key(.H, true, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find")
+		key_chk(resolve_key(.A, false, .Editor), .None, "a (unbound)")
+		// dispatch effects (dummy window; these commands don't touch the HWND)
+		doc.cursor = 0
+		command_dispatch(resolve_key(.Right, false, .Editor), {.Right, false, false, false}, &doc, &dummy, 10)
+		fmt.printfln("dispatch Right    -> cursor=%d", doc.cursor)
+		command_dispatch(resolve_key(.F, true, .Editor), {.F, true, false, false}, &doc, &dummy, 10)
+		fmt.printfln("dispatch Ctrl+F   -> find.active=%v", doc.find.active)
+		command_dispatch(resolve_key(.Escape, false, .Find), {.Escape, false, false, false}, &doc, &dummy, 10)
+		fmt.printfln("dispatch Esc      -> find.active=%v", doc.find.active)
 		doc_close(&doc)
 
 	case mode == "edittest":
