@@ -476,11 +476,51 @@ requests from live use, none urgent:
 Also fixed in passing (2026-07-19): filter used to scroll to the caret-nearest match unclamped, so
 a match near the end of the file showed two or three lines above a screen of empty rows.
 
+## 6i. Requested features — not yet built (Wyatt, 2026-07-19)
+
+**1. Undo history list, Photoshop-style.** A visible list of undo states with the ability to jump
+back to any one of them, rather than only stepping with Ctrl+Z.
+
+The buffer already supports this better than most editors would: `doc.undo` is a `[dynamic]Snapshot`
+and each `Snapshot` holds a **cloned piece tree** (`doc.odin`), so every past state is already
+materialised and reachable — jumping to state *n* is `apply_snapshot(doc, undo[n])` plus moving
+everything after it to the redo stack. What is missing is the UI and two hygiene problems this
+would expose:
+- **`push_undo` snapshots on every keystroke with no coalescing**, so typing a paragraph creates
+  hundreds of entries. A history list would make that obvious and useless. Needs run-coalescing
+  (group consecutive inserts with no caret jump) before a list is worth showing.
+- **`doc.undo` has no cap**, so it grows unbounded in a long-lived process. Cloning is proportional
+  to piece count, not bytes, but it is not free.
+Both are worth fixing regardless; the list is the feature that forces them.
+
+**2. Auto-reload when a file changes on disk** (e.g. CMTrace or another service appending to a log).
+
+This is a **CLAUDE.md hard rule that is currently unimplemented** — "external-change detection via
+timestamp polling, never held handles" — so it is owed anyway. Today Newtpad neither notices nor
+offers a reload, and a save silently clobbers whatever the other writer did. Grep confirms zero
+hits for `mtime`/`GetFileTime`/reload.
+
+Design notes for when it lands:
+- Poll `GetFileAttributesExW` (size + last-write) per visible tab on a timer, not a held handle —
+  the never-lock rule is absolute.
+- **Clean tab, file grew** → reload silently, and if the caret is at EOF keep it there. That is the
+  log-tailing case and the one Wyatt asked for.
+- **Clean tab, file changed otherwise** → reload, preserving caret/scroll by byte offset.
+- **Modified tab** → never silently discard the user's edits; surface a prompt or a marker.
+- The mmap path must handle a file that grows: `File_View` maps a fixed size, so an append is not
+  visible without remapping. The SEH guard already covers a file *shrinking* underneath us.
+- Interacts with the search worker: a reload invalidates the buffer, so it needs the same
+  cancel-and-restart treatment as an edit (`find_invalidate`).
+
+A minimal "follow the tail" mode was already parked in V2 (see the feature list at
+`git show 9db93d7:HANDOFF.md`); the detection half belongs in V1 because it is a correctness rule,
+not a feature.
+
 ## 7. Build environment (Windows, this machine)
 
-- **Headless test modes** (run against the debug exe): `sehtest`, `dpitest`, `regextest <mb>`,
-  `findtest`, `celltest`, `sessiontest`, `sessionlosstest <file> [old]`, `palettetest`, `vnavtest`,
-  `wraptest`, plus file-argument modes (`<file> keytest|findtest|filtertest|repltest|edittest`).
+- **Headless test modes** (run against the debug exe): `sehtest`, `dpitest`, `menutest`,
+  `settingstest`, `regextest <mb>`, `findtest`, `celltest`, `sessiontest`,
+  `sessionlosstest <file> [old]`, `palettetest`, `vnavtest`, `wraptest`, plus file-argument modes (`<file> keytest|findtest|filtertest|repltest|edittest`).
   **Set `NEWTPAD_SESSION_DIR` to a temp dir first** — the session modes otherwise write to the real
   store. Note a bare `odin build` omits the DPI manifest; use `build.bat` for anything visual.
 - **Odin** `dev-2026-07a` at `C:\Users\Wyatt\odin\dist`, on user PATH. **MSVC** from VS Community
