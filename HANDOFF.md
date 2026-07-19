@@ -224,10 +224,24 @@ UTF-8 and UTF-16LE edit/save/reopen with content + encoding intact. Also fixed: 
 launch now opens a scratch buffer instead of exiting (the "closes immediately" bug — the old
 default file paths were relative to the project root).
 
-**Next options:** (a) selection + clipboard + mouse click-to-position (the other half of
-"feels like an editor"); (b) find / filter-as-you-type (V1 headline; benchmark proved search
-is viable); (c) the RB piece tree (scale/multi-cursor); (d) shaping + font fallback
-(multilingual); (e) UI chrome (tabs, filename in title bar, draggable scrollbar); (f) reindex-
-on-edit + per-word undo coalescing (polish). Not yet verified interactively (environment
-can't inject keyboard/focus): live typing, Ctrl+S/dialog, undo — all use headless-verified
-paths, but worth a manual pass.
+**SELECTION + CLIPBOARD + MOUSE DONE (2026-07-18).** Selection = `[anchor,cursor)`;
+Shift+movement extends, plain movement collapses (Left/Right collapse to the selection edge).
+Edits replace/delete the selection as one undo step (undo restores the selection). Highlight =
+opaque quads behind text (`doc_selection_rects`). Clipboard via `CF_UNICODETEXT`
+(`platform/clipboard.odin`): Ctrl+C/X/V, Ctrl+A. Mouse (`window.odin` WM_LBUTTON*/MOUSEMOVE,
+`SetCapture`): click places caret, Shift+click / drag select, double-click = word, triple =
+line (`doc_pos_at` hit-test, monospace column mapping). Word keys: Ctrl+Left/Right,
+Ctrl+Backspace (`is_word`, `word_left_of/right_of`). Key events carry Shift; GetTickCount/
+GetDoubleClickTime hand-declared. Verified headless (`newtpad <file> seltest`):
+select/replace/undo-restores-selection, word boundaries, select-all, Unicode clipboard
+round-trip.
+
+The Save dialog also got Text/JSON/Markdown/Log/All filters + default `.txt`; the no-file
+crash was fixed (opens a scratch buffer). Wyatt confirmed live: open/save/undo work.
+
+**Next options:** (a) find / filter-as-you-type (V1 headline; benchmark proved search is
+viable); (b) the RB piece tree (scale / multi-cursor); (c) shaping + font fallback
+(multilingual); (d) UI chrome (tabs, filename in title bar, draggable scrollbar); (e) polish
+(reindex-on-edit so line count/scrollbar stay exact; per-word undo coalescing; goal-column for
+up/down; horizontal scroll for long lines). Interactive paths are headless-verified but a live
+pass (type, select with mouse+shift, Ctrl+C/V, Ctrl+Z) is always worth it.
