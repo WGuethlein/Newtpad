@@ -205,7 +205,9 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 // layout metrics and the glyph cache both have to follow.
 settings_apply_font :: proc(rc: ^Render_Ctx) {
 	s := rc.app.settings
-	if !plat.text_load_family(rc.text, s.font_family, s.font_style) {
+	// .Doc only — the chrome keeps its own typeface, so choosing a font for your
+	// text can never make the menus unreadable.
+	if !plat.text_load_family(rc.text, s.font_family, s.font_style, .Doc) {
 		// Keep the previous face rather than leaving nothing to draw with.
 		return
 	}

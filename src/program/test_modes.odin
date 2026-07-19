@@ -243,6 +243,32 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("unknown family falls back: %v  %s", okf, "OK" if okf else "FAIL")
 		if !okf {bad += 1}
 
+		// The chrome and the document must be independent: choosing a font for
+		// your text should never change the menus, and the two cell widths must
+		// not be shared. Both chains started as Consolas, so pick a family with a
+		// visibly different advance.
+		fmt.println("--- chrome vs document faces ---")
+		other := ""
+		for f in plat.FONT_FAMILIES {
+			if f.name != "Consolas" && plat.font_family_available(f) {
+				other = f.name
+				break
+			}
+		}
+		if other == "" {
+			fmt.println("  (only Consolas installed; cannot distinguish)")
+		} else {
+			ui_before := plat.text_char_em(&t, .UI)
+			plat.text_load_family(&t, other, .Regular, .Doc)
+			ui_after := plat.text_char_em(&t, .UI)
+			doc_after := plat.text_char_em(&t, .Doc)
+			unchanged := ui_before == ui_after
+			differs := doc_after != ui_after
+			fmt.printfln("  doc -> %s: ui em %.4f -> %.4f (unchanged=%v), doc em %.4f (differs=%v)  %s", other, ui_before, ui_after, unchanged, doc_after, differs, "OK" if unchanged && differs else "FAIL")
+			if !(unchanged && differs) {bad += 1}
+			plat.text_load_family(&t, "Consolas", .Regular, .Doc)
+		}
+
 		fmt.printfln("fonttest: %d failures", bad)
 		return true
 	}
@@ -800,7 +826,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		for scale in ([]f32{1.00, 1.05, 1.25, 1.50, 1.75, 2.00, 3.00}) {
 			px := f32(int(16 * scale + 0.5))
 			cw := plat.text_char_width(&t, px)
-			raw := t.char_em * px
+			raw := plat.text_char_em(&t, .Doc) * px
 			track := (cw - raw) / raw * 100
 			lh := line_height(px)
 			ok := cw == f32(int(cw)) && lh == f32(int(lh)) && cw >= 1 && lh >= 1

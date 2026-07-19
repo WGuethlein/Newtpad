@@ -502,6 +502,23 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		plat.quads_draw(gfx, quad_pipe, bars[:nb])
 	}
 
+	// Filter view replaces the document with just the matching lines, which is
+	// disorienting if you don't know why. Say so, and say how to leave.
+	//
+	// Drawn BEFORE the chrome: it sits at the top of the content area, which is
+	// exactly where menus and the palette drop down, and drawing it afterwards
+	// painted it over them.
+	if doc.filter && doc.find.active {
+		bh := sx(20)
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, CONTENT_TOP - bh}, size = {w, bh}, color = {0.18, 0.26, 0.20, 1}}})
+		msg := fmt.tprintf(
+			"FILTER  %d matching lines%s   —   Ctrl+L shows the whole file",
+			len(doc.filter_lines),
+			"" if doc_filtering(doc) else " (searching...)",
+		)
+		plat.text_draw(gfx, text, msg, sx(12), CONTENT_TOP - sx(6), UI_SMALL_PX, {0.70, 0.90, 0.74, 1})
+	}
+
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
 	if doc.kind == .Font {
 		font_page_draw(gfx, quad_pipe, text, rc.app, w, h)
@@ -514,20 +531,6 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 
 	if rc.app.palette.active {
 		palette_draw(gfx, quad_pipe, text, rc.app, w, h)
-	}
-
-	// Filter view replaces the document with just the matching lines, which is
-	// disorienting if you don't know why. Say so, unmistakably, and say how to
-	// leave — the previous signal was the word "filter" inside the find line.
-	if doc.filter && doc.find.active {
-		bh := sx(20)
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, CONTENT_TOP - bh}, size = {w, bh}, color = {0.18, 0.26, 0.20, 1}}})
-		msg := fmt.tprintf(
-			"FILTER  %d matching lines%s   —   Ctrl+L shows the whole file",
-			len(doc.filter_lines),
-			"" if doc_filtering(doc) else " (searching...)",
-		)
-		plat.text_draw(gfx, text, msg, sx(12), CONTENT_TOP - sx(6), UI_SMALL_PX, {0.70, 0.90, 0.74, 1})
 	}
 
 	if doc.find.active {
@@ -627,7 +630,7 @@ dp :: proc(rc: ^Render_Ctx, v: f32) -> f32 {
 metrics_recompute :: proc(rc: ^Render_Ctx) {
 	rc.px = dp(rc, BASE_PX)
 	rc.line_h = line_height(rc.px)
-	rc.char_w = plat.text_char_width(rc.text, rc.px)
+	rc.char_w = plat.text_char_width(rc.text, rc.px, .Doc) // the document's grid
 
 	// The chrome. Sole writer of these — see the note on their declarations.
 	UI_SCALE = plat.window_scale(rc.window)

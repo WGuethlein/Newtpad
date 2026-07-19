@@ -78,9 +78,11 @@ font_page_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, a
 	// drawn at the raw 96-DPI number would show 16px text on a 200% display
 	// while the document showed 32px.
 	px := active_render_ctx.px if active_render_ctx != nil else sx(f32(app.settings.font_size))
-	plat.text_draw(gfx, t, "The quick brown fox jumps over the lazy dog", x, y, px, {0.88, 0.91, 0.96, 1})
+	// .Doc: the preview must show the face the document will actually use, not
+	// the chrome face this page is otherwise drawn in.
+	plat.text_draw(gfx, t, "The quick brown fox jumps over the lazy dog", x, y, px, {0.88, 0.91, 0.96, 1}, .Doc)
 	y += px * 1.6
-	plat.text_draw(gfx, t, "0123456789  {}[]()<>  il1| oO0  ->  ==  !=", x, y, px, {0.75, 0.80, 0.88, 1})
+	plat.text_draw(gfx, t, "0123456789  {}[]()<>  il1| oO0  ->  ==  !=", x, y, px, {0.75, 0.80, 0.88, 1}, .Doc)
 
 	// Families are filtered to monospaced ones on purpose; say so, or the short
 	// list looks like a bug.

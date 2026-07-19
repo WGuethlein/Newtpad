@@ -250,7 +250,12 @@ find_merge :: proc(doc: ^Document) {
 	// Select the caret-nearest match exactly once per query. Re-running this on
 	// every merge would yank the viewport around as later results arrive while
 	// the user is still typing.
-	if !f.jumped && n > 0 {
+	// Never in filter view. The jump exists to bring the caret-nearest match on
+	// screen while stepping through matches; in a filtered list the point is to
+	// see all of them, so it must start and stay at the top. Setting `jumped` at
+	// open was not enough — every keystroke restarts the search, and the restart
+	// clears it.
+	if !f.jumped && n > 0 && !doc.filter {
 		f.jumped = true
 		f.current = 0
 		// Reference the START of any selection, not the caret. Selecting a match

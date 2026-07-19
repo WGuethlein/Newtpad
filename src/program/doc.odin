@@ -140,7 +140,7 @@ wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (end: int, 
 			r, sz := utf8.decode_rune(buf[i:n])
 			if sz == 0 {sz = 1}
 			if i + sz > n && pos + n < L {break} // rune straddles the chunk; refill
-			cw := plat.text_cell_width(t, r)
+			cw := plat.text_cell_width(t, r, .Doc)
 			if col + cw > c && col > 0 {
 				if last_break > p {return last_break, false}
 				return pos + i, false // char-break an over-long word
@@ -1222,7 +1222,7 @@ line_cell_col :: proc(doc: ^Document, t: ^plat.Text, ls, off: int) -> int {
 	buf: [VISIBLE_COLS * 4]u8 // <=4 bytes per cell, <=VISIBLE_COLS cells
 	n := min(off - ls, len(buf))
 	got := base.pt_read(&doc.pt, ls, buf[:n])
-	return plat.text_cells(t, buf[:got])
+	return plat.text_cells(t, buf[:got], .Doc)
 }
 
 // Inverse: byte offset within line [ls, le] at cell column `col` (rune-rounded).
@@ -1231,7 +1231,7 @@ line_offset_at_cell :: proc(doc: ^Document, t: ^plat.Text, ls, le, col: int) -> 
 	buf: [VISIBLE_COLS * 4]u8
 	n := min(le - ls, len(buf))
 	got := base.pt_read(&doc.pt, ls, buf[:n])
-	return min(ls + plat.text_bytes_for_cells(t, buf[:got], col), le)
+	return min(ls + plat.text_bytes_for_cells(t, buf[:got], col, .Doc), le)
 }
 
 // Byte offset under a client-space pixel (cell-grid column mapping).
@@ -1356,14 +1356,14 @@ doc_draw :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, px, char_w: f32,
 					plat.text_draw(gfx, t, num, nx, row_y, px, {0.42, 0.47, 0.56, 1})
 				}
 			}
-			plat.text_draw(gfx, t, string(line_buf[:vis]), col_x(char_w, 0), row_y, px, fg)
+			plat.text_draw(gfx, t, string(line_buf[:vis]), col_x(char_w, 0), row_y, px, fg, .Doc)
 		}
 
 		// Caret on this row: [start, end], but a wrap point (non-line-end `end`)
 		// belongs to the next visual row's start, so exclude it here.
 		if doc.cursor >= start && doc.cursor <= end && (line_end || doc.cursor < end) {
 			cprefix := min(doc.cursor - start, n) // cells before caret, clipped to drawn text
-			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix]))
+			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix], .Doc))
 			cy = row_y
 			caret = true
 		}

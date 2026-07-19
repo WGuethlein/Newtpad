@@ -28,6 +28,22 @@ ATLAS_MAX :: 4096
 MAX_TEXT_INSTANCES :: 4096
 MAX_FACES :: 8
 
+// Which typeface a piece of text belongs to. The document's font is the user's
+// choice; the chrome's is fixed, so choosing a document font cannot make the
+// menus unreadable.
+Font_Set :: enum u8 {
+	UI,
+	Doc,
+}
+
+// A primary face plus its per-codepoint fallbacks.
+Face_Chain :: struct {
+	faces:   [MAX_FACES]^IFontFace,
+	units:   [MAX_FACES]f32, // designUnitsPerEm per face
+	n:       int,
+	char_em: f32, // primary 'x' advance as a fraction of em == one cell's width
+}
+
 Font_Style :: enum u8 {
 	Regular,
 	Bold,
@@ -109,6 +125,7 @@ FALLBACK_FONTS := [?]struct {
 }
 
 Glyph_Key :: struct {
+	set:   u8, // which chain the face index belongs to
 	face:  u8,
 	index: u16,
 	px:    u16,
@@ -132,11 +149,11 @@ Text_Instance :: struct {
 Text :: struct {
 	// DirectWrite fonts: [0] primary, [1..] fallbacks
 	factory:    ^IFactory,
-	faces:      [MAX_FACES]^IFontFace,
-	units:      [MAX_FACES]f32, // designUnitsPerEm per face
-	nfaces:     int,
-	char_em:    f32, // primary 'x' advance as a fraction of em == one cell's width
-	cell_cache: map[rune]u8, // codepoint -> monospace cells (0 combining / 1 / 2 wide)
+	// Two independent face chains. The chrome must not change typeface when the
+	// user picks a font for their text: menus, tabs and the status bar are the
+	// application, not the document.
+	chains:     [Font_Set]Face_Chain,
+	cell_cache: [Font_Set]map[rune]u8, // codepoint -> cells; depends on char_em, so per chain
 
 	// atlas + cache
 	atlas:     ^d3d.ITexture2D,
@@ -219,7 +236,10 @@ PSOut ps_main(VSOut i) {
 // so this can run headless (see the `celltest` mode). text_init calls it before
 // building the GPU pipeline.
 text_load_faces :: proc(t: ^Text) -> (ok: bool) {
-	return text_load_family(t, "Consolas", .Regular)
+	// The chrome's typeface is fixed and loaded once; the document starts on the
+	// same family until settings say otherwise.
+	if !text_load_family(t, "Consolas", .Regular, .UI) {return false}
+	return text_load_family(t, "Consolas", .Regular, .Doc)
 }
 
 // The 'x' advance of a face as a fraction of em — one cell's width.
@@ -235,8 +255,8 @@ face_char_em :: proc(face: ^IFontFace, units: f32) -> f32 {
 }
 
 @(private = "file")
-add_face :: proc(t: ^Text, file_name: string, kind: FONT_FACE_TYPE, index: u32) -> bool {
-	if t.nfaces >= MAX_FACES {return false}
+add_face :: proc(t: ^Text, c: ^Face_Chain, file_name: string, kind: FONT_FACE_TYPE, index: u32) -> bool {
+	if c.n >= MAX_FACES {return false}
 	path := strings.concatenate({fonts_dir(), file_name}, context.temp_allocator)
 	wpath := win.utf8_to_wstring(path, context.temp_allocator)
 	file: ^IFontFile
@@ -251,16 +271,16 @@ add_face :: proc(t: ^Text, file_name: string, kind: FONT_FACE_TYPE, index: u32) 
 	file->Release() // the face keeps its own reference
 	fm: FONT_METRICS
 	face->GetMetrics(&fm)
-	t.faces[t.nfaces] = face
-	t.units[t.nfaces] = f32(fm.designUnitsPerEm)
-	t.nfaces += 1
+	c.faces[c.n] = face
+	c.units[c.n] = f32(fm.designUnitsPerEm)
+	c.n += 1
 	return true
 }
 
 // Load `family` in `style` as the primary face, then the fallback chain.
 // Returns false and leaves the previous faces in place if the family cannot be
 // loaded, so a missing font never leaves the app with nothing to draw with.
-text_load_family :: proc(t: ^Text, family: string, style: Font_Style) -> bool {
+text_load_family :: proc(t: ^Text, family: string, style: Font_Style, set := Font_Set.Doc) -> bool {
 	if t.factory == nil {
 		if hr := DWriteCreateFactory(.SHARED, &IID_IFactory, &t.factory); !win.SUCCEEDED(hr) {
 			fmt.eprintfln("DWriteCreateFactory failed: 0x%X", u32(hr))
@@ -290,28 +310,25 @@ text_load_family :: proc(t: ^Text, family: string, style: Font_Style) -> bool {
 	case .Regular:
 	}
 
-	// Build into a scratch Text so a failure can't strand us faceless.
-	fresh: Text
-	fresh.factory = t.factory
-	if !add_face(&fresh, file, .TRUETYPE, 0) {
-		if file == chosen.regular || !add_face(&fresh, chosen.regular, .TRUETYPE, 0) {
-			for i in 0 ..< fresh.nfaces {fresh.faces[i]->Release()}
+	// Build into a scratch chain so a failure can't strand us faceless.
+	fresh: Face_Chain
+	if !add_face(t, &fresh, file, .TRUETYPE, 0) {
+		if file == chosen.regular || !add_face(t, &fresh, chosen.regular, .TRUETYPE, 0) {
+			for i in 0 ..< fresh.n {fresh.faces[i]->Release()}
 			return false
 		}
 	}
 	for fdef in FALLBACK_FONTS {
-		add_face(&fresh, fdef.file, fdef.kind, fdef.face)
+		add_face(t, &fresh, fdef.file, fdef.kind, fdef.face)
 	}
+	fresh.char_em = face_char_em(fresh.faces[0], fresh.units[0])
 
 	// Release the faces we are replacing, then adopt the new ones.
-	for i in 0 ..< t.nfaces {
-		if t.faces[i] != nil {t.faces[i]->Release()}
-		t.faces[i] = nil
+	old := &t.chains[set]
+	for i in 0 ..< old.n {
+		if old.faces[i] != nil {old.faces[i]->Release()}
 	}
-	t.faces = fresh.faces
-	t.units = fresh.units
-	t.nfaces = fresh.nfaces
-	t.char_em = face_char_em(t.faces[0], t.units[0])
+	t.chains[set] = fresh
 	// Every cached glyph and cell width belongs to the old face.
 	text_reset_atlas(t)
 	return true
@@ -423,8 +440,8 @@ text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
 // two apart by (cell_w - raw) per column: ~0.2px/col for Consolas at 16px, which
 // is 400px of divergence by VISIBLE_COLS. Both sides must call this one proc.
 // Guarded by `newtpad dpitest`.
-text_char_width :: proc(t: ^Text, px: f32) -> f32 {
-	return max(1, f32(int(t.char_em * px + 0.5)))
+text_char_width :: proc(t: ^Text, px: f32, set := Font_Set.UI) -> f32 {
+	return max(1, f32(int(t.chains[set].char_em * px + 0.5)))
 }
 
 // Nonspacing combining marks and zero-width format characters. These need a
@@ -469,45 +486,46 @@ is_zero_width :: proc(r: rune) -> bool {
 // a missing-glyph box because no font has a glyph for U+0009.
 TAB_CELLS :: 4
 
-text_cell_width :: proc(t: ^Text, r: rune) -> int {
+text_cell_width :: proc(t: ^Text, r: rune, set := Font_Set.UI) -> int {
 	if r == '\t' {return TAB_CELLS}
-	if c, found := t.cell_cache[r]; found {return int(c)}
+	if c, found := t.cell_cache[set][r]; found {return int(c)}
+	c := &t.chains[set]
 	cells: u8 = 1
 	if is_zero_width(r) {
 		cells = 0
 	} else {
-		face, gi := rune_face(t, r)
+		face, gi := rune_face(t, r, set)
 		if gi != 0 {
 			gm: GLYPH_METRICS
 			idx := gi
-			t.faces[face]->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
-			adv_em := f32(gm.advanceWidth) / t.units[face]
-			if adv_em < 0.01 * t.char_em {
+			c.faces[face]->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
+			adv_em := f32(gm.advanceWidth) / c.units[face]
+			if adv_em < 0.01 * c.char_em {
 				cells = 0 // font reports zero advance
-			} else if adv_em > 1.5 * t.char_em {
+			} else if adv_em > 1.5 * c.char_em {
 				cells = 2 // wide / full-width
 			}
 		}
 	}
-	t.cell_cache[r] = cells
+	t.cell_cache[set][r] = cells
 	return int(cells)
 }
 
 // Total cells spanned by a UTF-8 slice (sum of per-rune cell widths).
-text_cells :: proc(t: ^Text, s: []u8) -> int {
+text_cells :: proc(t: ^Text, s: []u8, set := Font_Set.UI) -> int {
 	col := 0
-	for r in string(s) {col += text_cell_width(t, r)}
+	for r in string(s) {col += text_cell_width(t, r, set)}
 	return col
 }
 
 // Bytes of `s` that fill up to `target` cells, rounded to a rune boundary. Maps a
 // click's cell column back to a byte offset (inverse of text_cells).
-text_bytes_for_cells :: proc(t: ^Text, s: []u8, target: int) -> int {
+text_bytes_for_cells :: proc(t: ^Text, s: []u8, target: int, set := Font_Set.UI) -> int {
 	str := string(s)
 	col, i := 0, 0
 	for i < len(str) {
 		r, w := utf8.decode_rune(str[i:])
-		cw := text_cell_width(t, r)
+		cw := text_cell_width(t, r, set)
 		if col + cw > target {break} // target lands within this rune's cell span
 		col += cw
 		i += w
@@ -518,29 +536,33 @@ text_bytes_for_cells :: proc(t: ^Text, s: []u8, target: int) -> int {
 // Pick the first loaded face that has a glyph for r; fall back to the primary
 // (which renders .notdef) if none does. Per-codepoint fallback, no shaping.
 @(private)
-rune_face :: proc(t: ^Text, r: rune) -> (face: int, gi: u16) {
+rune_face :: proc(t: ^Text, r: rune, set := Font_Set.UI) -> (face: int, gi: u16) {
+	c := &t.chains[set]
 	cp := u32(r)
-	for fi in 0 ..< t.nfaces {
+	for fi in 0 ..< c.n {
 		g: u16
-		t.faces[fi]->GetGlyphIndices(&cp, 1, &g)
+		c.faces[fi]->GetGlyphIndices(&cp, 1, &g)
 		if g != 0 {
 			return fi, g
 		}
 	}
 	g: u16
-	t.faces[0]->GetGlyphIndices(&cp, 1, &g)
+	c.faces[0]->GetGlyphIndices(&cp, 1, &g)
 	return 0, g
 }
 
 // Draw a UTF-8 string with its baseline at (x, y), left-to-right.
-text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32) {
+// `set` selects the typeface: chrome text uses the fixed UI face, the document
+// uses whichever family the user chose. Defaulting to UI means only the document
+// draw has to say so.
+text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32, set := Font_Set.UI) {
 	instances := make([dynamic]Text_Instance, 0, len(str))
 	defer delete(instances)
 	// The atlas must hold still while these UVs are being collected.
 	t.drawing = true
 	defer t.drawing = false
 
-	cell_w := text_char_width(t, px) // same rounded advance the program's grid uses
+	cell_w := text_char_width(t, px, set) // same rounded advance the program's grid uses
 	pen := x
 	for r in str {
 		cells := text_cell_width(t, r)
@@ -548,8 +570,8 @@ text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32
 			pen += f32(cells) * cell_w // whitespace: advance, draw nothing
 			continue
 		}
-		face, gi := rune_face(t, r)
-		g := glyph_get(gfx, t, face, gi, px)
+		face, gi := rune_face(t, r, set)
+		g := glyph_get(gfx, t, set, face, gi, px)
 		if g.w > 0 && g.h > 0 {
 			// Combining marks (0 cells) sit over the previous cell, not after it.
 			glyph_x := pen - cell_w if cells == 0 else pen
@@ -597,8 +619,8 @@ text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32
 }
 
 @(private)
-glyph_get :: proc(gfx: ^Gfx, t: ^Text, face: int, index: u16, px: f32) -> Glyph {
-	key := Glyph_Key{u8(face), index, u16(px)}
+glyph_get :: proc(gfx: ^Gfx, t: ^Text, set: Font_Set, face: int, index: u16, px: f32) -> Glyph {
+	key := Glyph_Key{u8(set), u8(face), index, u16(px)}
 	if g, found := t.cache[key]; found {
 		return g
 	}
@@ -607,10 +629,11 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, face: int, index: u16, px: f32) -> Glyph 
 	// advance from design metrics
 	gm: GLYPH_METRICS
 	idx := index
-	t.faces[face]->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
-	g.advance = f32(gm.advanceWidth) * px / t.units[face]
+	c := &t.chains[set]
+	c.faces[face]->GetDesignGlyphMetrics(&idx, 1, &gm, win.BOOL(false))
+	g.advance = f32(gm.advanceWidth) * px / c.units[face]
 
-	cov, gw, gh, left, top := glyph_rasterize(t, face, index, px)
+	cov, gw, gh, left, top := glyph_rasterize(t, set, face, index, px)
 	g.w = gw
 	g.h = gh
 	g.left = left
@@ -748,7 +771,7 @@ text_atlas_dim :: proc(t: ^Text) -> i32 {return t.atlas_w}
 
 // The primary face's cell width as a fraction of em. Exposed so a test can check
 // that a family's styles agree — the cell grid assumes one advance for all text.
-text_char_em :: proc(t: ^Text) -> f32 {return t.char_em}
+text_char_em :: proc(t: ^Text, set := Font_Set.Doc) -> f32 {return t.chains[set].char_em}
 
 // How many `gw`x`gh` boxes the shelf packer fits in a `dim` square. Pure
 // arithmetic mirroring atlas_pack, so capacity can be checked without a GPU.
@@ -778,7 +801,7 @@ text_reset_atlas :: proc(t: ^Text) {
 	// Cell widths depend on char_em and on which face serves a rune, so a font
 	// change invalidates them too — a stale entry desyncs the column grid from
 	// what text_draw actually advances.
-	clear(&t.cell_cache)
+	for set in Font_Set {clear(&t.cell_cache[set])}
 	t.pack_x, t.pack_y, t.shelf_h = 0, 0, 0
 	t.atlas_full = false
 }
@@ -786,10 +809,10 @@ text_reset_atlas :: proc(t: ^Text) {
 // Returns the 3-channel ClearType coverage (caller frees) and placement, with
 // the run's baseline origin at (0,0) so left/top are pen-relative bearings.
 @(private)
-glyph_rasterize :: proc(t: ^Text, face: int, index: u16, px: f32) -> (cov: []u8, gw, gh, left, top: i32) {
+glyph_rasterize :: proc(t: ^Text, set: Font_Set, face: int, index: u16, px: f32) -> (cov: []u8, gw, gh, left, top: i32) {
 	idx := index
 	run := GLYPH_RUN {
-		fontFace     = t.faces[face],
+		fontFace     = t.chains[set].faces[face],
 		fontEmSize   = px,
 		glyphCount   = 1,
 		glyphIndices = &idx,
