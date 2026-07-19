@@ -380,6 +380,42 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		key_chk(resolve_key(.H, true, false, .Editor), .Replace_Open, "Ctrl+H / Editor")
 		key_chk(resolve_key(.H, true, false, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find")
 		key_chk(resolve_key(.A, false, false, .Editor), .None, "a (unbound)")
+		// Reported as dead in the GUI (2026-07-19); pin what the keymap resolves.
+		key_chk(resolve_key(.A, true, false, .Editor), .Select_All, "Ctrl+A / Editor")
+		key_chk(resolve_key(.P, true, false, .Editor), .Palette_Open, "Ctrl+P / Editor")
+		key_chk(resolve_key(.L, true, false, .Editor), .Find_Toggle_Filter, "Ctrl+L / Editor")
+		key_chk(resolve_key(.L, true, false, .Find), .Find_Toggle_Filter, "Ctrl+L / Find")
+		// The real defect: Find context has no fallback to the Editor bindings, so
+		// every editor chord is dead while the find bar is open.
+		key_chk(resolve_key(.A, true, false, .Find), .Select_All, "Ctrl+A / Find")
+		key_chk(resolve_key(.P, true, false, .Find), .Palette_Open, "Ctrl+P / Find")
+		key_chk(resolve_key(.S, true, false, .Find), .Save, "Ctrl+S / Find")
+		key_chk(resolve_key(.C, true, false, .Find), .Copy, "Ctrl+C / Find")
+		key_chk(resolve_key(.Z, true, false, .Find), .Undo, "Ctrl+Z / Find")
+		key_chk(resolve_key(.N, true, false, .Find), .Tab_New, "Ctrl+N / Find")
+		// These must NOT fall through — Find deliberately overrides them.
+		key_chk(resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find (override)")
+		key_chk(resolve_key(.Escape, false, false, .Find), .Find_Close, "Esc / Find (override)")
+		key_chk(resolve_key(.H, true, false, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find (override)")
+		// Unmodified keys must stay owned by the mode: falling these through would
+		// edit and navigate the document while the user types a query.
+		key_chk(resolve_key(.Delete, false, false, .Find), .None, "Delete / Find (no fall)")
+		key_chk(resolve_key(.Left, false, false, .Find), .None, "Left / Find (no fall)")
+		key_chk(resolve_key(.Home, false, false, .Find), .None, "Home / Find (no fall)")
+		// The palette is a text field: nothing falls through to the editor.
+		key_chk(resolve_key(.A, true, false, .Palette), .None, "Ctrl+A / Palette (no fall)")
+		key_chk(resolve_key(.S, true, false, .Palette), .None, "Ctrl+S / Palette (no fall)")
+		// ...and what dispatch actually does with them.
+		d0 := app_active(&app)
+		d0.cursor, d0.anchor = 0, 0
+		command_dispatch(.Select_All, {}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Ctrl+A   -> anchor=%d cursor=%d len=%d", d0.anchor, d0.cursor, d0.pt.length)
+		command_dispatch(resolve_key(.P, true, false, .Editor), {.P, true, false, false}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Ctrl+P   -> palette.active=%v results=%d", app.palette.active, len(app.palette.results))
+		// Arrowing past the drawn window (12 rows) — does selected stay visible?
+		for i in 0 ..< 30 {palette_move(&app, 1)}
+		fmt.printfln("palette Down x30  -> selected=%d of %d (drawn rows=12)", app.palette.selected, len(app.palette.results))
+		palette_close(&app)
 		// dispatch effects (dummy window/text; these commands don't touch them)
 		app_active(&app).cursor = 0
 		command_dispatch(resolve_key(.Right, false, false, .Editor), {.Right, false, false, false}, &app, &dummy, &dtext, 10)

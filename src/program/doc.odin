@@ -135,10 +135,18 @@ visible_begin :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> Visible_Iter 
 	return {doc = doc, t = t, rows = rows, pos = doc.top}
 }
 
+// Filter view only actually filters once there are matching lines. With the
+// filter armed but nothing matched yet — an empty query, or a worker that hasn't
+// published — the document renders normally instead of showing a blank screen.
+// That is what lets Ctrl+L arm the filter first and narrow as the user types.
+doc_filtering :: proc(doc: ^Document) -> bool {
+	return doc.filter && len(doc.filter_lines) > 0
+}
+
 visible_next :: proc(it: ^Visible_Iter) -> (row, start, end: int, line_end, ok: bool) {
 	if it.done || it.r >= it.rows {return}
 	d := it.doc
-	if d.filter {
+	if doc_filtering(d) {
 		fi := d.filter_top + it.r
 		if fi >= len(d.filter_lines) {return}
 		start = d.filter_lines[fi]

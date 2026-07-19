@@ -220,13 +220,35 @@ request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
 	app_close(app, slot)
 }
 
-// Map a key press to a command within the active context (shift ignored here; the
-// action reads it). First matching binding wins; a user overlay would prepend.
-resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
+@(private = "file")
+lookup_binding :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 	for b in default_bindings {
 		if b.key == key && b.ctrl == ctrl && b.alt == alt && b.ctx == ctx {
 			return b.cmd
 		}
+	}
+	return .None
+}
+
+// Map a key press to a command within the active context (shift ignored here; the
+// action reads it). First matching binding wins; a user overlay would prepend.
+//
+// Find falls back to the editor keymap for *modified* chords only. Without the
+// fallback, opening the find bar killed every global chord — Ctrl+S, Ctrl+P,
+// Ctrl+A, Ctrl+C, Ctrl+Z, Ctrl+N all resolved to nothing, which is what made
+// Ctrl+A and Ctrl+P look broken. The ctrl/alt restriction is the important half:
+// an unmodified fallback would send plain Delete to Delete_Fwd and the arrows to
+// the caret, so typing a query would quietly edit and navigate the document.
+// Unmodified keys stay owned by the mode.
+//
+// The palette does not fall back at all: it is a text field first, and every
+// printable key belongs to its query.
+resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
+	if cmd := lookup_binding(key, ctrl, alt, ctx); cmd != .None {
+		return cmd
+	}
+	if ctx == .Find && (ctrl || alt) {
+		return lookup_binding(key, ctrl, alt, .Editor)
 	}
 	return .None
 }
