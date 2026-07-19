@@ -7,6 +7,7 @@ import win "core:sys/windows"
 // Not present in core:sys/windows; hand-declare (used for click-count timing).
 foreign import user32_extra "system:User32.lib"
 foreign import kernel32_extra "system:Kernel32.lib"
+foreign import dwmapi "system:Dwmapi.lib"
 
 @(default_calling_convention = "system")
 foreign kernel32_extra {
@@ -16,6 +17,42 @@ foreign kernel32_extra {
 foreign user32_extra {
 	GetDoubleClickTime :: proc() -> u32 ---
 }
+@(default_calling_convention = "system")
+foreign dwmapi {
+	DwmExtendFrameIntoClientArea :: proc(hwnd: win.HWND, margins: ^MARGINS) -> win.HRESULT ---
+	DwmSetWindowAttribute :: proc(hwnd: win.HWND, attr: u32, value: rawptr, size: u32) -> win.HRESULT ---
+}
+
+// --- custom (borderless) window frame: we keep the OS resize/min/max behaviour
+// and the Win11 rounded corners + shadow, but replace the caption with our tab
+// bar. See wnd_proc's WM_NCCALCSIZE / WM_NCHITTEST / WM_NCLBUTTONDOWN. ---
+@(private = "file")
+MARGINS :: struct {
+	cxLeftWidth, cxRightWidth, cyTopHeight, cyBottomHeight: i32,
+}
+@(private = "file")
+NCCALCSIZE_PARAMS :: struct {
+	rgrc:  [3]win.RECT,
+	lppos: ^win.WINDOWPOS,
+}
+DWMWA_WINDOW_CORNER_PREFERENCE :: 33
+DWMWCP_ROUND: i32 : 2
+RESIZE_BORDER :: i32(6) // hit-test thickness of the resize edges
+CAPTION_BTN_W :: i32(46) // width of each min/max/close button
+// hit-test codes (not all in core:sys/windows)
+HT_CLIENT :: 1
+HT_CAPTION :: 2
+HT_MINBUTTON :: 8
+HT_MAXBUTTON :: 9
+HT_LEFT :: 10
+HT_RIGHT :: 11
+HT_TOP :: 12
+HT_TOPLEFT :: 13
+HT_TOPRIGHT :: 14
+HT_BOTTOM :: 15
+HT_BOTTOMLEFT :: 16
+HT_BOTTOMRIGHT :: 17
+HT_CLOSE :: 20
 
 // A single top-level OS window. Platform types stay in this layer; upper
 // layers see only this opaque handle and the procs below.
@@ -85,6 +122,12 @@ Window :: struct {
 	height:       i32,
 	should_close: bool,
 	resized:      bool,
+	maximized:    bool,
+	// custom title bar geometry (set by the program each frame, read by the NC
+	// hit-test): bar height and the x where the tab/menu region ends (left of it
+	// is client, right of it up to the window buttons is a drag region).
+	titlebar_h:   i32,
+	tabs_right:   i32,
 	// optional repaint callback, invoked from WM_SIZE so the app can render live
 	// during the OS modal resize loop (which blocks the main loop).
 	on_resize:    proc "contextless" (user: rawptr),
@@ -151,7 +194,25 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 		hinstance,
 		w, // handed to WM_NCCREATE so wnd_proc can find this Window
 	)
+
+	// Custom frame: keep a 1px DWM frame extension for the drop shadow, and force
+	// Win11 rounded corners. The caption itself is removed in WM_NCCALCSIZE.
+	m := MARGINS{0, 0, 1, 0}
+	DwmExtendFrameIntoClientArea(w.hwnd, &m)
+	corner := DWMWCP_ROUND
+	DwmSetWindowAttribute(w.hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, size_of(corner))
+	// Force the frame to recompute now that our WM_NCCALCSIZE is in effect.
+	win.SetWindowPos(w.hwnd, nil, 0, 0, 0, 0, win.SWP_FRAMECHANGED | win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOZORDER)
 	return w
+}
+
+// Cursor position in this window's client coordinates (for title-bar button
+// hover, since the buttons are non-client and don't get WM_MOUSEMOVE).
+window_cursor_client :: proc(w: ^Window) -> (x, y: i32) {
+	pt: win.POINT
+	win.GetCursorPos(&pt)
+	win.ScreenToClient(w.hwnd, &pt)
+	return pt.x, pt.y
 }
 
 window_set_title :: proc(w: ^Window, title: string) {
@@ -188,9 +249,78 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 	case win.WM_CLOSE, win.WM_DESTROY:
 		w.should_close = true
 		return 0
+	case win.WM_NCCALCSIZE:
+		if wparam == 0 {
+			break // wParam==FALSE: let DefWindowProc handle it
+		}
+		// Remove the caption: leave the client rect = full window rect. When
+		// maximized, inset by the frame so we don't overflow the monitor/taskbar.
+		if bool(win.IsZoomed(hwnd)) {
+			p := (^NCCALCSIZE_PARAMS)(uintptr(lparam))
+			fx := win.GetSystemMetrics(win.SM_CXFRAME) + win.GetSystemMetrics(win.SM_CXPADDEDBORDER)
+			fy := win.GetSystemMetrics(win.SM_CYFRAME) + win.GetSystemMetrics(win.SM_CXPADDEDBORDER)
+			p.rgrc[0].left += fx
+			p.rgrc[0].right -= fx
+			p.rgrc[0].top += fy
+			p.rgrc[0].bottom -= fy
+		}
+		return 0
+	case win.WM_NCHITTEST:
+		pt := win.POINT{i32(i16(lparam & 0xFFFF)), i32(i16((lparam >> 16) & 0xFFFF))}
+		win.ScreenToClient(hwnd, &pt)
+		x, y, W, H := pt.x, pt.y, w.width, w.height
+		if !bool(win.IsZoomed(hwnd)) {
+			rb := RESIZE_BORDER
+			top, bot, lft, rgt := y < rb, y >= H - rb, x < rb, x >= W - rb
+			switch {
+			case top && lft:
+				return HT_TOPLEFT
+			case top && rgt:
+				return HT_TOPRIGHT
+			case bot && lft:
+				return HT_BOTTOMLEFT
+			case bot && rgt:
+				return HT_BOTTOMRIGHT
+			case top:
+				return HT_TOP
+			case bot:
+				return HT_BOTTOM
+			case lft:
+				return HT_LEFT
+			case rgt:
+				return HT_RIGHT
+			}
+		}
+		if y < w.titlebar_h {
+			switch {
+			case x >= W - CAPTION_BTN_W:
+				return HT_CLOSE
+			case x >= W - 2 * CAPTION_BTN_W:
+				return HT_MAXBUTTON
+			case x >= W - 3 * CAPTION_BTN_W:
+				return HT_MINBUTTON
+			case x < w.tabs_right:
+				return HT_CLIENT // tabs / menu / + : the program handles the click
+			}
+			return HT_CAPTION // empty title-bar area: OS drag / double-click-maximize
+		}
+		return HT_CLIENT
+	case win.WM_NCLBUTTONDOWN:
+		switch wparam {
+		case HT_MINBUTTON:
+			win.ShowWindow(hwnd, win.SW_MINIMIZE)
+			return 0
+		case HT_MAXBUTTON:
+			win.ShowWindow(hwnd, win.SW_RESTORE if bool(win.IsZoomed(hwnd)) else win.SW_MAXIMIZE)
+			return 0
+		case HT_CLOSE:
+			win.PostMessageW(hwnd, win.WM_CLOSE, 0, 0)
+			return 0
+		}
 	case win.WM_SIZE:
 		w.width = i32(lparam & 0xFFFF)
 		w.height = i32((lparam >> 16) & 0xFFFF)
+		w.maximized = bool(win.IsZoomed(hwnd))
 		if w.on_resize != nil {
 			w.on_resize(w.resize_user) // repaint live during the modal resize loop
 		} else {

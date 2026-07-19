@@ -63,6 +63,7 @@ main :: proc() {
 	rc := Render_Ctx{&gfx, &text, &quad_pipe, &app, window, px, char_w, line_h}
 	window.on_resize = on_resize
 	window.resize_user = &rc
+	window.titlebar_h = i32(TAB_STRIP_H) // valid before the first render (NC hit-test)
 
 	// Debounced session autosave: save ~2s after input settles (crash safety).
 	session_dirty := false
@@ -280,7 +281,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		plat.quads_draw(gfx, quad_pipe, bars[:nb])
 	}
 
-	tabs_draw(gfx, quad_pipe, text, rc.app, w)
+	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
 
 	if rc.app.palette.active {
 		palette_draw(gfx, quad_pipe, text, rc.app, w, h)

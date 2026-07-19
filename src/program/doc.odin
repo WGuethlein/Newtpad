@@ -25,7 +25,7 @@ VISIBLE_COLS :: 2048
 
 TEXT_MARGIN_X :: f32(12) // left gutter before text (px)
 TEXT_MARGIN_Y :: f32(10) // top gutter above the first line (px)
-TAB_STRIP_H :: f32(26) // height of the tab strip above the content (px)
+TAB_STRIP_H :: f32(36) // height of the custom title bar (tabs + window buttons)
 LINE_SPACING :: f32(1.5) // line height = font px * this
 
 // Content-area top edge: below the tab strip.
