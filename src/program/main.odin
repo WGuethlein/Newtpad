@@ -21,6 +21,15 @@ main :: proc() {
 		path = os.args[1]
 	}
 
+	// One instance per user: a second launch hands its file to the running window
+	// and exits, so only one process owns the session file and backups. If the
+	// hand-off fails (owner starting up or shutting down) we run normally rather
+	// than lose the file — see the primary check on session save below.
+	primary := plat.instance_claim()
+	if !primary && plat.instance_send_open(path) {
+		return
+	}
+
 	window := plat.window_create("Newtpad", 1280, 720)
 
 	gfx, ok := plat.gfx_init(window)
@@ -49,8 +58,8 @@ main :: proc() {
 			fmt.eprintfln("Newtpad: could not open %q; starting empty", path)
 			app_new_scratch(&app)
 		}
-	} else if !session_restore(&app) { // bare launch: restore last session
-		app_new_scratch(&app)
+	} else if !(primary && session_restore(&app)) { // bare launch: restore last session
+		app_new_scratch(&app) // a non-primary fallback never touches the session
 	}
 	defer app_destroy(&app)
 
@@ -76,6 +85,20 @@ main :: proc() {
 		if window.char_count > 0 || window.key_count > 0 || window.mouse_pressed || window.mouse_middle_pressed {
 			session_dirty = true
 			last_input = time.tick_now()
+		}
+
+		// Files handed over by other launches (Explorer double-click while we're
+		// running): open each as a tab. app_open_path activates an existing tab if
+		// the file is already open, so re-opening a file just focuses it.
+		if window.open_count > 0 {
+			reqs: [plat.OPEN_QUEUE]string
+			for p in reqs[:plat.window_open_requests(window, reqs[:])] {
+				if !app_open_path(&app, p) {
+					fmt.eprintfln("Newtpad: could not open %q", p)
+				}
+			}
+			plat.window_clear_open_requests(window)
+			session_dirty = true
 		}
 
 		if window.resized {
@@ -211,15 +234,17 @@ main :: proc() {
 			fmt.eprintln("Newtpad: file changed on disk mid-read; showing a recovered copy")
 		}
 
-		// Autosave the session once input has settled.
-		if session_dirty && time.duration_seconds(time.tick_since(last_input)) > 2 {
+		// Autosave the session once input has settled (primary instance only).
+		if primary && session_dirty && time.duration_seconds(time.tick_since(last_input)) > 2 {
 			session_save(&app)
 			session_dirty = false
 		}
 		free_all(context.temp_allocator)
 	}
 
-	session_save(&app) // hot-exit: persist tabs + unsaved buffers on window close
+	if primary {
+		session_save(&app) // hot-exit: persist tabs + unsaved buffers on window close
+	}
 }
 
 // Everything render_frame needs; built once in main and handed to the resize

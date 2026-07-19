@@ -54,6 +54,14 @@ HT_BOTTOMLEFT :: 16
 HT_BOTTOMRIGHT :: 17
 HT_CLOSE :: 20
 
+// Window class name, also used by instance.odin to find a running instance.
+WINDOW_CLASS :: "NewtpadWindowClass"
+
+// Per-frame capacity for cross-instance open requests (selecting a batch of
+// files in Explorer sends one per file). Overflow is dropped, not truncated.
+OPEN_QUEUE :: 16
+OPEN_PATH_MAX :: 1024
+
 // A single top-level OS window. Platform types stay in this layer; upper
 // layers see only this opaque handle and the procs below.
 
@@ -146,6 +154,11 @@ Window :: struct {
 	mouse_shift:   bool,
 	mouse_down:    bool, // button held (dragging)
 	mouse_middle_pressed: bool, // a middle-click happened this frame
+	// paths handed over by other instances this frame (see instance.odin);
+	// copied out of the WM_COPYDATA payload, which is only valid during the call
+	open_paths:    [OPEN_QUEUE][OPEN_PATH_MAX]u8,
+	open_lens:     [OPEN_QUEUE]int,
+	open_count:    int,
 	// internal click-count tracking
 	last_click_ms: u32,
 	last_click_x:  i32,
@@ -161,7 +174,7 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 	hinstance := win.HINSTANCE(win.GetModuleHandleW(nil))
 
 	// RegisterClassExW copies the class name, so a temp wstring is fine here.
-	class_name := win.utf8_to_wstring("NewtpadWindowClass")
+	class_name := win.utf8_to_wstring(WINDOW_CLASS)
 
 	wc := win.WNDCLASSEXW {
 		cbSize        = size_of(win.WNDCLASSEXW),
@@ -219,6 +232,18 @@ window_set_title :: proc(w: ^Window, title: string) {
 	win.SetWindowTextW(w.hwnd, win.utf8_to_wstring(title, context.temp_allocator))
 }
 
+// Files handed to us by other instances since the last clear. The returned
+// strings alias the window's buffers — use or copy them before clearing.
+window_open_requests :: proc(w: ^Window, out: []string) -> int {
+	n := min(w.open_count, len(out))
+	for i in 0 ..< n {
+		out[i] = string(w.open_paths[i][:w.open_lens[i]])
+	}
+	return n
+}
+
+window_clear_open_requests :: proc(w: ^Window) {w.open_count = 0}
+
 // Drain the message queue once. Called at the top of each frame.
 window_pump_events :: proc(w: ^Window) {
 	msg: win.MSG
@@ -249,6 +274,18 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 	case win.WM_CLOSE, win.WM_DESTROY:
 		w.should_close = true
 		return 0
+	case win.WM_COPYDATA:
+		// Another instance handing us a file to open. The payload is only valid
+		// for the duration of this call, so copy it out now.
+		cds := (^win.COPYDATASTRUCT)(uintptr(lparam))
+		if cds == nil || cds.dwData != OPEN_REQUEST || cds.lpData == nil {break}
+		n := int(cds.cbData)
+		if n > 0 && n <= OPEN_PATH_MAX && w.open_count < OPEN_QUEUE {
+			copy(w.open_paths[w.open_count][:], (cast([^]u8)cds.lpData)[:n])
+			w.open_lens[w.open_count] = n
+			w.open_count += 1
+		}
+		return 1
 	case win.WM_NCCALCSIZE:
 		if wparam == 0 {
 			break // wParam==FALSE: let DefWindowProc handle it
