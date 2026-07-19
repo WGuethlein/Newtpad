@@ -168,6 +168,31 @@ default_bindings := []Binding {
 	{.Page_Down, false, .Find, .Find_Filter_Page_Down},
 }
 
+// Close a tab, prompting to save first if it has unsaved changes. Save-dialog
+// cancel or a failed save aborts the close (keeps the tab).
+request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
+	if slot < 0 || slot >= len(app.docs) || app.docs[slot] == nil {
+		return
+	}
+	d := app.docs[slot]
+	if d.modified {
+		switch plat.confirm_discard(w.hwnd, doc_display_name(d)) {
+		case .Cancel:
+			return
+		case .Save:
+			p := d.path
+			if p == "" {
+				np, ok := plat.file_save_dialog(w.hwnd)
+				if !ok {return}
+				p = np
+			}
+			if !doc_save(d, p) {return}
+		case .Discard:
+		}
+	}
+	app_close(app, slot)
+}
+
 // Map a key press to a command within the active context (shift ignored here; the
 // action reads it). First matching binding wins; a user overlay would prepend.
 resolve_key :: proc(key: plat.Key, ctrl: bool, ctx: Ctx) -> Command_Id {
@@ -264,7 +289,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			}
 		}
 	case .Tab_Close:
-		app_close(app, app.active)
+		request_close_tab(app, app.active, w)
 	case .Tab_Next:
 		app_switch_relative(app, -1 if ev.shift else 1) // Shift+Ctrl+Tab -> previous
 	case .Tab_Prev:

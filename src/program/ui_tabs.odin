@@ -39,7 +39,7 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window) -> bool {
 	}
 	if hit_slot >= 0 {
 		if hit_close {
-			app_close(app, hit_slot)
+			request_close_tab(app, hit_slot, win)
 		} else {
 			app_activate(app, hit_slot)
 		}

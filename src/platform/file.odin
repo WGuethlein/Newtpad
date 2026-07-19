@@ -215,6 +215,36 @@ file_open_dialog :: proc(owner: win.HWND) -> (path: string, ok: bool) {
 	return s, true
 }
 
+// Not all in core:sys/windows; hand-declared constants for MessageBoxW.
+@(private = "file")
+MB_YESNOCANCEL :: 0x00000003
+@(private = "file")
+MB_ICONWARNING :: 0x00000030
+@(private = "file")
+ID_YES :: 6
+@(private = "file")
+ID_NO :: 7
+
+Save_Choice :: enum {
+	Save,
+	Discard,
+	Cancel,
+}
+
+// Ask whether to save changes to `name` before closing. Yes/No/Cancel.
+confirm_discard :: proc(owner: win.HWND, name: string) -> Save_Choice {
+	msg := strings.concatenate({"Save changes to ", name, "?"}, context.temp_allocator)
+	wmsg := win.utf8_to_wstring(msg, context.temp_allocator)
+	wcap := win.utf8_to_wstring("Newtpad", context.temp_allocator)
+	switch win.MessageBoxW(owner, wmsg, wcap, MB_YESNOCANCEL | MB_ICONWARNING) {
+	case ID_YES:
+		return .Save
+	case ID_NO:
+		return .Discard
+	}
+	return .Cancel
+}
+
 file_close :: proc(fv: ^File_View) {
 	if fv.mapped {
 		if fv.view != nil {win.UnmapViewOfFile(fv.view)}

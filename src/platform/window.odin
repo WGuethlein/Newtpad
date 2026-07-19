@@ -85,6 +85,10 @@ Window :: struct {
 	height:       i32,
 	should_close: bool,
 	resized:      bool,
+	// optional repaint callback, invoked from WM_SIZE so the app can render live
+	// during the OS modal resize loop (which blocks the main loop).
+	on_resize:    proc "contextless" (user: rawptr),
+	resize_user:  rawptr,
 	// input, drained once per frame by the program
 	scroll_delta:  int, // mouse-wheel lines this frame (+down / -up)
 	key_events:    [64]Key_Event,
@@ -183,7 +187,11 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 	case win.WM_SIZE:
 		w.width = i32(lparam & 0xFFFF)
 		w.height = i32((lparam >> 16) & 0xFFFF)
-		w.resized = true
+		if w.on_resize != nil {
+			w.on_resize(w.resize_user) // repaint live during the modal resize loop
+		} else {
+			w.resized = true // pre-callback (startup): main handles the resize
+		}
 		return 0
 	case win.WM_MOUSEWHEEL:
 		// signed wheel delta lives in the high word of wParam

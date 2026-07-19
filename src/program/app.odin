@@ -148,13 +148,17 @@ app_destroy :: proc(a: ^App) {
 	delete(a.mru)
 }
 
-// Display label for a tab: the file's base name, or "untitled" for a scratch
-// buffer, with a leading "*" when modified.
-tab_title :: proc(d: ^Document, allocator := context.temp_allocator) -> string {
-	name := "untitled"
+// The document's display name: file base name, or "untitled" for a scratch.
+doc_display_name :: proc(d: ^Document) -> string {
 	if d.path != "" {
-		name = filepath.base(d.path)
+		return filepath.base(d.path)
 	}
+	return "untitled"
+}
+
+// Tab label: display name with a leading "*" when modified.
+tab_title :: proc(d: ^Document, allocator := context.temp_allocator) -> string {
+	name := doc_display_name(d)
 	if d.modified {
 		return strings.concatenate({"*", name}, allocator)
 	}
