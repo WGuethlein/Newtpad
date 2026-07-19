@@ -135,8 +135,13 @@ tracked.
    passes now share one capped `Visible_Iter` + layout helpers (killing the `12`/`10`/`1.5` magic and
    two more lingering uncapped-scan hazards in selection/find-match rects); the 8 headless test-modes
    moved to `test_modes.odin`; caret/selection/matches clip to `VISIBLE_COLS`.
-3. **[feature] Complex-script shaping + fix the monospace caret** (`IDWriteTextAnalyzer`) — the
-   real multilingual correctness, and it fixes caret/selection placement on mixed-width text.
+3. **[feature] Monospace cell grid + fixed caret — DONE (2026-07-18).** Chose the terminal-style
+   cell grid (refterm precedent) over `IDWriteTextAnalyzer` shaping — keeps "DirectWrite as rasterizer
+   only" intact and suits the LTR log/csv/json/code files. `text_cell_width` classifies each codepoint
+   as 0/1/2 cells (wide by measured advance, zero-width by codepoint block); the renderer advances by
+   cells and the editor's caret/selection/hit-test map offset↔cell through the same primitive, so they
+   agree with the glyphs. Verified by `celltest` + a CJK/kana screenshot. **Deferred:** ligatures,
+   proportional fonts, RTL/bidi, tab stops, Indic spacing/nonspacing marks.
 4. **[feature] Tabs + session restore** — gated on the Document-stability + per-document-arena
    decision (P2 above). This is the point to introduce arenas.
 5. **[feature] UI chrome** — command palette (Sublime-style, universal access), status bar,
