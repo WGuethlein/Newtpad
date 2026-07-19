@@ -1,275 +1,165 @@
-# Newtpad — Session Handoff
+# Newtpad — Handoff & State
 
-Written 2026-07-18, handing off from a the author desktop session (deep research phase) to local tooling terminal (build phase). Read this fully before substantial work; PROJECT-RULES is the compressed version.
+Rewritten 2026-07-18 after a mid-project audit (devil's-advocate + code review). This is the
+living state doc: what Newtpad is, what works now, how it's built, the debt we're carrying, and
+the roadmap. PROJECT-RULES is the compressed constitution (principles, hard rules, locked decisions,
+git conventions). Research corpus in [research/](research/); buffer benchmark in [bench/](bench/).
 
 ## 1. What Newtpad is
 
-Wyatt's project: a **notepad replacement for Windows** that opens any text file natively — the text-editor analog of File Pilot (filepilot.tech). Identity: **ultra-fast, ultra-small, fully handmade, shipped commercial product.**
+Wyatt's project: a **notepad replacement for Windows** — the text-editor analog of File Pilot
+(filepilot.tech). Identity: **ultra-fast, ultra-small, fully handmade, shipped commercial
+product.** Scope closer to Windows Notepad than Notepad++, with working plugins post-V1. the author
+writes the code; Wyatt directs. Standing rule: **ask the outcome-changing questions before
+substantial work; never rubber-stamp.**
 
-Wyatt's constraints, stated explicitly:
-- **Shipped product** (like File Pilot itself — polish, portable exe, licensing all matter).
-- Scope **closer to Windows Notepad than Notepad++** — but with **working plugin support post-V1** for code/markdown formatting and viewing.
-- **Fully handmade**: own UI, own text pipeline, own lexers. Chosen over "pragmatic" and "ship fastest" options when offered.
-- Wyatt directs the work ("I won't be doing the coding manually, you will — go with your recommendation").
-- **Standing instruction: always ask clarifying questions before big work; never rubber-stamp.**
+## 2. Current state — what works (30+ commits, one day)
 
-## 2. What happened so far
+A genuinely usable editor, built end-to-end:
+- **Open** any file: copy small (<16 MB) into private memory, mmap large (instant, ~0 private
+  memory, never-lock verified). Encoding detect/decode (UTF-8 / UTF-16 LE+BE via BOM). No-arg
+  launch = empty scratch buffer.
+- **View**: D3D11 + DXGI flip-model; DirectWrite→ClearType glyph atlas→instanced quads;
+  byte-offset viewport that walks lines on demand (instant at any size); byte-proportional
+  scrollbar; background thread counts total lines for the status bar.
+- **Edit**: piece-tree buffer (treap) with insert/delete/undo/redo; caret; text input; arrows/
+  Home/End/Page/word-nav (Ctrl+arrows, Ctrl+Backspace); selection (shift + mouse, double-click
+  word, triple-click line); clipboard (Ctrl+C/X/V, Ctrl+A) via CF_UNICODETEXT.
+- **Save**: Ctrl+S; native Save-As dialog for scratch/unnamed; re-encodes to the file's original
+  encoding; atomic (temp + rename, never-lock); CRLF preserved.
+- **Find/Replace**: Ctrl+F find, Ctrl+H replace, incremental highlight + next/prev (wrap),
+  Ctrl+R regex (via `core:text/regex`), Ctrl+L filter-to-matching-lines.
+- **Multilingual**: per-codepoint font fallback (Consolas + Microsoft YaHei CJK + Segoe UI
+  Symbol + Segoe UI). Latin/Cyrillic/Greek/CJK/accents/symbols render.
 
-1. Deep-research workflow ran (102 agents, 20 sources, 97 claims extracted, 25 adversarially verified: 23 confirmed / 2 refuted). Full report: [research/newtpad-research-report.md](research/newtpad-research-report.md).
-2. Wyatt supplied two primary-source transcripts of the File Pilot author (Vjekoslav Krajačić):
-   - BSC 2025 "Inside the Engine" talk → [research/filepilot-engine-talk-notes.md](research/filepilot-engine-talk-notes.md) (engine: arenas, layers, strings, unity build, codegen, threading).
-   - Wookash Podcast interview → [research/filepilot-wookash-interview-notes.md](research/filepilot-wookash-interview-notes.md) (product: five design rules, viewport-first streaming, file-locking trap, batch-rename-as-multi-cursor-spec, Windows API pain map). Raw transcript: [additional-transcripts/wookash.txt](additional-transcripts/wookash.txt).
-3. ~~No code exists yet. Not a git repo yet.~~ **Build phase started 2026-07-18** — see §10 for toolchain + current state.
+Verified: 13 `odin test` cases (encoding, line-nav, piece tree); headless mode dispatch
+(`newtpad <file> <count|edittest|savetest|seltest|findtest|repltest|filtertest>`); screenshots.
+Wyatt confirmed live: open/save/undo/mouse-select.
 
-## 3. Decisions and *why* (the part PROJECT-RULES compresses away)
+## 3. Architecture as-built
 
-### Odin over C/Zig/Rust
-The BSC talk is practically a spec for Odin's defaults: everything File Pilot's author hand-built in C (length-based UTF-8 strings, zero-is-initialization, designated initializers, arena allocators, declaration-order freedom via a codegen prepass) is native in Odin. Odin ships official thin D3D11/DXGI vendor bindings ("nearly the same as writing native C++"). Verified: all four languages have open paths; Rust rejected (fights arena lifetimes, slow compiles, its precedent Zed/GPUI is a retained-tree framework shaped nothing like our core); Zig viable but zigwin32's "complete bindings" claim was *refuted* in verification (1-2). **Known cost:** DirectWrite COM vtables must be hand-declared in Odin (bounded one-time work — File Pilot's "little C++" is likely exactly this seam). **Fallback:** C with the full File Pilot playbook if Odin tooling disappoints in practice.
+Layers (dependency order): **base → platform → program**. (`renderer`/`ui` are empty stubs; the
+planned `renderer (quads)` and `ui (immediate-mode)` split hasn't been extracted — their work
+lives in `platform/{quads,text}.odin` and `program/{doc,main,find}.odin`. **The boundary that
+matters — all Win32/COM/D3D isolated in `platform`, plain-data types exposed upward — is genuinely
+clean and verified by the audit.**)
 
-### D3D11, never OpenGL
-File Pilot's author's single clearest regret — an unfixable OpenGL driver black-screen bug shipped since his first release; he's rewriting to DirectX. D3D11 over D3D12 because we draw quads, not AAA scenes; Windows Terminal AtlasEngine and Zed-on-Windows both use D3D11.
+- `base/` (pure, no platform): `piecetable.odin` (treap piece tree + line-nav), `encoding.odin`
+  (detect/decode/encode), `lines.odin`. Tests alongside.
+- `platform/` (all Win32/COM): `window.odin` (window + input queue), `gfx.odin` (device/
+  swapchain/frame), `quads.odin` (instanced solid-quad pipeline), `text.odin` (DirectWrite +
+  ClearType glyph atlas + font fallback), `dwrite.odin` (hand-declared DirectWrite COM),
+  `file.odin` (mmap/copy open, atomic write, Save dialog), `clipboard.odin`.
+- `program/` (frame loop + document): `main.odin` (loop, input dispatch, render, headless test
+  modes), `doc.odin` (Document: buffer + cursor + selection + undo + viewport + line index +
+  filter), `find.odin` (find/replace/regex/filter).
 
-### DirectWrite as rasterizer only → glyph atlas → instanced quads
-Triple-validated: File Pilot (talk), refterm + Microsoft's AtlasEngine (shipped as Windows Terminal's default renderer), Zed's GPUI (alpha-only atlas, OS shaping, single instanced draw, 8.33 ms budget; shipped Windows port on DirectWrite + D3D11). **refterm is GPL-2.0 — study the pattern, never copy code.**
+Key mechanisms: buffer = treap keyed by byte position (O(log n)); undo = tree clone/restore;
+one background job (line-count worker, cancel flag + atomics); frame = `gfx_begin_frame` (clear +
+reset blend) → find/selection highlight quads → text → caret/scrollbar quads → find bar/status →
+`gfx_end_frame` → `free_all(temp_allocator)`.
 
-### Piece tree over the original + append arena — BENCHMARK-VALIDATED & LOCKED (2026-07-18)
-Was the one open decision; now settled with data (`bench/`, full numbers in `bench/RESULTS.md`). Decision: **piece TREE (RB-balanced) over the original, copying small files into the add-arena and mmapping large ones; mapped reads are SEH-guarded and run on worker threads.**
+## 4. Locked decisions (see PROJECT-RULES; do not relitigate without new evidence)
 
-Why (measured on real 10/100/1024 MB files, Odin `-o:speed`):
-- Only mmap opens multi-GB instantly (O(1), ~0.1 ms at any size) with ~0 private memory. Gap/naive are O(filesize): ~0.57 ms/MB open + the whole file committed to private RAM (1 GB → 0.6 s + 1 GB; 8 GB → ~5 s + 8 GB). That disqualifies gap/naive for the "opens anything instantly, multi-GB" identity. Gap's only win — 0 ns local typing vs piece's 2.6 µs — is imperceptible.
-- Fragmentation spike: a linear piece *list* is O(n²) insert (dead) → must be a piece *tree*; whole-buffer scan is unaffected by fragmentation (1.03×), so filter-as-you-type over a piece table is fine.
-- Never-lock: **verified** — with the file mmapped, another program can delete AND rename it (modern NTFS POSIX-unlink, Win10 1709+), and our view keeps reading the unlinked data without crashing. The old "mapping blocks delete" claim is false on target Windows. (Caveat: verify FAT32/USB/SMB; treat those as copy-on-open.)
+Odin; D3D11 + DXGI flip-model; DirectWrite-as-rasterizer → alpha/ClearType atlas → instanced
+quads; handmade immediate-mode UI; **buffer = piece tree over copy-small / mmap-large**
+(benchmark-validated, `bench/RESULTS.md`; treap chosen over red-black — same O(log n), less
+code); plugins post-V1 (narrow C-ABI). Refuted claims recorded in `research/`.
 
-Mandatory mitigations (adversarial pass, `bench/RESULTS.md`), to bake into the real impl:
-- **SEH `__try/__except`-guarded mapped reads on worker threads only** — never fault a mapped page on the UI thread (truncate/shrink-underneath and NTFS-*compressed* files fault routinely; network-drive stalls block the faulting thread for the SMB timeout). Not `AddVectoredExceptionHandler` (global, can't cleanly resume, would see D3D/DWrite COM exceptions).
-- **Empty/zero-byte floor case** (`CreateFileMapping` fails on 0 bytes → copy path).
-- **Remap-on-grow protocol** for live-appended files (feeds the V2 log-tail feature).
-- **Separate background/cancellable line-index subsystem** — the "instant open" *product* promise depends on it (scrollbar extent, go-to-line, viewport line layout), not on the buffer structure; the 1 GB single-line file is its acceptance test.
-- Define save + undo uniformly across the copy-small / mmap-large boundary.
+## 5. Debt register (from the 2026-07-18 audit)
 
-### Plugin architecture (designed now, shipped V2)
-File Pilot's author independently converged on Wyatt's exact plan and his context-menu horror stories (third-party code initializing on his main thread, users blaming him for hangs) define the rules: **C-ABI versioned function-pointer struct; two plugin kinds only (formatter: bytes→bytes; viewer: bytes→draw-list/text-model); worker threads, never UI thread; timeouts; misbehavior degrades to "plugin failed," never a hang; no generic scripting, ever.** First-party JSON/Markdown tools ship in-exe behind the same API to prove it.
+Ranked. P0 = fix before building more; P1 = cheap correctness/cleanliness now; P2 = deferred but
+tracked.
 
-### Refuted claims — do not repeat
-- "File Pilot fits on a floppy" — refuted 0-3. Honest floor ~2 MB (1.8→2.45 MB across versions; 14 DLL deps, ~312 imports per Hanselman's binary analysis).
-- "zigwin32 is complete, nothing hand-written needed" — refuted 1-2.
+**P0 — live hard-rule violations (break the "never freeze/crash on huge files" promise):**
+1. **Unguarded mapped-page reads on the UI thread.** `decode_to_utf8` aliases the mmap for large
+   UTF-8 files (no copy), so `pt_read`/`pt_line_end`/find/nav touch mapped pages on the UI
+   thread. NTFS-compressed files fault routinely; network/USB disconnect → UI freezes for the
+   SMB timeout then crashes (`EXCEPTION_IN_PAGE_ERROR`). No SEH guard exists. `bench/RESULTS.md`
+   called this "not optional." Fix: SEH `__try/__except` around mapped reads and/or copy-into-
+   private on a worker; never fault a mapped page on the UI thread.
+2. **`pt_line_end` scans to EOF uncapped, every frame** (`base/piecetable.odin`). A multi-GB
+   single-line file freezes (scans gigabytes/frame). Same shape: regex `pt_collect` materializes
+   the whole buffer per keystroke (`find.odin`). Fix: cap the forward scan to viewport-width +
+   margin; treat "no newline within N" as a long line; gate regex by size / background it.
 
-## 4. Feature plan
+**P1 — real bugs + cleanups, cheap now:**
+3. **Save-As path leak / inconsistent ownership** (`main.odin`/`doc.odin`): dialog returns a heap
+   path, repeated saves leak, `doc.path` is sometimes borrowed (`args[1]`) sometimes heap, never
+   freed. Fix: `path_owned` flag, free in `doc_close`.
+4. **Dead line-index anchors** (`doc.odin`): `anchors`/`anchor_count` are written but never read
+   (goto-line was removed; scrollbar is byte-proportional). Delete them (keep `line_count`).
+5. **Atlas-full writes out of bounds** (`text.odin`): only logs, keeps packing past 1024². Real
+   GPU corruption on a big multilingual doc. Fix: stop caching / clamp when full (real eviction
+   is P2).
+6. `CreateFileMappingW` result unchecked before `MapViewOfFile` (`file.odin`).
+7. **Duplicated viewport-line-walk** in `doc_draw`/`doc_selection_rects`/`find_match_rects`/
+   `doc_pos_at` with magic constants (`12`,`10`,`1.5`). Extract a `visible_lines` iterator +
+   shared layout constants.
+8. **7 headless test-modes clutter `main.odin`** (~125 lines) and pull `doc_debug_string` (leaks)
+   into the product path. Move to a gated harness / `tools`.
+9. **Long-line rendering**: `line_buf[2048]` truncates draw but caret/selection use true `end` →
+   caret misplaced on minified JSON/logs.
 
-**Validated 2026-07-18** against the demand-side research round that was previously missing (six-lens sweep: narrative switch posts, Reddit/forum recs, competitor pages, incumbent wishlists, large-file/log crowd, everyday scratchpad users — full findings in [research/demand-side-feature-research.md](research/demand-side-feature-research.md)). The research strongly *validated* the core identity (no-AI / no-account / instant / tiny / plain-text is a marketable tailwind — users are actively fleeing Win11 Notepad's AI+bloat) and surfaced six convergent gaps. Wyatt's scope decisions on those gaps are folded in below.
+**P2 — deferred, tracked (mostly locked decisions not yet needed):**
+- **Arenas on VirtualAlloc + grouped lifetimes** — unimplemented (heap + `free_all(temp)`/frame).
+  Fine now, but **decide before tabs**: the `&doc.idx`→worker + single-`defer doc_close` pattern
+  is correct only for one never-moved Document; tabs (Documents in a reallocating array) break it.
+  Establish heap-boxed, stable-address Documents + the per-document arena together, before tabs.
+- **Complex-script shaping** (Arabic/Indic/ligatures via `IDWriteTextAnalyzer`) — the chosen
+  follow-up to per-codepoint fallback. Related: the caret/hit-test/selection/find rects assume a
+  **monospace column** (4 sites) → misaligned on CJK/emoji. Real fix needs per-glyph x positions
+  (comes with shaping).
+- **Color emoji** (needs a color-glyph path).
+- **Command/hotkey/option codegen from a data file** — hardcoded now (VK→cmd in `window.odin`,
+  cmd→action in `main.odin`). Cheap retrofit; do it with the command palette (shared registry).
+- **Glyph-atlas eviction** (LRU/generational + atlas-full repack) and **reindex-on-edit** (line
+  count/scrollbar drift approximately after big edits).
+- **Precompiled `.cso` shaders** (drop the `d3dcompiler_47.dll` runtime dep) — before ship.
+- **Per-frame allocations** in `text_draw` (make/delete per line) — reuse a scratch buffer.
+- **`renderer`/`ui` layer extraction** — do it during the planned V1 UI rewrite, not before.
 
-**V1 (MVP):**
-- instant open; single portable ~2–3 MB exe
-- multi-GB files via mmap
-- **fast, never-freeze search *inside* huge files** — a first-order, benchmarked promise, not a footnote (users sharply separate "opens the 30 GB file" from "searches near EOF without a freeze/crash"; this is what actually drove people off Notepad++). Interacts with the pending buffer benchmark (§3).
-- encoding detect/convert (UTF-8/16/ANSI, BOM, CRLF/LF)
-- tabs + session restore (incl. unsaved scratch tabs) — **with a clean disable toggle** (a vocal cohort wants restore *off*; forcing it reproduces the exact complaint driving people to us)
-- **first-class scratch buffer** (NEW headline primitive): always-there on open with cursor restored; **continuous autosave to a recoverable, discoverable local store; never a save-nag for untitled scratch content** — while carefully avoiding Microsoft's silent-data-loss and hidden-plaintext-artifact mistakes (named files still prompt/save normally)
-- regex find/replace with filter-as-you-type
-- **filter-to-matching-lines** (pulled from V2): collapse a file to just the matches, ideally a separate pane preserving ±N context — the log/sysadmin crowd's single most-praised feature; reuses the find regex engine, so incremental cost is UI not core
-- **column/block (rectangular) editing** (pulled from V2): the strip-log-timestamps / prefix-many-lines workflow. Full multi-cursor stays V2.
-- hand-rolled incremental lexers (txt/json/env/ini/md/csv/log/xml/yaml/toml + C-like)
-- command palette (generated from data file, rebindable)
-- go-to-line, word wrap, zoom, themes
-- **crisp per-monitor DPI / multi-monitor scaling** as an explicit V1 quality goal (highest-engagement Notepad++ complaint; a near-free D3D11/DXGI win if built in from the start, costly to retrofit)
-- Explorer "Open with" + drag-drop + `file.txt:123` syntax
+## 6. Roadmap (prioritized)
 
-**V2:** plugin API ships with first-party proofs (JSON pretty-print/validate, **XML pretty-print**, **CSV column view** (sort/filter/dedupe), Markdown preview, hex viewer) — first-party structured-data reformat is deliberately held here to prove the plugin boundary, since V1 already *highlights* these formats; **full multi-cursor** (spec = File Pilot's batch rename: cursor per entry, live preview, **per-cursor copy/paste buffers**); .env value masking; log tail/follow (a *minimal* follow-the-tail is nearly free atop the mandatory grow-aware mmap, but low-latency follow is the bar — ship it right or not at all).
+1. **[P0] Mapped-read safety** — cap `pt_line_end`/scan work to the viewport; SEH-guard (or
+   worker-copy) reads that can touch the mapped original; size-gate regex materialization. This
+   removes the two live hard-rule violations and unblocks safe growth.
+2. **[P1] Correctness + cleanliness sweep** — Save-As ownership/leak; delete dead anchors; atlas
+   out-of-bounds guard; `CreateFileMapping` null-check; extract the visible-line iterator; move
+   test-modes out of `main.odin`; long-line caret clip.
+3. **[feature] Complex-script shaping + fix the monospace caret** (`IDWriteTextAnalyzer`) — the
+   real multilingual correctness, and it fixes caret/selection placement on mixed-width text.
+4. **[feature] Tabs + session restore** — gated on the Document-stability + per-document-arena
+   decision (P2 above). This is the point to introduce arenas.
+5. **[feature] UI chrome** — command palette (Sublime-style, universal access), status bar,
+   filename in title, draggable scrollbar; introduce the command/keybind data file + codegen here.
+6. **[polish] Atlas eviction, reindex-on-edit, precompiled shaders, per-frame alloc cleanup,
+   renderer/ui extraction** — before/as-part-of the V1 UI rewrite.
 
-**Out of scope (identity-protecting):** LSP, project trees, integrated terminal, git integration, **AI of any kind (not even opt-in), telemetry, account/cloud requirement** (the anti-features the target market most loudly rejects — omitting them is a positioning asset). Tree-sitter only if plugin demand forces it, after measuring binary/startup cost.
+Beyond V1 core (from the validated feature list, PROJECT-RULES/§4-of-old): column/block edit,
+go-to-line, word wrap, zoom, themes, Explorer "Open with" + drag-drop + `file.txt:123`; then the
+V2 plugin API + first-party proofs.
 
-**Fast-follow candidates (considered, not committed — do not relitigate as V1):** file compare/diff, sort/dedupe lines, keyword→color highlighting rules (cheap given the renderer; loved by log users), scrollbar match marks, macros/record-replay, code folding, bookmarks, global-hotkey/always-on-top quick-capture, Heynote-style in-buffer block separators, chord hotkeys, print/preview, spellcheck. Rationale and evidence strength for each in the research note (§C).
+## 7. Build environment (Windows, this machine)
 
-## 5. Ship-a-product realities (verified from File Pilot's experience)
+- **Odin** `dev-2026-07a` at `C:\Users\Wyatt\odin\dist`, on user PATH. **MSVC** from VS Community
+  2026 (v18). **Windows SDK** `10.0.28000.0` (had to be added via the VS Installer — VS shipped
+  without the C++ desktop SDK; Odin needs the import libs, else "Windows SDK not found").
+- `src/{base,platform,renderer,ui,program}` — one Odin package per dir (Odin compiles a package
+  at once → free "unity build"). `program` is `package main`.
+- `build.bat` — the one build script: `odin build src\program -out:build\newtpad.exe -debug
+  -collection:src=src` (append `run` to launch). Imports use the `src:` collection. Tests:
+  `odin test src\base -collection:src=src`. Debug exe ~950 KB (well under the 2-3 MB target).
+- Note: this environment can't inject GUI keyboard/focus, so interactive features are verified via
+  headless test-modes + screenshots; a live pass by Wyatt is still worth it per feature.
 
-- Code signing barely helps SmartScreen false positives for small unknown exes ("worst money ever spent") — budget reputation time; consider EV cert; warn early users.
-- Pricing: perpetual license, free trial, no subscriptions, no feature gating, offline (no license server). Quality-over-cheap worked — beta pre-orders repaid the author's debts.
-- Startup: overlap font/session/file preload with D3D11 device + window creation; the OS/GPU layer sets the startup floor, not app code.
-- Expect one full UI rewrite: V1 UI is a deliberate draft; his rewrite took 2–3 months informed by Ryan Fleury's UI series (read before designing ours: rfleury.com).
-- Toolchain that fits: RemedyBG / RAD Debugger (MSVC PDBs — Odin emits these), Spall profiler (handmade, integrable, can ship in builds to users).
+## 8. Working agreements
 
-## 6. Open questions (ranked)
-
-1. ~~Buffer benchmark~~ **DONE 2026-07-18** — piece tree over copy-small/mmap-large, validated with data (§3, bench/RESULTS.md).
-2. **Demand-side validation** of V1 list before feature freeze.
-3. **DirectWrite-from-Odin spike** — hand-declare the minimal COM surface (IDWriteFactory → IDWriteFontFace → IDWriteGlyphRunAnalysis) early; it's the recommendation's main risk.
-4. Tree-sitter cost measurement — only if/when plugin story demands it.
-5. Has File Pilot's D3D migration shipped post-v0.8 (informs expected D3D11 init cost)?
-
-## 7. FIRST SESSION AGENDA — feature research with Wyatt (his explicit request)
-
-**Wyatt has said the first thing he wants to do in the terminal is go over and research important features — before any building.** Do not start scaffolding or benchmarks until this has happened. Shape of that session:
-
-1. Walk the current V1/V2/out-of-scope list (§4) with him item by item — it is *judgment, not evidence* (the demand-side research round didn't survive verification), so treat every line as challengeable.
-2. Run the demand-side research that's still missing: `/delegate` pattern 2 (multi-modal sweep — user threads on HN/Reddit/Notepad++ forums, competitor feature/pricing pages for EmEditor/UltraEdit/Sublime/Notepad++, "why I switched editors" posts), plus `precedent-scout` agents for features where mechanism matters (large-file handling claims, session restore behaviors, encoding handling).
-3. Use `/ideate` on the features Wyatt cares most about; `/devils-advocate` on anything that threatens scope creep or the five principles.
-4. Ask Wyatt the outcome-changing questions as they surface (per standing instruction) — e.g., which V1 features are identity vs negotiable, what he'd cut first, what his own daily notepad pain points are (he's a primary user).
-5. End state: a validated, Wyatt-approved V1 feature list recorded here (replacing §4's caveat), then and only then move to the build sequence below.
-
-## 8. Suggested build sequence (after the feature session; not yet approved — ask first)
-
-1. ✅ **DONE (2026-07-18).** `git init`; scaffold layer skeleton, build script, D3D11 window clearing to a color. Next sub-step: the actual instanced colored quad (shaders + vertex/instance buffers).
-2. ✅ **DONE (2026-07-18).** Buffer benchmark → locked piece tree over copy-small/mmap-large (§3, bench/RESULTS.md).
-3. DirectWrite COM spike → glyph atlas → draw "Hello, 世界" proportionally.
-4. Read-only file viewing end-to-end (mmap, viewport-first layout, scrolling) — the "opens anything instantly" demo.
-5. Editing (piece table mutations, undo), then save pipeline (encodings, atomic write, never-lock rules).
-6. Find/filter-as-you-type; command palette + data-file codegen; tabs/session.
-
-## 9. Working agreements with Wyatt (carry these forward)
-
-- **Ask questions first — never rubber-stamp.** When a request is big, surface the 2–4 outcome-changing decisions via structured questions before running.
-- Wyatt supplies source material (transcripts etc.) — distill into `research/` notes and fold deltas into the report; keep the report the single source of truth.
-- Flag which claims are verified vs judgment. Use the devil's advocate skill on significant designs before presenting them as recommendations.
-- Wyatt's answers to the original scoping questions: touched all candidate languages remotely, the author codes → the author's recommendation stands; shipped product; Notepad-like with post-V1 plugins; fully handmade.
-- **Git identity:** every commit/push/merge is under Wyatt Guethlein's account only — no third-party attribution anywhere (no Co-Authored-By, no "Generated with" footers; `.local-settings.json` enforces `includeCoAuthoredBy: false`). History should read like a human engineer's: incremental logical commits, plain imperative messages, normal branching. See "Git conventions" in PROJECT-RULES.
-
-## 10. Build environment & current state (as of 2026-07-18)
-
-**Toolchain (Windows, this machine):**
-- **Odin** `dev-2026-07a` installed at `C:\Users\Wyatt\odin\dist`, on user PATH. Prebuilt release (bundles LLVM). `odin root` = that dir.
-- **MSVC** from Visual Studio Community 2026 (v18, `C:\Program Files\Microsoft Visual Studio\18\Community`), toolset 14.51.
-- **Windows SDK** `10.0.28000.0` — was **not** installed with VS initially (Unity bootstrapper skipped the C++ desktop SDK); added later via the VS Installer. Odin needs it for the import libs (`kernel32/user32/d3d11/dxgi/d3dcompiler.lib`). If setting up a fresh machine, install the "Windows 11 SDK" component or the "Desktop development with C++" workload first, or Odin fails with "Windows SDK not found."
-- Note: VS-Installer `modify` needs elevation from the start; `--wait` is not a valid flag on this installer version. Manual install via the VS Installer GUI is the reliable path.
-
-**Repo layout:**
-- `src/{base,platform,renderer,ui,program}` — one Odin package per layer (Odin compiles a package at once → free "unity build"). `program` is `package main`.
-- `build.bat` — the one build script: `odin build src\program -out:build\newtpad.exe -debug -collection:src=src`. Append `run` to launch. Output in `build/` (gitignored).
-- Imports use the `src:` collection (e.g. `import plat "src:platform"`).
-
-**TEXT RENDERING WORKS (2026-07-18) - supersedes the "next sub-steps" note below.**
-DirectWrite-from-Odin is de-risked; text renders end to end (verified by screenshot).
-- `src/platform/dwrite.odin` hand-declares the minimal DirectWrite COM (IDWriteFactory / IDWriteFontFace / IDWriteGlyphRunAnalysis). Vtable method ORDER is taken from the on-disk SDK `dwrite.h` (10.0.28000.0), NOT MS Learn (whose method tables are alphabetized and would call the wrong slot). Unused slots are `rawptr` placeholders to keep offsets correct.
-- `src/platform/text.odin`: loads a font face (Consolas), reads metrics for advances, rasterizes glyphs to ClearType coverage, packs into a shared `R8G8B8A8` atlas with a shelf packer, caches by `(glyph, px)`, draws cached glyphs as instanced quads. ClearType via DUAL-SOURCE blend (PS emits `SV_Target1` = per-channel coverage; blend `SRC1_COLOR`/`INV_SRC1_COLOR`), so result = ink*coverage + dst*(1-coverage). `gfx_begin_frame` now resets to opaque blend so per-pass state never leaks frames.
-- Spike learning: glyph bounds can be negative (an 'A' returned `L-1`), so the atlas uses the returned bearings; never assume origin (0,0).
-
-**Flagged follow-ups (from the devil's-advocate pass - address before they bite):**
-1. SHAPING + FONT FALLBACK: current text uses `GetGlyphIndices` (cmap 1:1), NOT shaping - no CJK / combining marks / ligatures / bidi / emoji yet. Next real text milestone = `IDWriteTextAnalyzer` shaping + `IDWriteFontFallback`. The glyph-run is already fed by an explicit index list so this slots in without reworking the raster/atlas.
-2. ATLAS EVICTION: atlas is grow-only (violates the PROJECT-RULES "caches need eviction" rule). Add LRU/generational + atlas-full handling before ship. `atlas_pack` currently just logs when full.
-3. PER-FRAME GLYPH WORK: `text_draw` calls `GetGlyphIndices` per char per frame and rasterizes on first sight synchronously - fine now, must be bounded/backgrounded for large files (viewport-first rule).
-4. `quads.odin` (solid rects) is currently unused by `main` but kept for UI backgrounds/cursor/selection.
-
-**Next options:** (a) shaping + font fallback (real multilingual text); (b) resume the build sequence with the week-1 buffer benchmark (piece table vs gap buffer), now higher-stakes since fast never-freeze search-in-huge-files is a first-order V1 promise; (c) read-only file viewing (mmap -> viewport layout -> scroll) toward the "opens anything instantly" demo.
-
-**What works:** `build.bat` produces a ~635 KB `newtpad.exe`; it opens a 1280×720 window, creates a D3D11 device + DXGI flip-model swapchain (`B8G8R8A8_UNORM`, `FLIP_DISCARD`, 2 buffers, BGRA_SUPPORT), handles resize (ResizeBuffers + RTV recreate), and clears to slate at vsync. On top of that, an **instanced quad pipeline** (`src/platform/quads.odin`) draws arbitrary pixel-space rectangles in a single `DrawInstanced` call: embedded HLSL compiled at startup via `vendor:directx/d3d_compiler`, a dynamic per-instance buffer (`Quad{pos,size,color}`), an `SV_VertexID` triangle-strip quad (no vertex buffer), and a screen-size constant buffer. Frame is split `gfx_begin_frame` (clear) → draws → `gfx_end_frame` (present). Win32 is isolated in `window.odin`, all D3D11/COM in `gfx.odin`+`quads.odin`; COM methods called via Odin's `->`.
-
-**Architecture decision (2026-07-18):** the GPU quad pipeline lives in **platform** (honoring the locked "all Win32/COM isolated in platform" rule). The `renderer` package will be the *CPU-side* glyph→quad builder + atlas packer with no COM. Revisit if this split chafes once text lands.
-
-**Shader note:** HLSL is compiled at runtime for dev speed → **d3dcompiler_47.dll** runtime dependency. Locked plan: switch to precompiled `.cso` bytecode (fxc/dxc at build time, embedded via `#load`) before V1 ships to drop that dep.
-
-**NOTE:** the "What works / Architecture / Shader / Immediate next" paragraphs just
-above are historical (pre-text-rendering). Current state is the newer blocks higher
-in section 10 plus this one.
-
-**FILE VIEWER WORKS (2026-07-18) — read-only, instant multi-GB.**
-`newtpad.exe [path] [scrollLines]` opens a real file and renders it.
-- `src/platform/file.odin`: `file_open_readonly` — copies files < 16 MB into private
-  memory, mmaps larger ones (share-everything, never-lock). A 1 GB file opens in
-  ~0.1 ms (mmap); whole-app cold start on it is ~267 ms.
-- `src/base/encoding.odin` + `lines.odin` (pure, tested in `base_test.odin`, `odin test src/base`):
-  BOM-detect UTF-8 / UTF-16 LE/BE, decode UTF-16 (incl. surrogate pairs) to internal
-  UTF-8; line navigation over bytes.
-- `src/program/doc.odin`: byte-offset viewport that walks line breaks ON DEMAND — no
-  full index needed to render, which is why open is instant at any size. Visible lines
-  draw through the ClearType `text_draw`. `window.odin` queues wheel / arrows / Page /
-  Home-End scroll to per-frame state.
-- Verified by screenshot: HANDOFF.md renders and scrolls (top vs pre-scrolled to §4).
-
-**BACKGROUND LINE INDEX DONE (2026-07-18).** The viewport renders via scan-on-demand
-(instant, no index), and a background worker thread now builds a SPARSE line index (a
-line-start anchor every 1024 lines + exact total count) published via atomics; anchors[]
-is pre-sized so it never reallocates, so the main thread reads it lock-free. This is the
-project's first background job (`src/program/doc.odin`: `Line_Index`, `index_worker`).
-It gives an exact scrollbar (track + thumb drawn with the solid-quad pipeline, now in
-use) and a status line ("line X of N, indexing %"), and `doc_goto_line` jumps to the
-nearest anchor then scans the remainder. Verified headless (`newtpad <file> count`): exact
-line counts (HANDOFF.md 189 = newline count; 1 GB file 18,198,529 lines, ~0.3 s in a
-release build, off the UI thread). Threading gotchas fixed: start the worker only after
-the Document is at its final address (it holds `&doc.idx`), and only clamp goto to the
-total once the index is DONE (a partial count clamps toward 0).
-
-**Deferred:** horizontal scroll / wrap (long lines clamped to 2000 chars); a real UI
-chrome (draggable scrollbar, filename header, tabs); interactive goto (needs a text-input
-box). Memory note: the sparse index pre-allocates `total/(8*1024)` ints (~1 MB per GB,
-graceful overflow guard) — a block-list would trim that further later.
-
-**EDITING WORKS (2026-07-18) — the viewer is now an editor.** The read-only flat buffer is
-replaced by a linear piece table (`src/base/piecetable.odin`, 12 unit tests): insert/delete/
-read + line-nav (`pt_line_start/end/next/prev`). The viewport reads/navigates through it on
-demand, so open stays instant. `src/program/doc.odin` adds a caret, undo/redo (piece-list
-snapshots), edits to the add arena, and cursor movement; `window.odin` maps input (WM_CHAR =
-text; WM_KEYDOWN = arrows move cursor, Page scrolls, Backspace/Delete/Enter edit, Ctrl+Z/Y
-undo/redo), drained per frame in `main.odin`. Byte-proportional scrollbar + caret via the
-solid-quad pipeline; auto-scroll keeps the caret visible. The background index scans the
-IMMUTABLE original (no race with edits, which only touch the add arena); shown line count =
-index count + net-newline delta. Edit path verified headless (`newtpad <file> edittest`):
-insert/backspace/delete-fwd/undo/redo/nl-delta all correct. (Interactive keyboard typing was
-not visually screenshot-verified — this environment can't focus/inject input into the GUI
-window across the session boundary — but the handlers are standard mapping into the verified
-edit path; type in it live to confirm.)
-
-**Deferred from editing:** SAVE (its own milestone: atomic write, re-encode, never-lock-while-
-mapped); the RB piece TREE (linear list is O(n^2) only for scattered/bulk edits — fine for
-local typing now, tree is the scale/multi-cursor follow-up); selection + clipboard + mouse
-click-to-position; per-word undo coalescing (currently per-keystroke); reindex-on-edit (line
-count/scrollbar drift approximately after big edits — index is over the original).
-
-**SAVE WORKS (2026-07-18).** Ctrl+S saves; an unnamed/scratch buffer opens the native
-Save-As dialog (`GetSaveFileNameW`, in `platform/file.odin`). Content re-encodes to the
-file's ORIGINAL encoding — UTF-8 keeps/omits its BOM as opened, UTF-16 LE/BE round-trip
-with a BOM (`base.encode_from_utf8`, tested). Atomic write: temp sibling file →
-`MoveFileEx` rename over the target, so a crash never corrupts the original and the target
-is never held open (works even when the original is mmapped — temp+rename, per the lock
-test). CRLF preserved (buffer keeps `\r`). Verified headless (`newtpad <in> savetest <out>`):
-UTF-8 and UTF-16LE edit/save/reopen with content + encoding intact. Also fixed: no-arg
-launch now opens a scratch buffer instead of exiting (the "closes immediately" bug — the old
-default file paths were relative to the project root).
-
-**SELECTION + CLIPBOARD + MOUSE DONE (2026-07-18).** Selection = `[anchor,cursor)`;
-Shift+movement extends, plain movement collapses (Left/Right collapse to the selection edge).
-Edits replace/delete the selection as one undo step (undo restores the selection). Highlight =
-opaque quads behind text (`doc_selection_rects`). Clipboard via `CF_UNICODETEXT`
-(`platform/clipboard.odin`): Ctrl+C/X/V, Ctrl+A. Mouse (`window.odin` WM_LBUTTON*/MOUSEMOVE,
-`SetCapture`): click places caret, Shift+click / drag select, double-click = word, triple =
-line (`doc_pos_at` hit-test, monospace column mapping). Word keys: Ctrl+Left/Right,
-Ctrl+Backspace (`is_word`, `word_left_of/right_of`). Key events carry Shift; GetTickCount/
-GetDoubleClickTime hand-declared. Verified headless (`newtpad <file> seltest`):
-select/replace/undo-restores-selection, word boundaries, select-all, Unicode clipboard
-round-trip.
-
-The Save dialog also got Text/JSON/Markdown/Log/All filters + default `.txt`; the no-file
-crash was fixed (opens a scratch buffer). Wyatt confirmed live: open/save/undo work.
-
-**FIND DONE (2026-07-18).** Ctrl+F opens a find bar (`src/program/find.odin`; seeded with the
-selection). Typing filters live: all matches highlight (dim amber, `find_match_rects`), the
-nearest is selected + scrolled to; Enter / Shift+Enter cycle next/prev (wrapping), Esc closes.
-Case-insensitive literal substring, scanned through the piece table in overlapping chunks (no
-full materialization; a background search for huge files is a follow-up). When `doc.find.active`,
-char/Backspace/Enter/Esc route to the query instead of the doc. Verified headless
-(`findtest`): case-insensitive offsets, overlapping matches, next/prev wrap, no-match. Also
-fixed the double/triple-click bug (held-button drag was collapsing the word/line selection).
-
-**Next options:** (a) find polish — regex (locked V1; needs an engine decision), Replace, and
-filter-to-matching-lines (the log feature, reuses this search); (b) RB piece tree (scale /
-multi-cursor); (c) shaping + font fallback (multilingual); (d) UI chrome (tabs, filename in
-title bar, draggable scrollbar); (e) editor polish (reindex-on-edit for exact line count/
-scrollbar; per-word undo coalescing; goal-column for up/down; horizontal scroll for long
-lines). Wyatt confirmed live: open/save/undo/mouse-select work; keep giving new features a
-quick live pass.
-
-**UPDATE - the (a)/(b)/(c) above are all DONE (2026-07-18):**
-- (a) Find follow-ups: Replace + regex (Ctrl+H / Ctrl+R, via `core:text/regex`) and
-  filter-to-matching-lines (Ctrl+L). See `find.odin`.
-- (b) The linear piece list is now a balanced piece TREE - an implicit treap keyed by byte
-  position (O(log n), kills the O(n^2) scattered-edit cost). A treap not red-black (Wyatt's
-  call): same asymptotics, far less code/bug-risk. Undo clones the tree. All base tests +
-  edittest/seltest pass unchanged. See `base/piecetable.odin`.
-- (c) Per-codepoint font fallback (`text.odin`): primary Consolas + fallbacks (Segoe UI Symbol,
-  Microsoft YaHei CJK, Segoe UI); atlas keyed by (face,glyph,size). Screenshot-verified
-  Latin/Cyrillic/Greek/CJK/accents/symbols all render.
-
-**Remaining next options:** complex-script SHAPING (Arabic/Indic/ligatures via
-`IDWriteTextAnalyzer` - the chosen follow-up); color EMOJI (needs a color-glyph path); caret/
-hit-test still assume a monospace column (mixed-width lines place the caret approximately - real
-fix needs per-glyph x positions); UI chrome (tabs, filename in title bar, draggable scrollbar);
-editor polish (reindex-on-edit, per-word undo coalescing, goal-column for up/down, horizontal
-scroll); background/incremental find+regex for huge files; group substitution ($1) in replace.
+- **Ask the 2-4 outcome-changing questions first; never rubber-stamp.** Surface locked-decision
+  impacts explicitly.
+- Distill Wyatt's source material into `research/`; keep the report the single source of truth.
+- Flag verified vs judgment; run devil's-advocate on significant designs before recommending.
+- **Git identity:** every commit/push/merge under Wyatt Guethlein's account only — no third-party
+  attribution anywhere (`.local-settings.json` enforces `includeCoAuthoredBy: false`). History
+  reads like a human engineer's: incremental logical commits, plain imperative messages. See
+  PROJECT-RULES "Git conventions."
