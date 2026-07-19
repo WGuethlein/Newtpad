@@ -1,4 +1,4 @@
-﻿// Layer: program â€” wires the layers together and owns the frame loop. The main
+// Layer: program — wires the layers together and owns the frame loop. The main
 // thread builds UI and handles input only: drain events, update the document,
 // draw the viewport, present. Headless argv test modes live in test_modes.odin.
 package main
@@ -24,7 +24,7 @@ main :: proc() {
 	// One instance per user: a second launch hands its file to the running window
 	// and exits, so only one process owns the session file and backups. If the
 	// hand-off fails (owner starting up or shutting down) we run normally rather
-	// than lose the file â€” see the primary check on session save below.
+	// than lose the file — see the primary check on session save below.
 	primary := plat.instance_claim()
 	if !primary && plat.instance_send_open(path) {
 		return
@@ -54,7 +54,7 @@ main :: proc() {
 
 	// Restore the session FIRST, then open any file from the command line as an
 	// extra tab. Opening a file used to skip the restore entirely, and the exit
-	// save then deleted every backup the (single-tab) session didn't reference â€”
+	// save then deleted every backup the (single-tab) session didn't reference —
 	// so launching Newtpad on a file destroyed unsaved scratch buffers. The
 	// single-instance hand-off already appends a tab rather than replacing the
 	// session, so this also makes both launch paths behave the same.
@@ -128,7 +128,7 @@ main :: proc() {
 		doc := app_active(&app)
 		// Usable content width in cells (word wrap breaks here).
 		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - SCROLLBAR_W) / char_w))
-		// Re-center on the caret only when it actually moves on THIS tab â€” never
+		// Re-center on the caret only when it actually moves on THIS tab — never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
 		active_before := app.active
 		cursor_before := doc.cursor
@@ -280,7 +280,7 @@ Render_Ctx :: struct {
 	px, char_w, line_h: f32,
 }
 
-// Draw one frame from current state. No input handling â€” safe to call from the
+// Draw one frame from current state. No input handling — safe to call from the
 // main loop or the WM_SIZE handler. vsync=false (resize) presents immediately so
 // clustered WM_SIZE repaints don't each stall on vsync.
 render_frame :: proc(rc: ^Render_Ctx, vsync := true) {

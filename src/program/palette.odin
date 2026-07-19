@@ -1,4 +1,4 @@
-﻿// Layer: program â€” the command palette (Ctrl+P): the universal access point. One
+// Layer: program — the command palette (Ctrl+P): the universal access point. One
 // overlay widget, three modes chosen by a leading prefix:
 //   (none) fuzzy-switch open tabs
 //   >      fuzzy-run a command from the command table

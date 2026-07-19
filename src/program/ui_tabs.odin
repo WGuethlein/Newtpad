@@ -1,7 +1,7 @@
-﻿// Layer: program â€” the custom title bar: [â˜° menu] [tabs] [+]  ...drag...  [_ â–¢ âœ•].
+// Layer: program — the custom title bar: [☰ menu] [tabs] [+]  ...drag...  [_ ▢ ✕].
 // The OS frame is removed (see window.odin); this strip IS the title bar. Menu,
 // tabs and + are client hit-tested here; the window buttons are non-client (the
-// platform handles their clicks) â€” we only draw them. Hover uses the live cursor
+// platform handles their clicks) — we only draw them. Hover uses the live cursor
 // position since the window buttons don't get client mouse messages.
 package main
 
@@ -119,11 +119,11 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 		tb := transmute([]u8)title
 		if plat.text_cells(text, tb) > max_cells && max_cells > 1 {
 			cut := plat.text_bytes_for_cells(text, tb, max_cells - 1)
-			title = strings.concatenate({title[:cut], "â€¦"}, context.temp_allocator)
+			title = strings.concatenate({title[:cut], "…"}, context.temp_allocator)
 		}
 		fg := [4]f32{0.92, 0.94, 0.98, 1} if active else {0.66, 0.70, 0.78, 1}
 		plat.text_draw(gfx, text, title, x + sx(8), base_y, UI_SMALL_PX, fg)
-		plat.text_draw(gfx, text, "Ã—", x + TAB_W - sx(15), base_y, UI_SMALL_PX, {0.60, 0.64, 0.72, 1})
+		plat.text_draw(gfx, text, "×", x + TAB_W - sx(15), base_y, UI_SMALL_PX, {0.60, 0.64, 0.72, 1})
 		x += TAB_W + TAB_GAP
 	}
 
@@ -137,8 +137,8 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 	bw := f32(plat.window_caption_btn_w(win))
 	cxf, cyf := f32(cx), f32(cy)
 	hov := in_bar && cxf >= width - 3 * bw
-	caption_btn(gfx, quad_pipe, text, width - 3 * bw, bw, "â€“", hov && cxf < width - 2 * bw, false)
-	caption_btn(gfx, quad_pipe, text, width - 2 * bw, bw, "â" if win.maximized else "â–¢", hov && cxf >= width - 2 * bw && cxf < width - bw, false)
-	caption_btn(gfx, quad_pipe, text, width - bw, bw, "âœ•", hov && cxf >= width - bw, true)
+	caption_btn(gfx, quad_pipe, text, width - 3 * bw, bw, "–", hov && cxf < width - 2 * bw, false)
+	caption_btn(gfx, quad_pipe, text, width - 2 * bw, bw, "❐" if win.maximized else "▢", hov && cxf >= width - 2 * bw && cxf < width - bw, false)
+	caption_btn(gfx, quad_pipe, text, width - bw, bw, "✕", hov && cxf >= width - bw, true)
 	_ = cyf
 }
