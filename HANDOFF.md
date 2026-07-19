@@ -277,6 +277,48 @@ line-count indexer. The open design question is snapshot cost vs. reading a piec
 main thread may be editing. Literal search is chunked and fast, and regex is opt-in (Ctrl+R), so
 the exposure is narrow — but it's the last live piece of roadmap item 1.
 
+## 6e. NEXT TASK — background the search worker (spec, 2026-07-19)
+
+Approved approach; closes §6d and the last of roadmap item 1. Implement this first.
+
+**Shape: viewport-first + background fill.** Two passes, because they solve different problems.
+1. *Synchronous, bounded:* search the visible byte range + a margin and publish immediately, so
+   highlights are never absent for a frame. This is the existing capped path, just scoped to the
+   viewport instead of the file head.
+2. *Worker:* full linear pass from offset 0, publishing incrementally. Linear (not viewport-outward)
+   keeps `matches` sorted, which next/prev, `find_match_rects` and the filter view all assume.
+   Viewport-outward would need a sort before every merge — not worth it.
+
+**Mirror `Line_Index` (`doc.odin:172`), do not invent a second pattern.** Same fields and lifecycle:
+`done`/`cancel`/`fault` as atomics, `th: ^thread.Thread`, cancel-store + join + destroy on teardown,
+and `guard: bool` to route reads through the SEH shim when the buffer is a live mapping.
+
+**The real hazard — do not skip this.** Pieces point into the original mapping *and* the append
+arena, and `pt.add` reallocs as the user types, freeing the block a worker may be mid-read on. So:
+- **Cancel + join the search worker before any document mutation.** Editing invalidates results
+  anyway. Typing in the *find bar* doesn't mutate the document, so the common incremental-find case
+  never joins — the join only costs on a real edit.
+- Do **not** `pt_collect` a snapshot for the worker: that is the multi-GB copy §6d just removed.
+  Clone the piece tree instead (cheap — proportional to piece count, not bytes) and read via
+  `pt_read`, exactly as `index_worker` does.
+
+**Merge once per frame, single-writer.** Worker appends to its own arrays and publishes an atomic
+`count`; the main thread reads `count` with acquire semantics and consumes only indices `< count`.
+Append-only + one writer means no lock. Never mutate the worker's arrays from the main thread.
+
+**Cancel on:** query change, document edit, find close, tab switch, document close. Restart on
+query change rather than trying to reuse partial results.
+
+**Done when:** `find.truncated` and `REGEX_SCAN_CAP` are gone (the cap exists only because search was
+synchronous); a 64 MB buffer keeps keystrokes at frame rate; the needle planted at the end of the
+file is found. Extend `newtpad regextest <mb>` — it already plants a needle past every block
+boundary and prints per-keystroke latency, so it's the natural acceptance test. Add a case that
+edits the document mid-search to prove the cancel-join path.
+
+**Worth doing first:** run `/devils-advocate` on this design before writing code. It is a
+concurrency change against a buffer the main thread mutates, which is exactly where an unchallenged
+plan ships a use-after-free.
+
 ## 7. Build environment (Windows, this machine)
 
 - **Odin** `dev-2026-07a` at `C:\Users\Wyatt\odin\dist`, on user PATH. **MSVC** from VS Community
