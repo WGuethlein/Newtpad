@@ -35,8 +35,12 @@ gfx_init :: proc(w: ^Window) -> (gfx: Gfx, ok: bool) {
 		SwapEffect   = .FLIP_DISCARD,
 	}
 
+	// The D3D11 debug layer validates every API call — a large per-call overhead
+	// that makes resize (many ResizeBuffers + draws per WM_SIZE) stutter. Opt in
+	// explicitly with -define:D3D_DEBUG=true; don't tie it to Odin's -debug, which
+	// we always build with for symbols.
 	flags := d3d.CREATE_DEVICE_FLAGS{.BGRA_SUPPORT}
-	when ODIN_DEBUG {
+	when #config(D3D_DEBUG, false) {
 		flags |= {.DEBUG}
 	}
 

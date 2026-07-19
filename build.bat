@@ -1,6 +1,7 @@
 @echo off
 REM Newtpad build script. One script, no build-system sprawl.
-REM Usage: build.bat [run]   (append "run" to launch after a successful build)
+REM Usage: build.bat [release] [run]
+REM   (default = -debug with symbols; "release" = -o:speed; "run" launches after)
 
 setlocal enabledelayedexpansion
 if not exist build mkdir build
@@ -9,10 +10,14 @@ REM SEH shim (guarded_copy.c) -> build\guarded.obj. Compiled once; it never
 REM changes. If you edit the .c, delete build\guarded.obj to force a rebuild.
 if not exist build\guarded.obj call :build_shim || exit /b 1
 
-odin build src\program -out:build\newtpad.exe -debug -collection:src=src
+set "OPT=-debug"
+if "%1"=="release" set "OPT=-o:speed"
+
+odin build src\program -out:build\newtpad.exe %OPT% -collection:src=src
 if errorlevel 1 exit /b 1
 
 if "%1"=="run" build\newtpad.exe
+if "%2"=="run" build\newtpad.exe
 exit /b 0
 
 REM --- compile the SEH shim; cl needs its own env, so locate MSVC via vswhere ---
