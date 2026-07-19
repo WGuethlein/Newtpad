@@ -38,22 +38,14 @@ main :: proc() {
 		return
 	}
 
-	doc: Document
+	app: App
 	if path == "" {
-		doc = doc_new()
-		fmt.println("Newtpad: new scratch buffer. Type; close to exit.")
-	} else {
-		ok2: bool
-		doc, ok2 = doc_open(path)
-		if !ok2 {
-			fmt.eprintfln("Newtpad: could not open %q; starting empty", path)
-			doc = doc_new()
-		} else {
-			fmt.printfln("Newtpad: opened %s (%d bytes, %v). Edit; close to exit.", path, doc.pt.length, doc.enc)
-		}
+		app_new_scratch(&app)
+	} else if !app_open_path(&app, path) {
+		fmt.eprintfln("Newtpad: could not open %q; starting empty", path)
+		app_new_scratch(&app)
 	}
-	defer doc_close(&doc)
-	doc_index_start(&doc) // &doc is stable here; safe for the worker to hold
+	defer app_destroy(&app)
 
 	px: f32 = 16
 	line_h := line_height(px)
@@ -66,34 +58,42 @@ main :: proc() {
 			plat.gfx_resize(&gfx, window.width, window.height)
 			window.resized = false
 		}
-		rows := int(f32(window.height) / line_h)
+		rows := int((f32(window.height) - CONTENT_TOP) / line_h)
+
+		doc := app_active(&app)
 
 		// Drain input once per frame: typed characters route to the find field or
 		// the document; key chords resolve to a command in the active context.
 		for i in 0 ..< window.char_count {
 			if doc.find.active {
-				find_input_rune(&doc, window.chars[i])
+				find_input_rune(doc, window.chars[i])
 			} else {
-				doc_insert_rune(&doc, window.chars[i])
+				doc_insert_rune(doc, window.chars[i])
 			}
 		}
 		window.char_count = 0
 		for i in 0 ..< window.key_count {
 			ev := window.key_events[i]
-			// Context is per-event: a chord this frame (Ctrl+F) can open/close find.
-			ctx := Ctx.Find if doc.find.active else Ctx.Editor
-			command_dispatch(resolve_key(ev.key, ev.ctrl, ctx), ev, &doc, window, rows)
+			// Context is per-event; the active doc may change (tab switch) mid-loop.
+			ctx := Ctx.Find if app_active(&app).find.active else Ctx.Editor
+			command_dispatch(resolve_key(ev.key, ev.ctrl, ctx), ev, &app, window, rows)
 		}
 		window.key_count = 0
 
+		// A tab switch/close may have changed the active document.
+		doc = app_active(&app)
+
+		// The tab strip claims clicks in its region before the caret sees them.
+		tabs_hit_test(&app, window)
+
 		// Mouse: press places/extends the caret (double=word, triple=line); drag extends.
 		if window.mouse_pressed {
-			mp := doc_pos_at(&doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
+			mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
 			switch window.mouse_count {
 			case 2:
-				doc_select_word_at(&doc, mp)
+				doc_select_word_at(doc, mp)
 			case 3:
-				doc_select_line_at(&doc, mp)
+				doc_select_line_at(doc, mp)
 			case:
 				doc.cursor = mp
 				if !window.mouse_shift {
@@ -103,20 +103,20 @@ main :: proc() {
 			window.mouse_pressed = false
 		} else if window.mouse_down && window.mouse_count == 1 {
 			// drag extends a single-click selection; word/line selects stay put
-			doc.cursor = doc_pos_at(&doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
+			doc.cursor = doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
 		}
 
 		if window.scroll_delta != 0 {
 			if doc.filter {
 				doc.filter_top = clamp(doc.filter_top + window.scroll_delta, 0, max(0, len(doc.filter_lines) - 1))
 			} else {
-				doc_scroll(&doc, window.scroll_delta)
+				doc_scroll(doc, window.scroll_delta)
 			}
 			window.scroll_delta = 0
 		}
 
 		if !doc.filter {
-			doc_ensure_cursor_visible(&doc, rows)
+			doc_ensure_cursor_visible(doc, rows)
 		}
 
 		plat.gfx_begin_frame(&gfx, 0.09, 0.11, 0.16)
@@ -125,27 +125,28 @@ main :: proc() {
 		// (Skipped in filter view, whose lines aren't consecutive.)
 		if !doc.filter {
 			findq: [80]plat.Quad
-			if nfq := find_match_rects(&doc, &text, px, char_w, rows, findq[:]); nfq > 0 {
+			if nfq := find_match_rects(doc, &text, px, char_w, rows, findq[:]); nfq > 0 {
 				plat.quads_draw(&gfx, &quad_pipe, findq[:nfq])
 			}
 			selq: [80]plat.Quad
-			if ns := doc_selection_rects(&doc, &text, px, char_w, rows, selq[:]); ns > 0 {
+			if ns := doc_selection_rects(doc, &text, px, char_w, rows, selq[:]); ns > 0 {
 				plat.quads_draw(&gfx, &quad_pipe, selq[:ns])
 			}
 		}
 
-		cx, cy, caret, bottom := doc_draw(&gfx, &text, &doc, px, char_w, rows)
+		cx, cy, caret, bottom := doc_draw(&gfx, &text, doc, px, char_w, rows)
 
-		// Scrollbar (byte-proportional) + caret, both solid quads.
+		// Scrollbar (byte-proportional, below the tab strip) + caret.
 		bars: [4]plat.Quad
 		nb := 0
 		w := f32(window.width)
 		h := f32(window.height)
 		total := doc.pt.length
 		if total > 0 && !doc.filter {
-			ty := f32(doc.top) / f32(total) * h
-			th := max(24, f32(bottom - doc.top) / f32(total) * h)
-			bars[nb] = {pos = {w - 14, 0}, size = {12, h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
+			sb_h := h - TAB_STRIP_H
+			ty := TAB_STRIP_H + f32(doc.top) / f32(total) * sb_h
+			th := max(24, f32(bottom - doc.top) / f32(total) * sb_h)
+			bars[nb] = {pos = {w - 14, TAB_STRIP_H}, size = {12, sb_h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
 			bars[nb] = {pos = {w - 13, ty}, size = {10, th}, color = {0.42, 0.48, 0.60, 1}};nb += 1
 		}
 		if caret {
@@ -154,6 +155,8 @@ main :: proc() {
 		if nb > 0 {
 			plat.quads_draw(&gfx, &quad_pipe, bars[:nb])
 		}
+
+		tabs_draw(&gfx, &quad_pipe, &text, &app, w)
 
 		if doc.find.active {
 			f := &doc.find
@@ -179,7 +182,7 @@ main :: proc() {
 			}
 		} else {
 			recovered := "  [RECOVERED COPY - file changed on disk, not the original]" if doc.recovered else ""
-			status := fmt.tprintf("%d lines%s%s%s", doc_line_count(&doc), " *" if doc.modified else "", recovered, "" if doc_index_done(&doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(&doc) * 100))
+			status := fmt.tprintf("%d lines%s%s%s", doc_line_count(doc), " *" if doc.modified else "", recovered, "" if doc_index_done(doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(doc) * 100))
 			col := [4]f32{0.95, 0.55, 0.35, 1} if doc.recovered else {0.55, 0.60, 0.70, 1}
 			plat.text_draw(&gfx, &text, status, 12, h - 8, 13, col)
 		}
@@ -189,8 +192,8 @@ main :: proc() {
 		// A mapped read may have faulted during this frame's draw/search (file
 		// truncated or decompression-broken underneath us). Detach from the map
 		// into a private copy so we never fault again; next frame draws that.
-		if doc_fault_pending(&doc) {
-			doc_recover_from_fault(&doc)
+		if doc_fault_pending(doc) {
+			doc_recover_from_fault(doc)
 			fmt.eprintln("Newtpad: file changed on disk mid-read; showing a recovered copy")
 		}
 		free_all(context.temp_allocator)

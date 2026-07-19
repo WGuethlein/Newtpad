@@ -25,17 +25,21 @@ VISIBLE_COLS :: 2048
 
 TEXT_MARGIN_X :: f32(12) // left gutter before text (px)
 TEXT_MARGIN_Y :: f32(10) // top gutter above the first line (px)
+TAB_STRIP_H :: f32(26) // height of the tab strip above the content (px)
 LINE_SPACING :: f32(1.5) // line height = font px * this
+
+// Content-area top edge: below the tab strip.
+CONTENT_TOP :: TAB_STRIP_H + TEXT_MARGIN_Y
 
 line_height :: #force_inline proc(px: f32) -> f32 {return px * LINE_SPACING}
 // Text baseline y for visible row r (what text_draw wants).
-row_baseline_y :: #force_inline proc(px: f32, r: int) -> f32 {return px + TEXT_MARGIN_Y + f32(r) * line_height(px)}
+row_baseline_y :: #force_inline proc(px: f32, r: int) -> f32 {return px + CONTENT_TOP + f32(r) * line_height(px)}
 // Top y of a line-height-tall highlight box for row r.
-row_rect_y :: #force_inline proc(px: f32, r: int) -> f32 {return TEXT_MARGIN_Y + f32(r) * line_height(px)}
+row_rect_y :: #force_inline proc(px: f32, r: int) -> f32 {return CONTENT_TOP + f32(r) * line_height(px)}
 // Left x of column `col` (monospace).
 col_x :: #force_inline proc(char_w: f32, col: int) -> f32 {return TEXT_MARGIN_X + f32(col) * char_w}
 // Inverse mappings for hit-testing a client-space pixel.
-row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - TEXT_MARGIN_Y) / line_height(px))}
+row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - CONTENT_TOP) / line_height(px))}
 col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return max(0, int((mx - TEXT_MARGIN_X) / char_w + 0.5))}
 
 // Walks the visible lines (filter view or consecutive) yielding each row's

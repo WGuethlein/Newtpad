@@ -98,6 +98,7 @@ Window :: struct {
 	mouse_count:   int, // 1 single, 2 double, 3 triple
 	mouse_shift:   bool,
 	mouse_down:    bool, // button held (dragging)
+	mouse_middle_pressed: bool, // a middle-click happened this frame
 	// internal click-count tracking
 	last_click_ms: u32,
 	last_click_x:  i32,
@@ -241,6 +242,13 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 	case win.WM_LBUTTONUP:
 		w.mouse_down = false
 		win.ReleaseCapture()
+		return 0
+	case win.WM_MBUTTONDOWN:
+		lp := u32(uintptr(lparam))
+		xi := int(lp & 0xFFFF);if xi >= 0x8000 {xi -= 0x10000}
+		yi := int(lp >> 16);if yi >= 0x8000 {yi -= 0x10000}
+		w.mouse_x = i32(xi);w.mouse_y = i32(yi)
+		w.mouse_middle_pressed = true
 		return 0
 	}
 	return win.DefWindowProcW(hwnd, msg, wparam, lparam)

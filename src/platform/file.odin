@@ -188,6 +188,33 @@ file_save_dialog :: proc(owner: win.HWND) -> (path: string, ok: bool) {
 	return s, true
 }
 
+// Native Open dialog. Returns the chosen path (temp-allocated; the caller clones
+// it) or ok=false if cancelled. The file must exist (OFN_FILEMUSTEXIST).
+file_open_dialog :: proc(owner: win.HWND) -> (path: string, ok: bool) {
+	buf: [520]u16
+	fbuf: [256]u16
+	build_filter(&fbuf, {"All Files (*.*)", "*.*", "Text (*.txt;*.md;*.log)", "*.txt;*.md;*.log", "Data (*.json;*.xml;*.yaml;*.toml;*.csv)", "*.json;*.xml;*.yaml;*.toml;*.csv"})
+	ofn := win.OPENFILENAMEW {
+		lStructSize  = size_of(win.OPENFILENAMEW),
+		hwndOwner    = owner,
+		lpstrFile    = win.wstring(&buf[0]),
+		nMaxFile     = u32(len(buf)),
+		lpstrFilter  = win.wstring(&fbuf[0]),
+		nFilterIndex = 1,
+		Flags        = u32(win.OFN_FILEMUSTEXIST | win.OFN_EXPLORER | win.OFN_NOCHANGEDIR),
+	}
+	if !win.GetOpenFileNameW(&ofn) {
+		return "", false
+	}
+	n := 0
+	for n < len(buf) && buf[n] != 0 {n += 1}
+	s, err := win.utf16_to_utf8(buf[:n], context.temp_allocator)
+	if err != nil {
+		return "", false
+	}
+	return s, true
+}
+
 file_close :: proc(fv: ^File_View) {
 	if fv.mapped {
 		if fv.view != nil {win.UnmapViewOfFile(fv.view)}

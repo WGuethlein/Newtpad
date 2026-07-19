@@ -43,6 +43,12 @@ Command_Id :: enum u8 {
 	Find_Open,
 	Replace_Open,
 	Clear_Selection,
+	// tabs
+	Tab_New,
+	Tab_Open,
+	Tab_Close,
+	Tab_Next,
+	Tab_Prev,
 	// find mode
 	Find_Close,
 	Find_Backspace,
@@ -90,6 +96,11 @@ command_table := [Command_Id]Command {
 	.Find_Open                = {"Find", "Search"},
 	.Replace_Open             = {"Replace", "Search"},
 	.Clear_Selection          = {"Clear Selection", "Cursor"},
+	.Tab_New                  = {"New Tab", "Tabs"},
+	.Tab_Open                 = {"Open File...", "Tabs"},
+	.Tab_Close                = {"Close Tab", "Tabs"},
+	.Tab_Next                 = {"Next Tab", "Tabs"},
+	.Tab_Prev                 = {"Previous Tab", "Tabs"},
 	.Find_Close               = {"Close Find", "Search"},
 	.Find_Backspace           = {"Find: Delete Backward", "Search"},
 	.Find_Confirm             = {"Find: Confirm", "Search"},
@@ -138,6 +149,12 @@ default_bindings := []Binding {
 	{.F, true, .Editor, .Find_Open},
 	{.H, true, .Editor, .Replace_Open},
 	{.Escape, false, .Editor, .Clear_Selection},
+	{.N, true, .Editor, .Tab_New},
+	{.O, true, .Editor, .Tab_Open},
+	{.W, true, .Editor, .Tab_Close},
+	{.Tab, true, .Editor, .Tab_Next}, // Ctrl+Tab (Shift -> previous, read in the action)
+	{.Page_Up, true, .Editor, .Tab_Prev},
+	{.Page_Down, true, .Editor, .Tab_Next},
 	// --- find context ---
 	{.Escape, false, .Find, .Find_Close},
 	{.F, true, .Find, .Find_Close},
@@ -165,7 +182,8 @@ resolve_key :: proc(key: plat.Key, ctrl: bool, ctx: Ctx) -> Command_Id {
 // Run a command. `rows` is the visible row count (page moves); `w` supplies the
 // HWND for clipboard / Save-dialog. The active-context split means each command
 // is unambiguous here.
-command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, doc: ^Document, w: ^plat.Window, rows: int) {
+command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^plat.Window, rows: int) {
+	doc := app_active(app)
 	switch cmd {
 	// --- editor ---
 	case .Cursor_Left:
@@ -235,6 +253,22 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, doc: ^Document, w:
 		find_open(doc, true)
 	case .Clear_Selection:
 		doc.anchor = doc.cursor
+
+	// --- tabs ---
+	case .Tab_New:
+		app_new_scratch(app)
+	case .Tab_Open:
+		if p, ok := plat.file_open_dialog(w.hwnd); ok {
+			if !app_open_path(app, p) {
+				fmt.eprintfln("Newtpad: could not open %s", p)
+			}
+		}
+	case .Tab_Close:
+		app_close(app, app.active)
+	case .Tab_Next:
+		app_switch_relative(app, -1 if ev.shift else 1) // Shift+Ctrl+Tab -> previous
+	case .Tab_Prev:
+		app_switch_relative(app, -1)
 
 	// --- find mode ---
 	case .Find_Close:

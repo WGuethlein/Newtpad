@@ -67,7 +67,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		doc_close(&doc)
 
 	case mode == "keytest":
-		doc, _ := doc_open(path) // e.g. "hello world foo"
+		app: App
+		if !app_open_path(&app, path) {app_new_scratch(&app)} // e.g. "hello world foo"
 		dummy: plat.Window
 		key_chk(resolve_key(.Left, false, .Editor), .Cursor_Left, "Left / Editor")
 		key_chk(resolve_key(.Left, true, .Editor), .Word_Left, "Ctrl+Left / Editor")
@@ -79,14 +80,19 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		key_chk(resolve_key(.H, true, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find")
 		key_chk(resolve_key(.A, false, .Editor), .None, "a (unbound)")
 		// dispatch effects (dummy window; these commands don't touch the HWND)
-		doc.cursor = 0
-		command_dispatch(resolve_key(.Right, false, .Editor), {.Right, false, false, false}, &doc, &dummy, 10)
-		fmt.printfln("dispatch Right    -> cursor=%d", doc.cursor)
-		command_dispatch(resolve_key(.F, true, .Editor), {.F, true, false, false}, &doc, &dummy, 10)
-		fmt.printfln("dispatch Ctrl+F   -> find.active=%v", doc.find.active)
-		command_dispatch(resolve_key(.Escape, false, .Find), {.Escape, false, false, false}, &doc, &dummy, 10)
-		fmt.printfln("dispatch Esc      -> find.active=%v", doc.find.active)
-		doc_close(&doc)
+		app_active(&app).cursor = 0
+		command_dispatch(resolve_key(.Right, false, .Editor), {.Right, false, false, false}, &app, &dummy, 10)
+		fmt.printfln("dispatch Right    -> cursor=%d", app_active(&app).cursor)
+		command_dispatch(resolve_key(.F, true, .Editor), {.F, true, false, false}, &app, &dummy, 10)
+		fmt.printfln("dispatch Ctrl+F   -> find.active=%v", app_active(&app).find.active)
+		command_dispatch(resolve_key(.Escape, false, .Find), {.Escape, false, false, false}, &app, &dummy, 10)
+		fmt.printfln("dispatch Esc      -> find.active=%v", app_active(&app).find.active)
+		// tab commands
+		command_dispatch(.Tab_New, {}, &app, &dummy, 10)
+		fmt.printfln("Tab_New           -> live tabs=%d active=%d", app_live_count(&app), app.active)
+		command_dispatch(.Tab_Close, {}, &app, &dummy, 10)
+		fmt.printfln("Tab_Close         -> live tabs=%d", app_live_count(&app))
+		app_destroy(&app)
 
 	case mode == "edittest":
 		doc, _ := doc_open(path)
