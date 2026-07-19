@@ -16,14 +16,6 @@ import plat "src:platform"
 
 FONT_ROWS :: 3 // family, style, size
 
-font_page_open :: proc(app: ^App) {
-	font_choices_refresh()
-	app.font_open = true
-	app.font_row = 0
-}
-
-font_page_close :: proc(app: ^App) {app.font_open = false}
-
 font_page_move :: proc(app: ^App, d: int) {
 	app.font_row = clamp(app.font_row + d, 0, FONT_ROWS - 1)
 }
@@ -82,7 +74,10 @@ font_page_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, a
 	y += sx(24)
 	plat.text_draw(gfx, t, "Preview", x, y, UI_SMALL_PX, {0.50, 0.55, 0.64, 1})
 	y += sx(28)
-	px := f32(app.settings.font_size)
+	// The real size the document renders at, DPI and zoom included — a preview
+	// drawn at the raw 96-DPI number would show 16px text on a 200% display
+	// while the document showed 32px.
+	px := active_render_ctx.px if active_render_ctx != nil else sx(f32(app.settings.font_size))
 	plat.text_draw(gfx, t, "The quick brown fox jumps over the lazy dog", x, y, px, {0.88, 0.91, 0.96, 1})
 	y += px * 1.6
 	plat.text_draw(gfx, t, "0123456789  {}[]()<>  il1| oO0  ->  ==  !=", x, y, px, {0.75, 0.80, 0.88, 1})

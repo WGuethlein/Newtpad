@@ -210,10 +210,10 @@ menu_hover_update :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window) {
 // Queries the cursor rather than reading win.mouse_y: WM_MOUSEMOVE only records
 // a position while a button is held (it exists for drag-select), so mouse_y is
 // wherever the last click landed and never moves during a plain hover.
-menu_hover_item :: proc(app: ^App, win: ^plat.Window) {
+menu_hover_item :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window) {
 	if app.menu.open < 0 {return}
-	_, cy := plat.window_cursor_client(win)
-	if r := menu_item_at(app, f32(cy)); r >= 0 {
+	cx, cy := plat.window_cursor_client(win)
+	if r := menu_item_at(t, app, f32(cx), f32(cy), f32(win.width), f32(win.height)); r >= 0 {
 		if item_enabled(app, menus[app.menu.open].items[r]) {app.menu.item = r}
 	}
 }
@@ -230,7 +230,9 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 		if mx >= gx && mx < gx + sx(GEAR_W_96) {
 			menu_close(app)
 			consume_click(win)
-			return .Settings_Open if !app.settings_open else .Settings_Close, true
+			// Always "open": it activates the existing Settings tab if there is
+			// one, so the gear is a destination, not a toggle.
+			return .Settings_Open, true
 		}
 		if i := menu_title_at(t, mx); i >= 0 {
 			if app.menu.open == i {menu_close(app)} else {menu_open_at(app, i)}
@@ -243,7 +245,7 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 
 	if app.menu.open >= 0 {
 		picked := Command_Id.None
-		if idx := menu_item_at(app, my); idx >= 0 {
+		if idx := menu_item_at(t, app, mx, my, w, h); idx >= 0 {
 			it := menus[app.menu.open].items[idx]
 			if item_enabled(app, it) {picked = it.cmd}
 		}
@@ -368,7 +370,9 @@ menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^
 	}
 	gpx := UI_PX * 1.35
 	gcw := plat.text_char_width(t, gpx)
-	plat.text_draw(gfx, t, "⚙", gx + (gw - gcw) * 0.5, base_y + sx(2), gpx, MENU_COL.fg if !app.settings_open else MENU_COL.check)
+	on_settings := false
+	if d := app_active(app); d != nil {on_settings = d.kind == .Settings}
+	plat.text_draw(gfx, t, "⚙", gx + (gw - gcw) * 0.5, base_y + sx(2), gpx, MENU_COL.check if on_settings else MENU_COL.fg)
 
 	if app.menu.open < 0 {return}
 	menu_draw_dropdown(gfx, qp, t, app, width, height)
@@ -379,17 +383,9 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	mi := app.menu.open
 	items := menus[mi].items
 	cw := plat.text_char_width(t, UI_PX)
-	x0, _ := menu_title_rect(t, mi)
-	dw := dropdown_w(t)
 	y0 := TAB_STRIP_H + MENU_BAR_H
-
-	h := f32(0)
-	for it in items {h += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
-	// The dropdown is a client-space quad, not an OS popup, so it cannot leave
-	// the window: clamp it or the bottom items are drawn off-screen and become
-	// unclickable.
-	h = min(h, max(MENU_ITEM_H, height - y0 - sx(4)))
-	x0 = min(x0, max(0, width - dw))
+	// Same geometry the hit-test uses — see menu_dropdown_rect.
+	x0, dw, h := menu_dropdown_rect(t, app, width, height)
 
 	plat.quads_draw(gfx, qp, []plat.Quad {
 			{pos = {x0 - sx(1), y0}, size = {dw + sx(2), h + sx(2)}, color = MENU_COL.border},
@@ -422,12 +418,38 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	}
 }
 
-// Row index at client y within the open dropdown, or -1.
-menu_item_at :: proc(app: ^App, my: f32) -> int {
+// Geometry of the open dropdown. The single source both the draw and the
+// hit-test consume, so they cannot disagree — every seam bug found so far has
+// been a pair of expressions in two different procs.
+menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0, w, h: f32) {
+	if app.menu.open < 0 {return 0, 0, 0}
+	items := menus[app.menu.open].items
+	x0, _ = menu_title_rect(t, app.menu.open)
+	w = dropdown_w(t)
+	y0 := TAB_STRIP_H + MENU_BAR_H
+	for it in items {h += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
+	// Clamped to the window: a client-space quad cannot leave it, and items drawn
+	// outside would be invisible but still clickable.
+	h = min(h, max(MENU_ITEM_H, height - y0 - sx(4)))
+	x0 = min(x0, max(0, width - w))
+	return
+}
+
+// Row index at client (x, y) within the open dropdown, or -1.
+//
+// Takes x: without it every point at the right height was a live menu row, so
+// clicking into the document to dismiss a menu instead ran whatever command sat
+// at that height — Save, Reload or Exit among them.
+menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> int {
 	if app.menu.open < 0 {return -1}
-	y := TAB_STRIP_H + MENU_BAR_H + sx(1)
+	x0, w, h := menu_dropdown_rect(t, app, width, height)
+	if mx < x0 || mx >= x0 + w {return -1}
+	y0 := TAB_STRIP_H + MENU_BAR_H + sx(1)
+	if my < y0 || my >= y0 + h {return -1} // below a clipped dropdown is not a row
+	y := y0
 	for it, i in menus[app.menu.open].items {
 		ih := MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4
+		if y + ih > y0 + h {break} // not drawn, so not selectable
 		if my >= y && my < y + ih {
 			return i if it.cmd != .None else -1
 		}

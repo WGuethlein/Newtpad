@@ -7,6 +7,7 @@ package main
 import "core:fmt"
 import "core:os"
 import "core:strconv"
+import "core:strings"
 import "core:time"
 import base "src:base"
 import plat "src:platform"
@@ -253,6 +254,29 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !tail_ok {bad += 1}
 		fmt.printfln("  content: %q", txt)
 
+		// Save, then let the file grow. The append offset must come from the file
+		// as last seen, not from the original length — otherwise the bytes we
+		// just saved get read back and inserted a second time.
+		{
+			doc.cursor, doc.anchor = 0, 0
+			doc_insert_text(&doc, transmute([]u8)string("EDIT"), .Paste)
+			doc_save(&doc, path)
+			saved := doc_debug_string(&doc)
+			f2, _ := os.open(path, os.O_WRONLY | os.O_APPEND)
+			os.write(f2, transmute([]u8)string("tail\n"))
+			os.close(f2)
+			s2 := plat.file_stamp(path)
+			doc_absorb_append(&doc, s2.size)
+			got := doc_debug_string(&doc)
+			want := fmt.tprintf("%s%s", saved, "tail\n")
+			dup_ok := got == want
+			fmt.printfln("append after save: %q  %s", got[:min(len(got), 32)], "OK" if dup_ok else "FAIL")
+			if !dup_ok {
+				fmt.printfln("  want %q", want[:min(len(want), 32)])
+				bad += 1
+			}
+		}
+
 		// Shrinking is not an append: it must be refused so the caller reloads.
 		refused := !doc_absorb_append(&doc, 5)
 		fmt.printfln("shrink refused by append path: %v  %s", refused, "OK" if refused else "FAIL")
@@ -434,6 +458,49 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !capped {bad += 1}
 		doc_history_goto(&doc2, 0) // walk to the oldest surviving state
 		fmt.printfln("walk to oldest after eviction: len %d  OK", doc2.pt.length)
+
+		// Labels must survive moving between the undo and redo stacks. A state
+		// that lost its description on the way back read as "As opened", so
+		// jumping to an entry renamed it and it never came back.
+		{
+			d3: Document
+			d3.pt = base.pt_init(nil)
+			defer base.pt_destroy(&d3.pt)
+			for r in "abc" {doc_insert_rune(&d3, r)}
+			d3.cursor, d3.anchor = 0, 0
+			doc_insert_text(&d3, transmute([]u8)string("XY"), .Paste)
+			d3.cursor = d3.pt.length
+			d3.anchor = d3.cursor
+			doc_insert_rune(&d3, '\n')
+
+			n := doc_history_len(&d3)
+			before := make([]string, n);defer delete(before)
+			for i in 0 ..< n {before[i] = strings.clone(doc_history_label(&d3, i))}
+			fmt.println("labels as recorded:")
+			for s, i in before {fmt.printfln("  %d %s", i, s)}
+
+			// Walk all the way back and forward again; every label must match.
+			doc_history_goto(&d3, 0)
+			doc_history_goto(&d3, n - 1)
+			stable := true
+			for i in 0 ..< n {
+				now := doc_history_label(&d3, i)
+				if now != before[i] {
+					fmt.printfln("  MISMATCH at %d: %q -> %q", i, before[i], now)
+					stable = false
+				}
+			}
+			for s in before {delete(s)}
+			fmt.printfln("labels stable across undo/redo round trip: %v  %s", stable, "OK" if stable else "FAIL")
+			if !stable {bad += 1}
+
+			// The oldest state is the file as opened, not an edit.
+			doc_history_goto(&d3, 0)
+			first := doc_history_label(&d3, 0)
+			fok := first == "As opened"
+			fmt.printfln("oldest entry reads %q  %s", first, "OK" if fok else "FAIL")
+			if !fok {bad += 1}
+		}
 
 		// Row hit-testing must account for the scroll offset: with more entries
 		// than fit, the row drawn k places down is entry top+k. Reading it as
@@ -633,24 +700,36 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// keyboard cursor sits somewhere else.
 		fmt.println("--- hover row hit-test ---")
 		menu_open_at(&a, 1) // Edit: has separators
+		W, H := f32(1280), f32(720)
+		dx, dw, _ := menu_dropdown_rect(&t, &a, W, H)
+		inx := dx + dw * 0.5 // a point inside the dropdown horizontally
 		rows_ok, seps_seen := true, 0
 		y := TAB_STRIP_H + MENU_BAR_H + sx(1)
 		for it, i in menus[1].items {
 			ih := MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4
-			got := menu_item_at(&a, y + ih * 0.5)
+			got := menu_item_at(&t, &a, inx, y + ih * 0.5, W, H)
 			if it.cmd == .None {
 				seps_seen += 1
 				if got != -1 {rows_ok = false}
 			} else if got != i {rows_ok = false}
 			y += ih
 		}
-		above := menu_item_at(&a, TAB_STRIP_H) // in the bar, not the dropdown
-		below := menu_item_at(&a, 99999)
+		above := menu_item_at(&t, &a, inx, TAB_STRIP_H, W, H) // in the bar
+		below := menu_item_at(&t, &a, inx, 99999, W, H)
+		// The x axis is the one that had no check at all: a point at a valid row
+		// height but far to the right used to select that row, so clicking into
+		// the document to dismiss a menu ran whatever command sat at that height.
+		mid_y := TAB_STRIP_H + MENU_BAR_H + sx(1) + MENU_ITEM_H * 0.5
+		right := menu_item_at(&t, &a, dx + dw + sx(200), mid_y, W, H)
+		left := menu_item_at(&t, &a, max(0, dx - sx(20)), mid_y, W, H)
 		edge_ok := above == -1 && below == -1
+		x_ok := right == -1 && left == -1
 		fmt.printfln("  rows map correctly (%d separators skipped): %v %s", seps_seen, rows_ok, "OK" if rows_ok else "FAIL")
-		fmt.printfln("  outside the dropdown -> -1: %v %s", edge_ok, "OK" if edge_ok else "FAIL")
+		fmt.printfln("  outside vertically -> -1: %v %s", edge_ok, "OK" if edge_ok else "FAIL")
+		fmt.printfln("  outside horizontally -> %d,%d %s", right, left, "OK" if x_ok else "FAIL")
 		if !rows_ok {bad += 1}
 		if !edge_ok {bad += 1}
+		if !x_ok {bad += 1}
 		menu_close(&a)
 
 		fmt.println("--- global chords survive menu mode ---")

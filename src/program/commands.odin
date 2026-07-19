@@ -466,6 +466,12 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 	if (ctx == .Find || ctx == .Menu) && (ctrl || alt) {
 		return lookup_binding(key, ctrl, alt, .Editor)
 	}
+	// The history panel is a side panel, not a mode: it owns only its navigation
+	// keys and everything else still edits the document. It has no text field, so
+	// there is no reason for it to swallow Backspace or the other editing keys.
+	if ctx == .History {
+		return lookup_binding(key, ctrl, alt, .Editor)
+	}
 	return .None
 }
 
@@ -670,9 +676,11 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	// --- font page ---
 	case .Font_Open:
 		menu_close(app)
-		font_page_open(app)
+		font_choices_refresh()
+		app.font_row = 0
+		app_open_special(app, .Font)
 	case .Font_Close:
-		font_page_close(app)
+		request_close_tab(app, app.active, w)
 	case .Font_Next:
 		font_page_move(app, 1)
 	case .Font_Prev:
@@ -685,11 +693,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	// --- settings page ---
 	case .Settings_Open:
 		menu_close(app)
-		font_choices_refresh() // a handful of file checks, not needed before this
-		app.settings_open = true
 		app.settings_row = 0
+		app_open_special(app, .Settings)
 	case .Settings_Close:
-		app.settings_open = false
+		request_close_tab(app, app.active, w)
 	case .Settings_Next:
 		app.settings_row = min(app.settings_row + 1, settings_row_count() - 1)
 	case .Settings_Prev:
@@ -740,7 +747,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Find_Filter_Page_Up:
 		if doc.filter {doc.filter_top = max(0, doc.filter_top - (rows - 1))}
 	case .Find_Filter_Page_Down:
-		if doc.filter {doc.filter_top = min(max(0, len(doc.filter_lines) - 1), doc.filter_top + (rows - 1))}
+		if doc.filter {doc.filter_top = min(doc_filter_max_top(doc, rows), doc.filter_top + (rows - 1))}
 
 	case .None:
 	// unbound: ignore

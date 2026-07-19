@@ -456,7 +456,7 @@ find_select_current :: proc(doc: ^Document) {
 				// Clamp so the screen stays full. Scrolling to the match's index
 				// directly meant a match near the end left the view showing the
 				// last two or three lines with empty rows beneath.
-				doc.filter_top = clamp(i, 0, max(0, len(doc.filter_lines) - max(1, doc.view_rows)))
+				doc.filter_top = clamp(i, 0, doc_filter_max_top(doc, doc.view_rows))
 				break
 			}
 		}

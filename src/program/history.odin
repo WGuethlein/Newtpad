@@ -98,7 +98,10 @@ history_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app
 	first := app.history.top
 	shown := min(max_rows, n - first)
 	app.history.rows = shown // hit-testing must use the count actually drawn
-	h := sx(28) + f32(shown) * HISTORY_ROW + sx(8)
+	// Height must include the hint line at the bottom, or it draws past the
+	// panel and onto the document.
+	hint_h := sx(22)
+	h := sx(28) + f32(shown) * HISTORY_ROW + hint_h
 
 	plat.quads_draw(gfx, qp, []plat.Quad {
 			{pos = {x0 - sx(1), y0}, size = {HISTORY_W + sx(2), h + sx(2)}, color = {0.30, 0.34, 0.42, 1}},
@@ -123,5 +126,7 @@ history_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app
 		plat.text_draw(gfx, t, fmt.tprintf("%s%s", mark, doc_history_label(d, i)), x0 + sx(10), y + HISTORY_ROW - sx(6), UI_SMALL_PX, col)
 		y += HISTORY_ROW
 	}
-	plat.text_draw(gfx, t, "Up/Down + Enter to jump    Esc closes", x0 + sx(10), y + sx(12), UI_SMALL_PX, {0.45, 0.49, 0.57, 1})
+	// Inside the panel: y is now the bottom of the last row, and the box was
+	// sized with hint_h to spare.
+	plat.text_draw(gfx, t, "Up/Down + Enter to jump    Esc closes", x0 + sx(10), y0 + sx(1) + h - sx(7), UI_SMALL_PX, {0.45, 0.49, 0.57, 1})
 }

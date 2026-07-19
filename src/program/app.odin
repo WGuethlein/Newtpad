@@ -17,9 +17,9 @@ App :: struct {
 	tab_scroll: f32, // horizontal scroll of the tab strip (overflow)
 	menu:       Menu_State,
 	settings:      Settings,
-	settings_open: bool,
+	// Settings and Font are tabs (Document.kind), not overlays; only their
+	// cursor position lives here.
 	settings_row:  int,
-	font_open:     bool, // Edit > Font page
 	font_row:      int,
 	history:       History_State,
 	palette:    Palette, // command palette overlay (Ctrl+P)
@@ -87,6 +87,21 @@ app_new_scratch :: proc(a: ^App) {
 	d := new(Document)
 	d^ = doc_new()
 	d.wrap = a.settings.wrap_default
+	app_activate(a, app_add(a, d))
+}
+
+// Open a Settings or Font tab, or switch to it if one is already open — these
+// are singletons; a second Settings tab would be nonsense.
+app_open_special :: proc(a: ^App, kind: Tab_Kind) {
+	for d, slot in a.docs {
+		if d != nil && d.kind == kind {
+			app_activate(a, slot)
+			return
+		}
+	}
+	d := new(Document)
+	d^ = doc_new()
+	d.kind = kind
 	app_activate(a, app_add(a, d))
 }
 
@@ -178,6 +193,12 @@ doc_display_name :: proc(d: ^Document) -> string {
 
 // Tab label: display name with a leading "*" when modified.
 tab_title :: proc(d: ^Document, allocator := context.temp_allocator) -> string {
+	#partial switch d.kind {
+	case .Settings:
+		return strings.clone("Settings", allocator)
+	case .Font:
+		return strings.clone("Font", allocator)
+	}
 	name := doc_display_name(d)
 	if d.modified {
 		return strings.concatenate({"*", name}, allocator)

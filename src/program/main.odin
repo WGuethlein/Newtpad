@@ -160,7 +160,7 @@ main :: proc() {
 		// Drain input once per frame: typed characters route to the find field or
 		// the document; key chords resolve to a command in the active context.
 		for i in 0 ..< window.char_count {
-			if app.font_open || app.settings_open {
+			if doc.kind != .Text {
 				// the settings page has no text fields; swallow typing
 			} else if app.palette.active {
 				palette_input_rune(&app, window.chars[i])
@@ -205,9 +205,9 @@ main :: proc() {
 			// Context is per-event; palette/find/menu/tab-switch can change it
 			// mid-loop. Priority: menu > palette > find > editor.
 			ctx := Ctx.Editor
-			if app.font_open {
+			if doc.kind == .Font {
 				ctx = .Font
-			} else if app.settings_open {
+			} else if doc.kind == .Settings {
 				ctx = .Settings
 			} else if app.history.open {
 				ctx = .History
@@ -242,7 +242,7 @@ main :: proc() {
 		// With a dropdown open, sliding across the bar switches menus and moving
 		// down the list highlights rows — before any click is considered.
 		menu_hover_update(&app, &text, window)
-		menu_hover_item(&app, window)
+		menu_hover_item(&app, &text, window)
 		history_hover_update(&app, window, f32(window.width))
 
 		// The menu claims clicks first: its bar sits above the scrollbar gutter's
@@ -271,9 +271,24 @@ main :: proc() {
 		// The tab strip claims clicks in its region before the caret sees them.
 		tabs_hit_test(&app, window)
 
+		// Settings and Font are full-window pages with no mouse targets of their
+		// own. Without this the click falls through to the document hidden behind
+		// them: the caret moves, a drag selects, and the right-hand strip starts
+		// a scrollbar drag — all invisibly.
+		if doc.kind != .Text {
+			window.mouse_pressed = false
+			window.mouse_middle_pressed = false
+			window.mouse_down = false
+			window.scroll_delta = 0
+		}
+
 		// Scrollbar: a press in the right-edge gutter starts a drag that maps the
 		// pointer's y to a byte-proportional scroll position (consumes the click).
-		if window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - SCROLLBAR_W && window.mouse_y >= i32(CHROME_TOP) {
+		// Same condition the scrollbar is DRAWN under: otherwise the gutter is
+		// live where no bar exists (empty buffer, filter view), swallowing clicks
+		// meant for the last column and scrolling a document you cannot see.
+		scrollbar_shown := doc.pt.length > 0 && !doc.filter
+		if scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - SCROLLBAR_W && window.mouse_y >= i32(CHROME_TOP) {
 			scrollbar_drag = true
 			window.mouse_pressed = false
 		}
@@ -321,7 +336,7 @@ main :: proc() {
 			if doc.filter {
 				// Stop at the point the list underfills the screen, rather than
 				// letting the last line scroll to the top over empty rows.
-				doc.filter_top = clamp(doc.filter_top + window.scroll_delta, 0, max(0, len(doc.filter_lines) - rows))
+				doc.filter_top = clamp(doc.filter_top + window.scroll_delta, 0, doc_filter_max_top(doc, rows))
 			} else {
 				doc_scroll(doc, &text, window.scroll_delta, rows)
 			}
@@ -466,9 +481,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	}
 
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
-	if rc.app.font_open {
+	if doc.kind == .Font {
 		font_page_draw(gfx, quad_pipe, text, rc.app, w, h)
-	} else if rc.app.settings_open {
+	} else if doc.kind == .Settings {
 		settings_draw(gfx, quad_pipe, text, rc.app, w, h)
 	} else if rc.app.history.open {
 		history_draw(gfx, quad_pipe, text, rc.app, w, h)

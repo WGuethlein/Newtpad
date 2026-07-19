@@ -30,13 +30,22 @@ tab_bg := [3][4]f32 {
 
 // x where the tabs + "+" end (everything left of here in the bar is client; the
 // gap between here and the window buttons is the OS drag region).
+// x where the caption buttons begin. Tabs must never be drawn or hit-tested
+// past this: WM_NCHITTEST checks the caption buttons FIRST, so a tab drawn
+// underneath them is unreachable — and clicking where it appears to be sends
+// HT_CLOSE, which exits the app.
 @(private = "file")
-tabs_right :: proc(app: ^App, char_w: f32) -> f32 {
+tabs_limit :: proc(win: ^plat.Window, width: f32) -> f32 {
+	return max(MENU_W, width - 3 * f32(plat.window_caption_btn_w(win)))
+}
+
+@(private = "file")
+tabs_right :: proc(app: ^App, win: ^plat.Window, width: f32) -> f32 {
 	x := MENU_W
 	for d in app.docs {
 		if d != nil {x += TAB_W + TAB_GAP}
 	}
-	return x + PLUS_W
+	return min(x + PLUS_W, tabs_limit(win, width))
 }
 
 // Handle a click on the title bar during the input phase. Returns true (and
@@ -47,6 +56,7 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window) -> bool {
 	mx := f32(win.mouse_x)
 
 	consumed := true
+	limit := tabs_limit(win, f32(win.width)) // must match what tabs_draw drew
 	if mx < MENU_W { // menu -> command palette
 		palette_open(app)
 		palette_input_rune(app, '>')
@@ -56,6 +66,7 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window) -> bool {
 		hit_close := false
 		for d, slot in app.docs {
 			if d == nil {continue}
+			if x + TAB_W > limit {break} // not drawn, so not clickable
 			if mx >= x && mx < x + TAB_W {
 				hit_slot = slot
 				hit_close = win.mouse_middle_pressed || mx >= x + TAB_W - TAB_CLOSE_W
@@ -68,7 +79,7 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window) -> bool {
 			} else {
 				app_activate(app, hit_slot)
 			}
-		} else if mx >= x && mx < x + PLUS_W { // + -> new tab
+		} else if x + PLUS_W <= limit && mx >= x && mx < x + PLUS_W { // + -> new tab
 			app_new_scratch(app)
 		}
 	}
@@ -93,7 +104,7 @@ caption_btn :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, x
 tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Text, app: ^App, win: ^plat.Window, width: f32) {
 	win.titlebar_h = i32(TAB_STRIP_H)
 	char_w := plat.text_char_width(text, UI_SMALL_PX)
-	win.tabs_right = i32(tabs_right(app, char_w))
+	win.tabs_right = i32(tabs_right(app, win, width))
 
 	cx, cy := plat.window_cursor_client(win)
 	in_bar := f32(cy) >= 0 && f32(cy) < TAB_STRIP_H
@@ -108,10 +119,15 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 	plat.text_draw(gfx, text, "☰", MENU_W / 2 - sx(8), base_y, UI_PX, {0.80, 0.84, 0.90, 1})
 
 	// tabs
+	// Nothing past `limit` may be drawn: the caption buttons are non-client and
+	// WM_NCHITTEST claims that region first, so a tab drawn under them looks
+	// clickable but sends HT_CLOSE — one click and the app exits.
+	limit := tabs_limit(win, width)
 	max_cells := int((TAB_W - TAB_CLOSE_W - sx(8)) / char_w)
 	x := MENU_W - app.tab_scroll
 	for d, slot in app.docs {
 		if d == nil {continue}
+		if x + TAB_W > limit {break} // overflow; scrolling the strip is a follow-up
 		active := slot == app.active
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {TAB_W, TAB_STRIP_H - sx(4)}, color = tab_bg[2 if active else 1]}})
 
@@ -127,11 +143,13 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 		x += TAB_W + TAB_GAP
 	}
 
-	// new-tab button
-	if in_bar && f32(cx) >= x && f32(cx) < x + PLUS_W {
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {PLUS_W, TAB_STRIP_H - sx(4)}, color = {0.20, 0.23, 0.30, 1}}})
+	// new-tab button, only if it fits clear of the caption buttons
+	if x + PLUS_W <= limit {
+		if in_bar && f32(cx) >= x && f32(cx) < x + PLUS_W {
+			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {PLUS_W, TAB_STRIP_H - sx(4)}, color = {0.20, 0.23, 0.30, 1}}})
+		}
+		plat.text_draw(gfx, text, "+", x + PLUS_W / 2 - sx(4), base_y, UI_PX, {0.75, 0.79, 0.86, 1})
 	}
-	plat.text_draw(gfx, text, "+", x + PLUS_W / 2 - sx(4), base_y, UI_PX, {0.75, 0.79, 0.86, 1})
 
 	// window buttons (non-client; drawn here, clicks handled by the platform)
 	bw := f32(plat.window_caption_btn_w(win))

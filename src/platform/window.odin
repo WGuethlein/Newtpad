@@ -531,6 +531,13 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 			w.alt_down = false
 			return 0
 		}
+	case win.WM_CAPTURECHANGED:
+		// Capture lost to a dialog, the file picker, or another window. The
+		// matching WM_LBUTTONUP goes there, not here, so without this mouse_down
+		// stays true forever and the caret is dragged to the last known position
+		// every frame — recoverable only by clicking again.
+		w.mouse_down = false
+		return 0
 	case win.WM_ACTIVATE:
 		// Losing activation must close any open menu. Without this, Alt+Tabbing
 		// away leaves the dropdown drawn and the app in menu mode, tracking a
@@ -538,6 +545,7 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		if (wparam & 0xFFFF) == 0 {
 			w.focus_lost = true
 			w.alt_down, w.alt_used, w.alt_tapped = false, false, false
+			w.mouse_down = false // a drag cannot continue into another window
 		}
 		return 0
 	case win.WM_KEYDOWN, win.WM_SYSKEYDOWN:

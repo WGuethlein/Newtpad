@@ -198,6 +198,14 @@ visible_begin :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> Visible_Iter 
 // filter armed but nothing matched yet — an empty query, or a worker that hasn't
 // published — the document renders normally instead of showing a blank screen.
 // That is what lets Ctrl+L arm the filter first and narrow as the user types.
+// Highest filter_top that still fills the screen. One definition: the wheel, the
+// page keys and the match auto-scroll each had their own, so Page-Down could
+// scroll to a single line above a screen of empty rows while the wheel refused
+// to move at all.
+doc_filter_max_top :: proc(doc: ^Document, rows: int) -> int {
+	return max(0, len(doc.filter_lines) - max(1, rows))
+}
+
 doc_filtering :: proc(doc: ^Document) -> bool {
 	return doc.filter && len(doc.filter_lines) > 0
 }
@@ -268,11 +276,22 @@ Snapshot :: struct {
 	cursor:   int,
 	anchor:   int,
 	nl_delta: int,
-	kind:     Edit_Kind, // what the edit AFTER this state was
-	count:    int, // characters/lines involved, for the label
+	kind:     Edit_Kind, // the edit that PRODUCED this state (.None = as opened)
+	count:    int, // characters/edits involved, for the label
+}
+
+// A tab is usually a text document, but Settings and Font are tabs too. Making
+// them tabs rather than a full-window takeover means they can be switched away
+// from, closed with Ctrl+W, and shown in the tab strip like anything else —
+// instead of trapping the window until you click the same button again.
+Tab_Kind :: enum u8 {
+	Text,
+	Settings,
+	Font,
 }
 
 Document :: struct {
+	kind:       Tab_Kind,
 	fv:         plat.File_View,
 	original:   []u8,
 	owned_orig: bool,
@@ -307,6 +326,12 @@ Document :: struct {
 	// run of typing continues only while both still match.
 	last_edit:    Edit_Kind,
 	last_edit_at: int,
+	// What produced the CURRENT state, and how much of it. Each Snapshot carries
+	// the same for the state it holds, so the description travels with a state as
+	// it moves between the undo and redo stacks — otherwise a state that came
+	// back via undo would lose its label.
+	state_kind:  Edit_Kind,
+	state_count: int,
 	idx:        Line_Index,
 	find:       Find,
 	search:     Search, // background find worker (see find.odin)
@@ -646,13 +671,17 @@ push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
 		len(doc.undo) > 0 &&
 		!doc_has_sel(doc)
 	if continues {
-		doc.undo[len(doc.undo) - 1].count += 1
+		doc.state_count += 1 // the run grows the state we are about to reach
 		return
 	}
 
+	// The snapshot holds the state we are leaving, labelled with whatever
+	// produced it. The edit now happening labels the state we are moving to.
 	s := snapshot(doc)
-	s.kind = kind
-	s.count = 1
+	s.kind = doc.state_kind
+	s.count = doc.state_count
+	doc.state_kind = kind
+	doc.state_count = 1
 	append(&doc.undo, s)
 	// Bounded: this is a long-lived process and every entry holds a cloned tree.
 	if len(doc.undo) > UNDO_MAX {
@@ -664,15 +693,22 @@ push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
 
 doc_undo :: proc(doc: ^Document) {
 	if len(doc.undo) == 0 {return}
-	append(&doc.redo, snapshot(doc)) // clone current for redo
+	cur := snapshot(doc) // the state we leave keeps its own description
+	cur.kind, cur.count = doc.state_kind, doc.state_count
+	append(&doc.redo, cur)
 	s := pop(&doc.undo)
+	doc.state_kind, doc.state_count = s.kind, s.count
 	apply_snapshot(doc, s) // s.root becomes the live tree
+	doc.last_edit = .None
 }
 
 doc_redo :: proc(doc: ^Document) {
 	if len(doc.redo) == 0 {return}
-	append(&doc.undo, snapshot(doc))
+	cur := snapshot(doc)
+	cur.kind, cur.count = doc.state_kind, doc.state_count
+	append(&doc.undo, cur)
 	s := pop(&doc.redo)
+	doc.state_kind, doc.state_count = s.kind, s.count
 	apply_snapshot(doc, s)
 	doc.last_edit = .None
 }
@@ -756,7 +792,13 @@ doc_absorb_append :: proc(doc: ^Document, new_size: i64) -> bool {
 	// shifts every offset by 3 and UTF-16 is transcoded, so "file grew by N"
 	// says nothing about how many document bytes to add.
 	if doc.enc != .UTF8 || doc.had_bom {return false}
-	old := i64(len(doc.original)) + i64(doc.appended)
+	// The real precondition is that the buffer IS the file's first `old` bytes.
+	// Deriving `old` from len(original)+appended broke after a save: saving
+	// writes pt.length bytes and clears `appended`, but leaves `original` at its
+	// opening length, so the next append re-read the user's own saved edits and
+	// inserted them a second time — silently duplicating text in their file.
+	if i64(doc.pt.length) != doc.disk_stamp.size {return false}
+	old := doc.disk_stamp.size
 	if new_size <= old {return false}
 
 	chunk, ok := plat.file_read_range(doc.path, old, int(new_size - old))
@@ -819,16 +861,20 @@ doc_history_len :: proc(doc: ^Document) -> int {
 // Index of the state the document is currently at.
 doc_history_current :: proc(doc: ^Document) -> int {return len(doc.undo)}
 
-// Label for history entry `i`. Index len(undo) is the present.
+// Label for history entry `i`: what produced that state. Every entry carries its
+// own description, so a state keeps its label as it moves between the undo and
+// redo stacks — deriving it from a neighbour made states rename themselves to
+// "Opened" the moment you jumped to one.
 doc_history_label :: proc(doc: ^Document, i: int) -> string {
-	if i == len(doc.undo) {return "(current state)"}
-	// An undo entry records the state BEFORE its edit, so entry i is described
-	// by the edit that produced state i+1.
 	kind: Edit_Kind
 	count := 0
-	if i < len(doc.undo) {
+	switch {
+	case i < len(doc.undo):
 		kind, count = doc.undo[i].kind, doc.undo[i].count
-	} else {
+	case i == len(doc.undo):
+		kind, count = doc.state_kind, doc.state_count
+	case:
+		// redo is stored newest-last, so it reads backwards against the timeline
 		j := len(doc.redo) - 1 - (i - len(doc.undo) - 1)
 		if j < 0 || j >= len(doc.redo) {return "?"}
 		kind, count = doc.redo[j].kind, doc.redo[j].count
@@ -845,7 +891,7 @@ doc_history_label :: proc(doc: ^Document, i: int) -> string {
 	case .Replace:
 		return "Replaced"
 	case .None:
-		return "Opened"
+		return "As opened"
 	}
 	return "Edit"
 }
