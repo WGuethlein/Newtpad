@@ -645,10 +645,11 @@ doc_cursor_col :: proc(doc: ^Document, t: ^plat.Text) -> int {
 }
 
 // Scroll so the top of the view is the line start at fraction `frac` of the
-// buffer (byte-proportional; used by the draggable scrollbar).
-doc_scroll_to_fraction :: proc(doc: ^Document, frac: f32) {
+// buffer (byte-proportional; used by the draggable scrollbar), bounded so the
+// last line stays at the bottom.
+doc_scroll_to_fraction :: proc(doc: ^Document, t: ^plat.Text, frac: f32, rows: int) {
 	target := int(clamp(frac, 0, 1) * f32(doc.pt.length))
-	doc.top = base.pt_line_start(&doc.pt, target)
+	doc.top = min(base.pt_line_start(&doc.pt, target), doc_max_top(doc, t, rows))
 }
 
 // Move the caret to the start of 1-based line `n` (O(n) line walk from the top).
@@ -835,9 +836,20 @@ doc_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows
 
 // --- viewport ---
 
-// Scroll the viewport by `delta` visual rows (up when negative). Visual rows are
-// wrap segments when wrapping, otherwise logical lines.
-doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta: int) {
+// The largest doc.top that still fills the viewport (keeps the last line at the
+// bottom row); 0 if the whole document fits. Bounds scrolling to real content.
+doc_max_top :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
+	p := visual_row_start(doc, t, doc.pt.length, doc.view_cols) if doc.wrap else base.pt_line_start(&doc.pt, doc.pt.length)
+	for _ in 0 ..< max(rows - 1, 0) {
+		if p == 0 {break}
+		p = prev_visual_row(doc, t, p, doc.view_cols) if doc.wrap else base.pt_prev_line_start(&doc.pt, p)
+	}
+	return p
+}
+
+// Scroll the viewport by `delta` visual rows (up when negative), clamped so the
+// last line can't scroll above the bottom row.
+doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta, rows: int) {
 	if delta > 0 {
 		for _ in 0 ..< delta {
 			nt := next_visual_row(doc, t, doc.top, doc.view_cols) if doc.wrap else base.pt_next_line_start(&doc.pt, doc.top)
@@ -850,6 +862,7 @@ doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta: int) {
 			doc.top = prev_visual_row(doc, t, doc.top, doc.view_cols) if doc.wrap else base.pt_prev_line_start(&doc.pt, doc.top)
 		}
 	}
+	doc.top = min(doc.top, doc_max_top(doc, t, rows))
 }
 
 // Keep the caret on screen: scroll so its visual row is within [top, top+rows).
@@ -867,7 +880,7 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 	}
 	// caret is below the viewport: put its row at the bottom
 	doc.top = cls
-	doc_scroll(doc, t, -(rows - 1))
+	doc_scroll(doc, t, -(rows - 1), rows)
 }
 
 // Draw visible lines; return the caret's screen rect (if visible) and the byte

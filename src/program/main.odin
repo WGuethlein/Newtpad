@@ -140,7 +140,7 @@ main :: proc() {
 		if scrollbar_drag {
 			if window.mouse_down {
 				frac := (f32(window.mouse_y) - TAB_STRIP_H) / max(1, f32(window.height) - TAB_STRIP_H)
-				doc_scroll_to_fraction(doc, frac)
+				doc_scroll_to_fraction(doc, &text, frac, rows)
 			} else {
 				scrollbar_drag = false
 			}
@@ -165,9 +165,9 @@ main :: proc() {
 			// drag extends a single-click selection; word/line selects stay put.
 			// Auto-scroll when the pointer is dragged past the top/bottom edge.
 			if window.mouse_y < i32(CONTENT_TOP) {
-				doc_scroll(doc, &text, -1)
+				doc_scroll(doc, &text, -1, rows)
 			} else if window.mouse_y > window.height - i32(line_h) {
-				doc_scroll(doc, &text, 1)
+				doc_scroll(doc, &text, 1, rows)
 			}
 			doc.cursor = doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
 		}
@@ -176,7 +176,7 @@ main :: proc() {
 			if doc.filter {
 				doc.filter_top = clamp(doc.filter_top + window.scroll_delta, 0, max(0, len(doc.filter_lines) - 1))
 			} else {
-				doc_scroll(doc, &text, window.scroll_delta)
+				doc_scroll(doc, &text, window.scroll_delta, rows)
 			}
 			window.scroll_delta = 0
 		}

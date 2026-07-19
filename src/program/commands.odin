@@ -255,9 +255,9 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Word_Right:
 		doc_word_right(doc, ev.shift)
 	case .Page_Up:
-		doc_scroll(doc, t, -(rows - 1))
+		doc_scroll(doc, t, -(rows - 1), rows)
 	case .Page_Down:
-		doc_scroll(doc, t, rows - 1)
+		doc_scroll(doc, t, rows - 1, rows)
 	case .Backspace:
 		doc_backspace(doc)
 	case .Delete_Fwd:
