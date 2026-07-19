@@ -8,7 +8,26 @@ import "core:os"
 import "core:strings"
 import win "core:sys/windows"
 
+// Not in core:sys/windows; hand-declared.
+foreign import kernel32_fs "system:Kernel32.lib"
+@(default_calling_convention = "system")
+foreign kernel32_fs {
+	GetDriveTypeW :: proc(lpRootPathName: win.wstring) -> u32 ---
+}
+DRIVE_FIXED :: 3
+
 FILE_MMAP_THRESHOLD :: 16 * 1024 * 1024 // copy below, mmap above
+
+// mmap only on a local fixed drive. Drive-letter paths are checked by volume
+// type; UNC / relative paths are treated as non-fixed (copy, crash-safe).
+@(private = "file")
+drive_is_fixed :: proc(path: string) -> bool {
+	if len(path) >= 3 && path[1] == ':' {
+		root := win.utf8_to_wstring(path[:3], context.temp_allocator) // "C:\"
+		return GetDriveTypeW(root) == DRIVE_FIXED
+	}
+	return false
+}
 
 File_View :: struct {
 	bytes:  []u8, // the file's bytes (mapped or copied); empty for a 0-byte file
@@ -27,8 +46,10 @@ file_open_readonly :: proc(path: string) -> (fv: File_View, ok: bool) {
 		return fv, true // empty file: bytes = nil
 	}
 
-	if n < FILE_MMAP_THRESHOLD {
-		// Small: read into private memory and let the handle go (no lock held).
+	// Copy (crash-immune) unless the file is large AND on a local fixed drive.
+	// mmap'd pages on a network/removable volume fault - and block the faulting
+	// thread for the SMB timeout - if the media drops; copying avoids that.
+	if n < FILE_MMAP_THRESHOLD || !drive_is_fixed(path) {
 		data, rerr := os.read_entire_file(path, context.allocator)
 		if rerr != nil {
 			return

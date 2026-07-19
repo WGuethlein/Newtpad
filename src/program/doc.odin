@@ -12,6 +12,9 @@ import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
 
+// Max bytes scanned per visible line for its end (bounds per-frame work).
+RENDER_LINE_CAP :: 8192
+
 // Background job that counts total lines over the immutable original bytes (no
 // race with edits, which only touch the add arena). The status bar shows this
 // plus nl_delta (net newlines from edits). Published via atomics.
@@ -570,7 +573,10 @@ doc_draw :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, px, char_w: f32,
 			if pos > doc.pt.length {break}
 			start = pos
 		}
-		end := base.pt_line_end(&doc.pt, start)
+		// Capped so a multi-GB single-line file doesn't scan gigabytes per frame.
+		// A line longer than the cap renders as successive capped rows (crude
+		// long-line handling; proper horizontal scroll is a follow-up).
+		end := base.pt_line_end_cap(&doc.pt, start, RENDER_LINE_CAP)
 		bottom = end
 		row_y := y0 + f32(r) * line_h
 

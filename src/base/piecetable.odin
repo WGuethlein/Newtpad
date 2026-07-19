@@ -242,6 +242,29 @@ pt_line_end :: proc(pt: ^Piece_Table, pos: int) -> int {
 	return pt.length
 }
 
+// Like pt_line_end but scans at most `cap` bytes; if no '\n' is found within
+// cap, returns pos+cap (a synthetic break). Keeps per-frame work bounded on
+// pathologically long lines (multi-GB single-line files). Rendering uses this;
+// navigation uses the uncapped pt_line_end.
+pt_line_end_cap :: proc(pt: ^Piece_Table, pos, cap: int) -> int {
+	buf: [4096]u8
+	p := clamp(pos, 0, pt.length)
+	limit := min(pt.length, p + cap)
+	for p < limit {
+		n := pt_read(pt, p, buf[:min(len(buf), limit - p)])
+		if n == 0 {
+			break
+		}
+		for k in 0 ..< n {
+			if buf[k] == '\n' {
+				return p + k
+			}
+		}
+		p += n
+	}
+	return limit
+}
+
 pt_next_line_start :: proc(pt: ^Piece_Table, pos: int) -> int {
 	e := pt_line_end(pt, pos)
 	return e + 1 if e < pt.length else pt.length
