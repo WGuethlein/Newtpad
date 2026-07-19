@@ -599,6 +599,31 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !(lvl1 && lvl2) {bad += 1}
 
 		// A global chord must still resolve while the menu is open.
+		// Hover maps a y coordinate to a row. Separators must report -1 rather
+		// than a selectable index, or hovering one highlights nothing while the
+		// keyboard cursor sits somewhere else.
+		fmt.println("--- hover row hit-test ---")
+		menu_open_at(&a, 1) // Edit: has separators
+		rows_ok, seps_seen := true, 0
+		y := TAB_STRIP_H + MENU_BAR_H + sx(1)
+		for it, i in menus[1].items {
+			ih := MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4
+			got := menu_item_at(&a, y + ih * 0.5)
+			if it.cmd == .None {
+				seps_seen += 1
+				if got != -1 {rows_ok = false}
+			} else if got != i {rows_ok = false}
+			y += ih
+		}
+		above := menu_item_at(&a, TAB_STRIP_H) // in the bar, not the dropdown
+		below := menu_item_at(&a, 99999)
+		edge_ok := above == -1 && below == -1
+		fmt.printfln("  rows map correctly (%d separators skipped): %v %s", seps_seen, rows_ok, "OK" if rows_ok else "FAIL")
+		fmt.printfln("  outside the dropdown -> -1: %v %s", edge_ok, "OK" if edge_ok else "FAIL")
+		if !rows_ok {bad += 1}
+		if !edge_ok {bad += 1}
+		menu_close(&a)
+
 		fmt.println("--- global chords survive menu mode ---")
 		for k in ([]plat.Key{.S, .P, .N, .Z}) {
 			got := resolve_key(k, true, false, .Menu)

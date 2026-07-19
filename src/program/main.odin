@@ -239,6 +239,11 @@ main :: proc() {
 			window.mouse_down = false
 		}
 
+		// With a dropdown open, sliding across the bar switches menus and moving
+		// down the list highlights rows — before any click is considered.
+		menu_hover_update(&app, &text, window)
+		menu_hover_item(&app, window)
+
 		// The menu claims clicks first: its bar sits above the scrollbar gutter's
 		// top edge, and an open dropdown overlaps the content.
 		if mcmd, consumed := menu_hit_test(&app, &text, window, f32(window.width), f32(window.height)); consumed {

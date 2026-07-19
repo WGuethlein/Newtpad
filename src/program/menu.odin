@@ -189,6 +189,30 @@ char_key :: proc(r: rune) -> plat.Key {
 
 // Click handling for the bar and any open dropdown. Returns true if the click
 // was consumed. Must run before the tab strip and scrollbar handlers.
+// Once a dropdown is open, moving the pointer across the bar switches to the
+// menu under it — how every native menu behaves. Without it the bar feels dead:
+// you open File, slide to Edit, and nothing happens until you click again.
+//
+// Only while something is open. Hovering the bar with everything closed must not
+// open anything, or the menu drops down whenever the pointer crosses the row.
+menu_hover_update :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window) {
+	if app.menu.open < 0 {return}
+	cx, cy := plat.window_cursor_client(win)
+	if f32(cy) < TAB_STRIP_H || f32(cy) >= TAB_STRIP_H + MENU_BAR_H {return}
+	if i := menu_title_at(t, f32(cx)); i >= 0 && i != app.menu.open {
+		menu_open_at(app, i)
+	}
+}
+
+// Highlight the dropdown row under the pointer, so the mouse and the keyboard
+// agree about what is selected before a click lands.
+menu_hover_item :: proc(app: ^App, win: ^plat.Window) {
+	if app.menu.open < 0 {return}
+	if r := menu_item_at(app, f32(win.mouse_y)); r >= 0 {
+		if item_enabled(app, menus[app.menu.open].items[r]) {app.menu.item = r}
+	}
+}
+
 // Returns the command a click selected (.None if it selected nothing) and
 // whether the click was consumed. The caller dispatches, so the menu never has
 // to know how commands run.
