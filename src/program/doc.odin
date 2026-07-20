@@ -374,6 +374,9 @@ Document :: struct {
 	// back via undo would lose its label.
 	state_kind:  Edit_Kind,
 	state_count: int,
+	// Inside a batch every edit still applies, but only the first takes a
+	// snapshot, so a multi-edit operation is one undo entry. See doc_batch_begin.
+	batch:       bool,
 	idx:        Line_Index,
 	find:       Find,
 	search:     Search, // background find worker (see find.odin)
@@ -709,6 +712,12 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
 	find_invalidate(doc) // every edit path routes through here; match offsets shift
 	doc.modified = true
+	// One entry for the whole batch; doc_batch_begin already took the snapshot of
+	// the state being left. Without this, Replace All pushed one snapshot per
+	// match -- and since UNDO_MAX evicts the oldest, replacing more than 200
+	// occurrences discarded the pre-replace state entirely. No amount of Ctrl+Z
+	// could get the document back.
+	if doc.batch {return}
 	for s in doc.redo {base.pt_free_node_tree(s.root)}
 	clear(&doc.redo)
 
@@ -736,6 +745,23 @@ push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
 		ordered_remove(&doc.undo, 0)
 	}
 	doc.last_edit = kind
+}
+
+// Group a multi-edit operation into a single undo entry. Every editor treats
+// Replace All as one step; doing otherwise is not just noisy, it overflows the
+// undo stack and loses the state the user wants back.
+doc_batch_begin :: proc(doc: ^Document, kind: Edit_Kind) {
+	if doc.batch {return}
+	push_undo(doc, kind) // snapshots the state being left, exactly once
+	doc.batch = true
+}
+
+// `count` labels the resulting state in the history list ("Replace x37").
+doc_batch_end :: proc(doc: ^Document, count: int) {
+	if !doc.batch {return}
+	doc.batch = false
+	doc.state_count = max(count, 1)
+	doc.last_edit = .None // a later keystroke must not coalesce into the batch
 }
 
 doc_undo :: proc(doc: ^Document) {
@@ -1010,6 +1036,21 @@ doc_insert_text :: proc(doc: ^Document, text: []u8, kind: Edit_Kind = .Paste) {
 	for b in text {if b == '\n' {doc.nl_delta += 1}}
 	doc.cursor += len(text)
 	doc.anchor = doc.cursor
+	doc.last_edit_at = doc.cursor
+}
+
+// Replace the selection with `text`, which is allowed to be empty. Find and
+// replace routed this through doc_insert_text, which returns early on empty
+// input -- before it deletes the selection -- so "replace X with nothing", a
+// first-class use of the feature, silently did nothing and said nothing.
+doc_replace_sel :: proc(doc: ^Document, text: []u8, kind: Edit_Kind = .Replace) {
+	if len(text) > 0 {
+		doc_insert_text(doc, text, kind)
+		return
+	}
+	if !doc_has_sel(doc) {return}
+	push_undo(doc, .Delete)
+	del_sel_raw(doc)
 	doc.last_edit_at = doc.cursor
 }
 

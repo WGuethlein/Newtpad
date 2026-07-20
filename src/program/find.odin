@@ -509,21 +509,29 @@ find_replace_current :: proc(doc: ^Document) {
 	m := f.matches[f.current]
 	doc.anchor = m
 	doc.cursor = m + f.match_len[f.current]
-	doc_insert_text(doc, f.replace[:]) // deletes the selected match, inserts replacement (undo-aware)
+	doc_replace_sel(doc, f.replace[:]) // handles an empty replacement as a delete
 	find_recompute(doc)
 }
 
 // Replace every match. Applied last->first so earlier offsets stay valid.
 // Each edit invalidates the search, but find_invalidate only marks it dirty, so
 // this costs one restart at the end rather than one per match.
+//
+// One undo entry for the whole operation, which is both what every other editor
+// does and a correctness requirement here: per-match entries overflowed
+// UNDO_MAX on any large replace and took the pre-replace state with them.
 find_replace_all :: proc(doc: ^Document) {
 	f := &doc.find
-	for i := len(f.matches) - 1; i >= 0; i -= 1 {
+	n := len(f.matches)
+	if n == 0 {return}
+	doc_batch_begin(doc, .Replace)
+	for i := n - 1; i >= 0; i -= 1 {
 		m := f.matches[i]
 		doc.anchor = m
 		doc.cursor = m + f.match_len[i]
-		doc_insert_text(doc, f.replace[:])
+		doc_replace_sel(doc, f.replace[:])
 	}
+	doc_batch_end(doc, n)
 	find_recompute(doc)
 }
 

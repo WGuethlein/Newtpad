@@ -1182,6 +1182,68 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad replacetest` covers the two ways Replace All lost data.
+	//
+	// It pushed one undo entry per match. UNDO_MAX is 200 and evicts the oldest,
+	// so replacing more than 200 occurrences discarded the pre-replace snapshot --
+	// the document before the replace became unreachable by any number of Ctrl+Z.
+	// The count here is deliberately above UNDO_MAX so the old behaviour cannot
+	// pass. And an empty replacement went through doc_insert_text, which returns
+	// early on empty input before deleting the selection, so "remove every X" was
+	// a silent no-op.
+	if os.args[1] == "replacetest" {
+		bad := 0
+		N :: 300 // > UNDO_MAX (200): the whole point
+		tmpf := fmt.tprintf("%s%cnewtpad_repl.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+
+		sb := strings.builder_make(context.temp_allocator)
+		for i in 0 ..< N {fmt.sbprintf(&sb, "alpha line %d\n", i)}
+		original := strings.to_string(sb)
+		plat.file_write_atomic(tmpf, transmute([]u8)original)
+
+		fmt.printfln("--- Replace All over %d matches (UNDO_MAX=%d) ---", N, UNDO_MAX)
+		doc, _ := doc_open(tmpf)
+		find_open(&doc, true)
+		for r in "alpha" {find_input_rune(&doc, r)}
+		doc.find.field = 1
+		for r in "beta" {find_input_rune(&doc, r)}
+		doc.find.field = 0
+		find_wait(&doc)
+		matches := len(doc.find.matches)
+		undo_before := len(doc.undo)
+		find_replace_all(&doc)
+		entries := len(doc.undo) - undo_before
+		fmt.printfln("  matches=%d, undo entries added=%d %s", matches, entries, "OK" if entries == 1 else "FAIL")
+		if entries != 1 {bad += 1}
+
+		// One Ctrl+Z must restore the document exactly.
+		doc_undo(&doc)
+		back := doc_debug_string(&doc)
+		restored := back == original
+		fmt.printfln("  one undo restores the original: %v %s", restored, "OK" if restored else "FAIL")
+		if !restored {bad += 1}
+		doc_close(&doc)
+
+		fmt.println("--- empty replacement deletes every occurrence ---")
+		d2, _ := doc_open(tmpf)
+		find_open(&d2, true)
+		for r in "alpha " {find_input_rune(&d2, r)}
+		d2.find.field = 1 // replacement left empty
+		d2.find.field = 0
+		find_wait(&d2)
+		before := len(doc_debug_string(&d2))
+		find_replace_all(&d2)
+		after_s := doc_debug_string(&d2)
+		shrank := len(after_s) < before
+		gone := !strings.contains(after_s, "alpha")
+		fmt.printfln("  %d -> %d bytes, 'alpha' gone=%v %s", before, len(after_s), gone, "OK" if shrank && gone else "FAIL")
+		if !(shrank && gone) {bad += 1}
+		doc_close(&d2)
+
+		fmt.printfln("replacetest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad diskstamptest` pins the restore/watch seam in both directions. A
 	// dirty tab restored from a backup used to carry a zero stamp, so the watcher
 	// compared zero against the real file, called it changed, and told the user to
