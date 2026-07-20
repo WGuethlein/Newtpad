@@ -101,48 +101,35 @@ is_smb_url :: proc(s: string) -> bool {
 	return len(s) > 6 && strings.equal_fold(s[:6], "smb://")
 }
 
-// Known text-ish extensions. A path ending in one of these is something we are
-// willing to open in a tab; everything else is revealed in Explorer instead.
-// Kept in step with the extensions install.ps1 registers.
+// Known text-ish extensions. A path ending in one of these opens in a tab;
+// everything else is revealed in Explorer instead.
+//
+// The list lives in ONE place — text_exts.txt at the repo root — embedded here at
+// compile time and read by install.ps1 for the Explorer registration. Two hand-
+// maintained copies used to drift (this list had .cpp/.cs/.go/…; the installer
+// had .markdown); a single source is the only thing that keeps them in step.
 @(private = "file")
-TEXT_EXTS := [?]string {
-	".txt",
-	".log",
-	".md",
-	".json",
-	".xml",
-	".yaml",
-	".yml",
-	".toml",
-	".ini",
-	".cfg",
-	".conf",
-	".env",
-	".csv",
-	".tsv",
-	".c",
-	".h",
-	".cpp",
-	".hpp",
-	".cs",
-	".odin",
-	".py",
-	".js",
-	".ts",
-	".go",
-	".rs",
-	".java",
-	".sql",
-	".sh",
-	".bat",
-	".ps1",
-	".html",
-	".css",
-	".gitignore",
+TEXT_EXTS_RAW :: #load("../../text_exts.txt", string)
+
+@(private = "file")
+text_exts_cache: []string
+
+@(private = "file")
+text_exts_list :: proc() -> []string {
+	if text_exts_cache == nil {
+		out := make([dynamic]string, 0, 40) // process-lifetime; slices into static data
+		raw := TEXT_EXTS_RAW // a ^string for the iterator; the bytes are static
+		for ln in strings.split_lines_iterator(&raw) {
+			s := strings.trim_space(ln)
+			if len(s) > 0 {append(&out, s)}
+		}
+		text_exts_cache = out[:]
+	}
+	return text_exts_cache
 }
 
 link_is_text_ext :: proc(path: string) -> bool {
-	for ext in TEXT_EXTS {
+	for ext in text_exts_list() {
 		if len(path) >= len(ext) && strings.equal_fold(path[len(path) - len(ext):], ext) {
 			return true
 		}
@@ -528,9 +515,9 @@ link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, 
 	return Link_Target{path = abs, line = l.line, col = l.col}, true
 }
 
-// Act on a resolved link. Text-ish files become tabs; anything else is revealed
-// in Explorer, so nothing we did executed it.
-link_activate :: proc(app: ^App, t: Link_Target) -> bool {
+// Act on a resolved link. Text-ish files become tabs; a directory (or any other
+// non-text target) is revealed in Explorer, so nothing we did executed it.
+link_activate :: proc(app: ^App, txt: ^plat.Text, t: Link_Target) -> bool {
 	if t.is_url {
 		return plat.shell_open_url(t.url)
 	}
@@ -546,19 +533,19 @@ link_activate :: proc(app: ^App, t: Link_Target) -> bool {
 		if d != nil {
 			doc_goto_line(d, t.line)
 			if t.col > 1 {
-				// Columns are 1-based and in bytes here, clamped to the line.
-				e := base_line_end_for_col(d)
-				d.cursor = min(d.cursor + t.col - 1, e)
+				// The column is 1-based cells (what the status bar reports), not
+				// bytes: on a CJK/tab line those differ, so a byte offset landed the
+				// caret in the wrong place. Map cells -> byte offset through the
+				// line's own glyph widths, capped and clamped to the line end.
+				ls := d.cursor // doc_goto_line left us at the line start
+				end := base.pt_line_end_cap(&d.pt, ls, RENDER_LINE_CAP)
+				buf := make([]u8, end - ls, context.temp_allocator)
+				got := base.pt_read(&d.pt, ls, buf)
+				off := plat.text_bytes_for_cells(txt, buf[:got], t.col - 1, .Doc)
+				d.cursor = min(ls + off, end)
 				d.anchor = d.cursor
 			}
 		}
 	}
 	return true
-}
-
-// End of the line the caret is on, for clamping a column jump. Capped like
-// every other line walk, so a column ref into a single-line file cannot scan it.
-@(private = "file")
-base_line_end_for_col :: proc(d: ^Document) -> int {
-	return base.pt_line_end_cap(&d.pt, d.cursor, RENDER_LINE_CAP)
 }

@@ -1293,6 +1293,23 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				fmt.printfln("  parent walk refused: %v %s", !rok, "OK" if !rok else "FAIL")
 				if rok {bad += 1}
 			}
+
+			// A relative directory resolves against the document folder and is
+			// flagged as a directory, so link_activate reveals it in Explorer
+			// rather than trying to open it as a tab.
+			os.make_directory(fmt.tprintf("%s\\newtpad_link_subdir", dir))
+			dirline := "open .\\newtpad_link_subdir here"
+			dl := links_scan(dirline)
+			if len(dl) > 0 {
+				td, dok2 := link_resolve(&doc, dirline, dl[0])
+				_, isdir := plat.path_exists(td.path)
+				okd := dok2 && isdir
+				fmt.printfln("  relative directory resolves + reveals: %v %s", td.path, "OK" if okd else "FAIL")
+				if !okd {bad += 1}
+			} else {
+				fmt.println("  FAIL: relative directory not detected")
+				bad += 1
+			}
 		}
 
 		fmt.println("--- scheme whitelist ---")

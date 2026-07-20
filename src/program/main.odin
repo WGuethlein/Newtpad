@@ -356,7 +356,7 @@ main :: proc() {
 			hits := links_layout(doc, &text, rows)
 			if h, found := links_hit(hits, px, char_w, f32(window.mouse_x), f32(window.mouse_y)); found {
 				if t, rok := link_resolve(doc, h.text, h.link); rok {
-					if !link_activate(&app, t) {
+					if !link_activate(&app, &text, t) {
 						plat.message_error(window.hwnd, fmt.tprintf("Could not open:\n\n%s", t.url if t.is_url else t.path))
 					}
 				}

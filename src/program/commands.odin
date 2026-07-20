@@ -623,11 +623,11 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// feature and the action shows up in the palette by name. Scans only the
 		// caret's own line rather than the viewport.
 		if line, l, found := link_at_cursor(doc); found {
-			if t, rok := link_resolve(doc, line, l); rok {
-				if !link_activate(app, t) {
+			if tgt, rok := link_resolve(doc, line, l); rok {
+				if !link_activate(app, t, tgt) {
 					plat.message_error(
 						w.hwnd if w != nil else nil,
-						fmt.tprintf("Could not open:\n\n%s", t.url if t.is_url else t.path),
+						fmt.tprintf("Could not open:\n\n%s", tgt.url if tgt.is_url else tgt.path),
 					)
 				}
 			}

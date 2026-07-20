@@ -24,13 +24,12 @@ $InstallDir = Join-Path $env:LOCALAPPDATA 'Newtpad'
 $ExePath    = Join-Path $InstallDir 'newtpad.exe'
 $AppKey     = 'HKCU:\Software\Classes\Applications\newtpad.exe'
 
-# Text-ish types Newtpad opens natively. Listed under SupportedTypes so Explorer
-# offers Newtpad in "Open with" for them.
-$Extensions = @(
-    '.txt', '.log', '.md', '.markdown', '.json', '.csv', '.tsv',
-    '.xml', '.yaml', '.yml', '.toml', '.ini', '.cfg', '.conf', '.env',
-    '.c', '.h', '.odin', '.py', '.js', '.ts', '.ps1', '.bat', '.sh'
-)
+# Text-ish types Newtpad opens natively, listed under SupportedTypes so Explorer
+# offers Newtpad in "Open with" for them. Single source of truth: text_exts.txt at
+# the repo root (also #load'ed by src/program/links.odin), so the "open in a tab"
+# set and the registered set can never drift.
+$Extensions = Get-Content (Join-Path $PSScriptRoot 'text_exts.txt') |
+    ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
 
 function Stop-Newtpad {
     $running = Get-Process newtpad -ErrorAction SilentlyContinue
