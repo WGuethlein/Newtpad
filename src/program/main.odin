@@ -152,7 +152,7 @@ main :: proc() {
 		rows := doc_visible_rows(doc, f32(window.height), line_h)
 		// Usable content width in cells (word wrap breaks here).
 		doc_update_gutter(doc, char_w) // before view_cols: the gutter narrows the text
-		doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - GUTTER_W - SCROLLBAR_W) / char_w))
+		doc.view_cols = doc_view_cols(f32(window.width), char_w)
 		doc.view_rows = rows
 		// Re-center on the caret only when it actually moves on THIS tab — never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
@@ -472,7 +472,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	doc_update_gutter(doc, char_w) // resize repaints come through here too
 	// Recompute the wrap width here (not just in the main loop) so word wrap
 	// re-flows live during a resize, which repaints through this path.
-	doc.view_cols = max(1, int((f32(window.width) - TEXT_MARGIN_X - SCROLLBAR_W) / char_w))
+	doc.view_cols = doc_view_cols(f32(window.width), char_w)
 
 	plat.text_frame_begin(text) // resets the atlas recycle guard
 	plat.gfx_begin_frame(gfx, 0.09, 0.11, 0.16)

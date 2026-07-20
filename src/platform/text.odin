@@ -566,7 +566,13 @@ text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32
 	cell_w := text_char_width(t, px, set) // same rounded advance the program's grid uses
 	pen := x
 	for r in str {
-		cells := text_cell_width(t, r)
+		// `set`, not the default .UI: the pen advances by cells * cell_w, and cell_w
+		// above is already this set's rounded advance. Classifying against the UI
+		// chain instead made every wide/zero-width decision -- and the cell_cache
+		// key -- belong to a different font than the one being drawn, so with any
+		// document font other than Consolas the caret and selection drifted from
+		// the glyphs, accumulating along the line.
+		cells := text_cell_width(t, r, set)
 		if r == '\t' {
 			pen += f32(cells) * cell_w // whitespace: advance, draw nothing
 			continue

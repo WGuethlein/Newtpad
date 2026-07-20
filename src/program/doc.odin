@@ -113,6 +113,16 @@ doc_update_gutter :: proc(doc: ^Document, char_w: f32) {
 	GUTTER_W = f32(digits + 2) * char_w
 }
 
+// Usable content width in cells -- what word wrap breaks at. One definition,
+// like col_x/col_at_x above: the main loop subtracted GUTTER_W and the resize
+// repaint in render_frame did not, so the two frames wrapped to different
+// widths. Latent only because the gutter is filter-view-only today; it goes
+// live the moment the gutter generalizes to normal editing.
+// Call after doc_update_gutter -- it reads GUTTER_W.
+doc_view_cols :: #force_inline proc(width, char_w: f32) -> int {
+	return max(1, int((width - TEXT_MARGIN_X - GUTTER_W - SCROLLBAR_W) / char_w))
+}
+
 col_x :: #force_inline proc(char_w: f32, col: int) -> f32 {return TEXT_MARGIN_X + GUTTER_W + f32(col) * char_w}
 // Inverse mappings for hit-testing a client-space pixel.
 row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - CONTENT_TOP) / line_height(px))}
