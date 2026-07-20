@@ -940,6 +940,76 @@ on both the mmap and copy paths — no crash, no integer overflow; the build is 
   window/monitor?
 - Huge-file P0: approve the two proposed fixes, and answer the 2 GB "when does it die" question above.
 
+## 6n. Second pass — Wyatt's answers acted on (2026-07-20)
+
+Wyatt answered the §6m open questions and the §6l link questions and said to use my
+judgement on the huge-file fixes and the scrollbar. Cut as two releases:
+**v0.2.0** (correctness + huge-file P0 + versioning) and **v0.3.0** (horizontal scroll +
+remaining link work). Versioning is now real: `src/program/version.odin` is the single
+source (`NEWTPAD_VERSION`), shown on the Settings page and by `newtpad --version`;
+`release.ps1` builds the release exe, tags `v<version>`, and pushes (a GitHub Release with
+the exe attached needs `gh`, which isn't installed — the exe upload is manual for now).
+
+### Shipped this pass (all with a headless guard where testable)
+
+- **Huge-file lockup (P0) — FIXED.** `doc_scroll`/`doc_max_top`/`doc_ensure_cursor_visible`/
+  `doc_scroll_to_fraction` now step by capped rows (`row_start_capped`/`next_row_start_capped`/
+  `prev_row_start_capped`, all bounded to `RENDER_LINE_CAP`, matching the renderer). Identical
+  to before for any line < 8 KB; bounded on long lines. `scrollperftest`: the uncapped
+  `pt_line_start` on 512 MB = 1151 ms, capped ops all < 3 ms; short-line scrolling still lands
+  on real line starts.
+- **Huge-file "2 GB crash" (P0) — mitigated.** The autosave/`session_save` `pt_collect`+write
+  of a multi-GB dirty buffer (the prime suspect: multi-second freeze + OOM on the ~2 s timer)
+  is now capped at `BACKUP_MAX` (128 MB). Above it a dirty buffer isn't backed up — the tab is
+  still recorded (a saved file reopens from disk) and the status bar warns its unsaved edits
+  aren't crash-protected. `doc_save_err`'s explicit-save `pt_collect`+encode is still on the
+  main thread; streaming/off-thread serialize is the remaining owed work. **Wyatt's note:** the
+  2 GB death was "pretty quick" after interaction, which is consistent with either the scan
+  stall or this timer — both are now addressed.
+- **Horizontal scrolling — DONE** (Wyatt's #1 ask). Per-doc `h_scroll` (cells) mirrored into an
+  `H_SCROLL` global that `col_x` subtracts and `col_at_x`/`cell_at_x` add — so caret, selection,
+  find, links, draw and hit-test shift through the one column primitive. Shift+wheel pans;
+  caret-follow keeps a caret arrowed/typed off the right edge on screen; a draggable bottom
+  scrollbar (`hscrollbar_geo` single-sources its draw + drag hit-test). Disabled while wrapping
+  or filtering; bounded to the widest *visible* line (no whole-file scan). `hscrolltest` asserts
+  drawn column == hit-tested column at both viewport edges across pan offsets, and the thumb
+  round-trips. **Live pass owed** (no GUI input here). Known cosmetic cost: the bar overlays the
+  bottom ~8 px of the last row rather than reserving a strip. Lines wider than `VISIBLE_COLS`
+  (2048 cells) still can't be panned past that — the pre-existing draw clip, now the h-scroll cap.
+- **Ctrl+F in filter view — FIXED.** It was bound to `Find_Close` in the find context, so it
+  dropped to the viewport; now `Find_Open` (which also leaves filter mode and focuses the query).
+  Escape still closes.
+- **Link column jump on CJK (§6l Q5) — FIXED.** The `:line:col` jump added col−1 *bytes*; now it
+  maps the 1-based *cell* column (what the status bar shows) through the line's glyph widths.
+  `link_activate` takes the text pipeline.
+- **Relative directory links (§6l Q7) — confirmed + tested.** `./dir` / `.\dir` resolve against
+  the document folder and reveal in Explorer (never opened as a tab). `linktest` covers it.
+- **One extension list (§6l Q6) — DONE.** `text_exts.txt` at the repo root is the single source:
+  `links.odin` `#load`s it at compile time, `install.ps1` reads it at run time. The two
+  hand-maintained copies that had drifted are gone.
+- **Show-links setting (§6l Q3) — DONE.** Settings > Show links: On Ctrl (default) / Always
+  underlined / Always tinted (colour, no underline). Activation stays Ctrl+click. Persisted.
+- **Markdown + smb links, filter banner, drag-select** — from the first pass, all in v0.2.0.
+
+### Still open (Wyatt wants these; deferred with a plan, not code)
+
+- **Links spanning wrapped lines (§6l Q1) — Wyatt said yes.** Needs a real change to `links_layout`
+  + `Link_Hit`: scan the *logical* line once (capped) and split each link into per-visual-row
+  segments, **decoupling the row-relative draw span (what `doc_draw` colours) from the full
+  resolve target (what `link_resolve` opens)** — today they're the same field, which is why a
+  wrapped link can't both underline per-row and resolve whole. Only matters with wrap ON (wrap
+  OFF runs the link off the edge, which horizontal scroll now reaches). Wants the seam test
+  extended to a wrapped case and a live pass. Not started — highest-value remaining item.
+- **Blurry text at high *zoom* (Ctrl+wheel) — diagnosed, not fixed.** Screenshot in `images/`.
+  The swapchain is `SCALING_NONE` (1:1, not stretched) and glyphs rasterize at the exact display
+  px and point-sample 1:1 — so it isn't scaling blur. Most likely **ClearType subpixel fringing
+  magnified at large sizes**: the atlas is 3-channel `CLEARTYPE_3x1`, whose coloured subpixel
+  coverage reads as soft/chromatic when the glyph is very large. The fix is grayscale AA above a
+  px threshold (or `NATURAL_SYMMETRIC`), a text-pipeline change that alters *all* text — needs a
+  visual compare pass with Wyatt, so it's held rather than changed blind. (§6l Q2 "selection vs
+  link" and Q4 "a binding for Open Link Under Cursor" — Wyatt: keep link-wins; make the binding
+  choosable once user keybind customization exists, which is separate future work.)
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -958,8 +1028,8 @@ on both the mmap and copy paths — no crash, no integer overflow; the build is 
     `celltest`, `drawcount <file>`
   - UI surfaces: `menutest`, `menuseam`, `palettetest`, `settingstest`, `fonttest`, `historytest`,
     `linktest`
-  - Document / editing: `vnavtest`, `wraptest`, `colperftest <mb>`, `replacetest`, `findtest`,
-    `regextest <mb>`
+  - Document / editing: `vnavtest`, `wraptest`, `colperftest <mb>`, `scrollperftest <mb>`,
+    `hscrolltest`, `replacetest`, `findtest`, `regextest <mb>`
   - Files / session: `savepathtest <dir>`, `savefailtest <dir>`, `resavetest <file>`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest <dir>`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
