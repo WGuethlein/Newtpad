@@ -28,7 +28,8 @@ if (git tag --list $tag) { Write-Error "$tag already exists. Bump NEWTPAD_VERSIO
 # --- build the shipped exe ---
 Write-Host 'Building release...' -ForegroundColor Cyan
 if (-not $DryRun) {
-    cmd /c "build.bat release"
+    $bat = Join-Path $PSScriptRoot 'build.bat' # absolute: cmd does not search the cwd
+    cmd /c "`"$bat`" release"
     if ($LASTEXITCODE -ne 0) { Write-Error 'Release build failed.'; exit 1 }
 }
 $exe = 'build\newtpad.exe'
