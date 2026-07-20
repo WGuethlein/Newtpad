@@ -123,9 +123,14 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 		// zero stamp, the watcher compared it against the real file and reported a
 		// change within a second of every launch -- on the hot-exit feature itself,
 		// telling the user to reload away the work it had just restored.
+		// had_bom and eol ride along too (format 3). doc_from_content sets neither,
+		// so a restored dirty buffer forgot both: a UTF-8-BOM config file came back
+		// BOM-less and a CRLF file came back LF, and the next save wrote it that way
+		// -- which breaks Excel and PowerShell on the first, and produces a
+		// whole-file diff on the second.
 		fmt.sbprintf(
 			&tb,
-			"%d %d %d %d %d %d %d %d %s\n",
+			"%d %d %d %d %d %d %d %d %d %d %s\n",
 			d.cursor,
 			d.anchor,
 			d.top,
@@ -134,12 +139,14 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 			backup_idx,
 			d.disk_stamp.mtime,
 			d.disk_stamp.size,
+			1 if d.had_bom else 0,
+			int(d.eol),
 			d.path,
 		)
 		ti += 1
 	}
 
-	body := fmt.tprintf("newtpad-session 2\nactive %d\n%s", active_idx, strings.to_string(tb))
+	body := fmt.tprintf("newtpad-session 3\nactive %d\n%s", active_idx, strings.to_string(tb))
 	sp := pjoin({dir, "session.txt"})
 	if !plat.file_write_atomic(sp, transmute([]u8)body) {
 		return false
@@ -184,7 +191,14 @@ session_restore :: proc(a: ^App) -> bool {
 	ti := 0
 	for li in 2 ..< len(lines) {
 		if len(lines[li]) == 0 {continue}
-		nf := 9 if ver >= 2 else 7 // path is last and may contain spaces
+		// path is last and may contain spaces, so the split count is the field count
+		nf := 7
+		switch {
+		case ver >= 3:
+			nf = 11
+		case ver == 2:
+			nf = 9
+		}
 		parts := strings.split_n(lines[li], " ", nf, context.temp_allocator)
 		if len(parts) < 6 {continue}
 		cursor := pint(parts[0])
@@ -194,13 +208,25 @@ session_restore :: proc(a: ^App) -> bool {
 		enc := base.Encoding(pint(parts[4]))
 		bidx := pint(parts[5])
 		stamp: plat.File_Stamp
+		had_bom := false
+		eol := base.Line_Ending.LF
+		have_eol := false
 		path := ""
 		if ver >= 2 {
 			if len(parts) >= 8 {
 				mt := u64(pint(parts[6]))
 				stamp = plat.File_Stamp{mtime = mt, size = i64(pint(parts[7])), ok = mt != 0}
 			}
-			path = parts[8] if len(parts) == 9 else ""
+			if ver >= 3 {
+				if len(parts) >= 10 {
+					had_bom = pint(parts[8]) != 0
+					eol = base.Line_Ending(pint(parts[9]))
+					have_eol = true
+				}
+				path = parts[10] if len(parts) == 11 else ""
+			} else {
+				path = parts[8] if len(parts) == 9 else ""
+			}
 		} else {
 			path = parts[6] if len(parts) == 7 else ""
 		}
@@ -230,6 +256,13 @@ session_restore :: proc(a: ^App) -> bool {
 			// that genuinely changed while we were closed still reports.
 			if !d.disk_stamp.ok && d.path != "" {
 				d.disk_stamp = stamp if stamp.ok else plat.file_stamp(d.path)
+			}
+			// Same for the BOM and line endings, which doc_from_content does not set
+			// either. Only for the backup path: doc_open detected both from the real
+			// bytes and is authoritative for a clean tab.
+			if bidx >= 0 && have_eol {
+				d.had_bom = had_bom
+				d.eol = eol
 			}
 			slot := app_add(a, d)
 			if ti == active {active_slot = slot}

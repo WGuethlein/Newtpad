@@ -47,7 +47,12 @@ history_move :: proc(app: ^App, delta: int) {
 history_activate :: proc(app: ^App) {
 	d := app_active(app)
 	if d == nil {return}
-	doc_history_goto(d, app.history.sel)
+	// Clamp as well as re-seating on tab switch: this index belongs to whatever
+	// document is active now, and jumping to a row that document does not have is
+	// how the panel used to rewrite the wrong buffer.
+	n := doc_history_len(d)
+	if n == 0 {return}
+	doc_history_goto(d, clamp(app.history.sel, 0, n - 1))
 }
 
 // Move the highlight to the row under the pointer. Uses the live cursor, not

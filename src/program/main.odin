@@ -474,7 +474,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// re-flows live during a resize, which repaints through this path.
 	doc.view_cols = doc_view_cols(f32(window.width), char_w)
 
-	plat.text_frame_begin(text) // resets the atlas recycle guard
+	plat.text_frame_begin(gfx, text) // resets the recycle guard and grows the atlas if owed
 	plat.gfx_begin_frame(gfx, 0.09, 0.11, 0.16)
 
 	// Behind the text: find-match highlights (dim), then the selection (bright).

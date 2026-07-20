@@ -9,6 +9,7 @@ import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:time"
+import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
 
@@ -1182,6 +1183,61 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad atlasgrowtest` proves the atlas actually grows. atlastest checks
+	// only text_atlas_fit_count -- arithmetic that assumes growth works -- and it
+	// passed for the entire time growth was impossible, because it never asked the
+	// atlas to do anything. atlas_relieve's one caller sat inside text_draw, where
+	// its own `drawing` guard always refused, so the atlas stayed at ATLAS_START
+	// forever and glyphs past ~1196 silently vanished while the pen advanced.
+	//
+	// Needs a real device, so it makes a window like drawcount does.
+	if os.args[1] == "atlasgrowtest" {
+		window := plat.window_create("Newtpad atlasgrow", 800, 600)
+		gfx, ok := plat.gfx_init(window)
+		if !ok {fmt.eprintln("atlasgrowtest: gfx init failed");return true}
+		text, tok := plat.text_init(&gfx)
+		if !tok {fmt.eprintln("atlasgrowtest: text init failed");return true}
+
+		start_dim := plat.text_atlas_dim(&text)
+		fmt.printfln("--- atlas growth under a heavy glyph load ---")
+		fmt.printfln("  start dim         : %d (ATLAS_START)", start_dim)
+
+		// Draw a lot of distinct CJK codepoints at a large size: glyph area grows
+		// with px^2, so this overflows 1024 quickly. One text_draw per frame, with
+		// a frame boundary between, which is where relief is now allowed to happen.
+		FRAMES :: 40
+		PER :: 64
+		cp := rune(0x4E00)
+		for f in 0 ..< FRAMES {
+			plat.text_frame_begin(&gfx, &text)
+			plat.gfx_begin_frame(&gfx, 0, 0, 0)
+			buf: [PER * 4]u8
+			n := 0
+			for _ in 0 ..< PER {
+				b, sz := utf8.encode_rune(cp)
+				bb := b
+				copy(buf[n:], bb[:sz])
+				n += sz
+				cp += 1
+			}
+			plat.text_draw(&gfx, &text, string(buf[:n]), 0, 40, 48, {1, 1, 1, 1})
+			plat.gfx_end_frame(&gfx, 0)
+		}
+		// One more boundary so any relief owed by the final frame is applied.
+		plat.text_frame_begin(&gfx, &text)
+
+		end_dim := plat.text_atlas_dim(&text)
+		grew := end_dim > start_dim
+		fmt.printfln("  after %d frames    : %d", FRAMES, end_dim)
+		fmt.printfln("  atlas grew        : %v %s", grew, "OK" if grew else "FAIL")
+		fmt.printfln("  atlas_full latched: %v %s", plat.text_atlas_full(&text), "OK" if !plat.text_atlas_full(&text) else "FAIL")
+		bad := 0
+		if !grew {bad += 1}
+		if plat.text_atlas_full(&text) {bad += 1}
+		fmt.printfln("atlasgrowtest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad resavetest <file>` opens a file, edits it and saves, so an external
 	// checker can assert what the save preserved. The atomic write used to rename
 	// a brand-new temp file over the target, which substitutes a fresh file and
@@ -1368,6 +1424,32 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("  genuine external change still detected: %v %s", detects, "OK" if detects else "FAIL")
 		if !detects {bad += 1}
 		app_destroy(&b)
+
+		// doc_from_content sets neither had_bom nor eol, so a dirty tab restored
+		// from a backup forgot both and the next save wrote a BOM-less LF file over
+		// what had been a UTF-8-BOM CRLF one -- which is what breaks Excel and
+		// PowerShell, and what turns one edit into a whole-file diff.
+		fmt.println("--- restore preserves BOM and line endings ---")
+		bomf := fmt.tprintf("%s%cnewtpad_bom.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+		bom_bytes := []u8{0xEF, 0xBB, 0xBF, 'a', '\r', '\n', 'b', '\r', '\n'}
+		plat.file_write_atomic(bomf, bom_bytes)
+		e: App
+		if fd, ok := doc_open(bomf); ok {
+			bd := new(Document);bd^ = fd
+			app_add(&e, bd)
+			fmt.printfln("  opened  : had_bom=%v eol=%v", bd.had_bom, bd.eol)
+			doc_insert_text(bd, transmute([]u8)string("x")) // dirty -> backup path
+		}
+		session_save(&e)
+		app_destroy(&e)
+
+		g: App
+		session_restore(&g)
+		gd := app_active(&g)
+		bom_ok := gd.had_bom && gd.eol == .CRLF
+		fmt.printfln("  restored: had_bom=%v eol=%v %s", gd.had_bom, gd.eol, "OK" if bom_ok else "FAIL")
+		if !bom_ok {bad += 1}
+		app_destroy(&g)
 
 		// doc_reload goes through doc_close, which nils idx.th, and only
 		// app_activate starts an index lazily -- which never fires again for a tab

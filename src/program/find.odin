@@ -520,10 +520,16 @@ find_replace_current :: proc(doc: ^Document) {
 // One undo entry for the whole operation, which is both what every other editor
 // does and a correctness requirement here: per-match entries overflowed
 // UNDO_MAX on any large replace and took the pre-replace state with them.
-find_replace_all :: proc(doc: ^Document) {
+// `complete` is false when this pass could not have seen every match: the worker
+// publishes incrementally and stops at MAX_MATCHES, so the list may be a prefix.
+// Replacing a prefix is legitimate -- running it again continues -- but doing it
+// silently was indistinguishable from replacing everything, which is how a user
+// ends up believing a rename is finished when it is not.
+find_replace_all :: proc(doc: ^Document) -> (replaced: int, complete: bool) {
 	f := &doc.find
 	n := len(f.matches)
-	if n == 0 {return}
+	complete = intrinsics.atomic_load(&doc.search.done) && !f.truncated
+	if n == 0 {return 0, complete}
 	doc_batch_begin(doc, .Replace)
 	for i := n - 1; i >= 0; i -= 1 {
 		m := f.matches[i]
@@ -533,6 +539,7 @@ find_replace_all :: proc(doc: ^Document) {
 	}
 	doc_batch_end(doc, n)
 	find_recompute(doc)
+	return n, complete
 }
 
 // Highlight rectangles for visible matches (dim; behind text and the selection).

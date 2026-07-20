@@ -93,6 +93,16 @@ app_activate :: proc(a: ^App, slot: int) {
 	if d.idx.th == nil {
 		doc_index_start(d)
 	}
+	// The history panel is one global surface showing whichever document is
+	// active, but its selected row indexes THAT document's undo stack. Switching
+	// tabs with the panel open left the old document's row number pointing into
+	// the new document's history, so pressing Enter jumped it to an unrelated
+	// state -- silently redoing edits that had been deliberately undone. Re-seat
+	// the selection on the document now being shown.
+	if a.history.open {
+		a.history.sel = doc_history_current(d)
+		a.history.top = 0 // the draw clamps this to bring the selection into view
+	}
 }
 
 app_new_scratch :: proc(a: ^App, at_end := false) {

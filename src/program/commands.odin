@@ -766,7 +766,21 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		find_backspace(doc)
 	case .Find_Confirm:
 		if doc.find.field == 1 {
-			if ev.ctrl {find_replace_all(doc)} else {find_replace_current(doc)}
+			if ev.ctrl {
+				// Say so when the pass could not have seen the whole document. The
+				// alternative -- replacing a prefix in silence -- looks exactly like
+				// replacing everything, so a half-finished rename reads as a finished
+				// one until something downstream breaks.
+				if replaced, complete := find_replace_all(doc); !complete {
+					plat.message_error(
+						w.hwnd if w != nil else nil,
+						fmt.tprintf(
+							"Replaced %d occurrence(s).\n\nThe search had not finished scanning the file, or there were more matches than Newtpad tracks at once, so there may be more.\n\nRun Replace All again to continue.",
+							replaced,
+						),
+					)
+				}
+			} else {find_replace_current(doc)}
 		} else {
 			if ev.shift {find_prev(doc)} else {find_next(doc)}
 		}

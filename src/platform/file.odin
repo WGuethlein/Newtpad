@@ -149,9 +149,13 @@ file_read_range :: proc(path: string, offset: i64, count: int, allocator := cont
 		return nil, false
 	}
 	defer win.CloseHandle(h)
-	lo := win.LONG(offset & 0xFFFFFFFF)
-	hi := win.LONG(offset >> 32)
-	if win.SetFilePointer(h, lo, &hi, win.FILE_BEGIN) == win.INVALID_SET_FILE_POINTER {
+	// SetFilePointerEx, not SetFilePointer: the latter returns the new low dword,
+	// and INVALID_SET_FILE_POINTER (0xFFFFFFFF) is a legal one -- any offset whose
+	// low 32 bits are all ones, i.e. every 4 GB boundary minus one. Distinguishing
+	// it from a real error needs a SetLastError/GetLastError pair that was not
+	// there, so a seek to 4 GB-1 read as failure and the tail of a multi-GB log
+	// silently never appeared. That is precisely the file this function exists for.
+	if !win.SetFilePointerEx(h, win.LARGE_INTEGER(offset), nil, win.FILE_BEGIN) {
 		return nil, false
 	}
 	buf := make([]u8, count, allocator)

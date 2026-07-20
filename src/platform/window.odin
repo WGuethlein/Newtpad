@@ -190,6 +190,9 @@ Window :: struct {
 	key_count:     int,
 	chars:         [64]rune, // printable characters typed this frame
 	char_count:    int,
+	// High surrogate awaiting its low half across two WM_CHAR messages. Persists
+	// between messages, not between frames — the pair arrives back to back.
+	pending_high:  u16,
 	// Alt+&lt;char&gt; this frame, layout-translated (menu mnemonics; see WM_SYSCHAR)
 	sys_chars:      [16]rune,
 	sys_char_count: int,
@@ -503,6 +506,24 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		return 0
 	case win.WM_CHAR:
 		r := rune(wparam)
+		// wparam is a UTF-16 code unit, not a rune. Anything outside the BMP -- an
+		// emoji from Win+., most IME output above U+FFFF -- arrives as TWO WM_CHARs,
+		// a high surrogate then a low one. Treating each as a rune inserted two lone
+		// surrogates, which cannot be encoded as valid UTF-8: the document came out
+		// mojibake and other editors read the saved file as corrupt.
+		switch {
+		case r >= 0xD800 && r <= 0xDBFF:
+			w.pending_high = u16(r) // wait for the low half
+			return 0
+		case r >= 0xDC00 && r <= 0xDFFF:
+			if w.pending_high == 0 {
+				return 0 // orphan low surrogate: drop rather than insert garbage
+			}
+			r = 0x10000 + (rune(w.pending_high) - 0xD800) << 10 + (r - 0xDC00)
+			w.pending_high = 0
+		case:
+			w.pending_high = 0 // a normal character cancels a dangling high half
+		}
 		if r >= 32 && r != 0x7F && w.char_count < len(w.chars) {
 			w.chars[w.char_count] = r
 			w.char_count += 1
