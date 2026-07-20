@@ -819,6 +819,127 @@ should on screen. `linktest` covers detection, resolution, the scheme whitelist,
 drawn-vs-clickable span agreement. **A live pass is owed on this feature specifically** — try a
 wrapped line, a CJK line, and a path with spaces.
 
+## 6m. Live-use bug pass (2026-07-20)
+
+Wyatt spent a day daily-driving Newtpad and reported a batch of bugs. Four were fixed and
+verified this pass; the two biggest (huge-file crash/lockup) were root-caused with evidence but
+their fixes are involved enough to want Wyatt's sign-off first, so they are written up here rather
+than shipped blind. Three feature requests are captured at the end.
+
+### Fixed and committed
+
+- **Filter banner drawn half under the menu bar (Ctrl+L).** The green `FILTER …` banner sat at
+  `CONTENT_TOP − 20`, but the gap between the menu bar and the first content row is only
+  `TEXT_MARGIN_Y` (10px), so half of it was hidden under the menu. Added a filter-only top inset
+  (`FILTER_BANNER_H`, `doc_update_top_inset`): the row math — baseline, rect, hit-test and row
+  count — all add it, so the document shifts down together and the banner gets a clean strip below
+  the menu. Set once per frame in both layout sites (main loop + `render_frame`) so draw and
+  hit-test agree. Zero unless filtering, so nothing else moves.
+- **Markdown `[label](target)` not recognised.** `links_scan` took the whole run as one bogus
+  relative path (parens are not delimiters — that is deliberate, so wiki URLs like `/a_(b)`
+  survive). Added a markdown branch that pulls the target out of the parens; only it underlines and
+  resolves. `linktest` covers URL, path-with-`:line`, and the negative (`[plain](word)`).
+- **`smb://host/share/path` not recognised.** Rejected by `has_uri_scheme` (correctly — it is a
+  URI, not a path), so it fell through every branch. Detect it explicitly and, in `link_resolve`,
+  rewrite to the Windows UNC form `\\host\share\path` (Windows has no `smb:` handler), which then
+  flows through the same stat-first path safety as any other path — text-ish opens in a tab,
+  anything else reveals in Explorer. `:line` suffix survives the `smb:` colon (drive-letter guard).
+- **Drag-select died at the bottom bar.** Dragging a selection down into the find/status strip
+  zeroed `mouse_down` unconditionally, killing the drag and its auto-scroll the instant the pointer
+  touched the bar — so a selection could never be dragged below the last visible line. Now only a
+  *fresh press* in the strip is consumed; an in-progress drag continues, and auto-scroll fires
+  across the whole bottom edge (into the bar, or past the window with capture held) instead of only
+  the last row's height. **Unverified without a live mouse pass** — this environment can't inject
+  drag input. The exact "stop when the mouse is off the screen" wish is still open (see questions).
+
+### Root-caused, NOT yet fixed — the huge-file P0 (needs sign-off)
+
+A background investigation reproduced against real multi-GB files (2.28 GB opened and indexed fine
+on both the mmap and copy paths — no crash, no integer overflow; the build is 64-bit so
+`int(info.size)` does not truncate at 2^31). Open and the steady frame are already capped
+(`pt_line_end_cap`, status caps, O(1) scrollbar). The failures are on *interaction*:
+
+1. **1 GB "lockup" — the viewport/nav scans are uncapped on the main thread.** `doc_scroll`,
+   `doc_max_top`, `doc_ensure_cursor_visible`, `doc_scroll_to_fraction` and the cursor-movement
+   helpers call the **uncapped** `pt_line_start`/`pt_line_end` (piecetable.odin:327,344), whose cost
+   is O(line length). Measured strictly linear: **350 ms per `pt_line_start` at 1 GB** on heap, ~1.7×
+   that through the SEH-guarded mmap read plus cold-page disk I/O — so **~0.5–1 s of UI-thread stall
+   on every wheel tick / PageUp-Dn / arrow / scrollbar drag** on a long-line file. This is a direct
+   violation of the "never freeze on huge files" hard rule. **It requires long lines** (minified
+   JSON, a single-line log, long records); a normal short-line 1 GB file does not hit it, and there
+   the lockup is more likely the index worker faulting all pages into the working set. Note this is
+   almost certainly Wyatt's case: he asked for a horizontal scrollbar, i.e. word wrap is off, and
+   the non-wrap scroll path is exactly the uncapped one (the wrap path already bounds by view width).
+   **Fix (proposed): make `doc_scroll`/`doc_max_top`/`doc_ensure_cursor_visible`/`scroll_to_fraction`
+   step by capped visual rows, the same way `doc_draw`'s `Visible_Iter` already does** — for
+   short-line files behaviour is identical; on long lines scrolling then matches what is actually
+   drawn (today the renderer shows a long line as capped 8192-byte rows while scroll steps a whole
+   logical line, so they already disagree). This is a **navigation-semantics change on pathological
+   lines** and touches the one-layout viewport core, which is why it wants sign-off + a headless
+   perf/correctness test (extend `colperftest`) rather than a blind edit.
+
+2. **2 GB "crash" — not reproduced; two live hypotheses.** No crashing path was found by inspection
+   or headless runs. Most likely: **(a)** the same uncapped-scan stall, ~2× worse plus a ~2 GB mmap
+   working set, leaves the app unresponsive long enough to be "not responding"/killed and *perceived*
+   as a crash ("almost no resource usage" fits mmap — file-backed pages are standby, not private).
+   **(b) The save/autosave path.** `doc_save_err` (doc.odin:638) and the ~2 s **session autosave**
+   (`session_save` → `pt_collect` for every *modified* buffer, session.odin:114; gated on `d.modified`,
+   which is why a fresh open doesn't hit it) do `pt_collect` **+** `encode_from_utf8` — two full-buffer
+   allocations, **~4–6 GB transient for a 2 GB doc — on the main thread**. One accidental keystroke in
+   a huge file therefore arms a guaranteed multi-second freeze, and a plausible OOM crash, ~2 s later
+   on a timer. This fits "opened fast, then died" better than anything else. **Fix (proposed): move
+   `pt_collect`+encode+write off the main thread (or stream to disk) for large buffers**, and/or a
+   stopgap size-cap on the periodic autosave backup — but the backup is the only crash-safe copy of
+   unsaved edits, so the trade-off (huge dirty buffer loses crash-protection) is Wyatt's call, not a
+   blind edit. **To confirm which hypothesis:** does the 2 GB file die ~2 s after you touch/edit it
+   (→ save path), or only when you scroll/navigate (→ scan path)? Machine RAM and a crash dump would
+   settle it.
+
+### Deferred, needs Wyatt input (not code-ready)
+
+- **Blurry fonts at max zoom.** Not diagnosable without a screenshot. Glyphs are rasterized at the
+  exact display px (`fontEmSize = px`, `Glyph_Key.px`) and point-sampled 1:1, so there is no obvious
+  scaling blur in the code. Candidates: DirectWrite `.NATURAL` rendering mode (text.odin:904) is
+  tuned for small sizes — `.NATURAL_SYMMETRIC` is Microsoft's recommendation for large/scaled text;
+  or a sub-pixel quad-alignment issue at large px. Switching the mode affects *all* text and can't be
+  verified blind, so it's held for a screenshot + a compare pass.
+
+### Requested features to document (not built)
+
+- **Horizontal scrollbar / horizontal viewport shift** (Wyatt's #1 ask). With word wrap off, long
+  lines run off the right edge (clipped at `VISIBLE_COLS`=2048 and the window edge) and there is no
+  way to pan right. **Design:** add a per-doc `left_col` (cells); `col_x`/`col_at_x`/`cell_at_x` are
+  already the single source of column geometry, so subtracting/adding `left_col` there shifts the
+  caret, selection, find rects, links and hit-test together — but `doc_draw` reads the raw line from
+  column 0 and would need to skip `left_col` cells (cells ≠ bytes on CJK/tabs), and a new draggable
+  horizontal scrollbar widget above the status bar is a fresh chrome seam. This is the exact
+  one-layout surface HANDOFF §6j warns is bug-prone, and it can't be GUI-tested here, so it wants a
+  dedicated pass with a drawn-vs-clickable seam test and a live loop with Wyatt. Interacts with the
+  huge-file scan fix (panning a long line must stay capped).
+- **`.csv`/`.db` table-view toggle** (like a markdown edit/preview toggle — note Newtpad has no
+  markdown preview yet either, so this is a new "view mode" concept). A parsed, columnized read-only
+  view of tabular data with a keystroke back to raw text. `Tab_Kind` already models non-text tabs
+  (Settings/Font); a view-mode flag on a text doc is the lighter option. `.db` (SQLite) means a
+  reader/parser dependency and edges toward the parked container/viewer plugin work (§6) — probably
+  a V2 plugin, whereas `.csv`/`.tsv` table view is plausible V1. Open questions: editable or
+  read-only; how wide columns/large tables are handled given the huge-file rules; is this the first
+  use of the parked side-panel/view-mode chrome.
+- **Tab drag — reorder within the strip, and tear off to a new window.** Reorder is contained
+  (`ui_tabs.odin` + the `docs` slot array + MRU). Tear-off-to-new-window is much larger: Newtpad is
+  deliberately single-instance with one process owning the session + backups (§6c), so a second
+  window is either a second top-level window in the same process (new window/gfx/atlas plumbing) or a
+  second process (which the single-instance mutex + shared session explicitly prevent). Reorder is a
+  reasonable standalone task; tear-off needs a design decision about the process/window model first.
+
+**Open questions carried forward (the ones from last night + this pass):**
+- The 7 link questions in §6l (wrap-spanning links, selection-vs-Ctrl+click, underline-without-Ctrl,
+  a binding for *Open Link Under Cursor*, byte-vs-cell column jump on CJK, the duplicated extension
+  list, directories-as-tab-vs-Explorer).
+- Drag-select: what should "stop when the mouse is off the screen" mean exactly — keep auto-scrolling
+  while held past the edge (standard, what the fix now does), or halt once the pointer leaves the
+  window/monitor?
+- Huge-file P0: approve the two proposed fixes, and answer the 2 GB "when does it die" question above.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
