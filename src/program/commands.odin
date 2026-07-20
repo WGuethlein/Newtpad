@@ -55,6 +55,7 @@ Command_Id :: enum u8 {
 	Replace_Open,
 	Filter_Open,
 	Goto_Line,
+	Open_Link,
 	Clear_Selection,
 	Toggle_Wrap,
 	// command palette
@@ -161,6 +162,7 @@ command_table := [Command_Id]Command {
 	.Replace_Open             = {"Replace", "Search"},
 	.Filter_Open              = {"Filter to Matching Lines", "Search"},
 	.Goto_Line                = {"Go to Line...", "Cursor"},
+	.Open_Link                = {"Open Link Under Cursor", "File"},
 	.Clear_Selection          = {"Clear Selection", "Cursor"},
 	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
 	.Palette_Open             = {"Command Palette", "View"},
@@ -611,6 +613,20 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// and reopens itself in that mode.
 		palette_open(app)
 		palette_input_rune(app, ':')
+	case .Open_Link:
+		// The keyboard route to what Ctrl+click does, so links are not a mouse-only
+		// feature and the action shows up in the palette by name. Scans only the
+		// caret's own line rather than the viewport.
+		if line, l, found := link_at_cursor(doc); found {
+			if t, rok := link_resolve(doc, line, l); rok {
+				if !link_activate(app, t) {
+					plat.message_error(
+						w.hwnd if w != nil else nil,
+						fmt.tprintf("Could not open:\n\n%s", t.url if t.is_url else t.path),
+					)
+				}
+			}
+		}
 	case .Clear_Selection:
 		doc.anchor = doc.cursor
 	case .Toggle_Wrap:

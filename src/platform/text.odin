@@ -560,6 +560,33 @@ rune_face :: proc(t: ^Text, r: rune, set := Font_Set.UI) -> (face: int, gi: u16)
 // uses whichever family the user chose. Defaulting to UI means only the document
 // draw has to say so.
 text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32, set := Font_Set.UI) {
+	text_draw_spans(gfx, t, str, x, y, px, color, nil, set)
+}
+
+// A byte range within the string that draws in its own colour. Spans must be
+// sorted by `start` and must not overlap; bytes outside every span use the base
+// colour. This is the primitive syntax highlighting and clickable links both
+// need — text_draw took one flat colour per call, so there was no way to
+// recolour part of a line.
+//
+// Underlines are deliberately NOT drawn here. This proc knows glyphs; the
+// caller owns the quad pipeline and the cell grid, and already draws selection
+// and find highlights as quads. text_span_cells gives it the cell range.
+Text_Span :: struct {
+	start: int,
+	len:   int,
+	color: [4]f32,
+}
+
+text_draw_spans :: proc(
+	gfx: ^Gfx,
+	t: ^Text,
+	str: string,
+	x, y, px: f32,
+	base: [4]f32,
+	spans: []Text_Span,
+	set := Font_Set.UI,
+) {
 	draw_calls_text += 1
 	instances := make([dynamic]Text_Instance, 0, len(str))
 	defer delete(instances)
@@ -569,7 +596,15 @@ text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32
 
 	cell_w := text_char_width(t, px, set) // same rounded advance the program's grid uses
 	pen := x
-	for r in str {
+	si := 0 // spans are sorted, so this only ever moves forward
+	for r, off in str {
+		// Advance past spans this rune is already beyond, then take the colour of
+		// the span containing it. One pass over both sequences, no search per rune.
+		for si < len(spans) && off >= spans[si].start + spans[si].len {si += 1}
+		color := base
+		if si < len(spans) && off >= spans[si].start {
+			color = spans[si].color
+		}
 		// `set`, not the default .UI: the pen advances by cells * cell_w, and cell_w
 		// above is already this set's rounded advance. Classifying against the UI
 		// chain instead made every wide/zero-width decision -- and the cell_cache
@@ -706,6 +741,24 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, set: Font_Set, face: int, index: u16, px:
 	}
 	t.cache[key] = g
 	return g
+}
+
+// Cell offset and cell width of a byte range within `str`. Decorations that sit
+// under text — a link underline, later a squiggle — must be placed on the same
+// grid the glyphs advance along, or they drift on CJK and tabs.
+text_span_cells :: proc(t: ^Text, str: string, start, length: int, set := Font_Set.UI) -> (col, cells: int) {
+	for r, off in str {
+		w := text_cell_width(t, r, set)
+		if off < start {
+			col += w
+			continue
+		}
+		if off >= start + length {
+			break
+		}
+		cells += w
+	}
+	return
 }
 
 // True once a glyph has been dropped for want of atlas space.

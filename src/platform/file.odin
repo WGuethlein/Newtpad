@@ -426,6 +426,65 @@ confirm_lossy_encoding :: proc(owner: win.HWND, name, enc: string, lost: int) ->
 	return .Cancel
 }
 
+// --- opening things the user clicked ---------------------------------------
+//
+// The rule: never hand an arbitrary string to ShellExecute. Text the user is
+// reading may have been written by anyone -- a build log, a downloaded file, a
+// pasted stack trace -- so a link in it is untrusted input.
+
+// URL schemes allowed to reach the shell. A whitelist, because a blacklist
+// fails open: search-ms:, ms-msdt: (Follina), ms-officecmd: and friends are
+// delivered exactly this way, and the list of dangerous handlers grows.
+@(private = "file")
+URL_SCHEMES := [?]string{"http://", "https://", "mailto:"}
+
+// True if `s` is a URL we are willing to open. file:// is deliberately absent:
+// it is a path, and paths go through the classify-and-reveal path below.
+url_is_openable :: proc(s: string) -> bool {
+	for scheme in URL_SCHEMES {
+		if len(s) > len(scheme) && strings.equal_fold(s[:len(scheme)], scheme) {
+			return true
+		}
+	}
+	return false
+}
+
+// Hand a URL to the default browser. Refuses anything not whitelisted, so a
+// caller that forgets to check cannot open a handler URL by accident.
+shell_open_url :: proc(url: string) -> bool {
+	if !url_is_openable(url) {
+		return false
+	}
+	wurl := win.utf8_to_wstring(url, context.temp_allocator)
+	wop := win.utf8_to_wstring("open", context.temp_allocator)
+	r := win.ShellExecuteW(nil, wop, wurl, nil, nil, win.SW_SHOWNORMAL)
+	return uintptr(rawptr(r)) > 32 // ShellExecute's documented success threshold
+}
+
+// Select `path` in Explorer rather than opening it. This is what a non-text
+// file gets: the user sees where it is and decides what to do, and nothing we
+// did executed it.
+shell_reveal :: proc(path: string) -> bool {
+	// /select, needs the path quoted or a comma or space in the name truncates it.
+	arg := strings.concatenate({"/select,\"", path, "\""}, context.temp_allocator)
+	warg := win.utf8_to_wstring(arg, context.temp_allocator)
+	wexe := win.utf8_to_wstring("explorer.exe", context.temp_allocator)
+	wop := win.utf8_to_wstring("open", context.temp_allocator)
+	r := win.ShellExecuteW(nil, wop, wexe, warg, nil, win.SW_SHOWNORMAL)
+	return uintptr(rawptr(r)) > 32
+}
+
+// Does this path exist, and is it a directory? Callers stat before opening: a
+// link to something that is not there should reach no handler at all.
+path_exists :: proc(path: string) -> (exists, is_dir: bool) {
+	wpath := win.utf8_to_wstring(path, context.temp_allocator)
+	attrs := win.GetFileAttributesW(wpath)
+	if attrs == win.INVALID_FILE_ATTRIBUTES {
+		return false, false
+	}
+	return true, (attrs & win.FILE_ATTRIBUTE_DIRECTORY) != 0
+}
+
 file_close :: proc(fv: ^File_View) {
 	if fv.mapped {
 		if fv.view != nil {win.UnmapViewOfFile(fv.view)}

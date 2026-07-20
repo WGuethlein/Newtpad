@@ -127,6 +127,14 @@ col_x :: #force_inline proc(char_w: f32, col: int) -> f32 {return TEXT_MARGIN_X 
 // Inverse mappings for hit-testing a client-space pixel.
 row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - CONTENT_TOP) / line_height(px))}
 col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w + 0.5))}
+// Which cell a point is INSIDE, as opposed to col_at_x, which rounds to the
+// nearest caret boundary because that is what click-to-place-caret wants.
+// Hit-testing a drawn span needs this one: with col_at_x the boundary sits half
+// a cell to the left, so a link's first cell was clickable from outside it and
+// its last cell was not clickable at all. Same function, wrong space — the
+// §6j bug class, caught here by asserting the drawn span against the clickable
+// span at both edges.
+cell_at_x :: #force_inline proc(char_w, mx: f32) -> int {return max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w))}
 
 // --- word wrap: break a logical line into visual rows at doc.view_cols cells ---
 
@@ -1445,7 +1453,20 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 
 // Draw visible lines; return the caret's screen rect (if visible) and the byte
 // offset just past the last visible line (for the scrollbar).
-doc_draw :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, px, char_w: f32, rows: int) -> (cx, cy: f32, caret: bool, bottom: int) {
+LINK_COL :: [4]f32{0.45, 0.70, 0.98, 1}
+
+doc_draw :: proc(
+	gfx: ^plat.Gfx,
+	t: ^plat.Text,
+	doc: ^Document,
+	px, char_w: f32,
+	rows: int,
+	links: []Link_Hit = nil,
+) -> (
+	cx, cy: f32,
+	caret: bool,
+	bottom: int,
+) {
 	fg := [4]f32{0.86, 0.90, 0.96, 1}
 	// A line longer than the cap renders as successive capped rows and columns
 	// past VISIBLE_COLS aren't drawn (crude long-line handling; proper horizontal
@@ -1474,7 +1495,21 @@ doc_draw :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, px, char_w: f32,
 					plat.text_draw(gfx, t, num, nx, row_y, px, {0.42, 0.47, 0.56, 1})
 				}
 			}
-			plat.text_draw(gfx, t, string(line_buf[:vis]), col_x(char_w, 0), row_y, px, fg, .Doc)
+			// Links on this row, if Ctrl is held. Colour comes from the same
+			// Link_Hit list the hover and the click consume, so what is highlighted
+			// is exactly what is clickable. The underlines are drawn by
+			// render_frame, which owns the quad pipeline — from this same list.
+			spans: [dynamic]plat.Text_Span
+			for h in links {
+				if h.row != row {continue}
+				spans = spans if spans != nil else make([dynamic]plat.Text_Span, 0, 4, context.temp_allocator)
+				append(&spans, plat.Text_Span{start = h.link.start, len = h.link.len, color = LINK_COL})
+			}
+			if spans != nil {
+				plat.text_draw_spans(gfx, t, string(line_buf[:vis]), col_x(char_w, 0), row_y, px, fg, spans[:], .Doc)
+			} else {
+				plat.text_draw(gfx, t, string(line_buf[:vis]), col_x(char_w, 0), row_y, px, fg, .Doc)
+			}
 		}
 
 		// Caret on this row: [start, end], but a wrap point (non-line-end `end`)

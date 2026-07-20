@@ -322,6 +322,36 @@ main :: proc() {
 			window.mouse_down = false
 		}
 
+		// Ctrl+hover over a link: hand cursor. Uses the live cursor position, not
+		// window.mouse_y, which WM_MOUSEMOVE only updates while a button is held —
+		// that exact mistake is in the §6j bug list.
+		{
+			want := plat.Cursor_Kind.Arrow
+			if plat.key_ctrl_down() && !doc.filter {
+				cx, cy := plat.window_cursor_client(window)
+				if _, over := links_hit(links_layout(doc, &text, rows), px, char_w, f32(cx), f32(cy)); over {
+					want = .Hand
+				}
+			}
+			plat.window_set_cursor(window, want)
+		}
+
+		// Ctrl+click a link. Checked before the caret handling below so it does not
+		// also move the caret, and gated on Ctrl so a plain click still means what
+		// it always meant — you can click into the middle of a URL to edit it.
+		if window.mouse_pressed && plat.key_ctrl_down() && !doc.filter {
+			hits := links_layout(doc, &text, rows)
+			if h, found := links_hit(hits, px, char_w, f32(window.mouse_x), f32(window.mouse_y)); found {
+				if t, rok := link_resolve(doc, h.text, h.link); rok {
+					if !link_activate(&app, t) {
+						plat.message_error(window.hwnd, fmt.tprintf("Could not open:\n\n%s", t.url if t.is_url else t.path))
+					}
+				}
+				window.mouse_pressed = false
+				window.mouse_down = false
+			}
+		}
+
 		// Mouse: press places/extends the caret (double=word, triple=line); drag extends.
 		if window.mouse_pressed {
 			mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
@@ -510,7 +540,29 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		}
 	}
 
-	cx, cy, caret, bottom := doc_draw(gfx, text, doc, px, char_w, rows)
+	// Links, only while Ctrl is held — that is the activation gesture, and it is
+	// also why this costs nothing the rest of the time. One list, produced once,
+	// consumed by the underline below, the glyph colouring inside doc_draw, and
+	// the hover and click in the main loop.
+	links: []Link_Hit
+	if plat.key_ctrl_down() && !doc.filter {
+		links = links_layout(doc, text, rows)
+		for h in links {
+			plat.quads_draw(
+				gfx,
+				quad_pipe,
+				[]plat.Quad {
+					{
+						pos = {col_x(char_w, h.col), row_baseline_y(px, h.row) + sx(2)},
+						size = {f32(h.cells) * char_w, max(sx(1), 1)},
+						color = LINK_COL,
+					},
+				},
+			)
+		}
+	}
+
+	cx, cy, caret, bottom := doc_draw(gfx, text, doc, px, char_w, rows, links)
 
 	// Scrollbar (byte-proportional, below the tab strip) + caret.
 	bars: [4]plat.Quad

@@ -190,6 +190,11 @@ Window :: struct {
 	key_count:     int,
 	chars:         [64]rune, // printable characters typed this frame
 	char_count:    int,
+	// Cursor the program wants over the client area this frame. The window class
+	// set one IDC_ARROW for the process lifetime and handled no WM_SETCURSOR, so
+	// the pointer never changed shape over anything.
+	cursor:        Cursor_Kind,
+	cursors:       [Cursor_Kind]win.HCURSOR,
 	// High surrogate awaiting its low half across two WM_CHAR messages. Persists
 	// between messages, not between frames — the pair arrives back to back.
 	pending_high:  u16,
@@ -243,6 +248,12 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 		lpszClassName = class_name,
 	}
 	win.RegisterClassExW(&wc)
+
+	// Loaded once. IDC_* are integer resource ids typed as cstring; reinterpret
+	// them as the wide-string form LoadCursorW expects.
+	w.cursors[.Arrow] = win.LoadCursorW(nil, transmute(win.wstring)win.IDC_ARROW)
+	w.cursors[.Hand] = win.LoadCursorW(nil, transmute(win.wstring)win.IDC_HAND)
+	w.cursors[.IBeam] = win.LoadCursorW(nil, transmute(win.wstring)win.IDC_IBEAM)
 
 	// No AdjustWindowRectEx: WM_NCCALCSIZE gives this window a client area equal
 	// to its whole window rect, so there is no frame to add. (It was also the
@@ -299,6 +310,18 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 }
 
 // Live Ctrl state, for gestures that aren't key presses (Ctrl+wheel).
+Cursor_Kind :: enum u8 {
+	Arrow,
+	Hand,
+	IBeam,
+}
+
+// What the pointer should look like over the client area. Set per frame by the
+// program; WM_SETCURSOR applies it. Setting it every frame is deliberate — the
+// program decides from live state (is Ctrl held, is the pointer over a link)
+// rather than trying to track enter/leave events.
+window_set_cursor :: proc(w: ^Window, k: Cursor_Kind) {w.cursor = k}
+
 key_ctrl_down :: proc() -> bool {
 	return (int(win.GetKeyState(win.VK_CONTROL)) & 0x8000) != 0
 }
@@ -498,6 +521,13 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 			w.resized = true // pre-callback (startup): main handles the resize
 		}
 		return 0
+	case win.WM_SETCURSOR:
+		// Only the client area; the caption and borders keep the system's own
+		// cursors (resize arrows at the edges) by falling through.
+		if (u32(lparam) & 0xFFFF) == win.HTCLIENT {
+			win.SetCursor(w.cursors[w.cursor])
+			return 1
+		}
 	case win.WM_MOUSEWHEEL:
 		// signed wheel delta lives in the high word of wParam
 		raw := int(wparam >> 16) & 0xFFFF

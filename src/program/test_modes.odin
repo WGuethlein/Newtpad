@@ -1183,6 +1183,171 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad linktest` covers link detection and resolution — the parts that are
+	// pure logic and therefore actually testable here. The Ctrl+click gesture and
+	// the underline are not covered: this environment cannot inject mouse input.
+	//
+	// The interesting cases are all about where a link ENDS, and about not
+	// turning ordinary prose into links.
+	if os.args[1] == "linktest" {
+		bad := 0
+		Case :: struct {
+			text:   string,
+			want:   string, // expected target text, "" = expect no link
+			line:   int,
+			kind:   Link_Kind,
+		}
+		cases := []Case {
+			// URLs, and the trailing-punctuation problem.
+			{"see http://example.com/x", "http://example.com/x", 0, .URL},
+			{"see http://example.com/x.", "http://example.com/x", 0, .URL},
+			{"(see https://example.com/a)", "https://example.com/a", 0, .URL},
+			{"wiki https://en.wikipedia.org/wiki/A_(b)", "https://en.wikipedia.org/wiki/A_(b)", 0, .URL},
+			{"mail mailto:a@b.com, thanks", "mailto:a@b.com", 0, .URL},
+			// A scheme we refuse: must not be detected as a URL at all.
+			{"run ms-msdt:/id PCWDiagnostic", "", 0, .URL},
+			{"run search-ms:query=x", "", 0, .URL},
+			// Absolute Windows paths.
+			{`open C:\dir\file.txt now`, `C:\dir\file.txt`, 0, .Path},
+			{`open C:/dir/file.txt now`, `C:/dir/file.txt`, 0, .Path},
+			// The drive-letter trap: C: must not parse as target "C" line 0.
+			{`at C:\dir\file.txt:42`, `C:\dir\file.txt`, 42, .Line_Ref},
+			// UNC.
+			{`see \\server\share\a.log`, `\\server\share\a.log`, 0, .Path},
+			// Compiler / linter output.
+			{"src/main.odin:120:5: error here", "src/main.odin", 120, .Line_Ref},
+			{"at build\\out.log:9", "build\\out.log", 9, .Line_Ref},
+			// Prose must not become links.
+			{"this is just a sentence", "", 0, .Path},
+			{"ratio was 3:1 overall", "", 0, .Path},
+			{"see the readme for details", "", 0, .Path},
+			// Quoted paths end at the quote.
+			{`"C:\dir\a.txt" and more`, `C:\dir\a.txt`, 0, .Path},
+		}
+
+		fmt.println("--- detection ---")
+		for c in cases {
+			links := links_scan(c.text)
+			got := ""
+			gl := 0
+			gk := Link_Kind.Path
+			if len(links) > 0 {
+				got = c.text[links[0].start:links[0].start + links[0].target_len]
+				gl = links[0].line
+				gk = links[0].kind
+			}
+			ok := got == c.want && gl == c.line
+			if c.want != "" {ok = ok && gk == c.kind}
+			if !ok {bad += 1}
+			fmt.printfln(
+				"  %-40q -> %-36q line=%-4d %s",
+				c.text,
+				got,
+				gl,
+				"OK" if ok else fmt.tprintf("FAIL (want %q line %d)", c.want, c.line),
+			)
+		}
+
+		fmt.println("--- resolution is anchored to the document's folder ---")
+		dir := os.get_env("TEMP", context.temp_allocator)
+		anchor := fmt.tprintf("%s\\newtpad_link_anchor.txt", dir)
+		target := fmt.tprintf("%s\\newtpad_link_target.txt", dir)
+		plat.file_write_atomic(anchor, transmute([]u8)string("anchor"))
+		plat.file_write_atomic(target, transmute([]u8)string("target"))
+		doc, dok := doc_open(anchor)
+		if dok {
+			defer doc_close(&doc)
+			line := "see newtpad_link_target.txt:3 for details"
+			links := links_scan(line)
+			if len(links) == 0 {
+				fmt.println("  FAIL: relative link not detected")
+				bad += 1
+			} else {
+				t, rok := link_resolve(&doc, line, links[0])
+				want_ok := rok && t.path == target && t.line == 3
+				fmt.printfln("  relative resolves next to the document: %v %s", t.path, "OK" if want_ok else "FAIL")
+				if !want_ok {bad += 1}
+			}
+
+			// A file that does not exist must not resolve at all.
+			missing := "see newtpad_no_such_file.txt for details"
+			ml := links_scan(missing)
+			if len(ml) > 0 {
+				_, rok := link_resolve(&doc, missing, ml[0])
+				fmt.printfln("  missing file refuses to resolve: %v %s", !rok, "OK" if !rok else "FAIL")
+				if rok {bad += 1}
+			}
+
+			// A parent walk is refused rather than resolved.
+			up := "see ..\\outside.txt now"
+			ul := links_scan(up)
+			if len(ul) > 0 {
+				_, rok := link_resolve(&doc, up, ul[0])
+				fmt.printfln("  parent walk refused: %v %s", !rok, "OK" if !rok else "FAIL")
+				if rok {bad += 1}
+			}
+		}
+
+		fmt.println("--- scheme whitelist ---")
+		for u in ([]string{"http://x.com", "https://x.com", "mailto:a@b.com"}) {
+			ok := plat.url_is_openable(u)
+			fmt.printfln("  %-24q openable=%v %s", u, ok, "OK" if ok else "FAIL")
+			if !ok {bad += 1}
+		}
+		for u in ([]string{"ms-msdt:/id X", "search-ms:query=x", "javascript:alert(1)", "file://server/x", "ms-officecmd:%7B%22id%22"}) {
+			ok := plat.url_is_openable(u)
+			fmt.printfln("  %-24q openable=%v %s", u, ok, "OK" if !ok else "FAIL")
+			if ok {bad += 1}
+		}
+
+		fmt.println("--- drawn span == clickable span ---")
+		// The underline is drawn from Link_Hit.col/cells and links_hit tests the
+		// same fields, so they cannot disagree by construction. This asserts the
+		// construction actually holds: a point inside the reported cells hits, and
+		// one just outside does not. Boundary cells on both edges, because that is
+		// where every seam bug in this codebase has lived.
+		{
+			tt: plat.Text
+			plat.text_load_faces(&tt)
+			seamf := fmt.tprintf("%s\\newtpad_link_seam.txt", dir)
+			plat.file_write_atomic(seamf, transmute([]u8)string("go to https://example.com/x now\n"))
+			sd, sok := doc_open(seamf)
+			if sok {
+				defer doc_close(&sd)
+				sd.view_cols = 200
+				sd.view_rows = 10
+				hits := links_layout(&sd, &tt, 10)
+				if len(hits) != 1 {
+					fmt.printfln("  FAIL: expected 1 hit, got %d", len(hits))
+					bad += 1
+				} else {
+					h := hits[0]
+					cw := plat.text_char_width(&tt, BASE_PX, .Doc)
+					px := BASE_PX
+					yy := row_baseline_y(px, h.row) - line_height(px) * 0.5
+					inside_l := col_x(cw, h.col) + cw * 0.5
+					inside_r := col_x(cw, h.col + h.cells - 1) + cw * 0.5
+					outside_l := col_x(cw, h.col - 1) + cw * 0.5
+					outside_r := col_x(cw, h.col + h.cells) + cw * 0.5
+					_, i1 := links_hit(hits, px, cw, inside_l, yy)
+					_, i2 := links_hit(hits, px, cw, inside_r, yy)
+					_, o1 := links_hit(hits, px, cw, outside_l, yy)
+					_, o2 := links_hit(hits, px, cw, outside_r, yy)
+					ok := i1 && i2 && !o1 && !o2
+					fmt.printfln("  cells [%d,%d)  first=%v last=%v before=%v after=%v %s", h.col, h.col + h.cells, i1, i2, o1, o2, "OK" if ok else "FAIL")
+					if !ok {bad += 1}
+					got := h.text[h.link.start:h.link.start + h.link.target_len]
+					tok := got == "https://example.com/x"
+					fmt.printfln("  target %q %s", got, "OK" if tok else "FAIL")
+					if !tok {bad += 1}
+				}
+			}
+		}
+
+		fmt.printfln("linktest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad devicelosttest` covers what happens after the GPU goes away.
 	//
 	// Present's HRESULT was discarded, so a removed device (driver update, TDR,
