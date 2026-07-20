@@ -1182,6 +1182,78 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad diskstamptest` pins the restore/watch seam in both directions. A
+	// dirty tab restored from a backup used to carry a zero stamp, so the watcher
+	// compared zero against the real file, called it changed, and told the user to
+	// reload away the work hot exit had just restored -- within a second of every
+	// launch. Suppressing the report would have been the wrong fix: it would also
+	// suppress a file that really did change while we were closed. So the session
+	// carries the stamp, and both directions are asserted here.
+	if os.args[1] == "diskstamptest" {
+		tmpf := fmt.tprintf("%s%cnewtpad_stamptest.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+		plat.file_write_atomic(tmpf, transmute([]u8)string("original content\n"))
+		bad := 0
+
+		a: App
+		if fd, ok := doc_open(tmpf); ok {
+			d := new(Document);d^ = fd
+			app_add(&a, d)
+			doc_insert_text(d, transmute([]u8)string("edited ")) // dirty: forces a backup
+		}
+		session_save(&a)
+		app_destroy(&a)
+
+		b: App
+		session_restore(&b)
+		d := app_active(&b)
+		fmt.println("--- restored dirty tab ---")
+		fmt.printfln("  modified=%v path=%q", d.modified, d.path)
+		has := d.disk_stamp.ok
+		fmt.printfln("  carries a disk stamp: %v %s", has, "OK" if has else "FAIL")
+		if !has {bad += 1}
+
+		// This is exactly the comparison watch_worker makes.
+		now := plat.file_stamp(tmpf)
+		quiet := now == d.disk_stamp
+		fmt.printfln("  unchanged file reports a change: %v %s", !quiet, "OK" if quiet else "FAIL")
+		if !quiet {bad += 1}
+
+		// Now let the file really change underneath us.
+		time.sleep(16 * time.Millisecond) // mtime granularity
+		plat.file_write_atomic(tmpf, transmute([]u8)string("changed by someone else\n"))
+		now2 := plat.file_stamp(tmpf)
+		detects := now2 != d.disk_stamp
+		fmt.printfln("  genuine external change still detected: %v %s", detects, "OK" if detects else "FAIL")
+		if !detects {bad += 1}
+		app_destroy(&b)
+
+		// doc_reload goes through doc_close, which nils idx.th, and only
+		// app_activate starts an index lazily -- which never fires again for a tab
+		// that is already active. So the tab you are watching a log on lost its line
+		// count permanently the first time it reloaded.
+		fmt.println("--- reload restarts the line index ---")
+		c: App
+		if fd, ok := doc_open(tmpf); ok {
+			rd := new(Document);rd^ = fd
+			app_add(&c, rd)
+			app_activate(&c, 0)
+			started_before := rd.idx.th != nil
+			reloaded := doc_reload(rd)
+			started_after := rd.idx.th != nil
+			fmt.printfln("  index running before reload: %v", started_before)
+			fmt.printfln("  reload ok=%v, index running after: %v %s", reloaded, started_after, "OK" if reloaded && started_after else "FAIL")
+			if !reloaded || !started_after {bad += 1}
+		}
+		app_destroy(&c)
+
+		empty: App
+		app_new_scratch(&empty)
+		session_save(&empty)
+		app_destroy(&empty)
+		fmt.printfln("diskstamptest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad sessiontest` round-trips session save -> restore. Set
 	// NEWTPAD_SESSION_DIR to a temp dir first — without it this writes to, and
 	// then resets, the real session under %APPDATA%\Newtpad.

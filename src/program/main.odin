@@ -384,13 +384,22 @@ main :: proc() {
 			// Get off the mapping before anything else: while we hold it, the
 			// other writer cannot rotate or replace the file.
 			doc_detach_mapping(d)
+			// Record the version we just saw in every branch. The worker re-reports
+			// any file whose stamp differs from the one we publish, so a change the
+			// user has not acted on used to be re-reported once a second forever --
+			// and each report set session_dirty, rewriting session.txt and a full
+			// backup of every dirty buffer, once a second, on an idle app.
+			// disk_changed is the flag that remembers; disk_stamp only records what
+			// we have already been told.
 			if d.modified {
 				// Never discard the user's edits silently. Mark and let them choose.
 				d.disk_changed = true
+				d.disk_stamp = c.stamp
 			} else if doc_absorb_append(d, c.stamp.size) {
 				d.disk_stamp = c.stamp
 			} else if !doc_reload(d) {
 				d.disk_changed = true
+				d.disk_stamp = c.stamp
 			}
 			session_dirty = true
 		}

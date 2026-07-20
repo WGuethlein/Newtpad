@@ -883,6 +883,11 @@ doc_reload :: proc(doc: ^Document) -> bool {
 	doc.disk_changed = false
 	doc.disk_gone = false
 	doc.recovered = false // freshly read; no longer a salvaged copy
+	// doc_close stopped the index and nil'd idx.th, and only app_activate starts
+	// one lazily -- which never fires again for a tab that is already active. So
+	// a reload left the status bar reading "0 lines, indexing 0%" for good, on the
+	// log-tailing path this feature exists for.
+	doc_index_start(doc)
 	return true
 }
 

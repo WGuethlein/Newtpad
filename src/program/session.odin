@@ -118,11 +118,28 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 			}
 		}
 		if slot == a.active {active_idx = ti}
-		fmt.sbprintf(&tb, "%d %d %d %d %d %d %s\n", d.cursor, d.anchor, d.top, 1 if d.wrap else 0, int(d.enc), backup_idx, d.path)
+		// mtime/size go in the line (format 2) so a restored dirty buffer knows what
+		// the file looked like when we left it. Without them a restored buffer had a
+		// zero stamp, the watcher compared it against the real file and reported a
+		// change within a second of every launch -- on the hot-exit feature itself,
+		// telling the user to reload away the work it had just restored.
+		fmt.sbprintf(
+			&tb,
+			"%d %d %d %d %d %d %d %d %s\n",
+			d.cursor,
+			d.anchor,
+			d.top,
+			1 if d.wrap else 0,
+			int(d.enc),
+			backup_idx,
+			d.disk_stamp.mtime,
+			d.disk_stamp.size,
+			d.path,
+		)
 		ti += 1
 	}
 
-	body := fmt.tprintf("newtpad-session 1\nactive %d\n%s", active_idx, strings.to_string(tb))
+	body := fmt.tprintf("newtpad-session 2\nactive %d\n%s", active_idx, strings.to_string(tb))
 	sp := pjoin({dir, "session.txt"})
 	if !plat.file_write_atomic(sp, transmute([]u8)body) {
 		return false
@@ -153,6 +170,10 @@ session_restore :: proc(a: ^App) -> bool {
 	if len(lines) < 2 || !strings.has_prefix(lines[0], "newtpad-session") {
 		return false
 	}
+	// Format 1 lines have no stamp fields. Read them rather than discarding a
+	// session written by the previous build.
+	ver := pint(strings.trim_space(lines[0][len("newtpad-session"):]))
+	if ver < 1 {ver = 1}
 	active := 0
 	if strings.has_prefix(lines[1], "active ") {
 		active = pint(lines[1][7:])
@@ -163,7 +184,8 @@ session_restore :: proc(a: ^App) -> bool {
 	ti := 0
 	for li in 2 ..< len(lines) {
 		if len(lines[li]) == 0 {continue}
-		parts := strings.split_n(lines[li], " ", 7, context.temp_allocator)
+		nf := 9 if ver >= 2 else 7 // path is last and may contain spaces
+		parts := strings.split_n(lines[li], " ", nf, context.temp_allocator)
 		if len(parts) < 6 {continue}
 		cursor := pint(parts[0])
 		anchor := pint(parts[1])
@@ -171,7 +193,17 @@ session_restore :: proc(a: ^App) -> bool {
 		wrap := pint(parts[3]) != 0
 		enc := base.Encoding(pint(parts[4]))
 		bidx := pint(parts[5])
-		path := parts[6] if len(parts) == 7 else ""
+		stamp: plat.File_Stamp
+		path := ""
+		if ver >= 2 {
+			if len(parts) >= 8 {
+				mt := u64(pint(parts[6]))
+				stamp = plat.File_Stamp{mtime = mt, size = i64(pint(parts[7])), ok = mt != 0}
+			}
+			path = parts[8] if len(parts) == 9 else ""
+		} else {
+			path = parts[6] if len(parts) == 7 else ""
+		}
 
 		d := new(Document)
 		created := false
@@ -192,6 +224,13 @@ session_restore :: proc(a: ^App) -> bool {
 			d.anchor = clamp(anchor, 0, L)
 			d.top = clamp(top, 0, L)
 			d.wrap = wrap
+			// A buffer rebuilt from a backup has never been stat'd (doc_from_content
+			// sets no stamp), while doc_open already stamped the clean-tab case. Adopt
+			// what the session recorded so an unchanged file stays quiet -- and a file
+			// that genuinely changed while we were closed still reports.
+			if !d.disk_stamp.ok && d.path != "" {
+				d.disk_stamp = stamp if stamp.ok else plat.file_stamp(d.path)
+			}
 			slot := app_add(a, d)
 			if ti == active {active_slot = slot}
 			restored += 1
