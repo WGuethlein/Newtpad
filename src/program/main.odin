@@ -14,6 +14,11 @@ import plat "src:platform"
 main :: proc() {
 	plat.seh_install() // arm the mapped-read fault guard before any file opens
 
+	if len(os.args) > 1 && (os.args[1] == "--version" || os.args[1] == "-v" || os.args[1] == "version") {
+		fmt.println("Newtpad", NEWTPAD_VERSION) // console builds only; the GUI shows it in Settings
+		return
+	}
+
 	if test_mode_dispatch() {return} // headless argv modes (see test_modes.odin)
 
 	// Open the file given on the command line; with no argument, start empty.

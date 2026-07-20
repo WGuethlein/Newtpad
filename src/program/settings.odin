@@ -248,6 +248,10 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 		y += rowh
 	}
 
+	// Version, bottom-left — the one always-visible surface for it in the GUI
+	// build (there is no console for --version once -subsystem:windows).
+	plat.text_draw(gfx, t, fmt.tprintf("Newtpad v%s", NEWTPAD_VERSION), x, height - sx(24), UI_SMALL_PX, {0.42, 0.47, 0.56, 1})
+
 	// The one setting with a consequence worth stating outright.
 	if !app.settings.restore_session {
 		plat.text_draw(
