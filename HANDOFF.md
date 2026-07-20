@@ -2,9 +2,14 @@
 
 Rewritten 2026-07-18 after a mid-project audit (devil's-advocate + code review). This is the
 living state doc: what Newtpad is, what works now, how it's built, the debt we're carrying, and
-the roadmap. The compressed constitution — principles, hard rules, locked decisions, git
-conventions — is kept locally, outside the repo. Research corpus in [research/](research/);
-buffer benchmark in [bench/](bench/).
+the roadmap. Research corpus in [research/](research/); buffer benchmark in [bench/](bench/).
+
+**The constitution (`CLAUDE.md`) is gitignored and exists only on Wyatt's disk.** That is a
+deliberate choice, but it means the document defining the locked decisions, the hard engineering
+rules and the git conventions has no backup, no history, and is invisible to a fresh clone — while
+this file, which repeatedly defers to it, is committed. Losing it loses the *why* behind every
+decision here. Worth revisiting: tracking it costs nothing and the reasons for keeping it out are
+worth restating if they still hold.
 
 ## 1. What Newtpad is
 
@@ -33,9 +38,14 @@ A genuinely usable editor, built end-to-end:
 - **Multilingual**: per-codepoint font fallback (Consolas + Microsoft YaHei CJK + Segoe UI
   Symbol + Segoe UI). Latin/Cyrillic/Greek/CJK/accents/symbols render.
 
-Verified: 13 `odin test` cases (encoding, line-nav, piece tree); headless mode dispatch
-(`newtpad <file> <count|edittest|savetest|seltest|findtest|repltest|filtertest>`); screenshots.
-Wyatt confirmed live: open/save/undo/mouse-select.
+**Note:** §2 describes the first day. Much more has shipped since — tabs, session restore, command
+palette, menu bar, settings, font selection, undo history, zoom, word wrap, external-change
+detection, per-monitor DPI, single-instance, an installer. §6b onward is the accurate record, and
+§6k is the most recent state.
+
+Verified: **20 `odin test` cases** (encoding, line-nav, piece tree, lossy-encoding detection) plus
+~28 headless test modes — see §7 for the full list. Wyatt daily-drives the editor, which is now the
+main source of bugs, because this environment cannot inject GUI input.
 
 ## 3. Architecture as-built
 
@@ -51,9 +61,23 @@ clean and verified by the audit.**)
   swapchain/frame), `quads.odin` (instanced solid-quad pipeline), `text.odin` (DirectWrite +
   ClearType glyph atlas + font fallback), `dwrite.odin` (hand-declared DirectWrite COM),
   `file.odin` (mmap/copy open, atomic write, Save dialog), `clipboard.odin`.
-- `program/` (frame loop + document): `main.odin` (loop, input dispatch, render, headless test
-  modes), `doc.odin` (Document: buffer + cursor + selection + undo + viewport + line index +
-  filter), `find.odin` (find/replace/regex/filter).
+- `program/` (frame loop, documents, all UI). Fourteen files — this list was three for a long
+  time while eleven more shipped, so keep it current:
+  - `main.odin` — frame loop, input dispatch, `render_frame`, status bar, device-lost handling.
+  - `app.odin` — the tab model: slot array of `^Document` (stable addresses), MRU, activate.
+  - `doc.odin` — `Document`: buffer, cursor, selection, undo/redo, viewport, line index, wrap,
+    filter, gutter, external-change state, history helpers.
+  - `find.odin` — find/replace/regex/filter and the background search worker.
+  - `commands.odin` — the `[Command_Id]Command` table, keymap, and `command_dispatch`.
+  - `menu.odin` — menu bar, dropdowns, mnemonics, scroll resolution.
+  - `palette.odin` — Ctrl+P overlay, prefix modes, fzf-style scoring.
+  - `ui_tabs.odin` — the tab strip in the custom caption.
+  - `settings.odin` / `fontpage.odin` — Settings and Font, which are tabs, not modal takeovers.
+  - `history.odin` — the undo-history panel.
+  - `session.odin` — hot exit: `session.txt` plus per-buffer backups.
+  - `watch.odin` — external-change detection on a worker (timestamp polling, never a held handle).
+  - `test_modes.odin` — the headless harness. **Note it is `package main`, so it ships inside the
+    release exe;** moving it behind a build flag is tracked in §5.
 
 Key mechanisms: buffer = treap keyed by byte position (O(log n)); undo = tree clone/restore;
 one background job (line-count worker, cancel flag + atomics); frame = `gfx_begin_frame` (clear +
@@ -68,6 +92,22 @@ quads; handmade immediate-mode UI; **buffer = piece tree over copy-small / mmap-
 code); plugins post-V1 (narrow C-ABI). Refuted claims recorded in `research/`.
 
 ## 5. Debt register (from the 2026-07-18 audit)
+
+**Status: P0 and P1 below are DONE** (see §6 items 1–2 for how, and §6k for a second, larger sweep
+on 2026-07-19). The list is kept because the reasoning is still the best statement of *why* these
+were the priorities. Read P2 as the live list, with these amendments:
+
+- **Arenas on VirtualAlloc: still zero implementation.** Heap plus `free_all(context.temp_allocator)`
+  per frame. Either build it or amend the locked decision — do not keep citing it as though it
+  describes the code.
+- **`\?\` long paths: still zero implementation.** Not one in the tree.
+- **Test modes ship in the release binary.** `test_modes.odin` is `package main`; the harness grew
+  a lot on 2026-07-19 and release went 0.69 → 0.87 MB. Gate it behind a build flag.
+- **The app redraws at vsync when idle** — no `WaitMessage` anywhere. A core burnt on a static
+  screen, which also multiplies every other per-frame cost.
+- **The text pipeline batches nothing** — one heap allocation, two buffer maps and one draw call
+  per string, 74 call sites, several inside per-row loops. This is the prerequisite for an
+  always-on line-number gutter (see `drawcount` in §6k).
 
 Ranked. P0 = fix before building more; P1 = cheap correctness/cleanliness now; P2 = deferred but
 tracked.
@@ -501,9 +541,16 @@ and be verified by reintroducing the divergence and watching it fail. `menutest`
 - **Save failures were silent** in release: reported via `eprintfln`, but release is
   `-subsystem:windows` so stderr is discarded. Ctrl+S on a file held open by another process did
   nothing and said nothing. Now a dialog naming the cause.
-- **Glyph atlas dropped glyphs silently** — text vanished while the pen advanced. Now grows to
-  4096², recycles, and says so in the status bar. A CJK page needs ~3000 glyphs and 1024² held
-  1196: reachable before any font work.
+- **Glyph atlas dropped glyphs silently** — text vanished while the pen advanced. A CJK page needs
+  ~3000 glyphs and 1024² held 1196: reachable before any font work. **Correction (2026-07-19): only
+  the status-bar clause of this actually shipped.** The growth and recycling did not work at all.
+  `atlas_relieve` refuses while `t.drawing`, and its only caller was inside `text_draw`, so the
+  guard was always true: the atlas stayed at 1024² for the life of the process and `ATLAS_MAX` was
+  dead code. Fixed by deferring relief to `text_frame_begin`, the one point per frame with no
+  instance queue live. **Why it went unnoticed for a day:** `atlastest` only exercises
+  `text_atlas_fit_count`, which is arithmetic that *assumes* growth works — it passed throughout.
+  `atlasgrowtest` now drives real glyphs through a real device and watches 1024 → 4096. This is the
+  cleanest example in the repo of a fix that existed in the commit message and not in the binary.
 - **mmap locks the file** (`ERROR_USER_MAPPED_FILE`), so a service could not rotate a log we had
   open — a silent violation of "never lock the user's file". Detaches to a private copy on any
   detected change.
@@ -539,64 +586,182 @@ requests from live use, none urgent:
 Also fixed in passing (2026-07-19): filter used to scroll to the caret-nearest match unclamped, so
 a match near the end of the file showed two or three lines above a screen of empty rows.
 
-## 6i. Requested features — not yet built (Wyatt, 2026-07-19)
+## 6i. Requested features — BOTH SHIPPED (Wyatt, 2026-07-19)
 
-**1. Undo history list, Photoshop-style.** A visible list of undo states with the ability to jump
-back to any one of them, rather than only stepping with Ctrl+Z.
+Kept because the design notes were the plan these were built to, and the hygiene problems named
+here were real. **This section said "not yet built" for two features that had already landed, and
+cited a grep for `mtime`/`GetFileTime`/reload that returns plenty of hits.** Stale docs that
+confidently assert absence are worse than no docs: they send the next session off to build a
+second copy of something.
 
-The buffer already supports this better than most editors would: `doc.undo` is a `[dynamic]Snapshot`
-and each `Snapshot` holds a **cloned piece tree** (`doc.odin`), so every past state is already
-materialised and reachable — jumping to state *n* is `apply_snapshot(doc, undo[n])` plus moving
-everything after it to the redo stack. What is missing is the UI and two hygiene problems this
-would expose:
-- **`push_undo` snapshots on every keystroke with no coalescing**, so typing a paragraph creates
-  hundreds of entries. A history list would make that obvious and useless. Needs run-coalescing
-  (group consecutive inserts with no caret jump) before a list is worth showing.
-- **`doc.undo` has no cap**, so it grows unbounded in a long-lived process. Cloning is proportional
-  to piece count, not bytes, but it is not free.
-Both are worth fixing regardless; the list is the feature that forces them.
+**1. Undo history list, Photoshop-style — DONE.** `history.odin`: a panel listing undo states with
+jump-to-state, driven by `doc_history_len`/`doc_history_current`/`doc_history_goto`. Covered by
+`historytest`.
 
-**2. Auto-reload when a file changes on disk** (e.g. CMTrace or another service appending to a log).
+The buffer supported this better than most editors would: `doc.undo` is a `[dynamic]Snapshot` and
+each holds a **cloned piece tree**, so every past state was already materialised — jumping to state
+*n* is `apply_snapshot` plus moving everything after it to the redo stack.
 
-This is a **CLAUDE.md hard rule that is currently unimplemented** — "external-change detection via
-timestamp polling, never held handles" — so it is owed anyway. Today Newtpad neither notices nor
-offers a reload, and a save silently clobbers whatever the other writer did. Grep confirms zero
-hits for `mtime`/`GetFileTime`/reload.
+The two hygiene problems this exposed:
+- **Coalescing** — `push_undo` continues a run for consecutive `.Type` edits with no caret jump, so
+  typing a paragraph is not hundreds of entries.
+- **`doc.undo` is capped** at `UNDO_MAX` (200), oldest evicted. That cap has a sharp edge worth
+  remembering: it is why Replace All had to become a single batched entry (2026-07-19). Replacing
+  more than 200 occurrences pushed the pre-replace state off the end of the stack and made the
+  original unreachable by any number of Ctrl+Z. `replacetest` runs 300 matches to hold that line.
 
-Design notes for when it lands:
-- Poll `GetFileAttributesExW` (size + last-write) per visible tab on a timer, not a held handle —
-  the never-lock rule is absolute.
-- **Clean tab, file grew** → reload silently, and if the caret is at EOF keep it there. That is the
-  log-tailing case and the one Wyatt asked for.
-- **Clean tab, file changed otherwise** → reload, preserving caret/scroll by byte offset.
-- **Modified tab** → never silently discard the user's edits; surface a prompt or a marker.
-- The mmap path must handle a file that grows: `File_View` maps a fixed size, so an append is not
-  visible without remapping. The SEH guard already covers a file *shrinking* underneath us.
-- Interacts with the search worker: a reload invalidates the buffer, so it needs the same
-  cancel-and-restart treatment as an edit (`find_invalidate`).
+**2. Auto-reload when a file changes on disk — DONE.** `watch.odin` polls `GetFileAttributesExW`
+(size + last-write) per open tab on a worker thread — never a held handle, per the never-lock rule.
+`main.odin` drains the results once per frame: a clean tab that grew absorbs the append, a clean
+tab that changed otherwise reloads preserving position by byte offset, and a modified tab is
+flagged rather than silently discarded. mmap detaches to a private copy on any detected change,
+because a mapping locks the file against a rotating writer.
 
-A minimal "follow the tail" mode was already parked in V2 (see the feature list at
-`git show 9db93d7:HANDOFF.md`); the detection half belongs in V1 because it is a correctness rule,
-not a feature.
+Three bugs found in this area later (2026-07-19, all fixed — see §6k):
+- A restored dirty tab carried no disk stamp, so the watcher reported a change within a second of
+  every launch and told the user to reload away the work hot exit had just restored.
+- Nothing recorded the stamp once a change was reported and not acted on, so the same change was
+  re-reported every second forever, rewriting the session and every dirty buffer's backup each time.
+- `doc_reload` never restarted the line index, so the status bar read "0 lines, indexing 0%" from
+  the first reload onward — on the log-tailing path the feature exists for.
+
+## 6k. Audit, then the correctness sweep (2026-07-19)
+
+A multi-agent audit read the code, docs and goals against two bars — daily-driver completeness and
+commercial ship-readiness — and every finding went through three-vote adversarial verification
+(2 of 3 refutes killed it). 85 raw findings, **61 confirmed, 16 refuted**. The full report is a
+working artifact, not committed; what matters is distilled here.
+
+### Falsifiers before fixes
+
+Two claims the plan leaned on were measured rather than assumed, and one of them was wrong:
+
+- **`menuseam`** — would a `LAYOUT → INPUT → COMMIT → DRAW` frame resolve scroll twice and diverge?
+  **Yes, in 9 of 9 scrolling cases.** Resolving with the highlighted item at *k* gives `top=0`, at
+  *k+1* gives `top=1`: the hit-test would accept rows `[0,6)` while the draw painted `[1,7)`. That
+  is the seam-bug class reintroduced at frame granularity by the very design meant to prevent it.
+  **One layout call per frame is therefore mandatory** in the extraction. Today's code is fine — it
+  resolves once inside the draw and the hit-test reads the cached `top`, deliberately one frame
+  stale and self-consistent.
+- **`drawcount`** — does an always-on gutter double per-frame draw calls? **No: ×1.68** at
+  1280×720 (26 rows, 38 `text_draw`, 4 `quads_draw`). It approaches ×2 only as the window grows,
+  since per-row work is already 68% of `text_draw`. The ordering conclusion survives — batch before
+  the gutter — but on a real number.
+
+### Fixed this session
+
+Data loss and correctness, each with a headless test, and where there was an observable failure
+mode the test was verified by reintroducing the bug and watching it fail:
+
+- **Ctrl+S read a freed path.** `doc_save_err` clones the incoming path, then frees `doc.path` —
+  which the caller's slice aliased on a re-save. The failure dialog, whose whole job is naming the
+  file that would not save, was the one reading freed memory. `savepathtest` pins it by pointer
+  identity, because the freed bytes usually still read back correctly and a content check would
+  pass with the bug present.
+- **Replace All destroyed undo.** One entry per match, against `UNDO_MAX` 200: replacing 300
+  occurrences pushed 200 entries, evicted 100, and left the original unreachable by any number of
+  Ctrl+Z. Now one batched entry. With the batching removed `replacetest` reports exactly that.
+- **Replace with an empty string was a silent no-op** — it went through `doc_insert_text`, which
+  returns early on empty input before deleting the selection.
+- **The watcher fought session restore**: a restored dirty tab carried no disk stamp, so within a
+  second of every launch it told the user to reload away the work hot exit had just restored; and
+  an unacknowledged change was re-reported every second forever, rewriting the session and every
+  backup each time. Session format 3 carries mtime/size (and `had_bom`/`eol`, which restore also
+  forgot); formats 1 and 2 still read.
+- **`doc_reload` never restarted the line index** — "0 lines, indexing 0%" from the first reload
+  onward, on the log-tailing path the feature exists for.
+- **The glyph atlas could never grow.** See the correction in §6j; this is the important one.
+- **The caret column scanned the whole buffer every frame.** `doc_cursor_col` called the uncapped
+  `pt_line_start`, measured at **223 ms** on a 100 MB single-line file in a debug build (the
+  audit's `-o:speed` harness said 27.9 ms). Now capped and cached: 2.3 ms on a cursor move, 0 after.
+  Past the cap the column is reported as unknown rather than wrong.
+- **The atomic write was neither durable nor faithful.** No `FlushFileBuffers` before the rename,
+  so a power loss could commit the rename with the data still in cache — strictly worse than the
+  plain overwrite the scheme replaced. And `MoveFileExW` substitutes a *new* file: forcing the old
+  path showed a Hidden file with an alternate data stream come back Archive with the stream gone.
+  **`Zone.Identifier` is an ADS**, so every save silently stripped mark-of-the-web from downloaded
+  files. Existing files now go through `ReplaceFileW`.
+- **Saving as Windows-1252 silently substituted `?`.** `rune_to_cp1252` always reported this per
+  character; the encoder discarded the answer. Now counted first, and the user is offered UTF-8.
+- **`WM_CHAR` treated a UTF-16 code unit as a rune**, so emoji inserted two lone surrogates that
+  cannot encode as valid UTF-8. **`SetFilePointer`** was compared against a value that is legal at
+  every 4 GB boundary, hiding the tail of large logs. Both fixed; both rest on reasoning, not an
+  executed test (see §7).
+- **The GPU going away froze the editor.** `Present`'s HRESULT was discarded, so a driver update or
+  TDR left a window that never updated while the loop called into dead COM objects, holding every
+  unsaved buffer. Now detected; the session is saved first, the reason named, and the process
+  exits. **Transparent recovery was deliberately not attempted** — a real removal cannot be
+  provoked here, and an untested recovery path that runs only during a GPU fault is a worse failure
+  mode than a clean exit that preserves the work.
+- **`doc_open` sniffed and transcoded straight out of the mapping**, outside the SEH guard, on the
+  main thread. `EXCEPTION_IN_PAGE_ERROR` is not catchable in Odin: a log rotated mid-open killed
+  the process and every other tab's unsaved work.
+- Smaller: the history panel's selected row indexed the active document's undo stack but lived on
+  `App`, so a tab switch pointed it at the wrong buffer; `text_draw` classified cell widths against
+  the UI font while drawing document text; `view_cols` had two definitions in one frame.
+
+### What the audit got wrong, and the lesson that generalises
+
+16 findings were refuted, including one that mattered: **"no IME support, CJK users cannot type" is
+false** — `window.odin` falls through to `DefWindowProcW`, so IMM32 handles composition and commit.
+The real gap is only composition-window positioning. Others: the `HWND` "leak" into the program
+layer is a disclosed, deliberate seam; the atlas-warning-latches finding had accurate mechanics but
+a false premise.
+
+The generalisable lesson is the atlas: **a fix can exist in the commit message and not in the
+binary, and a passing test suite will not tell you.** `atlastest` exercised arithmetic that assumed
+growth worked. Prefer a check that cannot pass with the bug present.
+
+### Deferred, with reasons
+
+- **High-contrast support** is blocked on the colour token layer, not on effort. There are ~51
+  hardcoded colour literals; routing them through `GetSysColor` *is* the UI overhaul's token work.
+  A partial job would leave some elements readable and others not, which for an accessibility
+  feature is worse than none because it claims support it does not deliver. It should land as the
+  first consumer of the token layer.
+- **Replace All still acts on the match list as it stands** — but now says so when the search was
+  truncated or still running, instead of replacing a prefix in silence.
+- Still open from the audit: no syntax highlighting, no line-number gutter outside filter view, no
+  drag-and-drop open, Shift cannot be part of a chord, no theme/light mode, no recent files, no
+  crash reporting, unsigned binary, no updater, no LICENSE, no UIA provider, no `\?\` long paths,
+  no VirtualAlloc arenas, and the app still redraws at vsync when idle with no `WaitMessage`.
 
 ## 7. Build environment (Windows, this machine)
 
-- **Headless test modes** (run against the debug exe): `sehtest`, `dpitest`, `menutest`,
-  `settingstest`, `fonttest`, `historytest`, `watchtest <dir>`, `atlastest`, `savefailtest <dir>`,
-  `regextest <mb>`, `findtest`, `celltest`, `sessiontest`,
-  `sessionlosstest <file> [old]`, `palettetest`, `vnavtest`, `wraptest`, plus file-argument modes (`<file> keytest|findtest|filtertest|repltest|edittest`).
-  **Set `NEWTPAD_SESSION_DIR` to a temp dir first** — the session modes otherwise write to the real
-  store. Note a bare `odin build` omits the DPI manifest; use `build.bat` for anything visual.
+- **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
+  headless modes can print. `build.bat release` = `-o:speed -subsystem:windows`, the shipped exe.
+  Append `run` to launch. Both embed `newtpad.res` (the per-monitor-v2 DPI manifest) and link
+  `guarded.obj` (the SEH shim). **A bare `odin build` omits both.** If you edit `guarded_copy.c` or
+  `newtpad.manifest`, delete the matching file in `build\` to force a rebuild.
+- Sizes as of 2026-07-19: **debug ~1.3 MB, release 0.87 MB** (target 2-3 MB). Release grew from
+  0.69 MB when the headless harness expanded — `test_modes.odin` is `package main`, so every test
+  mode ships inside the customer's binary. Tracked in §5.
+- Tests: `odin test src\base -collection:src=src` (20 cases: encoding, line-nav, piece tree,
+  lossy-encoding detection).
+- **Headless test modes** (debug exe). **Set `NEWTPAD_SESSION_DIR` to a temp dir first** or the
+  session modes write to, and reset, the real store under `%APPDATA%\Newtpad`:
+  - Rendering / platform: `sehtest`, `dpitest`, `atlastest`, `atlasgrowtest`, `devicelosttest`,
+    `celltest`, `drawcount <file>`
+  - UI surfaces: `menutest`, `menuseam`, `palettetest`, `settingstest`, `fonttest`, `historytest`
+  - Document / editing: `vnavtest`, `wraptest`, `colperftest <mb>`, `replacetest`, `findtest`,
+    `regextest <mb>`
+  - Files / session: `savepathtest <dir>`, `savefailtest <dir>`, `resavetest <file>`,
+    `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest <dir>`
+  - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
+  - Two are **falsifiers**, not regression tests — they measure a claim rather than guard a
+    behaviour: `menuseam` (does resolving scroll twice in one frame diverge? yes, in every case
+    where the dropdown does not fit) and `drawcount` (what does a frame actually cost? 26 rows,
+    38 `text_draw`, 4 `quads_draw`).
 - **Odin** `dev-2026-07a` at `C:\Users\Wyatt\odin\dist`, on user PATH. **MSVC** from VS Community
   2026 (v18). **Windows SDK** `10.0.28000.0` (had to be added via the VS Installer — VS shipped
   without the C++ desktop SDK; Odin needs the import libs, else "Windows SDK not found").
 - `src/{base,platform,renderer,ui,program}` — one Odin package per dir (Odin compiles a package
-  at once → free "unity build"). `program` is `package main`.
-- `build.bat` — the one build script: `odin build src\program -out:build\newtpad.exe -debug
-  -collection:src=src` (append `run` to launch). Imports use the `src:` collection. Tests:
-  `odin test src\base -collection:src=src`. Debug exe ~950 KB (well under the 2-3 MB target).
-- Note: this environment can't inject GUI keyboard/focus, so interactive features are verified via
-  headless test-modes + screenshots; a live pass by Wyatt is still worth it per feature.
+  at once → free "unity build"). `program` is `package main`. `renderer` and `ui` are still stubs.
+- **This environment cannot inject GUI keyboard or mouse input.** Interactive behaviour is verified
+  by headless modes plus screenshots, and every claim about what happens when you click something
+  is an inference from source. A live pass by Wyatt is still worth it per feature. Two fixes
+  currently rest on reasoning rather than an executed test: non-BMP input (`WM_CHAR` surrogate
+  pairing) and the 4 GB `SetFilePointerEx` boundary.
 
 ## 8. Working agreements
 
