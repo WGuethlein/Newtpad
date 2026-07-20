@@ -351,6 +351,13 @@ Document :: struct {
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	status_cursor: int, // cursor pos the cached status line was computed for
 	status_line:   int, // 1-based line of the cursor (0 = beyond the cap / unknown)
+	// Same for the column, which was neither cached nor capped and cost an
+	// uncapped backward scan per frame. Keyed on length too, so an edit that
+	// leaves the caret where it is still invalidates.
+	status_col_cursor: int,
+	status_col_len:    int,
+	status_col:        int, // 1-based column (0 = beyond the cap / unknown)
+	status_col_valid:  bool,
 	modified:   bool,
 	recovered:  bool, // a mapped read faulted; buffer is now a private copy, not the file
 	// External-change detection (watch.odin). `gen` distinguishes this document
@@ -1127,10 +1134,28 @@ doc_cursor_line :: proc(doc: ^Document) -> int {
 	return doc.status_line
 }
 
-// 1-based cell column of the caret within its line.
+// 1-based cell column of the caret within its line, or 0 when the line start is
+// further back than the cap -- same contract as doc_cursor_line above, and the
+// status bar omits whichever it cannot state.
+//
+// This ran unconditionally every frame and pt_line_start is an uncapped
+// backward scan, so on a single-line file with the caret near the end it walked
+// the whole document per frame: measured at 27.9 ms on 100 MB, i.e. a core
+// pinned at ~35 fps for as long as the file is open. Cached on the caret
+// position and the buffer length, so a still caret costs nothing.
+STATUS_COL_CAP :: 1 * 1024 * 1024
 doc_cursor_col :: proc(doc: ^Document, t: ^plat.Text) -> int {
-	ls := base.pt_line_start(&doc.pt, doc.cursor)
-	return line_cell_col(doc, t, ls, doc.cursor) + 1
+	// The valid flag matters: a fresh Document is all zeroes, and so is a caret at
+	// offset 0 in an empty buffer, which would otherwise return a cached 0.
+	if doc.status_col_valid && doc.cursor == doc.status_col_cursor && doc.pt.length == doc.status_col_len {
+		return doc.status_col
+	}
+	doc.status_col_valid = true
+	doc.status_col_cursor = doc.cursor
+	doc.status_col_len = doc.pt.length
+	ls, exact := base.pt_line_start_cap(&doc.pt, doc.cursor, STATUS_COL_CAP)
+	doc.status_col = line_cell_col(doc, t, ls, doc.cursor) + 1 if exact else 0
+	return doc.status_col
 }
 
 // Scroll so the top of the view is the line start at fraction `frac` of the

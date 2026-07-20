@@ -569,8 +569,22 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			hint_find(gfx, text, f, doc, w, h - sx(8))
 		}
 	} else {
+		// Either figure can be unknown on a huge file: both are capped so the status
+		// bar never spends an unbounded scan. Say what is known rather than printing
+		// a placeholder number that reads as fact.
 		ln := doc_cursor_line(doc)
-		lncol := fmt.tprintf("Ln %d, Col %d", ln, doc_cursor_col(doc, text)) if ln > 0 else fmt.tprintf("Col %d", doc_cursor_col(doc, text))
+		cl := doc_cursor_col(doc, text)
+		lncol: string
+		switch {
+		case ln > 0 && cl > 0:
+			lncol = fmt.tprintf("Ln %d, Col %d", ln, cl)
+		case cl > 0:
+			lncol = fmt.tprintf("Col %d", cl)
+		case ln > 0:
+			lncol = fmt.tprintf("Ln %d", ln)
+		case:
+			lncol = "Ln -, Col -"
+		}
 		recovered := "  [RECOVERED COPY - file changed on disk, not the original]" if doc.recovered else ""
 		// Only ever shown for a modified document: a clean one is reloaded
 		// silently, so a marker here always means there is a real choice to make.

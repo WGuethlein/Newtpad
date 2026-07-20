@@ -379,6 +379,34 @@ pt_line_end_cap :: proc(pt: ^Piece_Table, pos, cap: int) -> int {
 	return limit
 }
 
+// pt_line_start, bounded, mirroring pt_line_end_cap. `exact` is false when the
+// cap was reached without finding a newline, so the returned offset is a scan
+// floor rather than a real line start and the caller must not present a column
+// derived from it as fact.
+//
+// Needed because pt_line_start scans backward to the previous newline with no
+// bound: on a minified JSON or a single-line log with the caret near the end,
+// one call walks the whole document, and the status bar made that call every
+// frame.
+pt_line_start_cap :: proc(pt: ^Piece_Table, pos, cap: int) -> (start: int, exact: bool) {
+	buf: [4096]u8
+	q := clamp(pos, 0, pt.length)
+	floor := max(0, q - cap)
+	for q > floor {
+		chunk := min(len(buf), q - floor)
+		s := q - chunk
+		pt_read(pt, s, buf[:chunk])
+		for k := chunk - 1; k >= 0; k -= 1 {
+			if buf[k] == '\n' {
+				return s + k + 1, true
+			}
+		}
+		q = s
+	}
+	// Reaching offset 0 is a real line start; stopping at the cap is not.
+	return floor, floor == 0
+}
+
 pt_next_line_start :: proc(pt: ^Piece_Table, pos: int) -> int {
 	e := pt_line_end(pt, pos)
 	return e + 1 if e < pt.length else pt.length

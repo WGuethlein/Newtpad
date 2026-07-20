@@ -1182,6 +1182,65 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad colperftest <mb>` measures the status bar's caret column on a
+	// single-line file -- minified JSON, an unrotated log, a CSV with no newlines.
+	// doc_cursor_col called pt_line_start, an uncapped backward scan, and the
+	// status bar calls it unconditionally every frame: 27.9 ms per frame on
+	// 100 MB, one core pinned at ~35 fps for as long as the file stays open.
+	if os.args[1] == "colperftest" && len(os.args) > 2 {
+		mbn, _ := strconv.parse_int(os.args[2])
+		mb := max(mbn, 1)
+		n := mb * 1024 * 1024
+		content := make([]u8, n)
+		for i in 0 ..< n {content[i] = 'a'} // no newline anywhere: worst case
+		doc := doc_from_content(content, "", .UTF8)
+		defer doc_close(&doc)
+		doc.cursor = n // caret at the far end, so the scan is the whole buffer
+		t: plat.Text
+		plat.text_load_faces(&t)
+
+		s1 := time.tick_now()
+		c1 := doc_cursor_col(&doc, &t)
+		d1 := time.duration_milliseconds(time.tick_since(s1))
+
+		s2 := time.tick_now()
+		REP :: 200
+		for _ in 0 ..< REP {doc_cursor_col(&doc, &t)}
+		d2 := time.duration_milliseconds(time.tick_since(s2)) / f64(REP)
+
+		// A short line must still report a real column -- the cap must not blind the
+		// common case.
+		short := doc_from_content(transmute([]u8)strings.clone("hello world"), "", .UTF8)
+		defer doc_close(&short)
+		short.cursor = 5
+		sc := doc_cursor_col(&short, &t)
+
+		// The old path, timed here rather than quoted, so the comparison is this
+		// machine and this buffer: an uncapped backward scan for the line start.
+		s0 := time.tick_now()
+		base.pt_line_start(&doc.pt, doc.cursor)
+		d0 := time.duration_milliseconds(time.tick_since(s0))
+
+		fmt.printfln("--- caret column on a %d MB single-line buffer ---", mb)
+		fmt.printfln("  uncapped scan   : %.2f ms  <- what ran every frame", d0)
+		fmt.printfln("  first call      : %.2f ms (col=%d, 0 = beyond cap, reported as unknown)", d1, c1)
+		fmt.printfln("  cached repeat   : %.4f ms", d2)
+		fmt.printfln("  cap             : %d MB", STATUS_COL_CAP / (1024 * 1024))
+		bad := 0
+		if d1 > 16 {
+			fmt.printfln("  FAIL: first call exceeds one frame (%.2f ms)", d1)
+			bad += 1
+		}
+		if sc != 6 {
+			fmt.printfln("  FAIL: short line reports col %d, want 6", sc)
+			bad += 1
+		} else {
+			fmt.println("  short line still reports an exact column: OK")
+		}
+		fmt.printfln("colperftest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad replacetest` covers the two ways Replace All lost data.
 	//
 	// It pushed one undo entry per match. UNDO_MAX is 200 and evicts the oldest,
