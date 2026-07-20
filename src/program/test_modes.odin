@@ -940,6 +940,78 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad savepathtest <dir>` pins the ownership seam in the save path.
+	// doc_save_err replaces doc.path with a fresh buffer and frees the old one, so
+	// any caller that captured doc.path before the call is holding freed memory
+	// afterwards. That is what Ctrl+S did, and the failure dialog -- the one whose
+	// job is to name the file that would not save -- was the reader.
+	//
+	// Pointer identity is the deterministic check. Reading the freed bytes would
+	// usually still return the right characters, so a content comparison would
+	// pass with the bug present and prove nothing.
+	if os.args[1] == "savepathtest" && len(os.args) > 2 {
+		dir := os.args[2]
+		path := fmt.tprintf("%s\\savepath.txt", dir)
+		if werr := os.write_entire_file(path, transmute([]u8)string("hello\n")); werr != nil {
+			fmt.eprintfln("savepathtest: could not seed %q: %v", path, werr)
+			return true
+		}
+
+		t: plat.Text
+		plat.text_load_faces(&t)
+		a: App
+		menu_init(&a.menu)
+		if !app_open_path(&a, path) {
+			fmt.eprintfln("savepathtest: could not open %q", path)
+			return true
+		}
+		defer app_destroy(&a)
+		doc := app_active(&a)
+		bad := 0
+
+		fmt.println("--- the hazard: doc_save_err replaces the buffer a caller may alias ---")
+		before := raw_data(doc.path)
+		aliased := doc.path // exactly what the old Ctrl+S captured
+		doc_insert_text(doc, transmute([]u8)string("x"))
+		err := doc_save_err(doc, aliased)
+		after := raw_data(doc.path)
+		replaced := before != after
+		fmt.printfln("  save err=%v", err)
+		fmt.printfln(
+			"  doc.path buffer replaced by the save: %v %s",
+			replaced,
+			"OK (so an alias captured before the call is dangling)" if replaced else "FAIL",
+		)
+		if !replaced || err != .None {bad += 1}
+
+		fmt.println("--- the fix: Ctrl+S must not hand report_save an alias of doc.path ---")
+		// Drive the real command. If it still aliased, it would be formatting the
+		// buffer the save just freed.
+		doc_insert_text(doc, transmute([]u8)string("y"))
+		pre := raw_data(doc.path)
+		command_dispatch(.Save, {}, &a, nil, &t, 10)
+		post := raw_data(doc.path)
+		saved_ok := !doc.modified
+		fmt.printfln("  Ctrl+S completed, modified=%v %s", doc.modified, "OK" if saved_ok else "FAIL")
+		fmt.printfln("  buffer replaced again: %v (expected, the save re-clones)", pre != post)
+		if !saved_ok {bad += 1}
+
+		// Content must survive both saves: the original plus the two inserts.
+		got, rerr := os.read_entire_file(path, context.temp_allocator)
+		content_ok := rerr == nil && len(got) == len("hello\n") + 2
+		fmt.printfln(
+			"  file on disk = %q (%d bytes, want %d) %s",
+			string(got) if rerr == nil else "<unreadable>",
+			len(got),
+			len("hello\n") + 2,
+			"OK" if content_ok else "FAIL",
+		)
+		if !content_ok {bad += 1}
+
+		fmt.printfln("savepathtest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad drawcount <file>` measures what a frame actually costs in draw
 	// calls, because the claim "an always-on line-number gutter roughly doubles
 	// per-frame draw calls" was arithmetic from constants, not a measurement, and

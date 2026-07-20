@@ -423,6 +423,8 @@ request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
 				np, ok := plat.file_save_dialog(w.hwnd)
 				if !ok {return}
 				p = np
+			} else {
+				p = strings.clone(p, context.temp_allocator) // see .Save above
 			}
 			// Aborting the close is right — but say why, or the user sees the tab
 			// simply refuse to close with no explanation and may force-quit.
@@ -543,6 +545,13 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			if np, ok := plat.file_save_dialog(w.hwnd); ok {
 				p = np
 			}
+		} else {
+			// doc_save_err frees doc.path (doc.odin), and p aliases that buffer on a
+			// re-save -- so report_save formatted freed memory, on the most-used
+			// command, and worst on the failure path: the dialog whose whole job is
+			// naming the file that would not save is the one reading it. Give p the
+			// same lifetime the dialog branch already has.
+			p = strings.clone(p, context.temp_allocator)
 		}
 		if p != "" {
 			report_save(doc_save_err(doc, p), p, w)
