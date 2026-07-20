@@ -76,6 +76,20 @@ CONTENT_TOP := TAB_STRIP_H_96 + MENU_BAR_H_96 + TEXT_MARGIN_Y_96
 // inside a widget scale without every draw proc taking a context parameter.
 UI_SCALE: f32 = 1
 
+// Extra top inset, below the menu, for the FILTER banner (Ctrl+L). It names the
+// active filter and how to leave it. Only nonzero while filtering; set once per
+// frame by doc_update_top_inset and added by the row math below, so the drawn
+// rows, the hit-test and the row count all shift together. Without the shift the
+// banner (taller than the 10px menu/content gap) was drawn half under the menu
+// bar, cut off and unreadable.
+FILTER_BANNER_H: f32 = 0
+FILTER_BANNER_H_96 :: f32(22)
+
+// The banner shows exactly when the filter view is engaged (see render_frame).
+doc_update_top_inset :: proc(doc: ^Document) {
+	FILTER_BANNER_H = sx(FILTER_BANNER_H_96) if (doc != nil && doc.filter && doc.find.active) else 0
+}
+
 // Scale a 96-DPI offset. Sign-preserving, and never rounds a non-zero value away
 // to nothing (a 1px gap must stay visible).
 sx :: #force_inline proc(v: f32) -> f32 {
@@ -92,9 +106,9 @@ sx :: #force_inline proc(v: f32) -> f32 {
 // per row: a full row off by row 40.
 line_height :: #force_inline proc(px: f32) -> f32 {return f32(int(px * LINE_SPACING + 0.5))}
 // Text baseline y for visible row r (what text_draw wants).
-row_baseline_y :: #force_inline proc(px: f32, r: int) -> f32 {return px + CONTENT_TOP + f32(r) * line_height(px)}
+row_baseline_y :: #force_inline proc(px: f32, r: int) -> f32 {return px + CONTENT_TOP + FILTER_BANNER_H + f32(r) * line_height(px)}
 // Top y of a line-height-tall highlight box for row r.
-row_rect_y :: #force_inline proc(px: f32, r: int) -> f32 {return CONTENT_TOP + f32(r) * line_height(px)}
+row_rect_y :: #force_inline proc(px: f32, r: int) -> f32 {return CONTENT_TOP + FILTER_BANNER_H + f32(r) * line_height(px)}
 // Left x of column `col` (monospace).
 // Width of the line-number gutter, 0 when there isn't one. Set once per frame
 // (doc_update_gutter) and added by BOTH col_x and col_at_x, so the drawn column
@@ -125,7 +139,7 @@ doc_view_cols :: #force_inline proc(width, char_w: f32) -> int {
 
 col_x :: #force_inline proc(char_w: f32, col: int) -> f32 {return TEXT_MARGIN_X + GUTTER_W + f32(col) * char_w}
 // Inverse mappings for hit-testing a client-space pixel.
-row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - CONTENT_TOP) / line_height(px))}
+row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - CONTENT_TOP - FILTER_BANNER_H) / line_height(px))}
 col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w + 0.5))}
 // Which cell a point is INSIDE, as opposed to col_at_x, which rounds to the
 // nearest caret boundary because that is what click-to-place-caret wants.
@@ -243,9 +257,9 @@ doc_bottom_bar_h :: proc(doc: ^Document) -> f32 {
 	return sx(20) // status line
 }
 
-// Visible document rows, excluding the bottom bar.
+// Visible document rows, excluding the bottom bar and the filter banner inset.
 doc_visible_rows :: proc(doc: ^Document, height, line_h: f32) -> int {
-	return max(0, int((height - CONTENT_TOP - doc_bottom_bar_h(doc)) / line_h))
+	return max(0, int((height - CONTENT_TOP - FILTER_BANNER_H - doc_bottom_bar_h(doc)) / line_h))
 }
 
 // Highest filter_top that still fills the screen. One definition: the wheel, the

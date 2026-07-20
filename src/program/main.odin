@@ -147,6 +147,9 @@ main :: proc() {
 			window.resized = false
 		}
 		doc := app_active(&app)
+		// The filter banner (Ctrl+L) insets the content top; set it before any
+		// row math this frame so the rows, hit-test and count agree.
+		doc_update_top_inset(doc)
 		// Rows stop above the find/status bar, so no row is drawn behind it and
 		// no click in that strip lands on a row the user cannot see.
 		rows := doc_visible_rows(doc, f32(window.height), line_h)
@@ -519,6 +522,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	gfx, text, quad_pipe, window := rc.gfx, rc.text, rc.quads, rc.window
 	px, char_w, line_h := rc.px, rc.char_w, rc.line_h
 	doc := app_active(rc.app)
+	doc_update_top_inset(doc) // filter banner inset; must match the main loop's value
 	rows := doc_visible_rows(doc, f32(window.height), line_h)
 	doc_update_gutter(doc, char_w) // resize repaints come through here too
 	// Recompute the wrap width here (not just in the main loop) so word wrap
@@ -591,14 +595,16 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// exactly where menus and the palette drop down, and drawing it afterwards
 	// painted it over them.
 	if doc.filter && doc.find.active {
-		bh := sx(20)
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, CONTENT_TOP - bh}, size = {w, bh}, color = {0.18, 0.26, 0.20, 1}}})
+		// Sits in the reserved inset below the menu bar (see FILTER_BANNER_H), so
+		// it no longer draws half under the menu or over the first matching line.
+		by := CHROME_TOP
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, by}, size = {w, FILTER_BANNER_H}, color = {0.18, 0.26, 0.20, 1}}})
 		msg := fmt.tprintf(
 			"FILTER  %d matching lines%s   —   Ctrl+L shows the whole file",
 			len(doc.filter_lines),
 			"" if doc_filtering(doc) else " (searching...)",
 		)
-		plat.text_draw(gfx, text, msg, sx(12), CONTENT_TOP - sx(6), UI_SMALL_PX, {0.70, 0.90, 0.74, 1})
+		plat.text_draw(gfx, text, msg, sx(12), by + FILTER_BANNER_H - sx(7), UI_SMALL_PX, {0.70, 0.90, 0.74, 1})
 	}
 
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
