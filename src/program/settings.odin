@@ -40,6 +40,7 @@ Settings :: struct {
 	zoom_pct:        int, // viewport zoom, applied on top of font_size
 	font_family:     string, // family NAME, not a path — paths differ per machine
 	font_style:      plat.Font_Style,
+	link_style:      Link_Style, // when/how clickable links are shown
 }
 
 // Families present on this machine, in the curated order. Recomputed when the
@@ -70,6 +71,7 @@ settings_default :: proc() -> Settings {
 		zoom_pct = ZOOM_DEFAULT,
 		font_family = "Consolas",
 		font_style = .Regular,
+		link_style = .Hover,
 	}
 }
 
@@ -117,6 +119,10 @@ settings_load :: proc() -> Settings {
 			if n, pok := strconv.parse_int(parts[1]); pok && n >= 0 && n <= int(max(plat.Font_Style)) {
 				s.font_style = plat.Font_Style(n)
 			}
+		case "link_style":
+			if n, pok := strconv.parse_int(parts[1]); pok && n >= 0 && n <= int(max(Link_Style)) {
+				s.link_style = Link_Style(n)
+			}
 		}
 	}
 	return s
@@ -135,13 +141,14 @@ settings_save :: proc(s: Settings) -> bool {
 	if s.zoom_pct == 0 {s.zoom_pct = ZOOM_DEFAULT}
 	s.zoom_pct = clamp(s.zoom_pct, ZOOM_STEPS[0], ZOOM_STEPS[len(ZOOM_STEPS) - 1])
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\nfont_family %s\nfont_style %d\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\nfont_family %s\nfont_style %d\nlink_style %d\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
 		s.zoom_pct,
 		s.font_family if s.font_family != "" else "Consolas",
 		int(s.font_style),
+		int(s.link_style),
 	)
 	return plat.file_write_atomic(path, transmute([]u8)body)
 }
@@ -159,6 +166,7 @@ SETTINGS_ROWS := []Setting_Row {
 	{"Restore session on launch", "Reopen the tabs you had open, including unsaved ones"},
 	{"Word wrap new documents", "Long lines fold to the window width instead of running off"},
 	{"Zoom", "Ctrl+= / Ctrl+- / Ctrl+0 anywhere, or Ctrl+wheel"},
+	{"Show links", "When URLs and paths are highlighted (Ctrl+click always opens)"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
@@ -196,6 +204,10 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 	case 2:
 		zoom_adjust(rc, dir if dir != 0 else 0) // Enter on this row resets
 		return // zoom_adjust already applied and saved
+	case 3:
+		n := int(max(Link_Style)) + 1
+		step := dir if dir != 0 else 1 // Enter cycles forward; Left/Right step
+		s.link_style = Link_Style((int(s.link_style) + step + n) % n)
 	}
 	settings_apply(rc)
 	settings_save(s^)
@@ -242,6 +254,8 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			val = "On" if app.settings.wrap_default else "Off"
 		case 2:
 			val = fmt.tprintf("%d%%", app.settings.zoom_pct)
+		case 3:
+			val = link_style_name(app.settings.link_style)
 		}
 		vc := [4]f32{0.55, 0.85, 0.60, 1} if val != "Off" else [4]f32{0.55, 0.60, 0.70, 1}
 		plat.text_draw(gfx, t, val, width - sx(220), y, UI_PX, vc)

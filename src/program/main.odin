@@ -618,25 +618,30 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		}
 	}
 
-	// Links, only while Ctrl is held — that is the activation gesture, and it is
-	// also why this costs nothing the rest of the time. One list, produced once,
-	// consumed by the underline below, the glyph colouring inside doc_draw, and
-	// the hover and click in the main loop.
+	// Links. When shown (always, or only on Ctrl per the Show-links setting) the
+	// list is produced once and consumed by the underline here, the glyph
+	// colouring inside doc_draw, and the hover/click in the main loop. The
+	// underline is drawn while Ctrl is held (the activation affordance) or when the
+	// setting forces it; the "tint" style shows colour without an underline.
 	links: []Link_Hit
-	if plat.key_ctrl_down() && !doc.filter {
+	ctrl := plat.key_ctrl_down()
+	style := rc.app.settings.link_style
+	if !doc.filter && (ctrl || style != .Hover) {
 		links = links_layout(doc, text, rows)
-		for h in links {
-			plat.quads_draw(
-				gfx,
-				quad_pipe,
-				[]plat.Quad {
-					{
-						pos = {col_x(char_w, h.col), row_baseline_y(px, h.row) + sx(2)},
-						size = {f32(h.cells) * char_w, max(sx(1), 1)},
-						color = LINK_COL,
+		if ctrl || style == .Underline {
+			for h in links {
+				plat.quads_draw(
+					gfx,
+					quad_pipe,
+					[]plat.Quad {
+						{
+							pos = {col_x(char_w, h.col), row_baseline_y(px, h.row) + sx(2)},
+							size = {f32(h.cells) * char_w, max(sx(1), 1)},
+							color = LINK_COL,
+						},
 					},
-				},
-			)
+				)
+			}
 		}
 	}
 

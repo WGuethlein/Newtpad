@@ -26,6 +26,27 @@ Link_Kind :: enum u8 {
 	Line_Ref, // any of the above with a :123 or :123:45 suffix
 }
 
+// How links are shown. Activation is always Ctrl+click (a plain click still
+// edits), so this only governs the visual affordance, which VS Code-style
+// Ctrl-only hiding makes undiscoverable until you know to hold Ctrl.
+Link_Style :: enum u8 {
+	Hover, // decorate only while Ctrl is held (default)
+	Underline, // always underline + tint
+	Tint, // always tint, no underline (underline still appears on Ctrl)
+}
+
+link_style_name :: proc(s: Link_Style) -> string {
+	switch s {
+	case .Hover:
+		return "On Ctrl"
+	case .Underline:
+		return "Always, underlined"
+	case .Tint:
+		return "Always, tinted"
+	}
+	return "?"
+}
+
 // A link found inside one line of text. Offsets are bytes within that line, not
 // the document — the caller knows which line it scanned.
 Link :: struct {
