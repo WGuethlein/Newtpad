@@ -115,6 +115,21 @@ row_rect_y :: #force_inline proc(px: f32, r: int) -> f32 {return CONTENT_TOP + F
 // and the hit-tested column cannot disagree about where text begins.
 GUTTER_W: f32 = 0
 
+// Horizontal scroll offset, in cells (non-wrap only). col_x subtracts it and
+// col_at_x/cell_at_x add it, so the caret, selection, find highlights, links,
+// the drawn text and every hit-test shift together through the one column-
+// geometry primitive — the same single-source discipline the gutter uses. Zero
+// while wrapping or filtering (no horizontal scroll there). Mirrored from
+// doc.h_scroll once per frame by doc_update_hscroll.
+H_SCROLL: int = 0
+
+// Mirror the active doc's horizontal scroll into H_SCROLL for this frame, off
+// unless the document is in the plain (non-wrap, non-filter) view. Set alongside
+// the gutter/top-inset so the whole frame agrees.
+doc_update_hscroll :: proc(doc: ^Document) {
+	H_SCROLL = doc.h_scroll if (doc != nil && !doc.wrap && !doc.filter) else 0
+}
+
 // Recompute the gutter for the active document. Only the filter view has one:
 // its whole purpose is showing lines out of context, which is meaningless
 // without saying which lines they are.
@@ -137,10 +152,10 @@ doc_view_cols :: #force_inline proc(width, char_w: f32) -> int {
 	return max(1, int((width - TEXT_MARGIN_X - GUTTER_W - SCROLLBAR_W) / char_w))
 }
 
-col_x :: #force_inline proc(char_w: f32, col: int) -> f32 {return TEXT_MARGIN_X + GUTTER_W + f32(col) * char_w}
+col_x :: #force_inline proc(char_w: f32, col: int) -> f32 {return TEXT_MARGIN_X + GUTTER_W + f32(col - H_SCROLL) * char_w}
 // Inverse mappings for hit-testing a client-space pixel.
 row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - CONTENT_TOP - FILTER_BANNER_H) / line_height(px))}
-col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w + 0.5))}
+col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return H_SCROLL + max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w + 0.5))}
 // Which cell a point is INSIDE, as opposed to col_at_x, which rounds to the
 // nearest caret boundary because that is what click-to-place-caret wants.
 // Hit-testing a drawn span needs this one: with col_at_x the boundary sits half
@@ -148,7 +163,7 @@ col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return max(0, int((mx - 
 // its last cell was not clickable at all. Same function, wrong space — the
 // §6j bug class, caught here by asserting the drawn span against the clickable
 // span at both edges.
-cell_at_x :: #force_inline proc(char_w, mx: f32) -> int {return max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w))}
+cell_at_x :: #force_inline proc(char_w, mx: f32) -> int {return H_SCROLL + max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w))}
 
 // --- word wrap: break a logical line into visual rows at doc.view_cols cells ---
 
@@ -371,6 +386,7 @@ Document :: struct {
 	wrap:       bool, // word-wrap this document at view_cols
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
+	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)
 	status_cursor: int, // cursor pos the cached status line was computed for
 	status_line:   int, // 1-based line of the cursor (0 = beyond the cap / unknown)
 	// Same for the column, which was neither cached nor capped and cost an
@@ -1461,6 +1477,22 @@ doc_max_top :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 	return p
 }
 
+// Largest horizontal scroll (cells) that still shows content: the widest
+// currently-visible line minus the viewport width. Scoped to the visible rows,
+// never the whole file, so it costs about what a frame's draw does. 0 while
+// wrapping/filtering (no horizontal scroll there).
+doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
+	if doc == nil || doc.wrap || doc.filter {return 0}
+	widest := 0
+	it := visible_begin(doc, t, rows)
+	for {
+		_, start, end, _, ok := visible_next(&it)
+		if !ok {break}
+		if w := line_cell_col(doc, t, start, end); w > widest {widest = w}
+	}
+	return max(0, widest - max(1, doc.view_cols))
+}
+
 // Scroll the viewport by `delta` visual rows (up when negative), clamped so the
 // last line can't scroll above the bottom row.
 doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta, rows: int) {
@@ -1481,6 +1513,19 @@ doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta, rows: int) {
 
 // Keep the caret on screen: scroll so its visual row is within [top, top+rows).
 doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
+	// Horizontal follow first (plain view only; wrap/filter have no h-scroll):
+	// keep the caret's column inside [h_scroll, h_scroll+view_cols) so typing or
+	// arrowing off the right edge pans instead of hiding the caret.
+	if !doc.wrap && !doc.filter {
+		crow := row_start_capped(doc, doc.cursor)
+		ccol := line_cell_col(doc, t, crow, doc.cursor)
+		vc := max(1, doc.view_cols)
+		if ccol < doc.h_scroll {
+			doc.h_scroll = ccol
+		} else if ccol >= doc.h_scroll + vc {
+			doc.h_scroll = ccol - vc + 1
+		}
+	}
 	cls := visual_row_start(doc, t, doc.cursor, doc.view_cols) if doc.wrap else row_start_capped(doc, doc.cursor)
 	if cls < doc.top {
 		doc.top = cls

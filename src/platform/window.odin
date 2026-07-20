@@ -326,6 +326,10 @@ key_ctrl_down :: proc() -> bool {
 	return (int(win.GetKeyState(win.VK_CONTROL)) & 0x8000) != 0
 }
 
+key_shift_down :: proc() -> bool {
+	return (int(win.GetKeyState(win.VK_SHIFT)) & 0x8000) != 0
+}
+
 // Ask the window to close, exactly as the ✕ button does.
 window_request_close :: proc(w: ^Window) {
 	win.PostMessageW(w.hwnd, win.WM_CLOSE, 0, 0)

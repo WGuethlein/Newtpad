@@ -1644,6 +1644,59 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad hscrolltest` guards the horizontal-scroll seam: with the viewport
+	// panned right by H_SCROLL cells, the drawn column (col_x) and the hit-tested
+	// column (cell_at_x / doc_pos_at) must agree — the §6j "right function, wrong
+	// space" class, here the space being the horizontal offset. Checks the left
+	// edge, middle and right edge of the viewport at several pan offsets.
+	if os.args[1] == "hscrolltest" {
+		bad := 0
+		t: plat.Text
+		plat.text_load_faces(&t)
+		px := BASE_PX
+		cw := plat.text_char_width(&t, px, .Doc)
+		line := strings.repeat("x", 400) // ASCII: cell index == byte index
+		content := strings.concatenate({line, "\n"})
+		doc := doc_from_content(transmute([]u8)content, "", .UTF8)
+		defer doc_close(&doc)
+		doc.wrap = false
+		doc.view_cols = 80
+		doc.view_rows = 5
+		rows := 5
+		y := row_baseline_y(px, 0) - line_height(px) * 0.5
+
+		for hs in ([]int{0, 50, 100, 250}) {
+			doc.h_scroll = clamp(hs, 0, doc_max_hscroll(&doc, &t, rows))
+			doc_update_hscroll(&doc)
+			for cell in ([]int{doc.h_scroll, doc.h_scroll + doc.view_cols / 2, doc.h_scroll + doc.view_cols - 1}) {
+				base_x := col_x(cw, cell)
+				// cell_at_x truncates: any point inside the cell maps to it.
+				gc := cell_at_x(cw, base_x + cw*0.5)
+				// doc_pos_at rounds to the nearest caret boundary; bias left so it
+				// lands on this cell, then (ASCII) the byte offset equals the cell.
+				gb := doc_pos_at(&doc, &t, i32(base_x + cw*0.2), i32(y), px, cw, rows)
+				if gc != cell || gb != cell {
+					fmt.printfln("  FAIL hs=%d cell=%d -> cell_at_x=%d pos=%d", doc.h_scroll, cell, gc, gb)
+					bad += 1
+				}
+			}
+		}
+		// Wrapping disables horizontal scroll (H_SCROLL forced to 0).
+		doc.wrap = true
+		doc.h_scroll = 100
+		doc_update_hscroll(&doc)
+		if H_SCROLL != 0 {
+			fmt.println("  FAIL: wrap did not disable horizontal scroll")
+			bad += 1
+		}
+		doc.wrap = false
+		doc.h_scroll = 0
+		doc_update_hscroll(&doc) // leave the global reset
+		if bad == 0 {fmt.println("  drawn column == hit-tested column at every pan offset and edge: OK")}
+		fmt.printfln("hscrolltest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad replacetest` covers the two ways Replace All lost data.
 	//
 	// It pushed one undo entry per match. UNDO_MAX is 200 and evicts the oldest,

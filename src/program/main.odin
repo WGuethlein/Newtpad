@@ -162,6 +162,10 @@ main :: proc() {
 		doc_update_gutter(doc, char_w) // before view_cols: the gutter narrows the text
 		doc.view_cols = doc_view_cols(f32(window.width), char_w)
 		doc.view_rows = rows
+		// Horizontal scroll: clamp to real content, then mirror into H_SCROLL for
+		// this frame so the whole frame's column geometry agrees.
+		doc.h_scroll = clamp(doc.h_scroll, 0, doc_max_hscroll(doc, &text, rows))
+		doc_update_hscroll(doc)
 		// Re-center on the caret only when it actually moves on THIS tab — never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
 		active_before := app.active
@@ -404,6 +408,10 @@ main :: proc() {
 				// Stop at the point the list underfills the screen, rather than
 				// letting the last line scroll to the top over empty rows.
 				doc.filter_top = clamp(doc.filter_top + window.scroll_delta, 0, doc_filter_max_top(doc, rows))
+			} else if plat.key_shift_down() && !doc.wrap {
+				// Shift+wheel pans horizontally (no-op when wrapping — nothing runs
+				// off the edge then). A few cells per notch, clamped to real content.
+				doc.h_scroll = clamp(doc.h_scroll + window.scroll_delta * 4, 0, doc_max_hscroll(doc, &text, rows))
 			} else {
 				doc_scroll(doc, &text, window.scroll_delta, rows)
 			}
@@ -541,6 +549,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// Recompute the wrap width here (not just in the main loop) so word wrap
 	// re-flows live during a resize, which repaints through this path.
 	doc.view_cols = doc_view_cols(f32(window.width), char_w)
+	doc_update_hscroll(doc) // mirror the (already-clamped) horizontal offset
 
 	plat.text_frame_begin(gfx, text) // resets the recycle guard and grows the atlas if owed
 	plat.gfx_begin_frame(gfx, 0.09, 0.11, 0.16)
@@ -580,6 +589,16 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	}
 
 	cx, cy, caret, bottom := doc_draw(gfx, text, doc, px, char_w, rows, links)
+
+	// Horizontal scroll draws each line shifted left, so glyphs left of the first
+	// visible cell bleed into the left margin. Cover that thin strip with the
+	// background (the caret sits at/after the margin, so it is never covered; the
+	// right-side overrun is already hidden by the scrollbar drawn below).
+	if H_SCROLL > 0 {
+		ctop := CONTENT_TOP + FILTER_BANNER_H
+		cbot := f32(window.height) - doc_bottom_bar_h(doc)
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, ctop}, size = {TEXT_MARGIN_X, cbot - ctop}, color = {0.09, 0.11, 0.16, 1}}})
+	}
 
 	// Scrollbar (byte-proportional, below the tab strip) + caret.
 	bars: [4]plat.Quad
