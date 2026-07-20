@@ -1182,6 +1182,27 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad resavetest <file>` opens a file, edits it and saves, so an external
+	// checker can assert what the save preserved. The atomic write used to rename
+	// a brand-new temp file over the target, which substitutes a fresh file and
+	// silently drops the original's attributes, ACLs and alternate data streams --
+	// the properties are easiest to observe from outside, hence this mode.
+	if os.args[1] == "resavetest" && len(os.args) > 2 {
+		path := os.args[2]
+		doc, ok := doc_open(path)
+		if !ok {
+			fmt.eprintfln("resavetest: could not open %q", path)
+			return true
+		}
+		defer doc_close(&doc)
+		doc.cursor = doc.pt.length
+		doc.anchor = doc.cursor
+		doc_insert_text(&doc, transmute([]u8)string("appended\n"))
+		err := doc_save_err(&doc, path)
+		fmt.printfln("resavetest: save err=%v size=%d", err, doc.pt.length)
+		return true
+	}
+
 	// `newtpad colperftest <mb>` measures the status bar's caret column on a
 	// single-line file -- minified JSON, an unrotated log, a CSV with no newlines.
 	// doc_cursor_col called pt_line_start, an uncapped backward scan, and the

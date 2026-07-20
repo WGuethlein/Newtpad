@@ -13,8 +13,11 @@ foreign import kernel32_fs "system:Kernel32.lib"
 @(default_calling_convention = "system")
 foreign kernel32_fs {
 	GetDriveTypeW :: proc(lpRootPathName: win.wstring) -> u32 ---
+	ReplaceFileW :: proc(lpReplacedFileName, lpReplacementFileName, lpBackupFileName: win.wstring, dwReplaceFlags: win.DWORD, lpExclude, lpReserved: rawptr) -> win.BOOL ---
 }
 DRIVE_FIXED :: 3
+REPLACEFILE_WRITE_THROUGH :: win.DWORD(0x1)
+REPLACEFILE_IGNORE_MERGE_ERRORS :: win.DWORD(0x2)
 
 FILE_MMAP_THRESHOLD :: 16 * 1024 * 1024 // copy below, mmap above
 
@@ -195,6 +198,12 @@ file_write_atomic_err :: proc(path: string, data: []u8) -> Write_Error {
 		}
 		total += int(written)
 	}
+	// Durability before the rename. Without it the rename can commit while the
+	// bytes are still only in the cache, so a power loss leaves a zero-length file
+	// where the document was -- and the original is already gone. That is strictly
+	// worse than the plain overwrite this atomic scheme replaced, which is the
+	// whole reason the scheme exists.
+	win.FlushFileBuffers(h)
 	win.CloseHandle(h)
 	if total != len(data) {
 		win.DeleteFileW(wtmp)
@@ -202,7 +211,22 @@ file_write_atomic_err :: proc(path: string, data: []u8) -> Write_Error {
 	}
 
 	wdst := win.utf8_to_wstring(path, context.temp_allocator)
-	if !win.MoveFileExW(wtmp, wdst, win.MOVEFILE_REPLACE_EXISTING) {
+	// Replacing an existing file goes through ReplaceFileW, which keeps the
+	// original's ACLs, attributes, creation time and alternate data streams.
+	// MoveFileExW substitutes a brand-new file, so every save silently reset the
+	// permissions on anything with non-default ACLs -- a config under a hardened
+	// directory, a file in a shared folder -- and dropped Zone.Identifier with it.
+	// ReplaceFileW requires the target to exist, so a first save (Save As to a new
+	// name) still takes the rename path below.
+	if win.GetFileAttributesW(wdst) != win.INVALID_FILE_ATTRIBUTES {
+		if ReplaceFileW(wdst, wtmp, nil, REPLACEFILE_WRITE_THROUGH | REPLACEFILE_IGNORE_MERGE_ERRORS, nil, nil) {
+			return .None
+		}
+		// Fall through rather than fail: ReplaceFileW does not work on every
+		// filesystem or across volumes, and a save that succeeds without preserving
+		// metadata beats a save that refuses to happen.
+	}
+	if !win.MoveFileExW(wtmp, wdst, win.MOVEFILE_REPLACE_EXISTING | win.MOVEFILE_WRITE_THROUGH) {
 		win.DeleteFileW(wtmp)
 		return .Replace
 	}
