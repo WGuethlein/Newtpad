@@ -1223,6 +1223,13 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			{"see the readme for details", "", 0, .Path},
 			// Quoted paths end at the quote.
 			{`"C:\dir\a.txt" and more`, `C:\dir\a.txt`, 0, .Path},
+			// Markdown links: only the target inside the parens is the link.
+			{"[docs](https://example.com/y)", "https://example.com/y", 0, .URL},
+			{"see [the log](build/out.log:12) here", "build/out.log", 12, .Line_Ref},
+			{"a [plain](word) is not a link", "", 0, .Path},
+			// smb:// shares are detected as paths (link_resolve rewrites to UNC).
+			{"open smb://server/share/a.txt please", "smb://server/share/a.txt", 0, .Path},
+			{"log smb://server/share/a.txt:7 there", "smb://server/share/a.txt", 7, .Line_Ref},
 		}
 
 		fmt.println("--- detection ---")

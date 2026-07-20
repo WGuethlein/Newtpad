@@ -92,6 +92,15 @@ is_alpha :: proc(b: u8) -> bool {return (b >= 'a' && b <= 'z') || (b >= 'A' && b
 @(private = "file")
 is_digit :: proc(b: u8) -> bool {return b >= '0' && b <= '9'}
 
+// smb://host/share/path is how a Unix/macOS tool or a chat client writes a
+// Windows network share. Windows has no smb: protocol handler, so we detect it
+// here and link_resolve rewrites it to the UNC form \\host\share\path, which
+// then flows through the same path-safety checks as any other path.
+@(private = "file")
+is_smb_url :: proc(s: string) -> bool {
+	return len(s) > 6 && strings.equal_fold(s[:6], "smb://")
+}
+
 // Known text-ish extensions. A path ending in one of these is something we are
 // willing to open in a tab; everything else is revealed in Explorer instead.
 // Kept in step with the extensions install.ps1 registers.
@@ -231,6 +240,31 @@ links_scan :: proc(text: string, allocator := context.temp_allocator) -> []Link 
 			if matched {continue}
 		}
 
+		// --- smb:// share URLs (resolved as Windows UNC paths) --------------
+		// Rejected by looks_like_path (has_uri_scheme), so caught here first;
+		// link_resolve rewrites the token to \\host\share\path.
+		if (b == 's' || b == 'S') && is_smb_url(text[i:]) {
+			j := i + 6
+			for j < len(text) && !is_delim(text[j]) {j += 1}
+			run := trim_trailing(text[i:j])
+			if len(run) > 6 {
+				tl, ln, cl := split_line_ref(run)
+				append(
+					&out,
+					Link {
+						start = i,
+						len = len(run),
+						kind = .Line_Ref if ln > 0 else .Path,
+						line = ln,
+						col = cl,
+						target_len = tl,
+					},
+				)
+				i += len(run)
+				continue
+			}
+		}
+
 		// --- UNC paths ------------------------------------------------------
 		if b == '\\' && i + 1 < len(text) && text[i + 1] == '\\' {
 			j := i + 2
@@ -276,6 +310,48 @@ links_scan :: proc(text: string, allocator := context.temp_allocator) -> []Link 
 				i += len(run)
 				continue
 			}
+		}
+
+		// --- markdown links: [label](target) -------------------------------
+		// The clickable part is the target inside the parens; only it underlines
+		// and resolves. Without this the whole "[label](http://x)" run is taken
+		// as one path token — parens are not delimiters, so wiki URLs like
+		// /a_(b) survive — and the markdown link resolved as a bogus relative
+		// path and never opened.
+		if b == '[' {
+			if rb := strings.index_byte(text[i:], ']'); rb > 0 && i + rb + 1 < len(text) && text[i + rb + 1] == '(' {
+				us := i + rb + 2 // start of the target, just past "]("
+				j := us
+				for j < len(text) && text[j] != ')' && !is_delim(text[j]) {j += 1}
+				if j < len(text) && text[j] == ')' && j > us {
+					inner := text[us:j]
+					if plat.url_is_openable(inner) {
+						append(&out, Link{start = us, len = j - us, kind = .URL, target_len = j - us})
+						i = j + 1
+						continue
+					}
+					tl, ln, cl := split_line_ref(inner)
+					if tl > 0 && (is_smb_url(inner[:tl]) || looks_like_path(inner[:tl])) {
+						append(
+							&out,
+							Link {
+								start = us,
+								len = j - us,
+								kind = .Line_Ref if ln > 0 else .Path,
+								line = ln,
+								col = cl,
+								target_len = tl,
+							},
+						)
+						i = j + 1
+						continue
+					}
+				}
+			}
+			// Not a markdown link: skip '[' so its inner content is still scanned
+			// (e.g. "[C:\x]" continues to find the drive path inside).
+			i += 1
+			continue
 		}
 
 		// --- relative paths and bare file:line refs -------------------------
@@ -412,6 +488,16 @@ link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, 
 	if l.kind == .URL {
 		if !plat.url_is_openable(raw) {return {}, false}
 		return Link_Target{url = strings.clone(raw, context.temp_allocator), is_url = true}, true
+	}
+
+	// smb://host/share/path -> \\host\share\path. Windows has no smb: handler, so
+	// this becomes an ordinary UNC path and takes the path branch: stat'd first,
+	// text-ish opens in a tab, anything else is revealed in Explorer.
+	if is_smb_url(raw) {
+		body, _ := strings.replace_all(raw[6:], "/", "\\", context.temp_allocator)
+		abs := strings.concatenate({"\\\\", body}, context.temp_allocator)
+		if exists, _ := plat.path_exists(abs); !exists {return {}, false}
+		return Link_Target{path = abs, line = l.line, col = l.col}, true
 	}
 
 	abs := ""
