@@ -18,6 +18,35 @@ Gfx :: struct {
 	buf_w:         i32, // fixed swapchain buffer size (>= any window size)
 	buf_h:         i32,
 	tearing:       bool, // allow-tearing supported
+	// The GPU went away: driver update, TDR (a hung shader anywhere on the
+	// system), eGPU unplug, a Remote Desktop session change. Routine events, not
+	// exotic ones. Every D3D object is invalid afterwards and every call on them
+	// is undefined, so the frame loop must stop drawing the moment this is set.
+	lost:          bool,
+}
+
+// Result of presenting a frame. Anything other than .Ok means the device is
+// gone and the caller must stop rendering.
+Device_Status :: enum {
+	Ok,
+	Lost,
+}
+
+// Why the device was lost, for the message the user gets. HRESULTs here are the
+// documented DXGI removal reasons.
+gfx_lost_reason :: proc(gfx: ^Gfx) -> string {
+	if gfx.device == nil {return "the graphics device was released"}
+	switch gfx.device->GetDeviceRemovedReason() {
+	case dxgi.ERROR_DEVICE_HUNG:
+		return "the graphics driver stopped responding"
+	case dxgi.ERROR_DEVICE_REMOVED:
+		return "the graphics device was removed or the driver was updated"
+	case dxgi.ERROR_DEVICE_RESET:
+		return "the graphics device was reset"
+	case dxgi.ERROR_DRIVER_INTERNAL_ERROR:
+		return "the graphics driver reported an internal error"
+	}
+	return "the graphics device became unavailable"
 }
 
 // Whether the OS/driver supports DXGI allow-tearing (Win10 1607+). Needed so a
@@ -96,9 +125,19 @@ gfx_init :: proc(w: ^Window) -> (gfx: Gfx, ok: bool) {
 @(private)
 gfx_create_rtv :: proc(gfx: ^Gfx) {
 	backbuffer: ^d3d.ITexture2D
-	gfx.swapchain->GetBuffer(0, d3d.ITexture2D_UUID, (^rawptr)(&backbuffer))
-	gfx.device->CreateRenderTargetView((^d3d.IResource)(backbuffer), nil, &gfx.rtv)
-	backbuffer->Release()
+	// GetBuffer's HRESULT was discarded and backbuffer released unconditionally.
+	// On a lost device GetBuffer fails and leaves the pointer nil, so the Release
+	// was a call through a nil vtable -- an access violation on the resize path,
+	// at exactly the moment things were already going wrong.
+	if hr := gfx.swapchain->GetBuffer(0, d3d.ITexture2D_UUID, (^rawptr)(&backbuffer)); !win.SUCCEEDED(hr) || backbuffer == nil {
+		if hr == dxgi.ERROR_DEVICE_REMOVED || hr == dxgi.ERROR_DEVICE_RESET {gfx.lost = true}
+		gfx.rtv = nil
+		return
+	}
+	defer backbuffer->Release()
+	if hr := gfx.device->CreateRenderTargetView((^d3d.IResource)(backbuffer), nil, &gfx.rtv); !win.SUCCEEDED(hr) {
+		gfx.rtv = nil
+	}
 }
 
 gfx_resize :: proc(gfx: ^Gfx, width, height: i32) {
@@ -124,6 +163,9 @@ gfx_resize :: proc(gfx: ^Gfx, width, height: i32) {
 
 // Bind the backbuffer, set the viewport, and clear. Draw calls go after this.
 gfx_begin_frame :: proc(gfx: ^Gfx, r, g, b: f32) {
+	// Nothing may be issued against a dead device, and rtv is nil when the target
+	// could not be created — binding it would render into nothing at best.
+	if gfx.lost || gfx.rtv == nil {return}
 	color := [4]f32{r, g, b, 1}
 	viewport := d3d.VIEWPORT{0, 0, f32(gfx.width), f32(gfx.height), 0, 1}
 
@@ -138,10 +180,27 @@ gfx_begin_frame :: proc(gfx: ^Gfx, r, g, b: f32) {
 // used during a live resize so per-WM_SIZE presents don't each block on vblank.
 // Sync-0 needs the ALLOW_TEARING present flag to actually be immediate (otherwise
 // a flip-model present stays vblank-locked).
-gfx_end_frame :: proc(gfx: ^Gfx, sync: u32 = 1) {
+gfx_end_frame :: proc(gfx: ^Gfx, sync: u32 = 1) -> Device_Status {
+	if gfx.lost {return .Lost}
 	flags: dxgi.PRESENT
 	if sync == 0 && gfx.tearing {
 		flags = {.ALLOW_TEARING}
 	}
-	gfx.swapchain->Present(sync, flags)
+	// Present's HRESULT was discarded, so a removed device produced a window that
+	// never updated again while the loop kept issuing calls into dead COM objects
+	// -- a frozen editor holding every unsaved buffer, with no message and no way
+	// to get the text back.
+	hr := gfx.swapchain->Present(sync, flags)
+	if hr == dxgi.ERROR_DEVICE_REMOVED || hr == dxgi.ERROR_DEVICE_RESET {
+		gfx.lost = true
+		return .Lost
+	}
+	return .Ok
 }
+
+gfx_is_lost :: proc(gfx: ^Gfx) -> bool {return gfx.lost}
+
+// Test seam. A real device removal needs a TDR or a driver update, neither of
+// which can be provoked here, so this is the only way to exercise the paths that
+// must go inert afterwards. It sets the same flag Present would.
+gfx_force_lost :: proc(gfx: ^Gfx) {gfx.lost = true}

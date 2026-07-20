@@ -432,10 +432,47 @@ doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
 	doc.fv = fv
 	doc.path = strings.clone(path)
 	doc.path_owned = true
-	enc, bom := base.detect_encoding(fv.bytes)
+
+	// Both the sniff and any transcode read the mapping directly, on the main
+	// thread, outside the SEH guard -- read_rec routes through safe_copy, these
+	// did not. A mapped file that is rotated, truncated, or (NTFS-compressed)
+	// fails to decompress mid-open raises EXCEPTION_IN_PAGE_ERROR, which is not a
+	// catchable Odin error: it took the whole process down and every other tab's
+	// unsaved work with it. So read through the guard before touching the bytes.
+	enc: base.Encoding
+	bom: int
+	if fv.mapped {
+		head: [base.SNIFF]u8
+		n := min(len(fv.bytes), len(head))
+		if n > 0 && !base.safe_copy(head[:n], fv.bytes[:n]) {
+			doc.recovered = true // faulted pages came back zeroed; say so
+		}
+		enc, bom = base.detect_encoding(head[:n])
+	} else {
+		enc, bom = base.detect_encoding(fv.bytes)
+	}
 	doc.enc = enc
 	doc.had_bom = bom > 0
-	doc.original, doc.owned_orig = base.decode_to_utf8(fv.bytes, enc, bom)
+
+	// UTF-8 hands back the same bytes without reading them, so the mapping can
+	// stay. Every other encoding transcodes, which reads every byte -- take a
+	// private guarded copy first and decode from that.
+	if fv.mapped && enc != .UTF8 {
+		priv := make([]u8, len(fv.bytes))
+		if !base.safe_copy(priv, fv.bytes) {
+			doc.recovered = true
+		}
+		doc.original, doc.owned_orig = base.decode_to_utf8(priv, enc, bom)
+		if !doc.owned_orig {
+			// Defensive: every non-UTF-8 path allocates, but if that ever changes,
+			// doc.original would alias priv and freeing it would be a dangling read.
+			doc.owned_orig = true
+		} else {
+			delete(priv)
+		}
+	} else {
+		doc.original, doc.owned_orig = base.decode_to_utf8(fv.bytes, enc, bom)
+	}
 	doc.pt = base.pt_init(doc.original)
 
 	doc.idx.content = doc.original

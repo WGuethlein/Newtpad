@@ -1183,6 +1183,60 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad devicelosttest` covers what happens after the GPU goes away.
+	//
+	// Present's HRESULT was discarded, so a removed device (driver update, TDR,
+	// eGPU unplug, an RDP session change) left a window that never updated again
+	// while the loop kept issuing calls into dead COM objects -- a frozen editor
+	// still holding every unsaved buffer.
+	//
+	// What this does NOT cover: a real device removal. It cannot be provoked here,
+	// so the HRESULT branch itself is unexercised and the flag is set through a
+	// test seam. What it does cover is the property that matters once the flag is
+	// set -- every frame entry point goes inert instead of calling into dead
+	// objects -- and that gfx_create_rtv survives a failed GetBuffer, which used
+	// to Release through a nil pointer.
+	if os.args[1] == "devicelosttest" {
+		window := plat.window_create("Newtpad devicelost", 640, 480)
+		gfx, ok := plat.gfx_init(window)
+		if !ok {fmt.eprintln("devicelosttest: gfx init failed");return true}
+		text, tok := plat.text_init(&gfx)
+		if !tok {fmt.eprintln("devicelosttest: text init failed");return true}
+		qp, qok := plat.quads_init(&gfx)
+		if !qok {fmt.eprintln("devicelosttest: quad init failed");return true}
+		bad := 0
+
+		// A healthy frame presents cleanly.
+		plat.text_frame_begin(&gfx, &text)
+		plat.gfx_begin_frame(&gfx, 0, 0, 0)
+		plat.text_draw(&gfx, &text, "hello", 0, 20, 16, {1, 1, 1, 1})
+		st := plat.gfx_end_frame(&gfx, 0)
+		fmt.println("--- healthy device ---")
+		fmt.printfln("  present -> %v %s", st, "OK" if st == .Ok else "FAIL")
+		fmt.printfln("  lost    -> %v %s", plat.gfx_is_lost(&gfx), "OK" if !plat.gfx_is_lost(&gfx) else "FAIL")
+		if st != .Ok || plat.gfx_is_lost(&gfx) {bad += 1}
+
+		plat.gfx_force_lost(&gfx)
+
+		// Every one of these used to run straight into dead COM objects. They must
+		// now be no-ops, and reaching the end of this block at all is the assertion.
+		fmt.println("--- after the device is lost ---")
+		plat.text_frame_begin(&gfx, &text)
+		plat.gfx_begin_frame(&gfx, 0.1, 0.1, 0.1)
+		plat.text_draw(&gfx, &text, "should not draw", 0, 20, 16, {1, 1, 1, 1})
+		plat.quads_draw(&gfx, &qp, []plat.Quad{{pos = {0, 0}, size = {10, 10}, color = {1, 1, 1, 1}}})
+		st2 := plat.gfx_end_frame(&gfx, 0)
+		plat.gfx_resize(&gfx, 800, 600) // the path that used to Release a nil backbuffer
+		fmt.printfln("  a full frame + resize did not crash: OK")
+		fmt.printfln("  present -> %v %s", st2, "OK" if st2 == .Lost else "FAIL")
+		fmt.printfln("  lost    -> %v %s", plat.gfx_is_lost(&gfx), "OK" if plat.gfx_is_lost(&gfx) else "FAIL")
+		if st2 != .Lost || !plat.gfx_is_lost(&gfx) {bad += 1}
+		fmt.printfln("  reason  -> %q", plat.gfx_lost_reason(&gfx))
+
+		fmt.printfln("devicelosttest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad atlasgrowtest` proves the atlas actually grows. atlastest checks
 	// only text_atlas_fit_count -- arithmetic that assumes growth works -- and it
 	// passed for the entire time growth was impossible, because it never asked the

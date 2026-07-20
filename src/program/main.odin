@@ -429,6 +429,27 @@ main :: proc() {
 
 		render_frame(&rc)
 
+		// The GPU went away mid-frame (driver update, TDR, eGPU unplug, an RDP
+		// session change). Every D3D object is invalid now, so nothing can be drawn
+		// again in this process. Present's result used to be discarded, which left
+		// a permanently frozen window still holding every unsaved buffer, with no
+		// message and no way to get the text back.
+		//
+		// Get the work onto disk FIRST -- the session backups are the only copy of
+		// a dirty buffer -- then say what happened, then leave. Recreating the
+		// device and every dependent resource (atlas, shaders, both pipelines) is
+		// the nicer answer and is deliberately not attempted here: it cannot be
+		// exercised in this environment, and an untested recovery path that runs
+		// only during a GPU fault is a worse failure than a clean exit.
+		if plat.gfx_is_lost(&gfx) {
+			reason := plat.gfx_lost_reason(&gfx)
+			saved := primary && session_save(&app, session_can_sweep)
+			tail :=
+				"Your open tabs and unsaved changes have been saved, and will be restored when you start Newtpad again." if saved else "Newtpad could not save your session, so unsaved changes may be lost."
+			plat.message_error(window.hwnd, fmt.tprintf("Newtpad has to close because %s.\n\n%s", reason, tail))
+			break
+		}
+
 		// A mapped read may have faulted during this frame's draw/search (file
 		// truncated or decompression-broken underneath us). Detach from the map
 		// into a private copy so we never fault again; next frame draws that.
