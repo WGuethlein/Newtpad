@@ -497,22 +497,32 @@ rows_fitting :: proc(items: []Menu_Item, from: int, h: f32) -> (count: int) {
 	return
 }
 
+// The scroll resolution, as a pure function: which `top` does a dropdown of
+// height `h` settle on when `item` must be visible? Takes `top` by value and
+// returns the resolved offset instead of mutating, so the answer can be asked
+// without performing a draw — which is what `menuseam` needs to compare the row
+// set the draw would emit against the row set the hit-test would accept.
+menu_resolve_top :: proc(top, item: int, items: []Menu_Item, h: f32) -> int {
+	if item < 0 {return top}
+	t := top
+	if item < t {t = item}
+	// Grow `top` until the highlighted item is within the visible run.
+	for {
+		n := rows_fitting(items, t, h)
+		if n == 0 {break}
+		if item < t + n {break}
+		t += 1
+	}
+	return clamp(t, 0, max(0, len(items) - 1))
+}
+
 // Scroll the dropdown the minimum needed to bring `app.menu.item` into view.
 // Called from the draw, so the hit-test one frame later agrees with what is on
 // screen.
 @(private = "file")
 menu_scroll_to_item :: proc(app: ^App, items: []Menu_Item, h: f32) {
 	m := &app.menu
-	if m.item < 0 {return}
-	if m.item < m.top {m.top = m.item}
-	// Grow `top` until the highlighted item is within the visible run.
-	for {
-		n := rows_fitting(items, m.top, h)
-		if n == 0 {break}
-		if m.item < m.top + n {break}
-		m.top += 1
-	}
-	m.top = clamp(m.top, 0, max(0, len(items) - 1))
+	m.top = menu_resolve_top(m.top, m.item, items, h)
 }
 
 // Row index at client (x, y) within the open dropdown, or -1.

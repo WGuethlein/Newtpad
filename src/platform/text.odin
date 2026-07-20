@@ -556,6 +556,7 @@ rune_face :: proc(t: ^Text, r: rune, set := Font_Set.UI) -> (face: int, gi: u16)
 // uses whichever family the user chose. Defaulting to UI means only the document
 // draw has to say so.
 text_draw :: proc(gfx: ^Gfx, t: ^Text, str: string, x, y, px: f32, color: [4]f32, set := Font_Set.UI) {
+	draw_calls_text += 1
 	instances := make([dynamic]Text_Instance, 0, len(str))
 	defer delete(instances)
 	// The atlas must hold still while these UVs are being collected.

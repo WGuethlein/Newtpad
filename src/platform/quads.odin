@@ -126,11 +126,22 @@ quads_init :: proc(gfx: ^Gfx) -> (qp: Quad_Pipeline, ok: bool) {
 	return qp, true
 }
 
+// Draw-call accounting. Two increments on paths that already do a Map plus a
+// DrawInstanced, so the cost is noise — but it is the only way to answer "how
+// much does one more per-row draw actually cost" with a number instead of an
+// estimate. Read by `newtpad drawcount`.
+draw_calls_text: int
+draw_calls_quad: int
+
+draw_counts :: proc() -> (text_calls, quad_calls: int) {return draw_calls_text, draw_calls_quad}
+draw_counts_reset :: proc() {draw_calls_text, draw_calls_quad = 0, 0}
+
 // Upload the quad list and draw it all in a single instanced call.
 quads_draw :: proc(gfx: ^Gfx, qp: ^Quad_Pipeline, quads: []Quad) {
 	if len(quads) == 0 {
 		return
 	}
+	draw_calls_quad += 1
 	n := min(len(quads), MAX_QUADS)
 	ctx := gfx.ctx
 

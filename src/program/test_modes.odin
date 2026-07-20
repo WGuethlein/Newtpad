@@ -841,6 +841,165 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad menuseam` is a falsifier, not a regression test. It answers one
+	// question about a PROPOSED frame shape before that shape is committed to:
+	// if a frame ran LAYOUT, then applied INPUT, then ran LAYOUT again to draw,
+	// would the two layout passes resolve the same scroll offset?
+	//
+	// They only can when the dropdown fits. When it does not, resolving with the
+	// highlighted item at k and at k+1 yields two different `top` values, so the
+	// rows the hit-test accepted (pass 1) are not the rows the draw emitted
+	// (pass 2) — the seam-bug class, reintroduced at frame granularity, in a
+	// design whose entire purpose is to make that class impossible.
+	//
+	// TODAY'S CODE DOES NOT HAVE THIS BUG. menu_scroll_to_item runs exactly once,
+	// inside the draw, and menu_item_at reads the app.menu.top the previous draw
+	// cached (see menu.odin's comment above menu_scroll_to_item). It is one frame
+	// stale on purpose, and therefore self-consistent. This mode measures a
+	// property of the resolution function, to decide whether a future layout pass
+	// is allowed to run twice per frame.
+	if os.args[1] == "menuseam" {
+		t: plat.Text
+		plat.text_load_faces(&t)
+		a: App
+		menu_init(&a.menu)
+		app_new_scratch(&a)
+		defer app_destroy(&a)
+
+		W := f32(1280)
+		diverged, checked := 0, 0
+		fmt.println("--- scroll resolution stability across a one-row selection move ---")
+		fmt.println("  (topA = resolved with item k, topB = resolved with item k+1 after Down)")
+		for H in ([]f32{200, 201, 202, 480, 481, 720}) {
+			for m, mi in menus {
+				items := m.items
+				a.menu.open = mi
+				a.menu.item = -1
+				a.menu.top = 0
+				_, _, h := menu_dropdown_rect(&t, &a, W, H)
+				n0 := menu_visible_rows(&t, &a, W, H) // rows fitting from top=0
+				fits := n0 >= len(items)
+				if fits || n0 == 0 {
+					fmt.printfln("  h=%4.0f %-6s rows=%d/%d fits — resolution cannot move", H, m.title, n0, len(items))
+					continue
+				}
+				k := n0 - 1 // last row visible while top=0
+				if k + 1 > len(items) - 1 {continue}
+				checked += 1
+
+				topA := menu_resolve_top(0, k, items, h)
+				topB := menu_resolve_top(0, k + 1, items, h)
+
+				// Row sets each offset would produce.
+				a.menu.top = topA
+				nA := menu_visible_rows(&t, &a, W, H)
+				a.menu.top = topB
+				nB := menu_visible_rows(&t, &a, W, H)
+
+				if topA != topB {
+					diverged += 1
+					fmt.printfln(
+						"  h=%4.0f %-6s rows=%d/%d  topA=%d hitbox=[%d,%d)  topB=%d drawn=[%d,%d)  DIVERGES",
+						H, m.title, n0, len(items), topA, topA, topA + nA, topB, topB, topB + nB,
+					)
+				} else {
+					fmt.printfln("  h=%4.0f %-6s rows=%d/%d  topA=topB=%d  stable", H, m.title, n0, len(items), topA)
+				}
+			}
+		}
+
+		fmt.println("--- control: today's single-resolution frame ---")
+		// The current shape resolves once and caches. Re-resolving from the SAME
+		// cached top with the SAME item is idempotent, which is why today's draw
+		// and next frame's hit-test agree.
+		idem := true
+		for H in ([]f32{200, 480}) {
+			for m, mi in menus {
+				a.menu.open = mi
+				a.menu.top = 0
+				_, _, h := menu_dropdown_rect(&t, &a, W, H)
+				for k in 0 ..< len(m.items) {
+					once := menu_resolve_top(0, k, m.items, h)
+					twice := menu_resolve_top(once, k, m.items, h)
+					if once != twice {idem = false}
+				}
+			}
+		}
+		fmt.printfln("  resolve is idempotent for a fixed item: %v %s", idem, "OK" if idem else "FAIL")
+
+		fmt.printfln(
+			"menuseam: %d/%d scrolling cases diverge across one selection move; idempotent-for-fixed-item=%v",
+			diverged, checked, idem,
+		)
+		fmt.println(
+			"  DIVERGES means: a frame that resolves scroll in layout AND again in draw would",
+		)
+		fmt.println(
+			"  accept clicks on one row set and paint another. One layout call per frame is required.",
+		)
+		return true
+	}
+
+	// `newtpad drawcount <file>` measures what a frame actually costs in draw
+	// calls, because the claim "an always-on line-number gutter roughly doubles
+	// per-frame draw calls" was arithmetic from constants, not a measurement, and
+	// it is load-bearing: if true, renderer batching is a hard prerequisite for
+	// the gutter rather than a parallel cleanup.
+	//
+	// Creates its own window and drives render_frame directly — no GUI input, so
+	// it runs unattended. The window is visible for the moment it takes.
+	if os.args[1] == "drawcount" && len(os.args) > 2 {
+		window := plat.window_create("Newtpad drawcount", 1280, 720)
+		gfx, ok := plat.gfx_init(window)
+		if !ok {fmt.eprintln("drawcount: gfx init failed");return true}
+		text, tok := plat.text_init(&gfx)
+		if !tok {fmt.eprintln("drawcount: text init failed");return true}
+		quad_pipe, qok := plat.quads_init(&gfx)
+		if !qok {fmt.eprintln("drawcount: quad init failed");return true}
+
+		app: App
+		menu_init(&app.menu)
+		app.settings = settings_load()
+		if !app_open_path(&app, os.args[2]) {
+			fmt.eprintfln("drawcount: could not open %q", os.args[2])
+			return true
+		}
+		defer app_destroy(&app)
+
+		rc := Render_Ctx{&gfx, &text, &quad_pipe, &app, window, 0, 0, 0}
+		active_render_ctx = &rc
+		BASE_PX = f32(clamp(app.settings.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX))
+		metrics_recompute(&rc)
+		plat.window_pump_events(window)
+
+		// Warm frame: fills the glyph atlas, so the measured frame is a steady-state
+		// frame and not a first-paint one.
+		render_frame(&rc, false)
+		plat.window_pump_events(window)
+
+		plat.draw_counts_reset()
+		render_frame(&rc, false)
+		tc, qc := plat.draw_counts()
+
+		doc := app_active(&app)
+		rows := doc_visible_rows(doc, f32(window.height), rc.line_h)
+
+		fmt.println("--- steady-state frame, 1280x720, no menu open ---")
+		fmt.printfln("  visible text rows      : %d", rows)
+		fmt.printfln("  plat.text_draw  calls  : %d", tc)
+		fmt.printfln("  plat.quads_draw calls  : %d", qc)
+		fmt.printfln("  total draw calls       : %d", tc + qc)
+		fmt.println("--- projection: one more text_draw per visible row (the gutter) ---")
+		fmt.printfln("  projected text_draw    : %d  (x%.2f)", tc + rows, f32(tc + rows) / max(f32(tc), 1))
+		fmt.printfln("  projected total        : %d  (x%.2f)", tc + qc + rows, f32(tc + qc + rows) / max(f32(tc + qc), 1))
+		fmt.printfln(
+			"  per-row share of today's text_draw: %.0f%%",
+			100 * f32(rows) / max(f32(tc), 1),
+		)
+		fmt.println("  (text_draw also heap-allocates a [dynamic]Text_Instance per call — text.odin:559)")
+		return true
+	}
+
 	// `newtpad dpitest` guards the identity the whole cell grid rests on: the
 	// column grid the program lays out with (col_x, caret, selection, find rects)
 	// must advance by exactly the same amount as the pen inside text_draw. If a
