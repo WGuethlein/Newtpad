@@ -118,6 +118,7 @@ main :: proc() {
 	session_dirty := false
 	last_input := time.tick_now()
 	scrollbar_drag := false
+	hscrollbar_drag := false
 
 	for !window.should_close {
 		plat.window_pump_events(window)
@@ -321,6 +322,26 @@ main :: proc() {
 				doc_scroll_to_fraction(doc, &text, frac, rows)
 			} else {
 				scrollbar_drag = false
+			}
+		}
+
+		// Horizontal scrollbar: a press on its track starts a drag mapping the
+		// pointer's x to the scroll offset (same geometry the bar is drawn from).
+		{
+			maxhs := doc_max_hscroll(doc, &text, rows)
+			hb := hscrollbar_geo(doc, f32(window.width), f32(window.height), maxhs)
+			if hb.shown && window.mouse_pressed &&
+			   f32(window.mouse_y) >= hb.y && f32(window.mouse_y) <= hb.y + hb.h &&
+			   f32(window.mouse_x) >= hb.track_x && f32(window.mouse_x) <= hb.track_x + hb.track_w {
+				hscrollbar_drag = true
+				window.mouse_pressed = false
+			}
+			if hscrollbar_drag {
+				if window.mouse_down && hb.shown {
+					doc.h_scroll = hscrollbar_pos_at(hb, f32(window.mouse_x), maxhs)
+				} else {
+					hscrollbar_drag = false
+				}
 			}
 		}
 
@@ -536,6 +557,37 @@ Render_Ctx :: struct {
 	px, char_w, line_h: f32,
 }
 
+// Horizontal scrollbar geometry (pixels). One producer, consumed by the draw in
+// render_frame and the drag hit-test in the main loop, so the drawn track and the
+// clickable track cannot disagree. Shown only in the plain view when a visible
+// line overflows the viewport.
+Hbar :: struct {
+	shown:                                  bool,
+	track_x, track_w, y, h, thumb_x, thumb_w: f32,
+}
+
+hscrollbar_geo :: proc(doc: ^Document, winw, winh: f32, maxhs: int) -> (b: Hbar) {
+	if doc == nil || doc.wrap || doc.filter || maxhs <= 0 {return}
+	b.track_x = TEXT_MARGIN_X
+	b.track_w = winw - SCROLLBAR_W - TEXT_MARGIN_X
+	if b.track_w <= sx(30) {return}
+	b.h = sx(8)
+	b.y = winh - doc_bottom_bar_h(doc) - b.h
+	total := f32(maxhs + max(1, doc.view_cols)) // widest visible line, in cells
+	b.thumb_w = max(sx(24), b.track_w * f32(doc.view_cols) / total)
+	b.thumb_x = b.track_x + (b.track_w - b.thumb_w) * (f32(doc.h_scroll) / f32(maxhs))
+	b.shown = true
+	return
+}
+
+// Map a pointer x on the track to a horizontal scroll offset (thumb centred on
+// the cursor). Inverse of hscrollbar_geo's thumb_x; kept beside it so the two
+// stay consistent.
+hscrollbar_pos_at :: proc(b: Hbar, mx: f32, maxhs: int) -> int {
+	frac := (mx - b.track_x - b.thumb_w * 0.5) / max(1, b.track_w - b.thumb_w)
+	return clamp(int(frac * f32(maxhs) + 0.5), 0, maxhs)
+}
+
 // Draw one frame from current state. No input handling — safe to call from the
 // main loop or the WM_SIZE handler. vsync=false (resize) presents immediately so
 // clustered WM_SIZE repaints don't each stall on vsync.
@@ -618,6 +670,18 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	}
 	if nb > 0 {
 		plat.quads_draw(gfx, quad_pipe, bars[:nb])
+	}
+
+	// Horizontal scrollbar (plain view, when a visible line overflows).
+	if hb := hscrollbar_geo(doc, w, h, doc_max_hscroll(doc, text, rows)); hb.shown {
+		plat.quads_draw(
+			gfx,
+			quad_pipe,
+			[]plat.Quad {
+				{pos = {hb.track_x, hb.y}, size = {hb.track_w, hb.h}, color = {0.16, 0.18, 0.22, 1}},
+				{pos = {hb.thumb_x, hb.y}, size = {hb.thumb_w, hb.h}, color = {0.42, 0.48, 0.60, 1}},
+			},
+		)
 	}
 
 	// Filter view replaces the document with just the matching lines, which is

@@ -1692,7 +1692,27 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		doc.wrap = false
 		doc.h_scroll = 0
 		doc_update_hscroll(&doc) // leave the global reset
-		if bad == 0 {fmt.println("  drawn column == hit-tested column at every pan offset and edge: OK")}
+
+		// The draggable bar's seam: dropping the thumb where it was drawn must
+		// recover the same offset (thumb-centre round-trip through pos_at).
+		maxhs := doc_max_hscroll(&doc, &t, rows)
+		for hs in ([]int{0, 40, 120, maxhs}) {
+			doc.h_scroll = clamp(hs, 0, maxhs)
+			hb := hscrollbar_geo(&doc, 1000, 700, maxhs)
+			if !hb.shown {
+				fmt.println("  FAIL: scrollbar not shown though content overflows")
+				bad += 1
+				continue
+			}
+			got := hscrollbar_pos_at(hb, hb.thumb_x + hb.thumb_w*0.5, maxhs)
+			if got != doc.h_scroll {
+				fmt.printfln("  FAIL: thumb round-trip hs=%d -> %d", doc.h_scroll, got)
+				bad += 1
+			}
+		}
+		doc.h_scroll = 0
+
+		if bad == 0 {fmt.println("  drawn column == hit-tested column, and the scrollbar thumb round-trips: OK")}
 		fmt.printfln("hscrolltest: %d failures", bad)
 		return true
 	}
