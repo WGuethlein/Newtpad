@@ -311,7 +311,7 @@ default_bindings := []Binding {
 	{.Enter, false, false, .Menu, .Menu_Activate},
 	// --- find context ---
 	{.Escape, false, false, .Find, .Find_Close},
-	{.F, true, false, .Find, .Find_Close},
+	{.F, true, false, .Find, .Find_Open}, // switch to search view (leaves filter); Escape closes
 	{.Backspace, false, false, .Find, .Find_Backspace},
 	{.Enter, false, false, .Find, .Find_Confirm},
 	{.Tab, false, false, .Find, .Find_Field_Toggle},
@@ -593,6 +593,11 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			save_checked(doc, p, w)
 		}
 	case .Find_Open:
+		// Ctrl+F means "search", including as the way out of filter view (Ctrl+L):
+		// pressing it while filtering used to hit Find_Close and drop to the
+		// viewport instead of switching to the normal search. Always leave filter
+		// mode and focus the query; Escape is the way to close find.
+		doc.filter = false
 		find_open(doc, false)
 	case .Replace_Open:
 		find_open(doc, true)
