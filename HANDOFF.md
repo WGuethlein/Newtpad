@@ -726,6 +726,97 @@ growth worked. Prefer a check that cannot pass with the bug present.
   crash reporting, unsigned binary, no updater, no LICENSE, no UIA provider, no `\?\` long paths,
   no VirtualAlloc arenas, and the app still redraws at vsync when idle with no `WaitMessage`.
 
+## 6l. Clickable links and file paths — requested, not built (Wyatt, 2026-07-19)
+
+Ctrl+click a URL or a file path in a document and go there. It fits Newtpad specifically: the files
+this editor is for — build logs, stack traces, linter output, config files — are full of paths, and
+following one currently means selecting it, copying it, and opening it by hand.
+
+**Decisions taken up front** (Wyatt, 2026-07-19):
+
+- **Detect** URLs (http/https/file/mailto), absolute Windows paths, UNC paths, `file.txt:123`
+  line/column references, and relative paths.
+- **Relative resolution is anchored to the open document's folder and nothing else** — never the
+  process CWD (which is wherever Explorer happened to launch us), never `PATH`, never a walk up
+  through parent directories. An untitled buffer has no anchor, so relative detection is simply off
+  there. *(This is my reading of "make it relative only" — correct it if it meant something else.)*
+- **Ctrl+click activates**, matching VS Code and Sublime. Plain click still places the caret, so no
+  existing behaviour changes and you can still click into the middle of a URL to edit it.
+- **Safety posture: never hand an arbitrary path to `ShellExecute`.** A text-ish file opens as a
+  Newtpad tab; anything else is revealed in Explorer so the user decides. Only URLs are handed off.
+- **Sequenced after `text_draw_spans`.** Build the span primitive once and let syntax highlighting
+  and link underlining both consume it.
+
+### Why it is not standalone
+
+`text_draw` takes **one flat colour per call**, so there is no way to underline or recolour part of
+a line. That is the same gap syntax highlighting has (audit finding F1), and it should be filled
+once. Shipping detection and Ctrl+click without the visual affordance would mean links that work
+but are invisible until you happen to hold Ctrl over one.
+
+There is a second prerequisite the audit measured: **the text pipeline batches nothing** — one heap
+allocation, two buffer maps and one draw call per string (`drawcount`, §6k). Drawing a line as
+several spans multiplies that per row. Span rendering wants the batching work first, or a frame
+with a lot of links gets materially more expensive than a frame without.
+
+### Design notes for when it lands
+
+**Detection is viewport-scoped**, like everything else here — run over the visible line range plus a
+margin, never the whole document, so it costs nothing on a multi-GB log. Recompute per frame from
+the visible range rather than trying to keep spans valid across edits; the range is bounded, which
+is what makes that affordable.
+
+The hard part is not finding candidates, it is **ending them**:
+
+- **Trailing punctuation.** `see http://example.com/x.` must not include the period, and `(see
+  http://example.com/a_(b))` must keep the inner parens. The usual rule — strip trailing `.,;:!?`
+  and unbalanced closers — is a heuristic, and should be written down as one.
+- **Spaces in Windows paths.** `C:\Program Files\app\config.txt` has no reliable terminator. Accept
+  a space only when the run continues to a known extension, or when the whole path is quoted. This
+  will get some cases wrong; the failure should be a link that stops short, never one that swallows
+  the rest of the line.
+- **`C:` is a drive, not a line number.** The `path:line` parser must not treat a single-letter
+  segment followed by `\` as a `:line` suffix. Reuse whatever the CLI `file.txt:123` argument
+  handling uses so there is one parser, not two.
+
+**Resolution and safety.** Stat the target first — a path that does not exist should not reach any
+handler at all. Then:
+
+- Text-ish extension → `app_open_path`, which already activates an existing tab if the file is
+  open. **Reuse the extension list `install.ps1` registers** rather than writing a second one.
+- Anything else, or a directory → reveal in Explorer (`SHOpenFolderAndSelectItems`). Never
+  `ShellExecute` a file we did not classify.
+- URLs → the default browser, which is the one unavoidable handoff. **Whitelist schemes** —
+  `http`, `https`, `mailto`, and `file` (routed through the path logic above, not the browser).
+  Refuse everything else. This is not theoretical: `search-ms:`, `ms-msdt:` (Follina) and
+  `ms-officecmd:` are delivered exactly this way, through a link in a document someone else wrote.
+  A blacklist will be wrong eventually; a whitelist fails closed.
+
+**Activation.**
+
+- Ctrl+hover underlines the span and changes the cursor to a hand. Newtpad sets one `IDC_ARROW` for
+  the process lifetime and handles no `WM_SETCURSOR` (audit finding F5), so this shares a fix with
+  "the cursor is never an I-beam over text".
+- Ctrl+click opens. Also add an `Open_Link_At_Caret` command to the table, so it is keyboard
+  reachable and shows up in the palette with its chord — commands are declared once, and a
+  mouse-only feature would be the exception.
+
+**Things that will bite.**
+
+- **Word wrap splits a link across visual rows.** The underline has to be drawn per row segment and
+  the hit-test has to accept any segment. One `links_layout()` producing per-row segments, consumed
+  by the draw, the hover and the click — the seam rule applies here as much as anywhere.
+- **Filter view** should get links too; it renders `filter_lines` through a different path.
+- Spans are in **cells**, not pixels — go through `col_x`/`col_at_x` like every other overlay, or
+  the underline drifts from the glyphs on CJK.
+
+### Open questions
+
+- Does a detected link inside a *selection* still activate on Ctrl+click, or does selection win?
+- Should `file://` URLs with a host component be refused outright (they are a UNC in disguise)?
+- Is there a size cap on the line being scanned? A 100 MB single-line file has one visible "line";
+  detection must bound itself by the visible *cell* range, not the line.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
