@@ -315,14 +315,19 @@ main :: proc() {
 			}
 		}
 
-		// The find/status bar owns the bottom strip. Reserving rows keeps text
-		// from being drawn there, but doc_pos_at clamps an out-of-range row onto
-		// the last one, so a click in the bar still moved the caret and a drag
-		// still selected. Consume it instead.
+		// The find/status bar owns the bottom strip. A fresh press there must not
+		// place the caret (doc_pos_at would clamp the out-of-range row onto the
+		// last one). But an in-progress drag reaching the strip must NOT be
+		// cancelled: zeroing mouse_down here unconditionally killed the drag and
+		// its auto-scroll the instant the pointer touched the bar, so a selection
+		// could never be dragged below the last visible line. Consume only a fresh
+		// press; leave an ongoing drag to the auto-scroll below.
 		if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
-			window.mouse_pressed = false
-			window.mouse_middle_pressed = false
-			window.mouse_down = false
+			if window.mouse_pressed || window.mouse_middle_pressed {
+				window.mouse_pressed = false
+				window.mouse_middle_pressed = false
+				window.mouse_down = false
+			}
 		}
 
 		// Ctrl+hover over a link: hand cursor. Uses the live cursor position, not
@@ -372,10 +377,13 @@ main :: proc() {
 			window.mouse_pressed = false
 		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag {
 			// drag extends a single-click selection; word/line selects stay put.
-			// Auto-scroll when the pointer is dragged past the top/bottom edge.
-			if window.mouse_y < i32(CONTENT_TOP) {
+			// Auto-scroll while the pointer is dragged above the first row or at/
+			// below the last one — the edges are the content area, so entering the
+			// bottom bar (or leaving the window past it) keeps scrolling instead of
+			// stopping dead at the last visible line.
+			if f32(window.mouse_y) < CONTENT_TOP + FILTER_BANNER_H {
 				doc_scroll(doc, &text, -1, rows)
-			} else if window.mouse_y > window.height - i32(line_h) {
+			} else if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
 				doc_scroll(doc, &text, 1, rows)
 			}
 			doc.cursor = doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
