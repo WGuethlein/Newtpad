@@ -199,6 +199,22 @@ rune_to_cp1252 :: proc(r: rune) -> (u8, bool) {
 	return '?', false
 }
 
+// How many runes in `data` (UTF-8) the target encoding cannot represent. Only
+// the single-byte codepages can lose anything; UTF-8 and UTF-16 encode all of
+// Unicode. rune_to_cp1252 has always reported this per character -- encoding a
+// buffer just threw the answer away and wrote '?', so typing an em-dash or an
+// emoji into a Windows-1252 file destroyed it on save and reported success.
+encode_lossy_count :: proc(data: []u8, enc: Encoding) -> int {
+	if enc != .CP1252 {return 0}
+	n, i := 0, 0
+	for i < len(data) {
+		r, sz := utf8.decode_rune(data[i:])
+		i += max(sz, 1)
+		if _, ok := rune_to_cp1252(r); !ok {n += 1}
+	}
+	return n
+}
+
 // Decode to UTF-8. UTF-8 input returns the same bytes (BOM stripped), no copy
 // (allocated=false). UTF-16 input is transcoded into a new UTF-8 buffer
 // (allocated=true) — the caller owns it. Large multi-GB files are expected to be

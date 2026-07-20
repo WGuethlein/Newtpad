@@ -88,3 +88,31 @@ test_line_nav :: proc(t: ^testing.T) {
 	testing.expect_value(t, prev_line_start(b, 0), 0) // clamp at top
 	testing.expect_value(t, line_end(b, 11), 16) // last line ends at len
 }
+
+// Windows-1252 cannot hold an em-dash, a curly quote or an emoji. The encoder
+// substituted '?' for each and said nothing, so pasting modern text into a
+// legacy file destroyed it on save while the app reported success. The count is
+// what lets the save path ask the user first.
+@(test)
+test_encode_lossy_count :: proc(t: ^testing.T) {
+	// Plain ASCII is representable everywhere.
+	testing.expect_value(t, encode_lossy_count(transmute([]u8)string("hello"), Encoding.CP1252), 0)
+
+	// These have CP1252 slots even though they are non-ASCII.
+	testing.expect_value(t, encode_lossy_count(transmute([]u8)string("café — “quoted”"), Encoding.CP1252), 0)
+
+	// These do not.
+	testing.expect_value(t, encode_lossy_count(transmute([]u8)string("\U0001F600"), Encoding.CP1252), 1)
+	testing.expect_value(t, encode_lossy_count(transmute([]u8)string("中文"), Encoding.CP1252), 2)
+	testing.expect_value(t, encode_lossy_count(transmute([]u8)string("a\U0001F600b中c"), Encoding.CP1252), 2)
+
+	// Unicode encodings can represent everything, so nothing is ever lost.
+	for enc in ([]Encoding{.UTF8, .UTF16LE, .UTF16BE}) {
+		testing.expect_value(t, encode_lossy_count(transmute([]u8)string("\U0001F600中"), enc), 0)
+	}
+
+	// And the loss the count predicts is the loss that actually happens.
+	lossy := transmute([]u8)string("a\U0001F600b")
+	out := encode_from_utf8(lossy, .CP1252, false, context.temp_allocator)
+	testing.expect_value(t, string(out), "a?b")
+}

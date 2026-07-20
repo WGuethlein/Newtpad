@@ -406,6 +406,36 @@ report_save :: proc(err: plat.Write_Error, path: string, w: ^plat.Window) -> boo
 	return false
 }
 
+// Save, after checking the document's encoding can actually hold its contents.
+// Windows-1252 cannot represent an em-dash, a curly quote or an emoji, and
+// encode_from_utf8 substituted '?' for each one and reported success -- so
+// pasting modern text into a legacy file destroyed it silently. Returns true if
+// the file was written.
+//
+// The lossy check collects the buffer, and so does the save, so a CP1252 file is
+// collected twice. Acceptable while CP1252 means "small legacy file"; if that
+// stops being true, have doc_save_err report the loss instead.
+@(private = "file")
+save_checked :: proc(doc: ^Document, path: string, w: ^plat.Window) -> bool {
+	if doc.enc == .CP1252 {
+		body := base.pt_collect(&doc.pt, context.temp_allocator)
+		if lost := base.encode_lossy_count(body, doc.enc); lost > 0 {
+			switch plat.confirm_lossy_encoding(w.hwnd if w != nil else nil, doc_display_name(doc), enc_name(doc.enc), lost) {
+			case .Save_As_UTF8:
+				// Keep the text, change the container. A BOM would surprise anything
+				// parsing this file, so it is written BOM-less.
+				doc.enc = .UTF8
+				doc.had_bom = false
+			case .Save_Anyway:
+			// The user chose the loss with the count in front of them.
+			case .Cancel:
+				return false
+			}
+		}
+	}
+	return report_save(doc_save_err(doc, path), path, w)
+}
+
 // Close a tab, prompting to save first if it has unsaved changes. Save-dialog
 // cancel or a failed save aborts the close (keeps the tab).
 request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
@@ -428,7 +458,7 @@ request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
 			}
 			// Aborting the close is right — but say why, or the user sees the tab
 			// simply refuse to close with no explanation and may force-quit.
-			if !report_save(doc_save_err(d, p), p, w) {return}
+			if !save_checked(d, p, w) {return}
 		case .Discard:
 		}
 	}
@@ -554,11 +584,11 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			p = strings.clone(p, context.temp_allocator)
 		}
 		if p != "" {
-			report_save(doc_save_err(doc, p), p, w)
+			save_checked(doc, p, w)
 		}
 	case .Save_As:
 		if p, ok := plat.file_save_dialog(w.hwnd); ok {
-			report_save(doc_save_err(doc, p), p, w)
+			save_checked(doc, p, w)
 		}
 	case .Find_Open:
 		find_open(doc, false)

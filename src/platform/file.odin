@@ -4,6 +4,7 @@
 // the user's file (delete + rename verified to work while mapped; see bench/).
 package platform
 
+import "core:fmt"
 import "core:os"
 import "core:strings"
 import win "core:sys/windows"
@@ -379,6 +380,44 @@ confirm_discard :: proc(owner: win.HWND, name: string) -> Save_Choice {
 		return .Save
 	case ID_NO:
 		return .Discard
+	}
+	return .Cancel
+}
+
+Encoding_Choice :: enum {
+	Save_As_UTF8,
+	Save_Anyway,
+	Cancel,
+}
+
+// The file's encoding cannot represent something the user typed. Offer the
+// lossless option first: saving as UTF-8 keeps the text, and the alternative
+// destroys it. Notepad prompts here too rather than silently substituting.
+confirm_lossy_encoding :: proc(owner: win.HWND, name, enc: string, lost: int) -> Encoding_Choice {
+	count := fmt.tprintf("%d", lost)
+	msg := strings.concatenate(
+		{
+			name,
+			" is ",
+			enc,
+			", which cannot represent ",
+			count,
+			" character(s) in it.\n\nSave as UTF-8 instead to keep them?\n\n",
+			"Yes  - save as UTF-8 (nothing is lost)\n",
+			"No   - save as ",
+			enc,
+			" anyway (those characters become '?')\n",
+			"Cancel - do not save",
+		},
+		context.temp_allocator,
+	)
+	wmsg := win.utf8_to_wstring(msg, context.temp_allocator)
+	wcap := win.utf8_to_wstring("Newtpad", context.temp_allocator)
+	switch win.MessageBoxW(owner, wmsg, wcap, MB_YESNOCANCEL | MB_ICONWARNING) {
+	case ID_YES:
+		return .Save_As_UTF8
+	case ID_NO:
+		return .Save_Anyway
 	}
 	return .Cancel
 }
