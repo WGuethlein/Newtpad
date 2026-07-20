@@ -686,8 +686,11 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// while the pen still advances, so text goes missing with no other
 		// symptom. Say so rather than let it look like a corrupt file.
 		atlas := "  [GLYPH CACHE FULL - some text may not draw; reduce zoom or font size]" if plat.text_atlas_full(text) else ""
-		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, disk, indexing, atlas)
-		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text)
+		// A dirty buffer too large to auto-back-up: unsaved edits are not
+		// crash-protected until saved (backing it up would freeze/OOM the app).
+		nobackup := "  [LARGE FILE - unsaved edits are NOT auto-backed up; Save to keep them]" if doc_backup_skipped(doc) else ""
+		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, disk, indexing, atlas, nobackup)
+		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)
 		col := [4]f32{0.95, 0.55, 0.35, 1} if warn else {0.55, 0.60, 0.70, 1}
 		plat.text_draw(gfx, text, status, sx(12), h - sx(8), UI_SMALL_PX, col)
 	}

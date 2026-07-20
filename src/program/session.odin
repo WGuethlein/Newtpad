@@ -23,6 +23,22 @@ import plat "src:platform"
 
 MAX_SESSION_TABS :: 64
 
+// Largest buffer we snapshot into a crash-safe backup. A backup is a full
+// in-memory copy (pt_collect) plus a full write, on the main thread; for a
+// multi-GB buffer that is several GB of transient allocation and a multi-GB
+// write on the ~2 s autosave timer — a multi-second freeze and a real OOM-crash
+// risk (the most likely cause of the reported "2 GB opened, then died quickly").
+// Above this a dirty buffer is not backed up: the tab is still recorded (a saved
+// file reopens from disk, the live buffer is untouched), and the status bar warns
+// while it stays dirty. Streaming/off-thread serialize is the proper fix (owed).
+BACKUP_MAX :: 128 * 1024 * 1024
+
+// Whether a dirty buffer is too large to auto-back-up, so its unsaved edits are
+// not crash-protected until saved. Surfaced in the status bar.
+doc_backup_skipped :: proc(d: ^Document) -> bool {
+	return d != nil && d.modified && d.pt.length > BACKUP_MAX
+}
+
 @(private = "file")
 pjoin :: proc(elems: []string) -> string {
 	s, _ := filepath.join(elems, context.temp_allocator)
@@ -110,7 +126,11 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 		if d.path == "" && !d.modified && d.pt.length == 0 {continue}
 
 		backup_idx := -1
-		if d.modified || (d.path == "" && d.pt.length > 0) {
+		// Cap the backup (see BACKUP_MAX): snapshotting a multi-GB buffer here
+		// froze the autosave and risked an OOM crash. Skipping it never crashes and
+		// never touches the live buffer; it only forgoes crash-protection for that
+		// one huge dirty buffer, which the status bar flags.
+		if (d.modified || (d.path == "" && d.pt.length > 0)) && d.pt.length <= BACKUP_MAX {
 			content := base.pt_collect(&d.pt, context.temp_allocator) // internal UTF-8
 			if plat.file_write_atomic(backup_path(backups, ti), content) {
 				backup_idx = ti
