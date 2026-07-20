@@ -1544,6 +1544,89 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad scrollperftest <mb>` guards the huge-file lockup: the viewport
+	// helpers (doc_scroll / doc_max_top / doc_ensure_cursor_visible) called the
+	// UNCAPPED base.pt_line_start/end on the UI thread, O(line length), so a
+	// multi-GB single-line file froze on every wheel tick. They now step by capped
+	// rows like the renderer. This times them on a single-line buffer (worst case)
+	// and asserts each stays inside one frame, then checks that scrolling a normal
+	// multi-line buffer still lands on the right line starts.
+	if os.args[1] == "scrollperftest" && len(os.args) > 2 {
+		mbn, _ := strconv.parse_int(os.args[2])
+		n := max(mbn, 1) * 1024 * 1024
+		content := make([]u8, n)
+		for i in 0 ..< n {content[i] = 'a'} // one line, no newline: worst case
+		doc := doc_from_content(content, "", .UTF8)
+		defer doc_close(&doc)
+		doc.wrap = false
+		doc.view_cols = 200
+		doc.view_rows = 50
+		t: plat.Text
+		plat.text_load_faces(&t)
+		rows := 50
+		bad := 0
+
+		// The old uncapped scan, timed on this machine for the comparison.
+		s0 := time.tick_now()
+		base.pt_line_start(&doc.pt, doc.pt.length)
+		d0 := time.duration_milliseconds(time.tick_since(s0))
+
+		doc.top = n / 2
+		s1 := time.tick_now()
+		doc_max_top(&doc, &t, rows)
+		d1 := time.duration_milliseconds(time.tick_since(s1))
+
+		doc.top = n / 2
+		s2 := time.tick_now()
+		for _ in 0 ..< 20 {doc_scroll(&doc, &t, 1, rows)}
+		d2 := time.duration_milliseconds(time.tick_since(s2)) / 20
+
+		s3 := time.tick_now()
+		for _ in 0 ..< 20 {doc_scroll(&doc, &t, -1, rows)}
+		d3 := time.duration_milliseconds(time.tick_since(s3)) / 20
+
+		doc.cursor = n
+		doc.top = 0
+		s4 := time.tick_now()
+		doc_ensure_cursor_visible(&doc, &t, rows)
+		d4 := time.duration_milliseconds(time.tick_since(s4))
+
+		fmt.printfln("--- viewport ops on a %d MB single-line buffer ---", max(mbn, 1))
+		fmt.printfln("  uncapped pt_line_start : %.2f ms  <- what ran per interaction", d0)
+		fmt.printfln("  doc_max_top            : %.2f ms", d1)
+		fmt.printfln("  doc_scroll +1 (avg)    : %.3f ms", d2)
+		fmt.printfln("  doc_scroll -1 (avg)    : %.3f ms", d3)
+		fmt.printfln("  ensure_cursor_visible  : %.2f ms", d4)
+		for pair in ([]struct{name: string, ms: f64}{{"doc_max_top", d1}, {"doc_scroll+", d2}, {"doc_scroll-", d3}, {"ensure_visible", d4}}) {
+			if pair.ms > 16 {
+				fmt.printfln("  FAIL: %s exceeds one frame (%.2f ms)", pair.name, pair.ms)
+				bad += 1
+			}
+		}
+
+		// A normal multi-line buffer must still scroll by real line starts.
+		ml := strings.clone("l0\nl1\nl2\nl3\nl4\nl5\n")
+		md := doc_from_content(transmute([]u8)ml, "", .UTF8)
+		defer doc_close(&md)
+		md.wrap = false
+		md.view_cols = 80
+		md.view_rows = 3
+		md.top = 0
+		doc_scroll(&md, &t, 2, 3) // l0=0 l1=3 l2=6 ... -> top should be 6
+		if md.top != 6 {
+			fmt.printfln("  FAIL: scroll +2 landed at %d, want 6 (line start of l2)", md.top)
+			bad += 1
+		}
+		doc_scroll(&md, &t, -1, 3) // back to l1 at 3
+		if md.top != 3 {
+			fmt.printfln("  FAIL: scroll -1 landed at %d, want 3 (line start of l1)", md.top)
+			bad += 1
+		}
+		if bad == 0 {fmt.println("  bounded, and short-line scrolling still lands on line starts: OK")}
+		fmt.printfln("scrollperftest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad replacetest` covers the two ways Replace All lost data.
 	//
 	// It pushed one undo entry per match. UNDO_MAX is 200 and evicts the oldest,

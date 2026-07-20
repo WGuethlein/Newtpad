@@ -1222,7 +1222,7 @@ doc_cursor_col :: proc(doc: ^Document, t: ^plat.Text) -> int {
 // last line stays at the bottom.
 doc_scroll_to_fraction :: proc(doc: ^Document, t: ^plat.Text, frac: f32, rows: int) {
 	target := int(clamp(frac, 0, 1) * f32(doc.pt.length))
-	doc.top = min(base.pt_line_start(&doc.pt, target), doc_max_top(doc, t, rows))
+	doc.top = min(row_start_capped(doc, target), doc_max_top(doc, t, rows))
 }
 
 // Move the caret to the start of 1-based line `n` (O(n) line walk from the top).
@@ -1418,13 +1418,45 @@ doc_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows
 
 // --- viewport ---
 
+// Non-wrap row stepping, capped to RENDER_LINE_CAP exactly like the renderer
+// (visible_next / doc_draw). A line longer than the cap is treated as successive
+// capped rows — which is already how doc_draw shows it — so scrolling and drawing
+// agree on where the rows fall. For any normal line (< cap) these are identical
+// to base.pt_line_start / pt_next_line_start / pt_prev_line_start.
+//
+// This is the fix for the multi-GB single-line freeze: doc_scroll, doc_max_top,
+// doc_ensure_cursor_visible and doc_scroll_to_fraction called the UNCAPPED
+// base.pt_* scans (O(line length), ~350 ms/GB) on the UI thread on every wheel
+// tick / page / scrollbar drag, so a long-line file locked the whole app on any
+// interaction. These bound each step to one cap's worth of bytes.
+@(private = "file")
+row_start_capped :: proc(doc: ^Document, pos: int) -> int {
+	s, _ := base.pt_line_start_cap(&doc.pt, pos, RENDER_LINE_CAP)
+	return s
+}
+
+@(private = "file")
+next_row_start_capped :: proc(doc: ^Document, pos: int) -> int {
+	e := base.pt_line_end_cap(&doc.pt, pos, RENDER_LINE_CAP)
+	if e >= doc.pt.length {return doc.pt.length}
+	// A real newline is stepped past; a synthetic cap boundary starts at e.
+	return e + 1 if byte_at(doc, e) == '\n' else e
+}
+
+@(private = "file")
+prev_row_start_capped :: proc(doc: ^Document, pos: int) -> int {
+	if pos <= 0 {return 0}
+	s, _ := base.pt_line_start_cap(&doc.pt, pos - 1, RENDER_LINE_CAP)
+	return s
+}
+
 // The largest doc.top that still fills the viewport (keeps the last line at the
 // bottom row); 0 if the whole document fits. Bounds scrolling to real content.
 doc_max_top :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
-	p := visual_row_start(doc, t, doc.pt.length, doc.view_cols) if doc.wrap else base.pt_line_start(&doc.pt, doc.pt.length)
+	p := visual_row_start(doc, t, doc.pt.length, doc.view_cols) if doc.wrap else row_start_capped(doc, doc.pt.length)
 	for _ in 0 ..< max(rows - 1, 0) {
 		if p == 0 {break}
-		p = prev_visual_row(doc, t, p, doc.view_cols) if doc.wrap else base.pt_prev_line_start(&doc.pt, p)
+		p = prev_visual_row(doc, t, p, doc.view_cols) if doc.wrap else prev_row_start_capped(doc, p)
 	}
 	return p
 }
@@ -1434,14 +1466,14 @@ doc_max_top :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta, rows: int) {
 	if delta > 0 {
 		for _ in 0 ..< delta {
-			nt := next_visual_row(doc, t, doc.top, doc.view_cols) if doc.wrap else base.pt_next_line_start(&doc.pt, doc.top)
+			nt := next_visual_row(doc, t, doc.top, doc.view_cols) if doc.wrap else next_row_start_capped(doc, doc.top)
 			if nt == doc.top {break}
 			doc.top = nt
 		}
 	} else if delta < 0 {
 		for _ in 0 ..< -delta {
 			if doc.top == 0 {break}
-			doc.top = prev_visual_row(doc, t, doc.top, doc.view_cols) if doc.wrap else base.pt_prev_line_start(&doc.pt, doc.top)
+			doc.top = prev_visual_row(doc, t, doc.top, doc.view_cols) if doc.wrap else prev_row_start_capped(doc, doc.top)
 		}
 	}
 	doc.top = min(doc.top, doc_max_top(doc, t, rows))
@@ -1449,7 +1481,7 @@ doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta, rows: int) {
 
 // Keep the caret on screen: scroll so its visual row is within [top, top+rows).
 doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
-	cls := visual_row_start(doc, t, doc.cursor, doc.view_cols) if doc.wrap else base.pt_line_start(&doc.pt, doc.cursor)
+	cls := visual_row_start(doc, t, doc.cursor, doc.view_cols) if doc.wrap else row_start_capped(doc, doc.cursor)
 	if cls < doc.top {
 		doc.top = cls
 		return
@@ -1458,7 +1490,7 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 	p := doc.top
 	for _ in 0 ..< rows {
 		if p >= cls {return}
-		p = next_visual_row(doc, t, p, doc.view_cols) if doc.wrap else base.pt_next_line_start(&doc.pt, p)
+		p = next_visual_row(doc, t, p, doc.view_cols) if doc.wrap else next_row_start_capped(doc, p)
 	}
 	// caret is below the viewport: put its row at the bottom
 	doc.top = cls
