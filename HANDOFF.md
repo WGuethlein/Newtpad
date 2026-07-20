@@ -76,6 +76,7 @@ clean and verified by the audit.**)
   - `history.odin` — the undo-history panel.
   - `session.odin` — hot exit: `session.txt` plus per-buffer backups.
   - `watch.odin` — external-change detection on a worker (timestamp polling, never a held handle).
+  - `links.odin` — clickable URLs and file paths: detection, resolution, safety (§6l).
   - `test_modes.odin` — the headless harness. **Note it is `package main`, so it ships inside the
     release exe;** moving it behind a build flag is tracked in §5.
 
@@ -726,96 +727,97 @@ growth worked. Prefer a check that cannot pass with the bug present.
   crash reporting, unsigned binary, no updater, no LICENSE, no UIA provider, no `\?\` long paths,
   no VirtualAlloc arenas, and the app still redraws at vsync when idle with no `WaitMessage`.
 
-## 6l. Clickable links and file paths — requested, not built (Wyatt, 2026-07-19)
+## 6l. Clickable links and file paths — DONE (2026-07-19)
 
-Ctrl+click a URL or a file path in a document and go there. It fits Newtpad specifically: the files
-this editor is for — build logs, stack traces, linter output, config files — are full of paths, and
-following one currently means selecting it, copying it, and opening it by hand.
+Ctrl+click a URL or a file path in a document and go there. Built unsupervised in one pass along
+with its prerequisite; `linktest` covers the parts that are testable without GUI input, and the
+parts that are not are listed at the end of this section.
 
-**Decisions taken up front** (Wyatt, 2026-07-19):
+**As built.** Ctrl+hover underlines links in blue and turns the pointer into a hand; Ctrl+click
+opens. Plain click still places the caret, so you can click into the middle of a URL to edit it.
+`Open Link Under Cursor` is in the command table, so this is not mouse-only and appears in the
+palette by name — deliberately left unbound, because Shift cannot currently be part of a chord
+(audit finding F4) and every sensible single-modifier chord is taken.
 
-- **Detect** URLs (http/https/file/mailto), absolute Windows paths, UNC paths, `file.txt:123`
-  line/column references, and relative paths.
-- **Relative resolution is anchored to the open document's folder and nothing else** — never the
-  process CWD (which is wherever Explorer happened to launch us), never `PATH`, never a walk up
-  through parent directories. An untitled buffer has no anchor, so relative detection is simply off
-  there. *(This is my reading of "make it relative only" — correct it if it meant something else.)*
-- **Ctrl+click activates**, matching VS Code and Sublime. Plain click still places the caret, so no
-  existing behaviour changes and you can still click into the middle of a URL to edit it.
-- **Safety posture: never hand an arbitrary path to `ShellExecute`.** A text-ish file opens as a
-  Newtpad tab; anything else is revealed in Explorer so the user decides. Only URLs are handed off.
-- **Sequenced after `text_draw_spans`.** Build the span primitive once and let syntax highlighting
-  and link underlining both consume it.
+Detected: URLs (`http`, `https`, `mailto`), absolute drive paths, UNC paths, relative paths, and
+any of those with a `:123` or `:123:45` suffix.
 
-### Why it is not standalone
+**The prerequisite, `text_draw_spans`.** `text_draw` took one flat colour per call, so no part of a
+line could be recoloured or underlined. The new primitive walks the runes and a sorted span list
+together — one pass, no per-rune search — and `text_draw` is now a wrapper that passes no spans.
+**Syntax highlighting (audit finding F1) wants exactly this primitive**, and should be its second
+consumer. `text_span_cells` gives a byte range's cell range, for placing decorations on the same
+grid the glyphs advance along.
 
-`text_draw` takes **one flat colour per call**, so there is no way to underline or recolour part of
-a line. That is the same gap syntax highlighting has (audit finding F1), and it should be filled
-once. Shipping detection and Ctrl+click without the visual affordance would mean links that work
-but are invisible until you happen to hold Ctrl over one.
+**Safety, which is most of the design.** Text the user is reading may have been written by anyone,
+so a link in it is untrusted input:
 
-There is a second prerequisite the audit measured: **the text pipeline batches nothing** — one heap
-allocation, two buffer maps and one draw call per string (`drawcount`, §6k). Drawing a line as
-several spans multiplies that per row. Span rendering wants the batching work first, or a frame
-with a lot of links gets materially more expensive than a frame without.
+- URL schemes are **whitelisted**, not blacklisted. `search-ms:`, `ms-msdt:` (Follina) and
+  `ms-officecmd:` are delivered exactly this way and the list of dangerous handlers grows.
+- Paths are **stat'd first** — a broken link reaches no handler at all.
+- A text-ish file opens as a tab; **anything else is revealed in Explorer**, so nothing we did
+  executed it. `shell_open_url` re-checks the whitelist itself, so a caller that forgets cannot
+  open a handler URL by accident.
+- Relative paths anchor to the document's own folder and nothing else: no process CWD (which is
+  wherever Explorer launched us), no `PATH`, and **a parent walk is refused rather than resolved**.
+  An untitled buffer has no anchor, so relative links do not resolve there.
 
-### Design notes for when it lands
+**Where links end** is the whole difficulty, and the rules are heuristics — say so rather than
+pretending otherwise. Trailing sentence punctuation is trimmed; a closing bracket is kept when it
+is balanced within the run, so `A_(b)` in a wiki URL survives while `(see http://x)` does not.
+A token carrying a URI scheme is refused outright: `ms-msdt:/id` contains a slash and sailed
+straight through the path heuristic, and although `link_resolve` would never have opened it, it
+rendered **underlined** — advertising a target we would decline. A whitelist on the URL branch does
+not help if the path branch picks the same string up.
 
-**Detection is viewport-scoped**, like everything else here — run over the visible line range plus a
-margin, never the whole document, so it costs nothing on a multi-GB log. Recompute per frame from
-the visible range rather than trying to keep spans valid across edits; the range is bounded, which
-is what makes that affordable.
+**`WM_SETCURSOR` is now handled at all**, which it never was — the window class set one `IDC_ARROW`
+for the life of the process. That also unblocks the I-beam over text (audit finding F5); the
+plumbing is there and only the policy is missing.
 
-The hard part is not finding candidates, it is **ending them**:
+### The seam this produced, and what caught it
 
-- **Trailing punctuation.** `see http://example.com/x.` must not include the period, and `(see
-  http://example.com/a_(b))` must keep the inner parens. The usual rule — strip trailing `.,;:!?`
-  and unbalanced closers — is a heuristic, and should be written down as one.
-- **Spaces in Windows paths.** `C:\Program Files\app\config.txt` has no reliable terminator. Accept
-  a space only when the run continues to a known extension, or when the whole path is quoted. This
-  will get some cases wrong; the failure should be a link that stops short, never one that swallows
-  the rest of the line.
-- **`C:` is a drive, not a line number.** The `path:line` parser must not treat a single-letter
-  segment followed by `\` as a `:line` suffix. Reuse whatever the CLI `file.txt:123` argument
-  handling uses so there is one parser, not two.
+`links_layout` is the single producer of link geometry: the underline, the glyph colouring, the
+hover and the click all read the same `Link_Hit`. That is supposed to make divergence impossible —
+and it still shipped a bug, until the test caught it.
 
-**Resolution and safety.** Stat the target first — a path that does not exist should not reach any
-handler at all. Then:
+The hit-test used `col_at_x`, which **rounds to the nearest caret boundary**, because that is what
+click-to-place-caret needs. The underline is drawn from the cell index. Half a cell of shift meant
+a link's **first cell was clickable from outside it and its last cell was not clickable at all**.
+`cell_at_x` is the inside-the-cell version and now sits beside `col_at_x` with the distinction
+written down.
 
-- Text-ish extension → `app_open_path`, which already activates an existing tab if the file is
-  open. **Reuse the extension list `install.ps1` registers** rather than writing a second one.
-- Anything else, or a directory → reveal in Explorer (`SHOpenFolderAndSelectItems`). Never
-  `ShellExecute` a file we did not classify.
-- URLs → the default browser, which is the one unavoidable handoff. **Whitelist schemes** —
-  `http`, `https`, `mailto`, and `file` (routed through the path logic above, not the browser).
-  Refuse everything else. This is not theoretical: `search-ms:`, `ms-msdt:` (Follina) and
-  `ms-officecmd:` are delivered exactly this way, through a link in a document someone else wrote.
-  A blacklist will be wrong eventually; a whitelist fails closed.
+Right function, wrong space — the §6j class exactly, in code written specifically to avoid it. It
+was caught only because `linktest` compares the drawn span to the clickable span **at both edges**,
+which is the shape §6j says a seam test must have. Sharing one struct was not sufficient; the two
+consumers still read it through different transforms.
 
-**Activation.**
+### Open questions for the next session
 
-- Ctrl+hover underlines the span and changes the cursor to a hand. Newtpad sets one `IDC_ARROW` for
-  the process lifetime and handles no `WM_SETCURSOR` (audit finding F5), so this shares a fix with
-  "the cursor is never an I-beam over text".
-- Ctrl+click opens. Also add an `Open_Link_At_Caret` command to the table, so it is keyboard
-  reachable and shows up in the palette with its chord — commands are declared once, and a
-  mouse-only feature would be the exception.
+Design questions I could not settle alone, in rough priority:
 
-**Things that will bite.**
+1. **Word wrap is not handled.** A link spanning two visual rows currently gets one `Link_Hit` for
+   whatever lands on each row, since `links_layout` scans per visual row — so the halves underline
+   independently and each resolves the partial text, which usually fails. Wrapped rows need the
+   link detected on the *logical* line and then split into per-row segments. Filter view is
+   excluded for the same reason (it renders `filter_lines` through a different path).
+2. **Should a link inside a selection still activate on Ctrl+click, or does selection win?**
+   Currently the link wins, because the check runs before the caret handling.
+3. **Should the underline show without Ctrl?** It is Ctrl-gated now, which keeps the document clean
+   and costs nothing, but it also means links are invisible until you know to hold Ctrl. VS Code
+   has the same property and people do not discover it.
+4. **No binding for `Open Link Under Cursor`.** Worth one once Shift-in-chords lands (F4).
+5. **`link_activate` jumps to a column in bytes, not cells** — wrong for a CJK line. Nothing points
+   at it today because compiler output is ASCII, but it is inconsistent with the rest of the grid.
+6. **Extension list is duplicated.** `TEXT_EXTS` in `links.odin` restates what `install.ps1`
+   registers. Two lists that must agree and nothing enforces it.
+7. Whether directories should open as a *tab* listing contents rather than revealing in Explorer —
+   that edges toward the parked container/tree viewer (§6), so it was left alone.
 
-- **Word wrap splits a link across visual rows.** The underline has to be drawn per row segment and
-  the hit-test has to accept any segment. One `links_layout()` producing per-row segments, consumed
-  by the draw, the hover and the click — the seam rule applies here as much as anywhere.
-- **Filter view** should get links too; it renders `filter_lines` through a different path.
-- Spans are in **cells**, not pixels — go through `col_x`/`col_at_x` like every other overlay, or
-  the underline drifts from the glyphs on CJK.
-
-### Open questions
-
-- Does a detected link inside a *selection* still activate on Ctrl+click, or does selection win?
-- Should `file://` URLs with a host component be refused outright (they are a UNC in disguise)?
-- Is there a size cap on the line being scanned? A 100 MB single-line file has one visible "line";
-  detection must bound itself by the visible *cell* range, not the line.
+**Not covered by any test, because this environment cannot inject input:** the Ctrl+hover cursor
+change, the actual Ctrl+click gesture, and whether the underline lands where it looks like it
+should on screen. `linktest` covers detection, resolution, the scheme whitelist, and the
+drawn-vs-clickable span agreement. **A live pass is owed on this feature specifically** — try a
+wrapped line, a CJK line, and a path with spaces.
 
 ## 7. Build environment (Windows, this machine)
 
@@ -824,7 +826,7 @@ handler at all. Then:
   Append `run` to launch. Both embed `newtpad.res` (the per-monitor-v2 DPI manifest) and link
   `guarded.obj` (the SEH shim). **A bare `odin build` omits both.** If you edit `guarded_copy.c` or
   `newtpad.manifest`, delete the matching file in `build\` to force a rebuild.
-- Sizes as of 2026-07-19: **debug ~1.3 MB, release 0.87 MB** (target 2-3 MB). Release grew from
+- Sizes as of 2026-07-19: **debug ~1.3 MB, release 0.90 MB** (target 2-3 MB). Release grew from
   0.69 MB when the headless harness expanded — `test_modes.odin` is `package main`, so every test
   mode ships inside the customer's binary. Tracked in §5.
 - Tests: `odin test src\base -collection:src=src` (20 cases: encoding, line-nav, piece tree,
@@ -833,7 +835,8 @@ handler at all. Then:
   session modes write to, and reset, the real store under `%APPDATA%\Newtpad`:
   - Rendering / platform: `sehtest`, `dpitest`, `atlastest`, `atlasgrowtest`, `devicelosttest`,
     `celltest`, `drawcount <file>`
-  - UI surfaces: `menutest`, `menuseam`, `palettetest`, `settingstest`, `fonttest`, `historytest`
+  - UI surfaces: `menutest`, `menuseam`, `palettetest`, `settingstest`, `fonttest`, `historytest`,
+    `linktest`
   - Document / editing: `vnavtest`, `wraptest`, `colperftest <mb>`, `replacetest`, `findtest`,
     `regextest <mb>`
   - Files / session: `savepathtest <dir>`, `savefailtest <dir>`, `resavetest <file>`,
