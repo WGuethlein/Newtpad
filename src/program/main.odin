@@ -120,6 +120,8 @@ main :: proc() {
 	scrollbar_drag := false
 	hscrollbar_drag := false
 	md_preview_drag := false
+	sel_dragging := false // a text-selection drag has begun (pointer moved since press)
+	press_x, press_y: i32 // client pos of the press that may become a drag
 
 	for !window.should_close {
 		// Sleep when idle instead of spinning at vsync (which pinned a core the whole
@@ -527,19 +529,32 @@ main :: proc() {
 					doc.anchor = mp
 				}
 			}
+			press_x, press_y = window.mouse_x, window.mouse_y
+			sel_dragging = false // arm; a drag begins only once the pointer moves
 			window.mouse_pressed = false
 		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag {
-			// drag extends a single-click selection; word/line selects stay put.
-			// Auto-scroll while the pointer is dragged above the first row or at/
-			// below the last one — the edges are the content area, so entering the
-			// bottom bar (or leaving the window past it) keeps scrolling instead of
-			// stopping dead at the last visible line.
-			if f32(window.mouse_y) < CONTENT_TOP + FILTER_BANNER_H {
-				doc_scroll(doc, &text, -1, rows)
-			} else if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
-				doc_scroll(doc, &text, 1, rows)
+			// A selection drag begins only once the pointer has actually moved from
+			// the press point. A stationary press-and-hold must not extend the
+			// selection or auto-scroll -- that was the bug where holding still lit up
+			// lines and scrolled. Once dragging, the flag stays set, so holding at an
+			// edge keeps auto-scrolling without needing further movement.
+			DRAG_SLOP :: 3
+			slop := i32(sx(DRAG_SLOP))
+			if !sel_dragging && (abs(window.mouse_x - press_x) > slop || abs(window.mouse_y - press_y) > slop) {
+				sel_dragging = true
 			}
-			doc.cursor = doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
+			if sel_dragging {
+				// Auto-scroll while the pointer is dragged above the first row or at/
+				// below the last one — the edges are the content area, so entering the
+				// bottom bar (or leaving the window past it) keeps scrolling instead of
+				// stopping dead at the last visible line.
+				if f32(window.mouse_y) < CONTENT_TOP + FILTER_BANNER_H {
+					doc_scroll(doc, &text, -1, rows)
+				} else if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
+					doc_scroll(doc, &text, 1, rows)
+				}
+				doc.cursor = doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
+			}
 		}
 
 		// The wheel scrolls even with Ctrl held: Ctrl is the link-highlight modifier,
