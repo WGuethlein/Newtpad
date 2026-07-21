@@ -405,7 +405,7 @@ main :: proc() {
 				}
 			}
 			window.mouse_pressed = false
-		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag {
+		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag {
 			// drag extends a single-click selection; word/line selects stay put.
 			// Auto-scroll while the pointer is dragged above the first row or at/
 			// below the last one — the edges are the content area, so entering the
@@ -665,8 +665,12 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	total := doc.pt.length
 	if total > 0 && !doc.filter {
 		sb_h := h - CHROME_TOP
-		ty := CHROME_TOP + f32(doc.top) / f32(total) * sb_h
-		th := max(sx(24), f32(bottom - doc.top) / f32(total) * sb_h)
+		th := clamp(f32(bottom - doc.top) / f32(total) * sb_h, sx(24), sb_h)
+		// Keep the thumb inside the track. Without the upper clamp it ran off the
+		// bottom of the window when doc.top sat near the end -- which force-wrapping
+		// makes common, since the last visible row of a wrapped line lands close to
+		// the document end.
+		ty := clamp(CHROME_TOP + f32(doc.top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
 		bars[nb] = {pos = {w - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
 		bars[nb] = {pos = {w - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = {0.42, 0.48, 0.60, 1}};nb += 1
 	}
