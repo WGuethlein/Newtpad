@@ -941,6 +941,14 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad mdtest` covers the markdown block classifiers and inline parser
+	// (the rendering itself needs a live eye).
+	if os.args[1] == "mdtest" {
+		bad := md_selftest()
+		fmt.printfln("mdtest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad csvtest` covers the table-view field parser: delimiters, empties,
 	// quoted fields with embedded delimiters, and "" escapes.
 	if os.args[1] == "csvtest" {

@@ -59,6 +59,7 @@ Command_Id :: enum u8 {
 	Clear_Selection,
 	Toggle_Wrap,
 	Toggle_Table,
+	Toggle_Preview,
 	// command palette
 	Palette_Open,
 	Palette_Close,
@@ -167,6 +168,7 @@ command_table := [Command_Id]Command {
 	.Clear_Selection          = {"Clear Selection", "Cursor"},
 	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
 	.Toggle_Table             = {"Toggle Table View (CSV/TSV)", "View"},
+	.Toggle_Preview           = {"Toggle Markdown Preview / Split", "View"},
 	.Palette_Open             = {"Command Palette", "View"},
 	.Palette_Close            = {"Palette: Close", "View"},
 	.Palette_Confirm          = {"Palette: Confirm", "View"},
@@ -269,6 +271,7 @@ default_bindings := []Binding {
 	{.Escape, false, false, .Editor, .Clear_Selection},
 	{.Z, false, true, .Editor, .Toggle_Wrap}, // Alt+Z
 	{.T, true, false, .Editor, .Toggle_Table}, // Ctrl+T: CSV/TSV table view
+	{.M, true, false, .Editor, .Toggle_Preview}, // Ctrl+M: markdown preview -> split -> off
 	{.Plus, true, false, .Editor, .Zoom_In}, // Ctrl+= / Ctrl+numpad+
 	{.Minus, true, false, .Editor, .Zoom_Out}, // Ctrl+- / Ctrl+numpad-
 	{.Num0, true, false, .Editor, .Zoom_Reset}, // Ctrl+0
@@ -649,6 +652,21 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				doc.table_delim = table_choose_delim(doc)
 				doc.top = base.pt_line_start(&doc.pt, doc.top)
 				doc.table_col = 0
+			}
+		}
+	case .Toggle_Preview:
+		// Cycle Off -> Preview -> Split -> Off. Split seeds the preview scroll from
+		// the editor's so the two start aligned.
+		if doc.kind == .Text {
+			switch doc.md_mode {
+			case .Off:
+				doc.md_mode = .Preview
+				doc.top = base.pt_line_start(&doc.pt, doc.top)
+			case .Preview:
+				doc.md_mode = .Split
+				doc.md_top = doc.top
+			case .Split:
+				doc.md_mode = .Off
 			}
 		}
 

@@ -541,6 +541,11 @@ Document :: struct {
 	table_delim: u8, // ',' or '\t'; chosen when the view is turned on
 	table_col:   int, // horizontal scroll: first visible table column
 	table_cols:  int, // column count seen this frame (set by table_draw)
+	// Markdown view (see markdown.odin): Off / Preview (full) / Split (editor +
+	// live preview). md_top is the preview pane's own scroll byte offset in Split;
+	// Preview reuses doc.top.
+	md_mode:     Md_Mode,
+	md_top:      int,
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)

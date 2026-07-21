@@ -325,10 +325,10 @@ main :: proc() {
 			window.mouse_down = false
 			window.scroll_delta = 0
 		}
-		// Table view is read-only: swallow caret/selection clicks in the content
-		// area (the scrollbar and tab strip already claimed theirs above), but keep
-		// the wheel so it still scrolls rows.
-		if doc.table && doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) && !scrollbar_drag {
+		// Table and full-window markdown preview are read-only: swallow caret/
+		// selection clicks in the content area (the scrollbar and tabs already
+		// claimed theirs above), but keep the wheel so it still scrolls.
+		if doc.kind == .Text && (doc.table || doc.md_mode == .Preview) && window.mouse_y >= i32(CHROME_TOP) && !scrollbar_drag {
 			window.mouse_pressed = false
 			window.mouse_middle_pressed = false
 			window.mouse_down = false
@@ -641,7 +641,12 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	cx, cy: f32
 	caret := false
 	bottom := doc.top
-	if doc.table && doc.kind == .Text {
+	if doc.kind == .Text && doc.md_mode == .Preview {
+		// Full-window rendered markdown (read-only) replaces the text pass.
+		ytop := CONTENT_TOP + FILTER_BANNER_H
+		ybot := f32(window.height) - doc_bottom_bar_h(doc)
+		bottom = markdown_draw(gfx, quad_pipe, text, doc, px, char_w, TEXT_MARGIN_X, f32(window.width) - SCROLLBAR_W, ytop, ybot, doc.top)
+	} else if doc.table && doc.kind == .Text {
 		// Read-only grid view (CSV/TSV) replaces the text pass entirely.
 		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, rows, f32(window.width))
 	} else {
@@ -826,7 +831,15 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// A dirty buffer too large to auto-back-up: unsaved edits are not
 		// crash-protected until saved (backing it up would freeze/OOM the app).
 		nobackup := "  [LARGE FILE - unsaved edits are NOT auto-backed up; Save to keep them]" if doc_backup_skipped(doc) else ""
-		mode := "    Table (Ctrl+T)" if doc.table else ("    Wrap" if doc.wrap else "")
+		mode := "    Wrap" if doc.wrap else ""
+		if doc.table {mode = "    Table (Ctrl+T)"}
+		switch doc.md_mode {
+		case .Off:
+		case .Preview:
+			mode = "    Markdown Preview (Ctrl+M)"
+		case .Split:
+			mode = "    Markdown Split (Ctrl+M)"
+		}
 		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", mode, recovered, disk, indexing, atlas, nobackup)
 		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)
 		col := [4]f32{0.95, 0.55, 0.35, 1} if warn else {0.55, 0.60, 0.70, 1}
