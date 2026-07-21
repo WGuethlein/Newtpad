@@ -1056,6 +1056,40 @@ in v0.7.0; the two GUI-feel ones want a live pass (headless can't inject drags o
   because a move or Ctrl press is itself a waking message. **Can't be verified headlessly** — watch
   for any input lag or a stale frame after a background change during Wyatt's pass.
 
+## 6p. Markdown views + table editing (2026-07-20, v0.8.0)
+
+Wyatt asked for a markdown viewer/editor toggle with a live side-by-side split ("rich as
+feasible"), then a batch of table fixes after live-driving the grid. All shipped; the visual
+pieces (split layout, in-cell editing feel) want Wyatt's live pass.
+
+- **Markdown preview + split (Ctrl+M) — DONE.** `markdown.odin`: `Md_Mode {Off, Preview, Split}`,
+  cycled by Ctrl+M (and the View menu). Preview replaces the text pass with a line-based rendered
+  view; Split draws the editor on the left and a live preview on the right of a divider
+  (`doc_editor_right`, `MD_SPLIT_FRAC 0.5`), each with its own scroll (`md_top`, wheel routes to
+  the half under the cursor). Inline parser (`md_inline`) handles `**`/`__` bold (synthetic, drawn
+  twice offset a texel — no bold face in the atlas), `*`/`_` italic (tint), `` ` `` code, and
+  `[label](url)` links; block level does headings, rules, block-quotes, lists, and table rows.
+  `mdtest` covers the block classifiers and the inline parser (rendering itself needs a live eye).
+- **Table view menu + palette — DONE.** Ctrl+T (Toggle Table View) and Ctrl+M (Toggle Markdown
+  Preview) are in the View menu with their chords and in the palette, so neither is undiscoverable.
+  Menu predicates `is_table` / `is_md_view` check/enable the rows.
+- **Table columns no longer shift on scroll — DONE.** Column widths come from a one-time sample of
+  the first `TABLE_SAMPLE` (500) rows (`table_compute_widths`), cached in `doc.table_widths`, not
+  recomputed from the currently-visible rows — so scrolling a wider header off-screen and narrower
+  data in no longer reflows the grid. Recomputed on open and after a cell edit.
+- **Links inside table cells (Ctrl+click) — DONE.** Cells sit at arbitrary column x's, not the
+  uniform text grid, so raw-line link detection lit the whole row. `table_links` positions each
+  link in pixels to match `table_draw`'s layout and `table_link_hit` is a pixel-rect test; Ctrl+hover
+  shows the hand and Ctrl+click activates only the link under the pointer.
+- **Edit cells in place — DONE (live pass owed).** Click a cell to edit it: the buffer draws over
+  the cell with a caret + highlight box, keeping the grid's exact look. Enter/Tab commit (Tab steps
+  to the next cell), Esc cancels, click-away and scroll commit. The commit splices only the edited
+  field's raw byte span (`csv_field_ranges`, quote-aware) with the re-serialized value
+  (`csv_serialize`, quotes only when needed) through the document's undo as one step
+  (`doc_replace_range`), then re-fits columns. An external reload mid-edit drops the pending edit so
+  a commit never writes at a stale offset. `tablecellstest` covers the range parser, the serializer,
+  and the full replace-a-field splice.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -1075,7 +1109,8 @@ in v0.7.0; the two GUI-feel ones want a live pass (headless can't inject drags o
   - UI surfaces: `menutest`, `menuseam`, `palettetest`, `settingstest`, `fonttest`, `historytest`,
     `linktest`, `tabreordertest`
   - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
-    `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `replacetest`, `findtest`, `regextest <mb>`
+    `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `mdtest`, `replacetest`,
+    `findtest`, `regextest <mb>`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest <file>`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest <dir>`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
