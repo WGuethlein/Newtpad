@@ -119,6 +119,7 @@ main :: proc() {
 	last_input := time.tick_now()
 	scrollbar_drag := false
 	hscrollbar_drag := false
+	md_preview_drag := false
 
 	for !window.should_close {
 		// Sleep when idle instead of spinning at vsync (which pinned a core the whole
@@ -173,7 +174,7 @@ main :: proc() {
 		rows := doc_visible_rows(doc, f32(window.height), line_h)
 		// Usable content width in cells (word wrap breaks here).
 		doc_update_gutter(doc, char_w) // before view_cols: the gutter narrows the text
-		doc.view_cols = doc_view_cols(f32(window.width), char_w)
+		doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width)), char_w)
 		doc.view_rows = rows
 		// Horizontal scroll: clamp to real content, then mirror into H_SCROLL for
 		// this frame so the whole frame's column geometry agrees.
@@ -325,22 +326,13 @@ main :: proc() {
 			window.mouse_down = false
 			window.scroll_delta = 0
 		}
-		// Table and full-window markdown preview are read-only: swallow caret/
-		// selection clicks in the content area (the scrollbar and tabs already
-		// claimed theirs above), but keep the wheel so it still scrolls.
-		if doc.kind == .Text && (doc.table || doc.md_mode == .Preview) && window.mouse_y >= i32(CHROME_TOP) && !scrollbar_drag {
-			window.mouse_pressed = false
-			window.mouse_middle_pressed = false
-			window.mouse_down = false
-		}
-
-		// Scrollbar: a press in the right-edge gutter starts a drag that maps the
-		// pointer's y to a byte-proportional scroll position (consumes the click).
-		// Same condition the scrollbar is DRAWN under: otherwise the gutter is
-		// live where no bar exists (empty buffer, filter view), swallowing clicks
-		// meant for the last column and scrolling a document you cannot see.
+		ed_right := doc_editor_right(doc, f32(window.width))
+		// Editor scrollbar: a press in its gutter starts a byte-proportional drag. In
+		// Markdown Split it sits at the divider (ed_right), not the window edge, where
+		// the preview's own scrollbar lives. (Otherwise the gutter would be live where
+		// no bar exists — empty buffer, filter view — swallowing last-column clicks.)
 		scrollbar_shown := doc.pt.length > 0 && !doc.filter
-		if scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - SCROLLBAR_W && window.mouse_y >= i32(CHROME_TOP) {
+		if scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= ed_right - SCROLLBAR_W && f32(window.mouse_x) < ed_right && window.mouse_y >= i32(CHROME_TOP) {
 			scrollbar_drag = true
 			window.mouse_pressed = false
 		}
@@ -350,6 +342,19 @@ main :: proc() {
 				doc_scroll_to_fraction(doc, &text, frac, rows)
 			} else {
 				scrollbar_drag = false
+			}
+		}
+		// Preview scrollbar (Markdown Split only), at the window edge.
+		if doc.md_mode == .Split && scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - SCROLLBAR_W && window.mouse_y >= i32(CHROME_TOP) {
+			md_preview_drag = true
+			window.mouse_pressed = false
+		}
+		if md_preview_drag {
+			if window.mouse_down {
+				frac := (f32(window.mouse_y) - CHROME_TOP) / max(1, f32(window.height) - CHROME_TOP)
+				doc.md_top = md_scroll_pos(doc, frac)
+			} else {
+				md_preview_drag = false
 			}
 		}
 
@@ -370,6 +375,19 @@ main :: proc() {
 				} else {
 					hscrollbar_drag = false
 				}
+			}
+		}
+
+		// Read-only content: the table grid, a full preview, and the preview half of
+		// a split take no caret. Swallow any press the scrollbars above did not claim
+		// (so the wheel still scrolls, and the bars still drag). After the scrollbars,
+		// so a press on either bar reaches it first.
+		if doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) && !scrollbar_drag && !md_preview_drag {
+			ro := doc.table || doc.md_mode == .Preview || (doc.md_mode == .Split && f32(window.mouse_x) >= ed_right)
+			if ro && (window.mouse_pressed || window.mouse_down) {
+				window.mouse_pressed = false
+				window.mouse_middle_pressed = false
+				window.mouse_down = false
 			}
 		}
 
@@ -451,7 +469,14 @@ main :: proc() {
 		// so Ctrl+wheel is how you scroll through a document while its links are lit.
 		// Zoom lives on the keyboard instead (Ctrl+= / Ctrl+- / Ctrl+0) and Settings.
 		if window.scroll_delta != 0 {
-			if doc.table {
+			split_preview := false
+			if doc.md_mode == .Split && doc.kind == .Text {
+				cxp, _ := plat.window_cursor_client(window)
+				split_preview = f32(cxp) >= ed_right // wheel over the preview half
+			}
+			if split_preview {
+				doc.md_top = md_scroll_lines(doc, doc.md_top, window.scroll_delta)
+			} else if doc.table {
 				if plat.key_shift_down() { // Shift+wheel pans table columns
 					doc.table_col = clamp(doc.table_col + window.scroll_delta, 0, table_max_col(doc))
 				} else {
@@ -632,7 +657,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	doc_update_gutter(doc, char_w) // resize repaints come through here too
 	// Recompute the wrap width here (not just in the main loop) so word wrap
 	// re-flows live during a resize, which repaints through this path.
-	doc.view_cols = doc_view_cols(f32(window.width), char_w)
+	doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width)), char_w)
 	doc_update_hscroll(doc) // mirror the (already-clamped) horizontal offset
 
 	plat.text_frame_begin(gfx, text) // resets the recycle guard and grows the atlas if owed
@@ -702,11 +727,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, ctop}, size = {TEXT_MARGIN_X, cbot - ctop}, color = {0.09, 0.11, 0.16, 1}}})
 	}
 
-	// Scrollbar (byte-proportional, below the tab strip) + caret.
+	// Scrollbar (byte-proportional, below the tab strip) + caret. In Markdown Split
+	// the editor's scrollbar sits at the split, not the window edge (the preview's
+	// is drawn separately below).
 	bars: [4]plat.Quad
 	nb := 0
 	w := f32(window.width)
 	h := f32(window.height)
+	er := doc_editor_right(doc, w)
 	total := doc.pt.length
 	if total > 0 && !doc.filter {
 		sb_h := h - CHROME_TOP
@@ -716,14 +744,36 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// makes common, since the last visible row of a wrapped line lands close to
 		// the document end.
 		ty := clamp(CHROME_TOP + f32(doc.top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
-		bars[nb] = {pos = {w - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
-		bars[nb] = {pos = {w - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = {0.42, 0.48, 0.60, 1}};nb += 1
+		bars[nb] = {pos = {er - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
+		bars[nb] = {pos = {er - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = {0.42, 0.48, 0.60, 1}};nb += 1
 	}
 	if caret {
 		bars[nb] = {pos = {cx, cy - px}, size = {sx(2), line_h}, color = {0.95, 0.85, 0.35, 1}};nb += 1
 	}
 	if nb > 0 {
 		plat.quads_draw(gfx, quad_pipe, bars[:nb])
+	}
+
+	// Markdown Split: a divider, the live preview in the right half, and the
+	// preview's own byte-proportional scrollbar (on doc.md_top).
+	if doc.kind == .Text && doc.md_mode == .Split {
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {er, CHROME_TOP}, size = {max(sx(1), 1), h - CHROME_TOP}, color = {0.30, 0.34, 0.42, 1}}})
+		pvtop := CONTENT_TOP + FILTER_BANNER_H
+		pvbot := h - doc_bottom_bar_h(doc)
+		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.md_top)
+		if total > 0 {
+			sb_h := h - CHROME_TOP
+			th := clamp(f32(pv_bottom - doc.md_top) / f32(total) * sb_h, sx(24), sb_h)
+			ty := clamp(CHROME_TOP + f32(doc.md_top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
+			plat.quads_draw(
+				gfx,
+				quad_pipe,
+				[]plat.Quad {
+					{pos = {w - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = {0.16, 0.18, 0.22, 1}},
+					{pos = {w - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = {0.42, 0.48, 0.60, 1}},
+				},
+			)
+		}
 	}
 
 	// Horizontal scrollbar (plain view, when a visible line overflows).

@@ -127,7 +127,7 @@ H_SCROLL: int = 0
 // unless the document is in the plain (non-wrap, non-filter) view. Set alongside
 // the gutter/top-inset so the whole frame agrees.
 doc_update_hscroll :: proc(doc: ^Document) {
-	H_SCROLL = doc.h_scroll if (doc != nil && !doc.wrap && !doc.filter) else 0
+	H_SCROLL = doc.h_scroll if (doc != nil && !doc_wraps(doc) && !doc.filter) else 0
 }
 
 // Recompute the gutter for the active document. Only the filter view has one:
@@ -150,6 +150,15 @@ doc_update_gutter :: proc(doc: ^Document, char_w: f32) {
 // Call after doc_update_gutter -- it reads GUTTER_W.
 doc_view_cols :: #force_inline proc(width, char_w: f32) -> int {
 	return max(1, int((width - TEXT_MARGIN_X - GUTTER_W - SCROLLBAR_W) / char_w))
+}
+
+// Right edge of the editor's content area. The full window normally; the split
+// point in Markdown Split, where the preview owns the right half. Everything that
+// bounds the editor (wrap width, its scrollbar, its click region) uses this.
+MD_SPLIT_FRAC :: f32(0.5)
+doc_editor_right :: proc(doc: ^Document, winw: f32) -> f32 {
+	if doc != nil && doc.kind == .Text && doc.md_mode == .Split {return f32(int(winw * MD_SPLIT_FRAC))}
+	return winw
 }
 
 // Column geometry. `hs` is the row's effective horizontal offset in cells; the
@@ -226,9 +235,16 @@ line_wrap_decision :: proc(doc: ^Document, t: ^plat.Text, ls: int) -> bool {
 // force-wraps. Returns the (capped) line start too, for callers that then walk
 // visual rows. The one predicate the mixed layout rests on; bounded, which is
 // what preserves the "never freeze on a huge file" rule.
+// Whether the editor wraps at all: the user's word-wrap, or Markdown Split, where
+// the editor lives in the left half and must fold rather than run under the
+// preview.
+doc_wraps :: proc(doc: ^Document) -> bool {
+	return doc != nil && (doc.wrap || (doc.kind == .Text && doc.md_mode == .Split))
+}
+
 eff_wrap_at :: proc(doc: ^Document, t: ^plat.Text, off: int) -> (wrap: bool, ls: int) {
 	s, exact := base.pt_line_start_cap(&doc.pt, off, WRAP_START_CAP)
-	if doc.wrap {return true, s}
+	if doc_wraps(doc) {return true, s}
 	if !exact {return false, s} // line start beyond the cap: too long to wrap
 	return line_wrap_decision(doc, t, s), s
 }
@@ -1678,7 +1694,7 @@ HSCROLL_PAD :: 3
 // line longer than VISIBLE_COLS needs the draw to window on h_scroll — a separate
 // follow-up; this just makes the bar stop where the text does.)
 doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
-	if doc == nil || doc.wrap || doc.filter {return 0}
+	if doc == nil || doc_wraps(doc) || doc.filter {return 0}
 	widest := 0
 	it := visible_begin(doc, t, rows)
 	for {
@@ -1724,7 +1740,7 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 	// Skip it when the caret sits on a wrapped line (its rows fit the window, so
 	// h_scroll never hides it) or a too-long line (start past the cap) — leaving
 	// h_scroll put for whatever non-wrapped lines are being panned.
-	if !doc.wrap && !doc.filter {
+	if !doc_wraps(doc) && !doc.filter {
 		if lstart, exact := base.pt_line_start_cap(&doc.pt, doc.cursor, RENDER_LINE_CAP); exact && !line_wrap_decision(doc, t, lstart) {
 			ccol := line_cell_col(doc, t, lstart, doc.cursor)
 			vc := max(1, doc.view_cols)

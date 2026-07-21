@@ -218,6 +218,33 @@ md_draw_inline :: proc(gfx: ^plat.Gfx, text: ^plat.Text, runs: []Md_Run, xind, x
 	}
 }
 
+// Preview scroll: map a scrollbar fraction to a source-line-start byte offset.
+md_scroll_pos :: proc(doc: ^Document, frac: f32) -> int {
+	target := int(clamp(frac, 0, 1) * f32(doc.pt.length))
+	s, _ := base.pt_line_start_cap(&doc.pt, target, RENDER_LINE_CAP)
+	return clamp(s, 0, doc.pt.length)
+}
+
+// Preview scroll: move `off` by `delta` source lines (bounded, so a long line
+// can't hang it).
+md_scroll_lines :: proc(doc: ^Document, off, delta: int) -> int {
+	p := off
+	if delta > 0 {
+		for _ in 0 ..< delta {
+			e := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+			if e >= doc.pt.length {break}
+			p = e + 1
+		}
+	} else {
+		for _ in 0 ..< -delta {
+			if p <= 0 {break}
+			s, _ := base.pt_line_start_cap(&doc.pt, p - 1, RENDER_LINE_CAP)
+			p = s
+		}
+	}
+	return clamp(p, 0, doc.pt.length)
+}
+
 // Render markdown source from `top_byte`, laid out in [x0,x1] x [ytop,ybot].
 // Returns the byte offset just past the last line drawn (for scroll clamping).
 markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px, char_w: f32, x0, x1, ytop, ybot: f32, top_byte: int) -> (bottom: int) {
