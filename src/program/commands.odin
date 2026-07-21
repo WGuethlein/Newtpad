@@ -518,8 +518,26 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 // Run a command. `rows` is the visible row count (page moves); `w` supplies the
 // HWND for clipboard / Save-dialog. The active-context split means each command
 // is unambiguous here.
+// Commands that write to the document buffer. Table view blocks every one of
+// them (see the guard in command_dispatch): the grid is read-only text and the
+// only writes are the controlled cell-edit splice (table_edit_commit).
+command_mutates_doc :: proc(cmd: Command_Id) -> bool {
+	#partial switch cmd {
+	case .Backspace, .Delete_Fwd, .Delete_Word_Back, .Insert_Newline, .Insert_Tab, .Undo, .Redo, .Cut, .Paste:
+		return true
+	}
+	return false
+}
+
 command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^plat.Window, t: ^plat.Text, rows: int) {
 	doc := app_active(app)
+	// Table view is a read-only grid. Block every document-mutating command so a
+	// caret left over from text view can't silently corrupt the file at an
+	// unrelated offset, and so an in-cell edit's captured byte span can't be
+	// invalidated under it by an undo/paste before it commits. Cell editing has
+	// its own key path (intercepted before dispatch); the only buffer write in
+	// table view is table_edit_commit's single-field splice.
+	if doc != nil && doc.table && command_mutates_doc(cmd) {return}
 	switch cmd {
 	// --- editor ---
 	case .Cursor_Left:

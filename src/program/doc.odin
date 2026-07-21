@@ -1400,6 +1400,12 @@ doc_replace_sel :: proc(doc: ^Document, text: []u8, kind: Edit_Kind = .Replace) 
 // leaving the cursor just past the inserted text. Used by table cell editing,
 // which addresses the source directly rather than via the selection.
 doc_replace_range :: proc(doc: ^Document, at, count: int, text: []u8, kind: Edit_Kind = .Replace) {
+	// Clamp to the buffer: a caller's range may have been captured before some
+	// other edit shrank the document (a table cell edit holds byte offsets), and
+	// an out-of-range pt_delete would fault. Defence in depth -- table view also
+	// blocks the commands that could shrink it mid-edit.
+	at := clamp(at, 0, doc.pt.length)
+	count := clamp(count, 0, doc.pt.length - at)
 	if count == 0 && len(text) == 0 {return}
 	push_undo(doc, kind)
 	if count > 0 {

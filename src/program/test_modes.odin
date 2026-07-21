@@ -992,6 +992,51 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad tablereadonlytest` guards the data-loss hole a red-team found: table
+	// view is a read-only grid, so command_dispatch must block every
+	// document-mutating command (a stale caret from text view would otherwise
+	// corrupt the file invisibly), and doc_replace_range must clamp an out-of-range
+	// span rather than fault (a cell edit holds byte offsets that another edit could
+	// have shrunk).
+	if os.args[1] == "tablereadonlytest" {
+		bad := 0
+		// 1. The exact guard condition in command_dispatch: doc.table && mutates.
+		mutating := []Command_Id {
+			.Backspace, .Delete_Fwd, .Delete_Word_Back, .Insert_Newline, .Insert_Tab, .Undo, .Redo, .Cut, .Paste,
+		}
+		for c in mutating {
+			if !command_mutates_doc(c) {
+				fmt.printfln("  FAIL %v not classified as mutating (would leak into table view)", c)
+				bad += 1
+			}
+		}
+		// Read-only / navigation commands must NOT be blocked.
+		safe := []Command_Id{.Copy, .Cursor_Left, .Cursor_Down, .Select_All, .Save, .Page_Down}
+		for c in safe {
+			if command_mutates_doc(c) {
+				fmt.printfln("  FAIL %v wrongly classified as mutating (would be blocked in table view)", c)
+				bad += 1
+			}
+		}
+		// 2. doc_replace_range clamps a stale, now-out-of-range span instead of
+		//    faulting. Shrink the buffer, then splice at the old (too-large) offset.
+		d := new(Document)
+		d^ = doc_from_content(transmute([]u8)strings.clone("abcdef"), "t.csv", .UTF8)
+		fs, fe := 4, 6 // a field span captured when the buffer was 6 bytes
+		doc_replace_range(d, 0, 4, nil) // delete "abcd" -> "ef" (length 2 now)
+		doc_replace_range(d, fs, fe - fs, []u8{'Z'}) // stale [4,6): must clamp, not fault
+		got := make([]u8, d.pt.length, context.temp_allocator)
+		base.pt_read(&d.pt, 0, got)
+		if string(got) != "efZ" {
+			fmt.printfln("  FAIL clamp: got %q want %q", string(got), "efZ")
+			bad += 1
+		}
+		doc_close(d)
+		free(d)
+		fmt.printfln("tablereadonlytest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad tabreordertest` covers the reorder bookkeeping: after dragging a tab
 	// across the strip the document order changes but the same document stays
 	// active and the MRU still points at it (active/mru are slot indices, so a swap
