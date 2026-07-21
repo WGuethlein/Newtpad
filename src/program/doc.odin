@@ -1477,10 +1477,21 @@ doc_max_top :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 	return p
 }
 
+// A few cells of slack past the longest line's end, so the last character isn't
+// jammed against the right edge — but only a few, not a screen of blank.
+HSCROLL_PAD :: 3
+
 // Largest horizontal scroll (cells) that still shows content: the widest
-// currently-visible line minus the viewport width. Scoped to the visible rows,
-// never the whole file, so it costs about what a frame's draw does. 0 while
-// wrapping/filtering (no horizontal scroll there).
+// currently-visible line, plus a little slack, minus the viewport width. Scoped
+// to the visible rows, never the whole file, so it costs about what a frame's
+// draw does. 0 while wrapping/filtering (no horizontal scroll there).
+//
+// Capped at VISIBLE_COLS because that is all doc_draw renders of a line — without
+// the cap the bar ran far past the drawn text into blank space on a long line
+// (a minified JSON, a long log/CSV row), since the width was measured up to the
+// scan cap while only VISIBLE_COLS cells are ever drawn. (Panning the tail of a
+// line longer than VISIBLE_COLS needs the draw to window on h_scroll — a separate
+// follow-up; this just makes the bar stop where the text does.)
 doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 	if doc == nil || doc.wrap || doc.filter {return 0}
 	widest := 0
@@ -1490,7 +1501,8 @@ doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 		if !ok {break}
 		if w := line_cell_col(doc, t, start, end); w > widest {widest = w}
 	}
-	return max(0, widest - max(1, doc.view_cols))
+	reach := min(widest + HSCROLL_PAD, VISIBLE_COLS)
+	return max(0, reach - max(1, doc.view_cols))
 }
 
 // Scroll the viewport by `delta` visual rows (up when negative), clamped so the

@@ -1738,6 +1738,12 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			} else {
 				fmt.println("  clicking a long line does not fling the viewport: OK")
 			}
+			// The scroll range must stop at what doc_draw actually renders
+			// (VISIBLE_COLS), not run thousands of cells into blank space.
+			if mh := doc_max_hscroll(&ld, &t, ld.view_rows); mh > VISIBLE_COLS {
+				fmt.printfln("  FAIL: max h-scroll %d exceeds the drawn width %d (blank space)", mh, VISIBLE_COLS)
+				bad += 1
+			}
 			ld.h_scroll = 0
 			doc_update_hscroll(&ld)
 		}
