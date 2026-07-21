@@ -1145,6 +1145,45 @@ tagging 0.8.1. The other two verdicts were SURVIVES.
   (only untitled buffers with an empty path are unrestricted); and a view persists after Save-As
   changes the type (still toggleable off, just not back on). Neither loses data.
 
+## 6r. Logging + crash suite (2026-07-21, v0.9.0)
+
+A comprehensive logging/debug layer so crashes and "random" bugs come with evidence. Three
+pieces across the layers; the crash path is proven end-to-end by `crashtest` (below), but a
+real save-on-crash with open tabs is only exercisable live.
+
+- **`base/log.odin` — always-on ring logger.** A fixed 1024-line in-memory ring (`LOG_RING`,
+  `LOG_LINE_MAX` 240 B/line) plus an optional sink. The ring *is* the breadcrumb trail; a crash
+  report folds it in so a bug arrives with the sequence that produced it. Allocation-free hot path
+  (format into a stack buffer, copy into the ring under a short mutex), safe from worker threads.
+  Levels Debug/Info/Warn/Error; base stays filesystem/Win32-free (sink injected like `safe_copy`).
+- **`platform/crash.odin` — the safety net.** `SetUnhandledExceptionFilter` → on a hard fault:
+  (1) write a `.dmp` **minidump** (dbghelp, links automatically) *first*, before any log/alloc, so
+  nothing downstream can cost us the forensics; (2) log the fault; (3) **save the user's work** via
+  an injected hook; (4) write a `.txt` report — exception name/address **symbolized** when a PDB is
+  present (debug build resolves e.g. `main::test_mode_dispatch +0x…`), a backtrace, and the log
+  ring; (5) a friendly message box (suppressible via `crash_set_silent` for tests). Runs without an
+  Odin context and can't trust the heap, so it leans on stack buffers + pure Win32. Re-entrancy
+  guarded. Reports land in `%APPDATA%\Newtpad\crashes\`.
+- **`program/diag.odin` — the wiring.** `diag_init` arms the logger with a **file sink**
+  (`%APPDATA%\Newtpad\logs\newtpad.log`, append, rolled to `.old` past 2 MB) and installs the crash
+  handler with `on_fatal = session_save(app, sweep=false)` — a crash must never sweep backups.
+  **Odin panics/asserts route through the same path:** `context.assertion_failure_proc` (set on
+  main's context so it flows down the whole loop) logs the reason and `intrinsics.trap()`s; the
+  trap's illegal-instruction fault lands in the crash filter, so a panic gets the identical dump +
+  report + save as an access violation. Every dispatched command drops a breadcrumb (`diag_cmd`).
+- **Still to do (noted, not built):** a live debug overlay (frame time / doc state — GUI, can't be
+  headless-tested), a "Copy Diagnostics" command, and a hang watchdog for the frozen-frame class.
+  Symbolized offline analysis of a *release* `.dmp` needs the release PDB archived per version.
+
+### Verifying the crash suite
+- `logtest` — ring level-gating, oldest-first dump, wrap-around retention. Pure, headless.
+- `crashtest <null|panic|assert|oob>` — **triggers a real fault** and confirms the whole path:
+  silent (no dialog), writes a real `.dmp` + `.txt`, saves. The process then dies with the fault,
+  so the harness checks the files exist and the exit code is the exception (0xC0000005 for `null`,
+  0xC000001D for the trap-based panic/assert). **Set `NEWTPAD_SESSION_DIR` first** so artifacts land
+  in a temp dir. Verified 2026-07-21: all four kinds produced a ~1.4 MB dump + a report with the
+  faulting frame symbolized and the breadcrumb trail intact.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -1161,6 +1200,8 @@ tagging 0.8.1. The other two verdicts were SURVIVES.
   session modes write to, and reset, the real store under `%APPDATA%\Newtpad`:
   - Rendering / platform: `sehtest`, `dpitest`, `atlastest`, `atlasgrowtest`, `devicelosttest`,
     `celltest`, `blurtest`, `drawcount <file>`
+  - Logging / crash: `logtest`, `crashtest <null|panic|assert|oob>` (triggers a real fault; set
+    `NEWTPAD_SESSION_DIR` first — writes .dmp/.txt to its crashes dir, then exits with the fault)
   - UI surfaces: `menutest`, `menuseam`, `palettetest`, `settingstest`, `fonttest`, `historytest`,
     `linktest`, `tabreordertest`
   - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
