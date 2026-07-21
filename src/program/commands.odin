@@ -58,6 +58,7 @@ Command_Id :: enum u8 {
 	Open_Link,
 	Clear_Selection,
 	Toggle_Wrap,
+	Toggle_Table,
 	// command palette
 	Palette_Open,
 	Palette_Close,
@@ -165,6 +166,7 @@ command_table := [Command_Id]Command {
 	.Open_Link                = {"Open Link Under Cursor", "File"},
 	.Clear_Selection          = {"Clear Selection", "Cursor"},
 	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
+	.Toggle_Table             = {"Toggle Table View (CSV/TSV)", "View"},
 	.Palette_Open             = {"Command Palette", "View"},
 	.Palette_Close            = {"Palette: Close", "View"},
 	.Palette_Confirm          = {"Palette: Confirm", "View"},
@@ -266,6 +268,7 @@ default_bindings := []Binding {
 	{.S, true, true, .Editor, .Save_As}, // Ctrl+Alt+S (Ctrl+Shift+S can't be expressed: shift isn't part of a chord)
 	{.Escape, false, false, .Editor, .Clear_Selection},
 	{.Z, false, true, .Editor, .Toggle_Wrap}, // Alt+Z
+	{.T, true, false, .Editor, .Toggle_Table}, // Ctrl+T: CSV/TSV table view
 	{.Plus, true, false, .Editor, .Zoom_In}, // Ctrl+= / Ctrl+numpad+
 	{.Minus, true, false, .Editor, .Zoom_Out}, // Ctrl+- / Ctrl+numpad-
 	{.Num0, true, false, .Editor, .Zoom_Reset}, // Ctrl+0
@@ -637,6 +640,17 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Toggle_Wrap:
 		doc.wrap = !doc.wrap
 		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start
+	case .Toggle_Table:
+		// Read-only grid view of a CSV/TSV. Re-anchor the top to a line start so a
+		// row lands where the caret was, and pick the delimiter on first turn-on.
+		if doc.kind == .Text {
+			doc.table = !doc.table
+			if doc.table {
+				doc.table_delim = table_choose_delim(doc)
+				doc.top = base.pt_line_start(&doc.pt, doc.top)
+				doc.table_col = 0
+			}
+		}
 
 	// --- command palette ---
 	case .Palette_Open:

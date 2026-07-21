@@ -313,6 +313,14 @@ main :: proc() {
 			window.mouse_down = false
 			window.scroll_delta = 0
 		}
+		// Table view is read-only: swallow caret/selection clicks in the content
+		// area (the scrollbar and tab strip already claimed theirs above), but keep
+		// the wheel so it still scrolls rows.
+		if doc.table && doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) && !scrollbar_drag {
+			window.mouse_pressed = false
+			window.mouse_middle_pressed = false
+			window.mouse_down = false
+		}
 
 		// Scrollbar: a press in the right-edge gutter starts a drag that maps the
 		// pointer's y to a byte-proportional scroll position (consumes the click).
@@ -431,7 +439,13 @@ main :: proc() {
 		// so Ctrl+wheel is how you scroll through a document while its links are lit.
 		// Zoom lives on the keyboard instead (Ctrl+= / Ctrl+- / Ctrl+0) and Settings.
 		if window.scroll_delta != 0 {
-			if doc.filter {
+			if doc.table {
+				if plat.key_shift_down() { // Shift+wheel pans table columns
+					doc.table_col = clamp(doc.table_col + window.scroll_delta, 0, table_max_col(doc))
+				} else {
+					doc_scroll(doc, &text, window.scroll_delta, rows)
+				}
+			} else if doc.filter {
 				// Stop at the point the list underfills the screen, rather than
 				// letting the last line scroll to the top over empty rows.
 				doc.filter_top = clamp(doc.filter_top + window.scroll_delta, 0, doc_filter_max_top(doc, rows))
@@ -612,46 +626,54 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	plat.text_frame_begin(gfx, text) // resets the recycle guard and grows the atlas if owed
 	plat.gfx_begin_frame(gfx, 0.09, 0.11, 0.16)
 
-	// Behind the text: find-match highlights (dim), then the selection (bright).
-	if !doc.filter {
-		findq: [80]plat.Quad
-		if nfq := find_match_rects(doc, text, px, char_w, rows, findq[:]); nfq > 0 {
-			plat.quads_draw(gfx, quad_pipe, findq[:nfq])
-		}
-		selq: [80]plat.Quad
-		if ns := doc_selection_rects(doc, text, px, char_w, rows, selq[:]); ns > 0 {
-			plat.quads_draw(gfx, quad_pipe, selq[:ns])
-		}
-	}
-
-	// Links. When shown (always, or only on Ctrl per the Show-links setting) the
-	// list is produced once and consumed by the underline here, the glyph
-	// colouring inside doc_draw, and the hover/click in the main loop. The
-	// underline is drawn while Ctrl is held (the activation affordance) or when the
-	// setting forces it; the "tint" style shows colour without an underline.
-	links: []Link_Hit
-	ctrl := plat.key_ctrl_down()
-	style := rc.app.settings.link_style
-	if !doc.filter && (ctrl || style != .Hover) {
-		links = links_layout(doc, text, rows)
-		if ctrl || style == .Underline {
-			for h in links {
-				plat.quads_draw(
-					gfx,
-					quad_pipe,
-					[]plat.Quad {
-						{
-							pos = {col_x(char_w, h.col, 0 if h.wrapped else H_SCROLL), row_baseline_y(px, h.row) + sx(2)},
-							size = {f32(h.cells) * char_w, max(sx(1), 1)},
-							color = LINK_COL,
-						},
-					},
-				)
+	cx, cy: f32
+	caret := false
+	bottom := doc.top
+	if doc.table && doc.kind == .Text {
+		// Read-only grid view (CSV/TSV) replaces the text pass entirely.
+		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, rows, f32(window.width))
+	} else {
+		// Behind the text: find-match highlights (dim), then the selection (bright).
+		if !doc.filter {
+			findq: [80]plat.Quad
+			if nfq := find_match_rects(doc, text, px, char_w, rows, findq[:]); nfq > 0 {
+				plat.quads_draw(gfx, quad_pipe, findq[:nfq])
+			}
+			selq: [80]plat.Quad
+			if ns := doc_selection_rects(doc, text, px, char_w, rows, selq[:]); ns > 0 {
+				plat.quads_draw(gfx, quad_pipe, selq[:ns])
 			}
 		}
-	}
 
-	cx, cy, caret, bottom := doc_draw(gfx, text, doc, px, char_w, rows, links)
+		// Links. When shown (always, or only on Ctrl per the Show-links setting) the
+		// list is produced once and consumed by the underline here, the glyph
+		// colouring inside doc_draw, and the hover/click in the main loop. The
+		// underline is drawn while Ctrl is held (the activation affordance) or when
+		// the setting forces it; the "tint" style shows colour without an underline.
+		links: []Link_Hit
+		ctrl := plat.key_ctrl_down()
+		style := rc.app.settings.link_style
+		if !doc.filter && (ctrl || style != .Hover) {
+			links = links_layout(doc, text, rows)
+			if ctrl || style == .Underline {
+				for h in links {
+					plat.quads_draw(
+						gfx,
+						quad_pipe,
+						[]plat.Quad {
+							{
+								pos = {col_x(char_w, h.col, 0 if h.wrapped else H_SCROLL), row_baseline_y(px, h.row) + sx(2)},
+								size = {f32(h.cells) * char_w, max(sx(1), 1)},
+								color = LINK_COL,
+							},
+						},
+					)
+				}
+			}
+		}
+
+		cx, cy, caret, bottom = doc_draw(gfx, text, doc, px, char_w, rows, links)
+	}
 
 	// Horizontal scroll draws each line shifted left, so glyphs left of the first
 	// visible cell bleed into the left margin. Cover that thin strip with the
@@ -792,7 +814,8 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// A dirty buffer too large to auto-back-up: unsaved edits are not
 		// crash-protected until saved (backing it up would freeze/OOM the app).
 		nobackup := "  [LARGE FILE - unsaved edits are NOT auto-backed up; Save to keep them]" if doc_backup_skipped(doc) else ""
-		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", "    Wrap" if doc.wrap else "", recovered, disk, indexing, atlas, nobackup)
+		mode := "    Table (Ctrl+T)" if doc.table else ("    Wrap" if doc.wrap else "")
+		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", mode, recovered, disk, indexing, atlas, nobackup)
 		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)
 		col := [4]f32{0.95, 0.55, 0.35, 1} if warn else {0.55, 0.60, 0.70, 1}
 		plat.text_draw(gfx, text, status, sx(12), h - sx(8), UI_SMALL_PX, col)

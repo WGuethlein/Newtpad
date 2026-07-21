@@ -941,6 +941,40 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad csvtest` covers the table-view field parser: delimiters, empties,
+	// quoted fields with embedded delimiters, and "" escapes.
+	if os.args[1] == "csvtest" {
+		bad := 0
+		Case :: struct {
+			line:  string,
+			delim: u8,
+			want:  []string,
+		}
+		cases := []Case {
+			{"a,b,c", ',', {"a", "b", "c"}},
+			{"a,,c", ',', {"a", "", "c"}},
+			{`"a,b",c`, ',', {"a,b", "c"}},
+			{`"a""b",c`, ',', {`a"b`, "c"}},
+			{"", ',', {""}},
+			{"a,", ',', {"a", ""}},
+			{",b", ',', {"", "b"}},
+			{"x\ty\tz", '\t', {"x", "y", "z"}},
+		}
+		for c in cases {
+			got := csv_fields(c.line, c.delim)
+			ok := len(got) == len(c.want)
+			if ok {
+				for f, i in got {
+					if f != c.want[i] {ok = false;break}
+				}
+			}
+			fmt.printfln("  %-12q -> %v %s", c.line, got, "OK" if ok else fmt.tprintf("FAIL want %v", c.want))
+			if !ok {bad += 1}
+		}
+		fmt.printfln("csvtest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad tabreordertest` covers the reorder bookkeeping: after dragging a tab
 	// across the strip the document order changes but the same document stays
 	// active and the MRU still points at it (active/mru are slot indices, so a swap

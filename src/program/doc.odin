@@ -536,6 +536,11 @@ Document :: struct {
 	cursor:     int, // caret byte offset
 	anchor:     int, // other end of the selection (== cursor when none)
 	wrap:       bool, // word-wrap this document at view_cols
+	// Read-only table view of a CSV/TSV (see table.odin), toggled per document.
+	table:       bool,
+	table_delim: u8, // ',' or '\t'; chosen when the view is turned on
+	table_col:   int, // horizontal scroll: first visible table column
+	table_cols:  int, // column count seen this frame (set by table_draw)
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)
