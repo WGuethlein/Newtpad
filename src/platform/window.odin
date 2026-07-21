@@ -16,6 +16,17 @@ foreign kernel32_extra {
 @(default_calling_convention = "system")
 foreign user32_extra {
 	GetDoubleClickTime :: proc() -> u32 ---
+	MsgWaitForMultipleObjectsEx :: proc(nCount: win.DWORD, pHandles: ^win.HANDLE, dwMilliseconds: win.DWORD, dwWakeMask: win.DWORD, dwFlags: win.DWORD) -> win.DWORD ---
+}
+QS_ALLINPUT :: 0x04FF
+
+// Block until a message arrives (any input, window event, or posted message) or
+// `timeout_ms` elapses, then return so the caller can pump + render. This is what
+// keeps the app off a CPU core when idle — instead of spinning at vsync it sleeps
+// here, waking the instant an event lands. The caller spins (skips this) only
+// while it genuinely needs continuous frames (a drag auto-scrolling).
+window_wait_message :: proc(w: ^Window, timeout_ms: u32) {
+	MsgWaitForMultipleObjectsEx(0, nil, timeout_ms, QS_ALLINPUT, 0)
 }
 @(default_calling_convention = "system")
 foreign dwmapi {

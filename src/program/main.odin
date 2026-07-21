@@ -121,6 +121,18 @@ main :: proc() {
 	hscrollbar_drag := false
 
 	for !window.should_close {
+		// Sleep when idle instead of spinning at vsync (which pinned a core the whole
+		// time the app was open). Keep spinning only for the one thing that needs a
+		// frame with no incoming message: a held drag auto-scrolling past an edge.
+		// Otherwise block on the message queue — waking instantly on any input — with
+		// a short timeout while a worker is publishing (so indexing/search/autosave
+		// still tick), and a long one when there is nothing to poll (so a file changed
+		// on disk still surfaces within the watcher's own ~1 s cadence).
+		if !(window.mouse_down || app.tab_drag) {
+			d0 := app_active(&app)
+			polling := session_dirty || !doc_index_done(d0) || search_running(d0) || scrollbar_drag || hscrollbar_drag
+			plat.window_wait_message(window, 200 if polling else 1000)
+		}
 		plat.window_pump_events(window)
 
 		// Re-read the layout metrics every frame: a DPI change rewrites them via

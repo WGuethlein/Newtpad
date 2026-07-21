@@ -291,6 +291,12 @@ search_faulted :: proc(doc: ^Document) -> bool {
 	return intrinsics.atomic_load(&doc.search.fault)
 }
 
+// A background search worker is alive (or a restart is pending), so the main loop
+// should keep polling for results rather than sleeping.
+search_running :: proc(doc: ^Document) -> bool {
+	return doc.search.th != nil || doc.find.dirty
+}
+
 // --- the scan itself (shared by the inline and worker paths) ---
 
 // Scan `pt` for s.query, publishing after each block. Tracks the most recent
