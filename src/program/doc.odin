@@ -1756,7 +1756,8 @@ doc_draw :: proc(
 			for h in links {
 				if h.row != row {continue}
 				spans = spans if spans != nil else make([dynamic]plat.Text_Span, 0, 4, context.temp_allocator)
-				append(&spans, plat.Text_Span{start = h.link.start, len = h.link.len, color = LINK_COL})
+				// The row-relative segment (a wrapped link only colours its part here).
+				append(&spans, plat.Text_Span{start = h.span_start, len = h.span_len, color = LINK_COL})
 			}
 			if spans != nil {
 				plat.text_draw_spans(gfx, t, string(line_buf[:vis]), col_x(char_w, 0, rhs), row_y, px, fg, spans[:], .Doc)

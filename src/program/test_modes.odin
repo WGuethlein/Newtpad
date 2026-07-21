@@ -1368,6 +1368,42 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			}
 		}
 
+		fmt.println("--- a link that spans force-wrapped rows ---")
+		// A line over the wrap threshold (>1024) with a long URL that char-breaks
+		// across several visual rows. The link must be found on the LOGICAL line and
+		// split into per-row segments that together cover it and all resolve whole.
+		{
+			tt: plat.Text
+			plat.text_load_faces(&tt)
+			url := strings.concatenate({"http://example.com/", strings.repeat("a", 200)})
+			line := strings.concatenate({strings.repeat("x", 1100), " ", url, "\n"})
+			wd := doc_from_content(transmute([]u8)line, "", .UTF8)
+			defer doc_close(&wd)
+			wd.wrap = false // force-wrap kicks in because the line is > 1024 cells
+			wd.view_cols = 80
+			wd.view_rows = 60
+			hits := links_layout(&wd, &tt, 60)
+			segs := 0
+			total_cells := 0
+			resolved := false
+			all_whole := true
+			for h in hits {
+				if h.link.kind != .URL {continue}
+				segs += 1
+				total_cells += h.span_len
+				if !h.wrapped {all_whole = false} // every segment is on a wrapped row
+				if h.text[h.link.start:h.link.start + h.link.target_len] != url {all_whole = false}
+				if !resolved {
+					if tgt, ok := link_resolve(&wd, h.text, h.link); ok && tgt.is_url && tgt.url == url {
+						resolved = true
+					}
+				}
+			}
+			okw := segs >= 2 && total_cells == len(url) && resolved && all_whole
+			fmt.printfln("  %d row-segments, %d/%d cells covered, resolves whole=%v %s", segs, total_cells, len(url), resolved, "OK" if okw else "FAIL")
+			if !okw {bad += 1}
+		}
+
 		fmt.printfln("linktest: %d failures", bad)
 		return true
 	}

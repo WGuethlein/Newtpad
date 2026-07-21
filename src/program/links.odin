@@ -401,36 +401,84 @@ links_scan :: proc(text: string, allocator := context.temp_allocator) -> []Link 
 // the seam-bug class this codebase keeps generating — see HANDOFF §6j.
 Link_Hit :: struct {
 	row:   int, // visual row within the viewport
-	col:   int, // starting cell
-	cells: int,
-	text:  string, // temp copy of the row's drawn text; link offsets index this
-	link:  Link,
+	col:   int, // starting cell on the row (underline + hit-test)
+	cells: int, // cell span on the row
+	// The visible portion of the link on THIS row, as a byte span within the row's
+	// drawn text — what doc_draw colours. For a link that wraps across rows this is
+	// only the segment on this row; the whole link still resolves via text+link.
+	span_start: int,
+	span_len:   int,
+	wrapped:    bool, // on a force-wrapped row, which ignores the horizontal pan
+	// The line the link was found on and the whole link within it, so a click on
+	// any per-row segment resolves the entire target. For a wrapped link this is
+	// the logical line (all its rows share it); for an unwrapped row it is the row.
+	text: string,
+	link: Link,
 }
 
 // Links on the visible rows. Temp-allocated, rebuilt per frame.
 //
-// Only called while Ctrl is held, which is both the gesture and the reason this
-// costs nothing the rest of the time. Bounded by the same VISIBLE_COLS the draw
-// uses, so a 100 MB single-line file scans a screen's worth, not a file's.
+// Only called while Ctrl is held (or when the Show-links setting is on), which is
+// the gesture and the reason it costs nothing otherwise. Bounded by VISIBLE_COLS
+// and LINK_SCAN_CAP, so a 100 MB single-line file scans a screen's worth.
+//
+// A force-wrapped line's link must be detected on the whole LOGICAL line (a scan
+// per visual row would see a link cut at the wrap point and mis-resolve the
+// halves) and then split into per-row segments. Unwrapped rows keep the simple
+// per-row scan.
 links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := context.temp_allocator) -> []Link_Hit {
 	out := make([dynamic]Link_Hit, 0, 8, allocator)
 	if doc == nil {return out[:]}
 	line_buf: [VISIBLE_COLS]u8
+	// Cache of the current wrapped logical line, so its rows don't each rescan it.
+	cur_lls := -1
+	cur_line: string
+	cur_links: []Link
 	it := visible_begin(doc, t, rows)
 	for {
-		row, start, end, _, _, ok := visible_next(&it)
+		row, start, end, _, wrapped, ok := visible_next(&it)
 		if !ok {break}
-		draw_len := min(end - start, len(line_buf), LINK_SCAN_CAP)
-		if draw_len <= 0 {continue}
-		n := base.pt_read(&doc.pt, start, line_buf[:draw_len])
-		vis := n
-		if vis > 0 && line_buf[vis - 1] == '\r' {vis -= 1}
-		if vis <= 0 {continue}
-		// The row text has to outlive this loop iteration: line_buf is reused.
-		text := strings.clone(string(line_buf[:vis]), allocator)
-		for l in links_scan(text, allocator) {
-			col, cells := plat.text_span_cells(t, text, l.start, l.len, .Doc)
-			append(&out, Link_Hit{row = row, col = col, cells = cells, text = text, link = l})
+		if !wrapped {
+			draw_len := min(end - start, len(line_buf), LINK_SCAN_CAP)
+			if draw_len <= 0 {continue}
+			n := base.pt_read(&doc.pt, start, line_buf[:draw_len])
+			vis := n
+			if vis > 0 && line_buf[vis - 1] == '\r' {vis -= 1}
+			if vis <= 0 {continue}
+			text := strings.clone(string(line_buf[:vis]), allocator) // outlive the loop
+			for l in links_scan(text, allocator) {
+				col, cells := plat.text_span_cells(t, text, l.start, l.len, .Doc)
+				append(&out, Link_Hit{row = row, col = col, cells = cells, span_start = l.start, span_len = l.len, wrapped = false, text = text, link = l})
+			}
+			continue
+		}
+
+		// Wrapped row: scan its logical line once (bounded — a wrapped line is
+		// <= WRAP_START_CAP), then emit the portion of each link that lands here.
+		lls, _ := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
+		if lls != cur_lls {
+			cur_lls = lls
+			lend := base.pt_line_end_cap(&doc.pt, lls, LINK_SCAN_CAP)
+			cur_line, cur_links = "", nil
+			if lend > lls {
+				buf := make([]u8, lend - lls, allocator)
+				got := base.pt_read(&doc.pt, lls, buf)
+				cur_line = strings.clone(string(buf[:got]), allocator)
+				cur_links = links_scan(cur_line, allocator)
+			}
+		}
+		if len(cur_links) == 0 {continue}
+		row_off := start - lls
+		row_end_off := min(end - lls, len(cur_line))
+		if row_off >= row_end_off {continue}
+		row_text := cur_line[row_off:row_end_off]
+		for l in cur_links {
+			lo := max(l.start, row_off)
+			hi := min(l.start + l.len, row_end_off)
+			if lo >= hi {continue} // link doesn't touch this row
+			ss := lo - row_off // row-relative draw span
+			col, cells := plat.text_span_cells(t, row_text, ss, hi - lo, .Doc)
+			append(&out, Link_Hit{row = row, col = col, cells = cells, span_start = ss, span_len = hi - lo, wrapped = true, text = cur_line, link = l})
 		}
 	}
 	return out[:]
@@ -441,9 +489,11 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 // hit-tests with.
 links_hit :: proc(hits: []Link_Hit, px, char_w, mx, my: f32) -> (Link_Hit, bool) {
 	r := row_at_y(px, my)
-	c := cell_at_x(char_w, mx) // inside-the-cell, not nearest-caret-boundary
 	for h in hits {
-		if h.row == r && c >= h.col && c < h.col + h.cells {
+		if h.row != r {continue}
+		// inside-the-cell, not nearest-caret-boundary; a wrapped row ignores the pan.
+		c := cell_at_x(char_w, mx, 0 if h.wrapped else H_SCROLL)
+		if c >= h.col && c < h.col + h.cells {
 			return h, true
 		}
 	}

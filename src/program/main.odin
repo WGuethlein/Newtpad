@@ -635,7 +635,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 					quad_pipe,
 					[]plat.Quad {
 						{
-							pos = {col_x(char_w, h.col), row_baseline_y(px, h.row) + sx(2)},
+							pos = {col_x(char_w, h.col, 0 if h.wrapped else H_SCROLL), row_baseline_y(px, h.row) + sx(2)},
 							size = {f32(h.cells) * char_w, max(sx(1), 1)},
 							color = LINK_COL,
 						},
