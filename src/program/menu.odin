@@ -90,6 +90,13 @@ is_md_view :: proc(app: ^App) -> bool {
 	return d != nil && d.md_mode != .Off
 }
 
+// Grey the toggles out on a file whose type doesn't fit the view (a new/untitled
+// buffer always fits — see doc_can_*).
+@(private = "file")
+can_table :: proc(app: ^App) -> bool {return doc_can_table(app_active(app))}
+@(private = "file")
+can_md_view :: proc(app: ^App) -> bool {return doc_can_markdown(app_active(app))}
+
 @(private = "file")
 is_regex :: proc(app: ^App) -> bool {
 	d := app_active(app)
@@ -141,8 +148,8 @@ menus := []Menu {
 		'v',
 		[]Menu_Item {
 			{cmd = .Toggle_Wrap, checked = is_wrapped, enabled = has_doc},
-			{cmd = .Toggle_Table, checked = is_table, enabled = has_doc},
-			{cmd = .Toggle_Preview, checked = is_md_view, enabled = has_doc},
+			{cmd = .Toggle_Table, checked = is_table, enabled = can_table},
+			{cmd = .Toggle_Preview, checked = is_md_view, enabled = can_md_view},
 			sep,
 			{cmd = .Filter_Open, checked = is_filtered, enabled = has_doc},
 			{cmd = .Find_Toggle_Regex, checked = is_regex, enabled = has_doc},

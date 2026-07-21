@@ -646,7 +646,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Toggle_Table:
 		// Read-only grid view of a CSV/TSV. Re-anchor the top to a line start so a
 		// row lands where the caret was, and pick the delimiter on first turn-on.
-		if doc.kind == .Text {
+		if doc.kind == .Text && doc_can_table(doc) {
 			if doc.table_editing {table_edit_commit(doc)} // don't leave an edit dangling
 			doc.table = !doc.table
 			if doc.table {
@@ -661,7 +661,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Toggle_Preview:
 		// Cycle Off -> Preview -> Split -> Off. Both preview modes scroll from
 		// doc.top; Split anchors the editor and preview to the same source line.
-		if doc.kind == .Text {
+		if doc.kind == .Text && doc_can_markdown(doc) {
 			switch doc.md_mode {
 			case .Off:
 				doc.md_mode = .Preview

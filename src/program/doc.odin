@@ -161,6 +161,37 @@ doc_editor_right :: proc(doc: ^Document, winw: f32) -> f32 {
 	return winw
 }
 
+// A new/untitled buffer (no path yet) is allowed into any view -- you don't know
+// what it will become. A saved file only gets the view its extension fits.
+@(private = "file")
+path_has_ext :: proc(path: string, exts: []string) -> bool {
+	if path == "" {return true} // untitled: don't limit
+	lp := strings.to_lower(path, context.temp_allocator)
+	for e in exts {
+		if strings.has_suffix(lp, e) {return true}
+	}
+	return false
+}
+
+// Table view fits delimited data; markdown views fit markdown. Toggling a mode
+// OFF is always allowed (see the command guards) so a file can never get stuck
+// in a view -- these only gate turning a mode ON.
+doc_is_tabular :: proc(doc: ^Document) -> bool {
+	return doc != nil && path_has_ext(doc.path, {".csv", ".tsv", ".tab", ".psv"})
+}
+doc_is_markdownish :: proc(doc: ^Document) -> bool {
+	return doc != nil && path_has_ext(doc.path, {".md", ".markdown", ".mkd", ".mdown", ".mdwn", ".mdtext", ".mdx", ".mtext"})
+}
+
+// May the active document enter (or leave) each view? Already being in the view
+// keeps it toggleable so you can always get back out.
+doc_can_table :: proc(doc: ^Document) -> bool {
+	return doc != nil && doc.kind == .Text && (doc.table || doc_is_tabular(doc))
+}
+doc_can_markdown :: proc(doc: ^Document) -> bool {
+	return doc != nil && doc.kind == .Text && (doc.md_mode != .Off || doc_is_markdownish(doc))
+}
+
 // Column geometry. `hs` is the row's effective horizontal offset in cells; the
 // HS_GLOBAL sentinel means "use the frame-wide H_SCROLL". A force-wrapped row
 // passes 0 (it fits the window, so the pan does not apply to it) while the

@@ -166,6 +166,11 @@ palette_recompute :: proc(app: ^App) {
 	case .Commands:
 		for cmd in Command_Id {
 			if !command_in_palette(cmd) {continue}
+			// Don't offer a view the active file can't enter (an untitled buffer can
+			// enter any; toggling OFF stays offered so you can always get back out).
+			d := app_active(app)
+			if cmd == .Toggle_Table && !doc_can_table(d) {continue}
+			if cmd == .Toggle_Preview && !doc_can_markdown(d) {continue}
 			if s, ok := fuzzy_score(pat, command_table[cmd].title); ok {
 				append(&p.results, Palette_Result{score = s, cmd = cmd})
 			}
