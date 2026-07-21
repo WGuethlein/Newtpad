@@ -1090,6 +1090,32 @@ pieces (split layout, in-cell editing feel) want Wyatt's live pass.
   a commit never writes at a stale offset. `tablecellstest` covers the range parser, the serializer,
   and the full replace-a-field splice.
 
+## 6q. Live-use fixes on the 0.8.0 batch (2026-07-20, v0.8.1)
+
+Wyatt drove the 0.8.0 build and reported three things the same evening; all fixed.
+
+- **Markdown Split showed one pane on top of the other, unreadable — FIXED.** The editor pass
+  draws full window width and there is no scissor rect, so in Split its lines ran *under* the
+  right-half preview. Now the right half `[er,w]x[pvtop,pvbot]` is painted back to the background
+  before the divider + preview draw, giving two clean side-by-side panes. **Scroll is now shared:**
+  both panes render from `doc.top` (the separate `md_top` and the `md_scroll_*` helpers are gone),
+  and the preview's wheel and scrollbar drive `doc.top` too, so the halves stay anchored to the same
+  source line. Divider position is the single `doc_editor_right(doc,w)` used by the editor scrollbar,
+  the read-only-consume boundary, and the preview's `x0`. Needs a live eye on the visual result.
+- **A stationary press highlighted lines and scrolled — FIXED.** The `mouse_down` branch treated
+  any held button as an active drag: it re-extended the selection and auto-scrolled every frame, so
+  holding still (especially near an edge) ran away. A selection drag now begins only once the pointer
+  moves past `DRAG_SLOP` (3 px, DPI-scaled) from the press (`press_x/press_y`, `sel_dragging`); once
+  dragging it stays dragging, so holding at an edge still auto-scrolls. A plain press-and-hold does
+  nothing. Re-armed on every press.
+- **Ctrl+T / Ctrl+M worked on any file — now gated by type.** Table view only opens on delimited
+  files (`.csv/.tsv/.tab/.psv`), a markdown view only on markdown files (`.md` family) — but a
+  new/**untitled** buffer (empty path) is allowed into either, since its type isn't decided yet
+  (`doc_is_tabular` / `doc_is_markdownish` / `doc_can_table` / `doc_can_markdown` in doc.odin). The
+  gate is in `command_dispatch`, so the hotkey, palette, and menu click all honour it; the menu rows
+  grey out and the palette hides the command. **Toggling a mode OFF is always allowed**, so a file
+  saved to a new extension while in a view can never get stuck in it.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
