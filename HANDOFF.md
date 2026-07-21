@@ -942,8 +942,8 @@ and blew the frame budget — the cap is load-bearing). The iterator carries a `
 the lines around it keep it, and `doc_max_hscroll` excludes wrapped lines. `wraplongtest`
 covers it. **Consequence:** a single line longer than `RENDER_LINE_CAP` (~8192 cells) doesn't
 wrap — it still uses horizontal scroll (bounded). Raising that limit means making the wrap
-decision cheaper than a full backward scan (cache per line), a follow-up. Links on a wrapped
-row still take the global offset (rare).
+decision cheaper than a full backward scan (cache per line), a follow-up. (Links on wrapped
+rows are handled correctly as of v0.5.0 — see below.)
 
 **Open questions carried forward (the ones from last night + this pass):**
 - The 7 link questions in §6l (wrap-spanning links, selection-vs-Ctrl+click, underline-without-Ctrl,
@@ -1007,13 +1007,12 @@ the exe attached needs `gh`, which isn't installed — the exe upload is manual 
 
 ### Still open (Wyatt wants these; deferred with a plan, not code)
 
-- **Links spanning wrapped lines (§6l Q1) — Wyatt said yes.** Needs a real change to `links_layout`
-  + `Link_Hit`: scan the *logical* line once (capped) and split each link into per-visual-row
-  segments, **decoupling the row-relative draw span (what `doc_draw` colours) from the full
-  resolve target (what `link_resolve` opens)** — today they're the same field, which is why a
-  wrapped link can't both underline per-row and resolve whole. Only matters with wrap ON (wrap
-  OFF runs the link off the edge, which horizontal scroll now reaches). Wants the seam test
-  extended to a wrapped case and a live pass. Not started — highest-value remaining item.
+- **Links spanning wrapped lines (§6l Q1) — DONE (v0.5.0).** `links_layout` scans a wrapped
+  line's link on the *logical* line (once, cached across its rows) and splits it into per-row
+  segments; `Link_Hit` now carries a row-relative draw span (`span_start`/`span_len`) decoupled
+  from the full resolve target (`text`+`link`), plus a `wrapped` flag so the underline and click
+  hit-test use the row's own offset. `linktest` plants a URL that char-breaks across three
+  wrapped rows and checks the segments cover it and each resolves whole. Live pass still worth it.
 - **Blurry text at high *zoom* (Ctrl+wheel) — diagnosed, not fixed.** Screenshot in `images/`.
   The swapchain is `SCALING_NONE` (1:1, not stretched) and glyphs rasterize at the exact display
   px and point-sample 1:1 — so it isn't scaling blur. Most likely **ClearType subpixel fringing
