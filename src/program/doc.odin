@@ -152,10 +152,17 @@ doc_view_cols :: #force_inline proc(width, char_w: f32) -> int {
 	return max(1, int((width - TEXT_MARGIN_X - GUTTER_W - SCROLLBAR_W) / char_w))
 }
 
-col_x :: #force_inline proc(char_w: f32, col: int) -> f32 {return TEXT_MARGIN_X + GUTTER_W + f32(col - H_SCROLL) * char_w}
+// Column geometry. `hs` is the row's effective horizontal offset in cells; the
+// HS_GLOBAL sentinel means "use the frame-wide H_SCROLL". A force-wrapped row
+// passes 0 (it fits the window, so the pan does not apply to it) while the
+// non-wrapped rows around it still pan — the coexistence the mixed layout needs.
+HS_GLOBAL :: min(int)
+@(private = "file")
+eff_hs :: #force_inline proc(hs: int) -> int {return H_SCROLL if hs == HS_GLOBAL else hs}
+col_x :: #force_inline proc(char_w: f32, col: int, hs := HS_GLOBAL) -> f32 {return TEXT_MARGIN_X + GUTTER_W + f32(col - eff_hs(hs)) * char_w}
 // Inverse mappings for hit-testing a client-space pixel.
 row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - CONTENT_TOP - FILTER_BANNER_H) / line_height(px))}
-col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return H_SCROLL + max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w + 0.5))}
+col_at_x :: #force_inline proc(char_w, mx: f32, hs := HS_GLOBAL) -> int {return eff_hs(hs) + max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w + 0.5))}
 // Which cell a point is INSIDE, as opposed to col_at_x, which rounds to the
 // nearest caret boundary because that is what click-to-place-caret wants.
 // Hit-testing a drawn span needs this one: with col_at_x the boundary sits half
@@ -163,9 +170,68 @@ col_at_x :: #force_inline proc(char_w, mx: f32) -> int {return H_SCROLL + max(0,
 // its last cell was not clickable at all. Same function, wrong space — the
 // §6j bug class, caught here by asserting the drawn span against the clickable
 // span at both edges.
-cell_at_x :: #force_inline proc(char_w, mx: f32) -> int {return H_SCROLL + max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w))}
+cell_at_x :: #force_inline proc(char_w, mx: f32, hs := HS_GLOBAL) -> int {return eff_hs(hs) + max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w))}
 
 // --- word wrap: break a logical line into visual rows at doc.view_cols cells ---
+
+// A line longer than this force-wraps even with global word wrap off, so a
+// minified JSON or a long log/CSV row is readable without horizontal scrolling
+// (which only reaches VISIBLE_COLS anyway). Wyatt, 2026-07-20.
+WRAP_LONG_CELLS :: 1024
+
+// How far back a force-wrap line-start scan will go, and how far forward the
+// wrap decision scans. A line longer than this stays a capped, horizontally-
+// scrollable row rather than wrapping. It equals RENDER_LINE_CAP deliberately:
+// every viewport/navigation step decides wrap by scanning at most this far, so
+// the hot path costs no more than the capped no-wrap stepping the huge-file fix
+// established — the perf guarantee holds — and a line past the cap is already
+// drawn as capped segments, so leaving it unwrapped is consistent, not a loss.
+// (Lines from 1024 up to this wrap; longer single lines still use h-scroll.)
+WRAP_START_CAP :: RENDER_LINE_CAP
+
+// Should the logical line starting at `ls` force-wrap? True when it exceeds
+// WRAP_LONG_CELLS cells AND its newline (or EOF) is within WRAP_START_CAP bytes.
+// One bounded scan: stops at the newline (short line, cheap), at the threshold +
+// a found newline (wrap), or at the cap (too long to locate for wrapping → stays
+// a capped, horizontally-scrollable row, so a multi-GB single line never wraps
+// and never triggers an unbounded walk). Called once per visible logical line.
+@(private = "file")
+line_wrap_decision :: proc(doc: ^Document, t: ^plat.Text, ls: int) -> bool {
+	if doc.wrap {return true}
+	buf: [4096]u8
+	L := doc.pt.length
+	limit := min(L, ls + WRAP_START_CAP)
+	p, cells := ls, 0
+	long := false
+	for p < limit {
+		n := base.pt_read(&doc.pt, p, buf[:min(len(buf), limit - p)])
+		if n == 0 {break}
+		i := 0
+		for i < n {
+			if buf[i] == '\n' {return long} // newline within the cap: wrap iff long
+			r, sz := utf8.decode_rune(buf[i:n])
+			if sz == 0 {sz = 1}
+			if i + sz > n && p + n < limit {break} // rune straddles the chunk; refill
+			cells += plat.text_cell_width(t, r, .Doc)
+			if cells > WRAP_LONG_CELLS {long = true}
+			i += sz
+		}
+		if i == 0 {break}
+		p += i
+	}
+	return long if p >= L else false // EOF ends the line: wrap iff long; else too long
+}
+
+// Effective wrapping for the line containing `off`: global wrap, or the line
+// force-wraps. Returns the (capped) line start too, for callers that then walk
+// visual rows. The one predicate the mixed layout rests on; bounded, which is
+// what preserves the "never freeze on a huge file" rule.
+eff_wrap_at :: proc(doc: ^Document, t: ^plat.Text, off: int) -> (wrap: bool, ls: int) {
+	s, exact := base.pt_line_start_cap(&doc.pt, off, WRAP_START_CAP)
+	if doc.wrap {return true, s}
+	if !exact {return false, s} // line start beyond the cap: too long to wrap
+	return line_wrap_decision(doc, t, s), s
+}
 
 // End of the visual row starting at `p` (which must be a visual-row start).
 // Returns the break offset and whether it's the logical line end. Breaks after
@@ -240,18 +306,87 @@ prev_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 	}
 }
 
+// --- mixed layout: per-line wrap (global wrap, or a long line force-wrapping)
+// laid over the capped no-wrap rows. These are what the viewport and the caret
+// navigation step through, so a short line stays one (horizontally-scrollable)
+// row while a long line beside it wraps. All bounded (eff_wrap_at is; wrap_row_end
+// is bounded by a row; a force-wrappable line is <= WRAP_START_CAP), so the
+// huge-file guarantee holds. ---
+
+// Start of the visual row after the one starting at `p`.
+eff_next_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
+	if wrap, _ := eff_wrap_at(doc, t, p); wrap {
+		return next_visual_row(doc, t, p, cols)
+	}
+	return next_row_start_capped(doc, p)
+}
+
+// Start of the visual row containing byte `off`.
+eff_row_start :: proc(doc: ^Document, t: ^plat.Text, off, cols: int) -> int {
+	wrap, ls := eff_wrap_at(doc, t, off)
+	if !wrap {return row_start_capped(doc, off)}
+	s := ls
+	for {
+		e, le := wrap_row_end(doc, t, s, cols)
+		if le || off < e {return s}
+		s = e
+	}
+}
+
+// Start of the visual row before the one starting at `p`.
+eff_prev_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
+	if p <= 0 {return 0}
+	if !(p == 0 || byte_at(doc, p - 1) == '\n') { // p is mid a line
+		// Only a wrapping line has mid-line row boundaries to walk forward to; a
+		// huge no-wrap line's mid-line segments step by the capped boundary (and
+		// must, or this walks a quarter-megabyte per row — the perf/correctness bug).
+		if wrap, ls := eff_wrap_at(doc, t, p); wrap {
+			s := ls
+			for {
+				ns := next_visual_row(doc, t, s, cols)
+				if ns >= p {return s}
+				s = ns
+			}
+		}
+		return prev_row_start_capped(doc, p)
+	}
+	// p is a logical line start: the last visual row of the previous line.
+	wrapPrev, pls := eff_wrap_at(doc, t, p - 1)
+	if !wrapPrev {return prev_row_start_capped(doc, p)}
+	s := pls
+	for {
+		e, le := wrap_row_end(doc, t, s, cols)
+		if le {return s}
+		s = e
+	}
+}
+
+// End (exclusive) of the visual row starting at `p`.
+eff_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
+	if wrap, _ := eff_wrap_at(doc, t, p); wrap {
+		e, _ := wrap_row_end(doc, t, p, cols)
+		return e
+	}
+	return base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+}
+
 // Walks the visible rows (filter view, wrapped, or consecutive) yielding each
 // row's [start, end) byte range plus whether it ends a logical line. Wrap-aware,
 // so every screen pass (draw, selection, find highlights) sharing it stays
 // consistent; `end` is capped to RENDER_LINE_CAP when not wrapping so no pass
 // scans a pathological long line.
 Visible_Iter :: struct {
-	doc:  ^Document,
-	t:    ^plat.Text,
-	rows: int,
-	r:    int,
-	pos:  int,
-	done: bool,
+	doc:      ^Document,
+	t:        ^plat.Text,
+	rows:     int,
+	r:        int,
+	pos:      int,
+	done:     bool,
+	// Mixed layout: whether the current logical line is wrapping, and whether the
+	// next row begins a fresh logical line (so the wrap decision is re-made only at
+	// real line boundaries, not per capped segment of a huge line).
+	cur_wrap: bool,
+	fresh:    bool,
 }
 
 visible_begin :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> Visible_Iter {
@@ -289,7 +424,7 @@ doc_filtering :: proc(doc: ^Document) -> bool {
 	return doc.filter && len(doc.filter_lines) > 0
 }
 
-visible_next :: proc(it: ^Visible_Iter) -> (row, start, end: int, line_end, ok: bool) {
+visible_next :: proc(it: ^Visible_Iter) -> (row, start, end: int, line_end, wrapped, ok: bool) {
 	if it.done || it.r >= it.rows {return}
 	d := it.doc
 	if doc_filtering(d) {
@@ -297,21 +432,38 @@ visible_next :: proc(it: ^Visible_Iter) -> (row, start, end: int, line_end, ok: 
 		if fi >= len(d.filter_lines) {return}
 		start = d.filter_lines[fi]
 		end = base.pt_line_end_cap(&d.pt, start, RENDER_LINE_CAP)
-		line_end = true
+		line_end = true // filter view is never force-wrapped
 	} else {
 		if it.pos > d.pt.length {return}
 		start = it.pos
-		if d.wrap {
+		// Decide wrap for this row's logical line. The first visible row (doc.top may
+		// be mid-line) is located and classified; after that the decision is re-made
+		// only when a fresh logical line begins, so a huge line's many capped rows
+		// don't each re-scan.
+		if it.r == 0 {
+			it.cur_wrap, _ = eff_wrap_at(d, it.t, start)
+		} else if it.fresh {
+			it.cur_wrap = line_wrap_decision(d, it.t, start)
+		}
+		wrapped = it.cur_wrap
+		if it.cur_wrap {
 			end, line_end = wrap_row_end(d, it.t, start, d.view_cols)
 			if line_end {
+				it.fresh = true
 				if end >= d.pt.length {it.done = true} else {it.pos = end + 1}
 			} else {
-				it.pos = end // next visual row continues the same logical line
+				it.fresh = false // next visual row continues the same logical line
+				it.pos = end
 			}
 		} else {
 			end = base.pt_line_end_cap(&d.pt, start, RENDER_LINE_CAP)
 			line_end = true
-			if end >= d.pt.length {it.done = true} else {it.pos = end + 1}
+			// A fresh logical line follows only if this capped row ended at a real
+			// newline; a synthetic cap boundary keeps us in the same (non-wrapping,
+			// too-long) line, so we don't re-classify and don't start wrapping it.
+			it.fresh = end >= d.pt.length || (end < d.pt.length && byte_at(d, end) == '\n')
+			nxt := next_row_start_capped(d, start)
+			if nxt <= start {it.done = true} else {it.pos = nxt}
 		}
 	}
 	row = it.r
@@ -1238,7 +1390,7 @@ doc_cursor_col :: proc(doc: ^Document, t: ^plat.Text) -> int {
 // last line stays at the bottom.
 doc_scroll_to_fraction :: proc(doc: ^Document, t: ^plat.Text, frac: f32, rows: int) {
 	target := int(clamp(frac, 0, 1) * f32(doc.pt.length))
-	doc.top = min(row_start_capped(doc, target), doc_max_top(doc, t, rows))
+	doc.top = min(eff_row_start(doc, t, target, doc.view_cols), doc_max_top(doc, t, rows))
 }
 
 // Move the caret to the start of 1-based line `n` (O(n) line walk from the top).
@@ -1260,51 +1412,32 @@ doc_cursor_end :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_li
 doc_start :: proc(doc: ^Document, select: bool) {set_cursor(doc, 0, select)}
 doc_end :: proc(doc: ^Document, select: bool) {set_cursor(doc, doc.pt.length, select)}
 
+// Up/down move by VISUAL rows through the mixed layout, so they step wrapped
+// sub-rows of a long line and whole short lines alike, keeping the caret's cell
+// column. Bounded via the eff_* steppers.
 doc_cursor_up :: proc(doc: ^Document, t: ^plat.Text, select: bool) {
-	if doc.wrap {
-		vs := visual_row_start(doc, t, doc.cursor, doc.view_cols)
-		if vs == 0 {
-			set_cursor(doc, 0, select)
-			return
-		}
-		col := line_cell_col(doc, t, vs, doc.cursor)
-		pv := prev_visual_row(doc, t, vs, doc.view_cols)
-		pe, _ := wrap_row_end(doc, t, pv, doc.view_cols)
-		set_cursor(doc, line_offset_at_cell(doc, t, pv, pe, col), select)
+	vs := eff_row_start(doc, t, doc.cursor, doc.view_cols)
+	if vs == 0 {
+		set_cursor(doc, 0, select) // already the first row: clamp to the start
 		return
 	}
-	ls := base.pt_line_start(&doc.pt, doc.cursor)
-	if ls == 0 {
-		set_cursor(doc, 0, select)
-		return
-	}
-	col := doc.cursor - ls
-	prev := base.pt_prev_line_start(&doc.pt, doc.cursor)
-	set_cursor(doc, min(prev + col, base.pt_line_end(&doc.pt, prev)), select)
+	col := line_cell_col(doc, t, vs, doc.cursor)
+	pv := eff_prev_row(doc, t, vs, doc.view_cols)
+	pe := eff_row_end(doc, t, pv, doc.view_cols)
+	set_cursor(doc, line_offset_at_cell(doc, t, pv, pe, col), select)
 }
 
 doc_cursor_down :: proc(doc: ^Document, t: ^plat.Text, select: bool) {
-	if doc.wrap {
-		vs := visual_row_start(doc, t, doc.cursor, doc.view_cols)
-		e, le := wrap_row_end(doc, t, vs, doc.view_cols)
-		if le && e >= doc.pt.length { // already the last visual row
-			set_cursor(doc, doc.pt.length, select) // clamp to the doc end, mirroring Up's clamp to 0
-			return
-		}
-		col := line_cell_col(doc, t, vs, doc.cursor)
-		nv := next_visual_row(doc, t, vs, doc.view_cols)
-		ne, _ := wrap_row_end(doc, t, nv, doc.view_cols)
-		set_cursor(doc, line_offset_at_cell(doc, t, nv, ne, col), select)
+	vs := eff_row_start(doc, t, doc.cursor, doc.view_cols)
+	e := eff_row_end(doc, t, vs, doc.view_cols)
+	if e >= doc.pt.length { // already the last visual row
+		set_cursor(doc, doc.pt.length, select) // clamp to the doc end, mirroring Up
 		return
 	}
-	ls := base.pt_line_start(&doc.pt, doc.cursor)
-	col := doc.cursor - ls
-	nl := base.pt_next_line_start(&doc.pt, doc.cursor)
-	if nl == doc.pt.length && base.pt_line_end(&doc.pt, nl) == nl && ls == base.pt_line_start(&doc.pt, nl) {
-		set_cursor(doc, doc.pt.length, select) // no line below: clamp to the doc end, mirroring Up's clamp to 0
-		return
-	}
-	set_cursor(doc, min(nl + col, base.pt_line_end(&doc.pt, nl)), select)
+	col := line_cell_col(doc, t, vs, doc.cursor)
+	nv := eff_next_row(doc, t, vs, doc.view_cols)
+	ne := eff_row_end(doc, t, nv, doc.view_cols)
+	set_cursor(doc, line_offset_at_cell(doc, t, nv, ne, col), select)
 }
 
 // --- word boundaries, word nav, click selection, hit-test ---
@@ -1390,20 +1523,23 @@ line_offset_at_cell :: proc(doc: ^Document, t: ^plat.Text, ls, le, col: int) -> 
 	return min(ls + plat.text_bytes_for_cells(t, buf[:got], col, .Doc), le)
 }
 
-// Byte offset under a client-space pixel (cell-grid column mapping).
+// Byte offset under a client-space pixel (cell-grid column mapping). The column
+// is resolved with the target row's own offset — a wrapped row ignores the pan,
+// so a click on it maps by its own cells, not the panned ones.
 doc_pos_at :: proc(doc: ^Document, t: ^plat.Text, mx, my: i32, px, char_w: f32, rows: int) -> int {
 	target := clamp(row_at_y(px, f32(my)), 0, rows - 1)
-	col := col_at_x(char_w, f32(mx))
 	it := visible_begin(doc, t, rows)
-	last_start, last_end := doc.top, doc.top
+	last_start, last_end, last_wrap := doc.top, doc.top, false
 	for {
-		row, start, end, _, ok := visible_next(&it)
+		row, start, end, _, wrapped, ok := visible_next(&it)
 		if !ok {break}
-		last_start, last_end = start, end
+		last_start, last_end, last_wrap = start, end, wrapped
 		if row == target {
+			col := col_at_x(char_w, f32(mx), 0 if wrapped else H_SCROLL)
 			return line_offset_at_cell(doc, t, start, end, col)
 		}
 	}
+	col := col_at_x(char_w, f32(mx), 0 if last_wrap else H_SCROLL)
 	return line_offset_at_cell(doc, t, last_start, last_end, col) // click below last row
 }
 
@@ -1417,13 +1553,14 @@ doc_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows
 	it := visible_begin(doc, t, rows)
 	n := 0
 	for n < len(out) {
-		row, start, end, _, ok := visible_next(&it)
+		row, start, end, _, wrapped, ok := visible_next(&it)
 		if !ok {break}
 		if lo <= end && hi > start { // selection overlaps [start, end]
+			rhs := 0 if wrapped else H_SCROLL
 			startcol := min(line_cell_col(doc, t, start, max(start, lo)), VISIBLE_COLS)
 			endcol := min(line_cell_col(doc, t, start, min(end, hi)), VISIBLE_COLS)
-			sx := col_x(char_w, startcol)
-			ex := col_x(char_w, endcol)
+			sx := col_x(char_w, startcol, rhs)
+			ex := col_x(char_w, endcol, rhs)
 			if hi > end {ex += char_w * 0.4} // continues past EOL: hint the newline
 			out[n] = {pos = {sx, row_rect_y(px, row)}, size = {max(ex - sx, 2), lh}, color = col}
 			n += 1
@@ -1469,10 +1606,10 @@ prev_row_start_capped :: proc(doc: ^Document, pos: int) -> int {
 // The largest doc.top that still fills the viewport (keeps the last line at the
 // bottom row); 0 if the whole document fits. Bounds scrolling to real content.
 doc_max_top :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
-	p := visual_row_start(doc, t, doc.pt.length, doc.view_cols) if doc.wrap else row_start_capped(doc, doc.pt.length)
+	p := eff_row_start(doc, t, doc.pt.length, doc.view_cols)
 	for _ in 0 ..< max(rows - 1, 0) {
 		if p == 0 {break}
-		p = prev_visual_row(doc, t, p, doc.view_cols) if doc.wrap else prev_row_start_capped(doc, p)
+		p = eff_prev_row(doc, t, p, doc.view_cols)
 	}
 	return p
 }
@@ -1497,8 +1634,9 @@ doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 	widest := 0
 	it := visible_begin(doc, t, rows)
 	for {
-		_, start, end, _, ok := visible_next(&it)
+		_, start, end, _, wrapped, ok := visible_next(&it)
 		if !ok {break}
+		if wrapped {continue} // wrapped rows fit the window; they don't pan
 		if w := line_cell_col(doc, t, start, end); w > widest {widest = w}
 	}
 	reach := min(widest + HSCROLL_PAD, VISIBLE_COLS)
@@ -1510,14 +1648,14 @@ doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta, rows: int) {
 	if delta > 0 {
 		for _ in 0 ..< delta {
-			nt := next_visual_row(doc, t, doc.top, doc.view_cols) if doc.wrap else next_row_start_capped(doc, doc.top)
+			nt := eff_next_row(doc, t, doc.top, doc.view_cols)
 			if nt == doc.top {break}
 			doc.top = nt
 		}
 	} else if delta < 0 {
 		for _ in 0 ..< -delta {
 			if doc.top == 0 {break}
-			doc.top = prev_visual_row(doc, t, doc.top, doc.view_cols) if doc.wrap else prev_row_start_capped(doc, doc.top)
+			doc.top = eff_prev_row(doc, t, doc.top, doc.view_cols)
 		}
 	}
 	doc.top = min(doc.top, doc_max_top(doc, t, rows))
@@ -1535,8 +1673,11 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 	// h_scroll to the far right. A line that long is rendered as capped segments
 	// anyway (its column relative to the logical start is not what the draw uses),
 	// so leaving h_scroll put is the right behaviour, not a compromise.
+	// Skip it when the caret sits on a wrapped line (its rows fit the window, so
+	// h_scroll never hides it) or a too-long line (start past the cap) — leaving
+	// h_scroll put for whatever non-wrapped lines are being panned.
 	if !doc.wrap && !doc.filter {
-		if lstart, exact := base.pt_line_start_cap(&doc.pt, doc.cursor, RENDER_LINE_CAP); exact {
+		if lstart, exact := base.pt_line_start_cap(&doc.pt, doc.cursor, RENDER_LINE_CAP); exact && !line_wrap_decision(doc, t, lstart) {
 			ccol := line_cell_col(doc, t, lstart, doc.cursor)
 			vc := max(1, doc.view_cols)
 			if ccol < doc.h_scroll {
@@ -1546,7 +1687,7 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 			}
 		}
 	}
-	cls := visual_row_start(doc, t, doc.cursor, doc.view_cols) if doc.wrap else row_start_capped(doc, doc.cursor)
+	cls := eff_row_start(doc, t, doc.cursor, doc.view_cols)
 	if cls < doc.top {
 		doc.top = cls
 		return
@@ -1555,7 +1696,7 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 	p := doc.top
 	for _ in 0 ..< rows {
 		if p >= cls {return}
-		p = next_visual_row(doc, t, p, doc.view_cols) if doc.wrap else next_row_start_capped(doc, p)
+		p = eff_next_row(doc, t, p, doc.view_cols)
 	}
 	// caret is below the viewport: put its row at the bottom
 	doc.top = cls
@@ -1586,10 +1727,11 @@ doc_draw :: proc(
 	bottom = doc.top
 	it := visible_begin(doc, t, rows)
 	for {
-		row, start, end, line_end, ok := visible_next(&it)
+		row, start, end, line_end, wrapped, ok := visible_next(&it)
 		if !ok {break}
 		bottom = end
 		row_y := row_baseline_y(px, row)
+		rhs := 0 if wrapped else H_SCROLL // a wrapped row ignores the horizontal pan
 
 		draw_len := min(end - start, len(line_buf))
 		n := base.pt_read(&doc.pt, start, line_buf[:draw_len])
@@ -1617,9 +1759,9 @@ doc_draw :: proc(
 				append(&spans, plat.Text_Span{start = h.link.start, len = h.link.len, color = LINK_COL})
 			}
 			if spans != nil {
-				plat.text_draw_spans(gfx, t, string(line_buf[:vis]), col_x(char_w, 0), row_y, px, fg, spans[:], .Doc)
+				plat.text_draw_spans(gfx, t, string(line_buf[:vis]), col_x(char_w, 0, rhs), row_y, px, fg, spans[:], .Doc)
 			} else {
-				plat.text_draw(gfx, t, string(line_buf[:vis]), col_x(char_w, 0), row_y, px, fg, .Doc)
+				plat.text_draw(gfx, t, string(line_buf[:vis]), col_x(char_w, 0, rhs), row_y, px, fg, .Doc)
 			}
 		}
 
@@ -1627,7 +1769,7 @@ doc_draw :: proc(
 		// belongs to the next visual row's start, so exclude it here.
 		if doc.cursor >= start && doc.cursor <= end && (line_end || doc.cursor < end) {
 			cprefix := min(doc.cursor - start, n) // cells before caret, clipped to drawn text
-			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix], .Doc))
+			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix], .Doc), rhs)
 			cy = row_y
 			caret = true
 		}

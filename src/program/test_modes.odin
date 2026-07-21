@@ -1753,6 +1753,75 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad wraplongtest` covers the mixed layout: with global wrap OFF, a line
+	// past WRAP_LONG_CELLS force-wraps to the window while shorter lines stay single
+	// (horizontally-scrollable) rows, the h-scroll range ignores the wrapped lines,
+	// and a line too long to locate stays a capped no-wrap row (so it can't freeze).
+	if os.args[1] == "wraplongtest" {
+		bad := 0
+		t: plat.Text
+		plat.text_load_faces(&t)
+		// short(5) \n long(3000) \n medium(200) \n end(3) \n
+		content := strings.concatenate(
+			{"short\n", strings.repeat("x", 3000), "\n", strings.repeat("y", 200), "\n", "end\n"},
+		)
+		doc := doc_from_content(transmute([]u8)content, "", .UTF8)
+		defer doc_close(&doc)
+		doc.wrap = false
+		doc.view_cols = 80
+		doc.view_rows = 200
+		rows := 200
+
+		wrapped_rows := 0
+		medium_wrapped := false
+		short_wrapped := false
+		it := visible_begin(&doc, &t, rows)
+		for {
+			_, start, _, _, wrapped, ok := visible_next(&it)
+			if !ok {break}
+			if wrapped {wrapped_rows += 1}
+			if wrapped && start < 6 {short_wrapped = true} // the "short" line region
+			if wrapped && start >= 3007 && start < 3207 {medium_wrapped = true} // the 200-cell line
+		}
+		if wrapped_rows < 30 {
+			fmt.printfln("  FAIL: the 3000-cell line did not force-wrap (%d wrapped rows)", wrapped_rows)
+			bad += 1
+		}
+		if short_wrapped {
+			fmt.println("  FAIL: a 5-cell line was wrapped")
+			bad += 1
+		}
+		if medium_wrapped {
+			fmt.println("  FAIL: a 200-cell line was wrapped (under the 1024 threshold)")
+			bad += 1
+		}
+		// The h-scroll range must come from the 200-cell non-wrapped line, not the
+		// 3000-cell wrapped one.
+		if mh := doc_max_hscroll(&doc, &t, rows); mh != 200 + HSCROLL_PAD - 80 {
+			fmt.printfln("  FAIL: h-scroll range %d, want %d (from the 200-cell line)", mh, 200 + HSCROLL_PAD - 80)
+			bad += 1
+		}
+
+		// A line too long to locate its start (> WRAP_START_CAP) must NOT wrap: it
+		// stays a capped, no-wrap row, so the huge-file guarantee holds.
+		huge := strings.concatenate({strings.repeat("z", WRAP_START_CAP + 5000), "\n"})
+		hd := doc_from_content(transmute([]u8)huge, "", .UTF8)
+		defer doc_close(&hd)
+		hd.wrap = false
+		hd.view_cols = 80
+		hd.view_rows = 5
+		hd.top = base.pt_line_end_cap(&hd.pt, 0, RENDER_LINE_CAP) // a mid-line segment
+		it2 := visible_begin(&hd, &t, 5)
+		if _, _, _, _, w0, ok2 := visible_next(&it2); ok2 && w0 {
+			fmt.println("  FAIL: a >256KB line wrapped (should stay a capped no-wrap row)")
+			bad += 1
+		}
+
+		if bad == 0 {fmt.println("  long lines wrap, short/medium/huge lines do not, range excludes wrapped: OK")}
+		fmt.printfln("wraplongtest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad replacetest` covers the two ways Replace All lost data.
 	//
 	// It pushed one undo entry per match. UNDO_MAX is 200 and evicts the oldest,

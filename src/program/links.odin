@@ -418,7 +418,7 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 	line_buf: [VISIBLE_COLS]u8
 	it := visible_begin(doc, t, rows)
 	for {
-		row, start, end, _, ok := visible_next(&it)
+		row, start, end, _, _, ok := visible_next(&it)
 		if !ok {break}
 		draw_len := min(end - start, len(line_buf), LINK_SCAN_CAP)
 		if draw_len <= 0 {continue}

@@ -557,15 +557,16 @@ find_match_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: i
 	it := visible_begin(doc, t, rows)
 	n := 0
 	for n < len(out) {
-		row, start, end, _, ok := visible_next(&it)
+		row, start, end, _, wrapped, ok := visible_next(&it)
 		if !ok {break}
 		ry := row_rect_y(px, row)
+		rhs := 0 if wrapped else H_SCROLL
 		for mi < len(f.matches) && f.matches[mi] <= end && n < len(out) {
 			m := f.matches[mi]
 			startcol := min(line_cell_col(doc, t, start, max(m, start)), VISIBLE_COLS)
 			endcol := min(line_cell_col(doc, t, start, min(m + f.match_len[mi], end)), VISIBLE_COLS)
-			sx := col_x(char_w, startcol)
-			ex := col_x(char_w, endcol)
+			sx := col_x(char_w, startcol, rhs)
+			ex := col_x(char_w, endcol, rhs)
 			out[n] = {pos = {sx, ry}, size = {max(ex - sx, 2), lh}, color = col}
 			n += 1
 			mi += 1
