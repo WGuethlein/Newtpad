@@ -17,6 +17,31 @@ import plat "src:platform"
 TABLE_COL_MAX :: 40 // widest a column grows to (cells); longer fields truncate
 TABLE_COL_MIN :: 3
 TABLE_COL_PAD :: 1 // cells of gap after a column
+TABLE_SAMPLE :: 500 // rows scanned once to fix the column widths
+
+// Compute the per-column widths from the first TABLE_SAMPLE rows (bounded), so
+// they stay fixed as the user scrolls. Recomputed when the view opens and after
+// an edit; cheap relative to a frame.
+table_compute_widths :: proc(doc: ^Document, text: ^plat.Text) {
+	clear(&doc.table_widths)
+	delim := doc.table_delim if doc.table_delim != 0 else ','
+	buf: [RENDER_LINE_CAP]u8
+	p := 0
+	for _ in 0 ..< TABLE_SAMPLE {
+		if p > doc.pt.length {break}
+		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
+		if n > 0 && buf[n - 1] == '\r' {n -= 1}
+		for f, c in csv_fields(string(buf[:n]), delim) {
+			w := plat.text_cells(text, transmute([]u8)f, .Doc)
+			for c >= len(doc.table_widths) {append(&doc.table_widths, 0)}
+			if w > doc.table_widths[c] {doc.table_widths[c] = w}
+		}
+		if end >= doc.pt.length {break}
+		p = end + 1
+	}
+	for &w in doc.table_widths {w = clamp(w, TABLE_COL_MIN, TABLE_COL_MAX)}
+}
 
 // Pick the delimiter when the table view is turned on: tab for .tsv, else
 // whichever of tab/comma the first non-empty line has more of.
@@ -93,7 +118,11 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 		fields: []string,
 	}
 	vis := make([dynamic]Row, 0, rows, context.temp_allocator)
-	colw := make([dynamic]int, 0, 16, context.temp_allocator)
+	// Column widths come from a one-time sample (table_compute_widths), NOT from
+	// the currently-visible rows, so columns don't shift as you scroll different
+	// rows (a wider header, then narrower data) into view.
+	if len(doc.table_widths) == 0 {table_compute_widths(doc, text)}
+	colw := doc.table_widths
 	buf: [RENDER_LINE_CAP]u8
 	p := doc.top
 	for _ in 0 ..< rows {
@@ -103,19 +132,12 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 		vb := n
 		if vb > 0 && buf[vb - 1] == '\r' {vb -= 1}
 		line := strings.clone(string(buf[:vb]), context.temp_allocator)
-		fields := csv_fields(line, delim)
-		append(&vis, Row{fields})
-		for f, c in fields {
-			w := plat.text_cells(text, transmute([]u8)f, .Doc)
-			for c >= len(colw) {append(&colw, 0)}
-			if w > colw[c] {colw[c] = w}
-		}
+		append(&vis, Row{csv_fields(line, delim)})
 		bottom = end
 		if end >= doc.pt.length {break}
 		p = end + 1
 	}
 	doc.table_cols = len(colw)
-	for &w in colw {w = clamp(w, TABLE_COL_MIN, TABLE_COL_MAX)}
 
 	start_col := clamp(doc.table_col, 0, table_max_col(doc))
 	right := width - SCROLLBAR_W

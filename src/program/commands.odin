@@ -652,6 +652,9 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				doc.table_delim = table_choose_delim(doc)
 				doc.top = base.pt_line_start(&doc.pt, doc.top)
 				doc.table_col = 0
+				table_compute_widths(doc, t) // fix the columns now, so they don't shift on scroll
+			} else {
+				clear(&doc.table_widths) // recompute on next open (content may have changed)
 			}
 		}
 	case .Toggle_Preview:

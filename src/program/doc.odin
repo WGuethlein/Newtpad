@@ -555,8 +555,11 @@ Document :: struct {
 	// Read-only table view of a CSV/TSV (see table.odin), toggled per document.
 	table:       bool,
 	table_delim: u8, // ',' or '\t'; chosen when the view is turned on
-	table_col:   int, // horizontal scroll: first visible table column
-	table_cols:  int, // column count seen this frame (set by table_draw)
+	table_col:    int, // horizontal scroll: first visible table column
+	table_cols:   int, // column count seen this frame (set by table_draw)
+	table_widths: [dynamic]int, // per-column cell widths, computed once from a
+	// sample when the view opens — so columns don't shift as different rows scroll
+	// into view.
 	// Markdown view (see markdown.odin): Off / Preview (full) / Split (editor +
 	// live preview). md_top is the preview pane's own scroll byte offset in Split;
 	// Preview reuses doc.top.
@@ -749,6 +752,7 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.find.replace)
 	delete(doc.filter_lines)
 	delete(doc.filter_line_nos)
+	delete(doc.table_widths)
 	base.pt_destroy(&doc.pt)
 	if doc.owned_orig {
 		delete(doc.original)
