@@ -570,10 +570,9 @@ Document :: struct {
 	table_edit_buf:    [dynamic]u8,
 	table_edit_caret:  int, // byte offset within table_edit_buf
 	// Markdown view (see markdown.odin): Off / Preview (full) / Split (editor +
-	// live preview). md_top is the preview pane's own scroll byte offset in Split;
-	// Preview reuses doc.top.
+	// live preview). Both Preview and Split scroll from doc.top -- Split keeps the
+	// two panes anchored to the same source line.
 	md_mode:     Md_Mode,
-	md_top:      int,
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)

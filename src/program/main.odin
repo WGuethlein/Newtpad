@@ -395,8 +395,9 @@ main :: proc() {
 		}
 		if md_preview_drag {
 			if window.mouse_down {
+				// Synced with the editor: the preview bar drives doc.top too.
 				frac := (f32(window.mouse_y) - CHROME_TOP) / max(1, f32(window.height) - CHROME_TOP)
-				doc.md_top = md_scroll_pos(doc, frac)
+				doc_scroll_to_fraction(doc, &text, frac, rows)
 			} else {
 				md_preview_drag = false
 			}
@@ -545,14 +546,9 @@ main :: proc() {
 		// so Ctrl+wheel is how you scroll through a document while its links are lit.
 		// Zoom lives on the keyboard instead (Ctrl+= / Ctrl+- / Ctrl+0) and Settings.
 		if window.scroll_delta != 0 {
-			split_preview := false
-			if doc.md_mode == .Split && doc.kind == .Text {
-				cxp, _ := plat.window_cursor_client(window)
-				split_preview = f32(cxp) >= ed_right // wheel over the preview half
-			}
-			if split_preview {
-				doc.md_top = md_scroll_lines(doc, doc.md_top, window.scroll_delta)
-			} else if doc.table {
+			// In Markdown Split both halves share one scroll (doc.top), so the wheel
+			// over the preview falls through to the same doc_scroll as the editor.
+			if doc.table {
 				if doc.table_editing {table_edit_commit(doc)} // rows shift underfoot
 				if plat.key_shift_down() { // Shift+wheel pans table columns
 					doc.table_col = clamp(doc.table_col + window.scroll_delta, 0, table_max_col(doc))
@@ -841,17 +837,24 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		plat.quads_draw(gfx, quad_pipe, bars[:nb])
 	}
 
-	// Markdown Split: a divider, the live preview in the right half, and the
-	// preview's own byte-proportional scrollbar (on doc.md_top).
+	// Markdown Split: a divider, the live preview in the right half, and a second
+	// byte-proportional scrollbar mirroring the shared scroll (doc.top).
 	if doc.kind == .Text && doc.md_mode == .Split {
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {er, CHROME_TOP}, size = {max(sx(1), 1), h - CHROME_TOP}, color = {0.30, 0.34, 0.42, 1}}})
 		pvtop := CONTENT_TOP + FILTER_BANNER_H
 		pvbot := h - doc_bottom_bar_h(doc)
-		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.md_top)
+		// The editor pass above draws full-window width, so its lines bleed into the
+		// right half where the preview lives. There is no scissor rect (the H_SCROLL
+		// margin above uses the same trick), so paint the right half back to the
+		// background before the preview, giving two clean side-by-side panes.
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {er, pvtop}, size = {w - er, pvbot - pvtop}, color = {0.09, 0.11, 0.16, 1}}})
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {er, CHROME_TOP}, size = {max(sx(1), 1), h - CHROME_TOP}, color = {0.30, 0.34, 0.42, 1}}})
+		// Preview follows the editor's scroll (doc.top): one synced position, both
+		// panes anchored to the same source line.
+		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.top)
 		if total > 0 {
 			sb_h := h - CHROME_TOP
-			th := clamp(f32(pv_bottom - doc.md_top) / f32(total) * sb_h, sx(24), sb_h)
-			ty := clamp(CHROME_TOP + f32(doc.md_top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
+			th := clamp(f32(pv_bottom - doc.top) / f32(total) * sb_h, sx(24), sb_h)
+			ty := clamp(CHROME_TOP + f32(doc.top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
 			plat.quads_draw(
 				gfx,
 				quad_pipe,

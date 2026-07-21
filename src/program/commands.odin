@@ -659,8 +659,8 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			}
 		}
 	case .Toggle_Preview:
-		// Cycle Off -> Preview -> Split -> Off. Split seeds the preview scroll from
-		// the editor's so the two start aligned.
+		// Cycle Off -> Preview -> Split -> Off. Both preview modes scroll from
+		// doc.top; Split anchors the editor and preview to the same source line.
 		if doc.kind == .Text {
 			switch doc.md_mode {
 			case .Off:
@@ -668,7 +668,6 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				doc.top = base.pt_line_start(&doc.pt, doc.top)
 			case .Preview:
 				doc.md_mode = .Split
-				doc.md_top = doc.top
 			case .Split:
 				doc.md_mode = .Off
 			}
