@@ -931,6 +931,20 @@ on both the mmap and copy paths — no crash, no integer overflow; the build is 
   second process (which the single-instance mutex + shared session explicitly prevent). Reorder is a
   reasonable standalone task; tear-off needs a design decision about the process/window model first.
 
+**Force-wrap long lines — DONE (v0.4.0).** A third layout between all-scroll and
+all-wrap: with global wrap off, a line past `WRAP_LONG_CELLS` (1024) wraps to the window
+while shorter lines stay single, horizontally-scrollable rows. `eff_wrap_at` decides per
+line, **bounded to `RENDER_LINE_CAP`** so viewport/caret nav costs no more than the capped
+no-wrap stepping — a multi-GB single line stays a capped no-wrap row and can't freeze
+(`scrollperftest` <6ms on 128 MB; the earlier mixed-layout version scanned 256 KB per step
+and blew the frame budget — the cap is load-bearing). The iterator carries a `wrapped` flag;
+`col_x`/`col_at_x`/`cell_at_x` take a per-row offset so a wrapped row ignores the pan while
+the lines around it keep it, and `doc_max_hscroll` excludes wrapped lines. `wraplongtest`
+covers it. **Consequence:** a single line longer than `RENDER_LINE_CAP` (~8192 cells) doesn't
+wrap — it still uses horizontal scroll (bounded). Raising that limit means making the wrap
+decision cheaper than a full backward scan (cache per line), a follow-up. Links on a wrapped
+row still take the global offset (rare).
+
 **Open questions carried forward (the ones from last night + this pass):**
 - The 7 link questions in §6l (wrap-spanning links, selection-vs-Ctrl+click, underline-without-Ctrl,
   a binding for *Open Link Under Cursor*, byte-vs-cell column jump on CJK, the duplicated extension
