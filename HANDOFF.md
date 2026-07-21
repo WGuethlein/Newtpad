@@ -1116,6 +1116,35 @@ Wyatt drove the 0.8.0 build and reported three things the same evening; all fixe
   grey out and the palette hides the command. **Toggling a mode OFF is always allowed**, so a file
   saved to a new extension while in a view can never get stuck in it.
 
+### Red-team of the 0.8.x view features (2026-07-20)
+
+A devils-advocate pass over the four view features (editable cells, split, drag threshold,
+type gate) found one blocking bug and one cosmetic-but-real geometry bug; both fixed before
+tagging 0.8.1. The other two verdicts were SURVIVES.
+
+- **FATAL — table view was not actually read-only. FIXED.** Only *typed characters* were blocked
+  in table view; every key that resolves to a command (Backspace, Delete, Enter, Cut, Paste, Undo,
+  Redo) fell through to `command_dispatch` in the **editor** context and mutated the buffer at
+  `doc.cursor` — a stale offset carried over from text view, because entering table view never
+  resets the caret. The grid redraws from `doc.top`, so the edit was invisible: the "read-only"
+  grid silently corrupted the CSV at an unrelated place. Fix: `command_mutates_doc(cmd)` + a guard
+  at the top of `command_dispatch` that drops every mutating command while `doc.table` is set
+  (the grid's only write is `table_edit_commit`'s single-field splice). This also closes the
+  mid-edit hazard where an Undo/Paste shrank the buffer under an open cell edit and staled its
+  captured span. `doc_replace_range` also clamps its range now (defence in depth — the piece tree
+  already guards out-of-range `pt_delete`/`pt_insert` internally, so the hypothesised *crash* was
+  not actually reachable, but a misplaced splice would have been). `tablereadonlytest` guards the
+  classification and the clamp; falsified by removing `.Backspace` from the set and watching it fail.
+- **Split hscrollbar bled over the preview. FIXED.** `hscrollbar_geo` was built from the full window
+  width, so a long editor line ran its track and drag-mapping across the preview pane. Now both the
+  draw and the hit-test pass `doc_editor_right` as the width, so it stays in the editor half.
+- **Double-click-then-drag doesn't extend by word (SURVIVES, pre-existing).** The drag branch was
+  already gated `mouse_count == 1` before the slop fix, so this never worked — not a regression from
+  0.8.1. Minor UX nicety; left for later (would need word/line-granular extension).
+- **Type gate edges (SURVIVES, cosmetic).** A saved file with *no extension* can't enter table view
+  (only untitled buffers with an empty path are unrestricted); and a view persists after Save-As
+  changes the type (still toggleable off, just not back on). Neither loses data.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -1135,8 +1164,8 @@ Wyatt drove the 0.8.0 build and reported three things the same evening; all fixe
   - UI surfaces: `menutest`, `menuseam`, `palettetest`, `settingstest`, `fonttest`, `historytest`,
     `linktest`, `tabreordertest`
   - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
-    `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `mdtest`, `replacetest`,
-    `findtest`, `regextest <mb>`
+    `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `tablereadonlytest`,
+    `mdtest`, `replacetest`, `findtest`, `regextest <mb>`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest <file>`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest <dir>`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
