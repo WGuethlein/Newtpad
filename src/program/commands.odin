@@ -647,6 +647,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// Read-only grid view of a CSV/TSV. Re-anchor the top to a line start so a
 		// row lands where the caret was, and pick the delimiter on first turn-on.
 		if doc.kind == .Text {
+			if doc.table_editing {table_edit_commit(doc)} // don't leave an edit dangling
 			doc.table = !doc.table
 			if doc.table {
 				doc.table_delim = table_choose_delim(doc)

@@ -560,6 +560,15 @@ Document :: struct {
 	table_widths: [dynamic]int, // per-column cell widths, computed once from a
 	// sample when the view opens — so columns don't shift as different rows scroll
 	// into view.
+	// In-cell editing (table view). While editing, keystrokes go to table_edit_buf,
+	// not the document; on commit the source field range [s,e) is replaced.
+	table_editing:     bool,
+	table_edit_s:      int, // source byte range of the field being edited
+	table_edit_e:      int,
+	table_edit_row:    int, // visual row / column of the cell, for rendering
+	table_edit_col:    int,
+	table_edit_buf:    [dynamic]u8,
+	table_edit_caret:  int, // byte offset within table_edit_buf
 	// Markdown view (see markdown.odin): Off / Preview (full) / Split (editor +
 	// live preview). md_top is the preview pane's own scroll byte offset in Split;
 	// Preview reuses doc.top.
@@ -753,6 +762,7 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.filter_lines)
 	delete(doc.filter_line_nos)
 	delete(doc.table_widths)
+	delete(doc.table_edit_buf)
 	base.pt_destroy(&doc.pt)
 	if doc.owned_orig {
 		delete(doc.original)
@@ -1354,6 +1364,26 @@ doc_replace_sel :: proc(doc: ^Document, text: []u8, kind: Edit_Kind = .Replace) 
 	push_undo(doc, .Delete)
 	del_sel_raw(doc)
 	doc.last_edit_at = doc.cursor
+}
+
+// Replace the raw byte range [at, at+count) with `text`, as one undo step,
+// leaving the cursor just past the inserted text. Used by table cell editing,
+// which addresses the source directly rather than via the selection.
+doc_replace_range :: proc(doc: ^Document, at, count: int, text: []u8, kind: Edit_Kind = .Replace) {
+	if count == 0 && len(text) == 0 {return}
+	push_undo(doc, kind)
+	if count > 0 {
+		doc.nl_delta -= count_newlines(doc, at, count)
+		base.pt_delete(&doc.pt, at, count)
+	}
+	if len(text) > 0 {
+		base.pt_insert(&doc.pt, at, text)
+		for b in text {if b == '\n' {doc.nl_delta += 1}}
+	}
+	doc.cursor = at + len(text)
+	doc.anchor = doc.cursor
+	doc.last_edit_at = doc.cursor
+	doc.last_edit = .None // don't coalesce a later keystroke into this
 }
 
 // A single typed character: the one case that coalesces into a run. A newline

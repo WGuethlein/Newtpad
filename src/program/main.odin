@@ -194,6 +194,11 @@ main :: proc() {
 				palette_input_rune(&app, window.chars[i])
 			} else if doc.find.active {
 				find_input_rune(doc, window.chars[i])
+			} else if doc.table {
+				// Table view is read-only text; typing only does something once a
+				// cell is being edited (click a cell to start), and then it feeds the
+				// in-cell field, not the underlying document.
+				if doc.table_editing {table_edit_rune(doc, window.chars[i])}
 			} else {
 				doc_insert_rune(doc, window.chars[i])
 			}
@@ -230,6 +235,45 @@ main :: proc() {
 
 		for i in 0 ..< window.key_count {
 			ev := window.key_events[i]
+			// A cell edit in the table grid owns the editing keys (a mini text
+			// field), before they resolve to editor commands. Enter/Tab commit,
+			// Esc cancels; Tab then steps to the next cell on the same row.
+			if doc.table && doc.table_editing && !ev.ctrl && !ev.alt {
+				#partial switch ev.key {
+				case .Backspace:
+					table_edit_backspace(doc)
+					continue
+				case .Delete:
+					table_edit_delete(doc)
+					continue
+				case .Left:
+					table_edit_move(doc, -1)
+					continue
+				case .Right:
+					table_edit_move(doc, 1)
+					continue
+				case .Home:
+					table_edit_home(doc)
+					continue
+				case .End:
+					table_edit_end(doc)
+					continue
+				case .Escape:
+					table_edit_cancel(doc)
+					continue
+				case .Enter:
+					table_edit_commit(doc)
+					continue
+				case .Tab:
+					next_row, next_col := doc.table_edit_row, doc.table_edit_col + 1
+					table_edit_commit(doc)
+					if ok, r, col, fs, fe, val := table_cell_at_index(doc, next_row, next_col, rows); ok {
+						table_edit_start(doc, r, col, fs, fe, val)
+					}
+					continue
+				case:
+				}
+			}
 			// Context is per-event; palette/find/menu/tab-switch can change it
 			// mid-loop. Priority: menu > palette > find > editor.
 			ctx := Ctx.Editor
@@ -394,6 +438,18 @@ main :: proc() {
 			}
 		}
 
+		// Plain click on a table cell starts editing it in place (commit any cell
+		// already being edited first). Before the read-only consume below, which
+		// swallows the press for the grid. Ctrl is the link modifier, handled above.
+		if doc.table && doc.kind == .Text && window.mouse_pressed && !plat.key_ctrl_down() &&
+		   f32(window.mouse_y) >= CONTENT_TOP + FILTER_BANNER_H && f32(window.mouse_y) < f32(window.height) - doc_bottom_bar_h(doc) {
+			if doc.table_editing {table_edit_commit(doc)}
+			if ok, r, col, fs, fe, val := table_cell_at(doc, f32(window.mouse_x), f32(window.mouse_y), px, char_w, rows, f32(window.width)); ok {
+				table_edit_start(doc, r, col, fs, fe, val)
+			}
+			// don't consume: let the read-only block below swallow it uniformly
+		}
+
 		// Read-only content: the table grid, a full preview, and the preview half of
 		// a split take no caret. Swallow any press the scrollbars above did not claim
 		// (so the wheel still scrolls, and the bars still drag). After the scrollbars,
@@ -497,6 +553,7 @@ main :: proc() {
 			if split_preview {
 				doc.md_top = md_scroll_lines(doc, doc.md_top, window.scroll_delta)
 			} else if doc.table {
+				if doc.table_editing {table_edit_commit(doc)} // rows shift underfoot
 				if plat.key_shift_down() { // Shift+wheel pans table columns
 					doc.table_col = clamp(doc.table_col + window.scroll_delta, 0, table_max_col(doc))
 				} else {
@@ -533,6 +590,10 @@ main :: proc() {
 				continue
 			}
 			d.disk_gone = false
+			// A pending in-cell edit holds byte offsets into the current buffer; an
+			// absorb/reload below rebuilds it, so drop the edit rather than splice at
+			// a stale offset when it commits.
+			if d.table_editing {table_edit_cancel(d)}
 			// Get off the mapping before anything else: while we hold it, the
 			// other writer cannot rotate or replace the file.
 			doc_detach_mapping(d)

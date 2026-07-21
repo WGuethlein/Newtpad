@@ -983,6 +983,15 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad tablecellstest` covers in-cell editing: the field byte-range
+	// parser, the CSV serializer's quoting rules, and the full replace-a-field
+	// splice that table_edit_commit performs.
+	if os.args[1] == "tablecellstest" {
+		bad := table_selftest()
+		fmt.printfln("tablecellstest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad tabreordertest` covers the reorder bookkeeping: after dragging a tab
 	// across the strip the document order changes but the same document stays
 	// active and the MRU still points at it (active/mru are slot indices, so a swap
