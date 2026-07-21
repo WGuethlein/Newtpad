@@ -1,7 +1,9 @@
-// Layer: platform — glyph atlas + ClearType text pipeline (D3D11 + DirectWrite).
-// Rasterizes glyphs via the hand-declared DirectWrite bindings (dwrite.odin)
-// into a shared coverage atlas, caches them, and draws cached glyphs as
-// instanced quads with dual-source ClearType blending. COM stays in platform.
+// Layer: platform — glyph atlas + grayscale text pipeline (D3D11 + DirectWrite).
+// Rasterizes glyphs via the hand-declared DirectWrite bindings (dwrite.odin) into
+// a shared coverage atlas, caches them, and draws cached glyphs as instanced
+// quads. Coverage is DirectWrite's antialiased ClearType 3x1 with the three
+// subpixels averaged to grayscale (see glyph_get) — no colour fringe, which is
+// what read as "blur" once a glyph was magnified. COM stays in platform.
 //
 // Current scope (milestone): single font face, ASCII via GetGlyphIndices (a cmap
 // lookup, NOT shaping). Shaping + font fallback (IDWriteTextAnalyzer) are the
@@ -223,16 +225,13 @@ VSOut vs_main(VSIn i) {
 	return o;
 }
 
-struct PSOut {
-	float4 color    : SV_Target0;
-	float4 coverage : SV_Target1; // per-channel ClearType coverage (dual-source)
-};
-PSOut ps_main(VSOut i) {
-	float3 cov = atlas.Sample(samp, i.uv).rgb;
-	PSOut o;
-	o.color = float4(i.color.rgb, 1.0);
-	o.coverage = float4(cov * i.color.a, i.color.a);
-	return o;
+// Grayscale antialiasing: a single coverage value per pixel, alpha-blended.
+// This replaced ClearType's 3-channel subpixel coverage, whose colour fringes
+// read as soft/blurry when a glyph is magnified (viewport zoom). Grayscale has
+// no fringe and stays crisp at any size — what most editors use for scaled text.
+float4 ps_main(VSOut i) : SV_Target {
+	float cov = atlas.Sample(samp, i.uv).r;
+	return float4(i.color.rgb, cov * i.color.a);
 }
 `
 
@@ -379,15 +378,15 @@ text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
 		return
 	}
 
-	// --- dual-source ClearType blend: final = text*cov + dst*(1-cov) per channel ---
+	// --- straight alpha blend for grayscale glyphs: final = text*cov + dst*(1-cov) ---
 	blend_desc: d3d.BLEND_DESC
 	rt := &blend_desc.RenderTarget[0]
 	rt.BlendEnable = win.BOOL(true)
-	rt.SrcBlend = .SRC1_COLOR
-	rt.DestBlend = .INV_SRC1_COLOR
+	rt.SrcBlend = .SRC_ALPHA
+	rt.DestBlend = .INV_SRC_ALPHA
 	rt.BlendOp = .ADD
-	rt.SrcBlendAlpha = .SRC1_ALPHA
-	rt.DestBlendAlpha = .INV_SRC1_ALPHA
+	rt.SrcBlendAlpha = .ONE
+	rt.DestBlendAlpha = .INV_SRC_ALPHA
 	rt.BlendOpAlpha = .ADD
 	rt.RenderTargetWriteMask = 0x0F
 	if hr := gfx.device->CreateBlendState(&blend_desc, &t.blend); !win.SUCCEEDED(hr) {
@@ -702,14 +701,17 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, set: Font_Set, face: int, index: u16, px:
 			t.want_relief = true
 		}
 		if packed {
-			// expand 3-channel ClearType coverage to RGBA for the atlas.
+			// Average the three ClearType subpixels into one grayscale coverage and
+			// replicate across RGBA; the pixel shader samples .r and alpha-blends.
+			// Averaging is what removes the colour fringe that reads as blur at zoom.
 			rgba := make([]u8, int(gw * gh) * 4)
 			defer delete(rgba)
 			for i in 0 ..< int(gw * gh) {
-				rgba[i * 4 + 0] = cov[i * 3 + 0]
-				rgba[i * 4 + 1] = cov[i * 3 + 1]
-				rgba[i * 4 + 2] = cov[i * 3 + 2]
-				rgba[i * 4 + 3] = 255
+				c := u8((u32(cov[i * 3 + 0]) + u32(cov[i * 3 + 1]) + u32(cov[i * 3 + 2])) / 3)
+				rgba[i * 4 + 0] = c
+				rgba[i * 4 + 1] = c
+				rgba[i * 4 + 2] = c
+				rgba[i * 4 + 3] = c
 			}
 			box := d3d.BOX {
 				left   = u32(rx),
@@ -888,8 +890,14 @@ text_reset_atlas :: proc(t: ^Text) {
 	t.atlas_full = false
 }
 
-// Returns the 3-channel ClearType coverage (caller frees) and placement, with
-// the run's baseline origin at (0,0) so left/top are pen-relative bearings.
+// Returns 3-channel coverage (one RGB triple per pixel; caller frees) and
+// placement, baseline origin at (0,0) so left/top are pen-relative bearings.
+// The texture stays CLEARTYPE_3x1 because the antialiased (NATURAL_SYMMETRIC)
+// rendering mode only fills that type — asking for ALIASED_1x1 under it returns
+// an empty glyph. glyph_get averages the three subpixels into one grayscale
+// value, which is what kills ClearType's colour fringe (the source of the
+// zoomed-in "blur") while keeping the crisp antialiased edge. NATURAL_SYMMETRIC
+// antialiases in both axes, steadier than NATURAL as the viewport zooms.
 @(private)
 glyph_rasterize :: proc(t: ^Text, set: Font_Set, face: int, index: u16, px: f32) -> (cov: []u8, gw, gh, left, top: i32) {
 	idx := index
@@ -901,7 +909,7 @@ glyph_rasterize :: proc(t: ^Text, set: Font_Set, face: int, index: u16, px: f32)
 		isSideways   = win.BOOL(false),
 	}
 	analysis: ^IGlyphRunAnalysis
-	if hr := t.factory->CreateGlyphRunAnalysis(&run, 1.0, nil, .NATURAL, .NATURAL, 0, 0, &analysis); !win.SUCCEEDED(hr) {
+	if hr := t.factory->CreateGlyphRunAnalysis(&run, 1.0, nil, .NATURAL_SYMMETRIC, .NATURAL, 0, 0, &analysis); !win.SUCCEEDED(hr) {
 		return
 	}
 	defer analysis->Release()
@@ -924,6 +932,30 @@ glyph_rasterize :: proc(t: ^Text, set: Font_Set, face: int, index: u16, px: f32)
 		return nil, 0, 0, left, top
 	}
 	return
+}
+
+// Test helper (no D3D device): compile the text shaders, so a headless run
+// catches an HLSL error that would otherwise only surface as a failed text_init
+// (a black window that never draws) at startup.
+text_shaders_compile_ok :: proc() -> bool {
+	vs, vok := compile_shader(TEXT_HLSL, "vs_main", "vs_5_0")
+	if vs != nil {vs->Release()}
+	ps, pok := compile_shader(TEXT_HLSL, "ps_main", "ps_5_0")
+	if ps != nil {ps->Release()}
+	return vok && pok
+}
+
+// Test probe (no D3D device needed): rasterize `r` at `px` and report the
+// coverage size and whether any pixel is inked. Verifies the glyph path
+// produces real coverage — the pixels themselves still need a live eye.
+text_glyph_coverage_probe :: proc(t: ^Text, r: rune, px: f32, set := Font_Set.Doc) -> (w, h: int, inked: bool) {
+	face, gi := rune_face(t, r, set)
+	cov, gw, gh, _, _ := glyph_rasterize(t, set, face, gi, px)
+	defer if cov != nil {delete(cov)}
+	for b in cov {
+		if b > 0 {inked = true;break}
+	}
+	return int(gw), int(gh), inked
 }
 
 // Shelf packer: grow-only, no eviction yet. Returns ok=false when the atlas is

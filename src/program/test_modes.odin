@@ -1163,6 +1163,29 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 
 	// `newtpad celltest` prints the monospace cell width of sample codepoints and
 	// a byte<->cell round-trip (no GPU; uses text_load_faces).
+	// `newtpad blurtest` verifies the grayscale glyph path rasterizes real
+	// coverage at small and large (zoom) sizes. It can't judge how the pixels
+	// look -- that needs a live eye -- but it catches a broken coverage path.
+	if os.args[1] == "blurtest" {
+		t: plat.Text
+		plat.text_load_faces(&t)
+		bad := 0
+		if plat.text_shaders_compile_ok() {
+			fmt.println("  text shaders compile: OK")
+		} else {
+			fmt.println("  FAIL: text shaders do not compile")
+			bad += 1
+		}
+		for c in ([]struct{r: rune, px: f32}{{'A', 16}, {'g', 16}, {'5', 16}, {'中', 24}, {'W', 200}}) {
+			w, h, inked := plat.text_glyph_coverage_probe(&t, c.r, c.px)
+			ok := w > 0 && h > 0 && inked
+			fmt.printfln("  %q @ %.0fpx -> %dx%d inked=%v %s", c.r, c.px, w, h, inked, "OK" if ok else "FAIL")
+			if !ok {bad += 1}
+		}
+		fmt.printfln("blurtest: %d failures", bad)
+		return true
+	}
+
 	if os.args[1] == "celltest" {
 		t: plat.Text
 		if !plat.text_load_faces(&t) {

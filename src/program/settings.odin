@@ -165,7 +165,7 @@ Setting_Row :: struct {
 SETTINGS_ROWS := []Setting_Row {
 	{"Restore session on launch", "Reopen the tabs you had open, including unsaved ones"},
 	{"Word wrap new documents", "Long lines fold to the window width instead of running off"},
-	{"Zoom", "Ctrl+= / Ctrl+- / Ctrl+0 anywhere, or Ctrl+wheel"},
+	{"Zoom", "Ctrl+= / Ctrl+- / Ctrl+0 anywhere"},
 	{"Show links", "When URLs and paths are highlighted (Ctrl+click always opens)"},
 }
 
