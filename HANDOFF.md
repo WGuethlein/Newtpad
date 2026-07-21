@@ -1026,6 +1026,36 @@ the exe attached needs `gh`, which isn't installed — the exe upload is manual 
   link" and Q4 "a binding for Open Link Under Cursor" — Wyatt: keep link-wins; make the binding
   choosable once user keybind customization exists, which is separate future work.)
 
+## 6o. Four-in-one-pass batch (2026-07-20, v0.7.0)
+
+Wyatt asked for all four remaining options in one pass to bug-hunt the next day. All shipped
+in v0.7.0; the two GUI-feel ones want a live pass (headless can't inject drags or judge a grid).
+
+- **Streamed save (P1 data-safety) — DONE.** `doc_save_err` streamed in rune-aligned 1 MB chunks
+  instead of `pt_collect` + `encode_from_utf8` (two whole-buffer allocs, the multi-GB OOM). UTF-8
+  writes buffer bytes directly; other encodings transcode a chunk at a time and free it, so the
+  peak is one chunk. New `Atomic_Write` begin/write/commit in `file.odin` (`file_write_atomic` is
+  now a one-chunk wrapper, same `ReplaceFileW` durability); `encode_body_from_utf8` / `encoding_bom`
+  / `utf8_complete_len` in `base`. `savestreamtest` proves byte-identical output vs the whole-buffer
+  encoder across the 1 MB boundary for UTF-8/16LE/16BE/CP1252 with multibyte runes straddling it.
+- **Tab drag to reorder — DONE (live pass owed).** Press a tab and drag; it bubbles past neighbours
+  (adjacent swaps) so the active/highlighted tab follows the cursor, no floating render. `app_swap_tabs`
+  swaps two slots' docs and remaps `active` + `mru` (both slot indices; the watcher's per-doc gen
+  check discards a stale in-flight result). `tabreordertest` covers the bookkeeping. Tear-off-to-a-
+  new-window still deferred (fights single-instance).
+- **CSV/TSV table view (Ctrl+T) — DONE (live pass owed).** `table.odin`: toggle to a read-only
+  columnized grid; bounded (only visible rows parsed, only their fields set column widths, so a
+  multi-GB CSV is fine). Delimiter chosen on turn-on (tab for .tsv, else majority of the first line);
+  Shift+wheel pans columns; header row banded when the file's first line is on screen. v1 limits:
+  read-only, quotes parse within a line but not across a newline, columns past the window clip.
+  `csvtest` covers the field parser.
+- **Idle CPU — DONE.** The loop blocked at vsync (a pinned core). It now `MsgWaitForMultipleObjectsEx`
+  (QS_ALLINPUT) when idle — waking instantly on input/events — spinning only for a held drag
+  auto-scrolling past an edge, polling every 200 ms while a worker publishes and every 1 s otherwise
+  (so a disk change still surfaces within the watcher's cadence). Hover/Ctrl-highlight still update
+  because a move or Ctrl press is itself a waking message. **Can't be verified headlessly** — watch
+  for any input lag or a stale frame after a background change during Wyatt's pass.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -1043,10 +1073,10 @@ the exe attached needs `gh`, which isn't installed — the exe upload is manual 
   - Rendering / platform: `sehtest`, `dpitest`, `atlastest`, `atlasgrowtest`, `devicelosttest`,
     `celltest`, `blurtest`, `drawcount <file>`
   - UI surfaces: `menutest`, `menuseam`, `palettetest`, `settingstest`, `fonttest`, `historytest`,
-    `linktest`
-  - Document / editing: `vnavtest`, `wraptest`, `colperftest <mb>`, `scrollperftest <mb>`,
-    `hscrolltest`, `replacetest`, `findtest`, `regextest <mb>`
-  - Files / session: `savepathtest <dir>`, `savefailtest <dir>`, `resavetest <file>`,
+    `linktest`, `tabreordertest`
+  - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
+    `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `replacetest`, `findtest`, `regextest <mb>`
+  - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest <file>`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest <dir>`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
   - Two are **falsifiers**, not regression tests — they measure a claim rather than guard a
