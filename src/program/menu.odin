@@ -79,6 +79,18 @@ is_filtered :: proc(app: ^App) -> bool {
 }
 
 @(private = "file")
+is_table :: proc(app: ^App) -> bool {
+	d := app_active(app)
+	return d != nil && d.table
+}
+
+@(private = "file")
+is_md_view :: proc(app: ^App) -> bool {
+	d := app_active(app)
+	return d != nil && d.md_mode != .Off
+}
+
+@(private = "file")
 is_regex :: proc(app: ^App) -> bool {
 	d := app_active(app)
 	return d != nil && d.find.regex
@@ -129,6 +141,8 @@ menus := []Menu {
 		'v',
 		[]Menu_Item {
 			{cmd = .Toggle_Wrap, checked = is_wrapped, enabled = has_doc},
+			{cmd = .Toggle_Table, checked = is_table, enabled = has_doc},
+			{cmd = .Toggle_Preview, checked = is_md_view, enabled = has_doc},
 			sep,
 			{cmd = .Filter_Open, checked = is_filtered, enabled = has_doc},
 			{cmd = .Find_Toggle_Regex, checked = is_regex, enabled = has_doc},
