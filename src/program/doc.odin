@@ -1516,14 +1516,22 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 	// Horizontal follow first (plain view only; wrap/filter have no h-scroll):
 	// keep the caret's column inside [h_scroll, h_scroll+view_cols) so typing or
 	// arrowing off the right edge pans instead of hiding the caret.
+	//
+	// Only when the caret's real line start is found within the cap. On a line
+	// longer than RENDER_LINE_CAP the capped scan stops at a synthetic offset one
+	// cap back, so the column measured from it was ~8000 -- and a mere click flung
+	// h_scroll to the far right. A line that long is rendered as capped segments
+	// anyway (its column relative to the logical start is not what the draw uses),
+	// so leaving h_scroll put is the right behaviour, not a compromise.
 	if !doc.wrap && !doc.filter {
-		crow := row_start_capped(doc, doc.cursor)
-		ccol := line_cell_col(doc, t, crow, doc.cursor)
-		vc := max(1, doc.view_cols)
-		if ccol < doc.h_scroll {
-			doc.h_scroll = ccol
-		} else if ccol >= doc.h_scroll + vc {
-			doc.h_scroll = ccol - vc + 1
+		if lstart, exact := base.pt_line_start_cap(&doc.pt, doc.cursor, RENDER_LINE_CAP); exact {
+			ccol := line_cell_col(doc, t, lstart, doc.cursor)
+			vc := max(1, doc.view_cols)
+			if ccol < doc.h_scroll {
+				doc.h_scroll = ccol
+			} else if ccol >= doc.h_scroll + vc {
+				doc.h_scroll = ccol - vc + 1
+			}
 		}
 	}
 	cls := visual_row_start(doc, t, doc.cursor, doc.view_cols) if doc.wrap else row_start_capped(doc, doc.cursor)

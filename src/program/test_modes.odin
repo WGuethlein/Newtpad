@@ -1712,6 +1712,36 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 		doc.h_scroll = 0
 
+		// Clicking must not fling the viewport. On a line longer than the render
+		// cap, the caret-follow measured the column from a synthetic line start one
+		// cap back, so a click on a later segment jumped h_scroll to ~8000. Simulate
+		// a click on the second capped segment of a very long line and require
+		// h_scroll to stay put.
+		{
+			longline := strings.concatenate({strings.repeat("y", 20000), "\n"})
+			ld := doc_from_content(transmute([]u8)longline, "", .UTF8)
+			defer doc_close(&ld)
+			ld.wrap = false
+			ld.view_cols = 80
+			ld.view_rows = 5
+			ld.h_scroll = 0
+			ld.top = base.pt_line_end_cap(&ld.pt, 0, RENDER_LINE_CAP) // second capped segment
+			doc_update_hscroll(&ld) // H_SCROLL = 0
+			mx := col_x(cw, 40) + cw*0.2 // screen col 40 of the visible segment
+			my := row_baseline_y(px, 0) - line_height(px)*0.5
+			ld.cursor = doc_pos_at(&ld, &t, i32(mx), i32(my), px, cw, rows)
+			before := ld.h_scroll
+			doc_ensure_cursor_visible(&ld, &t, ld.view_rows)
+			if ld.h_scroll > before + ld.view_cols {
+				fmt.printfln("  FAIL: click on a long line flung h_scroll %d -> %d", before, ld.h_scroll)
+				bad += 1
+			} else {
+				fmt.println("  clicking a long line does not fling the viewport: OK")
+			}
+			ld.h_scroll = 0
+			doc_update_hscroll(&ld)
+		}
+
 		if bad == 0 {fmt.println("  drawn column == hit-tested column, and the scrollbar thumb round-trips: OK")}
 		fmt.printfln("hscrolltest: %d failures", bad)
 		return true
