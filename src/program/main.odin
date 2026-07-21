@@ -21,6 +21,13 @@ main :: proc() {
 
 	if test_mode_dispatch() {return} // headless argv modes (see test_modes.odin)
 
+	// Logging + crash handling, armed before the window so an init-time fault is
+	// still caught. The assertion proc is set on this context so it propagates to
+	// the whole frame loop (Odin context flows down the call tree).
+	diag_init()
+	context.assertion_failure_proc = diag_assert_fail
+	defer diag_shutdown()
+
 	// Open the file given on the command line; with no argument, start empty.
 	path := ""
 	if len(os.args) > 1 {
@@ -74,6 +81,9 @@ main :: proc() {
 	restored := primary && app.settings.restore_session && session_restore(&app)
 	// A session we couldn't load still owns its backups; don't sweep them.
 	session_can_sweep := !had_session || restored
+	// The crash handler saves the user's work; give it the App and the same
+	// sweep policy the exit save uses (but it always saves with sweep off).
+	diag_bind_app(&app, primary, session_can_sweep)
 	if path != "" {
 		if !app_open_path(&app, path) {
 			fmt.eprintfln("Newtpad: could not open %q", path)

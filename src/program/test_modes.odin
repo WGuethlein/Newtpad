@@ -1037,6 +1037,82 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad logtest` covers the base ring-buffer logger: level gating, the
+	// oldest-first dump order, wrap-around retention, and truncation.
+	if os.args[1] == "logtest" {
+		bad := 0
+		base.log_init(.Info)
+		// Level gate: a Debug line is dropped when the floor is Info.
+		base.log_debug("dropped")
+		if base.log_total() != 0 {
+			fmt.println("  FAIL debug line not gated out")
+			bad += 1
+		}
+		base.log_info("first")
+		base.log_warn("second")
+		if base.log_total() != 2 || base.log_retained() != 2 {
+			fmt.printfln("  FAIL counts total=%d retained=%d want 2/2", base.log_total(), base.log_retained())
+			bad += 1
+		}
+		// Dump order is oldest-first.
+		@(static) order: [dynamic]string
+		clear(&order)
+		base.log_each(proc(u: rawptr, e: ^base.Log_Entry) {
+			append(cast(^[dynamic]string)u, strings.clone(string(e.text[:e.len]), context.temp_allocator))
+		}, &order)
+		if len(order) != 2 || order[0] != "first" || order[1] != "second" {
+			fmt.printfln("  FAIL dump order %v", order)
+			bad += 1
+		}
+		// Wrap: write more than the ring holds; retained caps at LOG_RING and the
+		// oldest are the most recent LOG_RING lines.
+		for i in 0 ..< base.LOG_RING + 50 {base.log_info("line-%d", i)}
+		if base.log_retained() != base.LOG_RING {
+			fmt.printfln("  FAIL retained=%d want %d after wrap", base.log_retained(), base.LOG_RING)
+			bad += 1
+		}
+		clear(&order)
+		base.log_each(proc(u: rawptr, e: ^base.Log_Entry) {
+			append(cast(^[dynamic]string)u, strings.clone(string(e.text[:e.len]), context.temp_allocator))
+		}, &order)
+		want_first := fmt.tprintf("line-%d", base.LOG_RING + 50 - base.LOG_RING) // 50
+		if len(order) == 0 || order[0] != want_first {
+			fmt.printfln("  FAIL after wrap oldest=%q want %q", len(order) > 0 ? order[0] : "", want_first)
+			bad += 1
+		}
+		fmt.printfln("logtest: %d failures", bad)
+		return true
+	}
+
+	// `newtpad crashtest <null|panic|assert|oob>` deliberately triggers a fault to
+	// exercise the whole crash path end to end: the handler must write a .dmp and a
+	// .txt to the crashes dir and save the session, WITHOUT a blocking dialog. The
+	// process then dies with the fault -- the harness checks the files exist and the
+	// exit code is non-zero. Set NEWTPAD_SESSION_DIR to a temp dir first.
+	if os.args[1] == "crashtest" {
+		kind := os.args[2] if len(os.args) > 2 else "panic"
+		plat.crash_set_silent(true) // no message box in a headless run
+		diag_init()
+		context.assertion_failure_proc = diag_assert_fail
+		base.log_info("crashtest about to trigger %q", kind)
+		base.log_info("breadcrumb: pretend the user opened a file and typed")
+		switch kind {
+		case "null":
+			p := cast(^int)(uintptr(0))
+			p^ = 42 // access violation -> SEH filter
+		case "oob":
+			s := make([]int, 2)
+			i := len(os.args) + 5 // opaque index so it isn't folded out
+			s[i] = 1 // bounds check -> assertion proc -> trap -> SEH filter
+		case "assert":
+			assert(1 + len(os.args) < 0, "crashtest forced assert")
+		case:
+			panic("crashtest forced panic")
+		}
+		fmt.println("crashtest: did not crash (BUG)") // should be unreachable
+		return true
+	}
+
 	// `newtpad tabreordertest` covers the reorder bookkeeping: after dragging a tab
 	// across the strip the document order changes but the same document stays
 	// active and the MRU still points at it (active/mru are slot indices, so a swap

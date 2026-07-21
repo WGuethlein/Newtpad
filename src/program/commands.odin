@@ -530,6 +530,7 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 }
 
 command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^plat.Window, t: ^plat.Text, rows: int) {
+	if cmd != .None {diag_cmd(cmd)} // breadcrumb: what the user was doing
 	doc := app_active(app)
 	// Table view is a read-only grid. Block every document-mutating command so a
 	// caret left over from text view can't silently corrupt the file at an
