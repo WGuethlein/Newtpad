@@ -1013,13 +1013,16 @@ the exe attached needs `gh`, which isn't installed — the exe upload is manual 
   from the full resolve target (`text`+`link`), plus a `wrapped` flag so the underline and click
   hit-test use the row's own offset. `linktest` plants a URL that char-breaks across three
   wrapped rows and checks the segments cover it and each resolves whole. Live pass still worth it.
-- **Blurry text at high *zoom* (Ctrl+wheel) — diagnosed, not fixed.** Screenshot in `images/`.
-  The swapchain is `SCALING_NONE` (1:1, not stretched) and glyphs rasterize at the exact display
-  px and point-sample 1:1 — so it isn't scaling blur. Most likely **ClearType subpixel fringing
-  magnified at large sizes**: the atlas is 3-channel `CLEARTYPE_3x1`, whose coloured subpixel
-  coverage reads as soft/chromatic when the glyph is very large. The fix is grayscale AA above a
-  px threshold (or `NATURAL_SYMMETRIC`), a text-pipeline change that alters *all* text — needs a
-  visual compare pass with Wyatt, so it's held rather than changed blind. (§6l Q2 "selection vs
+- **Blurry text at high *zoom* — FIXED (v0.6.0).** It was ClearType subpixel fringing magnified:
+  the swapchain is `SCALING_NONE` (1:1) and glyphs rasterize at the exact px, so it was never
+  scaling blur — the 3-channel `CLEARTYPE_3x1` coverage's coloured subpixels read as soft/chromatic
+  when a glyph is large. Now the same ClearType coverage is **averaged to one grayscale value**
+  (`glyph_get`), the shader samples one channel and straight-alpha-blends (was dual-source), and the
+  rendering mode is `NATURAL_SYMMETRIC`. Note: asking DirectWrite for an `ALIASED_1x1` texture under
+  a ClearType rendering mode returns an *empty* glyph — the averaging trick is why this stays on the
+  working `CLEARTYPE_3x1` path. `blurtest` compiles the shaders and checks glyphs rasterize inked
+  16px–200px (headless — the look still wants a live eye). Also **Ctrl+wheel now scrolls** (Ctrl is
+  the link-highlight modifier); zoom moved to Ctrl+= / Ctrl+- / Ctrl+0 and Settings. (§6l Q2 "selection vs
   link" and Q4 "a binding for Open Link Under Cursor" — Wyatt: keep link-wins; make the binding
   choosable once user keybind customization exists, which is separate future work.)
 
@@ -1038,7 +1041,7 @@ the exe attached needs `gh`, which isn't installed — the exe upload is manual 
 - **Headless test modes** (debug exe). **Set `NEWTPAD_SESSION_DIR` to a temp dir first** or the
   session modes write to, and reset, the real store under `%APPDATA%\Newtpad`:
   - Rendering / platform: `sehtest`, `dpitest`, `atlastest`, `atlasgrowtest`, `devicelosttest`,
-    `celltest`, `drawcount <file>`
+    `celltest`, `blurtest`, `drawcount <file>`
   - UI surfaces: `menutest`, `menuseam`, `palettetest`, `settingstest`, `fonttest`, `historytest`,
     `linktest`
   - Document / editing: `vnavtest`, `wraptest`, `colperftest <mb>`, `scrollperftest <mb>`,
