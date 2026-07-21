@@ -409,7 +409,9 @@ main :: proc() {
 		// pointer's x to the scroll offset (same geometry the bar is drawn from).
 		{
 			maxhs := doc_max_hscroll(doc, &text, rows)
-			hb := hscrollbar_geo(doc, f32(window.width), f32(window.height), maxhs)
+			// Scope the bar to the editor half in Markdown Split (ed_right), so it
+			// doesn't run across the preview pane; full width otherwise.
+			hb := hscrollbar_geo(doc, ed_right, f32(window.height), maxhs)
 			if hb.shown && window.mouse_pressed &&
 			   f32(window.mouse_y) >= hb.y && f32(window.mouse_y) <= hb.y + hb.h &&
 			   f32(window.mouse_x) >= hb.track_x && f32(window.mouse_x) <= hb.track_x + hb.track_w {
@@ -882,7 +884,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	}
 
 	// Horizontal scrollbar (plain view, when a visible line overflows).
-	if hb := hscrollbar_geo(doc, w, h, doc_max_hscroll(doc, text, rows)); hb.shown {
+	if hb := hscrollbar_geo(doc, er, h, doc_max_hscroll(doc, text, rows)); hb.shown {
 		plat.quads_draw(
 			gfx,
 			quad_pipe,
