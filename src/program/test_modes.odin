@@ -941,6 +941,42 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad savestreamtest` proves the streamed save (rune-aligned chunks) is
+	// byte-identical to the reference whole-buffer encoder across the 1 MB chunk
+	// boundary, for every encoding — the risk being a multibyte rune split at a
+	// chunk edge or a per-chunk BOM.
+	if os.args[1] == "savestreamtest" {
+		bad := 0
+		dir := os.get_env("TEMP", context.temp_allocator)
+		// > SAVE_CHUNK (1 MB) of mixed ASCII + 3-byte runes, so runes straddle the
+		// chunk boundary at ~1 MB.
+		body := make([dynamic]u8, 0, (1 << 20) + 60000)
+		for len(body) < (1 << 20) + 40000 {append(&body, ..transmute([]u8)string("abc中def漢"))}
+		content := body[:]
+		Case :: struct {
+			e:    base.Encoding,
+			bom:  bool,
+			name: string,
+		}
+		for c in ([]Case{{.UTF8, false, "utf8"}, {.UTF8, true, "utf8bom"}, {.UTF16LE, true, "utf16le"}, {.UTF16BE, true, "utf16be"}, {.CP1252, false, "cp1252"}}) {
+			dup := make([]u8, len(content)) // doc_from_content takes ownership
+			copy(dup, content)
+			doc := doc_from_content(dup, "", c.e)
+			doc.had_bom = c.bom
+			path := fmt.tprintf("%s\\npstream_%s.bin", dir, c.name)
+			err := doc_save_err(&doc, path)
+			ref := base.encode_from_utf8(content, c.e, c.bom, context.temp_allocator)
+			on_disk, _ := os.read_entire_file(path, context.temp_allocator)
+			ok := err == .None && string(on_disk) == string(ref)
+			fmt.printfln("  %-8s streamed=%d ref=%d match=%v %s", c.name, len(on_disk), len(ref), string(on_disk) == string(ref), "OK" if ok else "FAIL")
+			if !ok {bad += 1}
+			doc_close(&doc)
+			os.remove(path)
+		}
+		fmt.printfln("savestreamtest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad savepathtest <dir>` pins the ownership seam in the save path.
 	// doc_save_err replaces doc.path with a fresh buffer and frees the old one, so
 	// any caller that captured doc.path before the call is holding freed memory

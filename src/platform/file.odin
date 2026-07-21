@@ -180,62 +180,91 @@ file_write_atomic :: proc(path: string, data: []u8) -> bool {
 	return err == .None
 }
 
-// As file_write_atomic, but says why it failed. The replace step fails with
-// ERROR_ACCESS_DENIED whenever another process holds the target open — which is
-// the normal state of a log being written by a service, i.e. exactly the file a
-// user is most likely to be editing when this matters.
-file_write_atomic_err :: proc(path: string, data: []u8) -> Write_Error {
-	tmp := strings.concatenate({path, ".newtpad~"}, context.temp_allocator)
-	wtmp := win.utf8_to_wstring(tmp, context.temp_allocator)
+// A streaming atomic write: create the temp file, write chunks, then commit
+// (flush + replace/rename). This lets a multi-GB save go out in bounded chunks
+// instead of one giant buffer — the whole-buffer collect+encode was several GB of
+// transient heap on the main thread and a real OOM. The temp/dst paths are heap-
+// owned by the writer and freed by commit or abort.
+Atomic_Write :: struct {
+	h:   win.HANDLE,
+	tmp: string, // heap; the ".newtpad~" temp path
+	dst: string, // heap; the final path
+}
 
+atomic_write_begin :: proc(path: string) -> (aw: Atomic_Write, ok: bool) {
+	tmp := strings.concatenate({path, ".newtpad~"}) // heap: outlives this call
+	wtmp := win.utf8_to_wstring(tmp, context.temp_allocator)
 	h := win.CreateFileW(wtmp, win.GENERIC_WRITE, 0, nil, win.CREATE_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, nil)
 	if h == win.INVALID_HANDLE_VALUE {
-		return .Create_Temp
+		delete(tmp)
+		return {}, false
 	}
+	return Atomic_Write{h = h, tmp = tmp, dst = strings.clone(path)}, true
+}
+
+// Write one chunk; false on any write failure (disk full). Caller then aborts.
+atomic_write :: proc(aw: ^Atomic_Write, data: []u8) -> bool {
 	total := 0
 	for total < len(data) {
 		written: win.DWORD
-		if !win.WriteFile(h, raw_data(data[total:]), win.DWORD(len(data) - total), &written, nil) {
-			break
-		}
-		if written == 0 {
-			break
+		if !win.WriteFile(aw.h, raw_data(data[total:]), win.DWORD(len(data) - total), &written, nil) || written == 0 {
+			return false
 		}
 		total += int(written)
 	}
-	// Durability before the rename. Without it the rename can commit while the
-	// bytes are still only in the cache, so a power loss leaves a zero-length file
-	// where the document was -- and the original is already gone. That is strictly
-	// worse than the plain overwrite this atomic scheme replaced, which is the
-	// whole reason the scheme exists.
-	win.FlushFileBuffers(h)
-	win.CloseHandle(h)
-	if total != len(data) {
-		win.DeleteFileW(wtmp)
-		return .Write
-	}
+	return true
+}
 
-	wdst := win.utf8_to_wstring(path, context.temp_allocator)
-	// Replacing an existing file goes through ReplaceFileW, which keeps the
-	// original's ACLs, attributes, creation time and alternate data streams.
-	// MoveFileExW substitutes a brand-new file, so every save silently reset the
-	// permissions on anything with non-default ACLs -- a config under a hardened
-	// directory, a file in a shared folder -- and dropped Zone.Identifier with it.
-	// ReplaceFileW requires the target to exist, so a first save (Save As to a new
-	// name) still takes the rename path below.
+@(private = "file")
+atomic_write_free :: proc(aw: ^Atomic_Write) {
+	delete(aw.tmp)
+	delete(aw.dst)
+	aw^ = {}
+}
+
+// Flush for durability (a rename committing while the bytes are still in cache
+// would leave a zero-length file after a power loss, with the original already
+// gone), then replace the target. ReplaceFileW keeps the original's ACLs,
+// attributes, creation time and alternate data streams (Zone.Identifier); it
+// needs the target to exist, so a first save falls through to the rename.
+atomic_write_commit :: proc(aw: ^Atomic_Write) -> Write_Error {
+	win.FlushFileBuffers(aw.h)
+	win.CloseHandle(aw.h)
+	wtmp := win.utf8_to_wstring(aw.tmp, context.temp_allocator)
+	wdst := win.utf8_to_wstring(aw.dst, context.temp_allocator)
+	defer atomic_write_free(aw)
 	if win.GetFileAttributesW(wdst) != win.INVALID_FILE_ATTRIBUTES {
 		if ReplaceFileW(wdst, wtmp, nil, REPLACEFILE_WRITE_THROUGH | REPLACEFILE_IGNORE_MERGE_ERRORS, nil, nil) {
 			return .None
 		}
-		// Fall through rather than fail: ReplaceFileW does not work on every
-		// filesystem or across volumes, and a save that succeeds without preserving
-		// metadata beats a save that refuses to happen.
 	}
 	if !win.MoveFileExW(wtmp, wdst, win.MOVEFILE_REPLACE_EXISTING | win.MOVEFILE_WRITE_THROUGH) {
 		win.DeleteFileW(wtmp)
 		return .Replace
 	}
 	return .None
+}
+
+atomic_write_abort :: proc(aw: ^Atomic_Write) {
+	win.CloseHandle(aw.h)
+	win.DeleteFileW(win.utf8_to_wstring(aw.tmp, context.temp_allocator))
+	atomic_write_free(aw)
+}
+
+// As file_write_atomic, but says why it failed. Now a thin wrapper over the
+// streaming API (one chunk). The replace step fails with ERROR_ACCESS_DENIED
+// whenever another process holds the target open — the normal state of a log a
+// service is writing, i.e. exactly the file a user is most likely to be editing.
+file_write_atomic_err :: proc(path: string, data: []u8) -> Write_Error {
+	aw, ok := atomic_write_begin(path)
+	if !ok {
+		return .Create_Temp
+	}
+	if !atomic_write(&aw, data) {
+		atomic_write_abort(&aw)
+		return .Write
+	}
+	return atomic_write_commit(&aw)
 }
 
 // Build a comdlg filter string (label\0pattern\0...\0\0) as wide chars.

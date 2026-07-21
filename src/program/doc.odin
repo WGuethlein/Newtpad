@@ -817,10 +817,48 @@ doc_save :: proc(doc: ^Document, path: string) -> bool {
 
 // Returns why the save failed so the caller can tell the user. A save that fails
 // silently is a data-loss bug: the user believes the file is written.
+//
+// Streamed in rune-aligned chunks rather than collect-whole + encode-whole: those
+// were two full-buffer allocations on the main thread (~4-6 GB transient for a
+// 2 GB doc, a real OOM). Now the peak is one chunk. UTF-8 writes the buffer bytes
+// directly; other encodings transcode a chunk at a time and free it immediately.
+SAVE_CHUNK :: 1 << 20
 doc_save_err :: proc(doc: ^Document, path: string) -> plat.Write_Error {
-	body := base.pt_collect(&doc.pt, context.temp_allocator) // internal UTF-8
-	out := base.encode_from_utf8(body, doc.enc, doc.had_bom, context.temp_allocator)
-	if err := plat.file_write_atomic_err(path, out); err != .None {
+	aw, ok := plat.atomic_write_begin(path)
+	if !ok {return .Create_Temp}
+
+	bom: [3]u8
+	if bn := base.encoding_bom(bom[:], doc.enc, doc.had_bom); bn > 0 {
+		if !plat.atomic_write(&aw, bom[:bn]) {
+			plat.atomic_write_abort(&aw)
+			return .Write
+		}
+	}
+
+	raw := make([]u8, SAVE_CHUNK)
+	defer delete(raw)
+	for pos := 0; pos < doc.pt.length; {
+		n := base.pt_read(&doc.pt, pos, raw[:min(SAVE_CHUNK, doc.pt.length - pos)])
+		if n == 0 {break}
+		if pos + n < doc.pt.length { // keep a multibyte rune whole across chunks
+			if a := base.utf8_complete_len(raw[:n]); a > 0 {n = a}
+		}
+		wrote := false
+		if doc.enc == .UTF8 {
+			wrote = plat.atomic_write(&aw, raw[:n]) // no transcode: write as-is
+		} else {
+			enc := base.encode_body_from_utf8(raw[:n], doc.enc)
+			wrote = plat.atomic_write(&aw, enc)
+			delete(enc)
+		}
+		if !wrote {
+			plat.atomic_write_abort(&aw)
+			return .Write
+		}
+		pos += n
+	}
+
+	if err := plat.atomic_write_commit(&aw); err != .None {
 		return err
 	}
 	newpath := strings.clone(path) // clone first: path may alias doc.path (re-save)
