@@ -105,6 +105,63 @@ table_max_col :: proc(doc: ^Document) -> int {
 	return max(0, doc.table_cols - 1)
 }
 
+// A link inside a table cell, positioned in pixels (cells sit at arbitrary
+// column x's, not the uniform text grid, so links here can't use Link_Hit).
+Table_Link :: struct {
+	x, y, w: f32, // underline rect; y is the text baseline
+	text:    string, // the cell text the link offsets index (for resolution)
+	link:    Link,
+}
+
+// Links in the visible cells, positioned to match table_draw's layout. Rebuilt
+// per frame while Ctrl is held (or Show-links is on), like the editor's links.
+table_links :: proc(doc: ^Document, text: ^plat.Text, px, char_w: f32, rows: int, width: f32, allocator := context.temp_allocator) -> []Table_Link {
+	out := make([dynamic]Table_Link, 0, 8, allocator)
+	colw := doc.table_widths
+	if len(colw) == 0 {return out[:]}
+	delim := doc.table_delim if doc.table_delim != 0 else ','
+	start_col := clamp(doc.table_col, 0, table_max_col(doc))
+	right := width - SCROLLBAR_W
+	buf: [RENDER_LINE_CAP]u8
+	p := doc.top
+	for r in 0 ..< rows {
+		if p > doc.pt.length {break}
+		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
+		if n > 0 && buf[n - 1] == '\r' {n -= 1}
+		fields := csv_fields(string(buf[:n]), delim, allocator)
+		ry := row_baseline_y(px, r)
+		cx := TEXT_MARGIN_X
+		for c := start_col; c < len(colw); c += 1 {
+			if cx >= right {break}
+			cellright := min(cx + f32(colw[c]) * char_w, right)
+			if c < len(fields) {
+				field := strings.clone(fields[c], allocator)
+				for l in links_scan(field, allocator) {
+					lcol, lcells := plat.text_span_cells(text, field, l.start, l.len, .Doc)
+					lx := cx + f32(lcol) * char_w
+					if lx < cellright {
+						append(&out, Table_Link{x = lx, y = ry, w = min(f32(lcells) * char_w, cellright - lx), text = field, link = l})
+					}
+				}
+			}
+			cx += f32(colw[c] + TABLE_COL_PAD) * char_w
+		}
+		if end >= doc.pt.length {break}
+		p = end + 1
+	}
+	return out[:]
+}
+
+table_link_hit :: proc(links: []Table_Link, mx, my, px, line_h: f32) -> (Table_Link, bool) {
+	for l in links {
+		if mx >= l.x && mx < l.x + l.w && my >= l.y - px && my < l.y - px + line_h {
+			return l, true
+		}
+	}
+	return {}, false
+}
+
 // Draw the visible rows as a grid. `doc.table_cols` is set here (the column count
 // this frame) so input can clamp horizontal scroll. Returns the byte offset just
 // past the last visible row, for the byte-proportional scrollbar.

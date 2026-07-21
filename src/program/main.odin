@@ -378,6 +378,22 @@ main :: proc() {
 			}
 		}
 
+		// Ctrl+click a link inside a table cell. Cells sit at arbitrary column x's,
+		// not the uniform text grid, so this uses pixel hit-testing. Runs before the
+		// read-only consume below so the click reaches the link first; consumes
+		// either way (the grid takes no caret).
+		if doc.table && doc.kind == .Text && window.mouse_pressed && plat.key_ctrl_down() {
+			if tl, found := table_link_hit(table_links(doc, &text, px, char_w, rows, f32(window.width)), f32(window.mouse_x), f32(window.mouse_y), px, line_h); found {
+				if t, rok := link_resolve(doc, tl.text, tl.link); rok {
+					if !link_activate(&app, &text, t) {
+						plat.message_error(window.hwnd, fmt.tprintf("Could not open:\n\n%s", t.url if t.is_url else t.path))
+					}
+				}
+				window.mouse_pressed = false
+				window.mouse_down = false
+			}
+		}
+
 		// Read-only content: the table grid, a full preview, and the preview half of
 		// a split take no caret. Swallow any press the scrollbars above did not claim
 		// (so the wheel still scrolls, and the bars still drag). After the scrollbars,
@@ -413,7 +429,11 @@ main :: proc() {
 			want := plat.Cursor_Kind.Arrow
 			if plat.key_ctrl_down() && !doc.filter {
 				cx, cy := plat.window_cursor_client(window)
-				if _, over := links_hit(links_layout(doc, &text, rows), px, char_w, f32(cx), f32(cy)); over {
+				if doc.table && doc.kind == .Text {
+					if _, over := table_link_hit(table_links(doc, &text, px, char_w, rows, f32(window.width)), f32(cx), f32(cy), px, line_h); over {
+						want = .Hand
+					}
+				} else if _, over := links_hit(links_layout(doc, &text, rows), px, char_w, f32(cx), f32(cy)); over {
 					want = .Hand
 				}
 			}
@@ -674,6 +694,12 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	} else if doc.table && doc.kind == .Text {
 		// Read-only grid view (CSV/TSV) replaces the text pass entirely.
 		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, rows, f32(window.width))
+		// Underline links in the cells while Ctrl is held (or Show-links is on).
+		if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
+			for tl in table_links(doc, text, px, char_w, rows, f32(window.width)) {
+				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {tl.x, tl.y + sx(2)}, size = {tl.w, max(sx(1), 1)}, color = LINK_COL}})
+			}
+		}
 	} else {
 		// Behind the text: find-match highlights (dim), then the selection (bright).
 		if !doc.filter {
