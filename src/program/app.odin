@@ -28,6 +28,33 @@ App :: struct {
 	// index alone is no longer enough to prove a result belongs to the document
 	// that asked for it.
 	next_gen:   u64,
+	// Tab reorder: a tab is being dragged along the strip. tab_drag_slot follows
+	// the dragged document as it swaps places (the slot changes each swap).
+	tab_drag:      bool,
+	tab_drag_slot: int,
+}
+
+// Swap the documents in two slots (tab reorder). Slot indices are referenced by
+// `active`, `mru` and the watcher (via each doc's gen), so those move with the
+// docs: active/mru are remapped here, and the watcher's gen check discards any
+// in-flight result for a slot whose document changed.
+app_swap_tabs :: proc(a: ^App, sa, sb: int) {
+	if sa == sb || sa < 0 || sb < 0 || sa >= len(a.docs) || sb >= len(a.docs) {return}
+	a.docs[sa], a.docs[sb] = a.docs[sb], a.docs[sa]
+	switch a.active {
+	case sa:
+		a.active = sb
+	case sb:
+		a.active = sa
+	}
+	for &m in a.mru {
+		switch m {
+		case sa:
+			m = sb
+		case sb:
+			m = sa
+		}
+	}
 }
 
 // Upper bound on watched files; matches the session's tab limit.

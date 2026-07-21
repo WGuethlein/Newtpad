@@ -294,6 +294,14 @@ main :: proc() {
 
 		// The tab strip claims clicks in its region before the caret sees them.
 		tabs_hit_test(&app, window)
+		// An in-progress tab reorder follows the cursor and ends on release.
+		if app.tab_drag {
+			if window.mouse_down {
+				tabs_drag_update(&app, window)
+			} else {
+				app.tab_drag = false
+			}
+		}
 
 		// Settings and Font are full-window pages with no mouse targets of their
 		// own. Without this the click falls through to the document hidden behind
@@ -405,7 +413,7 @@ main :: proc() {
 				}
 			}
 			window.mouse_pressed = false
-		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag {
+		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag {
 			// drag extends a single-click selection; word/line selects stay put.
 			// Auto-scroll while the pointer is dragged above the first row or at/
 			// below the last one — the edges are the content area, so entering the

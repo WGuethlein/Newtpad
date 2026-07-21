@@ -121,6 +121,10 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window) -> bool {
 				request_close_tab(app, hit_slot, win)
 			} else {
 				app_activate(app, hit_slot)
+				// Begin a reorder: keep the button "held" so a drag can follow. A
+				// plain click just activates and ends the drag on release (no swap).
+				app.tab_drag = true
+				app.tab_drag_slot = hit_slot
 			}
 		} else if x + PLUS_W <= limit && mx >= x && mx < x + PLUS_W { // + -> new tab
 			app_new_scratch(app, true) // always after the last tab
@@ -129,8 +133,37 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window) -> bool {
 
 	win.mouse_pressed = false
 	win.mouse_middle_pressed = false
-	win.mouse_down = false
+	if !app.tab_drag {win.mouse_down = false} // a tab drag needs the held state
 	return consumed
+}
+
+// Reorder the dragged tab as the pointer moves along the strip. Called each frame
+// while the drag is held. The tab bubbles past its neighbours (adjacent swaps),
+// so the active/highlighted tab follows the cursor — no floating render needed.
+tabs_drag_update :: proc(app: ^App, win: ^plat.Window) {
+	if f32(win.mouse_y) < 0 {return}
+	live := make([dynamic]int, 0, len(app.docs), context.temp_allocator)
+	for d, s in app.docs {
+		if d != nil {append(&live, s)}
+	}
+	di := -1
+	for s, i in live {
+		if s == app.tab_drag_slot {di = i;break}
+	}
+	if di < 0 || len(live) < 2 {return}
+	// Target display index from the cursor x (same layout the strip is drawn with).
+	rel := f32(win.mouse_x) - (MENU_W - app.tab_scroll)
+	target := clamp(int(rel / (TAB_W + TAB_GAP)), 0, len(live) - 1)
+	for di < target { // move right: swap with the next display neighbour
+		app_swap_tabs(app, live[di], live[di + 1])
+		app.tab_drag_slot = live[di + 1] // the dragged doc now lives in that slot
+		di += 1
+	}
+	for di > target { // move left
+		app_swap_tabs(app, live[di], live[di - 1])
+		app.tab_drag_slot = live[di - 1]
+		di -= 1
+	}
 }
 
 @(private = "file")

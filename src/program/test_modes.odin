@@ -941,6 +941,48 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad tabreordertest` covers the reorder bookkeeping: after dragging a tab
+	// across the strip the document order changes but the same document stays
+	// active and the MRU still points at it (active/mru are slot indices, so a swap
+	// that forgot to remap them would silently activate the wrong tab).
+	if os.args[1] == "tabreordertest" {
+		bad := 0
+		app: App
+		ds: [4]^Document
+		for i in 0 ..< 4 {
+			d := new(Document)
+			d^ = doc_new()
+			ds[i] = d
+			app_add(&app, d)
+		}
+		app_activate(&app, 1) // ds[1] active
+		active_doc := app.docs[app.active]
+
+		// Drag ds[0] to the far right via the same swaps tabs_drag_update makes.
+		app_swap_tabs(&app, 0, 1)
+		app_swap_tabs(&app, 1, 2)
+		app_swap_tabs(&app, 2, 3)
+		order_ok := app.docs[0] == ds[1] && app.docs[1] == ds[2] && app.docs[2] == ds[3] && app.docs[3] == ds[0]
+		active_ok := app.docs[app.active] == active_doc
+		mru_ok := len(app.mru) > 0 && app.mru[0] == app.active
+		fmt.printfln("  drag first tab to end: order=%v active-follows=%v mru=%v %s", order_ok, active_ok, mru_ok, "OK" if (order_ok && active_ok && mru_ok) else "FAIL")
+		if !(order_ok && active_ok && mru_ok) {bad += 1}
+
+		// Now drive the mouse-x -> target mapping through tabs_drag_update itself.
+		app.tab_drag_slot = 3 // ds[0], currently last
+		w: plat.Window
+		w.mouse_y = 5
+		w.mouse_x = 0 // far left -> target display index 0
+		tabs_drag_update(&app, &w)
+		front_ok := app.docs[0] == ds[0] // ds[0] bubbled back to the front
+		fmt.printfln("  drag last tab to front: %v %s", front_ok, "OK" if front_ok else "FAIL")
+		if !front_ok {bad += 1}
+
+		app_destroy(&app)
+		fmt.printfln("tabreordertest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad savestreamtest` proves the streamed save (rune-aligned chunks) is
 	// byte-identical to the reference whole-buffer encoder across the 1 MB chunk
 	// boundary, for every encoding — the risk being a multibyte rune split at a
