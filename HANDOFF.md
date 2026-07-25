@@ -1282,6 +1282,87 @@ keystroke frame timing, to confirm `MD_TABLE_MAX_ROWS = 1024` is the right numbe
 release binary and this batch added ~730 lines to it — the §5 debt item "gate the harness behind a
 build flag" is now the largest single contributor to binary size.
 
+## 6t. Live-feature batch 2 (2026-07-25, branch `feat/live-feature-batch-2`, v0.11.0)
+
+The four *features* §6s deferred from the 0.9.0 live-use report, plus the prerequisite Enter/`doc.eol`
+fix §6s's scope note called out. Design in `docs/superpowers/specs/2026-07-25-feature-batch-2-design.md`,
+plan in `docs/superpowers/plans/2026-07-25-feature-batch-2.md`, per-task briefs/reports in
+`.superpowers/sdd/task-{1..5}-{brief,report}.md`.
+
+- **Enter writes the document's own line ending (prerequisite, task 1).** `doc_insert_newline` wrote a
+  bare LF regardless of `doc.eol`, so every Enter in a CRLF file mixed the file's own endings, and
+  since `doc.eol` is detected only at open, the status bar kept claiming CRLF while the bytes drifted
+  to mixed. Flagged, not assumed, as priority-1 correctness and a hard prerequisite for task 2's
+  terminator rule below — a line move that preserves terminator identity is meaningless if the newline
+  it moved was already wrong.
+- **Alt+Up/Alt+Down move the selected range (task 2).** One undo per press, no-op at the first/last
+  line, byte-preserving. The real design work was the **terminator model**: carrying each line's own
+  terminator forced synthesizing one when the piece landing first was the unterminated last line, and
+  synthesis wrote `doc.eol` over a break the user never touched — on a `.Mixed` document that silently
+  converted a CRLF to an LF elsewhere in the file. Terminators now keep their byte positions and the
+  *lines* swap between them, so nothing is ever synthesized. Four scans plus a full-line temp
+  alloc/copy/insert were uncapped; now bounded by `MOVE_LINE_BUDGET` (2 MB) with a bail — not a
+  truncation — on a cap hit, since reverting the bail while keeping the capped scans corrupts the
+  buffer. Table view is read-only, so line move joined `command_mutates_doc`'s guard list (a fixed,
+  silent CSV-corruption path).
+- **Files dropped onto the window open as tabs (task 3).** Reuses the existing `WM_COPYDATA`
+  open-paths queue rather than standing up a second one; `app_consume_open_requests` is the one path
+  both the frame loop and `droptest` drive. Fixed along the way: `DragQueryFileW` truncates an
+  overlong path silently with no way to detect it from the return value, so `wbuf` (sized in wide
+  chars, where `OPEN_PATH_MAX` bounds UTF-8 bytes) now queries the true length first and skips rather
+  than opening a shorter, wrong path. Also fixed: `on_drop_files` called `runtime.default_context()`
+  inside a window procedure, which silently discards `context.assertion_failure_proc` — the
+  `diag_assert_fail` hook `main()` installs to route panics through the crash reporter — so a panic in
+  that handler would have bypassed crash reporting entirely. **Same latent gap flagged, not fixed, in
+  `on_resize`/`on_dpi`** (main.odin): both call `default_context()` and never restore the assertion
+  hook.
+- **The Markdown Split divider is draggable (task 4).** `doc_editor_right` stays the sole source of the
+  split x (grep-confirmed repo-wide); `Settings.split_frac` is one global fraction, not per-file, per
+  Wyatt's call. Three clamps (load, save, drag), `settings_save` fires on mouse-up only (not per
+  frame). Fixed: `md_divider_rect` spanned the full window height below the chrome with no upper
+  y-bound on the hit-test, so in Split mode a press in the find/status bar strip at the divider's x
+  started a spurious drag and settings save — that strip had never been interactive before (the quad
+  was decorative). The rect now stops at `winh - doc_bottom_bar_h(doc)`, tracking the find bar being
+  open, and both the hit-test and the draw read the same rect fields.
+- **Per-family view memory (task 5, this pass).** Wyatt's complaint: switch a `.md` to Split, open
+  another `.md`, and it comes back plain. His call: one remembered default **per family** (markdown ->
+  Off/Preview/Split, tabular -> Off/Table), learned implicitly from the last view toggled, with a
+  `remember_views` Settings toggle that turns "learn" into "pin." Three new `Settings` fields
+  (`md_default`, `table_default`, `remember_views`; `md_default` range-checked on load exactly like
+  `link_style`/`font_style` — an out-of-range value degrades to `.Off`, never an invalid enum), three
+  appended `SETTINGS_ROWS` (appended, not inserted — the value display is an index-based `switch i`
+  against that array), and `app_apply_view_defaults(a, doc)`.
+  - **The fresh-open/session-restore seam, checked before wiring anything up:** `app_open_path`
+    (dialog, command-line arg, drag-drop, link-open — every route in main.odin/links.odin) is the one
+    fresh-open entry point, and it alone now calls `app_apply_view_defaults` after `doc_open` succeeds.
+    `session_restore` builds its Documents directly via `doc_open`/`doc_from_content` and calls neither
+    `app_open_path` nor `app_apply_view_defaults` — the two paths already didn't share code, so no
+    opt-out flag was needed. Sabotage-tested: wiring the call into `session_restore`'s restore loop
+    made the restore assertion in `viewmemtest` fail exactly as expected (a restored `.md` tab flipped
+    to the family default instead of staying as left); reverted before commit.
+  - **Finding, not fixed — logged here as debt:** `session.txt` does not persist `md_mode`/`table` per
+    tab today (only `wrap` is). A restored tab's view always comes back `.Off`/`false` regardless of
+    what it was before the restart, independent of this feature. `viewmemtest`'s restore assertion
+    therefore proves the property that actually matters — `app_apply_view_defaults` is unreachable from
+    the restore path, so it can never overwrite a per-tab value — rather than a genuinely round-tripped
+    one. Persisting `md_mode`/`table` in the session format is separate, future work; this task's
+    protection holds either way.
+  - Deliberately **not** wired into `app_new_scratch`: an untitled buffer's path is `""`, and
+    `doc_is_markdownish("")`/`doc_is_tabular("")` both return true ("don't limit an unnamed buffer" —
+    see doc.odin), so applying the family default there would silently open every new blank tab in
+    Split/Table whenever a default was set, before the buffer has a file type at all. Family defaults
+    apply only where the family is actually known: a path with an extension.
+
+**Owed, not done:** Wyatt's live pass (Alt+arrow with real auto-repeat; an Explorer drag of several
+files and of a folder; dragging the divider and confirming it survives a restart; opening a `.md`
+after leaving the previous one in Split — this environment cannot inject GUI input). The
+`on_resize`/`on_dpi` `default_context()` gap flagged under task 3. Persisting `md_mode`/`table` per tab
+in the session format (task 5 finding above). The project-wide forgotten-feature audit that follows
+this batch, per Wyatt's decision to keep it a separate written report rather than fold it in here.
+
+**Out of scope, confirmed still out:** rebindable keys, a duplicate-line command (offered and
+declined), per-family split fractions, opening a folder's contents.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
