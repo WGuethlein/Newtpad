@@ -290,22 +290,22 @@ settings_apply_font :: proc(rc: ^Render_Ctx) {
 settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^App, width, height: f32) {
 	// Full-window page: cover the content area entirely so no document shows
 	// through and it reads as a distinct place, not an overlay.
-	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, CHROME_TOP}, size = {width, height - CHROME_TOP}, color = {0.10, 0.12, 0.16, 1}}})
+	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, CHROME_TOP}, size = {width, height - CHROME_TOP}, color = g_theme[.Bg_Base]}})
 
 	x := sx(32)
 	y := CHROME_TOP + sx(40)
-	plat.text_draw(gfx, t, "Settings", x, y, UI_PX * 1.4, {0.94, 0.96, 0.99, 1})
-	plat.text_draw(gfx, t, "Esc closes    Up/Down choose    Enter toggles", x, y + sx(22), UI_SMALL_PX, {0.50, 0.55, 0.64, 1})
+	plat.text_draw(gfx, t, "Settings", x, y, UI_PX * 1.4, g_theme[.Text_Primary])
+	plat.text_draw(gfx, t, "Esc closes    Up/Down choose    Enter toggles", x, y + sx(22), UI_SMALL_PX, g_theme[.Text_Muted])
 	y += sx(56)
 
 	rowh := sx(46)
 	for r, i in SETTINGS_ROWS {
 		sel := i == app.settings_row
 		if sel {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x - sx(12), y - sx(16)}, size = {width - sx(52), rowh - sx(6)}, color = {0.18, 0.24, 0.34, 1}}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x - sx(12), y - sx(16)}, size = {width - sx(52), rowh - sx(6)}, color = g_theme[.Selection_List]}})
 		}
-		plat.text_draw(gfx, t, r.label, x, y, UI_PX, {0.92, 0.94, 0.98, 1})
-		plat.text_draw(gfx, t, r.help, x, y + sx(16), UI_SMALL_PX, {0.50, 0.55, 0.64, 1})
+		plat.text_draw(gfx, t, r.label, x, y, UI_PX, g_theme[.Text_Primary])
+		plat.text_draw(gfx, t, r.help, x, y + sx(16), UI_SMALL_PX, g_theme[.Text_Muted])
 
 		val: string
 		switch i {
@@ -324,14 +324,14 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 		case 6:
 			val = "On" if app.settings.remember_views else "Off"
 		}
-		vc := [4]f32{0.55, 0.85, 0.60, 1} if val != "Off" else [4]f32{0.55, 0.60, 0.70, 1}
+		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Dim]
 		plat.text_draw(gfx, t, val, width - sx(220), y, UI_PX, vc)
 		y += rowh
 	}
 
 	// Version, bottom-left — the one always-visible surface for it in the GUI
 	// build (there is no console for --version once -subsystem:windows).
-	plat.text_draw(gfx, t, fmt.tprintf("Newtpad v%s", NEWTPAD_VERSION), x, height - sx(24), UI_SMALL_PX, {0.42, 0.47, 0.56, 1})
+	plat.text_draw(gfx, t, fmt.tprintf("Newtpad v%s", NEWTPAD_VERSION), x, height - sx(24), UI_SMALL_PX, g_theme[.Text_Muted])
 
 	// The one setting with a consequence worth stating outright.
 	if !app.settings.restore_session {
@@ -342,7 +342,7 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			x,
 			y + sx(20),
 			UI_SMALL_PX,
-			{0.80, 0.76, 0.50, 1},
+			g_theme[.Accent],
 		)
 	}
 }

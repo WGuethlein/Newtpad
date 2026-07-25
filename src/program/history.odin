@@ -109,29 +109,29 @@ history_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app
 	h := sx(28) + f32(shown) * HISTORY_ROW + hint_h
 
 	plat.quads_draw(gfx, qp, []plat.Quad {
-			{pos = {x0 - sx(1), y0}, size = {HISTORY_W + sx(2), h + sx(2)}, color = {0.30, 0.34, 0.42, 1}},
-			{pos = {x0, y0 + sx(1)}, size = {HISTORY_W, h}, color = {0.12, 0.14, 0.19, 1}},
+			{pos = {x0 - sx(1), y0}, size = {HISTORY_W + sx(2), h + sx(2)}, color = g_theme[.Border_Strong]},
+			{pos = {x0, y0 + sx(1)}, size = {HISTORY_W, h}, color = g_theme[.Bg_Panel]},
 		})
-	plat.text_draw(gfx, t, "History", x0 + sx(12), y0 + sx(19), UI_PX, {0.92, 0.94, 0.98, 1})
+	plat.text_draw(gfx, t, "History", x0 + sx(12), y0 + sx(19), UI_PX, g_theme[.Text_Primary])
 	if n > max_rows {
-		plat.text_draw(gfx, t, fmt.tprintf("%d of %d", app.history.sel + 1, n), x0 + HISTORY_W - sx(80), y0 + sx(19), UI_SMALL_PX, {0.50, 0.55, 0.64, 1})
+		plat.text_draw(gfx, t, fmt.tprintf("%d of %d", app.history.sel + 1, n), x0 + HISTORY_W - sx(80), y0 + sx(19), UI_SMALL_PX, g_theme[.Text_Muted])
 	}
 
 	y := y0 + sx(28)
 	for i in first ..< first + shown {
 		if i == app.history.sel {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y}, size = {HISTORY_W, HISTORY_ROW}, color = {0.20, 0.28, 0.42, 1}}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y}, size = {HISTORY_W, HISTORY_ROW}, color = g_theme[.Selection_List]}})
 		}
 		// States after the current one are the redo stack: reachable, but not
 		// where the document is. Dim them so the present is obvious.
-		col := [4]f32{0.88, 0.91, 0.96, 1}
-		if i > cur {col = {0.48, 0.52, 0.60, 1}}
-		if i == cur {col = {0.55, 0.85, 0.60, 1}}
+		col := g_theme[.Text_Primary]
+		if i > cur {col = g_theme[.Text_Muted]}
+		if i == cur {col = g_theme[.Success]}
 		mark := "▸ " if i == cur else "  "
 		plat.text_draw(gfx, t, fmt.tprintf("%s%s", mark, doc_history_label(d, i)), x0 + sx(10), y + HISTORY_ROW - sx(6), UI_SMALL_PX, col)
 		y += HISTORY_ROW
 	}
 	// Inside the panel: y is now the bottom of the last row, and the box was
 	// sized with hint_h to spare.
-	plat.text_draw(gfx, t, "Up/Down + Enter to jump    Esc closes", x0 + sx(10), y0 + sx(1) + h - sx(7), UI_SMALL_PX, {0.45, 0.49, 0.57, 1})
+	plat.text_draw(gfx, t, "Up/Down + Enter to jump    Esc closes", x0 + sx(10), y0 + sx(1) + h - sx(7), UI_SMALL_PX, g_theme[.Text_Muted])
 }

@@ -353,24 +353,10 @@ menu_title_at :: proc(t: ^plat.Text, mx: f32) -> int {
 
 // --- drawing ---
 
-@(private = "file")
-MENU_COL := struct {
-	bar, hover, drop, border, fg, dim, chord, check: [4]f32,
-} {
-	bar    = {0.12, 0.14, 0.18, 1},
-	hover  = {0.24, 0.30, 0.42, 1},
-	drop   = {0.13, 0.15, 0.20, 1},
-	border = {0.30, 0.34, 0.42, 1},
-	fg     = {0.90, 0.92, 0.97, 1},
-	dim    = {0.42, 0.46, 0.54, 1},
-	chord  = {0.58, 0.64, 0.76, 1},
-	check  = {0.55, 0.85, 0.60, 1},
-}
-
 menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^App, win: ^plat.Window, width, height: f32) {
 	cw := plat.text_char_width(t, UI_PX)
 	base_y := TAB_STRIP_H + MENU_BAR_H - sx(8)
-	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, TAB_STRIP_H}, size = {width, MENU_BAR_H}, color = MENU_COL.bar}})
+	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, TAB_STRIP_H}, size = {width, MENU_BAR_H}, color = g_theme[.Bg_Panel]}})
 
 	cx, cy := plat.window_cursor_client(win)
 	in_bar := f32(cy) >= TAB_STRIP_H && f32(cy) < TAB_STRIP_H + MENU_BAR_H
@@ -380,13 +366,13 @@ menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^
 		x0, x1 := menu_title_rect(t, i)
 		lit := i == app.menu.open || (app.menu.open < 0 && i == hover)
 		if lit {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, TAB_STRIP_H}, size = {x1 - x0, MENU_BAR_H}, color = MENU_COL.hover}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, TAB_STRIP_H}, size = {x1 - x0, MENU_BAR_H}, color = g_theme[.Selection_List]}})
 		}
-		plat.text_draw(gfx, t, m.title, x0 + MENU_PAD, base_y, UI_PX, MENU_COL.fg)
+		plat.text_draw(gfx, t, m.title, x0 + MENU_PAD, base_y, UI_PX, g_theme[.Text_Primary])
 		// Underline the mnemonic while in keyboard menu mode, the way Windows
 		// reveals access keys only once Alt has been pressed.
 		if app.menu.mode {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + MENU_PAD, base_y + sx(2)}, size = {cw, sx(1)}, color = MENU_COL.fg}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + MENU_PAD, base_y + sx(2)}, size = {cw, sx(1)}, color = g_theme[.Text_Primary]}})
 		}
 	}
 
@@ -396,13 +382,13 @@ menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^
 	gw := sx(GEAR_W_96)
 	gx := width - SCROLLBAR_W - gw
 	if in_bar && f32(cx) >= gx && f32(cx) < gx + gw {
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {gx, TAB_STRIP_H}, size = {gw, MENU_BAR_H}, color = MENU_COL.hover}})
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {gx, TAB_STRIP_H}, size = {gw, MENU_BAR_H}, color = g_theme[.Selection_List]}})
 	}
 	gpx := UI_PX * 1.35
 	gcw := plat.text_char_width(t, gpx)
 	on_settings := false
 	if d := app_active(app); d != nil {on_settings = d.kind == .Settings}
-	plat.text_draw(gfx, t, "⚙", gx + (gw - gcw) * 0.5, base_y + sx(2), gpx, MENU_COL.check if on_settings else MENU_COL.fg)
+	plat.text_draw(gfx, t, "⚙", gx + (gw - gcw) * 0.5, base_y + sx(2), gpx, g_theme[.Success] if on_settings else g_theme[.Text_Primary])
 
 	if app.menu.open < 0 {return}
 	menu_draw_dropdown(gfx, qp, t, app, width, height)
@@ -418,8 +404,8 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	x0, dw, h := menu_dropdown_rect(t, app, width, height)
 
 	plat.quads_draw(gfx, qp, []plat.Quad {
-			{pos = {x0 - sx(1), y0}, size = {dw + sx(2), h + sx(2)}, color = MENU_COL.border},
-			{pos = {x0, y0 + sx(1)}, size = {dw, h}, color = MENU_COL.drop},
+			{pos = {x0 - sx(1), y0}, size = {dw + sx(2), h + sx(2)}, color = g_theme[.Border_Strong]},
+			{pos = {x0, y0 + sx(1)}, size = {dw, h}, color = g_theme[.Bg_Panel]},
 		})
 
 	// Keep the highlighted item visible, then draw from the scroll offset.
@@ -444,21 +430,21 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 		it := items[i]
 		if it.cmd == .None { // separator
 			sh := MENU_ITEM_H * 0.4
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + sx(8), y + sh * 0.5}, size = {dw - sx(16), sx(1)}, color = MENU_COL.border}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + sx(8), y + sh * 0.5}, size = {dw - sx(16), sx(1)}, color = g_theme[.Border_Strong]}})
 			y += sh
 			continue
 		}
 		on := item_enabled(app, it)
 		if i == app.menu.item && on {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y}, size = {dw, MENU_ITEM_H}, color = MENU_COL.hover}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y}, size = {dw, MENU_ITEM_H}, color = g_theme[.Selection_List]}})
 		}
 		ty := y + MENU_ITEM_H - sx(7)
 		if it.checked != nil && it.checked(app) {
-			plat.text_draw(gfx, t, "✓", x0 + sx(8), ty, UI_PX, MENU_COL.check)
+			plat.text_draw(gfx, t, "✓", x0 + sx(8), ty, UI_PX, g_theme[.Success])
 		}
-		plat.text_draw(gfx, t, command_table[it.cmd].title, x0 + sx(28), ty, UI_PX, MENU_COL.fg if on else MENU_COL.dim)
+		plat.text_draw(gfx, t, command_table[it.cmd].title, x0 + sx(28), ty, UI_PX, g_theme[.Text_Primary] if on else g_theme[.Text_Muted])
 		if chord := command_chord(it.cmd); chord != "" {
-			plat.text_draw(gfx, t, chord, x0 + dw - sx(12) - f32(len(chord)) * cw, ty, UI_PX, MENU_COL.chord if on else MENU_COL.dim)
+			plat.text_draw(gfx, t, chord, x0 + dw - sx(12) - f32(len(chord)) * cw, ty, UI_PX, g_theme[.Text_Dim] if on else g_theme[.Text_Muted])
 		}
 		y += MENU_ITEM_H
 	}
@@ -466,10 +452,10 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	// Say that there is more. Silently truncating is what hid Edit > Font on a
 	// short window.
 	if more_above {
-		plat.text_draw(gfx, t, "▲", x0 + dw - sx(16), y0 + sx(12), UI_SMALL_PX, MENU_COL.chord)
+		plat.text_draw(gfx, t, "▲", x0 + dw - sx(16), y0 + sx(12), UI_SMALL_PX, g_theme[.Text_Dim])
 	}
 	if more_below {
-		plat.text_draw(gfx, t, "▼", x0 + dw - sx(16), y0 + h - sx(4), UI_SMALL_PX, MENU_COL.chord)
+		plat.text_draw(gfx, t, "▼", x0 + dw - sx(16), y0 + h - sx(4), UI_SMALL_PX, g_theme[.Text_Dim])
 	}
 }
 

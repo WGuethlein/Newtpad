@@ -399,26 +399,6 @@ md_col_x :: proc(c: ^Md_Table_Cache, i: int, char_w: f32) -> f32 {
 	return f32(cells) * char_w
 }
 
-// Colours.
-@(private = "file")
-MD_TEXT :: [4]f32{0.86, 0.90, 0.96, 1}
-@(private = "file")
-MD_HEAD :: [4]f32{0.72, 0.85, 1.0, 1}
-@(private = "file")
-MD_BOLD :: [4]f32{0.98, 0.99, 1.0, 1}
-@(private = "file")
-MD_ITALIC :: [4]f32{0.80, 0.86, 0.78, 1}
-@(private = "file")
-MD_CODE :: [4]f32{0.95, 0.80, 0.65, 1}
-@(private = "file")
-MD_QUOTE :: [4]f32{0.66, 0.72, 0.62, 1}
-@(private = "file")
-MD_MUTED :: [4]f32{0.55, 0.60, 0.70, 1}
-@(private = "file")
-MD_CODEBG :: [4]f32{0.12, 0.14, 0.18, 1}
-@(private = "file")
-MD_RULE :: [4]f32{0.30, 0.34, 0.42, 1}
-
 // One styled run of a line's inline content.
 @(private = "file")
 Md_Run :: struct {
@@ -519,10 +499,10 @@ md_draw_inline :: proc(gfx: ^plat.Gfx, text: ^plat.Text, runs: []Md_Run, xind, x
 	boff := max(sx(1), 1)
 	for run in runs {
 		col := base_col
-		if run.code {col = MD_CODE}
-		if run.ital {col = MD_ITALIC}
-		if run.link {col = LINK_COL}
-		if run.bold && !run.code && !run.link {col = MD_BOLD}
+		if run.code {col = g_theme[.Md_Code]}
+		if run.ital {col = g_theme[.Md_Italic]}
+		if run.link {col = g_theme[.Link]}
+		if run.bold && !run.code && !run.link {col = g_theme[.Text_Bright]}
 		// Split into words, keeping each word's trailing space so wrapping is by word.
 		w := run.text
 		for len(w) > 0 {
@@ -564,13 +544,13 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			in_fence = !in_fence
 			y += line_h
 		} else if in_fence {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {x1 - x0, line_h}, color = MD_CODEBG}})
-			plat.text_draw(gfx, text, line, x0 + char_w, y, px, MD_CODE, .Doc)
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {x1 - x0, line_h}, color = g_theme[.Bg_Panel]}})
+			plat.text_draw(gfx, text, line, x0 + char_w, y, px, g_theme[.Md_Code], .Doc)
 			y += line_h
 		} else if len(strings.trim_space(line)) == 0 {
 			y += line_h * 0.5 // blank line: a little gap
 		} else if md_is_rule(trimmed) {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {x1 - x0, max(sx(1), 1)}, color = MD_RULE}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {x1 - x0, max(sx(1), 1)}, color = g_theme[.Border_Strong]}})
 			y += line_h
 		} else if lvl := md_heading_level(trimmed); lvl > 0 {
 			hpx := md_head_px(px, lvl)
@@ -581,20 +561,20 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			runs := md_inline(strings.trim_left(trimmed[lvl:], " "))
 			// force bold heading colour
 			for &r in runs {r.bold = true}
-			md_draw_inline(gfx, text, runs, x0, x1, &x, &yy, hpx, plat.text_char_width(text, hpx, .Doc), hh, MD_HEAD)
+			md_draw_inline(gfx, text, runs, x0, x1, &x, &yy, hpx, plat.text_char_width(text, hpx, .Doc), hh, g_theme[.Md_Heading])
 			y = yy + hh - px * 0.3
 		} else if q, qcontent := md_quote(trimmed); q {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {max(sx(3), 2), line_h}, color = MD_QUOTE}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {max(sx(3), 2), line_h}, color = g_theme[.Md_Quote]}})
 			x := x0 + char_w * 2
 			yy := y
-			md_draw_inline(gfx, text, md_inline(qcontent), x0 + char_w * 2, x1, &x, &yy, px, char_w, line_h, MD_QUOTE)
+			md_draw_inline(gfx, text, md_inline(qcontent), x0 + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Md_Quote])
 			y = yy + line_h
 		} else if bullet, content, depth := md_list(line); bullet != "" {
 			ind := x0 + f32(depth) * char_w * 2
-			plat.text_draw(gfx, text, bullet, ind, y, px, MD_MUTED, .Doc)
+			plat.text_draw(gfx, text, bullet, ind, y, px, g_theme[.Text_Dim], .Doc)
 			x := ind + char_w * f32(len(bullet) + 1)
 			yy := y
-			md_draw_inline(gfx, text, md_inline(content), ind + char_w * 2, x1, &x, &yy, px, char_w, line_h, MD_TEXT)
+			md_draw_inline(gfx, text, md_inline(content), ind + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
 			y = yy + line_h
 		} else if md_is_table_row(line) {
 			if c := md_table_ensure(doc, text, p); c != nil {
@@ -604,7 +584,7 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		} else {
 			x := x0
 			yy := y
-			md_draw_inline(gfx, text, md_inline(line), x0, x1, &x, &yy, px, char_w, line_h, MD_TEXT)
+			md_draw_inline(gfx, text, md_inline(line), x0, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
 			y = yy + line_h
 		}
 
@@ -705,7 +685,7 @@ md_draw_table_row :: proc(
 		// worth of gap that has nothing after it — trim it or the rule overhangs
 		// the last column by MD_TABLE_PAD cells.
 		w := min(max(0, md_col_x(c, c.ncols, char_w) - f32(MD_TABLE_PAD) * char_w), x1 - x0)
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {w, max(sx(1), 1)}, color = MD_RULE}})
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {w, max(sx(1), 1)}, color = g_theme[.Border_Strong]}})
 		return
 	}
 	cells := md_split_cells(line, context.temp_allocator)
@@ -714,7 +694,7 @@ md_draw_table_row :: proc(
 		cx := x0 + md_col_x(c, i, char_w)
 		if cx >= x1 {break}
 		if i > 0 {
-			plat.text_draw(gfx, text, "│", cx - char_w, y, px, MD_MUTED, .Doc)
+			plat.text_draw(gfx, text, "│", cx - char_w, y, px, g_theme[.Text_Dim], .Doc)
 		}
 		cw := plat.text_cells(text, transmute([]u8)cell, .Doc)
 		pad := 0
@@ -725,6 +705,6 @@ md_draw_table_row :: proc(
 		case .Right:
 			pad = max(0, c.widths[i] - cw)
 		}
-		plat.text_draw(gfx, text, cell, cx + f32(pad) * char_w, y, px, MD_TEXT, .Doc)
+		plat.text_draw(gfx, text, cell, cx + f32(pad) * char_w, y, px, g_theme[.Text_Primary], .Doc)
 	}
 }

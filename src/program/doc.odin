@@ -2155,8 +2155,6 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 
 // Draw visible lines; return the caret's screen rect (if visible) and the byte
 // offset just past the last visible line (for the scrollbar).
-LINK_COL :: [4]f32{0.45, 0.70, 0.98, 1}
-
 doc_draw :: proc(
 	gfx: ^plat.Gfx,
 	t: ^plat.Text,

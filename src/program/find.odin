@@ -578,7 +578,7 @@ find_match_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: i
 	if !f.active || len(f.matches) == 0 {
 		return 0
 	}
-	col := [4]f32{0.42, 0.38, 0.16, 1} // muted amber
+	col := g_theme[.Find_Match_Bg]
 	lh := line_height(px)
 
 	mi := 0

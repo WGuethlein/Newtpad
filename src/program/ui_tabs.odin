@@ -22,13 +22,6 @@ TAB_CLOSE_W := TAB_CLOSE_W_96
 MENU_W := MENU_W_96
 PLUS_W := PLUS_W_96
 
-@(private = "file")
-tab_bg := [3][4]f32 {
-	{0.10, 0.12, 0.16, 1}, // strip background
-	{0.14, 0.16, 0.21, 1}, // inactive tab
-	{0.20, 0.23, 0.30, 1}, // active tab
-}
-
 // x where the tabs + "+" end (everything left of here in the bar is client; the
 // gap between here and the window buttons is the OS drag region).
 // x where the caption buttons begin. Tabs must never be drawn or hit-tested
@@ -169,10 +162,10 @@ tabs_drag_update :: proc(app: ^App, win: ^plat.Window) {
 @(private = "file")
 caption_btn :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, x, w: f32, glyph: string, hovered, is_close: bool) {
 	if hovered {
-		col := [4]f32{0.75, 0.16, 0.16, 1} if is_close else {0.28, 0.32, 0.40, 1}
+		col := g_theme[.Danger] if is_close else g_theme[.Border_Strong]
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x, 0}, size = {w, TAB_STRIP_H}, color = col}})
 	}
-	fg := [4]f32{0.96, 0.96, 0.98, 1} if (hovered && is_close) else {0.72, 0.76, 0.84, 1}
+	fg := g_theme[.Text_Bright] if (hovered && is_close) else g_theme[.Text_Secondary]
 	cw := plat.text_char_width(text, UI_PX)
 	plat.text_draw(gfx, text, glyph, x + (w - cw) / 2, TAB_STRIP_H * 0.5 + sx(5), UI_PX, fg)
 }
@@ -186,13 +179,13 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 	in_bar := f32(cy) >= 0 && f32(cy) < TAB_STRIP_H
 	base_y := TAB_STRIP_H - sx(12)
 
-	plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, 0}, size = {width, TAB_STRIP_H}, color = tab_bg[0]}})
+	plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, 0}, size = {width, TAB_STRIP_H}, color = g_theme[.Bg_Base]}})
 
 	// menu button
 	if in_bar && f32(cx) < MENU_W {
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, 0}, size = {MENU_W, TAB_STRIP_H}, color = {0.28, 0.32, 0.40, 1}}})
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, 0}, size = {MENU_W, TAB_STRIP_H}, color = g_theme[.Border_Strong]}})
 	}
-	plat.text_draw(gfx, text, "☰", MENU_W / 2 - sx(8), base_y, UI_PX, {0.80, 0.84, 0.90, 1})
+	plat.text_draw(gfx, text, "☰", MENU_W / 2 - sx(8), base_y, UI_PX, g_theme[.Text_Secondary])
 
 	// tabs
 	// Nothing past `limit` may be drawn: the caption buttons are non-client and
@@ -209,7 +202,7 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 		if d == nil {continue}
 		if x + TAB_W > limit {break} // overflow; the count is drawn below
 		active := slot == app.active
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {TAB_W, TAB_STRIP_H - sx(4)}, color = tab_bg[2 if active else 1]}})
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {TAB_W, TAB_STRIP_H - sx(4)}, color = g_theme[.Border_Subtle] if active else g_theme[.Bg_Panel]}})
 
 		title := tab_title(d, context.temp_allocator)
 		tb := transmute([]u8)title
@@ -217,9 +210,9 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 			cut := plat.text_bytes_for_cells(text, tb, max_cells - 1)
 			title = strings.concatenate({title[:cut], "…"}, context.temp_allocator)
 		}
-		fg := [4]f32{0.92, 0.94, 0.98, 1} if active else {0.66, 0.70, 0.78, 1}
+		fg := g_theme[.Text_Primary] if active else g_theme[.Text_Dim]
 		plat.text_draw(gfx, text, title, x + sx(8), base_y, UI_SMALL_PX, fg)
-		plat.text_draw(gfx, text, "×", x + TAB_W - sx(15), base_y, UI_SMALL_PX, {0.60, 0.64, 0.72, 1})
+		plat.text_draw(gfx, text, "×", x + TAB_W - sx(15), base_y, UI_SMALL_PX, g_theme[.Text_Dim])
 		x += TAB_W + TAB_GAP
 	}
 
@@ -228,17 +221,17 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 		hx := limit
 		hot := in_bar && f32(cx) >= hx && f32(cx) < hx + sx(52)
 		if hot {
-			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {hx, sx(4)}, size = {sx(52), TAB_STRIP_H - sx(4)}, color = {0.20, 0.23, 0.30, 1}}})
+			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {hx, sx(4)}, size = {sx(52), TAB_STRIP_H - sx(4)}, color = g_theme[.Border_Subtle]}})
 		}
-		plat.text_draw(gfx, text, fmt.tprintf("+%d ▸", hidden), hx + sx(6), base_y, UI_SMALL_PX, {0.75, 0.79, 0.86, 1})
+		plat.text_draw(gfx, text, fmt.tprintf("+%d ▸", hidden), hx + sx(6), base_y, UI_SMALL_PX, g_theme[.Text_Secondary])
 	}
 
 	// new-tab button, only if it fits clear of the caption buttons
 	if x + PLUS_W <= limit {
 		if in_bar && f32(cx) >= x && f32(cx) < x + PLUS_W {
-			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {PLUS_W, TAB_STRIP_H - sx(4)}, color = {0.20, 0.23, 0.30, 1}}})
+			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {PLUS_W, TAB_STRIP_H - sx(4)}, color = g_theme[.Border_Subtle]}})
 		}
-		plat.text_draw(gfx, text, "+", x + PLUS_W / 2 - sx(4), base_y, UI_PX, {0.75, 0.79, 0.86, 1})
+		plat.text_draw(gfx, text, "+", x + PLUS_W / 2 - sx(4), base_y, UI_PX, g_theme[.Text_Secondary])
 	}
 
 	// window buttons (non-client; drawn here, clicks handled by the platform)
