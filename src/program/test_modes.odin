@@ -3038,6 +3038,27 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			if !ok {fail^ = true}
 			fmt.printfln("  %-6s %-34s got=%d want=%d", "ok" if ok else "FAIL", label, got, want)
 		}
+		chks :: proc(label: string, got, want: string, fail: ^bool) {
+			ok := got == want
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %-34s got=%q want=%q", "ok" if ok else "FAIL", label, got, want)
+		}
+		// Mirrors doc_draw's row-claim predicate exactly (doc.odin, the `caret =
+		// true` line in doc_draw) without needing a real GPU device to draw
+		// through -- same shape as rowtest's caret_row check just below it. False
+		// is what doc_draw returns when no visible row claims the caret, which is
+		// how it silently vanishes from the screen.
+		caret_claimed :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> bool {
+			it := visible_begin(doc, t, rows)
+			for {
+				_, start, _, vis_end, line_end, _, ok := visible_next(&it)
+				if !ok {break}
+				if doc.cursor >= start && doc.cursor <= vis_end && (line_end || doc.cursor < vis_end) {
+					return true
+				}
+			}
+			return false
+		}
 		content := "hello\r\nworld\r\n"
 		doc: Document
 		doc.pt = base.pt_init(transmute([]u8)content)
@@ -3059,6 +3080,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		doc.cursor, doc.anchor = 0, 0
 		doc_cursor_end(&doc, false)
 		chk("End key lands at", doc.cursor, 5, &fail)
+		chk("caret drawn after End", 1 if caret_claimed(&doc, &t, 5) else 0, 1, &fail)
 
 		// Each check below resets the cursor explicitly rather than relying on the
 		// previous check's result. crlftest is otherwise state-sequential — a
@@ -3073,14 +3095,26 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// Right-arrow from the content end crosses the whole CRLF in one step.
 		doc_cursor_right(&doc, false)
 		chk("Right from EOL skips CRLF", doc.cursor, 7, &fail)
+		chk("caret drawn after Right across CRLF", 1 if caret_claimed(&doc, &t, 5) else 0, 1, &fail)
 
 		doc.cursor, doc.anchor = 7, 7
 		// Left-arrow back over the break returns to the content end, not the CR.
 		doc_cursor_left(&doc, false)
 		chk("Left over CRLF returns to", doc.cursor, 5, &fail)
+		chk("caret drawn after Left across CRLF", 1 if caret_claimed(&doc, &t, 5) else 0, 1, &fail)
 
 		// A click far to the right of the text clamps to the content end.
 		chk("click past EOL clamps to", doc_pos_at(&doc, &t, i32(cw * 30), 0, px, cw, 5), 5, &fail)
+
+		// Double-click past EOL selects the word at the clamped position -- the
+		// CR. It must not select the CR itself (invisible, and typing over it
+		// would silently turn the line's CRLF into a bare LF); it must leave the
+		// caret exactly at the content end, where row 0 can claim it (Important 1).
+		doc.cursor, doc.anchor = 0, 0
+		doc_select_word_at(&doc, 5)
+		chk("dblclick past EOL anchor", doc.anchor, 5, &fail)
+		chk("dblclick past EOL cursor", doc.cursor, 5, &fail)
+		chk("caret drawn after dblclick past EOL", 1 if caret_claimed(&doc, &t, 5) else 0, 1, &fail)
 
 		// Selecting the whole first line stops at the content end.
 		doc.anchor, doc.cursor = 0, 5
@@ -3131,6 +3165,35 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			doc_cursor_end(&edoc, false)
 			chk("End on empty CRLF line lands at", edoc.cursor, 0, &fail)
 			chk("click on empty CRLF line clamps to", doc_pos_at(&edoc, &t, i32(cw * 10), 0, px, cw, 5), 0, &fail)
+		}
+
+		// One Delete at the content end must consume the whole CRLF break, not
+		// the CR alone -- otherwise the buffer still renders two lines (the
+		// keystroke looks dead) and the stray LF corrupts an otherwise-CRLF file
+		// on save (Critical 1). Assert the buffer bytes, not just the cursor.
+		{
+			ddoc: Document
+			ddoc.pt = base.pt_init(transmute([]u8)string("hello\r\nworld"))
+			defer base.pt_destroy(&ddoc.pt)
+			ddoc.eol = .CRLF
+			ddoc.cursor, ddoc.anchor = 5, 5 // the CR, i.e. vis_end
+			doc_delete_fwd(&ddoc)
+			chks("Delete at break ->", string(base.pt_collect(&ddoc.pt, context.temp_allocator)), "helloworld", &fail)
+			chk("Delete at break cursor stays", ddoc.cursor, 5, &fail)
+		}
+
+		// The mirror: one Backspace at a line start must remove the whole break,
+		// not the LF alone leaving a bare CR. Pre-existing bug, but it now sits
+		// inconsistently beside the CRLF-atomic Left arrow.
+		{
+			bdoc: Document
+			bdoc.pt = base.pt_init(transmute([]u8)string("hello\r\nworld"))
+			defer base.pt_destroy(&bdoc.pt)
+			bdoc.eol = .CRLF
+			bdoc.cursor, bdoc.anchor = 7, 7 // start of "world"
+			doc_backspace(&bdoc)
+			chks("Backspace at break ->", string(base.pt_collect(&bdoc.pt, context.temp_allocator)), "helloworld", &fail)
+			chk("Backspace at break cursor lands at", bdoc.cursor, 5, &fail)
 		}
 
 		fmt.println("crlftest: FAILURES" if fail else "crlftest: all ok")

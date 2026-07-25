@@ -401,6 +401,18 @@ pt_row_vis_end :: proc(pt: ^Piece_Table, start, end: int, line_end: bool) -> int
 	return end
 }
 
+// True when a CRLF pair begins at byte offset `at` (pt[at]=='\r' && pt[at+1]==
+// '\n'). The single test for "is this the start of a two-byte line break" --
+// doc.odin had this as four independent inline byte-pair checks (both arrow
+// keys, and two more that were missing it entirely: Delete and Backspace each
+// removed one byte of the pair and left the other, and a click-clamped
+// double-click could select the CR as if it were content). One rule, one test.
+pt_crlf_at :: proc(pt: ^Piece_Table, at: int) -> bool {
+	if at < 0 || at + 1 >= pt.length {return false}
+	b: [2]u8
+	return pt_read(pt, at, b[:]) == 2 && b[0] == '\r' && b[1] == '\n'
+}
+
 // pt_line_start, bounded, mirroring pt_line_end_cap. `exact` is false when the
 // cap was reached without finding a newline, so the returned offset is a scan
 // floor rather than a real line start and the caller must not present a column

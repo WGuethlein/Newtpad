@@ -1487,7 +1487,9 @@ doc_backspace :: proc(doc: ^Document) {
 	}
 	if doc.cursor <= 0 {return}
 	push_undo(doc, .Delete)
-	p := prev_rune(doc, doc.cursor)
+	// Mirror of doc_delete_fwd: Backspace at a line start must take the whole
+	// CRLF break with it, not just the LF, or a bare CR is left behind.
+	p := doc.cursor - 2 if doc.cursor >= 2 && base.pt_crlf_at(&doc.pt, doc.cursor - 2) else prev_rune(doc, doc.cursor)
 	doc.nl_delta -= count_newlines(doc, p, doc.cursor - p)
 	base.pt_delete(&doc.pt, p, doc.cursor - p)
 	set_cursor(doc, p, false)
@@ -1503,7 +1505,11 @@ doc_delete_fwd :: proc(doc: ^Document) {
 	}
 	if doc.cursor >= doc.pt.length {return}
 	push_undo(doc, .Delete)
-	n := next_rune(doc, doc.cursor) - doc.cursor
+	// A CRLF break is one unit: deleting forward from the content end (the CR;
+	// see doc_cursor_end) must take the LF with it, or the buffer still renders
+	// two lines -- the keystroke looks dead -- and the stray LF corrupts an
+	// otherwise-CRLF file on save.
+	n := 2 if base.pt_crlf_at(&doc.pt, doc.cursor) else next_rune(doc, doc.cursor) - doc.cursor
 	doc.nl_delta -= count_newlines(doc, doc.cursor, n)
 	base.pt_delete(&doc.pt, doc.cursor, n)
 	doc.anchor = doc.cursor
@@ -1520,7 +1526,7 @@ doc_cursor_left :: proc(doc: ^Document, select: bool) {
 	// A CRLF break is one caret step. Without this the caret lands between CR and
 	// LF — the phantom cell at end of line, from the other side.
 	p := doc.cursor
-	if p >= 2 && byte_at(doc, p - 1) == '\n' && byte_at(doc, p - 2) == '\r' {
+	if p >= 2 && base.pt_crlf_at(&doc.pt, p - 2) {
 		set_cursor(doc, p - 2, select)
 		return
 	}
@@ -1534,7 +1540,7 @@ doc_cursor_right :: proc(doc: ^Document, select: bool) {
 		return
 	}
 	p := doc.cursor
-	if p + 1 < doc.pt.length && byte_at(doc, p) == '\r' && byte_at(doc, p + 1) == '\n' {
+	if base.pt_crlf_at(&doc.pt, p) {
 		set_cursor(doc, p + 2, select)
 		return
 	}
@@ -1691,6 +1697,16 @@ doc_select_word_at :: proc(doc: ^Document, pos: int) {
 		for s > 0 && base.char_class(byte_at(doc, s - 1)) == .Word {s -= 1}
 		for e < L && base.char_class(byte_at(doc, e)) == .Word {e += 1}
 		doc.anchor, doc.cursor = s, e
+	} else if base.pt_crlf_at(&doc.pt, pos) {
+		// pos is the CR that begins a CRLF break -- doc_pos_at clamps a click past
+		// EOL here, so this is the ordinary "double-click past end of line" case,
+		// not a deliberate click on the break. The pair isn't selectable content:
+		// selecting the CR (the else branch below) leaves cursor == vis_end + 1,
+		// which no row's [start, vis_end] claims, so the caret vanishes until the
+		// next keypress and typing then replaces the CR, corrupting the line
+		// ending. Land the caret at the content end instead, with no selection.
+		doc.anchor = pos
+		doc.cursor = pos
 	} else {
 		doc.anchor = pos
 		doc.cursor = next_rune(doc, pos)
