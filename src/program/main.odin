@@ -11,6 +11,34 @@ import "core:time"
 import base "src:base"
 import plat "src:platform"
 
+// Drain a batch of paths handed over by another instance or dropped onto the
+// window: open each as a tab (app_open_path activates an existing tab if the
+// file is already open, so re-opening one just focuses it), skip directories
+// with a status-bar note, and focus the FIRST successfully opened tab rather
+// than the last — the natural read order for a multi-file Explorer drop.
+// Exported as its own proc (not inlined in the frame loop) so droptest drives
+// the exact code the frame loop runs, rather than a parallel copy of it.
+app_consume_open_requests :: proc(a: ^App, paths: []string) {
+	first := -1
+	skipped := 0
+	for p in paths {
+		if plat.path_is_directory(p) {
+			skipped += 1
+			continue // a folder is not a document; project trees are out of scope
+		}
+		if !app_open_path(a, p) {
+			fmt.eprintfln("Newtpad: could not open %q", p)
+			skipped += 1
+			continue
+		}
+		if first < 0 {first = a.active}
+	}
+	if first >= 0 {app_activate(a, first)} // focus the first, not the last
+	if skipped > 0 {
+		app_note(a, fmt.tprintf("%d item%s skipped (folders and unreadable files are not opened)", skipped, "" if skipped == 1 else "s"))
+	}
+}
+
 main :: proc() {
 	plat.seh_install() // arm the mapped-read fault guard before any file opens
 
@@ -159,16 +187,14 @@ main :: proc() {
 			last_input = time.tick_now()
 		}
 
-		// Files handed over by other launches (Explorer double-click while we're
-		// running): open each as a tab. app_open_path activates an existing tab if
-		// the file is already open, so re-opening a file just focuses it.
+		// Files handed over by other launches (Explorer double-click) or dropped
+		// onto the window (WM_DROPFILES; see platform/window.odin) share this one
+		// queue. app_consume_open_requests is also called directly by droptest —
+		// same code path, not a parallel copy — so that mode actually exercises
+		// what the frame loop runs.
 		if window.open_count > 0 {
 			reqs: [plat.OPEN_QUEUE]string
-			for p in reqs[:plat.window_open_requests(window, reqs[:])] {
-				if !app_open_path(&app, p) {
-					fmt.eprintfln("Newtpad: could not open %q", p)
-				}
-			}
+			app_consume_open_requests(&app, reqs[:plat.window_open_requests(window, reqs[:])])
 			plat.window_clear_open_requests(window)
 			session_dirty = true
 		}
@@ -1020,7 +1046,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		case .Split:
 			mode = "    Markdown Split (Ctrl+M)"
 		}
-		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", mode, recovered, disk, indexing, atlas, nobackup)
+		// A transient notice (e.g. "2 items skipped" from a drop) rides along on
+		// the same line and counts itself down once per drawn frame.
+		notice := ""
+		if rc.app.notice_frames > 0 {
+			notice = fmt.tprintf("    %s", rc.app.notice)
+			rc.app.notice_frames -= 1
+		}
+		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", mode, recovered, disk, indexing, atlas, nobackup, notice)
 		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)
 		col := [4]f32{0.95, 0.55, 0.35, 1} if warn else {0.55, 0.60, 0.70, 1}
 		plat.text_draw(gfx, text, status, sx(12), h - sx(8), UI_SMALL_PX, col)

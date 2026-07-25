@@ -32,6 +32,24 @@ App :: struct {
 	// the dragged document as it swaps places (the slot changes each swap).
 	tab_drag:      bool,
 	tab_drag_slot: int,
+	// Transient status-bar message (dropped folder, etc). notice_frames counts
+	// down once per drawn frame; 0 means nothing to show.
+	notice:        string,
+	notice_frames: int,
+}
+
+// A short-lived status-bar message. Frames rather than wall-clock: the app
+// redraws at vsync, so a frame count is stable and needs no timer.
+NOTICE_FRAMES :: 240
+
+// Set the transient status-bar message, replacing any previous one. notice is
+// always self-owned (only ever set here), so freeing it unconditionally before
+// the clone is safe — the zero value is "", and deleting an empty string is a
+// no-op, not a crash.
+app_note :: proc(a: ^App, msg: string) {
+	delete(a.notice)
+	a.notice = strings.clone(msg) // caller's msg is often temp-allocated
+	a.notice_frames = NOTICE_FRAMES
 }
 
 // Swap the documents in two slots (tab reorder). Slot indices are referenced by
@@ -230,6 +248,7 @@ app_destroy :: proc(a: ^App) {
 	delete(a.mru)
 	delete(a.palette.query)
 	delete(a.palette.results)
+	delete(a.notice)
 }
 
 // The document's display name: file base name, or "untitled" for a scratch.

@@ -3371,6 +3371,80 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad droptest` exercises the drag-and-drop consumer without a real OS
+	// drop. WM_DROPFILES itself can't be synthesized headlessly, but everything
+	// downstream of "the queue has paths in it" is ordinary code shared with the
+	// WM_COPYDATA single-instance handoff, so this drives app_consume_open_requests
+	// directly -- the exact proc the frame loop calls, not a parallel copy of it.
+	if os.args[1] == "droptest" {
+		fail := false
+
+		tmp := os.get_env("TEMP", context.temp_allocator)
+		dir := fmt.tprintf("%s\\newtpad_droptest", tmp)
+		os.remove_all(dir) // in case a previous run crashed before cleaning up
+		if err := os.make_directory(dir); err != nil {
+			fmt.eprintfln("droptest: could not create %q: %v", dir, err)
+			return true
+		}
+		defer os.remove_all(dir) // real files on disk; must not be left behind
+
+		fileA := fmt.tprintf("%s\\a.txt", dir)
+		fileB := fmt.tprintf("%s\\b.txt", dir)
+		subdir := fmt.tprintf("%s\\sub", dir)
+		missing := fmt.tprintf("%s\\does_not_exist.txt", dir)
+
+		if werr := os.write_entire_file(fileA, transmute([]u8)string("alpha\n")); werr != nil {
+			fmt.eprintfln("droptest: could not seed %q: %v", fileA, werr)
+			return true
+		}
+		if werr := os.write_entire_file(fileB, transmute([]u8)string("beta\n")); werr != nil {
+			fmt.eprintfln("droptest: could not seed %q: %v", fileB, werr)
+			return true
+		}
+		if err := os.make_directory(subdir); err != nil {
+			fmt.eprintfln("droptest: could not create %q: %v", subdir, err)
+			return true
+		}
+
+		a: App
+		menu_init(&a.menu)
+		defer app_destroy(&a)
+
+		// Order: the folder first, then the two files, then a path that does not
+		// exist -- so "focus lands on the first successfully opened tab" is
+		// actually exercised (the first queue entry is not the one that should
+		// end up focused).
+		app_consume_open_requests(&a, []string{subdir, fileA, fileB, missing})
+
+		live := app_live_count(&a)
+		want_live := 2 // fileA, fileB -- subdir and missing produced no tab
+		ok1 := live == want_live
+		fmt.printfln("  %-6s tabs opened = %d (want %d)", "ok" if ok1 else "FAIL", live, want_live)
+		if !ok1 {fail = true}
+
+		focused := app_active(&a)
+		ok2 := focused != nil && focused.path == fileA
+		fmt.printfln("  %-6s focus on first opened: %q", "ok" if ok2 else "FAIL", focused.path if focused != nil else "<nil>")
+		if !ok2 {fail = true}
+
+		ok3 := a.notice_frames > 0 && strings.contains(a.notice, "2 items skipped")
+		fmt.printfln("  %-6s notice reports 2 skipped (folder + missing file): %q", "ok" if ok3 else "FAIL", a.notice)
+		if !ok3 {fail = true}
+
+		// Re-dropping a path that is already open must activate the existing tab
+		// rather than open a second one -- pinning app_open_path's existing
+		// dedupe behaviour rather than changing it.
+		before := live
+		app_consume_open_requests(&a, []string{fileB})
+		after := app_live_count(&a)
+		ok4 := after == before && app_active(&a) != nil && app_active(&a).path == fileB
+		fmt.printfln("  %-6s re-drop activates the existing tab (%d -> %d tabs)", "ok" if ok4 else "FAIL", before, after)
+		if !ok4 {fail = true}
+
+		fmt.println("droptest: FAILURES" if fail else "droptest: all ok")
+		return true
+	}
+
 	if len(os.args) < 3 {return false}
 	path, mode := os.args[1], os.args[2]
 

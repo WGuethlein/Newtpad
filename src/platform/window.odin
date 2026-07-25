@@ -2,6 +2,7 @@
 // This file owns the OS window and its message pump.
 package platform
 
+import "base:runtime"
 import win "core:sys/windows"
 
 // Not present in core:sys/windows; hand-declare (used for click-count timing).
@@ -317,6 +318,11 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 	DwmSetWindowAttribute(w.hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, size_of(corner))
 	// Force the frame to recompute now that our WM_NCCALCSIZE is in effect.
 	win.SetWindowPos(w.hwnd, nil, 0, 0, 0, 0, win.SWP_FRAMECHANGED | win.SWP_NOMOVE | win.SWP_NOSIZE | win.SWP_NOZORDER)
+
+	// Explorer drag-and-drop. Dropped paths join the same queue the
+	// single-instance handoff uses (WM_COPYDATA below), so there is one producer
+	// contract and one consumer rather than two to keep in sync.
+	win.DragAcceptFiles(w.hwnd, true)
 	return w
 }
 
@@ -428,6 +434,29 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 			w.open_count += 1
 		}
 		return 1
+	case win.WM_DROPFILES:
+		// Explorer drop. Same queue, same cap, same overflow rule as WM_COPYDATA
+		// above — one producer contract, one consumer.
+		//
+		// wnd_proc is invoked directly by the OS as a raw WNDPROC, so unlike an
+		// ordinary Odin call there is no context already flowing in — ...to_utf8
+		// needs one for its temp allocation.
+		context = runtime.default_context()
+		hdrop := win.HDROP(uintptr(wparam))
+		n := int(win.DragQueryFileW(hdrop, 0xFFFFFFFF, nil, 0))
+		for i in 0 ..< n {
+			if w.open_count >= OPEN_QUEUE {break} // overflow is dropped, as documented
+			wbuf: [OPEN_PATH_MAX]u16
+			got := win.DragQueryFileW(hdrop, u32(i), &wbuf[0], u32(len(wbuf)))
+			if got == 0 {continue}
+			u8buf, err := win.wstring_to_utf8(win.wstring(&wbuf[0]), int(got), context.temp_allocator)
+			if err != nil || len(u8buf) == 0 || len(u8buf) > OPEN_PATH_MAX {continue}
+			copy(w.open_paths[w.open_count][:], u8buf)
+			w.open_lens[w.open_count] = len(u8buf)
+			w.open_count += 1
+		}
+		win.DragFinish(hdrop)
+		return 0
 	case win.WM_NCCALCSIZE:
 		if wparam == 0 {
 			break // wParam==FALSE: let DefWindowProc handle it

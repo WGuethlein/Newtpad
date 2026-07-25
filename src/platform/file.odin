@@ -514,6 +514,15 @@ path_exists :: proc(path: string) -> (exists, is_dir: bool) {
 	return true, (attrs & win.FILE_ATTRIBUTE_DIRECTORY) != 0
 }
 
+// Whether `path` names a directory. Used by the drop handler: a dropped folder is
+// skipped rather than opened, since a project tree is out of scope. Missing paths
+// report false too — an unopenable file is a different failure, handled by the
+// caller's own open attempt rather than by this check.
+path_is_directory :: proc(path: string) -> bool {
+	_, is_dir := path_exists(path)
+	return is_dir
+}
+
 file_close :: proc(fv: ^File_View) {
 	if fv.mapped {
 		if fv.view != nil {win.UnmapViewOfFile(fv.view)}
