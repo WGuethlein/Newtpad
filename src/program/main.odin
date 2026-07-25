@@ -122,6 +122,11 @@ main :: proc() {
 	}
 	defer app_destroy(&app)
 
+	// Initialize theme to dark mode. The zero-initialized Theme is transparent black,
+	// making every themed surface invisible without this assignment. Task 5 will later
+	// replace this with a load-from-disk that falls back to theme_dark.
+	g_theme = theme_dark()
+
 	// The renderer is reusable so the WM_SIZE handler can repaint live during a
 	// window resize (the OS runs a modal loop that otherwise freezes this one).
 	rc := Render_Ctx{&gfx, &text, &quad_pipe, &app, window, 0, 0, 0}
