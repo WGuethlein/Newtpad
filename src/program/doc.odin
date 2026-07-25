@@ -315,11 +315,17 @@ wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (end: int, 
 	return L, true
 }
 
-// Start of the visual row after the one starting at `p`.
-next_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
+// Start of the visual row after the one starting at `p`. `ok` is false when `p`'s
+// row was the last one: an end at EOF has no successor, while a real newline
+// leaves a row after it — possibly the empty final one. Same distinction
+// next_row_start_capped draws, and for the same reason.
+next_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (start: int, ok: bool) {
 	e, le := wrap_row_end(doc, t, p, cols)
-	if le {return e + 1 if e < doc.pt.length else doc.pt.length}
-	return e
+	if le {
+		if e >= doc.pt.length {return doc.pt.length, false}
+		return e + 1, true
+	}
+	return e, e > p // a mid-line wrap point: the next visual row starts there
 }
 
 // Start of the visual row containing byte `off`.
@@ -339,7 +345,7 @@ prev_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 	if ls < p { // p is mid logical line: the segment just before it
 		s := ls
 		for {
-			ns := next_visual_row(doc, t, s, cols)
+			ns, _ := next_visual_row(doc, t, s, cols)
 			if ns >= p {return s}
 			s = ns
 		}
@@ -364,8 +370,7 @@ prev_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 // see next_row_start_capped for why that is distinct from "starts at length".
 eff_next_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (start: int, ok: bool) {
 	if wrap, _ := eff_wrap_at(doc, t, p); wrap {
-		nv := next_visual_row(doc, t, p, cols)
-		return nv, nv > p
+		return next_visual_row(doc, t, p, cols)
 	}
 	return next_row_start_capped(doc, p)
 }
@@ -392,7 +397,7 @@ eff_prev_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 		if wrap, ls := eff_wrap_at(doc, t, p); wrap {
 			s := ls
 			for {
-				ns := next_visual_row(doc, t, s, cols)
+				ns, _ := next_visual_row(doc, t, s, cols)
 				if ns >= p {return s}
 				s = ns
 			}

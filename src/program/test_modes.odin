@@ -2542,6 +2542,68 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		one("a\n", 2, 2, 1, &t, &fail) // trailing newline: the empty last row is real
 		one("a\nb", 3, 2, 1, &t, &fail)
 		one("a\nb\n", 4, 3, 2, &t, &fail)
+
+		// The wrap-aware sibling of next_row_start_capped is next_visual_row (via
+		// eff_next_row), and it had the identical ambiguity: wrap_row_end returns
+		// (L, true) both for a real trailing newline and for running to EOF with
+		// none, and eff_next_row's old `ok := nv > p` reported a successor row that
+		// doesn't exist in the EOF case. visible_next's own wrap-stop logic (below,
+		// at the `it.cur_wrap` branch) already gets this right and never calls
+		// eff_next_row, so it can't exercise the bug -- unlike doc_cursor_down,
+		// doc_scroll and doc_ensure_cursor_visible, which do. Check eff_next_row
+		// directly. doc.wrap is forced on because force-wrap alone needs
+		// WRAP_LONG_CELLS (1024) cells, far more than this line has.
+		{
+			long := "the quick brown fox jumps over the lazy dog and keeps going well past one row"
+			ldoc: Document
+			ldoc.pt = base.pt_init(transmute([]u8)long)
+			defer base.pt_destroy(&ldoc.pt)
+			ldoc.wrap = true
+			ldoc.view_cols = 40
+			// Row 0 is "the quick brown fox jumps over the lazy " (40 cells, break
+			// after the last space that fits): a genuine mid-line wrap point, so a
+			// real successor row follows at 40.
+			s1, ok1 := eff_next_row(&ldoc, &t, 0, ldoc.view_cols)
+			c1 := ok1 && s1 == 40
+			if !c1 {fail = true}
+			fmt.printfln(
+				"  %-6s eff_next_row wrap mid-line -> start=%d ok=%v (want start=40 ok=true)",
+				"ok" if c1 else "FAIL",
+				s1,
+				ok1,
+			)
+			// Row 1, "dog and keeps going well past one row" (37 cells), runs to EOF
+			// with no newline: THE BUG. eff_next_row must report no successor.
+			s2, ok2 := eff_next_row(&ldoc, &t, 40, ldoc.view_cols)
+			c2 := !ok2
+			if !c2 {fail = true}
+			fmt.printfln(
+				"  %-6s eff_next_row wrap at EOF -> start=%d ok=%v (want ok=false)",
+				"ok" if c2 else "FAIL",
+				s2,
+				ok2,
+			)
+			// The symmetric wrong fix: folding "ends at EOF" and "ends at a real
+			// newline" together (testing e.g. `e >= doc.pt.length` unconditionally)
+			// would discard the legitimate empty final row on a wrapped line that
+			// DOES end with a newline. Same line, with "\n" appended.
+			longnl := strings.concatenate({long, "\n"}, context.temp_allocator)
+			nldoc: Document
+			nldoc.pt = base.pt_init(transmute([]u8)longnl)
+			defer base.pt_destroy(&nldoc.pt)
+			nldoc.wrap = true
+			nldoc.view_cols = 40
+			s3, ok3 := eff_next_row(&nldoc, &t, 40, nldoc.view_cols)
+			c3 := ok3 && s3 == len(longnl)
+			if !c3 {fail = true}
+			fmt.printfln(
+				"  %-6s eff_next_row wrap at real newline -> start=%d ok=%v (want start=%d ok=true)",
+				"ok" if c3 else "FAIL",
+				s3,
+				ok3,
+				len(longnl),
+			)
+		}
 		fmt.println("rowtest: FAILURES" if fail else "rowtest: all ok")
 		return true
 	}
