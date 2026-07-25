@@ -20,8 +20,7 @@ Decisions taken by Wyatt before design (2026-07-25) are recorded inline as **Dec
 ## 0. Enter must write the document's own line ending (found during design)
 
 Not in Wyatt's report. Found while working out feature 1's terminator handling: `commands.odin:571`
-is `doc_insert_rune(doc, '
-')`, a bare LF regardless of `doc.eol`. **Every Enter pressed in a CRLF
+is `doc_insert_rune(doc, LF)`, a bare LF regardless of `doc.eol`. **Every Enter pressed in a CRLF
 file writes an LF-only line**, so the file's endings mix silently — and `doc.eol` is detected once at
 open and never recomputed, so the status bar keeps reporting CRLF and nothing surfaces it.
 
