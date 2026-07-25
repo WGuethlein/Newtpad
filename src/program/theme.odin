@@ -200,3 +200,80 @@ theme_dark :: proc() -> Theme {
 		.Syn_Xml_Attr   = {1, 0, 1, 1},
 	}
 }
+
+// A genuinely designed light theme, not theme_dark inverted. Every one of the
+// 107 pre-migration literals was chosen by eye against a dark background, so
+// carrying a role's dark value (or its naive per-channel inversion) onto a
+// light background is not a shortcut here -- it is the specific failure this
+// theme exists to avoid. See task-4-report.md for the full contrast-ratio
+// workings (WCAG relative-luminance ratios, computed, not eyeballed -- this
+// environment cannot render a frame) and the roles that did not survive a
+// straight lightening pass:
+//
+//   - Caret: dark's #F2D959 (pale gold) is a 1.42:1 smudge on white -- a caret
+//     that cannot be found, exactly the failure mode the task brief named.
+//     Light instead deepens the same gold hue to a saturated amber (#946200,
+//     ~5.3:1) so the identity survives, not just the label.
+//   - Border_Subtle does double duty as a hairline (table column separator)
+//     and as the active-tab/overflow/plus-hover fill. On dark the fill value
+//     is *lighter* than its surroundings, which pops on a dark strip; on
+//     white nothing can be lighter than the base, so the same value can only
+//     read as a weak hairline (~1.7:1) with a barely-there active-tab pop --
+//     reported below, not fixed, because fixing it means splitting the role.
+//   - Text_Bright/Danger: the tab-close hover icon pairs whatever Text_Bright
+//     is with a fixed red fill. Dark pairs white-on-red (5.89:1); light's
+//     darkest text (needed elsewhere for body-text emphasis) pairs
+//     near-black-on-red (3.18:1) -- still clears the 3:1 non-text UI
+//     threshold, but by less margin than dark had.
+//
+// Danger is the one role deliberately unchanged from Dark: it is a solid,
+// fully-opaque hover fill never blended with either theme's chrome, used only
+// for the close-tab affordance, and Windows itself renders that hover in the
+// same red regardless of system theme. Every other role's value had to move
+// because the surface it sits against moved; Danger's surface (its own
+// opaque quad) didn't.
+theme_light :: proc() -> Theme {
+	return Theme {
+		.Bg_Base        = {1.00, 1.00, 1.00, 1}, // #FFFFFF -- document canvas + tab-strip rest state
+		.Bg_Panel       = {0.93, 0.95, 0.96, 1}, // #EEF1F6 -- menu bar, history, query field, inactive tab
+		.Bg_Raised      = {0.89, 0.91, 0.93, 1}, // #E2E7EE -- scrollbar track, table header band
+		.Border_Subtle  = {0.70, 0.74, 0.80, 1}, // #B3BDCC -- table separator + active-tab fill (see note above: weak pop)
+		.Border_Strong  = {0.45, 0.51, 0.60, 1}, // #748199 -- dividers, dropdown borders, caption-hover fill
+		.Text_Muted     = {0.36, 0.40, 0.46, 1}, // #5D6776 -- gutter numbers, hints, scrollbar thumb (5.8:1 on white)
+		.Text_Dim       = {0.30, 0.34, 0.40, 1}, // #4C5666 -- chords, bullets, inactive-tab fg (7.4:1 on white)
+		.Text_Secondary = {0.23, 0.26, 0.31, 1}, // #3A4250 -- default row/caption text (10.1:1 on white)
+		.Text_Primary   = {0.12, 0.14, 0.19, 1}, // #1E2430 -- document text, headings, active tab (15.6:1 on white)
+		.Text_Bright    = {0.06, 0.07, 0.10, 1}, // #10131A -- bold emphasis, table header/edit text (18.7:1 on white)
+
+		.Selection_Doc  = {0.75, 0.84, 0.95, 1}, // #BFD6F2 -- pale blue; dark Text_Primary stays readable on top (10.5:1)
+		.Selection_List = {0.88, 0.90, 0.93, 1}, // #E1E6EE -- quieter than Selection_Doc: this role covers many widgets
+		.Caret          = {0.58, 0.38, 0.00, 1}, // #946200 -- deepened gold, not lightened (see note above)
+		.Accent         = {0.54, 0.43, 0.12, 1}, // #8A6D1F -- same gold family as Caret, lower chroma for running text
+		.Find_Match_Bg  = {0.94, 0.89, 0.72, 1}, // #F0E4B8 -- pale amber wash; text drawn on top is unchanged dark fg
+		.Link           = {0.11, 0.37, 0.66, 1}, // #1B5FA8 -- dark's #73B2FA is 2.2:1 on white; deepened to 6.5:1
+		.Warning        = {0.71, 0.28, 0.06, 1}, // #B5480F -- burnt orange, legible as status text on Bg_Panel (4.8:1)
+		.Danger         = {0.75, 0.16, 0.16, 1}, // #BF2929 -- SAME as Dark, deliberately (see note above)
+		.Success        = {0.12, 0.48, 0.24, 1}, // #1E7A3C -- deep green, legible on Bg_Base and Bg_Panel (5.3/4.8:1)
+		.Filter_Bg      = {0.86, 0.93, 0.87, 1}, // #DCEEDF -- pale green wash for the filter banner
+		.Filter_Text    = {0.12, 0.36, 0.20, 1}, // #1F5C34 -- deep green text on Filter_Bg (6.6:1)
+		.Md_Heading     = {0.09, 0.30, 0.53, 1}, // #164C86 -- deep blue heading text (8.6:1 on white)
+		.Md_Code        = {0.54, 0.29, 0.13, 1}, // #8A4A22 -- terracotta; legible on Bg_Base and the code-block Bg_Panel fill
+		.Md_Italic      = {0.25, 0.36, 0.23, 1}, // #3F5C3A -- deep moss green (7.5:1 on white)
+		.Md_Quote       = {0.33, 0.38, 0.30, 1}, // #55614C -- deep olive, used for both the quote bar and its text (6.6:1)
+
+		// Deliberate light-appropriate placeholders, not magenta: batch 4 has
+		// no consumer for these yet, but a light theme with magenta holes
+		// would be a trap for whoever wires syntax highlighting up next.
+		// Provisional -- chosen for legibility and mutual distinctness on
+		// Bg_Base, not validated against real code on screen.
+		.Syn_Keyword    = {0.23, 0.36, 0.86, 1}, // #3B5BDB -- indigo
+		.Syn_String     = {0.09, 0.51, 0.31, 1}, // #17824E -- green
+		.Syn_Number     = {0.71, 0.34, 0.04, 1}, // #B5560A -- burnt orange
+		.Syn_Comment    = {0.44, 0.48, 0.53, 1}, // #707A88 -- muted slate (deliberately near Text_Muted's tone)
+		.Syn_Type       = {0.04, 0.45, 0.52, 1}, // #0B7285 -- teal
+		.Syn_Punct      = {0.27, 0.29, 0.35, 1}, // #444B58 -- dark neutral, low-emphasis
+		.Syn_Json_Key   = {0.61, 0.26, 0.13, 1}, // #9C4221 -- rust
+		.Syn_Xml_Tag    = {0.71, 0.09, 0.35, 1}, // #B5165A -- rose/maroon
+		.Syn_Xml_Attr   = {0.42, 0.31, 0.71, 1}, // #6B4FB6 -- violet
+	}
+}

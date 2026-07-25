@@ -2751,6 +2751,56 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		chk(d, .Md_Italic, {{0.80, 0.86, 0.78, 1}}, &fail) // #CCDBC7
 		chk(d, .Md_Quote, {{0.66, 0.72, 0.62, 1}}, &fail) // #A8B89E
 
+		// Light is the theme that can actually fail (see theme.odin's
+		// theme_light comment and task-4-report.md): every one of Dark's
+		// values was chosen against a dark background, so nothing here
+		// checks Light against an absorbed-literal list the way Dark is
+		// checked above -- there is no pre-migration light UI to derive one
+		// from. What Light must prove instead:
+		//
+		//   1. every role is non-zero, same reasoning as Dark: a zero slot
+		//      renders as invisible transparent black, not an obvious error.
+		//   2. Light differs from Dark in every role that isn't deliberately
+		//      shared -- a light theme authored by copying theme_dark() and
+		//      editing a few fields would pass check 1 while silently
+		//      leaving most roles dark-only, and check 1 alone would not
+		//      catch it. The one deliberately shared role, and why, is
+		//      documented right above Danger's line in theme_light().
+		l := theme_light()
+
+		// The only role deliberately identical between the two themes, and
+		// why -- see also the note above Danger's line in theme_light().
+		is_shared_role :: proc(role: Color_Role) -> (shared: bool, reason: string) {
+			#partial switch role {
+			case .Danger:
+				return true, "solid opaque hover fill, never blended with either theme's chrome; Windows renders the close-tab hover in the same red regardless of system theme"
+			}
+			return false, ""
+		}
+
+		for role in Color_Role {
+			if l[role] == ([4]f32{0, 0, 0, 0}) {
+				fmt.printfln("  FAIL   %v is zero (unfilled Light slot)", role)
+				fail = true
+			}
+		}
+
+		for role in Color_Role {
+			is_shared, reason := is_shared_role(role)
+			same := l[role] == d[role]
+			ok := same == is_shared // shared roles MUST match; every other role MUST differ
+			if !ok {
+				if is_shared {
+					fmt.printfln("  FAIL   %v is declared shared with Dark but Light's value differs", role)
+				} else {
+					fmt.printfln("  FAIL   %v Light == Dark (%v) but this role is not on the shared list -- accidental dark-value inheritance", role, l[role])
+				}
+				fail = true
+			} else if is_shared {
+				fmt.printfln("  ok     %v shared with Dark: %s", role, reason)
+			}
+		}
+
 		fmt.println("themetest: FAILURES" if fail else "themetest: all ok")
 		return true
 	}
