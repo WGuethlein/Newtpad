@@ -2644,7 +2644,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		one :: proc(content: string, eol: base.Line_Ending, at, delta: int) -> string {
 			doc: Document
 			doc.pt = base.pt_init(transmute([]u8)content)
-			defer base.pt_destroy(&doc.pt)
+			defer doc_close(&doc) // undo/redo hold cloned trees too; pt_destroy alone leaked them
 			doc.eol = eol
 			doc.cursor, doc.anchor = at, at
 			doc_move_lines(&doc, delta)
@@ -2657,6 +2657,10 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// no-ops at the bounds: the buffer must come back byte-identical
 		chk("LF: first line up is a no-op", one("a\nb\n", .LF, 0, -1), "a\nb\n", &fail)
 		chk("LF: last line down is a no-op", one("a\nb\n", .LF, 2, 1), "a\nb\n", &fail)
+		// the bail arithmetic could plausibly strip the trailing newline instead of
+		// preserving it -- pin the case where a properly-terminated true last line
+		// receives a new neighbour rather than being swapped with a phantom row.
+		chk("LF: down into true last line", one("a\nb\nc\n", .LF, 2, 1), "a\nc\nb\n", &fail)
 		// the last line WITHOUT a trailing newline -- which line lacks one changes
 		chk("LF: unterminated last up", one("a\nb", .LF, 2, -1), "b\na", &fail)
 		chk("LF: into unterminated last", one("a\nb", .LF, 0, 1), "b\na", &fail)
@@ -2664,6 +2668,48 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		chk("CRLF: move line 2 up", one("a\r\nb\r\nc\r\n", .CRLF, 3, -1), "b\r\na\r\nc\r\n", &fail)
 		chk("CRLF: unterminated last up", one("a\r\nb", .CRLF, 3, -1), "b\r\na", &fail)
 		chk("CRLF: into unterminated last", one("a\r\nb", .CRLF, 0, 1), "b\r\na", &fail)
+		// .Mixed must never rewrite a line ending the move didn't touch. The old
+		// "each line carries its own terminator" model synthesised doc.eol's bytes
+		// whenever the piece landing first was the unterminated last line -- here
+		// that piece's real neighbour separator is a CRLF the move never touched.
+		// Both directions of the same swap, since both synthesised under the old model.
+		chk("Mixed: unterminated last up preserves CRLF", one("a\nb\r\nc", .Mixed, 5, -1), "a\nc\r\nb", &fail)
+		chk("Mixed: into unterminated last preserves CRLF", one("a\nb\r\nc", .Mixed, 2, 1), "a\nc\r\nb", &fail)
+		// A line longer than MOVE_LINE_BUDGET must be refused, not scanned: the fix
+		// for the unbounded-scan finding is a bail, and a bail that silently didn't
+		// fire would corrupt the buffer instead of leaving it alone -- so assert the
+		// whole buffer is untouched, not just that the call returned.
+		big := strings.repeat("x", MOVE_LINE_BUDGET + 16, context.temp_allocator)
+		over_budget := strings.concatenate({big, "\nb"}, context.temp_allocator)
+		chk(
+			"over-budget line is a no-op (bail, not a scan)",
+			one(over_budget, .LF, len(big) + 1, -1),
+			over_budget,
+			&fail,
+		)
+		// One press must add exactly one undo entry (Replace All's overflow bug
+		// was one snapshot per match; a batch is the fix, so pin that it still
+		// collapses to one here too), and doc_undo must restore the exact
+		// original bytes -- not just "no error", the pre-move buffer verbatim.
+		{
+			ud: Document
+			ud.pt = base.pt_init(transmute([]u8)string("a\r\nb\r\nc\r\n"))
+			defer doc_close(&ud)
+			ud.eol = .CRLF
+			ud.cursor, ud.anchor = 3, 3
+			before := len(ud.undo)
+			doc_move_lines(&ud, -1)
+			added := len(ud.undo) - before
+			if added != 1 {
+				fail = true
+				fmt.printfln("  FAIL   undo entries added: %d (want 1)", added)
+			} else {
+				fmt.printfln("  ok     undo entries added: %d (want 1)", added)
+			}
+			doc_undo(&ud)
+			restored := doc_debug_string(&ud)
+			chk("undo restores original bytes", restored, "a\r\nb\r\nc\r\n", &fail)
+		}
 		fmt.println("movelinetest: FAILURES" if fail else "movelinetest: all ok")
 		return true
 	}
