@@ -4392,6 +4392,172 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad highlighttest` is Task 1's Step 5: the failure mode of the whole
+	// syntax-highlighting batch is a lexer that is correct and quietly O(file).
+	// It proves highlight_row_spans/doc_row_lex_spans (highlight.odin, doc.odin)
+	// cost the same per viewport regardless of document size, using a counter
+	// of bytes handed to the lexer (hl_bytes_examined) rather than wall-clock,
+	// so the assertion is stable. It also proves the assertion CAN fail: a
+	// "buggy" variant, injected only in this test's own harness (never in the
+	// shipping row loop), feeds the lexer everything from byte 0 instead of
+	// just the current row, and the byte count must then diverge between a
+	// small and a huge file. Finally it checks the wrap-rebase path
+	// (doc_row_lex_spans's wrapped branch) directly: a bare number straddling a
+	// forced wrap point must still be fully covered, split correctly across
+	// both visual rows, each rebased to start within that row's own bytes.
+	if os.args[1] == "highlighttest" {
+		fmt.println("highlighttest:")
+		fail := false
+
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("highlighttest: no fonts loaded")
+			return true
+		}
+
+		// One repeating log line carrying all four patterns lex_log recognizes,
+		// so every row does real (not trivially-empty) lexing work.
+		line := "2026-07-25T10:23:45Z ERROR failed to open \"C:\\log.txt\" after 42 retries\n"
+
+		make_doc :: proc(line: string, repeats: int) -> Document {
+			sb := strings.builder_make(context.temp_allocator)
+			for _ in 0 ..< repeats {strings.write_string(&sb, line)}
+			d: Document
+			d.pt = base.pt_init(transmute([]u8)strings.to_string(sb))
+			d.path = "test.log"
+			d.view_cols = 200
+			return d
+		}
+
+		// Bytes handed to the lexer while drawing `rows` visible rows from
+		// doc.top, via the SAME per-row loop shape doc_draw uses (visible_begin/
+		// next, then either highlight_row_spans directly for an unwrapped row or
+		// doc_row_lex_spans's cache for a wrapped one). `buggy`, when true, feeds
+		// the lexer everything from byte 0 through the current row's end instead
+		// of just the row's own bytes -- a stand-in for "the row-span builder
+		// scans from the buffer start" -- to prove the assertion below can
+		// actually fail, not just that it happens to pass.
+		measure :: proc(doc: ^Document, t: ^plat.Text, rows: int, buggy: bool) -> int {
+			hl_bytes_examined = 0
+			line_buf: [VISIBLE_COLS]u8
+			hl_cache: Highlight_Row_Cache
+			hl_cache.cur_lls = -1
+			it := visible_begin(doc, t, rows)
+			for {
+				_, start, end, vis_end, _, wrapped, ok := visible_next(&it)
+				if !ok {break}
+				draw_len := min(vis_end - start, len(line_buf))
+				n := base.pt_read(&doc.pt, start, line_buf[:draw_len])
+				if n <= 0 {continue}
+				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				if buggy {
+					whole := make([]u8, end, context.temp_allocator)
+					got := base.pt_read(&doc.pt, 0, whole)
+					highlight_row_spans(doc, whole[:got], hl_buf[:])
+				} else {
+					doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], hl_buf[:])
+				}
+			}
+			return hl_bytes_examined
+		}
+
+		rows := 30
+		// `small` must have enough lines left after `top` to fill every one of
+		// `rows` rows -- otherwise visible_next runs out of document and the
+		// loop stops early, examining fewer rows (and so fewer bytes) than
+		// `big` for a reason that has nothing to do with the code under test.
+		// That is exactly the shape of bug this fixture must not itself have:
+		// it first shipped with small=20/top=5 lines, leaving only 15 lines for
+		// 30 rows, and "big examines 2x small's bytes" looked like a real
+		// failure until this comment's fix.
+		small := make_doc(line, rows + 10) // ~3 KB: a few rows' margin past `top`
+		big := make_doc(line, 200000) // ~15 MB
+		defer base.pt_destroy(&small.pt)
+		defer base.pt_destroy(&big.pt)
+		// Not byte 0: a few lines in, so a builder that secretly scans from the
+		// start would show up as size-dependent even though doc.top itself is a
+		// small, fixed-looking offset on both documents.
+		small.top = len(line) * 5
+		big.top = len(line) * 100000
+		small_bytes := measure(&small, &t, rows, false)
+		big_bytes := measure(&big, &t, rows, false)
+		ok := small_bytes > 0 && small_bytes == big_bytes
+		if !ok {fail = true}
+		fmt.printfln(
+			"  %-6s viewport-proportional: small=%d big=%d (want equal, both > 0)",
+			"ok" if ok else "FAIL",
+			small_bytes,
+			big_bytes,
+		)
+
+		small_buggy := measure(&small, &t, rows, true)
+		big_buggy := measure(&big, &t, rows, true)
+		// The bug must show up as a large, unmistakable gap, not noise -- big's
+		// doc.top is ~100000 lines in, so scanning from byte 0 on every one of
+		// its 30 rows examines roughly 100000x more bytes than small's does.
+		caught := big_buggy > small_buggy * 10
+		if !caught {fail = true}
+		fmt.printfln(
+			"  %-6s assertion can fail: buggy variant diverges (small=%d big=%d)",
+			"ok" if caught else "FAIL",
+			small_buggy,
+			big_buggy,
+		)
+
+		// Wrap rebase: a single bare number wider than the row forces a mid-token
+		// wrap (word-wrap breaks at the last fitting space; a token with none
+		// char-breaks -- see wrap_row_end's comment). The Number token must still
+		// be found in full across the wrapped rows, each piece rebased to start
+		// within [0, that row's own byte count) -- never negative, never past
+		// what's actually drawn on that row.
+		{
+			digits := "12345678901234567890" // 20 digits, no internal separators
+			content := strings.concatenate({digits, " done\n"}, context.temp_allocator)
+			wd: Document
+			wd.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&wd.pt)
+			wd.path = "test.log"
+			wd.wrap = true
+			wd.view_cols = 10
+
+			wcache: Highlight_Row_Cache
+			wcache.cur_lls = -1
+			line_buf: [VISIBLE_COLS]u8
+			total_len, first_start := 0, -1
+			bounds_ok := true
+			wit := visible_begin(&wd, &t, 6)
+			for {
+				_, start, end, vis_end, _, wrapped, ok := visible_next(&wit)
+				if !ok {break}
+				draw_len := min(vis_end - start, len(line_buf))
+				n := base.pt_read(&wd.pt, start, line_buf[:draw_len])
+				if n <= 0 {continue}
+				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				hn := doc_row_lex_spans(&wd, &wcache, start, end, wrapped, line_buf[:n], hl_buf[:])
+				for k in 0 ..< hn {
+					sp := hl_buf[k]
+					if sp.color != g_theme[.Syn_Number] {continue}
+					if first_start < 0 {first_start = sp.start}
+					total_len += sp.len
+					if sp.start < 0 || sp.start + sp.len > n {bounds_ok = false}
+				}
+			}
+			wrap_ok := bounds_ok && first_start == 0 && total_len == len(digits)
+			if !wrap_ok {fail = true}
+			fmt.printfln(
+				"  %-6s wrap rebase: number split across rows, total_len=%d (want %d) first_start=%d (want 0) bounds_ok=%v",
+				"ok" if wrap_ok else "FAIL",
+				total_len,
+				len(digits),
+				first_start,
+				bounds_ok,
+			)
+		}
+
+		fmt.println("highlighttest: FAILURES" if fail else "highlighttest: all ok")
+		return true
+	}
+
 	if len(os.args) < 3 {return false}
 	path, mode := os.args[1], os.args[2]
 

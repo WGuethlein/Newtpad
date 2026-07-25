@@ -2153,6 +2153,76 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 	doc_scroll(doc, t, -(rows - 1), rows)
 }
 
+// Per-viewport-pass state for the wrapped side of syntax highlighting.
+// Mirrors links_layout's cur_lls/cur_line/cur_links cache exactly — a wrapped
+// row is only a segment of its logical line, but the log lexer's line-start
+// timestamp pattern is anchored to the true line start, and any token can
+// straddle the wrap point, so the whole (capped) logical line is lexed once
+// and its spans rebased onto each visual row in turn, rather than re-lexing
+// a partial, possibly-truncated segment per row. Zero-value is not usable —
+// cur_lls must start at -1, a value no real line start can equal — so
+// callers must set that explicitly (see doc_draw).
+Highlight_Row_Cache :: struct {
+	cur_lls:  int,
+	cur_line: string,
+	cur_buf:  [HL_MAX_ROW_TOKENS]plat.Text_Span,
+	cur_n:    int,
+}
+
+// Row-relative syntax spans for one visible row, handling the wrap rebase
+// when needed. Factored out of doc_draw so highlighttest (test_modes.odin)
+// can exercise the exact wrap-rebase path doc_draw draws with, rather than a
+// second implementation that could quietly diverge from it — "test the
+// seam, not the unit" (CLAUDE.md).
+//
+// Filter rows are never `wrapped` (visible_next only ever sets it in the
+// non-filter branch), so a filtered row's bytes ARE its whole logical line
+// already — this line-local lexer handles the filter view for free. That
+// stops being free the instant a lexer needs cross-line state (Task 3's
+// index), so don't copy this shortcut without re-checking it applies.
+doc_row_lex_spans :: proc(
+	doc: ^Document,
+	cache: ^Highlight_Row_Cache,
+	start, end: int,
+	wrapped: bool,
+	row_bytes: []u8,
+	out: []plat.Text_Span,
+) -> int {
+	if !wrapped {
+		// The unwrapped row IS the whole (capped) logical line already sitting in
+		// the caller's line buffer — no extra read, no cache needed.
+		return highlight_row_spans(doc, row_bytes, out)
+	}
+	lls, _ := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
+	if lls != cache.cur_lls {
+		cache.cur_lls = lls
+		lend := base.pt_line_end_cap(&doc.pt, lls, RENDER_LINE_CAP)
+		cache.cur_line = ""
+		cache.cur_n = 0
+		if lend > lls {
+			buf := make([]u8, lend - lls, context.temp_allocator)
+			got := base.pt_read(&doc.pt, lls, buf)
+			cache.cur_line = string(buf[:got])
+			cache.cur_n = highlight_row_spans(doc, buf[:got], cache.cur_buf[:])
+		}
+	}
+	row_off := start - lls
+	row_end_off := min(end - lls, len(cache.cur_line))
+	n := 0
+	for k in 0 ..< cache.cur_n {
+		sp := cache.cur_buf[k]
+		lo := max(sp.start, row_off)
+		hi := min(sp.start + sp.len, row_end_off)
+		if lo >= hi {continue} // this token doesn't touch this row
+		if n >= len(out) {break}
+		// Rebased onto this row: "a wrapped link only colours its part here"
+		// (links.odin) applies identically to a syntax span.
+		out[n] = plat.Text_Span{start = lo - row_off, len = hi - lo, color = sp.color}
+		n += 1
+	}
+	return n
+}
+
 // Draw visible lines; return the caret's screen rect (if visible) and the byte
 // offset just past the last visible line (for the scrollbar).
 doc_draw :: proc(
@@ -2173,6 +2243,14 @@ doc_draw :: proc(
 	// scroll is a follow-up).
 	line_buf: [VISIBLE_COLS]u8
 	bottom = doc.top
+	// Syntax highlighting: nil lexer for an extension with no grammar (.txt,
+	// or anything not yet wired in highlight.odin) skips the whole pass below
+	// at zero cost. hl_cache.cur_lls starts at -1 (see its comment) so the
+	// first wrapped row this pass sees always misses and lexes its logical
+	// line fresh.
+	hl_lexer := highlight_lexer_for(doc.path)
+	hl_cache: Highlight_Row_Cache
+	hl_cache.cur_lls = -1
 	it := visible_begin(doc, t, rows)
 	for {
 		row, start, end, vis_end, line_end, wrapped, ok := visible_next(&it)
@@ -2198,12 +2276,62 @@ doc_draw :: proc(
 			// Link_Hit list the hover and the click consume, so what is highlighted
 			// is exactly what is clickable. The underlines are drawn by
 			// render_frame, which owns the quad pipeline — from this same list.
-			spans: [dynamic]plat.Text_Span
+			link_spans: [dynamic]plat.Text_Span
 			for h in links {
 				if h.row != row {continue}
-				spans = spans if spans != nil else make([dynamic]plat.Text_Span, 0, 4, context.temp_allocator)
+				link_spans = link_spans if link_spans != nil else make([dynamic]plat.Text_Span, 0, 4, context.temp_allocator)
 				// The row-relative segment (a wrapped link only colours its part here).
-				append(&spans, plat.Text_Span{start = h.span_start, len = h.span_len, color = g_theme[.Link]})
+				append(&link_spans, plat.Text_Span{start = h.span_start, len = h.span_len, color = g_theme[.Link]})
+			}
+
+			// Syntax spans on this row (nil hl_lexer -> zero cost). A URL inside a
+			// log line can be both a link and a lexer span on the same bytes: they
+			// must not simply both be appended, because text_draw_spans does NOT
+			// resolve overlap by append/draw order. Its own contract says spans
+			// "must be sorted... and must not overlap" — and its implementation
+			// (platform/text.odin's single forward-moving `si` index) genuinely
+			// has no defined behaviour for overlapping input: whichever span
+			// sorts first by `start` claims the entire overlapping run until IT
+			// ends, regardless of what was appended after or what the other
+			// span's start is. So links win by construction instead: any syntax
+			// span that intersects a link on this row is dropped before the merge
+			// below, rather than trusted to lose a fight text_draw_spans doesn't
+			// referee the way the brief hoped.
+			lex_spans: [dynamic]plat.Text_Span
+			if hl_lexer != nil {
+				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				hl_n := doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], hl_buf[:])
+				outer: for k in 0 ..< hl_n {
+					sp := hl_buf[k]
+					for l in link_spans {
+						if sp.start < l.start + l.len && l.start < sp.start + sp.len {
+							continue outer // overlaps a link: drop it, link wins
+						}
+					}
+					lex_spans = lex_spans if lex_spans != nil else make([dynamic]plat.Text_Span, 0, 4, context.temp_allocator)
+					append(&lex_spans, sp)
+				}
+			}
+
+			// Merge, sorted by start: lex_spans and link_spans are each already
+			// ascending (tokens are found left to right; links_layout scans the
+			// same way), so a linear merge keeps text_draw_spans's "sorted,
+			// non-overlapping" precondition without a general sort, and without
+			// the two lists ever containing an overlapping pair (link-intersecting
+			// lexer spans were already dropped above).
+			spans: [dynamic]plat.Text_Span
+			if lex_spans != nil || link_spans != nil {
+				spans = make([dynamic]plat.Text_Span, 0, len(lex_spans) + len(link_spans), context.temp_allocator)
+				li, ri := 0, 0
+				for li < len(lex_spans) || ri < len(link_spans) {
+					if ri >= len(link_spans) || (li < len(lex_spans) && lex_spans[li].start <= link_spans[ri].start) {
+						append(&spans, lex_spans[li])
+						li += 1
+					} else {
+						append(&spans, link_spans[ri])
+						ri += 1
+					}
+				}
 			}
 			if spans != nil {
 				plat.text_draw_spans(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs), row_y, px, fg, spans[:], .Doc)
