@@ -82,7 +82,10 @@ accents are genuinely semantic.
 - **Neutrals: 42 values across 81 sites collapse to 10 roles.** `text_muted` alone was seven shades
   doing one job — `#6B758A`, `#6B788F`, `#6B7A99`, `#737D91`, `#7A8599`, `#808A9E`, `#808CA3` —
   indistinguishable side by side.
-- **Accents: 23 values to 15 roles.** These carry meaning; merging them loses information.
+- **Accents: 19 values to 15 roles.** These carry meaning; merging them loses information.
+  (An earlier draft said 23 — that count came from the clustering script's chroma split, which filed
+  several blue-tinted greys as accents before they were reassigned to the neutral ramp. The table
+  below is authoritative.)
 
 **Total: 25 roles**, plus the 9 syntax placeholders.
 
