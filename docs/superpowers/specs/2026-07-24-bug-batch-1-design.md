@@ -22,7 +22,7 @@ Two of them — the most visible two — turn out to be the same seam: `visible_
 |---|---|---|---|
 | 2 | Caret one row below the text on untitled tabs | phantom trailing row emitted when the buffer has no trailing newline | `doc.odin:513`, `:1728` |
 | 4 | Newlines counted as characters (4 symptoms) | `'\r'` is inside the row range; stripped only in the text draw | `doc.odin:1873` vs `:1906` |
-| 5 | `(no matches)` flickers during rapid replace | status text tests `len(matches)==0` without consulting `find_busy` | `main.odin:949` |
+| 5 | `(no matches)` flickers during rapid replace | status text tests `len(matches)==0` without consulting `search_running` | `main.odin:949` |
 | 3 | Extra space in the Ctrl+H find line | hardcoded leading `"  "` in `info` + caret slot that vanishes | `main.odin:954,957` |
 | 8 | Markdown preview tables misaligned | each row advances `x` by its own cell widths | `markdown.odin:367` |
 | 10 | Ctrl+Left/Right asymmetric | right lands on word ends, left on word starts | `doc.odin:1585-1599` |
@@ -120,10 +120,10 @@ sixteen-bugs-one-shape lesson in HANDOFF §6j.
 `find_replace_current` (`find.odin:510`) edits the buffer, which calls `find_invalidate` →
 `search_stop` + `dirty = true`, then `find_recompute`, which clears the match arrays. For the frames
 between the clear and the worker's first publish, `len(f.matches) == 0`. The status text at
-`main.odin:949` tests only that, and never consults `find_busy` (`find.odin:297`), which already
+`main.odin:949` tests only that, and never consults `search_running` (`find.odin`), which already
 reports exactly this state (`search.th != nil || find.dirty`).
 
-**Fix.** Store the last published match count and index on `Find`. While `find_busy(doc)` is true,
+**Fix.** Store the last published match count and index on `Find`. While `search_running(doc)` is true,
 keep displaying them. Render `(no matches)` only when a search has *completed* with zero matches.
 
 Not a `(searching…)` indicator: that replaces one flicker with a different one. The count is stable
@@ -260,7 +260,7 @@ Headless modes in `test_modes.odin` (set `NEWTPAD_SESSION_DIR` to a temp dir fir
   replace selection, replace all, set line ending, undo, redo) and assert `revision` advanced. Stale
   widths on screen is the failure this prevents.
 - **Find count stability**: a replace on a document with many matches never shows zero while
-  `find_busy` is true.
+  `search_running` is true.
 
 Per CLAUDE.md, every one of these is watched failing with the bug reintroduced before the fix is
 called done. This matters most for #4, where the pre-existing draw-side strip means a naive test
