@@ -4409,6 +4409,20 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.println("highlighttest:")
 		fail := false
 
+		// The link-precedence checks below distinguish spans by their theme
+		// colour (Syn_Number vs Syn_Keyword vs Syn_String vs Link). Without a
+		// theme loaded, g_theme is its zero value, making every Color_Role
+		// compare equal by accident. theme_dark() itself doesn't help either:
+		// its Syn_* roles are still an unfilled magenta placeholder (batch 4
+		// hasn't wired Dark's syntax colours yet, see theme.odin), so every
+		// Syn_* role there is the SAME magenta too. theme_light() already has
+		// real, mutually distinct provisional values for all nine Syn_* roles
+		// (theme.odin's own comment: "chosen for legibility and mutual
+		// distinctness"), so it's what this test needs -- the other checks in
+		// this mode don't care which theme is loaded (they only ever compare
+		// one role's colour to itself).
+		g_theme = theme_light()
+
 		t: plat.Text
 		if !plat.text_load_faces(&t) {
 			fmt.eprintln("highlighttest: no fonts loaded")
@@ -4552,6 +4566,153 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				first_start,
 				bounds_ok,
 			)
+		}
+
+		// Link precedence: the drop-then-merge in doc_draw (factored out as
+		// highlight_merge_spans, highlight.odin) is the one place this batch's
+		// three interactions (lexer spans, links, wrap) actually collide, and a
+		// 2026-07 review found it had no test beyond "hand-verified by reading
+		// the code." These checks call highlight_merge_spans directly -- the
+		// literal proc doc_draw calls, not a copy -- first against a real .log
+		// row with a URL a lexer token also covers, then against synthetic spans
+		// that pin down all four ways a link and a token can intersect, plus the
+		// adjacent-but-not-overlapping case that must NOT drop (the boundary
+		// where < vs <= matters).
+		{
+			LEX := [4]f32{1, 0, 0, 1}
+			LINK := [4]f32{0, 1, 0, 1}
+
+			// Valid input to text_draw_spans only if ascending by start with no
+			// overlap between consecutive spans -- exactly the precondition
+			// highlight_merge_spans exists to uphold.
+			sorted_no_overlap :: proc(spans: []plat.Text_Span) -> bool {
+				for i in 1 ..< len(spans) {
+					if spans[i].start < spans[i - 1].start + spans[i - 1].len {return false}
+				}
+				return true
+			}
+			spans_eq :: proc(a, b: []plat.Text_Span) -> bool {
+				if len(a) != len(b) {return false}
+				for i in 0 ..< len(a) {
+					if a[i].start != b[i].start || a[i].len != b[i].len || a[i].color != b[i].color {return false}
+				}
+				return true
+			}
+			has_color :: proc(spans: []plat.Text_Span, color: [4]f32) -> bool {
+				for s in spans {
+					if s.color == color {return true}
+				}
+				return false
+			}
+
+			// The motivating real-world case: a quoted string that wraps a URL.
+			// The String token (the whole "..." run) and the URL Link genuinely
+			// overlap on real bytes, unlike the synthetic cases below -- this is
+			// "link inside token" with a real lexer and a real link scan behind
+			// it, not just asserted geometry.
+			{
+				row := `2026-07-25T10:23:45Z ERROR fetch "https://example.com/x" failed`
+				rdoc: Document
+				rdoc.path = "test.log"
+				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				hl_n := highlight_row_spans(&rdoc, transmute([]u8)row, hl_buf[:])
+				lks := links_scan(row)
+				link_buf := make([]plat.Text_Span, len(lks), context.temp_allocator)
+				for l, i in lks {link_buf[i] = plat.Text_Span{start = l.start, len = l.len, color = LINK}}
+				merged := make([]plat.Text_Span, hl_n + len(link_buf), context.temp_allocator)
+				mn := highlight_merge_spans(hl_buf[:hl_n], link_buf, merged)
+				out := merged[:mn]
+
+				url_start := strings.index(row, "https://")
+				url_len := len("https://example.com/x")
+				ts_len := len("2026-07-25T10:23:45Z")
+				kw_start := strings.index(row, "ERROR")
+				found_link, found_ts, found_kw := false, false, false
+				for s in out {
+					if s.start == url_start && s.len == url_len && s.color == LINK {found_link = true}
+					if s.start == 0 && s.len == ts_len && s.color == g_theme[.Syn_Number] {found_ts = true}
+					if s.start == kw_start && s.len == len("ERROR") && s.color == g_theme[.Syn_Keyword] {found_kw = true}
+				}
+				// The quoted-string token must be dropped WHOLE: no span anywhere
+				// in the output may carry the String colour, because the only
+				// String token on this row is the one the link overlaps.
+				real_ok :=
+					sorted_no_overlap(out) &&
+					found_link &&
+					found_ts &&
+					found_kw &&
+					!has_color(out, g_theme[.Syn_String])
+				if !real_ok {fail = true}
+				fmt.printfln(
+					"  %-6s link precedence, real row: quoted URL wins over String token, timestamp/ERROR untouched (n=%d)",
+					"ok" if real_ok else "FAIL",
+					mn,
+				)
+			}
+
+			// Synthetic geometry: exact control over where a link's boundary
+			// falls relative to a token's, covering all four intersection shapes
+			// the review enumerated plus the adjacent-but-not-overlapping case
+			// (both directions) that must survive untouched. Each case also
+			// carries an unrelated, non-intersecting span that must pass through
+			// unharmed -- proving the drop is selective, not "any link present
+			// nukes the row."
+			Case :: struct {
+				label:              string,
+				lex, link_in, want: []plat.Text_Span,
+			}
+			cases := []Case{
+				{
+					label = "partial overlap: link starts before token, ends inside it",
+					lex = []plat.Text_Span{{10, 10, LEX}, {40, 5, LEX}},
+					link_in = []plat.Text_Span{{5, 8, LINK}}, // [5,13) overlaps [10,20)'s left edge
+					want = []plat.Text_Span{{5, 8, LINK}, {40, 5, LEX}},
+				},
+				{
+					label = "partial overlap: token starts before link, ends inside it",
+					lex = []plat.Text_Span{{10, 10, LEX}, {40, 5, LEX}},
+					link_in = []plat.Text_Span{{15, 10, LINK}}, // [15,25) overlaps [10,20)'s right edge
+					want = []plat.Text_Span{{15, 10, LINK}, {40, 5, LEX}},
+				},
+				{
+					label = "link entirely inside token",
+					lex = []plat.Text_Span{{10, 20, LEX}, {40, 5, LEX}}, // [10,30)
+					link_in = []plat.Text_Span{{15, 5, LINK}}, // [15,20) inside [10,30)
+					want = []plat.Text_Span{{15, 5, LINK}, {40, 5, LEX}},
+				},
+				{
+					label = "token entirely inside link",
+					lex = []plat.Text_Span{{15, 5, LEX}, {40, 5, LEX}}, // [15,20)
+					link_in = []plat.Text_Span{{10, 20, LINK}}, // [10,30) contains [15,20)
+					want = []plat.Text_Span{{10, 20, LINK}, {40, 5, LEX}},
+				},
+				{
+					label = "adjacent, link right after token: must NOT drop",
+					lex = []plat.Text_Span{{10, 10, LEX}}, // [10,20)
+					link_in = []plat.Text_Span{{20, 5, LINK}}, // [20,25) touches, doesn't overlap
+					want = []plat.Text_Span{{10, 10, LEX}, {20, 5, LINK}},
+				},
+				{
+					label = "adjacent, link right before token: must NOT drop",
+					lex = []plat.Text_Span{{20, 10, LEX}}, // [20,30)
+					link_in = []plat.Text_Span{{10, 10, LINK}}, // [10,20) touches, doesn't overlap
+					want = []plat.Text_Span{{10, 10, LINK}, {20, 10, LEX}},
+				},
+				{
+					label = "no overlap, interleaved: merge must interleave by start, not concatenate",
+					lex = []plat.Text_Span{{5, 3, LEX}, {30, 5, LEX}},
+					link_in = []plat.Text_Span{{15, 5, LINK}},
+					want = []plat.Text_Span{{5, 3, LEX}, {15, 5, LINK}, {30, 5, LEX}},
+				},
+			}
+			for c in cases {
+				merged := make([]plat.Text_Span, len(c.lex) + len(c.link_in), context.temp_allocator)
+				mn := highlight_merge_spans(c.lex, c.link_in, merged)
+				out := merged[:mn]
+				ok := sorted_no_overlap(out) && spans_eq(out, c.want)
+				if !ok {fail = true}
+				fmt.printfln("  %-6s link precedence: %s", "ok" if ok else "FAIL", c.label)
+			}
 		}
 
 		fmt.println("highlighttest: FAILURES" if fail else "highlighttest: all ok")

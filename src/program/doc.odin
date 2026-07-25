@@ -2285,56 +2285,26 @@ doc_draw :: proc(
 			}
 
 			// Syntax spans on this row (nil hl_lexer -> zero cost). A URL inside a
-			// log line can be both a link and a lexer span on the same bytes: they
-			// must not simply both be appended, because text_draw_spans does NOT
-			// resolve overlap by append/draw order. Its own contract says spans
-			// "must be sorted... and must not overlap" — and its implementation
-			// (platform/text.odin's single forward-moving `si` index) genuinely
-			// has no defined behaviour for overlapping input: whichever span
-			// sorts first by `start` claims the entire overlapping run until IT
-			// ends, regardless of what was appended after or what the other
-			// span's start is. So links win by construction instead: any syntax
-			// span that intersects a link on this row is dropped before the merge
-			// below, rather than trusted to lose a fight text_draw_spans doesn't
-			// referee the way the brief hoped.
-			lex_spans: [dynamic]plat.Text_Span
+			// log line can be both a link and a lexer span on the same bytes, and
+			// text_draw_spans has no defined behaviour for overlapping input (see
+			// its own doc comment in platform/text.odin) — so the drop-then-merge
+			// precedence that resolves this lives in highlight_merge_spans
+			// (highlight.odin), not inlined here, so highlighttest can exercise
+			// the exact proc this draws with rather than a duplicate that could
+			// quietly diverge from it.
+			hl_n := 0
+			hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
 			if hl_lexer != nil {
-				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
-				hl_n := doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], hl_buf[:])
-				outer: for k in 0 ..< hl_n {
-					sp := hl_buf[k]
-					for l in link_spans {
-						if sp.start < l.start + l.len && l.start < sp.start + sp.len {
-							continue outer // overlaps a link: drop it, link wins
-						}
-					}
-					lex_spans = lex_spans if lex_spans != nil else make([dynamic]plat.Text_Span, 0, 4, context.temp_allocator)
-					append(&lex_spans, sp)
-				}
+				hl_n = doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], hl_buf[:])
 			}
 
-			// Merge, sorted by start: lex_spans and link_spans are each already
-			// ascending (tokens are found left to right; links_layout scans the
-			// same way), so a linear merge keeps text_draw_spans's "sorted,
-			// non-overlapping" precondition without a general sort, and without
-			// the two lists ever containing an overlapping pair (link-intersecting
-			// lexer spans were already dropped above).
-			spans: [dynamic]plat.Text_Span
-			if lex_spans != nil || link_spans != nil {
-				spans = make([dynamic]plat.Text_Span, 0, len(lex_spans) + len(link_spans), context.temp_allocator)
-				li, ri := 0, 0
-				for li < len(lex_spans) || ri < len(link_spans) {
-					if ri >= len(link_spans) || (li < len(lex_spans) && lex_spans[li].start <= link_spans[ri].start) {
-						append(&spans, lex_spans[li])
-						li += 1
-					} else {
-						append(&spans, link_spans[ri])
-						ri += 1
-					}
-				}
+			spans: []plat.Text_Span
+			if hl_n > 0 || link_spans != nil {
+				merged := make([]plat.Text_Span, hl_n + len(link_spans), context.temp_allocator)
+				spans = merged[:highlight_merge_spans(hl_buf[:hl_n], link_spans[:], merged)]
 			}
 			if spans != nil {
-				plat.text_draw_spans(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs), row_y, px, fg, spans[:], .Doc)
+				plat.text_draw_spans(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs), row_y, px, fg, spans, .Doc)
 			} else {
 				plat.text_draw(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs), row_y, px, fg, .Doc)
 			}
