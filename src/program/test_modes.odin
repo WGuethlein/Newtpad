@@ -2515,10 +2515,10 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			caret_row := -1
 			it := visible_begin(&doc, t, 10)
 			for {
-				row, start, end, _, line_end, _, ok := visible_next(&it)
+				row, start, _, vis_end, line_end, _, ok := visible_next(&it)
 				if !ok {break}
 				rows += 1
-				if doc.cursor >= start && doc.cursor <= end && (line_end || doc.cursor < end) {
+				if doc.cursor >= start && doc.cursor <= vis_end && (line_end || doc.cursor < vis_end) {
 					caret_row = row // last match wins, exactly as doc_draw does
 				}
 			}
@@ -2646,13 +2646,21 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		doc_cursor_end(&doc, false)
 		chk("End key lands at", doc.cursor, 5, &fail)
 
+		// Each check below resets the cursor explicitly rather than relying on the
+		// previous check's result. crlftest is otherwise state-sequential — a
+		// failure earlier in the chain would shift the input to everything after
+		// it, turning one direct failure into several attributed to the wrong
+		// mechanism.
+		doc.cursor, doc.anchor = 5, 5
 		// Status column at end of line: "hello" is 5 cells, so Col is 6, not 7.
 		chk("Col at end of line", doc_cursor_col(&doc, &t), 6, &fail)
 
+		doc.cursor, doc.anchor = 5, 5
 		// Right-arrow from the content end crosses the whole CRLF in one step.
 		doc_cursor_right(&doc, false)
 		chk("Right from EOL skips CRLF", doc.cursor, 7, &fail)
 
+		doc.cursor, doc.anchor = 7, 7
 		// Left-arrow back over the break returns to the content end, not the CR.
 		doc_cursor_left(&doc, false)
 		chk("Left over CRLF returns to", doc.cursor, 5, &fail)
@@ -2670,6 +2678,46 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		we, wle := wrap_row_end(&doc, &t, 0, 5)
 		chk("wrap_row_end at 5 cells", we, 6, &fail)
 		chk("wrap_row_end line_end", 1 if wle else 0, 1, &fail)
+
+		// CRLF x wrap: nothing above exercises eff_row_end's wrapped branch or
+		// visible_next's wrapped vis_end, since none of wraptest/wraplongtest use
+		// CRLF content. A CR landing exactly at the wrap column must not be pulled
+		// into row 0 as content, and the row that actually reaches the CRLF break
+		// must still report it as a break, not as two ordinary bytes.
+		{
+			wdoc: Document
+			wdoc.pt = base.pt_init(transmute([]u8)string("hello\r\n"))
+			defer base.pt_destroy(&wdoc.pt)
+			wdoc.eol = .CRLF
+			wdoc.wrap = true
+			wdoc.view_cols = 4
+			wit := visible_begin(&wdoc, &t, 2)
+			_, _, e0, ve0, le0, _, _ := visible_next(&wit)
+			chk("wrap row 0 end (mid-line wrap)", e0, 4, &fail)
+			chk("wrap row 0 vis_end (no CR here)", ve0, 4, &fail)
+			chk("wrap row 0 line_end", 1 if le0 else 0, 0, &fail)
+			_, s1, e1, ve1, le1, _, _ := visible_next(&wit)
+			chk("wrap row 1 start", s1, 4, &fail)
+			chk("wrap row 1 end at real newline", e1, 6, &fail)
+			chk("wrap row 1 line_end", 1 if le1 else 0, 1, &fail)
+			chk("wrap row 1 vis_end (before CR)", ve1, 5, &fail)
+		}
+
+		// An empty CRLF line ("\r\n\r\n"): two adjacent breaks with genuinely empty
+		// content between them. A CR check that doesn't require the following LF
+		// would treat the second break's CR as one byte of content, off by one on
+		// both the caret and a click.
+		{
+			edoc: Document
+			edoc.pt = base.pt_init(transmute([]u8)string("\r\n\r\n"))
+			defer base.pt_destroy(&edoc.pt)
+			edoc.eol = .CRLF
+			edoc.view_cols = 40
+			edoc.cursor, edoc.anchor = 0, 0
+			doc_cursor_end(&edoc, false)
+			chk("End on empty CRLF line lands at", edoc.cursor, 0, &fail)
+			chk("click on empty CRLF line clamps to", doc_pos_at(&edoc, &t, i32(cw * 10), 0, px, cw, 5), 0, &fail)
+		}
 
 		fmt.println("crlftest: FAILURES" if fail else "crlftest: all ok")
 		return true
