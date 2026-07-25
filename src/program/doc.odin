@@ -1665,6 +1665,16 @@ doc_move_lines :: proc(doc: ^Document, delta: int) {
 		a_first = true
 	}
 
+	// MOVE_LINE_BUDGET only bounded the individual scans above -- it said
+	// nothing about region_hi - region_lo, the span that's about to be read,
+	// copied and pushed through doc_replace_range (delete + insert + an undo
+	// tree clone). A short last line with a multi-GB selection above it (click
+	// line 2, Ctrl+Shift+End, Alt+Up) sailed through every _cap check while
+	// read_range below allocated and copied the whole remainder of the file on
+	// the input thread. Bail here, once both region ends are known, so the
+	// neighbour's size counts against the budget too, not just the selection's.
+	if region_hi - region_lo > MOVE_LINE_BUDGET {return}
+
 	a_bytes := read_range(&doc.pt, lo, end_a - lo)
 	other_bytes := read_range(&doc.pt, other_start, other_end - other_start)
 	a_term_bytes := read_range(&doc.pt, end_a, term_a)
