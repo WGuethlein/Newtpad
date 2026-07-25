@@ -29,9 +29,14 @@ import "core:strings"
 Color_Role :: enum u8 {
 	// --- neutrals: 10 roles absorbing 42 values across 81 sites ---
 
-	// #171C29 (2: main.odin:903,942 gutter/preview bg) + #1A1F29 (3:
+	// #171C29 (3: main.odin:903,942 gutter/preview bg + main.odin:842 the frame
+	// clear behind the plain-text/table/markdown-preview canvas, found only
+	// after the fact -- see doc_canvas_clear's comment) + #1A1F29 (3:
 	// ui_tabs.odin:27 tab strip, settings.odin:293 + fontpage.odin:45 full-page
-	// bg) + #1C212B (1: palette.odin:277 body bg). Winner: #1A1F29 (3 sites).
+	// bg) + #1C212B (1: palette.odin:277 body bg). Tied at 3 sites (#171C29 vs
+	// #1A1F29); chose #1A1F29 since its three sites span three separate files
+	// (ui_tabs, settings, fontpage) vs #171C29's three, which all live in
+	// main.odin.
 	Bg_Base,
 	// #1F242E (2: menu.odin bar + markdown.odin MD_CODEBG) + #1F2430 (1:
 	// history.odin:113) + #212633 (1: menu.odin drop) + #242933 (1:
@@ -54,6 +59,16 @@ Color_Role :: enum u8 {
 	// fontpage.odin:97, main.odin:1122) + #7A8599 (1: history.odin:128) +
 	// #808A9E (1: palette.odin:310) + #808CA3 (6: settings.odin:298,308,
 	// history.odin:117, fontpage.odin:50,67,75). Winner: #808CA3 (6 sites).
+	//
+	// Second candidate role split (found in the final review, alongside
+	// Border_Subtle's -- see theme_light's comment): this role is both a text
+	// colour (gutter numbers, every hint line) AND a fill (the scrollbar
+	// thumb, main.odin:924,960,973). An author darkening it for gutter
+	// legibility unavoidably darkens the thumb too; Light already shows this
+	// as a heavy near-black bar on a pale track. Not split here -- CLAUDE.md
+	// principle 3 (fight options) and the same "the author decides, not this
+	// batch" call Border_Subtle got -- but recorded so the next batch finds
+	// both candidates together instead of re-discovering this one alone.
 	Text_Muted,
 	// #8C99B2 (3: settings.odin:327 off, markdown.odin MD_MUTED,
 	// main.odin:1109 default status) + #94A3C2 (1: menu.odin chord) +
@@ -158,6 +173,21 @@ Theme :: [Color_Role][4]f32
 // global, never a lookup that can allocate or fail.
 g_theme: Theme
 
+// The document-canvas clear colour. The plain-text, table, and markdown-preview
+// paths draw no full-content background quad of their own (only the H_SCROLL
+// margin strip, the split-mode right half, and the Settings/Font pages do) --
+// so whatever render_frame clears the backbuffer to before drawing IS the
+// canvas underneath the document text. This proc is the one place that answer
+// comes from: render_frame calls it instead of holding its own copy, and
+// themetest reads it too, so the two cannot independently drift the way
+// main.odin:842's `gfx_begin_frame(gfx, 0.09, 0.11, 0.16)` once did -- a loose
+// three-scalar literal that matched none of this batch's `{r, g, b, a}` greps
+// and quietly left the canvas on Dark's old value after Light shipped, making
+// Light's Text_Primary (#1E2430, near-black) draw on a near-black canvas.
+doc_canvas_clear :: proc() -> [4]f32 {
+	return g_theme[.Bg_Base]
+}
+
 // The theme in use today. Each role's value is the winner (most call sites)
 // of the merged set documented on the enum above -- see the spec's role
 // table for the full absorbed-value lists. No call site has been migrated
@@ -254,7 +284,14 @@ theme_light :: proc() -> Theme {
 		.Text_Bright    = {0.06, 0.07, 0.10, 1}, // #10131A -- bold emphasis, table header/edit text (18.7:1 on white)
 
 		.Selection_Doc  = {0.75, 0.84, 0.95, 1}, // #BFD6F2 -- pale blue; dark Text_Primary stays readable on top (10.5:1)
-		.Selection_List = {0.88, 0.90, 0.93, 1}, // #E1E6EE -- quieter than Selection_Doc: this role covers many widgets
+		// #E1E6EE measured 1.12:1 against Bg_Panel -- menu-bar title hover, the
+		// gear hover, the dropdown item highlight, and the history selected row
+		// all use this fill with NO other cue (keyboard menu navigation has
+		// nothing else marking the selected item), so that was a near-invisible
+		// selection. Darkened to clear Dark's own separation (1.68:1 against its
+		// Bg_Panel): this value measures 1.64:1 against Light's Bg_Panel and
+		// 1.85:1 against Bg_Base, with Text_Primary still at 8.4:1 on top of it.
+		.Selection_List = {0.70, 0.75, 0.84, 1}, // #B3BFD6
 		.Caret          = {0.58, 0.38, 0.00, 1}, // #946200 -- deepened gold, not lightened (see note above)
 		.Accent         = {0.54, 0.43, 0.12, 1}, // #8A6D1F -- same gold family as Caret, lower chroma for running text
 		.Find_Match_Bg  = {0.94, 0.89, 0.72, 1}, // #F0E4B8 -- pale amber wash; text drawn on top is unchanged dark fg
@@ -306,17 +343,38 @@ theme_light :: proc() -> Theme {
 // spec's "Out of scope" section) -- editing a .theme file by hand is the
 // power-user path; the Settings row only ever picks a name.
 
-// %APPDATA%\Newtpad\themes, created if missing. Sibling of settings.txt and
-// session.txt under the same session_dir(), so NEWTPAD_SESSION_DIR redirects
-// this too and headless tests stay isolated from the real store.
+// %APPDATA%\Newtpad\themes -- the path, with no side effects. Sibling of
+// settings.txt and session.txt under the same session_dir(), so
+// NEWTPAD_SESSION_DIR redirects this too and headless tests stay isolated
+// from the real store.
+//
+// Deliberately does NOT create the directory: this is reachable from
+// settings_load (theme_resolve -> themes_dir) at every startup, so a bare
+// read of settings.txt was mkdir'ing a themes/ folder for every user who has
+// never placed a custom theme -- harmless, but a read path with a write
+// side effect nobody asked for. Both callers here are reads
+// (os.read_all_directory_by_path in theme_available_names,
+// os.read_entire_file via theme_load_file in theme_resolve) and both already
+// degrade correctly when the directory doesn't exist. See themes_dir_ensure
+// for the one place that genuinely needs the directory to be there.
 themes_dir :: proc() -> (string, bool) {
 	dir, ok := session_dir()
 	if !ok {
 		return "", false
 	}
-	td := fmt.tprintf("%s%cthemes", dir, '\\')
-	os.make_directory(td) // ignore "already exists"
-	return td, true
+	return fmt.tprintf("%s%cthemes", dir, '\\'), true
+}
+
+// themes_dir(), guaranteed to exist on disk. Call this only at the point
+// that actually needs to WRITE a theme file there -- never from a read path
+// (see themes_dir's comment for why that distinction matters).
+themes_dir_ensure :: proc() -> (string, bool) {
+	dir, ok := themes_dir()
+	if !ok {
+		return "", false
+	}
+	os.make_directory(dir) // ignore "already exists"
+	return dir, true
 }
 
 // Parses "#rrggbb" into a fully-opaque colour. Anything else -- wrong
