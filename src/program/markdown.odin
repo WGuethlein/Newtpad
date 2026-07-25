@@ -73,6 +73,184 @@ Md_Mode :: enum u8 {
 	Split, // editor left, live preview right
 }
 
+// Column widths depend on the whole table block, so measuring them from the
+// visible rows only would make them a function of scroll position — columns that
+// shift as you scroll. The measure is therefore hoisted out of the draw and
+// cached per block, keyed on the buffer revision. Within a block the widths are
+// constant by construction, which is what makes shift-free scrolling a property
+// of the design rather than something to test for.
+//
+// A block is bounded by content (it ends at the first non-table line), so this
+// is O(block), not O(file). Past MD_TABLE_BUDGET the block draws on fixed
+// columns instead — deterministic per row, so still shift-free, just not
+// content-sized. Content-sizing an arbitrarily large block would need a
+// background worker; see the batch-1 spec for why that is deferred.
+MD_TABLE_BUDGET :: 1 * 1024 * 1024
+MD_TABLE_MAX_COLS :: 32
+MD_TABLE_FIXED_CELLS :: 16 // fixed column width past the budget
+MD_TABLE_PAD :: 2 // cells of gap between columns
+
+Md_Align :: enum u8 {
+	Left,
+	Center,
+	Right,
+}
+
+Md_Table_Cache :: struct {
+	valid:    bool,
+	start:    int, // byte offset of the block's first row
+	end:      int, // just past the block's last row
+	revision: u64,
+	oversize: bool, // block exceeded MD_TABLE_BUDGET: fixed columns
+	sep_at:   int, // byte offset of the separator row, or -1
+	ncols:    int,
+	widths:   [MD_TABLE_MAX_COLS]int, // cells, excluding padding
+	align:    [MD_TABLE_MAX_COLS]Md_Align,
+}
+
+// A markdown table row, by the same test the renderer already used.
+md_is_table_row :: proc(line: string) -> bool {
+	return strings.contains(line, "|") && strings.count(line, "|") >= 2
+}
+
+// Split a row into cells, preserving empty ones. Strips at most one leading and
+// one trailing pipe rather than trimming a character set from both ends — the
+// old strings.trim(line, "| ") ate empty leading cells outright.
+md_split_cells :: proc(line: string, allocator := context.temp_allocator) -> []string {
+	s := strings.trim_right(line, " \t")
+	if strings.has_prefix(s, "|") {s = s[1:]}
+	if strings.has_suffix(s, "|") {s = s[:len(s) - 1]}
+	parts := strings.split(s, "|", allocator)
+	for &p in parts {p = strings.trim_space(p)}
+	return parts
+}
+
+// Alignment markers on a separator cell: :--- / :--: / ---: / ---
+@(private = "file")
+md_cell_align :: proc(cell: string) -> Md_Align {
+	c := strings.trim_space(cell)
+	left := strings.has_prefix(c, ":")
+	right := strings.has_suffix(c, ":")
+	switch {
+	case left && right:
+		return .Center
+	case right:
+		return .Right
+	}
+	return .Left
+}
+
+// Read one line at `p` into `buf`, trailing CR removed. Returns the line and the
+// offset of its end (at the newline, or the buffer end).
+@(private = "file")
+md_line_at :: proc(doc: ^Document, p: int, buf: []u8) -> (line: string, end: int) {
+	end = base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+	n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
+	if n > 0 && buf[n - 1] == '\r' {n -= 1}
+	return string(buf[:n]), end
+}
+
+// The contiguous run of table rows containing `p`. Scans backward to the block's
+// true start and forward to its end, both bounded by MD_TABLE_BUDGET so a file
+// that is one enormous table cannot stall a frame.
+@(private = "file")
+md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, ok: bool) {
+	buf: [RENDER_LINE_CAP]u8
+	line, lend := md_line_at(doc, p, buf[:])
+	if !md_is_table_row(line) {return 0, 0, false, false}
+	start, end = p, lend
+
+	// Backward.
+	q := p
+	for q > 0 {
+		if start - q > MD_TABLE_BUDGET {oversize = true;break}
+		ps := base.pt_line_start(&doc.pt, q - 1)
+		pl, _ := md_line_at(doc, ps, buf[:])
+		if !md_is_table_row(pl) {break}
+		start = ps
+		q = ps
+	}
+
+	// Forward.
+	r := lend
+	for r < doc.pt.length {
+		if r - start > MD_TABLE_BUDGET {oversize = true;break}
+		ns := r + 1
+		if ns > doc.pt.length {break}
+		nl, ne := md_line_at(doc, ns, buf[:])
+		if !md_is_table_row(nl) {break}
+		end = ne
+		r = ne
+	}
+	return start, end, oversize, true
+}
+
+// Per-column maxima across the whole block, plus the separator row's alignments.
+// Returns the populated cache; caller owns storage.
+//
+// Package-visible rather than file-private so the mdtabletest mode can drive the
+// oversized path directly, without needing a >1 MB fixture to trip the budget.
+md_table_measure :: proc(doc: ^Document, t: ^plat.Text, start, end: int, oversize: bool) -> Md_Table_Cache {
+	c := Md_Table_Cache {
+		valid    = true,
+		start    = start,
+		end      = end,
+		revision = doc.revision,
+		oversize = oversize,
+		sep_at   = -1,
+	}
+	buf: [RENDER_LINE_CAP]u8
+	for p := start; p <= end && p < doc.pt.length; {
+		line, lend := md_line_at(doc, p, buf[:])
+		if !md_is_table_row(line) {break}
+		cells := md_split_cells(line, context.temp_allocator)
+		if len(cells) > c.ncols {c.ncols = min(len(cells), MD_TABLE_MAX_COLS)}
+		if md_is_table_sep(strings.trim_left(line, " \t")) {
+			if c.sep_at < 0 {c.sep_at = p}
+			for cell, i in cells {
+				if i >= MD_TABLE_MAX_COLS {break}
+				c.align[i] = md_cell_align(cell)
+			}
+		} else if !oversize {
+			for cell, i in cells {
+				if i >= MD_TABLE_MAX_COLS {break}
+				w := plat.text_cells(t, transmute([]u8)cell, .Doc)
+				if w > c.widths[i] {c.widths[i] = w}
+			}
+		}
+		if lend >= doc.pt.length {break}
+		p = lend + 1
+	}
+	// Past the budget every column is the same fixed width: it depends on nothing
+	// outside the row being drawn, so it cannot shift with scroll either.
+	if oversize {
+		for i in 0 ..< max(c.ncols, 1) {c.widths[i] = MD_TABLE_FIXED_CELLS}
+	}
+	return c
+}
+
+// Cached measure for the block containing `p`, or nil if `p` is not a table row.
+// The per-frame cost is the containment test; a scan happens only when the
+// viewport enters a different block or the buffer changed.
+md_table_ensure :: proc(doc: ^Document, t: ^plat.Text, p: int) -> ^Md_Table_Cache {
+	c := &doc.md_table
+	if c.valid && c.revision == doc.revision && p >= c.start && p < c.end {
+		return c
+	}
+	start, end, oversize, ok := md_table_bounds(doc, p)
+	if !ok {return nil}
+	c^ = md_table_measure(doc, t, start, end, oversize)
+	return c
+}
+
+// x offset of column `i`, in pixels from x0.
+@(private = "file")
+md_col_x :: proc(c: ^Md_Table_Cache, i: int, char_w: f32) -> f32 {
+	cells := 0
+	for k in 0 ..< min(i, c.ncols) {cells += c.widths[k] + MD_TABLE_PAD}
+	return f32(cells) * char_w
+}
+
 // Colours.
 @(private = "file")
 MD_TEXT :: [4]f32{0.86, 0.90, 0.96, 1}
@@ -270,10 +448,9 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			yy := y
 			md_draw_inline(gfx, text, md_inline(content), ind + char_w * 2, x1, &x, &yy, px, char_w, line_h, MD_TEXT)
 			y = yy + line_h
-		} else if strings.contains(line, "|") && strings.count(line, "|") >= 2 {
-			// A basic table row: cells split on |, no cross-row alignment (v1).
-			if !md_is_table_sep(trimmed) {
-				md_draw_table_row(gfx, text, line, x0, x1, y, px, char_w)
+		} else if md_is_table_row(line) {
+			if c := md_table_ensure(doc, text, p); c != nil {
+				md_draw_table_row(gfx, qp, text, c, line, x0, x1, y, px, char_w, md_is_table_sep(trimmed))
 			}
 			y += line_h
 		} else {
@@ -353,17 +530,42 @@ md_is_table_sep :: proc(s: string) -> bool {
 	return strings.contains(s, "-")
 }
 
+// One row of a table, drawn at the block's cached column positions so every row
+// lines up. `qp` is needed for the header rule under the separator row, which
+// the old renderer skipped entirely.
 @(private = "file")
-md_draw_table_row :: proc(gfx: ^plat.Gfx, text: ^plat.Text, line: string, x0, x1, y, px, char_w: f32) {
-	cells := strings.split(strings.trim(line, "| "), "|", context.temp_allocator)
-	x := x0
+md_draw_table_row :: proc(
+	gfx: ^plat.Gfx,
+	qp: ^plat.Quad_Pipeline,
+	text: ^plat.Text,
+	c: ^Md_Table_Cache,
+	line: string,
+	x0, x1, y, px, char_w: f32,
+	is_sep: bool,
+) {
+	if is_sep {
+		// The separator row becomes a rule, not text.
+		w := min(md_col_x(c, c.ncols, char_w), x1 - x0)
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {w, max(sx(1), 1)}, color = MD_RULE}})
+		return
+	}
+	cells := md_split_cells(line, context.temp_allocator)
 	for cell, i in cells {
-		if x >= x1 {break}
+		if i >= c.ncols {break}
+		cx := x0 + md_col_x(c, i, char_w)
+		if cx >= x1 {break}
 		if i > 0 {
-			plat.text_draw(gfx, text, "│", x - char_w, y, px, MD_MUTED, .Doc)
+			plat.text_draw(gfx, text, "│", cx - char_w, y, px, MD_MUTED, .Doc)
 		}
-		c := strings.trim_space(cell)
-		plat.text_draw(gfx, text, c, x, y, px, MD_TEXT, .Doc)
-		x += f32(max(plat.text_cells(text, transmute([]u8)c, .Doc) + 3, 8)) * char_w
+		cw := plat.text_cells(text, transmute([]u8)cell, .Doc)
+		pad := 0
+		switch c.align[i] {
+		case .Left:
+		case .Center:
+			pad = max(0, (c.widths[i] - cw) / 2)
+		case .Right:
+			pad = max(0, c.widths[i] - cw)
+		}
+		plat.text_draw(gfx, text, cell, cx + f32(pad) * char_w, y, px, MD_TEXT, .Doc)
 	}
 }

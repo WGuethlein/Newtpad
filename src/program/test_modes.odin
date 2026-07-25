@@ -2629,6 +2629,89 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad mdtabletest` checks the two properties the old renderer lacked:
+	// every row's cells land on the same x positions, and those positions do not
+	// depend on where the viewport entered the block.
+	if os.args[1] == "mdtabletest" {
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("mdtabletest: no fonts loaded")
+			return true
+		}
+		fail := false
+		sb: strings.Builder
+		strings.builder_init(&sb, context.temp_allocator)
+		strings.write_string(&sb, "| id | name | notes |\n|:---|:----:|------:|\n")
+		for i in 0 ..< 200 {
+			fmt.sbprintf(&sb, "| %d | row %d | a much longer note cell %d |\n", i, i, i)
+		}
+		content := strings.to_string(sb)
+		doc: Document
+		doc.pt = base.pt_init(transmute([]u8)content)
+		defer base.pt_destroy(&doc.pt)
+		doc.md_mode = .Preview
+		fmt.println("mdtabletest:")
+
+		// Enter the block from three different offsets; the measure must agree.
+		offs := [3]int{0, 0, 0}
+		offs[1] = base.pt_line_start(&doc.pt, doc.pt.length / 2)
+		offs[2] = base.pt_line_start(&doc.pt, doc.pt.length - 40)
+		first: Md_Table_Cache
+		for off, k in offs {
+			// Force a cold measurement at each offset -- otherwise the first entry
+			// (offset 0, which is trivially its own true block start) would cache the
+			// whole block, and later offsets would just hit that cache without ever
+			// re-deriving the bounds, silently passing even with a broken backward
+			// scan. Entering "from a different offset" has to mean a fresh measure.
+			doc.md_table = {}
+			c := md_table_ensure(&doc, &t, off)
+			if c == nil {
+				fail = true
+				fmt.printfln("  FAIL  no table measured at offset %d", off)
+				continue
+			}
+			if k == 0 {
+				first = c^
+				fmt.printfln("  ok    measured %d cols, block [%d,%d)", c.ncols, c.start, c.end)
+				continue
+			}
+			same := c.ncols == first.ncols && c.start == first.start && c.end == first.end
+			if same {
+				for i in 0 ..< c.ncols {
+					if c.widths[i] != first.widths[i] || c.align[i] != first.align[i] {same = false}
+				}
+			}
+			if !same {fail = true}
+			fmt.printfln("  %-6s entering at %d matches the measure from 0", "ok" if same else "FAIL", off)
+		}
+		// Alignment comes from the separator row: left, centre, right.
+		if first.ncols == 3 {
+			a := first.align[0] == .Left && first.align[1] == .Center && first.align[2] == .Right
+			if !a {fail = true}
+			fmt.printfln("  %-6s separator alignments parsed", "ok" if a else "FAIL")
+		}
+		// The oversized fallback: fixed columns, which depend on nothing outside
+		// the row being drawn, so they are shift-free too.
+		ov := md_table_measure(&doc, &t, 0, doc.pt.length, true)
+		ovok := ov.ncols == 3
+		for i in 0 ..< ov.ncols {
+			if ov.widths[i] != MD_TABLE_FIXED_CELLS {ovok = false}
+		}
+		if !ovok {fail = true}
+		fmt.printfln("  %-6s oversized block uses fixed columns (%d)", "ok" if ovok else "FAIL", ov.widths[0])
+
+		// Empty leading cells survive the split: "||b|" strips one leading and one
+		// trailing pipe to "|b", which splits to ["", "b"] -- the old
+		// strings.trim(line, "| ") would have trimmed the whole prefix and lost the
+		// empty cell, collapsing this to just ["b"].
+		cells := md_split_cells("||b|", context.temp_allocator)
+		eok := len(cells) == 2 && cells[0] == "" && cells[1] == "b"
+		if !eok {fail = true}
+		fmt.printfln("  %-6s empty leading cells kept (%d cells)", "ok" if eok else "FAIL", len(cells))
+		fmt.println("mdtabletest: FAILURES" if fail else "mdtabletest: all ok")
+		return true
+	}
+
 	// `newtpad revtest` drives every mutator and requires Document.revision to
 	// advance for each. A path that bypassed it would leave caches (markdown
 	// table column widths) stale on screen with no other symptom.
