@@ -3117,6 +3117,35 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		chk(fmt.tprintf("not in Split -> zero-size rect (got %.0fx%.0f)", zdr.size.x, zdr.size.y), zdr.size.x == 0 && zdr.size.y == 0, &fail)
 		doc.md_mode = .Split
 
+		fmt.println("--- divider stops above the find/status bar ---")
+		// The find/status bar owns the bottom strip (main.odin ~535); before this,
+		// md_divider_rect's height ran the full window, so a press in that strip
+		// at the divider's x column started a spurious drag. Bound the rect to
+		// winh - doc_bottom_bar_h(doc), mirroring pvbot (main.odin ~930), and
+		// check it both with find closed (status line, the smaller bar) and open
+		// (the taller find bar) -- the bound must track doc_bottom_bar_h, not
+		// assume the smaller one.
+		bar_winw, bar_winh := f32(1280), f32(720)
+		find_states := []bool{false, true}
+		for find_active in find_states {
+			doc.find.active = find_active
+			doc.find.replace_mode = false
+			bar_h := doc_bottom_bar_h(&doc)
+			bdr := md_divider_rect(&doc, bar_winw, bar_winh, 0.5)
+			bottom := bdr.pos.y + bdr.size.y
+			want_bottom := bar_winh - bar_h
+			ok := abs(bottom - want_bottom) < 0.6
+			chk(fmt.tprintf("find.active=%v: rect bottom=%.1f stops at winh-bar_h=%.1f", find_active, bottom, want_bottom), ok, &fail)
+			// The point of the bound is the hit-test, not the drawing: a point
+			// inside the bar strip at the divider's x column must land outside
+			// the rect's y range, or a press there still starts a drag.
+			strip_y := bar_winh - bar_h*0.5 // mid-strip, well clear of rounding
+			cx := bdr.pos.x + bdr.size.x*0.5
+			inside := cx >= bdr.pos.x && cx < bdr.pos.x+bdr.size.x && strip_y >= bdr.pos.y && strip_y < bdr.pos.y+bdr.size.y
+			chk(fmt.tprintf("find.active=%v: point in bar strip at divider x is NOT in rect", find_active), !inside, &fail)
+		}
+		doc.find.active = false
+
 		fmt.println("--- drag clamp ---")
 		// Mirrors the exact expression main.odin's drag handler evaluates:
 		// clamp(mouse_x / winw, SPLIT_MIN, SPLIT_MAX).

@@ -168,13 +168,17 @@ doc_editor_right :: proc(doc: ^Document, winw, split_frac: f32) -> f32 {
 // widget, so what is drawn is exactly what is grabbable. Zero-size when the
 // document is not in Split, so callers need no second condition. Centred on
 // doc_editor_right's x -- never computed independently, or the grab band could
-// drift from the pane it is supposed to divide.
+// drift from the pane it is supposed to divide. Stops above the find/status bar
+// (doc_bottom_bar_h) -- that strip owns its own presses (main.odin), and before
+// this the divider's full-window-height hit band would steal one out from under
+// it whenever the divider's x column happened to cross the bar.
 MD_DIVIDER_W :: 6 // logical px; the visible line is thinner than the grab band
 md_divider_rect :: proc(doc: ^Document, winw, winh, split_frac: f32) -> plat.Quad {
 	if doc == nil || doc.kind != .Text || doc.md_mode != .Split {return {}}
 	er := doc_editor_right(doc, winw, split_frac)
 	w := sx(MD_DIVIDER_W)
-	return {pos = {er - w * 0.5, CHROME_TOP}, size = {w, max(0, winh - CHROME_TOP)}}
+	bot := winh - doc_bottom_bar_h(doc)
+	return {pos = {er - w * 0.5, CHROME_TOP}, size = {w, max(0, bot - CHROME_TOP)}}
 }
 
 // A new/untitled buffer (no path yet) is allowed into any view -- you don't know

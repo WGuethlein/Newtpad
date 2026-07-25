@@ -452,7 +452,7 @@ main :: proc() {
 			dvr := md_divider_rect(doc, f32(window.width), f32(window.height), app.settings.split_frac)
 			if dvr.size.x > 0 && window.mouse_pressed &&
 			   f32(window.mouse_x) >= dvr.pos.x && f32(window.mouse_x) < dvr.pos.x + dvr.size.x &&
-			   f32(window.mouse_y) >= dvr.pos.y {
+			   f32(window.mouse_y) >= dvr.pos.y && f32(window.mouse_y) < dvr.pos.y + dvr.size.y {
 				divider_drag = true
 				window.mouse_pressed = false
 			}
@@ -462,7 +462,7 @@ main :: proc() {
 				// Live during the drag so both panes track the pointer; settings_save
 				// runs on release only below -- per-WM_MOUSEMOVE saves would be
 				// hundreds of file writes for one drag.
-				app.settings.split_frac = clamp(f32(window.mouse_x) / f32(window.width), SPLIT_MIN, SPLIT_MAX)
+				app.settings.split_frac = clamp(f32(window.mouse_x) / max(1, f32(window.width)), SPLIT_MIN, SPLIT_MAX)
 			} else {
 				divider_drag = false
 				settings_save(app.settings)
@@ -556,7 +556,7 @@ main :: proc() {
 			want := plat.Cursor_Kind.Arrow
 			cx, cy := plat.window_cursor_client(window)
 			dvr := md_divider_rect(doc, f32(window.width), f32(window.height), app.settings.split_frac)
-			if divider_drag || (dvr.size.x > 0 && f32(cx) >= dvr.pos.x && f32(cx) < dvr.pos.x + dvr.size.x && f32(cy) >= dvr.pos.y) {
+			if divider_drag || (dvr.size.x > 0 && f32(cx) >= dvr.pos.x && f32(cx) < dvr.pos.x + dvr.size.x && f32(cy) >= dvr.pos.y && f32(cy) < dvr.pos.y + dvr.size.y) {
 				want = .SizeWE
 			} else if plat.key_ctrl_down() && !doc.filter {
 				if doc.table && doc.kind == .Text {

@@ -455,6 +455,8 @@ md_divider_rect :: proc(doc: ^Document, winw, winh: f32) -> plat.Quad
 
 Return a zero-size quad when the document is not in Split, so callers need no second condition.
 
+**Bound its height to the editable area**, stopping at `winh - doc_bottom_bar_h(doc)`. The find/status bar owns the bottom strip, and this quad was previously decorative — making it interactive without that bound means a click in that strip at the divider's x column starts a drag and fires a spurious `settings_save`, claiming a press the bar's own controls should have had.
+
 - [ ] **Step 3: Add the cursor kind**
 
 `Cursor_Kind` gains `.SizeWE`; `window_create` loads `IDC_SIZEWE` into `w.cursors[.SizeWE]` beside the existing three.
