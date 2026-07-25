@@ -135,8 +135,14 @@ across a rapid replace because the previous count stays on screen until a real r
 `" _"` only when `f.field == 0`. With focus on Replace the caret slot vanishes and the gap before
 `(1/24)` changes width.
 
-**Fix.** Give the caret a fixed-width slot in both focus states, and let a single separator own the
-space before the count. `info` stops carrying leading whitespace.
+**Fix.** `info` stops carrying leading whitespace, and the caret marks the focused field only —
+reserving nothing in the unfocused one.
+
+*Revised during implementation (2026-07-25).* The first attempt gave the caret a fixed-width slot in
+both states so the gap could never change. That was wrong: filling the unfocused field's slot with a
+blank makes both states agree at **two** spaces, which is the exact string from the bug report — it
+made the defect consistent instead of removing it. The accepted trade is that the count now shifts by
+one cell when focus moves between the fields, because a caret is a cursor, not a layout element.
 
 ## 4. Bug 8 — markdown preview tables
 
@@ -209,8 +215,9 @@ per-block cache above is its prerequisite, so choosing it later costs nothing al
 Wyatt's `"blender-mcp"` walk: rightward stops differ from leftward stops for the same text.
 
 **Fix.** Replace the two-class `is_word` with three classes — word / punctuation / whitespace — and
-stop at every class transition, with both directions landing on token **starts**. End of line is a
-stop. `"blender-mcp"` then yields the same stops in both directions:
+stop at every class transition, with both directions landing on token **starts**. A line break is
+whitespace, so a walk crosses it to the next token rather than stopping on it — matching the
+previous behaviour and other editors. `"blender-mcp"` then yields the same stops in both directions:
 `| " | blender | - | mcp | " |`.
 
 `doc_delete_word_back` (Ctrl+Backspace) shares `word_left_of` and inherits the new classifier;
