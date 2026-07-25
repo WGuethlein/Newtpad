@@ -283,7 +283,16 @@ theme_light :: proc() -> Theme {
 		.Text_Primary   = {0.12, 0.14, 0.19, 1}, // #1E2430 -- document text, headings, active tab (15.6:1 on white)
 		.Text_Bright    = {0.06, 0.07, 0.10, 1}, // #10131A -- bold emphasis, table header/edit text (18.7:1 on white)
 
-		.Selection_Doc  = {0.75, 0.84, 0.95, 1}, // #BFD6F2 -- pale blue; dark Text_Primary stays readable on top (10.5:1)
+		// #BFD6F2 measured 1.48:1 against Bg_Base -- the in-document text
+		// selection, drawn as an opaque quad behind unchanged Text_Primary
+		// glyphs (doc.odin:1989-2004) with NO other cue that anything is
+		// selected (no border, no text recolour), the same "the fill is the
+		// only cue" shape Selection_List had, and the single most-used
+		// highlight in the app. Darkened past the same 1.6:1 bar: this value
+		// measures 1.83:1 against Bg_Base, with Text_Primary still at 8.5:1
+		// on top of it (was 10.5:1 -- comfortably above the 4.5:1 AA text
+		// floor either way).
+		.Selection_Doc  = {0.68, 0.76, 0.85, 1}, // #ADC2D9
 		// #E1E6EE measured 1.12:1 against Bg_Panel -- menu-bar title hover, the
 		// gear hover, the dropdown item highlight, and the history selected row
 		// all use this fill with NO other cue (keyboard menu navigation has
@@ -294,7 +303,18 @@ theme_light :: proc() -> Theme {
 		.Selection_List = {0.70, 0.75, 0.84, 1}, // #B3BFD6
 		.Caret          = {0.58, 0.38, 0.00, 1}, // #946200 -- deepened gold, not lightened (see note above)
 		.Accent         = {0.54, 0.43, 0.12, 1}, // #8A6D1F -- same gold family as Caret, lower chroma for running text
-		.Find_Match_Bg  = {0.94, 0.89, 0.72, 1}, // #F0E4B8 -- pale amber wash; text drawn on top is unchanged dark fg
+		// #F0E4B8 measured 1.28:1 against Bg_Base -- find.odin's
+		// find_match_rects draws this as a dim wash behind unchanged fg text
+		// for every match but the one under the caret/selection, so most
+		// matches on screen have no cue but this fill: the same
+		// "fill-is-the-only-cue" shape as Selection_Doc/Selection_List, just
+		// not named in the original brief. Darkened past the same 1.6:1 bar:
+		// this value measures 1.64:1 against Bg_Base, staying deliberately
+		// closer to that floor than Selection_Doc's 1.83:1 so the match
+		// highlight stays visibly *dimmer* than the selection it can sit
+		// under (main.odin: "find-match highlights (dim), then the selection
+		// (bright)"). Text_Primary on top: 9.5:1 (was 12.1:1).
+		.Find_Match_Bg  = {0.84, 0.79, 0.64, 1}, // #D6C9A3 -- amber wash; text drawn on top is unchanged dark fg
 		.Link           = {0.11, 0.37, 0.66, 1}, // #1B5FA8 -- dark's #73B2FA is 2.2:1 on white; deepened to 6.5:1
 		.Warning        = {0.71, 0.28, 0.06, 1}, // #B5480F -- burnt orange, legible as status text on Bg_Panel (4.8:1)
 		.Danger         = {0.75, 0.16, 0.16, 1}, // #BF2929 -- SAME as Dark, deliberately (see note above)
