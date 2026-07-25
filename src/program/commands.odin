@@ -568,7 +568,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Delete_Word_Back:
 		doc_delete_word_back(doc)
 	case .Insert_Newline:
-		doc_insert_rune(doc, '\n')
+		doc_insert_newline(doc)
 	case .Insert_Tab:
 		// Tab arrives as WM_CHAR 0x09 too, but the char path filters control
 		// characters, so the binding is what actually inserts it.

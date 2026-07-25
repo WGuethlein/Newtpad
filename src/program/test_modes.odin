@@ -3403,6 +3403,46 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("redo x1    : %q", pre(doc_debug_string(&doc)))
 		doc_close(&doc)
 
+		// Enter must write the document's own terminator. A bare '\n' in a CRLF
+		// file silently mixes line endings, and doc.eol is only detected at open,
+		// so the status bar keeps saying CRLF and nothing tells the user.
+		nl: Document
+		nl.pt = base.pt_init(transmute([]u8)string("hello\r\nworld\r\n"))
+		defer base.pt_destroy(&nl.pt)
+		nl.eol = .CRLF
+		nl.cursor, nl.anchor = 5, 5
+		doc_insert_newline(&nl)
+		got := doc_debug_string(&nl)
+		want := "hello\r\n\r\nworld\r\n"
+		ok := got == want
+		fmt.printfln("  %-6s Enter on CRLF -> %q (want %q)", "ok" if ok else "FAIL", got, want)
+
+		// Mirror on LF: the fix must not be a hardcoded CRLF.
+		nl2: Document
+		nl2.pt = base.pt_init(transmute([]u8)string("hello\nworld\n"))
+		defer base.pt_destroy(&nl2.pt)
+		nl2.eol = .LF
+		nl2.cursor, nl2.anchor = 5, 5
+		doc_insert_newline(&nl2)
+		got2 := doc_debug_string(&nl2)
+		want2 := "hello\n\nworld\n"
+		ok2 := got2 == want2
+		fmt.printfln("  %-6s Enter on LF   -> %q (want %q)", "ok" if ok2 else "FAIL", got2, want2)
+
+		// Enter must replace an active selection exactly as doc_insert_rune does,
+		// not just splice in beside it -- otherwise Enter with a selection active
+		// behaves differently from typing any other character.
+		nl3: Document
+		nl3.pt = base.pt_init(transmute([]u8)string("hello\r\nworld\r\n"))
+		defer base.pt_destroy(&nl3.pt)
+		nl3.eol = .CRLF
+		nl3.anchor, nl3.cursor = 7, 12 // selects "world"
+		doc_insert_newline(&nl3)
+		got3 := doc_debug_string(&nl3)
+		want3 := "hello\r\n\r\n\r\n"
+		ok3 := got3 == want3
+		fmt.printfln("  %-6s Enter replaces selection -> %q (want %q)", "ok" if ok3 else "FAIL", got3, want3)
+
 	case mode == "savetest" && len(os.args) > 3:
 		outp := os.args[3]
 		doc, _ := doc_open(path)

@@ -1474,6 +1474,23 @@ doc_insert_rune :: proc(doc: ^Document, r: rune) {
 	doc_insert_text(doc, bytes[:n], .Newline if r == '\n' else .Type)
 }
 
+// Enter. Writes the document's own terminator rather than a bare LF: on a CRLF
+// file a lone '\n' mixes line endings for good, and doc.eol is detected once at
+// open, so nothing downstream notices or reports it.
+doc_insert_newline :: proc(doc: ^Document) {
+	if doc.eol == .CRLF {
+		// kind: .Newline (not the doc_insert_text default of .Paste) so undo
+		// history still reads "New line" and a following keystroke still
+		// breaks the typing run, exactly as the LF path below does.
+		doc_insert_text(doc, transmute([]u8)string("\r\n"), .Newline)
+		return
+	}
+	// .LF and .Mixed both land here: .Mixed means the file already disagrees
+	// with itself, so there is no right terminator to pick, and LF is the same
+	// harmless default detect_line_ending falls back to.
+	doc_insert_rune(doc, '\n')
+}
+
 doc_backspace :: proc(doc: ^Document) {
 	if doc_has_sel(doc) {
 		push_undo(doc, .Delete)
