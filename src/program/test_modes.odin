@@ -20,6 +20,23 @@ key_chk :: proc(got, want: Command_Id, label: string) {
 	fmt.printfln("%-22s -> %-16v %s", label, got, ok)
 }
 
+// Guard for any headless mode that writes settings.txt, session.txt, or crash
+// backups. Without NEWTPAD_SESSION_DIR set, session_dir() falls back to the
+// real %APPDATA%\Newtpad (see session_dir's own doc comment), so a bare
+// `newtpad.exe <mode>` run by hand silently overwrites the author's real
+// font/zoom/view settings or wipes the restore-session store -- including
+// unsaved-tab backups. Every mode that touches either store calls this first.
+// A documented "set NEWTPAD_SESSION_DIR first" in a comment is not a
+// constraint if nothing checks it; this is the check.
+@(private = "file")
+require_scratch_session :: proc(mode: string) -> bool {
+	if os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator) == "" {
+		fmt.printfln("%s: refusing to run without NEWTPAD_SESSION_DIR", mode)
+		return false
+	}
+	return true
+}
+
 // Run a headless test mode if argv selects one. Returns true if a mode ran (the
 // caller should then exit). `seh_install` has already run in main.
 test_mode_dispatch :: proc() -> (handled: bool) {
@@ -618,6 +635,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// `newtpad settingstest` round-trips settings.txt and checks the defaults and
 	// clamps. Set NEWTPAD_SESSION_DIR first — it writes to the session store.
 	if os.args[1] == "settingstest" {
+		if !require_scratch_session("settingstest") {return true}
 		bad := 0
 		d := settings_default()
 		fmt.printfln("defaults: restore=%v wrap=%v font=%d", d.restore_session, d.wrap_default, d.font_size)
@@ -2224,6 +2242,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// suppress a file that really did change while we were closed. So the session
 	// carries the stamp, and both directions are asserted here.
 	if os.args[1] == "diskstamptest" {
+		if !require_scratch_session("diskstamptest") {return true}
 		tmpf := fmt.tprintf("%s%cnewtpad_stamptest.txt", os.get_env("TEMP", context.temp_allocator), '\\')
 		plat.file_write_atomic(tmpf, transmute([]u8)string("original content\n"))
 		bad := 0
@@ -2318,6 +2337,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// NEWTPAD_SESSION_DIR to a temp dir first — without it this writes to, and
 	// then resets, the real session under %APPDATA%\Newtpad.
 	if os.args[1] == "sessiontest" {
+		if !require_scratch_session("sessiontest") {return true}
 		tmpf := fmt.tprintf("%s%cnewtpad_sesstest.txt", os.get_env("TEMP", context.temp_allocator), '\\')
 		plat.file_write_atomic(tmpf, transmute([]u8)string("clean file content\nsecond line"))
 		a: App
@@ -2356,6 +2376,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// session didn't reference, destroying unsaved scratch buffers. Set
 	// NEWTPAD_SESSION_DIR to a temp dir before running.
 	if os.args[1] == "sessionlosstest" && len(os.args) > 2 {
+		if !require_scratch_session("sessionlosstest") {return true}
 		file := os.args[2]
 		SCRATCH :: "precious unsaved work"
 
@@ -3153,6 +3174,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// Set NEWTPAD_SESSION_DIR to a temp dir first -- this reads/writes
 	// settings.txt and drives session_save/session_restore.
 	if os.args[1] == "viewmemtest" {
+		if !require_scratch_session("viewmemtest") {return true}
 		t: plat.Text
 		if !plat.text_load_faces(&t) {
 			fmt.eprintln("viewmemtest: no fonts loaded")
@@ -3316,6 +3338,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// comparison would miss. Also covers the drag clamp and that the fraction
 	// actually reaches the things that are supposed to derive from it.
 	if os.args[1] == "splittest" {
+		if !require_scratch_session("splittest") {return true}
 		fail := false
 		chk :: proc(label: string, ok: bool, fail: ^bool) {
 			if !ok {fail^ = true}
