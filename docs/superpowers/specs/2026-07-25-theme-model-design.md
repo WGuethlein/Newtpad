@@ -51,8 +51,9 @@ should be commented as such so nobody deletes them as dead.
 
 ## Two built-in themes, and the light one is the point
 
-**Dark** reproduces today's appearance exactly. **Light** is the second, and it is not a bonus — it
-is the test that can fail.
+**Dark** is today's appearance, consolidated per the merge table below — close enough that nothing
+should look *wrong*, but deliberately not pixel-identical. **Light** is the second, and it is not a
+bonus — it is the test that can fail.
 
 Building only a dark theme proves nothing: every colour in the tree was chosen against a dark
 background, so a dark-only theme model is indistinguishable from a rename. A light background is what
@@ -135,7 +136,9 @@ Headless `themetest`:
 - **every role is set in every built-in theme** — a zero-value entry is `{0,0,0,0}`, i.e. transparent
   black, which would render as an invisible hole rather than an obvious error. The total-array type
   guarantees a slot exists; it cannot guarantee somebody filled it in;
-- Dark's value for each role equals the literal it replaced (the regression guard above);
+- Dark's value for each role is one of the literals the merge table says that role absorbs — so a
+  role can only ever hold a colour that genuinely appeared in the pre-migration UI, and a typo'd
+  digit produces a value on no list and fails;
 - a `.theme` file round-trips;
 - an unknown role name in a file is ignored, not fatal;
 - a malformed colour (`#zzz`, `#12`, missing `#`) falls back to the built-in rather than to black;

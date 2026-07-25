@@ -47,15 +47,13 @@ No migration in this task. Nothing changes on screen.
 - `g_theme: Theme`
 - `theme_dark :: proc() -> Theme`
 
-- [ ] **Step 1: Derive the role list from the existing literals**
+- [ ] **Step 1: Use the merge table from the spec**
 
-Do not invent roles. Walk every colour literal in `src/program/` and name what it is *for*. Three sources already show the structure and should be followed rather than replaced:
+**The role list is already decided — do not re-derive it.** The spec's "role table" section fixes 25 roles and names exactly which literals each absorbs. It came from clustering all 61 distinct values by chroma and luminance, and a faithful one-role-per-literal alternative (66 roles) was measured and rejected as unauthorable.
 
-- `ui_tabs.odin:27-29` — a three-entry array already commented `// strip background`, `// inactive tab`, `// active tab`.
-- `markdown.odin:404-420` — ten already-named roles (`MD_TEXT`, `MD_HEAD`, `MD_BOLD`, `MD_ITALIC`, `MD_CODE`, `MD_QUOTE`, `MD_MUTED`, `MD_CODEBG`, `MD_RULE`, and `LINK_COL` in `doc.odin:2158`).
-- Repeated values that reveal a shared role: `{0.16,0.18,0.22}` is the scrollbar track in three places, `{0.42,0.48,0.60}` the thumb in three, `{0.95,0.88,0.55}` the find-bar accent in three, `{0.09,0.11,0.16}` the gutter/preview background in two.
+Your job in this step is to turn that table into the enum and record, per role, **which member of the merged set becomes its value** — generally the one with the most call sites, so the fewest pixels move. Record that choice per role in your report; it is the one judgement left in this step.
 
-Where one literal serves two genuinely different purposes, that is **two roles with the same Dark value** — the point of the model is that Light can separate them.
+Where the spec's table and the code disagree — a literal in the tree that appears in no row — stop and report it rather than inventing a home for it.
 
 Also declare, unused, the roles batch 4 will need: `Syn_Keyword`, `Syn_String`, `Syn_Number`, `Syn_Comment`, `Syn_Type`, `Syn_Punct`, `Syn_Json_Key`, `Syn_Xml_Tag`, `Syn_Xml_Attr`. **Comment them as deliberately unused until syntax highlighting lands**, or the next reader deletes them as dead.
 
@@ -79,16 +77,16 @@ g_theme: Theme
 
 Add an `#assert` tying the theme's length to the enum, mirroring how `command_table`'s length is asserted in `commands.odin`.
 
-- [ ] **Step 3: Populate Dark from the existing literals**
+- [ ] **Step 3: Populate Dark from the merge table**
 
-Transcribe each literal into its role. **This transcription is the whole risk of the batch** — a transposed digit is invisible in review and obvious in use. Copy carefully, one at a time.
+Each role takes the value you chose in Step 1. **This transcription is the whole risk of the batch** — a transposed digit is invisible in review and obvious in use. Copy one at a time.
 
 - [ ] **Step 4: Write `themetest`**
 
 Path-less mode beside `rowtest`. Assert:
 
 - every role in Dark is non-zero (catches an unfilled slot — see the zero-is-initialization note);
-- Dark's value for each role equals the literal it replaces. **Transcribe the expected values into the test independently from the pre-migration source, not by copying from `theme_dark`** — copying from the theme would make the test agree with a typo rather than catch it. The reviewer verifies the transcription against `git show`.
+- **every role's Dark value is one of the literals the spec's table says that role absorbs.** Encode the absorbed sets as data in the test and check membership. This is the replacement for the old pixel-identical guard: a role can only ever hold a colour that genuinely appeared in the pre-migration UI, so a typo'd digit produces a value on no list and fails, while an intended merge passes. Transcribe the absorbed sets from the **spec table**, not from `theme_dark` — copying from the theme would make the test agree with a typo instead of catching it.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -119,7 +117,7 @@ The hot path. `doc.odin` and `main.odin`, ~23 literals.
 build.bat && build\newtpad.exe themetest && build\newtpad.exe rowtest && build\newtpad.exe crlftest && build\newtpad.exe mdtabletest && build\newtpad.exe splittest
 ```
 
-`themetest` is what proves the values are unchanged. The others prove the geometry still works.
+`themetest` proves every role still holds a colour that genuinely appeared in the pre-migration UI. The others prove the geometry still works.
 
 **Confirm no literal was missed:** after this task `grep -cE '\{[01]?\.?[0-9]*, *[01]?\.?[0-9]*, *[01]?\.?[0-9]*, *[01](\.[0-9]+)?\}' src/program/doc.odin src/program/main.odin` should be 0 for colours. Report any remaining match and why it is not a colour.
 
@@ -218,4 +216,4 @@ git commit -m "Load themes from disk and pick one in Settings"
 - [ ] Bump `src/program/version.odin`
 - [ ] HANDOFF entry: the role model, what Light exposed, and any role that had to be split
 - [ ] **Run `install.ps1`** — standing instruction. Check `Get-Process newtpad` first; do **not** use `-Force` if it is running, since a hard kill can skip the hot-exit session write.
-- [ ] **Wyatt's live pass:** Dark must be pixel-identical to what he uses today — if anything looks different, the migration is wrong, and that is the single most useful thing he can check. Then Light, looking for text that vanishes, borders that disappear, or a caret he cannot find.
+- [ ] **Wyatt's live pass:** Dark is *deliberately* not pixel-identical — ~50 sites shift slightly as part of the 66-to-25 consolidation. So the check is not "did anything change" but "does anything look **wrong**": a label that lost contrast, a border that vanished, two things that used to be distinguishable now reading the same. Then Light, looking for text that vanishes, borders that disappear, or a caret he cannot find.
