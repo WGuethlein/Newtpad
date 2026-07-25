@@ -92,8 +92,12 @@ test_word_left_stops :: proc(t: ^testing.T) {
 	testing.expect_value(t, pt_word_left(&pt, 1), 0)
 }
 
+// A line break is whitespace like any other, so word nav walks over it onto
+// the next line rather than stopping there -- matching the previous code and
+// every other editor. (Renamed from test_word_nav_stops_at_line_end, which
+// claimed the opposite of what this asserts.)
 @(test)
-test_word_nav_stops_at_line_end :: proc(t: ^testing.T) {
+test_word_nav_crosses_line_breaks :: proc(t: ^testing.T) {
 	pt := pt_init(transmute([]u8)string("foo\nbar"))
 	defer pt_destroy(&pt)
 	testing.expect_value(t, pt_word_right(&pt, 0), 4) // over the break, onto "bar"

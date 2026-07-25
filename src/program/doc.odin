@@ -889,6 +889,7 @@ doc_recover_from_fault :: proc(doc: ^Document) {
 	doc.original = priv
 	doc.owned_orig = true
 	doc.pt.original = priv // pieces index by offset, so this repoint is transparent
+	doc.revision += 1 // faulted pages came back as zeros: real content change
 	plat.file_close(&doc.fv) // unmaps and zeroes fv
 	doc.recovered = true
 	doc.modified = true // buffer differs from disk; don't let a save look clean
