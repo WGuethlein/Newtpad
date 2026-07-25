@@ -2086,7 +2086,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		short_wrapped := false
 		it := visible_begin(&doc, &t, rows)
 		for {
-			_, start, _, _, wrapped, ok := visible_next(&it)
+			_, start, _, _, _, wrapped, ok := visible_next(&it)
 			if !ok {break}
 			if wrapped {wrapped_rows += 1}
 			if wrapped && start < 6 {short_wrapped = true} // the "short" line region
@@ -2121,7 +2121,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		hd.view_rows = 5
 		hd.top = base.pt_line_end_cap(&hd.pt, 0, RENDER_LINE_CAP) // a mid-line segment
 		it2 := visible_begin(&hd, &t, 5)
-		if _, _, _, _, w0, ok2 := visible_next(&it2); ok2 && w0 {
+		if _, _, _, _, _, w0, ok2 := visible_next(&it2); ok2 && w0 {
 			fmt.println("  FAIL: a >256KB line wrapped (should stay a capped no-wrap row)")
 			bad += 1
 		}
@@ -2515,7 +2515,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			caret_row := -1
 			it := visible_begin(&doc, t, 10)
 			for {
-				row, start, end, line_end, _, ok := visible_next(&it)
+				row, start, end, _, line_end, _, ok := visible_next(&it)
 				if !ok {break}
 				rows += 1
 				if doc.cursor >= start && doc.cursor <= end && (line_end || doc.cursor < end) {
@@ -2605,6 +2605,73 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			)
 		}
 		fmt.println("rowtest: FAILURES" if fail else "rowtest: all ok")
+		return true
+	}
+
+	// `newtpad crlftest` checks every consumer of a row agrees where it ends.
+	// Comparing against a constant would pass with the bug present, because the
+	// text draw already stripped the CR; the point is that the caret, the
+	// hit-test, the selection and the wrap budget did not.
+	if os.args[1] == "crlftest" {
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("crlftest: no fonts loaded")
+			return true
+		}
+		fail := false
+		chk :: proc(label: string, got, want: int, fail: ^bool) {
+			ok := got == want
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %-34s got=%d want=%d", "ok" if ok else "FAIL", label, got, want)
+		}
+		content := "hello\r\nworld\r\n"
+		doc: Document
+		doc.pt = base.pt_init(transmute([]u8)content)
+		defer base.pt_destroy(&doc.pt)
+		doc.eol = .CRLF
+		doc.view_cols = 40
+		px := f32(16) // document text size; render_frame computes this from zoom/DPI
+		cw := plat.text_char_width(&t, px, .Doc)
+		fmt.println("crlftest:")
+
+		// Row 0 is "hello": vis_end must be the offset of the CR, not of the LF.
+		it := visible_begin(&doc, &t, 5)
+		_, start, end, vis_end, _, _, _ := visible_next(&it)
+		chk("row 0 start", start, 0, &fail)
+		chk("row 0 end (structural, at LF)", end, 6, &fail)
+		chk("row 0 vis_end (before CR)", vis_end, 5, &fail)
+
+		// End key must land on the content end, not between CR and LF.
+		doc.cursor, doc.anchor = 0, 0
+		doc_cursor_end(&doc, false)
+		chk("End key lands at", doc.cursor, 5, &fail)
+
+		// Status column at end of line: "hello" is 5 cells, so Col is 6, not 7.
+		chk("Col at end of line", doc_cursor_col(&doc, &t), 6, &fail)
+
+		// Right-arrow from the content end crosses the whole CRLF in one step.
+		doc_cursor_right(&doc, false)
+		chk("Right from EOL skips CRLF", doc.cursor, 7, &fail)
+
+		// Left-arrow back over the break returns to the content end, not the CR.
+		doc_cursor_left(&doc, false)
+		chk("Left over CRLF returns to", doc.cursor, 5, &fail)
+
+		// A click far to the right of the text clamps to the content end.
+		chk("click past EOL clamps to", doc_pos_at(&doc, &t, i32(cw * 30), 0, px, cw, 5), 5, &fail)
+
+		// Selecting the whole first line stops at the content end.
+		doc.anchor, doc.cursor = 0, 5
+		nq := doc_selection_rects(&doc, &t, px, cw, 5, make([]plat.Quad, 8, context.temp_allocator))
+		chk("selection rects for line 0", nq, 1, &fail)
+
+		// The wrap budget must not spend a cell on the CR: at 5 cells, "hello"
+		// fits exactly on one row rather than pushing a character to the next.
+		we, wle := wrap_row_end(&doc, &t, 0, 5)
+		chk("wrap_row_end at 5 cells", we, 6, &fail)
+		chk("wrap_row_end line_end", 1 if wle else 0, 1, &fail)
+
+		fmt.println("crlftest: FAILURES" if fail else "crlftest: all ok")
 		return true
 	}
 
