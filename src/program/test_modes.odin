@@ -3381,19 +3381,55 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 		doc.find.active = false
 
+		fmt.println("--- divider grab band vs. scrollbar hit region ---")
+		// The point checked is the grab band's LEFT edge, not its drawn-line
+		// center: the old scrollbar hit-test was `mouse_x < ed_right` (strictly
+		// less), so the center point (== ed_right exactly) was never inside it
+		// even with the bug present -- only the left half of the band, where a
+		// press aiming at the line but landing a pixel or two short used to
+		// land, was ever actually swallowed. Checking the center would pass
+		// whether or not the fix is in place, which is the same rect-vs-rect
+		// blindness that let this ship: md_divider_rect never changed, only the
+		// scrollbar's competing claim did, so this has to test an actual point
+		// against both regions, the way a click does, and it has to be a point
+		// the bug really mis-served.
+		for winw in widths {
+			for frac in fracs {
+				er := doc_editor_right(&doc, winw, frac)
+				dr := md_divider_rect(&doc, winw, 720, frac)
+				band_left := dr.pos.x // left edge of the grab band
+				in_divider := band_left >= dr.pos.x && band_left < dr.pos.x+dr.size.x
+				sb_lo, sb_hi := editor_scrollbar_hit_x(&doc, er)
+				in_scrollbar := band_left >= sb_lo && band_left < sb_hi
+				chk(
+					fmt.tprintf("winw=%.0f frac=%.2f  grab-band left edge x=%.1f in divider rect and outside scrollbar hit region", winw, frac, band_left),
+					in_divider && !in_scrollbar,
+					&fail,
+				)
+			}
+		}
+
 		fmt.println("--- drag clamp ---")
-		// Mirrors the exact expression main.odin's drag handler evaluates:
-		// clamp(mouse_x / winw, SPLIT_MIN, SPLIT_MAX).
+		// split_frac_at is the exact proc main.odin's drag handler calls -- not
+		// a second copy of clamp(mx/winw, SPLIT_MIN, SPLIT_MAX), which would
+		// test Odin's clamp builtin rather than this code (report finding 6).
 		winw := f32(1000)
-		lo := clamp(f32(10) / winw, SPLIT_MIN, SPLIT_MAX) // drag to x=10 (0.01)
-		hi := clamp(f32(990) / winw, SPLIT_MIN, SPLIT_MAX) // drag to x=990 (0.99)
+		lo := split_frac_at(10, winw) // drag to x=10 (0.01), below SPLIT_MIN
+		hi := split_frac_at(990, winw) // drag to x=990 (0.99), above SPLIT_MAX
 		chk(fmt.tprintf("drag to 0.01 clamps to SPLIT_MIN (%.2f -> %.3f)", SPLIT_MIN, lo), lo == SPLIT_MIN, &fail)
 		chk(fmt.tprintf("drag to 0.99 clamps to SPLIT_MAX (%.2f -> %.3f)", SPLIT_MAX, hi), hi == SPLIT_MAX, &fail)
-		// Panes never invert: the editor's right edge at the low clamp must stay
-		// left of the right edge at the high clamp.
-		er_lo := doc_editor_right(&doc, winw, lo)
-		er_hi := doc_editor_right(&doc, winw, hi)
-		chk(fmt.tprintf("panes don't invert (er@min=%.0f < er@max=%.0f)", er_lo, er_hi), er_lo < er_hi, &fail)
+		// Panes never invert. Deliberately NOT lo/hi above: both clamp to the
+		// SPLIT_MIN/SPLIT_MAX constants, so comparing doc_editor_right at those
+		// two only proves SPLIT_MIN < SPLIT_MAX -- true regardless of whether
+		// the drag math is right. Two distinct, UNclamped fractions instead
+		// exercise the real mx/winw division: a swapped or inverted expression
+		// would produce equal or backwards results here.
+		mid_lo := split_frac_at(200, winw) // 0.2, inside [SPLIT_MIN, SPLIT_MAX]
+		mid_hi := split_frac_at(800, winw) // 0.8, inside [SPLIT_MIN, SPLIT_MAX]
+		chk(fmt.tprintf("unclamped fractions differ (x=200 -> %.2f, x=800 -> %.2f)", mid_lo, mid_hi), mid_lo < mid_hi, &fail)
+		er_lo := doc_editor_right(&doc, winw, mid_lo)
+		er_hi := doc_editor_right(&doc, winw, mid_hi)
+		chk(fmt.tprintf("panes don't invert (er@0.2=%.0f < er@0.8=%.0f)", er_lo, er_hi), er_lo < er_hi, &fail)
 
 		fmt.println("--- everything downstream of the fraction moves ---")
 		// If either of these stopped changing, something upstream reverted to

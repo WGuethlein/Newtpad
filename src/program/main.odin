@@ -415,7 +415,14 @@ main :: proc() {
 		// the preview's own scrollbar lives. (Otherwise the gutter would be live where
 		// no bar exists — empty buffer, filter view — swallowing last-column clicks.)
 		scrollbar_shown := doc.pt.length > 0 && !doc.filter
-		if scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= ed_right - SCROLLBAR_W && f32(window.mouse_x) < ed_right && window.mouse_y >= i32(CHROME_TOP) {
+		// In Markdown Split, md_divider_rect's grab band straddles ed_right by
+		// design (the drawn accent line sits centred on it too). Left uncapped,
+		// this check -- tested first -- claimed the left half of that band,
+		// leaving the divider grabbable only on its right half while the drawn
+		// line still looked centred. editor_scrollbar_hit_x cedes the divider's
+		// left half back to it, so the reachable band matches the drawn line.
+		scrollbar_lo, scrollbar_hi := editor_scrollbar_hit_x(doc, ed_right)
+		if scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= scrollbar_lo && f32(window.mouse_x) < scrollbar_hi && window.mouse_y >= i32(CHROME_TOP) {
 			scrollbar_drag = true
 			window.mouse_pressed = false
 		}
@@ -445,9 +452,9 @@ main :: proc() {
 		// Markdown Split's divider. Checked before the text-selection drag below
 		// (sel_dragging), or a press here would fall through and start selecting
 		// the preview/editor text instead of resizing. After the scrollbar checks
-		// above, though: the grab band overlaps the editor scrollbar's rightmost
-		// few pixels by design (MD_DIVIDER_W straddles ed_right), and the
-		// scrollbar was here first.
+		// above, though: MD_DIVIDER_W straddles ed_right, and editor_scrollbar_hit_x
+		// already ceded the divider's left half back to it, so the two no longer
+		// compete over the same pixels.
 		{
 			dvr := md_divider_rect(doc, f32(window.width), f32(window.height), app.settings.split_frac)
 			if dvr.size.x > 0 && window.mouse_pressed &&
@@ -462,7 +469,7 @@ main :: proc() {
 				// Live during the drag so both panes track the pointer; settings_save
 				// runs on release only below -- per-WM_MOUSEMOVE saves would be
 				// hundreds of file writes for one drag.
-				app.settings.split_frac = clamp(f32(window.mouse_x) / max(1, f32(window.width)), SPLIT_MIN, SPLIT_MAX)
+				app.settings.split_frac = split_frac_at(f32(window.mouse_x), f32(window.width))
 			} else {
 				divider_drag = false
 				settings_save(app.settings)

@@ -181,6 +181,28 @@ md_divider_rect :: proc(doc: ^Document, winw, winh, split_frac: f32) -> plat.Qua
 	return {pos = {er - w * 0.5, CHROME_TOP}, size = {w, max(0, bot - CHROME_TOP)}}
 }
 
+// The editor scrollbar's clickable x-range at the current doc_editor_right.
+// In Markdown Split it stops MD_DIVIDER_W/2 short of ed_right, ceding
+// md_divider_rect's grab band (which straddles ed_right) instead of competing
+// with it for the same pixels -- the full window edge otherwise. One proc so
+// main.odin's hit-test and splittest's assertion on it agree on the same
+// boundary rather than the test re-deriving a second copy.
+editor_scrollbar_hit_x :: proc(doc: ^Document, ed_right: f32) -> (lo, hi: f32) {
+	hi = ed_right - sx(MD_DIVIDER_W) * 0.5 if doc.md_mode == .Split else ed_right
+	return ed_right - SCROLLBAR_W, hi
+}
+
+// The drag fraction for a divider-drag mouse x at window width winw -- the
+// same expression main.odin's WM_MOUSEMOVE handler evaluates while
+// divider_drag is live, factored out so splittest calls the real computation
+// instead of a second copy of it. A test that re-evaluates its own copy of an
+// expression and asserts on the copy tests the language's clamp, not this
+// code (see the report on this finding). max(1, winw) matches main.odin's own
+// guard against a zero-width window.
+split_frac_at :: proc(mx, winw: f32) -> f32 {
+	return clamp(mx / max(1, winw), SPLIT_MIN, SPLIT_MAX)
+}
+
 // A new/untitled buffer (no path yet) is allowed into any view -- you don't know
 // what it will become. A saved file only gets the view its extension fits.
 @(private = "file")
