@@ -2778,6 +2778,103 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			}
 		}
 
+		// Task 7 / Important 1 regression: `oversize` (and the widths that ride on
+		// it, since the oversize branch fixes every column at MD_TABLE_FIXED_CELLS)
+		// must not depend on which offset entered the block. Lower the budget so
+		// this ~9.3 KB fixture lands in (K, 2K] -- too big to ever be "small enough"
+		// but too small to always trip both directions regardless of entry. That
+		// band is exactly where the old per-guard `oversize` flipped with the entry
+		// point: near-top entries tripped only the backward guard, near-bottom only
+		// the forward one, mid-block entries could trip neither.
+		{
+			saved := md_table_budget
+			md_table_budget = 6000 // K; fixture is ~9.3 KB, so K < B <= 2K
+			doc.md_table = {}
+			c0 := md_table_ensure(&doc, &t, offs[0])
+			c0v := c0^
+			doc.md_table = {}
+			c1 := md_table_ensure(&doc, &t, offs[1])
+			c1v := c1^
+			md_table_budget = saved
+			same := c0v.oversize == c1v.oversize && c0v.ncols == c1v.ncols
+			if same {
+				for i in 0 ..< c0v.ncols {
+					if c0v.widths[i] != c1v.widths[i] {same = false}
+				}
+			}
+			if !same {fail = true}
+			fmt.printfln(
+				"  %-6s entry-independent oversize: off=0 oversize=%v ncols=%d widths=%v | off=%d oversize=%v ncols=%d widths=%v",
+				"ok" if same else "FAIL",
+				c0v.oversize,
+				c0v.ncols,
+				c0v.widths[:c0v.ncols],
+				offs[1],
+				c1v.oversize,
+				c1v.ncols,
+				c1v.widths[:c1v.ncols],
+			)
+		}
+
+		// Task 7 / Important 2 regression: the byte budget alone does not bound the
+		// SCAN work on short rows. Lower the row cap far below this fixture's 200
+		// data rows (the byte budget stays at its 1 MB default, well clear of the
+		// ~9.3 KB fixture) and enter at the very first row, so the backward
+		// direction is free (0 rows to walk) and the forward direction is the one
+		// that must give up after md_table_max_rows rows rather than reading all of
+		// them.
+		{
+			saved := md_table_max_rows
+			md_table_max_rows = 50
+			doc.md_table = {}
+			c := md_table_ensure(&doc, &t, offs[0])
+			md_table_max_rows = saved
+			ok := c != nil && c.oversize && (c.end - c.start) < len(content) / 2
+			if !ok {fail = true}
+			if c != nil {
+				fmt.printfln(
+					"  %-6s row cap trips: oversize=%v window=%d bytes (fixture=%d, cap=50 rows)",
+					"ok" if ok else "FAIL",
+					c.oversize,
+					c.end - c.start,
+					len(content),
+				)
+			} else {
+				fail = true
+				fmt.println("  FAIL  row cap trip: no table measured")
+			}
+		}
+
+		// The row cap has the identical entry-dependence trap as Important 1, one
+		// level down: capping each direction's row COUNT independently reproduces
+		// the same flip unless the total is also checked once both scans complete
+		// without tripping (see the `total_rows` comment in md_table_bounds). This
+		// fixture has 202 physical block rows (header + separator + 200 data
+		// rows); with the row cap between R/2 and R, entering at the very first row
+		// trips the forward direction's own count on its own, but entering
+		// mid-block lets BOTH directions finish under the cap individually --
+		// exactly the case the `total_rows` check exists for.
+		{
+			saved := md_table_max_rows
+			md_table_max_rows = 120
+			doc.md_table = {}
+			edge := md_table_ensure(&doc, &t, offs[0])
+			edge_ov := edge != nil && edge.oversize
+			doc.md_table = {}
+			mid := md_table_ensure(&doc, &t, offs[1])
+			mid_ov := mid != nil && mid.oversize
+			md_table_max_rows = saved
+			ok := edge_ov && mid_ov
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s row-count entry-independence: off=0 oversize=%v | off=%d oversize=%v (cap=120 rows, block=202 rows)",
+				"ok" if ok else "FAIL",
+				edge_ov,
+				offs[1],
+				mid_ov,
+			)
+		}
+
 		// Empty leading cells survive the split: "||b|" strips one leading and one
 		// trailing pipe to "|b", which splits to ["", "b"] -- the old
 		// strings.trim(line, "| ") would have trimmed the whole prefix and lost the

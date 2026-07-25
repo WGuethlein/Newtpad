@@ -91,10 +91,32 @@ MD_TABLE_MAX_COLS :: 32
 MD_TABLE_FIXED_CELLS :: 16 // fixed column width past the budget
 MD_TABLE_PAD :: 2 // cells of gap between columns
 
+// The byte budget alone does not bound the WORK of finding a block's edges: a
+// renamed CSV with 20-byte rows and the 1 MB budget is ~50k short rows in each
+// direction, each costing a capped line-start scan plus a capped line-end scan
+// (two 4 KB pt_reads and a treap descent apiece) before the byte guard ever
+// trips. This caps the row COUNT per direction the same way MD_TABLE_BUDGET
+// caps the byte span per direction, so the expensive scan itself is bounded
+// even on pathologically short rows.
+MD_TABLE_MAX_ROWS :: 4096
+
+// md_table_bounds derives `oversize` from the byte budget and MD_TABLE_MAX_ROWS
+// together (see the entry-dependence comment in md_table_bounds). If the budget
+// were not comfortably larger than one capped line, the forward scan's very
+// first guard check (against the entry row's own length) could trip before a
+// single neighbour row is examined, collapsing the cache window to one row
+// regardless of the true block size.
+#assert(MD_TABLE_BUDGET > RENDER_LINE_CAP)
+
 // Runtime copy of MD_TABLE_BUDGET. Production code never changes it; mdtabletest
 // lowers it to drive md_table_bounds into the oversize path on a normal-sized
 // fixture instead of needing a real >1 MB buffer to build and scan.
 md_table_budget := MD_TABLE_BUDGET
+
+// Runtime copy of MD_TABLE_MAX_ROWS, mirroring md_table_budget: production code
+// never changes it; mdtabletest lowers it to drive the row-count guard on a
+// normal-sized fixture instead of needing thousands of rows built and scanned.
+md_table_max_rows := MD_TABLE_MAX_ROWS
 
 // Four slots, not one: rows draw top-to-bottom, so with two table blocks on
 // screen a single slot ends every frame holding the lower block and misses on
@@ -151,14 +173,18 @@ md_cell_align :: proc(cell: string) -> Md_Align {
 	return .Left
 }
 
-// Read one line at `p` into `buf`, trailing CR removed. Returns the line and the
-// offset of its end (at the newline, or the buffer end).
+// Read one line at `p` into `buf`, trailing CR removed. Returns the line, the
+// offset of its end (at the newline, or the buffer end), and whether that end
+// is a synthetic RENDER_LINE_CAP break rather than a real newline or EOF — a
+// single row longer than the cap, which the caller must treat as a truncation
+// of its own scan, not a real line boundary.
 @(private = "file")
-md_line_at :: proc(doc: ^Document, p: int, buf: []u8) -> (line: string, end: int) {
+md_line_at :: proc(doc: ^Document, p: int, buf: []u8) -> (line: string, end: int, capped: bool) {
 	end = base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+	capped = end < doc.pt.length && end - p >= RENDER_LINE_CAP
 	n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
 	if n > 0 && buf[n - 1] == '\r' {n -= 1}
-	return string(buf[:n]), end
+	return string(buf[:n]), end, capped
 }
 
 // The contiguous run of table rows containing `p`. Scans backward to the block's
@@ -167,7 +193,7 @@ md_line_at :: proc(doc: ^Document, p: int, buf: []u8) -> (line: string, end: int
 @(private = "file")
 md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, ok: bool) {
 	buf: [RENDER_LINE_CAP]u8
-	line, lend := md_line_at(doc, p, buf[:])
+	line, lend, entry_capped := md_line_at(doc, p, buf[:])
 	if !md_is_table_row(line) {return 0, 0, false, false}
 	start, end = p, lend
 
@@ -182,31 +208,71 @@ md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, o
 	//     subsequent row misses, and the fallback becomes the most expensive path.
 	// A window measured from `p` gives at least a budget's worth of cached rows
 	// ahead of the viewport in both directions.
+	//
+	// A third trap, found after those two: `oversize` must NOT be "did a guard
+	// fire while scanning", because which guard fires depends on `x = p - S`, the
+	// entry offset within the block. For a block of size K < B <= 2K (K the
+	// budget), entering near the top trips only the backward guard, entering near
+	// the bottom trips only the forward one, and entering mid-block can trip
+	// NEITHER — same block, three different answers depending on where the
+	// viewport happened to land, which is exactly the scroll-dependent shift this
+	// cache exists to prevent. So each direction only records that it was
+	// truncated (`trunc_back` / `trunc_fwd`); `oversize` is derived once, after
+	// both scans finish, from the window they produced — entry-independent by
+	// construction (see the callers' case analysis over B in the batch-1 report).
+	trunc_back, trunc_fwd := false, entry_capped
 	q := p
+	back_rows := 0
 	for q > 0 {
-		if p - q > md_table_budget {oversize = true;break}
+		if p - q > md_table_budget {trunc_back = true;break}
 		// pt_line_start is UNCAPPED: on a file with one enormous line containing
 		// pipes it scans to byte 0 by itself. A non-exact result means the cap was
 		// reached, which is a block boundary for our purposes.
 		ps, exact := base.pt_line_start_cap(&doc.pt, q - 1, RENDER_LINE_CAP)
-		if !exact {oversize = true;break}
-		pl, _ := md_line_at(doc, ps, buf[:])
+		if !exact {trunc_back = true;break}
+		// md_line_at's own cap: `ps` is a real line start (exact, above), but the
+		// line it starts may still run past RENDER_LINE_CAP before its own
+		// newline — a single row longer than the cap, the same failure this
+		// fixes on the forward side below.
+		pl, _, pl_capped := md_line_at(doc, ps, buf[:])
 		if !md_is_table_row(pl) {break}
+		if pl_capped {trunc_back = true}
+		back_rows += 1
 		start = ps
 		q = ps
+		if back_rows > md_table_max_rows {trunc_back = true;break}
 	}
 
-	// Forward.
+	// Forward. Requires MD_TABLE_BUDGET > RENDER_LINE_CAP (asserted at the
+	// constant) — otherwise this first check could trip on the entry row's own
+	// length alone, before a single neighbour row is scanned, reproducing the
+	// one-row cache window the comment above already names.
 	r := lend
+	fwd_rows := 0
 	for r < doc.pt.length {
-		if r - p > md_table_budget {oversize = true;break}
+		if r - p > md_table_budget {trunc_fwd = true;break}
 		ns := r + 1
 		if ns > doc.pt.length {break}
-		nl, ne := md_line_at(doc, ns, buf[:])
+		nl, ne, ne_capped := md_line_at(doc, ns, buf[:])
 		if !md_is_table_row(nl) {break}
+		if ne_capped {trunc_fwd = true}
+		fwd_rows += 1
 		end = ne
 		r = ne
+		if fwd_rows > md_table_max_rows {trunc_fwd = true;break}
 	}
+
+	// A row-count analogue of the same entry-dependence trap: if neither
+	// direction's row cap trips, both scans ran to the block's true edges, so
+	// `back_rows + fwd_rows + 1` IS the block's real total row count — entry-
+	// independent — and must be checked against the cap too. Without this, a
+	// block with, say, 200 short rows and a row cap of 120 would report oversize
+	// when entered near either edge (one direction's own count exceeds 120) but
+	// NOT when entered near the middle (each direction sees ~100, under the cap,
+	// even though the block has 200 rows total) — the identical flip Important 1
+	// fixes, one level down.
+	total_rows := back_rows + fwd_rows + 1
+	oversize = trunc_back || trunc_fwd || (end - start) > md_table_budget || total_rows > md_table_max_rows
 	return start, end, oversize, true
 }
 
@@ -214,7 +280,12 @@ md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, o
 // Returns the populated cache; caller owns storage.
 //
 // Package-visible rather than file-private so the mdtabletest mode can drive the
-// oversized path directly, without needing a >1 MB fixture to trip the budget.
+// O(1) oversized branch directly with `oversize=true`, without needing a real
+// >1 MB fixture. That direct call bypasses md_table_bounds entirely, so it does
+// NOT exercise how `oversize` gets set — two Criticals hid for a round behind
+// exactly that gap. The bounds drive-through (lowering md_table_budget so a
+// normal-sized fixture trips the real guards) is what actually tests oversize
+// detection; this export is only for the measurement branch below it.
 md_table_measure :: proc(doc: ^Document, t: ^plat.Text, start, end: int, oversize: bool) -> Md_Table_Cache {
 	c := Md_Table_Cache {
 		valid    = true,
@@ -237,7 +308,7 @@ md_table_measure :: proc(doc: ^Document, t: ^plat.Text, start, end: int, oversiz
 
 	buf: [RENDER_LINE_CAP]u8
 	for p := start; p <= end && p < doc.pt.length; {
-		line, lend := md_line_at(doc, p, buf[:])
+		line, lend, _ := md_line_at(doc, p, buf[:])
 		if !md_is_table_row(line) {break}
 		cells := md_split_cells(line, context.temp_allocator)
 		if len(cells) > c.ncols {c.ncols = min(len(cells), MD_TABLE_MAX_COLS)}
