@@ -297,15 +297,10 @@ wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (end: int, 
 		i := 0
 		for i < n {
 			if buf[i] == '\n' {return pos + i, true}
-			// A CRLF's CR is part of the break, not content: it must not consume a
-			// cell of the wrap budget, or every CRLF line wraps one column early.
-			if buf[i] == '\r' {
-				if i + 1 >= n && pos + n < L {break} // need the next byte; refill
-				if i + 1 < n && buf[i + 1] == '\n' {
-					i += 1
-					continue
-				}
-			}
+			// A CRLF's CR costs zero wrap-budget cells by construction
+			// (plat.is_zero_width), so it falls straight through the ordinary path
+			// below like any other zero-width character -- no special-casing needed
+			// to keep it out of the column count.
 			r, sz := utf8.decode_rune(buf[i:n])
 			if sz == 0 {sz = 1}
 			if i + sz > n && pos + n < L {break} // rune straddles the chunk; refill

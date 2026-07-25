@@ -3121,11 +3121,14 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		nq := doc_selection_rects(&doc, &t, px, cw, 5, make([]plat.Quad, 8, context.temp_allocator))
 		chk("selection rects for line 0", nq, 1, &fail)
 
-		// The wrap budget must not spend a cell on the CR: at 5 cells, "hello"
-		// fits exactly on one row rather than pushing a character to the next.
-		we, wle := wrap_row_end(&doc, &t, 0, 5)
-		chk("wrap_row_end at 5 cells", we, 6, &fail)
-		chk("wrap_row_end line_end", 1 if wle else 0, 1, &fail)
+		// The wrap budget must not spend a cell on the CR: it costs zero cells by
+		// construction (plat.is_zero_width) now, not by font-metric accident --
+		// wrap_row_end no longer special-cases CR at all (Important 2). The old
+		// "wrap_row_end at 5 cells"/"line_end" pair here could pass with the
+		// dedicated CR-skip block deleted and no zero-width guarantee in its
+		// place, because the font happened to also measure CR as ~0 -- this is
+		// the assertion that actually pins the guarantee down.
+		chk("CR cell width (zero by construction)", plat.text_cell_width(&t, '\r', .Doc), 0, &fail)
 
 		// CRLF x wrap: nothing above exercises eff_row_end's wrapped branch or
 		// visible_next's wrapped vis_end, since none of wraptest/wraplongtest use
