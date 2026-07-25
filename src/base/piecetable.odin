@@ -389,10 +389,15 @@ pt_line_end_cap :: proc(pt: ^Piece_Table, pos, cap: int) -> int {
 // line — a phantom cell with no glyph, because CR draws nothing while the pen
 // still advances.
 pt_row_vis_end :: proc(pt: ^Piece_Table, start, end: int, line_end: bool) -> int {
-	if end <= start {return end}
-	if !line_end {return end}
-	b: [1]u8
-	if pt_read(pt, end - 1, b[:]) == 1 && b[0] == '\r' {return end - 1}
+	if end <= start || !line_end {return end}
+	// Only a CR that is genuinely half of a CRLF pair is excluded. `line_end` is
+	// also true when a row ends at EOF and at a synthetic RENDER_LINE_CAP
+	// boundary, where a trailing CR is ordinary content: stripping it there made
+	// the caret and the click stop at one offset while Ctrl+End reached another —
+	// the same two-consumers-disagree bug this helper exists to remove.
+	if end >= pt.length {return end} // ends at EOF: nothing follows the CR
+	b: [2]u8
+	if pt_read(pt, end - 1, b[:]) == 2 && b[0] == '\r' && b[1] == '\n' {return end - 1}
 	return end
 }
 

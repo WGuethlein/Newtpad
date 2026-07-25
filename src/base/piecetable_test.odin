@@ -273,7 +273,14 @@ test_pt_row_vis_end :: proc(t: ^testing.T) {
 	cr := pt_init(transmute([]u8)string("a\rb"))
 	defer pt_destroy(&cr)
 	testing.expect_value(t, pt_row_vis_end(&cr, 0, 2, false), 2)
-	testing.expect_value(t, pt_row_vis_end(&cr, 0, 2, true), 1)
+	// ... and a CR with no LF after it is content even at a line end.
+	testing.expect_value(t, pt_row_vis_end(&cr, 0, 2, true), 2)
+
+	// A row ending at EOF on a bare CR: nothing follows, so nothing is stripped.
+	// Stripping here let End and a click clamp to 3 while Ctrl+End reached 4.
+	eof := pt_init(transmute([]u8)string("abc\r"))
+	defer pt_destroy(&eof)
+	testing.expect_value(t, pt_row_vis_end(&eof, 0, 4, true), 4)
 
 	// Degenerate ranges must not underflow.
 	testing.expect_value(t, pt_row_vis_end(&pt, 2, 2, true), 2)

@@ -1580,7 +1580,11 @@ doc_cursor_home :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_l
 // can never sit between CR and LF.
 doc_cursor_end :: proc(doc: ^Document, select: bool) {
 	e := base.pt_line_end(&doc.pt, doc.cursor)
-	set_cursor(doc, base.pt_row_vis_end(&doc.pt, base.pt_line_start(&doc.pt, doc.cursor), e, true), select)
+	// max(0, e - 1), not the line start: pt_row_vis_end only inspects the two bytes
+	// around `e`, and pt_line_start is an UNCAPPED backward scan. Passing the real
+	// line start walked the whole document on every End press on a single-line
+	// multi-GB file — the pattern pt_line_start_cap exists to prevent.
+	set_cursor(doc, base.pt_row_vis_end(&doc.pt, max(0, e - 1), e, true), select)
 }
 // Ctrl+Home / Ctrl+End. Without these there is no keyboard way to reach the end
 // of a large file at all.
