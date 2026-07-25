@@ -962,10 +962,11 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			info = " (no matches)"
 		}
 		mode := "regex" if f.regex else "text"
-		// The caret occupies a fixed-width slot whichever field has focus, so the
-		// gap before the match count does not change when focus moves to Replace.
-		fcaret := "_" if f.field == 0 else " "
-		rcaret := "_" if f.field == 1 else " "
+		// The caret marks the focused field and reserves nothing in the other one.
+		// A blank placeholder here would keep the double gap that was the reported
+		// bug, just consistently. `info` owns the single space before the count.
+		fcaret := "_" if f.field == 0 else ""
+		rcaret := "_" if f.field == 1 else ""
 		fline := fmt.tprintf("Find [%s]%s: %s%s%s", mode, " filter" if doc.filter else "", string(f.query[:]), fcaret, info)
 		if f.replace_mode {
 			plat.text_draw(gfx, text, fline, sx(12), h - sx(30), UI_PX, {0.95, 0.88, 0.55, 1})
