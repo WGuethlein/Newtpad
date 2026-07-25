@@ -58,10 +58,16 @@ Settings :: struct {
 	// pin instead of a running average of what you last did.
 	remember_views:  bool,
 	// "Dark", "Light", or a custom *.theme file's stem (see theme_resolve).
-	// Validated on load against theme_available_names -- an unknown name
-	// (hand-edited, or a file that was renamed/deleted since) is rejected
-	// rather than stored, leaving this at settings_default's "Dark" so
-	// theme_resolve never has to guess what the author meant.
+	// Stored as-is on load, the same as font_family above -- NOT validated
+	// against theme_available_names. That was tried and reverted: available
+	// names come from a directory read (themes_dir()/os.read_all_directory_by_path)
+	// that degrades to just the two built-ins on any failure, transient or
+	// not (a OneDrive/enterprise-roaming lock on the Roaming %APPDATA% tree,
+	// a momentary AV hold), so validating here meant a passing custom theme
+	// name could be silently and PERMANENTLY discarded by the next
+	// settings_save -- any zoom step, any split-divider drag. theme_resolve
+	// already falls back to Dark for whatever it can't resolve, by design;
+	// that is where an unresolvable name degrades, not here.
 	theme_name:      string,
 }
 
@@ -169,18 +175,10 @@ settings_load :: proc() -> Settings {
 				s.split_frac = clamp(n, SPLIT_MIN, SPLIT_MAX)
 			}
 		case "theme_name":
-			// Range-checked like font_style/link_style/md_default above, just
-			// against a name list instead of an integer range: only accept a
-			// name that resolves to something today (a built-in or an existing
-			// theme file). Anything else -- a typo, or a file since deleted --
-			// leaves theme_name at its "Dark" default rather than storing a name
-			// theme_resolve would silently fall back on every time it's read.
-			for n in theme_available_names(context.temp_allocator) {
-				if n == parts[1] {
-					s.theme_name = strings.clone(parts[1])
-					break
-				}
-			}
+			// Cloned unconditionally, same as font_family above -- see the
+			// Settings.theme_name field comment for why an availability check
+			// here is actively harmful rather than merely redundant.
+			s.theme_name = strings.clone(parts[1])
 		}
 	}
 	return s
@@ -245,6 +243,56 @@ SETTINGS_ROWS := []Setting_Row {
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
+
+// Rows that fit in height `h` starting at row `from`, given the fixed row
+// height `rowh` -- the settings-page analogue of menu.odin's rows_fitting.
+// Reused rather than reinvented (IMPORTANT 3 in the final review named this
+// explicitly): all settings rows are the same height, so this collapses to a
+// bound division, but keeping the same accumulate-until-it-doesn't-fit shape
+// as the dropdown's version means a future row of different height costs
+// nothing extra here, and settings_draw and this proc can never disagree
+// about what fits because there is only the one computation.
+settings_rows_fitting :: proc(from: int, h, rowh: f32) -> (count: int) {
+	used := f32(0)
+	for i := from; i < settings_row_count(); i += 1 {
+		if used + rowh > h {return}
+		used += rowh
+		count += 1
+	}
+	return
+}
+
+// Scroll `top` the minimum needed to keep `row` visible. Mirrors
+// menu_resolve_top exactly -- grow `top` one row at a time until the
+// selected row falls inside the run settings_rows_fitting says is visible.
+settings_resolve_top :: proc(top, row: int, h, rowh: f32) -> int {
+	t := top
+	if row < t {t = row}
+	for {
+		n := settings_rows_fitting(t, h, rowh)
+		if n == 0 {break}
+		if row < t + n {break}
+		t += 1
+	}
+	return clamp(t, 0, max(0, settings_row_count() - 1))
+}
+
+// Geometry of the row list: where it starts (below the page header), and how
+// much vertical room it has before the version string. The one place both
+// numbers come from, so settings_draw and a test asking "does everything fit"
+// read the same values instead of each hardcoding its own copy of the header
+// height and footer reservation -- which is exactly how the 8th row's help
+// text ended up overprinting the version string: the row loop grew but
+// nothing that used height - sx(24) as a bottom bound ever heard about it.
+settings_list_bounds :: proc(height: f32) -> (y0, avail_h: f32) {
+	y0 = CHROME_TOP + sx(40) + sx(56) // header title + subtitle, then the gap before row 0
+	// The version string's baseline sits at height - sx(24); reserve its own
+	// line height plus a gap above that, so the last visible row's help text
+	// (drawn sx(16) below its label, still inside its rowh slot) can never
+	// reach far enough down to touch it.
+	avail_h = max(0, (height - sx(24) - sx(20)) - y0)
+	return
+}
 
 // Apply a setting change that affects live state.
 settings_apply :: proc(rc: ^Render_Ctx) {
@@ -331,10 +379,20 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 	y := CHROME_TOP + sx(40)
 	plat.text_draw(gfx, t, "Settings", x, y, UI_PX * 1.4, g_theme[.Text_Primary])
 	plat.text_draw(gfx, t, "Esc closes    Up/Down choose    Enter toggles", x, y + sx(22), UI_SMALL_PX, g_theme[.Text_Muted])
-	y += sx(56)
 
 	rowh := sx(46)
-	for r, i in SETTINGS_ROWS {
+	y0, avail_h := settings_list_bounds(height)
+	// Scroll the minimum needed to keep the selected row visible -- the same
+	// pattern menu_draw_dropdown already uses via menu_scroll_to_item, reused
+	// rather than reinvented (IMPORTANT 3 in the final review named this
+	// explicitly as the preferred fix).
+	app.settings_top = settings_resolve_top(app.settings_top, app.settings_row, avail_h, rowh)
+	shown := settings_rows_fitting(app.settings_top, avail_h, rowh)
+	last := app.settings_top + shown
+
+	y = y0
+	for i := app.settings_top; i < last; i += 1 {
+		r := SETTINGS_ROWS[i]
 		sel := i == app.settings_row
 		if sel {
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x - sx(12), y - sx(16)}, size = {width - sx(52), rowh - sx(6)}, color = g_theme[.Selection_List]}})
@@ -366,18 +424,33 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 		y += rowh
 	}
 
+	// Say there's more, the same affordance menu_draw_dropdown uses for a
+	// clipped dropdown -- silently truncating a scrolled list is what hid
+	// Edit > Font there, and a short window with the Theme row selected is
+	// exactly the case that would otherwise recur here.
+	if app.settings_top > 0 {
+		plat.text_draw(gfx, t, "▲ more above", x, y0 - sx(14), UI_SMALL_PX, g_theme[.Text_Dim])
+	}
+	if last < settings_row_count() {
+		plat.text_draw(gfx, t, "▼ more below", x, y0 + avail_h + sx(2), UI_SMALL_PX, g_theme[.Text_Dim])
+	}
+
 	// Version, bottom-left — the one always-visible surface for it in the GUI
 	// build (there is no console for --version once -subsystem:windows).
 	plat.text_draw(gfx, t, fmt.tprintf("Newtpad v%s", NEWTPAD_VERSION), x, height - sx(24), UI_SMALL_PX, g_theme[.Text_Muted])
 
-	// The one setting with a consequence worth stating outright.
+	// The one setting with a consequence worth stating outright. Anchored off
+	// the version string, not off `y` (the last VISIBLE row's bottom) --
+	// Restore-session is row 0, so once the list scrolls it can read "off"
+	// while off-screen, and this note is about that setting, not about
+	// whichever row happens to be on screen right now.
 	if !app.settings.restore_session {
 		plat.text_draw(
 			gfx,
 			t,
 			"With restore off, unsaved buffers are still kept on disk — they just aren't reopened.",
 			x,
-			y + sx(20),
+			height - sx(44),
 			UI_SMALL_PX,
 			g_theme[.Accent],
 		)
