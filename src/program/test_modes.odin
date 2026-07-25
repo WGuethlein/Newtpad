@@ -2651,6 +2651,16 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		defer base.pt_destroy(&doc.pt)
 		doc.md_mode = .Preview
 		fmt.println("mdtabletest:")
+		// Longest single row in the fixture. #assert(MD_TABLE_BUDGET >
+		// RENDER_LINE_CAP) only guards the PRODUCTION constant; every block below
+		// that temporarily lowers the runtime md_table_budget asserts against this
+		// instead, since that's the precondition the forward guard's comment
+		// actually needs (see md_table_bounds) and the constant-level #assert says
+		// nothing about a value the test itself chose.
+		max_row_len := 0
+		for line in strings.split(content, "\n", context.temp_allocator) {
+			if len(line) > max_row_len {max_row_len = len(line)}
+		}
 
 		// Enter the block from three different offsets; the measure must agree.
 		offs := [3]int{0, 0, 0}
@@ -2745,6 +2755,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		{
 			saved := md_table_budget
 			md_table_budget = 200 // well under this ~8KB fixture, well over one row
+			assert(md_table_budget > max_row_len, "md_table_budget must clear the fixture's longest row or the forward guard's own-length precondition doesn't hold")
 			doc.md_table = {}
 			mid := base.pt_line_start(&doc.pt, doc.pt.length / 2)
 			entry_end := base.pt_line_end_cap(&doc.pt, mid, RENDER_LINE_CAP)
@@ -2789,31 +2800,52 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		{
 			saved := md_table_budget
 			md_table_budget = 6000 // K; fixture is ~9.3 KB, so K < B <= 2K
+			assert(md_table_budget > max_row_len, "md_table_budget must clear the fixture's longest row or the forward guard's own-length precondition doesn't hold")
 			doc.md_table = {}
 			c0 := md_table_ensure(&doc, &t, offs[0])
-			c0v := c0^
+			// c0 points INTO doc.md_table -- copy it out (nil-checked) before the
+			// next reset zeroes the slot it points to, or c0v below would read
+			// back the zeroed slot instead of offset 0's actual measurement.
+			c0_nil := c0 == nil
+			c0v: Md_Table_Cache
+			if !c0_nil {c0v = c0^}
 			doc.md_table = {}
 			c1 := md_table_ensure(&doc, &t, offs[1])
-			c1v := c1^
 			md_table_budget = saved
-			same := c0v.oversize == c1v.oversize && c0v.ncols == c1v.ncols
-			if same {
-				for i in 0 ..< c0v.ncols {
-					if c0v.widths[i] != c1v.widths[i] {same = false}
+			// Every other block in this mode nil-checks its md_table_ensure result
+			// before dereferencing; this one didn't. Can't fire on this fixture (both
+			// offsets are always table rows), but a future fixture edit would turn a
+			// FAIL into a crash instead of a FAIL, so check like every neighbour does.
+			if c0_nil || c1 == nil {
+				fail = true
+				fmt.println("  FAIL  entry-independent oversize: no table measured")
+			} else {
+				c1v := c1^
+				// K < B <= 2K (asserted above) must yield oversize=true by the
+				// three-case algebra in the batch-1 report -- so require it explicitly,
+				// not just that the two entries AGREE. Without `&& c0v.oversize`, an
+				// implementation that never sets oversize at all (a "never oversize"
+				// bug) would pass this check vacuously: both sides false, `==` true,
+				// ncols/widths equal because both took the non-oversize measure path.
+				same := c0v.oversize == c1v.oversize && c0v.oversize && c0v.ncols == c1v.ncols
+				if same {
+					for i in 0 ..< c0v.ncols {
+						if c0v.widths[i] != c1v.widths[i] {same = false}
+					}
 				}
+				if !same {fail = true}
+				fmt.printfln(
+					"  %-6s entry-independent oversize: off=0 oversize=%v ncols=%d widths=%v | off=%d oversize=%v ncols=%d widths=%v",
+					"ok" if same else "FAIL",
+					c0v.oversize,
+					c0v.ncols,
+					c0v.widths[:c0v.ncols],
+					offs[1],
+					c1v.oversize,
+					c1v.ncols,
+					c1v.widths[:c1v.ncols],
+				)
 			}
-			if !same {fail = true}
-			fmt.printfln(
-				"  %-6s entry-independent oversize: off=0 oversize=%v ncols=%d widths=%v | off=%d oversize=%v ncols=%d widths=%v",
-				"ok" if same else "FAIL",
-				c0v.oversize,
-				c0v.ncols,
-				c0v.widths[:c0v.ncols],
-				offs[1],
-				c1v.oversize,
-				c1v.ncols,
-				c1v.widths[:c1v.ncols],
-			)
 		}
 
 		// Task 7 / Important 2 regression: the byte budget alone does not bound the
@@ -2873,6 +2905,65 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				offs[1],
 				mid_ov,
 			)
+		}
+
+		// Review follow-up: md_table_bounds assumed `p` is a line start, but
+		// markdown_draw's own capped-segment walk (`p = end + 1`, where `end` came
+		// from pt_line_end_cap) hands it a mid-line offset for any physical line
+		// longer than RENDER_LINE_CAP -- the second and later drawn segments of
+		// such a line, and doc.top itself if the viewport happens to be scrolled
+		// there. Fixture: one physical line just over one RENDER_LINE_CAP (8192)
+		// long -- 8192 bytes of filler containing NO pipe, then a short
+		// pipe-delimited tail. The filler-only first segment does not look like a
+		// table row on its own, so p=0 is never a table entry here at all; the
+		// ONLY offset that ever reaches md_table_bounds for this fixture is the
+		// tail's own segment offset (RENDER_LINE_CAP+1 = 8193), exactly what
+		// markdown_draw produces after drawing the filler segment above it -- and
+		// it is not a real line start.
+		//
+		// A literal "entered at byte 0, compare to entered mid-line" check isn't
+		// constructible for THIS bug: a pipe-free first segment is required so the
+		// OLD backward loop's `if !md_is_table_row(pl) {break}` skips its own
+		// `pl_capped` check before it can fire (that's precisely what let this hide
+		// -- see the task-7 report's hand-derivation), but that same pipe-free
+		// segment also means p=0 never passes md_is_table_row and so is never a
+		// comparable md_table_bounds entry in the first place. So this checks the
+		// mid-line entry against the one thing every other entry into a
+		// >RENDER_LINE_CAP row in this suite already agrees on: the fixed oversize
+		// signature (ncols=MD_TABLE_MAX_COLS, every width=MD_TABLE_FIXED_CELLS).
+		{
+			filler, _ := strings.repeat("x", RENDER_LINE_CAP, context.temp_allocator)
+			sb2: strings.Builder
+			strings.builder_init(&sb2, context.temp_allocator)
+			strings.write_string(&sb2, filler)
+			strings.write_string(&sb2, "| a | b | c |")
+			strings.write_byte(&sb2, '\n')
+			ml_content := strings.to_string(sb2)
+			ml_doc: Document
+			ml_doc.pt = base.pt_init(transmute([]u8)ml_content)
+			defer base.pt_destroy(&ml_doc.pt)
+			ml_doc.md_mode = .Preview
+
+			mid_p := RENDER_LINE_CAP + 1 // 8193 -- exactly markdown_draw's p = end + 1
+			c := md_table_ensure(&ml_doc, &t, mid_p)
+			mok := c != nil && c.oversize && c.ncols == MD_TABLE_MAX_COLS
+			if mok {
+				for i in 0 ..< c.ncols {
+					if c.widths[i] != MD_TABLE_FIXED_CELLS {mok = false}
+				}
+			}
+			if !mok {fail = true}
+			if c != nil {
+				fmt.printfln(
+					"  %-6s mid-line entry (p=%d) into a >RENDER_LINE_CAP row forces oversize: oversize=%v start=%d",
+					"ok" if mok else "FAIL",
+					mid_p,
+					c.oversize,
+					c.start,
+				)
+			} else {
+				fmt.println("  FAIL  mid-line entry: no table measured")
+			}
 		}
 
 		// Empty leading cells survive the split: "||b|" strips one leading and one

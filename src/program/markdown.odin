@@ -98,7 +98,19 @@ MD_TABLE_PAD :: 2 // cells of gap between columns
 // trips. This caps the row COUNT per direction the same way MD_TABLE_BUDGET
 // caps the byte span per direction, so the expensive scan itself is bounded
 // even on pathologically short rows.
-MD_TABLE_MAX_ROWS :: 4096
+//
+// The per-row cost is a FIXED 4 KB pt_read in each capped helper regardless of
+// how short the row actually is (pt_line_start_cap and pt_line_end_cap both
+// read in 4 KB chunks against RENDER_LINE_CAP), so the row cap's true worst
+// case at the original 4096 was roughly 4096 rows * 2 reads backward + 4096 *
+// 1 read forward + up to 4096 * 1 read in the (non-oversize) measure pass over
+// the same span - about 50-67 MB copied and ~12k pt_reads on the single frame
+// that enters an ordinary pipe-delimited log file, repeating on every revision
+// bump, i.e. every keystroke in Split mode. 1024 is still far more rows than
+// any screenful or any hand-authored table (a real table is a few dozen rows
+// at most), cuts that worst case ~4x, and the fallback past it is the O(1)
+// fixed-column path, not a correctness loss.
+MD_TABLE_MAX_ROWS :: 1024
 
 // md_table_bounds derives `oversize` from the byte budget and MD_TABLE_MAX_ROWS
 // together (see the entry-dependence comment in md_table_bounds). If the budget
@@ -190,12 +202,26 @@ md_line_at :: proc(doc: ^Document, p: int, buf: []u8) -> (line: string, end: int
 // The contiguous run of table rows containing `p`. Scans backward to the block's
 // true start and forward to its end, both bounded by md_table_budget so a file
 // that is one enormous table cannot stall a frame.
+//
+// `p` need NOT be a line start. markdown_draw walks a line longer than
+// RENDER_LINE_CAP in capped segments (`p = end + 1` where `end` came from
+// `pt_line_end_cap`), so the second and later segments of such a line hand this
+// function a mid-line offset as the entry point — `doc.top` can be one too, if
+// the viewport happens to be scrolled there. A mid-line `p` cannot establish the
+// block's real start (`start = p` below would be a lie), so it is deliberately
+// forced oversize by the pt_line_start_cap seed just below rather than measuring
+// a partial line and disagreeing with the segment drawn above it.
 @(private = "file")
 md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, ok: bool) {
 	buf: [RENDER_LINE_CAP]u8
 	line, lend, entry_capped := md_line_at(doc, p, buf[:])
 	if !md_is_table_row(line) {return 0, 0, false, false}
 	start, end = p, lend
+
+	// Is `p` itself a real line start? Feeds trunc_back's seed value below (see
+	// the doc comment above the invariant this checks).
+	entry_line_start, entry_line_start_exact := base.pt_line_start_cap(&doc.pt, p, RENDER_LINE_CAP)
+	entry_is_line_start := entry_line_start_exact && entry_line_start == p
 
 	// Both bounds are measured from the ENTRY POINT `p`, never from the moving
 	// `start`. Two traps here, both of which shipped once:
@@ -220,7 +246,11 @@ md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, o
 	// truncated (`trunc_back` / `trunc_fwd`); `oversize` is derived once, after
 	// both scans finish, from the window they produced — entry-independent by
 	// construction (see the callers' case analysis over B in the batch-1 report).
-	trunc_back, trunc_fwd := false, entry_capped
+	// trunc_back starts seeded from the mid-line-entry check above: a `p` that
+	// isn't a real line start means `start = p` (set above) is not trustworthy,
+	// so the block is forced oversize even if both scans below would otherwise
+	// complete within budget.
+	trunc_back, trunc_fwd := !entry_is_line_start, entry_capped
 	q := p
 	back_rows := 0
 	for q > 0 {
