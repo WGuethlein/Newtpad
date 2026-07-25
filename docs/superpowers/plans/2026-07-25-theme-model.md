@@ -4,7 +4,7 @@
 
 **Goal:** Give Newtpad a colour model and two themes, so batch 4's syntax highlighting can emit role names instead of RGB.
 
-**Architecture:** A `Color_Role` enum plus `Theme :: [Color_Role][4]f32` — a total array over the enum, so a new role cannot be added without every theme being forced to supply it. One global `g_theme`, read by array index in the per-frame path. The 107 existing colour literals migrate to roles; the Dark theme reproduces today's rendering exactly, which turns the migration into a mechanical check rather than a visual one.
+**Architecture:** A `Color_Role` enum plus `Theme :: [Color_Role][4]f32` — a total array over the enum, so a new role cannot be added without every theme being forced to supply it. One global `g_theme`, read by array index in the per-frame path. The 107 existing colour literals collapse onto 25 roles per the spec's merge table; the check is that every role holds a colour that genuinely appeared in the pre-migration UI, so only the enumerated merges can move a pixel.
 
 **Tech Stack:** Odin; `src/program` only (the two literals in `src/platform` are a window-frame colour and an atlas clear value, not themeable surfaces); headless modes in `test_modes.odin`.
 
@@ -31,7 +31,7 @@
 
 **Modified:** `doc.odin`, `main.odin` (the document and chrome draw — the hot path); `ui_tabs.odin`, `palette.odin`, `menu.odin`, `settings.odin`, `fontpage.odin`, `history.odin`, `table.odin`, `markdown.odin`, `find.odin`, `links.odin` (UI surfaces); `test_modes.odin` (the new mode).
 
-**Task order.** The type and Dark first, so the migration is a pure rename with a mechanical check. Light comes *after* the migration, so its findings are about colour choices rather than tangled up with a rename. Files and the Settings row last.
+**Task order.** The type and Dark first, so the migration is a mechanical collapse onto a fixed table rather than a redesign. Light comes *after* the migration, so its findings are about colour choices rather than tangled up with the collapse. Files and the Settings row last.
 
 ---
 
