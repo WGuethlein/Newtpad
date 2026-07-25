@@ -847,7 +847,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// Underline links in the cells while Ctrl is held (or Show-links is on).
 		if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 			for tl in table_links(doc, text, px, char_w, rows, f32(window.width)) {
-				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {tl.x, tl.y + sx(2)}, size = {tl.w, max(sx(1), 1)}, color = LINK_COL}})
+				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {tl.x, tl.y + sx(2)}, size = {tl.w, max(sx(1), 1)}, color = g_theme[.Link]}})
 			}
 		}
 	} else {
@@ -882,7 +882,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 							{
 								pos = {col_x(char_w, h.col, 0 if h.wrapped else H_SCROLL), row_baseline_y(px, h.row) + sx(2)},
 								size = {f32(h.cells) * char_w, max(sx(1), 1)},
-								color = LINK_COL,
+								color = g_theme[.Link],
 							},
 						},
 					)
@@ -900,7 +900,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	if H_SCROLL > 0 {
 		ctop := CONTENT_TOP + FILTER_BANNER_H
 		cbot := f32(window.height) - doc_bottom_bar_h(doc)
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, ctop}, size = {TEXT_MARGIN_X, cbot - ctop}, color = {0.09, 0.11, 0.16, 1}}})
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, ctop}, size = {TEXT_MARGIN_X, cbot - ctop}, color = g_theme[.Bg_Base]}})
 	}
 
 	// Scrollbar (byte-proportional, below the tab strip) + caret. In Markdown Split
@@ -920,11 +920,11 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// makes common, since the last visible row of a wrapped line lands close to
 		// the document end.
 		ty := clamp(CHROME_TOP + f32(doc.top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
-		bars[nb] = {pos = {er - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = {0.16, 0.18, 0.22, 1}};nb += 1
-		bars[nb] = {pos = {er - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = {0.42, 0.48, 0.60, 1}};nb += 1
+		bars[nb] = {pos = {er - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = g_theme[.Bg_Raised]};nb += 1
+		bars[nb] = {pos = {er - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = g_theme[.Text_Muted]};nb += 1
 	}
 	if caret {
-		bars[nb] = {pos = {cx, cy - px}, size = {sx(2), line_h}, color = {0.95, 0.85, 0.35, 1}};nb += 1
+		bars[nb] = {pos = {cx, cy - px}, size = {sx(2), line_h}, color = g_theme[.Caret]};nb += 1
 	}
 	if nb > 0 {
 		plat.quads_draw(gfx, quad_pipe, bars[:nb])
@@ -939,12 +939,12 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// right half where the preview lives. There is no scissor rect (the H_SCROLL
 		// margin above uses the same trick), so paint the right half back to the
 		// background before the preview, giving two clean side-by-side panes.
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {er, pvtop}, size = {w - er, pvbot - pvtop}, color = {0.09, 0.11, 0.16, 1}}})
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {er, pvtop}, size = {w - er, pvbot - pvtop}, color = g_theme[.Bg_Base]}})
 		// The visible accent line is thinner than the draggable band; both come from
 		// md_divider_rect so the drawn line always sits exactly where a drag grabs it.
 		dr := md_divider_rect(doc, w, h, rc.app.settings.split_frac)
 		line_w := max(sx(1), 1)
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {dr.pos.x + dr.size.x * 0.5 - line_w * 0.5, dr.pos.y}, size = {line_w, dr.size.y}, color = {0.30, 0.34, 0.42, 1}}})
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {dr.pos.x + dr.size.x * 0.5 - line_w * 0.5, dr.pos.y}, size = {line_w, dr.size.y}, color = g_theme[.Border_Strong]}})
 		// Preview follows the editor's scroll (doc.top): one synced position, both
 		// panes anchored to the same source line.
 		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.top)
@@ -956,8 +956,8 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 				gfx,
 				quad_pipe,
 				[]plat.Quad {
-					{pos = {w - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = {0.16, 0.18, 0.22, 1}},
-					{pos = {w - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = {0.42, 0.48, 0.60, 1}},
+					{pos = {w - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = g_theme[.Bg_Raised]},
+					{pos = {w - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = g_theme[.Text_Muted]},
 				},
 			)
 		}
@@ -969,8 +969,8 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			gfx,
 			quad_pipe,
 			[]plat.Quad {
-				{pos = {hb.track_x, hb.y}, size = {hb.track_w, hb.h}, color = {0.16, 0.18, 0.22, 1}},
-				{pos = {hb.thumb_x, hb.y}, size = {hb.thumb_w, hb.h}, color = {0.42, 0.48, 0.60, 1}},
+				{pos = {hb.track_x, hb.y}, size = {hb.track_w, hb.h}, color = g_theme[.Bg_Raised]},
+				{pos = {hb.thumb_x, hb.y}, size = {hb.thumb_w, hb.h}, color = g_theme[.Text_Muted]},
 			},
 		)
 	}
@@ -985,13 +985,13 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// Sits in the reserved inset below the menu bar (see FILTER_BANNER_H), so
 		// it no longer draws half under the menu or over the first matching line.
 		by := CHROME_TOP
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, by}, size = {w, FILTER_BANNER_H}, color = {0.18, 0.26, 0.20, 1}}})
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, by}, size = {w, FILTER_BANNER_H}, color = g_theme[.Filter_Bg]}})
 		msg := fmt.tprintf(
 			"FILTER  %d matching lines%s   —   Ctrl+L shows the whole file",
 			len(doc.filter_lines),
 			"" if doc_filtering(doc) else " (searching...)",
 		)
-		plat.text_draw(gfx, text, msg, sx(12), by + FILTER_BANNER_H - sx(7), UI_SMALL_PX, {0.70, 0.90, 0.74, 1})
+		plat.text_draw(gfx, text, msg, sx(12), by + FILTER_BANNER_H - sx(7), UI_SMALL_PX, g_theme[.Filter_Text])
 	}
 
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
@@ -1019,7 +1019,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	if doc.find.active {
 		f := &doc.find
 		bar_h := sx(48) if f.replace_mode else sx(26)
-		bar := plat.Quad{pos = {0, h - bar_h}, size = {w, bar_h}, color = {0.14, 0.16, 0.20, 1}}
+		bar := plat.Quad{pos = {0, h - bar_h}, size = {w, bar_h}, color = g_theme[.Bg_Panel]}
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{bar})
 		info: string
 		switch {
@@ -1047,12 +1047,12 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		rcaret := "_" if f.field == 1 else ""
 		fline := fmt.tprintf("Find [%s]%s: %s%s%s", mode, " filter" if doc.filter else "", string(f.query[:]), fcaret, info)
 		if f.replace_mode {
-			plat.text_draw(gfx, text, fline, sx(12), h - sx(30), UI_PX, {0.95, 0.88, 0.55, 1})
+			plat.text_draw(gfx, text, fline, sx(12), h - sx(30), UI_PX, g_theme[.Accent])
 			rline := fmt.tprintf("Replace: %s%s", string(f.replace[:]), rcaret)
-			plat.text_draw(gfx, text, rline, sx(12), h - sx(8), UI_PX, {0.82, 0.9, 0.98, 1})
+			plat.text_draw(gfx, text, rline, sx(12), h - sx(8), UI_PX, g_theme[.Text_Bright])
 			hint_find(gfx, text, f, doc, w, h - sx(30))
 		} else {
-			plat.text_draw(gfx, text, fline, sx(12), h - sx(8), UI_PX, {0.95, 0.88, 0.55, 1})
+			plat.text_draw(gfx, text, fline, sx(12), h - sx(8), UI_PX, g_theme[.Accent])
 			hint_find(gfx, text, f, doc, w, h - sx(8))
 		}
 	} else {
@@ -1106,7 +1106,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		}
 		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", mode, recovered, disk, indexing, atlas, nobackup, notice)
 		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)
-		col := [4]f32{0.95, 0.55, 0.35, 1} if warn else {0.55, 0.60, 0.70, 1}
+		col := g_theme[.Warning] if warn else g_theme[.Text_Dim]
 		plat.text_draw(gfx, text, status, sx(12), h - sx(8), UI_SMALL_PX, col)
 	}
 
@@ -1118,8 +1118,8 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 // Ctrl+L was to be told they were there.
 @(private = "file")
 hint_find :: proc(gfx: ^plat.Gfx, text: ^plat.Text, f: ^Find, doc: ^Document, w, y: f32) {
-	on := [4]f32{0.95, 0.88, 0.55, 1}
-	off := [4]f32{0.45, 0.49, 0.57, 1}
+	on := g_theme[.Accent]
+	off := g_theme[.Text_Muted]
 	cw := plat.text_char_width(text, UI_SMALL_PX)
 	hints := [3]struct {
 		label: string,
