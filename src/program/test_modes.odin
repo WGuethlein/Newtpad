@@ -2652,6 +2652,109 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad themetest` proves theme_dark() only ever holds colours that
+	// genuinely appeared in the pre-migration UI. Dark is a *consolidation*
+	// (66 faithful roles collapsed to 25 by merging near-duplicate greys), so
+	// it is no longer pixel-identical to the old literals -- the old "every
+	// value equals the one literal it replaces" guard doesn't apply anymore.
+	// What replaces it: each role may hold any one of the several literals
+	// the spec's merge table says that role absorbs (see
+	// docs/superpowers/specs/2026-07-25-theme-model-design.md, "The role
+	// table"). The absorbed-set lists below are retyped from that spec table,
+	// not copied out of theme_dark -- copying from the theme would make this
+	// test agree with a transposed digit instead of catching one.
+	if os.args[1] == "themetest" {
+		d := theme_dark()
+		fail := false
+
+		// Every role must be non-zero: zero is transparent black, Odin's
+		// default for a Theme entry nobody wrote a value for -- an invisible
+		// hole rather than an obvious error (see theme.odin's header comment).
+		for role in Color_Role {
+			if d[role] == ([4]f32{0, 0, 0, 0}) {
+				fmt.printfln("  FAIL   %v is zero (unfilled Dark slot)", role)
+				fail = true
+			}
+		}
+
+		in_set :: proc(got: [4]f32, set: [][4]f32) -> bool {
+			for v in set {if got == v {return true}}
+			return false
+		}
+		chk :: proc(d: Theme, role: Color_Role, absorbs: [][4]f32, fail: ^bool) {
+			got := d[role]
+			ok := in_set(got, absorbs)
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %-16v got=%v absorbs=%v", "ok" if ok else "FAIL", role, got, absorbs)
+		}
+
+		fmt.println("themetest:")
+		// Neutrals: 10 roles absorbing 42 values across 81 sites.
+		chk(d, .Bg_Base, {{0.09, 0.11, 0.16, 1}, {0.10, 0.12, 0.16, 1}, {0.11, 0.13, 0.17, 1}}, &fail) // #171C29 #1A1F29 #1C212B
+		chk(
+			d,
+			.Bg_Panel,
+			{{0.12, 0.14, 0.18, 1}, {0.12, 0.14, 0.19, 1}, {0.13, 0.15, 0.20, 1}, {0.14, 0.16, 0.20, 1}, {0.14, 0.16, 0.21, 1}, {0.15, 0.17, 0.22, 1}},
+			&fail,
+		) // #1F242E #1F2430 #212633 #242933 #242936 #262B38
+		chk(d, .Bg_Raised, {{0.16, 0.18, 0.22, 1}, {0.16, 0.20, 0.27, 1}}, &fail) // #292E38 #293345
+		chk(d, .Border_Subtle, {{0.20, 0.23, 0.30, 1}, {0.24, 0.27, 0.33, 1}}, &fail) // #333B4C #3D4554
+		chk(d, .Border_Strong, {{0.28, 0.32, 0.40, 1}, {0.30, 0.34, 0.42, 1}}, &fail) // #475266 #4C576B
+		chk(
+			d,
+			.Text_Muted,
+			{
+				{0.42, 0.46, 0.54, 1},
+				{0.42, 0.47, 0.56, 1},
+				{0.42, 0.48, 0.60, 1},
+				{0.45, 0.49, 0.57, 1},
+				{0.48, 0.52, 0.60, 1},
+				{0.50, 0.54, 0.62, 1},
+				{0.50, 0.55, 0.64, 1},
+			},
+			&fail,
+		) // #6B758A #6B788F #6B7A99 #737D91 #7A8599 #808A9E #808CA3
+		chk(
+			d,
+			.Text_Dim,
+			{{0.55, 0.60, 0.70, 1}, {0.58, 0.64, 0.76, 1}, {0.60, 0.64, 0.72, 1}, {0.62, 0.68, 0.80, 1}, {0.66, 0.70, 0.78, 1}},
+			&fail,
+		) // #8C99B2 #94A3C2 #99A3B8 #9EADCC #A8B2C7
+		chk(
+			d,
+			.Text_Secondary,
+			{{0.72, 0.76, 0.84, 1}, {0.72, 0.78, 0.88, 1}, {0.75, 0.79, 0.86, 1}, {0.75, 0.80, 0.88, 1}, {0.80, 0.84, 0.90, 1}},
+			&fail,
+		) // #B8C2D6 #B8C7E0 #BFC9DB #BFCCE0 #CCD6E6
+		chk(
+			d,
+			.Text_Primary,
+			{{0.86, 0.90, 0.96, 1}, {0.88, 0.91, 0.96, 1}, {0.90, 0.92, 0.97, 1}, {0.92, 0.94, 0.98, 1}, {0.94, 0.96, 0.99, 1}, {0.95, 0.96, 0.99, 1}},
+			&fail,
+		) // #DBE6F5 #E0E8F5 #E6EBF7 #EBF0FA #F0F5FC #F2F5FC
+		chk(d, .Text_Bright, {{0.96, 0.96, 0.98, 1}, {0.98, 0.99, 1.0, 1}, {1, 1, 1, 1}, {0.82, 0.90, 0.98, 1}}, &fail) // #F5F5FA #FAFCFF #FFFFFF #D1E6FA
+
+		// Accents: 15 roles, each carrying real meaning.
+		chk(d, .Selection_Doc, {{0.20, 0.30, 0.48, 1}}, &fail) // #334C7A
+		chk(d, .Selection_List, {{0.20, 0.28, 0.42, 1}, {0.20, 0.30, 0.45, 1}, {0.24, 0.30, 0.42, 1}, {0.18, 0.24, 0.34, 1}}, &fail) // #33476B #334C73 #3D4C6B #2E3D57
+		chk(d, .Caret, {{0.95, 0.85, 0.35, 1}}, &fail) // #F2D959
+		chk(d, .Accent, {{0.95, 0.88, 0.55, 1}, {0.80, 0.76, 0.50, 1}}, &fail) // #F2E08C #CCC280
+		chk(d, .Find_Match_Bg, {{0.42, 0.38, 0.16, 1}}, &fail) // #6B6129
+		chk(d, .Link, {{0.45, 0.70, 0.98, 1}}, &fail) // #73B2FA
+		chk(d, .Warning, {{0.95, 0.55, 0.35, 1}}, &fail) // #F28C59
+		chk(d, .Danger, {{0.75, 0.16, 0.16, 1}}, &fail) // #BF2929
+		chk(d, .Success, {{0.55, 0.85, 0.60, 1}}, &fail) // #8CD999
+		chk(d, .Filter_Bg, {{0.18, 0.26, 0.20, 1}}, &fail) // #2E4233
+		chk(d, .Filter_Text, {{0.70, 0.90, 0.74, 1}}, &fail) // #B2E6BD
+		chk(d, .Md_Heading, {{0.72, 0.85, 1.0, 1}}, &fail) // #B8D9FF
+		chk(d, .Md_Code, {{0.95, 0.80, 0.65, 1}}, &fail) // #F2CCA6
+		chk(d, .Md_Italic, {{0.80, 0.86, 0.78, 1}}, &fail) // #CCDBC7
+		chk(d, .Md_Quote, {{0.66, 0.72, 0.62, 1}}, &fail) // #A8B89E
+
+		fmt.println("themetest: FAILURES" if fail else "themetest: all ok")
+		return true
+	}
+
 	// `newtpad movelinetest` — Alt+Up/Down. Terminators live BETWEEN lines and the
 	// last line often has none, so a naive cut-and-paste either duplicates one or
 	// drops it; on a CRLF file that leaves a bare LF, the corruption batch 1 fixed
