@@ -1008,6 +1008,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		palette_draw(gfx, quad_pipe, text, rc.app, w, h)
 	}
 
+	// Whether the transient notice (e.g. "2 items skipped" from a drop) is
+	// still live -- checked once per frame regardless of which branch below
+	// runs. This used to be a countdown that only decremented inside the
+	// no-find-bar branch, so opening find paused it indefinitely; app_notice_
+	// active is now a wall-clock check against app.odin's NOTICE_SECONDS, so
+	// it expires on schedule whether or not find happens to be open.
+	notice_live := app_notice_active(rc.app)
+
 	if doc.find.active {
 		f := &doc.find
 		bar_h := sx(48) if f.replace_mode else sx(26)
@@ -1090,12 +1098,11 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		case .Split:
 			mode = "    Markdown Split (Ctrl+M)"
 		}
-		// A transient notice (e.g. "2 items skipped" from a drop) rides along on
-		// the same line and counts itself down once per drawn frame.
+		// The transient notice rides along on the same line while notice_live
+		// (see above).
 		notice := ""
-		if rc.app.notice_frames > 0 {
+		if notice_live {
 			notice = fmt.tprintf("    %s", rc.app.notice)
-			rc.app.notice_frames -= 1
 		}
 		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", mode, recovered, disk, indexing, atlas, nobackup, notice)
 		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)

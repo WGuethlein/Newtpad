@@ -3819,7 +3819,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("  %-6s focus on first opened: %q", "ok" if ok2 else "FAIL", focused.path if focused != nil else "<nil>")
 		if !ok2 {fail = true}
 
-		ok3 := a.notice_frames > 0 && strings.contains(a.notice, "2 items skipped")
+		ok3 := app_notice_active(&a) && strings.contains(a.notice, "2 items skipped")
 		fmt.printfln("  %-6s notice reports 2 skipped (folder + missing file): %q", "ok" if ok3 else "FAIL", a.notice)
 		if !ok3 {fail = true}
 

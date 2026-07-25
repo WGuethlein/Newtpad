@@ -9,6 +9,7 @@ package main
 
 import "core:path/filepath"
 import "core:strings"
+import "core:time"
 
 App :: struct {
 	docs:       [dynamic]^Document, // slot array; nil = empty slot (never shifts)
@@ -32,15 +33,19 @@ App :: struct {
 	// the dragged document as it swaps places (the slot changes each swap).
 	tab_drag:      bool,
 	tab_drag_slot: int,
-	// Transient status-bar message (dropped folder, etc). notice_frames counts
-	// down once per drawn frame; 0 means nothing to show.
-	notice:        string,
-	notice_frames: int,
+	// Transient status-bar message (dropped folder, etc). Live from
+	// notice_started until NOTICE_SECONDS later; see app_notice_active.
+	notice:         string,
+	notice_started: time.Tick,
 }
 
-// A short-lived status-bar message. Frames rather than wall-clock: the app
-// redraws at vsync, so a frame count is stable and needs no timer.
-NOTICE_FRAMES :: 240
+// A short-lived status-bar message's display window. Wall-clock, not a frame
+// count: the frame loop blocks in window_wait_message for up to a second at a
+// time while idle (main.odin), so "240 frames" stretched a few seconds into
+// minutes whenever the app wasn't actively redrawing -- see the report on
+// this finding. The zero Tick is always in the past (it predates process
+// start), so a never-set notice_started reads as already-expired for free.
+NOTICE_SECONDS :: 4.0
 
 // Set the transient status-bar message, replacing any previous one. notice is
 // always self-owned (only ever set here), so freeing it unconditionally before
@@ -49,7 +54,15 @@ NOTICE_FRAMES :: 240
 app_note :: proc(a: ^App, msg: string) {
 	delete(a.notice)
 	a.notice = strings.clone(msg) // caller's msg is often temp-allocated
-	a.notice_frames = NOTICE_FRAMES
+	a.notice_started = time.tick_now()
+}
+
+// Whether the transient notice is still within its display window. One proc
+// so the draw call (main.odin) and anything asserting on it (test_modes.odin)
+// share the same definition of "still showing" instead of the draw call
+// re-deriving it inline, the way the frame-count version used to.
+app_notice_active :: proc(a: ^App) -> bool {
+	return a.notice != "" && time.duration_seconds(time.tick_since(a.notice_started)) < NOTICE_SECONDS
 }
 
 // Swap the documents in two slots (tab reorder). Slot indices are referenced by
