@@ -3074,6 +3074,142 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad viewmemtest` proves the per-family view memory (Wyatt's complaint:
+	// switching a .md to Split, then opening another .md, used to come up plain
+	// again). Checks, in order:
+	//   - a fresh open of a markdown/tabular file adopts the remembered family
+	//     default, through the same doc_can_* gating a manual toggle uses;
+	//   - a .txt is unaffected by md_default -- the gating holds, so a stray
+	//     default can never wedge a file into a view it cannot hold;
+	//   - toggling a view learns the new default only when remember_views is on;
+	//   - a session-restored tab is untouched by the family default -- this is
+	//     the assertion that protects the rule most likely to be broken: session
+	//     restore must win over a family default, always;
+	//   - an out-of-range md_default on disk degrades to .Off, not an invalid enum.
+	// Set NEWTPAD_SESSION_DIR to a temp dir first -- this reads/writes
+	// settings.txt and drives session_save/session_restore.
+	if os.args[1] == "viewmemtest" {
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("viewmemtest: no fonts loaded")
+			return true
+		}
+		bad := 0
+		tmp := os.get_env("TEMP", context.temp_allocator)
+		mdf := fmt.tprintf("%s%cnewtpad_viewmem.md", tmp, '\\')
+		csvf := fmt.tprintf("%s%cnewtpad_viewmem.csv", tmp, '\\')
+		txtf := fmt.tprintf("%s%cnewtpad_viewmem.txt", tmp, '\\')
+		plat.file_write_atomic(mdf, transmute([]u8)string("# heading\n\nbody text\n"))
+		plat.file_write_atomic(csvf, transmute([]u8)string("a,b,c\n1,2,3\n"))
+		plat.file_write_atomic(txtf, transmute([]u8)string("just plain text\n"))
+
+		fmt.println("--- fresh open adopts the family default ---")
+		{
+			a: App
+			a.settings = settings_default()
+			a.settings.md_default = .Split
+			a.settings.table_default = true
+			app_open_path(&a, mdf)
+			md := app_active(&a)
+			mdok := md != nil && md.md_mode == .Split
+			fmt.printfln("  .md  opens in %-8v %s", md.md_mode, "OK" if mdok else "FAIL")
+			if !mdok {bad += 1}
+
+			app_open_path(&a, csvf)
+			cv := app_active(&a)
+			cvok := cv != nil && cv.table
+			fmt.printfln("  .csv opens with table=%-5v %s", cv.table, "OK" if cvok else "FAIL")
+			if !cvok {bad += 1}
+
+			// The gating holds: a .txt cannot enter markdown mode (doc_can_markdown
+			// is false for it), so md_default cannot force it into Split anyway.
+			app_open_path(&a, txtf)
+			tx := app_active(&a)
+			txok := tx != nil && tx.md_mode == .Off
+			fmt.printfln("  .txt stays %-8v despite md_default=Split %s", tx.md_mode, "OK" if txok else "FAIL")
+			if !txok {bad += 1}
+			app_destroy(&a)
+		}
+
+		fmt.println("--- toggling a view learns the default, gated on remember_views ---")
+		{
+			a: App
+			dummy: plat.Window
+			a.settings = settings_default() // md_default .Off, so the fresh open below is Off
+			a.settings.remember_views = true
+			app_open_path(&a, mdf)
+			command_dispatch(.Toggle_Preview, {}, &a, &dummy, &t, 10) // Off -> Preview
+			learned := a.settings.md_default == .Preview
+			fmt.printfln("  remember on:  toggle -> md_default=%-8v %s", a.settings.md_default, "OK" if learned else "FAIL")
+			if !learned {bad += 1}
+			onDisk := settings_load() // learn-on-toggle must have written settings.txt, not just memory
+			savedOK := onDisk.md_default == .Preview
+			fmt.printfln("  ...settings.txt agrees: md_default=%-8v %s", onDisk.md_default, "OK" if savedOK else "FAIL")
+			if !savedOK {bad += 1}
+			app_destroy(&a)
+		}
+		{
+			a: App
+			dummy: plat.Window
+			a.settings = settings_default()
+			a.settings.remember_views = false
+			app_open_path(&a, csvf)
+			command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10) // Off -> On
+			notLearned := a.settings.table_default == false
+			fmt.printfln("  remember off: toggle -> table_default=%-5v (unchanged) %s", a.settings.table_default, "OK" if notLearned else "FAIL")
+			if !notLearned {bad += 1}
+			app_destroy(&a)
+		}
+
+		fmt.println("--- session restore wins over the family default ---")
+		{
+			// A tab left in Preview, saved and restored, must not come back forced
+			// onto a family default that says something else. (md_mode/table are
+			// not yet persisted per tab in session.txt -- only wrap is -- so the
+			// restored value below is always Off/false either way. What this
+			// proves is the property that matters regardless: app_apply_view_defaults
+			// is never reached from the restore path, so it can never overwrite a
+			// per-tab view -- today's Off, or a persisted value a future session
+			// format might carry.)
+			a: App
+			app_open_path(&a, mdf)
+			d := app_active(&a)
+			d.md_mode = .Preview // the view the user deliberately left this tab in
+			session_save(&a)
+			app_destroy(&a)
+
+			b: App
+			b.settings = settings_default()
+			b.settings.md_default = .Split // family default now disagrees
+			restored := session_restore(&b)
+			rd := app_active(&b)
+			ok := restored && rd != nil && rd.md_mode == .Off
+			fmt.printfln("  restored tab md_mode=%-8v (md_default=Split, untouched) %s", rd.md_mode if rd != nil else Md_Mode.Off, "OK" if ok else "FAIL")
+			if !ok {bad += 1}
+			app_destroy(&b)
+			// reset the session so the GUI doesn't inherit this test's tabs
+			empty: App
+			app_new_scratch(&empty)
+			session_save(&empty)
+			app_destroy(&empty)
+		}
+
+		fmt.println("--- out-of-range md_default degrades, not corrupts ---")
+		{
+			raw := "newtpad-settings 1\nrestore_session 1\nwrap_default 0\nfont_size 16\nzoom_pct 100\nfont_family Consolas\nfont_style 0\nlink_style 0\nsplit_frac 0.50\nmd_default 99\ntable_default 0\nremember_views 1\n"
+			if p, pok := session_dir(); pok {
+				plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)raw)
+			}
+			s := settings_load()
+			degraded := s.md_default == .Off
+			fmt.printfln("  md_default 99 -> %-8v %s", s.md_default, "OK" if degraded else "FAIL")
+			if !degraded {bad += 1}
+		}
+
+		fmt.printfln("viewmemtest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad splittest` proves the Markdown Split divider has exactly one x:
 	// md_divider_rect and doc_editor_right must agree at any window size and any
 	// fraction, not just at the old hardcoded 0.5 -- comparing the two against

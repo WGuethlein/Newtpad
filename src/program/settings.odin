@@ -48,6 +48,14 @@ Settings :: struct {
 	font_style:      plat.Font_Style,
 	link_style:      Link_Style, // when/how clickable links are shown
 	split_frac:      f32, // Markdown Split divider position; a global preference (not per-file/per-tab)
+	// Remembered per-FAMILY view (not per-extension, not per-file — Wyatt's call:
+	// one default for "markdown-ish" and one for "tabular", learned from the last
+	// view used). Applied only on a fresh open (app_apply_view_defaults); session
+	// restore carries its own per-tab state and must never be overridden by this.
+	md_default:      Md_Mode,
+	table_default:   bool,
+	remember_views:  bool, // when on, toggling a view updates the defaults above;
+	// off turns them into a pin instead of a running average of what you last did
 }
 
 // Families present on this machine, in the curated order. Recomputed when the
@@ -80,6 +88,9 @@ settings_default :: proc() -> Settings {
 		font_style = .Regular,
 		link_style = .Hover,
 		split_frac = SPLIT_DEFAULT,
+		md_default = .Off,
+		table_default = false,
+		remember_views = true, // remembering is on by default; the toggle pins it
 	}
 }
 
@@ -131,6 +142,18 @@ settings_load :: proc() -> Settings {
 			if n, pok := strconv.parse_int(parts[1]); pok && n >= 0 && n <= int(max(Link_Style)) {
 				s.link_style = Link_Style(n)
 			}
+		case "md_default":
+			// Range-checked like font_style/link_style above: an out-of-range integer
+			// (hand-edited, or a future build with more modes) degrades to the
+			// default rather than becoming an invalid enum value every switch on
+			// Md_Mode would then have to defend against.
+			if n, pok := strconv.parse_int(parts[1]); pok && n >= 0 && n <= int(max(Md_Mode)) {
+				s.md_default = Md_Mode(n)
+			}
+		case "table_default":
+			s.table_default = parts[1] == "1"
+		case "remember_views":
+			s.remember_views = parts[1] == "1"
 		case "split_frac":
 			// Clamp here too, not just on save: a hand-edited or corrupted file could
 			// carry a value that never went through the drag's own clamp.
@@ -160,7 +183,7 @@ settings_save :: proc(s: Settings) -> bool {
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\nfont_family %s\nfont_style %d\nlink_style %d\nsplit_frac %.4f\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\nfont_family %s\nfont_style %d\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\nremember_views %d\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
@@ -169,6 +192,9 @@ settings_save :: proc(s: Settings) -> bool {
 		int(s.font_style),
 		int(s.link_style),
 		s.split_frac,
+		int(s.md_default),
+		1 if s.table_default else 0,
+		1 if s.remember_views else 0,
 	)
 	return plat.file_write_atomic(path, transmute([]u8)body)
 }
@@ -187,6 +213,12 @@ SETTINGS_ROWS := []Setting_Row {
 	{"Word wrap new documents", "Long lines fold to the window width instead of running off"},
 	{"Zoom", "Ctrl+= / Ctrl+- / Ctrl+0 anywhere"},
 	{"Show links", "When URLs and paths are highlighted (Ctrl+click always opens)"},
+	// Appended, not inserted -- settings_draw's value switch below is index-based
+	// against this array, so inserting here would shift every later row's value
+	// to the wrong label.
+	{"Markdown default view", "Applied when a .md/.markdown file opens fresh (Ctrl+M cycles)"},
+	{"Table default view", "Applied when a .csv/.tsv file opens fresh (Ctrl+T toggles)"},
+	{"Remember last view used", "Toggling a view updates the two defaults above; off pins them"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
@@ -228,6 +260,14 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		n := int(max(Link_Style)) + 1
 		step := dir if dir != 0 else 1 // Enter cycles forward; Left/Right step
 		s.link_style = Link_Style((int(s.link_style) + step + n) % n)
+	case 4:
+		n := int(max(Md_Mode)) + 1
+		step := dir if dir != 0 else 1 // Enter cycles forward; Left/Right step
+		s.md_default = Md_Mode((int(s.md_default) + step + n) % n)
+	case 5:
+		if dir == 0 {s.table_default = !s.table_default}
+	case 6:
+		if dir == 0 {s.remember_views = !s.remember_views}
 	}
 	settings_apply(rc)
 	settings_save(s^)
@@ -276,6 +316,12 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			val = fmt.tprintf("%d%%", app.settings.zoom_pct)
 		case 3:
 			val = link_style_name(app.settings.link_style)
+		case 4:
+			val = md_mode_name(app.settings.md_default)
+		case 5:
+			val = "Table" if app.settings.table_default else "Off"
+		case 6:
+			val = "On" if app.settings.remember_views else "Off"
 		}
 		vc := [4]f32{0.55, 0.85, 0.60, 1} if val != "Off" else [4]f32{0.55, 0.60, 0.70, 1}
 		plat.text_draw(gfx, t, val, width - sx(220), y, UI_PX, vc)

@@ -687,6 +687,15 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			} else {
 				clear(&doc.table_widths) // recompute on next open (content may have changed)
 			}
+			// Learn the family default so the next tabular file opens the same way.
+			// Gated on remember_views: with it off the Settings value is a pin, not a
+			// running average of what you last did. Keyed on doc_is_tabular (the
+			// extension), not doc_can_table, so toggling table view on an untitled
+			// scratch buffer never teaches the family a default.
+			if app.settings.remember_views && doc_is_tabular(doc) {
+				app.settings.table_default = doc.table
+				settings_save(app.settings)
+			}
 		}
 	case .Toggle_Preview:
 		// Cycle Off -> Preview -> Split -> Off. Both preview modes scroll from
@@ -700,6 +709,15 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				doc.md_mode = .Split
 			case .Split:
 				doc.md_mode = .Off
+			}
+			// Learn the family default so the next file of this type opens the same
+			// way. Gated on remember_views: with it off the Settings value is a pin,
+			// not a running average of what you last did. Keyed on doc_is_markdownish
+			// (the extension), not doc_can_markdown, so cycling preview on an untitled
+			// scratch buffer never teaches the family a default.
+			if app.settings.remember_views && doc_is_markdownish(doc) {
+				app.settings.md_default = doc.md_mode
+				settings_save(app.settings)
 			}
 		}
 

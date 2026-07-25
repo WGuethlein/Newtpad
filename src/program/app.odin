@@ -172,6 +172,19 @@ app_open_special :: proc(a: ^App, kind: Tab_Kind) {
 	app_activate(a, app_add(a, d))
 }
 
+// Apply the remembered per-family view to a newly opened document. Fresh opens
+// only: session restore carries its own per-tab view state (session_restore
+// builds its Documents directly via doc_open/doc_from_content and never calls
+// this), and overriding that would silently change a view the user had
+// deliberately left set on that specific file. The existing doc_can_* gating
+// still applies, so a stored default can never force a view onto a file that
+// cannot hold it -- a stray md_default cannot wedge a .txt into Split.
+app_apply_view_defaults :: proc(a: ^App, doc: ^Document) {
+	if doc == nil || doc.kind != .Text {return}
+	if a.settings.md_default != .Off && doc_can_markdown(doc) {doc.md_mode = a.settings.md_default}
+	if a.settings.table_default && doc_can_table(doc) {doc.table = true}
+}
+
 // Open `path` into a new tab and activate it. Returns false if the file couldn't
 // be opened (no tab is added in that case).
 app_open_path :: proc(a: ^App, path: string) -> bool {
@@ -189,6 +202,7 @@ app_open_path :: proc(a: ^App, path: string) -> bool {
 		free(d)
 		return false
 	}
+	app_apply_view_defaults(a, d) // fresh open -- see the proc's own comment
 	app_activate(a, app_add(a, d))
 	return true
 }
