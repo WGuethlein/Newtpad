@@ -2652,6 +2652,23 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			doc_move_lines(&doc, delta)
 			return strings.clone(doc_debug_string(&doc), context.temp_allocator)
 		}
+		// Every case above collapses cursor and anchor to the same point, so a
+		// multi-line SELECTION -- a_bytes covering more than one line, the
+		// anchor/cursor restore's shift arithmetic -- was never exercised by any
+		// of them. That is exactly the path the unbounded-read finding lived in,
+		// and not a coincidence: an untested path is where an unchecked read
+		// range survives. Returns the resulting anchor/cursor too, not just the
+		// buffer, since a move that gets the bytes right but drops the
+		// selection in the wrong place still breaks "hold the key to repeat".
+		one_sel :: proc(content: string, eol: base.Line_Ending, anchor, cursor, delta: int) -> (buf: string, out_anchor, out_cursor: int) {
+			doc: Document
+			doc.pt = base.pt_init(transmute([]u8)content)
+			defer doc_close(&doc)
+			doc.eol = eol
+			doc.anchor, doc.cursor = anchor, cursor
+			doc_move_lines(&doc, delta)
+			return strings.clone(doc_debug_string(&doc), context.temp_allocator), doc.anchor, doc.cursor
+		}
 		fmt.println("movelinetest:")
 		// LF, middle of the file
 		chk("LF: move line 2 up", one("a\nb\nc\n", .LF, 2, -1), "b\na\nc\n", &fail)
@@ -2677,6 +2694,26 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// Both directions of the same swap, since both synthesised under the old model.
 		chk("Mixed: unterminated last up preserves CRLF", one("a\nb\r\nc", .Mixed, 5, -1), "a\nc\r\nb", &fail)
 		chk("Mixed: into unterminated last preserves CRLF", one("a\nb\r\nc", .Mixed, 2, 1), "a\nc\r\nb", &fail)
+		// Multi-line selection covering "bb" and "ccc" (bytes 2..7 of
+		// "a\nbb\nccc\nd\n"): a_bytes = pt[2:8) = "bb\nccc", with "a" above and
+		// "d" below. Moving down swaps the pair past "d"; moving up swaps it
+		// past "a". Both directions of the same selection, mirroring the
+		// single-line up/down pairs above.
+		sel_fixture := "a\nbb\nccc\nd\n"
+		{
+			buf, a, c := one_sel(sel_fixture, .LF, 2, 7, 1)
+			chk("multi-line sel: down past neighbour", buf, "a\nd\nbb\nccc\n", &fail)
+			ok := a == 4 && c == 9
+			if !ok {fail = true}
+			fmt.printfln("  %-6s multi-line sel down: anchor=%d cursor=%d (want 4, 9)", "ok" if ok else "FAIL", a, c)
+		}
+		{
+			buf, a, c := one_sel(sel_fixture, .LF, 2, 7, -1)
+			chk("multi-line sel: up past neighbour", buf, "bb\nccc\na\nd\n", &fail)
+			ok := a == 0 && c == 5
+			if !ok {fail = true}
+			fmt.printfln("  %-6s multi-line sel up: anchor=%d cursor=%d (want 0, 5)", "ok" if ok else "FAIL", a, c)
+		}
 		// A line longer than MOVE_LINE_BUDGET must be refused, not scanned: the fix
 		// for the unbounded-scan finding is a bail, and a bail that silently didn't
 		// fire would corrupt the buffer instead of leaving it alone -- so assert the
@@ -2695,6 +2732,29 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				"ok" if ok else "FAIL",
 				"over-budget line is a no-op",
 				len(over_budget),
+				ok,
+			)
+		}
+		// The line-length bail above doesn't cover this: every line here is two
+		// bytes, so lo_exact/last_exact/line_span_cap all succeed quickly and
+		// only the SELECTION's total span (region_hi - region_lo) crosses
+		// MOVE_LINE_BUDGET -- the exact shape of the Critical 1 finding (click
+		// line 2, Ctrl+Shift+End, Alt+Up on a huge file: every individual scan
+		// is short, only the read_range about to run is not). Verified this
+		// fails without the region_hi-region_lo bail in doc_move_lines: with it
+		// removed, the buffer comes back changed instead of byte-identical.
+		{
+			line := "x\n"
+			body := strings.repeat(line, MOVE_LINE_BUDGET / 2 + 50, context.temp_allocator)
+			multi_over := strings.concatenate({"z\n", body}, context.temp_allocator)
+			got, _, _ := one_sel(multi_over, .LF, 2, len(multi_over) - 1, -1)
+			ok := got == multi_over
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s %-34s %d bytes, unchanged=%v",
+				"ok" if ok else "FAIL",
+				"over-budget SELECTION is a no-op",
+				len(multi_over),
 				ok,
 			)
 		}
