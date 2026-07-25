@@ -2897,6 +2897,80 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				}
 				os.remove(path)
 			}
+
+			// A `base light` line overlays Light instead of the default
+			// Dark -- an unnamed role (Md_Quote here) must hold Light's
+			// value, not Dark's. This is the case the fix exists for: before
+			// `base`, a custom theme had no way to express "start from
+			// Light" at all, so a user on Light who picked any custom theme
+			// got every unmentioned role silently reset to Dark's values.
+			{
+				path := write_theme_file(tdir, "baselight", "base light\naccent #ffaa00\n")
+				got := theme_load_file(path, d)
+				ok := got[.Md_Quote] == l[.Md_Quote] && got[.Md_Quote] != d[.Md_Quote]
+				if !ok {fail = true}
+				fmt.printfln(
+					"  %-6s base light: unnamed role holds Light's value=%v (Dark's would be %v)",
+					"ok" if ok else "FAIL",
+					got[.Md_Quote],
+					d[.Md_Quote],
+				)
+				os.remove(path)
+			}
+
+			// A `base dark` line and no `base` line at all both overlay
+			// Dark -- `base` is opt-in, not required, so an existing file
+			// written before this feature existed must keep behaving
+			// exactly as it did.
+			{
+				path := write_theme_file(tdir, "basedark", "base dark\naccent #ffaa00\n")
+				got := theme_load_file(path, d)
+				ok := got[.Md_Quote] == d[.Md_Quote]
+				if !ok {fail = true}
+				fmt.printfln("  %-6s base dark: unnamed role holds Dark's value=%v", "ok" if ok else "FAIL", got[.Md_Quote])
+				os.remove(path)
+
+				path2 := write_theme_file(tdir, "nobase", "accent #ffaa00\n")
+				got2 := theme_load_file(path2, d)
+				ok2 := got2[.Md_Quote] == d[.Md_Quote]
+				if !ok2 {fail = true}
+				fmt.printfln("  %-6s no base line: unnamed role holds Dark's value=%v", "ok" if ok2 else "FAIL", got2[.Md_Quote])
+				os.remove(path2)
+			}
+
+			// An unrecognized base value falls back to Dark, the same
+			// "malformed input degrades" contract every other bad value in
+			// this loader already has.
+			{
+				path := write_theme_file(tdir, "basebogus", "base solarized\naccent #ffaa00\n")
+				got := theme_load_file(path, d)
+				ok := got[.Md_Quote] == d[.Md_Quote]
+				if !ok {fail = true}
+				fmt.printfln("  %-6s unrecognized base falls back to Dark: %v", "ok" if ok else "FAIL", got[.Md_Quote])
+				os.remove(path)
+			}
+
+			// `base` is recognized anywhere in the file, not only on the
+			// first line -- this format has no ordering rules, so a `base`
+			// line appearing after role lines must still apply to all of
+			// them (a single-pass fold would only pick this up if `base`
+			// happened to come first).
+			{
+				path := write_theme_file(tdir, "baselate", "accent #ffaa00\nmd_quote #112233\nbase light\n")
+				got := theme_load_file(path, d)
+				want_named := [4]f32{f32(0x11) / 255, f32(0x22) / 255, f32(0x33) / 255, 1}
+				named_applied := got[.Md_Quote] == want_named
+				unnamed_uses_light := got[.Text_Primary] == l[.Text_Primary] && got[.Text_Primary] != d[.Text_Primary]
+				ok := named_applied && unnamed_uses_light
+				if !ok {fail = true}
+				fmt.printfln(
+					"  %-6s base after role lines still applies: named role=%v, unnamed role uses Light=%v",
+					"ok" if ok else "FAIL",
+					got[.Md_Quote],
+					unnamed_uses_light,
+				)
+				os.remove(path)
+			}
 		}
 
 		// An unknown theme name in settings.txt falls back to Dark --

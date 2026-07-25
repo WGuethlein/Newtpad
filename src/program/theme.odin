@@ -288,21 +288,23 @@ theme_light :: proc() -> Theme {
 
 // --- theme files ---
 //
-// %APPDATA%\Newtpad\themes\*.theme, one `role #rrggbb` per line. Deliberately
-// the same key/value shape as settings.txt (see settings_load's comment):
-// unknown keys/roles are ignored so an older build reading a newer file
-// degrades instead of failing, and a malformed value leaves that field at
-// whatever it already was -- here, the built-in's value for that role,
-// rather than the zero value, which is transparent black and would render
-// as an invisible hole instead of an obvious error.
+// %APPDATA%\Newtpad\themes\*.theme, one `role #rrggbb` per line, plus one
+// optional `base dark`/`base light` line anywhere in the file (see
+// theme_load_file). Deliberately the same key/value shape as settings.txt
+// (see settings_load's comment): unknown keys/roles are ignored so an older
+// build reading a newer file degrades instead of failing, and a malformed
+// value leaves that field at whatever it already was -- here, the base
+// built-in's value for that role, rather than the zero value, which is
+// transparent black and would render as an invisible hole instead of an
+// obvious error.
 //
 // Built-in themes ("Dark", "Light") are never loaded from a file -- they are
 // theme_dark()/theme_light() directly. A name that isn't one of those two is
-// looked up as themes_dir()/<name>.theme, overlaid onto Dark (see
-// theme_resolve). Per-role colour pickers are deliberately out of scope
-// (CLAUDE.md principle 3, and the spec's "Out of scope" section) -- editing a
-// .theme file by hand is the power-user path; the Settings row only ever
-// picks a name.
+// looked up as themes_dir()/<name>.theme, overlaid onto whichever built-in
+// the file's own `base` key names (see theme_resolve). Per-role colour
+// pickers are deliberately out of scope (CLAUDE.md principle 3, and the
+// spec's "Out of scope" section) -- editing a .theme file by hand is the
+// power-user path; the Settings row only ever picks a name.
 
 // %APPDATA%\Newtpad\themes, created if missing. Sibling of settings.txt and
 // session.txt under the same session_dir(), so NEWTPAD_SESSION_DIR redirects
@@ -340,7 +342,10 @@ theme_parse_hex :: proc(s: string) -> (col: [4]f32, ok: bool) {
 // failing the whole file -- the same "unknown key ignored" contract
 // settings_load uses. Deliberately only the 25 roles the spec's "Theme
 // files" section documents as file-settable; the 9 Syn_* placeholders are
-// not (see theme.odin's enum comment -- batch 4 territory).
+// not (see theme.odin's enum comment -- batch 4 territory). "base" is
+// deliberately absent from this switch -- it selects which built-in
+// theme_load_file starts overlaying onto, it is not a role, and it must
+// never be counted or logged as an unrecognized one.
 @(private = "file")
 theme_role_from_key :: proc(key: string) -> (role: Color_Role, ok: bool) {
 	switch key {
@@ -374,21 +379,69 @@ theme_role_from_key :: proc(key: string) -> (role: Color_Role, ok: bool) {
 }
 
 // Hand-parsed `key value` lines, the same shape settings_load uses. Starts
-// from `base` (always a built-in -- see theme_resolve) and overlays only
-// what the file supplies, so a file naming three roles is a valid theme:
-// the other roles simply keep base's value. Never returns a lower-quality
-// result than `base` -- an unreadable file, an unknown role, or a malformed
-// colour each just skip that one line rather than touching the rest.
+// from a built-in -- Dark by default, or whichever one the file's own `base`
+// line names -- and overlays only what the file supplies, so a file naming
+// three roles is a valid theme: the other roles simply keep the base's
+// value. Never returns a lower-quality result than that base -- an
+// unreadable file, an unknown role, or a malformed colour each just skip
+// that one line rather than touching the rest.
+//
+// `base` exists because a fixed "always overlay Dark" base made a
+// light-based custom theme inexpressible: a user on Light who picked a
+// custom theme naming even one role got every *other* role reset to Dark's
+// values -- backgrounds, text, all of it flipping dark, a much bigger
+// surprise than "a partial file is valid" implies. Overlaying whichever
+// built-in was active before the switch was considered and rejected too --
+// that would make a custom theme's appearance depend on Dark/Light history
+// instead of the file itself, which is worse (non-deterministic from the
+// file's point of view). Letting the file declare its own base fixes both:
+// the file alone determines the theme's appearance, independent of what was
+// selected before, and a light-based custom theme finally becomes
+// expressible.
+//
+// `base` is recognized anywhere in the file, not just the first line -- this
+// format has no ordering rules (settings.txt doesn't either), so resolving
+// it is a first pass over every line before any role overlay is applied,
+// rather than a single-pass fold that would only see a `base` line if it
+// happened to come first. An absent or unrecognized value (`base solarized`,
+// a typo, no `base` line at all) falls back to Dark, the same "malformed
+// input degrades, never fails" contract theme_parse_hex/theme_role_from_key
+// already use.
 theme_load_file :: proc(path: string, base: Theme) -> Theme {
-	t := base
 	data, err := os.read_entire_file(path, context.temp_allocator)
 	if err != nil {
-		return t
+		return base
 	}
-	for line in strings.split_lines(string(data), context.temp_allocator) {
+	lines := strings.split_lines(string(data), context.temp_allocator)
+
+	// Pass 1: resolve the base built-in from a `base` line, wherever it
+	// falls. Starts at Dark so an absent or unrecognized value already
+	// lands on the required fallback without a separate branch.
+	t := theme_dark()
+	for line in lines {
 		parts := strings.split_n(strings.trim_space(line), " ", 2, context.temp_allocator)
 		if len(parts) < 2 {continue}
-		role, rok := theme_role_from_key(strings.trim_space(parts[0]))
+		if strings.trim_space(parts[0]) != "base" {continue}
+		switch strings.trim_space(parts[1]) {
+		case "dark": t = theme_dark()
+		case "light": t = theme_light()
+		// anything else is malformed: leave t at whatever a prior valid
+		// `base` line set it to, or Dark if none has appeared yet -- never
+		// black, same fallback contract every other malformed value here has.
+		}
+	}
+
+	// Pass 2: overlay named roles onto the base resolved above. `base`
+	// itself is skipped explicitly rather than falling through to
+	// theme_role_from_key's unknown-role branch -- it is not a role, and
+	// must never be mistaken for one (theme_role_from_key has no "base"
+	// case, so this is also independently enforced there).
+	for line in lines {
+		parts := strings.split_n(strings.trim_space(line), " ", 2, context.temp_allocator)
+		if len(parts) < 2 {continue}
+		key := strings.trim_space(parts[0])
+		if key == "base" {continue}
+		role, rok := theme_role_from_key(key)
 		if !rok {continue}
 		col, cok := theme_parse_hex(strings.trim_space(parts[1]))
 		if !cok {continue} // malformed colour: role keeps base's value, never black
@@ -425,11 +478,13 @@ theme_available_names :: proc(allocator := context.temp_allocator) -> []string {
 
 // Resolves a theme by name for both startup and the Settings row. "Dark"
 // and "Light" are theme_dark()/theme_light() directly; anything else is
-// looked up as themes_dir()/<name>.theme overlaid onto Dark. A name that
-// resolves to nothing -- no themes dir, no such file, a stale settings.txt
-// entry left over after the file was renamed or deleted -- falls back to
-// Dark: theme_load_file already returns `base` unchanged when the file
-// can't be read, so this never needs a separate existence check.
+// looked up as themes_dir()/<name>.theme, overlaid onto whichever built-in
+// the file's own `base` line names (theme_load_file), defaulting to Dark
+// when the file has none. A name that resolves to nothing -- no themes dir,
+// no such file, a stale settings.txt entry left over after the file was
+// renamed or deleted -- falls back to Dark: theme_load_file already returns
+// its `base` argument unchanged when the file can't be read, so this never
+// needs a separate existence check.
 theme_resolve :: proc(name: string) -> Theme {
 	switch name {
 	case "Dark":
