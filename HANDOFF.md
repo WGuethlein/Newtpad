@@ -1360,6 +1360,27 @@ after leaving the previous one in Split — this environment cannot inject GUI i
 in the session format (task 5 finding above). The project-wide forgotten-feature audit that follows
 this batch, per Wyatt's decision to keep it a separate written report rather than fold it in here.
 
+**Found by the whole-branch review, recorded rather than fixed:**
+
+- **Paste still writes clipboard bytes verbatim** (`commands.odin`). The Windows clipboard is CRLF by
+  convention, so pasting multi-line text into an LF file produces exactly the silent line-ending
+  mixing task 0 was justified by — via the most common way multi-line text enters a buffer. Task 0's
+  sweep judged paste "correctly left alone" on the grounds that a paste should preserve what was
+  copied. Defensible, but it is the opposite conclusion from task 0 on the same harm, so it is
+  written down here rather than left as an undocumented split decision.
+- **`doc_reload` loses the view.** It rebuilds via `doc_open` preserving `wrap` but not
+  `md_mode`/`table`, so an external-change reload silently resets a tab's view. Pre-existing, but this
+  batch makes it visible: with `md_default = .Split`, a reload now disagrees with what a fresh open of
+  the same file would do.
+- **`test_modes.odin` grew ~600 more lines** (five new modes). §6s already flagged it as the largest
+  single contributor to release binary size, since it is `package main` and ships in the release exe.
+  Gating the harness behind a build flag is now the highest-value size item by a wide margin.
+- **Six test modes wrote real user state.** `splittest`, `viewmemtest`, `settingstest`, `sessiontest`,
+  `diskstamptest` and `sessionlosstest` all wrote to `session_dir()`, which falls back to the real
+  per-user Newtpad folder under `%APPDATA%` — so running any of them bare destroyed real settings and
+  the session store including unsaved-tab backups. They now refuse to run without
+  `NEWTPAD_SESSION_DIR`. A documented constraint that nothing enforced was not a constraint.
+
 **Out of scope, confirmed still out:** rebindable keys, a duplicate-line command (offered and
 declined), per-family split fractions, opening a folder's contents.
 
