@@ -218,7 +218,8 @@ Expected: compile error (`doc_move_lines` undefined).
 In `src/program/doc.odin`, near the other line operations. Shape, not verbatim code — the terminator bookkeeping is the substance of this task and must be reasoned through, not transcribed:
 
 - Compute the moving span as **logical** lines: `lo = pt_line_start(min(anchor, cursor))`, `hi = pt_line_end(max(anchor, cursor))`. Logical, not visual, so wrap changes nothing.
-- Bail early (no edit at all, so no undo entry) when there is no neighbour: `delta < 0 && lo == 0`, or `delta > 0 && hi >= pt.length`.
+- Bail early (no edit at all, so no undo entry) when there is no neighbour. Upward that is `lo == 0`. Downward it is **not** `hi >= pt.length`: on a buffer ending with a newline, the last content line's `pt_line_end` is strictly less than `length`, so that test lets the move swap with the phantom empty final row instead of doing nothing. Test the span *including its terminator* against the buffer end — the line is last when nothing follows its own break.
+- Register the two commands in `command_mutates_doc` as well. Table view is read-only (a silent CSV corruption was fixed by making it so), and a command that edits without being listed there bypasses that guard.
 - Think in terms of *"line plus its following terminator"*. Moving down swaps `[lo, hi+term)` with the following line and its terminator; moving up swaps with the preceding one. When one of the two pieces is the final line and has no terminator, the swap must **synthesise** one for the piece that is no longer last and **remove** the one from the piece that now is — using `doc.eol`'s bytes, never a hardcoded `"\n"`.
 - Do it as a single `doc_replace_range` over the whole affected region rather than several edits, so intermediate states never exist and offsets cannot drift mid-operation.
 - Wrap in `doc_batch_begin(doc, .Replace)` / `doc_batch_end(doc, 1)` so one press is one undo entry.
