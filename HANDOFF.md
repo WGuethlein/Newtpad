@@ -1472,6 +1472,118 @@ files and of a folder, dragging the split divider and confirming it survives a r
 `.md` after leaving the previous one in Split. This environment cannot inject GUI input, so those are
 Wyatt's to confirm.
 
+## 6v. Colour model and themes (2026-07-25, v0.12.0, branch `feat/theme-model`)
+
+Batch 3 of the six in §6u, and the first of them to ship. Themes are named in CLAUDE.md principle 4 and
+had never existed: 107 hardcoded colour literals across 14 files, zero occurrences of "theme".
+
+Design in `docs/superpowers/specs/2026-07-25-theme-model-design.md`, plan in
+`docs/superpowers/plans/2026-07-25-theme-model.md`.
+
+**Why this went before syntax highlighting.** Highlighting introduces ~5 colour roles per format; if
+the model landed after it, every one would be written as RGB and migrated immediately. Batch 4's
+lexers can now emit role names from their first line. Nine `Syn_*` roles are already declared and
+deliberately unused — magenta in Dark as a "missing texture" marker, real values in Light. **Do not
+delete them as dead code.**
+
+### The model
+
+`Color_Role` enum, `Theme :: [Color_Role][4]f32`, one global `g_theme` read by array index in the
+per-frame path. The total-array-over-the-enum shape means a new role forces every theme to supply a
+value — and note *why* that holds: **Odin rejects an incomplete keyed enumerated-array composite
+literal at compile time**, verified empirically against this repo's compiler. The `#assert` next to it
+guards something narrower (that `Theme` stays defined in terms of the enum rather than being
+hand-rolled to a fixed size); the comment there says so.
+
+### 66 roles became 25, and the guard changed with it
+
+A faithful one-role-per-literal model came to 66 — a theme nobody would author. Clustering the 61
+distinct values by chroma and luminance found the real structure: **ten neutral tiers absorbing 42
+near-duplicate greys across 81 sites**, plus **fifteen semantic accents**. `Text_Muted` alone was seven
+shades doing one job across 18 sites.
+
+Consequence: **Dark is deliberately not pixel-identical to v0.11.0** — roughly 50 sites shift slightly.
+That forfeited the original mechanical guard ("if any pixel changes, the migration is wrong"), replaced
+by: every role must hold **one of the literals its row in the spec's merge table lists**, encoded as
+data in `themetest` and transcribed from the spec rather than from `theme_dark`. A typo lands on no
+list and fails; an intended merge passes.
+
+Five of `markdown.odin`'s ten `MD_*` roles dissolved into generic neutrals, so **markdown body text is
+no longer themeable independently of chrome text**. Each dissolved role is traced to its new home in
+`theme.odin`'s per-role comments.
+
+### The light theme is what made this worth doing
+
+Every colour in the tree was chosen against a dark background over months. A dark-only model is
+indistinguishable from a rename. Light, judged by arithmetic since nothing here can see a screen,
+found four real defects that would otherwise have shipped:
+
+- **The caret was invisible** — Dark's `#F2D959` computes to **1.42:1** on white. Light's is `#946200`
+  at 5.30:1: deepened, not lightened.
+- **Three highlight fills were near-invisible**, each a case where the fill is the *only* cue:
+  `Find_Match_Bg` at **1.28:1**, `Selection_Doc` (in-document text selection) at **1.48:1**, and
+  `Selection_List` (menu hover, history selection — keyboard menu navigation has no other indicator) at
+  **1.12:1**. All now clear 1.6:1.
+
+The first contrast audit measured text-on-background pairs exhaustively and **missed all three fills**,
+because a fill sits on a surface rather than carrying text. The lesson worth keeping: *audit fills
+against their surfaces, not just foregrounds against backgrounds.*
+
+`Danger` is the only role deliberately shared between themes — a solid hover fill never blended with
+chrome, and Windows renders that hover the same red under either system theme. The shared-role
+mechanism defaults to "must differ", so a role that accidentally matches fails loudly.
+
+### Theme files
+
+`%APPDATA%\Newtpad\themes\*.theme`, `role #rrggbb` lines, mirroring `settings_load` — unknown keys
+ignored, so old and new builds interoperate. A partial file overlays a built-in; a malformed colour
+(`#zzz`, `#12`, no `#`, wrong length, empty, trailing garbage) leaves that role at its built-in value
+and **never** at black, which would be an invisible hole rather than an obvious error.
+
+A `base dark|light` key, recognised **anywhere in the file**, says which built-in a custom theme
+extends. Without it a light-based custom theme was inexpressible at any level of partiality, and a
+Light user selecting any partial custom theme silently got Dark's entire scheme back.
+
+One Settings row picks a theme, by name rather than index. The row list now scrolls — the eighth row
+overflowed at 150% DPI on a 1366×768 screen and overprinted the version string, while staying
+keyboard-selectable off-screen.
+
+### Two things the batch got wrong that are worth remembering
+
+- **The document canvas survived all five task reviews.** `main.odin`'s `gfx_begin_frame` passed the
+  clear colour as three loose `f32` arguments, not a `[4]f32` composite — invisible to every grep in
+  the batch, all of which matched `{r, g, b, a}`. Under Light that was near-black text on a near-black
+  canvas across the whole document body, with correct chrome around it. Caught only by the
+  whole-branch review. **A migration grep is only as good as the shapes it looks for.**
+- **`themetest` proves the palette, never the mapping.** Nothing checks that a call site uses the role
+  the merge table assigned it; swapping two roles at any of the 107 sites still passes. The mapping
+  rests entirely on human review, which is why each task's review re-derived every substitution by
+  hand.
+
+### Owed and open
+
+- **Wyatt's live pass.** Ranked in the review; the top three: switch to Light and confirm the document
+  body is actually white with readable text; open a menu and History in Light and confirm the selected
+  row is visible; check Settings at 150% DPI on the 1366×768 laptop. Then the Dark regression sites that
+  actually moved — disabled menu items (now brighter, may not read as greyed out), inactive tabs,
+  the scrollbar thumb, markdown bullets.
+- **Two role splits, deferred for Wyatt's decision.** `Border_Subtle` serves a table hairline *and* the
+  active-tab elevated fill; on light, `Bg_Base` is `#FFFFFF` so nothing can be lighter and both jobs are
+  forced to want "darker" — the argument is geometric, not numeric. `Text_Muted` is simultaneously
+  gutter/hint text *and* the scrollbar thumb, so darkening it for legibility darkens the thumb. Both are
+  the same underlying issue: the neutral ramp was clustered by luminance without separating fills from
+  foregrounds.
+- **`table.odin`'s header/body text cue is gone** — both land in `Text_Primary`. The header keeps its
+  `Bg_Raised` band, so the row is still identifiable; only the text-weight difference went.
+- Minor, carried: a `theme_name` clone per Settings cycle press with no free; a file named
+  `Dark.theme`/`Light.theme` lists but can never load; custom-theme cycling follows directory order and
+  is unstable between runs; a later invalid `base` line does not reset an earlier valid one.
+- **Layer note for the `renderer`/`ui` extraction:** this makes it *easier* — 107 embedded design
+  decisions left the draw code — but `Color_Role`/`Theme`/`g_theme` live in `package main` today. When
+  `ui` becomes its own package it will need them, and `ui`→`program` is backwards, so `theme.odin` will
+  have to **split**: type and built-ins down into `ui`, the loader staying in `program` because it
+  depends on `session_dir()`. A split, not a move.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
