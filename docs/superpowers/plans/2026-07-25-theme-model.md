@@ -107,6 +107,12 @@ git commit -m "Add a colour role model and the current theme"
 
 The hot path. `doc.odin` and `main.odin`, ~23 literals.
 
+- [ ] **Step 0: Initialise `g_theme` at startup, before migrating anything**
+
+`g_theme = theme_dark()` during `main`'s init, beside the other one-time setup. **This must land in the same commit as the first migrated call site**, or every migrated surface renders as transparent black — a zero-value `Theme` is `{0,0,0,0}` — until theme loading arrives in Task 5.
+
+The property worth protecting: **the app runs correctly at every commit on this branch.** A migration that leaves the build black between tasks is not a safe place to stop, and this batch will be stopped in the middle at some point.
+
 - [ ] **Step 1: Replace each literal with its role**
 
 `g_theme[.Role]` at each site. Nothing else changes — no reordering, no refactoring, no "while I'm here."
@@ -179,6 +185,8 @@ git commit -m "Add a light theme"
 ---
 
 ## Task 5: Theme files and the Settings row
+
+Note `g_theme` is already initialised to Dark at startup (Task 2 Step 0); this step replaces that assignment with a load, it does not introduce the first one.
 
 - [ ] **Step 1: The loader**
 
