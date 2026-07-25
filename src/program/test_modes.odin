@@ -2495,6 +2495,57 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad rowtest` dumps the visible rows for buffers with and without a
+	// trailing newline, and where the caret lands in each. A buffer whose last
+	// line runs to EOF has no successor row; emitting one puts the caret on it.
+	if os.args[1] == "rowtest" {
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("rowtest: no fonts loaded")
+			return true
+		}
+		fail := false
+		one :: proc(content: string, caret: int, want_rows: int, want_caret_row: int, t: ^plat.Text, fail: ^bool) {
+			doc: Document
+			doc.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&doc.pt)
+			doc.cursor, doc.anchor = caret, caret
+			doc.view_cols = 40
+			rows := 0
+			caret_row := -1
+			it := visible_begin(&doc, t, 10)
+			for {
+				row, start, end, line_end, _, ok := visible_next(&it)
+				if !ok {break}
+				rows += 1
+				if doc.cursor >= start && doc.cursor <= end && (line_end || doc.cursor < end) {
+					caret_row = row // last match wins, exactly as doc_draw does
+				}
+			}
+			ok := rows == want_rows && caret_row == want_caret_row
+			if !ok {fail^ = true}
+			fmt.printfln(
+				"  %-6s %q caret=%d -> rows=%d (want %d) caret_row=%d (want %d)",
+				"ok" if ok else "FAIL",
+				content,
+				caret,
+				rows,
+				want_rows,
+				caret_row,
+				want_caret_row,
+			)
+		}
+		fmt.println("rowtest:")
+		one("", 0, 1, 0, &t, &fail) // empty scratch: one row, caret on it
+		one("a", 1, 1, 0, &t, &fail) // THE BUG: caret must stay on row 0
+		one("ab", 2, 1, 0, &t, &fail)
+		one("a\n", 2, 2, 1, &t, &fail) // trailing newline: the empty last row is real
+		one("a\nb", 3, 2, 1, &t, &fail)
+		one("a\nb\n", 4, 3, 2, &t, &fail)
+		fmt.println("rowtest: FAILURES" if fail else "rowtest: all ok")
+		return true
+	}
+
 	if len(os.args) < 3 {return false}
 	path, mode := os.args[1], os.args[2]
 

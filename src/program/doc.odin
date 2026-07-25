@@ -360,10 +360,12 @@ prev_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 // is bounded by a row; a force-wrappable line is <= WRAP_START_CAP), so the
 // huge-file guarantee holds. ---
 
-// Start of the visual row after the one starting at `p`.
-eff_next_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
+// Next visual row start, wrap-aware. `ok` is false when `p`'s row was the last —
+// see next_row_start_capped for why that is distinct from "starts at length".
+eff_next_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (start: int, ok: bool) {
 	if wrap, _ := eff_wrap_at(doc, t, p); wrap {
-		return next_visual_row(doc, t, p, cols)
+		nv := next_visual_row(doc, t, p, cols)
+		return nv, nv > p
 	}
 	return next_row_start_capped(doc, p)
 }
@@ -509,8 +511,8 @@ visible_next :: proc(it: ^Visible_Iter) -> (row, start, end: int, line_end, wrap
 			// newline; a synthetic cap boundary keeps us in the same (non-wrapping,
 			// too-long) line, so we don't re-classify and don't start wrapping it.
 			it.fresh = end >= d.pt.length || (end < d.pt.length && byte_at(d, end) == '\n')
-			nxt := next_row_start_capped(d, start)
-			if nxt <= start {it.done = true} else {it.pos = nxt}
+			nxt, more := next_row_start_capped(d, start)
+			if !more {it.done = true} else {it.pos = nxt}
 		}
 	}
 	row = it.r
@@ -1569,7 +1571,11 @@ doc_cursor_down :: proc(doc: ^Document, t: ^plat.Text, select: bool) {
 		return
 	}
 	col := line_cell_col(doc, t, vs, doc.cursor)
-	nv := eff_next_row(doc, t, vs, doc.view_cols)
+	nv, more := eff_next_row(doc, t, vs, doc.view_cols)
+	if !more {
+		set_cursor(doc, doc.pt.length, select)
+		return
+	}
 	ne := eff_row_end(doc, t, nv, doc.view_cols)
 	set_cursor(doc, line_offset_at_cell(doc, t, nv, ne, col), select)
 }
@@ -1722,12 +1728,22 @@ row_start_capped :: proc(doc: ^Document, pos: int) -> int {
 	return s
 }
 
+// Start of the row after the one beginning at `pos`. `ok` is false when that row
+// was the last one.
+//
+// The two facts this used to conflate: "the next row starts at length" is true
+// when the buffer ends with a newline, where that final empty row exists and
+// must render; "there is no next row" is true when the last line runs to EOF
+// with no newline to step past. Returning length for both emitted a phantom row
+// at [length, length] on every buffer without a trailing newline — which is
+// every scratch buffer — and the caret, matching it, was drawn on it.
 @(private = "file")
-next_row_start_capped :: proc(doc: ^Document, pos: int) -> int {
+next_row_start_capped :: proc(doc: ^Document, pos: int) -> (start: int, ok: bool) {
 	e := base.pt_line_end_cap(&doc.pt, pos, RENDER_LINE_CAP)
-	if e >= doc.pt.length {return doc.pt.length}
+	if e >= doc.pt.length {return doc.pt.length, false}
 	// A real newline is stepped past; a synthetic cap boundary starts at e.
-	return e + 1 if byte_at(doc, e) == '\n' else e
+	if byte_at(doc, e) == '\n' {return e + 1, true}
+	return e, true
 }
 
 @(private = "file")
@@ -1782,8 +1798,8 @@ doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta, rows: int) {
 	if delta > 0 {
 		for _ in 0 ..< delta {
-			nt := eff_next_row(doc, t, doc.top, doc.view_cols)
-			if nt == doc.top {break}
+			nt, more := eff_next_row(doc, t, doc.top, doc.view_cols)
+			if !more || nt == doc.top {break}
 			doc.top = nt
 		}
 	} else if delta < 0 {
@@ -1830,7 +1846,9 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 	p := doc.top
 	for _ in 0 ..< rows {
 		if p >= cls {return}
-		p = eff_next_row(doc, t, p, doc.view_cols)
+		np, more := eff_next_row(doc, t, p, doc.view_cols)
+		if !more {break}
+		p = np
 	}
 	// caret is below the viewport: put its row at the bottom
 	doc.top = cls
