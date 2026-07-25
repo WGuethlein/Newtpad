@@ -653,6 +653,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			font_family     = "Courier New",
 			font_style      = .Italic,
 			split_frac      = 0.25, // non-zero, non-default, exact in binary float (survives %.4f round-trip)
+			theme_name      = "Light", // non-blank, non-default -- see the blank-normalises check below for ""
 		}
 		settings_save(w)
 		r := settings_load()
@@ -2664,6 +2665,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// not copied out of theme_dark -- copying from the theme would make this
 	// test agree with a transposed digit instead of catching one.
 	if os.args[1] == "themetest" {
+		if !require_scratch_session("themetest") {return true}
 		d := theme_dark()
 		fail := false
 
@@ -2799,6 +2801,118 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			} else if is_shared {
 				fmt.printfln("  ok     %v shared with Dark: %s", role, reason)
 			}
+		}
+
+		// --- theme files: loading from disk (Task 5) ---
+		//
+		// Mirrors settings_load's shape exactly: same `key value` per-line
+		// parse, same "unknown key ignored" contract (theme_role_from_key),
+		// same "start from a valid default and overlay" so a partial file is
+		// valid (theme_load_file). Everything below writes only under
+		// NEWTPAD_SESSION_DIR/themes -- require_scratch_session at the top of
+		// this mode already refused to run without that set, so none of this
+		// touches the real %APPDATA%\Newtpad.
+		tdir, tdir_ok := themes_dir()
+		if !tdir_ok {
+			fmt.println("  FAIL   themetest: themes_dir unavailable")
+			fail = true
+		} else {
+			write_theme_file :: proc(dir, name, body: string) -> string {
+				path := fmt.tprintf("%s%c%s.theme", dir, '\\', name)
+				_ = os.write_entire_file(path, body)
+				return path
+			}
+
+			// A file naming several roles round-trips: every named role comes
+			// back exactly as written. Expected colours are computed the same
+			// way theme_parse_hex does (f32(digit-pair) / 255), not by
+			// reusing theme_parse_hex itself, so a bug in that arithmetic
+			// can't hide behind agreeing with its own test.
+			{
+				path := write_theme_file(tdir, "roundtrip", "bg_base #112233\ntext_primary #aabbcc\ncaret #ff00ff\n")
+				got := theme_load_file(path, d)
+				want_bg := [4]f32{f32(0x11) / 255, f32(0x22) / 255, f32(0x33) / 255, 1}
+				want_tp := [4]f32{f32(0xaa) / 255, f32(0xbb) / 255, f32(0xcc) / 255, 1}
+				want_caret := [4]f32{1, 0, 1, 1}
+				ok := got[.Bg_Base] == want_bg && got[.Text_Primary] == want_tp && got[.Caret] == want_caret
+				if !ok {fail = true}
+				fmt.printfln(
+					"  %-6s file round-trip: bg_base=%v text_primary=%v caret=%v",
+					"ok" if ok else "FAIL",
+					got[.Bg_Base],
+					got[.Text_Primary],
+					got[.Caret],
+				)
+				os.remove(path)
+			}
+
+			// A partial file -- naming only one role -- leaves every role it
+			// doesn't mention at the base's built-in value.
+			{
+				path := write_theme_file(tdir, "partial", "accent #ffaa00\n")
+				got := theme_load_file(path, d)
+				changed := got[.Accent] == [4]f32{1, f32(0xaa) / 255, 0, 1}
+				untouched := got[.Md_Quote] == d[.Md_Quote] && got[.Bg_Base] == d[.Bg_Base] && got[.Text_Primary] == d[.Text_Primary]
+				ok := changed && untouched
+				if !ok {fail = true}
+				fmt.printfln(
+					"  %-6s partial file: named role changed=%v, unmentioned roles untouched=%v",
+					"ok" if ok else "FAIL",
+					changed,
+					untouched,
+				)
+				os.remove(path)
+			}
+
+			// An unknown role name is skipped, not fatal -- the rest of the
+			// file still loads.
+			{
+				path := write_theme_file(tdir, "unknownrole", "not_a_real_role #ffffff\nlink #112233\n")
+				got := theme_load_file(path, d)
+				ok := got[.Link] == [4]f32{f32(0x11) / 255, f32(0x22) / 255, f32(0x33) / 255, 1}
+				if !ok {fail = true}
+				fmt.printfln("  %-6s unknown role name ignored, rest of file still applied: link=%v", "ok" if ok else "FAIL", got[.Link])
+				os.remove(path)
+			}
+
+			// Each malformed-colour form leaves that role at the built-in
+			// value -- never the zero value, which is transparent black and
+			// would render as an invisible hole rather than an obvious error.
+			{
+				path := write_theme_file(
+					tdir,
+					"malformed",
+					"border_strong #zzz\ntext_dim #12\nwarning 1122334\ndanger #1122334\n",
+				)
+				got := theme_load_file(path, d)
+				roles := []Color_Role{.Border_Strong, .Text_Dim, .Warning, .Danger}
+				labels := []string{"#zzz (non-hex digits)", "#12 (too short)", "1122334 (missing #)", "#1122334 (wrong length)"}
+				for role, i in roles {
+					v := got[role]
+					never_black := v != ([4]f32{0, 0, 0, 0}) && v != ([4]f32{0, 0, 0, 1})
+					fell_back := v == d[role]
+					ok := fell_back && never_black
+					if !ok {fail = true}
+					fmt.printfln("  %-6s malformed %-28s -> %v (built-in=%v)", "ok" if ok else "FAIL", labels[i], v, d[role])
+				}
+				os.remove(path)
+			}
+		}
+
+		// An unknown theme name in settings.txt falls back to Dark --
+		// validated in settings_load's "theme_name" case, the same way it
+		// already range-checks font_style/link_style/md_default.
+		{
+			bogus := settings_default()
+			bogus.theme_name = "TotallyBogusThemeName"
+			settings_save(bogus)
+			loaded := settings_load()
+			ok := loaded.theme_name == "Dark"
+			if !ok {fail = true}
+			fmt.printfln("  %-6s unknown theme_name in settings.txt -> %q (want \"Dark\")", "ok" if ok else "FAIL", loaded.theme_name)
+			// Leave settings.txt in a known-good state for any later mode run
+			// against the same NEWTPAD_SESSION_DIR in this process.
+			settings_save(settings_default())
 		}
 
 		fmt.println("themetest: FAILURES" if fail else "themetest: all ok")

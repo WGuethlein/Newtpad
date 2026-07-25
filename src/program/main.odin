@@ -122,10 +122,13 @@ main :: proc() {
 	}
 	defer app_destroy(&app)
 
-	// Initialize theme to dark mode. The zero-initialized Theme is transparent black,
-	// making every themed surface invisible without this assignment. Task 5 will later
-	// replace this with a load-from-disk that falls back to theme_dark.
-	g_theme = theme_dark()
+	// Load the saved theme choice. The zero-initialized Theme is transparent
+	// black, making every themed surface invisible without this assignment --
+	// theme_resolve always returns a fully-populated theme, falling back to
+	// theme_dark() for "Dark", an empty/corrupt settings.txt, or any name
+	// settings_load already rejected as unrecognized (see its "theme_name"
+	// case), so this can never leave g_theme at the zero value.
+	g_theme = theme_resolve(app.settings.theme_name)
 
 	// The renderer is reusable so the WM_SIZE handler can repaint live during a
 	// window resize (the OS runs a modal loop that otherwise freezes this one).

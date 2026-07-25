@@ -57,6 +57,12 @@ Settings :: struct {
 	// When on, toggling a view updates the defaults above; off turns them into a
 	// pin instead of a running average of what you last did.
 	remember_views:  bool,
+	// "Dark", "Light", or a custom *.theme file's stem (see theme_resolve).
+	// Validated on load against theme_available_names -- an unknown name
+	// (hand-edited, or a file that was renamed/deleted since) is rejected
+	// rather than stored, leaving this at settings_default's "Dark" so
+	// theme_resolve never has to guess what the author meant.
+	theme_name:      string,
 }
 
 // Families present on this machine, in the curated order. Recomputed when the
@@ -92,6 +98,7 @@ settings_default :: proc() -> Settings {
 		md_default = .Off,
 		table_default = false,
 		remember_views = true, // remembering is on by default; the toggle pins it
+		theme_name = "Dark",
 	}
 }
 
@@ -161,6 +168,19 @@ settings_load :: proc() -> Settings {
 			if n, pok := strconv.parse_f32(parts[1]); pok {
 				s.split_frac = clamp(n, SPLIT_MIN, SPLIT_MAX)
 			}
+		case "theme_name":
+			// Range-checked like font_style/link_style/md_default above, just
+			// against a name list instead of an integer range: only accept a
+			// name that resolves to something today (a built-in or an existing
+			// theme file). Anything else -- a typo, or a file since deleted --
+			// leaves theme_name at its "Dark" default rather than storing a name
+			// theme_resolve would silently fall back on every time it's read.
+			for n in theme_available_names(context.temp_allocator) {
+				if n == parts[1] {
+					s.theme_name = strings.clone(parts[1])
+					break
+				}
+			}
 		}
 	}
 	return s
@@ -184,7 +204,7 @@ settings_save :: proc(s: Settings) -> bool {
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\nfont_family %s\nfont_style %d\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\nremember_views %d\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\nfont_family %s\nfont_style %d\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\nremember_views %d\ntheme_name %s\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
@@ -196,6 +216,7 @@ settings_save :: proc(s: Settings) -> bool {
 		int(s.md_default),
 		1 if s.table_default else 0,
 		1 if s.remember_views else 0,
+		s.theme_name if s.theme_name != "" else "Dark",
 	)
 	return plat.file_write_atomic(path, transmute([]u8)body)
 }
@@ -220,6 +241,7 @@ SETTINGS_ROWS := []Setting_Row {
 	{"Markdown default view", "Applied when a .md/.markdown file opens fresh (Ctrl+M cycles)"},
 	{"Table default view", "Applied when a .csv/.tsv file opens fresh (Ctrl+T toggles)"},
 	{"Remember last view used", "Toggling a view updates the two defaults above; off pins them"},
+	{"Theme", "Dark, Light, or a custom .theme file placed in the themes folder"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
@@ -269,6 +291,19 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		if dir == 0 {s.table_default = !s.table_default}
 	case 6:
 		if dir == 0 {s.remember_views = !s.remember_views}
+	case 7:
+		names := theme_available_names(context.temp_allocator)
+		cur := 0
+		for n, i in names {
+			if n == s.theme_name {
+				cur = i
+				break
+			}
+		}
+		step := dir if dir != 0 else 1 // Enter cycles forward; Left/Right step
+		nn := len(names)
+		s.theme_name = strings.clone(names[((cur + step) % nn + nn) % nn])
+		g_theme = theme_resolve(s.theme_name)
 	}
 	settings_apply(rc)
 	settings_save(s^)
@@ -323,6 +358,8 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			val = "Table" if app.settings.table_default else "Off"
 		case 6:
 			val = "On" if app.settings.remember_views else "Off"
+		case 7:
+			val = app.settings.theme_name
 		}
 		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Dim]
 		plat.text_draw(gfx, t, val, width - sx(220), y, UI_PX, vc)

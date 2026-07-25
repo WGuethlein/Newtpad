@@ -21,6 +21,11 @@
 // exactly that, role by role.
 package main
 
+import "core:fmt"
+import "core:os"
+import "core:strconv"
+import "core:strings"
+
 Color_Role :: enum u8 {
 	// --- neutrals: 10 roles absorbing 42 values across 81 sites ---
 
@@ -279,4 +284,163 @@ theme_light :: proc() -> Theme {
 		.Syn_Xml_Tag    = {0.71, 0.09, 0.35, 1}, // #B5165A -- rose/maroon
 		.Syn_Xml_Attr   = {0.42, 0.31, 0.71, 1}, // #6B4FB6 -- violet
 	}
+}
+
+// --- theme files ---
+//
+// %APPDATA%\Newtpad\themes\*.theme, one `role #rrggbb` per line. Deliberately
+// the same key/value shape as settings.txt (see settings_load's comment):
+// unknown keys/roles are ignored so an older build reading a newer file
+// degrades instead of failing, and a malformed value leaves that field at
+// whatever it already was -- here, the built-in's value for that role,
+// rather than the zero value, which is transparent black and would render
+// as an invisible hole instead of an obvious error.
+//
+// Built-in themes ("Dark", "Light") are never loaded from a file -- they are
+// theme_dark()/theme_light() directly. A name that isn't one of those two is
+// looked up as themes_dir()/<name>.theme, overlaid onto Dark (see
+// theme_resolve). Per-role colour pickers are deliberately out of scope
+// (CLAUDE.md principle 3, and the spec's "Out of scope" section) -- editing a
+// .theme file by hand is the power-user path; the Settings row only ever
+// picks a name.
+
+// %APPDATA%\Newtpad\themes, created if missing. Sibling of settings.txt and
+// session.txt under the same session_dir(), so NEWTPAD_SESSION_DIR redirects
+// this too and headless tests stay isolated from the real store.
+themes_dir :: proc() -> (string, bool) {
+	dir, ok := session_dir()
+	if !ok {
+		return "", false
+	}
+	td := fmt.tprintf("%s%cthemes", dir, '\\')
+	os.make_directory(td) // ignore "already exists"
+	return td, true
+}
+
+// Parses "#rrggbb" into a fully-opaque colour. Anything else -- wrong
+// length, a missing '#', non-hex digits -- is malformed; the caller keeps
+// whatever value the role already had rather than accepting this result, so
+// a typo'd digit can never produce transparent black.
+@(private = "file")
+theme_parse_hex :: proc(s: string) -> (col: [4]f32, ok: bool) {
+	if len(s) != 7 || s[0] != '#' {
+		return {}, false
+	}
+	r, rok := strconv.parse_int(s[1:3], 16)
+	g, gok := strconv.parse_int(s[3:5], 16)
+	b, bok := strconv.parse_int(s[5:7], 16)
+	if !rok || !gok || !bok {
+		return {}, false
+	}
+	return {f32(r) / 255, f32(g) / 255, f32(b) / 255, 1}, true
+}
+
+// Role name (lowercase, matching the spec's role table exactly) -> Color_Role.
+// An unrecognized name returns ok=false so the caller skips it instead of
+// failing the whole file -- the same "unknown key ignored" contract
+// settings_load uses. Deliberately only the 25 roles the spec's "Theme
+// files" section documents as file-settable; the 9 Syn_* placeholders are
+// not (see theme.odin's enum comment -- batch 4 territory).
+@(private = "file")
+theme_role_from_key :: proc(key: string) -> (role: Color_Role, ok: bool) {
+	switch key {
+	case "bg_base": return .Bg_Base, true
+	case "bg_panel": return .Bg_Panel, true
+	case "bg_raised": return .Bg_Raised, true
+	case "border_subtle": return .Border_Subtle, true
+	case "border_strong": return .Border_Strong, true
+	case "text_muted": return .Text_Muted, true
+	case "text_dim": return .Text_Dim, true
+	case "text_secondary": return .Text_Secondary, true
+	case "text_primary": return .Text_Primary, true
+	case "text_bright": return .Text_Bright, true
+	case "selection_doc": return .Selection_Doc, true
+	case "selection_list": return .Selection_List, true
+	case "caret": return .Caret, true
+	case "accent": return .Accent, true
+	case "find_match_bg": return .Find_Match_Bg, true
+	case "link": return .Link, true
+	case "warning": return .Warning, true
+	case "danger": return .Danger, true
+	case "success": return .Success, true
+	case "filter_bg": return .Filter_Bg, true
+	case "filter_text": return .Filter_Text, true
+	case "md_heading": return .Md_Heading, true
+	case "md_code": return .Md_Code, true
+	case "md_italic": return .Md_Italic, true
+	case "md_quote": return .Md_Quote, true
+	}
+	return {}, false
+}
+
+// Hand-parsed `key value` lines, the same shape settings_load uses. Starts
+// from `base` (always a built-in -- see theme_resolve) and overlays only
+// what the file supplies, so a file naming three roles is a valid theme:
+// the other roles simply keep base's value. Never returns a lower-quality
+// result than `base` -- an unreadable file, an unknown role, or a malformed
+// colour each just skip that one line rather than touching the rest.
+theme_load_file :: proc(path: string, base: Theme) -> Theme {
+	t := base
+	data, err := os.read_entire_file(path, context.temp_allocator)
+	if err != nil {
+		return t
+	}
+	for line in strings.split_lines(string(data), context.temp_allocator) {
+		parts := strings.split_n(strings.trim_space(line), " ", 2, context.temp_allocator)
+		if len(parts) < 2 {continue}
+		role, rok := theme_role_from_key(strings.trim_space(parts[0]))
+		if !rok {continue}
+		col, cok := theme_parse_hex(strings.trim_space(parts[1]))
+		if !cok {continue} // malformed colour: role keeps base's value, never black
+		t[role] = col
+	}
+	return t
+}
+
+// Names of every theme the Settings row can cycle to: the two built-ins
+// first, then one entry per *.theme file under themes_dir() (its stem, the
+// filename minus ".theme"). Directory-read order isn't guaranteed, so the
+// tail may reorder between calls if files are added/removed -- only the two
+// built-ins are stable. temp-allocated by default; pass a longer-lived
+// allocator if the result must outlive the current frame/call.
+theme_available_names :: proc(allocator := context.temp_allocator) -> []string {
+	names := make([dynamic]string, allocator)
+	append(&names, "Dark")
+	append(&names, "Light")
+	dir, ok := themes_dir()
+	if !ok {
+		return names[:]
+	}
+	infos, err := os.read_all_directory_by_path(dir, allocator)
+	if err != nil {
+		return names[:]
+	}
+	for info in infos {
+		if info.type != .Regular {continue}
+		if !strings.has_suffix(info.name, ".theme") {continue}
+		append(&names, strings.trim_suffix(info.name, ".theme"))
+	}
+	return names[:]
+}
+
+// Resolves a theme by name for both startup and the Settings row. "Dark"
+// and "Light" are theme_dark()/theme_light() directly; anything else is
+// looked up as themes_dir()/<name>.theme overlaid onto Dark. A name that
+// resolves to nothing -- no themes dir, no such file, a stale settings.txt
+// entry left over after the file was renamed or deleted -- falls back to
+// Dark: theme_load_file already returns `base` unchanged when the file
+// can't be read, so this never needs a separate existence check.
+theme_resolve :: proc(name: string) -> Theme {
+	switch name {
+	case "Dark":
+		return theme_dark()
+	case "Light":
+		return theme_light()
+	}
+	dir, ok := themes_dir()
+	if !ok {
+		return theme_dark()
+	}
+	path := fmt.tprintf("%s%c%s.theme", dir, '\\', name)
+	return theme_load_file(path, theme_dark())
 }
