@@ -2673,6 +2673,15 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			if k == 0 {
 				first = c^
 				fmt.printfln("  ok    measured %d cols, block [%d,%d)", c.ncols, c.start, c.end)
+				// Cache-hit check: same offset, cache NOT cleared this time, so a
+				// second lookup must return the SAME slot rather than scanning again
+				// into a fresh round-robin slot. Pointer identity is the only
+				// observable a stale-but-correct rescan can't accidentally satisfy --
+				// the values would match either way, but the address would not.
+				hitc := md_table_ensure(&doc, &t, off)
+				hitok := hitc == c
+				if !hitok {fail = true}
+				fmt.printfln("  %-6s repeat lookup at same offset hits the cache", "ok" if hitok else "FAIL")
 				continue
 			}
 			same := c.ncols == first.ncols && c.start == first.start && c.end == first.end
@@ -2690,15 +2699,84 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			if !a {fail = true}
 			fmt.printfln("  %-6s separator alignments parsed", "ok" if a else "FAIL")
 		}
+		// The measure's primary output: the derived column widths, not just that
+		// three entry offsets agree with each other (which passes even with an
+		// all-zero widths array -- deleting the width-measuring loop kept the
+		// cross-offset check green until this assertion was added).
+		//   col 0: "id"=2 vs "0".."199"                  -> 3
+		//   col 1: "name"=4 vs "row 0".."row 199"         -> 7
+		//   col 2: "notes"=5 vs "a much longer note cell 199" (27 chars) -> 27
+		// The separator row is excluded from width measurement, so its dashes must
+		// not appear in these numbers.
+		want_widths := [3]int{3, 7, 27}
+		wok := first.ncols == 3
+		if wok {
+			for i in 0 ..< 3 {
+				if first.widths[i] != want_widths[i] {wok = false}
+			}
+		}
+		if !wok {fail = true}
+		fmt.printfln("  %-6s derived widths %v (want %v)", "ok" if wok else "FAIL", first.widths[:first.ncols], want_widths)
+
 		// The oversized fallback: fixed columns, which depend on nothing outside
-		// the row being drawn, so they are shift-free too.
+		// the row being drawn, so they are shift-free too. This calls
+		// md_table_measure directly with oversize=true, which bypasses
+		// md_table_bounds entirely -- exactly why the inverted budget guards were
+		// invisible to this suite. The block below drives the real path.
+		//
+		// ncols is MD_TABLE_MAX_COLS, not the block's actual 3 -- the oversized
+		// path does NO SCAN AT ALL (that's the fix: Critical 2 made the fallback
+		// O(1) by never reading the block to count columns), and the draw clips
+		// at x1, so a generous column count costs nothing.
 		ov := md_table_measure(&doc, &t, 0, doc.pt.length, true)
-		ovok := ov.ncols == 3
+		ovok := ov.ncols == MD_TABLE_MAX_COLS
 		for i in 0 ..< ov.ncols {
 			if ov.widths[i] != MD_TABLE_FIXED_CELLS {ovok = false}
 		}
 		if !ovok {fail = true}
 		fmt.printfln("  %-6s oversized block uses fixed columns (%d)", "ok" if ovok else "FAIL", ov.widths[0])
+
+		// Drive md_table_bounds itself into the oversize path, entering mid-block
+		// so both the backward and forward scans run. A real >1MB fixture would
+		// prove the same thing but costs tens of thousands of rows to build and
+		// print; md_table_budget is a runtime variable for exactly this reason --
+		// lowering it exercises the identical guard code on a fixture two orders
+		// of magnitude smaller.
+		{
+			saved := md_table_budget
+			md_table_budget = 200 // well under this ~8KB fixture, well over one row
+			doc.md_table = {}
+			mid := base.pt_line_start(&doc.pt, doc.pt.length / 2)
+			entry_end := base.pt_line_end_cap(&doc.pt, mid, RENDER_LINE_CAP)
+			c := md_table_ensure(&doc, &t, mid)
+			md_table_budget = saved
+			if c == nil {
+				fail = true
+				fmt.println("  FAIL  no table measured entering mid-block for the oversize drive")
+			} else {
+				// Critical 1: the backward scan must actually stop short of byte 0.
+				// The dead `start - q` guard let it walk all the way back (this file
+				// is one contiguous table, so the true start IS 0), so start > 0 here
+				// is the fixed backward guard actually firing.
+				back_ok := c.start > 0
+				// Critical 2: the forward scan must extend past the entry row's own
+				// end. The `r - start` guard tripped on its first check once the
+				// backward walk had moved `start`, leaving end pinned at entry_end.
+				fwd_ok := c.end > entry_end
+				window_ok := c.end - c.start < len(content) / 2
+				ok := c.oversize && back_ok && fwd_ok && window_ok
+				if !ok {fail = true}
+				fmt.printfln(
+					"  %-6s bounds() trips oversize with a bounded window: oversize=%v start=%d(>0) end=%d(>%d) window=%d",
+					"ok" if ok else "FAIL",
+					c.oversize,
+					c.start,
+					c.end,
+					entry_end,
+					c.end - c.start,
+				)
+			}
+		}
 
 		// Empty leading cells survive the split: "||b|" strips one leading and one
 		// trailing pipe to "|b", which splits to ["", "b"] -- the old

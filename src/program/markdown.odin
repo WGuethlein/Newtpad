@@ -80,15 +80,27 @@ Md_Mode :: enum u8 {
 // constant by construction, which is what makes shift-free scrolling a property
 // of the design rather than something to test for.
 //
-// A block is bounded by content (it ends at the first non-table line), so this
-// is O(block), not O(file). Past MD_TABLE_BUDGET the block draws on fixed
-// columns instead — deterministic per row, so still shift-free, just not
-// content-sized. Content-sizing an arbitrarily large block would need a
-// background worker; see the batch-1 spec for why that is deferred.
+// A block is bounded by content (it ends at the first non-table line), so the
+// normal measure is O(block), not O(file). Past MD_TABLE_BUDGET the block skips
+// measurement entirely and draws on fixed columns instead — O(1), not O(block):
+// deterministic per row, so still shift-free, just not content-sized.
+// Content-sizing an arbitrarily large block would need a background worker; see
+// the batch-1 spec for why that is deferred.
 MD_TABLE_BUDGET :: 1 * 1024 * 1024
 MD_TABLE_MAX_COLS :: 32
 MD_TABLE_FIXED_CELLS :: 16 // fixed column width past the budget
 MD_TABLE_PAD :: 2 // cells of gap between columns
+
+// Runtime copy of MD_TABLE_BUDGET. Production code never changes it; mdtabletest
+// lowers it to drive md_table_bounds into the oversize path on a normal-sized
+// fixture instead of needing a real >1 MB buffer to build and scan.
+md_table_budget := MD_TABLE_BUDGET
+
+// Four slots, not one: rows draw top-to-bottom, so with two table blocks on
+// screen a single slot ends every frame holding the lower block and misses on
+// the upper one the next frame — two full block measures per frame, in steady
+// state, forever. Fixed-size array, so still no allocation.
+MD_TABLE_SLOTS :: 4
 
 Md_Align :: enum u8 {
 	Left,
@@ -99,10 +111,9 @@ Md_Align :: enum u8 {
 Md_Table_Cache :: struct {
 	valid:    bool,
 	start:    int, // byte offset of the block's first row
-	end:      int, // just past the block's last row
+	end:      int, // offset of the last row's newline (pt_line_end_cap semantics)
 	revision: u64,
 	oversize: bool, // block exceeded MD_TABLE_BUDGET: fixed columns
-	sep_at:   int, // byte offset of the separator row, or -1
 	ncols:    int,
 	widths:   [MD_TABLE_MAX_COLS]int, // cells, excluding padding
 	align:    [MD_TABLE_MAX_COLS]Md_Align,
@@ -151,7 +162,7 @@ md_line_at :: proc(doc: ^Document, p: int, buf: []u8) -> (line: string, end: int
 }
 
 // The contiguous run of table rows containing `p`. Scans backward to the block's
-// true start and forward to its end, both bounded by MD_TABLE_BUDGET so a file
+// true start and forward to its end, both bounded by md_table_budget so a file
 // that is one enormous table cannot stall a frame.
 @(private = "file")
 md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, ok: bool) {
@@ -160,11 +171,25 @@ md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, o
 	if !md_is_table_row(line) {return 0, 0, false, false}
 	start, end = p, lend
 
-	// Backward.
+	// Both bounds are measured from the ENTRY POINT `p`, never from the moving
+	// `start`. Two traps here, both of which shipped once:
+	//   - `start - q` is invariantly 0 (the loop assigns both from `ps`), so a guard
+	//     written that way is dead code and the backward walk runs to byte 0 — on a
+	//     renamed CSV that is the whole file, on the UI thread.
+	//   - `r - start` in the forward loop is already past the budget the moment the
+	//     backward walk moved `start`, so it trips on the first iteration and leaves
+	//     `end` at the entry row. The cache window is then one row wide, every
+	//     subsequent row misses, and the fallback becomes the most expensive path.
+	// A window measured from `p` gives at least a budget's worth of cached rows
+	// ahead of the viewport in both directions.
 	q := p
 	for q > 0 {
-		if start - q > MD_TABLE_BUDGET {oversize = true;break}
-		ps := base.pt_line_start(&doc.pt, q - 1)
+		if p - q > md_table_budget {oversize = true;break}
+		// pt_line_start is UNCAPPED: on a file with one enormous line containing
+		// pipes it scans to byte 0 by itself. A non-exact result means the cap was
+		// reached, which is a block boundary for our purposes.
+		ps, exact := base.pt_line_start_cap(&doc.pt, q - 1, RENDER_LINE_CAP)
+		if !exact {oversize = true;break}
 		pl, _ := md_line_at(doc, ps, buf[:])
 		if !md_is_table_row(pl) {break}
 		start = ps
@@ -174,7 +199,7 @@ md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, o
 	// Forward.
 	r := lend
 	for r < doc.pt.length {
-		if r - start > MD_TABLE_BUDGET {oversize = true;break}
+		if r - p > md_table_budget {oversize = true;break}
 		ns := r + 1
 		if ns > doc.pt.length {break}
 		nl, ne := md_line_at(doc, ns, buf[:])
@@ -197,21 +222,32 @@ md_table_measure :: proc(doc: ^Document, t: ^plat.Text, start, end: int, oversiz
 		end      = end,
 		revision = doc.revision,
 		oversize = oversize,
-		sep_at   = -1,
 	}
+	// Past the budget: fixed columns, and NO SCAN AT ALL. Every column is the same
+	// width and every row draws at i*(width+pad), which depends on nothing outside
+	// the row being drawn — so it is shift-free without measuring anything, and the
+	// fallback is O(1) instead of O(block). Scanning the span here just to collect
+	// ncols would reintroduce the per-row cost the budget exists to avoid, and the
+	// draw already clips at x1, so a generous ncols costs nothing.
+	if oversize {
+		c.ncols = MD_TABLE_MAX_COLS
+		for i in 0 ..< MD_TABLE_MAX_COLS {c.widths[i] = MD_TABLE_FIXED_CELLS}
+		return c
+	}
+
 	buf: [RENDER_LINE_CAP]u8
 	for p := start; p <= end && p < doc.pt.length; {
 		line, lend := md_line_at(doc, p, buf[:])
 		if !md_is_table_row(line) {break}
 		cells := md_split_cells(line, context.temp_allocator)
 		if len(cells) > c.ncols {c.ncols = min(len(cells), MD_TABLE_MAX_COLS)}
-		if md_is_table_sep(strings.trim_left(line, " \t")) {
-			if c.sep_at < 0 {c.sep_at = p}
+		if md_row_is_sep(line) {
 			for cell, i in cells {
 				if i >= MD_TABLE_MAX_COLS {break}
 				c.align[i] = md_cell_align(cell)
 			}
-		} else if !oversize {
+		} else {
+			// The separator row is excluded, so its dashes never inflate a column.
 			for cell, i in cells {
 				if i >= MD_TABLE_MAX_COLS {break}
 				w := plat.text_cells(t, transmute([]u8)cell, .Doc)
@@ -221,26 +257,25 @@ md_table_measure :: proc(doc: ^Document, t: ^plat.Text, start, end: int, oversiz
 		if lend >= doc.pt.length {break}
 		p = lend + 1
 	}
-	// Past the budget every column is the same fixed width: it depends on nothing
-	// outside the row being drawn, so it cannot shift with scroll either.
-	if oversize {
-		for i in 0 ..< max(c.ncols, 1) {c.widths[i] = MD_TABLE_FIXED_CELLS}
-	}
 	return c
 }
 
 // Cached measure for the block containing `p`, or nil if `p` is not a table row.
-// The per-frame cost is the containment test; a scan happens only when the
-// viewport enters a different block or the buffer changed.
+// The per-frame cost is the containment test over MD_TABLE_SLOTS entries; a scan
+// happens only when the viewport enters a block none of the slots cover, or the
+// buffer changed.
 md_table_ensure :: proc(doc: ^Document, t: ^plat.Text, p: int) -> ^Md_Table_Cache {
-	c := &doc.md_table
-	if c.valid && c.revision == doc.revision && p >= c.start && p < c.end {
-		return c
+	for &c in doc.md_table {
+		if c.valid && c.revision == doc.revision && p >= c.start && p < c.end {
+			return &c
+		}
 	}
 	start, end, oversize, ok := md_table_bounds(doc, p)
 	if !ok {return nil}
-	c^ = md_table_measure(doc, t, start, end, oversize)
-	return c
+	slot := &doc.md_table[doc.md_table_next]
+	doc.md_table_next = (doc.md_table_next + 1) % MD_TABLE_SLOTS
+	slot^ = md_table_measure(doc, t, start, end, oversize)
+	return slot
 }
 
 // x offset of column `i`, in pixels from x0.
@@ -450,7 +485,7 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			y = yy + line_h
 		} else if md_is_table_row(line) {
 			if c := md_table_ensure(doc, text, p); c != nil {
-				md_draw_table_row(gfx, qp, text, c, line, x0, x1, y, px, char_w, md_is_table_sep(trimmed))
+				md_draw_table_row(gfx, qp, text, c, line, x0, x1, y, px, char_w, md_row_is_sep(line))
 			}
 			y += line_h
 		} else {
@@ -530,6 +565,14 @@ md_is_table_sep :: proc(s: string) -> bool {
 	return strings.contains(s, "-")
 }
 
+// Single source for "is this row a separator": the measure and the draw used to
+// each trim their own copy of the line before checking, which agreed only
+// incidentally. Both now call this on the same untrimmed line.
+@(private = "file")
+md_row_is_sep :: proc(line: string) -> bool {
+	return md_is_table_sep(strings.trim_left(line, " \t"))
+}
+
 // One row of a table, drawn at the block's cached column positions so every row
 // lines up. `qp` is needed for the header rule under the separator row, which
 // the old renderer skipped entirely.
@@ -544,8 +587,11 @@ md_draw_table_row :: proc(
 	is_sep: bool,
 ) {
 	if is_sep {
-		// The separator row becomes a rule, not text.
-		w := min(md_col_x(c, c.ncols, char_w), x1 - x0)
+		// The separator row becomes a rule, not text. md_col_x(c.ncols) sums a
+		// width+pad for every column including the last, so it includes one pad's
+		// worth of gap that has nothing after it — trim it or the rule overhangs
+		// the last column by MD_TABLE_PAD cells.
+		w := min(max(0, md_col_x(c, c.ncols, char_w) - f32(MD_TABLE_PAD) * char_w), x1 - x0)
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {w, max(sx(1), 1)}, color = MD_RULE}})
 		return
 	}

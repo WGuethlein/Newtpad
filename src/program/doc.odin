@@ -628,8 +628,11 @@ Document :: struct {
 	// live preview). Both Preview and Split scroll from doc.top -- Split keeps the
 	// two panes anchored to the same source line.
 	md_mode:     Md_Mode,
-	md_table:    Md_Table_Cache, // per-block column measure (markdown.odin); no
-	// allocation, so nothing to free on doc close
+	// Per-block column measure (markdown.odin). Four slots, not one, so two table
+	// blocks on screen at once don't thrash a single slot every frame; no
+	// allocation, so nothing to free on doc close.
+	md_table:      [MD_TABLE_SLOTS]Md_Table_Cache,
+	md_table_next: int, // round-robin replacement cursor
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)
