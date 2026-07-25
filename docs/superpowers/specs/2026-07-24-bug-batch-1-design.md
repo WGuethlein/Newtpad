@@ -11,10 +11,12 @@ live verification pass is small enough to be a real signal rather than a shrug.
 
 ## Summary of causes
 
-Five of the six were root-caused by reading before this spec was written; all five causes are
-verified against the source, not inferred from symptoms. Two of them — the most visible two — turn
-out to be the same seam: `visible_next` in `src/program/doc.odin`, the shared capped line iterator
-that every screen pass reads.
+All six were root-caused against the source before this spec was written, not inferred from
+symptoms. Bug 2 was the last to fall and needed Wyatt's screenshot to pin: the caret drawn on row 1
+at column 0 with the text on row 0 is what identified the phantom row.
+
+Two of them — the most visible two — turn out to be the same seam: `visible_next` in
+`src/program/doc.odin`, the shared capped line iterator that every screen pass reads.
 
 | # | Symptom | Cause | Site |
 |---|---|---|---|
@@ -154,12 +156,51 @@ separator row is skipped entirely (`markdown.odin:275`) so no header rule is dra
 Empty cells are preserved: split on `|` after stripping at most one leading and one trailing
 delimiter, rather than trimming the character set.
 
-**Bounded lookahead.** The markdown draw is today a single forward walk over visible lines
-(`p = end + 1`), so it cannot know column widths without looking ahead — and a table can begin
-above the viewport. To keep the viewport-first rule, the block scan is capped at a fixed number of
-lines above and below the visible window. Past the cap, columns are measured from the visible rows
-only, so they can shift as you scroll. That bounded imperfection is preferred to an unbounded scan
-on a large file; the cap and the fallback are stated in a comment at the call site.
+### Column widths must not depend on scroll position
+
+The markdown draw is today a single forward walk over visible lines (`p = end + 1`), so it cannot
+know column widths without looking ahead — and a table can begin above the viewport. Measuring from
+the visible rows only would make the widths a function of scroll position, i.e. **columns that shift
+as you scroll. That is not acceptable** (Wyatt, 2026-07-24) and no part of this design permits it.
+
+Note the cost is bounded by content, not by file size: a table block ends at the first non-table
+line, so measuring one is O(block), not O(file).
+
+**Hoist the measure out of the draw and cache it per block.** Each frame:
+
+1. locate the first visible table row;
+2. O(1) test — is it inside the cached block's `[start, end)` and does `revision` match? If so use
+   the cached widths and do not scan at all;
+3. on a miss, scan backward to the block's true start and forward to its end, measure the
+   per-column maxima, and cache `{start, end, revision, widths}`.
+
+So a scan happens only when the viewport enters a *different* block or after an edit — never per
+frame and never per scroll step. Within a block the widths are constant by construction, which is
+what makes shift-free scrolling a property of the design rather than something to be tested for.
+
+**Cache key.** `Document` gains a monotonic `revision: u64`, bumped in `push_undo`
+(`doc.odin:1054`) alongside the existing `find_invalidate` call — before the `doc.batch` early
+return, so every edit in a batch counts. That comment already asserts "every edit path routes
+through here"; the implementation must verify that claim rather than trust it, since a mutation path
+that bypasses `push_undo` would leave stale widths on screen. A test that edits through each public
+mutator and asserts `revision` advanced is the check.
+
+**The pathological block.** A block so large that even one measure pass is too slow — a database
+dump, or a `.csv` renamed `.md`. Measurement is capped at a byte budget generous enough to cover any
+hand-authored table (1 MB is roughly 12k rows; 4 MB roughly 50k). Within budget: content-sized,
+cached, no shift. Beyond it, that block draws on **fixed N-cell columns** — column `i` at `i*N`,
+with each row's cell count taken as drawn.
+
+The fallback is deliberately fixed-width rather than available-width-divided-by-column-count:
+the latter derives the count from a visible row, which reintroduces scroll dependence on a malformed
+table whose rows have differing cell counts. Fixed columns depend on nothing outside the row being
+drawn, so they are shift-free by construction too, and rows with different cell counts still align
+on the columns they share.
+
+A background measure worker (the existing line-count-worker pattern) would give content-sized
+columns at any size, at the price of one snap when it publishes plus debounced re-measure on every
+edit. Rejected for now as unjustified complexity for a file no human authors by hand — but the
+per-block cache above is its prerequisite, so choosing it later costs nothing already built here.
 
 ## 5. Bug 10 — Ctrl+Left/Right asymmetry
 
@@ -198,8 +239,19 @@ Headless modes in `test_modes.odin` (set `NEWTPAD_SESSION_DIR` to a temp dir fir
   fully present, so it must compare consumers against each other, not against a constant.
 - **EOF row count**: buffers with and without a trailing newline emit the correct number of rows;
   `doc_max_top` and down-arrow do not step past the last real row.
-- **Table columns**: every row of a markdown table draws its cells at identical x positions;
-  alignment markers place text correctly; a table crossing the lookahead cap still renders.
+- **Table columns**: every row of a markdown table draws its cells at identical x positions, and
+  alignment markers place text correctly.
+- **Table columns do not shift with scroll** — the property Wyatt rejected the first design over, so
+  it gets a direct test rather than an argument. Measure the drawn column x positions for a table
+  taller than the viewport with the block entered from the top, then from the middle, then from the
+  bottom, and assert all three are byte-identical. This must be watched failing against a
+  visible-rows-only measure, because that is the implementation it exists to rule out.
+- **Oversized fallback is deterministic**: a block past the measurement budget draws identical
+  column positions from any scroll offset, including when consecutive rows have differing cell
+  counts.
+- **`revision` covers every mutation**: drive each public mutator (insert, backspace, delete word,
+  replace selection, replace all, set line ending, undo, redo) and assert `revision` advanced. Stale
+  widths on screen is the failure this prevents.
 - **Find count stability**: a replace on a document with many matches never shows zero while
   `find_busy` is true.
 
@@ -220,7 +272,9 @@ shared iterator and everything else renders through it.
 3. Three-class word classifier and symmetric word nav (#10).
 4. Sticky find count while a search is in flight (#5).
 5. Find-line spacing (#3).
-6. Two-pass markdown table layout (#8).
+6. `Document.revision`, bumped in `push_undo`, with the mutator-coverage test. Split out because the
+   table cache depends on it and it is the one change here that touches every edit path.
+7. Two-pass markdown table layout on a cached per-block measure (#8).
 
 ## Out of scope
 
@@ -228,4 +282,5 @@ Deferred to branch 2: Alt+arrow line move, drag-and-drop open, per-file-family v
 Settings override, resizable split divider.
 
 Not addressed here, and not silently absorbed: rune-level classification of non-ASCII punctuation
-for word nav; the unbounded-scan question in markdown block measurement beyond the stated cap.
+for word nav (bug 10); content-sized table columns for blocks past the measurement budget, which
+would need the background measure worker described in §4 and is rejected as unjustified for now.
