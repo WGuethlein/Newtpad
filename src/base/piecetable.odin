@@ -379,6 +379,23 @@ pt_line_end_cap :: proc(pt: ^Piece_Table, pos, cap: int) -> int {
 	return limit
 }
 
+// Visible end of the row [start, end): excludes a trailing CR that is part of a
+// CRLF break. `line_end` must be false at a wrap point, where a CR is ordinary
+// content rather than half a line terminator.
+//
+// This is the single definition of where a rendered row's content stops. It used
+// to exist only inside the text draw, so the caret, the selection, the wrap
+// budget and the column readout each measured one cell too far on every CRLF
+// line — a phantom cell with no glyph, because CR draws nothing while the pen
+// still advances.
+pt_row_vis_end :: proc(pt: ^Piece_Table, start, end: int, line_end: bool) -> int {
+	if end <= start {return end}
+	if !line_end {return end}
+	b: [1]u8
+	if pt_read(pt, end - 1, b[:]) == 1 && b[0] == '\r' {return end - 1}
+	return end
+}
+
 // pt_line_start, bounded, mirroring pt_line_end_cap. `exact` is false when the
 // cap was reached without finding a newline, so the returned offset is a scan
 // floor rather than a real line start and the caller must not present a column

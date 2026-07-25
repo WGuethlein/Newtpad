@@ -253,3 +253,29 @@ test_pt_mixed_sequence :: proc(t: ^testing.T) {
 	pt_read(&pt, 4, dst)
 	testing.expect_value(t, string(dst), "brown")
 }
+
+@(test)
+test_pt_row_vis_end :: proc(t: ^testing.T) {
+	// CRLF: the CR belongs to the break, not to the line's content.
+	pt := pt_init(transmute([]u8)string("ab\r\ncd\r\n"))
+	defer pt_destroy(&pt)
+	testing.expect_value(t, pt_row_vis_end(&pt, 0, 2, true), 2) // "ab", end at the CR
+	testing.expect_value(t, pt_row_vis_end(&pt, 0, 3, true), 2) // end past the CR: strip it
+	testing.expect_value(t, pt_row_vis_end(&pt, 4, 7, true), 6) // "cd"
+
+	// LF only: nothing to strip.
+	lf := pt_init(transmute([]u8)string("ab\ncd"))
+	defer pt_destroy(&lf)
+	testing.expect_value(t, pt_row_vis_end(&lf, 0, 2, true), 2)
+	testing.expect_value(t, pt_row_vis_end(&lf, 3, 5, true), 5)
+
+	// A wrap point is not a line end, so a CR there is real content.
+	cr := pt_init(transmute([]u8)string("a\rb"))
+	defer pt_destroy(&cr)
+	testing.expect_value(t, pt_row_vis_end(&cr, 0, 2, false), 2)
+	testing.expect_value(t, pt_row_vis_end(&cr, 0, 2, true), 1)
+
+	// Degenerate ranges must not underflow.
+	testing.expect_value(t, pt_row_vis_end(&pt, 2, 2, true), 2)
+	testing.expect_value(t, pt_row_vis_end(&pt, 5, 4, true), 4)
+}
