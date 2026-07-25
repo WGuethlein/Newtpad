@@ -71,14 +71,62 @@ One Settings row selects the theme by name. **Not a colour picker per role** —
 option-count leakage CLAUDE.md principle 3 warns about. Editing a `.theme` file is the power-user
 path; the UI stays one choice.
 
-## The regression guard
+## Consolidation, and what replaced the regression guard
 
-**The Dark theme must reproduce today's rendering exactly.** That turns a 107-site migration from
-"trust the diff" into a mechanical check: if any pixel changes, the migration is wrong. Every role's
-value in Dark equals the literal it replaced, and that is asserted rather than eyeballed.
+**Revised 2026-07-25 after measurement.** A faithful one-role-per-literal model came to **66 roles**,
+which is a theme nobody would author. Clustering the 61 distinct values by chroma and luminance showed
+the real structure: the neutrals are a ramp with far more steps than anyone can distinguish, while the
+accents are genuinely semantic.
 
-This matters because a 107-literal migration across 14 files is precisely the kind of change where
-one transposed digit is invisible in review and obvious in use.
+- **Neutrals: 42 values across 81 sites collapse to 10 roles.** `text_muted` alone was seven shades
+  doing one job — `#6B758A`, `#6B788F`, `#6B7A99`, `#737D91`, `#7A8599`, `#808A9E`, `#808CA3` —
+  indistinguishable side by side.
+- **Accents: 23 values to 15 roles.** These carry meaning; merging them loses information.
+
+**Total: 25 roles**, plus the 9 syntax placeholders.
+
+### The cost, and what the guard becomes
+
+Consolidation changes rendered colour at roughly 50 sites. Each shift is small — `#6B758A` becoming
+`#737D91` is imperceptible in isolation — but **Dark is therefore no longer pixel-identical to
+v0.11.0**, which forfeits the original mechanical guard ("if any pixel changes, the migration is
+wrong").
+
+That guard was a means, not the goal. It is replaced by a weaker but still mechanical one:
+
+> **Every colour change is an intended merge, enumerated in advance.** The role table below lists
+> exactly which literals collapse into which role. A site whose colour changes to something *not* on
+> that list is a bug; a site whose colour is unchanged when the table says it should merge is also a
+> bug.
+
+So the migration's check moves from "prove nothing changed" to "prove only the listed merges
+happened" — which the test can still assert mechanically, because the mapping is data.
+
+### The role table
+
+Neutrals (10):
+
+| Role | Absorbs | Sites |
+|---|---|---|
+| `bg_base` | `#171C29` `#1A1F29` `#1C212B` | 6 |
+| `bg_panel` | `#1F242E` `#1F2430` `#212633` `#242933` `#242936` `#262B38` | 7 |
+| `bg_raised` | `#292E38` `#293345` | 4 |
+| `border_subtle` | `#333B4C` `#3D4554` | 4 |
+| `border_strong` | `#475266` `#4C576B` | 7 |
+| `text_muted` | `#6B758A` `#6B788F` `#6B7A99` `#737D91` `#7A8599` `#808A9E` `#808CA3` | 18 |
+| `text_dim` | `#8C99B2` `#94A3C2` `#99A3B8` `#9EADCC` `#A8B2C7` | 8 |
+| `text_secondary` | `#B8C2D6` `#B8C7E0` `#BFC9DB` `#BFCCE0` `#CCD6E6` | 7 |
+| `text_primary` | `#DBE6F5` `#E0E8F5` `#E6EBF7` `#EBF0FA` `#F0F5FC` `#F2F5FC` | 15 |
+| `text_bright` | `#F5F5FA` `#FAFCFF` `#FFFFFF` `#D1E6FA` | 5 |
+
+Accents (15): `selection_doc` (`#334C7A`), `selection_list` (`#33476B` `#334C73` `#3D4C6B` `#2E3D57`),
+`caret` (`#F2D959`), `accent` (`#F2E08C` `#CCC280`), `find_match_bg` (`#6B6129`), `link` (`#73B2FA`),
+`warning` (`#F28C59`), `danger` (`#BF2929`), `success` (`#8CD999`), `filter_bg` (`#2E4233`),
+`filter_text` (`#B2E6BD`), `md_heading` (`#B8D9FF`), `md_code` (`#F2CCA6`), `md_italic` (`#CCDBC7`),
+`md_quote` (`#A8B89E`).
+
+**Which member of a merged set becomes the role's value** is a judgement call to make and record per
+role — generally the one with the most sites, so the fewest pixels move.
 
 ## Testing
 
@@ -108,7 +156,8 @@ Plus the compile-time `#assert` on the array length.
 
 ## Verification owed to Wyatt
 
-This environment cannot see the screen. After the migration, the Dark theme should be pixel-identical
-to what he uses today — if anything looks different, the migration is wrong, and that is the single
-most useful thing he can check. Then switching to Light and looking for text that vanishes, borders
+This environment cannot see the screen. Dark is *deliberately* no longer pixel-identical to v0.11.0 —
+roughly 50 sites shift slightly as part of the consolidation. So the check is not "did anything
+change" but "does anything look **wrong**": a label that lost contrast against its background, a
+border that vanished, two things that used to be distinguishable now reading as the same. Then switching to Light and looking for text that vanishes, borders
 that disappear, or a caret that cannot be found.
