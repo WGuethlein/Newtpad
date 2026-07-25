@@ -944,14 +944,22 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		bar := plat.Quad{pos = {0, h - bar_h}, size = {w, bar_h}, color = {0.14, 0.16, 0.20, 1}}
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{bar})
 		info: string
-		if len(f.query) == 0 {
+		switch {
+		case len(f.query) == 0:
 			info = ""
-		} else if len(f.matches) == 0 {
-			info = "  (no matches)"
-		} else {
+		case len(f.matches) > 0:
 			// "+" marks a partial result: we stopped at the match limit or the
 			// regex scan cap, so there may be more further down the file.
-			info = fmt.tprintf("  (%d/%d%s)", f.current + 1, len(f.matches), "+" if f.truncated else "")
+			info = fmt.tprintf(" (%d/%d%s)", f.current + 1, len(f.matches), "+" if f.truncated else "")
+		case search_running(doc) && f.last_total > 0:
+			// Mid-restart after an edit: the matches are cleared but the search is
+			// still running, so the last published figure is the honest one. Saying
+			// "(no matches)" here made every replace flicker to zero.
+			info = fmt.tprintf(" (%d/%d%s)", f.last_current + 1, f.last_total, "+" if f.truncated else "")
+		case search_running(doc):
+			info = ""
+		case:
+			info = " (no matches)"
 		}
 		mode := "regex" if f.regex else "text"
 		fline := fmt.tprintf("Find [%s]%s: %s%s%s", mode, " filter" if doc.filter else "", string(f.query[:]), " _" if f.field == 0 else "", info)

@@ -696,6 +696,11 @@ Find :: struct {
 	jumped:       bool, // already auto-selected a match for this query
 	dirty:        bool, // an edit invalidated the results; restart next frame
 	truncated:    bool, // hit MAX_MATCHES; results are partial
+	// The most recently published result, kept so the status text does not read
+	// "(no matches)" during the frames between an edit clearing the matches and
+	// the worker republishing. A rapid replace otherwise flickers to zero.
+	last_total:   int,
+	last_current: int, // -1 when nothing has been published for this query
 }
 
 // A new empty scratch document (no file). This is what opens when Newtpad is

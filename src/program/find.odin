@@ -78,7 +78,7 @@ find_open :: proc(doc: ^Document, replace_mode: bool) {
 			append(&doc.find.query, ..buf)
 		}
 	}
-	find_recompute(doc)
+	find_query_changed(doc)
 }
 
 find_close :: proc(doc: ^Document) {
@@ -88,7 +88,7 @@ find_close :: proc(doc: ^Document) {
 }
 
 find_toggle_field :: proc(doc: ^Document) {doc.find.field = 1 - doc.find.field}
-find_toggle_regex :: proc(doc: ^Document) {doc.find.regex = !doc.find.regex;find_recompute(doc)}
+find_toggle_regex :: proc(doc: ^Document) {doc.find.regex = !doc.find.regex;find_query_changed(doc)}
 
 @(private = "file")
 active_buf :: proc(doc: ^Document) -> ^[dynamic]u8 {
@@ -98,7 +98,7 @@ active_buf :: proc(doc: ^Document) -> ^[dynamic]u8 {
 find_input_rune :: proc(doc: ^Document, r: rune) {
 	bytes, n := utf8.encode_rune(r)
 	append(active_buf(doc), ..bytes[:n])
-	if doc.find.field == 0 {find_recompute(doc)}
+	if doc.find.field == 0 {find_query_changed(doc)}
 }
 
 find_backspace :: proc(doc: ^Document) {
@@ -107,7 +107,7 @@ find_backspace :: proc(doc: ^Document) {
 	i := len(buf) - 1
 	for i > 0 && (buf[i] & 0xC0) == 0x80 {i -= 1} // whole rune
 	resize(buf, i)
-	if doc.find.field == 0 {find_recompute(doc)}
+	if doc.find.field == 0 {find_query_changed(doc)}
 }
 
 // --- search lifecycle ---
@@ -186,6 +186,16 @@ search_reset :: proc(doc: ^Document) {
 	doc.filter_top = 0
 }
 
+// A query change invalidates the previous count; a buffer change (replace) does
+// not. Deliberately not folded into find_recompute, which both call: keeping the
+// last count across a replace is exactly what stops the flicker to zero.
+@(private = "file")
+find_query_changed :: proc(doc: ^Document) {
+	doc.find.last_total = 0
+	doc.find.last_current = -1
+	find_recompute(doc)
+}
+
 find_recompute :: proc(doc: ^Document) {
 	search_reset(doc)
 	f := &doc.find
@@ -232,6 +242,14 @@ find_merge :: proc(doc: ^Document) {
 
 	f.matches = s.matches[:n]
 	f.match_len = s.match_len[:n]
+
+	// Sticky copy for the status text. Reached only on real progress (the
+	// n == f.merged guard above returns early otherwise), so a cleared array
+	// during a restart cannot overwrite these with zero.
+	if n > 0 {
+		f.last_total = n
+		f.last_current = f.current
+	}
 
 	// Filter view: one entry per matching line. Built from line starts the
 	// worker computed during its linear pass — deriving them here would mean

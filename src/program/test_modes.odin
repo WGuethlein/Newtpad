@@ -2894,6 +2894,20 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		doc.find.field = 0
 		find_wait(&doc)
 		fmt.printfln("query=%q replace=%q matches=%d", os.args[3], os.args[4], len(doc.find.matches))
+		// Replace one match at a time and confirm the reported count never
+		// collapses to zero while the search is still restarting.
+		total0 := len(doc.find.matches)
+		zeroed := false
+		for i in 0 ..< min(total0, 5) {
+			find_replace_current(&doc)
+			// Read the status figure the way render_frame does, without waiting.
+			if len(doc.find.matches) == 0 && search_running(&doc) && doc.find.last_total == 0 {
+				zeroed = true
+			}
+			find_wait(&doc)
+			_ = i
+		}
+		fmt.printfln("count stable across replaces: %v (started at %d)", !zeroed, total0)
 		find_replace_all(&doc)
 		s := doc_debug_string(&doc)
 		fmt.printfln("after replace all: %q", s[:min(len(s), 40)])
