@@ -1625,26 +1625,16 @@ doc_cursor_down :: proc(doc: ^Document, t: ^plat.Text, select: bool) {
 
 // --- word boundaries, word nav, click selection, hit-test ---
 
-@(private = "file")
-is_word :: proc(b: u8) -> bool {
-	return(b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_' || b >= 0x80
-}
-
+// Word boundaries live in base (three-class, direction-symmetric) so they are
+// unit-testable; these are the document-level adapters.
 @(private = "file")
 word_left_of :: proc(doc: ^Document, pos: int) -> int {
-	p := pos
-	for p > 0 && !is_word(byte_at(doc, p - 1)) {p -= 1}
-	for p > 0 && is_word(byte_at(doc, p - 1)) {p -= 1}
-	return p
+	return base.pt_word_left(&doc.pt, pos)
 }
 
 @(private = "file")
 word_right_of :: proc(doc: ^Document, pos: int) -> int {
-	L := doc.pt.length
-	p := pos
-	for p < L && !is_word(byte_at(doc, p)) {p += 1}
-	for p < L && is_word(byte_at(doc, p)) {p += 1}
-	return p
+	return base.pt_word_right(&doc.pt, pos)
 }
 
 doc_word_left :: proc(doc: ^Document, select: bool) {set_cursor(doc, word_left_of(doc, doc.cursor), select)}
@@ -1671,10 +1661,10 @@ doc_select_all :: proc(doc: ^Document) {
 
 doc_select_word_at :: proc(doc: ^Document, pos: int) {
 	L := doc.pt.length
-	if pos < L && is_word(byte_at(doc, pos)) {
+	if pos < L && base.char_class(byte_at(doc, pos)) == .Word {
 		s, e := pos, pos
-		for s > 0 && is_word(byte_at(doc, s - 1)) {s -= 1}
-		for e < L && is_word(byte_at(doc, e)) {e += 1}
+		for s > 0 && base.char_class(byte_at(doc, s - 1)) == .Word {s -= 1}
+		for e < L && base.char_class(byte_at(doc, e)) == .Word {e += 1}
 		doc.anchor, doc.cursor = s, e
 	} else {
 		doc.anchor = pos
