@@ -73,6 +73,18 @@ Md_Mode :: enum u8 {
 	Split, // editor left, live preview right
 }
 
+md_mode_name :: proc(m: Md_Mode) -> string {
+	switch m {
+	case .Off:
+		return "Off"
+	case .Preview:
+		return "Preview"
+	case .Split:
+		return "Split"
+	}
+	return "?"
+}
+
 // Column widths depend on the whole table block, so measuring them from the
 // visible rows only would make them a function of scroll position — columns that
 // shift as you scroll. The measure is therefore hoisted out of the draw and

@@ -10,6 +10,7 @@ import "core:strconv"
 import "core:strings"
 import "core:time"
 import "core:unicode/utf8"
+import "core:unicode/utf16"
 import base "src:base"
 import plat "src:platform"
 
@@ -17,6 +18,23 @@ import plat "src:platform"
 key_chk :: proc(got, want: Command_Id, label: string) {
 	ok := "OK" if got == want else fmt.tprintf("FAIL want=%v", want)
 	fmt.printfln("%-22s -> %-16v %s", label, got, ok)
+}
+
+// Guard for any headless mode that writes settings.txt, session.txt, or crash
+// backups. Without NEWTPAD_SESSION_DIR set, session_dir() falls back to the
+// real %APPDATA%\Newtpad (see session_dir's own doc comment), so a bare
+// `newtpad.exe <mode>` run by hand silently overwrites the author's real
+// font/zoom/view settings or wipes the restore-session store -- including
+// unsaved-tab backups. Every mode that touches either store calls this first.
+// A documented "set NEWTPAD_SESSION_DIR first" in a comment is not a
+// constraint if nothing checks it; this is the check.
+@(private = "file")
+require_scratch_session :: proc(mode: string) -> bool {
+	if os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator) == "" {
+		fmt.printfln("%s: refusing to run without NEWTPAD_SESSION_DIR", mode)
+		return false
+	}
+	return true
 }
 
 // Run a headless test mode if argv selects one. Returns true if a mode ran (the
@@ -617,6 +635,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// `newtpad settingstest` round-trips settings.txt and checks the defaults and
 	// clamps. Set NEWTPAD_SESSION_DIR first — it writes to the session store.
 	if os.args[1] == "settingstest" {
+		if !require_scratch_session("settingstest") {return true}
 		bad := 0
 		d := settings_default()
 		fmt.printfln("defaults: restore=%v wrap=%v font=%d", d.restore_session, d.wrap_default, d.font_size)
@@ -633,6 +652,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			zoom_pct        = 125,
 			font_family     = "Courier New",
 			font_style      = .Italic,
+			split_frac      = 0.25, // non-zero, non-default, exact in binary float (survives %.4f round-trip)
 		}
 		settings_save(w)
 		r := settings_load()
@@ -2222,6 +2242,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// suppress a file that really did change while we were closed. So the session
 	// carries the stamp, and both directions are asserted here.
 	if os.args[1] == "diskstamptest" {
+		if !require_scratch_session("diskstamptest") {return true}
 		tmpf := fmt.tprintf("%s%cnewtpad_stamptest.txt", os.get_env("TEMP", context.temp_allocator), '\\')
 		plat.file_write_atomic(tmpf, transmute([]u8)string("original content\n"))
 		bad := 0
@@ -2316,6 +2337,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// NEWTPAD_SESSION_DIR to a temp dir first — without it this writes to, and
 	// then resets, the real session under %APPDATA%\Newtpad.
 	if os.args[1] == "sessiontest" {
+		if !require_scratch_session("sessiontest") {return true}
 		tmpf := fmt.tprintf("%s%cnewtpad_sesstest.txt", os.get_env("TEMP", context.temp_allocator), '\\')
 		plat.file_write_atomic(tmpf, transmute([]u8)string("clean file content\nsecond line"))
 		a: App
@@ -2354,6 +2376,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// session didn't reference, destroying unsaved scratch buffers. Set
 	// NEWTPAD_SESSION_DIR to a temp dir before running.
 	if os.args[1] == "sessionlosstest" && len(os.args) > 2 {
+		if !require_scratch_session("sessionlosstest") {return true}
 		file := os.args[2]
 		SCRATCH :: "precious unsaved work"
 
@@ -2626,6 +2649,160 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			)
 		}
 		fmt.println("rowtest: FAILURES" if fail else "rowtest: all ok")
+		return true
+	}
+
+	// `newtpad movelinetest` — Alt+Up/Down. Terminators live BETWEEN lines and the
+	// last line often has none, so a naive cut-and-paste either duplicates one or
+	// drops it; on a CRLF file that leaves a bare LF, the corruption batch 1 fixed
+	// in doc_delete_fwd. Hence whole-buffer assertions, and the last line as an
+	// explicit case rather than one the general path is assumed to cover.
+	if os.args[1] == "movelinetest" {
+		fail := false
+		chk :: proc(label, got, want: string, fail: ^bool) {
+			ok := got == want
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %-34s got=%q want=%q", "ok" if ok else "FAIL", label, got, want)
+		}
+		one :: proc(content: string, eol: base.Line_Ending, at, delta: int) -> string {
+			doc: Document
+			doc.pt = base.pt_init(transmute([]u8)content)
+			defer doc_close(&doc) // undo/redo hold cloned trees too; pt_destroy alone leaked them
+			doc.eol = eol
+			doc.cursor, doc.anchor = at, at
+			doc_move_lines(&doc, delta)
+			return strings.clone(doc_debug_string(&doc), context.temp_allocator)
+		}
+		// Every case above collapses cursor and anchor to the same point, so a
+		// multi-line SELECTION -- a_bytes covering more than one line, the
+		// anchor/cursor restore's shift arithmetic -- was never exercised by any
+		// of them. That is exactly the path the unbounded-read finding lived in,
+		// and not a coincidence: an untested path is where an unchecked read
+		// range survives. Returns the resulting anchor/cursor too, not just the
+		// buffer, since a move that gets the bytes right but drops the
+		// selection in the wrong place still breaks "hold the key to repeat".
+		one_sel :: proc(content: string, eol: base.Line_Ending, anchor, cursor, delta: int) -> (buf: string, out_anchor, out_cursor: int) {
+			doc: Document
+			doc.pt = base.pt_init(transmute([]u8)content)
+			defer doc_close(&doc)
+			doc.eol = eol
+			doc.anchor, doc.cursor = anchor, cursor
+			doc_move_lines(&doc, delta)
+			return strings.clone(doc_debug_string(&doc), context.temp_allocator), doc.anchor, doc.cursor
+		}
+		fmt.println("movelinetest:")
+		// LF, middle of the file
+		chk("LF: move line 2 up", one("a\nb\nc\n", .LF, 2, -1), "b\na\nc\n", &fail)
+		chk("LF: move line 1 down", one("a\nb\nc\n", .LF, 0, 1), "b\na\nc\n", &fail)
+		// no-ops at the bounds: the buffer must come back byte-identical
+		chk("LF: first line up is a no-op", one("a\nb\n", .LF, 0, -1), "a\nb\n", &fail)
+		chk("LF: last line down is a no-op", one("a\nb\n", .LF, 2, 1), "a\nb\n", &fail)
+		// the bail arithmetic could plausibly strip the trailing newline instead of
+		// preserving it -- pin the case where a properly-terminated true last line
+		// receives a new neighbour rather than being swapped with a phantom row.
+		chk("LF: down into true last line", one("a\nb\nc\n", .LF, 2, 1), "a\nc\nb\n", &fail)
+		// the last line WITHOUT a trailing newline -- which line lacks one changes
+		chk("LF: unterminated last up", one("a\nb", .LF, 2, -1), "b\na", &fail)
+		chk("LF: into unterminated last", one("a\nb", .LF, 0, 1), "b\na", &fail)
+		// CRLF must never yield a bare LF anywhere
+		chk("CRLF: move line 2 up", one("a\r\nb\r\nc\r\n", .CRLF, 3, -1), "b\r\na\r\nc\r\n", &fail)
+		chk("CRLF: unterminated last up", one("a\r\nb", .CRLF, 3, -1), "b\r\na", &fail)
+		chk("CRLF: into unterminated last", one("a\r\nb", .CRLF, 0, 1), "b\r\na", &fail)
+		// .Mixed must never rewrite a line ending the move didn't touch. The old
+		// "each line carries its own terminator" model synthesised doc.eol's bytes
+		// whenever the piece landing first was the unterminated last line -- here
+		// that piece's real neighbour separator is a CRLF the move never touched.
+		// Both directions of the same swap, since both synthesised under the old model.
+		chk("Mixed: unterminated last up preserves CRLF", one("a\nb\r\nc", .Mixed, 5, -1), "a\nc\r\nb", &fail)
+		chk("Mixed: into unterminated last preserves CRLF", one("a\nb\r\nc", .Mixed, 2, 1), "a\nc\r\nb", &fail)
+		// Multi-line selection covering "bb" and "ccc" (bytes 2..7 of
+		// "a\nbb\nccc\nd\n"): a_bytes = pt[2:8) = "bb\nccc", with "a" above and
+		// "d" below. Moving down swaps the pair past "d"; moving up swaps it
+		// past "a". Both directions of the same selection, mirroring the
+		// single-line up/down pairs above.
+		sel_fixture := "a\nbb\nccc\nd\n"
+		{
+			buf, a, c := one_sel(sel_fixture, .LF, 2, 7, 1)
+			chk("multi-line sel: down past neighbour", buf, "a\nd\nbb\nccc\n", &fail)
+			ok := a == 4 && c == 9
+			if !ok {fail = true}
+			fmt.printfln("  %-6s multi-line sel down: anchor=%d cursor=%d (want 4, 9)", "ok" if ok else "FAIL", a, c)
+		}
+		{
+			buf, a, c := one_sel(sel_fixture, .LF, 2, 7, -1)
+			chk("multi-line sel: up past neighbour", buf, "bb\nccc\na\nd\n", &fail)
+			ok := a == 0 && c == 5
+			if !ok {fail = true}
+			fmt.printfln("  %-6s multi-line sel up: anchor=%d cursor=%d (want 0, 5)", "ok" if ok else "FAIL", a, c)
+		}
+		// A line longer than MOVE_LINE_BUDGET must be refused, not scanned: the fix
+		// for the unbounded-scan finding is a bail, and a bail that silently didn't
+		// fire would corrupt the buffer instead of leaving it alone -- so assert the
+		// whole buffer is untouched, not just that the call returned.
+		big := strings.repeat("x", MOVE_LINE_BUDGET + 16, context.temp_allocator)
+		over_budget := strings.concatenate({big, "\nb"}, context.temp_allocator)
+		// Compared in full but reported by length and a match flag: chk prints both
+		// operands with %q, and these are a megabyte each, which buried the rest of
+		// the mode's output under four megabytes of x's.
+		{
+			got := one(over_budget, .LF, len(big) + 1, -1)
+			ok := got == over_budget
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s %-34s %d bytes, unchanged=%v",
+				"ok" if ok else "FAIL",
+				"over-budget line is a no-op",
+				len(over_budget),
+				ok,
+			)
+		}
+		// The line-length bail above doesn't cover this: every line here is two
+		// bytes, so lo_exact/last_exact/line_span_cap all succeed quickly and
+		// only the SELECTION's total span (region_hi - region_lo) crosses
+		// MOVE_LINE_BUDGET -- the exact shape of the Critical 1 finding (click
+		// line 2, Ctrl+Shift+End, Alt+Up on a huge file: every individual scan
+		// is short, only the read_range about to run is not). Verified this
+		// fails without the region_hi-region_lo bail in doc_move_lines: with it
+		// removed, the buffer comes back changed instead of byte-identical.
+		{
+			line := "x\n"
+			body := strings.repeat(line, MOVE_LINE_BUDGET / 2 + 50, context.temp_allocator)
+			multi_over := strings.concatenate({"z\n", body}, context.temp_allocator)
+			got, _, _ := one_sel(multi_over, .LF, 2, len(multi_over) - 1, -1)
+			ok := got == multi_over
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s %-34s %d bytes, unchanged=%v",
+				"ok" if ok else "FAIL",
+				"over-budget SELECTION is a no-op",
+				len(multi_over),
+				ok,
+			)
+		}
+		// One press must add exactly one undo entry (Replace All's overflow bug
+		// was one snapshot per match; a batch is the fix, so pin that it still
+		// collapses to one here too), and doc_undo must restore the exact
+		// original bytes -- not just "no error", the pre-move buffer verbatim.
+		{
+			ud: Document
+			ud.pt = base.pt_init(transmute([]u8)string("a\r\nb\r\nc\r\n"))
+			defer doc_close(&ud)
+			ud.eol = .CRLF
+			ud.cursor, ud.anchor = 3, 3
+			before := len(ud.undo)
+			doc_move_lines(&ud, -1)
+			added := len(ud.undo) - before
+			if added != 1 {
+				fail = true
+				fmt.printfln("  FAIL   undo entries added: %d (want 1)", added)
+			} else {
+				fmt.printfln("  ok     undo entries added: %d (want 1)", added)
+			}
+			doc_undo(&ud)
+			restored := doc_debug_string(&ud)
+			chk("undo restores original bytes", restored, "a\r\nb\r\nc\r\n", &fail)
+		}
+		fmt.println("movelinetest: FAILURES" if fail else "movelinetest: all ok")
 		return true
 	}
 
@@ -2978,6 +3155,338 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad viewmemtest` proves the per-family view memory (Wyatt's complaint:
+	// switching a .md to Split, then opening another .md, used to come up plain
+	// again). Checks, in order:
+	//   - a fresh open of a markdown/tabular file adopts the remembered family
+	//     default, through the same doc_can_* gating a manual toggle uses;
+	//   - a .txt is unaffected by md_default -- the gating holds, so a stray
+	//     default can never wedge a file into a view it cannot hold;
+	//   - toggling a view learns the new default only when remember_views is on;
+	//   - toggling a view on an untitled buffer never learns a default -- the
+	//     empty-path short-circuit that lets an untitled buffer enter any view
+	//     also makes doc_is_tabular/doc_is_markdownish true for it, so the learn
+	//     gate needs its own doc.path != "" check, not just the family check;
+	//   - a session-restored tab is untouched by the family default -- this is
+	//     the assertion that protects the rule most likely to be broken: session
+	//     restore must win over a family default, always;
+	//   - an out-of-range md_default on disk degrades to .Off, not an invalid enum.
+	// Set NEWTPAD_SESSION_DIR to a temp dir first -- this reads/writes
+	// settings.txt and drives session_save/session_restore.
+	if os.args[1] == "viewmemtest" {
+		if !require_scratch_session("viewmemtest") {return true}
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("viewmemtest: no fonts loaded")
+			return true
+		}
+		bad := 0
+		tmp := os.get_env("TEMP", context.temp_allocator)
+		mdf := fmt.tprintf("%s%cnewtpad_viewmem.md", tmp, '\\')
+		csvf := fmt.tprintf("%s%cnewtpad_viewmem.csv", tmp, '\\')
+		txtf := fmt.tprintf("%s%cnewtpad_viewmem.txt", tmp, '\\')
+		plat.file_write_atomic(mdf, transmute([]u8)string("# heading\n\nbody text\n"))
+		plat.file_write_atomic(csvf, transmute([]u8)string("a,b,c\n1,2,3\n"))
+		plat.file_write_atomic(txtf, transmute([]u8)string("just plain text\n"))
+		// real files on disk in %TEMP% -- must not be left behind (see droptest)
+		defer os.remove(mdf)
+		defer os.remove(csvf)
+		defer os.remove(txtf)
+
+		fmt.println("--- fresh open adopts the family default ---")
+		{
+			a: App
+			a.settings = settings_default()
+			a.settings.md_default = .Split
+			a.settings.table_default = true
+			app_open_path(&a, mdf)
+			md := app_active(&a)
+			mdok := md != nil && md.md_mode == .Split
+			fmt.printfln("  .md  opens in %-8v %s", md.md_mode, "OK" if mdok else "FAIL")
+			if !mdok {bad += 1}
+
+			app_open_path(&a, csvf)
+			cv := app_active(&a)
+			cvok := cv != nil && cv.table
+			fmt.printfln("  .csv opens with table=%-5v %s", cv.table, "OK" if cvok else "FAIL")
+			if !cvok {bad += 1}
+
+			// The gating holds: a .txt cannot enter markdown mode (doc_can_markdown
+			// is false for it), so md_default cannot force it into Split anyway.
+			app_open_path(&a, txtf)
+			tx := app_active(&a)
+			txok := tx != nil && tx.md_mode == .Off
+			fmt.printfln("  .txt stays %-8v despite md_default=Split %s", tx.md_mode, "OK" if txok else "FAIL")
+			if !txok {bad += 1}
+			app_destroy(&a)
+		}
+
+		fmt.println("--- toggling a view learns the default, gated on remember_views ---")
+		{
+			a: App
+			dummy: plat.Window
+			a.settings = settings_default() // md_default .Off, so the fresh open below is Off
+			a.settings.remember_views = true
+			app_open_path(&a, mdf)
+			command_dispatch(.Toggle_Preview, {}, &a, &dummy, &t, 10) // Off -> Preview
+			learned := a.settings.md_default == .Preview
+			fmt.printfln("  remember on:  toggle -> md_default=%-8v %s", a.settings.md_default, "OK" if learned else "FAIL")
+			if !learned {bad += 1}
+			onDisk := settings_load() // learn-on-toggle must have written settings.txt, not just memory
+			savedOK := onDisk.md_default == .Preview
+			fmt.printfln("  ...settings.txt agrees: md_default=%-8v %s", onDisk.md_default, "OK" if savedOK else "FAIL")
+			if !savedOK {bad += 1}
+			app_destroy(&a)
+		}
+		{
+			a: App
+			dummy: plat.Window
+			a.settings = settings_default()
+			a.settings.remember_views = false
+			app_open_path(&a, csvf)
+			command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10) // Off -> On
+			notLearned := a.settings.table_default == false
+			fmt.printfln("  remember off: toggle -> table_default=%-5v (unchanged) %s", a.settings.table_default, "OK" if notLearned else "FAIL")
+			if !notLearned {bad += 1}
+			app_destroy(&a)
+		}
+
+		fmt.println("--- toggling a view on an untitled buffer must not teach a family default ---")
+		{
+			// doc_can_markdown/doc_can_table are true for an untitled buffer (the
+			// empty-path short-circuit in path_has_ext: "don't limit an untitled
+			// buffer"), so the toggle itself succeeds here same as on a real
+			// markdown/csv file. The learn gate must additionally require a path,
+			// or a stray Ctrl+M on a blank scratch tab teaches the family default.
+			a: App
+			dummy: plat.Window
+			a.settings = settings_default()
+			a.settings.remember_views = true
+			app_new_scratch(&a) // untitled: doc.path == ""
+			command_dispatch(.Toggle_Preview, {}, &a, &dummy, &t, 10) // Off -> Preview
+			mdUntouched := a.settings.md_default == .Off
+			fmt.printfln("  Ctrl+M on untitled: md_default=%-8v (should stay Off) %s", a.settings.md_default, "OK" if mdUntouched else "FAIL")
+			if !mdUntouched {bad += 1}
+			app_destroy(&a)
+		}
+		{
+			a: App
+			dummy: plat.Window
+			a.settings = settings_default()
+			a.settings.remember_views = true
+			app_new_scratch(&a) // untitled: doc.path == ""
+			command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10) // Off -> On
+			tableUntouched := a.settings.table_default == false
+			fmt.printfln("  Ctrl+T on untitled: table_default=%-5v (should stay false) %s", a.settings.table_default, "OK" if tableUntouched else "FAIL")
+			if !tableUntouched {bad += 1}
+			app_destroy(&a)
+		}
+
+		fmt.println("--- session restore wins over the family default ---")
+		{
+			// A tab left in Preview, saved and restored, must not come back forced
+			// onto a family default that says something else. (md_mode/table are
+			// not yet persisted per tab in session.txt -- only wrap is -- so the
+			// restored value below is always Off/false either way. What this
+			// proves is the property that matters regardless: app_apply_view_defaults
+			// is never reached from the restore path, so it can never overwrite a
+			// per-tab view -- today's Off, or a persisted value a future session
+			// format might carry.)
+			a: App
+			app_open_path(&a, mdf)
+			d := app_active(&a)
+			d.md_mode = .Preview // the view the user deliberately left this tab in
+			session_save(&a)
+			app_destroy(&a)
+
+			b: App
+			b.settings = settings_default()
+			b.settings.md_default = .Split // family default now disagrees
+			restored := session_restore(&b)
+			rd := app_active(&b)
+			ok := restored && rd != nil && rd.md_mode == .Off
+			fmt.printfln("  restored tab md_mode=%-8v (md_default=Split, untouched) %s", rd.md_mode if rd != nil else Md_Mode.Off, "OK" if ok else "FAIL")
+			if !ok {bad += 1}
+			app_destroy(&b)
+			// reset the session so the GUI doesn't inherit this test's tabs
+			empty: App
+			app_new_scratch(&empty)
+			session_save(&empty)
+			app_destroy(&empty)
+		}
+
+		fmt.println("--- out-of-range md_default degrades, not corrupts ---")
+		{
+			raw := "newtpad-settings 1\nrestore_session 1\nwrap_default 0\nfont_size 16\nzoom_pct 100\nfont_family Consolas\nfont_style 0\nlink_style 0\nsplit_frac 0.50\nmd_default 99\ntable_default 0\nremember_views 1\n"
+			if p, pok := session_dir(); pok {
+				plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)raw)
+			}
+			s := settings_load()
+			degraded := s.md_default == .Off
+			fmt.printfln("  md_default 99 -> %-8v %s", s.md_default, "OK" if degraded else "FAIL")
+			if !degraded {bad += 1}
+		}
+
+		fmt.printfln("viewmemtest: %d failures", bad)
+		return true
+	}
+
+	// `newtpad splittest` proves the Markdown Split divider has exactly one x:
+	// md_divider_rect and doc_editor_right must agree at any window size and any
+	// fraction, not just at the old hardcoded 0.5 -- comparing the two against
+	// EACH OTHER catches a second, independently-computed split x that a constant
+	// comparison would miss. Also covers the drag clamp and that the fraction
+	// actually reaches the things that are supposed to derive from it.
+	if os.args[1] == "splittest" {
+		if !require_scratch_session("splittest") {return true}
+		fail := false
+		chk :: proc(label: string, ok: bool, fail: ^bool) {
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+		}
+
+		doc: Document
+		doc.pt = base.pt_init(transmute([]u8)string("hello world\n"))
+		defer base.pt_destroy(&doc.pt)
+		doc.kind = .Text
+		doc.md_mode = .Split
+
+		fmt.println("splittest:")
+		fmt.println("--- agreement: md_divider_rect vs doc_editor_right ---")
+		// A 1px window and a very wide one are the boundary sizes where an
+		// off-by-a-few-pixels bug or an int-truncation mismatch would show up;
+		// a normal window is the everyday case. All three fractions, at all
+		// three widths.
+		widths := []f32{1, 100000, 1280}
+		fracs := []f32{0.2, 0.5, 0.73}
+		for winw in widths {
+			for frac in fracs {
+				er := doc_editor_right(&doc, winw, frac)
+				dr := md_divider_rect(&doc, winw, 720, frac)
+				center := dr.pos.x + dr.size.x * 0.5
+				ok := dr.size.x > 0 && abs(center - er) < 0.6 // sub-pixel rounding only
+				chk(fmt.tprintf("winw=%.0f frac=%.2f  editor_right=%.1f divider_center=%.1f", winw, frac, er, center), ok, &fail)
+			}
+		}
+		// Not in Split: the brief's "no second condition" contract -- zero size,
+		// not just "don't crash".
+		doc.md_mode = .Off
+		zdr := md_divider_rect(&doc, 1280, 720, 0.5)
+		chk(fmt.tprintf("not in Split -> zero-size rect (got %.0fx%.0f)", zdr.size.x, zdr.size.y), zdr.size.x == 0 && zdr.size.y == 0, &fail)
+		doc.md_mode = .Split
+
+		fmt.println("--- divider stops above the find/status bar ---")
+		// The find/status bar owns the bottom strip (main.odin ~535); before this,
+		// md_divider_rect's height ran the full window, so a press in that strip
+		// at the divider's x column started a spurious drag. Bound the rect to
+		// winh - doc_bottom_bar_h(doc), mirroring pvbot (main.odin ~930), and
+		// check it both with find closed (status line, the smaller bar) and open
+		// (the taller find bar) -- the bound must track doc_bottom_bar_h, not
+		// assume the smaller one.
+		bar_winw, bar_winh := f32(1280), f32(720)
+		find_states := []bool{false, true}
+		for find_active in find_states {
+			doc.find.active = find_active
+			doc.find.replace_mode = false
+			bar_h := doc_bottom_bar_h(&doc)
+			bdr := md_divider_rect(&doc, bar_winw, bar_winh, 0.5)
+			bottom := bdr.pos.y + bdr.size.y
+			want_bottom := bar_winh - bar_h
+			ok := abs(bottom - want_bottom) < 0.6
+			chk(fmt.tprintf("find.active=%v: rect bottom=%.1f stops at winh-bar_h=%.1f", find_active, bottom, want_bottom), ok, &fail)
+			// The point of the bound is the hit-test, not the drawing: a point
+			// inside the bar strip at the divider's x column must land outside
+			// the rect's y range, or a press there still starts a drag.
+			strip_y := bar_winh - bar_h*0.5 // mid-strip, well clear of rounding
+			cx := bdr.pos.x + bdr.size.x*0.5
+			inside := cx >= bdr.pos.x && cx < bdr.pos.x+bdr.size.x && strip_y >= bdr.pos.y && strip_y < bdr.pos.y+bdr.size.y
+			chk(fmt.tprintf("find.active=%v: point in bar strip at divider x is NOT in rect", find_active), !inside, &fail)
+		}
+		doc.find.active = false
+
+		fmt.println("--- divider grab band vs. scrollbar hit region ---")
+		// The point checked is the grab band's LEFT edge, not its drawn-line
+		// center: the old scrollbar hit-test was `mouse_x < ed_right` (strictly
+		// less), so the center point (== ed_right exactly) was never inside it
+		// even with the bug present -- only the left half of the band, where a
+		// press aiming at the line but landing a pixel or two short used to
+		// land, was ever actually swallowed. Checking the center would pass
+		// whether or not the fix is in place, which is the same rect-vs-rect
+		// blindness that let this ship: md_divider_rect never changed, only the
+		// scrollbar's competing claim did, so this has to test an actual point
+		// against both regions, the way a click does, and it has to be a point
+		// the bug really mis-served.
+		for winw in widths {
+			for frac in fracs {
+				er := doc_editor_right(&doc, winw, frac)
+				dr := md_divider_rect(&doc, winw, 720, frac)
+				band_left := dr.pos.x // left edge of the grab band
+				in_divider := band_left >= dr.pos.x && band_left < dr.pos.x+dr.size.x
+				sb_lo, sb_hi := editor_scrollbar_hit_x(&doc, er)
+				in_scrollbar := band_left >= sb_lo && band_left < sb_hi
+				chk(
+					fmt.tprintf("winw=%.0f frac=%.2f  grab-band left edge x=%.1f in divider rect and outside scrollbar hit region", winw, frac, band_left),
+					in_divider && !in_scrollbar,
+					&fail,
+				)
+			}
+		}
+
+		fmt.println("--- drag clamp ---")
+		// split_frac_at is the exact proc main.odin's drag handler calls -- not
+		// a second copy of clamp(mx/winw, SPLIT_MIN, SPLIT_MAX), which would
+		// test Odin's clamp builtin rather than this code (report finding 6).
+		winw := f32(1000)
+		lo := split_frac_at(10, winw) // drag to x=10 (0.01), below SPLIT_MIN
+		hi := split_frac_at(990, winw) // drag to x=990 (0.99), above SPLIT_MAX
+		chk(fmt.tprintf("drag to 0.01 clamps to SPLIT_MIN (%.2f -> %.3f)", SPLIT_MIN, lo), lo == SPLIT_MIN, &fail)
+		chk(fmt.tprintf("drag to 0.99 clamps to SPLIT_MAX (%.2f -> %.3f)", SPLIT_MAX, hi), hi == SPLIT_MAX, &fail)
+		// Panes never invert. Deliberately NOT lo/hi above: both clamp to the
+		// SPLIT_MIN/SPLIT_MAX constants, so comparing doc_editor_right at those
+		// two only proves SPLIT_MIN < SPLIT_MAX -- true regardless of whether
+		// the drag math is right. Two distinct, UNclamped fractions instead
+		// exercise the real mx/winw division: a swapped or inverted expression
+		// would produce equal or backwards results here.
+		mid_lo := split_frac_at(200, winw) // 0.2, inside [SPLIT_MIN, SPLIT_MAX]
+		mid_hi := split_frac_at(800, winw) // 0.8, inside [SPLIT_MIN, SPLIT_MAX]
+		chk(fmt.tprintf("unclamped fractions differ (x=200 -> %.2f, x=800 -> %.2f)", mid_lo, mid_hi), mid_lo < mid_hi, &fail)
+		er_lo := doc_editor_right(&doc, winw, mid_lo)
+		er_hi := doc_editor_right(&doc, winw, mid_hi)
+		chk(fmt.tprintf("panes don't invert (er@0.2=%.0f < er@0.8=%.0f)", er_lo, er_hi), er_lo < er_hi, &fail)
+
+		fmt.println("--- everything downstream of the fraction moves ---")
+		// If either of these stopped changing, something upstream reverted to
+		// reading a hardcoded half instead of the live fraction.
+		er_a := doc_editor_right(&doc, winw, 0.3)
+		er_b := doc_editor_right(&doc, winw, 0.7)
+		cols_a := doc_view_cols(er_a, 8)
+		cols_b := doc_view_cols(er_b, 8)
+		chk(fmt.tprintf("wrap columns differ (frac 0.3 -> %d cols, 0.7 -> %d cols)", cols_a, cols_b), cols_a != cols_b, &fail)
+		chk(fmt.tprintf("editor scrollbar x differs (frac 0.3 -> %.0f, 0.7 -> %.0f)", er_a, er_b), er_a != er_b, &fail)
+
+		fmt.println("--- settings_load clamps an out-of-range file value ---")
+		// Written directly to disk, bypassing settings_save's own clamp -- this is
+		// the "hand-edited or corrupt file" case settings_load has to catch on its
+		// own, not a re-test of the save-side clamp.
+		if p, pok := session_dir(); pok {
+			raw := "newtpad-settings 1\nrestore_session 1\nwrap_default 0\nfont_size 16\nzoom_pct 100\nfont_family Consolas\nfont_style 0\nlink_style 0\nsplit_frac 1.50\n"
+			plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)raw)
+			over := settings_load()
+			chk(fmt.tprintf("1.50 on disk loads clamped to %.2f (want %.2f)", over.split_frac, SPLIT_MAX), over.split_frac == SPLIT_MAX, &fail)
+
+			raw2 := "newtpad-settings 1\nrestore_session 1\nwrap_default 0\nfont_size 16\nzoom_pct 100\nfont_family Consolas\nfont_style 0\nlink_style 0\nsplit_frac -3.00\n"
+			plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)raw2)
+			under := settings_load()
+			chk(fmt.tprintf("-3.00 on disk loads clamped to %.2f (want %.2f)", under.split_frac, SPLIT_MIN), under.split_frac == SPLIT_MIN, &fail)
+		} else {
+			fmt.println("  FAIL  no session dir (set NEWTPAD_SESSION_DIR)")
+			fail = true
+		}
+
+		fmt.println("splittest: FAILURES" if fail else "splittest: all ok")
+		return true
+	}
+
 	// `newtpad revtest` drives every mutator and requires Document.revision to
 	// advance for each. A path that bypassed it would leave caches (markdown
 	// table column widths) stale on screen with no other symptom.
@@ -3277,6 +3786,155 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad droptest` exercises the drag-and-drop consumer without a real OS
+	// drop. WM_DROPFILES itself can't be synthesized headlessly, but everything
+	// downstream of "the queue has paths in it" is ordinary code shared with the
+	// WM_COPYDATA single-instance handoff, so this drives app_consume_open_requests
+	// directly -- the exact proc the frame loop calls, not a parallel copy of it.
+	if os.args[1] == "droptest" {
+		fail := false
+
+		tmp := os.get_env("TEMP", context.temp_allocator)
+		dir := fmt.tprintf("%s\\newtpad_droptest", tmp)
+		os.remove_all(dir) // in case a previous run crashed before cleaning up
+		if err := os.make_directory(dir); err != nil {
+			fmt.eprintfln("droptest: could not create %q: %v", dir, err)
+			return true
+		}
+		defer os.remove_all(dir) // real files on disk; must not be left behind
+
+		fileA := fmt.tprintf("%s\\a.txt", dir)
+		fileB := fmt.tprintf("%s\\b.txt", dir)
+		subdir := fmt.tprintf("%s\\sub", dir)
+		missing := fmt.tprintf("%s\\does_not_exist.txt", dir)
+
+		if werr := os.write_entire_file(fileA, transmute([]u8)string("alpha\n")); werr != nil {
+			fmt.eprintfln("droptest: could not seed %q: %v", fileA, werr)
+			return true
+		}
+		if werr := os.write_entire_file(fileB, transmute([]u8)string("beta\n")); werr != nil {
+			fmt.eprintfln("droptest: could not seed %q: %v", fileB, werr)
+			return true
+		}
+		if err := os.make_directory(subdir); err != nil {
+			fmt.eprintfln("droptest: could not create %q: %v", subdir, err)
+			return true
+		}
+
+		a: App
+		menu_init(&a.menu)
+		defer app_destroy(&a)
+
+		// Order: the folder first, then the two files, then a path that does not
+		// exist -- so "focus lands on the first successfully opened tab" is
+		// actually exercised (the first queue entry is not the one that should
+		// end up focused).
+		app_consume_open_requests(&a, []string{subdir, fileA, fileB, missing})
+
+		live := app_live_count(&a)
+		want_live := 2 // fileA, fileB -- subdir and missing produced no tab
+		ok1 := live == want_live
+		fmt.printfln("  %-6s tabs opened = %d (want %d)", "ok" if ok1 else "FAIL", live, want_live)
+		if !ok1 {fail = true}
+
+		focused := app_active(&a)
+		ok2 := focused != nil && focused.path == fileA
+		fmt.printfln("  %-6s focus on first opened: %q", "ok" if ok2 else "FAIL", focused.path if focused != nil else "<nil>")
+		if !ok2 {fail = true}
+
+		ok3 := app_notice_active(&a) && strings.contains(a.notice, "2 items skipped")
+		fmt.printfln("  %-6s notice reports 2 skipped (folder + missing file): %q", "ok" if ok3 else "FAIL", a.notice)
+		if !ok3 {fail = true}
+
+		// Re-dropping a path that is already open must activate the existing tab
+		// rather than open a second one -- pinning app_open_path's existing
+		// dedupe behaviour rather than changing it.
+		before := live
+		app_consume_open_requests(&a, []string{fileB})
+		after := app_live_count(&a)
+		ok4 := after == before && app_active(&a) != nil && app_active(&a).path == fileB
+		fmt.printfln("  %-6s re-drop activates the existing tab (%d -> %d tabs)", "ok" if ok4 else "FAIL", before, after)
+		if !ok4 {fail = true}
+
+		fmt.println("droptest: FAILURES" if fail else "droptest: all ok")
+		return true
+	}
+
+	// `newtpad dropfittest` exercises the skip-vs-truncate decision inside
+	// WM_DROPFILES (plat.drop_wide_fits / plat.drop_path_convert) directly.
+	// droptest above can't reach this: it drives app_consume_open_requests,
+	// well downstream of the handler, and WM_DROPFILES itself needs a live
+	// HDROP this environment can't synthesize. These two procs were pulled
+	// out of the handler specifically so the skip boundary is testable
+	// without one -- see the review fix in window.odin's WM_DROPFILES case.
+	if os.args[1] == "dropfittest" {
+		fail := false
+		chk :: proc(fail: ^bool, label: string, got: bool) {
+			fmt.printfln("  %-6s %s", "ok" if got else "FAIL", label)
+			if !got {fail^ = true}
+		}
+
+		// 1. Comfortably fits: an ordinary short ASCII path.
+		{
+			s := "C:\\Users\\test\\hello.txt"
+			wide: [plat.OPEN_PATH_MAX]u16
+			n := utf16.encode_string(wide[:], s)
+			need := n + 1 // DragQueryFileW's nil-buffer query includes the null terminator
+			chk(&fail, "fits: drop_wide_fits accepts", plat.drop_wide_fits(need))
+			out: [plat.OPEN_PATH_MAX]u8
+			path, ok := plat.drop_path_convert(wide[:n], out[:])
+			chk(&fail, "fits: drop_path_convert converts", ok && path == s)
+		}
+
+		// 2. Exactly at the wide-character cap: OPEN_PATH_MAX-1 chars, so
+		// need == OPEN_PATH_MAX -- the boundary drop_wide_fits must still
+		// accept (its check is need <= OPEN_PATH_MAX, not <).
+		{
+			s, _ := strings.repeat("a", plat.OPEN_PATH_MAX - 1, context.temp_allocator)
+			wide: [plat.OPEN_PATH_MAX]u16
+			n := utf16.encode_string(wide[:], s)
+			need := n + 1
+			chk(&fail, "at cap: drop_wide_fits accepts need == OPEN_PATH_MAX", need == plat.OPEN_PATH_MAX && plat.drop_wide_fits(need))
+			out: [plat.OPEN_PATH_MAX]u8
+			path, ok := plat.drop_path_convert(wide[:n], out[:])
+			chk(&fail, "at cap: drop_path_convert converts", ok && len(path) == n)
+		}
+
+		// 3. One wide character over the cap: DragQueryFileW would have to
+		// truncate to fit wbuf. Must be skipped, never truncated -- this is
+		// the finding the fix addresses, so it's the most load-bearing
+		// assertion in this mode. Checked against need one past the exact
+		// cap (not a generic "big number"), so a boundary-off-by-one
+		// (e.g. accepting need <= OPEN_PATH_MAX + 1) fails this test instead
+		// of slipping through on a value nobody would hit in practice.
+		{
+			s, _ := strings.repeat("a", plat.OPEN_PATH_MAX, context.temp_allocator)
+			wide: [plat.OPEN_PATH_MAX + 1]u16
+			n := utf16.encode_string(wide[:], s)
+			need := n + 1
+			chk(&fail, "over cap: drop_wide_fits rejects (skip, not truncate)", need == plat.OPEN_PATH_MAX + 1 && !plat.drop_wide_fits(need))
+		}
+
+		// 4. Wide length fits, but the UTF-8 expansion doesn't: 400 CJK
+		// characters are 400 UTF-16 code units (well under the cap) but
+		// 1200 UTF-8 bytes (over it). Confirms the byte-cap check still
+		// catches what the wide-cap check structurally cannot.
+		{
+			cjk_count :: 400
+			runes: [cjk_count]rune
+			for i in 0 ..< cjk_count {runes[i] = '中'}
+			wide: [plat.OPEN_PATH_MAX]u16
+			n := utf16.encode(wide[:], runes[:])
+			chk(&fail, "utf8 overflow: wide length fits", plat.drop_wide_fits(n + 1))
+			out: [plat.OPEN_PATH_MAX]u8
+			_, ok := plat.drop_path_convert(wide[:n], out[:])
+			chk(&fail, "utf8 overflow: drop_path_convert rejects (byte cap)", !ok)
+		}
+
+		fmt.println("dropfittest: FAILURES" if fail else "dropfittest: all ok")
+		return true
+	}
+
 	if len(os.args) < 3 {return false}
 	path, mode := os.args[1], os.args[2]
 
@@ -3304,6 +3962,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		key_chk(resolve_key(.Left, false, false, .Editor), .Cursor_Left, "Left / Editor")
 		key_chk(resolve_key(.Left, true, false, .Editor), .Word_Left, "Ctrl+Left / Editor")
 		key_chk(resolve_key(.F, true, false, .Editor), .Find_Open, "Ctrl+F / Editor")
+		key_chk(resolve_key(.Up, false, true, .Editor), .Move_Line_Up, "Alt+Up / Editor")
+		key_chk(resolve_key(.Down, false, true, .Editor), .Move_Line_Down, "Alt+Down / Editor")
 		key_chk(resolve_key(.Z, false, true, .Editor), .Toggle_Wrap, "Alt+Z / Editor")
 		key_chk(resolve_key(.Enter, false, false, .Editor), .Insert_Newline, "Enter / Editor")
 		key_chk(resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find")
@@ -3402,6 +4062,61 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		doc_redo(&doc)
 		fmt.printfln("redo x1    : %q", pre(doc_debug_string(&doc)))
 		doc_close(&doc)
+
+		// Enter must write the document's own terminator. A bare '\n' in a CRLF
+		// file silently mixes line endings, and doc.eol is only detected at open,
+		// so the status bar keeps saying CRLF and nothing tells the user.
+		nl: Document
+		nl.pt = base.pt_init(transmute([]u8)string("hello\r\nworld\r\n"))
+		defer base.pt_destroy(&nl.pt)
+		nl.eol = .CRLF
+		nl.cursor, nl.anchor = 5, 5
+		doc_insert_newline(&nl)
+		got := doc_debug_string(&nl)
+		want := "hello\r\n\r\nworld\r\n"
+		ok := got == want
+		fmt.printfln("  %-6s Enter on CRLF -> %q (want %q)", "ok" if ok else "FAIL", got, want)
+
+		// Mirror on LF: the fix must not be a hardcoded CRLF.
+		nl2: Document
+		nl2.pt = base.pt_init(transmute([]u8)string("hello\nworld\n"))
+		defer base.pt_destroy(&nl2.pt)
+		nl2.eol = .LF
+		nl2.cursor, nl2.anchor = 5, 5
+		doc_insert_newline(&nl2)
+		got2 := doc_debug_string(&nl2)
+		want2 := "hello\n\nworld\n"
+		ok2 := got2 == want2
+		fmt.printfln("  %-6s Enter on LF   -> %q (want %q)", "ok" if ok2 else "FAIL", got2, want2)
+
+		// .Mixed (a file that already disagrees with itself) falls through to
+		// the same LF path as .LF -- this was verified by inspection only until
+		// now; same buffer as the LF case above, so a bare LF is the only
+		// possible right answer either way.
+		nl2m: Document
+		nl2m.pt = base.pt_init(transmute([]u8)string("hello\nworld\n"))
+		defer base.pt_destroy(&nl2m.pt)
+		nl2m.eol = .Mixed
+		nl2m.cursor, nl2m.anchor = 5, 5
+		doc_insert_newline(&nl2m)
+		got2m := doc_debug_string(&nl2m)
+		want2m := "hello\n\nworld\n"
+		ok2m := got2m == want2m
+		fmt.printfln("  %-6s Enter on Mixed -> %q (want %q)", "ok" if ok2m else "FAIL", got2m, want2m)
+
+		// Enter must replace an active selection exactly as doc_insert_rune does,
+		// not just splice in beside it -- otherwise Enter with a selection active
+		// behaves differently from typing any other character.
+		nl3: Document
+		nl3.pt = base.pt_init(transmute([]u8)string("hello\r\nworld\r\n"))
+		defer base.pt_destroy(&nl3.pt)
+		nl3.eol = .CRLF
+		nl3.anchor, nl3.cursor = 7, 12 // selects "world"
+		doc_insert_newline(&nl3)
+		got3 := doc_debug_string(&nl3)
+		want3 := "hello\r\n\r\n\r\n"
+		ok3 := got3 == want3
+		fmt.printfln("  %-6s Enter replaces selection -> %q (want %q)", "ok" if ok3 else "FAIL", got3, want3)
 
 	case mode == "savetest" && len(os.args) > 3:
 		outp := os.args[3]

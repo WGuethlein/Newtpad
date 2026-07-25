@@ -155,10 +155,52 @@ doc_view_cols :: #force_inline proc(width, char_w: f32) -> int {
 // Right edge of the editor's content area. The full window normally; the split
 // point in Markdown Split, where the preview owns the right half. Everything that
 // bounds the editor (wrap width, its scrollbar, its click region) uses this.
-MD_SPLIT_FRAC :: f32(0.5)
-doc_editor_right :: proc(doc: ^Document, winw: f32) -> f32 {
-	if doc != nil && doc.kind == .Text && doc.md_mode == .Split {return f32(int(winw * MD_SPLIT_FRAC))}
+// split_frac comes from Settings (a global preference, not per-file) -- the
+// caller passes its own copy rather than this reading an App/Settings pointer,
+// since every call site already has one in scope.
+doc_editor_right :: proc(doc: ^Document, winw, split_frac: f32) -> f32 {
+	if doc != nil && doc.kind == .Text && doc.md_mode == .Split {return f32(int(winw * split_frac))}
 	return winw
+}
+
+// The draggable divider between the editor and the preview. Produced here and
+// consumed by the draw, the hover cursor and the drag hit-test -- one layout per
+// widget, so what is drawn is exactly what is grabbable. Zero-size when the
+// document is not in Split, so callers need no second condition. Centred on
+// doc_editor_right's x -- never computed independently, or the grab band could
+// drift from the pane it is supposed to divide. Stops above the find/status bar
+// (doc_bottom_bar_h) -- that strip owns its own presses (main.odin), and before
+// this the divider's full-window-height hit band would steal one out from under
+// it whenever the divider's x column happened to cross the bar.
+MD_DIVIDER_W :: 6 // logical px; the visible line is thinner than the grab band
+md_divider_rect :: proc(doc: ^Document, winw, winh, split_frac: f32) -> plat.Quad {
+	if doc == nil || doc.kind != .Text || doc.md_mode != .Split {return {}}
+	er := doc_editor_right(doc, winw, split_frac)
+	w := sx(MD_DIVIDER_W)
+	bot := winh - doc_bottom_bar_h(doc)
+	return {pos = {er - w * 0.5, CHROME_TOP}, size = {w, max(0, bot - CHROME_TOP)}}
+}
+
+// The editor scrollbar's clickable x-range at the current doc_editor_right.
+// In Markdown Split it stops MD_DIVIDER_W/2 short of ed_right, ceding
+// md_divider_rect's grab band (which straddles ed_right) instead of competing
+// with it for the same pixels -- the full window edge otherwise. One proc so
+// main.odin's hit-test and splittest's assertion on it agree on the same
+// boundary rather than the test re-deriving a second copy.
+editor_scrollbar_hit_x :: proc(doc: ^Document, ed_right: f32) -> (lo, hi: f32) {
+	hi = ed_right - sx(MD_DIVIDER_W) * 0.5 if doc.md_mode == .Split else ed_right
+	return ed_right - SCROLLBAR_W, hi
+}
+
+// The drag fraction for a divider-drag mouse x at window width winw -- the
+// same expression main.odin's WM_MOUSEMOVE handler evaluates while
+// divider_drag is live, factored out so splittest calls the real computation
+// instead of a second copy of it. A test that re-evaluates its own copy of an
+// expression and asserts on the copy tests the language's clamp, not this
+// code (see the report on this finding). max(1, winw) matches main.odin's own
+// guard against a zero-width window.
+split_frac_at :: proc(mx, winw: f32) -> f32 {
+	return clamp(mx / max(1, winw), SPLIT_MIN, SPLIT_MAX)
 }
 
 // A new/untitled buffer (no path yet) is allowed into any view -- you don't know
@@ -1474,6 +1516,23 @@ doc_insert_rune :: proc(doc: ^Document, r: rune) {
 	doc_insert_text(doc, bytes[:n], .Newline if r == '\n' else .Type)
 }
 
+// Enter. Writes the document's own terminator rather than a bare LF: on a CRLF
+// file a lone '\n' mixes line endings for good, and doc.eol is detected once at
+// open, so nothing downstream notices or reports it.
+doc_insert_newline :: proc(doc: ^Document) {
+	if doc.eol == .CRLF {
+		// kind: .Newline (not the doc_insert_text default of .Paste) so undo
+		// history still reads "New line" and a following keystroke still
+		// breaks the typing run, exactly as the LF path below does.
+		doc_insert_text(doc, transmute([]u8)string("\r\n"), .Newline)
+		return
+	}
+	// .LF and .Mixed both land here: .Mixed means the file already disagrees
+	// with itself, so there is no right terminator to pick, and LF is the same
+	// harmless default detect_line_ending falls back to.
+	doc_insert_rune(doc, '\n')
+}
+
 doc_backspace :: proc(doc: ^Document) {
 	if doc_has_sel(doc) {
 		push_undo(doc, .Delete)
@@ -1509,6 +1568,175 @@ doc_delete_fwd :: proc(doc: ^Document) {
 	doc.nl_delta -= count_newlines(doc, doc.cursor, n)
 	base.pt_delete(&doc.pt, doc.cursor, n)
 	doc.anchor = doc.cursor
+}
+
+// Bytes scanned/allocated/copied per line-move press. This path is not
+// navigation -- it scans, then allocates, then copies, then inserts -- so it
+// needs its own budget well above RENDER_LINE_CAP's per-frame render bound.
+// 2 MiB comfortably covers any real line (minified JSON lines run to a few
+// hundred KB in practice) while keeping the worst case a bounded, synchronous
+// blip on the input thread rather than an open-ended scan of a multi-GB file.
+MOVE_LINE_BUDGET :: 2 * 1024 * 1024
+
+// The end of a line's content (excluding its terminator) and the terminator's
+// length in bytes: 0 if `line_start` begins the buffer's final, unterminated
+// line, 1 for a bare LF, 2 for CRLF. pt_line_end stops at the '\n', which for
+// a CRLF line leaves the '\r' looking like content -- doc_cursor_end peels the
+// same byte off for the same reason. doc_move_lines needs this split to
+// reason about "line plus its following terminator" as one unit, so a swap
+// never cuts a CRLF pair in half.
+//
+// Capped: `ok` is false when no terminator (or buffer end) was found within
+// `cap` bytes of `line_start`, meaning the line is longer than the move
+// budget. The caller must bail rather than trust content_end/term_len, or a
+// pathologically long line gets split instead of refused.
+@(private = "file")
+line_span_cap :: proc(pt: ^base.Piece_Table, line_start, cap: int) -> (content_end, term_len: int, ok: bool) {
+	limit := min(pt.length, line_start + cap)
+	nl := base.pt_line_end_cap(pt, line_start, cap)
+	if nl >= limit && limit < pt.length {
+		return 0, 0, false // hit the budget before finding the line's own terminator
+	}
+	if nl >= pt.length {
+		return pt.length, 0, true
+	}
+	if nl > 0 && base.pt_crlf_at(pt, nl - 1) {
+		return nl - 1, 2, true
+	}
+	return nl, 1, true
+}
+
+// A defensive copy of pt[pos:pos+n) on the frame arena, for assembling
+// doc_move_lines' replacement text out of relocated pieces. nil for n <= 0 so
+// appending it is a no-op rather than an out-of-range read.
+@(private = "file")
+read_range :: proc(pt: ^base.Piece_Table, pos, n: int) -> []u8 {
+	if n <= 0 {return nil}
+	buf := make([]u8, n, context.temp_allocator)
+	base.pt_read(pt, pos, buf)
+	return buf
+}
+
+// Alt+Up / Alt+Down: move every logical line the selection touches up or down
+// past its neighbour, keeping the selection so the key can be held and the
+// move repeated. One undo entry per press; no wraparound -- the first line
+// has nothing above it and the last has nothing below, so those are a no-op
+// rather than a rotation. (Declined: duplicating the line instead of moving
+// it -- a different command, not this one.)
+//
+// The hazard is terminators: they live BETWEEN lines, and the buffer's last
+// line usually has none. Terminators keep their positions -- only the two
+// lines swap between them. The separator between A and `other` is always the
+// one that already separated them before the swap (physically A's own, when A
+// sat first and moved down past `other`; physically `other`'s own, when
+// `other` sat first and A moved up past it) -- and it always exists, by the
+// same reasoning that makes the no-neighbour cases below a bail rather than
+// an edit. The separator after the pair is whichever one already followed the
+// physically-second piece, carried over unchanged -- so it is empty exactly
+// when that piece was the buffer's true unterminated last line, with no
+// separate case needed for it. No synthesis, ever: a line move relocates
+// bytes, it never invents or discards a terminator, so a `.Mixed` document's
+// line endings are untouched anywhere the user didn't touch them. Everything
+// else -- both lines' own text -- is untouched bytes, just relocated. One
+// doc_replace_range over the whole region, so no intermediate state ever
+// exists and no offset can drift mid-edit.
+doc_move_lines :: proc(doc: ^Document, delta: int) {
+	orig_anchor, orig_cursor := doc.anchor, doc.cursor
+
+	// Both line-start scans run before any bail below, so an uncapped scan here
+	// would make the no-op case (e.g. the cursor sitting on a single giant line)
+	// the expensive one. A cap hit means the real line start is more than the
+	// budget away -- bail rather than guess.
+	lo, lo_exact := base.pt_line_start_cap(&doc.pt, min(orig_anchor, orig_cursor), MOVE_LINE_BUDGET)
+	if !lo_exact {return}
+	last_start, last_exact := base.pt_line_start_cap(&doc.pt, max(orig_anchor, orig_cursor), MOVE_LINE_BUDGET)
+	if !last_exact {return}
+	end_a, term_a, a_ok := line_span_cap(&doc.pt, last_start, MOVE_LINE_BUDGET)
+	if !a_ok {return}
+
+	if delta < 0 && lo == 0 {return} // first line: no line above to swap with
+	// `end_a + term_a` (not the brief's raw pt_line_end) is A's true span end,
+	// terminator included: a last line WITH a trailing newline has term_a > 0
+	// but still has no next line to swap with, since the terminator is the
+	// last byte in the buffer. Using the raw, un-peeled pt_line_end here
+	// under-counts a CRLF terminator by one byte and would fail to bail on
+	// exactly that case (see the report's arithmetic on "last line down").
+	if delta > 0 && end_a + term_a >= doc.pt.length {return} // last line: no line below
+
+	// `other` is the neighbour A swaps with -- the next line moving down, the
+	// previous line moving up -- and `a_first` says which of A/other lands
+	// first in the new byte order.
+	other_start, other_end, other_term: int
+	region_lo, region_hi: int
+	a_first: bool
+	if delta > 0 {
+		other_start = end_a + term_a
+		ok: bool
+		other_end, other_term, ok = line_span_cap(&doc.pt, other_start, MOVE_LINE_BUDGET)
+		if !ok {return}
+		region_lo, region_hi = lo, other_end + other_term
+		a_first = false
+	} else {
+		exact: bool
+		other_start, exact = base.pt_line_start_cap(&doc.pt, lo - 1, MOVE_LINE_BUDGET)
+		if !exact {return}
+		ok: bool
+		other_end, other_term, ok = line_span_cap(&doc.pt, other_start, MOVE_LINE_BUDGET)
+		if !ok {return}
+		region_lo, region_hi = other_start, end_a + term_a
+		a_first = true
+	}
+
+	// MOVE_LINE_BUDGET only bounded the individual scans above -- it said
+	// nothing about region_hi - region_lo, the span that's about to be read,
+	// copied and pushed through doc_replace_range (delete + insert + an undo
+	// tree clone). A short last line with a multi-GB selection above it (click
+	// line 2, Ctrl+Shift+End, Alt+Up) sailed through every _cap check while
+	// read_range below allocated and copied the whole remainder of the file on
+	// the input thread. Bail here, once both region ends are known, so the
+	// neighbour's size counts against the budget too, not just the selection's.
+	if region_hi - region_lo > MOVE_LINE_BUDGET {return}
+
+	a_bytes := read_range(&doc.pt, lo, end_a - lo)
+	other_bytes := read_range(&doc.pt, other_start, other_end - other_start)
+	a_term_bytes := read_range(&doc.pt, end_a, term_a)
+	other_term_bytes := read_range(&doc.pt, other_end, other_term)
+
+	// sep_mid is whichever piece sat PHYSICALLY first before the swap: A when
+	// moving down (A preceded other), other when moving up (other preceded A).
+	// sep_end is the other one's own terminator, carried over unchanged as the
+	// separator after the pair -- see the doc comment above for why this needs
+	// no synthesis and no unterminated-tail special case.
+	sep_mid := a_term_bytes if delta > 0 else other_term_bytes
+	sep_end := other_term_bytes if delta > 0 else a_term_bytes
+
+	first_bytes := a_bytes if a_first else other_bytes
+	second_bytes := other_bytes if a_first else a_bytes
+
+	out := make(
+		[dynamic]u8,
+		0,
+		len(first_bytes) + len(sep_mid) + len(second_bytes) + len(sep_end),
+		context.temp_allocator,
+	)
+	append(&out, ..first_bytes)
+	append(&out, ..sep_mid)
+	append(&out, ..second_bytes)
+	append(&out, ..sep_end)
+
+	doc_batch_begin(doc, .Replace)
+	doc_replace_range(doc, region_lo, region_hi - region_lo, out[:])
+	doc_batch_end(doc, 1)
+
+	// doc_replace_range collapses to a single caret past the inserted text;
+	// restore the selection so Alt+Up/Down can be held and the move repeated.
+	// A's internal bytes kept their relative layout, so shifting both ends by
+	// A's net displacement reproduces the original selection exactly.
+	new_a_start := region_lo if a_first else region_lo + len(first_bytes) + len(sep_mid)
+	shift := new_a_start - lo
+	doc.anchor = orig_anchor + shift
+	doc.cursor = orig_cursor + shift
+	doc.last_edit_at = doc.cursor
 }
 
 // --- cursor movement (select=true extends the selection) ---

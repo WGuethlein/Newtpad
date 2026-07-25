@@ -11,6 +11,34 @@ import "core:time"
 import base "src:base"
 import plat "src:platform"
 
+// Drain a batch of paths handed over by another instance or dropped onto the
+// window: open each as a tab (app_open_path activates an existing tab if the
+// file is already open, so re-opening one just focuses it), skip directories
+// with a status-bar note, and focus the FIRST successfully opened tab rather
+// than the last — the natural read order for a multi-file Explorer drop.
+// Exported as its own proc (not inlined in the frame loop) so droptest drives
+// the exact code the frame loop runs, rather than a parallel copy of it.
+app_consume_open_requests :: proc(a: ^App, paths: []string) {
+	first := -1
+	skipped := 0
+	for p in paths {
+		if plat.path_is_directory(p) {
+			skipped += 1
+			continue // a folder is not a document; project trees are out of scope
+		}
+		if !app_open_path(a, p) {
+			fmt.eprintfln("Newtpad: could not open %q", p)
+			skipped += 1
+			continue
+		}
+		if first < 0 {first = a.active}
+	}
+	if first >= 0 {app_activate(a, first)} // focus the first, not the last
+	if skipped > 0 {
+		app_note(a, fmt.tprintf("%d item%s skipped (folders and unreadable files are not opened)", skipped, "" if skipped == 1 else "s"))
+	}
+}
+
 main :: proc() {
 	plat.seh_install() // arm the mapped-read fault guard before any file opens
 
@@ -130,6 +158,7 @@ main :: proc() {
 	scrollbar_drag := false
 	hscrollbar_drag := false
 	md_preview_drag := false
+	divider_drag := false // dragging the Markdown Split divider (md_divider_rect)
 	sel_dragging := false // a text-selection drag has begun (pointer moved since press)
 	press_x, press_y: i32 // client pos of the press that may become a drag
 
@@ -159,16 +188,14 @@ main :: proc() {
 			last_input = time.tick_now()
 		}
 
-		// Files handed over by other launches (Explorer double-click while we're
-		// running): open each as a tab. app_open_path activates an existing tab if
-		// the file is already open, so re-opening a file just focuses it.
+		// Files handed over by other launches (Explorer double-click) or dropped
+		// onto the window (WM_DROPFILES; see platform/window.odin) share this one
+		// queue. app_consume_open_requests is also called directly by droptest —
+		// same code path, not a parallel copy — so that mode actually exercises
+		// what the frame loop runs.
 		if window.open_count > 0 {
 			reqs: [plat.OPEN_QUEUE]string
-			for p in reqs[:plat.window_open_requests(window, reqs[:])] {
-				if !app_open_path(&app, p) {
-					fmt.eprintfln("Newtpad: could not open %q", p)
-				}
-			}
+			app_consume_open_requests(&app, reqs[:plat.window_open_requests(window, reqs[:])])
 			plat.window_clear_open_requests(window)
 			session_dirty = true
 		}
@@ -186,7 +213,7 @@ main :: proc() {
 		rows := doc_visible_rows(doc, f32(window.height), line_h)
 		// Usable content width in cells (word wrap breaks here).
 		doc_update_gutter(doc, char_w) // before view_cols: the gutter narrows the text
-		doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width)), char_w)
+		doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), app.settings.split_frac), char_w)
 		doc.view_rows = rows
 		// Horizontal scroll: clamp to real content, then mirror into H_SCROLL for
 		// this frame so the whole frame's column geometry agrees.
@@ -382,13 +409,20 @@ main :: proc() {
 			window.mouse_down = false
 			window.scroll_delta = 0
 		}
-		ed_right := doc_editor_right(doc, f32(window.width))
+		ed_right := doc_editor_right(doc, f32(window.width), app.settings.split_frac)
 		// Editor scrollbar: a press in its gutter starts a byte-proportional drag. In
 		// Markdown Split it sits at the divider (ed_right), not the window edge, where
 		// the preview's own scrollbar lives. (Otherwise the gutter would be live where
 		// no bar exists — empty buffer, filter view — swallowing last-column clicks.)
 		scrollbar_shown := doc.pt.length > 0 && !doc.filter
-		if scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= ed_right - SCROLLBAR_W && f32(window.mouse_x) < ed_right && window.mouse_y >= i32(CHROME_TOP) {
+		// In Markdown Split, md_divider_rect's grab band straddles ed_right by
+		// design (the drawn accent line sits centred on it too). Left uncapped,
+		// this check -- tested first -- claimed the left half of that band,
+		// leaving the divider grabbable only on its right half while the drawn
+		// line still looked centred. editor_scrollbar_hit_x cedes the divider's
+		// left half back to it, so the reachable band matches the drawn line.
+		scrollbar_lo, scrollbar_hi := editor_scrollbar_hit_x(doc, ed_right)
+		if scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= scrollbar_lo && f32(window.mouse_x) < scrollbar_hi && window.mouse_y >= i32(CHROME_TOP) {
 			scrollbar_drag = true
 			window.mouse_pressed = false
 		}
@@ -412,6 +446,33 @@ main :: proc() {
 				doc_scroll_to_fraction(doc, &text, frac, rows)
 			} else {
 				md_preview_drag = false
+			}
+		}
+
+		// Markdown Split's divider. Checked before the text-selection drag below
+		// (sel_dragging), or a press here would fall through and start selecting
+		// the preview/editor text instead of resizing. After the scrollbar checks
+		// above, though: MD_DIVIDER_W straddles ed_right, and editor_scrollbar_hit_x
+		// already ceded the divider's left half back to it, so the two no longer
+		// compete over the same pixels.
+		{
+			dvr := md_divider_rect(doc, f32(window.width), f32(window.height), app.settings.split_frac)
+			if dvr.size.x > 0 && window.mouse_pressed &&
+			   f32(window.mouse_x) >= dvr.pos.x && f32(window.mouse_x) < dvr.pos.x + dvr.size.x &&
+			   f32(window.mouse_y) >= dvr.pos.y && f32(window.mouse_y) < dvr.pos.y + dvr.size.y {
+				divider_drag = true
+				window.mouse_pressed = false
+			}
+		}
+		if divider_drag {
+			if window.mouse_down {
+				// Live during the drag so both panes track the pointer; settings_save
+				// runs on release only below -- per-WM_MOUSEMOVE saves would be
+				// hundreds of file writes for one drag.
+				app.settings.split_frac = split_frac_at(f32(window.mouse_x), f32(window.width))
+			} else {
+				divider_drag = false
+				settings_save(app.settings)
 			}
 		}
 
@@ -469,7 +530,7 @@ main :: proc() {
 		// a split take no caret. Swallow any press the scrollbars above did not claim
 		// (so the wheel still scrolls, and the bars still drag). After the scrollbars,
 		// so a press on either bar reaches it first.
-		if doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) && !scrollbar_drag && !md_preview_drag {
+		if doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) && !scrollbar_drag && !md_preview_drag && !divider_drag {
 			ro := doc.table || doc.md_mode == .Preview || (doc.md_mode == .Split && f32(window.mouse_x) >= ed_right)
 			if ro && (window.mouse_pressed || window.mouse_down) {
 				window.mouse_pressed = false
@@ -493,13 +554,18 @@ main :: proc() {
 			}
 		}
 
-		// Ctrl+hover over a link: hand cursor. Uses the live cursor position, not
-		// window.mouse_y, which WM_MOUSEMOVE only updates while a button is held —
-		// that exact mistake is in the §6j bug list.
+		// Divider resize cursor, then Ctrl+hover over a link: hand cursor. Uses the
+		// live cursor position, not window.mouse_y, which WM_MOUSEMOVE only updates
+		// while a button is held — that exact mistake is in the §6j bug list. The
+		// same md_divider_rect the drag above hit-tests against, so the cursor
+		// changes exactly where a press would grab.
 		{
 			want := plat.Cursor_Kind.Arrow
-			if plat.key_ctrl_down() && !doc.filter {
-				cx, cy := plat.window_cursor_client(window)
+			cx, cy := plat.window_cursor_client(window)
+			dvr := md_divider_rect(doc, f32(window.width), f32(window.height), app.settings.split_frac)
+			if divider_drag || (dvr.size.x > 0 && f32(cx) >= dvr.pos.x && f32(cx) < dvr.pos.x + dvr.size.x && f32(cy) >= dvr.pos.y && f32(cy) < dvr.pos.y + dvr.size.y) {
+				want = .SizeWE
+			} else if plat.key_ctrl_down() && !doc.filter {
 				if doc.table && doc.kind == .Text {
 					if _, over := table_link_hit(table_links(doc, &text, px, char_w, rows, f32(window.width)), f32(cx), f32(cy), px, line_h); over {
 						want = .Hand
@@ -544,7 +610,7 @@ main :: proc() {
 			press_x, press_y = window.mouse_x, window.mouse_y
 			sel_dragging = false // arm; a drag begins only once the pointer moves
 			window.mouse_pressed = false
-		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag {
+		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag && !divider_drag {
 			// A selection drag begins only once the pointer has actually moved from
 			// the press point. A stationary press-and-hold must not extend the
 			// selection or auto-scroll -- that was the bug where holding still lit up
@@ -761,7 +827,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	doc_update_gutter(doc, char_w) // resize repaints come through here too
 	// Recompute the wrap width here (not just in the main loop) so word wrap
 	// re-flows live during a resize, which repaints through this path.
-	doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width)), char_w)
+	doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), rc.app.settings.split_frac), char_w)
 	doc_update_hscroll(doc) // mirror the (already-clamped) horizontal offset
 
 	plat.text_frame_begin(gfx, text) // resets the recycle guard and grows the atlas if owed
@@ -844,7 +910,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	nb := 0
 	w := f32(window.width)
 	h := f32(window.height)
-	er := doc_editor_right(doc, w)
+	er := doc_editor_right(doc, w, rc.app.settings.split_frac)
 	total := doc.pt.length
 	if total > 0 && !doc.filter {
 		sb_h := h - CHROME_TOP
@@ -874,7 +940,11 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// margin above uses the same trick), so paint the right half back to the
 		// background before the preview, giving two clean side-by-side panes.
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {er, pvtop}, size = {w - er, pvbot - pvtop}, color = {0.09, 0.11, 0.16, 1}}})
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {er, CHROME_TOP}, size = {max(sx(1), 1), h - CHROME_TOP}, color = {0.30, 0.34, 0.42, 1}}})
+		// The visible accent line is thinner than the draggable band; both come from
+		// md_divider_rect so the drawn line always sits exactly where a drag grabs it.
+		dr := md_divider_rect(doc, w, h, rc.app.settings.split_frac)
+		line_w := max(sx(1), 1)
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {dr.pos.x + dr.size.x * 0.5 - line_w * 0.5, dr.pos.y}, size = {line_w, dr.size.y}, color = {0.30, 0.34, 0.42, 1}}})
 		// Preview follows the editor's scroll (doc.top): one synced position, both
 		// panes anchored to the same source line.
 		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.top)
@@ -937,6 +1007,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	if rc.app.palette.active {
 		palette_draw(gfx, quad_pipe, text, rc.app, w, h)
 	}
+
+	// Whether the transient notice (e.g. "2 items skipped" from a drop) is
+	// still live -- checked once per frame regardless of which branch below
+	// runs. This used to be a countdown that only decremented inside the
+	// no-find-bar branch, so opening find paused it indefinitely; app_notice_
+	// active is now a wall-clock check against app.odin's NOTICE_SECONDS, so
+	// it expires on schedule whether or not find happens to be open.
+	notice_live := app_notice_active(rc.app)
 
 	if doc.find.active {
 		f := &doc.find
@@ -1020,7 +1098,13 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		case .Split:
 			mode = "    Markdown Split (Ctrl+M)"
 		}
-		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", mode, recovered, disk, indexing, atlas, nobackup)
+		// The transient notice rides along on the same line while notice_live
+		// (see above).
+		notice := ""
+		if notice_live {
+			notice = fmt.tprintf("    %s", rc.app.notice)
+		}
+		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", mode, recovered, disk, indexing, atlas, nobackup, notice)
 		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)
 		col := [4]f32{0.95, 0.55, 0.35, 1} if warn else {0.55, 0.60, 0.70, 1}
 		plat.text_draw(gfx, text, status, sx(12), h - sx(8), UI_SMALL_PX, col)

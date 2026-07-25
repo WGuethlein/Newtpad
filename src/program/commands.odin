@@ -57,6 +57,8 @@ Command_Id :: enum u8 {
 	Goto_Line,
 	Open_Link,
 	Clear_Selection,
+	Move_Line_Up,
+	Move_Line_Down,
 	Toggle_Wrap,
 	Toggle_Table,
 	Toggle_Preview,
@@ -166,6 +168,8 @@ command_table := [Command_Id]Command {
 	.Goto_Line                = {"Go to Line...", "Cursor"},
 	.Open_Link                = {"Open Link Under Cursor", "File"},
 	.Clear_Selection          = {"Clear Selection", "Cursor"},
+	.Move_Line_Up             = {"Move Line Up", "Edit"},
+	.Move_Line_Down           = {"Move Line Down", "Edit"},
 	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
 	.Toggle_Table             = {"Toggle Table View (CSV/TSV)", "View"},
 	.Toggle_Preview           = {"Toggle Markdown Preview / Split", "View"},
@@ -269,6 +273,8 @@ default_bindings := []Binding {
 	{.G, true, false, .Editor, .Goto_Line}, // Ctrl+G
 	{.S, true, true, .Editor, .Save_As}, // Ctrl+Alt+S (Ctrl+Shift+S can't be expressed: shift isn't part of a chord)
 	{.Escape, false, false, .Editor, .Clear_Selection},
+	{.Up, false, true, .Editor, .Move_Line_Up}, // Alt+Up
+	{.Down, false, true, .Editor, .Move_Line_Down}, // Alt+Down
 	{.Z, false, true, .Editor, .Toggle_Wrap}, // Alt+Z
 	{.T, true, false, .Editor, .Toggle_Table}, // Ctrl+T: CSV/TSV table view
 	{.M, true, false, .Editor, .Toggle_Preview}, // Ctrl+M: markdown preview -> split -> off
@@ -523,7 +529,8 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 // only writes are the controlled cell-edit splice (table_edit_commit).
 command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	#partial switch cmd {
-	case .Backspace, .Delete_Fwd, .Delete_Word_Back, .Insert_Newline, .Insert_Tab, .Undo, .Redo, .Cut, .Paste:
+	case .Backspace, .Delete_Fwd, .Delete_Word_Back, .Insert_Newline, .Insert_Tab, .Undo, .Redo, .Cut, .Paste,
+	     .Move_Line_Up, .Move_Line_Down:
 		return true
 	}
 	return false
@@ -568,7 +575,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Delete_Word_Back:
 		doc_delete_word_back(doc)
 	case .Insert_Newline:
-		doc_insert_rune(doc, '\n')
+		doc_insert_newline(doc)
 	case .Insert_Tab:
 		// Tab arrives as WM_CHAR 0x09 too, but the char path filters control
 		// characters, so the binding is what actually inserts it.
@@ -659,6 +666,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		}
 	case .Clear_Selection:
 		doc.anchor = doc.cursor
+	case .Move_Line_Up:
+		doc_move_lines(doc, -1)
+	case .Move_Line_Down:
+		doc_move_lines(doc, 1)
 	case .Toggle_Wrap:
 		doc.wrap = !doc.wrap
 		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start
@@ -676,6 +687,17 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			} else {
 				clear(&doc.table_widths) // recompute on next open (content may have changed)
 			}
+			// Learn the family default so the next tabular file opens the same way.
+			// Gated on remember_views: with it off the Settings value is a pin, not a
+			// running average of what you last did. Also gated on doc.path != "":
+			// doc_is_tabular short-circuits true for an untitled buffer (same as
+			// doc_can_table -- see path_has_ext's "don't limit" comment), so without
+			// this an untitled Ctrl+T would teach the family a default from a buffer
+			// that was never actually tabular.
+			if app.settings.remember_views && doc.path != "" && doc_is_tabular(doc) {
+				app.settings.table_default = doc.table
+				settings_save(app.settings)
+			}
 		}
 	case .Toggle_Preview:
 		// Cycle Off -> Preview -> Split -> Off. Both preview modes scroll from
@@ -689,6 +711,17 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				doc.md_mode = .Split
 			case .Split:
 				doc.md_mode = .Off
+			}
+			// Learn the family default so the next file of this type opens the same
+			// way. Gated on remember_views: with it off the Settings value is a pin,
+			// not a running average of what you last did. Also gated on doc.path != "":
+			// doc_is_markdownish short-circuits true for an untitled buffer (same as
+			// doc_can_markdown -- see path_has_ext's "don't limit" comment), so without
+			// this an untitled Ctrl+M would teach the family a default from a buffer
+			// that was never actually markdown.
+			if app.settings.remember_views && doc.path != "" && doc_is_markdownish(doc) {
+				app.settings.md_default = doc.md_mode
+				settings_save(app.settings)
 			}
 		}
 

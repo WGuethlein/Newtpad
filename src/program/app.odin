@@ -9,6 +9,7 @@ package main
 
 import "core:path/filepath"
 import "core:strings"
+import "core:time"
 
 App :: struct {
 	docs:       [dynamic]^Document, // slot array; nil = empty slot (never shifts)
@@ -32,6 +33,36 @@ App :: struct {
 	// the dragged document as it swaps places (the slot changes each swap).
 	tab_drag:      bool,
 	tab_drag_slot: int,
+	// Transient status-bar message (dropped folder, etc). Live from
+	// notice_started until NOTICE_SECONDS later; see app_notice_active.
+	notice:         string,
+	notice_started: time.Tick,
+}
+
+// A short-lived status-bar message's display window. Wall-clock, not a frame
+// count: the frame loop blocks in window_wait_message for up to a second at a
+// time while idle (main.odin), so "240 frames" stretched a few seconds into
+// minutes whenever the app wasn't actively redrawing -- see the report on
+// this finding. The zero Tick is always in the past (it predates process
+// start), so a never-set notice_started reads as already-expired for free.
+NOTICE_SECONDS :: 4.0
+
+// Set the transient status-bar message, replacing any previous one. notice is
+// always self-owned (only ever set here), so freeing it unconditionally before
+// the clone is safe — the zero value is "", and deleting an empty string is a
+// no-op, not a crash.
+app_note :: proc(a: ^App, msg: string) {
+	delete(a.notice)
+	a.notice = strings.clone(msg) // caller's msg is often temp-allocated
+	a.notice_started = time.tick_now()
+}
+
+// Whether the transient notice is still within its display window. One proc
+// so the draw call (main.odin) and anything asserting on it (test_modes.odin)
+// share the same definition of "still showing" instead of the draw call
+// re-deriving it inline, the way the frame-count version used to.
+app_notice_active :: proc(a: ^App) -> bool {
+	return a.notice != "" && time.duration_seconds(time.tick_since(a.notice_started)) < NOTICE_SECONDS
 }
 
 // Swap the documents in two slots (tab reorder). Slot indices are referenced by
@@ -154,6 +185,19 @@ app_open_special :: proc(a: ^App, kind: Tab_Kind) {
 	app_activate(a, app_add(a, d))
 }
 
+// Apply the remembered per-family view to a newly opened document. Fresh opens
+// only: session restore carries its own per-tab view state (session_restore
+// builds its Documents directly via doc_open/doc_from_content and never calls
+// this), and overriding that would silently change a view the user had
+// deliberately left set on that specific file. The existing doc_can_* gating
+// still applies, so a stored default can never force a view onto a file that
+// cannot hold it -- a stray md_default cannot wedge a .txt into Split.
+app_apply_view_defaults :: proc(a: ^App, doc: ^Document) {
+	if doc == nil || doc.kind != .Text {return}
+	if a.settings.md_default != .Off && doc_can_markdown(doc) {doc.md_mode = a.settings.md_default}
+	if a.settings.table_default && doc_can_table(doc) {doc.table = true}
+}
+
 // Open `path` into a new tab and activate it. Returns false if the file couldn't
 // be opened (no tab is added in that case).
 app_open_path :: proc(a: ^App, path: string) -> bool {
@@ -171,6 +215,7 @@ app_open_path :: proc(a: ^App, path: string) -> bool {
 		free(d)
 		return false
 	}
+	app_apply_view_defaults(a, d) // fresh open -- see the proc's own comment
 	app_activate(a, app_add(a, d))
 	return true
 }
@@ -230,6 +275,7 @@ app_destroy :: proc(a: ^App) {
 	delete(a.mru)
 	delete(a.palette.query)
 	delete(a.palette.results)
+	delete(a.notice)
 }
 
 // The document's display name: file base name, or "untitled" for a scratch.
