@@ -839,7 +839,13 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	doc_update_hscroll(doc) // mirror the (already-clamped) horizontal offset
 
 	plat.text_frame_begin(gfx, text) // resets the recycle guard and grows the atlas if owed
-	plat.gfx_begin_frame(gfx, 0.09, 0.11, 0.16)
+	// The clear IS the document canvas (see doc_canvas_clear's comment) -- it must
+	// read Bg_Base, not carry its own copy of it. This used to be a bare literal,
+	// {0.09, 0.11, 0.16} = Dark's old #171C29, which kept the canvas dark under
+	// Light: a shape (three loose f32 args, not a `{r, g, b, a}` composite) that
+	// survived five reviews of this batch because none of their greps matched it.
+	clear_col := doc_canvas_clear()
+	plat.gfx_begin_frame(gfx, clear_col[0], clear_col[1], clear_col[2])
 
 	cx, cy: f32
 	caret := false
