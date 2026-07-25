@@ -217,9 +217,12 @@ theme_dark :: proc() -> Theme {
 //   - Border_Subtle does double duty as a hairline (table column separator)
 //     and as the active-tab/overflow/plus-hover fill. On dark the fill value
 //     is *lighter* than its surroundings, which pops on a dark strip; on
-//     white nothing can be lighter than the base, so the same value can only
-//     read as a weak hairline (~1.7:1) with a barely-there active-tab pop --
-//     reported below, not fixed, because fixing it means splitting the role.
+//     white nothing can be lighter than the base, so both jobs are forced to
+//     want "darker" and one value cannot serve them. That geometric argument
+//     is the reason to split, not the ratios: light measures 1.90:1 for the
+//     hairline and 1.69:1 for the active-tab pop, which are actually *better*
+//     than dark's own 1.47:1 and 1.39:1 for the same pairings. Reported, not
+//     fixed, because fixing it means splitting the role.
 //   - Text_Bright/Danger: the tab-close hover icon pairs whatever Text_Bright
 //     is with a fixed red fill. Dark pairs white-on-red (5.89:1); light's
 //     darkest text (needed elsewhere for body-text emphasis) pairs
