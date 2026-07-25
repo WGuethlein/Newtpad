@@ -328,6 +328,8 @@ Add the message case beside `WM_COPYDATA`:
 
 Check `wstring_to_utf8`'s actual name and signature in `core:sys/windows` before using it — the codebase already converts wide paths somewhere in `platform/file.odin`, so **follow whatever helper that uses** rather than introducing a second conversion idiom.
 
+**Query the path length before reading it.** `DragQueryFileW` **truncates** into a too-small buffer and returns the count it copied, so there is no way to tell a genuinely 1023-character path from a silently shortened one. A fixed `[OPEN_PATH_MAX]u16` is also the wrong size in the wrong unit — `OPEN_PATH_MAX` bounds UTF-8 *bytes*, not wide characters. Call `DragQueryFileW(hdrop, i, nil, 0)` first for the true length and `continue` when it will not fit, so an overlong path is **dropped, not truncated** — the same rule `WM_COPYDATA` already enforces with its `n <= OPEN_PATH_MAX` pre-check, and the reason a truncated path would otherwise silently become a different, probably nonexistent file.
+
 - [ ] **Step 2: Add the directory check**
 
 In `src/platform/file.odin`, following the file's existing wide-path idiom:

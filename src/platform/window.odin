@@ -2,7 +2,6 @@
 // This file owns the OS window and its message pump.
 package platform
 
-import "base:runtime"
 import win "core:sys/windows"
 
 // Not present in core:sys/windows; hand-declare (used for click-count timing).
@@ -392,6 +391,41 @@ window_open_requests :: proc(w: ^Window, out: []string) -> int {
 
 window_clear_open_requests :: proc(w: ^Window) {w.open_count = 0}
 
+// Would DragQueryFileW's true required length (queried with a nil buffer,
+// which per MS docs reports the size *including* the null terminator) fit the
+// fixed wide buffer WM_DROPFILES reads into? "contextless" so it can be called
+// straight from wnd_proc, a raw WNDPROC with no Odin context of its own. Split
+// out of the handler so the exact skip-vs-truncate boundary -- fits, exactly
+// at the cap, one over it -- is something a test can drive directly, without
+// a live HDROP.
+drop_wide_fits :: proc "contextless" (need: int) -> bool {
+	return need > 0 && need <= OPEN_PATH_MAX
+}
+
+// Convert a wide path DragQueryFileW has already copied into `out`, a
+// caller-owned UTF-8 buffer. Calls WideCharToMultiByte directly rather than
+// core:sys/windows's wstring_to_utf8: that helper is an ordinary
+// "odin"-convention proc, so even though its buffer-based overload doesn't
+// itself allocate, calling it still requires an Odin context at the call
+// site -- which would force wnd_proc to fabricate one via
+// runtime.default_context(), silently resetting context.assertion_failure_proc
+// away from diag_assert_fail (main() sets that once so it propagates down the
+// whole frame loop -- see main.odin). Going straight to the Win32 call keeps
+// this "contextless" and sidesteps the question entirely.
+//
+// Fails (empty path, ok=false) if the conversion itself fails, or if the
+// UTF-8 expansion of a wide string that fit `drop_wide_fits` still overflows
+// `out` (three-byte-per-character scripts can do this well under the
+// wide-character cap) -- split out so that case has a test too.
+drop_path_convert :: proc "contextless" (wide: []u16, out: []u8) -> (path: string, ok: bool) {
+	if len(wide) == 0 {return}
+	need := win.WideCharToMultiByte(win.CP_UTF8, win.WC_ERR_INVALID_CHARS, win.wstring(raw_data(wide)), win.c_int(len(wide)), nil, 0, nil, nil)
+	if need == 0 || int(need) > len(out) {return}
+	got := win.WideCharToMultiByte(win.CP_UTF8, win.WC_ERR_INVALID_CHARS, win.wstring(raw_data(wide)), win.c_int(len(wide)), raw_data(out), need, nil, nil)
+	if got == 0 {return}
+	return string(out[:got]), true
+}
+
 // Drain the message queue once. Called at the top of each frame.
 window_pump_events :: proc(w: ^Window) {
 	msg: win.MSG
@@ -438,21 +472,46 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		// Explorer drop. Same queue, same cap, same overflow rule as WM_COPYDATA
 		// above — one producer contract, one consumer.
 		//
-		// wnd_proc is invoked directly by the OS as a raw WNDPROC, so unlike an
-		// ordinary Odin call there is no context already flowing in — ...to_utf8
-		// needs one for its temp allocation.
-		context = runtime.default_context()
+		// No Odin context needed: DragQueryFileW is a raw Win32 call, and
+		// drop_path_convert writes straight into a stack buffer, so nothing
+		// here allocates or reads `context`. That matters because wnd_proc is
+		// invoked directly by the OS as a raw WNDPROC and has no context
+		// flowing in the way an ordinary call gets one -- establishing one
+		// with `context = runtime.default_context()` (the fix that made this
+		// compile originally) is not free: it would silently reset
+		// context.assertion_failure_proc away from diag_assert_fail, which
+		// main() sets once specifically so it propagates down the whole frame
+		// loop's context (see main.odin). A panic or bounds check hit from in
+		// here would then skip the crash/log path the rest of the app gets.
+		// Staying context-free sidesteps the question rather than getting it
+		// wrong; on_resize/on_dpi in main.odin call default_context() too, but
+		// they live in package main and can reassign assertion_failure_proc
+		// there directly -- this file (package platform) cannot reach
+		// diag_assert_fail without inverting the platform/program layering.
 		hdrop := win.HDROP(uintptr(wparam))
 		n := int(win.DragQueryFileW(hdrop, 0xFFFFFFFF, nil, 0))
 		for i in 0 ..< n {
 			if w.open_count >= OPEN_QUEUE {break} // overflow is dropped, as documented
+
+			// wbuf is sized in wide characters; OPEN_PATH_MAX bounds UTF-8
+			// bytes for the queue slot below, a different unit entirely.
+			// Query the true required length before ever calling with a real
+			// buffer -- DragQueryFileW truncates silently into a too-small
+			// one and returns only the count it managed to copy, with no way
+			// to tell a genuine 1023-wide-char path from one clipped down to
+			// it. Skip rather than truncate.
+			need := int(win.DragQueryFileW(hdrop, u32(i), nil, 0))
+			if !drop_wide_fits(need) {continue}
+
 			wbuf: [OPEN_PATH_MAX]u16
 			got := win.DragQueryFileW(hdrop, u32(i), &wbuf[0], u32(len(wbuf)))
 			if got == 0 {continue}
-			u8buf, err := win.wstring_to_utf8(win.wstring(&wbuf[0]), int(got), context.temp_allocator)
-			if err != nil || len(u8buf) == 0 || len(u8buf) > OPEN_PATH_MAX {continue}
-			copy(w.open_paths[w.open_count][:], u8buf)
-			w.open_lens[w.open_count] = len(u8buf)
+
+			u8buf: [OPEN_PATH_MAX]u8
+			s, ok := drop_path_convert(wbuf[:got], u8buf[:])
+			if !ok {continue} // conversion failed, or UTF-8 expansion overflowed u8buf
+			copy(w.open_paths[w.open_count][:], s)
+			w.open_lens[w.open_count] = len(s)
 			w.open_count += 1
 		}
 		win.DragFinish(hdrop)

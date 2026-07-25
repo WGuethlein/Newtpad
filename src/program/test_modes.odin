@@ -10,6 +10,7 @@ import "core:strconv"
 import "core:strings"
 import "core:time"
 import "core:unicode/utf8"
+import "core:unicode/utf16"
 import base "src:base"
 import plat "src:platform"
 
@@ -3442,6 +3443,81 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !ok4 {fail = true}
 
 		fmt.println("droptest: FAILURES" if fail else "droptest: all ok")
+		return true
+	}
+
+	// `newtpad dropfittest` exercises the skip-vs-truncate decision inside
+	// WM_DROPFILES (plat.drop_wide_fits / plat.drop_path_convert) directly.
+	// droptest above can't reach this: it drives app_consume_open_requests,
+	// well downstream of the handler, and WM_DROPFILES itself needs a live
+	// HDROP this environment can't synthesize. These two procs were pulled
+	// out of the handler specifically so the skip boundary is testable
+	// without one -- see the review fix in window.odin's WM_DROPFILES case.
+	if os.args[1] == "dropfittest" {
+		fail := false
+		chk :: proc(fail: ^bool, label: string, got: bool) {
+			fmt.printfln("  %-6s %s", "ok" if got else "FAIL", label)
+			if !got {fail^ = true}
+		}
+
+		// 1. Comfortably fits: an ordinary short ASCII path.
+		{
+			s := "C:\\Users\\test\\hello.txt"
+			wide: [plat.OPEN_PATH_MAX]u16
+			n := utf16.encode_string(wide[:], s)
+			need := n + 1 // DragQueryFileW's nil-buffer query includes the null terminator
+			chk(&fail, "fits: drop_wide_fits accepts", plat.drop_wide_fits(need))
+			out: [plat.OPEN_PATH_MAX]u8
+			path, ok := plat.drop_path_convert(wide[:n], out[:])
+			chk(&fail, "fits: drop_path_convert converts", ok && path == s)
+		}
+
+		// 2. Exactly at the wide-character cap: OPEN_PATH_MAX-1 chars, so
+		// need == OPEN_PATH_MAX -- the boundary drop_wide_fits must still
+		// accept (its check is need <= OPEN_PATH_MAX, not <).
+		{
+			s, _ := strings.repeat("a", plat.OPEN_PATH_MAX - 1, context.temp_allocator)
+			wide: [plat.OPEN_PATH_MAX]u16
+			n := utf16.encode_string(wide[:], s)
+			need := n + 1
+			chk(&fail, "at cap: drop_wide_fits accepts need == OPEN_PATH_MAX", need == plat.OPEN_PATH_MAX && plat.drop_wide_fits(need))
+			out: [plat.OPEN_PATH_MAX]u8
+			path, ok := plat.drop_path_convert(wide[:n], out[:])
+			chk(&fail, "at cap: drop_path_convert converts", ok && len(path) == n)
+		}
+
+		// 3. One wide character over the cap: DragQueryFileW would have to
+		// truncate to fit wbuf. Must be skipped, never truncated -- this is
+		// the finding the fix addresses, so it's the most load-bearing
+		// assertion in this mode. Checked against need one past the exact
+		// cap (not a generic "big number"), so a boundary-off-by-one
+		// (e.g. accepting need <= OPEN_PATH_MAX + 1) fails this test instead
+		// of slipping through on a value nobody would hit in practice.
+		{
+			s, _ := strings.repeat("a", plat.OPEN_PATH_MAX, context.temp_allocator)
+			wide: [plat.OPEN_PATH_MAX + 1]u16
+			n := utf16.encode_string(wide[:], s)
+			need := n + 1
+			chk(&fail, "over cap: drop_wide_fits rejects (skip, not truncate)", need == plat.OPEN_PATH_MAX + 1 && !plat.drop_wide_fits(need))
+		}
+
+		// 4. Wide length fits, but the UTF-8 expansion doesn't: 400 CJK
+		// characters are 400 UTF-16 code units (well under the cap) but
+		// 1200 UTF-8 bytes (over it). Confirms the byte-cap check still
+		// catches what the wide-cap check structurally cannot.
+		{
+			cjk_count :: 400
+			runes: [cjk_count]rune
+			for i in 0 ..< cjk_count {runes[i] = '中'}
+			wide: [plat.OPEN_PATH_MAX]u16
+			n := utf16.encode(wide[:], runes[:])
+			chk(&fail, "utf8 overflow: wide length fits", plat.drop_wide_fits(n + 1))
+			out: [plat.OPEN_PATH_MAX]u8
+			_, ok := plat.drop_path_convert(wide[:n], out[:])
+			chk(&fail, "utf8 overflow: drop_path_convert rejects (byte cap)", !ok)
+		}
+
+		fmt.println("dropfittest: FAILURES" if fail else "dropfittest: all ok")
 		return true
 	}
 
