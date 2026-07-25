@@ -17,6 +17,30 @@ Decisions taken by Wyatt before design (2026-07-25) are recorded inline as **Dec
    pattern.
 4. **View memory per file family** — the largest, and it extends `Settings` the same way.
 
+## 0. Enter must write the document's own line ending (found during design)
+
+Not in Wyatt's report. Found while working out feature 1's terminator handling: `commands.odin:571`
+is `doc_insert_rune(doc, '
+')`, a bare LF regardless of `doc.eol`. **Every Enter pressed in a CRLF
+file writes an LF-only line**, so the file's endings mix silently — and `doc.eol` is detected once at
+open and never recomputed, so the status bar keeps reporting CRLF and nothing surfaces it.
+
+Same class as the `doc_delete_fwd` corruption batch 1 fixed, and it is priority-1 by CLAUDE.md's
+ordering, so it goes in ahead of the features.
+
+It is also a prerequisite rather than a digression: feature 1 must decide what terminator to
+synthesise when moving a line into or out of the final position. If Enter writes LF, an `doc.eol`-aware
+line move contradicts it; if line move writes LF to match, the bug spreads. Settling Enter first makes
+feature 1's rule simply "use `doc.eol`", consistently.
+
+`.Mixed` falls through to LF: the file already disagrees with itself, so there is no correct answer,
+and LF is the harmless default `detect_line_ending` already returns.
+
+**Scope note.** This widens the batch beyond the four requested features. It is one line of behaviour
+plus a test, it shares feature 1's fixtures and concern exactly, and leaving it would mean shipping a
+line-move that is careful about terminators next to an Enter that is not. Flagged for Wyatt rather
+than assumed.
+
 ## 1. Alt+Up/Down move line(s)
 
 **Decided:** move every logical line the selection touches, keep the selection so the keys can be
