@@ -243,14 +243,6 @@ find_merge :: proc(doc: ^Document) {
 	f.matches = s.matches[:n]
 	f.match_len = s.match_len[:n]
 
-	// Sticky copy for the status text. Reached only on real progress (the
-	// n == f.merged guard above returns early otherwise), so a cleared array
-	// during a restart cannot overwrite these with zero.
-	if n > 0 {
-		f.last_total = n
-		f.last_current = f.current
-	}
-
 	// Filter view: one entry per matching line. Built from line starts the
 	// worker computed during its linear pass — deriving them here would mean
 	// pt_line_start per match, an uncapped backward scan on the main thread.
@@ -288,6 +280,20 @@ find_merge :: proc(doc: ^Document) {
 			}
 		}
 		find_select_current(doc)
+	}
+
+	// Sticky copy for the status text. Reached only on real progress (the
+	// n == f.merged guard above returns early otherwise), so a cleared array
+	// during a restart cannot overwrite these with zero.
+	//
+	// After the jump block, not before it: search_reset clears f.current to -1
+	// and f.jumped to false on every restart, so at the slice assignments above
+	// f.current is still -1. When the whole result set publishes in one merge —
+	// always true on the synchronous path — copying there froze last_current at
+	// -1 and the bar read "(0/N)" for the rest of the busy window.
+	if n > 0 {
+		f.last_total = n
+		f.last_current = f.current
 	}
 }
 

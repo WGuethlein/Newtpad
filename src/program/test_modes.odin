@@ -2723,6 +2723,80 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad stickytest` checks the find bar's sticky match figures during an
+	// async replace. Below SEARCH_SYNC_MAX the search runs inline and every result
+	// publishes before find_recompute even returns, so a fixture that size proves
+	// nothing -- the flicker this guards against only exists on the worker-thread
+	// path. The fixture is built here in memory (mirrors wraptest) rather than
+	// read from a file, so this is reachable by anyone who checks out the branch,
+	// not just whoever had a scratch file lying around when the bug was found.
+	if os.args[1] == "stickytest" {
+		fail := false
+
+		// Every NEEDLE sits in the first 72 bytes, comfortably inside the worker's
+		// first SEARCH_BLOCK (256 KiB) read. That guarantees the whole result set
+		// publishes in one find_merge call -- the same shape the synchronous path
+		// always has -- so a corrupted sticky value can never be quietly
+		// self-corrected by a second partial merge landing after the jump has
+		// already run once. The filler after it never contains "NEEDLE", so the
+		// match count stays exactly NEEDLES while the buffer is pushed well past
+		// SEARCH_SYNC_MAX, which is what puts the search on the worker thread at
+		// all.
+		NEEDLES :: 8
+		sb := strings.builder_make(context.temp_allocator)
+		for i in 0 ..< NEEDLES {fmt.sbprintf(&sb, "NEEDLE %d\n", i)}
+		FILLER_LINES :: 7000 // ~7000 * 45 bytes =~ 315 KB, well past the 256 KiB threshold
+		for i in 0 ..< FILLER_LINES {strings.write_string(&sb, "the quick brown fox jumps over the lazy dog\n")}
+		content := strings.to_string(sb)
+
+		doc: Document
+		doc.pt = base.pt_init(transmute([]u8)content)
+		defer doc_close(&doc) // frees search results + find.query/replace, then doc.pt
+
+		over := doc.pt.length > SEARCH_SYNC_MAX
+		if !over {fail = true}
+		fmt.printfln(
+			"  %-6s fixture size=%d bytes (SEARCH_SYNC_MAX=%d), needles=%d",
+			"ok" if over else "FAIL",
+			doc.pt.length,
+			SEARCH_SYNC_MAX,
+			NEEDLES,
+		)
+
+		find_open(&doc, true)
+		for r in "NEEDLE" {find_input_rune(&doc, r)}
+		doc.find.field = 1
+		for r in "found" {find_input_rune(&doc, r)}
+		doc.find.field = 0
+		find_wait(&doc)
+		matched := len(doc.find.matches) == NEEDLES
+		if !matched {fail = true}
+		fmt.printfln("  %-6s initial matches=%d (want %d)", "ok" if matched else "FAIL", len(doc.find.matches), NEEDLES)
+
+		// Replace one match at a time. Immediately after each replace -- before
+		// find_wait lets the restarted search finish -- read the state exactly as
+		// render_frame does: while matches is empty and the search is still
+		// running, last_total/last_current must still be the previous search's
+		// real figures, never zero and never -1.
+		zeroed, stuck := false, false
+		total0 := len(doc.find.matches)
+		for i in 0 ..< total0 {
+			find_replace_current(&doc)
+			if len(doc.find.matches) == 0 && search_running(&doc) {
+				if doc.find.last_total == 0 {zeroed = true}
+				if doc.find.last_current < 0 {stuck = true}
+			}
+			find_wait(&doc)
+		}
+		if zeroed {fail = true}
+		if stuck {fail = true}
+		fmt.printfln("  %-6s count never zeroed across %d replaces", "ok" if !zeroed else "FAIL", total0)
+		fmt.printfln("  %-6s last_current never stuck at -1 across %d replaces", "ok" if !stuck else "FAIL", total0)
+
+		fmt.println("stickytest: FAILURES" if fail else "stickytest: all ok")
+		return true
+	}
+
 	if len(os.args) < 3 {return false}
 	path, mode := os.args[1], os.args[2]
 
