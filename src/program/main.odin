@@ -962,10 +962,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			info = " (no matches)"
 		}
 		mode := "regex" if f.regex else "text"
-		fline := fmt.tprintf("Find [%s]%s: %s%s%s", mode, " filter" if doc.filter else "", string(f.query[:]), " _" if f.field == 0 else "", info)
+		// The caret occupies a fixed-width slot whichever field has focus, so the
+		// gap before the match count does not change when focus moves to Replace.
+		fcaret := "_" if f.field == 0 else " "
+		rcaret := "_" if f.field == 1 else " "
+		fline := fmt.tprintf("Find [%s]%s: %s%s%s", mode, " filter" if doc.filter else "", string(f.query[:]), fcaret, info)
 		if f.replace_mode {
 			plat.text_draw(gfx, text, fline, sx(12), h - sx(30), UI_PX, {0.95, 0.88, 0.55, 1})
-			rline := fmt.tprintf("Replace: %s%s", string(f.replace[:]), " _" if f.field == 1 else "")
+			rline := fmt.tprintf("Replace: %s%s", string(f.replace[:]), rcaret)
 			plat.text_draw(gfx, text, rline, sx(12), h - sx(8), UI_PX, {0.82, 0.9, 0.98, 1})
 			hint_find(gfx, text, f, doc, w, h - sx(30))
 		} else {
