@@ -2608,6 +2608,50 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad revtest` drives every mutator and requires Document.revision to
+	// advance for each. A path that bypassed it would leave caches (markdown
+	// table column widths) stale on screen with no other symptom.
+	if os.args[1] == "revtest" {
+		fail := false
+		doc: Document
+		doc.pt = base.pt_init(transmute([]u8)string("alpha beta\ngamma delta\n"))
+		defer base.pt_destroy(&doc.pt)
+		doc.enc = .UTF8
+		last := doc.revision
+		step :: proc(doc: ^Document, last: ^u64, label: string, fail: ^bool) {
+			ok := doc.revision > last^
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %-22s revision %d -> %d", "ok" if ok else "FAIL", label, last^, doc.revision)
+			last^ = doc.revision
+		}
+		fmt.println("revtest:")
+		doc.cursor, doc.anchor = 0, 0
+		doc_insert_rune(&doc, 'X');step(&doc, &last, "insert rune", &fail)
+		doc_backspace(&doc);step(&doc, &last, "backspace", &fail)
+		doc.cursor = 5
+		doc_delete_word_back(&doc);step(&doc, &last, "delete word back", &fail)
+		doc.anchor, doc.cursor = 0, 3
+		doc_replace_sel(&doc, transmute([]u8)string("Q"));step(&doc, &last, "replace selection", &fail)
+		doc_set_line_ending(&doc, .CRLF);step(&doc, &last, "set line ending", &fail)
+		doc_undo(&doc);step(&doc, &last, "undo", &fail)
+		doc_redo(&doc);step(&doc, &last, "redo", &fail)
+		// The batch path, which Replace All uses: push_undo returns early while
+		// doc.batch is set, so the bump must come before that return. Otherwise a
+		// 200-match replace advances revision once and a cache misses 199 edits.
+		doc_batch_begin(&doc, .Replace)
+		before := doc.revision
+		doc.anchor, doc.cursor = 0, 1
+		doc_replace_sel(&doc, transmute([]u8)string("z"))
+		doc.anchor, doc.cursor = 2, 3
+		doc_replace_sel(&doc, transmute([]u8)string("z"))
+		doc_batch_end(&doc, 2)
+		bok := doc.revision >= before + 2
+		if !bok {fail = true}
+		fmt.printfln("  %-6s %-22s revision %d -> %d", "ok" if bok else "FAIL", "two edits in a batch", before, doc.revision)
+		fmt.println("revtest: FAILURES" if fail else "revtest: all ok")
+		return true
+	}
+
 	// `newtpad crlftest` checks every consumer of a row agrees where it ends.
 	// Comparing against a constant would pass with the bug present, because the
 	// text draw already stripped the CR; the point is that the caret, the

@@ -641,6 +641,10 @@ Document :: struct {
 	status_col:        int, // 1-based column (0 = beyond the cap / unknown)
 	status_col_valid:  bool,
 	modified:   bool,
+	// Monotonic mutation counter, for caches that must not outlive an edit (the
+	// markdown table column measure). Bumped in push_undo, which every edit path
+	// routes through.
+	revision:   u64,
 	recovered:  bool, // a mapped read faulted; buffer is now a private copy, not the file
 	// External-change detection (watch.odin). `gen` distinguishes this document
 	// from a later one reusing the same tab slot, so a stat result that arrives
@@ -1066,6 +1070,7 @@ snapshot :: proc(doc: ^Document) -> Snapshot {
 @(private = "file")
 apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 	find_invalidate(doc) // undo/redo don't go through push_undo
+	doc.revision += 1 // ...so neither does its bump; the buffer content still moved
 	base.pt_restore(&doc.pt, s.root, s.length) // takes ownership of s.root
 	doc.cursor = s.cursor
 	doc.anchor = s.anchor
@@ -1082,6 +1087,7 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 // A caret jump, a different kind of edit, or a newline breaks the run.
 push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
 	find_invalidate(doc) // every edit path routes through here; match offsets shift
+	doc.revision += 1 // ... and so must anything caching a measure of the buffer
 	doc.modified = true
 	// One entry for the whole batch; doc_batch_begin already took the snapshot of
 	// the state being left. Without this, Replace All pushed one snapshot per
@@ -1255,6 +1261,7 @@ doc_absorb_append :: proc(doc: ^Document, new_size: i64) -> bool {
 	base.pt_insert(&doc.pt, doc.pt.length, chunk)
 	for b in chunk {if b == '\n' {doc.nl_delta += 1}}
 	doc.appended += len(chunk)
+	doc.revision += 1 // content changed; this path deliberately skips push_undo
 	if at_end { // follow the tail, like tail -f
 		doc.cursor = doc.pt.length
 		doc.anchor = doc.cursor
@@ -1274,6 +1281,11 @@ doc_reload :: proc(doc: ^Document) -> bool {
 	cursor, anchor, top := doc.cursor, doc.anchor, doc.top
 	wrap := doc.wrap
 	path := strings.clone(doc.path)
+	// fresh is a brand-new Document and so starts at revision 0; carried forward
+	// and bumped rather than left at 0, or revision would go backwards on a tab
+	// that had already advanced past 0 -- breaking the "monotonic" contract a
+	// cache relies on to tell reload apart from "nothing happened since I looked".
+	rev := doc.revision
 
 	doc_close(doc) // stops both workers, frees the trees and the old original
 	doc^ = fresh
@@ -1281,6 +1293,7 @@ doc_reload :: proc(doc: ^Document) -> bool {
 	doc.path = path
 	doc.path_owned = true
 	doc.wrap = wrap
+	doc.revision = rev + 1
 	// Preserve position by byte offset, clamped — the file may have shrunk.
 	L := doc.pt.length
 	doc.cursor = clamp(cursor, 0, L)
