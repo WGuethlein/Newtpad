@@ -54,8 +54,9 @@ Settings :: struct {
 	// restore carries its own per-tab state and must never be overridden by this.
 	md_default:      Md_Mode,
 	table_default:   bool,
-	remember_views:  bool, // when on, toggling a view updates the defaults above;
-	// off turns them into a pin instead of a running average of what you last did
+	// When on, toggling a view updates the defaults above; off turns them into a
+	// pin instead of a running average of what you last did.
+	remember_views:  bool,
 }
 
 // Families present on this machine, in the curated order. Recomputed when the

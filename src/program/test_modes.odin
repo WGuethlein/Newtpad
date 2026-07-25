@@ -3082,6 +3082,10 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	//   - a .txt is unaffected by md_default -- the gating holds, so a stray
 	//     default can never wedge a file into a view it cannot hold;
 	//   - toggling a view learns the new default only when remember_views is on;
+	//   - toggling a view on an untitled buffer never learns a default -- the
+	//     empty-path short-circuit that lets an untitled buffer enter any view
+	//     also makes doc_is_tabular/doc_is_markdownish true for it, so the learn
+	//     gate needs its own doc.path != "" check, not just the family check;
 	//   - a session-restored tab is untouched by the family default -- this is
 	//     the assertion that protects the rule most likely to be broken: session
 	//     restore must win over a family default, always;
@@ -3102,6 +3106,10 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		plat.file_write_atomic(mdf, transmute([]u8)string("# heading\n\nbody text\n"))
 		plat.file_write_atomic(csvf, transmute([]u8)string("a,b,c\n1,2,3\n"))
 		plat.file_write_atomic(txtf, transmute([]u8)string("just plain text\n"))
+		// real files on disk in %TEMP% -- must not be left behind (see droptest)
+		defer os.remove(mdf)
+		defer os.remove(csvf)
+		defer os.remove(txtf)
 
 		fmt.println("--- fresh open adopts the family default ---")
 		{
@@ -3158,6 +3166,37 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			notLearned := a.settings.table_default == false
 			fmt.printfln("  remember off: toggle -> table_default=%-5v (unchanged) %s", a.settings.table_default, "OK" if notLearned else "FAIL")
 			if !notLearned {bad += 1}
+			app_destroy(&a)
+		}
+
+		fmt.println("--- toggling a view on an untitled buffer must not teach a family default ---")
+		{
+			// doc_can_markdown/doc_can_table are true for an untitled buffer (the
+			// empty-path short-circuit in path_has_ext: "don't limit an untitled
+			// buffer"), so the toggle itself succeeds here same as on a real
+			// markdown/csv file. The learn gate must additionally require a path,
+			// or a stray Ctrl+M on a blank scratch tab teaches the family default.
+			a: App
+			dummy: plat.Window
+			a.settings = settings_default()
+			a.settings.remember_views = true
+			app_new_scratch(&a) // untitled: doc.path == ""
+			command_dispatch(.Toggle_Preview, {}, &a, &dummy, &t, 10) // Off -> Preview
+			mdUntouched := a.settings.md_default == .Off
+			fmt.printfln("  Ctrl+M on untitled: md_default=%-8v (should stay Off) %s", a.settings.md_default, "OK" if mdUntouched else "FAIL")
+			if !mdUntouched {bad += 1}
+			app_destroy(&a)
+		}
+		{
+			a: App
+			dummy: plat.Window
+			a.settings = settings_default()
+			a.settings.remember_views = true
+			app_new_scratch(&a) // untitled: doc.path == ""
+			command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10) // Off -> On
+			tableUntouched := a.settings.table_default == false
+			fmt.printfln("  Ctrl+T on untitled: table_default=%-5v (should stay false) %s", a.settings.table_default, "OK" if tableUntouched else "FAIL")
+			if !tableUntouched {bad += 1}
 			app_destroy(&a)
 		}
 

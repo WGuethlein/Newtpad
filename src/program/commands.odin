@@ -689,10 +689,12 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			}
 			// Learn the family default so the next tabular file opens the same way.
 			// Gated on remember_views: with it off the Settings value is a pin, not a
-			// running average of what you last did. Keyed on doc_is_tabular (the
-			// extension), not doc_can_table, so toggling table view on an untitled
-			// scratch buffer never teaches the family a default.
-			if app.settings.remember_views && doc_is_tabular(doc) {
+			// running average of what you last did. Also gated on doc.path != "":
+			// doc_is_tabular short-circuits true for an untitled buffer (same as
+			// doc_can_table -- see path_has_ext's "don't limit" comment), so without
+			// this an untitled Ctrl+T would teach the family a default from a buffer
+			// that was never actually tabular.
+			if app.settings.remember_views && doc.path != "" && doc_is_tabular(doc) {
 				app.settings.table_default = doc.table
 				settings_save(app.settings)
 			}
@@ -712,10 +714,12 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			}
 			// Learn the family default so the next file of this type opens the same
 			// way. Gated on remember_views: with it off the Settings value is a pin,
-			// not a running average of what you last did. Keyed on doc_is_markdownish
-			// (the extension), not doc_can_markdown, so cycling preview on an untitled
-			// scratch buffer never teaches the family a default.
-			if app.settings.remember_views && doc_is_markdownish(doc) {
+			// not a running average of what you last did. Also gated on doc.path != "":
+			// doc_is_markdownish short-circuits true for an untitled buffer (same as
+			// doc_can_markdown -- see path_has_ext's "don't limit" comment), so without
+			// this an untitled Ctrl+M would teach the family a default from a buffer
+			// that was never actually markdown.
+			if app.settings.remember_views && doc.path != "" && doc_is_markdownish(doc) {
 				app.settings.md_default = doc.md_mode
 				settings_save(app.settings)
 			}
