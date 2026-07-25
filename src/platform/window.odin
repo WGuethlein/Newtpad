@@ -265,6 +265,7 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 	w.cursors[.Arrow] = win.LoadCursorW(nil, transmute(win.wstring)win.IDC_ARROW)
 	w.cursors[.Hand] = win.LoadCursorW(nil, transmute(win.wstring)win.IDC_HAND)
 	w.cursors[.IBeam] = win.LoadCursorW(nil, transmute(win.wstring)win.IDC_IBEAM)
+	w.cursors[.SizeWE] = win.LoadCursorW(nil, transmute(win.wstring)win.IDC_SIZEWE)
 
 	// No AdjustWindowRectEx: WM_NCCALCSIZE gives this window a client area equal
 	// to its whole window rect, so there is no frame to add. (It was also the
@@ -330,6 +331,7 @@ Cursor_Kind :: enum u8 {
 	Arrow,
 	Hand,
 	IBeam,
+	SizeWE, // horizontal resize, e.g. hovering/dragging the Markdown Split divider
 }
 
 // What the pointer should look like over the client area. Set per frame by the

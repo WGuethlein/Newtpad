@@ -158,6 +158,7 @@ main :: proc() {
 	scrollbar_drag := false
 	hscrollbar_drag := false
 	md_preview_drag := false
+	divider_drag := false // dragging the Markdown Split divider (md_divider_rect)
 	sel_dragging := false // a text-selection drag has begun (pointer moved since press)
 	press_x, press_y: i32 // client pos of the press that may become a drag
 
@@ -212,7 +213,7 @@ main :: proc() {
 		rows := doc_visible_rows(doc, f32(window.height), line_h)
 		// Usable content width in cells (word wrap breaks here).
 		doc_update_gutter(doc, char_w) // before view_cols: the gutter narrows the text
-		doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width)), char_w)
+		doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), app.settings.split_frac), char_w)
 		doc.view_rows = rows
 		// Horizontal scroll: clamp to real content, then mirror into H_SCROLL for
 		// this frame so the whole frame's column geometry agrees.
@@ -408,7 +409,7 @@ main :: proc() {
 			window.mouse_down = false
 			window.scroll_delta = 0
 		}
-		ed_right := doc_editor_right(doc, f32(window.width))
+		ed_right := doc_editor_right(doc, f32(window.width), app.settings.split_frac)
 		// Editor scrollbar: a press in its gutter starts a byte-proportional drag. In
 		// Markdown Split it sits at the divider (ed_right), not the window edge, where
 		// the preview's own scrollbar lives. (Otherwise the gutter would be live where
@@ -438,6 +439,33 @@ main :: proc() {
 				doc_scroll_to_fraction(doc, &text, frac, rows)
 			} else {
 				md_preview_drag = false
+			}
+		}
+
+		// Markdown Split's divider. Checked before the text-selection drag below
+		// (sel_dragging), or a press here would fall through and start selecting
+		// the preview/editor text instead of resizing. After the scrollbar checks
+		// above, though: the grab band overlaps the editor scrollbar's rightmost
+		// few pixels by design (MD_DIVIDER_W straddles ed_right), and the
+		// scrollbar was here first.
+		{
+			dvr := md_divider_rect(doc, f32(window.width), f32(window.height), app.settings.split_frac)
+			if dvr.size.x > 0 && window.mouse_pressed &&
+			   f32(window.mouse_x) >= dvr.pos.x && f32(window.mouse_x) < dvr.pos.x + dvr.size.x &&
+			   f32(window.mouse_y) >= dvr.pos.y {
+				divider_drag = true
+				window.mouse_pressed = false
+			}
+		}
+		if divider_drag {
+			if window.mouse_down {
+				// Live during the drag so both panes track the pointer; settings_save
+				// runs on release only below -- per-WM_MOUSEMOVE saves would be
+				// hundreds of file writes for one drag.
+				app.settings.split_frac = clamp(f32(window.mouse_x) / f32(window.width), SPLIT_MIN, SPLIT_MAX)
+			} else {
+				divider_drag = false
+				settings_save(app.settings)
 			}
 		}
 
@@ -495,7 +523,7 @@ main :: proc() {
 		// a split take no caret. Swallow any press the scrollbars above did not claim
 		// (so the wheel still scrolls, and the bars still drag). After the scrollbars,
 		// so a press on either bar reaches it first.
-		if doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) && !scrollbar_drag && !md_preview_drag {
+		if doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) && !scrollbar_drag && !md_preview_drag && !divider_drag {
 			ro := doc.table || doc.md_mode == .Preview || (doc.md_mode == .Split && f32(window.mouse_x) >= ed_right)
 			if ro && (window.mouse_pressed || window.mouse_down) {
 				window.mouse_pressed = false
@@ -519,13 +547,18 @@ main :: proc() {
 			}
 		}
 
-		// Ctrl+hover over a link: hand cursor. Uses the live cursor position, not
-		// window.mouse_y, which WM_MOUSEMOVE only updates while a button is held —
-		// that exact mistake is in the §6j bug list.
+		// Divider resize cursor, then Ctrl+hover over a link: hand cursor. Uses the
+		// live cursor position, not window.mouse_y, which WM_MOUSEMOVE only updates
+		// while a button is held — that exact mistake is in the §6j bug list. The
+		// same md_divider_rect the drag above hit-tests against, so the cursor
+		// changes exactly where a press would grab.
 		{
 			want := plat.Cursor_Kind.Arrow
-			if plat.key_ctrl_down() && !doc.filter {
-				cx, cy := plat.window_cursor_client(window)
+			cx, cy := plat.window_cursor_client(window)
+			dvr := md_divider_rect(doc, f32(window.width), f32(window.height), app.settings.split_frac)
+			if divider_drag || (dvr.size.x > 0 && f32(cx) >= dvr.pos.x && f32(cx) < dvr.pos.x + dvr.size.x && f32(cy) >= dvr.pos.y) {
+				want = .SizeWE
+			} else if plat.key_ctrl_down() && !doc.filter {
 				if doc.table && doc.kind == .Text {
 					if _, over := table_link_hit(table_links(doc, &text, px, char_w, rows, f32(window.width)), f32(cx), f32(cy), px, line_h); over {
 						want = .Hand
@@ -570,7 +603,7 @@ main :: proc() {
 			press_x, press_y = window.mouse_x, window.mouse_y
 			sel_dragging = false // arm; a drag begins only once the pointer moves
 			window.mouse_pressed = false
-		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag {
+		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag && !divider_drag {
 			// A selection drag begins only once the pointer has actually moved from
 			// the press point. A stationary press-and-hold must not extend the
 			// selection or auto-scroll -- that was the bug where holding still lit up
@@ -787,7 +820,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	doc_update_gutter(doc, char_w) // resize repaints come through here too
 	// Recompute the wrap width here (not just in the main loop) so word wrap
 	// re-flows live during a resize, which repaints through this path.
-	doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width)), char_w)
+	doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), rc.app.settings.split_frac), char_w)
 	doc_update_hscroll(doc) // mirror the (already-clamped) horizontal offset
 
 	plat.text_frame_begin(gfx, text) // resets the recycle guard and grows the atlas if owed
@@ -870,7 +903,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	nb := 0
 	w := f32(window.width)
 	h := f32(window.height)
-	er := doc_editor_right(doc, w)
+	er := doc_editor_right(doc, w, rc.app.settings.split_frac)
 	total := doc.pt.length
 	if total > 0 && !doc.filter {
 		sb_h := h - CHROME_TOP
@@ -900,7 +933,11 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// margin above uses the same trick), so paint the right half back to the
 		// background before the preview, giving two clean side-by-side panes.
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {er, pvtop}, size = {w - er, pvbot - pvtop}, color = {0.09, 0.11, 0.16, 1}}})
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {er, CHROME_TOP}, size = {max(sx(1), 1), h - CHROME_TOP}, color = {0.30, 0.34, 0.42, 1}}})
+		// The visible accent line is thinner than the draggable band; both come from
+		// md_divider_rect so the drawn line always sits exactly where a drag grabs it.
+		dr := md_divider_rect(doc, w, h, rc.app.settings.split_frac)
+		line_w := max(sx(1), 1)
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {dr.pos.x + dr.size.x * 0.5 - line_w * 0.5, dr.pos.y}, size = {line_w, dr.size.y}, color = {0.30, 0.34, 0.42, 1}}})
 		// Preview follows the editor's scroll (doc.top): one synced position, both
 		// panes anchored to the same source line.
 		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.top)

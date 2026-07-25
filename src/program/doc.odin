@@ -155,10 +155,26 @@ doc_view_cols :: #force_inline proc(width, char_w: f32) -> int {
 // Right edge of the editor's content area. The full window normally; the split
 // point in Markdown Split, where the preview owns the right half. Everything that
 // bounds the editor (wrap width, its scrollbar, its click region) uses this.
-MD_SPLIT_FRAC :: f32(0.5)
-doc_editor_right :: proc(doc: ^Document, winw: f32) -> f32 {
-	if doc != nil && doc.kind == .Text && doc.md_mode == .Split {return f32(int(winw * MD_SPLIT_FRAC))}
+// split_frac comes from Settings (a global preference, not per-file) -- the
+// caller passes its own copy rather than this reading an App/Settings pointer,
+// since every call site already has one in scope.
+doc_editor_right :: proc(doc: ^Document, winw, split_frac: f32) -> f32 {
+	if doc != nil && doc.kind == .Text && doc.md_mode == .Split {return f32(int(winw * split_frac))}
 	return winw
+}
+
+// The draggable divider between the editor and the preview. Produced here and
+// consumed by the draw, the hover cursor and the drag hit-test -- one layout per
+// widget, so what is drawn is exactly what is grabbable. Zero-size when the
+// document is not in Split, so callers need no second condition. Centred on
+// doc_editor_right's x -- never computed independently, or the grab band could
+// drift from the pane it is supposed to divide.
+MD_DIVIDER_W :: 6 // logical px; the visible line is thinner than the grab band
+md_divider_rect :: proc(doc: ^Document, winw, winh, split_frac: f32) -> plat.Quad {
+	if doc == nil || doc.kind != .Text || doc.md_mode != .Split {return {}}
+	er := doc_editor_right(doc, winw, split_frac)
+	w := sx(MD_DIVIDER_W)
+	return {pos = {er - w * 0.5, CHROME_TOP}, size = {w, max(0, winh - CHROME_TOP)}}
 }
 
 // A new/untitled buffer (no path yet) is allowed into any view -- you don't know

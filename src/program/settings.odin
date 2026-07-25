@@ -18,6 +18,12 @@ import plat "src:platform"
 FONT_SIZE_MIN :: 8
 FONT_SIZE_MAX :: 72
 
+// Markdown Split's divider position. A fraction of window width, clamped well
+// short of 0/1 so neither pane can be dragged to nothing.
+SPLIT_DEFAULT :: f32(0.5)
+SPLIT_MIN :: f32(0.15)
+SPLIT_MAX :: f32(0.85)
+
 // Zoom is a separate multiplier on top of the font size, so the two compose:
 // font size is the preference, zoom is the transient adjustment. Discrete steps
 // rather than a percentage counter, so repeated presses land on round numbers.
@@ -41,6 +47,7 @@ Settings :: struct {
 	font_family:     string, // family NAME, not a path — paths differ per machine
 	font_style:      plat.Font_Style,
 	link_style:      Link_Style, // when/how clickable links are shown
+	split_frac:      f32, // Markdown Split divider position; a global preference (not per-file/per-tab)
 }
 
 // Families present on this machine, in the curated order. Recomputed when the
@@ -72,6 +79,7 @@ settings_default :: proc() -> Settings {
 		font_family = "Consolas",
 		font_style = .Regular,
 		link_style = .Hover,
+		split_frac = SPLIT_DEFAULT,
 	}
 }
 
@@ -123,6 +131,12 @@ settings_load :: proc() -> Settings {
 			if n, pok := strconv.parse_int(parts[1]); pok && n >= 0 && n <= int(max(Link_Style)) {
 				s.link_style = Link_Style(n)
 			}
+		case "split_frac":
+			// Clamp here too, not just on save: a hand-edited or corrupted file could
+			// carry a value that never went through the drag's own clamp.
+			if n, pok := strconv.parse_f32(parts[1]); pok {
+				s.split_frac = clamp(n, SPLIT_MIN, SPLIT_MAX)
+			}
 		}
 	}
 	return s
@@ -140,8 +154,13 @@ settings_save :: proc(s: Settings) -> bool {
 	s.font_size = clamp(s.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX)
 	if s.zoom_pct == 0 {s.zoom_pct = ZOOM_DEFAULT}
 	s.zoom_pct = clamp(s.zoom_pct, ZOOM_STEPS[0], ZOOM_STEPS[len(ZOOM_STEPS) - 1])
+	// Zero means "never set" (a literal built without this field, or a struct
+	// that predates it) rather than a deliberate 0.0 fraction, which SPLIT_MIN
+	// would silently misrepresent as a real user choice.
+	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
+	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\nfont_family %s\nfont_style %d\nlink_style %d\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\nfont_family %s\nfont_style %d\nlink_style %d\nsplit_frac %.4f\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
@@ -149,6 +168,7 @@ settings_save :: proc(s: Settings) -> bool {
 		s.font_family if s.font_family != "" else "Consolas",
 		int(s.font_style),
 		int(s.link_style),
+		s.split_frac,
 	)
 	return plat.file_write_atomic(path, transmute([]u8)body)
 }

@@ -634,6 +634,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			zoom_pct        = 125,
 			font_family     = "Courier New",
 			font_style      = .Italic,
+			split_frac      = 0.25, // non-zero, non-default, exact in binary float (survives %.4f round-trip)
 		}
 		settings_save(w)
 		r := settings_load()
@@ -3070,6 +3071,96 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !eok {fail = true}
 		fmt.printfln("  %-6s empty leading cells kept (%d cells)", "ok" if eok else "FAIL", len(cells))
 		fmt.println("mdtabletest: FAILURES" if fail else "mdtabletest: all ok")
+		return true
+	}
+
+	// `newtpad splittest` proves the Markdown Split divider has exactly one x:
+	// md_divider_rect and doc_editor_right must agree at any window size and any
+	// fraction, not just at the old hardcoded 0.5 -- comparing the two against
+	// EACH OTHER catches a second, independently-computed split x that a constant
+	// comparison would miss. Also covers the drag clamp and that the fraction
+	// actually reaches the things that are supposed to derive from it.
+	if os.args[1] == "splittest" {
+		fail := false
+		chk :: proc(label: string, ok: bool, fail: ^bool) {
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+		}
+
+		doc: Document
+		doc.pt = base.pt_init(transmute([]u8)string("hello world\n"))
+		defer base.pt_destroy(&doc.pt)
+		doc.kind = .Text
+		doc.md_mode = .Split
+
+		fmt.println("splittest:")
+		fmt.println("--- agreement: md_divider_rect vs doc_editor_right ---")
+		// A 1px window and a very wide one are the boundary sizes where an
+		// off-by-a-few-pixels bug or an int-truncation mismatch would show up;
+		// a normal window is the everyday case. All three fractions, at all
+		// three widths.
+		widths := []f32{1, 100000, 1280}
+		fracs := []f32{0.2, 0.5, 0.73}
+		for winw in widths {
+			for frac in fracs {
+				er := doc_editor_right(&doc, winw, frac)
+				dr := md_divider_rect(&doc, winw, 720, frac)
+				center := dr.pos.x + dr.size.x * 0.5
+				ok := dr.size.x > 0 && abs(center - er) < 0.6 // sub-pixel rounding only
+				chk(fmt.tprintf("winw=%.0f frac=%.2f  editor_right=%.1f divider_center=%.1f", winw, frac, er, center), ok, &fail)
+			}
+		}
+		// Not in Split: the brief's "no second condition" contract -- zero size,
+		// not just "don't crash".
+		doc.md_mode = .Off
+		zdr := md_divider_rect(&doc, 1280, 720, 0.5)
+		chk(fmt.tprintf("not in Split -> zero-size rect (got %.0fx%.0f)", zdr.size.x, zdr.size.y), zdr.size.x == 0 && zdr.size.y == 0, &fail)
+		doc.md_mode = .Split
+
+		fmt.println("--- drag clamp ---")
+		// Mirrors the exact expression main.odin's drag handler evaluates:
+		// clamp(mouse_x / winw, SPLIT_MIN, SPLIT_MAX).
+		winw := f32(1000)
+		lo := clamp(f32(10) / winw, SPLIT_MIN, SPLIT_MAX) // drag to x=10 (0.01)
+		hi := clamp(f32(990) / winw, SPLIT_MIN, SPLIT_MAX) // drag to x=990 (0.99)
+		chk(fmt.tprintf("drag to 0.01 clamps to SPLIT_MIN (%.2f -> %.3f)", SPLIT_MIN, lo), lo == SPLIT_MIN, &fail)
+		chk(fmt.tprintf("drag to 0.99 clamps to SPLIT_MAX (%.2f -> %.3f)", SPLIT_MAX, hi), hi == SPLIT_MAX, &fail)
+		// Panes never invert: the editor's right edge at the low clamp must stay
+		// left of the right edge at the high clamp.
+		er_lo := doc_editor_right(&doc, winw, lo)
+		er_hi := doc_editor_right(&doc, winw, hi)
+		chk(fmt.tprintf("panes don't invert (er@min=%.0f < er@max=%.0f)", er_lo, er_hi), er_lo < er_hi, &fail)
+
+		fmt.println("--- everything downstream of the fraction moves ---")
+		// If either of these stopped changing, something upstream reverted to
+		// reading a hardcoded half instead of the live fraction.
+		er_a := doc_editor_right(&doc, winw, 0.3)
+		er_b := doc_editor_right(&doc, winw, 0.7)
+		cols_a := doc_view_cols(er_a, 8)
+		cols_b := doc_view_cols(er_b, 8)
+		chk(fmt.tprintf("wrap columns differ (frac 0.3 -> %d cols, 0.7 -> %d cols)", cols_a, cols_b), cols_a != cols_b, &fail)
+		chk(fmt.tprintf("editor scrollbar x differs (frac 0.3 -> %.0f, 0.7 -> %.0f)", er_a, er_b), er_a != er_b, &fail)
+
+		fmt.println("--- settings_load clamps an out-of-range file value ---")
+		// Written directly to disk, bypassing settings_save's own clamp -- this is
+		// the "hand-edited or corrupt file" case settings_load has to catch on its
+		// own, not a re-test of the save-side clamp.
+		if p, pok := session_dir(); pok {
+			raw := "newtpad-settings 1\nrestore_session 1\nwrap_default 0\nfont_size 16\nzoom_pct 100\nfont_family Consolas\nfont_style 0\nlink_style 0\nsplit_frac 1.50\n"
+			plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)raw)
+			over := settings_load()
+			chk(fmt.tprintf("1.50 on disk loads clamped to %.2f (want %.2f)", over.split_frac, SPLIT_MAX), over.split_frac == SPLIT_MAX, &fail)
+
+			raw2 := "newtpad-settings 1\nrestore_session 1\nwrap_default 0\nfont_size 16\nzoom_pct 100\nfont_family Consolas\nfont_style 0\nlink_style 0\nsplit_frac -3.00\n"
+			plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)raw2)
+			under := settings_load()
+			chk(fmt.tprintf("-3.00 on disk loads clamped to %.2f (want %.2f)", under.split_frac, SPLIT_MIN), under.split_frac == SPLIT_MIN, &fail)
+		} else {
+			fmt.println("  FAIL  no session dir (set NEWTPAD_SESSION_DIR)")
+			fail = true
+		}
+
+		fmt.println("splittest: FAILURES" if fail else "splittest: all ok")
 		return true
 	}
 
