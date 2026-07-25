@@ -1384,6 +1384,94 @@ this batch, per Wyatt's decision to keep it a separate written report rather tha
 **Out of scope, confirmed still out:** rebindable keys, a duplicate-line command (offered and
 declined), per-family split fractions, opening a folder's contents.
 
+## 6u. Next up — the feature audit and the batch plan (2026-07-25)
+
+After batches 1 and 2 shipped (§6s, §6t), Wyatt asked for a sweep of the whole tree for features
+that were promised and never delivered. The result is
+[docs/2026-07-25-forgotten-feature-audit.md](docs/2026-07-25-forgotten-feature-audit.md). **Read it
+before starting anything below** — it is the evidence, this section is only the plan.
+
+**The audit's first pass was wrong in a way worth remembering.** It swept for `TODO` markers and
+deferred-work comments, which by construction cannot find a feature nobody ever started — and nobody
+leaves a TODO for work they never began. Reading `research/demand-side-feature-research.md` and
+CLAUDE.md's product principles *as commitments* is what actually surfaced the gaps. The largest:
+
+- **There is no syntax highlighting at all.** Zero lexers; every "highlight" in the tree is a
+  find-match or selection rectangle; `doc_draw` paints every byte of every file one colour. CLAUDE.md
+  states lex/highlight as a hard rule and the viewport-first machinery was built to serve it.
+- **Column/block editing was V1 decision #1** (research §G, the "consensus #1 gap" flagged by 4 of 6
+  research lenses) and was never started.
+- **Themes, rebindable keys and an embedded installer** are all named in CLAUDE.md's product
+  principles and none exist. 107 hardcoded colour literals across 14 files.
+- Logging *is* real (`%APPDATA%\Newtpad\logs\newtpad.log`, on by default since 0.9.0) — it is simply
+  undiscoverable, with no command or menu entry.
+
+### Decisions taken with Wyatt, 2026-07-25 — do not relitigate
+
+1. **Theme model first, then syntax highlighting.** Highlighting introduces ~5 new colour roles per
+   format; if themes come after, every one is hardcoded and then migrated. The colour model lands
+   first so lexers emit *role names*, never RGB. (The audit's own suggested order had this backwards;
+   this supersedes it.)
+2. **Column editing = rectangular select + edit.** Alt+drag or Ctrl+Shift+arrows makes a rectangle;
+   typing replaces across every row; Backspace/Delete work across it; a zero-width rectangle acts as N
+   carets in one column so lines can be prefixed; copy/paste handles the block as rows. **Ctrl+D
+   select-next-occurrence is explicitly out** — that is the multi-cursor work research §G deferred to
+   V2.
+3. **Installer: build it unsigned but signing-ready.** A real self-contained installer (no PowerShell
+   execution policy, proper uninstall entry) plus a release script with the signing step stubbed and
+   documented, so it becomes one command the day a certificate exists. **Signing itself is blocked on
+   Wyatt** — it needs a purchased code-signing certificate (OV cert, or Azure Trusted Signing). Claude
+   cannot produce one, and must never handle a certificate password.
+
+### Batch plan
+
+| Batch | Contents |
+|---|---|
+| **3** | Colour model + themes — the foundation; must precede highlighting |
+| **4** | Syntax highlighting — lexers emitting theme roles |
+| **5** | Column/block editing |
+| **6** | Session persists `md_mode`/`table`; `doc_reload` keeps the view; the `on_resize`/`on_dpi` crash-reporter fix; an "Open Logs Folder" command; encoding commands in the menus |
+| **7** | Ship-readiness: real installer, signing pipeline, gate `test_modes.odin` behind a build flag, glyph-atlas eviction |
+| **8** | Tier-3 wins: rebindable keys, tab stops, sort/dedupe lines, keyword→colour rules, bookmarks, scrollbar match marks |
+
+Each batch: spec in `docs/superpowers/specs/`, plan in `docs/superpowers/plans/`, executed one task at
+a time with a fresh implementer and a review per task, then Wyatt's live pass. That loop caught a
+data-integrity regression in each of the last two batches; do not skip the review round.
+
+### Batch 3 design, as agreed
+
+- `program/theme.odin`: a `Color_Role` enum covering every semantic slot, and
+  `Theme :: [Color_Role][4]f32` — a **total array over the enum**, so a new role cannot be forgotten.
+  Same compiler-enforced pattern as `[Command_Id]Command`, with a matching `#assert`. A global
+  `g_theme` read by array index keeps the per-row draw cost to an index, not a lookup.
+- **Roles** come from the existing 107 literals (text, caret, selection, find-match, gutter,
+  scrollbar, tab active/inactive, menu, palette, status, link, the ten `MD_*`, table, history,
+  divider) **plus the syntax roles batch 4 will need** — keyword, string, number, comment, type,
+  punctuation. Declaring those now is the entire reason this batch goes first.
+- `markdown.odin` already has the right shape (`MD_TEXT`, `MD_HEAD`, `MD_CODE`…) — named roles, just
+  compile-time and per-file. Generalise that; do not invent a second pattern.
+- **Theme files** at `%APPDATA%\Newtpad\themes\*.theme`, `role #rrggbb` lines — the same key/value
+  shape as `settings.txt`, unknown keys ignored, so old and new builds interoperate. One Settings row
+  to pick a theme. **Not** a colour picker per role; that is the "fight options" line.
+- **Ship a light theme, not only the current dark one.** Building dark alone proves nothing — a light
+  background is what exposes every colour that silently assumed dark (muted greys that vanish,
+  overlays tuned against a dark base). It is the test that can actually fail.
+- **Testing:** headless `themetest` — every role set in every built-in theme (no zero-value black
+  holes), file round-trip, unknown role ignored, malformed colour degrades rather than corrupting.
+  Plus the compile-time `#assert` on the array length.
+
+### Repo state at handoff
+
+`main` @ 0.11.0, working tree clean, both feature branches merged (`fix/live-bug-batch-1`,
+`feat/live-feature-batch-2` — safe to delete). The installed binary at
+`%LOCALAPPDATA%\Newtpad\newtpad.exe` is the merged build. **`main` is ~68 commits ahead of
+`origin/main` — nothing has been pushed.**
+
+**Live pass still owed** on batch 2: Alt+arrow with real auto-repeat, an Explorer drag of several
+files and of a folder, dragging the split divider and confirming it survives a restart, and opening a
+`.md` after leaving the previous one in Split. This environment cannot inject GUI input, so those are
+Wyatt's to confirm.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
