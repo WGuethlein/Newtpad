@@ -200,9 +200,9 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 
 	start_col := clamp(doc.table_col, 0, table_max_col(doc))
 	right := width - SCROLLBAR_W
-	fg := [4]f32{0.86, 0.90, 0.96, 1}
-	sep := [4]f32{0.24, 0.27, 0.33, 1}
-	head_bg := [4]f32{0.16, 0.20, 0.27, 1}
+	fg := g_theme[.Text_Primary]
+	sep := g_theme[.Border_Subtle]
+	head_bg := g_theme[.Bg_Raised]
 	top := row_rect_y(px, 0)
 	bot := row_rect_y(px, len(vis))
 
@@ -227,7 +227,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 				cut := plat.text_bytes_for_cells(text, fb, colw[c], .Doc)
 				field = field[:cut]
 			}
-			hl := [4]f32{0.94, 0.96, 0.99, 1} if (doc.top == 0 && r == 0) else fg
+			hl := g_theme[.Text_Primary] if (doc.top == 0 && r == 0) else fg
 			plat.text_draw(gfx, text, field, cx, row_baseline_y(px, r), px, hl, .Doc)
 		}
 		cx += f32(cellcells) * char_w
@@ -243,13 +243,13 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			for c := start_col; c < ec && c < len(colw); c += 1 {ex += f32(colw[c] + TABLE_COL_PAD) * char_w}
 			if ex < right {
 				cw := f32(colw[ec] + TABLE_COL_PAD) * char_w if ec < len(colw) else char_w
-				box := [4]f32{0.20, 0.30, 0.45, 1}
+				box := g_theme[.Selection_List]
 				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {ex - char_w * 0.5, row_rect_y(px, er)}, size = {min(cw, right - ex), lh}, color = box}})
 				val := string(doc.table_edit_buf[:])
-				plat.text_draw(gfx, text, val, ex, row_baseline_y(px, er), px, {1, 1, 1, 1}, .Doc)
+				plat.text_draw(gfx, text, val, ex, row_baseline_y(px, er), px, g_theme[.Text_Bright], .Doc)
 				caret_cells := plat.text_cells(text, doc.table_edit_buf[:doc.table_edit_caret], .Doc)
 				cxp := ex + f32(caret_cells) * char_w
-				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cxp, row_rect_y(px, er)}, size = {max(sx(1), 1), lh}, color = {1, 1, 1, 1}}})
+				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cxp, row_rect_y(px, er)}, size = {max(sx(1), 1), lh}, color = g_theme[.Text_Bright]}})
 			}
 		}
 	}

@@ -273,26 +273,26 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 	boxh := l.h
 
 	plat.quads_draw(gfx, quad_pipe, []plat.Quad {
-			{pos = {x0 - sx(1), y0 - sx(1)}, size = {PW + sx(2), boxh + sx(2)}, color = {0.30, 0.34, 0.42, 1}}, // border
-			{pos = {x0, y0}, size = {PW, boxh}, color = {0.11, 0.13, 0.17, 1}}, // body
-			{pos = {x0, y0}, size = {PW, qh}, color = {0.15, 0.17, 0.22, 1}}, // query field
+			{pos = {x0 - sx(1), y0 - sx(1)}, size = {PW + sx(2), boxh + sx(2)}, color = g_theme[.Border_Strong]}, // border
+			{pos = {x0, y0}, size = {PW, boxh}, color = g_theme[.Bg_Base]}, // body
+			{pos = {x0, y0}, size = {PW, qh}, color = g_theme[.Bg_Panel]}, // query field
 		})
 
 	qs := string(p.query[:])
-	qcol := [4]f32{0.92, 0.94, 0.98, 1}
+	qcol := g_theme[.Text_Primary]
 	if len(qs) == 0 {
 		qs = "Search tabs    ( >  command    :  go to line    ?  help )"
-		qcol = {0.45, 0.49, 0.57, 1}
+		qcol = g_theme[.Text_Muted]
 	}
 	plat.text_draw(gfx, text, qs, x0 + sx(12), y0 + sx(22), UI_PX, qcol)
 
 	if p.mode == .Goto {
-		plat.text_draw(gfx, text, "type a line number, then Enter", x0 + sx(16), y0 + qh + sx(17), UI_PX, {0.6, 0.64, 0.72, 1})
+		plat.text_draw(gfx, text, "type a line number, then Enter", x0 + sx(16), y0 + qh + sx(17), UI_PX, g_theme[.Text_Dim])
 		return
 	}
 	if p.mode == .Help {
 		for h, i in PALETTE_HELP {
-			plat.text_draw(gfx, text, h, x0 + sx(16), y0 + qh + f32(i) * rowh + sx(17), UI_PX, {0.72, 0.78, 0.88, 1})
+			plat.text_draw(gfx, text, h, x0 + sx(16), y0 + qh + f32(i) * rowh + sx(17), UI_PX, g_theme[.Text_Secondary])
 		}
 		return
 	}
@@ -300,19 +300,19 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 	for i in 0 ..< nres {
 		ry := y0 + qh + f32(i) * rowh
 		if i == p.selected {
-			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x0, ry}, size = {PW, rowh}, color = {0.20, 0.28, 0.42, 1}}})
+			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x0, ry}, size = {PW, rowh}, color = g_theme[.Selection_List]}})
 		}
 		r := p.results[i]
-		fg := [4]f32{0.95, 0.96, 0.99, 1} if i == p.selected else {0.80, 0.84, 0.90, 1}
+		fg := g_theme[.Text_Primary] if i == p.selected else g_theme[.Text_Secondary]
 		if p.mode == .Commands {
 			plat.text_draw(gfx, text, command_table[r.cmd].title, x0 + sx(16), ry + sx(17), UI_PX, fg)
 			cat := command_table[r.cmd].category
-			plat.text_draw(gfx, text, cat, x0 + PW - sx(130), ry + sx(17), UI_SMALL_PX, {0.5, 0.54, 0.62, 1})
+			plat.text_draw(gfx, text, cat, x0 + PW - sx(130), ry + sx(17), UI_SMALL_PX, g_theme[.Text_Muted])
 			// The shortcut, right-aligned. The palette is the one place a user can
 			// learn the keymap, and it was showing title + category only.
 			if chord := command_chord(r.cmd); chord != "" {
 				cw := plat.text_char_width(text, UI_SMALL_PX)
-				plat.text_draw(gfx, text, chord, x0 + PW - sx(16) - f32(len(chord)) * cw, ry + sx(17), UI_SMALL_PX, {0.62, 0.68, 0.80, 1})
+				plat.text_draw(gfx, text, chord, x0 + PW - sx(16) - f32(len(chord)) * cw, ry + sx(17), UI_SMALL_PX, g_theme[.Text_Dim])
 			}
 		} else if r.slot >= 0 && r.slot < len(app.docs) && app.docs[r.slot] != nil {
 			plat.text_draw(gfx, text, doc_display_name(app.docs[r.slot]), x0 + sx(16), ry + sx(17), UI_PX, fg)

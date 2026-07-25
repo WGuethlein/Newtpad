@@ -653,6 +653,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			font_family     = "Courier New",
 			font_style      = .Italic,
 			split_frac      = 0.25, // non-zero, non-default, exact in binary float (survives %.4f round-trip)
+			theme_name      = "Light", // non-blank, non-default -- see the blank-normalises check below for ""
 		}
 		settings_save(w)
 		r := settings_load()
@@ -717,6 +718,66 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("  ...at 200%% DPI -> px %.0f (want 60)  %s", rcz.px, "OK" if dok else "FAIL")
 		if !dok {bad += 1}
 		BASE_PX = BASE_PX_96 // leave globals alone for later modes
+
+		// The settings-page row list (IMPORTANT 3, final review): the 8th row
+		// (Theme) stopped always fitting the window once it was added -- at
+		// 150% DPI on a 1366x768 laptop, the unclamped layout drew its label
+		// and help text straddling the version string's baseline. Checked at
+		// the reported scale/height plus two others so the guard isn't tuned
+		// to one number, using the same settings_list_bounds/
+		// settings_rows_fitting settings_draw itself now calls -- not a
+		// parallel copy of the arithmetic, so the two cannot disagree.
+		fmt.println("--- settings row-list overflow ---")
+		check_fit :: proc(rc: ^Render_Ctx, dpi: u32, height: f32) -> (ok: bool, shown: int, last_bottom, version_y: f32) {
+			rc.window.dpi = dpi
+			metrics_recompute(rc)
+			rowh := sx(46)
+			y0, avail_h := settings_list_bounds(height)
+			shown = settings_rows_fitting(0, avail_h, rowh)
+			last_bottom = y0 + f32(shown) * rowh
+			version_y = height - sx(24)
+			ok = last_bottom <= version_y
+			return
+		}
+		cases := [][2]f32{{96, 900}, {144, 768}, {192, 1080}}
+		for c in cases {
+			dpi, height := u32(c[0]), c[1]
+			ok, shown, last_bottom, version_y := check_fit(&rcz, dpi, height)
+			fmt.printfln(
+				"  %-6s dpi=%d height=%.0f: %d/%d rows shown, last row bottom=%.0f (version line=%.0f)",
+				"ok" if ok else "FAIL",
+				dpi,
+				height,
+				shown,
+				settings_row_count(),
+				last_bottom,
+				version_y,
+			)
+			if !ok {bad += 1}
+		}
+		// Proof this check can actually fail (CLAUDE.md: "a test that has never
+		// failed proves nothing") -- the unclamped layout the bug shipped with
+		// (draw every row regardless of height) DOES overflow at 150%/768. If
+		// this stops reproducing, the scenario needs revisiting, not just the
+		// fitted-count assertion above.
+		{
+			rcz.window.dpi = 144
+			metrics_recompute(&rcz)
+			rowh := sx(46)
+			y0, _ := settings_list_bounds(768)
+			naive_bottom := y0 + f32(settings_row_count()) * rowh
+			naive_version_y := f32(768) - sx(24)
+			overflowed := naive_bottom > naive_version_y
+			fmt.printfln(
+				"  %-6s unclamped layout overflows at 150%%/768 (naive_bottom=%.0f, version_y=%.0f)",
+				"ok" if overflowed else "FAIL",
+				naive_bottom,
+				naive_version_y,
+			)
+			if !overflowed {bad += 1}
+		}
+		rcz.window.dpi = 96
+		metrics_recompute(&rcz) // leave globals alone for later modes
 
 		fmt.printfln("settingstest: %d failures", bad)
 		return true
@@ -2649,6 +2710,402 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			)
 		}
 		fmt.println("rowtest: FAILURES" if fail else "rowtest: all ok")
+		return true
+	}
+
+	// `newtpad themetest` proves theme_dark() only ever holds colours that
+	// genuinely appeared in the pre-migration UI. Dark is a *consolidation*
+	// (66 faithful roles collapsed to 25 by merging near-duplicate greys), so
+	// it is no longer pixel-identical to the old literals -- the old "every
+	// value equals the one literal it replaces" guard doesn't apply anymore.
+	// What replaces it: each role may hold any one of the several literals
+	// the spec's merge table says that role absorbs (see
+	// docs/superpowers/specs/2026-07-25-theme-model-design.md, "The role
+	// table"). The absorbed-set lists below are retyped from that spec table,
+	// not copied out of theme_dark -- copying from the theme would make this
+	// test agree with a transposed digit instead of catching one.
+	if os.args[1] == "themetest" {
+		if !require_scratch_session("themetest") {return true}
+		d := theme_dark()
+		fail := false
+
+		// Every role must be non-zero: zero is transparent black, Odin's
+		// default for a Theme entry nobody wrote a value for -- an invisible
+		// hole rather than an obvious error (see theme.odin's header comment).
+		for role in Color_Role {
+			if d[role] == ([4]f32{0, 0, 0, 0}) {
+				fmt.printfln("  FAIL   %v is zero (unfilled Dark slot)", role)
+				fail = true
+			}
+		}
+
+		in_set :: proc(got: [4]f32, set: [][4]f32) -> bool {
+			for v in set {if got == v {return true}}
+			return false
+		}
+		chk :: proc(d: Theme, role: Color_Role, absorbs: [][4]f32, fail: ^bool) {
+			got := d[role]
+			ok := in_set(got, absorbs)
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %-16v got=%v absorbs=%v", "ok" if ok else "FAIL", role, got, absorbs)
+		}
+
+		fmt.println("themetest:")
+		// Neutrals: 10 roles absorbing 42 values across 81 sites.
+		chk(d, .Bg_Base, {{0.09, 0.11, 0.16, 1}, {0.10, 0.12, 0.16, 1}, {0.11, 0.13, 0.17, 1}}, &fail) // #171C29 #1A1F29 #1C212B
+		chk(
+			d,
+			.Bg_Panel,
+			{{0.12, 0.14, 0.18, 1}, {0.12, 0.14, 0.19, 1}, {0.13, 0.15, 0.20, 1}, {0.14, 0.16, 0.20, 1}, {0.14, 0.16, 0.21, 1}, {0.15, 0.17, 0.22, 1}},
+			&fail,
+		) // #1F242E #1F2430 #212633 #242933 #242936 #262B38
+		chk(d, .Bg_Raised, {{0.16, 0.18, 0.22, 1}, {0.16, 0.20, 0.27, 1}}, &fail) // #292E38 #293345
+		chk(d, .Border_Subtle, {{0.20, 0.23, 0.30, 1}, {0.24, 0.27, 0.33, 1}}, &fail) // #333B4C #3D4554
+		chk(d, .Border_Strong, {{0.28, 0.32, 0.40, 1}, {0.30, 0.34, 0.42, 1}}, &fail) // #475266 #4C576B
+		chk(
+			d,
+			.Text_Muted,
+			{
+				{0.42, 0.46, 0.54, 1},
+				{0.42, 0.47, 0.56, 1},
+				{0.42, 0.48, 0.60, 1},
+				{0.45, 0.49, 0.57, 1},
+				{0.48, 0.52, 0.60, 1},
+				{0.50, 0.54, 0.62, 1},
+				{0.50, 0.55, 0.64, 1},
+			},
+			&fail,
+		) // #6B758A #6B788F #6B7A99 #737D91 #7A8599 #808A9E #808CA3
+		chk(
+			d,
+			.Text_Dim,
+			{{0.55, 0.60, 0.70, 1}, {0.58, 0.64, 0.76, 1}, {0.60, 0.64, 0.72, 1}, {0.62, 0.68, 0.80, 1}, {0.66, 0.70, 0.78, 1}},
+			&fail,
+		) // #8C99B2 #94A3C2 #99A3B8 #9EADCC #A8B2C7
+		chk(
+			d,
+			.Text_Secondary,
+			{{0.72, 0.76, 0.84, 1}, {0.72, 0.78, 0.88, 1}, {0.75, 0.79, 0.86, 1}, {0.75, 0.80, 0.88, 1}, {0.80, 0.84, 0.90, 1}},
+			&fail,
+		) // #B8C2D6 #B8C7E0 #BFC9DB #BFCCE0 #CCD6E6
+		chk(
+			d,
+			.Text_Primary,
+			{{0.86, 0.90, 0.96, 1}, {0.88, 0.91, 0.96, 1}, {0.90, 0.92, 0.97, 1}, {0.92, 0.94, 0.98, 1}, {0.94, 0.96, 0.99, 1}, {0.95, 0.96, 0.99, 1}},
+			&fail,
+		) // #DBE6F5 #E0E8F5 #E6EBF7 #EBF0FA #F0F5FC #F2F5FC
+		chk(d, .Text_Bright, {{0.96, 0.96, 0.98, 1}, {0.98, 0.99, 1.0, 1}, {1, 1, 1, 1}, {0.82, 0.90, 0.98, 1}}, &fail) // #F5F5FA #FAFCFF #FFFFFF #D1E6FA
+
+		// Accents: 15 roles, each carrying real meaning.
+		chk(d, .Selection_Doc, {{0.20, 0.30, 0.48, 1}}, &fail) // #334C7A
+		chk(d, .Selection_List, {{0.20, 0.28, 0.42, 1}, {0.20, 0.30, 0.45, 1}, {0.24, 0.30, 0.42, 1}, {0.18, 0.24, 0.34, 1}}, &fail) // #33476B #334C73 #3D4C6B #2E3D57
+		chk(d, .Caret, {{0.95, 0.85, 0.35, 1}}, &fail) // #F2D959
+		chk(d, .Accent, {{0.95, 0.88, 0.55, 1}, {0.80, 0.76, 0.50, 1}}, &fail) // #F2E08C #CCC280
+		chk(d, .Find_Match_Bg, {{0.42, 0.38, 0.16, 1}}, &fail) // #6B6129
+		chk(d, .Link, {{0.45, 0.70, 0.98, 1}}, &fail) // #73B2FA
+		chk(d, .Warning, {{0.95, 0.55, 0.35, 1}}, &fail) // #F28C59
+		chk(d, .Danger, {{0.75, 0.16, 0.16, 1}}, &fail) // #BF2929
+		chk(d, .Success, {{0.55, 0.85, 0.60, 1}}, &fail) // #8CD999
+		chk(d, .Filter_Bg, {{0.18, 0.26, 0.20, 1}}, &fail) // #2E4233
+		chk(d, .Filter_Text, {{0.70, 0.90, 0.74, 1}}, &fail) // #B2E6BD
+		chk(d, .Md_Heading, {{0.72, 0.85, 1.0, 1}}, &fail) // #B8D9FF
+		chk(d, .Md_Code, {{0.95, 0.80, 0.65, 1}}, &fail) // #F2CCA6
+		chk(d, .Md_Italic, {{0.80, 0.86, 0.78, 1}}, &fail) // #CCDBC7
+		chk(d, .Md_Quote, {{0.66, 0.72, 0.62, 1}}, &fail) // #A8B89E
+
+		// Light is the theme that can actually fail (see theme.odin's
+		// theme_light comment and task-4-report.md): every one of Dark's
+		// values was chosen against a dark background, so nothing here
+		// checks Light against an absorbed-literal list the way Dark is
+		// checked above -- there is no pre-migration light UI to derive one
+		// from. What Light must prove instead:
+		//
+		//   1. every role is non-zero, same reasoning as Dark: a zero slot
+		//      renders as invisible transparent black, not an obvious error.
+		//   2. Light differs from Dark in every role that isn't deliberately
+		//      shared -- a light theme authored by copying theme_dark() and
+		//      editing a few fields would pass check 1 while silently
+		//      leaving most roles dark-only, and check 1 alone would not
+		//      catch it. The one deliberately shared role, and why, is
+		//      documented right above Danger's line in theme_light().
+		l := theme_light()
+
+		// The only role deliberately identical between the two themes, and
+		// why -- see also the note above Danger's line in theme_light().
+		is_shared_role :: proc(role: Color_Role) -> (shared: bool, reason: string) {
+			#partial switch role {
+			case .Danger:
+				return true, "solid opaque hover fill, never blended with either theme's chrome; Windows renders the close-tab hover in the same red regardless of system theme"
+			}
+			return false, ""
+		}
+
+		for role in Color_Role {
+			if l[role] == ([4]f32{0, 0, 0, 0}) {
+				fmt.printfln("  FAIL   %v is zero (unfilled Light slot)", role)
+				fail = true
+			}
+		}
+
+		for role in Color_Role {
+			is_shared, reason := is_shared_role(role)
+			same := l[role] == d[role]
+			ok := same == is_shared // shared roles MUST match; every other role MUST differ
+			if !ok {
+				if is_shared {
+					fmt.printfln("  FAIL   %v is declared shared with Dark but Light's value differs", role)
+				} else {
+					fmt.printfln("  FAIL   %v Light == Dark (%v) but this role is not on the shared list -- accidental dark-value inheritance", role, l[role])
+				}
+				fail = true
+			} else if is_shared {
+				fmt.printfln("  ok     %v shared with Dark: %s", role, reason)
+			}
+		}
+
+		// --- theme files: loading from disk (Task 5) ---
+		//
+		// Mirrors settings_load's shape exactly: same `key value` per-line
+		// parse, same "unknown key ignored" contract (theme_role_from_key),
+		// same "start from a valid default and overlay" so a partial file is
+		// valid (theme_load_file). Everything below writes only under
+		// NEWTPAD_SESSION_DIR/themes -- require_scratch_session at the top of
+		// this mode already refused to run without that set, so none of this
+		// touches the real %APPDATA%\Newtpad.
+		// _ensure: this block writes .theme files below, the one legitimate
+		// reason to create the directory (see themes_dir_ensure's comment).
+		tdir, tdir_ok := themes_dir_ensure()
+		if !tdir_ok {
+			fmt.println("  FAIL   themetest: themes_dir unavailable")
+			fail = true
+		} else {
+			write_theme_file :: proc(dir, name, body: string) -> string {
+				path := fmt.tprintf("%s%c%s.theme", dir, '\\', name)
+				_ = os.write_entire_file(path, body)
+				return path
+			}
+
+			// A file naming several roles round-trips: every named role comes
+			// back exactly as written. Expected colours are computed the same
+			// way theme_parse_hex does (f32(digit-pair) / 255), not by
+			// reusing theme_parse_hex itself, so a bug in that arithmetic
+			// can't hide behind agreeing with its own test.
+			{
+				path := write_theme_file(tdir, "roundtrip", "bg_base #112233\ntext_primary #aabbcc\ncaret #ff00ff\n")
+				got := theme_load_file(path, d)
+				want_bg := [4]f32{f32(0x11) / 255, f32(0x22) / 255, f32(0x33) / 255, 1}
+				want_tp := [4]f32{f32(0xaa) / 255, f32(0xbb) / 255, f32(0xcc) / 255, 1}
+				want_caret := [4]f32{1, 0, 1, 1}
+				ok := got[.Bg_Base] == want_bg && got[.Text_Primary] == want_tp && got[.Caret] == want_caret
+				if !ok {fail = true}
+				fmt.printfln(
+					"  %-6s file round-trip: bg_base=%v text_primary=%v caret=%v",
+					"ok" if ok else "FAIL",
+					got[.Bg_Base],
+					got[.Text_Primary],
+					got[.Caret],
+				)
+				os.remove(path)
+			}
+
+			// A partial file -- naming only one role -- leaves every role it
+			// doesn't mention at the base's built-in value.
+			{
+				path := write_theme_file(tdir, "partial", "accent #ffaa00\n")
+				got := theme_load_file(path, d)
+				changed := got[.Accent] == [4]f32{1, f32(0xaa) / 255, 0, 1}
+				untouched := got[.Md_Quote] == d[.Md_Quote] && got[.Bg_Base] == d[.Bg_Base] && got[.Text_Primary] == d[.Text_Primary]
+				ok := changed && untouched
+				if !ok {fail = true}
+				fmt.printfln(
+					"  %-6s partial file: named role changed=%v, unmentioned roles untouched=%v",
+					"ok" if ok else "FAIL",
+					changed,
+					untouched,
+				)
+				os.remove(path)
+			}
+
+			// An unknown role name is skipped, not fatal -- the rest of the
+			// file still loads.
+			{
+				path := write_theme_file(tdir, "unknownrole", "not_a_real_role #ffffff\nlink #112233\n")
+				got := theme_load_file(path, d)
+				ok := got[.Link] == [4]f32{f32(0x11) / 255, f32(0x22) / 255, f32(0x33) / 255, 1}
+				if !ok {fail = true}
+				fmt.printfln("  %-6s unknown role name ignored, rest of file still applied: link=%v", "ok" if ok else "FAIL", got[.Link])
+				os.remove(path)
+			}
+
+			// Each malformed-colour form leaves that role at the built-in
+			// value -- never the zero value, which is transparent black and
+			// would render as an invisible hole rather than an obvious error.
+			{
+				path := write_theme_file(
+					tdir,
+					"malformed",
+					"border_strong #zzz\ntext_dim #12\nwarning 1122334\ndanger #1122334\n",
+				)
+				got := theme_load_file(path, d)
+				roles := []Color_Role{.Border_Strong, .Text_Dim, .Warning, .Danger}
+				labels := []string{"#zzz (non-hex digits)", "#12 (too short)", "1122334 (missing #)", "#1122334 (wrong length)"}
+				for role, i in roles {
+					v := got[role]
+					// Checked and reported separately, not folded into one `ok :=
+					// fell_back && never_black`: fell_back == (v == d[role]) and
+					// d[role] is already known non-black (the "every role must be
+					// non-zero" loop above already proved that for Dark), so
+					// never_black was mathematically implied by fell_back and could
+					// never independently fail or independently surface in the
+					// printed line -- exactly the "conjunct that cannot fail" shape
+					// CLAUDE.md calls out. Splitting them means a future built-in
+					// that DID hold a black role would still be caught here instead
+					// of being silently absorbed into fell_back's pass.
+					never_black := v != ([4]f32{0, 0, 0, 0}) && v != ([4]f32{0, 0, 0, 1})
+					if !never_black {
+						fmt.printfln("  FAIL   malformed %-28s -> %v is black (should have fallen back)", labels[i], v)
+						fail = true
+					}
+					fell_back := v == d[role]
+					if !fell_back {
+						fmt.printfln("  FAIL   malformed %-28s -> %v did not fall back to built-in %v", labels[i], v, d[role])
+						fail = true
+					}
+					if never_black && fell_back {
+						fmt.printfln("  ok     malformed %-28s -> %v (built-in=%v)", labels[i], v, d[role])
+					}
+				}
+				os.remove(path)
+			}
+
+			// A `base light` line overlays Light instead of the default
+			// Dark -- an unnamed role (Md_Quote here) must hold Light's
+			// value, not Dark's. This is the case the fix exists for: before
+			// `base`, a custom theme had no way to express "start from
+			// Light" at all, so a user on Light who picked any custom theme
+			// got every unmentioned role silently reset to Dark's values.
+			{
+				path := write_theme_file(tdir, "baselight", "base light\naccent #ffaa00\n")
+				got := theme_load_file(path, d)
+				ok := got[.Md_Quote] == l[.Md_Quote] && got[.Md_Quote] != d[.Md_Quote]
+				if !ok {fail = true}
+				fmt.printfln(
+					"  %-6s base light: unnamed role holds Light's value=%v (Dark's would be %v)",
+					"ok" if ok else "FAIL",
+					got[.Md_Quote],
+					d[.Md_Quote],
+				)
+				os.remove(path)
+			}
+
+			// A `base dark` line and no `base` line at all both overlay
+			// Dark -- `base` is opt-in, not required, so an existing file
+			// written before this feature existed must keep behaving
+			// exactly as it did.
+			{
+				path := write_theme_file(tdir, "basedark", "base dark\naccent #ffaa00\n")
+				got := theme_load_file(path, d)
+				ok := got[.Md_Quote] == d[.Md_Quote]
+				if !ok {fail = true}
+				fmt.printfln("  %-6s base dark: unnamed role holds Dark's value=%v", "ok" if ok else "FAIL", got[.Md_Quote])
+				os.remove(path)
+
+				path2 := write_theme_file(tdir, "nobase", "accent #ffaa00\n")
+				got2 := theme_load_file(path2, d)
+				ok2 := got2[.Md_Quote] == d[.Md_Quote]
+				if !ok2 {fail = true}
+				fmt.printfln("  %-6s no base line: unnamed role holds Dark's value=%v", "ok" if ok2 else "FAIL", got2[.Md_Quote])
+				os.remove(path2)
+			}
+
+			// An unrecognized base value falls back to Dark, the same
+			// "malformed input degrades" contract every other bad value in
+			// this loader already has.
+			{
+				path := write_theme_file(tdir, "basebogus", "base solarized\naccent #ffaa00\n")
+				got := theme_load_file(path, d)
+				ok := got[.Md_Quote] == d[.Md_Quote]
+				if !ok {fail = true}
+				fmt.printfln("  %-6s unrecognized base falls back to Dark: %v", "ok" if ok else "FAIL", got[.Md_Quote])
+				os.remove(path)
+			}
+
+			// `base` is recognized anywhere in the file, not only on the
+			// first line -- this format has no ordering rules, so a `base`
+			// line appearing after role lines must still apply to all of
+			// them (a single-pass fold would only pick this up if `base`
+			// happened to come first).
+			{
+				path := write_theme_file(tdir, "baselate", "accent #ffaa00\nmd_quote #112233\nbase light\n")
+				got := theme_load_file(path, d)
+				want_named := [4]f32{f32(0x11) / 255, f32(0x22) / 255, f32(0x33) / 255, 1}
+				named_applied := got[.Md_Quote] == want_named
+				unnamed_uses_light := got[.Text_Primary] == l[.Text_Primary] && got[.Text_Primary] != d[.Text_Primary]
+				ok := named_applied && unnamed_uses_light
+				if !ok {fail = true}
+				fmt.printfln(
+					"  %-6s base after role lines still applies: named role=%v, unnamed role uses Light=%v",
+					"ok" if ok else "FAIL",
+					got[.Md_Quote],
+					unnamed_uses_light,
+				)
+				os.remove(path)
+			}
+		}
+
+		// settings_load no longer rejects an unresolvable theme_name -- it is
+		// cloned unconditionally, the same as font_family, because the
+		// rejection used to be destructive: theme_available_names' directory
+		// read degrades to just the two built-ins on ANY failure (transient
+		// or not), so validating on load meant a good custom theme name could
+		// be silently and permanently overwritten with "Dark" by the very
+		// next settings_save. Where the fallback behaviour now lives instead
+		// is theme_resolve, so that -- not settings_load -- is what this
+		// checks.
+		{
+			bogus := settings_default()
+			bogus.theme_name = "TotallyBogusThemeName"
+			settings_save(bogus)
+			loaded := settings_load()
+			preserved := loaded.theme_name == "TotallyBogusThemeName"
+			fmt.printfln(
+				"  %-6s settings_load preserves an unresolvable theme_name verbatim -> %q",
+				"ok" if preserved else "FAIL",
+				loaded.theme_name,
+			)
+			if !preserved {fail = true}
+
+			resolved := theme_resolve(loaded.theme_name)
+			falls_back := resolved == theme_dark()
+			fmt.printfln("  %-6s theme_resolve on that name falls back to Dark", "ok" if falls_back else "FAIL")
+			if !falls_back {fail = true}
+
+			// Leave settings.txt in a known-good state for any later mode run
+			// against the same NEWTPAD_SESSION_DIR in this process.
+			settings_save(settings_default())
+		}
+
+		// The document-canvas clear colour (main.odin:842) reads doc_canvas_clear(),
+		// not its own copy of Bg_Base -- see that proc's comment for the bug this
+		// guards against (a loose three-scalar literal that quietly kept the old
+		// Dark canvas colour after Light shipped, invisible to every `{r, g, b, a}`
+		// grep this batch ran). Reading gfx_begin_frame's actual argument isn't
+		// practical from here, so this proves the one thing that IS practical: the
+		// helper is a live read of g_theme, not a cached/baked copy -- swap
+		// g_theme[.Bg_Base] to a sentinel no real theme uses and confirm the helper
+		// tracks it. A helper hard-coded to return its own literal (reintroducing
+		// this exact bug one layer up) fails this immediately.
+		{
+			saved := g_theme[.Bg_Base]
+			sentinel := [4]f32{0.42, 0.11, 0.77, 1}
+			g_theme[.Bg_Base] = sentinel
+			tracks_live := doc_canvas_clear() == sentinel
+			g_theme[.Bg_Base] = saved
+			fmt.printfln("  %-6s doc_canvas_clear tracks g_theme[.Bg_Base] live", "ok" if tracks_live else "FAIL")
+			if !tracks_live {fail = true}
+		}
+
+		fmt.println("themetest: FAILURES" if fail else "themetest: all ok")
 		return true
 	}
 

@@ -42,12 +42,12 @@ font_page_adjust :: proc(rc: ^Render_Ctx, row, dir: int) {
 }
 
 font_page_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^App, width, height: f32) {
-	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, CHROME_TOP}, size = {width, height - CHROME_TOP}, color = {0.10, 0.12, 0.16, 1}}})
+	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, CHROME_TOP}, size = {width, height - CHROME_TOP}, color = g_theme[.Bg_Base]}})
 
 	x := sx(32)
 	y := CHROME_TOP + sx(40)
-	plat.text_draw(gfx, t, "Font", x, y, UI_PX * 1.4, {0.94, 0.96, 0.99, 1})
-	plat.text_draw(gfx, t, "Esc closes    Up/Down choose    Left/Right change", x, y + sx(22), UI_SMALL_PX, {0.50, 0.55, 0.64, 1})
+	plat.text_draw(gfx, t, "Font", x, y, UI_PX * 1.4, g_theme[.Text_Primary])
+	plat.text_draw(gfx, t, "Esc closes    Up/Down choose    Left/Right change", x, y + sx(22), UI_SMALL_PX, g_theme[.Text_Muted])
 	y += sx(60)
 
 	labels := [FONT_ROWS]string{"Family", "Style", "Size"}
@@ -59,12 +59,12 @@ font_page_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, a
 	rowh := sx(38)
 	for i in 0 ..< FONT_ROWS {
 		if i == app.font_row {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x - sx(12), y - sx(16)}, size = {width - sx(64), rowh - sx(4)}, color = {0.18, 0.24, 0.34, 1}}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x - sx(12), y - sx(16)}, size = {width - sx(64), rowh - sx(4)}, color = g_theme[.Selection_List]}})
 		}
-		plat.text_draw(gfx, t, labels[i], x, y, UI_PX, {0.92, 0.94, 0.98, 1})
-		plat.text_draw(gfx, t, vals[i], x + sx(160), y, UI_PX, {0.55, 0.85, 0.60, 1})
+		plat.text_draw(gfx, t, labels[i], x, y, UI_PX, g_theme[.Text_Primary])
+		plat.text_draw(gfx, t, vals[i], x + sx(160), y, UI_PX, g_theme[.Success])
 		if i == app.font_row {
-			plat.text_draw(gfx, t, "<   >", x + sx(420), y, UI_PX, {0.50, 0.55, 0.64, 1})
+			plat.text_draw(gfx, t, "<   >", x + sx(420), y, UI_PX, g_theme[.Text_Muted])
 		}
 		y += rowh
 	}
@@ -72,7 +72,7 @@ font_page_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, a
 	// Live preview at the real size, in the real face — the point of a font page
 	// is seeing the thing before committing to it.
 	y += sx(24)
-	plat.text_draw(gfx, t, "Preview", x, y, UI_SMALL_PX, {0.50, 0.55, 0.64, 1})
+	plat.text_draw(gfx, t, "Preview", x, y, UI_SMALL_PX, g_theme[.Text_Muted])
 	y += sx(28)
 	// The real size the document renders at, DPI and zoom included — a preview
 	// drawn at the raw 96-DPI number would show 16px text on a 200% display
@@ -80,9 +80,9 @@ font_page_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, a
 	px := active_render_ctx.px if active_render_ctx != nil else sx(f32(app.settings.font_size))
 	// .Doc: the preview must show the face the document will actually use, not
 	// the chrome face this page is otherwise drawn in.
-	plat.text_draw(gfx, t, "The quick brown fox jumps over the lazy dog", x, y, px, {0.88, 0.91, 0.96, 1}, .Doc)
+	plat.text_draw(gfx, t, "The quick brown fox jumps over the lazy dog", x, y, px, g_theme[.Text_Primary], .Doc)
 	y += px * 1.6
-	plat.text_draw(gfx, t, "0123456789  {}[]()<>  il1| oO0  ->  ==  !=", x, y, px, {0.75, 0.80, 0.88, 1}, .Doc)
+	plat.text_draw(gfx, t, "0123456789  {}[]()<>  il1| oO0  ->  ==  !=", x, y, px, g_theme[.Text_Secondary], .Doc)
 
 	// Families are filtered to monospaced ones on purpose; say so, or the short
 	// list looks like a bug.
@@ -94,6 +94,6 @@ font_page_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, a
 		x,
 		y,
 		UI_SMALL_PX,
-		{0.45, 0.49, 0.57, 1},
+		g_theme[.Text_Muted],
 	)
 }

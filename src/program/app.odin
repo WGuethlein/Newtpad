@@ -21,6 +21,10 @@ App :: struct {
 	// Settings and Font are tabs (Document.kind), not overlays; only their
 	// cursor position lives here.
 	settings_row:  int,
+	// First visible settings row, scrolled the same way history.top and
+	// menu.top are — see settings_resolve_top. Added when the 8-row list
+	// stopped always fitting the window (IMPORTANT 3 in the final review).
+	settings_top:  int,
 	font_row:      int,
 	history:       History_State,
 	palette:    Palette, // command palette overlay (Ctrl+P)

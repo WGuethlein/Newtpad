@@ -1986,7 +1986,7 @@ doc_pos_at :: proc(doc: ^Document, t: ^plat.Text, mx, my: i32, px, char_w: f32, 
 doc_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: int, out: []plat.Quad) -> int {
 	lo, hi := doc_sel_range(doc)
 	if lo == hi {return 0}
-	col := [4]f32{0.20, 0.30, 0.48, 1}
+	col := g_theme[.Selection_Doc]
 	lh := line_height(px)
 	it := visible_begin(doc, t, rows)
 	n := 0
@@ -2155,8 +2155,6 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 
 // Draw visible lines; return the caret's screen rect (if visible) and the byte
 // offset just past the last visible line (for the scrollbar).
-LINK_COL :: [4]f32{0.45, 0.70, 0.98, 1}
-
 doc_draw :: proc(
 	gfx: ^plat.Gfx,
 	t: ^plat.Text,
@@ -2169,7 +2167,7 @@ doc_draw :: proc(
 	caret: bool,
 	bottom: int,
 ) {
-	fg := [4]f32{0.86, 0.90, 0.96, 1}
+	fg := g_theme[.Text_Primary]
 	// A line longer than the cap renders as successive capped rows and columns
 	// past VISIBLE_COLS aren't drawn (crude long-line handling; proper horizontal
 	// scroll is a follow-up).
@@ -2193,7 +2191,7 @@ doc_draw :: proc(
 					num := fmt.tprintf("%d", doc.filter_line_nos[fi])
 					// Right-aligned against the gutter's text edge.
 					nx := TEXT_MARGIN_X + GUTTER_W - f32(len(num) + 1) * char_w
-					plat.text_draw(gfx, t, num, nx, row_y, px, {0.42, 0.47, 0.56, 1})
+					plat.text_draw(gfx, t, num, nx, row_y, px, g_theme[.Text_Muted])
 				}
 			}
 			// Links on this row, if Ctrl is held. Colour comes from the same
@@ -2205,7 +2203,7 @@ doc_draw :: proc(
 				if h.row != row {continue}
 				spans = spans if spans != nil else make([dynamic]plat.Text_Span, 0, 4, context.temp_allocator)
 				// The row-relative segment (a wrapped link only colours its part here).
-				append(&spans, plat.Text_Span{start = h.span_start, len = h.span_len, color = LINK_COL})
+				append(&spans, plat.Text_Span{start = h.span_start, len = h.span_len, color = g_theme[.Link]})
 			}
 			if spans != nil {
 				plat.text_draw_spans(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs), row_y, px, fg, spans[:], .Doc)

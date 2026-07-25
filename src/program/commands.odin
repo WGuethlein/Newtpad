@@ -845,6 +845,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Settings_Open:
 		menu_close(app)
 		app.settings_row = 0
+		app.settings_top = 0
 		app_open_special(app, .Settings)
 	case .Settings_Close:
 		request_close_tab(app, app.active, w)
