@@ -135,11 +135,18 @@ Color_Role :: enum u8 {
 
 Theme :: [Color_Role][4]f32
 
-// Belt-and-suspenders alongside the type itself: Theme is defined as
-// [Color_Role][4]f32 two lines up, so this can only fail if that definition
-// ever stops being an enum-indexed array (e.g. hand-rolled to a fixed size
-// during a refactor) -- the same role command_table's [Command_Id]Command
-// array plays for the command list.
+// This is NOT what forces theme_dark() to supply every role when one is
+// added -- that guarantee is the language's: Odin rejects an incomplete
+// keyed enumerated-array composite literal at compile time, so a role
+// missing from the Theme{...} literal below is a compile error, not a
+// silent zero (and #partial has no effect here -- it only applies to
+// switch, never to composite literals). What this #assert actually guards
+// is narrower: that Theme stays defined as [Color_Role][4]f32 two lines up
+// rather than being hand-rolled to some fixed-size array that happens to
+// match today's role count but silently decouples from the enum in a
+// future refactor. Cheap to keep, but read it as guarding that decoupling,
+// not as the reason adding a role can't be forgotten -- the same role
+// command_table's [Command_Id]Command array plays for the command list.
 #assert(len(Theme) == len(Color_Role))
 
 // Read per visible row and per chrome element every frame: an array index on a
