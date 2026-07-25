@@ -1086,8 +1086,10 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 // this, "hello" is five undo steps and the history list is unreadable.
 // A caret jump, a different kind of edit, or a newline breaks the run.
 push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
-	find_invalidate(doc) // every edit path routes through here; match offsets shift
-	doc.revision += 1 // ... and so must anything caching a measure of the buffer
+	find_invalidate(doc) // most edit paths route through here; match offsets shift
+	doc.revision += 1 // ...and so must anything caching a measure of the buffer --
+	// except apply_snapshot and doc_absorb_append, which bypass this by design and
+	// bump revision themselves, and doc_reload, which replaces the struct wholesale.
 	doc.modified = true
 	// One entry for the whole batch; doc_batch_begin already took the snapshot of
 	// the state being left. Without this, Replace All pushed one snapshot per

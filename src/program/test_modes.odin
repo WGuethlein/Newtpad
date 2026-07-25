@@ -305,12 +305,19 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 
 		doc.cursor = doc.pt.length // pretend the caret was at EOF, as when tailing
 		doc.anchor = doc.cursor
+		rev0 := doc.revision
 		absorbed := doc_absorb_append(&doc, s1.size)
 		txt := doc_debug_string(&doc)
 		tail_ok := absorbed && doc.pt.length == int(s1.size) && doc.cursor == doc.pt.length
 		fmt.printfln("absorbed=%v len=%d (want %d) caret follows=%v  %s", absorbed, doc.pt.length, s1.size, doc.cursor == doc.pt.length, "OK" if tail_ok else "FAIL")
 		if !tail_ok {bad += 1}
 		fmt.printfln("  content: %q", txt)
+		// doc_absorb_append bypasses push_undo by design, so it must bump
+		// revision itself; a future refactor that drops the bump leaves the
+		// markdown table cache reading stale columns with no other symptom.
+		rev0_ok := doc.revision > rev0
+		fmt.printfln("  revision bumped: %d -> %d  %s", rev0, doc.revision, "OK" if rev0_ok else "FAIL")
+		if !rev0_ok {bad += 1}
 
 		// Save, then let the file grow. The append offset must come from the file
 		// as last seen, not from the original length — otherwise the bytes we
@@ -324,6 +331,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			os.write(f2, transmute([]u8)string("tail\n"))
 			os.close(f2)
 			s2 := plat.file_stamp(path)
+			rev1 := doc.revision
 			doc_absorb_append(&doc, s2.size)
 			got := doc_debug_string(&doc)
 			want := fmt.tprintf("%s%s", saved, "tail\n")
@@ -333,6 +341,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				fmt.printfln("  want %q", want[:min(len(want), 32)])
 				bad += 1
 			}
+			rev1_ok := doc.revision > rev1
+			fmt.printfln("  revision bumped: %d -> %d  %s", rev1, doc.revision, "OK" if rev1_ok else "FAIL")
+			if !rev1_ok {bad += 1}
 		}
 
 		// Shrinking is not an append: it must be refused so the caller reloads.
@@ -344,21 +355,31 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		plat.file_write_atomic(path, transmute([]u8)string("completely different\ncontent here\n"))
 		doc.cursor = 5
 		doc.anchor = 5
+		rev2 := doc.revision
 		rok := doc_reload(&doc)
 		after := doc_debug_string(&doc)
 		reload_ok := rok && doc.cursor == 5 && !doc.disk_changed
 		fmt.printfln("reload=%v caret=%d stamp refreshed=%v  %s", rok, doc.cursor, doc.disk_stamp.ok, "OK" if reload_ok else "FAIL")
 		if !reload_ok {bad += 1}
 		fmt.printfln("  content: %q", after[:min(len(after), 24)])
+		// doc_reload replaces the whole Document; the old revision must carry
+		// forward and bump, not reset to the fresh struct's zero value.
+		rev2_ok := doc.revision > rev2
+		fmt.printfln("  revision bumped: %d -> %d  %s", rev2, doc.revision, "OK" if rev2_ok else "FAIL")
+		if !rev2_ok {bad += 1}
 
 		// A caret past the new end must clamp, not index out of bounds.
 		plat.file_write_atomic(path, transmute([]u8)string("tiny\n"))
 		doc.cursor = 999
 		doc.anchor = 999
+		rev3 := doc.revision
 		doc_reload(&doc)
 		clamped := doc.cursor <= doc.pt.length
 		fmt.printfln("caret clamped after shrink: %d <= %d  %s", doc.cursor, doc.pt.length, "OK" if clamped else "FAIL")
 		if !clamped {bad += 1}
+		rev3_ok := doc.revision > rev3
+		fmt.printfln("  revision bumped: %d -> %d  %s", rev3, doc.revision, "OK" if rev3_ok else "FAIL")
+		if !rev3_ok {bad += 1}
 
 		// Encodings whose bytes do not map 1:1 to document bytes must never take
 		// the append fast path: a BOM shifts every offset, UTF-16 is transcoded.
