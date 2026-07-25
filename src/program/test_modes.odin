@@ -719,6 +719,66 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !dok {bad += 1}
 		BASE_PX = BASE_PX_96 // leave globals alone for later modes
 
+		// The settings-page row list (IMPORTANT 3, final review): the 8th row
+		// (Theme) stopped always fitting the window once it was added -- at
+		// 150% DPI on a 1366x768 laptop, the unclamped layout drew its label
+		// and help text straddling the version string's baseline. Checked at
+		// the reported scale/height plus two others so the guard isn't tuned
+		// to one number, using the same settings_list_bounds/
+		// settings_rows_fitting settings_draw itself now calls -- not a
+		// parallel copy of the arithmetic, so the two cannot disagree.
+		fmt.println("--- settings row-list overflow ---")
+		check_fit :: proc(rc: ^Render_Ctx, dpi: u32, height: f32) -> (ok: bool, shown: int, last_bottom, version_y: f32) {
+			rc.window.dpi = dpi
+			metrics_recompute(rc)
+			rowh := sx(46)
+			y0, avail_h := settings_list_bounds(height)
+			shown = settings_rows_fitting(0, avail_h, rowh)
+			last_bottom = y0 + f32(shown) * rowh
+			version_y = height - sx(24)
+			ok = last_bottom <= version_y
+			return
+		}
+		cases := [][2]f32{{96, 900}, {144, 768}, {192, 1080}}
+		for c in cases {
+			dpi, height := u32(c[0]), c[1]
+			ok, shown, last_bottom, version_y := check_fit(&rcz, dpi, height)
+			fmt.printfln(
+				"  %-6s dpi=%d height=%.0f: %d/%d rows shown, last row bottom=%.0f (version line=%.0f)",
+				"ok" if ok else "FAIL",
+				dpi,
+				height,
+				shown,
+				settings_row_count(),
+				last_bottom,
+				version_y,
+			)
+			if !ok {bad += 1}
+		}
+		// Proof this check can actually fail (CLAUDE.md: "a test that has never
+		// failed proves nothing") -- the unclamped layout the bug shipped with
+		// (draw every row regardless of height) DOES overflow at 150%/768. If
+		// this stops reproducing, the scenario needs revisiting, not just the
+		// fitted-count assertion above.
+		{
+			rcz.window.dpi = 144
+			metrics_recompute(&rcz)
+			rowh := sx(46)
+			y0, _ := settings_list_bounds(768)
+			naive_bottom := y0 + f32(settings_row_count()) * rowh
+			naive_version_y := f32(768) - sx(24)
+			overflowed := naive_bottom > naive_version_y
+			fmt.printfln(
+				"  %-6s unclamped layout overflows at 150%%/768 (naive_bottom=%.0f, version_y=%.0f)",
+				"ok" if overflowed else "FAIL",
+				naive_bottom,
+				naive_version_y,
+			)
+			if !overflowed {bad += 1}
+		}
+		rcz.window.dpi = 96
+		metrics_recompute(&rcz) // leave globals alone for later modes
+
 		fmt.printfln("settingstest: %d failures", bad)
 		return true
 	}
@@ -2812,7 +2872,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// NEWTPAD_SESSION_DIR/themes -- require_scratch_session at the top of
 		// this mode already refused to run without that set, so none of this
 		// touches the real %APPDATA%\Newtpad.
-		tdir, tdir_ok := themes_dir()
+		// _ensure: this block writes .theme files below, the one legitimate
+		// reason to create the directory (see themes_dir_ensure's comment).
+		tdir, tdir_ok := themes_dir_ensure()
 		if !tdir_ok {
 			fmt.println("  FAIL   themetest: themes_dir unavailable")
 			fail = true
@@ -2889,11 +2951,29 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				labels := []string{"#zzz (non-hex digits)", "#12 (too short)", "1122334 (missing #)", "#1122334 (wrong length)"}
 				for role, i in roles {
 					v := got[role]
+					// Checked and reported separately, not folded into one `ok :=
+					// fell_back && never_black`: fell_back == (v == d[role]) and
+					// d[role] is already known non-black (the "every role must be
+					// non-zero" loop above already proved that for Dark), so
+					// never_black was mathematically implied by fell_back and could
+					// never independently fail or independently surface in the
+					// printed line -- exactly the "conjunct that cannot fail" shape
+					// CLAUDE.md calls out. Splitting them means a future built-in
+					// that DID hold a black role would still be caught here instead
+					// of being silently absorbed into fell_back's pass.
 					never_black := v != ([4]f32{0, 0, 0, 0}) && v != ([4]f32{0, 0, 0, 1})
+					if !never_black {
+						fmt.printfln("  FAIL   malformed %-28s -> %v is black (should have fallen back)", labels[i], v)
+						fail = true
+					}
 					fell_back := v == d[role]
-					ok := fell_back && never_black
-					if !ok {fail = true}
-					fmt.printfln("  %-6s malformed %-28s -> %v (built-in=%v)", "ok" if ok else "FAIL", labels[i], v, d[role])
+					if !fell_back {
+						fmt.printfln("  FAIL   malformed %-28s -> %v did not fall back to built-in %v", labels[i], v, d[role])
+						fail = true
+					}
+					if never_black && fell_back {
+						fmt.printfln("  ok     malformed %-28s -> %v (built-in=%v)", labels[i], v, d[role])
+					}
 				}
 				os.remove(path)
 			}
@@ -2973,20 +3053,56 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			}
 		}
 
-		// An unknown theme name in settings.txt falls back to Dark --
-		// validated in settings_load's "theme_name" case, the same way it
-		// already range-checks font_style/link_style/md_default.
+		// settings_load no longer rejects an unresolvable theme_name -- it is
+		// cloned unconditionally, the same as font_family, because the
+		// rejection used to be destructive: theme_available_names' directory
+		// read degrades to just the two built-ins on ANY failure (transient
+		// or not), so validating on load meant a good custom theme name could
+		// be silently and permanently overwritten with "Dark" by the very
+		// next settings_save. Where the fallback behaviour now lives instead
+		// is theme_resolve, so that -- not settings_load -- is what this
+		// checks.
 		{
 			bogus := settings_default()
 			bogus.theme_name = "TotallyBogusThemeName"
 			settings_save(bogus)
 			loaded := settings_load()
-			ok := loaded.theme_name == "Dark"
-			if !ok {fail = true}
-			fmt.printfln("  %-6s unknown theme_name in settings.txt -> %q (want \"Dark\")", "ok" if ok else "FAIL", loaded.theme_name)
+			preserved := loaded.theme_name == "TotallyBogusThemeName"
+			fmt.printfln(
+				"  %-6s settings_load preserves an unresolvable theme_name verbatim -> %q",
+				"ok" if preserved else "FAIL",
+				loaded.theme_name,
+			)
+			if !preserved {fail = true}
+
+			resolved := theme_resolve(loaded.theme_name)
+			falls_back := resolved == theme_dark()
+			fmt.printfln("  %-6s theme_resolve on that name falls back to Dark", "ok" if falls_back else "FAIL")
+			if !falls_back {fail = true}
+
 			// Leave settings.txt in a known-good state for any later mode run
 			// against the same NEWTPAD_SESSION_DIR in this process.
 			settings_save(settings_default())
+		}
+
+		// The document-canvas clear colour (main.odin:842) reads doc_canvas_clear(),
+		// not its own copy of Bg_Base -- see that proc's comment for the bug this
+		// guards against (a loose three-scalar literal that quietly kept the old
+		// Dark canvas colour after Light shipped, invisible to every `{r, g, b, a}`
+		// grep this batch ran). Reading gfx_begin_frame's actual argument isn't
+		// practical from here, so this proves the one thing that IS practical: the
+		// helper is a live read of g_theme, not a cached/baked copy -- swap
+		// g_theme[.Bg_Base] to a sentinel no real theme uses and confirm the helper
+		// tracks it. A helper hard-coded to return its own literal (reintroducing
+		// this exact bug one layer up) fails this immediately.
+		{
+			saved := g_theme[.Bg_Base]
+			sentinel := [4]f32{0.42, 0.11, 0.77, 1}
+			g_theme[.Bg_Base] = sentinel
+			tracks_live := doc_canvas_clear() == sentinel
+			g_theme[.Bg_Base] = saved
+			fmt.printfln("  %-6s doc_canvas_clear tracks g_theme[.Bg_Base] live", "ok" if tracks_live else "FAIL")
+			if !tracks_live {fail = true}
 		}
 
 		fmt.println("themetest: FAILURES" if fail else "themetest: all ok")
