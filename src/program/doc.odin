@@ -1528,6 +1528,153 @@ doc_delete_fwd :: proc(doc: ^Document) {
 	doc.anchor = doc.cursor
 }
 
+// The end of a line's content (excluding its terminator) and the terminator's
+// length in bytes: 0 if `line_start` begins the buffer's final, unterminated
+// line, 1 for a bare LF, 2 for CRLF. pt_line_end stops at the '\n', which for
+// a CRLF line leaves the '\r' looking like content -- doc_cursor_end peels the
+// same byte off for the same reason. doc_move_lines needs this split to
+// reason about "line plus its following terminator" as one unit, so a swap
+// never cuts a CRLF pair in half.
+@(private = "file")
+line_span :: proc(pt: ^base.Piece_Table, line_start: int) -> (content_end, term_len: int) {
+	nl := base.pt_line_end(pt, line_start)
+	if nl >= pt.length {
+		return pt.length, 0
+	}
+	if nl > 0 && base.pt_crlf_at(pt, nl - 1) {
+		return nl - 1, 2
+	}
+	return nl, 1
+}
+
+// The bytes to synthesise when a moved line needs a terminator that didn't
+// exist before -- doc.eol's own bytes, never a hardcoded "\n" (that's the
+// mixed-ending corruption this task exists to avoid). .Mixed falls back to LF,
+// same as doc_insert_newline and detect_line_ending's own default: a file that
+// already disagrees with itself has no "right" terminator to pick.
+@(private = "file")
+eol_bytes :: proc(eol: base.Line_Ending) -> string {
+	return "\r\n" if eol == .CRLF else "\n"
+}
+
+// A defensive copy of pt[pos:pos+n) on the frame arena, for assembling
+// doc_move_lines' replacement text out of relocated pieces. nil for n <= 0 so
+// appending it is a no-op rather than an out-of-range read.
+@(private = "file")
+read_range :: proc(pt: ^base.Piece_Table, pos, n: int) -> []u8 {
+	if n <= 0 {return nil}
+	buf := make([]u8, n, context.temp_allocator)
+	base.pt_read(pt, pos, buf)
+	return buf
+}
+
+// Alt+Up / Alt+Down: move every logical line the selection touches up or down
+// past its neighbour, keeping the selection so the key can be held and the
+// move repeated. One undo entry per press; no wraparound -- the first line
+// has nothing above it and the last has nothing below, so those are a no-op
+// rather than a rotation. (Declined: duplicating the line instead of moving
+// it -- a different command, not this one.)
+//
+// The hazard is terminators: they live BETWEEN lines, and the buffer's last
+// line usually has none. A naive cut-and-paste of the two spans either
+// duplicates a terminator or drops one -- on a CRLF file that means splitting
+// a \r\n pair and leaving a bare LF, the same corruption doc_delete_fwd and
+// doc_insert_newline (Task 1) had to be fixed for. So this reasons about two
+// "line plus its following terminator" units, works out which one ends up
+// physically last in the buffer, and only THAT boundary's terminator can
+// change: synthesised via doc.eol if the line moving out of last place never
+// had one, dropped if the line moving into last place did. Everything else --
+// both lines' own text, and the terminator that already sat between them --
+// is untouched bytes, just relocated. One doc_replace_range over the whole
+// region, so no intermediate state ever exists and no offset can drift
+// mid-edit.
+doc_move_lines :: proc(doc: ^Document, delta: int) {
+	orig_anchor, orig_cursor := doc.anchor, doc.cursor
+	lo := base.pt_line_start(&doc.pt, min(orig_anchor, orig_cursor))
+	last_start := base.pt_line_start(&doc.pt, max(orig_anchor, orig_cursor))
+	end_a, term_a := line_span(&doc.pt, last_start)
+
+	if delta < 0 && lo == 0 {return} // first line: no line above to swap with
+	// `end_a + term_a` (not the brief's raw pt_line_end) is A's true span end,
+	// terminator included: a last line WITH a trailing newline has term_a > 0
+	// but still has no next line to swap with, since the terminator is the
+	// last byte in the buffer. Using the raw, un-peeled pt_line_end here
+	// under-counts a CRLF terminator by one byte and would fail to bail on
+	// exactly that case (see the report's arithmetic on "last line down").
+	if delta > 0 && end_a + term_a >= doc.pt.length {return} // last line: no line below
+
+	// `other` is the neighbour A swaps with -- the next line moving down, the
+	// previous line moving up -- and `a_first` says which of A/other lands
+	// first in the new byte order.
+	other_start, other_end, other_term: int
+	region_lo, region_hi: int
+	a_first: bool
+	if delta > 0 {
+		other_start = end_a + term_a
+		other_end, other_term = line_span(&doc.pt, other_start)
+		region_lo, region_hi = lo, other_end + other_term
+		a_first = false
+	} else {
+		other_start = base.pt_line_start(&doc.pt, lo - 1)
+		other_end, other_term = line_span(&doc.pt, other_start)
+		region_lo, region_hi = other_start, end_a + term_a
+		a_first = true
+	}
+
+	a_bytes := read_range(&doc.pt, lo, end_a - lo)
+	other_bytes := read_range(&doc.pt, other_start, other_end - other_start)
+	a_term_bytes := read_range(&doc.pt, end_a, term_a)
+	other_term_bytes := read_range(&doc.pt, other_end, other_term)
+
+	// The piece landing first was physically SECOND before the swap, so its
+	// own terminator is what already separated the two lines -- reused as the
+	// new mid-separator, or synthesised if it never had one (it was the
+	// buffer's unterminated last line).
+	first_bytes := a_bytes if a_first else other_bytes
+	first_own_term_len := term_a if a_first else other_term
+	first_own_term_bytes := a_term_bytes if a_first else other_term_bytes
+	second_bytes := other_bytes if a_first else a_bytes
+	second_own_term_bytes := other_term_bytes if a_first else a_term_bytes
+
+	sep_mid := first_own_term_bytes if first_own_term_len > 0 else transmute([]u8)eol_bytes(doc.eol)
+
+	// The piece landing second keeps a terminator after it, UNLESS this
+	// region's tail is the buffer's true end and that end was unterminated --
+	// in which case whichever line moves into last place must drop its
+	// terminator, even if it had one. `second_own_term_bytes` is always
+	// non-empty when this isn't the unterminated-tail case: the piece landing
+	// second was, before the swap, immediately followed by the other piece, so
+	// it always had its own terminator.
+	unterminated_tail := region_hi >= doc.pt.length && first_own_term_len == 0
+	sep_end: []u8
+	if !unterminated_tail {sep_end = second_own_term_bytes}
+
+	out := make(
+		[dynamic]u8,
+		0,
+		len(first_bytes) + len(sep_mid) + len(second_bytes) + len(sep_end),
+		context.temp_allocator,
+	)
+	append(&out, ..first_bytes)
+	append(&out, ..sep_mid)
+	append(&out, ..second_bytes)
+	append(&out, ..sep_end)
+
+	doc_batch_begin(doc, .Replace)
+	doc_replace_range(doc, region_lo, region_hi - region_lo, out[:])
+	doc_batch_end(doc, 1)
+
+	// doc_replace_range collapses to a single caret past the inserted text;
+	// restore the selection so Alt+Up/Down can be held and the move repeated.
+	// A's internal bytes kept their relative layout, so shifting both ends by
+	// A's net displacement reproduces the original selection exactly.
+	new_a_start := region_lo if a_first else region_lo + len(first_bytes) + len(sep_mid)
+	shift := new_a_start - lo
+	doc.anchor = orig_anchor + shift
+	doc.cursor = orig_cursor + shift
+	doc.last_edit_at = doc.cursor
+}
+
 // --- cursor movement (select=true extends the selection) ---
 
 doc_cursor_left :: proc(doc: ^Document, select: bool) {

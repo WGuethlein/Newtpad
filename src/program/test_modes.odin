@@ -2629,6 +2629,45 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad movelinetest` — Alt+Up/Down. Terminators live BETWEEN lines and the
+	// last line often has none, so a naive cut-and-paste either duplicates one or
+	// drops it; on a CRLF file that leaves a bare LF, the corruption batch 1 fixed
+	// in doc_delete_fwd. Hence whole-buffer assertions, and the last line as an
+	// explicit case rather than one the general path is assumed to cover.
+	if os.args[1] == "movelinetest" {
+		fail := false
+		chk :: proc(label, got, want: string, fail: ^bool) {
+			ok := got == want
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %-34s got=%q want=%q", "ok" if ok else "FAIL", label, got, want)
+		}
+		one :: proc(content: string, eol: base.Line_Ending, at, delta: int) -> string {
+			doc: Document
+			doc.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&doc.pt)
+			doc.eol = eol
+			doc.cursor, doc.anchor = at, at
+			doc_move_lines(&doc, delta)
+			return strings.clone(doc_debug_string(&doc), context.temp_allocator)
+		}
+		fmt.println("movelinetest:")
+		// LF, middle of the file
+		chk("LF: move line 2 up", one("a\nb\nc\n", .LF, 2, -1), "b\na\nc\n", &fail)
+		chk("LF: move line 1 down", one("a\nb\nc\n", .LF, 0, 1), "b\na\nc\n", &fail)
+		// no-ops at the bounds: the buffer must come back byte-identical
+		chk("LF: first line up is a no-op", one("a\nb\n", .LF, 0, -1), "a\nb\n", &fail)
+		chk("LF: last line down is a no-op", one("a\nb\n", .LF, 2, 1), "a\nb\n", &fail)
+		// the last line WITHOUT a trailing newline -- which line lacks one changes
+		chk("LF: unterminated last up", one("a\nb", .LF, 2, -1), "b\na", &fail)
+		chk("LF: into unterminated last", one("a\nb", .LF, 0, 1), "b\na", &fail)
+		// CRLF must never yield a bare LF anywhere
+		chk("CRLF: move line 2 up", one("a\r\nb\r\nc\r\n", .CRLF, 3, -1), "b\r\na\r\nc\r\n", &fail)
+		chk("CRLF: unterminated last up", one("a\r\nb", .CRLF, 3, -1), "b\r\na", &fail)
+		chk("CRLF: into unterminated last", one("a\r\nb", .CRLF, 0, 1), "b\r\na", &fail)
+		fmt.println("movelinetest: FAILURES" if fail else "movelinetest: all ok")
+		return true
+	}
+
 	// `newtpad mdtabletest` checks the two properties the old renderer lacked:
 	// every row's cells land on the same x positions, and those positions do not
 	// depend on where the viewport entered the block.
@@ -3304,6 +3343,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		key_chk(resolve_key(.Left, false, false, .Editor), .Cursor_Left, "Left / Editor")
 		key_chk(resolve_key(.Left, true, false, .Editor), .Word_Left, "Ctrl+Left / Editor")
 		key_chk(resolve_key(.F, true, false, .Editor), .Find_Open, "Ctrl+F / Editor")
+		key_chk(resolve_key(.Up, false, true, .Editor), .Move_Line_Up, "Alt+Up / Editor")
+		key_chk(resolve_key(.Down, false, true, .Editor), .Move_Line_Down, "Alt+Down / Editor")
 		key_chk(resolve_key(.Z, false, true, .Editor), .Toggle_Wrap, "Alt+Z / Editor")
 		key_chk(resolve_key(.Enter, false, false, .Editor), .Insert_Newline, "Enter / Editor")
 		key_chk(resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find")
@@ -3428,6 +3469,21 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		want2 := "hello\n\nworld\n"
 		ok2 := got2 == want2
 		fmt.printfln("  %-6s Enter on LF   -> %q (want %q)", "ok" if ok2 else "FAIL", got2, want2)
+
+		// .Mixed (a file that already disagrees with itself) falls through to
+		// the same LF path as .LF -- this was verified by inspection only until
+		// now; same buffer as the LF case above, so a bare LF is the only
+		// possible right answer either way.
+		nl2m: Document
+		nl2m.pt = base.pt_init(transmute([]u8)string("hello\nworld\n"))
+		defer base.pt_destroy(&nl2m.pt)
+		nl2m.eol = .Mixed
+		nl2m.cursor, nl2m.anchor = 5, 5
+		doc_insert_newline(&nl2m)
+		got2m := doc_debug_string(&nl2m)
+		want2m := "hello\n\nworld\n"
+		ok2m := got2m == want2m
+		fmt.printfln("  %-6s Enter on Mixed -> %q (want %q)", "ok" if ok2m else "FAIL", got2m, want2m)
 
 		// Enter must replace an active selection exactly as doc_insert_rune does,
 		// not just splice in beside it -- otherwise Enter with a selection active
