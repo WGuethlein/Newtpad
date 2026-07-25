@@ -2681,12 +2681,21 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// whole buffer is untouched, not just that the call returned.
 		big := strings.repeat("x", MOVE_LINE_BUDGET + 16, context.temp_allocator)
 		over_budget := strings.concatenate({big, "\nb"}, context.temp_allocator)
-		chk(
-			"over-budget line is a no-op (bail, not a scan)",
-			one(over_budget, .LF, len(big) + 1, -1),
-			over_budget,
-			&fail,
-		)
+		// Compared in full but reported by length and a match flag: chk prints both
+		// operands with %q, and these are a megabyte each, which buried the rest of
+		// the mode's output under four megabytes of x's.
+		{
+			got := one(over_budget, .LF, len(big) + 1, -1)
+			ok := got == over_budget
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s %-34s %d bytes, unchanged=%v",
+				"ok" if ok else "FAIL",
+				"over-budget line is a no-op",
+				len(over_budget),
+				ok,
+			)
+		}
 		// One press must add exactly one undo entry (Replace All's overflow bug
 		// was one snapshot per match; a batch is the fix, so pin that it still
 		// collapses to one here too), and doc_undo must restore the exact
