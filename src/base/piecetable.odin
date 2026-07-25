@@ -379,6 +379,40 @@ pt_line_end_cap :: proc(pt: ^Piece_Table, pos, cap: int) -> int {
 	return limit
 }
 
+// Visible end of the row [start, end): excludes a trailing CR that is part of a
+// CRLF break. `line_end` must be false at a wrap point, where a CR is ordinary
+// content rather than half a line terminator.
+//
+// This is the single definition of where a rendered row's content stops. It used
+// to exist only inside the text draw, so the caret, the selection, the wrap
+// budget and the column readout each measured one cell too far on every CRLF
+// line — a phantom cell with no glyph, because CR draws nothing while the pen
+// still advances.
+pt_row_vis_end :: proc(pt: ^Piece_Table, start, end: int, line_end: bool) -> int {
+	if end <= start || !line_end {return end}
+	// Only a CR that is genuinely half of a CRLF pair is excluded. `line_end` is
+	// also true when a row ends at EOF and at a synthetic RENDER_LINE_CAP
+	// boundary, where a trailing CR is ordinary content: stripping it there made
+	// the caret and the click stop at one offset while Ctrl+End reached another —
+	// the same two-consumers-disagree bug this helper exists to remove.
+	if end >= pt.length {return end} // ends at EOF: nothing follows the CR
+	b: [2]u8
+	if pt_read(pt, end - 1, b[:]) == 2 && b[0] == '\r' && b[1] == '\n' {return end - 1}
+	return end
+}
+
+// True when a CRLF pair begins at byte offset `at` (pt[at]=='\r' && pt[at+1]==
+// '\n'). The single test for "is this the start of a two-byte line break" --
+// doc.odin had this as four independent inline byte-pair checks (both arrow
+// keys, and two more that were missing it entirely: Delete and Backspace each
+// removed one byte of the pair and left the other, and a click-clamped
+// double-click could select the CR as if it were content). One rule, one test.
+pt_crlf_at :: proc(pt: ^Piece_Table, at: int) -> bool {
+	if at < 0 || at + 1 >= pt.length {return false}
+	b: [2]u8
+	return pt_read(pt, at, b[:]) == 2 && b[0] == '\r' && b[1] == '\n'
+}
+
 // pt_line_start, bounded, mirroring pt_line_end_cap. `exact` is false when the
 // cap was reached without finding a newline, so the returned offset is a scan
 // floor rather than a real line start and the caller must not present a column

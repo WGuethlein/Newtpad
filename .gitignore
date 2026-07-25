@@ -20,3 +20,6 @@ desktop.ini
 
 # Generated benchmark test files
 /bench/data/
+
+# SDD session scratch (subagent-driven-development progress ledger)
+.superpowers/

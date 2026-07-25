@@ -1184,6 +1184,104 @@ real save-on-crash with open tabs is only exercisable live.
   in a temp dir. Verified 2026-07-21: all four kinds produced a ~1.4 MB dump + a report with the
   faulting frame symbolized and the breadcrumb trail intact.
 
+## 6s. Live-use bug batch 1 (2026-07-25, branch `fix/live-bug-batch-1`)
+
+Six bugs Wyatt reported from daily-driving 0.9.0. Design in
+`docs/superpowers/specs/2026-07-24-bug-batch-1-design.md`, task plan in
+`docs/superpowers/plans/2026-07-24-bug-batch-1.md`. The four *features* from the same report
+(Alt+arrow line move, drag-and-drop open, per-file-family view memory, resizable split) are
+deliberately deferred to a second branch.
+
+**Two of the six were the same seam** — `visible_next`, the capped line iterator every screen pass
+reads. That is the third time this shape has produced multiple bugs (see §6j), and it is why the
+fixes went in at the iterator rather than at the symptoms.
+
+- **Bug 2, phantom trailing row.** `next_row_start_capped` returned `length` for two different
+  facts: "the next row starts at `length`" (true after a trailing newline, where a final empty row
+  legitimately renders) and "there is no next row" (true at EOF with no newline). So every buffer
+  without a trailing newline — i.e. **every scratch buffer** — emitted a phantom row at
+  `[length, length]`, and because the caret loop assigns on *every* matching row, the phantom
+  overwrote the real hit. Caret one row below the text at column 0, never following it. Now
+  `(start, ok)`, propagated through `next_visual_row` / `eff_next_row` and their four walkers.
+  Watch out: `visible_next`'s wrap branch has its own inline EOF logic and never calls
+  `eff_next_row`, so a test written against the iterator cannot exercise the stepper.
+- **Bug 4, CRLF phantom cell.** A row is `[start, end)` with `end` at the LF, so on CRLF it held the
+  trailing CR — and only the *text draw* stripped it. `visible_next` now reports `vis_end` (backed by
+  `base.pt_row_vis_end`), consumed by the caret, hit-test, selection, link scan and h-scroll width.
+  **CRLF is atomic for the caret** (Wyatt approved): `End` stops on the content end, the arrows cross
+  the pair in one step, and one Delete or Backspace at a break consumes the whole pair. That last
+  part was missed on the first pass: making `End` land on the CR silently changed what `doc_delete_fwd`
+  does, so Delete removed only the CR, the document still rendered as two lines (the keystroke looked
+  dead), and a lone LF went to disk in a CRLF file. All five consumers now share `base.pt_crlf_at`.
+  `pt_row_vis_end` strips only a genuine pair — `line_end` is also true at EOF and at a synthetic
+  `RENDER_LINE_CAP` boundary, and stripping there made `End`/click stop at one offset while
+  `Ctrl+End` reached another.
+  *Diagnosis correction worth keeping:* of the four symptoms Wyatt reported, only the positional ones
+  (caret past EOL, selection extent, click clamp) reproduced. `plat.text_cells` is literally
+  `text_cell_width` summed, and CR measures 0 cells, so "wrap breaks one column early" did not
+  reproduce and "Col reads one too high" was never established (`doc_cursor_col` measures
+  line-start→cursor and never touches the CR). **If a wrap-width issue shows up again it is a
+  different bug.** C0 controls are now in `plat.is_zero_width` so that zero is true by construction
+  rather than a DirectWrite accident, and the untestable wrap-budget skip that assumed otherwise is
+  gone.
+- **Bug 10, word nav asymmetry.** Ctrl+Right landed on word *ends*, Ctrl+Left on word *starts*. New
+  `base/words.odin`: three classes (word / punct / space), both directions landing on token starts.
+  It lives in `base` because the old predicate was file-private in `package main` where `odin test`
+  could not reach it — which is why the asymmetry had no test. A line break is whitespace and is
+  crossed, not stopped on. Non-ASCII punctuation still classes as a word character (needs rune
+  decoding in the nav loop); recorded as an accepted limitation.
+- **Bug 5, `(no matches)` flicker.** Every edit clears the match arrays and restarts the worker, and
+  the status text tested only `len(matches) == 0`. Now a sticky last-published count shown while
+  `search_running`. The reset belongs in the four *query-edit* paths only — `find_recompute` is also
+  called by replace, so resetting there wipes the value that stops the flicker. And the sticky copy
+  goes *after* `find_merge`'s jump block, or `f.current` is still -1 and the bar reads `(0/N)`.
+  The test fixture must exceed `SEARCH_SYNC_MAX` (256 KiB) or the search runs inline and the
+  assertion passes with the bug present.
+- **Bug 3, Ctrl+H spacing.** The caret now marks the focused field and reserves nothing in the other.
+  The first attempt gave it a fixed-width slot in both states, which made both agree at *two* spaces
+  — the exact string from the bug report. The accepted trade: the count shifts one cell when focus
+  moves. **No automated test, by Wyatt's decision** — asserting on glyph advances would test
+  DirectWrite's metrics, not our layout.
+- **Bug 8, markdown table columns.** Was: each row advanced `x` by its own cell widths, so columns
+  could not line up by construction; the separator row was skipped instead of becoming a rule; and
+  `strings.trim(line, "| ")` ate empty leading cells. Now a two-pass measure **cached per table
+  block**, keyed on `{start, end, revision}`, four slots round-robin. Widths are a property of the
+  block, not of the visible rows — measuring from visible rows makes them a function of scroll
+  position, which Wyatt rejected outright. Hard-won details:
+  - Bound both scans from the **entry point**, never from the moving `start`: `start - q` is
+    invariantly zero (the loop assigns both), so a guard written that way is dead and the walk runs
+    to byte 0 through the *uncapped* `pt_line_start`.
+  - Derive `oversize` from the **window** (`trunc_back || trunc_fwd || (end-start) > budget ||
+    total_rows > cap`), not from which guard fired. Deriving it from the guards made the flag — and
+    therefore every column width — depend on where the viewport entered the block, which is the
+    scroll shift the design exists to prevent. The same trap recurs in the row dimension.
+  - Bound **iterations** as well as bytes: each scanned row costs two fixed 4 KB `pt_read`s
+    regardless of row length, so a byte budget alone does not bound the work.
+  - A non-line-start entry is forced oversize: `markdown_draw` walks a `>RENDER_LINE_CAP` line in
+    capped segments, so `p` is not always a line start.
+- **`Document.revision`** (new) is the cache key: monotonic, bumped in `push_undo` *before* the
+  `doc.batch` early return. The comment claiming "every edit path routes through here" was **false** —
+  `apply_snapshot`, `doc_absorb_append`, `doc_reload` and `doc_recover_from_fault` all bypass it and
+  now bump directly. `doc_reload` replaces the whole `Document`, so it carries the old value forward
+  and bumps rather than resetting to zero.
+
+**The lesson this batch adds to §6j.** Not just "test the seam" — **confirm the symptom before
+designing its fix.** Two of the six symptoms did not reproduce as reported, and the code written for
+them shipped with assertions that passed either way. One line measuring the CR's cell width up front
+would have removed nine lines of code and a round of review. Relatedly, three separate tests in this
+batch could not fail as first written: one reused a `Document` so the cache short-circuited the very
+property under test, one compared the two word-nav walks index-for-index (structurally impossible),
+and one used a fixture below the async search threshold. **A test written from a plan is not a test
+until it has been watched failing.**
+
+**Owed, not done:** Wyatt's live pass on all six symptoms (this environment cannot inject GUI input);
+the visual check on bug 3; and a real ≥100k-row pipe-delimited log in Split markdown mode with
+keystroke frame timing, to confirm `MD_TABLE_MAX_ROWS = 1024` is the right number.
+
+**Note:** release is now ~1.10 MB (was 0.87 MB at 0.9.0). `test_modes.odin` still ships in the
+release binary and this batch added ~730 lines to it — the §5 debt item "gate the harness behind a
+build flag" is now the largest single contributor to binary size.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

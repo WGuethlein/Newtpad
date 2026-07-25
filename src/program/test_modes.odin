@@ -305,12 +305,19 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 
 		doc.cursor = doc.pt.length // pretend the caret was at EOF, as when tailing
 		doc.anchor = doc.cursor
+		rev0 := doc.revision
 		absorbed := doc_absorb_append(&doc, s1.size)
 		txt := doc_debug_string(&doc)
 		tail_ok := absorbed && doc.pt.length == int(s1.size) && doc.cursor == doc.pt.length
 		fmt.printfln("absorbed=%v len=%d (want %d) caret follows=%v  %s", absorbed, doc.pt.length, s1.size, doc.cursor == doc.pt.length, "OK" if tail_ok else "FAIL")
 		if !tail_ok {bad += 1}
 		fmt.printfln("  content: %q", txt)
+		// doc_absorb_append bypasses push_undo by design, so it must bump
+		// revision itself; a future refactor that drops the bump leaves the
+		// markdown table cache reading stale columns with no other symptom.
+		rev0_ok := doc.revision > rev0
+		fmt.printfln("  revision bumped: %d -> %d  %s", rev0, doc.revision, "OK" if rev0_ok else "FAIL")
+		if !rev0_ok {bad += 1}
 
 		// Save, then let the file grow. The append offset must come from the file
 		// as last seen, not from the original length — otherwise the bytes we
@@ -324,6 +331,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			os.write(f2, transmute([]u8)string("tail\n"))
 			os.close(f2)
 			s2 := plat.file_stamp(path)
+			rev1 := doc.revision
 			doc_absorb_append(&doc, s2.size)
 			got := doc_debug_string(&doc)
 			want := fmt.tprintf("%s%s", saved, "tail\n")
@@ -333,6 +341,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				fmt.printfln("  want %q", want[:min(len(want), 32)])
 				bad += 1
 			}
+			rev1_ok := doc.revision > rev1
+			fmt.printfln("  revision bumped: %d -> %d  %s", rev1, doc.revision, "OK" if rev1_ok else "FAIL")
+			if !rev1_ok {bad += 1}
 		}
 
 		// Shrinking is not an append: it must be refused so the caller reloads.
@@ -344,21 +355,31 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		plat.file_write_atomic(path, transmute([]u8)string("completely different\ncontent here\n"))
 		doc.cursor = 5
 		doc.anchor = 5
+		rev2 := doc.revision
 		rok := doc_reload(&doc)
 		after := doc_debug_string(&doc)
 		reload_ok := rok && doc.cursor == 5 && !doc.disk_changed
 		fmt.printfln("reload=%v caret=%d stamp refreshed=%v  %s", rok, doc.cursor, doc.disk_stamp.ok, "OK" if reload_ok else "FAIL")
 		if !reload_ok {bad += 1}
 		fmt.printfln("  content: %q", after[:min(len(after), 24)])
+		// doc_reload replaces the whole Document; the old revision must carry
+		// forward and bump, not reset to the fresh struct's zero value.
+		rev2_ok := doc.revision > rev2
+		fmt.printfln("  revision bumped: %d -> %d  %s", rev2, doc.revision, "OK" if rev2_ok else "FAIL")
+		if !rev2_ok {bad += 1}
 
 		// A caret past the new end must clamp, not index out of bounds.
 		plat.file_write_atomic(path, transmute([]u8)string("tiny\n"))
 		doc.cursor = 999
 		doc.anchor = 999
+		rev3 := doc.revision
 		doc_reload(&doc)
 		clamped := doc.cursor <= doc.pt.length
 		fmt.printfln("caret clamped after shrink: %d <= %d  %s", doc.cursor, doc.pt.length, "OK" if clamped else "FAIL")
 		if !clamped {bad += 1}
+		rev3_ok := doc.revision > rev3
+		fmt.printfln("  revision bumped: %d -> %d  %s", rev3, doc.revision, "OK" if rev3_ok else "FAIL")
+		if !rev3_ok {bad += 1}
 
 		// Encodings whose bytes do not map 1:1 to document bytes must never take
 		// the append fast path: a BOM shifts every offset, UTF-16 is transcoded.
@@ -2086,7 +2107,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		short_wrapped := false
 		it := visible_begin(&doc, &t, rows)
 		for {
-			_, start, _, _, wrapped, ok := visible_next(&it)
+			_, start, _, _, _, wrapped, ok := visible_next(&it)
 			if !ok {break}
 			if wrapped {wrapped_rows += 1}
 			if wrapped && start < 6 {short_wrapped = true} // the "short" line region
@@ -2121,7 +2142,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		hd.view_rows = 5
 		hd.top = base.pt_line_end_cap(&hd.pt, 0, RENDER_LINE_CAP) // a mid-line segment
 		it2 := visible_begin(&hd, &t, 5)
-		if _, _, _, _, w0, ok2 := visible_next(&it2); ok2 && w0 {
+		if _, _, _, _, _, w0, ok2 := visible_next(&it2); ok2 && w0 {
 			fmt.println("  FAIL: a >256KB line wrapped (should stay a capped no-wrap row)")
 			bad += 1
 		}
@@ -2495,6 +2516,767 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad rowtest` dumps the visible rows for buffers with and without a
+	// trailing newline, and where the caret lands in each. A buffer whose last
+	// line runs to EOF has no successor row; emitting one puts the caret on it.
+	if os.args[1] == "rowtest" {
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("rowtest: no fonts loaded")
+			return true
+		}
+		fail := false
+		one :: proc(content: string, caret: int, want_rows: int, want_caret_row: int, t: ^plat.Text, fail: ^bool) {
+			doc: Document
+			doc.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&doc.pt)
+			doc.cursor, doc.anchor = caret, caret
+			doc.view_cols = 40
+			rows := 0
+			caret_row := -1
+			it := visible_begin(&doc, t, 10)
+			for {
+				row, start, _, vis_end, line_end, _, ok := visible_next(&it)
+				if !ok {break}
+				rows += 1
+				if doc.cursor >= start && doc.cursor <= vis_end && (line_end || doc.cursor < vis_end) {
+					caret_row = row // last match wins, exactly as doc_draw does
+				}
+			}
+			ok := rows == want_rows && caret_row == want_caret_row
+			if !ok {fail^ = true}
+			fmt.printfln(
+				"  %-6s %q caret=%d -> rows=%d (want %d) caret_row=%d (want %d)",
+				"ok" if ok else "FAIL",
+				content,
+				caret,
+				rows,
+				want_rows,
+				caret_row,
+				want_caret_row,
+			)
+		}
+		fmt.println("rowtest:")
+		one("", 0, 1, 0, &t, &fail) // empty scratch: one row, caret on it
+		one("a", 1, 1, 0, &t, &fail) // THE BUG: caret must stay on row 0
+		one("ab", 2, 1, 0, &t, &fail)
+		one("a\n", 2, 2, 1, &t, &fail) // trailing newline: the empty last row is real
+		one("a\nb", 3, 2, 1, &t, &fail)
+		one("a\nb\n", 4, 3, 2, &t, &fail)
+
+		// The wrap-aware sibling of next_row_start_capped is next_visual_row (via
+		// eff_next_row), and it had the identical ambiguity: wrap_row_end returns
+		// (L, true) both for a real trailing newline and for running to EOF with
+		// none, and eff_next_row's old `ok := nv > p` reported a successor row that
+		// doesn't exist in the EOF case. visible_next's own wrap-stop logic (below,
+		// at the `it.cur_wrap` branch) already gets this right and never calls
+		// eff_next_row, so it can't exercise the bug -- unlike doc_cursor_down,
+		// doc_scroll and doc_ensure_cursor_visible, which do. Check eff_next_row
+		// directly. doc.wrap is forced on because force-wrap alone needs
+		// WRAP_LONG_CELLS (1024) cells, far more than this line has.
+		{
+			long := "the quick brown fox jumps over the lazy dog and keeps going well past one row"
+			ldoc: Document
+			ldoc.pt = base.pt_init(transmute([]u8)long)
+			defer base.pt_destroy(&ldoc.pt)
+			ldoc.wrap = true
+			ldoc.view_cols = 40
+			// Row 0 is "the quick brown fox jumps over the lazy " (40 cells, break
+			// after the last space that fits): a genuine mid-line wrap point, so a
+			// real successor row follows at 40.
+			s1, ok1 := eff_next_row(&ldoc, &t, 0, ldoc.view_cols)
+			c1 := ok1 && s1 == 40
+			if !c1 {fail = true}
+			fmt.printfln(
+				"  %-6s eff_next_row wrap mid-line -> start=%d ok=%v (want start=40 ok=true)",
+				"ok" if c1 else "FAIL",
+				s1,
+				ok1,
+			)
+			// Row 1, "dog and keeps going well past one row" (37 cells), runs to EOF
+			// with no newline: THE BUG. eff_next_row must report no successor.
+			s2, ok2 := eff_next_row(&ldoc, &t, 40, ldoc.view_cols)
+			c2 := !ok2
+			if !c2 {fail = true}
+			fmt.printfln(
+				"  %-6s eff_next_row wrap at EOF -> start=%d ok=%v (want ok=false)",
+				"ok" if c2 else "FAIL",
+				s2,
+				ok2,
+			)
+			// The symmetric wrong fix: folding "ends at EOF" and "ends at a real
+			// newline" together (testing e.g. `e >= doc.pt.length` unconditionally)
+			// would discard the legitimate empty final row on a wrapped line that
+			// DOES end with a newline. Same line, with "\n" appended.
+			longnl := strings.concatenate({long, "\n"}, context.temp_allocator)
+			nldoc: Document
+			nldoc.pt = base.pt_init(transmute([]u8)longnl)
+			defer base.pt_destroy(&nldoc.pt)
+			nldoc.wrap = true
+			nldoc.view_cols = 40
+			s3, ok3 := eff_next_row(&nldoc, &t, 40, nldoc.view_cols)
+			c3 := ok3 && s3 == len(longnl)
+			if !c3 {fail = true}
+			fmt.printfln(
+				"  %-6s eff_next_row wrap at real newline -> start=%d ok=%v (want start=%d ok=true)",
+				"ok" if c3 else "FAIL",
+				s3,
+				ok3,
+				len(longnl),
+			)
+		}
+		fmt.println("rowtest: FAILURES" if fail else "rowtest: all ok")
+		return true
+	}
+
+	// `newtpad mdtabletest` checks the two properties the old renderer lacked:
+	// every row's cells land on the same x positions, and those positions do not
+	// depend on where the viewport entered the block.
+	if os.args[1] == "mdtabletest" {
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("mdtabletest: no fonts loaded")
+			return true
+		}
+		fail := false
+		sb: strings.Builder
+		strings.builder_init(&sb, context.temp_allocator)
+		strings.write_string(&sb, "| id | name | notes |\n|:---|:----:|------:|\n")
+		for i in 0 ..< 200 {
+			fmt.sbprintf(&sb, "| %d | row %d | a much longer note cell %d |\n", i, i, i)
+		}
+		content := strings.to_string(sb)
+		doc: Document
+		doc.pt = base.pt_init(transmute([]u8)content)
+		defer base.pt_destroy(&doc.pt)
+		doc.md_mode = .Preview
+		fmt.println("mdtabletest:")
+		// Longest single row in the fixture. #assert(MD_TABLE_BUDGET >
+		// RENDER_LINE_CAP) only guards the PRODUCTION constant; every block below
+		// that temporarily lowers the runtime md_table_budget asserts against this
+		// instead, since that's the precondition the forward guard's comment
+		// actually needs (see md_table_bounds) and the constant-level #assert says
+		// nothing about a value the test itself chose.
+		max_row_len := 0
+		for line in strings.split(content, "\n", context.temp_allocator) {
+			if len(line) > max_row_len {max_row_len = len(line)}
+		}
+
+		// Enter the block from three different offsets; the measure must agree.
+		offs := [3]int{0, 0, 0}
+		offs[1] = base.pt_line_start(&doc.pt, doc.pt.length / 2)
+		offs[2] = base.pt_line_start(&doc.pt, doc.pt.length - 40)
+		first: Md_Table_Cache
+		for off, k in offs {
+			// Force a cold measurement at each offset -- otherwise the first entry
+			// (offset 0, which is trivially its own true block start) would cache the
+			// whole block, and later offsets would just hit that cache without ever
+			// re-deriving the bounds, silently passing even with a broken backward
+			// scan. Entering "from a different offset" has to mean a fresh measure.
+			doc.md_table = {}
+			c := md_table_ensure(&doc, &t, off)
+			if c == nil {
+				fail = true
+				fmt.printfln("  FAIL  no table measured at offset %d", off)
+				continue
+			}
+			if k == 0 {
+				first = c^
+				fmt.printfln("  ok    measured %d cols, block [%d,%d)", c.ncols, c.start, c.end)
+				// Cache-hit check: same offset, cache NOT cleared this time, so a
+				// second lookup must return the SAME slot rather than scanning again
+				// into a fresh round-robin slot. Pointer identity is the only
+				// observable a stale-but-correct rescan can't accidentally satisfy --
+				// the values would match either way, but the address would not.
+				hitc := md_table_ensure(&doc, &t, off)
+				hitok := hitc == c
+				if !hitok {fail = true}
+				fmt.printfln("  %-6s repeat lookup at same offset hits the cache", "ok" if hitok else "FAIL")
+				continue
+			}
+			same := c.ncols == first.ncols && c.start == first.start && c.end == first.end
+			if same {
+				for i in 0 ..< c.ncols {
+					if c.widths[i] != first.widths[i] || c.align[i] != first.align[i] {same = false}
+				}
+			}
+			if !same {fail = true}
+			fmt.printfln("  %-6s entering at %d matches the measure from 0", "ok" if same else "FAIL", off)
+		}
+		// Alignment comes from the separator row: left, centre, right.
+		if first.ncols == 3 {
+			a := first.align[0] == .Left && first.align[1] == .Center && first.align[2] == .Right
+			if !a {fail = true}
+			fmt.printfln("  %-6s separator alignments parsed", "ok" if a else "FAIL")
+		}
+		// The measure's primary output: the derived column widths, not just that
+		// three entry offsets agree with each other (which passes even with an
+		// all-zero widths array -- deleting the width-measuring loop kept the
+		// cross-offset check green until this assertion was added).
+		//   col 0: "id"=2 vs "0".."199"                  -> 3
+		//   col 1: "name"=4 vs "row 0".."row 199"         -> 7
+		//   col 2: "notes"=5 vs "a much longer note cell 199" (27 chars) -> 27
+		// The separator row is excluded from width measurement, so its dashes must
+		// not appear in these numbers.
+		want_widths := [3]int{3, 7, 27}
+		wok := first.ncols == 3
+		if wok {
+			for i in 0 ..< 3 {
+				if first.widths[i] != want_widths[i] {wok = false}
+			}
+		}
+		if !wok {fail = true}
+		fmt.printfln("  %-6s derived widths %v (want %v)", "ok" if wok else "FAIL", first.widths[:first.ncols], want_widths)
+
+		// The oversized fallback: fixed columns, which depend on nothing outside
+		// the row being drawn, so they are shift-free too. This calls
+		// md_table_measure directly with oversize=true, which bypasses
+		// md_table_bounds entirely -- exactly why the inverted budget guards were
+		// invisible to this suite. The block below drives the real path.
+		//
+		// ncols is MD_TABLE_MAX_COLS, not the block's actual 3 -- the oversized
+		// path does NO SCAN AT ALL (that's the fix: Critical 2 made the fallback
+		// O(1) by never reading the block to count columns), and the draw clips
+		// at x1, so a generous column count costs nothing.
+		ov := md_table_measure(&doc, &t, 0, doc.pt.length, true)
+		ovok := ov.ncols == MD_TABLE_MAX_COLS
+		for i in 0 ..< ov.ncols {
+			if ov.widths[i] != MD_TABLE_FIXED_CELLS {ovok = false}
+		}
+		if !ovok {fail = true}
+		fmt.printfln("  %-6s oversized block uses fixed columns (%d)", "ok" if ovok else "FAIL", ov.widths[0])
+
+		// Drive md_table_bounds itself into the oversize path, entering mid-block
+		// so both the backward and forward scans run. A real >1MB fixture would
+		// prove the same thing but costs tens of thousands of rows to build and
+		// print; md_table_budget is a runtime variable for exactly this reason --
+		// lowering it exercises the identical guard code on a fixture two orders
+		// of magnitude smaller.
+		{
+			saved := md_table_budget
+			md_table_budget = 200 // well under this ~8KB fixture, well over one row
+			assert(md_table_budget > max_row_len, "md_table_budget must clear the fixture's longest row or the forward guard's own-length precondition doesn't hold")
+			doc.md_table = {}
+			mid := base.pt_line_start(&doc.pt, doc.pt.length / 2)
+			entry_end := base.pt_line_end_cap(&doc.pt, mid, RENDER_LINE_CAP)
+			c := md_table_ensure(&doc, &t, mid)
+			md_table_budget = saved
+			if c == nil {
+				fail = true
+				fmt.println("  FAIL  no table measured entering mid-block for the oversize drive")
+			} else {
+				// Critical 1: the backward scan must actually stop short of byte 0.
+				// The dead `start - q` guard let it walk all the way back (this file
+				// is one contiguous table, so the true start IS 0), so start > 0 here
+				// is the fixed backward guard actually firing.
+				back_ok := c.start > 0
+				// Critical 2: the forward scan must extend past the entry row's own
+				// end. The `r - start` guard tripped on its first check once the
+				// backward walk had moved `start`, leaving end pinned at entry_end.
+				fwd_ok := c.end > entry_end
+				window_ok := c.end - c.start < len(content) / 2
+				ok := c.oversize && back_ok && fwd_ok && window_ok
+				if !ok {fail = true}
+				fmt.printfln(
+					"  %-6s bounds() trips oversize with a bounded window: oversize=%v start=%d(>0) end=%d(>%d) window=%d",
+					"ok" if ok else "FAIL",
+					c.oversize,
+					c.start,
+					c.end,
+					entry_end,
+					c.end - c.start,
+				)
+			}
+		}
+
+		// Task 7 / Important 1 regression: `oversize` (and the widths that ride on
+		// it, since the oversize branch fixes every column at MD_TABLE_FIXED_CELLS)
+		// must not depend on which offset entered the block. Lower the budget so
+		// this ~9.3 KB fixture lands in (K, 2K] -- too big to ever be "small enough"
+		// but too small to always trip both directions regardless of entry. That
+		// band is exactly where the old per-guard `oversize` flipped with the entry
+		// point: near-top entries tripped only the backward guard, near-bottom only
+		// the forward one, mid-block entries could trip neither.
+		{
+			saved := md_table_budget
+			md_table_budget = 6000 // K; fixture is ~9.3 KB, so K < B <= 2K
+			assert(md_table_budget > max_row_len, "md_table_budget must clear the fixture's longest row or the forward guard's own-length precondition doesn't hold")
+			doc.md_table = {}
+			c0 := md_table_ensure(&doc, &t, offs[0])
+			// c0 points INTO doc.md_table -- copy it out (nil-checked) before the
+			// next reset zeroes the slot it points to, or c0v below would read
+			// back the zeroed slot instead of offset 0's actual measurement.
+			c0_nil := c0 == nil
+			c0v: Md_Table_Cache
+			if !c0_nil {c0v = c0^}
+			doc.md_table = {}
+			c1 := md_table_ensure(&doc, &t, offs[1])
+			md_table_budget = saved
+			// Every other block in this mode nil-checks its md_table_ensure result
+			// before dereferencing; this one didn't. Can't fire on this fixture (both
+			// offsets are always table rows), but a future fixture edit would turn a
+			// FAIL into a crash instead of a FAIL, so check like every neighbour does.
+			if c0_nil || c1 == nil {
+				fail = true
+				fmt.println("  FAIL  entry-independent oversize: no table measured")
+			} else {
+				c1v := c1^
+				// K < B <= 2K (asserted above) must yield oversize=true by the
+				// three-case algebra in the batch-1 report -- so require it explicitly,
+				// not just that the two entries AGREE. Without `&& c0v.oversize`, an
+				// implementation that never sets oversize at all (a "never oversize"
+				// bug) would pass this check vacuously: both sides false, `==` true,
+				// ncols/widths equal because both took the non-oversize measure path.
+				same := c0v.oversize == c1v.oversize && c0v.oversize && c0v.ncols == c1v.ncols
+				if same {
+					for i in 0 ..< c0v.ncols {
+						if c0v.widths[i] != c1v.widths[i] {same = false}
+					}
+				}
+				if !same {fail = true}
+				fmt.printfln(
+					"  %-6s entry-independent oversize: off=0 oversize=%v ncols=%d widths=%v | off=%d oversize=%v ncols=%d widths=%v",
+					"ok" if same else "FAIL",
+					c0v.oversize,
+					c0v.ncols,
+					c0v.widths[:c0v.ncols],
+					offs[1],
+					c1v.oversize,
+					c1v.ncols,
+					c1v.widths[:c1v.ncols],
+				)
+			}
+		}
+
+		// Task 7 / Important 2 regression: the byte budget alone does not bound the
+		// SCAN work on short rows. Lower the row cap far below this fixture's 200
+		// data rows (the byte budget stays at its 1 MB default, well clear of the
+		// ~9.3 KB fixture) and enter at the very first row, so the backward
+		// direction is free (0 rows to walk) and the forward direction is the one
+		// that must give up after md_table_max_rows rows rather than reading all of
+		// them.
+		{
+			saved := md_table_max_rows
+			md_table_max_rows = 50
+			doc.md_table = {}
+			c := md_table_ensure(&doc, &t, offs[0])
+			md_table_max_rows = saved
+			ok := c != nil && c.oversize && (c.end - c.start) < len(content) / 2
+			if !ok {fail = true}
+			if c != nil {
+				fmt.printfln(
+					"  %-6s row cap trips: oversize=%v window=%d bytes (fixture=%d, cap=50 rows)",
+					"ok" if ok else "FAIL",
+					c.oversize,
+					c.end - c.start,
+					len(content),
+				)
+			} else {
+				fail = true
+				fmt.println("  FAIL  row cap trip: no table measured")
+			}
+		}
+
+		// The row cap has the identical entry-dependence trap as Important 1, one
+		// level down: capping each direction's row COUNT independently reproduces
+		// the same flip unless the total is also checked once both scans complete
+		// without tripping (see the `total_rows` comment in md_table_bounds). This
+		// fixture has 202 physical block rows (header + separator + 200 data
+		// rows); with the row cap between R/2 and R, entering at the very first row
+		// trips the forward direction's own count on its own, but entering
+		// mid-block lets BOTH directions finish under the cap individually --
+		// exactly the case the `total_rows` check exists for.
+		{
+			saved := md_table_max_rows
+			md_table_max_rows = 120
+			doc.md_table = {}
+			edge := md_table_ensure(&doc, &t, offs[0])
+			edge_ov := edge != nil && edge.oversize
+			doc.md_table = {}
+			mid := md_table_ensure(&doc, &t, offs[1])
+			mid_ov := mid != nil && mid.oversize
+			md_table_max_rows = saved
+			ok := edge_ov && mid_ov
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s row-count entry-independence: off=0 oversize=%v | off=%d oversize=%v (cap=120 rows, block=202 rows)",
+				"ok" if ok else "FAIL",
+				edge_ov,
+				offs[1],
+				mid_ov,
+			)
+		}
+
+		// Review follow-up: md_table_bounds assumed `p` is a line start, but
+		// markdown_draw's own capped-segment walk (`p = end + 1`, where `end` came
+		// from pt_line_end_cap) hands it a mid-line offset for any physical line
+		// longer than RENDER_LINE_CAP -- the second and later drawn segments of
+		// such a line, and doc.top itself if the viewport happens to be scrolled
+		// there. Fixture: one physical line just over one RENDER_LINE_CAP (8192)
+		// long -- 8192 bytes of filler containing NO pipe, then a short
+		// pipe-delimited tail. The filler-only first segment does not look like a
+		// table row on its own, so p=0 is never a table entry here at all; the
+		// ONLY offset that ever reaches md_table_bounds for this fixture is the
+		// tail's own segment offset (RENDER_LINE_CAP+1 = 8193), exactly what
+		// markdown_draw produces after drawing the filler segment above it -- and
+		// it is not a real line start.
+		//
+		// A literal "entered at byte 0, compare to entered mid-line" check isn't
+		// constructible for THIS bug: a pipe-free first segment is required so the
+		// OLD backward loop's `if !md_is_table_row(pl) {break}` skips its own
+		// `pl_capped` check before it can fire (that's precisely what let this hide
+		// -- see the task-7 report's hand-derivation), but that same pipe-free
+		// segment also means p=0 never passes md_is_table_row and so is never a
+		// comparable md_table_bounds entry in the first place. So this checks the
+		// mid-line entry against the one thing every other entry into a
+		// >RENDER_LINE_CAP row in this suite already agrees on: the fixed oversize
+		// signature (ncols=MD_TABLE_MAX_COLS, every width=MD_TABLE_FIXED_CELLS).
+		{
+			filler, _ := strings.repeat("x", RENDER_LINE_CAP, context.temp_allocator)
+			sb2: strings.Builder
+			strings.builder_init(&sb2, context.temp_allocator)
+			strings.write_string(&sb2, filler)
+			strings.write_string(&sb2, "| a | b | c |")
+			strings.write_byte(&sb2, '\n')
+			ml_content := strings.to_string(sb2)
+			ml_doc: Document
+			ml_doc.pt = base.pt_init(transmute([]u8)ml_content)
+			defer base.pt_destroy(&ml_doc.pt)
+			ml_doc.md_mode = .Preview
+
+			mid_p := RENDER_LINE_CAP + 1 // 8193 -- exactly markdown_draw's p = end + 1
+			c := md_table_ensure(&ml_doc, &t, mid_p)
+			mok := c != nil && c.oversize && c.ncols == MD_TABLE_MAX_COLS
+			if mok {
+				for i in 0 ..< c.ncols {
+					if c.widths[i] != MD_TABLE_FIXED_CELLS {mok = false}
+				}
+			}
+			if !mok {fail = true}
+			if c != nil {
+				fmt.printfln(
+					"  %-6s mid-line entry (p=%d) into a >RENDER_LINE_CAP row forces oversize: oversize=%v start=%d",
+					"ok" if mok else "FAIL",
+					mid_p,
+					c.oversize,
+					c.start,
+				)
+			} else {
+				fmt.println("  FAIL  mid-line entry: no table measured")
+			}
+		}
+
+		// Empty leading cells survive the split: "||b|" strips one leading and one
+		// trailing pipe to "|b", which splits to ["", "b"] -- the old
+		// strings.trim(line, "| ") would have trimmed the whole prefix and lost the
+		// empty cell, collapsing this to just ["b"].
+		cells := md_split_cells("||b|", context.temp_allocator)
+		eok := len(cells) == 2 && cells[0] == "" && cells[1] == "b"
+		if !eok {fail = true}
+		fmt.printfln("  %-6s empty leading cells kept (%d cells)", "ok" if eok else "FAIL", len(cells))
+		fmt.println("mdtabletest: FAILURES" if fail else "mdtabletest: all ok")
+		return true
+	}
+
+	// `newtpad revtest` drives every mutator and requires Document.revision to
+	// advance for each. A path that bypassed it would leave caches (markdown
+	// table column widths) stale on screen with no other symptom.
+	if os.args[1] == "revtest" {
+		fail := false
+		doc: Document
+		doc.pt = base.pt_init(transmute([]u8)string("alpha beta\ngamma delta\n"))
+		defer base.pt_destroy(&doc.pt)
+		doc.enc = .UTF8
+		last := doc.revision
+		step :: proc(doc: ^Document, last: ^u64, label: string, fail: ^bool) {
+			ok := doc.revision > last^
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %-22s revision %d -> %d", "ok" if ok else "FAIL", label, last^, doc.revision)
+			last^ = doc.revision
+		}
+		fmt.println("revtest:")
+		doc.cursor, doc.anchor = 0, 0
+		doc_insert_rune(&doc, 'X');step(&doc, &last, "insert rune", &fail)
+		doc_backspace(&doc);step(&doc, &last, "backspace", &fail)
+		doc.cursor = 5
+		doc_delete_word_back(&doc);step(&doc, &last, "delete word back", &fail)
+		doc.anchor, doc.cursor = 0, 3
+		doc_replace_sel(&doc, transmute([]u8)string("Q"));step(&doc, &last, "replace selection", &fail)
+		doc_set_line_ending(&doc, .CRLF);step(&doc, &last, "set line ending", &fail)
+		doc_undo(&doc);step(&doc, &last, "undo", &fail)
+		doc_redo(&doc);step(&doc, &last, "redo", &fail)
+		// The batch path, which Replace All uses: push_undo returns early while
+		// doc.batch is set, so the bump must come before that return. Otherwise a
+		// 200-match replace advances revision once and a cache misses 199 edits.
+		doc_batch_begin(&doc, .Replace)
+		before := doc.revision
+		doc.anchor, doc.cursor = 0, 1
+		doc_replace_sel(&doc, transmute([]u8)string("z"))
+		doc.anchor, doc.cursor = 2, 3
+		doc_replace_sel(&doc, transmute([]u8)string("z"))
+		doc_batch_end(&doc, 2)
+		bok := doc.revision >= before + 2
+		if !bok {fail = true}
+		fmt.printfln("  %-6s %-22s revision %d -> %d", "ok" if bok else "FAIL", "two edits in a batch", before, doc.revision)
+		fmt.println("revtest: FAILURES" if fail else "revtest: all ok")
+		return true
+	}
+
+	// `newtpad crlftest` checks every consumer of a row agrees where it ends.
+	// Comparing against a constant would pass with the bug present, because the
+	// text draw already stripped the CR; the point is that the caret, the
+	// hit-test, the selection and the wrap budget did not.
+	if os.args[1] == "crlftest" {
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("crlftest: no fonts loaded")
+			return true
+		}
+		fail := false
+		chk :: proc(label: string, got, want: int, fail: ^bool) {
+			ok := got == want
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %-34s got=%d want=%d", "ok" if ok else "FAIL", label, got, want)
+		}
+		chks :: proc(label: string, got, want: string, fail: ^bool) {
+			ok := got == want
+			if !ok {fail^ = true}
+			fmt.printfln("  %-6s %-34s got=%q want=%q", "ok" if ok else "FAIL", label, got, want)
+		}
+		// Mirrors doc_draw's row-claim predicate exactly (doc.odin, the `caret =
+		// true` line in doc_draw) without needing a real GPU device to draw
+		// through -- same shape as rowtest's caret_row check just below it. False
+		// is what doc_draw returns when no visible row claims the caret, which is
+		// how it silently vanishes from the screen.
+		caret_claimed :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> bool {
+			it := visible_begin(doc, t, rows)
+			for {
+				_, start, _, vis_end, line_end, _, ok := visible_next(&it)
+				if !ok {break}
+				if doc.cursor >= start && doc.cursor <= vis_end && (line_end || doc.cursor < vis_end) {
+					return true
+				}
+			}
+			return false
+		}
+		content := "hello\r\nworld\r\n"
+		doc: Document
+		doc.pt = base.pt_init(transmute([]u8)content)
+		defer base.pt_destroy(&doc.pt)
+		doc.eol = .CRLF
+		doc.view_cols = 40
+		px := f32(16) // document text size; render_frame computes this from zoom/DPI
+		cw := plat.text_char_width(&t, px, .Doc)
+		fmt.println("crlftest:")
+
+		// Row 0 is "hello": vis_end must be the offset of the CR, not of the LF.
+		it := visible_begin(&doc, &t, 5)
+		_, start, end, vis_end, _, _, _ := visible_next(&it)
+		chk("row 0 start", start, 0, &fail)
+		chk("row 0 end (structural, at LF)", end, 6, &fail)
+		chk("row 0 vis_end (before CR)", vis_end, 5, &fail)
+
+		// End key must land on the content end, not between CR and LF.
+		doc.cursor, doc.anchor = 0, 0
+		doc_cursor_end(&doc, false)
+		chk("End key lands at", doc.cursor, 5, &fail)
+		chk("caret drawn after End", 1 if caret_claimed(&doc, &t, 5) else 0, 1, &fail)
+
+		// Each check below resets the cursor explicitly rather than relying on the
+		// previous check's result. crlftest is otherwise state-sequential — a
+		// failure earlier in the chain would shift the input to everything after
+		// it, turning one direct failure into several attributed to the wrong
+		// mechanism.
+		doc.cursor, doc.anchor = 5, 5
+		// Status column at end of line: "hello" is 5 cells, so Col is 6, not 7.
+		chk("Col at end of line", doc_cursor_col(&doc, &t), 6, &fail)
+
+		doc.cursor, doc.anchor = 5, 5
+		// Right-arrow from the content end crosses the whole CRLF in one step.
+		doc_cursor_right(&doc, false)
+		chk("Right from EOL skips CRLF", doc.cursor, 7, &fail)
+		chk("caret drawn after Right across CRLF", 1 if caret_claimed(&doc, &t, 5) else 0, 1, &fail)
+
+		doc.cursor, doc.anchor = 7, 7
+		// Left-arrow back over the break returns to the content end, not the CR.
+		doc_cursor_left(&doc, false)
+		chk("Left over CRLF returns to", doc.cursor, 5, &fail)
+		chk("caret drawn after Left across CRLF", 1 if caret_claimed(&doc, &t, 5) else 0, 1, &fail)
+
+		// A click far to the right of the text clamps to the content end.
+		chk("click past EOL clamps to", doc_pos_at(&doc, &t, i32(cw * 30), 0, px, cw, 5), 5, &fail)
+
+		// Double-click past EOL selects the word at the clamped position -- the
+		// CR. It must not select the CR itself (invisible, and typing over it
+		// would silently turn the line's CRLF into a bare LF); it must leave the
+		// caret exactly at the content end, where row 0 can claim it (Important 1).
+		doc.cursor, doc.anchor = 0, 0
+		doc_select_word_at(&doc, 5)
+		chk("dblclick past EOL anchor", doc.anchor, 5, &fail)
+		chk("dblclick past EOL cursor", doc.cursor, 5, &fail)
+		chk("caret drawn after dblclick past EOL", 1 if caret_claimed(&doc, &t, 5) else 0, 1, &fail)
+
+		// Selecting the whole first line stops at the content end.
+		doc.anchor, doc.cursor = 0, 5
+		nq := doc_selection_rects(&doc, &t, px, cw, 5, make([]plat.Quad, 8, context.temp_allocator))
+		chk("selection rects for line 0", nq, 1, &fail)
+
+		// The wrap budget must not spend a cell on the CR: it costs zero cells by
+		// construction (plat.is_zero_width) now, not by font-metric accident --
+		// wrap_row_end no longer special-cases CR at all (Important 2). The old
+		// "wrap_row_end at 5 cells"/"line_end" pair here could pass with the
+		// dedicated CR-skip block deleted and no zero-width guarantee in its
+		// place, because the font happened to also measure CR as ~0 -- this is
+		// the assertion that actually pins the guarantee down.
+		chk("CR cell width (zero by construction)", plat.text_cell_width(&t, '\r', .Doc), 0, &fail)
+
+		// CRLF x wrap: nothing above exercises eff_row_end's wrapped branch or
+		// visible_next's wrapped vis_end, since none of wraptest/wraplongtest use
+		// CRLF content. A CR landing exactly at the wrap column must not be pulled
+		// into row 0 as content, and the row that actually reaches the CRLF break
+		// must still report it as a break, not as two ordinary bytes.
+		{
+			wdoc: Document
+			wdoc.pt = base.pt_init(transmute([]u8)string("hello\r\n"))
+			defer base.pt_destroy(&wdoc.pt)
+			wdoc.eol = .CRLF
+			wdoc.wrap = true
+			wdoc.view_cols = 4
+			wit := visible_begin(&wdoc, &t, 2)
+			_, _, e0, ve0, le0, _, _ := visible_next(&wit)
+			chk("wrap row 0 end (mid-line wrap)", e0, 4, &fail)
+			chk("wrap row 0 vis_end (no CR here)", ve0, 4, &fail)
+			chk("wrap row 0 line_end", 1 if le0 else 0, 0, &fail)
+			_, s1, e1, ve1, le1, _, _ := visible_next(&wit)
+			chk("wrap row 1 start", s1, 4, &fail)
+			chk("wrap row 1 end at real newline", e1, 6, &fail)
+			chk("wrap row 1 line_end", 1 if le1 else 0, 1, &fail)
+			chk("wrap row 1 vis_end (before CR)", ve1, 5, &fail)
+		}
+
+		// An empty CRLF line ("\r\n\r\n"): two adjacent breaks with genuinely empty
+		// content between them. A CR check that doesn't require the following LF
+		// would treat the second break's CR as one byte of content, off by one on
+		// both the caret and a click.
+		{
+			edoc: Document
+			edoc.pt = base.pt_init(transmute([]u8)string("\r\n\r\n"))
+			defer base.pt_destroy(&edoc.pt)
+			edoc.eol = .CRLF
+			edoc.view_cols = 40
+			edoc.cursor, edoc.anchor = 0, 0
+			doc_cursor_end(&edoc, false)
+			chk("End on empty CRLF line lands at", edoc.cursor, 0, &fail)
+			chk("click on empty CRLF line clamps to", doc_pos_at(&edoc, &t, i32(cw * 10), 0, px, cw, 5), 0, &fail)
+		}
+
+		// One Delete at the content end must consume the whole CRLF break, not
+		// the CR alone -- otherwise the buffer still renders two lines (the
+		// keystroke looks dead) and the stray LF corrupts an otherwise-CRLF file
+		// on save (Critical 1). Assert the buffer bytes, not just the cursor.
+		{
+			ddoc: Document
+			ddoc.pt = base.pt_init(transmute([]u8)string("hello\r\nworld"))
+			defer base.pt_destroy(&ddoc.pt)
+			ddoc.eol = .CRLF
+			ddoc.cursor, ddoc.anchor = 5, 5 // the CR, i.e. vis_end
+			doc_delete_fwd(&ddoc)
+			chks("Delete at break ->", string(base.pt_collect(&ddoc.pt, context.temp_allocator)), "helloworld", &fail)
+			chk("Delete at break cursor stays", ddoc.cursor, 5, &fail)
+		}
+
+		// The mirror: one Backspace at a line start must remove the whole break,
+		// not the LF alone leaving a bare CR. Pre-existing bug, but it now sits
+		// inconsistently beside the CRLF-atomic Left arrow.
+		{
+			bdoc: Document
+			bdoc.pt = base.pt_init(transmute([]u8)string("hello\r\nworld"))
+			defer base.pt_destroy(&bdoc.pt)
+			bdoc.eol = .CRLF
+			bdoc.cursor, bdoc.anchor = 7, 7 // start of "world"
+			doc_backspace(&bdoc)
+			chks("Backspace at break ->", string(base.pt_collect(&bdoc.pt, context.temp_allocator)), "helloworld", &fail)
+			chk("Backspace at break cursor lands at", bdoc.cursor, 5, &fail)
+		}
+
+		fmt.println("crlftest: FAILURES" if fail else "crlftest: all ok")
+		return true
+	}
+
+	// `newtpad stickytest` checks the find bar's sticky match figures during an
+	// async replace. Below SEARCH_SYNC_MAX the search runs inline and every result
+	// publishes before find_recompute even returns, so a fixture that size proves
+	// nothing -- the flicker this guards against only exists on the worker-thread
+	// path. The fixture is built here in memory (mirrors wraptest) rather than
+	// read from a file, so this is reachable by anyone who checks out the branch,
+	// not just whoever had a scratch file lying around when the bug was found.
+	if os.args[1] == "stickytest" {
+		fail := false
+
+		// Every NEEDLE sits in the first 72 bytes, comfortably inside the worker's
+		// first SEARCH_BLOCK (256 KiB) read. That guarantees the whole result set
+		// publishes in one find_merge call -- the same shape the synchronous path
+		// always has -- so a corrupted sticky value can never be quietly
+		// self-corrected by a second partial merge landing after the jump has
+		// already run once. The filler after it never contains "NEEDLE", so the
+		// match count stays exactly NEEDLES while the buffer is pushed well past
+		// SEARCH_SYNC_MAX, which is what puts the search on the worker thread at
+		// all.
+		NEEDLES :: 8
+		sb := strings.builder_make(context.temp_allocator)
+		for i in 0 ..< NEEDLES {fmt.sbprintf(&sb, "NEEDLE %d\n", i)}
+		FILLER_LINES :: 7000 // ~7000 * 45 bytes =~ 315 KB, well past the 256 KiB threshold
+		for i in 0 ..< FILLER_LINES {strings.write_string(&sb, "the quick brown fox jumps over the lazy dog\n")}
+		content := strings.to_string(sb)
+
+		doc: Document
+		doc.pt = base.pt_init(transmute([]u8)content)
+		defer doc_close(&doc) // frees search results + find.query/replace, then doc.pt
+
+		over := doc.pt.length > SEARCH_SYNC_MAX
+		if !over {fail = true}
+		fmt.printfln(
+			"  %-6s fixture size=%d bytes (SEARCH_SYNC_MAX=%d), needles=%d",
+			"ok" if over else "FAIL",
+			doc.pt.length,
+			SEARCH_SYNC_MAX,
+			NEEDLES,
+		)
+
+		find_open(&doc, true)
+		for r in "NEEDLE" {find_input_rune(&doc, r)}
+		doc.find.field = 1
+		for r in "found" {find_input_rune(&doc, r)}
+		doc.find.field = 0
+		find_wait(&doc)
+		matched := len(doc.find.matches) == NEEDLES
+		if !matched {fail = true}
+		fmt.printfln("  %-6s initial matches=%d (want %d)", "ok" if matched else "FAIL", len(doc.find.matches), NEEDLES)
+
+		// Replace one match at a time. Immediately after each replace -- before
+		// find_wait lets the restarted search finish -- read the state exactly as
+		// render_frame does: while matches is empty and the search is still
+		// running, last_total/last_current must still be the previous search's
+		// real figures, never zero and never -1.
+		zeroed, stuck := false, false
+		total0 := len(doc.find.matches)
+		for i in 0 ..< total0 {
+			find_replace_current(&doc)
+			if len(doc.find.matches) == 0 && search_running(&doc) {
+				if doc.find.last_total == 0 {zeroed = true}
+				if doc.find.last_current < 0 {stuck = true}
+			}
+			find_wait(&doc)
+		}
+		if zeroed {fail = true}
+		if stuck {fail = true}
+		fmt.printfln("  %-6s count never zeroed across %d replaces", "ok" if !zeroed else "FAIL", total0)
+		fmt.printfln("  %-6s last_current never stuck at -1 across %d replaces", "ok" if !stuck else "FAIL", total0)
+
+		fmt.println("stickytest: FAILURES" if fail else "stickytest: all ok")
+		return true
+	}
+
 	if len(os.args) < 3 {return false}
 	path, mode := os.args[1], os.args[2]
 
@@ -2666,6 +3448,20 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		doc.find.field = 0
 		find_wait(&doc)
 		fmt.printfln("query=%q replace=%q matches=%d", os.args[3], os.args[4], len(doc.find.matches))
+		// Replace one match at a time and confirm the reported count never
+		// collapses to zero while the search is still restarting.
+		total0 := len(doc.find.matches)
+		zeroed := false
+		for i in 0 ..< min(total0, 5) {
+			find_replace_current(&doc)
+			// Read the status figure the way render_frame does, without waiting.
+			if len(doc.find.matches) == 0 && search_running(&doc) && doc.find.last_total == 0 {
+				zeroed = true
+			}
+			find_wait(&doc)
+			_ = i
+		}
+		fmt.printfln("count stable across replaces: %v (started at %d)", !zeroed, total0)
 		find_replace_all(&doc)
 		s := doc_debug_string(&doc)
 		fmt.printfln("after replace all: %q", s[:min(len(s), 40)])

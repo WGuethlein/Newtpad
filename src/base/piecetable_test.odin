@@ -253,3 +253,61 @@ test_pt_mixed_sequence :: proc(t: ^testing.T) {
 	pt_read(&pt, 4, dst)
 	testing.expect_value(t, string(dst), "brown")
 }
+
+@(test)
+test_pt_row_vis_end :: proc(t: ^testing.T) {
+	// CRLF: the CR belongs to the break, not to the line's content.
+	pt := pt_init(transmute([]u8)string("ab\r\ncd\r\n"))
+	defer pt_destroy(&pt)
+	testing.expect_value(t, pt_row_vis_end(&pt, 0, 2, true), 2) // "ab", end at the CR
+	testing.expect_value(t, pt_row_vis_end(&pt, 0, 3, true), 2) // end past the CR: strip it
+	testing.expect_value(t, pt_row_vis_end(&pt, 4, 7, true), 6) // "cd"
+
+	// LF only: nothing to strip.
+	lf := pt_init(transmute([]u8)string("ab\ncd"))
+	defer pt_destroy(&lf)
+	testing.expect_value(t, pt_row_vis_end(&lf, 0, 2, true), 2)
+	testing.expect_value(t, pt_row_vis_end(&lf, 3, 5, true), 5)
+
+	// A wrap point is not a line end, so a CR there is real content.
+	cr := pt_init(transmute([]u8)string("a\rb"))
+	defer pt_destroy(&cr)
+	testing.expect_value(t, pt_row_vis_end(&cr, 0, 2, false), 2)
+	// ... and a CR with no LF after it is content even at a line end.
+	testing.expect_value(t, pt_row_vis_end(&cr, 0, 2, true), 2)
+
+	// A row ending at EOF on a bare CR: nothing follows, so nothing is stripped.
+	// Stripping here let End and a click clamp to 3 while Ctrl+End reached 4.
+	eof := pt_init(transmute([]u8)string("abc\r"))
+	defer pt_destroy(&eof)
+	testing.expect_value(t, pt_row_vis_end(&eof, 0, 4, true), 4)
+
+	// Degenerate ranges must not underflow.
+	testing.expect_value(t, pt_row_vis_end(&pt, 2, 2, true), 2)
+	testing.expect_value(t, pt_row_vis_end(&pt, 5, 4, true), 4)
+}
+
+@(test)
+test_pt_crlf_at :: proc(t: ^testing.T) {
+	pt := pt_init(transmute([]u8)string("a\r\nb\rc"))
+	defer pt_destroy(&pt)
+	// pair present: the CR at 1 is followed by the LF at 2.
+	testing.expect(t, pt_crlf_at(&pt, 1), "CRLF pair at 1")
+	// lone CR (not followed by LF) is not a pair.
+	testing.expect(t, !pt_crlf_at(&pt, 4), "lone CR at 4")
+	// lone LF: `at` itself must be the CR, not the LF.
+	testing.expect(t, !pt_crlf_at(&pt, 2), "LF byte is not a pair start")
+	// both bounds: negative offset and one-past-the-end.
+	testing.expect(t, !pt_crlf_at(&pt, -1), "negative offset")
+	testing.expect(t, !pt_crlf_at(&pt, pt_len(&pt)), "at length")
+
+	// CR at EOF: no byte follows it, so it can never be a pair.
+	eof := pt_init(transmute([]u8)string("ab\r"))
+	defer pt_destroy(&eof)
+	testing.expect(t, !pt_crlf_at(&eof, 2), "CR at EOF has no LF to pair with")
+
+	// Empty buffer: every offset is out of bounds.
+	empty := pt_init(nil)
+	defer pt_destroy(&empty)
+	testing.expect(t, !pt_crlf_at(&empty, 0), "empty buffer")
+}

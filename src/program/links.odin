@@ -436,16 +436,15 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 	cur_links: []Link
 	it := visible_begin(doc, t, rows)
 	for {
-		row, start, end, _, wrapped, ok := visible_next(&it)
+		row, start, end, vis_end, _, wrapped, ok := visible_next(&it)
 		if !ok {break}
 		if !wrapped {
-			draw_len := min(end - start, len(line_buf), LINK_SCAN_CAP)
+			// [start, vis_end), not end: a link at EOL must not absorb a CRLF's CR.
+			draw_len := min(vis_end - start, len(line_buf), LINK_SCAN_CAP)
 			if draw_len <= 0 {continue}
 			n := base.pt_read(&doc.pt, start, line_buf[:draw_len])
-			vis := n
-			if vis > 0 && line_buf[vis - 1] == '\r' {vis -= 1}
-			if vis <= 0 {continue}
-			text := strings.clone(string(line_buf[:vis]), allocator) // outlive the loop
+			if n <= 0 {continue}
+			text := strings.clone(string(line_buf[:n]), allocator) // outlive the loop
 			for l in links_scan(text, allocator) {
 				col, cells := plat.text_span_cells(t, text, l.start, l.len, .Doc)
 				append(&out, Link_Hit{row = row, col = col, cells = cells, span_start = l.start, span_len = l.len, wrapped = false, text = text, link = l})

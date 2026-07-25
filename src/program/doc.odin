@@ -297,6 +297,10 @@ wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (end: int, 
 		i := 0
 		for i < n {
 			if buf[i] == '\n' {return pos + i, true}
+			// A CRLF's CR costs zero wrap-budget cells by construction
+			// (plat.is_zero_width), so it falls straight through the ordinary path
+			// below like any other zero-width character -- no special-casing needed
+			// to keep it out of the column count.
 			r, sz := utf8.decode_rune(buf[i:n])
 			if sz == 0 {sz = 1}
 			if i + sz > n && pos + n < L {break} // rune straddles the chunk; refill
@@ -315,11 +319,17 @@ wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (end: int, 
 	return L, true
 }
 
-// Start of the visual row after the one starting at `p`.
-next_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
+// Start of the visual row after the one starting at `p`. `ok` is false when `p`'s
+// row was the last one: an end at EOF has no successor, while a real newline
+// leaves a row after it — possibly the empty final one. Same distinction
+// next_row_start_capped draws, and for the same reason.
+next_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (start: int, ok: bool) {
 	e, le := wrap_row_end(doc, t, p, cols)
-	if le {return e + 1 if e < doc.pt.length else doc.pt.length}
-	return e
+	if le {
+		if e >= doc.pt.length {return doc.pt.length, false}
+		return e + 1, true
+	}
+	return e, e > p // a mid-line wrap point: the next visual row starts there
 }
 
 // Start of the visual row containing byte `off`.
@@ -339,7 +349,7 @@ prev_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 	if ls < p { // p is mid logical line: the segment just before it
 		s := ls
 		for {
-			ns := next_visual_row(doc, t, s, cols)
+			ns, _ := next_visual_row(doc, t, s, cols)
 			if ns >= p {return s}
 			s = ns
 		}
@@ -360,8 +370,9 @@ prev_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 // is bounded by a row; a force-wrappable line is <= WRAP_START_CAP), so the
 // huge-file guarantee holds. ---
 
-// Start of the visual row after the one starting at `p`.
-eff_next_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
+// Next visual row start, wrap-aware. `ok` is false when `p`'s row was the last —
+// see next_row_start_capped for why that is distinct from "starts at length".
+eff_next_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (start: int, ok: bool) {
 	if wrap, _ := eff_wrap_at(doc, t, p); wrap {
 		return next_visual_row(doc, t, p, cols)
 	}
@@ -390,7 +401,7 @@ eff_prev_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 		if wrap, ls := eff_wrap_at(doc, t, p); wrap {
 			s := ls
 			for {
-				ns := next_visual_row(doc, t, s, cols)
+				ns, _ := next_visual_row(doc, t, s, cols)
 				if ns >= p {return s}
 				s = ns
 			}
@@ -408,18 +419,23 @@ eff_prev_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 	}
 }
 
-// End (exclusive) of the visual row starting at `p`.
+// End (exclusive) of the visual row starting at `p`, minus a CRLF's CR: this
+// feeds line_offset_at_cell through up/down navigation, so it must land where
+// the caret is actually allowed to sit, not one phantom cell past it.
 eff_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 	if wrap, _ := eff_wrap_at(doc, t, p); wrap {
-		e, _ := wrap_row_end(doc, t, p, cols)
-		return e
+		e, le := wrap_row_end(doc, t, p, cols)
+		return base.pt_row_vis_end(&doc.pt, p, e, le)
 	}
-	return base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+	e := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+	return base.pt_row_vis_end(&doc.pt, p, e, true)
 }
 
 // Walks the visible rows (filter view, wrapped, or consecutive) yielding each
-// row's [start, end) byte range plus whether it ends a logical line. Wrap-aware,
-// so every screen pass (draw, selection, find highlights) sharing it stays
+// row's [start, end) byte range, its vis_end (end minus a CRLF's CR, when
+// line_end is true — the one definition every consumer reads instead of each
+// stripping the CR itself), and whether it ends a logical line. Wrap-aware, so
+// every screen pass (draw, selection, find highlights) sharing it stays
 // consistent; `end` is capped to RENDER_LINE_CAP when not wrapping so no pass
 // scans a pathological long line.
 Visible_Iter :: struct {
@@ -471,7 +487,7 @@ doc_filtering :: proc(doc: ^Document) -> bool {
 	return doc.filter && len(doc.filter_lines) > 0
 }
 
-visible_next :: proc(it: ^Visible_Iter) -> (row, start, end: int, line_end, wrapped, ok: bool) {
+visible_next :: proc(it: ^Visible_Iter) -> (row, start, end, vis_end: int, line_end, wrapped, ok: bool) {
 	if it.done || it.r >= it.rows {return}
 	d := it.doc
 	if doc_filtering(d) {
@@ -509,10 +525,13 @@ visible_next :: proc(it: ^Visible_Iter) -> (row, start, end: int, line_end, wrap
 			// newline; a synthetic cap boundary keeps us in the same (non-wrapping,
 			// too-long) line, so we don't re-classify and don't start wrapping it.
 			it.fresh = end >= d.pt.length || (end < d.pt.length && byte_at(d, end) == '\n')
-			nxt := next_row_start_capped(d, start)
-			if nxt <= start {it.done = true} else {it.pos = nxt}
+			nxt, more := next_row_start_capped(d, start)
+			if !more {it.done = true} else {it.pos = nxt}
 		}
 	}
+	// One definition of the row's content end for every consumer: the draw, the
+	// caret, the hit-test, the selection, the link scan and the h-scroll width.
+	vis_end = base.pt_row_vis_end(&d.pt, start, end, line_end)
 	row = it.r
 	it.r += 1
 	ok = true
@@ -604,6 +623,11 @@ Document :: struct {
 	// live preview). Both Preview and Split scroll from doc.top -- Split keeps the
 	// two panes anchored to the same source line.
 	md_mode:     Md_Mode,
+	// Per-block column measure (markdown.odin). Four slots, not one, so two table
+	// blocks on screen at once don't thrash a single slot every frame; no
+	// allocation, so nothing to free on doc close.
+	md_table:      [MD_TABLE_SLOTS]Md_Table_Cache,
+	md_table_next: int, // round-robin replacement cursor
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)
@@ -617,6 +641,10 @@ Document :: struct {
 	status_col:        int, // 1-based column (0 = beyond the cap / unknown)
 	status_col_valid:  bool,
 	modified:   bool,
+	// Monotonic mutation counter, for caches that must not outlive an edit (the
+	// markdown table column measure). Bumped in push_undo, which every edit path
+	// routes through.
+	revision:   u64,
 	recovered:  bool, // a mapped read faulted; buffer is now a private copy, not the file
 	// External-change detection (watch.odin). `gen` distinguishes this document
 	// from a later one reusing the same tab slot, so a stat result that arrives
@@ -672,6 +700,11 @@ Find :: struct {
 	jumped:       bool, // already auto-selected a match for this query
 	dirty:        bool, // an edit invalidated the results; restart next frame
 	truncated:    bool, // hit MAX_MATCHES; results are partial
+	// The most recently published result, kept so the status text does not read
+	// "(no matches)" during the frames between an edit clearing the matches and
+	// the worker republishing. A rapid replace otherwise flickers to zero.
+	last_total:   int,
+	last_current: int, // -1 when nothing has been published for this query
 }
 
 // A new empty scratch document (no file). This is what opens when Newtpad is
@@ -856,6 +889,7 @@ doc_recover_from_fault :: proc(doc: ^Document) {
 	doc.original = priv
 	doc.owned_orig = true
 	doc.pt.original = priv // pieces index by offset, so this repoint is transparent
+	doc.revision += 1 // faulted pages came back as zeros: real content change
 	plat.file_close(&doc.fv) // unmaps and zeroes fv
 	doc.recovered = true
 	doc.modified = true // buffer differs from disk; don't let a save look clean
@@ -1037,6 +1071,7 @@ snapshot :: proc(doc: ^Document) -> Snapshot {
 @(private = "file")
 apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 	find_invalidate(doc) // undo/redo don't go through push_undo
+	doc.revision += 1 // ...so neither does its bump; the buffer content still moved
 	base.pt_restore(&doc.pt, s.root, s.length) // takes ownership of s.root
 	doc.cursor = s.cursor
 	doc.anchor = s.anchor
@@ -1052,7 +1087,10 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 // this, "hello" is five undo steps and the history list is unreadable.
 // A caret jump, a different kind of edit, or a newline breaks the run.
 push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
-	find_invalidate(doc) // every edit path routes through here; match offsets shift
+	find_invalidate(doc) // most edit paths route through here; match offsets shift
+	doc.revision += 1 // ...and so must anything caching a measure of the buffer --
+	// except apply_snapshot and doc_absorb_append, which bypass this by design and
+	// bump revision themselves, and doc_reload, which replaces the struct wholesale.
 	doc.modified = true
 	// One entry for the whole batch; doc_batch_begin already took the snapshot of
 	// the state being left. Without this, Replace All pushed one snapshot per
@@ -1226,6 +1264,7 @@ doc_absorb_append :: proc(doc: ^Document, new_size: i64) -> bool {
 	base.pt_insert(&doc.pt, doc.pt.length, chunk)
 	for b in chunk {if b == '\n' {doc.nl_delta += 1}}
 	doc.appended += len(chunk)
+	doc.revision += 1 // content changed; this path deliberately skips push_undo
 	if at_end { // follow the tail, like tail -f
 		doc.cursor = doc.pt.length
 		doc.anchor = doc.cursor
@@ -1245,6 +1284,11 @@ doc_reload :: proc(doc: ^Document) -> bool {
 	cursor, anchor, top := doc.cursor, doc.anchor, doc.top
 	wrap := doc.wrap
 	path := strings.clone(doc.path)
+	// fresh is a brand-new Document and so starts at revision 0; carried forward
+	// and bumped rather than left at 0, or revision would go backwards on a tab
+	// that had already advanced past 0 -- breaking the "monotonic" contract a
+	// cache relies on to tell reload apart from "nothing happened since I looked".
+	rev := doc.revision
 
 	doc_close(doc) // stops both workers, frees the trees and the old original
 	doc^ = fresh
@@ -1252,6 +1296,7 @@ doc_reload :: proc(doc: ^Document) -> bool {
 	doc.path = path
 	doc.path_owned = true
 	doc.wrap = wrap
+	doc.revision = rev + 1
 	// Preserve position by byte offset, clamped — the file may have shrunk.
 	L := doc.pt.length
 	doc.cursor = clamp(cursor, 0, L)
@@ -1438,7 +1483,9 @@ doc_backspace :: proc(doc: ^Document) {
 	}
 	if doc.cursor <= 0 {return}
 	push_undo(doc, .Delete)
-	p := prev_rune(doc, doc.cursor)
+	// Mirror of doc_delete_fwd: Backspace at a line start must take the whole
+	// CRLF break with it, not just the LF, or a bare CR is left behind.
+	p := doc.cursor - 2 if doc.cursor >= 2 && base.pt_crlf_at(&doc.pt, doc.cursor - 2) else prev_rune(doc, doc.cursor)
 	doc.nl_delta -= count_newlines(doc, p, doc.cursor - p)
 	base.pt_delete(&doc.pt, p, doc.cursor - p)
 	set_cursor(doc, p, false)
@@ -1454,7 +1501,11 @@ doc_delete_fwd :: proc(doc: ^Document) {
 	}
 	if doc.cursor >= doc.pt.length {return}
 	push_undo(doc, .Delete)
-	n := next_rune(doc, doc.cursor) - doc.cursor
+	// A CRLF break is one unit: deleting forward from the content end (the CR;
+	// see doc_cursor_end) must take the LF with it, or the buffer still renders
+	// two lines -- the keystroke looks dead -- and the stray LF corrupts an
+	// otherwise-CRLF file on save.
+	n := 2 if base.pt_crlf_at(&doc.pt, doc.cursor) else next_rune(doc, doc.cursor) - doc.cursor
 	doc.nl_delta -= count_newlines(doc, doc.cursor, n)
 	base.pt_delete(&doc.pt, doc.cursor, n)
 	doc.anchor = doc.cursor
@@ -1468,7 +1519,14 @@ doc_cursor_left :: proc(doc: ^Document, select: bool) {
 		set_cursor(doc, lo, false) // collapse to selection start
 		return
 	}
-	set_cursor(doc, prev_rune(doc, doc.cursor), select)
+	// A CRLF break is one caret step. Without this the caret lands between CR and
+	// LF — the phantom cell at end of line, from the other side.
+	p := doc.cursor
+	if p >= 2 && base.pt_crlf_at(&doc.pt, p - 2) {
+		set_cursor(doc, p - 2, select)
+		return
+	}
+	set_cursor(doc, prev_rune(doc, p), select)
 }
 
 doc_cursor_right :: proc(doc: ^Document, select: bool) {
@@ -1477,7 +1535,12 @@ doc_cursor_right :: proc(doc: ^Document, select: bool) {
 		set_cursor(doc, hi, false) // collapse to selection end
 		return
 	}
-	set_cursor(doc, next_rune(doc, doc.cursor), select)
+	p := doc.cursor
+	if base.pt_crlf_at(&doc.pt, p) {
+		set_cursor(doc, p + 2, select)
+		return
+	}
+	set_cursor(doc, next_rune(doc, p), select)
 }
 
 enc_name :: proc(e: base.Encoding) -> string {return base.encoding_name(e)}
@@ -1540,7 +1603,16 @@ doc_goto_line :: proc(doc: ^Document, n: int) {
 }
 
 doc_cursor_home :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_line_start(&doc.pt, doc.cursor), select)}
-doc_cursor_end :: proc(doc: ^Document, select: bool) {set_cursor(doc, base.pt_line_end(&doc.pt, doc.cursor), select)}
+// End lands on the row's content end, not on the CR of a CRLF break: the caret
+// can never sit between CR and LF.
+doc_cursor_end :: proc(doc: ^Document, select: bool) {
+	e := base.pt_line_end(&doc.pt, doc.cursor)
+	// max(0, e - 1), not the line start: pt_row_vis_end only inspects the two bytes
+	// around `e`, and pt_line_start is an UNCAPPED backward scan. Passing the real
+	// line start walked the whole document on every End press on a single-line
+	// multi-GB file — the pattern pt_line_start_cap exists to prevent.
+	set_cursor(doc, base.pt_row_vis_end(&doc.pt, max(0, e - 1), e, true), select)
+}
 // Ctrl+Home / Ctrl+End. Without these there is no keyboard way to reach the end
 // of a large file at all.
 doc_start :: proc(doc: ^Document, select: bool) {set_cursor(doc, 0, select)}
@@ -1569,33 +1641,27 @@ doc_cursor_down :: proc(doc: ^Document, t: ^plat.Text, select: bool) {
 		return
 	}
 	col := line_cell_col(doc, t, vs, doc.cursor)
-	nv := eff_next_row(doc, t, vs, doc.view_cols)
+	nv, more := eff_next_row(doc, t, vs, doc.view_cols)
+	if !more {
+		set_cursor(doc, doc.pt.length, select)
+		return
+	}
 	ne := eff_row_end(doc, t, nv, doc.view_cols)
 	set_cursor(doc, line_offset_at_cell(doc, t, nv, ne, col), select)
 }
 
 // --- word boundaries, word nav, click selection, hit-test ---
 
-@(private = "file")
-is_word :: proc(b: u8) -> bool {
-	return(b >= '0' && b <= '9') || (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z') || b == '_' || b >= 0x80
-}
-
+// Word boundaries live in base (three-class, direction-symmetric) so they are
+// unit-testable; these are the document-level adapters.
 @(private = "file")
 word_left_of :: proc(doc: ^Document, pos: int) -> int {
-	p := pos
-	for p > 0 && !is_word(byte_at(doc, p - 1)) {p -= 1}
-	for p > 0 && is_word(byte_at(doc, p - 1)) {p -= 1}
-	return p
+	return base.pt_word_left(&doc.pt, pos)
 }
 
 @(private = "file")
 word_right_of :: proc(doc: ^Document, pos: int) -> int {
-	L := doc.pt.length
-	p := pos
-	for p < L && !is_word(byte_at(doc, p)) {p += 1}
-	for p < L && is_word(byte_at(doc, p)) {p += 1}
-	return p
+	return base.pt_word_right(&doc.pt, pos)
 }
 
 doc_word_left :: proc(doc: ^Document, select: bool) {set_cursor(doc, word_left_of(doc, doc.cursor), select)}
@@ -1622,11 +1688,21 @@ doc_select_all :: proc(doc: ^Document) {
 
 doc_select_word_at :: proc(doc: ^Document, pos: int) {
 	L := doc.pt.length
-	if pos < L && is_word(byte_at(doc, pos)) {
+	if pos < L && base.char_class(byte_at(doc, pos)) == .Word {
 		s, e := pos, pos
-		for s > 0 && is_word(byte_at(doc, s - 1)) {s -= 1}
-		for e < L && is_word(byte_at(doc, e)) {e += 1}
+		for s > 0 && base.char_class(byte_at(doc, s - 1)) == .Word {s -= 1}
+		for e < L && base.char_class(byte_at(doc, e)) == .Word {e += 1}
 		doc.anchor, doc.cursor = s, e
+	} else if base.pt_crlf_at(&doc.pt, pos) {
+		// pos is the CR that begins a CRLF break -- doc_pos_at clamps a click past
+		// EOL here, so this is the ordinary "double-click past end of line" case,
+		// not a deliberate click on the break. The pair isn't selectable content:
+		// selecting the CR (the else branch below) leaves cursor == vis_end + 1,
+		// which no row's [start, vis_end] claims, so the caret vanishes until the
+		// next keypress and typing then replaces the CR, corrupting the line
+		// ending. Land the caret at the content end instead, with no selection.
+		doc.anchor = pos
+		doc.cursor = pos
 	} else {
 		doc.anchor = pos
 		doc.cursor = next_rune(doc, pos)
@@ -1663,18 +1739,18 @@ line_offset_at_cell :: proc(doc: ^Document, t: ^plat.Text, ls, le, col: int) -> 
 doc_pos_at :: proc(doc: ^Document, t: ^plat.Text, mx, my: i32, px, char_w: f32, rows: int) -> int {
 	target := clamp(row_at_y(px, f32(my)), 0, rows - 1)
 	it := visible_begin(doc, t, rows)
-	last_start, last_end, last_wrap := doc.top, doc.top, false
+	last_start, last_vis_end, last_wrap := doc.top, doc.top, false
 	for {
-		row, start, end, _, wrapped, ok := visible_next(&it)
+		row, start, _, vis_end, _, wrapped, ok := visible_next(&it)
 		if !ok {break}
-		last_start, last_end, last_wrap = start, end, wrapped
+		last_start, last_vis_end, last_wrap = start, vis_end, wrapped
 		if row == target {
 			col := col_at_x(char_w, f32(mx), 0 if wrapped else H_SCROLL)
-			return line_offset_at_cell(doc, t, start, end, col)
+			return line_offset_at_cell(doc, t, start, vis_end, col)
 		}
 	}
 	col := col_at_x(char_w, f32(mx), 0 if last_wrap else H_SCROLL)
-	return line_offset_at_cell(doc, t, last_start, last_end, col) // click below last row
+	return line_offset_at_cell(doc, t, last_start, last_vis_end, col) // click below last row
 }
 
 // Selection highlight rectangles for the visible lines (opaque; drawn behind
@@ -1687,15 +1763,15 @@ doc_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows
 	it := visible_begin(doc, t, rows)
 	n := 0
 	for n < len(out) {
-		row, start, end, _, wrapped, ok := visible_next(&it)
+		row, start, end, vis_end, _, wrapped, ok := visible_next(&it)
 		if !ok {break}
 		if lo <= end && hi > start { // selection overlaps [start, end]
 			rhs := 0 if wrapped else H_SCROLL
 			startcol := min(line_cell_col(doc, t, start, max(start, lo)), VISIBLE_COLS)
-			endcol := min(line_cell_col(doc, t, start, min(end, hi)), VISIBLE_COLS)
+			endcol := min(line_cell_col(doc, t, start, min(vis_end, hi)), VISIBLE_COLS)
 			sx := col_x(char_w, startcol, rhs)
 			ex := col_x(char_w, endcol, rhs)
-			if hi > end {ex += char_w * 0.4} // continues past EOL: hint the newline
+			if hi > vis_end {ex += char_w * 0.4} // continues past EOL: hint the newline
 			out[n] = {pos = {sx, row_rect_y(px, row)}, size = {max(ex - sx, 2), lh}, color = col}
 			n += 1
 		}
@@ -1722,12 +1798,22 @@ row_start_capped :: proc(doc: ^Document, pos: int) -> int {
 	return s
 }
 
+// Start of the row after the one beginning at `pos`. `ok` is false when that row
+// was the last one.
+//
+// The two facts this used to conflate: "the next row starts at length" is true
+// when the buffer ends with a newline, where that final empty row exists and
+// must render; "there is no next row" is true when the last line runs to EOF
+// with no newline to step past. Returning length for both emitted a phantom row
+// at [length, length] on every buffer without a trailing newline — which is
+// every scratch buffer — and the caret, matching it, was drawn on it.
 @(private = "file")
-next_row_start_capped :: proc(doc: ^Document, pos: int) -> int {
+next_row_start_capped :: proc(doc: ^Document, pos: int) -> (start: int, ok: bool) {
 	e := base.pt_line_end_cap(&doc.pt, pos, RENDER_LINE_CAP)
-	if e >= doc.pt.length {return doc.pt.length}
+	if e >= doc.pt.length {return doc.pt.length, false}
 	// A real newline is stepped past; a synthetic cap boundary starts at e.
-	return e + 1 if byte_at(doc, e) == '\n' else e
+	if byte_at(doc, e) == '\n' {return e + 1, true}
+	return e, true
 }
 
 @(private = "file")
@@ -1768,10 +1854,10 @@ doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 	widest := 0
 	it := visible_begin(doc, t, rows)
 	for {
-		_, start, end, _, wrapped, ok := visible_next(&it)
+		_, start, _, vis_end, _, wrapped, ok := visible_next(&it)
 		if !ok {break}
 		if wrapped {continue} // wrapped rows fit the window; they don't pan
-		if w := line_cell_col(doc, t, start, end); w > widest {widest = w}
+		if w := line_cell_col(doc, t, start, vis_end); w > widest {widest = w}
 	}
 	reach := min(widest + HSCROLL_PAD, VISIBLE_COLS)
 	return max(0, reach - max(1, doc.view_cols))
@@ -1782,8 +1868,8 @@ doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta, rows: int) {
 	if delta > 0 {
 		for _ in 0 ..< delta {
-			nt := eff_next_row(doc, t, doc.top, doc.view_cols)
-			if nt == doc.top {break}
+			nt, more := eff_next_row(doc, t, doc.top, doc.view_cols)
+			if !more || nt == doc.top {break}
 			doc.top = nt
 		}
 	} else if delta < 0 {
@@ -1830,7 +1916,9 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 	p := doc.top
 	for _ in 0 ..< rows {
 		if p >= cls {return}
-		p = eff_next_row(doc, t, p, doc.view_cols)
+		np, more := eff_next_row(doc, t, p, doc.view_cols)
+		if !more {break}
+		p = np
 	}
 	// caret is below the viewport: put its row at the bottom
 	doc.top = cls
@@ -1861,17 +1949,15 @@ doc_draw :: proc(
 	bottom = doc.top
 	it := visible_begin(doc, t, rows)
 	for {
-		row, start, end, line_end, wrapped, ok := visible_next(&it)
+		row, start, end, vis_end, line_end, wrapped, ok := visible_next(&it)
 		if !ok {break}
 		bottom = end
 		row_y := row_baseline_y(px, row)
 		rhs := 0 if wrapped else H_SCROLL // a wrapped row ignores the horizontal pan
 
-		draw_len := min(end - start, len(line_buf))
+		draw_len := min(vis_end - start, len(line_buf))
 		n := base.pt_read(&doc.pt, start, line_buf[:draw_len])
-		vis := n
-		if vis > 0 && line_buf[vis - 1] == '\r' {vis -= 1}
-		if vis > 0 {
+		if n > 0 {
 			// Line number, when the filter view is showing lines out of context.
 			if GUTTER_W > 0 {
 				fi := doc.filter_top + row
@@ -1894,15 +1980,15 @@ doc_draw :: proc(
 				append(&spans, plat.Text_Span{start = h.span_start, len = h.span_len, color = LINK_COL})
 			}
 			if spans != nil {
-				plat.text_draw_spans(gfx, t, string(line_buf[:vis]), col_x(char_w, 0, rhs), row_y, px, fg, spans[:], .Doc)
+				plat.text_draw_spans(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs), row_y, px, fg, spans[:], .Doc)
 			} else {
-				plat.text_draw(gfx, t, string(line_buf[:vis]), col_x(char_w, 0, rhs), row_y, px, fg, .Doc)
+				plat.text_draw(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs), row_y, px, fg, .Doc)
 			}
 		}
 
-		// Caret on this row: [start, end], but a wrap point (non-line-end `end`)
-		// belongs to the next visual row's start, so exclude it here.
-		if doc.cursor >= start && doc.cursor <= end && (line_end || doc.cursor < end) {
+		// Caret on this row: [start, vis_end], but a wrap point (non-line-end
+		// vis_end) belongs to the next visual row's start, so exclude it here.
+		if doc.cursor >= start && doc.cursor <= vis_end && (line_end || doc.cursor < vis_end) {
 			cprefix := min(doc.cursor - start, n) // cells before caret, clipped to drawn text
 			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix], .Doc), rhs)
 			cy = row_y

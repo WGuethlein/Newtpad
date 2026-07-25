@@ -78,7 +78,7 @@ find_open :: proc(doc: ^Document, replace_mode: bool) {
 			append(&doc.find.query, ..buf)
 		}
 	}
-	find_recompute(doc)
+	find_query_changed(doc)
 }
 
 find_close :: proc(doc: ^Document) {
@@ -88,7 +88,7 @@ find_close :: proc(doc: ^Document) {
 }
 
 find_toggle_field :: proc(doc: ^Document) {doc.find.field = 1 - doc.find.field}
-find_toggle_regex :: proc(doc: ^Document) {doc.find.regex = !doc.find.regex;find_recompute(doc)}
+find_toggle_regex :: proc(doc: ^Document) {doc.find.regex = !doc.find.regex;find_query_changed(doc)}
 
 @(private = "file")
 active_buf :: proc(doc: ^Document) -> ^[dynamic]u8 {
@@ -98,7 +98,7 @@ active_buf :: proc(doc: ^Document) -> ^[dynamic]u8 {
 find_input_rune :: proc(doc: ^Document, r: rune) {
 	bytes, n := utf8.encode_rune(r)
 	append(active_buf(doc), ..bytes[:n])
-	if doc.find.field == 0 {find_recompute(doc)}
+	if doc.find.field == 0 {find_query_changed(doc)}
 }
 
 find_backspace :: proc(doc: ^Document) {
@@ -107,7 +107,7 @@ find_backspace :: proc(doc: ^Document) {
 	i := len(buf) - 1
 	for i > 0 && (buf[i] & 0xC0) == 0x80 {i -= 1} // whole rune
 	resize(buf, i)
-	if doc.find.field == 0 {find_recompute(doc)}
+	if doc.find.field == 0 {find_query_changed(doc)}
 }
 
 // --- search lifecycle ---
@@ -184,6 +184,16 @@ search_reset :: proc(doc: ^Document) {
 	clear(&doc.filter_lines)
 	clear(&doc.filter_line_nos)
 	doc.filter_top = 0
+}
+
+// A query change invalidates the previous count; a buffer change (replace) does
+// not. Deliberately not folded into find_recompute, which both call: keeping the
+// last count across a replace is exactly what stops the flicker to zero.
+@(private = "file")
+find_query_changed :: proc(doc: ^Document) {
+	doc.find.last_total = 0
+	doc.find.last_current = -1
+	find_recompute(doc)
 }
 
 find_recompute :: proc(doc: ^Document) {
@@ -270,6 +280,20 @@ find_merge :: proc(doc: ^Document) {
 			}
 		}
 		find_select_current(doc)
+	}
+
+	// Sticky copy for the status text. Reached only on real progress (the
+	// n == f.merged guard above returns early otherwise), so a cleared array
+	// during a restart cannot overwrite these with zero.
+	//
+	// After the jump block, not before it: search_reset clears f.current to -1
+	// and f.jumped to false on every restart, so at the slice assignments above
+	// f.current is still -1. When the whole result set publishes in one merge —
+	// always true on the synchronous path — copying there froze last_current at
+	// -1 and the bar read "(0/N)" for the rest of the busy window.
+	if n > 0 {
+		f.last_total = n
+		f.last_current = f.current
 	}
 }
 
@@ -563,14 +587,14 @@ find_match_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: i
 	it := visible_begin(doc, t, rows)
 	n := 0
 	for n < len(out) {
-		row, start, end, _, wrapped, ok := visible_next(&it)
+		row, start, end, vis_end, _, wrapped, ok := visible_next(&it)
 		if !ok {break}
 		ry := row_rect_y(px, row)
 		rhs := 0 if wrapped else H_SCROLL
 		for mi < len(f.matches) && f.matches[mi] <= end && n < len(out) {
 			m := f.matches[mi]
 			startcol := min(line_cell_col(doc, t, start, max(m, start)), VISIBLE_COLS)
-			endcol := min(line_cell_col(doc, t, start, min(m + f.match_len[mi], end)), VISIBLE_COLS)
+			endcol := min(line_cell_col(doc, t, start, min(m + f.match_len[mi], vis_end)), VISIBLE_COLS)
 			sx := col_x(char_w, startcol, rhs)
 			ex := col_x(char_w, endcol, rhs)
 			out[n] = {pos = {sx, ry}, size = {max(ex - sx, 2), lh}, color = col}

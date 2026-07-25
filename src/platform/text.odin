@@ -456,6 +456,13 @@ text_char_width :: proc(t: ^Text, px: f32, set := Font_Set.UI) -> f32 {
 @(private = "file")
 is_zero_width :: proc(r: rune) -> bool {
 	switch r {
+	case 0x0000 ..= 0x001F: // C0 controls, including CR/LF: no glyph, no advance.
+		// True by construction rather than a font accident -- text_cell_width's
+		// glyph-metrics fallback below happened to also measure CR as ~0 on the
+		// loaded font, which let wrap_row_end's CR handling go untested (see
+		// task-7 Important 2). \t is intercepted earlier in text_cell_width and
+		// never reaches here, so it's unaffected by being in this range.
+		return true
 	case 0x00AD: // soft hyphen
 		return true
 	case 0x0300 ..= 0x036F, 0x0483 ..= 0x0489: // combining diacritical, Cyrillic
