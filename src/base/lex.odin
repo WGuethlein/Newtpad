@@ -30,6 +30,23 @@ Token_Kind :: enum u8 {
 	Xml_Attr,
 }
 
+// Lexer state carried from the end of one line to the start of the next, for
+// grammars with a construct that can cross a line boundary (a block comment,
+// a triple-quoted string...). lex_log and lex_json never produce or consume
+// anything but .Normal -- they are entirely line-local (see each one's header
+// comment) -- so this only matters to a lexer like lex_xml.
+//
+// Must stay exactly one byte: the background per-line state index (Task 3,
+// program/lex_index.odin) is one Lex_State per line, so on a 10M-line file
+// the index is 10 MB; a wider backing type multiplies that directly. If a
+// future lexer's grammar cannot be captured in 256 states, that is a decision
+// to bring back rather than one to make by quietly widening this enum.
+Lex_State :: enum u8 {
+	Normal,
+	In_Comment, // inside a <!-- ... --> whose closing "-->" hasn't been seen yet
+}
+#assert(size_of(Lex_State) == 1)
+
 // One recognized construct within a single line's bytes. `start`/`len` are
 // byte offsets relative to whatever slice the lexer was handed — never
 // document- or row-absolute. The caller (program layer) is responsible for
