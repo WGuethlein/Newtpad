@@ -2834,6 +2834,46 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			}
 		}
 
+		// The role<->key mapping is a total array over Color_Role, so a role
+		// with NO key is a compile error rather than a test failure -- that is
+		// the point of the array, and it is the property whose absence let the
+		// nine Syn_* roles ship unsettable from a file. What the array cannot
+		// catch is a typo'd or duplicated key, so that is what this checks:
+		// every key non-empty, every key unique, and both directions agreeing.
+		{
+			seen := make(map[string]Color_Role, len(Color_Role), context.temp_allocator)
+			for role in Color_Role {
+				key := theme_key_from_role(role)
+				if key == "" {
+					fmt.printfln("  FAIL   %v has an empty file key", role)
+					fail = true
+					continue
+				}
+				if prev, dup := seen[key]; dup {
+					fmt.printfln("  FAIL   key %q maps to both %v and %v", key, prev, role)
+					fail = true
+					continue
+				}
+				seen[key] = role
+				back, ok := theme_role_from_key(key)
+				if !ok || back != role {
+					fmt.printfln("  FAIL   %v -> %q -> %v (ok=%v): key does not round-trip", role, key, back, ok)
+					fail = true
+				}
+			}
+			fmt.printfln("  ok     all %d role keys are non-empty, unique and round-trip", len(Color_Role))
+		}
+
+		// "base" is not a role and must never resolve to one -- it selects
+		// which built-in theme_load_file overlays onto. A role named "base"
+		// would silently capture that line and change which theme you get.
+		{
+			_, is_role := theme_role_from_key("base")
+			ok := !is_role
+			if !ok {fail = true}
+			fmt.printfln("  %-6s \"base\" is not a role key", "ok" if ok else "FAIL")
+		}
+
 		in_set :: proc(got: [4]f32, set: [][4]f32) -> bool {
 			for v in set {if got == v {return true}}
 			return false

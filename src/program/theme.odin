@@ -430,43 +430,74 @@ theme_parse_hex :: proc(s: string) -> (col: [4]f32, ok: bool) {
 	return {f32(r) / 255, f32(g) / 255, f32(b) / 255, 1}, true
 }
 
-// Role name (lowercase, matching the spec's role table exactly) -> Color_Role.
-// An unrecognized name returns ok=false so the caller skips it instead of
-// failing the whole file -- the same "unknown key ignored" contract
-// settings_load uses. Deliberately only the 25 roles the spec's "Theme
-// files" section documents as file-settable; the 9 Syn_* placeholders are
-// not (see theme.odin's enum comment -- batch 4 territory). "base" is
-// deliberately absent from this switch -- it selects which built-in
-// theme_load_file starts overlaying onto, it is not a role, and it must
-// never be counted or logged as an unrecognized one.
-@(private = "file")
+// The file key for every role, as a TOTAL array over Color_Role: Odin rejects
+// an incomplete keyed enumerated-array composite literal at compile time, so a
+// role added without a key is a compile error, not a role that silently cannot
+// be set from a file. That is exactly what went wrong before -- the nine Syn_*
+// roles were absent from the 25-case switch this replaces, so a theme file
+// could not touch them, and Dark's placeholders could not be worked around by
+// the very file mechanism meant to allow it.
+//
+// One array serves both directions: theme_key_from_role writes files
+// (theme_export), theme_role_from_key reads them (theme_load_file). Two
+// hand-maintained mappings would drift, and a drift here is silent.
+//
+// Keys are the lowercase enum name. "base" is deliberately not a key: it
+// selects which built-in theme_load_file overlays onto, it is not a role, and
+// it must never be counted or logged as an unrecognized one.
+theme_role_keys := [Color_Role]string {
+	.Bg_Base        = "bg_base",
+	.Bg_Panel       = "bg_panel",
+	.Bg_Raised      = "bg_raised",
+	.Border_Subtle  = "border_subtle",
+	.Border_Strong  = "border_strong",
+	.Text_Muted     = "text_muted",
+	.Text_Dim       = "text_dim",
+	.Text_Secondary = "text_secondary",
+	.Text_Primary   = "text_primary",
+	.Text_Bright    = "text_bright",
+	.Selection_Doc  = "selection_doc",
+	.Selection_List = "selection_list",
+	.Caret          = "caret",
+	.Accent         = "accent",
+	.Find_Match_Bg  = "find_match_bg",
+	.Link           = "link",
+	.Warning        = "warning",
+	.Danger         = "danger",
+	.Success        = "success",
+	.Filter_Bg      = "filter_bg",
+	.Filter_Text    = "filter_text",
+	.Md_Heading     = "md_heading",
+	.Md_Code        = "md_code",
+	.Md_Italic      = "md_italic",
+	.Md_Quote       = "md_quote",
+	.Syn_Keyword    = "syn_keyword",
+	.Syn_String     = "syn_string",
+	.Syn_Number     = "syn_number",
+	.Syn_Comment    = "syn_comment",
+	.Syn_Type       = "syn_type",
+	.Syn_Punct      = "syn_punct",
+	.Syn_Json_Key   = "syn_json_key",
+	.Syn_Xml_Tag    = "syn_xml_tag",
+	.Syn_Xml_Attr   = "syn_xml_attr",
+}
+
+// The file key for a role. Used by theme_export to write a file.
+theme_key_from_role :: proc(role: Color_Role) -> string {
+	return theme_role_keys[role]
+}
+
+// Role name -> Color_Role. An unrecognized name returns ok=false so the caller
+// skips that line instead of failing the whole file -- the same "unknown key
+// ignored" contract settings_load uses, which is what lets an older build read
+// a newer file. A linear scan of 34 entries, run once per line at load time;
+// the switch this replaces bought nothing measurable and cost the second
+// mapping.
 theme_role_from_key :: proc(key: string) -> (role: Color_Role, ok: bool) {
-	switch key {
-	case "bg_base": return .Bg_Base, true
-	case "bg_panel": return .Bg_Panel, true
-	case "bg_raised": return .Bg_Raised, true
-	case "border_subtle": return .Border_Subtle, true
-	case "border_strong": return .Border_Strong, true
-	case "text_muted": return .Text_Muted, true
-	case "text_dim": return .Text_Dim, true
-	case "text_secondary": return .Text_Secondary, true
-	case "text_primary": return .Text_Primary, true
-	case "text_bright": return .Text_Bright, true
-	case "selection_doc": return .Selection_Doc, true
-	case "selection_list": return .Selection_List, true
-	case "caret": return .Caret, true
-	case "accent": return .Accent, true
-	case "find_match_bg": return .Find_Match_Bg, true
-	case "link": return .Link, true
-	case "warning": return .Warning, true
-	case "danger": return .Danger, true
-	case "success": return .Success, true
-	case "filter_bg": return .Filter_Bg, true
-	case "filter_text": return .Filter_Text, true
-	case "md_heading": return .Md_Heading, true
-	case "md_code": return .Md_Code, true
-	case "md_italic": return .Md_Italic, true
-	case "md_quote": return .Md_Quote, true
+	for k, r in theme_role_keys {
+		if k == key {
+			return r, true
+		}
 	}
 	return {}, false
 }
