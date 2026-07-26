@@ -7158,13 +7158,19 @@ when NEWTPAD_TESTS {
 			fmt.println("--- session restore wins over the family default ---")
 			{
 				// A tab left in Preview, saved and restored, must not come back forced
-				// onto a family default that says something else. (md_mode/table are
-				// not yet persisted per tab in session.txt -- only wrap is -- so the
-				// restored value below is always Off/false either way. What this
-				// proves is the property that matters regardless: app_apply_view_defaults
-				// is never reached from the restore path, so it can never overwrite a
-				// per-tab view -- today's Off, or a persisted value a future session
-				// format might carry.)
+				// onto a family default that says something else: app_apply_view_defaults
+				// is never reached from the restore path, so it cannot overwrite a
+				// per-tab view.
+				//
+				// This assertion expected .Off until batch 6, and said so at length,
+				// because session.txt carried only `wrap` -- so it proved the property
+				// against a value that was constant either way. Session format 4
+				// persists md_mode, which is exactly the "a persisted value a future
+				// session format might carry" case the old comment anticipated: the tab
+				// now round-trips as .Preview while the family default says .Split, so
+				// the restore genuinely WINS over the default instead of coinciding
+				// with it. The test only started failing when format 4 landed, which is
+				// the assertion doing its job -- it was stale, not wrong.
 				a: App
 				app_open_path(&a, mdf)
 				d := app_active(&a)
@@ -7177,8 +7183,8 @@ when NEWTPAD_TESTS {
 				b.settings.md_default = .Split // family default now disagrees
 				restored := session_restore(&b)
 				rd := app_active(&b)
-				ok := restored && rd != nil && rd.md_mode == .Off
-				fmt.printfln("  restored tab md_mode=%-8v (md_default=Split, untouched) %s", rd.md_mode if rd != nil else Md_Mode.Off, "OK" if ok else "FAIL")
+				ok := restored && rd != nil && rd.md_mode == .Preview
+				fmt.printfln("  restored tab md_mode=%-8v (md_default=Split, untouched; want Preview) %s", rd.md_mode if rd != nil else Md_Mode.Off, "OK" if ok else "FAIL")
 				if !ok {bad += 1}
 				app_destroy(&b)
 				// reset the session so the GUI doesn't inherit this test's tabs
