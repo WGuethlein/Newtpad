@@ -553,8 +553,12 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 // call sites.
 @(private = "file")
 block_extend_dispatch :: proc(app: ^App, doc: ^Document, t: ^plat.Text, dline, dcell: int) {
-	if !block_extend(doc, t, dline, dcell) {
+	switch block_extend(doc, t, dline, dcell) {
+	case .Wrap_On:
 		app_note(app, "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]")
+	case .Caret_Unresolved:
+		app_note(app, "[COLUMN SELECT UNAVAILABLE HERE - the line is too far into a very large file]")
+	case .None:
 	}
 }
 

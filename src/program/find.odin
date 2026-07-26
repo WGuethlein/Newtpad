@@ -502,6 +502,9 @@ find_select_current :: proc(doc: ^Document) {
 	m := f.matches[f.current]
 	doc.anchor = m // select the match: highlights it + scrolls it into view
 	doc.cursor = m + f.match_len[f.current]
+	// Bypasses set_cursor -- jumping to a find match must drop a stale
+	// rectangle the same way a plain caret move does.
+	if block_active(doc) {block_clear(doc)}
 	if doc.filter { // keep the current match's line in the filtered view
 		mls := base.pt_line_start(&doc.pt, m)
 		for fl, i in doc.filter_lines {

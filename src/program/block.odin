@@ -267,38 +267,71 @@ DOC_LINE_INDEX_CAP :: BLOCK_ROW_CAP * 64
 // this file's own rule (the package comment above) is that every cell<->byte
 // conversion goes through one procedure, and a second walk here would be
 // exactly the Shape B bug the rule exists to prevent.
+//
+// `ok` is false whenever either axis could not be resolved within its own
+// cap -- doc_cursor_line returning 0 (caret beyond STATUS_LINE_CAP, an
+// unknown line) or pt_line_start_cap returning exact=false (caret beyond
+// STATUS_COL_CAP from its own line start). Both used to fall back to 0
+// silently while the caller still reported success, which seeds a rectangle
+// at line/cell 0 instead of refusing -- a confident wrong answer on a large
+// file. The caller must refuse rather than use `line`/`cell` when ok is
+// false.
 @(private = "file")
-caret_line_cell :: proc(doc: ^Document, t: ^plat.Text) -> (line, cell: int) {
-	// doc_cursor_line is 1-based (0 only when the caret sits beyond
-	// STATUS_LINE_CAP, an unknown line); block_anchor_line/block_cursor_line
-	// are 0-based, the same convention doc_line_start_of_index's own `n`
-	// uses. max(0, ...) only bites in that beyond-cap case, where the exact
-	// line truly is unknown and 0 is the same least-wrong fallback the
-	// status bar itself falls back to.
-	line = max(0, doc_cursor_line(doc) - 1)
+caret_line_cell :: proc(doc: ^Document, t: ^plat.Text) -> (line, cell: int, ok: bool) {
+	cl := doc_cursor_line(doc)
+	if cl == 0 {
+		return 0, 0, false
+	}
+	// doc_cursor_line is 1-based; block_anchor_line/block_cursor_line are
+	// 0-based, the same convention doc_line_start_of_index's own `n` uses.
+	line = cl - 1
 	ls, exact := base.pt_line_start_cap(&doc.pt, doc.cursor, STATUS_COL_CAP)
-	cell = line_cell_col(doc, t, ls, doc.cursor) if exact else 0
-	return
+	if !exact {
+		return line, 0, false
+	}
+	cell = line_cell_col(doc, t, ls, doc.cursor)
+	return line, cell, true
+}
+
+// Why block_extend refuses, distinct from whether it refused: the two
+// refusal reasons need two different user-facing notes (command_dispatch's
+// dispatcher, commands.odin), and a bare bool can't carry that. Wrap_On is
+// the pre-existing "word-wrap is on" refusal; Caret_Unresolved is new --
+// the caret sits far enough into a large file that caret_line_cell could
+// not resolve one or both axes within its own scan cap.
+Block_Refusal :: enum {
+	None,
+	Wrap_On,
+	Caret_Unresolved,
 }
 
 // Seed or extend a column rectangle from the keyboard. `dline`/`dcell` are
 // the step this call adds to the rectangle's CURSOR corner only -- the
 // anchor never moves once set, exactly like a normal shift-extend leaves
-// doc.anchor alone (set_cursor, doc.odin). Returns false, changing no state
-// at all, when the document is word-wrapped: wrap turns one logical line
-// into many visual rows, so a (line, cell) rectangle stops describing
-// anything stable the instant it's toggled (see this file's package comment
-// and doc.odin's block_anchor_line field comment) -- the gesture must refuse
-// up front rather than build a rectangle whose meaning is about to change
-// under it.
+// doc.anchor alone (set_cursor, doc.odin). Returns a refusal (changing no
+// state at all) rather than .None in two cases:
+//
+//   - .Wrap_On when the document is word-wrapped: wrap turns one logical
+//     line into many visual rows, so a (line, cell) rectangle stops
+//     describing anything stable the instant it's toggled (see this file's
+//     package comment and doc.odin's block_anchor_line field comment) -- the
+//     gesture must refuse up front rather than build a rectangle whose
+//     meaning is about to change under it.
+//   - .Caret_Unresolved when there is no rectangle yet and caret_line_cell
+//     could not resolve the caret's (line, cell) within its own caps. The
+//     old code let both axes fall back to 0 silently while still reporting
+//     success -- seeding a rectangle at line/cell 0 instead of wherever the
+//     caret actually is, on a document large enough to matter. Refusing is
+//     correct here; guessing is not, because Task 5/6 copy and edit through
+//     this rectangle.
 //
 // This takes no ^App and does not call app_note itself: block.odin has never
 // imported the App type (see the package comment's layering), and the one
-// caller with `app` already in scope is command_dispatch, which turns a
-// false return into the "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]" note.
-block_extend :: proc(doc: ^Document, t: ^plat.Text, dline, dcell: int) -> bool {
+// caller with `app` already in scope is command_dispatch, which turns each
+// refusal into its own status note.
+block_extend :: proc(doc: ^Document, t: ^plat.Text, dline, dcell: int) -> Block_Refusal {
 	if doc.wrap {
-		return false
+		return .Wrap_On
 	}
 	if !doc.block {
 		// No rectangle yet: seed BOTH corners at the caret's own (line,
@@ -306,7 +339,10 @@ block_extend :: proc(doc: ^Document, t: ^plat.Text, dline, dcell: int) -> bool {
 		// below, same as every later call once the rectangle already exists
 		// -- so the very first Alt+Shift+arrow both starts the rectangle at
 		// the caret AND moves one step, rather than requiring two presses.
-		line, cell := caret_line_cell(doc, t)
+		line, cell, ok := caret_line_cell(doc, t)
+		if !ok {
+			return .Caret_Unresolved
+		}
 		doc.block = true
 		doc.block_anchor_line = line
 		doc.block_anchor_cell = cell
@@ -319,7 +355,7 @@ block_extend :: proc(doc: ^Document, t: ^plat.Text, dline, dcell: int) -> bool {
 	// rather than the rectangle simply stopping at the edge.
 	doc.block_cursor_line = max(0, doc.block_cursor_line + dline)
 	doc.block_cursor_cell = max(0, doc.block_cursor_cell + dcell)
-	return true
+	return .None
 }
 
 doc_line_start_of_index :: proc(doc: ^Document, n: int) -> (start: int, ok: bool) {

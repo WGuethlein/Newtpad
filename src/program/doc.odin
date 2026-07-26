@@ -1147,6 +1147,10 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 	doc.cursor = s.cursor
 	doc.anchor = s.anchor
 	doc.nl_delta = s.nl_delta
+	// This bypasses set_cursor, so a live rectangle would otherwise survive
+	// undo/redo describing line/cell offsets a just-restored tree may no
+	// longer have.
+	if block_active(doc) {block_clear(doc)}
 }
 
 @(private = "file")
@@ -1383,6 +1387,10 @@ doc_reload :: proc(doc: ^Document) -> bool {
 	// log-tailing path this feature exists for.
 	doc_index_start(doc)
 	lex_index_start(doc) // same reasoning: doc_close nil'd lex_idx.th too
+	// No block_clear needed: doc^ = fresh above already zeroed every
+	// block_* field (zero-is-initialization), so a live rectangle cannot
+	// survive a reload -- unlike apply_snapshot/doc_select_all/etc, which
+	// mutate doc.cursor/anchor in place and so need an explicit clear.
 	return true
 }
 
@@ -1953,6 +1961,10 @@ doc_delete_word_back :: proc(doc: ^Document) {
 doc_select_all :: proc(doc: ^Document) {
 	doc.anchor = 0
 	doc.cursor = doc.pt.length
+	// Bypasses set_cursor, so a live rectangle must be dropped explicitly --
+	// otherwise Ctrl+A leaves a stale block describing a rectangle that no
+	// longer relates to the (now whole-document) selection.
+	if block_active(doc) {block_clear(doc)}
 }
 
 doc_select_word_at :: proc(doc: ^Document, pos: int) {
@@ -1976,11 +1988,17 @@ doc_select_word_at :: proc(doc: ^Document, pos: int) {
 		doc.anchor = pos
 		doc.cursor = next_rune(doc, pos)
 	}
+	// Bypasses set_cursor -- a double-click word-select must drop a stale
+	// rectangle the same way a plain caret move does.
+	if block_active(doc) {block_clear(doc)}
 }
 
 doc_select_line_at :: proc(doc: ^Document, pos: int) {
 	doc.anchor = base.pt_line_start(&doc.pt, pos)
 	doc.cursor = base.pt_next_line_start(&doc.pt, pos) // include the newline
+	// Bypasses set_cursor -- a triple-click line-select must drop a stale
+	// rectangle the same way a plain caret move does.
+	if block_active(doc) {block_clear(doc)}
 }
 
 // Cell column of byte offset `off` measured from line start `ls` (off >= ls),

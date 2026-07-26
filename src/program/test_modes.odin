@@ -1772,7 +1772,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// also cell 2.
 		doc.wrap = false
 		doc.cursor = 2
-		okE1 := block_extend(&doc, &t, 0, 1)
+		okE1 := block_extend(&doc, &t, 0, 1) == .None
 		cE1 :=
 			okE1 &&
 			block_active(&doc) &&
@@ -1794,10 +1794,10 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// Extending left past cell 0 clamps rather than going negative --
 		// four steps left from cursor_cell=3 must stop at 0, not -1, while
 		// the anchor (still at cell 2, set above) never moves.
-		okE2 := block_extend(&doc, &t, 0, -1) // 3 -> 2
-		okE3 := block_extend(&doc, &t, 0, -1) // 2 -> 1
-		okE4 := block_extend(&doc, &t, 0, -1) // 1 -> 0
-		okE5 := block_extend(&doc, &t, 0, -1) // would be -1: clamp to 0
+		okE2 := block_extend(&doc, &t, 0, -1) == .None // 3 -> 2
+		okE3 := block_extend(&doc, &t, 0, -1) == .None // 2 -> 1
+		okE4 := block_extend(&doc, &t, 0, -1) == .None // 1 -> 0
+		okE5 := block_extend(&doc, &t, 0, -1) == .None // would be -1: clamp to 0
 		cClamp := okE2 && okE3 && okE4 && okE5 && doc.block_cursor_cell == 0 && doc.block_anchor_cell == 2
 		if !cClamp {fail = true}
 		fmt.printfln("  %-6s block_extend clamps left of cell 0: cursor_cell=%d anchor_cell=%d (want 0, 2)", "ok" if cClamp else "FAIL", doc.block_cursor_cell, doc.block_anchor_cell)
@@ -1807,11 +1807,75 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// activating a block nor touching the geometry fields, even on the
 		// very first (seeding) call.
 		doc.wrap = true
-		okW := block_extend(&doc, &t, 0, 1)
-		cW := !okW && !block_active(&doc) && doc.block_anchor_line == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line == 0 && doc.block_cursor_cell == 0
+		refW := block_extend(&doc, &t, 0, 1)
+		cW := refW == .Wrap_On && !block_active(&doc) && doc.block_anchor_line == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line == 0 && doc.block_cursor_cell == 0
 		if !cW {fail = true}
-		fmt.printfln("  %-6s block_extend refuses while wrapped, no state changed: ok=%v block_active=%v", "ok" if cW else "FAIL", okW, block_active(&doc))
+		fmt.printfln("  %-6s block_extend refuses while wrapped, no state changed: refusal=%v block_active=%v", "ok" if cW else "FAIL", refW, block_active(&doc))
 		doc.wrap = false
+
+		// CRITICAL regression: caret_line_cell (and so block_extend) must
+		// REFUSE rather than seed a rectangle at (0,0) when the caret cannot
+		// be resolved within its own scan caps. The old code let both
+		// doc_cursor_line's beyond-STATUS_LINE_CAP fallback and
+		// pt_line_start_cap's exact=false fall back to 0 silently while
+		// still reporting success -- so Alt+Shift+Down on a large file
+		// seeded a rectangle anchored at line 0 / cell 0 instead of
+		// wherever the caret actually was, and reported that it worked.
+		// Sabotage: make caret_line_cell ignore its own `ok` (or have
+		// block_extend ignore caret_line_cell's ok) and both cases below
+		// must FAIL.
+
+		// Axis 1: caret beyond STATUS_LINE_CAP (doc.odin) -- doc_cursor_line
+		// itself returns 0 (unknown line) without even attempting the
+		// column walk. Many short lines so the document's total size
+		// clears the cap; the caret sits at the very end.
+		line_cap_target := STATUS_LINE_CAP + 8 * 4096 // comfortably past the cap
+		line_count := line_cap_target / 8
+		big_lines := make([]u8, line_count * 8)
+		for i in 0 ..< line_count {copy(big_lines[i * 8:i * 8 + 8], "aaaaaaa\n")}
+		bldoc := doc_from_content(big_lines, "", .UTF8)
+		defer doc_close(&bldoc)
+		bldoc.wrap = false
+		bldoc.cursor = len(big_lines) - 1
+		refB := block_extend(&bldoc, &t, 0, 1)
+		cB :=
+			refB == .Caret_Unresolved &&
+			!block_active(&bldoc) &&
+			bldoc.block_anchor_line == 0 &&
+			bldoc.block_anchor_cell == 0 &&
+			bldoc.block_cursor_line == 0 &&
+			bldoc.block_cursor_cell == 0
+		if !cB {fail = true}
+		fmt.printfln(
+			"  %-6s block_extend refuses beyond STATUS_LINE_CAP rather than seeding at line 0: refusal=%v block_active=%v",
+			"ok" if cB else "FAIL",
+			refB,
+			block_active(&bldoc),
+		)
+
+		// Axis 2: caret resolves to a known LINE (well under STATUS_LINE_CAP
+		// in total bytes) but that one line is longer than STATUS_COL_CAP,
+		// so pt_line_start_cap cannot resolve the column -- exact=false.
+		// A single line with no newline at all, longer than STATUS_COL_CAP.
+		giant_line := make([]u8, STATUS_COL_CAP + 4096)
+		mem.set(raw_data(giant_line), 'y', len(giant_line))
+		gldoc := doc_from_content(giant_line, "", .UTF8)
+		defer doc_close(&gldoc)
+		gldoc.wrap = false
+		gldoc.cursor = len(giant_line) - 1
+		refG := block_extend(&gldoc, &t, 0, 1)
+		cG :=
+			refG == .Caret_Unresolved &&
+			!block_active(&gldoc) &&
+			gldoc.block_anchor_line == 0 &&
+			gldoc.block_anchor_cell == 0
+		if !cG {fail = true}
+		fmt.printfln(
+			"  %-6s block_extend refuses beyond STATUS_COL_CAP rather than seeding at cell 0: refusal=%v block_active=%v",
+			"ok" if cG else "FAIL",
+			refG,
+			block_active(&gldoc),
+		)
 
 		// Clearing (task 2): Escape, Toggle_Wrap and a plain caret move must
 		// each drop a live block. These three go through command_dispatch /
@@ -1853,6 +1917,12 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			// real keymap (resolve_key -> command_dispatch), not block_extend
 			// called directly. Bare Alt+Left (shift not held) must still do
 			// nothing -- the whole reason the action re-reads ev.shift.
+			//
+			// Sets up its own state explicitly (block_clear, cursor/anchor)
+			// rather than relying on cArrow above having left the block
+			// cleared -- a case that depends on a PRECEDING case's side
+			// effect fails spuriously whenever something unrelated changes.
+			block_clear(ad)
 			ad.cursor, ad.anchor = 0, 0
 			rcmd := resolve_key(.Right, false, true, .Editor)
 			command_dispatch(rcmd, {.Right, false, true, true}, &a, &dummy, &t, 10) // Alt+Shift+Right
@@ -1879,7 +1949,104 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			if !cBareLeft {fail = true}
 			fmt.printfln("  %-6s bare Alt+Left (no shift) still does nothing: block_active=%v", "ok" if cBareLeft else "FAIL", block_active(ad))
 
+			// IMPORTANT regression: block_extend_dispatch (commands.odin)
+			// used to post the "[COLUMN SELECT NEEDS WRAP OFF...]" note on
+			// ANY refusal. Now that Caret_Unresolved is its own reason, a
+			// beyond-cap refusal must get its own distinct note rather than
+			// sending the user chasing Alt+Z for a problem that has nothing
+			// to do with wrap. Swap ad's content for a single line longer
+			// than STATUS_COL_CAP (same shape as the bare-block_extend axis
+			// 2 case above), then dispatch through the real keymap command
+			// rather than calling block_extend directly.
+			giant_disp := make([]u8, STATUS_COL_CAP + 4096)
+			mem.set(raw_data(giant_disp), 'z', len(giant_disp))
+			doc_close(ad)
+			ad^ = doc_from_content(giant_disp, "", .UTF8)
+			ad.wrap = false
+			ad.cursor = len(giant_disp) - 1
+			ad.anchor = ad.cursor
+			command_dispatch(.Block_Extend_Down, {}, &a, &dummy, &t, 10)
+			noteG := a.notice
+			cNote := !block_active(ad) && strings.contains(noteG, "UNAVAILABLE HERE") && !strings.contains(noteG, "NEEDS WRAP OFF")
+			if !cNote {fail = true}
+			fmt.printfln("  %-6s beyond-cap refusal gets its own note, not the wrap-off one: notice=%q", "ok" if cNote else "FAIL", noteG)
+
 			app_destroy(&a)
+		}
+
+		// Rectangle-clearing regression (IMPORTANT): apply_snapshot (undo),
+		// doc_select_all, doc_select_word_at, doc_select_line_at and
+		// find_select_current all mutate doc.cursor/anchor directly,
+		// bypassing set_cursor -- so a live block survived undo, Select All,
+		// double-click word-select, triple-click line-select and jumping to
+		// a find match. Each case below sets up its own state explicitly
+		// (fresh Document, block seeded fresh) rather than depending on a
+		// neighbouring case, per the same rule as the Alt+Shift+Right fix
+		// above.
+		{
+			// apply_snapshot, via doc_undo (doc.odin): a block active when
+			// an undo lands must not survive it -- the restored tree may no
+			// longer have the rows the rectangle's line/cell pair named.
+			und := doc_from_content(transmute([]u8)strings.clone("hello\nworld\n"), "", .UTF8)
+			defer doc_close(&und)
+			und.wrap = false
+			doc_insert_rune(&und, 'X') // pushes an undo snapshot of the pre-edit state
+			und.block = true
+			und.block_anchor_line, und.block_anchor_cell = 0, 0
+			und.block_cursor_line, und.block_cursor_cell = 1, 2
+			doc_undo(&und)
+			cUndo := !block_active(&und)
+			if !cUndo {fail = true}
+			fmt.printfln("  %-6s undo (apply_snapshot) clears a stale block: block_active=%v", "ok" if cUndo else "FAIL", block_active(&und))
+
+			// doc_select_all (Ctrl+A).
+			sad := doc_from_content(transmute([]u8)strings.clone("hello world\n"), "", .UTF8)
+			defer doc_close(&sad)
+			sad.block = true
+			sad.block_anchor_line, sad.block_anchor_cell = 0, 1
+			sad.block_cursor_line, sad.block_cursor_cell = 0, 3
+			doc_select_all(&sad)
+			cSelAll := !block_active(&sad)
+			if !cSelAll {fail = true}
+			fmt.printfln("  %-6s Select All clears a stale block: block_active=%v", "ok" if cSelAll else "FAIL", block_active(&sad))
+
+			// doc_select_word_at (double-click).
+			swd := doc_from_content(transmute([]u8)strings.clone("hello world\n"), "", .UTF8)
+			defer doc_close(&swd)
+			swd.block = true
+			swd.block_anchor_line, swd.block_anchor_cell = 0, 1
+			swd.block_cursor_line, swd.block_cursor_cell = 0, 3
+			doc_select_word_at(&swd, 2) // inside "hello"
+			cSelWord := !block_active(&swd)
+			if !cSelWord {fail = true}
+			fmt.printfln("  %-6s double-click word-select clears a stale block: block_active=%v", "ok" if cSelWord else "FAIL", block_active(&swd))
+
+			// doc_select_line_at (triple-click).
+			sld := doc_from_content(transmute([]u8)strings.clone("hello world\nsecond line\n"), "", .UTF8)
+			defer doc_close(&sld)
+			sld.block = true
+			sld.block_anchor_line, sld.block_anchor_cell = 0, 1
+			sld.block_cursor_line, sld.block_cursor_cell = 0, 3
+			doc_select_line_at(&sld, 2) // inside the first line
+			cSelLine := !block_active(&sld)
+			if !cSelLine {fail = true}
+			fmt.printfln("  %-6s triple-click line-select clears a stale block: block_active=%v", "ok" if cSelLine else "FAIL", block_active(&sld))
+
+			// find_select_current (find.odin) is file-private; drive it
+			// through the public find_next, which advances f.current and
+			// calls it -- the same path Ctrl+G / F3 takes.
+			fnd := doc_from_content(transmute([]u8)strings.clone("alpha beta gamma\n"), "", .UTF8)
+			defer doc_close(&fnd)
+			fnd.find.matches = []int{6, 11} // "beta" at 6, "gamma" at 11
+			fnd.find.match_len = []int{4, 5}
+			fnd.find.current = -1
+			fnd.block = true
+			fnd.block_anchor_line, fnd.block_anchor_cell = 0, 0
+			fnd.block_cursor_line, fnd.block_cursor_cell = 0, 3
+			find_next(&fnd)
+			cFindSel := !block_active(&fnd)
+			if !cFindSel {fail = true}
+			fmt.printfln("  %-6s jumping to a find match clears a stale block: block_active=%v", "ok" if cFindSel else "FAIL", block_active(&fnd))
 		}
 
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
