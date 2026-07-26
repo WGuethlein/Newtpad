@@ -134,7 +134,7 @@ block_stale_view :: proc(doc: ^Document) -> bool {
 // block_selection_rects when block_active(doc) and doc_selection_rects
 // otherwise. So a linear span that coexists with a rectangle is a selection
 // the user cannot see -- and the commands that drop the rectangle
-// (.Insert_Newline, .Insert_Tab, .Paste, .Delete_Word_Back, .Move_Line_*, via
+// (.Insert_Newline, .Paste, .Delete_Word_Back, .Move_Line_*, via
 // command_dispatch's block-clear branch) then run against doc.anchor..cursor,
 // and doc_insert_text deletes the selection first. The whole-branch review's
 // reproduction: Alt+drag a 4-cell-wide rectangle down 50 lines, then Ctrl+V.
@@ -144,11 +144,18 @@ block_stale_view :: proc(doc: ^Document) -> bool {
 // the keyboard.
 //
 // Every path that establishes a rectangle calls this, so the invariant holds
-// by construction rather than by each command remembering to check. Both
-// gestures also DEGRADE to a linear selection when they refuse (see
-// block_extend's own refusals and main.odin's drag path), which is why this
-// runs only on the success path: on a refusal the linear span is the visible,
-// intended selection.
+// by construction rather than by each command remembering to check. Neither
+// gesture may DEGRADE to a linear selection when it refuses: block_extend's
+// refusals never touch doc.cursor/anchor at all (command_dispatch's
+// Block_Extend_* cases only ever call block_extend_dispatch, nothing else),
+// and block_drag_update (this file) now owns the mouse drag's cursor commit
+// for exactly this reason -- a refusal there leaves doc.cursor untouched
+// too, rather than the pointer-tracking assignment main.odin used to make
+// unconditionally before the refusal was even checked. A live pass caught the
+// old mouse-side behaviour: Alt+drag under word wrap was refused as it should
+// be, but doc.cursor kept tracking the pointer anyway, leaving a full linear
+// selection behind that then outlived the gesture -- and even outlived
+// toggling wrap back off, because a real selection had been drawn.
 block_collapse_linear :: proc(doc: ^Document) {
 	doc.anchor = doc.cursor
 }
@@ -451,8 +458,7 @@ caret_line_start_cell :: proc(doc: ^Document, t: ^plat.Text) -> (line_start, cel
 // Why block_extend refuses, distinct from whether it refused: the two
 // refusal reasons need two different user-facing notes (command_dispatch's
 // dispatcher, commands.odin), and a bare bool can't carry that. Wrap_On is
-// the pre-existing "word-wrap is on" refusal (checked via doc_wraps, so it
-// also covers Markdown Split forcing the editor half to wrap); Caret_Unresolved
+// the pre-existing "word-wrap is on" refusal; Caret_Unresolved
 // covers every endpoint a bounded scan could not turn into a real line start
 // -- the caret further than BLOCK_LINE_STEP_CAP from its own line start, or a
 // vertical step that ran into a row longer than one step's budget. Filter_On is
@@ -461,11 +467,40 @@ caret_line_start_cell :: proc(doc: ^Document, t: ^plat.Text) -> (line_start, cel
 // rows mean something different again -- and telling the user to
 // press Alt+Z (the word-wrap toggle) when the real problem is the filter view
 // would send them chasing the wrong control.
+//
+// Split_On is its own variant for exactly the same reason, split out from
+// Wrap_On rather than folded into it: doc_wraps (doc.odin) is one bool because
+// every ordinary wrap-geometry check (H_SCROLL, doc_cursor_col, eff_wrap_at...)
+// genuinely does not care which of the two forced wrapping -- but the refusal
+// note does, because the two causes have two different fixes. A live-pass
+// report caught the old single Wrap_On note ("press Alt+Z") being shown in
+// Markdown Split, where Alt+Z does nothing at all -- Ctrl+M is the control
+// that actually turns Split (and so the forced wrap) off. block_wrap_refusal
+// below is the one place that decides between them, so the note-choosing
+// switches in commands.odin and main.odin stay a plain one-to-one map and
+// never re-derive the distinction themselves.
 Block_Refusal :: enum {
 	None,
 	Wrap_On,
 	Caret_Unresolved,
 	Filter_On,
+	Split_On,
+}
+
+// The single decision behind Wrap_On vs Split_On -- see Block_Refusal's own
+// comment for why this must be made in exactly one place. Split is checked
+// first: a document can have doc.wrap=true from before Ctrl+M was ever
+// pressed, and Split is the more specific, more actionable cause to report
+// when both happen to be true at once.
+@(private = "file")
+block_wrap_refusal :: proc(doc: ^Document) -> Block_Refusal {
+	if doc.kind == .Text && doc.md_mode == .Split {
+		return .Split_On
+	}
+	if doc.wrap {
+		return .Wrap_On
+	}
+	return .None
 }
 
 // Seed or extend a column rectangle from the keyboard. `dline`/`dcell` are
@@ -498,8 +533,8 @@ block_extend :: proc(doc: ^Document, t: ^plat.Text, dline, dcell: int) -> Block_
 	if doc.filter {
 		return .Filter_On
 	}
-	if doc_wraps(doc) {
-		return .Wrap_On
+	if r := block_wrap_refusal(doc); r != .None {
+		return r
 	}
 	anchor_off, anchor_cell := doc.block_anchor_line_start, doc.block_anchor_cell
 	cursor_off, cursor_cell := doc.block_cursor_line_start, doc.block_cursor_cell
@@ -562,8 +597,8 @@ block_set_from_points :: proc(doc: ^Document, t: ^plat.Text, a_off, a_cell, c_of
 	if doc.filter {
 		return .Filter_On
 	}
-	if doc_wraps(doc) {
-		return .Wrap_On
+	if r := block_wrap_refusal(doc); r != .None {
+		return r
 	}
 	if a_off < 0 || c_off < 0 {
 		return .Caret_Unresolved
@@ -634,9 +669,27 @@ block_drag_press :: proc(d: ^Block_Drag, doc: ^Document, alt: bool, cell: int) {
 	}
 }
 
-// One frame of a drag, after the caller has moved doc.cursor to the pointer.
-// Does nothing at all when the gesture is not an Alt+drag, so a plain drag
+// One frame of a drag, given the pointer's row-resolving byte offset
+// (`cursor_at`, from the caller's doc_pos_at -- the same primitive that
+// resolves a plain click) and its column cell. Does nothing at all when the
+// gesture is not an Alt+drag beyond committing the cursor, so a plain drag
 // pays neither the row resolve nor the rectangle write.
+//
+// This proc OWNS whether doc.cursor actually moves to the pointer this frame,
+// not just whether a rectangle gets built -- a plain (non-Alt) drag always
+// commits, tracking the pointer the way a linear selection always has; an
+// Alt-drag commits ONLY when the rectangle build succeeds. That is the fix for
+// a live-pass finding: main.odin used to set doc.cursor to the pointer before
+// checking the refusal, so a refused Alt-drag (wrap on, filter on, an
+// unresolvable row) still moved the cursor every frame and degraded into an
+// ordinary linear selection nobody asked for -- one that then outlived the
+// very gesture that produced it, surviving even after the refusing condition
+// (e.g. wrap) was toggled back off. A refused Alt-drag must instead leave
+// doc.cursor exactly where this proc found it: no rectangle (block_set_from_
+// points already guarantees that on refusal) and now no cursor move either.
+// The press itself still moves the caret unconditionally -- main.odin's
+// mouse_pressed case does that, same as it does for a plain click -- only the
+// DRAG's extension is withheld once Alt has been refused.
 //
 // Returns the refusal AND whether the caller should post a note for it --
 // `note` is true only on the FIRST refusal of a gesture, which is the whole
@@ -652,14 +705,26 @@ block_drag_press :: proc(d: ^Block_Drag, doc: ^Document, alt: bool, cell: int) {
 // from byte 0 (up to STATUS_LINE_CAP = 4 MiB, measured ~3ms) on every
 // mouse-move frame and produced a line NUMBER the draw then had to walk back
 // into an offset.
-block_drag_update :: proc(d: ^Block_Drag, doc: ^Document, t: ^plat.Text, cell: int) -> (refusal: Block_Refusal, note: bool) {
-	if !d.alt {return .None, false}
-	ls, ok := block_line_start_at(doc, doc.cursor)
+block_drag_update :: proc(d: ^Block_Drag, doc: ^Document, t: ^plat.Text, cursor_at, cell: int) -> (refusal: Block_Refusal, note: bool) {
+	if !d.alt {
+		doc.cursor = cursor_at
+		return .None, false
+	}
+	prev_cursor := doc.cursor
+	// Tentative: block_set_from_points' block_collapse_linear reads doc.cursor
+	// to decide where the (invisible) linear span collapses to on success, so
+	// doc.cursor must already be at the pointer by the time that call runs --
+	// rolled back below if the call refuses.
+	doc.cursor = cursor_at
+	ls, ok := block_line_start_at(doc, cursor_at)
 	cur_off := ls if ok else -1
 	refusal = block_set_from_points(doc, t, d.anchor_off, d.anchor_cell, cur_off, cell)
-	if refusal != .None && !d.refusal_noted {
-		d.refusal_noted = true
-		note = true
+	if refusal != .None {
+		doc.cursor = prev_cursor // undo the tentative move -- see the header comment
+		if !d.refusal_noted {
+			d.refusal_noted = true
+			note = true
+		}
 	}
 	return
 }

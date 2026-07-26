@@ -676,25 +676,26 @@ main :: proc() {
 					doc_scroll(doc, &text, 1, rows)
 				}
 				mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
-				// A refused column drag (below) still lands here: doc.cursor keeps
-				// tracking the pointer and the drag degrades to a normal linear
-				// selection instead of doing nothing. Deliberate, not an oversight --
-				// some feedback under the pointer beats a frozen drag when wrap or
-				// filter mode makes a rectangle impossible.
-				doc.cursor = mp
-				// The column: cell_at_x, the same primitive the draw and the
-				// hit-test use for every other column -- not a second
-				// conversion path from mp's byte offset. Everything else
-				// (the Alt latch, the row resolve, writing the rectangle,
-				// and the once-per-gesture refusal latch) is inside
-				// block_drag_update; it returns .None and note=false for a
-				// plain non-Alt drag, so this costs nothing when the gesture
-				// is not a column select. The wording of each note stays
-				// here because block.odin has never imported the App type.
-				if refusal, note := block_drag_update(&block_drag, doc, &text, cell_at_x(char_w, f32(window.mouse_x))); note {
+				// block_drag_update (block.odin) now owns whether doc.cursor commits
+				// to mp this frame, not just whether a rectangle gets built: always
+				// for a plain drag, only on an ACCEPTED rectangle for an Alt-drag. A
+				// live pass caught the previous version of this code, which set
+				// doc.cursor = mp unconditionally before the refusal was even
+				// checked -- so a refused Alt-drag (wrap on, filter on, Split view)
+				// still tracked the pointer every frame and degraded into an
+				// ordinary linear selection nobody asked for, one that outlived the
+				// gesture and even outlived toggling wrap back off. See
+				// block_drag_update's own comment for the fix. The column:
+				// cell_at_x, the same primitive the draw and the hit-test use for
+				// every other column -- not a second conversion path from mp's byte
+				// offset. The wording of each note stays here because block.odin has
+				// never imported the App type.
+				if refusal, note := block_drag_update(&block_drag, doc, &text, mp, cell_at_x(char_w, f32(window.mouse_x))); note {
 					switch refusal {
 					case .Wrap_On:
 						app_note(&app, "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]")
+					case .Split_On:
+						app_note(&app, "[COLUMN SELECT NEEDS SPLIT OFF - press Ctrl+M]")
 					case .Filter_On:
 						app_note(&app, "[COLUMN SELECT UNAVAILABLE - TURN OFF FILTER]")
 					case .Caret_Unresolved:
