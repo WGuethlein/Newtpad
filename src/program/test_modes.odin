@@ -5241,6 +5241,127 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			)
 		}
 
+		// --- 8: IMPORTANT 4 -- a resync candidate whose own physical line
+		// start lies more than RENDER_LINE_CAP bytes behind it must be
+		// SKIPPED, not validated against whatever pt_line_start_cap/
+		// pt_line_end_cap happen to read when the true line start is
+		// unreachable. lex_resync_state used to discard pt_line_start_cap's
+		// own `exact` flag (`ls, _ :=`), so a front-truncated read got
+		// handed to the validator as if it were the real line -- and once
+		// the candidate sits far enough into the line, the read buffer
+		// doesn't even reach the candidate at all, which made
+		// lex_c_resync_valid return true UNCONDITIONALLY (see that proc's
+		// own comment). Fixture: RENDER_LINE_CAP+500 bytes of filler with NO
+		// newline at all, then the exact same decoy check 7 uses (a string
+		// literal containing "*/") immediately followed by a real,
+		// never-closed block comment opener -- all still on the SAME
+		// physical line (it doesn't end until after "never closes"). The
+		// decoy sits far enough into that line that
+		// pt_line_start_cap(candidate, RENDER_LINE_CAP) cannot reach the
+		// true start (offset 0) and reports exact=false.
+		{
+			filler := strings.repeat("z", RENDER_LINE_CAP + 500, context.temp_allocator)
+			content := strings.concatenate(
+				{filler, `char *s = "*/"; /* real comment opens here and never closes` + "\n", "TARGET\n"},
+				context.temp_allocator,
+			)
+			td: Document
+			td.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&td.pt)
+			td.path = "test.c"
+
+			target := strings.index(content, "TARGET")
+			lexer, _, anchor, validate := highlight_lexer_for(td.path)
+
+			// Window wide enough to reach byte 0 -- the point here isn't the
+			// window bound (checks 3/6 already cover that), it's whether the
+			// front-truncated candidate gets skipped in favour of falling
+			// all the way back to byte 0, which correctly forward-lexes the
+			// WHOLE line and finds the real, never-closed "/*" this time.
+			state, cap_hit := lex_resync_state(&td, target, target, lexer, anchor, validate)
+
+			ok := !cap_hit && state == .In_Comment
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s front-truncated candidate (exact=false) is skipped, not validated: cap=%v state=%v",
+				"ok" if ok else "FAIL",
+				cap_hit,
+				state,
+			)
+		}
+
+		// --- 9: IMPORTANT 5 -- the candidate-validation loop's OWN cost is
+		// now counted into hl_resync_bytes_examined and independently
+		// byte-capped (LEX_RESYNC_MAX_VALIDATE_BYTES), not just
+		// candidate-COUNT-capped (LEX_RESYNC_MAX_CANDIDATES). Before this
+		// fix, NOTHING incremented hl_resync_bytes_examined for this loop at
+		// all -- check 6 above proves the FORWARD walk is window-bounded,
+		// but it calls lex_xml with validate == nil, which never touches the
+		// candidate loop at all, so it could never have caught this. This
+		// fixture is the C-family validated path with far more decoy
+		// candidates in the window (300) than the byte budget can afford to
+		// read (~131 at ~500 bytes each), so the loop must bail out early --
+		// and, since none of the 300 decoys are genuine (each "*/" sits
+		// inside a string), the walk correctly falls through to byte 0 and
+		// recovers the TRUE answer (a real comment opened on line 1 never
+		// closes) despite never having validated most of the candidates.
+		{
+			build_decoy_doc :: proc(num_decoys: int) -> (doc: Document, target: int, decoy_line_len: int) {
+				decoy_line := strings.concatenate(
+					{strings.repeat("z", 480, context.temp_allocator), ` = "decoy */ x";` + "\n"},
+					context.temp_allocator,
+				)
+				decoy_line_len = len(decoy_line)
+				sb := strings.builder_make(context.temp_allocator)
+				strings.write_string(&sb, "/* a real comment that never closes\n")
+				for _ in 0 ..< num_decoys {
+					strings.write_string(&sb, decoy_line)
+				}
+				target = strings.builder_len(sb)
+				strings.write_string(&sb, "TARGET\n")
+				doc.pt = base.pt_init(transmute([]u8)strings.to_string(sb))
+				return
+			}
+
+			num_decoys :: 300
+			dd, target, decoy_line_len := build_decoy_doc(num_decoys)
+			defer base.pt_destroy(&dd.pt)
+			dd.path = "test.c"
+			lexer, _, anchor, validate := highlight_lexer_for(dd.path)
+
+			hl_resync_bytes_examined = 0
+			// window = target-1: win_start ends up at 1 (> 0), so if the
+			// candidate loop never validates anything, lex_resync_state
+			// returns the cap-hit fallback IMMEDIATELY, before ever
+			// reaching the forward-lex loop below it -- isolating
+			// hl_resync_bytes_examined to JUST the candidate-validation
+			// loop's own cost, not conflated with a second contributor. Not
+			// quite the whole document, so nearly all 300 decoys are
+			// textually visible as candidates -- far more than the ~131 the
+			// byte budget can afford to read at ~500 bytes each.
+			window := target - 1
+			state, cap_hit := lex_resync_state(&dd, target, window, lexer, anchor, validate)
+			bytes_examined := hl_resync_bytes_examined
+			total_decoy_bytes := num_decoys * decoy_line_len
+
+			ok :=
+				cap_hit &&
+				state == .Normal && // the documented cap-hit fallback -- every decoy correctly rejected, none validated
+				bytes_examined > 0 && // was ALWAYS 0 before this fix -- the counter never saw this loop
+				bytes_examined <= LEX_RESYNC_MAX_VALIDATE_BYTES + RENDER_LINE_CAP && // budget + one line's overshoot slack
+				bytes_examined < total_decoy_bytes / 2 // proves the loop bailed EARLY, not after reading close to all 300 decoys
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s candidate-validation cost is counted and byte-capped: examined=%d/%d cap=%v state=%v (budget=%d)",
+				"ok" if ok else "FAIL",
+				bytes_examined,
+				total_decoy_bytes,
+				cap_hit,
+				state,
+				LEX_RESYNC_MAX_VALIDATE_BYTES,
+			)
+		}
+
 		fmt.println("lexstatetest: FAILURES" if fail else "lexstatetest: all ok")
 		return true
 	}

@@ -190,10 +190,36 @@ LEX_FILTER_RESYNC_WINDOW :: 4 * 1024
 // comments) still can't turn validation into unbounded per-candidate work —
 // once this many tries have failed, it's treated exactly like "the anchor
 // was never found" (cap-hit, or byte 0 if reached).
+//
+// IMPORTANT 5 (2026-07 review): this bounds candidate COUNT, not candidate
+// COST. Each candidate's validation reads up to RENDER_LINE_CAP (8 KiB) of
+// the piece table (see the candidate loop below), so 256 candidates could
+// read up to 2 MiB per call before this bound ever engages — reachable
+// EVERY FRAME in filter mode, where this whole proc runs once per visible
+// row (~3,000 rows/frame while filtering, per LEX_FILTER_RESYNC_WINDOW's own
+// comment). That is real, previously UNINSTRUMENTED cost: this reaches
+// outside the resync window lex_resync_state's own header comment claims
+// ("visits at most window bytes"), and nothing incremented
+// hl_resync_bytes_examined for it, so lexstatetest's window-bounded
+// assertion passed regardless of how much the validation loop actually
+// read. See LEX_RESYNC_MAX_VALIDATE_BYTES immediately below for the
+// independent byte budget that closes this, and lex_resync_state's header
+// comment for the corrected total-cost claim.
 LEX_RESYNC_MAX_CANDIDATES :: 256
 
-// Total bytes handed to a lexer by lex_resync_state's forward walk,
-// accumulated across calls. The counterpart to highlight.odin's
+// Independent BYTE budget on the candidate-validation loop (see IMPORTANT 5
+// above): stops the loop once this many bytes have been read for
+// validation, regardless of how many candidates that was or how far below
+// LEX_RESYNC_MAX_CANDIDATES the try count still is. Chosen as roughly the
+// size of one normal (non-filter) resync window — a validated resync's
+// worst-case total cost is therefore on the order of THREE windows (the
+// anchor's own textual scan, this budget, and the forward lex), not the
+// unbounded-in-practice 2 MiB the try-count bound alone allowed.
+LEX_RESYNC_MAX_VALIDATE_BYTES :: 64 * 1024
+
+// Total bytes handed to a lexer, accumulated across calls: both
+// lex_resync_state's own forward walk AND (since the 2026-07 review above)
+// its candidate-validation loop. The counterpart to highlight.odin's
 // hl_bytes_examined, but deliberately a SEPARATE counter rather than reusing
 // that one: hl_bytes_examined is only ever touched inside highlight_row_spans,
 // and lex_resync_state calls the lexer directly, never through
@@ -201,10 +227,13 @@ LEX_RESYNC_MAX_CANDIDATES :: 256
 // assertion to a stateful lexer without this counter would pass even if the
 // resync scanned the whole file, because the assertion would be watching a
 // path this code never runs through. Exists for lexstatetest to prove the
-// resync's cost is bounded by `window`, not by document size. Not touched by
-// lex_index_worker (the background index) — that runs on its own thread, and
-// a worker incrementing a plain global here would race the main thread's
-// reads of it, the same reason hl_bytes_examined is main-thread-only today.
+// resync's cost is bounded, not just by the forward walk but by the WHOLE
+// proc — see IMPORTANT 5's history: a counter that only watched the forward
+// walk is exactly what let the validation loop's cost go unnoticed the
+// first time. Not touched by lex_index_worker (the background index) — that
+// runs on its own thread, and a worker incrementing a plain global here
+// would race the main thread's reads of it, the same reason
+// hl_bytes_examined is main-thread-only today.
 hl_resync_bytes_examined: int
 
 // The Lex_State in effect at byte offset `at` for whichever lexer doc's path
@@ -265,14 +294,30 @@ doc_lex_state_at :: proc(doc: ^Document, at: int, window: int) -> base.Lex_State
 // start). `cap_hit` is returned so a test can assert on it directly instead
 // of inferring it from a wrong colour.
 //
-// Bounded to `window` bytes of forward lexing: the anchor (or byte 0) is
-// found at or after target-window, so lexing from there to target visits at
-// most `window` bytes of the buffer, regardless of the document's size.
-// hl_resync_bytes_examined tallies exactly those bytes (see its own comment)
-// — a separate counter from highlight_row_spans's hl_bytes_examined, because
-// this proc is called directly by doc_draw's bootstrap and by the filter
-// view, never through highlight_row_spans, so nothing else would ever see
-// this path's cost.
+// The FORWARD-LEXING half of this proc is bounded to `window` bytes: the
+// anchor (or byte 0) is found at or after target-window, so lexing from
+// there to target visits at most `window` bytes of the buffer, regardless of
+// the document's size.
+//
+// CORRECTED CLAIM (2026-07 review, IMPORTANT 5): an earlier version of this
+// comment stopped there and said this proc "visits at most window bytes" —
+// true of the forward walk alone, but false of the proc as a WHOLE once
+// `validate` is non-nil. Each candidate the walk below tries reads up to
+// RENDER_LINE_CAP (8 KiB) more from the piece table, entirely OUTSIDE
+// `window`, up to LEX_RESYNC_MAX_CANDIDATES times — a real cost this
+// comment used to claim couldn't exist, and hl_resync_bytes_examined used to
+// not count at all, so lexstatetest's window-bounded assertion passed
+// regardless of how much the validation loop actually read. Both are fixed
+// now: the candidate loop is ALSO capped by total bytes read
+// (LEX_RESYNC_MAX_VALIDATE_BYTES, independent of candidate count), and every
+// byte it reads is tallied into hl_resync_bytes_examined too — see that
+// counter's own comment. The real total worst case, honestly: `window`
+// (anchor scan) + LEX_RESYNC_MAX_VALIDATE_BYTES (validation, only when
+// `validate` is non-nil) + `window` (forward lex) — bounded, but no longer
+// just `window`. hl_resync_bytes_examined is a separate counter from
+// highlight_row_spans's hl_bytes_examined because this proc is called
+// directly by doc_draw's bootstrap and by the filter view, never through
+// highlight_row_spans, so nothing else would ever see this path's cost.
 //
 // `validate`, when non-nil, is consulted before ANY candidate occurrence of
 // `anchor` is trusted (see Resync_Validate_Proc's comment, highlight.odin,
@@ -286,6 +331,19 @@ doc_lex_state_at :: proc(doc: ^Document, at: int, window: int) -> base.Lex_State
 // that contains it, and the first (i.e. latest) one that validates wins —
 // so a "*/" inside a string or line comment is skipped in favour of an
 // earlier, real comment-close, rather than corrupting the resync.
+//
+// IMPORTANT 4 (2026-07 review): each candidate's physical line is located
+// via pt_line_start_cap, which — on a line longer than RENDER_LINE_CAP —
+// returns a scan FLOOR, not the true line start, and says so via its own
+// `exact` return value. This proc used to discard that flag (`ls, _ :=`),
+// so a front-truncated read got handed to `validate` as if it were the real
+// line: a string/comment opener further back on the true line becomes
+// invisible, and once the candidate sits >= RENDER_LINE_CAP bytes past the
+// true start, the read buffer doesn't even reach the candidate at all —
+// which made lex_c_resync_valid return true unconditionally (see that
+// proc's own corrected comment). Fixed below: a candidate is now SKIPPED
+// entirely (not validated, not accepted) whenever `exact` is false, exactly
+// like "I cannot know" everywhere else in this fix.
 lex_resync_state :: proc(
 	doc: ^Document,
 	target: int,
@@ -326,6 +384,7 @@ lex_resync_state :: proc(
 		// same cap the forward walk below already respects) so `validate`
 		// sees real line content, not an arbitrary window-relative slice.
 		tries := 0
+		validate_bytes := 0 // IMPORTANT 5: independent byte budget, see LEX_RESYNC_MAX_VALIDATE_BYTES
 		k := len(scan) - al
 		// Declared once, outside the loop: pt_read below always fills exactly
 		// `ln` bytes from index 0 and every read only ever looks at `lb[:ln]`,
@@ -346,14 +405,26 @@ lex_resync_state :: proc(
 				tries += 1
 				cand_start_abs := win_start + k
 				cand_end_abs := win_start + k + al
-				ls, _ := base.pt_line_start_cap(&doc.pt, cand_start_abs, RENDER_LINE_CAP)
-				le := base.pt_line_end_cap(&doc.pt, ls, RENDER_LINE_CAP)
-				ln := base.pt_read(&doc.pt, ls, lb[:min(le - ls, len(lb))])
-				if validate(lb[:ln], cand_end_abs - ls) {
-					from = k + al
-					break cand_loop
+				// IMPORTANT 4: `exact` false means `ls` is a scan FLOOR, not
+				// the candidate's true physical line start -- validating
+				// against that (possibly front-truncated, possibly not even
+				// reaching the candidate at all) buffer is exactly how a
+				// front-truncated read used to manufacture a false ACCEPT
+				// (see base.lex_c_resync_valid's corrected comment). Skip
+				// this candidate entirely rather than hand it a line it
+				// cannot trust; the walk just tries an earlier occurrence.
+				ls, exact := base.pt_line_start_cap(&doc.pt, cand_start_abs, RENDER_LINE_CAP)
+				if exact {
+					le := base.pt_line_end_cap(&doc.pt, ls, RENDER_LINE_CAP)
+					ln := base.pt_read(&doc.pt, ls, lb[:min(le - ls, len(lb))])
+					hl_resync_bytes_examined += ln // IMPORTANT 5: count validation reads too
+					validate_bytes += ln
+					if validate(lb[:ln], cand_end_abs - ls) {
+						from = k + al
+						break cand_loop
+					}
 				}
-				if tries >= LEX_RESYNC_MAX_CANDIDATES {break cand_loop}
+				if tries >= LEX_RESYNC_MAX_CANDIDATES || validate_bytes >= LEX_RESYNC_MAX_VALIDATE_BYTES {break cand_loop}
 			}
 			k -= 1
 		}
