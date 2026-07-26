@@ -4365,6 +4365,18 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("  %-6s shell_open_folder refuses a missing path", "ok" if g2 else "FAIL")
 		if !g2 {bad += 1}
 
+		// The lpParameters string handed to explorer.exe must be quoted, or a
+		// space in the path (an %APPDATA% under a Windows user name with a
+		// space, for instance) truncates it or splits it into extra arguments.
+		// This never calls ShellExecuteW -- it only checks the pure argument
+		// builder's output.
+		g3 := plat.explorer_folder_arg("C:\\Users\\John Doe\\AppData\\Roaming\\Newtpad\\logs") == "\"C:\\Users\\John Doe\\AppData\\Roaming\\Newtpad\\logs\""
+		fmt.printfln("  %-6s explorer_folder_arg quotes a path with a space", "ok" if g3 else "FAIL")
+		if !g3 {bad += 1}
+		g4 := plat.explorer_select_arg("C:\\Users\\John Doe\\x.txt") == "/select,\"C:\\Users\\John Doe\\x.txt\""
+		fmt.printfln("  %-6s explorer_select_arg quotes a path with a space", "ok" if g4 else "FAIL")
+		if !g4 {bad += 1}
+
 		fmt.println("--- drawn span == clickable span ---")
 		// The underline is drawn from Link_Hit.col/cells and links_hit tests the
 		// same fields, so they cannot disagree by construction. This asserts the

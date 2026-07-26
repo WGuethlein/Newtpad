@@ -513,12 +513,27 @@ shell_open_url :: proc(url: string) -> bool {
 	return uintptr(rawptr(r)) > 32 // ShellExecute's documented success threshold
 }
 
+// The /select,"path" argument for revealing `path` in Explorer, quoted so a
+// comma or space in the name (an %APPDATA% under a Windows user name with a
+// space, for instance) doesn't truncate it or get split into extra arguments.
+// Pure and allocator-parameterized so a test can assert on its output without
+// touching ShellExecuteW.
+explorer_select_arg :: proc(path: string, allocator := context.temp_allocator) -> string {
+	return strings.concatenate({"/select,\"", path, "\""}, allocator)
+}
+
+// The quoted lpParameters for opening `path` as a folder in Explorer. Same
+// quoting rule as explorer_select_arg, and the same reason: an unquoted space
+// in the path splits it into multiple ShellExecuteW arguments.
+explorer_folder_arg :: proc(path: string, allocator := context.temp_allocator) -> string {
+	return strings.concatenate({"\"", path, "\""}, allocator)
+}
+
 // Select `path` in Explorer rather than opening it. This is what a non-text
 // file gets: the user sees where it is and decides what to do, and nothing we
 // did executed it.
 shell_reveal :: proc(path: string) -> bool {
-	// /select, needs the path quoted or a comma or space in the name truncates it.
-	arg := strings.concatenate({"/select,\"", path, "\""}, context.temp_allocator)
+	arg := explorer_select_arg(path)
 	warg := win.utf8_to_wstring(arg, context.temp_allocator)
 	wexe := win.utf8_to_wstring("explorer.exe", context.temp_allocator)
 	wop := win.utf8_to_wstring("open", context.temp_allocator)
@@ -536,7 +551,8 @@ shell_open_folder :: proc(path: string) -> bool {
 	if !exists || !is_dir {
 		return false
 	}
-	warg := win.utf8_to_wstring(path, context.temp_allocator)
+	arg := explorer_folder_arg(path)
+	warg := win.utf8_to_wstring(arg, context.temp_allocator)
 	wexe := win.utf8_to_wstring("explorer.exe", context.temp_allocator)
 	wop := win.utf8_to_wstring("open", context.temp_allocator)
 	r := win.ShellExecuteW(nil, wop, wexe, warg, nil, win.SW_SHOWNORMAL)

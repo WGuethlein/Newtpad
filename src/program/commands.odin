@@ -1134,6 +1134,8 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			if !plat.shell_open_folder(logs) {
 				app_note(app, "[COULD NOT OPEN THE LOGS FOLDER]")
 			}
+		} else {
+			app_note(app, "[COULD NOT OPEN THE LOGS FOLDER]")
 		}
 	case .Settings_Close:
 		request_close_tab(app, app.active, w)
