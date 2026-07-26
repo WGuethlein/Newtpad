@@ -358,9 +358,46 @@ highlight_kind_role :: proc(k: base.Token_Kind) -> Color_Role {
 }
 
 // Tokens per row a pattern lexer can produce before highlight_row_spans stops
-// converting them. A screen row is bounded by VISIBLE_COLS cells; this is
-// generous headroom without ever allocating.
-HL_MAX_ROW_TOKENS :: 64
+// converting them — and the size of every fixed token/span array on the row
+// path: highlight_row_spans's `toks`, doc_draw's `hl_buf`,
+// Highlight_Row_Cache.cur_buf, highlight_merge_spans's `survivors`, and
+// lex_resync_state's / the index worker's `tok_buf`.
+//
+// The bound is in TOKENS, and a token is not a character: lex_c emits one per
+// punctuation BYTE (its `.Punct` branch, lex_c.odin), so density swings by
+// nearly 4x with the content. Measured by running the real lexers over real
+// input (2026-07 review):
+//
+//   hand-written source, this repo through lex_c/ODIN_KW:  4.9–5.9 chars/token
+//                                     worst single line:  46 tokens / 223 chars
+//   dense C / minified JS / minified JSON:                 2.2 / 1.8 / 1.5 chars/token
+//
+// 512 therefore covers ~2,500 characters of ordinary source — past
+// VISIBLE_COLS, the 2,048 cells a row can actually show — but only ~770 of
+// minified JSON, the densest real content measured. The value this replaced,
+// 64, covered ~100 characters of that and ~370 of ordinary code, justified as
+// "a screen row is bounded by VISIBLE_COLS cells; generous headroom": wrong
+// by more than 10x, and on a minified .js/.css/.json it meant colouring
+// stopped a tenth of the way across the row.
+//
+// Covering VISIBLE_COLS unconditionally would take 2,048 (a row of pure
+// punctuation really is one token per byte) — 64 KB per span array, ~160 KB
+// in doc_draw's frame alone. 512 is where the trade sits: 16 KB per
+// Text_Span array (32 B each), 12 KB per Token array (24 B each), ~43 KB in
+// doc_draw's frame including the row cache, and no frame over 64 KB.
+//
+// Past the cap, colouring stops but the row still DRAWS in full
+// (text_draw_spans simply runs out of spans), and the lexer's state_out is
+// still correct — every lexer keeps SCANNING once `out` is full rather than
+// returning early with whatever state it had reached. That invariant is
+// checked, not assumed: all five stateful lexers (lex_xml, lex_c,
+// lex_markdown, lex_yaml, lex_shell) guard each emit with `n < len(out)` and
+// never break their scan loop on it, and the four line-local ones (lex_log,
+// lex_json, lex_delimited, lex_config) do stop scanning when `out` fills,
+// which is sound only because their state_out is unconditionally .Normal.
+// See the "Keep lex_xml scanning for state past its token cap" fix earlier in
+// this branch for the bug this exists because of.
+HL_MAX_ROW_TOKENS :: 512
 
 // Total bytes handed to a lexer, accumulated across calls. Exists only for
 // highlighttest (test_modes.odin) to prove the per-frame cost is
