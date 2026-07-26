@@ -18,9 +18,16 @@ whole-branch review at the end, sabotage every test, then HANDOFF entry → vers
 `install.ps1`. It also carries the two bug *shapes* this codebase keeps producing and the
 operational traps that have each cost a session real time. Unlike `CLAUDE.md`, it is committed.
 
-**Immediate next step: batch 5 — column/block editing (§6u).** v0.13.0 and v0.14.0 are both released
-(2026-07-26). **§6x is the most recent state**; its "Owed and open" is where Wyatt's theme-tuning pass
-lives, and that pass is the point of the batch.
+**Immediate next step: batch 5 — column/block editing — is IN FLIGHT on `feat/column-editing`.**
+Task 1 of 6 is complete (the rectangle model and `block_row_range`); tasks 2–6 are not started. The
+plan is `docs/superpowers/plans/2026-07-26-column-editing.md`, the spec is beside it, and
+`.superpowers/sdd/progress.md` carries what each review found — **read that ledger before dispatching
+anything, it records a per-row perf constraint task 2 must respect.** Do not merge that branch
+without Wyatt's live pass: it mutates text across many lines at once and this environment cannot
+inject GUI input.
+
+v0.13.0 and v0.14.0 are both released (2026-07-26). **§6x is the most recent shipped state**; its
+"Owed and open" is where Wyatt's theme-tuning pass lives, and that pass is the point of that batch.
 
 ## 1. What Newtpad is
 
