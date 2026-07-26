@@ -5,6 +5,7 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -1689,6 +1690,55 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		cZ := zls_ok && okZ && zlo == zls && zhi == zls && padZ == 0
 		if !cZ {fail = true}
 		fmt.printfln("  %-6s zero-width rune at the column: bytes [%d,%d) rel to line_start=%d (want [0,0))", "ok" if cZ else "FAIL", zlo - zls, zhi - zls, zls)
+
+		// IMPORTANT regression: a row that genuinely ends with an incomplete
+		// multi-byte sequence -- a real file with a malformed tail, not a
+		// chunk-boundary split -- must still resolve via the rule-5 clamp,
+		// not refuse the whole row. "abcd\xE4\xB8" is 6 bytes; \xE4 wants a
+		// 3-byte encoding but only one continuation byte follows before the
+		// document itself ends. Both bytes must decode as RUNE_ERROR width 1
+		// and count as ordinary content -- the same as line_wrap_decision and
+		// wrap_row_end already treat them, and the same as the renderer draws
+		// them -- so the walk clamps to what it found: [0,6), ok=true. The
+		// old code refused the entire row here (ok=false) instead.
+		trunc := make([]u8, 6)
+		trunc[0], trunc[1], trunc[2], trunc[3] = 'a', 'b', 'c', 'd'
+		trunc[4], trunc[5] = 0xE4, 0xB8
+		tdoc := doc_from_content(trunc, "", .UTF8)
+		defer doc_close(&tdoc)
+		tlo, thi, padT, okT := block_row_range(&tdoc, &t, 0, 0, 10)
+		cT := okT && tlo == 0 && thi == 6 && padT == 0
+		if !cT {fail = true}
+		fmt.printfln("  %-6s truncated multi-byte tail at row's real end clamps: bytes [%d,%d) ok=%v (want [0,6) ok=true)", "ok" if cT else "FAIL", tlo, thi, okT)
+
+		// IMPORTANT regression: doc_line_start_of_index must refuse a line
+		// past DOC_LINE_INDEX_CAP WITHOUT first scanning the whole line to
+		// find that out. The old code walked via pt_next_line_start, which
+		// calls the UNCAPPED pt_line_end, so the cap check could only fire
+		// after an unbounded scan had already happened -- measured at 151ms
+		// for a 64MB single line before this fix. This builds the same shape
+		// of document (one line, no trailing newline, far longer than the
+		// cap) and asserts BOTH that the call refuses (ok=false) AND that it
+		// returns quickly: a bounded walk over ~DOC_LINE_INDEX_CAP bytes,
+		// chunked through 4096-byte reads, should take low single-digit
+		// milliseconds, not the ~150ms an unbounded scan of the whole 64MB
+		// line would cost.
+		huge := make([]u8, 64 * 1024 * 1024)
+		mem.set(raw_data(huge), 'x', len(huge))
+		hdoc := doc_from_content(huge, "", .UTF8)
+		defer doc_close(&hdoc)
+		hstart := time.now()
+		_, hok := doc_line_start_of_index(&hdoc, 1)
+		helapsed := time.since(hstart)
+		hms := time.duration_milliseconds(helapsed)
+		cH := !hok && hms < 50
+		if !cH {fail = true}
+		fmt.printfln(
+			"  %-6s single line past DOC_LINE_INDEX_CAP refuses without scanning it all: ok=%v elapsed=%.2fms (want ok=false, <50ms)",
+			"ok" if cH else "FAIL",
+			hok,
+			hms,
+		)
 
 		// block_bounds normalises regardless of drag direction: up-and-left
 		// must describe the same rectangle as down-and-right from the other

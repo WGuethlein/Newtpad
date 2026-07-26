@@ -141,13 +141,23 @@ block_row_range :: proc(doc: ^Document, t: ^plat.Text, line_start: int, cell_lo,
 					// at this rune's own lead byte so the next read begins
 					// with the complete encoding, then decode before counting
 					// anything. Nothing has been counted for this rune yet.
+					// Safe against the `if i == 0 {break}` guard below: this
+					// always advances p (i is the position of the incomplete
+					// rune's lead byte within the current, non-empty buffer),
+					// and pt_read never short-reads below pt.length, so the
+					// next iteration is guaranteed to make progress.
 					p += i
 					continue outer
 				}
-				// The row's own real end cut the rune off; there is nothing
-				// left to refill with. Refuse rather than count the partial
-				// bytes as a rune of their own.
-				return line_start, line_start, 0, false
+				// The row's own real end cut the rune off, not a chunk
+				// boundary -- there is nothing left to refill with. Fall
+				// through to decode_rune, which can't tell "truncated by
+				// chunk" apart from "truncated for real" and returns
+				// (RUNE_ERROR, 1) either way. That is the right answer here:
+				// every other row walk in this tree (line_wrap_decision,
+				// wrap_row_end) counts these bytes as RUNE_ERROR and the
+				// renderer draws them, so this walk must agree rather than
+				// refuse the whole row over its last one or two bytes.
 			}
 			r, sz := utf8.decode_rune(buf[i:n])
 			if sz == 0 {sz = 1}
@@ -211,35 +221,77 @@ block_row_range :: proc(doc: ^Document, t: ^plat.Text, line_start: int, cell_lo,
 // n), so calling it once per mouse-move frame (tasks 2/3) or once per row of
 // a rectangle (tasks 4/5) is quadratic over a rectangle that sits deep in a
 // large file -- exactly the "forward scanning is safe" mistake this codebase
-// has frozen on before (see pt_line_start_cap). Capping the walk and
-// refusing past the cap keeps one call's cost bounded and honest instead of
-// silently going quadratic; it does not remove the cost. If a later task
-// needs this per-frame against a realistically large document, the real
-// answer is a row iterator or a cached line index, not a bigger number here.
+// has frozen on before (see pt_line_start_cap). This bounds the walk's TOTAL
+// cost across every line it steps through, not just the count of lines --
+// each step is itself capped (via pt_line_end_cap) so a single pathologically
+// long line can't blow the budget before the per-iteration guard gets a
+// chance to fire. Capping the walk and refusing past the cap keeps one call's
+// cost bounded and honest instead of silently going quadratic (or, on one
+// long enough line, silently going linear in the whole document); it does
+// not remove the cost. If a later task needs this per-frame against a
+// realistically large document, the real answer is a row iterator or a
+// cached line index, not a bigger number here.
 DOC_LINE_INDEX_CAP :: BLOCK_ROW_CAP * 64
 
 // Byte offset of the start of 0-based logical line `n`. Walks FORWARD from 0
 // by a known, small line count -- the doc_goto_line idiom (doc.odin) -- which
 // is why this is safe where base.pt_line_start is not: pt_line_start scans
 // BACKWARD from an arbitrary offset with no bound, the exact hazard
-// doc.odin:1853 documents, while stepping forward through pt_next_line_start
-// costs only the lines actually walked. Added here because no "line N -> byte
-// offset" helper existed anywhere in the tree before this task, and the
-// keyboard and mouse gestures (later tasks) both need one to turn a target
-// logical line into the line_start block_row_range takes.
+// doc.odin:1853 documents, while stepping forward via the CAPPED
+// pt_line_end_cap costs only the lines actually walked, bounded by
+// DOC_LINE_INDEX_CAP total regardless of how long any one of those lines is.
+// Added here because no "line N -> byte offset" helper existed anywhere in
+// the tree before this task, and the keyboard and mouse gestures (later
+// tasks) both need one to turn a target logical line into the line_start
+// block_row_range takes.
 //
 // `ok` is false when the walk passed DOC_LINE_INDEX_CAP bytes before reaching
 // line n -- the same refuse-rather-than-guess contract as block_row_range's
-// own ok. Callers must not use `start` when ok is false.
+// own ok. Callers must not use `start` when ok is false. If n is at or past
+// the document's last line, the walk simply runs out of newlines first (the
+// real end of the document, not a cap break) and returns (pt.length, true) --
+// there is no line n to refuse, so clamping to the document's end is the
+// honest answer, not a guess. This clamp is silent by design, the same as
+// pt_next_line_start's own EOF behaviour; it is not itself a bug.
+//
+// Measured at ~2.9ms per call at the cap (debug build). Fine for a one-shot
+// click; NOT for a per-row loop or once per mouse-move frame -- 40 rows would
+// be ~120ms of main-thread work in one frame. Callers needing many rows must
+// resolve line_start ONCE here and then step forward row-by-row from that
+// already-resolved offset (block_row_end / a visible-row iterator), never by
+// calling this once per row.
 doc_line_start_of_index :: proc(doc: ^Document, n: int) -> (start: int, ok: bool) {
 	p := 0
 	for _ in 0 ..< n {
-		if p > DOC_LINE_INDEX_CAP {
+		if p >= DOC_LINE_INDEX_CAP {
 			return p, false
 		}
-		np := base.pt_next_line_start(&doc.pt, p)
-		if np == p {break}
-		p = np
+		// Step via the CAPPED primitive, not pt_next_line_start -- that proc
+		// calls pt_line_end, which is uncapped, so a single pathologically
+		// long line would already have been scanned in full before the guard
+		// above ever got a chance to fire. (Measured: a 64MB single-line
+		// document took 151ms and only THEN returned ok=false -- the walk
+		// had scanned the whole line before checking the cap it claimed to
+		// respect.) Passing DOC_LINE_INDEX_CAP - p as the per-step cap means
+		// the absolute offset this step can reach is always exactly
+		// DOC_LINE_INDEX_CAP, so no single step -- and therefore no single
+		// line, however long -- can scan past the walk's total budget.
+		e := base.pt_line_end_cap(&doc.pt, p, DOC_LINE_INDEX_CAP - p)
+		if e >= doc.pt.length {
+			// Real end of document, not a cap break: line n doesn't exist.
+			// Clamp rather than refuse -- see the doc comment above.
+			p = doc.pt.length
+			break
+		}
+		if e >= DOC_LINE_INDEX_CAP {
+			// Hit the cap without finding this line's '\n' -- or, per
+			// pt_line_end_cap's own contract, found one exactly at the cap
+			// boundary, indistinguishable from the truncated case. Either
+			// way, refuse rather than guess: the same rule block_row_end
+			// applies for BLOCK_ROW_CAP.
+			return p, false
+		}
+		p = e + 1
 	}
-	return p, p <= DOC_LINE_INDEX_CAP
+	return p, true
 }
