@@ -18,16 +18,13 @@ whole-branch review at the end, sabotage every test, then HANDOFF entry → vers
 `install.ps1`. It also carries the two bug *shapes* this codebase keeps producing and the
 operational traps that have each cost a session real time. Unlike `CLAUDE.md`, it is committed.
 
-**Immediate next step: batch 5 — column/block editing — is IN FLIGHT on `feat/column-editing`.**
-Task 1 of 6 is complete (the rectangle model and `block_row_range`); tasks 2–6 are not started. The
-plan is `docs/superpowers/plans/2026-07-26-column-editing.md`, the spec is beside it, and
-`.superpowers/sdd/progress.md` carries what each review found — **read that ledger before dispatching
-anything, it records a per-row perf constraint task 2 must respect.** Do not merge that branch
-without Wyatt's live pass: it mutates text across many lines at once and this environment cannot
-inject GUI input.
+**Immediate next step: batch 6 (§6u) — session persistence for `md_mode`/`table`, `doc_reload`
+keeping the view, the `on_resize`/`on_dpi` crash-reporter fix, an "Open Logs Folder" command, and
+encoding commands in the menus.**
 
-v0.13.0 and v0.14.0 are both released (2026-07-26). **§6x is the most recent shipped state**; its
-"Owed and open" is where Wyatt's theme-tuning pass lives, and that pass is the point of that batch.
+v0.13.0, v0.14.0 and v0.15.0 are all released (2026-07-26). **§6y is the most recent shipped state**
+(column editing). Two live passes are owed and both are ranked in their sections: §6y's gesture list
+— item 1 is the one that was a merge blocker — and §6x's theme-tuning pass.
 
 ## 1. What Newtpad is
 
@@ -134,6 +131,14 @@ were the priorities. Read P2 as the live list, with these amendments:
   started. Ruled out: the `@(test)` corpus (removing all twelve `src/base/*_test.odin` changed
   nothing). The remainder is LLVM at `-o:speed`. Belongs in the ship-readiness batch, not to a
   feature batch.
+- **A multi-row edit fragments the piece tree, so every later keystroke costs more.** A column edit
+  issues one independent splice per row, and the treap fragments as it goes: with a 2,000-row
+  rectangle, press 1 cost 7.9 ms and press 20 cost **69.5 ms**, still climbing (release build). The
+  workaround shipped in §6y is `BLOCK_EDIT_MAX_LINES :: 300`, where press 20 is 8.2 ms — but that is
+  a real functional limit on a feature whose headline use is "prefix every line", and 1,000-line
+  files are ordinary. **The fix is a batched multi-range splice** so N rows cost one restructuring
+  rather than N; that would let the cap go back to thousands. Until then the constant is a workaround
+  wearing a cap's clothes.
 - **`Highlight_Row_Cache.cur_buf` is a row-sized token budget filled from a whole line.** On
   `doc_row_lex_spans`'s whole-line path the 512-span array covers a logical line of up to
   `RENDER_LINE_CAP` (8192) bytes, so a dense enough wrapped line — measured: a 4.5 KB minified-JS
@@ -1930,6 +1935,129 @@ agreed with it.** Sabotage caught one, a reviewer with the whole branch in view 
   tail. One concrete tidy-up: `theme_role_keys` and its two accessors are pure and belong with
   `Color_Role`, but sit below the `// --- theme files ---` banner. Move them above it and the eventual
   cut is one horizontal line.
+
+## 6y. Column / block editing (2026-07-26, v0.15.0, branch `feat/column-editing`)
+
+Batch 5 of §6u, and **V1 decision #1** — research §G's "consensus #1 gap", flagged by four of six
+research lenses and never started until now. Alt+drag or Alt+Shift+arrows makes a rectangle; typing
+replaces across every row; a zero-width rectangle acts as N carets so lines can be prefixed;
+Backspace/Delete work across it; copy/cut yield the rows as lines. Ctrl+D stayed out, per §6u.
+
+Design in `docs/superpowers/specs/2026-07-26-column-editing-design.md`, plan beside it.
+
+### The fork that had to be answered first
+
+A rectangle is defined over screen rows. With word wrap **on**, one logical line is many visual rows,
+so "rows 10-13" means either four wrapped fragments of a single line or four whole lines — and those
+produce different edits from the same gesture, with the visual reading depending on window width.
+The spec stopped and asked rather than guessing. **Wyatt chose: column select requires wrap off.** It
+is the only option where the same gesture on the same file always produces the same edit.
+
+That answer is why `block_*` fields mean *logical* lines everywhere, and why four separate toggles
+(wrap, markdown preview/split, filter, table) must clear a live rectangle.
+
+**§6u's own gesture choice was wrong for this codebase and was overridden.** It named
+Ctrl+Shift+arrows; but `default_bindings` matches on `(key, ctrl, alt, ctx)` with **shift read by the
+action, not part of the chord** (`commands.odin:232`), so Ctrl+Shift+arrow is *already* word-wise
+select-extend. Taking it would have broken word selection. Alt+Shift+arrows is the free equivalent,
+and matches VS Code and Sublime.
+
+### The model changed mid-batch, and that was the right call
+
+The rectangle was first stored as `(logical line index, cell)`. It is now **`(byte offset of the
+line's first byte, cell)`**, changed in `d69d85e` after task 4's review measured what a line number
+actually costs here: **Newtpad has no line index.** Turning one back into a byte offset walks from
+byte 0.
+
+- A 10-row rectangle at line 28,000 of a 500 KiB log cost **48 ms per frame, steady state** — and
+  `main.odin` does not wait for messages while `mouse_down`, so an Alt+drag paid it every frame.
+  About 20 fps on an ordinary log file.
+- Worse, `doc_line_start_of_index` capped at 512 KiB while creation allowed 4 MiB, so **a rectangle
+  665 KiB deep created successfully and drew zero quads** — a selection the user can make and cannot
+  see, which copy and edit would then have acted on.
+
+Re-anchoring by byte offset took it to **0.079 ms**, and deleted `doc_line_start_of_index`,
+`DOC_LINE_INDEX_CAP`, `block_lines_forward` and `caret_line_cell` outright. Doing it at task 4,
+before copy and edit were written, is the only reason it was cheap. **The lesson generalises: a
+coordinate that is cheap in one representation is not automatically cheap in this buffer, and the
+piece tree makes byte offsets the natural currency.**
+
+### One conversion point, and it held
+
+`block_row_range` is the only place cell columns become byte ranges; the draw, the copy and the edit
+all ask it. That is CLAUDE.md's "one layout per widget" applied to a non-widget, the same move batch 4
+made with `doc_row_lex_extent`. The whole-branch review verified no second cell-counting walk exists
+anywhere in the branch. It is why the drawn rectangle and the edited rectangle cannot disagree — and
+every place they *did* disagree this batch was somewhere that bypassed it, never inside it.
+
+### What this batch got wrong — nine defects, none found by the code's own tests
+
+Every task passed its own tests and still carried a real defect. Each was found by a reviewer writing
+independent probes rather than reading the report. In order:
+
+- **A rune split at the 4096-byte chunk boundary, reported as success.** The refill guard was dead
+  code: `utf8.decode_rune` returns `(RUNE_ERROR, 1)` for an incomplete tail, so `i + sz > n` could
+  never be true. Copy would have emitted invalid UTF-8; edit would have corrupted the buffer.
+- **Truncation refused on row *length***, so any rectangle over a minified JSON/CSS/log line resolved
+  to nothing — and the test had baked that wrong expectation in for five successor tasks.
+- **A 151 ms freeze**: `DOC_LINE_INDEX_CAP` bounded nothing, because the walk stepped through the
+  *uncapped* `pt_line_end`. Now 1.16 ms.
+- **A rectangle anchored at line 0 when the true line was 600000** — both axes fell back to 0 past
+  their caps while still reporting success.
+- **Every Alt+drag stranded the app in menu keyboard mode**, because `WM_LBUTTONDOWN` never set
+  `alt_used`, so releasing Alt read as a bare Alt tap.
+- **The wrap refusal checked `doc.wrap` instead of `doc_wraps()`**, so Markdown Split — which
+  force-wraps — allowed a rectangle recording logical lines against wrapped rows.
+- **A phantom undo entry that destroyed the redo stack:** an all-short rectangle's Cut changed no
+  bytes but still opened a batch, setting `modified` and clearing redo.
+- **A stale rectangle survived find-replace**, so the draw highlighted one row while Ctrl+X cut three
+  — destroying text the user never saw selected.
+- **An invisible linear selection coexisted with a rectangle.** `doc.anchor` was never collapsed on a
+  successful Alt+drag, and the draw shows the rectangle *instead of* the linear span. Alt+drag down 50
+  lines then Ctrl+V replaced all 50. Found only by the whole-branch review; the two models are now
+  mutually exclusive by construction.
+
+**The through-line: a test written by the same process that wrote the code agrees with it.** Two tests
+on this branch were found structurally incapable of failing — one with a 450x margin, one measuring
+press #0 of an operation whose cost climbs with every press. Sabotage caught some; independent probes
+caught the rest. The reviewers that found the most were the ones told to *write a probe*, not to read.
+
+### The cap is a workaround, and should be recorded as one
+
+`BLOCK_EDIT_MAX_LINES` went **10,000 → 2,000 → 300** across the batch. Each keystroke issues N
+independent splices, so the treap fragments and steady-state cost climbs with every press: at a
+2,000-row cap, press 20 cost **69.5 ms**; at 300 it is 8.2 ms. Over the cap the edit is refused whole,
+with a note — never a partial rectangular edit, which is unrecoverable-looking damage.
+
+**300 rows is a real functional limit on a feature whose headline use is "prefix every line", and
+1,000-line files are ordinary.** The cause is the per-press fragmentation, not the row count: a single
+batched multi-range splice would remove the climb and let the cap go back to thousands. Added to §5 as
+debt. The cap is the right call *today* — the failure mode is a refusal, not damage — but it is a
+workaround.
+
+### Owed and open
+
+- **Wyatt's live pass, ranked** (this environment cannot inject GUI input, so every gesture claim is
+  inference from source):
+  1. **Alt+drag, then Ctrl+V / Enter / Tab.** The invisible-linear-selection fix. This was the merge
+     blocker.
+  2. **Alt+drag on a CSV → Ctrl+T → edit a cell → Ctrl+T → Ctrl+X.** The table-view hole.
+  3. **Alt+drag, then Ctrl+M twice into Split.** Does the rectangle vanish, or draw somewhere wrong?
+  4. **Held Backspace or a held character over a ~300-row rectangle**, in the *release* build. The
+     headless cost test runs debug.
+  5. **Alt+drag that never moves** (a click). Old rectangle clears, caret lands where clicked?
+  6. **Alt+drag while wrapped, then Alt+Z.** Note appears once, not per frame; gesture works after.
+  7. **Alt+Shift+Up/Down vs bare Alt+Up/Down** — the bare one must still move the line, with no
+     menu-mode stranding on Alt release.
+  8. **Ctrl+C from a CRLF file, pasted into another app.**
+- **Padding applies to width-replaces**, so a rectangle dragged past a ragged right edge lengthens
+  short rows on the first keystroke. Matches Sublime and VS Code, deliberate, one undo recovers — but
+  it is the behaviour most likely to surprise.
+- **Bisecting into this branch hits real runtime bugs.** All 16 commits compile, but commits before
+  `d69d85e` ship the 48 ms freeze and undrawable rectangles, and before `88414e9` the phantom-undo Cut.
+- **For the `renderer`/`ui` extraction:** `block.odin` never imports `App` and returns `[]plat.Quad`
+  exactly as `doc_selection_rects` does, so it moves cleanly into `ui`. The drag latches were folded
+  into one `Block_Drag` struct rather than left as a fourth group of loose locals in the frame loop.
 
 ## 7. Build environment (Windows, this machine)
 
