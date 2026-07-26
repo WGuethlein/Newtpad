@@ -1367,7 +1367,7 @@ doc_reload :: proc(doc: ^Document) -> bool {
 	if !ok {return false}
 
 	cursor, anchor, top := doc.cursor, doc.anchor, doc.top
-	wrap := doc.wrap
+	view := doc_view_capture(doc)
 	path := strings.clone(doc.path)
 	// fresh is a brand-new Document and so starts at revision 0; carried forward
 	// and bumped rather than left at 0, or revision would go backwards on a tab
@@ -1380,13 +1380,17 @@ doc_reload :: proc(doc: ^Document) -> bool {
 	if doc.path_owned {delete(doc.path)}
 	doc.path = path
 	doc.path_owned = true
-	doc.wrap = wrap
 	doc.revision = rev + 1
 	// Preserve position by byte offset, clamped — the file may have shrunk.
 	L := doc.pt.length
 	doc.cursor = clamp(cursor, 0, L)
 	doc.anchor = clamp(anchor, 0, L)
 	doc.top = clamp(top, 0, L)
+	// Applied after doc.path is back: doc_can_markdown/doc_can_table gate on the
+	// extension, and a view applied against an empty path would validate against
+	// "untitled", which path_has_ext deliberately lets through unrestricted.
+	// Position first, though -- doc_view_apply re-anchors doc.top to a line start.
+	doc_view_apply(doc, view)
 	doc.disk_stamp = plat.file_stamp(doc.path)
 	doc.disk_changed = false
 	doc.disk_gone = false

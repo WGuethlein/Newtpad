@@ -5052,6 +5052,44 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 		app_destroy(&c)
 
+		// A reload used to rebuild through doc_open and carry only `wrap`, so an
+		// external change silently reset the view -- on the log-tailing path the
+		// reload feature exists for, and disagreeing with what a fresh open of
+		// the same file would now do.
+		fmt.println("--- reload keeps the view ---")
+		mdp := fmt.tprintf("%s%cnewtpad_reload.md", os.get_env("TEMP", context.temp_allocator), '\\')
+		plat.file_write_atomic(mdp, transmute([]u8)string("# one\n\nbody\n"))
+		v: App
+		if fd, ok := doc_open(mdp); ok {
+			rd := new(Document);rd^ = fd
+			rd.md_mode = .Split
+			rd.wrap = true
+			app_add(&v, rd)
+			app_activate(&v, 0)
+			// 3 bytes into "body" (which starts at offset 7) -- deliberately
+			// mid-line, so a re-anchor to the line start is a real assertion and
+			// not one that top=0 would pass by accident.
+			mid_top := 10
+			rd.top = mid_top
+			plat.file_write_atomic(mdp, transmute([]u8)string("# one\n\nbody\nmore\n"))
+			rok := doc_reload(rd)
+			keep := rok && rd.md_mode == .Split && rd.wrap
+			fmt.printfln(
+				"  %-6s reload keeps md_mode and wrap: ok=%v md_mode=%v wrap=%v (want Split/true)",
+				"ok" if keep else "FAIL", rok, rd.md_mode, rd.wrap,
+			)
+			if !keep {bad += 1}
+
+			want_top := base.pt_line_start(&rd.pt, mid_top)
+			top_ok := rd.top == want_top
+			fmt.printfln(
+				"  %-6s reload re-anchors top to a line start: top=%v (want %v)",
+				"ok" if top_ok else "FAIL", rd.top, want_top,
+			)
+			if !top_ok {bad += 1}
+		}
+		app_destroy(&v)
+
 		empty: App
 		app_new_scratch(&empty)
 		session_save(&empty)
