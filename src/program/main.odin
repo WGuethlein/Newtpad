@@ -181,6 +181,17 @@ main :: proc() {
 	divider_drag := false // dragging the Markdown Split divider (md_divider_rect)
 	sel_dragging := false // a text-selection drag has begun (pointer moved since press)
 	press_x, press_y: i32 // client pos of the press that may become a drag
+	// Column-select drag (Alt+drag). press_alt is latched at press time, not
+	// resampled per frame below -- sampling key_alt_down() every frame would
+	// mean releasing Alt mid-drag silently turns a rectangle into a linear
+	// selection (and pressing Alt mid-drag would turn a linear drag into a
+	// rectangle), neither of which is how a held modifier should behave once
+	// a gesture has already started. press_block_line/cell are the anchor
+	// corner's (logical line, cell), resolved once at press the same way the
+	// cursor corner is resolved every drag frame below; -1 in the line means
+	// unresolved (doc_cursor_line's own beyond-STATUS_LINE_CAP sentinel).
+	press_alt := false
+	press_block_line, press_block_cell: int
 
 	for !window.should_close {
 		// Sleep when idle instead of spinning at vsync (which pinned a core the whole
@@ -626,6 +637,24 @@ main :: proc() {
 				if !window.mouse_shift {
 					doc.anchor = mp
 				}
+				// Latch Alt now, once, for the whole gesture (see the
+				// declaration comment above). doc.cursor was just set to mp
+				// above, so doc_cursor_line here reuses the cache the status
+				// bar's own "Ln" display recomputes for the same position
+				// later this same frame -- not a second scan.
+				press_alt = plat.key_alt_down()
+				if press_alt {
+					pln := doc_cursor_line(doc)
+					press_block_line = pln - 1 if pln > 0 else -1
+					press_block_cell = cell_at_x(char_w, f32(window.mouse_x))
+				} else if block_active(doc) {
+					// A plain click starts a fresh gesture; a rectangle left
+					// over from an earlier Alt+drag or Alt+Shift+arrow no
+					// longer describes anything the caret is doing, same as
+					// every other caret-moving path in doc.odin (set_cursor,
+					// doc_select_all, doc_select_word_at, ...).
+					block_clear(doc)
+				}
 			}
 			press_x, press_y = window.mouse_x, window.mouse_y
 			sel_dragging = false // arm; a drag begins only once the pointer moves
@@ -651,7 +680,31 @@ main :: proc() {
 				} else if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
 					doc_scroll(doc, &text, 1, rows)
 				}
-				doc.cursor = doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
+				mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
+				doc.cursor = mp
+				if press_alt {
+					// The column: cell_at_x, the same primitive the draw and
+					// the hit-test use for every other column -- not a second
+					// conversion path from mp's byte offset. The line: reuse
+					// doc_cursor_line's own cache exactly as press did above;
+					// doc.cursor just changed to mp, so this is the one real
+					// scan the status bar's "Ln" display would pay for this
+					// frame regardless, not an extra one added by this
+					// gesture. Calling doc_line_start_of_index here instead --
+					// once per row of a rectangle, or even once per frame in a
+					// loop -- is exactly the forbidden shape (~2.9ms per call
+					// at its cap; see block.odin's DOC_LINE_INDEX_CAP comment).
+					cln := doc_cursor_line(doc)
+					cur_line := cln - 1 if cln > 0 else -1
+					cur_cell := cell_at_x(char_w, f32(window.mouse_x))
+					switch block_set_from_points(doc, &text, press_block_line, press_block_cell, cur_line, cur_cell) {
+					case .Wrap_On:
+						app_note(&app, "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]")
+					case .Caret_Unresolved:
+						app_note(&app, "[COLUMN SELECT UNAVAILABLE HERE - the line is too far into a very large file]")
+					case .None:
+					}
+				}
 			}
 		}
 

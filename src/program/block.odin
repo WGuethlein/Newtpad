@@ -358,6 +358,40 @@ block_extend :: proc(doc: ^Document, t: ^plat.Text, dline, dcell: int) -> Block_
 	return .None
 }
 
+// Seed or replace a column rectangle from BOTH ends at once -- the mouse drag's
+// shape, as opposed to block_extend's keyboard shape of stepping the cursor
+// corner one delta at a time from wherever the rectangle already is. The
+// caller (main.odin's drag path) has already resolved both corners' (logical
+// line, cell) itself -- via cell_at_x for the cell and the same doc_cursor_line
+// the status bar draws from for the line -- so this proc does no resolution of
+// its own; it only applies the two refusals block_extend applies, then writes
+// the geometry straight through.
+//
+// `t` is accepted for the same reason every other block.odin proc takes it
+// (interface symmetry with block_extend/block_row_range) even though this
+// particular proc has no cell-space walk of its own to do with it -- both ends
+// arrive pre-resolved.
+//
+// A negative line (either end) is the caller's signal that it could not
+// resolve that point -- doc_cursor_line's own "0 = beyond STATUS_LINE_CAP"
+// contract, shifted to 0-based and re-expressed as "unresolved" rather than
+// "unknown line number", the same sentinel caret_line_cell would have refused
+// on. Cells never carry this signal: cell_at_x floors at 0 and cannot fail.
+block_set_from_points :: proc(doc: ^Document, t: ^plat.Text, a_line, a_cell, c_line, c_cell: int) -> Block_Refusal {
+	if doc.wrap {
+		return .Wrap_On
+	}
+	if a_line < 0 || c_line < 0 {
+		return .Caret_Unresolved
+	}
+	doc.block = true
+	doc.block_anchor_line = a_line
+	doc.block_anchor_cell = max(0, a_cell)
+	doc.block_cursor_line = c_line
+	doc.block_cursor_cell = max(0, c_cell)
+	return .None
+}
+
 doc_line_start_of_index :: proc(doc: ^Document, n: int) -> (start: int, ok: bool) {
 	p := 0
 	for _ in 0 ..< n {

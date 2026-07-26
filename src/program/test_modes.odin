@@ -2049,6 +2049,96 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			fmt.printfln("  %-6s jumping to a find match clears a stale block: block_active=%v", "ok" if cFindSel else "FAIL", block_active(&fnd))
 		}
 
+		// Task 3: block_set_from_points -- the mouse gesture's geometry
+		// setter. The gesture itself (Alt+drag in main.odin) is NOT covered
+		// here: this environment cannot inject mouse or keyboard input, so
+		// there is no way to drive the real press/drag/release sequence.
+		// What follows exercises exactly what is callable: the proc's own
+		// writes and its two refusals.
+		{
+			// Both ends set directly in one call (unlike block_extend, there
+			// is no seed-then-step split -- the mouse already knows both
+			// corners). A drag from (5,10) to (2,3), up-and-left, is stored
+			// exactly as given; block_bounds (already proven above to
+			// normalise regardless of drag direction) is what turns it into
+			// [2,5]x[3,10].
+			psp: Document
+			psp.wrap = false
+			refP := block_set_from_points(&psp, &t, 5, 10, 2, 3)
+			pline_lo, pline_hi, pcell_lo, pcell_hi := block_bounds(&psp)
+			cP :=
+				refP == .None &&
+				block_active(&psp) &&
+				psp.block_anchor_line == 5 &&
+				psp.block_anchor_cell == 10 &&
+				psp.block_cursor_line == 2 &&
+				psp.block_cursor_cell == 3 &&
+				pline_lo == 2 &&
+				pline_hi == 5 &&
+				pcell_lo == 3 &&
+				pcell_hi == 10
+			if !cP {fail = true}
+			fmt.printfln(
+				"  %-6s block_set_from_points stores both ends directly, bounds normalise: anchor=(%d,%d) cursor=(%d,%d) bounds=[%d,%d]x[%d,%d]",
+				"ok" if cP else "FAIL",
+				psp.block_anchor_line,
+				psp.block_anchor_cell,
+				psp.block_cursor_line,
+				psp.block_cursor_cell,
+				pline_lo,
+				pline_hi,
+				pcell_lo,
+				pcell_hi,
+			)
+
+			// Wrap_On: the same refusal block_extend gives, for the same
+			// reason -- word wrap turns a (line, cell) rectangle into
+			// something that stops describing anything stable the instant
+			// it's toggled. No state changes on refusal.
+			pwp: Document
+			pwp.wrap = true
+			refPW := block_set_from_points(&pwp, &t, 0, 0, 1, 1)
+			cPW :=
+				refPW == .Wrap_On &&
+				!block_active(&pwp) &&
+				pwp.block_anchor_line == 0 &&
+				pwp.block_anchor_cell == 0 &&
+				pwp.block_cursor_line == 0 &&
+				pwp.block_cursor_cell == 0
+			if !cPW {fail = true}
+			fmt.printfln("  %-6s block_set_from_points refuses while wrapped, no state changed: refusal=%v block_active=%v", "ok" if cPW else "FAIL", refPW, block_active(&pwp))
+
+			// Caret_Unresolved: main.odin passes -1 for a line it could not
+			// resolve (doc_cursor_line's own "0 = beyond STATUS_LINE_CAP"
+			// contract, shifted to 0-based and inverted into a sentinel).
+			// Either end being unresolved must refuse the WHOLE call rather
+			// than seed a rectangle at line 0 -- the exact "confident wrong
+			// answer on a large file" shape block_extend's own
+			// Caret_Unresolved exists to prevent. Checked on both the
+			// anchor end and the cursor end: nothing here says one end is
+			// more trustworthy than the other.
+			pup: Document
+			pup.wrap = false
+			refPU1 := block_set_from_points(&pup, &t, -1, 0, 3, 4)
+			refPU2 := block_set_from_points(&pup, &t, 0, 0, -1, 4)
+			cPU :=
+				refPU1 == .Caret_Unresolved &&
+				refPU2 == .Caret_Unresolved &&
+				!block_active(&pup) &&
+				pup.block_anchor_line == 0 &&
+				pup.block_anchor_cell == 0 &&
+				pup.block_cursor_line == 0 &&
+				pup.block_cursor_cell == 0
+			if !cPU {fail = true}
+			fmt.printfln(
+				"  %-6s block_set_from_points refuses an unresolved end (anchor or cursor), no seed at line 0: refAnchor=%v refCursor=%v block_active=%v",
+				"ok" if cPU else "FAIL",
+				refPU1,
+				refPU2,
+				block_active(&pup),
+			)
+		}
+
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
 		return true
 	}
