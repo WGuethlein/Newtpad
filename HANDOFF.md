@@ -18,8 +18,8 @@ whole-branch review at the end, sabotage every test, then HANDOFF entry → vers
 `install.ps1`. It also carries the two bug *shapes* this codebase keeps producing and the
 operational traps that have each cost a session real time. Unlike `CLAUDE.md`, it is committed.
 
-**Immediate next step: cut the v0.13.0 GitHub release — see §6w "Owed and open" for how, and for
-the `gh`-not-on-PATH trap that makes `release.ps1` skip the Release step without saying so.**
+**Immediate next step: batch 5 — column/block editing (§6u).** The v0.13.0 release is cut
+(2026-07-26): tag, GitHub Release, exe attached. See §6w "Owed and open" for what that surfaced.
 
 ## 1. What Newtpad is
 
@@ -1750,24 +1750,29 @@ Two things worth keeping from how that landed:
 
 ### Owed and open
 
-- **FIRST THING NEXT SESSION: cut the v0.13.0 GitHub release.** v0.13.0 is merged, installed and
-  pushed, but **no tag was cut and no Release exists** — and tags stop at **v0.9.0**, so v0.10.0,
-  v0.11.0 and v0.12.0 were never tagged either. `.\release.ps1` does the whole job from
-  `NEWTPAD_VERSION`: refuses a dirty or already-tagged tree, builds the release exe, tags
-  `v0.13.0`, pushes branch + tag, and creates the GitHub Release with the exe attached.
-  `.\release.ps1 -DryRun` first.
-  - **`gh` IS installed** (2.96.0, `C:\Program Files\GitHub CLI\gh.exe`) but was **not on the PATH
-    of a shell opened before it was installed**. `release.ps1` gates the Release step on
-    `Get-Command gh`, so in a stale shell it silently tags and pushes and then prints the *manual
-    upload* fallback as though `gh` were absent. **Open a fresh shell, confirm `gh --version`
-    answers, then run it.**
-  - Decide before running: **just v0.13.0** (auto-generated notes span everything back to v0.9.0,
-    so nothing is lost — four batches appear as one release), or **backfill v0.10.0–v0.12.0** onto
-    their merge commits so the tag history matches the version history. Backfilling means either
-    rebuilding those binaries from their commits or publishing those three without attachments.
-  - **The exe is unsigned.** If the repo is public, every download hits a SmartScreen warning.
-    Signing is blocked on Wyatt buying a certificate (§6u batch 7) — Claude must never handle the
-    certificate password.
+- **v0.13.0 release — DONE (2026-07-26).**
+  [Release v0.13.0](https://github.com/WGuethlein/Newtpad/releases/tag/v0.13.0), tag on `main`,
+  `newtpad.exe` (1.26 MB) attached. Wyatt's call: **just v0.13.0, no backfill** — v0.10.0–v0.12.0
+  stay untagged, and the auto-generated notes span back to v0.9.0, so four batches appear as one
+  release. Tag history is therefore permanently out of step with version history; that is known and
+  accepted, not an oversight to "fix" later.
+  - **The `gh`-not-on-PATH trap was live and is now fixed in the script.** `gh` 2.96.0 was installed
+    but absent from this session's PATH, exactly as predicted. `release.ps1` no longer gates on
+    `Get-Command gh` alone: it falls back to `C:\Program Files\GitHub CLI\gh.exe`, and if it still
+    cannot find `gh` it **exits non-zero** instead of printing the manual-upload message as though
+    the release had succeeded. It also checks `$LASTEXITCODE` after `gh release create`.
+  - **The notes say the build is unsigned**, since the repo is public and every download trips
+    SmartScreen. Signing is blocked on Wyatt buying a certificate (§6u batch 7) — Claude must never
+    handle the certificate password.
+  - **An em dash in `release.ps1` shipped as mojibake into the published notes.** PowerShell 5.1
+    decodes a BOM-less `.ps1` as ANSI, so the character was already corrupt before `gh` was invoked;
+    the release body was repaired and the note is now ASCII-only with a comment saying why. The
+    general form of this trap is in `docs/development-loop.md` §6. Verifying by reading `gh`'s
+    output in the console would not have caught it — the console mangles it identically. The check
+    that worked was dumping the bytes GitHub actually stored.
+  - **The release exe is 1.26 MB**, against the 0.90 MB recorded in §7 (2026-07-19). Growth is
+    consistent with `test_modes.odin` shipping in `package main` (§5) plus batch 4's lexers. Not
+    investigated; §7's figure is now stale.
 - **Wyatt's live pass** — one file of each family, in both themes. The nine `Syn_*` roles were chosen
   by arithmetic in batch 3 (§6v) and have never been seen against real code, Light especially.
 - The two "always cap-hit" resync gaps above (YAML, Markdown) are correct by construction but untested

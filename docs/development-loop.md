@@ -224,6 +224,12 @@ Each of these cost real time at least once.
   a scratchpad file — don't build Windows paths inside a heredoc.
 - PowerShell 5.1's `Get-Content -Raw` decodes UTF-8 as ANSI. It has already corrupted every em dash
   in HANDOFF.md once. Pass the encoding explicitly, or use the `Read` tool.
+- **PowerShell 5.1 decodes a BOM-less `.ps1` as ANSI too** — so a non-ASCII character written into a
+  script by the `Write`/`Edit` tools is already mojibake by the time the script runs, before any
+  command sees it. An em dash in `release.ps1`'s notes string shipped as `â€"` into the published
+  v0.13.0 release notes. Keep script string literals ASCII, or save the script with a BOM. **Reading
+  the command's output back in the console does not catch this** — the console mangles it the same
+  way, so it looks correct. Dump the bytes of what actually landed.
 - PowerShell 5.1 has no `&&`, no `||`, no ternary, no `?.`. Use `; if ($?) { }`.
 - Bash working directory persists between calls; shell variables do not.
 
