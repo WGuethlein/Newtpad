@@ -732,3 +732,28 @@ theme_export :: proc(from_name: string, t: Theme) -> (target: string, path: stri
 	}
 	return target, path, true
 }
+
+// Edit Current Theme: the one command that turns "themes are files" from a
+// documented format nobody has a file for into a loop. Exports the active
+// theme if it has no file yet, switches to it, and opens it as a tab -- so the
+// editor becomes the editor of its own theme, and saving re-applies (see
+// theme_reapply_if_active).
+//
+// Order matters on the failure path: settings.theme_name is updated only after
+// the file exists, so a failed write leaves the app on the theme it was
+// already using rather than pointing at a theme file that isn't there.
+theme_edit_current :: proc(app: ^App) -> bool {
+	target, path, ok := theme_export(app.settings.theme_name, g_theme)
+	if !ok {
+		app_note(app, "[THEME NOT SAVED - could not write to the themes folder]")
+		return false
+	}
+	if app.settings.theme_name != target {
+		delete(app.settings.theme_name)
+		app.settings.theme_name = strings.clone(target)
+		g_theme = theme_resolve(target)
+		settings_save(app.settings)
+	}
+	app_open_path(app, path)
+	return true
+}

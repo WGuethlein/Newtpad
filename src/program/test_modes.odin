@@ -3293,6 +3293,45 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				)
 				os.remove(path)
 			}
+
+			// The command's whole job: produce a file, point settings at it,
+			// and leave g_theme resolved from that file rather than from the
+			// built-in it started as. Tested through theme_edit_current rather
+			// than through the dispatch switch, because opening a tab needs an
+			// App and a window; what is asserted here is the state change the
+			// command is responsible for.
+			{
+				app_t: App
+				menu_init(&app_t.menu)
+				defer app_destroy(&app_t)
+				app_t.settings.theme_name = strings.clone("Dark")
+				g_saved := g_theme
+				g_theme = theme_dark()
+
+				ok_cmd := theme_edit_current(&app_t)
+				switched := app_t.settings.theme_name == "Dark Custom"
+				path, pok := theme_active_file_path(app_t.settings.theme_name)
+				on_disk := pok && os.exists(path)
+
+				// Editing the file and re-resolving must be visible in g_theme:
+				// this is the property the whole feature rests on.
+				_ = os.write_entire_file(path, transmute([]u8)string("base dark\ncaret #010203\n"))
+				g_theme = theme_resolve(app_t.settings.theme_name)
+				applied := g_theme[.Caret] == [4]f32{f32(0x01) / 255, f32(0x02) / 255, f32(0x03) / 255, 1}
+
+				all_ok := ok_cmd && switched && on_disk && applied
+				if !all_ok {fail = true}
+				fmt.printfln(
+					"  %-6s edit-current-theme: exported=%v switched=%v on_disk=%v reresolved=%v",
+					"ok" if all_ok else "FAIL",
+					ok_cmd,
+					switched,
+					on_disk,
+					applied,
+				)
+				if pok {os.remove(path)}
+				g_theme = g_saved
+			}
 		}
 
 		// settings_load no longer rejects an unresolvable theme_name -- it is

@@ -98,6 +98,7 @@ Command_Id :: enum u8 {
 	Settings_Toggle,
 	Settings_Inc,
 	Settings_Dec,
+	Theme_Edit,
 	// font page (Edit > Font)
 	Font_Open,
 	Font_Close,
@@ -204,6 +205,7 @@ command_table := [Command_Id]Command {
 	.Settings_Toggle          = {"Settings: Toggle", "View"},
 	.Settings_Inc             = {"Settings: Increase", "View"},
 	.Settings_Dec             = {"Settings: Decrease", "View"},
+	.Theme_Edit               = {"Edit Current Theme...", "View"},
 	.Font_Open                = {"Font...", "Edit"},
 	.Font_Close               = {"Font: Close", "Edit"},
 	.Font_Next                = {"Font: Next", "Edit"},
@@ -847,6 +849,8 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		app.settings_row = 0
 		app.settings_top = 0
 		app_open_special(app, .Settings)
+	case .Theme_Edit:
+		theme_edit_current(app)
 	case .Settings_Close:
 		request_close_tab(app, app.active, w)
 	case .Settings_Next:
