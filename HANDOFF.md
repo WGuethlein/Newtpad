@@ -18,13 +18,33 @@ whole-branch review at the end, sabotage every test, then HANDOFF entry → vers
 `install.ps1`. It also carries the two bug *shapes* this codebase keeps producing and the
 operational traps that have each cost a session real time. Unlike `CLAUDE.md`, it is committed.
 
-**Immediate next step: batch 6 (§6u) — session persistence for `md_mode`/`table`, `doc_reload`
-keeping the view, the `on_resize`/`on_dpi` crash-reporter fix, an "Open Logs Folder" command, and
-encoding commands in the menus.**
+### Where things stand — read this first (2026-07-26)
 
-v0.13.0, v0.14.0 and v0.15.0 are all released (2026-07-26). **§6y is the most recent shipped state**
-(column editing). Two live passes are owed and both are ranked in their sections: §6y's gesture list
-— item 1 is the one that was a merge blocker — and §6x's theme-tuning pass.
+**Working tree clean, `main` pushed, nothing in flight.** `v0.13.0`, `v0.14.0`, `v0.15.0` and
+`v0.15.1` are all tagged, released with the exe attached, and installed. The installed binary is
+v0.15.1 (1.4 MB).
+
+**Immediate next step: batch 6 (§6u)** — session persistence for `md_mode`/`table`, `doc_reload`
+keeping the view, the `on_resize`/`on_dpi` crash-reporter fix, an "Open Logs Folder" command, and
+encoding commands in the menus. Nothing has been specced for it.
+
+**Two things Wyatt owes, both ranked in their own sections and neither blocking:**
+
+1. **§6x's theme-tuning pass.** v0.14.0 added *View → Edit Current Theme...*, which writes the active
+   theme to a file, switches to it, and opens it as a tab — edit a colour, Ctrl+S, the window updates.
+   Dark's syntax colours were chosen by arithmetic and have been seen once. Sample files for it are at
+   `C:\Users\Wyatt\Newtpad-testfiles`.
+2. **The rest of §6y's column-editing gesture list.** Items 1-3 and 5 were passed and their findings
+   fixed in v0.15.1; items 4 and 6-8 are unconfirmed.
+
+**Decided, deliberately not built:** the column-edit region-splice fix (§5). At the shipped 300-row
+cap performance is fine (press 50 = 13.8 ms); what bites is the *limit*, and its failure mode is a
+refusal, not damage. Wyatt's call was that it is not needed yet. §5 carries the measurements so
+whoever picks it up does not re-derive them — **and does not re-diagnose it, which has now gone wrong
+twice.**
+
+**The `.superpowers/sdd/` ledger is complete through v0.15.1** and is scratch, not history — HANDOFF
+§6v-§6y is the record.
 
 ## 1. What Newtpad is
 
