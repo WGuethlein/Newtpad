@@ -26,7 +26,16 @@ REM declaring per-monitor-v2 DPI awareness. Building without it (a bare
 REM `odin build src\program`) yields a DPI-unaware exe that renders bitmap-
 REM stretched on non-96-DPI displays -- fine for the headless test modes, wrong
 REM for anything you look at.
-odin build src\program -out:build\newtpad.exe %OPT% -collection:src=src -resource:build\newtpad.res
+REM
+REM -extra-linker-flags "/STACK:8388608" raises the thread stack from the
+REM 1 MB default to 8 MB. test_modes.odin is one enormous procedure with many
+REM nested test procs, each getting its own Odin stack frame on top of
+REM test_mode_dispatch's already-large one; `blocktest` has hit a real
+REM STATUS_STACK_OVERFLOW twice from this (see docs/development-loop.md).
+REM This one flag (applies to both debug and release, since both go through
+REM this same invocation via %OPT%) raises the ceiling so the next added test
+REM case doesn't crash with a cause that's invisible from the error alone.
+odin build src\program -out:build\newtpad.exe %OPT% -collection:src=src -resource:build\newtpad.res -extra-linker-flags:"/STACK:8388608"
 if errorlevel 1 exit /b 1
 
 if "%1"=="run" build\newtpad.exe

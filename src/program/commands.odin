@@ -557,6 +557,8 @@ block_extend_dispatch :: proc(app: ^App, doc: ^Document, t: ^plat.Text, dline, d
 	switch block_extend(doc, t, dline, dcell) {
 	case .Wrap_On:
 		app_note(app, "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]")
+	case .Split_On:
+		app_note(app, "[COLUMN SELECT NEEDS SPLIT OFF - press Ctrl+M]")
 	case .Filter_On:
 		app_note(app, "[COLUMN SELECT UNAVAILABLE - TURN OFF FILTER]")
 	case .Caret_Unresolved:
@@ -634,19 +636,24 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	// rectangle first; the edit itself is unchanged.
 	//
 	// The exceptions handle it themselves: Backspace/Delete_Fwd edit the
-	// rectangle, Cut clears it in block_cut_delete, and Undo/Redo clear it in
+	// rectangle, Cut clears it in block_cut_delete, Undo/Redo clear it in
 	// apply_snapshot (doc.odin) because a restored tree may not have the rows
-	// at all.
+	// at all, and Insert_Tab -- Wyatt's call -- edits the rectangle exactly
+	// like a typed character does (see the .Insert_Tab case below) rather
+	// than clearing it and falling through to a single tab at the caret.
+	// Insert_Newline stays OUT of this exception list deliberately: splitting
+	// every spanned row from one Enter is rarely what's wanted, so Enter
+	// keeps clearing the rectangle and acting at the caret.
 	if doc != nil && block_active(doc) && command_mutates_doc(cmd) {
 		#partial switch cmd {
-		case .Backspace, .Delete_Fwd, .Cut, .Undo, .Redo:
+		case .Backspace, .Delete_Fwd, .Cut, .Undo, .Redo, .Insert_Tab:
 		case:
 			block_clear(doc)
 			// Belt and braces for the invariant block_collapse_linear
 			// (block.odin) establishes at the other end: nothing may leave a
 			// linear selection live underneath a rectangle, because the
 			// rectangle is what was DRAWN and this branch is exactly where
-			// the command that follows (.Insert_Newline, .Insert_Tab, .Paste,
+			// the command that follows (.Insert_Newline, .Paste,
 			// .Delete_Word_Back, .Move_Line_*) would run against
 			// doc.anchor..doc.cursor and delete it. With the gestures now
 			// collapsing on success this is unreachable, which is the point:
@@ -695,11 +702,29 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Delete_Word_Back:
 		doc_delete_word_back(doc)
 	case .Insert_Newline:
+		// Deliberate choice, not an oversight: a live rectangle is cleared
+		// above (command_mutates_doc's block-clear branch) rather than
+		// routed through block_replace the way .Insert_Tab now is --
+		// splitting every spanned row into two from one Enter is rarely what
+		// the user wants, unlike indenting them.
 		doc_insert_newline(doc)
 	case .Insert_Tab:
 		// Tab arrives as WM_CHAR 0x09 too, but the char path filters control
-		// characters, so the binding is what actually inserts it.
-		doc_insert_rune(doc, '\t')
+		// characters, so the binding is what actually inserts it. A live
+		// rectangle routes through block_replace exactly like a typed
+		// character does in editor_input_rune -- one tab on every spanned row
+		// (or, at zero width, one tab at each of N carets) -- so Tab inherits
+		// everything already proven about block_replace/block_apply: bottom-
+		// up ordering, one undo step for the whole rectangle, the
+		// BLOCK_EDIT_MAX_LINES row cap, and virtual-space padding on rows
+		// shorter than the rectangle's left edge. Wyatt's call (asked and
+		// answered): this is what VS Code and Sublime do, and it is the
+		// natural companion to the existing prefix-typing behaviour.
+		if block_active(doc) {
+			if !block_replace(doc, t, []u8{'\t'}) {block_edit_note(app)}
+		} else {
+			doc_insert_rune(doc, '\t')
+		}
 	case .Doc_Start:
 		doc_start(doc, ev.shift)
 	case .Doc_End:

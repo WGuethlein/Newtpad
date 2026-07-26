@@ -1573,6 +1573,36 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fail := false
 		fmt.println("blocktest:")
 
+		// Guard the REAL Windows clipboard for the WHOLE mode, not per-case.
+		// Several cases below (Cut in block_test_t/block_test_u, the Paste
+		// round trip in block_test_ai, the sentinel round trip in
+		// block_test_an) also save/restore around their own writes, but a
+		// previous round proved that per-case discipline alone is not
+		// enough: block_test_an wrote the clipboard with no save/restore of
+		// its own, and it shipped anyway because nothing checked the MODE as
+		// a whole. Saving once here and restoring via `defer` on every exit
+		// path -- including the "no fonts loaded" early return just below --
+		// means a future case that forgets its own save/restore still can't
+		// reach the user; only a bug in this one save/restore can. An empty
+		// clipboard, a clipboard holding non-text data (e.g. an image --
+		// clipboard_get_text reports ok=false for anything that isn't
+		// CF_UNICODETEXT), or a clipboard that can't be opened all come back
+		// with had_clip=false: there is nothing understood to restore in
+		// that case, so the defer below leaves the clipboard alone rather
+		// than blanking it.
+		mode_saved_clip, mode_had_clip := plat.clipboard_get_text(nil, context.allocator)
+		defer if mode_had_clip {
+			plat.clipboard_set_text(nil, mode_saved_clip)
+			delete(mode_saved_clip)
+		}
+
+		// Stand in for "the user's real clipboard content" with a sentinel of
+		// our own, so the seam-proof check at the very end of this mode (see
+		// "SEAM PROOF" near the bottom) can tell a clipboard that every case
+		// put back from one that some case clobbered and forgot.
+		mode_seam_sentinel := "BLOCKTEST MODE SEAM SENTINEL -- must survive every case"
+		plat.clipboard_set_text(nil, mode_seam_sentinel)
+
 		t: plat.Text
 		if !plat.text_load_faces(&t) {
 			fmt.println("  FAIL   no fonts loaded; cannot exercise cell widths")
@@ -1915,11 +1945,16 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// itself off, so a (line, cell) rectangle is exactly as unstable
 		// there as with word-wrap on. Before this fix, block_extend checked
 		// doc.wrap alone and let a rectangle through in Split.
+		//
+		// Split reports its OWN refusal (.Split_On, not .Wrap_On) -- a
+		// live-pass finding: the old single Wrap_On note told the user to
+		// press Alt+Z, which does nothing at all in Split (Ctrl+M is the
+		// control that turns it off). See Block_Refusal's own comment.
 		doc.md_mode = .Split
 		refS := block_extend(&doc, &t, 0, 1)
-		cSp := refS == .Wrap_On && !block_active(&doc) && doc.block_anchor_line_start == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line_start == 0 && doc.block_cursor_cell == 0
+		cSp := refS == .Split_On && !block_active(&doc) && doc.block_anchor_line_start == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line_start == 0 && doc.block_cursor_cell == 0
 		if !cSp {fail = true}
-		fmt.printfln("  %-6s block_extend refuses in Markdown Split via doc_wraps, no state changed: refusal=%v block_active=%v", "ok" if cSp else "FAIL", refS, block_active(&doc))
+		fmt.printfln("  %-6s block_extend refuses in Markdown Split via its own Split_On, no state changed: refusal=%v block_active=%v", "ok" if cSp else "FAIL", refS, block_active(&doc))
 		doc.md_mode = .Off
 
 		// Filter view gets its own refusal (.Filter_On, not .Wrap_On): its
@@ -2247,14 +2282,16 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			// Markdown Split refuses too, via the same doc_wraps predicate as
 			// block_extend -- not doc.wrap directly. Split force-wraps the
 			// editor half even with doc.wrap off, so the mouse gesture must
-			// refuse there exactly as the keyboard gesture does.
+			// refuse there exactly as the keyboard gesture does -- and, since
+			// the live pass, with its own Split_On rather than Wrap_On, so the
+			// note names Ctrl+M instead of the useless-here Alt+Z.
 			psS: Document
 			psS.wrap = false
 			psS.md_mode = .Split
 			refPS := block_set_from_points(&psS, &t, 0, 0, 1, 1)
-			cPS := refPS == .Wrap_On && !block_active(&psS)
+			cPS := refPS == .Split_On && !block_active(&psS)
 			if !cPS {fail = true}
-			fmt.printfln("  %-6s block_set_from_points refuses in Markdown Split via doc_wraps: refusal=%v block_active=%v", "ok" if cPS else "FAIL", refPS, block_active(&psS))
+			fmt.printfln("  %-6s block_set_from_points refuses in Markdown Split via its own Split_On: refusal=%v block_active=%v", "ok" if cPS else "FAIL", refPS, block_active(&psS))
 
 			// Filter view refuses distinctly (.Filter_On): its visible rows
 			// are a non-contiguous subset of the document's lines, a
@@ -2899,6 +2936,20 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			tad.block = true
 			tad.block_anchor_line_start, tad.block_anchor_cell = 0, 10 // "x" never reaches cell 10
 			tad.block_cursor_line_start, tad.block_cursor_cell = 0, 12
+
+			// Ctrl+X below reaches the REAL Windows clipboard through
+			// commands.odin's .Cut handler. Save/restore around it so this
+			// case doesn't leave the clipboard holding this fixture's cut
+			// byte ("x") -- belt-and-suspenders with the mode-level
+			// save/restore in the blocktest dispatcher above, which is what
+			// actually protects the user, but this keeps the mode's own
+			// seam-proof sentinel intact across this case specifically.
+			tsaved_clip, thad_clip := plat.clipboard_get_text(tdummy.hwnd, context.allocator)
+			defer if thad_clip {
+				plat.clipboard_set_text(tdummy.hwnd, tsaved_clip)
+				delete(tsaved_clip)
+			}
+
 			command_dispatch(resolve_key(.X, true, false, .Editor), {.X, true, false, false}, &ta, &tdummy, t, 10) // Ctrl+X
 			cT := !block_active(tad)
 			fmt.printfln("  %-6s LOW 3: Cut on a single all-short row still clears the block: block_active=%v", "ok" if cT else "FAIL", block_active(tad))
@@ -2927,6 +2978,17 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			uad.block = true
 			uad.block_anchor_line_start, uad.block_anchor_cell = 0, 0
 			uad.block_cursor_line_start, uad.block_cursor_cell = (u_rows - 1) * 2, 1
+
+			// Same real-clipboard concern as block_test_t above: Ctrl+X
+			// below writes the actual Windows clipboard via .Cut. Save and
+			// restore around it rather than leaving this fixture's rows in
+			// the clipboard for whatever runs next.
+			usaved_clip, uhad_clip := plat.clipboard_get_text(udummy.hwnd, context.allocator)
+			defer if uhad_clip {
+				plat.clipboard_set_text(udummy.hwnd, usaved_clip)
+				delete(usaved_clip)
+			}
+
 			command_dispatch(resolve_key(.X, true, false, .Editor), {.X, true, false, false}, &ua, &udummy, t, 10) // Ctrl+X
 			wantU := fmt.tprintf("%d rows", BLOCK_EDIT_MAX_LINES)
 			cU := strings.contains(ua.notice, wantU)
@@ -3512,9 +3574,10 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// picks block_selection_rects when block_active(doc) and
 		// doc_selection_rects otherwise, so a linear span coexisting with a
 		// rectangle is INVISIBLE -- and every mutating command that drops the
-		// rectangle (.Insert_Newline, .Insert_Tab, .Paste, .Delete_Word_Back,
+		// rectangle (.Insert_Newline, .Paste, .Delete_Word_Back,
 		// .Move_Line_*) then runs against doc.anchor..doc.cursor, where
-		// doc_insert_text deletes the selection first.
+		// doc_insert_text deletes the selection first. (.Insert_Tab no longer
+		// drops the rectangle at all -- it edits it, like a typed character.)
 		//
 		// Both gestures are exercised because both used to leave one behind
 		// and the fix is at both ends (block_collapse_linear, block.odin):
@@ -3606,6 +3669,27 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			pd.wrap = false
 			pd.anchor, pd.cursor = 0, 17
 			refusal := block_set_from_points(pd, t, 0, 0, 15, 4)
+
+			// This case needs a genuine clipboard set/get round trip in-process --
+			// Ctrl+V has to read back real CF_UNICODETEXT -- but
+			// plat.clipboard_set_text writes the REAL Windows clipboard; there is
+			// no test-double seam for it. Left unguarded, every blocktest run
+			// silently replaced whatever the user had copied with "PP" (a
+			// live-pass finding: Wyatt hit Ctrl+V afterward and got this
+			// fixture's text back instead of his own). Save it now and restore
+			// on every exit path, including a failing assertion below -- the
+			// defer runs regardless of how this proc returns. If the clipboard
+			// held something other than CF_UNICODETEXT, or was empty,
+			// clipboard_get_text reports ok=false and there is nothing to
+			// restore: leaving the clipboard as this test left it is acceptable
+			// in that case, corrupting it with a blank string is not, so the
+			// defer below does nothing rather than writing "" over content it
+			// never understood.
+			saved_clip, had_clip := plat.clipboard_get_text(pdummy.hwnd, context.allocator)
+			defer if had_clip {
+				plat.clipboard_set_text(pdummy.hwnd, saved_clip)
+				delete(saved_clip)
+			}
 
 			plat.clipboard_set_text(pdummy.hwnd, "PP")
 			command_dispatch(resolve_key(.V, true, false, .Editor), {.V, true, false, false}, &pa, &pdummy, t, 10)
@@ -3848,30 +3932,38 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			block_drag_press(&drag, &gd, false, 0)
 			plain_cleared := !block_active(&gd) && !drag.alt
 
-			// A non-Alt drag frame does nothing at all.
-			gd.cursor = 12
-			r_plain, n_plain := block_drag_update(&drag, &gd, t, 2)
-			plain_inert := r_plain == .None && !n_plain && !block_active(&gd)
+			// A non-Alt drag frame commits the cursor to the pointer -- same as a
+			// plain drag has always tracked it -- but does nothing else: no row
+			// resolve, no rectangle write.
+			r_plain, n_plain := block_drag_update(&drag, &gd, t, 12, 2)
+			plain_inert := r_plain == .None && !n_plain && !block_active(&gd) && gd.cursor == 12
 
 			// An Alt press latches the anchor corner at the caret's own row.
 			gd.cursor, gd.anchor = 2, 2
 			block_drag_press(&drag, &gd, true, 2)
 			latched := drag.alt && drag.anchor_off == 0 && drag.anchor_cell == 2
 
-			// A refused gesture (wrap on) notes once, not per frame.
+			// A refused gesture (wrap on) notes once, not per frame, AND --
+			// live-pass HIGH -- must not degrade into a linear selection.
+			// block_drag_update now owns the cursor commit itself (block.odin):
+			// before this fix, main.odin set doc.cursor to the pointer BEFORE
+			// checking the refusal, so a refused Alt-drag still tracked the
+			// pointer every frame. Passing cursor_at=12 (the pointer, three
+			// frames running) must leave gd.cursor pinned at 2 -- exactly where
+			// the press left it -- not slide to 12.
 			gd.wrap = true
-			gd.cursor = 12
-			r1, n1 := block_drag_update(&drag, &gd, t, 4)
-			r2, n2 := block_drag_update(&drag, &gd, t, 4)
-			r3, n3 := block_drag_update(&drag, &gd, t, 4)
+			r1, n1 := block_drag_update(&drag, &gd, t, 12, 4)
+			r2, n2 := block_drag_update(&drag, &gd, t, 12, 4)
+			r3, n3 := block_drag_update(&drag, &gd, t, 12, 4)
 			noted_once := r1 == .Wrap_On && n1 && r2 == .Wrap_On && !n2 && r3 == .Wrap_On && !n3
+			pinned_cursor, pinned_anchor := gd.cursor, gd.anchor // snapshot -- gd moves again below
+			cursor_pinned := pinned_cursor == 2 && pinned_anchor == 2
 
 			// A successful drag: rectangle built, no linear selection under it.
 			gd.wrap = false
 			gd.cursor, gd.anchor = 2, 2
 			block_drag_press(&drag, &gd, true, 2)
-			gd.cursor = 12 // pointer now on row 2; anchor stays where it was pressed
-			r_ok, n_ok := block_drag_update(&drag, &gd, t, 4)
+			r_ok, n_ok := block_drag_update(&drag, &gd, t, 12, 4) // pointer now on row 2; anchor stays where it was pressed
 			built :=
 				r_ok == .None &&
 				!n_ok &&
@@ -3882,9 +3974,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				gd.block_cursor_cell == 4 &&
 				gd.anchor == gd.cursor
 
-			cAM := plain_cleared && plain_inert && latched && noted_once && built
+			cAM := plain_cleared && plain_inert && latched && noted_once && cursor_pinned && built
 			fmt.printfln(
-				"  %-6s LOW 7: the folded Alt+drag latches behave as the inline ones did: plain_press_cleared=%v plain_drag_inert=%v anchor_latched=%v(off=%d cell=%d) noted_once=%v(%v,%v,%v) built=%v(anchor=%d cursor=%d)",
+				"  %-6s LOW 7 + HIGH (live pass): the folded Alt+drag latches behave as the inline ones did, and a refused drag leaves no linear selection: plain_press_cleared=%v plain_drag_inert=%v anchor_latched=%v(off=%d cell=%d) noted_once=%v(%v,%v,%v) cursor_pinned=%v(anchor=%d cursor=%d) built=%v(anchor=%d cursor=%d)",
 				"ok" if cAM else "FAIL",
 				plain_cleared,
 				plain_inert,
@@ -3895,6 +3987,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				n1,
 				n2,
 				n3,
+				cursor_pinned,
+				pinned_anchor,
+				pinned_cursor,
 				built,
 				gd.anchor,
 				gd.cursor,
@@ -3902,6 +3997,193 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			return cAM
 		}
 		if !block_test_am(&t) {fail = true}
+
+		// AN: LIVE PASS -- block_test_ai (HIGH 1's other half, above) needs a
+		// genuine set/get round trip against the REAL Windows clipboard to
+		// prove Paste no longer eats a linear span. Before this fix it wrote
+		// "PP" over the clipboard and never put back what was there, so every
+		// blocktest run silently replaced whatever the user had copied. Seed a
+		// sentinel standing in for "the user's real clipboard content", run
+		// block_test_ai (which now saves/restores around its own "PP" write),
+		// and confirm the sentinel -- not "PP" -- is what's left afterward.
+		// No App/Document needed here -- block_test_ai owns its own -- which
+		// keeps this proc's own stack frame small; see block_test_ao's own
+		// comment for why that matters at this depth.
+		//
+		// Sabotage (per task): remove the `defer if had_clip {...}` restore
+		// from block_test_ai and this must FAIL, reporting "PP".
+		//
+		// This proc used to write `sentinel` over the clipboard with no
+		// save/restore of its own -- that was the HIGH finding a later
+		// review caught: the mode-level save/restore now protects the real
+		// user clipboard regardless, but this proc still cleans up after
+		// itself (saving whatever was there -- the mode's own seam
+		// sentinel, if nothing upstream leaked -- before overwriting it,
+		// and restoring that on the way out) so it doesn't leave `sentinel`
+		// sitting in the clipboard for the mode's seam-proof check at the
+		// very end to trip over.
+		block_test_an :: proc(t: ^plat.Text) -> bool {
+			ndummy: plat.Window
+			sentinel := "USER'S REAL CLIPBOARD CONTENT - DO NOT LOSE"
+			nsaved_clip, nhad_clip := plat.clipboard_get_text(ndummy.hwnd, context.allocator)
+			defer if nhad_clip {
+				plat.clipboard_set_text(ndummy.hwnd, nsaved_clip)
+				delete(nsaved_clip)
+			}
+			plat.clipboard_set_text(ndummy.hwnd, sentinel)
+			_ = block_test_ai(t) // exercises the real clipboard round trip
+			after, ok := plat.clipboard_get_text(ndummy.hwnd, context.temp_allocator)
+			cAN := ok && after == sentinel
+			fmt.printfln(
+				"  %-6s LIVE PASS: blocktest's clipboard round trip restores what was there before, not \"PP\": got=%q (want %q)",
+				"ok" if cAN else "FAIL",
+				after,
+				sentinel,
+			)
+			return cAN
+		}
+		if !block_test_an(&t) {fail = true}
+
+		// AO/AP: LIVE PASS, split across TWO procs rather than one -- the wrap
+		// refusal used to post the same "[COLUMN SELECT NEEDS WRAP OFF -
+		// press Alt+Z]" note for BOTH causes doc_wraps covers, but Alt+Z does
+		// nothing at all in Markdown Split -- Ctrl+M is the control that turns
+		// it off. Each proc drives ONE cause through the real dispatcher
+		// (resolve_key -> command_dispatch -> block_extend_dispatch,
+		// commands.odin) with exactly one App/Document, matching the size of
+		// every other proc in this file. Putting both causes' Apps in one
+		// proc (tried first) hit a real STATUS_STACK_OVERFLOW at this call
+		// depth -- this file is one enormous procedure, and two Apps live at
+		// once in a single frame was enough to run it out, even though the
+		// exact same two Apps, one per call, are not. Compare the two notes
+		// via app.notice so the test survives across the two separate calls.
+		//
+		// Sabotage (per task): fold Split_On back into Wrap_On (either in
+		// block_wrap_refusal, block.odin, or in block_extend_dispatch's
+		// switch, commands.odin) and this pair must FAIL, reporting the Alt+Z
+		// note for Split too.
+		block_test_ao :: proc(t: ^plat.Text) -> (note: string, ok: bool) {
+			wa: App
+			wdummy: plat.Window
+			app_new_scratch(&wa)
+			wd := app_active(&wa)
+			doc_close(wd)
+			wd^ = doc_from_content(transmute([]u8)strings.clone("aaaa\nbbbb\ncccc\n"), "", .UTF8)
+			wd.wrap = true // plain word wrap, not Split
+			wd.cursor, wd.anchor = 0, 0
+			rcmd := resolve_key(.Right, false, true, .Editor) // Alt+Shift+Right
+			command_dispatch(rcmd, {.Right, false, true, true}, &wa, &wdummy, t, 10)
+			note = strings.clone(wa.notice)
+			ok = strings.contains(note, "WRAP OFF") && strings.contains(note, "Alt+Z") && !strings.contains(note, "SPLIT")
+			app_destroy(&wa)
+			return
+		}
+		block_test_ap :: proc(t: ^plat.Text) -> (note: string, ok: bool) {
+			sa: App
+			sdummy: plat.Window
+			app_new_scratch(&sa)
+			sd := app_active(&sa)
+			doc_close(sd)
+			sd^ = doc_from_content(transmute([]u8)strings.clone("aaaa\nbbbb\ncccc\n"), "", .UTF8)
+			sd.wrap = false
+			sd.md_mode = .Split
+			sd.cursor, sd.anchor = 0, 0
+			rcmd := resolve_key(.Right, false, true, .Editor) // Alt+Shift+Right
+			command_dispatch(rcmd, {.Right, false, true, true}, &sa, &sdummy, t, 10)
+			note = strings.clone(sa.notice)
+			ok = strings.contains(note, "SPLIT OFF") && strings.contains(note, "Ctrl+M") && !strings.contains(note, "Alt+Z")
+			app_destroy(&sa)
+			return
+		}
+		wrap_note, cWrapNote := block_test_ao(&t)
+		split_note, cSplitNote := block_test_ap(&t)
+		cAOAP := cWrapNote && cSplitNote
+		fmt.printfln(
+			"  %-6s LIVE PASS: word-wrap and Markdown Split get distinct refusal notes naming the right key: wrap=%q split=%q",
+			"ok" if cAOAP else "FAIL",
+			wrap_note,
+			split_note,
+		)
+		if !cAOAP {fail = true}
+		delete(wrap_note)
+		delete(split_note)
+
+		// AQ: FEATURE (Wyatt's call) -- Tab now acts across a live rectangle
+		// exactly like a typed character does (routes through block_replace),
+		// rather than clearing it first the way Enter still deliberately does.
+		// A ragged rectangle (rows of different lengths, some shorter than the
+		// rectangle's left cell) exercises block_apply's virtual-space padding
+		// the same way block_replace's other callers already do. One undo must
+		// restore the exact original bytes in one step.
+		//
+		// Sabotage (per task): drop .Insert_Tab from the exception list in
+		// command_dispatch's block-clear branch (commands.odin) and this must
+		// FAIL -- Tab would clear the rectangle and insert one tab at the
+		// caret instead of one per row.
+		block_test_aq :: proc(t: ^plat.Text) -> bool {
+			ta: App
+			tdummy: plat.Window
+			app_new_scratch(&ta)
+			td := app_active(&ta)
+			doc_close(td)
+			// Ragged: row 1 ("b\n") is only 1 cell long, shorter than the
+			// rectangle's cell_lo=2, so block_apply must pad it with one
+			// virtual space before the tab so all three rows land in the same
+			// column. Row starts: row0=0 ("aaaa\n", 5 bytes), row1=5 ("b\n", 2
+			// bytes), row2=7 ("cccc\n").
+			orig := "aaaa\nb\ncccc\n"
+			td^ = doc_from_content(transmute([]u8)strings.clone(orig), "", .UTF8)
+			td.wrap = false
+			td.anchor, td.cursor = 0, 0
+			// Rectangle at cell 2, rows 0..2 (all three lines), zero-width --
+			// N carets, so Tab prefixes each row at column 2 rather than
+			// replacing a range. a_off/c_off must be real line starts (0, 7).
+			refusal := block_set_from_points(td, t, 0, 2, 7, 2)
+
+			tab_cmd := resolve_key(.Tab, false, false, .Editor)
+			command_dispatch(tab_cmd, {.Tab, false, false, false}, &ta, &tdummy, t, 10)
+			after := doc_debug_string(td)
+			want := "aa\taa\nb \t\ncc\tcc\n"
+
+			block_still_active := block_active(td)
+
+			doc_undo(td)
+			undone := doc_debug_string(td)
+
+			cAQ := refusal == .None && after == want && block_still_active && undone == orig
+			fmt.printfln(
+				"  %-6s FEATURE: Tab indents every row of a ragged rectangle in one undo step: refusal=%v after=%q (want %q) block_active_after=%v undo=%q (want %q)",
+				"ok" if cAQ else "FAIL",
+				refusal,
+				after,
+				want,
+				block_still_active,
+				undone,
+				orig,
+			)
+			app_destroy(&ta)
+			return cAQ
+		}
+		if !block_test_aq(&t) {fail = true}
+
+		// SEAM PROOF: the assertion the previous round's clipboard fix
+		// lacked. block_test_an (above) only proves block_test_ai's OWN
+		// save/restore works; it says nothing about block_test_t,
+		// block_test_u, or a case added after this comment. This instead
+		// checks the WHOLE mode end-to-end: the sentinel set once, before
+		// any case ran (mode_seam_sentinel, at the top of this dispatch),
+		// must still be what's in the clipboard now that every case has
+		// run. Reintroduce any unrestored clipboard write anywhere above --
+		// not just the one the reviewer happened to name -- and this fails.
+		seam_after, seam_ok := plat.clipboard_get_text(nil, context.temp_allocator)
+		cSeam := seam_ok && seam_after == mode_seam_sentinel
+		fmt.printfln(
+			"  %-6s LIVE PASS (seam): every clipboard-touching case in blocktest restores what it found, start to finish: got=%q (want %q)",
+			"ok" if cSeam else "FAIL",
+			seam_after,
+			mode_seam_sentinel,
+		)
+		if !cSeam {fail = true}
 
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
 		return true
@@ -8541,9 +8823,20 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("word@2      : [%d,%d) %q", lo, hi, doc_selected_text(&doc, context.temp_allocator))
 		doc_select_all(&doc)
 		fmt.printfln("select all  : anchor=%d cursor=%d", doc.anchor, doc.cursor)
+		// Same real-clipboard concern as blocktest's Paste case (block_test_ai,
+		// above the seltest section): this is a genuine set/get round trip
+		// against the real Windows clipboard, so save whatever was there and
+		// restore it afterward rather than leaving the user's copied text
+		// overwritten with this fixture's sentinel. Nothing to restore (empty
+		// clipboard, or non-text content) is left alone, not blanked.
+		saved_clip, had_clip := plat.clipboard_get_text(nil, context.allocator)
 		plat.clipboard_set_text(nil, "clip round-trip ✓")
 		if g, gok := plat.clipboard_get_text(nil, context.temp_allocator); gok {
 			fmt.printfln("clipboard   : %q", g)
+		}
+		if had_clip {
+			plat.clipboard_set_text(nil, saved_clip)
+			delete(saved_clip)
 		}
 		doc_close(&doc)
 
