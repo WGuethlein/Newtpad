@@ -101,17 +101,26 @@ command itself produced.
 
 ### C. All 34 roles file-settable
 
-The nine `Syn_*` cases join `theme_role_from_key`, keyed by the lowercase enum name
-(`syn_keyword`, `syn_json_key`, …), consistent with the existing 25.
+Every role becomes settable by the lowercase enum name (`syn_keyword`, `syn_json_key`,
+…), consistent with the existing 25.
 
-The nine cases are the small part. **The guarantee is a test that walks every
-`Color_Role` value and asserts the parser accepts its key** — the same total-over-the-
-enum property `Theme` itself has, applied to the parser. The absence of that property
-is precisely what let nine roles ship unsettable and, in Dark, unset.
+**The mapping becomes a `[Color_Role]string` total array, not a 34-case switch.**
+Component A needs role→key to write the file and the parser needs key→role to read it;
+two hand-maintained mappings can drift apart, and a drift here is silent. A total array
+over the enum gives both directions from one declaration and makes a missing role a
+**compile error** — the same compiler-enforced pattern `Theme` and
+`[Command_Id]Command` already use, and the property whose absence let nine roles ship
+unsettable and, in Dark, unset. `theme_role_from_key` becomes a scan of that array;
+it runs once per line at load, so the switch's dispatch is worth nothing here.
 
-Replacing the switch with reflection over enum names was considered and rejected: it
-rewrites reviewed parsing logic to buy a guarantee the test already provides, and adds
-a runtime dependency to a product with a 2–3 MB size target.
+*(This supersedes the first draft of this section, which kept the switch and enforced
+coverage with a test. Reflection over enum names was rejected separately: it buys the
+same guarantee while adding a runtime dependency to a product with a 2–3 MB size
+target.)*
+
+A test still walks every `Color_Role` and asserts its key is non-empty, unique, and
+round-trips through both directions — the array makes *omission* impossible, not a
+typo'd or duplicated key.
 
 The enum's own comment ("deliberately unused until batch 4 … do not delete these as
 dead code") is now false and gets corrected in the same change.
