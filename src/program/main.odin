@@ -711,6 +711,12 @@ main :: proc() {
 				d.disk_changed = true
 				d.disk_stamp = c.stamp
 			}
+			// If what changed on disk was the active theme's file, re-apply it.
+			// Only on a branch that actually took the new bytes: when
+			// d.disk_changed is set the user's edits won.
+			if !d.disk_changed {
+				theme_reapply_if_active(&app, d.path)
+			}
 			session_dirty = true
 		}
 

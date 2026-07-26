@@ -432,7 +432,7 @@ report_save :: proc(err: plat.Write_Error, path: string, w: ^plat.Window) -> boo
 // collected twice. Acceptable while CP1252 means "small legacy file"; if that
 // stops being true, have doc_save_err report the loss instead.
 @(private = "file")
-save_checked :: proc(doc: ^Document, path: string, w: ^plat.Window) -> bool {
+save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -> bool {
 	if doc.enc == .CP1252 {
 		body := base.pt_collect(&doc.pt, context.temp_allocator)
 		if lost := base.encode_lossy_count(body, doc.enc); lost > 0 {
@@ -449,7 +449,14 @@ save_checked :: proc(doc: ^Document, path: string, w: ^plat.Window) -> bool {
 			}
 		}
 	}
-	return report_save(doc_save_err(doc, path), path, w)
+	saved := report_save(doc_save_err(doc, path), path, w)
+	if saved && app != nil {
+		// Saving the active theme's own file re-applies it -- this is the loop
+		// that makes tuning a theme possible without a rebuild. `path`, not
+		// doc.path: doc_save_err frees and reallocates doc.path.
+		theme_reapply_if_active(app, path)
+	}
+	return saved
 }
 
 // Close a tab, prompting to save first if it has unsaved changes. Save-dialog
@@ -474,7 +481,7 @@ request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
 			}
 			// Aborting the close is right — but say why, or the user sees the tab
 			// simply refuse to close with no explanation and may force-quit.
-			if !save_checked(d, p, w) {return}
+			if !save_checked(app, d, p, w) {return}
 		case .Discard:
 		}
 	}
@@ -620,11 +627,11 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			p = strings.clone(p, context.temp_allocator)
 		}
 		if p != "" {
-			save_checked(doc, p, w)
+			save_checked(app, doc, p, w)
 		}
 	case .Save_As:
 		if p, ok := plat.file_save_dialog(w.hwnd); ok {
-			save_checked(doc, p, w)
+			save_checked(app, doc, p, w)
 		}
 	case .Find_Open:
 		// Ctrl+F means "search", including as the way out of filter view (Ctrl+L):

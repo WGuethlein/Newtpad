@@ -3332,6 +3332,57 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				if pok {os.remove(path)}
 				g_theme = g_saved
 			}
+
+			// The comparison is the entire component, and its two inputs arrive
+			// from different places -- doc.path (Save dialog, argv, or an
+			// Explorer drop) versus themes_dir()'s constructed path -- so they
+			// can name the same file in different case and with different
+			// separators. Feeding it the export's own path back would prove
+			// nothing: those two are identical by construction. Each case below
+			// mangles the path deliberately.
+			{
+				app_t: App
+				menu_init(&app_t.menu)
+				defer app_destroy(&app_t) // frees theme_name; App is zero-is-initialization
+				app_t.settings.theme_name = strings.clone("Dark Custom")
+				path, pok := theme_active_file_path("Dark Custom")
+				g_saved := g_theme
+				g_theme = theme_dark()
+				_ = os.write_entire_file(path, transmute([]u8)string("base dark\ncaret #010203\n"))
+				want := [4]f32{f32(0x01) / 255, f32(0x02) / 255, f32(0x03) / 255, 1}
+
+				exact := pok && theme_reapply_if_active(&app_t, path) && g_theme[.Caret] == want
+
+				g_theme = theme_dark()
+				upper := theme_reapply_if_active(&app_t, strings.to_upper(path, context.temp_allocator)) && g_theme[.Caret] == want
+
+				g_theme = theme_dark()
+				fwd_path, _ := strings.replace_all(path, "\\", "/", context.temp_allocator)
+				fwd := theme_reapply_if_active(&app_t, fwd_path) && g_theme[.Caret] == want
+
+				g_theme = theme_dark()
+				other := !theme_reapply_if_active(&app_t, fmt.tprintf("%s%cnot-the-theme.txt", tdir, '\\')) && g_theme[.Caret] == theme_dark()[.Caret]
+
+				// A built-in has no file, so nothing can match it -- otherwise
+				// saving any file at all while on Dark would re-resolve.
+				delete(app_t.settings.theme_name)
+				app_t.settings.theme_name = strings.clone("Dark")
+				builtin := !theme_reapply_if_active(&app_t, path)
+
+				all_ok := exact && upper && fwd && other && builtin
+				if !all_ok {fail = true}
+				fmt.printfln(
+					"  %-6s reapply: exact=%v upper=%v fwdslash=%v other-file-ignored=%v builtin-ignored=%v",
+					"ok" if all_ok else "FAIL",
+					exact,
+					upper,
+					fwd,
+					other,
+					builtin,
+				)
+				if pok {os.remove(path)}
+				g_theme = g_saved
+			}
 		}
 
 		// settings_load no longer rejects an unresolvable theme_name -- it is

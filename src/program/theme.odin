@@ -757,3 +757,31 @@ theme_edit_current :: proc(app: ^App) -> bool {
 	app_open_path(app, path)
 	return true
 }
+
+// Re-resolve g_theme if `path` is the active theme's file. Called after a
+// successful save and after the external-change watcher reloads a document, so
+// editing the theme file inside Newtpad (or in another editor while it is open
+// here) updates the window without a restart.
+//
+// The comparison is the whole procedure, and its two inputs come from different
+// places: doc.path can arrive from the Save dialog, from argv, or from an
+// Explorer drop, while the theme path is constructed from themes_dir(). Those
+// can name the same file in different case and with different separators, so
+// the compare normalises both. A built-in theme has no file at all, which
+// theme_active_file_path reports as ok=false -- without that early out, every
+// save on Dark would fall through to a string compare against nothing.
+theme_reapply_if_active :: proc(app: ^App, path: string) -> bool {
+	theme_path, ok := theme_active_file_path(app.settings.theme_name)
+	if !ok || path == "" {
+		return false
+	}
+	norm :: proc(s: string) -> string {
+		fwd, _ := strings.replace_all(s, "\\", "/", context.temp_allocator)
+		return strings.to_lower(fwd, context.temp_allocator)
+	}
+	if norm(path) != norm(theme_path) {
+		return false
+	}
+	g_theme = theme_resolve(app.settings.theme_name)
+	return true
+}
