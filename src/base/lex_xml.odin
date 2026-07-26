@@ -186,18 +186,33 @@ lex_xml :: proc(line: []u8, state_in: Lex_State, out: []Token) -> (n: int, state
 		state = .Normal
 	}
 
-	for i < len(line) && n < len(out) {
+	// NOTE: scanning runs to len(line) regardless of `out`'s capacity -- only
+	// the WRITES below are guarded by `n < len(out)`. state_out must reflect
+	// the whole line even once `out` is full: a `<!--` past the 64th token
+	// (HL_MAX_ROW_TOKENS) on a dense line is still real and still opens a
+	// comment that the NEXT line's state_in must know about. Stopping the
+	// scan at capacity (the original bug here) silently reports whatever
+	// state was reached so far as if it were the line's true end state --
+	// wrong, and wrong on every subsequent line too, since state threads
+	// forward. lx_scan_tag_rest already had this shape (its own `n^ <
+	// len(out)` guards, unconditional scan); the outer loop just hadn't
+	// matched it.
+	for i < len(line) {
 		b := line[i]
 
 		if b == '<' && i + 4 <= len(line) && line[i + 1] == '!' && line[i + 2] == '-' && line[i + 3] == '-' {
 			close := lx_find_comment_close(line, i + 4)
 			if close < 0 {
-				out[n] = Token{i, len(line) - i, .Comment}
-				n += 1
+				if n < len(out) {
+					out[n] = Token{i, len(line) - i, .Comment}
+					n += 1
+				}
 				return n, .In_Comment // still open at end of line
 			}
-			out[n] = Token{i, close - i, .Comment}
-			n += 1
+			if n < len(out) {
+				out[n] = Token{i, close - i, .Comment}
+				n += 1
+			}
 			i = close
 			continue
 		}
@@ -207,16 +222,20 @@ lex_xml :: proc(line: []u8, state_in: Lex_State, out: []Token) -> (n: int, state
 			if j < len(line) && line[j] == '/' {j += 1}
 			l := lx_scan_name(line, j)
 			delim_len := (j + l) - i
-			out[n] = Token{i, delim_len, .Xml_Tag}
-			n += 1
+			if n < len(out) {
+				out[n] = Token{i, delim_len, .Xml_Tag}
+				n += 1
+			}
 			i = lx_scan_tag_rest(line, i + delim_len, out, &n)
 			continue
 		}
 
 		if b == '&' {
 			if l := lx_scan_entity(line, i); l > 0 {
-				out[n] = Token{i, l, .Keyword}
-				n += 1
+				if n < len(out) {
+					out[n] = Token{i, l, .Keyword}
+					n += 1
+				}
 				i += l
 				continue
 			}

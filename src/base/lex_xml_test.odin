@@ -170,13 +170,20 @@ test_lex_xml_empty_line_inside_comment :: proc(t: ^testing.T) {
 	testing.expectf(t, state == .In_Comment, "empty line inside an open comment stays In_Comment, got %v", state)
 }
 
-// A line producing more matches than `out` can hold must stop at capacity,
-// same contract as lex_log/lex_json.
+// A line producing more matches than `out` can hold must stop EMITTING at
+// capacity (same contract as lex_log/lex_json) but must NOT stop SCANNING:
+// the trailing `<!--` here opens a comment after the 2nd token, past `out`'s
+// capacity of 2, and state_out must still report .In_Comment. Before the fix
+// this test asserted only `n == 2` and threw away state with `n, _ :=` --
+// passing even though the real implementation silently returned .Normal here
+// (the token-capacity exit doubled as a scan-capacity exit). See lex_xml.odin's
+// header comment on the outer loop.
 @(test)
 test_lex_xml_stops_at_capacity :: proc(t: ^testing.T) {
-	line := `<a><b><c><d>`
+	line := `<a><b><c><!--`
 	bytes := transmute([]u8)line
 	out: [2]Token
-	n, _ := lex_xml(bytes, .Normal, out[:])
+	n, state := lex_xml(bytes, .Normal, out[:])
 	testing.expectf(t, n == 2, "want exactly 2 tokens (out's capacity), got %d", n)
+	testing.expectf(t, state == .In_Comment, "want In_Comment (scan must continue past emit capacity), got %v", state)
 }
