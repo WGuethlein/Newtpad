@@ -3289,6 +3289,188 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 		if !block_test_ac(&t) {fail = true}
 
+		// AD: MEDIUM re-derivation -- a HELD KEY, not a single press, is the
+		// real cost this cap has to bound. Every press of block_replace over a
+		// live rectangle splices the SAME rows again, fragmenting the piece
+		// tree further, so the cap's own cost test measuring only press #0 (R
+		// and AC above) could never see a held key degrade: the reviewer's own
+		// numbers at the old 2,000-row cap climbed from 7.9ms at press 1 past
+		// 70ms by press 20, still rising. This measures press 20 specifically
+		// -- a sustained-but-not-extreme held key -- against the same fixture
+		// R and AC use.
+		//
+		// The 50ms threshold is NOT the ~25ms release-build frame budget
+		// BLOCK_EDIT_MAX_LINES's own comment derives 300 from -- this headless
+		// mode normally runs as a DEBUG build day to day, and debug measured
+		// noticeably slower per splice (31.8ms debug vs 8.2ms release at this
+		// cap on the machine that derived these numbers). 50ms clears debug's
+		// real number with margin while still sitting well below what press 20
+		// costs at the OLD 2,000-row cap in EITHER build (76.3ms release /
+		// 318.8ms debug) -- see BLOCK_EDIT_MAX_LINES's own comment for the
+		// full cross-build table this was chosen against.
+		//
+		// Sabotage (per task): raise BLOCK_EDIT_MAX_LINES back to 2,000 (or
+		// any cap the comment's own curve shows crossing budget by press 20)
+		// and this must FAIL.
+		block_test_ad :: proc(t: ^plat.Text) -> bool {
+			line := "2026-07-26 INFO x\n" // 18 bytes; same fixture as R/AC
+			nrows := 100_000
+			mb := strings.builder_make(context.temp_allocator)
+			for _ in 0 ..< nrows {strings.write_string(&mb, line)}
+			mdoc := doc_from_content(transmute([]u8)strings.clone(strings.to_string(mb)), "", .UTF8)
+			defer doc_close(&mdoc)
+			mdoc.wrap = false
+			off := 45_000 * len(line)
+			mdoc.block = true
+			mdoc.block_anchor_line_start, mdoc.block_anchor_cell = off, 0
+			mdoc.block_cursor_line_start, mdoc.block_cursor_cell = off + (BLOCK_EDIT_MAX_LINES - 1) * len(line), 0
+
+			steady_press := 20
+			ms20 := 0.0
+			okall := true
+			for press in 1 ..= steady_press {
+				start := time.now()
+				ok := block_replace(&mdoc, t, transmute([]u8)string("x"))
+				elapsed := time.duration_milliseconds(time.since(start))
+				okall &= ok
+				if press == steady_press {ms20 = elapsed}
+			}
+			cAD := okall && ms20 < 50
+			fmt.printfln(
+				"  %-6s MEDIUM (re-derived): a HELD KEY's press #%d over a %d-row rectangle stays inside the frame budget: elapsed=%.2fms (want <50ms)",
+				"ok" if cAD else "FAIL",
+				steady_press,
+				BLOCK_EDIT_MAX_LINES,
+				ms20,
+			)
+			return cAD
+		}
+		if !block_test_ad(&t) {fail = true}
+
+		// AE: HIGH -- a stale rectangle must not survive a Replace All that
+		// leaves NO matches, because find.odin's own incidental clear
+		// (find_merge -> find_select_current, on jumping to the next match)
+		// only fires while matches remain. Reviewer's exact probe: rows 1-2 of
+		// a 4-row buffer, rectangle over cells [0,4), Replace All "Q" ->
+		// "ZZZZZZ" -- the one match sits on row 0, outside the rectangle
+		// entirely, and disappears once replaced. Both block_active AND
+		// block_text are asserted: block_active alone would pass even if the
+		// geometry fields were merely stale rather than truly cleared, and
+		// block_text is what Ctrl+C/Ctrl+X actually read, which is the
+		// concrete damage this finding described.
+		//
+		// Sabotage (per task): remove the `if block_active(doc)
+		// {block_clear(doc)}` line from find_replace_all (find.odin) and this
+		// must FAIL -- block_active reads true and block_text still returns
+		// the 3 stale rows.
+		block_test_ae :: proc(t: ^plat.Text) -> bool {
+			edoc := doc_from_content(transmute([]u8)strings.clone("aaaaQaaaa\nbbbbbbbbbb\ncccccccccc\ndddddddddd\n"), "", .UTF8)
+			defer doc_close(&edoc)
+			edoc.wrap = false
+			find_open(&edoc, true)
+			for r in "Q" {find_input_rune(&edoc, r)}
+			edoc.find.field = 1
+			for r in "ZZZZZZ" {find_input_rune(&edoc, r)}
+			edoc.find.field = 0
+			find_wait(&edoc)
+			matches_before := len(edoc.find.matches)
+
+			edoc.block = true
+			edoc.block_anchor_line_start, edoc.block_anchor_cell = 10, 0 // "bbbbbbbbbb\n"'s own line start
+			edoc.block_cursor_line_start, edoc.block_cursor_cell = 21, 4 // "cccccccccc\n"'s own line start
+			find_replace_all(&edoc)
+			find_wait(&edoc)
+
+			after := doc_debug_string(&edoc)
+			etxt, etok := block_text(&edoc, t)
+			cAE :=
+				matches_before == 1 &&
+				after == "aaaaZZZZZZaaaa\nbbbbbbbbbb\ncccccccccc\ndddddddddd\n" &&
+				!block_active(&edoc) &&
+				!etok &&
+				etxt == ""
+			fmt.printfln(
+				"  %-6s HIGH: Replace All that leaves zero matches drops the rectangle -- block_active=%v block_text_ok=%v block_text=%q content=%q",
+				"ok" if cAE else "FAIL",
+				block_active(&edoc),
+				etok,
+				etxt,
+				after,
+			)
+			return cAE
+		}
+		if !block_test_ae(&t) {fail = true}
+
+		// AF: LOW 1 -- Backspace over a multi-cell rune (a leading tab) must
+		// land the rectangle at the column the deletion actually reached, not
+		// cell_lo-1. Reviewer's exact probe: "\tabc\n\tdef\n", rectangle at
+		// cell 4 (zero-width, both rows identical) -- the tab is TAB_CELLS
+		// wide (4), so deleting it drops the rectangle back to column 0, not
+		// column 3. A stale column 3 would pad three stray spaces onto every
+		// row on the very next keystroke.
+		//
+		// Sabotage (per task): restore `new_cell` to a flat `cell_lo - 1` in
+		// block_delete (block.odin) and this must FAIL -- block_cursor_cell
+		// reads 3, not 0.
+		block_test_af :: proc(t: ^plat.Text) -> bool {
+			fdoc := doc_from_content(transmute([]u8)strings.clone("\tabc\n\tdef\n"), "", .UTF8)
+			defer doc_close(&fdoc)
+			fdoc.wrap = false
+			fdoc.block = true
+			fdoc.block_anchor_line_start, fdoc.block_anchor_cell = 0, 4
+			fdoc.block_cursor_line_start, fdoc.block_cursor_cell = 5, 4 // "\tdef\n"'s own line start
+			okf := block_delete(&fdoc, t, false)
+			got := doc_debug_string(&fdoc)
+			cAF :=
+				okf &&
+				got == "abc\ndef\n" &&
+				fdoc.block_anchor_cell == 0 &&
+				fdoc.block_cursor_cell == 0
+			fmt.printfln(
+				"  %-6s LOW 1: backspace over a leading tab lands the rectangle at column 0, not cell_lo-1=3: content=%q (want %q) anchor_cell=%d cursor_cell=%d (want 0,0)",
+				"ok" if cAF else "FAIL",
+				got,
+				"abc\\ndef\\n",
+				fdoc.block_anchor_cell,
+				fdoc.block_cursor_cell,
+			)
+			return cAF
+		}
+		if !block_test_af(&t) {fail = true}
+
+		// AG: LOW 1 -- same off-by-(w-1) for a CJK rune (2 cells). "你abc\n",
+		// rectangle at cell 2 (right after 你, zero-width) -- Backspace must
+		// delete the whole 3-byte rune and drop the rectangle to column 0,
+		// not column 1 (cell_lo-1).
+		//
+		// Sabotage: same as AF -- restore the flat `cell_lo - 1` and this must
+		// FAIL (cursor_cell reads 1, not 0).
+		block_test_ag :: proc(t: ^plat.Text) -> bool {
+			gdoc := doc_from_content(transmute([]u8)strings.clone("你abc\n"), "", .UTF8)
+			defer doc_close(&gdoc)
+			gdoc.wrap = false
+			gdoc.block = true
+			gdoc.block_anchor_line_start, gdoc.block_anchor_cell = 0, 2
+			gdoc.block_cursor_line_start, gdoc.block_cursor_cell = 0, 2
+			okg := block_delete(&gdoc, t, false)
+			got := doc_debug_string(&gdoc)
+			cAG :=
+				okg &&
+				got == "abc\n" &&
+				gdoc.block_anchor_cell == 0 &&
+				gdoc.block_cursor_cell == 0
+			fmt.printfln(
+				"  %-6s LOW 1: backspace over a CJK rune lands the rectangle at column 0, not cell_lo-1=1: content=%q (want %q) anchor_cell=%d cursor_cell=%d (want 0,0)",
+				"ok" if cAG else "FAIL",
+				got,
+				"abc\\n",
+				gdoc.block_anchor_cell,
+				gdoc.block_cursor_cell,
+			)
+			return cAG
+		}
+		if !block_test_ag(&t) {fail = true}
+
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
 		return true
 	}

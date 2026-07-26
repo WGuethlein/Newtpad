@@ -1091,6 +1091,16 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// view falls back to unfiltered until matches exist (doc_filtering).
 		doc.filter = !doc.filter
 		doc.filter_top = 0
+		// A rectangle made before Ctrl+L names rows by the buffer's own logical
+		// lines (block.odin never walks the filtered view), which is a
+		// different, non-contiguous set of rows the instant filter view turns
+		// on. block_extend already refuses to CREATE a rectangle while
+		// doc.filter is set; this is the other half -- drop one that already
+		// exists rather than let it silently edit rows the user can no longer
+		// see. block.odin's own edit paths refuse under doc.filter too
+		// (belt and braces), but this is the one place that actually removes
+		// the stale selection the user would otherwise still see highlighted.
+		if block_active(doc) {block_clear(doc)}
 	case .Find_Toggle_Replace_Mode:
 		doc.find.replace_mode = !doc.find.replace_mode
 	case .Find_Filter_Page_Up:

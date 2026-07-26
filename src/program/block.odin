@@ -625,20 +625,59 @@ block_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, ro
 //   worth of freeze on a single keypress. (The reviewer's own numbers, a
 //   different file and line: 131ms release / 308ms debug -- same order.)
 //
-//   THIS cap (2,000 rows), single-pass resolve (block_row_range once per
-//   row, not twice): release 9.0ms, debug 10.0ms -- see blocktest's own
-//   MEDIUM 2 case (test_modes.odin), which asserts <60ms against this exact
-//   fixture so a future regression in either the cap or the single-pass
-//   change trips it.
+//   A LATER cap of 2,000 rows, single-pass resolve (block_row_range once per
+//   row, not twice): release 9.0ms, debug 10.0ms for the FIRST press on a
+//   pristine piece tree.
 //
-// 2,000 was picked directly off the reviewer's measured curve (~13 us/row):
-// the largest round number still comfortably under one frame at 60 Hz, with
-// headroom left over for Task 6's edit, whose per-row work (resolve, plus a
-// splice that shifts every byte offset after it) is strictly more expensive
-// than a delete's -- it shares this cap rather than needing a smaller one of
-// its own, but its own worst case should be re-measured against it when it
-// lands, not assumed from the delete's numbers above.
-BLOCK_EDIT_MAX_LINES :: 2_000
+// That first-press number is the wrong thing to have sized this cap against.
+// A held key -- Backspace, Delete, or retyping the same column repeatedly --
+// sends the identical edit through this cap once per repeat, and each press
+// splices every row in the rectangle again, fragmenting the piece tree
+// further; every later press pays more to walk it. The 2,000-row cap's own
+// COST TEST only ever measured press #0, so it could not see this. Re-measured
+// as consecutive presses of block_replace over a live 2,000-row rectangle
+// (same fixture, release build):
+//
+//   press 1: 7.9ms   press 5: 29.2ms   press 10: 50.2ms   press 20: 69.5ms
+//   press 24: 77.0ms, still climbing -- against a ~25ms budget (one frame at
+//   60Hz with headroom for everything else a frame does), a held key at 2,000
+//   rows blows the budget by press 2 and is nearly triple it by press 20.
+//
+// DECISION: lower the cap rather than keep 2,000 and merely document the
+// degradation -- the whole point of a cap here is that the user never feels
+// it, and a documented-but-live 70ms stall on a held key fails that. Re-run
+// at smaller caps (same fixture, same held-key loop, release build):
+//
+//   cap 500: press 1  2.0ms   press 10 12.6ms   press 20 16.1ms   press 30 26.8ms (over budget)
+//   cap 300: press 1  1.1ms   press 10  4.9ms   press 20  8.2ms   press 50 13.6ms (still comfortably under)
+//
+// 300 is the chosen cap: press 20 -- a sustained-but-not-extreme held key --
+// costs ~8ms (RELEASE build) at 300 rows, and even 50 consecutive presses (a
+// key held for a second or two at typematic repeat rates) stay under 14ms,
+// versus 500 rows crossing the 25ms budget by press 30 and 2,000 rows blowing
+// through it by press 2. This does shrink the largest rectangle a single
+// Copy/Cut/edit can span from 2,000 rows to 300 -- but 300 rows is already
+// far more than a column edit is used for in practice (block_test_w's own
+// comment: "typing '// ' down a column is three keystrokes"), and an
+// unusable stall on every held key is a worse cost than refusing a rectangle
+// nobody was going to hold a key over anyway.
+//
+// blocktest's own steady-state case (test_modes.odin, MEDIUM/AD) asserts on
+// press 20, not press 1, so a future regression in either direction --
+// raising the cap back up, or reverting to measuring only the first press --
+// trips it. Its own threshold is 50ms, not the ~25ms release budget above:
+// DEBUG is measurably slower per splice (press 20 at this cap measured
+// 31.8ms debug against 8.2ms release on this machine -- the headless test
+// modes only ever run as a debug build's console mode day to day), so the
+// test's bound has to clear debug's real number with margin while still
+// sitting below what press 20 costs at the OLD 2,000-row cap in either build
+// (76.3ms release / 318.8ms debug, measured by temporarily restoring the old
+// cap) -- otherwise a regression back to 2,000 would slip through in debug
+// even though it demonstrably fails the actual budget. 50ms is comfortably
+// inside that gap on both builds; the ~25ms figure above is the real,
+// user-facing claim about the shipped (release) exe, which is what the
+// comment's own curve was measured against.
+BLOCK_EDIT_MAX_LINES :: 300
 
 // The rectangle's rows as text, one line per spanned row, joined with the
 // document's OWN line ending -- never a hard-coded '\n'. doc_insert_newline
@@ -671,6 +710,17 @@ BLOCK_EDIT_MAX_LINES :: 2_000
 //     frame -- a rectangle CAN span the whole file.
 block_text :: proc(doc: ^Document, t: ^plat.Text, allocator := context.temp_allocator) -> (string, bool) {
 	if !block_active(doc) {return "", false}
+	// Belt and braces with Find_Toggle_Filter clearing the block (commands.odin):
+	// block_extend already refuses to CREATE a rectangle while doc.filter is on
+	// (this file's own Filter_On refusal), because filter view's rows are a
+	// non-contiguous subset of the document's lines and a rectangle's rows mean
+	// something different again there. But a rectangle made BEFORE Ctrl+L
+	// survives the toggle unless something clears it, and every consumer here
+	// resolves rows by walking the buffer's own logical lines (block_step_lines,
+	// block_row_range) -- never the filtered view -- so it would read and copy
+	// rows the user cannot currently see. Refusing here is the second line of
+	// defence for whichever path failed to clear it first.
+	if doc.filter {return "", false}
 	off_lo, off_hi, cell_lo, cell_hi := block_bounds(doc)
 	eol := "\r\n" if doc.eol == .CRLF else "\n"
 
@@ -759,6 +809,10 @@ block_text :: proc(doc: ^Document, t: ^plat.Text, allocator := context.temp_allo
 // is the only thing that puts the caret there.
 block_cut_delete :: proc(doc: ^Document, t: ^plat.Text) -> bool {
 	if !block_active(doc) {return false}
+	// See block_text's own comment: belt and braces with Find_Toggle_Filter
+	// clearing the block: refuse rather than delete rows the filtered view is
+	// currently hiding from the user.
+	if doc.filter {return false}
 	off_lo, off_hi, cell_lo, cell_hi := block_bounds(doc)
 
 	starts := make([dynamic]int, 0, 64, context.temp_allocator)
@@ -863,6 +917,10 @@ block_cut_delete :: proc(doc: ^Document, t: ^plat.Text) -> bool {
 @(private = "file")
 block_apply :: proc(doc: ^Document, t: ^plat.Text, edit_lo, edit_hi: int, text: []u8, new_cell: int, kind: Edit_Kind) -> bool {
 	if !block_active(doc) {return false}
+	// See block_text's own comment: belt and braces with Find_Toggle_Filter
+	// clearing the block. block_apply is the single choke point block_replace
+	// and block_delete both funnel through, so one guard here covers both.
+	if doc.filter {return false}
 	off_lo, off_hi, _, _ := block_bounds(doc)
 
 	// Row starts first, by the cheap vertical walk alone (no cell walk yet), so
@@ -1033,7 +1091,7 @@ block_replace :: proc(doc: ^Document, t: ^plat.Text, text: []u8) -> bool {
 // keeps the operation rectangular.
 block_delete :: proc(doc: ^Document, t: ^plat.Text, forward: bool) -> bool {
 	if !block_active(doc) {return false}
-	_, _, cell_lo, cell_hi := block_bounds(doc)
+	off_lo, _, cell_lo, cell_hi := block_bounds(doc)
 	if cell_lo != cell_hi {
 		return block_apply(doc, t, cell_lo, cell_hi, nil, cell_lo, .Delete)
 	}
@@ -1043,5 +1101,34 @@ block_delete :: proc(doc: ^Document, t: ^plat.Text, forward: bool) -> bool {
 	if cell_lo == 0 {
 		return true // nothing to the left on any row; see this proc's comment
 	}
-	return block_apply(doc, t, cell_lo - 1, cell_lo, nil, cell_lo - 1, .Delete)
+	// The column Backspace leaves the rectangle in is cell_lo MINUS THE CELL
+	// WIDTH OF WHATEVER IT ACTUALLY DELETED -- not a flat -1, which assumes
+	// every deleted cell is exactly one cell wide. It usually is (an ASCII
+	// row), but block_row_range's own whole-rune-inclusion rule (this file's
+	// central invariant: a straddled rune is never split) pulls a wider rune
+	// in whole the moment cell_lo-1 lands inside its span -- a tab (4 cells,
+	// TAB_CELLS) or a CJK character (2 cells) -- so the byte range deleted can
+	// span more than one cell even though the EDIT range requested is always
+	// exactly [cell_lo-1, cell_lo). LOW 1's probe: "\tabc\n" with the
+	// rectangle at cell 4 deletes the whole leading tab (byte 0, the tab's
+	// own start, to byte 1), and the caret lands at column 0 -- cell_lo-1
+	// would report column 3, a column that does not exist on the row, and the
+	// next keystroke would pad three stray spaces onto every row to reach it.
+	//
+	// Resolved via the rectangle's own TOP row (off_lo) -- the same row
+	// top_caret is computed from elsewhere in this file, because that row's
+	// start can never shift out from under this read -- through the same
+	// block_row_range the edit itself calls a moment later inside
+	// block_apply. This is one extra single-row resolve, not a second
+	// cell-to-byte model: if this pre-read cannot resolve the row (ok=false),
+	// block_apply's own identical resolve moments later will refuse the same
+	// way and the whole edit aborts, so the fallback below is never observed
+	// standing in for a value that mattered.
+	new_cell := cell_lo - 1
+	if lo, hi, _, ok := block_row_range(doc, t, off_lo, cell_lo - 1, cell_lo); ok && hi > lo {
+		buf := make([]u8, hi - lo, context.temp_allocator)
+		base.pt_read(&doc.pt, lo, buf)
+		new_cell = cell_lo - plat.text_cells(t, buf, .Doc)
+	}
+	return block_apply(doc, t, cell_lo - 1, cell_lo, nil, new_cell, .Delete)
 }
