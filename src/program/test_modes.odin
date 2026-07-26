@@ -942,6 +942,27 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("  Down / Menu -> %v %s", un, "OK" if un == .Menu_Item_Next else "FAIL")
 		if un != .Menu_Item_Next {bad += 1}
 
+		// The Encoding menu. A fourth top-level menu is the first change to the
+		// bar's width since it was written, so the seam assertions above matter
+		// more here than the contents do.
+		enc_menu := -1
+		for m, i in menus {
+			if m.title == "Encoding" {enc_menu = i}
+		}
+		enc_rows_ok := enc_menu >= 0 && len(menus[enc_menu].items) == 10
+		fmt.printfln("  %-6s Encoding menu present with 8 commands + 2 separators: idx=%d", "ok" if enc_rows_ok else "FAIL", enc_menu)
+		if !enc_rows_ok {bad += 1}
+
+		mn_ok := true
+		enc_seen: map[rune]bool
+		defer delete(enc_seen)
+		for m in menus {
+			if enc_seen[m.mnemonic] {mn_ok = false}
+			enc_seen[m.mnemonic] = true
+		}
+		fmt.printfln("  %-6s every menu mnemonic is unique", "ok" if mn_ok else "FAIL")
+		if !mn_ok {bad += 1}
+
 		fmt.printfln("menutest: %d failures", bad)
 		return true
 	}
