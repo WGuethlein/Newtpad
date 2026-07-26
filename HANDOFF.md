@@ -11,6 +11,13 @@ this file, which repeatedly defers to it, is committed. Losing it loses the *why
 decision here. Worth revisiting: tracking it costs nothing and the reasons for keeping it out are
 worth restating if they still hold.
 
+**How work gets done here is written down: [docs/development-loop.md](docs/development-loop.md).**
+Read it before starting a batch. It is the loop batches 1–4 (§6s–§6w) converged on — ask the
+outcome-changing questions, spec, plan, a fresh subagent per task, a review after every task, a
+whole-branch review at the end, sabotage every test, then HANDOFF entry → version bump → merge →
+`install.ps1`. It also carries the two bug *shapes* this codebase keeps producing and the
+operational traps that have each cost a session real time. Unlike `CLAUDE.md`, it is committed.
+
 ## 1. What Newtpad is
 
 Wyatt's project: a **notepad replacement for Windows** — the text-editor analog of File Pilot
@@ -109,6 +116,22 @@ were the priorities. Read P2 as the live list, with these amendments:
 - **The text pipeline batches nothing** — one heap allocation, two buffer maps and one draw call
   per string, 74 call sites, several inside per-row loops. This is the prerequisite for an
   always-on line-number gutter (see `drawcount` in §6k).
+- **`build.bat release` is roughly 2x the ~5 s rule and has been for a while.** Measured A/B on this
+  machine 2026-07-26: **v0.12.0 8.1 s, v0.13.0 10.2 s** (warm, three runs each; debug stayed at
+  1.1 s). §6w originally recorded "5.8 s before this batch" — that figure was stale and made
+  highlighting look like a 2.7 s regression when the rule was already breached by ~60% before it
+  started. Ruled out: the `@(test)` corpus (removing all twelve `src/base/*_test.odin` changed
+  nothing). The remainder is LLVM at `-o:speed`. Belongs in the ship-readiness batch, not to a
+  feature batch.
+- **`Highlight_Row_Cache.cur_buf` is a row-sized token budget filled from a whole line.** On
+  `doc_row_lex_spans`'s whole-line path the 512-span array covers a logical line of up to
+  `RENDER_LINE_CAP` (8192) bytes, so a dense enough wrapped line — measured: a 4.5 KB minified-JS
+  line at 200 columns — colours its first four visual rows and leaves the next nineteen bare.
+  `state_out` stays correct (every lexer keeps scanning past a full `out`), so this is visual only,
+  and it is 4x better than v0.12.0's 64-token budget. **The obvious fix is wrong:** setting
+  `whole_line = false` on saturation makes the fall-through lex `[start,end)` with a `state_in`
+  resolved at `lls`. Either re-lex the row's own extent for spans while keeping the cached state, or
+  decide the refusal in `doc_row_lex_extent` before any state is resolved.
 
 Ranked. P0 = fix before building more; P1 = cheap correctness/cleanliness now; P2 = deferred but
 tracked.
@@ -1683,10 +1706,44 @@ warnings), `lexstatetest`/`highlighttest`/`lexcoveragetest`/`rowtest`/`crlftest`
 `.ps1`) has a zero-capacity-`out` test proving its state transition is computed before, and independent
 of, whether a token could be written — the direct descendant of the Task 3/4 bug shape.
 
-**`build.bat release` regressed further past the ~5 s rule**: 5.8 s before this batch, **~8.3–8.7 s**
-now (three runs). Debug (`build.bat`, no `-o:speed`) stayed under 1 s. Flagging rather than letting it
-slide, per the task brief's own instruction — worth a look before the ship-readiness batch (§6u batch
-7) if it keeps growing.
+**`build.bat release` is past the ~5 s rule, but this batch is not why.** The first draft of this
+entry said "5.8 s before this batch, ~8.3–8.7 s now," which would have sent someone hunting a 2.7 s
+regression inside these five tasks. The 5.8 s came from the plan and was stale. Measured A/B on this
+machine, same toolchain, warm, three runs each: **v0.12.0 8.1 s, v0.13.0 10.2 s**; debug 1.1 s at
+both. So the rule was already breached by ~60% before batch 4 started and this adds ~2 s of LLVM at
+`-o:speed` on ~4,000 new lines. Now in the §5 debt register, where it belongs. Removing all twelve
+`src/base/*_test.odin` files changes nothing, so the `@(test)` corpus is not the cause.
+
+### The whole-branch review, and the shape it kept finding
+
+The final review's most useful finding was not a bug but a **pattern**: *a component reads a bounded
+or truncated slice, cannot tell it was truncated, and returns a confident answer anyway.* Six
+commits on this branch exist because of it — `lex_xml` at its row buffer, `lex_c_resync_valid` at
+its 256-token buffer, the same again at a truncated line. Told to go looking for a fourth, the
+review found it in `doc_row_lex_spans`; told to go looking for a fifth, the fix pass found it in
+`links.odin` — pre-existing, nothing to do with highlighting, and the worse bug of the two: with
+word wrap on, a URL past ~4 KB into a logical line was **neither underlined nor clickable**. Both
+had the same root: `pt_line_start_cap` returns `(floor, exact)` and both call sites discarded
+`exact`, so a scan floor that *slides with the row* was used as a line start.
+
+The fix is one shared decision — `doc_row_lex_extent` (`doc.odin`) returns the byte range a row's
+spans come from and whether that range is a whole logical line, and **both** consumers (the span
+builder and `doc_draw`'s first-row state bootstrap) ask it. That is "one layout per widget" applied
+to a lexing extent, and it removes the diverge-across-two-sites mechanism rather than patching one
+side. `links_layout` got the same treatment.
+
+Two things worth keeping from how that landed:
+
+- **Two commits on this branch did not compile.** `git bisect` would have hit them. Both were
+  "wire it up" commits where an interface change and its call-site updates were split across a
+  commit boundary; both were fixed by the very next commit. Squashed before merge, and every one of
+  the 25 commits now passes `odin check src/program`. Worth checking on any branch that changes a
+  signature in one commit and its callers in another.
+- **One guard cannot be sabotage-tested, and that is now asserted rather than left as a
+  coincidence.** Removing `doc_row_lex_extent`'s `exact` check leaves every test green — because
+  `WRAP_START_CAP == RENDER_LINE_CAP` means the *other* guard catches the same rows.
+  `#assert(WRAP_START_CAP >= RENDER_LINE_CAP)` is what keeps that true; drop the cap below and the
+  guard becomes load-bearing with nothing testing it.
 
 ### Owed and open
 
@@ -1697,8 +1754,40 @@ slide, per the task brief's own instruction — worth a look before the ship-rea
 - `.py` has no lexer at all — a real follow-up task, not a guess this batch was willing to make (see
   `DELIBERATELY_PLAIN_EXTS`'s own comment, `program/highlight.odin`).
 - SQL's `--` comment gap and CSS's `//`-in-`url()` gap (above) are both real, disclosed trade-offs, not
-  fixed — see `CSS_KW`/`SQL_KW`'s own comments in `lex_c.odin`.
-- The release-build time regression (above) is unexplained; worth profiling if it keeps climbing.
+  fixed — see `CSS_KW`/`SQL_KW`'s own comments in `lex_c.odin`. One `line_comment` field on
+  `Keyword_Set` closes both; the reason it wasn't done here is that it changes reviewed matching
+  logic rather than adding a data table.
+- **`cur_buf` saturation on the whole-line path** — now in the §5 debt register, with the reason the
+  obvious fix is wrong. Visual only; state stays correct.
+- The release-build overrun is in §5 now, correctly attributed. Not this batch's to fix.
+- `links_layout`'s fragment fallback can emit a hit for text that is not a link in the document (a
+  URL cut across a wrap point leaves a tail that scans as a `.Path`). It cannot become a different
+  *site* — a URL needs a whitelisted scheme — and a spurious path only resolves if such a file
+  exists beside the document, so the worst case is an underline that does nothing. Documented at the
+  call site.
+
+### What only Wyatt can check, ranked
+
+Nothing in this environment can see a screen, and the nine `Syn_*` colours were chosen by arithmetic
+in §6v and have never been rendered against real code.
+
+1. **The `Syn_*` colours against real code, in Light and Dark.** Sharpest pairs: `Syn_Comment` vs
+   `Text_Muted` (the gutter line numbers sit right beside it), `Syn_Punct` vs `Text_Primary` (if
+   punctuation reads as body text, every `.Punct` token in this batch is wasted work), and
+   `Syn_Json_Key`/`Syn_Xml_Attr`, two roles with no precedent in any editor's default theme.
+2. **A minified `.json`, `.css` or `.xml` with word wrap on.** Where the `cur_buf` limit above shows:
+   colour stops partway down the line. Confirm whether that reads as "unfinished" or just "long
+   line."
+3. **Scroll a large `.c` or `.xml` fast.** The documented resync failure mode looks, on screen, like
+   *colour changing while you scroll* — the same byte coloured differently at different `doc.top`.
+   Correct by design; only Wyatt can say whether it's tolerable or the 64 KiB window needs raising.
+4. **Filter mode on a large `.c`/`.xml`/`.md`, typing live.** Per-row resync on every keystroke, and
+   filter-as-you-type is a stated speed promise. The one path here that could break it.
+5. **Ctrl-hover a URL inside a comment.** Links win by dropping the intersecting syntax span
+   *whole*, so the entire comment loses its colour, not just the URL's bytes. Tested and correct;
+   confirm it doesn't look like a glitch.
+6. **A `.md` file in source view, then Ctrl+M.** Two features colouring one file — confirm they read
+   as deliberate.
 
 ## 7. Build environment (Windows, this machine)
 
