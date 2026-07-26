@@ -1584,9 +1584,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		defer doc_close(&doc)
 
 		// Row 0 is pure ASCII: cells [2,6) is bytes [2,6).
-		ls0 := doc_line_start_of_index(&doc, 0)
+		ls0, ls0_ok := doc_line_start_of_index(&doc, 0)
 		b0lo, b0hi, pad0, ok0 := block_row_range(&doc, &t, ls0, 2, 6)
-		c0 := ok0 && b0lo == 2 && b0hi == 6 && pad0 == 0
+		c0 := ls0_ok && ok0 && b0lo == 2 && b0hi == 6 && pad0 == 0
 		if !c0 {fail = true}
 		fmt.printfln("  %-6s ascii row: bytes [%d,%d) pad=%d ok=%v", "ok" if c0 else "FAIL", b0lo, b0hi, pad0, ok0)
 
@@ -1595,40 +1595,100 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// byte form), pulling byte_lo back to the tab's own start (byte 0) --
 		// the rectangle ends up covering cells [0,6) worth of content in only
 		// 3 bytes, not the 4 a naive bytes==cells reading would expect.
-		ls1 := doc_line_start_of_index(&doc, 1)
+		ls1, ls1_ok := doc_line_start_of_index(&doc, 1)
 		b1lo, b1hi, pad1, ok1 := block_row_range(&doc, &t, ls1, 2, 6)
-		c1 := ok1 && b1lo == ls1 && b1hi == ls1 + 3 && pad1 == 0
+		c1 := ls1_ok && ok1 && b1lo == ls1 && b1hi == ls1 + 3 && pad1 == 0
 		if !c1 {fail = true}
 		fmt.printfln("  %-6s tab row: bytes rel [%d,%d) pad=%d ok=%v", "ok" if c1 else "FAIL", b1lo - ls1, b1hi - ls1, pad1, ok1)
 
-		// The CJK row: cells [2,6) must NOT be bytes [2,6). If this assertion
-		// ever reads "bytes == cells" the two spaces have been confused.
-		ls2 := doc_line_start_of_index(&doc, 2)
+		// The right-edge STRADDLE branch (a rune whose span reaches past
+		// cell_hi without starting exactly there) is otherwise never hit by
+		// this suite: row 1's own cell_hi=6 lands exactly on 'd', the exact-
+		// match branch. Here cell_hi=2 lands INSIDE the leading tab's [0,4)
+		// span, so the tab must be pulled in whole from the right edge too --
+		// same rule as the left edge, straddle wins over "past the edge".
+		b1slo, b1shi, pad1s, ok1s := block_row_range(&doc, &t, ls1, 0, 2)
+		c1s := ls1_ok && ok1s && b1slo == ls1 && b1shi == ls1 + 1 && pad1s == 0
+		if !c1s {fail = true}
+		fmt.printfln("  %-6s tab row right-edge straddle: bytes rel [%d,%d) pad=%d ok=%v", "ok" if c1s else "FAIL", b1slo - ls1, b1shi - ls1, pad1s, ok1s)
+
+		// The CJK row: cells [2,6) must NOT be bytes [2,6) -- and must be
+		// EXACTLY the right answer, not merely "some other answer". 你(3B)
+		// starts cell_lo=2 mid-span (cell+w=2>2 is false, so lo actually
+		// lands on 好 at rel byte 3); 界 starts exactly at cell_hi=6, so hi
+		// excludes it at rel byte 9. A wrong-but-different byte range would
+		// pass the old `!=` assertion; only the exact one catches that.
+		ls2, ls2_ok := doc_line_start_of_index(&doc, 2)
 		b2lo, b2hi, _, ok2 := block_row_range(&doc, &t, ls2, 2, 6)
-		c2 := ok2 && !(b2lo == ls2 + 2 && b2hi == ls2 + 6)
+		c2 := ls2_ok && ok2 && b2lo == ls2 + 3 && b2hi == ls2 + 9
 		if !c2 {fail = true}
-		fmt.printfln("  %-6s cjk row: bytes rel [%d,%d) differ from cells [2,6)", "ok" if c2 else "FAIL", b2lo - ls2, b2hi - ls2)
+		fmt.printfln("  %-6s cjk row: bytes rel [%d,%d) (want [3,9))", "ok" if c2 else "FAIL", b2lo - ls2, b2hi - ls2)
 
 		// "short" is 5 cells; a rectangle starting at cell 8 selects nothing on
 		// it and reports the padding an edit would need. pad is reported, NOT
 		// applied -- selection never mutates.
-		ls3 := doc_line_start_of_index(&doc, 3)
+		ls3, ls3_ok := doc_line_start_of_index(&doc, 3)
 		b3lo, b3hi, pad3, ok3 := block_row_range(&doc, &t, ls3, 8, 10)
-		c3 := ok3 && b3lo == b3hi && pad3 == 3
+		c3 := ls3_ok && ok3 && b3lo == b3hi && pad3 == 3
 		if !c3 {fail = true}
 		fmt.printfln("  %-6s short row selects nothing, pad=%d (want 3)", "ok" if c3 else "FAIL", pad3)
 
-		// A row longer than BLOCK_ROW_CAP cannot be scanned to completion: the
-		// exact-flag discipline requires ok=false rather than an answer read
-		// from a truncated slice.
+		// A row longer than BLOCK_ROW_CAP can still resolve a rectangle that
+		// sits entirely near its start: the walk finds cell_hi long before it
+		// would ever need to see past the cap, so this must SUCCEED. Refusing
+		// here (the old behaviour) meant every rectangle over a minified-JSON
+		// or log line resolved to nothing.
 		long := make([]u8, BLOCK_ROW_CAP + 500)
 		for i in 0 ..< len(long) {long[i] = 'x'}
 		ldoc := doc_from_content(long, "", .UTF8)
 		defer doc_close(&ldoc)
-		_, _, _, okL := block_row_range(&ldoc, &t, 0, 2, 6)
-		cL := !okL
+		bLlo, bLhi, padL, okL := block_row_range(&ldoc, &t, 0, 2, 6)
+		cL := okL && bLlo == 2 && bLhi == 6 && padL == 0
 		if !cL {fail = true}
-		fmt.printfln("  %-6s row past BLOCK_ROW_CAP refuses rather than guesses (ok=%v, want false)", "ok" if cL else "FAIL", okL)
+		fmt.printfln("  %-6s low cells on a row past BLOCK_ROW_CAP still resolve: bytes [%d,%d) ok=%v", "ok" if cL else "FAIL", bLlo, bLhi, okL)
+
+		// But a rectangle whose cell_hi genuinely lies past the cap CANNOT be
+		// resolved -- the walk runs off the end of the capped scan window
+		// without ever finding cell_hi, and row_end might only be a synthetic
+		// cap break rather than the row's real end. ok=false is the only
+		// honest answer here.
+		_, _, _, okL2 := block_row_range(&ldoc, &t, 0, BLOCK_ROW_CAP - 2, BLOCK_ROW_CAP + 50)
+		cL2 := !okL2
+		if !cL2 {fail = true}
+		fmt.printfln("  %-6s cell_hi past BLOCK_ROW_CAP refuses rather than guesses (ok=%v, want false)", "ok" if cL2 else "FAIL", okL2)
+
+		// Regression for the chunk-boundary rune split: block_row_range reads
+		// a row through a local 4096-byte buffer, and a multi-byte rune whose
+		// bytes straddle that exact boundary must be refilled and decoded
+		// whole, never counted as one cell per orphaned byte. 4091 ASCII
+		// bytes put 好's continuation bytes across index 4096; asking for
+		// cells [4091,4095) must land on 世's start (byte 4097), not wherever
+		// the two split halves of 好 happened to add up to.
+		splitsrc := strings.concatenate({strings.repeat("x", 4091, context.temp_allocator), "你好世界"}, context.temp_allocator)
+		sdoc := doc_from_content(transmute([]u8)strings.clone(splitsrc), "", .UTF8)
+		defer doc_close(&sdoc)
+		bSlo, bShi, padS, okS := block_row_range(&sdoc, &t, 0, 4091, 4095)
+		cS := okS && bSlo == 4091 && bShi == 4097 && padS == 0
+		if !cS {fail = true}
+		fmt.printfln("  %-6s rune split at the 4096-byte chunk boundary: bytes [%d,%d) ok=%v (want [4091,4097))", "ok" if cS else "FAIL", bSlo, bShi, okS)
+
+		// Regression for byte_lo leaking a foreign row's offset: line 0 is
+		// "x\n" (2 bytes), so line 1 starts at byte 2 and opens with a
+		// zero-width combining acute (no base rune of its own). Asking for
+		// cell 0 (an empty, single-column rectangle) makes hi_found fire on
+		// that first, zero-width rune (cell==cell_hi==0) while lo_found never
+		// fires (cell+w=0 is never > cell_lo=0) -- exactly the state the
+		// zero-width block cursor of a later task reaches. byte_lo must come
+		// out as this row's own start, not byte 0 belonging to line 0.
+		combining, combining_sz := utf8.encode_rune(rune(0x0301))
+		zsrc := strings.concatenate({"x\n", string(combining[:combining_sz]), " abc\n"}, context.temp_allocator)
+		zdoc := doc_from_content(transmute([]u8)strings.clone(zsrc), "", .UTF8)
+		defer doc_close(&zdoc)
+		zls, zls_ok := doc_line_start_of_index(&zdoc, 1)
+		zlo, zhi, padZ, okZ := block_row_range(&zdoc, &t, zls, 0, 0)
+		cZ := zls_ok && okZ && zlo == zls && zhi == zls && padZ == 0
+		if !cZ {fail = true}
+		fmt.printfln("  %-6s zero-width rune at the column: bytes [%d,%d) rel to line_start=%d (want [0,0))", "ok" if cZ else "FAIL", zlo - zls, zhi - zls, zls)
 
 		// block_bounds normalises regardless of drag direction: up-and-left
 		// must describe the same rectangle as down-and-right from the other

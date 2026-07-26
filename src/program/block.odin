@@ -25,9 +25,10 @@ import plat "src:platform"
 
 // Bytes a single row's cell-walk will scan before giving up rather than
 // answer from a truncated read. Shared with the renderer's own per-row cap
-// (RENDER_LINE_CAP, doc.odin) rather than inventing a second number: a block
-// rectangle is only ever drawn over visible rows, so whatever the renderer
-// can already afford to scan for one row is exactly what this can afford too.
+// (RENDER_LINE_CAP, doc.odin) rather than inventing a second number: this
+// bounds how much of one ROW's LENGTH the walk can afford to scan, not how
+// many rows a rectangle spans -- whatever the renderer can already afford to
+// scan for one row is exactly what this can afford too.
 BLOCK_ROW_CAP :: RENDER_LINE_CAP
 
 // Is a rectangular selection live? The four geometry fields below are only
@@ -67,16 +68,22 @@ block_bounds :: proc(doc: ^Document) -> (line_lo, line_hi, cell_lo, cell_hi: int
 // returns min(length, line_start+cap) BOTH when no '\n' turned up inside the
 // cap AND, indistinguishably, when a real '\n' sits exactly at the cap
 // boundary. doc_row_lex_extent (doc.odin) resolves the same ambiguity the
-// same way: treat it as truncated. A wrong "this is truncated" costs one row
-// the answer once; a wrong "this is the real end" is the confident-wrong-
-// answer shape this task exists to rule out.
+// same way: treat it as truncated.
+//
+// `truncated` does NOT by itself mean the caller must refuse -- it only means
+// row_end might be a synthetic cap break rather than the row's real end.
+// block_row_range only turns this into ok=false if its cell-walk actually ran
+// off the end of [line_start, row_end) without finding cell_hi: a short
+// rectangle near the start of an arbitrarily long row (a minified-JSON or log
+// line) must still succeed, because the walk never needed to see past the
+// cap to answer. Refusing on row length alone -- before the walk even starts
+// -- was the bug: it fails every rectangle on a long row, not just the ones
+// that actually reach past the cap.
 @(private = "file")
-block_row_end :: proc(doc: ^Document, line_start: int) -> (row_end: int, ok: bool) {
+block_row_end :: proc(doc: ^Document, line_start: int) -> (row_end: int, truncated: bool) {
 	row_end = base.pt_line_end_cap(&doc.pt, line_start, BLOCK_ROW_CAP)
-	if row_end == line_start + BLOCK_ROW_CAP && row_end < doc.pt.length {
-		return row_end, false
-	}
-	return row_end, true
+	truncated = row_end == line_start + BLOCK_ROW_CAP && row_end < doc.pt.length
+	return
 }
 
 // The one procedure that turns a rectangle's cell range into bytes for one
@@ -102,10 +109,15 @@ block_row_end :: proc(doc: ^Document, line_start: int) -> (row_end: int, ok: boo
 // exactly at cell_hi is excluded, because there is no partial glyph to
 // protect there.
 block_row_range :: proc(doc: ^Document, t: ^plat.Text, line_start: int, cell_lo, cell_hi: int) -> (byte_lo, byte_hi, pad_cells: int, ok: bool) {
-	row_end, resolved := block_row_end(doc, line_start)
-	if !resolved {
-		return 0, 0, 0, false
-	}
+	row_end, truncated := block_row_end(doc, line_start)
+
+	// Both default to line_start, not 0: line_start is an absolute offset
+	// into the document, and 0 is only correct for the very first row. If
+	// hi_found ever fires without lo_found -- a zero-width rune sitting
+	// exactly at cell_lo, or cell_lo == cell_hi -- byte_lo must stay a valid
+	// offset ON THIS ROW rather than leak an offset belonging to row zero.
+	byte_lo = line_start
+	byte_hi = line_start
 
 	buf: [4096]u8
 	p := line_start
@@ -117,9 +129,28 @@ block_row_range :: proc(doc: ^Document, t: ^plat.Text, line_start: int, cell_lo,
 		if n == 0 {break}
 		i := 0
 		for i < n {
+			if !utf8.full_rune(buf[i:n]) {
+				// decode_rune can't tell "chunk boundary split a valid
+				// multi-byte lead byte's tail off" apart from "this lead byte
+				// is simply invalid" -- both return (RUNE_ERROR, 1). full_rune
+				// can: it returns false only when the bytes seen so far are
+				// still a plausible PREFIX of a longer encoding, which is
+				// exactly the boundary-split case.
+				if p + n < row_end {
+					// More of the row exists past this chunk: refill starting
+					// at this rune's own lead byte so the next read begins
+					// with the complete encoding, then decode before counting
+					// anything. Nothing has been counted for this rune yet.
+					p += i
+					continue outer
+				}
+				// The row's own real end cut the rune off; there is nothing
+				// left to refill with. Refuse rather than count the partial
+				// bytes as a rune of their own.
+				return line_start, line_start, 0, false
+			}
 			r, sz := utf8.decode_rune(buf[i:n])
 			if sz == 0 {sz = 1}
-			if i + sz > n && p + n < row_end {break} // rune straddles the chunk; refill
 			w := plat.text_cell_width(t, r, .Doc)
 
 			if !lo_found && cell + w > cell_lo {
@@ -153,6 +184,16 @@ block_row_range :: proc(doc: ^Document, t: ^plat.Text, line_start: int, cell_lo,
 	}
 
 	if !hi_found {
+		if truncated {
+			// The walk ran off the end of the capped scan window without
+			// finding cell_hi -- and row_end might only be a synthetic cap
+			// break, not the row's real end. There is no way to tell whether
+			// cell_hi (or even cell_lo) sits just past what was scanned, so
+			// refuse rather than guess. A rectangle that DID find cell_hi
+			// within the cap (above) never reaches this branch, however long
+			// the row actually is.
+			return line_start, line_start, 0, false
+		}
 		if !lo_found {
 			// The row ran out before reaching cell_lo at all: nothing on it
 			// falls in the rectangle, and an edit would need pad_cells spaces
@@ -165,6 +206,18 @@ block_row_range :: proc(doc: ^Document, t: ^plat.Text, line_start: int, cell_lo,
 	return byte_lo, byte_hi, 0, true
 }
 
+// Byte budget for doc_line_start_of_index's forward walk. This is a BOUNDED
+// STOPGAP, not a real line index: the walk below costs O(bytes before line
+// n), so calling it once per mouse-move frame (tasks 2/3) or once per row of
+// a rectangle (tasks 4/5) is quadratic over a rectangle that sits deep in a
+// large file -- exactly the "forward scanning is safe" mistake this codebase
+// has frozen on before (see pt_line_start_cap). Capping the walk and
+// refusing past the cap keeps one call's cost bounded and honest instead of
+// silently going quadratic; it does not remove the cost. If a later task
+// needs this per-frame against a realistically large document, the real
+// answer is a row iterator or a cached line index, not a bigger number here.
+DOC_LINE_INDEX_CAP :: BLOCK_ROW_CAP * 64
+
 // Byte offset of the start of 0-based logical line `n`. Walks FORWARD from 0
 // by a known, small line count -- the doc_goto_line idiom (doc.odin) -- which
 // is why this is safe where base.pt_line_start is not: pt_line_start scans
@@ -174,12 +227,19 @@ block_row_range :: proc(doc: ^Document, t: ^plat.Text, line_start: int, cell_lo,
 // offset" helper existed anywhere in the tree before this task, and the
 // keyboard and mouse gestures (later tasks) both need one to turn a target
 // logical line into the line_start block_row_range takes.
-doc_line_start_of_index :: proc(doc: ^Document, n: int) -> int {
+//
+// `ok` is false when the walk passed DOC_LINE_INDEX_CAP bytes before reaching
+// line n -- the same refuse-rather-than-guess contract as block_row_range's
+// own ok. Callers must not use `start` when ok is false.
+doc_line_start_of_index :: proc(doc: ^Document, n: int) -> (start: int, ok: bool) {
 	p := 0
 	for _ in 0 ..< n {
+		if p > DOC_LINE_INDEX_CAP {
+			return p, false
+		}
 		np := base.pt_next_line_start(&doc.pt, p)
 		if np == p {break}
 		p = np
 	}
-	return p
+	return p, p <= DOC_LINE_INDEX_CAP
 }
