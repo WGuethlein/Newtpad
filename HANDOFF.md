@@ -18,6 +18,9 @@ whole-branch review at the end, sabotage every test, then HANDOFF entry → vers
 `install.ps1`. It also carries the two bug *shapes* this codebase keeps producing and the
 operational traps that have each cost a session real time. Unlike `CLAUDE.md`, it is committed.
 
+**Immediate next step: cut the v0.13.0 GitHub release — see §6w "Owed and open" for how, and for
+the `gh`-not-on-PATH trap that makes `release.ps1` skip the Release step without saying so.**
+
 ## 1. What Newtpad is
 
 Wyatt's project: a **notepad replacement for Windows** — the text-editor analog of File Pilot
@@ -1747,6 +1750,24 @@ Two things worth keeping from how that landed:
 
 ### Owed and open
 
+- **FIRST THING NEXT SESSION: cut the v0.13.0 GitHub release.** v0.13.0 is merged, installed and
+  pushed, but **no tag was cut and no Release exists** — and tags stop at **v0.9.0**, so v0.10.0,
+  v0.11.0 and v0.12.0 were never tagged either. `.\release.ps1` does the whole job from
+  `NEWTPAD_VERSION`: refuses a dirty or already-tagged tree, builds the release exe, tags
+  `v0.13.0`, pushes branch + tag, and creates the GitHub Release with the exe attached.
+  `.\release.ps1 -DryRun` first.
+  - **`gh` IS installed** (2.96.0, `C:\Program Files\GitHub CLI\gh.exe`) but was **not on the PATH
+    of a shell opened before it was installed**. `release.ps1` gates the Release step on
+    `Get-Command gh`, so in a stale shell it silently tags and pushes and then prints the *manual
+    upload* fallback as though `gh` were absent. **Open a fresh shell, confirm `gh --version`
+    answers, then run it.**
+  - Decide before running: **just v0.13.0** (auto-generated notes span everything back to v0.9.0,
+    so nothing is lost — four batches appear as one release), or **backfill v0.10.0–v0.12.0** onto
+    their merge commits so the tag history matches the version history. Backfilling means either
+    rebuilding those binaries from their commits or publishing those three without attachments.
+  - **The exe is unsigned.** If the repo is public, every download hits a SmartScreen warning.
+    Signing is blocked on Wyatt buying a certificate (§6u batch 7) — Claude must never handle the
+    certificate password.
 - **Wyatt's live pass** — one file of each family, in both themes. The nine `Syn_*` roles were chosen
   by arithmetic in batch 3 (§6v) and have never been seen against real code, Light especially.
 - The two "always cap-hit" resync gaps above (YAML, Markdown) are correct by construction but untested
