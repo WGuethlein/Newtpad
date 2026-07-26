@@ -135,13 +135,14 @@ Color_Role :: enum u8 {
 	// #A8B89E (1: markdown.odin MD_QUOTE).
 	Md_Quote,
 
-	// --- syntax highlighting (batch 4) ---
-	// Declared now so the lexers due in batch 4 emit role names from their
-	// first line instead of new RGB literals that would need migrating right
-	// after landing. Deliberately unused until then -- do not delete these as
-	// dead code. theme_dark gives them an obviously-fake placeholder colour
-	// (loud magenta) rather than leaving them zero, so a stray reference
-	// before batch 4 lands would be visually obvious instead of invisible.
+	// --- syntax highlighting ---
+	// Declared in batch 3 so batch 4's lexers could emit role names from their
+	// first line instead of RGB literals needing migration right after landing.
+	// That worked; what did not is that theme_dark kept the loud-magenta
+	// "missing texture" placeholder these were given, through the entire batch 4
+	// release -- every highlighted file rendered identically magenta in Dark in
+	// v0.13.0. Both built-ins now hold real values and themetest fails if either
+	// ever holds {1,0,1,1} again.
 	Syn_Keyword,
 	Syn_String,
 	Syn_Number,
@@ -224,15 +225,29 @@ theme_dark :: proc() -> Theme {
 		.Md_Italic      = {0.80, 0.86, 0.78, 1}, // #CCDBC7
 		.Md_Quote       = {0.66, 0.72, 0.62, 1}, // #A8B89E
 
-		.Syn_Keyword    = {1, 0, 1, 1},
-		.Syn_String     = {1, 0, 1, 1},
-		.Syn_Number     = {1, 0, 1, 1},
-		.Syn_Comment    = {1, 0, 1, 1},
-		.Syn_Type       = {1, 0, 1, 1},
-		.Syn_Punct      = {1, 0, 1, 1},
-		.Syn_Json_Key   = {1, 0, 1, 1},
-		.Syn_Xml_Tag    = {1, 0, 1, 1},
-		.Syn_Xml_Attr   = {1, 0, 1, 1},
+		// Light's hue family per role, re-tuned for this theme's Bg_Base
+		// (#1A1F29). Ratios are WCAG relative luminance against Bg_Base,
+		// computed rather than eyeballed -- this environment cannot render a
+		// frame, and computation is the standard theme_light already used.
+		// Every token colour clears 4.5:1 except Syn_Comment, which is
+		// deliberately de-emphasised and clears 3:1: a comment that shouts is
+		// a worse outcome than a comment that is slightly dim.
+		//
+		// Syn_Comment is pulled away from Text_Muted (#808CA3) on purpose --
+		// the gutter line numbers are Text_Muted and sit directly beside
+		// comment text. Light deliberately placed those two close together;
+		// Dark must not, because Dark is the theme with the gutter beside it
+		// in daily use. Syn_Punct is likewise kept clear of Text_Primary.
+		// themetest asserts both separations.
+		.Syn_Keyword    = {0.56, 0.66, 1.00, 1}, // #8FA8FF -- periwinkle (Light: indigo #3B5BDB), 7.4:1
+		.Syn_String     = {0.56, 0.85, 0.66, 1}, // #8FD9A8 -- soft green (Light: green #17824E), 10.1:1
+		.Syn_Number     = {0.96, 0.72, 0.48, 1}, // #F5B87A -- peach (Light: burnt orange #B5560A), 9.5:1
+		.Syn_Comment    = {0.43, 0.52, 0.47, 1}, // #6E8578 -- sage grey (Light: slate #707A88), 4.2:1
+		.Syn_Type       = {0.44, 0.83, 0.88, 1}, // #70D4E0 -- cyan (Light: teal #0B7285), 9.5:1
+		.Syn_Punct      = {0.60, 0.65, 0.74, 1}, // #99A6BD -- mid neutral (Light: #444B58), 6.7:1
+		.Syn_Json_Key   = {0.94, 0.63, 0.54, 1}, // #F0A18A -- salmon (Light: rust #9C4221), 8.0:1
+		.Syn_Xml_Tag    = {0.96, 0.55, 0.71, 1}, // #F58CB5 -- pink (Light: rose #B5165A), 7.3:1
+		.Syn_Xml_Attr   = {0.77, 0.68, 0.96, 1}, // #C4ADF5 -- lavender (Light: violet #6B4FB6), 8.4:1
 	}
 }
 
@@ -415,43 +430,74 @@ theme_parse_hex :: proc(s: string) -> (col: [4]f32, ok: bool) {
 	return {f32(r) / 255, f32(g) / 255, f32(b) / 255, 1}, true
 }
 
-// Role name (lowercase, matching the spec's role table exactly) -> Color_Role.
-// An unrecognized name returns ok=false so the caller skips it instead of
-// failing the whole file -- the same "unknown key ignored" contract
-// settings_load uses. Deliberately only the 25 roles the spec's "Theme
-// files" section documents as file-settable; the 9 Syn_* placeholders are
-// not (see theme.odin's enum comment -- batch 4 territory). "base" is
-// deliberately absent from this switch -- it selects which built-in
-// theme_load_file starts overlaying onto, it is not a role, and it must
-// never be counted or logged as an unrecognized one.
-@(private = "file")
+// The file key for every role, as a TOTAL array over Color_Role: Odin rejects
+// an incomplete keyed enumerated-array composite literal at compile time, so a
+// role added without a key is a compile error, not a role that silently cannot
+// be set from a file. That is exactly what went wrong before -- the nine Syn_*
+// roles were absent from the 25-case switch this replaces, so a theme file
+// could not touch them, and Dark's placeholders could not be worked around by
+// the very file mechanism meant to allow it.
+//
+// One array serves both directions: theme_key_from_role writes files
+// (theme_export), theme_role_from_key reads them (theme_load_file). Two
+// hand-maintained mappings would drift, and a drift here is silent.
+//
+// Keys are the lowercase enum name. "base" is deliberately not a key: it
+// selects which built-in theme_load_file overlays onto, it is not a role, and
+// it must never be counted or logged as an unrecognized one.
+theme_role_keys := [Color_Role]string {
+	.Bg_Base        = "bg_base",
+	.Bg_Panel       = "bg_panel",
+	.Bg_Raised      = "bg_raised",
+	.Border_Subtle  = "border_subtle",
+	.Border_Strong  = "border_strong",
+	.Text_Muted     = "text_muted",
+	.Text_Dim       = "text_dim",
+	.Text_Secondary = "text_secondary",
+	.Text_Primary   = "text_primary",
+	.Text_Bright    = "text_bright",
+	.Selection_Doc  = "selection_doc",
+	.Selection_List = "selection_list",
+	.Caret          = "caret",
+	.Accent         = "accent",
+	.Find_Match_Bg  = "find_match_bg",
+	.Link           = "link",
+	.Warning        = "warning",
+	.Danger         = "danger",
+	.Success        = "success",
+	.Filter_Bg      = "filter_bg",
+	.Filter_Text    = "filter_text",
+	.Md_Heading     = "md_heading",
+	.Md_Code        = "md_code",
+	.Md_Italic      = "md_italic",
+	.Md_Quote       = "md_quote",
+	.Syn_Keyword    = "syn_keyword",
+	.Syn_String     = "syn_string",
+	.Syn_Number     = "syn_number",
+	.Syn_Comment    = "syn_comment",
+	.Syn_Type       = "syn_type",
+	.Syn_Punct      = "syn_punct",
+	.Syn_Json_Key   = "syn_json_key",
+	.Syn_Xml_Tag    = "syn_xml_tag",
+	.Syn_Xml_Attr   = "syn_xml_attr",
+}
+
+// The file key for a role. Used by theme_export to write a file.
+theme_key_from_role :: proc(role: Color_Role) -> string {
+	return theme_role_keys[role]
+}
+
+// Role name -> Color_Role. An unrecognized name returns ok=false so the caller
+// skips that line instead of failing the whole file -- the same "unknown key
+// ignored" contract settings_load uses, which is what lets an older build read
+// a newer file. A linear scan of 34 entries, run once per line at load time;
+// the switch this replaces bought nothing measurable and cost the second
+// mapping.
 theme_role_from_key :: proc(key: string) -> (role: Color_Role, ok: bool) {
-	switch key {
-	case "bg_base": return .Bg_Base, true
-	case "bg_panel": return .Bg_Panel, true
-	case "bg_raised": return .Bg_Raised, true
-	case "border_subtle": return .Border_Subtle, true
-	case "border_strong": return .Border_Strong, true
-	case "text_muted": return .Text_Muted, true
-	case "text_dim": return .Text_Dim, true
-	case "text_secondary": return .Text_Secondary, true
-	case "text_primary": return .Text_Primary, true
-	case "text_bright": return .Text_Bright, true
-	case "selection_doc": return .Selection_Doc, true
-	case "selection_list": return .Selection_List, true
-	case "caret": return .Caret, true
-	case "accent": return .Accent, true
-	case "find_match_bg": return .Find_Match_Bg, true
-	case "link": return .Link, true
-	case "warning": return .Warning, true
-	case "danger": return .Danger, true
-	case "success": return .Success, true
-	case "filter_bg": return .Filter_Bg, true
-	case "filter_text": return .Filter_Text, true
-	case "md_heading": return .Md_Heading, true
-	case "md_code": return .Md_Code, true
-	case "md_italic": return .Md_Italic, true
-	case "md_quote": return .Md_Quote, true
+	for k, r in theme_role_keys {
+		if k == key {
+			return r, true
+		}
 	}
 	return {}, false
 }
@@ -549,7 +595,13 @@ theme_available_names :: proc(allocator := context.temp_allocator) -> []string {
 	for info in infos {
 		if info.type != .Regular {continue}
 		if !strings.has_suffix(info.name, ".theme") {continue}
-		append(&names, strings.trim_suffix(info.name, ".theme"))
+		stem := strings.trim_suffix(info.name, ".theme")
+		// A file named Dark.theme or Light.theme can never load -- theme_resolve
+		// answers those two names from the compiled-in themes before it looks at
+		// disk. Listing it would offer a Settings entry that silently does
+		// nothing, and a duplicate of a name already in this list.
+		if stem == "Dark" || stem == "Light" {continue}
+		append(&names, stem)
 	}
 	return names[:]
 }
@@ -576,4 +628,169 @@ theme_resolve :: proc(name: string) -> Theme {
 	}
 	path := fmt.tprintf("%s%c%s.theme", dir, '\\', name)
 	return theme_load_file(path, theme_dark())
+}
+
+// The .theme file backing a theme name, or ok=false when there is none. The
+// two built-ins are compiled in and have NO file -- theme_resolve returns
+// theme_dark()/theme_light() without consulting disk -- so they are the early
+// out here, and the reason "reload the theme file" needs an export step before
+// it can mean anything.
+theme_active_file_path :: proc(name: string) -> (path: string, ok: bool) {
+	if name == "Dark" || name == "Light" {
+		return "", false
+	}
+	dir, dok := themes_dir()
+	if !dok {
+		return "", false
+	}
+	return fmt.tprintf("%s%c%s.theme", dir, '\\', name), true
+}
+
+// The name to export the current theme AS. A built-in cannot be its own
+// target: a file called Dark.theme is unreachable, because theme_resolve
+// short-circuits on that name before looking at disk -- it would list in the
+// Settings cycle and then change nothing when picked. A custom theme exports
+// as itself, which combined with theme_export's no-overwrite rule means
+// "export" on an already-exported theme is just "open it".
+theme_export_target :: proc(name: string) -> string {
+	switch name {
+	case "Dark":
+		return "Dark Custom"
+	case "Light":
+		return "Light Custom"
+	}
+	return name
+}
+
+// Convert one channel to its 8-bit file form. Rounds to nearest rather than
+// truncating: the theme is f32 and the file is 8 bits per channel, so a trip
+// through a file cannot be exact (0.10 * 255 = 25.5). Rounding reaches a fixed
+// point after one trip; truncation drifts further on the first and can ratchet
+// down across repeated exports. themetest asserts the fixed point.
+@(private = "file")
+theme_chan_hex :: proc(c: f32) -> int {
+	v := int(c * 255 + 0.5)
+	if v < 0 {v = 0}
+	if v > 255 {v = 255}
+	return v
+}
+
+// Write the current theme to themes_dir()/<target>.theme and return the target
+// name and path. Writes every role, so the file is a complete, editable
+// starting point rather than something the user must know the format to build.
+//
+// NEVER overwrites: on an existing target this succeeds and returns the path
+// having written nothing. The file is the user's tuning work and the command
+// calling this is reachable at any time; silently replacing it with the
+// built-in's values would destroy exactly the thing this feature exists to
+// let them make.
+theme_export :: proc(from_name: string, t: Theme) -> (target: string, path: string, ok: bool) {
+	target = theme_export_target(from_name)
+	dir, dok := themes_dir_ensure()
+	if !dok {
+		return target, "", false
+	}
+	path = fmt.tprintf("%s%c%s.theme", dir, '\\', target)
+	if os.exists(path) {
+		return target, path, true // never clobber the user's edits
+	}
+
+	base_name := "light" if from_name == "Light" else "dark"
+	b := strings.builder_make(context.temp_allocator)
+	fmt.sbprintf(&b, "# Newtpad theme -- %s\n", target)
+	fmt.sbprint(&b, "#\n")
+	fmt.sbprint(&b, "# Edit a colour and save (Ctrl+S). The window updates immediately.\n")
+	fmt.sbprint(&b, "# Each line is `role #rrggbb`. Lines starting with # are comments.\n")
+	fmt.sbprint(&b, "# Delete a line to fall back to the base theme's value for that role.\n")
+	fmt.sbprint(&b, "# An unknown role or a malformed colour is skipped, never fatal.\n")
+	fmt.sbprint(&b, "#\n")
+	fmt.sbprintf(&b, "base %s\n\n", base_name)
+
+	sections := []struct {
+		title: string,
+		first: Color_Role,
+	}{{"neutrals", .Bg_Base}, {"accents", .Selection_Doc}, {"syntax", .Syn_Keyword}}
+	si := 0
+	for role in Color_Role {
+		if si < len(sections) && role == sections[si].first {
+			fmt.sbprintf(&b, "# --- %s ---\n", sections[si].title)
+			si += 1
+		}
+		c := t[role]
+		fmt.sbprintf(
+			&b,
+			"%s #%02X%02X%02X\n",
+			theme_key_from_role(role),
+			theme_chan_hex(c.r),
+			theme_chan_hex(c.g),
+			theme_chan_hex(c.b),
+		)
+	}
+
+	if os.write_entire_file(path, transmute([]u8)strings.to_string(b)) != nil {
+		return target, path, false
+	}
+	return target, path, true
+}
+
+// Edit Current Theme: the one command that turns "themes are files" from a
+// documented format nobody has a file for into a loop. Exports the active
+// theme if it has no file yet, switches to it, and opens it as a tab -- so the
+// editor becomes the editor of its own theme, and saving re-applies (see
+// theme_reapply_if_active).
+//
+// Order matters on the failure path: settings.theme_name is updated only after
+// the file exists, so a failed write leaves the app on the theme it was
+// already using rather than pointing at a theme file that isn't there.
+//
+// No delete() before the clone below: settings_default leaves theme_name as
+// the static literal "Dark" until settings.txt actually supplies a
+// theme_name line (settings_load only clones then), so on a fresh install,
+// or a settings.txt written before that key existed, this field can be a
+// pointer into .rdata rather than heap memory -- freeing it would be
+// HeapFree on read-only static memory. This leaks one short name string per
+// theme switch -- the same leak the Settings theme cycle at
+// settings.odin:353 already has, so the two sites are consistent rather
+// than newly divergent.
+theme_edit_current :: proc(app: ^App) -> bool {
+	target, path, ok := theme_export(app.settings.theme_name, g_theme)
+	if !ok {
+		app_note(app, "[THEME NOT SAVED - could not write to the themes folder]")
+		return false
+	}
+	if app.settings.theme_name != target {
+		app.settings.theme_name = strings.clone(target)
+		g_theme = theme_resolve(target)
+		settings_save(app.settings)
+	}
+	app_open_path(app, path)
+	return true
+}
+
+// Re-resolve g_theme if `path` is the active theme's file. Called after a
+// successful save and after the external-change watcher reloads a document, so
+// editing the theme file inside Newtpad (or in another editor while it is open
+// here) updates the window without a restart.
+//
+// The comparison is the whole procedure, and its two inputs come from different
+// places: doc.path can arrive from the Save dialog, from argv, or from an
+// Explorer drop, while the theme path is constructed from themes_dir(). Those
+// can name the same file in different case and with different separators, so
+// the compare normalises both. A built-in theme has no file at all, which
+// theme_active_file_path reports as ok=false -- without that early out, every
+// save on Dark would fall through to a string compare against nothing.
+theme_reapply_if_active :: proc(app: ^App, path: string) -> bool {
+	theme_path, ok := theme_active_file_path(app.settings.theme_name)
+	if !ok || path == "" {
+		return false
+	}
+	norm :: proc(s: string) -> string {
+		fwd, _ := strings.replace_all(s, "\\", "/", context.temp_allocator)
+		return strings.to_lower(fwd, context.temp_allocator)
+	}
+	if norm(path) != norm(theme_path) {
+		return false
+	}
+	g_theme = theme_resolve(app.settings.theme_name)
+	return true
 }

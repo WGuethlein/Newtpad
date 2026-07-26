@@ -2773,6 +2773,107 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			}
 		}
 
+		// No role in EITHER built-in may still hold the magenta placeholder
+		// {1,0,1,1}. Batch 3 planted that in theme_dark for the nine Syn_*
+		// roles as a deliberate "missing texture" marker; batch 4 shipped the
+		// lexers that consume them and never replaced it, so every highlighted
+		// file rendered identically magenta in Dark for a whole release. This
+		// is the check that would have caught it. Both built-ins are checked
+		// because the same omission is available to either one.
+		//
+		// Note this deliberately tests theme_dark()/theme_light() only, never a
+		// theme loaded from a file: `caret #ff00ff` is a legitimate colour for
+		// a user to write, and the file round-trip test below uses exactly that
+		// value.
+		{
+			placeholder := [4]f32{1, 0, 1, 1}
+			l := theme_light()
+			for role in Color_Role {
+				if d[role] == placeholder {
+					fmt.printfln("  FAIL   %v is still the magenta placeholder in Dark", role)
+					fail = true
+				}
+				if l[role] == placeholder {
+					fmt.printfln("  FAIL   %v is still the magenta placeholder in Light", role)
+					fail = true
+				}
+			}
+			fmt.println("  ok     no built-in role holds the magenta placeholder")
+		}
+
+		// Two role pairs sit next to each other on screen and must not read as
+		// the same colour. Both are lifted from HANDOFF 6w's "what only Wyatt
+		// can check" list, so they stop depending on someone noticing:
+		//
+		//   Syn_Comment vs Text_Muted -- the gutter line numbers are Text_Muted
+		//   and sit immediately beside comment text.
+		//   Syn_Punct vs Text_Primary -- if punctuation reads as body text,
+		//   every .Punct token batch 4 emits is wasted work.
+		//
+		// The bar is max absolute per-channel difference >= 0.10 (~26/255). That
+		// is a floor against the two being set equal or near-equal, NOT a claim
+		// that 0.10 is perceptually sufficient -- only Wyatt's eye settles that.
+		{
+			max_chan_diff :: proc(a, b: [4]f32) -> f32 {
+				m: f32 = 0
+				for i in 0 ..< 3 {
+					dch := a[i] - b[i]
+					if dch < 0 {dch = -dch}
+					if dch > m {m = dch}
+				}
+				return m
+			}
+			pairs := []struct {
+				a, b: Color_Role,
+			}{{.Syn_Comment, .Text_Muted}, {.Syn_Punct, .Text_Primary}}
+			for p in pairs {
+				diff := max_chan_diff(d[p.a], d[p.b])
+				ok := diff >= 0.10
+				if !ok {fail = true}
+				fmt.printfln("  %-6s Dark %v vs %v: max channel diff %.3f (need >= 0.10)", "ok" if ok else "FAIL", p.a, p.b, diff)
+			}
+		}
+
+		// The role<->key mapping is a total array over Color_Role, so a role
+		// with NO key is a compile error rather than a test failure -- that is
+		// the point of the array, and it is the property whose absence let the
+		// nine Syn_* roles ship unsettable from a file. What the array cannot
+		// catch is a typo'd or duplicated key, so that is what this checks:
+		// every key non-empty, every key unique, and both directions agreeing.
+		{
+			seen := make(map[string]Color_Role, len(Color_Role), context.temp_allocator)
+			for role in Color_Role {
+				key := theme_key_from_role(role)
+				if key == "" {
+					fmt.printfln("  FAIL   %v has an empty file key", role)
+					fail = true
+					continue
+				}
+				if prev, dup := seen[key]; dup {
+					fmt.printfln("  FAIL   key %q maps to both %v and %v", key, prev, role)
+					fail = true
+					continue
+				}
+				seen[key] = role
+				back, ok := theme_role_from_key(key)
+				if !ok || back != role {
+					fmt.printfln("  FAIL   %v -> %q -> %v (ok=%v): key does not round-trip", role, key, back, ok)
+					fail = true
+				}
+			}
+			fmt.printfln("  ok     all %d role keys are non-empty, unique and round-trip", len(Color_Role))
+		}
+
+		// "base" is not a role and must never resolve to one -- it selects
+		// which built-in theme_load_file overlays onto. A role named "base"
+		// would silently capture that line and change which theme you get.
+		{
+			_, is_role := theme_role_from_key("base")
+			ok := !is_role
+			if !ok {fail = true}
+			fmt.printfln("  %-6s \"base\" is not a role key", "ok" if ok else "FAIL")
+		}
+
 		in_set :: proc(got: [4]f32, set: [][4]f32) -> bool {
 			for v in set {if got == v {return true}}
 			return false
@@ -3012,6 +3113,113 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				os.remove(path)
 			}
 
+			// Export writes every role, and what it writes parses back to the
+			// same theme within the 8-bit limit of #rrggbb. The theme is
+			// [4]f32 and the file format is 8 bits per channel, so an exact
+			// round-trip is impossible by construction -- 0.10 * 255 = 25.5.
+			// Two properties matter here, and they guard different things.
+			// theme_chan_hex rounds to nearest, so a channel's drift is bounded
+			// by half a step (0.5/255): this is the check that actually
+			// distinguishes rounding from truncation -- truncation can drift up
+			// to just under 1/255, which would slip under a 1/255 bound but not
+			// under 0.5/255. The second property, a fixed point after one
+			// round-trip, does NOT distinguish them: truncation is idempotent
+			// too, so it is also a fixed point after one trip. That check
+			// guards a different, real property -- see the comment below.
+			{
+				target, path, ok := theme_export("Dark", d)
+				if !ok {
+					fmt.println("  FAIL   theme_export(\"Dark\") failed")
+					fail = true
+				} else {
+					first, rerr := os.read_entire_file(path, context.temp_allocator)
+					if rerr != nil {
+						fmt.println("  FAIL   exported theme file unreadable")
+						fail = true
+					} else {
+						parsed := theme_load_file(path, theme_light()) // base must come from the file, not this arg
+						worst: f32 = 0
+						for role in Color_Role {
+							for i in 0 ..< 4 {
+								dch := parsed[role][i] - d[role][i]
+								if dch < 0 {dch = -dch}
+								if dch > worst {worst = dch}
+							}
+						}
+						// theme_chan_hex rounds to nearest, so a correct implementation
+						// bounds every channel's drift at half a step (0.5/255). This is
+						// the bound that separates rounding from truncation: truncation
+						// drifts up to just under 1/255, which is caught here even though
+						// it slips past a looser 1/255 bound. If theme_chan_hex reverts to
+						// truncation, this assertion -- not the fixed-point check below --
+						// is the one that fails.
+						within := worst <= (1.0 / 510.0) + 0.0001
+						if !within {fail = true}
+						fmt.printfln("  %-6s export round-trip: worst channel drift %.5f (need <= 0.5/255)", "ok" if within else "FAIL", worst)
+
+						// Fixed point: exporting the PARSED theme must produce the
+						// identical bytes -- exporting does not drift further on each
+						// pass. This does NOT catch a reversion to truncation: truncation
+						// is also idempotent after one trip through 8-bit quantization,
+						// so it is a fixed point too. That regression is caught by the
+						// drift bound above, not this check. The first file is removed so
+						// the no-overwrite rule does not block the second write.
+						os.remove(path)
+						_, path2, ok2 := theme_export("Dark", parsed)
+						second, rerr2 := os.read_entire_file(path2, context.temp_allocator)
+						stable := ok2 && rerr2 == nil && string(first) == string(second)
+						if !stable {fail = true}
+						fmt.printfln("  %-6s export is a fixed point after one round-trip", "ok" if stable else "FAIL")
+						os.remove(path2)
+					}
+				}
+				_ = target
+			}
+
+			// The export must never destroy an existing file: it is the user's
+			// tuning work, and the command that calls this is reachable at any
+			// time. On an existing target the call succeeds and reports the
+			// path, but writes nothing.
+			{
+				target := theme_export_target("Dark")
+				path := fmt.tprintf("%s%c%s.theme", tdir, '\\', target)
+				sentinel := "base dark\ncaret #010203\n"
+				_ = os.write_entire_file(path, transmute([]u8)sentinel)
+				_, got_path, ok := theme_export("Dark", d)
+				after, _ := os.read_entire_file(path, context.temp_allocator)
+				preserved := ok && got_path == path && string(after) == sentinel
+				if !preserved {fail = true}
+				fmt.printfln("  %-6s export refuses to overwrite an existing theme file", "ok" if preserved else "FAIL")
+				os.remove(path)
+			}
+
+			// A '#' comment line is ignored, including one whose text contains
+			// a role name -- the exported file is full of both.
+			{
+				path := write_theme_file(tdir, "comments", "# caret #ffffff is the caret colour\n#link #ffffff\nlink #112233\n")
+				got := theme_load_file(path, d)
+				ok := got[.Link] == [4]f32{f32(0x11) / 255, f32(0x22) / 255, f32(0x33) / 255, 1} && got[.Caret] == d[.Caret]
+				if !ok {fail = true}
+				fmt.printfln("  %-6s '#' comment lines ignored, including ones naming a role", "ok" if ok else "FAIL")
+				os.remove(path)
+			}
+
+			// A built-in's name can never back a file: theme_resolve
+			// short-circuits on "Dark"/"Light" before consulting disk, so such
+			// a file would list in Settings and then do nothing when selected.
+			{
+				stray := fmt.tprintf("%s%cDark.theme", tdir, '\\')
+				stray_body := "caret #010203\n"
+				_ = os.write_entire_file(stray, transmute([]u8)stray_body)
+				names := theme_available_names(context.temp_allocator)
+				count := 0
+				for n in names {if n == "Dark" {count += 1}}
+				ok := count == 1 && theme_export_target("Dark") != "Dark" && theme_export_target("Light") != "Light"
+				if !ok {fail = true}
+				fmt.printfln("  %-6s a stray Dark.theme neither duplicates nor becomes an export target", "ok" if ok else "FAIL")
+				os.remove(stray)
+			}
+
 			// A `base light` line overlays Light instead of the default
 			// Dark -- an unnamed role (Md_Quote here) must hold Light's
 			// value, not Dark's. This is the case the fix exists for: before
@@ -3084,6 +3292,142 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 					unnamed_uses_light,
 				)
 				os.remove(path)
+			}
+
+			// Fresh install: settings_default leaves theme_name as the static
+			// literal "Dark" (never cloned) until settings.txt actually
+			// supplies a theme_name line, and no settings.txt exists yet
+			// under this NEWTPAD_SESSION_DIR. This is the reachable crash a
+			// stray delete() on theme_name used to hit -- HeapFree on a
+			// pointer into .rdata -- so this case exercises the literal path
+			// directly rather than the cloned one every other case here
+			// starts from.
+			{
+				app_t: App
+				menu_init(&app_t.menu)
+				defer app_destroy(&app_t)
+				app_t.settings = settings_default()
+				g_saved := g_theme
+				g_theme = theme_dark()
+
+				ok_cmd := theme_edit_current(&app_t)
+				switched := app_t.settings.theme_name == "Dark Custom"
+
+				all_ok := ok_cmd && switched
+				if !all_ok {fail = true}
+				fmt.printfln(
+					"  %-6s edit-current-theme survives a literal (un-cloned) theme_name: exported=%v switched=%v",
+					"ok" if all_ok else "FAIL",
+					ok_cmd,
+					switched,
+				)
+				path, pok := theme_active_file_path(app_t.settings.theme_name)
+				if pok {os.remove(path)}
+				g_theme = g_saved
+			}
+
+			// The command's second-invocation shape: the theme file already
+			// exists on disk (as it would after an earlier export or edit), so
+			// theme_export writes nothing here and the state change under test
+			// is purely the settings switch plus the re-resolve --
+			// `g_theme = theme_resolve(target)` inside theme_edit_current.
+			// This pre-writes a distinctive Dark Custom.theme file BEFORE
+			// calling theme_edit_current and reads g_theme directly afterward,
+			// with NO intervening theme_resolve call in this test: calling
+			// theme_resolve a second time here would make this pass even with
+			// that line deleted from the real procedure (verified by deleting
+			// it and rerunning this mode -- see task-4-report.md).
+			//
+			// app_open_path is headless-safe -- it maps and activates a tab
+			// like any other open, no window required -- so the opened tab is
+			// asserted too, not skipped as needing one.
+			{
+				app_t: App
+				menu_init(&app_t.menu)
+				defer app_destroy(&app_t)
+				app_t.settings.theme_name = strings.clone("Dark")
+				g_saved := g_theme
+				g_theme = theme_dark()
+
+				path, pok := theme_active_file_path("Dark Custom")
+				want := [4]f32{f32(0x01) / 255, f32(0x02) / 255, f32(0x03) / 255, 1}
+				if pok {
+					_ = os.write_entire_file(path, transmute([]u8)string("base dark\ncaret #010203\n"))
+				}
+				g_before := g_theme
+				before_already_matches := g_before[.Caret] == want
+
+				ok_cmd := theme_edit_current(&app_t)
+				switched := app_t.settings.theme_name == "Dark Custom"
+				on_disk := pok && os.exists(path)
+				applied := g_theme[.Caret] == want
+				opened_doc := app_active(&app_t)
+				opened := pok && opened_doc != nil && opened_doc.path == path
+
+				all_ok := ok_cmd && switched && on_disk && applied && opened && !before_already_matches
+				if !all_ok {fail = true}
+				fmt.printfln(
+					"  %-6s edit-current-theme (file preexisting): exported=%v switched=%v on_disk=%v reresolved=%v opened=%v",
+					"ok" if all_ok else "FAIL",
+					ok_cmd,
+					switched,
+					on_disk,
+					applied,
+					opened,
+				)
+				if pok {os.remove(path)}
+				g_theme = g_saved
+			}
+
+			// The comparison is the entire component, and its two inputs arrive
+			// from different places -- doc.path (Save dialog, argv, or an
+			// Explorer drop) versus themes_dir()'s constructed path -- so they
+			// can name the same file in different case and with different
+			// separators. Feeding it the export's own path back would prove
+			// nothing: those two are identical by construction. Each case below
+			// mangles the path deliberately.
+			{
+				app_t: App
+				menu_init(&app_t.menu)
+				defer app_destroy(&app_t) // App is zero-is-initialization
+				app_t.settings.theme_name = strings.clone("Dark Custom")
+				path, pok := theme_active_file_path("Dark Custom")
+				g_saved := g_theme
+				g_theme = theme_dark()
+				_ = os.write_entire_file(path, transmute([]u8)string("base dark\ncaret #010203\n"))
+				want := [4]f32{f32(0x01) / 255, f32(0x02) / 255, f32(0x03) / 255, 1}
+
+				exact := pok && theme_reapply_if_active(&app_t, path) && g_theme[.Caret] == want
+
+				g_theme = theme_dark()
+				upper := theme_reapply_if_active(&app_t, strings.to_upper(path, context.temp_allocator)) && g_theme[.Caret] == want
+
+				g_theme = theme_dark()
+				fwd_path, _ := strings.replace_all(path, "\\", "/", context.temp_allocator)
+				fwd := theme_reapply_if_active(&app_t, fwd_path) && g_theme[.Caret] == want
+
+				g_theme = theme_dark()
+				other := !theme_reapply_if_active(&app_t, fmt.tprintf("%s%cnot-the-theme.txt", tdir, '\\')) && g_theme[.Caret] == theme_dark()[.Caret]
+
+				// A built-in has no file, so nothing can match it -- otherwise
+				// saving any file at all while on Dark would re-resolve.
+				delete(app_t.settings.theme_name)
+				app_t.settings.theme_name = strings.clone("Dark")
+				builtin := !theme_reapply_if_active(&app_t, path)
+
+				all_ok := exact && upper && fwd && other && builtin
+				if !all_ok {fail = true}
+				fmt.printfln(
+					"  %-6s reapply: exact=%v upper=%v fwdslash=%v other-file-ignored=%v builtin-ignored=%v",
+					"ok" if all_ok else "FAIL",
+					exact,
+					upper,
+					fwd,
+					other,
+					builtin,
+				)
+				if pok {os.remove(path)}
+				g_theme = g_saved
 			}
 		}
 
@@ -4333,8 +4677,20 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("  %-6s focus on first opened: %q", "ok" if ok2 else "FAIL", focused.path if focused != nil else "<nil>")
 		if !ok2 {fail = true}
 
-		ok3 := app_notice_active(&a) && strings.contains(a.notice, "2 items skipped")
-		fmt.printfln("  %-6s notice reports 2 skipped (folder + missing file): %q", "ok" if ok3 else "FAIL", a.notice)
+		// The note has to be findable, which is a wording property as much as a
+		// colour one: it rides at the end of a status line that already carries
+		// line/column, encoding, line ending and line count. The loud
+		// conditions on that line use a [BRACKETED CAPS] idiom ([CHANGED ON
+		// DISK ...], [GLYPH CACHE FULL ...]); this asserts the folder note
+		// joins them, and that the two kinds are counted separately rather than
+		// summed into the old "2 items skipped", which made the user guess
+		// which had happened.
+		ok3 :=
+			app_notice_active(&a) &&
+			strings.contains(a.notice, "[FOLDERS NOT OPENED") &&
+			strings.contains(a.notice, "1 folder") &&
+			strings.contains(a.notice, "1 file")
+		fmt.printfln("  %-6s notice names folders and unreadable files separately: %q", "ok" if ok3 else "FAIL", a.notice)
 		if !ok3 {fail = true}
 
 		// Re-dropping a path that is already open must activate the existing tab

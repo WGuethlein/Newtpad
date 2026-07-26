@@ -18,8 +18,9 @@ whole-branch review at the end, sabotage every test, then HANDOFF entry → vers
 `install.ps1`. It also carries the two bug *shapes* this codebase keeps producing and the
 operational traps that have each cost a session real time. Unlike `CLAUDE.md`, it is committed.
 
-**Immediate next step: batch 5 — column/block editing (§6u).** The v0.13.0 release is cut
-(2026-07-26): tag, GitHub Release, exe attached. See §6w "Owed and open" for what that surfaced.
+**Immediate next step: batch 5 — column/block editing (§6u).** v0.13.0 and v0.14.0 are both released
+(2026-07-26). **§6x is the most recent state**; its "Owed and open" is where Wyatt's theme-tuning pass
+lives, and that pass is the point of the batch.
 
 ## 1. What Newtpad is
 
@@ -1814,6 +1815,114 @@ in §6v and have never been rendered against real code.
    confirm it doesn't look like a glitch.
 6. **A `.md` file in source view, then Ctrl+M.** Two features colouring one file — confirm they read
    as deliberate.
+
+## 6x. Theme tuning loop (2026-07-26, v0.14.0, branch `feat/theme-tuning-loop`)
+
+Wyatt's live pass on batch 4 found it in about a minute: **every syntax-highlighted file rendered
+identically magenta in Dark** — JSON, YAML, CSV and Markdown all the same colour. Not a bad palette.
+Dark's nine `Syn_*` roles were still literally `{1, 0, 1, 1}`, the "missing texture" marker §6v
+planted for roles nothing consumed yet. Batch 4 shipped the lexers that consume them and **filled in
+Light only**. It went out in v0.13.0 and was tagged, released and installed that way.
+
+Design in `docs/superpowers/specs/2026-07-26-theme-tuning-loop-design.md`, plan in
+`docs/superpowers/plans/2026-07-26-theme-tuning-loop.md`.
+
+### Why this is a batch and not a one-line fix
+
+Filling in nine values is trivial. What is not trivial is that the nine values were **chosen by
+arithmetic and had never been seen by a human eye** — the same condition that produced the bug. Asked
+how he wanted to tune them, Wyatt chose live-reloading a theme file over per-role inputs in Settings.
+That is also the answer CLAUDE.md principle 3 wants: 34 colour pickers is precisely the chrome that
+signals leakage in core design.
+
+Two facts found while exploring turned that into real work:
+
+- **The built-in themes have no file.** `theme_resolve` answers `Dark` and `Light` from
+  `theme_dark()`/`theme_light()` without ever consulting disk. The theme Wyatt actually runs could
+  not be reloaded, because there was nothing to reload.
+- **No `.theme` file existed anywhere and nothing in the product created one.** The format shipped in
+  batch 3 documented only in a source comment. A feature with no discoverable way to use it.
+
+So the batch had to *supply* the file before it could watch it. **Edit Current Theme** exports the
+active theme to `themes\Dark Custom.theme` (all 34 roles, with section comments), switches to it, and
+opens it as a tab. Edit a colour, Ctrl+S, the window updates. Newtpad became the editor of its own
+theme, which is the right shape for this product.
+
+### What made the parser change worth doing
+
+The nine `Syn_*` roles were also **unsettable from a file** — `theme_role_from_key` was a
+hand-written 25-case switch and they were simply absent. So the file mechanism could not have worked
+around the magenta even if a file had existed.
+
+The fix is not "add nine cases". Export needs role→key and the parser needs key→role, and two
+hand-maintained 34-entry mappings drift silently. Both now come from one `[Color_Role]string` **total
+array**, so a role added without a key is a *compile error* — the same guarantee `Theme` and
+`[Command_Id]Command` already carry. Sabotage-verified as a compile error, not a test failure:
+`Unhandled enumerated array case: Syn_Xml_Attr`.
+
+### Three things this batch got wrong
+
+- **A test that could not fail, and the spec was the reason.** The export round-trip was guarded by a
+  "second export is byte-identical" fixed-point check. Truncation is *idempotent*, so truncation is
+  also a fixed point — the check was structurally incapable of catching the regression it was written
+  for, and the drift bound of `1/255` admitted both. The property that separates them is accuracy:
+  rounding errs by at most half a step. Bound tightened to `0.5/255`, which Dark's own `0.12` green
+  channel (`30.6`) now separates. **The implementer found this by actually running the sabotage and
+  reporting that nothing failed** — exactly what §3 of the development loop is for.
+- **`delete()` on a static string literal, caught only by the whole-branch review.** `theme_edit_current`
+  freed the old `settings.theme_name` before cloning the new one. But `settings_default` sets
+  `theme_name = "Dark"` — a literal in `.rdata` — and `settings_load` only clones when `settings.txt`
+  actually carries that key. **On a fresh install with no settings file, the first use of Edit Current
+  Theme would `HeapFree` a pointer into read-only memory.** All six per-task reviews missed it because
+  every test assigned `strings.clone("Dark")` on the line before the call, so the literal path was
+  never executed. The free is gone (the site now matches the Settings cycle, which also does not free),
+  and a test now drives it from a defaulted `Settings` with no clone.
+- **A second test that did not observe the line it was named for.** The edit-loop case printed
+  `reresolved=` but computed it from the test's *own* `theme_resolve` call, so deleting the real
+  assignment in `theme_edit_current` left it green. Restructured to write the file first and assert
+  `g_theme` moved with no intervening resolve; sabotage now yields `reresolved=false`.
+
+The pattern across all three: **the tests were written by the same process that wrote the code, and
+agreed with it.** Sabotage caught one, a reviewer with the whole branch in view caught the other two.
+
+### Also in this batch
+
+- Dark's nine syntax colours mirror Light's hue families (indigo→periwinkle, teal→cyan, rust→salmon…),
+  ratios computed against `Bg_Base` rather than eyeballed. Two pairs are now **asserted** rather than
+  left to Wyatt's eye: `Syn_Comment` must stay clear of `Text_Muted` (the gutter numbers sit right
+  beside comments) and `Syn_Punct` clear of `Text_Primary`. Both were items 1 on §6w's
+  "only Wyatt can check" list; they are tests now.
+- A stray `Dark.theme` or `Light.theme` no longer lists in Settings. `theme_resolve` short-circuits on
+  those names before touching disk, so such a file was an entry that silently did nothing — the
+  "lists but can never load" defect §6v recorded and carried.
+- The dropped-folder note was invisible for a findable reason: it is appended to the end of the status
+  line and drawn in `Text_Dim` unless `warn` is set, which a notice did not set. Now the line goes
+  amber for its four seconds and the message joins the `[BRACKETED CAPS]` idiom the other loud
+  conditions use, counting folders and unreadable files separately.
+
+### Owed and open
+
+- **Wyatt's tuning pass is the point of the batch.** Run **Edit Current Theme** (View menu or the
+  palette), tune, save. Sample files for it are at `C:\Users\Wyatt\Newtpad-testfiles` — `big.c`,
+  `big.xml`, `big.md` (40/40/20 MB), `minified.json` and `minified.css` (single-line, for the
+  `cur_buf` limit), and `links-in-comments.c`.
+- **Light's `Syn_*` values are still provisional.** Deliberately untouched — the tuning loop is what
+  settles them, and changing them blind would be guessing twice.
+- **Carried, triaged CARRY by the whole-branch review:** `theme_export`'s `base` line defaults to
+  `dark` for any non-`Light` name (unreachable via no-overwrite, and cosmetic since all 34 roles are
+  written); the Settings theme cycle still leaks a `theme_name` clone per press (§6v already recorded
+  it — now consistent with the export site rather than divergent); `themes_dir_ensure` swallows every
+  `make_directory` error, not just "already exists"; and `theme_reapply_if_active` normalises case and
+  separators but not relative or `..` paths.
+- **`app_open_path` dedupes on a raw path compare** while this batch's theme comparison normalises. A
+  theme file opened once by drop and once by the command can land in two tabs. Pre-existing dedupe
+  behaviour, no data loss (the watcher marks the stale one), noted because the two comparisons are now
+  visibly inconsistent.
+- **For the `renderer`/`ui` extraction:** this made the split *easier* — replacing the switch with a
+  data table removed a `program`-only dependency, and the App-coupled procs are grouped at the file
+  tail. One concrete tidy-up: `theme_role_keys` and its two accessors are pure and belong with
+  `Color_Role`, but sit below the `// --- theme files ---` banner. Move them above it and the eventual
+  cut is one horizontal line.
 
 ## 7. Build environment (Windows, this machine)
 
