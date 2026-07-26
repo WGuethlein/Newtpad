@@ -860,6 +860,15 @@ doc_close :: proc(doc: ^Document) {
 	lex_index_stop(doc) // joins before the arrays below are freed
 	delete(doc.lex_idx.line_starts)
 	delete(doc.lex_idx.states)
+	// delete() frees the backing storage but leaves the [dynamic] header
+	// (len/cap/data) pointing at now-freed memory -- harmless here only
+	// because doc_reload immediately overwrites doc^ with a fresh zero value
+	// right after calling this. Zero explicitly so a caller that ever closes
+	// a document without an immediate doc_reload doesn't inherit a
+	// freed-but-live array header (append/len on it would be heap corruption,
+	// not just a stale read).
+	doc.lex_idx.line_starts = nil
+	doc.lex_idx.states = nil
 	// Before pt_destroy: the worker's view aliases the add chunks it frees.
 	search_release(doc)
 	for s in doc.undo {base.pt_free_node_tree(s.root)}
@@ -2214,9 +2223,25 @@ doc_row_lex_spans :: proc(
 	out: []plat.Text_Span,
 ) -> (n: int, state_out: base.Lex_State) {
 	if !wrapped {
-		// The unwrapped row IS the whole (capped) logical line already sitting in
-		// the caller's line buffer — no extra read, no cache needed.
-		return highlight_row_spans(doc, row_bytes, state_in, out)
+		// `row_bytes` is whatever the caller already read for DRAWING —
+		// doc_draw's line_buf is VISIBLE_COLS (2048) wide, but this row's real
+		// extent (`end`) can be up to RENDER_LINE_CAP (8192, 4x more): a long
+		// unwrapped line only shows its first 2048 bytes on screen but is still
+		// one row for lexing purposes. Trusting the caller's buffer here used to
+		// mean a `<!--` past byte 2048 was invisible to the lexer, so state_out
+		// silently reported the wrong thing — and every following row inherits
+		// it, since state threads row to row. So: re-read the row's OWN full
+		// extent directly (bounded to RENDER_LINE_CAP, same cap `end` already
+		// respects), lex THAT for spans/state, and let text_draw_spans's own
+		// tolerance for spans past the drawn string (platform/text.odin: the
+		// rune loop simply never reaches them) discard whatever falls outside
+		// what's actually shown. `full` is a fixed stack array, not a heap
+		// allocation — the per-row path stays allocation-free; this only adds
+		// a second bounded pt_read, not a second per-row alloc.
+		if end <= start {return highlight_row_spans(doc, row_bytes, state_in, out)}
+		full: [RENDER_LINE_CAP]u8
+		got := base.pt_read(&doc.pt, start, full[:min(end - start, len(full))])
+		return highlight_row_spans(doc, full[:got], state_in, out)
 	}
 	lls, _ := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
 	if lls != cache.cur_lls {
@@ -2341,12 +2366,38 @@ doc_draw :: proc(
 					hl_state = doc_lex_state_at(doc, start, LEX_FILTER_RESYNC_WINDOW)
 				} else if !hl_state_ready {
 					// Contiguous viewport: only the very first row needs a
-					// real lookup. It may be a wrapped continuation or a
-					// RENDER_LINE_CAP-split continuation rather than its
-					// logical line's true start, so find that start first
-					// (bounded, same shape doc_row_lex_spans uses below).
-					lls, _ := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
-					hl_state = doc_lex_state_at(doc, lls, LEX_RESYNC_WINDOW)
+					// real lookup, but WRAPPED and non-wrapped first rows need
+					// it resolved at different offsets, matching what
+					// doc_row_lex_spans is about to do with it:
+					//
+					// - Wrapped: the top row may be a wrap CONTINUATION, not
+					//   its logical line's true start. doc_row_lex_spans's
+					//   wrapped branch re-lexes the whole cached logical line
+					//   from THAT true start (WRAP_START_CAP back) every time
+					//   it sees a fresh lls, so state_in must be resolved
+					//   there too, or the whole-line lex begins from the wrong
+					//   state.
+					// - Non-wrapped: doc_row_lex_spans's !wrapped branch now
+					//   lexes the row's OWN [start,end) extent directly (see
+					//   its comment) rather than anything further back. This
+					//   used to be the bug here: for a RENDER_LINE_CAP-split
+					//   continuation row (chunk 2+ of a long unwrapped line),
+					//   resolving state at pt_line_start_cap's WRAP_START_CAP-
+					//   bounded guess — which for a line longer than that cap
+					//   lands neither at the true line start nor at `start`,
+					//   but partway between — meant the bytes between that
+					//   guess and `start` were never lexed at all. Resolving
+					//   directly AT `start` is correct even when `start` sits
+					//   mid-logical-line: lex_resync_state's forward walk is
+					//   chunk-relative to wherever it finds the anchor, not
+					//   dependent on `target` being a real line start (see its
+					//   comment).
+					if wrapped {
+						lls, _ := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
+						hl_state = doc_lex_state_at(doc, lls, LEX_RESYNC_WINDOW)
+					} else {
+						hl_state = doc_lex_state_at(doc, start, LEX_RESYNC_WINDOW)
+					}
 					hl_state_ready = true
 				}
 				hl_n, hl_state = doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], hl_state, hl_buf[:])
