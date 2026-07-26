@@ -2716,6 +2716,225 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !cUndoOne {fail = true}
 		fmt.printfln("  %-6s a single Ctrl+Z restores all three rows at once: %q (want %q)", "ok" if cUndoOne else "FAIL", restored, "aaaa\\nbbbb\\ncccc\\n")
 
+		// Q through V (below) are each their own local proc rather than an
+		// inline block: this whole `blocktest` branch is one very long
+		// function, and several App/Document-sized locals piled up as
+		// sibling blocks in the SAME stack frame were enough to overflow the
+		// default thread stack (STATUS_STACK_OVERFLOW) even though none of
+		// them, and no two of them, do so alone. A separate proc gets its
+		// own frame that is released on return, the same reason
+		// nth_line_start and seed_block above are already pulled out rather
+		// than inlined.
+
+		// Q: MEDIUM 1 regression. Two 4-cell rows, rectangle at cells [50,60)
+		// -- past the end of both. block_text still returns non-empty text
+		// for this (an eol-joined run of empty lines, "\n" for two rows), so
+		// `.Cut`'s `s != ""` clipboard guard passes and block_cut_delete gets
+		// called -- but nothing on either row actually falls in the
+		// rectangle. Before this fix, doc_batch_begin's push_undo ran anyway:
+		// it marks the file modified and (since doc.batch was still false at
+		// that moment) unconditionally clears the redo stack, so an
+		// accidental Cut on an all-short rectangle dirtied a clean file and
+		// destroyed the user's redo history with nothing to show for it.
+		//
+		// A real edit followed by doc_undo seeds qdoc.redo with one genuine
+		// entry (doc_undo pushes the state being LEFT onto redo -- the same
+		// path a user's own Ctrl+Z takes) and restores the original two-row
+		// content, then qdoc.modified is forced back to false to simulate
+		// the clean, just-opened file the bug report describes.
+		//
+		// Sabotage (per task): skip the `any_bytes` guard below and this
+		// case must FAIL -- modified flips to true, the redo entry is freed
+		// and the slice goes to length 0.
+		block_test_q :: proc(t: ^plat.Text) -> bool {
+			qdoc := doc_from_content(transmute([]u8)strings.clone("aaaa\nbbbb\n"), "", .UTF8)
+			defer doc_close(&qdoc)
+			qdoc.wrap = false
+			qdoc.cursor, qdoc.anchor = 0, 0
+			doc_insert_rune(&qdoc, 'z') // creates one undo entry
+			doc_undo(&qdoc)             // restores the original text, pushes redo[0]
+			qdoc.modified = false       // simulate a clean, just-opened file
+			q_undo_before := len(qdoc.undo)
+			q_redo_before := len(qdoc.redo)
+			qdoc.block = true
+			qdoc.block_anchor_line_start, qdoc.block_anchor_cell = 0, 50
+			qdoc.block_cursor_line_start, qdoc.block_cursor_cell = 5, 60 // "bbbb\n"'s own line start
+			qtxt, qtok := block_text(&qdoc, t)
+			qcut := block_cut_delete(&qdoc, t)
+			cQ :=
+				qtok &&
+				qtxt == "\n" &&
+				qcut &&
+				!qdoc.modified &&
+				len(qdoc.undo) == q_undo_before &&
+				len(qdoc.redo) == q_redo_before &&
+				!block_active(&qdoc) &&
+				doc_debug_string(&qdoc) == "aaaa\nbbbb\n"
+			fmt.printfln(
+				"  %-6s MEDIUM 1: Cut on an all-short rectangle leaves a clean file clean and the redo stack intact: text=%q modified=%v undo=%d (want %d) redo=%d (want %d) block_active=%v content=%q",
+				"ok" if cQ else "FAIL",
+				qtxt,
+				qdoc.modified,
+				len(qdoc.undo),
+				q_undo_before,
+				len(qdoc.redo),
+				q_redo_before,
+				block_active(&qdoc),
+				doc_debug_string(&qdoc),
+			)
+			return cQ
+		}
+		if !block_test_q(&t) {fail = true}
+
+		// R: MEDIUM 2 -- the cut's cost bound at the cap. Fixture mirrors the
+		// reviewer's own: 18-byte log lines ("2026-07-26 INFO x\n"), a rectangle
+		// spanning exactly BLOCK_EDIT_MAX_LINES rows starting deep in a file
+		// with ~100,000 such lines (~1.8 MB, the reviewer's file size), over
+		// cells [11,15) -- "INFO" -- so every row genuinely has bytes to
+		// delete (this measures the real delete cost, not the all-short skip
+		// path Q covers). The threshold is chosen to be well clear of a
+		// release build's real cost at this cap but to fall well BELOW what
+		// the double-resolve, 10,000-row original cost at this same row
+		// count -- see BLOCK_EDIT_MAX_LINES's own comment for both measured
+		// numbers. Sabotage (per task): revert the delete loop to call
+		// block_row_range a second time per row (restoring the old
+		// double-resolve) and/or restore BLOCK_EDIT_MAX_LINES to 10_000, and
+		// this must FAIL.
+		block_test_r :: proc(t: ^plat.Text) -> bool {
+			rline := "2026-07-26 INFO x\n" // 18 bytes; "INFO" is cells [11,15)
+			rrows := 100_000 // ~1.8 MB, the reviewer's file size
+			rb := strings.builder_make(context.temp_allocator)
+			for _ in 0 ..< rrows {strings.write_string(&rb, rline)}
+			rdoc := doc_from_content(transmute([]u8)strings.clone(strings.to_string(rb)), "", .UTF8)
+			defer doc_close(&rdoc)
+			rdoc.wrap = false
+			r_start_row := 45_000 // deep in the file, well clear of both ends
+			r_off := r_start_row * len(rline)
+			rdoc.block = true
+			rdoc.block_anchor_line_start, rdoc.block_anchor_cell = r_off, 11
+			rdoc.block_cursor_line_start, rdoc.block_cursor_cell = r_off + (BLOCK_EDIT_MAX_LINES - 1) * len(rline), 15
+			rstart := time.now()
+			rcut := block_cut_delete(&rdoc, t)
+			rms := time.duration_milliseconds(time.since(rstart))
+			cR := rcut && !block_active(&rdoc) && rms < 60
+			fmt.printfln(
+				"  %-6s MEDIUM 2: cutting a %d-row rectangle at the cap costs a bounded amount: ok=%v elapsed=%.2fms (want <60ms)",
+				"ok" if cR else "FAIL",
+				BLOCK_EDIT_MAX_LINES,
+				rcut,
+				rms,
+			)
+			return cR
+		}
+		if !block_test_r(&t) {fail = true}
+
+		// S: LOW 3 -- the caret must land at the rectangle's own top-left
+		// corner even when the TOP row is too short to have anything deleted
+		// on it. Rows "x" / "aaaaaaaa" / "bbbbbbbb", rectangle over cells
+		// [3,6): row 0 ("x") never reaches cell 3, so its own delete is
+		// skipped, and the old code left the caret at row 1's byte_lo
+		// (offset 5) -- the last row the bottom-up loop actually touched --
+		// instead of row 0's own resolved position (offset 1, "x"'s own end,
+		// since row 0 can't reach cell 3 at all). Sabotage: remove the
+		// explicit `doc.anchor = doc.cursor = los[0]` after the delete loop
+		// and this must FAIL (cursor/anchor would read 5, not 1).
+		block_test_s :: proc(t: ^plat.Text) -> bool {
+			topdoc := doc_from_content(transmute([]u8)strings.clone("x\naaaaaaaa\nbbbbbbbb\n"), "", .UTF8)
+			defer doc_close(&topdoc)
+			topdoc.wrap = false
+			topdoc.block = true
+			topdoc.block_anchor_line_start, topdoc.block_anchor_cell = 0, 3
+			topdoc.block_cursor_line_start, topdoc.block_cursor_cell = 11, 6 // "bbbbbbbb"'s own line start
+			topcut := block_cut_delete(&topdoc, t)
+			cTop := topcut && topdoc.cursor == 1 && topdoc.anchor == 1 && !block_active(&topdoc)
+			fmt.printfln(
+				"  %-6s LOW 3: caret lands at the rectangle's top-left even when the top row is too short to edit: ok=%v cursor=%d anchor=%d (want 1,1)",
+				"ok" if cTop else "FAIL",
+				topcut,
+				topdoc.cursor,
+				topdoc.anchor,
+			)
+			return cTop
+		}
+		if !block_test_s(&t) {fail = true}
+
+		// T: LOW 3 -- block clearing must be consistent across every Cut
+		// path, including a single-row all-short rectangle where block_text
+		// returns "". Before this fix, commands.odin's `.Cut` handler only
+		// called block_cut_delete inside its `s != ""` branch, so this exact
+		// case never called block_cut_delete at all and left the rectangle
+		// live -- the one Cut path that didn't collapse to a caret. Dispatched
+		// through the real command table (resolve_key -> command_dispatch),
+		// not block_cut_delete directly, so this exercises the actual
+		// gating this finding was about.
+		block_test_t :: proc(t: ^plat.Text) -> bool {
+			ta: App
+			tdummy: plat.Window
+			app_new_scratch(&ta)
+			tad := app_active(&ta)
+			doc_close(tad)
+			tad^ = doc_from_content(transmute([]u8)strings.clone("x\n"), "", .UTF8)
+			tad.wrap = false
+			tad.block = true
+			tad.block_anchor_line_start, tad.block_anchor_cell = 0, 10 // "x" never reaches cell 10
+			tad.block_cursor_line_start, tad.block_cursor_cell = 0, 12
+			command_dispatch(resolve_key(.X, true, false, .Editor), {.X, true, false, false}, &ta, &tdummy, t, 10) // Ctrl+X
+			cT := !block_active(tad)
+			fmt.printfln("  %-6s LOW 3: Cut on a single all-short row still clears the block: block_active=%v", "ok" if cT else "FAIL", block_active(tad))
+			app_destroy(&ta)
+			return cT
+		}
+		if !block_test_t(&t) {fail = true}
+
+		// U: LOW 4 -- the refusal note derives its row count from
+		// BLOCK_EDIT_MAX_LINES rather than a hardcoded "10000" that would
+		// drift the instant the constant changes (which this very task just
+		// did). Dispatched through the real command table so this exercises
+		// the actual note commands.odin builds, not a copy of its format
+		// string.
+		block_test_u :: proc(t: ^plat.Text) -> bool {
+			ua: App
+			udummy: plat.Window
+			app_new_scratch(&ua)
+			uad := app_active(&ua)
+			u_rows := BLOCK_EDIT_MAX_LINES + 5
+			ubuf := make([]u8, u_rows * 2)
+			for i in 0 ..< u_rows {ubuf[i * 2] = 'a'; ubuf[i * 2 + 1] = '\n'}
+			doc_close(uad)
+			uad^ = doc_from_content(ubuf, "", .UTF8)
+			uad.wrap = false
+			uad.block = true
+			uad.block_anchor_line_start, uad.block_anchor_cell = 0, 0
+			uad.block_cursor_line_start, uad.block_cursor_cell = (u_rows - 1) * 2, 1
+			command_dispatch(resolve_key(.X, true, false, .Editor), {.X, true, false, false}, &ua, &udummy, t, 10) // Ctrl+X
+			wantU := fmt.tprintf("%d rows", BLOCK_EDIT_MAX_LINES)
+			cU := strings.contains(ua.notice, wantU)
+			fmt.printfln("  %-6s LOW 4: the refusal note derives its row count from BLOCK_EDIT_MAX_LINES: notice=%q (want it to contain %q)", "ok" if cU else "FAIL", ua.notice, wantU)
+			app_destroy(&ua)
+			return cU
+		}
+		if !block_test_u(&t) {fail = true}
+
+		// V: LOW 4 -- the undo entry's label counts rows ACTUALLY EDITED, not
+		// rows spanned. Three rows, cells [1,3): "aaaa" and "cccc" each have
+		// two bytes there, but "b" (row 1) is only 1 cell wide and never
+		// reaches cell 1, so it contributes nothing. The rectangle spans 3
+		// rows but only 2 are actually edited -- doc.state_count (set by
+		// doc_batch_end, and what the history list reads) must read 2, not 3.
+		block_test_v :: proc(t: ^plat.Text) -> bool {
+			raggeddoc := doc_from_content(transmute([]u8)strings.clone("aaaa\nb\ncccc\n"), "", .UTF8)
+			defer doc_close(&raggeddoc)
+			raggeddoc.wrap = false
+			raggeddoc.block = true
+			raggeddoc.block_anchor_line_start, raggeddoc.block_anchor_cell = 0, 1
+			raggeddoc.block_cursor_line_start, raggeddoc.block_cursor_cell = 7, 3 // "cccc"'s own line start
+			raggedcut := block_cut_delete(&raggeddoc, t)
+			cRagged := raggedcut && raggeddoc.state_count == 2
+			fmt.printfln("  %-6s LOW 4: undo label counts rows actually edited, not rows spanned: ok=%v state_count=%d (want 2)", "ok" if cRagged else "FAIL", raggedcut, raggeddoc.state_count)
+			return cRagged
+		}
+		if !block_test_v(&t) {fail = true}
+
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
 		return true
 	}

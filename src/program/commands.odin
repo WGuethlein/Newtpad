@@ -646,7 +646,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				// clipboard while reporting success -- either a row could
 				// not be resolved, or the rectangle spans more than
 				// BLOCK_EDIT_MAX_LINES rows (block_text, block.odin).
-				app_note(app, "[COLUMN COPY REFUSED - a row could not be read, or the rectangle spans more than 10000 rows]")
+				app_note(app, fmt.tprintf("[COLUMN COPY REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
 			}
 		} else if s := doc_selected_text(doc, context.temp_allocator); s != "" {
 			plat.clipboard_set_text(w.hwnd, s)
@@ -654,12 +654,23 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Cut:
 		if block_active(doc) {
 			if s, ok := block_text(doc, t); ok {
-				if s != "" {
-					plat.clipboard_set_text(w.hwnd, s)
-					block_cut_delete(doc, t) // one undo step, bottom-up (block.odin)
+				// block_cut_delete runs even when s == "" (a single
+				// all-short row has nothing to copy) -- it always clears
+				// the block on a non-refusal, empty rectangle or not, so a
+				// Cut collapses the rectangle to a caret the same way every
+				// other path does. Gating the delete on s != "" left an
+				// all-short single-row rectangle live after Cut (block.odin,
+				// block_cut_delete's own comment).
+				if s != "" {plat.clipboard_set_text(w.hwnd, s)}
+				if !block_cut_delete(doc, t) {
+					// Refuses only if something changed between block_text's
+					// own check above and this call -- report it rather than
+					// silently leaving the clipboard write (if any) as the
+					// only visible effect of a Cut that deleted nothing.
+					app_note(app, fmt.tprintf("[COLUMN CUT REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
 				}
 			} else {
-				app_note(app, "[COLUMN CUT REFUSED - a row could not be read, or the rectangle spans more than 10000 rows]")
+				app_note(app, fmt.tprintf("[COLUMN CUT REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
 			}
 		} else if s := doc_selected_text(doc, context.temp_allocator); s != "" {
 			plat.clipboard_set_text(w.hwnd, s)

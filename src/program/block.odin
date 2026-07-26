@@ -599,8 +599,34 @@ block_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, ro
 // ONE vertical step; this bounds how many of them a single Copy/Cut may add
 // up, the same way BLOCK_ROW_CAP and BLOCK_LINE_STEP_CAP bound the other two
 // axes. Task 6 uses the same constant for its own edit for the identical
-// reason: whatever one rectangle-wide operation can afford, they all can.
-BLOCK_EDIT_MAX_LINES :: 10_000
+// reason: whatever one rectangle-wide operation can afford, they all can --
+// and an edit's per-row work (resolve, plus a splice that shifts every byte
+// offset after it) is strictly more expensive than a delete's, so this cap
+// is chosen against the delete measurement with headroom for that, not
+// against the cheapest of the three operations that share it.
+//
+// Measured on this branch, line 45,000 of a ~1.8 MB file (100,000 rows of
+// an 18-byte log line -- the shape of the reviewer's own fixture):
+//
+//   OLD cap (10,000 rows) + the double block_row_range resolve this task
+//   removed:  release (-o:speed) 84.8ms, debug 150.4ms -- most of a frame's
+//   worth of freeze on a single keypress. (The reviewer's own numbers, a
+//   different file and line: 131ms release / 308ms debug -- same order.)
+//
+//   THIS cap (2,000 rows), single-pass resolve (block_row_range once per
+//   row, not twice): release 9.0ms, debug 10.0ms -- see blocktest's own
+//   MEDIUM 2 case (test_modes.odin), which asserts <60ms against this exact
+//   fixture so a future regression in either the cap or the single-pass
+//   change trips it.
+//
+// 2,000 was picked directly off the reviewer's measured curve (~13 us/row):
+// the largest round number still comfortably under one frame at 60 Hz, with
+// headroom left over for Task 6's edit, whose per-row work (resolve, plus a
+// splice that shifts every byte offset after it) is strictly more expensive
+// than a delete's -- it shares this cap rather than needing a smaller one of
+// its own, but its own worst case should be re-measured against it when it
+// lands, not assumed from the delete's numbers above.
+BLOCK_EDIT_MAX_LINES :: 2_000
 
 // The rectangle's rows as text, one line per spanned row, joined with the
 // document's OWN line ending -- never a hard-coded '\n'. doc_insert_newline
@@ -663,32 +689,62 @@ block_text :: proc(doc: ^Document, t: ^plat.Text, allocator := context.temp_allo
 
 // Delete the rectangle's own cell range on every row it spans, as ONE undo
 // step, then collapse the block to a caret at the vanished rectangle's own
-// top-left corner. This is `.Cut`'s other half (commands.odin) -- block_text
-// supplies the clipboard text, this supplies the delete -- kept as two
-// procs, called in that order, so a copy block_text itself refused (ok=false)
-// never reaches this proc at all: the caller checks block_text's own result
-// first and skips the delete entirely on refusal, exactly like every other
-// refusal in this file changes no state.
+// top-left corner -- off_lo's own resolved left edge, whether or not that
+// row itself had anything to delete. This is `.Cut`'s other half
+// (commands.odin) -- block_text supplies the clipboard text, this supplies
+// the delete -- kept as two procs, called in that order, so a copy
+// block_text itself refused (ok=false) never reaches this proc at all: the
+// caller checks block_text's own result first and skips the delete entirely
+// on refusal, exactly like every other refusal in this file changes no
+// state. The block is cleared on every path out of this proc that doesn't
+// refuse -- including the one where nothing was deleted -- so a Cut always
+// collapses the rectangle to a caret, the same as it does on a normal
+// linear selection; nothing here may fall through to a live, stale block.
 //
 // Row starts are collected FIRST via block_step_lines alone (cheap: no cell
-// walk) and every one of them is validated through block_row_range BEFORE a
-// single byte is deleted -- the same two refusals block_text checks, run
-// again here because this proc never sees what block_text built and cannot
-// assume nothing changed between the two calls without checking. Refusing
-// outright, with nothing deleted, is the only safe answer to a row that
-// cannot be resolved: a half-deleted rectangle would be worse than a refused
-// copy, because there would be no surviving text to paste back over the gap.
+// walk), and every one of them is resolved through block_row_range exactly
+// ONCE, before any byte is deleted, into `ranges` -- both the refusal check
+// block_text also makes (a row that cannot be resolved refuses the whole
+// operation, nothing deleted -- a half-deleted rectangle would be worse
+// than a refused copy, because there would be no surviving text to paste
+// back over the gap) and the byte range the delete loop below then reuses
+// verbatim. The old code resolved every row TWICE -- once to validate, once
+// to delete -- for identical results both times, since nothing touches the
+// buffer between the two passes; that redundant second pass was ~25% of a
+// Cut's cost at the cap (see BLOCK_EDIT_MAX_LINES's own comment).
+//
+// Before opening the undo batch, `any_bytes` asks whether any row actually
+// has something to remove. A rectangle that lies entirely past the end of
+// every row it spans resolves byte_hi == byte_lo on all of them -- block_text
+// still returns non-empty text for two or more such rows (an eol-joined run
+// of empty lines), so `.Cut`'s `s != ""` clipboard guard passes and this proc
+// still gets called. If it is called, an empty rectangle is still a legitimate
+// thing to have copied (block_text's own contract: a too-short row
+// contributes an empty line, not a skipped one, so the copy is arguably worth
+// keeping on the clipboard) -- so the clipboard write in commands.odin is left
+// alone. But doc_batch_begin unconditionally calls push_undo, which marks the
+// document modified and clears the redo stack even when the batch that
+// follows deletes nothing. Skipping the batch entirely when there is nothing
+// to delete is the only way an accidental Cut on an all-short rectangle stays
+// a no-op: the file is not dirtied, no phantom undo entry appears, and the
+// redo stack survives.
 //
 // Deletion itself is applied HIGHEST OFFSET FIRST, the identical rule
 // find_replace_all (find.odin) applies to Replace All: deleting a row shifts
 // every byte offset AFTER it and never one before it, so processing top-down
 // would invalidate every row still to come. Bottom-up, each row's own
 // line_start is still a fact about the buffer when its turn arrives, because
-// nothing touched so far has deleted anything before it. The LAST row
-// deleted is the rectangle's own top row (off_lo), so doc_replace_sel's own
-// cursor placement (del_sel_raw sets cursor = the deleted range's start)
-// leaves the caret exactly where a Cut should: the top-left corner of what
-// just disappeared.
+// nothing touched so far has deleted anything before it. `ranges[0]` is
+// off_lo's own row -- the rectangle's topmost -- and nothing below it can
+// ever shift its offset, so it is read directly rather than relying on
+// del_sel_raw's own cursor placement to land there: when off_lo's row is
+// itself too short to have anything deleted, the bottom-up loop simply never
+// touches doc.cursor/anchor for it, and the caret would otherwise be left
+// wherever the last row WITH a deletion put it -- not the rectangle's
+// top-left at all. Setting it explicitly after the loop is correct whether
+// or not off_lo's own row had a deletion: when it did, del_sel_raw already
+// put the caret at the same byte_lo, so this is a no-op; when it didn't, this
+// is the only thing that puts the caret there.
 block_cut_delete :: proc(doc: ^Document, t: ^plat.Text) -> bool {
 	if !block_active(doc) {return false}
 	off_lo, off_hi, cell_lo, cell_hi := block_bounds(doc)
@@ -704,27 +760,42 @@ block_cut_delete :: proc(doc: ^Document, t: ^plat.Text) -> bool {
 		line_start = next
 	}
 
-	for ls in starts {
-		_, _, _, ok := block_row_range(doc, t, ls, cell_lo, cell_hi)
+	los := make([]int, len(starts), context.temp_allocator)
+	his := make([]int, len(starts), context.temp_allocator)
+	any_bytes := false
+	for ls, i in starts {
+		lo, hi, _, ok := block_row_range(doc, t, ls, cell_lo, cell_hi)
 		if !ok {return false}
+		los[i], his[i] = lo, hi
+		if hi > lo {any_bytes = true}
+	}
+
+	if !any_bytes {
+		// Nothing on any row falls in the rectangle -- refuse the batch
+		// itself rather than open one that would delete zero bytes. See
+		// this proc's own comment: doc_batch_begin's push_undo would dirty
+		// a clean file and destroy the redo stack for a no-op Cut otherwise.
+		block_clear(doc)
+		return true
 	}
 
 	doc_batch_begin(doc, .Delete)
+	edited := 0
 	for i := len(starts) - 1; i >= 0; i -= 1 {
-		byte_lo, byte_hi, _, ok := block_row_range(doc, t, starts[i], cell_lo, cell_hi)
-		if !ok {
-			// Unreachable -- every row was validated above and nothing at a
-			// LOWER offset than starts[i] has been touched yet -- but never
-			// delete from a range this call cannot vouch for, even here.
-			continue
-		}
-		if byte_hi > byte_lo {
-			doc.anchor = byte_lo
-			doc.cursor = byte_hi
+		if his[i] > los[i] {
+			doc.anchor = los[i]
+			doc.cursor = his[i]
 			doc_replace_sel(doc, nil)
+			edited += 1
 		}
 	}
-	doc_batch_end(doc, len(starts))
+	// off_lo's own row (index 0) never shifts from deletions below it --
+	// see this proc's own comment for why this must be set unconditionally,
+	// not left to del_sel_raw's cursor placement from whichever row the
+	// bottom-up loop happened to touch last.
+	doc.anchor = los[0]
+	doc.cursor = los[0]
+	doc_batch_end(doc, edited) // rows actually edited, not rows spanned
 	block_clear(doc)
 	return true
 }
