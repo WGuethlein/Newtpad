@@ -131,14 +131,18 @@ were the priorities. Read P2 as the live list, with these amendments:
   started. Ruled out: the `@(test)` corpus (removing all twelve `src/base/*_test.odin` changed
   nothing). The remainder is LLVM at `-o:speed`. Belongs in the ship-readiness batch, not to a
   feature batch.
-- **A multi-row edit fragments the piece tree, so every later keystroke costs more.** A column edit
-  issues one independent splice per row, and the treap fragments as it goes: with a 2,000-row
-  rectangle, press 1 cost 7.9 ms and press 20 cost **69.5 ms**, still climbing (release build). The
-  workaround shipped in §6y is `BLOCK_EDIT_MAX_LINES :: 300`, where press 20 is 8.2 ms — but that is
-  a real functional limit on a feature whose headline use is "prefix every line", and 1,000-line
-  files are ordinary. **The fix is a batched multi-range splice** so N rows cost one restructuring
-  rather than N; that would let the cap go back to thousands. Until then the constant is a workaround
-  wearing a cap's clothes.
+- **Every keystroke deep-clones the piece tree, so a multi-row edit gets more expensive with each
+  press.** `pt_snapshot` is `clone(pt.root)` — a full copy proportional to piece count — and
+  `doc_batch_begin` takes one per keystroke. A 2,000-row column edit adds ~2,000 pieces per press, so
+  press 1 cost 7.9 ms and press 20 cost **69.5 ms**, still climbing (release build). §6y first
+  attributed this to splice fragmentation and proposed a batched multi-range splice; **that diagnosis
+  was wrong and the fix would not have helped** — the cost is the snapshot, not the splices. The
+  workaround shipped is `BLOCK_EDIT_MAX_LINES :: 300`, a real functional limit on a feature whose
+  headline use is "prefix every line". **Agreed fix: coalesce consecutive block edits into one undo
+  entry**, as consecutive typed characters already do, so a held key costs one snapshot rather than
+  one per press; then re-measure and raise the cap. A persistent treap with structural sharing would
+  make snapshots O(1) and fix undo cost for every large edit — including Replace All, which has the
+  same characteristic — but it rewrites the locked buffer.
 - **`Highlight_Row_Cache.cur_buf` is a row-sized token budget filled from a whole line.** On
   `doc_row_lex_spans`'s whole-line path the 512-span array covers a logical line of up to
   `RENDER_LINE_CAP` (8192) bytes, so a dense enough wrapped line — measured: a 4.5 KB minified-JS
@@ -2058,6 +2062,44 @@ workaround.
 - **For the `renderer`/`ui` extraction:** `block.odin` never imports `App` and returns `[]plat.Quad`
   exactly as `doc_selection_rects` does, so it moves cleanly into `ui`. The drag latches were folded
   into one `Block_Drag` struct rather than left as a fourth group of loose locals in the frame loop.
+
+### The live pass, and what it found (v0.15.1)
+
+Wyatt used column editing at a real keyboard the day it shipped. Four findings, all real, none
+visible to any headless test:
+
+- **The test suite was destroying his clipboard.** `blocktest` wrote `"PP"` to the *real* Windows
+  clipboard to prove Paste no longer wipes a rectangle; he hit Ctrl+V mid-pass and got the fixture.
+  The first fix added save/restore to one case and left three others — **the unit restored while the
+  mode still lost data**, which is exactly the seam-versus-unit failure §6j is about, committed by a
+  round whose whole purpose was fixing that class of bug. Now the save/restore wraps the entire mode
+  via `defer`, and a seam assertion sets a sentinel before any case and checks it after all of them.
+  A reviewer proved the miss by setting a sentinel by hand and watching it die.
+- **The wrap refusal named the wrong key.** `doc_wraps` is `doc.wrap || md_mode == .Split`, but the
+  note always said "press Alt+Z" — which does nothing in Markdown Split, where Ctrl+M is the way out.
+  Split now has its own refusal reason and its own note.
+- **A refused Alt+drag left a linear selection behind.** The cursor moved before the refusal was
+  checked, so a refused column gesture silently became an ordinary selection — Wyatt saw a full-row
+  highlight that survived toggling wrap, because it had never been a rectangle. A previous round had
+  called this "defensible, kept deliberately"; the live pass disagreed. A refused gesture now leaves
+  the selection exactly as it found it.
+- **Tab now acts across the rectangle** (Wyatt's decision), routed through `block_replace` so it
+  inherits bottom-up ordering, the single undo entry, the row cap and virtual-space padding. Enter
+  still clears, deliberately — splitting N lines from one keystroke is rarely what anyone wants.
+
+Also: `blocktest` hit `STATUS_STACK_OVERFLOW` twice. The cause is total per-procedure frame size
+(Odin gives each nested proc its own frame, and two `App` structs in one callee doubles a frame
+already sitting on `test_mode_dispatch`'s), **not** the number of sibling blocks as first recorded.
+`build.bat` now passes `/STACK:8388608` so the next person adding a case does not hit a crash with
+an invisible cause.
+
+**The undo-cost diagnosis in §6y and in the whole-branch review was wrong.** The per-keystroke climb
+is not splice fragmentation — `pt_snapshot` is `clone(pt.root)`, a full deep copy of the tree, and
+`doc_batch_begin` takes one on every keystroke. A 2,000-row edit adds ~2,000 pieces per press, so by
+press 20 each press clones ~40,000 nodes. Batching the splices would not have helped. The agreed fix
+is to coalesce consecutive block edits into one undo entry, exactly as consecutive typed characters
+already coalesce, so holding a key costs one snapshot rather than one per press — then re-measure and
+raise the cap to whatever that supports. Recorded in §5.
 
 ## 7. Build environment (Windows, this machine)
 
