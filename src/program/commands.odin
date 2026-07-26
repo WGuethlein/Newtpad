@@ -642,6 +642,17 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		case .Backspace, .Delete_Fwd, .Cut, .Undo, .Redo:
 		case:
 			block_clear(doc)
+			// Belt and braces for the invariant block_collapse_linear
+			// (block.odin) establishes at the other end: nothing may leave a
+			// linear selection live underneath a rectangle, because the
+			// rectangle is what was DRAWN and this branch is exactly where
+			// the command that follows (.Insert_Newline, .Insert_Tab, .Paste,
+			// .Delete_Word_Back, .Move_Line_*) would run against
+			// doc.anchor..doc.cursor and delete it. With the gestures now
+			// collapsing on success this is unreachable, which is the point:
+			// if a future selection path forgets, the damage stops here
+			// rather than reaching doc_insert_text.
+			block_collapse_linear(doc)
 		}
 	}
 	switch cmd {
@@ -859,6 +870,19 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// row lands where the caret was, and pick the delimiter on first turn-on.
 		if doc.kind == .Text && doc_can_table(doc) {
 			if doc.table_editing {table_edit_commit(doc)} // don't leave an edit dangling
+			// A rectangle cannot survive the toggle in either direction, the
+			// same reason .Toggle_Wrap clears one. Table view is a grid of
+			// cells with their own widths -- a (line start, cell) pair means
+			// nothing there -- and, worse, the mutating-command guard above
+			// RETURNS EARLY for every mutating command while doc.table is
+			// set, so it never reaches the block-clear branch that would
+			// otherwise drop a rectangle the buffer has moved out from under.
+			// The whole-branch review's reproduction: Alt+drag on a CSV,
+			// Ctrl+T, edit a cell (table_edit_commit splices through
+			// doc_replace_range), Ctrl+T back, Ctrl+X -- and the cut took
+			// bytes the user never saw highlighted. Identical shape to the
+			// find_replace_all hole fixed earlier on this branch.
+			if block_active(doc) {block_clear(doc)}
 			doc.table = !doc.table
 			if doc.table {
 				doc.table_delim = table_choose_delim(doc)
@@ -893,6 +917,17 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			case .Split:
 				doc.md_mode = .Off
 			}
+			// Split makes doc_wraps true, so it changes what a rectangle's
+			// (line start, cell) pair means exactly the way Alt+Z does -- and
+			// .Toggle_Wrap has always cleared the block for that reason while
+			// this case did not. Cleared for every mode transition, not just
+			// the one into Split: leaving Split re-narrows the meaning the
+			// other way, and a rectangle that was live across the whole cycle
+			// has been drawn against visual rows the entire time. block.odin's
+			// four operations refuse under doc_wraps too (block_stale_view),
+			// but this is the one place that removes the stale rectangle the
+			// user would otherwise still see highlighted.
+			if block_active(doc) {block_clear(doc)}
 			// Learn the family default so the next file of this type opens the same
 			// way. Gated on remember_views: with it off the Settings value is a pin,
 			// not a running average of what you last did. Also gated on doc.path != "":

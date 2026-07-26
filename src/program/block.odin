@@ -77,24 +77,80 @@ block_clear :: proc(doc: ^Document) {
 
 // Fresh-press state transition for a rectangle left over from an earlier
 // gesture: main.odin's mouse-press handler calls this before it does
-// anything else with the click. `alt` is whether Alt is held at THIS press
-// -- and is deliberately NOT consulted below. Before this fix, the clear
-// only ran on the branch that also established Alt was NOT held, so an
-// Alt+click that never turned into a drag (never exceeded the slop in
-// main.odin's drag-vs-click check) left the previous rectangle live: the
-// click looked like it had been silently ignored. Every fresh press starts a
-// new gesture regardless of Alt, and a press that DOES become a real
-// Alt+drag rebuilds the rectangle from scratch via block_set_from_points
-// (both corners, not an extension of whatever was here), so clearing
-// unconditionally here costs nothing.
+// anything else with the click. Whether Alt is held at THIS press is
+// deliberately NOT consulted -- this proc took an `alt` parameter until the
+// whole-branch review pointed out no line of it ever read the value, which
+// is exactly the shape of the bug it was written to fix and so worth saying
+// once rather than carrying a parameter that reads as though it gates
+// something. Before that fix the clear only ran on the branch that also
+// established Alt was NOT held, so an Alt+click that never turned into a
+// drag (never exceeded the slop in main.odin's drag-vs-click check) left the
+// previous rectangle live: the click looked like it had been silently
+// ignored. Every fresh press starts a new gesture regardless of Alt, and a
+// press that DOES become a real Alt+drag rebuilds the rectangle from scratch
+// via block_set_from_points (both corners, not an extension of whatever was
+// here), so clearing unconditionally here costs nothing.
 //
 // Split out from main.odin's inline press handler -- which cannot be driven
 // headlessly, there is no seam to simulate a real WM_LBUTTONDOWN -- so this
 // one decision has a seam blocktest can exercise on its own.
-block_press_clear :: proc(doc: ^Document, alt: bool) {
+block_press_clear :: proc(doc: ^Document) {
 	if block_active(doc) {
 		block_clear(doc)
 	}
+}
+
+// Is the current view one in which a live rectangle no longer describes what
+// the user can see? Belt and braces with the toggles that are supposed to
+// clear the block outright (.Find_Toggle_Filter, .Toggle_Wrap, .Toggle_Preview,
+// .Toggle_Table -- commands.odin), and the second line of defence for
+// whichever of them ever fails to.
+//
+// doc.filter: the visible rows are a non-contiguous subset of the document's
+// lines, while every consumer here resolves rows by walking the buffer's own
+// logical lines (block_step_lines, block_row_range) -- so a rectangle made
+// before Ctrl+L would read and edit rows the filtered view is currently
+// hiding.
+//
+// doc_wraps: one logical line becomes several visual rows, so the rectangle
+// is DRAWN against visual rows and EDITED against logical lines, and the two
+// diverge past the first wrap point. Both gestures already refuse to create a
+// rectangle under wrap (block_extend / block_set_from_points' .Wrap_On), but
+// a rectangle made BEFORE wrap turned on survives unless something clears it
+// -- and Markdown Split turns wrap on via doc_wraps without the user ever
+// touching Alt+Z. That is the hole the whole-branch review found: .Toggle_Wrap
+// cleared the block, .Toggle_Preview did not, and these four operations
+// guarded only on doc.filter.
+@(private = "file")
+block_stale_view :: proc(doc: ^Document) -> bool {
+	return doc.filter || doc_wraps(doc)
+}
+
+// Collapse the LINEAR selection (doc.anchor..doc.cursor) to a caret, so a
+// rectangle and a linear span can never both be live.
+//
+// This is an invariant, not a tidy-up. Newtpad carries two selection models
+// side by side, and exactly one of them is ever DRAWN: main.odin picks
+// block_selection_rects when block_active(doc) and doc_selection_rects
+// otherwise. So a linear span that coexists with a rectangle is a selection
+// the user cannot see -- and the commands that drop the rectangle
+// (.Insert_Newline, .Insert_Tab, .Paste, .Delete_Word_Back, .Move_Line_*, via
+// command_dispatch's block-clear branch) then run against doc.anchor..cursor,
+// and doc_insert_text deletes the selection first. The whole-branch review's
+// reproduction: Alt+drag a 4-cell-wide rectangle down 50 lines, then Ctrl+V.
+// The mouse path set doc.cursor to the pointer on every drag frame while
+// doc.anchor stayed at the press point, so all 50 lines were replaced by the
+// clipboard. Shift-select, then Alt+Shift+Right, reached the same state from
+// the keyboard.
+//
+// Every path that establishes a rectangle calls this, so the invariant holds
+// by construction rather than by each command remembering to check. Both
+// gestures also DEGRADE to a linear selection when they refuse (see
+// block_extend's own refusals and main.odin's drag path), which is why this
+// runs only on the success path: on a refusal the linear span is the visible,
+// intended selection.
+block_collapse_linear :: proc(doc: ^Document) {
+	doc.anchor = doc.cursor
 }
 
 // The rectangle's four edges, normalised so lo <= hi on both axes regardless
@@ -476,6 +532,11 @@ block_extend :: proc(doc: ^Document, t: ^plat.Text, dline, dcell: int) -> Block_
 	// document by construction, so it can never hand back an offset outside
 	// the buffer.
 	doc.block_cursor_cell = max(0, cursor_cell + dcell)
+	// A rectangle now exists, so no linear selection may -- see
+	// block_collapse_linear. Shift-select some text and then press
+	// Alt+Shift+Right and, before this, the invisible linear span survived
+	// underneath the rectangle for the next Enter/Tab/Paste to delete.
+	block_collapse_linear(doc)
 	return .None
 }
 
@@ -512,7 +573,95 @@ block_set_from_points :: proc(doc: ^Document, t: ^plat.Text, a_off, a_cell, c_of
 	doc.block_anchor_cell = max(0, a_cell)
 	doc.block_cursor_line_start = c_off
 	doc.block_cursor_cell = max(0, c_cell)
+	// Same invariant as block_extend's, and this is the path the reviewer's
+	// own reproduction took: main.odin sets doc.cursor to the pointer on every
+	// drag frame but leaves doc.anchor at the press point, so without this an
+	// Alt+drag left a full linear span behind the rectangle -- unpainted,
+	// because the draw swaps to block_selection_rects -- for the next Ctrl+V
+	// to overwrite. See block_collapse_linear.
+	block_collapse_linear(doc)
 	return .None
+}
+
+// --- the Alt+drag gesture's own latched state ---
+
+// Everything main.odin's frame loop has to remember BETWEEN the mouse press
+// and the drag frames that follow it. These were four inline locals in that
+// loop -- the third such latch group there -- and folding them into one named
+// struct beside the procedures that consume them is what keeps the planned
+// renderer/ui extraction from having to untangle them from the frame loop
+// first (whole-branch review LOW 7).
+//
+// `alt` is latched at press time and never resampled per frame: sampling
+// key_alt_down() every frame would mean releasing Alt mid-drag silently turns
+// a rectangle into a linear selection, and pressing it mid-drag would turn a
+// linear drag into a rectangle -- neither is how a held modifier behaves once
+// a gesture has started.
+//
+// `anchor_off`/`anchor_cell` are the anchor corner's (line start byte offset,
+// cell), resolved once at the press exactly the way the cursor corner is
+// resolved on every drag frame. -1 in the offset means unresolved
+// (block_line_start_at's exact=false), which block_set_from_points reads as
+// its .Caret_Unresolved sentinel.
+//
+// `refusal_noted` is why a refused gesture posts its note once rather than on
+// every mouse-move frame it continues: app_note (app.odin) does a delete plus
+// a strings.clone per call.
+Block_Drag :: struct {
+	alt:           bool,
+	anchor_off:    int,
+	anchor_cell:   int,
+	refusal_noted: bool,
+}
+
+// A fresh mouse press: latch the gesture's modifier, clear whatever rectangle
+// the last gesture left, and -- only when Alt is held -- resolve the anchor
+// corner. `cell` is the press's own column, from the caller's cell_at_x (the
+// same primitive the draw and the hit-test use; this file does not reach for
+// the pointer position itself). doc.cursor must already have been moved to the
+// press point, which is what the row is resolved from.
+block_drag_press :: proc(d: ^Block_Drag, doc: ^Document, alt: bool, cell: int) {
+	d.alt = alt
+	d.refusal_noted = false // fresh gesture, fresh right to one note
+	// Every fresh press ends whatever rectangle came before, Alt or not --
+	// see block_press_clear's own comment for why Alt held at press time must
+	// not save a stale rectangle from a click that never becomes a drag.
+	block_press_clear(doc)
+	if alt {
+		ls, ok := block_line_start_at(doc, doc.cursor)
+		d.anchor_off = ls if ok else -1
+		d.anchor_cell = cell
+	}
+}
+
+// One frame of a drag, after the caller has moved doc.cursor to the pointer.
+// Does nothing at all when the gesture is not an Alt+drag, so a plain drag
+// pays neither the row resolve nor the rectangle write.
+//
+// Returns the refusal AND whether the caller should post a note for it --
+// `note` is true only on the FIRST refusal of a gesture, which is the whole
+// job of the latch. The two are separate because this file has never imported
+// the App type (see the package comment's layering) and so cannot call
+// app_note itself; the caller owns the wording, this owns the once-per-gesture
+// decision.
+//
+// The row is resolved by the same block_line_start_at the press used, so both
+// corners of a drag come from one procedure -- a bounded backward scan to the
+// nearest newline, the same call doc_cursor_col already makes every frame for
+// the status bar's "Col". It replaced a doc_cursor_line that counted newlines
+// from byte 0 (up to STATUS_LINE_CAP = 4 MiB, measured ~3ms) on every
+// mouse-move frame and produced a line NUMBER the draw then had to walk back
+// into an offset.
+block_drag_update :: proc(d: ^Block_Drag, doc: ^Document, t: ^plat.Text, cell: int) -> (refusal: Block_Refusal, note: bool) {
+	if !d.alt {return .None, false}
+	ls, ok := block_line_start_at(doc, doc.cursor)
+	cur_off := ls if ok else -1
+	refusal = block_set_from_points(doc, t, d.anchor_off, d.anchor_cell, cur_off, cell)
+	if refusal != .None && !d.refusal_noted {
+		d.refusal_noted = true
+		note = true
+	}
+	return
 }
 
 // --- Task 4: drawing the rectangle ---
@@ -539,6 +688,9 @@ block_set_from_points :: proc(doc: ^Document, t: ^plat.Text, a_off, a_cell, c_of
 // membership is a range test plus one byte read (block_is_line_start).
 block_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: int, out: []plat.Quad) -> int {
 	if !block_active(doc) {return 0}
+	// Wrap is the same class of hazard as doc.filter, and the four operations
+	// that share this guard say so in one place: see block_stale_view.
+	if block_stale_view(doc) {return 0}
 	off_lo, off_hi, cell_lo, cell_hi := block_bounds(doc)
 
 	col := g_theme[.Selection_Doc]
@@ -710,17 +862,15 @@ BLOCK_EDIT_MAX_LINES :: 300
 //     frame -- a rectangle CAN span the whole file.
 block_text :: proc(doc: ^Document, t: ^plat.Text, allocator := context.temp_allocator) -> (string, bool) {
 	if !block_active(doc) {return "", false}
-	// Belt and braces with Find_Toggle_Filter clearing the block (commands.odin):
-	// block_extend already refuses to CREATE a rectangle while doc.filter is on
-	// (this file's own Filter_On refusal), because filter view's rows are a
-	// non-contiguous subset of the document's lines and a rectangle's rows mean
-	// something different again there. But a rectangle made BEFORE Ctrl+L
-	// survives the toggle unless something clears it, and every consumer here
-	// resolves rows by walking the buffer's own logical lines (block_step_lines,
-	// block_row_range) -- never the filtered view -- so it would read and copy
-	// rows the user cannot currently see. Refusing here is the second line of
-	// defence for whichever path failed to clear it first.
-	if doc.filter {return "", false}
+	// Belt and braces with the view toggles clearing the block (commands.odin):
+	// both gestures already refuse to CREATE a rectangle in filter view or
+	// under wrap (this file's own Filter_On / Wrap_On refusals), but a
+	// rectangle made BEFORE the toggle survives unless something clears it,
+	// and every consumer here resolves rows by walking the buffer's own
+	// logical lines -- never the filtered or wrapped view -- so it would copy
+	// rows the user cannot currently see, or cell ranges taken from a row that
+	// is no longer what is drawn. See block_stale_view.
+	if block_stale_view(doc) {return "", false}
 	off_lo, off_hi, cell_lo, cell_hi := block_bounds(doc)
 	eol := "\r\n" if doc.eol == .CRLF else "\n"
 
@@ -809,10 +959,11 @@ block_text :: proc(doc: ^Document, t: ^plat.Text, allocator := context.temp_allo
 // is the only thing that puts the caret there.
 block_cut_delete :: proc(doc: ^Document, t: ^plat.Text) -> bool {
 	if !block_active(doc) {return false}
-	// See block_text's own comment: belt and braces with Find_Toggle_Filter
-	// clearing the block: refuse rather than delete rows the filtered view is
-	// currently hiding from the user.
-	if doc.filter {return false}
+	// See block_text's own comment and block_stale_view: refuse rather than
+	// delete rows the filtered view is currently hiding from the user, or a
+	// cell range that a wrapped view is drawing somewhere other than where
+	// this would delete it.
+	if block_stale_view(doc) {return false}
 	off_lo, off_hi, cell_lo, cell_hi := block_bounds(doc)
 
 	starts := make([dynamic]int, 0, 64, context.temp_allocator)
@@ -917,10 +1068,10 @@ block_cut_delete :: proc(doc: ^Document, t: ^plat.Text) -> bool {
 @(private = "file")
 block_apply :: proc(doc: ^Document, t: ^plat.Text, edit_lo, edit_hi: int, text: []u8, new_cell: int, kind: Edit_Kind) -> bool {
 	if !block_active(doc) {return false}
-	// See block_text's own comment: belt and braces with Find_Toggle_Filter
-	// clearing the block. block_apply is the single choke point block_replace
-	// and block_delete both funnel through, so one guard here covers both.
-	if doc.filter {return false}
+	// See block_text's own comment and block_stale_view. block_apply is the
+	// single choke point block_replace and block_delete both funnel through,
+	// so one guard here covers both.
+	if block_stale_view(doc) {return false}
 	off_lo, off_hi, _, _ := block_bounds(doc)
 
 	// Row starts first, by the cheap vertical walk alone (no cell walk yet), so

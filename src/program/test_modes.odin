@@ -1814,12 +1814,16 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// held at this press -- an Alt+click that never turns into a drag
 		// must behave like a plain click, not silently preserve whatever was
 		// there before. Regression: the old main.odin code only cleared on
-		// the non-Alt branch, so passing alt=true here with a seeded block
-		// used to leave it live.
+		// the non-Alt branch, so a press with Alt held and a seeded block
+		// used to leave it live. The proc no longer TAKES an `alt` argument
+		// (whole-branch review LOW 6: it never read the one it had), so what
+		// this now asserts is the same behaviour with the modifier removed
+		// from the interface entirely -- there is no longer a value that
+		// could gate it.
 		bd.block = true
 		bd.block_anchor_line_start, bd.block_anchor_cell = 1, 2
 		bd.block_cursor_line_start, bd.block_cursor_cell = 3, 4
-		block_press_clear(&bd, true) // alt HELD -- must still clear
+		block_press_clear(&bd)
 		cPress := !block_active(&bd) && bd.block_anchor_line_start == 0 && bd.block_anchor_cell == 0 && bd.block_cursor_line_start == 0 && bd.block_cursor_cell == 0
 		if !cPress {fail = true}
 		fmt.printfln("  %-6s block_press_clear drops a stale block even with Alt held: block_active=%v", "ok" if cPress else "FAIL", block_active(&bd))
@@ -2792,14 +2796,31 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// with ~100,000 such lines (~1.8 MB, the reviewer's file size), over
 		// cells [11,15) -- "INFO" -- so every row genuinely has bytes to
 		// delete (this measures the real delete cost, not the all-short skip
-		// path Q covers). The threshold is chosen to be well clear of a
-		// release build's real cost at this cap but to fall well BELOW what
-		// the double-resolve, 10,000-row original cost at this same row
-		// count -- see BLOCK_EDIT_MAX_LINES's own comment for both measured
-		// numbers. Sabotage (per task): revert the delete loop to call
-		// block_row_range a second time per row (restoring the old
-		// double-resolve) and/or restore BLOCK_EDIT_MAX_LINES to 10_000, and
-		// this must FAIL.
+		// path Q covers).
+		//
+		// THRESHOLD, retightened (whole-branch review LOW 5). This bound was
+		// 60ms, sized when the cap was 10,000 rows and then left alone through
+		// two cap reductions -- so at the current 300-row cap it had stopped
+		// being able to fail. A cost test that cannot fail is exactly what
+		// this project's own rule is about.
+		//
+		// Re-measured on this machine rather than estimated, DEBUG build (the
+		// build these headless modes run as day to day, and the slower of the
+		// two -- so a bound that holds here holds for release):
+		//
+		//   cap 300 (shipping):   1.33, 1.35, 1.37, 1.85, 1.94, 1.99 ms
+		//   cap 2,000 (the regression this must catch): 10.91 ms
+		//
+		// 6ms sits ~3x above the worst of six runs at the shipping cap and
+		// ~1.8x below what a regression to 2,000 rows costs. Note that the
+		// "roughly 15ms" the review suggested would NOT have worked: 2,000
+		// rows measures under 11ms on press #0, so 15ms would have passed the
+		// very regression it was retightened to catch. The number had to come
+		// off the meter, not off an estimate.
+		//
+		// Sabotage (per task): revert the delete loop to call block_row_range
+		// a second time per row (restoring the old double-resolve) and/or
+		// raise BLOCK_EDIT_MAX_LINES back to 2_000, and this must FAIL.
 		block_test_r :: proc(t: ^plat.Text) -> bool {
 			rline := "2026-07-26 INFO x\n" // 18 bytes; "INFO" is cells [11,15)
 			rrows := 100_000 // ~1.8 MB, the reviewer's file size
@@ -2816,9 +2837,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			rstart := time.now()
 			rcut := block_cut_delete(&rdoc, t)
 			rms := time.duration_milliseconds(time.since(rstart))
-			cR := rcut && !block_active(&rdoc) && rms < 60
+			cR := rcut && !block_active(&rdoc) && rms < 6
 			fmt.printfln(
-				"  %-6s MEDIUM 2: cutting a %d-row rectangle at the cap costs a bounded amount: ok=%v elapsed=%.2fms (want <60ms)",
+				"  %-6s MEDIUM 2: cutting a %d-row rectangle at the cap costs a bounded amount: ok=%v elapsed=%.2fms (want <6ms)",
 				"ok" if cR else "FAIL",
 				BLOCK_EDIT_MAX_LINES,
 				rcut,
@@ -3262,6 +3283,21 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// edit's real worst case, and strictly more work than R's delete).
 		// BLOCK_EDIT_MAX_LINES was chosen against the DELETE's numbers, so this
 		// is the case that has to justify it for the edit.
+		//
+		// THRESHOLD, retightened (whole-branch review LOW 5) for the same
+		// reason R's was: 80ms was sized against a 10,000-row cap and left
+		// stranded by two cap reductions, so a regression back to 2,000 rows
+		// slipped straight through it. Re-measured, DEBUG build:
+		//
+		//   cap 300 (shipping):   1.37, 1.37, 1.38, 1.39, 1.41, 1.42, 1.44 ms
+		//   cap 2,000 (the regression this must catch): 10.33 ms
+		//
+		// Same 6ms bound as R's, not a larger one. The edit is in principle
+		// more work than the cut (it deletes AND inserts, and the rows change
+		// length), but at this cap the two measure the same to within noise --
+		// both are dominated by the per-row splice -- so giving this case a
+		// looser bound would only weaken it for a distinction the meter does
+		// not actually show.
 		block_test_ac :: proc(t: ^plat.Text) -> bool {
 			line := "2026-07-26 INFO x\n" // 18 bytes; "INFO" is cells [11,15)
 			nrows := 100_000
@@ -3277,9 +3313,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			start := time.now()
 			okc := block_replace(&cdoc, t, transmute([]u8)string("WARN!"))
 			ms := time.duration_milliseconds(time.since(start))
-			cAC := okc && ms < 80
+			cAC := okc && ms < 6
 			fmt.printfln(
-				"  %-6s cost: replacing a %d-row rectangle at the cap costs a bounded amount: ok=%v elapsed=%.2fms (want <80ms)",
+				"  %-6s cost: replacing a %d-row rectangle at the cap costs a bounded amount: ok=%v elapsed=%.2fms (want <6ms)",
 				"ok" if cAC else "FAIL",
 				BLOCK_EDIT_MAX_LINES,
 				okc,
@@ -3470,6 +3506,402 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			return cAG
 		}
 		if !block_test_ag(&t) {fail = true}
+
+		// AH: WHOLE-BRANCH HIGH 1 -- a rectangle and a linear selection must
+		// never both be live, because only ONE of them is drawn. main.odin
+		// picks block_selection_rects when block_active(doc) and
+		// doc_selection_rects otherwise, so a linear span coexisting with a
+		// rectangle is INVISIBLE -- and every mutating command that drops the
+		// rectangle (.Insert_Newline, .Insert_Tab, .Paste, .Delete_Word_Back,
+		// .Move_Line_*) then runs against doc.anchor..doc.cursor, where
+		// doc_insert_text deletes the selection first.
+		//
+		// Both gestures are exercised because both used to leave one behind
+		// and the fix is at both ends (block_collapse_linear, block.odin):
+		//
+		//   MOUSE  -- main.odin sets doc.cursor to the pointer on every drag
+		//             frame while doc.anchor stays at the press point, then
+		//             calls block_set_from_points. Reviewer's reproduction:
+		//             Alt+drag a rectangle down 50 lines, press Ctrl+V, and
+		//             all 50 lines are replaced by the clipboard.
+		//   KEYBOARD -- Shift-select text (a real, visible linear span), then
+		//             Alt+Shift+Right, then Enter.
+		//
+		// The damage half is dispatched through the real command table so it
+		// crosses commands.odin's block-clear branch exactly as a keystroke
+		// does, rather than asserting on the anchor alone -- an anchor is only
+		// interesting because of what the next command does with it.
+		//
+		// Sabotage (per task): remove the block_collapse_linear call from
+		// block_set_from_points and this must FAIL -- Enter deletes bytes
+		// 0..17 instead of inserting one line break at the caret.
+		block_test_ah :: proc(t: ^plat.Text) -> bool {
+			ha: App
+			hdummy: plat.Window
+			app_new_scratch(&ha)
+			hd := app_active(&ha)
+			doc_close(hd)
+			hd^ = doc_from_content(transmute([]u8)strings.clone("aaaa\nbbbb\ncccc\ndddd\n"), "", .UTF8)
+			hd.wrap = false
+
+			// MOUSE: press at byte 0, drag to byte 17 (row 3, cell 2). The
+			// press set doc.anchor and every drag frame sets doc.cursor.
+			hd.anchor, hd.cursor = 0, 17
+			mouse_refusal := block_set_from_points(hd, t, 0, 0, 15, 4) // rows 0..15, cells 0..4
+			mouse_collapsed := hd.anchor == hd.cursor && hd.cursor == 17
+
+			// The damage: Enter, through the real dispatcher.
+			command_dispatch(resolve_key(.Enter, false, false, .Editor), {.Enter, false, false, false}, &ha, &hdummy, t, 10)
+			after_enter := doc_debug_string(hd)
+
+			// KEYBOARD: a genuine Shift-selection (bytes 2..7, visible and
+			// intended) followed by one Alt+Shift+Right.
+			kd := doc_from_content(transmute([]u8)strings.clone("aaaa\nbbbb\ncccc\n"), "", .UTF8)
+			defer doc_close(&kd)
+			kd.wrap = false
+			kd.anchor, kd.cursor = 2, 7
+			key_refusal := block_extend(&kd, t, 0, 1)
+			key_collapsed := kd.anchor == kd.cursor && kd.cursor == 7
+
+			cAH :=
+				mouse_refusal == .None &&
+				block_active(hd) == false && // Enter dropped it, as it always did
+				mouse_collapsed &&
+				after_enter == "aaaa\nbbbb\ncccc\ndd\ndd\n" &&
+				key_refusal == .None &&
+				block_active(&kd) &&
+				key_collapsed
+			fmt.printfln(
+				"  %-6s HIGH 1: a block gesture leaves no linear selection, so Enter inserts instead of replacing: mouse_refusal=%v anchor==cursor=%v content=%q (want %q) key_refusal=%v key_anchor=%d key_cursor=%d (want 7,7)",
+				"ok" if cAH else "FAIL",
+				mouse_refusal,
+				mouse_collapsed,
+				after_enter,
+				"aaaa\\nbbbb\\ncccc\\ndd\\ndd\\n",
+				key_refusal,
+				kd.anchor,
+				kd.cursor,
+			)
+			app_destroy(&ha)
+			return cAH
+		}
+		if !block_test_ah(&t) {fail = true}
+
+		// AI: WHOLE-BRANCH HIGH 1, the other half -- Paste specifically, the
+		// command the reviewer's own reproduction used. Separate from AH
+		// because it needs the real Windows clipboard (a set/get round trip in
+		// this same process): blocktest already writes the clipboard in the
+		// LOW 3 Cut case above, so this adds no new side effect, but keeping it
+		// out of AH means a clipboard failure cannot mask the keyboard half.
+		//
+		// Sabotage: same as AH -- drop block_collapse_linear from
+		// block_set_from_points and Ctrl+V eats bytes 0..17.
+		block_test_ai :: proc(t: ^plat.Text) -> bool {
+			pa: App
+			pdummy: plat.Window
+			app_new_scratch(&pa)
+			pd := app_active(&pa)
+			doc_close(pd)
+			pd^ = doc_from_content(transmute([]u8)strings.clone("aaaa\nbbbb\ncccc\ndddd\n"), "", .UTF8)
+			pd.wrap = false
+			pd.anchor, pd.cursor = 0, 17
+			refusal := block_set_from_points(pd, t, 0, 0, 15, 4)
+
+			plat.clipboard_set_text(pdummy.hwnd, "PP")
+			command_dispatch(resolve_key(.V, true, false, .Editor), {.V, true, false, false}, &pa, &pdummy, t, 10)
+			after := doc_debug_string(pd)
+
+			cAI := refusal == .None && after == "aaaa\nbbbb\ncccc\nddPPdd\n"
+			fmt.printfln(
+				"  %-6s HIGH 1: Ctrl+V with a rectangle active does not delete a linear span: refusal=%v content=%q (want %q)",
+				"ok" if cAI else "FAIL",
+				refusal,
+				after,
+				"aaaa\\nbbbb\\ncccc\\nddPPdd\\n",
+			)
+			app_destroy(&pa)
+			return cAI
+		}
+		if !block_test_ai(&t) {fail = true}
+
+		// AJ: WHOLE-BRANCH HIGH 2 -- table view bypassed every stale-rectangle
+		// guard. command_dispatch returns EARLY for mutating commands while
+		// doc.table is set, before it reaches the block-clear branch, and cell
+		// editing is intercepted before dispatch entirely (main.odin) yet
+		// splices the buffer through doc_replace_range (table_edit_commit).
+		// Reviewer's reproduction: Alt+drag on a CSV, Ctrl+T, edit a cell,
+		// Ctrl+T back, Ctrl+X -- and the cut took bytes never highlighted.
+		// Identical shape to the find_replace_all hole fixed earlier on this
+		// branch.
+		//
+		// Both new clears are asserted, because either alone leaves a route
+		// in: .Toggle_Table's (the seam) and table_edit_commit's (the actual
+		// write). The second is checked by re-seeding a rectangle while
+		// already inside table view -- exactly the state the toggle's own
+		// clear cannot reach.
+		//
+		// Sabotage (per task): remove either clear and this must FAIL.
+		block_test_aj :: proc(t: ^plat.Text) -> bool {
+			ja: App
+			jdummy: plat.Window
+			app_new_scratch(&ja)
+			jd := app_active(&ja)
+			doc_close(jd)
+			jd^ = doc_from_content(transmute([]u8)strings.clone("a,bb,c\nd,ee,f\n"), "", .UTF8)
+			jd.wrap = false
+			jd.block = true
+			jd.block_anchor_line_start, jd.block_anchor_cell = 0, 0
+			jd.block_cursor_line_start, jd.block_cursor_cell = 7, 4 // "d,ee,f\n"'s own line start
+
+			command_dispatch(resolve_key(.T, true, false, .Editor), {.T, true, false, false}, &ja, &jdummy, t, 10) // Ctrl+T
+			in_table := jd.table
+			toggle_cleared := !block_active(jd)
+
+			// Now the choke point: a rectangle live INSIDE table view, which
+			// the toggle's own clear can no longer reach, and a cell edit
+			// that splices the buffer under it.
+			jd.block = true
+			jd.block_anchor_line_start, jd.block_anchor_cell = 0, 0
+			jd.block_cursor_line_start, jd.block_cursor_cell = 7, 4
+			table_edit_start(jd, 0, 1, 2, 4, "ZZZZ") // field "bb" of row 0 is bytes [2,4)
+			table_edit_commit(jd)
+			commit_cleared := !block_active(jd)
+			spliced := doc_debug_string(jd)
+
+			cAJ := in_table && toggle_cleared && commit_cleared && spliced == "a,ZZZZ,c\nd,ee,f\n"
+			fmt.printfln(
+				"  %-6s HIGH 2: table view drops the rectangle at BOTH the toggle and the cell-commit splice: in_table=%v toggle_cleared=%v commit_cleared=%v content=%q (want %q)",
+				"ok" if cAJ else "FAIL",
+				in_table,
+				toggle_cleared,
+				commit_cleared,
+				spliced,
+				"a,ZZZZ,c\\nd,ee,f\\n",
+			)
+			app_destroy(&ja)
+			return cAJ
+		}
+		if !block_test_aj(&t) {fail = true}
+
+		// AK: WHOLE-BRANCH MEDIUM 3 -- Markdown Split turns wrap on
+		// (doc_wraps), which changes what a rectangle's (line start, cell)
+		// pair means exactly the way Alt+Z does. .Toggle_Wrap has always
+		// cleared the block for that reason; .Toggle_Preview did not, and the
+		// four block operations guarded only on doc.filter, never on wrap. A
+		// rectangle carried into Split is DRAWN against visual rows and EDITED
+		// against logical lines, which diverge past the first wrap point.
+		//
+		// Two halves, matching the two-sided fix: the toggle clears (the
+		// Preview -> Split transition specifically, the one that turns wrap
+		// on), and all four operations refuse under doc_wraps even when
+		// something else leaves a rectangle live there.
+		//
+		// Sabotage (per task): remove the clear from .Toggle_Preview, or drop
+		// doc_wraps from block_stale_view (block.odin), and this must FAIL.
+		block_test_ak :: proc(t: ^plat.Text) -> bool {
+			ma: App
+			mdummy: plat.Window
+			app_new_scratch(&ma)
+			md := app_active(&ma)
+			doc_close(md)
+			md^ = doc_from_content(transmute([]u8)strings.clone("aaaa\nbbbb\ncccc\n"), "", .UTF8)
+			md.wrap = false
+			md.md_mode = .Preview // one Ctrl+M from Split, the wrap-on transition
+			md.block = true
+			md.block_anchor_line_start, md.block_anchor_cell = 0, 0
+			md.block_cursor_line_start, md.block_cursor_cell = 10, 4
+
+			command_dispatch(resolve_key(.M, true, false, .Editor), {.M, true, false, false}, &ma, &mdummy, t, 10) // Ctrl+M
+			in_split := md.md_mode == .Split
+			toggle_cleared := !block_active(md)
+
+			// The guards: re-seed a rectangle with Split (and therefore
+			// doc_wraps) already on, and every operation must refuse.
+			md.block = true
+			md.block_anchor_line_start, md.block_anchor_cell = 0, 0
+			md.block_cursor_line_start, md.block_cursor_cell = 10, 4
+			wraps := doc_wraps(md)
+			_, copy_ok := block_text(md, t)
+			cut_ok := block_cut_delete(md, t)
+			edit_ok := block_replace(md, t, transmute([]u8)string("X"))
+			q: [8]plat.Quad
+			nq := block_selection_rects(md, t, 16, plat.text_char_width(t, 16, .Doc), 3, q[:])
+			intact := doc_debug_string(md)
+
+			cAK :=
+				in_split &&
+				toggle_cleared &&
+				wraps &&
+				!copy_ok &&
+				!cut_ok &&
+				!edit_ok &&
+				nq == 0 &&
+				intact == "aaaa\nbbbb\ncccc\n"
+			fmt.printfln(
+				"  %-6s MEDIUM 3: Split clears the rectangle and all four block ops refuse under wrap: in_split=%v cleared=%v wraps=%v copy_ok=%v cut_ok=%v edit_ok=%v quads=%d (want 0) content=%q",
+				"ok" if cAK else "FAIL",
+				in_split,
+				toggle_cleared,
+				wraps,
+				copy_ok,
+				cut_ok,
+				edit_ok,
+				nq,
+				intact,
+			)
+			app_destroy(&ma)
+			return cAK
+		}
+		if !block_test_ak(&t) {fail = true}
+
+		// AL: WHOLE-BRANCH LOW 4 -- the filter clear and the four doc.filter
+		// guards had no test at all. Ctrl+L's clear is load-bearing (filter
+		// view's rows are a non-contiguous subset of the document's lines,
+		// while every block operation walks the buffer's own logical lines),
+		// and the guards inside block.odin are its second line of defence.
+		// Same shape as AK, one view toggle over.
+		//
+		// Sabotage: remove `if block_active(doc) {block_clear(doc)}` from
+		// .Find_Toggle_Filter, or drop doc.filter from block_stale_view, and
+		// this must FAIL.
+		block_test_al :: proc(t: ^plat.Text) -> bool {
+			la: App
+			ldummy: plat.Window
+			app_new_scratch(&la)
+			ld := app_active(&la)
+			doc_close(ld)
+			ld^ = doc_from_content(transmute([]u8)strings.clone("aaaa\nbbbb\ncccc\n"), "", .UTF8)
+			ld.wrap = false
+			find_open(ld, false) // Ctrl+L is bound in the .Find context
+			ld.block = true
+			ld.block_anchor_line_start, ld.block_anchor_cell = 0, 0
+			ld.block_cursor_line_start, ld.block_cursor_cell = 10, 4
+
+			command_dispatch(resolve_key(.L, true, false, .Find), {.L, true, false, false}, &la, &ldummy, t, 10) // Ctrl+L
+			filtering := ld.filter
+			toggle_cleared := !block_active(ld)
+
+			ld.block = true
+			ld.block_anchor_line_start, ld.block_anchor_cell = 0, 0
+			ld.block_cursor_line_start, ld.block_cursor_cell = 10, 4
+			_, copy_ok := block_text(ld, t)
+			cut_ok := block_cut_delete(ld, t)
+			edit_ok := block_replace(ld, t, transmute([]u8)string("X"))
+			q: [8]plat.Quad
+			nq := block_selection_rects(ld, t, 16, plat.text_char_width(t, 16, .Doc), 3, q[:])
+			intact := doc_debug_string(ld)
+
+			cAL :=
+				filtering &&
+				toggle_cleared &&
+				!copy_ok &&
+				!cut_ok &&
+				!edit_ok &&
+				nq == 0 &&
+				intact == "aaaa\nbbbb\ncccc\n"
+			fmt.printfln(
+				"  %-6s LOW 4: Ctrl+L clears the rectangle and all four block ops refuse under filter: filtering=%v cleared=%v copy_ok=%v cut_ok=%v edit_ok=%v quads=%d (want 0) content=%q",
+				"ok" if cAL else "FAIL",
+				filtering,
+				toggle_cleared,
+				copy_ok,
+				cut_ok,
+				edit_ok,
+				nq,
+				intact,
+			)
+			app_destroy(&la)
+			return cAL
+		}
+		if !block_test_al(&t) {fail = true}
+
+		// AM: WHOLE-BRANCH LOW 7 -- the Alt+drag gesture's latches moved out of
+		// main.odin's frame loop into Block_Drag / block_drag_press /
+		// block_drag_update (block.odin). The fold was required to be
+		// behaviour-preserving, and this is what says so: as four inline
+		// locals in the frame loop none of this could be driven headlessly at
+		// all (there is no seam to simulate a real WM_LBUTTONDOWN), so the
+		// once-per-gesture note latch in particular was previously untestable.
+		// Getting a seam out of the move is the point of having made it.
+		//
+		// Four properties, all of them things the inline code did:
+		//   - a press clears the previous gesture's rectangle whether or not
+		//     Alt is held (block_press_clear's own rule, one layer up);
+		//   - a NON-Alt drag frame costs nothing and creates nothing;
+		//   - a refused gesture reports note=true exactly once however many
+		//     drag frames follow -- app_note does a delete plus a
+		//     strings.clone per call, which is why the latch exists;
+		//   - a successful drag builds the rectangle AND leaves no linear
+		//     selection behind it (HIGH 1, through the real gesture entry
+		//     point rather than block_set_from_points directly).
+		block_test_am :: proc(t: ^plat.Text) -> bool {
+			gd := doc_from_content(transmute([]u8)strings.clone("aaaa\nbbbb\ncccc\n"), "", .UTF8)
+			defer doc_close(&gd)
+			gd.wrap = false
+
+			// A press with Alt NOT held still drops the last rectangle.
+			gd.block = true
+			gd.block_anchor_line_start, gd.block_anchor_cell = 0, 1
+			gd.block_cursor_line_start, gd.block_cursor_cell = 5, 3
+			drag: Block_Drag
+			gd.cursor, gd.anchor = 0, 0
+			block_drag_press(&drag, &gd, false, 0)
+			plain_cleared := !block_active(&gd) && !drag.alt
+
+			// A non-Alt drag frame does nothing at all.
+			gd.cursor = 12
+			r_plain, n_plain := block_drag_update(&drag, &gd, t, 2)
+			plain_inert := r_plain == .None && !n_plain && !block_active(&gd)
+
+			// An Alt press latches the anchor corner at the caret's own row.
+			gd.cursor, gd.anchor = 2, 2
+			block_drag_press(&drag, &gd, true, 2)
+			latched := drag.alt && drag.anchor_off == 0 && drag.anchor_cell == 2
+
+			// A refused gesture (wrap on) notes once, not per frame.
+			gd.wrap = true
+			gd.cursor = 12
+			r1, n1 := block_drag_update(&drag, &gd, t, 4)
+			r2, n2 := block_drag_update(&drag, &gd, t, 4)
+			r3, n3 := block_drag_update(&drag, &gd, t, 4)
+			noted_once := r1 == .Wrap_On && n1 && r2 == .Wrap_On && !n2 && r3 == .Wrap_On && !n3
+
+			// A successful drag: rectangle built, no linear selection under it.
+			gd.wrap = false
+			gd.cursor, gd.anchor = 2, 2
+			block_drag_press(&drag, &gd, true, 2)
+			gd.cursor = 12 // pointer now on row 2; anchor stays where it was pressed
+			r_ok, n_ok := block_drag_update(&drag, &gd, t, 4)
+			built :=
+				r_ok == .None &&
+				!n_ok &&
+				block_active(&gd) &&
+				gd.block_anchor_line_start == 0 &&
+				gd.block_anchor_cell == 2 &&
+				gd.block_cursor_line_start == 10 &&
+				gd.block_cursor_cell == 4 &&
+				gd.anchor == gd.cursor
+
+			cAM := plain_cleared && plain_inert && latched && noted_once && built
+			fmt.printfln(
+				"  %-6s LOW 7: the folded Alt+drag latches behave as the inline ones did: plain_press_cleared=%v plain_drag_inert=%v anchor_latched=%v(off=%d cell=%d) noted_once=%v(%v,%v,%v) built=%v(anchor=%d cursor=%d)",
+				"ok" if cAM else "FAIL",
+				plain_cleared,
+				plain_inert,
+				latched,
+				drag.anchor_off,
+				drag.anchor_cell,
+				noted_once,
+				n1,
+				n2,
+				n3,
+				built,
+				gd.anchor,
+				gd.cursor,
+			)
+			return cAM
+		}
+		if !block_test_am(&t) {fail = true}
 
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
 		return true

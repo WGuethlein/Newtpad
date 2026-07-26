@@ -442,6 +442,22 @@ table_edit_end :: proc(doc: ^Document) {doc.table_edit_caret = len(doc.table_edi
 table_edit_commit :: proc(doc: ^Document) {
 	if !doc.table_editing {return}
 	doc.table_editing = false
+	// The one buffer write table view has, and therefore the one place a
+	// column rectangle can go stale without any command dispatch running.
+	// command_dispatch's own block-clear branch is unreachable here twice
+	// over: the table guard returns early for every mutating command while
+	// doc.table is set, and cell editing is intercepted before dispatch
+	// (main.odin) so no Command_Id is ever produced. The splice below shifts
+	// every byte offset after the edited field, which is precisely what makes
+	// a rectangle's row offsets stop naming the rows it was drawn over.
+	// Clearing here rather than only at the .Toggle_Table seam is the same
+	// argument that put the clear inside find.odin's replace procs: guard the
+	// write, not the routes to it.
+	//
+	// Placed after the not-editing early return deliberately -- this proc is
+	// called speculatively from several places (the wheel, the toggle) and
+	// only the calls that actually splice may drop the user's selection.
+	if block_active(doc) {block_clear(doc)}
 	delim := doc.table_delim if doc.table_delim != 0 else ','
 	ser := csv_serialize(string(doc.table_edit_buf[:]), delim)
 	doc_replace_range(doc, doc.table_edit_s, doc.table_edit_e - doc.table_edit_s, transmute([]u8)ser)
