@@ -556,6 +556,8 @@ block_extend_dispatch :: proc(app: ^App, doc: ^Document, t: ^plat.Text, dline, d
 	switch block_extend(doc, t, dline, dcell) {
 	case .Wrap_On:
 		app_note(app, "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]")
+	case .Filter_On:
+		app_note(app, "[COLUMN SELECT UNAVAILABLE - TURN OFF FILTER]")
 	case .Caret_Unresolved:
 		app_note(app, "[COLUMN SELECT UNAVAILABLE HERE - the line is too far into a very large file]")
 	case .None:

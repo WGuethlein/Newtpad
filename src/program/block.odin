@@ -50,6 +50,28 @@ block_clear :: proc(doc: ^Document) {
 	doc.block_cursor_cell = 0
 }
 
+// Fresh-press state transition for a rectangle left over from an earlier
+// gesture: main.odin's mouse-press handler calls this before it does
+// anything else with the click. `alt` is whether Alt is held at THIS press
+// -- and is deliberately NOT consulted below. Before this fix, the clear
+// only ran on the branch that also established Alt was NOT held, so an
+// Alt+click that never turned into a drag (never exceeded the slop in
+// main.odin's drag-vs-click check) left the previous rectangle live: the
+// click looked like it had been silently ignored. Every fresh press starts a
+// new gesture regardless of Alt, and a press that DOES become a real
+// Alt+drag rebuilds the rectangle from scratch via block_set_from_points
+// (both corners, not an extension of whatever was here), so clearing
+// unconditionally here costs nothing.
+//
+// Split out from main.odin's inline press handler -- which cannot be driven
+// headlessly, there is no seam to simulate a real WM_LBUTTONDOWN -- so this
+// one decision has a seam blocktest can exercise on its own.
+block_press_clear :: proc(doc: ^Document, alt: bool) {
+	if block_active(doc) {
+		block_clear(doc)
+	}
+}
+
 // The rectangle's four edges, normalised so lo <= hi on both axes regardless
 // of which corner the drag started from -- dragging up-and-left must describe
 // the identical rectangle as dragging down-and-right from the opposite
@@ -296,13 +318,20 @@ caret_line_cell :: proc(doc: ^Document, t: ^plat.Text) -> (line, cell: int, ok: 
 // Why block_extend refuses, distinct from whether it refused: the two
 // refusal reasons need two different user-facing notes (command_dispatch's
 // dispatcher, commands.odin), and a bare bool can't carry that. Wrap_On is
-// the pre-existing "word-wrap is on" refusal; Caret_Unresolved is new --
-// the caret sits far enough into a large file that caret_line_cell could
-// not resolve one or both axes within its own scan cap.
+// the pre-existing "word-wrap is on" refusal (checked via doc_wraps, so it
+// also covers Markdown Split forcing the editor half to wrap); Caret_Unresolved
+// is new -- the caret sits far enough into a large file that caret_line_cell
+// could not resolve one or both axes within its own scan cap. Filter_On is
+// its own variant rather than folding into Wrap_On: in filter mode the visible
+// rows are a non-contiguous subset of the document's lines, so a rectangle's
+// line indices mean something different again -- and telling the user to
+// press Alt+Z (the word-wrap toggle) when the real problem is the filter view
+// would send them chasing the wrong control.
 Block_Refusal :: enum {
 	None,
 	Wrap_On,
 	Caret_Unresolved,
+	Filter_On,
 }
 
 // Seed or extend a column rectangle from the keyboard. `dline`/`dcell` are
@@ -330,7 +359,10 @@ Block_Refusal :: enum {
 // caller with `app` already in scope is command_dispatch, which turns each
 // refusal into its own status note.
 block_extend :: proc(doc: ^Document, t: ^plat.Text, dline, dcell: int) -> Block_Refusal {
-	if doc.wrap {
+	if doc.filter {
+		return .Filter_On
+	}
+	if doc_wraps(doc) {
 		return .Wrap_On
 	}
 	if !doc.block {
@@ -378,7 +410,10 @@ block_extend :: proc(doc: ^Document, t: ^plat.Text, dline, dcell: int) -> Block_
 // "unknown line number", the same sentinel caret_line_cell would have refused
 // on. Cells never carry this signal: cell_at_x floors at 0 and cannot fail.
 block_set_from_points :: proc(doc: ^Document, t: ^plat.Text, a_line, a_cell, c_line, c_cell: int) -> Block_Refusal {
-	if doc.wrap {
+	if doc.filter {
+		return .Filter_On
+	}
+	if doc_wraps(doc) {
 		return .Wrap_On
 	}
 	if a_line < 0 || c_line < 0 {

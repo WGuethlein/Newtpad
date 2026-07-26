@@ -192,6 +192,11 @@ main :: proc() {
 	// unresolved (doc_cursor_line's own beyond-STATUS_LINE_CAP sentinel).
 	press_alt := false
 	press_block_line, press_block_cell: int
+	// Latched alongside press_alt: whether this gesture has already posted its
+	// refusal note (wrap/filter/unresolved-caret). Without this, a refused
+	// Alt+drag that keeps moving calls app_note on every mouse-move frame --
+	// app_note (app.odin) does a delete plus a strings.clone per call.
+	block_refusal_noted := false
 
 	for !window.should_close {
 		// Sleep when idle instead of spinning at vsync (which pinned a core the whole
@@ -643,23 +648,31 @@ main :: proc() {
 				// bar's own "Ln" display recomputes for the same position
 				// later this same frame -- not a second scan.
 				press_alt = plat.key_alt_down()
+				block_refusal_noted = false // fresh gesture, fresh right to one note
+				// Every fresh press ends whatever rectangle came before, Alt
+				// or not -- see block_press_clear's own comment (block.odin)
+				// for why Alt held at press time must not save a stale
+				// rectangle from a click that never turns into a drag.
+				block_press_clear(doc, press_alt)
 				if press_alt {
 					pln := doc_cursor_line(doc)
 					press_block_line = pln - 1 if pln > 0 else -1
 					press_block_cell = cell_at_x(char_w, f32(window.mouse_x))
-				} else if block_active(doc) {
-					// A plain click starts a fresh gesture; a rectangle left
-					// over from an earlier Alt+drag or Alt+Shift+arrow no
-					// longer describes anything the caret is doing, same as
-					// every other caret-moving path in doc.odin (set_cursor,
-					// doc_select_all, doc_select_word_at, ...).
-					block_clear(doc)
 				}
 			}
 			press_x, press_y = window.mouse_x, window.mouse_y
 			sel_dragging = false // arm; a drag begins only once the pointer moves
 			window.mouse_pressed = false
-		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag && !divider_drag {
+		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag && !divider_drag && !md_preview_drag {
+			// md_preview_drag belongs in this exclusion list exactly like the other
+			// three drag latches beside it: window.mouse_down stays true for its
+			// whole gesture (real OS state, not something any of these consumers
+			// clear), so leaving it out let a preview-scrollbar drag also fall into
+			// the selection branch below on every one of its frames -- re-running
+			// the Alt-drag path with whatever press_alt/press_block_line/cell were
+			// left over from an unrelated earlier gesture. Finding 2 (doc_wraps'
+			// filter/Split refusals) already suppresses most of the fallout since
+			// Markdown Split forces wrap, but this is the actual leak.
 			// A selection drag begins only once the pointer has actually moved from
 			// the press point. A stationary press-and-hold must not extend the
 			// selection or auto-scroll -- that was the bug where holding still lit up
@@ -681,27 +694,55 @@ main :: proc() {
 					doc_scroll(doc, &text, 1, rows)
 				}
 				mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
+				// A refused column drag (below) still lands here: doc.cursor keeps
+				// tracking the pointer and the drag degrades to a normal linear
+				// selection instead of doing nothing. Deliberate, not an oversight --
+				// some feedback under the pointer beats a frozen drag when wrap or
+				// filter mode makes a rectangle impossible.
 				doc.cursor = mp
 				if press_alt {
 					// The column: cell_at_x, the same primitive the draw and
 					// the hit-test use for every other column -- not a second
 					// conversion path from mp's byte offset. The line: reuse
 					// doc_cursor_line's own cache exactly as press did above;
-					// doc.cursor just changed to mp, so this is the one real
-					// scan the status bar's "Ln" display would pay for this
-					// frame regardless, not an extra one added by this
-					// gesture. Calling doc_line_start_of_index here instead --
-					// once per row of a rectangle, or even once per frame in a
-					// loop -- is exactly the forbidden shape (~2.9ms per call
-					// at its cap; see block.odin's DOC_LINE_INDEX_CAP comment).
+					// doc.cursor just changed to mp, so this recomputes (the cache
+					// keys on doc.cursor, which just changed) regardless of what
+					// follows. When the find bar is CLOSED, the status bar's own
+					// "Ln" display recomputes the identical line for the identical
+					// cursor later this same frame (main.odin's draw, the `else` of
+					// `if doc.find.active`), so that later call is a cache hit and
+					// this one was the only real cost either way. When find IS open,
+					// that status-bar call never happens (the find bar draws in its
+					// place instead), so this genuinely is an added per-frame cost of
+					// the drag -- up to STATUS_LINE_CAP (4 MB) of count_newlines,
+					// measured ~3ms; not a freeze, but a prior report's claim that
+					// this reuse was unconditional (free whether or not find is
+					// open) was wrong. Calling doc_line_start_of_index here instead --
+					// once per row of a rectangle, or even once per frame in a loop --
+					// would be far worse regardless (~2.9ms per call at its cap; see
+					// block.odin's DOC_LINE_INDEX_CAP comment).
 					cln := doc_cursor_line(doc)
 					cur_line := cln - 1 if cln > 0 else -1
 					cur_cell := cell_at_x(char_w, f32(window.mouse_x))
+					// Latched so a refused gesture posts its note once, not on every
+					// mouse-move frame it continues -- app_note (app.odin) does a
+					// delete plus a strings.clone per call.
 					switch block_set_from_points(doc, &text, press_block_line, press_block_cell, cur_line, cur_cell) {
 					case .Wrap_On:
-						app_note(&app, "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]")
+						if !block_refusal_noted {
+							app_note(&app, "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]")
+							block_refusal_noted = true
+						}
+					case .Filter_On:
+						if !block_refusal_noted {
+							app_note(&app, "[COLUMN SELECT UNAVAILABLE - TURN OFF FILTER]")
+							block_refusal_noted = true
+						}
 					case .Caret_Unresolved:
-						app_note(&app, "[COLUMN SELECT UNAVAILABLE HERE - the line is too far into a very large file]")
+						if !block_refusal_noted {
+							app_note(&app, "[COLUMN SELECT UNAVAILABLE HERE - the line is too far into a very large file]")
+							block_refusal_noted = true
+						}
 					case .None:
 					}
 				}

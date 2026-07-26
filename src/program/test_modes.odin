@@ -1764,6 +1764,21 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !cc {fail = true}
 		fmt.printfln("  %-6s block_clear deactivates and zeroes geometry", "ok" if cc else "FAIL")
 
+		// block_press_clear (finding 5, task-3 review): a fresh press must
+		// drop a stale rectangle from an earlier gesture EVEN WHEN Alt is
+		// held at this press -- an Alt+click that never turns into a drag
+		// must behave like a plain click, not silently preserve whatever was
+		// there before. Regression: the old main.odin code only cleared on
+		// the non-Alt branch, so passing alt=true here with a seeded block
+		// used to leave it live.
+		bd.block = true
+		bd.block_anchor_line, bd.block_anchor_cell = 1, 2
+		bd.block_cursor_line, bd.block_cursor_cell = 3, 4
+		block_press_clear(&bd, true) // alt HELD -- must still clear
+		cPress := !block_active(&bd) && bd.block_anchor_line == 0 && bd.block_anchor_cell == 0 && bd.block_cursor_line == 0 && bd.block_cursor_cell == 0
+		if !cPress {fail = true}
+		fmt.printfln("  %-6s block_press_clear drops a stale block even with Alt held: block_active=%v", "ok" if cPress else "FAIL", block_active(&bd))
+
 		// block_extend (task 2): the first call with no block active seeds
 		// BOTH corners at the caret's own (line, cell) -- via the same
 		// cell-space primitives doc_cursor_col uses, never a hand-rolled
@@ -1812,6 +1827,30 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !cW {fail = true}
 		fmt.printfln("  %-6s block_extend refuses while wrapped, no state changed: refusal=%v block_active=%v", "ok" if cW else "FAIL", refW, block_active(&doc))
 		doc.wrap = false
+
+		// The real predicate is doc_wraps, not doc.wrap directly: Markdown
+		// Split force-wraps the editor half (it lives in the left pane and
+		// must fold rather than run under the preview) even with doc.wrap
+		// itself off, so a (line, cell) rectangle is exactly as unstable
+		// there as with word-wrap on. Before this fix, block_extend checked
+		// doc.wrap alone and let a rectangle through in Split.
+		doc.md_mode = .Split
+		refS := block_extend(&doc, &t, 0, 1)
+		cSp := refS == .Wrap_On && !block_active(&doc) && doc.block_anchor_line == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line == 0 && doc.block_cursor_cell == 0
+		if !cSp {fail = true}
+		fmt.printfln("  %-6s block_extend refuses in Markdown Split via doc_wraps, no state changed: refusal=%v block_active=%v", "ok" if cSp else "FAIL", refS, block_active(&doc))
+		doc.md_mode = .Off
+
+		// Filter view gets its own refusal (.Filter_On, not .Wrap_On): its
+		// visible rows are a non-contiguous subset of the document's lines,
+		// a different ambiguity than wrap, and telling the user to press
+		// Alt+Z would send them chasing the wrong control.
+		doc.filter = true
+		refF := block_extend(&doc, &t, 0, 1)
+		cF := refF == .Filter_On && !block_active(&doc) && doc.block_anchor_line == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line == 0 && doc.block_cursor_cell == 0
+		if !cF {fail = true}
+		fmt.printfln("  %-6s block_extend refuses while filter view is on: refusal=%v block_active=%v", "ok" if cF else "FAIL", refF, block_active(&doc))
+		doc.filter = false
 
 		// CRITICAL regression: caret_line_cell (and so block_extend) must
 		// REFUSE rather than seed a rectangle at (0,0) when the caret cannot
@@ -2107,6 +2146,30 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				pwp.block_cursor_cell == 0
 			if !cPW {fail = true}
 			fmt.printfln("  %-6s block_set_from_points refuses while wrapped, no state changed: refusal=%v block_active=%v", "ok" if cPW else "FAIL", refPW, block_active(&pwp))
+
+			// Markdown Split refuses too, via the same doc_wraps predicate as
+			// block_extend -- not doc.wrap directly. Split force-wraps the
+			// editor half even with doc.wrap off, so the mouse gesture must
+			// refuse there exactly as the keyboard gesture does.
+			psS: Document
+			psS.wrap = false
+			psS.md_mode = .Split
+			refPS := block_set_from_points(&psS, &t, 0, 0, 1, 1)
+			cPS := refPS == .Wrap_On && !block_active(&psS)
+			if !cPS {fail = true}
+			fmt.printfln("  %-6s block_set_from_points refuses in Markdown Split via doc_wraps: refusal=%v block_active=%v", "ok" if cPS else "FAIL", refPS, block_active(&psS))
+
+			// Filter view refuses distinctly (.Filter_On): its visible rows
+			// are a non-contiguous subset of the document's lines, a
+			// different ambiguity than wrap, so it needs its own note rather
+			// than telling the user to press Alt+Z.
+			psF: Document
+			psF.wrap = false
+			psF.filter = true
+			refPF := block_set_from_points(&psF, &t, 0, 0, 1, 1)
+			cPF := refPF == .Filter_On && !block_active(&psF)
+			if !cPF {fail = true}
+			fmt.printfln("  %-6s block_set_from_points refuses while filter view is on: refusal=%v block_active=%v", "ok" if cPF else "FAIL", refPF, block_active(&psF))
 
 			// Caret_Unresolved: main.odin passes -1 for a line it could not
 			// resolve (doc_cursor_line's own "0 = beyond STATUS_LINE_CAP"
