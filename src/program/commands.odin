@@ -59,6 +59,10 @@ Command_Id :: enum u8 {
 	Clear_Selection,
 	Move_Line_Up,
 	Move_Line_Down,
+	Block_Extend_Left,
+	Block_Extend_Right,
+	Block_Extend_Up,
+	Block_Extend_Down,
 	Toggle_Wrap,
 	Toggle_Table,
 	Toggle_Preview,
@@ -171,6 +175,10 @@ command_table := [Command_Id]Command {
 	.Clear_Selection          = {"Clear Selection", "Cursor"},
 	.Move_Line_Up             = {"Move Line Up", "Edit"},
 	.Move_Line_Down           = {"Move Line Down", "Edit"},
+	.Block_Extend_Left        = {"Extend Column Selection Left", "Edit"},
+	.Block_Extend_Right       = {"Extend Column Selection Right", "Edit"},
+	.Block_Extend_Up          = {"Extend Column Selection Up", "Edit"},
+	.Block_Extend_Down        = {"Extend Column Selection Down", "Edit"},
 	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
 	.Toggle_Table             = {"Toggle Table View (CSV/TSV)", "View"},
 	.Toggle_Preview           = {"Toggle Markdown Preview / Split", "View"},
@@ -275,8 +283,15 @@ default_bindings := []Binding {
 	{.G, true, false, .Editor, .Goto_Line}, // Ctrl+G
 	{.S, true, true, .Editor, .Save_As}, // Ctrl+Alt+S (Ctrl+Shift+S can't be expressed: shift isn't part of a chord)
 	{.Escape, false, false, .Editor, .Clear_Selection},
-	{.Up, false, true, .Editor, .Move_Line_Up}, // Alt+Up
-	{.Down, false, true, .Editor, .Move_Line_Down}, // Alt+Down
+	{.Up, false, true, .Editor, .Move_Line_Up}, // Alt+Up (Alt+Shift+Up extends a column selection -- shift read in the action)
+	{.Down, false, true, .Editor, .Move_Line_Down}, // Alt+Down (Alt+Shift+Down extends a column selection -- shift read in the action)
+	// Alt+Left/Right were unbound before this feature. The chord itself
+	// carries no shift bit (Binding has none -- shift is read by the
+	// action), so a bare Alt+Left/Right lands on these same two rows; the
+	// action must keep doing nothing without shift, exactly as the unbound
+	// key did before this task.
+	{.Left, false, true, .Editor, .Block_Extend_Left}, // Alt+Left / Alt+Shift+Left
+	{.Right, false, true, .Editor, .Block_Extend_Right}, // Alt+Right / Alt+Shift+Right
 	{.Z, false, true, .Editor, .Toggle_Wrap}, // Alt+Z
 	{.T, true, false, .Editor, .Toggle_Table}, // Ctrl+T: CSV/TSV table view
 	{.M, true, false, .Editor, .Toggle_Preview}, // Ctrl+M: markdown preview -> split -> off
@@ -530,6 +545,19 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 	return .None
 }
 
+// block_extend (block.odin) takes no ^App -- that file has never imported
+// the App type, keeping its layering the same as before this feature -- so
+// the one caller that has `app` in scope turns a refusal into the status
+// note here instead. Shared by every Block_Extend_* dispatch case and the
+// two Move_Line_Up/Down branches below, so the message can't drift between
+// call sites.
+@(private = "file")
+block_extend_dispatch :: proc(app: ^App, doc: ^Document, t: ^plat.Text, dline, dcell: int) {
+	if !block_extend(doc, t, dline, dcell) {
+		app_note(app, "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]")
+	}
+}
+
 // Run a command. `rows` is the visible row count (page moves); `w` supplies the
 // HWND for clipboard / Save-dialog. The active-context split means each command
 // is unambiguous here.
@@ -675,13 +703,51 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		}
 	case .Clear_Selection:
 		doc.anchor = doc.cursor
+		// Escape clears a normal selection; it must drop a live column
+		// rectangle the same way, or it survives invisibly after the caret
+		// looks like it has none.
+		if block_active(doc) {block_clear(doc)}
 	case .Move_Line_Up:
-		doc_move_lines(doc, -1)
+		// Shift isn't part of the chord (Binding has no shift field -- see
+		// the comment above default_bindings), so Alt+Up and Alt+Shift+Up
+		// both dispatch here; the action tells them apart. Shift held means
+		// extend the column rectangle up a row instead of moving the line --
+		// bare Alt+Up is unchanged from before this feature existed.
+		if ev.shift {
+			block_extend_dispatch(app, doc, t, -1, 0)
+		} else {
+			doc_move_lines(doc, -1)
+		}
 	case .Move_Line_Down:
-		doc_move_lines(doc, 1)
+		if ev.shift {
+			block_extend_dispatch(app, doc, t, 1, 0)
+		} else {
+			doc_move_lines(doc, 1)
+		}
+	case .Block_Extend_Left:
+		// Alt+Left carries no shift bit in the chord either (same reason as
+		// Move_Line_Up above), and this binding used to not exist at all --
+		// so a bare Alt+Left must keep doing nothing, exactly as an unbound
+		// key does. Only Alt+Shift+Left may act.
+		if ev.shift {block_extend_dispatch(app, doc, t, 0, -1)}
+	case .Block_Extend_Right:
+		if ev.shift {block_extend_dispatch(app, doc, t, 0, 1)}
+	case .Block_Extend_Up:
+		// Unreachable from the default keymap (Alt+Up already means
+		// Move_Line_Up, handled above) -- reachable only from the palette or
+		// a future user rebind. There is no bare-key behaviour to preserve
+		// here, unlike Left/Right, so no shift check is needed.
+		block_extend_dispatch(app, doc, t, -1, 0)
+	case .Block_Extend_Down:
+		block_extend_dispatch(app, doc, t, 1, 0)
 	case .Toggle_Wrap:
 		doc.wrap = !doc.wrap
 		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start
+		// Wrap changes what a rectangle's (line, cell) pair even means -- a
+		// visual row stops being one logical line -- so a live block cannot
+		// survive the toggle, the same reason the gesture itself refuses
+		// while already wrapped (block_extend).
+		if block_active(doc) {block_clear(doc)}
 	case .Toggle_Table:
 		// Read-only grid view of a CSV/TSV. Re-anchor the top to a line start so a
 		// row lands where the caret was, and pick the delimiter on first turn-on.

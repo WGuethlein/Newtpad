@@ -1764,6 +1764,124 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !cc {fail = true}
 		fmt.printfln("  %-6s block_clear deactivates and zeroes geometry", "ok" if cc else "FAIL")
 
+		// block_extend (task 2): the first call with no block active seeds
+		// BOTH corners at the caret's own (line, cell) -- via the same
+		// cell-space primitives doc_cursor_col uses, never a hand-rolled
+		// walk -- and only then applies its own delta to the cursor corner.
+		// `doc`'s line 0 ("abcdefgh") is pure ASCII, so byte offset 2 is
+		// also cell 2.
+		doc.wrap = false
+		doc.cursor = 2
+		okE1 := block_extend(&doc, &t, 0, 1)
+		cE1 :=
+			okE1 &&
+			block_active(&doc) &&
+			doc.block_anchor_line == 0 &&
+			doc.block_anchor_cell == 2 &&
+			doc.block_cursor_line == 0 &&
+			doc.block_cursor_cell == 3
+		if !cE1 {fail = true}
+		fmt.printfln(
+			"  %-6s block_extend seeds anchor at caret and moves cursor: anchor=(%d,%d) cursor=(%d,%d) ok=%v",
+			"ok" if cE1 else "FAIL",
+			doc.block_anchor_line,
+			doc.block_anchor_cell,
+			doc.block_cursor_line,
+			doc.block_cursor_cell,
+			okE1,
+		)
+
+		// Extending left past cell 0 clamps rather than going negative --
+		// four steps left from cursor_cell=3 must stop at 0, not -1, while
+		// the anchor (still at cell 2, set above) never moves.
+		okE2 := block_extend(&doc, &t, 0, -1) // 3 -> 2
+		okE3 := block_extend(&doc, &t, 0, -1) // 2 -> 1
+		okE4 := block_extend(&doc, &t, 0, -1) // 1 -> 0
+		okE5 := block_extend(&doc, &t, 0, -1) // would be -1: clamp to 0
+		cClamp := okE2 && okE3 && okE4 && okE5 && doc.block_cursor_cell == 0 && doc.block_anchor_cell == 2
+		if !cClamp {fail = true}
+		fmt.printfln("  %-6s block_extend clamps left of cell 0: cursor_cell=%d anchor_cell=%d (want 0, 2)", "ok" if cClamp else "FAIL", doc.block_cursor_cell, doc.block_anchor_cell)
+		block_clear(&doc)
+
+		// wrap=true refuses unconditionally and changes no state -- neither
+		// activating a block nor touching the geometry fields, even on the
+		// very first (seeding) call.
+		doc.wrap = true
+		okW := block_extend(&doc, &t, 0, 1)
+		cW := !okW && !block_active(&doc) && doc.block_anchor_line == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line == 0 && doc.block_cursor_cell == 0
+		if !cW {fail = true}
+		fmt.printfln("  %-6s block_extend refuses while wrapped, no state changed: ok=%v block_active=%v", "ok" if cW else "FAIL", okW, block_active(&doc))
+		doc.wrap = false
+
+		// Clearing (task 2): Escape, Toggle_Wrap and a plain caret move must
+		// each drop a live block. These three go through command_dispatch /
+		// set_cursor rather than block.odin directly, so they need a real
+		// App (command_dispatch reads app.settings, app.docs, ...) rather
+		// than the bare `doc` used above.
+		{
+			a: App
+			dummy: plat.Window
+			app_new_scratch(&a)
+			ad := app_active(&a)
+			ad.wrap = false
+			seed_block :: proc(d: ^Document) {
+				d.block = true
+				d.block_anchor_line, d.block_anchor_cell = 1, 2
+				d.block_cursor_line, d.block_cursor_cell = 3, 4
+			}
+
+			seed_block(ad)
+			command_dispatch(.Toggle_Wrap, {}, &a, &dummy, &t, 10)
+			cTW := !block_active(ad) && ad.wrap == true
+			if !cTW {fail = true}
+			fmt.printfln("  %-6s Toggle_Wrap clears an active block: block_active=%v wrap=%v", "ok" if cTW else "FAIL", block_active(ad), ad.wrap)
+			ad.wrap = false // back off, for the tests below
+
+			seed_block(ad)
+			command_dispatch(.Clear_Selection, {}, &a, &dummy, &t, 10)
+			cCS := !block_active(ad)
+			if !cCS {fail = true}
+			fmt.printfln("  %-6s Escape (Clear_Selection) clears an active block: block_active=%v", "ok" if cCS else "FAIL", block_active(ad))
+
+			seed_block(ad)
+			command_dispatch(resolve_key(.Right, false, false, .Editor), {.Right, false, false, false}, &a, &dummy, &t, 10)
+			cArrow := !block_active(ad)
+			if !cArrow {fail = true}
+			fmt.printfln("  %-6s a plain (unshifted) arrow move clears a stale block: block_active=%v", "ok" if cArrow else "FAIL", block_active(ad))
+
+			// Full dispatch wiring: Alt+Shift+Right seeds+extends through the
+			// real keymap (resolve_key -> command_dispatch), not block_extend
+			// called directly. Bare Alt+Left (shift not held) must still do
+			// nothing -- the whole reason the action re-reads ev.shift.
+			ad.cursor, ad.anchor = 0, 0
+			rcmd := resolve_key(.Right, false, true, .Editor)
+			command_dispatch(rcmd, {.Right, false, true, true}, &a, &dummy, &t, 10) // Alt+Shift+Right
+			cDispR :=
+				block_active(ad) &&
+				ad.block_anchor_line == 0 &&
+				ad.block_anchor_cell == 0 &&
+				ad.block_cursor_line == 0 &&
+				ad.block_cursor_cell == 1
+			if !cDispR {fail = true}
+			fmt.printfln(
+				"  %-6s Alt+Shift+Right dispatch creates+extends a block: active=%v anchor=(%d,%d) cursor=(%d,%d)",
+				"ok" if cDispR else "FAIL",
+				block_active(ad),
+				ad.block_anchor_line,
+				ad.block_anchor_cell,
+				ad.block_cursor_line,
+				ad.block_cursor_cell,
+			)
+			block_clear(ad)
+			lcmd := resolve_key(.Left, false, true, .Editor)
+			command_dispatch(lcmd, {.Left, false, false, true}, &a, &dummy, &t, 10) // bare Alt+Left, no shift (Key_Event is {key,ctrl,shift,alt})
+			cBareLeft := !block_active(ad)
+			if !cBareLeft {fail = true}
+			fmt.printfln("  %-6s bare Alt+Left (no shift) still does nothing: block_active=%v", "ok" if cBareLeft else "FAIL", block_active(ad))
+
+			app_destroy(&a)
+		}
+
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
 		return true
 	}

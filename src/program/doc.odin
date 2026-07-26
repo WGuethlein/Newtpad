@@ -1460,6 +1460,17 @@ set_cursor :: proc(doc: ^Document, pos: int, select: bool) {
 	doc.cursor = pos
 	if !select {
 		doc.anchor = pos
+		// A plain (non-extending) caret move collapses a normal selection --
+		// and it must drop a live column rectangle the same way, or an
+		// unrelated arrow key (Home, a click, Ctrl+Right...) would leave a
+		// stale block behind describing a rectangle the caret has already
+		// left. block_extend never reaches this branch itself (it only ever
+		// touches the block_* fields directly, not doc.cursor/anchor), so
+		// this cannot clear a block out from under the gesture that is
+		// actively building it.
+		if block_active(doc) {
+			block_clear(doc)
+		}
 	}
 }
 

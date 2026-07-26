@@ -260,6 +260,68 @@ DOC_LINE_INDEX_CAP :: BLOCK_ROW_CAP * 64
 // resolve line_start ONCE here and then step forward row-by-row from that
 // already-resolved offset (block_row_end / a visible-row iterator), never by
 // calling this once per row.
+// Caret's own (logical line, cell) position, for seeding a fresh rectangle.
+// Reuses doc_cursor_line's cached, capped line count and the same
+// pt_line_start_cap -> line_cell_col path doc_cursor_col takes (doc.odin,
+// around line 1829) rather than hand-rolling a byte-to-cell walk here --
+// this file's own rule (the package comment above) is that every cell<->byte
+// conversion goes through one procedure, and a second walk here would be
+// exactly the Shape B bug the rule exists to prevent.
+@(private = "file")
+caret_line_cell :: proc(doc: ^Document, t: ^plat.Text) -> (line, cell: int) {
+	// doc_cursor_line is 1-based (0 only when the caret sits beyond
+	// STATUS_LINE_CAP, an unknown line); block_anchor_line/block_cursor_line
+	// are 0-based, the same convention doc_line_start_of_index's own `n`
+	// uses. max(0, ...) only bites in that beyond-cap case, where the exact
+	// line truly is unknown and 0 is the same least-wrong fallback the
+	// status bar itself falls back to.
+	line = max(0, doc_cursor_line(doc) - 1)
+	ls, exact := base.pt_line_start_cap(&doc.pt, doc.cursor, STATUS_COL_CAP)
+	cell = line_cell_col(doc, t, ls, doc.cursor) if exact else 0
+	return
+}
+
+// Seed or extend a column rectangle from the keyboard. `dline`/`dcell` are
+// the step this call adds to the rectangle's CURSOR corner only -- the
+// anchor never moves once set, exactly like a normal shift-extend leaves
+// doc.anchor alone (set_cursor, doc.odin). Returns false, changing no state
+// at all, when the document is word-wrapped: wrap turns one logical line
+// into many visual rows, so a (line, cell) rectangle stops describing
+// anything stable the instant it's toggled (see this file's package comment
+// and doc.odin's block_anchor_line field comment) -- the gesture must refuse
+// up front rather than build a rectangle whose meaning is about to change
+// under it.
+//
+// This takes no ^App and does not call app_note itself: block.odin has never
+// imported the App type (see the package comment's layering), and the one
+// caller with `app` already in scope is command_dispatch, which turns a
+// false return into the "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]" note.
+block_extend :: proc(doc: ^Document, t: ^plat.Text, dline, dcell: int) -> bool {
+	if doc.wrap {
+		return false
+	}
+	if !doc.block {
+		// No rectangle yet: seed BOTH corners at the caret's own (line,
+		// cell). This call's own delta is then applied to the cursor corner
+		// below, same as every later call once the rectangle already exists
+		// -- so the very first Alt+Shift+arrow both starts the rectangle at
+		// the caret AND moves one step, rather than requiring two presses.
+		line, cell := caret_line_cell(doc, t)
+		doc.block = true
+		doc.block_anchor_line = line
+		doc.block_anchor_cell = cell
+		doc.block_cursor_line = line
+		doc.block_cursor_cell = cell
+	}
+	// Clamp at 0 on both axes -- there is no line or cell before the start
+	// of the document to extend into, and going negative would make
+	// block_bounds' min/max normalisation paper over an already-wrong value
+	// rather than the rectangle simply stopping at the edge.
+	doc.block_cursor_line = max(0, doc.block_cursor_line + dline)
+	doc.block_cursor_cell = max(0, doc.block_cursor_cell + dcell)
+	return true
+}
+
 doc_line_start_of_index :: proc(doc: ^Document, n: int) -> (start: int, ok: bool) {
 	p := 0
 	for _ in 0 ..< n {
