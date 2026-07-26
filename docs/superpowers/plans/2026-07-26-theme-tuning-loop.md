@@ -389,7 +389,9 @@ git commit -m "Derive theme file keys from one total array over Color_Role"
 - Produces, relied on by Tasks 4 and 5:
   - `theme_active_file_path :: proc(name: string) -> (path: string, ok: bool)` — temp-allocated path of the `.theme` backing `name`; `ok=false` for `"Dark"`, `"Light"`, or when `themes_dir()` is unavailable.
   - `theme_export_target :: proc(name: string) -> string` — the theme name to export the current theme *as*: `"Dark Custom"` for `"Dark"`, `"Light Custom"` for `"Light"`, otherwise `name` unchanged. Temp-allocated or a literal.
-  - `theme_export :: proc(from_name: string) -> (target: string, path: string, ok: bool)` — writes the file if it does not exist, never overwrites; returns the target theme name and the file path. `ok=false` only when the directory or the write fails.
+  - `theme_export :: proc(from_name: string, t: Theme) -> (target: string, path: string, ok: bool)` — writes `t`'s values to the file if it does not exist, never overwrites; returns the target theme name and the file path. `ok=false` only when the directory or the write fails.
+
+**Why `t` is a parameter and not a read of `g_theme`.** Headless test modes dispatch at `main.odin:50`, before `g_theme` is assigned at `main.odin:131`, so a global read would export the zero value — all-transparent-black — under every test in this file, and the round-trip test would fail for a reason that has nothing to do with the code under test. Taking the theme explicitly also removes a hidden dependency from a procedure whose entire contract is "serialise this theme".
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -405,7 +407,7 @@ Add to `themetest`, inside the existing `else` branch that has `tdir` in scope (
 			// result is byte-identical to the first, i.e. one trip reaches a
 			// fixed point rather than drifting further on each export.
 			{
-				target, path, ok := theme_export("Dark")
+				target, path, ok := theme_export("Dark", d)
 				if !ok {
 					fmt.println("  FAIL   theme_export(\"Dark\") failed")
 					fail = true
@@ -429,13 +431,10 @@ Add to `themetest`, inside the existing `else` branch that has `tdir` in scope (
 						fmt.printfln("  %-6s export round-trip: worst channel drift %.5f (need <= 1/255)", "ok" if within else "FAIL", worst)
 
 						// Fixed point: exporting the PARSED theme must produce
-						// the identical bytes. Written under a second name so
-						// the no-overwrite rule does not block it.
+						// the identical bytes. The first file is removed so the
+						// no-overwrite rule does not block the second write.
 						os.remove(path)
-						g_saved := g_theme
-						g_theme = parsed
-						_, path2, ok2 := theme_export("Dark")
-						g_theme = g_saved
+						_, path2, ok2 := theme_export("Dark", parsed)
 						second, rerr2 := os.read_entire_file(path2, context.temp_allocator)
 						stable := ok2 && rerr2 && string(first) == string(second)
 						if !stable {fail = true}
@@ -455,7 +454,7 @@ Add to `themetest`, inside the existing `else` branch that has `tdir` in scope (
 				path := fmt.tprintf("%s%c%s.theme", tdir, '\\', target)
 				sentinel := "base dark\ncaret #010203\n"
 				_ = os.write_entire_file(path, transmute([]u8)sentinel)
-				_, got_path, ok := theme_export("Dark")
+				_, got_path, ok := theme_export("Dark", d)
 				after, _ := os.read_entire_file(path, context.temp_allocator)
 				preserved := ok && got_path == path && string(after) == sentinel
 				if !preserved {fail = true}
@@ -557,7 +556,7 @@ theme_chan_hex :: proc(c: f32) -> int {
 // calling this is reachable at any time; silently replacing it with the
 // built-in's values would destroy exactly the thing this feature exists to
 // let them make.
-theme_export :: proc(from_name: string) -> (target: string, path: string, ok: bool) {
+theme_export :: proc(from_name: string, t: Theme) -> (target: string, path: string, ok: bool) {
 	target = theme_export_target(from_name)
 	dir, dok := themes_dir_ensure()
 	if !dok {
@@ -589,7 +588,7 @@ theme_export :: proc(from_name: string) -> (target: string, path: string, ok: bo
 			fmt.sbprintf(&b, "# --- %s ---\n", sections[si].title)
 			si += 1
 		}
-		c := g_theme[role]
+		c := t[role]
 		fmt.sbprintf(
 			&b,
 			"%s #%02X%02X%02X\n",
@@ -751,7 +750,7 @@ Append to `src/program/theme.odin`:
 // the file exists, so a failed write leaves the app on the theme it was
 // already using rather than pointing at a theme file that isn't there.
 theme_edit_current :: proc(app: ^App) -> bool {
-	target, path, ok := theme_export(app.settings.theme_name)
+	target, path, ok := theme_export(app.settings.theme_name, g_theme)
 	if !ok {
 		app_note(app, "[THEME NOT SAVED - could not write to the themes folder]")
 		return false
