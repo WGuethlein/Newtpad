@@ -115,6 +115,71 @@ lex_c_odin_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token
 @(private = "file")
 lex_c_odin_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.ODIN_KW, line, candidate_end)}
 
+// Task 5: .css and .sql fold into the SAME C-family grammar as the eleven
+// languages above -- one more Keyword_Set each (base.CSS_KW/base.SQL_KW),
+// not a new lexer. See those tables' own comments (lex_c.odin) for exactly
+// what each fold gets right and the disclosed imprecisions each accepts.
+@(private = "file")
+lex_c_css_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_c(line, state_in, &base.CSS_KW, out)
+}
+@(private = "file")
+lex_c_css_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.CSS_KW, line, candidate_end)}
+
+@(private = "file")
+lex_c_sql_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_c(line, state_in, &base.SQL_KW, out)
+}
+@(private = "file")
+lex_c_sql_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.SQL_KW, line, candidate_end)}
+
+// Task 5: the delimited-values lexer (base.lex_delimited) parameterized on
+// the delimiter byte -- one tiny adapter per extension, same shape as the
+// C-family adapters above. Line-local (see base/lex_delimited.odin's
+// header), so no *_valid wrapper is needed -- these are registered
+// stateful=false below, same as lex_log/lex_json.
+@(private = "file")
+lex_delimited_csv_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_delimited(line, ',', out), .Normal
+}
+@(private = "file")
+lex_delimited_tsv_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_delimited(line, '\t', out), .Normal
+}
+
+// Task 5: base.lex_config is already line-local with the (line, out) -> n
+// shape lex_log/lex_json use -- one shared adapter for all five extensions
+// it covers (.ini .cfg .conf .env .gitignore). base.lex_yaml, by contrast,
+// already matches Lexer_Proc's shape exactly (state_in/state_out, same as
+// base.lex_xml) and needs no adapter at all -- see EXT_LEXERS below.
+@(private = "file")
+lex_config_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_config(line, out), .Normal
+}
+
+// Task 5: the shell lexer (base.lex_shell) parameterized on a per-dialect
+// base.Shell_Set -- one adapter per extension, mirroring the C-family shape
+// exactly. Only PowerShell (.ps1) carries real state (its <# #> block
+// comment); bash and batch's Shell_Set never produces anything but .Normal
+// (Shell_Set.block_comment is false for both), so they are registered
+// stateful=false below even though they share this same adapter shape.
+@(private = "file")
+lex_shell_sh_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_shell(line, state_in, &base.BASH_SH, out)
+}
+@(private = "file")
+lex_shell_bat_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_shell(line, state_in, &base.BATCH, out)
+}
+@(private = "file")
+lex_shell_ps1_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_shell(line, state_in, &base.POWERSHELL, out)
+}
+@(private = "file")
+lex_shell_ps1_valid :: proc(line: []u8, candidate_end: int) -> bool {
+	return base.lex_shell_resync_valid(&base.POWERSHELL, line, candidate_end)
+}
+
 // Extension (with leading dot, case-insensitive) -> lexer, whether that
 // lexer's state can differ line to line, the byte marker whose end position
 // is unambiguously .Normal (used to seed the bounded resync,
@@ -138,8 +203,32 @@ lex_c_odin_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.le
 // that check is sound given this grammar's Lex_State shape.
 //
 // `.log` is Task 1's entry; `.json` is Task 2's; `.xml`/`.html` are Task 3's;
-// the eleven C-family extensions are this task's. `.txt` and every other
-// extension correctly map to no lexer at all.
+// the eleven C-family extensions are Task 4's. Task 5 (this one) adds
+// markdown, delimited, config, YAML, shell, and folds .css/.sql into the
+// C-family grammar above — see task-5-report.md for the full account,
+// including two entries below whose resync_validate ALWAYS rejects rather
+// than approximating an anchor that doesn't exist for their grammar:
+//
+//   - Markdown's "```" fence marker TOGGLES state (the SAME bytes open and
+//     close it), unlike XML's "-->" or C's validated "*/" — see
+//     base.lex_markdown_resync_valid's comment.
+//   - YAML's block scalar ends based on the FOLLOWING line's indentation
+//     relative to an arbitrarily-distant key, which Resync_Validate_Proc's
+//     one-line signature cannot express at all — see
+//     base.lex_yaml_resync_valid's comment.
+//
+// Both are still registered stateful=true (so the small-file background
+// index, which never consults resync_anchor, stays exactly correct); only
+// a huge/mapped file of either kind always cap-hits to .Normal on resync,
+// rather than merely when a construct outgrows the window the way every
+// other stateful entry's documented failure mode works. `.txt`, `.py`, and
+// every other extension not listed below correctly map to no lexer at all
+// — `.py` is a genuine gap this task's own coverage test (highlighttest's
+// sibling, see the extension-coverage check) caught: the design doc's
+// "34 extensions" count already included it, but no lexer was ever
+// assigned to it. Left deliberately plain rather than force-fit into an
+// existing grammar that doesn't actually match Python — see
+// task-5-report.md.
 @(private = "file")
 EXT_LEXERS := [?]struct {
 	ext:             string,
@@ -163,6 +252,23 @@ EXT_LEXERS := [?]struct {
 	{".go", lex_c_go_adapt, true, "*/", lex_c_go_valid},
 	{".rs", lex_c_rust_adapt, true, "*/", lex_c_rust_valid},
 	{".odin", lex_c_odin_adapt, true, "*/", lex_c_odin_valid},
+	{".css", lex_c_css_adapt, true, "*/", lex_c_css_valid},
+	{".sql", lex_c_sql_adapt, true, "*/", lex_c_sql_valid},
+	{".md", base.lex_markdown, true, "```", base.lex_markdown_resync_valid},
+	{".markdown", base.lex_markdown, true, "```", base.lex_markdown_resync_valid},
+	{".csv", lex_delimited_csv_adapt, false, "", nil},
+	{".tsv", lex_delimited_tsv_adapt, false, "", nil},
+	{".ini", lex_config_adapt, false, "", nil},
+	{".cfg", lex_config_adapt, false, "", nil},
+	{".conf", lex_config_adapt, false, "", nil},
+	{".env", lex_config_adapt, false, "", nil},
+	{".gitignore", lex_config_adapt, false, "", nil},
+	{".toml", lex_config_adapt, false, "", nil},
+	{".yaml", base.lex_yaml, true, "\n", base.lex_yaml_resync_valid},
+	{".yml", base.lex_yaml, true, "\n", base.lex_yaml_resync_valid},
+	{".sh", lex_shell_sh_adapt, false, "", nil},
+	{".bat", lex_shell_bat_adapt, false, "", nil},
+	{".ps1", lex_shell_ps1_adapt, true, "#>", lex_shell_ps1_valid},
 }
 
 // A stateful entry with no resync_anchor is an undetectable bail: doc_draw's
@@ -182,6 +288,31 @@ ext_lexers_check :: proc "contextless" () {
 		}
 	}
 }
+
+// The complete, EXPLICIT list of extensions in text_exts.txt that
+// deliberately have no lexer at all — Task 5's Step 4, made a hand-maintained
+// list rather than "whatever EXT_LEXERS doesn't happen to mention":
+//
+//   - .txt has no grammar to find (design doc: "`.txt` stays plain,
+//     correctly"). Never expected to gain a lexer.
+//   - .py is a REAL GAP this task's own coverage test (lexcoveragetest,
+//     test_modes.odin) caught rather than shipped silently: the design doc's
+//     "34 extensions" count already included .py, but no lexer was ever
+//     assigned to it in any of this batch's four tasks. None of this
+//     batch's seven lexers are an honest fit for Python's actual grammar
+//     (significant indentation, `#` comments, triple-quoted multi-line
+//     strings) — forcing it through, say, the shell lexer's `#`-comment
+//     handling would get comments right and nothing else, which is exactly
+//     the "half-works" outcome CLAUDE.md and this batch's own briefs warn
+//     against. Left plain rather than guessed at; a real Python lexer is a
+//     follow-up task's to build deliberately, not this one's to improvise.
+//
+// lexcoveragetest asserts every extension in the ACTUAL text_exts.txt
+// resolves to either a real lexer (highlight_lexer_for returns non-nil) or
+// an entry in this exact list — so adding a ninth extension to
+// text_exts.txt without either giving it a lexer or adding it here fails a
+// test instead of being noticed on screen.
+DELIBERATELY_PLAIN_EXTS := []string{".txt", ".py"}
 
 // The lexer for a document's path (nil when the extension has none yet, or
 // never will, like .txt), whether it carries state across lines, and — when

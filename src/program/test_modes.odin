@@ -5366,6 +5366,51 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad lexcoveragetest` is Task 5's Step 4: assert over the ACTUAL
+	// text_exts.txt (via text_exts_list(), links.odin — the same embedded
+	// copy the app itself uses, not a hand-typed duplicate that could drift)
+	// that every extension resolves to either a real lexer or an entry in
+	// DELIBERATELY_PLAIN_EXTS (highlight.odin). This is the check that
+	// outlives this task: adding a 35th extension to text_exts.txt without
+	// giving it a lexer OR adding it to the plain list fails HERE, on the
+	// next run of this mode, rather than being noticed by Wyatt on screen
+	// months later. It is also what caught .py — already present in
+	// text_exts.txt, matching the design doc's own "34 extensions" count,
+	// but never assigned a lexer by any of this batch's four tasks — before
+	// this task shipped, not after.
+	if os.args[1] == "lexcoveragetest" {
+		fmt.println("lexcoveragetest:")
+		fail := false
+		seen := 0
+		// Reads the SAME text_exts.txt links.odin embeds (one source of
+		// truth, per that file's own comment) rather than importing
+		// text_exts_list itself, which is file-private to links.odin —
+		// this is a second reader of the same underlying data, not a second
+		// hand-maintained copy of it.
+		raw := #load("../../text_exts.txt", string)
+		for ln in strings.split_lines_iterator(&raw) {
+			ext := strings.trim_space(ln)
+			if len(ext) == 0 {continue}
+			seen += 1
+			lexer, _, _, _ := highlight_lexer_for(ext) // ext already starts with '.', a valid "path" for the extension-matching logic
+			has_lexer := lexer != nil
+			is_plain := false
+			for p in DELIBERATELY_PLAIN_EXTS {
+				if strings.equal_fold(p, ext) {
+					is_plain = true
+					break
+				}
+			}
+			ok := has_lexer != is_plain // exactly one of the two must hold
+			if !ok {fail = true}
+			status := "lexer" if has_lexer else ("plain" if is_plain else "NEITHER")
+			fmt.printfln("  %-6s %-12s -> %s", "ok" if ok else "FAIL", ext, status)
+		}
+		fmt.printfln("  examined %d extensions from text_exts.txt", seen)
+		fmt.println("lexcoveragetest: FAILURES" if fail else "lexcoveragetest: all ok")
+		return true
+	}
+
 	if len(os.args) < 3 {return false}
 	path, mode := os.args[1], os.args[2]
 
