@@ -128,3 +128,261 @@ test_lex_log_stops_at_capacity :: proc(t: ^testing.T) {
 	warn_start := strings.index(line, "WARN")
 	tok_eq(t, out[1], warn_start, len("WARN"), .Keyword, "second level word")
 }
+
+// ---------------------------------------------------------------------------
+// lex_json
+//
+// Written before lex_json's real implementation (see lex_json.odin's header)
+// -- run against a stub (always returns 0) first and watch every non-empty
+// case fail, then again after the implementation lands and watch them all
+// pass. See task-2-report.md for both runs' output.
+
+// A string immediately followed by ':' (no whitespace) is a Json_Key, not a
+// String -- the one distinction that makes JSON highlighting worth having
+// over generic string colouring.
+@(test)
+test_lex_json_key_vs_value :: proc(t: ^testing.T) {
+	line := `{"name": "Alice"}`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 5, "want 5 tokens, got %d", n)
+	if n != 5 {return}
+	tok_eq(t, out[0], 0, 1, .Punct, "{")
+	name_start := strings.index(line, `"name"`)
+	tok_eq(t, out[1], name_start, len(`"name"`), .Json_Key, "\"name\" is a key")
+	colon_start := strings.index(line, ":")
+	tok_eq(t, out[2], colon_start, 1, .Punct, ":")
+	val_start := strings.index(line, `"Alice"`)
+	tok_eq(t, out[3], val_start, len(`"Alice"`), .String, "\"Alice\" is a value")
+	tok_eq(t, out[4], len(line) - 1, 1, .Punct, "}")
+}
+
+// The ':' need not be adjacent to the closing quote -- whitespace between a
+// key's string and its colon must not turn the key into a plain String.
+@(test)
+test_lex_json_key_with_whitespace_before_colon :: proc(t: ^testing.T) {
+	line := `{"name"   : "Alice"}`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 5, "want 5 tokens, got %d", n)
+	if n != 5 {return}
+	name_start := strings.index(line, `"name"`)
+	tok_eq(t, out[1], name_start, len(`"name"`), .Json_Key, "\"name\" is still a key across whitespace")
+}
+
+// A colon appearing *inside* a string's contents must not make that string
+// look like a key -- only a ':' found after the closing quote counts.
+@(test)
+test_lex_json_string_value_containing_colon :: proc(t: ^testing.T) {
+	line := `{"a": "x:y"}`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 5, "want 5 tokens, got %d", n)
+	if n != 5 {return}
+	val_start := strings.index(line, `"x:y"`)
+	tok_eq(t, out[3], val_start, len(`"x:y"`), .String, "\"x:y\" is a value despite its internal ':'")
+}
+
+// Negative integer.
+@(test)
+test_lex_json_number_negative :: proc(t: ^testing.T) {
+	line := `[-3]`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 3, "want 3 tokens, got %d", n)
+	if n != 3 {return}
+	tok_eq(t, out[1], 1, 2, .Number, "-3")
+}
+
+// Fractional number, no exponent.
+@(test)
+test_lex_json_number_fraction :: proc(t: ^testing.T) {
+	line := `[0.5]`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 3, "want 3 tokens, got %d", n)
+	if n != 3 {return}
+	tok_eq(t, out[1], 1, 3, .Number, "0.5")
+}
+
+// Exponent with an explicit sign.
+@(test)
+test_lex_json_number_exponent_signed :: proc(t: ^testing.T) {
+	line := `[3.14e-2]`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 3, "want 3 tokens, got %d", n)
+	if n != 3 {return}
+	tok_eq(t, out[1], 1, 7, .Number, "3.14e-2")
+}
+
+// Exponent with no sign.
+@(test)
+test_lex_json_number_exponent_unsigned :: proc(t: ^testing.T) {
+	line := `[1e10]`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 3, "want 3 tokens, got %d", n)
+	if n != 3 {return}
+	tok_eq(t, out[1], 1, 4, .Number, "1e10")
+}
+
+// Malformed: a leading '.' with no integer part is invalid JSON, but it is
+// plausibly a number and must be coloured as one, not refused.
+@(test)
+test_lex_json_number_malformed_leading_dot :: proc(t: ^testing.T) {
+	line := `.5`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 1, "want 1 token, got %d", n)
+	if n != 1 {return}
+	tok_eq(t, out[0], 0, 2, .Number, ".5")
+}
+
+// Malformed: an exponent marker with no digits after it must not be
+// consumed -- "1e" colours "1" and leaves the bare "e" unlexed, rather than
+// running past the line or refusing the leading digit too.
+@(test)
+test_lex_json_number_malformed_dangling_exponent :: proc(t: ^testing.T) {
+	line := `1e`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 1, "want 1 token, got %d", n)
+	if n != 1 {return}
+	tok_eq(t, out[0], 0, 1, .Number, "1")
+}
+
+// Malformed: a run of dashes with a digit only at the end. The first '-' is
+// not a number (nothing plausible follows it) and is skipped; the second
+// '-' starts a genuine "-3".
+@(test)
+test_lex_json_number_malformed_double_dash :: proc(t: ^testing.T) {
+	line := `--3`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 1, "want 1 token, got %d", n)
+	if n != 1 {return}
+	tok_eq(t, out[0], 1, 2, .Number, "-3")
+}
+
+// Malformed: a hex-looking literal. JSON has no hex numbers, so this
+// colours the two plausible decimal runs either side of the 'x' and skips
+// the 'x' itself -- not a single wrong token spanning "0x10", not a crash.
+@(test)
+test_lex_json_number_malformed_hex_prefix :: proc(t: ^testing.T) {
+	line := `0x10`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 2, "want 2 tokens, got %d", n)
+	if n != 2 {return}
+	tok_eq(t, out[0], 0, 1, .Number, "0")
+	tok_eq(t, out[1], 2, 2, .Number, "10")
+}
+
+// true/false/null are Keyword; nothing else is.
+@(test)
+test_lex_json_keywords :: proc(t: ^testing.T) {
+	line := `[true, false, null]`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 7, "want 7 tokens, got %d", n)
+	if n != 7 {return}
+	true_start := strings.index(line, "true")
+	tok_eq(t, out[1], true_start, len("true"), .Keyword, "true")
+	false_start := strings.index(line, "false")
+	tok_eq(t, out[3], false_start, len("false"), .Keyword, "false")
+	null_start := strings.index(line, "null")
+	tok_eq(t, out[5], null_start, len("null"), .Keyword, "null")
+}
+
+// Structural characters are Punct and nothing more.
+@(test)
+test_lex_json_structural_punct :: proc(t: ^testing.T) {
+	line := `{}[],:`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 6, "want 6 tokens, got %d", n)
+	if n != 6 {return}
+	for i in 0 ..< 6 {
+		tok_eq(t, out[i], i, 1, .Punct, "structural char")
+	}
+}
+
+// An escaped quote inside a string must not end it early.
+@(test)
+test_lex_json_string_escaped_quote :: proc(t: ^testing.T) {
+	line := `"a\"b"`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 1, "want 1 token, got %d", n)
+	if n != 1 {return}
+	tok_eq(t, out[0], 0, len(line), .String, `"a\"b" as one token`)
+}
+
+// Unlike lex_log's unterminated quote (0 tokens -- no match), a JSON
+// unterminated string colours to the line's end: "the lexer colours, it
+// does not validate" (task-2 brief), and an unterminated string is exactly
+// when you're staring at broken JSON and most want the colour.
+@(test)
+test_lex_json_unterminated_string :: proc(t: ^testing.T) {
+	line := `"abc`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 1, "want 1 token, got %d", n)
+	if n != 1 {return}
+	tok_eq(t, out[0], 0, len(line), .String, "unterminated string runs to line end")
+}
+
+// A malformed fixture -- an unbalanced opening brace -- must not crash or
+// hang, and the lone '{' is just a Punct.
+@(test)
+test_lex_json_unbalanced_brace :: proc(t: ^testing.T) {
+	line := `{"a": 1`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 4, "want 4 tokens, got %d", n)
+	if n != 4 {return}
+	tok_eq(t, out[0], 0, 1, .Punct, "{")
+	a_start := strings.index(line, `"a"`)
+	tok_eq(t, out[1], a_start, len(`"a"`), .Json_Key, "\"a\" is a key")
+	colon_start := strings.index(line, ":")
+	tok_eq(t, out[2], colon_start, 1, .Punct, ":")
+	tok_eq(t, out[3], len(line) - 1, 1, .Number, "1")
+}
+
+// Empty input: no tokens, no crash.
+@(test)
+test_lex_json_empty :: proc(t: ^testing.T) {
+	out: [8]Token
+	n := lex_json(nil, out[:])
+	testing.expectf(t, n == 0, "want 0 tokens on empty line, got %d", n)
+}
+
+// A line producing more matches than `out` can hold must stop at capacity.
+@(test)
+test_lex_json_stops_at_capacity :: proc(t: ^testing.T) {
+	line := `[1,2,3,4,5]`
+	bytes := transmute([]u8)line
+	out: [2]Token
+	n := lex_json(bytes, out[:])
+	testing.expectf(t, n == 2, "want exactly 2 tokens (out's capacity), got %d", n)
+	if n != 2 {return}
+	tok_eq(t, out[0], 0, 1, .Punct, "[")
+	tok_eq(t, out[1], 1, 1, .Number, "1")
+}

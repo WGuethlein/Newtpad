@@ -19,15 +19,15 @@ import plat "src:platform"
 
 Lexer_Proc :: proc(line: []u8, out: []base.Token) -> int
 
-// Extension (with leading dot, case-insensitive) -> lexer. `.log` is the only
-// entry Task 1 adds; `.txt` and every other extension correctly map to no
-// lexer at all — `.txt` has no grammar to find, and everything else is a
-// later task's lexer landing in this same table.
+// Extension (with leading dot, case-insensitive) -> lexer. `.log` is Task
+// 1's entry; `.json` is Task 2's. `.txt` and every other extension correctly
+// map to no lexer at all — `.txt` has no grammar to find, and everything
+// else is a later task's lexer landing in this same table.
 @(private = "file")
 EXT_LEXERS := [?]struct {
 	ext:   string,
 	lexer: Lexer_Proc,
-}{{".log", base.lex_log}}
+}{{".log", base.lex_log}, {".json", base.lex_json}}
 
 // The lexer for a document's path, or nil when the extension has none yet
 // (or never will, like .txt).
