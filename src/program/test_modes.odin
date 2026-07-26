@@ -3117,10 +3117,15 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			// same theme within the 8-bit limit of #rrggbb. The theme is
 			// [4]f32 and the file format is 8 bits per channel, so an exact
 			// round-trip is impossible by construction -- 0.10 * 255 = 25.5.
-			// Two properties make that safe instead of merely lossy: every
-			// channel lands within 1/255, and a second export of the parsed
-			// result is byte-identical to the first, i.e. one trip reaches a
-			// fixed point rather than drifting further on each export.
+			// Two properties matter here, and they guard different things.
+			// theme_chan_hex rounds to nearest, so a channel's drift is bounded
+			// by half a step (0.5/255): this is the check that actually
+			// distinguishes rounding from truncation -- truncation can drift up
+			// to just under 1/255, which would slip under a 1/255 bound but not
+			// under 0.5/255. The second property, a fixed point after one
+			// round-trip, does NOT distinguish them: truncation is idempotent
+			// too, so it is also a fixed point after one trip. That check
+			// guards a different, real property -- see the comment below.
 			{
 				target, path, ok := theme_export("Dark", d)
 				if !ok {
@@ -3141,13 +3146,24 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 								if dch > worst {worst = dch}
 							}
 						}
-						within := worst <= (1.0 / 255.0) + 0.0001
+						// theme_chan_hex rounds to nearest, so a correct implementation
+						// bounds every channel's drift at half a step (0.5/255). This is
+						// the bound that separates rounding from truncation: truncation
+						// drifts up to just under 1/255, which is caught here even though
+						// it slips past a looser 1/255 bound. If theme_chan_hex reverts to
+						// truncation, this assertion -- not the fixed-point check below --
+						// is the one that fails.
+						within := worst <= (1.0 / 510.0) + 0.0001
 						if !within {fail = true}
-						fmt.printfln("  %-6s export round-trip: worst channel drift %.5f (need <= 1/255)", "ok" if within else "FAIL", worst)
+						fmt.printfln("  %-6s export round-trip: worst channel drift %.5f (need <= 0.5/255)", "ok" if within else "FAIL", worst)
 
-						// Fixed point: exporting the PARSED theme must produce
-						// the identical bytes. The first file is removed so the
-						// no-overwrite rule does not block the second write.
+						// Fixed point: exporting the PARSED theme must produce the
+						// identical bytes -- exporting does not drift further on each
+						// pass. This does NOT catch a reversion to truncation: truncation
+						// is also idempotent after one trip through 8-bit quantization,
+						// so it is a fixed point too. That regression is caught by the
+						// drift bound above, not this check. The first file is removed so
+						// the no-overwrite rule does not block the second write.
 						os.remove(path)
 						_, path2, ok2 := theme_export("Dark", parsed)
 						second, rerr2 := os.read_entire_file(path2, context.temp_allocator)
