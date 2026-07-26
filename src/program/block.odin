@@ -28,6 +28,7 @@
 // block_row_range's ok=false is that refusal.
 package main
 
+import "core:strings"
 import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
@@ -588,4 +589,142 @@ block_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, ro
 		n += 1
 	}
 	return n
+}
+
+// --- Task 5: copy and cut ---
+
+// Rows a rectangle's copy or cut may walk before refusing the whole
+// operation rather than build an unbounded result on the main thread.
+// block_row_range and block_step_lines already bound the cost of ONE row and
+// ONE vertical step; this bounds how many of them a single Copy/Cut may add
+// up, the same way BLOCK_ROW_CAP and BLOCK_LINE_STEP_CAP bound the other two
+// axes. Task 6 uses the same constant for its own edit for the identical
+// reason: whatever one rectangle-wide operation can afford, they all can.
+BLOCK_EDIT_MAX_LINES :: 10_000
+
+// The rectangle's rows as text, one line per spanned row, joined with the
+// document's OWN line ending -- never a hard-coded '\n'. doc_insert_newline
+// (doc.odin) writes doc.eol's own bytes for Enter for the identical reason: a
+// CRLF file that ever picks up a bare '\n' mixes line endings for good, and
+// that exact corruption shape has already shipped once here as a save-path
+// bug. Copying rows out of a CRLF file and pasting them back must not
+// reintroduce it one layer up.
+//
+// A row too short to reach cell_lo still contributes a line -- empty, not
+// skipped -- so the rectangle's SHAPE survives the round trip: N spanned rows
+// always produce N lines. This is deliberately the OPPOSITE of what
+// block_selection_rects does with such a row (skips it -- nothing to paint);
+// the draw and the copy have different jobs even though both call
+// block_row_range for the same row, because only the copy has to hand back
+// something a paste can reconstruct the rectangle's height from.
+//
+// Refuses (ok=false, "" text) rather than answer with a partial rectangle:
+//
+//   - any spanned row's own block_row_range refuses. A bounded scan that
+//     could not resolve a row is not a fact this proc can hand to the
+//     clipboard -- the project's rule is refuse, not guess, and a confident
+//     wrong answer from a truncated scan is the shape that has shipped seven
+//     times in this codebase already.
+//   - the rectangle spans more than BLOCK_EDIT_MAX_LINES rows. Building an
+//     unbounded string on the main thread is the same freeze class task 4
+//     fixed for the draw (48ms/frame at line 28,000 of an ordinary log,
+//     every frame of a live drag); the copy must not reintroduce it one
+//     layer up just because it runs once per keypress instead of once per
+//     frame -- a rectangle CAN span the whole file.
+block_text :: proc(doc: ^Document, t: ^plat.Text, allocator := context.temp_allocator) -> (string, bool) {
+	if !block_active(doc) {return "", false}
+	off_lo, off_hi, cell_lo, cell_hi := block_bounds(doc)
+	eol := "\r\n" if doc.eol == .CRLF else "\n"
+
+	b := strings.builder_make(allocator)
+	line_start := off_lo
+	rows := 0
+	for {
+		rows += 1
+		if rows > BLOCK_EDIT_MAX_LINES {return "", false}
+
+		byte_lo, byte_hi, _, ok := block_row_range(doc, t, line_start, cell_lo, cell_hi)
+		if !ok {return "", false}
+
+		if rows > 1 {strings.write_string(&b, eol)}
+		if byte_hi > byte_lo {
+			buf := make([]u8, byte_hi - byte_lo, context.temp_allocator)
+			base.pt_read(&doc.pt, byte_lo, buf)
+			strings.write_string(&b, string(buf))
+		}
+
+		if line_start >= off_hi {break}
+		next, step_ok := block_step_lines(doc, line_start, 1)
+		if !step_ok {return "", false}
+		line_start = next
+	}
+	return strings.to_string(b), true
+}
+
+// Delete the rectangle's own cell range on every row it spans, as ONE undo
+// step, then collapse the block to a caret at the vanished rectangle's own
+// top-left corner. This is `.Cut`'s other half (commands.odin) -- block_text
+// supplies the clipboard text, this supplies the delete -- kept as two
+// procs, called in that order, so a copy block_text itself refused (ok=false)
+// never reaches this proc at all: the caller checks block_text's own result
+// first and skips the delete entirely on refusal, exactly like every other
+// refusal in this file changes no state.
+//
+// Row starts are collected FIRST via block_step_lines alone (cheap: no cell
+// walk) and every one of them is validated through block_row_range BEFORE a
+// single byte is deleted -- the same two refusals block_text checks, run
+// again here because this proc never sees what block_text built and cannot
+// assume nothing changed between the two calls without checking. Refusing
+// outright, with nothing deleted, is the only safe answer to a row that
+// cannot be resolved: a half-deleted rectangle would be worse than a refused
+// copy, because there would be no surviving text to paste back over the gap.
+//
+// Deletion itself is applied HIGHEST OFFSET FIRST, the identical rule
+// find_replace_all (find.odin) applies to Replace All: deleting a row shifts
+// every byte offset AFTER it and never one before it, so processing top-down
+// would invalidate every row still to come. Bottom-up, each row's own
+// line_start is still a fact about the buffer when its turn arrives, because
+// nothing touched so far has deleted anything before it. The LAST row
+// deleted is the rectangle's own top row (off_lo), so doc_replace_sel's own
+// cursor placement (del_sel_raw sets cursor = the deleted range's start)
+// leaves the caret exactly where a Cut should: the top-left corner of what
+// just disappeared.
+block_cut_delete :: proc(doc: ^Document, t: ^plat.Text) -> bool {
+	if !block_active(doc) {return false}
+	off_lo, off_hi, cell_lo, cell_hi := block_bounds(doc)
+
+	starts := make([dynamic]int, 0, 64, context.temp_allocator)
+	line_start := off_lo
+	for {
+		if len(starts) >= BLOCK_EDIT_MAX_LINES {return false}
+		append(&starts, line_start)
+		if line_start >= off_hi {break}
+		next, step_ok := block_step_lines(doc, line_start, 1)
+		if !step_ok {return false}
+		line_start = next
+	}
+
+	for ls in starts {
+		_, _, _, ok := block_row_range(doc, t, ls, cell_lo, cell_hi)
+		if !ok {return false}
+	}
+
+	doc_batch_begin(doc, .Delete)
+	for i := len(starts) - 1; i >= 0; i -= 1 {
+		byte_lo, byte_hi, _, ok := block_row_range(doc, t, starts[i], cell_lo, cell_hi)
+		if !ok {
+			// Unreachable -- every row was validated above and nothing at a
+			// LOWER offset than starts[i] has been touched yet -- but never
+			// delete from a range this call cannot vouch for, even here.
+			continue
+		}
+		if byte_hi > byte_lo {
+			doc.anchor = byte_lo
+			doc.cursor = byte_hi
+			doc_replace_sel(doc, nil)
+		}
+	}
+	doc_batch_end(doc, len(starts))
+	block_clear(doc)
+	return true
 }

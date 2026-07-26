@@ -2578,6 +2578,144 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			fmt.printfln("  %-6s a long line's continuation rows are not rows of the rectangle: n=%d (want 3, not 4)", "ok" if cJ else "FAIL", nJ)
 		}
 
+		// Task 5: block_text (copy) and block_cut_delete (cut).
+
+		// K: rows join with the document's OWN line ending -- CRLF here. Three
+		// 3-cell ASCII rows, rectangle over the whole width of all three, so
+		// the ONLY thing under test is the separator between them. Sabotage:
+		// hardcode '\n' in block_text and this must FAIL (it would read
+		// "abc\ndef\nghi" instead).
+		crdoc := doc_from_content(transmute([]u8)strings.clone("abc\r\ndef\r\nghi\r\n"), "", .UTF8)
+		defer doc_close(&crdoc)
+		crdoc.wrap = false
+		crdoc.eol = .CRLF
+		crdoc.block = true
+		crdoc.block_anchor_line_start, crdoc.block_anchor_cell = 0, 0
+		crdoc.block_cursor_line_start, crdoc.block_cursor_cell = 10, 3 // line 2 ("ghi") starts at byte 10
+		crtxt, crok := block_text(&crdoc, &t)
+		cCR := crok && crtxt == "abc\r\ndef\r\nghi"
+		if !cCR {fail = true}
+		fmt.printfln("  %-6s block_text joins rows with doc.eol=CRLF: %q ok=%v (want %q)", "ok" if cCR else "FAIL", crtxt, crok, "abc\\r\\ndef\\r\\nghi")
+		block_clear(&crdoc)
+
+		// L: the LF counterpart of K, same shape, doc.eol=.LF (the default).
+		// Tested separately per the brief: a version that always emitted "\r\n"
+		// would pass K and fail only here.
+		lfdoc := doc_from_content(transmute([]u8)strings.clone("abc\ndef\nghi\n"), "", .UTF8)
+		defer doc_close(&lfdoc)
+		lfdoc.wrap = false
+		lfdoc.block = true
+		lfdoc.block_anchor_line_start, lfdoc.block_anchor_cell = 0, 0
+		lfdoc.block_cursor_line_start, lfdoc.block_cursor_cell = 8, 3 // line 2 ("ghi") starts at byte 8
+		lftxt, lfok := block_text(&lfdoc, &t)
+		cLF := lfok && lftxt == "abc\ndef\nghi"
+		if !cLF {fail = true}
+		fmt.printfln("  %-6s block_text joins rows with doc.eol=LF: %q ok=%v (want %q)", "ok" if cLF else "FAIL", lftxt, lfok, "abc\\ndef\\nghi")
+		block_clear(&lfdoc)
+
+		// M: requirement 2 -- a row too short to reach cell_lo contributes an
+		// EMPTY line, not a skipped one, so the rectangle's row count survives
+		// the round trip. Reuses `doc`'s CJK line (ls2, reaches cells [8,10) as
+		// " o") and "short" line (ls3, 5 cells, does not reach cell 8 at all).
+		// Sabotage: `continue` past a row with pad_cells>0 instead of still
+		// writing it (empty) -- this must FAIL (result would be " o" with no
+		// trailing separator, one line short of what a 2-row rectangle owes).
+		doc.block = true
+		doc.block_anchor_line_start, doc.block_anchor_cell = ls2, 8
+		doc.block_cursor_line_start, doc.block_cursor_cell = ls3, 10
+		mtxt, mok := block_text(&doc, &t)
+		cM := mok && mtxt == " o\n"
+		if !cM {fail = true}
+		fmt.printfln("  %-6s a too-short row contributes an EMPTY line, not a skipped one: %q ok=%v (want %q)", "ok" if cM else "FAIL", mtxt, mok, " o\\n")
+		block_clear(&doc)
+
+		// N: block_text refuses (ok=false, "" text) when a spanned row's own
+		// block_row_range refuses -- the same long-row/cell_hi-past-cap fixture
+		// as block_row_range's own refusal test above. A partial rectangle must
+		// never reach the clipboard.
+		nbuf := make([]u8, BLOCK_ROW_CAP + 500)
+		for i in 0 ..< len(nbuf) {nbuf[i] = 'x'}
+		ndoc := doc_from_content(nbuf, "", .UTF8)
+		defer doc_close(&ndoc)
+		ndoc.wrap = false
+		ndoc.block = true
+		ndoc.block_anchor_line_start, ndoc.block_anchor_cell = 0, BLOCK_ROW_CAP - 2
+		ndoc.block_cursor_line_start, ndoc.block_cursor_cell = 0, BLOCK_ROW_CAP + 50
+		ntxt, nok := block_text(&ndoc, &t)
+		cN := !nok && ntxt == ""
+		if !cN {fail = true}
+		fmt.printfln("  %-6s block_text refuses when a row's own block_row_range refuses: ok=%v text=%q (want ok=false, \"\")", "ok" if cN else "FAIL", nok, ntxt)
+		block_clear(&ndoc)
+
+		// O: block_text refuses a rectangle spanning more than
+		// BLOCK_EDIT_MAX_LINES rows, rather than build the whole string and
+		// throw it away -- this is the cap that keeps a Ctrl+C on a
+		// rectangle spanning an entire huge file off the main thread. Rows are
+		// trivial ("a\n", 2 bytes) so any refusal here is the ROW-COUNT cap,
+		// not a per-row block_row_range refusal -- isolates the one from the
+		// other.
+		big_rows := BLOCK_EDIT_MAX_LINES + 5
+		obuf := make([]u8, big_rows * 2)
+		for i in 0 ..< big_rows {obuf[i * 2] = 'a'; obuf[i * 2 + 1] = '\n'}
+		odoc := doc_from_content(obuf, "", .UTF8)
+		defer doc_close(&odoc)
+		odoc.wrap = false
+		odoc.block = true
+		odoc.block_anchor_line_start, odoc.block_anchor_cell = 0, 0
+		odoc.block_cursor_line_start, odoc.block_cursor_cell = (big_rows - 1) * 2, 1
+		ostart := time.now()
+		otxt, ook := block_text(&odoc, &t)
+		oms := time.duration_milliseconds(time.since(ostart))
+		cO := !ook && otxt == "" && oms < 50
+		if !cO {fail = true}
+		fmt.printfln("  %-6s block_text refuses past BLOCK_EDIT_MAX_LINES rows without building the whole string: ok=%v text=%q elapsed=%.2fms (want ok=false, \"\", <50ms)", "ok" if cO else "FAIL", ook, otxt, oms)
+		block_clear(&odoc)
+
+		// P: block_cut_delete -- the other half of `.Cut`. Three 4-cell ASCII
+		// rows, rectangle over cells [1,3) (the middle two of each), so cutting
+		// leaves "aa"/"bb"/"cc" on every row. Checked, in order:
+		//   - block_text (the clipboard text) matches what actually gets cut.
+		//   - the buffer afterward has exactly that rectangle removed from
+		//     every row -- not zero rows, not a subset.
+		//   - the whole cut is ONE undo entry (batched), not one per row --
+		//     doc_undo restores the original in a single call.
+		//   - the block is cleared afterward, and the caret lands at the
+		//     vanished rectangle's own top-left corner (byte 1, row 0's own
+		//     cell 1).
+		pdoc := doc_from_content(transmute([]u8)strings.clone("aaaa\nbbbb\ncccc\n"), "", .UTF8)
+		defer doc_close(&pdoc)
+		pdoc.wrap = false
+		pls0, _, pls2 := 0, 5, 10 // row starts: "aaaa\n"=5B, "bbbb\n"=5B, so rows at 0, 5, 10
+		pdoc.block = true
+		pdoc.block_anchor_line_start, pdoc.block_anchor_cell = pls0, 1
+		pdoc.block_cursor_line_start, pdoc.block_cursor_cell = pls2, 3
+		ptxt, ptok := block_text(&pdoc, &t)
+		cPtxt := ptok && ptxt == "aa\nbb\ncc"
+		if !cPtxt {fail = true}
+		fmt.printfln("  %-6s block_cut_delete fixture: block_text matches what will be cut: %q ok=%v (want %q)", "ok" if cPtxt else "FAIL", ptxt, ptok, "aa\\nbb\\ncc")
+
+		undo_before := len(pdoc.undo)
+		pcut := block_cut_delete(&pdoc, &t)
+		after := doc_debug_string(&pdoc)
+		cCut := pcut && after == "aa\nbb\ncc\n" && len(pdoc.undo) == undo_before + 1 && !block_active(&pdoc) && pdoc.cursor == 1 && pdoc.anchor == 1
+		if !cCut {fail = true}
+		fmt.printfln(
+			"  %-6s block_cut_delete removes the rectangle from every row in ONE undo step, clears the block, carets top-left: ok=%v content=%q undo=%d (want +1) block_active=%v cursor=%d anchor=%d (want 1,1)",
+			"ok" if cCut else "FAIL",
+			pcut,
+			after,
+			len(pdoc.undo),
+			block_active(&pdoc),
+			pdoc.cursor,
+			pdoc.anchor,
+		)
+
+		doc_undo(&pdoc)
+		restored := doc_debug_string(&pdoc)
+		cUndoOne := restored == "aaaa\nbbbb\ncccc\n"
+		if !cUndoOne {fail = true}
+		fmt.printfln("  %-6s a single Ctrl+Z restores all three rows at once: %q (want %q)", "ok" if cUndoOne else "FAIL", restored, "aaaa\\nbbbb\\ncccc\\n")
+
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
 		return true
 	}

@@ -634,11 +634,34 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Select_All:
 		doc_select_all(doc)
 	case .Copy:
-		if s := doc_selected_text(doc, context.temp_allocator); s != "" {
+		// A live rectangle takes priority over the linear selection: the two
+		// are mutually exclusive in practice, but block_active is the flag
+		// that means "the user is column-selecting", the same predicate
+		// block_selection_rects uses to pick between the two draws.
+		if block_active(doc) {
+			if s, ok := block_text(doc, t); ok {
+				if s != "" {plat.clipboard_set_text(w.hwnd, s)}
+			} else {
+				// Refuse rather than put a partial rectangle on the
+				// clipboard while reporting success -- either a row could
+				// not be resolved, or the rectangle spans more than
+				// BLOCK_EDIT_MAX_LINES rows (block_text, block.odin).
+				app_note(app, "[COLUMN COPY REFUSED - a row could not be read, or the rectangle spans more than 10000 rows]")
+			}
+		} else if s := doc_selected_text(doc, context.temp_allocator); s != "" {
 			plat.clipboard_set_text(w.hwnd, s)
 		}
 	case .Cut:
-		if s := doc_selected_text(doc, context.temp_allocator); s != "" {
+		if block_active(doc) {
+			if s, ok := block_text(doc, t); ok {
+				if s != "" {
+					plat.clipboard_set_text(w.hwnd, s)
+					block_cut_delete(doc, t) // one undo step, bottom-up (block.odin)
+				}
+			} else {
+				app_note(app, "[COLUMN CUT REFUSED - a row could not be read, or the rectangle spans more than 10000 rows]")
+			}
+		} else if s := doc_selected_text(doc, context.temp_allocator); s != "" {
 			plat.clipboard_set_text(w.hwnd, s)
 			doc_backspace(doc) // deletes the selection
 		}
