@@ -595,7 +595,13 @@ theme_available_names :: proc(allocator := context.temp_allocator) -> []string {
 	for info in infos {
 		if info.type != .Regular {continue}
 		if !strings.has_suffix(info.name, ".theme") {continue}
-		append(&names, strings.trim_suffix(info.name, ".theme"))
+		stem := strings.trim_suffix(info.name, ".theme")
+		// A file named Dark.theme or Light.theme can never load -- theme_resolve
+		// answers those two names from the compiled-in themes before it looks at
+		// disk. Listing it would offer a Settings entry that silently does
+		// nothing, and a duplicate of a name already in this list.
+		if stem == "Dark" || stem == "Light" {continue}
+		append(&names, stem)
 	}
 	return names[:]
 }
@@ -622,4 +628,107 @@ theme_resolve :: proc(name: string) -> Theme {
 	}
 	path := fmt.tprintf("%s%c%s.theme", dir, '\\', name)
 	return theme_load_file(path, theme_dark())
+}
+
+// The .theme file backing a theme name, or ok=false when there is none. The
+// two built-ins are compiled in and have NO file -- theme_resolve returns
+// theme_dark()/theme_light() without consulting disk -- so they are the early
+// out here, and the reason "reload the theme file" needs an export step before
+// it can mean anything.
+theme_active_file_path :: proc(name: string) -> (path: string, ok: bool) {
+	if name == "Dark" || name == "Light" {
+		return "", false
+	}
+	dir, dok := themes_dir()
+	if !dok {
+		return "", false
+	}
+	return fmt.tprintf("%s%c%s.theme", dir, '\\', name), true
+}
+
+// The name to export the current theme AS. A built-in cannot be its own
+// target: a file called Dark.theme is unreachable, because theme_resolve
+// short-circuits on that name before looking at disk -- it would list in the
+// Settings cycle and then change nothing when picked. A custom theme exports
+// as itself, which combined with theme_export's no-overwrite rule means
+// "export" on an already-exported theme is just "open it".
+theme_export_target :: proc(name: string) -> string {
+	switch name {
+	case "Dark":
+		return "Dark Custom"
+	case "Light":
+		return "Light Custom"
+	}
+	return name
+}
+
+// Convert one channel to its 8-bit file form. Rounds to nearest rather than
+// truncating: the theme is f32 and the file is 8 bits per channel, so a trip
+// through a file cannot be exact (0.10 * 255 = 25.5). Rounding reaches a fixed
+// point after one trip; truncation drifts further on the first and can ratchet
+// down across repeated exports. themetest asserts the fixed point.
+@(private = "file")
+theme_chan_hex :: proc(c: f32) -> int {
+	v := int(c * 255 + 0.5)
+	if v < 0 {v = 0}
+	if v > 255 {v = 255}
+	return v
+}
+
+// Write the current theme to themes_dir()/<target>.theme and return the target
+// name and path. Writes every role, so the file is a complete, editable
+// starting point rather than something the user must know the format to build.
+//
+// NEVER overwrites: on an existing target this succeeds and returns the path
+// having written nothing. The file is the user's tuning work and the command
+// calling this is reachable at any time; silently replacing it with the
+// built-in's values would destroy exactly the thing this feature exists to
+// let them make.
+theme_export :: proc(from_name: string, t: Theme) -> (target: string, path: string, ok: bool) {
+	target = theme_export_target(from_name)
+	dir, dok := themes_dir_ensure()
+	if !dok {
+		return target, "", false
+	}
+	path = fmt.tprintf("%s%c%s.theme", dir, '\\', target)
+	if os.exists(path) {
+		return target, path, true // never clobber the user's edits
+	}
+
+	base_name := "light" if from_name == "Light" else "dark"
+	b := strings.builder_make(context.temp_allocator)
+	fmt.sbprintf(&b, "# Newtpad theme -- %s\n", target)
+	fmt.sbprint(&b, "#\n")
+	fmt.sbprint(&b, "# Edit a colour and save (Ctrl+S). The window updates immediately.\n")
+	fmt.sbprint(&b, "# Each line is `role #rrggbb`. Lines starting with # are comments.\n")
+	fmt.sbprint(&b, "# Delete a line to fall back to the base theme's value for that role.\n")
+	fmt.sbprint(&b, "# An unknown role or a malformed colour is skipped, never fatal.\n")
+	fmt.sbprint(&b, "#\n")
+	fmt.sbprintf(&b, "base %s\n\n", base_name)
+
+	sections := []struct {
+		title: string,
+		first: Color_Role,
+	}{{"neutrals", .Bg_Base}, {"accents", .Selection_Doc}, {"syntax", .Syn_Keyword}}
+	si := 0
+	for role in Color_Role {
+		if si < len(sections) && role == sections[si].first {
+			fmt.sbprintf(&b, "# --- %s ---\n", sections[si].title)
+			si += 1
+		}
+		c := t[role]
+		fmt.sbprintf(
+			&b,
+			"%s #%02X%02X%02X\n",
+			theme_key_from_role(role),
+			theme_chan_hex(c.r),
+			theme_chan_hex(c.g),
+			theme_chan_hex(c.b),
+		)
+	}
+
+	if os.write_entire_file(path, transmute([]u8)strings.to_string(b)) != nil {
+		return target, path, false
+	}
+	return target, path, true
 }

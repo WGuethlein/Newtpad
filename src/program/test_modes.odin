@@ -3113,6 +3113,97 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				os.remove(path)
 			}
 
+			// Export writes every role, and what it writes parses back to the
+			// same theme within the 8-bit limit of #rrggbb. The theme is
+			// [4]f32 and the file format is 8 bits per channel, so an exact
+			// round-trip is impossible by construction -- 0.10 * 255 = 25.5.
+			// Two properties make that safe instead of merely lossy: every
+			// channel lands within 1/255, and a second export of the parsed
+			// result is byte-identical to the first, i.e. one trip reaches a
+			// fixed point rather than drifting further on each export.
+			{
+				target, path, ok := theme_export("Dark", d)
+				if !ok {
+					fmt.println("  FAIL   theme_export(\"Dark\") failed")
+					fail = true
+				} else {
+					first, rerr := os.read_entire_file(path, context.temp_allocator)
+					if rerr != nil {
+						fmt.println("  FAIL   exported theme file unreadable")
+						fail = true
+					} else {
+						parsed := theme_load_file(path, theme_light()) // base must come from the file, not this arg
+						worst: f32 = 0
+						for role in Color_Role {
+							for i in 0 ..< 4 {
+								dch := parsed[role][i] - d[role][i]
+								if dch < 0 {dch = -dch}
+								if dch > worst {worst = dch}
+							}
+						}
+						within := worst <= (1.0 / 255.0) + 0.0001
+						if !within {fail = true}
+						fmt.printfln("  %-6s export round-trip: worst channel drift %.5f (need <= 1/255)", "ok" if within else "FAIL", worst)
+
+						// Fixed point: exporting the PARSED theme must produce
+						// the identical bytes. The first file is removed so the
+						// no-overwrite rule does not block the second write.
+						os.remove(path)
+						_, path2, ok2 := theme_export("Dark", parsed)
+						second, rerr2 := os.read_entire_file(path2, context.temp_allocator)
+						stable := ok2 && rerr2 == nil && string(first) == string(second)
+						if !stable {fail = true}
+						fmt.printfln("  %-6s export is a fixed point after one round-trip", "ok" if stable else "FAIL")
+						os.remove(path2)
+					}
+				}
+				_ = target
+			}
+
+			// The export must never destroy an existing file: it is the user's
+			// tuning work, and the command that calls this is reachable at any
+			// time. On an existing target the call succeeds and reports the
+			// path, but writes nothing.
+			{
+				target := theme_export_target("Dark")
+				path := fmt.tprintf("%s%c%s.theme", tdir, '\\', target)
+				sentinel := "base dark\ncaret #010203\n"
+				_ = os.write_entire_file(path, transmute([]u8)sentinel)
+				_, got_path, ok := theme_export("Dark", d)
+				after, _ := os.read_entire_file(path, context.temp_allocator)
+				preserved := ok && got_path == path && string(after) == sentinel
+				if !preserved {fail = true}
+				fmt.printfln("  %-6s export refuses to overwrite an existing theme file", "ok" if preserved else "FAIL")
+				os.remove(path)
+			}
+
+			// A '#' comment line is ignored, including one whose text contains
+			// a role name -- the exported file is full of both.
+			{
+				path := write_theme_file(tdir, "comments", "# caret #ffffff is the caret colour\n#link #ffffff\nlink #112233\n")
+				got := theme_load_file(path, d)
+				ok := got[.Link] == [4]f32{f32(0x11) / 255, f32(0x22) / 255, f32(0x33) / 255, 1} && got[.Caret] == d[.Caret]
+				if !ok {fail = true}
+				fmt.printfln("  %-6s '#' comment lines ignored, including ones naming a role", "ok" if ok else "FAIL")
+				os.remove(path)
+			}
+
+			// A built-in's name can never back a file: theme_resolve
+			// short-circuits on "Dark"/"Light" before consulting disk, so such
+			// a file would list in Settings and then do nothing when selected.
+			{
+				stray := fmt.tprintf("%s%cDark.theme", tdir, '\\')
+				stray_body := "caret #010203\n"
+				_ = os.write_entire_file(stray, transmute([]u8)stray_body)
+				names := theme_available_names(context.temp_allocator)
+				count := 0
+				for n in names {if n == "Dark" {count += 1}}
+				ok := count == 1 && theme_export_target("Dark") != "Dark" && theme_export_target("Light") != "Light"
+				if !ok {fail = true}
+				fmt.printfln("  %-6s a stray Dark.theme neither duplicates nor becomes an export target", "ok" if ok else "FAIL")
+				os.remove(stray)
+			}
+
 			// A `base light` line overlays Light instead of the default
 			// Dark -- an unnamed role (Md_Quote here) must hold Light's
 			// value, not Dark's. This is the case the fix exists for: before
