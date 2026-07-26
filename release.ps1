@@ -70,8 +70,12 @@ if (-not $gh) {
 # Prepended to the auto-generated notes. The repo is public and the exe is
 # unsigned, so every download trips SmartScreen; say so rather than letting it
 # look like a broken binary. Delete this once signing is in place.
+#
+# ASCII only, deliberately. PowerShell 5.1 decodes a BOM-less .ps1 as ANSI, so a
+# non-ASCII character here is already mojibake by the time gh is invoked. An em
+# dash in this string shipped as "a-EUR-quote" in the published v0.13.0 notes.
 $notes = @"
-**This build is unsigned.** Windows SmartScreen will warn when you download or first run it — choose **More info** then **Run anyway**. Code signing needs a purchased certificate and is tracked as ship-readiness work.
+**This build is unsigned.** Windows SmartScreen will warn when you download or first run it. Choose **More info**, then **Run anyway**. Code signing needs a purchased certificate and is tracked as ship-readiness work.
 "@
 & $gh release create $tag $exe --title "Newtpad $tag" --notes $notes --generate-notes
 if ($LASTEXITCODE -ne 0) { Write-Error "gh release create failed for $tag."; exit 1 }
