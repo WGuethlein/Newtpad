@@ -713,6 +713,7 @@ Document :: struct {
 	// snapshot, so a multi-edit operation is one undo entry. See doc_batch_begin.
 	batch:       bool,
 	idx:        Line_Index,
+	lex_idx:    Lex_State_Index, // background per-line syntax-lexer state (see lex_index.odin)
 	find:       Find,
 	search:     Search, // background find worker (see find.odin)
 	// filter-to-matching-lines view (only while find is active)
@@ -856,6 +857,9 @@ doc_close :: proc(doc: ^Document) {
 		thread.join(doc.idx.th)
 		thread.destroy(doc.idx.th)
 	}
+	lex_index_stop(doc) // joins before the arrays below are freed
+	delete(doc.lex_idx.line_starts)
+	delete(doc.lex_idx.states)
 	// Before pt_destroy: the worker's view aliases the add chunks it frees.
 	search_release(doc)
 	for s in doc.undo {base.pt_free_node_tree(s.root)}
@@ -1353,6 +1357,7 @@ doc_reload :: proc(doc: ^Document) -> bool {
 	// a reload left the status bar reading "0 lines, indexing 0%" for good, on the
 	// log-tailing path this feature exists for.
 	doc_index_start(doc)
+	lex_index_start(doc) // same reasoning: doc_close nil'd lex_idx.th too
 	return true
 }
 
@@ -2162,11 +2167,19 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 // a partial, possibly-truncated segment per row. Zero-value is not usable —
 // cur_lls must start at -1, a value no real line start can equal — so
 // callers must set that explicitly (see doc_draw).
+//
+// cur_state_out is the Lex_State the WHOLE cached logical line ends in —
+// computed once, the same call that fills cur_buf — and handed back
+// unchanged on every visual row of that line, wrapped or not. Only the row
+// that actually starts a new logical line needs a fresh, caller-supplied
+// state_in; every other visual row of an already-wrapped line reuses the
+// cached tokens and the cached state_out, both fixed once the line is lexed.
 Highlight_Row_Cache :: struct {
-	cur_lls:  int,
-	cur_line: string,
-	cur_buf:  [HL_MAX_ROW_TOKENS]plat.Text_Span,
-	cur_n:    int,
+	cur_lls:       int,
+	cur_line:      string,
+	cur_buf:       [HL_MAX_ROW_TOKENS]plat.Text_Span,
+	cur_n:         int,
+	cur_state_out: base.Lex_State,
 }
 
 // Row-relative syntax spans for one visible row, handling the wrap rebase
@@ -2177,21 +2190,33 @@ Highlight_Row_Cache :: struct {
 //
 // Filter rows are never `wrapped` (visible_next only ever sets it in the
 // non-filter branch), so a filtered row's bytes ARE its whole logical line
-// already — this line-local lexer handles the filter view for free. That
-// stops being free the instant a lexer needs cross-line state (Task 3's
-// index), so don't copy this shortcut without re-checking it applies.
+// already — this line-local lexer handles the filter view for free FOR A
+// LINE-LOCAL LEXER. A stateful lexer's filter row still needs its OWN
+// state_in resolved independently (the row above it in the filter view can
+// be an unrelated logical line 10,000 lines away) — that resolution is the
+// caller's job (doc_lex_state_at, program/lex_index.odin), not this proc's;
+// this proc only threads whatever state_in it is given through to the lexer
+// and reports what it ends in.
+//
+// `state_in` is the Lex_State in effect at `start` (this row's logical
+// line's start, not necessarily this row's own start when wrapped).
+// `state_out` is what the WHOLE logical line ends in — identical across
+// every visual row of a wrapped line, so the caller can hold it and only
+// advance to the next logical line's start once `line_end` is reached
+// (doc_draw does exactly this).
 doc_row_lex_spans :: proc(
 	doc: ^Document,
 	cache: ^Highlight_Row_Cache,
 	start, end: int,
 	wrapped: bool,
 	row_bytes: []u8,
+	state_in: base.Lex_State,
 	out: []plat.Text_Span,
-) -> int {
+) -> (n: int, state_out: base.Lex_State) {
 	if !wrapped {
 		// The unwrapped row IS the whole (capped) logical line already sitting in
 		// the caller's line buffer — no extra read, no cache needed.
-		return highlight_row_spans(doc, row_bytes, out)
+		return highlight_row_spans(doc, row_bytes, state_in, out)
 	}
 	lls, _ := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
 	if lls != cache.cur_lls {
@@ -2199,16 +2224,17 @@ doc_row_lex_spans :: proc(
 		lend := base.pt_line_end_cap(&doc.pt, lls, RENDER_LINE_CAP)
 		cache.cur_line = ""
 		cache.cur_n = 0
+		cache.cur_state_out = state_in // nothing to lex: state passes through
 		if lend > lls {
 			buf := make([]u8, lend - lls, context.temp_allocator)
 			got := base.pt_read(&doc.pt, lls, buf)
 			cache.cur_line = string(buf[:got])
-			cache.cur_n = highlight_row_spans(doc, buf[:got], cache.cur_buf[:])
+			cache.cur_n, cache.cur_state_out = highlight_row_spans(doc, buf[:got], state_in, cache.cur_buf[:])
 		}
 	}
 	row_off := start - lls
 	row_end_off := min(end - lls, len(cache.cur_line))
-	n := 0
+	n = 0
 	for k in 0 ..< cache.cur_n {
 		sp := cache.cur_buf[k]
 		lo := max(sp.start, row_off)
@@ -2220,7 +2246,8 @@ doc_row_lex_spans :: proc(
 		out[n] = plat.Text_Span{start = lo - row_off, len = hi - lo, color = sp.color}
 		n += 1
 	}
-	return n
+	state_out = cache.cur_state_out
+	return
 }
 
 // Draw visible lines; return the caret's screen rect (if visible) and the byte
@@ -2248,9 +2275,21 @@ doc_draw :: proc(
 	// at zero cost. hl_cache.cur_lls starts at -1 (see its comment) so the
 	// first wrapped row this pass sees always misses and lexes its logical
 	// line fresh.
-	hl_lexer := highlight_lexer_for(doc.path)
+	hl_lexer, _, _ := highlight_lexer_for(doc.path)
 	hl_cache: Highlight_Row_Cache
 	hl_cache.cur_lls = -1
+	// The Lex_State carried into the row about to be drawn. In the filter
+	// view every row is a non-contiguous logical line (row N+1 can be 10,000
+	// lines below row N), so each one resolves its own state independently
+	// below. Outside the filter view the viewport is one contiguous stream:
+	// bytes flow from one row straight into the next regardless of whether a
+	// row boundary happens to be a wrap point, a RENDER_LINE_CAP split, or a
+	// genuine new logical line, so a single running state threaded forward
+	// row to row is correct throughout — only the FIRST row needs an actual
+	// lookup (hl_state_ready gates that), because it may be lexing a
+	// document byte range whose preceding state is otherwise unknown.
+	hl_state: base.Lex_State
+	hl_state_ready := false
 	it := visible_begin(doc, t, rows)
 	for {
 		row, start, end, vis_end, line_end, wrapped, ok := visible_next(&it)
@@ -2295,7 +2334,22 @@ doc_draw :: proc(
 			hl_n := 0
 			hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
 			if hl_lexer != nil {
-				hl_n = doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], hl_buf[:])
+				if doc_filtering(doc) {
+					// Non-contiguous row: can't inherit state from the row
+					// above (see hl_state's comment), so resolve it here,
+					// bounded by the smaller filter-view window.
+					hl_state = doc_lex_state_at(doc, start, LEX_FILTER_RESYNC_WINDOW)
+				} else if !hl_state_ready {
+					// Contiguous viewport: only the very first row needs a
+					// real lookup. It may be a wrapped continuation or a
+					// RENDER_LINE_CAP-split continuation rather than its
+					// logical line's true start, so find that start first
+					// (bounded, same shape doc_row_lex_spans uses below).
+					lls, _ := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
+					hl_state = doc_lex_state_at(doc, lls, LEX_RESYNC_WINDOW)
+					hl_state_ready = true
+				}
+				hl_n, hl_state = doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], hl_state, hl_buf[:])
 			}
 
 			spans: []plat.Text_Span

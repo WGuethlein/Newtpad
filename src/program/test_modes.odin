@@ -4467,9 +4467,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				if buggy {
 					whole := make([]u8, end, context.temp_allocator)
 					got := base.pt_read(&doc.pt, 0, whole)
-					highlight_row_spans(doc, whole[:got], hl_buf[:])
+					highlight_row_spans(doc, whole[:got], .Normal, hl_buf[:])
 				} else {
-					doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], hl_buf[:])
+					doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], .Normal, hl_buf[:])
 				}
 			}
 			return hl_bytes_examined
@@ -4547,7 +4547,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				n := base.pt_read(&wd.pt, start, line_buf[:draw_len])
 				if n <= 0 {continue}
 				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
-				hn := doc_row_lex_spans(&wd, &wcache, start, end, wrapped, line_buf[:n], hl_buf[:])
+				hn, _ := doc_row_lex_spans(&wd, &wcache, start, end, wrapped, line_buf[:n], .Normal, hl_buf[:])
 				for k in 0 ..< hn {
 					sp := hl_buf[k]
 					if sp.color != g_theme[.Syn_Number] {continue}
@@ -4615,7 +4615,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				rdoc: Document
 				rdoc.path = "test.log"
 				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
-				hl_n := highlight_row_spans(&rdoc, transmute([]u8)row, hl_buf[:])
+				hl_n, _ := highlight_row_spans(&rdoc, transmute([]u8)row, .Normal, hl_buf[:])
 				lks := links_scan(row)
 				link_buf := make([]plat.Text_Span, len(lks), context.temp_allocator)
 				for l, i in lks {link_buf[i] = plat.Text_Span{start = l.start, len = l.len, color = LINK}}
@@ -4716,6 +4716,247 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 
 		fmt.println("highlighttest: FAILURES" if fail else "highlighttest: all ok")
+		return true
+	}
+
+	// `newtpad lexstatetest` is Task 3's own verification surface: the
+	// background per-line index, the bounded backward resync, and the two
+	// interactions the design doc calls out for a STATEFUL lexer specifically
+	// (lex_xml) rather than the line-local ones highlighttest already covers.
+	if os.args[1] == "lexstatetest" {
+		fmt.println("lexstatetest:")
+		fail := false
+		g_theme = theme_light() // see highlighttest's identical comment on why
+
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("lexstatetest: no fonts loaded")
+			return true
+		}
+
+		// --- 1: state threads correctly across rows in the ordinary,
+		// contiguous (non-filter) viewport -- the exact doc_draw shape, hand-
+		// rolled the same way highlighttest's wrap-rebase check is, so this
+		// exercises doc_row_lex_spans/doc_lex_state_at rather than a second
+		// copy of what doc_draw does. `<!-- start` opens on row 1, `middle`
+		// (row 2) is entirely inside it with NO markers of its own, and
+		// `end --> <b/>` (row 3) closes it mid-row and then lexes a real tag
+		// -- the one row that proves state, not just "always Comment" or
+		// "always Normal", is actually being carried forward.
+		{
+			content := "<a>\n<!-- start\nmiddle\nend --> <b/>\n"
+			wd: Document
+			wd.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&wd.pt)
+			wd.path = "test.xml"
+			wd.view_cols = 200
+
+			cache: Highlight_Row_Cache
+			cache.cur_lls = -1
+			hl_state := doc_lex_state_at(&wd, 0, LEX_RESYNC_WINDOW)
+			line_buf: [VISIBLE_COLS]u8
+			row_comment := [4]bool{false, false, false, false} // does this row carry ANY Comment span?
+			row_tag := [4]int{0, 0, 0, 0} // Xml_Tag span count per row
+			row := 0
+			it := visible_begin(&wd, &t, 4)
+			for {
+				_, start, end, vis_end, _, wrapped, ok := visible_next(&it)
+				if !ok {break}
+				draw_len := min(vis_end - start, len(line_buf))
+				n := base.pt_read(&wd.pt, start, line_buf[:draw_len])
+				if n <= 0 {continue}
+				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				hn: int
+				hn, hl_state = doc_row_lex_spans(&wd, &cache, start, end, wrapped, line_buf[:n], hl_state, hl_buf[:])
+				for k in 0 ..< hn {
+					if row < 4 {
+						if hl_buf[k].color == g_theme[.Syn_Comment] {row_comment[row] = true}
+						if hl_buf[k].color == g_theme[.Syn_Xml_Tag] {row_tag[row] += 1}
+					}
+				}
+				row += 1
+			}
+			ok :=
+				row == 4 &&
+				!row_comment[0] && row_tag[0] == 2 && // "<a>"
+				row_comment[1] && // "<!-- start" -- opens, unterminated
+				row_comment[2] && // "middle" -- no markers, still inside
+				row_comment[3] && row_tag[3] == 2 && // "end --> <b/>" -- closes, then a tag
+				hl_state == .Normal // closed by the last row; nothing left open
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s state threads across rows: comment=%v tags=%v final=%v",
+				"ok" if ok else "FAIL",
+				row_comment,
+				row_tag,
+				hl_state,
+			)
+		}
+
+		// --- 2: the filter view. Three rows, deliberately listed OUT OF
+		// ORDER (offset order would let a bug that quietly reuses the
+		// contiguous running-state logic pass by accident) -- one before any
+		// comment, one inside one, one after it closes. Each must resolve
+		// its OWN state independently of the others; there is no "previous
+		// row" to inherit from in filter mode (see doc_draw's comment on
+		// hl_state).
+		{
+			content := strings.concatenate(
+				{
+					"before comment\n",
+					"<!-- open\n",
+					"still inside comment\n",
+					"closes here -->\n",
+					"after comment\n",
+				},
+				context.temp_allocator,
+			)
+			fdoc: Document
+			fdoc.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&fdoc.pt)
+			fdoc.path = "test.xml"
+
+			before_at := 0
+			inside_at := strings.index(content, "still inside comment")
+			after_at := strings.index(content, "after comment")
+
+			// Reordered: after, before, inside -- not ascending, not the
+			// order they appear in the file.
+			s_after := doc_lex_state_at(&fdoc, after_at, LEX_FILTER_RESYNC_WINDOW)
+			s_before := doc_lex_state_at(&fdoc, before_at, LEX_FILTER_RESYNC_WINDOW)
+			s_inside := doc_lex_state_at(&fdoc, inside_at, LEX_FILTER_RESYNC_WINDOW)
+
+			ok := s_before == .Normal && s_inside == .In_Comment && s_after == .Normal
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s filter view resolves rows independently: before=%v inside=%v after=%v",
+				"ok" if ok else "FAIL",
+				s_before,
+				s_inside,
+				s_after,
+			)
+		}
+
+		// --- 3: the documented failure mode, AND its own sabotage. A
+		// comment opened at byte 0 and never closed; `target` sits well past
+		// LEX_RESYNC_WINDOW bytes of plain filler with no "-->" anywhere, so
+		// a real-sized window must cap-hit and bail to .Normal -- the wrong
+		// answer, but the DOCUMENTED one (see lex_resync_state's comment),
+		// not a crash or a truncation. Widening the window past the target
+		// (the sabotage: proving the bound, not the mechanism, is what
+		// produces the wrong answer) must then find byte 0 and compute the
+		// TRUE state, .In_Comment -- showing this assertion can fail, and
+		// exactly what makes it fail.
+		{
+			sb := strings.builder_make(context.temp_allocator)
+			strings.write_string(&sb, "<!-- unterminated comment\n")
+			filler := strings.repeat("x", 78, context.temp_allocator)
+			// Enough filler lines to push `target` past LEX_RESYNC_WINDOW
+			// (64 KiB) with real margin, so this isn't a fixture that
+			// happens to sit right at the boundary.
+			for _ in 0 ..< 900 {
+				strings.write_string(&sb, filler)
+				strings.write_byte(&sb, '\n')
+			}
+			target := strings.builder_len(sb)
+			strings.write_string(&sb, "TARGET\n")
+			content := strings.to_string(sb)
+
+			ld: Document
+			ld.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&ld.pt)
+
+			cap_ok := target > LEX_RESYNC_WINDOW
+			state_bad, cap_hit_bad := lex_resync_state(&ld, target, LEX_RESYNC_WINDOW, base.lex_xml, "-->")
+			// Sabotage the bound, not the mechanism: a window wide enough to
+			// reach byte 0 (which is always unambiguously .Normal on its
+			// own) recovers the true answer through the exact same code.
+			state_good, cap_hit_good := lex_resync_state(&ld, target, target + 10, base.lex_xml, "-->")
+
+			ok :=
+				cap_ok &&
+				cap_hit_bad &&
+				state_bad == .Normal && // wrong, but the documented failure mode
+				!cap_hit_good &&
+				state_good == .In_Comment // true state, recovered once the bound doesn't starve it
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s documented failure mode: target=%d window=%d bad=(cap=%v,%v) widened=(cap=%v,%v)",
+				"ok" if ok else "FAIL",
+				target,
+				LEX_RESYNC_WINDOW,
+				cap_hit_bad,
+				state_bad,
+				cap_hit_good,
+				state_good,
+			)
+		}
+
+		// --- 4: the real background index, end to end -- a real file on
+		// disk, doc_open, lex_index_start, waited for completion -- cross-
+		// checked against the resync mechanism (a generous window, standing
+		// in for ground truth) at several offsets including one inside a
+		// same-line-opened-and-closed comment's aftermath and one genuinely
+		// spanning two lines. The two mechanisms must agree everywhere.
+		{
+			xml_content := strings.concatenate(
+				{
+					"<root>\n",
+					"<!-- header comment\n",
+					"spanning two lines -->\n",
+					"<child attr=\"v\">text</child>\n",
+					"<!-- trailing -->\n",
+					"</root>\n",
+				},
+				context.temp_allocator,
+			)
+			tmpf := fmt.tprintf("%s%cnewtpad_lexidx_test.xml", os.get_env("TEMP", context.temp_allocator), '\\')
+			if werr := os.write_entire_file(tmpf, transmute([]u8)xml_content); werr != nil {
+				fmt.printfln("  FAIL   could not write fixture: %v", werr)
+				fail = true
+			} else {
+				xd, xok := doc_open(tmpf)
+				if !xok {
+					fmt.println("  FAIL   could not open fixture")
+					fail = true
+				} else {
+					lex_index_start(&xd)
+					t0 := time.tick_now()
+					for !lex_index_done(&xd) && time.duration_seconds(time.tick_since(t0)) < 5 {
+						time.sleep(time.Millisecond)
+					}
+					indexed := lex_index_done(&xd)
+
+					offsets := [5]int {
+						0,
+						strings.index(xml_content, "spanning two lines"),
+						strings.index(xml_content, "<child"),
+						strings.index(xml_content, "<!-- trailing -->"),
+						strings.index(xml_content, "</root>"),
+					}
+					want := [5]base.Lex_State{.Normal, .In_Comment, .Normal, .Normal, .Normal}
+
+					agree := indexed
+					for off, i in offsets {
+						via_index := doc_lex_state_at(&xd, off, LEX_RESYNC_WINDOW)
+						via_resync, _ := lex_resync_state(&xd, off, off + 10, base.lex_xml, "-->")
+						if via_index != want[i] || via_resync != want[i] || via_index != via_resync {
+							agree = false
+						}
+					}
+					if !agree {fail = true}
+					fmt.printfln(
+						"  %-6s background index matches resync ground truth (indexed=%v)",
+						"ok" if agree else "FAIL",
+						indexed,
+					)
+				}
+				doc_close(&xd)
+				os.remove(tmpf)
+			}
+		}
+
+		fmt.println("lexstatetest: FAILURES" if fail else "lexstatetest: all ok")
 		return true
 	}
 

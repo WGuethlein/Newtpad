@@ -17,29 +17,64 @@ import "core:strings"
 import base "src:base"
 import plat "src:platform"
 
-Lexer_Proc :: proc(line: []u8, out: []base.Token) -> int
+// Every lexer in the table speaks this shape: a line's raw bytes plus the
+// Lex_State the previous line ended in, producing tokens plus the state THIS
+// line ends in. Task 3 added the state parameter/result — lex_log and
+// lex_json (line-local, Task 1/2) never look at state_in and always return
+// .Normal, via the two adapters below, so neither file was rewritten to grow
+// a state it doesn't have. lex_xml (base/lex_xml.odin) is the first real
+// consumer: its signature already matches this exactly, so it needs no
+// adapter of its own.
+Lexer_Proc :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State)
 
-// Extension (with leading dot, case-insensitive) -> lexer. `.log` is Task
-// 1's entry; `.json` is Task 2's. `.txt` and every other extension correctly
-// map to no lexer at all — `.txt` has no grammar to find, and everything
-// else is a later task's lexer landing in this same table.
+@(private = "file")
+lex_log_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_log(line, out), .Normal
+}
+
+@(private = "file")
+lex_json_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_json(line, out), .Normal
+}
+
+// Extension (with leading dot, case-insensitive) -> lexer, whether that
+// lexer's state can differ line to line, and (when it can) the byte marker
+// whose end position is unambiguously .Normal — used by the bounded resync
+// (program/lex_index.odin) to find a safe place to start lexing forward
+// without scanning from byte 0. "-->" is safe for XML/HTML because comments
+// don't nest: once one has closed, nothing about an enclosing construct can
+// still be open. A future stateful lexer (Task 4's C-family, for `*/`) reuses
+// the same resync mechanism by registering its own marker here — this is not
+// XML-specific machinery with an XML-only escape hatch.
+//
+// `.log` is Task 1's entry; `.json` is Task 2's; `.xml`/`.html` are this
+// task's. `.txt` and every other extension correctly map to no lexer at all.
 @(private = "file")
 EXT_LEXERS := [?]struct {
-	ext:   string,
-	lexer: Lexer_Proc,
-}{{".log", base.lex_log}, {".json", base.lex_json}}
+	ext:           string,
+	lexer:         Lexer_Proc,
+	stateful:      bool, // false: state_in is never consulted, don't bother indexing
+	resync_anchor: string, // "" when stateful is false (never consulted)
+}{
+	{".log", lex_log_adapt, false, ""},
+	{".json", lex_json_adapt, false, ""},
+	{".xml", base.lex_xml, true, "-->"},
+	{".html", base.lex_xml, true, "-->"},
+}
 
-// The lexer for a document's path, or nil when the extension has none yet
-// (or never will, like .txt).
-highlight_lexer_for :: proc(path: string) -> Lexer_Proc {
-	if path == "" {return nil}
+// The lexer for a document's path (nil when the extension has none yet, or
+// never will, like .txt), whether it carries state across lines, and — when
+// it does — the resync anchor marker for it. See EXT_LEXERS's comment for
+// what all three mean.
+highlight_lexer_for :: proc(path: string) -> (lexer: Lexer_Proc, stateful: bool, resync_anchor: string) {
+	if path == "" {return}
 	dot := strings.last_index_byte(path, '.')
-	if dot < 0 {return nil}
+	if dot < 0 {return}
 	ext := path[dot:]
 	for e in EXT_LEXERS {
-		if strings.equal_fold(ext, e.ext) {return e.lexer}
+		if strings.equal_fold(ext, e.ext) {return e.lexer, e.stateful, e.resync_anchor}
 	}
-	return nil
+	return
 }
 
 // Token_Kind -> Color_Role. Data, not branching logic: every kind a lexer can
@@ -143,15 +178,23 @@ highlight_merge_spans :: proc(lex_spans, link_spans: []plat.Text_Span, out: []pl
 // the whole logical line, capped) and routes a wrapped row through
 // doc_row_lex_spans, which lexes the cached whole logical line once and
 // rebases the result onto each visual row — see that proc's comment.
-highlight_row_spans :: proc(doc: ^Document, row_bytes: []u8, out: []plat.Text_Span) -> int {
-	if doc == nil || len(row_bytes) == 0 || len(out) == 0 {return 0}
-	lexer := highlight_lexer_for(doc.path)
-	if lexer == nil {return 0}
+//
+// `state_in` is the Lex_State the lexer should begin this row's bytes in
+// (.Normal for a line-local lexer or for the very first line of a stateful
+// one); `state_out` is what it ends in, for the caller to pass to whatever
+// comes next. A nil lexer returns state_in unchanged, so a caller that always
+// threads state_out forward doesn't need to special-case "no lexer."
+highlight_row_spans :: proc(doc: ^Document, row_bytes: []u8, state_in: base.Lex_State, out: []plat.Text_Span) -> (n: int, state_out: base.Lex_State) {
+	state_out = state_in
+	if doc == nil || len(row_bytes) == 0 || len(out) == 0 {return}
+	lexer, _, _ := highlight_lexer_for(doc.path)
+	if lexer == nil {return}
 	toks: [HL_MAX_ROW_TOKENS]base.Token
-	n := lexer(row_bytes, toks[:])
+	tn: int
+	tn, state_out = lexer(row_bytes, state_in, toks[:])
 	hl_bytes_examined += len(row_bytes)
 	w := 0
-	for i in 0 ..< n {
+	for i in 0 ..< tn {
 		if w >= len(out) {break}
 		tok := toks[i]
 		if tok.kind == .None {continue}
@@ -162,5 +205,6 @@ highlight_row_spans :: proc(doc: ^Document, row_bytes: []u8, out: []plat.Text_Sp
 		}
 		w += 1
 	}
-	return w
+	n = w
+	return
 }
