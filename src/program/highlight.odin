@@ -54,7 +54,23 @@ EXT_LEXERS := [?]struct {
 	ext:           string,
 	lexer:         Lexer_Proc,
 	stateful:      bool, // false: state_in is never consulted, don't bother indexing
-	resync_anchor: string, // "" when stateful is false (never consulted)
+	// A byte sequence whose completion means the state there is unambiguously
+	// .Normal. "" when stateful is false (never consulted).
+	//
+	// WARNING for whoever adds the C-family lexer: a bare literal anchor stops
+	// being sound the moment a lexer's state set grows past "in a comment or
+	// not". `*/` is NOT unambiguously .Normal -- `char *s = "*/";` and `// */`
+	// both put it at a position that is inside a string or a line comment, and
+	// lex_resync_state deliberately takes the LAST occurrence in the window,
+	// which is the one most likely to be inside a string on a line of code.
+	//
+	// XML survives a bare "-->" only by accident: Lex_State has no In_Tag or
+	// In_Attr_String, so `<a href="x-->y">` really is .Normal there. That luck
+	// does not extend to C. Either give the anchor a lexer-supplied validity
+	// predicate at the candidate position, or pick a structurally stronger one
+	// (a `}` at column 0, a blank line) whose meaning does not depend on the
+	// state it is trying to establish.
+	resync_anchor: string,
 }{
 	{".log", lex_log_adapt, false, ""},
 	{".json", lex_json_adapt, false, ""},
