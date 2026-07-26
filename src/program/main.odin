@@ -20,22 +20,34 @@ import plat "src:platform"
 // the exact code the frame loop runs, rather than a parallel copy of it.
 app_consume_open_requests :: proc(a: ^App, paths: []string) {
 	first := -1
-	skipped := 0
+	folders := 0
+	unreadable := 0
 	for p in paths {
 		if plat.path_is_directory(p) {
-			skipped += 1
+			folders += 1
 			continue // a folder is not a document; project trees are out of scope
 		}
 		if !app_open_path(a, p) {
 			fmt.eprintfln("Newtpad: could not open %q", p)
-			skipped += 1
+			unreadable += 1
 			continue
 		}
 		if first < 0 {first = a.active}
 	}
 	if first >= 0 {app_activate(a, first)} // focus the first, not the last
-	if skipped > 0 {
-		app_note(a, fmt.tprintf("%d item%s skipped (folders and unreadable files are not opened)", skipped, "" if skipped == 1 else "s"))
+	if folders > 0 || unreadable > 0 {
+		// [BRACKETED CAPS] matches the status line's other loud conditions
+		// ([CHANGED ON DISK ...], [GLYPH CACHE FULL ...]) -- this is the same
+		// class of message and should read as one. Folders and unreadable files
+		// are counted separately: they are different problems, and one message
+		// covering both made the user guess which had happened.
+		if folders > 0 && unreadable > 0 {
+			app_note(a, fmt.tprintf("[FOLDERS NOT OPENED - %d folder%s skipped (Newtpad opens files, not folders); %d file%s could not be read]", folders, "" if folders == 1 else "s", unreadable, "" if unreadable == 1 else "s"))
+		} else if folders > 0 {
+			app_note(a, fmt.tprintf("[FOLDERS NOT OPENED - %d folder%s skipped. Newtpad opens files, not folders]", folders, "" if folders == 1 else "s"))
+		} else {
+			app_note(a, fmt.tprintf("[FILE NOT OPENED - %d file%s could not be read]", unreadable, "" if unreadable == 1 else "s"))
+		}
 	}
 }
 
@@ -1125,7 +1137,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			notice = fmt.tprintf("    %s", rc.app.notice)
 		}
 		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", mode, recovered, disk, indexing, atlas, nobackup, notice)
-		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)
+		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc) || notice_live
 		col := g_theme[.Warning] if warn else g_theme[.Text_Dim]
 		plat.text_draw(gfx, text, status, sx(12), h - sx(8), UI_SMALL_PX, col)
 	}

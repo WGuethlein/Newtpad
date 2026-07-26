@@ -4631,8 +4631,20 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("  %-6s focus on first opened: %q", "ok" if ok2 else "FAIL", focused.path if focused != nil else "<nil>")
 		if !ok2 {fail = true}
 
-		ok3 := app_notice_active(&a) && strings.contains(a.notice, "2 items skipped")
-		fmt.printfln("  %-6s notice reports 2 skipped (folder + missing file): %q", "ok" if ok3 else "FAIL", a.notice)
+		// The note has to be findable, which is a wording property as much as a
+		// colour one: it rides at the end of a status line that already carries
+		// line/column, encoding, line ending and line count. The loud
+		// conditions on that line use a [BRACKETED CAPS] idiom ([CHANGED ON
+		// DISK ...], [GLYPH CACHE FULL ...]); this asserts the folder note
+		// joins them, and that the two kinds are counted separately rather than
+		// summed into the old "2 items skipped", which made the user guess
+		// which had happened.
+		ok3 :=
+			app_notice_active(&a) &&
+			strings.contains(a.notice, "[FOLDERS NOT OPENED") &&
+			strings.contains(a.notice, "1 folder") &&
+			strings.contains(a.notice, "1 file")
+		fmt.printfln("  %-6s notice names folders and unreadable files separately: %q", "ok" if ok3 else "FAIL", a.notice)
 		if !ok3 {fail = true}
 
 		// Re-dropping a path that is already open must activate the existing tab
