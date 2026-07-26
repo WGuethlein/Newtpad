@@ -606,6 +606,19 @@ test_lex_c_resync_valid_accepts_close_of_already_open_comment :: proc(t: ^testin
 // checked against the ACTUAL package-level table so a typo in the data (a
 // word in the wrong bucket, a missing type_intro entry) fails here instead
 // of only showing up looking "subtly wrong" in a real file later.
+//
+// CORRECTION (2026-07 review, IMPORTANT 1): every check below MUST include
+// at least one word taken from the plain `keywords` list, not only words
+// reached via `type_intro` (class/struct/interface/...). GO_KW originally
+// shipped missing `func` and `map` — 20 real keywords instead of 25 — and
+// this section's own Go test didn't catch it, because its only fixture was
+// `type Widget struct { Count int }`: every coloured word in it comes from
+// type_intro, so an omission anywhere in the separate `keywords` slice was
+// structurally invisible to it. Every test below now exercises at least one
+// `keywords`-only word; test_lex_c_kw_table_cpp, _js and _odin already did
+// (virtual/const/struct respectively, confirmed by inspection) and are
+// unchanged; test_lex_c_kw_table_c, _cs, _java, _ts, _go and _rust gained
+// one.
 
 @(private = "file")
 lc_word_kind :: proc(line: string, kw: ^Keyword_Set, word: string) -> Token_Kind {
@@ -625,6 +638,9 @@ test_lex_c_kw_table_c :: proc(t: ^testing.T) {
 	testing.expectf(t, lc_word_kind(line, &kw, "struct") == .Keyword, "C: 'struct' is a Keyword")
 	testing.expectf(t, lc_word_kind(line, &kw, "Foo") == .Type, "C: identifier after 'struct' is Type")
 	testing.expectf(t, lc_word_kind(line, &kw, "int") == .Type, "C: 'int' is a known Type")
+	line2 := `if (x) { return 0; }`
+	testing.expectf(t, lc_word_kind(line2, &kw, "if") == .Keyword, "C: 'if' is a Keyword (plain keywords list, not type_intro)")
+	testing.expectf(t, lc_word_kind(line2, &kw, "return") == .Keyword, "C: 'return' is a Keyword")
 }
 
 @(test)
@@ -644,6 +660,8 @@ test_lex_c_kw_table_cs :: proc(t: ^testing.T) {
 	testing.expectf(t, lc_word_kind(line, &kw, "class") == .Keyword, "C#: 'class' is a Keyword")
 	testing.expectf(t, lc_word_kind(line, &kw, "Widget") == .Type, "C#: identifier after 'class' is Type")
 	testing.expectf(t, lc_word_kind(line, &kw, "int") == .Type, "C#: 'int' is a known Type")
+	testing.expectf(t, lc_word_kind(line, &kw, "public") == .Keyword, "C#: 'public' is a Keyword (plain keywords list, not type_intro)")
+	testing.expectf(t, lc_word_kind(line, &kw, "private") == .Keyword, "C#: 'private' is a Keyword")
 }
 
 @(test)
@@ -653,6 +671,7 @@ test_lex_c_kw_table_java :: proc(t: ^testing.T) {
 	testing.expectf(t, lc_word_kind(line, &kw, "class") == .Keyword, "Java: 'class' is a Keyword")
 	testing.expectf(t, lc_word_kind(line, &kw, "Widget") == .Type, "Java: identifier after 'class' is Type")
 	testing.expectf(t, lc_word_kind(line, &kw, "boolean") == .Type, "Java: 'boolean' is a known Type")
+	testing.expectf(t, lc_word_kind(line, &kw, "public") == .Keyword, "Java: 'public' is a Keyword (plain keywords list, not type_intro)")
 }
 
 @(test)
@@ -673,8 +692,17 @@ test_lex_c_kw_table_ts :: proc(t: ^testing.T) {
 	testing.expectf(t, lc_word_kind(line, &kw, "interface") == .Keyword, "TS: 'interface' is a Keyword")
 	testing.expectf(t, lc_word_kind(line, &kw, "Widget") == .Type, "TS: identifier after 'interface' is Type")
 	testing.expectf(t, lc_word_kind(line, &kw, "number") == .Type, "TS: 'number' is a known Type")
+	line2 := `readonly x: number = 1;`
+	testing.expectf(t, lc_word_kind(line2, &kw, "readonly") == .Keyword, "TS: 'readonly' is a Keyword (plain keywords list, not type_intro)")
 }
 
+// THE motivating case for IMPORTANT 1: the original fixture here
+// (`type Widget struct { Count int }`) only ever exercises words reached via
+// type_intro (type/struct), which is EXACTLY the blind spot that let 'func'
+// and 'map' ship missing from GO_KW.keywords -- a fixture built only from
+// type_intro words cannot catch an omission in the separate keywords slice.
+// 'func' is asserted directly because it is the single most frequent
+// keyword in any real Go file (every function declaration starts with it).
 @(test)
 test_lex_c_kw_table_go :: proc(t: ^testing.T) {
 	kw := GO_KW
@@ -682,6 +710,9 @@ test_lex_c_kw_table_go :: proc(t: ^testing.T) {
 	testing.expectf(t, lc_word_kind(line, &kw, "type") == .Keyword, "Go: 'type' is a Keyword")
 	testing.expectf(t, lc_word_kind(line, &kw, "Widget") == .Type, "Go: identifier after 'type' is Type")
 	testing.expectf(t, lc_word_kind(line, &kw, "int") == .Type, "Go: 'int' is a known Type")
+	line2 := `func f() map[string]int { return nil }`
+	testing.expectf(t, lc_word_kind(line2, &kw, "func") == .Keyword, "Go: 'func' is a Keyword (was missing -- IMPORTANT 1)")
+	testing.expectf(t, lc_word_kind(line2, &kw, "map") == .Keyword, "Go: 'map' is a Keyword (was missing -- IMPORTANT 1)")
 }
 
 @(test)
@@ -691,6 +722,9 @@ test_lex_c_kw_table_rust :: proc(t: ^testing.T) {
 	testing.expectf(t, lc_word_kind(line, &kw, "struct") == .Keyword, "Rust: 'struct' is a Keyword")
 	testing.expectf(t, lc_word_kind(line, &kw, "Widget") == .Type, "Rust: identifier after 'struct' is Type")
 	testing.expectf(t, lc_word_kind(line, &kw, "u32") == .Type, "Rust: 'u32' is a known Type")
+	line2 := `fn f() { let x = 1; }`
+	testing.expectf(t, lc_word_kind(line2, &kw, "fn") == .Keyword, "Rust: 'fn' is a Keyword (plain keywords list, not type_intro)")
+	testing.expectf(t, lc_word_kind(line2, &kw, "let") == .Keyword, "Rust: 'let' is a Keyword")
 }
 
 @(test)
@@ -700,4 +734,199 @@ test_lex_c_kw_table_odin :: proc(t: ^testing.T) {
 	testing.expectf(t, lc_word_kind(line, &kw, "struct") == .Keyword, "Odin: 'struct' is a Keyword")
 	testing.expectf(t, lc_word_kind(line, &kw, "Widget") == .None, "Odin: the type name comes BEFORE 'struct' -- type_intro must not guess here")
 	testing.expectf(t, lc_word_kind(line, &kw, "int") == .Type, "Odin: 'int' is a known Type")
+}
+
+// ---------------------------------------------------------------------------
+// Nested block comments (IMPORTANT 2, 2026-07 review) — Odin and Rust ONLY.
+// Confirmed empirically for this task (not reasoned from memory): both
+// `odin check` and `rustc`, the actual toolchains available in this
+// environment, were run against "/* outer /* inner */ still comment */" and
+// accepted it as one balanced comment, then separately rejected the residue
+// "still comment */" alone as a syntax error — see ODIN_KW/RUST_KW's own
+// comments. lc_find_block_comment_close_depth tracks the nesting DEPTH as
+// Lex_State's raw byte value (see that type's comment, lex.odin) instead of
+// widening the type — these tests check that encoding directly via
+// `int(state)`, not just the boolean Normal/not-Normal split every other
+// lexer here cares about.
+
+@(test)
+test_lex_c_nested_comment_closes_on_same_line :: proc(t: ^testing.T) {
+	kw := ODIN_KW
+	line := `/* outer /* inner */ still comment */`
+	out: [8]Token
+	n, state := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
+	testing.expectf(t, state == .Normal, "a balanced nested comment must close by the line's end, got %v", state)
+	testing.expectf(t, n >= 1, "want at least 1 token, got %d", n)
+	if n >= 1 {
+		ctok_eq(t, out[0], 0, len(line), .Comment, "the WHOLE line is one comment -- the inner /* does not close it early")
+	}
+}
+
+// The depth itself, threaded across three lines: opens twice (depth 2),
+// closes once (still open, depth 1 -- NOT Normal), then closes the matching
+// outer one (Normal, and real code after it is lexed for real).
+@(test)
+test_lex_c_nested_comment_depth_threads_across_lines :: proc(t: ^testing.T) {
+	kw := RUST_KW
+	line1 := `fn f() { /* outer /* inner`
+	line2 := `inner close */ still outer`
+	line3 := `outer close */ let x = 1;`
+	out: [8]Token
+
+	_, s1 := lex_c(transmute([]u8)line1, .Normal, &kw, out[:])
+	testing.expectf(t, s1 != .Normal, "line1: two opens, no closes -- must still be open, got %v", s1)
+	testing.expectf(t, int(s1) == 2, "line1: depth must be 2 (two nested opens), got %d", int(s1))
+
+	_, s2 := lex_c(transmute([]u8)line2, s1, &kw, out[:])
+	testing.expectf(t, s2 != .Normal, "line2: one close of two -- still open, got %v", s2)
+	testing.expectf(t, int(s2) == 1, "line2: depth must drop to 1, not close fully, got %d", int(s2))
+
+	n3, s3 := lex_c(transmute([]u8)line3, s2, &kw, out[:])
+	testing.expectf(t, s3 == .Normal, "line3: the matching outer close -- must be Normal now, got %v", s3)
+	testing.expectf(t, n3 > 0, "line3: real code after the close must still be scanned, got 0 tokens")
+	let_start := strings.index(line3, "let")
+	let_found := false
+	for i in 0 ..< n3 {
+		if out[i].start == let_start {
+			ctok_eq(t, out[i], let_start, len("let"), .Keyword, "'let' after the real close is real code, not comment")
+			let_found = true
+		}
+	}
+	testing.expectf(t, let_found, "want 'let' lexed as a real Keyword after the comment closes")
+}
+
+// A pathological line with more nested opens than fit in one byte (255) must
+// SATURATE, not wrap back toward 0 -- wrapping would masquerade as
+// Lex_State.Normal and silently declare a still-deeply-open comment closed.
+// 300 unmatched opens, no closes at all.
+@(test)
+test_lex_c_nested_comment_depth_saturates_not_wraps :: proc(t: ^testing.T) {
+	kw := ODIN_KW
+	line := strings.repeat("/* ", 300, context.temp_allocator)
+	out: [8]Token
+	_, state := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
+	testing.expectf(t, state != .Normal, "300 unmatched opens must never read back as Normal, got %v", state)
+	testing.expectf(t, int(state) == LC_MAX_COMMENT_DEPTH, "depth must saturate at %d, got %d", LC_MAX_COMMENT_DEPTH, int(state))
+}
+
+// The other direction, re-confirmed against a REAL per-language table now
+// that the close-scan is shared between the nesting and non-nesting paths:
+// C++ (nest_comments == false) must still show the original C behaviour --
+// the first "*/" always closes, regardless of any "/*" seen since.
+@(test)
+test_lex_c_cpp_still_non_nesting_via_real_table :: proc(t: ^testing.T) {
+	kw := CPP_KW
+	line := `/* /* */ int x;`
+	out: [8]Token
+	n, state := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
+	testing.expectf(t, state == .Normal, "C++ does not nest -- first */ must close, got %v", state)
+	want_end := strings.index(line, "*/") + 2
+	testing.expectf(t, n >= 1, "want at least 1 token, got %d", n)
+	if n >= 1 {
+		ctok_eq(t, out[0], 0, want_end, .Comment, "C++: comment ends at the FIRST */")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// The resync validator's own capacity truncation (IMPORTANT 3, 2026-07
+// review). lex_c_resync_valid's `toks: [256]Token` can fill before reaching
+// a candidate on a dense enough line -- lex_c keeps SCANNING past capacity
+// (by design) but stops EMITTING, so a String/Comment token past the 256th
+// slot is simply never written, and the validator's loop has nothing to
+// reject on. Fixture: enough Punct-producing "{}" pairs (260 tokens) to
+// exhaust the buffer before the line's own decoy string is ever reached.
+
+@(test)
+test_lex_c_resync_valid_rejects_when_token_capacity_truncated :: proc(t: ^testing.T) {
+	kw := LC_TEST_KW_C
+	line := strings.concatenate({strings.repeat("{}", 130, context.temp_allocator), ` x = "*/";`}, context.temp_allocator)
+	end := strings.index(line, `*/`) + 2
+	ok := lex_c_resync_valid(&kw, transmute([]u8)line, end)
+	testing.expectf(t, !ok, "truncation means this call cannot know -- the safe answer is reject, not a default accept")
+}
+
+// ---------------------------------------------------------------------------
+// Nested-comment languages take the conservative "always reject" path
+// instead (IMPORTANT 2's fallout on the validator, and the corrected central
+// claim on lex_c_resync_valid -- see that proc's own comment for the full
+// counterexample): there is no way to soundly validate a resync candidate
+// for a nest_comments language from one physical line alone, because the
+// true incoming nesting DEPTH is exactly the fact a single line can't carry.
+@(test)
+test_lex_c_resync_valid_always_rejects_for_nest_comments_languages :: proc(t: ^testing.T) {
+	kw := ODIN_KW
+	line := `int x; /* a real, self-contained comment */ int y;`
+	end := strings.index(line, `*/`) + 2
+	ok := lex_c_resync_valid(&kw, transmute([]u8)line, end)
+	testing.expectf(t, !ok, "a nest_comments language's validator must reject even an ordinary, real comment close -- it cannot know the true incoming depth")
+}
+
+// ---------------------------------------------------------------------------
+// JS/TS regex literals (IMPORTANT 6, 2026-07 review). Before this fix, lex_c
+// had NO concept of a regex literal at all: each '/' was examined on its
+// own, which was usually harmless (a lone '/' with no special following byte
+// just falls through as an ordinary, uncoloured byte) but broke badly the
+// moment a regex happened to contain the literal bytes "/*" (an escaped
+// "\/" immediately followed by a "*" quantifier is a completely ordinary way
+// to write one, e.g. matching zero-or-more slashes) or "//" -- both were
+// misread as a genuine comment open by the plain '/'+'*' or '/'+'/' check.
+// Unlike every OTHER imprecision in this lexer (bounded to one line or one
+// token), a phantom "/*" open's blast radius is the rest of the FILE: it
+// persists until the next literal "*/" anywhere at all, not just this line.
+// lc_scan_regex closes that gap by consuming the whole regex (when the
+// same-line heuristic in Keyword_Set.regex says a '/' here is regex-likely,
+// not division-likely) as one token, so its interior bytes are never
+// independently re-examined by the comment checks.
+
+@(test)
+test_lex_c_regex_with_embedded_slash_star_does_not_open_phantom_comment :: proc(t: ^testing.T) {
+	// THE motivating example from the review itself.
+	kw := JS_KW
+	line := `var re = /^https?:\/\/*/;`
+	out: [8]Token
+	_, state := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
+	testing.expectf(t, state == .Normal, "a same-line regex literal must never leave a comment open, got %v", state)
+}
+
+@(test)
+test_lex_c_regex_literal_recognized_as_one_token :: proc(t: ^testing.T) {
+	kw := JS_KW
+	line := `const re = /ab\/c/gi;`
+	out: [8]Token
+	n, state := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
+	testing.expectf(t, state == .Normal, "regex literal must not open comment state, got %v", state)
+	re_start := strings.index(line, `/ab`)
+	found := false
+	for i in 0 ..< n {
+		if out[i].start == re_start {
+			ctok_eq(t, out[i], re_start, len(`/ab\/c/gi`), .String, "the whole /pattern/flags literal is one token, escaped '/' and all")
+			found = true
+		}
+	}
+	testing.expectf(t, found, "want the regex literal token")
+}
+
+// A regex where the FIRST '/' is preceded by something value-shaped (an
+// identifier) must be treated as division, not misread as a regex open --
+// the same heuristic in the other direction.
+@(test)
+test_lex_c_slash_after_value_is_division_not_regex :: proc(t: ^testing.T) {
+	kw := JS_KW
+	line := `x = a / b;`
+	out: [8]Token
+	_, state := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
+	testing.expectf(t, state == .Normal, "ordinary division must not be mistaken for an unterminated regex, got %v", state)
+}
+
+// A language with kw.regex == false (the other nine -- none of them have a
+// /regex/ literal syntax at all) must show the UNCHANGED old behaviour: the
+// phantom-comment mistake this fixes is JS/TS-specific, gated by the flag,
+// not a blanket change to every language's '/' handling.
+@(test)
+test_lex_c_regex_disabled_for_language_without_it :: proc(t: ^testing.T) {
+	kw := LC_TEST_KW_C
+	line := `x = /^https?:\/\/*/;`
+	out: [8]Token
+	_, state := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
+	testing.expectf(t, state == .In_Comment, "kw.regex == false: the pre-existing (unfixed) behaviour for other languages must be unchanged")
 }

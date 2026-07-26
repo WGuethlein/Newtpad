@@ -3,13 +3,21 @@
 // per-language Keyword_Set (data, not branching — see the tables at the
 // bottom of this file and task-4-report.md for each list's source).
 //
-// Shares lex_xml's two-state shape exactly: Lex_State stays {Normal,
-// In_Comment} (lex.odin) — In_Comment here means "inside an unterminated
-// `/* ... */`", the only construct in any of these eleven grammars that
-// genuinely needs to survive past its own line. That is a deliberate scope
-// cut, not an oversight, and it is what keeps the resync anchor sound (see
-// lex_c_resync_valid's comment below, and EXT_LEXERS's warning comment in
-// program/highlight.odin):
+// Shares lex_xml's Lex_State TYPE exactly (lex.odin) — a block comment
+// (`/* ... */`) is the only construct in any of these eleven grammars that
+// genuinely needs to survive past its own line, which is what keeps the
+// resync anchor sound (see lex_c_resync_valid's comment below, and
+// EXT_LEXERS's warning comment in program/highlight.odin). For nine of the
+// eleven languages that is a flat two-value split, same as lex_xml
+// (In_Comment means exactly "inside an unterminated `/* ... */`"). Rust and
+// Odin (Keyword_Set.nest_comments) genuinely NEST block comments — verified
+// empirically for this task, not assumed (`odin check` and `rustc` both
+// accept "/* outer /* inner */ still comment */" as one balanced comment and
+// reject the residue "still comment */" alone as a syntax error) — so for
+// those two, Lex_State's raw byte carries a nesting DEPTH (1..255) instead
+// of a flat flag; see lc_find_block_comment_close_depth and Lex_State's own
+// comment (lex.odin) for why this still fits the one-byte budget without
+// widening the type. That is a deliberate scope cut, not an oversight:
 //
 //   - Double-quoted strings and char literals are LINE-LOCAL, same contract
 //     as lex_json: an unterminated one colours to the line's end rather than
@@ -31,6 +39,19 @@
 //     supporting the cross-line form soundly would need a new Lex_State
 //     value (which language, which delimiter?), and this batch does not
 //     spend one on it.
+//   - JS/TS regex literals (Keyword_Set.regex) are ALSO same-line-only —
+//     real JS/TS grammar treats an unescaped literal newline inside one as a
+//     syntax error — so lc_scan_regex needs no Lex_State either. Added after
+//     a 2026-07 review found a regex containing the literal bytes "/*" (an
+//     escaped "\/" immediately followed by a "*" quantifier) was mistaken
+//     for a block-comment open by the plain '/'+'*' check: unlike every
+//     other imprecision on this page, THAT mistake's blast radius was the
+//     rest of the file, not one line or one token, because the resulting
+//     phantom comment persists until the next literal "*/" anywhere at all.
+//     Distinguishing a regex from division needs the previous significant
+//     token — lc_scan_regex's caller tracks a same-line "does the last thing
+//     I saw complete an expression" flag for exactly this, gated to JS/TS
+//     only (Keyword_Set.regex).
 //   - Preprocessor lines (`#include`, `#define`, ...) colour only the
 //     directive word itself as Keyword, then fall through to the ordinary
 //     scanner for the remainder of the line — so a string or comment after
@@ -59,13 +80,29 @@ Raw_String_Kind :: enum u8 {
 // One language's vocabulary, as data — never branching logic. See the
 // per-language tables below for what's in each slice and where it came from.
 Keyword_Set :: struct {
-	keywords:   []string, // -> Token_Kind.Keyword
-	types:      []string, // built-in primitive / well-known type names -> Token_Kind.Type
-	type_intro: []string, // the identifier right after one of these -> Token_Kind.Type (also Keyword itself)
-	preproc:    bool, // a line starting (after leading whitespace) with '#' is a preprocessor directive
-	digit_sep:  u8, // '_' or '\'' as a numeric-literal digit separator; 0 disables
-	raw_string: Raw_String_Kind,
-	backtick:   bool, // Go/JS/TS backtick raw or template strings
+	keywords:      []string, // -> Token_Kind.Keyword
+	types:         []string, // built-in primitive / well-known type names -> Token_Kind.Type
+	type_intro:    []string, // the identifier right after one of these -> Token_Kind.Type (also Keyword itself)
+	preproc:       bool, // a line starting (after leading whitespace) with '#' is a preprocessor directive
+	digit_sep:     u8, // '_' or '\'' as a numeric-literal digit separator; 0 disables
+	raw_string:    Raw_String_Kind,
+	backtick:      bool, // Go/JS/TS backtick raw or template strings
+	// Odin and Rust nest /* */ (verified empirically: `odin check` and
+	// `rustc` both accept "/* outer /* inner */ still comment */" as ONE
+	// comment, and reject "still comment */" alone as a syntax error --
+	// see lex_c.odin's header). Every other language here follows C's rule
+	// (the FIRST "*/" always closes, regardless of any "/*" seen since).
+	// Honoured by lc_find_block_comment_close_depth, which tracks depth as
+	// the RAW numeric value of Lex_State itself (see that type's comment,
+	// lex.odin) rather than widening the enum.
+	nest_comments: bool,
+	// JS/TS: a leading '/' NOT immediately followed by '/' or '*', and not
+	// immediately preceded (this scan) by something value-shaped, may open
+	// a same-line /regex/ literal -- see lc_scan_regex and IMPORTANT 6 in
+	// task-4-report.md for why this exists (a regex containing the literal
+	// bytes "/*" was otherwise misread as a block-comment open that can
+	// persist to the end of the FILE, not just the line).
+	regex:         bool,
 }
 
 @(private = "file")
@@ -104,20 +141,57 @@ lc_word_in :: proc(word: string, list: []string) -> bool {
 	return false
 }
 
-// Index just past the line's first "*/" at or after `i`, or -1 if none.
-// Bounded by len(line), mirroring lx_find_comment_close (lex_xml.odin) —
-// same shape, different two-byte marker. Finding the FIRST occurrence (not
-// scanning past an inner "/*") is exactly what makes "/* /* */" close at the
-// first "*/" instead of nesting: a block comment's scan never looks at
-// what's inside it beyond hunting for this marker.
+// Max representable nesting depth: Lex_State is one byte (lex.odin's hard
+// #assert), and depth is threaded across lines AS that byte's raw value (see
+// lc_find_block_comment_close_depth below), so 255 is the hard ceiling, not
+// a tunable. Incrementing SATURATES here rather than wrapping — a plain
+// `+= 1` on a u8 at 255 wraps to 0, which would masquerade as
+// Lex_State.Normal and silently declare a still-very-much-open comment
+// closed. 255 levels of genuine nesting is not a realistic file; this only
+// guards against that wraparound ever being reachable at all.
+LC_MAX_COMMENT_DEPTH :: 255
+
+// Where a block comment closes, honouring nesting when `nest` (see
+// Keyword_Set.nest_comments): `depth_in` is the count of currently-open "/*"
+// markers on entry (>=1 — the one that got us here always counts), and the
+// scan increments on every "/*" it sees (only when `nest`) and decrements on
+// every "*/", closing (returning depth 0) the moment depth reaches zero.
+// Bounded by len(line), mirroring lx_find_comment_close (lex_xml.odin).
+// Returns (-1, depth) if the line ends first — the comment is still open,
+// at whatever depth it ended at (this is exactly the byte lex_c threads
+// forward as Lex_State; see that type's comment, lex.odin).
+//
+// When !nest, this degenerates to the ORIGINAL (pre-Task-4-review)
+// lc_find_block_comment_close's exact shape: no "/*" is ever counted, so the
+// very first "*/" always drives depth_in (always 1 for a non-nesting
+// grammar — see lex_c's two call sites below) to 0 and closes, regardless of
+// any "/*" seen since — C's rule, unchanged, and exactly what makes
+// "/* /* */" close at the first "*/" instead of nesting for those nine
+// languages. depth_in is only ever handed in as either the literal 1 (a
+// comment just opened this scan) or int(state_in) (a comment carried over
+// from a previous line, whose raw byte IS the depth for both nesting and
+// non-nesting grammars alike — a non-nesting grammar's state_in is never
+// anything but Normal(0) or In_Comment(1) by construction, so int(state_in)
+// is always exactly 1 there too).
 @(private = "file")
-lc_find_block_comment_close :: proc(line: []u8, i: int) -> int {
+lc_find_block_comment_close_depth :: proc(line: []u8, i: int, depth_in: int, nest: bool) -> (close: int, depth_out: int) {
+	depth := depth_in
 	j := i
 	for j + 2 <= len(line) {
-		if line[j] == '*' && line[j + 1] == '/' {return j + 2}
+		if nest && line[j] == '/' && line[j + 1] == '*' {
+			if depth < LC_MAX_COMMENT_DEPTH {depth += 1} // saturate, never wrap — see LC_MAX_COMMENT_DEPTH
+			j += 2
+			continue
+		}
+		if line[j] == '*' && line[j + 1] == '/' {
+			depth -= 1
+			j += 2
+			if depth == 0 {return j, 0}
+			continue
+		}
 		j += 1
 	}
-	return -1
+	return -1, depth
 }
 
 // Length of a quoted run starting at line[i] (line[i] == q), or 0 if the
@@ -229,6 +303,59 @@ lc_scan_raw_string :: proc(line: []u8, i: int, kind: Raw_String_Kind) -> int {
 		return 0
 	}
 	return 0
+}
+
+// Length of a same-line JS/TS regex literal starting at line[i] (line[i] ==
+// '/'), or 0 if it doesn't plausibly close on this line -- same "leave it
+// plain" policy as the backtick/raw-string forms above: a regex is always
+// genuinely line-local in real JS/TS grammar (an unescaped literal newline
+// inside one is a syntax error there too), so this is pure same-line
+// scanning, no Lex_State needed, and failing to find a close just means
+// "not a regex after all" rather than "broken code."
+//
+// Honours a backslash escape (`\/` never closes it) and a `[...]` character
+// class (an unescaped '/' inside brackets doesn't close it either -- e.g.
+// `/[a/b]/` is one regex matching 'a', '/', or 'b', not two divisions).
+// Absorbs trailing flag letters (g, i, m, s, u, y, ...) into the same token,
+// same shape as lc_scan_number_suffix.
+//
+// See IMPORTANT 6 in task-4-report.md for why this exists: without it, a
+// regex containing the literal bytes "/*" (e.g. an escaped "\/" immediately
+// followed by a "*" quantifier, as in `/^https?:\/\/*/`) was mistaken for a
+// block-comment OPEN by the ordinary '/'+'*' check, which then hunts for a
+// "*/" that may not exist anywhere else in the file -- unlike every other
+// imprecision in this lexer (bounded to one token or one line), that mistake
+// mis-colours every line from there to the end of the document. Consuming
+// the whole regex as one token here means its interior bytes are never
+// independently re-examined by that check at all.
+@(private = "file")
+lc_scan_regex :: proc(line: []u8, i: int) -> int {
+	j := i + 1
+	in_class := false
+	for j < len(line) {
+		b := line[j]
+		if b == '\\' && j + 1 < len(line) {
+			j += 2
+			continue
+		}
+		if b == '[' {
+			in_class = true
+			j += 1
+			continue
+		}
+		if b == ']' {
+			in_class = false
+			j += 1
+			continue
+		}
+		if b == '/' && !in_class {
+			k := j + 1
+			for k < len(line) && lc_is_ident_char(line[k]) {k += 1} // trailing flags
+			return k - i
+		}
+		j += 1
+	}
+	return 0 // doesn't close on this line -- not a regex we can confidently claim
 }
 
 // Consume trailing letters/digits directly following a number's numeric
@@ -362,14 +489,19 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 	i := 0
 	n = 0
 
-	if state == .In_Comment {
-		close := lc_find_block_comment_close(line, 0)
+	if state != .Normal {
+		// int(state) IS the depth: for a non-nesting grammar state_in is
+		// never anything but .Normal(0)/.In_Comment(1) by construction, so
+		// this is exactly 1 there too -- see
+		// lc_find_block_comment_close_depth's comment for why reusing the
+		// raw byte this way is sound for every language, nesting or not.
+		close, depth_out := lc_find_block_comment_close_depth(line, 0, int(state), kw.nest_comments)
 		if close < 0 {
 			if len(line) > 0 && n < len(out) {
 				out[n] = Token{0, len(line), .Comment}
 				n += 1
 			}
-			return n, .In_Comment
+			return n, Lex_State(u8(depth_out))
 		}
 		if n < len(out) {
 			out[n] = Token{0, close, .Comment}
@@ -404,6 +536,14 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 	// unrelated keyword) breaks the chain.
 	pending_type := false
 
+	// true when the last significant thing this scan saw completes an
+	// expression (a value, or a ')'/']' closing one) -- i.e. a following '/'
+	// more likely means DIVISION than the start of a regex literal. Only
+	// consulted when kw.regex; see lc_scan_regex and IMPORTANT 6 in
+	// task-4-report.md. Starts false: nothing precedes the first byte of a
+	// line, which is itself a position a regex may legitimately start.
+	expr_complete := false
+
 	for i < len(line) {
 		b := line[i]
 
@@ -422,13 +562,19 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 		}
 
 		if b == '/' && i + 1 < len(line) && line[i + 1] == '*' {
-			close := lc_find_block_comment_close(line, i + 2)
+			// A regex literal can NEVER genuinely start with "/*" -- a bare
+			// '*' with nothing to repeat is itself a regex syntax error --
+			// so this is always a real block-comment open (or, for a
+			// non-regex language, always was). lc_scan_regex is only
+			// attempted below, for a '/' NOT immediately followed by '*' or
+			// '/'.
+			close, depth_out := lc_find_block_comment_close_depth(line, i + 2, 1, kw.nest_comments)
 			if close < 0 {
 				if n < len(out) {
 					out[n] = Token{i, len(line) - i, .Comment}
 					n += 1
 				}
-				return n, .In_Comment // NOTE: unconditional -- see header
+				return n, Lex_State(u8(depth_out)) // NOTE: unconditional -- see header
 			}
 			if n < len(out) {
 				out[n] = Token{i, close - i, .Comment}
@@ -436,7 +582,25 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 			}
 			i = close
 			pending_type = false
+			expr_complete = false
 			continue
+		}
+
+		if kw.regex && b == '/' && !expr_complete {
+			if l := lc_scan_regex(line, i); l > 0 {
+				if n < len(out) {
+					out[n] = Token{i, l, .String}
+					n += 1
+				}
+				i += l
+				pending_type = false
+				expr_complete = true // a regex literal IS a value
+				continue
+			}
+			// Doesn't close on this line, or line[i] wasn't really a regex
+			// open after all: falls through to ordinary scanning below,
+			// same "leave it plain" contract as the backtick/raw-string
+			// forms -- see the file header.
 		}
 
 		if kw.raw_string != .None && (b == 'r' || (kw.raw_string == .Cpp && b == 'R')) {
@@ -447,6 +611,7 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 				}
 				i += l
 				pending_type = false
+				expr_complete = true
 				continue
 			}
 		}
@@ -459,10 +624,12 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 				}
 				i += l
 				pending_type = false
+				expr_complete = true
 				continue
 			}
 			// Doesn't close on this line: left plain (see file header).
 			i += 1
+			expr_complete = false
 			continue
 		}
 
@@ -475,6 +642,7 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 			}
 			i += l
 			pending_type = false
+			expr_complete = true
 			continue
 		}
 
@@ -486,9 +654,11 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 				}
 				i += l
 				pending_type = false
+				expr_complete = true
 				continue
 			}
 			i += 1 // an unterminated char literal (or a stray quote) -- skip just this byte
+			expr_complete = false
 			continue
 		}
 
@@ -500,6 +670,7 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 				}
 				i += l
 				pending_type = false
+				expr_complete = true
 				continue
 			}
 		}
@@ -524,6 +695,11 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 				n += 1
 			}
 			pending_type = next_pending
+			// A Keyword is usually followed by an operand (return/typeof/
+			// case/new/... in the languages that have kw.regex), so treat
+			// it like an operator for the regex heuristic; a plain
+			// identifier or a known Type name is a value.
+			expr_complete = kind != .Keyword
 			i += l
 			continue
 		}
@@ -535,10 +711,12 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 			}
 			i += 1
 			pending_type = false
+			expr_complete = b == ')' || b == ']' // closes a call/subscript -> a value; every other punct (`{}(;,:`) opens an expression
 			continue
 		}
 
 		pending_type = false
+		expr_complete = false // an operator byte this lexer doesn't tokenize (+ - = < ...): an operand should follow
 		i += 1
 	}
 	return n, state
@@ -559,21 +737,51 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 // ordinary code and mis-colour every row from there to the viewport -- the
 // exact failure mode the task brief warns about.
 //
-// This validator is sound given lex_c's actual state shape: Lex_State only
-// ever carries ONE fact across a physical line boundary for this grammar --
-// whether a block comment is still open (see this file's header: strings,
-// char literals, and same-line-only raw/backtick forms are all line-local).
-// So re-lexing THIS line alone, assuming .Normal at its start, reproduces
-// every String/Comment span a real forward lex would need to judge this
-// candidate — with one asymmetry, and it is always the SAFE one: if the line
-// actually starts inside a carried-over block comment (so the .Normal
-// assumption here is technically wrong), the only way that can change the
-// verdict is by mistaking some of that comment's prose for a spurious
-// String/Comment span, which can only make this proc REJECT a candidate a
-// full-context lex would have accepted (safe: the caller just tries an
-// earlier occurrence, or bails to the documented cap-hit .Normal fallback).
-// It can never manufacture an ACCEPT that full context would reject: block
-// comments don't nest, so the first "*/" after a real "/*" always closes it
+// CORRECTNESS NOTE (2026-07 review): an earlier version of this comment
+// claimed this proc "can never manufacture an ACCEPT that full context would
+// reject." That is FALSE AS STATED, in two ways a later review caught, both
+// now closed -- but load-bearing enough to spell out for whoever adds the
+// next stateful lexer, rather than just quietly fixing the code and leaving
+// the old, false claim standing:
+//
+//   1. `toks` below is a FIXED [256]Token buffer. lex_c stops EMITTING at
+//      capacity but keeps SCANNING (by design -- see lex_c's own comment),
+//      so on a line dense enough to exceed 256 tokens (400-800 bytes of
+//      real code is enough), a String or Comment token that would have
+//      covered `candidate_end` could simply never have been WRITTEN, and
+//      the loop below would find nothing to reject on. Fixed by checking
+//      `n == len(toks)` (truncation) and rejecting outright: truncation
+//      means "this call cannot know," and the safe answer to "can I trust
+//      this candidate" is no, same as a cap hit in lex_resync_state itself.
+//   2. The CALLER (lex_resync_state, lex_index.odin) used to hand this proc
+//      a `line` read via `pt_line_start_cap(..., RENDER_LINE_CAP)` while
+//      discarding that call's own `exact` flag. On a line longer than
+//      RENDER_LINE_CAP (8 KiB), the returned start is a scan FLOOR, not the
+//      line's real start -- so a string or comment opener further back on
+//      the true line is invisible to this proc, and on a sufficiently long
+//      line the buffer doesn't even reach `candidate_end` at all, which
+//      made every call return true unconditionally. Fixed at the caller:
+//      it now skips validating a candidate at all when `exact` is false,
+//      rather than handing this proc a line it cannot trust.
+//
+// With both closed, the argument below is accurate again FOR A NON-NESTING
+// GRAMMAR (nine of these eleven languages -- see the nest_comments carve-out
+// immediately below, which this proc takes BEFORE reaching any of this):
+// Lex_State only ever carries ONE fact across a physical line boundary for
+// a non-nesting C-family grammar -- whether a block comment is still open
+// (see this file's header: strings, char literals, and same-line-only
+// raw/backtick forms are all line-local). So re-lexing THIS line alone,
+// assuming .Normal at its start, reproduces every String/Comment span a real
+// forward lex would need to judge this candidate — with one asymmetry, and
+// it is always the SAFE one: if the line actually starts inside a
+// carried-over block comment (so the .Normal assumption here is technically
+// wrong), the only way that can change the verdict is by mistaking some of
+// that comment's prose for a spurious String/Comment span, which can only
+// make this proc REJECT a candidate a full-context lex would have accepted
+// (safe: the caller just tries an earlier occurrence, or bails to the
+// documented cap-hit .Normal fallback). It can never manufacture an ACCEPT
+// that full context would reject: for a NON-NESTING grammar, block comments
+// don't nest, so the first "*/" after a real "/*" always closes it
 // regardless of what came before on the line -- a candidate that genuinely
 // closes a real (possibly-prior-context) comment is correctly accepted
 // whether or not the Normal-start assumption matches the true state.
@@ -585,11 +793,31 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 // so only a STRICTLY interior overlap rejects it -- which can only happen
 // for a `//` line comment that continues past the candidate to the true
 // line end (a same-line block comment's own close is never interior to
-// itself, by construction: lc_find_block_comment_close stops at the first
-// "*/" it finds).
+// itself, by construction).
+//
+// NESTING GRAMMARS (Rust, Odin -- Keyword_Set.nest_comments) BREAK THIS
+// ARGUMENT, and NOT just in the two ways above: the "first */ always
+// closes" invariant the accept-case proof depends on is specifically false
+// once "/*" can appear INSIDE an already-open comment and genuinely deepen
+// it. Concrete counterexample: true state_in is already In_Comment at depth
+// 1 (opened on some earlier line this proc never sees), and THIS line reads
+// `/* comment */ real code`. The true forward lex (nest-aware, starting at
+// depth 1) sees the "/*" as a NESTED open (depth -> 2), then the "*/" only
+// brings it back to depth 1 -- still open, "real code" is still comment
+// prose. This proc's wrong .Normal-assumed re-lex instead sees the same
+// bytes as a fresh, self-contained "/* comment */" (depth 0 -> 1 -> 0) and
+// reports the candidate at that "*/" as a clean close -- a genuine FALSE
+// ACCEPT, not merely an over-cautious reject, and there is no way to tell
+// the two situations apart from this one line: the true incoming depth is
+// exactly the fact this proc does not have. So for a nest_comments language
+// the only answer that can never be wrong is "no" -- see the check at the
+// top of the function body below.
 lex_c_resync_valid :: proc(kw: ^Keyword_Set, line: []u8, candidate_end: int) -> bool {
+	if kw.nest_comments {return false} // see "NESTING GRAMMARS" above
+
 	toks: [256]Token
 	n, _ := lex_c(line, .Normal, kw, toks[:])
+	if n == len(toks) {return false} // truncated: see "CORRECTNESS NOTE" point 1 above
 	for k in 0 ..< n {
 		tk := toks[k]
 		if tk.kind == .String {
@@ -701,11 +929,13 @@ C_KW := Keyword_Set {
 		"uint32_t",
 		"uint64_t",
 	},
-	type_intro = {"struct", "union", "enum"},
-	preproc    = true,
-	digit_sep  = '_',
-	raw_string = .None,
-	backtick   = false,
+	type_intro    = {"struct", "union", "enum"},
+	preproc       = true,
+	digit_sep     = '_',
+	raw_string    = .None,
+	backtick      = false,
+	nest_comments = false,
+	regex         = false,
 }
 
 // --- C++ (.cpp, .hpp) ---------------------------------------------------
@@ -794,11 +1024,13 @@ CPP_KW := Keyword_Set {
 		"xor_eq",
 	},
 	types = {"void", "bool", "char", "char8_t", "char16_t", "char32_t", "wchar_t", "short", "int", "long", "float", "double", "signed", "unsigned", "auto"},
-	type_intro = {"class", "struct", "union", "enum", "typename", "using"},
-	preproc    = true,
-	digit_sep  = '\'',
-	raw_string = .Cpp,
-	backtick   = false,
+	type_intro    = {"class", "struct", "union", "enum", "typename", "using"},
+	preproc       = true,
+	digit_sep     = '\'',
+	raw_string    = .Cpp,
+	backtick      = false,
+	nest_comments = false,
+	regex         = false,
 }
 
 // --- C# (.cs) -------------------------------------------------------------
@@ -915,11 +1147,13 @@ CS_KW := Keyword_Set {
 		"yield",
 	},
 	types = {"bool", "byte", "char", "decimal", "double", "float", "int", "long", "object", "sbyte", "short", "string", "uint", "ulong", "ushort", "void", "dynamic", "nint", "nuint"},
-	type_intro = {"class", "struct", "interface", "enum", "record"},
-	preproc    = true,
-	digit_sep  = '_',
-	raw_string = .None,
-	backtick   = false,
+	type_intro    = {"class", "struct", "interface", "enum", "record"},
+	preproc       = true,
+	digit_sep     = '_',
+	raw_string    = .None,
+	backtick      = false,
+	nest_comments = false,
+	regex         = false,
 }
 
 // --- Java (.java) ----------------------------------------------------------
@@ -986,11 +1220,13 @@ JAVA_KW := Keyword_Set {
 		"with",
 	},
 	types = {"boolean", "byte", "char", "double", "float", "int", "long", "short", "void"},
-	type_intro = {"class", "interface", "enum", "record", "extends", "implements"},
-	preproc    = false,
-	digit_sep  = '_',
-	raw_string = .None,
-	backtick   = false,
+	type_intro    = {"class", "interface", "enum", "record", "extends", "implements"},
+	preproc       = false,
+	digit_sep     = '_',
+	raw_string    = .None,
+	backtick      = false,
+	nest_comments = false,
+	regex         = false,
 }
 
 // --- JavaScript (.js) -------------------------------------------------------
@@ -999,6 +1235,13 @@ JAVA_KW := Keyword_Set {
 // -- always-reserved words, strict-mode/module-only reserved words, and the
 // future-reserved-words tables on that page. No `types` list: JS has no
 // primitive type keywords.
+//
+// regex = true (2026-07 review, IMPORTANT 6): JS has a /regex/ literal
+// syntax lex_c did not recognize at all until this fix -- see lc_scan_regex
+// and Keyword_Set.regex's own comment for the mechanism, and
+// task-4-report.md for the motivating bug (a regex containing the literal
+// bytes "/*" was mistaken for a block-comment open that persists to the end
+// of the file, not just the line).
 JS_KW := Keyword_Set {
 	keywords = {
 		"break",
@@ -1052,11 +1295,13 @@ JS_KW := Keyword_Set {
 		"as",
 		"from",
 	},
-	type_intro = {"class", "extends"},
-	preproc    = false,
-	digit_sep  = '_',
-	raw_string = .None,
-	backtick   = true,
+	type_intro    = {"class", "extends"},
+	preproc       = false,
+	digit_sep     = '_',
+	raw_string    = .None,
+	backtick      = true,
+	nest_comments = false,
+	regex         = true,
 }
 
 // --- TypeScript (.ts) --------------------------------------------------
@@ -1129,20 +1374,46 @@ TS_KW := Keyword_Set {
 		"public",
 	},
 	types = {"string", "number", "boolean", "any", "unknown", "never", "object", "symbol", "bigint", "undefined"},
-	type_intro = {"class", "interface", "type", "enum", "namespace", "module", "extends", "implements"},
-	preproc    = false,
-	digit_sep  = '_',
-	raw_string = .None,
-	backtick   = true,
+	type_intro    = {"class", "interface", "type", "enum", "namespace", "module", "extends", "implements"},
+	preproc       = false,
+	digit_sep     = '_',
+	raw_string    = .None,
+	backtick      = true,
+	nest_comments = false,
+	regex         = true,
 }
 
 // --- Go (.go) --------------------------------------------------------------
 // Source: the Go language specification, "Keywords" and "Predeclared
 // identifiers" sections (go.dev/ref/spec). Go's 25 reserved keywords are
-// exhaustively enumerated by the spec itself (unlike most of the other
-// languages here); `types` is the predeclared-identifier type list from the
-// same page. Go's raw string literal is backtick-delimited with no escapes
-// at all -- the single most exact fit of any language for lc_scan_backtick.
+// exhaustively enumerated by the spec itself: break, case, chan, const,
+// continue, default, defer, else, fallthrough, for, func, go, goto, if,
+// import, interface, map, package, range, return, select, struct, switch,
+// type, var. `type`/`struct`/`interface` are colour-equivalent Keywords via
+// type_intro below (see that field's own comment), not missing from this
+// list -- they belong there instead because Go's declaration shape puts a
+// type NAME right after each of them, which this list alone can't express.
+//
+// CORRECTION (2026-07 review): this table originally listed 24 entries and
+// claimed "all 25, exhaustively enumerated" -- but four of those 24
+// (true/false/iota/nil, still present below) are PREDECLARED IDENTIFIERS
+// per the spec's own "Predeclared identifiers" section, not keywords, and
+// the table was actually missing two real keywords outright: `func` (the
+// single most frequent keyword in any Go file -- every function
+// declaration starts with it) and `map`. Both are added below. true/false/
+// iota/nil are left in `keywords` rather than removed: every other
+// language's table in this file also colours its "true/false/null-ish"
+// literals as Keyword for the same reason (see CPP_KW, JS_KW, JAVA_KW,
+// RUST_KW) -- "colour by shape," not by the spec's own part-of-speech label
+// -- so this is a deliberate, consistent choice, not the bug. The bug was
+// the two missing entries, and `test_lex_c_kw_table_go` below now asserts
+// `func`/`map` directly (a fixture built only from type_intro words, as the
+// original test was, cannot catch an omission in the plain keywords list --
+// exactly how this slipped through the first time).
+//
+// `types` is the predeclared-identifier TYPE list from the same page. Go's
+// raw string literal is backtick-delimited with no escapes at all -- the
+// single most exact fit of any language for lc_scan_backtick.
 GO_KW := Keyword_Set {
 	keywords = {
 		"break",
@@ -1155,10 +1426,12 @@ GO_KW := Keyword_Set {
 		"else",
 		"fallthrough",
 		"for",
+		"func",
 		"go",
 		"goto",
 		"if",
 		"import",
+		"map",
 		"package",
 		"range",
 		"return",
@@ -1171,11 +1444,13 @@ GO_KW := Keyword_Set {
 		"nil",
 	},
 	types = {"any", "bool", "byte", "comparable", "complex64", "complex128", "error", "float32", "float64", "int", "int8", "int16", "int32", "int64", "rune", "string", "uint", "uint8", "uint16", "uint32", "uint64", "uintptr"},
-	type_intro = {"type", "struct", "interface"},
-	preproc    = false,
-	digit_sep  = '_',
-	raw_string = .None,
-	backtick   = true,
+	type_intro    = {"type", "struct", "interface"},
+	preproc       = false,
+	digit_sep     = '_',
+	raw_string    = .None,
+	backtick      = true,
+	nest_comments = false,
+	regex         = false,
 }
 
 // --- Rust (.rs) ------------------------------------------------------------
@@ -1185,6 +1460,15 @@ GO_KW := Keyword_Set {
 // belongs in the same coloured bucket). Primitive type names are from
 // general knowledge of `std` (the fetched page didn't enumerate them); this
 // list is unusually stable and uncontroversial across Rust's history.
+//
+// nest_comments = true (2026-07 review, IMPORTANT 2): Rust's block comments
+// NEST -- The Rust Reference's "Comments" section states this directly, and
+// it was confirmed empirically for this task by actually compiling both
+// halves with the rustc available in this environment (1.87.0):
+// "/* outer /* inner */ still comment */" compiles clean as a whole
+// program, while "still comment */" alone (the residue C's non-nesting rule
+// would leave behind) fails with a parse error -- the same shape of check
+// already done for Odin below, just with rustc instead of odin check.
 RUST_KW := Keyword_Set {
 	keywords = {
 		"_",
@@ -1239,11 +1523,13 @@ RUST_KW := Keyword_Set {
 		"macro_rules",
 	},
 	types = {"i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64", "bool", "char", "str"},
-	type_intro = {"struct", "enum", "trait", "impl", "type"},
-	preproc    = false,
-	digit_sep  = '_',
-	raw_string = .Rust,
-	backtick   = false,
+	type_intro    = {"struct", "enum", "trait", "impl", "type"},
+	preproc       = false,
+	digit_sep     = '_',
+	raw_string    = .Rust,
+	backtick      = false,
+	nest_comments = true,
+	regex         = false,
 }
 
 // --- Odin (.odin) -----------------------------------------------------------
@@ -1255,6 +1541,16 @@ RUST_KW := Keyword_Set {
 // "or", "not" (Odin uses `&&`/`||`/`!`, not word-operators -- not observed
 // anywhere in this tree) and a bare "private" keyword (Odin spells this as
 // the `@(private)` attribute, not a keyword).
+//
+// nest_comments = true (2026-07 review, IMPORTANT 2): confirmed empirically
+// with the odin toolchain available in this environment, not asserted from
+// memory -- `odin check` accepts a file whose entire content is
+// "/* outer /* inner */ still comment */" (one balanced, nested comment),
+// and separately rejects "still comment */" alone (the residue C's
+// non-nesting rule would leave behind) as a syntax error. This codebase's
+// OWN source is Odin, so a non-nesting lexer would mis-colour a real file in
+// this very tree the first time Wyatt opened one containing a commented-out
+// block that itself contains a comment.
 //
 // type_intro is deliberately EMPTY: Odin's type-declaration shape is
 // `Name :: struct { ... }` -- the identifier comes BEFORE `struct`, not
@@ -1349,9 +1645,11 @@ ODIN_KW := Keyword_Set {
 		"any",
 		"typeid",
 	},
-	type_intro = {},
-	preproc    = false,
-	digit_sep  = '_',
-	raw_string = .None,
-	backtick   = false,
+	type_intro    = {},
+	preproc       = false,
+	digit_sep     = '_',
+	raw_string    = .None,
+	backtick      = false,
+	nest_comments = true,
+	regex         = false,
 }

@@ -41,6 +41,17 @@ Token_Kind :: enum u8 {
 // the index is 10 MB; a wider backing type multiplies that directly. If a
 // future lexer's grammar cannot be captured in 256 states, that is a decision
 // to bring back rather than one to make by quietly widening this enum.
+//
+// The two named values below are all lex_xml, lex_log and lex_json ever
+// produce or consume. A lexer whose grammar needs more than a flat
+// Normal/In_Comment split (Task 4's lex_c, for a NESTING block comment --
+// see Keyword_Set.nest_comments, lex_c.odin) may reinterpret a non-Normal
+// value's raw byte as an integer depth (1..255) rather than a boolean flag,
+// entirely within this same one-byte budget: 0 stays Normal for every
+// lexer, unconditionally, and every OTHER lexer only ever writes/reads 0 or
+// 1, so a lexer that never nests is completely unaffected by one that does.
+// That is a decision about how lex_c spends its own byte, not a change to
+// this enum's size or its meaning for anyone else.
 Lex_State :: enum u8 {
 	Normal,
 	In_Comment, // inside a <!-- ... --> whose closing "-->" hasn't been seen yet
