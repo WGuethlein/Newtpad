@@ -644,21 +644,31 @@ Document :: struct {
 	cursor:     int, // caret byte offset
 	anchor:     int, // other end of the selection (== cursor when none)
 	// --- rectangular (column) selection ---
-	// Four integers, not a byte range: a rectangle is a (logical line, cell
-	// column) region and cannot be expressed as cursor/anchor offsets. Lines are
-	// LOGICAL line indices, never visual rows -- column select requires word wrap
-	// off (see the design doc's wrap fork), and turning wrap on clears the block
-	// rather than silently changing what the rectangle means.
+	// Four integers, not a byte range: a rectangle is a (row, cell column)
+	// region and cannot be expressed as cursor/anchor offsets.
 	//
-	// Cells, not bytes and not codepoints: the renderer is a monospace cell grid
-	// (plat.text_cell_width classifies a rune as 0, 1 or 2 cells), so a tab or a
-	// CJK character makes a row's byte range differ from its cell range. Every
-	// conversion goes through block_row_range and nowhere else.
-	block:             bool,
-	block_anchor_line: int,
-	block_anchor_cell: int,
-	block_cursor_line: int,
-	block_cursor_cell: int,
+	// The vertical coordinate is the BYTE OFFSET of the row's own first byte,
+	// not a line NUMBER. Newtpad has no line index, so a line number is not a
+	// cheap coordinate here: turning one back into an offset means walking from
+	// byte 0, which costs O(depth in the file) and has to be paid again by
+	// every consumer. Storing the offset the caret already had (pt_line_start_cap
+	// hands it over on the way to computing the cell column) makes every
+	// consumer's cost proportional to the RECTANGLE, never to how far into the
+	// file it sits. Rows are LOGICAL line starts, never visual rows -- column
+	// select requires word wrap off (see the design doc's wrap fork), and
+	// turning wrap on clears the block rather than silently changing what the
+	// rectangle means.
+	//
+	// Cells, not bytes and not codepoints, on the horizontal axis: the renderer
+	// is a monospace cell grid (plat.text_cell_width classifies a rune as 0, 1
+	// or 2 cells), so a tab or a CJK character makes a row's byte range differ
+	// from its cell range. Every conversion goes through block_row_range and
+	// nowhere else.
+	block:                   bool,
+	block_anchor_line_start: int,
+	block_anchor_cell:       int,
+	block_cursor_line_start: int,
+	block_cursor_cell:       int,
 	wrap:       bool, // word-wrap this document at view_cols
 	// Read-only table view of a CSV/TSV (see table.odin), toggled per document.
 	table:       bool,

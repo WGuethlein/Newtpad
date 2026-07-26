@@ -1580,14 +1580,30 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			return true
 		}
 
+		// TEST SCAFFOLDING ONLY: the byte offset of 0-based line n, by walking
+		// this fixture from the start. The PRODUCT has no line-number-to-offset
+		// procedure any more -- removing it is the point of this change, because
+		// a line number is not a cheap coordinate in this codebase. Fixtures
+		// still need a way to say "line 2" when they are four lines long, and
+		// paying O(depth) in a test that builds the document itself is fine.
+		nth_line_start :: proc(d: ^Document, n: int) -> int {
+			p := 0
+			for _ in 0 ..< n {
+				e := base.pt_line_end_cap(&d.pt, p, d.pt.length + 1)
+				if e >= d.pt.length {return d.pt.length}
+				p = e + 1
+			}
+			return p
+		}
+
 		src := "abcdefgh\n\tindented\n你好世界 ok\nshort\n"
 		doc := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
 		defer doc_close(&doc)
 
 		// Row 0 is pure ASCII: cells [2,6) is bytes [2,6).
-		ls0, ls0_ok := doc_line_start_of_index(&doc, 0)
+		ls0 := nth_line_start(&doc, 0)
 		b0lo, b0hi, pad0, ok0 := block_row_range(&doc, &t, ls0, 2, 6)
-		c0 := ls0_ok && ok0 && b0lo == 2 && b0hi == 6 && pad0 == 0
+		c0 := ok0 && b0lo == 2 && b0hi == 6 && pad0 == 0
 		if !c0 {fail = true}
 		fmt.printfln("  %-6s ascii row: bytes [%d,%d) pad=%d ok=%v", "ok" if c0 else "FAIL", b0lo, b0hi, pad0, ok0)
 
@@ -1596,9 +1612,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// byte form), pulling byte_lo back to the tab's own start (byte 0) --
 		// the rectangle ends up covering cells [0,6) worth of content in only
 		// 3 bytes, not the 4 a naive bytes==cells reading would expect.
-		ls1, ls1_ok := doc_line_start_of_index(&doc, 1)
+		ls1 := nth_line_start(&doc, 1)
 		b1lo, b1hi, pad1, ok1 := block_row_range(&doc, &t, ls1, 2, 6)
-		c1 := ls1_ok && ok1 && b1lo == ls1 && b1hi == ls1 + 3 && pad1 == 0
+		c1 := ok1 && b1lo == ls1 && b1hi == ls1 + 3 && pad1 == 0
 		if !c1 {fail = true}
 		fmt.printfln("  %-6s tab row: bytes rel [%d,%d) pad=%d ok=%v", "ok" if c1 else "FAIL", b1lo - ls1, b1hi - ls1, pad1, ok1)
 
@@ -1609,7 +1625,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// span, so the tab must be pulled in whole from the right edge too --
 		// same rule as the left edge, straddle wins over "past the edge".
 		b1slo, b1shi, pad1s, ok1s := block_row_range(&doc, &t, ls1, 0, 2)
-		c1s := ls1_ok && ok1s && b1slo == ls1 && b1shi == ls1 + 1 && pad1s == 0
+		c1s := ok1s && b1slo == ls1 && b1shi == ls1 + 1 && pad1s == 0
 		if !c1s {fail = true}
 		fmt.printfln("  %-6s tab row right-edge straddle: bytes rel [%d,%d) pad=%d ok=%v", "ok" if c1s else "FAIL", b1slo - ls1, b1shi - ls1, pad1s, ok1s)
 
@@ -1619,18 +1635,18 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// lands on 好 at rel byte 3); 界 starts exactly at cell_hi=6, so hi
 		// excludes it at rel byte 9. A wrong-but-different byte range would
 		// pass the old `!=` assertion; only the exact one catches that.
-		ls2, ls2_ok := doc_line_start_of_index(&doc, 2)
+		ls2 := nth_line_start(&doc, 2)
 		b2lo, b2hi, _, ok2 := block_row_range(&doc, &t, ls2, 2, 6)
-		c2 := ls2_ok && ok2 && b2lo == ls2 + 3 && b2hi == ls2 + 9
+		c2 := ok2 && b2lo == ls2 + 3 && b2hi == ls2 + 9
 		if !c2 {fail = true}
 		fmt.printfln("  %-6s cjk row: bytes rel [%d,%d) (want [3,9))", "ok" if c2 else "FAIL", b2lo - ls2, b2hi - ls2)
 
 		// "short" is 5 cells; a rectangle starting at cell 8 selects nothing on
 		// it and reports the padding an edit would need. pad is reported, NOT
 		// applied -- selection never mutates.
-		ls3, ls3_ok := doc_line_start_of_index(&doc, 3)
+		ls3 := nth_line_start(&doc, 3)
 		b3lo, b3hi, pad3, ok3 := block_row_range(&doc, &t, ls3, 8, 10)
-		c3 := ls3_ok && ok3 && b3lo == b3hi && pad3 == 3
+		c3 := ok3 && b3lo == b3hi && pad3 == 3
 		if !c3 {fail = true}
 		fmt.printfln("  %-6s short row selects nothing, pad=%d (want 3)", "ok" if c3 else "FAIL", pad3)
 
@@ -1685,9 +1701,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		zsrc := strings.concatenate({"x\n", string(combining[:combining_sz]), " abc\n"}, context.temp_allocator)
 		zdoc := doc_from_content(transmute([]u8)strings.clone(zsrc), "", .UTF8)
 		defer doc_close(&zdoc)
-		zls, zls_ok := doc_line_start_of_index(&zdoc, 1)
+		zls := nth_line_start(&zdoc, 1)
 		zlo, zhi, padZ, okZ := block_row_range(&zdoc, &t, zls, 0, 0)
-		cZ := zls_ok && okZ && zlo == zls && zhi == zls && padZ == 0
+		cZ := okZ && zlo == zls && zhi == zls && padZ == 0
 		if !cZ {fail = true}
 		fmt.printfln("  %-6s zero-width rune at the column: bytes [%d,%d) rel to line_start=%d (want [0,0))", "ok" if cZ else "FAIL", zlo - zls, zhi - zls, zls)
 
@@ -1711,56 +1727,85 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		if !cT {fail = true}
 		fmt.printfln("  %-6s truncated multi-byte tail at row's real end clamps: bytes [%d,%d) ok=%v (want [0,6) ok=true)", "ok" if cT else "FAIL", tlo, thi, okT)
 
-		// IMPORTANT regression: doc_line_start_of_index must refuse a line
-		// past DOC_LINE_INDEX_CAP WITHOUT first scanning the whole line to
-		// find that out. The old code walked via pt_next_line_start, which
-		// calls the UNCAPPED pt_line_end, so the cap check could only fire
-		// after an unbounded scan had already happened -- measured at 151ms
-		// for a 64MB single line before this fix. This builds the same shape
-		// of document (one line, no trailing newline, far longer than the
-		// cap) and asserts BOTH that the call refuses (ok=false) AND that it
-		// returns quickly: a bounded walk over ~DOC_LINE_INDEX_CAP bytes,
-		// chunked through 4096-byte reads, should take low single-digit
-		// milliseconds, not the ~150ms an unbounded scan of the whole 64MB
-		// line would cost.
+		// IMPORTANT regression: seeding a rectangle must refuse a caret whose
+		// own line start lies past BLOCK_LINE_STEP_CAP WITHOUT first scanning
+		// the whole line to find that out. 64 MB, one line, no newline
+		// anywhere, caret at the very end: the bounded BACKWARD scan looks at
+		// one cap's worth of bytes and gives up. base.pt_line_start scans back
+		// with no bound at all and would read all 64 MB before reporting the
+		// same failure -- the shape doc.odin:1853 documents, and the reason
+		// every seed in this file goes through block_line_start_at.
 		huge := make([]u8, 64 * 1024 * 1024)
 		mem.set(raw_data(huge), 'x', len(huge))
 		hdoc := doc_from_content(huge, "", .UTF8)
 		defer doc_close(&hdoc)
+		hdoc.wrap = false
+		hdoc.cursor = hdoc.pt.length
 		hstart := time.now()
-		_, hok := doc_line_start_of_index(&hdoc, 1)
-		helapsed := time.since(hstart)
-		hms := time.duration_milliseconds(helapsed)
-		cH := !hok && hms < 50
+		refH := block_extend(&hdoc, &t, 0, 1)
+		hms := time.duration_milliseconds(time.since(hstart))
+		cH := refH == .Caret_Unresolved && !block_active(&hdoc) && hms < 50
 		if !cH {fail = true}
 		fmt.printfln(
-			"  %-6s single line past DOC_LINE_INDEX_CAP refuses without scanning it all: ok=%v elapsed=%.2fms (want ok=false, <50ms)",
+			"  %-6s caret past BLOCK_LINE_STEP_CAP refuses without scanning the whole line: refusal=%v elapsed=%.2fms (want Caret_Unresolved, <50ms)",
 			"ok" if cH else "FAIL",
-			hok,
+			refH,
 			hms,
+		)
+
+		// IMPORTANT regression: a VERTICAL STEP that runs into a row longer
+		// than one step's budget must refuse too, not answer from the
+		// synthetic cap break pt_line_end_cap hands back. Line 0 is "a" and
+		// line 1 is longer than BLOCK_LINE_STEP_CAP with no newline after it,
+		// so the caret's own line start resolves fine (it is 2 bytes back) but
+		// stepping DOWN off it cannot find where the next row begins. Refusing
+		// is the only honest answer; treating the cap break as a row start
+		// would anchor the rectangle in the middle of a line.
+		stepsrc := make([]u8, 2 + BLOCK_LINE_STEP_CAP + 4096)
+		mem.set(raw_data(stepsrc), 'x', len(stepsrc))
+		stepsrc[0], stepsrc[1] = 'a', '\n'
+		stdoc := doc_from_content(stepsrc, "", .UTF8)
+		defer doc_close(&stdoc)
+		stdoc.wrap = false
+		stdoc.cursor = 2 // start of the over-long second line
+		refStep := block_extend(&stdoc, &t, 1, 0)
+		cStep :=
+			refStep == .Caret_Unresolved &&
+			!block_active(&stdoc) &&
+			stdoc.block_anchor_line_start == 0 &&
+			stdoc.block_cursor_line_start == 0
+		if !cStep {fail = true}
+		fmt.printfln(
+			"  %-6s a step into a row past BLOCK_LINE_STEP_CAP refuses, no state changed: refusal=%v block_active=%v",
+			"ok" if cStep else "FAIL",
+			refStep,
+			block_active(&stdoc),
 		)
 
 		// block_bounds normalises regardless of drag direction: up-and-left
 		// must describe the same rectangle as down-and-right from the other
-		// corner.
+		// corner. The vertical axis is a BYTE OFFSET now (500 and 200 are
+		// line starts, not line 500 and line 200), so the min/max is a
+		// comparison of offsets -- but the property under test is unchanged:
+		// both axes normalise independently.
 		bd: Document
-		bd.block_anchor_line, bd.block_anchor_cell = 5, 10
-		bd.block_cursor_line, bd.block_cursor_cell = 2, 3
-		lline_lo, lline_hi, lcell_lo, lcell_hi := block_bounds(&bd)
-		bd.block_anchor_line, bd.block_anchor_cell = 2, 3
-		bd.block_cursor_line, bd.block_cursor_cell = 5, 10
-		rline_lo, rline_hi, rcell_lo, rcell_hi := block_bounds(&bd)
-		cb := lline_lo == 2 && lline_hi == 5 && lcell_lo == 3 && lcell_hi == 10 &&
-			lline_lo == rline_lo && lline_hi == rline_hi && lcell_lo == rcell_lo && lcell_hi == rcell_hi
+		bd.block_anchor_line_start, bd.block_anchor_cell = 500, 10
+		bd.block_cursor_line_start, bd.block_cursor_cell = 200, 3
+		loff_lo, loff_hi, lcell_lo, lcell_hi := block_bounds(&bd)
+		bd.block_anchor_line_start, bd.block_anchor_cell = 200, 3
+		bd.block_cursor_line_start, bd.block_cursor_cell = 500, 10
+		roff_lo, roff_hi, rcell_lo, rcell_hi := block_bounds(&bd)
+		cb := loff_lo == 200 && loff_hi == 500 && lcell_lo == 3 && lcell_hi == 10 &&
+			loff_lo == roff_lo && loff_hi == roff_hi && lcell_lo == rcell_lo && lcell_hi == rcell_hi
 		if !cb {fail = true}
-		fmt.printfln("  %-6s block_bounds normalises drag direction: [%d,%d]x[%d,%d]", "ok" if cb else "FAIL", lline_lo, lline_hi, lcell_lo, lcell_hi)
+		fmt.printfln("  %-6s block_bounds normalises drag direction: offs [%d,%d] cells [%d,%d]", "ok" if cb else "FAIL", loff_lo, loff_hi, lcell_lo, lcell_hi)
 
 		// block_clear turns block_active off (and, zero-is-initialization,
 		// resets the geometry so a caller that forgets the guard reads an
 		// empty rectangle rather than a stale one).
 		bd.block = true
 		block_clear(&bd)
-		cc := !block_active(&bd) && bd.block_anchor_line == 0 && bd.block_anchor_cell == 0 && bd.block_cursor_line == 0 && bd.block_cursor_cell == 0
+		cc := !block_active(&bd) && bd.block_anchor_line_start == 0 && bd.block_anchor_cell == 0 && bd.block_cursor_line_start == 0 && bd.block_cursor_cell == 0
 		if !cc {fail = true}
 		fmt.printfln("  %-6s block_clear deactivates and zeroes geometry", "ok" if cc else "FAIL")
 
@@ -1772,36 +1817,37 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// the non-Alt branch, so passing alt=true here with a seeded block
 		// used to leave it live.
 		bd.block = true
-		bd.block_anchor_line, bd.block_anchor_cell = 1, 2
-		bd.block_cursor_line, bd.block_cursor_cell = 3, 4
+		bd.block_anchor_line_start, bd.block_anchor_cell = 1, 2
+		bd.block_cursor_line_start, bd.block_cursor_cell = 3, 4
 		block_press_clear(&bd, true) // alt HELD -- must still clear
-		cPress := !block_active(&bd) && bd.block_anchor_line == 0 && bd.block_anchor_cell == 0 && bd.block_cursor_line == 0 && bd.block_cursor_cell == 0
+		cPress := !block_active(&bd) && bd.block_anchor_line_start == 0 && bd.block_anchor_cell == 0 && bd.block_cursor_line_start == 0 && bd.block_cursor_cell == 0
 		if !cPress {fail = true}
 		fmt.printfln("  %-6s block_press_clear drops a stale block even with Alt held: block_active=%v", "ok" if cPress else "FAIL", block_active(&bd))
 
 		// block_extend (task 2): the first call with no block active seeds
-		// BOTH corners at the caret's own (line, cell) -- via the same
-		// cell-space primitives doc_cursor_col uses, never a hand-rolled
-		// walk -- and only then applies its own delta to the cursor corner.
-		// `doc`'s line 0 ("abcdefgh") is pure ASCII, so byte offset 2 is
-		// also cell 2.
+		// BOTH corners at the caret's own (line start offset, cell) -- both
+		// out of the SAME pt_line_start_cap call doc_cursor_col already makes,
+		// never a hand-rolled walk and never a line count -- and only then
+		// applies its own delta to the cursor corner. `doc`'s line 0
+		// ("abcdefgh") is pure ASCII and starts at byte 0, so the caret at
+		// byte 2 is line start 0, cell 2.
 		doc.wrap = false
 		doc.cursor = 2
 		okE1 := block_extend(&doc, &t, 0, 1) == .None
 		cE1 :=
 			okE1 &&
 			block_active(&doc) &&
-			doc.block_anchor_line == 0 &&
+			doc.block_anchor_line_start == 0 &&
 			doc.block_anchor_cell == 2 &&
-			doc.block_cursor_line == 0 &&
+			doc.block_cursor_line_start == 0 &&
 			doc.block_cursor_cell == 3
 		if !cE1 {fail = true}
 		fmt.printfln(
-			"  %-6s block_extend seeds anchor at caret and moves cursor: anchor=(%d,%d) cursor=(%d,%d) ok=%v",
+			"  %-6s block_extend seeds anchor at caret and moves cursor: anchor=(off %d,cell %d) cursor=(off %d,cell %d) ok=%v",
 			"ok" if cE1 else "FAIL",
-			doc.block_anchor_line,
+			doc.block_anchor_line_start,
 			doc.block_anchor_cell,
-			doc.block_cursor_line,
+			doc.block_cursor_line_start,
 			doc.block_cursor_cell,
 			okE1,
 		)
@@ -1818,12 +1864,43 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fmt.printfln("  %-6s block_extend clamps left of cell 0: cursor_cell=%d anchor_cell=%d (want 0, 2)", "ok" if cClamp else "FAIL", doc.block_cursor_cell, doc.block_anchor_cell)
 		block_clear(&doc)
 
+		// A vertical step lands on the NEXT ROW'S OWN line start, not on
+		// "line index + 1" -- the whole point of the model. Two steps down
+		// from the caret on line 0 of `doc` must reach line 2's byte offset
+		// (ls2), which is 9 for "abcdefgh\n" + "\tindented\n". Stepping is
+		// where a line-number model and an offset model visibly differ: an
+		// index would still read 2 here whether or not it could be resolved.
+		doc.cursor = 0
+		okV1 := block_extend(&doc, &t, 1, 0) == .None
+		okV2 := block_extend(&doc, &t, 1, 0) == .None
+		cV := okV1 && okV2 && doc.block_anchor_line_start == ls0 && doc.block_cursor_line_start == ls2
+		if !cV {fail = true}
+		fmt.printfln(
+			"  %-6s two steps down land on the next rows' own line starts: anchor_off=%d cursor_off=%d (want %d, %d)",
+			"ok" if cV else "FAIL",
+			doc.block_anchor_line_start,
+			doc.block_cursor_line_start,
+			ls0,
+			ls2,
+		)
+
+		// Stepping up past the first row stops at byte 0 and reports success
+		// -- running out of DOCUMENT is not truncation, exactly as an arrow
+		// key at the top of the buffer does nothing rather than failing.
+		okU1 := block_extend(&doc, &t, -1, 0) == .None
+		okU2 := block_extend(&doc, &t, -1, 0) == .None
+		okU3 := block_extend(&doc, &t, -1, 0) == .None
+		cU := okU1 && okU2 && okU3 && doc.block_cursor_line_start == 0
+		if !cU {fail = true}
+		fmt.printfln("  %-6s stepping up past the first row stops at offset 0: cursor_off=%d (want 0)", "ok" if cU else "FAIL", doc.block_cursor_line_start)
+		block_clear(&doc)
+
 		// wrap=true refuses unconditionally and changes no state -- neither
 		// activating a block nor touching the geometry fields, even on the
 		// very first (seeding) call.
 		doc.wrap = true
 		refW := block_extend(&doc, &t, 0, 1)
-		cW := refW == .Wrap_On && !block_active(&doc) && doc.block_anchor_line == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line == 0 && doc.block_cursor_cell == 0
+		cW := refW == .Wrap_On && !block_active(&doc) && doc.block_anchor_line_start == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line_start == 0 && doc.block_cursor_cell == 0
 		if !cW {fail = true}
 		fmt.printfln("  %-6s block_extend refuses while wrapped, no state changed: refusal=%v block_active=%v", "ok" if cW else "FAIL", refW, block_active(&doc))
 		doc.wrap = false
@@ -1836,7 +1913,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// doc.wrap alone and let a rectangle through in Split.
 		doc.md_mode = .Split
 		refS := block_extend(&doc, &t, 0, 1)
-		cSp := refS == .Wrap_On && !block_active(&doc) && doc.block_anchor_line == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line == 0 && doc.block_cursor_cell == 0
+		cSp := refS == .Wrap_On && !block_active(&doc) && doc.block_anchor_line_start == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line_start == 0 && doc.block_cursor_cell == 0
 		if !cSp {fail = true}
 		fmt.printfln("  %-6s block_extend refuses in Markdown Split via doc_wraps, no state changed: refusal=%v block_active=%v", "ok" if cSp else "FAIL", refS, block_active(&doc))
 		doc.md_mode = .Off
@@ -1847,55 +1924,69 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// Alt+Z would send them chasing the wrong control.
 		doc.filter = true
 		refF := block_extend(&doc, &t, 0, 1)
-		cF := refF == .Filter_On && !block_active(&doc) && doc.block_anchor_line == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line == 0 && doc.block_cursor_cell == 0
+		cF := refF == .Filter_On && !block_active(&doc) && doc.block_anchor_line_start == 0 && doc.block_anchor_cell == 0 && doc.block_cursor_line_start == 0 && doc.block_cursor_cell == 0
 		if !cF {fail = true}
 		fmt.printfln("  %-6s block_extend refuses while filter view is on: refusal=%v block_active=%v", "ok" if cF else "FAIL", refF, block_active(&doc))
 		doc.filter = false
 
-		// CRITICAL regression: caret_line_cell (and so block_extend) must
-		// REFUSE rather than seed a rectangle at (0,0) when the caret cannot
-		// be resolved within its own scan caps. The old code let both
-		// doc_cursor_line's beyond-STATUS_LINE_CAP fallback and
-		// pt_line_start_cap's exact=false fall back to 0 silently while
-		// still reporting success -- so Alt+Shift+Down on a large file
-		// seeded a rectangle anchored at line 0 / cell 0 instead of
-		// wherever the caret actually was, and reported that it worked.
-		// Sabotage: make caret_line_cell ignore its own `ok` (or have
-		// block_extend ignore caret_line_cell's ok) and both cases below
-		// must FAIL.
+		// CRITICAL regression: caret_line_start_cell (and so block_extend)
+		// must REFUSE rather than seed a rectangle at offset 0 / cell 0 when
+		// the caret cannot be resolved within its scan cap. Falling back to 0
+		// while reporting success anchors the rectangle at the top of the file
+		// instead of wherever the caret actually is, on a document large
+		// enough to matter -- and the copy and the edit run through it.
+		// Sabotage: make caret_line_start_cell ignore its own `ok` (or have
+		// block_extend ignore caret_line_start_cell's ok) and the axis-2 case
+		// below must FAIL.
+		//
+		// The two axes this used to have are now ASYMMETRIC, and that is the
+		// model change showing through: what a bounded scan can know about a
+		// caret's LINE NUMBER (axis 1) and about its LINE START (axis 2) are
+		// different facts. Axis 1 is now a success case; axis 2 still refuses.
 
-		// Axis 1: caret beyond STATUS_LINE_CAP (doc.odin) -- doc_cursor_line
-		// itself returns 0 (unknown line) without even attempting the
-		// column walk. Many short lines so the document's total size
-		// clears the cap; the caret sits at the very end.
-		line_cap_target := STATUS_LINE_CAP + 8 * 4096 // comfortably past the cap
+		// Axis 1 INVERTED by this change: a caret more than STATUS_LINE_CAP
+		// (4 MiB) into the file. The line-NUMBER model had to refuse here --
+		// doc_cursor_line returns 0 (unknown) past that cap -- so column
+		// select was simply unavailable anywhere past 4 MiB of a file, and
+		// the test asserted that refusal. A line START is a LOCAL fact, a
+		// backward scan to the nearest newline, so the same caret now
+		// resolves EXACTLY and cheaply. This case is here to pin that the
+		// model change bought correctness, not just speed: it must SUCCEED,
+		// and anchor where the caret actually is.
+		line_cap_target := STATUS_LINE_CAP + 8 * 4096 // comfortably past the old cap
 		line_count := line_cap_target / 8
 		big_lines := make([]u8, line_count * 8)
 		for i in 0 ..< line_count {copy(big_lines[i * 8:i * 8 + 8], "aaaaaaa\n")}
 		bldoc := doc_from_content(big_lines, "", .UTF8)
 		defer doc_close(&bldoc)
 		bldoc.wrap = false
-		bldoc.cursor = len(big_lines) - 1
-		refB := block_extend(&bldoc, &t, 0, 1)
+		bldoc.cursor = len(big_lines) - 1 // on the last line, at its '\n'
+		want_bl := (line_count - 1) * 8 // that line's own first byte
+		bstart := time.now()
+		refB := block_extend(&bldoc, &t, 1, 0)
+		bms := time.duration_milliseconds(time.since(bstart))
 		cB :=
-			refB == .Caret_Unresolved &&
-			!block_active(&bldoc) &&
-			bldoc.block_anchor_line == 0 &&
-			bldoc.block_anchor_cell == 0 &&
-			bldoc.block_cursor_line == 0 &&
-			bldoc.block_cursor_cell == 0
+			refB == .None &&
+			block_active(&bldoc) &&
+			bldoc.block_anchor_line_start == want_bl &&
+			bldoc.block_cursor_line_start == len(big_lines) &&
+			bms < 5
 		if !cB {fail = true}
 		fmt.printfln(
-			"  %-6s block_extend refuses beyond STATUS_LINE_CAP rather than seeding at line 0: refusal=%v block_active=%v",
+			"  %-6s caret 4+ MiB deep resolves exactly instead of refusing: refusal=%v anchor_off=%d (want %d) elapsed=%.2fms (<5ms)",
 			"ok" if cB else "FAIL",
 			refB,
-			block_active(&bldoc),
+			bldoc.block_anchor_line_start,
+			want_bl,
+			bms,
 		)
 
-		// Axis 2: caret resolves to a known LINE (well under STATUS_LINE_CAP
-		// in total bytes) but that one line is longer than STATUS_COL_CAP,
-		// so pt_line_start_cap cannot resolve the column -- exact=false.
-		// A single line with no newline at all, longer than STATUS_COL_CAP.
+		// Axis 2 SURVIVES the model change: one line longer than
+		// BLOCK_LINE_STEP_CAP with the caret at its end. The backward scan
+		// hits its cap without finding a newline, so what it returns is a
+		// scan FLOOR and not a line start -- neither the row nor the column
+		// is a fact, and the gesture must still refuse rather than anchor at
+		// the floor. A single line with no newline at all.
 		giant_line := make([]u8, STATUS_COL_CAP + 4096)
 		mem.set(raw_data(giant_line), 'y', len(giant_line))
 		gldoc := doc_from_content(giant_line, "", .UTF8)
@@ -1906,7 +1997,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		cG :=
 			refG == .Caret_Unresolved &&
 			!block_active(&gldoc) &&
-			gldoc.block_anchor_line == 0 &&
+			gldoc.block_anchor_line_start == 0 &&
 			gldoc.block_anchor_cell == 0
 		if !cG {fail = true}
 		fmt.printfln(
@@ -1929,8 +2020,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			ad.wrap = false
 			seed_block :: proc(d: ^Document) {
 				d.block = true
-				d.block_anchor_line, d.block_anchor_cell = 1, 2
-				d.block_cursor_line, d.block_cursor_cell = 3, 4
+				d.block_anchor_line_start, d.block_anchor_cell = 1, 2
+				d.block_cursor_line_start, d.block_cursor_cell = 3, 4
 			}
 
 			seed_block(ad)
@@ -1967,18 +2058,18 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			command_dispatch(rcmd, {.Right, false, true, true}, &a, &dummy, &t, 10) // Alt+Shift+Right
 			cDispR :=
 				block_active(ad) &&
-				ad.block_anchor_line == 0 &&
+				ad.block_anchor_line_start == 0 &&
 				ad.block_anchor_cell == 0 &&
-				ad.block_cursor_line == 0 &&
+				ad.block_cursor_line_start == 0 &&
 				ad.block_cursor_cell == 1
 			if !cDispR {fail = true}
 			fmt.printfln(
 				"  %-6s Alt+Shift+Right dispatch creates+extends a block: active=%v anchor=(%d,%d) cursor=(%d,%d)",
 				"ok" if cDispR else "FAIL",
 				block_active(ad),
-				ad.block_anchor_line,
+				ad.block_anchor_line_start,
 				ad.block_anchor_cell,
-				ad.block_cursor_line,
+				ad.block_cursor_line_start,
 				ad.block_cursor_cell,
 			)
 			block_clear(ad)
@@ -2031,8 +2122,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			und.wrap = false
 			doc_insert_rune(&und, 'X') // pushes an undo snapshot of the pre-edit state
 			und.block = true
-			und.block_anchor_line, und.block_anchor_cell = 0, 0
-			und.block_cursor_line, und.block_cursor_cell = 1, 2
+			und.block_anchor_line_start, und.block_anchor_cell = 0, 0
+			und.block_cursor_line_start, und.block_cursor_cell = 1, 2
 			doc_undo(&und)
 			cUndo := !block_active(&und)
 			if !cUndo {fail = true}
@@ -2042,8 +2133,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			sad := doc_from_content(transmute([]u8)strings.clone("hello world\n"), "", .UTF8)
 			defer doc_close(&sad)
 			sad.block = true
-			sad.block_anchor_line, sad.block_anchor_cell = 0, 1
-			sad.block_cursor_line, sad.block_cursor_cell = 0, 3
+			sad.block_anchor_line_start, sad.block_anchor_cell = 0, 1
+			sad.block_cursor_line_start, sad.block_cursor_cell = 0, 3
 			doc_select_all(&sad)
 			cSelAll := !block_active(&sad)
 			if !cSelAll {fail = true}
@@ -2053,8 +2144,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			swd := doc_from_content(transmute([]u8)strings.clone("hello world\n"), "", .UTF8)
 			defer doc_close(&swd)
 			swd.block = true
-			swd.block_anchor_line, swd.block_anchor_cell = 0, 1
-			swd.block_cursor_line, swd.block_cursor_cell = 0, 3
+			swd.block_anchor_line_start, swd.block_anchor_cell = 0, 1
+			swd.block_cursor_line_start, swd.block_cursor_cell = 0, 3
 			doc_select_word_at(&swd, 2) // inside "hello"
 			cSelWord := !block_active(&swd)
 			if !cSelWord {fail = true}
@@ -2064,8 +2155,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			sld := doc_from_content(transmute([]u8)strings.clone("hello world\nsecond line\n"), "", .UTF8)
 			defer doc_close(&sld)
 			sld.block = true
-			sld.block_anchor_line, sld.block_anchor_cell = 0, 1
-			sld.block_cursor_line, sld.block_cursor_cell = 0, 3
+			sld.block_anchor_line_start, sld.block_anchor_cell = 0, 1
+			sld.block_cursor_line_start, sld.block_cursor_cell = 0, 3
 			doc_select_line_at(&sld, 2) // inside the first line
 			cSelLine := !block_active(&sld)
 			if !cSelLine {fail = true}
@@ -2080,8 +2171,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			fnd.find.match_len = []int{4, 5}
 			fnd.find.current = -1
 			fnd.block = true
-			fnd.block_anchor_line, fnd.block_anchor_cell = 0, 0
-			fnd.block_cursor_line, fnd.block_cursor_cell = 0, 3
+			fnd.block_anchor_line_start, fnd.block_anchor_cell = 0, 0
+			fnd.block_cursor_line_start, fnd.block_cursor_cell = 0, 3
 			find_next(&fnd)
 			cFindSel := !block_active(&fnd)
 			if !cFindSel {fail = true}
@@ -2097,35 +2188,37 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		{
 			// Both ends set directly in one call (unlike block_extend, there
 			// is no seed-then-step split -- the mouse already knows both
-			// corners). A drag from (5,10) to (2,3), up-and-left, is stored
-			// exactly as given; block_bounds (already proven above to
-			// normalise regardless of drag direction) is what turns it into
-			// [2,5]x[3,10].
+			// corners, and main.odin resolves each one's line start through
+			// block_line_start_at before calling). A drag from (offset 500,
+			// cell 10) to (offset 200, cell 3), up-and-left, is stored exactly
+			// as given; block_bounds (already proven above to normalise
+			// regardless of drag direction) is what turns it into
+			// offs [200,500] x cells [3,10].
 			psp: Document
 			psp.wrap = false
-			refP := block_set_from_points(&psp, &t, 5, 10, 2, 3)
-			pline_lo, pline_hi, pcell_lo, pcell_hi := block_bounds(&psp)
+			refP := block_set_from_points(&psp, &t, 500, 10, 200, 3)
+			poff_lo, poff_hi, pcell_lo, pcell_hi := block_bounds(&psp)
 			cP :=
 				refP == .None &&
 				block_active(&psp) &&
-				psp.block_anchor_line == 5 &&
+				psp.block_anchor_line_start == 500 &&
 				psp.block_anchor_cell == 10 &&
-				psp.block_cursor_line == 2 &&
+				psp.block_cursor_line_start == 200 &&
 				psp.block_cursor_cell == 3 &&
-				pline_lo == 2 &&
-				pline_hi == 5 &&
+				poff_lo == 200 &&
+				poff_hi == 500 &&
 				pcell_lo == 3 &&
 				pcell_hi == 10
 			if !cP {fail = true}
 			fmt.printfln(
-				"  %-6s block_set_from_points stores both ends directly, bounds normalise: anchor=(%d,%d) cursor=(%d,%d) bounds=[%d,%d]x[%d,%d]",
+				"  %-6s block_set_from_points stores both ends directly, bounds normalise: anchor=(off %d,cell %d) cursor=(off %d,cell %d) bounds=offs[%d,%d] cells[%d,%d]",
 				"ok" if cP else "FAIL",
-				psp.block_anchor_line,
+				psp.block_anchor_line_start,
 				psp.block_anchor_cell,
-				psp.block_cursor_line,
+				psp.block_cursor_line_start,
 				psp.block_cursor_cell,
-				pline_lo,
-				pline_hi,
+				poff_lo,
+				poff_hi,
 				pcell_lo,
 				pcell_hi,
 			)
@@ -2140,9 +2233,9 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			cPW :=
 				refPW == .Wrap_On &&
 				!block_active(&pwp) &&
-				pwp.block_anchor_line == 0 &&
+				pwp.block_anchor_line_start == 0 &&
 				pwp.block_anchor_cell == 0 &&
-				pwp.block_cursor_line == 0 &&
+				pwp.block_cursor_line_start == 0 &&
 				pwp.block_cursor_cell == 0
 			if !cPW {fail = true}
 			fmt.printfln("  %-6s block_set_from_points refuses while wrapped, no state changed: refusal=%v block_active=%v", "ok" if cPW else "FAIL", refPW, block_active(&pwp))
@@ -2171,15 +2264,14 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			if !cPF {fail = true}
 			fmt.printfln("  %-6s block_set_from_points refuses while filter view is on: refusal=%v block_active=%v", "ok" if cPF else "FAIL", refPF, block_active(&psF))
 
-			// Caret_Unresolved: main.odin passes -1 for a line it could not
-			// resolve (doc_cursor_line's own "0 = beyond STATUS_LINE_CAP"
-			// contract, shifted to 0-based and inverted into a sentinel).
-			// Either end being unresolved must refuse the WHOLE call rather
-			// than seed a rectangle at line 0 -- the exact "confident wrong
-			// answer on a large file" shape block_extend's own
-			// Caret_Unresolved exists to prevent. Checked on both the
-			// anchor end and the cursor end: nothing here says one end is
-			// more trustworthy than the other.
+			// Caret_Unresolved: main.odin passes -1 for an end whose line
+			// start block_line_start_at could not resolve (exact=false -- what
+			// it returned is a scan floor, not a row). Either end being
+			// unresolved must refuse the WHOLE call rather than seed a
+			// rectangle at offset 0 -- the exact "confident wrong answer on a
+			// large file" shape block_extend's own Caret_Unresolved exists to
+			// prevent. Checked on both the anchor end and the cursor end:
+			// nothing here says one end is more trustworthy than the other.
 			pup: Document
 			pup.wrap = false
 			refPU1 := block_set_from_points(&pup, &t, -1, 0, 3, 4)
@@ -2188,13 +2280,13 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				refPU1 == .Caret_Unresolved &&
 				refPU2 == .Caret_Unresolved &&
 				!block_active(&pup) &&
-				pup.block_anchor_line == 0 &&
+				pup.block_anchor_line_start == 0 &&
 				pup.block_anchor_cell == 0 &&
-				pup.block_cursor_line == 0 &&
+				pup.block_cursor_line_start == 0 &&
 				pup.block_cursor_cell == 0
 			if !cPU {fail = true}
 			fmt.printfln(
-				"  %-6s block_set_from_points refuses an unresolved end (anchor or cursor), no seed at line 0: refAnchor=%v refCursor=%v block_active=%v",
+				"  %-6s block_set_from_points refuses an unresolved end (anchor or cursor), no seed at offset 0: refAnchor=%v refCursor=%v block_active=%v",
 				"ok" if cPU else "FAIL",
 				refPU1,
 				refPU2,
@@ -2222,8 +2314,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			// straddles it, same as block_row_range's own "tab row" case
 			// above.
 			doc.block = true
-			doc.block_anchor_line, doc.block_anchor_cell = 0, 2
-			doc.block_cursor_line, doc.block_cursor_cell = 2, 6
+			doc.block_anchor_line_start, doc.block_anchor_cell = ls0, 2
+			doc.block_cursor_line_start, doc.block_cursor_cell = ls2, 6
 			nA := block_selection_rects(&doc, &t, px, cw, 5, rectq[:])
 			cA := nA == 3
 			if !cA {fail = true}
@@ -2239,8 +2331,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			// quad. Line 2 (CJK, 11 cells) reaches cells [8,10); line 3
 			// ("short", 5 cells) does not, and must contribute nothing --
 			// not a padded/clamped quad, nothing at all.
-			doc.block_anchor_line, doc.block_anchor_cell = 2, 8
-			doc.block_cursor_line, doc.block_cursor_cell = 3, 10
+			doc.block_anchor_line_start, doc.block_anchor_cell = ls2, 8
+			doc.block_cursor_line_start, doc.block_cursor_cell = ls3, 10
 			nB := block_selection_rects(&doc, &t, px, cw, 5, rectq[:])
 			cB := nB == 1
 			if !cB {fail = true}
@@ -2251,15 +2343,33 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			// sits exactly on a rune boundary on all three rows (ascii, tab
 			// and CJK each start a rune there), so byte_lo == byte_hi on
 			// every one and the floor below is what makes it visible.
-			doc.block_anchor_line, doc.block_anchor_cell = 0, 0
-			doc.block_cursor_line, doc.block_cursor_cell = 2, 0
+			doc.block_anchor_line_start, doc.block_anchor_cell = ls0, 0
+			doc.block_cursor_line_start, doc.block_cursor_cell = ls2, 0
 			nC := block_selection_rects(&doc, &t, px, cw, 5, rectq[:])
 			cC := nC == 3
 			for i in 0 ..< nC {
-				if rectq[i].size.x != 2 {cC = false}
+				if rectq[i].size.x != sx(2) {cC = false}
 			}
 			if !cC {fail = true}
-			fmt.printfln("  %-6s zero-width rectangle draws a thin bar per row: n=%d widths=%v (want 3, all 2px)", "ok" if cC else "FAIL", nC, rectq[:nC])
+			fmt.printfln("  %-6s zero-width rectangle draws a thin bar per row: n=%d widths=%v (want 3, all sx(2))", "ok" if cC else "FAIL", nC, rectq[:nC])
+
+			// ...and that bar SCALES WITH DPI. It is the primary affordance
+			// for the feature's most-used case (N carets in one column), so it
+			// must match the real caret, which main.odin draws at sx(2). A raw
+			// 2 renders half the caret's width at 200% scale -- the user sees
+			// hairlines where the caret is a bar. doc_selection_rects (doc.odin)
+			// does use a raw 2 for its own floor, which is why the number got
+			// copied here; there the floor is a degenerate case nobody looks at.
+			saved_scale := UI_SCALE
+			UI_SCALE = 2
+			nDpi := block_selection_rects(&doc, &t, px, cw, 5, rectq[:])
+			cDpi := nDpi == 3
+			for i in 0 ..< nDpi {
+				if rectq[i].size.x != 4 {cDpi = false}
+			}
+			UI_SCALE = saved_scale
+			if !cDpi {fail = true}
+			fmt.printfln("  %-6s the zero-width bar scales with DPI: n=%d width=%.1f at 200%% (want 3, 4px)", "ok" if cDpi else "FAIL", nDpi, rectq[0].size.x if nDpi > 0 else 0)
 
 			block_clear(&doc)
 		}
@@ -2275,8 +2385,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			defer doc_close(&ldoc2)
 			ldoc2.wrap = false
 			ldoc2.block = true
-			ldoc2.block_anchor_line, ldoc2.block_anchor_cell = 0, BLOCK_ROW_CAP - 2
-			ldoc2.block_cursor_line, ldoc2.block_cursor_cell = 0, BLOCK_ROW_CAP + 50
+			ldoc2.block_anchor_line_start, ldoc2.block_anchor_cell = 0, BLOCK_ROW_CAP - 2
+			ldoc2.block_cursor_line_start, ldoc2.block_cursor_cell = 0, BLOCK_ROW_CAP + 50
 			px := f32(16)
 			cw := plat.text_char_width(&t, px, .Doc)
 			rectq: [4]plat.Quad
@@ -2302,8 +2412,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			// rectangle spanning all 4 lines must still only emit 2 quads
 			// when only 2 rows are visible.
 			cdoc.block = true
-			cdoc.block_anchor_line, cdoc.block_anchor_cell = 0, 0
-			cdoc.block_cursor_line, cdoc.block_cursor_cell = 3, 1
+			cdoc.block_anchor_line_start, cdoc.block_anchor_cell = nth_line_start(&cdoc, 0), 0
+			cdoc.block_cursor_line_start, cdoc.block_cursor_cell = nth_line_start(&cdoc, 3), 1
 			nE := block_selection_rects(&cdoc, &t, px, cw, 2, rectq[:])
 			cE := nE == 2
 			if !cE {fail = true}
@@ -2314,12 +2424,11 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			// the FIRST visible row is logical line 1, not line 0. A
 			// rectangle over lines [1,2] must match viewport rows 0 and 1
 			// and exclude row 2 (logical line 3, outside the rectangle).
-			top1, top1_ok := doc_line_start_of_index(&cdoc, 1)
-			cdoc.top = top1 if top1_ok else 0
-			cdoc.block_anchor_line, cdoc.block_anchor_cell = 1, 0
-			cdoc.block_cursor_line, cdoc.block_cursor_cell = 2, 1
+			cdoc.top = nth_line_start(&cdoc, 1)
+			cdoc.block_anchor_line_start, cdoc.block_anchor_cell = nth_line_start(&cdoc, 1), 0
+			cdoc.block_cursor_line_start, cdoc.block_cursor_cell = nth_line_start(&cdoc, 2), 1
 			nF := block_selection_rects(&cdoc, &t, px, cw, 3, rectq[:])
-			cF := top1_ok && nF == 2
+			cF := nF == 2
 			if !cF {fail = true}
 			fmt.printfln("  %-6s inclusion is by byte range, not row-index arithmetic (doc.top mid-document): n=%d (want 2)", "ok" if cF else "FAIL", nF)
 
@@ -2327,8 +2436,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			// past. A 4-row rectangle with a 1-slot buffer must truncate to
 			// 1, the same convention doc_selection_rects follows.
 			cdoc.top = 0
-			cdoc.block_anchor_line, cdoc.block_anchor_cell = 0, 0
-			cdoc.block_cursor_line, cdoc.block_cursor_cell = 3, 1
+			cdoc.block_anchor_line_start, cdoc.block_anchor_cell = nth_line_start(&cdoc, 0), 0
+			cdoc.block_cursor_line_start, cdoc.block_cursor_cell = nth_line_start(&cdoc, 3), 1
 			small: [1]plat.Quad
 			nG := block_selection_rects(&cdoc, &t, px, cw, 4, small[:])
 			cG := nG == 1
@@ -2336,31 +2445,137 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			fmt.printfln("  %-6s out buffer truncates rather than overruns: n=%d (want 1, cap=1)", "ok" if cG else "FAIL", nG)
 		}
 
-		// H: the vertical-span resolve (doc_line_start_of_index once for the
-		// top, then block_lines_forward from that already-resolved point for
-		// the bottom) must stay cheap for a rectangle spanning many rows --
-		// the whole reason it does not re-resolve the bottom edge from byte
-		// 0. 200 short lines, a rectangle over all of them, 100 visible
-		// rows: resolving per row here would be ~40x the measured 2.9ms/
-		// call-at-cap cost class (the HARD CONSTRAINT this task was warned
-		// about); this must land in low single-digit milliseconds instead.
+		// H: THE REVIEWER'S CASE. A rectangle deep in a large file must both
+		// CREATE and DRAW. Under the line-NUMBER model these two caps
+		// disagreed: a corner could be seeded anywhere within STATUS_LINE_CAP
+		// (4 MiB) but the draw's line walk gave up after DOC_LINE_INDEX_CAP
+		// (512 KiB), so driving the real block_extend path with the caret at
+		// 665 KiB of a 716 KB file produced refusal=.None, block_active=true
+		// and then ZERO quads -- a selection the user could not see, and one
+		// the copy and the edit would still run through. Both halves are
+		// asserted here, in that order, because either alone would have passed
+		// on the broken build.
 		{
-			nlines := 200
-			pdoc := doc_from_content(transmute([]u8)strings.clone(strings.repeat("x\n", nlines, context.temp_allocator)), "", .UTF8)
-			defer doc_close(&pdoc)
-			pdoc.wrap = false
-			pdoc.block = true
-			pdoc.block_anchor_line, pdoc.block_anchor_cell = 0, 0
-			pdoc.block_cursor_line, pdoc.block_cursor_cell = nlines - 1, 1
+			line := "the quick brown fox jumps over the lazy dog 0123456789\n" // 55 bytes
+			deep_lines := 13000 // ~715 KB, the reviewer's file size
+			b := strings.builder_make(context.temp_allocator)
+			for _ in 0 ..< deep_lines {strings.write_string(&b, line)}
+			deep := transmute([]u8)strings.clone(strings.to_string(b))
+			ddoc := doc_from_content(deep, "", .UTF8)
+			defer doc_close(&ddoc)
+			ddoc.wrap = false
+			// Caret at 665 KiB in, on a real line start well past the old
+			// 512 KiB draw cap.
+			deep_row := (665 * 1024) / len(line)
+			deep_off := deep_row * len(line)
+			ddoc.cursor = deep_off + 5
+			refD1 := block_extend(&ddoc, &t, 0, 4) // seed a 4-cell-wide rectangle
+			refD2 := block_extend(&ddoc, &t, 1, 0)
+			refD3 := block_extend(&ddoc, &t, 1, 0) // 3 rows tall
+			ddoc.top = deep_off
 			px := f32(16)
 			cw := plat.text_char_width(&t, px, .Doc)
-			rectq := make([]plat.Quad, 100, context.temp_allocator)
-			pstart := time.now()
-			nH := block_selection_rects(&pdoc, &t, px, cw, 100, rectq)
-			pms := time.duration_milliseconds(time.since(pstart))
-			cH := nH == 100 && pms < 50
-			if !cH {fail = true}
-			fmt.printfln("  %-6s vertical span resolve stays cheap across many rows: n=%d elapsed=%.2fms (want 100, <50ms)", "ok" if cH else "FAIL", nH, pms)
+			rectq: [16]plat.Quad
+			nDeep := block_selection_rects(&ddoc, &t, px, cw, 10, rectq[:])
+			cDeep :=
+				refD1 == .None &&
+				refD2 == .None &&
+				refD3 == .None &&
+				block_active(&ddoc) &&
+				ddoc.block_anchor_line_start == deep_off &&
+				nDeep == 3
+			if !cDeep {fail = true}
+			fmt.printfln(
+				"  %-6s a rectangle 665 KiB deep both creates AND draws: refusals=%v/%v/%v anchor_off=%d (want %d) quads=%d (want 3)",
+				"ok" if cDeep else "FAIL",
+				refD1,
+				refD2,
+				refD3,
+				ddoc.block_anchor_line_start,
+				deep_off,
+				nDeep,
+			)
+
+		}
+
+		// I: the draw's COST must scale with the RECTANGLE, not with how far
+		// into the file it sits. This is the reviewer's measured freeze,
+		// rebuilt to their exact fixture: a ten-row rectangle at line 28,000
+		// of a ~500 KiB log cost 48 MS PER FRAME, steady state, at -o:speed --
+		// and main.odin's frame loop does not wait for messages while
+		// mouse_down, so an Alt+drag paid it on every frame (~20 fps on an
+		// ordinary log file). Note this rectangle sits INSIDE the old 512 KiB
+		// walk budget on purpose: the defect it pins is the cost, not the
+		// refusal that case H covers, so the old model would have drawn all
+		// ten quads here -- just far too slowly.
+		//
+		// The threshold is 5 ms. Chosen against that 48 ms measurement: ~10x
+		// below the defect, so the old resolve cannot sneak under it, and
+		// still ~80x above what this model actually costs, so it will not
+		// flake on a loaded machine. (The version of this test before this
+		// change allowed 50 ms against a ~0.1 ms reality -- a 450x margin,
+		// which is why it could never have failed.) Averaged over 30 calls:
+		// one call is now short enough that timer granularity would dominate
+		// a single sample.
+		{
+			logline := "2026-07-26 INFO x\n" // 18 bytes
+			log_rows := 29000 // ~522 KB, the reviewer's file size
+			lb := strings.builder_make(context.temp_allocator)
+			for _ in 0 ..< log_rows {strings.write_string(&lb, logline)}
+			cdoc2 := doc_from_content(transmute([]u8)strings.clone(strings.to_string(lb)), "", .UTF8)
+			defer doc_close(&cdoc2)
+			cdoc2.wrap = false
+			cost_off := 28000 * len(logline) // line 28,000
+			cdoc2.cursor = cost_off + 5
+			cdoc2.top = cost_off
+			block_extend(&cdoc2, &t, 0, 4)
+			for _ in 0 ..< 9 {block_extend(&cdoc2, &t, 1, 0)} // the reviewer's 10 rows
+			px := f32(16)
+			cw := plat.text_char_width(&t, px, .Doc)
+			rectq: [16]plat.Quad
+			cstart := time.now()
+			nCost := 0
+			REPS :: 30
+			for _ in 0 ..< REPS {nCost = block_selection_rects(&cdoc2, &t, px, cw, 10, rectq[:])}
+			cms := time.duration_milliseconds(time.since(cstart)) / REPS
+			cCost := nCost == 10 && cms < 5
+			if !cCost {fail = true}
+			fmt.printfln(
+				"  %-6s draw cost scales with the rectangle, not its depth (10 rows at line 28,000 of 522 KB): n=%d %.3fms/call (want 10, <5ms)",
+				"ok" if cCost else "FAIL",
+				nCost,
+				cms,
+			)
+		}
+
+		// J: a logical line longer than RENDER_LINE_CAP is shown as several
+		// screen rows, each restarting its cell numbering at 0 (visible_next,
+		// doc.odin). Only the FIRST of those rows is a row of the rectangle --
+		// the continuation rows are the same logical line, so painting cells
+		// [cell_lo, cell_hi) on them would highlight bytes 8 KiB further along
+		// that line than the rectangle covers. block_is_line_start is what
+		// rejects them, and this is the case that fails without it: the
+		// fixture's middle line is 10,000 bytes, so it occupies two screen
+		// rows, and a rectangle spanning all three lines must emit THREE
+		// quads, not four.
+		{
+			jb := strings.builder_make(context.temp_allocator)
+			strings.write_string(&jb, "a\n")
+			for _ in 0 ..< 10000 {strings.write_byte(&jb, 'x')}
+			strings.write_string(&jb, "\nb\n")
+			jdoc := doc_from_content(transmute([]u8)strings.clone(strings.to_string(jb)), "", .UTF8)
+			defer doc_close(&jdoc)
+			jdoc.wrap = false
+			jdoc.block = true
+			jdoc.block_anchor_line_start, jdoc.block_anchor_cell = 0, 0
+			jdoc.block_cursor_line_start, jdoc.block_cursor_cell = 10003, 1 // "b"'s own line start
+			px := f32(16)
+			cw := plat.text_char_width(&t, px, .Doc)
+			rectq: [8]plat.Quad
+			nJ := block_selection_rects(&jdoc, &t, px, cw, 8, rectq[:])
+			cJ := nJ == 3
+			if !cJ {fail = true}
+			fmt.printfln("  %-6s a long line's continuation rows are not rows of the rectangle: n=%d (want 3, not 4)", "ok" if cJ else "FAIL", nJ)
 		}
 
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
