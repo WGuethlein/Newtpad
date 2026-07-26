@@ -64,10 +64,18 @@ trusts:
 Consumers: `session_save`/`session_restore`, `doc_reload`. Nothing else. `app_apply_view_defaults`
 (§6t) stays exactly as it is and keeps applying *family defaults on fresh open only*.
 
-**Why validation lives here and not in the callers:** the interesting cases are all "the file is not
-what it was". A `.md` tab restored after the file was replaced by something unparseable, a CSV tab
-whose log rotated into non-tabular text — both arrive through a different caller, and a check in
-each caller is a check that will be forgotten in the third one.
+**What the validation actually defends against — stated precisely, because the obvious reading is
+wrong.** `doc_can_table`/`doc_can_markdown` gate on the file *extension*, and neither reload nor
+restore changes a path, so on the happy path nothing ever degrades: a rotated log keeps its `.csv`
+name and keeps its grid. The guard exists for a stored view that does not match the document it
+lands on — a session written by a different build, a hand-edited one, an `md_mode` integer out of
+enum range, or a future third caller. That is a narrower claim than "it handles files that changed",
+and it is the one the tests can actually falsify: the plan's session test hand-writes a v4 line
+putting a table view on a `.txt`, because a view saved through the normal path is legal by
+construction and could never fail the check.
+
+A check in each caller is still the wrong shape — it is the check that gets forgotten in the third
+caller — but it earns its place as a guard, not as a transformation that fires in daily use.
 
 ### Non-goal
 
@@ -111,8 +119,10 @@ it rather than a constant.
 same place `wrap` is carried today (`doc.odin:1383`). `wrap`'s open-coded carry is deleted, not left
 beside the new one.
 
-The reload path is the one that most needs the validation: reload exists for **log tailing**, and a
-rotated log is exactly the file that stops being a CSV between one read and the next.
+Reload is where the *preservation* matters most — reload exists for **log tailing**, so it fires
+repeatedly on a file the user is watching, and today every one of those silently drops the view. The
+validation is along for the ride rather than doing work here: the path does not change across a
+reload, so the gates always say yes.
 
 `block_*` state deliberately keeps its current behaviour — `doc^ = fresh` zeroes it, so a rectangle
 cannot survive a reload, and `doc_view_apply` must not resurrect one.
@@ -246,7 +256,12 @@ the run on exactly the case it exists for.
 the point — the alternative is 300 presses of Ctrl+Z and a pre-run state that has already been
 evicted.
 
-History label: "Column edit ×N", counted the same way `Typed %d characters` is.
+**No new `Edit_Kind`.** A `.Column` variant was considered and dropped: requiring the *existing*
+kind to match (`block_replace` passes `.Paste`, `block_delete` passes `.Delete`) already gives the
+right granularity for free — a held character coalesces with itself, a held Backspace with itself,
+and switching between them starts a new entry. The history labels stay "Inserted text" and
+"Deleted N times", with the count accumulated across the run. A new variant would have bought a
+nicer label at the cost of touching every exhaustive switch over `Edit_Kind`.
 
 **No cap raise rides along.** `BLOCK_EDIT_MAX_LINES` stays at 300. §5 is explicit that the cap is
 about per-press read cost through a fragmenting tree, that it was misdiagnosed twice, and that the
@@ -311,11 +326,12 @@ the bug, capture the failure output, restore** — and the captured output goes 
 
 | Item | Test | The check that cannot pass with the bug present |
 |---|---|---|
-| 1, 2 | `sessiontest` | Save a tab in Split and a CSV in Table, restore, assert both come back; assert a v3 session still loads; assert an out-of-range `md_mode` degrades to `.Off` rather than producing an invalid enum |
-| 1, 3 | `watchtest` | Reload a `.md` left in Split and assert `md_mode` survives; reload a Table CSV rewritten as non-tabular and assert it degrades to `.Off` rather than drawing a grid |
+| 1 | `viewmemtest` | `doc_view_apply` refuses a Table/Split view stored against a `.txt`, and accepts the same view on a `.csv`/`.md` — with a delimiter chosen, since a grid with `table_delim == 0` draws one column |
+| 1, 2 | `sessiontest` | Save a tab in Split and a CSV in Table, restore, assert both come back; assert a hand-written v4 line putting a table view on a `.txt` comes back plain; assert a v3 session still loads; assert an out-of-range `md_mode` degrades to `.Off` rather than producing an invalid enum |
+| 1, 3 | `diskstamptest` | Reload a `.md` left in Split and assert `md_mode` and `wrap` both survive; sabotage by applying the view before `doc.path` is restored and watch the gate refuse it |
 | 4 | new `enctest` | `doc_open` with a forced encoding decodes a BOM-less UTF-16 file that `detect_encoding` calls UTF-8; menu rows resolve to the right commands; `checked` tracks the live doc |
 | 5 | `linktest` (extend) | `shell_open_folder` refuses a path that is not a directory. The `ShellExecuteW` itself is not exercised headlessly |
-| 6 | new `ctxtest` | `diag_context()` returns a context whose `assertion_failure_proc` is `diag_assert_fail`, plus a grep-assert that no bare `default_context()` remains in `package main` |
+| 6 | `logtest` (extend) | `diag_context()` returns a context whose `assertion_failure_proc` is `diag_assert_fail`, plus a grep-assert that no bare `default_context()` remains in `package main` |
 | 7 | `blocktest` | N consecutive block edits produce **one** undo entry and one Ctrl+Z restores the pre-run text; a rectangle re-made mid-run produces two |
 | 8 | build A/B | `build.bat release` then `build.bat release tests`; record both sizes and confirm the gated exe does not dispatch a mode name |
 | 9 | new `pastetest` | Paste `"a\r\nb"` into an LF document and assert the buffer holds `"a\nb"`; and the CRLF direction |
