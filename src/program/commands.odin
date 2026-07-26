@@ -8,6 +8,7 @@ package main
 
 import "core:fmt"
 import "core:strings"
+import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
 
@@ -564,6 +565,39 @@ block_extend_dispatch :: proc(app: ^App, doc: ^Document, t: ^plat.Text, dline, d
 	}
 }
 
+// The one note every rectangle-wide EDIT refusal posts. block_replace and
+// block_delete refuse for exactly the two reasons the copy and the cut already
+// refuse for -- an unresolvable row, or a rectangle deeper than
+// BLOCK_EDIT_MAX_LINES -- and the row count is read off the constant rather
+// than written out, because it has already moved once (10,000 -> 2,000) and a
+// literal would have drifted silently.
+//
+// The refusal is the whole edit or none of it: block_apply leaves the buffer
+// byte-identical, so this note is the only thing that happened.
+@(private = "file")
+block_edit_note :: proc(app: ^App) {
+	app_note(app, fmt.tprintf("[COLUMN EDIT REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
+}
+
+// The typed-character path when a rectangle is live: one character replaces the
+// rectangle's cell range on every row it spans (or, at zero width, is inserted
+// on every row -- prefixing a column). main.odin's char loop calls this instead
+// of doc_insert_rune so the choice lives beside the Backspace/Delete cases that
+// make the same one, and so a headless test can drive the real decision rather
+// than a copy of it.
+//
+// Control characters never reach here (the platform char path filters them), so
+// there is no newline case to worry about: Enter is .Insert_Newline, which
+// drops the rectangle with every other block-unaware mutating command below.
+editor_input_rune :: proc(app: ^App, doc: ^Document, t: ^plat.Text, r: rune) {
+	if block_active(doc) {
+		buf, n := utf8.encode_rune(r)
+		if !block_replace(doc, t, buf[:n]) {block_edit_note(app)}
+		return
+	}
+	doc_insert_rune(doc, r)
+}
+
 // Run a command. `rows` is the visible row count (page moves); `w` supplies the
 // HWND for clipboard / Save-dialog. The active-context split means each command
 // is unambiguous here.
@@ -589,6 +623,27 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	// its own key path (intercepted before dispatch); the only buffer write in
 	// table view is table_edit_commit's single-field splice.
 	if doc != nil && doc.table && command_mutates_doc(cmd) {return}
+	// A live rectangle is only meaningful to the handful of commands that know
+	// about it. Every OTHER document-mutating command edits at doc.cursor
+	// through a path that writes doc.cursor directly rather than via set_cursor
+	// (doc_insert_text, doc_move_lines), so the block_clear set_cursor performs
+	// on an ordinary caret move never runs -- and the rectangle is left holding
+	// byte offsets describing rows the edit has since moved. A following Ctrl+X
+	// would then cut bytes the user never saw highlighted, which is the one
+	// outcome this whole feature is built to make impossible. Drop the
+	// rectangle first; the edit itself is unchanged.
+	//
+	// The exceptions handle it themselves: Backspace/Delete_Fwd edit the
+	// rectangle, Cut clears it in block_cut_delete, and Undo/Redo clear it in
+	// apply_snapshot (doc.odin) because a restored tree may not have the rows
+	// at all.
+	if doc != nil && block_active(doc) && command_mutates_doc(cmd) {
+		#partial switch cmd {
+		case .Backspace, .Delete_Fwd, .Cut, .Undo, .Redo:
+		case:
+			block_clear(doc)
+		}
+	}
 	switch cmd {
 	// --- editor ---
 	case .Cursor_Left:
@@ -612,9 +667,20 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Page_Down:
 		doc_scroll(doc, t, rows - 1, rows)
 	case .Backspace:
-		doc_backspace(doc)
+		// A live rectangle takes priority, exactly as it does for Copy and Cut
+		// below. At zero width it is N carets and this deletes one cell to the
+		// left of every one of them; with width it deletes the rectangle.
+		if block_active(doc) {
+			if !block_delete(doc, t, false) {block_edit_note(app)}
+		} else {
+			doc_backspace(doc)
+		}
 	case .Delete_Fwd:
-		doc_delete_fwd(doc)
+		if block_active(doc) {
+			if !block_delete(doc, t, true) {block_edit_note(app)}
+		} else {
+			doc_delete_fwd(doc)
+		}
 	case .Delete_Word_Back:
 		doc_delete_word_back(doc)
 	case .Insert_Newline:

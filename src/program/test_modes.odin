@@ -2935,6 +2935,360 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 		if !block_test_v(&t) {fail = true}
 
+		// --- Task 6: editing across the rectangle ---
+		//
+		// Every case below compares BYTES, never line counts: the whole risk of
+		// this feature is a rectangular edit that lands on the right number of
+		// rows at the wrong offsets, which a line count cannot see. Each is its
+		// own local proc for the stack-frame reason spelled out above Q.
+
+		// W: the prefix case -- a ZERO-WIDTH rectangle at cell 0 is N carets,
+		// and typing into it prefixes every row, including a one-character row
+		// and an EMPTY one (which is where a "skip rows that are too short"
+		// implementation quietly loses lines). Then a SECOND character is typed
+		// with no rectangle re-made in between: the rectangle survives its own
+		// edit as a zero-width rectangle at the new column, so consecutive
+		// keystrokes compose the way typing does everywhere else. Finally each
+		// keystroke is shown to be exactly one undo entry, and undo/redo to
+		// round-trip the bytes.
+		//
+		// Sabotage (per task): drop the doc_batch_begin/doc_batch_end pair in
+		// block_apply and the undo-count assertions here must FAIL (four rows
+		// produce four entries per keystroke, not one).
+		block_test_w :: proc(t: ^plat.Text) -> bool {
+			src := "alpha\nb\n\ngamma\n" // 4 rows: normal, short, EMPTY, normal
+			wdoc := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+			defer doc_close(&wdoc)
+			wdoc.wrap = false
+			wdoc.block = true
+			wdoc.block_anchor_line_start, wdoc.block_anchor_cell = 0, 0
+			wdoc.block_cursor_line_start, wdoc.block_cursor_cell = 9, 0 // "gamma"'s own line start
+			u0 := len(wdoc.undo)
+
+			ok1 := block_replace(&wdoc, t, transmute([]u8)string("// "))
+			got1 := doc_debug_string(&wdoc)
+			want1 := "// alpha\n// b\n// \n// gamma\n"
+			c1 := ok1 && got1 == want1 && len(wdoc.undo) == u0 + 1 && block_active(&wdoc)
+
+			// Second keystroke, no rectangle re-made: it must land at cell 3 on
+			// every row -- including the row that is now exactly 3 cells long.
+			ok2 := block_replace(&wdoc, t, transmute([]u8)string("X"))
+			got2 := doc_debug_string(&wdoc)
+			want2 := "// Xalpha\n// Xb\n// X\n// Xgamma\n"
+			c2 := ok2 && got2 == want2 && len(wdoc.undo) == u0 + 2
+
+			doc_undo(&wdoc)
+			back1 := doc_debug_string(&wdoc)
+			doc_undo(&wdoc)
+			back0 := doc_debug_string(&wdoc)
+			c3 := back1 == want1 && back0 == src
+			doc_redo(&wdoc)
+			doc_redo(&wdoc)
+			c4 := doc_debug_string(&wdoc) == want2
+
+			cW := c1 && c2 && c3 && c4
+			fmt.printfln(
+				"  %-6s prefix: one keystroke prefixes every row (empty one included) as ONE undo step, and the next lands at the new column: got=%q then %q undo=%d (want %d) undo-back=%q redo-fwd=%v",
+				"ok" if cW else "FAIL",
+				got1,
+				got2,
+				len(wdoc.undo),
+				u0 + 2,
+				back0,
+				c4,
+			)
+			return cW
+		}
+		if !block_test_w(&t) {fail = true}
+
+		// X: the replace case -- a rectangle with WIDTH over three ragged rows.
+		// Row 0 reaches past the rectangle (3 bytes deleted), row 1 stops inside
+		// it (1 byte deleted, the range clamped to what the row has), row 2 never
+		// reaches its left edge at all (0 deleted, and pad_cells=1 space written
+		// so the X still lands in column 2). Three different per-row shapes, one
+		// exact expected buffer.
+		block_test_x :: proc(t: ^plat.Text) -> bool {
+			src := "abcdefgh\nabc\na\n"
+			xdoc := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+			defer doc_close(&xdoc)
+			xdoc.wrap = false
+			xdoc.block = true
+			xdoc.block_anchor_line_start, xdoc.block_anchor_cell = 0, 2
+			xdoc.block_cursor_line_start, xdoc.block_cursor_cell = 13, 5 // "a"'s own line start
+			u0 := len(xdoc.undo)
+			okx := block_replace(&xdoc, t, transmute([]u8)string("X"))
+			got := doc_debug_string(&xdoc)
+			want := "abXfgh\nabX\na X\n"
+			// The caret follows the TOP row to just past what was inserted
+			// there (byte 3 of "abXfgh"), and the rectangle is left live and
+			// zero-width at cell 3 -- cell_lo plus the X's own cell width, not
+			// its byte length. Read before the undo below, which clears both.
+			cur, anc := xdoc.cursor, xdoc.anchor
+			caret := cur == 3 && anc == 3
+			rect := block_active(&xdoc) && xdoc.block_anchor_cell == 3 && xdoc.block_cursor_cell == 3
+			// A line break has no rectangular meaning and is refused outright,
+			// changing nothing -- see block_replace's own guard.
+			nl := !block_replace(&xdoc, t, transmute([]u8)string("a\nb")) && doc_debug_string(&xdoc) == want
+			// One undo step, and it restores the bytes exactly; redo re-applies.
+			one := len(xdoc.undo) == u0 + 1
+			doc_undo(&xdoc)
+			back := doc_debug_string(&xdoc)
+			doc_redo(&xdoc)
+			fwd := doc_debug_string(&xdoc)
+			cX := okx && got == want && one && back == src && fwd == want && caret && rect && nl
+			fmt.printfln(
+				"  %-6s replace: rectangle [2,5) over three ragged rows, one X: got=%q (want %q) undo=%d (want %d) after-undo=%q after-redo=%q caret=%d,%d (want 3,3) rect-at-cell-3=%v newline-refused=%v",
+				"ok" if cX else "FAIL",
+				got,
+				want,
+				len(xdoc.undo),
+				u0 + 1,
+				back,
+				fwd,
+				cur,
+				anc,
+				rect,
+				nl,
+			)
+			return cX
+		}
+		if !block_test_x(&t) {fail = true}
+
+		// Y: BOTTOM-UP. The three rows change length by three DIFFERENT amounts
+		// (+2, +5, +3 -- the padding is what makes them differ), so any pass that
+		// applies its pre-computed ranges top-down writes rows 1 and 2 at offsets
+		// that stopped being facts the moment row 0 was spliced. The reference is
+		// built by applying the identical per-row splices INDIVIDUALLY, in
+		// reverse order, on a second document -- so this compares the feature
+		// against the rule rather than against a string somebody typed out, and
+		// the literal expectation is asserted too so both cannot drift together.
+		//
+		// Sabotage (per task): reverse block_apply's write loop to run 0..n and
+		// this must FAIL.
+		block_test_y :: proc(t: ^plat.Text) -> bool {
+			src := "aaaaaaaa\nbb\ncccc\n"
+			ydoc := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+			defer doc_close(&ydoc)
+			ydoc.wrap = false
+			ydoc.block = true
+			ydoc.block_anchor_line_start, ydoc.block_anchor_cell = 0, 5
+			ydoc.block_cursor_line_start, ydoc.block_cursor_cell = 12, 5 // "cccc"'s own line start
+			oky := block_replace(&ydoc, t, transmute([]u8)string("XY"))
+			got := doc_debug_string(&ydoc)
+
+			// Same three edits, applied one at a time, highest offset first.
+			ref := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+			defer doc_close(&ref)
+			doc_replace_range(&ref, 16, 0, transmute([]u8)string(" XY")) // "cccc" + 1 pad
+			doc_replace_range(&ref, 11, 0, transmute([]u8)string("   XY")) // "bb" + 3 pad
+			doc_replace_range(&ref, 5, 0, transmute([]u8)string("XY")) // "aaaaaaaa", no pad
+			want := doc_debug_string(&ref)
+
+			// The rectangle's BOTTOM corner must have been corrected by the net
+			// bytes the rows above it added: 12 + 2 + 5 = 19, the new start of
+			// "cccc XY". A stale corner here is the same class of silent damage
+			// as a top-down write, one keystroke later.
+			corner := ydoc.block_cursor_line_start == 19 && ydoc.block_anchor_line_start == 0
+			cY := oky && got == want && got == "aaaaaXYaaa\nbb   XY\ncccc XY\n" && corner
+			fmt.printfln(
+				"  %-6s bottom-up: rows changing length by +2/+5/+3 match the same splices applied individually in reverse: got=%q ref=%q bottom-corner=%d (want 19)",
+				"ok" if cY else "FAIL",
+				got,
+				want,
+				ydoc.block_cursor_line_start,
+			)
+			return cY
+		}
+		if !block_test_y(&t) {fail = true}
+
+		// Z: the cap refuses the WHOLE edit. BLOCK_EDIT_MAX_LINES + 1 rows, so
+		// the row-start walk trips the cap before a single cell is resolved. The
+		// buffer must be byte-identical afterwards, with no undo entry and the
+		// modified flag still clear -- a partially-applied rectangular edit
+		// across thousands of rows is damage the user cannot see the shape of,
+		// let alone undo confidently. Both entry points are checked: typing and
+		// Backspace refuse the same way.
+		//
+		// Sabotage (per task): move the cap check so it truncates the row list
+		// instead of returning false (a partial edit) and the byte comparison
+		// here must FAIL.
+		block_test_z :: proc(t: ^plat.Text) -> bool {
+			rows := BLOCK_EDIT_MAX_LINES + 1
+			zb := make([]u8, rows * 3)
+			for i in 0 ..< rows {zb[i * 3] = 'a'; zb[i * 3 + 1] = 'b'; zb[i * 3 + 2] = '\n'}
+			zdoc := doc_from_content(zb, "", .UTF8)
+			defer doc_close(&zdoc)
+			zdoc.wrap = false
+			zdoc.modified = false
+			before := doc_debug_string(&zdoc)
+			u0 := len(zdoc.undo)
+			zdoc.block = true
+			zdoc.block_anchor_line_start, zdoc.block_anchor_cell = 0, 0
+			zdoc.block_cursor_line_start, zdoc.block_cursor_cell = (rows - 1) * 3, 0
+			okr := block_replace(&zdoc, t, transmute([]u8)string("X"))
+			after_r := doc_debug_string(&zdoc)
+			okd := block_delete(&zdoc, t, true)
+			after_d := doc_debug_string(&zdoc)
+			cZ :=
+				!okr &&
+				!okd &&
+				after_r == before &&
+				after_d == before &&
+				len(zdoc.undo) == u0 &&
+				!zdoc.modified
+			fmt.printfln(
+				"  %-6s cap: a %d-row rectangle (limit %d) refuses the whole edit -- bytes identical=%v/%v replace=%v delete=%v undo=%d (want %d) modified=%v",
+				"ok" if cZ else "FAIL",
+				rows,
+				BLOCK_EDIT_MAX_LINES,
+				after_r == before,
+				after_d == before,
+				okr,
+				okd,
+				len(zdoc.undo),
+				u0,
+				zdoc.modified,
+			)
+			return cZ
+		}
+		if !block_test_z(&t) {fail = true}
+
+		// AA: block_delete's four shapes, dispatched through the REAL command
+		// table (resolve_key -> command_dispatch) so this exercises the wiring,
+		// not just the procedure. Backspace on a zero-width rectangle deletes
+		// the cell to the left of every caret; a row too short to have one
+		// contributes nothing rather than being padded (padding is an INSERT
+		// affordance and must not appear here). Backspace at column 0 is a
+		// no-op -- never N line joins -- and leaves no undo entry at all.
+		// Delete forward at the last cell of a row must not eat the newline.
+		block_test_aa :: proc(t: ^plat.Text) -> bool {
+			aa: App
+			adummy: plat.Window
+			app_new_scratch(&aa)
+			d := app_active(&aa)
+			doc_close(d)
+			d^ = doc_from_content(transmute([]u8)strings.clone("abcdef\nabc\na\n"), "", .UTF8)
+			d.wrap = false
+			d.block = true
+			d.block_anchor_line_start, d.block_anchor_cell = 0, 3
+			d.block_cursor_line_start, d.block_cursor_cell = 11, 3 // "a"'s own line start
+			u0 := len(d.undo)
+			command_dispatch(resolve_key(.Backspace, false, false, .Editor), {.Backspace, false, false, false}, &aa, &adummy, t, 10)
+			bs := doc_debug_string(d)
+			// "a" (row 2) has nothing at cell 2, so it is untouched -- and the
+			// rectangle is left at cell 2 for the next press.
+			cBS := bs == "abdef\nab\na\n" && len(d.undo) == u0 + 1 && block_active(d) && d.block_cursor_cell == 2
+
+			// Backspace twice more walks the column left to 0, then a third press
+			// must do nothing at all -- no join, no undo entry.
+			command_dispatch(resolve_key(.Backspace, false, false, .Editor), {.Backspace, false, false, false}, &aa, &adummy, t, 10)
+			command_dispatch(resolve_key(.Backspace, false, false, .Editor), {.Backspace, false, false, false}, &aa, &adummy, t, 10)
+			at0 := doc_debug_string(d)
+			u1 := len(d.undo)
+			command_dispatch(resolve_key(.Backspace, false, false, .Editor), {.Backspace, false, false, false}, &aa, &adummy, t, 10)
+			cZero := doc_debug_string(d) == at0 && len(d.undo) == u1 && d.block_cursor_cell == 0
+			app_destroy(&aa)
+
+			// Delete forward, on its own document: cell 0 of every row, and the
+			// second row is a single character -- deleting it must leave an empty
+			// line, never pull the following line up.
+			fdoc := doc_from_content(transmute([]u8)strings.clone("abc\nx\n"), "", .UTF8)
+			defer doc_close(&fdoc)
+			fdoc.wrap = false
+			fdoc.block = true
+			fdoc.block_anchor_line_start, fdoc.block_anchor_cell = 0, 0
+			fdoc.block_cursor_line_start, fdoc.block_cursor_cell = 4, 0
+			okf := block_delete(&fdoc, t, true)
+			fwd := doc_debug_string(&fdoc)
+			cFwd := okf && fwd == "bc\n\n" && fdoc.block_cursor_cell == 0
+
+			// A rectangle WITH width: Delete removes it and leaves the rectangle
+			// live and zero-width at its left edge, so typing continues there.
+			wdoc := doc_from_content(transmute([]u8)strings.clone("abcd\nefgh\n"), "", .UTF8)
+			defer doc_close(&wdoc)
+			wdoc.wrap = false
+			wdoc.block = true
+			wdoc.block_anchor_line_start, wdoc.block_anchor_cell = 0, 1
+			wdoc.block_cursor_line_start, wdoc.block_cursor_cell = 5, 3
+			okw := block_delete(&wdoc, t, false)
+			wide := doc_debug_string(&wdoc)
+			cWide := okw && wide == "ad\neh\n" && block_active(&wdoc) && wdoc.block_anchor_cell == 1 && wdoc.block_cursor_cell == 1
+
+			cAA := cBS && cZero && cFwd && cWide
+			fmt.printfln(
+				"  %-6s delete: backspace across the column=%q (want %q) col-0 press is a no-op=%v forward=%q (want %q) width-rectangle=%q (want %q)",
+				"ok" if cAA else "FAIL",
+				bs,
+				"abdef\\nab\\na\\n",
+				cZero,
+				fwd,
+				"bc\\n\\n",
+				wide,
+				"ad\\neh\\n",
+			)
+			return cAA
+		}
+		if !block_test_aa(&t) {fail = true}
+
+		// AB: CRLF. block_row_end now peels the trailing CR with pt_row_vis_end
+		// -- the tree's single definition of where a row's content stops -- so a
+		// rectangle running past the end of a CRLF row covers the row's real
+		// content and nothing else. Before that, row_end was the '\n' itself, so
+		// the CR sat inside the rectangle as a phantom cell and a column delete
+		// took half the line break with it: a bare LF in an otherwise-CRLF file,
+		// which is exactly the corruption doc_insert_newline and pt_crlf_at
+		// already exist to prevent one layer down. Sabotage: restore
+		// block_row_end to `pt_line_end_cap` alone and this must FAIL.
+		block_test_ab :: proc(t: ^plat.Text) -> bool {
+			bdoc := doc_from_content(transmute([]u8)strings.clone("ab\r\ncd\r\n"), "", .UTF8)
+			defer doc_close(&bdoc)
+			bdoc.wrap = false
+			bdoc.block = true
+			bdoc.block_anchor_line_start, bdoc.block_anchor_cell = 0, 1
+			bdoc.block_cursor_line_start, bdoc.block_cursor_cell = 4, 5 // past both rows' ends
+			okb := block_delete(&bdoc, t, false)
+			got := doc_debug_string(&bdoc)
+			cAB := okb && got == "a\r\nc\r\n"
+			fmt.printfln("  %-6s crlf: a column delete past the end of a CRLF row keeps the CR: got=%q (want %q)", "ok" if cAB else "FAIL", got, "a\\r\\nc\\r\\n")
+			return cAB
+		}
+		if !block_test_ab(&t) {fail = true}
+
+		// AC: the EDIT's own cost at the cap. Same fixture as R (the cut's
+		// measurement) so the two numbers are comparable: 18-byte log lines,
+		// ~1.8 MB, a rectangle of exactly BLOCK_EDIT_MAX_LINES rows starting at
+		// row 45,000, over cells [11,15) -- "INFO" -- replaced by "WARN!" so
+		// every row both deletes and inserts, and the rows change length (the
+		// edit's real worst case, and strictly more work than R's delete).
+		// BLOCK_EDIT_MAX_LINES was chosen against the DELETE's numbers, so this
+		// is the case that has to justify it for the edit.
+		block_test_ac :: proc(t: ^plat.Text) -> bool {
+			line := "2026-07-26 INFO x\n" // 18 bytes; "INFO" is cells [11,15)
+			nrows := 100_000
+			cb := strings.builder_make(context.temp_allocator)
+			for _ in 0 ..< nrows {strings.write_string(&cb, line)}
+			cdoc := doc_from_content(transmute([]u8)strings.clone(strings.to_string(cb)), "", .UTF8)
+			defer doc_close(&cdoc)
+			cdoc.wrap = false
+			off := 45_000 * len(line)
+			cdoc.block = true
+			cdoc.block_anchor_line_start, cdoc.block_anchor_cell = off, 11
+			cdoc.block_cursor_line_start, cdoc.block_cursor_cell = off + (BLOCK_EDIT_MAX_LINES - 1) * len(line), 15
+			start := time.now()
+			okc := block_replace(&cdoc, t, transmute([]u8)string("WARN!"))
+			ms := time.duration_milliseconds(time.since(start))
+			cAC := okc && ms < 80
+			fmt.printfln(
+				"  %-6s cost: replacing a %d-row rectangle at the cap costs a bounded amount: ok=%v elapsed=%.2fms (want <80ms)",
+				"ok" if cAC else "FAIL",
+				BLOCK_EDIT_MAX_LINES,
+				okc,
+				ms,
+			)
+			return cAC
+		}
+		if !block_test_ac(&t) {fail = true}
+
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
 		return true
 	}

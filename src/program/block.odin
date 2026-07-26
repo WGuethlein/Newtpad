@@ -220,10 +220,22 @@ block_step_lines :: proc(doc: ^Document, from, d: int) -> (start: int, ok: bool)
 // cap to answer. Refusing on row length alone -- before the walk even starts
 // -- was the bug: it fails every rectangle on a long row, not just the ones
 // that actually reach past the cap.
+//
+// The trailing CR of a CRLF break is peeled off with pt_row_vis_end -- the
+// tree's single definition of where a rendered row's content stops, and the
+// one every other consumer (the caret, the click, the wrap budget, the column
+// readout) already uses. Without it a CRLF row's last cell was the CR itself:
+// a phantom cell with no glyph that the rectangle could cover, so a column cut
+// or a column edit at the end of a line deleted one half of the line break and
+// left a bare LF in an otherwise-CRLF file. `line_end` is false when the scan
+// stopped at the cap, because there a CR really is ordinary content -- exactly
+// the distinction pt_row_vis_end's own comment draws, which is why `truncated`
+// is computed from the raw end BEFORE the peel.
 @(private = "file")
 block_row_end :: proc(doc: ^Document, line_start: int) -> (row_end: int, truncated: bool) {
-	row_end = base.pt_line_end_cap(&doc.pt, line_start, BLOCK_ROW_CAP)
-	truncated = row_end == line_start + BLOCK_ROW_CAP && row_end < doc.pt.length
+	raw := base.pt_line_end_cap(&doc.pt, line_start, BLOCK_ROW_CAP)
+	truncated = raw == line_start + BLOCK_ROW_CAP && raw < doc.pt.length
+	row_end = base.pt_row_vis_end(&doc.pt, line_start, raw, !truncated)
 	return
 }
 
@@ -798,4 +810,238 @@ block_cut_delete :: proc(doc: ^Document, t: ^plat.Text) -> bool {
 	doc_batch_end(doc, edited) // rows actually edited, not rows spanned
 	block_clear(doc)
 	return true
+}
+
+// --- Task 6: editing across the rectangle ---
+
+// Every rectangle-wide edit -- typing over the rectangle, Backspace, Delete --
+// runs through this one procedure, for the same reason block_row_range is the
+// one place cells become bytes: the three entry points differ only in which
+// cell range they touch, what they put back, and the column they leave the
+// rectangle in. Two independent bottom-up splice loops would eventually
+// disagree about the order they apply in, and the failure mode of that
+// disagreement is a silently corrupted file, not a crash.
+//
+// `edit_lo`/`edit_hi` are the CELL range to replace on every spanned row --
+// deliberately a parameter rather than block_bounds' own cells, because
+// Backspace on a zero-width rectangle at cell c edits [c-1, c), which is not
+// the rectangle. `text` is what replaces it (empty for a delete). `new_cell` is
+// the column the rectangle is left sitting in afterwards.
+//
+// Three refusals, all of them leaving the buffer byte-identical and the
+// rectangle untouched, because a rectangular edit that only partly happened is
+// unrecoverable-looking damage spread across a file the user cannot easily
+// inspect -- worse than the keystroke appearing to do nothing:
+//
+//   - more than BLOCK_EDIT_MAX_LINES rows. Checked while collecting the row
+//     starts, so it costs one cheap step per row and refuses BEFORE any
+//     cell-walk, let alone any write.
+//   - any row block_row_range could not resolve. Same rule the copy and the
+//     cut already follow: a bounded scan that cannot tell it was truncated
+//     must never answer as though it saw the whole row.
+//   - (not a refusal but the same discipline) nothing on any row would
+//     actually change: no batch is opened at all. doc_batch_begin's push_undo
+//     marks the document modified and clears the redo stack unconditionally,
+//     so opening one for a no-op dirties a clean file and destroys the user's
+//     redo history with nothing to show for it -- the exact bug the Cut path
+//     shipped and fixed one task ago.
+//
+// ORDER. Writes are applied HIGHEST OFFSET FIRST, the identical rule
+// block_cut_delete and find_replace_all (find.odin) apply: splicing a row
+// shifts every byte offset after it and never one before it, so a top-down
+// pass would hand every remaining row an offset that was a fact about the
+// buffer before the pass started and is not one now. Bottom-up, each row's own
+// range is still valid when its turn arrives. This is not a performance
+// choice; top-down corrupts, and it corrupts silently.
+//
+// PADDING. A row too short to reach edit_lo reports pad_cells, and this is the
+// ONLY place in the feature that acts on it: exactly that many spaces are
+// written before the inserted text so the edit lands in the same column on
+// every row. Without it, block-prefixing a ragged file silently skips every
+// short row -- which is most of the point of the feature. Padding applies only
+// when there is text to insert: a delete has no column to reach.
+@(private = "file")
+block_apply :: proc(doc: ^Document, t: ^plat.Text, edit_lo, edit_hi: int, text: []u8, new_cell: int, kind: Edit_Kind) -> bool {
+	if !block_active(doc) {return false}
+	off_lo, off_hi, _, _ := block_bounds(doc)
+
+	// Row starts first, by the cheap vertical walk alone (no cell walk yet), so
+	// the cap refuses before anything more expensive happens. block_step_lines
+	// is the only row walk in this file and this is not allowed to become a
+	// second one.
+	starts := make([dynamic]int, 0, 64, context.temp_allocator)
+	line_start := off_lo
+	for {
+		if len(starts) >= BLOCK_EDIT_MAX_LINES {return false}
+		append(&starts, line_start)
+		if line_start >= off_hi {break}
+		next, step_ok := block_step_lines(doc, line_start, 1)
+		if !step_ok {return false}
+		line_start = next
+	}
+
+	// Every row resolved exactly ONCE, before any byte is written -- both the
+	// refusal check and the range the write loop below reuses verbatim. Nothing
+	// touches the buffer between the two loops, so a second resolve would
+	// return identical answers for ~25% of the operation's cost (see
+	// BLOCK_EDIT_MAX_LINES' own comment for the measurement that established
+	// that).
+	n := len(starts)
+	los := make([]int, n, context.temp_allocator)
+	his := make([]int, n, context.temp_allocator)
+	pads := make([]int, n, context.temp_allocator)
+	any_change := false
+	for ls, i in starts {
+		lo, hi, pad, ok := block_row_range(doc, t, ls, edit_lo, edit_hi)
+		if !ok {return false}
+		los[i], his[i] = lo, hi
+		pads[i] = pad if len(text) > 0 else 0
+		if hi > lo || len(text) > 0 {any_change = true}
+	}
+	if !any_change {
+		// A delete whose cell range lies past the end of every spanned row.
+		// Leave the rectangle exactly as it was: the keystroke did nothing, and
+		// nothing is the honest result -- see this proc's own comment for why
+		// no batch may be opened here.
+		return true
+	}
+
+	// Net bytes the rows ABOVE the rectangle's last row add or remove. The top
+	// row's own start can never move (every write is at or below it), so this
+	// is the whole correction the bottom corner needs afterwards. Computed from
+	// the pre-edit ranges rather than observed during the loop so it reads as
+	// the arithmetic it is.
+	shift := 0
+	for i in 0 ..< n - 1 {
+		if len(text) > 0 {
+			shift += pads[i] + len(text) - (his[i] - los[i])
+		} else {
+			shift -= his[i] - los[i]
+		}
+	}
+
+	doc_batch_begin(doc, kind)
+	edited := 0
+	ins := make([dynamic]u8, 0, len(text) + 8, context.temp_allocator)
+	for i := n - 1; i >= 0; i -= 1 {
+		if len(text) == 0 {
+			if his[i] <= los[i] {continue} // nothing of this row is in the rectangle
+			doc.anchor, doc.cursor = los[i], his[i]
+			doc_replace_sel(doc, nil)
+			edited += 1
+			continue
+		}
+		clear(&ins)
+		for _ in 0 ..< pads[i] {append(&ins, ' ')}
+		append(&ins, ..text)
+		doc.anchor, doc.cursor = los[i], his[i]
+		doc_replace_sel(doc, ins[:], kind)
+		edited += 1
+	}
+
+	// The caret follows the TOP row, whose offsets nothing below it could
+	// shift: just past what was inserted there, or at the resolved left edge
+	// when this was a delete. Set unconditionally rather than left to whatever
+	// the bottom-up loop's last row happened to leave behind -- when the top
+	// row itself had nothing to edit, the loop never touched doc.cursor for it
+	// at all (the LOW 3 finding, block_cut_delete's own comment).
+	top_caret := los[0] + pads[0] + len(text) if len(text) > 0 else los[0]
+	doc.cursor = top_caret
+	doc.anchor = top_caret
+	doc_batch_end(doc, edited) // rows actually edited, not rows spanned
+
+	// The rectangle SURVIVES the edit, collapsed to zero width at new_cell on
+	// the same rows. Typing "// " down a column is three keystrokes, and
+	// clearing the block here would make the second one an ordinary insert on
+	// one line -- the feature's most-wanted use would need the rectangle
+	// re-made between every character. See block_replace's own comment.
+	//
+	// Only the BOTTOM corner is corrected: the top row's start is still a fact.
+	// The anchor/cursor orientation is preserved so a following Alt+Shift+arrow
+	// keeps extending from the end the user built the rectangle from.
+	new_hi := starts[n - 1] + shift
+	if doc.block_anchor_line_start <= doc.block_cursor_line_start {
+		doc.block_anchor_line_start = starts[0]
+		doc.block_cursor_line_start = new_hi
+	} else {
+		doc.block_anchor_line_start = new_hi
+		doc.block_cursor_line_start = starts[0]
+	}
+	doc.block_anchor_cell = new_cell
+	doc.block_cursor_cell = new_cell
+	return true
+}
+
+// Type over the rectangle: `text` replaces the rectangle's own cell range on
+// every row it spans, as ONE undo step. A ZERO-WIDTH rectangle (cell_lo ==
+// cell_hi, the "N carets in one column" affordance) replaces nothing and so
+// simply inserts on every row -- which is how a column of lines gets prefixed.
+//
+// Afterwards the rectangle is still live, zero-width, at the column the insert
+// finished in on every row: cell_lo plus the text's own cell width (never its
+// byte length -- a tab is 4 cells and one byte, and CJK is 2 cells and 3).
+// Padding guarantees every row really is at that same column, which is what
+// makes the choice safe: the next keystroke's rectangle is a fact about all N
+// rows, not just the longest.
+//
+// The three defensible post-edit states are collapse to a single caret, keep
+// the rectangle, and this one. Collapsing loses the column after the first
+// character, so "// " would need the rectangle re-made twice. Keeping the
+// rectangle at its original width means the second character overwrites the
+// first on every row -- typing "ab" leaves "b". A zero-width rectangle at the
+// new column is the only one of the three where consecutive keystrokes compose
+// the way typing does everywhere else in the editor.
+//
+// Returns false, having changed nothing at all, when block_apply refuses --
+// see its comment for the three cases. The caller posts the note; this file
+// has never imported the App type.
+block_replace :: proc(doc: ^Document, t: ^plat.Text, text: []u8) -> bool {
+	if !block_active(doc) {return false}
+	// A line break in `text` has no rectangular meaning: it would split every
+	// spanned row in two, so the row starts collected below stop naming line
+	// starts the moment the first one is written, and the bottom corner's own
+	// correction becomes arithmetic about a shape that no longer exists.
+	// Nothing in the product can send one -- the platform char path filters
+	// control characters and Enter is .Insert_Newline, which drops the
+	// rectangle (command_dispatch) -- so this guards the precondition rather
+	// than a reachable case, and refusing is the only safe answer for a future
+	// caller (a column paste) that has not been designed yet.
+	for b in text {
+		if b == '\n' || b == '\r' {return false}
+	}
+	_, _, cell_lo, cell_hi := block_bounds(doc)
+	return block_apply(doc, t, cell_lo, cell_hi, text, cell_lo + plat.text_cells(t, text, .Doc), .Paste)
+}
+
+// Backspace (forward=false) or Delete (forward=true) across the rectangle, as
+// ONE undo step, leaving it live and zero-width at the column the deletion
+// left off in -- same reasoning as block_replace, so held-down Backspace walks
+// the whole column left one cell per press.
+//
+// A rectangle with width deletes its own cell range and collapses to its left
+// edge; that is the "select a column and press Delete" gesture, and it is
+// deliberately NOT block_cut_delete (which clears the rectangle, because a Cut
+// ends the gesture the way it does on a linear selection).
+//
+// A ZERO-WIDTH rectangle is N carets: Backspace takes the cell to the left on
+// every row, Delete the cell to the right. Neither ever joins rows. The right
+// edge cannot: block_row_range's walk is bounded by the row's own visible end,
+// so a row whose content stops before the deleted cell simply contributes
+// nothing (no newline is reachable, let alone deletable). The left edge is
+// handled here -- Backspace at column 0 is a no-op rather than N line joins,
+// which is both what every other column editor does and the only answer that
+// keeps the operation rectangular.
+block_delete :: proc(doc: ^Document, t: ^plat.Text, forward: bool) -> bool {
+	if !block_active(doc) {return false}
+	_, _, cell_lo, cell_hi := block_bounds(doc)
+	if cell_lo != cell_hi {
+		return block_apply(doc, t, cell_lo, cell_hi, nil, cell_lo, .Delete)
+	}
+	if forward {
+		return block_apply(doc, t, cell_lo, cell_lo + 1, nil, cell_lo, .Delete)
+	}
+	if cell_lo == 0 {
+		return true // nothing to the left on any row; see this proc's comment
+	}
+	return block_apply(doc, t, cell_lo - 1, cell_lo, nil, cell_lo - 1, .Delete)
 }

@@ -275,7 +275,9 @@ main :: proc() {
 				// in-cell field, not the underlying document.
 				if doc.table_editing {table_edit_rune(doc, window.chars[i])}
 			} else {
-				doc_insert_rune(doc, window.chars[i])
+				// Not doc_insert_rune directly: with a column rectangle live
+				// one keystroke is an edit on every row it spans.
+				editor_input_rune(&app, doc, &text, window.chars[i])
 			}
 		}
 		window.char_count = 0
