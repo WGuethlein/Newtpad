@@ -155,6 +155,9 @@ app_activate :: proc(a: ^App, slot: int) {
 	if d.idx.th == nil {
 		doc_index_start(d)
 	}
+	if d.lex_idx.th == nil {
+		lex_index_start(d) // no-op when the doc's lexer isn't stateful or the file is mapped
+	}
 	// The history panel is one global surface showing whichever document is
 	// active, but its selected row indexes THAT document's undo stack. Switching
 	// tabs with the panel open left the old document's row number pointing into

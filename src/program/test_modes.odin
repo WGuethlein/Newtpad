@@ -1779,6 +1779,40 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			if !okw {bad += 1}
 		}
 
+		fmt.println("--- a link past the wrapped-row scan caps ---")
+		// Same shape as the syntax highlighter's wrapped-row bug (see
+		// doc_row_lex_extent, doc.odin): the wrapped branch below discards
+		// pt_line_start_cap's `exact` flag and caps its whole-line read at
+		// LINK_SCAN_CAP, so on a logical line longer than either cap it hands
+		// the rebase a window that cannot contain the row -- and every row past
+		// it is skipped, silently, with no links at all.
+		//
+		// Reachable only with the user's word wrap ON: a line whose newline sits
+		// beyond WRAP_START_CAP never force-wraps (line_wrap_decision). The URL
+		// here sits at byte ~9000, past both LINK_SCAN_CAP (4096) and
+		// WRAP_START_CAP (8192).
+		{
+			tt: plat.Text
+			plat.text_load_faces(&tt)
+			url := "https://example.com/deep"
+			line := strings.concatenate({strings.repeat("x", 9000), " ", url, "\n"})
+			wd := doc_from_content(transmute([]u8)line, "", .UTF8)
+			defer doc_close(&wd)
+			wd.wrap = true // only the wrap setting produces wrapped rows this far in
+			wd.view_cols = 80
+			wd.view_rows = 200
+			hits := links_layout(&wd, &tt, 200)
+			cells, resolved := 0, false
+			for h in hits {
+				if h.link.kind != .URL {continue}
+				cells += h.span_len
+				if tgt, ok := link_resolve(&wd, h.text, h.link); ok && tgt.is_url && tgt.url == url {resolved = true}
+			}
+			okd := cells == len(url) && resolved
+			fmt.printfln("  %d/%d cells covered, resolves=%v %s", cells, len(url), resolved, "OK" if okd else "FAIL")
+			if !okd {bad += 1}
+		}
+
 		fmt.printfln("linktest: %d failures", bad)
 		return true
 	}
@@ -4389,6 +4423,1203 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 
 		fmt.println("dropfittest: FAILURES" if fail else "dropfittest: all ok")
+		return true
+	}
+
+	// `newtpad highlighttest` is Task 1's Step 5: the failure mode of the whole
+	// syntax-highlighting batch is a lexer that is correct and quietly O(file).
+	// It proves highlight_row_spans/doc_row_lex_spans (highlight.odin, doc.odin)
+	// cost the same per viewport regardless of document size, using a counter
+	// of bytes handed to the lexer (hl_bytes_examined) rather than wall-clock,
+	// so the assertion is stable. It also proves the assertion CAN fail: a
+	// "buggy" variant, injected only in this test's own harness (never in the
+	// shipping row loop), feeds the lexer everything from byte 0 instead of
+	// just the current row, and the byte count must then diverge between a
+	// small and a huge file. Finally it checks the wrap-rebase path
+	// (doc_row_lex_spans's wrapped branch) directly: a bare number straddling a
+	// forced wrap point must still be fully covered, split correctly across
+	// both visual rows, each rebased to start within that row's own bytes.
+	if os.args[1] == "highlighttest" {
+		fmt.println("highlighttest:")
+		fail := false
+
+		// The link-precedence checks below distinguish spans by their theme
+		// colour (Syn_Number vs Syn_Keyword vs Syn_String vs Link). Without a
+		// theme loaded, g_theme is its zero value, making every Color_Role
+		// compare equal by accident. theme_dark() itself doesn't help either:
+		// its Syn_* roles are still an unfilled magenta placeholder (batch 4
+		// hasn't wired Dark's syntax colours yet, see theme.odin), so every
+		// Syn_* role there is the SAME magenta too. theme_light() already has
+		// real, mutually distinct provisional values for all nine Syn_* roles
+		// (theme.odin's own comment: "chosen for legibility and mutual
+		// distinctness"), so it's what this test needs -- the other checks in
+		// this mode don't care which theme is loaded (they only ever compare
+		// one role's colour to itself).
+		g_theme = theme_light()
+
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("highlighttest: no fonts loaded")
+			return true
+		}
+
+		// One repeating log line carrying all four patterns lex_log recognizes,
+		// so every row does real (not trivially-empty) lexing work.
+		line := "2026-07-25T10:23:45Z ERROR failed to open \"C:\\log.txt\" after 42 retries\n"
+
+		make_doc :: proc(line: string, repeats: int) -> Document {
+			sb := strings.builder_make(context.temp_allocator)
+			for _ in 0 ..< repeats {strings.write_string(&sb, line)}
+			d: Document
+			d.pt = base.pt_init(transmute([]u8)strings.to_string(sb))
+			d.path = "test.log"
+			d.view_cols = 200
+			return d
+		}
+
+		// Bytes handed to the lexer while drawing `rows` visible rows from
+		// doc.top, via the SAME per-row loop shape doc_draw uses (visible_begin/
+		// next, then either highlight_row_spans directly for an unwrapped row or
+		// doc_row_lex_spans's cache for a wrapped one). `buggy`, when true, feeds
+		// the lexer everything from byte 0 through the current row's end instead
+		// of just the row's own bytes -- a stand-in for "the row-span builder
+		// scans from the buffer start" -- to prove the assertion below can
+		// actually fail, not just that it happens to pass.
+		measure :: proc(doc: ^Document, t: ^plat.Text, rows: int, buggy: bool) -> int {
+			hl_bytes_examined = 0
+			line_buf: [VISIBLE_COLS]u8
+			hl_cache: Highlight_Row_Cache
+			it := visible_begin(doc, t, rows)
+			for {
+				_, start, end, vis_end, _, wrapped, ok := visible_next(&it)
+				if !ok {break}
+				draw_len := min(vis_end - start, len(line_buf))
+				n := base.pt_read(&doc.pt, start, line_buf[:draw_len])
+				if n <= 0 {continue}
+				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				if buggy {
+					whole := make([]u8, end, context.temp_allocator)
+					got := base.pt_read(&doc.pt, 0, whole)
+					highlight_row_spans(doc, whole[:got], .Normal, hl_buf[:])
+				} else {
+					doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], .Normal, hl_buf[:])
+				}
+			}
+			return hl_bytes_examined
+		}
+
+		rows := 30
+		// `small` must have enough lines left after `top` to fill every one of
+		// `rows` rows -- otherwise visible_next runs out of document and the
+		// loop stops early, examining fewer rows (and so fewer bytes) than
+		// `big` for a reason that has nothing to do with the code under test.
+		// That is exactly the shape of bug this fixture must not itself have:
+		// it first shipped with small=20/top=5 lines, leaving only 15 lines for
+		// 30 rows, and "big examines 2x small's bytes" looked like a real
+		// failure until this comment's fix.
+		small := make_doc(line, rows + 10) // ~3 KB: a few rows' margin past `top`
+		big := make_doc(line, 200000) // ~15 MB
+		defer base.pt_destroy(&small.pt)
+		defer base.pt_destroy(&big.pt)
+		// Not byte 0: a few lines in, so a builder that secretly scans from the
+		// start would show up as size-dependent even though doc.top itself is a
+		// small, fixed-looking offset on both documents.
+		small.top = len(line) * 5
+		big.top = len(line) * 100000
+		small_bytes := measure(&small, &t, rows, false)
+		big_bytes := measure(&big, &t, rows, false)
+		ok := small_bytes > 0 && small_bytes == big_bytes
+		if !ok {fail = true}
+		fmt.printfln(
+			"  %-6s viewport-proportional: small=%d big=%d (want equal, both > 0)",
+			"ok" if ok else "FAIL",
+			small_bytes,
+			big_bytes,
+		)
+
+		small_buggy := measure(&small, &t, rows, true)
+		big_buggy := measure(&big, &t, rows, true)
+		// The bug must show up as a large, unmistakable gap, not noise -- big's
+		// doc.top is ~100000 lines in, so scanning from byte 0 on every one of
+		// its 30 rows examines roughly 100000x more bytes than small's does.
+		caught := big_buggy > small_buggy * 10
+		if !caught {fail = true}
+		fmt.printfln(
+			"  %-6s assertion can fail: buggy variant diverges (small=%d big=%d)",
+			"ok" if caught else "FAIL",
+			small_buggy,
+			big_buggy,
+		)
+
+		// Wrap rebase: a single bare number wider than the row forces a mid-token
+		// wrap (word-wrap breaks at the last fitting space; a token with none
+		// char-breaks -- see wrap_row_end's comment). The Number token must still
+		// be found in full across the wrapped rows, each piece rebased to start
+		// within [0, that row's own byte count) -- never negative, never past
+		// what's actually drawn on that row.
+		{
+			digits := "12345678901234567890" // 20 digits, no internal separators
+			content := strings.concatenate({digits, " done\n"}, context.temp_allocator)
+			wd: Document
+			wd.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&wd.pt)
+			wd.path = "test.log"
+			wd.wrap = true
+			wd.view_cols = 10
+
+			wcache: Highlight_Row_Cache
+			line_buf: [VISIBLE_COLS]u8
+			total_len, first_start := 0, -1
+			bounds_ok := true
+			wit := visible_begin(&wd, &t, 6)
+			for {
+				_, start, end, vis_end, _, wrapped, ok := visible_next(&wit)
+				if !ok {break}
+				draw_len := min(vis_end - start, len(line_buf))
+				n := base.pt_read(&wd.pt, start, line_buf[:draw_len])
+				if n <= 0 {continue}
+				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				hn, _ := doc_row_lex_spans(&wd, &wcache, start, end, wrapped, line_buf[:n], .Normal, hl_buf[:])
+				for k in 0 ..< hn {
+					sp := hl_buf[k]
+					if sp.color != g_theme[.Syn_Number] {continue}
+					if first_start < 0 {first_start = sp.start}
+					total_len += sp.len
+					if sp.start < 0 || sp.start + sp.len > n {bounds_ok = false}
+				}
+			}
+			wrap_ok := bounds_ok && first_start == 0 && total_len == len(digits)
+			if !wrap_ok {fail = true}
+			fmt.printfln(
+				"  %-6s wrap rebase: number split across rows, total_len=%d (want %d) first_start=%d (want 0) bounds_ok=%v",
+				"ok" if wrap_ok else "FAIL",
+				total_len,
+				len(digits),
+				first_start,
+				bounds_ok,
+			)
+		}
+
+		// Wrapped rows PAST WRAP_START_CAP -- the case the rebase check above
+		// cannot reach, because its line is 26 bytes long. One logical line of
+		// ~28 KB with word wrap ON: a line whose own newline sits beyond
+		// WRAP_START_CAP never FORCE-wraps (line_wrap_decision, doc.odin), so
+		// only the user's wrap setting produces wrapped rows this far into a
+		// line -- and once a row starts more than WRAP_START_CAP (8192) bytes
+		// past the line start, pt_line_start_cap can no longer find that start
+		// and returns a scan FLOOR that slides forward with every visual row,
+		// flagged exact=false.
+		//
+		// doc_row_lex_spans used to discard that flag (`lls, _ :=`) and treat
+		// the floor as a line start, which broke both of its outputs at once:
+		// state_in (the state at the PREVIOUS logical line's end) got applied
+		// at an arbitrary mid-line byte and the result reported as what the
+		// WHOLE line ends in, and the rebase window collapsed ([row_off,
+		// row_end_off) is empty once the floor sits exactly RENDER_LINE_CAP
+		// behind the row) so the row drew with no spans at all. Both are
+		// asserted here: the state threaded through the draw path must match
+		// what doc_lex_state_at independently reports for the same byte offset,
+		// and the row after the comment opens must actually be coloured as one.
+		//
+		// The SECOND half of the same bug lives nearer the front of the line
+		// and needs its own marker: for a row whose line start IS findable
+		// (exact=true, anywhere in the first WRAP_START_CAP bytes), the cached
+		// whole-line read is still capped at RENDER_LINE_CAP, so on a line
+		// longer than that it can neither colour nor account for anything past
+		// byte 8192 -- while still reporting its result as the whole line's.
+		// CLOSED_AT puts a complete `/* */` just past that cap, inside the row
+		// that straddles it, so a cache built from a truncated read shows up as
+		// an uncoloured comment rather than only as a wrong state.
+		//
+		// WHICH HALF THIS ACTUALLY PINS, stated plainly because the name above
+		// overclaims: every assertion here fails when the truncated-read guard
+		// goes, and NONE of them fail when only the exact=false guard goes.
+		// That is not slack in the fixture -- it is doc_row_lex_extent's
+		// #assert(WRAP_START_CAP >= RENDER_LINE_CAP) holding: with the caps
+		// equal, an inexact floor is start-8192 and the end scan can only reach
+		// `start`, so the truncation guard catches the same rows. Break that
+		// assert and this test goes quiet; the assert, not this fixture, is what
+		// guards the exact flag.
+		{
+			CLOSED_AT :: 9000 // just past RENDER_LINE_CAP: inside the row straddling it
+			CLOSED_LEN :: 102 // "/*" + 98 filler + "*/"
+			OPEN_AT :: 20500 // > 2x WRAP_START_CAP into the line: the floor is nowhere near the truth
+			ROW_COLS :: 2000 // no spaces anywhere below, so rows char-break on exactly this stride
+			content := strings.concatenate(
+				{
+					strings.repeat("a", CLOSED_AT, context.temp_allocator),
+					"/*", // a COMPLETE comment, past the cached read's cap
+					strings.repeat("z", CLOSED_LEN - 4, context.temp_allocator),
+					"*/",
+					strings.repeat("a", OPEN_AT - CLOSED_AT - CLOSED_LEN, context.temp_allocator),
+					"/*", // opens a block comment that never closes: every byte past here is In_Comment
+					strings.repeat("b", 8000, context.temp_allocator),
+					"\n",
+				},
+				context.temp_allocator,
+			)
+			cd: Document
+			cd.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&cd.pt)
+			cd.path = "test.c"
+			cd.wrap = true
+			cd.view_cols = ROW_COLS
+
+			cache: Highlight_Row_Cache
+			line_buf: [VISIBLE_COLS]u8
+			all_wrapped := true
+			open_row_start, open_row_end := -1, -1
+			open_row_state := base.Lex_State.Normal
+			next_row_len, next_row_comment := -1, 0
+			straddle_comment := 0 // Comment-coloured bytes on the row spanning RENDER_LINE_CAP
+			hl_state := base.Lex_State.Normal // byte 0 of the document: unambiguously .Normal
+			it := visible_begin(&cd, &t, 20)
+			for {
+				_, start, end, vis_end, _, wrapped, ok := visible_next(&it)
+				if !ok {break}
+				if !wrapped {all_wrapped = false}
+				draw_len := min(vis_end - start, len(line_buf))
+				n := base.pt_read(&cd.pt, start, line_buf[:draw_len])
+				if n <= 0 {continue}
+				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				hn: int
+				hn, hl_state = doc_row_lex_spans(&cd, &cache, start, end, wrapped, line_buf[:n], hl_state, hl_buf[:])
+				if start <= CLOSED_AT && CLOSED_AT < end {
+					for k in 0 ..< hn {
+						if hl_buf[k].color == g_theme[.Syn_Comment] {straddle_comment += hl_buf[k].len}
+					}
+				}
+				// The row the comment opens ON, then the row after it -- that
+				// one is entirely inside the comment, so entirely one span.
+				if start <= OPEN_AT && OPEN_AT < end {
+					open_row_start, open_row_end = start, end
+					open_row_state = hl_state
+				} else if open_row_end == start && next_row_len < 0 {
+					next_row_len = end - start
+					for k in 0 ..< hn {
+						if hl_buf[k].color == g_theme[.Syn_Comment] {next_row_comment += hl_buf[k].len}
+					}
+				}
+			}
+			// Ground truth for the same byte offset through the independent
+			// mechanism (lex_index.odin's bounded resync -- this Document was
+			// never handed to lex_index_start, so doc_lex_state_at can't
+			// shortcut to the background index).
+			truth := doc_lex_state_at(&cd, open_row_end, LEX_RESYNC_WINDOW)
+			past_cap := open_row_start > WRAP_START_CAP
+			long_ok :=
+				past_cap &&
+				all_wrapped &&
+				open_row_state == .In_Comment &&
+				truth == open_row_state &&
+				next_row_len > 0 &&
+				next_row_comment == next_row_len &&
+				straddle_comment == CLOSED_LEN
+			if !long_ok {fail = true}
+			fmt.printfln(
+				"  %-6s wrapped row past WRAP_START_CAP: row=[%d,%d) wrapped=%v state=%v truth=%v, next row comment-coloured %d/%d bytes, straddle row %d/%d",
+				"ok" if long_ok else "FAIL",
+				open_row_start,
+				open_row_end,
+				all_wrapped,
+				open_row_state,
+				truth,
+				next_row_comment,
+				next_row_len,
+				straddle_comment,
+				CLOSED_LEN,
+			)
+		}
+
+		// Link precedence: the drop-then-merge in doc_draw (factored out as
+		// highlight_merge_spans, highlight.odin) is the one place this batch's
+		// three interactions (lexer spans, links, wrap) actually collide, and a
+		// 2026-07 review found it had no test beyond "hand-verified by reading
+		// the code." These checks call highlight_merge_spans directly -- the
+		// literal proc doc_draw calls, not a copy -- first against a real .log
+		// row with a URL a lexer token also covers, then against synthetic spans
+		// that pin down all four ways a link and a token can intersect, plus the
+		// adjacent-but-not-overlapping case that must NOT drop (the boundary
+		// where < vs <= matters).
+		{
+			LEX := [4]f32{1, 0, 0, 1}
+			LINK := [4]f32{0, 1, 0, 1}
+
+			// Valid input to text_draw_spans only if ascending by start with no
+			// overlap between consecutive spans -- exactly the precondition
+			// highlight_merge_spans exists to uphold.
+			sorted_no_overlap :: proc(spans: []plat.Text_Span) -> bool {
+				for i in 1 ..< len(spans) {
+					if spans[i].start < spans[i - 1].start + spans[i - 1].len {return false}
+				}
+				return true
+			}
+			spans_eq :: proc(a, b: []plat.Text_Span) -> bool {
+				if len(a) != len(b) {return false}
+				for i in 0 ..< len(a) {
+					if a[i].start != b[i].start || a[i].len != b[i].len || a[i].color != b[i].color {return false}
+				}
+				return true
+			}
+			has_color :: proc(spans: []plat.Text_Span, color: [4]f32) -> bool {
+				for s in spans {
+					if s.color == color {return true}
+				}
+				return false
+			}
+
+			// The motivating real-world case: a quoted string that wraps a URL.
+			// The String token (the whole "..." run) and the URL Link genuinely
+			// overlap on real bytes, unlike the synthetic cases below -- this is
+			// "link inside token" with a real lexer and a real link scan behind
+			// it, not just asserted geometry.
+			{
+				row := `2026-07-25T10:23:45Z ERROR fetch "https://example.com/x" failed`
+				rdoc: Document
+				rdoc.path = "test.log"
+				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				hl_n, _ := highlight_row_spans(&rdoc, transmute([]u8)row, .Normal, hl_buf[:])
+				lks := links_scan(row)
+				link_buf := make([]plat.Text_Span, len(lks), context.temp_allocator)
+				for l, i in lks {link_buf[i] = plat.Text_Span{start = l.start, len = l.len, color = LINK}}
+				merged := make([]plat.Text_Span, hl_n + len(link_buf), context.temp_allocator)
+				mn := highlight_merge_spans(hl_buf[:hl_n], link_buf, merged)
+				out := merged[:mn]
+
+				url_start := strings.index(row, "https://")
+				url_len := len("https://example.com/x")
+				ts_len := len("2026-07-25T10:23:45Z")
+				kw_start := strings.index(row, "ERROR")
+				found_link, found_ts, found_kw := false, false, false
+				for s in out {
+					if s.start == url_start && s.len == url_len && s.color == LINK {found_link = true}
+					if s.start == 0 && s.len == ts_len && s.color == g_theme[.Syn_Number] {found_ts = true}
+					if s.start == kw_start && s.len == len("ERROR") && s.color == g_theme[.Syn_Keyword] {found_kw = true}
+				}
+				// The quoted-string token must be dropped WHOLE: no span anywhere
+				// in the output may carry the String colour, because the only
+				// String token on this row is the one the link overlaps.
+				real_ok :=
+					sorted_no_overlap(out) &&
+					found_link &&
+					found_ts &&
+					found_kw &&
+					!has_color(out, g_theme[.Syn_String])
+				if !real_ok {fail = true}
+				fmt.printfln(
+					"  %-6s link precedence, real row: quoted URL wins over String token, timestamp/ERROR untouched (n=%d)",
+					"ok" if real_ok else "FAIL",
+					mn,
+				)
+			}
+
+			// Synthetic geometry: exact control over where a link's boundary
+			// falls relative to a token's, covering all four intersection shapes
+			// the review enumerated plus the adjacent-but-not-overlapping case
+			// (both directions) that must survive untouched. Each case also
+			// carries an unrelated, non-intersecting span that must pass through
+			// unharmed -- proving the drop is selective, not "any link present
+			// nukes the row."
+			Case :: struct {
+				label:              string,
+				lex, link_in, want: []plat.Text_Span,
+			}
+			cases := []Case{
+				{
+					label = "partial overlap: link starts before token, ends inside it",
+					lex = []plat.Text_Span{{10, 10, LEX}, {40, 5, LEX}},
+					link_in = []plat.Text_Span{{5, 8, LINK}}, // [5,13) overlaps [10,20)'s left edge
+					want = []plat.Text_Span{{5, 8, LINK}, {40, 5, LEX}},
+				},
+				{
+					label = "partial overlap: token starts before link, ends inside it",
+					lex = []plat.Text_Span{{10, 10, LEX}, {40, 5, LEX}},
+					link_in = []plat.Text_Span{{15, 10, LINK}}, // [15,25) overlaps [10,20)'s right edge
+					want = []plat.Text_Span{{15, 10, LINK}, {40, 5, LEX}},
+				},
+				{
+					label = "link entirely inside token",
+					lex = []plat.Text_Span{{10, 20, LEX}, {40, 5, LEX}}, // [10,30)
+					link_in = []plat.Text_Span{{15, 5, LINK}}, // [15,20) inside [10,30)
+					want = []plat.Text_Span{{15, 5, LINK}, {40, 5, LEX}},
+				},
+				{
+					label = "token entirely inside link",
+					lex = []plat.Text_Span{{15, 5, LEX}, {40, 5, LEX}}, // [15,20)
+					link_in = []plat.Text_Span{{10, 20, LINK}}, // [10,30) contains [15,20)
+					want = []plat.Text_Span{{10, 20, LINK}, {40, 5, LEX}},
+				},
+				{
+					label = "adjacent, link right after token: must NOT drop",
+					lex = []plat.Text_Span{{10, 10, LEX}}, // [10,20)
+					link_in = []plat.Text_Span{{20, 5, LINK}}, // [20,25) touches, doesn't overlap
+					want = []plat.Text_Span{{10, 10, LEX}, {20, 5, LINK}},
+				},
+				{
+					label = "adjacent, link right before token: must NOT drop",
+					lex = []plat.Text_Span{{20, 10, LEX}}, // [20,30)
+					link_in = []plat.Text_Span{{10, 10, LINK}}, // [10,20) touches, doesn't overlap
+					want = []plat.Text_Span{{10, 10, LINK}, {20, 10, LEX}},
+				},
+				{
+					label = "no overlap, interleaved: merge must interleave by start, not concatenate",
+					lex = []plat.Text_Span{{5, 3, LEX}, {30, 5, LEX}},
+					link_in = []plat.Text_Span{{15, 5, LINK}},
+					want = []plat.Text_Span{{5, 3, LEX}, {15, 5, LINK}, {30, 5, LEX}},
+				},
+			}
+			for c in cases {
+				merged := make([]plat.Text_Span, len(c.lex) + len(c.link_in), context.temp_allocator)
+				mn := highlight_merge_spans(c.lex, c.link_in, merged)
+				out := merged[:mn]
+				ok := sorted_no_overlap(out) && spans_eq(out, c.want)
+				if !ok {fail = true}
+				fmt.printfln("  %-6s link precedence: %s", "ok" if ok else "FAIL", c.label)
+			}
+		}
+
+		fmt.println("highlighttest: FAILURES" if fail else "highlighttest: all ok")
+		return true
+	}
+
+	// `newtpad lexstatetest` is Task 3's own verification surface: the
+	// background per-line index, the bounded backward resync, and the two
+	// interactions the design doc calls out for a STATEFUL lexer specifically
+	// (lex_xml) rather than the line-local ones highlighttest already covers.
+	if os.args[1] == "lexstatetest" {
+		fmt.println("lexstatetest:")
+		fail := false
+		g_theme = theme_light() // see highlighttest's identical comment on why
+
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.eprintln("lexstatetest: no fonts loaded")
+			return true
+		}
+
+		// --- 1: state threads correctly across rows in the ordinary,
+		// contiguous (non-filter) viewport -- the exact doc_draw shape, hand-
+		// rolled the same way highlighttest's wrap-rebase check is, so this
+		// exercises doc_row_lex_spans/doc_lex_state_at rather than a second
+		// copy of what doc_draw does. `<!-- start` opens on row 1, `middle`
+		// (row 2) is entirely inside it with NO markers of its own, and
+		// `end --> <b/>` (row 3) closes it mid-row and then lexes a real tag
+		// -- the one row that proves state, not just "always Comment" or
+		// "always Normal", is actually being carried forward.
+		{
+			content := "<a>\n<!-- start\nmiddle\nend --> <b/>\n"
+			wd: Document
+			wd.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&wd.pt)
+			wd.path = "test.xml"
+			wd.view_cols = 200
+
+			cache: Highlight_Row_Cache
+			hl_state := doc_lex_state_at(&wd, 0, LEX_RESYNC_WINDOW)
+			line_buf: [VISIBLE_COLS]u8
+			row_comment := [4]bool{false, false, false, false} // does this row carry ANY Comment span?
+			row_tag := [4]int{0, 0, 0, 0} // Xml_Tag span count per row
+			row := 0
+			it := visible_begin(&wd, &t, 4)
+			for {
+				_, start, end, vis_end, _, wrapped, ok := visible_next(&it)
+				if !ok {break}
+				draw_len := min(vis_end - start, len(line_buf))
+				n := base.pt_read(&wd.pt, start, line_buf[:draw_len])
+				if n <= 0 {continue}
+				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				hn: int
+				hn, hl_state = doc_row_lex_spans(&wd, &cache, start, end, wrapped, line_buf[:n], hl_state, hl_buf[:])
+				for k in 0 ..< hn {
+					if row < 4 {
+						if hl_buf[k].color == g_theme[.Syn_Comment] {row_comment[row] = true}
+						if hl_buf[k].color == g_theme[.Syn_Xml_Tag] {row_tag[row] += 1}
+					}
+				}
+				row += 1
+			}
+			ok :=
+				row == 4 &&
+				!row_comment[0] && row_tag[0] == 2 && // "<a>"
+				row_comment[1] && // "<!-- start" -- opens, unterminated
+				row_comment[2] && // "middle" -- no markers, still inside
+				row_comment[3] && row_tag[3] == 2 && // "end --> <b/>" -- closes, then a tag
+				hl_state == .Normal // closed by the last row; nothing left open
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s state threads across rows: comment=%v tags=%v final=%v",
+				"ok" if ok else "FAIL",
+				row_comment,
+				row_tag,
+				hl_state,
+			)
+		}
+
+		// --- 2: the filter view. Three rows, deliberately listed OUT OF
+		// ORDER (offset order would let a bug that quietly reuses the
+		// contiguous running-state logic pass by accident) -- one before any
+		// comment, one inside one, one after it closes. Each must resolve
+		// its OWN state independently of the others; there is no "previous
+		// row" to inherit from in filter mode (see doc_draw's comment on
+		// hl_state).
+		{
+			content := strings.concatenate(
+				{
+					"before comment\n",
+					"<!-- open\n",
+					"still inside comment\n",
+					"closes here -->\n",
+					"after comment\n",
+				},
+				context.temp_allocator,
+			)
+			fdoc: Document
+			fdoc.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&fdoc.pt)
+			fdoc.path = "test.xml"
+
+			before_at := 0
+			inside_at := strings.index(content, "still inside comment")
+			after_at := strings.index(content, "after comment")
+
+			// Reordered: after, before, inside -- not ascending, not the
+			// order they appear in the file.
+			s_after := doc_lex_state_at(&fdoc, after_at, LEX_FILTER_RESYNC_WINDOW)
+			s_before := doc_lex_state_at(&fdoc, before_at, LEX_FILTER_RESYNC_WINDOW)
+			s_inside := doc_lex_state_at(&fdoc, inside_at, LEX_FILTER_RESYNC_WINDOW)
+
+			ok := s_before == .Normal && s_inside == .In_Comment && s_after == .Normal
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s filter view resolves rows independently: before=%v inside=%v after=%v",
+				"ok" if ok else "FAIL",
+				s_before,
+				s_inside,
+				s_after,
+			)
+		}
+
+		// --- 3: the documented failure mode, AND its own sabotage. A
+		// comment opened at byte 0 and never closed; `target` sits well past
+		// LEX_RESYNC_WINDOW bytes of plain filler with no "-->" anywhere, so
+		// a real-sized window must cap-hit and bail to .Normal -- the wrong
+		// answer, but the DOCUMENTED one (see lex_resync_state's comment),
+		// not a crash or a truncation. Widening the window past the target
+		// (the sabotage: proving the bound, not the mechanism, is what
+		// produces the wrong answer) must then find byte 0 and compute the
+		// TRUE state, .In_Comment -- showing this assertion can fail, and
+		// exactly what makes it fail.
+		{
+			sb := strings.builder_make(context.temp_allocator)
+			strings.write_string(&sb, "<!-- unterminated comment\n")
+			filler := strings.repeat("x", 78, context.temp_allocator)
+			// Enough filler lines to push `target` past LEX_RESYNC_WINDOW
+			// (64 KiB) with real margin, so this isn't a fixture that
+			// happens to sit right at the boundary.
+			for _ in 0 ..< 900 {
+				strings.write_string(&sb, filler)
+				strings.write_byte(&sb, '\n')
+			}
+			target := strings.builder_len(sb)
+			strings.write_string(&sb, "TARGET\n")
+			content := strings.to_string(sb)
+
+			ld: Document
+			ld.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&ld.pt)
+
+			cap_ok := target > LEX_RESYNC_WINDOW
+			state_bad, cap_hit_bad := lex_resync_state(&ld, target, LEX_RESYNC_WINDOW, base.lex_xml, "-->")
+			// Sabotage the bound, not the mechanism: a window wide enough to
+			// reach byte 0 (which is always unambiguously .Normal on its
+			// own) recovers the true answer through the exact same code.
+			state_good, cap_hit_good := lex_resync_state(&ld, target, target + 10, base.lex_xml, "-->")
+
+			ok :=
+				cap_ok &&
+				cap_hit_bad &&
+				state_bad == .Normal && // wrong, but the documented failure mode
+				!cap_hit_good &&
+				state_good == .In_Comment // true state, recovered once the bound doesn't starve it
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s documented failure mode: target=%d window=%d bad=(cap=%v,%v) widened=(cap=%v,%v)",
+				"ok" if ok else "FAIL",
+				target,
+				LEX_RESYNC_WINDOW,
+				cap_hit_bad,
+				state_bad,
+				cap_hit_good,
+				state_good,
+			)
+		}
+
+		// --- 4: the real background index, end to end -- a real file on
+		// disk, doc_open, lex_index_start, waited for completion -- cross-
+		// checked against the resync mechanism (a generous window, standing
+		// in for ground truth) at several offsets including one inside a
+		// same-line-opened-and-closed comment's aftermath and one genuinely
+		// spanning two lines. The two mechanisms must agree everywhere.
+		{
+			xml_content := strings.concatenate(
+				{
+					"<root>\n",
+					"<!-- header comment\n",
+					"spanning two lines -->\n",
+					"<child attr=\"v\">text</child>\n",
+					"<!-- trailing -->\n",
+					"</root>\n",
+				},
+				context.temp_allocator,
+			)
+			tmpf := fmt.tprintf("%s%cnewtpad_lexidx_test.xml", os.get_env("TEMP", context.temp_allocator), '\\')
+			if werr := os.write_entire_file(tmpf, transmute([]u8)xml_content); werr != nil {
+				fmt.printfln("  FAIL   could not write fixture: %v", werr)
+				fail = true
+			} else {
+				xd, xok := doc_open(tmpf)
+				if !xok {
+					fmt.println("  FAIL   could not open fixture")
+					fail = true
+				} else {
+					lex_index_start(&xd)
+					t0 := time.tick_now()
+					for !lex_index_done(&xd) && time.duration_seconds(time.tick_since(t0)) < 5 {
+						time.sleep(time.Millisecond)
+					}
+					indexed := lex_index_done(&xd)
+
+					offsets := [5]int {
+						0,
+						strings.index(xml_content, "spanning two lines"),
+						strings.index(xml_content, "<child"),
+						strings.index(xml_content, "<!-- trailing -->"),
+						strings.index(xml_content, "</root>"),
+					}
+					want := [5]base.Lex_State{.Normal, .In_Comment, .Normal, .Normal, .Normal}
+
+					agree := indexed
+					for off, i in offsets {
+						via_index := doc_lex_state_at(&xd, off, LEX_RESYNC_WINDOW)
+						via_resync, _ := lex_resync_state(&xd, off, off + 10, base.lex_xml, "-->")
+						if via_index != want[i] || via_resync != want[i] || via_index != via_resync {
+							agree = false
+						}
+					}
+					if !agree {fail = true}
+					fmt.printfln(
+						"  %-6s background index matches resync ground truth (indexed=%v)",
+						"ok" if agree else "FAIL",
+						indexed,
+					)
+				}
+				doc_close(&xd)
+				os.remove(tmpf)
+			}
+		}
+
+		// --- 5: three-way cross-check on a line LONGER THAN RENDER_LINE_CAP
+		// (8192 bytes). Check 4 above cross-checks index against resync, but
+		// its fixture's lines are ~30 bytes -- nowhere near long enough to
+		// see the bug this review found: doc_draw's per-row DRAW buffer
+		// (line_buf, VISIBLE_COLS = 2048 wide) used to ALSO be what fed the
+		// lexer for an unwrapped row, so a `<!--` sitting past byte 2048 was
+		// invisible to the state machine even though the background index
+		// and the resync both correctly lex the whole (capped to
+		// RENDER_LINE_CAP = 8192) row. All three must agree at the same
+		// offset on a fixture that actually exercises the gap.
+		//
+		// The line must exceed RENDER_LINE_CAP, not just VISIBLE_COLS: any
+		// line over WRAP_LONG_CELLS (1024 cells) force-wraps even with word
+		// wrap off, UNLESS its own newline sits beyond WRAP_START_CAP
+		// (== RENDER_LINE_CAP) bytes from its start -- see line_wrap_decision
+		// (doc.odin). A 2500-byte line still force-wraps and never reaches
+		// doc_row_lex_spans's !wrapped branch at all, which is exactly why
+		// an earlier draft of this check passed even with the bug reinstated
+		// (sabotage-verified: see the task's own report). Only a line over
+		// 8192 bytes is genuinely capped/non-wrapped and split into
+		// successive RENDER_LINE_CAP rows the way this bug needs.
+		{
+			marker_pos :: 5000 // > VISIBLE_COLS (2048), still inside row 0's own 8192-byte extent
+			line1 := strings.concatenate(
+				{
+					strings.repeat("x", marker_pos, context.temp_allocator),
+					"<!-- opens, never closes in line1 -- ",
+					strings.repeat("y", 4000, context.temp_allocator), // pushes line1 past RENDER_LINE_CAP
+				},
+				context.temp_allocator,
+			)
+			xml_content := strings.concatenate(
+				{line1, "\n", "still inside, no markers of its own\n", "closes here --> <b/>\n"},
+				context.temp_allocator,
+			)
+			line2_start := len(line1) + 1
+
+			tmpf := fmt.tprintf("%s%cnewtpad_lexidx_long_test.xml", os.get_env("TEMP", context.temp_allocator), '\\')
+			if werr := os.write_entire_file(tmpf, transmute([]u8)xml_content); werr != nil {
+				fmt.printfln("  FAIL   could not write long-line fixture: %v", werr)
+				fail = true
+			} else {
+				xd, xok := doc_open(tmpf)
+				if !xok {
+					fmt.println("  FAIL   could not open long-line fixture")
+					fail = true
+				} else {
+					line_len_ok := len(line1) > RENDER_LINE_CAP
+
+					lex_index_start(&xd)
+					t0 := time.tick_now()
+					for !lex_index_done(&xd) && time.duration_seconds(time.tick_since(t0)) < 5 {
+						time.sleep(time.Millisecond)
+					}
+
+					via_index := doc_lex_state_at(&xd, line2_start, LEX_RESYNC_WINDOW)
+					via_resync, _ := lex_resync_state(&xd, line2_start, LEX_RESYNC_WINDOW, base.lex_xml, "-->")
+
+					// The doc_draw shape itself, hand-rolled the same way
+					// check 1 above is: bootstrap once at row 0, then thread
+					// hl_state row to row through doc_row_lex_spans exactly
+					// like doc_draw's own loop. line1 alone spans TWO capped
+					// rows here (row 0 = [0,8192), row 1 = [8192,len(line1))
+					// -- both non-wrapped continuations of the same logical
+					// line). via_draw is the state after row 0 -- the value
+					// that used to come back .Normal (wrong) because the
+					// lexer never saw past byte 2048 of that row, so it never
+					// even noticed the comment opened.
+					via_draw := base.Lex_State.Normal
+					t: plat.Text
+					if !plat.text_load_faces(&t) {
+						fmt.eprintln("  FAIL   no fonts loaded for draw-path check")
+						fail = true
+					} else {
+						cache: Highlight_Row_Cache
+						line_buf: [VISIBLE_COLS]u8
+						hl_state := doc_lex_state_at(&xd, 0, LEX_RESYNC_WINDOW)
+						it := visible_begin(&xd, &t, 5)
+						row := 0
+						for {
+							_, start, end, vis_end, _, wrapped, ok := visible_next(&it)
+							if !ok {break}
+							draw_len := min(vis_end - start, len(line_buf))
+							n := base.pt_read(&xd.pt, start, line_buf[:draw_len])
+							if n > 0 {
+								hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+								_, hl_state = doc_row_lex_spans(&xd, &cache, start, end, wrapped, line_buf[:n], hl_state, hl_buf[:])
+							}
+							if row == 0 {via_draw = hl_state}
+							row += 1
+						}
+					}
+
+					agree :=
+						line_len_ok &&
+						via_index == .In_Comment &&
+						via_resync == .In_Comment &&
+						via_draw == .In_Comment
+					if !agree {fail = true}
+					fmt.printfln(
+						"  %-6s three-way agreement past RENDER_LINE_CAP: index=%v resync=%v drawpath=%v (line1=%d bytes)",
+						"ok" if agree else "FAIL",
+						via_index,
+						via_resync,
+						via_draw,
+						len(line1),
+					)
+
+					doc_close(&xd)
+				}
+				os.remove(tmpf)
+			}
+
+			// --- 5b: the bootstrap fix itself (doc_draw's hl_state, see its
+			// comment), isolated from the rest of the pipeline. A fresh
+			// in-memory Document over the SAME content -- deliberately never
+			// given to lex_index_start, so doc_lex_state_at always takes the
+			// resync path (an indexed small file can't be used for this one:
+			// the background index only records state before each raw
+			// newline-delimited line, so a synthetic mid-line offset like
+			// 8192 below isn't one of its recorded points -- a real, narrower
+			// limitation of the index noted in lex_index.odin, not what this
+			// check is after).
+			//
+			// Simulates a viewport scrolled so its TOP row is offset 8192 --
+			// exactly one RENDER_LINE_CAP into line1, a synthetic
+			// continuation of the same still-open comment, not a real
+			// logical line start. This row is non-wrapped (same reasoning as
+			// row 0/1 above).
+			//
+			// OLD bootstrap: find lls = pt_line_start_cap(pt, 8192,
+			// WRAP_START_CAP=8192), then resolve state THERE. That happens to
+			// compute lls=0 exactly (8192-8192=0) -- the TRUE start of line1
+			// -- so old_state is the state at byte 0 (.Normal, trivially,
+			// nothing precedes it) treated as if it were the state at byte
+			// 8192, silently skipping the 8192 bytes in between that contain
+			// the comment-open marker at byte 5000. NEW bootstrap: resolve
+			// state directly AT 8192, which lex_resync_state's target-
+			// relative forward walk (see its comment) answers correctly.
+			{
+				bd: Document
+				bd.pt = base.pt_init(transmute([]u8)xml_content)
+				defer base.pt_destroy(&bd.pt)
+				bd.path = "test.xml"
+
+				old_lls, _ := base.pt_line_start_cap(&bd.pt, 8192, WRAP_START_CAP)
+				old_state := doc_lex_state_at(&bd, old_lls, LEX_RESYNC_WINDOW)
+				new_state := doc_lex_state_at(&bd, 8192, LEX_RESYNC_WINDOW)
+				bootstrap_ok := old_lls == 0 && old_state == .Normal && new_state == .In_Comment
+				if !bootstrap_ok {fail = true}
+				fmt.printfln(
+					"  %-6s bootstrap resolves state AT the row, not at an earlier guess: old(lls=%d)=%v new=%v",
+					"ok" if bootstrap_ok else "FAIL",
+					old_lls,
+					old_state,
+					new_state,
+				)
+			}
+		}
+
+		// --- 6: hl_resync_bytes_examined (lex_index.odin) proves
+		// lex_resync_state's OWN cost is bounded by `window`, not by document
+		// size. hl_bytes_examined (highlight.odin) can't answer this: it is
+		// only ever incremented inside highlight_row_spans, and
+		// lex_resync_state calls the lexer directly, never through
+		// highlight_row_spans -- doc_draw's bootstrap and the filter view
+		// both call it straight. Without a counter ON that path, extending
+		// highlighttest's viewport-proportional assertion to a stateful
+		// lexer would have passed even if the resync scanned the entire
+		// file, because the assertion would be watching a path this code
+		// never runs through.
+		{
+			build_resync_doc :: proc(prefix_lines: int) -> (doc: Document, target: int) {
+				sb := strings.builder_make(context.temp_allocator)
+				for _ in 0 ..< prefix_lines {
+					strings.write_string(&sb, "plain filler line, no markers at all here\n")
+				}
+				strings.write_string(&sb, "<!-- closed comment --> \n")
+				strings.write_string(&sb, strings.repeat("z", 500, context.temp_allocator))
+				strings.write_byte(&sb, '\n')
+				target = strings.builder_len(sb)
+				strings.write_string(&sb, "TARGET LINE\n")
+				doc.pt = base.pt_init(transmute([]u8)strings.to_string(sb))
+				return
+			}
+
+			// Identical tail (the comment-close anchor, the 500-byte filler
+			// line, `target`) on all three fixtures -- only the amount of
+			// filler BEFORE that tail differs, and the resync never looks at
+			// bytes before `target - window`.
+			//
+			// This check used to assert small_bytes == big_bytes, and it
+			// passed -- while `big` really did read a saturated 64 KiB window
+			// out of the piece table and `small` a few hundred bytes. The
+			// counter simply could not see the backward anchor scan (see
+			// hl_resync_bytes_examined, lex_index.odin): the test named after
+			// window-bounded cost was measuring only the forward walk, whose
+			// input is the identical tail on both fixtures, so equality was
+			// guaranteed by the fixture rather than earned by the code.
+			//
+			// With the scan counted, the honest claim is what lex_resync_state
+			// actually promises: every call is bounded by its three terms
+			// (2*window + the validation budget) regardless of document size,
+			// and past the point where the window saturates, cost stops
+			// growing entirely -- which is what `bigger`, twice `big`'s size
+			// for the same answer and the same byte count, pins down. `small`
+			// must now come in BELOW `big`, not equal to it: it has less
+			// document behind `target` than the window would allow.
+			small_doc, small_target := build_resync_doc(5)
+			big_doc, big_target := build_resync_doc(200000)
+			bigger_doc, bigger_target := build_resync_doc(400000)
+			defer base.pt_destroy(&small_doc.pt)
+			defer base.pt_destroy(&big_doc.pt)
+			defer base.pt_destroy(&bigger_doc.pt)
+
+			hl_resync_bytes_examined = 0
+			small_state, small_cap := lex_resync_state(&small_doc, small_target, LEX_RESYNC_WINDOW, base.lex_xml, "-->")
+			small_bytes := hl_resync_bytes_examined
+
+			hl_resync_bytes_examined = 0
+			big_state, big_cap := lex_resync_state(&big_doc, big_target, LEX_RESYNC_WINDOW, base.lex_xml, "-->")
+			big_bytes := hl_resync_bytes_examined
+
+			hl_resync_bytes_examined = 0
+			bigger_state, bigger_cap := lex_resync_state(&bigger_doc, bigger_target, LEX_RESYNC_WINDOW, base.lex_xml, "-->")
+			bigger_bytes := hl_resync_bytes_examined
+
+			// The worst case lex_resync_state's own header comment states:
+			// window (anchor scan) + validation budget + window (forward lex).
+			bound := 2 * LEX_RESYNC_WINDOW + LEX_RESYNC_MAX_VALIDATE_BYTES
+			ok :=
+				!small_cap &&
+				!big_cap &&
+				!bigger_cap &&
+				small_state == .Normal &&
+				big_state == .Normal &&
+				bigger_state == .Normal &&
+				small_bytes > 0 &&
+				small_bytes <= bound &&
+				big_bytes <= bound &&
+				small_bytes < big_bytes && // the scan the counter used to miss
+				big_bytes == bigger_bytes // saturated: 2x the file, same cost
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s resync cost is window-bounded, not file-bounded: small=%d big=%d bigger=%d (want big==bigger, small<big, all <=%d)",
+				"ok" if ok else "FAIL",
+				small_bytes,
+				big_bytes,
+				bigger_bytes,
+				bound,
+			)
+		}
+
+		// --- 7: Task 4's own anchor-soundness proof, end to end through the
+		// REAL ".c" registration (highlight_lexer_for), not just the base-
+		// layer unit tests in lex_c_test.odin. Exactly the task brief's own
+		// example, `char *s = "*/";`, in genuinely ordinary code -- followed,
+		// on the SAME line, by a real `/*` that never closes. The decoy's
+		// "*/" is the only occurrence of those two bytes anywhere in the
+		// content, so it is also the textual LAST occurrence in the window.
+		//
+		// WITHOUT a validator (validate omitted -> nil, simulating this
+		// task's starting point): lex_resync_state trusts that lone "*/"
+		// unconditionally and resumes forward lexing from ONE BYTE INSIDE the
+		// string (before its closing quote), assuming .Normal there. That
+		// makes the resumed scan see a bogus, unterminated string starting at
+		// the real closing quote -- which swallows the rest of the line,
+		// INCLUDING the real "/*" opener, as inert string content. The real
+		// comment is never even noticed: silently, confidently .Normal,
+		// cap_hit FALSE.
+		//
+		// WITH the real validator (lex_c_c_valid, wired through EXT_LEXERS):
+		// the decoy candidate is rejected (it sits inside a String token when
+		// the line is re-lexed from a fresh .Normal), no other "*/" exists in
+		// the window, and the walk falls through to byte 0 (unambiguously
+		// .Normal on its own) and forward-lexes the WHOLE line properly from
+		// there -- closing the decoy string correctly, THEN finding the real,
+		// genuinely unclosed "/*" right after it. .In_Comment, correctly.
+		{
+			content := strings.concatenate(
+				{`char *s = "*/"; /* real comment opens here and never closes` + "\n", "TARGET\n"},
+				context.temp_allocator,
+			)
+			cd: Document
+			cd.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&cd.pt)
+			cd.path = "test.c"
+
+			target := strings.index(content, "TARGET")
+			lexer, stateful, anchor, validate := highlight_lexer_for(cd.path)
+
+			naive_state, naive_cap := lex_resync_state(&cd, target, LEX_RESYNC_WINDOW, lexer, anchor)
+			fixed_state, fixed_cap := lex_resync_state(&cd, target, LEX_RESYNC_WINDOW, lexer, anchor, validate)
+
+			ok :=
+				stateful &&
+				anchor == "*/" &&
+				validate != nil &&
+				!naive_cap &&
+				naive_state == .Normal && // confidently wrong: the decoy fooled it
+				!fixed_cap &&
+				fixed_state == .In_Comment // correct: the validator rejected the decoy
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s C-family resync anchor soundness: naive=(cap=%v,%v) validated=(cap=%v,%v)",
+				"ok" if ok else "FAIL",
+				naive_cap,
+				naive_state,
+				fixed_cap,
+				fixed_state,
+			)
+		}
+
+		// --- 8: IMPORTANT 4 -- a resync candidate whose own physical line
+		// start lies more than RENDER_LINE_CAP bytes behind it must be
+		// SKIPPED, not validated against whatever pt_line_start_cap/
+		// pt_line_end_cap happen to read when the true line start is
+		// unreachable. lex_resync_state used to discard pt_line_start_cap's
+		// own `exact` flag (`ls, _ :=`), so a front-truncated read got
+		// handed to the validator as if it were the real line -- and once
+		// the candidate sits far enough into the line, the read buffer
+		// doesn't even reach the candidate at all, which made
+		// lex_c_resync_valid return true UNCONDITIONALLY (see that proc's
+		// own comment). Fixture: RENDER_LINE_CAP+500 bytes of filler with NO
+		// newline at all, then the exact same decoy check 7 uses (a string
+		// literal containing "*/") immediately followed by a real,
+		// never-closed block comment opener -- all still on the SAME
+		// physical line (it doesn't end until after "never closes"). The
+		// decoy sits far enough into that line that
+		// pt_line_start_cap(candidate, RENDER_LINE_CAP) cannot reach the
+		// true start (offset 0) and reports exact=false.
+		{
+			filler := strings.repeat("z", RENDER_LINE_CAP + 500, context.temp_allocator)
+			content := strings.concatenate(
+				{filler, `char *s = "*/"; /* real comment opens here and never closes` + "\n", "TARGET\n"},
+				context.temp_allocator,
+			)
+			td: Document
+			td.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&td.pt)
+			td.path = "test.c"
+
+			target := strings.index(content, "TARGET")
+			lexer, _, anchor, validate := highlight_lexer_for(td.path)
+
+			// Window wide enough to reach byte 0 -- the point here isn't the
+			// window bound (checks 3/6 already cover that), it's whether the
+			// front-truncated candidate gets skipped in favour of falling
+			// all the way back to byte 0, which correctly forward-lexes the
+			// WHOLE line and finds the real, never-closed "/*" this time.
+			state, cap_hit := lex_resync_state(&td, target, target, lexer, anchor, validate)
+
+			ok := !cap_hit && state == .In_Comment
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s front-truncated candidate (exact=false) is skipped, not validated: cap=%v state=%v",
+				"ok" if ok else "FAIL",
+				cap_hit,
+				state,
+			)
+		}
+
+		// --- 9: IMPORTANT 5 -- the candidate-validation loop's OWN cost is
+		// now counted into hl_resync_bytes_examined and independently
+		// byte-capped (LEX_RESYNC_MAX_VALIDATE_BYTES), not just
+		// candidate-COUNT-capped (LEX_RESYNC_MAX_CANDIDATES). Before this
+		// fix, NOTHING incremented hl_resync_bytes_examined for this loop at
+		// all -- check 6 above proves the FORWARD walk is window-bounded,
+		// but it calls lex_xml with validate == nil, which never touches the
+		// candidate loop at all, so it could never have caught this. This
+		// fixture is the C-family validated path with far more decoy
+		// candidates in the window (300) than the byte budget can afford to
+		// read (~131 at ~500 bytes each), so the loop must bail out early --
+		// and, since none of the 300 decoys are genuine (each "*/" sits
+		// inside a string), the walk correctly falls through to byte 0 and
+		// recovers the TRUE answer (a real comment opened on line 1 never
+		// closes) despite never having validated most of the candidates.
+		{
+			build_decoy_doc :: proc(num_decoys: int) -> (doc: Document, target: int, decoy_line_len: int) {
+				decoy_line := strings.concatenate(
+					{strings.repeat("z", 480, context.temp_allocator), ` = "decoy */ x";` + "\n"},
+					context.temp_allocator,
+				)
+				decoy_line_len = len(decoy_line)
+				sb := strings.builder_make(context.temp_allocator)
+				strings.write_string(&sb, "/* a real comment that never closes\n")
+				for _ in 0 ..< num_decoys {
+					strings.write_string(&sb, decoy_line)
+				}
+				target = strings.builder_len(sb)
+				strings.write_string(&sb, "TARGET\n")
+				doc.pt = base.pt_init(transmute([]u8)strings.to_string(sb))
+				return
+			}
+
+			num_decoys :: 300
+			dd, target, decoy_line_len := build_decoy_doc(num_decoys)
+			defer base.pt_destroy(&dd.pt)
+			dd.path = "test.c"
+			lexer, _, anchor, validate := highlight_lexer_for(dd.path)
+
+			hl_resync_bytes_examined = 0
+			// window = target-1: win_start ends up at 1 (> 0), so if the
+			// candidate loop never validates anything, lex_resync_state
+			// returns the cap-hit fallback IMMEDIATELY, before ever
+			// reaching the forward-lex loop below it -- isolating
+			// hl_resync_bytes_examined to JUST the candidate-validation
+			// loop's own cost, not conflated with a second contributor. Not
+			// quite the whole document, so nearly all 300 decoys are
+			// textually visible as candidates -- far more than the ~131 the
+			// byte budget can afford to read at ~500 bytes each.
+			window := target - 1
+			state, cap_hit := lex_resync_state(&dd, target, window, lexer, anchor, validate)
+			// hl_resync_bytes_examined now counts the backward anchor scan's
+			// own read as well, and this fixture's window is deliberately
+			// nearly the whole document, so that term dominates: win_start
+			// lands at 1 and the scan runs from there to `target`, exactly
+			// `window` bytes. Subtract it to isolate the candidate loop, which
+			// is what this check is about -- the two terms are added by
+			// different code and only one of them is what
+			// LEX_RESYNC_MAX_VALIDATE_BYTES bounds.
+			validated_bytes := hl_resync_bytes_examined - window
+			total_decoy_bytes := num_decoys * decoy_line_len
+
+			ok :=
+				cap_hit &&
+				state == .Normal && // the documented cap-hit fallback -- every decoy correctly rejected, none validated
+				validated_bytes > 0 && // was ALWAYS 0 before this fix -- the counter never saw this loop
+				validated_bytes <= LEX_RESYNC_MAX_VALIDATE_BYTES + RENDER_LINE_CAP && // budget + one line's overshoot slack
+				validated_bytes < total_decoy_bytes / 2 // proves the loop bailed EARLY, not after reading close to all 300 decoys
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s candidate-validation cost is counted and byte-capped: validated=%d/%d cap=%v state=%v (budget=%d, scan=%d)",
+				"ok" if ok else "FAIL",
+				validated_bytes,
+				total_decoy_bytes,
+				cap_hit,
+				state,
+				LEX_RESYNC_MAX_VALIDATE_BYTES,
+				window,
+			)
+		}
+
+		fmt.println("lexstatetest: FAILURES" if fail else "lexstatetest: all ok")
+		return true
+	}
+
+	// `newtpad lexcoveragetest` is Task 5's Step 4: assert over the ACTUAL
+	// text_exts.txt (via text_exts_list(), links.odin — the same embedded
+	// copy the app itself uses, not a hand-typed duplicate that could drift)
+	// that every extension resolves to either a real lexer or an entry in
+	// DELIBERATELY_PLAIN_EXTS (highlight.odin). This is the check that
+	// outlives this task: adding a 35th extension to text_exts.txt without
+	// giving it a lexer OR adding it to the plain list fails HERE, on the
+	// next run of this mode, rather than being noticed by Wyatt on screen
+	// months later. It is also what caught .py — already present in
+	// text_exts.txt, matching the design doc's own "34 extensions" count,
+	// but never assigned a lexer by any of this batch's four tasks — before
+	// this task shipped, not after.
+	if os.args[1] == "lexcoveragetest" {
+		fmt.println("lexcoveragetest:")
+		fail := false
+		seen := 0
+		// Reads the SAME text_exts.txt links.odin embeds (one source of
+		// truth, per that file's own comment) rather than importing
+		// text_exts_list itself, which is file-private to links.odin —
+		// this is a second reader of the same underlying data, not a second
+		// hand-maintained copy of it.
+		raw := #load("../../text_exts.txt", string)
+		for ln in strings.split_lines_iterator(&raw) {
+			ext := strings.trim_space(ln)
+			if len(ext) == 0 {continue}
+			seen += 1
+			lexer, _, _, _ := highlight_lexer_for(ext) // ext already starts with '.', a valid "path" for the extension-matching logic
+			has_lexer := lexer != nil
+			is_plain := false
+			for p in DELIBERATELY_PLAIN_EXTS {
+				if strings.equal_fold(p, ext) {
+					is_plain = true
+					break
+				}
+			}
+			ok := has_lexer != is_plain // exactly one of the two must hold
+			if !ok {fail = true}
+			status := "lexer" if has_lexer else ("plain" if is_plain else "NEITHER")
+			fmt.printfln("  %-6s %-12s -> %s", "ok" if ok else "FAIL", ext, status)
+		}
+		// The other EXT_LEXERS invariant: a stateful entry with no
+		// resync_anchor bails to .Normal silently on every huge/mapped file of
+		// that extension. The app checks this at startup (diag_init ->
+		// highlight_check_ext_tables) where the only outcome available is a
+		// logged line and a panic; here it is an ordinary assertion, which is
+		// where a table edit should be caught.
+		anchors_ok, offender := highlight_ext_tables_ok()
+		if !anchors_ok {fail = true}
+		fmt.printfln(
+			"  %-6s every stateful EXT_LEXERS entry registers a resync_anchor%s",
+			"ok" if anchors_ok else "FAIL",
+			"" if anchors_ok else fmt.tprintf(" (%s does not)", offender),
+		)
+		fmt.printfln("  examined %d extensions from text_exts.txt", seen)
+		fmt.println("lexcoveragetest: FAILURES" if fail else "lexcoveragetest: all ok")
 		return true
 	}
 
