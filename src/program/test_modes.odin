@@ -1558,6 +1558,106 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad blocktest` proves block_row_range is the only place a block
+	// rectangle's cells become bytes, and that it never reports a truncated
+	// scan as though it were complete. Fixture rows are chosen so byte
+	// offsets and cell columns disagree in three different ways: a plain
+	// ASCII row, a row whose leading tab makes one byte span four cells, and
+	// a row of CJK where one rune is 2 cells and 3 bytes. A rectangle over
+	// cells [2, 6) must land on a different byte range on each of them --
+	// that divergence IS the feature, and a version of block_row_range that
+	// confused cells with bytes would still pass a pure-ASCII fixture.
+	if os.args[1] == "blocktest" {
+		if !require_scratch_session("blocktest") {return true}
+		fail := false
+		fmt.println("blocktest:")
+
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			fmt.println("  FAIL   no fonts loaded; cannot exercise cell widths")
+			fmt.println("blocktest: FAILURES")
+			return true
+		}
+
+		src := "abcdefgh\n\tindented\n你好世界 ok\nshort\n"
+		doc := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+		defer doc_close(&doc)
+
+		// Row 0 is pure ASCII: cells [2,6) is bytes [2,6).
+		ls0 := doc_line_start_of_index(&doc, 0)
+		b0lo, b0hi, pad0, ok0 := block_row_range(&doc, &t, ls0, 2, 6)
+		c0 := ok0 && b0lo == 2 && b0hi == 6 && pad0 == 0
+		if !c0 {fail = true}
+		fmt.printfln("  %-6s ascii row: bytes [%d,%d) pad=%d ok=%v", "ok" if c0 else "FAIL", b0lo, b0hi, pad0, ok0)
+
+		// Row 1's leading tab is one byte spanning TAB_CELLS=4 cells, so cell 2
+		// falls INSIDE it. The tab is included whole (a partial glyph has no
+		// byte form), pulling byte_lo back to the tab's own start (byte 0) --
+		// the rectangle ends up covering cells [0,6) worth of content in only
+		// 3 bytes, not the 4 a naive bytes==cells reading would expect.
+		ls1 := doc_line_start_of_index(&doc, 1)
+		b1lo, b1hi, pad1, ok1 := block_row_range(&doc, &t, ls1, 2, 6)
+		c1 := ok1 && b1lo == ls1 && b1hi == ls1 + 3 && pad1 == 0
+		if !c1 {fail = true}
+		fmt.printfln("  %-6s tab row: bytes rel [%d,%d) pad=%d ok=%v", "ok" if c1 else "FAIL", b1lo - ls1, b1hi - ls1, pad1, ok1)
+
+		// The CJK row: cells [2,6) must NOT be bytes [2,6). If this assertion
+		// ever reads "bytes == cells" the two spaces have been confused.
+		ls2 := doc_line_start_of_index(&doc, 2)
+		b2lo, b2hi, _, ok2 := block_row_range(&doc, &t, ls2, 2, 6)
+		c2 := ok2 && !(b2lo == ls2 + 2 && b2hi == ls2 + 6)
+		if !c2 {fail = true}
+		fmt.printfln("  %-6s cjk row: bytes rel [%d,%d) differ from cells [2,6)", "ok" if c2 else "FAIL", b2lo - ls2, b2hi - ls2)
+
+		// "short" is 5 cells; a rectangle starting at cell 8 selects nothing on
+		// it and reports the padding an edit would need. pad is reported, NOT
+		// applied -- selection never mutates.
+		ls3 := doc_line_start_of_index(&doc, 3)
+		b3lo, b3hi, pad3, ok3 := block_row_range(&doc, &t, ls3, 8, 10)
+		c3 := ok3 && b3lo == b3hi && pad3 == 3
+		if !c3 {fail = true}
+		fmt.printfln("  %-6s short row selects nothing, pad=%d (want 3)", "ok" if c3 else "FAIL", pad3)
+
+		// A row longer than BLOCK_ROW_CAP cannot be scanned to completion: the
+		// exact-flag discipline requires ok=false rather than an answer read
+		// from a truncated slice.
+		long := make([]u8, BLOCK_ROW_CAP + 500)
+		for i in 0 ..< len(long) {long[i] = 'x'}
+		ldoc := doc_from_content(long, "", .UTF8)
+		defer doc_close(&ldoc)
+		_, _, _, okL := block_row_range(&ldoc, &t, 0, 2, 6)
+		cL := !okL
+		if !cL {fail = true}
+		fmt.printfln("  %-6s row past BLOCK_ROW_CAP refuses rather than guesses (ok=%v, want false)", "ok" if cL else "FAIL", okL)
+
+		// block_bounds normalises regardless of drag direction: up-and-left
+		// must describe the same rectangle as down-and-right from the other
+		// corner.
+		bd: Document
+		bd.block_anchor_line, bd.block_anchor_cell = 5, 10
+		bd.block_cursor_line, bd.block_cursor_cell = 2, 3
+		lline_lo, lline_hi, lcell_lo, lcell_hi := block_bounds(&bd)
+		bd.block_anchor_line, bd.block_anchor_cell = 2, 3
+		bd.block_cursor_line, bd.block_cursor_cell = 5, 10
+		rline_lo, rline_hi, rcell_lo, rcell_hi := block_bounds(&bd)
+		cb := lline_lo == 2 && lline_hi == 5 && lcell_lo == 3 && lcell_hi == 10 &&
+			lline_lo == rline_lo && lline_hi == rline_hi && lcell_lo == rcell_lo && lcell_hi == rcell_hi
+		if !cb {fail = true}
+		fmt.printfln("  %-6s block_bounds normalises drag direction: [%d,%d]x[%d,%d]", "ok" if cb else "FAIL", lline_lo, lline_hi, lcell_lo, lcell_hi)
+
+		// block_clear turns block_active off (and, zero-is-initialization,
+		// resets the geometry so a caller that forgets the guard reads an
+		// empty rectangle rather than a stale one).
+		bd.block = true
+		block_clear(&bd)
+		cc := !block_active(&bd) && bd.block_anchor_line == 0 && bd.block_anchor_cell == 0 && bd.block_cursor_line == 0 && bd.block_cursor_cell == 0
+		if !cc {fail = true}
+		fmt.printfln("  %-6s block_clear deactivates and zeroes geometry", "ok" if cc else "FAIL")
+
+		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
+		return true
+	}
+
 	// `newtpad linktest` covers link detection and resolution — the parts that are
 	// pure logic and therefore actually testable here. The Ctrl+click gesture and
 	// the underline are not covered: this environment cannot inject mouse input.

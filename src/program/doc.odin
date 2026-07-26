@@ -643,6 +643,22 @@ Document :: struct {
 	top:        int, // byte offset of the top visible (visual) row
 	cursor:     int, // caret byte offset
 	anchor:     int, // other end of the selection (== cursor when none)
+	// --- rectangular (column) selection ---
+	// Four integers, not a byte range: a rectangle is a (logical line, cell
+	// column) region and cannot be expressed as cursor/anchor offsets. Lines are
+	// LOGICAL line indices, never visual rows -- column select requires word wrap
+	// off (see the design doc's wrap fork), and turning wrap on clears the block
+	// rather than silently changing what the rectangle means.
+	//
+	// Cells, not bytes and not codepoints: the renderer is a monospace cell grid
+	// (plat.text_cell_width classifies a rune as 0, 1 or 2 cells), so a tab or a
+	// CJK character makes a row's byte range differ from its cell range. Every
+	// conversion goes through block_row_range and nowhere else.
+	block:             bool,
+	block_anchor_line: int,
+	block_anchor_cell: int,
+	block_cursor_line: int,
+	block_cursor_cell: int,
 	wrap:       bool, // word-wrap this document at view_cols
 	// Read-only table view of a CSV/TSV (see table.odin), toggled per document.
 	table:       bool,
