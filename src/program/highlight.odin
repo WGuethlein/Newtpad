@@ -278,14 +278,31 @@ EXT_LEXERS := [?]struct {
 // just every row of that extension mis-colouring the moment state matters,
 // with nothing to point at why. EXT_LEXERS is a fixed table maintained by
 // hand, not generated, so nothing else catches a new stateful entry added
-// without its anchor -- this is that catch, run once at startup rather than
-// left to be noticed on screen.
-@(init)
-ext_lexers_check :: proc "contextless" () {
+// without its anchor -- this is that catch.
+//
+// The predicate is separate from the reporting so lexcoveragetest can assert
+// it as an ordinary check line (nothing in the table is expressible as a
+// compile-time #assert: EXT_LEXERS is a runtime array of composite literals,
+// and Odin has no compile-time loop to fold it with).
+highlight_ext_tables_ok :: proc() -> (ok: bool, offender: string) {
 	for e in EXT_LEXERS {
-		if e.stateful && e.resync_anchor == "" {
-			panic_contextless("EXT_LEXERS: a stateful lexer must register a resync_anchor")
-		}
+		if e.stateful && e.resync_anchor == "" {return false, e.ext}
+	}
+	return true, ""
+}
+
+// Run the check and make its failure VISIBLE. It used to be an @(init) that
+// called panic_contextless: correct, but in the shipped GUI-subsystem build
+// there is no console for a panic message to land in, and an @(init) runs
+// before diag_init has armed the logger, so nothing reached the log file
+// either. Called from diag_init instead, once the sink is live, so the line
+// lands in %APPDATA%\Newtpad\logs\newtpad.log. The panic stays: a mis-built
+// table is a programming error, the debug build should still stop loudly on
+// it, and the crash handler now folds the logged line into the report.
+highlight_check_ext_tables :: proc() {
+	if ok, offender := highlight_ext_tables_ok(); !ok {
+		base.log_error("EXT_LEXERS: stateful entry %q has no resync_anchor -- its rows will silently mis-colour", offender)
+		panic("EXT_LEXERS: a stateful lexer must register a resync_anchor")
 	}
 }
 

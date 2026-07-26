@@ -55,6 +55,11 @@ diag_init :: proc() {
 
 	base.log_set_sink(diag_sink)
 	base.log_info("Newtpad %s starting (debug=%v)", NEWTPAD_VERSION, ODIN_DEBUG)
+
+	// Hand-maintained table whose failure mode is silent mis-colouring. Checked
+	// here, not in an @(init), so its complaint reaches the log file -- see
+	// highlight_check_ext_tables (highlight.odin).
+	highlight_check_ext_tables()
 }
 
 // Give the crash handler what it needs to save the user's work. Called from main

@@ -5561,6 +5561,19 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			status := "lexer" if has_lexer else ("plain" if is_plain else "NEITHER")
 			fmt.printfln("  %-6s %-12s -> %s", "ok" if ok else "FAIL", ext, status)
 		}
+		// The other EXT_LEXERS invariant: a stateful entry with no
+		// resync_anchor bails to .Normal silently on every huge/mapped file of
+		// that extension. The app checks this at startup (diag_init ->
+		// highlight_check_ext_tables) where the only outcome available is a
+		// logged line and a panic; here it is an ordinary assertion, which is
+		// where a table edit should be caught.
+		anchors_ok, offender := highlight_ext_tables_ok()
+		if !anchors_ok {fail = true}
+		fmt.printfln(
+			"  %-6s every stateful EXT_LEXERS entry registers a resync_anchor%s",
+			"ok" if anchors_ok else "FAIL",
+			"" if anchors_ok else fmt.tprintf(" (%s does not)", offender),
+		)
 		fmt.printfln("  examined %d extensions from text_exts.txt", seen)
 		fmt.println("lexcoveragetest: FAILURES" if fail else "lexcoveragetest: all ok")
 		return true
