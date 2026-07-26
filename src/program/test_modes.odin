@@ -7628,6 +7628,49 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad pastetest` -- the Windows clipboard is CRLF by convention, so
+	// pasting into an LF file mixed line endings silently, through the most
+	// common way multi-line text enters a buffer.
+	if os.args[1] == "pastetest" {
+		if !require_scratch_session("pastetest") {return true}
+		bad := 0
+		fmt.println("pastetest:")
+
+		// The user's clipboard, guarded for the whole mode on every exit path.
+		saved_clip, had_clip := plat.clipboard_get_text(nil, context.allocator)
+		defer if had_clip {
+			plat.clipboard_set_text(nil, saved_clip)
+			delete(saved_clip)
+		}
+
+		paste_case :: proc(eol: base.Line_Ending, clip, want: string) -> (bad: int) {
+			a: App
+			defer app_destroy(&a) // owns and closes the Document added below
+			d := new(Document)
+			d^ = doc_from_content(make([]u8, 0), "", .UTF8)
+			d.eol = eol
+			app_add(&a, d)
+			app_activate(&a, 0)
+			// hwnd nil: clipboard_get_text/clipboard_set_text take a nil owner
+			// (blocktest already does exactly this), and the .Paste arm of
+			// command_dispatch reads nothing else off the window. `t` is nil
+			// because no rectangle is live, so no cell measuring happens.
+			wv: plat.Window
+			plat.clipboard_set_text(nil, clip)
+			command_dispatch(.Paste, plat.Key_Event{}, &a, &wv, nil, 0)
+			got := doc_debug_string(d)
+			ok := got == want
+			fmt.printfln("  %-6s eol=%v paste %q -> %q (want %q)", "ok" if ok else "FAIL", eol, clip, got, want)
+			if !ok {bad += 1}
+			return
+		}
+		bad += paste_case(.LF, "a\r\nb", "a\nb")
+		bad += paste_case(.CRLF, "a\nb", "a\r\nb")
+
+		fmt.printfln("pastetest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad stickytest` checks the find bar's sticky match figures during an
 	// async replace. Below SEARCH_SYNC_MAX the search runs inline and every result
 	// publishes before find_recompute even returns, so a fixture that size proves

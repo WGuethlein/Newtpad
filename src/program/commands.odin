@@ -808,7 +808,13 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		}
 	case .Paste:
 		if s, ok := plat.clipboard_get_text(w.hwnd, context.temp_allocator); ok {
-			doc_insert_text(doc, transmute([]u8)s)
+			// The Windows clipboard is CRLF by convention, so pasting into an LF
+			// file mixed the endings silently -- through the most common way
+			// multi-line text enters a buffer. Copy and Cut are deliberately NOT
+			// converted: what leaves the document is what the document holds, and
+			// rewriting on the way out would corrupt a paste into another editor.
+			norm := base.convert_line_endings(transmute([]u8)s, doc.eol, context.temp_allocator)
+			doc_insert_text(doc, norm)
 		}
 	case .Save:
 		p := doc.path
