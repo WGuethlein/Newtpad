@@ -8,6 +8,7 @@ package main
 
 import "core:fmt"
 import "core:strings"
+import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
 
@@ -59,6 +60,10 @@ Command_Id :: enum u8 {
 	Clear_Selection,
 	Move_Line_Up,
 	Move_Line_Down,
+	Block_Extend_Left,
+	Block_Extend_Right,
+	Block_Extend_Up,
+	Block_Extend_Down,
 	Toggle_Wrap,
 	Toggle_Table,
 	Toggle_Preview,
@@ -171,6 +176,10 @@ command_table := [Command_Id]Command {
 	.Clear_Selection          = {"Clear Selection", "Cursor"},
 	.Move_Line_Up             = {"Move Line Up", "Edit"},
 	.Move_Line_Down           = {"Move Line Down", "Edit"},
+	.Block_Extend_Left        = {"Extend Column Selection Left", "Edit"},
+	.Block_Extend_Right       = {"Extend Column Selection Right", "Edit"},
+	.Block_Extend_Up          = {"Extend Column Selection Up", "Edit"},
+	.Block_Extend_Down        = {"Extend Column Selection Down", "Edit"},
 	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
 	.Toggle_Table             = {"Toggle Table View (CSV/TSV)", "View"},
 	.Toggle_Preview           = {"Toggle Markdown Preview / Split", "View"},
@@ -275,8 +284,15 @@ default_bindings := []Binding {
 	{.G, true, false, .Editor, .Goto_Line}, // Ctrl+G
 	{.S, true, true, .Editor, .Save_As}, // Ctrl+Alt+S (Ctrl+Shift+S can't be expressed: shift isn't part of a chord)
 	{.Escape, false, false, .Editor, .Clear_Selection},
-	{.Up, false, true, .Editor, .Move_Line_Up}, // Alt+Up
-	{.Down, false, true, .Editor, .Move_Line_Down}, // Alt+Down
+	{.Up, false, true, .Editor, .Move_Line_Up}, // Alt+Up (Alt+Shift+Up extends a column selection -- shift read in the action)
+	{.Down, false, true, .Editor, .Move_Line_Down}, // Alt+Down (Alt+Shift+Down extends a column selection -- shift read in the action)
+	// Alt+Left/Right were unbound before this feature. The chord itself
+	// carries no shift bit (Binding has none -- shift is read by the
+	// action), so a bare Alt+Left/Right lands on these same two rows; the
+	// action must keep doing nothing without shift, exactly as the unbound
+	// key did before this task.
+	{.Left, false, true, .Editor, .Block_Extend_Left}, // Alt+Left / Alt+Shift+Left
+	{.Right, false, true, .Editor, .Block_Extend_Right}, // Alt+Right / Alt+Shift+Right
 	{.Z, false, true, .Editor, .Toggle_Wrap}, // Alt+Z
 	{.T, true, false, .Editor, .Toggle_Table}, // Ctrl+T: CSV/TSV table view
 	{.M, true, false, .Editor, .Toggle_Preview}, // Ctrl+M: markdown preview -> split -> off
@@ -530,6 +546,58 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 	return .None
 }
 
+// block_extend (block.odin) takes no ^App -- that file has never imported
+// the App type, keeping its layering the same as before this feature -- so
+// the one caller that has `app` in scope turns a refusal into the status
+// note here instead. Shared by every Block_Extend_* dispatch case and the
+// two Move_Line_Up/Down branches below, so the message can't drift between
+// call sites.
+@(private = "file")
+block_extend_dispatch :: proc(app: ^App, doc: ^Document, t: ^plat.Text, dline, dcell: int) {
+	switch block_extend(doc, t, dline, dcell) {
+	case .Wrap_On:
+		app_note(app, "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]")
+	case .Filter_On:
+		app_note(app, "[COLUMN SELECT UNAVAILABLE - TURN OFF FILTER]")
+	case .Caret_Unresolved:
+		app_note(app, "[COLUMN SELECT UNAVAILABLE HERE - the line is too far into a very large file]")
+	case .None:
+	}
+}
+
+// The one note every rectangle-wide EDIT refusal posts. block_replace and
+// block_delete refuse for exactly the two reasons the copy and the cut already
+// refuse for -- an unresolvable row, or a rectangle deeper than
+// BLOCK_EDIT_MAX_LINES -- and the row count is read off the constant rather
+// than written out, because it has already moved once (10,000 -> 2,000) and a
+// literal would have drifted silently.
+//
+// The refusal is the whole edit or none of it: block_apply leaves the buffer
+// byte-identical, so this note is the only thing that happened.
+@(private = "file")
+block_edit_note :: proc(app: ^App) {
+	app_note(app, fmt.tprintf("[COLUMN EDIT REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
+}
+
+// The typed-character path when a rectangle is live: one character replaces the
+// rectangle's cell range on every row it spans (or, at zero width, is inserted
+// on every row -- prefixing a column). main.odin's char loop calls this instead
+// of doc_insert_rune so the choice lives beside the Backspace/Delete cases that
+// make the same one, and so a headless test can drive the real decision rather
+// than a copy of it.
+//
+// Control characters never reach here (the platform char path filters them), so
+// there is no newline case to worry about: Enter is .Insert_Newline, which
+// drops the rectangle with every other block-unaware mutating command below.
+editor_input_rune :: proc(app: ^App, doc: ^Document, t: ^plat.Text, r: rune) {
+	if block_active(doc) {
+		buf, n := utf8.encode_rune(r)
+		if !block_replace(doc, t, buf[:n]) {block_edit_note(app)}
+		return
+	}
+	doc_insert_rune(doc, r)
+}
+
 // Run a command. `rows` is the visible row count (page moves); `w` supplies the
 // HWND for clipboard / Save-dialog. The active-context split means each command
 // is unambiguous here.
@@ -555,6 +623,38 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	// its own key path (intercepted before dispatch); the only buffer write in
 	// table view is table_edit_commit's single-field splice.
 	if doc != nil && doc.table && command_mutates_doc(cmd) {return}
+	// A live rectangle is only meaningful to the handful of commands that know
+	// about it. Every OTHER document-mutating command edits at doc.cursor
+	// through a path that writes doc.cursor directly rather than via set_cursor
+	// (doc_insert_text, doc_move_lines), so the block_clear set_cursor performs
+	// on an ordinary caret move never runs -- and the rectangle is left holding
+	// byte offsets describing rows the edit has since moved. A following Ctrl+X
+	// would then cut bytes the user never saw highlighted, which is the one
+	// outcome this whole feature is built to make impossible. Drop the
+	// rectangle first; the edit itself is unchanged.
+	//
+	// The exceptions handle it themselves: Backspace/Delete_Fwd edit the
+	// rectangle, Cut clears it in block_cut_delete, and Undo/Redo clear it in
+	// apply_snapshot (doc.odin) because a restored tree may not have the rows
+	// at all.
+	if doc != nil && block_active(doc) && command_mutates_doc(cmd) {
+		#partial switch cmd {
+		case .Backspace, .Delete_Fwd, .Cut, .Undo, .Redo:
+		case:
+			block_clear(doc)
+			// Belt and braces for the invariant block_collapse_linear
+			// (block.odin) establishes at the other end: nothing may leave a
+			// linear selection live underneath a rectangle, because the
+			// rectangle is what was DRAWN and this branch is exactly where
+			// the command that follows (.Insert_Newline, .Insert_Tab, .Paste,
+			// .Delete_Word_Back, .Move_Line_*) would run against
+			// doc.anchor..doc.cursor and delete it. With the gestures now
+			// collapsing on success this is unreachable, which is the point:
+			// if a future selection path forgets, the damage stops here
+			// rather than reaching doc_insert_text.
+			block_collapse_linear(doc)
+		}
+	}
 	switch cmd {
 	// --- editor ---
 	case .Cursor_Left:
@@ -578,9 +678,20 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Page_Down:
 		doc_scroll(doc, t, rows - 1, rows)
 	case .Backspace:
-		doc_backspace(doc)
+		// A live rectangle takes priority, exactly as it does for Copy and Cut
+		// below. At zero width it is N carets and this deletes one cell to the
+		// left of every one of them; with width it deletes the rectangle.
+		if block_active(doc) {
+			if !block_delete(doc, t, false) {block_edit_note(app)}
+		} else {
+			doc_backspace(doc)
+		}
 	case .Delete_Fwd:
-		doc_delete_fwd(doc)
+		if block_active(doc) {
+			if !block_delete(doc, t, true) {block_edit_note(app)}
+		} else {
+			doc_delete_fwd(doc)
+		}
 	case .Delete_Word_Back:
 		doc_delete_word_back(doc)
 	case .Insert_Newline:
@@ -600,11 +711,45 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Select_All:
 		doc_select_all(doc)
 	case .Copy:
-		if s := doc_selected_text(doc, context.temp_allocator); s != "" {
+		// A live rectangle takes priority over the linear selection: the two
+		// are mutually exclusive in practice, but block_active is the flag
+		// that means "the user is column-selecting", the same predicate
+		// block_selection_rects uses to pick between the two draws.
+		if block_active(doc) {
+			if s, ok := block_text(doc, t); ok {
+				if s != "" {plat.clipboard_set_text(w.hwnd, s)}
+			} else {
+				// Refuse rather than put a partial rectangle on the
+				// clipboard while reporting success -- either a row could
+				// not be resolved, or the rectangle spans more than
+				// BLOCK_EDIT_MAX_LINES rows (block_text, block.odin).
+				app_note(app, fmt.tprintf("[COLUMN COPY REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
+			}
+		} else if s := doc_selected_text(doc, context.temp_allocator); s != "" {
 			plat.clipboard_set_text(w.hwnd, s)
 		}
 	case .Cut:
-		if s := doc_selected_text(doc, context.temp_allocator); s != "" {
+		if block_active(doc) {
+			if s, ok := block_text(doc, t); ok {
+				// block_cut_delete runs even when s == "" (a single
+				// all-short row has nothing to copy) -- it always clears
+				// the block on a non-refusal, empty rectangle or not, so a
+				// Cut collapses the rectangle to a caret the same way every
+				// other path does. Gating the delete on s != "" left an
+				// all-short single-row rectangle live after Cut (block.odin,
+				// block_cut_delete's own comment).
+				if s != "" {plat.clipboard_set_text(w.hwnd, s)}
+				if !block_cut_delete(doc, t) {
+					// Refuses only if something changed between block_text's
+					// own check above and this call -- report it rather than
+					// silently leaving the clipboard write (if any) as the
+					// only visible effect of a Cut that deleted nothing.
+					app_note(app, fmt.tprintf("[COLUMN CUT REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
+				}
+			} else {
+				app_note(app, fmt.tprintf("[COLUMN CUT REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
+			}
+		} else if s := doc_selected_text(doc, context.temp_allocator); s != "" {
 			plat.clipboard_set_text(w.hwnd, s)
 			doc_backspace(doc) // deletes the selection
 		}
@@ -675,18 +820,69 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		}
 	case .Clear_Selection:
 		doc.anchor = doc.cursor
+		// Escape clears a normal selection; it must drop a live column
+		// rectangle the same way, or it survives invisibly after the caret
+		// looks like it has none.
+		if block_active(doc) {block_clear(doc)}
 	case .Move_Line_Up:
-		doc_move_lines(doc, -1)
+		// Shift isn't part of the chord (Binding has no shift field -- see
+		// the comment above default_bindings), so Alt+Up and Alt+Shift+Up
+		// both dispatch here; the action tells them apart. Shift held means
+		// extend the column rectangle up a row instead of moving the line --
+		// bare Alt+Up is unchanged from before this feature existed.
+		if ev.shift {
+			block_extend_dispatch(app, doc, t, -1, 0)
+		} else {
+			doc_move_lines(doc, -1)
+		}
 	case .Move_Line_Down:
-		doc_move_lines(doc, 1)
+		if ev.shift {
+			block_extend_dispatch(app, doc, t, 1, 0)
+		} else {
+			doc_move_lines(doc, 1)
+		}
+	case .Block_Extend_Left:
+		// Alt+Left carries no shift bit in the chord either (same reason as
+		// Move_Line_Up above), and this binding used to not exist at all --
+		// so a bare Alt+Left must keep doing nothing, exactly as an unbound
+		// key does. Only Alt+Shift+Left may act.
+		if ev.shift {block_extend_dispatch(app, doc, t, 0, -1)}
+	case .Block_Extend_Right:
+		if ev.shift {block_extend_dispatch(app, doc, t, 0, 1)}
+	case .Block_Extend_Up:
+		// Unreachable from the default keymap (Alt+Up already means
+		// Move_Line_Up, handled above) -- reachable only from the palette or
+		// a future user rebind. There is no bare-key behaviour to preserve
+		// here, unlike Left/Right, so no shift check is needed.
+		block_extend_dispatch(app, doc, t, -1, 0)
+	case .Block_Extend_Down:
+		block_extend_dispatch(app, doc, t, 1, 0)
 	case .Toggle_Wrap:
 		doc.wrap = !doc.wrap
 		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start
+		// Wrap changes what a rectangle's (line, cell) pair even means -- a
+		// visual row stops being one logical line -- so a live block cannot
+		// survive the toggle, the same reason the gesture itself refuses
+		// while already wrapped (block_extend).
+		if block_active(doc) {block_clear(doc)}
 	case .Toggle_Table:
 		// Read-only grid view of a CSV/TSV. Re-anchor the top to a line start so a
 		// row lands where the caret was, and pick the delimiter on first turn-on.
 		if doc.kind == .Text && doc_can_table(doc) {
 			if doc.table_editing {table_edit_commit(doc)} // don't leave an edit dangling
+			// A rectangle cannot survive the toggle in either direction, the
+			// same reason .Toggle_Wrap clears one. Table view is a grid of
+			// cells with their own widths -- a (line start, cell) pair means
+			// nothing there -- and, worse, the mutating-command guard above
+			// RETURNS EARLY for every mutating command while doc.table is
+			// set, so it never reaches the block-clear branch that would
+			// otherwise drop a rectangle the buffer has moved out from under.
+			// The whole-branch review's reproduction: Alt+drag on a CSV,
+			// Ctrl+T, edit a cell (table_edit_commit splices through
+			// doc_replace_range), Ctrl+T back, Ctrl+X -- and the cut took
+			// bytes the user never saw highlighted. Identical shape to the
+			// find_replace_all hole fixed earlier on this branch.
+			if block_active(doc) {block_clear(doc)}
 			doc.table = !doc.table
 			if doc.table {
 				doc.table_delim = table_choose_delim(doc)
@@ -721,6 +917,17 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			case .Split:
 				doc.md_mode = .Off
 			}
+			// Split makes doc_wraps true, so it changes what a rectangle's
+			// (line start, cell) pair means exactly the way Alt+Z does -- and
+			// .Toggle_Wrap has always cleared the block for that reason while
+			// this case did not. Cleared for every mode transition, not just
+			// the one into Split: leaving Split re-narrows the meaning the
+			// other way, and a rectangle that was live across the whole cycle
+			// has been drawn against visual rows the entire time. block.odin's
+			// four operations refuse under doc_wraps too (block_stale_view),
+			// but this is the one place that removes the stale rectangle the
+			// user would otherwise still see highlighted.
+			if block_active(doc) {block_clear(doc)}
 			// Learn the family default so the next file of this type opens the same
 			// way. Gated on remember_views: with it off the Settings value is a pin,
 			// not a running average of what you last did. Also gated on doc.path != "":
@@ -919,6 +1126,16 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// view falls back to unfiltered until matches exist (doc_filtering).
 		doc.filter = !doc.filter
 		doc.filter_top = 0
+		// A rectangle made before Ctrl+L names rows by the buffer's own logical
+		// lines (block.odin never walks the filtered view), which is a
+		// different, non-contiguous set of rows the instant filter view turns
+		// on. block_extend already refuses to CREATE a rectangle while
+		// doc.filter is set; this is the other half -- drop one that already
+		// exists rather than let it silently edit rows the user can no longer
+		// see. block.odin's own edit paths refuse under doc.filter too
+		// (belt and braces), but this is the one place that actually removes
+		// the stale selection the user would otherwise still see highlighted.
+		if block_active(doc) {block_clear(doc)}
 	case .Find_Toggle_Replace_Mode:
 		doc.find.replace_mode = !doc.find.replace_mode
 	case .Find_Filter_Page_Up:

@@ -502,6 +502,9 @@ find_select_current :: proc(doc: ^Document) {
 	m := f.matches[f.current]
 	doc.anchor = m // select the match: highlights it + scrolls it into view
 	doc.cursor = m + f.match_len[f.current]
+	// Bypasses set_cursor -- jumping to a find match must drop a stale
+	// rectangle the same way a plain caret move does.
+	if block_active(doc) {block_clear(doc)}
 	if doc.filter { // keep the current match's line in the filtered view
 		mls := base.pt_line_start(&doc.pt, m)
 		for fl, i in doc.filter_lines {
@@ -531,7 +534,18 @@ find_prev :: proc(doc: ^Document) {
 }
 
 // Replace the current match with the replace text, then re-find.
+//
+// block_clear first: this mutates the buffer at the match's own offsets, not
+// at a rectangle's, so a live column selection is describing rows this edit
+// is about to shift underneath it. `.Find_Confirm` (commands.odin) is NOT in
+// command_mutates_doc -- the dispatcher's own stale-rectangle guard never
+// runs for it -- and command_dispatch is not this proc's only caller anyway
+// (test_modes.odin calls find_replace_current directly, bypassing dispatch
+// entirely). The genuine choke point is here, not the dispatcher: every path
+// that can reach a buffer mutation through find must go through one of these
+// two procs, so clearing here is the one place that actually guarantees it.
 find_replace_current :: proc(doc: ^Document) {
+	if block_active(doc) {block_clear(doc)}
 	f := &doc.find
 	if f.current < 0 || f.current >= len(f.matches) {
 		return
@@ -555,7 +569,21 @@ find_replace_current :: proc(doc: ^Document) {
 // Replacing a prefix is legitimate -- running it again continues -- but doing it
 // silently was indistinguishable from replacing everything, which is how a user
 // ends up believing a rename is finished when it is not.
+//
+// block_clear first, unconditionally, before even the n==0 check -- see
+// find_replace_current's own comment for why this proc (not the dispatcher)
+// is the genuine choke point. This one matters more: find_merge's own
+// jump-to-match logic (find.odin, find_select_current) happens to clear a
+// live block as a side effect of selecting the caret-nearest match after
+// find_recompute below -- but ONLY when matches remain. Replace All is the
+// one operation guaranteed to remove the very matches it just replaced, so
+// the case that most needs the drop is exactly the case the incidental path
+// does not cover: a Replace All that leaves zero matches never calls
+// find_select_current at all, and the rectangle -- still naming rows the
+// replacement has since moved -- survives to eat whatever Ctrl+X or the next
+// keystroke touches next.
 find_replace_all :: proc(doc: ^Document) -> (replaced: int, complete: bool) {
+	if block_active(doc) {block_clear(doc)}
 	f := &doc.find
 	n := len(f.matches)
 	complete = intrinsics.atomic_load(&doc.search.done) && !f.truncated

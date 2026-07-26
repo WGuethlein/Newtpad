@@ -214,7 +214,13 @@ Each of these cost real time at least once.
 - Argument order is per-mode and unforgiving: `keytest`/`edittest` take the path **first**;
   `watchtest` takes a directory.
 - **Never run `drawcount`.** It opens a real window, hangs, and locks the exe so the next build
-  fails.
+  fails. **`keytest` has the same trap with a different trigger:** it takes `<path> <mode>`, two
+  arguments, and with only one it falls through to opening the real GUI window and hangs. Any
+  file-argument mode can do this — check the argument order in `test_modes.odin` before running one.
+- **A test mode can grow a stack overflow.** Adding three or more new inline test blocks as siblings
+  inside `blocktest` produced a real `STATUS_STACK_OVERFLOW` at runtime — the procedure was already
+  very long and each block's locals stack up. Pull each new case into its own local proc; the
+  existing `block_test_*` procs are that pattern.
 - **`Select-String "FAIL"` is case-insensitive** and happily matches "0 failures" in a passing
   summary. Use `-CaseSensitive`.
 
@@ -231,6 +237,13 @@ Each of these cost real time at least once.
   the command's output back in the console does not catch this** — the console mangles it the same
   way, so it looks correct. Dump the bytes of what actually landed.
 - PowerShell 5.1 has no `&&`, no `||`, no ternary, no `?.`. Use `; if ($?) { }`.
+- **PowerShell 5.1 re-parses quotes when passing arguments to a native command**, so a `"` inside a
+  here-string reaches `git commit -m` as an argument break — the tail of the message then arrives as
+  a pathspec and the commit fails. Write the message to a file and use `git commit -F`.
+- **The `Write`/`Edit` tools can silently rewrite a whole file from CRLF to LF.** It happened twice
+  on one branch. `.gitattributes` normalises storage so nothing corrupts, but the working tree ends up
+  inconsistent and the diff balloons. Check `git diff --stat` before committing and confirm the line
+  count matches what you actually changed.
 - Bash working directory persists between calls; shell variables do not.
 
 **Git**

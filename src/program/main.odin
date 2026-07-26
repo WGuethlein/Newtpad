@@ -181,6 +181,12 @@ main :: proc() {
 	divider_drag := false // dragging the Markdown Split divider (md_divider_rect)
 	sel_dragging := false // a text-selection drag has begun (pointer moved since press)
 	press_x, press_y: i32 // client pos of the press that may become a drag
+	// Column-select drag (Alt+drag). Four inline latches until the
+	// whole-branch review's LOW 7 folded them into one struct next to the two
+	// procedures that consume them -- see Block_Drag (block.odin) for what
+	// each field latches and why. Behaviour is unchanged; this is the same
+	// three assignments at the press and the same one call per drag frame.
+	block_drag: Block_Drag
 
 	for !window.should_close {
 		// Sleep when idle instead of spinning at vsync (which pinned a core the whole
@@ -259,7 +265,9 @@ main :: proc() {
 				// in-cell field, not the underlying document.
 				if doc.table_editing {table_edit_rune(doc, window.chars[i])}
 			} else {
-				doc_insert_rune(doc, window.chars[i])
+				// Not doc_insert_rune directly: with a column rectangle live
+				// one keystroke is an edit on every row it spans.
+				editor_input_rune(&app, doc, &text, window.chars[i])
 			}
 		}
 		window.char_count = 0
@@ -626,11 +634,27 @@ main :: proc() {
 				if !window.mouse_shift {
 					doc.anchor = mp
 				}
+				// Latch Alt now, once, for the whole gesture, clear any
+				// rectangle the last gesture left, and resolve the anchor
+				// corner -- all three inside block_drag_press (block.odin),
+				// which owns the gesture's state. doc.cursor was just set to
+				// mp above, which is the row it resolves from.
+				block_drag_press(&block_drag, doc, plat.key_alt_down(), cell_at_x(char_w, f32(window.mouse_x)))
 			}
 			press_x, press_y = window.mouse_x, window.mouse_y
 			sel_dragging = false // arm; a drag begins only once the pointer moves
 			window.mouse_pressed = false
-		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag && !divider_drag {
+		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag && !divider_drag && !md_preview_drag {
+			// md_preview_drag belongs in this exclusion list exactly like the other
+			// three drag latches beside it: window.mouse_down stays true for its
+			// whole gesture (real OS state, not something any of these consumers
+			// clear), so leaving it out let a preview-scrollbar drag also fall into
+			// the selection branch below on every one of its frames -- re-running
+			// the Alt-drag path with whatever block_drag (the Alt latch and the
+			// anchor corner it resolved) was left over from an unrelated earlier
+			// gesture. Finding 2 (doc_wraps'
+			// filter/Split refusals) already suppresses most of the fallout since
+			// Markdown Split forces wrap, but this is the actual leak.
 			// A selection drag begins only once the pointer has actually moved from
 			// the press point. A stationary press-and-hold must not extend the
 			// selection or auto-scroll -- that was the bug where holding still lit up
@@ -651,7 +675,33 @@ main :: proc() {
 				} else if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
 					doc_scroll(doc, &text, 1, rows)
 				}
-				doc.cursor = doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
+				mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
+				// A refused column drag (below) still lands here: doc.cursor keeps
+				// tracking the pointer and the drag degrades to a normal linear
+				// selection instead of doing nothing. Deliberate, not an oversight --
+				// some feedback under the pointer beats a frozen drag when wrap or
+				// filter mode makes a rectangle impossible.
+				doc.cursor = mp
+				// The column: cell_at_x, the same primitive the draw and the
+				// hit-test use for every other column -- not a second
+				// conversion path from mp's byte offset. Everything else
+				// (the Alt latch, the row resolve, writing the rectangle,
+				// and the once-per-gesture refusal latch) is inside
+				// block_drag_update; it returns .None and note=false for a
+				// plain non-Alt drag, so this costs nothing when the gesture
+				// is not a column select. The wording of each note stays
+				// here because block.odin has never imported the App type.
+				if refusal, note := block_drag_update(&block_drag, doc, &text, cell_at_x(char_w, f32(window.mouse_x))); note {
+					switch refusal {
+					case .Wrap_On:
+						app_note(&app, "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]")
+					case .Filter_On:
+						app_note(&app, "[COLUMN SELECT UNAVAILABLE - TURN OFF FILTER]")
+					case .Caret_Unresolved:
+						app_note(&app, "[COLUMN SELECT UNAVAILABLE HERE - the line is too far into a very large file]")
+					case .None:
+					}
+				}
 			}
 		}
 
@@ -890,7 +940,12 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 				plat.quads_draw(gfx, quad_pipe, findq[:nfq])
 			}
 			selq: [80]plat.Quad
-			if ns := doc_selection_rects(doc, text, px, char_w, rows, selq[:]); ns > 0 {
+			// A column rectangle is still a selection (same fill role,
+			// Selection_Doc) -- it just gets its geometry from block_row_range
+			// instead of the linear anchor/cursor pair, so the draw call
+			// swaps procedures rather than branching inside one of them.
+			ns := block_selection_rects(doc, text, px, char_w, rows, selq[:]) if block_active(doc) else doc_selection_rects(doc, text, px, char_w, rows, selq[:])
+			if ns > 0 {
 				plat.quads_draw(gfx, quad_pipe, selq[:ns])
 			}
 		}

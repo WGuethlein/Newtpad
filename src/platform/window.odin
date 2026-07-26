@@ -348,6 +348,10 @@ key_shift_down :: proc() -> bool {
 	return (int(win.GetKeyState(win.VK_SHIFT)) & 0x8000) != 0
 }
 
+key_alt_down :: proc() -> bool {
+	return (int(win.GetKeyState(win.VK_MENU)) & 0x8000) != 0
+}
+
 // Ask the window to close, exactly as the ✕ button does.
 window_request_close :: proc(w: ^Window) {
 	win.PostMessageW(w.hwnd, win.WM_CLOSE, 0, 0)
@@ -743,6 +747,7 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		w.mouse_count = w.click_count
 		w.mouse_shift = (int(win.GetKeyState(win.VK_SHIFT)) & 0x8000) != 0
 		w.mouse_down = true
+		if w.alt_down {w.alt_used = true} // Alt is a modifier here, not a tap
 		win.SetCapture(hwnd)
 		return 0
 	case win.WM_MOUSEMOVE:
