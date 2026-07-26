@@ -3,9 +3,8 @@
 **Date:** 2026-07-26
 **Batch:** 5 of the plan in HANDOFF §6u
 **Target version:** 0.15.0
-**Status:** SPEC ONLY — not planned, not implemented. One decision needs Wyatt (see "The
-open fork"). Three further decisions are recorded as *stated assumptions*, made in his
-absence and overturnable.
+**Status:** Fork resolved by Wyatt 2026-07-26 — **Option A, column select requires wrap off**,
+and the three stated assumptions stand as written. Proceeding to plan and implementation.
 
 ## Why
 
@@ -21,10 +20,11 @@ spec does not relitigate either.
 2. **A zero-width rectangle acts as N carets in one column**, so lines can be prefixed. This
    is the single most-wanted case, not a side effect.
 
-## Stated assumptions — made without Wyatt, overturnable
+## Stated assumptions — put to Wyatt, and accepted 2026-07-26
 
-These were put to him with recommendations on 2026-07-26; he authorised continuing before
-answering, so they are recorded here as assumptions rather than decisions.
+These were put to him with recommendations; he accepted them together with the fork's
+recommended option. They are decisions now, kept in their original form so the reasoning
+survives.
 
 1. **Gesture: Alt+drag (mouse) and Alt+Shift+arrows (keyboard).** §6u's text names
    Ctrl+Shift+arrows, and that is wrong for this codebase — the keymap matches on
@@ -45,9 +45,12 @@ answering, so they are recorded here as assumptions rather than decisions.
    interoperates with every other application and is predictable in both directions. Block
    paste is additive later if wanted.
 
-## The open fork — word wrap
+## The fork — word wrap — RESOLVED: Option A
 
-**This is the question that needs Wyatt, and it is why this spec stops here.**
+**Wyatt's answer, 2026-07-26: Option A. Column select requires word wrap off.** Attempting the
+gesture while wrapped posts a status note and does nothing else; it never silently changes the
+view, and it never produces an edit whose meaning depends on the window width. The rest of this
+section is the reasoning, kept because it is the reason the model says "logical line" everywhere.
 
 A rectangle is defined over screen rows. With word wrap **off**, one visual row is exactly one
 logical line and a rectangle is unambiguous. With wrap **on**, one logical line becomes many
@@ -172,10 +175,13 @@ output, restore.
 - **Full virtual space.** Assumption 2.
 - **Column select under word wrap**, pending the fork above.
 
-## What has to happen before this is planned
+## Consequences of Option A, for the plan
 
-1. **Wyatt answers the wrap fork.** It changes the gesture handling, the model (`line` means
-   logical or visual), and three of the seven tests. Planning before it is answered would mean
-   writing code twice.
-2. **Wyatt confirms or overturns the three stated assumptions.** The gesture one in particular
-   contradicts §6u's own text, for a reason §6u could not have known.
+- `block_*_line` always means a **logical line index**. With wrap off, that is also the visual
+  row, so the two spaces coincide and the ambiguity disappears — but the field names and every
+  comment must say *logical*, because wrap can be turned on while a block is active.
+- **Turning wrap on with a block active must clear the block**, for the same reason the gesture
+  is refused: a live rectangle whose meaning is about to change is worse than no rectangle.
+  `Toggle_Wrap` therefore clears block state, and that is a test.
+- The status note for the refused gesture follows the `[BRACKETED CAPS]` idiom the status line
+  already uses: `[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]`.
