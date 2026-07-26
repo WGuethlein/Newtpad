@@ -13,9 +13,26 @@ import base "src:base"
 
 // Background per-line lexer-state index for small files. Mirrors Line_Index
 // (doc.odin:586) field-for-field and lifecycle-for-lifecycle: immutable
-// `original`, atomics for done/cancel/fault, a guard flag for mapped content,
-// cancel-store-then-join on teardown — see that struct's comment for the
-// rationale, which applies here unchanged.
+// `original`, atomics for done/cancel/fault, cancel-store-then-join on
+// teardown — see that struct's comment for the rationale, which applies here
+// unchanged.
+//
+// Deliberately does NOT mirror Line_Index's `guard` field. lex_index_start
+// (below) refuses to run this index over mapped content at all, so a guarded
+// copy-through-SEH path can never execute — and unlike Line_Index's worker
+// (a flat byte scan, trivially chunked through a fixed 64 KiB buffer), this
+// worker is LINE- and TOKEN-oriented: a guarded version would need to carry a
+// partial line's bytes across chunk boundaries and re-enter the lexer
+// mid-line, real machinery this index has no way to exercise or verify while
+// the mapped gate stays shut. A prior revision kept a `guard` field anyway,
+// "for structural parity" — but it hardcoded `guard = false` and the field
+// was never anything but dead weight: its branch did `make([]u8, len(c))`, a
+// whole-file HEAP allocation, which is exactly what a guarded read exists to
+// avoid, and it would have fired the first time anyone loosened the mapped
+// gate, unreviewed and untested. Deleted rather than half-fixed: build the
+// real (chunked, carry-over) guarded path together with whatever change
+// actually lifts the mapped restriction, so it can be designed and tested
+// against the scenario that motivates it, not shipped speculatively now.
 //
 // Where it deliberately differs: Line_Index publishes a single running total
 // that an edit can cheaply correct forward (nl_delta). A per-line STATE can't
@@ -36,15 +53,11 @@ Lex_State_Index :: struct {
 	scanned:            int, // atomic: bytes scanned so far (progress only, unused today)
 	done:               bool, // atomic
 	cancel:             bool, // atomic
-	fault:              bool, // atomic: a guarded read faulted
-	// Scan through the SEH guard, mirroring Line_Index.guard's purpose exactly.
-	// Always false in the current build: lex_index_start refuses to run this
-	// index over mapped content at all (see its comment) — huge/mapped files
-	// use the resync path unconditionally instead. Kept, and checked in the
-	// worker below, so a future change to that gating doesn't silently
-	// reintroduce an unguarded read of memory that can be truncated out from
-	// under the scan.
-	guard: bool,
+	// atomic: never set true today (no guarded copy path exists — see the
+	// struct comment above). Kept, and checked in lex_index_valid, purely so
+	// that struct doesn't need touching again if a future guarded path is
+	// added; it costs one bool and one always-false branch.
+	fault: bool,
 	th:    ^thread.Thread,
 
 	// Published together, only meaningful once `done` is observed true: one
@@ -66,17 +79,6 @@ Lex_State_Index :: struct {
 lex_index_worker :: proc(data: rawptr) {
 	idx := (^Lex_State_Index)(data)
 	c := idx.content
-	priv: []u8
-	if idx.guard {
-		priv = make([]u8, len(c))
-		if !base.safe_copy(priv, c) {
-			intrinsics.atomic_store(&idx.fault, true)
-			delete(priv)
-			return
-		}
-		c = priv
-	}
-	defer if priv != nil {delete(priv)}
 
 	tok_buf: [HL_MAX_ROW_TOKENS]base.Token
 	state := base.Lex_State.Normal
@@ -118,7 +120,6 @@ lex_index_start :: proc(doc: ^Document) {
 	doc.lex_idx.total = len(doc.original)
 	doc.lex_idx.lexer = lexer
 	doc.lex_idx.built_for_revision = doc.revision
-	doc.lex_idx.guard = false // see the struct's comment: never mapped here
 	doc.lex_idx.th = thread.create_and_start_with_data(&doc.lex_idx, lex_index_worker)
 }
 
@@ -181,13 +182,49 @@ lex_index_lookup :: proc(idx: ^Lex_State_Index, offset: int) -> base.Lex_State {
 LEX_RESYNC_WINDOW :: 64 * 1024
 LEX_FILTER_RESYNC_WINDOW :: 4 * 1024
 
-// The Lex_State in effect at byte offset `at` (expected to be a logical
-// line's start) for whichever lexer doc's path selects — .Normal at zero
-// cost if that lexer isn't stateful. Otherwise: the background index if it
-// is built, valid, and covers `at` (an O(log line_count) lookup — "always
-// correct, instant" per the design doc); else the bounded resync, correct at
-// any revision (including mid-edit) because it reads the LIVE piece table,
-// just slower than the index.
+// Total bytes handed to a lexer by lex_resync_state's forward walk,
+// accumulated across calls. The counterpart to highlight.odin's
+// hl_bytes_examined, but deliberately a SEPARATE counter rather than reusing
+// that one: hl_bytes_examined is only ever touched inside highlight_row_spans,
+// and lex_resync_state calls the lexer directly, never through
+// highlight_row_spans — so extending highlighttest's viewport-proportional
+// assertion to a stateful lexer without this counter would pass even if the
+// resync scanned the whole file, because the assertion would be watching a
+// path this code never runs through. Exists for lexstatetest to prove the
+// resync's cost is bounded by `window`, not by document size. Not touched by
+// lex_index_worker (the background index) — that runs on its own thread, and
+// a worker incrementing a plain global here would race the main thread's
+// reads of it, the same reason hl_bytes_examined is main-thread-only today.
+hl_resync_bytes_examined: int
+
+// The Lex_State in effect at byte offset `at` for whichever lexer doc's path
+// selects — .Normal at zero cost if that lexer isn't stateful. Otherwise: the
+// background index if it is built, valid, and covers `at` (an O(log
+// line_count) lookup — "always correct, instant" per the design doc); else
+// the bounded resync, correct at any revision (including mid-edit) because it
+// reads the LIVE piece table, just slower than the index.
+//
+// `at` need NOT be a logical line's start. lex_resync_state's forward walk
+// (below) is target-relative, not line-start-relative, so it lexes correctly
+// forward to any `at` — this is what lets doc_draw's contiguous-viewport
+// bootstrap ask for the state at a RENDER_LINE_CAP-split continuation row's
+// own start (mid-logical-line) rather than hunting for the true line start
+// first (see doc_draw's comment on hl_state).
+//
+// The background index does NOT share that property, and this IS a known
+// gap: it only records state before each raw newline-delimited line, so `at`
+// landing inside a line longer than one RENDER_LINE_CAP chunk (rather than at
+// one of the index's recorded line_starts) returns the state before that
+// whole line, not the true state at `at`. In practice this only bites a
+// SMALL (unmapped, indexed) file containing a single logical line longer
+// than RENDER_LINE_CAP scrolled into its middle — a narrower case than the
+// huge/mapped one this task's resync fix targets, since the index only
+// exists at all for small files. Not fixed here: closing it means either
+// making the index record RENDER_LINE_CAP-granularity split points too (more
+// per-line-that-happens-to-be-huge bookkeeping) or having doc_lex_state_at
+// notice `at` doesn't land on a recorded line_starts entry and fall through
+// to resync in that case specifically. Flagging rather than leaving it
+// implicit, same as this file's other documented trade-offs.
 doc_lex_state_at :: proc(doc: ^Document, at: int, window: int) -> base.Lex_State {
 	lexer, stateful, anchor := highlight_lexer_for(doc.path)
 	if !stateful || lexer == nil {return .Normal}
@@ -198,14 +235,18 @@ doc_lex_state_at :: proc(doc: ^Document, at: int, window: int) -> base.Lex_State
 	return state
 }
 
-// Scan backward from `target` (a byte offset, expected to be a logical
-// line's start) up to `window` bytes for the end of `anchor` — a byte
-// sequence whose completion is unambiguously .Normal for this lexer's
-// grammar (see EXT_LEXERS's resync_anchor comment, highlight.odin) — then
-// lex forward from there to `target`, threading state one (possibly
-// partial, for the anchor's own line) line at a time. Byte 0 is ALSO
-// unambiguously .Normal on its own, so reaching it counts as finding an
-// anchor even if the marker itself never occurs.
+// Scan backward from `target` (any byte offset — need NOT be a logical
+// line's start; see doc_lex_state_at's comment) up to `window` bytes for the
+// end of `anchor` — a byte sequence whose completion is unambiguously
+// .Normal for this lexer's grammar (see EXT_LEXERS's resync_anchor comment,
+// highlight.odin) — then lex forward from there to `target`, threading state
+// one (possibly partial, for the anchor's own line) RENDER_LINE_CAP-or-
+// newline-delimited chunk at a time. Byte 0 is ALSO unambiguously .Normal on
+// its own, so reaching it counts as finding an anchor even if the marker
+// itself never occurs. The forward walk doesn't care whether `target` (or
+// any chunk boundary it passes through) lines up with a real newline: it
+// just keeps chunking until `pos` reaches `target`, which is what makes it
+// safe to call with a synthetic RENDER_LINE_CAP split point as `target`.
 //
 // If the window is exhausted without finding the anchor and without
 // reaching byte 0, that is a CAP HIT: bail to .Normal rather than guess
@@ -217,6 +258,11 @@ doc_lex_state_at :: proc(doc: ^Document, at: int, window: int) -> base.Lex_State
 // Bounded to `window` bytes of forward lexing: the anchor (or byte 0) is
 // found at or after target-window, so lexing from there to target visits at
 // most `window` bytes of the buffer, regardless of the document's size.
+// hl_resync_bytes_examined tallies exactly those bytes (see its own comment)
+// — a separate counter from highlight_row_spans's hl_bytes_examined, because
+// this proc is called directly by doc_draw's bootstrap and by the filter
+// view, never through highlight_row_spans, so nothing else would ever see
+// this path's cost.
 lex_resync_state :: proc(
 	doc: ^Document,
 	target: int,
@@ -259,12 +305,17 @@ lex_resync_state :: proc(
 	state = .Normal
 	pos := win_start + from
 	tok_buf: [HL_MAX_ROW_TOKENS]base.Token
+	// A fixed stack buffer, not a context.temp_allocator make() per chunk: in
+	// filter mode this loop runs once per visible row (LEX_FILTER_RESYNC_WINDOW
+	// is small, but ~3,000 rows/frame while filtering is real), and a bounded
+	// array reused across iterations costs nothing extra per chunk.
+	lb: [RENDER_LINE_CAP]u8
 	for pos < target {
 		line_end := base.pt_line_end_cap(&doc.pt, pos, RENDER_LINE_CAP)
 		if line_end > pos {
-			lb := make([]u8, line_end - pos, context.temp_allocator)
-			n := base.pt_read(&doc.pt, pos, lb)
+			n := base.pt_read(&doc.pt, pos, lb[:line_end - pos])
 			_, state = lexer(lb[:n], state, tok_buf[:])
+			hl_resync_bytes_examined += n
 		}
 		nxt := line_end
 		if nxt < doc.pt.length {
