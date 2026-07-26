@@ -1653,3 +1653,142 @@ ODIN_KW := Keyword_Set {
 	nest_comments = true,
 	regex         = false,
 }
+
+// --- CSS (.css) — folded here, not given its own lexer ---------------------
+// Task 5's brief: fold .sql and .css into their nearest fit rather than
+// building dedicated lexers, and state which and why. CSS is the C-family
+// grammar almost exactly: `/* */` block comments (CSS Syntax Module Level 3
+// defines NO line-comment form at all — verified against the spec's own
+// "Comments" section, not assumed), single/double-quoted strings, numeric
+// literals, and `{}();,:` structural punctuation all match this file's
+// existing, UNMODIFIED matching logic with zero changes. Unit suffixes
+// ("10px", "1.5em") need no CSS-specific handling either:
+// lc_scan_number_suffix already absorbs trailing alnum runs onto every
+// language's number token, so "10px" is already one Number token today.
+//
+// One disclosed imprecision from reusing the grammar AS-IS rather than
+// tuning lex_c's own matching logic for a twelfth language (see this file's
+// top-of-file header on why that boundary is treated as a real one, not
+// bureaucracy): lex_c unconditionally treats "//" as a line-comment opener
+// for every Keyword_Set, because all eleven C-family languages genuinely
+// have that form. CSS does not, and "//" appears constantly in real
+// stylesheets inside `url(https://...)` values (font/background/@import
+// URLs) — a line containing one will have everything after the "//"
+// mis-coloured as a Comment. Bounded to that ONE physical line (lex_c's
+// "//" branch never opens a Lex_State — it returns within the same call,
+// state untouched), so it self-corrects on the very next line rather than
+// compounding the way an unclosed `/* */` would; still a real, visible cost
+// on an extremely common CSS pattern, stated here rather than found on
+// screen.
+//
+// Keywords: common global/property-value keywords and at-rule names, from
+// general knowledge of CSS (MDN's CSS reference) rather than one exhaustive
+// spec table — CSS has no small enumerable "reserved word" list the way a
+// programming language does; these are the handful that show up
+// constantly in real stylesheets. `types` is left empty (no primitive type
+// keywords in CSS); `type_intro` likewise (no "identifier after a
+// type-introducing keyword" shape exists here at all).
+CSS_KW := Keyword_Set {
+	keywords = {
+		"important",
+		"inherit", "initial", "unset", "revert",
+		"none", "auto", "normal",
+		"block", "inline", "flex", "grid", "contents", "table",
+		"absolute", "relative", "fixed", "sticky", "static",
+		"solid", "dashed", "dotted", "double", "groove", "ridge",
+		"bold", "italic", "underline", "uppercase", "lowercase", "capitalize",
+		"center", "left", "right", "top", "bottom", "middle",
+		"hidden", "visible", "scroll", "collapse",
+		"media", "import", "keyframes", "supports", "charset",
+		"page", "namespace", "document", "font-face",
+		"nowrap", "wrap", "pointer", "transparent", "currentColor",
+	},
+	types         = {},
+	type_intro    = {},
+	preproc       = false,
+	digit_sep     = 0,
+	raw_string    = .None,
+	backtick      = false,
+	nest_comments = false,
+	regex         = false,
+}
+
+// --- SQL (.sql) — folded here, not given its own lexer ---------------------
+// Same "nearest fit, state which and why" instruction as CSS above.
+// Keywords, quoted string literals, numeric literals, `/* */` block
+// comments (ANSI SQL and every mainstream dialect — T-SQL, MySQL, Postgres,
+// SQLite — all support this form identically to C's), and structural
+// punctuation all match this grammar's shape well.
+//
+// TWO disclosed imprecisions from reusing the grammar AS-IS (see CSS_KW's
+// comment immediately above for why lex_c's own matching logic is not
+// touched to accommodate a new language — that boundary is treated as real,
+// not bureaucracy):
+//
+//   1. SQL's real line-comment marker is "--", which lex_c does not
+//      recognize at all (it only ever checks for "//"). A "-- comment"
+//      line's words are lexed as ordinary SQL tokens rather than suppressed
+//      as a comment — concretely, "-- SELECT the right index" colours
+//      SELECT as a Keyword, inside what a human reader knows is a comment.
+//      This is the SHARPER of the two gaps here (sharper than CSS's
+//      "//"-inside-a-url case above): SQL developers routinely write "--"
+//      comments containing ordinary SQL words, not just rare URL bytes.
+//      Genuinely closing it means teaching lex_c a second, per-language
+//      line-comment marker — a change to the shared grammar's own matching
+//      logic, not a new data table, which is exactly the kind of touch
+//      this task's scope note reserves for calling out rather than making
+//      unilaterally. Flagged here and in task-5-report.md as a real
+//      follow-up candidate. Block comments (`/* */`) are unaffected and
+//      colour correctly.
+//   2. SQL keywords are case-INSENSITIVE (SELECT/select/Select all valid),
+//      but lc_word_in (this grammar's shared matching function) does an
+//      exact, case-SENSITIVE compare, same as every other C-family
+//      language here (none of which are case-insensitive). Both UPPERCASE
+//      and lowercase forms are listed explicitly below, covering the two
+//      dominant real styles; a mixed/title-case style ("Select", "From")
+//      will not colour. Disclosed rather than silently incomplete.
+//
+// Keywords/types: common vocabulary shared across the dialects Wyatt is
+// likely to actually open (T-SQL, MySQL, Postgres, SQLite), from general
+// knowledge of SQL rather than one single spec table — there is no one
+// canonical "reserved word list" the way C99 or the Go spec has; every real
+// database's own reference diverges slightly at the edges. `type_intro` is
+// left empty: "CREATE TABLE name" puts a TABLE name after the keyword
+// TABLE, not a TYPE in the sense this batch's Type role means elsewhere —
+// guessing here would be the same kind of wrong guess ODIN_KW's own comment
+// declines to make for Odin's `Name :: struct`.
+SQL_KW := Keyword_Set {
+	keywords = {
+		"select", "from", "where", "join", "inner", "left", "right", "outer", "on",
+		"group", "by", "order", "having", "insert", "into", "values", "update", "set", "delete",
+		"create", "table", "alter", "drop", "index", "view", "trigger", "procedure", "function",
+		"begin", "end", "if", "else", "while", "declare", "as", "distinct", "limit", "offset",
+		"union", "all", "exists", "in", "not", "and", "or", "null", "is", "like", "between",
+		"case", "when", "then", "primary", "key", "foreign", "references", "constraint",
+		"default", "check", "unique", "cascade", "transaction", "commit", "rollback",
+		"grant", "revoke", "with", "asc", "desc", "top", "exec", "execute", "return", "returns",
+		"SELECT", "FROM", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "OUTER", "ON",
+		"GROUP", "BY", "ORDER", "HAVING", "INSERT", "INTO", "VALUES", "UPDATE", "SET", "DELETE",
+		"CREATE", "TABLE", "ALTER", "DROP", "INDEX", "VIEW", "TRIGGER", "PROCEDURE", "FUNCTION",
+		"BEGIN", "END", "IF", "ELSE", "WHILE", "DECLARE", "AS", "DISTINCT", "LIMIT", "OFFSET",
+		"UNION", "ALL", "EXISTS", "IN", "NOT", "AND", "OR", "NULL", "IS", "LIKE", "BETWEEN",
+		"CASE", "WHEN", "THEN", "PRIMARY", "KEY", "FOREIGN", "REFERENCES", "CONSTRAINT",
+		"DEFAULT", "CHECK", "UNIQUE", "CASCADE", "TRANSACTION", "COMMIT", "ROLLBACK",
+		"GRANT", "REVOKE", "WITH", "ASC", "DESC", "TOP", "EXEC", "EXECUTE", "RETURN", "RETURNS",
+	},
+	types = {
+		"int", "integer", "bigint", "smallint", "tinyint", "float", "double", "decimal", "numeric",
+		"varchar", "char", "text", "nchar", "nvarchar", "date", "datetime", "timestamp", "time",
+		"boolean", "bool", "blob", "binary", "real", "serial", "uuid", "json", "xml",
+		"INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC",
+		"VARCHAR", "CHAR", "TEXT", "NCHAR", "NVARCHAR", "DATE", "DATETIME", "TIMESTAMP", "TIME",
+		"BOOLEAN", "BOOL", "BLOB", "BINARY", "REAL", "SERIAL", "UUID", "JSON", "XML",
+	},
+	type_intro    = {},
+	preproc       = false,
+	digit_sep     = 0,
+	raw_string    = .None,
+	backtick      = false,
+	nest_comments = false,
+	regex         = false,
+}
