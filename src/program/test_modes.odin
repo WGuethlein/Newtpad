@@ -4352,6 +4352,19 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			if ok {bad += 1}
 		}
 
+		// shell_open_folder refuses anything that is not a directory. The
+		// ShellExecuteW itself is not exercised headlessly -- it would open a
+		// real Explorer window -- so what is tested is the guard, which is the
+		// part that can be wrong.
+		nf := fmt.tprintf("%s%cnewtpad_notadir.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+		plat.file_write_atomic(nf, transmute([]u8)string("x"))
+		g1 := !plat.shell_open_folder(nf)
+		fmt.printfln("  %-6s shell_open_folder refuses a file", "ok" if g1 else "FAIL")
+		if !g1 {bad += 1}
+		g2 := !plat.shell_open_folder(fmt.tprintf("%s%cnewtpad_no_such_dir_zz", os.get_env("TEMP", context.temp_allocator), '\\'))
+		fmt.printfln("  %-6s shell_open_folder refuses a missing path", "ok" if g2 else "FAIL")
+		if !g2 {bad += 1}
+
 		fmt.println("--- drawn span == clickable span ---")
 		// The underline is drawn from Link_Hit.col/cells and links_hit tests the
 		// same fields, so they cannot disagree by construction. This asserts the

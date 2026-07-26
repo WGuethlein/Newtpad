@@ -526,6 +526,23 @@ shell_reveal :: proc(path: string) -> bool {
 	return uintptr(rawptr(r)) > 32
 }
 
+// Open a directory in Explorer. Refuses anything that is not an existing
+// directory: file.odin's rule is that nothing arbitrary reaches ShellExecuteW,
+// and while the only caller builds its path from session_dir rather than from
+// document text, a guard that lives in the helper is one a future caller cannot
+// forget.
+shell_open_folder :: proc(path: string) -> bool {
+	exists, is_dir := path_exists(path)
+	if !exists || !is_dir {
+		return false
+	}
+	warg := win.utf8_to_wstring(path, context.temp_allocator)
+	wexe := win.utf8_to_wstring("explorer.exe", context.temp_allocator)
+	wop := win.utf8_to_wstring("open", context.temp_allocator)
+	r := win.ShellExecuteW(nil, wop, wexe, warg, nil, win.SW_SHOWNORMAL)
+	return uintptr(rawptr(r)) > 32
+}
+
 // Does this path exist, and is it a directory? Callers stat before opening: a
 // link to something that is not there should reach no handler at all.
 path_exists :: proc(path: string) -> (exists, is_dir: bool) {

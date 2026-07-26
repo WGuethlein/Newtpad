@@ -175,6 +175,7 @@ menus := []Menu {
 			{cmd = .Palette_Open},
 			{cmd = .Settings_Open},
 			{cmd = .Theme_Edit},
+			{cmd = .Open_Logs_Folder},
 		},
 	},
 	{

@@ -7,6 +7,7 @@
 package main
 
 import "core:fmt"
+import "core:path/filepath"
 import "core:strings"
 import "core:unicode/utf8"
 import base "src:base"
@@ -107,6 +108,7 @@ Command_Id :: enum u8 {
 	Settings_Inc,
 	Settings_Dec,
 	Theme_Edit,
+	Open_Logs_Folder,
 	// font page (Edit > Font)
 	Font_Open,
 	Font_Close,
@@ -221,6 +223,7 @@ command_table := [Command_Id]Command {
 	.Settings_Inc             = {"Settings: Increase", "View"},
 	.Settings_Dec             = {"Settings: Decrease", "View"},
 	.Theme_Edit               = {"Edit Current Theme...", "View"},
+	.Open_Logs_Folder         = {"Open Logs Folder", "View"},
 	.Font_Open                = {"Font...", "Edit"},
 	.Font_Close               = {"Font: Close", "Edit"},
 	.Font_Next                = {"Font: Next", "Edit"},
@@ -1121,6 +1124,17 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		app_open_special(app, .Settings)
 	case .Theme_Edit:
 		theme_edit_current(app)
+	case .Open_Logs_Folder:
+		// Logging has been on by default since 0.9.0 and had no command, no menu
+		// entry and no mention anywhere in the UI -- the audit found a working
+		// feature nobody could reach. diag_init creates this directory on every
+		// launch, so the miss below is a real failure, not a first-run case.
+		if dir, ok := session_dir(); ok {
+			logs, _ := filepath.join({dir, "logs"}, context.temp_allocator)
+			if !plat.shell_open_folder(logs) {
+				app_note(app, "[COULD NOT OPEN THE LOGS FOLDER]")
+			}
+		}
 	case .Settings_Close:
 		request_close_tab(app, app.active, w)
 	case .Settings_Next:
