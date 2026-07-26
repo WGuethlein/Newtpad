@@ -62,6 +62,24 @@ EXT_LEXERS := [?]struct {
 	{".html", base.lex_xml, true, "-->"},
 }
 
+// A stateful entry with no resync_anchor is an undetectable bail: doc_draw's
+// bootstrap and the filter view both call lex_resync_state with whatever
+// anchor highlight_lexer_for hands back, and lex_resync_state's own
+// `len(anchor) == 0` guard returns `.Normal, false` silently -- not a crash,
+// just every row of that extension mis-colouring the moment state matters,
+// with nothing to point at why. EXT_LEXERS is a fixed table maintained by
+// hand, not generated, so nothing else catches a new stateful entry added
+// without its anchor -- this is that catch, run once at startup rather than
+// left to be noticed on screen.
+@(init)
+ext_lexers_check :: proc "contextless" () {
+	for e in EXT_LEXERS {
+		if e.stateful && e.resync_anchor == "" {
+			panic_contextless("EXT_LEXERS: a stateful lexer must register a resync_anchor")
+		}
+	}
+}
+
 // The lexer for a document's path (nil when the extension has none yet, or
 // never will, like .txt), whether it carries state across lines, and — when
 // it does — the resync anchor marker for it. See EXT_LEXERS's comment for
