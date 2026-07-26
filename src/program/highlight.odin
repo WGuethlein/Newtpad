@@ -37,45 +37,132 @@ lex_json_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) 
 	return base.lex_json(line, out), .Normal
 }
 
+// A resync candidate's validity check: given the single physical line that
+// contains it and the offset just past the anchor within that line, is the
+// state right after that offset trustworthy as .Normal? nil means "trust the
+// anchor unconditionally" (XML's historical behaviour — sound for "-->" only
+// because Lex_State has nothing else it could be there; see EXT_LEXERS's
+// comment). See base.lex_c_resync_valid for why the C-family entries below
+// need this and XML doesn't.
+Resync_Validate_Proc :: proc(line: []u8, candidate_end: int) -> bool
+
+// Task 4: one grammar (base.lex_c), eleven keyword sets. Each extension gets
+// its own tiny pair of adapters — one binding the keyword set to lex_c's
+// Lexer_Proc shape, one binding it to lex_c_resync_valid's — mirroring
+// lex_log_adapt/lex_json_adapt's existing shape exactly. See lex_c.odin's
+// header and its per-language keyword tables (C_KW, CPP_KW, ...) for what
+// each language actually gets and where each keyword list came from.
+@(private = "file")
+lex_c_c_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_c(line, state_in, &base.C_KW, out)
+}
+@(private = "file")
+lex_c_c_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.C_KW, line, candidate_end)}
+
+@(private = "file")
+lex_c_cpp_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_c(line, state_in, &base.CPP_KW, out)
+}
+@(private = "file")
+lex_c_cpp_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.CPP_KW, line, candidate_end)}
+
+@(private = "file")
+lex_c_cs_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_c(line, state_in, &base.CS_KW, out)
+}
+@(private = "file")
+lex_c_cs_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.CS_KW, line, candidate_end)}
+
+@(private = "file")
+lex_c_java_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_c(line, state_in, &base.JAVA_KW, out)
+}
+@(private = "file")
+lex_c_java_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.JAVA_KW, line, candidate_end)}
+
+@(private = "file")
+lex_c_js_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_c(line, state_in, &base.JS_KW, out)
+}
+@(private = "file")
+lex_c_js_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.JS_KW, line, candidate_end)}
+
+@(private = "file")
+lex_c_ts_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_c(line, state_in, &base.TS_KW, out)
+}
+@(private = "file")
+lex_c_ts_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.TS_KW, line, candidate_end)}
+
+@(private = "file")
+lex_c_go_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_c(line, state_in, &base.GO_KW, out)
+}
+@(private = "file")
+lex_c_go_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.GO_KW, line, candidate_end)}
+
+@(private = "file")
+lex_c_rust_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_c(line, state_in, &base.RUST_KW, out)
+}
+@(private = "file")
+lex_c_rust_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.RUST_KW, line, candidate_end)}
+
+@(private = "file")
+lex_c_odin_adapt :: proc(line: []u8, state_in: base.Lex_State, out: []base.Token) -> (n: int, state_out: base.Lex_State) {
+	return base.lex_c(line, state_in, &base.ODIN_KW, out)
+}
+@(private = "file")
+lex_c_odin_valid :: proc(line: []u8, candidate_end: int) -> bool {return base.lex_c_resync_valid(&base.ODIN_KW, line, candidate_end)}
+
 // Extension (with leading dot, case-insensitive) -> lexer, whether that
-// lexer's state can differ line to line, and (when it can) the byte marker
-// whose end position is unambiguously .Normal — used by the bounded resync
-// (program/lex_index.odin) to find a safe place to start lexing forward
-// without scanning from byte 0. "-->" is safe for XML/HTML because comments
-// don't nest: once one has closed, nothing about an enclosing construct can
-// still be open. A future stateful lexer (Task 4's C-family, for `*/`) reuses
-// the same resync mechanism by registering its own marker here — this is not
-// XML-specific machinery with an XML-only escape hatch.
+// lexer's state can differ line to line, the byte marker whose end position
+// is unambiguously .Normal (used to seed the bounded resync,
+// program/lex_index.odin, before it starts lexing forward), and — when a
+// bare textual match on that marker is NOT enough on its own — the validator
+// that confirms a candidate occurrence before trusting it.
 //
-// `.log` is Task 1's entry; `.json` is Task 2's; `.xml`/`.html` are this
-// task's. `.txt` and every other extension correctly map to no lexer at all.
+// "-->" is safe for XML/HTML with resync_validate left nil (trust the last
+// occurrence unconditionally) because comments don't nest AND Lex_State has
+// no In_Tag/In_Attr_String: `<a href="x-->y">` really is .Normal wherever
+// "-->" lands, so there is nothing for a validator to catch.
+//
+// `*/` is NOT unambiguously .Normal for the C-family entries below —
+// `char *s = "*/";` and `// */` both put it at a position that is inside a
+// string or a line comment — so every one of them registers
+// base.lex_c_resync_valid (via its own tiny per-language wrapper above) as
+// resync_validate. lex_resync_state (lex_index.odin) walks candidate
+// occurrences from the last backward and uses the first one the validator
+// accepts, rather than blindly trusting the last textual match the way the
+// nil-validator path does. See base.lex_c_resync_valid's own comment for why
+// that check is sound given this grammar's Lex_State shape.
+//
+// `.log` is Task 1's entry; `.json` is Task 2's; `.xml`/`.html` are Task 3's;
+// the eleven C-family extensions are this task's. `.txt` and every other
+// extension correctly map to no lexer at all.
 @(private = "file")
 EXT_LEXERS := [?]struct {
-	ext:           string,
-	lexer:         Lexer_Proc,
-	stateful:      bool, // false: state_in is never consulted, don't bother indexing
-	// A byte sequence whose completion means the state there is unambiguously
-	// .Normal. "" when stateful is false (never consulted).
-	//
-	// WARNING for whoever adds the C-family lexer: a bare literal anchor stops
-	// being sound the moment a lexer's state set grows past "in a comment or
-	// not". `*/` is NOT unambiguously .Normal -- `char *s = "*/";` and `// */`
-	// both put it at a position that is inside a string or a line comment, and
-	// lex_resync_state deliberately takes the LAST occurrence in the window,
-	// which is the one most likely to be inside a string on a line of code.
-	//
-	// XML survives a bare "-->" only by accident: Lex_State has no In_Tag or
-	// In_Attr_String, so `<a href="x-->y">` really is .Normal there. That luck
-	// does not extend to C. Either give the anchor a lexer-supplied validity
-	// predicate at the candidate position, or pick a structurally stronger one
-	// (a `}` at column 0, a blank line) whose meaning does not depend on the
-	// state it is trying to establish.
-	resync_anchor: string,
+	ext:             string,
+	lexer:           Lexer_Proc,
+	stateful:        bool, // false: state_in is never consulted, don't bother indexing
+	resync_anchor:   string, // "" when stateful is false (never consulted)
+	resync_validate: Resync_Validate_Proc, // nil: trust resync_anchor's last occurrence unconditionally (sound only for XML's "-->" — see comment above)
 }{
-	{".log", lex_log_adapt, false, ""},
-	{".json", lex_json_adapt, false, ""},
-	{".xml", base.lex_xml, true, "-->"},
-	{".html", base.lex_xml, true, "-->"},
+	{".log", lex_log_adapt, false, "", nil},
+	{".json", lex_json_adapt, false, "", nil},
+	{".xml", base.lex_xml, true, "-->", nil},
+	{".html", base.lex_xml, true, "-->", nil},
+	{".c", lex_c_c_adapt, true, "*/", lex_c_c_valid},
+	{".h", lex_c_c_adapt, true, "*/", lex_c_c_valid},
+	{".cpp", lex_c_cpp_adapt, true, "*/", lex_c_cpp_valid},
+	{".hpp", lex_c_cpp_adapt, true, "*/", lex_c_cpp_valid},
+	{".cs", lex_c_cs_adapt, true, "*/", lex_c_cs_valid},
+	{".java", lex_c_java_adapt, true, "*/", lex_c_java_valid},
+	{".js", lex_c_js_adapt, true, "*/", lex_c_js_valid},
+	{".ts", lex_c_ts_adapt, true, "*/", lex_c_ts_valid},
+	{".go", lex_c_go_adapt, true, "*/", lex_c_go_valid},
+	{".rs", lex_c_rust_adapt, true, "*/", lex_c_rust_valid},
+	{".odin", lex_c_odin_adapt, true, "*/", lex_c_odin_valid},
 }
 
 // A stateful entry with no resync_anchor is an undetectable bail: doc_draw's
@@ -98,15 +185,15 @@ ext_lexers_check :: proc "contextless" () {
 
 // The lexer for a document's path (nil when the extension has none yet, or
 // never will, like .txt), whether it carries state across lines, and — when
-// it does — the resync anchor marker for it. See EXT_LEXERS's comment for
-// what all three mean.
-highlight_lexer_for :: proc(path: string) -> (lexer: Lexer_Proc, stateful: bool, resync_anchor: string) {
+// it does — the resync anchor marker and (maybe) its validator. See
+// EXT_LEXERS's comment for what all four mean.
+highlight_lexer_for :: proc(path: string) -> (lexer: Lexer_Proc, stateful: bool, resync_anchor: string, resync_validate: Resync_Validate_Proc) {
 	if path == "" {return}
 	dot := strings.last_index_byte(path, '.')
 	if dot < 0 {return}
 	ext := path[dot:]
 	for e in EXT_LEXERS {
-		if strings.equal_fold(ext, e.ext) {return e.lexer, e.stateful, e.resync_anchor}
+		if strings.equal_fold(ext, e.ext) {return e.lexer, e.stateful, e.resync_anchor, e.resync_validate}
 	}
 	return
 }
@@ -221,7 +308,7 @@ highlight_merge_spans :: proc(lex_spans, link_spans: []plat.Text_Span, out: []pl
 highlight_row_spans :: proc(doc: ^Document, row_bytes: []u8, state_in: base.Lex_State, out: []plat.Text_Span) -> (n: int, state_out: base.Lex_State) {
 	state_out = state_in
 	if doc == nil || len(row_bytes) == 0 || len(out) == 0 {return}
-	lexer, _, _ := highlight_lexer_for(doc.path)
+	lexer, _, _, _ := highlight_lexer_for(doc.path)
 	if lexer == nil {return}
 	toks: [HL_MAX_ROW_TOKENS]base.Token
 	tn: int

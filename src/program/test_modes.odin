@@ -5181,6 +5181,66 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			)
 		}
 
+		// --- 7: Task 4's own anchor-soundness proof, end to end through the
+		// REAL ".c" registration (highlight_lexer_for), not just the base-
+		// layer unit tests in lex_c_test.odin. Exactly the task brief's own
+		// example, `char *s = "*/";`, in genuinely ordinary code -- followed,
+		// on the SAME line, by a real `/*` that never closes. The decoy's
+		// "*/" is the only occurrence of those two bytes anywhere in the
+		// content, so it is also the textual LAST occurrence in the window.
+		//
+		// WITHOUT a validator (validate omitted -> nil, simulating this
+		// task's starting point): lex_resync_state trusts that lone "*/"
+		// unconditionally and resumes forward lexing from ONE BYTE INSIDE the
+		// string (before its closing quote), assuming .Normal there. That
+		// makes the resumed scan see a bogus, unterminated string starting at
+		// the real closing quote -- which swallows the rest of the line,
+		// INCLUDING the real "/*" opener, as inert string content. The real
+		// comment is never even noticed: silently, confidently .Normal,
+		// cap_hit FALSE.
+		//
+		// WITH the real validator (lex_c_c_valid, wired through EXT_LEXERS):
+		// the decoy candidate is rejected (it sits inside a String token when
+		// the line is re-lexed from a fresh .Normal), no other "*/" exists in
+		// the window, and the walk falls through to byte 0 (unambiguously
+		// .Normal on its own) and forward-lexes the WHOLE line properly from
+		// there -- closing the decoy string correctly, THEN finding the real,
+		// genuinely unclosed "/*" right after it. .In_Comment, correctly.
+		{
+			content := strings.concatenate(
+				{`char *s = "*/"; /* real comment opens here and never closes` + "\n", "TARGET\n"},
+				context.temp_allocator,
+			)
+			cd: Document
+			cd.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&cd.pt)
+			cd.path = "test.c"
+
+			target := strings.index(content, "TARGET")
+			lexer, stateful, anchor, validate := highlight_lexer_for(cd.path)
+
+			naive_state, naive_cap := lex_resync_state(&cd, target, LEX_RESYNC_WINDOW, lexer, anchor)
+			fixed_state, fixed_cap := lex_resync_state(&cd, target, LEX_RESYNC_WINDOW, lexer, anchor, validate)
+
+			ok :=
+				stateful &&
+				anchor == "*/" &&
+				validate != nil &&
+				!naive_cap &&
+				naive_state == .Normal && // confidently wrong: the decoy fooled it
+				!fixed_cap &&
+				fixed_state == .In_Comment // correct: the validator rejected the decoy
+			if !ok {fail = true}
+			fmt.printfln(
+				"  %-6s C-family resync anchor soundness: naive=(cap=%v,%v) validated=(cap=%v,%v)",
+				"ok" if ok else "FAIL",
+				naive_cap,
+				naive_state,
+				fixed_cap,
+				fixed_state,
+			)
+		}
+
 		fmt.println("lexstatetest: FAILURES" if fail else "lexstatetest: all ok")
 		return true
 	}

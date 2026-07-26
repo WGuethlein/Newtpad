@@ -2300,7 +2300,7 @@ doc_draw :: proc(
 	// at zero cost. hl_cache.cur_lls starts at -1 (see its comment) so the
 	// first wrapped row this pass sees always misses and lexes its logical
 	// line fresh.
-	hl_lexer, _, _ := highlight_lexer_for(doc.path)
+	hl_lexer, _, _, _ := highlight_lexer_for(doc.path)
 	hl_cache: Highlight_Row_Cache
 	hl_cache.cur_lls = -1
 	// The Lex_State carried into the row about to be drawn. In the filter

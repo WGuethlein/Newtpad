@@ -113,7 +113,7 @@ lex_index_worker :: proc(data: rawptr) {
 // small/huge split the design doc calls for).
 lex_index_start :: proc(doc: ^Document) {
 	if doc.lex_idx.th != nil {return}
-	lexer, stateful, _ := highlight_lexer_for(doc.path)
+	lexer, stateful, _, _ := highlight_lexer_for(doc.path)
 	if !stateful || lexer == nil {return}
 	if doc.fv.mapped {return}
 	doc.lex_idx.content = doc.original
@@ -146,7 +146,7 @@ lex_index_valid :: proc(doc: ^Document) -> bool {
 	if !intrinsics.atomic_load(&idx.done) {return false}
 	if intrinsics.atomic_load(&idx.fault) {return false}
 	if idx.built_for_revision != doc.revision {return false}
-	cur_lexer, _, _ := highlight_lexer_for(doc.path)
+	cur_lexer, _, _, _ := highlight_lexer_for(doc.path)
 	if cur_lexer != idx.lexer {return false}
 	return true
 }
@@ -181,6 +181,16 @@ lex_index_lookup :: proc(idx: ^Lex_State_Index, offset: int) -> base.Lex_State {
 // filter view on huge files, not something hidden — see task-3-report.md.
 LEX_RESYNC_WINDOW :: 64 * 1024
 LEX_FILTER_RESYNC_WINDOW :: 4 * 1024
+
+// Bound on how many textual anchor occurrences lex_resync_state will try
+// against a validator before giving up (see that proc's comment). A window
+// is already capped (64 KiB, or 4 KiB in filter mode), so this is a second,
+// independent bound: a pathological file whose window is packed with "*/"
+// occurrences (e.g. binary-ish data, or genuinely thousands of tiny
+// comments) still can't turn validation into unbounded per-candidate work —
+// once this many tries have failed, it's treated exactly like "the anchor
+// was never found" (cap-hit, or byte 0 if reached).
+LEX_RESYNC_MAX_CANDIDATES :: 256
 
 // Total bytes handed to a lexer by lex_resync_state's forward walk,
 // accumulated across calls. The counterpart to highlight.odin's
@@ -226,12 +236,12 @@ hl_resync_bytes_examined: int
 // to resync in that case specifically. Flagging rather than leaving it
 // implicit, same as this file's other documented trade-offs.
 doc_lex_state_at :: proc(doc: ^Document, at: int, window: int) -> base.Lex_State {
-	lexer, stateful, anchor := highlight_lexer_for(doc.path)
+	lexer, stateful, anchor, validate := highlight_lexer_for(doc.path)
 	if !stateful || lexer == nil {return .Normal}
 	if lex_index_valid(doc) && len(doc.lex_idx.line_starts) > 0 && at <= doc.lex_idx.total {
 		return lex_index_lookup(&doc.lex_idx, at)
 	}
-	state, _ := lex_resync_state(doc, at, window, lexer, anchor)
+	state, _ := lex_resync_state(doc, at, window, lexer, anchor, validate)
 	return state
 }
 
@@ -263,12 +273,26 @@ doc_lex_state_at :: proc(doc: ^Document, at: int, window: int) -> base.Lex_State
 // this proc is called directly by doc_draw's bootstrap and by the filter
 // view, never through highlight_row_spans, so nothing else would ever see
 // this path's cost.
+//
+// `validate`, when non-nil, is consulted before ANY candidate occurrence of
+// `anchor` is trusted (see Resync_Validate_Proc's comment, highlight.odin,
+// and base.lex_c_resync_valid for the concrete C-family case this exists
+// for). nil preserves the original behaviour exactly — trust the LAST
+// textual occurrence in the window unconditionally — which is what every
+// existing XML/HTML call site still gets, and is sound there only because
+// Lex_State has nothing else "-->" could be catching (see EXT_LEXERS's
+// comment, highlight.odin). With a validator, candidates are walked from the
+// LAST occurrence backward, each checked against the single physical line
+// that contains it, and the first (i.e. latest) one that validates wins —
+// so a "*/" inside a string or line comment is skipped in favour of an
+// earlier, real comment-close, rather than corrupting the resync.
 lex_resync_state :: proc(
 	doc: ^Document,
 	target: int,
 	window: int,
 	lexer: Lexer_Proc,
 	anchor: string,
+	validate: Resync_Validate_Proc = nil,
 ) -> (
 	state: base.Lex_State,
 	cap_hit: bool,
@@ -282,24 +306,62 @@ lex_resync_state :: proc(
 	got := base.pt_read(&doc.pt, win_start, buf)
 	scan := buf[:got]
 
-	// Last occurrence of `anchor` in the scanned window, if any -- its END
-	// position (index within `scan`) is where .Normal becomes provable.
-	found_at := -1
 	al := len(anchor)
-	scan_loop: for k := 0; k + al <= len(scan); k += 1 {
-		for j := 0; j < al; j += 1 {
-			if scan[k + j] != anchor[j] {continue scan_loop}
+	from := -1
+
+	if validate == nil {
+		// Original behaviour: the LAST occurrence in the window, trusted
+		// unconditionally.
+		found_at := -1
+		scan_loop: for k := 0; k + al <= len(scan); k += 1 {
+			for j := 0; j < al; j += 1 {
+				if scan[k + j] != anchor[j] {continue scan_loop}
+			}
+			found_at = k + al
 		}
-		found_at = k + al
+		from = found_at
+	} else {
+		// Walk candidates from the last occurrence backward; the physical
+		// line containing each one is read fresh (bounded to RENDER_LINE_CAP,
+		// same cap the forward walk below already respects) so `validate`
+		// sees real line content, not an arbitrary window-relative slice.
+		tries := 0
+		k := len(scan) - al
+		// Declared once, outside the loop: pt_read below always fills exactly
+		// `ln` bytes from index 0 and every read only ever looks at `lb[:ln]`,
+		// so reusing the buffer across candidates is safe, and it avoids
+		// re-zeroing an 8 KiB stack array up to LEX_RESYNC_MAX_CANDIDATES
+		// times per call -- real weight in filter mode, where this whole
+		// proc runs once per visible row.
+		lb: [RENDER_LINE_CAP]u8
+		cand_loop: for k >= 0 {
+			match := true
+			for j := 0; j < al; j += 1 {
+				if scan[k + j] != anchor[j] {
+					match = false
+					break
+				}
+			}
+			if match {
+				tries += 1
+				cand_start_abs := win_start + k
+				cand_end_abs := win_start + k + al
+				ls, _ := base.pt_line_start_cap(&doc.pt, cand_start_abs, RENDER_LINE_CAP)
+				le := base.pt_line_end_cap(&doc.pt, ls, RENDER_LINE_CAP)
+				ln := base.pt_read(&doc.pt, ls, lb[:min(le - ls, len(lb))])
+				if validate(lb[:ln], cand_end_abs - ls) {
+					from = k + al
+					break cand_loop
+				}
+				if tries >= LEX_RESYNC_MAX_CANDIDATES {break cand_loop}
+			}
+			k -= 1
+		}
 	}
 
-	from := 0
-	if found_at >= 0 {
-		from = found_at
-	} else if win_start == 0 {
-		from = 0 // never found the marker, but byte 0 is unambiguous on its own
-	} else {
-		return .Normal, true // cap hit
+	if from < 0 {
+		if win_start != 0 {return .Normal, true} // cap hit
+		from = 0 // never found (or never validated) a marker, but byte 0 is unambiguous on its own
 	}
 
 	state = .Normal
