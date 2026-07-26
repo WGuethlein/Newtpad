@@ -65,7 +65,7 @@ main :: proc() {
 	// still caught. The assertion proc is set on this context so it propagates to
 	// the whole frame loop (Odin context flows down the call tree).
 	diag_init()
-	context.assertion_failure_proc = diag_assert_fail
+	context = diag_context() // the hook propagates down the whole frame loop from here
 	defer diag_shutdown()
 
 	// Open the file given on the command line; with no argument, start empty.
@@ -1288,7 +1288,7 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 // new size needs, so the atlas is dropped wholesale; the viewport-first rule
 // bounds what gets re-rasterized to roughly the visible glyph set.
 on_dpi :: proc "contextless" (user: rawptr) {
-	context = runtime.default_context()
+	context = diag_context()
 	rc := (^Render_Ctx)(user)
 	metrics_recompute(rc) // also refreshes window.titlebar_h
 	plat.text_reset_atlas(rc.text)
@@ -1298,7 +1298,7 @@ on_dpi :: proc "contextless" (user: rawptr) {
 // the "system" window proc (no Odin context) and uses a private scratch arena so
 // it never disturbs the main loop's temp allocator.
 on_resize :: proc "contextless" (user: rawptr) {
-	context = runtime.default_context()
+	context = diag_context()
 	rc := (^Render_Ctx)(user)
 	if rc.window.width <= 0 || rc.window.height <= 0 {return}
 	@(static) scratch: [64 * 1024]u8

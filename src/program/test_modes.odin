@@ -1205,6 +1205,14 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			fmt.printfln("  FAIL after wrap oldest=%q want %q", len(order) > 0 ? order[0] : "", want_first)
 			bad += 1
 		}
+		// The hook must survive establishing a context from a contextless
+		// callback. Checked by identity, not by triggering a real assert: a
+		// genuine panic ends the process, and the thing that was broken is the
+		// pointer, so the pointer is what to assert on.
+		ctx := diag_context()
+		hook_ok := ctx.assertion_failure_proc == diag_assert_fail
+		fmt.printfln("  %-6s diag_context keeps the crash-reporter assertion hook", "ok" if hook_ok else "FAIL")
+		if !hook_ok {bad += 1}
 		fmt.printfln("logtest: %d failures", bad)
 		return true
 	}
@@ -1218,7 +1226,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		kind := os.args[2] if len(os.args) > 2 else "panic"
 		plat.crash_set_silent(true) // no message box in a headless run
 		diag_init()
-		context.assertion_failure_proc = diag_assert_fail
+		context = diag_context()
 		base.log_info("crashtest about to trigger %q", kind)
 		base.log_info("breadcrumb: pretend the user opened a file and typed")
 		switch kind {
