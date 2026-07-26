@@ -135,13 +135,14 @@ Color_Role :: enum u8 {
 	// #A8B89E (1: markdown.odin MD_QUOTE).
 	Md_Quote,
 
-	// --- syntax highlighting (batch 4) ---
-	// Declared now so the lexers due in batch 4 emit role names from their
-	// first line instead of new RGB literals that would need migrating right
-	// after landing. Deliberately unused until then -- do not delete these as
-	// dead code. theme_dark gives them an obviously-fake placeholder colour
-	// (loud magenta) rather than leaving them zero, so a stray reference
-	// before batch 4 lands would be visually obvious instead of invisible.
+	// --- syntax highlighting ---
+	// Declared in batch 3 so batch 4's lexers could emit role names from their
+	// first line instead of RGB literals needing migration right after landing.
+	// That worked; what did not is that theme_dark kept the loud-magenta
+	// "missing texture" placeholder these were given, through the entire batch 4
+	// release -- every highlighted file rendered identically magenta in Dark in
+	// v0.13.0. Both built-ins now hold real values and themetest fails if either
+	// ever holds {1,0,1,1} again.
 	Syn_Keyword,
 	Syn_String,
 	Syn_Number,
@@ -224,15 +225,29 @@ theme_dark :: proc() -> Theme {
 		.Md_Italic      = {0.80, 0.86, 0.78, 1}, // #CCDBC7
 		.Md_Quote       = {0.66, 0.72, 0.62, 1}, // #A8B89E
 
-		.Syn_Keyword    = {1, 0, 1, 1},
-		.Syn_String     = {1, 0, 1, 1},
-		.Syn_Number     = {1, 0, 1, 1},
-		.Syn_Comment    = {1, 0, 1, 1},
-		.Syn_Type       = {1, 0, 1, 1},
-		.Syn_Punct      = {1, 0, 1, 1},
-		.Syn_Json_Key   = {1, 0, 1, 1},
-		.Syn_Xml_Tag    = {1, 0, 1, 1},
-		.Syn_Xml_Attr   = {1, 0, 1, 1},
+		// Light's hue family per role, re-tuned for this theme's Bg_Base
+		// (#1A1F29). Ratios are WCAG relative luminance against Bg_Base,
+		// computed rather than eyeballed -- this environment cannot render a
+		// frame, and computation is the standard theme_light already used.
+		// Every token colour clears 4.5:1 except Syn_Comment, which is
+		// deliberately de-emphasised and clears 3:1: a comment that shouts is
+		// a worse outcome than a comment that is slightly dim.
+		//
+		// Syn_Comment is pulled away from Text_Muted (#808CA3) on purpose --
+		// the gutter line numbers are Text_Muted and sit directly beside
+		// comment text. Light deliberately placed those two close together;
+		// Dark must not, because Dark is the theme with the gutter beside it
+		// in daily use. Syn_Punct is likewise kept clear of Text_Primary.
+		// themetest asserts both separations.
+		.Syn_Keyword    = {0.56, 0.66, 1.00, 1}, // #8FA8FF -- periwinkle (Light: indigo #3B5BDB), 7.4:1
+		.Syn_String     = {0.56, 0.85, 0.66, 1}, // #8FD9A8 -- soft green (Light: green #17824E), 10.1:1
+		.Syn_Number     = {0.96, 0.72, 0.48, 1}, // #F5B87A -- peach (Light: burnt orange #B5560A), 9.5:1
+		.Syn_Comment    = {0.43, 0.52, 0.47, 1}, // #6E8578 -- sage grey (Light: slate #707A88), 4.2:1
+		.Syn_Type       = {0.44, 0.83, 0.88, 1}, // #70D4E0 -- cyan (Light: teal #0B7285), 9.5:1
+		.Syn_Punct      = {0.60, 0.65, 0.74, 1}, // #99A6BD -- mid neutral (Light: #444B58), 6.7:1
+		.Syn_Json_Key   = {0.94, 0.63, 0.54, 1}, // #F0A18A -- salmon (Light: rust #9C4221), 8.0:1
+		.Syn_Xml_Tag    = {0.96, 0.55, 0.71, 1}, // #F58CB5 -- pink (Light: rose #B5165A), 7.3:1
+		.Syn_Xml_Attr   = {0.77, 0.68, 0.96, 1}, // #C4ADF5 -- lavender (Light: violet #6B4FB6), 8.4:1
 	}
 }
 

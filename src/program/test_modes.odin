@@ -2773,6 +2773,67 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			}
 		}
 
+		// No role in EITHER built-in may still hold the magenta placeholder
+		// {1,0,1,1}. Batch 3 planted that in theme_dark for the nine Syn_*
+		// roles as a deliberate "missing texture" marker; batch 4 shipped the
+		// lexers that consume them and never replaced it, so every highlighted
+		// file rendered identically magenta in Dark for a whole release. This
+		// is the check that would have caught it. Both built-ins are checked
+		// because the same omission is available to either one.
+		//
+		// Note this deliberately tests theme_dark()/theme_light() only, never a
+		// theme loaded from a file: `caret #ff00ff` is a legitimate colour for
+		// a user to write, and the file round-trip test below uses exactly that
+		// value.
+		{
+			placeholder := [4]f32{1, 0, 1, 1}
+			l := theme_light()
+			for role in Color_Role {
+				if d[role] == placeholder {
+					fmt.printfln("  FAIL   %v is still the magenta placeholder in Dark", role)
+					fail = true
+				}
+				if l[role] == placeholder {
+					fmt.printfln("  FAIL   %v is still the magenta placeholder in Light", role)
+					fail = true
+				}
+			}
+			fmt.println("  ok     no built-in role holds the magenta placeholder")
+		}
+
+		// Two role pairs sit next to each other on screen and must not read as
+		// the same colour. Both are lifted from HANDOFF 6w's "what only Wyatt
+		// can check" list, so they stop depending on someone noticing:
+		//
+		//   Syn_Comment vs Text_Muted -- the gutter line numbers are Text_Muted
+		//   and sit immediately beside comment text.
+		//   Syn_Punct vs Text_Primary -- if punctuation reads as body text,
+		//   every .Punct token batch 4 emits is wasted work.
+		//
+		// The bar is max absolute per-channel difference >= 0.10 (~26/255). That
+		// is a floor against the two being set equal or near-equal, NOT a claim
+		// that 0.10 is perceptually sufficient -- only Wyatt's eye settles that.
+		{
+			max_chan_diff :: proc(a, b: [4]f32) -> f32 {
+				m: f32 = 0
+				for i in 0 ..< 3 {
+					dch := a[i] - b[i]
+					if dch < 0 {dch = -dch}
+					if dch > m {m = dch}
+				}
+				return m
+			}
+			pairs := []struct {
+				a, b: Color_Role,
+			}{{.Syn_Comment, .Text_Muted}, {.Syn_Punct, .Text_Primary}}
+			for p in pairs {
+				diff := max_chan_diff(d[p.a], d[p.b])
+				ok := diff >= 0.10
+				if !ok {fail = true}
+				fmt.printfln("  %-6s Dark %v vs %v: max channel diff %.3f (need >= 0.10)", "ok" if ok else "FAIL", p.a, p.b, diff)
+			}
+		}
+
 		in_set :: proc(got: [4]f32, set: [][4]f32) -> bool {
 			for v in set {if got == v {return true}}
 			return false
