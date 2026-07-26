@@ -18,8 +18,16 @@ if defined NEED_MSVC call :msvc_artifacts || exit /b 1
 REM Release is the shipped app: GUI subsystem, so launching it never flashes a
 REM console window. Debug keeps the console subsystem because the headless test
 REM modes (test_modes.odin) print their results to stdout.
+REM
+REM The harness is `package main`, so it ships inside whatever exe is built.
+REM `release` gates it out via NEWTPAD_TESTS (see test_modes.odin). `release tests`
+REM is the way back in: some measurements are only meaningful against an -o:speed
+REM build (a held key over a 300-row column rectangle, HANDOFF 6y), and gating
+REM without this row would make that class of measurement impossible. It keeps the
+REM console subsystem, or the modes would have nowhere to print.
 set "OPT=-debug"
-if "%1"=="release" set "OPT=-o:speed -subsystem:windows"
+if "%1"=="release" set "OPT=-o:speed -subsystem:windows -define:NEWTPAD_TESTS=false"
+if "%1"=="release" if "%2"=="tests" set "OPT=-o:speed -define:NEWTPAD_TESTS=true"
 
 REM -resource embeds newtpad.res, which carries the application manifest
 REM declaring per-monitor-v2 DPI awareness. Building without it (a bare
