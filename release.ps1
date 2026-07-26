@@ -50,11 +50,29 @@ $branch = (git rev-parse --abbrev-ref HEAD).Trim()
 git push origin $branch
 git push origin $tag
 
-# --- GitHub Release (optional, needs gh) ---
-if (Get-Command gh -ErrorAction SilentlyContinue) {
-    gh release create $tag $exe --title "Newtpad $tag" --generate-notes
-    Write-Host "GitHub Release $tag created with the exe attached." -ForegroundColor Green
-} else {
-    Write-Host "Pushed tag $tag. Install 'gh' to auto-create a GitHub Release, or upload $exe manually at:" -ForegroundColor Yellow
-    Write-Host "  https://github.com/WGuethlein/Newtpad/releases/new?tag=$tag"
+# --- GitHub Release (needs gh) ---
+# A shell opened before gh was installed does not have it on PATH, so look in the
+# default install location too. Getting this wrong once meant the tag was pushed
+# and the Release silently skipped, with the manual-upload fallback printed as
+# though gh were absent.
+$gh = (Get-Command gh -ErrorAction SilentlyContinue).Source
+if (-not $gh) {
+    $fallback = 'C:\Program Files\GitHub CLI\gh.exe'
+    if (Test-Path $fallback) { $gh = $fallback }
 }
+if (-not $gh) {
+    Write-Host "Pushed tag $tag, but 'gh' was not found on PATH or at the default install path." -ForegroundColor Yellow
+    Write-Host "No GitHub Release was created. Install 'gh', or upload $exe manually at:" -ForegroundColor Yellow
+    Write-Host "  https://github.com/WGuethlein/Newtpad/releases/new?tag=$tag"
+    exit 1
+}
+
+# Prepended to the auto-generated notes. The repo is public and the exe is
+# unsigned, so every download trips SmartScreen; say so rather than letting it
+# look like a broken binary. Delete this once signing is in place.
+$notes = @"
+**This build is unsigned.** Windows SmartScreen will warn when you download or first run it — choose **More info** then **Run anyway**. Code signing needs a purchased certificate and is tracked as ship-readiness work.
+"@
+& $gh release create $tag $exe --title "Newtpad $tag" --notes $notes --generate-notes
+if ($LASTEXITCODE -ne 0) { Write-Error "gh release create failed for $tag."; exit 1 }
+Write-Host "GitHub Release $tag created with the exe attached." -ForegroundColor Green
