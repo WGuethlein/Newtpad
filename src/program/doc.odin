@@ -729,6 +729,14 @@ Document :: struct {
 	// run of typing continues only while both still match.
 	last_edit:    Edit_Kind,
 	last_edit_at: int,
+	// Column-edit run identity. A held key over a rectangle issues one batch per
+	// press; without this each press was its own undo entry, so a 300-row prefix
+	// held for two seconds was dozens of Ctrl+Z -- and UNDO_MAX (200) then evicted
+	// the pre-run state entirely, making the original unreachable. `block_run` is
+	// bumped whenever a gesture creates or reshapes a rectangle; `last_block_run`
+	// is the run the current undo entry belongs to, and 0 means "not a run".
+	block_run:      int,
+	last_block_run: int,
 	// What produced the CURRENT state, and how much of it. Each Snapshot carries
 	// the same for the state it holds, so the description travels with a state as
 	// it moves between the undo and redo stacks — otherwise a state that came
@@ -1171,6 +1179,7 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 	// undo/redo describing line/cell offsets a just-restored tree may no
 	// longer have.
 	if block_active(doc) {block_clear(doc)}
+	doc.last_block_run = 0 // undo/redo/history jump always ends a run
 }
 
 @(private = "file")
@@ -1187,6 +1196,10 @@ push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
 	// except apply_snapshot and doc_absorb_append, which bypass this by design and
 	// bump revision themselves, and doc_reload, which replaces the struct wholesale.
 	doc.modified = true
+	// Any edit that is not part of the current column run ends it. Set here, on
+	// the path every ordinary edit takes, so a missed break is impossible rather
+	// than enumerated: doc_batch_begin_run re-sets it after calling through.
+	doc.last_block_run = 0
 	// One entry for the whole batch; doc_batch_begin already took the snapshot of
 	// the state being left. Without this, Replace All pushed one snapshot per
 	// match -- and since UNDO_MAX evicts the oldest, replacing more than 200
@@ -1237,6 +1250,39 @@ doc_batch_end :: proc(doc: ^Document, count: int) {
 	doc.batch = false
 	doc.state_count = max(count, 1)
 	doc.last_edit = .None // a later keystroke must not coalesce into the batch
+}
+
+// Like doc_batch_begin, but CONTINUES the previous entry when this batch belongs
+// to the same column-edit run and is the same kind of edit. `run` is doc.block_run;
+// 0 behaves exactly like doc_batch_begin.
+doc_batch_begin_run :: proc(doc: ^Document, kind: Edit_Kind, run: int) {
+	if doc.batch {return}
+	if run != 0 && run == doc.last_block_run && kind == doc.last_edit {
+		// No snapshot -- the entry the first press pushed already describes the
+		// state before the whole run. Everything ELSE push_undo does still must
+		// happen: the buffer really is changing.
+		find_invalidate(doc)
+		doc.revision += 1
+		doc.modified = true
+		doc.batch = true
+		return
+	}
+	push_undo(doc, kind)
+	doc.batch = true
+	doc.last_block_run = run // after push_undo, which clears it
+}
+
+// `count` accumulates across a continued run, so the history reads "Deleted 20
+// times" for a held Backspace rather than "1" written twenty times over one entry.
+doc_batch_end_run :: proc(doc: ^Document, count, run: int) {
+	if !doc.batch {return}
+	doc.batch = false
+	continued := run != 0 && run == doc.last_block_run
+	doc.state_count = max(doc.state_count + count, 1) if continued else max(count, 1)
+	// doc_batch_end sets last_edit = .None so a later keystroke cannot coalesce
+	// into a batch. A column run is the one case where the next press must, so
+	// the kind is left alone and the run token is what gates it.
+	doc.last_block_run = run
 }
 
 doc_undo :: proc(doc: ^Document) {

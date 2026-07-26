@@ -4196,6 +4196,104 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 		if !block_test_aq(&t) {fail = true}
 
+		// A held key over a rectangle used to push one undo entry per press: 20
+		// presses was 20 Ctrl+Z, and with UNDO_MAX at 200 a long hold evicted the
+		// pre-run state off the end of the stack entirely -- unreachable by any
+		// number of undos. Same shape as the Replace All bug in 6i.
+		block_test_undo_run :: proc(t: ^plat.Text) -> (bad: int) {
+			raw := "alpha\nbravo\ncharlie\n"
+			content := make([]u8, len(raw));copy(content, transmute([]u8)raw)
+			doc := doc_from_content(content, "", .UTF8)
+			defer doc_close(&doc)
+			doc.wrap = false
+			before := doc_debug_string(&doc)
+
+			doc.block = true
+			doc.block_run += 1
+			doc.block_anchor_line_start = 0
+			doc.block_anchor_cell = 0
+			doc.block_cursor_line_start = 12 // "charlie" line start
+			doc.block_cursor_cell = 0
+
+			for _ in 0 ..< 5 {block_replace(&doc, t, transmute([]u8)string("x"))}
+			one := len(doc.undo) == 1
+			fmt.printfln("  %-6s 5 presses over a rectangle = 1 undo entry (got %d)", "ok" if one else "FAIL", len(doc.undo))
+			if !one {bad += 1}
+
+			doc_undo(&doc)
+			back := doc_debug_string(&doc) == before
+			fmt.printfln("  %-6s one undo restores the whole run", "ok" if back else "FAIL")
+			if !back {bad += 1}
+			return
+		}
+		if block_test_undo_run(&t) > 0 {fail = true}
+
+		// A re-made rectangle is a new run; an ordinary edit in between breaks it.
+		block_test_undo_run_breaks :: proc(t: ^plat.Text) -> (bad: int) {
+			raw := "alpha\nbravo\ncharlie\n"
+			content := make([]u8, len(raw));copy(content, transmute([]u8)raw)
+			doc := doc_from_content(content, "", .UTF8)
+			defer doc_close(&doc)
+			doc.wrap = false
+
+			make_rect :: proc(doc: ^Document) {
+				doc.block = true
+				doc.block_run += 1
+				doc.block_anchor_line_start = 0
+				doc.block_anchor_cell = 0
+				doc.block_cursor_line_start = 12
+				doc.block_cursor_cell = 0
+			}
+			make_rect(&doc)
+			block_replace(&doc, t, transmute([]u8)string("x"))
+			block_clear(&doc)
+			make_rect(&doc)
+			block_replace(&doc, t, transmute([]u8)string("y"))
+			two := len(doc.undo) == 2
+			fmt.printfln("  %-6s a re-made rectangle starts a new undo entry (got %d)", "ok" if two else "FAIL", len(doc.undo))
+			if !two {bad += 1}
+			return
+		}
+		if block_test_undo_run_breaks(&t) > 0 {fail = true}
+
+		// The OTHER break condition, and the one block_clear does not cover: an
+		// ordinary edit between two block edits OF THE SAME KIND, with the same
+		// rectangle still live and its run token unchanged. Only
+		// `doc.last_block_run = 0` in push_undo separates them -- remove that one
+		// line and the run token still matches, the kind still matches, and the
+		// second block edit folds the unrelated insert into its entry, so one
+		// Ctrl+Z takes back more than the user did. The insert is placed at the
+		// very end of the buffer so it shifts none of the rectangle's row starts;
+		// what is under test is the undo bookkeeping, not the geometry. It uses
+		// doc_insert_text's default kind (.Paste), the same kind block_replace
+		// passes -- with a different kind the kind gate would break the run on its
+		// own and this case would prove nothing about push_undo.
+		block_test_undo_run_break_edit :: proc(t: ^plat.Text) -> (bad: int) {
+			raw := "alpha\nbravo\ncharlie\n"
+			content := make([]u8, len(raw));copy(content, transmute([]u8)raw)
+			doc := doc_from_content(content, "", .UTF8)
+			defer doc_close(&doc)
+			doc.wrap = false
+
+			doc.block = true
+			doc.block_run += 1
+			doc.block_anchor_line_start = 0
+			doc.block_anchor_cell = 0
+			doc.block_cursor_line_start = 12
+			doc.block_cursor_cell = 0
+
+			block_replace(&doc, t, transmute([]u8)string("x"))
+			doc.cursor = doc.pt.length
+			doc.anchor = doc.cursor
+			doc_insert_text(&doc, transmute([]u8)string("Z"))
+			block_replace(&doc, t, transmute([]u8)string("y"))
+			three := len(doc.undo) == 3
+			fmt.printfln("  %-6s an ordinary edit between two block edits breaks the run (got %d, want 3)", "ok" if three else "FAIL", len(doc.undo))
+			if !three {bad += 1}
+			return
+		}
+		if block_test_undo_run_break_edit(&t) > 0 {fail = true}
+
 		// SEAM PROOF: the assertion the previous round's clipboard fix
 		// lacked. block_test_an (above) only proves block_test_ai's OWN
 		// save/restore works; it says nothing about block_test_t,
