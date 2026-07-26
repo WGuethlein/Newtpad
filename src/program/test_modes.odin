@@ -7,6 +7,7 @@ package main
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
 import "core:time"
@@ -5064,6 +5065,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 	// then resets, the real session under %APPDATA%\Newtpad.
 	if os.args[1] == "sessiontest" {
 		if !require_scratch_session("sessiontest") {return true}
+		bad := 0
 		tmpf := fmt.tprintf("%s%cnewtpad_sesstest.txt", os.get_env("TEMP", context.temp_allocator), '\\')
 		plat.file_write_atomic(tmpf, transmute([]u8)string("clean file content\nsecond line"))
 		a: App
@@ -5089,11 +5091,98 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			fmt.printfln("  tab %d: path=%q modified=%v cursor=%d %q", i, d.path, d.modified, d.cursor, s[:min(len(s), 24)])
 		}
 		app_destroy(&b)
+
+		// A stored table view against a .txt must not come back on. Written by
+		// hand because save() can only produce views that were legal when they
+		// were saved; a session from another build, or an edited one, cannot.
+		{
+			dir, _ := session_dir()
+			txtf := fmt.tprintf("%s%cnewtpad_sess_v4.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+			plat.file_write_atomic(txtf, transmute([]u8)string("plain,text,file\n"))
+			line := fmt.tprintf("0 0 0 0 0 -1 0 0 0 0 2 1 %s\n", txtf)
+			body := fmt.tprintf("newtpad-session 4\nactive 0\n%s", line)
+			sp, _ := filepath.join({dir, "session.txt"}, context.temp_allocator)
+			plat.file_write_atomic(sp, transmute([]u8)body)
+
+			v: App
+			vok := session_restore(&v)
+			vd := app_active(&v)
+			good := vok && vd != nil && !vd.table && vd.md_mode == .Off
+			fmt.printfln(
+				"  %-6s a .txt restored with md_mode=2 table=1 comes back plain: ok=%v table=%v md_mode=%v",
+				"ok" if good else "FAIL", vok, vd != nil && vd.table, Md_Mode.Off if vd == nil else vd.md_mode,
+			)
+			if !good {bad += 1}
+			app_destroy(&v)
+		}
+
+		// Round-trip: a .md left in Split and a .csv left in Table come back
+		// that way. The property task 5 of batch 2 could only assert as a
+		// constant (session.txt did not carry a view at all) is now real.
+		{
+			mdf := fmt.tprintf("%s%cnewtpad_sess.md", os.get_env("TEMP", context.temp_allocator), '\\')
+			csvf := fmt.tprintf("%s%cnewtpad_sess.csv", os.get_env("TEMP", context.temp_allocator), '\\')
+			plat.file_write_atomic(mdf, transmute([]u8)string("# heading\n\ntext\n"))
+			plat.file_write_atomic(csvf, transmute([]u8)string("a,b\n1,2\n"))
+
+			w: App
+			if fd, ok := doc_open(mdf); ok {
+				d := new(Document);d^ = fd;d.md_mode = .Split
+				app_add(&w, d)
+			}
+			if fd, ok := doc_open(csvf); ok {
+				d := new(Document);d^ = fd;d.table = true;d.table_delim = ','
+				app_add(&w, d)
+			}
+			session_save(&w)
+			app_destroy(&w)
+
+			x: App
+			session_restore(&x)
+			got_md, got_tbl := Md_Mode.Off, false
+			for d in x.docs {
+				if d == nil {continue}
+				if strings.has_suffix(d.path, ".md") {got_md = d.md_mode}
+				if strings.has_suffix(d.path, ".csv") {got_tbl = d.table}
+			}
+			rt := got_md == .Split && got_tbl
+			fmt.printfln(
+				"  %-6s view round-trips: md_mode=%v table=%v (want Split/true)",
+				"ok" if rt else "FAIL", got_md, got_tbl,
+			)
+			if !rt {bad += 1}
+			app_destroy(&x)
+		}
+
+		// A v3 session (eleven fields, no md_mode/table) must still load: the
+		// old two fields simply aren't there, and the path is still the last field.
+		{
+			dir, _ := session_dir()
+			v3f := fmt.tprintf("%s%cnewtpad_sess_v3.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+			plat.file_write_atomic(v3f, transmute([]u8)string("old format file\n"))
+			line := fmt.tprintf("0 0 0 0 0 -1 0 0 0 0 %s\n", v3f)
+			body := fmt.tprintf("newtpad-session 3\nactive 0\n%s", line)
+			sp, _ := filepath.join({dir, "session.txt"}, context.temp_allocator)
+			plat.file_write_atomic(sp, transmute([]u8)body)
+
+			y: App
+			yok := session_restore(&y)
+			yd := app_active(&y)
+			v3ok := yok && yd != nil && !yd.table && yd.md_mode == .Off && yd.path == v3f
+			fmt.printfln(
+				"  %-6s v3 session still loads: ok=%v table=%v md_mode=%v path_ok=%v",
+				"ok" if v3ok else "FAIL", yok, yd != nil && yd.table, Md_Mode.Off if yd == nil else yd.md_mode, yd != nil && yd.path == v3f,
+			)
+			if !v3ok {bad += 1}
+			app_destroy(&y)
+		}
+
 		// reset the session so the GUI doesn't restore this test's tabs
 		empty: App
 		app_new_scratch(&empty)
 		session_save(&empty)
 		app_destroy(&empty)
+		fmt.printfln("sessiontest: %d failures", bad)
 		return true
 	}
 
