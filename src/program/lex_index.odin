@@ -182,6 +182,23 @@ lex_index_lookup :: proc(idx: ^Lex_State_Index, offset: int) -> base.Lex_State {
 LEX_RESYNC_WINDOW :: 64 * 1024
 LEX_FILTER_RESYNC_WINDOW :: 4 * 1024
 
+// Scratch for lex_resync_state's backward anchor scan, so that scan costs no
+// heap allocation: in filter mode the proc runs once per VISIBLE ROW, and a
+// make() there was a per-row allocation on the frame path.
+//
+// Package-level rather than a [LEX_RESYNC_WINDOW]u8 local, because 64 KiB in
+// that proc's frame would sit on top of the two RENDER_LINE_CAP line buffers
+// and the token array it already carries — one frame near 100 KB, entered
+// once per row. Sharing one buffer is safe for exactly the reason
+// hl_resync_bytes_examined is safe as a plain global: lex_resync_state is
+// main-thread-only. Its only callers are doc_lex_state_at (doc_draw's
+// bootstrap and the filter view, both on the main thread) and the headless
+// test modes; the background index worker lexes `content` directly and never
+// comes through here. It is also never re-entered — nothing it calls calls
+// back into it.
+@(private = "file")
+lex_resync_scan_buf: [LEX_RESYNC_WINDOW]u8
+
 // Bound on how many textual anchor occurrences lex_resync_state will try
 // against a validator before giving up (see that proc's comment). A window
 // is already capped (64 KiB, or 4 KiB in filter mode), so this is a second,
@@ -366,7 +383,14 @@ lex_resync_state :: proc(
 	scan_len := target - win_start
 	if scan_len <= 0 {return .Normal, false}
 
-	buf := make([]u8, scan_len, context.temp_allocator)
+	// The scratch buffer covers every shipping call: both call sites pass a
+	// constant window (LEX_RESYNC_WINDOW / LEX_FILTER_RESYNC_WINDOW), neither
+	// wider than it. A caller asking for MORE falls back to a temp allocation
+	// rather than being silently clamped — lexstatetest widens the window past
+	// the whole document on purpose, to show the bound rather than the
+	// mechanism is what produces the documented wrong answer, and clamping
+	// would turn that call into a cap hit and quietly delete the sabotage.
+	buf := lex_resync_scan_buf[:scan_len] if scan_len <= len(lex_resync_scan_buf) else make([]u8, scan_len, context.temp_allocator)
 	got := base.pt_read(&doc.pt, win_start, buf)
 	// The anchor scan's own read is a THIRD cost term, named in this proc's
 	// header comment from the start and never instrumented: up to a full
