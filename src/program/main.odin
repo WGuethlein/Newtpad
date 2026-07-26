@@ -984,7 +984,12 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 				plat.quads_draw(gfx, quad_pipe, findq[:nfq])
 			}
 			selq: [80]plat.Quad
-			if ns := doc_selection_rects(doc, text, px, char_w, rows, selq[:]); ns > 0 {
+			// A column rectangle is still a selection (same fill role,
+			// Selection_Doc) -- it just gets its geometry from block_row_range
+			// instead of the linear anchor/cursor pair, so the draw call
+			// swaps procedures rather than branching inside one of them.
+			ns := block_selection_rects(doc, text, px, char_w, rows, selq[:]) if block_active(doc) else doc_selection_rects(doc, text, px, char_w, rows, selq[:])
+			if ns > 0 {
 				plat.quads_draw(gfx, quad_pipe, selq[:ns])
 			}
 		}

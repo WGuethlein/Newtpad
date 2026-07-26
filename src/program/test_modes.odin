@@ -2202,6 +2202,167 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			)
 		}
 
+		// Task 4: block_selection_rects -- the draw. Reuses the same `doc`
+		// fixture as block_row_range's own tests above (bytes and cells
+		// disagree there via a tab and via CJK), so a draw that quietly
+		// counted bytes instead of asking block_row_range would be caught
+		// here too, not only in block_row_range's own assertions.
+		{
+			doc.wrap = false
+			doc.filter = false
+			doc.md_mode = .Off
+			doc.top = 0
+			px := f32(16)
+			cw := plat.text_char_width(&t, px, .Doc)
+			rectq: [8]plat.Quad
+
+			// A: emitted quad count equals the number of visible spanned
+			// rows when every row reaches cell_lo. Rows 0 (ascii), 1 (tab)
+			// and 2 (CJK) all reach cell 2 -- the tab row's leading tab
+			// straddles it, same as block_row_range's own "tab row" case
+			// above.
+			doc.block = true
+			doc.block_anchor_line, doc.block_anchor_cell = 0, 2
+			doc.block_cursor_line, doc.block_cursor_cell = 2, 6
+			nA := block_selection_rects(&doc, &t, px, cw, 5, rectq[:])
+			cA := nA == 3
+			if !cA {fail = true}
+			fmt.printfln("  %-6s quad count == spanned rows reaching cell_lo: n=%d (want 3)", "ok" if cA else "FAIL", nA)
+
+			// Fill colour is the same role the linear selection uses -- a
+			// rectangle is still a selection, not a new colour.
+			cCol := nA > 0 && rectq[0].color == g_theme[.Selection_Doc]
+			if !cCol {fail = true}
+			fmt.printfln("  %-6s fill colour is g_theme[.Selection_Doc]: got=%v want=%v", "ok" if cCol else "FAIL", rectq[0].color, g_theme[.Selection_Doc])
+
+			// B: requirement 2 -- a row too short to reach cell_lo emits no
+			// quad. Line 2 (CJK, 11 cells) reaches cells [8,10); line 3
+			// ("short", 5 cells) does not, and must contribute nothing --
+			// not a padded/clamped quad, nothing at all.
+			doc.block_anchor_line, doc.block_anchor_cell = 2, 8
+			doc.block_cursor_line, doc.block_cursor_cell = 3, 10
+			nB := block_selection_rects(&doc, &t, px, cw, 5, rectq[:])
+			cB := nB == 1
+			if !cB {fail = true}
+			fmt.printfln("  %-6s row too short for cell_lo emits no quad: n=%d (want 1, CJK row only)", "ok" if cB else "FAIL", nB)
+
+			// C: requirement 1 -- a zero-width rectangle (cell_lo == cell_hi)
+			// draws a thin bar on every spanned row, not nothing. Cell 0
+			// sits exactly on a rune boundary on all three rows (ascii, tab
+			// and CJK each start a rune there), so byte_lo == byte_hi on
+			// every one and the floor below is what makes it visible.
+			doc.block_anchor_line, doc.block_anchor_cell = 0, 0
+			doc.block_cursor_line, doc.block_cursor_cell = 2, 0
+			nC := block_selection_rects(&doc, &t, px, cw, 5, rectq[:])
+			cC := nC == 3
+			for i in 0 ..< nC {
+				if rectq[i].size.x != 2 {cC = false}
+			}
+			if !cC {fail = true}
+			fmt.printfln("  %-6s zero-width rectangle draws a thin bar per row: n=%d widths=%v (want 3, all 2px)", "ok" if cC else "FAIL", nC, rectq[:nC])
+
+			block_clear(&doc)
+		}
+
+		// D: a row block_row_range itself refuses (ok=false, cell_hi
+		// genuinely past BLOCK_ROW_CAP) must not draw a quad either --
+		// drawing it as empty, or as far as the walk got, would show a
+		// boundary that isn't where the rectangle actually ends.
+		{
+			long2 := make([]u8, BLOCK_ROW_CAP + 500)
+			for i in 0 ..< len(long2) {long2[i] = 'x'}
+			ldoc2 := doc_from_content(long2, "", .UTF8)
+			defer doc_close(&ldoc2)
+			ldoc2.wrap = false
+			ldoc2.block = true
+			ldoc2.block_anchor_line, ldoc2.block_anchor_cell = 0, BLOCK_ROW_CAP - 2
+			ldoc2.block_cursor_line, ldoc2.block_cursor_cell = 0, BLOCK_ROW_CAP + 50
+			px := f32(16)
+			cw := plat.text_char_width(&t, px, .Doc)
+			rectq: [4]plat.Quad
+			nD := block_selection_rects(&ldoc2, &t, px, cw, 2, rectq[:])
+			cD := nD == 0
+			if !cD {fail = true}
+			fmt.printfln("  %-6s row block_row_range refuses (cell_hi past BLOCK_ROW_CAP) emits no quad: n=%d (want 0)", "ok" if cD else "FAIL", nD)
+		}
+
+		// E/F/G: viewport clipping, byte-range inclusion (not row-index
+		// arithmetic), and out-buffer truncation, all against a fresh
+		// 4-line fixture.
+		{
+			cdoc := doc_from_content(transmute([]u8)strings.clone("l0\nl1\nl2\nl3\n"), "", .UTF8)
+			defer doc_close(&cdoc)
+			cdoc.wrap = false
+			px := f32(16)
+			cw := plat.text_char_width(&t, px, .Doc)
+			rectq: [8]plat.Quad
+
+			// E: rows clip to the viewport (the same capped Visible_Iter the
+			// other three screen passes use), not walked past `rows`. A
+			// rectangle spanning all 4 lines must still only emit 2 quads
+			// when only 2 rows are visible.
+			cdoc.block = true
+			cdoc.block_anchor_line, cdoc.block_anchor_cell = 0, 0
+			cdoc.block_cursor_line, cdoc.block_cursor_cell = 3, 1
+			nE := block_selection_rects(&cdoc, &t, px, cw, 2, rectq[:])
+			cE := nE == 2
+			if !cE {fail = true}
+			fmt.printfln("  %-6s rows clip to the viewport: n=%d (want 2 of 4 spanned rows, rows=2)", "ok" if cE else "FAIL", nE)
+
+			// F: inclusion is by BYTE RANGE, not "visible row r is logical
+			// line line_lo + r" -- doc.top is set to line 1's own start, so
+			// the FIRST visible row is logical line 1, not line 0. A
+			// rectangle over lines [1,2] must match viewport rows 0 and 1
+			// and exclude row 2 (logical line 3, outside the rectangle).
+			top1, top1_ok := doc_line_start_of_index(&cdoc, 1)
+			cdoc.top = top1 if top1_ok else 0
+			cdoc.block_anchor_line, cdoc.block_anchor_cell = 1, 0
+			cdoc.block_cursor_line, cdoc.block_cursor_cell = 2, 1
+			nF := block_selection_rects(&cdoc, &t, px, cw, 3, rectq[:])
+			cF := top1_ok && nF == 2
+			if !cF {fail = true}
+			fmt.printfln("  %-6s inclusion is by byte range, not row-index arithmetic (doc.top mid-document): n=%d (want 2)", "ok" if cF else "FAIL", nF)
+
+			// G: `out` is a fixed caller buffer -- respected, not written
+			// past. A 4-row rectangle with a 1-slot buffer must truncate to
+			// 1, the same convention doc_selection_rects follows.
+			cdoc.top = 0
+			cdoc.block_anchor_line, cdoc.block_anchor_cell = 0, 0
+			cdoc.block_cursor_line, cdoc.block_cursor_cell = 3, 1
+			small: [1]plat.Quad
+			nG := block_selection_rects(&cdoc, &t, px, cw, 4, small[:])
+			cG := nG == 1
+			if !cG {fail = true}
+			fmt.printfln("  %-6s out buffer truncates rather than overruns: n=%d (want 1, cap=1)", "ok" if cG else "FAIL", nG)
+		}
+
+		// H: the vertical-span resolve (doc_line_start_of_index once for the
+		// top, then block_lines_forward from that already-resolved point for
+		// the bottom) must stay cheap for a rectangle spanning many rows --
+		// the whole reason it does not re-resolve the bottom edge from byte
+		// 0. 200 short lines, a rectangle over all of them, 100 visible
+		// rows: resolving per row here would be ~40x the measured 2.9ms/
+		// call-at-cap cost class (the HARD CONSTRAINT this task was warned
+		// about); this must land in low single-digit milliseconds instead.
+		{
+			nlines := 200
+			pdoc := doc_from_content(transmute([]u8)strings.clone(strings.repeat("x\n", nlines, context.temp_allocator)), "", .UTF8)
+			defer doc_close(&pdoc)
+			pdoc.wrap = false
+			pdoc.block = true
+			pdoc.block_anchor_line, pdoc.block_anchor_cell = 0, 0
+			pdoc.block_cursor_line, pdoc.block_cursor_cell = nlines - 1, 1
+			px := f32(16)
+			cw := plat.text_char_width(&t, px, .Doc)
+			rectq := make([]plat.Quad, 100, context.temp_allocator)
+			pstart := time.now()
+			nH := block_selection_rects(&pdoc, &t, px, cw, 100, rectq)
+			pms := time.duration_milliseconds(time.since(pstart))
+			cH := nH == 100 && pms < 50
+			if !cH {fail = true}
+			fmt.printfln("  %-6s vertical span resolve stays cheap across many rows: n=%d elapsed=%.2fms (want 100, <50ms)", "ok" if cH else "FAIL", nH, pms)
+		}
+
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
 		return true
 	}

@@ -427,6 +427,140 @@ block_set_from_points :: proc(doc: ^Document, t: ^plat.Text, a_line, a_cell, c_l
 	return .None
 }
 
+// --- Task 4: drawing the rectangle ---
+
+// Byte offset of the start of logical line `to_line`, walking FORWARD from
+// `from` -- the already-resolved byte start of `from_line` -- rather than
+// from the document's start. doc_line_start_of_index (above) always resolves
+// relative to byte 0, spending its whole DOC_LINE_INDEX_CAP budget just
+// reaching `from_line`; re-deriving the rectangle's BOTTOM edge the same way
+// would spend a second cap's worth of budget reaching `to_line`'s ABSOLUTE
+// position in the file, so a rectangle sitting deep in a large file would
+// fail to draw even when it only covers a screenful of rows. Anchoring here
+// at `from` instead makes the walk's cost proportional to (to_line -
+// from_line) -- the rectangle's own height, which is what a per-frame draw
+// can actually afford, not its depth.
+//
+// Same stepping (base.pt_line_end_cap) and the same refuse-rather-than-guess
+// contract as doc_line_start_of_index: `ok` is false if the walk passes
+// DOC_LINE_INDEX_CAP bytes past `from` before reaching `to_line`. If
+// `to_line` is at or past the document's last line, clamps to pt.length (the
+// real end, not a cap break) -- same reasoning as doc_line_start_of_index's
+// own EOF clamp.
+@(private = "file")
+block_lines_forward :: proc(doc: ^Document, from, from_line, to_line: int) -> (start: int, ok: bool) {
+	p := from
+	budget := from + DOC_LINE_INDEX_CAP
+	for _ in from_line ..< to_line {
+		if p >= budget {
+			return p, false
+		}
+		e := base.pt_line_end_cap(&doc.pt, p, budget - p)
+		if e >= doc.pt.length {
+			p = doc.pt.length
+			break
+		}
+		if e >= budget {
+			return p, false
+		}
+		p = e + 1
+	}
+	return p, true
+}
+
+// Selection highlight rectangles for a column rectangle's visible rows -- the
+// block-select counterpart to doc_selection_rects (doc.odin), same shape, so
+// main.odin's draw call picks between the two on block_active(doc). Every
+// byte range drawn here comes from block_row_range -- never a second,
+// independently-derived cell walk -- because Task 6's edit calls the exact
+// same procedure on the exact same rows: if this draw and that edit each
+// worked out their own byte ranges, they could drift apart, and the user
+// would edit something other than what they saw highlighted. See this file's
+// package comment for why that single-source rule is the whole point of the
+// feature.
+block_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: int, out: []plat.Quad) -> int {
+	if !block_active(doc) {return 0}
+	line_lo, line_hi, cell_lo, cell_hi := block_bounds(doc)
+
+	// Resolve the rectangle's vertical span to BYTES once per draw call, not
+	// once per row -- doc_line_start_of_index costs ~2.9ms per call at its
+	// cap (debug build), so calling it per visible row (~40/frame) would cost
+	// ~120ms in a single frame. line_lo's own byte offset must come from
+	// doc_line_start_of_index (the only anchor it has: doc start); line_hi's
+	// is then found by walking FORWARD from that already-resolved point
+	// (block_lines_forward above), not by a second doc-start-anchored call.
+	span_lo, lo_ok := doc_line_start_of_index(doc, line_lo)
+	if !lo_ok {
+		// The rectangle's own top could not be resolved within
+		// DOC_LINE_INDEX_CAP bytes of the document start -- refuse rather
+		// than guess a span that might not actually bound the rectangle,
+		// same rule as every other cap in this file. Known gap (see the
+		// task-4 report): block_extend/block_set_from_points can seed a
+		// corner up to STATUS_LINE_CAP (4 MiB) deep, larger than
+		// DOC_LINE_INDEX_CAP (512 KiB) here, so a rectangle can exist that
+		// far in and still fail to draw.
+		return 0
+	}
+	span_hi, hi_ok := block_lines_forward(doc, span_lo, line_lo, line_hi + 1)
+	if !hi_ok {
+		return 0 // same refusal, for the rectangle's bottom edge
+	}
+
+	col := g_theme[.Selection_Doc]
+	lh := line_height(px)
+	it := visible_begin(doc, t, rows)
+	n := 0
+	for n < len(out) {
+		row, start, _, _, _, wrapped, ok := visible_next(&it)
+		if !ok {break}
+		// Byte-range inclusion, not line-number arithmetic: a logical line
+		// longer than RENDER_LINE_CAP is split into several capped rows by
+		// the viewport iterator (doc.odin), each drawn as its own screen row
+		// with its own cell-0 origin -- the same convention the ordinary
+		// text draw already uses for such a line. Comparing byte ranges
+		// (rather than assuming visible row r is logical line line_lo + r)
+		// handles that split for free and also means doc.top need not sit at
+		// the rectangle's own top line.
+		if start < span_lo || start >= span_hi {continue}
+
+		byte_lo, byte_hi, pad_cells, rok := block_row_range(doc, t, start, cell_lo, cell_hi)
+		if !rok {
+			// The row's cell walk ran off the end of BLOCK_ROW_CAP without
+			// resolving cell_hi -- block_row_range's own refusal. Drawing
+			// this row anyway (as empty, or as far as the walk got) would
+			// show a boundary that isn't actually where the rectangle ends
+			// on this row; skipping it is the same "a bounded scan that
+			// cannot tell it was truncated must never answer as though it
+			// saw the whole row" rule the rest of this file follows. Task 6
+			// must make the identical call and will refuse the row the same
+			// way, so nothing is ever edited that wasn't shown selected.
+			continue
+		}
+		if pad_cells > 0 {
+			// The row never reached cell_lo -- requirement 2: it
+			// contributes nothing to the selection. Padding is reported for
+			// an edit to use later (Task 6), never drawn or applied here.
+			continue
+		}
+
+		rhs := 0 if wrapped else H_SCROLL
+		startcol := min(line_cell_col(doc, t, start, byte_lo), VISIBLE_COLS)
+		endcol := min(line_cell_col(doc, t, start, byte_hi), VISIBLE_COLS)
+		sx := col_x(char_w, startcol, rhs)
+		ex := col_x(char_w, endcol, rhs)
+		// A zero-width rectangle (cell_lo == cell_hi) resolves byte_lo ==
+		// byte_hi on every row it reaches -- the "N carets in one column"
+		// affordance (requirement 1) -- and a non-zero rectangle can still
+		// collapse to zero width on a row that runs out exactly at cell_lo.
+		// Either way the floor below turns it into a visible thin bar rather
+		// than an invisible 0-px quad -- the same floor doc_selection_rects
+		// (doc.odin) already applies to its own rectangles, not a new rule.
+		out[n] = {pos = {sx, row_rect_y(px, row)}, size = {max(ex - sx, 2), lh}, color = col}
+		n += 1
+	}
+	return n
+}
+
 doc_line_start_of_index :: proc(doc: ^Document, n: int) -> (start: int, ok: bool) {
 	p := 0
 	for _ in 0 ..< n {
