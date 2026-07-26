@@ -4294,6 +4294,57 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		}
 		if block_test_undo_run_break_edit(&t) > 0 {fail = true}
 
+		// doc_absorb_append bypasses push_undo by design (it bumps revision
+		// itself) and used to leave last_block_run set with the rectangle still
+		// live. Reachable while column-editing a file that is being appended to
+		// on disk -- a tailing log -- whenever the buffer length still matches
+		// the disk stamp, which a length-preserving column replace (one byte
+		// over one byte per row, no padding) satisfies. Without the fix, the
+		// next press coalesces onto a snapshot taken before the appended tail,
+		// so one Ctrl+Z would discard bytes that came from disk.
+		block_test_undo_run_absorb_append :: proc(t: ^plat.Text) -> (bad: int) {
+			tmpf := fmt.tprintf("%s%cnewtpad_block_absorb.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+			plat.file_write_atomic(tmpf, transmute([]u8)string("alpha\nbravo\ncharlie\n"))
+			doc, ok := doc_open(tmpf)
+			if !ok {
+				fmt.println("  FAIL   block_test_undo_run_absorb_append: could not open temp file")
+				return 1
+			}
+			defer doc_close(&doc)
+			doc.wrap = false
+
+			doc.block = true
+			doc.block_run += 1
+			doc.block_anchor_line_start = 0
+			doc.block_anchor_cell = 0
+			doc.block_cursor_line_start = 12 // "charlie" line start
+			doc.block_cursor_cell = 1
+
+			// A width-1 rectangle [0,1) replaced with a single-byte "x" swaps
+			// one existing byte for one byte per row -- length-preserving, so
+			// pt.length still matches doc.disk_stamp.size afterward, the
+			// precondition doc_absorb_append checks. (A zero-width rectangle,
+			// as the other undo-run cases use, INSERTS instead and would grow
+			// the buffer past the disk stamp.)
+			block_replace(&doc, t, transmute([]u8)string("x"))
+
+			f, fok := os.open(tmpf, os.O_WRONLY | os.O_APPEND)
+			if fok == os.ERROR_NONE {
+				os.write(f, transmute([]u8)string("delta\n"))
+				os.close(f)
+			}
+			s := plat.file_stamp(tmpf)
+			absorbed := doc_absorb_append(&doc, s.size)
+
+			block_replace(&doc, t, transmute([]u8)string("y"))
+			two := len(doc.undo) == 2
+			ok_all := absorbed && two
+			fmt.printfln("  %-6s doc_absorb_append between two block edits does not coalesce them: absorbed=%v undo entries=%d (want 2)", "ok" if ok_all else "FAIL", absorbed, len(doc.undo))
+			if !ok_all {bad += 1}
+			return
+		}
+		if block_test_undo_run_absorb_append(&t) > 0 {fail = true}
+
 		// SEAM PROOF: the assertion the previous round's clipboard fix
 		// lacked. block_test_an (above) only proves block_test_ai's OWN
 		// save/restore works; it says nothing about block_test_t,

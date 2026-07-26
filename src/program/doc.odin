@@ -1272,13 +1272,18 @@ doc_batch_begin_run :: proc(doc: ^Document, kind: Edit_Kind, run: int) {
 	doc.last_block_run = run // after push_undo, which clears it
 }
 
-// `count` accumulates across a continued run, so the history reads "Deleted 20
-// times" for a held Backspace rather than "1" written twenty times over one entry.
+// `count` labels the resulting state with the rows THIS press edited. It cannot
+// accumulate across the run: push_undo unconditionally zeroes last_block_run
+// before this runs (see push_undo's comment -- that ordering is what makes the
+// break condition complete), so by the time we get here the token this batch
+// began with never survives to be compared against. A coalesced run is
+// therefore labelled by its last press -- "x3" for a held key over a 3-row
+// rectangle, not an accumulated "x60" -- which is also the more truthful
+// number: the entry restores three columns, not sixty rows.
 doc_batch_end_run :: proc(doc: ^Document, count, run: int) {
 	if !doc.batch {return}
 	doc.batch = false
-	continued := run != 0 && run == doc.last_block_run
-	doc.state_count = max(doc.state_count + count, 1) if continued else max(count, 1)
+	doc.state_count = max(count, 1)
 	// doc_batch_end sets last_edit = .None so a later keystroke cannot coalesce
 	// into a batch. A column run is the one case where the next press must, so
 	// the kind is left alone and the run token is what gates it.
@@ -1411,6 +1416,11 @@ doc_absorb_append :: proc(doc: ^Document, new_size: i64) -> bool {
 		doc.anchor = doc.cursor
 	}
 	find_invalidate(doc) // match offsets past the old end are now stale
+	// This bypasses push_undo, so a live column run's token would otherwise
+	// survive an append. The next press would then coalesce onto a snapshot
+	// taken before the appended tail, and one Ctrl+Z would discard bytes that
+	// came from disk, not from the user's edit.
+	doc.last_block_run = 0
 	return true
 }
 
