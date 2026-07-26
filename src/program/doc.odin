@@ -2417,6 +2417,18 @@ doc_draw :: proc(
 
 		draw_len := min(vis_end - start, len(line_buf))
 		n := base.pt_read(&doc.pt, start, line_buf[:draw_len])
+		// An EMPTY row skips this whole block, syntax highlighting included, so
+		// hl_state does not advance across a blank line — while the background
+		// index (lex_index_worker, lex_index.odin) lexes every line including
+		// the empty ones. The two only agree because a blank line is
+		// state-preserving in all five stateful grammars: lex_xml and lex_c
+		// carry an open comment through it untouched, and lex_markdown and
+		// lex_yaml each handle "blank line inside my construct" explicitly
+		// (a fenced block, a block scalar), as does lex_shell's <# #>. A sixth
+		// stateful lexer whose state a blank line can CHANGE — an
+		// indentation-sensitive grammar where a blank line closes a block,
+		// say — breaks that agreement here rather than in itself, and would
+		// need this guard restructured so the lexer still sees the row.
 		if n > 0 {
 			// Line number, when the filter view is showing lines out of context.
 			if GUTTER_W > 0 {
