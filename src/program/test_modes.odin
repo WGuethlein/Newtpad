@@ -1779,6 +1779,40 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			if !okw {bad += 1}
 		}
 
+		fmt.println("--- a link past the wrapped-row scan caps ---")
+		// Same shape as the syntax highlighter's wrapped-row bug (see
+		// doc_row_lex_extent, doc.odin): the wrapped branch below discards
+		// pt_line_start_cap's `exact` flag and caps its whole-line read at
+		// LINK_SCAN_CAP, so on a logical line longer than either cap it hands
+		// the rebase a window that cannot contain the row -- and every row past
+		// it is skipped, silently, with no links at all.
+		//
+		// Reachable only with the user's word wrap ON: a line whose newline sits
+		// beyond WRAP_START_CAP never force-wraps (line_wrap_decision). The URL
+		// here sits at byte ~9000, past both LINK_SCAN_CAP (4096) and
+		// WRAP_START_CAP (8192).
+		{
+			tt: plat.Text
+			plat.text_load_faces(&tt)
+			url := "https://example.com/deep"
+			line := strings.concatenate({strings.repeat("x", 9000), " ", url, "\n"})
+			wd := doc_from_content(transmute([]u8)line, "", .UTF8)
+			defer doc_close(&wd)
+			wd.wrap = true // only the wrap setting produces wrapped rows this far in
+			wd.view_cols = 80
+			wd.view_rows = 200
+			hits := links_layout(&wd, &tt, 200)
+			cells, resolved := 0, false
+			for h in hits {
+				if h.link.kind != .URL {continue}
+				cells += h.span_len
+				if tgt, ok := link_resolve(&wd, h.text, h.link); ok && tgt.is_url && tgt.url == url {resolved = true}
+			}
+			okd := cells == len(url) && resolved
+			fmt.printfln("  %d/%d cells covered, resolves=%v %s", cells, len(url), resolved, "OK" if okd else "FAIL")
+			if !okd {bad += 1}
+		}
+
 		fmt.printfln("linktest: %d failures", bad)
 		return true
 	}

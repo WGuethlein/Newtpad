@@ -438,7 +438,43 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 	for {
 		row, start, end, vis_end, _, wrapped, ok := visible_next(&it)
 		if !ok {break}
-		if !wrapped {
+
+		// A wrapped row is normally scanned as part of its whole logical line
+		// (below), but only when that line is actually reachable: both scans
+		// bounding it are capped, and a capped scan that came up short must not
+		// be treated as though it saw the line.
+		//
+		//   - pt_line_start_cap reports exact=false past WRAP_START_CAP bytes
+		//     into a line: what comes back is a scan floor that slides with the
+		//     row, not a line start.
+		//   - the read below stops at LINK_SCAN_CAP, so on a longer line it
+		//     cannot cover a row past that point.
+		//
+		// Either way the rebase window ([row_off, row_end_off)) comes out empty
+		// and the row is skipped — no underline, nothing clickable — on a
+		// silently wrong premise, and the sliding floor makes the cache miss
+		// once per row on top of it. Reachable only with word wrap ON, since a
+		// line whose newline is past WRAP_START_CAP never force-wraps
+		// (line_wrap_decision, doc.odin). This is the same bug, and the same
+		// treatment, as doc_row_lex_extent's in the syntax highlighter: fall
+		// back to scanning the ROW's own bytes. A link straddling the wrap
+		// point then resolves to only its part of the row rather than whole,
+		// which is a real (documented) loss — but it applies only to rows that
+		// currently produce nothing at all.
+		lls, lend := 0, 0
+		row_local := !wrapped
+		if wrapped {
+			exact: bool
+			lls, exact = base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
+			if exact {
+				lend = base.pt_line_end_cap(&doc.pt, lls, LINK_SCAN_CAP)
+				row_local = end > lend
+			} else {
+				row_local = true
+			}
+		}
+
+		if row_local {
 			// [start, vis_end), not end: a link at EOL must not absorb a CRLF's CR.
 			draw_len := min(vis_end - start, len(line_buf), LINK_SCAN_CAP)
 			if draw_len <= 0 {continue}
@@ -447,17 +483,18 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 			text := strings.clone(string(line_buf[:n]), allocator) // outlive the loop
 			for l in links_scan(text, allocator) {
 				col, cells := plat.text_span_cells(t, text, l.start, l.len, .Doc)
-				append(&out, Link_Hit{row = row, col = col, cells = cells, span_start = l.start, span_len = l.len, wrapped = false, text = text, link = l})
+				// `wrapped` still comes from the iterator, not from which branch
+				// took the row: it is what tells links_hit whether the
+				// horizontal pan applies (a wrapped row ignores it).
+				append(&out, Link_Hit{row = row, col = col, cells = cells, span_start = l.start, span_len = l.len, wrapped = wrapped, text = text, link = l})
 			}
 			continue
 		}
 
-		// Wrapped row: scan its logical line once (bounded — a wrapped line is
-		// <= WRAP_START_CAP), then emit the portion of each link that lands here.
-		lls, _ := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
+		// Wrapped row whose whole logical line IS reachable: scan it once, then
+		// emit the portion of each link that lands here.
 		if lls != cur_lls {
 			cur_lls = lls
-			lend := base.pt_line_end_cap(&doc.pt, lls, LINK_SCAN_CAP)
 			cur_line, cur_links = "", nil
 			if lend > lls {
 				buf := make([]u8, lend - lls, allocator)
