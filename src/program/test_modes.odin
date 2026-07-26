@@ -4455,7 +4455,6 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			hl_bytes_examined = 0
 			line_buf: [VISIBLE_COLS]u8
 			hl_cache: Highlight_Row_Cache
-			hl_cache.cur_lls = -1
 			it := visible_begin(doc, t, rows)
 			for {
 				_, start, end, vis_end, _, wrapped, ok := visible_next(&it)
@@ -4535,7 +4534,6 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			wd.view_cols = 10
 
 			wcache: Highlight_Row_Cache
-			wcache.cur_lls = -1
 			line_buf: [VISIBLE_COLS]u8
 			total_len, first_start := 0, -1
 			bounds_ok := true
@@ -4565,6 +4563,127 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				len(digits),
 				first_start,
 				bounds_ok,
+			)
+		}
+
+		// Wrapped rows PAST WRAP_START_CAP -- the case the rebase check above
+		// cannot reach, because its line is 26 bytes long. One logical line of
+		// ~28 KB with word wrap ON: a line whose own newline sits beyond
+		// WRAP_START_CAP never FORCE-wraps (line_wrap_decision, doc.odin), so
+		// only the user's wrap setting produces wrapped rows this far into a
+		// line -- and once a row starts more than WRAP_START_CAP (8192) bytes
+		// past the line start, pt_line_start_cap can no longer find that start
+		// and returns a scan FLOOR that slides forward with every visual row,
+		// flagged exact=false.
+		//
+		// doc_row_lex_spans used to discard that flag (`lls, _ :=`) and treat
+		// the floor as a line start, which broke both of its outputs at once:
+		// state_in (the state at the PREVIOUS logical line's end) got applied
+		// at an arbitrary mid-line byte and the result reported as what the
+		// WHOLE line ends in, and the rebase window collapsed ([row_off,
+		// row_end_off) is empty once the floor sits exactly RENDER_LINE_CAP
+		// behind the row) so the row drew with no spans at all. Both are
+		// asserted here: the state threaded through the draw path must match
+		// what doc_lex_state_at independently reports for the same byte offset,
+		// and the row after the comment opens must actually be coloured as one.
+		//
+		// The SECOND half of the same bug lives nearer the front of the line
+		// and needs its own marker: for a row whose line start IS findable
+		// (exact=true, anywhere in the first WRAP_START_CAP bytes), the cached
+		// whole-line read is still capped at RENDER_LINE_CAP, so on a line
+		// longer than that it can neither colour nor account for anything past
+		// byte 8192 -- while still reporting its result as the whole line's.
+		// CLOSED_AT puts a complete `/* */` just past that cap, inside the row
+		// that straddles it, so a cache built from a truncated read shows up as
+		// an uncoloured comment rather than only as a wrong state.
+		{
+			CLOSED_AT :: 9000 // just past RENDER_LINE_CAP: inside the row straddling it
+			CLOSED_LEN :: 102 // "/*" + 98 filler + "*/"
+			OPEN_AT :: 20500 // > 2x WRAP_START_CAP into the line: the floor is nowhere near the truth
+			ROW_COLS :: 2000 // no spaces anywhere below, so rows char-break on exactly this stride
+			content := strings.concatenate(
+				{
+					strings.repeat("a", CLOSED_AT, context.temp_allocator),
+					"/*", // a COMPLETE comment, past the cached read's cap
+					strings.repeat("z", CLOSED_LEN - 4, context.temp_allocator),
+					"*/",
+					strings.repeat("a", OPEN_AT - CLOSED_AT - CLOSED_LEN, context.temp_allocator),
+					"/*", // opens a block comment that never closes: every byte past here is In_Comment
+					strings.repeat("b", 8000, context.temp_allocator),
+					"\n",
+				},
+				context.temp_allocator,
+			)
+			cd: Document
+			cd.pt = base.pt_init(transmute([]u8)content)
+			defer base.pt_destroy(&cd.pt)
+			cd.path = "test.c"
+			cd.wrap = true
+			cd.view_cols = ROW_COLS
+
+			cache: Highlight_Row_Cache
+			line_buf: [VISIBLE_COLS]u8
+			all_wrapped := true
+			open_row_start, open_row_end := -1, -1
+			open_row_state := base.Lex_State.Normal
+			next_row_len, next_row_comment := -1, 0
+			straddle_comment := 0 // Comment-coloured bytes on the row spanning RENDER_LINE_CAP
+			hl_state := base.Lex_State.Normal // byte 0 of the document: unambiguously .Normal
+			it := visible_begin(&cd, &t, 20)
+			for {
+				_, start, end, vis_end, _, wrapped, ok := visible_next(&it)
+				if !ok {break}
+				if !wrapped {all_wrapped = false}
+				draw_len := min(vis_end - start, len(line_buf))
+				n := base.pt_read(&cd.pt, start, line_buf[:draw_len])
+				if n <= 0 {continue}
+				hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				hn: int
+				hn, hl_state = doc_row_lex_spans(&cd, &cache, start, end, wrapped, line_buf[:n], hl_state, hl_buf[:])
+				if start <= CLOSED_AT && CLOSED_AT < end {
+					for k in 0 ..< hn {
+						if hl_buf[k].color == g_theme[.Syn_Comment] {straddle_comment += hl_buf[k].len}
+					}
+				}
+				// The row the comment opens ON, then the row after it -- that
+				// one is entirely inside the comment, so entirely one span.
+				if start <= OPEN_AT && OPEN_AT < end {
+					open_row_start, open_row_end = start, end
+					open_row_state = hl_state
+				} else if open_row_end == start && next_row_len < 0 {
+					next_row_len = end - start
+					for k in 0 ..< hn {
+						if hl_buf[k].color == g_theme[.Syn_Comment] {next_row_comment += hl_buf[k].len}
+					}
+				}
+			}
+			// Ground truth for the same byte offset through the independent
+			// mechanism (lex_index.odin's bounded resync -- this Document was
+			// never handed to lex_index_start, so doc_lex_state_at can't
+			// shortcut to the background index).
+			truth := doc_lex_state_at(&cd, open_row_end, LEX_RESYNC_WINDOW)
+			past_cap := open_row_start > WRAP_START_CAP
+			long_ok :=
+				past_cap &&
+				all_wrapped &&
+				open_row_state == .In_Comment &&
+				truth == open_row_state &&
+				next_row_len > 0 &&
+				next_row_comment == next_row_len &&
+				straddle_comment == CLOSED_LEN
+			if !long_ok {fail = true}
+			fmt.printfln(
+				"  %-6s wrapped row past WRAP_START_CAP: row=[%d,%d) wrapped=%v state=%v truth=%v, next row comment-coloured %d/%d bytes, straddle row %d/%d",
+				"ok" if long_ok else "FAIL",
+				open_row_start,
+				open_row_end,
+				all_wrapped,
+				open_row_state,
+				truth,
+				next_row_comment,
+				next_row_len,
+				straddle_comment,
+				CLOSED_LEN,
 			)
 		}
 
@@ -4752,7 +4871,6 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			wd.view_cols = 200
 
 			cache: Highlight_Row_Cache
-			cache.cur_lls = -1
 			hl_state := doc_lex_state_at(&wd, 0, LEX_RESYNC_WINDOW)
 			line_buf: [VISIBLE_COLS]u8
 			row_comment := [4]bool{false, false, false, false} // does this row carry ANY Comment span?
@@ -5031,7 +5149,6 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 						fail = true
 					} else {
 						cache: Highlight_Row_Cache
-						cache.cur_lls = -1
 						line_buf: [VISIBLE_COLS]u8
 						hl_state := doc_lex_state_at(&xd, 0, LEX_RESYNC_WINDOW)
 						it := visible_begin(&xd, &t, 5)

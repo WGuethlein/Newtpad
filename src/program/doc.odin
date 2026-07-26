@@ -2173,9 +2173,10 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 // timestamp pattern is anchored to the true line start, and any token can
 // straddle the wrap point, so the whole (capped) logical line is lexed once
 // and its spans rebased onto each visual row in turn, rather than re-lexing
-// a partial, possibly-truncated segment per row. Zero-value is not usable —
-// cur_lls must start at -1, a value no real line start can equal — so
-// callers must set that explicitly (see doc_draw).
+// a partial, possibly-truncated segment per row. The zero value IS a usable
+// empty cache — cur_whole false means "holds nothing," so the first row of a
+// pass always misses. (It used to need cur_lls seeded to -1, a value no real
+// line start can equal; cur_whole subsumes that sentinel.)
 //
 // cur_state_out is the Lex_State the WHOLE cached logical line ends in —
 // computed once, the same call that fills cur_buf — and handed back
@@ -2183,12 +2184,77 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 // that actually starts a new logical line needs a fresh, caller-supplied
 // state_in; every other visual row of an already-wrapped line reuses the
 // cached tokens and the cached state_out, both fixed once the line is lexed.
+//
+// cur_whole is what makes that claim conditional rather than assumed: the
+// cache can only speak for a whole logical line when doc_row_lex_extent said
+// so (its comment has the two ways that fails). When it is false the cache
+// holds nothing and every row of that line lexes its own extent instead —
+// see doc_row_lex_spans.
+//
+// cur_line_buf is the cached line's bytes, a fixed array rather than a
+// per-row make(): the whole point of the cache is that a wrapped row costs
+// nothing extra, and RENDER_LINE_CAP bounds the read by construction (a line
+// that doesn't fit in it is exactly the cur_whole=false case). Its live
+// length is cur_len, kept as an int rather than a string field so the struct
+// never holds a pointer into itself.
 Highlight_Row_Cache :: struct {
 	cur_lls:       int,
-	cur_line:      string,
+	cur_line_buf:  [RENDER_LINE_CAP]u8,
+	cur_len:       int,
 	cur_buf:       [HL_MAX_ROW_TOKENS]plat.Text_Span,
 	cur_n:         int,
+	cur_whole:     bool,
 	cur_state_out: base.Lex_State,
+}
+
+// The byte range a row's syntax spans are lexed from, and whether that range
+// is the row's WHOLE logical line (so the result is cacheable and shared by
+// every visual row of it) or just this row's own extent.
+//
+// ONE decision, two consumers — doc_row_lex_spans and doc_draw's first-row
+// state bootstrap — because they must agree about where `state_in` belongs.
+// The bootstrap resolves the state at `from`; doc_row_lex_spans begins lexing
+// at `from`. Split across two sites they diverged: the bootstrap resolved at
+// a line start the row loop then didn't lex from.
+//
+// A wrapped row uses its whole logical line UNLESS either bound fails, and
+// both failures have the same shape — a bounded scan that cannot see far
+// enough must not pretend it did:
+//
+//   - pt_line_start_cap reports exact=false: no newline within WRAP_START_CAP
+//     behind `start`, so what came back is a scan FLOOR that slides with
+//     `start`, not a line start. Applying `state_in` (the state at the
+//     PREVIOUS logical line's end) there is a confident wrong answer, and
+//     since the floor moves with every visual row it also defeats the cache
+//     it feeds — every row past 8 KiB into the line would re-read and re-lex.
+//   - pt_line_end_cap hit its cap: the line is longer than RENDER_LINE_CAP,
+//     so a read from `lls` cannot reach its end and the state it produces is
+//     the state at a truncated read's end, not at the line's end — which is
+//     what the cache hands out as "what this WHOLE line ends in."
+//
+// Falling back to the row's own extent is correct for the caller's state
+// threading because successive visual rows of one logical line are a
+// contiguous byte stream: visible_next sets the next row's `pos` to exactly
+// this row's `end` at a wrap point (doc.odin's wrap branch; "a wrap point
+// belongs to the next visual row's start"), so row-to-row threading of the
+// state at `end` is the same thing the !wrapped path already relies on.
+doc_row_lex_extent :: proc(doc: ^Document, start, end: int, wrapped: bool) -> (from, to: int, whole_line: bool) {
+	if wrapped {
+		lls, exact := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
+		if exact {
+			lend := base.pt_line_end_cap(&doc.pt, lls, RENDER_LINE_CAP)
+			// pt_line_end_cap returns min(length, lls+cap) when it finds no
+			// newline, so "stopped short of the cap, or ran out of document"
+			// is exactly "this is a real line end." A line of precisely
+			// RENDER_LINE_CAP bytes is indistinguishable from a truncated one
+			// here and is treated as truncated: conservative, and it only
+			// costs that one line the shared cache.
+			if lend < lls + RENDER_LINE_CAP || lend >= doc.pt.length {
+				return lls, lend, true
+			}
+		}
+	}
+	return start, min(end, start + RENDER_LINE_CAP), false
 }
 
 // Row-relative syntax spans for one visible row, handling the wrap rebase
@@ -2207,12 +2273,19 @@ Highlight_Row_Cache :: struct {
 // this proc only threads whatever state_in it is given through to the lexer
 // and reports what it ends in.
 //
-// `state_in` is the Lex_State in effect at `start` (this row's logical
-// line's start, not necessarily this row's own start when wrapped).
-// `state_out` is what the WHOLE logical line ends in — identical across
-// every visual row of a wrapped line, so the caller can hold it and only
-// advance to the next logical line's start once `line_end` is reached
-// (doc_draw does exactly this).
+// `state_in` is the Lex_State in effect at doc_row_lex_extent's `from` for
+// this row — its logical line's start on the whole-line path, this row's own
+// `start` otherwise. doc_draw's bootstrap resolves it through that same proc,
+// so the two cannot disagree about which one it is.
+//
+// `state_out` follows the same split. On the whole-line path it is what the
+// WHOLE logical line ends in — identical across every visual row of that
+// line, so the caller can hold it and only advance once `line_end` is
+// reached (doc_draw does exactly this). On the row-extent path it is what
+// THIS ROW's bytes end in, which is what the next visual row starts in:
+// successive rows of one logical line are contiguous (see
+// doc_row_lex_extent), so threading it forward row to row is correct, and is
+// what the !wrapped path has always done.
 doc_row_lex_spans :: proc(
 	doc: ^Document,
 	cache: ^Highlight_Row_Cache,
@@ -2222,7 +2295,57 @@ doc_row_lex_spans :: proc(
 	state_in: base.Lex_State,
 	out: []plat.Text_Span,
 ) -> (n: int, state_out: base.Lex_State) {
-	if !wrapped {
+	if wrapped {
+		// The cache serves any row whose bytes lie inside the logical line it
+		// already holds — checked directly against that line's extent rather
+		// than by re-deriving `lls` per row, so the common case (every visual
+		// row after the first of a wrapped line) costs nothing but this
+		// comparison.
+		if !(cache.cur_whole && start >= cache.cur_lls && end <= cache.cur_lls + cache.cur_len) {
+			from, to, whole := doc_row_lex_extent(doc, start, end, true)
+			cache.cur_lls = from
+			cache.cur_len = 0
+			cache.cur_n = 0
+			cache.cur_whole = whole
+			cache.cur_state_out = state_in // nothing to lex: state passes through
+			if whole && to > from {
+				// `to - from` is bounded by RENDER_LINE_CAP by construction
+				// (doc_row_lex_extent only returns whole_line when the line
+				// end came back inside that cap); the min mirrors the
+				// !wrapped path's own read below rather than trusting that
+				// invariant from a distance.
+				cache.cur_len = base.pt_read(&doc.pt, from, cache.cur_line_buf[:min(to - from, len(cache.cur_line_buf))])
+				cache.cur_n, cache.cur_state_out = highlight_row_spans(
+					doc,
+					cache.cur_line_buf[:cache.cur_len],
+					state_in,
+					cache.cur_buf[:],
+				)
+			}
+		}
+		if cache.cur_whole {
+			row_off := start - cache.cur_lls
+			row_end_off := min(end - cache.cur_lls, cache.cur_len)
+			n = 0
+			for k in 0 ..< cache.cur_n {
+				sp := cache.cur_buf[k]
+				lo := max(sp.start, row_off)
+				hi := min(sp.start + sp.len, row_end_off)
+				if lo >= hi {continue} // this token doesn't touch this row
+				if n >= len(out) {break}
+				// Rebased onto this row: "a wrapped link only colours its part here"
+				// (links.odin) applies identically to a syntax span.
+				out[n] = plat.Text_Span{start = lo - row_off, len = hi - lo, color = sp.color}
+				n += 1
+			}
+			state_out = cache.cur_state_out
+			return
+		}
+		// Not a whole line we can speak for (doc_row_lex_extent said so): this
+		// row lexes its OWN extent, exactly like the !wrapped path below, and
+		// reports the state at the end of THAT extent. Falls through.
+	}
+	{
 		// `row_bytes` is whatever the caller already read for DRAWING —
 		// doc_draw's line_buf is VISIBLE_COLS (2048) wide, but this row's real
 		// extent (`end`) can be up to RENDER_LINE_CAP (8192, 4x more): a long
@@ -2243,36 +2366,6 @@ doc_row_lex_spans :: proc(
 		got := base.pt_read(&doc.pt, start, full[:min(end - start, len(full))])
 		return highlight_row_spans(doc, full[:got], state_in, out)
 	}
-	lls, _ := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
-	if lls != cache.cur_lls {
-		cache.cur_lls = lls
-		lend := base.pt_line_end_cap(&doc.pt, lls, RENDER_LINE_CAP)
-		cache.cur_line = ""
-		cache.cur_n = 0
-		cache.cur_state_out = state_in // nothing to lex: state passes through
-		if lend > lls {
-			buf := make([]u8, lend - lls, context.temp_allocator)
-			got := base.pt_read(&doc.pt, lls, buf)
-			cache.cur_line = string(buf[:got])
-			cache.cur_n, cache.cur_state_out = highlight_row_spans(doc, buf[:got], state_in, cache.cur_buf[:])
-		}
-	}
-	row_off := start - lls
-	row_end_off := min(end - lls, len(cache.cur_line))
-	n = 0
-	for k in 0 ..< cache.cur_n {
-		sp := cache.cur_buf[k]
-		lo := max(sp.start, row_off)
-		hi := min(sp.start + sp.len, row_end_off)
-		if lo >= hi {continue} // this token doesn't touch this row
-		if n >= len(out) {break}
-		// Rebased onto this row: "a wrapped link only colours its part here"
-		// (links.odin) applies identically to a syntax span.
-		out[n] = plat.Text_Span{start = lo - row_off, len = hi - lo, color = sp.color}
-		n += 1
-	}
-	state_out = cache.cur_state_out
-	return
 }
 
 // Draw visible lines; return the caret's screen rect (if visible) and the byte
@@ -2297,12 +2390,11 @@ doc_draw :: proc(
 	bottom = doc.top
 	// Syntax highlighting: nil lexer for an extension with no grammar (.txt,
 	// or anything not yet wired in highlight.odin) skips the whole pass below
-	// at zero cost. hl_cache.cur_lls starts at -1 (see its comment) so the
-	// first wrapped row this pass sees always misses and lexes its logical
-	// line fresh.
+	// at zero cost. hl_cache's zero value is an empty cache (see its comment),
+	// so the first wrapped row this pass sees always misses and lexes its
+	// logical line fresh.
 	hl_lexer, _, _, _ := highlight_lexer_for(doc.path)
 	hl_cache: Highlight_Row_Cache
-	hl_cache.cur_lls = -1
 	// The Lex_State carried into the row about to be drawn. In the filter
 	// view every row is a non-contiguous logical line (row N+1 can be 10,000
 	// lines below row N), so each one resolves its own state independently
@@ -2366,38 +2458,32 @@ doc_draw :: proc(
 					hl_state = doc_lex_state_at(doc, start, LEX_FILTER_RESYNC_WINDOW)
 				} else if !hl_state_ready {
 					// Contiguous viewport: only the very first row needs a
-					// real lookup, but WRAPPED and non-wrapped first rows need
-					// it resolved at different offsets, matching what
-					// doc_row_lex_spans is about to do with it:
+					// real lookup, and it must be resolved at exactly the
+					// offset doc_row_lex_spans is about to start lexing from —
+					// which is doc_row_lex_extent's `from`, the SAME proc
+					// doc_row_lex_spans asks. Two sites deciding this
+					// separately is how they came apart before:
 					//
-					// - Wrapped: the top row may be a wrap CONTINUATION, not
-					//   its logical line's true start. doc_row_lex_spans's
-					//   wrapped branch re-lexes the whole cached logical line
-					//   from THAT true start (WRAP_START_CAP back) every time
-					//   it sees a fresh lls, so state_in must be resolved
-					//   there too, or the whole-line lex begins from the wrong
-					//   state.
-					// - Non-wrapped: doc_row_lex_spans's !wrapped branch now
-					//   lexes the row's OWN [start,end) extent directly (see
-					//   its comment) rather than anything further back. This
-					//   used to be the bug here: for a RENDER_LINE_CAP-split
-					//   continuation row (chunk 2+ of a long unwrapped line),
-					//   resolving state at pt_line_start_cap's WRAP_START_CAP-
-					//   bounded guess — which for a line longer than that cap
-					//   lands neither at the true line start nor at `start`,
-					//   but partway between — meant the bytes between that
-					//   guess and `start` were never lexed at all. Resolving
-					//   directly AT `start` is correct even when `start` sits
-					//   mid-logical-line: lex_resync_state's forward walk is
-					//   chunk-relative to wherever it finds the anchor, not
-					//   dependent on `target` being a real line start (see its
-					//   comment).
-					if wrapped {
-						lls, _ := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
-						hl_state = doc_lex_state_at(doc, lls, LEX_RESYNC_WINDOW)
-					} else {
-						hl_state = doc_lex_state_at(doc, start, LEX_RESYNC_WINDOW)
-					}
+					// - Wrapped whole-line rows: the top row may be a wrap
+					//   CONTINUATION, not its logical line's true start, and
+					//   doc_row_lex_spans re-lexes the whole cached line from
+					//   that true start, so state_in must be resolved there
+					//   too or the whole-line lex begins from the wrong state.
+					// - Row-extent rows (never wrapped, or wrapped but past
+					//   one of doc_row_lex_extent's two bounds): the row lexes
+					//   its OWN [start,end) extent, so state must be resolved
+					//   at `start`. Resolving at pt_line_start_cap's
+					//   WRAP_START_CAP-bounded guess instead — which for a
+					//   line longer than that cap lands neither at the true
+					//   line start nor at `start`, but partway between — meant
+					//   the bytes in between were never lexed at all.
+					//
+					// Resolving directly AT a mid-logical-line offset is fine:
+					// lex_resync_state's forward walk is chunk-relative to
+					// wherever it finds the anchor, not dependent on `target`
+					// being a real line start (see its comment).
+					from, _, _ := doc_row_lex_extent(doc, start, end, wrapped)
+					hl_state = doc_lex_state_at(doc, from, LEX_RESYNC_WINDOW)
 					hl_state_ready = true
 				}
 				hl_n, hl_state = doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], hl_state, hl_buf[:])
