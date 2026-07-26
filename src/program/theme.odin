@@ -742,6 +742,16 @@ theme_export :: proc(from_name: string, t: Theme) -> (target: string, path: stri
 // Order matters on the failure path: settings.theme_name is updated only after
 // the file exists, so a failed write leaves the app on the theme it was
 // already using rather than pointing at a theme file that isn't there.
+//
+// No delete() before the clone below: settings_default leaves theme_name as
+// the static literal "Dark" until settings.txt actually supplies a
+// theme_name line (settings_load only clones then), so on a fresh install,
+// or a settings.txt written before that key existed, this field can be a
+// pointer into .rdata rather than heap memory -- freeing it would be
+// HeapFree on read-only static memory. This leaks one short name string per
+// theme switch -- the same leak the Settings theme cycle at
+// settings.odin:353 already has, so the two sites are consistent rather
+// than newly divergent.
 theme_edit_current :: proc(app: ^App) -> bool {
 	target, path, ok := theme_export(app.settings.theme_name, g_theme)
 	if !ok {
@@ -749,7 +759,6 @@ theme_edit_current :: proc(app: ^App) -> bool {
 		return false
 	}
 	if app.settings.theme_name != target {
-		delete(app.settings.theme_name)
 		app.settings.theme_name = strings.clone(target)
 		g_theme = theme_resolve(target)
 		settings_save(app.settings)

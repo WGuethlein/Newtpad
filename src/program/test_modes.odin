@@ -3294,12 +3294,53 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				os.remove(path)
 			}
 
-			// The command's whole job: produce a file, point settings at it,
-			// and leave g_theme resolved from that file rather than from the
-			// built-in it started as. Tested through theme_edit_current rather
-			// than through the dispatch switch, because opening a tab needs an
-			// App and a window; what is asserted here is the state change the
-			// command is responsible for.
+			// Fresh install: settings_default leaves theme_name as the static
+			// literal "Dark" (never cloned) until settings.txt actually
+			// supplies a theme_name line, and no settings.txt exists yet
+			// under this NEWTPAD_SESSION_DIR. This is the reachable crash a
+			// stray delete() on theme_name used to hit -- HeapFree on a
+			// pointer into .rdata -- so this case exercises the literal path
+			// directly rather than the cloned one every other case here
+			// starts from.
+			{
+				app_t: App
+				menu_init(&app_t.menu)
+				defer app_destroy(&app_t)
+				app_t.settings = settings_default()
+				g_saved := g_theme
+				g_theme = theme_dark()
+
+				ok_cmd := theme_edit_current(&app_t)
+				switched := app_t.settings.theme_name == "Dark Custom"
+
+				all_ok := ok_cmd && switched
+				if !all_ok {fail = true}
+				fmt.printfln(
+					"  %-6s edit-current-theme survives a literal (un-cloned) theme_name: exported=%v switched=%v",
+					"ok" if all_ok else "FAIL",
+					ok_cmd,
+					switched,
+				)
+				path, pok := theme_active_file_path(app_t.settings.theme_name)
+				if pok {os.remove(path)}
+				g_theme = g_saved
+			}
+
+			// The command's second-invocation shape: the theme file already
+			// exists on disk (as it would after an earlier export or edit), so
+			// theme_export writes nothing here and the state change under test
+			// is purely the settings switch plus the re-resolve --
+			// `g_theme = theme_resolve(target)` inside theme_edit_current.
+			// This pre-writes a distinctive Dark Custom.theme file BEFORE
+			// calling theme_edit_current and reads g_theme directly afterward,
+			// with NO intervening theme_resolve call in this test: calling
+			// theme_resolve a second time here would make this pass even with
+			// that line deleted from the real procedure (verified by deleting
+			// it and rerunning this mode -- see task-4-report.md).
+			//
+			// app_open_path is headless-safe -- it maps and activates a tab
+			// like any other open, no window required -- so the opened tab is
+			// asserted too, not skipped as needing one.
 			{
 				app_t: App
 				menu_init(&app_t.menu)
@@ -3308,26 +3349,31 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 				g_saved := g_theme
 				g_theme = theme_dark()
 
+				path, pok := theme_active_file_path("Dark Custom")
+				want := [4]f32{f32(0x01) / 255, f32(0x02) / 255, f32(0x03) / 255, 1}
+				if pok {
+					_ = os.write_entire_file(path, transmute([]u8)string("base dark\ncaret #010203\n"))
+				}
+				g_before := g_theme
+				before_already_matches := g_before[.Caret] == want
+
 				ok_cmd := theme_edit_current(&app_t)
 				switched := app_t.settings.theme_name == "Dark Custom"
-				path, pok := theme_active_file_path(app_t.settings.theme_name)
 				on_disk := pok && os.exists(path)
+				applied := g_theme[.Caret] == want
+				opened_doc := app_active(&app_t)
+				opened := pok && opened_doc != nil && opened_doc.path == path
 
-				// Editing the file and re-resolving must be visible in g_theme:
-				// this is the property the whole feature rests on.
-				_ = os.write_entire_file(path, transmute([]u8)string("base dark\ncaret #010203\n"))
-				g_theme = theme_resolve(app_t.settings.theme_name)
-				applied := g_theme[.Caret] == [4]f32{f32(0x01) / 255, f32(0x02) / 255, f32(0x03) / 255, 1}
-
-				all_ok := ok_cmd && switched && on_disk && applied
+				all_ok := ok_cmd && switched && on_disk && applied && opened && !before_already_matches
 				if !all_ok {fail = true}
 				fmt.printfln(
-					"  %-6s edit-current-theme: exported=%v switched=%v on_disk=%v reresolved=%v",
+					"  %-6s edit-current-theme (file preexisting): exported=%v switched=%v on_disk=%v reresolved=%v opened=%v",
 					"ok" if all_ok else "FAIL",
 					ok_cmd,
 					switched,
 					on_disk,
 					applied,
+					opened,
 				)
 				if pok {os.remove(path)}
 				g_theme = g_saved
@@ -3343,7 +3389,7 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			{
 				app_t: App
 				menu_init(&app_t.menu)
-				defer app_destroy(&app_t) // frees theme_name; App is zero-is-initialization
+				defer app_destroy(&app_t) // App is zero-is-initialization
 				app_t.settings.theme_name = strings.clone("Dark Custom")
 				path, pok := theme_active_file_path("Dark Custom")
 				g_saved := g_theme
