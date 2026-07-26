@@ -217,9 +217,13 @@ LEX_RESYNC_MAX_CANDIDATES :: 256
 // unbounded-in-practice 2 MiB the try-count bound alone allowed.
 LEX_RESYNC_MAX_VALIDATE_BYTES :: 64 * 1024
 
-// Total bytes handed to a lexer, accumulated across calls: both
-// lex_resync_state's own forward walk AND (since the 2026-07 review above)
-// its candidate-validation loop. The counterpart to highlight.odin's
+// Total bytes lex_resync_state reads from the piece table, accumulated
+// across calls: its backward anchor scan, its candidate-validation loop, and
+// its forward walk -- the same three terms that proc's header comment names
+// as its worst case, so the counter and the claim cover the same ground.
+// (The forward walk was the only one counted originally; the other two were
+// each added by the review that found the assertion depending on them was
+// vacuous without them.) The counterpart to highlight.odin's
 // hl_bytes_examined, but deliberately a SEPARATE counter rather than reusing
 // that one: hl_bytes_examined is only ever touched inside highlight_row_spans,
 // and lex_resync_state calls the lexer directly, never through
@@ -314,7 +318,9 @@ doc_lex_state_at :: proc(doc: ^Document, at: int, window: int) -> base.Lex_State
 // counter's own comment. The real total worst case, honestly: `window`
 // (anchor scan) + LEX_RESYNC_MAX_VALIDATE_BYTES (validation, only when
 // `validate` is non-nil) + `window` (forward lex) — bounded, but no longer
-// just `window`. hl_resync_bytes_examined is a separate counter from
+// just `window`. All three terms are counted into hl_resync_bytes_examined
+// now; the anchor scan was the last one still invisible to it, and it is the
+// term that actually separates a small file from a huge one. hl_resync_bytes_examined is a separate counter from
 // highlight_row_spans's hl_bytes_examined because this proc is called
 // directly by doc_draw's bootstrap and by the filter view, never through
 // highlight_row_spans, so nothing else would ever see this path's cost.
@@ -362,6 +368,18 @@ lex_resync_state :: proc(
 
 	buf := make([]u8, scan_len, context.temp_allocator)
 	got := base.pt_read(&doc.pt, win_start, buf)
+	// The anchor scan's own read is a THIRD cost term, named in this proc's
+	// header comment from the start and never instrumented: up to a full
+	// window from the piece table plus an O(window * len(anchor)) backward
+	// walk over it, per call. Bounded by construction (scan_len <= window),
+	// but a guard-rail that cannot see the thing it guards is how the
+	// candidate loop's cost went unnoticed (IMPORTANT 5 above), and it made
+	// lexstatetest's "window-bounded, not file-bounded" check vacuous: it
+	// asserted a small and a huge file examine EQUAL bytes, and they did --
+	// because the one term that genuinely differs between them (a few hundred
+	// bytes of scan versus a saturated 64 KiB window) was the term nothing
+	// counted.
+	hl_resync_bytes_examined += got
 	scan := buf[:got]
 
 	al := len(anchor)

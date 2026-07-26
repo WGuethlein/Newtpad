@@ -5261,16 +5261,33 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			}
 
 			// Identical tail (the comment-close anchor, the 500-byte filler
-			// line, `target`) on both fixtures -- only the amount of filler
-			// BEFORE that tail differs, and the resync never looks at bytes
-			// before `target - window`, so it should never even see that
-			// prefix. `big` is ~200,000 lines (several MB): if the resync
-			// ever regressed to scanning from byte 0, big_bytes would dwarf
-			// small_bytes instead of matching it.
+			// line, `target`) on all three fixtures -- only the amount of
+			// filler BEFORE that tail differs, and the resync never looks at
+			// bytes before `target - window`.
+			//
+			// This check used to assert small_bytes == big_bytes, and it
+			// passed -- while `big` really did read a saturated 64 KiB window
+			// out of the piece table and `small` a few hundred bytes. The
+			// counter simply could not see the backward anchor scan (see
+			// hl_resync_bytes_examined, lex_index.odin): the test named after
+			// window-bounded cost was measuring only the forward walk, whose
+			// input is the identical tail on both fixtures, so equality was
+			// guaranteed by the fixture rather than earned by the code.
+			//
+			// With the scan counted, the honest claim is what lex_resync_state
+			// actually promises: every call is bounded by its three terms
+			// (2*window + the validation budget) regardless of document size,
+			// and past the point where the window saturates, cost stops
+			// growing entirely -- which is what `bigger`, twice `big`'s size
+			// for the same answer and the same byte count, pins down. `small`
+			// must now come in BELOW `big`, not equal to it: it has less
+			// document behind `target` than the window would allow.
 			small_doc, small_target := build_resync_doc(5)
 			big_doc, big_target := build_resync_doc(200000)
+			bigger_doc, bigger_target := build_resync_doc(400000)
 			defer base.pt_destroy(&small_doc.pt)
 			defer base.pt_destroy(&big_doc.pt)
+			defer base.pt_destroy(&bigger_doc.pt)
 
 			hl_resync_bytes_examined = 0
 			small_state, small_cap := lex_resync_state(&small_doc, small_target, LEX_RESYNC_WINDOW, base.lex_xml, "-->")
@@ -5280,21 +5297,33 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			big_state, big_cap := lex_resync_state(&big_doc, big_target, LEX_RESYNC_WINDOW, base.lex_xml, "-->")
 			big_bytes := hl_resync_bytes_examined
 
+			hl_resync_bytes_examined = 0
+			bigger_state, bigger_cap := lex_resync_state(&bigger_doc, bigger_target, LEX_RESYNC_WINDOW, base.lex_xml, "-->")
+			bigger_bytes := hl_resync_bytes_examined
+
+			// The worst case lex_resync_state's own header comment states:
+			// window (anchor scan) + validation budget + window (forward lex).
+			bound := 2 * LEX_RESYNC_WINDOW + LEX_RESYNC_MAX_VALIDATE_BYTES
 			ok :=
 				!small_cap &&
 				!big_cap &&
+				!bigger_cap &&
 				small_state == .Normal &&
 				big_state == .Normal &&
+				bigger_state == .Normal &&
 				small_bytes > 0 &&
-				small_bytes == big_bytes &&
-				small_bytes < LEX_RESYNC_WINDOW
+				small_bytes <= bound &&
+				big_bytes <= bound &&
+				small_bytes < big_bytes && // the scan the counter used to miss
+				big_bytes == bigger_bytes // saturated: 2x the file, same cost
 			if !ok {fail = true}
 			fmt.printfln(
-				"  %-6s resync cost is window-bounded, not file-bounded: small=%d big=%d (want equal, both >0, <%d)",
+				"  %-6s resync cost is window-bounded, not file-bounded: small=%d big=%d bigger=%d (want big==bigger, small<big, all <=%d)",
 				"ok" if ok else "FAIL",
 				small_bytes,
 				big_bytes,
-				LEX_RESYNC_WINDOW,
+				bigger_bytes,
+				bound,
 			)
 		}
 
@@ -5458,24 +5487,33 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			// byte budget can afford to read at ~500 bytes each.
 			window := target - 1
 			state, cap_hit := lex_resync_state(&dd, target, window, lexer, anchor, validate)
-			bytes_examined := hl_resync_bytes_examined
+			// hl_resync_bytes_examined now counts the backward anchor scan's
+			// own read as well, and this fixture's window is deliberately
+			// nearly the whole document, so that term dominates: win_start
+			// lands at 1 and the scan runs from there to `target`, exactly
+			// `window` bytes. Subtract it to isolate the candidate loop, which
+			// is what this check is about -- the two terms are added by
+			// different code and only one of them is what
+			// LEX_RESYNC_MAX_VALIDATE_BYTES bounds.
+			validated_bytes := hl_resync_bytes_examined - window
 			total_decoy_bytes := num_decoys * decoy_line_len
 
 			ok :=
 				cap_hit &&
 				state == .Normal && // the documented cap-hit fallback -- every decoy correctly rejected, none validated
-				bytes_examined > 0 && // was ALWAYS 0 before this fix -- the counter never saw this loop
-				bytes_examined <= LEX_RESYNC_MAX_VALIDATE_BYTES + RENDER_LINE_CAP && // budget + one line's overshoot slack
-				bytes_examined < total_decoy_bytes / 2 // proves the loop bailed EARLY, not after reading close to all 300 decoys
+				validated_bytes > 0 && // was ALWAYS 0 before this fix -- the counter never saw this loop
+				validated_bytes <= LEX_RESYNC_MAX_VALIDATE_BYTES + RENDER_LINE_CAP && // budget + one line's overshoot slack
+				validated_bytes < total_decoy_bytes / 2 // proves the loop bailed EARLY, not after reading close to all 300 decoys
 			if !ok {fail = true}
 			fmt.printfln(
-				"  %-6s candidate-validation cost is counted and byte-capped: examined=%d/%d cap=%v state=%v (budget=%d)",
+				"  %-6s candidate-validation cost is counted and byte-capped: validated=%d/%d cap=%v state=%v (budget=%d, scan=%d)",
 				"ok" if ok else "FAIL",
-				bytes_examined,
+				validated_bytes,
 				total_decoy_bytes,
 				cap_hit,
 				state,
 				LEX_RESYNC_MAX_VALIDATE_BYTES,
+				window,
 			)
 		}
 
