@@ -131,18 +131,37 @@ were the priorities. Read P2 as the live list, with these amendments:
   started. Ruled out: the `@(test)` corpus (removing all twelve `src/base/*_test.odin` changed
   nothing). The remainder is LLVM at `-o:speed`. Belongs in the ship-readiness batch, not to a
   feature batch.
-- **Every keystroke deep-clones the piece tree, so a multi-row edit gets more expensive with each
-  press.** `pt_snapshot` is `clone(pt.root)` — a full copy proportional to piece count — and
-  `doc_batch_begin` takes one per keystroke. A 2,000-row column edit adds ~2,000 pieces per press, so
-  press 1 cost 7.9 ms and press 20 cost **69.5 ms**, still climbing (release build). §6y first
-  attributed this to splice fragmentation and proposed a batched multi-range splice; **that diagnosis
-  was wrong and the fix would not have helped** — the cost is the snapshot, not the splices. The
-  workaround shipped is `BLOCK_EDIT_MAX_LINES :: 300`, a real functional limit on a feature whose
-  headline use is "prefix every line". **Agreed fix: coalesce consecutive block edits into one undo
-  entry**, as consecutive typed characters already do, so a held key costs one snapshot rather than
-  one per press; then re-measure and raise the cap. A persistent treap with structural sharing would
-  make snapshots O(1) and fix undo cost for every large edit — including Replace All, which has the
-  same characteristic — but it rewrites the locked buffer.
+- **`pt_insert` never coalesces adjacent appends, so a multi-row edit fragments the tree and every
+  subsequent READ pays for it.** This was misdiagnosed twice before being measured; the numbers below
+  are instrumented, release build, 2,000-row rectangle, and the four phases sum to wall-clock within
+  0.1%:
+
+  | press | total | row-start walk | cell→byte resolve | snapshot | splice | pieces |
+  |---|---|---|---|---|---|---|
+  | 1 | 6.75 ms | 3.16 | 3.15 | 0.00 | 0.41 | 4,001 |
+  | 20 | 63.97 ms | 30.42 | 30.46 | 2.27 | 0.81 | 42,001 |
+
+  Piece count grows by exactly `rows` per press, and both `block_step_lines` and `block_row_range`
+  read *through* the tree, so after N presses each row costs ~N times what it did on press 1. **The
+  cost is 95% reads.** §6y blamed splice fragmentation (right about the cause, wrong that it bills to
+  the writes — the splice itself is 1.3%); §6z then blamed the undo snapshot and proposed coalescing
+  (wrong: forcing *zero* snapshots on presses 2..N, strictly better than coalescing, moved press 20
+  by **0.9 ms — 1.4%**). Both corrections are recorded because the second was more confident and less
+  right than the first.
+
+  **The fix that follows from the measurement:** have `block_apply` read `[first_row_start,
+  last_row_end)` once, edit it in a temp buffer, and issue **one** `pt_delete` + **one** `pt_insert`
+  rather than 2N splices. Piece count then stays flat across a held key and every press costs what
+  press 1 costs — 6.75 ms at 2,000 rows, inside a 25 ms budget, which would let
+  `BLOCK_EDIT_MAX_LINES` go from **300** back to thousands. Two things it must handle: the region
+  read needs its own byte cap (2,000 rows of long lines is unbounded), and `doc.nl_delta` plus find
+  invalidation currently ride on the per-row `doc_replace_sel`.
+
+  Note `pt_insert`'s missing coalescing is **not** block-specific — ordinary held-key typing also
+  adds a piece per character.
+- **Coalescing consecutive block edits into one undo entry is still worth doing**, but as correctness,
+  not performance: 20 presses is currently 20 Ctrl+Z, and with `UNDO_MAX :: 200` a long hold evicts
+  the pre-run state entirely, which is a small data-loss path. Do not attach a cap raise to it.
 - **`Highlight_Row_Cache.cur_buf` is a row-sized token budget filled from a whole line.** On
   `doc_row_lex_spans`'s whole-line path the 512-span array covers a logical line of up to
   `RENDER_LINE_CAP` (8192) bytes, so a dense enough wrapped line — measured: a 4.5 KB minified-JS
@@ -2093,13 +2112,19 @@ already sitting on `test_mode_dispatch`'s), **not** the number of sibling blocks
 `build.bat` now passes `/STACK:8388608` so the next person adding a case does not hit a crash with
 an invisible cause.
 
-**The undo-cost diagnosis in §6y and in the whole-branch review was wrong.** The per-keystroke climb
-is not splice fragmentation — `pt_snapshot` is `clone(pt.root)`, a full deep copy of the tree, and
-`doc_batch_begin` takes one on every keystroke. A 2,000-row edit adds ~2,000 pieces per press, so by
-press 20 each press clones ~40,000 nodes. Batching the splices would not have helped. The agreed fix
-is to coalesce consecutive block edits into one undo entry, exactly as consecutive typed characters
-already coalesce, so holding a key costs one snapshot rather than one per press — then re-measure and
-raise the cap to whatever that supports. Recorded in §5.
+**The per-keystroke cost was diagnosed twice by reading and both answers were wrong.** §6y blamed
+splice fragmentation; a later session blamed the undo snapshot (`pt_snapshot` is `clone(pt.root)`,
+taken per keystroke) and got as far as choosing "coalesce consecutive block edits" as the fix. An
+implementer then instrumented it before building, per the falsifiers-before-fixes rule, and found the
+snapshot is **3.5%** of press 20 — forcing zero snapshots on presses 2..N moved it by 0.9 ms. The
+cost is 95% *reads*: `pt_insert` never coalesces adjacent appends, so pieces grow by one per row per
+press and both row walks read through an ever-more-fragmented tree. Full table and the fix that
+follows are in §5.
+
+**The lesson is the process one.** The second diagnosis was more confident than the first and less
+right, and it was written into this document as settled fact before anyone measured. The only reason
+it did not ship is that the implementer's brief carried an explicit stop condition — *if the snapshot
+is not dominant, report BLOCKED rather than build the wrong fix* — and they used it.
 
 ## 7. Build environment (Windows, this machine)
 

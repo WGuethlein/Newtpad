@@ -215,8 +215,10 @@ Each of these cost real time at least once.
   `watchtest` takes a directory.
 - **Never run `drawcount`.** It opens a real window, hangs, and locks the exe so the next build
   fails. **`keytest` has the same trap with a different trigger:** it takes `<path> <mode>`, two
-  arguments, and with only one it falls through to opening the real GUI window and hangs. Any
-  file-argument mode can do this — check the argument order in `test_modes.odin` before running one.
+  arguments, and with only one it falls through to opening the real GUI window and hangs. **`edittest`
+  and `seltest` do the same when their two arguments are in the wrong order** — the path comes
+  FIRST — and that cost a ten-minute timeout once. Any file-argument mode can do this; check the
+  argument order in `test_modes.odin` before running one.
 - **A test mode can grow a stack overflow.** The trigger is total per-procedure frame size, not a
   sibling count — it is not "three or more inline blocks." `test_mode_dispatch` is one enormous
   procedure with an already-large frame; a callee that holds two `App` structs live at once
