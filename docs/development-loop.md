@@ -240,6 +240,12 @@ Each of these cost real time at least once.
 - **PowerShell 5.1 re-parses quotes when passing arguments to a native command**, so a `"` inside a
   here-string reaches `git commit -m` as an argument break — the tail of the message then arrives as
   a pathspec and the commit fails. Write the message to a file and use `git commit -F`.
+- **Never pipe `.\release.ps1` (or any script that runs `git push`) through `2>&1`.** PowerShell 5.1
+  wraps each stderr line from a native command in an ErrorRecord, and `git push` writes its progress
+  there — so with the script's `$ErrorActionPreference = 'Stop'` the push "fails" and the script
+  aborts *after* tagging and pushing the branch but *before* pushing the tag and creating the
+  Release. Recovering means pushing the tag and running `gh release create` by hand, and
+  `release.ps1` cannot simply be re-run because it refuses an existing tag. Run it bare.
 - **The `Write`/`Edit` tools can silently rewrite a whole file from CRLF to LF.** It happened twice
   on one branch. `.gitattributes` normalises storage so nothing corrupts, but the working tree ends up
   inconsistent and the diff balloons. Check `git diff --stat` before committing and confirm the line
