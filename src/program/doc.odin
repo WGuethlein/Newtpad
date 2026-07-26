@@ -1386,10 +1386,12 @@ doc_reload :: proc(doc: ^Document) -> bool {
 	doc.cursor = clamp(cursor, 0, L)
 	doc.anchor = clamp(anchor, 0, L)
 	doc.top = clamp(top, 0, L)
-	// Applied after doc.path is back: doc_can_markdown/doc_can_table gate on the
-	// extension, and a view applied against an empty path would validate against
-	// "untitled", which path_has_ext deliberately lets through unrestricted.
-	// Position first, though -- doc_view_apply re-anchors doc.top to a line start.
+	// Applied after the position clamps, not before: doc_view_apply re-anchors
+	// doc.top to a line start when a line-scrolled view is on, and the clamp above
+	// would overwrite that. (An earlier draft of this comment claimed the ordering
+	// was about doc.path being empty until line 1381 -- it never is: doc_open
+	// clones the path into `fresh`, so doc.path is valid the instant doc^ = fresh
+	// runs. Sabotaging the order fails through `top`, not through the gates.)
 	doc_view_apply(doc, view)
 	doc.disk_stamp = plat.file_stamp(doc.path)
 	doc.disk_changed = false
