@@ -4630,6 +4630,16 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		// CLOSED_AT puts a complete `/* */` just past that cap, inside the row
 		// that straddles it, so a cache built from a truncated read shows up as
 		// an uncoloured comment rather than only as a wrong state.
+		//
+		// WHICH HALF THIS ACTUALLY PINS, stated plainly because the name above
+		// overclaims: every assertion here fails when the truncated-read guard
+		// goes, and NONE of them fail when only the exact=false guard goes.
+		// That is not slack in the fixture -- it is doc_row_lex_extent's
+		// #assert(WRAP_START_CAP >= RENDER_LINE_CAP) holding: with the caps
+		// equal, an inexact floor is start-8192 and the end scan can only reach
+		// `start`, so the truncation guard catches the same rows. Break that
+		// assert and this test goes quiet; the assert, not this fixture, is what
+		// guards the exact flag.
 		{
 			CLOSED_AT :: 9000 // just past RENDER_LINE_CAP: inside the row straddling it
 			CLOSED_LEN :: 102 // "/*" + 98 filler + "*/"

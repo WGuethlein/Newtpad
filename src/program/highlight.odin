@@ -388,6 +388,7 @@ highlight_kind_role :: proc(k: base.Token_Kind) -> Color_Role {
 //   hand-written source, this repo through lex_c/ODIN_KW:  4.9–5.9 chars/token
 //                                     worst single line:  46 tokens / 223 chars
 //   dense C / minified JS / minified JSON:                 2.2 / 1.8 / 1.5 chars/token
+//   a row of pure punctuation ({},;:()[]):                 1.0 chars/token
 //
 // 512 therefore covers ~2,500 characters of ordinary source — past
 // VISIBLE_COLS, the 2,048 cells a row can actually show — but only ~770 of
@@ -414,6 +415,14 @@ highlight_kind_role :: proc(k: base.Token_Kind) -> Color_Role {
 // which is sound only because their state_out is unconditionally .Normal.
 // See the "Keep lex_xml scanning for state past its token cap" fix earlier in
 // this branch for the bug this exists because of.
+//
+// One caveat on the "past VISIBLE_COLS" reasoning above: it holds on the
+// row-extent path, where the budget is spent on one row's bytes. On
+// doc_row_lex_spans's WHOLE-LINE path the same array is filled from a whole
+// logical line — up to RENDER_LINE_CAP (8192) bytes, four rows' worth — so a
+// dense wrapped line can exhaust it partway down and leave its later rows
+// bare. That is a known limit, not a state bug (see above), and it is in
+// HANDOFF §5 with the reason the obvious fix is wrong.
 HL_MAX_ROW_TOKENS :: 512
 
 // Total bytes handed to a lexer, accumulated across calls. Exists only for

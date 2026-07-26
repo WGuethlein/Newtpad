@@ -460,7 +460,13 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 		// back to scanning the ROW's own bytes. A link straddling the wrap
 		// point then resolves to only its part of the row rather than whole,
 		// which is a real (documented) loss — but it applies only to rows that
-		// currently produce nothing at all.
+		// currently produce nothing at all. Note what that loss actually is:
+		// links_scan runs on a FRAGMENT, so it can emit a hit for text that is
+		// not a link in the document (a URL cut across the boundary leaves a
+		// tail that scans as a .Path). It cannot become a different SITE — a
+		// URL needs a whitelisted scheme (links_scan below) — and a spurious
+		// path only resolves if such a file exists beside the document, so the
+		// worst case is an underline that does nothing when clicked.
 		lls, lend := 0, 0
 		row_local := !wrapped
 		if wrapped {

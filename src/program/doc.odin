@@ -2221,6 +2221,17 @@ Highlight_Row_Cache :: struct {
 // both failures have the same shape — a bounded scan that cannot see far
 // enough must not pretend it did:
 //
+// (There is a THIRD bound on this path that this proc does not decide and
+// does not guard: cur_buf holds HL_MAX_ROW_TOKENS spans, a budget sized for
+// a ROW, while the whole-line path fills it from a LINE of up to
+// RENDER_LINE_CAP bytes. A line dense enough to saturate it colours its
+// first rows and leaves the rest bare. state_out stays correct — every lexer
+// keeps scanning for state after its token slice fills — so this is a visual
+// limit, not a state bug, and it is recorded in HANDOFF §5 rather than fixed
+// here: the naive `saturated -> whole_line = false` is WRONG, because the
+// fall-through would then lex [start,end) with a state_in that was resolved
+// at lls.)
+//
 //   - pt_line_start_cap reports exact=false: no newline within WRAP_START_CAP
 //     behind `start`, so what came back is a scan FLOOR that slides with
 //     `start`, not a line start. Applying `state_in` (the state at the
@@ -2238,6 +2249,16 @@ Highlight_Row_Cache :: struct {
 // this row's `end` at a wrap point (doc.odin's wrap branch; "a wrap point
 // belongs to the next visual row's start"), so row-to-row threading of the
 // state at `end` is the same thing the !wrapped path already relies on.
+//
+// The `exact` guard below cannot be sabotage-tested on its own, and that is a
+// consequence of the two caps being equal rather than of the guard being
+// pointless: when exact is false the floor is exactly start - WRAP_START_CAP,
+// so pt_line_end_cap can only reach `start` and the truncation guard fires
+// instead. Drop WRAP_START_CAP below RENDER_LINE_CAP and that stops holding —
+// the end scan would run PAST `start`, could find a real newline, and would
+// return whole_line=true on a floor that is not a line start, with no test to
+// catch it. Hence the assert: it is what keeps the untested guard redundant.
+#assert(WRAP_START_CAP >= RENDER_LINE_CAP)
 doc_row_lex_extent :: proc(doc: ^Document, start, end: int, wrapped: bool) -> (from, to: int, whole_line: bool) {
 	if wrapped {
 		lls, exact := base.pt_line_start_cap(&doc.pt, start, WRAP_START_CAP)
@@ -2424,7 +2445,11 @@ doc_draw :: proc(
 		// state-preserving in all five stateful grammars: lex_xml and lex_c
 		// carry an open comment through it untouched, and lex_markdown and
 		// lex_yaml each handle "blank line inside my construct" explicitly
-		// (a fenced block, a block scalar), as does lex_shell's <# #>. A sixth
+		// (a fenced block, a block scalar), as does lex_shell's <# #>. One
+		// exception, unreachable today: lex_yaml drops .In_Comment on a bare
+		// "\r", which only matters if a YAML block scalar could open on a CRLF
+		// line, and ym_match_block_scalar rejects `|\r` so it cannot. That is a
+		// pre-existing CRLF gap in the grammar, not in this guard. A sixth
 		// stateful lexer whose state a blank line can CHANGE — an
 		// indentation-sensitive grammar where a blank line closes a block,
 		// say — breaks that agreement here rather than in itself, and would
