@@ -217,10 +217,16 @@ Each of these cost real time at least once.
   fails. **`keytest` has the same trap with a different trigger:** it takes `<path> <mode>`, two
   arguments, and with only one it falls through to opening the real GUI window and hangs. Any
   file-argument mode can do this — check the argument order in `test_modes.odin` before running one.
-- **A test mode can grow a stack overflow.** Adding three or more new inline test blocks as siblings
-  inside `blocktest` produced a real `STATUS_STACK_OVERFLOW` at runtime — the procedure was already
-  very long and each block's locals stack up. Pull each new case into its own local proc; the
-  existing `block_test_*` procs are that pattern.
+- **A test mode can grow a stack overflow.** The trigger is total per-procedure frame size, not a
+  sibling count — it is not "three or more inline blocks." `test_mode_dispatch` is one enormous
+  procedure with an already-large frame; a callee that holds two `App` structs live at once
+  (inline, or via a local proc that itself calls another local proc without returning first) adds
+  its own full frame on top of that, and `blocktest` has hit a real `STATUS_STACK_OVERFLOW` twice
+  this way — the same two `App`s, called one at a time from separate local procs, did not overflow.
+  Pull each new case into its own local proc, and keep each proc to one `App`/`Document` at a time;
+  the existing `block_test_*` procs are that pattern. `build.bat` now also raises the thread stack
+  to 8 MB via `-extra-linker-flags:"/STACK:8388608"`, so this is a higher ceiling, not just a
+  comment convention — but it is still a ceiling, not an excuse to stop watching frame size.
 - **`Select-String "FAIL"` is case-insensitive** and happily matches "0 failures" in a passing
   summary. Use `-CaseSensitive`.
 

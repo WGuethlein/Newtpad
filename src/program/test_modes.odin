@@ -1573,6 +1573,36 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		fail := false
 		fmt.println("blocktest:")
 
+		// Guard the REAL Windows clipboard for the WHOLE mode, not per-case.
+		// Several cases below (Cut in block_test_t/block_test_u, the Paste
+		// round trip in block_test_ai, the sentinel round trip in
+		// block_test_an) also save/restore around their own writes, but a
+		// previous round proved that per-case discipline alone is not
+		// enough: block_test_an wrote the clipboard with no save/restore of
+		// its own, and it shipped anyway because nothing checked the MODE as
+		// a whole. Saving once here and restoring via `defer` on every exit
+		// path -- including the "no fonts loaded" early return just below --
+		// means a future case that forgets its own save/restore still can't
+		// reach the user; only a bug in this one save/restore can. An empty
+		// clipboard, a clipboard holding non-text data (e.g. an image --
+		// clipboard_get_text reports ok=false for anything that isn't
+		// CF_UNICODETEXT), or a clipboard that can't be opened all come back
+		// with had_clip=false: there is nothing understood to restore in
+		// that case, so the defer below leaves the clipboard alone rather
+		// than blanking it.
+		mode_saved_clip, mode_had_clip := plat.clipboard_get_text(nil, context.allocator)
+		defer if mode_had_clip {
+			plat.clipboard_set_text(nil, mode_saved_clip)
+			delete(mode_saved_clip)
+		}
+
+		// Stand in for "the user's real clipboard content" with a sentinel of
+		// our own, so the seam-proof check at the very end of this mode (see
+		// "SEAM PROOF" near the bottom) can tell a clipboard that every case
+		// put back from one that some case clobbered and forgot.
+		mode_seam_sentinel := "BLOCKTEST MODE SEAM SENTINEL -- must survive every case"
+		plat.clipboard_set_text(nil, mode_seam_sentinel)
+
 		t: plat.Text
 		if !plat.text_load_faces(&t) {
 			fmt.println("  FAIL   no fonts loaded; cannot exercise cell widths")
@@ -2906,6 +2936,20 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			tad.block = true
 			tad.block_anchor_line_start, tad.block_anchor_cell = 0, 10 // "x" never reaches cell 10
 			tad.block_cursor_line_start, tad.block_cursor_cell = 0, 12
+
+			// Ctrl+X below reaches the REAL Windows clipboard through
+			// commands.odin's .Cut handler. Save/restore around it so this
+			// case doesn't leave the clipboard holding this fixture's cut
+			// byte ("x") -- belt-and-suspenders with the mode-level
+			// save/restore in the blocktest dispatcher above, which is what
+			// actually protects the user, but this keeps the mode's own
+			// seam-proof sentinel intact across this case specifically.
+			tsaved_clip, thad_clip := plat.clipboard_get_text(tdummy.hwnd, context.allocator)
+			defer if thad_clip {
+				plat.clipboard_set_text(tdummy.hwnd, tsaved_clip)
+				delete(tsaved_clip)
+			}
+
 			command_dispatch(resolve_key(.X, true, false, .Editor), {.X, true, false, false}, &ta, &tdummy, t, 10) // Ctrl+X
 			cT := !block_active(tad)
 			fmt.printfln("  %-6s LOW 3: Cut on a single all-short row still clears the block: block_active=%v", "ok" if cT else "FAIL", block_active(tad))
@@ -2934,6 +2978,17 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			uad.block = true
 			uad.block_anchor_line_start, uad.block_anchor_cell = 0, 0
 			uad.block_cursor_line_start, uad.block_cursor_cell = (u_rows - 1) * 2, 1
+
+			// Same real-clipboard concern as block_test_t above: Ctrl+X
+			// below writes the actual Windows clipboard via .Cut. Save and
+			// restore around it rather than leaving this fixture's rows in
+			// the clipboard for whatever runs next.
+			usaved_clip, uhad_clip := plat.clipboard_get_text(udummy.hwnd, context.allocator)
+			defer if uhad_clip {
+				plat.clipboard_set_text(udummy.hwnd, usaved_clip)
+				delete(usaved_clip)
+			}
+
 			command_dispatch(resolve_key(.X, true, false, .Editor), {.X, true, false, false}, &ua, &udummy, t, 10) // Ctrl+X
 			wantU := fmt.tprintf("%d rows", BLOCK_EDIT_MAX_LINES)
 			cU := strings.contains(ua.notice, wantU)
@@ -3957,9 +4012,24 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		//
 		// Sabotage (per task): remove the `defer if had_clip {...}` restore
 		// from block_test_ai and this must FAIL, reporting "PP".
+		//
+		// This proc used to write `sentinel` over the clipboard with no
+		// save/restore of its own -- that was the HIGH finding a later
+		// review caught: the mode-level save/restore now protects the real
+		// user clipboard regardless, but this proc still cleans up after
+		// itself (saving whatever was there -- the mode's own seam
+		// sentinel, if nothing upstream leaked -- before overwriting it,
+		// and restoring that on the way out) so it doesn't leave `sentinel`
+		// sitting in the clipboard for the mode's seam-proof check at the
+		// very end to trip over.
 		block_test_an :: proc(t: ^plat.Text) -> bool {
 			ndummy: plat.Window
 			sentinel := "USER'S REAL CLIPBOARD CONTENT - DO NOT LOSE"
+			nsaved_clip, nhad_clip := plat.clipboard_get_text(ndummy.hwnd, context.allocator)
+			defer if nhad_clip {
+				plat.clipboard_set_text(ndummy.hwnd, nsaved_clip)
+				delete(nsaved_clip)
+			}
 			plat.clipboard_set_text(ndummy.hwnd, sentinel)
 			_ = block_test_ai(t) // exercises the real clipboard round trip
 			after, ok := plat.clipboard_get_text(ndummy.hwnd, context.temp_allocator)
@@ -4035,6 +4105,8 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			split_note,
 		)
 		if !cAOAP {fail = true}
+		delete(wrap_note)
+		delete(split_note)
 
 		// AQ: FEATURE (Wyatt's call) -- Tab now acts across a live rectangle
 		// exactly like a typed character does (routes through block_replace),
@@ -4093,6 +4165,25 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			return cAQ
 		}
 		if !block_test_aq(&t) {fail = true}
+
+		// SEAM PROOF: the assertion the previous round's clipboard fix
+		// lacked. block_test_an (above) only proves block_test_ai's OWN
+		// save/restore works; it says nothing about block_test_t,
+		// block_test_u, or a case added after this comment. This instead
+		// checks the WHOLE mode end-to-end: the sentinel set once, before
+		// any case ran (mode_seam_sentinel, at the top of this dispatch),
+		// must still be what's in the clipboard now that every case has
+		// run. Reintroduce any unrestored clipboard write anywhere above --
+		// not just the one the reviewer happened to name -- and this fails.
+		seam_after, seam_ok := plat.clipboard_get_text(nil, context.temp_allocator)
+		cSeam := seam_ok && seam_after == mode_seam_sentinel
+		fmt.printfln(
+			"  %-6s LIVE PASS (seam): every clipboard-touching case in blocktest restores what it found, start to finish: got=%q (want %q)",
+			"ok" if cSeam else "FAIL",
+			seam_after,
+			mode_seam_sentinel,
+		)
+		if !cSeam {fail = true}
 
 		fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
 		return true

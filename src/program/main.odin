@@ -666,15 +666,6 @@ main :: proc() {
 				sel_dragging = true
 			}
 			if sel_dragging {
-				// Auto-scroll while the pointer is dragged above the first row or at/
-				// below the last one — the edges are the content area, so entering the
-				// bottom bar (or leaving the window past it) keeps scrolling instead of
-				// stopping dead at the last visible line.
-				if f32(window.mouse_y) < CONTENT_TOP + FILTER_BANNER_H {
-					doc_scroll(doc, &text, -1, rows)
-				} else if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
-					doc_scroll(doc, &text, 1, rows)
-				}
 				mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
 				// block_drag_update (block.odin) now owns whether doc.cursor commits
 				// to mp this frame, not just whether a rectangle gets built: always
@@ -690,7 +681,8 @@ main :: proc() {
 				// every other column -- not a second conversion path from mp's byte
 				// offset. The wording of each note stays here because block.odin has
 				// never imported the App type.
-				if refusal, note := block_drag_update(&block_drag, doc, &text, mp, cell_at_x(char_w, f32(window.mouse_x))); note {
+				refusal, note := block_drag_update(&block_drag, doc, &text, mp, cell_at_x(char_w, f32(window.mouse_x)))
+				if note {
 					switch refusal {
 					case .Wrap_On:
 						app_note(&app, "[COLUMN SELECT NEEDS WRAP OFF - press Alt+Z]")
@@ -701,6 +693,22 @@ main :: proc() {
 					case .Caret_Unresolved:
 						app_note(&app, "[COLUMN SELECT UNAVAILABLE HERE - the line is too far into a very large file]")
 					case .None:
+					}
+				}
+				// Auto-scroll while the pointer is dragged above the first row or at/
+				// below the last one — the edges are the content area, so entering the
+				// bottom bar (or leaving the window past it) keeps scrolling instead of
+				// stopping dead at the last visible line. Gated on refusal == .None:
+				// a refused Alt-drag already pins the cursor and refuses to extend the
+				// rectangle (block_drag_update, above) -- scrolling the view under a
+				// gesture that was just refused moved the file out from under the user
+				// for a drag that wasn't doing anything. A plain (non-Alt) drag is
+				// never refused, so this doesn't change its behavior.
+				if refusal == .None {
+					if f32(window.mouse_y) < CONTENT_TOP + FILTER_BANNER_H {
+						doc_scroll(doc, &text, -1, rows)
+					} else if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
+						doc_scroll(doc, &text, 1, rows)
 					}
 				}
 			}
