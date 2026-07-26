@@ -784,7 +784,9 @@ doc_new :: proc() -> (doc: Document) {
 	return
 }
 
-doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
+// `force_enc` overrides what detect_encoding decided -- the Reopen As commands.
+// The sniff still runs, because a BOM is also how many bytes to skip.
+doc_open :: proc(path: string, force_enc: Maybe(base.Encoding) = nil) -> (doc: Document, ok: bool) {
 	fv, fok := plat.file_open_readonly(path)
 	if !fok {
 		return
@@ -810,6 +812,14 @@ doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
 		enc, bom = base.detect_encoding(head[:n])
 	} else {
 		enc, bom = base.detect_encoding(fv.bytes)
+	}
+	if fe, has := force_enc.?; has {
+		// The BOM belonged to the encoding it announced. Under a different
+		// reading those bytes are content, so the skip goes with the detection
+		// it came from -- otherwise a forced reopen quietly eats the first two
+		// or three bytes of the file every time.
+		if fe != enc {bom = 0}
+		enc = fe
 	}
 	doc.enc = enc
 	doc.had_bom = bom > 0
@@ -1362,8 +1372,17 @@ doc_absorb_append :: proc(doc: ^Document, new_size: i64) -> bool {
 // simple append. Undo states describe a document that no longer exists, so they
 // go; keeping them would let Ctrl+Z resurrect a file that was never on disk.
 doc_reload :: proc(doc: ^Document) -> bool {
+	return doc_reload_forced(doc, nil)
+}
+
+// Re-open from disk, discarding the buffer. `force_enc` re-decodes under an
+// encoding the user picked instead of the detected one (the Reopen As commands);
+// nil is an ordinary reload. Undo states describe a document that no longer
+// exists, so they go; keeping them would let Ctrl+Z resurrect a file that was
+// never on disk.
+doc_reload_forced :: proc(doc: ^Document, force_enc: Maybe(base.Encoding)) -> bool {
 	if doc.path == "" {return false}
-	fresh, ok := doc_open(doc.path)
+	fresh, ok := doc_open(doc.path, force_enc)
 	if !ok {return false}
 
 	cursor, anchor, top := doc.cursor, doc.anchor, doc.top

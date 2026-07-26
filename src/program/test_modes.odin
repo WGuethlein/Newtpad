@@ -5098,6 +5098,74 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 		return true
 	}
 
+	// `newtpad enctest` -- forcing an encoding at open time. detect_encoding is
+	// right almost always, and there was no way to say otherwise: doc_set_encoding
+	// only changes what the next SAVE writes, it re-decodes nothing.
+	if os.args[1] == "enctest" {
+		bad := 0
+		fmt.println("enctest:")
+		tmp := os.get_env("TEMP", context.temp_allocator)
+
+		// "caf\xC3\xA9" is valid UTF-8 for "café" and detect says UTF8. The same
+		// bytes read as Windows-1252 are "cafÃ©" -- the real-world mislabelling,
+		// and an assertion that cannot pass if the override is ignored.
+		u8f := fmt.tprintf("%s%cnewtpad_enc_u8.txt", tmp, '\\')
+		plat.file_write_atomic(u8f, transmute([]u8)string("caf\xC3\xA9"))
+
+		enc_default :: proc(path: string) -> (enc: base.Encoding, text: string) {
+			d, ok := doc_open(path)
+			if !ok {return .UTF8, ""}
+			defer doc_close(&d)
+			return d.enc, doc_debug_string(&d)
+		}
+		de, dt := enc_default(u8f)
+		ok1 := de == .UTF8 && dt == "café"
+		fmt.printfln("  %-6s default open detects UTF-8: enc=%v text=%q", "ok" if ok1 else "FAIL", de, dt)
+		if !ok1 {bad += 1}
+
+		enc_forced :: proc(path: string, force: base.Encoding) -> (enc: base.Encoding, text: string) {
+			d, ok := doc_open(path, force)
+			if !ok {return .UTF8, ""}
+			defer doc_close(&d)
+			return d.enc, doc_debug_string(&d)
+		}
+		fe, ft := enc_forced(u8f, .CP1252)
+		ok2 := fe == .CP1252 && ft == "cafÃ©"
+		fmt.printfln("  %-6s forced CP1252 re-decodes the same bytes: enc=%v text=%q", "ok" if ok2 else "FAIL", fe, ft)
+		if !ok2 {bad += 1}
+
+		// A BOM belongs to the encoding that wrote it. Forcing a different one
+		// makes those bytes content, so the skip must be dropped -- otherwise a
+		// forced reopen silently eats two or three bytes of the user's file.
+		bomf := fmt.tprintf("%s%cnewtpad_enc_bom.txt", tmp, '\\')
+		plat.file_write_atomic(bomf, transmute([]u8)string("\xEF\xBB\xBFhi"))
+		be, bt := enc_forced(bomf, .CP1252)
+		ok3 := be == .CP1252 && strings.has_suffix(bt, "hi") && len(bt) > 2
+		fmt.printfln("  %-6s forced encoding drops a BOM skip that no longer applies: text=%q", "ok" if ok3 else "FAIL", bt)
+		if !ok3 {bad += 1}
+
+		// The reopen path itself: same document, re-read under a new encoding,
+		// with the view preserved (it goes through doc_reload).
+		reopen_case :: proc(path: string) -> (bad: int) {
+			d, ok := doc_open(path)
+			if !ok {return 1}
+			defer doc_close(&d)
+			d.wrap = true
+			rok := doc_reload_forced(&d, .CP1252)
+			good := rok && d.enc == .CP1252 && d.wrap && doc_debug_string(&d) == "cafÃ©"
+			fmt.printfln(
+				"  %-6s doc_reload_forced re-decodes and keeps the view: ok=%v enc=%v wrap=%v",
+				"ok" if good else "FAIL", rok, d.enc, d.wrap,
+			)
+			if !good {bad += 1}
+			return
+		}
+		bad += reopen_case(u8f)
+
+		fmt.printfln("enctest: %d failures", bad)
+		return true
+	}
+
 	// `newtpad sessiontest` round-trips session save -> restore. Set
 	// NEWTPAD_SESSION_DIR to a temp dir first — without it this writes to, and
 	// then resets, the real session under %APPDATA%\Newtpad.

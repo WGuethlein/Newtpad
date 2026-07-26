@@ -365,6 +365,10 @@ MB_ICONWARNING :: 0x00000030
 ID_YES :: 6
 @(private = "file")
 ID_NO :: 7
+@(private = "file")
+MB_YESNO :: 0x00000004
+@(private = "file")
+MB_DEFBUTTON2 :: 0x00000100 // second button is default: Cancel, not the destructive one
 
 Save_Choice :: enum {
 	Save,
@@ -415,6 +419,25 @@ confirm_discard :: proc(owner: win.HWND, name: string) -> Save_Choice {
 		return .Discard
 	}
 	return .Cancel
+}
+
+// Re-reading the file under a different encoding throws the buffer away. Asked
+// only when there is something to lose; No is the default button, because a
+// mis-aimed Enter on this dialog destroys unsaved work.
+confirm_reopen :: proc(owner: win.HWND, name, enc: string) -> bool {
+	msg := strings.concatenate(
+		{
+			"Reopen ",
+			name,
+			" as ",
+			enc,
+			"?\n\nIt will be re-read from disk and your unsaved changes will be lost.",
+		},
+		context.temp_allocator,
+	)
+	wmsg := win.utf8_to_wstring(msg, context.temp_allocator)
+	wcap := win.utf8_to_wstring("Newtpad", context.temp_allocator)
+	return win.MessageBoxW(owner, wmsg, wcap, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == ID_YES
 }
 
 Encoding_Choice :: enum {

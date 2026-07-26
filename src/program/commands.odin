@@ -86,6 +86,9 @@ Command_Id :: enum u8 {
 	Enc_UTF8,
 	Enc_UTF16LE,
 	Enc_CP1252,
+	Reopen_UTF8,
+	Reopen_UTF16LE,
+	Reopen_CP1252,
 	Eol_LF,
 	Eol_CRLF,
 	// menu bar navigation
@@ -199,6 +202,9 @@ command_table := [Command_Id]Command {
 	.Enc_UTF8                 = {"Save as UTF-8", "Encoding"},
 	.Enc_UTF16LE              = {"Save as UTF-16 LE", "Encoding"},
 	.Enc_CP1252               = {"Save as Windows-1252", "Encoding"},
+	.Reopen_UTF8              = {"Reopen as UTF-8", "Encoding"},
+	.Reopen_UTF16LE           = {"Reopen as UTF-16 LE", "Encoding"},
+	.Reopen_CP1252            = {"Reopen as Windows-1252", "Encoding"},
 	.Eol_LF                   = {"Line Endings: LF (Unix)", "Encoding"},
 	.Eol_CRLF                 = {"Line Endings: CRLF (Windows)", "Encoding"},
 	.Menu_Close               = {"Menu: Close", "View"},
@@ -473,6 +479,25 @@ save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -
 		theme_reapply_if_active(app, path)
 	}
 	return saved
+}
+
+// Re-read the file under `enc`. Confirms first when there are unsaved changes:
+// this discards the buffer, and a menu row that silently destroys work is worse
+// than no row. A failed read leaves the document exactly as it was -- doc_open
+// fails before doc_reload_forced touches anything.
+@(private = "file")
+reopen_with_encoding :: proc(app: ^App, doc: ^Document, w: ^plat.Window, enc: base.Encoding) {
+	if doc == nil || doc.path == "" {return}
+	if doc.modified {
+		if !plat.confirm_reopen(w.hwnd if w != nil else nil, doc_display_name(doc), enc_name(enc)) {
+			return
+		}
+	}
+	if !doc_reload_forced(doc, enc) {
+		app_note(app, "[REOPEN FAILED - the file could not be read]")
+		return
+	}
+	app_note(app, fmt.tprintf("[REOPENED AS %s]", enc_name(enc)))
 }
 
 // Close a tab, prompting to save first if it has unsaved changes. Save-dialog
@@ -1001,6 +1026,12 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		doc_set_encoding(doc, .UTF16LE)
 	case .Enc_CP1252:
 		doc_set_encoding(doc, .CP1252)
+	case .Reopen_UTF8:
+		reopen_with_encoding(app, doc, w, .UTF8)
+	case .Reopen_UTF16LE:
+		reopen_with_encoding(app, doc, w, .UTF16LE)
+	case .Reopen_CP1252:
+		reopen_with_encoding(app, doc, w, .CP1252)
 	case .Eol_LF:
 		doc_set_line_ending(doc, .LF)
 	case .Eol_CRLF:
