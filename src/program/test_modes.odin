@@ -6793,6 +6793,58 @@ test_mode_dispatch :: proc() -> (handled: bool) {
 			if !degraded {bad += 1}
 		}
 
+		// --- doc_view_apply validates against the document it lands on ---
+		// These are the cases a stored view can actually be wrong in: the
+		// extension gates never change under reload or restore, so the guard
+		// only fires for a view that came from somewhere else -- a session
+		// written by another build, a hand-edited one, a future caller.
+		view_apply_cases :: proc() -> (bad: int) {
+			// A table view stored against a .txt must not turn the grid on.
+			// doc_from_content takes ownership of the slice; an empty one is
+			// enough here, since only the path drives the gates.
+			td := doc_from_content(make([]u8, 0), "C:\\tmp\\notes.txt", .UTF8)
+			defer doc_close(&td)
+			doc_view_apply(&td, Doc_View{wrap = true, md_mode = .Split, table = true})
+			ok1 := !td.table && td.md_mode == .Off && td.wrap
+			fmt.printfln(
+				"  %-6s .txt refuses both views, keeps wrap: table=%v md_mode=%v wrap=%v (want false/Off/true)",
+				"ok" if ok1 else "FAIL", td.table, td.md_mode, td.wrap,
+			)
+			if !ok1 {bad += 1}
+			return
+		}
+		bad += view_apply_cases()
+
+		view_apply_accepts :: proc() -> (bad: int) {
+			// The same view against files that DO fit is applied, and turning
+			// the grid on picks a delimiter -- a table with table_delim == 0
+			// draws no columns at all.
+			md := doc_from_content(make([]u8, 0), "C:\\tmp\\readme.md", .UTF8)
+			defer doc_close(&md)
+			doc_view_apply(&md, Doc_View{md_mode = .Split})
+			ok2 := md.md_mode == .Split
+			fmt.printfln("  %-6s .md accepts Split: md_mode=%v (want Split)", "ok" if ok2 else "FAIL", md.md_mode)
+			if !ok2 {bad += 1}
+			return
+		}
+		bad += view_apply_accepts()
+
+		view_apply_table :: proc() -> (bad: int) {
+			raw := "a,b,c\n1,2,3\n"
+			content := make([]u8, len(raw));copy(content, transmute([]u8)raw)
+			cd := doc_from_content(content, "C:\\tmp\\data.csv", .UTF8)
+			defer doc_close(&cd)
+			doc_view_apply(&cd, Doc_View{table = true})
+			ok3 := cd.table && cd.table_delim == ','
+			fmt.printfln(
+				"  %-6s .csv accepts Table and gets a delimiter: table=%v delim=%q (want true/',')",
+				"ok" if ok3 else "FAIL", cd.table, rune(cd.table_delim),
+			)
+			if !ok3 {bad += 1}
+			return
+		}
+		bad += view_apply_table()
+
 		fmt.printfln("viewmemtest: %d failures", bad)
 		return true
 	}
