@@ -11386,6 +11386,37 @@ when NEWTPAD_TESTS {
 				chk(&bad, !keymap_reload_if_active(other), "saving some other file does not")
 				os.remove(path)
 				keymap_reset()
+
+				// --- View > Edit Keybindings... -----------------------------------------------
+				// app_open_path is headless-safe (it maps and activates a tab like
+				// any other open), so the opened tab is asserted rather than
+				// skipped as needing a window -- the same shape the Edit Current
+				// Theme... case uses.
+				fmt.println("--- Edit Keybindings... ---")
+				{
+					app_t: App
+					menu_init(&app_t.menu)
+					defer app_destroy(&app_t)
+					app_t.settings = settings_default()
+					made := keymap_edit_current(&app_t)
+					chk(&bad, made && os.exists(path), fmt.tprintf("writes keys.txt when there isn't one (ok=%v exists=%v)", made, os.exists(path)))
+					opened := app_active(&app_t)
+					chk(&bad, opened != nil && strings.to_lower(opened.path, context.temp_allocator) == strings.to_lower(path, context.temp_allocator), fmt.tprintf("and opens it as a tab: %q", opened.path if opened != nil else ""))
+					// What it wrote must be what keymap_load reads back with no
+					// complaint -- the seed is only documentation if it is also
+					// a valid file.
+					keymap_load()
+					chk(&bad, len(g_keymap.entries) == 0 && resolve_key(.T, true, false, .Editor) == .Toggle_Table, "the freshly written file loads clean and changes nothing")
+					// Second invocation must not clobber the user's bindings --
+					// this command exists to let them edit the file, not to reset it.
+					mine := "ctrl+t = Undo\n"
+					_ = os.write_entire_file(path, transmute([]u8)mine)
+					again := keymap_edit_current(&app_t)
+					back, _ := os.read_entire_file(path, context.temp_allocator)
+					chk(&bad, again && string(back) == mine, fmt.tprintf("an existing keys.txt is never overwritten (%d bytes back, want %d)", len(back), len(mine)))
+				}
+				os.remove(path)
+				keymap_reset()
 				return bad
 			}
 			n := keymaptest()

@@ -509,3 +509,28 @@ keymap_seed_text :: proc(allocator := context.allocator) -> string {
 	}
 	return strings.to_string(b)
 }
+
+// Edit Keybindings: writes the seeded file if there isn't one, then opens it as
+// a tab -- the same loop Edit Current Theme... gives the theme, and for the same
+// reason. A documented file format nobody has a file for is not a feature; a
+// file the app writes for you, with every default in it, is.
+//
+// An existing file is never overwritten: the user's bindings are the thing this
+// command exists to let them edit. Saving it re-reads it (keymap_reload_if_active
+// via save_checked), so a binding can be tried without restarting.
+keymap_edit_current :: proc(app: ^App) -> bool {
+	path, ok := keymap_path()
+	if !ok {
+		app_note(app, "[KEYS.TXT NOT AVAILABLE - the settings folder could not be found]")
+		return false
+	}
+	if !os.exists(path) {
+		seed := keymap_seed_text(context.temp_allocator)
+		if os.write_entire_file(path, transmute([]u8)seed) != nil {
+			app_note(app, "[KEYS.TXT NOT WRITTEN - could not write to the settings folder]")
+			return false
+		}
+	}
+	app_open_path(app, path)
+	return true
+}

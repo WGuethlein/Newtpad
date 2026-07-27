@@ -109,6 +109,7 @@ Command_Id :: enum u8 {
 	Settings_Inc,
 	Settings_Dec,
 	Theme_Edit,
+	Keys_Edit,
 	Open_Logs_Folder,
 	// font page (Edit > Font)
 	Font_Open,
@@ -224,6 +225,7 @@ command_table := [Command_Id]Command {
 	.Settings_Inc             = {"Settings: Increase", "View"},
 	.Settings_Dec             = {"Settings: Decrease", "View"},
 	.Theme_Edit               = {"Edit Current Theme...", "View"},
+	.Keys_Edit                = {"Edit Keybindings...", "View"},
 	.Open_Logs_Folder         = {"Open Logs Folder", "View"},
 	.Font_Open                = {"Font...", "Edit"},
 	.Font_Close               = {"Font: Close", "Edit"},
@@ -1295,6 +1297,8 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		app_open_special(app, .Settings)
 	case .Theme_Edit:
 		theme_edit_current(app)
+	case .Keys_Edit:
+		keymap_edit_current(app)
 	case .Open_Logs_Folder:
 		// Logging has been on by default since 0.9.0 and had no command, no menu
 		// entry and no mention anywhere in the UI -- the audit found a working
