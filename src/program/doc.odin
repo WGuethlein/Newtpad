@@ -1603,13 +1603,21 @@ doc_set_line_ending :: proc(doc: ^Document, eol: base.Line_Ending) {
 		return
 	}
 	push_undo(doc, .Replace)
-	// Every bookmark except one at offset 0 falls inside [0, length) and is
-	// dropped, which is the right answer rather than an accident: a CRLF<->LF
-	// rewrite moves every line start after the first by one byte per preceding
-	// line, so nothing here could be shifted correctly without re-walking the
-	// whole buffer. Undo restores the set (the snapshot above holds it).
-	pt_edit_delete(doc, 0, doc.pt.length)
-	pt_edit_insert(doc, 0, converted)
+	// One replace over the whole buffer, so the bookmark rules see it as one
+	// operation. Every bookmark inside [0, length) -- which is all of them,
+	// INCLUDING one at offset 0 -- is dropped, and that is the right answer
+	// rather than an accident: a CRLF<->LF rewrite moves every line start after
+	// the first by one byte per preceding line, so nothing here could be shifted
+	// correctly without re-walking the whole buffer. Undo restores the set (the
+	// snapshot above holds it).
+	//
+	// The one survivor is a bookmark on the trailing empty line, at offset ==
+	// length, which is not inside the replaced range: it moves to the new end,
+	// which is still the trailing empty line. That is exact, not a guess. As two
+	// calls it instead landed on 0 and stayed there, putting a mark on line 1
+	// that the user never set -- the silent-relocation outcome this feature is
+	// written to avoid, and the reason the delete and the insert are one call.
+	pt_edit_replace(doc, 0, doc.pt.length, converted)
 	doc.eol = eol
 	doc.cursor = clamp(doc.cursor, 0, doc.pt.length)
 	doc.anchor = doc.cursor

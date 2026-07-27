@@ -11887,6 +11887,33 @@ when NEWTPAD_TESTS {
 			}
 			bm_replace(&bad, BM_FIX, bm_set, bm_at, bm_invariant)
 
+			// --- Encoding > LF/CRLF --------------------------------------------------
+			//
+			// doc_set_line_ending rewrites the whole buffer, so every bookmark
+			// inside it goes -- there is no correct shift without re-walking, and
+			// undo brings them back. What must NOT happen is the one this used to
+			// do: a bookmark on the TRAILING EMPTY LINE is at offset == length,
+			// outside the replaced range, and as a separate delete-then-insert it
+			// collapsed to 0 and stayed there. The user set no bookmark on line 1
+			// and got one.
+			bm_eol :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), inv: proc(d: ^Document) -> bool) {
+				fmt.println("--- LF -> CRLF ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+				set(&d, {12, 26}) // "charlie", and the trailing empty line at length
+
+				doc_set_line_ending(&d, .CRLF)
+				// 26 LF bytes -> 30 CRLF bytes; the trailing empty line is the new end.
+				ok := len(d.bookmarks) == 1 && d.bookmarks[0] == d.pt.length && d.pt.length == 30
+				bm_chk(bad, ok, fmt.tprintf("the trailing-line bookmark follows the end, and NOTHING lands on line 1: %v (want [%d])", d.bookmarks[:], d.pt.length))
+				bm_chk(bad, inv(&d), "...invariant holds")
+
+				doc_undo(&d)
+				back := len(d.bookmarks) == 2 && d.bookmarks[0] == 12 && d.bookmarks[1] == 26
+				bm_chk(bad, back, fmt.tprintf("undo restores the whole set: %v (want [12 26])", d.bookmarks[:]))
+			}
+			bm_eol(&bad, BM_FIX, bm_set, bm_invariant)
+
 			// --- undo / redo ---------------------------------------------------------
 			bm_undo :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), inv: proc(d: ^Document) -> bool) {
 				fmt.println("--- undo/redo ---")
