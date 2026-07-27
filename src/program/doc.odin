@@ -2319,9 +2319,19 @@ sort_cmp_ci :: proc(a, b: []u8) -> int {
 	return 0
 }
 
-// Split [0,len(buf)) into lines and their terminators. `buf` is a whole-line
-// region that never ends with a terminator (see doc_sort_lines' hi), so there
-// are exactly (newlines + 1) lines and (newlines) terminators.
+// Split [0,len(buf)) into lines and their terminators, producing exactly
+// (newlines + 1) lines and (newlines) terminators — because the final line is
+// appended unconditionally, whether or not it is empty.
+//
+// A previous version of this comment justified that by claiming `buf` never
+// ends with a terminator. **That is false**, and the batch-10 whole-branch
+// review caught it: when the region's last line is empty, `line_span_cap`
+// returns `content_end == line_start`, so `hi` lands just past the preceding
+// '\n' and `buf` does end with one. Worked example — `"b\na\n\n"` with no
+// selection gives `lo=0, hi=4, buf="b\na\n"`. The count identity survives
+// anyway (that trailing '\n' contributes a newline AND an empty final line),
+// which is why nothing was broken; but the reason had to be right, because
+// doc_sort_lines' line cap is written against it.
 //
 // `terms[i]` is the LENGTH of the terminator that followed input line i -- 2 for
 // CRLF, 1 for LF. A 2 is always exactly "\r\n" by construction, which is what
@@ -2439,10 +2449,13 @@ doc_sort_lines :: proc(doc: ^Document, mode: Sort_Mode) -> Sort_Result {
 	// their way up to it: several hundred megabytes allocated, on the input
 	// thread, only to be thrown away by a refusal one line later.
 	//
-	// sort_split_lines appends one line per '\n' plus one final line, and `buf`
-	// never ends with a terminator (see hi above), so newlines+1 IS len(lines) --
-	// this is the same test, not an approximation of it. One pass over a buffer
-	// that is already in cache is the whole price of knowing first.
+	// sort_split_lines appends one line per '\n' plus one final line — appended
+	// unconditionally, whether or not it is empty — so newlines+1 IS len(lines),
+	// the same test rather than an approximation of it. (An earlier version of
+	// this comment reached the same identity via "buf never ends with a
+	// terminator", which is not true when the region's last line is empty; see
+	// sort_split_lines. Right answer, wrong reason.) One pass over a buffer that
+	// is already in cache is the whole price of knowing first.
 	//
 	// After the READ, though, and that part is unchanged: the byte cap already
 	// bounds the read, and the line count is not knowable without it. Nothing has

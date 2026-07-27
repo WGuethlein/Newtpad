@@ -491,7 +491,12 @@ highlight_merge_spans_n :: proc(out: []plat.Text_Span, producers: ..[]plat.Text_
 	survivors: [HL_MAX_ROW_TOKENS]plat.Text_Span
 	lo, hi, cur: [HL_MERGE_MAX_PRODUCERS]int
 	sn := 0
-	np := min(len(producers), HL_MERGE_MAX_PRODUCERS)
+	// Not min(): a producer silently dropped is a whole class of colouring that
+	// vanishes with nothing to notice it, and the caller list is compile-time
+	// (doc_draw passes three). Assert rather than clamp, so adding a fourth is
+	// a crash in the test run rather than a colour nobody can find.
+	assert(len(producers) <= HL_MERGE_MAX_PRODUCERS, "highlight_merge_spans_n: more producers than HL_MERGE_MAX_PRODUCERS")
+	np := len(producers)
 
 	for pi in 0 ..< np {
 		lo[pi] = sn

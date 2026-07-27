@@ -13967,10 +13967,19 @@ when NEWTPAD_TESTS {
 				// against 1.63 ms release on the identical fixture, 8.5x. So the
 				// RELEASE gate is the only real one and the debug gate is a
 				// smoke test at a MEASURED multiplier -- §6ad's shape, where the
-				// same honesty was owed about a frame budget. Cases (1) and (2)
-				// pass the 1 ms gate in BOTH builds and are held to it in both.
+				// same honesty was owed about a frame budget.
+				//
+				// The SAME multiplier applies to case (2). It measures 0.71 ms
+				// debug against a 1 ms gate -- a 28% margin -- and the
+				// bounds-checking that makes case (3) 8.5x slower applies to it
+				// too, so a machine 1.4x slower than this one would go red with
+				// nothing wrong. A gate that flakes is worse than no gate,
+				// because the next person learns to ignore it. Case (1) is
+				// 0.038 ms debug and needs no headroom.
 				DEBUG_MULT :: 9.0
-				worst_gate := BUDGET_MS * (DEBUG_MULT if ODIN_DEBUG else 1.0)
+				dbg := f64(DEBUG_MULT) if ODIN_DEBUG else 1.0
+				wide_gate := BUDGET_MS * dbg
+				worst_gate := BUDGET_MS * dbg
 
 				measure :: proc(r: ^Color_Rules, rows: [][]u8, reps: int) -> (ms: f64, spans: int) {
 					out: [RULES_MAX_ROW_SPANS]plat.Text_Span
@@ -14071,7 +14080,7 @@ when NEWTPAD_TESTS {
 				fmt.printfln("  (3) adversarial          : %.4f ms/frame  %6.1f us/row  %6d probes/row  (%d unbudgeted, cap %d)", worst_ms, worst_ms * 1000 / ROWS, worst_probes, unbudgeted, RULES_MAX_ROW_PROBES)
 				ru_chk(bad, none_ms < 0.05, fmt.tprintf("a machine with no rules.txt pays essentially nothing: %.4f ms/frame", none_ms))
 				ru_chk(bad, real_ms < BUDGET_MS, fmt.tprintf("(1) 64 rules over a viewport of real log rows stay under %.1f ms/frame: %.4f", f64(BUDGET_MS), real_ms))
-				ru_chk(bad, wide_ms < BUDGET_MS, fmt.tprintf("(2) ...and over a viewport of FULL-WIDTH rows, which is 19x the bytes: %.4f", wide_ms))
+				ru_chk(bad, wide_ms < wide_gate, fmt.tprintf("(2) ...and over a viewport of FULL-WIDTH rows, which is 19x the bytes: %.4f (gate %.1f)", wide_ms, wide_gate))
 				ru_chk(bad, worst_ms < worst_gate, fmt.tprintf("(3) ...and so does the adversarial shape, which is what the probe budget exists for: %.4f (gate %.1f, %s build)", worst_ms, worst_gate, "debug" if ODIN_DEBUG else "release"))
 				// The budget must BIND on (3) -- otherwise it is dead code that
 				// could be deleted with the timing still green -- and must not
