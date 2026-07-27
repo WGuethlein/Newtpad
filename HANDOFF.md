@@ -2584,6 +2584,64 @@ measurement so the next reader can tell.
   `build\guarded.obj` and `build\newtpad.res` are copied into the extracted tree and the invocation
   carries `-resource:` and `/STACK:8388608`. Prove the harness on a known-good control first.
 
+## 6ac. The horizontal scrollbar scrolled the wrong number (2026-07-27, v0.17.1)
+
+Wyatt, from live use, within minutes of batch 7 merging: *"the horizontal scrollbar doesn't work when
+in Ctrl+M and Ctrl+T views."* Both were real. Branch `fix/hscroll-grid-preview`.
+
+**v0.17.0 was merged but never cut** — batch 7 landed under the overnight merge-don't-install policy
+and no tag was made, so this release is the first one carrying it.
+
+### What it was
+
+The bar asked one question — how far can this pan? — of `doc_max_hscroll`, which only ever measures
+the **widest source-text line**, and wrote its answer to `doc.h_scroll`. Neither is right outside the
+plain text view:
+
+- **The grid pans `doc.table_col`, by whole columns**, and has since before the bar existed —
+  Shift+wheel drives it. `table.odin` contains **zero** references to `H_SCROLL`.
+- **Markdown Preview has no horizontal axis at all**; it lays out to the pane width. Also zero
+  references.
+
+So in both views the bar appeared (source lines *are* long), dragged, and moved nothing. Markdown
+**Split** was never affected — `doc_wraps` already returns true there, which the new tests confirm
+rather than assume.
+
+### The fix, and why it is shaped this way
+
+`hscroll_model` (`main.odin`) is now the single authority for **which number the bar pans** —
+`Cells` for text, `Columns` for the grid, `None` where the content lays out to fit — and the
+geometry, the drag and the draw all ask it. `hscroll_set` is the only writer the drag uses, so it
+cannot set a field the draw does not read. This is CLAUDE.md's "one layout per widget" applied to a
+policy rather than a geometry, the same move `command_allowed_on` made in §6ab.
+
+`table_cols_fitting` (`table.odin`) sizes the thumb using the same advance the draw uses, rather than
+a second nearly-identical loop.
+
+**One deliberate deviation from the option Wyatt picked.** He chose cell-level panning for the grid
+over "scroll by whole columns"; the grid *already* pans by column via Shift+wheel, so cell-level
+would have given one view two scroll models. Wired to the existing column pan instead, and told him.
+
+### Worth keeping
+
+- **The bug was reproduced before it was fixed.** Reverting the model prints the report back:
+  `drag wrote h_scroll=152, which the grid never reads`. Nine assertions red sabotaged, zero clean.
+- **Two self-inflicted errors caught by the discipline, not by luck.** The first grid fixture used the
+  temp allocator for content `doc_from_content` takes ownership of (`owned_orig = true`), so
+  `doc_close` freed temp memory — instant `0xC0000374` heap corruption, no output at all. And the
+  first sabotage patched the *wrong occurrence* of an identical line elsewhere in `main.odin`, so the
+  grid cases stayed green and looked vacuous when they were merely un-sabotaged. Both are arguments
+  for reading which line the patch actually landed on.
+- The new block reports through **its own counter**, not the shared `bad` — the pre-existing summary
+  line beside it is `if bad == 0`, so an unrelated failure silently suppresses it. Same shared-counter
+  smell §6ab fixed once already.
+
+### Owed
+
+Nothing was verified against real GUI input. Wyatt's pass: a wide CSV in Ctrl+T (drag the bar, and
+confirm Shift+wheel still agrees with it), a long-lined `.md` in Ctrl+M (no bar at all), and a plain
+long-lined text file (unchanged).
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
