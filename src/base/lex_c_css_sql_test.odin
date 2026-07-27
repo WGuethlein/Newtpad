@@ -230,7 +230,9 @@ test_lex_c_sql_dash_dash_inside_string_is_not_a_comment :: proc(t: ^testing.T) {
 // The numeric path: "a - -1" is subtraction of a negative literal, not a
 // comment. "--" is matched as a two-byte RUN, so the space between the
 // dashes means neither position matches. (`a--1`, with no space, IS a
-// comment in every real dialect, so the two-byte run is also right there.)
+// comment in ANSI SQL, Postgres, SQLite and T-SQL -- though not in MySQL,
+// which requires whitespace after the "--". See SQL_KW's comment: the
+// majority reading is the chosen default, not a claim of unanimity.)
 @(test)
 test_lex_c_sql_minus_minus_with_space_is_arithmetic :: proc(t: ^testing.T) {
 	kw := SQL_KW

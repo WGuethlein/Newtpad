@@ -1808,8 +1808,13 @@ CSS_KW := Keyword_Set {
 //   - It is ahead of the number scan, so "-- 1" is a comment, not a dash
 //     followed by a Number. Ordinary arithmetic is untouched, because "--"
 //     is matched as a two-byte run: "a - -1" has a space between the two
-//     dashes and never matches. "a--1" with no space IS a comment, which is
-//     also what every real dialect does.
+//     dashes and never matches. "a--1" with no space IS a comment here,
+//     which is what ANSI SQL, Postgres, SQLite and T-SQL all do -- but NOT
+//     every dialect: MySQL requires whitespace after the "--" and reads
+//     "5--3" as 5 minus negative 3. The majority behaviour is the right
+//     default for a highlighter that does not know which dialect it is
+//     looking at; the MySQL case is a disclosed miscolour, not a claim that
+//     nobody disagrees.
 //   - It is behind the string scan in effect, because a string literal is
 //     consumed whole as one token, so a "--" inside 'a--b' is never examined
 //     as a potential marker at all.
