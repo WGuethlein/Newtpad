@@ -484,6 +484,30 @@ save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -
 	return saved
 }
 
+// How large a file may be and still be re-decoded under a forced encoding.
+//
+// Reopening as anything but UTF-8 transcodes, and doc_open's transcode branch
+// materialises the whole file on the UI thread: make([]u8, len) + safe_copy for
+// a private guarded copy, then decode_to_utf8 into a second allocation. Above
+// plat.FILE_MMAP_THRESHOLD (16 MB) the file is mapped precisely so that none of
+// that happens at open time, and one menu click would undo it -- on a 500 MB log
+// that is a multi-second freeze on the "opens multi-GB files" property, and if
+// the allocation fails the document comes back EMPTY, which a following Ctrl+S
+// then writes over the user's file.
+//
+// So it refuses above a cap, the same shape as a column edit refusing past
+// BLOCK_EDIT_MAX_LINES: a refusal that changes nothing beats a partial result.
+// 64 MB is four times the mmap threshold. Below 16 MB the bytes were copied into
+// private memory at open time anyway, so a transcode there adds nothing new in
+// kind; between 16 and 64 MB sits the band of large-but-ordinary logs and dumps
+// where a mis-detected encoding is still worth correcting and the cost is a
+// tenth of a second. 64 MB bounds the transient allocation at roughly 3x that.
+//
+// A variable, not a constant, only so enctest can lower it and prove the refusal
+// without carrying a 64 MB fixture. Nothing in the product writes it.
+REOPEN_TRANSCODE_MAX_BYTES :: i64(64 * 1024 * 1024)
+reopen_transcode_max_bytes := REOPEN_TRANSCODE_MAX_BYTES
+
 // Re-read the file under `enc`. Confirms first when there are unsaved changes:
 // this discards the buffer, and a menu row that silently destroys work is worse
 // than no row. A failed read leaves the document exactly as it was -- doc_open
@@ -491,6 +515,22 @@ save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -
 @(private = "file")
 reopen_with_encoding :: proc(app: ^App, doc: ^Document, w: ^plat.Window, enc: base.Encoding) {
 	if doc == nil || doc.path == "" {return}
+	// Before the confirm, not after: refusing is not a decision the user should
+	// be asked to discard unsaved work for first. Only the transcoding rows are
+	// capped -- doc_open takes the private copy only when the resolved encoding
+	// is not UTF-8, so Reopen as UTF-8 keeps the mapping and costs nothing extra
+	// however large the file is. doc.disk_stamp.size is the size the watcher last
+	// saw, which is the same number that decides mapped-vs-copied on the re-open.
+	if enc != .UTF8 && doc.disk_stamp.size > reopen_transcode_max_bytes {
+		app_note(
+			app,
+			fmt.tprintf(
+				"[REOPEN REFUSED - re-decoding reads the whole file at once, and this one is over the %d MB limit]",
+				reopen_transcode_max_bytes / (1024 * 1024),
+			),
+		)
+		return
+	}
 	if doc.modified {
 		if !plat.confirm_reopen(w.hwnd if w != nil else nil, doc_display_name(doc), enc_name(enc)) {
 			return

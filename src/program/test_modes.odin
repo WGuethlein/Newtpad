@@ -5418,6 +5418,63 @@ when NEWTPAD_TESTS {
 			}
 			bad += reopen_case(u8f)
 
+			// The size cap. Re-decoding under a forced encoding materialises the
+			// whole file twice on the UI thread, so above REOPEN_TRANSCODE_MAX_BYTES
+			// the command must change NOTHING -- not a truncated document, not an
+			// empty one a following Ctrl+S would write over the file. The cap is
+			// lowered here rather than carrying a 64 MB fixture; that is the whole
+			// reason it is a variable. Both halves matter: the transcoding row
+			// refuses, and Reopen as UTF-8 -- which never takes the private copy --
+			// still goes through at the same size.
+			reopen_cap_case :: proc(path: string) -> (bad: int) {
+				a: App
+				dummy: plat.Window
+				t: plat.Text
+				if !app_open_path(&a, path) {
+					fmt.println("  FAIL   reopen cap: could not open the fixture")
+					return 1
+				}
+				defer app_destroy(&a)
+				d := app_active(&a)
+				before_text := strings.clone(doc_debug_string(d), context.temp_allocator)
+				before_enc := d.enc
+				before_mod := d.modified
+
+				saved := reopen_transcode_max_bytes
+				defer reopen_transcode_max_bytes = saved
+				reopen_transcode_max_bytes = 1 // the fixture is larger than this
+
+				command_dispatch(.Reopen_CP1252, {}, &a, &dummy, &t, 10)
+				refused :=
+					doc_debug_string(d) == before_text &&
+					d.enc == before_enc &&
+					d.modified == before_mod &&
+					strings.has_prefix(a.notice, "[REOPEN REFUSED")
+				fmt.printfln(
+					"  %-6s an over-cap reopen refuses and changes nothing: text=%q enc=%v modified=%v note=%q",
+					"ok" if refused else "FAIL",
+					doc_debug_string(d),
+					d.enc,
+					d.modified,
+					a.notice,
+				)
+				if !refused {bad += 1}
+
+				// UTF-8 is not a transcode, so the cap does not apply to it.
+				command_dispatch(.Reopen_UTF8, {}, &a, &dummy, &t, 10)
+				allowed := d.enc == .UTF8 && doc_debug_string(d) == before_text && strings.has_prefix(a.notice, "[REOPENED AS")
+				fmt.printfln(
+					"  %-6s the cap does not apply to Reopen as UTF-8: enc=%v text=%q note=%q",
+					"ok" if allowed else "FAIL",
+					d.enc,
+					doc_debug_string(d),
+					a.notice,
+				)
+				if !allowed {bad += 1}
+				return
+			}
+			bad += reopen_cap_case(u8f)
+
 			fmt.printfln("enctest: %d failures", bad)
 			return true
 		}
