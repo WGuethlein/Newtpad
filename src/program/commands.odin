@@ -477,7 +477,7 @@ save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -
 		// Same loop for the keymap: saving keys.txt re-reads it, so a binding can
 		// be tried without restarting. Both are called unconditionally and each
 		// checks the path itself.
-		keymap_reload_if_active(path)
+		keymap_reload_if_active(app, path)
 	}
 	return saved
 }

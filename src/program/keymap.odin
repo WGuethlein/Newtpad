@@ -419,7 +419,13 @@ keymap_path :: proc() -> (string, bool) {
 // file, an unreadable one, or one made entirely of garbage all leave the
 // defaults in force -- keymap_parse returns an empty entry list and every
 // lookup falls through.
-keymap_load :: proc() {
+//
+// Returns the counts so the caller can say something: at startup nothing but
+// the log is wanted (there is no window yet, and a 4-second status message
+// nobody is watching is not a report), but on the reload-after-save path the
+// user is standing there having just tried a binding -- see
+// keymap_reload_if_active.
+keymap_load :: proc() -> (bound: int, refused: int) {
 	path, ok := keymap_path()
 	if !ok {return}
 	data, err := os.read_entire_file(path, context.temp_allocator)
@@ -428,11 +434,12 @@ keymap_load :: proc() {
 		return
 	}
 	km := keymap_parse(string(data))
-	n := keymap_reject_total(km)
-	if len(km.entries) > 0 || n > 0 {
-		base.log_info("keys.txt: %d binding(s), %d line(s) refused", len(km.entries), n)
+	bound, refused = len(km.entries), keymap_reject_total(km)
+	if bound > 0 || refused > 0 {
+		base.log_info("keys.txt: %d binding(s), %d line(s) refused", bound, refused)
 	}
 	keymap_install(km)
+	return
 }
 
 // Re-read keys.txt if `path` names it. The mirror of theme_reapply_if_active:
@@ -445,7 +452,16 @@ keymap_load :: proc() {
 // can arrive from the Save dialog, from argv or from an Explorer drop, and can
 // name the same file with different case and separators than the one built
 // from session_dir().
-keymap_reload_if_active :: proc(path: string) -> bool {
+//
+// A refused line is REPORTED here, and only here. Everywhere else in the app a
+// bad line is a log entry, which is the right weight for a file read at
+// startup -- but this is the try-it loop: the user wrote `ctrl+shift+k =
+// Duplicate_Line`, pressed Ctrl+S, and is about to press the chord and get
+// nothing, with no way to tell a rejected line from a mistyped one. A note in
+// the status bar is the same channel a failed theme write and a skipped folder
+// use ([BRACKETED CAPS], four seconds); the log still has the per-line reason,
+// which is why the note points at it rather than trying to quote one.
+keymap_reload_if_active :: proc(app: ^App, path: string) -> bool {
 	kp, ok := keymap_path()
 	if !ok || path == "" {
 		return false
@@ -457,7 +473,10 @@ keymap_reload_if_active :: proc(path: string) -> bool {
 	if norm(path) != norm(kp) {
 		return false
 	}
-	keymap_load()
+	_, refused := keymap_load()
+	if refused > 0 && app != nil {
+		app_note(app, fmt.tprintf("[KEYS.TXT: %d LINE%s REFUSED - see the log (View > Open Logs Folder)]", refused, "" if refused == 1 else "S"))
+	}
 	return true
 }
 

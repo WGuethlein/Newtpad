@@ -11430,9 +11430,32 @@ when NEWTPAD_TESTS {
 				// Saving the file re-reads it: the loop that makes a binding
 				// testable without restarting.
 				_ = os.write_entire_file(path, transmute([]u8)string("ctrl+t = Redo\n"))
-				chk(&bad, keymap_reload_if_active(path) && resolve_key(.T, true, false, .Editor) == .Redo, fmt.tprintf("saving keys.txt re-reads it -> %v (want Redo)", resolve_key(.T, true, false, .Editor)))
+				chk(&bad, keymap_reload_if_active(nil, path) && resolve_key(.T, true, false, .Editor) == .Redo, fmt.tprintf("saving keys.txt re-reads it -> %v (want Redo)", resolve_key(.T, true, false, .Editor)))
 				other := fmt.tprintf("%s%csettings.txt", os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator), '\\')
-				chk(&bad, !keymap_reload_if_active(other), "saving some other file does not")
+				chk(&bad, !keymap_reload_if_active(nil, other), "saving some other file does not")
+				// A refused line has to be visible from inside the app. Without
+				// this the reload loop is only half a loop: the user writes a
+				// chord, saves, presses it, nothing happens, and the one place
+				// that says why is a log file they have no reason to open.
+				{
+					app_t: App
+					menu_init(&app_t.menu)
+					defer app_destroy(&app_t)
+					app_t.settings = settings_default()
+					_ = os.write_entire_file(path, transmute([]u8)string("ctrl+t = Redo\nctrl+shift+k = Undo\nnonsense\n"))
+					reloaded := keymap_reload_if_active(&app_t, path)
+					chk(&bad, reloaded && resolve_key(.T, true, false, .Editor) == .Redo, fmt.tprintf("the good lines still take effect alongside the bad -> %v (want Redo)", resolve_key(.T, true, false, .Editor)))
+					chk(&bad, app_notice_active(&app_t) && strings.contains(app_t.notice, "2 LINES REFUSED"), fmt.tprintf("the refusals are reported in the app, not just the log: %q", app_t.notice))
+					_ = os.write_entire_file(path, transmute([]u8)string("ctrl+q = Frobnicate\n"))
+					keymap_reload_if_active(&app_t, path)
+					chk(&bad, strings.contains(app_t.notice, "1 LINE REFUSED"), fmt.tprintf("one line is singular: %q", app_t.notice))
+					// And a file with nothing wrong with it says nothing at all --
+					// a note on every save of keys.txt would be noise.
+					app_t.notice_started = {}
+					_ = os.write_entire_file(path, transmute([]u8)string("ctrl+t = Undo\n"))
+					keymap_reload_if_active(&app_t, path)
+					chk(&bad, !app_notice_active(&app_t), fmt.tprintf("a clean file posts no note: %q", app_t.notice))
+				}
 				os.remove(path)
 				keymap_reset()
 

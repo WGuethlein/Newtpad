@@ -798,7 +798,7 @@ main :: proc() {
 				theme_reapply_if_active(&app, d.path)
 				// And the keymap, for the same reason: editing keys.txt in another
 				// editor while Newtpad has it open should take effect here too.
-				keymap_reload_if_active(d.path)
+				keymap_reload_if_active(&app, d.path)
 			}
 			session_dirty = true
 		}
