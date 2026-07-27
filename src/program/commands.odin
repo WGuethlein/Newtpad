@@ -639,6 +639,17 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	case .Backspace, .Delete_Fwd, .Delete_Word_Back, .Insert_Newline, .Insert_Tab, .Undo, .Redo, .Cut, .Paste,
 	     .Move_Line_Up, .Move_Line_Down:
 		return true
+	// Changing the line ending rewrites the ENTIRE buffer -- doc_set_line_ending
+	// does pt_delete(0, length) followed by pt_insert -- so every line start after
+	// the first moves by one byte per preceding line. Nothing looks like an edit
+	// less and few things are a bigger one. Left out, both guards below missed it:
+	// a live rectangle kept byte offsets naming rows that had shifted (Alt+drag,
+	// Encoding > CRLF, Ctrl+X cut bytes the user never saw highlighted), and an
+	// in-progress table cell edit kept a captured byte span that table_edit_commit
+	// would then splice at the wrong place. Same shape as the find_replace_all and
+	// Toggle_Table holes fixed in earlier batches.
+	case .Eol_LF, .Eol_CRLF:
+		return true
 	}
 	return false
 }

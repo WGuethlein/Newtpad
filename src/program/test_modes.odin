@@ -4354,6 +4354,50 @@ when NEWTPAD_TESTS {
 			}
 			if block_test_undo_run_absorb_append(&t) > 0 {fail = true}
 
+			// A rectangle must not survive a line-ending conversion.
+			// doc_set_line_ending rewrites the WHOLE buffer -- pt_delete(0, length)
+			// then pt_insert -- so every row start after the first shifts by one byte
+			// per preceding line, while the rectangle's stored block_*_line_start
+			// offsets still name the old ones. The next Ctrl+X would then cut bytes
+			// the user never saw highlighted. The only thing standing between the two
+			// is command_mutates_doc: with .Eol_LF/.Eol_CRLF missing from it neither
+			// the table guard nor the block_clear branch in command_dispatch fires.
+			// Dispatched as a command, not by calling doc_set_line_ending directly --
+			// the guard lives in command_dispatch, so a direct call would prove
+			// nothing.
+			block_test_eol_clears_rect :: proc(t: ^plat.Text) -> (bad: int) {
+				ta: App
+				tdummy: plat.Window
+				app_new_scratch(&ta)
+				td := app_active(&ta)
+				doc_close(td)
+				td^ = doc_from_content(transmute([]u8)strings.clone("alpha\nbravo\ncharlie\n"), "", .UTF8)
+				td.wrap = false
+				td.eol = .LF
+				// Row starts are 0, 6, 12; a width-2 rectangle down all three rows.
+				refusal := block_set_from_points(td, t, 0, 0, 12, 2)
+				live_before := refusal == .None && block_active(td)
+
+				command_dispatch(.Eol_CRLF, {}, &ta, &tdummy, t, 10)
+
+				after := doc_debug_string(td)
+				gone := !block_active(td)
+				converted := td.eol == .CRLF && after == "alpha\r\nbravo\r\ncharlie\r\n"
+				ok_all := live_before && gone && converted
+				fmt.printfln(
+					"  %-6s a line-ending change drops the live rectangle: live_before=%v block_active_after=%v eol=%v text=%q",
+					"ok" if ok_all else "FAIL",
+					live_before,
+					block_active(td),
+					td.eol,
+					after,
+				)
+				if !ok_all {bad += 1}
+				app_destroy(&ta)
+				return
+			}
+			if block_test_eol_clears_rect(&t) > 0 {fail = true}
+
 			// SEAM PROOF: the assertion the previous round's clipboard fix
 			// lacked. block_test_an (above) only proves block_test_ai's OWN
 			// save/restore works; it says nothing about block_test_t,
