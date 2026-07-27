@@ -14064,7 +14064,7 @@ when NEWTPAD_TESTS {
 				none_ms, _ := measure(&none, real_rows, 200)
 
 				fmt.printfln("  rules active           : %d (RULES_MAX %d), pattern cap %d bytes", len(real_rules.list), RULES_MAX, RULES_PATTERN_MAX)
-				fmt.printfln("  viewport               : %d rows x %d bytes (realistic) / %d bytes (adversarial)", ROWS, len(line), len(wide))
+				fmt.printfln("  viewport               : %d rows of %d bytes (case 1) or %d bytes (cases 2 and 3)", ROWS, len(line), len(wide))
 				fmt.printfln("  no rules installed       : %.4f ms/frame", none_ms)
 				fmt.printfln("  (1) real log rows        : %.4f ms/frame  %6.1f us/row  %6d probes/row  (%d spans/frame)", real_ms, real_ms * 1000 / ROWS, real_probes, real_spans)
 				fmt.printfln("  (2) full-width rows      : %.4f ms/frame  %6.1f us/row  %6d probes/row", wide_ms, wide_ms * 1000 / ROWS, wide_probes)
