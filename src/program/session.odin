@@ -319,7 +319,8 @@ session_restore :: proc(a: ^App) -> bool {
 			d.top = clamp(top, 0, L)
 			// After the position clamps, not before: doc_view_apply re-anchors
 			// doc.top to a line start when a line-scrolled view is on.
-			doc_view_apply(d, Doc_View{wrap = wrap, md_mode = md_mode, table = table})			// A buffer rebuilt from a backup has never been stat'd (doc_from_content
+			doc_view_apply(d, Doc_View{wrap = wrap, md_mode = md_mode, table = table})
+			// A buffer rebuilt from a backup has never been stat'd (doc_from_content
 			// sets no stamp), while doc_open already stamped the clean-tab case. Adopt
 			// what the session recorded so an unchanged file stays quiet -- and a file
 			// that genuinely changed while we were closed still reports.
