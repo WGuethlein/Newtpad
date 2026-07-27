@@ -388,10 +388,18 @@ session_restore :: proc(a: ^App) -> bool {
 
 		d := new(Document)
 		created := false
+		// "the session RECORDED a backup" (bidx >= 0) is not "the backup LOADED".
+		// A missing, swept or unreadable backup falls through to doc_open below,
+		// which is a reopen FROM DISK -- so everything that is only true of a
+		// restored buffer (the recorded BOM/EOL, and above all the bookmark
+		// offsets, which describe the bytes we wrote, not the bytes on disk) must
+		// key off this and not off bidx.
+		from_backup := false
 		if bidx >= 0 { // dirty/untitled: restore content from the backup
 			if content, cerr := os.read_entire_file(backup_path(backups, bidx), context.allocator); cerr == nil {
 				d^ = doc_from_content(content, path, enc)
 				created = true
+				from_backup = true
 			}
 		}
 		if !created && path != "" { // clean tab: reopen from disk
@@ -417,11 +425,11 @@ session_restore :: proc(a: ^App) -> bool {
 			// Same for the BOM and line endings, which doc_from_content does not set
 			// either. Only for the backup path: doc_open detected both from the real
 			// bytes and is authoritative for a clean tab.
-			if bidx >= 0 && have_eol {
+			if from_backup && have_eol {
 				d.had_bom = had_bom
 				d.eol = eol
 			}
-			session_restore_bookmarks(d, bm_field, stamp, bidx >= 0)
+			session_restore_bookmarks(d, bm_field, stamp, from_backup)
 			slot := app_add(a, d)
 			if ti == active {active_slot = slot}
 			restored += 1

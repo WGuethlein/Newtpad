@@ -12209,6 +12209,28 @@ when NEWTPAD_TESTS {
 					bm_chk(bad, good, fmt.tprintf("a hand-edited bookmark field keeps only the valid, ascending line starts: %v (want [6 20])", d != nil ? d.bookmarks[:] : nil))
 				}
 
+				// A session that RECORDED a backup whose file is gone. The tab falls
+				// through to a reopen from disk, so the offsets are once again
+				// offsets against a file we did not write -- the stamp check has to
+				// run. Keying the gate off `bidx >= 0` ("a backup was recorded")
+				// rather than off "the backup loaded" skipped it, and a dirty tab
+				// whose backup was swept came back with marks measured against a
+				// buffer that no longer exists.
+				//
+				// bidx 99 has no backup file; the stamp fields are deliberately
+				// wrong, and 6 and 20 ARE line starts in the file, so only the stamp
+				// check can drop them.
+				{
+					line := fmt.tprintf("0 0 0 0 0 99 12345 999 0 0 0 0 6,20 %s\n", v4)
+					plat.file_write_atomic(sp, transmute([]u8)fmt.tprintf("newtpad-session 5\nactive 0\n%s", line))
+					h: App
+					defer app_destroy(&h)
+					ok := session_restore(&h)
+					d := app_active(&h)
+					good := ok && d != nil && d.path == v4 && len(d.bookmarks) == 0
+					bm_chk(bad, good, fmt.tprintf("a recorded-but-missing backup still gets the stamp check: ok=%v path=%q bookmarks=%v (want [])", ok, d != nil ? d.path : "", d != nil ? d.bookmarks[:] : nil))
+				}
+
 				// A path with spaces still splits correctly with the extra field in
 				// front of it -- the reason the bookmark token may never contain one.
 				spaced := fmt.tprintf("%s%cnewtpad bm spaced.txt", tmp, '\\')
