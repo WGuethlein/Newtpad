@@ -378,7 +378,9 @@ block_row_range :: proc(doc: ^Document, t: ^plat.Text, line_start: int, cell_lo,
 			}
 			r, sz := utf8.decode_rune(buf[i:n])
 			if sz == 0 {sz = 1}
-			w := plat.text_cell_width(t, r, .Doc)
+			// `cell` is the running cell column from `line_start`, this row's
+			// own origin -- the same origin the draw measures from.
+			w := plat.text_cell_width_at(t, r, cell, .Doc)
 
 			if !lo_found && cell + w > cell_lo {
 				// This rune's span reaches into or past cell_lo, whether it

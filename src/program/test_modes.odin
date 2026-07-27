@@ -1614,9 +1614,19 @@ when NEWTPAD_TESTS {
 				return true
 			}
 			samples := "aé中がx́\t" // ascii, 2-byte latin, CJK x2, kana, ascii, combining acute, tab
-			fmt.printfln("tab = %d cells (want %d, and must draw no glyph)", plat.text_cell_width(&t, '\t'), plat.TAB_CELLS)
+			// Column 0: a standalone probe of a tab at the start of a row.
+			fmt.printfln("tab = %d cells (want %d, and must draw no glyph)", plat.text_cell_width_at(&t, '\t', 0), plat.TAB_CELLS)
 			fmt.printf("cells: ")
-			for r in samples {fmt.printf("%q=%d ", r, plat.text_cell_width(&t, r))}
+			// A running column, not 0 per rune: this walks `samples` from its
+			// start, so each rune's real column is available, and the per-rune
+			// widths printed here must sum to the text_cells total printed on
+			// the next line.
+			scol := 0
+			for r in samples {
+				w := plat.text_cell_width_at(&t, r, scol)
+				fmt.printf("%q=%d ", r, w)
+				scol += w
+			}
 			bytes := transmute([]u8)samples
 			fmt.printfln(" | total=%d cells over %d bytes", plat.text_cells(&t, bytes), len(bytes))
 			// inverse: the byte offset at each cell column should round-trip.
@@ -7781,7 +7791,9 @@ when NEWTPAD_TESTS {
 			// dedicated CR-skip block deleted and no zero-width guarantee in its
 			// place, because the font happened to also measure CR as ~0 -- this is
 			// the assertion that actually pins the guarantee down.
-			chk("CR cell width (zero by construction)", plat.text_cell_width(&t, '\r', .Doc), 0, &fail)
+			// Column 0: CR is not a tab, so the column cannot affect its width --
+			// that is the whole content of this assertion.
+			chk("CR cell width (zero by construction)", plat.text_cell_width_at(&t, '\r', 0, .Doc), 0, &fail)
 
 			// CRLF x wrap: nothing above exercises eff_row_end's wrapped branch or
 			// visible_next's wrapped vis_end, since none of wraptest/wraplongtest use

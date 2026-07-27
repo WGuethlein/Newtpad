@@ -294,7 +294,9 @@ line_wrap_decision :: proc(doc: ^Document, t: ^plat.Text, ls: int) -> bool {
 			r, sz := utf8.decode_rune(buf[i:n])
 			if sz == 0 {sz = 1}
 			if i + sz > n && p + n < limit {break} // rune straddles the chunk; refill
-			cells += plat.text_cell_width(t, r, .Doc)
+			// `cells` is this line's running cell column, counted from the
+			// logical line start `ls` -- the right origin for a tab stop.
+			cells += plat.text_cell_width_at(t, r, cells, .Doc)
 			if cells > WRAP_LONG_CELLS {long = true}
 			i += sz
 		}
@@ -346,7 +348,17 @@ wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (end: int, 
 			r, sz := utf8.decode_rune(buf[i:n])
 			if sz == 0 {sz = 1}
 			if i + sz > n && pos + n < L {break} // rune straddles the chunk; refill
-			cw := plat.text_cell_width(t, r, .Doc)
+			// `col` is the column within this VISUAL row, which is the origin
+			// tab stops are measured from here. With wrap off -- the normal
+			// case, the only case for .tsv, and the only case column editing
+			// permits -- a visual row is its logical line, so it is exactly
+			// right. With wrap on, a tab on a continuation row aligns to that
+			// row rather than to the logical line; that is a deliberate,
+			// bounded deviation (leading indentation lives on the first visual
+			// row, where the origin is right), and what matters more is that
+			// the draw and the hit-test share this convention, which they do
+			// because both measure from the row start.
+			cw := plat.text_cell_width_at(t, r, col, .Doc)
 			if col + cw > c && col > 0 {
 				if last_break > p {return last_break, false}
 				return pos + i, false // char-break an over-long word

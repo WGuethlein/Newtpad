@@ -490,14 +490,25 @@ is_zero_width :: proc(r: rune) -> bool {
 // relative to one cell, so it matches whatever font renders it (no width tables);
 // width 0 is decided by is_zero_width. Cached; the ratio is px-independent. Tabs
 // are one cell for now (tab stops are a later feature).
-// Cells a tab occupies. Fixed width, not true tab stops (which would advance to
-// the next multiple and so need the column, which this per-rune call doesn't
-// have). Predictable, and it beats the previous behaviour: one cell, rendered as
-// a missing-glyph box because no font has a glyph for U+0009.
+// Cells a tab occupies. A fixed width, not true tab stops (which advance to the
+// next multiple and so need the starting column). The column is now threaded in
+// -- see text_cell_width_at -- but the tab branch deliberately still ignores it,
+// so this commit changes no behaviour. Predictable, and it beats the previous
+// behaviour: one cell, rendered as a missing-glyph box because no font has a
+// glyph for U+0009.
 TAB_CELLS :: 4
 
-text_cell_width :: proc(t: ^Text, r: rune, set := Font_Set.UI) -> int {
-	if r == '\t' {return TAB_CELLS}
+// Cells a rune occupies when it begins at cell column `col` of its row.
+// `col` matters only for '\t': a tab advances to the next tab stop, so its
+// width depends on where it starts. Every other rune ignores it.
+//
+// `col` is required rather than defaulted on purpose. A defaulted `col := 0`
+// compiles at every existing call site unchanged, which is precisely how a
+// substring measurement would keep a silently wrong origin; making it required
+// turns the sweep into a compiler error at every site that decides a tab's
+// width.
+text_cell_width_at :: proc(t: ^Text, r: rune, col: int, set := Font_Set.UI) -> int {
+	if r == '\t' {return TAB_CELLS} // `col` unused until tab stops land
 	if c, found := t.cell_cache[set][r]; found {return int(c)}
 	c := &t.chains[set]
 	cells: u8 = 1
@@ -524,7 +535,7 @@ text_cell_width :: proc(t: ^Text, r: rune, set := Font_Set.UI) -> int {
 // Total cells spanned by a UTF-8 slice (sum of per-rune cell widths).
 text_cells :: proc(t: ^Text, s: []u8, set := Font_Set.UI) -> int {
 	col := 0
-	for r in string(s) {col += text_cell_width(t, r, set)}
+	for r in string(s) {col += text_cell_width_at(t, r, col, set)}
 	return col
 }
 
@@ -535,7 +546,7 @@ text_bytes_for_cells :: proc(t: ^Text, s: []u8, target: int, set := Font_Set.UI)
 	col, i := 0, 0
 	for i < len(str) {
 		r, w := utf8.decode_rune(str[i:])
-		cw := text_cell_width(t, r, set)
+		cw := text_cell_width_at(t, r, col, set)
 		if col + cw > target {break} // target lands within this rune's cell span
 		col += cw
 		i += w
@@ -602,6 +613,14 @@ text_draw_spans :: proc(
 
 	cell_w := text_char_width(t, px, set) // same rounded advance the program's grid uses
 	pen := x
+	// The cell column, tracked alongside the pen. `pen` is pixels and cannot
+	// stand in for it: (pen - x) / cell_w only equals the column while every
+	// rune is a whole number of fixed-width cells, which stops being true the
+	// moment a tab's width depends on where it starts. `str` is always drawn
+	// from a row start (the document draw passes line_buf from the row start at
+	// col_x(.., 0, ..); chrome callers pass whole labels), so 0 is the real
+	// origin here.
+	col := 0
 	si := 0 // spans are sorted, so this only ever moves forward
 	for r, off in str {
 		// Advance past spans this rune is already beyond, then take the colour of
@@ -617,9 +636,10 @@ text_draw_spans :: proc(
 		// key -- belong to a different font than the one being drawn, so with any
 		// document font other than Consolas the caret and selection drifted from
 		// the glyphs, accumulating along the line.
-		cells := text_cell_width(t, r, set)
+		cells := text_cell_width_at(t, r, col, set)
 		if r == '\t' {
 			pen += f32(cells) * cell_w // whitespace: advance, draw nothing
+			col += cells
 			continue
 		}
 		face, gi := rune_face(t, r, set)
@@ -636,6 +656,7 @@ text_draw_spans :: proc(
 			})
 		}
 		pen += f32(cells) * cell_w // grid advance, not the glyph's natural advance
+		col += cells
 	}
 	if len(instances) == 0 {
 		return
@@ -757,7 +778,12 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, set: Font_Set, face: int, index: u16, px:
 // grid the glyphs advance along, or they drift on CJK and tabs.
 text_span_cells :: proc(t: ^Text, str: string, start, length: int, set := Font_Set.UI) -> (col, cells: int) {
 	for r, off in str {
-		w := text_cell_width(t, r, set)
+		// `col + cells`, not either alone: this walk splits one running column
+		// across two accumulators -- `col` holds the cells before `start`, and
+		// `cells` holds the cells since. Neither is the rune's column on its
+		// own; only their sum is, before `start` (when cells == 0) and after it
+		// (when col has stopped moving) alike.
+		w := text_cell_width_at(t, r, col + cells, set)
 		if off < start {
 			col += w
 			continue
