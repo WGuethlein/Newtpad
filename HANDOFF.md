@@ -24,10 +24,14 @@ operational traps that have each cost a session real time. Unlike `CLAUDE.md`, i
 tagged with the exe attached. The installed binary is v0.16.0 — **1.01 MB, down from 1.43 MB**,
 because the headless harness no longer ships inside it (§6z).
 
-**Immediate next step: batch 7 (§6u)** — ship-readiness: a real self-contained installer, the
-signing pipeline built signing-*ready* (a certificate is Wyatt's to buy; Claude must never handle
-one), and glyph-atlas eviction. Gating `test_modes.odin` came forward into batch 6, so it is off
-batch 7's list. Nothing has been specced for it.
+**The road to V1 is sequenced in §6aa (2026-07-26), which supersedes §6u's batch table.** The V1
+feature list is *done* — five of research §G's six V1 decisions shipped and the sixth was deferred
+to V2 — so what remains is hard-rule debt, one batch of promises from CLAUDE.md's own principles,
+and distribution. The UI overhaul moved to V2; a free public beta precedes the paid V1.
+
+**Immediate next step: batch 7 (§6aa)** — the silent failures: glyph-atlas eviction, `\\?\` long
+paths, tab stops, the CSS/SQL comment markers, and the §5 findings carried out of batch 6. Nothing
+has been specced for it.
 
 **Three things Wyatt owes, all ranked in their own sections and none blocking:**
 
@@ -2270,6 +2274,93 @@ release-build measurement and gating without that row would have made it impossi
 - **Nothing in this batch was verified against real GUI input.** Every claim about what happens when
   you click something is inference from source plus a headless assertion.
 - Carried findings are in §5.
+
+## 6aa. The road to V1 (2026-07-26)
+
+Wyatt asked for the whole plan from v0.16.0 to a shipped V1 and answered the four forks that decide
+its shape. **This supersedes §6u's batch table for batches 7-8** — the contents moved, and two
+things left V1 entirely.
+
+### Where V1 actually stands
+
+Of `research/demand-side-feature-research.md` §G's six V1 decisions, **five have shipped**:
+column/block editing (§6y), filter-to-matches (§6e, §6h), the scratch buffer as a hot-exit primitive
+with a Settings toggle (§6b), per-monitor DPI (§6g), and the session-restore toggle. The sixth —
+first-party JSON/CSV/XML reformat — was decided *out* of V1 and held to the V2 plugin proofs.
+
+**The V1 feature list is done.** What separates v0.16.0 from a shippable product is hard-rule debt,
+distribution machinery, and one batch of promises made in CLAUDE.md's own product principles. Worth
+stating plainly, because it changes what the remaining batches are *for*: they are mostly not
+feature work, and a session that opens this file looking for the next feature to build will
+misread the state.
+
+### The four forks, as answered
+
+1. **The UI overhaul and the `renderer`/`ui` extraction move to V2, as its first item.** CLAUDE.md
+   ranks them priority 2, but `research/newtpad-research-report.md:129` records File Pilot's own
+   advice: budget exactly one UI rewrite and do it *after* V1, once real use cases exist. The
+   research wins — shipping is what produces the use cases the rewrite is supposed to be informed
+   by. It is also the difference between V1 being four batches away and ten.
+2. **A free public beta precedes the paid V1.** "V1" is therefore two milestones, and the commerce
+   work (trial, offline licence key, storefront) sits *after* the beta rather than before it.
+3. **Rebindable keys are in V1.** Named in CLAUDE.md principle 4; the hard half — the data-declared
+   `[Command_Id]Command` table with its `#assert` — has existed since the tabs batch. Only the user
+   overlay is missing.
+4. **Accessibility rides with the UI refresh, i.e. V2.** High-contrast is blocked on the colour-token
+   layer rather than on effort (§6k), and a UIA provider written against a UI about to be rewritten
+   is work done twice. Note what this decides: **the beta and the paid V1 both ship with no
+   screen-reader support.** A deliberate, dated choice — not an oversight to rediscover.
+
+### The batches
+
+| Batch | Theme | Contents |
+|---|---|---|
+| **7** | Silent failures | Glyph-atlas eviction · `\\?\` long paths · tab stops · CSS `//` + SQL `--` comment markers · the §5 findings carried out of batch 6 |
+| **8** | Engine debt | Release build time back under the ~5 s rule · precompiled `.cso` shaders · batch the text pipeline · settle the VirtualAlloc-arena decision |
+| **9** | Keys and navigation | Rebindable-key overlay · bookmarks · scrollbar match marks · filter click-to-jump · filter's first paint |
+| **10** | Text operations | Sort lines / remove duplicates · keyword→colour rules · whatever live use has surfaced by then |
+| **11** | Distribution | Real self-contained installer · signing pipeline built signing-*ready* · updater · LICENSE/EULA · a way for a beta tester to send a crash |
+| — | **BETA** | Landing page, download, publish the price early and hold it (File Pilot precedent) |
+| **12** | Commerce | Trial · offline licence key · storefront — informed by beta feedback |
+| — | **V1** | |
+
+Batches 9 and 10 are one body of work split on a guess; the split is provisional and belongs to
+whoever plans them.
+
+**Batch 7 is the one to spec next.** Its four items are independent of each other, which makes it
+the cleanest fan-out on the list, and every one of them is a wrong behaviour a user can hit today:
+the atlas silently drops glyphs while the pen advances, a path over ~260 characters simply fails to
+open, tabs render as one cell so indented code and `.tsv` are wrong, and a `--` SQL comment colours
+its own contents as keywords.
+
+**Batch 8's arena row is a decision, not an implementation.** CLAUDE.md's memory rule describes
+arenas on VirtualAlloc that have never existed; the honest options are to build them or to amend the
+rule. Recommendation on the evidence available: **amend.** There is no measured allocation problem,
+the per-document arena was already refuted once on its own merits (§6b), and a locked decision that
+describes code nobody has written is worse than no rule. Do not let a batch default into building it.
+
+### Explicitly out of V1
+
+Ruled out here, so the next audit does not resurface them as gaps: code folding, macros /
+record-replay, file compare / diff, print and print preview, spellcheck, and global-hotkey quick
+capture — all from research §C, none ever ruled in. Also out, by earlier decision: first-party
+reformat, full multi-cursor, and plugins (all V2), and the container/archive tree viewer (§6).
+
+### The gate on the beta that is not a batch
+
+**Wyatt's live passes are now on the critical path, not beside it.** Nothing in this codebase has
+ever been verified against real GUI input except by Wyatt — this environment cannot inject any. Two
+are owed before strangers see the product: **§6x's theme-tuning pass** (Dark's syntax colours were
+chosen by arithmetic and have been looked at once, and they are the first thing every beta tester
+will see) and **§6z's list** on batch 6. A public beta is the mechanism that finally converts this
+debt into other people's testing, which is an argument for reaching it sooner rather than for
+skipping the two passes.
+
+### Also worth doing, independent of any batch
+
+`CLAUDE.md` is gitignored and exists only on Wyatt's disk (see the note at the top of this file,
+still true). It defines every locked decision, the hard engineering rules and the git conventions,
+and it has no backup, no history, and is invisible to a fresh clone. Tracking it costs nothing.
 
 ## 7. Build environment (Windows, this machine)
 
