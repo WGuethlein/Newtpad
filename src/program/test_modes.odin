@@ -7262,6 +7262,42 @@ when NEWTPAD_TESTS {
 				app_destroy(&a)
 			}
 
+			// The live half of doc_view_apply's mutual-exclusion rule. Both
+			// doc_can_* gates short-circuit true on an untitled buffer, so Ctrl+T
+			// then Ctrl+M was reachable with two keystrokes on a fresh tab and
+			// produced table && md_mode == .Split -- the state view.odin calls
+			// undefined. Session format 4 persists both fields, so a restart
+			// resolved it through doc_view_apply while the live document stayed in
+			// it. Each toggle must turn the other off itself. Both directions,
+			// because they are two separate pieces of code.
+			fmt.println("--- the two views are mutually exclusive live, not only on restore ---")
+			{
+				a: App
+				dummy: plat.Window
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
+				command_dispatch(.Toggle_Preview, {}, &a, &dummy, &t, 10)
+				d := app_active(&a)
+				ok1 := d != nil && !d.table && d.md_mode != .Off
+				fmt.printfln("  Ctrl+T then Ctrl+M: table=%-5v md_mode=%-8v (want false/not-Off) %s", d.table, d.md_mode, "OK" if ok1 else "FAIL")
+				if !ok1 {bad += 1}
+				app_destroy(&a)
+			}
+			{
+				a: App
+				dummy: plat.Window
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				command_dispatch(.Toggle_Preview, {}, &a, &dummy, &t, 10)
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
+				d := app_active(&a)
+				ok2 := d != nil && d.table && d.md_mode == .Off
+				fmt.printfln("  Ctrl+M then Ctrl+T: table=%-5v md_mode=%-8v (want true/Off) %s", d.table, d.md_mode, "OK" if ok2 else "FAIL")
+				if !ok2 {bad += 1}
+				app_destroy(&a)
+			}
+
 			fmt.println("--- session restore wins over the family default ---")
 			{
 				// A tab left in Preview, saved and restored, must not come back forced

@@ -694,6 +694,20 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	return false
 }
 
+// Leave the grid, doing everything .Toggle_Table's own off-branch does rather
+// than assigning the field. A dangling cell edit holds a byte span captured
+// before whatever happens next, and table_edit_commit is the only thing that
+// closes it (it splices, drops the rectangle and refits); the widths go so the
+// next turn-on measures the content as it then is. Used by .Toggle_Preview,
+// which must turn the grid off because the two views are mutually exclusive.
+@(private = "file")
+leave_table_view :: proc(doc: ^Document) {
+	if !doc.table {return}
+	if doc.table_editing {table_edit_commit(doc)}
+	doc.table = false
+	clear(&doc.table_widths)
+}
+
 command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^plat.Window, t: ^plat.Text, rows: int) {
 	if cmd != .None {diag_cmd(cmd)} // breadcrumb: what the user was doing
 	doc := app_active(app)
@@ -995,6 +1009,17 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			if block_active(doc) {block_clear(doc)}
 			doc.table = !doc.table
 			if doc.table {
+				// The grid and a markdown view are mutually exclusive -- Split
+				// force-wraps and the table guard above blocks every mutating
+				// command, so a document in both is the state view.odin calls
+				// undefined and doc_view_apply refuses to restore. Both gates
+				// short-circuit true for an untitled buffer, so Ctrl+T then
+				// Ctrl+M on a scratch tab reached it live; session format 4
+				// persists both fields, so a restart quietly resolved it while
+				// the live case stayed broken. Turning markdown off needs no
+				// care beyond the field: its only companion state is the
+				// rectangle, cleared just above for both directions.
+				doc.md_mode = .Off
 				doc.table_delim = table_choose_delim(doc)
 				doc.top = base.pt_line_start(&doc.pt, doc.top)
 				doc.table_col = 0
@@ -1021,6 +1046,12 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			switch doc.md_mode {
 			case .Off:
 				doc.md_mode = .Preview
+				// The other half of the mutual exclusion .Toggle_Table enforces.
+				// Through leave_table_view, not doc.table = false: an in-cell
+				// edit left dangling here would keep a byte span nothing will
+				// ever splice, and the fitted widths would be reused against
+				// content that has moved on.
+				leave_table_view(doc)
 				doc.top = base.pt_line_start(&doc.pt, doc.top)
 			case .Preview:
 				doc.md_mode = .Split
