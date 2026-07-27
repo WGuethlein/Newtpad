@@ -37,6 +37,11 @@ worth reading before trusting any other "X is missing" claim in this file.
 **The installed binary is still v0.16.0.** Batch 7 merged under Wyatt's overnight policy: merge, do
 not `install.ps1`. Run it after the live pass in §6ab's "Owed".
 
+**Batch 9 is merged; v0.18.0.** Keys and navigation — `keys.txt` rebinding, bookmarks, scrollbar
+match marks, filter click-to-jump, and filter's first paint. See §6ad, whose "what this batch got
+wrong" section is the useful half: six tests that could not fail, two correct functions composing
+wrongly, and two draw-order defects no per-task review could see.
+
 **Batch 8 is specced and its scope halved** — `docs/superpowers/specs/2026-07-27-batch-8-design.md`.
 Build time turned out already resolved (measured: 5.1 s, §5) and the arena decision was settled in
 batch 7, leaving precompiled `.cso` shaders (which the 2026-07-25 audit downgraded itself) and
@@ -2676,6 +2681,124 @@ passes through it safely. One instance, not a class.
 Nothing was verified against real GUI input. Wyatt's pass: a wide CSV in Ctrl+T — **hold and drag**
 the bar, not just click it — and confirm Shift+wheel still agrees with it; a long-lined `.md` in
 Ctrl+M (no bar at all); and a plain long-lined text file (unchanged).
+
+## 6ad. Keys and navigation (2026-07-27, v0.18.0, branch `feat/batch-9`)
+
+Batch 9 of §6aa — the first of the two feature batches between here and the beta. Five items, 28
+commits. Design in `docs/superpowers/specs/2026-07-27-batch-9-design.md`, plan beside it.
+
+**Shipped:** a `keys.txt` user keymap overlay · bookmarks with `Ctrl+F2` / `F2` / `Shift+F2`,
+persisted · find-match ticks on the scrollbar · click a filtered line to jump to it · and filter view
+finally paints on the first frame.
+
+### Decisions taken with Wyatt, 2026-07-27 — do not relitigate
+
+- **Rebindable keys are a file, not a capture UI.** The UI is a whole widget (conflict detection,
+  reserved chords, reset-to-default) and is its own batch; the file matches the shape `settings.txt`
+  and the theme files already use. Revisit only if the file is painful in real use.
+- **Bookmarks: simple toggle plus next/prev, persisted. No numbered bookmarks** — they would consume
+  nine chords, and `Ctrl+1..9` is what most editors use for tab switching.
+- Taken at the same time, for batch 11: **proprietary free-beta EULA**, and a **manual-check-only
+  updater** (no background traffic — research §D lists no-telemetry as a hard expectation).
+
+### What the batch had to work around
+
+**Shift is not part of a chord.** `Binding` is `(key, ctrl, alt, ctx)`, and `commands.odin:252` and
+`:294` both say so — §6y was caught by this once already. So bookmarks ship **one** cycle command
+reading `ev.shift` for direction, and `keys.txt` **refuses** a `shift+` chord rather than silently
+binding the `ctrl+` half. Silently binding something the user did not ask for is the worse failure.
+
+**There were no F-keys in the tree.** `plat.Key` had none and `vk_to_key` no cases, so `VK_F2`
+resolved to `.None` and every function key was swallowed. Adding F1–F12 **silently broke Alt+F4** —
+the pump let Alt+F4 and F10 reach `DefWindowProc` only because `vk_to_key` returned `.None` for them,
+an accident of the key set rather than a decision. Caught by the implementer, fixed via
+`key_belongs_to_windows`, and rebased into the F-key commit so no commit in history carries the
+regression.
+
+### The lesson that generalises: what the compiler does and does not enforce
+
+The implementer's first write-up said *"growing an enum puts zero pressure on code that switches on
+values."* The reviewer tested Odin directly and that is **too strong** — a plain `switch` over an
+enum *is* exhaustive, and compiler pressure did work here (the total `[plat.Key]string` array failed
+to build until twelve rows were added). The accurate version, which is worth keeping:
+
+> Odin's exhaustive `switch` and total array literals give **structural** pressure — every value has
+> an entry. They give **no** pressure on **semantic** questions — which values must be treated
+> specially. And none at all at the three sites that opt out: `#partial switch`, a `case:` default,
+> and a **value comparison**, which is not a switch at all. `wnd_proc`'s `if key == .None` was the
+> third kind, and `vk_to_key`'s switch is over `win.WPARAM`, not over `Key`. Growing an enum is a
+> behavioural change at every `==`/`!=` site against it, and those are invisible by construction.
+
+### The bound, and the plan's number being wrong
+
+Filter's first paint adds a **synchronous** scan on the UI thread, which is a hard-rule violation if
+the bound is wrong. The plan pointed at `SEARCH_SYNC_MAX` (256 KB) as the precedent. Measured, it
+spends **13.90 ms of a 16.7 ms frame** on `[A-Za-z]+@[a-z]+` — a pattern someone might plausibly
+type — and **fails outright in debug at 20.35 ms**. Shipped **`SEARCH_FIRST_PAINT = 64 KB`** instead.
+
+Then the review found a **worse pattern**: `(the|fox|dog)+x` at 10.79 ms, and the budget was on bytes
+*offered*, not consumed — `pt_line_end_cap` returns `p+cap` when it finds no newline, so a file with
+no newline in its first 128 KB (minified JSON, a single-line dump) scanned **2×** the budget. Fixed
+by reserving the run-on *inside* the budget, so regex first paint covers ~48 KB and literal still 64.
+Re-measured worst case **10.98 ms release / 15.5 ms debug**. The falsifier is in the shipped test and
+**gated** — it fails the suite over a frame — which is the "a test that has never failed proves
+nothing" rule applied to a *number* rather than a branch.
+
+**Also corrected: §6e's claim that "filter view shows an empty screen" was never literally true.**
+`visible_next` falls back to the unfiltered document while `filter_lines` is empty, and has since
+2026-07-19. The real defects were no rows on the first frame when the head of the file *did* match,
+and a banner that said "searching" **forever** on a query with no matches. Both fixed.
+
+### What this batch got wrong
+
+**Six tests could not fail, and every one was found by sabotage rather than by reading.** One in
+task 1, three in task 2, one in task 3 that the implementer found in their own test, and a sixth that
+only the whole-branch review caught (`mark_bucket_h`, the entire shape-A guard against a track taller
+than `MAX_QUADS` — every fixture used a 100–700 px track, so the guard could be deleted with the
+suite green). The pattern across all six is the same: **the assertion measured the fixture, or the
+buffer, or a value that was constant either way.**
+
+**Two correct functions composed wrongly, and a structural invariant is exactly the check that could
+not see it.** `bookmarks_shift_delete` collapsed a bookmark at `at+n` down to `at`; `bookmarks_shift_insert`
+then declined to push it back out because its rule was `b > at`. Each half right alone. Result:
+**bookmark a line, put the caret two lines above it, press Alt+Down, and the bookmark silently jumps
+two lines up** — reachable also via replace-all on a newline-terminated pattern and paste over a line
+selection. The invariant ("every entry is a real line start") held throughout, which is why 57
+assertions saw nothing. Fixed by collapsing the two procs into **one** rule over one seam
+(`pt_edit_replace`), so no pair of calls can express the old composition.
+
+**Two draw-order defects that no per-task review could see**, both the batch-3 shape at a different
+seam: every task reasoned about *one* neighbour in `render_frame` and none asked what runs *after* its
+block or what else replaces the text pass. The bottom bar painted over the last 2.5% of the match
+track — exactly the off-screen matches the ticks exist to show — and bookmark marks were drawn in
+full Markdown Preview at source-line positions, pointing at nothing. Fixing the first meant collapsing
+**five** copies of `h - CHROME_TOP` into one `scrollbar_track`.
+
+**A test that asserted something the app did not honour.** `find_filter_click` set
+`cursor == anchor` and the test agreed — but `find_merge` ran later in the same frame and converted
+it into a selection, so clicking a filtered row and typing one character **overwrote the matched
+word.** CLAUDE.md §6j's shape with the test on the wrong side of it.
+
+### Deliberately carried
+
+Regex first paint covers ~48 KB rather than 64 (the run-on is reserved inside the budget; both
+alternatives were priced and worse). The debug timing gate uses a measured 1.4× multiplier, so the
+release gate is the only real one and it sits at 67% used. `.Find_Open`/`.Filter_Open` still set
+`doc.filter` directly, so "one path in and out" is not literally true. `doc_close` frees six other
+`[dynamic]` fields without nilling them. `keys.txt` accepts plumbing commands the palette hides. No
+marks on the Split preview bar and no bookmark marks on the scrollbar — the second mark kind is a
+precedence-and-colour question, not free. §6d's block-boundary limitation gained one more instance.
+
+### Owed
+
+**Nothing in this batch was verified against real GUI input** — all five items are things you click or
+press. Wyatt's pass, ranked: (1) **Alt+F4 still closes the window** — the regression that nearly
+shipped; (2) `Ctrl+F2` / `F2` / `Shift+F2`, and a bookmark mark surviving a horizontal scroll;
+(3) a refused `keys.txt` line showing `[KEYS.TXT: n LINES REFUSED ...]`, and `alt+f4 = Save_File`
+being refused; (4) whether a 2 px amber tick reads on both the Dark and Light tracks, and whether a
+dense set is informative or noise — if noise the fix is a taller bucket, not a dimmer colour;
+(5) whether ~48 KB regex / 64 KB literal first paint is enough on his real logs; (6) click a filtered
+row, then type.
 
 ## 7. Build environment (Windows, this machine)
 
