@@ -29,6 +29,53 @@ REGEX_LINE_SLACK :: 1 << 16 // extra bytes allowed to reach the block's line end
 // frame. Above it, the worker earns its keep.
 SEARCH_SYNC_MAX :: 256 << 10
 
+// ...and how much of a LARGER buffer the calling thread scans before handing the
+// rest to that worker, so the frame a keystroke produces already holds whatever
+// the head of the file contains. The worker resumes from the byte this stopped
+// on (Scan_State), so nothing is scanned or emitted twice.
+//
+// This is HANDOFF §6e's owed "pass 1" and the last thing owed against CLAUDE.md's
+// "no frame ever shows emptiness". The filter view is what needs it: it renders
+// filter_lines, so it has nothing at all to show until the search publishes, and
+// a viewport-scoped pass cannot help it because the filtered list is not
+// viewport-relative.
+//
+// THE BUDGET IS IN BYTES SCANNED AND IT IS SPENT WHETHER OR NOT ANYTHING WAS
+// FOUND. "Scan until the screen is full" is the unbounded main-thread scan that
+// roadmap item 1 removed -- a sparse query would walk a multi-GB file looking
+// for a sixtieth row. A partly filled first frame is the accepted outcome; a
+// frozen one is not.
+//
+// **The number came from the measurement below, and the first number was wrong.**
+// `newtpad findtest`, section "--- the synchronous first-paint pass ---", times
+// find_recompute over an 8 MB buffer and fails the suite if any case exceeds a
+// frame. Per 256 KB, -o:speed (debug is ~1.5x worse and printed by the same run):
+//
+//	literal, ordinary            0.40 ms
+//	literal, matches constantly  0.47 ms
+//	regex, ordinary              1.62 ms
+//	regex, scans every byte      13.90 ms   <- [A-Za-z]+@[a-z]+
+//
+// So a 256 KB budget -- the tidy answer, and the one this was first written with,
+// since it makes SEARCH_SYNC_MAX the only number -- spends 83% of a frame on a
+// pattern a person might plausibly type to find email addresses. 64 KB puts that
+// worst case at ~3.5 ms (~5 ms in debug), which leaves room both for a worse
+// pattern and for the two or three keystrokes a held key can deliver into one
+// frame. The literal path, which is the default mode, costs ~0.1 ms here and is
+// nowhere near its own share -- raising ITS budget alone is the obvious follow-up
+// if a first screen ever looks too thin in live use, and it is a follow-up rather
+// than part of this change because a second, kind-dependent budget is a second
+// bound to keep honest.
+//
+// What this is NOT is a bound on regex time in general: core:text/regex
+// backtracks, so a pathological pattern is slow per byte at any budget. That
+// exposure is pre-existing -- every buffer at or below SEARCH_SYNC_MAX is scanned
+// inline whole, and each of the worker's blocks costs the same per byte -- and
+// this deliberately does not widen it: below SEARCH_SYNC_MAX nothing changes, and
+// above it the inline share is a quarter of one block.
+SEARCH_FIRST_PAINT :: 64 << 10
+#assert(SEARCH_FIRST_PAINT <= SEARCH_SYNC_MAX) // or a "small" buffer would be split
+
 // A background search over a private view of the buffer.
 //
 // Mirrors Line_Index's lifecycle (done/cancel/fault as atomics, cancel-store +
@@ -45,8 +92,26 @@ SEARCH_SYNC_MAX :: 256 << 10
 // single writer and no lock. (Odin's intrinsics.atomic_store/load are
 // sequentially consistent, so the release/acquire pairing this needs is
 // implied; the entries are written before the count that publishes them.)
+// Where a bounded pass stopped, so the next one continues instead of starting
+// over. The inline first-paint pass and the worker are two passes over one scan:
+// no byte is read twice and no match is emitted twice, which is why the budget
+// costs nothing but the handoff.
+//
+// Both scans advance `pos` a whole block at a time and count newlines over
+// exactly the bytes they advance past, so `last_nl` and `nlines` are complete
+// for everything below `pos` and a resume needs nothing else. Plain fields, not
+// atomics: the inline pass has returned before the worker is created, and
+// nothing on the main thread reads these while the worker runs.
+Scan_State :: struct {
+	pos:     int, // first byte not yet scanned
+	n:       int, // matches emitted so far (the worker's private count)
+	last_nl: int, // offset of the last newline before pos, -1 if there is none
+	nlines:  int, // newlines passed before pos
+}
+
 Search :: struct {
 	view:       base.Piece_Table, // worker's private read view (worker only)
+	at:         Scan_State, // resume point (see Scan_State)
 	query:      []u8, // private copy; the find bar's buffer keeps mutating
 	regex:      bool,
 	matches:    []int, // fixed MAX_MATCHES capacity, written by index
@@ -173,6 +238,7 @@ search_reset :: proc(doc: ^Document) {
 	intrinsics.atomic_store(&s.cancel, false)
 	intrinsics.atomic_store(&s.fault, false)
 	intrinsics.atomic_store(&s.truncated, false)
+	s.at = {pos = 0, n = 0, last_nl = -1, nlines = 0} // scan from the top again
 	s.total = doc.pt.length
 	s.regex = doc.find.regex
 
@@ -208,12 +274,25 @@ find_recompute :: proc(doc: ^Document) {
 	s.query = make([]u8, len(f.query))
 	copy(s.query, f.query[:])
 
-	if doc.pt.length <= SEARCH_SYNC_MAX {
-		// Small buffer: scan the live tree inline. No view, no thread.
-		scan_all(s, &doc.pt)
-	} else {
-		s.view = base.pt_view(&doc.pt)
-		s.th = thread.create_and_start_with_data(s, search_worker)
+	// One pass on this thread first, always, over the live tree — no view, no
+	// thread. A buffer at or below SEARCH_SYNC_MAX is finished outright by it,
+	// exactly as before; a larger one gets SEARCH_FIRST_PAINT bytes and leaves
+	// s.at at the byte the worker picks up from. Either way the find_merge below
+	// publishes what it found into this very frame. See SEARCH_FIRST_PAINT for
+	// the budget and the measurement behind it.
+	scan_all(s, &doc.pt, max(int) if doc.pt.length <= SEARCH_SYNC_MAX else SEARCH_FIRST_PAINT)
+	if !intrinsics.atomic_load(&s.done) {
+		if intrinsics.atomic_load(&s.fault) {
+			// The mapping changed underneath the inline pass. doc_fault_pending
+			// picks the flag up and recovers the document; handing the same
+			// buffer to a worker would only fault it again. Nothing further is
+			// coming, so say so rather than leave the UI polling (and find_wait
+			// spinning) for a search that will never publish.
+			intrinsics.atomic_store(&s.done, true)
+		} else {
+			s.view = base.pt_view(&doc.pt)
+			s.th = thread.create_and_start_with_data(s, search_worker)
+		}
 	}
 	find_merge(doc)
 }
@@ -221,7 +300,8 @@ find_recompute :: proc(doc: ^Document) {
 @(private = "file")
 search_worker :: proc(data: rawptr) {
 	s := (^Search)(data)
-	scan_all(s, &s.view)
+	// Unbounded: resumes at s.at.pos and runs to the end of the buffer.
+	scan_all(s, &s.view, max(int))
 }
 
 // Take whatever the worker has published into the document's view of the
@@ -324,20 +404,25 @@ search_running :: proc(doc: ^Document) -> bool {
 
 // --- the scan itself (shared by the inline and worker paths) ---
 
-// Scan `pt` for s.query, publishing after each block. Tracks the most recent
-// newline as it goes so every match carries its line start; that costs nothing
-// here (the bytes are already in hand) and saves the main thread an unbounded
-// backward scan per match at merge time.
+// Scan `pt` for s.query from s.at, publishing after each block, and stop once
+// `upto` bytes of the buffer have been covered — `max(int)` for "all of it".
+// Tracks the most recent newline as it goes so every match carries its line
+// start; that costs nothing here (the bytes are already in hand) and saves the
+// main thread an unbounded backward scan per match at merge time.
+//
+// `done` is set only when the buffer really ran out, never when the budget did:
+// find_recompute reads it to decide whether a worker is still needed, and
+// find_wait spins on it.
 @(private = "file")
-scan_all :: proc(s: ^Search, pt: ^base.Piece_Table) {
+scan_all :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 	if pt.length == 0 || len(s.query) == 0 {
 		intrinsics.atomic_store(&s.done, true)
 		return
 	}
 	if s.regex {
-		scan_regex(s, pt)
+		scan_regex(s, pt, upto)
 	} else {
-		scan_literal(s, pt)
+		scan_literal(s, pt, upto)
 	}
 }
 
@@ -359,7 +444,7 @@ emit :: proc(s: ^Search, n: ^int, at, length, line_start, line_no: int) -> bool 
 }
 
 @(private = "file")
-scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table) {
+scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 	q := s.query
 	L := pt.length
 	ql := make([]u8, len(q))
@@ -370,23 +455,37 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table) {
 	buf := make([]u8, SEARCH_BLOCK + len(q) - 1)
 	defer delete(buf)
 
-	// nlines counts newlines passed, so the 1-based line number of a match is
-	// nlines+1. Counted here because the scan is already walking every byte —
-	// deriving it later would mean re-scanning the file per match.
-	n, last_nl, nlines := 0, -1, 0
-	pos := 0
-	for pos < L {
-		if intrinsics.atomic_load(&s.cancel) {return}
-		got := base.pt_read(pt, pos, buf[:min(len(buf), L - pos)])
-		if got == 0 {break}
+	// Resume where the last pass stopped. nlines counts newlines passed, so the
+	// 1-based line number of a match is nlines+1. Counted here because the scan
+	// is already walking every byte — deriving it later would mean re-scanning
+	// the file per match.
+	n, last_nl, nlines := s.at.n, s.at.last_nl, s.at.nlines
+	pos := s.at.pos
+	halted := false // cancel / fault / MAX_MATCHES: nothing more to publish here
+	ended := false // a read returned nothing: treat the buffer as exhausted
+	scan: for pos < L && pos < upto {
+		if intrinsics.atomic_load(&s.cancel) {
+			halted = true
+			break scan
+		}
+		// This pass's block, shortened when the budget ends inside one — so a
+		// budget that isn't a multiple of SEARCH_BLOCK is the budget and not the
+		// next multiple up.
+		bs := min(SEARCH_BLOCK, upto - pos)
+		got := base.pt_read(pt, pos, buf[:min(bs + len(q) - 1, L - pos)])
+		if got == 0 {
+			ended = true
+			break scan
+		}
 		if pt.fault {
 			pt.fault = false
 			intrinsics.atomic_store(&s.fault, true)
-			return
+			halted = true
+			break scan
 		}
-		last := pos + SEARCH_BLOCK >= L
+		last := pos + bs >= L
 		limit := got - len(q) + 1
-		if !last {limit = min(SEARCH_BLOCK, limit)}
+		if !last {limit = min(bs, limit)}
 		for k := 0; k < limit; k += 1 {
 			hit := true
 			for j in 0 ..< len(q) {
@@ -397,23 +496,32 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table) {
 			}
 			// Check before updating last_nl: a match starting on a '\n' belongs
 			// to the line that newline terminates, not the one it begins.
-			if hit && !emit(s, &n, pos + k, len(q), last_nl + 1, nlines + 1) {return}
+			if hit && !emit(s, &n, pos + k, len(q), last_nl + 1, nlines + 1) {
+				halted = true // emit published count/done/truncated itself
+				break scan
+			}
 			if buf[k] == '\n' {
 				last_nl = pos + k
 				nlines += 1
 			}
 		}
-		pos += SEARCH_BLOCK
+		pos += bs
 		intrinsics.atomic_store(&s.count, n)
 		intrinsics.atomic_store(&s.scanned, min(pos, L))
 	}
+	s.at = {pos = pos, n = n, last_nl = last_nl, nlines = nlines}
+	if halted {return}
 	intrinsics.atomic_store(&s.count, n)
-	intrinsics.atomic_store(&s.scanned, L)
-	intrinsics.atomic_store(&s.done, true)
+	if ended || pos >= L {
+		intrinsics.atomic_store(&s.scanned, L)
+		intrinsics.atomic_store(&s.done, true)
+	} else {
+		intrinsics.atomic_store(&s.scanned, pos) // budget spent; a worker resumes
+	}
 }
 
 @(private = "file")
-scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table) {
+scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 	L := pt.length
 	heap := context.allocator
 	// One reusable block buffer: captures are slices into it, but the offsets are
@@ -436,33 +544,54 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table) {
 	ctx.temp_allocator = ctx.allocator
 	context = ctx
 
-	n, last_nl, nlines := 0, -1, 0
-	pos := 0
-	for pos < L {
-		if intrinsics.atomic_load(&s.cancel) {return}
-		end := pos + min(SEARCH_BLOCK, L - pos)
+	// Resume where the last pass stopped; see scan_literal for the same fields.
+	n, last_nl, nlines := s.at.n, s.at.last_nl, s.at.nlines
+	pos := s.at.pos
+	halted := false // cancel / fault / MAX_MATCHES: nothing more to publish here
+	ended := false // no bytes read, or an unusable pattern: the scan is over
+	scan: for pos < L && pos < upto {
+		if intrinsics.atomic_load(&s.cancel) {
+			halted = true
+			break scan
+		}
+		// Shortened when the budget ends inside a block (scan_literal has the
+		// same line and the same reason). min(upto, L) so max(int) can't
+		// overflow the addition below.
+		end := pos + min(SEARCH_BLOCK, min(upto, L) - pos)
 		if end < L {
 			// Never split a line: run on to the next newline (bounded), and keep
 			// that newline with its line so end-of-line patterns still match.
+			// Deliberately allowed to overrun the budget by up to
+			// REGEX_LINE_SLACK: a partial line would give this block's pattern a
+			// different answer than the resumed one, and the slack is already
+			// the cap on that overrun.
 			end = min(base.pt_line_end_cap(pt, end, REGEX_LINE_SLACK) + 1, L)
 		}
 		got := base.pt_read(pt, pos, buf[:end - pos])
-		if got == 0 {break}
+		if got == 0 {
+			ended = true
+			break scan
+		}
 		if pt.fault {
 			pt.fault = false
 			intrinsics.atomic_store(&s.fault, true)
-			return
+			halted = true
+			break scan
 		}
 
 		// Recompiled per block: compilation scales with the pattern, not the
 		// file, so it stays negligible next to the scan itself.
 		it, err := regex.create_iterator(string(buf[:got]), string(s.query), {.Case_Insensitive}, context.temp_allocator, context.temp_allocator)
 		if err != nil {
-			break // invalid pattern -> no matches
+			ended = true // invalid pattern -> no matches, and none are coming
+			break scan
 		}
 		c := 0 // newline-tracking cursor, walked forward to each match
 		for {
-			if intrinsics.atomic_load(&s.cancel) {return}
+			if intrinsics.atomic_load(&s.cancel) {
+				halted = true
+				break scan
+			}
 			cap, _, ok := regex.match_iterator(&it)
 			if !ok || len(cap.pos) == 0 {
 				break
@@ -474,7 +603,10 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table) {
 					nlines += 1
 				}
 			}
-			if !emit(s, &n, pos + ms, me - ms, last_nl + 1, nlines + 1) {return}
+			if !emit(s, &n, pos + ms, me - ms, last_nl + 1, nlines + 1) {
+				halted = true // emit published count/done/truncated itself
+				break scan
+			}
 		}
 		for ; c < got; c += 1 {
 			if buf[c] == '\n' {
@@ -487,9 +619,15 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table) {
 		intrinsics.atomic_store(&s.scanned, min(pos, L))
 		mem.dynamic_arena_free_all(&arena)
 	}
+	s.at = {pos = pos, n = n, last_nl = last_nl, nlines = nlines}
+	if halted {return}
 	intrinsics.atomic_store(&s.count, n)
-	intrinsics.atomic_store(&s.scanned, L)
-	intrinsics.atomic_store(&s.done, true)
+	if ended || pos >= L {
+		intrinsics.atomic_store(&s.scanned, L)
+		intrinsics.atomic_store(&s.done, true)
+	} else {
+		intrinsics.atomic_store(&s.scanned, pos) // budget spent; a worker resumes
+	}
 }
 
 // --- navigation & replace ---
@@ -737,6 +875,44 @@ find_mark_rects :: proc(doc: ^Document, x, w, track_top, track_h: f32, out: []pl
 }
 
 // --- the filter view ---
+
+// The search that fills filter_lines has not finished: either the scan itself is
+// still going, or an edit invalidated the results and the restart is pending.
+//
+// Deliberately NOT search_running: s.th stays non-nil after a worker finishes on
+// its own (only search_stop nils it), so that one answers "should the main loop
+// keep polling", which stays true for a while after the last result has landed.
+// This one has to be able to say the search is over.
+filter_searching :: proc(doc: ^Document) -> bool {
+	return doc.find.dirty || !intrinsics.atomic_load(&doc.search.done)
+}
+
+// What the filter banner says. One producer, so the states it has to keep apart
+// are something a test can hold rather than a format string inside render_frame.
+//
+// The middle state is the whole point. Filter view renders filter_lines, and an
+// EMPTY filter_lines is two different facts: the search has not reached a match
+// yet, or the file has none. This said "0 matching lines (searching...)" for
+// both — so a query that genuinely matched nothing claimed to be searching
+// forever, and a query whose first match sits 200 MB in looked exactly like one
+// with no matches at all. The bounded first-paint pass (SEARCH_SYNC_MAX) makes
+// the second state far rarer; it cannot make it impossible, which is why the
+// wording has to be honest rather than hopeful.
+filter_banner_text :: proc(doc: ^Document) -> string {
+	state: string
+	switch {
+	case doc_filtering(doc):
+		state = fmt.tprintf("%d matching lines", len(doc.filter_lines))
+	case len(doc.find.query) == 0:
+		// Ctrl+L arms the filter before anything is typed; nothing is missing.
+		state = "type to filter"
+	case filter_searching(doc):
+		state = "searching..."
+	case:
+		state = "no matching lines"
+	}
+	return fmt.tprintf("FILTER  %s   —   Ctrl+L shows the whole file", state)
+}
 
 // Turn the filter view on or off.
 //

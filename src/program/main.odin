@@ -1247,12 +1247,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// it no longer draws half under the menu or over the first matching line.
 		by := CHROME_TOP
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, by}, size = {w, FILTER_BANNER_H}, color = g_theme[.Filter_Bg]}})
-		msg := fmt.tprintf(
-			"FILTER  %d matching lines%s   —   Ctrl+L shows the whole file",
-			len(doc.filter_lines),
-			"" if doc_filtering(doc) else " (searching...)",
-		)
-		plat.text_draw(gfx, text, msg, sx(12), by + FILTER_BANNER_H - sx(7), UI_SMALL_PX, g_theme[.Filter_Text])
+		// filter_banner_text (find.odin) owns the wording, so "searching" and
+		// "no matching lines" cannot collapse into one string again.
+		plat.text_draw(gfx, text, filter_banner_text(doc), sx(12), by + FILTER_BANNER_H - sx(7), UI_SMALL_PX, g_theme[.Filter_Text])
 	}
 
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)

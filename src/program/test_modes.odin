@@ -444,7 +444,10 @@ when NEWTPAD_TESTS {
 				settled_ms := time.duration_milliseconds(time.tick_since(t1))
 				fmt.printfln("  %-15q key %6.2f ms  settled %7.1f ms  %6d matches%s", string(doc.find.query[:]), key_ms, settled_ms, len(doc.find.matches), " (truncated)" if doc.find.truncated else "")
 			}
-			fmt.printfln("worst keystroke: %.2f ms (frame budget 16.7)", worst)
+			// A number nobody checks is a number that drifts. The keystroke now
+			// carries the bounded first-paint scan (SEARCH_FIRST_PAINT) as well
+			// as the restart, so this line is the end-to-end bound on it.
+			fmt.printfln("worst keystroke: %.2f ms (frame budget 16.7)  %s", worst, "OK" if worst < 16.7 else "FAIL")
 			if len(doc.find.matches) > 0 {
 				m := doc.find.matches[0]
 				fmt.printfln("planted needle found at %d (%.1f MB in), len=%d", m, f64(m) / (1024 * 1024), doc.find.match_len[0])
@@ -591,6 +594,171 @@ when NEWTPAD_TESTS {
 			return
 		}
 
+		// The bounded synchronous first-paint pass (SEARCH_SYNC_MAX) and the three
+		// things it has to get right: rows in the filter view on the FIRST frame
+		// when the head of the file has matches, an honest banner when it does
+		// not, and a cost that stays inside a frame.
+		//
+		// The last of those is a falsifier, not an assertion about behaviour: a
+		// bound nobody measured is the bug, so the timings are printed and the
+		// suite fails if any of them exceeds a frame.
+		findtest_first_paint :: proc() -> (bad: int) {
+			fmt.println("--- the synchronous first-paint pass ---")
+			fp_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			// A filler line with no digits and no '@', so the planted needle and
+			// the scanning regex below are the only things that can match.
+			FILL :: "the quick brown fox jumps over the lazy dog................\n" // 60 B
+			NEEDLE :: "NEEDLE-ZZZ"
+			// 8 MB: far enough past SEARCH_SYNC_MAX that the worker cannot have
+			// published anything in the microseconds between a keystroke
+			// returning and the assertion after it — its first block alone is
+			// ~1 ms of work and it has a thread spawn to pay for first. Nothing
+			// moves under the checks either way: doc.filter_lines is written only
+			// by find_merge, on this thread.
+			SIZE :: 8 << 20
+			LINES :: SIZE / len(FILL)
+
+			build :: proc(plant_lines: []int, plant_bytes: []int = nil) -> []u8 {
+				content := make([]u8, LINES * len(FILL)) // heap: the doc takes it
+				for i in 0 ..< LINES {copy(content[i * len(FILL):], transmute([]u8)string(FILL))}
+				for ln in plant_lines {copy(content[ln * len(FILL):], transmute([]u8)string(NEEDLE))}
+				for at in plant_bytes {copy(content[at:], transmute([]u8)string(NEEDLE))}
+				return content
+			}
+			// The banner text, without the fixed tail, so a message reads.
+			state :: proc(doc: ^Document) -> string {return filter_banner_text(doc)}
+
+			// --- a first match PAST the budget --------------------------------
+			//
+			// The needle is in the last line of 8 MB, so the bounded pass spends
+			// its whole budget and finds nothing. The frame it produces must say
+			// so rather than look like a query with no matches at all.
+			{
+				doc := doc_from_content(build([]int{LINES - 1}), "", .UTF8)
+				defer doc_close(&doc)
+				fp_chk(&bad, doc.pt.length > SEARCH_SYNC_MAX, fmt.tprintf("the fixture is past the budget, so a worker is really involved: %d bytes vs %d", doc.pt.length, SEARCH_SYNC_MAX))
+
+				find_open(&doc, false)
+				find_set_filter(&doc, true)
+				for r in NEEDLE {find_input_rune(&doc, r)}
+				// No find_wait: this is the first frame after the keystroke.
+				fp_chk(&bad, len(doc.filter_lines) == 0, fmt.tprintf("the budget really was exhausted with nothing found: %d rows", len(doc.filter_lines)))
+				fp_chk(&bad, filter_searching(&doc), "...and the view knows the search is still going")
+				fp_chk(&bad, strings.contains(state(&doc), "searching"), fmt.tprintf("the first frame says it is SEARCHING: %q", state(&doc)))
+				fp_chk(&bad, !strings.contains(state(&doc), "no matching"), "...and does not claim there are no matches")
+
+				find_wait(&doc)
+				fp_chk(&bad, len(doc.filter_lines) == 1, fmt.tprintf("the worker then finds the line the budget could not reach: %d rows", len(doc.filter_lines)))
+				fp_chk(&bad, !filter_searching(&doc) && strings.contains(state(&doc), "1 matching lines"), fmt.tprintf("...and the banner switches to the count: %q", state(&doc)))
+				// A line START and a line NUMBER produced by the WORKER, 8 MB
+				// past the handoff: both are carried across it in Scan_State, and
+				// the number is the one the filter gutter draws.
+				fp_chk(&bad, len(doc.filter_lines) == 1 && doc.filter_lines[0] == (LINES - 1) * len(FILL), fmt.tprintf("...at the right line start: %d (want %d)", doc.filter_lines[0] if len(doc.filter_lines) == 1 else -1, (LINES - 1) * len(FILL)))
+				fp_chk(&bad, len(doc.filter_line_nos) == 1 && doc.filter_line_nos[0] == LINES, fmt.tprintf("...and the right line number, counted across the handoff: %d (want %d)", doc.filter_line_nos[0] if len(doc.filter_line_nos) == 1 else -1, LINES))
+
+				// The third state, which used to be indistinguishable from the
+				// first: a finished search that genuinely found nothing.
+				clear(&doc.find.query)
+				for r in "QQZZ-NOT-HERE" {find_input_rune(&doc, r)}
+				find_wait(&doc)
+				fp_chk(&bad, !filter_searching(&doc) && strings.contains(state(&doc), "no matching lines"), fmt.tprintf("a finished search with no matches says exactly that: %q", state(&doc)))
+				find_close(&doc)
+			}
+
+			// --- a first match EARLY ------------------------------------------
+			//
+			// The whole feature. These rows exist in the very frame the keystroke
+			// produced, which is only possible if the scan ran before
+			// find_recompute returned — the worker has not been given a chance to
+			// publish anything.
+			{
+				planted := make([]int, 64, context.temp_allocator)
+				for i in 0 ..< len(planted) {planted[i] = i * 4} // first ~15 KB
+				// One more needle STRADDLING the handoff, four bytes before the
+				// budget runs out. The bounded pass reads its block plus the
+				// len(query)-1 overlap, so this one belongs to the bounded pass;
+				// the worker resumes past it and must not count it again. Without
+				// a planted straddle the handoff is the one block boundary in the
+				// scan that nothing crosses.
+				straddle := SEARCH_FIRST_PAINT - 4
+				WANT :: 65 // 64 early + the straddler, each on its own line
+				doc := doc_from_content(build(planted, []int{straddle}), "", .UTF8)
+				defer doc_close(&doc)
+
+				find_open(&doc, false)
+				find_set_filter(&doc, true)
+				for r in NEEDLE {find_input_rune(&doc, r)}
+				first := len(doc.filter_lines)
+				fp_chk(&bad, first == WANT, fmt.tprintf("the FIRST frame already has every row up to the budget: %d (want %d)", first, WANT))
+				fp_chk(&bad, doc_filtering(&doc), "...so the view is actually filtering, not falling back to the whole file")
+				fp_chk(&bad, first > 0 && doc.filter_lines[0] == planted[0] * len(FILL), fmt.tprintf("...starting at the first planted line: %d", doc.filter_lines[0] if first > 0 else -1))
+				fp_chk(&bad, first > 0 && doc.filter_lines[first - 1] == (straddle / len(FILL)) * len(FILL), fmt.tprintf("...and the match straddling the handoff is in it: %d (want %d)", doc.filter_lines[first - 1] if first > 0 else -1, (straddle / len(FILL)) * len(FILL)))
+
+				// The handoff is a seam: the worker resumes at the byte the
+				// bounded pass stopped on, so the finished set must be exactly
+				// what was planted — a resume from 0 would double them all, and a
+				// resume that skipped the overlap would lose the straddler.
+				find_wait(&doc)
+				fp_chk(&bad, len(doc.find.matches) == WANT, fmt.tprintf("the completed scan counts each planted match once: %d (want %d)", len(doc.find.matches), WANT))
+				fp_chk(&bad, len(doc.filter_lines) == WANT, fmt.tprintf("...and one filter row each: %d (want %d)", len(doc.filter_lines), WANT))
+				// Line numbers are counted during the scan, so they only survive
+				// the handoff if last_nl/nlines do. The straddler is the one
+				// entry the bounded pass produced near its own far edge.
+				want_no := straddle / len(FILL) + 1
+				got_no := doc.filter_line_nos[WANT - 1] if len(doc.filter_line_nos) == WANT else -1
+				fp_chk(&bad, got_no == want_no, fmt.tprintf("the gutter line number across the handoff is right: %d (want %d)", got_no, want_no))
+				find_close(&doc)
+			}
+
+			// --- what the pass costs -------------------------------------------
+			//
+			// The number the budget was chosen from. Timed around find_recompute,
+			// which is the whole keystroke: reset, the bounded scan, the pt_view
+			// clone and the thread spawn. Each case joins its worker afterwards
+			// so the next reading is not taken against a busy core.
+			{
+				doc := doc_from_content(build([]int{LINES - 1}), "", .UTF8)
+				defer doc_close(&doc)
+				find_open(&doc, false)
+				worst := 0.0
+				cost :: proc(doc: ^Document, q: string, rx: bool) -> f64 {
+					doc.find.regex = rx
+					clear(&doc.find.query)
+					append(&doc.find.query, ..transmute([]u8)q)
+					t0 := time.tick_now()
+					find_recompute(doc)
+					ms := time.duration_milliseconds(time.tick_since(t0))
+					find_invalidate(doc) // cancel + join before the next reading
+					return ms
+				}
+				FRAME :: 16.7
+				cases := []struct {
+					label: string,
+					q:     string,
+					rx:    bool,
+				} {
+					{"literal, ordinary", NEEDLE, false},
+					{"literal, matches constantly", "e", false},
+					{"regex, ordinary", "NEEDLE-[A-Z]+", true},
+					{"regex, scans every byte", "[A-Za-z]+@[a-z]+", true},
+				}
+				for c in cases {
+					ms := cost(&doc, c.q, c.rx)
+					worst = max(worst, ms)
+					fmt.printfln("  %-28s %6.2f ms   (%d KB budget)", c.label, ms, SEARCH_FIRST_PAINT / 1024)
+				}
+				doc.find.regex = false
+				fp_chk(&bad, worst < FRAME, fmt.tprintf("worst synchronous keystroke %.2f ms, frame budget %.1f ms", worst, FRAME))
+				find_close(&doc)
+			}
+
+			fmt.printfln("first-paint pass: %d failures", bad)
+			return
+		}
+
 		// `newtpad findtest` covers the literal scan's block-boundary handling and
 		// the line starts the worker computes for the filter view — both of which
 		// are per-block bookkeeping that a single-block search would never exercise.
@@ -670,6 +838,7 @@ when NEWTPAD_TESTS {
 			fmt.printfln("case-insensitive: %d found, want 2", len(doc.find.matches))
 
 			bad := findtest_filter_click()
+			bad += findtest_first_paint()
 			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")
 			return true
 		}
@@ -9898,20 +10067,37 @@ when NEWTPAD_TESTS {
 		if os.args[1] == "stickytest" {
 			fail := false
 
-			// Every NEEDLE sits in the first 72 bytes, comfortably inside the worker's
-			// first SEARCH_BLOCK (256 KiB) read. That guarantees the whole result set
-			// publishes in one find_merge call -- the same shape the synchronous path
-			// always has -- so a corrupted sticky value can never be quietly
+			// Every NEEDLE sits PAST the bounded first-paint pass and inside the
+			// worker's first block, which is two conditions and both are load-bearing.
+			//
+			// Past SEARCH_FIRST_PAINT, or find_recompute republishes the surviving
+			// needles synchronously and returns with matches already non-empty --
+			// so the "matches empty while the search is still running" window this
+			// mode exists to inspect only opens on the LAST replace, when zero
+			// matches genuinely remain, which is not the state that was ever in
+			// question. The needles used to sit in the first 72 bytes for exactly
+			// the opposite reason, and the first-paint pass (§6ad) turned seven of
+			// these eight iterations into ones that observe nothing. The guard
+			// below is what would have caught that, so the placement is now
+			// checked rather than described.
+			//
+			// Inside one block, so the whole set still publishes in a single
+			// find_merge and a corrupted sticky value cannot be quietly
 			// self-corrected by a second partial merge landing after the jump has
-			// already run once. The filler after it never contains "NEEDLE", so the
-			// match count stays exactly NEEDLES while the buffer is pushed well past
-			// SEARCH_SYNC_MAX, which is what puts the search on the worker thread at
-			// all.
+			// already run once.
+			//
+			// The filler never contains "NEEDLE", so the count stays exactly NEEDLES
+			// while the buffer is pushed well past SEARCH_SYNC_MAX -- which is what
+			// puts the search on the worker thread at all.
 			NEEDLES :: 8
+			FILL :: "the quick brown fox jumps over the lazy dog\n" // 43 bytes
+			LEAD_LINES :: (SEARCH_FIRST_PAINT / len(FILL)) + 200 // clears the budget
 			sb := strings.builder_make(context.temp_allocator)
+			for i in 0 ..< LEAD_LINES {strings.write_string(&sb, FILL)}
+			first_needle := strings.builder_len(sb)
 			for i in 0 ..< NEEDLES {fmt.sbprintf(&sb, "NEEDLE %d\n", i)}
-			FILLER_LINES :: 7000 // ~7000 * 45 bytes =~ 315 KB, well past the 256 KiB threshold
-			for i in 0 ..< FILLER_LINES {strings.write_string(&sb, "the quick brown fox jumps over the lazy dog\n")}
+			FILLER_LINES :: 7000 // ~7000 * 43 bytes =~ 301 KB, past the 256 KiB threshold
+			for i in 0 ..< FILLER_LINES {strings.write_string(&sb, FILL)}
 			content := strings.to_string(sb)
 
 			doc: Document
@@ -9926,6 +10112,17 @@ when NEWTPAD_TESTS {
 				doc.pt.length,
 				SEARCH_SYNC_MAX,
 				NEEDLES,
+			)
+			// The premise, checked: the inline pass cannot reach a single needle,
+			// and every needle is inside the worker's first block.
+			placed := first_needle >= SEARCH_FIRST_PAINT && first_needle < SEARCH_BLOCK
+			if !placed {fail = true}
+			fmt.printfln(
+				"  %-6s first needle at %d: past the %d B first-paint budget, inside the %d B first worker block",
+				"ok" if placed else "FAIL",
+				first_needle,
+				SEARCH_FIRST_PAINT,
+				SEARCH_BLOCK,
 			)
 
 			find_open(&doc, true)
