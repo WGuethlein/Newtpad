@@ -2360,11 +2360,21 @@ sort_split_lines :: proc(buf: []u8, lines: ^[dynamic]Sort_Line, terms: ^[dynamic
 // its offset is the Alt+Down bug that shipped. `Reload from Disk` and
 // doc_set_line_ending drop for the same reason.
 //
-// A bookmark at the region's far edge (b == hi) survives and lands correctly:
-// the replacement text ends in '\n' whenever hi is not the buffer end (the
-// region stops at a line's CONTENT end, so its terminator is the untouched byte
-// that follows), which is exactly what bookmarks_shift_replace's `b == at+n`
-// rule asks for.
+// A bookmark exactly AT the region's far edge (b == hi) is DROPPED, and that is
+// correct -- but not for the reason this comment used to give. It claimed the
+// replacement ends in '\n' whenever hi is not the buffer end, which is backwards:
+// the region stops at a line's CONTENT end, so the replacement ends with the
+// last output line's CONTENT and ends in '\n' only when that line is empty.
+// bookmarks_shift_replace's `b == at+n` rule therefore almost never keeps such a
+// bookmark. Both directions verified: "a\n\n\n" with a bookmark at 3, ascending,
+// drops it; "\nb\n\n" descending keeps it.
+//
+// It stays dropped because b == hi is only REACHABLE when the region's last line
+// is empty -- anywhere else hi sits at a content end, and the byte after it is a
+// terminator, so no bookmark (which is always a line start) can be there at all.
+// So a bookmark at hi always names an empty line: there is no content for it to
+// be silently re-pointed at, and losing it errs in the same direction as every
+// other bookmark inside the region. Undo restores the whole set.
 doc_sort_lines :: proc(doc: ^Document, mode: Sort_Mode) -> Sort_Result {
 	if doc == nil || doc.kind != .Text || doc.pt.length == 0 {return .Unchanged}
 
@@ -2484,6 +2494,20 @@ doc_sort_lines :: proc(doc: ^Document, mode: Sort_Mode) -> Sort_Result {
 	if slice.equal(out[:], buf) {return .Unchanged}
 
 	had_sel := doc_has_sel(doc)
+	// The batch pair is CURRENTLY INERT, and kept anyway. Verified by deletion:
+	// with a SINGLE doc_replace_range the entry count is 1 either way --
+	// doc_batch_begin's push_undo takes the one snapshot and doc_replace_range's
+	// own then returns early on doc.batch, so removing the pair just moves which
+	// call takes it. doc_batch_end's state_count = max(1,1) equals push_undo's 1,
+	// and both paths end at last_edit = .None. Deleting these two lines leaves
+	// sortlinestest, bookmarktest, historytest, replacetest and blocktest all at
+	// zero failures, and no test can be written that it would fail.
+	//
+	// What actually delivers the one-undo-entry property is the single write, and
+	// that is what sl_undo asserts against (12 lines -> 1 entry; a per-line loop
+	// reads 24). This pair is the guard the moment a second write appears beside
+	// it, it costs nothing, and it is the documented idiom -- but it is not the
+	// mechanism, and the plan was wrong to treat it as one.
 	doc_batch_begin(doc, .Replace)
 	doc_replace_range(doc, lo, hi - lo, out[:])
 	doc_batch_end(doc, 1)
@@ -2498,6 +2522,12 @@ doc_sort_lines :: proc(doc: ^Document, mode: Sort_Mode) -> Sort_Result {
 	if had_sel {
 		doc.anchor, doc.cursor = lo, lo + len(out)
 	} else {
+		// `lo`, not 0 -- though with no selection lo IS always 0 (sel_lo is 0 and
+		// the line start of 0 is 0), so no test can tell the two apart and saying
+		// so here is worth more than a check that cannot fail. It is written as lo
+		// because the statement is "collapse to the start of what was sorted"; if
+		// the no-selection scope ever stops being the whole document, this line is
+		// already right.
 		doc.anchor, doc.cursor = lo, lo
 	}
 	doc.last_edit_at = doc.cursor
