@@ -146,11 +146,13 @@ when NEWTPAD_TESTS {
 	//
 	//   1. It measures ONE frame of ONE document in ONE view, reaching about six
 	//      of the ~60 text_draw_spans call sites in program/ (they do carry all
-	//      the instances, but still). Nothing here exercises the menus, palette,
-	//      history panel, Settings/Font tabs, find/replace bar, filter banner,
-	//      markdown preview or split, or the grid. A batching change can break any
-	//      of those and this reports green. The fix is a view argument
-	//      (`drawcount <file> [--menu|--palette|--find|--md-split|--grid]`), not a
+	//      the instances, but still). `--find <query>` is the first view argument
+	//      and covers the find/replace bar and the scrollbar's match marks;
+	//      nothing here yet exercises the menus, palette, history panel,
+	//      Settings/Font tabs, filter banner, markdown preview or split, or the
+	//      grid. A batching change can break any of those and this reports green.
+	//      The rest of the fix is the rest of that argument
+	//      (`drawcount <file> [--menu|--palette|--md-split|--grid]`), not a
 	//      better digest — do not confuse the two.
 	//   2. The digest hashes UVs, and UVs encode glyph FIRST-USE order in the
 	//      atlas. A batching pass that regroups draws reorders glyph_get, which
@@ -167,11 +169,13 @@ when NEWTPAD_TESTS {
 	//
 	// doc_workers_quiet's last term is !search_running, and search.th is nil'd only
 	// by search_stop, which the main loop drives and render_frame never does. Inert
-	// while nothing here opens find; the moment limit 1 is closed with a --find
-	// view, the settle loop will burn all 400 iterations and blame nondeterminism
-	// for a missing reap.
+	// while nothing here opens find, and it stayed inert when --find arrived only
+	// because --find runs find_wait (which joins the worker) BEFORE the settle
+	// loop starts. Any future view argument that leaves a worker running has to do
+	// the same, or the loop burns all 400 iterations and blames nondeterminism for
+	// a reap that nothing in this mode performs.
 	@(private = "file")
-	draw_count_mode :: proc(path: string) {
+	draw_count_mode :: proc(path: string, query := "") {
 		h: Headless_Gpu
 		if !headless_gpu_init(&h, 1280, 720, "drawcount") {return}
 		defer headless_gpu_destroy(&h)
@@ -211,6 +215,23 @@ when NEWTPAD_TESTS {
 			plat.text_load_family(&h.text, "Consolas", app.settings.font_style)
 		}
 		metrics_recompute(&rc)
+
+		// With --find, run the query to completion BEFORE the settle loop. The
+		// note above about doc_workers_quiet's !search_running term is the reason:
+		// find_merge is driven by the main loop, never by render_frame, so a
+		// worker left running here would keep search_running true for all 400
+		// iterations and the mode would report "never settled" rather than a
+		// frame. find_wait is exactly the headless join this needs, and it also
+		// makes the measured frame the steady-state one -- a partially published
+		// match list would put a different number of scrollbar marks in every run.
+		if query != "" {
+			if d := app_active(&app); d != nil {
+				find_open(d, false)
+				for r in query {find_input_rune(d, r)}
+				find_wait(d)
+			}
+		}
+
 		plat.draw_digest_enable(true)
 
 		// Render whole frames until the frame stops changing, then report it. A
@@ -278,6 +299,9 @@ when NEWTPAD_TESTS {
 
 		fmt.println("--- drawcount: headless offscreen frame, 1280x720 @96dpi, no menu open ---")
 		fmt.printfln("  file                   : %s", path)
+		if query != "" {
+			fmt.printfln("  find bar               : open, query %q, %d matches%s", query, len(doc.find.matches), "+" if doc.find.truncated else "")
+		}
 		fmt.printfln("  font / size / tab      : %s %v / %.0f px / %d", app.settings.font_family, app.settings.font_style, rc.px, app.settings.tab_width)
 		fmt.printfln(
 			"  frame settled after    : %d frames %s",
@@ -2445,11 +2469,17 @@ when NEWTPAD_TESTS {
 		// this one now refuses instead.
 		if os.args[1] == "drawcount" {
 			if len(os.args) < 3 {
-				fmt.eprintln("usage: newtpad drawcount <file>")
+				fmt.eprintln("usage: newtpad drawcount <file> [--find <query>]")
 				return true
 			}
 			if !require_scratch_session("drawcount") {return true}
-			draw_count_mode(os.args[2])
+			// `--find <query>` opens the find bar and runs the query before the
+			// frame is measured -- the first step against KNOWN LIMIT 1 below, and
+			// the only way to measure the scrollbar's match marks, which exist
+			// only while the bar is open.
+			query := ""
+			if len(os.args) > 4 && os.args[3] == "--find" {query = os.args[4]}
+			draw_count_mode(os.args[2], query)
 			return true
 		}
 
