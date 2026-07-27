@@ -206,8 +206,10 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 
 		title := tab_title(d, context.temp_allocator)
 		tb := transmute([]u8)title
-		if plat.text_cells(text, tb) > max_cells && max_cells > 1 {
-			cut := plat.text_bytes_for_cells(text, tb, max_cells - 1)
+		// Both col0 = 0: a tab title is a whole label drawn from its own x, and
+		// these two are the measure/inverse pair for that one label.
+		if plat.text_cells(text, tb, 0) > max_cells && max_cells > 1 {
+			cut := plat.text_bytes_for_cells(text, tb, max_cells - 1, 0)
 			title = strings.concatenate({title[:cut], "…"}, context.temp_allocator)
 		}
 		fg := g_theme[.Text_Primary] if active else g_theme[.Text_Dim]

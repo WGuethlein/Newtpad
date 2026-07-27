@@ -363,7 +363,9 @@ md_table_measure :: proc(doc: ^Document, t: ^plat.Text, start, end: int, oversiz
 			// The separator row is excluded, so its dashes never inflate a column.
 			for cell, i in cells {
 				if i >= MD_TABLE_MAX_COLS {break}
-				w := plat.text_cells(t, transmute([]u8)cell, .Doc)
+				// col0 = 0: a table cell is measured from its own start,
+				// matching where md_draw_table_row draws it (see that proc).
+				w := plat.text_cells(t, transmute([]u8)cell, 0, .Doc)
 				if w > c.widths[i] {c.widths[i] = w}
 			}
 		}
@@ -512,7 +514,11 @@ md_draw_inline :: proc(gfx: ^plat.Gfx, text: ^plat.Text, runs: []Md_Run, xind, x
 			for e < len(w) && is_space(w[e]) {e += 1}
 			word := w[:e]
 			w = w[e:]
-			ww := f32(plat.text_cells(text, transmute([]u8)word, .Doc)) * char_w
+			// col0 = 0: one word, drawn from x^ by the text_draw immediately
+			// below and advancing x^ by exactly this width. Measuring it from
+			// the row's column instead would make the measurement disagree with
+			// the draw, which measures every string it is given from 0.
+			ww := f32(plat.text_cells(text, transmute([]u8)word, 0, .Doc)) * char_w
 			if x^ + ww > x1 && x^ > xind { // wrap
 				x^ = xind
 				y^ += line_h
@@ -696,7 +702,10 @@ md_draw_table_row :: proc(
 		if i > 0 {
 			plat.text_draw(gfx, text, "│", cx - char_w, y, px, g_theme[.Text_Dim], .Doc)
 		}
-		cw := plat.text_cells(text, transmute([]u8)cell, .Doc)
+		// col0 = 0, and it must match md_table_measure's origin for the same
+		// cell or the alignment padding below is computed against a width the
+		// column was never sized for.
+		cw := plat.text_cells(text, transmute([]u8)cell, 0, .Doc)
 		pad := 0
 		switch c.align[i] {
 		case .Left:

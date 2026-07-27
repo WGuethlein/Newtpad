@@ -488,7 +488,12 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 			if n <= 0 {continue}
 			text := strings.clone(string(line_buf[:n]), allocator) // outlive the loop
 			for l in links_scan(text, allocator) {
-				col, cells := plat.text_span_cells(t, text, l.start, l.len, .Doc)
+				// col0 = 0: `text` was read from `start`, the VISUAL ROW's own
+				// start, which is the origin doc_draw draws the row from and
+				// therefore the origin tab stops are measured from (see
+				// wrap_row_end). `col` comes back row-relative, which is what
+				// links_hit compares against cell_at_x.
+				col, cells := plat.text_span_cells(t, text, l.start, l.len, 0, .Doc)
 				// `wrapped` still comes from the iterator, not from which branch
 				// took the row: it is what tells links_hit whether the
 				// horizontal pan applies (a wrapped row ignores it).
@@ -519,7 +524,13 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 			hi := min(l.start + l.len, row_end_off)
 			if lo >= hi {continue} // link doesn't touch this row
 			ss := lo - row_off // row-relative draw span
-			col, cells := plat.text_span_cells(t, row_text, ss, hi - lo, .Doc)
+			// col0 = 0 even though `row_text` is a SLICE of the logical line:
+			// it is sliced at row_off, i.e. it starts exactly at this visual
+			// row's start, and tab stops are measured from the visual row start
+			// (the documented wrap deviation -- doc.odin's wrap_row_end). The
+			// logical line's column would be the wrong origin here, not the
+			// more precise one.
+			col, cells := plat.text_span_cells(t, row_text, ss, hi - lo, 0, .Doc)
 			append(&out, Link_Hit{row = row, col = col, cells = cells, span_start = ss, span_len = hi - lo, wrapped = true, text = cur_line, link = l})
 		}
 	}
@@ -654,7 +665,8 @@ link_activate :: proc(app: ^App, txt: ^plat.Text, t: Link_Target) -> bool {
 				end := base.pt_line_end_cap(&d.pt, ls, RENDER_LINE_CAP)
 				buf := make([]u8, end - ls, context.temp_allocator)
 				got := base.pt_read(&d.pt, ls, buf)
-				off := plat.text_bytes_for_cells(txt, buf[:got], t.col - 1, .Doc)
+				// col0 = 0: `buf` was read from `ls`, the line start.
+				off := plat.text_bytes_for_cells(txt, buf[:got], t.col - 1, 0, .Doc)
 				d.cursor = min(ls + off, end)
 				d.anchor = d.cursor
 			}

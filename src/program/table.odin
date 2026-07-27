@@ -35,7 +35,13 @@ table_compute_widths :: proc(doc: ^Document, text: ^plat.Text) {
 		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
 		if n > 0 && buf[n - 1] == '\r' {n -= 1}
 		for f, c in csv_fields(string(buf[:n]), delim) {
-			w := plat.text_cells(text, transmute([]u8)f, .Doc)
+			// col0 = 0: a grid field is measured from ITS OWN start, because
+			// that is where table_draw draws it (text_draw's own column origin
+			// is the string it is handed). A tab inside a field therefore
+			// aligns to the field, not to the row -- the choice the batch-7
+			// spec left open, settled this way because it is the only one where
+			// the measured width and the drawn width are the same number.
+			w := plat.text_cells(text, transmute([]u8)f, 0, .Doc)
 			for c >= len(doc.table_widths) {append(&doc.table_widths, 0)}
 			if w > doc.table_widths[c] {doc.table_widths[c] = w}
 		}
@@ -140,7 +146,9 @@ table_links :: proc(doc: ^Document, text: ^plat.Text, px, char_w: f32, rows: int
 			if c < len(fields) {
 				field := strings.clone(fields[c], allocator)
 				for l in links_scan(field, allocator) {
-					lcol, lcells := plat.text_span_cells(text, field, l.start, l.len, .Doc)
+					// col0 = 0: `field` is the fragment, and `lcol` is used as an
+					// offset from the field's own x (cx) just below.
+					lcol, lcells := plat.text_span_cells(text, field, l.start, l.len, 0, .Doc)
 					lx := cx + f32(lcol) * char_w
 					if lx < cellright {
 						append(&out, Table_Link{x = lx, y = ry, w = min(f32(lcells) * char_w, cellright - lx), text = field, link = l})
@@ -223,8 +231,11 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			if c >= len(row.fields) {continue}
 			field := row.fields[c]
 			fb := transmute([]u8)field
-			if plat.text_cells(text, fb, .Doc) > colw[c] { // truncate an over-wide field
-				cut := plat.text_bytes_for_cells(text, fb, colw[c], .Doc)
+			// Both col0 = 0, and they must match each other: this is the
+			// measure/inverse pair for the same field, and a tab inside it
+			// would be cut at the wrong byte if the two disagreed.
+			if plat.text_cells(text, fb, 0, .Doc) > colw[c] { // truncate an over-wide field
+				cut := plat.text_bytes_for_cells(text, fb, colw[c], 0, .Doc)
 				field = field[:cut]
 			}
 			hl := g_theme[.Text_Primary] if (doc.top == 0 && r == 0) else fg
@@ -247,7 +258,9 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {ex - char_w * 0.5, row_rect_y(px, er)}, size = {min(cw, right - ex), lh}, color = box}})
 				val := string(doc.table_edit_buf[:])
 				plat.text_draw(gfx, text, val, ex, row_baseline_y(px, er), px, g_theme[.Text_Bright], .Doc)
-				caret_cells := plat.text_cells(text, doc.table_edit_buf[:doc.table_edit_caret], .Doc)
+				// col0 = 0: the edit buffer IS the fragment, drawn from `ex` on
+				// the line above, and the caret offsets from that same x.
+				caret_cells := plat.text_cells(text, doc.table_edit_buf[:doc.table_edit_caret], 0, .Doc)
 				cxp := ex + f32(caret_cells) * char_w
 				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cxp, row_rect_y(px, er)}, size = {max(sx(1), 1), lh}, color = g_theme[.Text_Bright]}})
 			}

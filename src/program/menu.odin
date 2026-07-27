@@ -371,7 +371,8 @@ menu_open_at :: proc(app: ^App, mi: int) {
 
 @(private = "file")
 title_w :: proc(t: ^plat.Text, s: string) -> f32 {
-	return f32(plat.text_cells(t, transmute([]u8)s)) * plat.text_char_width(t, UI_PX) + 2 * MENU_PAD
+	// col0 = 0: a menu title is a whole label, drawn from its own x.
+	return f32(plat.text_cells(t, transmute([]u8)s, 0)) * plat.text_char_width(t, UI_PX) + 2 * MENU_PAD
 }
 
 // x range of top-level menu `i` in the bar.

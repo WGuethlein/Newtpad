@@ -295,7 +295,16 @@ line_wrap_decision :: proc(doc: ^Document, t: ^plat.Text, ls: int) -> bool {
 			if sz == 0 {sz = 1}
 			if i + sz > n && p + n < limit {break} // rune straddles the chunk; refill
 			// `cells` is this line's running cell column, counted from the
-			// logical line start `ls` -- the right origin for a tab stop.
+			// LOGICAL line start `ls`. wrap_row_end below counts from the
+			// VISUAL row start, and the two origins are deliberately different
+			// rather than one of them being an oversight: this proc answers
+			// "is this whole logical line long enough to need wrapping at
+			// all", a question about the line, so the line is its origin;
+			// wrap_row_end answers "where does THIS visual row break", a
+			// question about a row that is drawn from its own x, so the row is
+			// its origin. They can only disagree about a tab on a continuation
+			// row, and only about the wrap threshold, never about a drawn
+			// column -- see wrap_row_end's own note.
 			cells += plat.text_cell_width_at(t, r, cells, .Doc)
 			if cells > WRAP_LONG_CELLS {long = true}
 			i += sz
@@ -2111,7 +2120,12 @@ line_cell_col :: proc(doc: ^Document, t: ^plat.Text, ls, off: int) -> int {
 	buf: [VISIBLE_COLS * 4]u8 // <=4 bytes per cell, <=VISIBLE_COLS cells
 	n := min(off - ls, len(buf))
 	got := base.pt_read(&doc.pt, ls, buf[:n])
-	return plat.text_cells(t, buf[:got], .Doc)
+	// col0 = 0 by this proc's own contract: the answer is defined as the column
+	// measured FROM `ls`, so `ls` is the origin. Choosing what `ls` means -- a
+	// logical line start or a visual row start -- is the caller's job, and the
+	// callers inside the draw loop pass the visual row start so that this and
+	// wrap_row_end agree.
+	return plat.text_cells(t, buf[:got], 0, .Doc)
 }
 
 // Inverse: byte offset within line [ls, le] at cell column `col` (rune-rounded).
@@ -2120,7 +2134,10 @@ line_offset_at_cell :: proc(doc: ^Document, t: ^plat.Text, ls, le, col: int) -> 
 	buf: [VISIBLE_COLS * 4]u8
 	n := min(le - ls, len(buf))
 	got := base.pt_read(&doc.pt, ls, buf[:n])
-	return min(ls + plat.text_bytes_for_cells(t, buf[:got], col, .Doc), le)
+	// col0 = 0, matching line_cell_col above exactly -- these two are inverses
+	// and a different origin in either would break the round-trip on any line
+	// containing a tab.
+	return min(ls + plat.text_bytes_for_cells(t, buf[:got], col, 0, .Doc), le)
 }
 
 // Byte offset under a client-space pixel (cell-grid column mapping). The column
@@ -2690,7 +2707,12 @@ doc_draw :: proc(
 		// vis_end) belongs to the next visual row's start, so exclude it here.
 		if doc.cursor >= start && doc.cursor <= vis_end && (line_end || doc.cursor < vis_end) {
 			cprefix := min(doc.cursor - start, n) // cells before caret, clipped to drawn text
-			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix], .Doc), rhs)
+			// col0 = 0: line_buf was read from `start`, the visual row start,
+			// and the glyphs above were drawn from col_x(char_w, 0, rhs) with
+			// the same buffer -- so the caret is measured in exactly the space
+			// the text was drawn in. This is the draw/caret seam; the two must
+			// keep the same origin or the caret drifts along a tabbed line.
+			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix], 0, .Doc), rhs)
 			cy = row_y
 			caret = true
 		}

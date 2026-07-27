@@ -156,6 +156,12 @@ Text :: struct {
 	// application, not the document.
 	chains:     [Font_Set]Face_Chain,
 	cell_cache: [Font_Set]map[rune]u8, // codepoint -> cells; depends on char_em, so per chain
+	// Tab-stop spacing. NOT per font set: a tab stop is a property of the text,
+	// not of the typeface it happens to be drawn in, and the chrome and the
+	// document disagreeing about it would put a tab in a tab title on a
+	// different grid from the same tab in the document. Read it through
+	// text_tab_width, never directly -- 0 means "never initialised" and hangs.
+	tab_width:  int,
 
 	// atlas + cache
 	atlas:     ^d3d.ITexture2D,
@@ -239,6 +245,11 @@ float4 ps_main(VSOut i) : SV_Target {
 // so this can run headless (see the `celltest` mode). text_init calls it before
 // building the GPU pipeline.
 text_load_faces :: proc(t: ^Text) -> (ok: bool) {
+	// The one place every Text -- product and headless test alike -- passes
+	// through, so it is where the tab spacing gets its default. Settings
+	// overwrite it later via text_set_tab_width; text_tab_width clamps anyway,
+	// so this is for the field reading truthfully, not for safety.
+	t.tab_width = TAB_WIDTH_DEFAULT
 	// The chrome's typeface is fixed and loaded once; the document starts on the
 	// same family until settings say otherwise.
 	if !text_load_family(t, "Consolas", .Regular, .UI) {return false}
@@ -485,18 +496,36 @@ is_zero_width :: proc(r: rune) -> bool {
 	return false
 }
 
-// Monospace cells a codepoint occupies: 0 (combining / zero-width), 1 (normal),
-// or 2 (wide / full-width CJK). Width 2 is decided by the glyph's real advance
-// relative to one cell, so it matches whatever font renders it (no width tables);
-// width 0 is decided by is_zero_width. Cached; the ratio is px-independent. Tabs
-// are one cell for now (tab stops are a later feature).
-// Cells a tab occupies. A fixed width, not true tab stops (which advance to the
-// next multiple and so need the starting column). The column is now threaded in
-// -- see text_cell_width_at -- but the tab branch deliberately still ignores it,
-// so this commit changes no behaviour. Predictable, and it beats the previous
-// behaviour: one cell, rendered as a missing-glyph box because no font has a
-// glyph for U+0009.
-TAB_CELLS :: 4
+// Tab-stop spacing: a tab advances to the next multiple of Text.tab_width, so
+// the number is the stop SPACING, not a fixed advance.
+//
+// The floor is 1, not 0, and that bound is load-bearing rather than cosmetic. A
+// spacing of 0 makes the advance 0, and every loop that measures text here
+// (text_cells, text_bytes_for_cells, text_draw_spans) and in the program layer
+// (line_wrap_decision, wrap_row_end, block_row_range) advances by exactly that
+// value -- so a 0 is not a wrong number on screen, it is a non-terminating loop
+// on the main thread, i.e. a hang on the one property Newtpad advertises.
+TAB_WIDTH_DEFAULT :: 4
+TAB_WIDTH_MIN :: 1
+TAB_WIDTH_MAX :: 16
+
+// The effective tab-stop spacing, always within [TAB_WIDTH_MIN, TAB_WIDTH_MAX].
+// Zero-is-initialization means a `Text` that never went through text_load_faces
+// -- a bare `t: plat.Text` in a test, a future deserialized one -- reads 0 here,
+// and 0 is the one value that hangs (see above), so the read is clamped rather
+// than trusted. Callers that want to display the setting should read this, not
+// the field.
+text_tab_width :: proc(t: ^Text) -> int {
+	if t.tab_width < TAB_WIDTH_MIN {return TAB_WIDTH_DEFAULT}
+	return min(t.tab_width, TAB_WIDTH_MAX)
+}
+
+// Set the tab-stop spacing, clamped. Every cached cell measurement downstream of
+// a tab is now wrong, so the caller must invalidate whatever a font change
+// invalidates (settings_apply does).
+text_set_tab_width :: proc(t: ^Text, n: int) {
+	t.tab_width = clamp(n, TAB_WIDTH_MIN, TAB_WIDTH_MAX)
+}
 
 // Cells a rune occupies when it begins at cell column `col` of its row.
 // `col` matters only for '\t': a tab advances to the next tab stop, so its
@@ -507,8 +536,27 @@ TAB_CELLS :: 4
 // substring measurement would keep a silently wrong origin; making it required
 // turns the sweep into a compiler error at every site that decides a tab's
 // width.
+//
+// Monospace cells a non-tab codepoint occupies: 0 (combining / zero-width), 1
+// (normal), or 2 (wide / full-width CJK). Width 2 is decided by the glyph's real
+// advance relative to one cell, so it matches whatever font renders it (no width
+// tables); width 0 is decided by is_zero_width. Cached; the ratio is
+// px-independent.
 text_cell_width_at :: proc(t: ^Text, r: rune, col: int, set := Font_Set.UI) -> int {
-	if r == '\t' {return TAB_CELLS} // `col` unused until tab stops land
+	if r == '\t' {
+		// This early return MUST stay above the cell_cache lookup below. The
+		// cache is keyed by rune alone, which is sound for every other
+		// codepoint because their width is a property of the glyph -- but a
+		// tab's width is a property of WHERE IT IS. Caching it would freeze
+		// whatever the first tab measured (4 at column 0, say) and hand that
+		// same 4 to a tab at column 2, silently reintroducing fixed-width tabs
+		// through the cache with the arithmetic below looking correct.
+		//
+		// No font has a glyph for U+0009 either, so a tab must never reach the
+		// glyph-metrics path: it would measure as .notdef, not as whitespace.
+		n := text_tab_width(t)
+		return n - (col % n) // in [1, n]; never 0, so measuring loops advance
+	}
 	if c, found := t.cell_cache[set][r]; found {return int(c)}
 	c := &t.chains[set]
 	cells: u8 = 1
@@ -532,22 +580,37 @@ text_cell_width_at :: proc(t: ^Text, r: rune, col: int, set := Font_Set.UI) -> i
 	return int(cells)
 }
 
-// Total cells spanned by a UTF-8 slice (sum of per-rune cell widths).
-text_cells :: proc(t: ^Text, s: []u8, set := Font_Set.UI) -> int {
-	col := 0
+// Total cells spanned by a UTF-8 slice (sum of per-rune cell widths), when the
+// slice begins at cell column `col0` of its row.
+//
+// `col0` is REQUIRED, for the same reason text_cell_width_at's `col` is: this
+// proc is the wrapper most of the program measures through, and a defaulted 0
+// would compile every existing call site unchanged while silently measuring a
+// mid-row fragment's tabs from the wrong origin. Two of those call sites are
+// reachable from a keystroke (block_replace, block_delete), so the default would
+// have shipped the bug this parameter exists to prevent.
+//
+// The RESULT stays relative -- the slice's own cell width, not the column it
+// ends at -- so `col0` changes only what the tabs inside measure to, never the
+// meaning of the return value.
+text_cells :: proc(t: ^Text, s: []u8, col0: int, set := Font_Set.UI) -> int {
+	col := col0
 	for r in string(s) {col += text_cell_width_at(t, r, col, set)}
-	return col
+	return col - col0
 }
 
 // Bytes of `s` that fill up to `target` cells, rounded to a rune boundary. Maps a
-// click's cell column back to a byte offset (inverse of text_cells).
-text_bytes_for_cells :: proc(t: ^Text, s: []u8, target: int, set := Font_Set.UI) -> int {
+// click's cell column back to a byte offset (inverse of text_cells). `target` is
+// relative to the start of `s`; `col0` is where `s` starts on its row, and must
+// be the same value the matching text_cells call was given or the two stop being
+// inverses on any line containing a tab.
+text_bytes_for_cells :: proc(t: ^Text, s: []u8, target: int, col0: int, set := Font_Set.UI) -> int {
 	str := string(s)
-	col, i := 0, 0
+	col, i := col0, 0
 	for i < len(str) {
 		r, w := utf8.decode_rune(str[i:])
 		cw := text_cell_width_at(t, r, col, set)
-		if col + cw > target {break} // target lands within this rune's cell span
+		if col + cw > col0 + target {break} // target lands within this rune's cell span
 		col += cw
 		i += w
 	}
@@ -616,10 +679,18 @@ text_draw_spans :: proc(
 	// The cell column, tracked alongside the pen. `pen` is pixels and cannot
 	// stand in for it: (pen - x) / cell_w only equals the column while every
 	// rune is a whole number of fixed-width cells, which stops being true the
-	// moment a tab's width depends on where it starts. `str` is always drawn
-	// from a row start (the document draw passes line_buf from the row start at
-	// col_x(.., 0, ..); chrome callers pass whole labels), so 0 is the real
-	// origin here.
+	// moment a tab's width depends on where it starts.
+	//
+	// 0 is the origin, and that is the convention rather than an accident: a
+	// fragment is measured from its own start and drawn from its own start.
+	// The document draw passes line_buf from the visual row start at
+	// col_x(.., 0, ..); chrome callers pass whole labels; the markdown and
+	// table draws pass one field/word/cell each, positioned by their own x.
+	// Every measuring call site (text_cells, text_span_cells) passes the same
+	// origin for the same fragment, so what is drawn and what is hit-tested
+	// cannot disagree. There is deliberately no col0 parameter here: no caller
+	// would pass anything but 0, and an always-0 parameter on the hottest proc
+	// in the file is worse than none.
 	col := 0
 	si := 0 // spans are sorted, so this only ever moves forward
 	for r, off in str {
@@ -773,17 +844,23 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, set: Font_Set, face: int, index: u16, px:
 	return g
 }
 
-// Cell offset and cell width of a byte range within `str`. Decorations that sit
-// under text — a link underline, later a squiggle — must be placed on the same
-// grid the glyphs advance along, or they drift on CJK and tabs.
-text_span_cells :: proc(t: ^Text, str: string, start, length: int, set := Font_Set.UI) -> (col, cells: int) {
+// Cell offset and cell width of a byte range within `str`, when `str` itself
+// begins at cell column `col0` of its row. Decorations that sit under text — a
+// link underline, later a squiggle — must be placed on the same grid the glyphs
+// advance along, or they drift on CJK and tabs.
+//
+// `col0` is required (see text_cells). Both returns stay RELATIVE to `str`: the
+// caller draws the decoration from `str`'s own x, so an absolute column would be
+// the wrong space to hand back.
+text_span_cells :: proc(t: ^Text, str: string, start, length: int, col0: int, set := Font_Set.UI) -> (col, cells: int) {
 	for r, off in str {
-		// `col + cells`, not either alone: this walk splits one running column
-		// across two accumulators -- `col` holds the cells before `start`, and
-		// `cells` holds the cells since. Neither is the rune's column on its
-		// own; only their sum is, before `start` (when cells == 0) and after it
-		// (when col has stopped moving) alike.
-		w := text_cell_width_at(t, r, col + cells, set)
+		// `col0 + col + cells`, not any one alone: this walk splits one running
+		// column across two accumulators -- `col` holds the cells before
+		// `start`, and `cells` holds the cells since -- on top of the origin
+		// `col0` the whole fragment sits at. Neither accumulator is the rune's
+		// column on its own; only the sum is, before `start` (when cells == 0)
+		// and after it (when col has stopped moving) alike.
+		w := text_cell_width_at(t, r, col0 + col + cells, set)
 		if off < start {
 			col += w
 			continue

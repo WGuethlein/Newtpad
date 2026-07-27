@@ -1615,7 +1615,7 @@ when NEWTPAD_TESTS {
 			}
 			samples := "aé中がx́\t" // ascii, 2-byte latin, CJK x2, kana, ascii, combining acute, tab
 			// Column 0: a standalone probe of a tab at the start of a row.
-			fmt.printfln("tab = %d cells (want %d, and must draw no glyph)", plat.text_cell_width_at(&t, '\t', 0), plat.TAB_CELLS)
+			fmt.printfln("tab = %d cells (want %d, and must draw no glyph)", plat.text_cell_width_at(&t, '\t', 0), plat.text_tab_width(&t))
 			fmt.printf("cells: ")
 			// A running column, not 0 per rune: this walks `samples` from its
 			// start, so each rune's real column is available, and the per-rune
@@ -1628,12 +1628,202 @@ when NEWTPAD_TESTS {
 				scol += w
 			}
 			bytes := transmute([]u8)samples
-			fmt.printfln(" | total=%d cells over %d bytes", plat.text_cells(&t, bytes), len(bytes))
+			// col0 = 0 throughout: `samples` is a standalone string measured from
+			// its own start, which is also the origin the per-rune walk above used.
+			fmt.printfln(" | total=%d cells over %d bytes", plat.text_cells(&t, bytes, 0), len(bytes))
 			// inverse: the byte offset at each cell column should round-trip.
-			total := plat.text_cells(&t, bytes)
+			total := plat.text_cells(&t, bytes, 0)
 			fmt.printf("col->byte: ")
-			for c in 0 ..= total {fmt.printf("%d:%d ", c, plat.text_bytes_for_cells(&t, bytes, c))}
+			for c in 0 ..= total {fmt.printf("%d:%d ", c, plat.text_bytes_for_cells(&t, bytes, c, 0))}
 			fmt.println()
+			return true
+		}
+
+		// `newtpad tabstoptest` proves a tab is an ADVANCE TO THE NEXT STOP, not
+		// a fixed width. The one property worth asserting is that THE SAME RUNE
+		// MEASURES DIFFERENTLY AT DIFFERENT COLUMNS -- a check that only ever
+		// measures a tab at column 0 returns 4 under fixed-width tabs and under
+		// true tab stops alike, so it cannot fail and proves nothing. That is
+		// not a hypothetical: every tab in every fixture of the other ten
+		// headless suites is a LEADING tab, which is why sabotaging the tab
+		// branch to real tab stops moved only two lines of `celltest` and left
+		// the other nine suites byte-identical (measured twice, independently,
+		// during batch 7 task 1).
+		//
+		// So the cases below come in pairs wherever possible: a column where the
+		// two behaviours agree (0, 4, 8) to pin the wrap-around, and a column
+		// where they cannot (1, 2, 3, 5) to make the check fail if the advance
+		// ever goes back to being constant.
+		if os.args[1] == "tabstoptest" {
+			bad := 0
+			fmt.println("tabstoptest:")
+
+			chk :: proc(label: string, got, want: int, bad: ^int) {
+				ok := got == want
+				fmt.printfln("  %-6s %-72s got=%d want=%d", "ok" if ok else "FAIL", label, got, want)
+				if !ok {bad^ += 1}
+			}
+
+			// --- the advance itself -------------------------------------------
+			tab_test_advance :: proc(chk: proc(string, int, int, ^int), bad: ^int) {
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("  FAIL tabstoptest: no fonts loaded")
+					bad^ += 1
+					return
+				}
+				fmt.println("--- the advance, tab_width=4 ---")
+				chk("text_tab_width after text_load_faces", plat.text_tab_width(&t), 4, bad)
+				// 0 and 4 are 4 under BOTH behaviours; 1/2/3/5/6/7 cannot be.
+				chk("'\\t' at col 0", plat.text_cell_width_at(&t, '\t', 0, .Doc), 4, bad)
+				chk("'\\t' at col 1", plat.text_cell_width_at(&t, '\t', 1, .Doc), 3, bad)
+				chk("'\\t' at col 2", plat.text_cell_width_at(&t, '\t', 2, .Doc), 2, bad)
+				chk("'\\t' at col 3", plat.text_cell_width_at(&t, '\t', 3, .Doc), 1, bad)
+				chk("'\\t' at col 4 (wraps back to a full stop)", plat.text_cell_width_at(&t, '\t', 4, .Doc), 4, bad)
+				chk("'\\t' at col 5", plat.text_cell_width_at(&t, '\t', 5, .Doc), 3, bad)
+				chk("'\\t' at col 7", plat.text_cell_width_at(&t, '\t', 7, .Doc), 1, bad)
+				chk("'\\t' at col 8", plat.text_cell_width_at(&t, '\t', 8, .Doc), 4, bad)
+				// The advance is never 0 at any column -- a 0 is not a wrong
+				// number on screen, it is a non-terminating measuring loop.
+				min_adv := max(int)
+				for c in 0 ..< 64 {min_adv = min(min_adv, plat.text_cell_width_at(&t, '\t', c, .Doc))}
+				chk("smallest advance over columns 0..63 (0 would hang the walks)", min_adv, 1, bad)
+				// The tab must never be served from cell_cache, which is keyed by
+				// rune alone: measure at 0 FIRST, then at 2. If the early return
+				// ever moves below the cache lookup, the second call returns the
+				// cached 4 and this fails.
+				_ = plat.text_cell_width_at(&t, '\t', 0, .Doc)
+				chk("'\\t' at col 2 after one at col 0 (cell_cache must not serve tabs)", plat.text_cell_width_at(&t, '\t', 2, .Doc), 2, bad)
+			}
+			tab_test_advance(chk, &bad)
+
+			// --- the three wrappers actually thread col0 ----------------------
+			// This is the item that task 1's sweep stopped one level short of:
+			// text_cells / text_bytes_for_cells / text_span_cells each hardcoded
+			// an origin of 0 internally, so a mid-row fragment measured its tabs
+			// from the wrong place even though every DIRECT caller of
+			// text_cell_width_at was correct.
+			tab_test_wrappers :: proc(chk: proc(string, int, int, ^int), bad: ^int) {
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("  FAIL tabstoptest: no fonts loaded")
+					bad^ += 1
+					return
+				}
+				s := "ab\tcd"
+				fmt.println("--- text_cells ---")
+				// "a\tb" is 1 + 3 + 1 = 5 under tab stops and 1 + 4 + 1 = 6 under
+				// a fixed four, so it discriminates -- the batch-7 plan says this
+				// case "cannot fail", and that is arithmetic the plan got wrong.
+				chk(`text_cells "a\tb" @0`, plat.text_cells(&t, transmute([]u8)string("a\tb"), 0, .Doc), 5, bad)
+				chk(`text_cells "ab\tc" @0`, plat.text_cells(&t, transmute([]u8)string("ab\tc"), 0, .Doc), 5, bad)
+				chk(`text_cells "abc\td" @0`, plat.text_cells(&t, transmute([]u8)string("abc\td"), 0, .Doc), 5, bad)
+				chk(`text_cells "abcd\te" @0 (agrees with fixed-4; pins the wrap)`, plat.text_cells(&t, transmute([]u8)string("abcd\te"), 0, .Doc), 9, bad)
+				chk(`text_cells "\t\t" @0`, plat.text_cells(&t, transmute([]u8)string("\t\t"), 0, .Doc), 8, bad)
+				// The same slice, four origins, four answers. A wrapper that
+				// ignores col0 returns 4 for all of them.
+				chk(`text_cells "\t" @0`, plat.text_cells(&t, transmute([]u8)string("\t"), 0, .Doc), 4, bad)
+				chk(`text_cells "\t" @1`, plat.text_cells(&t, transmute([]u8)string("\t"), 1, .Doc), 3, bad)
+				chk(`text_cells "\t" @2`, plat.text_cells(&t, transmute([]u8)string("\t"), 2, .Doc), 2, bad)
+				chk(`text_cells "\t" @3`, plat.text_cells(&t, transmute([]u8)string("\t"), 3, .Doc), 1, bad)
+				chk(`text_cells "ab\tcd" @0`, plat.text_cells(&t, transmute([]u8)s, 0, .Doc), 6, bad)
+				chk(`text_cells "ab\tcd" @1 (same bytes, different origin)`, plat.text_cells(&t, transmute([]u8)s, 1, .Doc), 5, bad)
+
+				fmt.println("--- text_span_cells ---")
+				// "cd" inside "ab\tcd": the tab occupies columns 2-3, so the span
+				// starts at column 4. Under a fixed four it would start at 6.
+				c0, n0 := plat.text_span_cells(&t, s, 3, 2, 0, .Doc)
+				chk(`text_span_cells "ab\tcd" [3,5) @0 -> col`, c0, 4, bad)
+				chk(`text_span_cells "ab\tcd" [3,5) @0 -> cells`, n0, 2, bad)
+				c1, n1 := plat.text_span_cells(&t, s, 3, 2, 1, .Doc)
+				chk(`text_span_cells "ab\tcd" [3,5) @1 -> col (origin threaded)`, c1, 3, bad)
+				chk(`text_span_cells "ab\tcd" [3,5) @1 -> cells`, n1, 2, bad)
+
+				fmt.println("--- seam: the three wrappers agree with each other ---")
+				// text_span_cells' `col` IS text_cells over the prefix, and
+				// text_bytes_for_cells is text_cells' inverse. All three walk the
+				// same runes, so all three must see the same column sequence --
+				// this is the check that catches a consumer (or a wrapper) that
+				// forgot to thread the origin, which a unit test of the advance
+				// alone cannot.
+				// Counted separately from `bad` so this line reports on ITSELF and
+				// not on whatever failed above it -- a summary that reads the
+				// shared counter turns green only when the whole mode is green,
+				// which makes it useless as a signal about the seam.
+				seam_bad := 0
+				for col0 in 0 ..< 5 {
+					for p in 0 ..= len(s) {
+						if p > 0 && p < len(s) && (s[p] & 0xC0) == 0x80 {continue} // rune boundaries only
+						pref := plat.text_cells(&t, transmute([]u8)s[:p], col0, .Doc)
+						back := plat.text_bytes_for_cells(&t, transmute([]u8)s, pref, col0, .Doc)
+						if back != p {
+							fmt.printfln("  FAIL   round-trip @col0=%d prefix=%d -> %d cells -> byte %d", col0, p, pref, back)
+							seam_bad += 1
+						}
+						if p < len(s) {
+							sc, _ := plat.text_span_cells(&t, s, p, len(s) - p, col0, .Doc)
+							if sc != pref {
+								fmt.printfln("  FAIL   text_span_cells col=%d disagrees with text_cells prefix=%d @col0=%d", sc, pref, col0)
+								seam_bad += 1
+							}
+						}
+					}
+				}
+				bad^ += seam_bad
+				// Known limit, stated so nobody reads more into a green line than
+				// is there: this catches a consumer that threads the origin
+				// INCONSISTENTLY across the three wrappers. It does NOT catch all
+				// three dropping col0 together -- they stay mutually consistent,
+				// just wrong -- which is what the "@1 / @2 / @3" value checks
+				// above are for.
+				fmt.printfln("  %-6s cells<->bytes<->span agree for every prefix of %q at origins 0..4", "ok" if seam_bad == 0 else "FAIL", s)
+			}
+			tab_test_wrappers(chk, &bad)
+
+			// --- the setting, and its clamp -----------------------------------
+			tab_test_width_setting :: proc(chk: proc(string, int, int, ^int), bad: ^int) {
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("  FAIL tabstoptest: no fonts loaded")
+					bad^ += 1
+					return
+				}
+				fmt.println("--- tab_width is configurable ---")
+				plat.text_set_tab_width(&t, 8)
+				chk("text_tab_width after set(8)", plat.text_tab_width(&t), 8, bad)
+				chk("'\\t' at col 0, width 8", plat.text_cell_width_at(&t, '\t', 0, .Doc), 8, bad)
+				chk("'\\t' at col 1, width 8", plat.text_cell_width_at(&t, '\t', 1, .Doc), 7, bad)
+				chk(`text_cells "a\tb" @0, width 8`, plat.text_cells(&t, transmute([]u8)string("a\tb"), 0, .Doc), 9, bad)
+				plat.text_set_tab_width(&t, 2)
+				chk(`text_cells "abc\td" @0, width 2`, plat.text_cells(&t, transmute([]u8)string("abc\td"), 0, .Doc), 5, bad)
+
+				fmt.println("--- the clamp, which is a hang guard and not cosmetic ---")
+				// A spacing of 0 makes the advance 0, and every measuring loop in
+				// platform and program advances by exactly that -- so an
+				// unclamped 0 is a frozen UI, not a layout glitch.
+				plat.text_set_tab_width(&t, 0)
+				chk("set(0) clamps up to TAB_WIDTH_MIN", plat.text_tab_width(&t), plat.TAB_WIDTH_MIN, bad)
+				zero_adv := max(int)
+				for c in 0 ..< 16 {zero_adv = min(zero_adv, plat.text_cell_width_at(&t, '\t', c, .Doc))}
+				chk("after set(0), the smallest advance is still >= 1", zero_adv, 1, bad)
+				// And the loops really do terminate at the clamped width.
+				chk(`text_cells "\t\t\t" after set(0)`, plat.text_cells(&t, transmute([]u8)string("\t\t\t"), 0, .Doc), 3, bad)
+				plat.text_set_tab_width(&t, -5)
+				chk("set(-5) clamps up to TAB_WIDTH_MIN", plat.text_tab_width(&t), plat.TAB_WIDTH_MIN, bad)
+				plat.text_set_tab_width(&t, 999)
+				chk("set(999) clamps down to TAB_WIDTH_MAX", plat.text_tab_width(&t), plat.TAB_WIDTH_MAX, bad)
+
+				// Zero-is-initialization: a Text that never reached
+				// text_load_faces reads tab_width 0 straight out of the struct,
+				// and 0 is the one value that hangs. text_tab_width must hand
+				// back the default instead of the raw field.
+				raw: plat.Text
+				chk("a zero-valued Text reports the default width", plat.text_tab_width(&raw), plat.TAB_WIDTH_DEFAULT, bad)
+				chk("a zero-valued Text still advances a tab at col 2", plat.text_cell_width_at(&raw, '\t', 2, .Doc), 2, bad)
+			}
+			tab_test_width_setting(chk, &bad)
+
+			fmt.printfln("tabstoptest: %d failures", bad)
 			return true
 		}
 
@@ -1715,7 +1905,8 @@ when NEWTPAD_TESTS {
 			if !c0 {fail = true}
 			fmt.printfln("  %-6s ascii row: bytes [%d,%d) pad=%d ok=%v", "ok" if c0 else "FAIL", b0lo, b0hi, pad0, ok0)
 
-			// Row 1's leading tab is one byte spanning TAB_CELLS=4 cells, so cell 2
+			// Row 1's leading tab is one byte spanning 4 cells (it starts at
+			// column 0, so it advances a full tab_width), so cell 2
 			// falls INSIDE it. The tab is included whole (a partial glyph has no
 			// byte form), pulling byte_lo back to the tab's own start (byte 0) --
 			// the rectangle ends up covering cells [0,6) worth of content in only
@@ -3580,9 +3771,9 @@ when NEWTPAD_TESTS {
 			// AF: LOW 1 -- Backspace over a multi-cell rune (a leading tab) must
 			// land the rectangle at the column the deletion actually reached, not
 			// cell_lo-1. Reviewer's exact probe: "\tabc\n\tdef\n", rectangle at
-			// cell 4 (zero-width, both rows identical) -- the tab is TAB_CELLS
-			// wide (4), so deleting it drops the rectangle back to column 0, not
-			// column 3. A stale column 3 would pad three stray spaces onto every
+			// cell 4 (zero-width, both rows identical) -- the tab starts at
+			// column 0 so it is 4 cells wide, and deleting it drops the
+			// rectangle back to column 0, not column 3. A stale column 3 would pad three stray spaces onto every
 			// row on the very next keystroke.
 			//
 			// Sabotage (per task): restore `new_cell` to a flat `cell_lo - 1` in
@@ -4478,6 +4669,97 @@ when NEWTPAD_TESTS {
 			}
 			if block_test_history_jump_blocked_in_table(&t) > 0 {fail = true}
 
+			// --- batch 7: a tab that is NOT at column 0 -------------------------
+			// Every tab in every fixture above this line is a LEADING tab, and a
+			// tab at column 0 is 4 cells under fixed-width tabs and under true
+			// tab stops alike -- so none of them can see the difference. These
+			// three use "ab\tcd", where the tab starts at column 2 and is
+			// therefore 2 cells wide, not 4.
+			//
+			// AR: block_row_range, the one procedure that turns cells into bytes.
+			// Sabotage: make the tab branch of text_cell_width_at return a
+			// constant 4 again and this FAILS -- cell 4 then lands inside the
+			// tab (which would span columns 2..5), so byte_lo is pulled back to
+			// the tab's own start at byte 2 instead of naming 'c' at byte 3.
+			block_test_ar :: proc(t: ^plat.Text) -> bool {
+				rdoc := doc_from_content(transmute([]u8)strings.clone("ab\tcd\n"), "", .UTF8)
+				defer doc_close(&rdoc)
+				rdoc.wrap = false
+				// Columns: a=0 b=1 tab=2..3 c=4 d=5.
+				lo1, hi1, pad1, ok1 := block_row_range(&rdoc, t, 0, 4, 6) // "cd"
+				lo2, hi2, _, ok2 := block_row_range(&rdoc, t, 0, 2, 4) // the tab itself
+				cAR := ok1 && lo1 == 3 && hi1 == 5 && pad1 == 0 && ok2 && lo2 == 2 && hi2 == 3
+				fmt.printfln(
+					"  %-6s TAB STOPS: \"ab\\tcd\" cells [4,6)->bytes [%d,%d) (want [3,5)) and cells [2,4)->bytes [%d,%d) (want [2,3))",
+					"ok" if cAR else "FAIL", lo1, hi1, lo2, hi2,
+				)
+				return cAR
+			}
+			if !block_test_ar(&t) {fail = true}
+
+			// AS: block_delete's caret column, the second of the two
+			// keystroke-reachable wrapper bugs the task-1 review found. The
+			// rectangle is zero-width at cell 4, Backspace deletes the whole tab
+			// (columns 2..3), and the rectangle must land at column 2.
+			//
+			// Sabotage: restore `new_cell = cell_lo - plat.text_cells(t, buf, 0)`
+			// -- the pre-batch-7 form, whose origin of 0 measures the tab as 4 --
+			// and this FAILS with both cells reading 0: the caret jumps to the
+			// start of every row.
+			block_test_as :: proc(t: ^plat.Text) -> bool {
+				sdoc := doc_from_content(transmute([]u8)strings.clone("ab\tcd\nab\tcd\n"), "", .UTF8)
+				defer doc_close(&sdoc)
+				sdoc.wrap = false
+				sdoc.block = true
+				sdoc.block_anchor_line_start, sdoc.block_anchor_cell = 0, 4
+				sdoc.block_cursor_line_start, sdoc.block_cursor_cell = 6, 4 // second row's line start
+				oks := block_delete(&sdoc, t, false)
+				got := doc_debug_string(&sdoc)
+				cAS := oks && got == "abcd\nabcd\n" && sdoc.block_anchor_cell == 2 && sdoc.block_cursor_cell == 2
+				fmt.printfln(
+					"  %-6s TAB STOPS: backspace over a mid-line tab lands at column 2 (the tab's own start), not 0: content=%q (want %q) cells=%d,%d (want 2,2)",
+					"ok" if cAS else "FAIL", got, "abcd\\nabcd\\n", sdoc.block_anchor_cell, sdoc.block_cursor_cell,
+				)
+				return cAS
+			}
+			if !block_test_as(&t) {fail = true}
+
+			// AT: block_replace's caret column, the first of the two. Pressing
+			// Tab inside a zero-width rectangle at cell 2 inserts a tab that
+			// advances to column 4, not to 2+4=6. Driven through the real
+			// command table so it crosses commands.odin's .Insert_Tab branch the
+			// way a keystroke does.
+			//
+			// Sabotage: pass 0 instead of cell_lo as text_cells' origin in
+			// block_replace and this FAILS with both cells reading 6 -- and the
+			// next keystroke would then pad two stray spaces onto every row.
+			block_test_at :: proc(t: ^plat.Text) -> bool {
+				ta: App
+				tdummy: plat.Window
+				app_new_scratch(&ta)
+				td := app_active(&ta)
+				doc_close(td)
+				td^ = doc_from_content(transmute([]u8)strings.clone("abcd\nabcd\n"), "", .UTF8)
+				td.wrap = false
+				td.anchor, td.cursor = 0, 0
+				refusal := block_set_from_points(td, t, 0, 2, 5, 2)
+				tab_cmd := resolve_key(.Tab, false, false, .Editor)
+				command_dispatch(tab_cmd, {.Tab, false, false, false}, &ta, &tdummy, t, 10)
+				after := doc_debug_string(td)
+				cAT :=
+					refusal == .None &&
+					after == "ab\tcd\nab\tcd\n" &&
+					td.block_anchor_cell == 4 &&
+					td.block_cursor_cell == 4
+				fmt.printfln(
+					"  %-6s TAB STOPS: Tab inside a rectangle at cell 2 leaves it at column 4, not 6: after=%q (want %q) cells=%d,%d (want 4,4)",
+					"ok" if cAT else "FAIL", after, "ab\\tcd\\nab\\tcd\\n", td.block_anchor_cell, td.block_cursor_cell,
+				)
+				app_destroy(&ta)
+				return cAT
+			}
+			if !block_test_at(&t) {fail = true}
+
 			// SEAM PROOF: the assertion the previous round's clipboard fix
 			// lacked. block_test_an (above) only proves block_test_ai's OWN
 			// save/restore works; it says nothing about block_test_t,
@@ -4708,6 +4990,51 @@ when NEWTPAD_TESTS {
 						fmt.printfln("  target %q %s", got, "OK" if tok else "FAIL")
 						if !tok {bad += 1}
 					}
+				}
+			}
+
+			fmt.println("--- a link that starts after a MID-LINE tab ---")
+			// The seam check above puts the link after a plain space, so its
+			// column is the same under fixed-width tabs and true tab stops --
+			// like every other tab in every other suite, it cannot see the
+			// difference. Here "see" fills columns 0-2, the tab at column 3
+			// advances ONE cell to reach the stop at 4, and the link starts
+			// there. Under a fixed four the tab would be 4 wide and the link
+			// would start at column 7.
+			//
+			// This is text_span_cells' only non-leading-tab fixture, and it is a
+			// seam check as well as a value check: the same col/cells drive the
+			// drawn underline and links_hit, so the boundary probes below fail
+			// if either one drifts. Sabotage the tab branch of
+			// text_cell_width_at back to a constant and col prints 7.
+			{
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				url := "https://example.com/x"
+				td := doc_from_content(transmute([]u8)strings.clone("see\thttps://example.com/x now\n"), "", .UTF8)
+				defer doc_close(&td)
+				td.wrap = false
+				td.view_cols = 200
+				td.view_rows = 10
+				hits := links_layout(&td, &tt, 10)
+				if len(hits) != 1 {
+					fmt.printfln("  FAIL: expected 1 hit, got %d", len(hits))
+					bad += 1
+				} else {
+					h := hits[0]
+					cw := plat.text_char_width(&tt, BASE_PX, .Doc)
+					px := BASE_PX
+					yy := row_baseline_y(px, h.row) - line_height(px) * 0.5
+					_, i1 := links_hit(hits, px, cw, col_x(cw, h.col) + cw * 0.5, yy)
+					_, i2 := links_hit(hits, px, cw, col_x(cw, h.col + h.cells - 1) + cw * 0.5, yy)
+					_, o1 := links_hit(hits, px, cw, col_x(cw, h.col - 1) + cw * 0.5, yy)
+					_, o2 := links_hit(hits, px, cw, col_x(cw, h.col + h.cells) + cw * 0.5, yy)
+					ok := h.col == 4 && h.cells == len(url) && i1 && i2 && !o1 && !o2
+					fmt.printfln(
+						"  col=%d (want 4; a fixed-4 tab gives 7) cells=%d/%d  first=%v last=%v before=%v after=%v %s",
+						h.col, h.cells, len(url), i1, i2, o1, o2, "OK" if ok else "FAIL",
+					)
+					if !ok {bad += 1}
 				}
 			}
 
@@ -5850,6 +6177,67 @@ when NEWTPAD_TESTS {
 				p = e + 1 if le else e
 			}
 			base.pt_destroy(&doc.pt)
+
+			// --- batch 7: a MID-LINE tab, the case the dump above cannot reach --
+			// Neither fixture above contains a tab, and every tab in every other
+			// suite is a leading one -- which is 4 cells under fixed-width tabs
+			// and under true tab stops alike. These two are the only wrap checks
+			// that can tell the two apart.
+			bad := 0
+
+			// wrap_row_end. "ab\tcd efghijkl" at 8 cells: the tab starts at
+			// column 2, so it is 2 cells wide and 'e' is the last rune that fits
+			// -- the break falls back to the space at byte 5, giving [0,6).
+			// Under a fixed four the tab would end at column 6, 'd' would fill
+			// column 8, and the break would fall back to the TAB at byte 3
+			// instead, giving [0,3). Sabotage the tab branch back to a constant
+			// and this prints 3.
+			tab_wrap :: proc(t: ^plat.Text) -> (bad: int) {
+				content := "ab\tcd efghijkl"
+				doc: Document
+				doc.pt = base.pt_init(transmute([]u8)content)
+				defer base.pt_destroy(&doc.pt)
+				e, le := wrap_row_end(&doc, t, 0, 8)
+				ok := e == 6 && !le
+				fmt.printfln(
+					"  %-6s mid-line tab: wrap_row_end(%q, 8 cells) = [0,%d) line_end=%v (want [0,6), false; a fixed-4 tab gives [0,3))",
+					"ok" if ok else "FAIL", content, e, le,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			bad += tab_wrap(&t)
+
+			// line_wrap_decision, through eff_wrap_at (its only non-file-private
+			// caller). "a\t" repeated: each pair lands the tab at column 1, so it
+			// advances 3 and the pair costs exactly 4 cells. 256 pairs is 1024
+			// cells -- NOT over WRAP_LONG_CELLS, so the line must not force-wrap.
+			// Under a fixed four each pair costs 5, 256 pairs is 1280, and the
+			// line force-wraps. The 300-pair case is the control: 1200 cells is
+			// over the threshold under either behaviour, so a check stuck at
+			// `false` fails it.
+			tab_wrap_decision :: proc(t: ^plat.Text) -> (bad: int) {
+				one :: proc(t: ^plat.Text, pairs: int, want: bool) -> bool {
+					content := strings.concatenate({strings.repeat("a\t", pairs), "\n"}, context.temp_allocator)
+					doc: Document
+					doc.pt = base.pt_init(transmute([]u8)content)
+					defer base.pt_destroy(&doc.pt)
+					doc.wrap = false
+					got, _ := eff_wrap_at(&doc, t, 0)
+					ok := got == want
+					fmt.printfln(
+						"  %-6s %d x \"a\\t\" = %d cells: force-wraps=%v (want %v; a fixed-4 tab makes it %d cells)",
+						"ok" if ok else "FAIL", pairs, pairs * 4, got, want, pairs * 5,
+					)
+					return ok
+				}
+				if !one(t, 256, false) {bad += 1} // 1024 cells: exactly at, not over, the threshold
+				if !one(t, 300, true) {bad += 1} // 1200 cells: over it under either behaviour
+				return
+			}
+			bad += tab_wrap_decision(&t)
+
+			fmt.printfln("wraptest: %d failures", bad)
 			return true
 		}
 
