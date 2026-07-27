@@ -49,6 +49,14 @@ Draw_Stats :: struct {
 	quad_calls:     int,
 	text_instances: int,
 	quad_instances: int,
+	// Instances the caller built that MAX_TEXT_INSTANCES / MAX_QUADS refused to
+	// submit. Zero today, because each call draws one short string — but batching
+	// is precisely the change that makes one call carry a whole frame's worth, and
+	// the clamp is silent: it drops the tail and draws the rest. The digest would
+	// register that (it hashes what was submitted, not what was asked for) but
+	// only as "different", with nothing saying why. This says why.
+	text_clamped:   int,
+	quad_clamped:   int,
 	text_digest:    u64,
 	quad_digest:    u64,
 	frame_digest:   u64,

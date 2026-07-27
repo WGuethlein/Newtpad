@@ -134,6 +134,7 @@ quads_draw :: proc(gfx: ^Gfx, qp: ^Quad_Pipeline, quads: []Quad) {
 	}
 	g_draw.quad_calls += 1
 	n := min(len(quads), MAX_QUADS)
+	g_draw.quad_clamped += len(quads) - n
 	draw_note_quads(quads[:n])
 	ctx := gfx.ctx
 

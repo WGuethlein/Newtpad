@@ -749,7 +749,8 @@ text_draw_spans :: proc(
 	}
 
 	n := min(len(instances), MAX_TEXT_INSTANCES)
-	draw_note_text(instances[:n]) // see draw_trace.odin
+	g_draw.text_clamped += len(instances) - n // see draw_trace.odin
+	draw_note_text(instances[:n])
 	ctx := gfx.ctx
 
 	mapped: d3d.MAPPED_SUBRESOURCE

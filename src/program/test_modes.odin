@@ -248,6 +248,12 @@ when NEWTPAD_TESTS {
 		fmt.println("--- instance stream (what the GPU consumed) ---")
 		fmt.printfln("  text instances         : %d", cur.text_instances)
 		fmt.printfln("  quad instances         : %d", cur.quad_instances)
+		fmt.printfln(
+			"  instances clamped away : %d text, %d quad  %s",
+			cur.text_clamped,
+			cur.quad_clamped,
+			"" if cur.text_clamped == 0 && cur.quad_clamped == 0 else "FAIL - MAX_TEXT_INSTANCES/MAX_QUADS dropped geometry; the frame on screen is incomplete",
+		)
 		fmt.printfln("  text  stream digest    : 0x%016x", cur.text_digest)
 		fmt.printfln("  quad  stream digest    : 0x%016x", cur.quad_digest)
 		fmt.printfln("  frame stream digest    : 0x%016x", cur.frame_digest)
