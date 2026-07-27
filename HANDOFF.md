@@ -2636,11 +2636,37 @@ would have given one view two scroll models. Wired to the existing column pan in
   line beside it is `if bad == 0`, so an unrelated failure silently suppresses it. Same shared-counter
   smell §6ab fixed once already.
 
+### The follow-up (v0.17.2): the bar moved on click and froze on drag
+
+Wyatt, on the v0.17.1 build: *"it only moves when you click, not when you hold and drag."* A second,
+independent bug that the first fix **made reachable** — the bar had to work before anyone could
+notice it did not drag.
+
+The read-only swallow (`main.odin`) consumes a press on the grid, a full Preview, or a Split's
+preview half, because those take no caret. Consuming means zeroing `window.mouse_down` — **and that
+is persistent platform state**, set on `WM_LBUTTONDOWN` and cleared on `WM_LBUTTONUP`. Zero it
+mid-gesture and the drag dies twice over: the latch sees `!mouse_down` and clears itself, and
+`WM_MOUSEMOVE` only updates `mouse_x` *while* `mouse_down` is set, so the pointer stops moving too.
+
+The guard already excluded `scrollbar_drag`, `md_preview_drag` and `divider_drag`. **`hscrollbar_drag`
+was simply missing from the list** — invisible for as long as the horizontal bar was dead in those
+views, and invisible in the plain text view because `ro` is false there so nothing is swallowed.
+
+Fixed by making the latch list a `Drag_Latches` struct behind one pure predicate,
+`ro_surface_swallows`, so the list is a thing that can be tested rather than four `&&` clauses nobody
+re-reads. The test asserts each latch vetoes the swallow **and** that an ordinary press still *is*
+swallowed — without that second half a predicate returning `false` unconditionally would pass.
+Sabotage (dropping `hscroll`) reddens exactly three cases.
+
+**Checked for a second instance, per §4 of the loop:** the bottom-strip block ten lines below does the
+same zeroing, but guards on `mouse_pressed` (a fresh press) rather than `mouse_down`, so a held drag
+passes through it safely. One instance, not a class.
+
 ### Owed
 
-Nothing was verified against real GUI input. Wyatt's pass: a wide CSV in Ctrl+T (drag the bar, and
-confirm Shift+wheel still agrees with it), a long-lined `.md` in Ctrl+M (no bar at all), and a plain
-long-lined text file (unchanged).
+Nothing was verified against real GUI input. Wyatt's pass: a wide CSV in Ctrl+T — **hold and drag**
+the bar, not just click it — and confirm Shift+wheel still agrees with it; a long-lined `.md` in
+Ctrl+M (no bar at all); and a plain long-lined text file (unchanged).
 
 ## 7. Build environment (Windows, this machine)
 

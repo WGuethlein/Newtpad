@@ -562,8 +562,9 @@ main :: proc() {
 		// a split take no caret. Swallow any press the scrollbars above did not claim
 		// (so the wheel still scrolls, and the bars still drag). After the scrollbars,
 		// so a press on either bar reaches it first.
-		if doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) && !scrollbar_drag && !md_preview_drag && !divider_drag {
-			ro := doc.table || doc.md_mode == .Preview || (doc.md_mode == .Split && f32(window.mouse_x) >= ed_right)
+		if doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) {
+			drags := Drag_Latches{scrollbar_drag, hscrollbar_drag, md_preview_drag, divider_drag}
+			ro := ro_surface_swallows(doc.table, doc.md_mode, f32(window.mouse_x) >= ed_right, drags)
 			if ro && (window.mouse_pressed || window.mouse_down) {
 				window.mouse_pressed = false
 				window.mouse_middle_pressed = false
@@ -965,6 +966,34 @@ hscrollbar_geo :: proc(doc: ^Document, winw, winh: f32, m: Hscroll) -> (b: Hbar)
 // Map a pointer x on the track to a horizontal scroll offset (thumb centred on
 // the cursor). Inverse of hscrollbar_geo's thumb_x; kept beside it so the two
 // stay consistent.
+// Every gesture that owns the pointer across frames. The read-only swallow must
+// exclude all of them, and this struct exists so the list is one thing that can
+// be tested rather than four `&&` clauses nobody re-reads.
+Drag_Latches :: struct {
+	vscroll, hscroll, preview, divider: bool,
+}
+
+// Should a read-only surface swallow this mouse event?
+//
+// The grid, a full Preview and the preview half of a Split take no caret, so a
+// press that no scrollbar claimed is consumed. **But consuming means zeroing
+// `window.mouse_down`, and that is persistent platform state** — set on
+// WM_LBUTTONDOWN, cleared on WM_LBUTTONUP (`window.odin`). Zero it mid-gesture
+// and the drag is dead until the next press, twice over: the latch above sees
+// `!mouse_down` and clears itself, and WM_MOUSEMOVE only updates `mouse_x`
+// while `mouse_down` is set, so the pointer stops moving too.
+//
+// That is exactly what shipped: `hscroll` was missing from this list while the
+// other three were present, so dragging the grid's horizontal bar moved it on
+// the press frame and froze — "it only moves when you click, not when you hold
+// and drag" (Wyatt, live use, v0.17.1). It went unnoticed because the bar was
+// dead in the grid until the fix immediately before it, and because in the
+// plain text view `ro` is false so nothing is swallowed at all.
+ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool, d: Drag_Latches) -> bool {
+	if d.vscroll || d.hscroll || d.preview || d.divider {return false}
+	return table || md_mode == .Preview || (md_mode == .Split && in_preview_half)
+}
+
 hscrollbar_pos_at :: proc(b: Hbar, mx: f32, m: Hscroll) -> int {
 	frac := (mx - b.track_x - b.thumb_w * 0.5) / max(1, b.track_w - b.thumb_w)
 	return clamp(int(frac * f32(m.max) + 0.5), 0, m.max)

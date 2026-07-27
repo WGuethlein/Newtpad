@@ -6499,6 +6499,61 @@ when NEWTPAD_TESTS {
 			}
 			fmt.printfln("  grid pans columns, markdown preview shows no bar: %s", "OK" if grid_bad == 0 else fmt.tprintf("%d FAILED", grid_bad))
 
+			// A read-only surface swallows a press by zeroing window.mouse_down,
+			// which is PERSISTENT platform state -- so every cross-frame drag latch
+			// must be excluded or the gesture dies on its first frame. `hscroll` was
+			// missing while the other three were present, which is why the grid's
+			// horizontal bar moved on click and froze on drag (v0.17.1, live use).
+			ro_bad := 0
+			{
+				all := []Drag_Latches {
+					{vscroll = true},
+					{hscroll = true},
+					{preview = true},
+					{divider = true},
+				}
+				names := []string{"vscroll", "hscroll", "preview", "divider"}
+				for d, i in all {
+					// Grid: every latch must veto the swallow.
+					if ro_surface_swallows(true, .Off, false, d) {
+						fmt.printfln("  FAIL ro-swallow: grid swallows while %s drag is live", names[i])
+						ro_bad += 1
+					}
+					// Full Preview, and the preview half of a Split, likewise.
+					if ro_surface_swallows(false, .Preview, false, d) {
+						fmt.printfln("  FAIL ro-swallow: preview swallows while %s drag is live", names[i])
+						ro_bad += 1
+					}
+					if ro_surface_swallows(false, .Split, true, d) {
+						fmt.printfln("  FAIL ro-swallow: split preview half swallows while %s drag is live", names[i])
+						ro_bad += 1
+					}
+				}
+				// With no drag live the swallow must still happen, or a press in the
+				// grid would place a caret in a read-only view. A predicate that
+				// always returns false would pass every case above.
+				none: Drag_Latches
+				if !ro_surface_swallows(true, .Off, false, none) {
+					fmt.println("  FAIL ro-swallow: grid does not swallow an ordinary press")
+					ro_bad += 1
+				}
+				if !ro_surface_swallows(false, .Preview, false, none) {
+					fmt.println("  FAIL ro-swallow: preview does not swallow an ordinary press")
+					ro_bad += 1
+				}
+				// The editor half of a Split, and a plain text doc, are NOT read-only.
+				if ro_surface_swallows(false, .Split, false, none) {
+					fmt.println("  FAIL ro-swallow: split EDITOR half swallowed a press")
+					ro_bad += 1
+				}
+				if ro_surface_swallows(false, .Off, false, none) {
+					fmt.println("  FAIL ro-swallow: plain text swallowed a press")
+					ro_bad += 1
+				}
+			}
+			fmt.printfln("  a live drag survives the read-only swallow: %s", "OK" if ro_bad == 0 else fmt.tprintf("%d FAILED", ro_bad))
+			bad += ro_bad
+
 			// Wrapping disables horizontal scroll (H_SCROLL forced to 0).
 			doc.wrap = true
 			doc.h_scroll = 100
