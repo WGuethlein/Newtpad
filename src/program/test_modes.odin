@@ -6688,6 +6688,67 @@ when NEWTPAD_TESTS {
 			}
 			bad += reopen_over_cap_stamp_skips_the_stat()
 
+			// Encoding > Line Endings, the OTHER consumer of convert_line_endings and
+			// the one nothing covered: pastetest drives the paste path, and crlftest
+			// is a caret/hit-test/wrap suite that never calls this at all.
+			//
+			// The lone CR must survive here for the same reason it survives a paste --
+			// detect_line_ending counts only '\n' and Line_Ending has no .CR member, so
+			// a bare CR has never been a line ending anywhere in Newtpad, and the old
+			// code rewrote bytes the detector does not classify as endings.
+			//
+			// The MIXED case is the one that changed. A buffer of nothing but lone CRs
+			// was never rewritten even before the fix: convert_line_endings returns the
+			// same length, and doc_set_line_ending's length-equality early return then
+			// takes the no-op path. Only a buffer holding both reaches the rewrite.
+			eol_row_case :: proc(text, want_crlf, want_lf: string) -> (bad: int) {
+				a: App
+				defer app_destroy(&a)
+				c := make([]u8, len(text));copy(c, transmute([]u8)text)
+				d := new(Document)
+				d^ = doc_from_content(c, "", .UTF8)
+				d.eol = .LF
+				app_add(&a, d)
+				app_activate(&a, 0)
+				doc_set_line_ending(d, .CRLF)
+				to_crlf := strings.clone(doc_debug_string(d), context.temp_allocator)
+				crlf_eol := d.eol
+				doc_set_line_ending(d, .LF)
+				to_lf := doc_debug_string(d)
+				ok := to_crlf == want_crlf && to_lf == want_lf && crlf_eol == .CRLF && d.eol == .LF
+				fmt.printfln(
+					"  %-6s Line Endings rows leave a lone CR alone: %q -> CRLF %q (want %q) -> LF %q (want %q)",
+					"ok" if ok else "FAIL", text, to_crlf, want_crlf, to_lf, want_lf,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			// Both endings present: the LF converts, the CR does not, and going back
+			// leaves the CR where it was rather than eating it as half a pair.
+			bad += eol_row_case("a\rb\nc", "a\rb\r\nc", "a\rb\nc")
+			// A CR at the very end is the branch a lookahead-bounds slip gets wrong.
+			bad += eol_row_case("a\nb\r", "a\r\nb\r", "a\nb\r")
+			// Nothing but lone CRs: the early return fires, so the text is untouched
+			// AND no undo step is pushed -- assert the second half too, or this case
+			// passes for an implementation that rewrites the buffer to itself.
+			{
+				a: App
+				defer app_destroy(&a)
+				c := make([]u8, 3);copy(c, transmute([]u8)string("a\rb"))
+				d := new(Document)
+				d^ = doc_from_content(c, "", .UTF8)
+				d.eol = .LF
+				app_add(&a, d)
+				app_activate(&a, 0)
+				doc_set_line_ending(d, .CRLF)
+				ok := doc_debug_string(d) == "a\rb" && d.eol == .CRLF && len(d.undo) == 0
+				fmt.printfln(
+					"  %-6s an all-lone-CR buffer takes the no-op path: text=%q eol=%v undo=%d",
+					"ok" if ok else "FAIL", doc_debug_string(d), d.eol, len(d.undo),
+				)
+				if !ok {bad += 1}
+			}
+
 			fmt.printfln("enctest: %d failures", bad)
 			return true
 		}
