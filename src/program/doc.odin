@@ -1220,10 +1220,15 @@ count_newlines :: proc(doc: ^Document, pos, count: int) -> (c: int) {
 // The edit half of that is the whole difficulty of the feature, and it is solved
 // the way find_invalidate and apply_snapshot solve the same shape for the match
 // list and the column rectangle: ONE seam that every edit already passes through
-// (here, pt_edit_insert/pt_edit_delete, which wrap the only two piece-table
-// mutations in this file), plus a cloned set carried on the undo Snapshot. No
-// third mechanism, and in particular no per-command bookkeeping -- a command that
-// forgets is exactly how the column rectangle went stale before §6u.
+// (here, pt_edit_replace, which wraps every piece-table mutation in this file),
+// plus a cloned set carried on the undo Snapshot. No third mechanism, and in
+// particular no per-command bookkeeping -- a command that forgets is exactly how
+// the column rectangle went stale before §6u.
+//
+// "One seam" also means one RULE. It was briefly a shift-for-insert and a
+// shift-for-delete, and a replace calls both at the same offset -- where the two
+// correct halves produced a wrong answer that no invariant could see. See
+// bookmarks_shift_replace.
 
 // A bookmark's index in doc.bookmarks, and whether the offset is bookmarked.
 // Binary search: the list is sorted by construction.
