@@ -1420,18 +1420,11 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// so on a large file there are none for the first frames — gating here
 		// made Ctrl+L do nothing at exactly the moment it was most wanted. The
 		// view falls back to unfiltered until matches exist (doc_filtering).
-		doc.filter = !doc.filter
-		doc.filter_top = 0
-		// A rectangle made before Ctrl+L names rows by the buffer's own logical
-		// lines (block.odin never walks the filtered view), which is a
-		// different, non-contiguous set of rows the instant filter view turns
-		// on. block_extend already refuses to CREATE a rectangle while
-		// doc.filter is set; this is the other half -- drop one that already
-		// exists rather than let it silently edit rows the user can no longer
-		// see. block.odin's own edit paths refuse under doc.filter too
-		// (belt and braces), but this is the one place that actually removes
-		// the stale selection the user would otherwise still see highlighted.
-		if block_active(doc) {block_clear(doc)}
+		// find_set_filter (find.odin) is the single path in and out of the
+		// filter view -- it also drops a live column rectangle, and its comment
+		// is where the reason lives. Clicking a filtered row leaves through the
+		// same proc.
+		find_set_filter(doc, !doc.filter)
 	case .Find_Toggle_Replace_Mode:
 		doc.find.replace_mode = !doc.find.replace_mode
 	case .Find_Filter_Page_Up:

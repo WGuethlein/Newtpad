@@ -630,6 +630,23 @@ main :: proc() {
 			}
 		}
 
+		// Filter view: a press jumps to that line in the unfiltered document
+		// (HANDOFF §6h item 2). Before the caret handling below, which would
+		// otherwise place a caret inside the filtered row and leave the view
+		// filtered.
+		//
+		// The press is consumed either way while the view is actually filtering,
+		// including when it lands on the empty area past the last matching row:
+		// that means "none of these", and falling through would place the caret
+		// wherever doc_pos_at clamped the out-of-range row to. mouse_down goes
+		// with it so the next frames cannot turn the same gesture into a
+		// selection drag across the document the jump has just revealed.
+		if window.mouse_pressed && doc_filtering(doc) {
+			_ = find_filter_click(doc, &text, f32(window.mouse_x), f32(window.mouse_y), px, rows)
+			window.mouse_pressed = false
+			window.mouse_down = false
+		}
+
 		// Mouse: press places/extends the caret (double=word, triple=line); drag extends.
 		if window.mouse_pressed {
 			mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)

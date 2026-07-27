@@ -554,6 +554,38 @@ doc_filtering :: proc(doc: ^Document) -> bool {
 	return doc.filter && len(doc.filter_lines) > 0
 }
 
+// The line the filter view drew at client-space y, as a byte offset, if any.
+//
+// Walks the same visible_begin/visible_next walk the filter draw walks, so the
+// row a press lands on is by construction the row the user sees: filter_top, the
+// row height and the end of the list each keep their single definition and this
+// asks them rather than repeating any of them (CLAUDE.md, "one layout per
+// widget"). In the filter view `start` is filter_lines[i] -- already the byte
+// offset of a line start -- which is exactly what the jump wants, so no row
+// index is derived here and none can drift by one against the draw's.
+//
+// ok is false for a y above the first row, at or past the last row on screen, or
+// on a drawn row past the end of filter_lines. Deliberately unlike doc_pos_at,
+// which CLAMPS a y off either end onto the nearest row: right for placing a
+// caret, wrong here, where it would turn a press on the empty area below the
+// last match into a jump to the last match.
+doc_filter_line_at :: proc(doc: ^Document, t: ^plat.Text, my, px: f32, rows: int) -> (start: int, ok: bool) {
+	if doc == nil || !doc_filtering(doc) {return 0, false}
+	// row_rect_y(px, 0) is the top of the first row -- the same producer
+	// row_at_y subtracts -- so a press on the filter banner, which sits in the
+	// inset above it, is refused rather than truncating to row 0.
+	if my < row_rect_y(px, 0) {return 0, false}
+	target := row_at_y(px, my)
+	if target >= rows {return 0, false}
+	it := visible_begin(doc, t, rows)
+	for {
+		row, s, _, _, _, _, more := visible_next(&it)
+		if !more {break}
+		if row == target {return s, true}
+	}
+	return 0, false
+}
+
 visible_next :: proc(it: ^Visible_Iter) -> (row, start, end, vis_end: int, line_end, wrapped, ok: bool) {
 	if it.done || it.r >= it.rows {return}
 	d := it.doc

@@ -478,6 +478,119 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// Clicking a row in the filter view jumps to that line in the unfiltered
+		// document (HANDOFF §6h item 2). Its own proc, with its own Document and
+		// its own plat.Text: test_mode_dispatch is one enormous procedure and
+		// another few hundred bytes of frame inside findtest's case is how it
+		// blows the stack.
+		//
+		// The seam under test is drawn-row vs clicked-row. find_filter_click is
+		// the whole action -- hit-test, caret, leave filter mode -- so this is
+		// what main.odin calls, not a re-implementation of it beside the real one.
+		findtest_filter_click :: proc() -> (bad: int) {
+			fmt.println("--- filter click-to-jump ---")
+			fc_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			// Line starts come from the fixture's own lengths, never from
+			// doc.filter_lines -- comparing filter_lines against itself is the
+			// vacuous shape this whole section exists to avoid.
+			src := []string{"aaa", "bbb NEEDLE", "ccc", "ddd NEEDLE", "eee"}
+			total := 0
+			for line in src {total += len(line) + 1}
+			content := make([]u8, total) // heap: doc_from_content takes ownership
+			starts := make([]int, len(src), context.temp_allocator)
+			at := 0
+			for line, i in src {
+				starts[i] = at
+				copy(content[at:], transmute([]u8)line)
+				at += len(line)
+				content[at] = '\n'
+				at += 1
+			}
+
+			doc := doc_from_content(content, "", .UTF8)
+			defer doc_close(&doc)
+			t: plat.Text
+			plat.text_load_faces(&t)
+			cw := plat.text_char_width(&t, 16)
+
+			find_open(&doc, false)
+			for r in "NEEDLE" {find_input_rune(&doc, r)}
+			find_wait(&doc)
+			find_set_filter(&doc, true)
+			doc_update_gutter(&doc, cw)
+			defer {
+				// GUTTER_W is a global read by col_x/col_at_x: leaving it set
+				// would follow every later mode in this process.
+				find_set_filter(&doc, false)
+				doc_update_gutter(&doc, cw)
+			}
+
+			px := f32(16)
+			ROWS :: 10 // deliberately more rows than matches
+			row_y :: proc(px: f32, r: int) -> f32 {return row_rect_y(px, r) + line_height(px) * 0.5}
+			text_x := col_x(cw, 3) // well inside the text column
+			gutter_x := TEXT_MARGIN_X + GUTTER_W * 0.5 // inside the line-number gutter
+
+			fc_chk(
+				&bad,
+				len(doc.filter_lines) == 2 && doc.filter_lines[0] == starts[1] && doc.filter_lines[1] == starts[3],
+				fmt.tprintf("the fixture filters to lines 2 and 4: %v (want [%d %d])", doc.filter_lines, starts[1], starts[3]),
+			)
+			fc_chk(&bad, GUTTER_W > 0, fmt.tprintf("the filter view really has a gutter to click in: %.0f px", GUTTER_W))
+			fc_chk(&bad, gutter_x < col_x(cw, 0), fmt.tprintf("...and the gutter x is left of column 0: %.0f < %.0f", gutter_x, col_x(cw, 0)))
+
+			// Each drawn row maps to its own line, and the whole action lands the
+			// caret on that line's START. Row 1 is the one an off-by-one gets
+			// wrong in a direction row 0 cannot show.
+			//
+			// Both x positions on every row: the gutter and the text column must
+			// give the same line, which is what fails if the x ever re-enters
+			// this path as a column.
+			for want, r in ([]int{starts[1], starts[3]}) {
+				for x, xi in ([]f32{text_x, gutter_x}) {
+					place := "text" if xi == 0 else "gutter" // `where` is a keyword
+					find_set_filter(&doc, true)
+					doc.cursor, doc.anchor = 0, 0
+					j := find_filter_click(&doc, &t, x, row_y(px, r), px, ROWS)
+					fc_chk(
+						&bad,
+						j && doc.cursor == want && doc.anchor == want && !doc.filter,
+						fmt.tprintf("press in the %-6s of row %d -> cursor %d (want %d), anchor==cursor=%v, filter off=%v, jumped=%v", place, r, doc.cursor, want, doc.anchor == doc.cursor, !doc.filter, j),
+					)
+				}
+			}
+
+			// A press past the last matching row is a no-op: no jump, still
+			// filtered, caret untouched.
+			find_set_filter(&doc, true)
+			doc.cursor, doc.anchor = 0, 0
+			jumped := find_filter_click(&doc, &t, text_x, row_y(px, 3), px, ROWS)
+			fc_chk(&bad, !jumped && doc.filter && doc.cursor == 0, fmt.tprintf("a press past the last row does nothing: jumped=%v filter=%v cursor=%d", jumped, doc.filter, doc.cursor))
+
+			// Scrolled: the hit-test must read filter_top, not assume 0.
+			find_set_filter(&doc, true)
+			doc.filter_top = 1
+			doc.cursor, doc.anchor = 0, 0
+			jumped = find_filter_click(&doc, &t, text_x, row_y(px, 0), px, ROWS)
+			fc_chk(
+				&bad,
+				jumped && doc.cursor == starts[3],
+				fmt.tprintf("scrolled by one, row 0 jumps to %d (want %d)", doc.cursor, starts[3]),
+			)
+
+			// A press on the banner strip above the first row is not a press on
+			// row 0.
+			find_set_filter(&doc, true)
+			_, hit := doc_filter_line_at(&doc, &t, row_rect_y(px, 0) - 1, px, ROWS)
+			fc_chk(&bad, !hit, "a press above the first row is refused, not clamped to it")
+
+			fmt.printfln("filter click-to-jump: %d failures", bad)
+			return
+		}
+
 		// `newtpad findtest` covers the literal scan's block-boundary handling and
 		// the line starts the worker computes for the filter view — both of which
 		// are per-block bookkeeping that a single-block search would never exercise.
@@ -555,6 +668,9 @@ when NEWTPAD_TESTS {
 			for r in "straddle" {find_input_rune(&doc, r)}
 			find_wait(&doc)
 			fmt.printfln("case-insensitive: %d found, want 2", len(doc.find.matches))
+
+			bad := findtest_filter_click()
+			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")
 			return true
 		}
 

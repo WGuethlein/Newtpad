@@ -736,6 +736,58 @@ find_mark_rects :: proc(doc: ^Document, x, w, track_top, track_h: f32, out: []pl
 	return n, partial
 }
 
+// --- the filter view ---
+
+// Turn the filter view on or off.
+//
+// One path, so "leaving filter mode" means exactly one thing wherever it is
+// reached from -- the Ctrl+L command and find_filter_click below. A second
+// teardown beside this one is how the two drift apart on what has to be reset.
+//
+// The block_clear is the half that is easy to leave out. A rectangle made before
+// the toggle names rows by the buffer's own logical lines (block.odin never
+// walks the filtered view), which is a different, non-contiguous set of rows the
+// instant filter view turns on -- and, coming back the other way, a rectangle
+// built while filtered would name rows the unfiltered document interleaves with
+// everything between them. block_extend already refuses to CREATE a rectangle
+// while doc.filter is set; this is the other half: drop one that already exists
+// rather than let it silently edit rows the user can no longer see. block.odin's
+// own edit paths refuse under doc.filter too (belt and braces), but this is the
+// one place that actually removes the stale selection the user would otherwise
+// still see highlighted. Gated on the state actually changing so that setting
+// the filter to what it already is stays a no-op.
+find_set_filter :: proc(doc: ^Document, on: bool) {
+	was := doc.filter
+	doc.filter = on
+	doc.filter_top = 0
+	if was != on && block_active(doc) {block_clear(doc)}
+}
+
+// A press in the filter view jumps to the line it landed on, in the unfiltered
+// document (HANDOFF 6h item 2). Reports whether it did: false means the press
+// fell on the empty area past the last matching row, where there is no line to
+// jump to and the caller must not fall through to placing a caret in a view it
+// is about to leave.
+//
+// `mx` is taken and deliberately unused. A filter row is chosen by its ROW
+// alone, so a press in the line-number gutter selects the same line as a press
+// in the text -- which is the assertion (findtest) that goes red the moment
+// anyone reintroduces an x -> column step here, e.g. by reaching for doc_pos_at,
+// whose answer is an offset INTO the row rather than the line start this jumps
+// to. Taking the parameter is what lets the test press at both x positions and
+// demand the same answer.
+find_filter_click :: proc(doc: ^Document, t: ^plat.Text, mx, my, px: f32, rows: int) -> bool {
+	ls, hit := doc_filter_line_at(doc, t, my, px, rows)
+	if !hit {return false}
+	doc.cursor, doc.anchor = ls, ls
+	// Leaves filter mode through the one path (which also drops a live
+	// rectangle). The caret is brought on screen by the main loop's existing
+	// doc_ensure_cursor_visible, which fires because the cursor moved on this
+	// tab this frame and doc.filter is now false.
+	find_set_filter(doc, false)
+	return true
+}
+
 // --- the find bar's status text ---
 
 // The trailing "(current/total)" the find bar draws after the query.
