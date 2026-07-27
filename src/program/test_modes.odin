@@ -13140,6 +13140,39 @@ when NEWTPAD_TESTS {
 			}
 			mm_truncated(&bad, mm_search)
 
+			// The shape-A guard, which nothing observed until now: every other
+			// case here uses a 100/200/700 px track, and mark_bucket_h only
+			// coarsens above ~4094 px, so the whole guard could be deleted and
+			// this suite stayed green (found by the batch-9 whole-branch review).
+			// What it would let through: find_mark_cap clamps the buffer at
+			// plat.MAX_QUADS, find_mark_rects breaks on `n >= len(out)`, and
+			// every mark below ~4096 px is silently dropped -- a bounded pass
+			// reporting a confident wrong answer. So assert BOTH halves: the
+			// count stays inside the batch limit, AND the last mark still lands
+			// near the bottom of the track. The count alone passes with the
+			// guard removed; the reach is what actually catches it.
+			mm_tall_track :: proc(bad: ^int, search: proc(_: ^Document, _: string)) {
+				TRACK :: f32(8192) // past MAX_QUADS; a 8K panel is not far off
+				sb := strings.builder_make()
+				for i in 0 ..< 20000 {fmt.sbprintf(&sb, "q line %d\n", i)}
+				d := doc_from_content(sb.buf[:], "tall.txt", .UTF8)
+				defer doc_close(&d)
+				search(&d, "q")
+				cap := find_mark_cap(&d, TRACK)
+				out := make([]plat.Quad, max(cap, 1), context.temp_allocator)
+				n, _ := find_mark_rects(&d, 0, 10, 0, TRACK, out)
+				mm_chk(bad, n > 0, fmt.tprintf("a %.0f px track still emits marks: %d", TRACK, n))
+				mm_chk(bad, n <= plat.MAX_QUADS, fmt.tprintf("marks stay inside the quad batch limit: %d <= %d", n, plat.MAX_QUADS))
+				// Without the growing bucket the last mark stops at ~MAX_QUADS px.
+				last := out[n - 1].pos.y if n > 0 else 0
+				mm_chk(
+					bad,
+					last > TRACK*0.9,
+					fmt.tprintf("the last mark still reaches the bottom of the track: y=%.0f of %.0f", last, TRACK),
+				)
+			}
+			mm_tall_track(&bad, mm_search)
+
 			fmt.printfln("matchmarkstest: %d failures", bad)
 			return true
 		}

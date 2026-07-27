@@ -464,7 +464,8 @@ main :: proc() {
 		}
 		if scrollbar_drag {
 			if window.mouse_down {
-				frac := (f32(window.mouse_y) - CHROME_TOP) / max(1, f32(window.height) - CHROME_TOP)
+				tt, th := scrollbar_track(doc, f32(window.height))
+				frac := (f32(window.mouse_y) - tt) / max(1, th)
 				doc_scroll_to_fraction(doc, &text, frac, rows)
 			} else {
 				scrollbar_drag = false
@@ -478,7 +479,8 @@ main :: proc() {
 		if md_preview_drag {
 			if window.mouse_down {
 				// Synced with the editor: the preview bar drives doc.top too.
-				frac := (f32(window.mouse_y) - CHROME_TOP) / max(1, f32(window.height) - CHROME_TOP)
+				tt, th := scrollbar_track(doc, f32(window.height))
+				frac := (f32(window.mouse_y) - tt) / max(1, th)
 				doc_scroll_to_fraction(doc, &text, frac, rows)
 			} else {
 				md_preview_drag = false
@@ -1018,6 +1020,21 @@ ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool
 	return table || md_mode == .Preview || (md_mode == .Split && in_preview_half)
 }
 
+// The vertical scrollbar's track, in client pixels. ONE definition, consumed by
+// the thumb draw, the find-match marks, the Markdown Split preview bar and both
+// drag hit-tests — CLAUDE.md's "one layout per widget" applied to a widget that
+// had quietly grown five copies of `h - CHROME_TOP`.
+//
+// Subtracting the bottom bar is the fix, not a refinement: the status line (and
+// the taller find/replace bar) is drawn AFTER the scrollbar, opaque and full
+// width, so a track running to the window bottom has its last rows painted over.
+// That cost the thumb its last ~20px near the document end, and — since batch 9
+// — every match tick in the last 2.5% of the file (4.7% in replace mode), which
+// are exactly the off-screen matches the ticks exist to point at.
+scrollbar_track :: proc(doc: ^Document, winh: f32) -> (top, height: f32) {
+	return CHROME_TOP, max(1, winh - CHROME_TOP - doc_bottom_bar_h(doc))
+}
+
 hscrollbar_pos_at :: proc(b: Hbar, mx: f32, m: Hscroll) -> int {
 	frac := (mx - b.track_x - b.thumb_w * 0.5) / max(1, b.track_w - b.thumb_w)
 	return clamp(int(frac * f32(m.max) + 0.5), 0, m.max)
@@ -1128,7 +1145,13 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// horizontally, which is exactly the band these are drawn in -- so drawing
 	// them earlier would make every mark vanish the moment the user scrolls
 	// right. Skipped in the grid view, which has no text rows to mark.
-	if doc != nil && doc.kind == .Text && !doc.table {
+	// Skipped in every view that replaces the text pass, because the marks are
+	// positioned by the SOURCE line rows and those views lay out on a different
+	// model: the grid (table_draw) and full Markdown Preview (markdown_draw).
+	// Split is fine — the editor pass really runs in its left half. Preview was
+	// missed when this was written, and the stray ticks it produced sat in the
+	// left margin pointing at nothing.
+	if doc != nil && doc.kind == .Text && !doc.table && doc.md_mode != .Preview {
 		bmq: [80]plat.Quad
 		if nbq := doc_bookmark_rects(doc, text, px, rows, bmq[:]); nbq > 0 {
 			plat.quads_draw(gfx, quad_pipe, bmq[:nbq])
@@ -1145,7 +1168,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	er := doc_editor_right(doc, w, rc.app.settings.split_frac)
 	total := doc.pt.length
 	if total > 0 && !doc.filter {
-		sb_h := h - CHROME_TOP
+		_, sb_h := scrollbar_track(doc, h)
 		th := clamp(f32(bottom - doc.top) / f32(total) * sb_h, sx(24), sb_h)
 		// Keep the thumb inside the track. Without the upper clamp it ran off the
 		// bottom of the window when doc.top sat near the end -- which force-wrapping
@@ -1209,7 +1232,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// panes anchored to the same source line.
 		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.top)
 		if total > 0 {
-			sb_h := h - CHROME_TOP
+			_, sb_h := scrollbar_track(doc, h)
 			th := clamp(f32(pv_bottom - doc.top) / f32(total) * sb_h, sx(24), sb_h)
 			ty := clamp(CHROME_TOP + f32(doc.top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
 			plat.quads_draw(
