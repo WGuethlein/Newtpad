@@ -786,6 +786,12 @@ sort_lines_dispatch :: proc(app: ^App, doc: ^Document, mode: Sort_Mode) {
 		app_note(app, fmt.tprintf("[%s REFUSED - over the %d MB / %d line limit]", what, SORT_MAX_BYTES / (1024 * 1024), SORT_MAX_LINES))
 	case .Unresolved:
 		app_note(app, fmt.tprintf("[%s UNAVAILABLE HERE - a line runs longer than it can scan]", what))
+	case .Faulted:
+		// The file changed on disk mid-read. main.odin's recovery detaches from
+		// the mapping at the end of this frame and prints its own line; say here
+		// that the command did not run, because from the user's side it simply
+		// did nothing.
+		app_note(app, fmt.tprintf("[%s REFUSED - the file changed on disk while it was being read]", what))
 	}
 }
 

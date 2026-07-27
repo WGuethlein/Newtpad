@@ -2251,6 +2251,7 @@ Sort_Result :: enum u8 {
 	Unchanged, // already sorted / no duplicates -- nothing written, NO undo entry
 	Too_Big, // over SORT_MAX_BYTES or SORT_MAX_LINES: refused, nothing changed
 	Unresolved, // a line start or line end further than the cap away: refused
+	Faulted, // the region's read faulted on the mapping: refused, nothing changed
 }
 
 Sort_Mode :: enum u8 {
@@ -2395,7 +2396,21 @@ doc_sort_lines :: proc(doc: ^Document, mode: Sort_Mode) -> Sort_Result {
 
 	buf := make([]u8, hi - lo)
 	defer delete(buf)
-	base.pt_read(&doc.pt, lo, buf)
+	// A read out of a MAPPED original can fail: another process truncates the
+	// file underneath us, the SEH shim catches the access violation, read_rec
+	// (piecetable.odin) sets pt.fault and leaves the uncopied tail ZEROED. Every
+	// other reader of a faulted region only DISPLAYS it for one frame; this one
+	// would write it back as a real edit, splicing a run of NULs into the
+	// document and marking it modified. main.odin's doc_fault_pending recovery
+	// runs after the command and only detaches the mapping -- it cannot un-write
+	// them, and the undo entry it would leave behind restores a tree read out of
+	// the same broken mapping.
+	//
+	// Peeked, not taken: doc_fault_pending must still see the flag this frame and
+	// recover. A short return from pt_read is checked too, because a truncation
+	// that lands exactly on a piece boundary can end the copy without any
+	// individual copy faulting.
+	if base.pt_read(&doc.pt, lo, buf) != len(buf) || base.pt_faulted(&doc.pt) {return .Faulted}
 
 	lines := make([dynamic]Sort_Line, 0, 64)
 	defer delete(lines)

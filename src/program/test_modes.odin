@@ -13357,6 +13357,40 @@ when NEWTPAD_TESTS {
 				sl_chk(bad, strings.contains(command_table[.Sort_Lines].title, "selection"), fmt.tprintf("the sort title states its scope: %q", command_table[.Sort_Lines].title))
 				sl_chk(bad, strings.contains(command_table[.Remove_Duplicate_Lines].title, "exact"), fmt.tprintf("the dedupe title states that the match is exact: %q", command_table[.Remove_Duplicate_Lines].title))
 			}
+			// --- a faulted region read is refused, never written back ------------------
+			//
+			// The region is read out of the MAPPED original, and that read can fail:
+			// another process truncates the file, the SEH shim catches it, read_rec
+			// sets pt.fault and leaves the uncopied tail zeroed. Every other reader
+			// only draws a faulted region for one frame. This one would write it back
+			// as a real edit -- a run of NULs spliced into the document, `modified`
+			// set, and an undo entry holding a tree cloned from the same broken
+			// mapping. main.odin's doc_fault_pending recovery runs after the command
+			// and only detaches; it cannot un-write them.
+			//
+			// The fixture keeps the BYTES correct and only reports the copy as failed,
+			// so the region resolution above the read behaves exactly as it always
+			// does and this case is about the guard rather than about garbage input.
+			sl_fault :: proc(bad: ^int) {
+				fmt.println("--- a faulted region read refuses ---")
+				src := "d\nc\nb\na\n"
+				d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				defer doc_close(&d)
+				faulting :: proc(dst, src: []u8) -> bool {
+					copy(dst, src)
+					return false // "the mapping went away mid-copy"
+				}
+				base.safe_copy = faulting
+				r := doc_sort_lines(&d, .Ascending)
+				base.safe_copy = base.default_copy
+				got := doc_debug_string(&d)
+				sl_chk(bad, r == .Faulted, fmt.tprintf("a region read that faulted refuses: %v (want Faulted)", r))
+				sl_chk(bad, got == src && len(d.undo) == 0, fmt.tprintf("...and nothing is written back: %q (want %q) undo=%d (want 0)", got, src, len(d.undo)))
+				// PEEKED, not taken. doc_fault_pending is what arms the recovery, and
+				// a mid-command check that consumed the flag would refuse correctly and
+				// then leave the document attached to a mapping it cannot read.
+				sl_chk(bad, base.pt_take_fault(&d.pt), "...and the flag survives for doc_fault_pending to take")
+			}
 			// --- a live column rectangle refuses --------------------------------------
 			//
 			// The largest escalation on the command_mutates_doc list, and it was
@@ -13435,6 +13469,7 @@ when NEWTPAD_TESTS {
 			sl_cap_lines(&bad)
 			sl_cap_bytes(&bad)
 			sl_commands(&bad)
+			sl_fault(&bad)
 			sl_block(&bad)
 			fmt.printfln("sortlinestest: %d failures", bad)
 			return true
