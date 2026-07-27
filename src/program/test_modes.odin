@@ -13049,11 +13049,15 @@ when NEWTPAD_TESTS {
 			//
 			// A CRLF file comes back CRLF, with and without a trailing terminator.
 			//
-			// Worth knowing while reading these: a stray '\r' left on a line's
-			// content cannot change the ORDER, because CR sorts before every
-			// printable byte exactly where the "shorter string first" rule would
-			// have put the line anyway. What it changes is the BYTES, which is what
-			// these two compare.
+			// This comment used to claim that a stray '\r' left on a line's content
+			// "cannot change the ORDER, because CR sorts before every printable
+			// byte". That is true only of bytes >= 0x20. TAB is 0x09, BELOW CR's
+			// 0x0D -- so `key` against `key\tvalue`, which is what half the config
+			// and log files in the world look like, orders one way with the
+			// terminator peeled and the other way with it left on. The last case
+			// below is that fixture, and it is the one that makes "\r\n is ONE
+			// terminator" a falsifiable claim for the SORT rather than only for
+			// dedupe.
 			sl_crlf :: proc(bad: ^int) {
 				fmt.println("--- CRLF ---")
 				{
@@ -13100,6 +13104,25 @@ when NEWTPAD_TESTS {
 					got := doc_debug_string(&d)
 					want := "dup\r\nother\r\n"
 					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("the region stops at the last line's content end, not at its '\\n': %v %q (want %q)", r, got, want))
+				}
+				{
+					// The CRLF case that changes the ORDER, not only the bytes. A
+					// line's content ends where the next byte decides the comparison,
+					// and here that byte is TAB (0x09) on two lines against the
+					// leftover CR (0x0D) on the third. Peeled, "key" is a prefix of
+					// both others and the length rule puts it first. Left on, "key\r"
+					// compares at index 3 against '\t' -- and 0x09 < 0x0D, so both
+					// tabbed lines sort AHEAD of the bare key instead of behind it.
+					//
+					// `key` beside `key<tab>value` is what half the config and log
+					// files in the world look like, so this is a shape the product
+					// actually meets, not a constructed one.
+					d := doc_from_content(transmute([]u8)strings.clone("key\tb\r\nkey\r\nkey\ta\r\n"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					got := doc_debug_string(&d)
+					want := "key\r\nkey\ta\r\nkey\tb\r\n"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("a leftover '\\r' would change the ORDER when the next byte is TAB: %v %q (want %q)", r, got, want))
 				}
 			}
 			// --- a region whose line endings disagree with each other -----------------
