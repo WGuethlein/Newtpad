@@ -1114,7 +1114,10 @@ when NEWTPAD_TESTS {
 					found = true
 					for it in m.items {
 						if it.cmd == .None {continue}
-						if it.enabled == nil || it.enabled(&ea) {append(&live, it.cmd)}
+						// item_enabled, not it.enabled: the row predicate is only
+						// half the rule now (command_allowed_on is the other half),
+						// and the half the product reads is the one worth asserting.
+						if item_enabled(&ea, it) {append(&live, it.cmd)}
 					}
 				}
 				enc_dead := found && len(live) == 0
@@ -1140,7 +1143,11 @@ when NEWTPAD_TESTS {
 					for it in m.items {
 						if it.cmd != cmd {continue}
 						found = true
-						if it.enabled == nil || it.enabled(app) {live = true}
+						// Through item_enabled: the kind rule now lives in
+						// command_allowed_on, so `it.enabled` alone no longer decides
+						// whether a row is live, and asserting on half the rule would
+						// report Save as live on a pseudo-tab.
+						if item_enabled(app, it) {live = true}
 					}
 				}
 				return
@@ -6868,8 +6875,75 @@ when NEWTPAD_TESTS {
 			row_ok := chose && c2
 			fmt.printfln("click away closes=%v, click row chooses=%v  %s", away_ok, row_ok, "OK" if away_ok && row_ok else "FAIL")
 			a.palette.active = false
-
 			app_destroy(&a)
+
+			// The pseudo-tab gate is NOT the menu's to keep. palette_execute calls
+			// command_dispatch directly and consults no menu row, the palette draws
+			// over the Settings page, and palette_click runs before main.odin's
+			// pseudo-tab mouse-swallow -- so every rule the menus table used to hold
+			// alone was reachable from here with a mouse. (Not with the keyboard: no
+			// Ctrl chord resolves in the .Settings context.) These cases drive the
+			// real palette path -- open, type the command's own title, pick its row,
+			// execute -- against a Settings tab, and assert the pseudo-document is
+			// untouched. Refused at the dispatch layer, so they hold for the menu
+			// route in the same breath.
+			palette_pseudo_case :: proc(cmd: Command_Id, clip: string) -> (bad: int) {
+				a: App
+				wv: plat.Window // hwnd nil: the clipboard takes a nil owner (pastetest)
+				a.settings = settings_default()
+				app_open_special(&a, .Settings)
+				defer app_destroy(&a)
+				d := app_active(&a)
+				if clip != "" {plat.clipboard_set_text(nil, clip)}
+				palette_open(&a)
+				palette_input_rune(&a, '>')
+				for r in command_table[cmd].title {palette_input_rune(&a, r)}
+				// Find the row rather than trusting the fuzzy ranking to put an exact
+				// title first: the point is what happens when the user picks it.
+				row := -1
+				for res, i in a.palette.results {
+					if res.cmd == cmd {row = i}
+				}
+				if row < 0 {
+					// Not a pass. If the command stops being offered the case stops
+					// testing anything, and silence there is how a test rots.
+					fmt.printfln("  FAIL   %v is not in the palette at all, so this case proves nothing", cmd)
+					return 1
+				}
+				a.palette.selected = row
+				palette_execute(&a, &wv, nil, 10)
+				// d.eol carries the Eol_* case on its own: the pseudo-buffer is empty,
+				// so doc_set_line_ending takes its length-equality early return and
+				// sets doc.eol WITHOUT marking the document modified. Assert only the
+				// buffer and the modified flag and that case can never go red.
+				ok := d.pt.length == 0 && !d.modified && d.enc == .UTF8 && d.eol == .LF
+				fmt.printfln(
+					"  %-6s palette %-20v refused on a Settings tab: bytes=%d modified=%v enc=%v eol=%v",
+					"ok" if ok else "FAIL", cmd, d.pt.length, d.modified, d.enc, d.eol,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			{
+				// The user's clipboard, restored on every exit path.
+				saved_clip, had_clip := plat.clipboard_get_text(nil, context.allocator)
+				defer if had_clip {
+					plat.clipboard_set_text(nil, saved_clip)
+					delete(saved_clip)
+				}
+				pbad := 0
+				// Paste is the finding's own reproduction: the clipboard landed in the
+				// pseudo-document and left it .modified, so closing the tab raised a
+				// save-changes dialog for a page with no file.
+				pbad += palette_pseudo_case(.Paste, "clipboard text")
+				// Enc_UTF16LE is the same hole one menu over -- it sets doc.modified
+				// without touching the buffer, so a buffer-only assertion would miss it.
+				pbad += palette_pseudo_case(.Enc_UTF16LE, "")
+				// Eol_CRLF rewrites the WHOLE buffer (doc_set_line_ending), which is why
+				// it counts as a mutation even though the pseudo-buffer is empty.
+				pbad += palette_pseudo_case(.Eol_CRLF, "")
+				fmt.printfln("palette pseudo-tab gate: %d failures", pbad)
+			}
 			return true
 		}
 

@@ -728,6 +728,42 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	return false
 }
 
+// May `cmd` run against `doc`? The single answer to that question, and both
+// routes to a command consult it: the menu greys the row out (item_enabled,
+// menu.odin) and command_dispatch refuses outright.
+//
+// One predicate rather than one per route, because the routes are not equal.
+// Settings and Font are TABS, not overlays, so app_active returns a Document for
+// them -- a pseudo-document with no file, no encoding and no line endings. This
+// rule used to live entirely in the `menus` table, as a per-row `enabled`
+// predicate, and the command palette walked straight past it: palette_execute
+// calls command_dispatch directly and consults no row, the palette draws OVER
+// the Settings page, and palette_click runs before the pseudo-tab mouse-swallow
+// in main.odin. So Settings -> View > Command Palette > Paste did the exact
+// thing the menu gate was added to stop: the clipboard landed in a buffer
+// nothing draws, the pseudo-tab went .modified, and closing it raised a
+// save-changes dialog for a page with no file. A rule enforced at one of two
+// entry points is not enforced.
+//
+// Composed from command_mutates_doc rather than listing the buffer writers a
+// second time, so a mutating command added there is gated here for free. The
+// three extras are not buffer writes: Save/Save_As put the empty pseudo-buffer
+// through a Save dialog, and Enc_* sets doc.modified without touching the text.
+//
+// A nil document answers "allowed": whether a command needs a document at all is
+// the row's own business (has_doc and friends in menu.odin), and the dispatch
+// arms that can meet a nil doc already handle one. This proc answers only the
+// question the two routes disagreed about -- what KIND of document it is.
+command_allowed_on :: proc(cmd: Command_Id, doc: ^Document) -> bool {
+	if doc == nil || doc.kind == .Text {return true}
+	if command_mutates_doc(cmd) {return false}
+	#partial switch cmd {
+	case .Save, .Save_As, .Enc_UTF8, .Enc_UTF16LE, .Enc_CP1252:
+		return false
+	}
+	return true
+}
+
 // Leave the grid, doing everything .Toggle_Table's own off-branch does rather
 // than assigning the field. A dangling cell edit holds a byte span captured
 // before whatever happens next, and table_edit_commit is the only thing that
@@ -745,6 +781,12 @@ leave_table_view :: proc(doc: ^Document) {
 command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^plat.Window, t: ^plat.Text, rows: int) {
 	if cmd != .None {diag_cmd(cmd)} // breadcrumb: what the user was doing
 	doc := app_active(app)
+	// The document-kind gate, ahead of every other guard: it is the one rule the
+	// menu and the palette have to agree on, and this is the point both of them
+	// reach. Silent, exactly like the greyed-out menu row it mirrors -- there is
+	// no note to show, because on a pseudo-tab there is no document the user
+	// meant this for.
+	if !command_allowed_on(cmd, doc) {return}
 	// Table view is a read-only grid. Block every document-mutating command so a
 	// caret left over from text view can't silently corrupt the file at an
 	// unrelated offset, and so an in-cell edit's captured byte span can't be

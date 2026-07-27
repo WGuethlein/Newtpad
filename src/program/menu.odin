@@ -41,17 +41,6 @@ Menu :: struct {
 @(private = "file")
 has_doc :: proc(app: ^App) -> bool {return app_active(app) != nil}
 
-// Settings and Font are tabs, not overlays, so app_active returns a Document for
-// them and has_doc is true — but they have no file, no encoding and no line
-// endings. Without this, Encoding > Save as UTF-16 LE on the Settings tab set
-// doc.modified on a pseudo-document, and request_close_tab then raised a
-// save-changes dialog for a page that has nothing to save.
-@(private = "file")
-has_text_doc :: proc(app: ^App) -> bool {
-	d := app_active(app)
-	return d != nil && d.kind == .Text
-}
-
 // Reload needs a file on disk to reload from; an untitled buffer has none.
 @(private = "file")
 has_file :: proc(app: ^App) -> bool {
@@ -139,12 +128,13 @@ menus := []Menu {
 			{cmd = .Tab_New},
 			{cmd = .Tab_Open},
 			sep,
-			// Save and Save As are has_text_doc, not has_doc: on the Settings and
-			// Font pseudo-tabs app_active returns a Document, so both rows were
-			// live and both led to a Save dialog that wrote the pseudo-tab's empty
-			// buffer out as a file the user thought was their settings.
-			{cmd = .Save, enabled = has_text_doc},
-			{cmd = .Save_As, enabled = has_text_doc},
+			// Both are dead on the Settings and Font pseudo-tabs, but not from
+			// here: `enabled` says only "there is a document". The kind rule is
+			// command_allowed_on (commands.odin), consulted by item_enabled below
+			// AND by command_dispatch, because the palette reaches a command
+			// without ever looking at a menu row.
+			{cmd = .Save, enabled = has_doc},
+			{cmd = .Save_As, enabled = has_doc},
 			{cmd = .Reload, enabled = has_file},
 			sep,
 			// Tab_Close stays has_doc, and this is why the fix is row-by-row rather
@@ -164,13 +154,14 @@ menus := []Menu {
 			sep,
 			{cmd = .Cut, enabled = has_sel},
 			{cmd = .Copy, enabled = has_sel},
-			// has_text_doc for the same reason as File > Save: a paste on the
-			// Settings tab inserted the clipboard into a pseudo-document nothing
-			// draws, leaving it .modified so Ctrl+W then asked whether to save a
-			// page with no file. Cut and Copy need no change -- has_sel is already
-			// false there, because a pseudo-tab swallows every click and keystroke
-			// (main.odin) so no selection can ever exist on one.
-			{cmd = .Paste, enabled = has_text_doc},
+			// Dead on a pseudo-tab for the same reason File > Save is, and by the
+			// same shared predicate: a paste there inserted the clipboard into a
+			// document nothing draws and left it .modified, so the tab-strip X or
+			// File > Close Tab then asked whether to save a page with no file.
+			// Cut and Copy carry no kind predicate of their own -- command_mutates_doc
+			// covers Cut, and Copy off a pseudo-document is a no-op reading an
+			// empty buffer.
+			{cmd = .Paste, enabled = has_doc},
 			sep,
 			{cmd = .Select_All, enabled = has_doc},
 			sep,
@@ -210,12 +201,15 @@ menus := []Menu {
 			{cmd = .Reopen_UTF16LE, enabled = has_file},
 			{cmd = .Reopen_CP1252, enabled = has_file},
 			sep,
-			{cmd = .Enc_UTF8, checked = is_enc_utf8, enabled = has_text_doc},
-			{cmd = .Enc_UTF16LE, checked = is_enc_utf16le, enabled = has_text_doc},
-			{cmd = .Enc_CP1252, checked = is_enc_cp1252, enabled = has_text_doc},
+			// Same shape again: these set doc.modified (Enc_*) or rewrite the whole
+			// buffer (Eol_*), and both are refused on a pseudo-tab by
+			// command_allowed_on, not by anything in this table.
+			{cmd = .Enc_UTF8, checked = is_enc_utf8, enabled = has_doc},
+			{cmd = .Enc_UTF16LE, checked = is_enc_utf16le, enabled = has_doc},
+			{cmd = .Enc_CP1252, checked = is_enc_cp1252, enabled = has_doc},
 			sep,
-			{cmd = .Eol_LF, checked = is_eol_lf, enabled = has_text_doc},
-			{cmd = .Eol_CRLF, checked = is_eol_crlf, enabled = has_text_doc},
+			{cmd = .Eol_LF, checked = is_eol_lf, enabled = has_doc},
+			{cmd = .Eol_CRLF, checked = is_eol_crlf, enabled = has_doc},
 		},
 	},
 }
@@ -353,8 +347,16 @@ consume_click :: proc(win: ^plat.Window) {
 	win.mouse_down = false
 }
 
+// A row is live when the command may run against the active document AND the
+// row's own predicate agrees. Two halves, deliberately: the first is
+// command_allowed_on (commands.odin), the shared rule about what KIND of
+// document is under the cursor, which command_dispatch enforces too so a row
+// cannot be grey here and still run from the palette; the second is this row's
+// local availability -- a selection to cut, a file to reload, history to undo --
+// which only the menu has any reason to know.
 item_enabled :: proc(app: ^App, it: Menu_Item) -> bool {
 	if it.cmd == .None {return false} // separator
+	if !command_allowed_on(it.cmd, app_active(app)) {return false}
 	return it.enabled == nil || it.enabled(app)
 }
 
