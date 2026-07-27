@@ -162,6 +162,17 @@ were the priorities. Read P2 as the live list, with these amendments:
     `app_apply_view_defaults`; the reasoning lives only in `app.odin`.
   - Paste now rewrites a **lone CR** as a line break, inherited from `convert_line_endings`. Real in
     a CSV field or terminal output pasted into an LF document.
+- **Carried from batch 7 (task 2, true tab stops):** `line_cell_col` (`doc.odin`) reads at most
+  `VISIBLE_COLS * 4` = 8192 bytes from the row start and **silently truncates** past that — no
+  `exact` flag, unlike `pt_line_start_cap`. Shape A, and `block_delete` is now subject to it: it
+  measures the deleted run's column forward from the row start instead of subtracting the run's own
+  width (the subtraction is circular under true tab stops), so a rectangle more than ~2048 cells into
+  a row would get a too-small column. **Not currently reachable** — `cell_lo` comes from
+  `caret_line_start_cell`, which has the *identical* bound, so the seed cannot outrun it — and
+  deliberately **not** widened, because widening one of the two identical bounds would make them
+  disagree. **The right fix, when it is done:** have `line_cell_col` return an `exact` flag and have
+  `block_delete` refuse when it is false, matching the refusal contract `caret_line_start_cell`
+  already has. Both bounds move together or neither does.
 - **The app redraws at vsync when idle** — no `WaitMessage` anywhere. A core burnt on a static
   screen, which also multiplies every other per-frame cost.
 - **The text pipeline batches nothing** — one heap allocation, two buffer maps and one draw call
