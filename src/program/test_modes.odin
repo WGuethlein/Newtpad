@@ -6401,6 +6401,104 @@ when NEWTPAD_TESTS {
 				}
 			}
 
+			// The grid and the markdown views replace the text pass entirely, and
+			// each pans a DIFFERENT number -- or none at all. Before hscroll_model
+			// the bar took its range from doc_max_hscroll unconditionally and wrote
+			// doc.h_scroll on drag, so in both views it appeared (source lines are
+			// long), dragged, and moved nothing: table_draw and markdown_draw never
+			// read H_SCROLL. Wyatt reported it from live use, 2026-07-27.
+			grid_bad := 0
+			{
+				// A grid wide enough that not every column fits. Built with the
+				// DEFAULT allocator, not temp: doc_from_content sets owned_orig, so
+				// doc_close frees this slice. A temp-allocated fixture here is a
+				// heap corruption (0xC0000374), not a leak -- cost one crash.
+				sb := strings.builder_make()
+				for r in 0 ..< 4 {
+					for c in 0 ..< 40 {
+						if c > 0 {strings.write_byte(&sb, ',')}
+						fmt.sbprintf(&sb, "r%dc%d", r, c)
+					}
+					strings.write_byte(&sb, '\n')
+				}
+				gdoc := doc_from_content(sb.buf[:], "wide.csv", .UTF8)
+				defer doc_close(&gdoc)
+				gdoc.table = true
+				gdoc.view_cols = 80
+				gdoc.view_rows = 5
+
+				gm := hscroll_model(&gdoc, &t, rows, 1000, cw)
+				if gm.kind != .Columns {
+					fmt.printfln("  FAIL grid: hscroll kind is %v, want Columns", gm.kind)
+					bad += 1;grid_bad += 1
+				}
+				if gm.max <= 0 {
+					fmt.printfln("  FAIL grid: nothing to pan (max=%d) though 40 columns do not fit", gm.max)
+					bad += 1;grid_bad += 1
+				}
+				if gm.span >= 40 {
+					fmt.printfln("  FAIL grid: thumb span %d claims all 40 columns fit", gm.span)
+					bad += 1;grid_bad += 1
+				}
+				// The drag must move the number the GRID reads, and must not touch
+				// the text view's. This is the assertion the old code fails.
+				ghb := hscrollbar_geo(&gdoc, 1000, 700, gm)
+				if !ghb.shown {
+					fmt.println("  FAIL grid: scrollbar hidden though columns overflow")
+					bad += 1;grid_bad += 1
+				} else {
+					hscroll_set(&gdoc, gm, hscrollbar_pos_at(ghb, ghb.track_x + ghb.track_w, gm))
+					if gdoc.table_col != gm.max {
+						fmt.printfln("  FAIL grid: dragging to the end set table_col=%d, want %d", gdoc.table_col, gm.max)
+						bad += 1;grid_bad += 1
+					}
+					if gdoc.h_scroll != 0 {
+						fmt.printfln("  FAIL grid: drag wrote h_scroll=%d, which the grid never reads", gdoc.h_scroll)
+						bad += 1;grid_bad += 1
+					}
+					// Thumb round-trip in column space.
+					for tc in ([]int{0, 1, gm.max / 2, gm.max}) {
+						gdoc.table_col = clamp(tc, 0, gm.max)
+						m2 := hscroll_model(&gdoc, &t, rows, 1000, cw)
+						b2 := hscrollbar_geo(&gdoc, 1000, 700, m2)
+						got := hscrollbar_pos_at(b2, b2.thumb_x + b2.thumb_w*0.5, m2)
+						if got != gdoc.table_col {
+							fmt.printfln("  FAIL grid: thumb round-trip col=%d -> %d", gdoc.table_col, got)
+							bad += 1;grid_bad += 1
+						}
+					}
+				}
+			}
+			{
+				// Markdown Preview and Split lay out to the pane, so there is no
+				// horizontal axis and the bar must be hidden -- not shown and dead.
+				mdline := strings.repeat("y", 400)
+				defer delete(mdline)
+				mdoc := doc_from_content(transmute([]u8)strings.concatenate({mdline, "\n"}), "notes.md", .UTF8)
+				defer doc_close(&mdoc)
+				mdoc.view_cols = 80
+				mdoc.view_rows = 5
+				for mode in ([]Md_Mode{.Preview, .Split}) {
+					mdoc.md_mode = mode
+					mm := hscroll_model(&mdoc, &t, rows, 1000, cw)
+					if mm.kind != .None {
+						fmt.printfln("  FAIL markdown %v: hscroll kind is %v, want None", mode, mm.kind)
+						bad += 1;grid_bad += 1
+					}
+					if hscrollbar_geo(&mdoc, 1000, 700, mm).shown {
+						fmt.printfln("  FAIL markdown %v: scrollbar shown though the pane lays out to fit", mode)
+						bad += 1;grid_bad += 1
+					}
+				}
+				mdoc.md_mode = .Off
+				om := hscroll_model(&mdoc, &t, rows, 1000, cw)
+				if om.kind != .Cells {
+					fmt.printfln("  FAIL markdown Off: hscroll kind is %v, want Cells", om.kind)
+					bad += 1;grid_bad += 1
+				}
+			}
+			fmt.printfln("  grid pans columns, markdown preview shows no bar: %s", "OK" if grid_bad == 0 else fmt.tprintf("%d FAILED", grid_bad))
+
 			// Wrapping disables horizontal scroll (H_SCROLL forced to 0).
 			doc.wrap = true
 			doc.h_scroll = 100
@@ -6418,13 +6516,14 @@ when NEWTPAD_TESTS {
 			maxhs := doc_max_hscroll(&doc, &t, rows)
 			for hs in ([]int{0, 40, 120, maxhs}) {
 				doc.h_scroll = clamp(hs, 0, maxhs)
-				hb := hscrollbar_geo(&doc, 1000, 700, maxhs)
+				hm := hscroll_model(&doc, &t, rows, 1000, cw)
+				hb := hscrollbar_geo(&doc, 1000, 700, hm)
 				if !hb.shown {
 					fmt.println("  FAIL: scrollbar not shown though content overflows")
 					bad += 1
 					continue
 				}
-				got := hscrollbar_pos_at(hb, hb.thumb_x + hb.thumb_w*0.5, maxhs)
+				got := hscrollbar_pos_at(hb, hb.thumb_x + hb.thumb_w*0.5, hm)
 				if got != doc.h_scroll {
 					fmt.printfln("  FAIL: thumb round-trip hs=%d -> %d", doc.h_scroll, got)
 					bad += 1

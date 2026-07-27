@@ -511,10 +511,10 @@ main :: proc() {
 		// Horizontal scrollbar: a press on its track starts a drag mapping the
 		// pointer's x to the scroll offset (same geometry the bar is drawn from).
 		{
-			maxhs := doc_max_hscroll(doc, &text, rows)
+			hm := hscroll_model(doc, &text, rows, ed_right, char_w)
 			// Scope the bar to the editor half in Markdown Split (ed_right), so it
 			// doesn't run across the preview pane; full width otherwise.
-			hb := hscrollbar_geo(doc, ed_right, f32(window.height), maxhs)
+			hb := hscrollbar_geo(doc, ed_right, f32(window.height), hm)
 			if hb.shown && window.mouse_pressed &&
 			   f32(window.mouse_y) >= hb.y && f32(window.mouse_y) <= hb.y + hb.h &&
 			   f32(window.mouse_x) >= hb.track_x && f32(window.mouse_x) <= hb.track_x + hb.track_w {
@@ -523,7 +523,7 @@ main :: proc() {
 			}
 			if hscrollbar_drag {
 				if window.mouse_down && hb.shown {
-					doc.h_scroll = hscrollbar_pos_at(hb, f32(window.mouse_x), maxhs)
+					hscroll_set(doc, hm, hscrollbar_pos_at(hb, f32(window.mouse_x), hm))
 				} else {
 					hscrollbar_drag = false
 				}
@@ -882,16 +882,82 @@ Hbar :: struct {
 	track_x, track_w, y, h, thumb_x, thumb_w: f32,
 }
 
-hscrollbar_geo :: proc(doc: ^Document, winw, winh: f32, maxhs: int) -> (b: Hbar) {
-	if doc == nil || doc.wrap || doc.filter || maxhs <= 0 {return}
+// What the horizontal scrollbar actually pans. There is more than one answer,
+// which is the whole bug this type exists to close: the text view scrolls by
+// CELLS (doc.h_scroll), while the grid scrolls by COLUMNS (doc.table_col) and
+// has done since before the bar existed -- Shift+wheel drives it. The bar used
+// to compute its range from doc_max_hscroll unconditionally, i.e. from the
+// widest source-text line, and to write doc.h_scroll on drag. In the grid that
+// meant a bar that appeared (source lines are long), dragged, and moved
+// nothing, because table_draw never reads H_SCROLL. Markdown Preview was the
+// same, with no pan axis at all.
+//
+// Resolving it here once, and having the geometry, the drag and the draw all
+// ask, is CLAUDE.md's "one layout per widget" applied to the question "which
+// number am I scrolling?".
+Hscroll_Kind :: enum u8 {
+	None, // wrapped, filtered, or a view that lays out to fit (Preview, Split)
+	Cells, // plain text view: doc.h_scroll
+	Columns, // grid view: doc.table_col
+}
+
+Hscroll :: struct {
+	kind:     Hscroll_Kind,
+	pos, max: int, // current and maximum offset, in this kind's unit
+	span:     int, // how much is visible in the same unit; sizes the thumb
+}
+
+hscroll_model :: proc(doc: ^Document, t: ^plat.Text, rows: int, winw, char_w: f32) -> (m: Hscroll) {
+	if doc == nil || doc.filter {return}
+	// The grid replaces the text pass entirely, so its axis is columns and the
+	// widest source line is irrelevant to it.
+	if doc.table && doc.kind == .Text {
+		if len(doc.table_widths) == 0 {table_compute_widths(doc, t)} // idempotent; one-time sample
+		if doc.table_cols == 0 {doc.table_cols = len(doc.table_widths)} // table_draw sets this, but not before frame 1
+		m.max = table_max_col(doc)
+		if m.max <= 0 {return}
+		m.pos = clamp(doc.table_col, 0, m.max)
+		m.span = table_cols_fitting(doc, char_w, winw, m.pos)
+		m.kind = .Columns
+		return
+	}
+	// Preview lays markdown out to the pane width, so there is nothing to pan
+	// horizontally; Split's editor half wraps for the same reason. (A markdown
+	// TABLE wider than the pane is still clipped -- that is a separate problem
+	// needing the table to scroll, not the pane. Tracked in HANDOFF 5.)
+	if doc.kind == .Text && doc.md_mode != .Off {return}
+	if doc_wraps(doc) {return}
+	m.max = doc_max_hscroll(doc, t, rows)
+	if m.max <= 0 {return}
+	m.pos = clamp(doc.h_scroll, 0, m.max)
+	m.span = max(1, doc.view_cols)
+	m.kind = .Cells
+	return
+}
+
+// Write a new offset back to whichever field this view pans. The only writer
+// the bar's drag uses -- so the drag cannot set a field the draw does not read.
+hscroll_set :: proc(doc: ^Document, m: Hscroll, pos: int) {
+	p := clamp(pos, 0, m.max)
+	switch m.kind {
+	case .Cells:
+		doc.h_scroll = p
+	case .Columns:
+		doc.table_col = p
+	case .None: // nothing to write; the bar is not shown
+	}
+}
+
+hscrollbar_geo :: proc(doc: ^Document, winw, winh: f32, m: Hscroll) -> (b: Hbar) {
+	if doc == nil || m.kind == .None || m.max <= 0 {return}
 	b.track_x = TEXT_MARGIN_X
 	b.track_w = winw - SCROLLBAR_W - TEXT_MARGIN_X
 	if b.track_w <= sx(30) {return}
 	b.h = sx(8)
 	b.y = winh - doc_bottom_bar_h(doc) - b.h
-	total := f32(maxhs + max(1, doc.view_cols)) // widest visible line, in cells
-	b.thumb_w = max(sx(24), b.track_w * f32(doc.view_cols) / total)
-	b.thumb_x = b.track_x + (b.track_w - b.thumb_w) * (f32(doc.h_scroll) / f32(maxhs))
+	total := f32(m.max + max(1, m.span)) // full extent in this kind's unit
+	b.thumb_w = max(sx(24), b.track_w * f32(m.span) / total)
+	b.thumb_x = b.track_x + (b.track_w - b.thumb_w) * (f32(m.pos) / f32(m.max))
 	b.shown = true
 	return
 }
@@ -899,9 +965,9 @@ hscrollbar_geo :: proc(doc: ^Document, winw, winh: f32, maxhs: int) -> (b: Hbar)
 // Map a pointer x on the track to a horizontal scroll offset (thumb centred on
 // the cursor). Inverse of hscrollbar_geo's thumb_x; kept beside it so the two
 // stay consistent.
-hscrollbar_pos_at :: proc(b: Hbar, mx: f32, maxhs: int) -> int {
+hscrollbar_pos_at :: proc(b: Hbar, mx: f32, m: Hscroll) -> int {
 	frac := (mx - b.track_x - b.thumb_w * 0.5) / max(1, b.track_w - b.thumb_w)
-	return clamp(int(frac * f32(maxhs) + 0.5), 0, maxhs)
+	return clamp(int(frac * f32(m.max) + 0.5), 0, m.max)
 }
 
 // Draw one frame from current state. No input handling — safe to call from the
@@ -1063,8 +1129,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		}
 	}
 
-	// Horizontal scrollbar (plain view, when a visible line overflows).
-	if hb := hscrollbar_geo(doc, er, h, doc_max_hscroll(doc, text, rows)); hb.shown {
+	// Horizontal scrollbar: cells in the text view, columns in the grid, hidden
+	// where the content lays out to fit. hscroll_model is the one authority.
+	if hb := hscrollbar_geo(doc, er, h, hscroll_model(doc, text, rows, er, char_w)); hb.shown {
 		plat.quads_draw(
 			gfx,
 			quad_pipe,
