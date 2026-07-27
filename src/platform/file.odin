@@ -111,9 +111,6 @@ file_open_readonly :: proc(path: string) -> (fv: File_View, ok: bool) {
 	return fv, true
 }
 
-// Write data to a sibling temp file then atomically rename it over `path`, so a
-// crash mid-write never corrupts the original. Never holds `path` open. Works
-// even when the original is memory-mapped (delete+rename succeed; see bench/).
 // An opaque identity for "the file as we last saw it". Compared with ==; the
 // program layer never sees a FILETIME (platform types don't leak upward).
 File_Stamp :: struct {
@@ -122,9 +119,25 @@ File_Stamp :: struct {
 	ok:    bool, // false when the file could not be stat'd (missing, unreachable)
 }
 
-// Cheap stat with no handle held open. Safe to call from a worker: on a dropped
-// network share this blocks for the redirector timeout, which is exactly why it
-// must not run on the UI thread.
+// Stat with no handle held open. Cheap only when the path is reachable: on a
+// dropped network share GetFileAttributesExW blocks for the SMB redirector
+// timeout -- tens of seconds -- so the watcher worker calls it with its mutex
+// released (watch.odin) rather than holding the main thread out of the lock.
+//
+// Five call sites run it on the UI THREAD anyway. That is a real risk, not a
+// contract violation this comment can wish away, and each one accepts it for the
+// same reason: it stands next to a blocking file operation on the same path, so
+// it adds a timeout only where one was already going to be paid.
+//   doc.odin  doc_open        -- immediately after opening and reading the file
+//   doc.odin  doc_save_err    -- immediately after writing it
+//   doc.odin  doc_reload_forced -- immediately after re-reading it
+//   session.odin session_restore -- only when the session file carried no usable
+//                                stamp, beside the open that rebuilt the tab
+//   commands.odin reopen_with_encoding -- only on the branch that is about to
+//                                open the file; the recorded stamp refuses first
+//                                when it can, costing nothing
+// A NEW UI-thread caller is not covered by that argument, and there is no
+// bounded or off-thread stat helper in the tree to reach for instead.
 file_stamp :: proc(path: string) -> File_Stamp {
 	wpath := wide_path(path)
 	d: win.WIN32_FILE_ATTRIBUTE_DATA
@@ -185,6 +198,11 @@ file_read_range :: proc(path: string, offset: i64, count: int, allocator := cont
 	return buf, true
 }
 
+// Write data to a sibling temp file then atomically rename it over `path`, so a
+// crash mid-write never corrupts the original. Never holds `path` open. Works
+// even when the original is memory-mapped (delete+rename succeed; see bench/).
+// (This header had drifted up the file and was sitting above File_Stamp, which
+// it says nothing true about.)
 file_write_atomic :: proc(path: string, data: []u8) -> bool {
 	err := file_write_atomic_err(path, data)
 	return err == .None

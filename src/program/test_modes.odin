@@ -6644,6 +6644,46 @@ when NEWTPAD_TESTS {
 			}
 			bad += reopen_unstattable_case()
 
+			// ...and the converse: a stamp that ALREADY refuses is not re-measured.
+			// The stat is synchronous on the UI thread and blocks for the redirector
+			// timeout on a dropped share, so a file the stamp already puts over the
+			// cap must be refused without one -- which is what the code did before
+			// the cap was fixed, and what statting unconditionally took away.
+			//
+			// "No syscall" is not directly observable here, so the two orders are
+			// told apart by their notice: with the file deleted, statting first can
+			// only produce "could not be measured", while consulting the stamp first
+			// produces the over-the-limit message. Same refusal, different reason,
+			// and only the second one is free.
+			reopen_over_cap_stamp_skips_the_stat :: proc() -> (bad: int) {
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				f := fmt.tprintf("%s%cnewtpad_enc_overcap.txt", tmp, '\\')
+				plat.file_write_atomic(f, transmute([]u8)string("caf\xC3\xA9"))
+				a: App
+				dummy: plat.Window
+				t: plat.Text
+				if !app_open_path(&a, f) {
+					fmt.println("  FAIL   over-cap stamp: could not open the fixture")
+					os.remove(f)
+					return 1
+				}
+				defer app_destroy(&a)
+				d := app_active(&a)
+				saved := reopen_transcode_max_bytes
+				defer reopen_transcode_max_bytes = saved
+				reopen_transcode_max_bytes = 1 // the stamp doc_open took is larger than this
+				os.remove(f) // unreachable: a live stat can now only fail
+				command_dispatch(.Reopen_CP1252, {}, &a, &dummy, &t, 10)
+				ok := d.enc == .UTF8 && strings.contains(a.notice, "over the")
+				fmt.printfln(
+					"  %-6s an already-over-cap stamp refuses without statting: enc=%v note=%q",
+					"ok" if ok else "FAIL", d.enc, a.notice,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			bad += reopen_over_cap_stamp_skips_the_stat()
+
 			fmt.printfln("enctest: %d failures", bad)
 			return true
 		}

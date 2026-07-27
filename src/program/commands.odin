@@ -535,16 +535,36 @@ reopen_with_encoding :: proc(app: ^App, doc: ^Document, w: ^plat.Window, enc: ba
 	// A guard whose unknown case is its unsafe case is not a guard.
 	//
 	// The stat is synchronous on the UI thread and can block for the redirector
-	// timeout on a dropped share (see plat.file_stamp) -- but the reopen it
-	// gates opens and reads that same path, so refusing here is strictly less
-	// blocking than proceeding, not more.
+	// timeout on a dropped share (see plat.file_stamp), so the order below is
+	// load-bearing and an earlier version of this comment had it wrong: refusing
+	// is NOT "strictly less blocking than proceeding" in every branch.
+	//
+	// The recorded stamp gets to REFUSE for free -- if what we last saw was
+	// already over the cap, or could not be measured at all, the answer cannot
+	// change in the safe direction and the old code refused it with zero
+	// syscalls. Blocking for thirty seconds only to print the same message would
+	// be a regression introduced by the fix.
+	//
+	// The stamp does not get to APPROVE: that is the whole bug (below). So the
+	// stat runs exactly on the branch where the reopen it gates was about to open
+	// and read the same path -- one timeout instead of one, never a new one on a
+	// path that was going to stay untouched.
+	//
+	// A not-ok stamp does not wedge the rows shut either: the watcher re-stats
+	// every open file from its worker thread and publishes the result
+	// (main.odin), so a share that comes back clears the stamp within a poll
+	// without the UI thread blocking at all.
 	if enc != .UTF8 {
-		st := plat.file_stamp(doc.path)
-		if !st.ok {
+		ok, size := doc.disk_stamp.ok, doc.disk_stamp.size
+		if ok && size <= reopen_transcode_max_bytes {
+			st := plat.file_stamp(doc.path)
+			ok, size = st.ok, st.size
+		}
+		if !ok {
 			app_note(app, "[REOPEN REFUSED - the file could not be measured, so its cost is unknown]")
 			return
 		}
-		if st.size > reopen_transcode_max_bytes {
+		if size > reopen_transcode_max_bytes {
 			app_note(
 				app,
 				fmt.tprintf(
