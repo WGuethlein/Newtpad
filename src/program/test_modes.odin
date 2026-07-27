@@ -1805,8 +1805,82 @@ when NEWTPAD_TESTS {
 				return bad
 			}
 
+			// Half three: the boundary that is *not* 260.
+			//
+			// Win32 reserves twelve characters inside a directory for an 8.3 name it
+			// may have to generate there, so a plain CreateDirectoryW refuses at 248
+			// while a plain CreateFileW is content to 259. That asymmetry — not any
+			// margin against MAX_PATH — is why LONG_PATH_THRESHOLD is 248, and
+			// raising it would break mkdir for the lengths 248-258 while every file
+			// operation kept working. The round trip above cannot see it: at 283
+			// characters the directory is far past where the two limits differ.
+			long_path_boundary :: proc() -> int {
+				bad := 0
+				fmt.println("--- the 248-character directory boundary ---")
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				if tmp == "" {
+					fmt.println("  no %TEMP% in the environment FAIL")
+					return 1
+				}
+				// Cleanup prefixes by hand, for the same reason the round trip does:
+				// the sabotage runs disable long_path_form, and a cleanup sharing the
+				// mechanism under test leaves the mess behind on exactly the run that
+				// failed.
+				ext :: proc(p: string) -> string {return fmt.tprintf(`\\?\%s`, p)}
+				// One component of exactly the length needed, so the parent is always
+				// short and the only variable in the call is the length of the string
+				// handed to CreateDirectoryW.
+				fill :: proc(parent: string, total: int, c: string) -> string {
+					n := total - len(parent) - 1
+					if n < 1 || n > 255 {return ""}
+					return fmt.tprintf(`%s\%s`, parent, strings.repeat(c, n, context.temp_allocator))
+				}
+
+				// 248 written out, deliberately **not** plat.LONG_PATH_THRESHOLD:
+				// this is a fact about Win32, not about our constant. Deriving the
+				// fixture from the constant would move the fixture with it and the
+				// row would stay green through exactly the change it exists to
+				// catch — verified, that is what the first version of it did.
+				DIR_MAX_PLAIN :: 248
+				root := fmt.tprintf(`%s\nplp_bound`, tmp)
+				d248 := fill(root, DIR_MAX_PLAIN, "d")
+				if len(d248) != DIR_MAX_PLAIN {
+					fmt.printfln("  fixture arithmetic failed: root is %d chars FAIL", len(root))
+					return 1
+				}
+
+				defer {
+					plat.dir_remove(ext(d248))
+					plat.dir_remove(ext(root))
+					left, _ := plat.path_exists(ext(root))
+					fmt.printfln("  cleaned up, anything left behind: %v %s", left, "FAIL" if left else "OK")
+				}
+
+				ERROR_ALREADY_EXISTS :: 183
+				if !plat.dir_create(root) && plat.last_error() != ERROR_ALREADY_EXISTS {
+					fmt.printfln("  could not create the %d-char root, win32 error %d FAIL", len(root), plat.last_error())
+					return 1
+				}
+
+				// The row. Plain, this call fails with ERROR_FILENAME_EXCED_RANGE
+				// (206), so it passes only because the prefix went on — and it goes
+				// red the moment the threshold is raised above 248.
+				dok := plat.dir_create(d248)
+				derr := plat.last_error()
+				if !dok && derr == ERROR_ALREADY_EXISTS {dok = true}
+				if dok {
+					fmt.printfln("  dir_create at exactly %d chars OK", len(d248))
+				} else {
+					fmt.printfln("  dir_create at exactly %d chars failed, win32 error %d FAIL", len(d248), derr)
+					bad += 1
+				}
+
+				return bad
+			}
+
 			bad := long_path_rules(chk, pad)
 			bad += long_path_roundtrip()
+			bad += long_path_boundary()
 			fmt.printfln("longpathtest: %d failures", bad)
 			return true
 		}

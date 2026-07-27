@@ -203,9 +203,13 @@ Atomic_Write :: struct {
 
 atomic_write_begin :: proc(path: string) -> (aw: Atomic_Write, ok: bool) {
 	tmp := strings.concatenate({path, ".newtpad~"}) // heap: outlives this call
-	// The suffix is nine characters, so a target that fits under MAX_PATH can
-	// still produce a temp path that does not. LONG_PATH_THRESHOLD's slack is
-	// sized for exactly this.
+	// wide_path on `tmp`, not on `path`: the prefix is a property of the string
+	// handed to the syscall, and the suffix is nine characters longer than the
+	// target. So the temp is thresholded on its own length and crosses the
+	// threshold nine characters before the target does — which is what leaves a
+	// 239-247 character save with a prefixed temp beside a plain destination.
+	// atomic_write_commit hands ReplaceFileW one of each; longpathtest's
+	// mixed-pair row is what says Win32 accepts that.
 	wtmp := wide_path(tmp)
 	h := win.CreateFileW(wtmp, win.GENERIC_WRITE, 0, nil, win.CREATE_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, nil)
 	if h == win.INVALID_HANDLE_VALUE {

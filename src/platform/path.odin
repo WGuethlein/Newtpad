@@ -35,12 +35,38 @@ package platform
 import "core:strings"
 import win "core:sys/windows"
 
-// Prefix at this length or above. MAX_PATH leaves 259 usable characters, so 248
-// is conservative by a margin; it is also the number core:os uses, and the slack
-// covers the ".newtpad~" suffix atomic_write_begin appends to a save target
-// (a 250-character target would otherwise produce a 259-character temp path that
-// works only by luck).
+// Prefix at this length or above. 248 is `MAX_PATH - 12`, and it is the number
+// core:os uses (`_fix_long_path_internal`, core/os/path_windows.odin) — for a
+// reason worth stating, because it is not the 259-character file limit and it is
+// not a safety margin against one.
+//
+// **Directories cap lower than files.** Win32 reserves twelve characters inside a
+// directory for an 8.3 name it may have to generate there, so a *plain*
+// `CreateDirectoryW` refuses at 248 while a plain `CreateFileW` is content to 259.
+// Measured on this machine, one component under a short parent:
+//
+//   plain CreateDirectoryW  247 ok, 248 fails ERROR_FILENAME_EXCED_RANGE (206)
+//   plain CreateFileW       259 ok, 260 fails ERROR_PATH_NOT_FOUND (3)
+//   the `\\?\` form         succeeds at every length, both calls
+//
+// `dir_create` is therefore what pins the threshold here. **Raising it breaks
+// directory creation for the eleven lengths 248-258 and nothing else complains**
+// — files keep working, so the damage stays invisible until a mkdir at exactly
+// the wrong depth fails. The `#assert` below and `longpathtest`'s "dir_create at
+// exactly 248 chars" row are what turn that into a build error and a red test.
+//
+// The threshold applies to *each string handed to a syscall*, not to a logical
+// file: `atomic_write_begin` appends ".newtpad~" and calls `wide_path` on the temp
+// string, which is thresholded on its own length. Those nine characters play no
+// part in choosing 248, and no slack here is reserved for them.
 LONG_PATH_THRESHOLD :: 248
+
+// The plain-form cap Win32 puts on a directory path, measured above. The
+// threshold may sit at or below it and nowhere else, so the compiler says so
+// rather than leaving the next reader to rediscover the 206 the hard way.
+@(private = "file")
+DIR_PATH_MAX_PLAIN :: 248
+#assert(LONG_PATH_THRESHOLD <= DIR_PATH_MAX_PLAIN)
 
 @(private = "file")
 is_sep :: proc(c: u8) -> bool {
