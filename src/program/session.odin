@@ -191,6 +191,26 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 
 // Reopen the last session into `a` (which must be empty). Returns false if there
 // is no session or nothing could be restored.
+//
+// This procedure deliberately NEVER calls app_apply_view_defaults, and that is a
+// rule, not an omission. Every tab here is built directly (doc_open /
+// doc_from_content) and then given the view the session recorded for that
+// specific file; the family default is what a FRESH open falls back to when
+// there is nothing better. Applying it on top would silently overwrite a view
+// the user deliberately left set -- a .md tab left in Preview coming back as
+// Split because the family default says so. Restore wins over the default,
+// always. (The reasoning also lives at app_apply_view_defaults in app.odin, at
+// the other end of the same rule.)
+//
+// The test that holds the line is viewmemtest's "session restore wins over the
+// family default" case (HANDOFF §6z), sabotage-verified by wiring
+// app_apply_view_defaults in here and watching it fail. Worth knowing before
+// trusting it: that assertion was VACUOUS for eight tasks of batch 6 -- it
+// expected md_mode == .Off against a session format that carried only `wrap`,
+// so the value was constant whether this code was right or wrong. Format 4
+// persists md_mode and it now asserts .Preview against a .Split family default,
+// which is the version that can actually fail. If a future format change makes
+// another of its values constant again, the case needs the same treatment.
 session_restore :: proc(a: ^App) -> bool {
 	dir, ok := session_dir()
 	if !ok {
@@ -299,8 +319,7 @@ session_restore :: proc(a: ^App) -> bool {
 			d.top = clamp(top, 0, L)
 			// After the position clamps, not before: doc_view_apply re-anchors
 			// doc.top to a line start when a line-scrolled view is on.
-			doc_view_apply(d, Doc_View{wrap = wrap, md_mode = md_mode, table = table})
-			// A buffer rebuilt from a backup has never been stat'd (doc_from_content
+			doc_view_apply(d, Doc_View{wrap = wrap, md_mode = md_mode, table = table})			// A buffer rebuilt from a backup has never been stat'd (doc_from_content
 			// sets no stamp), while doc_open already stamped the clean-tab case. Adopt
 			// what the session recorded so an unchanged file stays quiet -- and a file
 			// that genuinely changed while we were closed still reports.
