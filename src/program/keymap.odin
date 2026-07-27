@@ -176,7 +176,7 @@ keymap_chord_reserved :: proc(key: plat.Key, ctrl, alt: bool) -> bool {
 // named shift", and the shift case is the one that must not become a silent
 // ctrl-only binding.
 Keymap_Reject :: enum u8 {
-	Malformed, // no '=', or an empty chord
+	Malformed, // no '=', an empty chord, or modifiers with no key ("ctrl+")
 	Unknown_Key, // "ctrl+foo"
 	Shift, // "ctrl+shift+k" -- see rule 4 in the file header
 	Unmodified, // "k" -- see rule 3
@@ -250,6 +250,36 @@ command_from_name :: proc(s: string) -> (Command_Id, bool) {
 	return .None, false
 }
 
+// Drop the whitespace that only pads a '+'. "ctrl + shift + k" is the same
+// chord a user means by "ctrl+shift+k", and it should get the same answer --
+// "shift is not part of a chord" -- rather than being blamed on an unknown key
+// named "ctrl + shift + k". Both are refusals; only one of them tells the user
+// what to change.
+//
+// Only whitespace ADJACENT to a '+' is dropped, not all of it. Key names come
+// from key_names, the one table the seed writer also formats with, and a name
+// there could legitimately contain a space one day ("Num Lock"); squeezing
+// everything would make such a name unmatchable while the writer kept emitting
+// it. Returns the input untouched when there is no whitespace to remove, which
+// is every well-formed line.
+@(private = "file")
+chord_squeeze :: proc(s: string, allocator := context.temp_allocator) -> string {
+	if strings.index_byte(s, ' ') < 0 && strings.index_byte(s, '\t') < 0 {return s}
+	b := strings.builder_make(allocator)
+	space :: proc(c: byte) -> bool {return c == ' ' || c == '\t'}
+	for i in 0 ..< len(s) {
+		if space(s[i]) {
+			p := i - 1
+			for p >= 0 && space(s[p]) {p -= 1}
+			n := i + 1
+			for n < len(s) && space(s[n]) {n += 1}
+			if (p >= 0 && s[p] == '+') || (n < len(s) && s[n] == '+') {continue}
+		}
+		strings.write_byte(&b, s[i])
+	}
+	return strings.to_string(b)
+}
+
 // PURE over the file's bytes: no window, no globals, no disk. That is what
 // lets keymaptest drive every case headlessly, and it is the reason the load
 // path is split into parse + install rather than one read_and_apply.
@@ -283,25 +313,39 @@ keymap_parse :: proc(src: string, allocator := context.allocator) -> Keymap {
 		// Modifier prefixes are stripped one at a time rather than splitting on
 		// '+', because the key itself can BE '+' or '-': splitting "ctrl++"
 		// yields ["ctrl", "", ""] and loses the key.
-		rest := lhs
+		//
+		// The prefixes are consumed even when nothing follows (>=, not >), so
+		// "ctrl+" arrives at the empty-key check below as a chord with no key
+		// rather than as the unknown key "ctrl+". Both are refused either way;
+		// the point is that the warning names the problem the user has.
+		rest := chord_squeeze(lhs)
 		ctrl, alt, shift := false, false, false
 		for {
-			if len(rest) > 5 && strings.equal_fold(rest[:5], "ctrl+") {
+			if len(rest) >= 5 && strings.equal_fold(rest[:5], "ctrl+") {
 				ctrl = true
 				rest = rest[5:]
 				continue
 			}
-			if len(rest) > 4 && strings.equal_fold(rest[:4], "alt+") {
+			if len(rest) >= 4 && strings.equal_fold(rest[:4], "alt+") {
 				alt = true
 				rest = rest[4:]
 				continue
 			}
-			if len(rest) > 6 && strings.equal_fold(rest[:6], "shift+") {
+			if len(rest) >= 6 && strings.equal_fold(rest[:6], "shift+") {
 				shift = true
 				rest = rest[6:]
 				continue
 			}
 			break
+		}
+
+		// Modifiers and nothing else. Malformed rather than Shift even when
+		// shift was one of them: the line has no key at all, which is the more
+		// basic thing to say, and it is the same fault as the empty chord above.
+		if rest == "" {
+			km.rejects[.Malformed] += 1
+			base.log_warn("keys.txt:%d: %q refused -- there is no key after the modifiers", line_no + 1, lhs)
+			continue
 		}
 
 		// Checked before the key name, so `ctrl+shift+k` reports the real

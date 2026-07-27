@@ -11216,9 +11216,25 @@ when NEWTPAD_TESTS {
 				// --- malformed chords / garbage lines ------------------------------
 				fmt.println("--- malformed lines ---")
 				k = load("ctrl+nope = Undo\nthis line has no equals sign\n = Undo\nctrl+ = Undo\n")
-				chk(&bad, k.rejects[.Unknown_Key] == 2, fmt.tprintf("2 unknown-key refusals (got %d)  [`ctrl+nope` and `ctrl+` -- the trailing + leaves no key]", k.rejects[.Unknown_Key]))
-				chk(&bad, k.rejects[.Malformed] == 2, fmt.tprintf("2 malformed refusals (got %d)  [no '=' and an empty chord]", k.rejects[.Malformed]))
+				chk(&bad, k.rejects[.Unknown_Key] == 1, fmt.tprintf("1 unknown-key refusal (got %d)  [`ctrl+nope`]", k.rejects[.Unknown_Key]))
+				chk(&bad, k.rejects[.Malformed] == 3, fmt.tprintf("3 malformed refusals (got %d)  [no '=', an empty chord, and `ctrl+` -- modifiers with no key]", k.rejects[.Malformed]))
 				chk(&bad, len(k.entries) == 0, fmt.tprintf("nothing bound (%d entries)", len(k.entries)))
+				// A chord that is nothing but modifiers is diagnosed as having no
+				// key, whichever modifiers they are -- including shift, where the
+				// missing key is the more basic fault. All three were Unknown_Key
+				// before, which named the wrong problem: the reject reasons exist so
+				// the warning can tell the user what to change.
+				k = load("ctrl+ = Undo\nalt+ = Undo\nshift+ = Undo\n")
+				chk(&bad, k.rejects[.Malformed] == 3 && k.rejects[.Unknown_Key] == 0 && k.rejects[.Shift] == 0, fmt.tprintf("modifiers with no key: malformed=%d unknown-key=%d shift=%d (want 3/0/0)", k.rejects[.Malformed], k.rejects[.Unknown_Key], k.rejects[.Shift]))
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("nothing bound (%d entries)", len(k.entries)))
+				// Spaces around the '+' are tolerated, so a spaced-out chord gets
+				// the diagnosis its compact spelling would get.
+				k = load("ctrl + shift + k = Undo\n")
+				chk(&bad, k.rejects[.Shift] == 1 && k.rejects[.Unknown_Key] == 0, fmt.tprintf("`ctrl + shift + k` is refused for naming shift, not for the key (shift=%d key=%d)", k.rejects[.Shift], k.rejects[.Unknown_Key]))
+				k = load("ctrl + t = Undo\nctrl + + = Redo\n")
+				chk(&bad, len(k.entries) == 2 && keymap_reject_total(k) == 0, fmt.tprintf("a spaced chord binds like the compact one (%d entries, %d refusals)", len(k.entries), keymap_reject_total(k)))
+				chk(&bad, resolve_key(.T, true, false, .Editor) == .Undo, fmt.tprintf("`ctrl + t` -> %v (want Undo)", resolve_key(.T, true, false, .Editor)))
+				chk(&bad, resolve_key(.Plus, true, false, .Editor) == .Redo, fmt.tprintf("...including when the key IS '+': `ctrl + +` -> %v (want Redo; the default is Zoom_In)", resolve_key(.Plus, true, false, .Editor)))
 
 				// --- shift is not part of a chord -----------------------------------
 				// The load-bearing one. commands.odin:252-254 and :294 both say a
