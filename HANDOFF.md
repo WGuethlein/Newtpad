@@ -144,7 +144,19 @@ were the priorities. Read P2 as the live list, with these amendments:
 - **Arenas on VirtualAlloc: still zero implementation.** Heap plus `free_all(context.temp_allocator)`
   per frame. Either build it or amend the locked decision — do not keep citing it as though it
   describes the code.
-- **`\?\` long paths: still zero implementation.** Not one in the tree.
+- ~~**`\?\` long paths: still zero implementation.**~~ **Platform layer DONE (2026-07-26, batch 7
+  task 3.)** `src/platform/path.odin` — `long_path_form` / `wide_path`, every file-I/O call in
+  `file.odin` converted, `longpathtest` covering the rule table plus a real 292-character round trip.
+  **The program layer is not converted:** ~15 `os.*` filesystem calls in `session.odin`,
+  `settings.odin`, `theme.odin` and `diag.odin` (`make_directory`, `read_entire_file`,
+  `write_entire_file`, `exists`, `stat`, `remove`, `rename`, `open`) still inherit `core:os`'s
+  `_fix_long_path`, which returns the path unchanged whenever HKLM `LongPathsEnabled` is set — the
+  registry opt-in CLAUDE.md forbids depending on, and one that does nothing without the
+  `longPathAware` manifest entry we deliberately do not ship. Not urgent: every one of those paths
+  is under `%APPDATA%\Newtpad` and short. **It is reachable, though** — `NEWTPAD_SESSION_DIR`
+  redirects the whole store, so a long override loses the session, the settings, the log and the
+  crash artefacts, each silently (see the comment on `write_minidump`, `crash.odin`). Converting
+  them means routing through `plat.dir_create` / a `plat` read-write pair rather than `core:os`.
 - ~~**Test modes ship in the release binary.**~~ **DONE (2026-07-26, §6z.)** `NEWTPAD_TESTS`
   (`#config`, defaults to `ODIN_DEBUG`) gates the whole file; release went 1,494,528 → 1,055,744
   bytes. `build.bat release tests` puts it back for `-o:speed` measurements.
