@@ -794,6 +794,62 @@ when NEWTPAD_TESTS {
 			fmt.printfln("  Enter resets to %d (text layer %d)  %s", az.settings.tab_width, plat.text_tab_width(&t2), "OK" if rstw else "FAIL")
 			if !rstw {bad += 1}
 
+			// --- a tab-width change invalidates the CELL caches ---------------
+			// metrics_recompute and text_reset_atlas between them cover every
+			// cached measurement denominated in PIXELS, which is why they were
+			// enough for font and zoom. Two caches hold CELL counts and are keyed
+			// on nothing a settings change moves: doc.md_table on doc.revision
+			// (only an edit bumps it) and doc.table_widths on edits and view
+			// toggles. Without settings_apply invalidating them, changing Tab
+			// width with a grid or a preview open leaves both columns sized
+			// against the old tab stops until the next edit.
+			//
+			// Both checks read the value THE DRAW WOULD USE (table_draw's own
+			// "refit when empty", md_table_ensure's own lookup), not the validity
+			// flags, so they cannot pass on an invalidation that clears a flag
+			// nothing consults.
+			fmt.println("--- tab width invalidates the cell caches ---")
+			{
+				// A literal tab in the MIDDLE of a field, so the measurement moves
+				// with the tab width: "a\tb" is 'a' + a tab from column 1 + 'b',
+				// which is 5 cells at width 4 and 9 at width 8. A LEADING tab
+				// would be one full width in both and could not tell them apart.
+				cd := new(Document)
+				cd^ = doc_from_content(transmute([]u8)strings.clone("a\tb,c\nd,e\n"), "t.csv", .UTF8)
+				cd.table, cd.table_delim = true, ','
+				mdd := new(Document)
+				mdd^ = doc_from_content(transmute([]u8)strings.clone("| a\tb | c |\n|---|---|\n| d | e |\n"), "t.md", .UTF8)
+				app_add(&az, cd)
+				app_add(&az, mdd)
+
+				settings_toggle_row(&rcz, 8, 0) // Enter: start from the default 4
+				table_compute_widths(cd, &t2)
+				w4 := cd.table_widths[0] if len(cd.table_widths) > 0 else -1
+				m4 := -1
+				if c := md_table_ensure(mdd, &t2, 0); c != nil {m4 = c.widths[0]}
+				base4 := w4 == 5 && m4 == 5
+				fmt.printfln("  %-6s at width 4: grid col 0 = %d cells, md col 0 = %d (want 5, 5)", "ok" if base4 else "FAIL", w4, m4)
+				if !base4 {bad += 1}
+
+				for _ in 0 ..< 4 {settings_toggle_row(&rcz, 8, 1)} // 4 -> 8
+
+				// table_draw's own line: refit only when the widths were cleared.
+				if len(cd.table_widths) == 0 {table_compute_widths(cd, &t2)}
+				w8 := cd.table_widths[0] if len(cd.table_widths) > 0 else -1
+				m8 := -1
+				if c := md_table_ensure(mdd, &t2, 0); c != nil {m8 = c.widths[0]}
+				movd := w8 == 9 && m8 == 9
+				fmt.printfln(
+					"  %-6s at width 8: grid col 0 = %d cells, md col 0 = %d (want 9, 9; a stale cache reports 5)",
+					"ok" if movd else "FAIL", w8, m8,
+				)
+				if !movd {bad += 1}
+
+				app_destroy(&az)
+				az = App{} // the dynamic arrays above are freed; do not walk them again
+				az.settings = settings_default()
+			}
+
 			BASE_PX = BASE_PX_96 // leave globals alone for later modes
 
 			// The settings-page row list (IMPORTANT 3, final review): the 8th row

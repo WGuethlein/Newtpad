@@ -330,6 +330,30 @@ settings_list_bounds :: proc(height: f32) -> (y0, avail_h: f32) {
 	return
 }
 
+// Caches holding measurements denominated in CELLS, on every open document.
+//
+// metrics_recompute and text_reset_atlas between them cover everything measured
+// in PIXELS -- that is what a font or zoom change moves, and it is why those two
+// were enough until tab width became configurable. A tab-width change moves the
+// cell counts themselves, and neither of these two caches is keyed on anything
+// that notices:
+//
+//   - doc.md_table is keyed on doc.revision, which only an edit bumps.
+//   - doc.table_widths is cleared only by edits and by entering/leaving the grid.
+//
+// So without this, changing Tab width from 4 to 8 with a markdown preview or a
+// CSV grid open leaves the columns sized against the old tab stops until the
+// next edit: text overhangs its column, and the alignment padding is computed
+// against a width the column was never sized for.
+@(private = "file")
+cell_caches_invalidate :: proc(app: ^App) {
+	for d in app.docs { 	// slot array: nil is a closed tab
+		if d == nil {continue}
+		clear(&d.table_widths) // table_draw refits when it is empty
+		for &c in d.md_table {c.valid = false}
+	}
+}
+
 // Apply a setting change that affects live state.
 settings_apply :: proc(rc: ^Render_Ctx) {
 	s := rc.app.settings
@@ -340,7 +364,14 @@ settings_apply :: proc(rc: ^Render_Ctx) {
 	// a line with a tab is wrong once the spacing moves, so the reset has to be
 	// the last thing that happens. text_set_tab_width clamps, so a 0 arriving
 	// from a struct that predates the field cannot reach the measuring loops.
+	//
+	// Read the effective width on both sides of the write rather than comparing
+	// s.tab_width to itself: text_set_tab_width clamps, so 0, -5 and 99 are all
+	// no-ops against an already-clamped value and must not cost a walk of every
+	// open document on every zoom step.
+	tab_before := plat.text_tab_width(rc.text)
 	plat.text_set_tab_width(rc.text, s.tab_width)
+	if plat.text_tab_width(rc.text) != tab_before {cell_caches_invalidate(rc.app)}
 	metrics_recompute(rc)
 	plat.text_reset_atlas(rc.text) // px changed: cached glyphs are the wrong size
 }
