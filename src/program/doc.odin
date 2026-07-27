@@ -1236,89 +1236,123 @@ bookmark_find :: proc(doc: ^Document, off: int) -> (idx: int, found: bool) {
 	return lo, lo < len(doc.bookmarks) && doc.bookmarks[lo] == off
 }
 
-// Text of length `n` inserted at `at`. A bookmark strictly after the insertion
-// point moves with the bytes it names.
+// ONE edit, ONE shift. The range [at, at+n) is about to be replaced by `text`.
+// An insert is n == 0, a delete is an empty `text`, and a real replace is both
+// AT THE SAME OFFSET -- which is the entire reason this is a single procedure
+// and not two.
 //
-// The `>` (not `>=`) is the load-bearing part. An insert exactly AT a bookmarked
-// line start leaves that offset alone, and that is what keeps the "every entry
-// is a line start" invariant true in both directions: the byte before `at` is
-// untouched by the insert, so `at` is still a line start afterwards -- whether
-// what was typed there was "x" (the bookmark keeps naming the same line, now one
-// character longer) or "abc\n" (the bookmark names the new line that begins at
-// that offset). Shifting instead would leave the "x" case pointing one byte into
-// its own line, which no row's line start matches, so the mark would vanish from
-// the gutter while the entry stayed in the list.
-@(private = "file")
-bookmarks_shift_insert :: proc(doc: ^Document, at, n: int) {
-	if n == 0 || len(doc.bookmarks) == 0 {return}
-	for &b in doc.bookmarks {
-		if b > at {b += n}
-	}
-}
-
-// The range [at, at+n) is about to be deleted. MUST be called before the
-// pt_delete, because it reads the byte in front of `at` out of the live buffer.
+// It WAS two, and the composition was wrong in a way that neither half could be
+// blamed for. The delete rule correctly collapses a bookmark sitting at `at + n`
+// down onto `at` (the "the line above me was deleted, my line starts there now"
+// case); the insert rule then correctly declines to move an offset equal to `at`
+// (the "you typed at my line start, that is still my line start" case). Compose
+// them at one offset and the bookmark stops on the REPLACEMENT text: Alt+Down
+// over a bookmarked line below, a paste over a Shift+Down/triple-click line
+// selection, Replace All on any pattern ending in '\n'. The structural invariant
+// held throughout -- every entry was still a real line start -- so nothing that
+// checked the invariant could see it. CLAUDE.md §6j's shape exactly: two correct
+// functions, wrong result.
 //
-// Three outcomes per bookmark, and each one is a case the invariant forces:
+// The rules, with `m` = len(text):
 //
 //   b < at            untouched; nothing before it moved.
-//   at <= b < at+n    DROPPED. The line start itself is inside the deleted text,
-//                     so after the delete the offset would name whatever bytes
+//   at <= b < at+n    DROPPED. The line start itself is inside the replaced
+//                     text, so afterwards the offset would name whatever bytes
 //                     moved up into it -- a bookmark silently pointing at a
 //                     different line, which is the one outcome worse than losing
 //                     it. This is also what makes "delete the bookmarked line"
 //                     drop it: that selection runs from the line start, so
 //                     b == at.
-//   b == at+n and `at` is NOT a line start
-//                     DROPPED. The delete ended exactly on the bookmark and
-//                     started mid-line, i.e. it JOINED this line onto the
-//                     previous one (Backspace at a line start deletes just the
-//                     '\n'; the same shape swallows a CRLF pair). The bookmark
-//                     would land on `at`, which is mid-line, so the entry would
-//                     survive as an offset that is not a line start.
-//   otherwise         b -= n.
+//   b == at+n (n > 0) The edge the replacement butts against. The bookmarked
+//                     line's text now begins at `at + m`, and the entry survives
+//                     only if THAT is a line start:
+//                       m > 0  -> `text` must END in '\n'. "bravo\n" -> "XX\n"
+//                                 keeps the bookmark on the line below; the same
+//                                 replace with "XX" merges that line onto the
+//                                 replacement's tail, and it is DROPPED.
+//                       m == 0 -> `at` must have been a line start. Deleting the
+//                                 whole line ABOVE keeps the bookmark (its line
+//                                 genuinely begins where the deleted one did);
+//                                 Backspace at a bookmarked line start deletes
+//                                 just the '\n' from mid-line, joins the two
+//                                 lines, and DROPS it. One byte read out of the
+//                                 LIVE buffer tells them apart -- which is why
+//                                 this must run before the mutation.
+//   b == at (n == 0)  A pure insert AT a bookmarked line start leaves it alone.
+//                     The byte before `at` is untouched, so `at` is still a line
+//                     start afterwards -- whether what was typed was "x" (the
+//                     bookmark keeps naming the same line, now one character
+//                     longer) or "abc\n" (it names the new line beginning
+//                     there). Shifting instead would leave the "x" case one byte
+//                     inside its own line, which no row's line start matches, so
+//                     the mark would vanish while the entry stayed in the list.
+//   otherwise         b += m - n.
 //
-// `at` being a line start is one byte read, taken once for the whole call rather
-// than per bookmark. Note that b == at+n with `at` a line start is the "delete
-// the whole line ABOVE" case, which must KEEP the bookmark (its line now begins
-// where the deleted one did) -- that is why this is a condition and not simply a
-// half-open range in the other direction.
+// Every rule is monotone in `b`, so the list stays sorted and duplicate-free
+// without a re-sort: entries before `at` do not move, the one at `at+n` lands on
+// `at+m`, and everything past it lands strictly beyond that.
 @(private = "file")
-bookmarks_shift_delete :: proc(doc: ^Document, at, n: int) {
-	if n == 0 || len(doc.bookmarks) == 0 {return}
-	at_is_line_start := at == 0 || (at <= doc.pt.length && byte_at(doc, at - 1) == '\n')
+bookmarks_shift_replace :: proc(doc: ^Document, at, n: int, text: []u8) {
+	m := len(text)
+	if (n == 0 && m == 0) || len(doc.bookmarks) == 0 {return}
+	// Asked by exactly one case, and only when n > 0, so a plain insert pays for
+	// no byte read at all.
+	end_is_line_start := false
+	if n > 0 {
+		end_is_line_start =
+			text[m - 1] == '\n' if m > 0 else (at == 0 || (at <= doc.pt.length && byte_at(doc, at - 1) == '\n'))
+	}
 	keep := 0
 	for b in doc.bookmarks {
-		if b < at {
+		switch {
+		case b < at:
 			doc.bookmarks[keep] = b
 			keep += 1
-			continue
+		case n == 0: // pure insert: `b == at` stays put, everything after shifts
+			doc.bookmarks[keep] = b if b == at else b + m
+			keep += 1
+		case b < at + n: // the line start was inside the replaced text -- dropped
+		case b == at + n:
+			if end_is_line_start {
+				doc.bookmarks[keep] = at + m
+				keep += 1
+			}
+		case:
+			doc.bookmarks[keep] = b + m - n
+			keep += 1
 		}
-		if b < at + n {continue} // the line start was inside the deleted text
-		if b == at + n && !at_is_line_start {continue} // the line was joined onto the previous one
-		doc.bookmarks[keep] = b - n
-		keep += 1
 	}
 	resize(&doc.bookmarks, keep)
 }
 
-// The only two piece-table mutations in this file go through these, so the
-// bookmark shift cannot be forgotten at a call site. That is deliberate: the
-// alternative -- a bookmarks_shift_* call next to each of the ten base.pt_*
-// calls -- is CLAUDE.md's shape B (a correct function fed the wrong input, or
-// forgotten at the eleventh site), and this feature's whole risk is exactly
-// that. Nothing outside doc.odin calls base.pt_insert/base.pt_delete; block.odin
-// and find.odin's replace both route through doc_replace_range.
+// Every piece-table mutation in this file goes through these, so the bookmark
+// shift cannot be forgotten at a call site. That is deliberate: the alternative
+// -- a bookmarks_shift_* call next to each of the ten base.pt_* calls -- is
+// CLAUDE.md's shape B (a correct function fed the wrong input, or forgotten at
+// the eleventh site), and this feature's whole risk is exactly that. Nothing
+// outside doc.odin calls base.pt_insert/base.pt_delete; block.odin and
+// find.odin's replace both route through doc_replace_range.
+//
+// pt_edit_replace is the primitive and the other two are named sugar over it,
+// rather than the other way round: a caller that deletes and then inserts at the
+// same offset through the two thin wrappers is exactly the bug
+// bookmarks_shift_replace's comment describes, so there is no pair of calls that
+// can express it.
+@(private = "file")
+pt_edit_replace :: proc(doc: ^Document, at, n: int, text: []u8) {
+	bookmarks_shift_replace(doc, at, n, text) // before the mutation: it reads byte_at(at-1)
+	if n > 0 {base.pt_delete(&doc.pt, at, n)}
+	if len(text) > 0 {base.pt_insert(&doc.pt, at, text)}
+}
+
 @(private = "file")
 pt_edit_insert :: proc(doc: ^Document, at: int, text: []u8) {
-	bookmarks_shift_insert(doc, at, len(text))
-	base.pt_insert(&doc.pt, at, text)
+	pt_edit_replace(doc, at, 0, text)
 }
 
 @(private = "file")
 pt_edit_delete :: proc(doc: ^Document, at, n: int) {
-	bookmarks_shift_delete(doc, at, n) // before the delete: it reads byte_at(at-1)
-	base.pt_delete(&doc.pt, at, n)
+	pt_edit_replace(doc, at, n, nil)
 }
 
 // Toggle the bookmark on the line the caret is on. Returns the resulting state
@@ -1817,13 +1851,26 @@ set_cursor :: proc(doc: ^Document, pos: int, select: bool) {
 	}
 }
 
+// Replace the selection (possibly empty) with `text` (possibly empty) as ONE
+// piece-table operation, leaving the caret just past what was written.
+//
+// One operation, not a delete followed by an insert at the same offset: see
+// bookmarks_shift_replace. Pasting over a whole-line selection is the everyday
+// way to hit that, so this is the seam it has to be fixed at rather than in
+// doc_insert_text alone.
 @(private = "file")
-del_sel_raw :: proc(doc: ^Document) {
+replace_sel_raw :: proc(doc: ^Document, text: []u8) {
 	lo, hi := doc_sel_range(doc)
 	doc.nl_delta -= count_newlines(doc, lo, hi - lo)
-	pt_edit_delete(doc, lo, hi - lo)
-	doc.cursor = lo
-	doc.anchor = lo
+	pt_edit_replace(doc, lo, hi - lo, text)
+	for b in text {if b == '\n' {doc.nl_delta += 1}}
+	doc.cursor = lo + len(text)
+	doc.anchor = doc.cursor
+}
+
+@(private = "file")
+del_sel_raw :: proc(doc: ^Document) {
+	replace_sel_raw(doc, nil)
 }
 
 // Selected text as a freshly-allocated UTF-8 string (empty if no selection).
@@ -1844,11 +1891,11 @@ doc_selected_text :: proc(doc: ^Document, allocator := context.allocator) -> str
 doc_insert_text :: proc(doc: ^Document, text: []u8, kind: Edit_Kind = .Paste) {
 	if len(text) == 0 {return}
 	push_undo(doc, kind)
-	if doc_has_sel(doc) {del_sel_raw(doc)}
-	pt_edit_insert(doc, doc.cursor, text)
-	for b in text {if b == '\n' {doc.nl_delta += 1}}
-	doc.cursor += len(text)
-	doc.anchor = doc.cursor
+	// With no selection doc_sel_range is (cursor, cursor), so this is a plain
+	// insert at the caret; with one it is a single replace rather than a delete
+	// and an insert at the same offset (bookmarks_shift_replace explains why the
+	// difference is not cosmetic).
+	replace_sel_raw(doc, text)
 	doc.last_edit_at = doc.cursor
 }
 
@@ -1879,14 +1926,13 @@ doc_replace_range :: proc(doc: ^Document, at, count: int, text: []u8, kind: Edit
 	count := clamp(count, 0, doc.pt.length - at)
 	if count == 0 && len(text) == 0 {return}
 	push_undo(doc, kind)
-	if count > 0 {
-		doc.nl_delta -= count_newlines(doc, at, count)
-		pt_edit_delete(doc, at, count)
-	}
-	if len(text) > 0 {
-		pt_edit_insert(doc, at, text)
-		for b in text {if b == '\n' {doc.nl_delta += 1}}
-	}
+	if count > 0 {doc.nl_delta -= count_newlines(doc, at, count)}
+	// One pt_edit_replace, not a delete plus an insert at the same offset. This
+	// is the path Alt+Up/Alt+Down, Replace All and a column edit all take, and
+	// splitting it silently moved a bookmark onto the replacement text --
+	// see bookmarks_shift_replace.
+	pt_edit_replace(doc, at, count, text)
+	for b in text {if b == '\n' {doc.nl_delta += 1}}
 	doc.cursor = at + len(text)
 	doc.anchor = doc.cursor
 	doc.last_edit_at = doc.cursor

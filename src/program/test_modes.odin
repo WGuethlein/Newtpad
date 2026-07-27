@@ -11776,6 +11776,117 @@ when NEWTPAD_TESTS {
 			}
 			bm_delete(&bad, BM_FIX, bm_set, bm_at, bm_invariant)
 
+			// --- a replace is ONE operation ------------------------------------------
+			//
+			// The shift used to be two procedures, and their COMPOSITION at a
+			// single offset was wrong even though each half was right on its own:
+			// the delete half collapses a bookmark sitting at the region's END
+			// down onto its START, and the insert half then declines to move an
+			// offset equal to the start, so the bookmark silently ended up naming
+			// the REPLACEMENT text.
+			//
+			// bm_invariant CANNOT see this -- every entry is still a real line
+			// start, just the wrong one. That is why every case here asserts the
+			// TEXT the bookmark names, read through the bookmark itself. A case
+			// that only checked offsets and the invariant would have stayed green
+			// through the whole bug, which is exactly what happened.
+			bm_replace :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), at: proc(d: ^Document, at, n: int) -> string, inv: proc(d: ^Document) -> bool) {
+				fmt.println("--- a replace is one operation ---")
+
+				// Alt+Down two lines above a bookmark. doc_move_lines is a single
+				// doc_replace_range over [6,20) that writes the same 14 bytes back
+				// in the other order, so "delta" must not move AT ALL. The broken
+				// version pulled it back to 6, where it named "charl".
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {20})
+					d.cursor, d.anchor = 6, 6 // on "bravo", two lines above the mark
+					doc_move_lines(&d, 1)
+					ok := len(d.bookmarks) == 1 && d.bookmarks[0] == 20 && at(&d, 0, 5) == "delta"
+					bm_chk(bad, ok, fmt.tprintf("Alt+Down above a bookmark leaves it on its own line: %v %q (want [20] \"delta\")", d.bookmarks[:], at(&d, 0, 5)))
+					bm_chk(bad, inv(&d), "...invariant holds -- and it held with the bug too, which is the point")
+				}
+
+				// Alt+Up, the mirror: the caret on "charlie" swaps it with "bravo"
+				// over the same region, and "delta" still must not move.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {20})
+					d.cursor, d.anchor = 12, 12 // on "charlie"
+					doc_move_lines(&d, -1)
+					ok := len(d.bookmarks) == 1 && d.bookmarks[0] == 20 && at(&d, 0, 5) == "delta"
+					bm_chk(bad, ok, fmt.tprintf("Alt+Up above a bookmark leaves it on its own line: %v %q (want [20] \"delta\")", d.bookmarks[:], at(&d, 0, 5)))
+					bm_chk(bad, inv(&d), "...invariant holds")
+				}
+
+				// Paste over a whole-line selection (Shift+Down or a triple-click,
+				// then Ctrl+V): "bravo\n" -> "XX\n" shortens the line by three
+				// bytes, so the bookmark on "charlie" lands on 9, not on 6 where
+				// "XX" now lives.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {12})
+					d.anchor, d.cursor = 6, 12 // exactly "bravo\n"
+					doc_replace_sel(&d, transmute([]u8)string("XX\n"), .Paste)
+					ok := len(d.bookmarks) == 1 && d.bookmarks[0] == 9 && at(&d, 0, 7) == "charlie"
+					bm_chk(bad, ok, fmt.tprintf("a paste over the line ABOVE moves the bookmark past the replacement: %v %q (want [9] \"charlie\")", d.bookmarks[:], at(&d, 0, 7)))
+					bm_chk(bad, inv(&d), "...invariant holds")
+				}
+
+				// The same edit through doc_replace_range, which is the path
+				// Replace All and a column edit take -- the selection is not
+				// involved, so this is a second reachable route to the same shape.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {12, 20})
+					doc_replace_range(&d, 6, 6, transmute([]u8)string("XX\n"), .Replace)
+					ok := len(d.bookmarks) == 2 && d.bookmarks[0] == 9 && d.bookmarks[1] == 17
+					bm_chk(bad, ok && at(&d, 0, 7) == "charlie" && at(&d, 1, 5) == "delta", fmt.tprintf("replace-all over a newline-terminated match: %v %q/%q (want [9 17] \"charlie\"/\"delta\")", d.bookmarks[:], at(&d, 0, 7), at(&d, 1, 5)))
+					bm_chk(bad, inv(&d), "...invariant holds")
+				}
+
+				// A replacement that does NOT end in a newline merges the
+				// bookmarked line onto the replacement's tail, so there is no line
+				// for the mark to sit on and it is dropped. Same conservatism as
+				// the Backspace-join case, and pinned here so it is a decision.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {12})
+					doc_replace_range(&d, 6, 6, transmute([]u8)string("XX"), .Replace)
+					bm_chk(bad, len(d.bookmarks) == 0, fmt.tprintf("a replacement with no trailing newline joins the line and drops it: %v (want [])", d.bookmarks[:]))
+					bm_chk(bad, inv(&d), "...invariant holds")
+				}
+
+				// A bookmark strictly BELOW the replaced region shifts by the size
+				// difference, not by the delete's -n or the insert's +m alone.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {20})
+					doc_replace_range(&d, 6, 6, transmute([]u8)string("XX\n"), .Replace)
+					ok := len(d.bookmarks) == 1 && d.bookmarks[0] == 17 && at(&d, 0, 5) == "delta"
+					bm_chk(bad, ok, fmt.tprintf("a bookmark below shifts by m-n: %v %q (want [17] \"delta\")", d.bookmarks[:], at(&d, 0, 5)))
+					bm_chk(bad, inv(&d), "...invariant holds")
+				}
+
+				// And undo puts the set back, since a replace is one undo step.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {12})
+					doc_replace_range(&d, 6, 6, transmute([]u8)string("XX"), .Replace)
+					doc_undo(&d)
+					ok := len(d.bookmarks) == 1 && d.bookmarks[0] == 12 && at(&d, 0, 7) == "charlie"
+					bm_chk(bad, ok, fmt.tprintf("undo of a replace restores the set: %v %q (want [12] \"charlie\")", d.bookmarks[:], at(&d, 0, 7)))
+				}
+			}
+			bm_replace(&bad, BM_FIX, bm_set, bm_at, bm_invariant)
+
 			// --- undo / redo ---------------------------------------------------------
 			bm_undo :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), inv: proc(d: ^Document) -> bool) {
 				fmt.println("--- undo/redo ---")
