@@ -2137,7 +2137,10 @@ line_cell_col :: proc(doc: ^Document, t: ^plat.Text, ls, off: int) -> int {
 }
 
 // Inverse: byte offset within line [ls, le] at cell column `col` (rune-rounded).
-@(private = "file")
+// Not file-private: this and line_cell_col are a seam — the drawn column and the
+// hit-tested column — and CLAUDE.md's rule is to test the seam, not the unit, so
+// hscrolltest round-trips the pair on a tabbed line. With tabs the two are no
+// longer inverses by construction the way they were when a cell was a byte.
 line_offset_at_cell :: proc(doc: ^Document, t: ^plat.Text, ls, le, col: int) -> int {
 	buf: [VISIBLE_COLS * 4]u8
 	n := min(le - ls, len(buf))

@@ -351,6 +351,12 @@ cell_caches_invalidate :: proc(app: ^App) {
 		if d == nil {continue}
 		clear(&d.table_widths) // table_draw refits when it is empty
 		for &c in d.md_table {c.valid = false}
+		// The third cell-denominated cache, and the one two earlier passes
+		// missed: doc_cursor_col keys only on (cursor, pt.length), so with the
+		// caret sitting after a mid-line tab the status bar keeps reporting the
+		// old Col N until the caret moves. Cosmetic and self-correcting, but it
+		// is the same class as the two above and belongs in the same place.
+		d.status_col_valid = false
 	}
 }
 

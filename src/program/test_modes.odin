@@ -6112,6 +6112,68 @@ when NEWTPAD_TESTS {
 					}
 				}
 			}
+			// The same seam on a line containing TABS, which is the case the
+			// ASCII fixture above structurally cannot see: there cell index ==
+			// byte index, so line_cell_col and line_offset_at_cell agree even if
+			// neither understands a tab stop. Batch 7's design named this pair --
+			// "the row measure/hit-test pair, which must agree or the caret
+			// drifts" -- and every other tab fixture in the tree measures the
+			// platform layer, not this one. Round-trip every byte offset in the
+			// row: offset -> cell -> offset must be a fixed point at each one.
+			{
+				tline := "ab\tcd\te\t\tfghi\tj" // tabs at 2, 5, 7, 8, 13
+				tcontent := strings.concatenate({tline, "\n"})
+				tdoc := doc_from_content(transmute([]u8)tcontent, "", .UTF8)
+				defer doc_close(&tdoc)
+				tdoc.wrap = false
+				tdoc.view_cols = 80
+				tdoc.view_rows = 5
+				le := len(tline)
+				for off in 0 ..= le {
+					cell := line_cell_col(&tdoc, &t, 0, off)
+					back := line_offset_at_cell(&tdoc, &t, 0, le, cell)
+					if back != off {
+						fmt.printfln("  FAIL tab seam: off=%d -> cell=%d -> off=%d", off, cell, back)
+						bad += 1
+					}
+				}
+				// And the drawn column must be strictly increasing across the row:
+				// a tab that returned 0 cells would stall the caret on two offsets.
+				prev := -1
+				for off in 0 ..= le {
+					c := line_cell_col(&tdoc, &t, 0, off)
+					if c <= prev {
+						fmt.printfln("  FAIL tab seam: column not increasing at off=%d (%d <= %d)", off, c, prev)
+						bad += 1
+					}
+					prev = c
+				}
+				// The round-trip above is NOT enough on its own, and finding that
+				// out is why these value assertions exist: line_cell_col and
+				// line_offset_at_cell are inverses whatever a tab measures, so
+				// reverting to fixed-width tabs leaves the round-trip green (tried
+				// it -- 0 failures). Only absolute columns discriminate. At width 4
+				// these are the tab stops; under fixed-width-4 the same offsets read
+				// 6, 12, 17, 21, 21, so every row below moves.
+				for pair in ([][2]int {
+					{2, 2}, // the first tab starts at column 2
+					{3, 4}, // ...and advances to the stop, not by a full 4
+					{5, 6},
+					{6, 8}, // second tab: 6 -> 8
+					{7, 9},
+					{8, 12}, // a tab at 9 advances 3 to reach 12
+					{9, 16}, // a tab sitting exactly on a stop advances a full 4
+					{14, 24},
+				}) {
+					off, want := pair[0], pair[1]
+					got := line_cell_col(&tdoc, &t, 0, off)
+					if got != want {
+						fmt.printfln("  FAIL tab seam: col at off=%d is %d, want %d", off, got, want)
+						bad += 1
+					}
+				}
+			}
+
 			// Wrapping disables horizontal scroll (H_SCROLL forced to 0).
 			doc.wrap = true
 			doc.h_scroll = 100
