@@ -249,11 +249,21 @@ test_lex_c_sql_minus_minus_with_space_is_arithmetic :: proc(t: ^testing.T) {
 	testing.expectf(t, found_num, "SQL: the '1' in '- -1' is still a Number")
 }
 
-// SHAPE A again, the other direction (see the CSS case above for the shape).
-// Here the marker DOES fire: `out` fills on the braces, then "--" swallows
-// the rest of the line INCLUDING a "/*". state_out must be .Normal -- the
-// block comment inside a line comment is not real, and the emit cap must not
-// change that verdict either way.
+// MARKER PRECEDENCE past the emit cap -- NOT a Shape A test, which is what
+// this comment used to claim. Shape A is "the scan stopped when the token
+// buffer filled"; a scan that stopped here would report .Normal, and .Normal
+// is also the correct answer, so this case cannot go red from a Shape A
+// regression. (The CSS case above is the real Shape A one: there the correct
+// answer is .In_Comment and a truncated scan says .Normal.) It was absent
+// from the sabotage failure list for that reason.
+//
+// What it does guard is worth keeping: `out` fills on the braces, then "--"
+// fires and swallows the rest of the line INCLUDING a "/*", so the line
+// comment must WIN over the block-comment open that follows it. Revert SQL's
+// marker to the hardcoded "//" and the "--" no longer fires, the "/*" is seen
+// as an ordinary block open, and state comes back .In_Comment -- which is the
+// failure this case does catch. The n == 2 assertion holds the emit cap
+// alongside it.
 @(test)
 test_lex_c_sql_line_comment_hides_block_open_past_out_capacity :: proc(t: ^testing.T) {
 	kw := SQL_KW
