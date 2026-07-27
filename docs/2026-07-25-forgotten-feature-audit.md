@@ -1,5 +1,35 @@
 # Feature audit — 2026-07-25
 
+> ## Status as of 2026-07-27 — read this before acting on anything below
+>
+> Verified against `0d9dac3` (v0.11.0). Four batches have shipped since; **most of this document is
+> now history.** The method was right and is worth re-reading; the findings are not current.
+>
+> **Tier 1 — all shipped.** Syntax highlighting (§6w, seven lexers), column/block editing (§6y),
+> session persists the view (§6z).
+> **Tier 2 — item 4 (signing + installer) is the only live one.** Item 6 (gate `test_modes.odin`)
+> shipped in §6z, taking the release from 1,494,528 to 1,055,744 bytes.
+> **Tier 3 — items 7 (themes, §6v), 10 (Open Logs Folder, §6z) and 11 (the crash-reporter fix, §6z)
+> shipped.** Tab stops shipped in §6ab. Rebindable keys, sort/dedupe, keyword→colour rules,
+> bookmarks and scrollbar marks remain, sequenced as batch 9-10 in HANDOFF §6aa.
+>
+> **Two findings were wrong, and both were wrong in the same way — a claim of absence that nobody
+> re-tested:**
+>
+> - **Tier 2 item 5, "glyph atlas has no eviction … the only item whose failure mode is *your text
+>   silently vanishes*" — REFUTED.** Grow-then-recycle shipped in §6j. Measured 2026-07-26: at 4096²
+>   the atlas holds 61,425 glyphs at 16px and 9,768 at 48px (300% DPI), and `atlas_full` never
+>   latches. The audit was reading `text.odin`'s header comment, which outlived its own fix by seven
+>   months. See HANDOFF §6ab.
+> - **"Tabs are one cell for now … indented code and `.tsv` display wrong" — wrong on the number.**
+>   `TAB_CELLS :: 4` was already there; `text.odin` carried the stale comment *directly above* the
+>   live constant. The real gap was fixed-width vs true tab stops, fixed in §6ab.
+>
+> The lesson generalises and is the most useful thing this document produced: **a claim of presence
+> gets exercised by every build; a claim of absence is never re-tested.** A grep for what is missing
+> finds comments, not code. Both refutations came from running a measurement the audit could have
+> run.
+
 Two passes. The **first** swept for work that was started and left unfinished (TODOs, deferred
 comments, stale debt entries). Wyatt correctly pointed out that this structurally cannot find
 features that were **decided in the docs and never begun** — which is most of what is actually

@@ -378,7 +378,9 @@ block_row_range :: proc(doc: ^Document, t: ^plat.Text, line_start: int, cell_lo,
 			}
 			r, sz := utf8.decode_rune(buf[i:n])
 			if sz == 0 {sz = 1}
-			w := plat.text_cell_width(t, r, .Doc)
+			// `cell` is the running cell column from `line_start`, this row's
+			// own origin -- the same origin the draw measures from.
+			w := plat.text_cell_width_at(t, r, cell, .Doc)
 
 			if !lo_found && cell + w > cell_lo {
 				// This rune's span reaches into or past cell_lo, whether it
@@ -1287,7 +1289,14 @@ block_replace :: proc(doc: ^Document, t: ^plat.Text, text: []u8) -> bool {
 		if b == '\n' || b == '\r' {return false}
 	}
 	_, _, cell_lo, cell_hi := block_bounds(doc)
-	return block_apply(doc, t, cell_lo, cell_hi, text, cell_lo + plat.text_cells(t, text, .Doc), .Paste)
+	// col0 = cell_lo, NOT 0: `text` is typed INTO the rectangle, so its first
+	// rune lands at column cell_lo on every row, and a tab inside it advances
+	// to the next stop past cell_lo. Pressing Tab inside a column selection
+	// (commands.odin's .Insert_Tab -> block_replace with "\t") is the reachable
+	// case: with a 0 origin the width comes back as a full tab_width and the
+	// rectangle parks at cell_lo + 4 while the padded rows really end at
+	// cell_lo + (4 - cell_lo % 4).
+	return block_apply(doc, t, cell_lo, cell_hi, text, cell_lo + plat.text_cells(t, text, cell_lo, .Doc), .Paste)
 }
 
 // Backspace (forward=false) or Delete (forward=true) across the rectangle, as
@@ -1320,19 +1329,30 @@ block_delete :: proc(doc: ^Document, t: ^plat.Text, forward: bool) -> bool {
 	if cell_lo == 0 {
 		return true // nothing to the left on any row; see this proc's comment
 	}
-	// The column Backspace leaves the rectangle in is cell_lo MINUS THE CELL
-	// WIDTH OF WHATEVER IT ACTUALLY DELETED -- not a flat -1, which assumes
-	// every deleted cell is exactly one cell wide. It usually is (an ASCII
-	// row), but block_row_range's own whole-rune-inclusion rule (this file's
-	// central invariant: a straddled rune is never split) pulls a wider rune
-	// in whole the moment cell_lo-1 lands inside its span -- a tab (4 cells,
-	// TAB_CELLS) or a CJK character (2 cells) -- so the byte range deleted can
-	// span more than one cell even though the EDIT range requested is always
-	// exactly [cell_lo-1, cell_lo). LOW 1's probe: "\tabc\n" with the
-	// rectangle at cell 4 deletes the whole leading tab (byte 0, the tab's
-	// own start, to byte 1), and the caret lands at column 0 -- cell_lo-1
-	// would report column 3, a column that does not exist on the row, and the
-	// next keystroke would pad three stray spaces onto every row to reach it.
+	// The column Backspace leaves the rectangle in is THE COLUMN THE DELETED
+	// RUN STARTS AT -- not a flat cell_lo-1, which assumes every deleted cell
+	// is exactly one cell wide. It usually is (an ASCII row), but
+	// block_row_range's own whole-rune-inclusion rule (this file's central
+	// invariant: a straddled rune is never split) pulls a wider rune in whole
+	// the moment cell_lo-1 lands inside its span -- a tab or a CJK character --
+	// so the byte range deleted can span more than one cell even though the
+	// EDIT range requested is always exactly [cell_lo-1, cell_lo). LOW 1's
+	// probe: "\tabc\n" with the rectangle at cell 4 deletes the whole leading
+	// tab (byte 0, the tab's own start, to byte 1), and the caret lands at
+	// column 0 -- cell_lo-1 would report column 3, a column that does not exist
+	// on the row, and the next keystroke would pad three stray spaces onto
+	// every row to reach it.
+	//
+	// Measured FORWARD from the row start, not as cell_lo minus the deleted
+	// run's own width. The subtraction was equivalent while a tab was a fixed
+	// four cells; under true tab stops it is circular -- text_cells needs the
+	// run's starting column to measure a tab inside it, and that starting
+	// column is precisely the answer being computed. Handing it a 0 origin
+	// instead is the bug that shape produces: on "ab\tcd" with the rectangle at
+	// cell 4 the tab occupies columns 2-3 (width 2), a 0 origin measures it as
+	// 4, and the caret jumps to the row start on every row. line_cell_col has
+	// no such loop, and it is the same proc caret_line_start_cell above already
+	// uses to turn an offset on a row into a column, so the two cannot diverge.
 	//
 	// Resolved via the rectangle's own TOP row (off_lo) -- the same row
 	// top_caret is computed from elsewhere in this file, because that row's
@@ -1345,9 +1365,7 @@ block_delete :: proc(doc: ^Document, t: ^plat.Text, forward: bool) -> bool {
 	// standing in for a value that mattered.
 	new_cell := cell_lo - 1
 	if lo, hi, _, ok := block_row_range(doc, t, off_lo, cell_lo - 1, cell_lo); ok && hi > lo {
-		buf := make([]u8, hi - lo, context.temp_allocator)
-		base.pt_read(&doc.pt, lo, buf)
-		new_cell = cell_lo - plat.text_cells(t, buf, .Doc)
+		new_cell = line_cell_col(doc, t, off_lo, lo)
 	}
 	return block_apply(doc, t, cell_lo - 1, cell_lo, nil, new_cell, .Delete)
 }

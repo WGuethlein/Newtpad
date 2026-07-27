@@ -186,6 +186,11 @@ app_open_special :: proc(a: ^App, kind: Tab_Kind) {
 			return
 		}
 	}
+	// A bare doc_new(): no content, no path, and nothing ever writes to it. Menu
+	// rows lean on that -- Edit > Select All stays live on a pseudo-tab and is
+	// harmless only because selecting an empty buffer produces no selection (see
+	// menu.odin). Anything that gives this Document content breaks that, which is
+	// why command_allowed_on refuses the writers outright rather than trusting it.
 	d := new(Document)
 	d^ = doc_new()
 	d.kind = kind

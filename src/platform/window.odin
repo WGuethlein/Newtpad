@@ -99,6 +99,12 @@ WINDOW_CLASS :: "NewtpadWindowClass"
 
 // Per-frame capacity for cross-instance open requests (selecting a batch of
 // files in Explorer sends one per file). Overflow is dropped, not truncated.
+//
+// Paths on this queue are deliberately NOT \\?\-prefixed. They arrive from
+// another process (WM_COPYDATA) or from Explorer (WM_DROPFILES) and are carried
+// as plain UTF-8; the prefix is applied at the syscall, inside platform/file.odin.
+// OPEN_PATH_MAX is 1024, well past MAX_PATH, so a long dropped path survives the
+// queue and is opened correctly by the file layer.
 OPEN_QUEUE :: 16
 OPEN_PATH_MAX :: 1024
 

@@ -13,7 +13,14 @@ ytok_eq :: proc(t: ^testing.T, got: Token, want_start, want_len: int, want_kind:
 	testing.expectf(
 		t,
 		got.start == want_start && got.len == want_len && got.kind == want_kind,
-		"%s: got {%d,%d,%v} want {%d,%d,%v}",
+		// No literal '{' in this format string: Odin's fmt reads "{%d," as a
+		// brace-index verb, which not only hides the first number but
+		// desynchronises the whole argument list -- so the want triple was
+		// mis-bound too. That garbles the one output sabotage discipline
+		// (docs/development-loop.md §3) depends on reading. Fixed tree-wide
+		// 2026-07-26; it had mangled every failure here since the file was
+		// written. See lex_c_test.odin for where it was found.
+		"%s: got start=%d len=%d kind=%v, want start=%d len=%d kind=%v",
 		label,
 		got.start,
 		got.len,

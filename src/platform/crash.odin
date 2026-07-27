@@ -108,6 +108,28 @@ crash_filter :: proc "system" (info: ^win.EXCEPTION_POINTERS) -> win.LONG {
 	return win.EXCEPTION_EXECUTE_HANDLER
 }
 
+// NOT wide_path, here or in the report writer below: this runs inside the
+// unhandled-exception filter, and the fewer moving parts between the fault and
+// the bytes on disk, the better. The exclusion stands -- but not for the reason
+// it used to give, and it is a known hole rather than a free one.
+//
+// **The crash directory is already user-configurable.** `session_dir()`
+// (program/session.odin) honours NEWTPAD_SESSION_DIR and `diag_init` derives
+// `<dir>\crashes` from it, so an override long enough to push these paths past
+// MAX_PATH produces a crash file plain CreateFileW cannot open, and the artefact
+// the crash suite exists to produce is lost with no diagnostic at all. In
+// practice the hole opens one step earlier still: the `os.make_directory` that
+// would have created `<dir>\crashes` is core:os's registry-dependent long-path
+// path, so the directory is not there either. Nobody has hit this -- the override
+// is a test affordance and %APPDATA%\Newtpad\crashes is short -- but "always
+// short" is now an assumption about how the program is invoked, not a fact.
+//
+// The "less machinery in the filter" half is weaker than it reads, too: the
+// `win.utf8_to_wstring` calls below allocate from the **heap**, inside a filter
+// whose entire premise is that the heap may be corrupt. `wide_path` would put
+// that work on the temp allocator instead, which is not obviously worse. Whether
+// to switch is a call for the crash-reporting work, not a drive-by; recorded here
+// so it is weighed rather than rediscovered.
 @(private = "file")
 write_minidump :: proc(path: string, info: ^win.EXCEPTION_POINTERS) {
 	h := win.CreateFileW(

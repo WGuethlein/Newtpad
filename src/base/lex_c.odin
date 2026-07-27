@@ -59,6 +59,14 @@
 //     (Keyword_Set.preproc); Odin's `#`-prefixed compiler directives are a
 //     different shape entirely (inline, not line-anchored — see ODIN_KW's
 //     comment) and are deliberately NOT recognized by this mechanism.
+//   - The LINE-comment marker is per-language data
+//     (Keyword_Set.line_comment), not the hardcoded "//" this lexer shipped
+//     with: "//" for the eleven C-family languages, "--" for SQL, and the
+//     empty string for CSS, which has no line-comment form at all. Only
+//     "everything from the marker to the line's end is a Comment" is shared;
+//     which bytes open one is data, like every other per-language fact here.
+//     A block comment is still the only cross-line construct, so this adds
+//     no Lex_State — a line comment ends with its line, by definition.
 //
 // `Syn_Type` is lexical only, per the task brief: a built-in primitive name
 // (Keyword_Set.types) colours Type unconditionally, and the identifier
@@ -103,6 +111,37 @@ Keyword_Set :: struct {
 	// bytes "/*" was otherwise misread as a block-comment open that can
 	// persist to the end of the FILE, not just the line).
 	regex:         bool,
+	// This language's line-comment marker: from it to the line's end is one
+	// Comment token, and nothing after it on the line is scanned as code.
+	// "//" for all eleven C-family languages, "--" for SQL, and EMPTY for
+	// CSS, which genuinely has no line-comment form at all (CSS Syntax
+	// Module Level 3 defines only `/* */`).
+	//
+	// EMPTY MEANS "THIS LANGUAGE HAS NO LINE COMMENT" -- never "the empty
+	// string matches at every byte." A prefix compare written the obvious
+	// way succeeds trivially on a zero-length needle, which would open a
+	// comment at offset 0 of every line and colour a whole stylesheet solid;
+	// lc_line_comment_at rejects a zero-length marker before comparing
+	// anything, and that early return is the only reason "" is safe as the
+	// zero value. Note that it IS the zero value: a Keyword_Set that omits
+	// this field gets "no line comment," so every table below sets it
+	// explicitly and test_lex_c_line_comment_marker_per_table asserts the
+	// marker of each real table by name, so a twelfth language that forgets
+	// it fails a test instead of silently losing its comments.
+	line_comment:  string,
+}
+
+// Does this language's line-comment marker begin at line[i]? A zero-length
+// marker NEVER matches -- see Keyword_Set.line_comment for why that guard is
+// load-bearing rather than defensive.
+@(private = "file")
+lc_line_comment_at :: #force_inline proc(line: []u8, i: int, mark: string) -> bool {
+	if len(mark) == 0 {return false} // the language has no line comment at all (CSS)
+	if i + len(mark) > len(line) {return false}
+	for k in 0 ..< len(mark) {
+		if line[i + k] != mark[k] {return false}
+	}
+	return true
 }
 
 @(private = "file")
@@ -552,7 +591,18 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 			continue
 		}
 
-		if b == '/' && i + 1 < len(line) && line[i + 1] == '/' {
+		// The language's own line-comment marker (Keyword_Set.line_comment):
+		// "//" for the C family, "--" for SQL, none at all for CSS. Checked
+		// BEFORE the "/*" and regex branches, exactly as the hardcoded "//"
+		// test it replaces was, so a C-family "//" still wins over both. For
+		// a marker that isn't slash-shaped this ordering is what keeps SQL's
+		// "--" ahead of the number scan, so "-- 1" is a comment rather than a
+		// dash and a Number. `i = len(line)` runs whether or not the token was
+		// emitted -- a line comment swallows the rest of the line, so there is
+		// no state left to find past it, and stopping the scan here is not the
+		// Shape-A "stopped scanning at the buffer cap" mistake (see lex_c's
+		// own comment and the capacity tests in lex_c_test.odin).
+		if lc_line_comment_at(line, i, kw.line_comment) {
 			if n < len(out) {
 				out[n] = Token{i, len(line) - i, .Comment}
 				n += 1
@@ -791,9 +841,13 @@ lex_c :: proc(line: []u8, state_in: Lex_State, kw: ^Keyword_Set, out: []Token) -
 // (up to and including its very end) is rejected outright. A Comment token
 // CAN legitimately end exactly at the candidate (that is the accept case),
 // so only a STRICTLY interior overlap rejects it -- which can only happen
-// for a `//` line comment that continues past the candidate to the true
-// line end (a same-line block comment's own close is never interior to
-// itself, by construction).
+// for a LINE comment (Keyword_Set.line_comment: "//" for the C family, "--"
+// for SQL) that continues past the candidate to the true line end (a
+// same-line block comment's own close is never interior to itself, by
+// construction). A language with no line comment at all (CSS) simply never
+// produces that shape, so this arm is unreachable there -- correctly: in CSS
+// a "*/" that a stylesheet author wrote after a "//" really IS at a .Normal
+// position, because CSS's "//" opens nothing.
 //
 // NESTING GRAMMARS (Rust, Odin -- Keyword_Set.nest_comments) BREAK THIS
 // ARGUMENT, and NOT just in the two ways above: the "first */ always
@@ -936,6 +990,7 @@ C_KW := Keyword_Set {
 	backtick      = false,
 	nest_comments = false,
 	regex         = false,
+	line_comment  = "//",
 }
 
 // --- C++ (.cpp, .hpp) ---------------------------------------------------
@@ -1031,6 +1086,7 @@ CPP_KW := Keyword_Set {
 	backtick      = false,
 	nest_comments = false,
 	regex         = false,
+	line_comment  = "//",
 }
 
 // --- C# (.cs) -------------------------------------------------------------
@@ -1154,6 +1210,7 @@ CS_KW := Keyword_Set {
 	backtick      = false,
 	nest_comments = false,
 	regex         = false,
+	line_comment  = "//",
 }
 
 // --- Java (.java) ----------------------------------------------------------
@@ -1227,6 +1284,7 @@ JAVA_KW := Keyword_Set {
 	backtick      = false,
 	nest_comments = false,
 	regex         = false,
+	line_comment  = "//",
 }
 
 // --- JavaScript (.js) -------------------------------------------------------
@@ -1302,6 +1360,7 @@ JS_KW := Keyword_Set {
 	backtick      = true,
 	nest_comments = false,
 	regex         = true,
+	line_comment  = "//",
 }
 
 // --- TypeScript (.ts) --------------------------------------------------
@@ -1381,6 +1440,7 @@ TS_KW := Keyword_Set {
 	backtick      = true,
 	nest_comments = false,
 	regex         = true,
+	line_comment  = "//",
 }
 
 // --- Go (.go) --------------------------------------------------------------
@@ -1451,6 +1511,7 @@ GO_KW := Keyword_Set {
 	backtick      = true,
 	nest_comments = false,
 	regex         = false,
+	line_comment  = "//",
 }
 
 // --- Rust (.rs) ------------------------------------------------------------
@@ -1530,6 +1591,7 @@ RUST_KW := Keyword_Set {
 	backtick      = false,
 	nest_comments = true,
 	regex         = false,
+	line_comment  = "//",
 }
 
 // --- Odin (.odin) -----------------------------------------------------------
@@ -1652,6 +1714,7 @@ ODIN_KW := Keyword_Set {
 	backtick      = false,
 	nest_comments = true,
 	regex         = false,
+	line_comment  = "//",
 }
 
 // --- CSS (.css) — folded here, not given its own lexer ---------------------
@@ -1666,20 +1729,26 @@ ODIN_KW := Keyword_Set {
 // lc_scan_number_suffix already absorbs trailing alnum runs onto every
 // language's number token, so "10px" is already one Number token today.
 //
-// One disclosed imprecision from reusing the grammar AS-IS rather than
-// tuning lex_c's own matching logic for a twelfth language (see this file's
-// top-of-file header on why that boundary is treated as a real one, not
-// bureaucracy): lex_c unconditionally treats "//" as a line-comment opener
-// for every Keyword_Set, because all eleven C-family languages genuinely
-// have that form. CSS does not, and "//" appears constantly in real
-// stylesheets inside `url(https://...)` values (font/background/@import
-// URLs) — a line containing one will have everything after the "//"
-// mis-coloured as a Comment. Bounded to that ONE physical line (lex_c's
-// "//" branch never opens a Lex_State — it returns within the same call,
-// state untouched), so it self-corrects on the very next line rather than
-// compounding the way an unclosed `/* */` would; still a real, visible cost
-// on an extremely common CSS pattern, stated here rather than found on
-// screen.
+// CLOSED 2026-07-26 (batch 7 task 4): the "//" gap this table used to
+// disclose. lex_c no longer hardcodes "//" — the marker is per-language data
+// (Keyword_Set.line_comment), and CSS's is EMPTY, because CSS Syntax Module
+// Level 3 defines no line-comment form at all. So `url(https://x/y)` now
+// lexes as an ordinary declaration instead of colouring everything after the
+// "//" as a Comment to end of line, which was a real, visible cost on an
+// extremely common CSS pattern (font/background/@import URLs). `/* */` is
+// unaffected and is still handled by the shared block-comment path, carried
+// across lines through Lex_State exactly as before — that is CSS's real and
+// only comment form.
+//
+// One consequence worth stating, because it is the opposite trade rather
+// than a pure win: the old "//" behaviour incidentally swallowed the rest of
+// the line, which shielded any later "/*" on it. A URL containing the
+// literal bytes "/*" (`url(https://x/a/*/b)`) will now open a genuine block
+// comment that persists until the next "*/" anywhere in the file. That is
+// the same shape as the JS regex bug IMPORTANT 6 fixed, but the trade is
+// clearly right: `url(https://...)` occurs in most real stylesheets and
+// "/*" inside a URL path is close to nonexistent, whereas the old behaviour
+// mis-coloured the common case every time.
 //
 // Keywords: common global/property-value keywords and at-rule names, from
 // general knowledge of CSS (MDN's CSS reference) rather than one exhaustive
@@ -1711,6 +1780,11 @@ CSS_KW := Keyword_Set {
 	backtick      = false,
 	nest_comments = false,
 	regex         = false,
+	// EMPTY ON PURPOSE, and the one value in this file that means "absent"
+	// rather than "default": CSS has no line comment. See
+	// Keyword_Set.line_comment and lc_line_comment_at for why "" can never
+	// degenerate into "matches everywhere."
+	line_comment  = "",
 }
 
 // --- SQL (.sql) — folded here, not given its own lexer ---------------------
@@ -1720,27 +1794,35 @@ CSS_KW := Keyword_Set {
 // SQLite — all support this form identically to C's), and structural
 // punctuation all match this grammar's shape well.
 //
-// TWO disclosed imprecisions from reusing the grammar AS-IS (see CSS_KW's
-// comment immediately above for why lex_c's own matching logic is not
-// touched to accommodate a new language — that boundary is treated as real,
-// not bureaucracy):
+// CLOSED 2026-07-26 (batch 7 task 4): the "--" gap this table used to
+// disclose — the sharper of §6w's two, because SQL comments routinely
+// contain ordinary SQL words ("-- SELECT the right index" coloured SELECT as
+// a Keyword INSIDE the comment). lex_c's line-comment marker is now
+// per-language data (Keyword_Set.line_comment) and SQL's is "--", so the
+// whole run from "--" to the line's end is one Comment token and nothing in
+// it is lexed as code.
 //
-//   1. SQL's real line-comment marker is "--", which lex_c does not
-//      recognize at all (it only ever checks for "//"). A "-- comment"
-//      line's words are lexed as ordinary SQL tokens rather than suppressed
-//      as a comment — concretely, "-- SELECT the right index" colours
-//      SELECT as a Keyword, inside what a human reader knows is a comment.
-//      This is the SHARPER of the two gaps here (sharper than CSS's
-//      "//"-inside-a-url case above): SQL developers routinely write "--"
-//      comments containing ordinary SQL words, not just rare URL bytes.
-//      Genuinely closing it means teaching lex_c a second, per-language
-//      line-comment marker — a change to the shared grammar's own matching
-//      logic, not a new data table, which is exactly the kind of touch
-//      this task's scope note reserves for calling out rather than making
-//      unilaterally. Flagged here and in task-5-report.md as a real
-//      follow-up candidate. Block comments (`/* */`) are unaffected and
-//      colour correctly.
-//   2. SQL keywords are case-INSENSITIVE (SELECT/select/Select all valid),
+// Two things that follow from where the check sits in lex_c's dispatch, both
+// tested rather than assumed (lex_c_css_sql_test.odin):
+//
+//   - It is ahead of the number scan, so "-- 1" is a comment, not a dash
+//     followed by a Number. Ordinary arithmetic is untouched, because "--"
+//     is matched as a two-byte run: "a - -1" has a space between the two
+//     dashes and never matches. "a--1" with no space IS a comment here,
+//     which is what ANSI SQL, Postgres, SQLite and T-SQL all do -- but NOT
+//     every dialect: MySQL requires whitespace after the "--" and reads
+//     "5--3" as 5 minus negative 3. The majority behaviour is the right
+//     default for a highlighter that does not know which dialect it is
+//     looking at; the MySQL case is a disclosed miscolour, not a claim that
+//     nobody disagrees.
+//   - It is behind the string scan in effect, because a string literal is
+//     consumed whole as one token, so a "--" inside 'a--b' is never examined
+//     as a potential marker at all.
+//
+// ONE disclosed imprecision remains from reusing the grammar AS-IS (see
+// CSS_KW's comment immediately above):
+//
+//   1. SQL keywords are case-INSENSITIVE (SELECT/select/Select all valid),
 //      but lc_word_in (this grammar's shared matching function) does an
 //      exact, case-SENSITIVE compare, same as every other C-family
 //      language here (none of which are case-insensitive). Both UPPERCASE
@@ -1791,4 +1873,5 @@ SQL_KW := Keyword_Set {
 	backtick      = false,
 	nest_comments = false,
 	regex         = false,
+	line_comment  = "--", // NOT "//" -- see this table's comment above
 }

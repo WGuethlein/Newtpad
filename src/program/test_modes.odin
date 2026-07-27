@@ -661,6 +661,7 @@ when NEWTPAD_TESTS {
 				wrap_default    = true,
 				font_size       = 22,
 				zoom_pct        = 125,
+				tab_width       = 3, // non-default and in range, so the whole-struct compare below can see it
 				font_family     = "Courier New",
 				font_style      = .Italic,
 				split_frac      = 0.25, // non-zero, non-default, exact in binary float (survives %.4f round-trip)
@@ -687,6 +688,44 @@ when NEWTPAD_TESTS {
 			cok := c.font_size <= FONT_SIZE_MAX && c.font_size >= FONT_SIZE_MIN
 			fmt.printfln("clamp 9999 -> %d  %s", c.font_size, "OK" if cok else "FAIL")
 			if !cok {bad += 1}
+
+			// tab_width has the same "0 is not a real choice" hazard as zoom_pct,
+			// and a sharper consequence: a 0 reaching plat.text_cell_width_at
+			// makes the advance 0 and every measuring loop non-terminating. So
+			// the save side must write the DEFAULT for a 0, not the clamped
+			// minimum -- writing 1 would silently turn every tab into one cell on
+			// the next launch.
+			settings_save(Settings{restore_session = true, font_size = 16, zoom_pct = 100})
+			tz := settings_load()
+			tzok := tz.tab_width == plat.TAB_WIDTH_DEFAULT
+			fmt.printfln("tab_width 0 saves as the default %d (not the min) -> %d  %s", plat.TAB_WIDTH_DEFAULT, tz.tab_width, "OK" if tzok else "FAIL")
+			if !tzok {bad += 1}
+
+			// Out of range in both directions, written straight to disk so this is
+			// settings_load's own normalise and not a re-test of the save side.
+			//
+			// The 0 case is the seam, not a second clamp check: a `tab_width 0` on
+			// disk (hand-edited, or a truncated write) must resolve to whatever a
+			// struct 0 resolves to on the way OUT, because the two sides are the
+			// same value read twice. They disagreed once -- save wrote the default
+			// 4 while load clamped to the minimum 1, so a hand-edited file gave
+			// one-cell tabs in every document -- and the assertion below is written
+			// against `tz` (what the save side produced for a struct 0, measured
+			// eight lines up) rather than against a literal, so reintroducing the
+			// disagreement in EITHER direction fails it.
+			if p, pok := session_dir(); pok {
+				base_kv := "newtpad-settings 1\nrestore_session 1\nwrap_default 0\nfont_size 16\nzoom_pct 100\n"
+				plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)strings.concatenate({base_kv, "tab_width 99\n"}, context.temp_allocator))
+				hiw := settings_load()
+				plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)strings.concatenate({base_kv, "tab_width 0\n"}, context.temp_allocator))
+				low := settings_load()
+				twok := hiw.tab_width == plat.TAB_WIDTH_MAX && low.tab_width == tz.tab_width && low.tab_width == plat.TAB_WIDTH_DEFAULT
+				fmt.printfln(
+					"tab_width on disk 99 -> %d (want %d), 0 -> %d (want %d, the same thing a struct 0 saves as)  %s",
+					hiw.tab_width, plat.TAB_WIDTH_MAX, low.tab_width, tz.tab_width, "OK" if twok else "FAIL",
+				)
+				if !twok {bad += 1}
+			}
 
 			// A missing file must give defaults rather than zeroes (font_size 0 would
 			// divide into the cell grid).
@@ -728,6 +767,89 @@ when NEWTPAD_TESTS {
 			dok := int(rcz.px) == 60
 			fmt.printfln("  ...at 200%% DPI -> px %.0f (want 60)  %s", rcz.px, "OK" if dok else "FAIL")
 			if !dok {bad += 1}
+
+			// --- tab width reaches the text layer -----------------------------
+			// The row can be right and the wiring still missing: settings_apply
+			// is the only thing that pushes the setting into plat.Text, and
+			// nothing else in the program reads Settings.tab_width. Assert the
+			// row index first -- SETTINGS_ROWS is index-matched against the value
+			// switch and the toggle switch, so an inserted row silently moves
+			// this to a different setting.
+			fmt.println("--- tab width ---")
+			trok := len(SETTINGS_ROWS) > 8 && SETTINGS_ROWS[8].label == "Tab width"
+			fmt.printfln("  row 8 is %q  %s", SETTINGS_ROWS[8].label if len(SETTINGS_ROWS) > 8 else "", "OK" if trok else "FAIL")
+			if !trok {bad += 1}
+			az.settings.tab_width = 4
+			settings_toggle_row(&rcz, 8, 1)
+			settings_toggle_row(&rcz, 8, 1)
+			up := az.settings.tab_width == 6 && plat.text_tab_width(&t2) == 6
+			fmt.printfln("  two Rights -> setting %d, text layer %d (want 6, 6)  %s", az.settings.tab_width, plat.text_tab_width(&t2), "OK" if up else "FAIL")
+			if !up {bad += 1}
+			for _ in 0 ..< 40 {settings_toggle_row(&rcz, 8, -1)}
+			downc := az.settings.tab_width == plat.TAB_WIDTH_MIN && plat.text_tab_width(&t2) == plat.TAB_WIDTH_MIN
+			fmt.printfln("  40 Lefts clamp at %d (text layer %d)  %s", az.settings.tab_width, plat.text_tab_width(&t2), "OK" if downc else "FAIL")
+			if !downc {bad += 1}
+			settings_toggle_row(&rcz, 8, 0) // Enter resets
+			rstw := az.settings.tab_width == plat.TAB_WIDTH_DEFAULT && plat.text_tab_width(&t2) == plat.TAB_WIDTH_DEFAULT
+			fmt.printfln("  Enter resets to %d (text layer %d)  %s", az.settings.tab_width, plat.text_tab_width(&t2), "OK" if rstw else "FAIL")
+			if !rstw {bad += 1}
+
+			// --- a tab-width change invalidates the CELL caches ---------------
+			// metrics_recompute and text_reset_atlas between them cover every
+			// cached measurement denominated in PIXELS, which is why they were
+			// enough for font and zoom. Two caches hold CELL counts and are keyed
+			// on nothing a settings change moves: doc.md_table on doc.revision
+			// (only an edit bumps it) and doc.table_widths on edits and view
+			// toggles. Without settings_apply invalidating them, changing Tab
+			// width with a grid or a preview open leaves both columns sized
+			// against the old tab stops until the next edit.
+			//
+			// Both checks read the value THE DRAW WOULD USE (table_draw's own
+			// "refit when empty", md_table_ensure's own lookup), not the validity
+			// flags, so they cannot pass on an invalidation that clears a flag
+			// nothing consults.
+			fmt.println("--- tab width invalidates the cell caches ---")
+			{
+				// A literal tab in the MIDDLE of a field, so the measurement moves
+				// with the tab width: "a\tb" is 'a' + a tab from column 1 + 'b',
+				// which is 5 cells at width 4 and 9 at width 8. A LEADING tab
+				// would be one full width in both and could not tell them apart.
+				cd := new(Document)
+				cd^ = doc_from_content(transmute([]u8)strings.clone("a\tb,c\nd,e\n"), "t.csv", .UTF8)
+				cd.table, cd.table_delim = true, ','
+				mdd := new(Document)
+				mdd^ = doc_from_content(transmute([]u8)strings.clone("| a\tb | c |\n|---|---|\n| d | e |\n"), "t.md", .UTF8)
+				app_add(&az, cd)
+				app_add(&az, mdd)
+
+				settings_toggle_row(&rcz, 8, 0) // Enter: start from the default 4
+				table_compute_widths(cd, &t2)
+				w4 := cd.table_widths[0] if len(cd.table_widths) > 0 else -1
+				m4 := -1
+				if c := md_table_ensure(mdd, &t2, 0); c != nil {m4 = c.widths[0]}
+				base4 := w4 == 5 && m4 == 5
+				fmt.printfln("  %-6s at width 4: grid col 0 = %d cells, md col 0 = %d (want 5, 5)", "ok" if base4 else "FAIL", w4, m4)
+				if !base4 {bad += 1}
+
+				for _ in 0 ..< 4 {settings_toggle_row(&rcz, 8, 1)} // 4 -> 8
+
+				// table_draw's own line: refit only when the widths were cleared.
+				if len(cd.table_widths) == 0 {table_compute_widths(cd, &t2)}
+				w8 := cd.table_widths[0] if len(cd.table_widths) > 0 else -1
+				m8 := -1
+				if c := md_table_ensure(mdd, &t2, 0); c != nil {m8 = c.widths[0]}
+				movd := w8 == 9 && m8 == 9
+				fmt.printfln(
+					"  %-6s at width 8: grid col 0 = %d cells, md col 0 = %d (want 9, 9; a stale cache reports 5)",
+					"ok" if movd else "FAIL", w8, m8,
+				)
+				if !movd {bad += 1}
+
+				app_destroy(&az)
+				az = App{} // the dynamic arrays above are freed; do not walk them again
+				az.settings = settings_default()
+			}
+
 			BASE_PX = BASE_PX_96 // leave globals alone for later modes
 
 			// The settings-page row list (IMPORTANT 3, final review): the 8th row
@@ -975,9 +1097,11 @@ when NEWTPAD_TESTS {
 			// Settings and Font are TABS, so app_active returns a Document for them
 			// and has_doc is true. The Encoding menu's Save-as and Line-Endings rows
 			// used that predicate and were therefore live on a pseudo-tab: "Save as
-			// UTF-16 LE" set doc.modified on a page with no file, and Ctrl+W then
-			// asked whether to save it. Every row of the menu must be dead there --
-			// the Reopen_* rows already were, via has_file.
+			// UTF-16 LE" set doc.modified on a page with no file, and closing the
+			// tab then asked whether to save it -- closing it via the tab strip's X,
+			// the File row or Escape, NOT via Ctrl+W, which is bound in the .Editor
+			// context only and does not resolve on a pseudo-tab at all. Every row of the
+			// menu must be dead there -- the Reopen_* rows already were, via has_file.
 			{
 				ea: App
 				app_open_special(&ea, .Settings)
@@ -992,7 +1116,10 @@ when NEWTPAD_TESTS {
 					found = true
 					for it in m.items {
 						if it.cmd == .None {continue}
-						if it.enabled == nil || it.enabled(&ea) {append(&live, it.cmd)}
+						// item_enabled, not it.enabled: the row predicate is only
+						// half the rule now (command_allowed_on is the other half),
+						// and the half the product reads is the one worth asserting.
+						if item_enabled(&ea, it) {append(&live, it.cmd)}
 					}
 				}
 				enc_dead := found && len(live) == 0
@@ -1000,6 +1127,143 @@ when NEWTPAD_TESTS {
 				if !enc_dead {bad += 1}
 				app_destroy(&ea)
 			}
+
+			// The same pseudo-tab problem outside the Encoding menu, which the
+			// Encoding fix did not reach: File > Save / Save As and Edit > Paste
+			// were has_doc, so all three were live on Settings and Font. Save
+			// raised a Save dialog for a page with no file; Paste inserted the
+			// clipboard into a document nothing draws and left it .modified, so
+			// closing the tab -- by the tab strip's X, by this File row, or by Escape;
+			// Ctrl+W does not resolve on a pseudo-tab -- then asked whether to save it.
+			//
+			// Tab_Close is asserted LIVE in the same breath, deliberately: closing
+			// one is the only thing on this menu that means anything on a pseudo-tab,
+			// so a gate written as "nothing runs there" -- or done as one predicate
+			// swap over the rows above -- would kill the row that has to survive.
+			// Without this half the test would pass just as well against that wrong
+			// fix.
+			menu_row_live :: proc(app: ^App, cmd: Command_Id) -> (live: bool, found: bool) {
+				for m in menus {
+					for it in m.items {
+						if it.cmd != cmd {continue}
+						found = true
+						// Through item_enabled: the kind rule now lives in
+						// command_allowed_on, so `it.enabled` alone no longer decides
+						// whether a row is live, and asserting on half the rule would
+						// report Save as live on a pseudo-tab.
+						if item_enabled(app, it) {live = true}
+					}
+				}
+				return
+			}
+			pseudo_tab_rows_case :: proc(kind: Tab_Kind) -> (bad: int) {
+				a: App
+				app_open_special(&a, kind)
+				defer app_destroy(&a)
+				for cmd in ([]Command_Id{.Save, .Save_As, .Paste}) {
+					live, found := menu_row_live(&a, cmd)
+					ok := found && !live
+					fmt.printfln("  %-6s %-8v %-8v is dead on the pseudo-tab (found=%v)", "ok" if ok else "FAIL", kind, cmd, found)
+					if !ok {bad += 1}
+				}
+				live, found := menu_row_live(&a, .Tab_Close)
+				ok := found && live
+				fmt.printfln("  %-6s %-8v Tab_Close stays LIVE (found=%v)", "ok" if ok else "FAIL", kind, found)
+				if !ok {bad += 1}
+				return
+			}
+			fmt.println("--- mutating rows are dead on the Settings and Font pseudo-tabs ---")
+			bad += pseudo_tab_rows_case(.Settings)
+			bad += pseudo_tab_rows_case(.Font)
+			// ...and all four are live on a real text tab, or the three above would
+			// pass with the rows simply disabled everywhere.
+			{
+				a: App
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				all_live := true
+				for cmd in ([]Command_Id{.Save, .Save_As, .Paste, .Tab_Close}) {
+					live, found := menu_row_live(&a, cmd)
+					if !found || !live {all_live = false}
+				}
+				fmt.printfln("  %-6s all four are live on an ordinary text tab", "ok" if all_live else "FAIL")
+				if !all_live {bad += 1}
+			}
+
+			// Nothing anywhere exercised what a `checked` predicate MEANS. This mode
+			// asserted that the model is well-formed and that the mnemonics do not
+			// collide; whether a check mark tracks the state it names was untested
+			// for is_wrapped and is_table since they were written, and for the
+			// encoding predicates since batch 6 added them.
+			//
+			// Read through the menus table rather than by calling the predicates,
+			// which are @(private = "file") in menu.odin anyway: that makes the
+			// assertion cover the WIRING too. A row pointed at the wrong predicate
+			// -- Toggle_Table checked by is_wrapped, say -- is the likelier mistake
+			// than a predicate that reads the wrong field, and calling the procs
+			// directly would miss it entirely.
+			//
+			// Driven with command_dispatch, not by writing doc.wrap: the check mark
+			// and the command must agree, and that is a seam.
+			menu_checked_of :: proc(app: ^App, cmd: Command_Id) -> (checked, found: bool) {
+				for m in menus {
+					for it in m.items {
+						if it.cmd != cmd || it.checked == nil {continue}
+						found = true
+						if it.checked(app) {checked = true}
+					}
+				}
+				return
+			}
+			// A toggle's check mark must be off, then on, then off again -- all
+			// three, because "reads true once" also passes for a predicate stuck
+			// true, and "flips" passes for one that is simply inverted.
+			checked_toggle_case :: proc(t: ^plat.Text, cmd: Command_Id, label: string) -> (bad: int) {
+				a: App
+				dummy: plat.Window
+				a.settings = settings_default()
+				app_new_scratch(&a) // untitled: doc_can_table/doc_can_markdown allow any view
+				defer app_destroy(&a)
+				before, found := menu_checked_of(&a, cmd)
+				command_dispatch(cmd, {}, &a, &dummy, t, 10)
+				on, _ := menu_checked_of(&a, cmd)
+				command_dispatch(cmd, {}, &a, &dummy, t, 10)
+				off, _ := menu_checked_of(&a, cmd)
+				ok := found && !before && on && !off
+				fmt.printfln(
+					"  %-6s %-14v check mark: start=%v after one toggle=%v after two=%v (found=%v)",
+					"ok" if ok else "FAIL", label, before, on, off, found,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			// The encoding rows track a VALUE, so the property is exclusivity: after
+			// picking one, that row is checked and the sibling rows are not. A
+			// predicate comparing against the wrong enum member passes an "is it
+			// checked" test on whichever encoding it happens to name.
+			checked_encoding_case :: proc() -> (bad: int) {
+				a: App
+				dummy: plat.Window
+				t: plat.Text
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				u8_before, found := menu_checked_of(&a, .Enc_UTF8)
+				command_dispatch(.Enc_UTF16LE, {}, &a, &dummy, &t, 10)
+				u16_on, _ := menu_checked_of(&a, .Enc_UTF16LE)
+				u8_off, _ := menu_checked_of(&a, .Enc_UTF8)
+				cp_off, _ := menu_checked_of(&a, .Enc_CP1252)
+				ok := found && u8_before && u16_on && !u8_off && !cp_off
+				fmt.printfln(
+					"  %-6s Enc rows are exclusive: UTF8 was %v, after Enc_UTF16LE -> UTF16LE=%v UTF8=%v CP1252=%v",
+					"ok" if ok else "FAIL", u8_before, u16_on, u8_off, cp_off,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			fmt.println("--- check marks track the state they name ---")
+			bad += checked_toggle_case(&t, .Toggle_Wrap, "Toggle_Wrap")
+			bad += checked_toggle_case(&t, .Toggle_Table, "Toggle_Table")
+			bad += checked_encoding_case()
 
 			fmt.printfln("menutest: %d failures", bad)
 			return true
@@ -1434,6 +1698,426 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad longpathtest` — the \\?\ extended-length prefix, in two halves.
+		//
+		// Half one is `plat.long_path_form`'s rule table as pure string assertions.
+		// It is a pure function precisely so this half needs no filesystem, and the
+		// rules are not arbitrary: \\?\ turns path normalization OFF, so a blanket
+		// prefix is worse than the 260-character bug it fixes. Every row here is a
+		// way the naive version breaks something that works today.
+		//
+		// Half two is one real round-trip through a directory nest under %TEMP%
+		// longer than MAX_PATH: mkdir, save through the atomic-write path, stat,
+		// reopen, re-save (the ReplaceFileW branch), delete. That half is what
+		// proves the feature rather than the arithmetic — sabotaging
+		// long_path_form to `return path` makes it fail with real Win32 errors.
+		if os.args[1] == "longpathtest" {
+			// Every non-vacuous case needs a path *longer* than the threshold, or
+			// "unchanged" proves nothing: a short absolute path is left alone too.
+			// `prefix` plus enough directory segments to clear `n` characters, then
+			// a file name — so the result never ends in a separator and the
+			// expected canonical form is a plain concatenation.
+			pad :: proc(prefix: string, n: int) -> string {
+				b := strings.builder_make(context.temp_allocator)
+				strings.write_string(&b, prefix)
+				for strings.builder_len(b) < n {strings.write_string(&b, `abcdefgh\`)}
+				strings.write_string(&b, "f.txt")
+				return strings.to_string(b)
+			}
+			chk :: proc(bad: ^int, label, got, want: string) {
+				ok := got == want
+				if !ok {bad^ += 1}
+				fmt.printfln("  %-34s %s", label, "OK" if ok else "FAIL")
+				if !ok {
+					fmt.printfln("      got  %q", got)
+					fmt.printfln("      want %q", want)
+				}
+			}
+
+			long_path_rules :: proc(chk: proc(bad: ^int, label, got, want: string), pad: proc(prefix: string, n: int) -> string) -> int {
+				bad := 0
+				L :: plat.LONG_PATH_THRESHOLD
+				fmt.println("--- long_path_form: the rule table ---")
+
+				// Relative: \\?\ is invalid on one, so it is returned untouched.
+				// The long case is the one that matters — a short relative path
+				// would be left alone for the length reason alone.
+				chk(&bad, "short relative", plat.long_path_form(`sub\f.txt`), `sub\f.txt`)
+				rel := pad(`sub\`, 300)
+				chk(&bad, "long relative", plat.long_path_form(rel), rel)
+				// Drive-relative ("C:f.txt") and rooted-without-volume ("\f.txt")
+				// are both relative for this purpose: neither names a volume, so
+				// neither can carry the prefix.
+				dr := pad("C:", 300)
+				chk(&bad, "long drive-relative C:x", plat.long_path_form(dr), dr)
+				rooted := pad(`\`, 300)
+				chk(&bad, "long rooted, no volume", plat.long_path_form(rooted), rooted)
+
+				// Short absolute: no need, and keeping it plain keeps ordinary
+				// paths readable in a debugger and in an error dialog.
+				chk(&bad, "short absolute", plat.long_path_form(`C:\a\b.txt`), `C:\a\b.txt`)
+
+				// The threshold boundary, both sides. One under is left alone, one
+				// at it is prefixed; without both, an off-by-one is invisible.
+				under := fmt.tprintf(`C:\%s`, strings.repeat("a", L - 4, context.temp_allocator))
+				at := fmt.tprintf(`C:\%s`, strings.repeat("a", L - 3, context.temp_allocator))
+				chk(&bad, "one under the threshold", plat.long_path_form(under), under)
+				chk(&bad, "exactly at the threshold", plat.long_path_form(at), fmt.tprintf(`\\?\%s`, at))
+
+				// The point of the task.
+				lng := pad(`C:\`, 300)
+				chk(&bad, "long absolute", plat.long_path_form(lng), fmt.tprintf(`\\?\%s`, lng))
+
+				// \\?\ does not treat '/' as a separator, so slashes must be
+				// converted before the prefix goes on. Same path as the row above,
+				// spelled with '/' — so the expected output is identical.
+				fwd, _ := strings.replace_all(lng, `\`, "/", context.temp_allocator)
+				chk(&bad, "forward slashes converted", plat.long_path_form(fwd), fmt.tprintf(`\\?\%s`, lng))
+
+				// ...and it does not resolve '.' or '..' either. Canonicalizing
+				// AFTER prefixing would be too late; this is the ordering trap the
+				// whole helper is arranged around.
+				dots := fmt.tprintf(`C:\a\b\..\.\c\%s`, strings.repeat(`x\`, 130, context.temp_allocator))
+				want_dots := fmt.tprintf(`\\?\C:\a\c\%s`, strings.repeat(`x\`, 130, context.temp_allocator))
+				want_dots = want_dots[:len(want_dots) - 1] // trailing separator collapses away
+				chk(&bad, "dot and dotdot resolved first", plat.long_path_form(dots), want_dots)
+
+				// '..' may not climb out of the volume root; Win32's own
+				// normalizer treats C:\..\x as C:\x rather than as an error.
+				esc := fmt.tprintf(`C:\..\..\a\%s`, strings.repeat(`y\`, 140, context.temp_allocator))
+				want_esc := fmt.tprintf(`\\?\C:\a\%s`, strings.repeat(`y\`, 140, context.temp_allocator))
+				want_esc = want_esc[:len(want_esc) - 1]
+				chk(&bad, "dotdot cannot escape the root", plat.long_path_form(esc), want_esc)
+
+				// UNC takes a different shape entirely: \\?\UNC\server\share, not
+				// \\?\\\server\share.
+				unc := pad(`\\server\share\`, 300)
+				chk(&bad, "UNC becomes \\\\?\\UNC", plat.long_path_form(unc), fmt.tprintf(`\\?\UNC%s`, unc[1:]))
+				// `is_sep` accepts '/' in the lead-in too, so `//server/share/...`
+				// is a UNC path as far as this helper is concerned — and it must
+				// land on the same output as the backslash spelling, not on
+				// `\\?\/server/share`. Nothing in Newtpad produces this shape, but
+				// a path pasted from a URL or a shell script does.
+				unc_fwd, _ := strings.replace_all(unc, `\`, "/", context.temp_allocator)
+				chk(&bad, "UNC with forward slashes", plat.long_path_form(unc_fwd), fmt.tprintf(`\\?\UNC%s`, unc[1:]))
+				// ...and its server and share are root, not components a '..' pops.
+				unc_esc := fmt.tprintf(`\\srv\share\..\..\a\%s`, strings.repeat(`z\`, 140, context.temp_allocator))
+				want_unc := fmt.tprintf(`\\?\UNC\srv\share\a\%s`, strings.repeat(`z\`, 140, context.temp_allocator))
+				want_unc = want_unc[:len(want_unc) - 1]
+				chk(&bad, "dotdot cannot eat the share", plat.long_path_form(unc_esc), want_unc)
+
+				// Idempotent. Checked by pointer identity, not by content: the
+				// requirement is that an already-prefixed path is *returned*, not
+				// rebuilt into something that merely compares equal. The
+				// round-trip's cleanup below depends on this holding even when the
+				// rest of the function is sabotaged.
+				pre := fmt.tprintf(`\\?\%s`, pad(`C:\`, 300))
+				again := plat.long_path_form(pre)
+				same := raw_data(again) == raw_data(pre)
+				fmt.printfln("  %-34s %s", "already prefixed, returned as-is", "OK" if same else "FAIL")
+				if !same {bad += 1}
+
+				return bad
+			}
+
+			long_path_roundtrip :: proc() -> int {
+				bad := 0
+				fmt.println("--- the round trip: a real file past MAX_PATH ---")
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				if tmp == "" {
+					fmt.println("  no %TEMP% in the environment FAIL")
+					return 1
+				}
+
+				// A nest whose full path clears 260 by a comfortable margin, built
+				// from 40-character segments so the count is small and each mkdir
+				// is individually legal.
+				seg := "nplp_0123456789012345678901234567890123"
+				dirs := make([dynamic]string, 0, 16, context.temp_allocator)
+				cur := fmt.tprintf(`%s\nplp_root`, tmp)
+				append(&dirs, cur)
+				for len(cur) < 280 {
+					cur = fmt.tprintf(`%s\%s`, cur, seg)
+					append(&dirs, cur)
+				}
+				deep := cur
+				file := fmt.tprintf(`%s\long.txt`, deep)
+				fmt.printfln("  nest depth %d, deepest directory %d chars, file %d chars", len(dirs), len(deep), len(file))
+				if len(file) <= 260 {
+					fmt.println("  the fixture does not actually exceed MAX_PATH FAIL")
+					return 1
+				}
+
+				// Cleanup prefixes by hand instead of going through
+				// long_path_form. The sabotage run for this test disables that
+				// function, and a cleanup sharing the mechanism under test would
+				// leave a 300-character directory tree behind on exactly the run
+				// that failed — which is the one nobody wants to unpick by hand.
+				// plat.file_delete / dir_remove still route through wide_path, but
+				// the idempotency rule (asserted above) passes an already-prefixed
+				// path straight through, sabotage or not.
+				ext :: proc(p: string) -> string {return fmt.tprintf(`\\?\%s`, p)}
+				defer {
+					plat.file_delete(ext(file))
+					plat.file_delete(ext(fmt.tprintf("%s.newtpad~", file)))
+					plat.file_delete(ext(fmt.tprintf(`%s\replace_a.txt`, deep)))
+					plat.file_delete(ext(fmt.tprintf(`%s\replace_b.txt`, deep)))
+					#reverse for d in dirs {plat.dir_remove(ext(d))}
+					left, _ := plat.path_exists(ext(dirs[0]))
+					fmt.printfln("  cleaned up, anything left behind: %v %s", left, "FAIL" if left else "OK")
+				}
+
+				ERROR_ALREADY_EXISTS :: 183
+				made := 0
+				for d in dirs {
+					if plat.dir_create(d) || plat.last_error() == ERROR_ALREADY_EXISTS {
+						made += 1
+						continue
+					}
+					fmt.printfln("  mkdir failed at depth %d (%d chars), win32 error %d FAIL", made, len(d), plat.last_error())
+					bad += 1
+					break
+				}
+				if made == len(dirs) {
+					fmt.printfln("  created %d directories, deepest %d chars OK", made, len(deep))
+				}
+
+				// The save goes through doc_save_err -> atomic_write_begin/commit,
+				// i.e. temp file + rename, never a held handle on the target. That
+				// is how "never lock the user's file" is honoured and this path
+				// must not stop honouring it because the name got long.
+				body := "long path, first write\n"
+				dup := make([]u8, len(body)) // doc_from_content takes ownership
+				copy(dup, transmute([]u8)body)
+				doc := doc_from_content(dup, "", .UTF8)
+				werr := doc_save_err(&doc, file)
+				doc_close(&doc)
+				fmt.printfln("  atomic save err=%v %s", werr, "OK" if werr == .None else "FAIL")
+				if werr != .None {bad += 1}
+
+				st := plat.file_stamp(file)
+				stat_ok := st.ok && st.size == i64(len(body))
+				fmt.printfln("  stat ok=%v size=%d (want %d) %s", st.ok, st.size, len(body), "OK" if stat_ok else "FAIL")
+				if !stat_ok {bad += 1}
+
+				reopened, ropen := doc_open(file)
+				read_ok := ropen && reopened.pt.length == len(body)
+				fmt.printfln("  reopen ok=%v bytes=%d (want %d) %s", ropen, reopened.pt.length if ropen else -1, len(body), "OK" if read_ok else "FAIL")
+				if !read_ok {bad += 1}
+				if ropen {doc_close(&reopened)}
+
+				// A second save over an existing target takes the ReplaceFileW
+				// branch, which preserves the original's ACLs and alternate data
+				// streams. It falls back to MoveFileExW on failure, so a green
+				// save here would not prove ReplaceFileW accepted the prefix —
+				// hence the direct probe below.
+				body2 := "long path, second write, longer\n"
+				dup2 := make([]u8, len(body2))
+				copy(dup2, transmute([]u8)body2)
+				doc2 := doc_from_content(dup2, "", .UTF8)
+				werr2 := doc_save_err(&doc2, file)
+				doc_close(&doc2)
+				st2 := plat.file_stamp(file)
+				resave_ok := werr2 == .None && st2.ok && st2.size == i64(len(body2))
+				fmt.printfln("  re-save err=%v size=%d (want %d) %s", werr2, st2.size, len(body2), "OK" if resave_ok else "FAIL")
+				if !resave_ok {bad += 1}
+
+				// The canonicalization rules, against the filesystem rather than
+				// against an expected string: the same file named with forward
+				// slashes and a "..\seg" detour. \\?\ resolves neither, so a
+				// helper that prefixed before canonicalizing would hand Win32 a
+				// literal directory named ".." and this stat would fail.
+				detour := fmt.tprintf(`%s/../%s/long.txt`, deep, seg)
+				dst := plat.file_stamp(detour)
+				detour_ok := dst.ok && dst.size == i64(len(body2))
+				fmt.printfln("  stat via '/' and '..' ok=%v size=%d (want %d) %s", dst.ok, dst.size, len(body2), "OK" if detour_ok else "FAIL")
+				if !detour_ok {bad += 1}
+
+				// Direct: does ReplaceFileW itself accept an extended-length path?
+				// If this ever prints false, every long-path save silently loses
+				// the target's ACLs and Zone.Identifier to the MoveFileExW
+				// fallback, which is worth knowing before a user finds out.
+				ra := fmt.tprintf(`%s\replace_a.txt`, deep)
+				rb := fmt.tprintf(`%s\replace_b.txt`, deep)
+				pa := plat.file_write_atomic(ra, transmute([]u8)string("a"))
+				pb := plat.file_write_atomic(rb, transmute([]u8)string("bb"))
+				replaced := pa && pb && plat.file_replace(ra, rb)
+				fmt.printfln("  ReplaceFileW accepts \\\\?\\: %v %s", replaced, "OK" if replaced else "FAIL (saves fall back to MoveFileEx)")
+				if !replaced {bad += 1}
+
+				del := plat.file_delete(file)
+				still_there, _ := plat.path_exists(file)
+				del_ok := del && !still_there
+				fmt.printfln("  delete ok=%v, still present=%v %s", del, still_there, "OK" if del_ok else "FAIL")
+				if !del_ok {bad += 1}
+
+				return bad
+			}
+
+			// Half three: the two boundaries that are *not* 260. Both are invisible
+			// to the round trip above, which sits at 283/292 characters where
+			// everything in sight is prefixed and every limit is long behind it.
+			//
+			//  - **248, the directory cap.** Win32 reserves twelve characters inside
+			//    a directory for an 8.3 name it may have to generate there, so a
+			//    plain CreateDirectoryW refuses at 248 while a plain CreateFileW is
+			//    content to 259. That asymmetry, not any margin against MAX_PATH, is
+			//    why LONG_PATH_THRESHOLD is 248; raising it breaks mkdir for the
+			//    lengths 248-258 while every file operation keeps working.
+			//
+			//  - **239-247, where a save's two paths disagree.** The target is under
+			//    the threshold and its ".newtpad~" temp is over it, so
+			//    atomic_write_commit hands ReplaceFileW a *plain* destination and a
+			//    `\\?\` source. Win32 resolves the two arguments independently and
+			//    it works — but nothing said so until this fixture, and if it were
+			//    ever untrue, every save of a file whose name lands in that
+			//    nine-character window would fall through to MoveFileExW and quietly
+			//    drop the target's ACLs and Zone.Identifier. That is the precise loss
+			//    the direct ReplaceFileW probe was added to rule out, so ruling it
+			//    out at 292 characters only is ruling it out where it cannot happen.
+			long_path_boundary :: proc() -> int {
+				bad := 0
+				fmt.println("--- the 248 and 239-247 boundaries ---")
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				if tmp == "" {
+					fmt.println("  no %TEMP% in the environment FAIL")
+					return 1
+				}
+				// Cleanup prefixes by hand, for the same reason the round trip does:
+				// the sabotage runs disable long_path_form, and a cleanup sharing the
+				// mechanism under test leaves the mess behind on exactly the run that
+				// failed.
+				ext :: proc(p: string) -> string {return fmt.tprintf(`\\?\%s`, p)}
+				// One component of exactly the length needed, so the parent is always
+				// short and the only variable in the call is the length of the string
+				// handed to CreateDirectoryW.
+				fill :: proc(parent: string, total: int, c: string) -> string {
+					n := total - len(parent) - 1
+					if n < 1 || n > 255 {return ""}
+					return fmt.tprintf(`%s\%s`, parent, strings.repeat(c, n, context.temp_allocator))
+				}
+
+				// 248 written out, deliberately **not** plat.LONG_PATH_THRESHOLD:
+				// this is a fact about Win32, not about our constant. Deriving the
+				// fixture from the constant would move the fixture with it and the
+				// row would stay green through exactly the change it exists to
+				// catch — verified, that is what the first version of it did.
+				DIR_MAX_PLAIN :: 248
+				// Mid-window, so a character of drift either way keeps the target
+				// plain and its 252-character temp prefixed. Both ends are asserted
+				// below anyway.
+				MIXED_TARGET :: 243
+				root := fmt.tprintf(`%s\nplp_bound`, tmp)
+				d248 := fill(root, DIR_MAX_PLAIN, "d")
+				save := fill(root, MIXED_TARGET, "s") // the real save target
+				save_tmp := fmt.tprintf("%s.newtpad~", save)
+				pa := fill(root, MIXED_TARGET, "a") // the direct-probe pair
+				pb := fmt.tprintf("%s.newtpad~", pa)
+				if len(d248) != DIR_MAX_PLAIN || len(save) != MIXED_TARGET {
+					fmt.printfln("  fixture arithmetic failed: root is %d chars FAIL", len(root))
+					return 1
+				}
+
+				defer {
+					plat.file_delete(ext(save))
+					plat.file_delete(ext(save_tmp))
+					plat.file_delete(ext(pa))
+					plat.file_delete(ext(pb))
+					plat.dir_remove(ext(d248))
+					plat.dir_remove(ext(root))
+					left, _ := plat.path_exists(ext(root))
+					fmt.printfln("  cleaned up, anything left behind: %v %s", left, "FAIL" if left else "OK")
+				}
+
+				ERROR_ALREADY_EXISTS :: 183
+				if !plat.dir_create(root) && plat.last_error() != ERROR_ALREADY_EXISTS {
+					fmt.printfln("  could not create the %d-char root, win32 error %d FAIL", len(root), plat.last_error())
+					return 1
+				}
+
+				// The row. Plain, this call fails with ERROR_FILENAME_EXCED_RANGE
+				// (206), so it passes only because the prefix went on — and it goes
+				// red the moment the threshold is raised above 248.
+				dok := plat.dir_create(d248)
+				derr := plat.last_error()
+				if !dok && derr == ERROR_ALREADY_EXISTS {dok = true}
+				if dok {
+					fmt.printfln("  dir_create at exactly %d chars OK", len(d248))
+				} else {
+					fmt.printfln("  dir_create at exactly %d chars failed, win32 error %d FAIL", len(d248), derr)
+					bad += 1
+				}
+
+				// The pair really is mixed. Asserted, not assumed: a threshold change
+				// or a longer %TEMP% would otherwise leave everything below green
+				// while testing two prefixed paths, which the round trip already
+				// covers.
+				dst_plain := plat.long_path_form(save) == save
+				tmp_pref := plat.long_path_form(save_tmp) != save_tmp
+				mixed := dst_plain && tmp_pref
+				fmt.printfln(
+					"  target %d chars plain=%v, temp %d chars prefixed=%v %s",
+					len(save),
+					dst_plain,
+					len(save_tmp),
+					tmp_pref,
+					"OK" if mixed else "FAIL (the fixture is no longer a mixed pair)",
+				)
+				if !mixed {bad += 1}
+
+				// A real save through doc_save_err, twice: the first creates the
+				// target (no destination yet, so the rename), the second replaces it.
+				body := "boundary save, first write\n"
+				dup := make([]u8, len(body))
+				copy(dup, transmute([]u8)body)
+				doc := doc_from_content(dup, "", .UTF8)
+				werr := doc_save_err(&doc, save)
+				doc_close(&doc)
+				st1 := plat.file_stamp(save)
+				create_ok := werr == .None && st1.ok && st1.size == i64(len(body))
+				fmt.printfln("  create-save err=%v size=%d (want %d) %s", werr, st1.size, len(body), "OK" if create_ok else "FAIL")
+				if !create_ok {bad += 1}
+
+				body2 := "boundary save, second write, over an existing target\n"
+				dup2 := make([]u8, len(body2))
+				copy(dup2, transmute([]u8)body2)
+				doc2 := doc_from_content(dup2, "", .UTF8)
+				werr2 := doc_save_err(&doc2, save)
+				doc_close(&doc2)
+				st2 := plat.file_stamp(save)
+				resave_ok := werr2 == .None && st2.ok && st2.size == i64(len(body2))
+				fmt.printfln("  replace-save err=%v size=%d (want %d) %s", werr2, st2.size, len(body2), "OK" if resave_ok else "FAIL")
+				if !resave_ok {bad += 1}
+
+				// ...and *which branch* that second save took, because a green save
+				// proves nothing on its own: the MoveFileExW fallback also returns
+				// .None, and does it while discarding the ACLs. atomic_write_commit
+				// takes ReplaceFileW exactly when GetFileAttributesW sees the plain
+				// destination and file_replace then succeeds, so both halves are
+				// checked here against real Win32, at the real lengths, with a pair
+				// built the same way the save builds its own.
+				wa := plat.file_write_atomic(pa, transmute([]u8)string("a"))
+				wb := plat.file_write_atomic(pb, transmute([]u8)string("bb"))
+				replaced := wa && wb && plat.file_replace(pa, pb)
+				branch := st2.ok && replaced
+				fmt.printfln(
+					"  replace-save took ReplaceFileW: dst visible=%v, ReplaceFileW(plain, \\\\?\\)=%v %s",
+					st2.ok,
+					replaced,
+					"OK" if branch else "FAIL (every save in the 239-247 window falls back to MoveFileEx)",
+				)
+				if !branch {bad += 1}
+
+				return bad
+			}
+
+			bad := long_path_rules(chk, pad)
+			bad += long_path_roundtrip()
+			bad += long_path_boundary()
+			fmt.printfln("longpathtest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad drawcount <file>` measures what a frame actually costs in draw
 		// calls, because the claim "an always-on line-number gutter roughly doubles
 		// per-frame draw calls" was arithmetic from constants, not a measurement, and
@@ -1614,16 +2298,223 @@ when NEWTPAD_TESTS {
 				return true
 			}
 			samples := "aé中がx́\t" // ascii, 2-byte latin, CJK x2, kana, ascii, combining acute, tab
-			fmt.printfln("tab = %d cells (want %d, and must draw no glyph)", plat.text_cell_width(&t, '\t'), plat.TAB_CELLS)
-			fmt.printf("cells: ")
-			for r in samples {fmt.printf("%q=%d ", r, plat.text_cell_width(&t, r))}
-			bytes := transmute([]u8)samples
-			fmt.printfln(" | total=%d cells over %d bytes", plat.text_cells(&t, bytes), len(bytes))
-			// inverse: the byte offset at each cell column should round-trip.
-			total := plat.text_cells(&t, bytes)
-			fmt.printf("col->byte: ")
-			for c in 0 ..= total {fmt.printf("%d:%d ", c, plat.text_bytes_for_cells(&t, bytes, c))}
+			// A DUMP, not an assertion -- celltest has no failure count and never
+			// had one. The old form printed the advance at column 0 against
+			// text_tab_width and read like a check, but those two are equal at
+			// column 0 under fixed-width tabs and under true tab stops alike, so
+			// it could not fail. The advance across a full period is at least
+			// legible to an eye; the assertions live in tabstoptest.
+			fmt.printf("tab advance by column (width %d, and it must draw no glyph): ", plat.text_tab_width(&t))
+			for c in 0 ..< 2 * plat.text_tab_width(&t) {fmt.printf("%d:%d ", c, plat.text_cell_width_at(&t, '\t', c))}
 			fmt.println()
+			fmt.printf("cells: ")
+			// A running column, not 0 per rune: this walks `samples` from its
+			// start, so each rune's real column is available, and the per-rune
+			// widths printed here must sum to the text_cells total printed on
+			// the next line.
+			scol := 0
+			for r in samples {
+				w := plat.text_cell_width_at(&t, r, scol)
+				fmt.printf("%q=%d ", r, w)
+				scol += w
+			}
+			bytes := transmute([]u8)samples
+			// col0 = 0 throughout: `samples` is a standalone string measured from
+			// its own start, which is also the origin the per-rune walk above used.
+			fmt.printfln(" | total=%d cells over %d bytes", plat.text_cells(&t, bytes, 0), len(bytes))
+			// inverse: the byte offset at each cell column should round-trip.
+			total := plat.text_cells(&t, bytes, 0)
+			fmt.printf("col->byte: ")
+			for c in 0 ..= total {fmt.printf("%d:%d ", c, plat.text_bytes_for_cells(&t, bytes, c, 0))}
+			fmt.println()
+			return true
+		}
+
+		// `newtpad tabstoptest` proves a tab is an ADVANCE TO THE NEXT STOP, not
+		// a fixed width. The one property worth asserting is that THE SAME RUNE
+		// MEASURES DIFFERENTLY AT DIFFERENT COLUMNS -- a check that only ever
+		// measures a tab at column 0 returns 4 under fixed-width tabs and under
+		// true tab stops alike, so it cannot fail and proves nothing. That is
+		// not a hypothetical: every tab in every fixture of the other ten
+		// headless suites is a LEADING tab, which is why sabotaging the tab
+		// branch to real tab stops moved only two lines of `celltest` and left
+		// the other nine suites byte-identical (measured twice, independently,
+		// during batch 7 task 1).
+		//
+		// So the cases below come in pairs wherever possible: a column where the
+		// two behaviours agree (0, 4, 8) to pin the wrap-around, and a column
+		// where they cannot (1, 2, 3, 5) to make the check fail if the advance
+		// ever goes back to being constant.
+		if os.args[1] == "tabstoptest" {
+			bad := 0
+			fmt.println("tabstoptest:")
+
+			chk :: proc(label: string, got, want: int, bad: ^int) {
+				ok := got == want
+				fmt.printfln("  %-6s %-72s got=%d want=%d", "ok" if ok else "FAIL", label, got, want)
+				if !ok {bad^ += 1}
+			}
+
+			// --- the advance itself -------------------------------------------
+			tab_test_advance :: proc(chk: proc(string, int, int, ^int), bad: ^int) {
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("  FAIL tabstoptest: no fonts loaded")
+					bad^ += 1
+					return
+				}
+				fmt.println("--- the advance, tab_width=4 ---")
+				chk("text_tab_width after text_load_faces", plat.text_tab_width(&t), 4, bad)
+				// 0 and 4 are 4 under BOTH behaviours; 1/2/3/5/6/7 cannot be.
+				chk("'\\t' at col 0", plat.text_cell_width_at(&t, '\t', 0, .Doc), 4, bad)
+				chk("'\\t' at col 1", plat.text_cell_width_at(&t, '\t', 1, .Doc), 3, bad)
+				chk("'\\t' at col 2", plat.text_cell_width_at(&t, '\t', 2, .Doc), 2, bad)
+				chk("'\\t' at col 3", plat.text_cell_width_at(&t, '\t', 3, .Doc), 1, bad)
+				chk("'\\t' at col 4 (wraps back to a full stop)", plat.text_cell_width_at(&t, '\t', 4, .Doc), 4, bad)
+				chk("'\\t' at col 5", plat.text_cell_width_at(&t, '\t', 5, .Doc), 3, bad)
+				chk("'\\t' at col 7", plat.text_cell_width_at(&t, '\t', 7, .Doc), 1, bad)
+				chk("'\\t' at col 8", plat.text_cell_width_at(&t, '\t', 8, .Doc), 4, bad)
+				// The advance is never 0 at any column -- a 0 is not a wrong
+				// number on screen, it is a non-terminating measuring loop.
+				min_adv := max(int)
+				for c in 0 ..< 64 {min_adv = min(min_adv, plat.text_cell_width_at(&t, '\t', c, .Doc))}
+				chk("smallest advance over columns 0..63 (0 would hang the walks)", min_adv, 1, bad)
+				// The tab must never be served from cell_cache, which is keyed by
+				// rune alone: measure at 0 FIRST, then at 2. If the early return
+				// ever moves below the cache lookup, the second call returns the
+				// cached 4 and this fails.
+				_ = plat.text_cell_width_at(&t, '\t', 0, .Doc)
+				chk("'\\t' at col 2 after one at col 0 (cell_cache must not serve tabs)", plat.text_cell_width_at(&t, '\t', 2, .Doc), 2, bad)
+			}
+			tab_test_advance(chk, &bad)
+
+			// --- the three wrappers actually thread col0 ----------------------
+			// This is the item that task 1's sweep stopped one level short of:
+			// text_cells / text_bytes_for_cells / text_span_cells each hardcoded
+			// an origin of 0 internally, so a mid-row fragment measured its tabs
+			// from the wrong place even though every DIRECT caller of
+			// text_cell_width_at was correct.
+			tab_test_wrappers :: proc(chk: proc(string, int, int, ^int), bad: ^int) {
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("  FAIL tabstoptest: no fonts loaded")
+					bad^ += 1
+					return
+				}
+				s := "ab\tcd"
+				fmt.println("--- text_cells ---")
+				// "a\tb" is 1 + 3 + 1 = 5 under tab stops and 1 + 4 + 1 = 6 under
+				// a fixed four, so it discriminates -- the batch-7 plan says this
+				// case "cannot fail", and that is arithmetic the plan got wrong.
+				chk(`text_cells "a\tb" @0`, plat.text_cells(&t, transmute([]u8)string("a\tb"), 0, .Doc), 5, bad)
+				chk(`text_cells "ab\tc" @0`, plat.text_cells(&t, transmute([]u8)string("ab\tc"), 0, .Doc), 5, bad)
+				chk(`text_cells "abc\td" @0`, plat.text_cells(&t, transmute([]u8)string("abc\td"), 0, .Doc), 5, bad)
+				chk(`text_cells "abcd\te" @0 (agrees with fixed-4; pins the wrap)`, plat.text_cells(&t, transmute([]u8)string("abcd\te"), 0, .Doc), 9, bad)
+				chk(`text_cells "\t\t" @0`, plat.text_cells(&t, transmute([]u8)string("\t\t"), 0, .Doc), 8, bad)
+				// The same slice, four origins, four answers. A wrapper that
+				// ignores col0 returns 4 for all of them.
+				chk(`text_cells "\t" @0`, plat.text_cells(&t, transmute([]u8)string("\t"), 0, .Doc), 4, bad)
+				chk(`text_cells "\t" @1`, plat.text_cells(&t, transmute([]u8)string("\t"), 1, .Doc), 3, bad)
+				chk(`text_cells "\t" @2`, plat.text_cells(&t, transmute([]u8)string("\t"), 2, .Doc), 2, bad)
+				chk(`text_cells "\t" @3`, plat.text_cells(&t, transmute([]u8)string("\t"), 3, .Doc), 1, bad)
+				chk(`text_cells "ab\tcd" @0`, plat.text_cells(&t, transmute([]u8)s, 0, .Doc), 6, bad)
+				chk(`text_cells "ab\tcd" @1 (same bytes, different origin)`, plat.text_cells(&t, transmute([]u8)s, 1, .Doc), 5, bad)
+
+				fmt.println("--- text_span_cells ---")
+				// "cd" inside "ab\tcd": the tab occupies columns 2-3, so the span
+				// starts at column 4. Under a fixed four it would start at 6.
+				c0, n0 := plat.text_span_cells(&t, s, 3, 2, 0, .Doc)
+				chk(`text_span_cells "ab\tcd" [3,5) @0 -> col`, c0, 4, bad)
+				chk(`text_span_cells "ab\tcd" [3,5) @0 -> cells`, n0, 2, bad)
+				c1, n1 := plat.text_span_cells(&t, s, 3, 2, 1, .Doc)
+				chk(`text_span_cells "ab\tcd" [3,5) @1 -> col (origin threaded)`, c1, 3, bad)
+				chk(`text_span_cells "ab\tcd" [3,5) @1 -> cells`, n1, 2, bad)
+
+				fmt.println("--- seam: the three wrappers agree with each other ---")
+				// text_span_cells' `col` IS text_cells over the prefix, and
+				// text_bytes_for_cells is text_cells' inverse. All three walk the
+				// same runes, so all three must see the same column sequence --
+				// this is the check that catches a consumer (or a wrapper) that
+				// forgot to thread the origin, which a unit test of the advance
+				// alone cannot.
+				// Counted separately from `bad` so this line reports on ITSELF and
+				// not on whatever failed above it -- a summary that reads the
+				// shared counter turns green only when the whole mode is green,
+				// which makes it useless as a signal about the seam.
+				seam_bad := 0
+				for col0 in 0 ..< 5 {
+					for p in 0 ..= len(s) {
+						if p > 0 && p < len(s) && (s[p] & 0xC0) == 0x80 {continue} // rune boundaries only
+						pref := plat.text_cells(&t, transmute([]u8)s[:p], col0, .Doc)
+						back := plat.text_bytes_for_cells(&t, transmute([]u8)s, pref, col0, .Doc)
+						if back != p {
+							fmt.printfln("  FAIL   round-trip @col0=%d prefix=%d -> %d cells -> byte %d", col0, p, pref, back)
+							seam_bad += 1
+						}
+						if p < len(s) {
+							sc, _ := plat.text_span_cells(&t, s, p, len(s) - p, col0, .Doc)
+							if sc != pref {
+								fmt.printfln("  FAIL   text_span_cells col=%d disagrees with text_cells prefix=%d @col0=%d", sc, pref, col0)
+								seam_bad += 1
+							}
+						}
+					}
+				}
+				bad^ += seam_bad
+				// Known limit, stated so nobody reads more into a green line than
+				// is there: this catches a consumer that threads the origin
+				// INCONSISTENTLY across the three wrappers. It does NOT catch all
+				// three dropping col0 together -- they stay mutually consistent,
+				// just wrong -- which is what the "@1 / @2 / @3" value checks
+				// above are for.
+				fmt.printfln("  %-6s cells<->bytes<->span agree for every prefix of %q at origins 0..4", "ok" if seam_bad == 0 else "FAIL", s)
+			}
+			tab_test_wrappers(chk, &bad)
+
+			// --- the setting, and its clamp -----------------------------------
+			tab_test_width_setting :: proc(chk: proc(string, int, int, ^int), bad: ^int) {
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("  FAIL tabstoptest: no fonts loaded")
+					bad^ += 1
+					return
+				}
+				fmt.println("--- tab_width is configurable ---")
+				plat.text_set_tab_width(&t, 8)
+				chk("text_tab_width after set(8)", plat.text_tab_width(&t), 8, bad)
+				chk("'\\t' at col 0, width 8", plat.text_cell_width_at(&t, '\t', 0, .Doc), 8, bad)
+				chk("'\\t' at col 1, width 8", plat.text_cell_width_at(&t, '\t', 1, .Doc), 7, bad)
+				chk(`text_cells "a\tb" @0, width 8`, plat.text_cells(&t, transmute([]u8)string("a\tb"), 0, .Doc), 9, bad)
+				plat.text_set_tab_width(&t, 2)
+				chk(`text_cells "abc\td" @0, width 2`, plat.text_cells(&t, transmute([]u8)string("abc\td"), 0, .Doc), 5, bad)
+
+				fmt.println("--- the clamp, which is a hang guard and not cosmetic ---")
+				// A spacing of 0 makes the advance 0, and every measuring loop in
+				// platform and program advances by exactly that -- so an
+				// unclamped 0 is a frozen UI, not a layout glitch.
+				plat.text_set_tab_width(&t, 0)
+				chk("set(0) clamps up to TAB_WIDTH_MIN", plat.text_tab_width(&t), plat.TAB_WIDTH_MIN, bad)
+				zero_adv := max(int)
+				for c in 0 ..< 16 {zero_adv = min(zero_adv, plat.text_cell_width_at(&t, '\t', c, .Doc))}
+				chk("after set(0), the smallest advance is still >= 1", zero_adv, 1, bad)
+				// And the loops really do terminate at the clamped width.
+				chk(`text_cells "\t\t\t" after set(0)`, plat.text_cells(&t, transmute([]u8)string("\t\t\t"), 0, .Doc), 3, bad)
+				plat.text_set_tab_width(&t, -5)
+				chk("set(-5) clamps up to TAB_WIDTH_MIN", plat.text_tab_width(&t), plat.TAB_WIDTH_MIN, bad)
+				plat.text_set_tab_width(&t, 999)
+				chk("set(999) clamps down to TAB_WIDTH_MAX", plat.text_tab_width(&t), plat.TAB_WIDTH_MAX, bad)
+
+				// Zero-is-initialization: a Text that never reached
+				// text_load_faces reads tab_width 0 straight out of the struct,
+				// and 0 is the one value that hangs. text_tab_width must hand
+				// back the default instead of the raw field.
+				raw: plat.Text
+				chk("a zero-valued Text reports the default width", plat.text_tab_width(&raw), plat.TAB_WIDTH_DEFAULT, bad)
+				chk("a zero-valued Text still advances a tab at col 2", plat.text_cell_width_at(&raw, '\t', 2, .Doc), 2, bad)
+			}
+			tab_test_width_setting(chk, &bad)
+
+			fmt.printfln("tabstoptest: %d failures", bad)
 			return true
 		}
 
@@ -1705,7 +2596,8 @@ when NEWTPAD_TESTS {
 			if !c0 {fail = true}
 			fmt.printfln("  %-6s ascii row: bytes [%d,%d) pad=%d ok=%v", "ok" if c0 else "FAIL", b0lo, b0hi, pad0, ok0)
 
-			// Row 1's leading tab is one byte spanning TAB_CELLS=4 cells, so cell 2
+			// Row 1's leading tab is one byte spanning 4 cells (it starts at
+			// column 0, so it advances a full tab_width), so cell 2
 			// falls INSIDE it. The tab is included whole (a partial glyph has no
 			// byte form), pulling byte_lo back to the tab's own start (byte 0) --
 			// the rectangle ends up covering cells [0,6) worth of content in only
@@ -3570,9 +4462,9 @@ when NEWTPAD_TESTS {
 			// AF: LOW 1 -- Backspace over a multi-cell rune (a leading tab) must
 			// land the rectangle at the column the deletion actually reached, not
 			// cell_lo-1. Reviewer's exact probe: "\tabc\n\tdef\n", rectangle at
-			// cell 4 (zero-width, both rows identical) -- the tab is TAB_CELLS
-			// wide (4), so deleting it drops the rectangle back to column 0, not
-			// column 3. A stale column 3 would pad three stray spaces onto every
+			// cell 4 (zero-width, both rows identical) -- the tab starts at
+			// column 0 so it is 4 cells wide, and deleting it drops the
+			// rectangle back to column 0, not column 3. A stale column 3 would pad three stray spaces onto every
 			// row on the very next keystroke.
 			//
 			// Sabotage (per task): restore `new_cell` to a flat `cell_lo - 1` in
@@ -4468,6 +5360,97 @@ when NEWTPAD_TESTS {
 			}
 			if block_test_history_jump_blocked_in_table(&t) > 0 {fail = true}
 
+			// --- batch 7: a tab that is NOT at column 0 -------------------------
+			// Every tab in every fixture above this line is a LEADING tab, and a
+			// tab at column 0 is 4 cells under fixed-width tabs and under true
+			// tab stops alike -- so none of them can see the difference. These
+			// three use "ab\tcd", where the tab starts at column 2 and is
+			// therefore 2 cells wide, not 4.
+			//
+			// AR: block_row_range, the one procedure that turns cells into bytes.
+			// Sabotage: make the tab branch of text_cell_width_at return a
+			// constant 4 again and this FAILS -- cell 4 then lands inside the
+			// tab (which would span columns 2..5), so byte_lo is pulled back to
+			// the tab's own start at byte 2 instead of naming 'c' at byte 3.
+			block_test_ar :: proc(t: ^plat.Text) -> bool {
+				rdoc := doc_from_content(transmute([]u8)strings.clone("ab\tcd\n"), "", .UTF8)
+				defer doc_close(&rdoc)
+				rdoc.wrap = false
+				// Columns: a=0 b=1 tab=2..3 c=4 d=5.
+				lo1, hi1, pad1, ok1 := block_row_range(&rdoc, t, 0, 4, 6) // "cd"
+				lo2, hi2, _, ok2 := block_row_range(&rdoc, t, 0, 2, 4) // the tab itself
+				cAR := ok1 && lo1 == 3 && hi1 == 5 && pad1 == 0 && ok2 && lo2 == 2 && hi2 == 3
+				fmt.printfln(
+					"  %-6s TAB STOPS: \"ab\\tcd\" cells [4,6)->bytes [%d,%d) (want [3,5)) and cells [2,4)->bytes [%d,%d) (want [2,3))",
+					"ok" if cAR else "FAIL", lo1, hi1, lo2, hi2,
+				)
+				return cAR
+			}
+			if !block_test_ar(&t) {fail = true}
+
+			// AS: block_delete's caret column, the second of the two
+			// keystroke-reachable wrapper bugs the task-1 review found. The
+			// rectangle is zero-width at cell 4, Backspace deletes the whole tab
+			// (columns 2..3), and the rectangle must land at column 2.
+			//
+			// Sabotage: restore `new_cell = cell_lo - plat.text_cells(t, buf, 0)`
+			// -- the pre-batch-7 form, whose origin of 0 measures the tab as 4 --
+			// and this FAILS with both cells reading 0: the caret jumps to the
+			// start of every row.
+			block_test_as :: proc(t: ^plat.Text) -> bool {
+				sdoc := doc_from_content(transmute([]u8)strings.clone("ab\tcd\nab\tcd\n"), "", .UTF8)
+				defer doc_close(&sdoc)
+				sdoc.wrap = false
+				sdoc.block = true
+				sdoc.block_anchor_line_start, sdoc.block_anchor_cell = 0, 4
+				sdoc.block_cursor_line_start, sdoc.block_cursor_cell = 6, 4 // second row's line start
+				oks := block_delete(&sdoc, t, false)
+				got := doc_debug_string(&sdoc)
+				cAS := oks && got == "abcd\nabcd\n" && sdoc.block_anchor_cell == 2 && sdoc.block_cursor_cell == 2
+				fmt.printfln(
+					"  %-6s TAB STOPS: backspace over a mid-line tab lands at column 2 (the tab's own start), not 0: content=%q (want %q) cells=%d,%d (want 2,2)",
+					"ok" if cAS else "FAIL", got, "abcd\\nabcd\\n", sdoc.block_anchor_cell, sdoc.block_cursor_cell,
+				)
+				return cAS
+			}
+			if !block_test_as(&t) {fail = true}
+
+			// AT: block_replace's caret column, the first of the two. Pressing
+			// Tab inside a zero-width rectangle at cell 2 inserts a tab that
+			// advances to column 4, not to 2+4=6. Driven through the real
+			// command table so it crosses commands.odin's .Insert_Tab branch the
+			// way a keystroke does.
+			//
+			// Sabotage: pass 0 instead of cell_lo as text_cells' origin in
+			// block_replace and this FAILS with both cells reading 6 -- and the
+			// next keystroke would then pad two stray spaces onto every row.
+			block_test_at :: proc(t: ^plat.Text) -> bool {
+				ta: App
+				tdummy: plat.Window
+				app_new_scratch(&ta)
+				td := app_active(&ta)
+				doc_close(td)
+				td^ = doc_from_content(transmute([]u8)strings.clone("abcd\nabcd\n"), "", .UTF8)
+				td.wrap = false
+				td.anchor, td.cursor = 0, 0
+				refusal := block_set_from_points(td, t, 0, 2, 5, 2)
+				tab_cmd := resolve_key(.Tab, false, false, .Editor)
+				command_dispatch(tab_cmd, {.Tab, false, false, false}, &ta, &tdummy, t, 10)
+				after := doc_debug_string(td)
+				cAT :=
+					refusal == .None &&
+					after == "ab\tcd\nab\tcd\n" &&
+					td.block_anchor_cell == 4 &&
+					td.block_cursor_cell == 4
+				fmt.printfln(
+					"  %-6s TAB STOPS: Tab inside a rectangle at cell 2 leaves it at column 4, not 6: after=%q (want %q) cells=%d,%d (want 4,4)",
+					"ok" if cAT else "FAIL", after, "ab\\tcd\\nab\\tcd\\n", td.block_anchor_cell, td.block_cursor_cell,
+				)
+				app_destroy(&ta)
+				return cAT
+			}
+			if !block_test_at(&t) {fail = true}
+
 			// SEAM PROOF: the assertion the previous round's clipboard fix
 			// lacked. block_test_an (above) only proves block_test_ai's OWN
 			// save/restore works; it says nothing about block_test_t,
@@ -4698,6 +5681,51 @@ when NEWTPAD_TESTS {
 						fmt.printfln("  target %q %s", got, "OK" if tok else "FAIL")
 						if !tok {bad += 1}
 					}
+				}
+			}
+
+			fmt.println("--- a link that starts after a MID-LINE tab ---")
+			// The seam check above puts the link after a plain space, so its
+			// column is the same under fixed-width tabs and true tab stops --
+			// like every other tab in every other suite, it cannot see the
+			// difference. Here "see" fills columns 0-2, the tab at column 3
+			// advances ONE cell to reach the stop at 4, and the link starts
+			// there. Under a fixed four the tab would be 4 wide and the link
+			// would start at column 7.
+			//
+			// This is text_span_cells' only non-leading-tab fixture, and it is a
+			// seam check as well as a value check: the same col/cells drive the
+			// drawn underline and links_hit, so the boundary probes below fail
+			// if either one drifts. Sabotage the tab branch of
+			// text_cell_width_at back to a constant and col prints 7.
+			{
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				url := "https://example.com/x"
+				td := doc_from_content(transmute([]u8)strings.clone("see\thttps://example.com/x now\n"), "", .UTF8)
+				defer doc_close(&td)
+				td.wrap = false
+				td.view_cols = 200
+				td.view_rows = 10
+				hits := links_layout(&td, &tt, 10)
+				if len(hits) != 1 {
+					fmt.printfln("  FAIL: expected 1 hit, got %d", len(hits))
+					bad += 1
+				} else {
+					h := hits[0]
+					cw := plat.text_char_width(&tt, BASE_PX, .Doc)
+					px := BASE_PX
+					yy := row_baseline_y(px, h.row) - line_height(px) * 0.5
+					_, i1 := links_hit(hits, px, cw, col_x(cw, h.col) + cw * 0.5, yy)
+					_, i2 := links_hit(hits, px, cw, col_x(cw, h.col + h.cells - 1) + cw * 0.5, yy)
+					_, o1 := links_hit(hits, px, cw, col_x(cw, h.col - 1) + cw * 0.5, yy)
+					_, o2 := links_hit(hits, px, cw, col_x(cw, h.col + h.cells) + cw * 0.5, yy)
+					ok := h.col == 4 && h.cells == len(url) && i1 && i2 && !o1 && !o2
+					fmt.printfln(
+						"  col=%d (want 4; a fixed-4 tab gives 7) cells=%d/%d  first=%v last=%v before=%v after=%v %s",
+						h.col, h.cells, len(url), i1, i2, o1, o2, "OK" if ok else "FAIL",
+					)
+					if !ok {bad += 1}
 				}
 			}
 
@@ -5084,6 +6112,68 @@ when NEWTPAD_TESTS {
 					}
 				}
 			}
+			// The same seam on a line containing TABS, which is the case the
+			// ASCII fixture above structurally cannot see: there cell index ==
+			// byte index, so line_cell_col and line_offset_at_cell agree even if
+			// neither understands a tab stop. Batch 7's design named this pair --
+			// "the row measure/hit-test pair, which must agree or the caret
+			// drifts" -- and every other tab fixture in the tree measures the
+			// platform layer, not this one. Round-trip every byte offset in the
+			// row: offset -> cell -> offset must be a fixed point at each one.
+			{
+				tline := "ab\tcd\te\t\tfghi\tj" // tabs at 2, 5, 7, 8, 13
+				tcontent := strings.concatenate({tline, "\n"})
+				tdoc := doc_from_content(transmute([]u8)tcontent, "", .UTF8)
+				defer doc_close(&tdoc)
+				tdoc.wrap = false
+				tdoc.view_cols = 80
+				tdoc.view_rows = 5
+				le := len(tline)
+				for off in 0 ..= le {
+					cell := line_cell_col(&tdoc, &t, 0, off)
+					back := line_offset_at_cell(&tdoc, &t, 0, le, cell)
+					if back != off {
+						fmt.printfln("  FAIL tab seam: off=%d -> cell=%d -> off=%d", off, cell, back)
+						bad += 1
+					}
+				}
+				// And the drawn column must be strictly increasing across the row:
+				// a tab that returned 0 cells would stall the caret on two offsets.
+				prev := -1
+				for off in 0 ..= le {
+					c := line_cell_col(&tdoc, &t, 0, off)
+					if c <= prev {
+						fmt.printfln("  FAIL tab seam: column not increasing at off=%d (%d <= %d)", off, c, prev)
+						bad += 1
+					}
+					prev = c
+				}
+				// The round-trip above is NOT enough on its own, and finding that
+				// out is why these value assertions exist: line_cell_col and
+				// line_offset_at_cell are inverses whatever a tab measures, so
+				// reverting to fixed-width tabs leaves the round-trip green (tried
+				// it -- 0 failures). Only absolute columns discriminate. At width 4
+				// these are the tab stops; under fixed-width-4 the same offsets read
+				// 6, 12, 17, 21, 21, so every row below moves.
+				for pair in ([][2]int {
+					{2, 2}, // the first tab starts at column 2
+					{3, 4}, // ...and advances to the stop, not by a full 4
+					{5, 6},
+					{6, 8}, // second tab: 6 -> 8
+					{7, 9},
+					{8, 12}, // a tab at 9 advances 3 to reach 12
+					{9, 16}, // a tab sitting exactly on a stop advances a full 4
+					{14, 24},
+				}) {
+					off, want := pair[0], pair[1]
+					got := line_cell_col(&tdoc, &t, 0, off)
+					if got != want {
+						fmt.printfln("  FAIL tab seam: col at off=%d is %d, want %d", off, got, want)
+						bad += 1
+					}
+				}
+			}
+
 			// Wrapping disables horizontal scroll (H_SCROLL forced to 0).
 			doc.wrap = true
 			doc.h_scroll = 100
@@ -5545,6 +6635,182 @@ when NEWTPAD_TESTS {
 			}
 			bad += reopen_cap_case(u8f)
 
+			// The cap must read the file's size NOW, not doc.disk_stamp.size. The
+			// stamp is 0 when the last stat failed and stale on a restored dirty
+			// tab, and both cases read as "small" -- which is the direction that
+			// hurts, because the cap exists to refuse a multi-second synchronous
+			// transcode. A stamp claiming 0 against a file that is really over the
+			// cap must still refuse.
+			//
+			// The stamp is falsified rather than reproduced: a dropped share and a
+			// session restored across a file that grew are both unreachable from a
+			// headless test, and the stamp is the single value both of them feed.
+			reopen_stale_stamp_case :: proc(path: string) -> (bad: int) {
+				a: App
+				dummy: plat.Window
+				t: plat.Text
+				if !app_open_path(&a, path) {
+					fmt.println("  FAIL   stale stamp: could not open the fixture")
+					return 1
+				}
+				defer app_destroy(&a)
+				d := app_active(&a)
+				before_text := strings.clone(doc_debug_string(d), context.temp_allocator)
+				before_enc := d.enc
+
+				saved := reopen_transcode_max_bytes
+				defer reopen_transcode_max_bytes = saved
+				reopen_transcode_max_bytes = 1 // the fixture on disk is larger than this
+
+				d.disk_stamp.size = 0 // what a failed stat, or a session-restored tab, leaves behind
+				command_dispatch(.Reopen_CP1252, {}, &a, &dummy, &t, 10)
+				refused :=
+					doc_debug_string(d) == before_text &&
+					d.enc == before_enc &&
+					strings.has_prefix(a.notice, "[REOPEN REFUSED")
+				fmt.printfln(
+					"  %-6s a stamp reporting 0 does not get a really-large file past the cap: enc=%v note=%q",
+					"ok" if refused else "FAIL", d.enc, a.notice,
+				)
+				if !refused {bad += 1}
+				return
+			}
+			bad += reopen_stale_stamp_case(u8f)
+
+			// A file that cannot be stat'd at all is treated as OVER the cap, not
+			// under it. Distinguished from a plain failure by the notice: without
+			// the guard the command reaches doc_open, which fails on the missing
+			// file and says "[REOPEN FAILED" -- same end state here, but only
+			// because a deleted file is the cheap version of an unreachable one. On
+			// a dropped share doc_open blocks first and empties the document if the
+			// allocation then fails, which is the outcome being bought off.
+			reopen_unstattable_case :: proc() -> (bad: int) {
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				gone := fmt.tprintf("%s%cnewtpad_enc_gone.txt", tmp, '\\')
+				plat.file_write_atomic(gone, transmute([]u8)string("caf\xC3\xA9"))
+				a: App
+				dummy: plat.Window
+				t: plat.Text
+				if !app_open_path(&a, gone) {
+					fmt.println("  FAIL   unstattable: could not open the fixture")
+					os.remove(gone)
+					return 1
+				}
+				defer app_destroy(&a)
+				d := app_active(&a)
+				os.remove(gone) // now unstattable, with the cap left at its real 64 MB
+				command_dispatch(.Reopen_CP1252, {}, &a, &dummy, &t, 10)
+				refused := d.enc == .UTF8 && strings.has_prefix(a.notice, "[REOPEN REFUSED")
+				fmt.printfln(
+					"  %-6s an unstattable file is over the cap, not under it: enc=%v note=%q",
+					"ok" if refused else "FAIL", d.enc, a.notice,
+				)
+				if !refused {bad += 1}
+				return
+			}
+			bad += reopen_unstattable_case()
+
+			// ...and the converse: a stamp that ALREADY refuses is not re-measured.
+			// The stat is synchronous on the UI thread and blocks for the redirector
+			// timeout on a dropped share, so a file the stamp already puts over the
+			// cap must be refused without one -- which is what the code did before
+			// the cap was fixed, and what statting unconditionally took away.
+			//
+			// "No syscall" is not directly observable here, so the two orders are
+			// told apart by their notice: with the file deleted, statting first can
+			// only produce "could not be measured", while consulting the stamp first
+			// produces the over-the-limit message. Same refusal, different reason,
+			// and only the second one is free.
+			reopen_over_cap_stamp_skips_the_stat :: proc() -> (bad: int) {
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				f := fmt.tprintf("%s%cnewtpad_enc_overcap.txt", tmp, '\\')
+				plat.file_write_atomic(f, transmute([]u8)string("caf\xC3\xA9"))
+				a: App
+				dummy: plat.Window
+				t: plat.Text
+				if !app_open_path(&a, f) {
+					fmt.println("  FAIL   over-cap stamp: could not open the fixture")
+					os.remove(f)
+					return 1
+				}
+				defer app_destroy(&a)
+				d := app_active(&a)
+				saved := reopen_transcode_max_bytes
+				defer reopen_transcode_max_bytes = saved
+				reopen_transcode_max_bytes = 1 // the stamp doc_open took is larger than this
+				os.remove(f) // unreachable: a live stat can now only fail
+				command_dispatch(.Reopen_CP1252, {}, &a, &dummy, &t, 10)
+				ok := d.enc == .UTF8 && strings.contains(a.notice, "over the")
+				fmt.printfln(
+					"  %-6s an already-over-cap stamp refuses without statting: enc=%v note=%q",
+					"ok" if ok else "FAIL", d.enc, a.notice,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			bad += reopen_over_cap_stamp_skips_the_stat()
+
+			// Encoding > Line Endings, the OTHER consumer of convert_line_endings and
+			// the one nothing covered: pastetest drives the paste path, and crlftest
+			// is a caret/hit-test/wrap suite that never calls this at all.
+			//
+			// The lone CR must survive here for the same reason it survives a paste --
+			// detect_line_ending counts only '\n' and Line_Ending has no .CR member, so
+			// a bare CR has never been a line ending anywhere in Newtpad, and the old
+			// code rewrote bytes the detector does not classify as endings.
+			//
+			// The MIXED case is the one that changed. A buffer of nothing but lone CRs
+			// was never rewritten even before the fix: convert_line_endings returns the
+			// same length, and doc_set_line_ending's length-equality early return then
+			// takes the no-op path. Only a buffer holding both reaches the rewrite.
+			eol_row_case :: proc(text, want_crlf, want_lf: string) -> (bad: int) {
+				a: App
+				defer app_destroy(&a)
+				c := make([]u8, len(text));copy(c, transmute([]u8)text)
+				d := new(Document)
+				d^ = doc_from_content(c, "", .UTF8)
+				d.eol = .LF
+				app_add(&a, d)
+				app_activate(&a, 0)
+				doc_set_line_ending(d, .CRLF)
+				to_crlf := strings.clone(doc_debug_string(d), context.temp_allocator)
+				crlf_eol := d.eol
+				doc_set_line_ending(d, .LF)
+				to_lf := doc_debug_string(d)
+				ok := to_crlf == want_crlf && to_lf == want_lf && crlf_eol == .CRLF && d.eol == .LF
+				fmt.printfln(
+					"  %-6s Line Endings rows leave a lone CR alone: %q -> CRLF %q (want %q) -> LF %q (want %q)",
+					"ok" if ok else "FAIL", text, to_crlf, want_crlf, to_lf, want_lf,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			// Both endings present: the LF converts, the CR does not, and going back
+			// leaves the CR where it was rather than eating it as half a pair.
+			bad += eol_row_case("a\rb\nc", "a\rb\r\nc", "a\rb\nc")
+			// A CR at the very end is the branch a lookahead-bounds slip gets wrong.
+			bad += eol_row_case("a\nb\r", "a\r\nb\r", "a\nb\r")
+			// Nothing but lone CRs: the early return fires, so the text is untouched
+			// AND no undo step is pushed -- assert the second half too, or this case
+			// passes for an implementation that rewrites the buffer to itself.
+			{
+				a: App
+				defer app_destroy(&a)
+				c := make([]u8, 3);copy(c, transmute([]u8)string("a\rb"))
+				d := new(Document)
+				d^ = doc_from_content(c, "", .UTF8)
+				d.eol = .LF
+				app_add(&a, d)
+				app_activate(&a, 0)
+				doc_set_line_ending(d, .CRLF)
+				ok := doc_debug_string(d) == "a\rb" && d.eol == .CRLF && len(d.undo) == 0
+				fmt.printfln(
+					"  %-6s an all-lone-CR buffer takes the no-op path: text=%q eol=%v undo=%d",
+					"ok" if ok else "FAIL", doc_debug_string(d), d.eol, len(d.undo),
+				)
+				if !ok {bad += 1}
+			}
+
 			fmt.printfln("enctest: %d failures", bad)
 			return true
 		}
@@ -5776,8 +7042,75 @@ when NEWTPAD_TESTS {
 			row_ok := chose && c2
 			fmt.printfln("click away closes=%v, click row chooses=%v  %s", away_ok, row_ok, "OK" if away_ok && row_ok else "FAIL")
 			a.palette.active = false
-
 			app_destroy(&a)
+
+			// The pseudo-tab gate is NOT the menu's to keep. palette_execute calls
+			// command_dispatch directly and consults no menu row, the palette draws
+			// over the Settings page, and palette_click runs before main.odin's
+			// pseudo-tab mouse-swallow -- so every rule the menus table used to hold
+			// alone was reachable from here with a mouse. (Not with the keyboard: no
+			// Ctrl chord resolves in the .Settings context.) These cases drive the
+			// real palette path -- open, type the command's own title, pick its row,
+			// execute -- against a Settings tab, and assert the pseudo-document is
+			// untouched. Refused at the dispatch layer, so they hold for the menu
+			// route in the same breath.
+			palette_pseudo_case :: proc(cmd: Command_Id, clip: string) -> (bad: int) {
+				a: App
+				wv: plat.Window // hwnd nil: the clipboard takes a nil owner (pastetest)
+				a.settings = settings_default()
+				app_open_special(&a, .Settings)
+				defer app_destroy(&a)
+				d := app_active(&a)
+				if clip != "" {plat.clipboard_set_text(nil, clip)}
+				palette_open(&a)
+				palette_input_rune(&a, '>')
+				for r in command_table[cmd].title {palette_input_rune(&a, r)}
+				// Find the row rather than trusting the fuzzy ranking to put an exact
+				// title first: the point is what happens when the user picks it.
+				row := -1
+				for res, i in a.palette.results {
+					if res.cmd == cmd {row = i}
+				}
+				if row < 0 {
+					// Not a pass. If the command stops being offered the case stops
+					// testing anything, and silence there is how a test rots.
+					fmt.printfln("  FAIL   %v is not in the palette at all, so this case proves nothing", cmd)
+					return 1
+				}
+				a.palette.selected = row
+				palette_execute(&a, &wv, nil, 10)
+				// d.eol carries the Eol_* case on its own: the pseudo-buffer is empty,
+				// so doc_set_line_ending takes its length-equality early return and
+				// sets doc.eol WITHOUT marking the document modified. Assert only the
+				// buffer and the modified flag and that case can never go red.
+				ok := d.pt.length == 0 && !d.modified && d.enc == .UTF8 && d.eol == .LF
+				fmt.printfln(
+					"  %-6s palette %-20v refused on a Settings tab: bytes=%d modified=%v enc=%v eol=%v",
+					"ok" if ok else "FAIL", cmd, d.pt.length, d.modified, d.enc, d.eol,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			{
+				// The user's clipboard, restored on every exit path.
+				saved_clip, had_clip := plat.clipboard_get_text(nil, context.allocator)
+				defer if had_clip {
+					plat.clipboard_set_text(nil, saved_clip)
+					delete(saved_clip)
+				}
+				pbad := 0
+				// Paste is the finding's own reproduction: the clipboard landed in the
+				// pseudo-document and left it .modified, so closing the tab raised a
+				// save-changes dialog for a page with no file.
+				pbad += palette_pseudo_case(.Paste, "clipboard text")
+				// Enc_UTF16LE is the same hole one menu over -- it sets doc.modified
+				// without touching the buffer, so a buffer-only assertion would miss it.
+				pbad += palette_pseudo_case(.Enc_UTF16LE, "")
+				// Eol_CRLF rewrites the WHOLE buffer (doc_set_line_ending), which is why
+				// it counts as a mutation even though the pseudo-buffer is empty.
+				pbad += palette_pseudo_case(.Eol_CRLF, "")
+				fmt.printfln("palette pseudo-tab gate: %d failures", pbad)
+			}
 			return true
 		}
 
@@ -5840,6 +7173,111 @@ when NEWTPAD_TESTS {
 				p = e + 1 if le else e
 			}
 			base.pt_destroy(&doc.pt)
+
+			// --- batch 7: a MID-LINE tab, the case the dump above cannot reach --
+			// Neither fixture above contains a tab, and every tab in every other
+			// suite is a leading one -- which is 4 cells under fixed-width tabs
+			// and under true tab stops alike. These two are the only wrap checks
+			// that can tell the two apart.
+			bad := 0
+
+			// wrap_row_end. "ab\tcd efghijkl" at 8 cells: the tab starts at
+			// column 2, so it is 2 cells wide and 'e' is the last rune that fits
+			// -- the break falls back to the space at byte 5, giving [0,6).
+			// Under a fixed four the tab would end at column 6, 'd' would fill
+			// column 8, and the break would fall back to the TAB at byte 3
+			// instead, giving [0,3). Sabotage the tab branch back to a constant
+			// and this prints 3.
+			tab_wrap :: proc(t: ^plat.Text) -> (bad: int) {
+				content := "ab\tcd efghijkl"
+				doc: Document
+				doc.pt = base.pt_init(transmute([]u8)content)
+				defer base.pt_destroy(&doc.pt)
+				e, le := wrap_row_end(&doc, t, 0, 8)
+				ok := e == 6 && !le
+				fmt.printfln(
+					"  %-6s mid-line tab: wrap_row_end(%q, 8 cells) = [0,%d) line_end=%v (want [0,6), false; a fixed-4 tab gives [0,3))",
+					"ok" if ok else "FAIL", content, e, le,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			bad += tab_wrap(&t)
+
+			// The batch's HEADLINE decision, which nothing above can observe:
+			// TAB STOPS ARE MEASURED FROM THE VISUAL ROW START, NOT THE LOGICAL
+			// LINE START. tab_wrap measures the FIRST visual row, where the two
+			// origins are the same number, so it cannot tell them apart. This
+			// puts the tab on a CONTINUATION row, where they differ, and it is
+			// the only check in the tree that would notice a future refactor
+			// threading a logical-line column through wrap_row_end.
+			//
+			// "abcde f\thijk" at 6 cells. Row 1 breaks at the space: [0,6). Row 2
+			// starts at byte 6 mid-line (pt_line_start(6) == 0 -- there is no
+			// newline in the fixture, so this really is a continuation row).
+			//
+			//   from the ROW start (correct): 'f' at column 0 -> 1, the tab at
+			//   column 1 advances 3 to column 4, 'h' 5, 'i' 6, and 'j' does not
+			//   fit -- the break falls back to just after the tab, [6,8).
+			//
+			//   from the LOGICAL LINE start: row 2 begins at logical column 6, so
+			//   the tab sits at column 7 and advances 1, not 3. Everything then
+			//   fits and the row runs to the end of the buffer, [6,12) line_end.
+			tab_wrap_continuation :: proc(t: ^plat.Text) -> (bad: int) {
+				content := "abcde f\thijk"
+				doc: Document
+				doc.pt = base.pt_init(transmute([]u8)content)
+				defer base.pt_destroy(&doc.pt)
+
+				e1, le1 := wrap_row_end(&doc, t, 0, 6)
+				r1 := e1 == 6 && !le1 && base.pt_line_start(&doc.pt, 6) == 0
+				fmt.printfln(
+					"  %-6s continuation setup: row 1 = [0,%d) line_end=%v, and byte 6 is mid-LINE (line start %d) -- want [0,6), false, 0",
+					"ok" if r1 else "FAIL", e1, le1, base.pt_line_start(&doc.pt, 6),
+				)
+				if !r1 {bad += 1}
+
+				e2, le2 := wrap_row_end(&doc, t, 6, 6)
+				r2 := e2 == 8 && !le2
+				fmt.printfln(
+					"  %-6s tab on a CONTINUATION row measures from the ROW start: wrap_row_end(%q, from 6, 6 cells) = [6,%d) line_end=%v (want [6,8), false; measuring from the LOGICAL line start gives [6,12), true)",
+					"ok" if r2 else "FAIL", content, e2, le2,
+				)
+				if !r2 {bad += 1}
+				return
+			}
+			bad += tab_wrap_continuation(&t)
+
+			// line_wrap_decision, through eff_wrap_at (its only non-file-private
+			// caller). "a\t" repeated: each pair lands the tab at column 1, so it
+			// advances 3 and the pair costs exactly 4 cells. 256 pairs is 1024
+			// cells -- NOT over WRAP_LONG_CELLS, so the line must not force-wrap.
+			// Under a fixed four each pair costs 5, 256 pairs is 1280, and the
+			// line force-wraps. The 300-pair case is the control: 1200 cells is
+			// over the threshold under either behaviour, so a check stuck at
+			// `false` fails it.
+			tab_wrap_decision :: proc(t: ^plat.Text) -> (bad: int) {
+				one :: proc(t: ^plat.Text, pairs: int, want: bool) -> bool {
+					content := strings.concatenate({strings.repeat("a\t", pairs), "\n"}, context.temp_allocator)
+					doc: Document
+					doc.pt = base.pt_init(transmute([]u8)content)
+					defer base.pt_destroy(&doc.pt)
+					doc.wrap = false
+					got, _ := eff_wrap_at(&doc, t, 0)
+					ok := got == want
+					fmt.printfln(
+						"  %-6s %d x \"a\\t\" = %d cells: force-wraps=%v (want %v; a fixed-4 tab makes it %d cells)",
+						"ok" if ok else "FAIL", pairs, pairs * 4, got, want, pairs * 5,
+					)
+					return ok
+				}
+				if !one(t, 256, false) {bad += 1} // 1024 cells: exactly at, not over, the threshold
+				if !one(t, 300, true) {bad += 1} // 1200 cells: over it under either behaviour
+				return
+			}
+			bad += tab_wrap_decision(&t)
+
+			fmt.printfln("wraptest: %d failures", bad)
 			return true
 		}
 
@@ -7781,7 +9219,9 @@ when NEWTPAD_TESTS {
 			// dedicated CR-skip block deleted and no zero-width guarantee in its
 			// place, because the font happened to also measure CR as ~0 -- this is
 			// the assertion that actually pins the guarantee down.
-			chk("CR cell width (zero by construction)", plat.text_cell_width(&t, '\r', .Doc), 0, &fail)
+			// Column 0: CR is not a tab, so the column cannot affect its width --
+			// that is the whole content of this assertion.
+			chk("CR cell width (zero by construction)", plat.text_cell_width_at(&t, '\r', 0, .Doc), 0, &fail)
 
 			// CRLF x wrap: nothing above exercises eff_row_end's wrapped branch or
 			// visible_next's wrapped vis_end, since none of wraptest/wraplongtest use
@@ -7894,6 +9334,17 @@ when NEWTPAD_TESTS {
 			}
 			bad += paste_case(.LF, "a\r\nb", "a\nb")
 			bad += paste_case(.CRLF, "a\nb", "a\r\nb")
+			// A LONE CR is data and must arrive unchanged. It used to become a line
+			// break, which invents a row: Newtpad counts lines by '\n' only, so
+			// "a\rb" is one line before the paste and must be one line after it.
+			// Real in a CSV field and in terminal output that redraws a progress
+			// line with a carriage return. Both targets, because the CRLF direction
+			// is where a slip attaches an '\n' to the CR instead of leaving it.
+			bad += paste_case(.LF, "a\rb", "a\rb")
+			bad += paste_case(.CRLF, "a\rb", "a\rb")
+			// The CR-then-real-break sequence, so the fix cannot be "ignore every
+			// CR": the CRLF after it must still normalise.
+			bad += paste_case(.LF, "a\rb\r\nc", "a\rb\nc")
 
 			fmt.printfln("pastetest: %d failures", bad)
 			return true

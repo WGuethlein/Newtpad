@@ -147,6 +147,10 @@ main :: proc() {
 	rc := Render_Ctx{&gfx, &text, &quad_pipe, &app, window, 0, 0, 0}
 	active_render_ctx = &rc
 	BASE_PX = f32(clamp(app.settings.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX))
+	// Before the first frame: text_load_faces left the platform default (4) in
+	// place, and nothing else reads the saved value on this path -- settings_apply
+	// only runs when a setting is CHANGED.
+	plat.text_set_tab_width(&text, app.settings.tab_width)
 	// Apply the saved font before the first frame. A family that is no longer
 	// installed leaves the default in place rather than failing to start.
 	if app.settings.font_family != "" && app.settings.font_family != "Consolas" {

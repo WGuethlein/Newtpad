@@ -44,6 +44,11 @@ Settings :: struct {
 	wrap_default:    bool, // new documents start word-wrapped
 	font_size:       int, // document text size at 96 DPI
 	zoom_pct:        int, // viewport zoom, applied on top of font_size
+	// Tab-stop spacing in cells: a tab advances to the next multiple of this.
+	// Bounds live in platform (plat.TAB_WIDTH_MIN/MAX) because that is where the
+	// value is consumed and where a 0 would hang a measuring loop -- duplicating
+	// them here is how the two ends drift apart.
+	tab_width:       int,
 	font_family:     string, // family NAME, not a path — paths differ per machine
 	font_style:      plat.Font_Style,
 	link_style:      Link_Style, // when/how clickable links are shown
@@ -97,6 +102,7 @@ settings_default :: proc() -> Settings {
 		wrap_default = false,
 		font_size = int(BASE_PX_96),
 		zoom_pct = ZOOM_DEFAULT,
+		tab_width = plat.TAB_WIDTH_DEFAULT,
 		font_family = "Consolas",
 		font_style = .Regular,
 		link_style = .Hover,
@@ -115,6 +121,27 @@ settings_path :: proc() -> (string, bool) {
 		return "", false
 	}
 	return fmt.tprintf("%s%csettings.txt", dir, '\\'), true
+}
+
+// The single reading of `tab_width`, called by BOTH settings_load and
+// settings_save so the two ends cannot disagree about what a value means.
+//
+// 0 is "never set" -- a struct built before the field existed, a truncated
+// settings.txt, a hand edit -- and resolves to the DEFAULT, not to
+// TAB_WIDTH_MIN. Same reasoning as zoom_pct's `if == 0` one line above the save
+// call, with teeth: a 0 clamped up to 1 makes every tab in every document one
+// cell wide, which reads as the app silently changing a setting rather than as
+// a default being applied. Anything else is a real choice and is clamped into
+// range.
+//
+// Two sides normalising the same value differently is exactly the bug this
+// replaces: save wrote 4 for a struct 0 while load turned a disk 0 into 1, so a
+// file the save side would never have produced still had to be read, and was
+// read the other way.
+@(private = "file")
+tab_width_normalise :: proc(n: int) -> int {
+	if n == 0 {return plat.TAB_WIDTH_DEFAULT}
+	return clamp(n, plat.TAB_WIDTH_MIN, plat.TAB_WIDTH_MAX)
 }
 
 // Hand-parsed `key value` lines, the same shape session.txt already uses.
@@ -145,6 +172,12 @@ settings_load :: proc() -> Settings {
 		case "zoom_pct":
 			if n, pok := strconv.parse_int(parts[1]); pok {
 				s.zoom_pct = clamp(n, ZOOM_STEPS[0], ZOOM_STEPS[len(ZOOM_STEPS) - 1])
+			}
+		case "tab_width":
+			// Through the same normaliser the save side uses, deliberately: a 0
+			// has to mean the same thing coming in as it does going out.
+			if n, pok := strconv.parse_int(parts[1]); pok {
+				s.tab_width = tab_width_normalise(n)
 			}
 		case "font_family":
 			s.font_family = strings.clone(parts[1])
@@ -196,17 +229,19 @@ settings_save :: proc(s: Settings) -> bool {
 	s.font_size = clamp(s.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX)
 	if s.zoom_pct == 0 {s.zoom_pct = ZOOM_DEFAULT}
 	s.zoom_pct = clamp(s.zoom_pct, ZOOM_STEPS[0], ZOOM_STEPS[len(ZOOM_STEPS) - 1])
+	s.tab_width = tab_width_normalise(s.tab_width)
 	// Zero means "never set" (a literal built without this field, or a struct
 	// that predates it) rather than a deliberate 0.0 fraction, which SPLIT_MIN
 	// would silently misrepresent as a real user choice.
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\nfont_family %s\nfont_style %d\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\nremember_views %d\ntheme_name %s\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\nremember_views %d\ntheme_name %s\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
 		s.zoom_pct,
+		s.tab_width,
 		s.font_family if s.font_family != "" else "Consolas",
 		int(s.font_style),
 		int(s.link_style),
@@ -240,6 +275,7 @@ SETTINGS_ROWS := []Setting_Row {
 	{"Table default view", "Applied when a .csv/.tsv file opens fresh (Ctrl+T toggles)"},
 	{"Remember last view used", "Toggling a view updates the two defaults above; off pins them"},
 	{"Theme", "Dark, Light, or a custom .theme file placed in the themes folder"},
+	{"Tab width", "Columns a Tab advances to; Left/Right adjust, Enter resets to 4"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
@@ -294,12 +330,54 @@ settings_list_bounds :: proc(height: f32) -> (y0, avail_h: f32) {
 	return
 }
 
+// Caches holding measurements denominated in CELLS, on every open document.
+//
+// metrics_recompute and text_reset_atlas between them cover everything measured
+// in PIXELS -- that is what a font or zoom change moves, and it is why those two
+// were enough until tab width became configurable. A tab-width change moves the
+// cell counts themselves, and neither of these two caches is keyed on anything
+// that notices:
+//
+//   - doc.md_table is keyed on doc.revision, which only an edit bumps.
+//   - doc.table_widths is cleared only by edits and by entering/leaving the grid.
+//
+// So without this, changing Tab width from 4 to 8 with a markdown preview or a
+// CSV grid open leaves the columns sized against the old tab stops until the
+// next edit: text overhangs its column, and the alignment padding is computed
+// against a width the column was never sized for.
+@(private = "file")
+cell_caches_invalidate :: proc(app: ^App) {
+	for d in app.docs { 	// slot array: nil is a closed tab
+		if d == nil {continue}
+		clear(&d.table_widths) // table_draw refits when it is empty
+		for &c in d.md_table {c.valid = false}
+		// The third cell-denominated cache, and the one two earlier passes
+		// missed: doc_cursor_col keys only on (cursor, pt.length), so with the
+		// caret sitting after a mid-line tab the status bar keeps reporting the
+		// old Col N until the caret moves. Cosmetic and self-correcting, but it
+		// is the same class as the two above and belongs in the same place.
+		d.status_col_valid = false
+	}
+}
+
 // Apply a setting change that affects live state.
 settings_apply :: proc(rc: ^Render_Ctx) {
 	s := rc.app.settings
 	// Zoom multiplies the preferred size; the DPI scale is applied on top of the
 	// result inside metrics_recompute.
 	BASE_PX = f32(clamp(s.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX)) * f32(s.zoom_pct) / 100
+	// Before the invalidation below, not after: every cached cell measurement on
+	// a line with a tab is wrong once the spacing moves, so the reset has to be
+	// the last thing that happens. text_set_tab_width clamps, so a 0 arriving
+	// from a struct that predates the field cannot reach the measuring loops.
+	//
+	// Read the effective width on both sides of the write rather than comparing
+	// s.tab_width to itself: text_set_tab_width clamps, so 0, -5 and 99 are all
+	// no-ops against an already-clamped value and must not cost a walk of every
+	// open document on every zoom step.
+	tab_before := plat.text_tab_width(rc.text)
+	plat.text_set_tab_width(rc.text, s.tab_width)
+	if plat.text_tab_width(rc.text) != tab_before {cell_caches_invalidate(rc.app)}
 	metrics_recompute(rc)
 	plat.text_reset_atlas(rc.text) // px changed: cached glyphs are the wrong size
 }
@@ -352,6 +430,16 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		nn := len(names)
 		s.theme_name = strings.clone(names[((cur + step) % nn + nn) % nn])
 		g_theme = theme_resolve(s.theme_name)
+	case 8:
+		// Stepped, not cycled: 16 values is too many to reach by pressing Enter,
+		// and the useful ones (2, 4, 8) are all within a few Rights of each
+		// other. Enter resets to the default instead -- the same affordance the
+		// Zoom row already uses.
+		if dir == 0 {
+			s.tab_width = plat.TAB_WIDTH_DEFAULT
+		} else {
+			s.tab_width = clamp(s.tab_width + dir, plat.TAB_WIDTH_MIN, plat.TAB_WIDTH_MAX)
+		}
 	}
 	settings_apply(rc)
 	settings_save(s^)
@@ -418,6 +506,8 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			val = "On" if app.settings.remember_views else "Off"
 		case 7:
 			val = app.settings.theme_name
+		case 8:
+			val = fmt.tprintf("%d", app.settings.tab_width)
 		}
 		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Dim]
 		plat.text_draw(gfx, t, val, width - sx(220), y, UI_PX, vc)

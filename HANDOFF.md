@@ -24,10 +24,21 @@ operational traps that have each cost a session real time. Unlike `CLAUDE.md`, i
 tagged with the exe attached. The installed binary is v0.16.0 — **1.01 MB, down from 1.43 MB**,
 because the headless harness no longer ships inside it (§6z).
 
-**Immediate next step: batch 7 (§6u)** — ship-readiness: a real self-contained installer, the
-signing pipeline built signing-*ready* (a certificate is Wyatt's to buy; Claude must never handle
-one), and glyph-atlas eviction. Gating `test_modes.odin` came forward into batch 6, so it is off
-batch 7's list. Nothing has been specced for it.
+**The road to V1 is sequenced in §6aa (2026-07-26), which supersedes §6u's batch table.** The V1
+feature list is *done* — five of research §G's six V1 decisions shipped and the sixth was deferred
+to V2 — so what remains is hard-rule debt, one batch of promises from CLAUDE.md's own principles,
+and distribution. The UI overhaul moved to V2; a free public beta precedes the paid V1.
+
+**Batch 7 is merged; v0.17.0.** Tab stops, `\\?\` long paths, CSS/SQL line comments, and the five
+findings batch 6 carried — see §6ab. Two of its five planned items turned out **not to be real**
+(glyph-atlas eviction was refuted by measurement, and tabs were already 4 cells, not 1), which is
+worth reading before trusting any other "X is missing" claim in this file.
+
+**The installed binary is still v0.16.0.** Batch 7 merged under Wyatt's overnight policy: merge, do
+not `install.ps1`. Run it after the live pass in §6ab's "Owed".
+
+**Immediate next step: batch 8 (§6aa)** — engine debt: release build time back under the ~5 s rule,
+precompiled `.cso` shaders, batching the text pipeline. Nothing has been specced for it.
 
 **Three things Wyatt owes, all ranked in their own sections and none blocking:**
 
@@ -140,24 +151,40 @@ were the priorities. Read P2 as the live list, with these amendments:
 - **Arenas on VirtualAlloc: still zero implementation.** Heap plus `free_all(context.temp_allocator)`
   per frame. Either build it or amend the locked decision — do not keep citing it as though it
   describes the code.
-- **`\?\` long paths: still zero implementation.** Not one in the tree.
+- ~~**`\?\` long paths: still zero implementation.**~~ **Platform layer DONE (2026-07-26, batch 7
+  task 3.)** `src/platform/path.odin` — `long_path_form` / `wide_path`, every file-I/O call in
+  `file.odin` converted, `longpathtest` covering the rule table plus a real 292-character round trip.
+  **The program layer is not converted:** ~15 `os.*` filesystem calls in `session.odin`,
+  `settings.odin`, `theme.odin` and `diag.odin` (`make_directory`, `read_entire_file`,
+  `write_entire_file`, `exists`, `stat`, `remove`, `rename`, `open`) still inherit `core:os`'s
+  `_fix_long_path`, which returns the path unchanged whenever HKLM `LongPathsEnabled` is set — the
+  registry opt-in CLAUDE.md forbids depending on, and one that does nothing without the
+  `longPathAware` manifest entry we deliberately do not ship. Not urgent: every one of those paths
+  is under `%APPDATA%\Newtpad` and short. **It is reachable, though** — `NEWTPAD_SESSION_DIR`
+  redirects the whole store, so a long override loses the session, the settings, the log and the
+  crash artefacts, each silently (see the comment on `write_minidump`, `crash.odin`). Converting
+  them means routing through `plat.dir_create` / a `plat` read-write pair rather than `core:os`.
 - ~~**Test modes ship in the release binary.**~~ **DONE (2026-07-26, §6z.)** `NEWTPAD_TESTS`
   (`#config`, defaults to `ODIN_DEBUG`) gates the whole file; release went 1,494,528 → 1,055,744
   bytes. `build.bat release tests` puts it back for `-o:speed` measurements.
-- **Carried from batch 6 (§6z), none blocking:**
-  - The reopen size cap reads `doc.disk_stamp.size`, so it **fails open** when the stamp is absent
-    (a failed stat on a dropped share reads as size 0) or stale (a restored dirty tab carries the
-    size the session recorded, so a file that grew to 500 MB while Newtpad was closed still reports
-    the old one). Best-effort by construction; a real guard would stat at the moment of the reopen.
-  - **`File ▸ Save` and `Edit ▸ Paste` are live on the Settings and Font pseudo-tabs.** Pre-existing
-    and not introduced by the `Encoding` menu (whose rows were gated); `Tab_Close` shares `has_doc`
-    and must stay live, so it is a row-by-row call rather than one predicate.
-  - No test exercises any menu `checked` predicate's semantics — the new encoding ones or the older
-    `is_wrapped`/`is_table`. `menutest` covers structure and mnemonic uniqueness only.
-  - `session_restore` still carries no comment saying why it deliberately never calls
-    `app_apply_view_defaults`; the reasoning lives only in `app.odin`.
-  - Paste now rewrites a **lone CR** as a line break, inherited from `convert_line_endings`. Real in
-    a CSV field or terminal output pasted into an LF document.
+- ~~**Carried from batch 6 (§6z), none blocking**~~ — **all five DONE (2026-07-27, §6ab task 5.)**
+  The reopen cap now stats at the reopen and refuses on a failed stat; Save/Save As/Paste are dead
+  on the pseudo-tabs; `menutest` asserts the `checked` predicates flip; `session_restore` says why
+  it skips `app_apply_view_defaults`; and a lone CR survives a paste. Two of them turned out bigger
+  than the entry: the pseudo-tab gate was **menu-only and the command palette walked past it**, so
+  the batch-6 encoding bug was still live by mouse, and the fix moved to one shared
+  `command_allowed_on` predicate covering eight commands.
+- **Carried from batch 7 (task 2, true tab stops):** `line_cell_col` (`doc.odin`) reads at most
+  `VISIBLE_COLS * 4` = 8192 bytes from the row start and **silently truncates** past that — no
+  `exact` flag, unlike `pt_line_start_cap`. Shape A, and `block_delete` is now subject to it: it
+  measures the deleted run's column forward from the row start instead of subtracting the run's own
+  width (the subtraction is circular under true tab stops), so a rectangle more than ~2048 cells into
+  a row would get a too-small column. **Not currently reachable** — `cell_lo` comes from
+  `caret_line_start_cell`, which has the *identical* bound, so the seed cannot outrun it — and
+  deliberately **not** widened, because widening one of the two identical bounds would make them
+  disagree. **The right fix, when it is done:** have `line_cell_col` return an `exact` flag and have
+  `block_delete` refuse when it is false, matching the refusal contract `caret_line_start_cell`
+  already has. Both bounds move together or neither does.
 - **The app redraws at vsync when idle** — no `WaitMessage` anywhere. A core burnt on a static
   screen, which also multiplies every other per-frame cost.
 - **The text pipeline batches nothing** — one heap allocation, two buffer maps and one draw call
@@ -256,8 +283,15 @@ tracked.
 - **Color emoji** (needs a color-glyph path).
 - **Command/hotkey/option codegen from a data file** — hardcoded now (VK→cmd in `window.odin`,
   cmd→action in `main.odin`). Cheap retrofit; do it with the command palette (shared registry).
-- **Glyph-atlas eviction** (LRU/generational + atlas-full repack) and **reindex-on-edit** (line
-  count/scrollbar drift approximately after big edits).
+- ~~**Glyph-atlas eviction** (LRU/generational + atlas-full repack)~~ — **REFUTED, not deferred
+  (2026-07-26, §6ab).** Measured before batch 7 spent a night on it: at 4096² the atlas holds
+  **61,425** glyphs at 16px and **9,768** at 48px (300% DPI), growth 1024→4096 is observed against a
+  real device, and `atlas_full` does not latch (`atlastest`, `atlasgrowtest`). Grow-then-recycle
+  already exists from §6j. One screen of text is far fewer distinct glyphs than the capacity, so the
+  "your text silently vanishes" failure the 2026-07-25 audit ranked Tier 2 is **not reachable by a
+  real document.** The belief traced to one stale comment in `text.odin` that outlived its fix by
+  seven months. Do not re-add this without a measurement that contradicts the above.
+- **reindex-on-edit** (line count/scrollbar drift approximately after big edits).
 - **Precompiled `.cso` shaders** (drop the `d3dcompiler_47.dll` runtime dep) — before ship.
 - **Per-frame allocations** in `text_draw` (make/delete per line) — reuse a scratch buffer.
 - **`renderer`/`ui` layer extraction** — do it during the planned V1 UI rewrite, not before.
@@ -2270,6 +2304,253 @@ release-build measurement and gating without that row would have made it impossi
 - **Nothing in this batch was verified against real GUI input.** Every claim about what happens when
   you click something is inference from source plus a headless assertion.
 - Carried findings are in §5.
+
+## 6aa. The road to V1 (2026-07-26)
+
+Wyatt asked for the whole plan from v0.16.0 to a shipped V1 and answered the four forks that decide
+its shape. **This supersedes §6u's batch table for batches 7-8** — the contents moved, and two
+things left V1 entirely.
+
+### Where V1 actually stands
+
+Of `research/demand-side-feature-research.md` §G's six V1 decisions, **five have shipped**:
+column/block editing (§6y), filter-to-matches (§6e, §6h), the scratch buffer as a hot-exit primitive
+with a Settings toggle (§6b), per-monitor DPI (§6g), and the session-restore toggle. The sixth —
+first-party JSON/CSV/XML reformat — was decided *out* of V1 and held to the V2 plugin proofs.
+
+**The V1 feature list is done.** What separates v0.16.0 from a shippable product is hard-rule debt,
+distribution machinery, and one batch of promises made in CLAUDE.md's own product principles. Worth
+stating plainly, because it changes what the remaining batches are *for*: they are mostly not
+feature work, and a session that opens this file looking for the next feature to build will
+misread the state.
+
+### The four forks, as answered
+
+1. **The UI overhaul and the `renderer`/`ui` extraction move to V2, as its first item.** CLAUDE.md
+   ranks them priority 2, but `research/newtpad-research-report.md:129` records File Pilot's own
+   advice: budget exactly one UI rewrite and do it *after* V1, once real use cases exist. The
+   research wins — shipping is what produces the use cases the rewrite is supposed to be informed
+   by. It is also the difference between V1 being four batches away and ten.
+2. **A free public beta precedes the paid V1.** "V1" is therefore two milestones, and the commerce
+   work (trial, offline licence key, storefront) sits *after* the beta rather than before it.
+3. **Rebindable keys are in V1.** Named in CLAUDE.md principle 4; the hard half — the data-declared
+   `[Command_Id]Command` table with its `#assert` — has existed since the tabs batch. Only the user
+   overlay is missing.
+4. **Accessibility rides with the UI refresh, i.e. V2.** High-contrast is blocked on the colour-token
+   layer rather than on effort (§6k), and a UIA provider written against a UI about to be rewritten
+   is work done twice. Note what this decides: **the beta and the paid V1 both ship with no
+   screen-reader support.** A deliberate, dated choice — not an oversight to rediscover.
+
+### The batches
+
+| Batch | Theme | Contents |
+|---|---|---|
+| **7** | Silent failures | Glyph-atlas eviction · `\\?\` long paths · tab stops · CSS `//` + SQL `--` comment markers · the §5 findings carried out of batch 6 |
+| **8** | Engine debt | Release build time back under the ~5 s rule · precompiled `.cso` shaders · batch the text pipeline · settle the VirtualAlloc-arena decision |
+| **9** | Keys and navigation | Rebindable-key overlay · bookmarks · scrollbar match marks · filter click-to-jump · filter's first paint |
+| **10** | Text operations | Sort lines / remove duplicates · keyword→colour rules · whatever live use has surfaced by then |
+| **11** | Distribution | Real self-contained installer · signing pipeline built signing-*ready* · updater · LICENSE/EULA · a way for a beta tester to send a crash |
+| — | **BETA** | Landing page, download, publish the price early and hold it (File Pilot precedent) |
+| **12** | Commerce | Trial · offline licence key · storefront — informed by beta feedback |
+| — | **V1** | |
+
+Batches 9 and 10 are one body of work split on a guess; the split is provisional and belongs to
+whoever plans them.
+
+**Batch 7 is the one to spec next.** Its four items are independent of each other, which makes it
+the cleanest fan-out on the list, and every one of them is a wrong behaviour a user can hit today:
+the atlas silently drops glyphs while the pen advances, a path over ~260 characters simply fails to
+open, tabs render as one cell so indented code and `.tsv` are wrong, and a `--` SQL comment colours
+its own contents as keywords.
+
+**Batch 8's arena row is a decision, not an implementation.** CLAUDE.md's memory rule describes
+arenas on VirtualAlloc that have never existed; the honest options are to build them or to amend the
+rule. Recommendation on the evidence available: **amend.** There is no measured allocation problem,
+the per-document arena was already refuted once on its own merits (§6b), and a locked decision that
+describes code nobody has written is worse than no rule. Do not let a batch default into building it.
+
+### Explicitly out of V1
+
+Ruled out here, so the next audit does not resurface them as gaps: code folding, macros /
+record-replay, file compare / diff, print and print preview, spellcheck, and global-hotkey quick
+capture — all from research §C, none ever ruled in. Also out, by earlier decision: first-party
+reformat, full multi-cursor, and plugins (all V2), and the container/archive tree viewer (§6).
+
+### The gate on the beta that is not a batch
+
+**Wyatt's live passes are now on the critical path, not beside it.** Nothing in this codebase has
+ever been verified against real GUI input except by Wyatt — this environment cannot inject any. Two
+are owed before strangers see the product: **§6x's theme-tuning pass** (Dark's syntax colours were
+chosen by arithmetic and have been looked at once, and they are the first thing every beta tester
+will see) and **§6z's list** on batch 6. A public beta is the mechanism that finally converts this
+debt into other people's testing, which is an argument for reaching it sooner rather than for
+skipping the two passes.
+
+### Also worth doing, independent of any batch
+
+`CLAUDE.md` is gitignored and exists only on Wyatt's disk (see the note at the top of this file,
+still true). It defines every locked decision, the hard engineering rules and the git conventions,
+and it has no backup, no history, and is invisible to a fresh clone. Tracking it costs nothing.
+
+## 6ab. Tab stops, long paths, and two beliefs that were not true (2026-07-27, v0.17.0, branch `feat/batch-7`)
+
+Batch 7 of §6aa, the first batch down the road to V1, executed overnight with Wyatt asleep. Six
+tasks, 35 commits. Design in `docs/superpowers/specs/2026-07-26-batch-7-design.md`, plan beside it.
+
+**Merge policy for this batch was different and deliberate:** merged to `main`, **`install.ps1` NOT
+run.** Wyatt's call — unreviewed overnight code should not reach the daily driver before he has
+looked at it. The standing "reinstall after every merge" rule resumes once he has done the live pass
+below.
+
+**Shipped:** tabs advance to real tab stops at a configurable width; paths over 260 characters open,
+save and stat; `.css` and `.sql` get their own line-comment rules; the five findings batch 6 carried
+are closed; and 131 lexer assertions can print their numbers when they fail.
+
+### The headline is that two planned items were not real, and measuring cost twenty minutes
+
+§6aa listed five items for this batch. **Two of them did not exist as described**, and both were
+found by running a measurement rather than reading a comment.
+
+- **Glyph-atlas eviction — refuted, dropped from the batch.** The 2026-07-25 audit ranked it Tier 2
+  with the sharpest failure description on its list: *"the only item whose failure mode is 'your text
+  silently vanishes.'"* HANDOFF §5 and the roadmap carried it too. All three traced to one comment in
+  `text.odin` — *"Atlas is grow-only for now; eviction is required before ship"* — that **outlived the
+  §6j fix by seven months.** Measured: at 4096² the atlas holds **61,425** glyphs at 16px and
+  **9,768** at 48px (300% DPI), growth 1024→4096 is observed against a real device, and `atlas_full`
+  never latches. One screen of text is nowhere near that many *distinct* glyphs. Nothing was built;
+  the comment, §5, the roadmap and the audit were corrected instead.
+- **"Tabs render as one cell" — wrong on the number.** `TAB_CELLS :: 4` was already there, and
+  `text.odin` carried the stale claim *directly above* the live constant. The real gap was
+  fixed-width vs true stops, which is what shipped.
+
+**The generalisable lesson, and it is the most useful thing this batch produced: a claim of presence
+is exercised by every build; a claim of absence is never re-tested.** Three sections of this file and
+a whole audit document inherited two false beliefs from two comments, and no test could have caught
+either, because nothing tests a sentence. When a doc says a thing is missing, the cheap move is to go
+and measure before you go and build.
+
+### True tab stops — the column is the whole difficulty
+
+A tab's width depends on where it starts, which is exactly why `TAB_CELLS` was a constant: the
+per-rune `text_cell_width` had no column to work with. Making tabs real meant threading a column
+through every measurement, across ~21 sites — squarely the Shape-B class (*a correct, tested function
+fed the wrong input*).
+
+**The technique that made it safe was making the parameter required, not defaulted, and letting the
+compiler enumerate the sites.** A defaulted `col := 0` would have compiled everywhere unchanged and
+left the wrong behaviour at precisely the sites the task existed to find. Done twice: task 1 for
+`text_cell_width_at`, task 2 for the three wrappers.
+
+**Tab stops are measured from the visual row start.** With wrap off — the normal case, the only case
+for `.tsv`, and the only case column editing permits (§6y) — a visual row *is* its logical line, so
+this is exactly right. With wrap on, a tab on a *continuation* row aligns to that row rather than to
+the logical line: bounded, rare (leading indentation lives on the first visual row), and now the one
+behaviour in the tree with a test that can actually see it.
+
+### What this batch got wrong
+
+**The plan was wrong twice, and a reviewer caught it both times. The spec was right both times.**
+
+- The plan's investigation concluded that no `col0` parameter was needed on the three wrapper procs,
+  from an audit table of their *direct* callers. It missed that the wrappers hardcode an origin of 0
+  internally, and that **two of their callers are reachable from a keystroke**: Tab inside a column
+  selection, and Backspace on a rectangle after a tab, where the caret jumped to the row start on
+  every row. The spec had proposed exactly the parameter the plan removed. Corrected in flight, in a
+  box left in the plan rather than by a silent edit.
+- The plan told task 2 to fix `block_delete` by passing the deleted run's starting column to
+  `text_cells`. **That instruction is circular** — the column being passed is the value being
+  computed. The implementer removed the call and measured forward with `line_cell_col` instead, which
+  also fixed a right-edge straddle that was wrong even under fixed-width tabs.
+- The plan's own arithmetic for its headline test case was wrong (`text_cells("a\tb")` is 5, not 6),
+  and it declared that case unable to fail. It can, and does.
+- **The pseudo-tab gate landed menu-only and the command palette walked straight past it.** Task 5
+  gated Save/Save As/Paste in the `menus` table; `palette.odin` calls `command_dispatch` directly and
+  never consults `item_enabled`. So Settings ▸ Ctrl+P ▸ `>Paste` still pasted into the settings page,
+  which is the bug the commit message claimed to have removed. The fix moved to one shared
+  `command_allowed_on` predicate that both routes consult — and it turned out to cover **eight**
+  commands, not three: `Enc_*` and `Eol_*` had the identical bypass, meaning **the batch-6 encoding
+  data-integrity bug was still reachable by mouse.** Two places enforcing one rule is how they
+  diverge; this is CLAUDE.md's "one layout per widget" applied to a policy rather than a geometry.
+
+**Three tests could not fail, and each was caught by sabotage rather than by review:**
+
+- Task 1's acceptance criterion — "all ten suites pass unchanged" — was *met and nearly worthless*.
+  Sabotaging the tab branch to true tab stops moved **two non-timing lines in the entire corpus**,
+  both in `celltest`, because every tab in every fixture is a *leading* tab and a tab at column 0 is
+  4 cells under both behaviours. Measured independently by the implementer and the reviewer. That
+  finding is why task 2 added a fixture per uncovered consumer instead of trusting green.
+- The controller's own seam test in `hscrolltest` passed under sabotage: `line_cell_col` and
+  `line_offset_at_cell` are inverses *whatever a tab measures*, so a round-trip cannot see tab stops
+  at all. It needed absolute-column assertions, which go red on seven rows.
+- A `longpathtest` row sized its fixture from `LONG_PATH_THRESHOLD`, so sabotaging the threshold
+  moved the fixture too and the row stayed green. It now writes the Win32 number out as the fact it
+  is.
+
+**And the evidence itself was broken.** `ctok_eq`/`tok_eq` in eight `src/base` test files formatted
+failures as `"got {%d,%d,%v}"`. Odin's `fmt` reads a literal `{` as a brace-index verb, so it printed
+`%!(MISSING CLOSE BRACE)` *and desynchronised the rest of the argument list*, mis-binding the `want`
+triple too. **131 assertion sites across 109 tests have had unreadable failure output since each file
+was written** — which is precisely the output the sabotage step depends on reading, and three of
+those files' headers cite recorded sabotage transcripts that were garbled when recorded.
+
+### Deliberately carried, each triaged by the whole-branch review
+
+- `line_cell_col` silently truncates past 8192 bytes with no `exact` flag, and `block_delete` now
+  depends on it. Verified harmless today: `caret_line_start_cell` computes the seed *through the same
+  proc*, so the seed cannot outrun the bound, and `block_row_range` refuses rather than guessing. The
+  recorded fix is an `exact` flag plus a refusal; widening one of two identical bounds would be the
+  actual bug.
+- ~21 `os.*` filesystem calls in the program layer are unconverted and inherit `core:os`'s
+  registry-dependent long-path behaviour. All under `%APPDATA%\Newtpad`; reachable only via a long
+  `NEWTPAD_SESSION_DIR`. Needs a `plat` read/write pair that does not exist yet.
+- `zoom_pct` **and** `split_frac` carry the same save/load 0-handling asymmetry that `tab_width` just
+  fixed — a hand-edited `settings.txt` with a `0` loads as the minimum but saves as the default.
+  Third and fourth instances of the shape; both reachable only by hand-editing.
+- CSS `url(https://x/a/*/b)` can now open a real block comment persisting to the next `*/`, because
+  the old `//` swallow was accidentally shielding it. Judged worth it (a `/*` inside an unquoted URL
+  path is essentially unheard of; quoted URLs are immune) and **pinned by a test asserting the losing
+  behaviour**, so closing it later must be deliberate.
+- `lex_yaml` has a Shape-A-*shaped* loop that is not a live bug — every `state_out` write happens
+  above the capped loop and returns immediately. One edit from becoming real.
+- 17 source comments across 8 files cite `.superpowers/sdd/task-N-report.md` paths, which are
+  **gitignored and collide every batch**. Pre-existing; those citations were already dangling.
+
+### Owed
+
+- **Wyatt's live pass**, ranked: (1) a file with indented code and a ragged `.tsv`, and a mid-line
+  click on a tabbed row — tab stops are the most visual change in the batch and *nothing here was
+  verified against real GUI input*; (2) Settings ▸ Tab width 4 → 8 with a CSV grid and a markdown
+  preview open; (3) Settings ▸ Ctrl+P ▸ `>Paste` ▸ Enter, then close the tab — it should close
+  silently; (4) opening, saving and Save-As on a path over 260 characters, including from Explorer
+  and by drag-drop; (5) Encoding ▸ Reopen on a mis-detected file.
+- **Then `install.ps1`**, which this batch deliberately did not run.
+- The two live passes still owed from before: §6x's theme tuning (Dark's syntax colours have been
+  seen once) and §6z's batch-6 list.
+
+### Unplanned finding: the release build time is no longer over the rule
+
+§5 records `build.bat release` at **10.2 s** against the ~5 s rule, measured at v0.13.0, and §6aa
+made fixing it batch 8's first item. Re-measured at the end of this batch, warm, three consecutive
+runs: **5.12 / 5.07 / 5.07 s.** Release exe 1,060,352 bytes.
+
+Nothing in batch 7 targeted build time, so the likely cause is §6z's `NEWTPAD_TESTS` gating removing
+`test_modes.odin` — now 11k lines — from the release compile, and the 10.2 s figure predating it.
+That is a hypothesis, not a measurement: **nobody has A/B'd `build.bat release` against
+`build.bat release tests` to confirm it.** Do that before batch 8 spends a task on a rule that may no
+longer be breached. Note §5's own history here — the "5.8 s before this batch" figure it once
+carried was stale and made highlighting look like a 2.7 s regression.
+
+### Operational traps found, for `docs/development-loop.md` §6
+
+- **After `build.bat release`, `NEWTPAD_TESTS` gates out `test_modes.odin`, so *every* mode name
+  falls through to opening the real GUI and hanging** — not just `drawcount`. More generally, **any
+  unrecognized first argument does this**, which is how a typo'd mode name costs a timeout.
+- **`build.bat` invoked through the Bash tool hangs**; run it through PowerShell.
+- PowerShell 5.1's `Set-Content -Encoding UTF8` writes a **BOM into `.odin` source**. It did, to
+  `menu.odin`, mid-batch. §6 already warns about the read direction; this is the write direction.
+- The §5.3 bisectability loop **fails on every commit, including known-good ones**, unless
+  `build\guarded.obj` and `build\newtpad.res` are copied into the extracted tree and the invocation
+  carries `-resource:` and `/STACK:8388608`. Prove the harness on a known-good control first.
 
 ## 7. Build environment (Windows, this machine)
 

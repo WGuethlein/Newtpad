@@ -151,13 +151,26 @@ detect_line_ending :: proc(data: []u8) -> Line_Ending {
 }
 
 // Rewrite line endings. Returns a fresh buffer.
+//
+// CRLF and LF are converted; a LONE CR is left exactly as it is. It used to
+// become a line break, which is wrong twice over. Newtpad's own line model
+// counts only '\n' (see detect_line_ending, and every line index in the
+// program layer), so a bare CR is not a break here to begin with -- rewriting
+// it invents a row that did not exist. And it is real data: a CR inside a CSV
+// field, or terminal output with a progress bar redrawn by carriage return,
+// pasted into an LF document. Paste is the common way text enters a buffer
+// (commands.odin) and it is not allowed to alter the bytes it was handed
+// beyond the ending normalisation it was asked for.
 convert_line_endings :: proc(data: []u8, to: Line_Ending, allocator := context.allocator) -> []u8 {
 	out := make([dynamic]u8, 0, len(data) + len(data) / 16, allocator)
 	for i := 0; i < len(data); i += 1 {
 		c := data[i]
 		if c == '\r' {
-			// Normalise CR and CRLF alike; a lone CR is treated as a line break.
-			if i + 1 < len(data) && data[i + 1] == '\n' {i += 1}
+			if i + 1 >= len(data) || data[i + 1] != '\n' {
+				append(&out, '\r') // lone CR: content, not a line ending
+				continue
+			}
+			i += 1
 			if to == .CRLF {append(&out, '\r')}
 			append(&out, '\n')
 			continue
