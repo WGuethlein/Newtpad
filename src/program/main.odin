@@ -114,6 +114,10 @@ main :: proc() {
 	app: App
 	menu_init(&app.menu) // before any frame: the zero value means "File is open"
 	app.settings = settings_load()
+	// The user keymap overlay, before any frame can resolve a key. A missing or
+	// unreadable keys.txt leaves the defaults in force (keymap.odin).
+	keymap_load()
+	defer keymap_reset()
 	had_session := primary && session_exists()
 	// Restore is opt-out. Note the sweep guard below still protects the backups
 	// when it is off: they belong to tabs we chose not to adopt, so turning
@@ -792,6 +796,9 @@ main :: proc() {
 			// d.disk_changed is set the user's edits won.
 			if !d.disk_changed {
 				theme_reapply_if_active(&app, d.path)
+				// And the keymap, for the same reason: editing keys.txt in another
+				// editor while Newtpad has it open should take effect here too.
+				keymap_reload_if_active(d.path)
 			}
 			session_dirty = true
 		}

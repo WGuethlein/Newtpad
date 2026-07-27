@@ -11163,6 +11163,236 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad keymaptest` — the keys.txt user overlay (keymap.odin).
+		//
+		// Every case asserts through resolve_key, not through the returned Keymap.
+		// A test that only counted parse results would prove that the parser
+		// parsed, which is not the claim: the claim is that a chord in the file
+		// changes what a key press DOES, and that nothing in the file can take
+		// away the way out. The reject counters are checked as well, but always
+		// alongside the resolve_key answer — "the line was ignored" and "the line
+		// was ignored for the right reason" are different assertions, and the
+		// shift case only means anything if both hold.
+		//
+		// Writes keys.txt in the session dir for the load-from-disk case, hence
+		// the scratch guard.
+		if os.args[1] == "keymaptest" {
+			if !require_scratch_session("keymaptest") {return true}
+			// Its own proc: test_mode_dispatch's frame is already large (§6,
+			// STATUS_STACK_OVERFLOW twice).
+			keymaptest :: proc() -> int {
+				bad := 0
+				chk :: proc(bad: ^int, cond: bool, msg: string) {
+					fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+					if !cond {bad^ += 1}
+				}
+				// Parse + install, so the following resolve_key calls run against
+				// the live overlay exactly as the app's would.
+				load :: proc(src: string) -> Keymap {
+					km := keymap_parse(src)
+					keymap_install(km) // takes ownership of km.entries
+					return km
+				}
+				defer keymap_reset()
+
+				// --- a good file -------------------------------------------------
+				// Two chords the defaults leave alone, so a pass here cannot be a
+				// default answering by accident.
+				fmt.println("--- a good file ---")
+				k := load("# a comment\n\nctrl+k = Move_Line_Up\nalt+down = Undo\n")
+				chk(&bad, len(k.entries) == 2 && keymap_reject_total(k) == 0, fmt.tprintf("2 bindings, 0 refusals (got %d / %d)", len(k.entries), keymap_reject_total(k)))
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .Move_Line_Up, fmt.tprintf("ctrl+k -> %v (want Move_Line_Up)", resolve_key(.K, true, false, .Editor)))
+				chk(&bad, resolve_key(.Down, false, true, .Editor) == .Undo, fmt.tprintf("alt+down -> %v (want Undo, default was Move_Line_Down)", resolve_key(.Down, false, true, .Editor)))
+				// Case and whitespace are not part of the format.
+				load("   CTRL+K   =   move_line_up   \n")
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .Move_Line_Up, "case and padding are ignored")
+
+				// --- an unknown command name is ignored ---------------------------
+				fmt.println("--- unknown command name ---")
+				k = load("ctrl+k = Frobnicate\n")
+				chk(&bad, k.rejects[.Unknown_Command] == 1 && len(k.entries) == 0, fmt.tprintf("refused as Unknown_Command (%d), no binding made (%d)", k.rejects[.Unknown_Command], len(k.entries)))
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .None, fmt.tprintf("ctrl+k -> %v (want None)", resolve_key(.K, true, false, .Editor)))
+
+				// --- malformed chords / garbage lines ------------------------------
+				fmt.println("--- malformed lines ---")
+				k = load("ctrl+nope = Undo\nthis line has no equals sign\n = Undo\nctrl+ = Undo\n")
+				chk(&bad, k.rejects[.Unknown_Key] == 2, fmt.tprintf("2 unknown-key refusals (got %d)  [`ctrl+nope` and `ctrl+` -- the trailing + leaves no key]", k.rejects[.Unknown_Key]))
+				chk(&bad, k.rejects[.Malformed] == 2, fmt.tprintf("2 malformed refusals (got %d)  [no '=' and an empty chord]", k.rejects[.Malformed]))
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("nothing bound (%d entries)", len(k.entries)))
+
+				// --- shift is not part of a chord -----------------------------------
+				// The load-bearing one. commands.odin:252-254 and :294 both say a
+				// Binding is (key, ctrl, alt, ctx); dropping the shift and binding
+				// ctrl+k would give the user a chord they never asked for on a key
+				// they are still using for something else.
+				fmt.println("--- a shift+ chord is refused, not silently downgraded ---")
+				k = load("ctrl+shift+k = Undo\nshift+f5 = Undo\n")
+				chk(&bad, k.rejects[.Shift] == 2, fmt.tprintf("2 shift refusals (got %d)", k.rejects[.Shift]))
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("no binding made (%d entries)", len(k.entries)))
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .None, fmt.tprintf("ctrl+k is NOT bound behind the user's back -> %v (want None)", resolve_key(.K, true, false, .Editor)))
+				// And shift wins the diagnosis even when the key is also bad, so the
+				// warning names the real problem.
+				k = load("ctrl+shift+nope = Undo\n")
+				chk(&bad, k.rejects[.Shift] == 1 && k.rejects[.Unknown_Key] == 0, fmt.tprintf("shift is diagnosed before the key name (shift=%d key=%d)", k.rejects[.Shift], k.rejects[.Unknown_Key]))
+
+				// --- an empty command unbinds a default -----------------------------
+				fmt.println("--- an empty command unbinds ---")
+				k = load("ctrl+z =\n")
+				chk(&bad, len(k.entries) == 1 && k.entries[0].cmd == .None, fmt.tprintf("recorded as an entry, not a refusal (%d entries, cmd=%v)", len(k.entries), k.entries[0].cmd if len(k.entries) == 1 else Command_Id.None))
+				chk(&bad, resolve_key(.Z, true, false, .Editor) == .None, fmt.tprintf("ctrl+z -> %v (want None; the default is Undo)", resolve_key(.Z, true, false, .Editor)))
+				chk(&bad, resolve_key(.Y, true, false, .Editor) == .Redo, "unbinding one chord leaves the rest of the defaults alone (ctrl+y still Redo)")
+
+				// --- duplicates: last wins ------------------------------------------
+				fmt.println("--- a duplicate chord: last wins ---")
+				k = load("ctrl+k = Undo\nctrl+k = Redo\nctrl+k = Save_As\n")
+				chk(&bad, len(k.entries) == 3, fmt.tprintf("all three lines kept (%d)", len(k.entries)))
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .Save_As, fmt.tprintf("ctrl+k -> %v (want Save_As, the LAST line)", resolve_key(.K, true, false, .Editor)))
+				// A later unbind must beat an earlier bind, too.
+				load("ctrl+k = Undo\nctrl+k =\n")
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .None, fmt.tprintf("a later unbind beats an earlier bind -> %v (want None)", resolve_key(.K, true, false, .Editor)))
+
+				// --- an overlay entry beats a default --------------------------------
+				fmt.println("--- the overlay beats the defaults ---")
+				load("ctrl+t = Undo\n")
+				chk(&bad, resolve_key(.T, true, false, .Editor) == .Undo, fmt.tprintf("ctrl+t -> %v (want Undo; the default is Toggle_Table)", resolve_key(.T, true, false, .Editor)))
+				chk(&bad, command_chord(.Undo) == "Ctrl+T", fmt.tprintf("the menus teach the NEW chord: command_chord(Undo)=%q (want \"Ctrl+T\")", command_chord(.Undo)))
+				chk(&bad, command_chord(.Toggle_Table) == "", fmt.tprintf("...and stop teaching the one that was taken: command_chord(Toggle_Table)=%q (want \"\")", command_chord(.Toggle_Table)))
+
+				// --- reserved chords are refused --------------------------------------
+				// The escape hatch, so a bad file cannot be a one-way door: cancel,
+				// save, and the palette (which can run every command, including
+				// View > Edit Keybindings...).
+				fmt.println("--- reserved chords ---")
+				k = load("esc = Undo\nctrl+s = Undo\nctrl+p = Undo\nctrl+s =\n")
+				chk(&bad, k.rejects[.Reserved] == 4, fmt.tprintf("4 reserved refusals -- rebinds AND the unbind (got %d)", k.rejects[.Reserved]))
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("nothing bound (%d entries)", len(k.entries)))
+				chk(&bad, resolve_key(.Escape, false, false, .Editor) == .Clear_Selection, fmt.tprintf("Esc still cancels -> %v", resolve_key(.Escape, false, false, .Editor)))
+				chk(&bad, resolve_key(.S, true, false, .Editor) == .Save, fmt.tprintf("Ctrl+S still saves -> %v", resolve_key(.S, true, false, .Editor)))
+				chk(&bad, resolve_key(.P, true, false, .Editor) == .Palette_Open, fmt.tprintf("Ctrl+P still opens the palette -> %v", resolve_key(.P, true, false, .Editor)))
+				// Ctrl+Alt+S is Save_As and is NOT reserved -- the reservation is on
+				// the exact chord, not on the key.
+				k = load("ctrl+alt+s = Undo\n")
+				chk(&bad, k.rejects[.Reserved] == 0 && resolve_key(.S, true, true, .Editor) == .Undo, fmt.tprintf("ctrl+alt+s is a different chord and is bindable -> %v", resolve_key(.S, true, true, .Editor)))
+				chk(&bad, resolve_key(.S, true, false, .Editor) == .Save, "...and Ctrl+S is untouched by it")
+
+				// --- an unmodified printable key is refused -----------------------------
+				// WM_CHAR is drained separately from the key events (main.odin), so
+				// `k = Exit` would type a k AND quit, every time.
+				fmt.println("--- unmodified printable keys ---")
+				k = load("k = Undo\n5 = Undo\n- = Undo\n")
+				chk(&bad, k.rejects[.Unmodified] == 3, fmt.tprintf("3 refusals -- letter, digit, minus (got %d)", k.rejects[.Unmodified]))
+				chk(&bad, resolve_key(.K, false, false, .Editor) == .None, fmt.tprintf("bare k -> %v (want None)", resolve_key(.K, false, false, .Editor)))
+				// Keys that never reach WM_CHAR (r >= 32 filter) stay bindable bare.
+				k = load("pgdn = Undo\ndel = Redo\n")
+				chk(&bad, k.rejects[.Unmodified] == 0 && resolve_key(.Page_Down, false, false, .Editor) == .Undo, fmt.tprintf("bare PgDn is still bindable -> %v", resolve_key(.Page_Down, false, false, .Editor)))
+
+				// --- the overlay is scoped to .Editor -------------------------------------
+				fmt.println("--- context scoping ---")
+				load("ctrl+k = Undo\nenter = Undo\n")
+				chk(&bad, resolve_key(.K, true, false, .Palette) == .None, fmt.tprintf("the palette is untouched: ctrl+k/Palette -> %v (want None)", resolve_key(.K, true, false, .Palette)))
+				chk(&bad, resolve_key(.Enter, false, false, .Palette) == .Palette_Confirm, fmt.tprintf("Enter still confirms in the palette -> %v", resolve_key(.Enter, false, false, .Palette)))
+				chk(&bad, resolve_key(.Enter, false, false, .Find) == .Find_Confirm, fmt.tprintf("Enter still confirms in find -> %v", resolve_key(.Enter, false, false, .Find)))
+				chk(&bad, resolve_key(.Escape, false, false, .Find) == .Find_Close, fmt.tprintf("Esc still closes find -> %v", resolve_key(.Escape, false, false, .Find)))
+				chk(&bad, resolve_key(.Escape, false, false, .Menu) == .Menu_Close, fmt.tprintf("Esc still closes the menu -> %v", resolve_key(.Escape, false, false, .Menu)))
+				chk(&bad, resolve_key(.Escape, false, false, .Settings) == .Settings_Close, fmt.tprintf("Esc still closes settings -> %v", resolve_key(.Escape, false, false, .Settings)))
+				chk(&bad, resolve_key(.Escape, false, false, .History) == .History_Close, fmt.tprintf("Esc still closes the history panel -> %v", resolve_key(.Escape, false, false, .History)))
+				chk(&bad, resolve_key(.Escape, false, false, .Font) == .Font_Close, fmt.tprintf("Esc still closes the font page -> %v", resolve_key(.Escape, false, false, .Font)))
+				// The §6f fallbacks still work, and now carry the overlay's answer:
+				// a modified chord in find/menu/history resolves through .Editor.
+				chk(&bad, resolve_key(.K, true, false, .Find) == .Undo, fmt.tprintf("find falls back to the overlaid editor chord -> %v (want Undo)", resolve_key(.K, true, false, .Find)))
+				chk(&bad, resolve_key(.K, true, false, .Menu) == .Undo, fmt.tprintf("the menu falls back too -> %v", resolve_key(.K, true, false, .Menu)))
+				chk(&bad, resolve_key(.Left, false, false, .Find) == .None, "unmodified keys still stay owned by find (Left)")
+
+				// --- an entirely garbage file leaves the defaults intact --------------------
+				fmt.println("--- a file that is nothing but garbage ---")
+				k = load("\x00\x01 binary junk\n!!!!\nctrl+shift+q = Nope\n= = =\n\xff\xfe\nhello world\n")
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("nothing bound (%d entries)", len(k.entries)))
+				chk(&bad, keymap_reject_total(k) > 0, fmt.tprintf("and it complained (%d refusals)", keymap_reject_total(k)))
+				intact := true
+				for b in default_bindings {
+					if resolve_key(b.key, b.ctrl, b.alt, b.ctx) == .None {intact = false}
+				}
+				chk(&bad, intact, "every default binding still resolves")
+				// Spot-checks in the actual currency the user cares about.
+				chk(&bad, resolve_key(.S, true, false, .Editor) == .Save && resolve_key(.Z, true, false, .Editor) == .Undo && resolve_key(.F, true, false, .Editor) == .Find_Open, "Ctrl+S / Ctrl+Z / Ctrl+F unchanged")
+				keymap_reset()
+				chk(&bad, resolve_key(.T, true, false, .Editor) == .Toggle_Table, "and clearing the overlay restores the defaults")
+
+				// --- the seeded file is honest documentation ---------------------------------
+				// Newtpad writes this file; Newtpad has to be able to read it back.
+				// Everything in it is commented, so a fresh seed must parse to
+				// nothing at all -- no line of the header may accidentally go live.
+				fmt.println("--- the seeded keys.txt ---")
+				seed := keymap_seed_text(context.temp_allocator)
+				k = load(seed)
+				chk(&bad, len(k.entries) == 0 && keymap_reject_total(k) == 0, fmt.tprintf("a fresh seed parses to nothing: %d entries, %d refusals", len(k.entries), keymap_reject_total(k)))
+				chk(&bad, strings.contains(seed, "DELETE THIS FILE"), "the escape hatch is in the header")
+				chk(&bad, strings.contains(seed, "THE LAST LINE WINS"), "last-wins is stated in the header")
+				chk(&bad, strings.contains(seed, "SHIFT IS NOT PART OF A CHORD"), "the shift rule is stated in the header")
+				chk(&bad, strings.contains(seed, "EDITOR ONLY"), "the editor-only scope is stated in the header")
+				// The three reserved commands must not appear in the list at all --
+				// a row a user can uncomment only to be refused is worse than no
+				// row. Matched on the command name plus the newline rather than on
+				// the padded chord, so column widths are free to change.
+				chk(&bad, !strings.contains(seed, "= Save\n") && !strings.contains(seed, "= Clear_Selection\n") && !strings.contains(seed, "= Palette_Open\n"), "the reserved chords are not listed as if they were editable")
+				// Uncomment every row of the built-in list and they must all come
+				// back as real bindings with no refusals -- the property that makes
+				// the file usable as a reference. A chord the parser cannot read
+				// back (a separator drift between the writer and the reader, a key
+				// display name that gained a space) fails here.
+				//
+				// Sliced to the list's own section rather than scanning the whole
+				// file: the header contains worked examples that are themselves
+				// valid binding lines, and counting those would make the total
+				// depend on how the prose is written.
+				live := strings.builder_make(context.temp_allocator)
+				want := 0
+				for b in default_bindings {
+					if b.ctx == .Editor && !keymap_chord_reserved(b.key, b.ctrl, b.alt) {want += 1}
+				}
+				in_block := false
+				for ln in strings.split_lines(seed, context.temp_allocator) {
+					if strings.has_prefix(ln, "# ---") {
+						in_block = strings.contains(ln, "the built-in editor keys")
+						continue
+					}
+					if !in_block || !strings.has_prefix(ln, "# ") {continue}
+					body := strings.trim_space(ln[2:])
+					cut := strings.index(body, " = ")
+					if cut <= 0 {continue}
+					if _, cok := command_from_name(strings.trim_space(body[cut + 3:])); !cok {continue}
+					strings.write_string(&live, body)
+					strings.write_byte(&live, '\n')
+				}
+				k = load(strings.to_string(live))
+				chk(&bad, len(k.entries) == want && keymap_reject_total(k) == 0, fmt.tprintf("uncommenting the seeded list gives %d bindings and %d refusals (want %d / 0)", len(k.entries), keymap_reject_total(k), want))
+				keymap_reset()
+
+				// --- from disk, through session_dir ------------------------------------------
+				fmt.println("--- loading from disk ---")
+				path, pok := keymap_path()
+				chk(&bad, pok && strings.has_suffix(path, "keys.txt") && strings.has_prefix(strings.to_lower(path, context.temp_allocator), strings.to_lower(os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator), context.temp_allocator)), fmt.tprintf("keys.txt resolves inside NEWTPAD_SESSION_DIR: %q", path))
+				os.remove(path)
+				keymap_load()
+				chk(&bad, len(g_keymap.entries) == 0 && resolve_key(.T, true, false, .Editor) == .Toggle_Table, "no keys.txt -> the defaults, and no complaint")
+				_ = os.write_entire_file(path, transmute([]u8)string("ctrl+t = Undo\n"))
+				keymap_load()
+				chk(&bad, resolve_key(.T, true, false, .Editor) == .Undo, fmt.tprintf("a keys.txt on disk takes effect -> %v", resolve_key(.T, true, false, .Editor)))
+				// Saving the file re-reads it: the loop that makes a binding
+				// testable without restarting.
+				_ = os.write_entire_file(path, transmute([]u8)string("ctrl+t = Redo\n"))
+				chk(&bad, keymap_reload_if_active(path) && resolve_key(.T, true, false, .Editor) == .Redo, fmt.tprintf("saving keys.txt re-reads it -> %v (want Redo)", resolve_key(.T, true, false, .Editor)))
+				other := fmt.tprintf("%s%csettings.txt", os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator), '\\')
+				chk(&bad, !keymap_reload_if_active(other), "saving some other file does not")
+				os.remove(path)
+				keymap_reset()
+				return bad
+			}
+			n := keymaptest()
+			fmt.printfln("keymaptest: %d failures", n)
+			return true
+		}
+
 		if len(os.args) < 3 {return false}
 		path, mode := os.args[1], os.args[2]
 

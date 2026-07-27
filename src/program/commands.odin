@@ -7,6 +7,7 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 import "core:path/filepath"
 import "core:strings"
 import "core:unicode/utf8"
@@ -366,7 +367,32 @@ default_bindings := []Binding {
 // document. Used by the palette and the menu — the keymap is the only place that
 // knows the shortcuts, so anything that teaches them has to read it from here
 // rather than repeat them in a second table that can drift.
+// A user overlay changes the answer, so this reads the overlay too. Without
+// that, rebinding Save to Ctrl+J would leave every menu and palette row still
+// teaching Ctrl+S — a shortcut that no longer works. The keymap being the only
+// place that knows the shortcuts is exactly why this proc exists; consulting
+// only half of the keymap would reintroduce the drift it was written to stop.
+//
+// Two guards, both no-ops when there is no keys.txt:
+//   * an overlay row for this command wins outright (it is the user's own
+//     choice, and it may be the only binding a command has);
+//   * a default row is skipped when the chord no longer resolves to this
+//     command — the overlay either unbound it or gave it to something else.
 command_chord :: proc(cmd: Command_Id, allocator := context.temp_allocator) -> string {
+	if cmd == .None {return ""}
+	fmt_chord :: proc(b: Binding, allocator: mem.Allocator) -> string {
+		parts: [4]string
+		n := 0
+		if b.ctrl {parts[n] = "Ctrl+";n += 1}
+		if b.alt {parts[n] = "Alt+";n += 1}
+		parts[n] = key_name(b.key)
+		n += 1
+		return strings.concatenate(parts[:n], allocator)
+	}
+	// Last-wins inside the file, the same order keymap_lookup resolves in.
+	#reverse for e in g_keymap.entries {
+		if e.cmd == cmd {return fmt_chord(e, allocator)}
+	}
 	// Editor bindings first — that's the chord a user would press from the
 	// document. Falling back to any context so mode-local commands (the find
 	// toggles) still teach their key instead of showing blank.
@@ -374,66 +400,12 @@ command_chord :: proc(cmd: Command_Id, allocator := context.temp_allocator) -> s
 		for b in default_bindings {
 			if b.cmd != cmd {continue}
 			if pass == 0 && b.ctx != .Editor {continue}
-			parts: [4]string
-			n := 0
-			if b.ctrl {parts[n] = "Ctrl+";n += 1}
-			if b.alt {parts[n] = "Alt+";n += 1}
-			parts[n] = key_name(b.key)
-			n += 1
-			return strings.concatenate(parts[:n], allocator)
+			if resolve_key(b.key, b.ctrl, b.alt, b.ctx) != cmd {continue}
+			return fmt_chord(b, allocator)
 		}
 	}
 	return ""
 }
-
-@(private = "file")
-key_name :: proc(k: plat.Key) -> string {
-	#partial switch k {
-	case .Left:
-		return "Left"
-	case .Right:
-		return "Right"
-	case .Up:
-		return "Up"
-	case .Down:
-		return "Down"
-	case .Home:
-		return "Home"
-	case .End:
-		return "End"
-	case .Page_Up:
-		return "PgUp"
-	case .Page_Down:
-		return "PgDn"
-	case .Backspace:
-		return "Backspace"
-	case .Delete:
-		return "Del"
-	case .Enter:
-		return "Enter"
-	case .Tab:
-		return "Tab"
-	case .Escape:
-		return "Esc"
-	case .Plus:
-		return "+"
-	case .Minus:
-		return "-"
-	}
-	// Letters and digits are contiguous in the enum, in order.
-	if k >= .A && k <= .Z {
-		return LETTERS[int(k) - int(plat.Key.A)][:]
-	}
-	if k >= .Num0 && k <= .Num9 {
-		return DIGITS[int(k) - int(plat.Key.Num0)][:]
-	}
-	return ""
-}
-
-@(private = "file")
-LETTERS := [26]string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"}
-@(private = "file")
-DIGITS := [10]string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
 
 // Show a save failure. Silence here is a data-loss bug: the user believes the
 // file was written, and in a release build (-subsystem:windows) stderr is gone.
@@ -480,6 +452,10 @@ save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -
 		// that makes tuning a theme possible without a rebuild. `path`, not
 		// doc.path: doc_save_err frees and reallocates doc.path.
 		theme_reapply_if_active(app, path)
+		// Same loop for the keymap: saving keys.txt re-reads it, so a binding can
+		// be tried without restarting. Both are called unconditionally and each
+		// checks the path itself.
+		keymap_reload_if_active(path)
 	}
 	return saved
 }
@@ -616,8 +592,19 @@ request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
 	app_close(app, slot)
 }
 
+// The user overlay (keys.txt, see keymap.odin) is consulted FIRST; only a chord
+// it does not mention falls through to default_bindings. The second return
+// value is load-bearing: an overlay entry whose command is .None means the user
+// unbound the chord, and returning .None *without* consulting the defaults is
+// the only way that can work.
+//
+// keymap_lookup answers only for .Editor, so every other context reaches the
+// defaults untouched by design (keymap.odin, rule 1).
 @(private = "file")
 lookup_binding :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
+	if cmd, found := keymap_lookup(key, ctrl, alt, ctx); found {
+		return cmd
+	}
 	for b in default_bindings {
 		if b.key == key && b.ctrl == ctrl && b.alt == alt && b.ctx == ctx {
 			return b.cmd
