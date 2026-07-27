@@ -11379,6 +11379,11 @@ when NEWTPAD_TESTS {
 				chk(&bad, strings.contains(seed, "THE LAST LINE WINS"), "last-wins is stated in the header")
 				chk(&bad, strings.contains(seed, "SHIFT IS NOT PART OF A CHORD"), "the shift rule is stated in the header")
 				chk(&bad, strings.contains(seed, "EDITOR ONLY"), "the editor-only scope is stated in the header")
+				// The one surprise the file does not refuse: an alt+<letter> binding
+				// shadows the menu bar's mnemonic for that letter. A header that
+				// enumerates what the file will not let you do has to say this too,
+				// or it reads as a complete list and is not one.
+				chk(&bad, strings.contains(seed, "takes over from the menu bar's Alt shortcut") && strings.contains(seed, "still opens the menu bar"), "the alt+<letter> mnemonic shadow is stated in the header")
 				// The three reserved commands must not appear in the list at all --
 				// a row a user can uncomment only to be refused is worse than no
 				// row. Matched on the command name plus the newline rather than on

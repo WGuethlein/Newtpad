@@ -33,6 +33,18 @@
 //      REFUSED rather than silently bound to ctrl+k -- binding a chord the user
 //      did not write is worse than binding nothing.
 //
+// One thing the file DOES let you do is worth stating in the same breath,
+// because it is a surprise rather than a refusal: `alt+<letter>` takes the
+// menu bar's Alt mnemonic for that letter. It is not a new mechanism --
+// main.odin's mnemonic path already yields to an explicit Alt binding, which
+// is how Alt+Z reaches Toggle_Wrap today -- and the menu bar cannot be lost by
+// it: a bare Alt tap is window.alt_tapped, not a Binding, and the arrow/Enter
+// rows that walk the menus are in contexts rule 1 keeps out of reach.
+// Reserving F/E/V/N instead would key the reserved set off menus[].mnemonic, a
+// second table that would have to stay in sync -- exactly the drift this
+// design exists to avoid. So it is documented, in the seeded header, not
+// refused.
+//
 // And the escape hatch for everything the four rules do not catch: delete
 // keys.txt. That sentence is in the seeded header of the file itself, because
 // someone whose keymap is broken cannot read documentation from inside the app.
@@ -497,7 +509,11 @@ keymap_chord_text :: proc(b: Binding, allocator := context.temp_allocator) -> st
 // followed by every default editor binding commented out, so the file is also
 // the reference for what the names are. There is no other place in the product
 // that lists them.
-keymap_seed_text :: proc(allocator := context.allocator) -> string {
+//
+// Temp-allocated by default: the result is written to disk (or parsed) and
+// dropped by both callers, and a permanent default on a builder nobody frees
+// is a leak waiting for the third caller.
+keymap_seed_text :: proc(allocator := context.temp_allocator) -> string {
 	b := strings.builder_make(allocator)
 	w :: proc(b: ^strings.Builder, s: string) {strings.write_string(b, s)}
 	w(&b, "# Newtpad keybindings. Restart is not needed -- saving this file re-reads it.\n")
@@ -535,6 +551,11 @@ keymap_seed_text :: proc(allocator := context.allocator) -> string {
 	w(&b, "# 4. NO UNMODIFIED LETTERS, DIGITS, + OR -.  `k = Undo` is refused: the\n")
 	w(&b, "#    character is typed independently of the keymap, so the command would\n")
 	w(&b, "#    also run every time you typed a k. Add ctrl+ or alt+.\n")
+	w(&b, "#\n")
+	w(&b, "# --- and one thing it WILL let you do, which may surprise you --------------\n")
+	w(&b, "#\n")
+	w(&b, "# An `alt+<letter>` binding takes over from the menu bar's Alt shortcut for\n")
+	w(&b, "# that letter (F/E/V/N). Tapping Alt on its own still opens the menu bar.\n")
 	w(&b, "#\n")
 	w(&b, "# --- LOST? -----------------------------------------------------------------\n")
 	w(&b, "#\n")
