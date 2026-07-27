@@ -1097,9 +1097,11 @@ when NEWTPAD_TESTS {
 			// Settings and Font are TABS, so app_active returns a Document for them
 			// and has_doc is true. The Encoding menu's Save-as and Line-Endings rows
 			// used that predicate and were therefore live on a pseudo-tab: "Save as
-			// UTF-16 LE" set doc.modified on a page with no file, and Ctrl+W then
-			// asked whether to save it. Every row of the menu must be dead there --
-			// the Reopen_* rows already were, via has_file.
+			// UTF-16 LE" set doc.modified on a page with no file, and closing the
+			// tab then asked whether to save it -- closing it via the tab strip's X,
+			// the File row or Escape, NOT via Ctrl+W, which is bound in the .Editor
+			// context only and does not resolve on a pseudo-tab at all. Every row of the
+			// menu must be dead there -- the Reopen_* rows already were, via has_file.
 			{
 				ea: App
 				app_open_special(&ea, .Settings)
@@ -1131,13 +1133,15 @@ when NEWTPAD_TESTS {
 			// were has_doc, so all three were live on Settings and Font. Save
 			// raised a Save dialog for a page with no file; Paste inserted the
 			// clipboard into a document nothing draws and left it .modified, so
-			// Ctrl+W then asked whether to save it.
+			// closing the tab -- by the tab strip's X, by this File row, or by Escape;
+			// Ctrl+W does not resolve on a pseudo-tab -- then asked whether to save it.
 			//
-			// Tab_Close is asserted LIVE in the same breath, deliberately: it
-			// shares has_doc with the rows above, so "gate the pseudo-tabs" done as
-			// one predicate swap would kill the one row on this menu that means
-			// something there. Without this half the test would pass just as well
-			// against the wrong fix.
+			// Tab_Close is asserted LIVE in the same breath, deliberately: closing
+			// one is the only thing on this menu that means anything on a pseudo-tab,
+			// so a gate written as "nothing runs there" -- or done as one predicate
+			// swap over the rows above -- would kill the row that has to survive.
+			// Without this half the test would pass just as well against that wrong
+			// fix.
 			menu_row_live :: proc(app: ^App, cmd: Command_Id) -> (live: bool, found: bool) {
 				for m in menus {
 					for it in m.items {

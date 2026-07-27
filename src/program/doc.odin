@@ -645,8 +645,13 @@ Snapshot :: struct {
 
 // A tab is usually a text document, but Settings and Font are tabs too. Making
 // them tabs rather than a full-window takeover means they can be switched away
-// from, closed with Ctrl+W, and shown in the tab strip like anything else —
-// instead of trapping the window until you click the same button again.
+// from, closed, and shown in the tab strip like anything else — instead of
+// trapping the window until you click the same button again.
+//
+// Closed by Escape, the tab strip's X or File > Close Tab. NOT by Ctrl+W, as
+// this comment used to say: that chord is bound in the .Editor context and a
+// pseudo-tab puts main.odin in .Settings or .Font, which falls back to .Editor
+// for Find, Menu and History only (resolve_key, commands.odin).
 Tab_Kind :: enum u8 {
 	Text,
 	Settings,

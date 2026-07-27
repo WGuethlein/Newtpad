@@ -137,9 +137,18 @@ menus := []Menu {
 			{cmd = .Save_As, enabled = has_doc},
 			{cmd = .Reload, enabled = has_file},
 			sep,
-			// Tab_Close stays has_doc, and this is why the fix is row-by-row rather
-			// than one predicate swap: closing a Settings tab is the ONLY thing on
-			// this menu that means something there, and Ctrl+W already does it.
+			// Tab_Close must stay live on a pseudo-tab, and this is why the rule
+			// is per-command rather than "nothing runs on a Settings tab": closing
+			// one is the only thing on this menu that means anything there.
+			//
+			// Ctrl+W does NOT do it, which an earlier version of this comment
+			// claimed as the reason the row could safely go dead. The binding is
+			// {.W, true, false, .Editor, .Tab_Close} (commands.odin) -- Editor
+			// context -- and on a pseudo-tab main.odin sets ctx to .Settings or
+			// .Font, from which resolve_key falls back to .Editor for nothing but
+			// Find, Menu and History. What actually closes a pseudo-tab is Escape
+			// (Settings_Close / Font_Close, both request_close_tab), the tab
+			// strip's X, and this row.
 			{cmd = .Tab_Close, enabled = has_doc},
 			{cmd = .Exit},
 		},
