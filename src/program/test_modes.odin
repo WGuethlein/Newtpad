@@ -1651,6 +1651,13 @@ when NEWTPAD_TESTS {
 				// \\?\\\server\share.
 				unc := pad(`\\server\share\`, 300)
 				chk(&bad, "UNC becomes \\\\?\\UNC", plat.long_path_form(unc), fmt.tprintf(`\\?\UNC%s`, unc[1:]))
+				// `is_sep` accepts '/' in the lead-in too, so `//server/share/...`
+				// is a UNC path as far as this helper is concerned — and it must
+				// land on the same output as the backslash spelling, not on
+				// `\\?\/server/share`. Nothing in Newtpad produces this shape, but
+				// a path pasted from a URL or a shell script does.
+				unc_fwd, _ := strings.replace_all(unc, `\`, "/", context.temp_allocator)
+				chk(&bad, "UNC with forward slashes", plat.long_path_form(unc_fwd), fmt.tprintf(`\\?\UNC%s`, unc[1:]))
 				// ...and its server and share are root, not components a '..' pops.
 				unc_esc := fmt.tprintf(`\\srv\share\..\..\a\%s`, strings.repeat(`z\`, 140, context.temp_allocator))
 				want_unc := fmt.tprintf(`\\?\UNC\srv\share\a\%s`, strings.repeat(`z\`, 140, context.temp_allocator))
