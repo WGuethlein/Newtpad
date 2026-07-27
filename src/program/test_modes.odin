@@ -9018,6 +9018,17 @@ when NEWTPAD_TESTS {
 			}
 			bad += paste_case(.LF, "a\r\nb", "a\nb")
 			bad += paste_case(.CRLF, "a\nb", "a\r\nb")
+			// A LONE CR is data and must arrive unchanged. It used to become a line
+			// break, which invents a row: Newtpad counts lines by '\n' only, so
+			// "a\rb" is one line before the paste and must be one line after it.
+			// Real in a CSV field and in terminal output that redraws a progress
+			// line with a carriage return. Both targets, because the CRLF direction
+			// is where a slip attaches an '\n' to the CR instead of leaving it.
+			bad += paste_case(.LF, "a\rb", "a\rb")
+			bad += paste_case(.CRLF, "a\rb", "a\rb")
+			// The CR-then-real-break sequence, so the fix cannot be "ignore every
+			// CR": the CRLF after it must still normalise.
+			bad += paste_case(.LF, "a\rb\r\nc", "a\rb\nc")
 
 			fmt.printfln("pastetest: %d failures", bad)
 			return true

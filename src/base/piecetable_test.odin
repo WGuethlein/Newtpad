@@ -232,10 +232,36 @@ test_line_endings :: proc(t: ^testing.T) {
 	defer delete(to_lf)
 	testing.expect_value(t, string(to_lf), "a\nb\nc")
 
-	// Mixed input normalises cleanly, and a lone CR counts as a break.
+	// Mixed input normalises cleanly. The lone CR in "c\rd" is NOT a break and
+	// must survive byte-for-byte: Newtpad counts lines by '\n' alone, so a bare
+	// CR is content (a CSV field, terminal output), and paste routes through
+	// here. Written as an explicit \r in the expectation, not a copy of the
+	// input, so the assertion states the byte rather than assuming it.
 	mixed := convert_line_endings(transmute([]u8)string("a\r\nb\nc\rd"), .LF)
 	defer delete(mixed)
-	testing.expect_value(t, string(mixed), "a\nb\nc\nd")
+	testing.expect_value(t, string(mixed), "a\nb\nc\rd")
+
+	// The same in the CRLF direction: the CRLF gains nothing (it already is
+	// one), the LF becomes CRLF, and the lone CR must NOT collect an '\n' --
+	// that is how a bare CR turns into a visible new row.
+	to_crlf2 := convert_line_endings(transmute([]u8)string("a\r\nb\nc\rd"), .CRLF)
+	defer delete(to_crlf2)
+	testing.expect_value(t, string(to_crlf2), "a\r\nb\r\nc\rd")
+
+	// The paste case from the report, minimal: "a\rb" is one line in Newtpad's
+	// model and must stay one line, under either target.
+	lone_lf := convert_line_endings(transmute([]u8)string("a\rb"), .LF)
+	defer delete(lone_lf)
+	testing.expect_value(t, string(lone_lf), "a\rb")
+	lone_crlf := convert_line_endings(transmute([]u8)string("a\rb"), .CRLF)
+	defer delete(lone_crlf)
+	testing.expect_value(t, string(lone_crlf), "a\rb")
+
+	// A CR at the very end of the buffer: the CRLF lookahead runs off the end
+	// there, which is the branch an "i + 1 < len" ordering slip gets wrong.
+	tail := convert_line_endings(transmute([]u8)string("ab\r"), .CRLF)
+	defer delete(tail)
+	testing.expect_value(t, string(tail), "ab\r")
 }
 
 @(test)
