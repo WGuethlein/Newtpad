@@ -346,15 +346,29 @@ Cursor_Kind :: enum u8 {
 // rather than trying to track enter/leave events.
 window_set_cursor :: proc(w: ^Window, k: Cursor_Kind) {w.cursor = k}
 
+// Headless seam. These three read the *physical* keyboard, not a queued event,
+// so a frame built by a windowless measurement mode would still branch on
+// whatever the person at the keyboard happens to be holding — Ctrl alone adds a
+// link-underline quad per visible link to `drawcount`'s reading. A measurement
+// whose value depends on that is not a measurement. Off in the product, where
+// reading the real keyboard is exactly the point.
+@(private)
+keys_ignored: bool
+
+keys_ignore_physical :: proc(on: bool) {keys_ignored = on}
+
 key_ctrl_down :: proc() -> bool {
+	if keys_ignored {return false}
 	return (int(win.GetKeyState(win.VK_CONTROL)) & 0x8000) != 0
 }
 
 key_shift_down :: proc() -> bool {
+	if keys_ignored {return false}
 	return (int(win.GetKeyState(win.VK_SHIFT)) & 0x8000) != 0
 }
 
 key_alt_down :: proc() -> bool {
+	if keys_ignored {return false}
 	return (int(win.GetKeyState(win.VK_MENU)) & 0x8000) != 0
 }
 
@@ -381,6 +395,14 @@ monitor_work_area :: proc(hwnd: win.HWND) -> (win.RECT, bool) {
 // Cursor position in this window's client coordinates (for title-bar button
 // hover, since the buttons are non-client and don't get WM_MOUSEMOVE).
 window_cursor_client :: proc(w: ^Window) -> (x, y: i32) {
+	// A windowless Window (the headless render path: no hwnd, just a size) has
+	// no client space to map into. ScreenToClient(nil) FAILS SILENTLY and leaves
+	// the point in SCREEN coordinates, so every hover hit-test downstream —
+	// tabs, the menu bar, the palette, the history panel — would read the
+	// physical mouse position as though it were inside the window and light up
+	// whatever it landed on. Report a point outside every widget instead, so a
+	// headless frame draws no hover state at all.
+	if w.hwnd == nil {return -1, -1}
 	pt: win.POINT
 	win.GetCursorPos(&pt)
 	win.ScreenToClient(w.hwnd, &pt)
