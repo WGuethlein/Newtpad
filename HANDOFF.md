@@ -190,13 +190,17 @@ were the priorities. Read P2 as the live list, with these amendments:
 - **The text pipeline batches nothing** — one heap allocation, two buffer maps and one draw call
   per string, 74 call sites, several inside per-row loops. This is the prerequisite for an
   always-on line-number gutter (see `drawcount` in §6k).
-- **`build.bat release` is roughly 2x the ~5 s rule and has been for a while.** Measured A/B on this
-  machine 2026-07-26: **v0.12.0 8.1 s, v0.13.0 10.2 s** (warm, three runs each; debug stayed at
-  1.1 s). §6w originally recorded "5.8 s before this batch" — that figure was stale and made
-  highlighting look like a 2.7 s regression when the rule was already breached by ~60% before it
-  started. Ruled out: the `@(test)` corpus (removing all twelve `src/base/*_test.odin` changed
-  nothing). The remainder is LLVM at `-o:speed`. Belongs in the ship-readiness batch, not to a
-  feature batch.
+- ~~**`build.bat release` is roughly 2x the ~5 s rule**~~ — **essentially resolved, measured
+  2026-07-27 at v0.17.0.** Warm, consecutive runs on this machine: `build.bat release` **5.12 / 5.07 /
+  5.07 / 5.31 / 5.08 s** (1,060,352 bytes); `build.bat release tests` **6.94 / 6.91 s**
+  (1,594,880 bytes); debug 1.07 s. **The harness accounts for ~1.85 s**, so §6z's `NEWTPAD_TESTS`
+  gating is what closed the gap — the old 10.2 s figure was measured at v0.13.0 with
+  `test_modes.odin` (now ~11k lines) still compiled into the release. Nothing in batch 7 targeted
+  build time. At 5.1 s the rule is met to within noise, so **do not spend a batch-8 task on this**;
+  re-measure if it drifts back. The earlier entry's own history is the caution: the "5.8 s before
+  this batch" figure it once carried was stale and made highlighting look like a 2.7 s regression.
+  Still true from that entry: the `@(test)` corpus is not the cost (removing all twelve
+  `src/base/*_test.odin` changed nothing), and the remainder is LLVM at `-o:speed`.
 - **`pt_insert` never coalesces adjacent appends, so a multi-row edit fragments the tree and every
   subsequent READ pays for it.** This was misdiagnosed twice before being measured; the numbers below
   are instrumented, release build, 2,000-row rectangle, and the four phases sum to wall-clock within
@@ -2533,12 +2537,13 @@ those files' headers cite recorded sabotage transcripts that were garbled when r
 made fixing it batch 8's first item. Re-measured at the end of this batch, warm, three consecutive
 runs: **5.12 / 5.07 / 5.07 s.** Release exe 1,060,352 bytes.
 
-Nothing in batch 7 targeted build time, so the likely cause is §6z's `NEWTPAD_TESTS` gating removing
-`test_modes.odin` — now 11k lines — from the release compile, and the 10.2 s figure predating it.
-That is a hypothesis, not a measurement: **nobody has A/B'd `build.bat release` against
-`build.bat release tests` to confirm it.** Do that before batch 8 spends a task on a rule that may no
-longer be breached. Note §5's own history here — the "5.8 s before this batch" figure it once
-carried was stale and made highlighting look like a 2.7 s regression.
+Nothing in batch 7 targeted build time, so the suspect was §6z's `NEWTPAD_TESTS` gating removing
+`test_modes.odin` — now ~11k lines — from the release compile, with the 10.2 s figure predating it.
+**A/B'd rather than assumed:** `build.bat release tests` is **6.94 / 6.91 s** against release's
+**5.1 s**, so the harness is ~1.85 s of it and the gating is indeed what closed the gap. §5's entry
+is updated with both series. **Batch 8 should not spend a task on this** — the rule is met to within
+noise. Third time in this file that a debt entry outlived its cause; the entry now carries its
+measurement so the next reader can tell.
 
 ### Operational traps found, for `docs/development-loop.md` §6
 
