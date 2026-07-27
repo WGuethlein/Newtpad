@@ -402,7 +402,9 @@ highlight_kind_role :: proc(k: base.Token_Kind) -> Color_Role {
 // punctuation really is one token per byte) — 64 KB per span array, ~160 KB
 // in doc_draw's frame alone. 512 is where the trade sits: 16 KB per
 // Text_Span array (32 B each), 12 KB per Token array (24 B each), ~43 KB in
-// doc_draw's frame including the row cache, and no frame over 64 KB.
+// doc_draw's frame including the row cache, and no frame over 64 KB. (Batch 10
+// added the colour rules' own 8 KB row buffer to that frame — see
+// RULES_MAX_ROW_SPANS — taking it to ~51 KB, still inside the 64.)
 //
 // Past the cap, colouring stops but the row still DRAWS in full
 // (text_draw_spans simply runs out of spans), and the lexer's state_out is

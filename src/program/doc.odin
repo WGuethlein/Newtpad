@@ -3257,6 +3257,15 @@ doc_draw :: proc(
 	// past VISIBLE_COLS aren't drawn (crude long-line handling; proper horizontal
 	// scroll is a follow-up).
 	line_buf: [VISIBLE_COLS]u8
+	// Colour-rule spans for the row being drawn (rules.odin). Declared HERE
+	// rather than inside the row loop, unlike hl_buf below it: Odin
+	// zero-initialises a declared array, so a per-row declaration is an 8 KB
+	// memset per row -- 320 KB a frame on a full viewport, spent to clear a
+	// buffer that is written before it is read. Only the [:rules_n] prefix each
+	// row writes is ever consumed, so one buffer for the whole pass is
+	// equivalent and free. (hl_buf has the same 16 KB-per-row shape and
+	// predates this; left alone here rather than changed as a side effect.)
+	rules_buf: [RULES_MAX_ROW_SPANS]plat.Text_Span
 	bottom = doc.top
 	// Syntax highlighting: nil lexer for an extension with no grammar (.txt,
 	// or anything not yet wired in highlight.odin) skips the whole pass below
@@ -3383,7 +3392,6 @@ doc_draw :: proc(
 			// above. rules_active() is a length check, so a machine with no
 			// rules.txt pays one compare per row for the feature.
 			rules_n := 0
-			rules_buf: [RULES_MAX_ROW_SPANS]plat.Text_Span
 			if rules_active() {
 				rules_n = rules_row_spans(line_buf[:n], rules_buf[:])
 			}

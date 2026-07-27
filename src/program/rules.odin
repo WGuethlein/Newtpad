@@ -45,6 +45,7 @@
 package main
 
 import "base:intrinsics"
+import "base:runtime"
 import "core:fmt"
 import "core:os"
 import "core:strings"
@@ -153,13 +154,20 @@ Rules_Reject :: enum u8 {
 // refused. That total is what drives the "[RULES.TXT: n LINES REFUSED]" note
 // after a save, and telling someone a line was refused when it took effect
 // would send them looking for a mistake they did not make.
+//
+// `pattern_alloc` is the allocator every pattern was cloned from. Recorded
+// rather than assumed because rules_destroy frees them one at a time and the
+// default `delete` would take context.allocator -- fine for every caller today
+// and a use-after-free the moment one passes something else. keymap_parse gets
+// away with not tracking it only because a Binding owns no memory.
 Color_Rules :: struct {
-	list:        [dynamic]Color_Rule,
-	first_byte:  [256]u64,
-	second_byte: [256]u64,
-	len1:        u64,
-	rejects:     [Rules_Reject]int,
-	duplicates:  int,
+	list:          [dynamic]Color_Rule,
+	first_byte:    [256]u64,
+	second_byte:   [256]u64,
+	len1:          u64,
+	rejects:       [Rules_Reject]int,
+	duplicates:    int,
+	pattern_alloc: runtime.Allocator,
 }
 
 // Candidate comparisons the row scan has made, accumulated across calls.
@@ -181,7 +189,8 @@ rules_active :: proc() -> bool {
 }
 
 rules_destroy :: proc(r: ^Color_Rules) {
-	for rule in r.list {delete(rule.pattern)}
+	alloc := r.pattern_alloc if r.pattern_alloc.procedure != nil else context.allocator
+	for rule in r.list {delete(rule.pattern, alloc)}
 	delete(r.list)
 	r^ = {}
 }
@@ -249,6 +258,7 @@ rules_role_from_name :: proc(s: string) -> (Color_Role, bool) {
 rules_parse :: proc(src: string, allocator := context.allocator) -> Color_Rules {
 	r: Color_Rules
 	r.list = make([dynamic]Color_Rule, allocator)
+	r.pattern_alloc = allocator
 
 	for raw_line, line_no in strings.split_lines(src, context.temp_allocator) {
 		line := strings.trim_space(raw_line)
