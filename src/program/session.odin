@@ -148,9 +148,16 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 		// BOM-less and a CRLF file came back LF, and the next save wrote it that way
 		// -- which breaks Excel and PowerShell on the first, and produces a
 		// whole-file diff on the second.
+		// md_mode and table ride along too (format 4). Without them a restored
+		// tab always came back .Off/false: leave a .md in Split, restart, and it
+		// is plain text again -- and with a family default set (batch 2's
+		// remember_views) the restore actively disagreed with what a fresh open
+		// of the same file would have done. table_delim is NOT persisted: it is
+		// re-derived from the path and first line by doc_view_apply, which is
+		// cheaper than a field that can go stale against the file.
 		fmt.sbprintf(
 			&tb,
-			"%d %d %d %d %d %d %d %d %d %d %s\n",
+			"%d %d %d %d %d %d %d %d %d %d %d %d %s\n",
 			d.cursor,
 			d.anchor,
 			d.top,
@@ -161,12 +168,14 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 			d.disk_stamp.size,
 			1 if d.had_bom else 0,
 			int(d.eol),
+			int(d.md_mode),
+			1 if d.table else 0,
 			d.path,
 		)
 		ti += 1
 	}
 
-	body := fmt.tprintf("newtpad-session 3\nactive %d\n%s", active_idx, strings.to_string(tb))
+	body := fmt.tprintf("newtpad-session 4\nactive %d\n%s", active_idx, strings.to_string(tb))
 	sp := pjoin({dir, "session.txt"})
 	if !plat.file_write_atomic(sp, transmute([]u8)body) {
 		return false
@@ -214,7 +223,9 @@ session_restore :: proc(a: ^App) -> bool {
 		// path is last and may contain spaces, so the split count is the field count
 		nf := 7
 		switch {
-		case ver >= 3:
+		case ver >= 4:
+			nf = 13
+		case ver == 3:
 			nf = 11
 		case ver == 2:
 			nf = 9
@@ -231,6 +242,8 @@ session_restore :: proc(a: ^App) -> bool {
 		had_bom := false
 		eol := base.Line_Ending.LF
 		have_eol := false
+		md_mode := Md_Mode.Off
+		table := false
 		path := ""
 		if ver >= 2 {
 			if len(parts) >= 8 {
@@ -243,7 +256,22 @@ session_restore :: proc(a: ^App) -> bool {
 					eol = base.Line_Ending(pint(parts[9]))
 					have_eol = true
 				}
-				path = parts[10] if len(parts) == 11 else ""
+				if ver >= 4 {
+					if len(parts) >= 12 {
+						// Range-checked, not cast blind: an out-of-range integer
+						// read off disk makes an invalid enum, and every switch on
+						// it then falls through -- the same degrade-don't-corrupt
+						// rule link_style and font_style follow in settings.odin.
+						m := pint(parts[10])
+						if m >= int(Md_Mode.Off) && m <= int(Md_Mode.Split) {
+							md_mode = Md_Mode(m)
+						}
+						table = pint(parts[11]) != 0
+					}
+					path = parts[12] if len(parts) == 13 else ""
+				} else {
+					path = parts[10] if len(parts) == 11 else ""
+				}
 			} else {
 				path = parts[8] if len(parts) == 9 else ""
 			}
@@ -269,7 +297,9 @@ session_restore :: proc(a: ^App) -> bool {
 			d.cursor = clamp(cursor, 0, L)
 			d.anchor = clamp(anchor, 0, L)
 			d.top = clamp(top, 0, L)
-			d.wrap = wrap
+			// After the position clamps, not before: doc_view_apply re-anchors
+			// doc.top to a line start when a line-scrolled view is on.
+			doc_view_apply(d, Doc_View{wrap = wrap, md_mode = md_mode, table = table})
 			// A buffer rebuilt from a backup has never been stat'd (doc_from_content
 			// sets no stamp), while doc_open already stamped the clean-tab case. Adopt
 			// what the session recorded so an unchanged file stays quiet -- and a file

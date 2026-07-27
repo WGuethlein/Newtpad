@@ -7,6 +7,7 @@
 package main
 
 import "core:fmt"
+import "core:path/filepath"
 import "core:strings"
 import "core:unicode/utf8"
 import base "src:base"
@@ -86,6 +87,9 @@ Command_Id :: enum u8 {
 	Enc_UTF8,
 	Enc_UTF16LE,
 	Enc_CP1252,
+	Reopen_UTF8,
+	Reopen_UTF16LE,
+	Reopen_CP1252,
 	Eol_LF,
 	Eol_CRLF,
 	// menu bar navigation
@@ -104,6 +108,7 @@ Command_Id :: enum u8 {
 	Settings_Inc,
 	Settings_Dec,
 	Theme_Edit,
+	Open_Logs_Folder,
 	// font page (Edit > Font)
 	Font_Open,
 	Font_Close,
@@ -199,6 +204,9 @@ command_table := [Command_Id]Command {
 	.Enc_UTF8                 = {"Save as UTF-8", "Encoding"},
 	.Enc_UTF16LE              = {"Save as UTF-16 LE", "Encoding"},
 	.Enc_CP1252               = {"Save as Windows-1252", "Encoding"},
+	.Reopen_UTF8              = {"Reopen as UTF-8", "Encoding"},
+	.Reopen_UTF16LE           = {"Reopen as UTF-16 LE", "Encoding"},
+	.Reopen_CP1252            = {"Reopen as Windows-1252", "Encoding"},
 	.Eol_LF                   = {"Line Endings: LF (Unix)", "Encoding"},
 	.Eol_CRLF                 = {"Line Endings: CRLF (Windows)", "Encoding"},
 	.Menu_Close               = {"Menu: Close", "View"},
@@ -215,6 +223,7 @@ command_table := [Command_Id]Command {
 	.Settings_Inc             = {"Settings: Increase", "View"},
 	.Settings_Dec             = {"Settings: Decrease", "View"},
 	.Theme_Edit               = {"Edit Current Theme...", "View"},
+	.Open_Logs_Folder         = {"Open Logs Folder", "View"},
 	.Font_Open                = {"Font...", "Edit"},
 	.Font_Close               = {"Font: Close", "Edit"},
 	.Font_Next                = {"Font: Next", "Edit"},
@@ -475,6 +484,65 @@ save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -
 	return saved
 }
 
+// How large a file may be and still be re-decoded under a forced encoding.
+//
+// Reopening as anything but UTF-8 transcodes, and doc_open's transcode branch
+// materialises the whole file on the UI thread: make([]u8, len) + safe_copy for
+// a private guarded copy, then decode_to_utf8 into a second allocation. Above
+// plat.FILE_MMAP_THRESHOLD (16 MB) the file is mapped precisely so that none of
+// that happens at open time, and one menu click would undo it -- on a 500 MB log
+// that is a multi-second freeze on the "opens multi-GB files" property, and if
+// the allocation fails the document comes back EMPTY, which a following Ctrl+S
+// then writes over the user's file.
+//
+// So it refuses above a cap, the same shape as a column edit refusing past
+// BLOCK_EDIT_MAX_LINES: a refusal that changes nothing beats a partial result.
+// 64 MB is four times the mmap threshold. Below 16 MB the bytes were copied into
+// private memory at open time anyway, so a transcode there adds nothing new in
+// kind; between 16 and 64 MB sits the band of large-but-ordinary logs and dumps
+// where a mis-detected encoding is still worth correcting and the cost is a
+// tenth of a second. 64 MB bounds the transient allocation at roughly 3x that.
+//
+// A variable, not a constant, only so enctest can lower it and prove the refusal
+// without carrying a 64 MB fixture. Nothing in the product writes it.
+REOPEN_TRANSCODE_MAX_BYTES :: i64(64 * 1024 * 1024)
+reopen_transcode_max_bytes := REOPEN_TRANSCODE_MAX_BYTES
+
+// Re-read the file under `enc`. Confirms first when there are unsaved changes:
+// this discards the buffer, and a menu row that silently destroys work is worse
+// than no row. A failed read leaves the document exactly as it was -- doc_open
+// fails before doc_reload_forced touches anything.
+@(private = "file")
+reopen_with_encoding :: proc(app: ^App, doc: ^Document, w: ^plat.Window, enc: base.Encoding) {
+	if doc == nil || doc.path == "" {return}
+	// Before the confirm, not after: refusing is not a decision the user should
+	// be asked to discard unsaved work for first. Only the transcoding rows are
+	// capped -- doc_open takes the private copy only when the resolved encoding
+	// is not UTF-8, so Reopen as UTF-8 keeps the mapping and costs nothing extra
+	// however large the file is. doc.disk_stamp.size is the size the watcher last
+	// saw, which is the same number that decides mapped-vs-copied on the re-open.
+	if enc != .UTF8 && doc.disk_stamp.size > reopen_transcode_max_bytes {
+		app_note(
+			app,
+			fmt.tprintf(
+				"[REOPEN REFUSED - re-decoding reads the whole file at once, and this one is over the %d MB limit]",
+				reopen_transcode_max_bytes / (1024 * 1024),
+			),
+		)
+		return
+	}
+	if doc.modified {
+		if !plat.confirm_reopen(w.hwnd if w != nil else nil, doc_display_name(doc), enc_name(enc)) {
+			return
+		}
+	}
+	if !doc_reload_forced(doc, enc) {
+		app_note(app, "[REOPEN FAILED - the file could not be read]")
+		return
+	}
+	app_note(app, fmt.tprintf("[REOPENED AS %s]", enc_name(enc)))
+}
+
 // Close a tab, prompting to save first if it has unsaved changes. Save-dialog
 // cancel or a failed save aborts the close (keeps the tab).
 request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
@@ -611,8 +679,43 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	case .Backspace, .Delete_Fwd, .Delete_Word_Back, .Insert_Newline, .Insert_Tab, .Undo, .Redo, .Cut, .Paste,
 	     .Move_Line_Up, .Move_Line_Down:
 		return true
+	// Changing the line ending rewrites the ENTIRE buffer -- doc_set_line_ending
+	// does pt_delete(0, length) followed by pt_insert -- so every line start after
+	// the first moves by one byte per preceding line. Nothing looks like an edit
+	// less and few things are a bigger one. Left out, both guards below missed it:
+	// a live rectangle kept byte offsets naming rows that had shifted (Alt+drag,
+	// Encoding > CRLF, Ctrl+X cut bytes the user never saw highlighted), and an
+	// in-progress table cell edit kept a captured byte span that table_edit_commit
+	// would then splice at the wrong place. Same shape as the find_replace_all and
+	// Toggle_Table holes fixed in earlier batches.
+	case .Eol_LF, .Eol_CRLF:
+		return true
+	// Same class one level up: jumping to a history state is apply_snapshot ->
+	// pt_restore, a whole-tree replacement, exactly what .Undo and .Redo above are.
+	// It was missed for the same reason -- it does not look like an edit. The
+	// rectangle is not what this protects (apply_snapshot clears one itself); the
+	// TABLE guard is. Edit > Undo History is enabled on any document, a click in
+	// the menu bar lands above CONTENT_TOP so an in-progress cell edit is never
+	// committed on the way, and without this the panel then rewrites the buffer
+	// under a captured cell span that table_edit_commit will splice into.
+	case .History_Jump:
+		return true
 	}
 	return false
+}
+
+// Leave the grid, doing everything .Toggle_Table's own off-branch does rather
+// than assigning the field. A dangling cell edit holds a byte span captured
+// before whatever happens next, and table_edit_commit is the only thing that
+// closes it (it splices, drops the rectangle and refits); the widths go so the
+// next turn-on measures the content as it then is. Used by .Toggle_Preview,
+// which must turn the grid off because the two views are mutually exclusive.
+@(private = "file")
+leave_table_view :: proc(doc: ^Document) {
+	if !doc.table {return}
+	if doc.table_editing {table_edit_commit(doc)}
+	doc.table = false
+	clear(&doc.table_widths)
 }
 
 command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^plat.Window, t: ^plat.Text, rows: int) {
@@ -780,7 +883,13 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		}
 	case .Paste:
 		if s, ok := plat.clipboard_get_text(w.hwnd, context.temp_allocator); ok {
-			doc_insert_text(doc, transmute([]u8)s)
+			// The Windows clipboard is CRLF by convention, so pasting into an LF
+			// file mixed the endings silently -- through the most common way
+			// multi-line text enters a buffer. Copy and Cut are deliberately NOT
+			// converted: what leaves the document is what the document holds, and
+			// rewriting on the way out would corrupt a paste into another editor.
+			norm := base.convert_line_endings(transmute([]u8)s, doc.eol, context.temp_allocator)
+			doc_insert_text(doc, norm)
 		}
 	case .Save:
 		p := doc.path
@@ -910,6 +1019,17 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			if block_active(doc) {block_clear(doc)}
 			doc.table = !doc.table
 			if doc.table {
+				// The grid and a markdown view are mutually exclusive -- Split
+				// force-wraps and the table guard above blocks every mutating
+				// command, so a document in both is the state view.odin calls
+				// undefined and doc_view_apply refuses to restore. Both gates
+				// short-circuit true for an untitled buffer, so Ctrl+T then
+				// Ctrl+M on a scratch tab reached it live; session format 4
+				// persists both fields, so a restart quietly resolved it while
+				// the live case stayed broken. Turning markdown off needs no
+				// care beyond the field: its only companion state is the
+				// rectangle, cleared just above for both directions.
+				doc.md_mode = .Off
 				doc.table_delim = table_choose_delim(doc)
 				doc.top = base.pt_line_start(&doc.pt, doc.top)
 				doc.table_col = 0
@@ -936,6 +1056,12 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			switch doc.md_mode {
 			case .Off:
 				doc.md_mode = .Preview
+				// The other half of the mutual exclusion .Toggle_Table enforces.
+				// Through leave_table_view, not doc.table = false: an in-cell
+				// edit left dangling here would keep a byte span nothing will
+				// ever splice, and the fitted widths would be reused against
+				// content that has moved on.
+				leave_table_view(doc)
 				doc.top = base.pt_line_start(&doc.pt, doc.top)
 			case .Preview:
 				doc.md_mode = .Split
@@ -1001,6 +1127,12 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		doc_set_encoding(doc, .UTF16LE)
 	case .Enc_CP1252:
 		doc_set_encoding(doc, .CP1252)
+	case .Reopen_UTF8:
+		reopen_with_encoding(app, doc, w, .UTF8)
+	case .Reopen_UTF16LE:
+		reopen_with_encoding(app, doc, w, .UTF16LE)
+	case .Reopen_CP1252:
+		reopen_with_encoding(app, doc, w, .CP1252)
 	case .Eol_LF:
 		doc_set_line_ending(doc, .LF)
 	case .Eol_CRLF:
@@ -1090,6 +1222,19 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		app_open_special(app, .Settings)
 	case .Theme_Edit:
 		theme_edit_current(app)
+	case .Open_Logs_Folder:
+		// Logging has been on by default since 0.9.0 and had no command, no menu
+		// entry and no mention anywhere in the UI -- the audit found a working
+		// feature nobody could reach. diag_init creates this directory on every
+		// launch, so the miss below is a real failure, not a first-run case.
+		if dir, ok := session_dir(); ok {
+			logs, _ := filepath.join({dir, "logs"}, context.temp_allocator)
+			if !plat.shell_open_folder(logs) {
+				app_note(app, "[COULD NOT OPEN THE LOGS FOLDER]")
+			}
+		} else {
+			app_note(app, "[COULD NOT OPEN THE LOGS FOLDER]")
+		}
 	case .Settings_Close:
 		request_close_tab(app, app.active, w)
 	case .Settings_Next:

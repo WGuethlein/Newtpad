@@ -73,6 +73,7 @@ block_clear :: proc(doc: ^Document) {
 	doc.block_anchor_cell = 0
 	doc.block_cursor_line_start = 0
 	doc.block_cursor_cell = 0
+	doc.last_block_run = 0 // ending the rectangle ends its undo run
 }
 
 // Fresh-press state transition for a rectangle left over from an earlier
@@ -555,6 +556,7 @@ block_extend :: proc(doc: ^Document, t: ^plat.Text, dline, dcell: int) -> Block_
 	if !step_ok {
 		return .Caret_Unresolved
 	}
+	doc.block_run += 1
 	doc.block = true
 	doc.block_anchor_line_start = anchor_off
 	doc.block_anchor_cell = anchor_cell
@@ -603,6 +605,7 @@ block_set_from_points :: proc(doc: ^Document, t: ^plat.Text, a_off, a_cell, c_of
 	if a_off < 0 || c_off < 0 {
 		return .Caret_Unresolved
 	}
+	doc.block_run += 1
 	doc.block = true
 	doc.block_anchor_line_start = a_off
 	doc.block_anchor_cell = max(0, a_cell)
@@ -1194,7 +1197,7 @@ block_apply :: proc(doc: ^Document, t: ^plat.Text, edit_lo, edit_hi: int, text: 
 		}
 	}
 
-	doc_batch_begin(doc, kind)
+	doc_batch_begin_run(doc, kind, doc.block_run)
 	edited := 0
 	ins := make([dynamic]u8, 0, len(text) + 8, context.temp_allocator)
 	for i := n - 1; i >= 0; i -= 1 {
@@ -1222,7 +1225,7 @@ block_apply :: proc(doc: ^Document, t: ^plat.Text, edit_lo, edit_hi: int, text: 
 	top_caret := los[0] + pads[0] + len(text) if len(text) > 0 else los[0]
 	doc.cursor = top_caret
 	doc.anchor = top_caret
-	doc_batch_end(doc, edited) // rows actually edited, not rows spanned
+	doc_batch_end_run(doc, edited, doc.block_run) // rows actually edited, not rows spanned
 
 	// The rectangle SURVIVES the edit, collapsed to zero width at new_cell on
 	// the same rows. Typing "// " down a column is three keystrokes, and

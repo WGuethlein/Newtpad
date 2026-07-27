@@ -199,10 +199,22 @@ app_open_special :: proc(a: ^App, kind: Tab_Kind) {
 // deliberately left set on that specific file. The existing doc_can_* gating
 // still applies, so a stored default can never force a view onto a file that
 // cannot hold it -- a stray md_default cannot wedge a .txt into Split.
+//
+// Through doc_view_apply, not by writing doc.md_mode/doc.table here: this is the
+// third caller that puts a view onto a Document, and open-coding the doc_can_*
+// gates a second time is precisely the shape batch 6 exists to remove. It also
+// silently omitted two of doc_view_apply's rules -- the markdown/grid mutual
+// exclusion, and the top re-anchor -- which were inert only because the family
+// defaults key on disjoint extensions and a fresh open has top == 0.
+//
+// `wrap` is NOT a family default; it comes from settings.wrap_default at open
+// time (app_open_path/app_new_scratch) or from a restored session, so the
+// document's current value is passed straight back through. table_delim is left
+// 0 on purpose: doc_view_apply then chooses one, which the open-coded version
+// never did -- a defaulted grid used to fall back to ',' with nothing recorded.
 app_apply_view_defaults :: proc(a: ^App, doc: ^Document) {
 	if doc == nil || doc.kind != .Text {return}
-	if a.settings.md_default != .Off && doc_can_markdown(doc) {doc.md_mode = a.settings.md_default}
-	if a.settings.table_default && doc_can_table(doc) {doc.table = true}
+	doc_view_apply(doc, Doc_View{wrap = doc.wrap, md_mode = a.settings.md_default, table = a.settings.table_default})
 }
 
 // Open `path` into a new tab and activate it. Returns false if the file couldn't

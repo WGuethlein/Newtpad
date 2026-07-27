@@ -365,6 +365,10 @@ MB_ICONWARNING :: 0x00000030
 ID_YES :: 6
 @(private = "file")
 ID_NO :: 7
+@(private = "file")
+MB_YESNO :: 0x00000004
+@(private = "file")
+MB_DEFBUTTON2 :: 0x00000100 // second button is default: Cancel, not the destructive one
 
 Save_Choice :: enum {
 	Save,
@@ -415,6 +419,25 @@ confirm_discard :: proc(owner: win.HWND, name: string) -> Save_Choice {
 		return .Discard
 	}
 	return .Cancel
+}
+
+// Re-reading the file under a different encoding throws the buffer away. Asked
+// only when there is something to lose; No is the default button, because a
+// mis-aimed Enter on this dialog destroys unsaved work.
+confirm_reopen :: proc(owner: win.HWND, name, enc: string) -> bool {
+	msg := strings.concatenate(
+		{
+			"Reopen ",
+			name,
+			" as ",
+			enc,
+			"?\n\nIt will be re-read from disk and your unsaved changes will be lost.",
+		},
+		context.temp_allocator,
+	)
+	wmsg := win.utf8_to_wstring(msg, context.temp_allocator)
+	wcap := win.utf8_to_wstring("Newtpad", context.temp_allocator)
+	return win.MessageBoxW(owner, wmsg, wcap, MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) == ID_YES
 }
 
 Encoding_Choice :: enum {
@@ -490,12 +513,45 @@ shell_open_url :: proc(url: string) -> bool {
 	return uintptr(rawptr(r)) > 32 // ShellExecute's documented success threshold
 }
 
+// The /select,"path" argument for revealing `path` in Explorer, quoted so a
+// comma or space in the name (an %APPDATA% under a Windows user name with a
+// space, for instance) doesn't truncate it or get split into extra arguments.
+// Pure and allocator-parameterized so a test can assert on its output without
+// touching ShellExecuteW.
+explorer_select_arg :: proc(path: string, allocator := context.temp_allocator) -> string {
+	return strings.concatenate({"/select,\"", path, "\""}, allocator)
+}
+
+// The quoted lpParameters for opening `path` as a folder in Explorer. Same
+// quoting rule as explorer_select_arg, and the same reason: an unquoted space
+// in the path splits it into multiple ShellExecuteW arguments.
+explorer_folder_arg :: proc(path: string, allocator := context.temp_allocator) -> string {
+	return strings.concatenate({"\"", path, "\""}, allocator)
+}
+
 // Select `path` in Explorer rather than opening it. This is what a non-text
 // file gets: the user sees where it is and decides what to do, and nothing we
 // did executed it.
 shell_reveal :: proc(path: string) -> bool {
-	// /select, needs the path quoted or a comma or space in the name truncates it.
-	arg := strings.concatenate({"/select,\"", path, "\""}, context.temp_allocator)
+	arg := explorer_select_arg(path)
+	warg := win.utf8_to_wstring(arg, context.temp_allocator)
+	wexe := win.utf8_to_wstring("explorer.exe", context.temp_allocator)
+	wop := win.utf8_to_wstring("open", context.temp_allocator)
+	r := win.ShellExecuteW(nil, wop, wexe, warg, nil, win.SW_SHOWNORMAL)
+	return uintptr(rawptr(r)) > 32
+}
+
+// Open a directory in Explorer. Refuses anything that is not an existing
+// directory: file.odin's rule is that nothing arbitrary reaches ShellExecuteW,
+// and while the only caller builds its path from session_dir rather than from
+// document text, a guard that lives in the helper is one a future caller cannot
+// forget.
+shell_open_folder :: proc(path: string) -> bool {
+	exists, is_dir := path_exists(path)
+	if !exists || !is_dir {
+		return false
+	}
+	arg := explorer_folder_arg(path)
 	warg := win.utf8_to_wstring(arg, context.temp_allocator)
 	wexe := win.utf8_to_wstring("explorer.exe", context.temp_allocator)
 	wop := win.utf8_to_wstring("open", context.temp_allocator)

@@ -729,6 +729,14 @@ Document :: struct {
 	// run of typing continues only while both still match.
 	last_edit:    Edit_Kind,
 	last_edit_at: int,
+	// Column-edit run identity. A held key over a rectangle issues one batch per
+	// press; without this each press was its own undo entry, so a 300-row prefix
+	// held for two seconds was dozens of Ctrl+Z -- and UNDO_MAX (200) then evicted
+	// the pre-run state entirely, making the original unreachable. `block_run` is
+	// bumped whenever a gesture creates or reshapes a rectangle; `last_block_run`
+	// is the run the current undo entry belongs to, and 0 means "not a run".
+	block_run:      int,
+	last_block_run: int,
 	// What produced the CURRENT state, and how much of it. Each Snapshot carries
 	// the same for the state it holds, so the description travels with a state as
 	// it moves between the undo and redo stacks — otherwise a state that came
@@ -784,7 +792,9 @@ doc_new :: proc() -> (doc: Document) {
 	return
 }
 
-doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
+// `force_enc` overrides what detect_encoding decided -- the Reopen As commands.
+// The sniff still runs, because a BOM is also how many bytes to skip.
+doc_open :: proc(path: string, force_enc: Maybe(base.Encoding) = nil) -> (doc: Document, ok: bool) {
 	fv, fok := plat.file_open_readonly(path)
 	if !fok {
 		return
@@ -810,6 +820,14 @@ doc_open :: proc(path: string) -> (doc: Document, ok: bool) {
 		enc, bom = base.detect_encoding(head[:n])
 	} else {
 		enc, bom = base.detect_encoding(fv.bytes)
+	}
+	if fe, has := force_enc.?; has {
+		// The BOM belonged to the encoding it announced. Under a different
+		// reading those bytes are content, so the skip goes with the detection
+		// it came from -- otherwise a forced reopen quietly eats the first two
+		// or three bytes of the file every time.
+		if fe != enc {bom = 0}
+		enc = fe
 	}
 	doc.enc = enc
 	doc.had_bom = bom > 0
@@ -1161,6 +1179,7 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 	// undo/redo describing line/cell offsets a just-restored tree may no
 	// longer have.
 	if block_active(doc) {block_clear(doc)}
+	doc.last_block_run = 0 // undo/redo/history jump always ends a run
 }
 
 @(private = "file")
@@ -1177,6 +1196,10 @@ push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
 	// except apply_snapshot and doc_absorb_append, which bypass this by design and
 	// bump revision themselves, and doc_reload, which replaces the struct wholesale.
 	doc.modified = true
+	// Any edit that is not part of the current column run ends it. Set here, on
+	// the path every ordinary edit takes, so a missed break is impossible rather
+	// than enumerated: doc_batch_begin_run re-sets it after calling through.
+	doc.last_block_run = 0
 	// One entry for the whole batch; doc_batch_begin already took the snapshot of
 	// the state being left. Without this, Replace All pushed one snapshot per
 	// match -- and since UNDO_MAX evicts the oldest, replacing more than 200
@@ -1227,6 +1250,44 @@ doc_batch_end :: proc(doc: ^Document, count: int) {
 	doc.batch = false
 	doc.state_count = max(count, 1)
 	doc.last_edit = .None // a later keystroke must not coalesce into the batch
+}
+
+// Like doc_batch_begin, but CONTINUES the previous entry when this batch belongs
+// to the same column-edit run and is the same kind of edit. `run` is doc.block_run;
+// 0 behaves exactly like doc_batch_begin.
+doc_batch_begin_run :: proc(doc: ^Document, kind: Edit_Kind, run: int) {
+	if doc.batch {return}
+	if run != 0 && run == doc.last_block_run && kind == doc.last_edit {
+		// No snapshot -- the entry the first press pushed already describes the
+		// state before the whole run. Everything ELSE push_undo does still must
+		// happen: the buffer really is changing.
+		find_invalidate(doc)
+		doc.revision += 1
+		doc.modified = true
+		doc.batch = true
+		return
+	}
+	push_undo(doc, kind)
+	doc.batch = true
+	doc.last_block_run = run // after push_undo, which clears it
+}
+
+// `count` labels the resulting state with the rows THIS press edited. It cannot
+// accumulate across the run: push_undo unconditionally zeroes last_block_run
+// before this runs (see push_undo's comment -- that ordering is what makes the
+// break condition complete), so by the time we get here the token this batch
+// began with never survives to be compared against. A coalesced run is
+// therefore labelled by its last press -- "x3" for a held key over a 3-row
+// rectangle, not an accumulated "x60" -- which is also the more truthful
+// number: the entry restores three columns, not sixty rows.
+doc_batch_end_run :: proc(doc: ^Document, count, run: int) {
+	if !doc.batch {return}
+	doc.batch = false
+	doc.state_count = max(count, 1)
+	// doc_batch_end sets last_edit = .None so a later keystroke cannot coalesce
+	// into a batch. A column run is the one case where the next press must, so
+	// the kind is left alone and the run token is what gates it.
+	doc.last_block_run = run
 }
 
 doc_undo :: proc(doc: ^Document) {
@@ -1355,6 +1416,11 @@ doc_absorb_append :: proc(doc: ^Document, new_size: i64) -> bool {
 		doc.anchor = doc.cursor
 	}
 	find_invalidate(doc) // match offsets past the old end are now stale
+	// This bypasses push_undo, so a live column run's token would otherwise
+	// survive an append. The next press would then coalesce onto a snapshot
+	// taken before the appended tail, and one Ctrl+Z would discard bytes that
+	// came from disk, not from the user's edit.
+	doc.last_block_run = 0
 	return true
 }
 
@@ -1362,12 +1428,21 @@ doc_absorb_append :: proc(doc: ^Document, new_size: i64) -> bool {
 // simple append. Undo states describe a document that no longer exists, so they
 // go; keeping them would let Ctrl+Z resurrect a file that was never on disk.
 doc_reload :: proc(doc: ^Document) -> bool {
+	return doc_reload_forced(doc, nil)
+}
+
+// Re-open from disk, discarding the buffer. `force_enc` re-decodes under an
+// encoding the user picked instead of the detected one (the Reopen As commands);
+// nil is an ordinary reload. Undo states describe a document that no longer
+// exists, so they go; keeping them would let Ctrl+Z resurrect a file that was
+// never on disk.
+doc_reload_forced :: proc(doc: ^Document, force_enc: Maybe(base.Encoding)) -> bool {
 	if doc.path == "" {return false}
-	fresh, ok := doc_open(doc.path)
+	fresh, ok := doc_open(doc.path, force_enc)
 	if !ok {return false}
 
 	cursor, anchor, top := doc.cursor, doc.anchor, doc.top
-	wrap := doc.wrap
+	view := doc_view_capture(doc)
 	path := strings.clone(doc.path)
 	// fresh is a brand-new Document and so starts at revision 0; carried forward
 	// and bumped rather than left at 0, or revision would go backwards on a tab
@@ -1380,13 +1455,19 @@ doc_reload :: proc(doc: ^Document) -> bool {
 	if doc.path_owned {delete(doc.path)}
 	doc.path = path
 	doc.path_owned = true
-	doc.wrap = wrap
 	doc.revision = rev + 1
 	// Preserve position by byte offset, clamped — the file may have shrunk.
 	L := doc.pt.length
 	doc.cursor = clamp(cursor, 0, L)
 	doc.anchor = clamp(anchor, 0, L)
 	doc.top = clamp(top, 0, L)
+	// Applied after the position clamps, not before: doc_view_apply re-anchors
+	// doc.top to a line start when a line-scrolled view is on, and the clamp above
+	// would overwrite that. (An earlier draft of this comment claimed the ordering
+	// was about doc.path being empty until line 1381 -- it never is: doc_open
+	// clones the path into `fresh`, so doc.path is valid the instant doc^ = fresh
+	// runs. Sabotaging the order fails through `top`, not through the gates.)
+	doc_view_apply(doc, view)
 	doc.disk_stamp = plat.file_stamp(doc.path)
 	doc.disk_changed = false
 	doc.disk_gone = false

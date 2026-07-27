@@ -117,6 +117,20 @@ diag_on_fatal :: proc() {
 	sync.mutex_unlock(&g_diag.mu)
 }
 
+// An Odin context with the crash-reporter assertion hook installed, for the
+// contextless callbacks the window procedure invokes.
+//
+// runtime.default_context() resets context.assertion_failure_proc to the runtime
+// default, so a panic, assert or bounds check inside on_resize or on_dpi skipped
+// the crash path the rest of the app gets -- on the two callbacks that run while
+// the window is being manipulated. Every place that needs a fresh context uses
+// this, so the hook is named in exactly one place.
+diag_context :: proc "contextless" () -> runtime.Context {
+	c := runtime.default_context()
+	c.assertion_failure_proc = diag_assert_fail
+	return c
+}
+
 // Route Odin panics/asserts (`assert`, `panic`, bounds checks) through the crash
 // path: record the reason in the log ring, then trap. The trap raises an illegal
 // instruction, which the platform unhandled-exception filter catches and turns
