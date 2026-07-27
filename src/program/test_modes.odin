@@ -6431,6 +6431,81 @@ when NEWTPAD_TESTS {
 			}
 			bad += reopen_cap_case(u8f)
 
+			// The cap must read the file's size NOW, not doc.disk_stamp.size. The
+			// stamp is 0 when the last stat failed and stale on a restored dirty
+			// tab, and both cases read as "small" -- which is the direction that
+			// hurts, because the cap exists to refuse a multi-second synchronous
+			// transcode. A stamp claiming 0 against a file that is really over the
+			// cap must still refuse.
+			//
+			// The stamp is falsified rather than reproduced: a dropped share and a
+			// session restored across a file that grew are both unreachable from a
+			// headless test, and the stamp is the single value both of them feed.
+			reopen_stale_stamp_case :: proc(path: string) -> (bad: int) {
+				a: App
+				dummy: plat.Window
+				t: plat.Text
+				if !app_open_path(&a, path) {
+					fmt.println("  FAIL   stale stamp: could not open the fixture")
+					return 1
+				}
+				defer app_destroy(&a)
+				d := app_active(&a)
+				before_text := strings.clone(doc_debug_string(d), context.temp_allocator)
+				before_enc := d.enc
+
+				saved := reopen_transcode_max_bytes
+				defer reopen_transcode_max_bytes = saved
+				reopen_transcode_max_bytes = 1 // the fixture on disk is larger than this
+
+				d.disk_stamp.size = 0 // what a failed stat, or a session-restored tab, leaves behind
+				command_dispatch(.Reopen_CP1252, {}, &a, &dummy, &t, 10)
+				refused :=
+					doc_debug_string(d) == before_text &&
+					d.enc == before_enc &&
+					strings.has_prefix(a.notice, "[REOPEN REFUSED")
+				fmt.printfln(
+					"  %-6s a stamp reporting 0 does not get a really-large file past the cap: enc=%v note=%q",
+					"ok" if refused else "FAIL", d.enc, a.notice,
+				)
+				if !refused {bad += 1}
+				return
+			}
+			bad += reopen_stale_stamp_case(u8f)
+
+			// A file that cannot be stat'd at all is treated as OVER the cap, not
+			// under it. Distinguished from a plain failure by the notice: without
+			// the guard the command reaches doc_open, which fails on the missing
+			// file and says "[REOPEN FAILED" -- same end state here, but only
+			// because a deleted file is the cheap version of an unreachable one. On
+			// a dropped share doc_open blocks first and empties the document if the
+			// allocation then fails, which is the outcome being bought off.
+			reopen_unstattable_case :: proc() -> (bad: int) {
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				gone := fmt.tprintf("%s%cnewtpad_enc_gone.txt", tmp, '\\')
+				plat.file_write_atomic(gone, transmute([]u8)string("caf\xC3\xA9"))
+				a: App
+				dummy: plat.Window
+				t: plat.Text
+				if !app_open_path(&a, gone) {
+					fmt.println("  FAIL   unstattable: could not open the fixture")
+					os.remove(gone)
+					return 1
+				}
+				defer app_destroy(&a)
+				d := app_active(&a)
+				os.remove(gone) // now unstattable, with the cap left at its real 64 MB
+				command_dispatch(.Reopen_CP1252, {}, &a, &dummy, &t, 10)
+				refused := d.enc == .UTF8 && strings.has_prefix(a.notice, "[REOPEN REFUSED")
+				fmt.printfln(
+					"  %-6s an unstattable file is over the cap, not under it: enc=%v note=%q",
+					"ok" if refused else "FAIL", d.enc, a.notice,
+				)
+				if !refused {bad += 1}
+				return
+			}
+			bad += reopen_unstattable_case()
+
 			fmt.printfln("enctest: %d failures", bad)
 			return true
 		}

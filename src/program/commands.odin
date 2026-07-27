@@ -519,17 +519,41 @@ reopen_with_encoding :: proc(app: ^App, doc: ^Document, w: ^plat.Window, enc: ba
 	// be asked to discard unsaved work for first. Only the transcoding rows are
 	// capped -- doc_open takes the private copy only when the resolved encoding
 	// is not UTF-8, so Reopen as UTF-8 keeps the mapping and costs nothing extra
-	// however large the file is. doc.disk_stamp.size is the size the watcher last
-	// saw, which is the same number that decides mapped-vs-copied on the re-open.
-	if enc != .UTF8 && doc.disk_stamp.size > reopen_transcode_max_bytes {
-		app_note(
-			app,
-			fmt.tprintf(
-				"[REOPEN REFUSED - re-decoding reads the whole file at once, and this one is over the %d MB limit]",
-				reopen_transcode_max_bytes / (1024 * 1024),
-			),
-		)
-		return
+	// however large the file is.
+	//
+	// Stat NOW rather than reading doc.disk_stamp.size, which is what this used
+	// to do and what made the cap fail OPEN on exactly the two cases it exists
+	// for: the stamp is 0 when the last stat failed (a dropped share), and it is
+	// stale on a restored dirty tab, which carries the size the session recorded
+	// -- so a file that grew to 500 MB while Newtpad was closed reported its old
+	// size and the cap waved the transcode through. The size that matters is the
+	// size doc_open is about to read, and that is only knowable now.
+	//
+	// A failed stat REFUSES. Being wrong in that direction costs a menu row that
+	// does nothing and says why; being wrong in the other costs the multi-second
+	// UI freeze the cap exists to prevent, on a file we could not even measure.
+	// A guard whose unknown case is its unsafe case is not a guard.
+	//
+	// The stat is synchronous on the UI thread and can block for the redirector
+	// timeout on a dropped share (see plat.file_stamp) -- but the reopen it
+	// gates opens and reads that same path, so refusing here is strictly less
+	// blocking than proceeding, not more.
+	if enc != .UTF8 {
+		st := plat.file_stamp(doc.path)
+		if !st.ok {
+			app_note(app, "[REOPEN REFUSED - the file could not be measured, so its cost is unknown]")
+			return
+		}
+		if st.size > reopen_transcode_max_bytes {
+			app_note(
+				app,
+				fmt.tprintf(
+					"[REOPEN REFUSED - re-decoding reads the whole file at once, and this one is over the %d MB limit]",
+					reopen_transcode_max_bytes / (1024 * 1024),
+				),
+			)
+			return
+		}
 	}
 	if doc.modified {
 		if !plat.confirm_reopen(w.hwnd if w != nil else nil, doc_display_name(doc), enc_name(enc)) {
