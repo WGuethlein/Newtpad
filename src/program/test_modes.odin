@@ -194,6 +194,15 @@ when NEWTPAD_TESTS {
 		// theme_resolve, which is the reason this is a real frame and not a
 		// plausible one.
 		g_theme = theme_resolve(app.settings.theme_name)
+		// Same reason, one line later: the colour rules (rules.odin) are a span
+		// producer in doc_draw, so a frame measured without them is not the
+		// frame this machine draws. A scratch session dir means "whatever
+		// rules.txt you put THERE", which is what makes a with/without
+		// comparison possible at all -- before this call the mode reported a
+		// bit-identical digest with rules active, which is precisely the false
+		// green a digest exists to prevent.
+		rules_load()
+		defer rules_reset()
 		defer app_destroy(&app)
 		if !app_open_path(&app, path) {
 			fmt.eprintfln("drawcount: could not open %q", path)
@@ -12905,6 +12914,1306 @@ when NEWTPAD_TESTS {
 			bm_session(&bad, BM_FIX, bm_set)
 
 			fmt.printfln("bookmarktest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad sortlinestest` — Sort Lines / Sort Lines Descending / Remove
+		// Duplicate Lines (doc.odin's doc_sort_lines and the three commands).
+		//
+		// Every case asserts the WHOLE buffer byte-for-byte, never a line count and
+		// never a length: the entire risk of this feature is a rewrite that lands
+		// the right number of lines with the wrong bytes at the edges -- a swallowed
+		// '\r', an invented trailing newline, a corrupted first or last line of a
+		// selection. A length check cannot see any of those.
+		//
+		// Each case is its own local proc holding one Document at a time
+		// (development-loop.md §6: test_mode_dispatch's frame is already large and
+		// blocktest has hit a real stack overflow twice this way).
+		if os.args[1] == "sortlinestest" {
+			sl_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			// --- ascending, whole document (no selection) ----------------------------
+			//
+			// The caret sits mid-document with NO selection, so "the whole document"
+			// is the scope under test rather than an accident of the caret being at
+			// 0. Case-insensitive: "Apple" sorts with "apple", not before "banana"
+			// by ASCII (where every capital beats every lowercase, and a sort of a
+			// mixed-case list looks broken).
+			sl_asc :: proc(bad: ^int) {
+				fmt.println("--- ascending, whole document ---")
+				src := "banana\nApple\ncherry\napple\n"
+				d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				defer doc_close(&d)
+				d.cursor, d.anchor = 15, 15 // inside "cherry", no selection
+				r := doc_sort_lines(&d, .Ascending)
+				got := doc_debug_string(&d)
+				want := "Apple\napple\nbanana\ncherry\n"
+				sl_chk(bad, r == .Ok && got == want, fmt.tprintf("sorts the whole file with no selection: %v %q (want %q)", r, got, want))
+				// The trailing newline count is part of the bytes above, but say it
+				// separately so a failure names the cause rather than the diff.
+				sl_chk(bad, strings.count(got, "\n") == strings.count(src, "\n"), fmt.tprintf("the number of line terminators is unchanged: %d (want %d)", strings.count(got, "\n"), strings.count(src, "\n")))
+				// No selection in, no selection out -- and the caret lands at the
+				// start of what was sorted rather than at the end of the file.
+				sl_chk(bad, d.cursor == 0 && d.anchor == 0, fmt.tprintf("the caret collapses to the region start: cursor=%d anchor=%d (want 0/0)", d.cursor, d.anchor))
+				// Running it again finds nothing to do: no write, no undo entry.
+				u := len(d.undo)
+				r2 := doc_sort_lines(&d, .Ascending)
+				sl_chk(bad, r2 == .Unchanged && len(d.undo) == u && doc_debug_string(&d) == want, fmt.tprintf("sorting an already-sorted file is a no-op with no undo entry: %v undo=%d (want Unchanged/%d)", r2, len(d.undo), u))
+			}
+			// --- descending ----------------------------------------------------------
+			sl_desc :: proc(bad: ^int) {
+				fmt.println("--- descending ---")
+				d := doc_from_content(transmute([]u8)strings.clone("banana\nApple\ncherry\napple\n"), "", .UTF8)
+				defer doc_close(&d)
+				r := doc_sort_lines(&d, .Descending)
+				got := doc_debug_string(&d)
+				// "Apple" BEFORE "apple": descending reverses the ORDER, not the
+				// ties. reverse_sort over the ascending comparator gives
+				// "apple\nApple" here and fails this line.
+				want := "cherry\nbanana\nApple\napple\n"
+				sl_chk(bad, r == .Ok && got == want, fmt.tprintf("descending, with ties still in original order: %v %q (want %q)", r, got, want))
+			}
+			// --- a selection with a PARTIAL line at both ends -------------------------
+			//
+			// The selection starts inside "delta" and ends inside "alpha". Both must
+			// be sorted whole; the lines outside must not move at all. An
+			// implementation that sorted the raw selection would leave "de" and
+			// "al" stranded, which is the corruption the expansion exists to stop.
+			sl_selection :: proc(bad: ^int) {
+				fmt.println("--- selection, partial lines at both ends ---")
+				//              0    4      10       18     24     30
+				src := "zzz\ndelta\ncharlie\nbravo\nalpha\nyyy\n"
+				d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				defer doc_close(&d)
+				d.anchor, d.cursor = 6, 26 // "de|lta" ... "al|pha"
+				r := doc_sort_lines(&d, .Ascending)
+				got := doc_debug_string(&d)
+				want := "zzz\nalpha\nbravo\ncharlie\ndelta\nyyy\n"
+				sl_chk(bad, r == .Ok && got == want, fmt.tprintf("both partial lines are expanded whole: %v %q (want %q)", r, got, want))
+				// The region stays selected so a second command can follow, and its
+				// bounds are the EXPANDED ones, not the ones the user dragged.
+				sl_chk(bad, d.anchor == 4 && d.cursor == 29, fmt.tprintf("the expanded region stays selected: [%d,%d) (want [4,29))", d.anchor, d.cursor))
+			}
+			// --- stability -----------------------------------------------------------
+			//
+			// 32 lines that are all the same word in different cases: every one
+			// compares EQUAL under the case-insensitive key, and every one is a
+			// distinct byte string, so their order in the output is a direct readout
+			// of whether the sort is stable. 32 rather than a handful because
+			// slice.sort_by is smoothsort -- explicitly "not guaranteed to be
+			// stable" -- and a heap over four elements can come back in order by
+			// luck. The "zzz" line is there so the sort actually WRITES: without it
+			// the correct output is byte-identical to the input and the case would
+			// assert nothing.
+			//
+			// Descending is asserted on the same fixture and must give the SAME
+			// order for the 32, because ties break on the original index in both
+			// directions.
+			sl_stable :: proc(bad: ^int) {
+				fmt.println("--- stability (32 lines equal under the key) ---")
+				b := strings.builder_make(context.temp_allocator)
+				variants := make([dynamic]string, 0, 32, context.temp_allocator)
+				for k in 0 ..< 32 {
+					i := (k * 13) % 32 // a permutation of 0..31: not already sorted
+					w := make([]u8, 5, context.temp_allocator)
+					for j in 0 ..< 5 {
+						w[j] = u8('A' + j) if (i >> uint(j)) & 1 == 1 else u8('a' + j)
+					}
+					append(&variants, string(w))
+					// "zzz" sits in the MIDDLE, so BOTH directions have to move it
+					// and neither case can be "correct" by returning .Unchanged --
+					// which is exactly what happened with it at one end, and would
+					// have made one of the two assertions weaker than it looks.
+					if k == 16 {strings.write_string(&b, "zzz\n")}
+					strings.write_string(&b, string(w))
+					strings.write_byte(&b, '\n')
+				}
+				src := strings.to_string(b)
+				tail := strings.builder_make(context.temp_allocator)
+				for v in variants {
+					strings.write_string(&tail, v)
+					strings.write_byte(&tail, '\n')
+				}
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					got := doc_debug_string(&d)
+					want := fmt.tprintf("%szzz\n", strings.to_string(tail))
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("ascending keeps all 32 equal keys in their original order (first 24 of %d bytes: %q)", len(got), got[:min(24, len(got))]))
+				}
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Descending)
+					got := doc_debug_string(&d)
+					want := fmt.tprintf("zzz\n%s", strings.to_string(tail))
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("descending keeps them in the SAME order (ties are not reversed) (first 24 of %d bytes: %q)", len(got), got[:min(24, len(got))]))
+				}
+			}
+			// --- CRLF ----------------------------------------------------------------
+			//
+			// A CRLF file comes back CRLF, with and without a trailing terminator.
+			//
+			// This comment used to claim that a stray '\r' left on a line's content
+			// "cannot change the ORDER, because CR sorts before every printable
+			// byte". That is true only of bytes >= 0x20. TAB is 0x09, BELOW CR's
+			// 0x0D -- so `key` against `key\tvalue`, which is what half the config
+			// and log files in the world look like, orders one way with the
+			// terminator peeled and the other way with it left on. The last case
+			// below is that fixture, and it is the one that makes "\r\n is ONE
+			// terminator" a falsifiable claim for the SORT rather than only for
+			// dedupe.
+			sl_crlf :: proc(bad: ^int) {
+				fmt.println("--- CRLF ---")
+				{
+					d := doc_from_content(transmute([]u8)strings.clone("banana\r\nApple\r\ncherry\r\n"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					got := doc_debug_string(&d)
+					want := "Apple\r\nbanana\r\ncherry\r\n"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("a CRLF file comes back CRLF: %v %q (want %q)", r, got, want))
+				}
+				{
+					// No trailing terminator: the last line is the only one without
+					// a '\r' in front of its break, and the file must not gain one.
+					d := doc_from_content(transmute([]u8)strings.clone("dupA\r\nother\r\ndupB"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Descending)
+					got := doc_debug_string(&d)
+					want := "other\r\ndupB\r\ndupA"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("a CRLF file with no trailing terminator keeps both properties: %v %q (want %q)", r, got, want))
+				}
+				{
+					// Dedupe is where "\r\n is ONE terminator" can actually be
+					// falsified, because it compares whole lines for equality rather
+					// than ordering them. The last line here has no '\r' in front of
+					// its break -- there is no break -- so a split on '\n' alone
+					// leaves every OTHER line carrying one, and the duplicate stops
+					// matching.
+					d := doc_from_content(transmute([]u8)strings.clone("dup\r\nother\r\ndup"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Dedupe)
+					got := doc_debug_string(&d)
+					want := "dup\r\nother"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("dedupe sees \\r\\n as one terminator, not content: %v %q (want %q)", r, got, want))
+				}
+				{
+					// The same duplicate, but now the file DOES end with a
+					// terminator -- which moves the load onto where the region
+					// STOPS. Ending it at the raw '\n' instead of the line's content
+					// end leaves a lone '\r' as the last line's last byte, and the
+					// duplicate stops matching for that reason instead.
+					d := doc_from_content(transmute([]u8)strings.clone("dup\r\nother\r\ndup\r\n"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Dedupe)
+					got := doc_debug_string(&d)
+					want := "dup\r\nother\r\n"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("the region stops at the last line's content end, not at its '\\n': %v %q (want %q)", r, got, want))
+				}
+				{
+					// The CRLF case that changes the ORDER, not only the bytes. A
+					// line's content ends where the next byte decides the comparison,
+					// and here that byte is TAB (0x09) on two lines against the
+					// leftover CR (0x0D) on the third. Peeled, "key" is a prefix of
+					// both others and the length rule puts it first. Left on, "key\r"
+					// compares at index 3 against '\t' -- and 0x09 < 0x0D, so both
+					// tabbed lines sort AHEAD of the bare key instead of behind it.
+					//
+					// `key` beside `key<tab>value` is what half the config and log
+					// files in the world look like, so this is a shape the product
+					// actually meets, not a constructed one.
+					d := doc_from_content(transmute([]u8)strings.clone("key\tb\r\nkey\r\nkey\ta\r\n"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					got := doc_debug_string(&d)
+					want := "key\r\nkey\ta\r\nkey\tb\r\n"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("a leftover '\\r' would change the ORDER when the next byte is TAB: %v %q (want %q)", r, got, want))
+				}
+			}
+			// --- a region whose line endings disagree with each other -----------------
+			//
+			// NOT what the plan says (it says re-emit doc.eol). Terminators keep
+			// their POSITIONS instead -- doc_move_lines' rule -- so a mixed region
+			// comes back with the same terminator bytes in the same places rather
+			// than normalised to one kind. It matters because detect_line_ending
+			// only sniffs the head of the file (§6ab), so doc.eol can genuinely
+			// disagree with the region being sorted, and normalising there would be
+			// a silent rewrite of bytes the user did not ask to touch.
+			sl_mixed :: proc(bad: ^int) {
+				fmt.println("--- a mixed-terminator region is not normalised ---")
+				d := doc_from_content(transmute([]u8)strings.clone("b\r\na\nc\r\n"), "", .UTF8)
+				defer doc_close(&d)
+				d.eol = .LF // what detect_line_ending would say from a sniff
+				r := doc_sort_lines(&d, .Ascending)
+				got := doc_debug_string(&d)
+				want := "a\r\nb\nc\r\n"
+				sl_chk(bad, r == .Ok && got == want, fmt.tprintf("terminators keep their positions, none is rewritten: %v %q (want %q)", r, got, want))
+			}
+			// --- no trailing newline --------------------------------------------------
+			//
+			// The file must not GAIN one. Every naive join appends a terminator
+			// after the last line.
+			sl_no_trailing :: proc(bad: ^int) {
+				fmt.println("--- no trailing newline ---")
+				{
+					d := doc_from_content(transmute([]u8)strings.clone("cherry\nbanana\napple"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					got := doc_debug_string(&d)
+					want := "apple\nbanana\ncherry"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("a file with no trailing newline does not gain one: %v %q (want %q)", r, got, want))
+				}
+				{
+					// ...and one WITH a trailing newline does not lose it, nor gain a
+					// second: the empty last line is a terminator, not a line to sort.
+					// Sorting it as a line floats "" to the top and gives "\na\nb".
+					d := doc_from_content(transmute([]u8)strings.clone("b\na\n"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					got := doc_debug_string(&d)
+					sl_chk(bad, r == .Ok && got == "a\nb\n", fmt.tprintf("the trailing empty line is not sorted as a line: %v %q (want %q)", r, got, "a\nb\n"))
+				}
+				{
+					// A single line has nothing to sort and must not be rewritten.
+					d := doc_from_content(transmute([]u8)strings.clone("only\n"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					sl_chk(bad, r == .Unchanged && doc_debug_string(&d) == "only\n" && len(d.undo) == 0, fmt.tprintf("a one-line file is left alone: %v %q undo=%d", r, doc_debug_string(&d), len(d.undo)))
+				}
+			}
+			// --- one undo entry -------------------------------------------------------
+			//
+			// One entry, and undoing it restores every byte. The failure this guards
+			// is a per-line edit loop: with UNDO_MAX at 200, a sort that pushed an
+			// entry per line would evict the pre-sort state entirely and no amount
+			// of Ctrl+Z would get the file back. So the count is asserted against
+			// the LINE COUNT of the fixture, not against 1 alone -- 12 lines, and a
+			// per-line implementation reads 12.
+			sl_undo :: proc(bad: ^int) {
+				fmt.println("--- one undo entry ---")
+				src := "l\nk\nj\ni\nh\ng\nf\ne\nd\nc\nb\na\n"
+				d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				defer doc_close(&d)
+				u0 := len(d.undo)
+				r := doc_sort_lines(&d, .Ascending)
+				want := "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n"
+				sl_chk(bad, r == .Ok && doc_debug_string(&d) == want, fmt.tprintf("12 lines sort: %v %q", r, doc_debug_string(&d)))
+				sl_chk(bad, len(d.undo) == u0 + 1, fmt.tprintf("exactly one undo entry for 12 sorted lines: %d (want %d)", len(d.undo), u0 + 1))
+				doc_undo(&d)
+				sl_chk(bad, doc_debug_string(&d) == src && len(d.undo) == u0, fmt.tprintf("ONE undo restores every byte: %q (want %q) undo=%d", doc_debug_string(&d), src, len(d.undo)))
+				doc_redo(&d)
+				sl_chk(bad, doc_debug_string(&d) == want, fmt.tprintf("and redo puts it back: %q", doc_debug_string(&d)))
+				// A do-nothing sort must not destroy the REDO stack.
+				//
+				// This replaces an assertion on d.state_count == 1, which no
+				// implementation could have made anything else: doc_batch_end sets
+				// max(1,1), push_undo without the batch sets 1, and a per-line loop
+				// still labels each entry 1. It could not fail, so it proved nothing.
+				//
+				// This can. push_undo clears doc.redo unconditionally, so the no-op
+				// guard being ahead of doc_batch_begin -- which its comment in
+				// doc.odin claims is "crucial" -- is the only thing standing between
+				// "sort an already-sorted file" and "your redo history is gone". Set
+				// up a real redo entry first (type, then undo), then sort a file that
+				// is already in order.
+				doc_insert_rune(&d, 'x')
+				doc_undo(&d)
+				u1, redo1 := len(d.undo), len(d.redo)
+				r2 := doc_sort_lines(&d, .Ascending)
+				sl_chk(
+					bad,
+					r2 == .Unchanged && len(d.redo) == redo1 && len(d.undo) == u1 && doc_debug_string(&d) == want,
+					fmt.tprintf("a no-op sort leaves the redo stack alone: %v redo=%d (want %d) undo=%d (want %d) %q", r2, len(d.redo), redo1, len(d.undo), u1, doc_debug_string(&d)),
+				)
+			}
+			// --- bookmarks ------------------------------------------------------------
+			//
+			// Inside the sorted region: DROPPED. Outside: kept, and still naming its
+			// own line. A sort reorders lines, so no shift rule can say where a
+			// bookmark went -- leaving one pointing at whatever line landed on its
+			// offset is §6ad's Alt+Down bug, which shipped.
+			//
+			// Read the text AT each surviving bookmark rather than at the offset it
+			// is expected to hold: an offset that is arithmetically right but names
+			// the wrong line still fails that way (bookmarktest's own lesson).
+			sl_bookmarks :: proc(bad: ^int) {
+				fmt.println("--- bookmarks in the region are dropped, outside kept ---")
+				//              0    4      10       18     24     30
+				src := "zzz\ndelta\ncharlie\nbravo\nalpha\nyyy\n"
+				d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				defer doc_close(&d)
+				for o in ([]int{0, 10, 24, 30}) { // zzz, charlie, alpha, yyy
+					d.cursor, d.anchor = o, o
+					doc_bookmark_toggle(&d)
+				}
+				sl_chk(bad, len(d.bookmarks) == 4, fmt.tprintf("four bookmarks set: %v", d.bookmarks[:]))
+				d.anchor, d.cursor = 6, 26 // the same partial selection as above
+				r := doc_sort_lines(&d, .Ascending)
+				at :: proc(d: ^Document, i, n: int) -> string {
+					if i < 0 || i >= len(d.bookmarks) {return "<no such bookmark>"}
+					b := d.bookmarks[i]
+					if b < 0 || b >= d.pt.length {return "<oob>"}
+					buf := make([]u8, min(n, d.pt.length - b), context.temp_allocator)
+					base.pt_read(&d.pt, b, buf)
+					return string(buf)
+				}
+				kept := len(d.bookmarks) == 2 && d.bookmarks[0] == 0 && d.bookmarks[1] == 30
+				sl_chk(bad, r == .Ok && kept, fmt.tprintf("the two inside the region are gone, the two outside stayed: %v (want [0 30])", d.bookmarks[:]))
+				sl_chk(bad, at(&d, 0, 3) == "zzz" && at(&d, 1, 3) == "yyy", fmt.tprintf("and each survivor still names its own line: %q / %q (want \"zzz\" / \"yyy\")", at(&d, 0, 3), at(&d, 1, 3)))
+				// The invariant the shift rules exist to preserve, checked here too
+				// because a wrong answer can be sorted and in range and still not be
+				// a line start.
+				inv := true
+				prev := -1
+				for b in d.bookmarks {
+					if b <= prev || b < 0 || b > d.pt.length {inv = false}
+					prev = b
+					if b == 0 {continue}
+					one: [1]u8
+					base.pt_read(&d.pt, b - 1, one[:])
+					if one[0] != '\n' {inv = false}
+				}
+				sl_chk(bad, inv, fmt.tprintf("every surviving entry is still a real line start: %v", d.bookmarks[:]))
+				// Undo restores the set, so the drop is not a loss the user cannot
+				// take back.
+				doc_undo(&d)
+				sl_chk(bad, len(d.bookmarks) == 4, fmt.tprintf("undo brings the dropped bookmarks back: %v", d.bookmarks[:]))
+			}
+			// --- dedupe ---------------------------------------------------------------
+			sl_dedupe :: proc(bad: ^int) {
+				fmt.println("--- remove duplicate lines ---")
+				{
+					// Duplicates at a DISTANCE, never adjacent: uniq-style adjacent
+					// collapse leaves this input completely unchanged. And "Alpha"
+					// must survive, because dedupe compares exact bytes while the
+					// SORT compares case-insensitively -- the one place the two
+					// commands deliberately disagree.
+					src := "alpha\nbravo\nAlpha\ncharlie\nbravo\nalpha\n"
+					d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+					defer doc_close(&d)
+					u0 := len(d.undo)
+					r := doc_sort_lines(&d, .Dedupe)
+					got := doc_debug_string(&d)
+					want := "alpha\nbravo\nAlpha\ncharlie\n"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("keeps the FIRST of each, at any distance, and Alpha != alpha: %v %q (want %q)", r, got, want))
+					sl_chk(bad, len(d.undo) == u0 + 1, fmt.tprintf("one undo entry: %d (want %d)", len(d.undo), u0 + 1))
+					doc_undo(&d)
+					sl_chk(bad, doc_debug_string(&d) == src, fmt.tprintf("undo restores every dropped line: %q", doc_debug_string(&d)))
+				}
+				{
+					// A no-op dedupe must push NOTHING: an undo entry that restores
+					// the state it is already in is worse than no entry, and it
+					// evicts a real one from UNDO_MAX. It must not dirty the
+					// document or bump the revision either -- push_undo does both,
+					// so an entry appearing here also means an unsaved-changes
+					// prompt on a file nothing changed.
+					d := doc_from_content(transmute([]u8)strings.clone("a\nb\nc\n"), "", .UTF8)
+					defer doc_close(&d)
+					rev0 := d.revision
+					r := doc_sort_lines(&d, .Dedupe)
+					sl_chk(
+						bad,
+						r == .Unchanged && len(d.undo) == 0 && d.revision == rev0 && doc_debug_string(&d) == "a\nb\nc\n",
+						fmt.tprintf("a dedupe with nothing to remove pushes no undo entry: %v undo=%d revision %d->%d %q", r, len(d.undo), rev0, d.revision, doc_debug_string(&d)),
+					)
+				}
+				{
+					// Dedupe inside a selection leaves the lines outside alone,
+					// including a duplicate of one it removed.
+					src := "keep\nkeep\nkeep\n"
+					d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+					defer doc_close(&d)
+					d.anchor, d.cursor = 5, 12 // lines 2 and 3 only
+					r := doc_sort_lines(&d, .Dedupe)
+					got := doc_debug_string(&d)
+					sl_chk(bad, r == .Ok && got == "keep\nkeep\n", fmt.tprintf("dedupe is scoped to the selection: %v %q (want %q)", r, got, "keep\nkeep\n"))
+				}
+			}
+			// --- the caps refuse, and change nothing ---------------------------------
+			//
+			// Two caps, and the test proves each one BINDS FIRST in its own case:
+			// the line fixture is ~2 MB (well under SORT_MAX_BYTES) and the byte
+			// fixture is 17 lines (well under SORT_MAX_LINES), so neither case can
+			// be passing for the other cap's reason.
+			sl_cap_lines :: proc(bad: ^int) {
+				fmt.println("--- the line cap refuses ---")
+				n := SORT_MAX_LINES + 2
+				content := make([]u8, n * 2)
+				for i in 0 ..< n {
+					content[i * 2] = 'b' if i % 2 == 0 else 'a' // unsorted, so a sort WOULD rewrite it
+					content[i * 2 + 1] = '\n'
+				}
+				before := make([]u8, len(content))
+				defer delete(before)
+				copy(before, content)
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+				rev0 := d.revision
+				// Measured, not asserted by inspection: the refusal has to come
+				// BEFORE the per-line allocation, and the only way to see that is to
+				// watch what the refused call actually allocates. SORT_MAX_LINES' own
+				// comment justifies the cap by saying "a Sort_Line per line ... is
+				// what costs there" -- splitting first spends exactly that (24 B a
+				// line, plus both dynamic arrays doubling their way up) on a region
+				// it is about to throw away.
+				track: mem.Tracking_Allocator
+				mem.tracking_allocator_init(&track, context.allocator)
+				defer mem.tracking_allocator_destroy(&track)
+				r: Sort_Result
+				{
+					context.allocator = mem.tracking_allocator(&track)
+					r = doc_sort_lines(&d, .Ascending)
+				}
+				after := base.pt_collect(&d.pt, context.temp_allocator)
+				same := len(after) == len(before)
+				if same {
+					for i in 0 ..< len(before) {
+						if after[i] != before[i] {same = false;break}
+					}
+				}
+				sl_chk(bad, r == .Too_Big, fmt.tprintf("%d lines / %.1f MB is refused: %v (want Too_Big)", n, f64(len(before)) / (1024 * 1024), r))
+				sl_chk(bad, same && len(d.undo) == 0 && d.revision == rev0, fmt.tprintf("and nothing changed: bytes-equal=%v undo=%d revision %d->%d", same, len(d.undo), rev0, d.revision))
+				// The one read of the region is unavoidable (the line count is not
+				// knowable without it); everything past it is not. A megabyte of slack
+				// over the region's own size, so this measures the per-line arrays and
+				// not the read.
+				SLACK :: 1024 * 1024
+				sl_chk(
+					bad,
+					int(track.peak_memory_allocated) < len(before) + SLACK,
+					fmt.tprintf(
+						"...and refuses before it allocates per line: peak %.1f MB on a %.1f MB region (want under %.1f MB)",
+						f64(track.peak_memory_allocated) / (1024 * 1024),
+						f64(len(before)) / (1024 * 1024),
+						f64(len(before) + SLACK) / (1024 * 1024),
+					),
+				)
+			}
+			sl_cap_bytes :: proc(bad: ^int) {
+				fmt.println("--- the byte cap refuses ---")
+				BLOCK :: 1024 * 1024
+				nblocks := 17 // 17 MB > SORT_MAX_BYTES, in only 17 lines
+				content := make([]u8, nblocks * BLOCK)
+				for k in 0 ..< nblocks {
+					fill := u8('b') if k % 2 == 0 else u8('a')
+					for i in 0 ..< BLOCK {content[k * BLOCK + i] = fill}
+					content[(k + 1) * BLOCK - 1] = '\n'
+				}
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+				rev0, len0 := d.revision, d.pt.length
+				r := doc_sort_lines(&d, .Ascending)
+				// Spot-check the head byte of every block rather than collecting 17
+				// MB again: a sort would have moved the 'a' blocks in front of the
+				// 'b' blocks, so this sees any rewrite that actually happened.
+				intact := d.pt.length == len0
+				for k in 0 ..< nblocks {
+					one: [1]u8
+					base.pt_read(&d.pt, k * BLOCK, one[:])
+					if one[0] != (u8('b') if k % 2 == 0 else u8('a')) {intact = false}
+				}
+				sl_chk(bad, r == .Too_Big, fmt.tprintf("%d MB in %d lines is refused: %v (want Too_Big)", nblocks, nblocks, r))
+				sl_chk(bad, intact && len(d.undo) == 0 && d.revision == rev0, fmt.tprintf("and nothing changed: blocks-intact=%v undo=%d revision %d->%d", intact, len(d.undo), rev0, d.revision))
+			}
+			// --- the three commands, as the app sees them ----------------------------
+			//
+			// The palette is the ONLY route to these (no default chord), so a
+			// missing row means an unreachable feature; and every one of them
+			// rewrites the buffer, so command_mutates_doc has to know -- that is
+			// what makes table view block them and what drops a live column
+			// rectangle first. §6ad's Eol_LF was missed in exactly that list.
+			sl_commands :: proc(bad: ^int) {
+				fmt.println("--- the commands ---")
+				for cmd in ([]Command_Id{.Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines}) {
+					sl_chk(bad, command_mutates_doc(cmd), fmt.tprintf("%v is a document mutation", cmd))
+					sl_chk(bad, command_in_palette(cmd), fmt.tprintf("%v is offered in the palette", cmd))
+					sl_chk(bad, command_chord(cmd) == "", fmt.tprintf("%v has no default chord: %q", cmd, command_chord(cmd)))
+					sl_chk(bad, command_table[cmd].title != "" && command_table[cmd].category == "Edit", fmt.tprintf("%v is titled and filed under Edit: %q", cmd, command_table[cmd].title))
+				}
+				// The palette shows the title and nothing else, so the two things a
+				// user cannot otherwise know have to be in it.
+				sl_chk(bad, strings.contains(command_table[.Sort_Lines].title, "selection"), fmt.tprintf("the sort title states its scope: %q", command_table[.Sort_Lines].title))
+				sl_chk(bad, strings.contains(command_table[.Remove_Duplicate_Lines].title, "exact"), fmt.tprintf("the dedupe title states that the match is exact: %q", command_table[.Remove_Duplicate_Lines].title))
+			}
+			// --- a faulted region read is refused, never written back ------------------
+			//
+			// The region is read out of the MAPPED original, and that read can fail:
+			// another process truncates the file, the SEH shim catches it, read_rec
+			// sets pt.fault and leaves the uncopied tail zeroed. Every other reader
+			// only draws a faulted region for one frame. This one would write it back
+			// as a real edit -- a run of NULs spliced into the document, `modified`
+			// set, and an undo entry holding a tree cloned from the same broken
+			// mapping. main.odin's doc_fault_pending recovery runs after the command
+			// and only detaches; it cannot un-write them.
+			//
+			// The fixture keeps the BYTES correct and only reports the copy as failed,
+			// so the region resolution above the read behaves exactly as it always
+			// does and this case is about the guard rather than about garbage input.
+			sl_fault :: proc(bad: ^int) {
+				fmt.println("--- a faulted region read refuses ---")
+				src := "d\nc\nb\na\n"
+				d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				defer doc_close(&d)
+				faulting :: proc(dst, src: []u8) -> bool {
+					copy(dst, src)
+					return false // "the mapping went away mid-copy"
+				}
+				base.safe_copy = faulting
+				r := doc_sort_lines(&d, .Ascending)
+				base.safe_copy = base.default_copy
+				got := doc_debug_string(&d)
+				sl_chk(bad, r == .Faulted, fmt.tprintf("a region read that faulted refuses: %v (want Faulted)", r))
+				sl_chk(bad, got == src && len(d.undo) == 0, fmt.tprintf("...and nothing is written back: %q (want %q) undo=%d (want 0)", got, src, len(d.undo)))
+				// PEEKED, not taken. doc_fault_pending is what arms the recovery, and
+				// a mid-command check that consumed the flag would refuse correctly and
+				// then leave the document attached to a mapping it cannot read.
+				sl_chk(bad, base.pt_take_fault(&d.pt), "...and the flag survives for doc_fault_pending to take")
+			}
+			// --- a live column rectangle refuses --------------------------------------
+			//
+			// The largest escalation on the command_mutates_doc list, and it was
+			// live. command_dispatch's block-clear branch runs block_clear plus
+			// block_collapse_linear for every mutating command NOT on its exception
+			// list, and block_collapse_linear (block.odin) is `doc.anchor =
+			// doc.cursor` -- so doc_sort_lines then saw !doc_has_sel and took the
+			// WHOLE-DOCUMENT branch. Column-select five rows of a 200k-line log, run
+			// Sort Lines from the palette, and the entire file is reordered and every
+			// bookmark inside it dropped. Paste, Delete_Word_Back, Insert_Newline and
+			// Move_Line_* -- the rest of that branch's traffic -- all act at the caret
+			// or on a single line; only this one turns "the selection" into "the file".
+			//
+			// It has to go through the real command_dispatch. The collapse lives
+			// there, not in doc_sort_lines, so a test that called the doc-level proc
+			// directly is structurally incapable of seeing it -- which is exactly why
+			// the feature shipped with the hole.
+			sl_block :: proc(bad: ^int) {
+				fmt.println("--- a live column rectangle refuses ---")
+				a: App
+				dummy: plat.Window
+				t: plat.Text // these commands never measure text; a zero Text is enough
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				ad := app_active(&a)
+				src := "d\nc\nb\na\n"
+				doc_close(ad)
+				ad^ = doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				ad.wrap = false
+				// A rectangle over the first two rows AND a linear selection under it:
+				// the exact state block_collapse_linear exists to flatten, so the
+				// fixture reproduces the escalation rather than approximating it.
+				ad.block = true
+				ad.block_anchor_line_start, ad.block_anchor_cell = 0, 0
+				ad.block_cursor_line_start, ad.block_cursor_cell = 2, 1
+				ad.anchor, ad.cursor = 0, 3
+				a.notice = ""
+				command_dispatch(.Sort_Lines, {}, &a, &dummy, &t, 10)
+				got := doc_debug_string(ad)
+				sl_chk(bad, got == src, fmt.tprintf("a rectangle does not turn Sort Lines into a WHOLE-FILE sort: %q (want %q)", got, src))
+				sl_chk(bad, len(ad.undo) == 0, fmt.tprintf("...and the refusal pushes no undo entry: undo=%d (want 0)", len(ad.undo)))
+				// Every other block refusal leaves the gesture's state alone
+				// (block_extend's comment in block.odin says so explicitly); this one
+				// must too, or the refusal silently destroys the selection instead.
+				sl_chk(bad, block_active(ad), fmt.tprintf("...and the rectangle is still live: block_active=%v (want true)", block_active(ad)))
+				sl_chk(bad, strings.contains(a.notice, "column"), fmt.tprintf("...and it says why, naming the column selection: notice=%q", a.notice))
+				// Dedupe reaches the same branch by the same route.
+				dsrc := "x\nx\ny\n"
+				doc_close(ad)
+				ad^ = doc_from_content(transmute([]u8)strings.clone(dsrc), "", .UTF8)
+				ad.wrap = false
+				ad.block = true
+				ad.block_anchor_line_start, ad.block_anchor_cell = 0, 0
+				ad.block_cursor_line_start, ad.block_cursor_cell = 2, 1
+				ad.anchor, ad.cursor = 0, 0
+				a.notice = ""
+				command_dispatch(.Remove_Duplicate_Lines, {}, &a, &dummy, &t, 10)
+				dgot := doc_debug_string(ad)
+				sl_chk(bad, dgot == dsrc, fmt.tprintf("Remove Duplicate Lines refuses under a rectangle too: %q (want %q)", dgot, dsrc))
+				// The note names the command the user actually ran. Posting "SORT" for
+				// Remove Duplicate Lines tells them a sort was refused for something
+				// they never asked for.
+				sl_chk(bad, !strings.contains(a.notice, "SORT"), fmt.tprintf("...and its note does not claim a SORT was refused: notice=%q", a.notice))
+			}
+			bad := 0
+			sl_asc(&bad)
+			sl_desc(&bad)
+			sl_selection(&bad)
+			sl_stable(&bad)
+			sl_crlf(&bad)
+			sl_mixed(&bad)
+			sl_no_trailing(&bad)
+			sl_undo(&bad)
+			sl_bookmarks(&bad)
+			sl_dedupe(&bad)
+			sl_cap_lines(&bad)
+			sl_cap_bytes(&bad)
+			sl_commands(&bad)
+			sl_fault(&bad)
+			sl_block(&bad)
+			fmt.printfln("sortlinestest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad rulestest` — the keyword->colour rules (rules.odin) and the
+		// N-producer merge they became the third producer of (highlight.odin).
+		//
+		// Three claims need falsifying here, and only the first is about parsing:
+		//
+		//   1. The FILE is tolerant and its rules mean what they say -- unknown
+		//      roles, malformed lines, duplicates, the two caps.
+		//   2. The PRECEDENCE really is links > lexer > rules, asserted in both
+		//      directions against each of the two producers that outrank rules.
+		//      "Both directions" is the load-bearing half: a merge that dropped
+		//      every rule span would pass a one-directional test.
+		//   3. The no-overlap PRECONDITION text_draw_spans requires still holds
+		//      with three producers, including on a row that saturates the row
+		//      token cap -- where the failure is undefined rendering, not a
+		//      wrong colour.
+		//
+		// Plus the cost, because "bounded by construction" is a claim about a
+		// number and this is where the number comes from.
+		if os.args[1] == "rulestest" {
+			if !require_scratch_session("rulestest") {return true}
+			// Roles must resolve to real, distinct colours: with g_theme at its
+			// zero value every span would be transparent black and every
+			// colour assertion below would pass against every other one.
+			g_theme = theme_light()
+
+			ru_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+			// Valid input to text_draw_spans only if ascending by start with no
+			// overlap between consecutive spans -- the same predicate
+			// highlighttest's link-precedence block uses, restated here because
+			// three producers is a new way to violate it.
+			ru_sorted :: proc(spans: []plat.Text_Span) -> bool {
+				for i in 1 ..< len(spans) {
+					if spans[i].start < spans[i - 1].start + spans[i - 1].len {return false}
+				}
+				return true
+			}
+			ru_eq :: proc(a, b: []plat.Text_Span) -> bool {
+				if len(a) != len(b) {return false}
+				for i in 0 ..< len(a) {
+					if a[i].start != b[i].start || a[i].len != b[i].len || a[i].color != b[i].color {return false}
+				}
+				return true
+			}
+			ru_has_color :: proc(spans: []plat.Text_Span, color: [4]f32) -> bool {
+				for s in spans {
+					if s.color == color {return true}
+				}
+				return false
+			}
+			// Lexer spans for a row, through the real dispatch (the extension of
+			// `path` picks the lexer), so these cases collide with what the
+			// product actually colours rather than with hand-written geometry.
+			ru_lex :: proc(path, row: string, out: []plat.Text_Span) -> int {
+				d: Document
+				d.path = path
+				n, _ := highlight_row_spans(&d, transmute([]u8)row, .Normal, out)
+				return n
+			}
+			ru_links :: proc(row: string, out: []plat.Text_Span) -> int {
+				n := 0
+				for l in links_scan(row) {
+					if n >= len(out) {break}
+					out[n] = plat.Text_Span{start = l.start, len = l.len, color = g_theme[.Link]}
+					n += 1
+				}
+				return n
+			}
+
+			// --- parsing --------------------------------------------------------------
+			ru_parse :: proc(bad: ^int) {
+				fmt.println("--- parsing ---")
+				src := "# a comment, and the next line is blank\n\nERROR = Danger\nWARN=Warning\nbadline\n = Danger\nSHOUT =\nFOO = Neon_Pink\nlower = syn_keyword\nERROR = Warning\n"
+				r := rules_parse(src)
+				defer rules_destroy(&r)
+				role_of :: proc(r: ^Color_Rules, pat: string) -> (Color_Role, bool) {
+					for rule in r.list {
+						if rule.pattern == pat {return rule.role, true}
+					}
+					return {}, false
+				}
+				ru_chk(bad, len(r.list) == 3, fmt.tprintf("three good rules survive the file: %d (want 3)", len(r.list)))
+				er, eok := role_of(&r, "ERROR")
+				// LAST wins, and the duplicate does not become a second entry --
+				// two entries for one pattern would also make the row scan's
+				// tie-break reachable, which it is documented not to be.
+				ru_chk(bad, eok && er == .Warning, fmt.tprintf("a duplicate pattern is overridden by the LAST line: %v (want Warning)", er))
+				ru_chk(bad, r.duplicates == 1, fmt.tprintf("...and is counted as a duplicate, not a refusal: %d (want 1)", r.duplicates))
+				wr, wok := role_of(&r, "WARN")
+				ru_chk(bad, wok && wr == .Warning, fmt.tprintf("`WARN=Warning` with no spaces parses: ok=%v %v", wok, wr))
+				lr, lok := role_of(&r, "lower")
+				// The theme files' own lowercase key spelling must work too, or
+				// the role list in the seeded header would be the only spelling
+				// that does and the .theme files would read as a different format.
+				ru_chk(bad, lok && lr == .Syn_Keyword, fmt.tprintf("the lowercase theme-file spelling `syn_keyword` resolves: ok=%v %v", lok, lr))
+				ru_chk(bad, r.rejects[.Unknown_Role] == 1, fmt.tprintf("an unknown role is refused: %d (want 1)", r.rejects[.Unknown_Role]))
+				// `badline` (no '='), ` = Danger` (no pattern) and `SHOUT =`
+				// (no role). Three separate shapes, one counter.
+				ru_chk(bad, r.rejects[.Malformed] == 3, fmt.tprintf("three malformed lines are refused: %d (want 3)", r.rejects[.Malformed]))
+				ru_chk(bad, rules_reject_total(r) == 4, fmt.tprintf("the refusal total excludes the duplicate: %d (want 4)", rules_reject_total(r)))
+				// A pattern may contain '=' because the split is at the LAST one.
+				{
+					r2 := rules_parse("key=value = Syn_String\n")
+					defer rules_destroy(&r2)
+					_, ok := role_of(&r2, "key=value")
+					ru_chk(bad, len(r2.list) == 1 && ok, fmt.tprintf("a pattern may contain '=' (split at the last one): %d rule(s), found=%v", len(r2.list), ok))
+				}
+				// Nothing in this file is ever fatal: a file of pure garbage
+				// leaves an empty, usable rule set.
+				{
+					r3 := rules_parse("!!!\n???\n=\n")
+					defer rules_destroy(&r3)
+					ru_chk(bad, len(r3.list) == 0 && rules_reject_total(r3) == 3, fmt.tprintf("a file of pure garbage yields no rules and no crash: %d rules, %d refused", len(r3.list), rules_reject_total(r3)))
+				}
+			}
+			// --- the two caps ---------------------------------------------------------
+			ru_caps_parse :: proc(bad: ^int) {
+				fmt.println("--- the parse caps ---")
+				b := strings.builder_make(context.temp_allocator)
+				// RULES_MAX + 5 distinct patterns, so the last five are refused.
+				for i in 0 ..< RULES_MAX + 5 {
+					strings.write_string(&b, fmt.tprintf("p%03d = Danger\n", i))
+				}
+				long := strings.repeat("x", RULES_PATTERN_MAX + 1, context.temp_allocator)
+				strings.write_string(&b, fmt.tprintf("%s = Danger\n", long))
+				edge := strings.repeat("y", RULES_PATTERN_MAX, context.temp_allocator)
+				r := rules_parse(strings.to_string(b))
+				defer rules_destroy(&r)
+				ru_chk(bad, len(r.list) == RULES_MAX, fmt.tprintf("no more than RULES_MAX rules are kept: %d (want %d)", len(r.list), RULES_MAX))
+				ru_chk(bad, r.rejects[.Too_Many] == 5, fmt.tprintf("the extras are counted: %d (want 5)", r.rejects[.Too_Many]))
+				// The over-long pattern arrives AFTER the cap is already full, so
+				// assert it in its own file or Too_Many would absorb it.
+				{
+					r2 := rules_parse(fmt.tprintf("%s = Danger\n%s = Warning\n", long, edge))
+					defer rules_destroy(&r2)
+					ru_chk(bad, r2.rejects[.Too_Long] == 1 && len(r2.list) == 1, fmt.tprintf("a pattern over %d bytes is refused and one at exactly %d is not: too_long=%d kept=%d", RULES_PATTERN_MAX, RULES_PATTERN_MAX, r2.rejects[.Too_Long], len(r2.list)))
+				}
+				// The index must cover every kept rule in BOTH tables, or a rule
+				// parses fine and then never matches anything -- the silent
+				// half-failure. Checked against the tables directly rather than
+				// through a match, so a rule that is merely unreachable still
+				// fails here.
+				covered, second := 0, 0
+				for rule, i in r.list {
+					bit := u64(1) << uint(i)
+					if r.first_byte[rule.pattern[0]] & bit != 0 {covered += 1}
+					if len(rule.pattern) == 1 {
+						if r.len1 & bit != 0 {second += 1}
+					} else if r.second_byte[rule.pattern[1]] & bit != 0 {
+						second += 1
+					}
+				}
+				ru_chk(bad, covered == len(r.list) && second == len(r.list), fmt.tprintf("every kept rule is in both index tables: first=%d/%d second=%d/%d", covered, len(r.list), second, len(r.list)))
+				// A ONE-byte pattern has no second byte and must be carried by
+				// `len1` instead -- the case the narrowing AND would otherwise
+				// silently drop. It is also the shape someone writes first
+				// (`> = Syn_Comment` for a quoted mail body).
+				{
+					r2 := rules_parse("> = Syn_Comment\nab = Danger\n")
+					defer rules_destroy(&r2)
+					out: [RULES_MAX_ROW_SPANS]plat.Text_Span
+					n := rules_row_spans_of(&r2, transmute([]u8)string("> quoted"), out[:])
+					ru_chk(bad, n == 1 && out[0].start == 0 && out[0].len == 1, fmt.tprintf("a one-byte pattern still matches: %d span(s) %v", n, out[:n]))
+					// ...including as the very LAST byte of a row, where no
+					// second byte exists to look up at all.
+					n2 := rules_row_spans_of(&r2, transmute([]u8)string("quoted >"), out[:])
+					ru_chk(bad, n2 == 1 && out[0].start == 7, fmt.tprintf("...and at the last byte of the row, where there is no second byte: %d span(s) %v", n2, out[:n2]))
+				}
+			}
+			// --- a rule colours its match ---------------------------------------------
+			ru_colour :: proc(bad: ^int) {
+				fmt.println("--- a rule colours its match ---")
+				r := rules_parse("ERROR = Danger\n")
+				defer rules_destroy(&r)
+				row := "2026 ERROR boom"
+				out: [RULES_MAX_ROW_SPANS]plat.Text_Span
+				n := rules_row_spans_of(&r, transmute([]u8)row, out[:])
+				got := out[:n]
+				want := []plat.Text_Span{{5, 5, g_theme[.Danger]}}
+				ru_chk(bad, ru_eq(got, want), fmt.tprintf("one span over the match: %v (want start=5 len=5 %v)", got, g_theme[.Danger]))
+				// A pattern that is not present colours nothing -- so the case
+				// above is not just "any rule paints something".
+				r2 := rules_parse("ABSENT = Danger\n")
+				defer rules_destroy(&r2)
+				n2 := rules_row_spans_of(&r2, transmute([]u8)row, out[:])
+				ru_chk(bad, n2 == 0, fmt.tprintf("a pattern that does not occur colours nothing: %d spans (want 0)", n2))
+				// Matching is case-sensitive, which is a DECISION and therefore
+				// something a reader is entitled to see asserted rather than
+				// inferred.
+				r3 := rules_parse("error = Danger\n")
+				defer rules_destroy(&r3)
+				n3 := rules_row_spans_of(&r3, transmute([]u8)row, out[:])
+				ru_chk(bad, n3 == 0, fmt.tprintf("matching is case-sensitive: `error` does not match `ERROR`: %d spans (want 0)", n3))
+				// The colour is a ROLE, resolved at draw time. Switching theme
+				// must recolour the same rule with no reparse -- the property
+				// that makes one rules.txt correct in Dark and in Light.
+				//
+				// Accent, not Danger: Dark and Light give Danger the SAME
+				// #BF2929, so a theme-follows assertion on that role passes with
+				// the lookup deleted. Found by the assertion failing, which is
+				// the sabotage arriving early.
+				r4 := rules_parse("ERROR = Accent\n")
+				defer rules_destroy(&r4)
+				saved := g_theme
+				g_theme = theme_dark()
+				n4 := rules_row_spans_of(&r4, transmute([]u8)row, out[:])
+				dark_c := out[0].color
+				g_theme = theme_light()
+				n5 := rules_row_spans_of(&r4, transmute([]u8)row, out[:])
+				light_c := out[0].color
+				g_theme = saved
+				ru_chk(
+					bad,
+					n4 == 1 && n5 == 1 && dark_c == theme_dark()[.Accent] && light_c == theme_light()[.Accent] && dark_c != light_c,
+					fmt.tprintf("the same rule follows the theme with no reload: dark=%v light=%v", dark_c, light_c),
+				)
+			}
+			// --- two rules that would overlap ------------------------------------------
+			//
+			// Deterministic BOTH ways round, because "deterministic" that depends
+			// on the order two rules happen to be written in is not a rule anyone
+			// can predict.
+			ru_overlap :: proc(bad: ^int) {
+				fmt.println("--- overlapping rules ---")
+				out: [RULES_MAX_ROW_SPANS]plat.Text_Span
+				// Same position, different lengths: the longer wins whole.
+				for src in ([]string{"ERR = Warning\nERROR = Danger\n", "ERROR = Danger\nERR = Warning\n"}) {
+					r := rules_parse(src)
+					defer rules_destroy(&r)
+					n := rules_row_spans_of(&r, transmute([]u8)string("x ERROR y"), out[:])
+					got := out[:n]
+					want := []plat.Text_Span{{2, 5, g_theme[.Danger]}}
+					ru_chk(bad, ru_eq(got, want) && ru_sorted(got), fmt.tprintf("longest match wins, either file order: %v (want start=2 len=5 Danger) [%q]", got, src))
+				}
+				// Different positions, ranges that would overlap: leftmost wins
+				// and the loser never gets a turn, so the output cannot overlap.
+				for src in ([]string{"ab = Warning\nbc = Danger\n", "bc = Danger\nab = Warning\n"}) {
+					r := rules_parse(src)
+					defer rules_destroy(&r)
+					n := rules_row_spans_of(&r, transmute([]u8)string("xabcx"), out[:])
+					got := out[:n]
+					want := []plat.Text_Span{{1, 2, g_theme[.Warning]}}
+					ru_chk(bad, ru_eq(got, want) && ru_sorted(got), fmt.tprintf("leftmost wins and the spans never overlap: %v (want start=1 len=2 Warning) [%q]", got, src))
+				}
+			}
+			// --- precedence: the lexer outranks rules, in BOTH directions ---------------
+			ru_prec_lexer :: proc(bad: ^int) {
+				fmt.println("--- precedence vs the lexer ---")
+				r := rules_parse("ERROR = Danger\n")
+				defer rules_destroy(&r)
+				lex_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				rule_buf: [RULES_MAX_ROW_SPANS]plat.Text_Span
+				merged: [HL_MAX_ROW_TOKENS]plat.Text_Span
+
+				// (a) The lexer wins where they collide. `"ERROR"` is a JSON
+				// string token; the rule would repaint five bytes out of the
+				// middle of it and make correct JSON look broken.
+				jrow := `{"level": "ERROR"}`
+				ln := ru_lex("t.json", jrow, lex_buf[:])
+				rn := rules_row_spans_of(&r, transmute([]u8)jrow, rule_buf[:])
+				mn := highlight_merge_row(nil, lex_buf[:ln], rule_buf[:rn], merged[:])
+				out := merged[:mn]
+				ru_chk(bad, ln > 0 && rn == 1, fmt.tprintf("the fixture really does collide: %d lexer span(s), %d rule span(s)", ln, rn))
+				ru_chk(bad, !ru_has_color(out, g_theme[.Danger]) && ru_sorted(out), fmt.tprintf("a rule inside a lexer token is dropped whole: %d span(s), any Danger=%v", mn, ru_has_color(out, g_theme[.Danger])))
+				ru_chk(bad, ru_has_color(out, g_theme[.Syn_String]), "...and the String token it collided with survives")
+
+				// (b) The rule wins where the lexer says nothing -- which is the
+				// entire audience for this feature. A .txt has no lexer at all.
+				trow := "plain ERROR text"
+				tn := ru_lex("notes.txt", trow, lex_buf[:])
+				rn2 := rules_row_spans_of(&r, transmute([]u8)trow, rule_buf[:])
+				mn2 := highlight_merge_row(nil, lex_buf[:tn], rule_buf[:rn2], merged[:])
+				out2 := merged[:mn2]
+				ru_chk(bad, tn == 0, fmt.tprintf(".txt really has no lexer: %d lexer span(s) (want 0)", tn))
+				ru_chk(bad, ru_eq(out2, []plat.Text_Span{{6, 5, g_theme[.Danger]}}), fmt.tprintf("the rule is the only span and it shows: %v", out2))
+
+				// (c) ...and a lexed file is not wholesale immune: a rule that
+				// misses every token still shows inside a .json. Which bytes the
+				// lexer leaves bare is ASSERTED, not assumed, so this case fails
+				// loudly if lex_json ever starts covering them.
+				r2 := rules_parse("ZZZ = Danger\n")
+				defer rules_destroy(&r2)
+				brow := `{"a": 1}   ZZZ`
+				bn := ru_lex("t.json", brow, lex_buf[:])
+				at := strings.index(brow, "ZZZ")
+				bare := true
+				for s in lex_buf[:bn] {
+					if at < s.start + s.len && s.start < at + 3 {bare = false}
+				}
+				rn3 := rules_row_spans_of(&r2, transmute([]u8)brow, rule_buf[:])
+				mn3 := highlight_merge_row(nil, lex_buf[:bn], rule_buf[:rn3], merged[:])
+				out3 := merged[:mn3]
+				ru_chk(bad, bare && bn > 0, fmt.tprintf("the fixture's ZZZ really is outside every token (%d lexer spans, bare=%v)", bn, bare))
+				ru_chk(bad, ru_has_color(out3, g_theme[.Danger]) && ru_sorted(out3), fmt.tprintf("a rule that misses every token still shows inside a lexed file: %v", out3))
+			}
+			// --- precedence: links outrank rules, in BOTH directions --------------------
+			ru_prec_link :: proc(bad: ^int) {
+				fmt.println("--- precedence vs links ---")
+				r := rules_parse("error = Danger\nsee = Warning\n")
+				defer rules_destroy(&r)
+				row := "see https://example.com/error now"
+				link_buf: [8]plat.Text_Span
+				rule_buf: [RULES_MAX_ROW_SPANS]plat.Text_Span
+				merged: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				kn := ru_links(row, link_buf[:])
+				rn := rules_row_spans_of(&r, transmute([]u8)row, rule_buf[:])
+				mn := highlight_merge_row(link_buf[:kn], nil, rule_buf[:rn], merged[:])
+				out := merged[:mn]
+				ru_chk(bad, kn == 1 && rn == 2, fmt.tprintf("the fixture has one link and two rule matches: %d / %d", kn, rn))
+				// Inside the URL: dropped. Outside it: kept. One row, both
+				// directions, so "the merge drops everything" cannot pass.
+				ru_chk(bad, !ru_has_color(out, g_theme[.Danger]), fmt.tprintf("a rule inside a link is dropped: %v", out))
+				ru_chk(bad, ru_eq(out, []plat.Text_Span{{0, 3, g_theme[.Warning]}, {4, 25, g_theme[.Link]}}), fmt.tprintf("...and the rule outside it survives, beside the link: %v", out))
+				ru_chk(bad, ru_sorted(out), "the merged stream is sorted with no overlaps")
+			}
+			// --- an absent or empty rules.txt changes NOTHING ---------------------------
+			//
+			// The weakest possible version of this case is "it does not crash".
+			// This one asserts the SPAN STREAM is byte-identical to what the
+			// two-producer merge produced before rules existed -- on a row that
+			// really has both a lexer token and a link, and with the identity
+			// checked against a NON-EMPTY stream so it cannot hold vacuously.
+			ru_empty :: proc(bad: ^int) {
+				fmt.println("--- an empty or absent rules.txt ---")
+				row := `2026-07-25T10:23:45Z ERROR fetch "https://example.com/x" failed`
+				lex_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				link_buf: [8]plat.Text_Span
+				ln := ru_lex("t.log", row, lex_buf[:])
+				kn := ru_links(row, link_buf[:])
+				before: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				bn := highlight_merge_spans(lex_buf[:ln], link_buf[:kn], before[:])
+				ru_chk(bad, ln > 0 && kn > 0 && bn > 1, fmt.tprintf("the baseline stream is non-empty: %d lexer + %d link -> %d merged", ln, kn, bn))
+
+				rule_buf: [RULES_MAX_ROW_SPANS]plat.Text_Span
+				after: [HL_MAX_ROW_TOKENS]plat.Text_Span
+				for c in ([]struct {
+					label: string,
+					src:   string,
+				}{{"absent (no rules installed at all)", ""}, {"empty file", ""}, {"comments only", "# nothing here\n#\n"}, {"only refused lines", "garbage\nX = Neon_Pink\n"}}) {
+					r := rules_parse(c.src)
+					defer rules_destroy(&r)
+					rn := rules_row_spans_of(&r, transmute([]u8)row, rule_buf[:])
+					an := highlight_merge_row(link_buf[:kn], lex_buf[:ln], rule_buf[:rn], after[:])
+					ru_chk(bad, rn == 0 && an == bn && ru_eq(after[:an], before[:bn]), fmt.tprintf("%s: the span stream is IDENTICAL (%d rule spans, %d vs %d merged)", c.label, rn, an, bn))
+				}
+				// And through the global the shipping path reads, not only
+				// through an explicit rule set.
+				rules_reset()
+				ru_chk(bad, !rules_active() && rules_row_spans(transmute([]u8)row, rule_buf[:]) == 0, "with no rules installed, the shipping entry point returns 0 spans")
+			}
+			// --- the row token cap -------------------------------------------------------
+			//
+			// A row that saturates must DEGRADE (colouring stops) and never
+			// overflow. §5 already records cur_buf saturating as a live visual
+			// bug on dense wrapped lines; rules must not make it worse, which
+			// means they must respect the same budget rather than add to it.
+			ru_cap_row :: proc(bad: ^int) {
+				fmt.println("--- the row token cap ---")
+				// A 1-byte pattern against a full-width row: 2048 candidate
+				// matches into a 256-span buffer.
+				r := rules_parse("a = Danger\n")
+				defer rules_destroy(&r)
+				row := make([]u8, VISIBLE_COLS, context.temp_allocator)
+				for i in 0 ..< len(row) {row[i] = 'a'}
+				out: [RULES_MAX_ROW_SPANS]plat.Text_Span
+				n := rules_row_spans_of(&r, row, out[:])
+				ru_chk(bad, n == RULES_MAX_ROW_SPANS, fmt.tprintf("a saturating row fills the buffer exactly and stops: %d (want %d)", n, RULES_MAX_ROW_SPANS))
+				// `n > 0` first, or a sabotage that returns nothing crashes this
+				// case on out[n-1] instead of reporting it -- a test that panics
+				// is a test that stops telling you which of the others failed.
+				ru_chk(bad, n > 0 && ru_sorted(out[:n]) && out[n - 1].start + out[n - 1].len <= len(row), "...with every span still sorted and inside the row")
+				// A smaller `out` is honoured too -- the cap is the caller's
+				// slice length, not a constant the scan happens to match.
+				small := out[:3]
+				n2 := rules_row_spans_of(&r, row, small)
+				ru_chk(bad, n2 == 3, fmt.tprintf("the cap is len(out), not a constant: %d (want 3)", n2))
+
+				// The MERGE's own budget, with all three producers oversubscribed.
+				lex := make([]plat.Text_Span, HL_MAX_ROW_TOKENS, context.temp_allocator)
+				for i in 0 ..< len(lex) {lex[i] = plat.Text_Span{i * 4, 2, g_theme[.Syn_Keyword]}}
+				rules := make([]plat.Text_Span, RULES_MAX_ROW_SPANS, context.temp_allocator)
+				for i in 0 ..< len(rules) {rules[i] = plat.Text_Span{i * 4 + 2, 2, g_theme[.Danger]}}
+				links := []plat.Text_Span{{1, 1, g_theme[.Link]}}
+				merged := make([]plat.Text_Span, len(lex) + len(rules) + len(links), context.temp_allocator)
+				mn := highlight_merge_row(links, lex, rules, merged)
+				out3 := merged[:mn]
+				ru_chk(bad, mn <= HL_MAX_ROW_TOKENS, fmt.tprintf("the merge never emits more than the survivor budget: %d (cap %d)", mn, HL_MAX_ROW_TOKENS))
+				ru_chk(bad, ru_sorted(out3), "...and a saturated merge is STILL sorted with no overlaps (the precondition, not the colour)")
+				// Degradation, not silence: the surviving spans are the
+				// highest-priority ones, in order, not an arbitrary subset.
+				ru_chk(bad, mn > 0 && out3[0].color == g_theme[.Link], fmt.tprintf("...and the link (highest priority) is still first: %v", out3[0] if mn > 0 else plat.Text_Span{}))
+			}
+			// --- the per-frame cost -------------------------------------------------------
+			//
+			// A FALSIFIER for the cap, not a regression guard: it measures what
+			// RULES_MAX actually costs on a frame's worth of rows, and it FAILS
+			// if the realistic figure crosses the budget the plan set. The
+			// adversarial figure is reported beside it because the two are far
+			// apart and shipping only the friendlier one would be dishonest.
+			ru_cost :: proc(bad: ^int) {
+				fmt.println("--- per-frame cost at RULES_MAX ---")
+				ROWS :: 40 // a 720p window at 16 px is about this many text rows
+				BUDGET_MS :: 1.0 // the batch 10 plan's per-frame budget for this feature
+				// The adversarial case is a tight byte loop and the debug build
+				// bounds-checks every index in it: measured 13.87 ms debug
+				// against 1.63 ms release on the identical fixture, 8.5x. So the
+				// RELEASE gate is the only real one and the debug gate is a
+				// smoke test at a MEASURED multiplier -- §6ad's shape, where the
+				// same honesty was owed about a frame budget.
+				//
+				// The SAME multiplier applies to case (2). It measures 0.71 ms
+				// debug against a 1 ms gate -- a 28% margin -- and the
+				// bounds-checking that makes case (3) 8.5x slower applies to it
+				// too, so a machine 1.4x slower than this one would go red with
+				// nothing wrong. A gate that flakes is worse than no gate,
+				// because the next person learns to ignore it. Case (1) is
+				// 0.038 ms debug and needs no headroom.
+				DEBUG_MULT :: 9.0
+				dbg := f64(DEBUG_MULT) if ODIN_DEBUG else 1.0
+				wide_gate := BUDGET_MS * dbg
+				worst_gate := BUDGET_MS * dbg
+
+				measure :: proc(r: ^Color_Rules, rows: [][]u8, reps: int) -> (ms: f64, spans: int) {
+					out: [RULES_MAX_ROW_SPANS]plat.Text_Span
+					t0 := time.now()
+					for _ in 0 ..< reps {
+						for row in rows {spans += rules_row_spans_of(r, row, out[:])}
+					}
+					return time.duration_milliseconds(time.since(t0)) / f64(reps), spans / max(reps, 1)
+				}
+
+				// (1) REALISTIC at the cap: 64 log/source keywords, a real log
+				// line repeated across the viewport.
+				kw := []string {
+					"ERROR", "WARN", "INFO", "DEBUG", "TRACE", "FATAL", "PANIC", "NOTICE",
+					"TODO", "FIXME", "XXX", "HACK", "NOTE", "BUG", "WARNING", "CRITICAL",
+					"failed", "failure", "success", "timeout", "refused", "denied", "retry", "abort",
+					"null", "nil", "true", "false", "exception", "stack", "trace", "assert",
+					"GET", "POST", "PUT", "DELETE", "HEAD", "PATCH", "200", "404",
+					"500", "301", "403", "502", "connect", "close", "open", "read",
+					"write", "flush", "sync", "lock", "unlock", "spawn", "exit", "kill",
+					"start", "stop", "pause", "resume", "begin", "commit", "rollback", "drop",
+				}
+				b := strings.builder_make(context.temp_allocator)
+				for k in kw {strings.write_string(&b, fmt.tprintf("%s = Danger\n", k))}
+				real_rules := rules_parse(strings.to_string(b))
+				defer rules_destroy(&real_rules)
+				line := transmute([]u8)string("2026-07-27T10:23:45.881Z ERROR worker[3] request failed after 3 retry attempts, status=502 path=/api/v1/things")
+				real_rows := make([][]u8, ROWS, context.temp_allocator)
+				for i in 0 ..< ROWS {real_rows[i] = line}
+				real_ms, real_spans := measure(&real_rules, real_rows, 200)
+
+				// (2) The SAME rules over FULL-WIDTH rows. doc_draw reads up to
+				// VISIBLE_COLS bytes per visual row (line_buf), so a minified
+				// .json or a long unwrapped line really does put 40 x 2048 bytes
+				// through this in one frame -- roughly nineteen times the work of
+				// (1). This is the case the probe budget must never clip, and it
+				// is why the budget is not simply set to (1)'s figure.
+				widetext := make([]u8, VISIBLE_COLS, context.temp_allocator)
+				for i in 0 ..< len(widetext) {widetext[i] = line[i % len(line)]}
+				wide_rows := make([][]u8, ROWS, context.temp_allocator)
+				for i in 0 ..< ROWS {wide_rows[i] = widetext}
+				wide_ms, _ := measure(&real_rules, wide_rows, 60)
+
+				// (3) ADVERSARIAL at the cap, and it is the TRUE worst case
+				// rather than a plausible-looking one: 64 patterns of the maximum
+				// length that agree on the first 62 bytes AND on the last, and
+				// differ only at byte 62, against a full-width row of that byte.
+				// The first-byte index cannot separate them, no cheap prefix or
+				// suffix check could either, and every one of the 64 candidates
+				// at every one of the 2048 positions runs a 62-byte compare
+				// before failing. Nothing a rules.txt can express costs more.
+				//
+				// The obvious version of this fixture -- 63 shared bytes and a
+				// unique LAST byte -- is not adversarial at all: one of the 64
+				// distinguishing bytes lands on 'a' itself, that rule matches,
+				// and the cursor jumps a whole pattern length each time. It
+				// measured 2,016 probes per row where this one measures the cap.
+				b2 := strings.builder_make(context.temp_allocator)
+				for i in 0 ..< RULES_MAX {
+					p := make([]u8, RULES_PATTERN_MAX, context.temp_allocator)
+					for j in 0 ..< len(p) {p[j] = 'a'}
+					p[RULES_PATTERN_MAX - 2] = u8(0x21 + i) // '!'..'`', never 'a'
+					strings.write_string(&b2, fmt.tprintf("%s = Danger\n", string(p)))
+				}
+				worst_rules := rules_parse(strings.to_string(b2))
+				defer rules_destroy(&worst_rules)
+				wide := make([]u8, VISIBLE_COLS, context.temp_allocator)
+				for i in 0 ..< len(wide) {wide[i] = 'a'}
+				worst_rows := make([][]u8, ROWS, context.temp_allocator)
+				for i in 0 ..< ROWS {worst_rows[i] = wide}
+				worst_ms, _ := measure(&worst_rules, worst_rows, 20)
+				// The budget must actually BIND on this shape, or it is dead
+				// code that could be deleted with the timing still green on a
+				// fast enough machine. Measured directly off the probe counter,
+				// one row at a time, against the unbudgeted count the shape
+				// would otherwise reach (one candidate per rule per position).
+				probes_for :: proc(r: ^Color_Rules, row: []u8) -> int {
+					out: [RULES_MAX_ROW_SPANS]plat.Text_Span
+					rules_probes_examined = 0
+					_ = rules_row_spans_of(r, row, out[:])
+					return rules_probes_examined
+				}
+				worst_probes := probes_for(&worst_rules, wide)
+				unbudgeted := len(wide) * RULES_MAX
+				real_probes := probes_for(&real_rules, line)
+				wide_probes := probes_for(&real_rules, widetext)
+
+				// (3) The floor: the same viewport with NO rules, which is what
+				// every machine without a rules.txt pays.
+				none: Color_Rules
+				none_ms, _ := measure(&none, real_rows, 200)
+
+				fmt.printfln("  rules active           : %d (RULES_MAX %d), pattern cap %d bytes", len(real_rules.list), RULES_MAX, RULES_PATTERN_MAX)
+				fmt.printfln("  viewport               : %d rows of %d bytes (case 1) or %d bytes (cases 2 and 3)", ROWS, len(line), len(wide))
+				fmt.printfln("  no rules installed       : %.4f ms/frame", none_ms)
+				fmt.printfln("  (1) real log rows        : %.4f ms/frame  %6.1f us/row  %6d probes/row  (%d spans/frame)", real_ms, real_ms * 1000 / ROWS, real_probes, real_spans)
+				fmt.printfln("  (2) full-width rows      : %.4f ms/frame  %6.1f us/row  %6d probes/row", wide_ms, wide_ms * 1000 / ROWS, wide_probes)
+				fmt.printfln("  (3) adversarial          : %.4f ms/frame  %6.1f us/row  %6d probes/row  (%d unbudgeted, cap %d)", worst_ms, worst_ms * 1000 / ROWS, worst_probes, unbudgeted, RULES_MAX_ROW_PROBES)
+				ru_chk(bad, none_ms < 0.05, fmt.tprintf("a machine with no rules.txt pays essentially nothing: %.4f ms/frame", none_ms))
+				ru_chk(bad, real_ms < BUDGET_MS, fmt.tprintf("(1) 64 rules over a viewport of real log rows stay under %.1f ms/frame: %.4f", f64(BUDGET_MS), real_ms))
+				ru_chk(bad, wide_ms < wide_gate, fmt.tprintf("(2) ...and over a viewport of FULL-WIDTH rows, which is 19x the bytes: %.4f (gate %.1f)", wide_ms, wide_gate))
+				ru_chk(bad, worst_ms < worst_gate, fmt.tprintf("(3) ...and so does the adversarial shape, which is what the probe budget exists for: %.4f (gate %.1f, %s build)", worst_ms, worst_gate, "debug" if ODIN_DEBUG else "release"))
+				// The budget must BIND on (3) -- otherwise it is dead code that
+				// could be deleted with the timing still green -- and must not
+				// come near (1) or (2), because a budget that clipped a real row
+				// is a colouring bug rather than a bound.
+				ru_chk(bad, worst_probes <= RULES_MAX_ROW_PROBES + 1 && worst_probes < unbudgeted / 4, fmt.tprintf("the probe budget really binds on the adversarial row: %d probes of %d unbudgeted", worst_probes, unbudgeted))
+				ru_chk(bad, wide_probes * 2 < RULES_MAX_ROW_PROBES, fmt.tprintf("...and leaves a full-width real row untouched, with 2x to spare: %d probes (cap %d)", wide_probes, RULES_MAX_ROW_PROBES))
+			}
+			// --- the file, through session_dir --------------------------------------------
+			ru_file :: proc(bad: ^int) {
+				fmt.println("--- loading from disk ---")
+				path, pok := rules_path()
+				ru_chk(
+					bad,
+					pok &&
+					strings.has_suffix(path, "rules.txt") &&
+					strings.has_prefix(strings.to_lower(path, context.temp_allocator), strings.to_lower(os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator), context.temp_allocator)),
+					fmt.tprintf("rules.txt resolves inside NEWTPAD_SESSION_DIR: %q", path),
+				)
+				os.remove(path)
+				rules_load()
+				ru_chk(bad, !rules_active(), "no rules.txt -> no rules, and no complaint")
+				_ = os.write_entire_file(path, transmute([]u8)string("ERROR = Danger\n"))
+				rules_load()
+				ru_chk(bad, rules_active() && len(g_rules.list) == 1 && g_rules.list[0].role == .Danger, fmt.tprintf("a rules.txt on disk takes effect: %d rule(s)", len(g_rules.list)))
+				_ = os.write_entire_file(path, transmute([]u8)string("ERROR = Warning\n"))
+				ru_chk(bad, rules_reload_if_active(nil, path) && len(g_rules.list) == 1 && g_rules.list[0].role == .Warning, fmt.tprintf("saving rules.txt re-reads it: %v", g_rules.list[0].role if len(g_rules.list) == 1 else Color_Role{}))
+				other := fmt.tprintf("%s%csettings.txt", os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator), '\\')
+				ru_chk(bad, !rules_reload_if_active(nil, other), "saving some other file does not")
+				{
+					app_t: App
+					menu_init(&app_t.menu)
+					defer app_destroy(&app_t)
+					app_t.settings = settings_default()
+					_ = os.write_entire_file(path, transmute([]u8)string("ERROR = Danger\nWARN = Neon_Pink\nrubbish\n"))
+					reloaded := rules_reload_if_active(&app_t, path)
+					ru_chk(bad, reloaded && len(g_rules.list) == 1, fmt.tprintf("the good lines still take effect alongside the bad: %d rule(s)", len(g_rules.list)))
+					ru_chk(bad, app_notice_active(&app_t) && strings.contains(app_t.notice, "2 LINES REFUSED"), fmt.tprintf("the refusals are reported in the app, not just the log: %q", app_t.notice))
+					// A duplicate is honoured, not refused, so it must NOT post
+					// a note -- telling someone a line was refused when it took
+					// effect sends them hunting for a mistake they did not make.
+					app_t.notice_started = {}
+					_ = os.write_entire_file(path, transmute([]u8)string("ERROR = Danger\nERROR = Warning\n"))
+					rules_reload_if_active(&app_t, path)
+					ru_chk(bad, !app_notice_active(&app_t) && g_rules.list[0].role == .Warning, fmt.tprintf("a duplicate posts no refusal note and the last line wins: notice=%q role=%v", app_t.notice, g_rules.list[0].role))
+				}
+				os.remove(path)
+				rules_reset()
+
+				fmt.println("--- Edit Colour Rules... ---")
+				{
+					app_t: App
+					menu_init(&app_t.menu)
+					defer app_destroy(&app_t)
+					app_t.settings = settings_default()
+					made := rules_edit_current(&app_t)
+					ru_chk(bad, made && os.exists(path), fmt.tprintf("writes rules.txt when there isn't one (ok=%v exists=%v)", made, os.exists(path)))
+					opened := app_active(&app_t)
+					ru_chk(bad, opened != nil && strings.to_lower(opened.path, context.temp_allocator) == strings.to_lower(path, context.temp_allocator), fmt.tprintf("and opens it as a tab: %q", opened.path if opened != nil else ""))
+					// The seed is only documentation if it is also a valid file:
+					// it must load with no complaint and change nothing.
+					rules_load()
+					ru_chk(bad, !rules_active(), "the freshly written file loads clean and activates no rules")
+					seed := rules_seed_text(context.temp_allocator)
+					sr := rules_parse(seed)
+					defer rules_destroy(&sr)
+					ru_chk(bad, rules_reject_total(sr) == 0, fmt.tprintf("...and nothing in it is refused: %d", rules_reject_total(sr)))
+					// Uncommenting the worked examples must give real rules --
+					// the header is the only place a user learns the syntax, so
+					// a header whose examples do not parse is worse than none.
+					live := strings.builder_make(context.temp_allocator)
+					n := 0
+					for ln in strings.split_lines(seed, context.temp_allocator) {
+						if !strings.has_prefix(ln, "# ") {continue}
+						body := strings.trim_space(ln[2:])
+						cut := strings.index(body, " = ")
+						if cut <= 0 {continue}
+						if _, rok := rules_role_from_name(strings.trim_space(body[cut + 3:])); !rok {continue}
+						strings.write_string(&live, body)
+						strings.write_byte(&live, '\n')
+						n += 1
+					}
+					lr := rules_parse(strings.to_string(live))
+					defer rules_destroy(&lr)
+					ru_chk(bad, n >= 9 && len(lr.list) == n && rules_reject_total(lr) == 0, fmt.tprintf("uncommenting the seeded examples gives %d rules and %d refusals (want %d / 0)", len(lr.list), rules_reject_total(lr), n))
+					// Every role name is listed, or the file's own list is a lie.
+					missing := ""
+					for role in Color_Role {
+						if !strings.contains(seed, fmt.tprintf("#     %v\n", role)) {missing = fmt.tprintf("%v", role)}
+					}
+					ru_chk(bad, missing == "", fmt.tprintf("every Color_Role is listed in the seeded file (missing: %q)", missing))
+					// Second invocation must not clobber the user's rules.
+					mine := "ERROR = Danger\n"
+					_ = os.write_entire_file(path, transmute([]u8)mine)
+					again := rules_edit_current(&app_t)
+					back, _ := os.read_entire_file(path, context.temp_allocator)
+					ru_chk(bad, again && string(back) == mine, fmt.tprintf("an existing rules.txt is never overwritten (%d bytes back, want %d)", len(back), len(mine)))
+				}
+				os.remove(path)
+				rules_reset()
+			}
+			// --- the command is reachable ---------------------------------------------
+			ru_command :: proc(bad: ^int) {
+				fmt.println("--- the command ---")
+				ru_chk(bad, command_in_palette(.Rules_Edit), "Rules_Edit is offered in the palette")
+				ru_chk(bad, command_table[.Rules_Edit].title == "Edit Colour Rules..." && command_table[.Rules_Edit].category == "View", fmt.tprintf("titled and filed under View: %q / %q", command_table[.Rules_Edit].title, command_table[.Rules_Edit].category))
+				ru_chk(bad, !command_mutates_doc(.Rules_Edit), "it is not a document mutation")
+				// In the View menu, beside the two rows it mirrors. The palette
+				// is not enough on its own: §6x and §6ad both shipped their file
+				// as a menu row because that is where someone looks for it.
+				found := false
+				for m in menus {
+					if m.title != "View" {continue}
+					for it in m.items {
+						if it.cmd == .Rules_Edit {found = true}
+					}
+				}
+				ru_chk(bad, found, "and it has a row in the View menu")
+			}
+
+			bad := 0
+			ru_parse(&bad)
+			ru_caps_parse(&bad)
+			ru_colour(&bad)
+			ru_overlap(&bad)
+			ru_prec_lexer(&bad)
+			ru_prec_link(&bad)
+			ru_empty(&bad)
+			ru_cap_row(&bad)
+			ru_cost(&bad)
+			ru_file(&bad)
+			ru_command(&bad)
+			fmt.printfln("rulestest: %d failures", bad)
 			return true
 		}
 

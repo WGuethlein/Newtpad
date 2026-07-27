@@ -118,6 +118,10 @@ main :: proc() {
 	// unreadable keys.txt leaves the defaults in force (keymap.odin).
 	keymap_load()
 	defer keymap_reset()
+	// The colour rules, before any frame can draw a row. A missing or unreadable
+	// rules.txt leaves no rules active (rules.odin).
+	rules_load()
+	defer rules_reset()
 	had_session := primary && session_exists()
 	// Restore is opt-out. Note the sweep guard below still protects the backups
 	// when it is off: they belong to tabs we chose not to adopt, so turning
@@ -818,6 +822,8 @@ main :: proc() {
 				// And the keymap, for the same reason: editing keys.txt in another
 				// editor while Newtpad has it open should take effect here too.
 				keymap_reload_if_active(&app, d.path)
+				// And the colour rules, same reason again.
+				rules_reload_if_active(&app, d.path)
 			}
 			session_dirty = true
 		}

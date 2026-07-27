@@ -37,6 +37,11 @@ worth reading before trusting any other "X is missing" claim in this file.
 **The installed binary is still v0.16.0.** Batch 7 merged under Wyatt's overnight policy: merge, do
 not `install.ps1`. Run it after the live pass in §6ab's "Owed".
 
+**Batch 10 is merged; v0.19.0 — the last feature batch before the beta.** Sort lines, remove
+duplicate lines, and `rules.txt` keyword colouring. §6ae's "what it got wrong" is the useful half:
+a column rectangle silently escalated a sort to the whole file, and the colour rules' own seeded
+header promised something the precedence order does not deliver on `.log` files.
+
 **Batch 9 is merged; v0.18.0.** Keys and navigation — `keys.txt` rebinding, bookmarks, scrollbar
 match marks, filter click-to-jump, and filter's first paint. See §6ad, whose "what this batch got
 wrong" section is the useful half: six tests that could not fail, two correct functions composing
@@ -2799,6 +2804,105 @@ being refused; (4) whether a 2 px amber tick reads on both the Dark and Light tr
 dense set is informative or noise — if noise the fix is a taller bucket, not a dimmer colour;
 (5) whether ~48 KB regex / 64 KB literal first paint is enough on his real logs; (6) click a filtered
 row, then type.
+
+## 6ae. Text operations (2026-07-27, v0.19.0, branch `feat/batch-10`)
+
+Batch 10 of §6aa — **the last feature batch before the beta.** Three commands and a colour-rule file,
+all from research §C's secondary list, all aimed at the log-and-data audience Newtpad courts.
+
+**Shipped:** `Sort Lines` / `Sort Lines (descending)` / `Remove Duplicate Lines`, and
+`%APPDATA%\Newtpad\rules.txt` keyword→colour rules.
+
+### Decisions taken with Wyatt, 2026-07-27
+
+Sort acts on the selected lines expanded to whole lines, or the whole document; ascending with a
+descending variant; **no case-sensitivity or numeric-order options** (principle 3). Dedupe removes
+**all** duplicates keeping the first, not `uniq`-style adjacent-only, which silently leaves
+duplicates on unsorted input and reads as broken. Colour rules live in a file, global, naming
+`Color_Role`s so a rule cannot invent a colour and reads correctly in both themes.
+
+**Precedence was decided in the plan rather than at the keyboard: links > lexer > rules.** Rules are
+lowest so they can never punch holes in real syntax colouring — a rule matching `error` inside a JSON
+string would recolour part of a token and make correct code look broken, which is worse than a rule
+not showing.
+
+### The consequence of that precedence, and the honest fix
+
+**On a `.log`, six of the nine rules the seeded file shipped as its own starter block did nothing.**
+`lex_log` already colours `ERROR WARNING WARN INFO DEBUG TRACE`, so a rule for any of them is dropped
+— measured one at a time against `drawcount`'s frame digest, six of nine byte-identical. The user's
+first act after *Edit Colour Rules...* is to uncomment that block, and the file itself supplied the
+expectation that then reads as broken.
+
+The whole-branch review blocked the merge on it. **The precedence did not change** — it is right —
+but the seeded header now names the six words `lex_log` owns, says plainly that a rule for them
+changes nothing on a `.log`, and splits the starter block into "these show on a .log" and "these do
+not, but do on a .txt". *A feature whose own documentation creates a false expectation is broken in
+the only way the user can see.*
+
+### What this batch got right, and it is worth copying
+
+Sort and dedupe are **the strongest-verified feature of the last three batches**, and the reason is
+one decision: **every assertion compares the whole buffer byte-for-byte**, never a line count or a
+length. The reviewer drove 45 hand-built fixtures through it — empty document, `"\n"`, `"\n\n\n"`,
+lone CR, CRLF without a trailing terminator, mid-line-to-mid-line selections, reverse selections,
+mixed endings both orders — and found no path that corrupts a byte.
+
+Two structural choices did the work. **`hi` lands at the last line's *content* end**, so the
+trailing-newline question survives by construction rather than by a special case — those bytes are
+never read and never written, and a CRLF region cannot end on half a terminator. And **the region is
+read once and written once**, which is what actually delivers the single undo entry.
+
+### What it got wrong
+
+- **A live column rectangle turned "sort the selection" into "sort the whole file."** Every
+  `command_mutates_doc` command not on an exception list gets `block_collapse_linear`, which is
+  `anchor = cursor` — so sort then saw no selection and took the whole-document branch. Column-select
+  five rows of a 200k-line log, sort, and the entire file reorders. Recoverable with one Ctrl+Z, and
+  untested until the review found it. Now refuses with a note.
+- **The plan named the wrong mechanism for the one-undo-entry property.** It credited
+  `doc_batch_begin`/`end`; verified by deletion, that pair is **inert** here — remove it and five
+  suites still pass, because `push_undo(.Replace)` never coalesces and both paths end identically.
+  What delivers the property is the single write. Kept as the guard for when a second write appears,
+  now commented as inert, and the plan is amended in place.
+- **Two "cannot be falsified" claims were false.** A shipped comment said a stray `\r` cannot change
+  sort order "because CR sorts before every printable byte" — TAB is 0x09, below CR's 0x0D, and
+  `key` / `key\tvalue` in a CRLF file reorders. And `sort_split_lines`' count identity was justified
+  by "`buf` never ends with a terminator", which is untrue when the region's last line is empty. Both
+  conclusions survived; both reasons were wrong, and the reasons are what the next reader trusts.
+- **`drawcount` never loaded `rules.txt`**, so the first before/after measurement was bit-identical
+  and meaningless — a false green on the one instrument built to prevent exactly that.
+- **The cost bound was aimed at the wrong lever.** The plan said cap the rule count; measured, cost
+  at 64 rules spans **20,000×** depending on the *rules*, not their number. The bound that works is a
+  second-byte index plus a per-row probe budget.
+
+### Deliberately carried
+
+The sort folds **ASCII case only**; non-ASCII compares by UTF-8 byte order, so `Ä`/`ä` do not fold —
+defensible under principle 3, and bytewise UTF-8 *is* codepoint order so ordering stays sensible
+within a script. A live column rectangle **refuses** rather than sorting the rectangle's row span
+(sorting cells has two honest readings and principle 3 says offer neither). A rule pattern cannot
+start with `#`; matching is case-sensitive; a match straddling a wrap boundary is not coloured; rules
+do not reach Markdown preview or the grid. The per-row probe budget is a silent truncation, not a
+refusal — the same shape as `HL_MAX_ROW_TOKENS`, with 10× headroom on the worst realistic row.
+
+**Shape A, swept and confirmed, all pre-existing on `main` and none introduced here:**
+`doc_move_lines`' `read_range` (`doc.odin`) ignores `pt_read`'s return and the fault flag across four
+reads and then **writes** — a truncated mmap splices NULs into the document, and Alt+Up is a held key.
+`block_text` is read-then-clipboard-then-delete on Cut. Sort's own instance was fixed here (it peeks
+`pt_faulted` and refuses; **taking** the flag would have traded a corruption bug for a
+recovery-never-runs bug). `doc.odin` first when this is picked up.
+
+**Also carried from batch 9, still unmeasured:** `find_mark_rects` is O(matches) to 100,000 per
+frame, the only non-viewport-proportional per-frame cost on the cumulative ledger. `drawcount` has no
+timing yet — that is the natural next thing for it.
+
+### Owed
+
+Nothing was verified against real GUI input. Wyatt's pass: sort and dedupe on a real selection and on
+a whole file (and confirm one Ctrl+Z restores it); the refusal when a column rectangle is live; and
+*Edit Colour Rules...* — write `FATAL = Danger` on a `.log` and confirm it shows, then `ERROR` and
+confirm it does not, which is the behaviour the header now explains rather than the bug it looks like.
 
 ## 7. Build environment (Windows, this machine)
 

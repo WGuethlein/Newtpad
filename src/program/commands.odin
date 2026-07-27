@@ -76,6 +76,14 @@ Command_Id :: enum u8 {
 	// direction is read off ev.shift in the dispatch, exactly as
 	// doc_cursor_left(doc, ev.shift) reads it.
 	Bookmark_Cycle,
+	// Sort/dedupe the selected lines (the whole document with no selection).
+	// THREE commands, not two with a modifier: shift is not part of a chord
+	// (see Binding, and Bookmark_Cycle above), so a descending variant cannot
+	// be Shift+something and has to be its own row. All three are palette-only
+	// -- no default chord, because adding one is a keys.txt line now.
+	Sort_Lines,
+	Sort_Lines_Desc,
+	Remove_Duplicate_Lines,
 	// command palette
 	Palette_Open,
 	Palette_Close,
@@ -117,6 +125,7 @@ Command_Id :: enum u8 {
 	Settings_Dec,
 	Theme_Edit,
 	Keys_Edit,
+	Rules_Edit,
 	Open_Logs_Folder,
 	// font page (Edit > Font)
 	Font_Open,
@@ -199,6 +208,14 @@ command_table := [Command_Id]Command {
 	.Toggle_Preview           = {"Toggle Markdown Preview / Split", "View"},
 	.Bookmark_Toggle          = {"Toggle Bookmark on This Line", "Cursor"},
 	.Bookmark_Cycle           = {"Go to Next Bookmark (Shift: Previous)", "Cursor"},
+	// The titles carry the two things a user would otherwise have to discover by
+	// running the command on real data: the scope (selection, else the whole
+	// file) and, for dedupe, that the match is exact -- `Foo` and `foo` are two
+	// different lines, even though the SORT compares case-insensitively. The
+	// palette shows the title and nothing else, so anything not in it is not said.
+	.Sort_Lines               = {"Sort Lines (selection, or whole file)", "Edit"},
+	.Sort_Lines_Desc          = {"Sort Lines Descending (selection, or whole file)", "Edit"},
+	.Remove_Duplicate_Lines   = {"Remove Duplicate Lines (exact match, keeps the first)", "Edit"},
 	.Palette_Open             = {"Command Palette", "View"},
 	.Palette_Close            = {"Palette: Close", "View"},
 	.Palette_Confirm          = {"Palette: Confirm", "View"},
@@ -235,6 +252,7 @@ command_table := [Command_Id]Command {
 	.Settings_Dec             = {"Settings: Decrease", "View"},
 	.Theme_Edit               = {"Edit Current Theme...", "View"},
 	.Keys_Edit                = {"Edit Keybindings...", "View"},
+	.Rules_Edit               = {"Edit Colour Rules...", "View"},
 	.Open_Logs_Folder         = {"Open Logs Folder", "View"},
 	.Font_Open                = {"Font...", "Edit"},
 	.Font_Close               = {"Font: Close", "Edit"},
@@ -486,9 +504,11 @@ save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -
 		// doc.path: doc_save_err frees and reallocates doc.path.
 		theme_reapply_if_active(app, path)
 		// Same loop for the keymap: saving keys.txt re-reads it, so a binding can
-		// be tried without restarting. Both are called unconditionally and each
-		// checks the path itself.
+		// be tried without restarting. All three are called unconditionally and
+		// each checks the path itself.
 		keymap_reload_if_active(app, path)
+		// And for the colour rules: saving rules.txt recolours the next frame.
+		rules_reload_if_active(app, path)
 	}
 	return saved
 }
@@ -713,6 +733,72 @@ block_edit_note :: proc(app: ^App) {
 	app_note(app, fmt.tprintf("[COLUMN EDIT REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
 }
 
+// The note for all three of Sort Lines / Sort Lines Descending / Remove
+// Duplicate Lines, in one place for the reason block_edit_note is: three copies
+// of a refusal message drift, and the cap is read off the constant rather than
+// written out because BLOCK_EDIT_MAX_LINES has already moved once and a literal
+// would have gone stale silently.
+//
+// The .Unchanged note is not decoration. All three commands are palette-only, so
+// the user has just typed a name and pressed Enter; with nothing to do and
+// nothing said, the command reads as broken -- the same argument
+// .Bookmark_Cycle's "[NO BOOKMARKS]" makes. And .Unchanged specifically means NO
+// undo entry was pushed (doc_sort_lines returns before doc_batch_begin), so
+// there is not even a history row to notice.
+@(private = "file")
+sort_lines_dispatch :: proc(app: ^App, doc: ^Document, mode: Sort_Mode) {
+	// Name the command the user actually ran. A single shared "[SORT ...]" told
+	// someone who had just run Remove Duplicate Lines that a SORT was refused --
+	// an operation they never asked for, in a product where the note bar is the
+	// only feedback a palette-only command has.
+	what := "DEDUPE" if mode == .Dedupe else "SORT"
+	// A rectangle is a COLUMN; these three commands only speak rows. Refuse
+	// rather than guess -- "sort the rectangle's rows by their whole-line
+	// content" and "sort them by the cells the rectangle actually covers" are
+	// both honest readings of the same gesture, and principle 3's answer to an
+	// operation with two meanings is to offer neither. BLOCK_EDIT_MAX_LINES'
+	// refusal has the same shape, and adding a chord or a row-span variant later
+	// is a change to this one branch.
+	//
+	// Without this the escalation was the largest on the command_mutates_doc
+	// list: the block-clear branch in command_dispatch runs block_collapse_linear
+	// (`doc.anchor = doc.cursor`) for every mutating command not on its exception
+	// list, so doc_sort_lines saw !doc_has_sel and sorted the WHOLE FILE. Five
+	// column-selected rows of a 200k-line log reordered the lot and dropped every
+	// bookmark in it. The three commands are on that exception list now, which is
+	// what lets this refusal be reached at all.
+	//
+	// Leave the rectangle live, exactly like every other block refusal
+	// (block_extend's own comment in block.odin makes this an invariant): a
+	// refusal that also destroys the gesture's state costs the user the selection
+	// they spent the drag making, for nothing.
+	if doc != nil && block_active(doc) {
+		app_note(app, fmt.tprintf("[%s UNAVAILABLE - column selection is live; press Escape first]", what))
+		return
+	}
+	switch doc_sort_lines(doc, mode) {
+	case .Ok:
+	// The document visibly changed; a note would be noise.
+	case .Unchanged:
+		if doc != nil && doc.kind == .Text {
+			app_note(app, "[NO DUPLICATE LINES]" if mode == .Dedupe else "[ALREADY SORTED]")
+		}
+	case .Too_Big:
+		// Short enough to read at a glance. The old wording explained the
+		// implementation ("read and rewritten in one go") in 110 characters; what
+		// the user can act on is the two numbers.
+		app_note(app, fmt.tprintf("[%s REFUSED - over the %d MB / %d line limit]", what, SORT_MAX_BYTES / (1024 * 1024), SORT_MAX_LINES))
+	case .Unresolved:
+		app_note(app, fmt.tprintf("[%s UNAVAILABLE HERE - a line runs longer than it can scan]", what))
+	case .Faulted:
+		// The file changed on disk mid-read. main.odin's recovery detaches from
+		// the mapping at the end of this frame and prints its own line; say here
+		// that the command did not run, because from the user's side it simply
+		// did nothing.
+		app_note(app, fmt.tprintf("[%s REFUSED - the file changed on disk while it was being read]", what))
+	}
+}
+
 // The typed-character path when a rectangle is live: one character replaces the
 // rectangle's cell range on every row it spans (or, at zero width, is inserted
 // on every row -- prefixing a column). main.odin's char loop calls this instead
@@ -741,7 +827,16 @@ editor_input_rune :: proc(app: ^App, doc: ^Document, t: ^plat.Text, r: rune) {
 command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	#partial switch cmd {
 	case .Backspace, .Delete_Fwd, .Delete_Word_Back, .Insert_Newline, .Insert_Tab, .Undo, .Redo, .Cut, .Paste,
-	     .Move_Line_Up, .Move_Line_Down:
+	     .Move_Line_Up, .Move_Line_Down,
+	     // One replace over a whole-line region -- the same kind of edit
+	     // Alt+Up/Down already is, and for the same reasons it has to be listed
+	     // here: table view must block it (the grid is read-only and a caret left
+	     // over from text view would rewrite the file underneath it), and a live
+	     // column rectangle has to be seen at all -- these three are the one entry
+	     // on this list that REFUSES under a rectangle rather than dropping it,
+	     // and they only get the chance because membership here is what routes
+	     // them through the block branch in command_dispatch.
+	     .Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines:
 		return true
 	// Changing the line ending rewrites the ENTIRE buffer -- doc_set_line_ending
 	// does pt_delete(0, length) followed by pt_insert -- so every line start after
@@ -853,9 +948,19 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	// Insert_Newline stays OUT of this exception list deliberately: splitting
 	// every spanned row from one Enter is rarely what's wanted, so Enter
 	// keeps clearing the rectangle and acting at the caret.
+	//
+	// Sort_Lines / Sort_Lines_Desc / Remove_Duplicate_Lines are on the list for
+	// the opposite reason to the rest of it: not because they edit the rectangle,
+	// but because the collapse this branch performs is what made them dangerous.
+	// Every other command here acts at the caret or on one line, so flattening the
+	// selection first costs a line at worst; these three read the selection as
+	// their SCOPE, so a collapsed selection silently promoted them to the whole
+	// document. They refuse in sort_lines_dispatch instead, and reaching that
+	// refusal with the rectangle intact is the whole point of the exception.
 	if doc != nil && block_active(doc) && command_mutates_doc(cmd) {
 		#partial switch cmd {
-		case .Backspace, .Delete_Fwd, .Cut, .Undo, .Redo, .Insert_Tab:
+		case .Backspace, .Delete_Fwd, .Cut, .Undo, .Redo, .Insert_Tab,
+		     .Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines:
 		case:
 			block_clear(doc)
 			// Belt and braces for the invariant block_collapse_linear
@@ -1115,6 +1220,12 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		if !doc_bookmark_cycle(doc, ev.shift) && doc != nil && doc.kind == .Text {
 			app_note(app, "[NO BOOKMARKS - press Ctrl+F2 to set one]")
 		}
+	case .Sort_Lines:
+		sort_lines_dispatch(app, doc, .Ascending)
+	case .Sort_Lines_Desc:
+		sort_lines_dispatch(app, doc, .Descending)
+	case .Remove_Duplicate_Lines:
+		sort_lines_dispatch(app, doc, .Dedupe)
 	case .Toggle_Wrap:
 		doc.wrap = !doc.wrap
 		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start
@@ -1348,6 +1459,8 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		theme_edit_current(app)
 	case .Keys_Edit:
 		keymap_edit_current(app)
+	case .Rules_Edit:
+		rules_edit_current(app)
 	case .Open_Logs_Folder:
 		// Logging has been on by default since 0.9.0 and had no command, no menu
 		// entry and no mention anywhere in the UI -- the audit found a working

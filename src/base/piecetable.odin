@@ -75,6 +75,14 @@ pt_take_fault :: proc(pt: ^Piece_Table) -> bool {
 	return f
 }
 
+// The same flag, PEEKED rather than taken: for a caller that has just read a
+// region and has to decide whether the bytes it is holding are real, but must
+// not consume the flag -- doc_fault_pending is the one place allowed to do that,
+// because taking it is what arms the recovery. A mid-command check that took it
+// would refuse correctly and then leave the document still attached to a mapping
+// it can no longer read.
+pt_faulted :: proc(pt: ^Piece_Table) -> bool {return pt.fault}
+
 @(private = "file")
 rng: u64 = 0x243F6A8885A308D3
 
