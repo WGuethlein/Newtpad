@@ -558,6 +558,7 @@ when NEWTPAD_TESTS {
 					find_set_filter(&doc, true)
 					doc.cursor, doc.anchor = 0, 0
 					j := find_filter_click(&doc, &t, x, row_y(px, r), px, ROWS)
+					find_merge(&doc) // main.odin runs one later in the SAME frame
 					fc_chk(
 						&bad,
 						j && doc.cursor == want && doc.anchor == want && !doc.filter,
@@ -591,6 +592,75 @@ when NEWTPAD_TESTS {
 			fc_chk(&bad, !hit, "a press above the first row is refused, not clamped to it")
 
 			fmt.printfln("filter click-to-jump: %d failures", bad)
+			return
+		}
+
+		// The same click, one level up: its post-condition has to survive the REST
+		// OF THE FRAME, not just the return from find_filter_click.
+		//
+		// main.odin runs the click at the top of the frame and find_merge near the
+		// bottom of it. With the filter armed BEFORE the query was typed (Ctrl+L,
+		// then type), the once-per-query auto-select has never fired -- it is gated
+		// off while filtering -- so the first merge after the click fires it, and
+		// the caret the click just placed becomes a SELECTION of some match
+		// elsewhere. Type one character and it overwrites the matched word.
+		//
+		// So this asserts the same three things findtest_filter_click does, but
+		// after the merges that follow in the frame, which is the state the user's
+		// next keystroke actually meets. A large fixture, so the search really is
+		// still publishing when the click lands -- the live shape of the bug.
+		findtest_filter_click_frame :: proc() -> (bad: int) {
+			fmt.println("--- the click's post-condition survives the frame ---")
+			cf_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			FILL :: "the quick brown fox jumps over the lazy dog................\n" // 60 B
+			NEEDLE :: "NEEDLE-ZZZ"
+			SIZE :: 8 << 20
+			LINES :: SIZE / len(FILL)
+			content := make([]u8, LINES * len(FILL)) // heap: the doc takes it
+			for i in 0 ..< LINES {copy(content[i * len(FILL):], transmute([]u8)string(FILL))}
+			// Two matching lines inside the first-paint budget, so the filter view
+			// has rows to click in the very frame the query was typed, and one far
+			// past it, so the worker is still publishing afterwards.
+			rows_at := [2]int{10 * len(FILL), 40 * len(FILL)}
+			for at in rows_at {copy(content[at:], transmute([]u8)string(NEEDLE))}
+			copy(content[(LINES - 1) * len(FILL):], transmute([]u8)string(NEEDLE))
+
+			doc := doc_from_content(content, "", .UTF8)
+			defer doc_close(&doc)
+			t: plat.Text
+			plat.text_load_faces(&t)
+			cw := plat.text_char_width(&t, 16)
+			px := f32(16)
+			ROWS :: 10
+
+			find_open(&doc, false)
+			find_set_filter(&doc, true) // Ctrl+L first, THEN the query: the trigger
+			for r in NEEDLE {find_input_rune(&doc, r)}
+			doc_update_gutter(&doc, cw)
+			defer {
+				find_set_filter(&doc, false) // GUTTER_W is a global; leave it clear
+				doc_update_gutter(&doc, cw)
+			}
+			cf_chk(&bad, len(doc.filter_lines) >= 2 && doc.filter_lines[0] == rows_at[0], fmt.tprintf("the first frame has rows to click: %d, first at %d (want %d)", len(doc.filter_lines), doc.filter_lines[0] if len(doc.filter_lines) > 0 else -1, rows_at[0]))
+			cf_chk(&bad, filter_searching(&doc), "...and the search is still running, as it is in life")
+
+			want := rows_at[1]
+			jumped := find_filter_click(&doc, &t, col_x(cw, 3), row_rect_y(px, 1) + line_height(px) * 0.5, px, ROWS)
+			cf_chk(&bad, jumped && doc.cursor == want && doc.anchor == want, fmt.tprintf("the click itself lands the caret on the row's line start: cursor %d anchor %d (want %d)", doc.cursor, doc.anchor, want))
+
+			// Everything the rest of the frame does, and every frame after it.
+			find_wait(&doc)
+			cf_chk(
+				&bad,
+				doc.cursor == want && doc.anchor == want,
+				fmt.tprintf("...and the merges that follow leave it there: cursor %d anchor %d (want %d, collapsed)", doc.cursor, doc.anchor, want),
+			)
+			cf_chk(&bad, !doc_has_sel(&doc), "...as a caret, not as a selection the next keystroke would overwrite")
+			find_close(&doc)
+			fmt.printfln("click post-condition: %d failures", bad)
 			return
 		}
 
@@ -946,6 +1016,7 @@ when NEWTPAD_TESTS {
 			fmt.printfln("case-insensitive: %d found, want 2", len(doc.find.matches))
 
 			bad := findtest_filter_click()
+			bad += findtest_filter_click_frame()
 			bad += findtest_first_paint()
 			bad += findtest_autoselect()
 			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")

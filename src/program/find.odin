@@ -968,11 +968,24 @@ filter_banner_text :: proc(doc: ^Document) -> string {
 // one place that actually removes the stale selection the user would otherwise
 // still see highlighted. Gated on the state actually changing so that setting
 // the filter to what it already is stays a no-op.
+//
+// Leaving filter view also SPENDS the once-per-query auto-select, and that half
+// is the one with a bug attached. find_merge gates the jump on !doc.filter, so a search
+// that STARTED filtered (Ctrl+L, then type) has never fired it -- and the first
+// merge after doc.filter goes false fires it, replacing the caret with a
+// selection of a match somewhere else. main.odin runs that merge later in the
+// very frame the click ran in, so find_filter_click's post-condition did not
+// survive its own frame: click a filtered row while the search is still
+// publishing, type one character, and it overwrites the matched word.
+// Leaving filter view is itself a caret placement -- by the click, or by the
+// user's own caret that Ctrl+L returns to -- so the jump is spent, not pending.
+// (`.Filter_Open` already does this on the way in, for the same reason.)
 find_set_filter :: proc(doc: ^Document, on: bool) {
 	was := doc.filter
 	doc.filter = on
 	doc.filter_top = 0
 	if was != on && block_active(doc) {block_clear(doc)}
+	if was && !on {doc.find.jumped = true}
 }
 
 // A press in the filter view jumps to the line it landed on, in the unfiltered
