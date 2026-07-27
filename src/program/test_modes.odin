@@ -6330,6 +6330,50 @@ when NEWTPAD_TESTS {
 			}
 			bad += tab_wrap(&t)
 
+			// The batch's HEADLINE decision, which nothing above can observe:
+			// TAB STOPS ARE MEASURED FROM THE VISUAL ROW START, NOT THE LOGICAL
+			// LINE START. tab_wrap measures the FIRST visual row, where the two
+			// origins are the same number, so it cannot tell them apart. This
+			// puts the tab on a CONTINUATION row, where they differ, and it is
+			// the only check in the tree that would notice a future refactor
+			// threading a logical-line column through wrap_row_end.
+			//
+			// "abcde f\thijk" at 6 cells. Row 1 breaks at the space: [0,6). Row 2
+			// starts at byte 6 mid-line (pt_line_start(6) == 0 -- there is no
+			// newline in the fixture, so this really is a continuation row).
+			//
+			//   from the ROW start (correct): 'f' at column 0 -> 1, the tab at
+			//   column 1 advances 3 to column 4, 'h' 5, 'i' 6, and 'j' does not
+			//   fit -- the break falls back to just after the tab, [6,8).
+			//
+			//   from the LOGICAL LINE start: row 2 begins at logical column 6, so
+			//   the tab sits at column 7 and advances 1, not 3. Everything then
+			//   fits and the row runs to the end of the buffer, [6,12) line_end.
+			tab_wrap_continuation :: proc(t: ^plat.Text) -> (bad: int) {
+				content := "abcde f\thijk"
+				doc: Document
+				doc.pt = base.pt_init(transmute([]u8)content)
+				defer base.pt_destroy(&doc.pt)
+
+				e1, le1 := wrap_row_end(&doc, t, 0, 6)
+				r1 := e1 == 6 && !le1 && base.pt_line_start(&doc.pt, 6) == 0
+				fmt.printfln(
+					"  %-6s continuation setup: row 1 = [0,%d) line_end=%v, and byte 6 is mid-LINE (line start %d) -- want [0,6), false, 0",
+					"ok" if r1 else "FAIL", e1, le1, base.pt_line_start(&doc.pt, 6),
+				)
+				if !r1 {bad += 1}
+
+				e2, le2 := wrap_row_end(&doc, t, 6, 6)
+				r2 := e2 == 8 && !le2
+				fmt.printfln(
+					"  %-6s tab on a CONTINUATION row measures from the ROW start: wrap_row_end(%q, from 6, 6 cells) = [6,%d) line_end=%v (want [6,8), false; measuring from the LOGICAL line start gives [6,12), true)",
+					"ok" if r2 else "FAIL", content, e2, le2,
+				)
+				if !r2 {bad += 1}
+				return
+			}
+			bad += tab_wrap_continuation(&t)
+
 			// line_wrap_decision, through eff_wrap_at (its only non-file-private
 			// caller). "a\t" repeated: each pair lands the tab at column 1, so it
 			// advances 3 and the pair costs exactly 4 cells. 256 pairs is 1024

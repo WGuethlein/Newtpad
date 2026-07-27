@@ -366,7 +366,10 @@ wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (end: int, 
 			// bounded deviation (leading indentation lives on the first visual
 			// row, where the origin is right), and what matters more is that
 			// the draw and the hit-test share this convention, which they do
-			// because both measure from the row start.
+			// because both measure from the row start. Guarded by wraptest's
+			// continuation-row case, which is the ONLY check in the tree that
+			// can see this choice -- every other tab fixture sits on a first
+			// visual row, where the two origins are the same number.
 			cw := plat.text_cell_width_at(t, r, col, .Doc)
 			if col + cw > c && col > 0 {
 				if last_break > p {return last_break, false}
