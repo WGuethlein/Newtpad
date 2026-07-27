@@ -160,20 +160,13 @@ were the priorities. Read P2 as the live list, with these amendments:
 - ~~**Test modes ship in the release binary.**~~ **DONE (2026-07-26, §6z.)** `NEWTPAD_TESTS`
   (`#config`, defaults to `ODIN_DEBUG`) gates the whole file; release went 1,494,528 → 1,055,744
   bytes. `build.bat release tests` puts it back for `-o:speed` measurements.
-- **Carried from batch 6 (§6z), none blocking:**
-  - The reopen size cap reads `doc.disk_stamp.size`, so it **fails open** when the stamp is absent
-    (a failed stat on a dropped share reads as size 0) or stale (a restored dirty tab carries the
-    size the session recorded, so a file that grew to 500 MB while Newtpad was closed still reports
-    the old one). Best-effort by construction; a real guard would stat at the moment of the reopen.
-  - **`File ▸ Save` and `Edit ▸ Paste` are live on the Settings and Font pseudo-tabs.** Pre-existing
-    and not introduced by the `Encoding` menu (whose rows were gated); `Tab_Close` shares `has_doc`
-    and must stay live, so it is a row-by-row call rather than one predicate.
-  - No test exercises any menu `checked` predicate's semantics — the new encoding ones or the older
-    `is_wrapped`/`is_table`. `menutest` covers structure and mnemonic uniqueness only.
-  - `session_restore` still carries no comment saying why it deliberately never calls
-    `app_apply_view_defaults`; the reasoning lives only in `app.odin`.
-  - Paste now rewrites a **lone CR** as a line break, inherited from `convert_line_endings`. Real in
-    a CSV field or terminal output pasted into an LF document.
+- ~~**Carried from batch 6 (§6z), none blocking**~~ — **all five DONE (2026-07-27, §6ab task 5.)**
+  The reopen cap now stats at the reopen and refuses on a failed stat; Save/Save As/Paste are dead
+  on the pseudo-tabs; `menutest` asserts the `checked` predicates flip; `session_restore` says why
+  it skips `app_apply_view_defaults`; and a lone CR survives a paste. Two of them turned out bigger
+  than the entry: the pseudo-tab gate was **menu-only and the command palette walked past it**, so
+  the batch-6 encoding bug was still live by mouse, and the fix moved to one shared
+  `command_allowed_on` predicate covering eight commands.
 - **Carried from batch 7 (task 2, true tab stops):** `line_cell_col` (`doc.odin`) reads at most
   `VISIBLE_COLS * 4` = 8192 bytes from the row start and **silently truncates** past that — no
   `exact` flag, unlike `pt_line_start_cap`. Shape A, and `block_delete` is now subject to it: it
@@ -283,8 +276,15 @@ tracked.
 - **Color emoji** (needs a color-glyph path).
 - **Command/hotkey/option codegen from a data file** — hardcoded now (VK→cmd in `window.odin`,
   cmd→action in `main.odin`). Cheap retrofit; do it with the command palette (shared registry).
-- **Glyph-atlas eviction** (LRU/generational + atlas-full repack) and **reindex-on-edit** (line
-  count/scrollbar drift approximately after big edits).
+- ~~**Glyph-atlas eviction** (LRU/generational + atlas-full repack)~~ — **REFUTED, not deferred
+  (2026-07-26, §6ab).** Measured before batch 7 spent a night on it: at 4096² the atlas holds
+  **61,425** glyphs at 16px and **9,768** at 48px (300% DPI), growth 1024→4096 is observed against a
+  real device, and `atlas_full` does not latch (`atlastest`, `atlasgrowtest`). Grow-then-recycle
+  already exists from §6j. One screen of text is far fewer distinct glyphs than the capacity, so the
+  "your text silently vanishes" failure the 2026-07-25 audit ranked Tier 2 is **not reachable by a
+  real document.** The belief traced to one stale comment in `text.odin` that outlived its fix by
+  seven months. Do not re-add this without a measurement that contradicts the above.
+- **reindex-on-edit** (line count/scrollbar drift approximately after big edits).
 - **Precompiled `.cso` shaders** (drop the `d3dcompiler_47.dll` runtime dep) — before ship.
 - **Per-frame allocations** in `text_draw` (make/delete per line) — reuse a scratch buffer.
 - **`renderer`/`ui` layer extraction** — do it during the planned V1 UI rewrite, not before.

@@ -9,7 +9,19 @@
 // lookup, NOT shaping). Shaping + font fallback (IDWriteTextAnalyzer) are the
 // next milestone; keep the glyph-run construction fed by an explicit index list
 // so shaping can replace the cmap path without reworking the raster/atlas.
-// Atlas is grow-only for now; eviction is required before ship (project rule).
+// Atlas sizing: starts at ATLAS_START, doubles on demand to ATLAS_MAX, then
+// recycles wholesale at a frame boundary (atlas_relieve / text_frame_begin).
+// This comment used to say "grow-only for now; eviction is required before
+// ship" — it outlived the §6j fix by seven months and, being a claim of
+// ABSENCE, was never re-tested, so it propagated into HANDOFF §5, CLAUDE.md's
+// roadmap and the 2026-07-25 feature audit, which ranked it a ship blocker
+// whose failure mode was "your text silently vanishes." Measured 2026-07-26
+// (`newtpad atlastest`, `newtpad atlasgrowtest`): at 4096² the atlas holds
+// 61,425 glyphs at 16px and 9,768 at 48px (300% DPI); growth 1024→4096 is
+// observed against a real device and `atlas_full` does not latch. One screen
+// of text is far fewer distinct glyphs than that, so exhaustion is not
+// reachable by a real document. LRU/generational eviction was consequently
+// dropped from batch 7 — see HANDOFF §6ab.
 package platform
 
 import "core:fmt"
@@ -1071,9 +1083,13 @@ text_glyph_coverage_probe :: proc(t: ^Text, r: rune, px: f32, set := Font_Set.Do
 	return int(gw), int(gh), inked
 }
 
-// Shelf packer: grow-only, no eviction yet. Returns ok=false when the atlas is
-// full (caller then skips the glyph rather than writing out of bounds).
-// Eviction / a second atlas page is a follow-up.
+// Shelf packer. Returns ok=false when the atlas is full; the caller then skips
+// the glyph (rather than writing out of bounds) and asks for relief at the next
+// frame boundary, which grows or recycles. A shelf allocator cannot free an
+// individual rectangle, so relief is necessarily wholesale — affordable because
+// the viewport-first rule bounds what has to come back to about one screen of
+// glyphs. Per-glyph eviction would mean replacing the packer, and the measured
+// capacity (see this file's header) says nothing is asking for that.
 @(private)
 atlas_pack :: proc(t: ^Text, w, h: i32) -> (x, y: i32, ok: bool) {
 	PAD :: 1
