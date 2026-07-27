@@ -46,33 +46,64 @@ SEARCH_SYNC_MAX :: 256 << 10
 // for a sixtieth row. A partly filled first frame is the accepted outcome; a
 // frozen one is not.
 //
+// Bytes SCANNED, not bytes offered: a regex block runs on to the next newline,
+// and that run-on is scanned too, so on this bounded pass it is reserved out of
+// the budget rather than added on top of it (see scan_regex). It used to be added
+// on top, which made "64 KB" mean 131073 bytes on a file with no newline in it.
+// The regex path therefore covers ~48 KB of a first paint where the literal path
+// covers the whole 64 KB; the number is the cost, not the reach.
+//
 // **The number came from the measurement below, and the first number was wrong.**
 // `newtpad findtest`, section "--- the synchronous first-paint pass ---", times
-// find_recompute over an 8 MB buffer and fails the suite if any case exceeds a
-// frame. Per 256 KB, -o:speed (debug is ~1.5x worse and printed by the same run):
+// find_recompute over two 8 MB buffers -- 60-byte lines, and the same filler with
+// no newline in it at all -- and fails the suite if any case exceeds a frame.
+// What it prints at this budget, -o:speed (the debug build is ~1.4x worse and
+// prints its own numbers from the same run):
 //
-//	literal, ordinary            0.40 ms
-//	literal, matches constantly  0.47 ms
-//	regex, ordinary              1.62 ms
-//	regex, scans every byte      13.90 ms   <- [A-Za-z]+@[a-z]+
+//	                              60 B lines   no newlines
+//	literal, ordinary                0.10 ms       0.10 ms
+//	literal, matches constantly      0.11 ms       0.11 ms
+//	regex, ordinary                  0.29 ms       0.36 ms
+//	regex, scans every byte          2.39 ms       3.17 ms   <- [A-Za-z]+@[a-z]+
+//	regex, backtracks hard           7.80 ms      10.98 ms   <- (the|fox|dog)+x
 //
-// So a 256 KB budget -- the tidy answer, and the one this was first written with,
-// since it makes SEARCH_SYNC_MAX the only number -- spends 83% of a frame on a
-// pattern a person might plausibly type to find email addresses. 64 KB puts that
-// worst case at ~3.5 ms (~5 ms in debug), which leaves room both for a worse
-// pattern and for the two or three keystrokes a held key can deliver into one
-// frame. The literal path, which is the default mode, costs ~0.1 ms here and is
-// nowhere near its own share -- raising ITS budget alone is the obvious follow-up
-// if a first screen ever looks too thin in live use, and it is a follow-up rather
-// than part of this change because a second, kind-dependent budget is a second
-// bound to keep honest.
+// The rejected candidate was 256 KB -- the tidy answer, and the one this was
+// first written with, since it makes SEARCH_SYNC_MAX the only number in the file.
+// Set the constant to 256 KB and the same test reprints itself as (worst
+// fixture, -o:speed then debug):
+//
+//	regex, scans every byte         14.05 ms   /  20.89 ms
+//	regex, backtracks hard          47.19 ms   /  63.47 ms
+//
+// i.e. 84% of a frame for a pattern a person might plausibly type to find email
+// addresses, and nearly three frames for one that backtracks -- on every find
+// keystroke, on every file over 256 KB, and a held key delivers two or three
+// keystrokes into one frame.
+//
+// 64 KB is comfortable for the literal path (0.17 ms, 1% of a frame) and AT THE
+// EDGE for the regex one: a deliberately backtracking pattern is ~11 ms -o:speed
+// and ~15.5 ms in the debug build. If a first screen ever looks too thin in live
+// use, the two moves are opposite and both defensible -- raise the LITERAL budget
+// (it is nowhere near its own share), or cut the REGEX one (it is what sizes the
+// single number). Either one makes this a second, kind-dependent bound to keep
+// honest, which is why neither is here yet.
 //
 // What this is NOT is a bound on regex time in general: core:text/regex
 // backtracks, so a pathological pattern is slow per byte at any budget. That
 // exposure is pre-existing -- every buffer at or below SEARCH_SYNC_MAX is scanned
 // inline whole, and each of the worker's blocks costs the same per byte -- and
 // this deliberately does not widen it: below SEARCH_SYNC_MAX nothing changes, and
-// above it the inline share is a quarter of one block.
+// above it the inline share is a fraction of one block.
+//
+// The handoff is also one more BLOCK BOUNDARY per file, so HANDOFF 6d's "a
+// pattern spanning a block boundary won't match" gains one more instance. The
+// literal path cannot lose a match across it: the block is read with the
+// len(query)-1 overlap and the worker resumes at exactly the byte this pass
+// stopped issuing from (findtest plants a straddler at SEARCH_FIRST_PAINT - 4).
+// The regex path's boundary is a line end, so it carries the same caveat every
+// other block already does -- except on the no-newline shape above, where the
+// clamp puts it mid-line, which is what REGEX_LINE_SLACK has always meant on a
+// file whose lines are longer than the slack.
 SEARCH_FIRST_PAINT :: 64 << 10
 #assert(SEARCH_FIRST_PAINT <= SEARCH_SYNC_MAX) // or a "small" buffer would be split
 
@@ -585,23 +616,47 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 	pos := s.at.pos
 	halted := false // cancel / fault / MAX_MATCHES: nothing more to publish here
 	ended := false // no bytes read, or an unusable pattern: the scan is over
-	scan: for pos < L && pos < upto {
+
+	// A block runs on past its end to the next newline so that a line is never
+	// split -- and THOSE BYTES ARE SCANNED TOO. On a bounded pass they therefore
+	// have to come OUT of the budget rather than sit on top of it: pt_line_end_cap
+	// returns pos+cap when it finds no '\n', so a file with no newline in its
+	// first 128 KB (minified JSON, a single-line log dump) made a 65536-byte
+	// budget read 131073 bytes -- twice the work the number was chosen against,
+	// and on a backtracking pattern twice a frame. The reservation is taken once,
+	// up front, so the loop keeps its whole-block shape instead of growing a tail
+	// of ever-smaller blocks at the budget's edge.
+	//
+	// A quarter of the budget, capped at REGEX_LINE_SLACK: enough for any line a
+	// log or a CSV has, and it scales if the budget is ever changed. The unbounded
+	// worker pass is untouched -- it has no budget to overrun, and leaving its
+	// block boundaries exactly where they were keeps every existing test's premise
+	// about them true.
+	slack := REGEX_LINE_SLACK
+	target := upto // where blocks stop being issued
+	if upto < L {
+		slack = min(REGEX_LINE_SLACK, (upto - pos) / 4)
+		target = upto - slack
+	}
+	scan: for pos < L && pos < target {
 		if intrinsics.atomic_load(&s.cancel) {
 			halted = true
 			break scan
 		}
 		// Shortened when the budget ends inside a block (scan_literal has the
-		// same line and the same reason). min(upto, L) so max(int) can't
+		// same line and the same reason). min(target, L) so max(int) can't
 		// overflow the addition below.
-		end := pos + min(SEARCH_BLOCK, min(upto, L) - pos)
+		end := pos + min(SEARCH_BLOCK, min(target, L) - pos)
 		if end < L {
-			// Never split a line: run on to the next newline (bounded), and keep
-			// that newline with its line so end-of-line patterns still match.
-			// Deliberately allowed to overrun the budget by up to
-			// REGEX_LINE_SLACK: a partial line would give this block's pattern a
-			// different answer than the resumed one, and the slack is already
-			// the cap on that overrun.
-			end = min(base.pt_line_end_cap(pt, end, REGEX_LINE_SLACK) + 1, L)
+			// Never split a line: run on to the next newline (bounded by the
+			// slack reserved above), and keep that newline with its line so
+			// end-of-line patterns still match. A partial line would give this
+			// block's pattern a different answer than the resumed one.
+			//
+			// The clamp to `upto` is what makes the budget exact, and it bites
+			// only on the no-newline shape -- where the block was ending mid-line
+			// whatever we did, because there is no line end to find.
+			end = min(base.pt_line_end_cap(pt, end, slack) + 1, L, upto)
 		}
 		got := base.pt_read(pt, pos, buf[:end - pos])
 		if got == 0 {

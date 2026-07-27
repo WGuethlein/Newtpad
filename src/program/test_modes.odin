@@ -783,28 +783,92 @@ when NEWTPAD_TESTS {
 				find_close(&doc)
 			}
 
+			// --- the budget is in BYTES SCANNED, even with no newline in reach --
+			//
+			// A regex block runs on to the next newline, and pt_line_end_cap
+			// returns pos+cap when it finds none — so on a file with no newline
+			// in its first 128 KB (minified JSON, a single-line dump) the pass
+			// used to read 131073 bytes for a 65536-byte budget. The timing table
+			// below is the reason that matters; this is the part of it a stopwatch
+			// cannot state. A needle planted between the two numbers is in the
+			// first frame if and only if the pass overran, which is a fact about
+			// bytes and does not move with the build or the machine.
+			{
+				FLAT :: "the quick brown fox jumps over the lazy dog................." // 60 B, no '\n'
+				INSIDE :: 30 << 10 // inside the budget
+				OVER :: 70 << 10 // past it, inside the old overrun window
+				#assert(INSIDE < SEARCH_FIRST_PAINT)
+				#assert(OVER > SEARCH_FIRST_PAINT && OVER < SEARCH_FIRST_PAINT + REGEX_LINE_SLACK)
+				content := make([]u8, (SIZE / len(FLAT)) * len(FLAT)) // heap: the doc takes it
+				for i in 0 ..< SIZE / len(FLAT) {copy(content[i * len(FLAT):], transmute([]u8)string(FLAT))}
+				copy(content[INSIDE:], transmute([]u8)string(NEEDLE))
+				copy(content[OVER:], transmute([]u8)string(NEEDLE))
+
+				doc := doc_from_content(content, "", .UTF8)
+				defer doc_close(&doc)
+				find_open(&doc, false)
+				doc.find.regex = true // the overrun is the regex path's alone
+				for r in "NEEDLE-[A-Z]+" {find_input_rune(&doc, r)}
+				// No find_wait: this is the frame the keystroke produced. Every
+				// match on this file shares one line, so filter_lines dedupes to a
+				// single row — the matches themselves are what carries the fact.
+				got := len(doc.find.matches)
+				fp_chk(&bad, got >= 1 && doc.find.matches[0] == INSIDE, fmt.tprintf("the bounded pass ran on a file with no newlines: %d matches, first at %d (want %d)", got, doc.find.matches[0] if got > 0 else -1, INSIDE))
+				fp_chk(&bad, got == 1, fmt.tprintf("...and stopped AT the budget: the needle at %d (past the %d B budget) is not in this frame — %d matches, want 1", OVER, SEARCH_FIRST_PAINT, got))
+				find_wait(&doc)
+				fp_chk(&bad, len(doc.find.matches) == 2 && doc.find.matches[1] == OVER, fmt.tprintf("the worker then picks up the one past the budget: %d matches (want 2)", len(doc.find.matches)))
+				doc.find.regex = false
+				find_close(&doc)
+			}
+
 			// --- what the pass costs -------------------------------------------
 			//
 			// The number the budget was chosen from. Timed around find_recompute,
 			// which is the whole keystroke: reset, the bounded scan, the pt_view
 			// clone and the thread spawn. Each case joins its worker afterwards
 			// so the next reading is not taken against a busy core.
+			//
+			// Two fixtures and two adversarial patterns, because a falsifier that
+			// only samples inputs its author picked is the "test that has never
+			// failed" one level up. The patterns the budget was originally chosen
+			// against were the author's own; a 30-second search beat the worst of
+			// them by 3.3x. And the SHAPE matters as much as the pattern: a buffer
+			// with no newline in it is the one where the block's run-on to a line
+			// end (pt_line_end_cap returns pos+cap when there is no '\n') decides
+			// how many bytes the "byte budget" actually spends.
 			{
-				doc := doc_from_content(build([]int{LINES - 1}), "", .UTF8)
-				defer doc_close(&doc)
-				find_open(&doc, false)
-				worst := 0.0
+				// The LOWEST of three readings. Noise only ever adds — a stolen
+				// timeslice, a worker still winding down — so the minimum is the
+				// closest estimate of what the pass itself costs, and the number
+				// this gates on sits close enough to the frame budget on a
+				// backtracking pattern that a single noisy reading would other-
+				// wise fail the suite at random.
 				cost :: proc(doc: ^Document, q: string, rx: bool) -> f64 {
 					doc.find.regex = rx
 					clear(&doc.find.query)
 					append(&doc.find.query, ..transmute([]u8)q)
-					t0 := time.tick_now()
-					find_recompute(doc)
-					ms := time.duration_milliseconds(time.tick_since(t0))
-					find_invalidate(doc) // cancel + join before the next reading
-					return ms
+					best := max(f64)
+					for _ in 0 ..< 3 {
+						t0 := time.tick_now()
+						find_recompute(doc)
+						best = min(best, time.duration_milliseconds(time.tick_since(t0)))
+						find_invalidate(doc) // cancel + join before the next reading
+					}
+					return best
 				}
 				FRAME :: 16.7
+				// One frame is a claim about the SHIPPED build. The same table is
+				// ~1.4x slower under -debug (the worst case is 11.2 ms at -o:speed
+				// and 15.5-16.4 ms here), and -debug is what the suite runs by
+				// default -- so gating it at one literal frame means a red at
+				// random on a busy machine, asserting a property the product does
+				// not have to hold. The allowance is that measured ratio and
+				// nothing else, and it still fails everything this exists to
+				// catch: a 256 KB budget prints 63.47 ms in this build, the
+				// block's run-on escaping the budget 30.96 ms, and the bound
+				// removed altogether 639 ms.
+				gate := f64(FRAME)
+				when ODIN_DEBUG {gate = FRAME * 1.4}
 				cases := []struct {
 					label: string,
 					q:     string,
@@ -814,15 +878,40 @@ when NEWTPAD_TESTS {
 					{"literal, matches constantly", "e", false},
 					{"regex, ordinary", "NEEDLE-[A-Z]+", true},
 					{"regex, scans every byte", "[A-Za-z]+@[a-z]+", true},
+					// Backtracks over the filler's own words. 3.3x the one above
+					// at the same budget, and the reason "the worst case is
+					// ~3.5 ms" was a claim about a pattern, not about the bound.
+					{"regex, backtracks hard", "(the|fox|dog)+x", true},
 				}
-				for c in cases {
-					ms := cost(&doc, c.q, c.rx)
-					worst = max(worst, ms)
-					fmt.printfln("  %-28s %6.2f ms   (%d KB budget)", c.label, ms, SEARCH_FIRST_PAINT / 1024)
+				worst := 0.0
+				// The same filler with '.' where the '\n' is: 8 MB, not one
+				// newline in it. Minified JSON and single-line log dumps are this
+				// shape, and it is the shape that makes the budget lie.
+				FLAT :: "the quick brown fox jumps over the lazy dog................." // 60 B, no '\n'
+				flat :: proc() -> []u8 {
+					content := make([]u8, LINES * len(FLAT)) // heap: the doc takes it
+					for i in 0 ..< LINES {copy(content[i * len(FLAT):], transmute([]u8)string(FLAT))}
+					return content
 				}
-				doc.find.regex = false
-				fp_chk(&bad, worst < FRAME, fmt.tprintf("worst synchronous keystroke %.2f ms, frame budget %.1f ms", worst, FRAME))
-				find_close(&doc)
+				for shape in 0 ..< 2 {
+					doc := doc_from_content(build([]int{LINES - 1}) if shape == 0 else flat(), "", .UTF8)
+					defer doc_close(&doc)
+					find_open(&doc, false)
+					for c in cases {
+						ms := cost(&doc, c.q, c.rx)
+						worst = max(worst, ms)
+						fmt.printfln("  %-28s %6.2f ms   (%d KB budget, %s)", c.label, ms, SEARCH_FIRST_PAINT / 1024, "60 B lines" if shape == 0 else "no newlines")
+					}
+					doc.find.regex = false
+					find_close(&doc)
+				}
+				// It passes, but the margin is the finding: the backtracking
+				// pattern on the no-newline fixture is ~11 ms of a 16.7 ms frame
+				// at -o:speed. 64 KB is 1% of a frame for the literal path and
+				// two thirds of one for the regex path -- so the single number is
+				// sized by regex, and cutting it for regex alone is the move if a
+				// keystroke ever feels heavy in live use.
+				fp_chk(&bad, worst < gate, fmt.tprintf("worst synchronous keystroke %.2f ms, budget %.1f ms (%s build, one frame is %.1f)", worst, gate, "debug" if ODIN_DEBUG else "release", f64(FRAME)))
 			}
 
 			fmt.printfln("first-paint pass: %d failures", bad)
