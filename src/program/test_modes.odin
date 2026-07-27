@@ -13194,11 +13194,32 @@ when NEWTPAD_TESTS {
 				want := "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n"
 				sl_chk(bad, r == .Ok && doc_debug_string(&d) == want, fmt.tprintf("12 lines sort: %v %q", r, doc_debug_string(&d)))
 				sl_chk(bad, len(d.undo) == u0 + 1, fmt.tprintf("exactly one undo entry for 12 sorted lines: %d (want %d)", len(d.undo), u0 + 1))
-				sl_chk(bad, d.state_count == 1, fmt.tprintf("the history row is labelled x1: state_count=%d", d.state_count))
 				doc_undo(&d)
 				sl_chk(bad, doc_debug_string(&d) == src && len(d.undo) == u0, fmt.tprintf("ONE undo restores every byte: %q (want %q) undo=%d", doc_debug_string(&d), src, len(d.undo)))
 				doc_redo(&d)
 				sl_chk(bad, doc_debug_string(&d) == want, fmt.tprintf("and redo puts it back: %q", doc_debug_string(&d)))
+				// A do-nothing sort must not destroy the REDO stack.
+				//
+				// This replaces an assertion on d.state_count == 1, which no
+				// implementation could have made anything else: doc_batch_end sets
+				// max(1,1), push_undo without the batch sets 1, and a per-line loop
+				// still labels each entry 1. It could not fail, so it proved nothing.
+				//
+				// This can. push_undo clears doc.redo unconditionally, so the no-op
+				// guard being ahead of doc_batch_begin -- which its comment in
+				// doc.odin claims is "crucial" -- is the only thing standing between
+				// "sort an already-sorted file" and "your redo history is gone". Set
+				// up a real redo entry first (type, then undo), then sort a file that
+				// is already in order.
+				doc_insert_rune(&d, 'x')
+				doc_undo(&d)
+				u1, redo1 := len(d.undo), len(d.redo)
+				r2 := doc_sort_lines(&d, .Ascending)
+				sl_chk(
+					bad,
+					r2 == .Unchanged && len(d.redo) == redo1 && len(d.undo) == u1 && doc_debug_string(&d) == want,
+					fmt.tprintf("a no-op sort leaves the redo stack alone: %v redo=%d (want %d) undo=%d (want %d) %q", r2, len(d.redo), redo1, len(d.undo), u1, doc_debug_string(&d)),
+				)
 			}
 			// --- bookmarks ------------------------------------------------------------
 			//
