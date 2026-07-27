@@ -1736,8 +1736,15 @@ when NEWTPAD_TESTS {
 				return true
 			}
 			samples := "aé中がx́\t" // ascii, 2-byte latin, CJK x2, kana, ascii, combining acute, tab
-			// Column 0: a standalone probe of a tab at the start of a row.
-			fmt.printfln("tab = %d cells (want %d, and must draw no glyph)", plat.text_cell_width_at(&t, '\t', 0), plat.text_tab_width(&t))
+			// A DUMP, not an assertion -- celltest has no failure count and never
+			// had one. The old form printed the advance at column 0 against
+			// text_tab_width and read like a check, but those two are equal at
+			// column 0 under fixed-width tabs and under true tab stops alike, so
+			// it could not fail. The advance across a full period is at least
+			// legible to an eye; the assertions live in tabstoptest.
+			fmt.printf("tab advance by column (width %d, and it must draw no glyph): ", plat.text_tab_width(&t))
+			for c in 0 ..< 2 * plat.text_tab_width(&t) {fmt.printf("%d:%d ", c, plat.text_cell_width_at(&t, '\t', c))}
+			fmt.println()
 			fmt.printf("cells: ")
 			// A running column, not 0 per rune: this walks `samples` from its
 			// start, so each rune's real column is available, and the per-rune
