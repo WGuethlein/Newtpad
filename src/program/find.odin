@@ -126,7 +126,10 @@ SEARCH_FIRST_PAINT :: 64 << 10
 // Where a bounded pass stopped, so the next one continues instead of starting
 // over. The inline first-paint pass and the worker are two passes over one scan:
 // no byte is read twice and no match is emitted twice, which is why the budget
-// costs nothing but the handoff.
+// costs nothing but the handoff. Both halves are asserted, and they need
+// different instruments: the emitted-twice half by the match counts in findtest,
+// the read-twice half by Search.swept -- a worker that starts over writes the
+// same values to the same indices and is invisible in the results.
 //
 // Both scans advance `pos` a whole block at a time and count newlines over
 // exactly the bytes they advance past, so `last_nl` and `nlines` are complete
@@ -150,7 +153,14 @@ Search :: struct {
 	line_start: []int, // line start of each match, computed here (see below)
 	line_no:    []int, // 1-based line number of each match, counted in the same pass
 	count:      int, // atomic: how many entries are published
-	scanned:    int, // atomic: bytes scanned, for progress
+	scanned:    int, // atomic: how far the scan has reached, for progress
+	// atomic: bytes the scans actually advanced over, ACCUMULATED across both
+	// passes. scanned is a position and a resume-from-zero would simply retrace
+	// it, so it cannot see one; this can, and "no byte is scanned twice" is
+	// otherwise a performance claim with nothing checking it (findtest asserts
+	// swept == pt.length once the search is done). One atomic add per 256 KB
+	// block is the whole cost.
+	swept:      int,
 	total:      int,
 	done:       bool, // atomic
 	cancel:     bool, // atomic
@@ -265,6 +275,7 @@ search_reset :: proc(doc: ^Document) {
 	}
 	intrinsics.atomic_store(&s.count, 0)
 	intrinsics.atomic_store(&s.scanned, 0)
+	intrinsics.atomic_store(&s.swept, 0)
 	intrinsics.atomic_store(&s.done, false)
 	intrinsics.atomic_store(&s.cancel, false)
 	intrinsics.atomic_store(&s.fault, false)
@@ -459,6 +470,12 @@ find_scanned :: proc(doc: ^Document) -> int {
 	return intrinsics.atomic_load(&doc.search.scanned)
 }
 
+// Bytes the two passes actually swept, which equals the buffer length exactly
+// when the handoff worked. Test instrument; see Search.swept.
+find_swept :: proc(doc: ^Document) -> int {
+	return intrinsics.atomic_load(&doc.search.swept)
+}
+
 search_faulted :: proc(doc: ^Document) -> bool {
 	return intrinsics.atomic_load(&doc.search.fault)
 }
@@ -572,7 +589,9 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 				nlines += 1
 			}
 		}
+		was := pos
 		pos += bs
+		intrinsics.atomic_add(&s.swept, min(pos, L) - was) // see Search.swept
 		intrinsics.atomic_store(&s.count, n)
 		intrinsics.atomic_store(&s.scanned, min(pos, L))
 	}
@@ -705,7 +724,9 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 				nlines += 1
 			}
 		}
+		was := pos
 		pos += got
+		intrinsics.atomic_add(&s.swept, min(pos, L) - was) // see Search.swept
 		intrinsics.atomic_store(&s.count, n)
 		intrinsics.atomic_store(&s.scanned, min(pos, L))
 		mem.dynamic_arena_free_all(&arena)
@@ -986,9 +1007,9 @@ filter_searching :: proc(doc: ^Document) -> bool {
 // yet, or the file has none. This said "0 matching lines (searching...)" for
 // both — so a query that genuinely matched nothing claimed to be searching
 // forever, and a query whose first match sits 200 MB in looked exactly like one
-// with no matches at all. The bounded first-paint pass (SEARCH_SYNC_MAX) makes
-// the second state far rarer; it cannot make it impossible, which is why the
-// wording has to be honest rather than hopeful.
+// with no matches at all. The bounded first-paint pass (SEARCH_FIRST_PAINT)
+// makes the second state far rarer; it cannot make it impossible, which is why
+// the wording has to be honest rather than hopeful.
 filter_banner_text :: proc(doc: ^Document) -> string {
 	state: string
 	switch {

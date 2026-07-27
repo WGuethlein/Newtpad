@@ -664,7 +664,7 @@ when NEWTPAD_TESTS {
 			return
 		}
 
-		// The bounded synchronous first-paint pass (SEARCH_SYNC_MAX) and the three
+		// The bounded synchronous first-paint pass (SEARCH_FIRST_PAINT) and the three
 		// things it has to get right: rows in the filter view on the FIRST frame
 		// when the head of the file has matches, an honest banner when it does
 		// not, and a cost that stays inside a frame.
@@ -780,6 +780,11 @@ when NEWTPAD_TESTS {
 				want_no := straddle / len(FILL) + 1
 				got_no := doc.filter_line_nos[WANT - 1] if len(doc.filter_line_nos) == WANT else -1
 				fp_chk(&bad, got_no == want_no, fmt.tprintf("the gutter line number across the handoff is right: %d (want %d)", got_no, want_no))
+				// The other half of "nothing is scanned twice", which the results
+				// cannot show: a worker that starts over from 0 rewrites the same
+				// values into the same indices and every assertion above still
+				// passes. Bytes swept is the only thing that sees it.
+				fp_chk(&bad, find_swept(&doc) == doc.pt.length, fmt.tprintf("the two passes swept the buffer exactly once: %d bytes of %d", find_swept(&doc), doc.pt.length))
 				find_close(&doc)
 			}
 
