@@ -7231,9 +7231,17 @@ when NEWTPAD_TESTS {
 			// A stored table view against a .txt must not come back on. Written by
 			// hand because save() can only produce views that were legal when they
 			// were saved; a session from another build, or an edited one, cannot.
+			//
+			// The fixture path CONTAINS A SPACE, and that is what makes this case
+			// able to fail as a format-ladder test at all. The field count is the
+			// argument to split_n, which CAPS the split rather than requiring it,
+			// so reading a v4 line with the current format's larger count still
+			// works perfectly for a space-free path -- collapsing the whole ladder
+			// to `case ver >= 4: nf = 14` left this suite green. With a space the
+			// collapse splits the path in two and the tab is dropped.
 			{
 				dir, _ := session_dir()
-				txtf := fmt.tprintf("%s%cnewtpad_sess_v4.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+				txtf := fmt.tprintf("%s%cnewtpad sess v4.txt", os.get_env("TEMP", context.temp_allocator), '\\')
 				plat.file_write_atomic(txtf, transmute([]u8)string("plain,text,file\n"))
 				line := fmt.tprintf("0 0 0 0 0 -1 0 0 0 0 2 1 %s\n", txtf)
 				body := fmt.tprintf("newtpad-session 4\nactive 0\n%s", line)
@@ -7243,10 +7251,10 @@ when NEWTPAD_TESTS {
 				v: App
 				vok := session_restore(&v)
 				vd := app_active(&v)
-				good := vok && vd != nil && !vd.table && vd.md_mode == .Off
+				good := vok && vd != nil && !vd.table && vd.md_mode == .Off && vd.path == txtf
 				fmt.printfln(
-					"  %-6s a .txt restored with md_mode=2 table=1 comes back plain: ok=%v table=%v md_mode=%v",
-					"ok" if good else "FAIL", vok, vd != nil && vd.table, Md_Mode.Off if vd == nil else vd.md_mode,
+					"  %-6s a .txt restored with md_mode=2 table=1 comes back plain: ok=%v table=%v md_mode=%v path_ok=%v",
+					"ok" if good else "FAIL", vok, vd != nil && vd.table, Md_Mode.Off if vd == nil else vd.md_mode, vd != nil && vd.path == txtf,
 				)
 				if !good {bad += 1}
 				app_destroy(&v)
@@ -7292,9 +7300,12 @@ when NEWTPAD_TESTS {
 
 			// A v3 session (eleven fields, no md_mode/table) must still load: the
 			// old two fields simply aren't there, and the path is still the last field.
+			// Spaced for the same reason as the v4 fixture above -- without one, any
+			// collapse of the ladder that only ever OVER-counts fields still reads
+			// this line correctly and the case proves nothing.
 			{
 				dir, _ := session_dir()
-				v3f := fmt.tprintf("%s%cnewtpad_sess_v3.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+				v3f := fmt.tprintf("%s%cnewtpad sess v3.txt", os.get_env("TEMP", context.temp_allocator), '\\')
 				plat.file_write_atomic(v3f, transmute([]u8)string("old format file\n"))
 				line := fmt.tprintf("0 0 0 0 0 -1 0 0 0 0 %s\n", v3f)
 				body := fmt.tprintf("newtpad-session 3\nactive 0\n%s", line)
