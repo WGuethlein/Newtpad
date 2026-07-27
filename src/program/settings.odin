@@ -44,6 +44,11 @@ Settings :: struct {
 	wrap_default:    bool, // new documents start word-wrapped
 	font_size:       int, // document text size at 96 DPI
 	zoom_pct:        int, // viewport zoom, applied on top of font_size
+	// Tab-stop spacing in cells: a tab advances to the next multiple of this.
+	// Bounds live in platform (plat.TAB_WIDTH_MIN/MAX) because that is where the
+	// value is consumed and where a 0 would hang a measuring loop -- duplicating
+	// them here is how the two ends drift apart.
+	tab_width:       int,
 	font_family:     string, // family NAME, not a path — paths differ per machine
 	font_style:      plat.Font_Style,
 	link_style:      Link_Style, // when/how clickable links are shown
@@ -97,6 +102,7 @@ settings_default :: proc() -> Settings {
 		wrap_default = false,
 		font_size = int(BASE_PX_96),
 		zoom_pct = ZOOM_DEFAULT,
+		tab_width = plat.TAB_WIDTH_DEFAULT,
 		font_family = "Consolas",
 		font_style = .Regular,
 		link_style = .Hover,
@@ -145,6 +151,10 @@ settings_load :: proc() -> Settings {
 		case "zoom_pct":
 			if n, pok := strconv.parse_int(parts[1]); pok {
 				s.zoom_pct = clamp(n, ZOOM_STEPS[0], ZOOM_STEPS[len(ZOOM_STEPS) - 1])
+			}
+		case "tab_width":
+			if n, pok := strconv.parse_int(parts[1]); pok {
+				s.tab_width = clamp(n, plat.TAB_WIDTH_MIN, plat.TAB_WIDTH_MAX)
 			}
 		case "font_family":
 			s.font_family = strings.clone(parts[1])
@@ -196,17 +206,23 @@ settings_save :: proc(s: Settings) -> bool {
 	s.font_size = clamp(s.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX)
 	if s.zoom_pct == 0 {s.zoom_pct = ZOOM_DEFAULT}
 	s.zoom_pct = clamp(s.zoom_pct, ZOOM_STEPS[0], ZOOM_STEPS[len(ZOOM_STEPS) - 1])
+	// Same "0 means never set" reasoning as zoom_pct, with teeth: clamping a 0 up
+	// to TAB_WIDTH_MIN would write 1 to disk and make every tab one cell wide on
+	// the next launch, a silent setting change nobody asked for.
+	if s.tab_width == 0 {s.tab_width = plat.TAB_WIDTH_DEFAULT}
+	s.tab_width = clamp(s.tab_width, plat.TAB_WIDTH_MIN, plat.TAB_WIDTH_MAX)
 	// Zero means "never set" (a literal built without this field, or a struct
 	// that predates it) rather than a deliberate 0.0 fraction, which SPLIT_MIN
 	// would silently misrepresent as a real user choice.
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\nfont_family %s\nfont_style %d\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\nremember_views %d\ntheme_name %s\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\nremember_views %d\ntheme_name %s\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
 		s.zoom_pct,
+		s.tab_width,
 		s.font_family if s.font_family != "" else "Consolas",
 		int(s.font_style),
 		int(s.link_style),
@@ -240,6 +256,7 @@ SETTINGS_ROWS := []Setting_Row {
 	{"Table default view", "Applied when a .csv/.tsv file opens fresh (Ctrl+T toggles)"},
 	{"Remember last view used", "Toggling a view updates the two defaults above; off pins them"},
 	{"Theme", "Dark, Light, or a custom .theme file placed in the themes folder"},
+	{"Tab width", "Columns a Tab advances to; Left/Right adjust, Enter resets to 4"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
@@ -300,6 +317,11 @@ settings_apply :: proc(rc: ^Render_Ctx) {
 	// Zoom multiplies the preferred size; the DPI scale is applied on top of the
 	// result inside metrics_recompute.
 	BASE_PX = f32(clamp(s.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX)) * f32(s.zoom_pct) / 100
+	// Before the invalidation below, not after: every cached cell measurement on
+	// a line with a tab is wrong once the spacing moves, so the reset has to be
+	// the last thing that happens. text_set_tab_width clamps, so a 0 arriving
+	// from a struct that predates the field cannot reach the measuring loops.
+	plat.text_set_tab_width(rc.text, s.tab_width)
 	metrics_recompute(rc)
 	plat.text_reset_atlas(rc.text) // px changed: cached glyphs are the wrong size
 }
@@ -352,6 +374,16 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		nn := len(names)
 		s.theme_name = strings.clone(names[((cur + step) % nn + nn) % nn])
 		g_theme = theme_resolve(s.theme_name)
+	case 8:
+		// Stepped, not cycled: 16 values is too many to reach by pressing Enter,
+		// and the useful ones (2, 4, 8) are all within a few Rights of each
+		// other. Enter resets to the default instead -- the same affordance the
+		// Zoom row already uses.
+		if dir == 0 {
+			s.tab_width = plat.TAB_WIDTH_DEFAULT
+		} else {
+			s.tab_width = clamp(s.tab_width + dir, plat.TAB_WIDTH_MIN, plat.TAB_WIDTH_MAX)
+		}
 	}
 	settings_apply(rc)
 	settings_save(s^)
@@ -418,6 +450,8 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			val = "On" if app.settings.remember_views else "Off"
 		case 7:
 			val = app.settings.theme_name
+		case 8:
+			val = fmt.tprintf("%d", app.settings.tab_width)
 		}
 		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Dim]
 		plat.text_draw(gfx, t, val, width - sx(220), y, UI_PX, vc)

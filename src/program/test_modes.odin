@@ -661,6 +661,7 @@ when NEWTPAD_TESTS {
 				wrap_default    = true,
 				font_size       = 22,
 				zoom_pct        = 125,
+				tab_width       = 3, // non-default and in range, so the whole-struct compare below can see it
 				font_family     = "Courier New",
 				font_style      = .Italic,
 				split_frac      = 0.25, // non-zero, non-default, exact in binary float (survives %.4f round-trip)
@@ -687,6 +688,31 @@ when NEWTPAD_TESTS {
 			cok := c.font_size <= FONT_SIZE_MAX && c.font_size >= FONT_SIZE_MIN
 			fmt.printfln("clamp 9999 -> %d  %s", c.font_size, "OK" if cok else "FAIL")
 			if !cok {bad += 1}
+
+			// tab_width has the same "0 is not a real choice" hazard as zoom_pct,
+			// and a sharper consequence: a 0 reaching plat.text_cell_width_at
+			// makes the advance 0 and every measuring loop non-terminating. So
+			// the save side must write the DEFAULT for a 0, not the clamped
+			// minimum -- writing 1 would silently turn every tab into one cell on
+			// the next launch.
+			settings_save(Settings{restore_session = true, font_size = 16, zoom_pct = 100})
+			tz := settings_load()
+			tzok := tz.tab_width == plat.TAB_WIDTH_DEFAULT
+			fmt.printfln("tab_width 0 saves as the default %d (not the min) -> %d  %s", plat.TAB_WIDTH_DEFAULT, tz.tab_width, "OK" if tzok else "FAIL")
+			if !tzok {bad += 1}
+
+			// Out of range in both directions, written straight to disk so this is
+			// settings_load's own clamp and not a re-test of the save side.
+			if p, pok := session_dir(); pok {
+				base_kv := "newtpad-settings 1\nrestore_session 1\nwrap_default 0\nfont_size 16\nzoom_pct 100\n"
+				plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)strings.concatenate({base_kv, "tab_width 99\n"}, context.temp_allocator))
+				hiw := settings_load()
+				plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)strings.concatenate({base_kv, "tab_width 0\n"}, context.temp_allocator))
+				low := settings_load()
+				twok := hiw.tab_width == plat.TAB_WIDTH_MAX && low.tab_width == plat.TAB_WIDTH_MIN
+				fmt.printfln("tab_width on disk 99 -> %d (want %d), 0 -> %d (want %d)  %s", hiw.tab_width, plat.TAB_WIDTH_MAX, low.tab_width, plat.TAB_WIDTH_MIN, "OK" if twok else "FAIL")
+				if !twok {bad += 1}
+			}
 
 			// A missing file must give defaults rather than zeroes (font_size 0 would
 			// divide into the cell grid).
@@ -728,6 +754,33 @@ when NEWTPAD_TESTS {
 			dok := int(rcz.px) == 60
 			fmt.printfln("  ...at 200%% DPI -> px %.0f (want 60)  %s", rcz.px, "OK" if dok else "FAIL")
 			if !dok {bad += 1}
+
+			// --- tab width reaches the text layer -----------------------------
+			// The row can be right and the wiring still missing: settings_apply
+			// is the only thing that pushes the setting into plat.Text, and
+			// nothing else in the program reads Settings.tab_width. Assert the
+			// row index first -- SETTINGS_ROWS is index-matched against the value
+			// switch and the toggle switch, so an inserted row silently moves
+			// this to a different setting.
+			fmt.println("--- tab width ---")
+			trok := len(SETTINGS_ROWS) > 8 && SETTINGS_ROWS[8].label == "Tab width"
+			fmt.printfln("  row 8 is %q  %s", SETTINGS_ROWS[8].label if len(SETTINGS_ROWS) > 8 else "", "OK" if trok else "FAIL")
+			if !trok {bad += 1}
+			az.settings.tab_width = 4
+			settings_toggle_row(&rcz, 8, 1)
+			settings_toggle_row(&rcz, 8, 1)
+			up := az.settings.tab_width == 6 && plat.text_tab_width(&t2) == 6
+			fmt.printfln("  two Rights -> setting %d, text layer %d (want 6, 6)  %s", az.settings.tab_width, plat.text_tab_width(&t2), "OK" if up else "FAIL")
+			if !up {bad += 1}
+			for _ in 0 ..< 40 {settings_toggle_row(&rcz, 8, -1)}
+			downc := az.settings.tab_width == plat.TAB_WIDTH_MIN && plat.text_tab_width(&t2) == plat.TAB_WIDTH_MIN
+			fmt.printfln("  40 Lefts clamp at %d (text layer %d)  %s", az.settings.tab_width, plat.text_tab_width(&t2), "OK" if downc else "FAIL")
+			if !downc {bad += 1}
+			settings_toggle_row(&rcz, 8, 0) // Enter resets
+			rstw := az.settings.tab_width == plat.TAB_WIDTH_DEFAULT && plat.text_tab_width(&t2) == plat.TAB_WIDTH_DEFAULT
+			fmt.printfln("  Enter resets to %d (text layer %d)  %s", az.settings.tab_width, plat.text_tab_width(&t2), "OK" if rstw else "FAIL")
+			if !rstw {bad += 1}
+
 			BASE_PX = BASE_PX_96 // leave globals alone for later modes
 
 			// The settings-page row list (IMPORTANT 3, final review): the 8th row
