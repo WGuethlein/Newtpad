@@ -206,6 +206,15 @@ were the priorities. Read P2 as the live list, with these amendments:
   disagree. **The right fix, when it is done:** have `line_cell_col` return an `exact` flag and have
   `block_delete` refuse when it is false, matching the refusal contract `caret_line_start_cell`
   already has. Both bounds move together or neither does.
+- **`keys.txt` can bind the plumbing commands the palette deliberately hides.** `command_from_name`
+  (`keymap.odin`) accepts every `Command_Id`, including the ones `command_in_palette` (`palette.odin`)
+  filters out precisely because they are not things a user invokes — `Menu_Activate`, `History_Jump`,
+  `Settings_Close` and the rest. Audited during the batch 9 task 1 review: **every** dispatch case for
+  those is either guarded by "is that surface open" or prompts, so nothing currently reachable
+  misbehaves, and this is not a defect today. **Nothing enforces it, though**, and batch 9 adds
+  commands: the class is a plumbing command becoming dispatchable from the Editor with no surface
+  open. The fix, if a case ever needs one, is to reuse `command_in_palette` as the parse-time filter
+  — one predicate, shared with the seed writer that already uses it — never a second list.
 - **A markdown table wider than the Preview pane is clipped with no way to reach the rest.**
   Surfaced 2026-07-27 while fixing the horizontal scrollbar: Preview lays prose out to the pane, so
   the pane itself correctly has no horizontal axis and the bar is now hidden there (Wyatt's call).
