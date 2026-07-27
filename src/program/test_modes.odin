@@ -7181,8 +7181,14 @@ when NEWTPAD_TESTS {
 
 				app_open_path(&a, csvf)
 				cv := app_active(&a)
-				cvok := cv != nil && cv.table
-				fmt.printfln("  .csv opens with table=%-5v %s", cv.table, "OK" if cvok else "FAIL")
+				// table_delim too, not just the flag: app_apply_view_defaults used to
+				// set doc.table directly and leave the delimiter at 0, which
+				// table_compute_widths silently falls back to ',' for -- so a .tsv
+				// opened by the family default drew one enormous column. Routing
+				// through doc_view_apply is what chooses it, and this is the
+				// assertion that cannot pass with the second code path back.
+				cvok := cv != nil && cv.table && cv.table_delim == ','
+				fmt.printfln("  .csv opens with table=%-5v delim=%q %s", cv.table, rune(cv.table_delim), "OK" if cvok else "FAIL")
 				if !cvok {bad += 1}
 
 				// The gating holds: a .txt cannot enter markdown mode (doc_can_markdown
