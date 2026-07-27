@@ -743,6 +743,11 @@ block_edit_note :: proc(app: ^App) {
 // there is not even a history row to notice.
 @(private = "file")
 sort_lines_dispatch :: proc(app: ^App, doc: ^Document, mode: Sort_Mode) {
+	// Name the command the user actually ran. A single shared "[SORT ...]" told
+	// someone who had just run Remove Duplicate Lines that a SORT was refused --
+	// an operation they never asked for, in a product where the note bar is the
+	// only feedback a palette-only command has.
+	what := "DEDUPE" if mode == .Dedupe else "SORT"
 	switch doc_sort_lines(doc, mode) {
 	case .Ok:
 	// The document visibly changed; a note would be noise.
@@ -751,16 +756,12 @@ sort_lines_dispatch :: proc(app: ^App, doc: ^Document, mode: Sort_Mode) {
 			app_note(app, "[NO DUPLICATE LINES]" if mode == .Dedupe else "[ALREADY SORTED]")
 		}
 	case .Too_Big:
-		app_note(
-			app,
-			fmt.tprintf(
-				"[SORT REFUSED - the lines are read and rewritten in one go, and this is over the %d MB / %d line limit]",
-				SORT_MAX_BYTES / (1024 * 1024),
-				SORT_MAX_LINES,
-			),
-		)
+		// Short enough to read at a glance. The old wording explained the
+		// implementation ("read and rewritten in one go") in 110 characters; what
+		// the user can act on is the two numbers.
+		app_note(app, fmt.tprintf("[%s REFUSED - over the %d MB / %d line limit]", what, SORT_MAX_BYTES / (1024 * 1024), SORT_MAX_LINES))
 	case .Unresolved:
-		app_note(app, "[SORT UNAVAILABLE HERE - a line runs longer than the sort can scan]")
+		app_note(app, fmt.tprintf("[%s UNAVAILABLE HERE - a line runs longer than it can scan]", what))
 	}
 }
 
