@@ -50,7 +50,13 @@ off**, and the four limits are listed at the mode itself in `test_modes.odin`; t
 the digest hashes UVs, which encode glyph first-use order, so a batching pass that regroups draws
 moves the digest with zero pixel change. Read them before batch 8b.
 
-**Immediate next step:** answer the two questions at the end of the batch-8 spec — whether the
+**Both batch-8 questions answered by Wyatt, 2026-07-27:** (1) **yes to an always-on line-number
+gutter, but as a toggle** — off by default, so the text-pipeline batching that unblocks it stays
+justified and stays batch 8b; (2) grid horizontal scrolling should genuinely work rather than be
+hidden, which is now fixed (see below). The pixel-harness question is still open and is the one that
+decides whether 8b can be verified at all.
+
+**Superseded — the two questions at the end of the batch-8 spec** — whether the
 line-number gutter is actually wanted (it is batching's whole justification) and whether a pixel
 readback harness is worth building, or whether Wyatt's live pass is the intended verification for
 renderer work from here on.
@@ -200,6 +206,12 @@ were the priorities. Read P2 as the live list, with these amendments:
   disagree. **The right fix, when it is done:** have `line_cell_col` return an `exact` flag and have
   `block_delete` refuse when it is false, matching the refusal contract `caret_line_start_cell`
   already has. Both bounds move together or neither does.
+- **A markdown table wider than the Preview pane is clipped with no way to reach the rest.**
+  Surfaced 2026-07-27 while fixing the horizontal scrollbar: Preview lays prose out to the pane, so
+  the pane itself correctly has no horizontal axis and the bar is now hidden there (Wyatt's call).
+  A wide `| a | b | ... |` table is the one thing in a preview that genuinely overflows. The fix is
+  to scroll the **table element**, not the pane — a different mechanism from either the text view's
+  cell pan or the grid's column pan, which is why it was deliberately kept out of that fix.
 - **The app redraws at vsync when idle** — no `WaitMessage` anywhere. A core burnt on a static
   screen, which also multiplies every other per-frame cost.
 - **The text pipeline batches nothing** — one heap allocation, two buffer maps and one draw call

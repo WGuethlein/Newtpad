@@ -113,6 +113,27 @@ table_max_col :: proc(doc: ^Document) -> int {
 	return max(0, doc.table_cols - 1)
 }
 
+// How many columns fit on screen starting at `start_col`. Same advance the draw
+// uses -- TEXT_MARGIN_X, then colw[c] + TABLE_COL_PAD cells per column, stopping
+// at width - SCROLLBAR_W -- because this sizes the horizontal scrollbar's thumb
+// and a thumb measured by a second, nearly-identical loop is precisely the
+// divergence CLAUDE.md's "one layout per widget" exists to prevent. Always at
+// least 1, so a single column wider than the window still yields a sane thumb
+// rather than a zero-width one.
+table_cols_fitting :: proc(doc: ^Document, char_w, width: f32, start_col: int) -> int {
+	colw := doc.table_widths
+	if len(colw) == 0 {return 1}
+	right := width - SCROLLBAR_W
+	cx := TEXT_MARGIN_X
+	n := 0
+	for c := start_col; c < len(colw); c += 1 {
+		if cx >= right {break}
+		cx += f32(colw[c] + TABLE_COL_PAD) * char_w
+		n += 1
+	}
+	return max(1, n)
+}
+
 // A link inside a table cell, positioned in pixels (cells sit at arbitrary
 // column x's, not the uniform text grid, so links here can't use Link_Hit).
 Table_Link :: struct {
