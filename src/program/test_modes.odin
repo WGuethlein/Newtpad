@@ -11951,6 +11951,155 @@ when NEWTPAD_TESTS {
 				}
 			}
 
+			// --- session format 5 ----------------------------------------------------
+			//
+			// Writes session.txt and backups in NEWTPAD_SESSION_DIR (hence the
+			// scratch guard at the top of the mode).
+			bm_session :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int)) {
+				fmt.println("--- session ---")
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				dir, _ := session_dir()
+				sp, _ := filepath.join({dir, "session.txt"}, context.temp_allocator)
+
+				// A CLEAN tab (reopened from disk) whose file has not changed.
+				clean := fmt.tprintf("%s%cnewtpad_bm_clean.txt", tmp, '\\')
+				plat.file_write_atomic(clean, transmute([]u8)fix)
+				{
+					a: App
+					defer app_destroy(&a)
+					if fd, ok := doc_open(clean); ok {
+						d := new(Document)
+						d^ = fd
+						set(d, {6, 20})
+						app_add(&a, d)
+					}
+					session_save(&a)
+				}
+				body, _ := os.read_entire_file(sp, context.temp_allocator)
+				bm_chk(bad, strings.contains(string(body), "newtpad-session 5") && strings.contains(string(body), " 6,20 "), fmt.tprintf("the line carries the set as one token: %q", strings.trim_space(string(body))))
+				{
+					b: App
+					defer app_destroy(&b)
+					session_restore(&b)
+					d := app_active(&b)
+					got := d != nil ? fmt.tprintf("%v", d.bookmarks[:]) : "<no tab>"
+					bm_chk(bad, d != nil && len(d.bookmarks) == 2 && d.bookmarks[0] == 6 && d.bookmarks[1] == 20, fmt.tprintf("a clean tab restores its bookmarks: %s (want [6 20])", got))
+				}
+
+				// ...and the same tab whose file CHANGED while we were closed drops
+				// them rather than restoring offsets onto shifted text.
+				//
+				// The replacement is chosen so that ONLY the stamp check can save
+				// it: 6 and 20 are still real line starts in the new file, so the
+				// per-entry line-start filter accepts them and the bookmarks come
+				// back pointing at two lines nobody marked. A first version of this
+				// case used a file with completely different line lengths, and it
+				// passed with the stamp check deleted -- the filter was doing the
+				// work and the assertion was proving the wrong thing. The size also
+				// differs (37 vs 26), which is the half of the stamp that does not
+				// depend on filesystem clock granularity.
+				plat.file_write_atomic(clean, transmute([]u8)string("AAAAA\nBBBBB\nCCCCCCC\nDDDDD\nEXTRA LINE\n"))
+				{
+					c: App
+					defer app_destroy(&c)
+					session_restore(&c)
+					d := app_active(&c)
+					got := d != nil ? fmt.tprintf("%v", d.bookmarks[:]) : "<no tab>"
+					bm_chk(bad, d != nil && len(d.bookmarks) == 0, fmt.tprintf("a changed disk stamp drops them: %s (want [])", got))
+				}
+
+				// A DIRTY tab restores from its backup, which is the buffer exactly
+				// as it was, so the offsets are good regardless of what the file on
+				// disk did.
+				{
+					a: App
+					defer app_destroy(&a)
+					d := new(Document)
+					d^ = doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					set(d, {6, 12})
+					app_add(&a, d)
+					session_save(&a)
+				}
+				{
+					b: App
+					defer app_destroy(&b)
+					session_restore(&b)
+					d := app_active(&b)
+					got := d != nil ? fmt.tprintf("%v", d.bookmarks[:]) : "<no tab>"
+					bm_chk(bad, d != nil && len(d.bookmarks) == 2 && d.bookmarks[0] == 6 && d.bookmarks[1] == 12, fmt.tprintf("an untitled dirty tab restores from its backup: %s (want [6 12])", got))
+				}
+
+				// A hand-written format 4 line still loads -- the tolerant ladder.
+				// Written by hand because session_save can only produce the CURRENT
+				// format, so nothing else in this mode can prove an older one still
+				// reads (the shape §6z's viewmemtest fix used).
+				//
+				// The path deliberately CONTAINS A SPACE, and that is what makes
+				// this case able to fail. The field count is the argument to
+				// split_n, which caps the split rather than requiring it, so
+				// reading a v4 line with v5's count of 14 still works for a
+				// space-free path -- a first version of this case used one and
+				// passed with the ladder collapsed to `case ver >= 4: nf = 14`.
+				// With a space in the path that same collapse splits the path in
+				// two, the line comes back with 14 parts, and the tab is dropped.
+				v4 := fmt.tprintf("%s%cnewtpad bm v4.txt", tmp, '\\')
+				plat.file_write_atomic(v4, transmute([]u8)fix)
+				{
+					line := fmt.tprintf("12 12 0 0 0 -1 0 0 0 0 0 0 %s\n", v4)
+					plat.file_write_atomic(sp, transmute([]u8)fmt.tprintf("newtpad-session 4\nactive 0\n%s", line))
+					e: App
+					defer app_destroy(&e)
+					ok := session_restore(&e)
+					d := app_active(&e)
+					good := ok && d != nil && d.path == v4 && d.cursor == 12 && len(d.bookmarks) == 0
+					bm_chk(bad, good, fmt.tprintf("a v4 session still loads, with no bookmarks: ok=%v path=%q cursor=%d bookmarks=%v", ok, d != nil ? d.path : "", d != nil ? d.cursor : -1, d != nil ? d.bookmarks[:] : nil))
+				}
+
+				// A v5 line whose bookmark field is nonsense, out of order, or names
+				// something that is not a line start: each entry is dropped on its
+				// own and the tab still restores. 6 and 20 are line starts in the
+				// fixture; 7 is mid-line, 4 is out of order after 6, "zz" is not a
+				// number, and 9999 is past the end.
+				{
+					line := fmt.tprintf("0 0 0 0 0 -1 %d %d 0 0 0 0 7,6,4,zz,9999,20 %s\n", plat.file_stamp(v4).mtime, plat.file_stamp(v4).size, v4)
+					plat.file_write_atomic(sp, transmute([]u8)fmt.tprintf("newtpad-session 5\nactive 0\n%s", line))
+					f: App
+					defer app_destroy(&f)
+					ok := session_restore(&f)
+					d := app_active(&f)
+					good := ok && d != nil && len(d.bookmarks) == 2 && d.bookmarks[0] == 6 && d.bookmarks[1] == 20
+					bm_chk(bad, good, fmt.tprintf("a hand-edited bookmark field keeps only the valid, ascending line starts: %v (want [6 20])", d != nil ? d.bookmarks[:] : nil))
+				}
+
+				// A path with spaces still splits correctly with the extra field in
+				// front of it -- the reason the bookmark token may never contain one.
+				spaced := fmt.tprintf("%s%cnewtpad bm spaced.txt", tmp, '\\')
+				plat.file_write_atomic(spaced, transmute([]u8)fix)
+				{
+					a: App
+					defer app_destroy(&a)
+					if fd, ok := doc_open(spaced); ok {
+						d := new(Document)
+						d^ = fd
+						set(d, {12})
+						app_add(&a, d)
+					}
+					session_save(&a)
+					g: App
+					defer app_destroy(&g)
+					session_restore(&g)
+					d := app_active(&g)
+					good := d != nil && d.path == spaced && len(d.bookmarks) == 1 && d.bookmarks[0] == 12
+					bm_chk(bad, good, fmt.tprintf("a path with spaces survives the new field: path=%q bookmarks=%v", d != nil ? d.path : "", d != nil ? d.bookmarks[:] : nil))
+				}
+
+				os.remove(clean)
+				os.remove(v4)
+				os.remove(spaced)
+				os.remove(sp)
+			}
+			bm_session(&bad, BM_FIX, bm_set)
+
 			fmt.printfln("bookmarktest: %d failures", bad)
 			return true
 		}
