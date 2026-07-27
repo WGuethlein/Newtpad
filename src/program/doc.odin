@@ -2218,13 +2218,12 @@ doc_move_lines :: proc(doc: ^Document, delta: int) {
 	doc.last_edit_at = doc.cursor
 }
 
-// --- sort lines ---
+// --- sort lines / remove duplicate lines ---
 //
-// Two commands (and, shortly, a third) over one procedure, because the only
-// thing that differs is what happens to the line list in the middle: the scope
-// resolution, the cap, the terminator handling, the single write and the
-// bookmark consequence are shared, and each of them is a place a second copy
-// would drift.
+// Three commands over one procedure, because the only thing that differs is what
+// happens to the line list in the middle: the scope resolution, the cap, the
+// terminator handling, the single write and the bookmark consequence are shared
+// and each of them is a place a second copy would drift.
 //
 // The shape is doc_move_lines': resolve a whole-line region, read it ONCE, build
 // the replacement in a private buffer, and write it back with ONE
@@ -2239,8 +2238,9 @@ doc_move_lines :: proc(doc: ^Document, delta: int) {
 // still must not turn "Ctrl+A, sort" on a multi-GB log into an unbounded copy.
 SORT_MAX_BYTES :: 16 * 1024 * 1024
 // ...and the line count, which the byte cap does not bound on its own: 16 MiB of
-// "a\n" is eight million lines, and the sort's own per-line bookkeeping is what
-// costs there, not the bytes. Whichever binds first refuses.
+// "a\n" is eight million lines, and the sort's own bookkeeping (a Sort_Line per
+// line, plus a map entry per line for dedupe) is what costs there, not the bytes.
+// Whichever binds first refuses.
 SORT_MAX_LINES :: 1_000_000
 
 // What a sort did, so the caller can post the note. doc.odin has no ^App (the
@@ -2248,7 +2248,7 @@ SORT_MAX_LINES :: 1_000_000
 // beside every other refusal note.
 Sort_Result :: enum u8 {
 	Ok, // the region was rewritten
-	Unchanged, // already in order -- nothing written, NO undo entry
+	Unchanged, // already sorted / no duplicates -- nothing written, NO undo entry
 	Too_Big, // over SORT_MAX_BYTES or SORT_MAX_LINES: refused, nothing changed
 	Unresolved, // a line start or line end further than the cap away: refused
 }
@@ -2256,6 +2256,7 @@ Sort_Result :: enum u8 {
 Sort_Mode :: enum u8 {
 	Ascending,
 	Descending,
+	Dedupe,
 }
 
 // One line of the region: a slice INTO the read-once buffer (which does not move
@@ -2342,8 +2343,8 @@ sort_split_lines :: proc(buf: []u8, lines: ^[dynamic]Sort_Line, terms: ^[dynamic
 	append(lines, Sort_Line{text = buf[start:], idx = len(lines)})
 }
 
-// Sort the selected lines, expanded to whole lines at both ends -- the whole
-// document when there is no selection.
+// Sort, or dedupe, the selected lines expanded to whole lines at both ends --
+// the whole document when there is no selection.
 //
 // Expanding is not optional: a selection almost never lands exactly on line
 // boundaries, and sorting a partial first or last line corrupts it.
@@ -2413,6 +2414,22 @@ doc_sort_lines :: proc(doc: ^Document, mode: Sort_Mode) -> Sort_Result {
 		slice.sort_by(out_lines, sort_less_asc)
 	case .Descending:
 		slice.sort_by(out_lines, sort_less_desc)
+	case .Dedupe:
+		// Exact bytes, not the sort's case-insensitive key: `Foo` and `foo` are
+		// different lines. Keep the FIRST occurrence and drop every later one
+		// regardless of distance -- not uniq's adjacent-only collapse, which
+		// silently leaves duplicates on unsorted input and reads as broken.
+		seen := make(map[string]bool, 1 << 8)
+		defer delete(seen)
+		keep := 0
+		for l in lines {
+			s := string(l.text)
+			if s in seen {continue}
+			seen[s] = true
+			lines[keep] = l
+			keep += 1
+		}
+		out_lines = lines[:keep]
 	}
 
 	out := make([dynamic]u8, 0, len(buf))

@@ -76,13 +76,14 @@ Command_Id :: enum u8 {
 	// direction is read off ev.shift in the dispatch, exactly as
 	// doc_cursor_left(doc, ev.shift) reads it.
 	Bookmark_Cycle,
-	// Sort the selected lines (the whole document with no selection). TWO
-	// commands, not one with a modifier: shift is not part of a chord (see
-	// Binding, and Bookmark_Cycle above), so a descending variant cannot be
-	// Shift+something and has to be its own row. Both are palette-only -- no
-	// default chord, because adding one is a keys.txt line now.
+	// Sort/dedupe the selected lines (the whole document with no selection).
+	// THREE commands, not two with a modifier: shift is not part of a chord
+	// (see Binding, and Bookmark_Cycle above), so a descending variant cannot
+	// be Shift+something and has to be its own row. All three are palette-only
+	// -- no default chord, because adding one is a keys.txt line now.
 	Sort_Lines,
 	Sort_Lines_Desc,
+	Remove_Duplicate_Lines,
 	// command palette
 	Palette_Open,
 	Palette_Close,
@@ -206,11 +207,14 @@ command_table := [Command_Id]Command {
 	.Toggle_Preview           = {"Toggle Markdown Preview / Split", "View"},
 	.Bookmark_Toggle          = {"Toggle Bookmark on This Line", "Cursor"},
 	.Bookmark_Cycle           = {"Go to Next Bookmark (Shift: Previous)", "Cursor"},
-	// The title carries the thing a user would otherwise have to discover by
-	// running the command on real data: the scope. The palette shows the title
-	// and nothing else, so anything not in it is not said.
+	// The titles carry the two things a user would otherwise have to discover by
+	// running the command on real data: the scope (selection, else the whole
+	// file) and, for dedupe, that the match is exact -- `Foo` and `foo` are two
+	// different lines, even though the SORT compares case-insensitively. The
+	// palette shows the title and nothing else, so anything not in it is not said.
 	.Sort_Lines               = {"Sort Lines (selection, or whole file)", "Edit"},
 	.Sort_Lines_Desc          = {"Sort Lines Descending (selection, or whole file)", "Edit"},
+	.Remove_Duplicate_Lines   = {"Remove Duplicate Lines (exact match, keeps the first)", "Edit"},
 	.Palette_Open             = {"Command Palette", "View"},
 	.Palette_Close            = {"Palette: Close", "View"},
 	.Palette_Confirm          = {"Palette: Confirm", "View"},
@@ -725,17 +729,18 @@ block_edit_note :: proc(app: ^App) {
 	app_note(app, fmt.tprintf("[COLUMN EDIT REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
 }
 
-// The note for both of Sort Lines / Sort Lines Descending, in one place for the
-// reason block_edit_note is: copies of a refusal message drift, and the cap is
-// read off the constant rather than written out because BLOCK_EDIT_MAX_LINES has
-// already moved once and a literal would have gone stale silently.
+// The note for all three of Sort Lines / Sort Lines Descending / Remove
+// Duplicate Lines, in one place for the reason block_edit_note is: three copies
+// of a refusal message drift, and the cap is read off the constant rather than
+// written out because BLOCK_EDIT_MAX_LINES has already moved once and a literal
+// would have gone stale silently.
 //
-// The .Unchanged note is not decoration. These are palette-only, so the user has
-// just typed a name and pressed Enter; with nothing to do and nothing said, the
-// command reads as broken -- the same argument .Bookmark_Cycle's "[NO
-// BOOKMARKS]" makes. And .Unchanged specifically means NO undo entry was pushed
-// (doc_sort_lines returns before doc_batch_begin), so there is not even a
-// history row to notice.
+// The .Unchanged note is not decoration. All three commands are palette-only, so
+// the user has just typed a name and pressed Enter; with nothing to do and
+// nothing said, the command reads as broken -- the same argument
+// .Bookmark_Cycle's "[NO BOOKMARKS]" makes. And .Unchanged specifically means NO
+// undo entry was pushed (doc_sort_lines returns before doc_batch_begin), so
+// there is not even a history row to notice.
 @(private = "file")
 sort_lines_dispatch :: proc(app: ^App, doc: ^Document, mode: Sort_Mode) {
 	switch doc_sort_lines(doc, mode) {
@@ -743,7 +748,7 @@ sort_lines_dispatch :: proc(app: ^App, doc: ^Document, mode: Sort_Mode) {
 	// The document visibly changed; a note would be noise.
 	case .Unchanged:
 		if doc != nil && doc.kind == .Text {
-			app_note(app, "[ALREADY SORTED]")
+			app_note(app, "[NO DUPLICATE LINES]" if mode == .Dedupe else "[ALREADY SORTED]")
 		}
 	case .Too_Big:
 		app_note(
@@ -794,7 +799,7 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	     // over from text view would rewrite the file underneath it), and a live
 	     // column rectangle must be dropped first or it keeps naming rows the
 	     // sort has since moved.
-	     .Sort_Lines, .Sort_Lines_Desc:
+	     .Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines:
 		return true
 	// Changing the line ending rewrites the ENTIRE buffer -- doc_set_line_ending
 	// does pt_delete(0, length) followed by pt_insert -- so every line start after
@@ -1172,6 +1177,8 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		sort_lines_dispatch(app, doc, .Ascending)
 	case .Sort_Lines_Desc:
 		sort_lines_dispatch(app, doc, .Descending)
+	case .Remove_Duplicate_Lines:
+		sort_lines_dispatch(app, doc, .Dedupe)
 	case .Toggle_Wrap:
 		doc.wrap = !doc.wrap
 		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start

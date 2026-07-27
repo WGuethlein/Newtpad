@@ -12908,8 +12908,8 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
-		// `newtpad sortlinestest` — Sort Lines / Sort Lines Descending (doc.odin's
-		// doc_sort_lines and the two commands).
+		// `newtpad sortlinestest` — Sort Lines / Sort Lines Descending / Remove
+		// Duplicate Lines (doc.odin's doc_sort_lines and the three commands).
 		//
 		// Every case asserts the WHOLE buffer byte-for-byte, never a line count and
 		// never a length: the entire risk of this feature is a rewrite that lands
@@ -13074,6 +13074,33 @@ when NEWTPAD_TESTS {
 					want := "other\r\ndupB\r\ndupA"
 					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("a CRLF file with no trailing terminator keeps both properties: %v %q (want %q)", r, got, want))
 				}
+				{
+					// Dedupe is where "\r\n is ONE terminator" can actually be
+					// falsified, because it compares whole lines for equality rather
+					// than ordering them. The last line here has no '\r' in front of
+					// its break -- there is no break -- so a split on '\n' alone
+					// leaves every OTHER line carrying one, and the duplicate stops
+					// matching.
+					d := doc_from_content(transmute([]u8)strings.clone("dup\r\nother\r\ndup"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Dedupe)
+					got := doc_debug_string(&d)
+					want := "dup\r\nother"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("dedupe sees \\r\\n as one terminator, not content: %v %q (want %q)", r, got, want))
+				}
+				{
+					// The same duplicate, but now the file DOES end with a
+					// terminator -- which moves the load onto where the region
+					// STOPS. Ending it at the raw '\n' instead of the line's content
+					// end leaves a lone '\r' as the last line's last byte, and the
+					// duplicate stops matching for that reason instead.
+					d := doc_from_content(transmute([]u8)strings.clone("dup\r\nother\r\ndup\r\n"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Dedupe)
+					got := doc_debug_string(&d)
+					want := "dup\r\nother\r\n"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("the region stops at the last line's content end, not at its '\\n': %v %q (want %q)", r, got, want))
+				}
 			}
 			// --- a region whose line endings disagree with each other -----------------
 			//
@@ -13203,6 +13230,56 @@ when NEWTPAD_TESTS {
 				doc_undo(&d)
 				sl_chk(bad, len(d.bookmarks) == 4, fmt.tprintf("undo brings the dropped bookmarks back: %v", d.bookmarks[:]))
 			}
+			// --- dedupe ---------------------------------------------------------------
+			sl_dedupe :: proc(bad: ^int) {
+				fmt.println("--- remove duplicate lines ---")
+				{
+					// Duplicates at a DISTANCE, never adjacent: uniq-style adjacent
+					// collapse leaves this input completely unchanged. And "Alpha"
+					// must survive, because dedupe compares exact bytes while the
+					// SORT compares case-insensitively -- the one place the two
+					// commands deliberately disagree.
+					src := "alpha\nbravo\nAlpha\ncharlie\nbravo\nalpha\n"
+					d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+					defer doc_close(&d)
+					u0 := len(d.undo)
+					r := doc_sort_lines(&d, .Dedupe)
+					got := doc_debug_string(&d)
+					want := "alpha\nbravo\nAlpha\ncharlie\n"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("keeps the FIRST of each, at any distance, and Alpha != alpha: %v %q (want %q)", r, got, want))
+					sl_chk(bad, len(d.undo) == u0 + 1, fmt.tprintf("one undo entry: %d (want %d)", len(d.undo), u0 + 1))
+					doc_undo(&d)
+					sl_chk(bad, doc_debug_string(&d) == src, fmt.tprintf("undo restores every dropped line: %q", doc_debug_string(&d)))
+				}
+				{
+					// A no-op dedupe must push NOTHING: an undo entry that restores
+					// the state it is already in is worse than no entry, and it
+					// evicts a real one from UNDO_MAX. It must not dirty the
+					// document or bump the revision either -- push_undo does both,
+					// so an entry appearing here also means an unsaved-changes
+					// prompt on a file nothing changed.
+					d := doc_from_content(transmute([]u8)strings.clone("a\nb\nc\n"), "", .UTF8)
+					defer doc_close(&d)
+					rev0 := d.revision
+					r := doc_sort_lines(&d, .Dedupe)
+					sl_chk(
+						bad,
+						r == .Unchanged && len(d.undo) == 0 && d.revision == rev0 && doc_debug_string(&d) == "a\nb\nc\n",
+						fmt.tprintf("a dedupe with nothing to remove pushes no undo entry: %v undo=%d revision %d->%d %q", r, len(d.undo), rev0, d.revision, doc_debug_string(&d)),
+					)
+				}
+				{
+					// Dedupe inside a selection leaves the lines outside alone,
+					// including a duplicate of one it removed.
+					src := "keep\nkeep\nkeep\n"
+					d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+					defer doc_close(&d)
+					d.anchor, d.cursor = 5, 12 // lines 2 and 3 only
+					r := doc_sort_lines(&d, .Dedupe)
+					got := doc_debug_string(&d)
+					sl_chk(bad, r == .Ok && got == "keep\nkeep\n", fmt.tprintf("dedupe is scoped to the selection: %v %q (want %q)", r, got, "keep\nkeep\n"))
+				}
+			}
 			// --- the caps refuse, and change nothing ---------------------------------
 			//
 			// Two caps, and the test proves each one BINDS FIRST in its own case:
@@ -13260,24 +13337,25 @@ when NEWTPAD_TESTS {
 				sl_chk(bad, r == .Too_Big, fmt.tprintf("%d MB in %d lines is refused: %v (want Too_Big)", nblocks, nblocks, r))
 				sl_chk(bad, intact && len(d.undo) == 0 && d.revision == rev0, fmt.tprintf("and nothing changed: blocks-intact=%v undo=%d revision %d->%d", intact, len(d.undo), rev0, d.revision))
 			}
-			// --- the commands, as the app sees them ----------------------------------
+			// --- the three commands, as the app sees them ----------------------------
 			//
 			// The palette is the ONLY route to these (no default chord), so a
-			// missing row means an unreachable feature; and both of them rewrite the
-			// buffer, so command_mutates_doc has to know -- that is what makes table
-			// view block them and what drops a live column rectangle first. §6ad's
-			// Eol_LF was missed in exactly that list.
+			// missing row means an unreachable feature; and every one of them
+			// rewrites the buffer, so command_mutates_doc has to know -- that is
+			// what makes table view block them and what drops a live column
+			// rectangle first. §6ad's Eol_LF was missed in exactly that list.
 			sl_commands :: proc(bad: ^int) {
 				fmt.println("--- the commands ---")
-				for cmd in ([]Command_Id{.Sort_Lines, .Sort_Lines_Desc}) {
+				for cmd in ([]Command_Id{.Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines}) {
 					sl_chk(bad, command_mutates_doc(cmd), fmt.tprintf("%v is a document mutation", cmd))
 					sl_chk(bad, command_in_palette(cmd), fmt.tprintf("%v is offered in the palette", cmd))
 					sl_chk(bad, command_chord(cmd) == "", fmt.tprintf("%v has no default chord: %q", cmd, command_chord(cmd)))
 					sl_chk(bad, command_table[cmd].title != "" && command_table[cmd].category == "Edit", fmt.tprintf("%v is titled and filed under Edit: %q", cmd, command_table[cmd].title))
 				}
-				// The palette shows the title and nothing else, so the one thing a
-				// user cannot otherwise know has to be in it.
+				// The palette shows the title and nothing else, so the two things a
+				// user cannot otherwise know have to be in it.
 				sl_chk(bad, strings.contains(command_table[.Sort_Lines].title, "selection"), fmt.tprintf("the sort title states its scope: %q", command_table[.Sort_Lines].title))
+				sl_chk(bad, strings.contains(command_table[.Remove_Duplicate_Lines].title, "exact"), fmt.tprintf("the dedupe title states that the match is exact: %q", command_table[.Remove_Duplicate_Lines].title))
 			}
 			bad := 0
 			sl_asc(&bad)
@@ -13289,6 +13367,7 @@ when NEWTPAD_TESTS {
 			sl_no_trailing(&bad)
 			sl_undo(&bad)
 			sl_bookmarks(&bad)
+			sl_dedupe(&bad)
 			sl_cap_lines(&bad)
 			sl_cap_bytes(&bad)
 			sl_commands(&bad)
