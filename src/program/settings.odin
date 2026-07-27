@@ -123,6 +123,27 @@ settings_path :: proc() -> (string, bool) {
 	return fmt.tprintf("%s%csettings.txt", dir, '\\'), true
 }
 
+// The single reading of `tab_width`, called by BOTH settings_load and
+// settings_save so the two ends cannot disagree about what a value means.
+//
+// 0 is "never set" -- a struct built before the field existed, a truncated
+// settings.txt, a hand edit -- and resolves to the DEFAULT, not to
+// TAB_WIDTH_MIN. Same reasoning as zoom_pct's `if == 0` one line above the save
+// call, with teeth: a 0 clamped up to 1 makes every tab in every document one
+// cell wide, which reads as the app silently changing a setting rather than as
+// a default being applied. Anything else is a real choice and is clamped into
+// range.
+//
+// Two sides normalising the same value differently is exactly the bug this
+// replaces: save wrote 4 for a struct 0 while load turned a disk 0 into 1, so a
+// file the save side would never have produced still had to be read, and was
+// read the other way.
+@(private = "file")
+tab_width_normalise :: proc(n: int) -> int {
+	if n == 0 {return plat.TAB_WIDTH_DEFAULT}
+	return clamp(n, plat.TAB_WIDTH_MIN, plat.TAB_WIDTH_MAX)
+}
+
 // Hand-parsed `key value` lines, the same shape session.txt already uses.
 // Unknown keys are ignored rather than fatal, so an older build reading a newer
 // file degrades instead of failing.
@@ -153,8 +174,10 @@ settings_load :: proc() -> Settings {
 				s.zoom_pct = clamp(n, ZOOM_STEPS[0], ZOOM_STEPS[len(ZOOM_STEPS) - 1])
 			}
 		case "tab_width":
+			// Through the same normaliser the save side uses, deliberately: a 0
+			// has to mean the same thing coming in as it does going out.
 			if n, pok := strconv.parse_int(parts[1]); pok {
-				s.tab_width = clamp(n, plat.TAB_WIDTH_MIN, plat.TAB_WIDTH_MAX)
+				s.tab_width = tab_width_normalise(n)
 			}
 		case "font_family":
 			s.font_family = strings.clone(parts[1])
@@ -206,11 +229,7 @@ settings_save :: proc(s: Settings) -> bool {
 	s.font_size = clamp(s.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX)
 	if s.zoom_pct == 0 {s.zoom_pct = ZOOM_DEFAULT}
 	s.zoom_pct = clamp(s.zoom_pct, ZOOM_STEPS[0], ZOOM_STEPS[len(ZOOM_STEPS) - 1])
-	// Same "0 means never set" reasoning as zoom_pct, with teeth: clamping a 0 up
-	// to TAB_WIDTH_MIN would write 1 to disk and make every tab one cell wide on
-	// the next launch, a silent setting change nobody asked for.
-	if s.tab_width == 0 {s.tab_width = plat.TAB_WIDTH_DEFAULT}
-	s.tab_width = clamp(s.tab_width, plat.TAB_WIDTH_MIN, plat.TAB_WIDTH_MAX)
+	s.tab_width = tab_width_normalise(s.tab_width)
 	// Zero means "never set" (a literal built without this field, or a struct
 	// that predates it) rather than a deliberate 0.0 fraction, which SPLIT_MIN
 	// would silently misrepresent as a real user choice.

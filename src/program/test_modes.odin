@@ -702,15 +702,28 @@ when NEWTPAD_TESTS {
 			if !tzok {bad += 1}
 
 			// Out of range in both directions, written straight to disk so this is
-			// settings_load's own clamp and not a re-test of the save side.
+			// settings_load's own normalise and not a re-test of the save side.
+			//
+			// The 0 case is the seam, not a second clamp check: a `tab_width 0` on
+			// disk (hand-edited, or a truncated write) must resolve to whatever a
+			// struct 0 resolves to on the way OUT, because the two sides are the
+			// same value read twice. They disagreed once -- save wrote the default
+			// 4 while load clamped to the minimum 1, so a hand-edited file gave
+			// one-cell tabs in every document -- and the assertion below is written
+			// against `tz` (what the save side produced for a struct 0, measured
+			// eight lines up) rather than against a literal, so reintroducing the
+			// disagreement in EITHER direction fails it.
 			if p, pok := session_dir(); pok {
 				base_kv := "newtpad-settings 1\nrestore_session 1\nwrap_default 0\nfont_size 16\nzoom_pct 100\n"
 				plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)strings.concatenate({base_kv, "tab_width 99\n"}, context.temp_allocator))
 				hiw := settings_load()
 				plat.file_write_atomic(fmt.tprintf("%s%csettings.txt", p, '\\'), transmute([]u8)strings.concatenate({base_kv, "tab_width 0\n"}, context.temp_allocator))
 				low := settings_load()
-				twok := hiw.tab_width == plat.TAB_WIDTH_MAX && low.tab_width == plat.TAB_WIDTH_MIN
-				fmt.printfln("tab_width on disk 99 -> %d (want %d), 0 -> %d (want %d)  %s", hiw.tab_width, plat.TAB_WIDTH_MAX, low.tab_width, plat.TAB_WIDTH_MIN, "OK" if twok else "FAIL")
+				twok := hiw.tab_width == plat.TAB_WIDTH_MAX && low.tab_width == tz.tab_width && low.tab_width == plat.TAB_WIDTH_DEFAULT
+				fmt.printfln(
+					"tab_width on disk 99 -> %d (want %d), 0 -> %d (want %d, the same thing a struct 0 saves as)  %s",
+					hiw.tab_width, plat.TAB_WIDTH_MAX, low.tab_width, tz.tab_width, "OK" if twok else "FAIL",
+				)
 				if !twok {bad += 1}
 			}
 
