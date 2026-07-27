@@ -172,6 +172,18 @@ menus := []Menu {
 			// empty buffer.
 			{cmd = .Paste, enabled = has_doc},
 			sep,
+			// Live on a pseudo-tab, and the precondition for that being harmless is
+			// worth writing down because nothing else states it: app_open_special
+			// (app.odin) builds the Settings and Font documents from a bare
+			// doc_new() with no content and nothing ever writes to them, so
+			// doc_select_all leaves anchor == cursor == 0 and there is no selection
+			// for Cut or Copy to act on.
+			//
+			// That held by luck until a palette paste could put text in the
+			// pseudo-buffer -- select it, and Cut went live and mutated. Cut is now
+			// refused outright there by command_allowed_on (via command_mutates_doc),
+			// so the invariant no longer rests on the buffer happening to be empty;
+			// this row is merely a no-op rather than a harmless-for-now one.
 			{cmd = .Select_All, enabled = has_doc},
 			sep,
 			{cmd = .Find_Open, enabled = has_doc},
