@@ -37,8 +37,23 @@ worth reading before trusting any other "X is missing" claim in this file.
 **The installed binary is still v0.16.0.** Batch 7 merged under Wyatt's overnight policy: merge, do
 not `install.ps1`. Run it after the live pass in §6ab's "Owed".
 
-**Immediate next step: batch 8 (§6aa)** — engine debt: release build time back under the ~5 s rule,
-precompiled `.cso` shaders, batching the text pipeline. Nothing has been specced for it.
+**Batch 8 is specced and its scope halved** — `docs/superpowers/specs/2026-07-27-batch-8-design.md`.
+Build time turned out already resolved (measured: 5.1 s, §5) and the arena decision was settled in
+batch 7, leaving precompiled `.cso` shaders (which the 2026-07-25 audit downgraded itself) and
+**batching the text pipeline**, which is the only item that buys anything — it unblocks the
+always-on line-number gutter.
+
+**One batch-8 task is already merged: `drawcount` is now headless.** It renders a real frame
+offscreen, prints draw calls plus an instance-stream digest, and exits — so the batching work has an
+instrument for the first time, and a §6 trap is retired. **It is not yet sufficient to sign that work
+off**, and the four limits are listed at the mode itself in `test_modes.odin`; the sharpest is that
+the digest hashes UVs, which encode glyph first-use order, so a batching pass that regroups draws
+moves the digest with zero pixel change. Read them before batch 8b.
+
+**Immediate next step:** answer the two questions at the end of the batch-8 spec — whether the
+line-number gutter is actually wanted (it is batching's whole justification) and whether a pixel
+readback harness is worth building, or whether Wyatt's live pass is the intended verification for
+renderer work from here on.
 
 **Three things Wyatt owes, all ranked in their own sections and none blocking:**
 
