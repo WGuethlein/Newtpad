@@ -12291,6 +12291,242 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad matchmarkstest` — the find-match ticks on the vertical
+		// scrollbar (find.odin: find_mark_y / find_mark_cap / find_mark_rects).
+		//
+		// The claim that actually needs falsifying is NOT "a mark appears". It is
+		// that the quad count is bounded by the TRACK, not by the match count --
+		// a 200 MB log at MAX_MATCHES must cost a few hundred quads, not 100,000.
+		// A test that only checked mark positions would pass with the bucketing
+		// deleted, which is the exact failure mode this batch has already shipped
+		// three times, so the count is asserted directly and against a fixture
+		// that really does saturate MAX_MATCHES rather than a flag poked by hand.
+		//
+		// Three properties, each with its own sabotage:
+		//
+		//   1. BUCKETING  — N matches inside one pixel row are one quad, and the
+		//      output buffer (find_mark_cap) is never filled. Emitting one quad
+		//      per match breaks both.
+		//   2. MAPPING    — offset 0 lands on the track's top pixel and offset
+		//      pt.length flush with its bottom, one mark-height up. Dropping the
+		//      mark-height term draws the last tick past the end of the bar.
+		//   3. TRUNCATION — a saturated set is reported as partial AND the find
+		//      bar's counter carries the "+" that is the only thing on screen
+		//      saying so. The marks add no second convention, so removing that
+		//      "+" would leave an incomplete set looking complete.
+		if os.args[1] == "matchmarkstest" {
+			if !require_scratch_session("matchmarkstest") {return true}
+			// find_mark_rects reads g_theme; left at its zero value every quad
+			// would be transparent black and the colour assertion below could not
+			// tell Match_Mark from any other role.
+			g_theme = theme_dark()
+
+			mm_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			// Open find and type `q`, one rune at a time through the product's
+			// own entry point. Small buffers scan inline, so results are ready
+			// when this returns; large ones hand off to the worker, which is what
+			// find_wait is for.
+			mm_search :: proc(d: ^Document, q: string) {
+				find_open(d, false)
+				for r in q {find_input_rune(d, r)}
+				find_wait(d)
+			}
+
+			bad := 0
+
+			// --- the mapping, on its own ---------------------------------------------
+			//
+			// No Document: this is arithmetic, and testing it through a fixture
+			// would mean the endpoints depend on where a needle happened to land.
+			mm_mapping :: proc(bad: ^int) {
+				fmt.println("--- mapping ---")
+				TOP :: f32(100)
+				H :: f32(500)
+				MH :: f32(2)
+				y0 := find_mark_y(0, 1000, TOP, H, MH)
+				yend := find_mark_y(1000, 1000, TOP, H, MH)
+				ymid := find_mark_y(500, 1000, TOP, H, MH)
+				mm_chk(bad, y0 == TOP, fmt.tprintf("offset 0 lands on the track's top pixel: y=%.1f (want %.1f)", y0, TOP))
+				// The whole point of the mark-height term: without it the tick for
+				// the last byte is drawn at TOP+H, entirely below the track.
+				mm_chk(bad, yend == TOP + H - MH, fmt.tprintf("offset == pt.length lands flush with the bottom: y=%.1f (want %.1f)", yend, TOP + H - MH))
+				mm_chk(bad, ymid == TOP + H / 2, fmt.tprintf("halfway lands halfway: y=%.1f (want %.1f)", ymid, TOP + H / 2))
+				// Between an edit and the next find_merge, f.matches still holds
+				// offsets measured against the buffer as it was.
+				lo := find_mark_y(-50, 1000, TOP, H, MH)
+				hi := find_mark_y(9999, 1000, TOP, H, MH)
+				mm_chk(bad, lo == TOP && hi == TOP + H - MH, fmt.tprintf("stale offsets clamp into the track: %.1f, %.1f", lo, hi))
+				mm_chk(bad, find_mark_y(0, 0, TOP, H, MH) == TOP, "an empty buffer does not divide by zero")
+			}
+			mm_mapping(&bad)
+
+			// --- bucketing ------------------------------------------------------------
+			//
+			// 4000 bytes over a 100 px track: one pixel row is 40 bytes. Eight
+			// needles inside the first 40 bytes and one at byte 2000, so the
+			// answer is two marks from nine matches -- and the two rows are far
+			// enough apart that no rounding choice merges them.
+			mm_bucket :: proc(bad: ^int, search: proc(d: ^Document, q: string)) {
+				fmt.println("--- bucketing ---")
+				content := make([]u8, 4000)
+				for i in 0 ..< len(content) {content[i] = 'a'}
+				for off := 0; off < 32; off += 4 {content[off] = 'Q'} // 8 in row 0
+				content[2000] = 'Q' // row 50
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+				search(&d, "Q")
+
+				TRACK_H :: f32(100)
+				mc := find_mark_cap(&d, TRACK_H)
+				out := make([]plat.Quad, mc, context.temp_allocator)
+				n, partial := find_mark_rects(&d, 300, 16, 0, TRACK_H, out)
+
+				mm_chk(bad, len(d.find.matches) == 9, fmt.tprintf("the fixture really has 9 matches: %d", len(d.find.matches)))
+				mm_chk(bad, n == 2, fmt.tprintf("9 matches over 2 occupied pixel rows collapse to 2 marks: %d", n))
+				mm_chk(bad, !partial, "a complete set is not reported as partial")
+				if n == 2 {
+					mm_chk(bad, out[0].pos.y == 0 && out[1].pos.y == 50, fmt.tprintf("the two marks sit on rows 0 and 50: %.1f, %.1f", out[0].pos.y, out[1].pos.y))
+					mm_chk(bad, out[0].size == [2]f32{16, sx(MATCH_MARK_H_96)}, fmt.tprintf("a mark spans the bar's width at MATCH_MARK_H: %v", out[0].size))
+					mm_chk(bad, out[0].pos.x == 300, fmt.tprintf("marks start at the x they were given: %.1f", out[0].pos.x))
+					// Colour comes from a role, and from THIS role -- a literal or
+					// a borrowed role (Find_Match_Bg is the tempting one) would
+					// leave the tick invisible on the track it is drawn on.
+					mm_chk(bad, out[0].color == theme_dark()[.Match_Mark], fmt.tprintf("marks are drawn in Color_Role.Match_Mark: %v", out[0].color))
+				}
+				// The bound that makes the fixed buffer safe. With the bucketing
+				// removed this is n == mc, i.e. geometry silently dropped.
+				mm_chk(bad, n < mc, fmt.tprintf("the mark buffer is never filled: %d of %d", n, mc))
+			}
+			mm_bucket(&bad, mm_search)
+
+			// --- endpoints, through the real geometry ---------------------------------
+			//
+			// mm_mapping asserts the arithmetic; this asserts that find_mark_rects
+			// actually feeds it pt.length and the track it was handed.
+			mm_endpoints :: proc(bad: ^int, search: proc(d: ^Document, q: string)) {
+				fmt.println("--- endpoints ---")
+				content := make([]u8, 1000)
+				for i in 0 ..< len(content) {content[i] = 'a'}
+				content[0] = 'Q'
+				content[999] = 'Q' // the last byte in the buffer
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+				search(&d, "Q")
+
+				TRACK_TOP :: f32(60)
+				TRACK_H :: f32(200)
+				out := make([]plat.Quad, find_mark_cap(&d, TRACK_H), context.temp_allocator)
+				n, _ := find_mark_rects(&d, 0, 16, TRACK_TOP, TRACK_H, out)
+				mh := sx(MATCH_MARK_H_96)
+				mm_chk(bad, n == 2, fmt.tprintf("two matches, two rows, two marks: %d", n))
+				if n == 2 {
+					mm_chk(bad, out[0].pos.y == TRACK_TOP, fmt.tprintf("the first byte's mark is at the track top: %.1f (want %.1f)", out[0].pos.y, TRACK_TOP))
+					mm_chk(
+						bad,
+						out[1].pos.y == TRACK_TOP + TRACK_H - mh,
+						fmt.tprintf("the last byte's mark is flush with the track bottom: %.1f (want %.1f)", out[1].pos.y, TRACK_TOP + TRACK_H - mh),
+					)
+					mm_chk(bad, out[1].pos.y + out[1].size.y <= TRACK_TOP + TRACK_H, "no mark is drawn past the end of the track")
+				}
+			}
+			mm_endpoints(&bad, mm_search)
+
+			// --- nothing to mark ------------------------------------------------------
+			//
+			// find_mark_cap returning 0 is what keeps render_frame from allocating
+			// a per-frame buffer on every one of the frames where the find bar is
+			// shut, which is nearly all of them.
+			mm_empty :: proc(bad: ^int, search: proc(d: ^Document, q: string)) {
+				fmt.println("--- nothing to mark ---")
+				content := make([]u8, 1000)
+				for i in 0 ..< len(content) {content[i] = 'a'}
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+
+				TRACK_H :: f32(200)
+				mm_chk(bad, find_mark_cap(&d, TRACK_H) == 0, "find shut: no buffer is asked for")
+				out: [8]plat.Quad
+				n0, _ := find_mark_rects(&d, 0, 16, 0, TRACK_H, out[:])
+				mm_chk(bad, n0 == 0, fmt.tprintf("find shut: nothing is drawn: %d", n0))
+
+				search(&d, "ZZZ") // no such text in the fixture
+				mm_chk(bad, len(d.find.matches) == 0, fmt.tprintf("the query really finds nothing: %d", len(d.find.matches)))
+				mm_chk(bad, find_mark_cap(&d, TRACK_H) == 0, "no matches: no buffer is asked for")
+				n1, _ := find_mark_rects(&d, 0, 16, 0, TRACK_H, out[:])
+				mm_chk(bad, n1 == 0, fmt.tprintf("no matches: nothing is drawn: %d", n1))
+			}
+			mm_empty(&bad, mm_search)
+
+			// --- a saturated result set -----------------------------------------------
+			//
+			// 200,000 matches against MAX_MATCHES = 100,000, over a buffer past
+			// SEARCH_SYNC_MAX so this goes through the worker exactly as the real
+			// thing does. This is the case the whole design exists for: the mark
+			// count must be a property of the track, and the incompleteness must
+			// reach the screen.
+			mm_truncated :: proc(bad: ^int, search: proc(d: ^Document, q: string)) {
+				fmt.println("--- a saturated result set ---")
+				N :: 200_000
+				content := make([]u8, N * 2)
+				for i in 0 ..< N {
+					content[i * 2] = 'a'
+					content[i * 2 + 1] = 'b'
+				}
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+				search(&d, "ab")
+
+				mm_chk(bad, d.pt.length > SEARCH_SYNC_MAX, fmt.tprintf("the fixture goes through the WORKER, not the inline scan: %d bytes", d.pt.length))
+				mm_chk(bad, len(d.find.matches) == MAX_MATCHES && d.find.truncated, fmt.tprintf("MAX_MATCHES saturated: %d matches, truncated=%v", len(d.find.matches), d.find.truncated))
+
+				TRACK_H :: f32(700)
+				mc := find_mark_cap(&d, TRACK_H)
+				// DELIBERATELY oversized: one slot per match, not find_mark_cap's.
+				// Sized to the cap, `n <= cap` is a statement about the buffer and
+				// not about the bucketing -- with the dedupe deleted it still held,
+				// because find_mark_rects stops at len(out). That is the assertion
+				// that cannot fail, and it passed green through the first sabotage
+				// run of this very test. Given room for one quad per match, the
+				// count is free to be wrong, so the bound below means something.
+				out := make([]plat.Quad, len(d.find.matches), context.temp_allocator)
+				n, partial := find_mark_rects(&d, 0, 16, 0, TRACK_H, out)
+
+				// The headline: quads scale with the bar, not with the file.
+				mm_chk(bad, n <= int(TRACK_H) + 2, fmt.tprintf("100,000 matches cost %d quads with room for %d, bounded by the %.0f px track", n, len(out), TRACK_H))
+				mm_chk(bad, n * 100 < len(d.find.matches), fmt.tprintf("...which is under 1%% of one-quad-per-match: %d vs %d", n, len(d.find.matches)))
+				// The published prefix covers the first half of the buffer, so
+				// the marks fill the top half of the track and stop.
+				mm_chk(bad, n >= 340 && n <= 352, fmt.tprintf("the marks really cover the scanned half of the track: %d rows (want ~350)", n))
+				// ...and what render_frame would actually have allocated is enough
+				// for that count with room to spare.
+				mm_chk(bad, n < mc, fmt.tprintf("find_mark_cap's buffer would not have filled: %d of %d", n, mc))
+
+				// Ascending and unique -- the property the one-compare dedupe
+				// relies on, and the one that fails first if the mapping ever
+				// stops being monotonic in the offset.
+				ok_order := true
+				for i in 1 ..< n {
+					if i32(out[i].pos.y) <= i32(out[i - 1].pos.y) {ok_order = false}
+				}
+				mm_chk(bad, ok_order, "the marks come out in ascending, unique pixel rows")
+
+				// Incompleteness has to reach the user, and the marks deliberately
+				// do not say it themselves -- the find bar's counter does. If that
+				// "+" ever goes away this pairing is what notices.
+				mm_chk(bad, partial, fmt.tprintf("find_mark_rects reports the set as partial: %v", partial))
+				info := find_status_info(&d)
+				mm_chk(bad, strings.has_suffix(info, "+)"), fmt.tprintf("the find bar says the set is partial: %q", info))
+			}
+			mm_truncated(&bad, mm_search)
+
+			fmt.printfln("matchmarkstest: %d failures", bad)
+			return true
+		}
+
 		if len(os.args) < 3 {return false}
 		path, mode := os.args[1], os.args[2]
 

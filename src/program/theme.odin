@@ -141,6 +141,17 @@ Color_Role :: enum u8 {
 	// the one mark on the canvas that must read against the document
 	// background, which is a different constraint from any chrome accent.
 	Bookmark,
+	// The find-match ticks on the vertical scrollbar (find_mark_rects). A new
+	// role for the same reason Bookmark is one, plus a constraint no existing
+	// role carries: this is the only accent drawn as a solid fill on the
+	// scrollbar TRACK (Bg_Raised), so it is judged against that surface and not
+	// against Bg_Base. Find_Match_Bg is the obvious candidate and is the wrong
+	// one -- it is a wash tuned to sit *behind unchanged text* on the canvas
+	// (deliberately dim, 1.64:1 in Light), and a 2px tick with that contrast is
+	// not there at all. Same amber family as Find_Match_Bg on purpose, since
+	// the tick and the in-document highlight are one feature; the value differs
+	// because the job does.
+	Match_Mark,
 
 	// --- syntax highlighting ---
 	// Declared in batch 3 so batch 4's lexers could emit role names from their
@@ -232,6 +243,10 @@ theme_dark :: proc() -> Theme {
 		.Md_Italic      = {0.80, 0.86, 0.78, 1}, // #CCDBC7
 		.Md_Quote       = {0.66, 0.72, 0.62, 1}, // #A8B89E
 		.Bookmark       = {0.40, 0.66, 0.95, 1}, // #66A8F2
+		// #F2A93B -- 6.8:1 against Bg_Raised (#292E38), the scrollbar track it
+		// is drawn on. Brighter and more saturated than Find_Match_Bg's
+		// #6B6129, which measures 1.4:1 there and would be an invisible tick.
+		.Match_Mark     = {0.95, 0.66, 0.23, 1}, // #F2A93B
 
 		// Light's hue family per role, re-tuned for this theme's Bg_Base
 		// (#1A1F29). Ratios are WCAG relative luminance against Bg_Base,
@@ -353,6 +368,13 @@ theme_light :: proc() -> Theme {
 		// the margin. Deepened to the same blue family as Link, 5.9:1 against
 		// Bg_Base -- a 4px bar needs contrast more than text does, not less.
 		.Bookmark       = {0.13, 0.40, 0.71, 1}, // #2166B5
+		// Judged against Bg_Raised (#E2E7EE), not Bg_Base: this is the one
+		// accent drawn on the scrollbar track. 4.0:1 there -- above the 3:1
+		// non-text UI floor with margin, because a 2px tick has less area to
+		// carry its contrast than a glyph does. Deepened from Dark's #F2A93B
+		// (1.6:1 on the pale track) into the same amber family Find_Match_Bg
+		// keeps in this theme.
+		.Match_Mark     = {0.65, 0.37, 0.00, 1}, // #A65F00
 
 		// Deliberate light-appropriate placeholders, not magenta: batch 4 has
 		// no consumer for these yet, but a light theme with magenta holes
@@ -485,6 +507,7 @@ theme_role_keys := [Color_Role]string {
 	.Md_Italic      = "md_italic",
 	.Md_Quote       = "md_quote",
 	.Bookmark       = "bookmark",
+	.Match_Mark     = "match_mark",
 	.Syn_Keyword    = "syn_keyword",
 	.Syn_String     = "syn_string",
 	.Syn_Number     = "syn_number",

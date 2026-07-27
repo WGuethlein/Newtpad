@@ -1135,7 +1135,35 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// makes common, since the last visible row of a wrapped line lands close to
 		// the document end.
 		ty := clamp(CHROME_TOP + f32(doc.top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
-		bars[nb] = {pos = {er - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = g_theme[.Bg_Raised]};nb += 1
+		track := plat.Quad{pos = {er - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = g_theme[.Bg_Raised]}
+		// Find-match ticks, drawn BETWEEN the track and the thumb.
+		//
+		// Under the thumb rather than over it, deliberately. No single colour
+		// reads strongly on both surfaces in Dark -- the track is near-black and
+		// the thumb is a pale grey -- and the marks the user actually needs are
+		// the ones OFF screen: every match the thumb covers is already on screen
+		// with its own highlight behind the text. The cost is that a file small
+		// enough to fit in the window hides its marks behind a full-height thumb,
+		// which is exactly the file that does not need them.
+		//
+		// Costs two extra quads_draw calls -- the marks' own, plus the track's,
+		// which can no longer share a batch with the thumb now that something is
+		// drawn between them -- and only while the find bar is open with matches.
+		// find_mark_cap returns 0 otherwise and this whole block is skipped,
+		// allocation included; measured on HANDOFF.md, 7 -> 9 calls with the bar
+		// open and 4 with it shut, which is what it was before this existed.
+		if mc := find_mark_cap(doc, sb_h); mc > 0 {
+			marks := make([]plat.Quad, mc, context.temp_allocator)
+			nmk, _ := find_mark_rects(doc, er - SCROLLBAR_W, SCROLLBAR_W, CHROME_TOP, sb_h, marks)
+			if nmk > 0 {
+				plat.quads_draw(gfx, quad_pipe, []plat.Quad{track})
+				plat.quads_draw(gfx, quad_pipe, marks[:nmk])
+			} else {
+				bars[nb] = track;nb += 1
+			}
+		} else {
+			bars[nb] = track;nb += 1
+		}
 		bars[nb] = {pos = {er - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = g_theme[.Text_Muted]};nb += 1
 	}
 	if caret {
@@ -1237,24 +1265,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		bar_h := sx(48) if f.replace_mode else sx(26)
 		bar := plat.Quad{pos = {0, h - bar_h}, size = {w, bar_h}, color = g_theme[.Bg_Panel]}
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{bar})
-		info: string
-		switch {
-		case len(f.query) == 0:
-			info = ""
-		case len(f.matches) > 0:
-			// "+" marks a partial result: we stopped at the match limit or the
-			// regex scan cap, so there may be more further down the file.
-			info = fmt.tprintf(" (%d/%d%s)", f.current + 1, len(f.matches), "+" if f.truncated else "")
-		case search_running(doc) && f.last_total > 0:
-			// Mid-restart after an edit: the matches are cleared but the search is
-			// still running, so the last published figure is the honest one. Saying
-			// "(no matches)" here made every replace flicker to zero.
-			info = fmt.tprintf(" (%d/%d%s)", f.last_current + 1, f.last_total, "+" if f.truncated else "")
-		case search_running(doc):
-			info = ""
-		case:
-			info = " (no matches)"
-		}
+		// One producer (find.odin), because the scrollbar's match marks are drawn
+		// from the same partial match list and rely on this "+" to say so.
+		info := find_status_info(doc)
 		mode := "regex" if f.regex else "text"
 		// The caret marks the focused field and reserves nothing in the other one.
 		// A blank placeholder here would keep the double gap that was the reported

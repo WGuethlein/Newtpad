@@ -7,6 +7,7 @@
 package main
 
 import "base:intrinsics"
+import "core:fmt"
 import "core:mem"
 import "core:text/regex"
 import "core:thread"
@@ -631,4 +632,135 @@ find_match_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: i
 		}
 	}
 	return n
+}
+
+// --- scrollbar match marks ---
+
+// Tick height, at 96 DPI. Two pixels, not one: sx() rounds and a one-pixel mark
+// on a 150% display stays one pixel, which reads as a rendering artifact rather
+// than as a mark.
+MATCH_MARK_H_96 :: f32(2)
+
+// The y of the tick for a match at byte `offset`, in window pixels.
+//
+// One producer for the mapping, and deliberately the SAME arithmetic the
+// scrollbar thumb uses (render_frame: CHROME_TOP + doc.top/total * sb_h),
+// including the same shape of clamp that keeps the thumb from running off the
+// bottom of the track. That is the whole reason this feature is cheap: the bar
+// is byte-proportional (HANDOFF 6b), so no line index is involved and a mark's
+// position is a division. If the thumb's mapping ever changes, this must change
+// with it or a tick will sit somewhere the thumb never travels.
+//
+// `total` is pt.length, so `offset == total` is a legal input and lands flush
+// with the bottom of the track rather than one mark-height past it. Offsets
+// outside [0, total] are clamped rather than trusted: between an edit and the
+// next find_merge, f.matches still holds offsets measured against the buffer as
+// it was, and one of them can exceed the buffer as it now is.
+find_mark_y :: proc(offset, total: int, track_top, track_h, mark_h: f32) -> f32 {
+	if total <= 0 {return track_top}
+	frac := clamp(f64(offset) / f64(total), 0, 1)
+	return clamp(track_top + f32(frac * f64(track_h)), track_top, track_top + track_h - mark_h)
+}
+
+// How many quads find_mark_rects can possibly emit for this track, and 0 when
+// it would emit none.
+//
+// Both halves are load-bearing. The 0 lets the caller skip the per-frame
+// allocation entirely when the find bar is shut or the query found nothing --
+// which is almost every frame. The bound is what makes the buffer safe: marks
+// are bucketed and the y is clamped into [track_top, track_top + track_h -
+// mark_h], so the number of DISTINCT buckets cannot exceed the number of
+// buckets in the track however many matches there are. A 200 MB log at
+// MAX_MATCHES emits one quad per occupied bucket, not 100,000 quads. The +2
+// covers the two truncations (track_top and the clamped bottom both rounding
+// into their own bucket).
+find_mark_cap :: proc(doc: ^Document, track_h: f32) -> int {
+	if doc == nil || !doc.find.active || len(doc.find.matches) == 0 || doc.pt.length <= 0 {return 0}
+	if track_h <= 0 {return 0}
+	return min(int(track_h) + 2, plat.MAX_QUADS)
+}
+
+// Height of one bucket, in pixels.
+//
+// One pixel on every display that exists: quads_draw clamps a call to
+// plat.MAX_QUADS (4096) instances, so a track taller than that would have its
+// last marks silently dropped -- a bounded pass reporting a confident wrong
+// answer, the shape that keeps recurring here (docs/development-loop.md 4).
+// Rather than leave that as a comment about how tall a window can be, the
+// bucket grows so the count cannot: at any real height this returns 1 and the
+// bucketing is exactly per-pixel-row, and past ~4000 px of track it coarsens
+// instead of losing marks off the bottom.
+@(private = "file")
+mark_bucket_h :: proc(track_h: f32) -> f32 {
+	return f32(int(max(track_h, 0)) / (plat.MAX_QUADS - 2) + 1)
+}
+
+// One quad per occupied pixel row of the scrollbar track (see mark_bucket_h for
+// the one case where a bucket is taller than a pixel), from however many matches
+// are published right now.
+//
+// The bucketing is the point, not a nicety: quads_draw takes a slice per call
+// and a 200 MB log with 50,000 matches would otherwise put 50,000 instances on
+// a bar a few hundred pixels tall, every frame, to draw a few hundred distinct
+// pixels. f.matches is sorted ascending and find_mark_y is monotonic in the
+// offset, so the rows come out in order and collapsing them costs one integer
+// compare against the last row emitted -- no set, no allocation.
+//
+// `partial` reports that the published set is a prefix (MAX_MATCHES saturated;
+// HANDOFF 6e). Nothing is drawn differently for it and that is a decision, not
+// an omission: the find bar's counter already appends "+" for exactly this
+// state (find_status_info), the bar is on screen whenever these marks are --
+// both require find.active -- and a second, wordless convention on the track
+// would be the same sentence in a language the user has not been taught. It is
+// returned so the caller and matchmarkstest can see the state rather than
+// having to infer it from the mark count.
+find_mark_rects :: proc(doc: ^Document, x, w, track_top, track_h: f32, out: []plat.Quad) -> (n: int, partial: bool) {
+	if doc == nil {return 0, false}
+	f := &doc.find
+	partial = f.truncated
+	if !f.active || len(f.matches) == 0 || doc.pt.length <= 0 || track_h <= 0 {return 0, partial}
+
+	col := g_theme[.Match_Mark]
+	mark_h := sx(MATCH_MARK_H_96)
+	bucket := mark_bucket_h(track_h)
+	last_row := min(i32)
+	for m in f.matches {
+		if n >= len(out) {break} // unreachable at find_mark_cap's size; see its comment
+		y := find_mark_y(m, doc.pt.length, track_top, track_h, mark_h)
+		row := i32((y - track_top) / bucket)
+		if row == last_row {continue}
+		last_row = row
+		out[n] = {pos = {x, y}, size = {w, mark_h}, color = col}
+		n += 1
+	}
+	return n, partial
+}
+
+// --- the find bar's status text ---
+
+// The trailing "(current/total)" the find bar draws after the query.
+//
+// Extracted from render_frame so the "+" that marks an incomplete result set
+// has exactly one producer. The scrollbar match marks are drawn from the same
+// partial list and deliberately add no second indicator of their own, so this
+// string is the only thing on screen saying the set is a prefix -- which makes
+// it something a test can hold the marks against instead of a comment.
+find_status_info :: proc(doc: ^Document) -> string {
+	f := &doc.find
+	switch {
+	case len(f.query) == 0:
+		return ""
+	case len(f.matches) > 0:
+		// "+" marks a partial result: we stopped at the match limit, so there
+		// may be more further down the file.
+		return fmt.tprintf(" (%d/%d%s)", f.current + 1, len(f.matches), "+" if f.truncated else "")
+	case search_running(doc) && f.last_total > 0:
+		// Mid-restart after an edit: the matches are cleared but the search is
+		// still running, so the last published figure is the honest one. Saying
+		// "(no matches)" here made every replace flicker to zero.
+		return fmt.tprintf(" (%d/%d%s)", f.last_current + 1, f.last_total, "+" if f.truncated else "")
+	case search_running(doc):
+		return ""
+	}
+	return " (no matches)"
 }
