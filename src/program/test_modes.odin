@@ -140,6 +140,36 @@ when NEWTPAD_TESTS {
 	//     See draw_trace.odin.
 	//
 	// Runs offscreen and exits; no window, nothing on screen, no lock on the exe.
+	//
+	// KNOWN LIMITS — read these before trusting it to sign off the batching work,
+	// because two of them will bite exactly there:
+	//
+	//   1. It measures ONE frame of ONE document in ONE view, reaching about six
+	//      of the ~60 text_draw_spans call sites in program/ (they do carry all
+	//      the instances, but still). Nothing here exercises the menus, palette,
+	//      history panel, Settings/Font tabs, find/replace bar, filter banner,
+	//      markdown preview or split, or the grid. A batching change can break any
+	//      of those and this reports green. The fix is a view argument
+	//      (`drawcount <file> [--menu|--palette|--find|--md-split|--grid]`), not a
+	//      better digest — do not confuse the two.
+	//   2. The digest hashes UVs, and UVs encode glyph FIRST-USE order in the
+	//      atlas. A batching pass that regroups draws reorders glyph_get, which
+	//      reshuffles the packer and moves the digest with zero pixel change — a
+	//      FALSE POSITIVE arriving during precisely the work this was built for.
+	//      Add a UV-independent digest (pos/size/colour only) before batching.
+	//   3. The digest sees instances, not render state. Blend state, SRV, sampler,
+	//      stride and the per-call constants buffer are all set per draw today and
+	//      batching necessarily moves them; a bit-identical stream with the wrong
+	//      blend state bound hashes green. Closing this needs a real pixel readback
+	//      (CopyResource to a STAGING texture), which also dissolves limit 2.
+	//   4. No cost measurement at all — no allocation count, no frame time — so a
+	//      change could cut draw calls and raise cost unnoticed.
+	//
+	// doc_workers_quiet's last term is !search_running, and search.th is nil'd only
+	// by search_stop, which the main loop drives and render_frame never does. Inert
+	// while nothing here opens find; the moment limit 1 is closed with a --find
+	// view, the settle loop will burn all 400 iterations and blame nondeterminism
+	// for a missing reap.
 	@(private = "file")
 	draw_count_mode :: proc(path: string) {
 		h: Headless_Gpu
@@ -149,6 +179,17 @@ when NEWTPAD_TESTS {
 		app: App
 		menu_init(&app.menu)
 		app.settings = settings_load() // scratch session dir => the defaults, deterministically
+		// Without this g_theme stays at its zero value, which is transparent
+		// black -- and that makes the digest's whole colour dimension a constant.
+		// Every instance's 16 colour bytes would be {0,0,0,0}, the canvas clear
+		// would be opaque black, and the text pixel shader emits cov * color.a,
+		// so the offscreen target would be a uniform black rectangle. "The merged
+		// batch used one call's colour for all of it" is the single likeliest bug
+		// batching produces, and it is exactly what that hole hides -- as would
+		// any pixel hash later built on this target. Mirrors main.odin's own
+		// theme_resolve, which is the reason this is a real frame and not a
+		// plausible one.
+		g_theme = theme_resolve(app.settings.theme_name)
 		defer app_destroy(&app)
 		if !app_open_path(&app, path) {
 			fmt.eprintfln("drawcount: could not open %q", path)
@@ -160,6 +201,15 @@ when NEWTPAD_TESTS {
 		defer active_render_ctx = nil
 		BASE_PX = f32(clamp(app.settings.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX))
 		plat.text_set_tab_width(&h.text, app.settings.tab_width)
+		// Same two branches as main.odin's startup. Faithful without it only
+		// because a scratch session dir forces the defaults -- so it would start
+		// lying the moment anyone measured against a real settings.txt, and the
+		// glyph mix is most of what the digest hashes.
+		if app.settings.font_family != "" && app.settings.font_family != "Consolas" {
+			plat.text_load_family(&h.text, app.settings.font_family, app.settings.font_style)
+		} else if app.settings.font_style != .Regular {
+			plat.text_load_family(&h.text, "Consolas", app.settings.font_style)
+		}
 		metrics_recompute(&rc)
 		plat.draw_digest_enable(true)
 
