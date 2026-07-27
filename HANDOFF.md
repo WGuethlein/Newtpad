@@ -20,15 +20,19 @@ operational traps that have each cost a session real time. Unlike `CLAUDE.md`, i
 
 ### Where things stand — read this first (2026-07-26)
 
-**Working tree clean, `main` pushed, nothing in flight.** `v0.13.0`, `v0.14.0`, `v0.15.0` and
-`v0.15.1` are all tagged, released with the exe attached, and installed. The installed binary is
-v0.15.1 (1.4 MB).
+**Batch 6 is merged; v0.16.0 tagged, released and installed.** `v0.13.0` through `v0.16.0` are all
+tagged with the exe attached. The installed binary is v0.16.0 — **1.01 MB, down from 1.43 MB**,
+because the headless harness no longer ships inside it (§6z).
 
-**Immediate next step: batch 6 (§6u)** — session persistence for `md_mode`/`table`, `doc_reload`
-keeping the view, the `on_resize`/`on_dpi` crash-reporter fix, an "Open Logs Folder" command, and
-encoding commands in the menus. Nothing has been specced for it.
+**Immediate next step: batch 7 (§6u)** — ship-readiness: a real self-contained installer, the
+signing pipeline built signing-*ready* (a certificate is Wyatt's to buy; Claude must never handle
+one), and glyph-atlas eviction. Gating `test_modes.odin` came forward into batch 6, so it is off
+batch 7's list. Nothing has been specced for it.
 
-**Two things Wyatt owes, both ranked in their own sections and neither blocking:**
+**Three things Wyatt owes, all ranked in their own sections and none blocking:**
+
+0. **§6z's live pass** on batch 6 — the `Encoding` menu on a real window, a reopen under a forced
+   encoding, a `.md` left in Split surviving a restart, and one Ctrl+Z after a held column edit.
 
 1. **§6x's theme-tuning pass.** v0.14.0 added *View → Edit Current Theme...*, which writes the active
    theme to a file, switches to it, and opens it as a tab — edit a colour, Ctrl+S, the window updates.
@@ -137,8 +141,23 @@ were the priorities. Read P2 as the live list, with these amendments:
   per frame. Either build it or amend the locked decision — do not keep citing it as though it
   describes the code.
 - **`\?\` long paths: still zero implementation.** Not one in the tree.
-- **Test modes ship in the release binary.** `test_modes.odin` is `package main`; the harness grew
-  a lot on 2026-07-19 and release went 0.69 → 0.87 MB. Gate it behind a build flag.
+- ~~**Test modes ship in the release binary.**~~ **DONE (2026-07-26, §6z.)** `NEWTPAD_TESTS`
+  (`#config`, defaults to `ODIN_DEBUG`) gates the whole file; release went 1,494,528 → 1,055,744
+  bytes. `build.bat release tests` puts it back for `-o:speed` measurements.
+- **Carried from batch 6 (§6z), none blocking:**
+  - The reopen size cap reads `doc.disk_stamp.size`, so it **fails open** when the stamp is absent
+    (a failed stat on a dropped share reads as size 0) or stale (a restored dirty tab carries the
+    size the session recorded, so a file that grew to 500 MB while Newtpad was closed still reports
+    the old one). Best-effort by construction; a real guard would stat at the moment of the reopen.
+  - **`File ▸ Save` and `Edit ▸ Paste` are live on the Settings and Font pseudo-tabs.** Pre-existing
+    and not introduced by the `Encoding` menu (whose rows were gated); `Tab_Close` shares `has_doc`
+    and must stay live, so it is a row-by-row call rather than one predicate.
+  - No test exercises any menu `checked` predicate's semantics — the new encoding ones or the older
+    `is_wrapped`/`is_table`. `menutest` covers structure and mnemonic uniqueness only.
+  - `session_restore` still carries no comment saying why it deliberately never calls
+    `app_apply_view_defaults`; the reasoning lives only in `app.odin`.
+  - Paste now rewrites a **lone CR** as a line break, inherited from `convert_line_endings`. Real in
+    a CSV field or terminal output pasted into an LF document.
 - **The app redraws at vsync when idle** — no `WaitMessage` anywhere. A core burnt on a static
   screen, which also multiplies every other per-frame cost.
 - **The text pipeline batches nothing** — one heap allocation, two buffer maps and one draw call
@@ -2145,6 +2164,112 @@ follows are in §5.
 right, and it was written into this document as settled fact before anyone measured. The only reason
 it did not ship is that the implementer's brief carried an explicit stop condition — *if the snapshot
 is not dominant, report BLOCKED rather than build the wrong fix* — and they used it.
+
+## 6z. View persistence, encoding surface, four debts (2026-07-26, v0.16.0, branch `feat/batch-6`)
+
+Batch 6 of §6u. Ten tasks, 22 commits. §6u listed five items; three more came off the §5 debt
+register when Wyatt scoped it. Design in `docs/superpowers/specs/2026-07-26-batch-6-design.md`,
+plan beside it.
+
+**Shipped:** a tab's view (`wrap` + `md_mode` + `table`) now survives both a restart and an
+external-change reload; a mis-detected file can be reopened under a chosen encoding; the eight
+encoding commands are in a new top-level `Encoding` menu instead of palette-only; `Open Logs
+Folder` makes the log discoverable after seven months of it being written and unreachable; the
+crash reporter stays armed inside `on_resize`/`on_dpi`; a held column edit is one undo step; paste
+normalises line endings; and the headless harness no longer ships in the release exe.
+
+### One value, one validator — and the spec was wrong about why
+
+Session restore and `doc_reload` are the same problem twice: both put a view onto a `Document` they
+did not create, both carried `wrap` open-coded, both dropped `md_mode`/`table` on the floor. They
+now share `Doc_View` + `doc_view_apply` (`src/program/view.odin`) — the same move `block_row_range`
+and `doc_row_lex_extent` made, for the same reason.
+
+**The spec claimed that validator would degrade a view when a file stopped fitting it — a rotated
+log falling out of Table view. That is false**, and writing the plan is what caught it:
+`doc_can_table`/`doc_can_markdown` gate on the *extension*, and neither reload nor restore changes a
+path, so a rotated `.csv` keeps its grid. The guard's real job is a view arriving from somewhere
+else — another build's session file, a hand-edited one, an out-of-range enum. That distinction is
+not pedantic: the test the spec originally called for could never have failed. The shipped test
+hand-writes a v4 session line putting a table view on a `.txt`, which can.
+
+Session format 3 → 4 (two appended fields, tolerant ladder, v1-v3 still load). `table_delim` is
+deliberately not persisted — `doc_view_apply` re-derives it, which cannot go stale against the file.
+
+### What this batch got wrong
+
+Every task passed its own review; the failures are all in the seams between them.
+
+- **A `viewmemtest` assertion went stale the moment format 4 landed, and nothing noticed for eight
+  tasks.** "Session restore wins over the family default" asserted `md_mode == .Off` — and said so
+  in its own comment, because `session.txt` carried only `wrap` when it was written, so the value
+  was constant whether the restore path was buggy or not. Task 2 made it real and the assertion
+  started failing. **Task 2 never ran the mode, and task 2's reviewer verified the property by
+  reading the call graph instead of running it.** Task 10's implementer found the failure and
+  reported it as pre-existing and unrelated. It now asserts `.Preview` against a `.Split` family
+  default — strictly stronger — sabotage-verified by wiring `app_apply_view_defaults` into
+  `session_restore` and watching it fail. **A test whose own comment admits its value is constant
+  either way is a test to revisit the moment the thing it measures becomes variable.**
+- **Two vacuous tests, one of them written by this session's controller.** `doc_batch_end_run`'s
+  `continued` branch was dead code with a comment claiming an accumulation that never happened
+  (`push_undo` zeroes the run token before the batch guard — that position *is* the break
+  condition); a reviewer proved it by instrumenting the branch and watching it never fire once
+  across the whole of `blocktest`. And the first `.History_Jump` test asserted that a live rectangle
+  was cleared — which passed with the fix sabotaged, because `apply_snapshot` clears one itself. The
+  property that actually depends on `command_mutates_doc` is the **table** guard, and the rewritten
+  test fails correctly.
+- **A comment that explained a hazard that cannot happen.** The plan's `doc_reload` ordering comment
+  said the view must be applied after `doc.path` is restored or the gates would see an empty path.
+  `doc_open` clones the path into `fresh`, so it is never empty. The implementer noticed when the
+  sabotage failed through the wrong channel and left the comment as drafted anyway; the reviewer
+  caught it. The ordering does matter — via the `top` clamp, not the path.
+- **The `Encoding` menu made a pre-existing data-integrity hole reachable.** `.Eol_LF`/`.Eol_CRLF`
+  were missing from `command_mutates_doc`, and `doc_set_line_ending` rewrites the entire buffer
+  (`pt_delete(0, length)` + `pt_insert`). Both dispatch guards key on that predicate, so: Alt+drag a
+  rectangle on an LF file, Encoding ▸ CRLF, Ctrl+X — every row start had shifted by one byte per
+  preceding line and the cut took text never highlighted. Palette-reachable on `main` since the
+  commands existed; **putting them in a menu is what turned it into something a user would actually
+  do.** The whole-branch review found it, and its re-review then found `.History_Jump` missing for
+  the identical reason. Both are now in the predicate. *A batch that only makes an existing
+  capability easier to reach still owns the consequences of that reachability.*
+- **A sabotage step opened a real Explorer window on the desktop.** Weakening `shell_open_folder`'s
+  `is_dir` guard let a real path reach `ShellExecuteW`. The permanent tests now assert on pure
+  argument-builder procs (`explorer_folder_arg`/`explorer_select_arg`) and cannot reach the shell —
+  which also fixed the unquoted path that would have opened the wrong folder for any user whose
+  profile name contains a space.
+
+### Decisions taken with Wyatt during the batch
+
+- **Reopen refuses above 64 MB rather than confirming.** A forced non-UTF-8 encoding on a mapped
+  file transcodes synchronously on the UI thread — one menu click on a 500 MB log is a multi-second
+  freeze, on the property Newtpad advertises. The failure mode is now a refusal that changes
+  nothing, the same shape as `BLOCK_EDIT_MAX_LINES`. Scoped to `enc != .UTF8`, which exactly matches
+  `doc_open`'s own transcode branch. **The cap reads `doc.disk_stamp.size` and therefore fails open
+  when the stamp is absent or stale** — best-effort, tracked in §5.
+- **The grid and the markdown views now exclude each other live.** Both gates let an *untitled*
+  buffer into any view, so Ctrl+T then Ctrl+M produced `table && md_mode == .Split` — the state
+  `view.odin` refuses to restore. Format 4 fixed the restart case and left the live one.
+- **Line-ending conversion stayed out of the menu scope discussion** — the commands already existed;
+  only the reopen trio is new.
+
+### Release size
+
+`build.bat release` **1,494,528 → 1,055,744 bytes (-29.4%)**, both numbers remeasured independently
+by a reviewer rather than taken from the implementer. `build.bat release tests` is the way back in —
+`-o:speed` with the harness and the console subsystem, because §6y's held-key column cost is a
+release-build measurement and gating without that row would have made it impossible for good.
+
+### Owed
+
+- **Wyatt's live pass**, ranked: (1) the `Encoding` menu on a real window — four titles in the
+  caption, the check mark tracking the active document, Reopen greyed on an untitled buffer;
+  (2) Reopen as Windows-1252 on a mis-detected file, and the confirm on a dirty tab defaulting to
+  Cancel; (3) a `.md` left in Split and a `.csv` left in Table, closed and reopened — the whole point
+  of the batch; (4) a held character over a ~300-row rectangle, then **one** Ctrl+Z; (5) Ctrl+T then
+  Ctrl+M on an untitled buffer; (6) View ▸ Open Logs Folder.
+- **Nothing in this batch was verified against real GUI input.** Every claim about what happens when
+  you click something is inference from source plus a headless assertion.
+- Carried findings are in §5.
 
 ## 7. Build environment (Windows, this machine)
 
