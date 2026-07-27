@@ -146,11 +146,13 @@ when NEWTPAD_TESTS {
 	//
 	//   1. It measures ONE frame of ONE document in ONE view, reaching about six
 	//      of the ~60 text_draw_spans call sites in program/ (they do carry all
-	//      the instances, but still). Nothing here exercises the menus, palette,
-	//      history panel, Settings/Font tabs, find/replace bar, filter banner,
-	//      markdown preview or split, or the grid. A batching change can break any
-	//      of those and this reports green. The fix is a view argument
-	//      (`drawcount <file> [--menu|--palette|--find|--md-split|--grid]`), not a
+	//      the instances, but still). `--find <query>` is the first view argument
+	//      and covers the find/replace bar and the scrollbar's match marks;
+	//      nothing here yet exercises the menus, palette, history panel,
+	//      Settings/Font tabs, filter banner, markdown preview or split, or the
+	//      grid. A batching change can break any of those and this reports green.
+	//      The rest of the fix is the rest of that argument
+	//      (`drawcount <file> [--menu|--palette|--md-split|--grid]`), not a
 	//      better digest — do not confuse the two.
 	//   2. The digest hashes UVs, and UVs encode glyph FIRST-USE order in the
 	//      atlas. A batching pass that regroups draws reorders glyph_get, which
@@ -167,11 +169,13 @@ when NEWTPAD_TESTS {
 	//
 	// doc_workers_quiet's last term is !search_running, and search.th is nil'd only
 	// by search_stop, which the main loop drives and render_frame never does. Inert
-	// while nothing here opens find; the moment limit 1 is closed with a --find
-	// view, the settle loop will burn all 400 iterations and blame nondeterminism
-	// for a missing reap.
+	// while nothing here opens find, and it stayed inert when --find arrived only
+	// because --find runs find_wait (which joins the worker) BEFORE the settle
+	// loop starts. Any future view argument that leaves a worker running has to do
+	// the same, or the loop burns all 400 iterations and blames nondeterminism for
+	// a reap that nothing in this mode performs.
 	@(private = "file")
-	draw_count_mode :: proc(path: string) {
+	draw_count_mode :: proc(path: string, query := "") {
 		h: Headless_Gpu
 		if !headless_gpu_init(&h, 1280, 720, "drawcount") {return}
 		defer headless_gpu_destroy(&h)
@@ -211,6 +215,23 @@ when NEWTPAD_TESTS {
 			plat.text_load_family(&h.text, "Consolas", app.settings.font_style)
 		}
 		metrics_recompute(&rc)
+
+		// With --find, run the query to completion BEFORE the settle loop. The
+		// note above about doc_workers_quiet's !search_running term is the reason:
+		// find_merge is driven by the main loop, never by render_frame, so a
+		// worker left running here would keep search_running true for all 400
+		// iterations and the mode would report "never settled" rather than a
+		// frame. find_wait is exactly the headless join this needs, and it also
+		// makes the measured frame the steady-state one -- a partially published
+		// match list would put a different number of scrollbar marks in every run.
+		if query != "" {
+			if d := app_active(&app); d != nil {
+				find_open(d, false)
+				for r in query {find_input_rune(d, r)}
+				find_wait(d)
+			}
+		}
+
 		plat.draw_digest_enable(true)
 
 		// Render whole frames until the frame stops changing, then report it. A
@@ -278,6 +299,9 @@ when NEWTPAD_TESTS {
 
 		fmt.println("--- drawcount: headless offscreen frame, 1280x720 @96dpi, no menu open ---")
 		fmt.printfln("  file                   : %s", path)
+		if query != "" {
+			fmt.printfln("  find bar               : open, query %q, %d matches%s", query, len(doc.find.matches), "+" if doc.find.truncated else "")
+		}
 		fmt.printfln("  font / size / tab      : %s %v / %.0f px / %d", app.settings.font_family, app.settings.font_style, rc.px, app.settings.tab_width)
 		fmt.printfln(
 			"  frame settled after    : %d frames %s",
@@ -420,7 +444,10 @@ when NEWTPAD_TESTS {
 				settled_ms := time.duration_milliseconds(time.tick_since(t1))
 				fmt.printfln("  %-15q key %6.2f ms  settled %7.1f ms  %6d matches%s", string(doc.find.query[:]), key_ms, settled_ms, len(doc.find.matches), " (truncated)" if doc.find.truncated else "")
 			}
-			fmt.printfln("worst keystroke: %.2f ms (frame budget 16.7)", worst)
+			// A number nobody checks is a number that drifts. The keystroke now
+			// carries the bounded first-paint scan (SEARCH_FIRST_PAINT) as well
+			// as the restart, so this line is the end-to-end bound on it.
+			fmt.printfln("worst keystroke: %.2f ms (frame budget 16.7)  %s", worst, "OK" if worst < 16.7 else "FAIL")
 			if len(doc.find.matches) > 0 {
 				m := doc.find.matches[0]
 				fmt.printfln("planted needle found at %d (%.1f MB in), len=%d", m, f64(m) / (1024 * 1024), doc.find.match_len[0])
@@ -452,6 +479,556 @@ when NEWTPAD_TESTS {
 			}
 			find_close(&doc)
 			return true
+		}
+
+		// Clicking a row in the filter view jumps to that line in the unfiltered
+		// document (HANDOFF §6h item 2). Its own proc, with its own Document and
+		// its own plat.Text: test_mode_dispatch is one enormous procedure and
+		// another few hundred bytes of frame inside findtest's case is how it
+		// blows the stack.
+		//
+		// The seam under test is drawn-row vs clicked-row. find_filter_click is
+		// the whole action -- hit-test, caret, leave filter mode -- so this is
+		// what main.odin calls, not a re-implementation of it beside the real one.
+		findtest_filter_click :: proc() -> (bad: int) {
+			fmt.println("--- filter click-to-jump ---")
+			fc_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			// Line starts come from the fixture's own lengths, never from
+			// doc.filter_lines -- comparing filter_lines against itself is the
+			// vacuous shape this whole section exists to avoid.
+			src := []string{"aaa", "bbb NEEDLE", "ccc", "ddd NEEDLE", "eee"}
+			total := 0
+			for line in src {total += len(line) + 1}
+			content := make([]u8, total) // heap: doc_from_content takes ownership
+			starts := make([]int, len(src), context.temp_allocator)
+			at := 0
+			for line, i in src {
+				starts[i] = at
+				copy(content[at:], transmute([]u8)line)
+				at += len(line)
+				content[at] = '\n'
+				at += 1
+			}
+
+			doc := doc_from_content(content, "", .UTF8)
+			defer doc_close(&doc)
+			t: plat.Text
+			plat.text_load_faces(&t)
+			cw := plat.text_char_width(&t, 16)
+
+			find_open(&doc, false)
+			for r in "NEEDLE" {find_input_rune(&doc, r)}
+			find_wait(&doc)
+			find_set_filter(&doc, true)
+			doc_update_gutter(&doc, cw)
+			defer {
+				// GUTTER_W is a global read by col_x/col_at_x: leaving it set
+				// would follow every later mode in this process.
+				find_set_filter(&doc, false)
+				doc_update_gutter(&doc, cw)
+			}
+
+			px := f32(16)
+			ROWS :: 10 // deliberately more rows than matches
+			row_y :: proc(px: f32, r: int) -> f32 {return row_rect_y(px, r) + line_height(px) * 0.5}
+			text_x := col_x(cw, 3) // well inside the text column
+			gutter_x := TEXT_MARGIN_X + GUTTER_W * 0.5 // inside the line-number gutter
+
+			fc_chk(
+				&bad,
+				len(doc.filter_lines) == 2 && doc.filter_lines[0] == starts[1] && doc.filter_lines[1] == starts[3],
+				fmt.tprintf("the fixture filters to lines 2 and 4: %v (want [%d %d])", doc.filter_lines, starts[1], starts[3]),
+			)
+			fc_chk(&bad, GUTTER_W > 0, fmt.tprintf("the filter view really has a gutter to click in: %.0f px", GUTTER_W))
+			fc_chk(&bad, gutter_x < col_x(cw, 0), fmt.tprintf("...and the gutter x is left of column 0: %.0f < %.0f", gutter_x, col_x(cw, 0)))
+
+			// Each drawn row maps to its own line, and the whole action lands the
+			// caret on that line's START. Row 1 is the one an off-by-one gets
+			// wrong in a direction row 0 cannot show.
+			//
+			// Both x positions on every row: the gutter and the text column must
+			// give the same line, which is what fails if the x ever re-enters
+			// this path as a column.
+			for want, r in ([]int{starts[1], starts[3]}) {
+				for x, xi in ([]f32{text_x, gutter_x}) {
+					place := "text" if xi == 0 else "gutter" // `where` is a keyword
+					find_set_filter(&doc, true)
+					doc.cursor, doc.anchor = 0, 0
+					j := find_filter_click(&doc, &t, x, row_y(px, r), px, ROWS)
+					find_merge(&doc) // main.odin runs one later in the SAME frame
+					fc_chk(
+						&bad,
+						j && doc.cursor == want && doc.anchor == want && !doc.filter,
+						fmt.tprintf("press in the %-6s of row %d -> cursor %d (want %d), anchor==cursor=%v, filter off=%v, jumped=%v", place, r, doc.cursor, want, doc.anchor == doc.cursor, !doc.filter, j),
+					)
+				}
+			}
+
+			// A press past the last matching row is a no-op: no jump, still
+			// filtered, caret untouched.
+			find_set_filter(&doc, true)
+			doc.cursor, doc.anchor = 0, 0
+			jumped := find_filter_click(&doc, &t, text_x, row_y(px, 3), px, ROWS)
+			fc_chk(&bad, !jumped && doc.filter && doc.cursor == 0, fmt.tprintf("a press past the last row does nothing: jumped=%v filter=%v cursor=%d", jumped, doc.filter, doc.cursor))
+
+			// Scrolled: the hit-test must read filter_top, not assume 0.
+			find_set_filter(&doc, true)
+			doc.filter_top = 1
+			doc.cursor, doc.anchor = 0, 0
+			jumped = find_filter_click(&doc, &t, text_x, row_y(px, 0), px, ROWS)
+			fc_chk(
+				&bad,
+				jumped && doc.cursor == starts[3],
+				fmt.tprintf("scrolled by one, row 0 jumps to %d (want %d)", doc.cursor, starts[3]),
+			)
+
+			// A press on the banner strip above the first row is not a press on
+			// row 0.
+			find_set_filter(&doc, true)
+			_, hit := doc_filter_line_at(&doc, &t, row_rect_y(px, 0) - 1, px, ROWS)
+			fc_chk(&bad, !hit, "a press above the first row is refused, not clamped to it")
+
+			fmt.printfln("filter click-to-jump: %d failures", bad)
+			return
+		}
+
+		// The same click, one level up: its post-condition has to survive the REST
+		// OF THE FRAME, not just the return from find_filter_click.
+		//
+		// main.odin runs the click at the top of the frame and find_merge near the
+		// bottom of it. With the filter armed BEFORE the query was typed (Ctrl+L,
+		// then type), the once-per-query auto-select has never fired -- it is gated
+		// off while filtering -- so the first merge after the click fires it, and
+		// the caret the click just placed becomes a SELECTION of some match
+		// elsewhere. Type one character and it overwrites the matched word.
+		//
+		// So this asserts the same three things findtest_filter_click does, but
+		// after the merges that follow in the frame, which is the state the user's
+		// next keystroke actually meets. A large fixture, so the search really is
+		// still publishing when the click lands -- the live shape of the bug.
+		findtest_filter_click_frame :: proc() -> (bad: int) {
+			fmt.println("--- the click's post-condition survives the frame ---")
+			cf_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			FILL :: "the quick brown fox jumps over the lazy dog................\n" // 60 B
+			NEEDLE :: "NEEDLE-ZZZ"
+			SIZE :: 8 << 20
+			LINES :: SIZE / len(FILL)
+			content := make([]u8, LINES * len(FILL)) // heap: the doc takes it
+			for i in 0 ..< LINES {copy(content[i * len(FILL):], transmute([]u8)string(FILL))}
+			// Two matching lines inside the first-paint budget, so the filter view
+			// has rows to click in the very frame the query was typed, and one far
+			// past it, so the worker is still publishing afterwards.
+			rows_at := [2]int{10 * len(FILL), 40 * len(FILL)}
+			for at in rows_at {copy(content[at:], transmute([]u8)string(NEEDLE))}
+			copy(content[(LINES - 1) * len(FILL):], transmute([]u8)string(NEEDLE))
+
+			doc := doc_from_content(content, "", .UTF8)
+			defer doc_close(&doc)
+			t: plat.Text
+			plat.text_load_faces(&t)
+			cw := plat.text_char_width(&t, 16)
+			px := f32(16)
+			ROWS :: 10
+
+			find_open(&doc, false)
+			find_set_filter(&doc, true) // Ctrl+L first, THEN the query: the trigger
+			for r in NEEDLE {find_input_rune(&doc, r)}
+			doc_update_gutter(&doc, cw)
+			defer {
+				find_set_filter(&doc, false) // GUTTER_W is a global; leave it clear
+				doc_update_gutter(&doc, cw)
+			}
+			cf_chk(&bad, len(doc.filter_lines) >= 2 && doc.filter_lines[0] == rows_at[0], fmt.tprintf("the first frame has rows to click: %d, first at %d (want %d)", len(doc.filter_lines), doc.filter_lines[0] if len(doc.filter_lines) > 0 else -1, rows_at[0]))
+			cf_chk(&bad, filter_searching(&doc), "...and the search is still running, as it is in life")
+
+			want := rows_at[1]
+			jumped := find_filter_click(&doc, &t, col_x(cw, 3), row_rect_y(px, 1) + line_height(px) * 0.5, px, ROWS)
+			cf_chk(&bad, jumped && doc.cursor == want && doc.anchor == want, fmt.tprintf("the click itself lands the caret on the row's line start: cursor %d anchor %d (want %d)", doc.cursor, doc.anchor, want))
+
+			// Everything the rest of the frame does, and every frame after it.
+			find_wait(&doc)
+			cf_chk(
+				&bad,
+				doc.cursor == want && doc.anchor == want,
+				fmt.tprintf("...and the merges that follow leave it there: cursor %d anchor %d (want %d, collapsed)", doc.cursor, doc.anchor, want),
+			)
+			cf_chk(&bad, !doc_has_sel(&doc), "...as a caret, not as a selection the next keystroke would overwrite")
+			find_close(&doc)
+			fmt.printfln("click post-condition: %d failures", bad)
+			return
+		}
+
+		// The bounded synchronous first-paint pass (SEARCH_FIRST_PAINT) and the three
+		// things it has to get right: rows in the filter view on the FIRST frame
+		// when the head of the file has matches, an honest banner when it does
+		// not, and a cost that stays inside a frame.
+		//
+		// The last of those is a falsifier, not an assertion about behaviour: a
+		// bound nobody measured is the bug, so the timings are printed and the
+		// suite fails if any of them exceeds a frame.
+		findtest_first_paint :: proc() -> (bad: int) {
+			fmt.println("--- the synchronous first-paint pass ---")
+			fp_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			// A filler line with no digits and no '@', so the planted needle and
+			// the scanning regex below are the only things that can match.
+			FILL :: "the quick brown fox jumps over the lazy dog................\n" // 60 B
+			NEEDLE :: "NEEDLE-ZZZ"
+			// 8 MB: far enough past SEARCH_SYNC_MAX that the worker cannot have
+			// published anything in the microseconds between a keystroke
+			// returning and the assertion after it — its first block alone is
+			// ~1 ms of work and it has a thread spawn to pay for first. Nothing
+			// moves under the checks either way: doc.filter_lines is written only
+			// by find_merge, on this thread.
+			SIZE :: 8 << 20
+			LINES :: SIZE / len(FILL)
+
+			build :: proc(plant_lines: []int, plant_bytes: []int = nil) -> []u8 {
+				content := make([]u8, LINES * len(FILL)) // heap: the doc takes it
+				for i in 0 ..< LINES {copy(content[i * len(FILL):], transmute([]u8)string(FILL))}
+				for ln in plant_lines {copy(content[ln * len(FILL):], transmute([]u8)string(NEEDLE))}
+				for at in plant_bytes {copy(content[at:], transmute([]u8)string(NEEDLE))}
+				return content
+			}
+			// The banner text, without the fixed tail, so a message reads.
+			state :: proc(doc: ^Document) -> string {return filter_banner_text(doc)}
+
+			// --- a first match PAST the budget --------------------------------
+			//
+			// The needle is in the last line of 8 MB, so the bounded pass spends
+			// its whole budget and finds nothing. The frame it produces must say
+			// so rather than look like a query with no matches at all.
+			{
+				doc := doc_from_content(build([]int{LINES - 1}), "", .UTF8)
+				defer doc_close(&doc)
+				fp_chk(&bad, doc.pt.length > SEARCH_SYNC_MAX, fmt.tprintf("the fixture is past the budget, so a worker is really involved: %d bytes vs %d", doc.pt.length, SEARCH_SYNC_MAX))
+
+				find_open(&doc, false)
+				find_set_filter(&doc, true)
+				for r in NEEDLE {find_input_rune(&doc, r)}
+				// No find_wait: this is the first frame after the keystroke.
+				fp_chk(&bad, len(doc.filter_lines) == 0, fmt.tprintf("the budget really was exhausted with nothing found: %d rows", len(doc.filter_lines)))
+				fp_chk(&bad, filter_searching(&doc), "...and the view knows the search is still going")
+				fp_chk(&bad, strings.contains(state(&doc), "searching"), fmt.tprintf("the first frame says it is SEARCHING: %q", state(&doc)))
+				fp_chk(&bad, !strings.contains(state(&doc), "no matching"), "...and does not claim there are no matches")
+
+				find_wait(&doc)
+				fp_chk(&bad, len(doc.filter_lines) == 1, fmt.tprintf("the worker then finds the line the budget could not reach: %d rows", len(doc.filter_lines)))
+				fp_chk(&bad, !filter_searching(&doc) && strings.contains(state(&doc), "1 matching lines"), fmt.tprintf("...and the banner switches to the count: %q", state(&doc)))
+				// A line START and a line NUMBER produced by the WORKER, 8 MB
+				// past the handoff: both are carried across it in Scan_State, and
+				// the number is the one the filter gutter draws.
+				fp_chk(&bad, len(doc.filter_lines) == 1 && doc.filter_lines[0] == (LINES - 1) * len(FILL), fmt.tprintf("...at the right line start: %d (want %d)", doc.filter_lines[0] if len(doc.filter_lines) == 1 else -1, (LINES - 1) * len(FILL)))
+				fp_chk(&bad, len(doc.filter_line_nos) == 1 && doc.filter_line_nos[0] == LINES, fmt.tprintf("...and the right line number, counted across the handoff: %d (want %d)", doc.filter_line_nos[0] if len(doc.filter_line_nos) == 1 else -1, LINES))
+
+				// The third state, which used to be indistinguishable from the
+				// first: a finished search that genuinely found nothing.
+				clear(&doc.find.query)
+				for r in "QQZZ-NOT-HERE" {find_input_rune(&doc, r)}
+				find_wait(&doc)
+				fp_chk(&bad, !filter_searching(&doc) && strings.contains(state(&doc), "no matching lines"), fmt.tprintf("a finished search with no matches says exactly that: %q", state(&doc)))
+				find_close(&doc)
+			}
+
+			// --- a first match EARLY ------------------------------------------
+			//
+			// The whole feature. These rows exist in the very frame the keystroke
+			// produced, which is only possible if the scan ran before
+			// find_recompute returned — the worker has not been given a chance to
+			// publish anything.
+			{
+				planted := make([]int, 64, context.temp_allocator)
+				for i in 0 ..< len(planted) {planted[i] = i * 4} // first ~15 KB
+				// One more needle STRADDLING the handoff, four bytes before the
+				// budget runs out. The bounded pass reads its block plus the
+				// len(query)-1 overlap, so this one belongs to the bounded pass;
+				// the worker resumes past it and must not count it again. Without
+				// a planted straddle the handoff is the one block boundary in the
+				// scan that nothing crosses.
+				straddle := SEARCH_FIRST_PAINT - 4
+				WANT :: 65 // 64 early + the straddler, each on its own line
+				doc := doc_from_content(build(planted, []int{straddle}), "", .UTF8)
+				defer doc_close(&doc)
+
+				find_open(&doc, false)
+				find_set_filter(&doc, true)
+				for r in NEEDLE {find_input_rune(&doc, r)}
+				first := len(doc.filter_lines)
+				fp_chk(&bad, first == WANT, fmt.tprintf("the FIRST frame already has every row up to the budget: %d (want %d)", first, WANT))
+				fp_chk(&bad, doc_filtering(&doc), "...so the view is actually filtering, not falling back to the whole file")
+				fp_chk(&bad, first > 0 && doc.filter_lines[0] == planted[0] * len(FILL), fmt.tprintf("...starting at the first planted line: %d", doc.filter_lines[0] if first > 0 else -1))
+				fp_chk(&bad, first > 0 && doc.filter_lines[first - 1] == (straddle / len(FILL)) * len(FILL), fmt.tprintf("...and the match straddling the handoff is in it: %d (want %d)", doc.filter_lines[first - 1] if first > 0 else -1, (straddle / len(FILL)) * len(FILL)))
+
+				// The handoff is a seam: the worker resumes at the byte the
+				// bounded pass stopped on, so the finished set must be exactly
+				// what was planted — a resume from 0 would double them all, and a
+				// resume that skipped the overlap would lose the straddler.
+				find_wait(&doc)
+				fp_chk(&bad, len(doc.find.matches) == WANT, fmt.tprintf("the completed scan counts each planted match once: %d (want %d)", len(doc.find.matches), WANT))
+				fp_chk(&bad, len(doc.filter_lines) == WANT, fmt.tprintf("...and one filter row each: %d (want %d)", len(doc.filter_lines), WANT))
+				// Line numbers are counted during the scan, so they only survive
+				// the handoff if last_nl/nlines do. The straddler is the one
+				// entry the bounded pass produced near its own far edge.
+				want_no := straddle / len(FILL) + 1
+				got_no := doc.filter_line_nos[WANT - 1] if len(doc.filter_line_nos) == WANT else -1
+				fp_chk(&bad, got_no == want_no, fmt.tprintf("the gutter line number across the handoff is right: %d (want %d)", got_no, want_no))
+				// The other half of "nothing is scanned twice", which the results
+				// cannot show: a worker that starts over from 0 rewrites the same
+				// values into the same indices and every assertion above still
+				// passes. Bytes swept is the only thing that sees it.
+				fp_chk(&bad, find_swept(&doc) == doc.pt.length, fmt.tprintf("the two passes swept the buffer exactly once: %d bytes of %d", find_swept(&doc), doc.pt.length))
+				find_close(&doc)
+			}
+
+			// --- the budget is in BYTES SCANNED, even with no newline in reach --
+			//
+			// A regex block runs on to the next newline, and pt_line_end_cap
+			// returns pos+cap when it finds none — so on a file with no newline
+			// in its first 128 KB (minified JSON, a single-line dump) the pass
+			// used to read 131073 bytes for a 65536-byte budget. The timing table
+			// below is the reason that matters; this is the part of it a stopwatch
+			// cannot state. A needle planted between the two numbers is in the
+			// first frame if and only if the pass overran, which is a fact about
+			// bytes and does not move with the build or the machine.
+			{
+				FLAT :: "the quick brown fox jumps over the lazy dog................." // 60 B, no '\n'
+				INSIDE :: 30 << 10 // inside the budget
+				OVER :: 70 << 10 // past it, inside the old overrun window
+				#assert(INSIDE < SEARCH_FIRST_PAINT)
+				#assert(OVER > SEARCH_FIRST_PAINT && OVER < SEARCH_FIRST_PAINT + REGEX_LINE_SLACK)
+				content := make([]u8, (SIZE / len(FLAT)) * len(FLAT)) // heap: the doc takes it
+				for i in 0 ..< SIZE / len(FLAT) {copy(content[i * len(FLAT):], transmute([]u8)string(FLAT))}
+				copy(content[INSIDE:], transmute([]u8)string(NEEDLE))
+				copy(content[OVER:], transmute([]u8)string(NEEDLE))
+
+				doc := doc_from_content(content, "", .UTF8)
+				defer doc_close(&doc)
+				find_open(&doc, false)
+				doc.find.regex = true // the overrun is the regex path's alone
+				for r in "NEEDLE-[A-Z]+" {find_input_rune(&doc, r)}
+				// No find_wait: this is the frame the keystroke produced. Every
+				// match on this file shares one line, so filter_lines dedupes to a
+				// single row — the matches themselves are what carries the fact.
+				got := len(doc.find.matches)
+				fp_chk(&bad, got >= 1 && doc.find.matches[0] == INSIDE, fmt.tprintf("the bounded pass ran on a file with no newlines: %d matches, first at %d (want %d)", got, doc.find.matches[0] if got > 0 else -1, INSIDE))
+				fp_chk(&bad, got == 1, fmt.tprintf("...and stopped AT the budget: the needle at %d (past the %d B budget) is not in this frame — %d matches, want 1", OVER, SEARCH_FIRST_PAINT, got))
+				find_wait(&doc)
+				fp_chk(&bad, len(doc.find.matches) == 2 && doc.find.matches[1] == OVER, fmt.tprintf("the worker then picks up the one past the budget: %d matches (want 2)", len(doc.find.matches)))
+				doc.find.regex = false
+				find_close(&doc)
+			}
+
+			// --- what the pass costs -------------------------------------------
+			//
+			// The number the budget was chosen from. Timed around find_recompute,
+			// which is the whole keystroke: reset, the bounded scan, the pt_view
+			// clone and the thread spawn. Each case joins its worker afterwards
+			// so the next reading is not taken against a busy core.
+			//
+			// Two fixtures and two adversarial patterns, because a falsifier that
+			// only samples inputs its author picked is the "test that has never
+			// failed" one level up. The patterns the budget was originally chosen
+			// against were the author's own; a 30-second search beat the worst of
+			// them by 3.3x. And the SHAPE matters as much as the pattern: a buffer
+			// with no newline in it is the one where the block's run-on to a line
+			// end (pt_line_end_cap returns pos+cap when there is no '\n') decides
+			// how many bytes the "byte budget" actually spends.
+			{
+				// The LOWEST of three readings. Noise only ever adds — a stolen
+				// timeslice, a worker still winding down — so the minimum is the
+				// closest estimate of what the pass itself costs, and the number
+				// this gates on sits close enough to the frame budget on a
+				// backtracking pattern that a single noisy reading would other-
+				// wise fail the suite at random.
+				cost :: proc(doc: ^Document, q: string, rx: bool) -> f64 {
+					doc.find.regex = rx
+					clear(&doc.find.query)
+					append(&doc.find.query, ..transmute([]u8)q)
+					best := max(f64)
+					for _ in 0 ..< 3 {
+						t0 := time.tick_now()
+						find_recompute(doc)
+						best = min(best, time.duration_milliseconds(time.tick_since(t0)))
+						find_invalidate(doc) // cancel + join before the next reading
+					}
+					return best
+				}
+				FRAME :: 16.7
+				// One frame is a claim about the SHIPPED build. The same table is
+				// ~1.4x slower under -debug (the worst case is 11.2 ms at -o:speed
+				// and 15.5-16.4 ms here), and -debug is what the suite runs by
+				// default -- so gating it at one literal frame means a red at
+				// random on a busy machine, asserting a property the product does
+				// not have to hold. The allowance is that measured ratio and
+				// nothing else, and it still fails everything this exists to
+				// catch: a 256 KB budget prints 63.47 ms in this build, the
+				// block's run-on escaping the budget 30.96 ms, and the bound
+				// removed altogether 639 ms.
+				gate := f64(FRAME)
+				when ODIN_DEBUG {gate = FRAME * 1.4}
+				cases := []struct {
+					label: string,
+					q:     string,
+					rx:    bool,
+				} {
+					{"literal, ordinary", NEEDLE, false},
+					{"literal, matches constantly", "e", false},
+					{"regex, ordinary", "NEEDLE-[A-Z]+", true},
+					{"regex, scans every byte", "[A-Za-z]+@[a-z]+", true},
+					// Backtracks over the filler's own words. 3.3x the one above
+					// at the same budget, and the reason "the worst case is
+					// ~3.5 ms" was a claim about a pattern, not about the bound.
+					{"regex, backtracks hard", "(the|fox|dog)+x", true},
+				}
+				worst := 0.0
+				// The same filler with '.' where the '\n' is: 8 MB, not one
+				// newline in it. Minified JSON and single-line log dumps are this
+				// shape, and it is the shape that makes the budget lie.
+				FLAT :: "the quick brown fox jumps over the lazy dog................." // 60 B, no '\n'
+				flat :: proc() -> []u8 {
+					content := make([]u8, LINES * len(FLAT)) // heap: the doc takes it
+					for i in 0 ..< LINES {copy(content[i * len(FLAT):], transmute([]u8)string(FLAT))}
+					return content
+				}
+				for shape in 0 ..< 2 {
+					doc := doc_from_content(build([]int{LINES - 1}) if shape == 0 else flat(), "", .UTF8)
+					defer doc_close(&doc)
+					find_open(&doc, false)
+					for c in cases {
+						ms := cost(&doc, c.q, c.rx)
+						worst = max(worst, ms)
+						fmt.printfln("  %-28s %6.2f ms   (%d KB budget, %s)", c.label, ms, SEARCH_FIRST_PAINT / 1024, "60 B lines" if shape == 0 else "no newlines")
+					}
+					doc.find.regex = false
+					find_close(&doc)
+				}
+				// It passes, but the margin is the finding: the backtracking
+				// pattern on the no-newline fixture is ~11 ms of a 16.7 ms frame
+				// at -o:speed. 64 KB is 1% of a frame for the literal path and
+				// two thirds of one for the regex path -- so the single number is
+				// sized by regex, and cutting it for regex alone is the move if a
+				// keystroke ever feels heavy in live use.
+				fp_chk(&bad, worst < gate, fmt.tprintf("worst synchronous keystroke %.2f ms, budget %.1f ms (%s build, one frame is %.1f)", worst, gate, "debug" if ODIN_DEBUG else "release", f64(FRAME)))
+			}
+
+			fmt.printfln("first-paint pass: %d failures", bad)
+			return
+		}
+
+		// Which match the once-per-query auto-select lands on. The property is
+		// "the one nearest the caret", and it is a property of the SETTLED result,
+		// not of whatever prefix happened to be published when the first match
+		// showed up -- so a bounded first pass that publishes a shorter prefix must
+		// not change the answer. It did: with the caret at 100 KB and matches at
+		// 20 KB and 150 KB, the 64 KB pass made the 20 KB one the first thing
+		// merged, and the viewport was yanked to the top of the file and locked
+		// there (review of tasks 4/5, finding 1).
+		//
+		// The query is set in one go rather than typed: every keystroke restarts
+		// the search AND fires its own auto-select, so a typed query moves the very
+		// caret this is about. find_recompute is the whole keystroke either way.
+		findtest_autoselect :: proc() -> (bad: int) {
+			fmt.println("--- auto-select picks the caret-nearest match ---")
+			as_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			FILL :: "the quick brown fox jumps over the lazy dog................\n" // 60 B
+			NEEDLE :: "NEEDLE-ZZZ"
+			SIZE :: 8 << 20
+			LINES :: SIZE / len(FILL)
+			CARET :: 100 << 10 // between the two planted matches
+			// Planted on line starts so the wanted offsets are exact.
+			EARLY :: ((20 << 10) / len(FILL)) * len(FILL) // inside the first-paint budget
+			LATE :: ((150 << 10) / len(FILL)) * len(FILL) // past it, inside the worker's first block
+			#assert(EARLY < SEARCH_FIRST_PAINT)
+			#assert(LATE > SEARCH_FIRST_PAINT && LATE < SEARCH_BLOCK)
+			#assert(EARLY < CARET && CARET < LATE)
+
+			build :: proc(plant: []int) -> []u8 {
+				content := make([]u8, LINES * len(FILL)) // heap: the doc takes it
+				for i in 0 ..< LINES {copy(content[i * len(FILL):], transmute([]u8)string(FILL))}
+				for at in plant {copy(content[at:], transmute([]u8)string(NEEDLE))}
+				return content
+			}
+			// One keystroke's worth of work with the caret parked at `caret`.
+			run :: proc(doc: ^Document, caret: int) {
+				doc.cursor, doc.anchor = caret, caret
+				clear(&doc.find.query)
+				append(&doc.find.query, ..transmute([]u8)string(NEEDLE))
+				find_recompute(doc)
+			}
+
+			{
+				doc := doc_from_content(build([]int{EARLY, LATE}), "", .UTF8)
+				defer doc_close(&doc)
+				as_chk(&bad, doc.pt.length > SEARCH_SYNC_MAX, fmt.tprintf("the fixture needs a worker: %d bytes vs %d", doc.pt.length, SEARCH_SYNC_MAX))
+				find_open(&doc, false)
+
+				// The caret sits past the first match and before the second, in the
+				// window the bounded pass opened: (SEARCH_FIRST_PAINT, SEARCH_BLOCK].
+				run(&doc, CARET)
+				as_chk(
+					&bad,
+					doc.cursor == CARET && doc.anchor == CARET,
+					fmt.tprintf("the frame the keystroke produced has not moved the caret: cursor %d anchor %d (want %d)", doc.cursor, doc.anchor, CARET),
+				)
+				find_wait(&doc)
+				as_chk(
+					&bad,
+					doc.find.current == 1 && doc.anchor == LATE && doc.cursor == LATE + len(NEEDLE),
+					fmt.tprintf("...and it settles on the match BELOW the caret: current %d, selection [%d,%d) (want 1, [%d,%d)) over %d matches", doc.find.current, doc.anchor, doc.cursor, LATE, LATE + len(NEEDLE), len(doc.find.matches)),
+				)
+
+				// The caret above both matches: the nearest is the first one, and
+				// there is nothing to wait for -- it must land in the same frame.
+				run(&doc, 0)
+				as_chk(
+					&bad,
+					doc.find.current == 0 && doc.anchor == EARLY,
+					fmt.tprintf("a caret above every match selects the first one, in the first frame: current %d anchor %d (want 0, %d)", doc.find.current, doc.anchor, EARLY),
+				)
+
+				// The caret past every match: nothing is below it, so it wraps to
+				// the first -- and must not stall waiting for a match that is never
+				// coming.
+				run(&doc, 5 << 20)
+				find_wait(&doc)
+				as_chk(
+					&bad,
+					doc.find.current == 0 && doc.anchor == EARLY,
+					fmt.tprintf("a caret past every match wraps to the first: current %d anchor %d (want 0, %d)", doc.find.current, doc.anchor, EARLY),
+				)
+				find_close(&doc)
+			}
+
+			// The other half of deferring the jump: when the only match is behind
+			// the caret, no LATER merge carries new results, so a jump that waits
+			// for progress would never fire at all.
+			{
+				doc := doc_from_content(build([]int{EARLY}), "", .UTF8)
+				defer doc_close(&doc)
+				find_open(&doc, false)
+				run(&doc, CARET)
+				find_wait(&doc)
+				as_chk(
+					&bad,
+					doc.find.current == 0 && doc.anchor == EARLY && doc.cursor == EARLY + len(NEEDLE),
+					fmt.tprintf("a single match, published before the caret was passed, is still selected: current %d, selection [%d,%d) (want 0, [%d,%d))", doc.find.current, doc.anchor, doc.cursor, EARLY, EARLY + len(NEEDLE)),
+				)
+				find_close(&doc)
+			}
+
+			fmt.printfln("auto-select: %d failures", bad)
+			return
 		}
 
 		// `newtpad findtest` covers the literal scan's block-boundary handling and
@@ -531,6 +1108,12 @@ when NEWTPAD_TESTS {
 			for r in "straddle" {find_input_rune(&doc, r)}
 			find_wait(&doc)
 			fmt.printfln("case-insensitive: %d found, want 2", len(doc.find.matches))
+
+			bad := findtest_filter_click()
+			bad += findtest_filter_click_frame()
+			bad += findtest_first_paint()
+			bad += findtest_autoselect()
+			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")
 			return true
 		}
 
@@ -2445,11 +3028,17 @@ when NEWTPAD_TESTS {
 		// this one now refuses instead.
 		if os.args[1] == "drawcount" {
 			if len(os.args) < 3 {
-				fmt.eprintln("usage: newtpad drawcount <file>")
+				fmt.eprintln("usage: newtpad drawcount <file> [--find <query>]")
 				return true
 			}
 			if !require_scratch_session("drawcount") {return true}
-			draw_count_mode(os.args[2])
+			// `--find <query>` opens the find bar and runs the query before the
+			// frame is measured -- the first step against KNOWN LIMIT 1 below, and
+			// the only way to measure the scrollbar's match marks, which exist
+			// only while the bar is open.
+			query := ""
+			if len(os.args) > 4 && os.args[3] == "--find" {query = os.args[4]}
+			draw_count_mode(os.args[2], query)
 			return true
 		}
 
@@ -7231,9 +7820,17 @@ when NEWTPAD_TESTS {
 			// A stored table view against a .txt must not come back on. Written by
 			// hand because save() can only produce views that were legal when they
 			// were saved; a session from another build, or an edited one, cannot.
+			//
+			// The fixture path CONTAINS A SPACE, and that is what makes this case
+			// able to fail as a format-ladder test at all. The field count is the
+			// argument to split_n, which CAPS the split rather than requiring it,
+			// so reading a v4 line with the current format's larger count still
+			// works perfectly for a space-free path -- collapsing the whole ladder
+			// to `case ver >= 4: nf = 14` left this suite green. With a space the
+			// collapse splits the path in two and the tab is dropped.
 			{
 				dir, _ := session_dir()
-				txtf := fmt.tprintf("%s%cnewtpad_sess_v4.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+				txtf := fmt.tprintf("%s%cnewtpad sess v4.txt", os.get_env("TEMP", context.temp_allocator), '\\')
 				plat.file_write_atomic(txtf, transmute([]u8)string("plain,text,file\n"))
 				line := fmt.tprintf("0 0 0 0 0 -1 0 0 0 0 2 1 %s\n", txtf)
 				body := fmt.tprintf("newtpad-session 4\nactive 0\n%s", line)
@@ -7243,10 +7840,10 @@ when NEWTPAD_TESTS {
 				v: App
 				vok := session_restore(&v)
 				vd := app_active(&v)
-				good := vok && vd != nil && !vd.table && vd.md_mode == .Off
+				good := vok && vd != nil && !vd.table && vd.md_mode == .Off && vd.path == txtf
 				fmt.printfln(
-					"  %-6s a .txt restored with md_mode=2 table=1 comes back plain: ok=%v table=%v md_mode=%v",
-					"ok" if good else "FAIL", vok, vd != nil && vd.table, Md_Mode.Off if vd == nil else vd.md_mode,
+					"  %-6s a .txt restored with md_mode=2 table=1 comes back plain: ok=%v table=%v md_mode=%v path_ok=%v",
+					"ok" if good else "FAIL", vok, vd != nil && vd.table, Md_Mode.Off if vd == nil else vd.md_mode, vd != nil && vd.path == txtf,
 				)
 				if !good {bad += 1}
 				app_destroy(&v)
@@ -7292,9 +7889,12 @@ when NEWTPAD_TESTS {
 
 			// A v3 session (eleven fields, no md_mode/table) must still load: the
 			// old two fields simply aren't there, and the path is still the last field.
+			// Spaced for the same reason as the v4 fixture above -- without one, any
+			// collapse of the ladder that only ever OVER-counts fields still reads
+			// this line correctly and the case proves nothing.
 			{
 				dir, _ := session_dir()
-				v3f := fmt.tprintf("%s%cnewtpad_sess_v3.txt", os.get_env("TEMP", context.temp_allocator), '\\')
+				v3f := fmt.tprintf("%s%cnewtpad sess v3.txt", os.get_env("TEMP", context.temp_allocator), '\\')
 				plat.file_write_atomic(v3f, transmute([]u8)string("old format file\n"))
 				line := fmt.tprintf("0 0 0 0 0 -1 0 0 0 0 %s\n", v3f)
 				body := fmt.tprintf("newtpad-session 3\nactive 0\n%s", line)
@@ -9741,20 +10341,37 @@ when NEWTPAD_TESTS {
 		if os.args[1] == "stickytest" {
 			fail := false
 
-			// Every NEEDLE sits in the first 72 bytes, comfortably inside the worker's
-			// first SEARCH_BLOCK (256 KiB) read. That guarantees the whole result set
-			// publishes in one find_merge call -- the same shape the synchronous path
-			// always has -- so a corrupted sticky value can never be quietly
+			// Every NEEDLE sits PAST the bounded first-paint pass and inside the
+			// worker's first block, which is two conditions and both are load-bearing.
+			//
+			// Past SEARCH_FIRST_PAINT, or find_recompute republishes the surviving
+			// needles synchronously and returns with matches already non-empty --
+			// so the "matches empty while the search is still running" window this
+			// mode exists to inspect only opens on the LAST replace, when zero
+			// matches genuinely remain, which is not the state that was ever in
+			// question. The needles used to sit in the first 72 bytes for exactly
+			// the opposite reason, and the first-paint pass (§6ad) turned seven of
+			// these eight iterations into ones that observe nothing. The guard
+			// below is what would have caught that, so the placement is now
+			// checked rather than described.
+			//
+			// Inside one block, so the whole set still publishes in a single
+			// find_merge and a corrupted sticky value cannot be quietly
 			// self-corrected by a second partial merge landing after the jump has
-			// already run once. The filler after it never contains "NEEDLE", so the
-			// match count stays exactly NEEDLES while the buffer is pushed well past
-			// SEARCH_SYNC_MAX, which is what puts the search on the worker thread at
-			// all.
+			// already run once.
+			//
+			// The filler never contains "NEEDLE", so the count stays exactly NEEDLES
+			// while the buffer is pushed well past SEARCH_SYNC_MAX -- which is what
+			// puts the search on the worker thread at all.
 			NEEDLES :: 8
+			FILL :: "the quick brown fox jumps over the lazy dog\n" // 43 bytes
+			LEAD_LINES :: (SEARCH_FIRST_PAINT / len(FILL)) + 200 // clears the budget
 			sb := strings.builder_make(context.temp_allocator)
+			for i in 0 ..< LEAD_LINES {strings.write_string(&sb, FILL)}
+			first_needle := strings.builder_len(sb)
 			for i in 0 ..< NEEDLES {fmt.sbprintf(&sb, "NEEDLE %d\n", i)}
-			FILLER_LINES :: 7000 // ~7000 * 45 bytes =~ 315 KB, well past the 256 KiB threshold
-			for i in 0 ..< FILLER_LINES {strings.write_string(&sb, "the quick brown fox jumps over the lazy dog\n")}
+			FILLER_LINES :: 7000 // ~7000 * 43 bytes =~ 301 KB, past the 256 KiB threshold
+			for i in 0 ..< FILLER_LINES {strings.write_string(&sb, FILL)}
 			content := strings.to_string(sb)
 
 			doc: Document
@@ -9769,6 +10386,17 @@ when NEWTPAD_TESTS {
 				doc.pt.length,
 				SEARCH_SYNC_MAX,
 				NEEDLES,
+			)
+			// The premise, checked: the inline pass cannot reach a single needle,
+			// and every needle is inside the worker's first block.
+			placed := first_needle >= SEARCH_FIRST_PAINT && first_needle < SEARCH_BLOCK
+			if !placed {fail = true}
+			fmt.printfln(
+				"  %-6s first needle at %d: past the %d B first-paint budget, inside the %d B first worker block",
+				"ok" if placed else "FAIL",
+				first_needle,
+				SEARCH_FIRST_PAINT,
+				SEARCH_BLOCK,
 			)
 
 			find_open(&doc, true)
@@ -11160,6 +11788,1392 @@ when NEWTPAD_TESTS {
 			)
 			fmt.printfln("  examined %d extensions from text_exts.txt", seen)
 			fmt.println("lexcoveragetest: FAILURES" if fail else "lexcoveragetest: all ok")
+			return true
+		}
+
+		// `newtpad keymaptest` — the keys.txt user overlay (keymap.odin).
+		//
+		// Every case asserts through resolve_key, not through the returned Keymap.
+		// A test that only counted parse results would prove that the parser
+		// parsed, which is not the claim: the claim is that a chord in the file
+		// changes what a key press DOES, and that nothing in the file can take
+		// away the way out. The reject counters are checked as well, but always
+		// alongside the resolve_key answer — "the line was ignored" and "the line
+		// was ignored for the right reason" are different assertions, and the
+		// shift case only means anything if both hold.
+		//
+		// Writes keys.txt in the session dir for the load-from-disk case, hence
+		// the scratch guard.
+		if os.args[1] == "keymaptest" {
+			if !require_scratch_session("keymaptest") {return true}
+			// Its own proc: test_mode_dispatch's frame is already large (§6,
+			// STATUS_STACK_OVERFLOW twice).
+			keymaptest :: proc() -> int {
+				bad := 0
+				chk :: proc(bad: ^int, cond: bool, msg: string) {
+					fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+					if !cond {bad^ += 1}
+				}
+				// Parse + install, so the following resolve_key calls run against
+				// the live overlay exactly as the app's would.
+				load :: proc(src: string) -> Keymap {
+					km := keymap_parse(src)
+					keymap_install(km) // takes ownership of km.entries
+					return km
+				}
+				defer keymap_reset()
+
+				// --- a good file -------------------------------------------------
+				// Two chords the defaults leave alone, so a pass here cannot be a
+				// default answering by accident.
+				fmt.println("--- a good file ---")
+				k := load("# a comment\n\nctrl+k = Move_Line_Up\nalt+down = Undo\n")
+				chk(&bad, len(k.entries) == 2 && keymap_reject_total(k) == 0, fmt.tprintf("2 bindings, 0 refusals (got %d / %d)", len(k.entries), keymap_reject_total(k)))
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .Move_Line_Up, fmt.tprintf("ctrl+k -> %v (want Move_Line_Up)", resolve_key(.K, true, false, .Editor)))
+				chk(&bad, resolve_key(.Down, false, true, .Editor) == .Undo, fmt.tprintf("alt+down -> %v (want Undo, default was Move_Line_Down)", resolve_key(.Down, false, true, .Editor)))
+				// Case and whitespace are not part of the format.
+				load("   CTRL+K   =   move_line_up   \n")
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .Move_Line_Up, "case and padding are ignored")
+
+				// --- an unknown command name is ignored ---------------------------
+				fmt.println("--- unknown command name ---")
+				k = load("ctrl+k = Frobnicate\n")
+				chk(&bad, k.rejects[.Unknown_Command] == 1 && len(k.entries) == 0, fmt.tprintf("refused as Unknown_Command (%d), no binding made (%d)", k.rejects[.Unknown_Command], len(k.entries)))
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .None, fmt.tprintf("ctrl+k -> %v (want None)", resolve_key(.K, true, false, .Editor)))
+
+				// --- malformed chords / garbage lines ------------------------------
+				fmt.println("--- malformed lines ---")
+				k = load("ctrl+nope = Undo\nthis line has no equals sign\n = Undo\nctrl+ = Undo\n")
+				chk(&bad, k.rejects[.Unknown_Key] == 1, fmt.tprintf("1 unknown-key refusal (got %d)  [`ctrl+nope`]", k.rejects[.Unknown_Key]))
+				chk(&bad, k.rejects[.Malformed] == 3, fmt.tprintf("3 malformed refusals (got %d)  [no '=', an empty chord, and `ctrl+` -- modifiers with no key]", k.rejects[.Malformed]))
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("nothing bound (%d entries)", len(k.entries)))
+				// A chord that is nothing but modifiers is diagnosed as having no
+				// key, whichever modifiers they are -- including shift, where the
+				// missing key is the more basic fault. All three were Unknown_Key
+				// before, which named the wrong problem: the reject reasons exist so
+				// the warning can tell the user what to change.
+				k = load("ctrl+ = Undo\nalt+ = Undo\nshift+ = Undo\n")
+				chk(&bad, k.rejects[.Malformed] == 3 && k.rejects[.Unknown_Key] == 0 && k.rejects[.Shift] == 0, fmt.tprintf("modifiers with no key: malformed=%d unknown-key=%d shift=%d (want 3/0/0)", k.rejects[.Malformed], k.rejects[.Unknown_Key], k.rejects[.Shift]))
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("nothing bound (%d entries)", len(k.entries)))
+				// Spaces around the '+' are tolerated, so a spaced-out chord gets
+				// the diagnosis its compact spelling would get.
+				k = load("ctrl + shift + k = Undo\n")
+				chk(&bad, k.rejects[.Shift] == 1 && k.rejects[.Unknown_Key] == 0, fmt.tprintf("`ctrl + shift + k` is refused for naming shift, not for the key (shift=%d key=%d)", k.rejects[.Shift], k.rejects[.Unknown_Key]))
+				k = load("ctrl + t = Undo\nctrl + + = Redo\n")
+				chk(&bad, len(k.entries) == 2 && keymap_reject_total(k) == 0, fmt.tprintf("a spaced chord binds like the compact one (%d entries, %d refusals)", len(k.entries), keymap_reject_total(k)))
+				chk(&bad, resolve_key(.T, true, false, .Editor) == .Undo, fmt.tprintf("`ctrl + t` -> %v (want Undo)", resolve_key(.T, true, false, .Editor)))
+				chk(&bad, resolve_key(.Plus, true, false, .Editor) == .Redo, fmt.tprintf("...including when the key IS '+': `ctrl + +` -> %v (want Redo; the default is Zoom_In)", resolve_key(.Plus, true, false, .Editor)))
+
+				// --- shift is not part of a chord -----------------------------------
+				// The load-bearing one. commands.odin:252-254 and :294 both say a
+				// Binding is (key, ctrl, alt, ctx); dropping the shift and binding
+				// ctrl+k would give the user a chord they never asked for on a key
+				// they are still using for something else.
+				fmt.println("--- a shift+ chord is refused, not silently downgraded ---")
+				k = load("ctrl+shift+k = Undo\nshift+f5 = Undo\n")
+				chk(&bad, k.rejects[.Shift] == 2, fmt.tprintf("2 shift refusals (got %d)", k.rejects[.Shift]))
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("no binding made (%d entries)", len(k.entries)))
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .None, fmt.tprintf("ctrl+k is NOT bound behind the user's back -> %v (want None)", resolve_key(.K, true, false, .Editor)))
+				// And shift wins the diagnosis even when the key is also bad, so the
+				// warning names the real problem.
+				k = load("ctrl+shift+nope = Undo\n")
+				chk(&bad, k.rejects[.Shift] == 1 && k.rejects[.Unknown_Key] == 0, fmt.tprintf("shift is diagnosed before the key name (shift=%d key=%d)", k.rejects[.Shift], k.rejects[.Unknown_Key]))
+
+				// --- an empty command unbinds a default -----------------------------
+				fmt.println("--- an empty command unbinds ---")
+				k = load("ctrl+z =\n")
+				chk(&bad, len(k.entries) == 1 && k.entries[0].cmd == .None, fmt.tprintf("recorded as an entry, not a refusal (%d entries, cmd=%v)", len(k.entries), k.entries[0].cmd if len(k.entries) == 1 else Command_Id.None))
+				chk(&bad, resolve_key(.Z, true, false, .Editor) == .None, fmt.tprintf("ctrl+z -> %v (want None; the default is Undo)", resolve_key(.Z, true, false, .Editor)))
+				chk(&bad, resolve_key(.Y, true, false, .Editor) == .Redo, "unbinding one chord leaves the rest of the defaults alone (ctrl+y still Redo)")
+
+				// --- duplicates: last wins ------------------------------------------
+				fmt.println("--- a duplicate chord: last wins ---")
+				k = load("ctrl+k = Undo\nctrl+k = Redo\nctrl+k = Save_As\n")
+				chk(&bad, len(k.entries) == 3, fmt.tprintf("all three lines kept (%d)", len(k.entries)))
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .Save_As, fmt.tprintf("ctrl+k -> %v (want Save_As, the LAST line)", resolve_key(.K, true, false, .Editor)))
+				// A later unbind must beat an earlier bind, too.
+				load("ctrl+k = Undo\nctrl+k =\n")
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .None, fmt.tprintf("a later unbind beats an earlier bind -> %v (want None)", resolve_key(.K, true, false, .Editor)))
+
+				// --- an overlay entry beats a default --------------------------------
+				fmt.println("--- the overlay beats the defaults ---")
+				load("ctrl+t = Undo\n")
+				chk(&bad, resolve_key(.T, true, false, .Editor) == .Undo, fmt.tprintf("ctrl+t -> %v (want Undo; the default is Toggle_Table)", resolve_key(.T, true, false, .Editor)))
+				// What the menus TEACH turns on add-vs-replace, not on which half
+				// of the keymap the row came from. This line ADDS a chord: Ctrl+Z
+				// still runs Undo, so un-teaching it would take away a shortcut the
+				// user knows and never asked to lose.
+				chk(&bad, command_chord(.Undo) == "Ctrl+Z", fmt.tprintf("an ADDED chord does not un-teach the working default: command_chord(Undo)=%q (want \"Ctrl+Z\")", command_chord(.Undo)))
+				chk(&bad, command_chord(.Toggle_Table) == "", fmt.tprintf("...and the command whose chord was TAKEN teaches nothing: command_chord(Toggle_Table)=%q (want \"\")", command_chord(.Toggle_Table)))
+				// Replace, both ways of spelling it, and the menus follow the user.
+				load("ctrl+z =\nctrl+t = Undo\n")
+				chk(&bad, command_chord(.Undo) == "Ctrl+T", fmt.tprintf("unbinding the default makes the menus teach the new chord: %q (want \"Ctrl+T\")", command_chord(.Undo)))
+				load("ctrl+z = Redo\nctrl+t = Undo\n")
+				chk(&bad, command_chord(.Undo) == "Ctrl+T", fmt.tprintf("giving the default away does too: %q (want \"Ctrl+T\")", command_chord(.Undo)))
+				// A command with no default chord at all -- the overlay is its only
+				// possible answer, which is why the seed lists these by name.
+				load("ctrl+alt+o = Open_Link\n")
+				chk(&bad, command_chord(.Open_Link) == "Ctrl+Alt+O", fmt.tprintf("a command with no default teaches its overlay chord: %q (want \"Ctrl+Alt+O\")", command_chord(.Open_Link)))
+				// An overlay row a LATER line overrode must not be taught either:
+				// Ctrl+K runs Redo here, so teaching it for Undo would be exactly
+				// the drift this proc exists to stop. Ctrl+Z is unbound first so
+				// that the default cannot answer and the overlay's own guard is
+				// what is under test.
+				k = load("ctrl+z =\nctrl+k = Undo\nctrl+k = Redo\n")
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .Redo, fmt.tprintf("ctrl+k -> %v (want Redo, the last line)", resolve_key(.K, true, false, .Editor)))
+				chk(&bad, command_chord(.Undo) == "", fmt.tprintf("a superseded overlay row is not taught: command_chord(Undo)=%q (want \"\"; Ctrl+K runs Redo)", command_chord(.Undo)))
+				// The invariant that makes every guard above a provable no-op on a
+				// machine with no keys.txt: with an empty overlay resolve_key is the
+				// plain default lookup, so a default row can only fail its own guard
+				// if some OTHER default row shadows the same chord.
+				dup_pairs := 0
+				for a, i in default_bindings {
+					for b, j in default_bindings {
+						if j <= i {continue}
+						if a.key == b.key && a.ctrl == b.ctrl && a.alt == b.alt && a.ctx == b.ctx {dup_pairs += 1}
+					}
+				}
+				chk(&bad, dup_pairs == 0, fmt.tprintf("no two default_bindings rows share a chord (%d duplicate pair(s) in %d rows)", dup_pairs, len(default_bindings)))
+
+				// --- reserved chords are refused --------------------------------------
+				// The escape hatch, so a bad file cannot be a one-way door: cancel,
+				// save, and the palette (which can run every command, including
+				// View > Edit Keybindings...).
+				fmt.println("--- reserved chords ---")
+				k = load("esc = Undo\nctrl+s = Undo\nctrl+p = Undo\nctrl+s =\n")
+				chk(&bad, k.rejects[.Reserved] == 4, fmt.tprintf("4 reserved refusals -- rebinds AND the unbind (got %d)", k.rejects[.Reserved]))
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("nothing bound (%d entries)", len(k.entries)))
+				chk(&bad, resolve_key(.Escape, false, false, .Editor) == .Clear_Selection, fmt.tprintf("Esc still cancels -> %v", resolve_key(.Escape, false, false, .Editor)))
+				chk(&bad, resolve_key(.S, true, false, .Editor) == .Save, fmt.tprintf("Ctrl+S still saves -> %v", resolve_key(.S, true, false, .Editor)))
+				chk(&bad, resolve_key(.P, true, false, .Editor) == .Palette_Open, fmt.tprintf("Ctrl+P still opens the palette -> %v", resolve_key(.P, true, false, .Editor)))
+				// Ctrl+Alt+S is Save_As and is NOT reserved -- the reservation is on
+				// the exact chord, not on the key.
+				k = load("ctrl+alt+s = Undo\n")
+				chk(&bad, k.rejects[.Reserved] == 0 && resolve_key(.S, true, true, .Editor) == .Undo, fmt.tprintf("ctrl+alt+s is a different chord and is bindable -> %v", resolve_key(.S, true, true, .Editor)))
+				chk(&bad, resolve_key(.S, true, false, .Editor) == .Save, "...and Ctrl+S is untouched by it")
+
+				// --- chords Windows owns are refused ------------------------------------
+				// Not "reserved" -- these are chords the message pump hands back to
+				// DefWindowProc before the lookup runs, so a binding for one would
+				// sit in the table and never fire once. Silently accepting it is the
+				// same failure the unmodified-printable rule below refuses.
+				fmt.println("--- chords Windows owns ---")
+				k = load("alt+f4 = Undo\nf10 = Undo\nalt+f10 = Undo\n")
+				chk(&bad, k.rejects[.Os_Owned] == 3, fmt.tprintf("3 OS-owned refusals -- alt+f4, bare f10, alt+f10 (got %d)", k.rejects[.Os_Owned]))
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("nothing bound (%d entries)", len(k.entries)))
+				// A BARE F4 is ordinary -- the reservation is on the chord, not the
+				// key, and this is the pair that shows the parser asks the pump's own
+				// predicate rather than carrying a second list of function keys.
+				k = load("f4 = Undo\nctrl+f4 = Redo\n")
+				chk(&bad, k.rejects[.Os_Owned] == 0 && resolve_key(.F4, false, false, .Editor) == .Undo, fmt.tprintf("bare F4 is still bindable -> %v (%d refusals)", resolve_key(.F4, false, false, .Editor), k.rejects[.Os_Owned]))
+				chk(&bad, resolve_key(.F4, true, false, .Editor) == .Redo, fmt.tprintf("...and so is Ctrl+F4 -> %v", resolve_key(.F4, true, false, .Editor)))
+
+				// --- an unmodified printable key is refused -----------------------------
+				// WM_CHAR is drained separately from the key events (main.odin), so
+				// `k = Exit` would type a k AND quit, every time.
+				fmt.println("--- unmodified printable keys ---")
+				k = load("k = Undo\n5 = Undo\n- = Undo\n")
+				chk(&bad, k.rejects[.Unmodified] == 3, fmt.tprintf("3 refusals -- letter, digit, minus (got %d)", k.rejects[.Unmodified]))
+				chk(&bad, resolve_key(.K, false, false, .Editor) == .None, fmt.tprintf("bare k -> %v (want None)", resolve_key(.K, false, false, .Editor)))
+				// Keys that never reach WM_CHAR (r >= 32 filter) stay bindable bare.
+				k = load("pgdn = Undo\ndel = Redo\n")
+				chk(&bad, k.rejects[.Unmodified] == 0 && resolve_key(.Page_Down, false, false, .Editor) == .Undo, fmt.tprintf("bare PgDn is still bindable -> %v", resolve_key(.Page_Down, false, false, .Editor)))
+
+				// --- the overlay is scoped to .Editor -------------------------------------
+				fmt.println("--- context scoping ---")
+				load("ctrl+k = Undo\nenter = Undo\n")
+				chk(&bad, resolve_key(.K, true, false, .Palette) == .None, fmt.tprintf("the palette is untouched: ctrl+k/Palette -> %v (want None)", resolve_key(.K, true, false, .Palette)))
+				chk(&bad, resolve_key(.Enter, false, false, .Palette) == .Palette_Confirm, fmt.tprintf("Enter still confirms in the palette -> %v", resolve_key(.Enter, false, false, .Palette)))
+				chk(&bad, resolve_key(.Enter, false, false, .Find) == .Find_Confirm, fmt.tprintf("Enter still confirms in find -> %v", resolve_key(.Enter, false, false, .Find)))
+				chk(&bad, resolve_key(.Escape, false, false, .Find) == .Find_Close, fmt.tprintf("Esc still closes find -> %v", resolve_key(.Escape, false, false, .Find)))
+				chk(&bad, resolve_key(.Escape, false, false, .Menu) == .Menu_Close, fmt.tprintf("Esc still closes the menu -> %v", resolve_key(.Escape, false, false, .Menu)))
+				chk(&bad, resolve_key(.Escape, false, false, .Settings) == .Settings_Close, fmt.tprintf("Esc still closes settings -> %v", resolve_key(.Escape, false, false, .Settings)))
+				chk(&bad, resolve_key(.Escape, false, false, .History) == .History_Close, fmt.tprintf("Esc still closes the history panel -> %v", resolve_key(.Escape, false, false, .History)))
+				chk(&bad, resolve_key(.Escape, false, false, .Font) == .Font_Close, fmt.tprintf("Esc still closes the font page -> %v", resolve_key(.Escape, false, false, .Font)))
+				// The §6f fallbacks still work, and now carry the overlay's answer:
+				// a modified chord in find/menu/history resolves through .Editor.
+				chk(&bad, resolve_key(.K, true, false, .Find) == .Undo, fmt.tprintf("find falls back to the overlaid editor chord -> %v (want Undo)", resolve_key(.K, true, false, .Find)))
+				chk(&bad, resolve_key(.K, true, false, .Menu) == .Undo, fmt.tprintf("the menu falls back too -> %v", resolve_key(.K, true, false, .Menu)))
+				chk(&bad, resolve_key(.Left, false, false, .Find) == .None, "unmodified keys still stay owned by find (Left)")
+
+				// --- an entirely garbage file leaves the defaults intact --------------------
+				fmt.println("--- a file that is nothing but garbage ---")
+				k = load("\x00\x01 binary junk\n!!!!\nctrl+shift+q = Nope\n= = =\n\xff\xfe\nhello world\n")
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("nothing bound (%d entries)", len(k.entries)))
+				chk(&bad, keymap_reject_total(k) > 0, fmt.tprintf("and it complained (%d refusals)", keymap_reject_total(k)))
+				intact := true
+				for b in default_bindings {
+					if resolve_key(b.key, b.ctrl, b.alt, b.ctx) == .None {intact = false}
+				}
+				chk(&bad, intact, "every default binding still resolves")
+				// Spot-checks in the actual currency the user cares about.
+				chk(&bad, resolve_key(.S, true, false, .Editor) == .Save && resolve_key(.Z, true, false, .Editor) == .Undo && resolve_key(.F, true, false, .Editor) == .Find_Open, "Ctrl+S / Ctrl+Z / Ctrl+F unchanged")
+				keymap_reset()
+				chk(&bad, resolve_key(.T, true, false, .Editor) == .Toggle_Table, "and clearing the overlay restores the defaults")
+
+				// --- the seeded file is honest documentation ---------------------------------
+				// Newtpad writes this file; Newtpad has to be able to read it back.
+				// Everything in it is commented, so a fresh seed must parse to
+				// nothing at all -- no line of the header may accidentally go live.
+				fmt.println("--- the seeded keys.txt ---")
+				seed := keymap_seed_text(context.temp_allocator)
+				k = load(seed)
+				chk(&bad, len(k.entries) == 0 && keymap_reject_total(k) == 0, fmt.tprintf("a fresh seed parses to nothing: %d entries, %d refusals", len(k.entries), keymap_reject_total(k)))
+				chk(&bad, strings.contains(seed, "DELETE THIS FILE"), "the escape hatch is in the header")
+				chk(&bad, strings.contains(seed, "THE LAST LINE WINS"), "last-wins is stated in the header")
+				chk(&bad, strings.contains(seed, "SHIFT IS NOT PART OF A CHORD"), "the shift rule is stated in the header")
+				chk(&bad, strings.contains(seed, "EDITOR ONLY"), "the editor-only scope is stated in the header")
+				// The one surprise the file does not refuse: an alt+<letter> binding
+				// shadows the menu bar's mnemonic for that letter. A header that
+				// enumerates what the file will not let you do has to say this too,
+				// or it reads as a complete list and is not one.
+				chk(&bad, strings.contains(seed, "takes over from the menu bar's Alt shortcut") && strings.contains(seed, "still opens the menu bar"), "the alt+<letter> mnemonic shadow is stated in the header")
+				// The three reserved commands must not appear in the list at all --
+				// a row a user can uncomment only to be refused is worse than no
+				// row. Matched on the command name plus the newline rather than on
+				// the padded chord, so column widths are free to change.
+				chk(&bad, !strings.contains(seed, "= Save\n") && !strings.contains(seed, "= Clear_Selection\n") && !strings.contains(seed, "= Palette_Open\n"), "the reserved chords are not listed as if they were editable")
+				// Uncomment every row of the built-in list and they must all come
+				// back as real bindings with no refusals -- the property that makes
+				// the file usable as a reference. A chord the parser cannot read
+				// back (a separator drift between the writer and the reader, a key
+				// display name that gained a space) fails here.
+				//
+				// Sliced to the list's own section rather than scanning the whole
+				// file: the header contains worked examples that are themselves
+				// valid binding lines, and counting those would make the total
+				// depend on how the prose is written.
+				live := strings.builder_make(context.temp_allocator)
+				want := 0
+				for b in default_bindings {
+					if b.ctx == .Editor && !keymap_chord_reserved(b.key, b.ctrl, b.alt) {want += 1}
+				}
+				in_block := false
+				for ln in strings.split_lines(seed, context.temp_allocator) {
+					if strings.has_prefix(ln, "# ---") {
+						in_block = strings.contains(ln, "the built-in editor keys")
+						continue
+					}
+					if !in_block || !strings.has_prefix(ln, "# ") {continue}
+					body := strings.trim_space(ln[2:])
+					cut := strings.index(body, " = ")
+					if cut <= 0 {continue}
+					if _, cok := command_from_name(strings.trim_space(body[cut + 3:])); !cok {continue}
+					strings.write_string(&live, body)
+					strings.write_byte(&live, '\n')
+				}
+				k = load(strings.to_string(live))
+				chk(&bad, len(k.entries) == want && keymap_reject_total(k) == 0, fmt.tprintf("uncommenting the seeded list gives %d bindings and %d refusals (want %d / 0)", len(k.entries), keymap_reject_total(k), want))
+				keymap_reset()
+
+				// --- from disk, through session_dir ------------------------------------------
+				fmt.println("--- loading from disk ---")
+				path, pok := keymap_path()
+				chk(&bad, pok && strings.has_suffix(path, "keys.txt") && strings.has_prefix(strings.to_lower(path, context.temp_allocator), strings.to_lower(os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator), context.temp_allocator)), fmt.tprintf("keys.txt resolves inside NEWTPAD_SESSION_DIR: %q", path))
+				os.remove(path)
+				keymap_load()
+				chk(&bad, len(g_keymap.entries) == 0 && resolve_key(.T, true, false, .Editor) == .Toggle_Table, "no keys.txt -> the defaults, and no complaint")
+				_ = os.write_entire_file(path, transmute([]u8)string("ctrl+t = Undo\n"))
+				keymap_load()
+				chk(&bad, resolve_key(.T, true, false, .Editor) == .Undo, fmt.tprintf("a keys.txt on disk takes effect -> %v", resolve_key(.T, true, false, .Editor)))
+				// Saving the file re-reads it: the loop that makes a binding
+				// testable without restarting.
+				_ = os.write_entire_file(path, transmute([]u8)string("ctrl+t = Redo\n"))
+				chk(&bad, keymap_reload_if_active(nil, path) && resolve_key(.T, true, false, .Editor) == .Redo, fmt.tprintf("saving keys.txt re-reads it -> %v (want Redo)", resolve_key(.T, true, false, .Editor)))
+				other := fmt.tprintf("%s%csettings.txt", os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator), '\\')
+				chk(&bad, !keymap_reload_if_active(nil, other), "saving some other file does not")
+				// A refused line has to be visible from inside the app. Without
+				// this the reload loop is only half a loop: the user writes a
+				// chord, saves, presses it, nothing happens, and the one place
+				// that says why is a log file they have no reason to open.
+				{
+					app_t: App
+					menu_init(&app_t.menu)
+					defer app_destroy(&app_t)
+					app_t.settings = settings_default()
+					_ = os.write_entire_file(path, transmute([]u8)string("ctrl+t = Redo\nctrl+shift+k = Undo\nnonsense\n"))
+					reloaded := keymap_reload_if_active(&app_t, path)
+					chk(&bad, reloaded && resolve_key(.T, true, false, .Editor) == .Redo, fmt.tprintf("the good lines still take effect alongside the bad -> %v (want Redo)", resolve_key(.T, true, false, .Editor)))
+					chk(&bad, app_notice_active(&app_t) && strings.contains(app_t.notice, "2 LINES REFUSED"), fmt.tprintf("the refusals are reported in the app, not just the log: %q", app_t.notice))
+					_ = os.write_entire_file(path, transmute([]u8)string("ctrl+q = Frobnicate\n"))
+					keymap_reload_if_active(&app_t, path)
+					chk(&bad, strings.contains(app_t.notice, "1 LINE REFUSED"), fmt.tprintf("one line is singular: %q", app_t.notice))
+					// And a file with nothing wrong with it says nothing at all --
+					// a note on every save of keys.txt would be noise.
+					app_t.notice_started = {}
+					_ = os.write_entire_file(path, transmute([]u8)string("ctrl+t = Undo\n"))
+					keymap_reload_if_active(&app_t, path)
+					chk(&bad, !app_notice_active(&app_t), fmt.tprintf("a clean file posts no note: %q", app_t.notice))
+				}
+				os.remove(path)
+				keymap_reset()
+
+				// --- View > Edit Keybindings... -----------------------------------------------
+				// app_open_path is headless-safe (it maps and activates a tab like
+				// any other open), so the opened tab is asserted rather than
+				// skipped as needing a window -- the same shape the Edit Current
+				// Theme... case uses.
+				fmt.println("--- Edit Keybindings... ---")
+				{
+					app_t: App
+					menu_init(&app_t.menu)
+					defer app_destroy(&app_t)
+					app_t.settings = settings_default()
+					made := keymap_edit_current(&app_t)
+					chk(&bad, made && os.exists(path), fmt.tprintf("writes keys.txt when there isn't one (ok=%v exists=%v)", made, os.exists(path)))
+					opened := app_active(&app_t)
+					chk(&bad, opened != nil && strings.to_lower(opened.path, context.temp_allocator) == strings.to_lower(path, context.temp_allocator), fmt.tprintf("and opens it as a tab: %q", opened.path if opened != nil else ""))
+					// What it wrote must be what keymap_load reads back with no
+					// complaint -- the seed is only documentation if it is also
+					// a valid file.
+					keymap_load()
+					chk(&bad, len(g_keymap.entries) == 0 && resolve_key(.T, true, false, .Editor) == .Toggle_Table, "the freshly written file loads clean and changes nothing")
+					// Second invocation must not clobber the user's bindings --
+					// this command exists to let them edit the file, not to reset it.
+					mine := "ctrl+t = Undo\n"
+					_ = os.write_entire_file(path, transmute([]u8)mine)
+					again := keymap_edit_current(&app_t)
+					back, _ := os.read_entire_file(path, context.temp_allocator)
+					chk(&bad, again && string(back) == mine, fmt.tprintf("an existing keys.txt is never overwritten (%d bytes back, want %d)", len(back), len(mine)))
+				}
+				os.remove(path)
+				keymap_reset()
+				return bad
+			}
+			n := keymaptest()
+			fmt.printfln("keymaptest: %d failures", n)
+			return true
+		}
+
+		// `newtpad bookmarktest` — line bookmarks (doc.odin's bookmark section,
+		// the Ctrl+F2/F2 commands, and the session v5 field).
+		//
+		// The claim this mode has to be able to falsify is NOT "toggling appends
+		// an int". It is that a bookmark still names the line it was set on after
+		// the buffer has moved underneath it. So every edit case asserts three
+		// independent things about the same state:
+		//
+		//   1. the OFFSET, against a number computed by hand from the fixture;
+		//   2. the TEXT at that offset, so an offset that is arithmetically right
+		//      but names the wrong line still fails;
+		//   3. the "every entry is a real line start" INVARIANT, which is the
+		//      property the shift rules exist to preserve and the one that a
+		//      wrong rule breaks even when the arithmetic looks plausible.
+		//
+		// Several cases also assert through doc_bookmark_rects -- what is DRAWN --
+		// rather than through doc.bookmarks alone, because the list is not the
+		// user-visible artifact and a mark on the wrong row is the failure that
+		// would actually be reported.
+		if os.args[1] == "bookmarktest" {
+			if !require_scratch_session("bookmarktest") {return true}
+
+			// "alpha\nbravo\ncharlie\ndelta\n" -- 26 bytes, four lines.
+			// Line starts: 0, 6, 12, 20. Deliberately unequal line lengths so an
+			// off-by-one in a shift cannot land on another line's start by luck.
+			BM_FIX :: "alpha\nbravo\ncharlie\ndelta\n"
+
+			bm_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			// `n` bytes of the buffer starting at BOOKMARK `i` -- read through the
+			// bookmark itself, never at a literal offset.
+			//
+			// This is the difference between a check that can fail and one that
+			// cannot, and it was got wrong first time round: reading at the
+			// expected offset (`bm_at(&d, 14, 7) == "charlie"`) asserts something
+			// about the FIXTURE, not about the bookmark, and sabotaging the shift
+			// left every such line green while the offsets beside them went red.
+			// Reading at d.bookmarks[i] is what makes "the entry still names its
+			// own line" an assertion about the entry.
+			bm_at :: proc(d: ^Document, i, n: int) -> string {
+				if i < 0 || i >= len(d.bookmarks) {return "<no such bookmark>"}
+				at := d.bookmarks[i]
+				if at < 0 || at >= d.pt.length {return "<oob>"}
+				buf := make([]u8, min(n, d.pt.length - at), context.temp_allocator)
+				base.pt_read(&d.pt, at, buf)
+				return string(buf)
+			}
+
+			// The invariant every shift rule is written to preserve: the list is
+			// strictly ascending, in range, and every entry is a real line start.
+			// Checked after every edit case; it is the assertion that does not
+			// depend on the fixture's arithmetic.
+			bm_invariant :: proc(d: ^Document) -> bool {
+				prev := -1
+				for b in d.bookmarks {
+					if b <= prev || b < 0 || b > d.pt.length {return false}
+					prev = b
+					if b == 0 {continue}
+					one: [1]u8
+					base.pt_read(&d.pt, b - 1, one[:])
+					if one[0] != '\n' {return false}
+				}
+				return true
+			}
+
+			bm_list :: proc(d: ^Document) -> string {return fmt.tprintf("%v", d.bookmarks[:])}
+
+			// Bookmark each offset by putting the caret there and toggling, i.e.
+			// through the product's own entry point rather than by appending to
+			// the array -- a fixture built by hand would not prove the toggle
+			// keeps the list sorted.
+			bm_set :: proc(d: ^Document, offs: []int) {
+				for o in offs {
+					d.cursor, d.anchor = o, o
+					doc_bookmark_toggle(d)
+				}
+			}
+
+			bad := 0
+
+			// --- toggle -------------------------------------------------------------
+			bm_toggle :: proc(bad: ^int, fix: string) {
+				fmt.println("--- toggle ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+
+				// From the MIDDLE of a line: the bookmark is the line's start, not
+				// the caret. This is the whole point of "bookmark the line".
+				d.cursor, d.anchor = 14, 14 // inside "charlie"
+				on, ok := doc_bookmark_toggle(&d)
+				bm_chk(bad, on && ok && len(d.bookmarks) == 1 && d.bookmarks[0] == 12, fmt.tprintf("caret mid-line bookmarks the LINE START: %v (want [12])", d.bookmarks[:]))
+
+				// A second line, set from a lower offset, still lands sorted.
+				d.cursor, d.anchor = 2, 2
+				doc_bookmark_toggle(&d)
+				bm_chk(bad, len(d.bookmarks) == 2 && d.bookmarks[0] == 0 && d.bookmarks[1] == 12, fmt.tprintf("the list stays sorted: %v (want [0 12])", d.bookmarks[:]))
+
+				// Toggling the same line OFF, from a different offset on it than
+				// the one it was set from.
+				d.cursor, d.anchor = 18, 18 // still inside "charlie"
+				on2, _ := doc_bookmark_toggle(&d)
+				bm_chk(bad, !on2 && len(d.bookmarks) == 1 && d.bookmarks[0] == 0, fmt.tprintf("toggling off from elsewhere on the line: on=%v %v (want [0])", on2, d.bookmarks[:]))
+
+				// And exactly at a line start, both ways -- offset 0 is the edge
+				// case for every "is this a line start" test in the shift rules.
+				d.cursor, d.anchor = 0, 0
+				doc_bookmark_toggle(&d)
+				bm_chk(bad, len(d.bookmarks) == 0, fmt.tprintf("toggling off at offset 0: %v (want [])", d.bookmarks[:]))
+
+				// A pseudo-tab (Settings/Font) has no lines to bookmark.
+				d.kind = .Settings
+				_, okp := doc_bookmark_toggle(&d)
+				bm_chk(bad, !okp && len(d.bookmarks) == 0, "a pseudo-tab refuses rather than bookmarking its empty buffer")
+			}
+			bm_toggle(&bad, BM_FIX)
+
+			// --- cycle, with wrap ----------------------------------------------------
+			bm_cycle :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int)) {
+				fmt.println("--- cycle ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+
+				// An empty set: a no-op that says so, not a crash and not a caret
+				// teleported to 0.
+				d.cursor, d.anchor = 14, 14
+				movedF := doc_bookmark_cycle(&d, false)
+				movedB := doc_bookmark_cycle(&d, true)
+				bm_chk(bad, !movedF && !movedB && d.cursor == 14, fmt.tprintf("cycling an empty set is a no-op: fwd=%v back=%v cursor=%d", movedF, movedB, d.cursor))
+
+				set(&d, {0, 12, 20})
+				d.cursor, d.anchor = 0, 0
+				doc_bookmark_cycle(&d, false)
+				c1 := d.cursor
+				doc_bookmark_cycle(&d, false)
+				c2 := d.cursor
+				doc_bookmark_cycle(&d, false)
+				c3 := d.cursor // wraps to the first
+				bm_chk(bad, c1 == 12 && c2 == 20 && c3 == 0, fmt.tprintf("forward wraps: 0 -> %d -> %d -> %d (want 12, 20, 0)", c1, c2, c3))
+
+				b1 := doc_bookmark_cycle(&d, true) ? d.cursor : -1 // wraps to the last
+				doc_bookmark_cycle(&d, true)
+				b2 := d.cursor
+				doc_bookmark_cycle(&d, true)
+				b3 := d.cursor
+				bm_chk(bad, b1 == 20 && b2 == 12 && b3 == 0, fmt.tprintf("backward wraps: 0 -> %d -> %d -> %d (want 20, 12, 0)", b1, b2, b3))
+
+				// From a caret that is not itself on a bookmark: forward goes to
+				// the next one AFTER the caret, not to the next INDEX.
+				d.cursor, d.anchor = 14, 14 // inside "charlie", whose start (12) is bookmarked
+				doc_bookmark_cycle(&d, false)
+				fwd := d.cursor
+				d.cursor, d.anchor = 14, 14
+				doc_bookmark_cycle(&d, true)
+				back := d.cursor
+				bm_chk(bad, fwd == 20 && back == 12, fmt.tprintf("from mid-line: forward=%d back=%d (want 20, 12 -- back lands on this line's own start)", fwd, back))
+
+				// The jump collapses a selection, like every other caret move.
+				d.cursor, d.anchor = 0, 26
+				doc_bookmark_cycle(&d, false)
+				bm_chk(bad, d.anchor == d.cursor, fmt.tprintf("the jump collapses the selection: cursor=%d anchor=%d", d.cursor, d.anchor))
+			}
+			bm_cycle(&bad, BM_FIX, bm_set)
+
+			// --- an insert ABOVE shifts the offset ------------------------------------
+			//
+			// THE case this feature is most likely to get wrong, so it is asserted
+			// four ways: the offsets, the text each one names, the line-start
+			// invariant, and the marks that actually get drawn. Removing the shift
+			// leaves offsets 12 and 20 pointing at 'o' inside "bravo" and 'e'
+			// inside "charlie" -- neither is a line start, so all four fail.
+			bm_insert :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), at: proc(d: ^Document, at, n: int) -> string, inv: proc(d: ^Document) -> bool) {
+				fmt.println("--- an insert above shifts ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+				set(&d, {12, 20})
+
+				d.cursor, d.anchor = 0, 0
+				doc_insert_text(&d, transmute([]u8)string("XY"), .Paste)
+				bm_chk(bad, len(d.bookmarks) == 2 && d.bookmarks[0] == 14 && d.bookmarks[1] == 22, fmt.tprintf("2 bytes at offset 0: %v (want [14 22])", d.bookmarks[:]))
+				bm_chk(bad, at(&d, 0, 7) == "charlie" && at(&d, 1, 5) == "delta", fmt.tprintf("...and they still name their own lines: %q / %q (want \"charlie\" / \"delta\")", at(&d, 0, 7), at(&d, 1, 5)))
+				bm_chk(bad, inv(&d), "...and every entry is still a line start")
+
+				// An insert BETWEEN two bookmarks moves only the later one.
+				d.cursor, d.anchor = 21, 21 // the end of "charlie", after the first bookmark
+				doc_insert_text(&d, transmute([]u8)string("ZZZ"), .Paste)
+				bm_chk(bad, d.bookmarks[0] == 14 && d.bookmarks[1] == 25, fmt.tprintf("an insert between them moves only the later: %v (want [14 25])", d.bookmarks[:]))
+				bm_chk(bad, at(&d, 0, 10) == "charlieZZZ" && at(&d, 1, 5) == "delta", fmt.tprintf("...still their own lines: %q / %q", at(&d, 0, 10), at(&d, 1, 5)))
+				bm_chk(bad, inv(&d), "...invariant holds")
+
+				// An insert EXACTLY AT a bookmark leaves it alone: the byte before
+				// it did not move, so the offset is still that line's start, and
+				// the inserted text belongs to the bookmarked line. Shifting here
+				// would push the entry one byte into its own line, where no row's
+				// line start matches it -- the mark would silently stop drawing.
+				d.cursor, d.anchor = 14, 14
+				doc_insert_text(&d, transmute([]u8)string("Q"), .Paste)
+				bm_chk(bad, d.bookmarks[0] == 14 && at(&d, 0, 8) == "Qcharlie", fmt.tprintf("an insert AT the line start does not shift it: %v, line is %q (want [14 ...] \"Qcharlie\")", d.bookmarks[:], at(&d, 0, 8)))
+				bm_chk(bad, inv(&d), "...invariant holds")
+
+				// ...including when what is inserted ENDS in a newline, which is
+				// the case where the two answers differ visibly: offset 14 now
+				// begins the new "NEW" line.
+				d.cursor, d.anchor = 14, 14
+				doc_insert_text(&d, transmute([]u8)string("NEW\n"), .Paste)
+				bm_chk(bad, d.bookmarks[0] == 14 && at(&d, 0, 3) == "NEW", fmt.tprintf("a newline-terminated insert at the line start keeps the offset: %v, line is %q", d.bookmarks[:], at(&d, 0, 3)))
+				bm_chk(bad, inv(&d), "...invariant holds")
+			}
+			bm_insert(&bad, BM_FIX, bm_set, bm_at, bm_invariant)
+
+			// --- deletes -------------------------------------------------------------
+			bm_delete :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), at: proc(d: ^Document, at, n: int) -> string, inv: proc(d: ^Document) -> bool) {
+				fmt.println("--- deletes ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+
+				// Deleting the bookmarked line takes the bookmark with it, and the
+				// bookmark BELOW it shifts up onto the offset the deleted line had.
+				set(&d, {12, 20})
+				d.anchor, d.cursor = 12, 20 // all of "charlie\n"
+				doc_replace_sel(&d, nil, .Delete)
+				bm_chk(bad, len(d.bookmarks) == 1 && d.bookmarks[0] == 12, fmt.tprintf("deleting the bookmarked line drops it: %v (want [12], the old 20)", d.bookmarks[:]))
+				bm_chk(bad, at(&d, 0, 5) == "delta", fmt.tprintf("...and the survivor still names its own line: %q", at(&d, 0, 5)))
+				bm_chk(bad, inv(&d), "...invariant holds")
+
+				// Deleting the line ABOVE a bookmark must KEEP it -- the bookmarked
+				// line now begins where the deleted one did. This is the case that
+				// stops "drop anything the delete touched" from being the rule.
+				d2 := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d2)
+				set(&d2, {12})
+				d2.anchor, d2.cursor = 6, 12 // all of "bravo\n"
+				doc_replace_sel(&d2, nil, .Delete)
+				bm_chk(bad, len(d2.bookmarks) == 1 && d2.bookmarks[0] == 6 && at(&d2, 0, 7) == "charlie", fmt.tprintf("deleting the line ABOVE shifts, does not drop: %v %q (want [6] \"charlie\")", d2.bookmarks[:], at(&d2, 0, 7)))
+				bm_chk(bad, inv(&d2), "...invariant holds")
+
+				// Backspace at a bookmarked line start JOINS it onto the previous
+				// line. The offset would land mid-line, so the bookmark dies --
+				// the one delete case that is neither "inside the range" nor a
+				// plain shift, and the reason the rule reads the byte in front of
+				// the deleted range.
+				d3 := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d3)
+				set(&d3, {12})
+				d3.cursor, d3.anchor = 12, 12
+				doc_backspace(&d3)
+				bm_chk(bad, len(d3.bookmarks) == 0, fmt.tprintf("Backspace at the line start joins the line and drops the bookmark: %v (want [])", d3.bookmarks[:]))
+				bm_chk(bad, inv(&d3), "...invariant holds")
+
+				// A delete that starts at the bookmarked line start but stays
+				// inside the line drops it too. Deliberate conservatism, pinned
+				// here so it is a decision and not a surprise: the rule is "the
+				// line start was inside the deleted text", and distinguishing this
+				// from a whole-line delete would need the line's extent, a scan
+				// this path does not otherwise pay for.
+				d4 := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d4)
+				set(&d4, {12})
+				d4.cursor, d4.anchor = 12, 12
+				doc_delete_fwd(&d4)
+				bm_chk(bad, len(d4.bookmarks) == 0, fmt.tprintf("Delete at the line start drops it (documented conservatism): %v (want [])", d4.bookmarks[:]))
+
+				// A delete entirely BELOW every bookmark moves nothing.
+				d5 := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d5)
+				set(&d5, {0, 6})
+				d5.anchor, d5.cursor = 20, 26
+				doc_replace_sel(&d5, nil, .Delete)
+				bm_chk(bad, len(d5.bookmarks) == 2 && d5.bookmarks[0] == 0 && d5.bookmarks[1] == 6, fmt.tprintf("a delete below them changes nothing: %v (want [0 6])", d5.bookmarks[:]))
+				bm_chk(bad, inv(&d5), "...invariant holds")
+			}
+			bm_delete(&bad, BM_FIX, bm_set, bm_at, bm_invariant)
+
+			// --- a replace is ONE operation ------------------------------------------
+			//
+			// The shift used to be two procedures, and their COMPOSITION at a
+			// single offset was wrong even though each half was right on its own:
+			// the delete half collapses a bookmark sitting at the region's END
+			// down onto its START, and the insert half then declines to move an
+			// offset equal to the start, so the bookmark silently ended up naming
+			// the REPLACEMENT text.
+			//
+			// bm_invariant CANNOT see this -- every entry is still a real line
+			// start, just the wrong one. That is why every case here asserts the
+			// TEXT the bookmark names, read through the bookmark itself. A case
+			// that only checked offsets and the invariant would have stayed green
+			// through the whole bug, which is exactly what happened.
+			bm_replace :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), at: proc(d: ^Document, at, n: int) -> string, inv: proc(d: ^Document) -> bool) {
+				fmt.println("--- a replace is one operation ---")
+
+				// Alt+Down two lines above a bookmark. doc_move_lines is a single
+				// doc_replace_range over [6,20) that writes the same 14 bytes back
+				// in the other order, so "delta" must not move AT ALL. The broken
+				// version pulled it back to 6, where it named "charl".
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {20})
+					d.cursor, d.anchor = 6, 6 // on "bravo", two lines above the mark
+					doc_move_lines(&d, 1)
+					ok := len(d.bookmarks) == 1 && d.bookmarks[0] == 20 && at(&d, 0, 5) == "delta"
+					bm_chk(bad, ok, fmt.tprintf("Alt+Down above a bookmark leaves it on its own line: %v %q (want [20] \"delta\")", d.bookmarks[:], at(&d, 0, 5)))
+					bm_chk(bad, inv(&d), "...invariant holds -- and it held with the bug too, which is the point")
+				}
+
+				// Alt+Up, the mirror: the caret on "charlie" swaps it with "bravo"
+				// over the same region, and "delta" still must not move.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {20})
+					d.cursor, d.anchor = 12, 12 // on "charlie"
+					doc_move_lines(&d, -1)
+					ok := len(d.bookmarks) == 1 && d.bookmarks[0] == 20 && at(&d, 0, 5) == "delta"
+					bm_chk(bad, ok, fmt.tprintf("Alt+Up above a bookmark leaves it on its own line: %v %q (want [20] \"delta\")", d.bookmarks[:], at(&d, 0, 5)))
+					bm_chk(bad, inv(&d), "...invariant holds")
+				}
+
+				// Paste over a whole-line selection (Shift+Down or a triple-click,
+				// then Ctrl+V): "bravo\n" -> "XX\n" shortens the line by three
+				// bytes, so the bookmark on "charlie" lands on 9, not on 6 where
+				// "XX" now lives.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {12})
+					d.anchor, d.cursor = 6, 12 // exactly "bravo\n"
+					doc_replace_sel(&d, transmute([]u8)string("XX\n"), .Paste)
+					ok := len(d.bookmarks) == 1 && d.bookmarks[0] == 9 && at(&d, 0, 7) == "charlie"
+					bm_chk(bad, ok, fmt.tprintf("a paste over the line ABOVE moves the bookmark past the replacement: %v %q (want [9] \"charlie\")", d.bookmarks[:], at(&d, 0, 7)))
+					bm_chk(bad, inv(&d), "...invariant holds")
+				}
+
+				// The same edit through doc_replace_range, which is the path
+				// Replace All and a column edit take -- the selection is not
+				// involved, so this is a second reachable route to the same shape.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {12, 20})
+					doc_replace_range(&d, 6, 6, transmute([]u8)string("XX\n"), .Replace)
+					ok := len(d.bookmarks) == 2 && d.bookmarks[0] == 9 && d.bookmarks[1] == 17
+					bm_chk(bad, ok && at(&d, 0, 7) == "charlie" && at(&d, 1, 5) == "delta", fmt.tprintf("replace-all over a newline-terminated match: %v %q/%q (want [9 17] \"charlie\"/\"delta\")", d.bookmarks[:], at(&d, 0, 7), at(&d, 1, 5)))
+					bm_chk(bad, inv(&d), "...invariant holds")
+				}
+
+				// A replacement that does NOT end in a newline merges the
+				// bookmarked line onto the replacement's tail, so there is no line
+				// for the mark to sit on and it is dropped. Same conservatism as
+				// the Backspace-join case, and pinned here so it is a decision.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {12})
+					doc_replace_range(&d, 6, 6, transmute([]u8)string("XX"), .Replace)
+					bm_chk(bad, len(d.bookmarks) == 0, fmt.tprintf("a replacement with no trailing newline joins the line and drops it: %v (want [])", d.bookmarks[:]))
+					bm_chk(bad, inv(&d), "...invariant holds")
+				}
+
+				// A bookmark strictly BELOW the replaced region shifts by the size
+				// difference, not by the delete's -n or the insert's +m alone.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {20})
+					doc_replace_range(&d, 6, 6, transmute([]u8)string("XX\n"), .Replace)
+					ok := len(d.bookmarks) == 1 && d.bookmarks[0] == 17 && at(&d, 0, 5) == "delta"
+					bm_chk(bad, ok, fmt.tprintf("a bookmark below shifts by m-n: %v %q (want [17] \"delta\")", d.bookmarks[:], at(&d, 0, 5)))
+					bm_chk(bad, inv(&d), "...invariant holds")
+				}
+
+				// And undo puts the set back, since a replace is one undo step.
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					defer doc_close(&d)
+					set(&d, {12})
+					doc_replace_range(&d, 6, 6, transmute([]u8)string("XX"), .Replace)
+					doc_undo(&d)
+					ok := len(d.bookmarks) == 1 && d.bookmarks[0] == 12 && at(&d, 0, 7) == "charlie"
+					bm_chk(bad, ok, fmt.tprintf("undo of a replace restores the set: %v %q (want [12] \"charlie\")", d.bookmarks[:], at(&d, 0, 7)))
+				}
+			}
+			bm_replace(&bad, BM_FIX, bm_set, bm_at, bm_invariant)
+
+			// --- Encoding > LF/CRLF --------------------------------------------------
+			//
+			// doc_set_line_ending rewrites the whole buffer, so every bookmark
+			// inside it goes -- there is no correct shift without re-walking, and
+			// undo brings them back. What must NOT happen is the one this used to
+			// do: a bookmark on the TRAILING EMPTY LINE is at offset == length,
+			// outside the replaced range, and as a separate delete-then-insert it
+			// collapsed to 0 and stayed there. The user set no bookmark on line 1
+			// and got one.
+			bm_eol :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), inv: proc(d: ^Document) -> bool) {
+				fmt.println("--- LF -> CRLF ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+				set(&d, {12, 26}) // "charlie", and the trailing empty line at length
+
+				doc_set_line_ending(&d, .CRLF)
+				// 26 LF bytes -> 30 CRLF bytes; the trailing empty line is the new end.
+				ok := len(d.bookmarks) == 1 && d.bookmarks[0] == d.pt.length && d.pt.length == 30
+				bm_chk(bad, ok, fmt.tprintf("the trailing-line bookmark follows the end, and NOTHING lands on line 1: %v (want [%d])", d.bookmarks[:], d.pt.length))
+				bm_chk(bad, inv(&d), "...invariant holds")
+
+				doc_undo(&d)
+				back := len(d.bookmarks) == 2 && d.bookmarks[0] == 12 && d.bookmarks[1] == 26
+				bm_chk(bad, back, fmt.tprintf("undo restores the whole set: %v (want [12 26])", d.bookmarks[:]))
+			}
+			bm_eol(&bad, BM_FIX, bm_set, bm_invariant)
+
+			// --- undo / redo ---------------------------------------------------------
+			bm_undo :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), inv: proc(d: ^Document) -> bool) {
+				fmt.println("--- undo/redo ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+				set(&d, {12, 20})
+
+				d.anchor, d.cursor = 12, 20
+				doc_replace_sel(&d, nil, .Delete)
+				after := fmt.tprintf("%v", d.bookmarks[:])
+				doc_undo(&d)
+				bm_chk(bad, len(d.bookmarks) == 2 && d.bookmarks[0] == 12 && d.bookmarks[1] == 20, fmt.tprintf("undo restores the dropped bookmark: %v (want [12 20], was %s)", d.bookmarks[:], after))
+				bm_chk(bad, inv(&d), "...invariant holds")
+				doc_redo(&d)
+				bm_chk(bad, len(d.bookmarks) == 1 && d.bookmarks[0] == 12, fmt.tprintf("redo re-applies the drop: %v (want [12])", d.bookmarks[:]))
+
+				// A bookmark set AFTER an edit belongs to the state it was set in:
+				// undoing that edit must bring back the set as it was BEFORE it,
+				// not carry the newer one backwards.
+				d2 := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d2)
+				set(&d2, {12})
+				d2.cursor, d2.anchor = 0, 0
+				doc_insert_text(&d2, transmute([]u8)string("XY"), .Paste) // 12 -> 14
+				set(&d2, {0}) // a second bookmark, in the post-edit state
+				doc_undo(&d2)
+				bm_chk(bad, len(d2.bookmarks) == 1 && d2.bookmarks[0] == 12, fmt.tprintf("undo restores the set that belonged to the state: %v (want [12])", d2.bookmarks[:]))
+				doc_redo(&d2)
+				bm_chk(bad, len(d2.bookmarks) == 2 && d2.bookmarks[0] == 0 && d2.bookmarks[1] == 14, fmt.tprintf("redo restores the newer set: %v (want [0 14])", d2.bookmarks[:]))
+			}
+			bm_undo(&bad, BM_FIX, bm_set, bm_invariant)
+
+			// --- what is DRAWN -------------------------------------------------------
+			//
+			// The seam, not the unit: doc_bookmark_rects walks the same
+			// visible_begin/visible_next the draw does, so these assertions are
+			// about rows the document actually renders. A wrapped line is the case
+			// worth having -- its continuation rows have a `start` that is not the
+			// logical line start, and a mark on one of them would be a mark on a
+			// row the user reads as the middle of a sentence.
+			bm_marks :: proc(bad: ^int, fix: string, t: ^plat.Text, set: proc(d: ^Document, offs: []int)) {
+				fmt.println("--- the drawn marks ---")
+				px := BASE_PX
+				q: [32]plat.Quad
+
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+				d.view_cols = 80
+				set(&d, {6, 20})
+
+				n := doc_bookmark_rects(&d, t, px, 4, q[:])
+				okn := n == 2 && q[0].pos.y == row_rect_y(px, 1) && q[1].pos.y == row_rect_y(px, 3)
+				bm_chk(bad, okn, fmt.tprintf("one mark per bookmarked visible row: n=%d ys=%v/%v (want 2 at rows 1 and 3)", n, q[0].pos.y, q[1].pos.y))
+				bm_chk(bad, n == 2 && q[0].size.y == line_height(px), fmt.tprintf("a mark is one row tall: %v (want %v)", q[0].size.y, line_height(px)))
+
+				// Entirely left of where text begins, at any gutter width. This is
+				// the "do not add a second width" check: the mark is positioned
+				// against TEXT_MARGIN_X only, and col_x is the one definition of
+				// where column 0 starts, so asking col_x is how the two are kept
+				// from overlapping rather than comparing two literals.
+				cw := plat.text_char_width(t, px)
+				clear_of_text := n == 2 && q[0].pos.x >= 0 && q[0].pos.x + q[0].size.x <= col_x(cw, 0)
+				bm_chk(bad, clear_of_text, fmt.tprintf("the mark sits left of column 0: [%v,%v) vs col_x(0)=%v", q[0].pos.x, q[0].pos.x + q[0].size.x, col_x(cw, 0)))
+				// ...and with a filter-view gutter present it is still clear of it,
+				// since GUTTER_W only pushes column 0 further right.
+				saved := GUTTER_W
+				GUTTER_W = 40
+				n2 := doc_bookmark_rects(&d, t, px, 4, q[:])
+				bm_chk(bad, n2 == 2 && q[0].pos.x + q[0].size.x <= col_x(cw, 0), fmt.tprintf("...and still clear with a gutter: [%v,%v) vs col_x(0)=%v", q[0].pos.x, q[0].pos.x + q[0].size.x, col_x(cw, 0)))
+				GUTTER_W = saved
+
+				// Scrolled: only the bookmarks in view are drawn, at their row
+				// within the view rather than their row in the file.
+				d.top = 12
+				n3 := doc_bookmark_rects(&d, t, px, 2, q[:])
+				bm_chk(bad, n3 == 1 && q[0].pos.y == row_rect_y(px, 1), fmt.tprintf("scrolled: n=%d y=%v (want 1 at row 1)", n3, q[0].pos.y))
+
+				// A wrapped line gets exactly ONE mark, on its first visual row --
+				// and the line AFTER it is marked on the row it is actually drawn
+				// on, which is the assertion that pins the row walk to
+				// visible_next. A mark placed by counting newlines from doc.top
+				// (the obvious second implementation) puts "tail" on row 2 instead
+				// of row 9, because it cannot see that one logical line occupied
+				// eight visual rows.
+				//
+				// "head\n" is 0..4, the 300-'w' line starts at 5, its terminator is
+				// at 305, "tail" starts at 306. At 40 cells the long line is 8
+				// visual rows (1..8), so "tail" is row 9.
+				long := strings.repeat("w", 300, context.temp_allocator)
+				wsrc := fmt.tprintf("head\n%s\ntail\n", long)
+				w := doc_from_content(transmute([]u8)strings.clone(wsrc), "", .UTF8)
+				defer doc_close(&w)
+				w.wrap = true
+				w.view_cols = 40
+				set(&w, {5, 306})
+				nw := doc_bookmark_rects(&w, t, px, 12, q[:])
+				okw := nw == 2 && q[0].pos.y == row_rect_y(px, 1) && q[1].pos.y == row_rect_y(px, 9)
+				bm_chk(bad, okw, fmt.tprintf("a wrapped line is marked once and the next line lands on its real row: n=%d ys=%v/%v (want 2 at rows 1 and 9)", nw, q[0].pos.y, q[1].pos.y))
+			}
+
+			// --- the bindings and the dispatch ---------------------------------------
+			//
+			// Through resolve_key and command_dispatch, not by calling the doc
+			// procs: the claim is that Ctrl+F2 and F2/Shift+F2 DO these things.
+			// Shift+F2 is the case the whole command shape exists for -- it is not
+			// a second binding and cannot be, so if the dispatch ever stops reading
+			// ev.shift the two directions collapse into one and only this fails.
+			bm_dispatch :: proc(bad: ^int, fix: string, t: ^plat.Text) {
+				fmt.println("--- Ctrl+F2 / F2 / Shift+F2 ---")
+				bm_chk(bad, resolve_key(.F2, true, false, .Editor) == .Bookmark_Toggle, fmt.tprintf("Ctrl+F2 -> %v", resolve_key(.F2, true, false, .Editor)))
+				bm_chk(bad, resolve_key(.F2, false, false, .Editor) == .Bookmark_Cycle, fmt.tprintf("F2 -> %v", resolve_key(.F2, false, false, .Editor)))
+
+				// Adding F1-F12 to plat.Key took Alt+F4 away from Windows: before
+				// it, VK_F4 translated to .None and the pump fell through to
+				// DefWindowProc, which is what closes the window. Nothing in the
+				// type system could catch that -- the enum grew and every
+				// exhaustive switch still compiled. The rule lives in one
+				// predicate that the pump asks and this asserts, since driving the
+				// real wnd_proc needs an HWND and a message loop.
+				bm_chk(bad, plat.key_belongs_to_windows(.F4, true) && plat.key_belongs_to_windows(.F10, true), "Alt+F4 and F10 are handed back to Windows")
+				bm_chk(bad, !plat.key_belongs_to_windows(.F4, false) && !plat.key_belongs_to_windows(.F10, false), "...but a bare F4 / F10 is ordinary and stays bindable")
+				bm_chk(bad, !plat.key_belongs_to_windows(.F2, true) && !plat.key_belongs_to_windows(.Z, true), "...and Alt+F2 / Alt+Z are ours")
+
+				a: App
+				dummy: plat.Window
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				a.settings = settings_default()
+				ad := app_active(&a)
+				doc_insert_text(ad, transmute([]u8)fix, .Paste)
+				ad.cursor, ad.anchor = 0, 0
+
+				// Ctrl+F2 on three lines, reached the way the user reaches them.
+				for off in ([]int{0, 12, 20}) {
+					ad.cursor, ad.anchor = off, off
+					command_dispatch(resolve_key(.F2, true, false, .Editor), {.F2, true, false, false}, &a, &dummy, t, 10)
+				}
+				bm_chk(bad, len(ad.bookmarks) == 3, fmt.tprintf("Ctrl+F2 x3 sets three: %v", ad.bookmarks[:]))
+
+				ad.cursor, ad.anchor = 0, 0
+				cyc := resolve_key(.F2, false, false, .Editor)
+				command_dispatch(cyc, {.F2, false, false, false}, &a, &dummy, t, 10)
+				fwd := ad.cursor
+				command_dispatch(cyc, {.F2, false, true, false}, &a, &dummy, t, 10) // Shift+F2
+				back := ad.cursor
+				bm_chk(bad, fwd == 12 && back == 0, fmt.tprintf("F2 then Shift+F2: %d then %d (want 12 then 0 -- shift is read from the event, not the chord)", fwd, back))
+
+				// Ctrl+F2 again on a bookmarked line removes it.
+				ad.cursor, ad.anchor = 14, 14
+				command_dispatch(resolve_key(.F2, true, false, .Editor), {.F2, true, false, false}, &a, &dummy, t, 10)
+				bm_chk(bad, len(ad.bookmarks) == 2, fmt.tprintf("Ctrl+F2 again clears that line: %v", ad.bookmarks[:]))
+
+				// An empty set says so rather than leaving the key looking dead.
+				b: App
+				dummy2: plat.Window
+				app_new_scratch(&b)
+				defer app_destroy(&b)
+				b.settings = settings_default()
+				command_dispatch(cyc, {.F2, false, false, false}, &b, &dummy2, t, 10)
+				bm_chk(bad, app_notice_active(&b) && strings.contains(b.notice, "NO BOOKMARKS"), fmt.tprintf("F2 with no bookmarks posts a note: %q", b.notice))
+			}
+
+			// The two cases above need real font metrics (visible_next decides wrap
+			// through plat.Text). Loaded once here rather than per case.
+			{
+				t: plat.Text
+				if plat.text_load_faces(&t) {
+					bm_marks(&bad, BM_FIX, &t, bm_set)
+					bm_dispatch(&bad, BM_FIX, &t)
+				} else {
+					fmt.println("  FAIL no fonts loaded; cannot exercise the drawn marks or the dispatch")
+					bad += 1
+				}
+			}
+
+			// --- session format 5 ----------------------------------------------------
+			//
+			// Writes session.txt and backups in NEWTPAD_SESSION_DIR (hence the
+			// scratch guard at the top of the mode).
+			bm_session :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int)) {
+				fmt.println("--- session ---")
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				dir, _ := session_dir()
+				sp, _ := filepath.join({dir, "session.txt"}, context.temp_allocator)
+
+				// A CLEAN tab (reopened from disk) whose file has not changed.
+				clean := fmt.tprintf("%s%cnewtpad_bm_clean.txt", tmp, '\\')
+				plat.file_write_atomic(clean, transmute([]u8)fix)
+				{
+					a: App
+					defer app_destroy(&a)
+					if fd, ok := doc_open(clean); ok {
+						d := new(Document)
+						d^ = fd
+						set(d, {6, 20})
+						app_add(&a, d)
+					}
+					session_save(&a)
+				}
+				body, _ := os.read_entire_file(sp, context.temp_allocator)
+				bm_chk(bad, strings.contains(string(body), "newtpad-session 5") && strings.contains(string(body), " 6,20 "), fmt.tprintf("the line carries the set as one token: %q", strings.trim_space(string(body))))
+				{
+					b: App
+					defer app_destroy(&b)
+					session_restore(&b)
+					d := app_active(&b)
+					got := d != nil ? fmt.tprintf("%v", d.bookmarks[:]) : "<no tab>"
+					bm_chk(bad, d != nil && len(d.bookmarks) == 2 && d.bookmarks[0] == 6 && d.bookmarks[1] == 20, fmt.tprintf("a clean tab restores its bookmarks: %s (want [6 20])", got))
+				}
+
+				// ...and the same tab whose file CHANGED while we were closed drops
+				// them rather than restoring offsets onto shifted text.
+				//
+				// The replacement is chosen so that ONLY the stamp check can save
+				// it: 6 and 20 are still real line starts in the new file, so the
+				// per-entry line-start filter accepts them and the bookmarks come
+				// back pointing at two lines nobody marked. A first version of this
+				// case used a file with completely different line lengths, and it
+				// passed with the stamp check deleted -- the filter was doing the
+				// work and the assertion was proving the wrong thing. The size also
+				// differs (37 vs 26), which is the half of the stamp that does not
+				// depend on filesystem clock granularity.
+				plat.file_write_atomic(clean, transmute([]u8)string("AAAAA\nBBBBB\nCCCCCCC\nDDDDD\nEXTRA LINE\n"))
+				{
+					c: App
+					defer app_destroy(&c)
+					session_restore(&c)
+					d := app_active(&c)
+					got := d != nil ? fmt.tprintf("%v", d.bookmarks[:]) : "<no tab>"
+					bm_chk(bad, d != nil && len(d.bookmarks) == 0, fmt.tprintf("a changed disk stamp drops them: %s (want [])", got))
+				}
+
+				// A DIRTY tab restores from its backup, which is the buffer exactly
+				// as it was, so the offsets are good regardless of what the file on
+				// disk did.
+				{
+					a: App
+					defer app_destroy(&a)
+					d := new(Document)
+					d^ = doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+					set(d, {6, 12})
+					app_add(&a, d)
+					session_save(&a)
+				}
+				{
+					b: App
+					defer app_destroy(&b)
+					session_restore(&b)
+					d := app_active(&b)
+					got := d != nil ? fmt.tprintf("%v", d.bookmarks[:]) : "<no tab>"
+					bm_chk(bad, d != nil && len(d.bookmarks) == 2 && d.bookmarks[0] == 6 && d.bookmarks[1] == 12, fmt.tprintf("an untitled dirty tab restores from its backup: %s (want [6 12])", got))
+				}
+
+				// A hand-written format 4 line still loads -- the tolerant ladder.
+				// Written by hand because session_save can only produce the CURRENT
+				// format, so nothing else in this mode can prove an older one still
+				// reads (the shape §6z's viewmemtest fix used).
+				//
+				// The path deliberately CONTAINS A SPACE, and that is what makes
+				// this case able to fail. The field count is the argument to
+				// split_n, which caps the split rather than requiring it, so
+				// reading a v4 line with v5's count of 14 still works for a
+				// space-free path -- a first version of this case used one and
+				// passed with the ladder collapsed to `case ver >= 4: nf = 14`.
+				// With a space in the path that same collapse splits the path in
+				// two, the line comes back with 14 parts, and the tab is dropped.
+				v4 := fmt.tprintf("%s%cnewtpad bm v4.txt", tmp, '\\')
+				plat.file_write_atomic(v4, transmute([]u8)fix)
+				{
+					line := fmt.tprintf("12 12 0 0 0 -1 0 0 0 0 0 0 %s\n", v4)
+					plat.file_write_atomic(sp, transmute([]u8)fmt.tprintf("newtpad-session 4\nactive 0\n%s", line))
+					e: App
+					defer app_destroy(&e)
+					ok := session_restore(&e)
+					d := app_active(&e)
+					good := ok && d != nil && d.path == v4 && d.cursor == 12 && len(d.bookmarks) == 0
+					bm_chk(bad, good, fmt.tprintf("a v4 session still loads, with no bookmarks: ok=%v path=%q cursor=%d bookmarks=%v", ok, d != nil ? d.path : "", d != nil ? d.cursor : -1, d != nil ? d.bookmarks[:] : nil))
+				}
+
+				// A v5 line whose bookmark field is nonsense, out of order, or names
+				// something that is not a line start: each entry is dropped on its
+				// own and the tab still restores. 6 and 20 are line starts in the
+				// fixture; 7 is mid-line, 4 is out of order after 6, "zz" is not a
+				// number, and 9999 is past the end.
+				{
+					line := fmt.tprintf("0 0 0 0 0 -1 %d %d 0 0 0 0 7,6,4,zz,9999,20 %s\n", plat.file_stamp(v4).mtime, plat.file_stamp(v4).size, v4)
+					plat.file_write_atomic(sp, transmute([]u8)fmt.tprintf("newtpad-session 5\nactive 0\n%s", line))
+					f: App
+					defer app_destroy(&f)
+					ok := session_restore(&f)
+					d := app_active(&f)
+					good := ok && d != nil && len(d.bookmarks) == 2 && d.bookmarks[0] == 6 && d.bookmarks[1] == 20
+					bm_chk(bad, good, fmt.tprintf("a hand-edited bookmark field keeps only the valid, ascending line starts: %v (want [6 20])", d != nil ? d.bookmarks[:] : nil))
+				}
+
+				// A session that RECORDED a backup whose file is gone. The tab falls
+				// through to a reopen from disk, so the offsets are once again
+				// offsets against a file we did not write -- the stamp check has to
+				// run. Keying the gate off `bidx >= 0` ("a backup was recorded")
+				// rather than off "the backup loaded" skipped it, and a dirty tab
+				// whose backup was swept came back with marks measured against a
+				// buffer that no longer exists.
+				//
+				// bidx 99 has no backup file; the stamp fields are deliberately
+				// wrong, and 6 and 20 ARE line starts in the file, so only the stamp
+				// check can drop them.
+				{
+					line := fmt.tprintf("0 0 0 0 0 99 12345 999 0 0 0 0 6,20 %s\n", v4)
+					plat.file_write_atomic(sp, transmute([]u8)fmt.tprintf("newtpad-session 5\nactive 0\n%s", line))
+					h: App
+					defer app_destroy(&h)
+					ok := session_restore(&h)
+					d := app_active(&h)
+					good := ok && d != nil && d.path == v4 && len(d.bookmarks) == 0
+					bm_chk(bad, good, fmt.tprintf("a recorded-but-missing backup still gets the stamp check: ok=%v path=%q bookmarks=%v (want [])", ok, d != nil ? d.path : "", d != nil ? d.bookmarks[:] : nil))
+				}
+
+				// A path with spaces still splits correctly with the extra field in
+				// front of it -- the reason the bookmark token may never contain one.
+				spaced := fmt.tprintf("%s%cnewtpad bm spaced.txt", tmp, '\\')
+				plat.file_write_atomic(spaced, transmute([]u8)fix)
+				{
+					a: App
+					defer app_destroy(&a)
+					if fd, ok := doc_open(spaced); ok {
+						d := new(Document)
+						d^ = fd
+						set(d, {12})
+						app_add(&a, d)
+					}
+					session_save(&a)
+					g: App
+					defer app_destroy(&g)
+					session_restore(&g)
+					d := app_active(&g)
+					good := d != nil && d.path == spaced && len(d.bookmarks) == 1 && d.bookmarks[0] == 12
+					bm_chk(bad, good, fmt.tprintf("a path with spaces survives the new field: path=%q bookmarks=%v", d != nil ? d.path : "", d != nil ? d.bookmarks[:] : nil))
+				}
+
+				os.remove(clean)
+				os.remove(v4)
+				os.remove(spaced)
+				os.remove(sp)
+			}
+			bm_session(&bad, BM_FIX, bm_set)
+
+			fmt.printfln("bookmarktest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad matchmarkstest` — the find-match ticks on the vertical
+		// scrollbar (find.odin: find_mark_y / find_mark_cap / find_mark_rects).
+		//
+		// The claim that actually needs falsifying is NOT "a mark appears". It is
+		// that the quad count is bounded by the TRACK, not by the match count --
+		// a 200 MB log at MAX_MATCHES must cost a few hundred quads, not 100,000.
+		// A test that only checked mark positions would pass with the bucketing
+		// deleted, which is the exact failure mode this batch has already shipped
+		// three times, so the count is asserted directly and against a fixture
+		// that really does saturate MAX_MATCHES rather than a flag poked by hand.
+		//
+		// Three properties, each with its own sabotage:
+		//
+		//   1. BUCKETING  — N matches inside one pixel row are one quad, and the
+		//      output buffer (find_mark_cap) is never filled. Emitting one quad
+		//      per match breaks both.
+		//   2. MAPPING    — offset 0 lands on the track's top pixel and offset
+		//      pt.length flush with its bottom, one mark-height up. Dropping the
+		//      mark-height term draws the last tick past the end of the bar.
+		//   3. TRUNCATION — a saturated set is reported as partial AND the find
+		//      bar's counter carries the "+" that is the only thing on screen
+		//      saying so. The marks add no second convention, so removing that
+		//      "+" would leave an incomplete set looking complete.
+		if os.args[1] == "matchmarkstest" {
+			if !require_scratch_session("matchmarkstest") {return true}
+			// find_mark_rects reads g_theme; left at its zero value every quad
+			// would be transparent black and the colour assertion below could not
+			// tell Match_Mark from any other role.
+			g_theme = theme_dark()
+
+			mm_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			// Open find and type `q`, one rune at a time through the product's
+			// own entry point. Small buffers scan inline, so results are ready
+			// when this returns; large ones hand off to the worker, which is what
+			// find_wait is for.
+			mm_search :: proc(d: ^Document, q: string) {
+				find_open(d, false)
+				for r in q {find_input_rune(d, r)}
+				find_wait(d)
+			}
+
+			bad := 0
+
+			// --- the mapping, on its own ---------------------------------------------
+			//
+			// No Document: this is arithmetic, and testing it through a fixture
+			// would mean the endpoints depend on where a needle happened to land.
+			mm_mapping :: proc(bad: ^int) {
+				fmt.println("--- mapping ---")
+				TOP :: f32(100)
+				H :: f32(500)
+				MH :: f32(2)
+				y0 := find_mark_y(0, 1000, TOP, H, MH)
+				yend := find_mark_y(1000, 1000, TOP, H, MH)
+				ymid := find_mark_y(500, 1000, TOP, H, MH)
+				mm_chk(bad, y0 == TOP, fmt.tprintf("offset 0 lands on the track's top pixel: y=%.1f (want %.1f)", y0, TOP))
+				// The whole point of the mark-height term: without it the tick for
+				// the last byte is drawn at TOP+H, entirely below the track.
+				mm_chk(bad, yend == TOP + H - MH, fmt.tprintf("offset == pt.length lands flush with the bottom: y=%.1f (want %.1f)", yend, TOP + H - MH))
+				mm_chk(bad, ymid == TOP + H / 2, fmt.tprintf("halfway lands halfway: y=%.1f (want %.1f)", ymid, TOP + H / 2))
+				// Between an edit and the next find_merge, f.matches still holds
+				// offsets measured against the buffer as it was.
+				lo := find_mark_y(-50, 1000, TOP, H, MH)
+				hi := find_mark_y(9999, 1000, TOP, H, MH)
+				mm_chk(bad, lo == TOP && hi == TOP + H - MH, fmt.tprintf("stale offsets clamp into the track: %.1f, %.1f", lo, hi))
+				mm_chk(bad, find_mark_y(0, 0, TOP, H, MH) == TOP, "an empty buffer does not divide by zero")
+			}
+			mm_mapping(&bad)
+
+			// --- bucketing ------------------------------------------------------------
+			//
+			// 4000 bytes over a 100 px track: one pixel row is 40 bytes. Eight
+			// needles inside the first 40 bytes and one at byte 2000, so the
+			// answer is two marks from nine matches -- and the two rows are far
+			// enough apart that no rounding choice merges them.
+			mm_bucket :: proc(bad: ^int, search: proc(d: ^Document, q: string)) {
+				fmt.println("--- bucketing ---")
+				content := make([]u8, 4000)
+				for i in 0 ..< len(content) {content[i] = 'a'}
+				for off := 0; off < 32; off += 4 {content[off] = 'Q'} // 8 in row 0
+				content[2000] = 'Q' // row 50
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+				search(&d, "Q")
+
+				TRACK_H :: f32(100)
+				mc := find_mark_cap(&d, TRACK_H)
+				out := make([]plat.Quad, mc, context.temp_allocator)
+				n, partial := find_mark_rects(&d, 300, 16, 0, TRACK_H, out)
+
+				mm_chk(bad, len(d.find.matches) == 9, fmt.tprintf("the fixture really has 9 matches: %d", len(d.find.matches)))
+				mm_chk(bad, n == 2, fmt.tprintf("9 matches over 2 occupied pixel rows collapse to 2 marks: %d", n))
+				mm_chk(bad, !partial, "a complete set is not reported as partial")
+				if n == 2 {
+					mm_chk(bad, out[0].pos.y == 0 && out[1].pos.y == 50, fmt.tprintf("the two marks sit on rows 0 and 50: %.1f, %.1f", out[0].pos.y, out[1].pos.y))
+					mm_chk(bad, out[0].size == [2]f32{16, sx(MATCH_MARK_H_96)}, fmt.tprintf("a mark spans the bar's width at MATCH_MARK_H: %v", out[0].size))
+					mm_chk(bad, out[0].pos.x == 300, fmt.tprintf("marks start at the x they were given: %.1f", out[0].pos.x))
+					// Colour comes from a role, and from THIS role -- a literal or
+					// a borrowed role (Find_Match_Bg is the tempting one) would
+					// leave the tick invisible on the track it is drawn on.
+					mm_chk(bad, out[0].color == theme_dark()[.Match_Mark], fmt.tprintf("marks are drawn in Color_Role.Match_Mark: %v", out[0].color))
+				}
+				// The bound that makes the fixed buffer safe. With the bucketing
+				// removed this is n == mc, i.e. geometry silently dropped.
+				mm_chk(bad, n < mc, fmt.tprintf("the mark buffer is never filled: %d of %d", n, mc))
+			}
+			mm_bucket(&bad, mm_search)
+
+			// --- endpoints, through the real geometry ---------------------------------
+			//
+			// mm_mapping asserts the arithmetic; this asserts that find_mark_rects
+			// actually feeds it pt.length and the track it was handed.
+			mm_endpoints :: proc(bad: ^int, search: proc(d: ^Document, q: string)) {
+				fmt.println("--- endpoints ---")
+				content := make([]u8, 1000)
+				for i in 0 ..< len(content) {content[i] = 'a'}
+				content[0] = 'Q'
+				content[999] = 'Q' // the last byte in the buffer
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+				search(&d, "Q")
+
+				TRACK_TOP :: f32(60)
+				TRACK_H :: f32(200)
+				out := make([]plat.Quad, find_mark_cap(&d, TRACK_H), context.temp_allocator)
+				n, _ := find_mark_rects(&d, 0, 16, TRACK_TOP, TRACK_H, out)
+				mh := sx(MATCH_MARK_H_96)
+				mm_chk(bad, n == 2, fmt.tprintf("two matches, two rows, two marks: %d", n))
+				if n == 2 {
+					mm_chk(bad, out[0].pos.y == TRACK_TOP, fmt.tprintf("the first byte's mark is at the track top: %.1f (want %.1f)", out[0].pos.y, TRACK_TOP))
+					mm_chk(
+						bad,
+						out[1].pos.y == TRACK_TOP + TRACK_H - mh,
+						fmt.tprintf("the last byte's mark is flush with the track bottom: %.1f (want %.1f)", out[1].pos.y, TRACK_TOP + TRACK_H - mh),
+					)
+					mm_chk(bad, out[1].pos.y + out[1].size.y <= TRACK_TOP + TRACK_H, "no mark is drawn past the end of the track")
+				}
+			}
+			mm_endpoints(&bad, mm_search)
+
+			// --- nothing to mark ------------------------------------------------------
+			//
+			// find_mark_cap returning 0 is what keeps render_frame from allocating
+			// a per-frame buffer on every one of the frames where the find bar is
+			// shut, which is nearly all of them.
+			mm_empty :: proc(bad: ^int, search: proc(d: ^Document, q: string)) {
+				fmt.println("--- nothing to mark ---")
+				content := make([]u8, 1000)
+				for i in 0 ..< len(content) {content[i] = 'a'}
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+
+				TRACK_H :: f32(200)
+				mm_chk(bad, find_mark_cap(&d, TRACK_H) == 0, "find shut: no buffer is asked for")
+				out: [8]plat.Quad
+				n0, _ := find_mark_rects(&d, 0, 16, 0, TRACK_H, out[:])
+				mm_chk(bad, n0 == 0, fmt.tprintf("find shut: nothing is drawn: %d", n0))
+
+				search(&d, "ZZZ") // no such text in the fixture
+				mm_chk(bad, len(d.find.matches) == 0, fmt.tprintf("the query really finds nothing: %d", len(d.find.matches)))
+				mm_chk(bad, find_mark_cap(&d, TRACK_H) == 0, "no matches: no buffer is asked for")
+				n1, _ := find_mark_rects(&d, 0, 16, 0, TRACK_H, out[:])
+				mm_chk(bad, n1 == 0, fmt.tprintf("no matches: nothing is drawn: %d", n1))
+			}
+			mm_empty(&bad, mm_search)
+
+			// --- a saturated result set -----------------------------------------------
+			//
+			// 200,000 matches against MAX_MATCHES = 100,000, over a buffer past
+			// SEARCH_SYNC_MAX so this goes through the worker exactly as the real
+			// thing does. This is the case the whole design exists for: the mark
+			// count must be a property of the track, and the incompleteness must
+			// reach the screen.
+			mm_truncated :: proc(bad: ^int, search: proc(d: ^Document, q: string)) {
+				fmt.println("--- a saturated result set ---")
+				N :: 200_000
+				content := make([]u8, N * 2)
+				for i in 0 ..< N {
+					content[i * 2] = 'a'
+					content[i * 2 + 1] = 'b'
+				}
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+				search(&d, "ab")
+
+				mm_chk(bad, d.pt.length > SEARCH_SYNC_MAX, fmt.tprintf("the fixture goes through the WORKER, not the inline scan: %d bytes", d.pt.length))
+				mm_chk(bad, len(d.find.matches) == MAX_MATCHES && d.find.truncated, fmt.tprintf("MAX_MATCHES saturated: %d matches, truncated=%v", len(d.find.matches), d.find.truncated))
+
+				TRACK_H :: f32(700)
+				mc := find_mark_cap(&d, TRACK_H)
+				// DELIBERATELY oversized: one slot per match, not find_mark_cap's.
+				// Sized to the cap, `n <= cap` is a statement about the buffer and
+				// not about the bucketing -- with the dedupe deleted it still held,
+				// because find_mark_rects stops at len(out). That is the assertion
+				// that cannot fail, and it passed green through the first sabotage
+				// run of this very test. Given room for one quad per match, the
+				// count is free to be wrong, so the bound below means something.
+				out := make([]plat.Quad, len(d.find.matches), context.temp_allocator)
+				n, partial := find_mark_rects(&d, 0, 16, 0, TRACK_H, out)
+
+				// The headline: quads scale with the bar, not with the file.
+				mm_chk(bad, n <= int(TRACK_H) + 2, fmt.tprintf("100,000 matches cost %d quads with room for %d, bounded by the %.0f px track", n, len(out), TRACK_H))
+				mm_chk(bad, n * 100 < len(d.find.matches), fmt.tprintf("...which is under 1%% of one-quad-per-match: %d vs %d", n, len(d.find.matches)))
+				// The published prefix covers the first half of the buffer, so
+				// the marks fill the top half of the track and stop.
+				mm_chk(bad, n >= 340 && n <= 352, fmt.tprintf("the marks really cover the scanned half of the track: %d rows (want ~350)", n))
+				// ...and what render_frame would actually have allocated is enough
+				// for that count with room to spare.
+				mm_chk(bad, n < mc, fmt.tprintf("find_mark_cap's buffer would not have filled: %d of %d", n, mc))
+
+				// Ascending and unique -- the property the one-compare dedupe
+				// relies on, and the one that fails first if the mapping ever
+				// stops being monotonic in the offset.
+				ok_order := true
+				for i in 1 ..< n {
+					if i32(out[i].pos.y) <= i32(out[i - 1].pos.y) {ok_order = false}
+				}
+				mm_chk(bad, ok_order, "the marks come out in ascending, unique pixel rows")
+
+				// Incompleteness has to reach the user, and the marks deliberately
+				// do not say it themselves -- the find bar's counter does. If that
+				// "+" ever goes away this pairing is what notices.
+				mm_chk(bad, partial, fmt.tprintf("find_mark_rects reports the set as partial: %v", partial))
+				info := find_status_info(&d)
+				mm_chk(bad, strings.has_suffix(info, "+)"), fmt.tprintf("the find bar says the set is partial: %q", info))
+			}
+			mm_truncated(&bad, mm_search)
+
+			// The shape-A guard, which nothing observed until now: every other
+			// case here uses a 100/200/700 px track, and mark_bucket_h only
+			// coarsens above ~4094 px, so the whole guard could be deleted and
+			// this suite stayed green (found by the batch-9 whole-branch review).
+			// What it would let through: find_mark_cap clamps the buffer at
+			// plat.MAX_QUADS, find_mark_rects breaks on `n >= len(out)`, and
+			// every mark below ~4096 px is silently dropped -- a bounded pass
+			// reporting a confident wrong answer. So assert BOTH halves: the
+			// count stays inside the batch limit, AND the last mark still lands
+			// near the bottom of the track. The count alone passes with the
+			// guard removed; the reach is what actually catches it.
+			mm_tall_track :: proc(bad: ^int, search: proc(_: ^Document, _: string)) {
+				TRACK :: f32(8192) // past MAX_QUADS; a 8K panel is not far off
+				sb := strings.builder_make()
+				for i in 0 ..< 20000 {fmt.sbprintf(&sb, "q line %d\n", i)}
+				d := doc_from_content(sb.buf[:], "tall.txt", .UTF8)
+				defer doc_close(&d)
+				search(&d, "q")
+				cap := find_mark_cap(&d, TRACK)
+				out := make([]plat.Quad, max(cap, 1), context.temp_allocator)
+				n, _ := find_mark_rects(&d, 0, 10, 0, TRACK, out)
+				mm_chk(bad, n > 0, fmt.tprintf("a %.0f px track still emits marks: %d", TRACK, n))
+				mm_chk(bad, n <= plat.MAX_QUADS, fmt.tprintf("marks stay inside the quad batch limit: %d <= %d", n, plat.MAX_QUADS))
+				// Without the growing bucket the last mark stops at ~MAX_QUADS px.
+				last := out[n - 1].pos.y if n > 0 else 0
+				mm_chk(
+					bad,
+					last > TRACK*0.9,
+					fmt.tprintf("the last mark still reaches the bottom of the track: y=%.0f of %.0f", last, TRACK),
+				)
+			}
+			mm_tall_track(&bad, mm_search)
+
+			fmt.printfln("matchmarkstest: %d failures", bad)
 			return true
 		}
 

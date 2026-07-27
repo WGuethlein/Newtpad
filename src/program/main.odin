@@ -114,6 +114,10 @@ main :: proc() {
 	app: App
 	menu_init(&app.menu) // before any frame: the zero value means "File is open"
 	app.settings = settings_load()
+	// The user keymap overlay, before any frame can resolve a key. A missing or
+	// unreadable keys.txt leaves the defaults in force (keymap.odin).
+	keymap_load()
+	defer keymap_reset()
 	had_session := primary && session_exists()
 	// Restore is opt-out. Note the sweep guard below still protects the backups
 	// when it is off: they belong to tabs we chose not to adopt, so turning
@@ -460,7 +464,8 @@ main :: proc() {
 		}
 		if scrollbar_drag {
 			if window.mouse_down {
-				frac := (f32(window.mouse_y) - CHROME_TOP) / max(1, f32(window.height) - CHROME_TOP)
+				tt, th := scrollbar_track(doc, f32(window.height))
+				frac := (f32(window.mouse_y) - tt) / max(1, th)
 				doc_scroll_to_fraction(doc, &text, frac, rows)
 			} else {
 				scrollbar_drag = false
@@ -474,7 +479,8 @@ main :: proc() {
 		if md_preview_drag {
 			if window.mouse_down {
 				// Synced with the editor: the preview bar drives doc.top too.
-				frac := (f32(window.mouse_y) - CHROME_TOP) / max(1, f32(window.height) - CHROME_TOP)
+				tt, th := scrollbar_track(doc, f32(window.height))
+				frac := (f32(window.mouse_y) - tt) / max(1, th)
 				doc_scroll_to_fraction(doc, &text, frac, rows)
 			} else {
 				md_preview_drag = false
@@ -624,6 +630,23 @@ main :: proc() {
 				window.mouse_pressed = false
 				window.mouse_down = false
 			}
+		}
+
+		// Filter view: a press jumps to that line in the unfiltered document
+		// (HANDOFF §6h item 2). Before the caret handling below, which would
+		// otherwise place a caret inside the filtered row and leave the view
+		// filtered.
+		//
+		// The press is consumed either way while the view is actually filtering,
+		// including when it lands on the empty area past the last matching row:
+		// that means "none of these", and falling through would place the caret
+		// wherever doc_pos_at clamped the out-of-range row to. mouse_down goes
+		// with it so the next frames cannot turn the same gesture into a
+		// selection drag across the document the jump has just revealed.
+		if window.mouse_pressed && doc_filtering(doc) {
+			_ = find_filter_click(doc, &text, f32(window.mouse_x), f32(window.mouse_y), px, rows)
+			window.mouse_pressed = false
+			window.mouse_down = false
 		}
 
 		// Mouse: press places/extends the caret (double=word, triple=line); drag extends.
@@ -792,6 +815,9 @@ main :: proc() {
 			// d.disk_changed is set the user's edits won.
 			if !d.disk_changed {
 				theme_reapply_if_active(&app, d.path)
+				// And the keymap, for the same reason: editing keys.txt in another
+				// editor while Newtpad has it open should take effect here too.
+				keymap_reload_if_active(&app, d.path)
 			}
 			session_dirty = true
 		}
@@ -994,6 +1020,21 @@ ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool
 	return table || md_mode == .Preview || (md_mode == .Split && in_preview_half)
 }
 
+// The vertical scrollbar's track, in client pixels. ONE definition, consumed by
+// the thumb draw, the find-match marks, the Markdown Split preview bar and both
+// drag hit-tests — CLAUDE.md's "one layout per widget" applied to a widget that
+// had quietly grown five copies of `h - CHROME_TOP`.
+//
+// Subtracting the bottom bar is the fix, not a refinement: the status line (and
+// the taller find/replace bar) is drawn AFTER the scrollbar, opaque and full
+// width, so a track running to the window bottom has its last rows painted over.
+// That cost the thumb its last ~20px near the document end, and — since batch 9
+// — every match tick in the last 2.5% of the file (4.7% in replace mode), which
+// are exactly the off-screen matches the ticks exist to point at.
+scrollbar_track :: proc(doc: ^Document, winh: f32) -> (top, height: f32) {
+	return CHROME_TOP, max(1, winh - CHROME_TOP - doc_bottom_bar_h(doc))
+}
+
 hscrollbar_pos_at :: proc(b: Hbar, mx: f32, m: Hscroll) -> int {
 	frac := (mx - b.track_x - b.thumb_w * 0.5) / max(1, b.track_w - b.thumb_w)
 	return clamp(int(frac * f32(m.max) + 0.5), 0, m.max)
@@ -1098,6 +1139,25 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, ctop}, size = {TEXT_MARGIN_X, cbot - ctop}, color = g_theme[.Bg_Base]}})
 	}
 
+	// Bookmark marks, in the left margin. AFTER the H_SCROLL cover strip above,
+	// not with the selection/find quads behind the text: that strip repaints
+	// [0, TEXT_MARGIN_X) with the canvas colour whenever the view is panned
+	// horizontally, which is exactly the band these are drawn in -- so drawing
+	// them earlier would make every mark vanish the moment the user scrolls
+	// right. Skipped in the grid view, which has no text rows to mark.
+	// Skipped in every view that replaces the text pass, because the marks are
+	// positioned by the SOURCE line rows and those views lay out on a different
+	// model: the grid (table_draw) and full Markdown Preview (markdown_draw).
+	// Split is fine — the editor pass really runs in its left half. Preview was
+	// missed when this was written, and the stray ticks it produced sat in the
+	// left margin pointing at nothing.
+	if doc != nil && doc.kind == .Text && !doc.table && doc.md_mode != .Preview {
+		bmq: [80]plat.Quad
+		if nbq := doc_bookmark_rects(doc, text, px, rows, bmq[:]); nbq > 0 {
+			plat.quads_draw(gfx, quad_pipe, bmq[:nbq])
+		}
+	}
+
 	// Scrollbar (byte-proportional, below the tab strip) + caret. In Markdown Split
 	// the editor's scrollbar sits at the split, not the window edge (the preview's
 	// is drawn separately below).
@@ -1108,14 +1168,42 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	er := doc_editor_right(doc, w, rc.app.settings.split_frac)
 	total := doc.pt.length
 	if total > 0 && !doc.filter {
-		sb_h := h - CHROME_TOP
+		_, sb_h := scrollbar_track(doc, h)
 		th := clamp(f32(bottom - doc.top) / f32(total) * sb_h, sx(24), sb_h)
 		// Keep the thumb inside the track. Without the upper clamp it ran off the
 		// bottom of the window when doc.top sat near the end -- which force-wrapping
 		// makes common, since the last visible row of a wrapped line lands close to
 		// the document end.
 		ty := clamp(CHROME_TOP + f32(doc.top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
-		bars[nb] = {pos = {er - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = g_theme[.Bg_Raised]};nb += 1
+		track := plat.Quad{pos = {er - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = g_theme[.Bg_Raised]}
+		// Find-match ticks, drawn BETWEEN the track and the thumb.
+		//
+		// Under the thumb rather than over it, deliberately. No single colour
+		// reads strongly on both surfaces in Dark -- the track is near-black and
+		// the thumb is a pale grey -- and the marks the user actually needs are
+		// the ones OFF screen: every match the thumb covers is already on screen
+		// with its own highlight behind the text. The cost is that a file small
+		// enough to fit in the window hides its marks behind a full-height thumb,
+		// which is exactly the file that does not need them.
+		//
+		// Costs two extra quads_draw calls -- the marks' own, plus the track's,
+		// which can no longer share a batch with the thumb now that something is
+		// drawn between them -- and only while the find bar is open with matches.
+		// find_mark_cap returns 0 otherwise and this whole block is skipped,
+		// allocation included; measured on HANDOFF.md, 7 -> 9 calls with the bar
+		// open and 4 with it shut, which is what it was before this existed.
+		if mc := find_mark_cap(doc, sb_h); mc > 0 {
+			marks := make([]plat.Quad, mc, context.temp_allocator)
+			nmk, _ := find_mark_rects(doc, er - SCROLLBAR_W, SCROLLBAR_W, CHROME_TOP, sb_h, marks)
+			if nmk > 0 {
+				plat.quads_draw(gfx, quad_pipe, []plat.Quad{track})
+				plat.quads_draw(gfx, quad_pipe, marks[:nmk])
+			} else {
+				bars[nb] = track;nb += 1
+			}
+		} else {
+			bars[nb] = track;nb += 1
+		}
 		bars[nb] = {pos = {er - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = g_theme[.Text_Muted]};nb += 1
 	}
 	if caret {
@@ -1144,7 +1232,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// panes anchored to the same source line.
 		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.top)
 		if total > 0 {
-			sb_h := h - CHROME_TOP
+			_, sb_h := scrollbar_track(doc, h)
 			th := clamp(f32(pv_bottom - doc.top) / f32(total) * sb_h, sx(24), sb_h)
 			ty := clamp(CHROME_TOP + f32(doc.top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
 			plat.quads_draw(
@@ -1182,12 +1270,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// it no longer draws half under the menu or over the first matching line.
 		by := CHROME_TOP
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, by}, size = {w, FILTER_BANNER_H}, color = g_theme[.Filter_Bg]}})
-		msg := fmt.tprintf(
-			"FILTER  %d matching lines%s   —   Ctrl+L shows the whole file",
-			len(doc.filter_lines),
-			"" if doc_filtering(doc) else " (searching...)",
-		)
-		plat.text_draw(gfx, text, msg, sx(12), by + FILTER_BANNER_H - sx(7), UI_SMALL_PX, g_theme[.Filter_Text])
+		// filter_banner_text (find.odin) owns the wording, so "searching" and
+		// "no matching lines" cannot collapse into one string again.
+		plat.text_draw(gfx, text, filter_banner_text(doc), sx(12), by + FILTER_BANNER_H - sx(7), UI_SMALL_PX, g_theme[.Filter_Text])
 	}
 
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
@@ -1217,24 +1302,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		bar_h := sx(48) if f.replace_mode else sx(26)
 		bar := plat.Quad{pos = {0, h - bar_h}, size = {w, bar_h}, color = g_theme[.Bg_Panel]}
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{bar})
-		info: string
-		switch {
-		case len(f.query) == 0:
-			info = ""
-		case len(f.matches) > 0:
-			// "+" marks a partial result: we stopped at the match limit or the
-			// regex scan cap, so there may be more further down the file.
-			info = fmt.tprintf(" (%d/%d%s)", f.current + 1, len(f.matches), "+" if f.truncated else "")
-		case search_running(doc) && f.last_total > 0:
-			// Mid-restart after an edit: the matches are cleared but the search is
-			// still running, so the last published figure is the honest one. Saying
-			// "(no matches)" here made every replace flicker to zero.
-			info = fmt.tprintf(" (%d/%d%s)", f.last_current + 1, f.last_total, "+" if f.truncated else "")
-		case search_running(doc):
-			info = ""
-		case:
-			info = " (no matches)"
-		}
+		// One producer (find.odin), because the scrollbar's match marks are drawn
+		// from the same partial match list and rely on this "+" to say so.
+		info := find_status_info(doc)
 		mode := "regex" if f.regex else "text"
 		// The caret marks the focused field and reserves nothing in the other one.
 		// A blank placeholder here would keep the double gap that was the reported

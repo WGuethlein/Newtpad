@@ -7,6 +7,7 @@
 package main
 
 import "base:intrinsics"
+import "core:fmt"
 import "core:mem"
 import "core:text/regex"
 import "core:thread"
@@ -28,6 +29,84 @@ REGEX_LINE_SLACK :: 1 << 16 // extra bytes allowed to reach the block's line end
 // frame. Above it, the worker earns its keep.
 SEARCH_SYNC_MAX :: 256 << 10
 
+// ...and how much of a LARGER buffer the calling thread scans before handing the
+// rest to that worker, so the frame a keystroke produces already holds whatever
+// the head of the file contains. The worker resumes from the byte this stopped
+// on (Scan_State), so nothing is scanned or emitted twice.
+//
+// This is HANDOFF §6e's owed "pass 1" and the last thing owed against CLAUDE.md's
+// "no frame ever shows emptiness". The filter view is what needs it: it renders
+// filter_lines, so it has nothing at all to show until the search publishes, and
+// a viewport-scoped pass cannot help it because the filtered list is not
+// viewport-relative.
+//
+// THE BUDGET IS IN BYTES SCANNED AND IT IS SPENT WHETHER OR NOT ANYTHING WAS
+// FOUND. "Scan until the screen is full" is the unbounded main-thread scan that
+// roadmap item 1 removed -- a sparse query would walk a multi-GB file looking
+// for a sixtieth row. A partly filled first frame is the accepted outcome; a
+// frozen one is not.
+//
+// Bytes SCANNED, not bytes offered: a regex block runs on to the next newline,
+// and that run-on is scanned too, so on this bounded pass it is reserved out of
+// the budget rather than added on top of it (see scan_regex). It used to be added
+// on top, which made "64 KB" mean 131073 bytes on a file with no newline in it.
+// The regex path therefore covers ~48 KB of a first paint where the literal path
+// covers the whole 64 KB; the number is the cost, not the reach.
+//
+// **The number came from the measurement below, and the first number was wrong.**
+// `newtpad findtest`, section "--- the synchronous first-paint pass ---", times
+// find_recompute over two 8 MB buffers -- 60-byte lines, and the same filler with
+// no newline in it at all -- and fails the suite if any case exceeds a frame.
+// What it prints at this budget, -o:speed (the debug build is ~1.4x worse and
+// prints its own numbers from the same run):
+//
+//	                              60 B lines   no newlines
+//	literal, ordinary                0.10 ms       0.10 ms
+//	literal, matches constantly      0.11 ms       0.11 ms
+//	regex, ordinary                  0.29 ms       0.36 ms
+//	regex, scans every byte          2.39 ms       3.17 ms   <- [A-Za-z]+@[a-z]+
+//	regex, backtracks hard           7.80 ms      10.98 ms   <- (the|fox|dog)+x
+//
+// The rejected candidate was 256 KB -- the tidy answer, and the one this was
+// first written with, since it makes SEARCH_SYNC_MAX the only number in the file.
+// Set the constant to 256 KB and the same test reprints itself as (worst
+// fixture, -o:speed then debug):
+//
+//	regex, scans every byte         14.05 ms   /  20.89 ms
+//	regex, backtracks hard          47.19 ms   /  63.47 ms
+//
+// i.e. 84% of a frame for a pattern a person might plausibly type to find email
+// addresses, and nearly three frames for one that backtracks -- on every find
+// keystroke, on every file over 256 KB, and a held key delivers two or three
+// keystrokes into one frame.
+//
+// 64 KB is comfortable for the literal path (0.17 ms, 1% of a frame) and AT THE
+// EDGE for the regex one: a deliberately backtracking pattern is ~11 ms -o:speed
+// and ~15.5 ms in the debug build. If a first screen ever looks too thin in live
+// use, the two moves are opposite and both defensible -- raise the LITERAL budget
+// (it is nowhere near its own share), or cut the REGEX one (it is what sizes the
+// single number). Either one makes this a second, kind-dependent bound to keep
+// honest, which is why neither is here yet.
+//
+// What this is NOT is a bound on regex time in general: core:text/regex
+// backtracks, so a pathological pattern is slow per byte at any budget. That
+// exposure is pre-existing -- every buffer at or below SEARCH_SYNC_MAX is scanned
+// inline whole, and each of the worker's blocks costs the same per byte -- and
+// this deliberately does not widen it: below SEARCH_SYNC_MAX nothing changes, and
+// above it the inline share is a fraction of one block.
+//
+// The handoff is also one more BLOCK BOUNDARY per file, so HANDOFF 6d's "a
+// pattern spanning a block boundary won't match" gains one more instance. The
+// literal path cannot lose a match across it: the block is read with the
+// len(query)-1 overlap and the worker resumes at exactly the byte this pass
+// stopped issuing from (findtest plants a straddler at SEARCH_FIRST_PAINT - 4).
+// The regex path's boundary is a line end, so it carries the same caveat every
+// other block already does -- except on the no-newline shape above, where the
+// clamp puts it mid-line, which is what REGEX_LINE_SLACK has always meant on a
+// file whose lines are longer than the slack.
+SEARCH_FIRST_PAINT :: 64 << 10
+#assert(SEARCH_FIRST_PAINT <= SEARCH_SYNC_MAX) // or a "small" buffer would be split
+
 // A background search over a private view of the buffer.
 //
 // Mirrors Line_Index's lifecycle (done/cancel/fault as atomics, cancel-store +
@@ -44,8 +123,29 @@ SEARCH_SYNC_MAX :: 256 << 10
 // single writer and no lock. (Odin's intrinsics.atomic_store/load are
 // sequentially consistent, so the release/acquire pairing this needs is
 // implied; the entries are written before the count that publishes them.)
+// Where a bounded pass stopped, so the next one continues instead of starting
+// over. The inline first-paint pass and the worker are two passes over one scan:
+// no byte is read twice and no match is emitted twice, which is why the budget
+// costs nothing but the handoff. Both halves are asserted, and they need
+// different instruments: the emitted-twice half by the match counts in findtest,
+// the read-twice half by Search.swept -- a worker that starts over writes the
+// same values to the same indices and is invisible in the results.
+//
+// Both scans advance `pos` a whole block at a time and count newlines over
+// exactly the bytes they advance past, so `last_nl` and `nlines` are complete
+// for everything below `pos` and a resume needs nothing else. Plain fields, not
+// atomics: the inline pass has returned before the worker is created, and
+// nothing on the main thread reads these while the worker runs.
+Scan_State :: struct {
+	pos:     int, // first byte not yet scanned
+	n:       int, // matches emitted so far (the worker's private count)
+	last_nl: int, // offset of the last newline before pos, -1 if there is none
+	nlines:  int, // newlines passed before pos
+}
+
 Search :: struct {
 	view:       base.Piece_Table, // worker's private read view (worker only)
+	at:         Scan_State, // resume point (see Scan_State)
 	query:      []u8, // private copy; the find bar's buffer keeps mutating
 	regex:      bool,
 	matches:    []int, // fixed MAX_MATCHES capacity, written by index
@@ -53,7 +153,14 @@ Search :: struct {
 	line_start: []int, // line start of each match, computed here (see below)
 	line_no:    []int, // 1-based line number of each match, counted in the same pass
 	count:      int, // atomic: how many entries are published
-	scanned:    int, // atomic: bytes scanned, for progress
+	scanned:    int, // atomic: how far the scan has reached, for progress
+	// atomic: bytes the scans actually advanced over, ACCUMULATED across both
+	// passes. scanned is a position and a resume-from-zero would simply retrace
+	// it, so it cannot see one; this can, and "no byte is scanned twice" is
+	// otherwise a performance claim with nothing checking it (findtest asserts
+	// swept == pt.length once the search is done). One atomic add per 256 KB
+	// block is the whole cost.
+	swept:      int,
 	total:      int,
 	done:       bool, // atomic
 	cancel:     bool, // atomic
@@ -168,10 +275,12 @@ search_reset :: proc(doc: ^Document) {
 	}
 	intrinsics.atomic_store(&s.count, 0)
 	intrinsics.atomic_store(&s.scanned, 0)
+	intrinsics.atomic_store(&s.swept, 0)
 	intrinsics.atomic_store(&s.done, false)
 	intrinsics.atomic_store(&s.cancel, false)
 	intrinsics.atomic_store(&s.fault, false)
 	intrinsics.atomic_store(&s.truncated, false)
+	s.at = {pos = 0, n = 0, last_nl = -1, nlines = 0} // scan from the top again
 	s.total = doc.pt.length
 	s.regex = doc.find.regex
 
@@ -207,12 +316,25 @@ find_recompute :: proc(doc: ^Document) {
 	s.query = make([]u8, len(f.query))
 	copy(s.query, f.query[:])
 
-	if doc.pt.length <= SEARCH_SYNC_MAX {
-		// Small buffer: scan the live tree inline. No view, no thread.
-		scan_all(s, &doc.pt)
-	} else {
-		s.view = base.pt_view(&doc.pt)
-		s.th = thread.create_and_start_with_data(s, search_worker)
+	// One pass on this thread first, always, over the live tree — no view, no
+	// thread. A buffer at or below SEARCH_SYNC_MAX is finished outright by it,
+	// exactly as before; a larger one gets SEARCH_FIRST_PAINT bytes and leaves
+	// s.at at the byte the worker picks up from. Either way the find_merge below
+	// publishes what it found into this very frame. See SEARCH_FIRST_PAINT for
+	// the budget and the measurement behind it.
+	scan_all(s, &doc.pt, max(int) if doc.pt.length <= SEARCH_SYNC_MAX else SEARCH_FIRST_PAINT)
+	if !intrinsics.atomic_load(&s.done) {
+		if intrinsics.atomic_load(&s.fault) {
+			// The mapping changed underneath the inline pass. doc_fault_pending
+			// picks the flag up and recovers the document; handing the same
+			// buffer to a worker would only fault it again. Nothing further is
+			// coming, so say so rather than leave the UI polling (and find_wait
+			// spinning) for a search that will never publish.
+			intrinsics.atomic_store(&s.done, true)
+		} else {
+			s.view = base.pt_view(&doc.pt)
+			s.th = thread.create_and_start_with_data(s, search_worker)
+		}
 	}
 	find_merge(doc)
 }
@@ -220,7 +342,8 @@ find_recompute :: proc(doc: ^Document) {
 @(private = "file")
 search_worker :: proc(data: rawptr) {
 	s := (^Search)(data)
-	scan_all(s, &s.view)
+	// Unbounded: resumes at s.at.pos and runs to the end of the buffer.
+	scan_all(s, &s.view, max(int))
 }
 
 // Take whatever the worker has published into the document's view of the
@@ -236,26 +359,44 @@ find_merge :: proc(doc: ^Document) {
 	}
 	if s.matches == nil {return}
 
+	// `scanned` and `done` are read BEFORE `count`, and the order is load-bearing.
+	// A scan stores count first and scanned/done after it, so a scanned read
+	// taken first is always covered by the count read that follows. Taken the
+	// other way round — or with `scanned` read where it is USED, with the whole
+	// merge body in between — a merge sees a count from before a block and a
+	// scanned from after it: a short prefix the jump below then treats as
+	// complete up to the caret, so it picks the match above instead of the one
+	// below. Measured, not theorised: reading them at the point of use put
+	// findtest's auto-select section red in 3 runs out of 10.
+	scanned := intrinsics.atomic_load(&s.scanned)
+	done := intrinsics.atomic_load(&s.done)
 	n := intrinsics.atomic_load(&s.count)
 	f.truncated = intrinsics.atomic_load(&s.truncated)
-	if n == f.merged {return}
+	// Nothing new AND nothing owed. The auto-select below can be waiting on the
+	// SCAN rather than on a result (see there), and the merge that finally makes
+	// it eligible may carry no new matches at all — a single match above the
+	// caret is published once and never again — so "no progress" is not on its
+	// own a reason to return while the jump is still pending.
+	if n == f.merged && f.jumped {return}
 
-	f.matches = s.matches[:n]
-	f.match_len = s.match_len[:n]
+	if n != f.merged {
+		f.matches = s.matches[:n]
+		f.match_len = s.match_len[:n]
 
-	// Filter view: one entry per matching line. Built from line starts the
-	// worker computed during its linear pass — deriving them here would mean
-	// pt_line_start per match, an uncapped backward scan on the main thread.
-	// Matches are sorted, so same-line matches are adjacent and dedupe is a
-	// comparison against the last line appended.
-	for i in f.merged ..< n {
-		ls := s.line_start[i]
-		if len(doc.filter_lines) == 0 || doc.filter_lines[len(doc.filter_lines) - 1] != ls {
-			append(&doc.filter_lines, ls)
-			append(&doc.filter_line_nos, s.line_no[i]) // for the filter gutter
+		// Filter view: one entry per matching line. Built from line starts the
+		// worker computed during its linear pass — deriving them here would mean
+		// pt_line_start per match, an uncapped backward scan on the main thread.
+		// Matches are sorted, so same-line matches are adjacent and dedupe is a
+		// comparison against the last line appended.
+		for i in f.merged ..< n {
+			ls := s.line_start[i]
+			if len(doc.filter_lines) == 0 || doc.filter_lines[len(doc.filter_lines) - 1] != ls {
+				append(&doc.filter_lines, ls)
+				append(&doc.filter_line_nos, s.line_no[i]) // for the filter gutter
+			}
 		}
+		f.merged = n
 	}
-	f.merged = n
 
 	// Select the caret-nearest match exactly once per query. Re-running this on
 	// every merge would yank the viewport around as later results arrive while
@@ -265,14 +406,31 @@ find_merge :: proc(doc: ^Document) {
 	// see all of them, so it must start and stay at the top. Setting `jumped` at
 	// open was not enough — every keystroke restarts the search, and the restart
 	// clears it.
-	if !f.jumped && n > 0 && !doc.filter {
+	//
+	// Reference the START of any selection, not the caret. Selecting a match
+	// leaves the caret at its end, so re-running this after a toggle (Ctrl+R,
+	// Ctrl+L) would pick the *next* match every time — the selection walked
+	// forward one match per keypress.
+	//
+	// And not until the scan has actually reached the caret. Matches publish in
+	// order, so a prefix that stops short of the caret CANNOT contain the match
+	// below it: firing there picks the last match above the caret and locks it
+	// in, which on screen is the viewport yanked to the top of a file the user
+	// had scrolled into. That used to be masked rather than handled — the first
+	// non-empty publication came from the worker's first 256 KB block — and the
+	// bounded first-paint pass (SEARCH_FIRST_PAINT) exposed it by publishing a
+	// 64 KB prefix first. So the wait is now explicit.
+	//
+	// Capped at SEARCH_BLOCK: a caret 200 MB down would otherwise hold the jump
+	// until the whole file had been scanned, and a jump that lands seconds after
+	// the keystroke is the very thing "once per query" exists to prevent. `done`
+	// is the other way out, for a scan that ended early (a fault): pick from
+	// whatever it managed to publish rather than never pick at all.
+	from := min(doc.cursor, doc.anchor)
+	reached := scanned >= min(from, SEARCH_BLOCK) || done
+	if !f.jumped && n > 0 && !doc.filter && reached {
 		f.jumped = true
 		f.current = 0
-		// Reference the START of any selection, not the caret. Selecting a match
-		// leaves the caret at its end, so re-running this after a toggle (Ctrl+R,
-		// Ctrl+L) would pick the *next* match every time — the selection walked
-		// forward one match per keypress.
-		from := min(doc.cursor, doc.anchor)
 		for m, i in f.matches {
 			if m >= from {
 				f.current = i
@@ -282,9 +440,10 @@ find_merge :: proc(doc: ^Document) {
 		find_select_current(doc)
 	}
 
-	// Sticky copy for the status text. Reached only on real progress (the
-	// n == f.merged guard above returns early otherwise), so a cleared array
-	// during a restart cannot overwrite these with zero.
+	// Sticky copy for the status text. Guarded on n > 0, so a cleared array
+	// during a restart cannot overwrite these with zero — the guard, not the
+	// early return above, is what carries that: this is now also reached on a
+	// merge with no new results while the jump is still pending.
 	//
 	// After the jump block, not before it: search_reset clears f.current to -1
 	// and f.jumped to false on every restart, so at the slice assignments above
@@ -311,6 +470,12 @@ find_scanned :: proc(doc: ^Document) -> int {
 	return intrinsics.atomic_load(&doc.search.scanned)
 }
 
+// Bytes the two passes actually swept, which equals the buffer length exactly
+// when the handoff worked. Test instrument; see Search.swept.
+find_swept :: proc(doc: ^Document) -> int {
+	return intrinsics.atomic_load(&doc.search.swept)
+}
+
 search_faulted :: proc(doc: ^Document) -> bool {
 	return intrinsics.atomic_load(&doc.search.fault)
 }
@@ -323,20 +488,25 @@ search_running :: proc(doc: ^Document) -> bool {
 
 // --- the scan itself (shared by the inline and worker paths) ---
 
-// Scan `pt` for s.query, publishing after each block. Tracks the most recent
-// newline as it goes so every match carries its line start; that costs nothing
-// here (the bytes are already in hand) and saves the main thread an unbounded
-// backward scan per match at merge time.
+// Scan `pt` for s.query from s.at, publishing after each block, and stop once
+// `upto` bytes of the buffer have been covered — `max(int)` for "all of it".
+// Tracks the most recent newline as it goes so every match carries its line
+// start; that costs nothing here (the bytes are already in hand) and saves the
+// main thread an unbounded backward scan per match at merge time.
+//
+// `done` is set only when the buffer really ran out, never when the budget did:
+// find_recompute reads it to decide whether a worker is still needed, and
+// find_wait spins on it.
 @(private = "file")
-scan_all :: proc(s: ^Search, pt: ^base.Piece_Table) {
+scan_all :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 	if pt.length == 0 || len(s.query) == 0 {
 		intrinsics.atomic_store(&s.done, true)
 		return
 	}
 	if s.regex {
-		scan_regex(s, pt)
+		scan_regex(s, pt, upto)
 	} else {
-		scan_literal(s, pt)
+		scan_literal(s, pt, upto)
 	}
 }
 
@@ -358,7 +528,7 @@ emit :: proc(s: ^Search, n: ^int, at, length, line_start, line_no: int) -> bool 
 }
 
 @(private = "file")
-scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table) {
+scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 	q := s.query
 	L := pt.length
 	ql := make([]u8, len(q))
@@ -369,23 +539,37 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table) {
 	buf := make([]u8, SEARCH_BLOCK + len(q) - 1)
 	defer delete(buf)
 
-	// nlines counts newlines passed, so the 1-based line number of a match is
-	// nlines+1. Counted here because the scan is already walking every byte —
-	// deriving it later would mean re-scanning the file per match.
-	n, last_nl, nlines := 0, -1, 0
-	pos := 0
-	for pos < L {
-		if intrinsics.atomic_load(&s.cancel) {return}
-		got := base.pt_read(pt, pos, buf[:min(len(buf), L - pos)])
-		if got == 0 {break}
+	// Resume where the last pass stopped. nlines counts newlines passed, so the
+	// 1-based line number of a match is nlines+1. Counted here because the scan
+	// is already walking every byte — deriving it later would mean re-scanning
+	// the file per match.
+	n, last_nl, nlines := s.at.n, s.at.last_nl, s.at.nlines
+	pos := s.at.pos
+	halted := false // cancel / fault / MAX_MATCHES: nothing more to publish here
+	ended := false // a read returned nothing: treat the buffer as exhausted
+	scan: for pos < L && pos < upto {
+		if intrinsics.atomic_load(&s.cancel) {
+			halted = true
+			break scan
+		}
+		// This pass's block, shortened when the budget ends inside one — so a
+		// budget that isn't a multiple of SEARCH_BLOCK is the budget and not the
+		// next multiple up.
+		bs := min(SEARCH_BLOCK, upto - pos)
+		got := base.pt_read(pt, pos, buf[:min(bs + len(q) - 1, L - pos)])
+		if got == 0 {
+			ended = true
+			break scan
+		}
 		if pt.fault {
 			pt.fault = false
 			intrinsics.atomic_store(&s.fault, true)
-			return
+			halted = true
+			break scan
 		}
-		last := pos + SEARCH_BLOCK >= L
+		last := pos + bs >= L
 		limit := got - len(q) + 1
-		if !last {limit = min(SEARCH_BLOCK, limit)}
+		if !last {limit = min(bs, limit)}
 		for k := 0; k < limit; k += 1 {
 			hit := true
 			for j in 0 ..< len(q) {
@@ -396,23 +580,34 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table) {
 			}
 			// Check before updating last_nl: a match starting on a '\n' belongs
 			// to the line that newline terminates, not the one it begins.
-			if hit && !emit(s, &n, pos + k, len(q), last_nl + 1, nlines + 1) {return}
+			if hit && !emit(s, &n, pos + k, len(q), last_nl + 1, nlines + 1) {
+				halted = true // emit published count/done/truncated itself
+				break scan
+			}
 			if buf[k] == '\n' {
 				last_nl = pos + k
 				nlines += 1
 			}
 		}
-		pos += SEARCH_BLOCK
+		was := pos
+		pos += bs
+		intrinsics.atomic_add(&s.swept, min(pos, L) - was) // see Search.swept
 		intrinsics.atomic_store(&s.count, n)
 		intrinsics.atomic_store(&s.scanned, min(pos, L))
 	}
+	s.at = {pos = pos, n = n, last_nl = last_nl, nlines = nlines}
+	if halted {return}
 	intrinsics.atomic_store(&s.count, n)
-	intrinsics.atomic_store(&s.scanned, L)
-	intrinsics.atomic_store(&s.done, true)
+	if ended || pos >= L {
+		intrinsics.atomic_store(&s.scanned, L)
+		intrinsics.atomic_store(&s.done, true)
+	} else {
+		intrinsics.atomic_store(&s.scanned, pos) // budget spent; a worker resumes
+	}
 }
 
 @(private = "file")
-scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table) {
+scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 	L := pt.length
 	heap := context.allocator
 	// One reusable block buffer: captures are slices into it, but the offsets are
@@ -435,33 +630,78 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table) {
 	ctx.temp_allocator = ctx.allocator
 	context = ctx
 
-	n, last_nl, nlines := 0, -1, 0
-	pos := 0
-	for pos < L {
-		if intrinsics.atomic_load(&s.cancel) {return}
-		end := pos + min(SEARCH_BLOCK, L - pos)
+	// Resume where the last pass stopped; see scan_literal for the same fields.
+	n, last_nl, nlines := s.at.n, s.at.last_nl, s.at.nlines
+	pos := s.at.pos
+	halted := false // cancel / fault / MAX_MATCHES: nothing more to publish here
+	ended := false // no bytes read, or an unusable pattern: the scan is over
+
+	// A block runs on past its end to the next newline so that a line is never
+	// split -- and THOSE BYTES ARE SCANNED TOO. On a bounded pass they therefore
+	// have to come OUT of the budget rather than sit on top of it: pt_line_end_cap
+	// returns pos+cap when it finds no '\n', so a file with no newline in its
+	// first 128 KB (minified JSON, a single-line log dump) made a 65536-byte
+	// budget read 131073 bytes -- twice the work the number was chosen against,
+	// and on a backtracking pattern twice a frame. The reservation is taken once,
+	// up front, so the loop keeps its whole-block shape instead of growing a tail
+	// of ever-smaller blocks at the budget's edge.
+	//
+	// A quarter of the budget, capped at REGEX_LINE_SLACK: enough for any line a
+	// log or a CSV has, and it scales if the budget is ever changed. The unbounded
+	// worker pass is untouched -- it has no budget to overrun, and leaving its
+	// block boundaries exactly where they were keeps every existing test's premise
+	// about them true.
+	slack := REGEX_LINE_SLACK
+	target := upto // where blocks stop being issued
+	if upto < L {
+		slack = min(REGEX_LINE_SLACK, (upto - pos) / 4)
+		target = upto - slack
+	}
+	scan: for pos < L && pos < target {
+		if intrinsics.atomic_load(&s.cancel) {
+			halted = true
+			break scan
+		}
+		// Shortened when the budget ends inside a block (scan_literal has the
+		// same line and the same reason). min(target, L) so max(int) can't
+		// overflow the addition below.
+		end := pos + min(SEARCH_BLOCK, min(target, L) - pos)
 		if end < L {
-			// Never split a line: run on to the next newline (bounded), and keep
-			// that newline with its line so end-of-line patterns still match.
-			end = min(base.pt_line_end_cap(pt, end, REGEX_LINE_SLACK) + 1, L)
+			// Never split a line: run on to the next newline (bounded by the
+			// slack reserved above), and keep that newline with its line so
+			// end-of-line patterns still match. A partial line would give this
+			// block's pattern a different answer than the resumed one.
+			//
+			// The clamp to `upto` is what makes the budget exact, and it bites
+			// only on the no-newline shape -- where the block was ending mid-line
+			// whatever we did, because there is no line end to find.
+			end = min(base.pt_line_end_cap(pt, end, slack) + 1, L, upto)
 		}
 		got := base.pt_read(pt, pos, buf[:end - pos])
-		if got == 0 {break}
+		if got == 0 {
+			ended = true
+			break scan
+		}
 		if pt.fault {
 			pt.fault = false
 			intrinsics.atomic_store(&s.fault, true)
-			return
+			halted = true
+			break scan
 		}
 
 		// Recompiled per block: compilation scales with the pattern, not the
 		// file, so it stays negligible next to the scan itself.
 		it, err := regex.create_iterator(string(buf[:got]), string(s.query), {.Case_Insensitive}, context.temp_allocator, context.temp_allocator)
 		if err != nil {
-			break // invalid pattern -> no matches
+			ended = true // invalid pattern -> no matches, and none are coming
+			break scan
 		}
 		c := 0 // newline-tracking cursor, walked forward to each match
 		for {
-			if intrinsics.atomic_load(&s.cancel) {return}
+			if intrinsics.atomic_load(&s.cancel) {
+				halted = true
+				break scan
+			}
 			cap, _, ok := regex.match_iterator(&it)
 			if !ok || len(cap.pos) == 0 {
 				break
@@ -473,7 +713,10 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table) {
 					nlines += 1
 				}
 			}
-			if !emit(s, &n, pos + ms, me - ms, last_nl + 1, nlines + 1) {return}
+			if !emit(s, &n, pos + ms, me - ms, last_nl + 1, nlines + 1) {
+				halted = true // emit published count/done/truncated itself
+				break scan
+			}
 		}
 		for ; c < got; c += 1 {
 			if buf[c] == '\n' {
@@ -481,14 +724,22 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table) {
 				nlines += 1
 			}
 		}
+		was := pos
 		pos += got
+		intrinsics.atomic_add(&s.swept, min(pos, L) - was) // see Search.swept
 		intrinsics.atomic_store(&s.count, n)
 		intrinsics.atomic_store(&s.scanned, min(pos, L))
 		mem.dynamic_arena_free_all(&arena)
 	}
+	s.at = {pos = pos, n = n, last_nl = last_nl, nlines = nlines}
+	if halted {return}
 	intrinsics.atomic_store(&s.count, n)
-	intrinsics.atomic_store(&s.scanned, L)
-	intrinsics.atomic_store(&s.done, true)
+	if ended || pos >= L {
+		intrinsics.atomic_store(&s.scanned, L)
+		intrinsics.atomic_store(&s.done, true)
+	} else {
+		intrinsics.atomic_store(&s.scanned, pos) // budget spent; a worker resumes
+	}
 }
 
 // --- navigation & replace ---
@@ -631,4 +882,238 @@ find_match_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: i
 		}
 	}
 	return n
+}
+
+// --- scrollbar match marks ---
+
+// Tick height, at 96 DPI. Two pixels, not one: sx() rounds and a one-pixel mark
+// on a 150% display stays one pixel, which reads as a rendering artifact rather
+// than as a mark.
+MATCH_MARK_H_96 :: f32(2)
+
+// The y of the tick for a match at byte `offset`, in window pixels.
+//
+// One producer for the mapping, and deliberately the SAME arithmetic the
+// scrollbar thumb uses (render_frame: CHROME_TOP + doc.top/total * sb_h),
+// including the same shape of clamp that keeps the thumb from running off the
+// bottom of the track. That is the whole reason this feature is cheap: the bar
+// is byte-proportional (HANDOFF 6b), so no line index is involved and a mark's
+// position is a division. If the thumb's mapping ever changes, this must change
+// with it or a tick will sit somewhere the thumb never travels.
+//
+// `total` is pt.length, so `offset == total` is a legal input and lands flush
+// with the bottom of the track rather than one mark-height past it. Offsets
+// outside [0, total] are clamped rather than trusted: between an edit and the
+// next find_merge, f.matches still holds offsets measured against the buffer as
+// it was, and one of them can exceed the buffer as it now is.
+find_mark_y :: proc(offset, total: int, track_top, track_h, mark_h: f32) -> f32 {
+	if total <= 0 {return track_top}
+	frac := clamp(f64(offset) / f64(total), 0, 1)
+	return clamp(track_top + f32(frac * f64(track_h)), track_top, track_top + track_h - mark_h)
+}
+
+// How many quads find_mark_rects can possibly emit for this track, and 0 when
+// it would emit none.
+//
+// Both halves are load-bearing. The 0 lets the caller skip the per-frame
+// allocation entirely when the find bar is shut or the query found nothing --
+// which is almost every frame. The bound is what makes the buffer safe: marks
+// are bucketed and the y is clamped into [track_top, track_top + track_h -
+// mark_h], so the number of DISTINCT buckets cannot exceed the number of
+// buckets in the track however many matches there are. A 200 MB log at
+// MAX_MATCHES emits one quad per occupied bucket, not 100,000 quads. The +2
+// covers the two truncations (track_top and the clamped bottom both rounding
+// into their own bucket).
+find_mark_cap :: proc(doc: ^Document, track_h: f32) -> int {
+	if doc == nil || !doc.find.active || len(doc.find.matches) == 0 || doc.pt.length <= 0 {return 0}
+	if track_h <= 0 {return 0}
+	return min(int(track_h) + 2, plat.MAX_QUADS)
+}
+
+// Height of one bucket, in pixels.
+//
+// One pixel on every display that exists: quads_draw clamps a call to
+// plat.MAX_QUADS (4096) instances, so a track taller than that would have its
+// last marks silently dropped -- a bounded pass reporting a confident wrong
+// answer, the shape that keeps recurring here (docs/development-loop.md 4).
+// Rather than leave that as a comment about how tall a window can be, the
+// bucket grows so the count cannot: at any real height this returns 1 and the
+// bucketing is exactly per-pixel-row, and past ~4000 px of track it coarsens
+// instead of losing marks off the bottom.
+@(private = "file")
+mark_bucket_h :: proc(track_h: f32) -> f32 {
+	return f32(int(max(track_h, 0)) / (plat.MAX_QUADS - 2) + 1)
+}
+
+// One quad per occupied pixel row of the scrollbar track (see mark_bucket_h for
+// the one case where a bucket is taller than a pixel), from however many matches
+// are published right now.
+//
+// The bucketing is the point, not a nicety: quads_draw takes a slice per call
+// and a 200 MB log with 50,000 matches would otherwise put 50,000 instances on
+// a bar a few hundred pixels tall, every frame, to draw a few hundred distinct
+// pixels. f.matches is sorted ascending and find_mark_y is monotonic in the
+// offset, so the rows come out in order and collapsing them costs one integer
+// compare against the last row emitted -- no set, no allocation.
+//
+// `partial` reports that the published set is a prefix (MAX_MATCHES saturated;
+// HANDOFF 6e). Nothing is drawn differently for it and that is a decision, not
+// an omission: the find bar's counter already appends "+" for exactly this
+// state (find_status_info), the bar is on screen whenever these marks are --
+// both require find.active -- and a second, wordless convention on the track
+// would be the same sentence in a language the user has not been taught. It is
+// returned so the caller and matchmarkstest can see the state rather than
+// having to infer it from the mark count.
+find_mark_rects :: proc(doc: ^Document, x, w, track_top, track_h: f32, out: []plat.Quad) -> (n: int, partial: bool) {
+	if doc == nil {return 0, false}
+	f := &doc.find
+	partial = f.truncated
+	if !f.active || len(f.matches) == 0 || doc.pt.length <= 0 || track_h <= 0 {return 0, partial}
+
+	col := g_theme[.Match_Mark]
+	mark_h := sx(MATCH_MARK_H_96)
+	bucket := mark_bucket_h(track_h)
+	last_row := min(i32)
+	for m in f.matches {
+		if n >= len(out) {break} // unreachable at find_mark_cap's size; see its comment
+		y := find_mark_y(m, doc.pt.length, track_top, track_h, mark_h)
+		row := i32((y - track_top) / bucket)
+		if row == last_row {continue}
+		last_row = row
+		out[n] = {pos = {x, y}, size = {w, mark_h}, color = col}
+		n += 1
+	}
+	return n, partial
+}
+
+// --- the filter view ---
+
+// The search that fills filter_lines has not finished: either the scan itself is
+// still going, or an edit invalidated the results and the restart is pending.
+//
+// Deliberately NOT search_running: s.th stays non-nil after a worker finishes on
+// its own (only search_stop nils it), so that one answers "should the main loop
+// keep polling", which stays true for a while after the last result has landed.
+// This one has to be able to say the search is over.
+filter_searching :: proc(doc: ^Document) -> bool {
+	return doc.find.dirty || !intrinsics.atomic_load(&doc.search.done)
+}
+
+// What the filter banner says. One producer, so the states it has to keep apart
+// are something a test can hold rather than a format string inside render_frame.
+//
+// The middle state is the whole point. Filter view renders filter_lines, and an
+// EMPTY filter_lines is two different facts: the search has not reached a match
+// yet, or the file has none. This said "0 matching lines (searching...)" for
+// both — so a query that genuinely matched nothing claimed to be searching
+// forever, and a query whose first match sits 200 MB in looked exactly like one
+// with no matches at all. The bounded first-paint pass (SEARCH_FIRST_PAINT)
+// makes the second state far rarer; it cannot make it impossible, which is why
+// the wording has to be honest rather than hopeful.
+filter_banner_text :: proc(doc: ^Document) -> string {
+	state: string
+	switch {
+	case doc_filtering(doc):
+		state = fmt.tprintf("%d matching lines", len(doc.filter_lines))
+	case len(doc.find.query) == 0:
+		// Ctrl+L arms the filter before anything is typed; nothing is missing.
+		state = "type to filter"
+	case filter_searching(doc):
+		state = "searching..."
+	case:
+		state = "no matching lines"
+	}
+	return fmt.tprintf("FILTER  %s   —   Ctrl+L shows the whole file", state)
+}
+
+// Turn the filter view on or off.
+//
+// One path, so "leaving filter mode" means exactly one thing wherever it is
+// reached from -- the Ctrl+L command and find_filter_click below. A second
+// teardown beside this one is how the two drift apart on what has to be reset.
+//
+// The block_clear is the half that is easy to leave out. A rectangle made before
+// the toggle names rows by the buffer's own logical lines (block.odin never
+// walks the filtered view), which is a different, non-contiguous set of rows the
+// instant filter view turns on -- and, coming back the other way, a rectangle
+// built while filtered would name rows the unfiltered document interleaves with
+// everything between them. block_extend already refuses to CREATE a rectangle
+// while doc.filter is set; this is the other half: drop one that already exists
+// rather than let it silently edit rows the user can no longer see. block.odin's
+// own edit paths refuse under doc.filter too (belt and braces), but this is the
+// one place that actually removes the stale selection the user would otherwise
+// still see highlighted. Gated on the state actually changing so that setting
+// the filter to what it already is stays a no-op.
+//
+// Leaving filter view also SPENDS the once-per-query auto-select, and that half
+// is the one with a bug attached. find_merge gates the jump on !doc.filter, so a search
+// that STARTED filtered (Ctrl+L, then type) has never fired it -- and the first
+// merge after doc.filter goes false fires it, replacing the caret with a
+// selection of a match somewhere else. main.odin runs that merge later in the
+// very frame the click ran in, so find_filter_click's post-condition did not
+// survive its own frame: click a filtered row while the search is still
+// publishing, type one character, and it overwrites the matched word.
+// Leaving filter view is itself a caret placement -- by the click, or by the
+// user's own caret that Ctrl+L returns to -- so the jump is spent, not pending.
+// (`.Filter_Open` already does this on the way in, for the same reason.)
+find_set_filter :: proc(doc: ^Document, on: bool) {
+	was := doc.filter
+	doc.filter = on
+	doc.filter_top = 0
+	if was != on && block_active(doc) {block_clear(doc)}
+	if was && !on {doc.find.jumped = true}
+}
+
+// A press in the filter view jumps to the line it landed on, in the unfiltered
+// document (HANDOFF 6h item 2). Reports whether it did: false means the press
+// fell on the empty area past the last matching row, where there is no line to
+// jump to and the caller must not fall through to placing a caret in a view it
+// is about to leave.
+//
+// `mx` is taken and deliberately unused. A filter row is chosen by its ROW
+// alone, so a press in the line-number gutter selects the same line as a press
+// in the text -- which is the assertion (findtest) that goes red the moment
+// anyone reintroduces an x -> column step here, e.g. by reaching for doc_pos_at,
+// whose answer is an offset INTO the row rather than the line start this jumps
+// to. Taking the parameter is what lets the test press at both x positions and
+// demand the same answer.
+find_filter_click :: proc(doc: ^Document, t: ^plat.Text, mx, my, px: f32, rows: int) -> bool {
+	ls, hit := doc_filter_line_at(doc, t, my, px, rows)
+	if !hit {return false}
+	doc.cursor, doc.anchor = ls, ls
+	// Leaves filter mode through the one path (which also drops a live
+	// rectangle). The caret is brought on screen by the main loop's existing
+	// doc_ensure_cursor_visible, which fires because the cursor moved on this
+	// tab this frame and doc.filter is now false.
+	find_set_filter(doc, false)
+	return true
+}
+
+// --- the find bar's status text ---
+
+// The trailing "(current/total)" the find bar draws after the query.
+//
+// Extracted from render_frame so the "+" that marks an incomplete result set
+// has exactly one producer. The scrollbar match marks are drawn from the same
+// partial list and deliberately add no second indicator of their own, so this
+// string is the only thing on screen saying the set is a prefix -- which makes
+// it something a test can hold the marks against instead of a comment.
+find_status_info :: proc(doc: ^Document) -> string {
+	f := &doc.find
+	switch {
+	case len(f.query) == 0:
+		return ""
+	case len(f.matches) > 0:
+		// "+" marks a partial result: we stopped at the match limit, so there
+		// may be more further down the file.
+		return fmt.tprintf(" (%d/%d%s)", f.current + 1, len(f.matches), "+" if f.truncated else "")
+	case search_running(doc) && f.last_total > 0:
+		// Mid-restart after an edit: the matches are cleared but the search is
+		// still running, so the last published figure is the honest one. Saying
+		// "(no matches)" here made every replace flicker to zero.
+		return fmt.tprintf(" (%d/%d%s)", f.last_current + 1, f.last_total, "+" if f.truncated else "")
+	case search_running(doc):
+		return ""
+	}
+	return " (no matches)"
 }

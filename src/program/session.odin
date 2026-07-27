@@ -11,6 +11,11 @@
 //   active <index>
 //   <cursor> <anchor> <top> <wrap> <enc> <backupIndex|-1> <path...>
 // The path is the rest of the line (may contain spaces); -1 backup = clean tab.
+//
+// Every later format APPENDS fields ahead of the path and bumps the version;
+// the reader keeps a tolerant ladder so a session written by any older build
+// still restores (see session_restore's per-version field counts). Format 5's
+// field is the bookmark list.
 package main
 
 import "core:fmt"
@@ -22,6 +27,14 @@ import base "src:base"
 import plat "src:platform"
 
 MAX_SESSION_TABS :: 64
+
+// Bookmarks persisted per tab (format 5). A cap, not because anyone will hit it
+// -- every bookmark is one deliberate Ctrl+F2 -- but because this field is the
+// first unbounded-length thing in a session line, and session.txt is rewritten
+// on a ~2 s autosave timer. A run of the whole file bookmarked by some future
+// "bookmark all matches" command would otherwise put a megabyte on that timer.
+// Beyond the cap the extras are simply not written; the tab still restores.
+SESSION_BOOKMARKS_MAX :: 256
 
 // Largest buffer we snapshot into a crash-safe backup. A backup is a full
 // in-memory copy (pt_collect) plus a full write, on the main thread; for a
@@ -155,9 +168,29 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 		// of the same file would have done. table_delim is NOT persisted: it is
 		// re-derived from the path and first line by doc_view_apply, which is
 		// cheaper than a field that can go stale against the file.
+		// Bookmarks ride along too (format 5). Comma-separated with NO SPACES,
+		// which is the load-bearing part: the path is still "the rest of the
+		// line", so every field ahead of it has to be a single token or every
+		// later split index moves.
+		//
+		// "-" for an empty set is NOT load-bearing and is not claimed to be --
+		// strings.split_n emits an empty part for a doubled separator, so the
+		// positions would survive an empty token (sabotage-verified: removing
+		// the placeholder breaks nothing). It is here so a human reading
+		// session.txt sees a field rather than a gap, and so a field appended
+		// after it later is unambiguous by eye.
+		bm := strings.builder_make(context.temp_allocator)
+		for b, i in d.bookmarks {
+			if i >= SESSION_BOOKMARKS_MAX {break}
+			if i > 0 {strings.write_byte(&bm, ',')}
+			strings.write_int(&bm, b)
+		}
+		bm_field := strings.to_string(bm)
+		if bm_field == "" {bm_field = "-"}
+
 		fmt.sbprintf(
 			&tb,
-			"%d %d %d %d %d %d %d %d %d %d %d %d %s\n",
+			"%d %d %d %d %d %d %d %d %d %d %d %d %s %s\n",
 			d.cursor,
 			d.anchor,
 			d.top,
@@ -170,12 +203,13 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 			int(d.eol),
 			int(d.md_mode),
 			1 if d.table else 0,
+			bm_field,
 			d.path,
 		)
 		ti += 1
 	}
 
-	body := fmt.tprintf("newtpad-session 4\nactive %d\n%s", active_idx, strings.to_string(tb))
+	body := fmt.tprintf("newtpad-session 5\nactive %d\n%s", active_idx, strings.to_string(tb))
 	sp := pjoin({dir, "session.txt"})
 	if !plat.file_write_atomic(sp, transmute([]u8)body) {
 		return false
@@ -211,6 +245,51 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 // persists md_mode and it now asserts .Preview against a .Split family default,
 // which is the version that can actually fail. If a future format change makes
 // another of its values constant again, the case needs the same treatment.
+// Put a session line's bookmark field back onto a restored tab, or refuse to.
+//
+// A bookmark is a byte offset into a specific sequence of bytes, so it is only
+// meaningful against the file the session recorded. Three gates, in order:
+//
+//   - `from_backup` is the crash-safe copy of the buffer as we left it, so its
+//     offsets are exactly the ones that were written. Always trusted.
+//   - a clean tab is reopened from disk, so the offsets are only good if the
+//     file is byte-for-byte what it was. The recorded stamp against the stamp
+//     doc_open just took answers that, and a mismatch DROPS the whole set --
+//     the same "trust disk for clean" reasoning §6b used for the buffer itself.
+//     Restoring them anyway would put marks on lines nobody bookmarked, which
+//     is worse than losing them, because it is silent.
+//   - anything that is not a line start in the buffer that actually loaded is
+//     dropped individually. That is defence against a stamp that did not move
+//     (mtime granularity, a same-size in-place rewrite), and it is also what
+//     keeps doc.bookmarks' invariant true for a set that came off disk rather
+//     than out of the shift rules.
+//
+// Out-of-order or duplicate entries in the file are dropped by the same pass,
+// so a hand-edited session.txt cannot break the sorted-list assumption that
+// bookmark_find relies on.
+@(private = "file")
+session_restore_bookmarks :: proc(d: ^Document, field: string, stamp: plat.File_Stamp, from_backup: bool) {
+	if field == "" || field == "-" {return}
+	if !from_backup {
+		if !stamp.ok || !d.disk_stamp.ok {return}
+		if stamp.mtime != d.disk_stamp.mtime || stamp.size != d.disk_stamp.size {return}
+	}
+	prev := -1
+	rest := field
+	for tok in strings.split_iterator(&rest, ",") {
+		v, vok := strconv.parse_int(tok)
+		if !vok || v <= prev || v < 0 || v > d.pt.length {continue}
+		if v > 0 {
+			one: [1]u8
+			base.pt_read(&d.pt, v - 1, one[:])
+			if one[0] != '\n' {continue}
+		}
+		append(&d.bookmarks, v)
+		prev = v
+		if len(d.bookmarks) >= SESSION_BOOKMARKS_MAX {break}
+	}
+}
+
 session_restore :: proc(a: ^App) -> bool {
 	dir, ok := session_dir()
 	if !ok {
@@ -243,7 +322,9 @@ session_restore :: proc(a: ^App) -> bool {
 		// path is last and may contain spaces, so the split count is the field count
 		nf := 7
 		switch {
-		case ver >= 4:
+		case ver >= 5:
+			nf = 14
+		case ver == 4:
 			nf = 13
 		case ver == 3:
 			nf = 11
@@ -264,6 +345,7 @@ session_restore :: proc(a: ^App) -> bool {
 		have_eol := false
 		md_mode := Md_Mode.Off
 		table := false
+		bm_field := ""
 		path := ""
 		if ver >= 2 {
 			if len(parts) >= 8 {
@@ -288,7 +370,12 @@ session_restore :: proc(a: ^App) -> bool {
 						}
 						table = pint(parts[11]) != 0
 					}
-					path = parts[12] if len(parts) == 13 else ""
+					if ver >= 5 {
+						if len(parts) >= 13 {bm_field = parts[12]}
+						path = parts[13] if len(parts) == 14 else ""
+					} else {
+						path = parts[12] if len(parts) == 13 else ""
+					}
 				} else {
 					path = parts[10] if len(parts) == 11 else ""
 				}
@@ -301,10 +388,18 @@ session_restore :: proc(a: ^App) -> bool {
 
 		d := new(Document)
 		created := false
+		// "the session RECORDED a backup" (bidx >= 0) is not "the backup LOADED".
+		// A missing, swept or unreadable backup falls through to doc_open below,
+		// which is a reopen FROM DISK -- so everything that is only true of a
+		// restored buffer (the recorded BOM/EOL, and above all the bookmark
+		// offsets, which describe the bytes we wrote, not the bytes on disk) must
+		// key off this and not off bidx.
+		from_backup := false
 		if bidx >= 0 { // dirty/untitled: restore content from the backup
 			if content, cerr := os.read_entire_file(backup_path(backups, bidx), context.allocator); cerr == nil {
 				d^ = doc_from_content(content, path, enc)
 				created = true
+				from_backup = true
 			}
 		}
 		if !created && path != "" { // clean tab: reopen from disk
@@ -330,10 +425,11 @@ session_restore :: proc(a: ^App) -> bool {
 			// Same for the BOM and line endings, which doc_from_content does not set
 			// either. Only for the backup path: doc_open detected both from the real
 			// bytes and is authoritative for a clean tab.
-			if bidx >= 0 && have_eol {
+			if from_backup && have_eol {
 				d.had_bom = had_bom
 				d.eol = eol
 			}
+			session_restore_bookmarks(d, bm_field, stamp, from_backup)
 			slot := app_add(a, d)
 			if ti == active {active_slot = slot}
 			restored += 1

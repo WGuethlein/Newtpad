@@ -121,6 +121,51 @@ Key :: enum u16 {
 	Left, Right, Up, Down, Home, End, Page_Up, Page_Down,
 	Backspace, Delete, Enter, Tab, Escape,
 	Plus, Minus, // the =/+ and -/_ keys, and their numpad twins (zoom)
+	// The whole F1-F12 range, contiguous, even though only F2/Ctrl+F2 are bound
+	// today. Adding one at a time is how a key set acquires holes that the next
+	// feature re-discovers: before this, VK_F2 fell through vk_to_key to .None
+	// and every function key was silently swallowed by the message pump.
+	// F10 is the one to know about: Windows treats a bare F10 as the menu-bar
+	// activation key and delivers it as WM_SYSKEYDOWN, so key_belongs_to_windows
+	// below hands it straight back to DefWindowProc. It is translated but never
+	// queued, and keys.txt refuses to bind it for that reason.
+	F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
+}
+
+// Chords the OS owns, which must reach DefWindowProc instead of the key queue.
+// `sys` is "this arrived as WM_SYSKEYDOWN", which is how Windows delivers a
+// key pressed with Alt held, and a bare F10.
+//
+// This exists because adding F1–F12 to `Key` above SILENTLY BROKE Alt+F4. The
+// pump's rule is "translate and queue what we recognize, let DefWindowProc
+// handle the rest", and Alt+F4 / F10 were previously "the rest" only because
+// vk_to_key returned .None for them — an accident of the key set, not a
+// decision. The moment VK_F4 translated, Alt+F4 was queued and swallowed, and
+// the window stopped closing. Nothing in the type system could catch that: the
+// enum grew, every exhaustive switch still compiled.
+//
+// Deliberately a named predicate rather than an inline condition in wnd_proc,
+// so the rule can be asserted from a headless test (keytest) — the pump itself
+// needs a real HWND and a message loop, which this environment cannot drive.
+//
+// Only the two: Alt+Space is VK_SPACE, which has no Key at all, and Alt+Tab
+// and Ctrl+Alt+Del never reach an application window.
+key_belongs_to_windows :: proc "contextless" (key: Key, sys: bool) -> bool {
+	if !sys {return false} // a bare F4 or F10 is ordinary and stays bindable
+	return key == .F4 || key == .F10 // Alt+F4 closes; F10 opens the system menu
+}
+
+// The same question asked from a CHORD rather than from a message, for callers
+// that never see a WM_ at all -- the keys.txt parser, which has to refuse
+// `alt+f4 = ...` and `f10 = ...` rather than accept a binding the pump will
+// swallow before the lookup ever runs.
+//
+// The translation is one fact the parser cannot know: Alt held means
+// WM_SYSKEYDOWN by definition, and Windows also delivers a BARE F10 that way
+// because it is the menu-bar activation key. Kept here, next to the pump that
+// relies on it, so there is still exactly one list of the keys Windows owns.
+key_chord_belongs_to_windows :: proc "contextless" (key: Key, alt: bool) -> bool {
+	return key_belongs_to_windows(key, alt || key == .F10)
 }
 
 // A raw key press, drained once per frame. The program maps (key, modifiers) to
@@ -171,6 +216,11 @@ vk_to_key :: proc "contextless" (vk: win.WPARAM) -> Key {
 	}
 	if vk >= win.WPARAM('0') && vk <= win.WPARAM('9') {
 		return Key(u16(Key.Num0) + u16(vk - win.WPARAM('0')))
+	}
+	// VK_F1..VK_F12 are contiguous (0x70..0x7B), as are Key.F1..Key.F12, so the
+	// range translates the same way the letters and digits above do.
+	if vk >= win.WPARAM(win.VK_F1) && vk <= win.WPARAM(win.VK_F12) {
+		return Key(u16(Key.F1) + u16(vk - win.WPARAM(win.VK_F1)))
 	}
 	return .None
 }
@@ -746,7 +796,7 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		}
 		if w.alt_down {w.alt_used = true} // Alt is a modifier here, not a tap
 		key := vk_to_key(wparam)
-		if key == .None {
+		if key == .None || key_belongs_to_windows(key, msg == win.WM_SYSKEYDOWN) {
 			break
 		}
 		ctrl := (int(win.GetKeyState(win.VK_CONTROL)) & 0x8000) != 0

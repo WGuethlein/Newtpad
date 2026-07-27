@@ -7,6 +7,7 @@
 package main
 
 import "core:fmt"
+import "core:mem"
 import "core:path/filepath"
 import "core:strings"
 import "core:unicode/utf8"
@@ -68,6 +69,13 @@ Command_Id :: enum u8 {
 	Toggle_Wrap,
 	Toggle_Table,
 	Toggle_Preview,
+	Bookmark_Toggle,
+	// ONE cycle command, not a next/prev pair: Binding is (key, ctrl, alt, ctx)
+	// and shift is not part of a chord (see Binding's own comment and the
+	// Ctrl+Alt+S scar below), so F2 and Shift+F2 cannot be two rows. The
+	// direction is read off ev.shift in the dispatch, exactly as
+	// doc_cursor_left(doc, ev.shift) reads it.
+	Bookmark_Cycle,
 	// command palette
 	Palette_Open,
 	Palette_Close,
@@ -108,6 +116,7 @@ Command_Id :: enum u8 {
 	Settings_Inc,
 	Settings_Dec,
 	Theme_Edit,
+	Keys_Edit,
 	Open_Logs_Folder,
 	// font page (Edit > Font)
 	Font_Open,
@@ -188,6 +197,8 @@ command_table := [Command_Id]Command {
 	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
 	.Toggle_Table             = {"Toggle Table View (CSV/TSV)", "View"},
 	.Toggle_Preview           = {"Toggle Markdown Preview / Split", "View"},
+	.Bookmark_Toggle          = {"Toggle Bookmark on This Line", "Cursor"},
+	.Bookmark_Cycle           = {"Go to Next Bookmark (Shift: Previous)", "Cursor"},
 	.Palette_Open             = {"Command Palette", "View"},
 	.Palette_Close            = {"Palette: Close", "View"},
 	.Palette_Confirm          = {"Palette: Confirm", "View"},
@@ -223,6 +234,7 @@ command_table := [Command_Id]Command {
 	.Settings_Inc             = {"Settings: Increase", "View"},
 	.Settings_Dec             = {"Settings: Decrease", "View"},
 	.Theme_Edit               = {"Edit Current Theme...", "View"},
+	.Keys_Edit                = {"Edit Keybindings...", "View"},
 	.Open_Logs_Folder         = {"Open Logs Folder", "View"},
 	.Font_Open                = {"Font...", "Edit"},
 	.Font_Close               = {"Font: Close", "Edit"},
@@ -309,6 +321,8 @@ default_bindings := []Binding {
 	{.Minus, true, false, .Editor, .Zoom_Out}, // Ctrl+- / Ctrl+numpad-
 	{.Num0, true, false, .Editor, .Zoom_Reset}, // Ctrl+0
 	{.P, true, false, .Editor, .Palette_Open}, // Ctrl+P
+	{.F2, true, false, .Editor, .Bookmark_Toggle}, // Ctrl+F2
+	{.F2, false, false, .Editor, .Bookmark_Cycle}, // F2 / Shift+F2 -- shift read in the action
 	// --- palette context ---
 	{.P, true, false, .Palette, .Palette_Close},
 	{.Escape, false, false, .Palette, .Palette_Close},
@@ -366,74 +380,65 @@ default_bindings := []Binding {
 // document. Used by the palette and the menu — the keymap is the only place that
 // knows the shortcuts, so anything that teaches them has to read it from here
 // rather than repeat them in a second table that can drift.
+// A user overlay changes the answer, so this reads the overlay too. Without
+// that, rebinding Save to Ctrl+J would leave every menu and palette row still
+// teaching Ctrl+S — a shortcut that no longer works. The keymap being the only
+// place that knows the shortcuts is exactly why this proc exists; consulting
+// only half of the keymap would reintroduce the drift it was written to stop.
+//
+// Three sources, in this order, and EVERY candidate — default or overlay — has
+// to answer the same question first: does this chord still resolve to this
+// command? A row that teaches a chord which now runs something ELSE is worse
+// than a row that teaches nothing, and a keys.txt can produce that from either
+// side (a later duplicate line beats an earlier one, so an overlay row is no
+// more self-evidently live than a default one).
+//
+//  1. THE DEFAULT EDITOR CHORD, IF IT STILL RESOLVES. The distinction that
+//     matters is between a keys.txt line that ADDS a chord and one that
+//     REPLACES it. `ctrl+k = Undo` leaves Ctrl+Z alone; the user asked for one
+//     more way in, not for the one they already know to be un-taught, so the
+//     menus keep saying Ctrl+Z. Unbinding Ctrl+Z, or giving it to Redo, makes
+//     this test fail — and then, and only then, the overlay's chord is what
+//     gets taught. "The overlay wins" alone would collapse the two cases.
+//  2. THE OVERLAY'S OWN ROW, last-wins inside the file (the order
+//     keymap_lookup resolves in). This is the answer for a rebind, and the
+//     only answer a command with no default chord at all can have —
+//     `ctrl+alt+o = Open_Link` is the whole reason the seed lists those.
+//  3. ANY OTHER CONTEXT'S DEFAULT, so mode-local commands (the find toggles)
+//     still teach their key instead of showing blank. Last, because an Editor
+//     chord is the one a user would press from the document.
+//
+// All three are no-ops with no keys.txt: an empty overlay makes resolve_key the
+// plain default lookup, and no two default_bindings rows share a (key, ctrl,
+// alt, ctx) — keymaptest pins that — so nothing can fail its own guard.
 command_chord :: proc(cmd: Command_Id, allocator := context.temp_allocator) -> string {
-	// Editor bindings first — that's the chord a user would press from the
-	// document. Falling back to any context so mode-local commands (the find
-	// toggles) still teach their key instead of showing blank.
-	for pass in 0 ..< 2 {
-		for b in default_bindings {
-			if b.cmd != cmd {continue}
-			if pass == 0 && b.ctx != .Editor {continue}
-			parts: [4]string
-			n := 0
-			if b.ctrl {parts[n] = "Ctrl+";n += 1}
-			if b.alt {parts[n] = "Alt+";n += 1}
-			parts[n] = key_name(b.key)
-			n += 1
-			return strings.concatenate(parts[:n], allocator)
-		}
+	if cmd == .None {return ""}
+	fmt_chord :: proc(b: Binding, allocator: mem.Allocator) -> string {
+		parts: [4]string
+		n := 0
+		if b.ctrl {parts[n] = "Ctrl+";n += 1}
+		if b.alt {parts[n] = "Alt+";n += 1}
+		parts[n] = key_name(b.key)
+		n += 1
+		return strings.concatenate(parts[:n], allocator)
+	}
+	for b in default_bindings {
+		if b.cmd != cmd || b.ctx != .Editor {continue}
+		if resolve_key(b.key, b.ctrl, b.alt, b.ctx) != cmd {continue}
+		return fmt_chord(b, allocator)
+	}
+	#reverse for e in g_keymap.entries {
+		if e.cmd != cmd {continue}
+		if resolve_key(e.key, e.ctrl, e.alt, e.ctx) != cmd {continue}
+		return fmt_chord(e, allocator)
+	}
+	for b in default_bindings {
+		if b.cmd != cmd || b.ctx == .Editor {continue}
+		if resolve_key(b.key, b.ctrl, b.alt, b.ctx) != cmd {continue}
+		return fmt_chord(b, allocator)
 	}
 	return ""
 }
-
-@(private = "file")
-key_name :: proc(k: plat.Key) -> string {
-	#partial switch k {
-	case .Left:
-		return "Left"
-	case .Right:
-		return "Right"
-	case .Up:
-		return "Up"
-	case .Down:
-		return "Down"
-	case .Home:
-		return "Home"
-	case .End:
-		return "End"
-	case .Page_Up:
-		return "PgUp"
-	case .Page_Down:
-		return "PgDn"
-	case .Backspace:
-		return "Backspace"
-	case .Delete:
-		return "Del"
-	case .Enter:
-		return "Enter"
-	case .Tab:
-		return "Tab"
-	case .Escape:
-		return "Esc"
-	case .Plus:
-		return "+"
-	case .Minus:
-		return "-"
-	}
-	// Letters and digits are contiguous in the enum, in order.
-	if k >= .A && k <= .Z {
-		return LETTERS[int(k) - int(plat.Key.A)][:]
-	}
-	if k >= .Num0 && k <= .Num9 {
-		return DIGITS[int(k) - int(plat.Key.Num0)][:]
-	}
-	return ""
-}
-
-@(private = "file")
-LETTERS := [26]string{"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"}
-@(private = "file")
-DIGITS := [10]string{"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"}
 
 // Show a save failure. Silence here is a data-loss bug: the user believes the
 // file was written, and in a release build (-subsystem:windows) stderr is gone.
@@ -480,6 +485,10 @@ save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -
 		// that makes tuning a theme possible without a rebuild. `path`, not
 		// doc.path: doc_save_err frees and reallocates doc.path.
 		theme_reapply_if_active(app, path)
+		// Same loop for the keymap: saving keys.txt re-reads it, so a binding can
+		// be tried without restarting. Both are called unconditionally and each
+		// checks the path itself.
+		keymap_reload_if_active(app, path)
 	}
 	return saved
 }
@@ -616,8 +625,19 @@ request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
 	app_close(app, slot)
 }
 
+// The user overlay (keys.txt, see keymap.odin) is consulted FIRST; only a chord
+// it does not mention falls through to default_bindings. The second return
+// value is load-bearing: an overlay entry whose command is .None means the user
+// unbound the chord, and returning .None *without* consulting the defaults is
+// the only way that can work.
+//
+// keymap_lookup answers only for .Editor, so every other context reaches the
+// defaults untouched by design (keymap.odin, rule 1).
 @(private = "file")
 lookup_binding :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
+	if cmd, found := keymap_lookup(key, ctrl, alt, ctx); found {
+		return cmd
+	}
 	for b in default_bindings {
 		if b.key == key && b.ctrl == ctrl && b.alt == alt && b.ctx == ctx {
 			return b.cmd
@@ -1077,6 +1097,24 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		block_extend_dispatch(app, doc, t, -1, 0)
 	case .Block_Extend_Down:
 		block_extend_dispatch(app, doc, t, 1, 0)
+	case .Bookmark_Toggle:
+		// No note on success: the mark appears in the margin on the caret's own
+		// row, which is on screen by definition, so a status line saying the
+		// same thing is noise. The refusal DOES get one -- it is the caret's
+		// line start being further than BOOKMARK_LINE_CAP away (one enormous
+		// line), the same bound and the same "say so rather than guess" as
+		// block_extend's .Caret_Unresolved, and a silent no-op reads as a dead
+		// key.
+		if _, ok := doc_bookmark_toggle(doc); !ok && doc != nil && doc.kind == .Text {
+			app_note(app, "[BOOKMARK UNAVAILABLE HERE - the line is too far into a very large file]")
+		}
+	case .Bookmark_Cycle:
+		// ev.shift is the direction. It is not in the chord and cannot be (see
+		// Bookmark_Cycle's comment on Command_Id), so this is the only place the
+		// two directions are distinguished.
+		if !doc_bookmark_cycle(doc, ev.shift) && doc != nil && doc.kind == .Text {
+			app_note(app, "[NO BOOKMARKS - press Ctrl+F2 to set one]")
+		}
 	case .Toggle_Wrap:
 		doc.wrap = !doc.wrap
 		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start
@@ -1308,6 +1346,8 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		app_open_special(app, .Settings)
 	case .Theme_Edit:
 		theme_edit_current(app)
+	case .Keys_Edit:
+		keymap_edit_current(app)
 	case .Open_Logs_Folder:
 		// Logging has been on by default since 0.9.0 and had no command, no menu
 		// entry and no mention anywhere in the UI -- the audit found a working
@@ -1380,18 +1420,11 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// so on a large file there are none for the first frames — gating here
 		// made Ctrl+L do nothing at exactly the moment it was most wanted. The
 		// view falls back to unfiltered until matches exist (doc_filtering).
-		doc.filter = !doc.filter
-		doc.filter_top = 0
-		// A rectangle made before Ctrl+L names rows by the buffer's own logical
-		// lines (block.odin never walks the filtered view), which is a
-		// different, non-contiguous set of rows the instant filter view turns
-		// on. block_extend already refuses to CREATE a rectangle while
-		// doc.filter is set; this is the other half -- drop one that already
-		// exists rather than let it silently edit rows the user can no longer
-		// see. block.odin's own edit paths refuse under doc.filter too
-		// (belt and braces), but this is the one place that actually removes
-		// the stale selection the user would otherwise still see highlighted.
-		if block_active(doc) {block_clear(doc)}
+		// find_set_filter (find.odin) is the single path in and out of the
+		// filter view -- it also drops a live column rectangle, and its comment
+		// is where the reason lives. Clicking a filtered row leaves through the
+		// same proc.
+		find_set_filter(doc, !doc.filter)
 	case .Find_Toggle_Replace_Mode:
 		doc.find.replace_mode = !doc.find.replace_mode
 	case .Find_Filter_Page_Up:
