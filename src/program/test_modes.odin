@@ -1556,6 +1556,261 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad longpathtest` — the \\?\ extended-length prefix, in two halves.
+		//
+		// Half one is `plat.long_path_form`'s rule table as pure string assertions.
+		// It is a pure function precisely so this half needs no filesystem, and the
+		// rules are not arbitrary: \\?\ turns path normalization OFF, so a blanket
+		// prefix is worse than the 260-character bug it fixes. Every row here is a
+		// way the naive version breaks something that works today.
+		//
+		// Half two is one real round-trip through a directory nest under %TEMP%
+		// longer than MAX_PATH: mkdir, save through the atomic-write path, stat,
+		// reopen, re-save (the ReplaceFileW branch), delete. That half is what
+		// proves the feature rather than the arithmetic — sabotaging
+		// long_path_form to `return path` makes it fail with real Win32 errors.
+		if os.args[1] == "longpathtest" {
+			// Every non-vacuous case needs a path *longer* than the threshold, or
+			// "unchanged" proves nothing: a short absolute path is left alone too.
+			// `prefix` plus enough directory segments to clear `n` characters, then
+			// a file name — so the result never ends in a separator and the
+			// expected canonical form is a plain concatenation.
+			pad :: proc(prefix: string, n: int) -> string {
+				b := strings.builder_make(context.temp_allocator)
+				strings.write_string(&b, prefix)
+				for strings.builder_len(b) < n {strings.write_string(&b, `abcdefgh\`)}
+				strings.write_string(&b, "f.txt")
+				return strings.to_string(b)
+			}
+			chk :: proc(bad: ^int, label, got, want: string) {
+				ok := got == want
+				if !ok {bad^ += 1}
+				fmt.printfln("  %-34s %s", label, "OK" if ok else "FAIL")
+				if !ok {
+					fmt.printfln("      got  %q", got)
+					fmt.printfln("      want %q", want)
+				}
+			}
+
+			long_path_rules :: proc(chk: proc(bad: ^int, label, got, want: string), pad: proc(prefix: string, n: int) -> string) -> int {
+				bad := 0
+				L :: plat.LONG_PATH_THRESHOLD
+				fmt.println("--- long_path_form: the rule table ---")
+
+				// Relative: \\?\ is invalid on one, so it is returned untouched.
+				// The long case is the one that matters — a short relative path
+				// would be left alone for the length reason alone.
+				chk(&bad, "short relative", plat.long_path_form(`sub\f.txt`), `sub\f.txt`)
+				rel := pad(`sub\`, 300)
+				chk(&bad, "long relative", plat.long_path_form(rel), rel)
+				// Drive-relative ("C:f.txt") and rooted-without-volume ("\f.txt")
+				// are both relative for this purpose: neither names a volume, so
+				// neither can carry the prefix.
+				dr := pad("C:", 300)
+				chk(&bad, "long drive-relative C:x", plat.long_path_form(dr), dr)
+				rooted := pad(`\`, 300)
+				chk(&bad, "long rooted, no volume", plat.long_path_form(rooted), rooted)
+
+				// Short absolute: no need, and keeping it plain keeps ordinary
+				// paths readable in a debugger and in an error dialog.
+				chk(&bad, "short absolute", plat.long_path_form(`C:\a\b.txt`), `C:\a\b.txt`)
+
+				// The threshold boundary, both sides. One under is left alone, one
+				// at it is prefixed; without both, an off-by-one is invisible.
+				under := fmt.tprintf(`C:\%s`, strings.repeat("a", L - 4, context.temp_allocator))
+				at := fmt.tprintf(`C:\%s`, strings.repeat("a", L - 3, context.temp_allocator))
+				chk(&bad, "one under the threshold", plat.long_path_form(under), under)
+				chk(&bad, "exactly at the threshold", plat.long_path_form(at), fmt.tprintf(`\\?\%s`, at))
+
+				// The point of the task.
+				lng := pad(`C:\`, 300)
+				chk(&bad, "long absolute", plat.long_path_form(lng), fmt.tprintf(`\\?\%s`, lng))
+
+				// \\?\ does not treat '/' as a separator, so slashes must be
+				// converted before the prefix goes on. Same path as the row above,
+				// spelled with '/' — so the expected output is identical.
+				fwd, _ := strings.replace_all(lng, `\`, "/", context.temp_allocator)
+				chk(&bad, "forward slashes converted", plat.long_path_form(fwd), fmt.tprintf(`\\?\%s`, lng))
+
+				// ...and it does not resolve '.' or '..' either. Canonicalizing
+				// AFTER prefixing would be too late; this is the ordering trap the
+				// whole helper is arranged around.
+				dots := fmt.tprintf(`C:\a\b\..\.\c\%s`, strings.repeat(`x\`, 130, context.temp_allocator))
+				want_dots := fmt.tprintf(`\\?\C:\a\c\%s`, strings.repeat(`x\`, 130, context.temp_allocator))
+				want_dots = want_dots[:len(want_dots) - 1] // trailing separator collapses away
+				chk(&bad, "dot and dotdot resolved first", plat.long_path_form(dots), want_dots)
+
+				// '..' may not climb out of the volume root; Win32's own
+				// normalizer treats C:\..\x as C:\x rather than as an error.
+				esc := fmt.tprintf(`C:\..\..\a\%s`, strings.repeat(`y\`, 140, context.temp_allocator))
+				want_esc := fmt.tprintf(`\\?\C:\a\%s`, strings.repeat(`y\`, 140, context.temp_allocator))
+				want_esc = want_esc[:len(want_esc) - 1]
+				chk(&bad, "dotdot cannot escape the root", plat.long_path_form(esc), want_esc)
+
+				// UNC takes a different shape entirely: \\?\UNC\server\share, not
+				// \\?\\\server\share.
+				unc := pad(`\\server\share\`, 300)
+				chk(&bad, "UNC becomes \\\\?\\UNC", plat.long_path_form(unc), fmt.tprintf(`\\?\UNC%s`, unc[1:]))
+				// ...and its server and share are root, not components a '..' pops.
+				unc_esc := fmt.tprintf(`\\srv\share\..\..\a\%s`, strings.repeat(`z\`, 140, context.temp_allocator))
+				want_unc := fmt.tprintf(`\\?\UNC\srv\share\a\%s`, strings.repeat(`z\`, 140, context.temp_allocator))
+				want_unc = want_unc[:len(want_unc) - 1]
+				chk(&bad, "dotdot cannot eat the share", plat.long_path_form(unc_esc), want_unc)
+
+				// Idempotent. Checked by pointer identity, not by content: the
+				// requirement is that an already-prefixed path is *returned*, not
+				// rebuilt into something that merely compares equal. The
+				// round-trip's cleanup below depends on this holding even when the
+				// rest of the function is sabotaged.
+				pre := fmt.tprintf(`\\?\%s`, pad(`C:\`, 300))
+				again := plat.long_path_form(pre)
+				same := raw_data(again) == raw_data(pre)
+				fmt.printfln("  %-34s %s", "already prefixed, returned as-is", "OK" if same else "FAIL")
+				if !same {bad += 1}
+
+				return bad
+			}
+
+			long_path_roundtrip :: proc() -> int {
+				bad := 0
+				fmt.println("--- the round trip: a real file past MAX_PATH ---")
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				if tmp == "" {
+					fmt.println("  no %TEMP% in the environment FAIL")
+					return 1
+				}
+
+				// A nest whose full path clears 260 by a comfortable margin, built
+				// from 40-character segments so the count is small and each mkdir
+				// is individually legal.
+				seg := "nplp_0123456789012345678901234567890123"
+				dirs := make([dynamic]string, 0, 16, context.temp_allocator)
+				cur := fmt.tprintf(`%s\nplp_root`, tmp)
+				append(&dirs, cur)
+				for len(cur) < 280 {
+					cur = fmt.tprintf(`%s\%s`, cur, seg)
+					append(&dirs, cur)
+				}
+				deep := cur
+				file := fmt.tprintf(`%s\long.txt`, deep)
+				fmt.printfln("  nest depth %d, deepest directory %d chars, file %d chars", len(dirs), len(deep), len(file))
+				if len(file) <= 260 {
+					fmt.println("  the fixture does not actually exceed MAX_PATH FAIL")
+					return 1
+				}
+
+				// Cleanup prefixes by hand instead of going through
+				// long_path_form. The sabotage run for this test disables that
+				// function, and a cleanup sharing the mechanism under test would
+				// leave a 300-character directory tree behind on exactly the run
+				// that failed — which is the one nobody wants to unpick by hand.
+				// plat.file_delete / dir_remove still route through wide_path, but
+				// the idempotency rule (asserted above) passes an already-prefixed
+				// path straight through, sabotage or not.
+				ext :: proc(p: string) -> string {return fmt.tprintf(`\\?\%s`, p)}
+				defer {
+					plat.file_delete(ext(file))
+					plat.file_delete(ext(fmt.tprintf("%s.newtpad~", file)))
+					plat.file_delete(ext(fmt.tprintf(`%s\replace_a.txt`, deep)))
+					plat.file_delete(ext(fmt.tprintf(`%s\replace_b.txt`, deep)))
+					#reverse for d in dirs {plat.dir_remove(ext(d))}
+					left, _ := plat.path_exists(ext(dirs[0]))
+					fmt.printfln("  cleaned up, anything left behind: %v %s", left, "FAIL" if left else "OK")
+				}
+
+				ERROR_ALREADY_EXISTS :: 183
+				made := 0
+				for d in dirs {
+					if plat.dir_create(d) || plat.last_error() == ERROR_ALREADY_EXISTS {
+						made += 1
+						continue
+					}
+					fmt.printfln("  mkdir failed at depth %d (%d chars), win32 error %d FAIL", made, len(d), plat.last_error())
+					bad += 1
+					break
+				}
+				if made == len(dirs) {
+					fmt.printfln("  created %d directories, deepest %d chars OK", made, len(deep))
+				}
+
+				// The save goes through doc_save_err -> atomic_write_begin/commit,
+				// i.e. temp file + rename, never a held handle on the target. That
+				// is how "never lock the user's file" is honoured and this path
+				// must not stop honouring it because the name got long.
+				body := "long path, first write\n"
+				dup := make([]u8, len(body)) // doc_from_content takes ownership
+				copy(dup, transmute([]u8)body)
+				doc := doc_from_content(dup, "", .UTF8)
+				werr := doc_save_err(&doc, file)
+				doc_close(&doc)
+				fmt.printfln("  atomic save err=%v %s", werr, "OK" if werr == .None else "FAIL")
+				if werr != .None {bad += 1}
+
+				st := plat.file_stamp(file)
+				stat_ok := st.ok && st.size == i64(len(body))
+				fmt.printfln("  stat ok=%v size=%d (want %d) %s", st.ok, st.size, len(body), "OK" if stat_ok else "FAIL")
+				if !stat_ok {bad += 1}
+
+				reopened, ropen := doc_open(file)
+				read_ok := ropen && reopened.pt.length == len(body)
+				fmt.printfln("  reopen ok=%v bytes=%d (want %d) %s", ropen, reopened.pt.length if ropen else -1, len(body), "OK" if read_ok else "FAIL")
+				if !read_ok {bad += 1}
+				if ropen {doc_close(&reopened)}
+
+				// A second save over an existing target takes the ReplaceFileW
+				// branch, which preserves the original's ACLs and alternate data
+				// streams. It falls back to MoveFileExW on failure, so a green
+				// save here would not prove ReplaceFileW accepted the prefix —
+				// hence the direct probe below.
+				body2 := "long path, second write, longer\n"
+				dup2 := make([]u8, len(body2))
+				copy(dup2, transmute([]u8)body2)
+				doc2 := doc_from_content(dup2, "", .UTF8)
+				werr2 := doc_save_err(&doc2, file)
+				doc_close(&doc2)
+				st2 := plat.file_stamp(file)
+				resave_ok := werr2 == .None && st2.ok && st2.size == i64(len(body2))
+				fmt.printfln("  re-save err=%v size=%d (want %d) %s", werr2, st2.size, len(body2), "OK" if resave_ok else "FAIL")
+				if !resave_ok {bad += 1}
+
+				// The canonicalization rules, against the filesystem rather than
+				// against an expected string: the same file named with forward
+				// slashes and a "..\seg" detour. \\?\ resolves neither, so a
+				// helper that prefixed before canonicalizing would hand Win32 a
+				// literal directory named ".." and this stat would fail.
+				detour := fmt.tprintf(`%s/../%s/long.txt`, deep, seg)
+				dst := plat.file_stamp(detour)
+				detour_ok := dst.ok && dst.size == i64(len(body2))
+				fmt.printfln("  stat via '/' and '..' ok=%v size=%d (want %d) %s", dst.ok, dst.size, len(body2), "OK" if detour_ok else "FAIL")
+				if !detour_ok {bad += 1}
+
+				// Direct: does ReplaceFileW itself accept an extended-length path?
+				// If this ever prints false, every long-path save silently loses
+				// the target's ACLs and Zone.Identifier to the MoveFileExW
+				// fallback, which is worth knowing before a user finds out.
+				ra := fmt.tprintf(`%s\replace_a.txt`, deep)
+				rb := fmt.tprintf(`%s\replace_b.txt`, deep)
+				pa := plat.file_write_atomic(ra, transmute([]u8)string("a"))
+				pb := plat.file_write_atomic(rb, transmute([]u8)string("bb"))
+				replaced := pa && pb && plat.file_replace(ra, rb)
+				fmt.printfln("  ReplaceFileW accepts \\\\?\\: %v %s", replaced, "OK" if replaced else "FAIL (saves fall back to MoveFileEx)")
+				if !replaced {bad += 1}
+
+				del := plat.file_delete(file)
+				still_there, _ := plat.path_exists(file)
+				del_ok := del && !still_there
+				fmt.printfln("  delete ok=%v, still present=%v %s", del, still_there, "OK" if del_ok else "FAIL")
+				if !del_ok {bad += 1}
+
+				return bad
+			}
+
+			bad := long_path_rules(chk, pad)
+			bad += long_path_roundtrip()
+			fmt.printfln("longpathtest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad drawcount <file>` measures what a frame actually costs in draw
 		// calls, because the claim "an always-on line-number gutter roughly doubles
 		// per-frame draw calls" was arithmetic from constants, not a measurement, and

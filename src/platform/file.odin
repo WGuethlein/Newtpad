@@ -27,6 +27,8 @@ FILE_MMAP_THRESHOLD :: 16 * 1024 * 1024 // copy below, mmap above
 @(private = "file")
 drive_is_fixed :: proc(path: string) -> bool {
 	if len(path) >= 3 && path[1] == ':' {
+		// No wide_path here: the argument is the three-character volume root, which
+		// can never approach MAX_PATH, and GetDriveTypeW wants a plain root anyway.
 		root := win.utf8_to_wstring(path[:3], context.temp_allocator) // "C:\"
 		return GetDriveTypeW(root) == DRIVE_FIXED
 	}
@@ -41,7 +43,15 @@ File_View :: struct {
 }
 
 file_open_readonly :: proc(path: string) -> (fv: File_View, ok: bool) {
-	info, serr := os.stat(path, context.allocator)
+	// core:os does its own long-path fixing, but only when HKLM LongPathsEnabled
+	// is set — the registry opt-in CLAUDE.md forbids relying on, and one that does
+	// nothing without a `longPathAware` manifest entry we deliberately do not
+	// ship. It also gives up on any path containing "..". So the \\?\ decision is
+	// made here and core:os is handed a path it will pass through untouched.
+	// Without these two conversions the whole feature is dead for every file under
+	// FILE_MMAP_THRESHOLD, i.e. essentially every file.
+	long := long_path_form(path)
+	info, serr := os.stat(long, context.allocator)
 	if serr != nil {
 		return
 	}
@@ -54,7 +64,7 @@ file_open_readonly :: proc(path: string) -> (fv: File_View, ok: bool) {
 	// mmap'd pages on a network/removable volume fault - and block the faulting
 	// thread for the SMB timeout - if the media drops; copying avoids that.
 	if n < FILE_MMAP_THRESHOLD || !drive_is_fixed(path) {
-		data, rerr := os.read_entire_file(path, context.allocator)
+		data, rerr := os.read_entire_file(long, context.allocator)
 		if rerr != nil {
 			return
 		}
@@ -71,7 +81,7 @@ file_open_readonly :: proc(path: string) -> (fv: File_View, ok: bool) {
 	// roll it while we hold the mapping. The document layer detaches to a private
 	// copy as soon as it detects the file changing (see doc_detach_mapping), which
 	// is what keeps "never lock the user's file" true in practice.
-	wpath := win.utf8_to_wstring(path)
+	wpath := wide_path(path)
 	hfile := win.CreateFileW(
 		wpath,
 		win.GENERIC_READ,
@@ -116,7 +126,7 @@ File_Stamp :: struct {
 // network share this blocks for the redirector timeout, which is exactly why it
 // must not run on the UI thread.
 file_stamp :: proc(path: string) -> File_Stamp {
-	wpath := win.utf8_to_wstring(path, context.temp_allocator)
+	wpath := wide_path(path)
 	d: win.WIN32_FILE_ATTRIBUTE_DATA
 	if !win.GetFileAttributesExW(wpath, win.GetFileExInfoStandard, &d) {
 		return File_Stamp{}
@@ -135,7 +145,7 @@ file_read_range :: proc(path: string, offset: i64, count: int, allocator := cont
 	if count <= 0 {
 		return nil, true
 	}
-	wpath := win.utf8_to_wstring(path, context.temp_allocator)
+	wpath := wide_path(path)
 	h := win.CreateFileW(
 		wpath,
 		win.GENERIC_READ,
@@ -193,7 +203,10 @@ Atomic_Write :: struct {
 
 atomic_write_begin :: proc(path: string) -> (aw: Atomic_Write, ok: bool) {
 	tmp := strings.concatenate({path, ".newtpad~"}) // heap: outlives this call
-	wtmp := win.utf8_to_wstring(tmp, context.temp_allocator)
+	// The suffix is nine characters, so a target that fits under MAX_PATH can
+	// still produce a temp path that does not. LONG_PATH_THRESHOLD's slack is
+	// sized for exactly this.
+	wtmp := wide_path(tmp)
 	h := win.CreateFileW(wtmp, win.GENERIC_WRITE, 0, nil, win.CREATE_ALWAYS, win.FILE_ATTRIBUTE_NORMAL, nil)
 	if h == win.INVALID_HANDLE_VALUE {
 		delete(tmp)
@@ -227,14 +240,25 @@ atomic_write_free :: proc(aw: ^Atomic_Write) {
 // gone), then replace the target. ReplaceFileW keeps the original's ACLs,
 // attributes, creation time and alternate data streams (Zone.Identifier); it
 // needs the target to exist, so a first save falls through to the rename.
+// ReplaceFileW as a named operation. Extracted so the long-path round-trip can
+// ask it directly whether it accepts an extended-length path: atomic_write_commit
+// silently falls back to MoveFileExW when it fails, which would hide the answer
+// behind a save that still succeeded — with the ACLs and alternate data streams
+// quietly gone.
+file_replace :: proc(dst, src: string) -> bool {
+	return bool(
+		ReplaceFileW(wide_path(dst), wide_path(src), nil, REPLACEFILE_WRITE_THROUGH | REPLACEFILE_IGNORE_MERGE_ERRORS, nil, nil),
+	)
+}
+
 atomic_write_commit :: proc(aw: ^Atomic_Write) -> Write_Error {
 	win.FlushFileBuffers(aw.h)
 	win.CloseHandle(aw.h)
-	wtmp := win.utf8_to_wstring(aw.tmp, context.temp_allocator)
-	wdst := win.utf8_to_wstring(aw.dst, context.temp_allocator)
+	wtmp := wide_path(aw.tmp)
+	wdst := wide_path(aw.dst)
 	defer atomic_write_free(aw)
 	if win.GetFileAttributesW(wdst) != win.INVALID_FILE_ATTRIBUTES {
-		if ReplaceFileW(wdst, wtmp, nil, REPLACEFILE_WRITE_THROUGH | REPLACEFILE_IGNORE_MERGE_ERRORS, nil, nil) {
+		if file_replace(aw.dst, aw.tmp) {
 			return .None
 		}
 	}
@@ -247,7 +271,7 @@ atomic_write_commit :: proc(aw: ^Atomic_Write) -> Write_Error {
 
 atomic_write_abort :: proc(aw: ^Atomic_Write) {
 	win.CloseHandle(aw.h)
-	win.DeleteFileW(win.utf8_to_wstring(aw.tmp, context.temp_allocator))
+	win.DeleteFileW(wide_path(aw.tmp))
 	atomic_write_free(aw)
 }
 
@@ -268,6 +292,14 @@ file_write_atomic_err :: proc(path: string, data: []u8) -> Write_Error {
 }
 
 // Build a comdlg filter string (label\0pattern\0...\0\0) as wide chars.
+//
+// NOT wide_path, here or in either dialog below: comdlg32 does not accept \\?\ in
+// lpstrFile, and the path it hands *back* must stay in plain form because it goes
+// on to become doc.path — the string shown in the title bar, written to the
+// session file and compared against on reopen. The prefix belongs at the moment
+// of the syscall, not in the value we carry around. (These are also the two sites
+// where a long path is unreachable anyway: the dialogs cannot navigate past
+// MAX_PATH.)
 @(private = "file")
 build_filter :: proc(dst: ^[256]u16, parts: []string) {
 	i := 0
@@ -507,6 +539,8 @@ shell_open_url :: proc(url: string) -> bool {
 	if !url_is_openable(url) {
 		return false
 	}
+	// NOT wide_path: this is a URL, not a path, and ShellExecuteW rejects \\?\
+	// outright. Prefixing here would be a regression, not a fix.
 	wurl := win.utf8_to_wstring(url, context.temp_allocator)
 	wop := win.utf8_to_wstring("open", context.temp_allocator)
 	r := win.ShellExecuteW(nil, wop, wurl, nil, nil, win.SW_SHOWNORMAL)
@@ -534,6 +568,10 @@ explorer_folder_arg :: proc(path: string, allocator := context.temp_allocator) -
 // did executed it.
 shell_reveal :: proc(path: string) -> bool {
 	arg := explorer_select_arg(path)
+	// NOT wide_path: `arg` is an Explorer command line, and the path inside it is
+	// handed to another process. explorer.exe does not accept \\?\, so a long path
+	// simply cannot be revealed — that is a shell limitation, not one we can fix by
+	// prefixing, and prefixing would break the short paths that work today.
 	warg := win.utf8_to_wstring(arg, context.temp_allocator)
 	wexe := win.utf8_to_wstring("explorer.exe", context.temp_allocator)
 	wop := win.utf8_to_wstring("open", context.temp_allocator)
@@ -552,6 +590,9 @@ shell_open_folder :: proc(path: string) -> bool {
 		return false
 	}
 	arg := explorer_folder_arg(path)
+	// NOT wide_path, same reason as shell_reveal: inter-process, and explorer.exe
+	// rejects \\?\. (The path_exists guard above *is* long-path aware, so the
+	// refusal a long path gets here is Explorer's, not a stat that failed.)
 	warg := win.utf8_to_wstring(arg, context.temp_allocator)
 	wexe := win.utf8_to_wstring("explorer.exe", context.temp_allocator)
 	wop := win.utf8_to_wstring("open", context.temp_allocator)
@@ -562,7 +603,7 @@ shell_open_folder :: proc(path: string) -> bool {
 // Does this path exist, and is it a directory? Callers stat before opening: a
 // link to something that is not there should reach no handler at all.
 path_exists :: proc(path: string) -> (exists, is_dir: bool) {
-	wpath := win.utf8_to_wstring(path, context.temp_allocator)
+	wpath := wide_path(path)
 	attrs := win.GetFileAttributesW(wpath)
 	if attrs == win.INVALID_FILE_ATTRIBUTES {
 		return false, false

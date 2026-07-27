@@ -54,6 +54,11 @@ instance_send_open :: proc(path: string) -> bool {
 
 	// The receiving instance has its own working directory, so a relative path
 	// from a shell would resolve differently there. Send an absolute one.
+	//
+	// Absolute, but deliberately NOT \\?\-prefixed: this crosses a process
+	// boundary, and the receiver stores what it is given as doc.path — the string
+	// in the title bar and in the session file. The prefix is a syscall-time
+	// detail applied in platform/file.odin, not something we carry around.
 	abs := transmute([]u8)path_absolute(path)
 	if len(abs) > 0 {
 		cds := win.COPYDATASTRUCT {

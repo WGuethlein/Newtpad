@@ -272,6 +272,9 @@ face_char_em :: proc(face: ^IFontFace, units: f32) -> f32 {
 add_face :: proc(t: ^Text, c: ^Face_Chain, file_name: string, kind: FONT_FACE_TYPE, index: u32) -> bool {
 	if c.n >= MAX_FACES {return false}
 	path := strings.concatenate({fonts_dir(), file_name}, context.temp_allocator)
+	// NOT wide_path: a font file lives under %SystemRoot%\Fonts and is always far
+	// short of MAX_PATH, and DirectWrite's CreateFontFileReference is not one of
+	// the APIs \\?\ is documented to work with.
 	wpath := win.utf8_to_wstring(path, context.temp_allocator)
 	file: ^IFontFile
 	if hr := t.factory->CreateFontFileReference(wpath, nil, &file); !win.SUCCEEDED(hr) {

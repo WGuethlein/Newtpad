@@ -108,6 +108,11 @@ crash_filter :: proc "system" (info: ^win.EXCEPTION_POINTERS) -> win.LONG {
 	return win.EXCEPTION_EXECUTE_HANDLER
 }
 
+// NOT wide_path, here or in the report writer below: both paths are built from
+// the crash directory under %APPDATA%\Newtpad and are always short, and this runs
+// inside the unhandled-exception filter where the less machinery on the path to
+// the write the better. If the crash directory ever becomes user-configurable,
+// this is the pair to revisit.
 @(private = "file")
 write_minidump :: proc(path: string, info: ^win.EXCEPTION_POINTERS) {
 	h := win.CreateFileW(
