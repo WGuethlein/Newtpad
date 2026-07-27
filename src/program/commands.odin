@@ -748,6 +748,30 @@ sort_lines_dispatch :: proc(app: ^App, doc: ^Document, mode: Sort_Mode) {
 	// an operation they never asked for, in a product where the note bar is the
 	// only feedback a palette-only command has.
 	what := "DEDUPE" if mode == .Dedupe else "SORT"
+	// A rectangle is a COLUMN; these three commands only speak rows. Refuse
+	// rather than guess -- "sort the rectangle's rows by their whole-line
+	// content" and "sort them by the cells the rectangle actually covers" are
+	// both honest readings of the same gesture, and principle 3's answer to an
+	// operation with two meanings is to offer neither. BLOCK_EDIT_MAX_LINES'
+	// refusal has the same shape, and adding a chord or a row-span variant later
+	// is a change to this one branch.
+	//
+	// Without this the escalation was the largest on the command_mutates_doc
+	// list: the block-clear branch in command_dispatch runs block_collapse_linear
+	// (`doc.anchor = doc.cursor`) for every mutating command not on its exception
+	// list, so doc_sort_lines saw !doc_has_sel and sorted the WHOLE FILE. Five
+	// column-selected rows of a 200k-line log reordered the lot and dropped every
+	// bookmark in it. The three commands are on that exception list now, which is
+	// what lets this refusal be reached at all.
+	//
+	// Leave the rectangle live, exactly like every other block refusal
+	// (block_extend's own comment in block.odin makes this an invariant): a
+	// refusal that also destroys the gesture's state costs the user the selection
+	// they spent the drag making, for nothing.
+	if doc != nil && block_active(doc) {
+		app_note(app, fmt.tprintf("[%s UNAVAILABLE - column selection is live; press Escape first]", what))
+		return
+	}
 	switch doc_sort_lines(doc, mode) {
 	case .Ok:
 	// The document visibly changed; a note would be noise.
@@ -798,8 +822,10 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	     // Alt+Up/Down already is, and for the same reasons it has to be listed
 	     // here: table view must block it (the grid is read-only and a caret left
 	     // over from text view would rewrite the file underneath it), and a live
-	     // column rectangle must be dropped first or it keeps naming rows the
-	     // sort has since moved.
+	     // column rectangle has to be seen at all -- these three are the one entry
+	     // on this list that REFUSES under a rectangle rather than dropping it,
+	     // and they only get the chance because membership here is what routes
+	     // them through the block branch in command_dispatch.
 	     .Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines:
 		return true
 	// Changing the line ending rewrites the ENTIRE buffer -- doc_set_line_ending
@@ -912,9 +938,19 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	// Insert_Newline stays OUT of this exception list deliberately: splitting
 	// every spanned row from one Enter is rarely what's wanted, so Enter
 	// keeps clearing the rectangle and acting at the caret.
+	//
+	// Sort_Lines / Sort_Lines_Desc / Remove_Duplicate_Lines are on the list for
+	// the opposite reason to the rest of it: not because they edit the rectangle,
+	// but because the collapse this branch performs is what made them dangerous.
+	// Every other command here acts at the caret or on one line, so flattening the
+	// selection first costs a line at worst; these three read the selection as
+	// their SCOPE, so a collapsed selection silently promoted them to the whole
+	// document. They refuse in sort_lines_dispatch instead, and reaching that
+	// refusal with the rectangle intact is the whole point of the exception.
 	if doc != nil && block_active(doc) && command_mutates_doc(cmd) {
 		#partial switch cmd {
-		case .Backspace, .Delete_Fwd, .Cut, .Undo, .Redo, .Insert_Tab:
+		case .Backspace, .Delete_Fwd, .Cut, .Undo, .Redo, .Insert_Tab,
+		     .Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines:
 		case:
 			block_clear(doc)
 			// Belt and braces for the invariant block_collapse_linear

@@ -13357,6 +13357,70 @@ when NEWTPAD_TESTS {
 				sl_chk(bad, strings.contains(command_table[.Sort_Lines].title, "selection"), fmt.tprintf("the sort title states its scope: %q", command_table[.Sort_Lines].title))
 				sl_chk(bad, strings.contains(command_table[.Remove_Duplicate_Lines].title, "exact"), fmt.tprintf("the dedupe title states that the match is exact: %q", command_table[.Remove_Duplicate_Lines].title))
 			}
+			// --- a live column rectangle refuses --------------------------------------
+			//
+			// The largest escalation on the command_mutates_doc list, and it was
+			// live. command_dispatch's block-clear branch runs block_clear plus
+			// block_collapse_linear for every mutating command NOT on its exception
+			// list, and block_collapse_linear (block.odin) is `doc.anchor =
+			// doc.cursor` -- so doc_sort_lines then saw !doc_has_sel and took the
+			// WHOLE-DOCUMENT branch. Column-select five rows of a 200k-line log, run
+			// Sort Lines from the palette, and the entire file is reordered and every
+			// bookmark inside it dropped. Paste, Delete_Word_Back, Insert_Newline and
+			// Move_Line_* -- the rest of that branch's traffic -- all act at the caret
+			// or on a single line; only this one turns "the selection" into "the file".
+			//
+			// It has to go through the real command_dispatch. The collapse lives
+			// there, not in doc_sort_lines, so a test that called the doc-level proc
+			// directly is structurally incapable of seeing it -- which is exactly why
+			// the feature shipped with the hole.
+			sl_block :: proc(bad: ^int) {
+				fmt.println("--- a live column rectangle refuses ---")
+				a: App
+				dummy: plat.Window
+				t: plat.Text // these commands never measure text; a zero Text is enough
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				ad := app_active(&a)
+				src := "d\nc\nb\na\n"
+				doc_close(ad)
+				ad^ = doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				ad.wrap = false
+				// A rectangle over the first two rows AND a linear selection under it:
+				// the exact state block_collapse_linear exists to flatten, so the
+				// fixture reproduces the escalation rather than approximating it.
+				ad.block = true
+				ad.block_anchor_line_start, ad.block_anchor_cell = 0, 0
+				ad.block_cursor_line_start, ad.block_cursor_cell = 2, 1
+				ad.anchor, ad.cursor = 0, 3
+				a.notice = ""
+				command_dispatch(.Sort_Lines, {}, &a, &dummy, &t, 10)
+				got := doc_debug_string(ad)
+				sl_chk(bad, got == src, fmt.tprintf("a rectangle does not turn Sort Lines into a WHOLE-FILE sort: %q (want %q)", got, src))
+				sl_chk(bad, len(ad.undo) == 0, fmt.tprintf("...and the refusal pushes no undo entry: undo=%d (want 0)", len(ad.undo)))
+				// Every other block refusal leaves the gesture's state alone
+				// (block_extend's comment in block.odin says so explicitly); this one
+				// must too, or the refusal silently destroys the selection instead.
+				sl_chk(bad, block_active(ad), fmt.tprintf("...and the rectangle is still live: block_active=%v (want true)", block_active(ad)))
+				sl_chk(bad, strings.contains(a.notice, "column"), fmt.tprintf("...and it says why, naming the column selection: notice=%q", a.notice))
+				// Dedupe reaches the same branch by the same route.
+				dsrc := "x\nx\ny\n"
+				doc_close(ad)
+				ad^ = doc_from_content(transmute([]u8)strings.clone(dsrc), "", .UTF8)
+				ad.wrap = false
+				ad.block = true
+				ad.block_anchor_line_start, ad.block_anchor_cell = 0, 0
+				ad.block_cursor_line_start, ad.block_cursor_cell = 2, 1
+				ad.anchor, ad.cursor = 0, 0
+				a.notice = ""
+				command_dispatch(.Remove_Duplicate_Lines, {}, &a, &dummy, &t, 10)
+				dgot := doc_debug_string(ad)
+				sl_chk(bad, dgot == dsrc, fmt.tprintf("Remove Duplicate Lines refuses under a rectangle too: %q (want %q)", dgot, dsrc))
+				// The note names the command the user actually ran. Posting "SORT" for
+				// Remove Duplicate Lines tells them a sort was refused for something
+				// they never asked for.
+				sl_chk(bad, !strings.contains(a.notice, "SORT"), fmt.tprintf("...and its note does not claim a SORT was refused: notice=%q", a.notice))
+			}
 			bad := 0
 			sl_asc(&bad)
 			sl_desc(&bad)
@@ -13371,6 +13435,7 @@ when NEWTPAD_TESTS {
 			sl_cap_lines(&bad)
 			sl_cap_bytes(&bad)
 			sl_commands(&bad)
+			sl_block(&bad)
 			fmt.printfln("sortlinestest: %d failures", bad)
 			return true
 		}
