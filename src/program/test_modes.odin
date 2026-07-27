@@ -1179,6 +1179,81 @@ when NEWTPAD_TESTS {
 				if !all_live {bad += 1}
 			}
 
+			// Nothing anywhere exercised what a `checked` predicate MEANS. This mode
+			// asserted that the model is well-formed and that the mnemonics do not
+			// collide; whether a check mark tracks the state it names was untested
+			// for is_wrapped and is_table since they were written, and for the
+			// encoding predicates since batch 6 added them.
+			//
+			// Read through the menus table rather than by calling the predicates,
+			// which are @(private = "file") in menu.odin anyway: that makes the
+			// assertion cover the WIRING too. A row pointed at the wrong predicate
+			// -- Toggle_Table checked by is_wrapped, say -- is the likelier mistake
+			// than a predicate that reads the wrong field, and calling the procs
+			// directly would miss it entirely.
+			//
+			// Driven with command_dispatch, not by writing doc.wrap: the check mark
+			// and the command must agree, and that is a seam.
+			menu_checked_of :: proc(app: ^App, cmd: Command_Id) -> (checked, found: bool) {
+				for m in menus {
+					for it in m.items {
+						if it.cmd != cmd || it.checked == nil {continue}
+						found = true
+						if it.checked(app) {checked = true}
+					}
+				}
+				return
+			}
+			// A toggle's check mark must be off, then on, then off again -- all
+			// three, because "reads true once" also passes for a predicate stuck
+			// true, and "flips" passes for one that is simply inverted.
+			checked_toggle_case :: proc(t: ^plat.Text, cmd: Command_Id, label: string) -> (bad: int) {
+				a: App
+				dummy: plat.Window
+				a.settings = settings_default()
+				app_new_scratch(&a) // untitled: doc_can_table/doc_can_markdown allow any view
+				defer app_destroy(&a)
+				before, found := menu_checked_of(&a, cmd)
+				command_dispatch(cmd, {}, &a, &dummy, t, 10)
+				on, _ := menu_checked_of(&a, cmd)
+				command_dispatch(cmd, {}, &a, &dummy, t, 10)
+				off, _ := menu_checked_of(&a, cmd)
+				ok := found && !before && on && !off
+				fmt.printfln(
+					"  %-6s %-14v check mark: start=%v after one toggle=%v after two=%v (found=%v)",
+					"ok" if ok else "FAIL", label, before, on, off, found,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			// The encoding rows track a VALUE, so the property is exclusivity: after
+			// picking one, that row is checked and the sibling rows are not. A
+			// predicate comparing against the wrong enum member passes an "is it
+			// checked" test on whichever encoding it happens to name.
+			checked_encoding_case :: proc() -> (bad: int) {
+				a: App
+				dummy: plat.Window
+				t: plat.Text
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				u8_before, found := menu_checked_of(&a, .Enc_UTF8)
+				command_dispatch(.Enc_UTF16LE, {}, &a, &dummy, &t, 10)
+				u16_on, _ := menu_checked_of(&a, .Enc_UTF16LE)
+				u8_off, _ := menu_checked_of(&a, .Enc_UTF8)
+				cp_off, _ := menu_checked_of(&a, .Enc_CP1252)
+				ok := found && u8_before && u16_on && !u8_off && !cp_off
+				fmt.printfln(
+					"  %-6s Enc rows are exclusive: UTF8 was %v, after Enc_UTF16LE -> UTF16LE=%v UTF8=%v CP1252=%v",
+					"ok" if ok else "FAIL", u8_before, u16_on, u8_off, cp_off,
+				)
+				if !ok {bad += 1}
+				return
+			}
+			fmt.println("--- check marks track the state they name ---")
+			bad += checked_toggle_case(&t, .Toggle_Wrap, "Toggle_Wrap")
+			bad += checked_toggle_case(&t, .Toggle_Table, "Toggle_Table")
+			bad += checked_encoding_case()
+
 			fmt.printfln("menutest: %d failures", bad)
 			return true
 		}
