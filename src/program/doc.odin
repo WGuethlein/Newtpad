@@ -2299,6 +2299,15 @@ sort_lower :: proc(b: u8) -> u8 {return b + 32 if b >= 'A' && b <= 'Z' else b}
 // Case-insensitive (ASCII) byte order, ties broken by length. Not a locale
 // collation and not Unicode case folding: this is the "no options" sort of
 // principle 3, and the audience is log lines and identifiers.
+//
+// The limitation, stated rather than left to be discovered: sort_lower folds
+// A-Z and nothing else, so a-umlaut and A-umlaut do NOT fold and a mixed-case
+// German list is not alphabetised the way a German speaker would write it.
+// Carried deliberately -- a Unicode case-folding table is a dependency and a
+// size cost a notepad's sort does not earn. It has one property worth knowing
+// though: comparing UTF-8 BYTEWISE is codepoint order, so non-ASCII lines still
+// sort deterministically and sensibly WITHIN a script. What is missing is case
+// pairing, not ordering.
 @(private = "file")
 sort_cmp_ci :: proc(a, b: []u8) -> int {
 	n := min(len(a), len(b))
