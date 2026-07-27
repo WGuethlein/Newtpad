@@ -3375,10 +3375,23 @@ doc_draw :: proc(
 				hl_n, hl_state = doc_row_lex_spans(doc, &hl_cache, start, end, wrapped, line_buf[:n], hl_state, hl_buf[:])
 			}
 
+			// Colour rules (rules.odin) are the THIRD span producer and the
+			// lowest-priority one: links > lexer > rules, fixed here and
+			// nowhere else. They are independent of hl_lexer on purpose —
+			// their whole audience is the .txt and .log files that have no
+			// lexer at all — so this sits outside the `hl_lexer != nil` block
+			// above. rules_active() is a length check, so a machine with no
+			// rules.txt pays one compare per row for the feature.
+			rules_n := 0
+			rules_buf: [RULES_MAX_ROW_SPANS]plat.Text_Span
+			if rules_active() {
+				rules_n = rules_row_spans(line_buf[:n], rules_buf[:])
+			}
+
 			spans: []plat.Text_Span
-			if hl_n > 0 || link_spans != nil {
-				merged := make([]plat.Text_Span, hl_n + len(link_spans), context.temp_allocator)
-				spans = merged[:highlight_merge_spans(hl_buf[:hl_n], link_spans[:], merged)]
+			if hl_n > 0 || rules_n > 0 || link_spans != nil {
+				merged := make([]plat.Text_Span, hl_n + len(link_spans) + rules_n, context.temp_allocator)
+				spans = merged[:highlight_merge_row(link_spans[:], hl_buf[:hl_n], rules_buf[:rules_n], merged)]
 			}
 			if spans != nil {
 				plat.text_draw_spans(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs), row_y, px, fg, spans, .Doc)

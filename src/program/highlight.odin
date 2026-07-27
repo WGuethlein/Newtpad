@@ -434,50 +434,128 @@ HL_MAX_ROW_TOKENS :: 512
 // shipping text_draw_spans (platform/text.odin).
 hl_bytes_examined: int
 
-// Combine one row's raw lexer spans with its link spans into a single
-// sorted, non-overlapping list — the shape text_draw_spans requires. Links
-// always win: a lexer span that intersects a link anywhere is dropped
-// WHOLE, never truncated, because text_draw_spans's own contract ("sorted…
-// must not overlap") has no defined behaviour for overlapping input (see
-// the comment at doc_draw's call site for the concrete example). Both
-// inputs must already be sorted ascending by start with no internal
-// overlaps of their own (lex_spans: tokens are found left to right;
-// link_spans: links_layout scans the same way), so survivor selection plus
-// a linear two-pointer merge is enough — no general sort — and the two
-// inputs never contain an overlapping pair once the drop below has run,
-// which is exactly the precondition being upheld.
+// How many span producers the merge below can take. Three today: links, the
+// lexer, and the colour rules (rules.odin). It bounds two fixed arrays, not a
+// slice length, so raising it is a real change rather than a constant edit.
+HL_MERGE_MAX_PRODUCERS :: 3
+
+// Combine one row's span producers into a single sorted, non-overlapping list
+// — the shape text_draw_spans requires. `producers` is in DESCENDING PRIORITY
+// order: producers[0] is kept whole, and a span from any later producer that
+// intersects an already-kept span anywhere is dropped WHOLE, never truncated,
+// because text_draw_spans's own contract ("sorted… must not overlap") has no
+// defined behaviour for overlapping input (see the comment at doc_draw's call
+// site for the concrete example).
+//
+// The shipping order is **links > lexer > rules**, decided in the batch 10
+// plan and NOT at this keyboard: a rule matching `error` inside a JSON string
+// would otherwise recolour part of a token and make correct code look broken,
+// while a rule loses nothing where the file has no lexer — which is the .txt
+// and .log case rules exist for. doc_draw is the one site that fixes the
+// order; this proc only honours whatever order it is handed.
+//
+// Every producer must already be sorted ascending by start with no internal
+// overlaps of its own (lex_spans: tokens are found left to right; link_spans:
+// links_layout scans the same way; rule spans: rules_row_spans advances past
+// each match it emits). Given that, both halves below are linear sweeps rather
+// than general sorts:
+//
+//   * The DROP pass compares each producer against the earlier ones with a
+//     per-segment cursor that only ever advances, because both sides are
+//     sorted. That is what keeps rules — which can be far denser than links —
+//     from costing O(rules × lexer) per row.
+//   * The MERGE pass is an N-way pick-the-smallest-start over the surviving
+//     segments, each of which is still sorted.
+//
+// Ties on `start` go to the LOWEST-priority producer that has one, which is
+// what the two-producer code this replaced did (`survivors[li].start <=
+// link_spans[ri].start` preferred the lexer). Reachable only between a span and
+// a zero-length span at the same offset, since two non-empty spans sharing a
+// start overlap and one of them has already been dropped.
+//
+// One saturation note, and it is the only behavioural difference from the
+// two-producer version: `survivors` is HL_MAX_ROW_TOKENS for ALL producers
+// together, so on a row that fills it the lower-priority producers lose spans
+// they used to keep. That is the row-token cap doing its job — colouring stops,
+// the row still draws in full — and it is the budget the batch 10 plan asks
+// rules to share rather than to add to.
 //
 // Factored out of doc_draw, which previously had this inlined, so
 // highlighttest can call the literal proc doc_draw draws with rather than a
 // second copy that could quietly diverge — "test the seam, not the unit"
 // (CLAUDE.md). A 2026-07 review flagged this mechanism as untested; the
 // "link precedence" checks in highlighttest exist to close that gap.
-highlight_merge_spans :: proc(lex_spans, link_spans: []plat.Text_Span, out: []plat.Text_Span) -> int {
+highlight_merge_spans_n :: proc(out: []plat.Text_Span, producers: ..[]plat.Text_Span) -> int {
 	survivors: [HL_MAX_ROW_TOKENS]plat.Text_Span
+	lo, hi, cur: [HL_MERGE_MAX_PRODUCERS]int
 	sn := 0
-	outer: for sp in lex_spans {
-		for l in link_spans {
-			if sp.start < l.start + l.len && l.start < sp.start + sp.len {
-				continue outer // overlaps a link: drop it whole, link wins
+	np := min(len(producers), HL_MERGE_MAX_PRODUCERS)
+
+	for pi in 0 ..< np {
+		lo[pi] = sn
+		hi[pi] = sn
+		// One cursor per EARLIER segment, reset for this producer and then
+		// only advanced. Sound because producers[pi] is sorted ascending: once
+		// a kept span ends at or before this span's start it can never overlap
+		// a later one either.
+		for pj in 0 ..< pi {cur[pj] = lo[pj]}
+		for sp in producers[pi] {
+			if sn >= len(survivors) {break}
+			drop := false
+			for pj in 0 ..< pi {
+				c := cur[pj]
+				for c < hi[pj] && survivors[c].start + survivors[c].len <= sp.start {c += 1}
+				cur[pj] = c
+				if c < hi[pj] && survivors[c].start < sp.start + sp.len {
+					drop = true
+					break
+				}
 			}
+			if drop {continue}
+			survivors[sn] = sp
+			sn += 1
+			hi[pi] = sn
 		}
-		if sn >= len(survivors) {break}
-		survivors[sn] = sp
-		sn += 1
 	}
+
+	for pi in 0 ..< np {cur[pi] = lo[pi]}
 	n := 0
-	li, ri := 0, 0
-	for (li < sn || ri < len(link_spans)) && n < len(out) {
-		if ri >= len(link_spans) || (li < sn && survivors[li].start <= link_spans[ri].start) {
-			out[n] = survivors[li]
-			li += 1
-		} else {
-			out[n] = link_spans[ri]
-			ri += 1
+	for n < len(out) {
+		best := -1
+		for pi in 0 ..< np {
+			if cur[pi] >= hi[pi] {continue}
+			// <=, not <: on a tie the later (lower-priority) producer wins,
+			// preserving the two-producer behaviour described above.
+			if best < 0 || survivors[cur[pi]].start <= survivors[cur[best]].start {best = pi}
 		}
+		if best < 0 {break}
+		out[n] = survivors[cur[best]]
+		cur[best] += 1
 		n += 1
 	}
 	return n
+}
+
+// The ONE place the shipping precedence order is written down: **links >
+// lexer > rules**. doc_draw calls this and so does rulestest, so sabotaging
+// the order here fails the tests — which is the point. A test that spelled the
+// order out itself would agree with a swapped call site, which is CLAUDE.md
+// §6j's shape ("the test on the wrong side of the seam").
+//
+// The parameters are named rather than variadic for the same reason: a swap at
+// the call site is visible as `lex_spans = links`, not as two adjacent slices
+// in a list.
+highlight_merge_row :: proc(link_spans, lex_spans, rule_spans: []plat.Text_Span, out: []plat.Text_Span) -> int {
+	return highlight_merge_spans_n(out, link_spans, lex_spans, rule_spans)
+}
+
+// The two-producer shape doc_draw used before rules existed, and the one
+// highlighttest's link-precedence cases call. It FORWARDS to the N-producer
+// merge with the shipping order spelled out — it is not a second merge beside
+// it, which is precisely the parallel path the plan forbids, because a second
+// mechanism is how the no-overlap precondition gets violated.
+highlight_merge_spans :: proc(lex_spans, link_spans: []plat.Text_Span, out: []plat.Text_Span) -> int {
+	return highlight_merge_spans_n(out, link_spans, lex_spans)
 }
 
 // Row-relative syntax spans for one row's bytes, through whichever lexer

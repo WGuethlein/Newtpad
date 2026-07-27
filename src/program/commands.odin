@@ -125,6 +125,7 @@ Command_Id :: enum u8 {
 	Settings_Dec,
 	Theme_Edit,
 	Keys_Edit,
+	Rules_Edit,
 	Open_Logs_Folder,
 	// font page (Edit > Font)
 	Font_Open,
@@ -251,6 +252,7 @@ command_table := [Command_Id]Command {
 	.Settings_Dec             = {"Settings: Decrease", "View"},
 	.Theme_Edit               = {"Edit Current Theme...", "View"},
 	.Keys_Edit                = {"Edit Keybindings...", "View"},
+	.Rules_Edit               = {"Edit Colour Rules...", "View"},
 	.Open_Logs_Folder         = {"Open Logs Folder", "View"},
 	.Font_Open                = {"Font...", "Edit"},
 	.Font_Close               = {"Font: Close", "Edit"},
@@ -502,9 +504,11 @@ save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -
 		// doc.path: doc_save_err frees and reallocates doc.path.
 		theme_reapply_if_active(app, path)
 		// Same loop for the keymap: saving keys.txt re-reads it, so a binding can
-		// be tried without restarting. Both are called unconditionally and each
-		// checks the path itself.
+		// be tried without restarting. All three are called unconditionally and
+		// each checks the path itself.
 		keymap_reload_if_active(app, path)
+		// And for the colour rules: saving rules.txt recolours the next frame.
+		rules_reload_if_active(app, path)
 	}
 	return saved
 }
@@ -1455,6 +1459,8 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		theme_edit_current(app)
 	case .Keys_Edit:
 		keymap_edit_current(app)
+	case .Rules_Edit:
+		rules_edit_current(app)
 	case .Open_Logs_Folder:
 		// Logging has been on by default since 0.9.0 and had no command, no menu
 		// entry and no mention anywhere in the UI -- the audit found a working

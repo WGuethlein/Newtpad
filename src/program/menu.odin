@@ -212,6 +212,7 @@ menus := []Menu {
 			{cmd = .Settings_Open},
 			{cmd = .Theme_Edit},
 			{cmd = .Keys_Edit},
+			{cmd = .Rules_Edit},
 			{cmd = .Open_Logs_Folder},
 		},
 	},
