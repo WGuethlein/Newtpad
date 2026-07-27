@@ -2412,15 +2412,32 @@ doc_sort_lines :: proc(doc: ^Document, mode: Sort_Mode) -> Sort_Result {
 	// individual copy faulting.
 	if base.pt_read(&doc.pt, lo, buf) != len(buf) || base.pt_faulted(&doc.pt) {return .Faulted}
 
+	// The line cap, checked BEFORE the split rather than after it. The byte cap
+	// is correctly ahead of its own allocation (the make above); this one was
+	// not, and the constant's comment names the very cost it failed to bound --
+	// "a Sort_Line per line ... is what costs there". 16 MiB of bare '\n' is 16
+	// million Sort_Lines at 24 bytes each, plus the two dynamic arrays doubling
+	// their way up to it: several hundred megabytes allocated, on the input
+	// thread, only to be thrown away by a refusal one line later.
+	//
+	// sort_split_lines appends one line per '\n' plus one final line, and `buf`
+	// never ends with a terminator (see hi above), so newlines+1 IS len(lines) --
+	// this is the same test, not an approximation of it. One pass over a buffer
+	// that is already in cache is the whole price of knowing first.
+	//
+	// After the READ, though, and that part is unchanged: the byte cap already
+	// bounds the read, and the line count is not knowable without it. Nothing has
+	// been written either way, which is what makes both caps refusals rather than
+	// partial edits.
+	nl := 0
+	for b in buf {if b == '\n' {nl += 1}}
+	if nl + 1 > SORT_MAX_LINES {return .Too_Big}
+
 	lines := make([dynamic]Sort_Line, 0, 64)
 	defer delete(lines)
 	terms := make([dynamic]u8, 0, 64)
 	defer delete(terms)
 	sort_split_lines(buf, &lines, &terms)
-	// After the read, not before: the byte cap already bounds this scan, and the
-	// line count is not knowable without it. Still a refusal that changes
-	// nothing -- the buffer has not been touched yet.
-	if len(lines) > SORT_MAX_LINES {return .Too_Big}
 	if len(lines) < 2 {return .Unchanged}
 
 	out_lines := lines[:]

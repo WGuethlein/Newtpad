@@ -13300,7 +13300,21 @@ when NEWTPAD_TESTS {
 				d := doc_from_content(content, "", .UTF8)
 				defer doc_close(&d)
 				rev0 := d.revision
-				r := doc_sort_lines(&d, .Ascending)
+				// Measured, not asserted by inspection: the refusal has to come
+				// BEFORE the per-line allocation, and the only way to see that is to
+				// watch what the refused call actually allocates. SORT_MAX_LINES' own
+				// comment justifies the cap by saying "a Sort_Line per line ... is
+				// what costs there" -- splitting first spends exactly that (24 B a
+				// line, plus both dynamic arrays doubling their way up) on a region
+				// it is about to throw away.
+				track: mem.Tracking_Allocator
+				mem.tracking_allocator_init(&track, context.allocator)
+				defer mem.tracking_allocator_destroy(&track)
+				r: Sort_Result
+				{
+					context.allocator = mem.tracking_allocator(&track)
+					r = doc_sort_lines(&d, .Ascending)
+				}
 				after := base.pt_collect(&d.pt, context.temp_allocator)
 				same := len(after) == len(before)
 				if same {
@@ -13310,6 +13324,21 @@ when NEWTPAD_TESTS {
 				}
 				sl_chk(bad, r == .Too_Big, fmt.tprintf("%d lines / %.1f MB is refused: %v (want Too_Big)", n, f64(len(before)) / (1024 * 1024), r))
 				sl_chk(bad, same && len(d.undo) == 0 && d.revision == rev0, fmt.tprintf("and nothing changed: bytes-equal=%v undo=%d revision %d->%d", same, len(d.undo), rev0, d.revision))
+				// The one read of the region is unavoidable (the line count is not
+				// knowable without it); everything past it is not. A megabyte of slack
+				// over the region's own size, so this measures the per-line arrays and
+				// not the read.
+				SLACK :: 1024 * 1024
+				sl_chk(
+					bad,
+					int(track.peak_memory_allocated) < len(before) + SLACK,
+					fmt.tprintf(
+						"...and refuses before it allocates per line: peak %.1f MB on a %.1f MB region (want under %.1f MB)",
+						f64(track.peak_memory_allocated) / (1024 * 1024),
+						f64(len(before)) / (1024 * 1024),
+						f64(len(before) + SLACK) / (1024 * 1024),
+					),
+				)
 			}
 			sl_cap_bytes :: proc(bad: ^int) {
 				fmt.println("--- the byte cap refuses ---")
