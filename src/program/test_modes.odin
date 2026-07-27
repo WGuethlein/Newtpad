@@ -12908,6 +12908,394 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad sortlinestest` — Sort Lines / Sort Lines Descending (doc.odin's
+		// doc_sort_lines and the two commands).
+		//
+		// Every case asserts the WHOLE buffer byte-for-byte, never a line count and
+		// never a length: the entire risk of this feature is a rewrite that lands
+		// the right number of lines with the wrong bytes at the edges -- a swallowed
+		// '\r', an invented trailing newline, a corrupted first or last line of a
+		// selection. A length check cannot see any of those.
+		//
+		// Each case is its own local proc holding one Document at a time
+		// (development-loop.md §6: test_mode_dispatch's frame is already large and
+		// blocktest has hit a real stack overflow twice this way).
+		if os.args[1] == "sortlinestest" {
+			sl_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			// --- ascending, whole document (no selection) ----------------------------
+			//
+			// The caret sits mid-document with NO selection, so "the whole document"
+			// is the scope under test rather than an accident of the caret being at
+			// 0. Case-insensitive: "Apple" sorts with "apple", not before "banana"
+			// by ASCII (where every capital beats every lowercase, and a sort of a
+			// mixed-case list looks broken).
+			sl_asc :: proc(bad: ^int) {
+				fmt.println("--- ascending, whole document ---")
+				src := "banana\nApple\ncherry\napple\n"
+				d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				defer doc_close(&d)
+				d.cursor, d.anchor = 15, 15 // inside "cherry", no selection
+				r := doc_sort_lines(&d, .Ascending)
+				got := doc_debug_string(&d)
+				want := "Apple\napple\nbanana\ncherry\n"
+				sl_chk(bad, r == .Ok && got == want, fmt.tprintf("sorts the whole file with no selection: %v %q (want %q)", r, got, want))
+				// The trailing newline count is part of the bytes above, but say it
+				// separately so a failure names the cause rather than the diff.
+				sl_chk(bad, strings.count(got, "\n") == strings.count(src, "\n"), fmt.tprintf("the number of line terminators is unchanged: %d (want %d)", strings.count(got, "\n"), strings.count(src, "\n")))
+				// No selection in, no selection out -- and the caret lands at the
+				// start of what was sorted rather than at the end of the file.
+				sl_chk(bad, d.cursor == 0 && d.anchor == 0, fmt.tprintf("the caret collapses to the region start: cursor=%d anchor=%d (want 0/0)", d.cursor, d.anchor))
+				// Running it again finds nothing to do: no write, no undo entry.
+				u := len(d.undo)
+				r2 := doc_sort_lines(&d, .Ascending)
+				sl_chk(bad, r2 == .Unchanged && len(d.undo) == u && doc_debug_string(&d) == want, fmt.tprintf("sorting an already-sorted file is a no-op with no undo entry: %v undo=%d (want Unchanged/%d)", r2, len(d.undo), u))
+			}
+			// --- descending ----------------------------------------------------------
+			sl_desc :: proc(bad: ^int) {
+				fmt.println("--- descending ---")
+				d := doc_from_content(transmute([]u8)strings.clone("banana\nApple\ncherry\napple\n"), "", .UTF8)
+				defer doc_close(&d)
+				r := doc_sort_lines(&d, .Descending)
+				got := doc_debug_string(&d)
+				// "Apple" BEFORE "apple": descending reverses the ORDER, not the
+				// ties. reverse_sort over the ascending comparator gives
+				// "apple\nApple" here and fails this line.
+				want := "cherry\nbanana\nApple\napple\n"
+				sl_chk(bad, r == .Ok && got == want, fmt.tprintf("descending, with ties still in original order: %v %q (want %q)", r, got, want))
+			}
+			// --- a selection with a PARTIAL line at both ends -------------------------
+			//
+			// The selection starts inside "delta" and ends inside "alpha". Both must
+			// be sorted whole; the lines outside must not move at all. An
+			// implementation that sorted the raw selection would leave "de" and
+			// "al" stranded, which is the corruption the expansion exists to stop.
+			sl_selection :: proc(bad: ^int) {
+				fmt.println("--- selection, partial lines at both ends ---")
+				//              0    4      10       18     24     30
+				src := "zzz\ndelta\ncharlie\nbravo\nalpha\nyyy\n"
+				d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				defer doc_close(&d)
+				d.anchor, d.cursor = 6, 26 // "de|lta" ... "al|pha"
+				r := doc_sort_lines(&d, .Ascending)
+				got := doc_debug_string(&d)
+				want := "zzz\nalpha\nbravo\ncharlie\ndelta\nyyy\n"
+				sl_chk(bad, r == .Ok && got == want, fmt.tprintf("both partial lines are expanded whole: %v %q (want %q)", r, got, want))
+				// The region stays selected so a second command can follow, and its
+				// bounds are the EXPANDED ones, not the ones the user dragged.
+				sl_chk(bad, d.anchor == 4 && d.cursor == 29, fmt.tprintf("the expanded region stays selected: [%d,%d) (want [4,29))", d.anchor, d.cursor))
+			}
+			// --- stability -----------------------------------------------------------
+			//
+			// 32 lines that are all the same word in different cases: every one
+			// compares EQUAL under the case-insensitive key, and every one is a
+			// distinct byte string, so their order in the output is a direct readout
+			// of whether the sort is stable. 32 rather than a handful because
+			// slice.sort_by is smoothsort -- explicitly "not guaranteed to be
+			// stable" -- and a heap over four elements can come back in order by
+			// luck. The "zzz" line is there so the sort actually WRITES: without it
+			// the correct output is byte-identical to the input and the case would
+			// assert nothing.
+			//
+			// Descending is asserted on the same fixture and must give the SAME
+			// order for the 32, because ties break on the original index in both
+			// directions.
+			sl_stable :: proc(bad: ^int) {
+				fmt.println("--- stability (32 lines equal under the key) ---")
+				b := strings.builder_make(context.temp_allocator)
+				variants := make([dynamic]string, 0, 32, context.temp_allocator)
+				for k in 0 ..< 32 {
+					i := (k * 13) % 32 // a permutation of 0..31: not already sorted
+					w := make([]u8, 5, context.temp_allocator)
+					for j in 0 ..< 5 {
+						w[j] = u8('A' + j) if (i >> uint(j)) & 1 == 1 else u8('a' + j)
+					}
+					append(&variants, string(w))
+					// "zzz" sits in the MIDDLE, so BOTH directions have to move it
+					// and neither case can be "correct" by returning .Unchanged --
+					// which is exactly what happened with it at one end, and would
+					// have made one of the two assertions weaker than it looks.
+					if k == 16 {strings.write_string(&b, "zzz\n")}
+					strings.write_string(&b, string(w))
+					strings.write_byte(&b, '\n')
+				}
+				src := strings.to_string(b)
+				tail := strings.builder_make(context.temp_allocator)
+				for v in variants {
+					strings.write_string(&tail, v)
+					strings.write_byte(&tail, '\n')
+				}
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					got := doc_debug_string(&d)
+					want := fmt.tprintf("%szzz\n", strings.to_string(tail))
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("ascending keeps all 32 equal keys in their original order (first 24 of %d bytes: %q)", len(got), got[:min(24, len(got))]))
+				}
+				{
+					d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Descending)
+					got := doc_debug_string(&d)
+					want := fmt.tprintf("zzz\n%s", strings.to_string(tail))
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("descending keeps them in the SAME order (ties are not reversed) (first 24 of %d bytes: %q)", len(got), got[:min(24, len(got))]))
+				}
+			}
+			// --- CRLF ----------------------------------------------------------------
+			//
+			// A CRLF file comes back CRLF, with and without a trailing terminator.
+			//
+			// Worth knowing while reading these: a stray '\r' left on a line's
+			// content cannot change the ORDER, because CR sorts before every
+			// printable byte exactly where the "shorter string first" rule would
+			// have put the line anyway. What it changes is the BYTES, which is what
+			// these two compare.
+			sl_crlf :: proc(bad: ^int) {
+				fmt.println("--- CRLF ---")
+				{
+					d := doc_from_content(transmute([]u8)strings.clone("banana\r\nApple\r\ncherry\r\n"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					got := doc_debug_string(&d)
+					want := "Apple\r\nbanana\r\ncherry\r\n"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("a CRLF file comes back CRLF: %v %q (want %q)", r, got, want))
+				}
+				{
+					// No trailing terminator: the last line is the only one without
+					// a '\r' in front of its break, and the file must not gain one.
+					d := doc_from_content(transmute([]u8)strings.clone("dupA\r\nother\r\ndupB"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Descending)
+					got := doc_debug_string(&d)
+					want := "other\r\ndupB\r\ndupA"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("a CRLF file with no trailing terminator keeps both properties: %v %q (want %q)", r, got, want))
+				}
+			}
+			// --- a region whose line endings disagree with each other -----------------
+			//
+			// NOT what the plan says (it says re-emit doc.eol). Terminators keep
+			// their POSITIONS instead -- doc_move_lines' rule -- so a mixed region
+			// comes back with the same terminator bytes in the same places rather
+			// than normalised to one kind. It matters because detect_line_ending
+			// only sniffs the head of the file (§6ab), so doc.eol can genuinely
+			// disagree with the region being sorted, and normalising there would be
+			// a silent rewrite of bytes the user did not ask to touch.
+			sl_mixed :: proc(bad: ^int) {
+				fmt.println("--- a mixed-terminator region is not normalised ---")
+				d := doc_from_content(transmute([]u8)strings.clone("b\r\na\nc\r\n"), "", .UTF8)
+				defer doc_close(&d)
+				d.eol = .LF // what detect_line_ending would say from a sniff
+				r := doc_sort_lines(&d, .Ascending)
+				got := doc_debug_string(&d)
+				want := "a\r\nb\nc\r\n"
+				sl_chk(bad, r == .Ok && got == want, fmt.tprintf("terminators keep their positions, none is rewritten: %v %q (want %q)", r, got, want))
+			}
+			// --- no trailing newline --------------------------------------------------
+			//
+			// The file must not GAIN one. Every naive join appends a terminator
+			// after the last line.
+			sl_no_trailing :: proc(bad: ^int) {
+				fmt.println("--- no trailing newline ---")
+				{
+					d := doc_from_content(transmute([]u8)strings.clone("cherry\nbanana\napple"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					got := doc_debug_string(&d)
+					want := "apple\nbanana\ncherry"
+					sl_chk(bad, r == .Ok && got == want, fmt.tprintf("a file with no trailing newline does not gain one: %v %q (want %q)", r, got, want))
+				}
+				{
+					// ...and one WITH a trailing newline does not lose it, nor gain a
+					// second: the empty last line is a terminator, not a line to sort.
+					// Sorting it as a line floats "" to the top and gives "\na\nb".
+					d := doc_from_content(transmute([]u8)strings.clone("b\na\n"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					got := doc_debug_string(&d)
+					sl_chk(bad, r == .Ok && got == "a\nb\n", fmt.tprintf("the trailing empty line is not sorted as a line: %v %q (want %q)", r, got, "a\nb\n"))
+				}
+				{
+					// A single line has nothing to sort and must not be rewritten.
+					d := doc_from_content(transmute([]u8)strings.clone("only\n"), "", .UTF8)
+					defer doc_close(&d)
+					r := doc_sort_lines(&d, .Ascending)
+					sl_chk(bad, r == .Unchanged && doc_debug_string(&d) == "only\n" && len(d.undo) == 0, fmt.tprintf("a one-line file is left alone: %v %q undo=%d", r, doc_debug_string(&d), len(d.undo)))
+				}
+			}
+			// --- one undo entry -------------------------------------------------------
+			//
+			// One entry, and undoing it restores every byte. The failure this guards
+			// is a per-line edit loop: with UNDO_MAX at 200, a sort that pushed an
+			// entry per line would evict the pre-sort state entirely and no amount
+			// of Ctrl+Z would get the file back. So the count is asserted against
+			// the LINE COUNT of the fixture, not against 1 alone -- 12 lines, and a
+			// per-line implementation reads 12.
+			sl_undo :: proc(bad: ^int) {
+				fmt.println("--- one undo entry ---")
+				src := "l\nk\nj\ni\nh\ng\nf\ne\nd\nc\nb\na\n"
+				d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				defer doc_close(&d)
+				u0 := len(d.undo)
+				r := doc_sort_lines(&d, .Ascending)
+				want := "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\n"
+				sl_chk(bad, r == .Ok && doc_debug_string(&d) == want, fmt.tprintf("12 lines sort: %v %q", r, doc_debug_string(&d)))
+				sl_chk(bad, len(d.undo) == u0 + 1, fmt.tprintf("exactly one undo entry for 12 sorted lines: %d (want %d)", len(d.undo), u0 + 1))
+				sl_chk(bad, d.state_count == 1, fmt.tprintf("the history row is labelled x1: state_count=%d", d.state_count))
+				doc_undo(&d)
+				sl_chk(bad, doc_debug_string(&d) == src && len(d.undo) == u0, fmt.tprintf("ONE undo restores every byte: %q (want %q) undo=%d", doc_debug_string(&d), src, len(d.undo)))
+				doc_redo(&d)
+				sl_chk(bad, doc_debug_string(&d) == want, fmt.tprintf("and redo puts it back: %q", doc_debug_string(&d)))
+			}
+			// --- bookmarks ------------------------------------------------------------
+			//
+			// Inside the sorted region: DROPPED. Outside: kept, and still naming its
+			// own line. A sort reorders lines, so no shift rule can say where a
+			// bookmark went -- leaving one pointing at whatever line landed on its
+			// offset is §6ad's Alt+Down bug, which shipped.
+			//
+			// Read the text AT each surviving bookmark rather than at the offset it
+			// is expected to hold: an offset that is arithmetically right but names
+			// the wrong line still fails that way (bookmarktest's own lesson).
+			sl_bookmarks :: proc(bad: ^int) {
+				fmt.println("--- bookmarks in the region are dropped, outside kept ---")
+				//              0    4      10       18     24     30
+				src := "zzz\ndelta\ncharlie\nbravo\nalpha\nyyy\n"
+				d := doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				defer doc_close(&d)
+				for o in ([]int{0, 10, 24, 30}) { // zzz, charlie, alpha, yyy
+					d.cursor, d.anchor = o, o
+					doc_bookmark_toggle(&d)
+				}
+				sl_chk(bad, len(d.bookmarks) == 4, fmt.tprintf("four bookmarks set: %v", d.bookmarks[:]))
+				d.anchor, d.cursor = 6, 26 // the same partial selection as above
+				r := doc_sort_lines(&d, .Ascending)
+				at :: proc(d: ^Document, i, n: int) -> string {
+					if i < 0 || i >= len(d.bookmarks) {return "<no such bookmark>"}
+					b := d.bookmarks[i]
+					if b < 0 || b >= d.pt.length {return "<oob>"}
+					buf := make([]u8, min(n, d.pt.length - b), context.temp_allocator)
+					base.pt_read(&d.pt, b, buf)
+					return string(buf)
+				}
+				kept := len(d.bookmarks) == 2 && d.bookmarks[0] == 0 && d.bookmarks[1] == 30
+				sl_chk(bad, r == .Ok && kept, fmt.tprintf("the two inside the region are gone, the two outside stayed: %v (want [0 30])", d.bookmarks[:]))
+				sl_chk(bad, at(&d, 0, 3) == "zzz" && at(&d, 1, 3) == "yyy", fmt.tprintf("and each survivor still names its own line: %q / %q (want \"zzz\" / \"yyy\")", at(&d, 0, 3), at(&d, 1, 3)))
+				// The invariant the shift rules exist to preserve, checked here too
+				// because a wrong answer can be sorted and in range and still not be
+				// a line start.
+				inv := true
+				prev := -1
+				for b in d.bookmarks {
+					if b <= prev || b < 0 || b > d.pt.length {inv = false}
+					prev = b
+					if b == 0 {continue}
+					one: [1]u8
+					base.pt_read(&d.pt, b - 1, one[:])
+					if one[0] != '\n' {inv = false}
+				}
+				sl_chk(bad, inv, fmt.tprintf("every surviving entry is still a real line start: %v", d.bookmarks[:]))
+				// Undo restores the set, so the drop is not a loss the user cannot
+				// take back.
+				doc_undo(&d)
+				sl_chk(bad, len(d.bookmarks) == 4, fmt.tprintf("undo brings the dropped bookmarks back: %v", d.bookmarks[:]))
+			}
+			// --- the caps refuse, and change nothing ---------------------------------
+			//
+			// Two caps, and the test proves each one BINDS FIRST in its own case:
+			// the line fixture is ~2 MB (well under SORT_MAX_BYTES) and the byte
+			// fixture is 17 lines (well under SORT_MAX_LINES), so neither case can
+			// be passing for the other cap's reason.
+			sl_cap_lines :: proc(bad: ^int) {
+				fmt.println("--- the line cap refuses ---")
+				n := SORT_MAX_LINES + 2
+				content := make([]u8, n * 2)
+				for i in 0 ..< n {
+					content[i * 2] = 'b' if i % 2 == 0 else 'a' // unsorted, so a sort WOULD rewrite it
+					content[i * 2 + 1] = '\n'
+				}
+				before := make([]u8, len(content))
+				defer delete(before)
+				copy(before, content)
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+				rev0 := d.revision
+				r := doc_sort_lines(&d, .Ascending)
+				after := base.pt_collect(&d.pt, context.temp_allocator)
+				same := len(after) == len(before)
+				if same {
+					for i in 0 ..< len(before) {
+						if after[i] != before[i] {same = false;break}
+					}
+				}
+				sl_chk(bad, r == .Too_Big, fmt.tprintf("%d lines / %.1f MB is refused: %v (want Too_Big)", n, f64(len(before)) / (1024 * 1024), r))
+				sl_chk(bad, same && len(d.undo) == 0 && d.revision == rev0, fmt.tprintf("and nothing changed: bytes-equal=%v undo=%d revision %d->%d", same, len(d.undo), rev0, d.revision))
+			}
+			sl_cap_bytes :: proc(bad: ^int) {
+				fmt.println("--- the byte cap refuses ---")
+				BLOCK :: 1024 * 1024
+				nblocks := 17 // 17 MB > SORT_MAX_BYTES, in only 17 lines
+				content := make([]u8, nblocks * BLOCK)
+				for k in 0 ..< nblocks {
+					fill := u8('b') if k % 2 == 0 else u8('a')
+					for i in 0 ..< BLOCK {content[k * BLOCK + i] = fill}
+					content[(k + 1) * BLOCK - 1] = '\n'
+				}
+				d := doc_from_content(content, "", .UTF8)
+				defer doc_close(&d)
+				rev0, len0 := d.revision, d.pt.length
+				r := doc_sort_lines(&d, .Ascending)
+				// Spot-check the head byte of every block rather than collecting 17
+				// MB again: a sort would have moved the 'a' blocks in front of the
+				// 'b' blocks, so this sees any rewrite that actually happened.
+				intact := d.pt.length == len0
+				for k in 0 ..< nblocks {
+					one: [1]u8
+					base.pt_read(&d.pt, k * BLOCK, one[:])
+					if one[0] != (u8('b') if k % 2 == 0 else u8('a')) {intact = false}
+				}
+				sl_chk(bad, r == .Too_Big, fmt.tprintf("%d MB in %d lines is refused: %v (want Too_Big)", nblocks, nblocks, r))
+				sl_chk(bad, intact && len(d.undo) == 0 && d.revision == rev0, fmt.tprintf("and nothing changed: blocks-intact=%v undo=%d revision %d->%d", intact, len(d.undo), rev0, d.revision))
+			}
+			// --- the commands, as the app sees them ----------------------------------
+			//
+			// The palette is the ONLY route to these (no default chord), so a
+			// missing row means an unreachable feature; and both of them rewrite the
+			// buffer, so command_mutates_doc has to know -- that is what makes table
+			// view block them and what drops a live column rectangle first. §6ad's
+			// Eol_LF was missed in exactly that list.
+			sl_commands :: proc(bad: ^int) {
+				fmt.println("--- the commands ---")
+				for cmd in ([]Command_Id{.Sort_Lines, .Sort_Lines_Desc}) {
+					sl_chk(bad, command_mutates_doc(cmd), fmt.tprintf("%v is a document mutation", cmd))
+					sl_chk(bad, command_in_palette(cmd), fmt.tprintf("%v is offered in the palette", cmd))
+					sl_chk(bad, command_chord(cmd) == "", fmt.tprintf("%v has no default chord: %q", cmd, command_chord(cmd)))
+					sl_chk(bad, command_table[cmd].title != "" && command_table[cmd].category == "Edit", fmt.tprintf("%v is titled and filed under Edit: %q", cmd, command_table[cmd].title))
+				}
+				// The palette shows the title and nothing else, so the one thing a
+				// user cannot otherwise know has to be in it.
+				sl_chk(bad, strings.contains(command_table[.Sort_Lines].title, "selection"), fmt.tprintf("the sort title states its scope: %q", command_table[.Sort_Lines].title))
+			}
+			bad := 0
+			sl_asc(&bad)
+			sl_desc(&bad)
+			sl_selection(&bad)
+			sl_stable(&bad)
+			sl_crlf(&bad)
+			sl_mixed(&bad)
+			sl_no_trailing(&bad)
+			sl_undo(&bad)
+			sl_bookmarks(&bad)
+			sl_cap_lines(&bad)
+			sl_cap_bytes(&bad)
+			sl_commands(&bad)
+			fmt.printfln("sortlinestest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad matchmarkstest` — the find-match ticks on the vertical
 		// scrollbar (find.odin: find_mark_y / find_mark_cap / find_mark_rects).
 		//

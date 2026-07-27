@@ -76,6 +76,13 @@ Command_Id :: enum u8 {
 	// direction is read off ev.shift in the dispatch, exactly as
 	// doc_cursor_left(doc, ev.shift) reads it.
 	Bookmark_Cycle,
+	// Sort the selected lines (the whole document with no selection). TWO
+	// commands, not one with a modifier: shift is not part of a chord (see
+	// Binding, and Bookmark_Cycle above), so a descending variant cannot be
+	// Shift+something and has to be its own row. Both are palette-only -- no
+	// default chord, because adding one is a keys.txt line now.
+	Sort_Lines,
+	Sort_Lines_Desc,
 	// command palette
 	Palette_Open,
 	Palette_Close,
@@ -199,6 +206,11 @@ command_table := [Command_Id]Command {
 	.Toggle_Preview           = {"Toggle Markdown Preview / Split", "View"},
 	.Bookmark_Toggle          = {"Toggle Bookmark on This Line", "Cursor"},
 	.Bookmark_Cycle           = {"Go to Next Bookmark (Shift: Previous)", "Cursor"},
+	// The title carries the thing a user would otherwise have to discover by
+	// running the command on real data: the scope. The palette shows the title
+	// and nothing else, so anything not in it is not said.
+	.Sort_Lines               = {"Sort Lines (selection, or whole file)", "Edit"},
+	.Sort_Lines_Desc          = {"Sort Lines Descending (selection, or whole file)", "Edit"},
 	.Palette_Open             = {"Command Palette", "View"},
 	.Palette_Close            = {"Palette: Close", "View"},
 	.Palette_Confirm          = {"Palette: Confirm", "View"},
@@ -713,6 +725,40 @@ block_edit_note :: proc(app: ^App) {
 	app_note(app, fmt.tprintf("[COLUMN EDIT REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
 }
 
+// The note for both of Sort Lines / Sort Lines Descending, in one place for the
+// reason block_edit_note is: copies of a refusal message drift, and the cap is
+// read off the constant rather than written out because BLOCK_EDIT_MAX_LINES has
+// already moved once and a literal would have gone stale silently.
+//
+// The .Unchanged note is not decoration. These are palette-only, so the user has
+// just typed a name and pressed Enter; with nothing to do and nothing said, the
+// command reads as broken -- the same argument .Bookmark_Cycle's "[NO
+// BOOKMARKS]" makes. And .Unchanged specifically means NO undo entry was pushed
+// (doc_sort_lines returns before doc_batch_begin), so there is not even a
+// history row to notice.
+@(private = "file")
+sort_lines_dispatch :: proc(app: ^App, doc: ^Document, mode: Sort_Mode) {
+	switch doc_sort_lines(doc, mode) {
+	case .Ok:
+	// The document visibly changed; a note would be noise.
+	case .Unchanged:
+		if doc != nil && doc.kind == .Text {
+			app_note(app, "[ALREADY SORTED]")
+		}
+	case .Too_Big:
+		app_note(
+			app,
+			fmt.tprintf(
+				"[SORT REFUSED - the lines are read and rewritten in one go, and this is over the %d MB / %d line limit]",
+				SORT_MAX_BYTES / (1024 * 1024),
+				SORT_MAX_LINES,
+			),
+		)
+	case .Unresolved:
+		app_note(app, "[SORT UNAVAILABLE HERE - a line runs longer than the sort can scan]")
+	}
+}
+
 // The typed-character path when a rectangle is live: one character replaces the
 // rectangle's cell range on every row it spans (or, at zero width, is inserted
 // on every row -- prefixing a column). main.odin's char loop calls this instead
@@ -741,7 +787,14 @@ editor_input_rune :: proc(app: ^App, doc: ^Document, t: ^plat.Text, r: rune) {
 command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	#partial switch cmd {
 	case .Backspace, .Delete_Fwd, .Delete_Word_Back, .Insert_Newline, .Insert_Tab, .Undo, .Redo, .Cut, .Paste,
-	     .Move_Line_Up, .Move_Line_Down:
+	     .Move_Line_Up, .Move_Line_Down,
+	     // One replace over a whole-line region -- the same kind of edit
+	     // Alt+Up/Down already is, and for the same reasons it has to be listed
+	     // here: table view must block it (the grid is read-only and a caret left
+	     // over from text view would rewrite the file underneath it), and a live
+	     // column rectangle must be dropped first or it keeps naming rows the
+	     // sort has since moved.
+	     .Sort_Lines, .Sort_Lines_Desc:
 		return true
 	// Changing the line ending rewrites the ENTIRE buffer -- doc_set_line_ending
 	// does pt_delete(0, length) followed by pt_insert -- so every line start after
@@ -1115,6 +1168,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		if !doc_bookmark_cycle(doc, ev.shift) && doc != nil && doc.kind == .Text {
 			app_note(app, "[NO BOOKMARKS - press Ctrl+F2 to set one]")
 		}
+	case .Sort_Lines:
+		sort_lines_dispatch(app, doc, .Ascending)
+	case .Sort_Lines_Desc:
+		sort_lines_dispatch(app, doc, .Descending)
 	case .Toggle_Wrap:
 		doc.wrap = !doc.wrap
 		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start

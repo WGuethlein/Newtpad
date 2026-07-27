@@ -2218,6 +2218,243 @@ doc_move_lines :: proc(doc: ^Document, delta: int) {
 	doc.last_edit_at = doc.cursor
 }
 
+// --- sort lines ---
+//
+// Two commands (and, shortly, a third) over one procedure, because the only
+// thing that differs is what happens to the line list in the middle: the scope
+// resolution, the cap, the terminator handling, the single write and the
+// bookmark consequence are shared, and each of them is a place a second copy
+// would drift.
+//
+// The shape is doc_move_lines': resolve a whole-line region, read it ONCE, build
+// the replacement in a private buffer, and write it back with ONE
+// doc_replace_range inside a doc_batch_begin/end pair. Not a per-line edit loop
+// -- §5's measurement is 2,000 per-row splices at 64 ms with the tree left
+// fragmented so every later read pays, where one region replace costs what a
+// single edit costs.
+
+// The region a sort will read, allocate and copy in one go, on the input thread.
+// 16 MiB is eight times MOVE_LINE_BUDGET: a sort is a deliberate, once-in-a-while
+// action rather than a held key, so it can afford more than a line move, but it
+// still must not turn "Ctrl+A, sort" on a multi-GB log into an unbounded copy.
+SORT_MAX_BYTES :: 16 * 1024 * 1024
+// ...and the line count, which the byte cap does not bound on its own: 16 MiB of
+// "a\n" is eight million lines, and the sort's own per-line bookkeeping is what
+// costs there, not the bytes. Whichever binds first refuses.
+SORT_MAX_LINES :: 1_000_000
+
+// What a sort did, so the caller can post the note. doc.odin has no ^App (the
+// same layering block_extend keeps), so the refusal text lives in commands.odin
+// beside every other refusal note.
+Sort_Result :: enum u8 {
+	Ok, // the region was rewritten
+	Unchanged, // already in order -- nothing written, NO undo entry
+	Too_Big, // over SORT_MAX_BYTES or SORT_MAX_LINES: refused, nothing changed
+	Unresolved, // a line start or line end further than the cap away: refused
+}
+
+Sort_Mode :: enum u8 {
+	Ascending,
+	Descending,
+}
+
+// One line of the region: a slice INTO the read-once buffer (which does not move
+// while the sort runs) plus where the line started out.
+//
+// `idx` is not decoration -- it is the final tie-break in both comparators, and
+// it is what makes the sort STABLE. slice.sort_by is smoothsort and explicitly
+// "not guaranteed to be stable", so without a tie-break the order of `Foo` and
+// `foo` -- equal under a case-insensitive compare -- would be whatever the heap
+// happened to do. With it the comparator is a total order and the result is the
+// stable one by construction, independent of the algorithm underneath.
+@(private = "file")
+Sort_Line :: struct {
+	text: []u8,
+	idx:  int,
+}
+
+// Ascending and descending as two procs rather than one plus a flag: slice.sort_by
+// takes a plain proc with no closure, and a package-level "which direction is this
+// sort" variable is exactly the kind of hidden state that makes two call sites
+// disagree. Note both tie-break on `idx` ASCENDING: descending reverses the ORDER,
+// not the ties, so equal lines keep their original relative order either way --
+// which is also why this cannot be reverse_sort over the ascending comparator.
+@(private = "file")
+sort_less_asc :: proc(a, b: Sort_Line) -> bool {
+	c := sort_cmp_ci(a.text, b.text)
+	return c < 0 if c != 0 else a.idx < b.idx
+}
+
+@(private = "file")
+sort_less_desc :: proc(a, b: Sort_Line) -> bool {
+	c := sort_cmp_ci(a.text, b.text)
+	return c > 0 if c != 0 else a.idx < b.idx
+}
+
+@(private = "file")
+sort_lower :: proc(b: u8) -> u8 {return b + 32 if b >= 'A' && b <= 'Z' else b}
+
+// Case-insensitive (ASCII) byte order, ties broken by length. Not a locale
+// collation and not Unicode case folding: this is the "no options" sort of
+// principle 3, and the audience is log lines and identifiers.
+@(private = "file")
+sort_cmp_ci :: proc(a, b: []u8) -> int {
+	n := min(len(a), len(b))
+	for i in 0 ..< n {
+		ca, cb := sort_lower(a[i]), sort_lower(b[i])
+		if ca != cb {return -1 if ca < cb else 1}
+	}
+	if len(a) != len(b) {return -1 if len(a) < len(b) else 1}
+	return 0
+}
+
+// Split [0,len(buf)) into lines and their terminators. `buf` is a whole-line
+// region that never ends with a terminator (see doc_sort_lines' hi), so there
+// are exactly (newlines + 1) lines and (newlines) terminators.
+//
+// `terms[i]` is the LENGTH of the terminator that followed input line i -- 2 for
+// CRLF, 1 for LF. A 2 is always exactly "\r\n" by construction, which is what
+// lets the join re-emit it from the length alone.
+//
+// Terminators are indexed by POSITION, not carried with their line, and that is
+// the whole line-ending story here. doc_move_lines takes the same view ("only
+// the two lines swap between them"), and it is stronger than re-emitting
+// doc.eol: a CRLF file comes back CRLF and an LF file LF, but so does a region
+// that disagrees with doc.eol -- which is reachable, because detect_line_ending
+// only sniffs the head of the file (§6ab) while the region can be anywhere in
+// it. Nothing is normalised, invented or discarded; the same terminator bytes
+// come back in the same places.
+@(private = "file")
+sort_split_lines :: proc(buf: []u8, lines: ^[dynamic]Sort_Line, terms: ^[dynamic]u8) {
+	start := 0
+	for i := 0; i < len(buf); i += 1 {
+		if buf[i] != '\n' {continue}
+		end := i
+		tl := 1
+		if end > start && buf[end - 1] == '\r' {
+			end -= 1
+			tl = 2
+		}
+		append(lines, Sort_Line{text = buf[start:end], idx = len(lines)})
+		append(terms, u8(tl))
+		start = i + 1
+	}
+	append(lines, Sort_Line{text = buf[start:], idx = len(lines)})
+}
+
+// Sort the selected lines, expanded to whole lines at both ends -- the whole
+// document when there is no selection.
+//
+// Expanding is not optional: a selection almost never lands exactly on line
+// boundaries, and sorting a partial first or last line corrupts it.
+//
+// Bookmarks: every bookmark INSIDE the region is dropped, every one outside is
+// kept, and neither is coded here. The single write goes through
+// doc_replace_range -> pt_edit_replace, whose one rule already says exactly
+// that (bookmarks_shift_replace: `at <= b < at+n` is dropped; `b < at` is
+// untouched; `b >= at+n` shifts). That is deliberate and it is the point of
+// §6ad's one-seam collapse -- a sort reorders lines, so no shift can express
+// where a bookmark went, and leaving one pointing at whatever line landed on
+// its offset is the Alt+Down bug that shipped. `Reload from Disk` and
+// doc_set_line_ending drop for the same reason.
+//
+// A bookmark at the region's far edge (b == hi) survives and lands correctly:
+// the replacement text ends in '\n' whenever hi is not the buffer end (the
+// region stops at a line's CONTENT end, so its terminator is the untouched byte
+// that follows), which is exactly what bookmarks_shift_replace's `b == at+n`
+// rule asks for.
+doc_sort_lines :: proc(doc: ^Document, mode: Sort_Mode) -> Sort_Result {
+	if doc == nil || doc.kind != .Text || doc.pt.length == 0 {return .Unchanged}
+
+	sel_lo, sel_hi := doc_sel_range(doc)
+	if !doc_has_sel(doc) {sel_lo, sel_hi = 0, doc.pt.length}
+
+	lo, lo_exact := base.pt_line_start_cap(&doc.pt, sel_lo, SORT_MAX_BYTES)
+	if !lo_exact {return .Unresolved}
+
+	// A range that ends exactly ON a line start does not include that line --
+	// the convention every editor with this command uses, and here it is also
+	// what stops "no selection" (sel_hi == pt.length) from feeding the trailing
+	// empty line of a newline-terminated file into the sort, where it would
+	// float to the top and turn "a\nb\n" into "\na\nb".
+	end_pos := sel_hi
+	if end_pos > lo && end_pos > 0 && byte_at(doc, end_pos - 1) == '\n' {end_pos -= 1}
+
+	last_start, last_exact := base.pt_line_start_cap(&doc.pt, end_pos, SORT_MAX_BYTES)
+	if !last_exact {return .Unresolved}
+	// The region stops at the last line's CONTENT end, terminator excluded, so
+	// the document's trailing terminator (or its absence) is never part of what
+	// is rewritten. That is what makes "does this file end with a newline"
+	// survive by construction rather than by an end-of-join special case -- the
+	// bytes are simply never read and never written.
+	hi, _, span_ok := line_span_cap(&doc.pt, last_start, SORT_MAX_BYTES)
+	if !span_ok {return .Unresolved}
+	if hi <= lo {return .Unchanged}
+	if hi - lo > SORT_MAX_BYTES {return .Too_Big}
+
+	buf := make([]u8, hi - lo)
+	defer delete(buf)
+	base.pt_read(&doc.pt, lo, buf)
+
+	lines := make([dynamic]Sort_Line, 0, 64)
+	defer delete(lines)
+	terms := make([dynamic]u8, 0, 64)
+	defer delete(terms)
+	sort_split_lines(buf, &lines, &terms)
+	// After the read, not before: the byte cap already bounds this scan, and the
+	// line count is not knowable without it. Still a refusal that changes
+	// nothing -- the buffer has not been touched yet.
+	if len(lines) > SORT_MAX_LINES {return .Too_Big}
+	if len(lines) < 2 {return .Unchanged}
+
+	out_lines := lines[:]
+	switch mode {
+	case .Ascending:
+		slice.sort_by(out_lines, sort_less_asc)
+	case .Descending:
+		slice.sort_by(out_lines, sort_less_desc)
+	}
+
+	out := make([dynamic]u8, 0, len(buf))
+	defer delete(out)
+	for l, i in out_lines {
+		append(&out, ..l.text)
+		// Positional terminators (see sort_split_lines). len(out_lines) <=
+		// len(lines) always, so terms[i] exists for every i < len(out_lines)-1.
+		if i < len(out_lines) - 1 {
+			if terms[i] == 2 {append(&out, '\r')}
+			append(&out, '\n')
+		}
+	}
+
+	// Nothing to write. Crucially this is checked BEFORE doc_batch_begin, whose
+	// push_undo would otherwise mark the document modified and push an entry
+	// that restores the state it is already in -- an undo step that does
+	// nothing is worse than no undo step, and it evicts a real one from
+	// UNDO_MAX. block_delete's own no-op guard exists for the same reason.
+	if slice.equal(out[:], buf) {return .Unchanged}
+
+	had_sel := doc_has_sel(doc)
+	doc_batch_begin(doc, .Replace)
+	doc_replace_range(doc, lo, hi - lo, out[:])
+	doc_batch_end(doc, 1)
+
+	// Keep the affected region selected when the user had a selection, so a
+	// second command (sort, then dedupe) can follow without re-selecting;
+	// collapse to the region start when they did not, because doc_replace_range
+	// leaves the caret past the inserted text and the end of a just-sorted whole
+	// document is nowhere the user asked to be. Either way the ORIGINAL offsets
+	// are gone on purpose: the lines moved, so preserving the caret's byte offset
+	// would put it in the middle of an unrelated line.
+	if had_sel {
+		doc.anchor, doc.cursor = lo, lo + len(out)
+	} else {
+		doc.anchor, doc.cursor = lo, lo
+	}
+	doc.last_edit_at = doc.cursor
+	return .Ok
+}
+
 // --- cursor movement (select=true extends the selection) ---
 
 doc_cursor_left :: proc(doc: ^Document, select: bool) {
