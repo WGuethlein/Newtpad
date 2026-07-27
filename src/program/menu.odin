@@ -139,10 +139,17 @@ menus := []Menu {
 			{cmd = .Tab_New},
 			{cmd = .Tab_Open},
 			sep,
-			{cmd = .Save, enabled = has_doc},
-			{cmd = .Save_As, enabled = has_doc},
+			// Save and Save As are has_text_doc, not has_doc: on the Settings and
+			// Font pseudo-tabs app_active returns a Document, so both rows were
+			// live and both led to a Save dialog that wrote the pseudo-tab's empty
+			// buffer out as a file the user thought was their settings.
+			{cmd = .Save, enabled = has_text_doc},
+			{cmd = .Save_As, enabled = has_text_doc},
 			{cmd = .Reload, enabled = has_file},
 			sep,
+			// Tab_Close stays has_doc, and this is why the fix is row-by-row rather
+			// than one predicate swap: closing a Settings tab is the ONLY thing on
+			// this menu that means something there, and Ctrl+W already does it.
 			{cmd = .Tab_Close, enabled = has_doc},
 			{cmd = .Exit},
 		},
@@ -157,7 +164,13 @@ menus := []Menu {
 			sep,
 			{cmd = .Cut, enabled = has_sel},
 			{cmd = .Copy, enabled = has_sel},
-			{cmd = .Paste, enabled = has_doc},
+			// has_text_doc for the same reason as File > Save: a paste on the
+			// Settings tab inserted the clipboard into a pseudo-document nothing
+			// draws, leaving it .modified so Ctrl+W then asked whether to save a
+			// page with no file. Cut and Copy need no change -- has_sel is already
+			// false there, because a pseudo-tab swallows every click and keystroke
+			// (main.odin) so no selection can ever exist on one.
+			{cmd = .Paste, enabled = has_text_doc},
 			sep,
 			{cmd = .Select_All, enabled = has_doc},
 			sep,

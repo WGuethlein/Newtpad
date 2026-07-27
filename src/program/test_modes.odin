@@ -1123,6 +1123,62 @@ when NEWTPAD_TESTS {
 				app_destroy(&ea)
 			}
 
+			// The same pseudo-tab problem outside the Encoding menu, which the
+			// Encoding fix did not reach: File > Save / Save As and Edit > Paste
+			// were has_doc, so all three were live on Settings and Font. Save
+			// raised a Save dialog for a page with no file; Paste inserted the
+			// clipboard into a document nothing draws and left it .modified, so
+			// Ctrl+W then asked whether to save it.
+			//
+			// Tab_Close is asserted LIVE in the same breath, deliberately: it
+			// shares has_doc with the rows above, so "gate the pseudo-tabs" done as
+			// one predicate swap would kill the one row on this menu that means
+			// something there. Without this half the test would pass just as well
+			// against the wrong fix.
+			menu_row_live :: proc(app: ^App, cmd: Command_Id) -> (live: bool, found: bool) {
+				for m in menus {
+					for it in m.items {
+						if it.cmd != cmd {continue}
+						found = true
+						if it.enabled == nil || it.enabled(app) {live = true}
+					}
+				}
+				return
+			}
+			pseudo_tab_rows_case :: proc(kind: Tab_Kind) -> (bad: int) {
+				a: App
+				app_open_special(&a, kind)
+				defer app_destroy(&a)
+				for cmd in ([]Command_Id{.Save, .Save_As, .Paste}) {
+					live, found := menu_row_live(&a, cmd)
+					ok := found && !live
+					fmt.printfln("  %-6s %-8v %-8v is dead on the pseudo-tab (found=%v)", "ok" if ok else "FAIL", kind, cmd, found)
+					if !ok {bad += 1}
+				}
+				live, found := menu_row_live(&a, .Tab_Close)
+				ok := found && live
+				fmt.printfln("  %-6s %-8v Tab_Close stays LIVE (found=%v)", "ok" if ok else "FAIL", kind, found)
+				if !ok {bad += 1}
+				return
+			}
+			fmt.println("--- mutating rows are dead on the Settings and Font pseudo-tabs ---")
+			bad += pseudo_tab_rows_case(.Settings)
+			bad += pseudo_tab_rows_case(.Font)
+			// ...and all four are live on a real text tab, or the three above would
+			// pass with the rows simply disabled everywhere.
+			{
+				a: App
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				all_live := true
+				for cmd in ([]Command_Id{.Save, .Save_As, .Paste, .Tab_Close}) {
+					live, found := menu_row_live(&a, cmd)
+					if !found || !live {all_live = false}
+				}
+				fmt.printfln("  %-6s all four are live on an ordinary text tab", "ok" if all_live else "FAIL")
+				if !all_live {bad += 1}
+			}
+
 			fmt.printfln("menutest: %d failures", bad)
 			return true
 		}
