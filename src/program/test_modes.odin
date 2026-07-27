@@ -1805,18 +1805,30 @@ when NEWTPAD_TESTS {
 				return bad
 			}
 
-			// Half three: the boundary that is *not* 260.
+			// Half three: the two boundaries that are *not* 260. Both are invisible
+			// to the round trip above, which sits at 283/292 characters where
+			// everything in sight is prefixed and every limit is long behind it.
 			//
-			// Win32 reserves twelve characters inside a directory for an 8.3 name it
-			// may have to generate there, so a plain CreateDirectoryW refuses at 248
-			// while a plain CreateFileW is content to 259. That asymmetry — not any
-			// margin against MAX_PATH — is why LONG_PATH_THRESHOLD is 248, and
-			// raising it would break mkdir for the lengths 248-258 while every file
-			// operation kept working. The round trip above cannot see it: at 283
-			// characters the directory is far past where the two limits differ.
+			//  - **248, the directory cap.** Win32 reserves twelve characters inside
+			//    a directory for an 8.3 name it may have to generate there, so a
+			//    plain CreateDirectoryW refuses at 248 while a plain CreateFileW is
+			//    content to 259. That asymmetry, not any margin against MAX_PATH, is
+			//    why LONG_PATH_THRESHOLD is 248; raising it breaks mkdir for the
+			//    lengths 248-258 while every file operation keeps working.
+			//
+			//  - **239-247, where a save's two paths disagree.** The target is under
+			//    the threshold and its ".newtpad~" temp is over it, so
+			//    atomic_write_commit hands ReplaceFileW a *plain* destination and a
+			//    `\\?\` source. Win32 resolves the two arguments independently and
+			//    it works — but nothing said so until this fixture, and if it were
+			//    ever untrue, every save of a file whose name lands in that
+			//    nine-character window would fall through to MoveFileExW and quietly
+			//    drop the target's ACLs and Zone.Identifier. That is the precise loss
+			//    the direct ReplaceFileW probe was added to rule out, so ruling it
+			//    out at 292 characters only is ruling it out where it cannot happen.
 			long_path_boundary :: proc() -> int {
 				bad := 0
-				fmt.println("--- the 248-character directory boundary ---")
+				fmt.println("--- the 248 and 239-247 boundaries ---")
 				tmp := os.get_env("TEMP", context.temp_allocator)
 				if tmp == "" {
 					fmt.println("  no %TEMP% in the environment FAIL")
@@ -1842,14 +1854,26 @@ when NEWTPAD_TESTS {
 				// row would stay green through exactly the change it exists to
 				// catch — verified, that is what the first version of it did.
 				DIR_MAX_PLAIN :: 248
+				// Mid-window, so a character of drift either way keeps the target
+				// plain and its 252-character temp prefixed. Both ends are asserted
+				// below anyway.
+				MIXED_TARGET :: 243
 				root := fmt.tprintf(`%s\nplp_bound`, tmp)
 				d248 := fill(root, DIR_MAX_PLAIN, "d")
-				if len(d248) != DIR_MAX_PLAIN {
+				save := fill(root, MIXED_TARGET, "s") // the real save target
+				save_tmp := fmt.tprintf("%s.newtpad~", save)
+				pa := fill(root, MIXED_TARGET, "a") // the direct-probe pair
+				pb := fmt.tprintf("%s.newtpad~", pa)
+				if len(d248) != DIR_MAX_PLAIN || len(save) != MIXED_TARGET {
 					fmt.printfln("  fixture arithmetic failed: root is %d chars FAIL", len(root))
 					return 1
 				}
 
 				defer {
+					plat.file_delete(ext(save))
+					plat.file_delete(ext(save_tmp))
+					plat.file_delete(ext(pa))
+					plat.file_delete(ext(pb))
 					plat.dir_remove(ext(d248))
 					plat.dir_remove(ext(root))
 					left, _ := plat.path_exists(ext(root))
@@ -1874,6 +1898,66 @@ when NEWTPAD_TESTS {
 					fmt.printfln("  dir_create at exactly %d chars failed, win32 error %d FAIL", len(d248), derr)
 					bad += 1
 				}
+
+				// The pair really is mixed. Asserted, not assumed: a threshold change
+				// or a longer %TEMP% would otherwise leave everything below green
+				// while testing two prefixed paths, which the round trip already
+				// covers.
+				dst_plain := plat.long_path_form(save) == save
+				tmp_pref := plat.long_path_form(save_tmp) != save_tmp
+				mixed := dst_plain && tmp_pref
+				fmt.printfln(
+					"  target %d chars plain=%v, temp %d chars prefixed=%v %s",
+					len(save),
+					dst_plain,
+					len(save_tmp),
+					tmp_pref,
+					"OK" if mixed else "FAIL (the fixture is no longer a mixed pair)",
+				)
+				if !mixed {bad += 1}
+
+				// A real save through doc_save_err, twice: the first creates the
+				// target (no destination yet, so the rename), the second replaces it.
+				body := "boundary save, first write\n"
+				dup := make([]u8, len(body))
+				copy(dup, transmute([]u8)body)
+				doc := doc_from_content(dup, "", .UTF8)
+				werr := doc_save_err(&doc, save)
+				doc_close(&doc)
+				st1 := plat.file_stamp(save)
+				create_ok := werr == .None && st1.ok && st1.size == i64(len(body))
+				fmt.printfln("  create-save err=%v size=%d (want %d) %s", werr, st1.size, len(body), "OK" if create_ok else "FAIL")
+				if !create_ok {bad += 1}
+
+				body2 := "boundary save, second write, over an existing target\n"
+				dup2 := make([]u8, len(body2))
+				copy(dup2, transmute([]u8)body2)
+				doc2 := doc_from_content(dup2, "", .UTF8)
+				werr2 := doc_save_err(&doc2, save)
+				doc_close(&doc2)
+				st2 := plat.file_stamp(save)
+				resave_ok := werr2 == .None && st2.ok && st2.size == i64(len(body2))
+				fmt.printfln("  replace-save err=%v size=%d (want %d) %s", werr2, st2.size, len(body2), "OK" if resave_ok else "FAIL")
+				if !resave_ok {bad += 1}
+
+				// ...and *which branch* that second save took, because a green save
+				// proves nothing on its own: the MoveFileExW fallback also returns
+				// .None, and does it while discarding the ACLs. atomic_write_commit
+				// takes ReplaceFileW exactly when GetFileAttributesW sees the plain
+				// destination and file_replace then succeeds, so both halves are
+				// checked here against real Win32, at the real lengths, with a pair
+				// built the same way the save builds its own.
+				wa := plat.file_write_atomic(pa, transmute([]u8)string("a"))
+				wb := plat.file_write_atomic(pb, transmute([]u8)string("bb"))
+				replaced := wa && wb && plat.file_replace(pa, pb)
+				branch := st2.ok && replaced
+				fmt.printfln(
+					"  replace-save took ReplaceFileW: dst visible=%v, ReplaceFileW(plain, \\\\?\\)=%v %s",
+					st2.ok,
+					replaced,
+					"OK" if branch else "FAIL (every save in the 239-247 window falls back to MoveFileEx)",
+				)
+				if !branch {bad += 1}
 
 				return bad
 			}
