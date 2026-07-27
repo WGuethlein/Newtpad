@@ -134,6 +134,13 @@ Color_Role :: enum u8 {
 	Md_Italic,
 	// #A8B89E (1: markdown.odin MD_QUOTE).
 	Md_Quote,
+	// The bookmark mark in the left margin (doc_bookmark_rects). A new role
+	// rather than a reuse: the nearest existing candidates are Accent (the find
+	// bar) and Caret, and a mark that changes colour when an author retunes the
+	// find bar is the kind of coupling these roles exist to prevent. It is also
+	// the one mark on the canvas that must read against the document
+	// background, which is a different constraint from any chrome accent.
+	Bookmark,
 
 	// --- syntax highlighting ---
 	// Declared in batch 3 so batch 4's lexers could emit role names from their
@@ -224,6 +231,7 @@ theme_dark :: proc() -> Theme {
 		.Md_Code        = {0.95, 0.80, 0.65, 1}, // #F2CCA6
 		.Md_Italic      = {0.80, 0.86, 0.78, 1}, // #CCDBC7
 		.Md_Quote       = {0.66, 0.72, 0.62, 1}, // #A8B89E
+		.Bookmark       = {0.40, 0.66, 0.95, 1}, // #66A8F2
 
 		// Light's hue family per role, re-tuned for this theme's Bg_Base
 		// (#1A1F29). Ratios are WCAG relative luminance against Bg_Base,
@@ -340,6 +348,11 @@ theme_light :: proc() -> Theme {
 		.Md_Code        = {0.54, 0.29, 0.13, 1}, // #8A4A22 -- terracotta; legible on Bg_Base and the code-block Bg_Panel fill
 		.Md_Italic      = {0.25, 0.36, 0.23, 1}, // #3F5C3A -- deep moss green (7.5:1 on white)
 		.Md_Quote       = {0.33, 0.38, 0.30, 1}, // #55614C -- deep olive, used for both the quote bar and its text (6.6:1)
+		// A solid mark on the document canvas, so it is judged like Link is:
+		// Dark's #66A8F2 measures 2.6:1 on white and would be a pale smear in
+		// the margin. Deepened to the same blue family as Link, 5.9:1 against
+		// Bg_Base -- a 4px bar needs contrast more than text does, not less.
+		.Bookmark       = {0.13, 0.40, 0.71, 1}, // #2166B5
 
 		// Deliberate light-appropriate placeholders, not magenta: batch 4 has
 		// no consumer for these yet, but a light theme with magenta holes
@@ -471,6 +484,7 @@ theme_role_keys := [Color_Role]string {
 	.Md_Code        = "md_code",
 	.Md_Italic      = "md_italic",
 	.Md_Quote       = "md_quote",
+	.Bookmark       = "bookmark",
 	.Syn_Keyword    = "syn_keyword",
 	.Syn_String     = "syn_string",
 	.Syn_Number     = "syn_number",

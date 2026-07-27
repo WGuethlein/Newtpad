@@ -11501,6 +11501,460 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad bookmarktest` — line bookmarks (doc.odin's bookmark section,
+		// the Ctrl+F2/F2 commands, and the session v5 field).
+		//
+		// The claim this mode has to be able to falsify is NOT "toggling appends
+		// an int". It is that a bookmark still names the line it was set on after
+		// the buffer has moved underneath it. So every edit case asserts three
+		// independent things about the same state:
+		//
+		//   1. the OFFSET, against a number computed by hand from the fixture;
+		//   2. the TEXT at that offset, so an offset that is arithmetically right
+		//      but names the wrong line still fails;
+		//   3. the "every entry is a real line start" INVARIANT, which is the
+		//      property the shift rules exist to preserve and the one that a
+		//      wrong rule breaks even when the arithmetic looks plausible.
+		//
+		// Several cases also assert through doc_bookmark_rects -- what is DRAWN --
+		// rather than through doc.bookmarks alone, because the list is not the
+		// user-visible artifact and a mark on the wrong row is the failure that
+		// would actually be reported.
+		if os.args[1] == "bookmarktest" {
+			if !require_scratch_session("bookmarktest") {return true}
+
+			// "alpha\nbravo\ncharlie\ndelta\n" -- 26 bytes, four lines.
+			// Line starts: 0, 6, 12, 20. Deliberately unequal line lengths so an
+			// off-by-one in a shift cannot land on another line's start by luck.
+			BM_FIX :: "alpha\nbravo\ncharlie\ndelta\n"
+
+			bm_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			// `n` bytes of the buffer starting at BOOKMARK `i` -- read through the
+			// bookmark itself, never at a literal offset.
+			//
+			// This is the difference between a check that can fail and one that
+			// cannot, and it was got wrong first time round: reading at the
+			// expected offset (`bm_at(&d, 14, 7) == "charlie"`) asserts something
+			// about the FIXTURE, not about the bookmark, and sabotaging the shift
+			// left every such line green while the offsets beside them went red.
+			// Reading at d.bookmarks[i] is what makes "the entry still names its
+			// own line" an assertion about the entry.
+			bm_at :: proc(d: ^Document, i, n: int) -> string {
+				if i < 0 || i >= len(d.bookmarks) {return "<no such bookmark>"}
+				at := d.bookmarks[i]
+				if at < 0 || at >= d.pt.length {return "<oob>"}
+				buf := make([]u8, min(n, d.pt.length - at), context.temp_allocator)
+				base.pt_read(&d.pt, at, buf)
+				return string(buf)
+			}
+
+			// The invariant every shift rule is written to preserve: the list is
+			// strictly ascending, in range, and every entry is a real line start.
+			// Checked after every edit case; it is the assertion that does not
+			// depend on the fixture's arithmetic.
+			bm_invariant :: proc(d: ^Document) -> bool {
+				prev := -1
+				for b in d.bookmarks {
+					if b <= prev || b < 0 || b > d.pt.length {return false}
+					prev = b
+					if b == 0 {continue}
+					one: [1]u8
+					base.pt_read(&d.pt, b - 1, one[:])
+					if one[0] != '\n' {return false}
+				}
+				return true
+			}
+
+			bm_list :: proc(d: ^Document) -> string {return fmt.tprintf("%v", d.bookmarks[:])}
+
+			// Bookmark each offset by putting the caret there and toggling, i.e.
+			// through the product's own entry point rather than by appending to
+			// the array -- a fixture built by hand would not prove the toggle
+			// keeps the list sorted.
+			bm_set :: proc(d: ^Document, offs: []int) {
+				for o in offs {
+					d.cursor, d.anchor = o, o
+					doc_bookmark_toggle(d)
+				}
+			}
+
+			bad := 0
+
+			// --- toggle -------------------------------------------------------------
+			bm_toggle :: proc(bad: ^int, fix: string) {
+				fmt.println("--- toggle ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+
+				// From the MIDDLE of a line: the bookmark is the line's start, not
+				// the caret. This is the whole point of "bookmark the line".
+				d.cursor, d.anchor = 14, 14 // inside "charlie"
+				on, ok := doc_bookmark_toggle(&d)
+				bm_chk(bad, on && ok && len(d.bookmarks) == 1 && d.bookmarks[0] == 12, fmt.tprintf("caret mid-line bookmarks the LINE START: %v (want [12])", d.bookmarks[:]))
+
+				// A second line, set from a lower offset, still lands sorted.
+				d.cursor, d.anchor = 2, 2
+				doc_bookmark_toggle(&d)
+				bm_chk(bad, len(d.bookmarks) == 2 && d.bookmarks[0] == 0 && d.bookmarks[1] == 12, fmt.tprintf("the list stays sorted: %v (want [0 12])", d.bookmarks[:]))
+
+				// Toggling the same line OFF, from a different offset on it than
+				// the one it was set from.
+				d.cursor, d.anchor = 18, 18 // still inside "charlie"
+				on2, _ := doc_bookmark_toggle(&d)
+				bm_chk(bad, !on2 && len(d.bookmarks) == 1 && d.bookmarks[0] == 0, fmt.tprintf("toggling off from elsewhere on the line: on=%v %v (want [0])", on2, d.bookmarks[:]))
+
+				// And exactly at a line start, both ways -- offset 0 is the edge
+				// case for every "is this a line start" test in the shift rules.
+				d.cursor, d.anchor = 0, 0
+				doc_bookmark_toggle(&d)
+				bm_chk(bad, len(d.bookmarks) == 0, fmt.tprintf("toggling off at offset 0: %v (want [])", d.bookmarks[:]))
+
+				// A pseudo-tab (Settings/Font) has no lines to bookmark.
+				d.kind = .Settings
+				_, okp := doc_bookmark_toggle(&d)
+				bm_chk(bad, !okp && len(d.bookmarks) == 0, "a pseudo-tab refuses rather than bookmarking its empty buffer")
+			}
+			bm_toggle(&bad, BM_FIX)
+
+			// --- cycle, with wrap ----------------------------------------------------
+			bm_cycle :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int)) {
+				fmt.println("--- cycle ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+
+				// An empty set: a no-op that says so, not a crash and not a caret
+				// teleported to 0.
+				d.cursor, d.anchor = 14, 14
+				movedF := doc_bookmark_cycle(&d, false)
+				movedB := doc_bookmark_cycle(&d, true)
+				bm_chk(bad, !movedF && !movedB && d.cursor == 14, fmt.tprintf("cycling an empty set is a no-op: fwd=%v back=%v cursor=%d", movedF, movedB, d.cursor))
+
+				set(&d, {0, 12, 20})
+				d.cursor, d.anchor = 0, 0
+				doc_bookmark_cycle(&d, false)
+				c1 := d.cursor
+				doc_bookmark_cycle(&d, false)
+				c2 := d.cursor
+				doc_bookmark_cycle(&d, false)
+				c3 := d.cursor // wraps to the first
+				bm_chk(bad, c1 == 12 && c2 == 20 && c3 == 0, fmt.tprintf("forward wraps: 0 -> %d -> %d -> %d (want 12, 20, 0)", c1, c2, c3))
+
+				b1 := doc_bookmark_cycle(&d, true) ? d.cursor : -1 // wraps to the last
+				doc_bookmark_cycle(&d, true)
+				b2 := d.cursor
+				doc_bookmark_cycle(&d, true)
+				b3 := d.cursor
+				bm_chk(bad, b1 == 20 && b2 == 12 && b3 == 0, fmt.tprintf("backward wraps: 0 -> %d -> %d -> %d (want 20, 12, 0)", b1, b2, b3))
+
+				// From a caret that is not itself on a bookmark: forward goes to
+				// the next one AFTER the caret, not to the next INDEX.
+				d.cursor, d.anchor = 14, 14 // inside "charlie", whose start (12) is bookmarked
+				doc_bookmark_cycle(&d, false)
+				fwd := d.cursor
+				d.cursor, d.anchor = 14, 14
+				doc_bookmark_cycle(&d, true)
+				back := d.cursor
+				bm_chk(bad, fwd == 20 && back == 12, fmt.tprintf("from mid-line: forward=%d back=%d (want 20, 12 -- back lands on this line's own start)", fwd, back))
+
+				// The jump collapses a selection, like every other caret move.
+				d.cursor, d.anchor = 0, 26
+				doc_bookmark_cycle(&d, false)
+				bm_chk(bad, d.anchor == d.cursor, fmt.tprintf("the jump collapses the selection: cursor=%d anchor=%d", d.cursor, d.anchor))
+			}
+			bm_cycle(&bad, BM_FIX, bm_set)
+
+			// --- an insert ABOVE shifts the offset ------------------------------------
+			//
+			// THE case this feature is most likely to get wrong, so it is asserted
+			// four ways: the offsets, the text each one names, the line-start
+			// invariant, and the marks that actually get drawn. Removing the shift
+			// leaves offsets 12 and 20 pointing at 'o' inside "bravo" and 'e'
+			// inside "charlie" -- neither is a line start, so all four fail.
+			bm_insert :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), at: proc(d: ^Document, at, n: int) -> string, inv: proc(d: ^Document) -> bool) {
+				fmt.println("--- an insert above shifts ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+				set(&d, {12, 20})
+
+				d.cursor, d.anchor = 0, 0
+				doc_insert_text(&d, transmute([]u8)string("XY"), .Paste)
+				bm_chk(bad, len(d.bookmarks) == 2 && d.bookmarks[0] == 14 && d.bookmarks[1] == 22, fmt.tprintf("2 bytes at offset 0: %v (want [14 22])", d.bookmarks[:]))
+				bm_chk(bad, at(&d, 0, 7) == "charlie" && at(&d, 1, 5) == "delta", fmt.tprintf("...and they still name their own lines: %q / %q (want \"charlie\" / \"delta\")", at(&d, 0, 7), at(&d, 1, 5)))
+				bm_chk(bad, inv(&d), "...and every entry is still a line start")
+
+				// An insert BETWEEN two bookmarks moves only the later one.
+				d.cursor, d.anchor = 21, 21 // the end of "charlie", after the first bookmark
+				doc_insert_text(&d, transmute([]u8)string("ZZZ"), .Paste)
+				bm_chk(bad, d.bookmarks[0] == 14 && d.bookmarks[1] == 25, fmt.tprintf("an insert between them moves only the later: %v (want [14 25])", d.bookmarks[:]))
+				bm_chk(bad, at(&d, 0, 10) == "charlieZZZ" && at(&d, 1, 5) == "delta", fmt.tprintf("...still their own lines: %q / %q", at(&d, 0, 10), at(&d, 1, 5)))
+				bm_chk(bad, inv(&d), "...invariant holds")
+
+				// An insert EXACTLY AT a bookmark leaves it alone: the byte before
+				// it did not move, so the offset is still that line's start, and
+				// the inserted text belongs to the bookmarked line. Shifting here
+				// would push the entry one byte into its own line, where no row's
+				// line start matches it -- the mark would silently stop drawing.
+				d.cursor, d.anchor = 14, 14
+				doc_insert_text(&d, transmute([]u8)string("Q"), .Paste)
+				bm_chk(bad, d.bookmarks[0] == 14 && at(&d, 0, 8) == "Qcharlie", fmt.tprintf("an insert AT the line start does not shift it: %v, line is %q (want [14 ...] \"Qcharlie\")", d.bookmarks[:], at(&d, 0, 8)))
+				bm_chk(bad, inv(&d), "...invariant holds")
+
+				// ...including when what is inserted ENDS in a newline, which is
+				// the case where the two answers differ visibly: offset 14 now
+				// begins the new "NEW" line.
+				d.cursor, d.anchor = 14, 14
+				doc_insert_text(&d, transmute([]u8)string("NEW\n"), .Paste)
+				bm_chk(bad, d.bookmarks[0] == 14 && at(&d, 0, 3) == "NEW", fmt.tprintf("a newline-terminated insert at the line start keeps the offset: %v, line is %q", d.bookmarks[:], at(&d, 0, 3)))
+				bm_chk(bad, inv(&d), "...invariant holds")
+			}
+			bm_insert(&bad, BM_FIX, bm_set, bm_at, bm_invariant)
+
+			// --- deletes -------------------------------------------------------------
+			bm_delete :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), at: proc(d: ^Document, at, n: int) -> string, inv: proc(d: ^Document) -> bool) {
+				fmt.println("--- deletes ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+
+				// Deleting the bookmarked line takes the bookmark with it, and the
+				// bookmark BELOW it shifts up onto the offset the deleted line had.
+				set(&d, {12, 20})
+				d.anchor, d.cursor = 12, 20 // all of "charlie\n"
+				doc_replace_sel(&d, nil, .Delete)
+				bm_chk(bad, len(d.bookmarks) == 1 && d.bookmarks[0] == 12, fmt.tprintf("deleting the bookmarked line drops it: %v (want [12], the old 20)", d.bookmarks[:]))
+				bm_chk(bad, at(&d, 0, 5) == "delta", fmt.tprintf("...and the survivor still names its own line: %q", at(&d, 0, 5)))
+				bm_chk(bad, inv(&d), "...invariant holds")
+
+				// Deleting the line ABOVE a bookmark must KEEP it -- the bookmarked
+				// line now begins where the deleted one did. This is the case that
+				// stops "drop anything the delete touched" from being the rule.
+				d2 := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d2)
+				set(&d2, {12})
+				d2.anchor, d2.cursor = 6, 12 // all of "bravo\n"
+				doc_replace_sel(&d2, nil, .Delete)
+				bm_chk(bad, len(d2.bookmarks) == 1 && d2.bookmarks[0] == 6 && at(&d2, 0, 7) == "charlie", fmt.tprintf("deleting the line ABOVE shifts, does not drop: %v %q (want [6] \"charlie\")", d2.bookmarks[:], at(&d2, 0, 7)))
+				bm_chk(bad, inv(&d2), "...invariant holds")
+
+				// Backspace at a bookmarked line start JOINS it onto the previous
+				// line. The offset would land mid-line, so the bookmark dies --
+				// the one delete case that is neither "inside the range" nor a
+				// plain shift, and the reason the rule reads the byte in front of
+				// the deleted range.
+				d3 := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d3)
+				set(&d3, {12})
+				d3.cursor, d3.anchor = 12, 12
+				doc_backspace(&d3)
+				bm_chk(bad, len(d3.bookmarks) == 0, fmt.tprintf("Backspace at the line start joins the line and drops the bookmark: %v (want [])", d3.bookmarks[:]))
+				bm_chk(bad, inv(&d3), "...invariant holds")
+
+				// A delete that starts at the bookmarked line start but stays
+				// inside the line drops it too. Deliberate conservatism, pinned
+				// here so it is a decision and not a surprise: the rule is "the
+				// line start was inside the deleted text", and distinguishing this
+				// from a whole-line delete would need the line's extent, a scan
+				// this path does not otherwise pay for.
+				d4 := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d4)
+				set(&d4, {12})
+				d4.cursor, d4.anchor = 12, 12
+				doc_delete_fwd(&d4)
+				bm_chk(bad, len(d4.bookmarks) == 0, fmt.tprintf("Delete at the line start drops it (documented conservatism): %v (want [])", d4.bookmarks[:]))
+
+				// A delete entirely BELOW every bookmark moves nothing.
+				d5 := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d5)
+				set(&d5, {0, 6})
+				d5.anchor, d5.cursor = 20, 26
+				doc_replace_sel(&d5, nil, .Delete)
+				bm_chk(bad, len(d5.bookmarks) == 2 && d5.bookmarks[0] == 0 && d5.bookmarks[1] == 6, fmt.tprintf("a delete below them changes nothing: %v (want [0 6])", d5.bookmarks[:]))
+				bm_chk(bad, inv(&d5), "...invariant holds")
+			}
+			bm_delete(&bad, BM_FIX, bm_set, bm_at, bm_invariant)
+
+			// --- undo / redo ---------------------------------------------------------
+			bm_undo :: proc(bad: ^int, fix: string, set: proc(d: ^Document, offs: []int), inv: proc(d: ^Document) -> bool) {
+				fmt.println("--- undo/redo ---")
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+				set(&d, {12, 20})
+
+				d.anchor, d.cursor = 12, 20
+				doc_replace_sel(&d, nil, .Delete)
+				after := fmt.tprintf("%v", d.bookmarks[:])
+				doc_undo(&d)
+				bm_chk(bad, len(d.bookmarks) == 2 && d.bookmarks[0] == 12 && d.bookmarks[1] == 20, fmt.tprintf("undo restores the dropped bookmark: %v (want [12 20], was %s)", d.bookmarks[:], after))
+				bm_chk(bad, inv(&d), "...invariant holds")
+				doc_redo(&d)
+				bm_chk(bad, len(d.bookmarks) == 1 && d.bookmarks[0] == 12, fmt.tprintf("redo re-applies the drop: %v (want [12])", d.bookmarks[:]))
+
+				// A bookmark set AFTER an edit belongs to the state it was set in:
+				// undoing that edit must bring back the set as it was BEFORE it,
+				// not carry the newer one backwards.
+				d2 := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d2)
+				set(&d2, {12})
+				d2.cursor, d2.anchor = 0, 0
+				doc_insert_text(&d2, transmute([]u8)string("XY"), .Paste) // 12 -> 14
+				set(&d2, {0}) // a second bookmark, in the post-edit state
+				doc_undo(&d2)
+				bm_chk(bad, len(d2.bookmarks) == 1 && d2.bookmarks[0] == 12, fmt.tprintf("undo restores the set that belonged to the state: %v (want [12])", d2.bookmarks[:]))
+				doc_redo(&d2)
+				bm_chk(bad, len(d2.bookmarks) == 2 && d2.bookmarks[0] == 0 && d2.bookmarks[1] == 14, fmt.tprintf("redo restores the newer set: %v (want [0 14])", d2.bookmarks[:]))
+			}
+			bm_undo(&bad, BM_FIX, bm_set, bm_invariant)
+
+			// --- what is DRAWN -------------------------------------------------------
+			//
+			// The seam, not the unit: doc_bookmark_rects walks the same
+			// visible_begin/visible_next the draw does, so these assertions are
+			// about rows the document actually renders. A wrapped line is the case
+			// worth having -- its continuation rows have a `start` that is not the
+			// logical line start, and a mark on one of them would be a mark on a
+			// row the user reads as the middle of a sentence.
+			bm_marks :: proc(bad: ^int, fix: string, t: ^plat.Text, set: proc(d: ^Document, offs: []int)) {
+				fmt.println("--- the drawn marks ---")
+				px := BASE_PX
+				q: [32]plat.Quad
+
+				d := doc_from_content(transmute([]u8)strings.clone(fix), "", .UTF8)
+				defer doc_close(&d)
+				d.view_cols = 80
+				set(&d, {6, 20})
+
+				n := doc_bookmark_rects(&d, t, px, 4, q[:])
+				okn := n == 2 && q[0].pos.y == row_rect_y(px, 1) && q[1].pos.y == row_rect_y(px, 3)
+				bm_chk(bad, okn, fmt.tprintf("one mark per bookmarked visible row: n=%d ys=%v/%v (want 2 at rows 1 and 3)", n, q[0].pos.y, q[1].pos.y))
+				bm_chk(bad, n == 2 && q[0].size.y == line_height(px), fmt.tprintf("a mark is one row tall: %v (want %v)", q[0].size.y, line_height(px)))
+
+				// Entirely left of where text begins, at any gutter width. This is
+				// the "do not add a second width" check: the mark is positioned
+				// against TEXT_MARGIN_X only, and col_x is the one definition of
+				// where column 0 starts, so asking col_x is how the two are kept
+				// from overlapping rather than comparing two literals.
+				cw := plat.text_char_width(t, px)
+				clear_of_text := n == 2 && q[0].pos.x >= 0 && q[0].pos.x + q[0].size.x <= col_x(cw, 0)
+				bm_chk(bad, clear_of_text, fmt.tprintf("the mark sits left of column 0: [%v,%v) vs col_x(0)=%v", q[0].pos.x, q[0].pos.x + q[0].size.x, col_x(cw, 0)))
+				// ...and with a filter-view gutter present it is still clear of it,
+				// since GUTTER_W only pushes column 0 further right.
+				saved := GUTTER_W
+				GUTTER_W = 40
+				n2 := doc_bookmark_rects(&d, t, px, 4, q[:])
+				bm_chk(bad, n2 == 2 && q[0].pos.x + q[0].size.x <= col_x(cw, 0), fmt.tprintf("...and still clear with a gutter: [%v,%v) vs col_x(0)=%v", q[0].pos.x, q[0].pos.x + q[0].size.x, col_x(cw, 0)))
+				GUTTER_W = saved
+
+				// Scrolled: only the bookmarks in view are drawn, at their row
+				// within the view rather than their row in the file.
+				d.top = 12
+				n3 := doc_bookmark_rects(&d, t, px, 2, q[:])
+				bm_chk(bad, n3 == 1 && q[0].pos.y == row_rect_y(px, 1), fmt.tprintf("scrolled: n=%d y=%v (want 1 at row 1)", n3, q[0].pos.y))
+
+				// A wrapped line gets exactly ONE mark, on its first visual row --
+				// and the line AFTER it is marked on the row it is actually drawn
+				// on, which is the assertion that pins the row walk to
+				// visible_next. A mark placed by counting newlines from doc.top
+				// (the obvious second implementation) puts "tail" on row 2 instead
+				// of row 9, because it cannot see that one logical line occupied
+				// eight visual rows.
+				//
+				// "head\n" is 0..4, the 300-'w' line starts at 5, its terminator is
+				// at 305, "tail" starts at 306. At 40 cells the long line is 8
+				// visual rows (1..8), so "tail" is row 9.
+				long := strings.repeat("w", 300, context.temp_allocator)
+				wsrc := fmt.tprintf("head\n%s\ntail\n", long)
+				w := doc_from_content(transmute([]u8)strings.clone(wsrc), "", .UTF8)
+				defer doc_close(&w)
+				w.wrap = true
+				w.view_cols = 40
+				set(&w, {5, 306})
+				nw := doc_bookmark_rects(&w, t, px, 12, q[:])
+				okw := nw == 2 && q[0].pos.y == row_rect_y(px, 1) && q[1].pos.y == row_rect_y(px, 9)
+				bm_chk(bad, okw, fmt.tprintf("a wrapped line is marked once and the next line lands on its real row: n=%d ys=%v/%v (want 2 at rows 1 and 9)", nw, q[0].pos.y, q[1].pos.y))
+			}
+
+			// --- the bindings and the dispatch ---------------------------------------
+			//
+			// Through resolve_key and command_dispatch, not by calling the doc
+			// procs: the claim is that Ctrl+F2 and F2/Shift+F2 DO these things.
+			// Shift+F2 is the case the whole command shape exists for -- it is not
+			// a second binding and cannot be, so if the dispatch ever stops reading
+			// ev.shift the two directions collapse into one and only this fails.
+			bm_dispatch :: proc(bad: ^int, fix: string, t: ^plat.Text) {
+				fmt.println("--- Ctrl+F2 / F2 / Shift+F2 ---")
+				bm_chk(bad, resolve_key(.F2, true, false, .Editor) == .Bookmark_Toggle, fmt.tprintf("Ctrl+F2 -> %v", resolve_key(.F2, true, false, .Editor)))
+				bm_chk(bad, resolve_key(.F2, false, false, .Editor) == .Bookmark_Cycle, fmt.tprintf("F2 -> %v", resolve_key(.F2, false, false, .Editor)))
+
+				// Adding F1-F12 to plat.Key took Alt+F4 away from Windows: before
+				// it, VK_F4 translated to .None and the pump fell through to
+				// DefWindowProc, which is what closes the window. Nothing in the
+				// type system could catch that -- the enum grew and every
+				// exhaustive switch still compiled. The rule lives in one
+				// predicate that the pump asks and this asserts, since driving the
+				// real wnd_proc needs an HWND and a message loop.
+				bm_chk(bad, plat.key_belongs_to_windows(.F4, true) && plat.key_belongs_to_windows(.F10, true), "Alt+F4 and F10 are handed back to Windows")
+				bm_chk(bad, !plat.key_belongs_to_windows(.F4, false) && !plat.key_belongs_to_windows(.F10, false), "...but a bare F4 / F10 is ordinary and stays bindable")
+				bm_chk(bad, !plat.key_belongs_to_windows(.F2, true) && !plat.key_belongs_to_windows(.Z, true), "...and Alt+F2 / Alt+Z are ours")
+
+				a: App
+				dummy: plat.Window
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				a.settings = settings_default()
+				ad := app_active(&a)
+				doc_insert_text(ad, transmute([]u8)fix, .Paste)
+				ad.cursor, ad.anchor = 0, 0
+
+				// Ctrl+F2 on three lines, reached the way the user reaches them.
+				for off in ([]int{0, 12, 20}) {
+					ad.cursor, ad.anchor = off, off
+					command_dispatch(resolve_key(.F2, true, false, .Editor), {.F2, true, false, false}, &a, &dummy, t, 10)
+				}
+				bm_chk(bad, len(ad.bookmarks) == 3, fmt.tprintf("Ctrl+F2 x3 sets three: %v", ad.bookmarks[:]))
+
+				ad.cursor, ad.anchor = 0, 0
+				cyc := resolve_key(.F2, false, false, .Editor)
+				command_dispatch(cyc, {.F2, false, false, false}, &a, &dummy, t, 10)
+				fwd := ad.cursor
+				command_dispatch(cyc, {.F2, false, true, false}, &a, &dummy, t, 10) // Shift+F2
+				back := ad.cursor
+				bm_chk(bad, fwd == 12 && back == 0, fmt.tprintf("F2 then Shift+F2: %d then %d (want 12 then 0 -- shift is read from the event, not the chord)", fwd, back))
+
+				// Ctrl+F2 again on a bookmarked line removes it.
+				ad.cursor, ad.anchor = 14, 14
+				command_dispatch(resolve_key(.F2, true, false, .Editor), {.F2, true, false, false}, &a, &dummy, t, 10)
+				bm_chk(bad, len(ad.bookmarks) == 2, fmt.tprintf("Ctrl+F2 again clears that line: %v", ad.bookmarks[:]))
+
+				// An empty set says so rather than leaving the key looking dead.
+				b: App
+				dummy2: plat.Window
+				app_new_scratch(&b)
+				defer app_destroy(&b)
+				b.settings = settings_default()
+				command_dispatch(cyc, {.F2, false, false, false}, &b, &dummy2, t, 10)
+				bm_chk(bad, app_notice_active(&b) && strings.contains(b.notice, "NO BOOKMARKS"), fmt.tprintf("F2 with no bookmarks posts a note: %q", b.notice))
+			}
+
+			// The two cases above need real font metrics (visible_next decides wrap
+			// through plat.Text). Loaded once here rather than per case.
+			{
+				t: plat.Text
+				if plat.text_load_faces(&t) {
+					bm_marks(&bad, BM_FIX, &t, bm_set)
+					bm_dispatch(&bad, BM_FIX, &t)
+				} else {
+					fmt.println("  FAIL no fonts loaded; cannot exercise the drawn marks or the dispatch")
+					bad += 1
+				}
+			}
+
+			fmt.printfln("bookmarktest: %d failures", bad)
+			return true
+		}
+
 		if len(os.args) < 3 {return false}
 		path, mode := os.args[1], os.args[2]
 

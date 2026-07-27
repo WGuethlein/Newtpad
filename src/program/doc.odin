@@ -8,6 +8,7 @@ package main
 
 import "base:intrinsics"
 import "core:fmt"
+import "core:slice"
 import "core:strings"
 import "core:thread"
 import "core:unicode/utf8"
@@ -634,13 +635,22 @@ Edit_Kind :: enum u8 {
 UNDO_MAX :: 200 // entries kept; oldest dropped. Each holds a cloned piece tree.
 
 Snapshot :: struct {
-	root:     ^base.Node, // cloned piece tree
-	length:   int,
-	cursor:   int,
-	anchor:   int,
-	nl_delta: int,
-	kind:     Edit_Kind, // the edit that PRODUCED this state (.None = as opened)
-	count:    int, // characters/edits involved, for the label
+	root:      ^base.Node, // cloned piece tree
+	length:    int,
+	cursor:    int,
+	anchor:    int,
+	nl_delta:  int,
+	// The bookmark set belonging to this state, cloned. Owned by the snapshot
+	// exactly like `root` is, and freed wherever `root` is freed.
+	//
+	// A snapshot rather than a replay: undo restores a whole tree (pt_restore),
+	// so there is no edit to run the shift rules backwards against, and the
+	// shift rules are lossy in one direction anyway -- a delete DROPS the
+	// bookmarks it spanned, and nothing in the forward direction remembers what
+	// they were. Carrying the set is what makes undo restore them.
+	bookmarks: []int,
+	kind:      Edit_Kind, // the edit that PRODUCED this state (.None = as opened)
+	count:     int, // characters/edits involved, for the label
 }
 
 // A tab is usually a text document, but Settings and Font are tabs too. Making
@@ -752,6 +762,21 @@ Document :: struct {
 	disk_gone:    bool, // it stopped existing
 	appended:     int, // bytes absorbed from the file's tail since it was opened
 	nl_delta:   int,
+	// Bookmarked lines, as the BYTE OFFSET of each line's first byte, kept
+	// sorted ascending and never holding a duplicate.
+	//
+	// Byte offsets, not line numbers, for the same reason the column rectangle
+	// above stores them: Newtpad has no line index, so turning a line number
+	// back into an offset means walking from byte 0 -- §6y measured 48 ms per
+	// frame at line 28,000 of a 500 KiB log. Every consumer here (the gutter
+	// mark, the cycle, the session writer) wants an offset, so a line number
+	// would be converted at every one of them.
+	//
+	// The invariant, maintained by bookmarks_shift_insert/_delete and worth
+	// stating because everything else leans on it: every entry is a real line
+	// start (offset 0, or preceded by '\n'). See those two procs for how each
+	// edit case preserves it.
+	bookmarks:  [dynamic]int,
 	undo:       [dynamic]Snapshot,
 	redo:       [dynamic]Snapshot,
 	// Coalescing state: what the last edit was and where it left the caret. A
@@ -944,10 +969,11 @@ doc_close :: proc(doc: ^Document) {
 	doc.lex_idx.states = nil
 	// Before pt_destroy: the worker's view aliases the add chunks it frees.
 	search_release(doc)
-	for s in doc.undo {base.pt_free_node_tree(s.root)}
-	for s in doc.redo {base.pt_free_node_tree(s.root)}
+	for s in doc.undo {snapshot_free(s)}
+	for s in doc.redo {snapshot_free(s)}
 	delete(doc.undo)
 	delete(doc.redo)
+	delete(doc.bookmarks)
 	delete(doc.find.query)
 	delete(doc.find.replace)
 	delete(doc.filter_lines)
@@ -1183,6 +1209,169 @@ count_newlines :: proc(doc: ^Document, pos, count: int) -> (c: int) {
 	return
 }
 
+// --- bookmarks ---
+//
+// Stored on the Document as sorted byte offsets of line starts (see the field's
+// comment for why offsets). Everything below exists to keep two properties true:
+// the list stays sorted with no duplicates, and every entry is still a real line
+// start after any edit.
+//
+// The edit half of that is the whole difficulty of the feature, and it is solved
+// the way find_invalidate and apply_snapshot solve the same shape for the match
+// list and the column rectangle: ONE seam that every edit already passes through
+// (here, pt_edit_insert/pt_edit_delete, which wrap the only two piece-table
+// mutations in this file), plus a cloned set carried on the undo Snapshot. No
+// third mechanism, and in particular no per-command bookkeeping -- a command that
+// forgets is exactly how the column rectangle went stale before §6u.
+
+// A bookmark's index in doc.bookmarks, and whether the offset is bookmarked.
+// Binary search: the list is sorted by construction.
+@(private = "file")
+bookmark_find :: proc(doc: ^Document, off: int) -> (idx: int, found: bool) {
+	lo, hi := 0, len(doc.bookmarks)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if doc.bookmarks[mid] < off {lo = mid + 1} else {hi = mid}
+	}
+	return lo, lo < len(doc.bookmarks) && doc.bookmarks[lo] == off
+}
+
+// Text of length `n` inserted at `at`. A bookmark strictly after the insertion
+// point moves with the bytes it names.
+//
+// The `>` (not `>=`) is the load-bearing part. An insert exactly AT a bookmarked
+// line start leaves that offset alone, and that is what keeps the "every entry
+// is a line start" invariant true in both directions: the byte before `at` is
+// untouched by the insert, so `at` is still a line start afterwards -- whether
+// what was typed there was "x" (the bookmark keeps naming the same line, now one
+// character longer) or "abc\n" (the bookmark names the new line that begins at
+// that offset). Shifting instead would leave the "x" case pointing one byte into
+// its own line, which no row's line start matches, so the mark would vanish from
+// the gutter while the entry stayed in the list.
+@(private = "file")
+bookmarks_shift_insert :: proc(doc: ^Document, at, n: int) {
+	if n == 0 || len(doc.bookmarks) == 0 {return}
+	for &b in doc.bookmarks {
+		if b > at {b += n}
+	}
+}
+
+// The range [at, at+n) is about to be deleted. MUST be called before the
+// pt_delete, because it reads the byte in front of `at` out of the live buffer.
+//
+// Three outcomes per bookmark, and each one is a case the invariant forces:
+//
+//   b < at            untouched; nothing before it moved.
+//   at <= b < at+n    DROPPED. The line start itself is inside the deleted text,
+//                     so after the delete the offset would name whatever bytes
+//                     moved up into it -- a bookmark silently pointing at a
+//                     different line, which is the one outcome worse than losing
+//                     it. This is also what makes "delete the bookmarked line"
+//                     drop it: that selection runs from the line start, so
+//                     b == at.
+//   b == at+n and `at` is NOT a line start
+//                     DROPPED. The delete ended exactly on the bookmark and
+//                     started mid-line, i.e. it JOINED this line onto the
+//                     previous one (Backspace at a line start deletes just the
+//                     '\n'; the same shape swallows a CRLF pair). The bookmark
+//                     would land on `at`, which is mid-line, so the entry would
+//                     survive as an offset that is not a line start.
+//   otherwise         b -= n.
+//
+// `at` being a line start is one byte read, taken once for the whole call rather
+// than per bookmark. Note that b == at+n with `at` a line start is the "delete
+// the whole line ABOVE" case, which must KEEP the bookmark (its line now begins
+// where the deleted one did) -- that is why this is a condition and not simply a
+// half-open range in the other direction.
+@(private = "file")
+bookmarks_shift_delete :: proc(doc: ^Document, at, n: int) {
+	if n == 0 || len(doc.bookmarks) == 0 {return}
+	at_is_line_start := at == 0 || (at <= doc.pt.length && byte_at(doc, at - 1) == '\n')
+	keep := 0
+	for b in doc.bookmarks {
+		if b < at {
+			doc.bookmarks[keep] = b
+			keep += 1
+			continue
+		}
+		if b < at + n {continue} // the line start was inside the deleted text
+		if b == at + n && !at_is_line_start {continue} // the line was joined onto the previous one
+		doc.bookmarks[keep] = b - n
+		keep += 1
+	}
+	resize(&doc.bookmarks, keep)
+}
+
+// The only two piece-table mutations in this file go through these, so the
+// bookmark shift cannot be forgotten at a call site. That is deliberate: the
+// alternative -- a bookmarks_shift_* call next to each of the ten base.pt_*
+// calls -- is CLAUDE.md's shape B (a correct function fed the wrong input, or
+// forgotten at the eleventh site), and this feature's whole risk is exactly
+// that. Nothing outside doc.odin calls base.pt_insert/base.pt_delete; block.odin
+// and find.odin's replace both route through doc_replace_range.
+@(private = "file")
+pt_edit_insert :: proc(doc: ^Document, at: int, text: []u8) {
+	bookmarks_shift_insert(doc, at, len(text))
+	base.pt_insert(&doc.pt, at, text)
+}
+
+@(private = "file")
+pt_edit_delete :: proc(doc: ^Document, at, n: int) {
+	bookmarks_shift_delete(doc, at, n) // before the delete: it reads byte_at(at-1)
+	base.pt_delete(&doc.pt, at, n)
+}
+
+// Toggle the bookmark on the line the caret is on. Returns the resulting state
+// (true = now bookmarked) and false in `ok` when the caret's line start could not
+// be resolved within the cap -- the same refusal block_extend makes, and for the
+// same reason: guessing would silently bookmark the wrong line.
+doc_bookmark_toggle :: proc(doc: ^Document) -> (on, ok: bool) {
+	if doc == nil || doc.kind != .Text {return false, false}
+	ls, exact := base.pt_line_start_cap(&doc.pt, doc.cursor, BOOKMARK_LINE_CAP)
+	if !exact {return false, false}
+	idx, found := bookmark_find(doc, ls)
+	if found {
+		ordered_remove(&doc.bookmarks, idx)
+		return false, true
+	}
+	inject_at(&doc.bookmarks, idx, ls)
+	return true, true
+}
+
+// Bytes scanned backwards to find the caret's line start when toggling. Same
+// budget MOVE_LINE_BUDGET uses and for the same reason: this is a keypress, not
+// a frame pass, so it can afford more than RENDER_LINE_CAP -- but it still must
+// not become an unbounded walk of a multi-GB single-line file.
+BOOKMARK_LINE_CAP :: MOVE_LINE_BUDGET
+
+// Move the caret to the next (or previous) bookmark, wrapping. A no-op with an
+// empty set. Returns false when there was nothing to go to, so the caller can
+// say so rather than leaving the keypress looking dead.
+//
+// Strictly after / strictly before the CARET, not the current bookmark index:
+// there is no "current" bookmark to hold, the caret moves for a hundred other
+// reasons, and an index would be one more thing every edit path has to fix.
+doc_bookmark_cycle :: proc(doc: ^Document, back: bool) -> bool {
+	if doc == nil || len(doc.bookmarks) == 0 {return false}
+	idx, found := bookmark_find(doc, doc.cursor)
+	target: int
+	if back {
+		// bookmark_find gives the first entry >= cursor, so the first one
+		// strictly before it is idx-1 either way (found or not).
+		target = doc.bookmarks[idx - 1] if idx > 0 else doc.bookmarks[len(doc.bookmarks) - 1]
+	} else {
+		nxt := idx + 1 if found else idx
+		target = doc.bookmarks[nxt] if nxt < len(doc.bookmarks) else doc.bookmarks[0]
+	}
+	doc.cursor = target
+	doc.anchor = target
+	// Same reasoning as doc_select_all: this writes doc.cursor directly rather
+	// than through set_cursor, so a live rectangle would otherwise survive a jump
+	// to a line it no longer describes.
+	if block_active(doc) {block_clear(doc)}
+	return true
+}
+
 // --- undo/redo ---
 
 @(private = "file")
@@ -1193,7 +1382,19 @@ snapshot :: proc(doc: ^Document) -> Snapshot {
 		cursor = doc.cursor,
 		anchor = doc.anchor,
 		nl_delta = doc.nl_delta,
+		bookmarks = slice.clone(doc.bookmarks[:]) if len(doc.bookmarks) > 0 else nil,
 	}
+}
+
+// Free everything a Snapshot owns. Every site that drops one calls this rather
+// than pt_free_node_tree alone -- the tree used to be the only owned thing, and
+// the four drop sites (doc_close x2, push_undo's redo clear, UNDO_MAX eviction)
+// are exactly the kind of list that acquires a leak when a second owned field
+// appears.
+@(private = "file")
+snapshot_free :: proc(s: Snapshot) {
+	base.pt_free_node_tree(s.root)
+	delete(s.bookmarks)
 }
 
 @(private = "file")
@@ -1204,6 +1405,13 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 	doc.cursor = s.cursor
 	doc.anchor = s.anchor
 	doc.nl_delta = s.nl_delta
+	// The bookmark set belonging to the restored state, exactly as the tree is.
+	// The snapshot's array is consumed here (the Snapshot is popped and never
+	// freed by its caller, mirroring how pt_restore takes s.root), so this is a
+	// move, not a copy.
+	clear(&doc.bookmarks)
+	append(&doc.bookmarks, ..s.bookmarks)
+	delete(s.bookmarks)
 	// This bypasses set_cursor, so a live rectangle would otherwise survive
 	// undo/redo describing line/cell offsets a just-restored tree may no
 	// longer have.
@@ -1235,7 +1443,7 @@ push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
 	// occurrences discarded the pre-replace state entirely. No amount of Ctrl+Z
 	// could get the document back.
 	if doc.batch {return}
-	for s in doc.redo {base.pt_free_node_tree(s.root)}
+	for s in doc.redo {snapshot_free(s)}
 	clear(&doc.redo)
 
 	continues := kind == .Type &&
@@ -1258,7 +1466,7 @@ push_undo :: proc(doc: ^Document, kind: Edit_Kind = .Type) {
 	append(&doc.undo, s)
 	// Bounded: this is a long-lived process and every entry holds a cloned tree.
 	if len(doc.undo) > UNDO_MAX {
-		base.pt_free_node_tree(doc.undo[0].root)
+		snapshot_free(doc.undo[0])
 		ordered_remove(&doc.undo, 0)
 	}
 	doc.last_edit = kind
@@ -1361,8 +1569,13 @@ doc_set_line_ending :: proc(doc: ^Document, eol: base.Line_Ending) {
 		return
 	}
 	push_undo(doc, .Replace)
-	base.pt_delete(&doc.pt, 0, doc.pt.length)
-	base.pt_insert(&doc.pt, 0, converted)
+	// Every bookmark except one at offset 0 falls inside [0, length) and is
+	// dropped, which is the right answer rather than an accident: a CRLF<->LF
+	// rewrite moves every line start after the first by one byte per preceding
+	// line, so nothing here could be shifted correctly without re-walking the
+	// whole buffer. Undo restores the set (the snapshot above holds it).
+	pt_edit_delete(doc, 0, doc.pt.length)
+	pt_edit_insert(doc, 0, converted)
 	doc.eol = eol
 	doc.cursor = clamp(doc.cursor, 0, doc.pt.length)
 	doc.anchor = doc.cursor
@@ -1434,9 +1647,11 @@ doc_absorb_append :: proc(doc: ^Document, new_size: i64) -> bool {
 	if !ok || len(chunk) == 0 {return false}
 
 	// Appending at the end never disturbs earlier offsets, so the caret,
-	// selection and search results all stay meaningful.
+	// selection, search results and bookmarks all stay meaningful (every
+	// bookmark is < length, so bookmarks_shift_insert's `b > at` moves none of
+	// them).
 	at_end := doc.cursor >= doc.pt.length
-	base.pt_insert(&doc.pt, doc.pt.length, chunk)
+	pt_edit_insert(doc, doc.pt.length, chunk)
 	for b in chunk {if b == '\n' {doc.nl_delta += 1}}
 	doc.appended += len(chunk)
 	doc.revision += 1 // content changed; this path deliberately skips push_undo
@@ -1606,7 +1821,7 @@ set_cursor :: proc(doc: ^Document, pos: int, select: bool) {
 del_sel_raw :: proc(doc: ^Document) {
 	lo, hi := doc_sel_range(doc)
 	doc.nl_delta -= count_newlines(doc, lo, hi - lo)
-	base.pt_delete(&doc.pt, lo, hi - lo)
+	pt_edit_delete(doc, lo, hi - lo)
 	doc.cursor = lo
 	doc.anchor = lo
 }
@@ -1630,7 +1845,7 @@ doc_insert_text :: proc(doc: ^Document, text: []u8, kind: Edit_Kind = .Paste) {
 	if len(text) == 0 {return}
 	push_undo(doc, kind)
 	if doc_has_sel(doc) {del_sel_raw(doc)}
-	base.pt_insert(&doc.pt, doc.cursor, text)
+	pt_edit_insert(doc, doc.cursor, text)
 	for b in text {if b == '\n' {doc.nl_delta += 1}}
 	doc.cursor += len(text)
 	doc.anchor = doc.cursor
@@ -1666,10 +1881,10 @@ doc_replace_range :: proc(doc: ^Document, at, count: int, text: []u8, kind: Edit
 	push_undo(doc, kind)
 	if count > 0 {
 		doc.nl_delta -= count_newlines(doc, at, count)
-		base.pt_delete(&doc.pt, at, count)
+		pt_edit_delete(doc, at, count)
 	}
 	if len(text) > 0 {
-		base.pt_insert(&doc.pt, at, text)
+		pt_edit_insert(doc, at, text)
 		for b in text {if b == '\n' {doc.nl_delta += 1}}
 	}
 	doc.cursor = at + len(text)
@@ -1715,7 +1930,7 @@ doc_backspace :: proc(doc: ^Document) {
 	// CRLF break with it, not just the LF, or a bare CR is left behind.
 	p := doc.cursor - 2 if doc.cursor >= 2 && base.pt_crlf_at(&doc.pt, doc.cursor - 2) else prev_rune(doc, doc.cursor)
 	doc.nl_delta -= count_newlines(doc, p, doc.cursor - p)
-	base.pt_delete(&doc.pt, p, doc.cursor - p)
+	pt_edit_delete(doc, p, doc.cursor - p)
 	set_cursor(doc, p, false)
 	doc.last_edit_at = doc.cursor
 }
@@ -1735,7 +1950,7 @@ doc_delete_fwd :: proc(doc: ^Document) {
 	// otherwise-CRLF file on save.
 	n := 2 if base.pt_crlf_at(&doc.pt, doc.cursor) else next_rune(doc, doc.cursor) - doc.cursor
 	doc.nl_delta -= count_newlines(doc, doc.cursor, n)
-	base.pt_delete(&doc.pt, doc.cursor, n)
+	pt_edit_delete(doc, doc.cursor, n)
 	doc.anchor = doc.cursor
 }
 
@@ -2073,7 +2288,7 @@ doc_delete_word_back :: proc(doc: ^Document) {
 	if p == doc.cursor {return}
 	push_undo(doc, .Delete)
 	doc.nl_delta -= count_newlines(doc, p, doc.cursor - p)
-	base.pt_delete(&doc.pt, p, doc.cursor - p)
+	pt_edit_delete(doc, p, doc.cursor - p)
 	set_cursor(doc, p, false)
 	doc.last_edit_at = doc.cursor
 }
@@ -2193,6 +2408,44 @@ doc_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows
 			out[n] = {pos = {sx, row_rect_y(px, row)}, size = {max(ex - sx, 2), lh}, color = col}
 			n += 1
 		}
+	}
+	return n
+}
+
+// Bookmark mark geometry, in the LEFT MARGIN. Two numbers, used only here.
+//
+// The margin and not the gutter, deliberately: GUTTER_W is nonzero only in the
+// filter view (doc_update_gutter), so there is no gutter to draw in while
+// editing, and turning one on for every document is Wyatt's toggle and belongs
+// to the batching work -- not a side effect of adding bookmarks. Nothing here
+// adds a second width: TEXT_MARGIN_X and GUTTER_W both keep their single
+// definitions, and the mark sits entirely to the LEFT of col_x(char_w, 0), so
+// it cannot overlap the filter view's line numbers when a gutter IS present.
+BOOKMARK_MARK_X_96 :: f32(3)
+BOOKMARK_MARK_W_96 :: f32(4)
+
+// One quad per visible row whose LINE START is bookmarked, produced from the
+// same visible_begin/visible_next walk the draw and the selection use -- so a
+// mark can only appear on a row the document actually drew, and a wrapped
+// line's continuation rows (whose `start` is not the logical line start) are
+// excluded by construction rather than by a second rule.
+//
+// Works in the filter view too: there `start` is filter_lines[i], which is
+// already a line start, so a bookmarked line that survives the filter is marked
+// with no extra case.
+doc_bookmark_rects :: proc(doc: ^Document, t: ^plat.Text, px: f32, rows: int, out: []plat.Quad) -> int {
+	if doc == nil || len(doc.bookmarks) == 0 {return 0}
+	col := g_theme[.Bookmark]
+	lh := line_height(px)
+	x, w := sx(BOOKMARK_MARK_X_96), sx(BOOKMARK_MARK_W_96)
+	it := visible_begin(doc, t, rows)
+	n := 0
+	for n < len(out) {
+		row, start, _, _, _, _, ok := visible_next(&it)
+		if !ok {break}
+		if _, found := bookmark_find(doc, start); !found {continue}
+		out[n] = {pos = {x, row_rect_y(px, row)}, size = {w, lh}, color = col}
+		n += 1
 	}
 	return n
 }

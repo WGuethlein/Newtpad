@@ -69,6 +69,13 @@ Command_Id :: enum u8 {
 	Toggle_Wrap,
 	Toggle_Table,
 	Toggle_Preview,
+	Bookmark_Toggle,
+	// ONE cycle command, not a next/prev pair: Binding is (key, ctrl, alt, ctx)
+	// and shift is not part of a chord (see Binding's own comment and the
+	// Ctrl+Alt+S scar below), so F2 and Shift+F2 cannot be two rows. The
+	// direction is read off ev.shift in the dispatch, exactly as
+	// doc_cursor_left(doc, ev.shift) reads it.
+	Bookmark_Cycle,
 	// command palette
 	Palette_Open,
 	Palette_Close,
@@ -190,6 +197,8 @@ command_table := [Command_Id]Command {
 	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
 	.Toggle_Table             = {"Toggle Table View (CSV/TSV)", "View"},
 	.Toggle_Preview           = {"Toggle Markdown Preview / Split", "View"},
+	.Bookmark_Toggle          = {"Toggle Bookmark on This Line", "Cursor"},
+	.Bookmark_Cycle           = {"Go to Next Bookmark (Shift: Previous)", "Cursor"},
 	.Palette_Open             = {"Command Palette", "View"},
 	.Palette_Close            = {"Palette: Close", "View"},
 	.Palette_Confirm          = {"Palette: Confirm", "View"},
@@ -312,6 +321,8 @@ default_bindings := []Binding {
 	{.Minus, true, false, .Editor, .Zoom_Out}, // Ctrl+- / Ctrl+numpad-
 	{.Num0, true, false, .Editor, .Zoom_Reset}, // Ctrl+0
 	{.P, true, false, .Editor, .Palette_Open}, // Ctrl+P
+	{.F2, true, false, .Editor, .Bookmark_Toggle}, // Ctrl+F2
+	{.F2, false, false, .Editor, .Bookmark_Cycle}, // F2 / Shift+F2 -- shift read in the action
 	// --- palette context ---
 	{.P, true, false, .Palette, .Palette_Close},
 	{.Escape, false, false, .Palette, .Palette_Close},
@@ -1086,6 +1097,24 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		block_extend_dispatch(app, doc, t, -1, 0)
 	case .Block_Extend_Down:
 		block_extend_dispatch(app, doc, t, 1, 0)
+	case .Bookmark_Toggle:
+		// No note on success: the mark appears in the margin on the caret's own
+		// row, which is on screen by definition, so a status line saying the
+		// same thing is noise. The refusal DOES get one -- it is the caret's
+		// line start being further than BOOKMARK_LINE_CAP away (one enormous
+		// line), the same bound and the same "say so rather than guess" as
+		// block_extend's .Caret_Unresolved, and a silent no-op reads as a dead
+		// key.
+		if _, ok := doc_bookmark_toggle(doc); !ok && doc != nil && doc.kind == .Text {
+			app_note(app, "[BOOKMARK UNAVAILABLE HERE - the line is too far into a very large file]")
+		}
+	case .Bookmark_Cycle:
+		// ev.shift is the direction. It is not in the chord and cannot be (see
+		// Bookmark_Cycle's comment on Command_Id), so this is the only place the
+		// two directions are distinguished.
+		if !doc_bookmark_cycle(doc, ev.shift) && doc != nil && doc.kind == .Text {
+			app_note(app, "[NO BOOKMARKS - press Ctrl+F2 to set one]")
+		}
 	case .Toggle_Wrap:
 		doc.wrap = !doc.wrap
 		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start

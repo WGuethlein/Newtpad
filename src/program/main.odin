@@ -1105,6 +1105,19 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, ctop}, size = {TEXT_MARGIN_X, cbot - ctop}, color = g_theme[.Bg_Base]}})
 	}
 
+	// Bookmark marks, in the left margin. AFTER the H_SCROLL cover strip above,
+	// not with the selection/find quads behind the text: that strip repaints
+	// [0, TEXT_MARGIN_X) with the canvas colour whenever the view is panned
+	// horizontally, which is exactly the band these are drawn in -- so drawing
+	// them earlier would make every mark vanish the moment the user scrolls
+	// right. Skipped in the grid view, which has no text rows to mark.
+	if doc != nil && doc.kind == .Text && !doc.table {
+		bmq: [80]plat.Quad
+		if nbq := doc_bookmark_rects(doc, text, px, rows, bmq[:]); nbq > 0 {
+			plat.quads_draw(gfx, quad_pipe, bmq[:nbq])
+		}
+	}
+
 	// Scrollbar (byte-proportional, below the tab strip) + caret. In Markdown Split
 	// the editor's scrollbar sits at the split, not the window edge (the preview's
 	// is drawn separately below).
