@@ -213,8 +213,15 @@ Each of these cost real time at least once.
   under `%APPDATA%\Newtpad`; they now refuse without it, but set it anyway.
 - Argument order is per-mode and unforgiving: `keytest`/`edittest` take the path **first**;
   `watchtest` takes a directory.
-- **Never run `drawcount`.** It opens a real window, hangs, and locks the exe so the next build
-  fails. **`keytest` has the same trap with a different trigger:** it takes `<path> <mode>`, two
+- **`drawcount` is safe to run as of batch 8** — `newtpad drawcount <file>` renders offscreen (no
+  window, no message pump), prints its numbers and exits, and a bare `newtpad drawcount` prints
+  usage. **The old rule here was right to forbid it but wrong about why**, and the difference is the
+  useful part: measured under a watchdog before the change, the windowed `drawcount <file>` **exited
+  in 0.3 s** — it opened a visible window whose DPI and mouse position moved the reading, which is
+  reason enough not to trust it, but it did not hang. What hung past 20 s was **bare `drawcount`
+  with no path**, falling through to the real GUI. So the hazard was never this mode; it was the
+  missing-argument fall-through, which is the trap the rest of this bullet describes. **That trap is
+  still live everywhere else, so keep reading.** `keytest` takes `<path> <mode>`, two
   arguments, and with only one it falls through to opening the real GUI window and hangs. **`edittest`
   and `seltest` do the same when their two arguments are in the wrong order** — the path comes
   FIRST — and that cost a ten-minute timeout once. Any file-argument mode can do this; check the

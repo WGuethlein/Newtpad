@@ -682,7 +682,7 @@ text_draw_spans :: proc(
 	spans: []Text_Span,
 	set := Font_Set.UI,
 ) {
-	draw_calls_text += 1
+	g_draw.text_calls += 1 // see draw_trace.odin
 	instances := make([dynamic]Text_Instance, 0, len(str))
 	defer delete(instances)
 	// The atlas must hold still while these UVs are being collected.
@@ -749,6 +749,8 @@ text_draw_spans :: proc(
 	}
 
 	n := min(len(instances), MAX_TEXT_INSTANCES)
+	g_draw.text_clamped += len(instances) - n // see draw_trace.odin
+	draw_note_text(instances[:n])
 	ctx := gfx.ctx
 
 	mapped: d3d.MAPPED_SUBRESOURCE

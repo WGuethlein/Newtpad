@@ -13,6 +13,10 @@ Gfx :: struct {
 	ctx:           ^d3d.IDeviceContext,
 	swapchain:     ^dxgi.ISwapChain,
 	rtv:           ^d3d.IRenderTargetView,
+	// Set only by gfx_init_offscreen: the render target when there is no
+	// swapchain to get a backbuffer from. nil on the windowed path, which is
+	// also how the rest of this file tells the two apart (`swapchain == nil`).
+	offscreen:     ^d3d.ITexture2D,
 	width:         i32, // client/viewport size (what we render into)
 	height:        i32,
 	buf_w:         i32, // fixed swapchain buffer size (>= any window size)
@@ -66,11 +70,12 @@ gfx_check_tearing :: proc() -> bool {
 	return bool(allow)
 }
 
-gfx_init :: proc(w: ^Window) -> (gfx: Gfx, ok: bool) {
-	gfx.width = w.width
-	gfx.height = w.height
-	gfx.tearing = gfx_check_tearing()
-
+// The device and its immediate context, with no target attached. Shared by the
+// windowed path (gfx_init) and the headless one (gfx_init_offscreen) so a
+// measurement taken without a window runs against the same device
+// configuration — same flags, same feature levels — the product runs against.
+@(private)
+gfx_create_device :: proc(gfx: ^Gfx) -> bool {
 	// The D3D11 debug layer validates every API call — a large per-call overhead.
 	// Opt in with -define:D3D_DEBUG=true; don't tie it to Odin's -debug.
 	flags := d3d.CREATE_DEVICE_FLAGS{.BGRA_SUPPORT}
@@ -81,6 +86,71 @@ gfx_init :: proc(w: ^Window) -> (gfx: Gfx, ok: bool) {
 
 	if hr := d3d.CreateDevice(nil, .HARDWARE, nil, flags, raw_data(levels[:]), u32(len(levels)), d3d.SDK_VERSION, &gfx.device, nil, &gfx.ctx); !win.SUCCEEDED(hr) {
 		fmt.eprintfln("D3D11CreateDevice failed: 0x%X", u32(hr))
+		return false
+	}
+	return true
+}
+
+// A real device drawing into an offscreen texture instead of a swapchain: no
+// HWND, no message pump, nothing on screen, and the process exits when the
+// caller is done with it.
+//
+// This exists because a D3D device does not need a *window* — only a swapchain
+// does — but the only way to get one here used to be gfx_init, so every headless
+// mode that needed the GPU (`drawcount`, `atlasgrowtest`) created a visible
+// window it never pumped. That is what development-loop.md §6 warns about, and
+// it also made `drawcount`'s output depend on the machine: the monitor's DPI
+// scaled every metric, and the physical mouse position over that window changed
+// how many hover quads the frame drew. An instrument whose reading moves with
+// where the pointer happens to be cannot support a before/after comparison.
+//
+// The format matches the swapchain's backbuffer so the pipeline state, blend
+// and shaders are exercised exactly as they are on screen.
+gfx_init_offscreen :: proc(width, height: i32) -> (gfx: Gfx, ok: bool) {
+	gfx.width, gfx.height = width, height
+	gfx.buf_w, gfx.buf_h = width, height
+	if !gfx_create_device(&gfx) {
+		return gfx, false
+	}
+	desc := d3d.TEXTURE2D_DESC {
+		Width      = u32(width),
+		Height     = u32(height),
+		MipLevels  = 1,
+		ArraySize  = 1,
+		Format     = .B8G8R8A8_UNORM, // as CreateSwapChainForHwnd's below
+		SampleDesc = {Count = 1},
+		Usage      = .DEFAULT,
+		BindFlags  = {.RENDER_TARGET},
+	}
+	if hr := gfx.device->CreateTexture2D(&desc, nil, &gfx.offscreen); !win.SUCCEEDED(hr) {
+		fmt.eprintfln("CreateTexture2D(offscreen %dx%d) failed: 0x%X", width, height, u32(hr))
+		return gfx, false
+	}
+	if hr := gfx.device->CreateRenderTargetView((^d3d.IResource)(gfx.offscreen), nil, &gfx.rtv); !win.SUCCEEDED(hr) {
+		fmt.eprintfln("CreateRenderTargetView(offscreen) failed: 0x%X", u32(hr))
+		return gfx, false
+	}
+	return gfx, true
+}
+
+// Release everything gfx_init / gfx_init_offscreen created, in reverse order.
+// The product leaks these deliberately (process exit reclaims them and the
+// teardown would only slow the exit), but a headless mode that creates and
+// destroys a device inside one run needs them back.
+gfx_destroy :: proc(gfx: ^Gfx) {
+	if gfx.rtv != nil {gfx.rtv->Release();gfx.rtv = nil}
+	if gfx.offscreen != nil {gfx.offscreen->Release();gfx.offscreen = nil}
+	if gfx.swapchain != nil {gfx.swapchain->Release();gfx.swapchain = nil}
+	if gfx.ctx != nil {gfx.ctx->Release();gfx.ctx = nil}
+	if gfx.device != nil {gfx.device->Release();gfx.device = nil}
+}
+
+gfx_init :: proc(w: ^Window) -> (gfx: Gfx, ok: bool) {
+	gfx.width = w.width
+	gfx.height = w.height
+	gfx.tearing = gfx_check_tearing()
+
+	if !gfx_create_device(&gfx) {
 		return gfx, false
 	}
 
@@ -182,6 +252,15 @@ gfx_begin_frame :: proc(gfx: ^Gfx, r, g, b: f32) {
 // a flip-model present stays vblank-locked).
 gfx_end_frame :: proc(gfx: ^Gfx, sync: u32 = 1) -> Device_Status {
 	if gfx.lost {return .Lost}
+	// Offscreen (gfx_init_offscreen): nothing to present. Flush anyway, so the
+	// frame's commands are actually submitted to the GPU rather than left
+	// queued in the context — otherwise a headless "frame" would be a list of
+	// API calls that never ran, and a driver validation failure in one of them
+	// would go unreported.
+	if gfx.swapchain == nil {
+		gfx.ctx->Flush()
+		return .Ok
+	}
 	flags: dxgi.PRESENT
 	if sync == 0 && gfx.tearing {
 		flags = {.ALLOW_TEARING}

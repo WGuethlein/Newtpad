@@ -4,6 +4,7 @@
 // main.odin so the frame loop reads clean.
 package main
 
+import "base:intrinsics"
 import "core:fmt"
 import "core:mem"
 import "core:os"
@@ -46,6 +47,324 @@ when NEWTPAD_TESTS {
 			return false
 		}
 		return true
+	}
+
+	// A real D3D11 device with no OS window. An offscreen render target stands in
+	// for the swapchain, so a mode can drive the product's actual draw path,
+	// print numbers, and exit.
+	//
+	// `drawcount` and `atlasgrowtest` both used to call window_create purely to
+	// get a device, because gfx_init was the only way to make one — a visible
+	// window that nothing ever pumped. That is the trap development-loop.md §6
+	// records against `drawcount`, and it also made the reading environmental:
+	// the window landed on whatever monitor, so its DPI scaled every metric, and
+	// the physical mouse sitting over it changed how many hover quads the frame
+	// drew.
+	//
+	// `window` here is a plain Window value with no hwnd. The draw path reads its
+	// size and DPI and nothing else; window_cursor_client returns (-1,-1) for a
+	// hwnd-less window (see its comment) so no hover state can leak in, and the
+	// DPI is pinned at 96 rather than sampled from a monitor, so the same input
+	// gives the same numbers on any machine.
+	//
+	// ~17 KB of Window buffers, so own it from a proc of your own rather than
+	// from test_mode_dispatch's already-large frame (§6, stack overflow).
+	@(private = "file")
+	Headless_Gpu :: struct {
+		gfx:    plat.Gfx,
+		text:   plat.Text,
+		quads:  plat.Quad_Pipeline,
+		window: plat.Window,
+	}
+
+	@(private = "file")
+	headless_gpu_init :: proc(h: ^Headless_Gpu, width, height: i32, label: string) -> bool {
+		h.window.width, h.window.height = width, height
+		h.window.dpi = 96
+		ok: bool
+		if h.gfx, ok = plat.gfx_init_offscreen(width, height); !ok {
+			fmt.eprintfln("%s: offscreen device init failed", label)
+			return false
+		}
+		if h.text, ok = plat.text_init(&h.gfx); !ok {
+			fmt.eprintfln("%s: text init failed", label)
+			return false
+		}
+		if h.quads, ok = plat.quads_init(&h.gfx); !ok {
+			fmt.eprintfln("%s: quad init failed", label)
+			return false
+		}
+		// The frame must not branch on what someone is holding down while the
+		// measurement runs — Ctrl alone underlines every visible link.
+		plat.keys_ignore_physical(true)
+		return true
+	}
+
+	@(private = "file")
+	headless_gpu_destroy :: proc(h: ^Headless_Gpu) {
+		plat.keys_ignore_physical(false)
+		plat.gfx_destroy(&h.gfx)
+	}
+
+	// No background job of this document's is still going to change what a frame
+	// draws. Each worker is "quiet" when it was never started, finished, or
+	// stopped on a fault — a faulted index never sets `done`, so waiting on
+	// `done` alone would wait forever on exactly the mapped-file case the SEH
+	// guard exists for.
+	@(private = "file")
+	doc_workers_quiet :: proc(d: ^Document) -> bool {
+		if d == nil {return true}
+		if d.idx.th != nil && !doc_index_done(d) && !intrinsics.atomic_load(&d.idx.fault) {
+			return false
+		}
+		if d.lex_idx.th != nil && !lex_index_done(d) && !intrinsics.atomic_load(&d.lex_idx.fault) {
+			return false
+		}
+		return !search_running(d)
+	}
+
+	// `newtpad drawcount <file>` — what one frame costs, and what one frame
+	// contains. Two readings, and needing both is the lesson rather than a
+	// flourish:
+	//
+	//   * The CALL COUNTS say whether batching the text pipeline achieved
+	//     anything. text_draw_spans does one heap allocation, two buffer maps and
+	//     one DrawInstanced per string across 74 call sites, several of them
+	//     inside per-row loops, and HANDOFF §6k's "does an always-on gutter double
+	//     per-frame draw calls?" is stated in these numbers.
+	//   * The STREAM DIGESTS say whether the pixels moved. A call count is exactly
+	//     the kind of assertion that passes while the content is wrong — halving
+	//     the count by dropping half the glyphs reads as a win. The digest covers
+	//     the ordered instances the GPU consumed and is blind to call boundaries,
+	//     so a pure batching change leaves it identical while the counts fall.
+	//     See draw_trace.odin.
+	//
+	// Runs offscreen and exits; no window, nothing on screen, no lock on the exe.
+	//
+	// KNOWN LIMITS — read these before trusting it to sign off the batching work,
+	// because two of them will bite exactly there:
+	//
+	//   1. It measures ONE frame of ONE document in ONE view, reaching about six
+	//      of the ~60 text_draw_spans call sites in program/ (they do carry all
+	//      the instances, but still). Nothing here exercises the menus, palette,
+	//      history panel, Settings/Font tabs, find/replace bar, filter banner,
+	//      markdown preview or split, or the grid. A batching change can break any
+	//      of those and this reports green. The fix is a view argument
+	//      (`drawcount <file> [--menu|--palette|--find|--md-split|--grid]`), not a
+	//      better digest — do not confuse the two.
+	//   2. The digest hashes UVs, and UVs encode glyph FIRST-USE order in the
+	//      atlas. A batching pass that regroups draws reorders glyph_get, which
+	//      reshuffles the packer and moves the digest with zero pixel change — a
+	//      FALSE POSITIVE arriving during precisely the work this was built for.
+	//      Add a UV-independent digest (pos/size/colour only) before batching.
+	//   3. The digest sees instances, not render state. Blend state, SRV, sampler,
+	//      stride and the per-call constants buffer are all set per draw today and
+	//      batching necessarily moves them; a bit-identical stream with the wrong
+	//      blend state bound hashes green. Closing this needs a real pixel readback
+	//      (CopyResource to a STAGING texture), which also dissolves limit 2.
+	//   4. No cost measurement at all — no allocation count, no frame time — so a
+	//      change could cut draw calls and raise cost unnoticed.
+	//
+	// doc_workers_quiet's last term is !search_running, and search.th is nil'd only
+	// by search_stop, which the main loop drives and render_frame never does. Inert
+	// while nothing here opens find; the moment limit 1 is closed with a --find
+	// view, the settle loop will burn all 400 iterations and blame nondeterminism
+	// for a missing reap.
+	@(private = "file")
+	draw_count_mode :: proc(path: string) {
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 1280, 720, "drawcount") {return}
+		defer headless_gpu_destroy(&h)
+
+		app: App
+		menu_init(&app.menu)
+		app.settings = settings_load() // scratch session dir => the defaults, deterministically
+		// Without this g_theme stays at its zero value, which is transparent
+		// black -- and that makes the digest's whole colour dimension a constant.
+		// Every instance's 16 colour bytes would be {0,0,0,0}, the canvas clear
+		// would be opaque black, and the text pixel shader emits cov * color.a,
+		// so the offscreen target would be a uniform black rectangle. "The merged
+		// batch used one call's colour for all of it" is the single likeliest bug
+		// batching produces, and it is exactly what that hole hides -- as would
+		// any pixel hash later built on this target. Mirrors main.odin's own
+		// theme_resolve, which is the reason this is a real frame and not a
+		// plausible one.
+		g_theme = theme_resolve(app.settings.theme_name)
+		defer app_destroy(&app)
+		if !app_open_path(&app, path) {
+			fmt.eprintfln("drawcount: could not open %q", path)
+			return
+		}
+
+		rc := Render_Ctx{&h.gfx, &h.text, &h.quads, &app, &h.window, 0, 0, 0}
+		active_render_ctx = &rc
+		defer active_render_ctx = nil
+		BASE_PX = f32(clamp(app.settings.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX))
+		plat.text_set_tab_width(&h.text, app.settings.tab_width)
+		// Same two branches as main.odin's startup. Faithful without it only
+		// because a scratch session dir forces the defaults -- so it would start
+		// lying the moment anyone measured against a real settings.txt, and the
+		// glyph mix is most of what the digest hashes.
+		if app.settings.font_family != "" && app.settings.font_family != "Consolas" {
+			plat.text_load_family(&h.text, app.settings.font_family, app.settings.font_style)
+		} else if app.settings.font_style != .Regular {
+			plat.text_load_family(&h.text, "Consolas", app.settings.font_style)
+		}
+		metrics_recompute(&rc)
+		plat.draw_digest_enable(true)
+
+		// Render whole frames until the frame stops changing, then report it. A
+		// single frame is not reproducible, for two separate reasons:
+		//
+		//   * the first frame fills the glyph atlas, so it is a first-paint frame,
+		//     not the steady-state one the product spends its life drawing;
+		//   * the line index and the stateful-lexer index run on worker threads,
+		//     and their results reach the screen. The status bar carries
+		//     "(indexing 47%)" while the line index runs — same glyph count as
+		//     "(indexing 48%)", different glyphs — which is precisely a change the
+		//     call counts cannot see and the digest can. Measured on a 149 MB log
+		//     before this wait existed: identical counts, identical instance
+		//     totals, and a text digest that differed on every run.
+		//
+		// So: wait for the workers to go quiet, and only then require two
+		// consecutive identical frames. Both halves are load-bearing — quiet alone
+		// still catches the first-paint frame, and two-in-a-row alone is
+		// satisfiable mid-index whenever the rounded percentage happens to repeat.
+		doc := app_active(&app)
+		SETTLE_MAX :: 400
+		prev, cur: plat.Draw_Stats
+		frames := 0
+		settled, have_prev := false, false
+		for i in 1 ..= SETTLE_MAX {
+			free_all(context.temp_allocator) // as the real frame loop does
+			plat.draw_counts_reset()
+			render_frame(&rc, false)
+			cur = plat.draw_stats()
+			frames = i
+			quiet := doc_workers_quiet(doc)
+			if quiet && have_prev && cur == prev {
+				settled = true
+				break
+			}
+			prev = cur
+			have_prev = quiet // never compare against a frame drawn mid-index
+			time.sleep(2 * time.Millisecond)
+		}
+
+		// Repack the atlas from scratch, then measure. A glyph's UVs ARE its
+		// position in the atlas, and the shelf packer assigns those in first-use
+		// order — so the UVs in a warm frame's instance stream encode which glyphs
+		// the settle frames happened to touch on the way here. That is history,
+		// not content: with the indexing percentage counting up during warm-up,
+		// the same 149 MB file settled with a different text digest on every run
+		// while the call counts and the instance totals stayed identical. After a
+		// reset the measured frame packs the atlas in its own deterministic draw
+		// order, so the stream describes the frame and nothing else.
+		plat.text_reset_atlas(&h.text)
+		warm: plat.Draw_Stats
+		for i in 0 ..< 2 {
+			free_all(context.temp_allocator)
+			plat.draw_counts_reset()
+			render_frame(&rc, false)
+			if i == 0 {warm = plat.draw_stats()} else {cur = plat.draw_stats()}
+		}
+		// The repacking frame and the one after it must agree. They differ only if
+		// the atlas ran out of room and relieved mid-measurement, which would make
+		// the reported stream one that no steady-state frame ever draws.
+		reproducible := warm == cur
+
+		rows := doc_visible_rows(doc, f32(h.window.height), rc.line_h)
+		tc, qc := cur.text_calls, cur.quad_calls
+
+		fmt.println("--- drawcount: headless offscreen frame, 1280x720 @96dpi, no menu open ---")
+		fmt.printfln("  file                   : %s", path)
+		fmt.printfln("  font / size / tab      : %s %v / %.0f px / %d", app.settings.font_family, app.settings.font_style, rc.px, app.settings.tab_width)
+		fmt.printfln(
+			"  frame settled after    : %d frames %s",
+			frames,
+			"(workers quiet, two identical in a row)" if settled else "FAIL - never settled, the numbers below are one sample of a moving target",
+		)
+		fmt.printfln(
+			"  measured frame         : atlas %dx%d, repacked  %s",
+			plat.text_atlas_dim(&h.text),
+			plat.text_atlas_dim(&h.text),
+			"(reproduced identically on the next frame)" if reproducible else "FAIL - the next frame differed; the atlas moved mid-measurement",
+		)
+		fmt.printfln("  visible text rows      : %d", rows)
+		fmt.println("--- draw calls ---")
+		fmt.printfln("  plat.text_draw  calls  : %d  (%d issued a DrawInstanced, %d drew no glyphs)", tc, cur.text_draws, tc - cur.text_draws)
+		fmt.printfln("  plat.quads_draw calls  : %d", qc)
+		fmt.printfln("  total draw calls       : %d", tc + qc)
+		fmt.println("--- instance stream (what the GPU consumed) ---")
+		fmt.printfln("  text instances         : %d", cur.text_instances)
+		fmt.printfln("  quad instances         : %d", cur.quad_instances)
+		fmt.printfln(
+			"  instances clamped away : %d text, %d quad  %s",
+			cur.text_clamped,
+			cur.quad_clamped,
+			"" if cur.text_clamped == 0 && cur.quad_clamped == 0 else "FAIL - MAX_TEXT_INSTANCES/MAX_QUADS dropped geometry; the frame on screen is incomplete",
+		)
+		fmt.printfln("  text  stream digest    : 0x%016x", cur.text_digest)
+		fmt.printfln("  quad  stream digest    : 0x%016x", cur.quad_digest)
+		fmt.printfln("  frame stream digest    : 0x%016x", cur.frame_digest)
+		fmt.println("--- projection: one more text_draw per visible row (the gutter) ---")
+		fmt.printfln("  projected text_draw    : %d  (x%.2f)", tc + rows, f32(tc + rows) / max(f32(tc), 1))
+		fmt.printfln("  projected total        : %d  (x%.2f)", tc + qc + rows, f32(tc + qc + rows) / max(f32(tc + qc), 1))
+		fmt.printfln("  per-row share of today's text_draw: %.0f%%", 100 * f32(rows) / max(f32(tc), 1))
+		fmt.println("  (text_draw also heap-allocates a [dynamic]Text_Instance per call — text.odin)")
+	}
+
+	// `newtpad atlasgrowtest` proves the atlas actually grows. atlastest checks
+	// only text_atlas_fit_count -- arithmetic that assumes growth works -- and it
+	// passed for the entire time growth was impossible, because it never asked the
+	// atlas to do anything. atlas_relieve's one caller sat inside text_draw, where
+	// its own `drawing` guard always refused, so the atlas stayed at ATLAS_START
+	// forever and glyphs past ~1196 silently vanished while the pen advanced.
+	//
+	// Needs a real device, which is all it needs: no window (it used to make one).
+	@(private = "file")
+	atlas_grow_mode :: proc() -> int {
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "atlasgrowtest") {return 1}
+		defer headless_gpu_destroy(&h)
+
+		start_dim := plat.text_atlas_dim(&h.text)
+		fmt.printfln("--- atlas growth under a heavy glyph load ---")
+		fmt.printfln("  start dim         : %d (ATLAS_START)", start_dim)
+
+		// Draw a lot of distinct CJK codepoints at a large size: glyph area grows
+		// with px^2, so this overflows 1024 quickly. One text_draw per frame, with
+		// a frame boundary between, which is where relief is now allowed to happen.
+		FRAMES :: 40
+		PER :: 64
+		cp := rune(0x4E00)
+		for _ in 0 ..< FRAMES {
+			plat.text_frame_begin(&h.gfx, &h.text)
+			plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+			buf: [PER * 4]u8
+			n := 0
+			for _ in 0 ..< PER {
+				b, sz := utf8.encode_rune(cp)
+				bb := b
+				copy(buf[n:], bb[:sz])
+				n += sz
+				cp += 1
+			}
+			plat.text_draw(&h.gfx, &h.text, string(buf[:n]), 0, 40, 48, {1, 1, 1, 1})
+			plat.gfx_end_frame(&h.gfx, 0)
+		}
+		// One more boundary so any relief owed by the final frame is applied.
+		plat.text_frame_begin(&h.gfx, &h.text)
+
+		end_dim := plat.text_atlas_dim(&h.text)
+		grew := end_dim > start_dim
+		fmt.printfln("  after %d frames    : %d", FRAMES, end_dim)
+		fmt.printfln("  atlas grew        : %v %s", grew, "OK" if grew else "FAIL")
+		fmt.printfln("  atlas_full latched: %v %s", plat.text_atlas_full(&h.text), "OK" if !plat.text_atlas_full(&h.text) else "FAIL")
+		bad := 0
+		if !grew {bad += 1}
+		if plat.text_atlas_full(&h.text) {bad += 1}
+		return bad
 	}
 
 	// Run a headless test mode if argv selects one. Returns true if a mode ran (the
@@ -2118,63 +2437,19 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
-		// `newtpad drawcount <file>` measures what a frame actually costs in draw
-		// calls, because the claim "an always-on line-number gutter roughly doubles
-		// per-frame draw calls" was arithmetic from constants, not a measurement, and
-		// it is load-bearing: if true, renderer batching is a hard prerequisite for
-		// the gutter rather than a parallel cleanup.
-		//
-		// Creates its own window and drives render_frame directly — no GUI input, so
-		// it runs unattended. The window is visible for the moment it takes.
-		if os.args[1] == "drawcount" && len(os.args) > 2 {
-			window := plat.window_create("Newtpad drawcount", 1280, 720)
-			gfx, ok := plat.gfx_init(window)
-			if !ok {fmt.eprintln("drawcount: gfx init failed");return true}
-			text, tok := plat.text_init(&gfx)
-			if !tok {fmt.eprintln("drawcount: text init failed");return true}
-			quad_pipe, qok := plat.quads_init(&gfx)
-			if !qok {fmt.eprintln("drawcount: quad init failed");return true}
-
-			app: App
-			menu_init(&app.menu)
-			app.settings = settings_load()
-			if !app_open_path(&app, os.args[2]) {
-				fmt.eprintfln("drawcount: could not open %q", os.args[2])
+		// See draw_count_mode. Matched on the mode name ALONE, not on
+		// `&& len(os.args) > 2`: with that guard a bare `newtpad drawcount` fell
+		// through to argv's "open this path" handling and opened the real GUI
+		// window on a file called "drawcount", which is half of the trap
+		// development-loop.md §6 records. Every file-argument mode has this shape;
+		// this one now refuses instead.
+		if os.args[1] == "drawcount" {
+			if len(os.args) < 3 {
+				fmt.eprintln("usage: newtpad drawcount <file>")
 				return true
 			}
-			defer app_destroy(&app)
-
-			rc := Render_Ctx{&gfx, &text, &quad_pipe, &app, window, 0, 0, 0}
-			active_render_ctx = &rc
-			BASE_PX = f32(clamp(app.settings.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX))
-			metrics_recompute(&rc)
-			plat.window_pump_events(window)
-
-			// Warm frame: fills the glyph atlas, so the measured frame is a steady-state
-			// frame and not a first-paint one.
-			render_frame(&rc, false)
-			plat.window_pump_events(window)
-
-			plat.draw_counts_reset()
-			render_frame(&rc, false)
-			tc, qc := plat.draw_counts()
-
-			doc := app_active(&app)
-			rows := doc_visible_rows(doc, f32(window.height), rc.line_h)
-
-			fmt.println("--- steady-state frame, 1280x720, no menu open ---")
-			fmt.printfln("  visible text rows      : %d", rows)
-			fmt.printfln("  plat.text_draw  calls  : %d", tc)
-			fmt.printfln("  plat.quads_draw calls  : %d", qc)
-			fmt.printfln("  total draw calls       : %d", tc + qc)
-			fmt.println("--- projection: one more text_draw per visible row (the gutter) ---")
-			fmt.printfln("  projected text_draw    : %d  (x%.2f)", tc + rows, f32(tc + rows) / max(f32(tc), 1))
-			fmt.printfln("  projected total        : %d  (x%.2f)", tc + qc + rows, f32(tc + qc + rows) / max(f32(tc + qc), 1))
-			fmt.printfln(
-				"  per-row share of today's text_draw: %.0f%%",
-				100 * f32(rows) / max(f32(tc), 1),
-			)
-			fmt.println("  (text_draw also heap-allocates a [dynamic]Text_Instance per call — text.odin:559)")
+			if !require_scratch_session("drawcount") {return true}
+			draw_count_mode(os.args[2])
 			return true
 		}
 
@@ -5857,58 +6132,10 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
-		// `newtpad atlasgrowtest` proves the atlas actually grows. atlastest checks
-		// only text_atlas_fit_count -- arithmetic that assumes growth works -- and it
-		// passed for the entire time growth was impossible, because it never asked the
-		// atlas to do anything. atlas_relieve's one caller sat inside text_draw, where
-		// its own `drawing` guard always refused, so the atlas stayed at ATLAS_START
-		// forever and glyphs past ~1196 silently vanished while the pen advanced.
-		//
-		// Needs a real device, so it makes a window like drawcount does.
+		// See atlas_grow_mode -- it needs a real device, which it now gets without
+		// a window.
 		if os.args[1] == "atlasgrowtest" {
-			window := plat.window_create("Newtpad atlasgrow", 800, 600)
-			gfx, ok := plat.gfx_init(window)
-			if !ok {fmt.eprintln("atlasgrowtest: gfx init failed");return true}
-			text, tok := plat.text_init(&gfx)
-			if !tok {fmt.eprintln("atlasgrowtest: text init failed");return true}
-
-			start_dim := plat.text_atlas_dim(&text)
-			fmt.printfln("--- atlas growth under a heavy glyph load ---")
-			fmt.printfln("  start dim         : %d (ATLAS_START)", start_dim)
-
-			// Draw a lot of distinct CJK codepoints at a large size: glyph area grows
-			// with px^2, so this overflows 1024 quickly. One text_draw per frame, with
-			// a frame boundary between, which is where relief is now allowed to happen.
-			FRAMES :: 40
-			PER :: 64
-			cp := rune(0x4E00)
-			for f in 0 ..< FRAMES {
-				plat.text_frame_begin(&gfx, &text)
-				plat.gfx_begin_frame(&gfx, 0, 0, 0)
-				buf: [PER * 4]u8
-				n := 0
-				for _ in 0 ..< PER {
-					b, sz := utf8.encode_rune(cp)
-					bb := b
-					copy(buf[n:], bb[:sz])
-					n += sz
-					cp += 1
-				}
-				plat.text_draw(&gfx, &text, string(buf[:n]), 0, 40, 48, {1, 1, 1, 1})
-				plat.gfx_end_frame(&gfx, 0)
-			}
-			// One more boundary so any relief owed by the final frame is applied.
-			plat.text_frame_begin(&gfx, &text)
-
-			end_dim := plat.text_atlas_dim(&text)
-			grew := end_dim > start_dim
-			fmt.printfln("  after %d frames    : %d", FRAMES, end_dim)
-			fmt.printfln("  atlas grew        : %v %s", grew, "OK" if grew else "FAIL")
-			fmt.printfln("  atlas_full latched: %v %s", plat.text_atlas_full(&text), "OK" if !plat.text_atlas_full(&text) else "FAIL")
-			bad := 0
-			if !grew {bad += 1}
-			if plat.text_atlas_full(&text) {bad += 1}
-			fmt.printfln("atlasgrowtest: %d failures", bad)
+			fmt.printfln("atlasgrowtest: %d failures", atlas_grow_mode())
 			return true
 		}
 
