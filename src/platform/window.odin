@@ -126,9 +126,9 @@ Key :: enum u16 {
 	// feature re-discovers: before this, VK_F2 fell through vk_to_key to .None
 	// and every function key was silently swallowed by the message pump.
 	// F10 is the one to know about: Windows treats a bare F10 as the menu-bar
-	// activation key and delivers it as WM_SYSKEYDOWN, which this pump handles
-	// (see WM_KEYDOWN/WM_SYSKEYDOWN), so it arrives here like any other key
-	// rather than reaching DefWindowProc.
+	// activation key and delivers it as WM_SYSKEYDOWN, so key_belongs_to_windows
+	// below hands it straight back to DefWindowProc. It is translated but never
+	// queued, and keys.txt refuses to bind it for that reason.
 	F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12,
 }
 
@@ -153,6 +153,19 @@ Key :: enum u16 {
 key_belongs_to_windows :: proc "contextless" (key: Key, sys: bool) -> bool {
 	if !sys {return false} // a bare F4 or F10 is ordinary and stays bindable
 	return key == .F4 || key == .F10 // Alt+F4 closes; F10 opens the system menu
+}
+
+// The same question asked from a CHORD rather than from a message, for callers
+// that never see a WM_ at all -- the keys.txt parser, which has to refuse
+// `alt+f4 = ...` and `f10 = ...` rather than accept a binding the pump will
+// swallow before the lookup ever runs.
+//
+// The translation is one fact the parser cannot know: Alt held means
+// WM_SYSKEYDOWN by definition, and Windows also delivers a BARE F10 that way
+// because it is the menu-bar activation key. Kept here, next to the pump that
+// relies on it, so there is still exactly one list of the keys Windows owns.
+key_chord_belongs_to_windows :: proc "contextless" (key: Key, alt: bool) -> bool {
+	return key_belongs_to_windows(key, alt || key == .F10)
 }
 
 // A raw key press, drained once per frame. The program maps (key, modifiers) to

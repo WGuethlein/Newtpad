@@ -204,7 +204,8 @@ Keymap_Reject :: enum u8 {
 	Unknown_Key, // "ctrl+foo"
 	Shift, // "ctrl+shift+k" -- see rule 4 in the file header
 	Unmodified, // "k" -- see rule 3
-	Reserved, // "ctrl+s" -- see keymap_reserved
+	Reserved, // "ctrl+s" -- see keymap_chord_reserved
+	Os_Owned, // "alt+f4", "f10" -- see plat.key_chord_belongs_to_windows
 	Unknown_Command, // "ctrl+k = Frobnicate"
 }
 
@@ -403,6 +404,19 @@ keymap_parse :: proc(src: string, allocator := context.allocator) -> Keymap {
 		if keymap_chord_reserved(key, ctrl, alt) {
 			km.rejects[.Reserved] += 1
 			base.log_warn("keys.txt:%d: %q refused -- Esc, Ctrl+S and Ctrl+P are reserved as the way back from a broken keymap", line_no + 1, lhs)
+			continue
+		}
+		// Windows takes these before the pump can queue them, so the binding
+		// would exist in the table and never once fire. Accepting it silently is
+		// the failure rule 3 already refuses for an unmodified printable key:
+		// the user asks for something, gets no warning, and the key does nothing.
+		if plat.key_chord_belongs_to_windows(key, alt) {
+			km.rejects[.Os_Owned] += 1
+			base.log_warn(
+				"keys.txt:%d: %q refused -- Windows owns that chord (Alt+F4 closes the window, F10 opens the system menu), so it never reaches Newtpad",
+				line_no + 1,
+				lhs,
+			)
 			continue
 		}
 

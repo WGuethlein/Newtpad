@@ -11324,6 +11324,22 @@ when NEWTPAD_TESTS {
 				chk(&bad, k.rejects[.Reserved] == 0 && resolve_key(.S, true, true, .Editor) == .Undo, fmt.tprintf("ctrl+alt+s is a different chord and is bindable -> %v", resolve_key(.S, true, true, .Editor)))
 				chk(&bad, resolve_key(.S, true, false, .Editor) == .Save, "...and Ctrl+S is untouched by it")
 
+				// --- chords Windows owns are refused ------------------------------------
+				// Not "reserved" -- these are chords the message pump hands back to
+				// DefWindowProc before the lookup runs, so a binding for one would
+				// sit in the table and never fire once. Silently accepting it is the
+				// same failure the unmodified-printable rule below refuses.
+				fmt.println("--- chords Windows owns ---")
+				k = load("alt+f4 = Undo\nf10 = Undo\nalt+f10 = Undo\n")
+				chk(&bad, k.rejects[.Os_Owned] == 3, fmt.tprintf("3 OS-owned refusals -- alt+f4, bare f10, alt+f10 (got %d)", k.rejects[.Os_Owned]))
+				chk(&bad, len(k.entries) == 0, fmt.tprintf("nothing bound (%d entries)", len(k.entries)))
+				// A BARE F4 is ordinary -- the reservation is on the chord, not the
+				// key, and this is the pair that shows the parser asks the pump's own
+				// predicate rather than carrying a second list of function keys.
+				k = load("f4 = Undo\nctrl+f4 = Redo\n")
+				chk(&bad, k.rejects[.Os_Owned] == 0 && resolve_key(.F4, false, false, .Editor) == .Undo, fmt.tprintf("bare F4 is still bindable -> %v (%d refusals)", resolve_key(.F4, false, false, .Editor), k.rejects[.Os_Owned]))
+				chk(&bad, resolve_key(.F4, true, false, .Editor) == .Redo, fmt.tprintf("...and so is Ctrl+F4 -> %v", resolve_key(.F4, true, false, .Editor)))
+
 				// --- an unmodified printable key is refused -----------------------------
 				// WM_CHAR is drained separately from the key events (main.odin), so
 				// `k = Exit` would type a k AND quit, every time.
