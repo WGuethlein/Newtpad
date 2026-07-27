@@ -759,6 +759,114 @@ when NEWTPAD_TESTS {
 			return
 		}
 
+		// Which match the once-per-query auto-select lands on. The property is
+		// "the one nearest the caret", and it is a property of the SETTLED result,
+		// not of whatever prefix happened to be published when the first match
+		// showed up -- so a bounded first pass that publishes a shorter prefix must
+		// not change the answer. It did: with the caret at 100 KB and matches at
+		// 20 KB and 150 KB, the 64 KB pass made the 20 KB one the first thing
+		// merged, and the viewport was yanked to the top of the file and locked
+		// there (review of tasks 4/5, finding 1).
+		//
+		// The query is set in one go rather than typed: every keystroke restarts
+		// the search AND fires its own auto-select, so a typed query moves the very
+		// caret this is about. find_recompute is the whole keystroke either way.
+		findtest_autoselect :: proc() -> (bad: int) {
+			fmt.println("--- auto-select picks the caret-nearest match ---")
+			as_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			FILL :: "the quick brown fox jumps over the lazy dog................\n" // 60 B
+			NEEDLE :: "NEEDLE-ZZZ"
+			SIZE :: 8 << 20
+			LINES :: SIZE / len(FILL)
+			CARET :: 100 << 10 // between the two planted matches
+			// Planted on line starts so the wanted offsets are exact.
+			EARLY :: ((20 << 10) / len(FILL)) * len(FILL) // inside the first-paint budget
+			LATE :: ((150 << 10) / len(FILL)) * len(FILL) // past it, inside the worker's first block
+			#assert(EARLY < SEARCH_FIRST_PAINT)
+			#assert(LATE > SEARCH_FIRST_PAINT && LATE < SEARCH_BLOCK)
+			#assert(EARLY < CARET && CARET < LATE)
+
+			build :: proc(plant: []int) -> []u8 {
+				content := make([]u8, LINES * len(FILL)) // heap: the doc takes it
+				for i in 0 ..< LINES {copy(content[i * len(FILL):], transmute([]u8)string(FILL))}
+				for at in plant {copy(content[at:], transmute([]u8)string(NEEDLE))}
+				return content
+			}
+			// One keystroke's worth of work with the caret parked at `caret`.
+			run :: proc(doc: ^Document, caret: int) {
+				doc.cursor, doc.anchor = caret, caret
+				clear(&doc.find.query)
+				append(&doc.find.query, ..transmute([]u8)string(NEEDLE))
+				find_recompute(doc)
+			}
+
+			{
+				doc := doc_from_content(build([]int{EARLY, LATE}), "", .UTF8)
+				defer doc_close(&doc)
+				as_chk(&bad, doc.pt.length > SEARCH_SYNC_MAX, fmt.tprintf("the fixture needs a worker: %d bytes vs %d", doc.pt.length, SEARCH_SYNC_MAX))
+				find_open(&doc, false)
+
+				// The caret sits past the first match and before the second, in the
+				// window the bounded pass opened: (SEARCH_FIRST_PAINT, SEARCH_BLOCK].
+				run(&doc, CARET)
+				as_chk(
+					&bad,
+					doc.cursor == CARET && doc.anchor == CARET,
+					fmt.tprintf("the frame the keystroke produced has not moved the caret: cursor %d anchor %d (want %d)", doc.cursor, doc.anchor, CARET),
+				)
+				find_wait(&doc)
+				as_chk(
+					&bad,
+					doc.find.current == 1 && doc.anchor == LATE && doc.cursor == LATE + len(NEEDLE),
+					fmt.tprintf("...and it settles on the match BELOW the caret: current %d, selection [%d,%d) (want 1, [%d,%d)) over %d matches", doc.find.current, doc.anchor, doc.cursor, LATE, LATE + len(NEEDLE), len(doc.find.matches)),
+				)
+
+				// The caret above both matches: the nearest is the first one, and
+				// there is nothing to wait for -- it must land in the same frame.
+				run(&doc, 0)
+				as_chk(
+					&bad,
+					doc.find.current == 0 && doc.anchor == EARLY,
+					fmt.tprintf("a caret above every match selects the first one, in the first frame: current %d anchor %d (want 0, %d)", doc.find.current, doc.anchor, EARLY),
+				)
+
+				// The caret past every match: nothing is below it, so it wraps to
+				// the first -- and must not stall waiting for a match that is never
+				// coming.
+				run(&doc, 5 << 20)
+				find_wait(&doc)
+				as_chk(
+					&bad,
+					doc.find.current == 0 && doc.anchor == EARLY,
+					fmt.tprintf("a caret past every match wraps to the first: current %d anchor %d (want 0, %d)", doc.find.current, doc.anchor, EARLY),
+				)
+				find_close(&doc)
+			}
+
+			// The other half of deferring the jump: when the only match is behind
+			// the caret, no LATER merge carries new results, so a jump that waits
+			// for progress would never fire at all.
+			{
+				doc := doc_from_content(build([]int{EARLY}), "", .UTF8)
+				defer doc_close(&doc)
+				find_open(&doc, false)
+				run(&doc, CARET)
+				find_wait(&doc)
+				as_chk(
+					&bad,
+					doc.find.current == 0 && doc.anchor == EARLY && doc.cursor == EARLY + len(NEEDLE),
+					fmt.tprintf("a single match, published before the caret was passed, is still selected: current %d, selection [%d,%d) (want 0, [%d,%d))", doc.find.current, doc.anchor, doc.cursor, EARLY, EARLY + len(NEEDLE)),
+				)
+				find_close(&doc)
+			}
+
+			fmt.printfln("auto-select: %d failures", bad)
+			return
+		}
+
 		// `newtpad findtest` covers the literal scan's block-boundary handling and
 		// the line starts the worker computes for the filter view — both of which
 		// are per-block bookkeeping that a single-block search would never exercise.
@@ -839,6 +947,7 @@ when NEWTPAD_TESTS {
 
 			bad := findtest_filter_click()
 			bad += findtest_first_paint()
+			bad += findtest_autoselect()
 			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")
 			return true
 		}

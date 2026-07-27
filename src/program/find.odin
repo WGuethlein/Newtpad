@@ -317,26 +317,44 @@ find_merge :: proc(doc: ^Document) {
 	}
 	if s.matches == nil {return}
 
+	// `scanned` and `done` are read BEFORE `count`, and the order is load-bearing.
+	// A scan stores count first and scanned/done after it, so a scanned read
+	// taken first is always covered by the count read that follows. Taken the
+	// other way round — or with `scanned` read where it is USED, with the whole
+	// merge body in between — a merge sees a count from before a block and a
+	// scanned from after it: a short prefix the jump below then treats as
+	// complete up to the caret, so it picks the match above instead of the one
+	// below. Measured, not theorised: reading them at the point of use put
+	// findtest's auto-select section red in 3 runs out of 10.
+	scanned := intrinsics.atomic_load(&s.scanned)
+	done := intrinsics.atomic_load(&s.done)
 	n := intrinsics.atomic_load(&s.count)
 	f.truncated = intrinsics.atomic_load(&s.truncated)
-	if n == f.merged {return}
+	// Nothing new AND nothing owed. The auto-select below can be waiting on the
+	// SCAN rather than on a result (see there), and the merge that finally makes
+	// it eligible may carry no new matches at all — a single match above the
+	// caret is published once and never again — so "no progress" is not on its
+	// own a reason to return while the jump is still pending.
+	if n == f.merged && f.jumped {return}
 
-	f.matches = s.matches[:n]
-	f.match_len = s.match_len[:n]
+	if n != f.merged {
+		f.matches = s.matches[:n]
+		f.match_len = s.match_len[:n]
 
-	// Filter view: one entry per matching line. Built from line starts the
-	// worker computed during its linear pass — deriving them here would mean
-	// pt_line_start per match, an uncapped backward scan on the main thread.
-	// Matches are sorted, so same-line matches are adjacent and dedupe is a
-	// comparison against the last line appended.
-	for i in f.merged ..< n {
-		ls := s.line_start[i]
-		if len(doc.filter_lines) == 0 || doc.filter_lines[len(doc.filter_lines) - 1] != ls {
-			append(&doc.filter_lines, ls)
-			append(&doc.filter_line_nos, s.line_no[i]) // for the filter gutter
+		// Filter view: one entry per matching line. Built from line starts the
+		// worker computed during its linear pass — deriving them here would mean
+		// pt_line_start per match, an uncapped backward scan on the main thread.
+		// Matches are sorted, so same-line matches are adjacent and dedupe is a
+		// comparison against the last line appended.
+		for i in f.merged ..< n {
+			ls := s.line_start[i]
+			if len(doc.filter_lines) == 0 || doc.filter_lines[len(doc.filter_lines) - 1] != ls {
+				append(&doc.filter_lines, ls)
+				append(&doc.filter_line_nos, s.line_no[i]) // for the filter gutter
+			}
 		}
+		f.merged = n
 	}
-	f.merged = n
 
 	// Select the caret-nearest match exactly once per query. Re-running this on
 	// every merge would yank the viewport around as later results arrive while
@@ -346,14 +364,31 @@ find_merge :: proc(doc: ^Document) {
 	// see all of them, so it must start and stay at the top. Setting `jumped` at
 	// open was not enough — every keystroke restarts the search, and the restart
 	// clears it.
-	if !f.jumped && n > 0 && !doc.filter {
+	//
+	// Reference the START of any selection, not the caret. Selecting a match
+	// leaves the caret at its end, so re-running this after a toggle (Ctrl+R,
+	// Ctrl+L) would pick the *next* match every time — the selection walked
+	// forward one match per keypress.
+	//
+	// And not until the scan has actually reached the caret. Matches publish in
+	// order, so a prefix that stops short of the caret CANNOT contain the match
+	// below it: firing there picks the last match above the caret and locks it
+	// in, which on screen is the viewport yanked to the top of a file the user
+	// had scrolled into. That used to be masked rather than handled — the first
+	// non-empty publication came from the worker's first 256 KB block — and the
+	// bounded first-paint pass (SEARCH_FIRST_PAINT) exposed it by publishing a
+	// 64 KB prefix first. So the wait is now explicit.
+	//
+	// Capped at SEARCH_BLOCK: a caret 200 MB down would otherwise hold the jump
+	// until the whole file had been scanned, and a jump that lands seconds after
+	// the keystroke is the very thing "once per query" exists to prevent. `done`
+	// is the other way out, for a scan that ended early (a fault): pick from
+	// whatever it managed to publish rather than never pick at all.
+	from := min(doc.cursor, doc.anchor)
+	reached := scanned >= min(from, SEARCH_BLOCK) || done
+	if !f.jumped && n > 0 && !doc.filter && reached {
 		f.jumped = true
 		f.current = 0
-		// Reference the START of any selection, not the caret. Selecting a match
-		// leaves the caret at its end, so re-running this after a toggle (Ctrl+R,
-		// Ctrl+L) would pick the *next* match every time — the selection walked
-		// forward one match per keypress.
-		from := min(doc.cursor, doc.anchor)
 		for m, i in f.matches {
 			if m >= from {
 				f.current = i
@@ -363,9 +398,10 @@ find_merge :: proc(doc: ^Document) {
 		find_select_current(doc)
 	}
 
-	// Sticky copy for the status text. Reached only on real progress (the
-	// n == f.merged guard above returns early otherwise), so a cleared array
-	// during a restart cannot overwrite these with zero.
+	// Sticky copy for the status text. Guarded on n > 0, so a cleared array
+	// during a restart cannot overwrite these with zero — the guard, not the
+	// early return above, is what carries that: this is now also reached on a
+	// merge with no new results while the jump is still pending.
 	//
 	// After the jump block, not before it: search_reset clears f.current to -1
 	// and f.jumped to false on every restart, so at the slice assignments above
