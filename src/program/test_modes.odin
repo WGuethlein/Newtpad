@@ -11255,8 +11255,41 @@ when NEWTPAD_TESTS {
 				fmt.println("--- the overlay beats the defaults ---")
 				load("ctrl+t = Undo\n")
 				chk(&bad, resolve_key(.T, true, false, .Editor) == .Undo, fmt.tprintf("ctrl+t -> %v (want Undo; the default is Toggle_Table)", resolve_key(.T, true, false, .Editor)))
-				chk(&bad, command_chord(.Undo) == "Ctrl+T", fmt.tprintf("the menus teach the NEW chord: command_chord(Undo)=%q (want \"Ctrl+T\")", command_chord(.Undo)))
-				chk(&bad, command_chord(.Toggle_Table) == "", fmt.tprintf("...and stop teaching the one that was taken: command_chord(Toggle_Table)=%q (want \"\")", command_chord(.Toggle_Table)))
+				// What the menus TEACH turns on add-vs-replace, not on which half
+				// of the keymap the row came from. This line ADDS a chord: Ctrl+Z
+				// still runs Undo, so un-teaching it would take away a shortcut the
+				// user knows and never asked to lose.
+				chk(&bad, command_chord(.Undo) == "Ctrl+Z", fmt.tprintf("an ADDED chord does not un-teach the working default: command_chord(Undo)=%q (want \"Ctrl+Z\")", command_chord(.Undo)))
+				chk(&bad, command_chord(.Toggle_Table) == "", fmt.tprintf("...and the command whose chord was TAKEN teaches nothing: command_chord(Toggle_Table)=%q (want \"\")", command_chord(.Toggle_Table)))
+				// Replace, both ways of spelling it, and the menus follow the user.
+				load("ctrl+z =\nctrl+t = Undo\n")
+				chk(&bad, command_chord(.Undo) == "Ctrl+T", fmt.tprintf("unbinding the default makes the menus teach the new chord: %q (want \"Ctrl+T\")", command_chord(.Undo)))
+				load("ctrl+z = Redo\nctrl+t = Undo\n")
+				chk(&bad, command_chord(.Undo) == "Ctrl+T", fmt.tprintf("giving the default away does too: %q (want \"Ctrl+T\")", command_chord(.Undo)))
+				// A command with no default chord at all -- the overlay is its only
+				// possible answer, which is why the seed lists these by name.
+				load("ctrl+alt+o = Open_Link\n")
+				chk(&bad, command_chord(.Open_Link) == "Ctrl+Alt+O", fmt.tprintf("a command with no default teaches its overlay chord: %q (want \"Ctrl+Alt+O\")", command_chord(.Open_Link)))
+				// An overlay row a LATER line overrode must not be taught either:
+				// Ctrl+K runs Redo here, so teaching it for Undo would be exactly
+				// the drift this proc exists to stop. Ctrl+Z is unbound first so
+				// that the default cannot answer and the overlay's own guard is
+				// what is under test.
+				k = load("ctrl+z =\nctrl+k = Undo\nctrl+k = Redo\n")
+				chk(&bad, resolve_key(.K, true, false, .Editor) == .Redo, fmt.tprintf("ctrl+k -> %v (want Redo, the last line)", resolve_key(.K, true, false, .Editor)))
+				chk(&bad, command_chord(.Undo) == "", fmt.tprintf("a superseded overlay row is not taught: command_chord(Undo)=%q (want \"\"; Ctrl+K runs Redo)", command_chord(.Undo)))
+				// The invariant that makes every guard above a provable no-op on a
+				// machine with no keys.txt: with an empty overlay resolve_key is the
+				// plain default lookup, so a default row can only fail its own guard
+				// if some OTHER default row shadows the same chord.
+				dup_pairs := 0
+				for a, i in default_bindings {
+					for b, j in default_bindings {
+						if j <= i {continue}
+						if a.key == b.key && a.ctrl == b.ctrl && a.alt == b.alt && a.ctx == b.ctx {dup_pairs += 1}
+					}
+				}
+				chk(&bad, dup_pairs == 0, fmt.tprintf("no two default_bindings rows share a chord (%d duplicate pair(s) in %d rows)", dup_pairs, len(default_bindings)))
 
 				// --- reserved chords are refused --------------------------------------
 				// The escape hatch, so a bad file cannot be a one-way door: cancel,

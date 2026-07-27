@@ -375,11 +375,31 @@ default_bindings := []Binding {
 // place that knows the shortcuts is exactly why this proc exists; consulting
 // only half of the keymap would reintroduce the drift it was written to stop.
 //
-// Two guards, both no-ops when there is no keys.txt:
-//   * an overlay row for this command wins outright (it is the user's own
-//     choice, and it may be the only binding a command has);
-//   * a default row is skipped when the chord no longer resolves to this
-//     command — the overlay either unbound it or gave it to something else.
+// Three sources, in this order, and EVERY candidate — default or overlay — has
+// to answer the same question first: does this chord still resolve to this
+// command? A row that teaches a chord which now runs something ELSE is worse
+// than a row that teaches nothing, and a keys.txt can produce that from either
+// side (a later duplicate line beats an earlier one, so an overlay row is no
+// more self-evidently live than a default one).
+//
+//  1. THE DEFAULT EDITOR CHORD, IF IT STILL RESOLVES. The distinction that
+//     matters is between a keys.txt line that ADDS a chord and one that
+//     REPLACES it. `ctrl+k = Undo` leaves Ctrl+Z alone; the user asked for one
+//     more way in, not for the one they already know to be un-taught, so the
+//     menus keep saying Ctrl+Z. Unbinding Ctrl+Z, or giving it to Redo, makes
+//     this test fail — and then, and only then, the overlay's chord is what
+//     gets taught. "The overlay wins" alone would collapse the two cases.
+//  2. THE OVERLAY'S OWN ROW, last-wins inside the file (the order
+//     keymap_lookup resolves in). This is the answer for a rebind, and the
+//     only answer a command with no default chord at all can have —
+//     `ctrl+alt+o = Open_Link` is the whole reason the seed lists those.
+//  3. ANY OTHER CONTEXT'S DEFAULT, so mode-local commands (the find toggles)
+//     still teach their key instead of showing blank. Last, because an Editor
+//     chord is the one a user would press from the document.
+//
+// All three are no-ops with no keys.txt: an empty overlay makes resolve_key the
+// plain default lookup, and no two default_bindings rows share a (key, ctrl,
+// alt, ctx) — keymaptest pins that — so nothing can fail its own guard.
 command_chord :: proc(cmd: Command_Id, allocator := context.temp_allocator) -> string {
 	if cmd == .None {return ""}
 	fmt_chord :: proc(b: Binding, allocator: mem.Allocator) -> string {
@@ -391,20 +411,20 @@ command_chord :: proc(cmd: Command_Id, allocator := context.temp_allocator) -> s
 		n += 1
 		return strings.concatenate(parts[:n], allocator)
 	}
-	// Last-wins inside the file, the same order keymap_lookup resolves in.
-	#reverse for e in g_keymap.entries {
-		if e.cmd == cmd {return fmt_chord(e, allocator)}
+	for b in default_bindings {
+		if b.cmd != cmd || b.ctx != .Editor {continue}
+		if resolve_key(b.key, b.ctrl, b.alt, b.ctx) != cmd {continue}
+		return fmt_chord(b, allocator)
 	}
-	// Editor bindings first — that's the chord a user would press from the
-	// document. Falling back to any context so mode-local commands (the find
-	// toggles) still teach their key instead of showing blank.
-	for pass in 0 ..< 2 {
-		for b in default_bindings {
-			if b.cmd != cmd {continue}
-			if pass == 0 && b.ctx != .Editor {continue}
-			if resolve_key(b.key, b.ctrl, b.alt, b.ctx) != cmd {continue}
-			return fmt_chord(b, allocator)
-		}
+	#reverse for e in g_keymap.entries {
+		if e.cmd != cmd {continue}
+		if resolve_key(e.key, e.ctrl, e.alt, e.ctx) != cmd {continue}
+		return fmt_chord(e, allocator)
+	}
+	for b in default_bindings {
+		if b.cmd != cmd || b.ctx == .Editor {continue}
+		if resolve_key(b.key, b.ctrl, b.alt, b.ctx) != cmd {continue}
+		return fmt_chord(b, allocator)
 	}
 	return ""
 }
