@@ -20,7 +20,13 @@ ctok_eq :: proc(t: ^testing.T, got: Token, want_start, want_len: int, want_kind:
 	testing.expectf(
 		t,
 		got.start == want_start && got.len == want_len && got.kind == want_kind,
-		"%s: got {%d,%d,%v} want {%d,%d,%v}",
+		// No literal '{' in this format string: Odin's fmt reads "{0," as a
+		// brace-index verb and renders "%!(MISSING CLOSE BRACE)" instead of
+		// the numbers, which garbles the one output sabotage discipline
+		// (docs/development-loop.md §3) depends on reading. Found 2026-07-26
+		// while sabotaging task 4; it had been silently mangling every
+		// ctok_eq failure since this file was written.
+		"%s: got start=%d len=%d kind=%v, want start=%d len=%d kind=%v",
 		label,
 		got.start,
 		got.len,
@@ -33,13 +39,14 @@ ctok_eq :: proc(t: ^testing.T, got: Token, want_start, want_len: int, want_kind:
 
 @(private = "file")
 LC_TEST_KW_C :: Keyword_Set {
-	keywords   = {"return", "if", "else", "const"},
-	types      = {"int", "char", "void"},
-	type_intro = {"struct", "union", "enum"},
-	preproc    = true,
-	digit_sep  = '_',
-	raw_string = .None,
-	backtick   = false,
+	keywords     = {"return", "if", "else", "const"},
+	types        = {"int", "char", "void"},
+	type_intro   = {"struct", "union", "enum"},
+	preproc      = true,
+	digit_sep    = '_',
+	raw_string   = .None,
+	backtick     = false,
+	line_comment = "//", // C's marker, spelled out -- the zero value is "no line comment"
 }
 
 // --- comments ---------------------------------------------------------
@@ -61,6 +68,82 @@ test_lex_c_line_comment :: proc(t: ^testing.T) {
 		}
 	}
 	testing.expectf(t, found, "want a Comment token at %d, got none among %d tokens", c_start, n)
+}
+
+// The line-comment marker is per-language DATA (Keyword_Set.line_comment),
+// not a hardcoded "//" -- batch 7 task 4. The three tests below pin the three
+// ways that can go wrong; CSS's and SQL's own behaviour lives in
+// lex_c_css_sql_test.odin.
+
+// 1. An EMPTY marker must mean "this language has no line comment", NEVER
+//    "the empty string matches at every byte." The inverted check is the
+//    obvious way to write a prefix compare and it would open a Comment at
+//    offset 0 of every line of every file -- so this asserts the whole line
+//    still lexes as code, not just that token 0 isn't a Comment.
+@(test)
+test_lex_c_empty_line_comment_marker_matches_nothing :: proc(t: ^testing.T) {
+	kw := LC_TEST_KW_C
+	kw.line_comment = ""
+	line := `int x = 1; // not a comment in this language`
+	out: [16]Token
+	n, state := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
+	testing.expectf(t, state == .Normal, "an empty marker must not open any state, got %v", state)
+	testing.expectf(t, n > 0, "an empty marker must not stop the scan: want real tokens, got %d", n)
+	for i in 0 ..< n {
+		testing.expectf(t, out[i].kind != .Comment, "empty marker means NO line comment: got a Comment token at %d len %d", out[i].start, out[i].len)
+	}
+	ctok_eq(t, out[0], 0, 3, .Type, "'int' still lexes -- the scan did not stop at a phantom comment at offset 0")
+}
+
+// 2. The marker is per-language, so SQL's "--" must NOT be a comment in a
+//    C-family language. C's own "x--;" is a post-decrement, and before the
+//    marker became data there was no way for this to regress; now there is.
+@(test)
+test_lex_c_double_dash_is_not_a_comment_in_c :: proc(t: ^testing.T) {
+	kw := C_KW
+	line := `int x = 1; x--; return x;`
+	out: [16]Token
+	n, state := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
+	testing.expectf(t, state == .Normal, "no state opened by 'x--;', got %v", state)
+	for i in 0 ..< n {
+		testing.expectf(t, out[i].kind != .Comment, "C: '--' is post-decrement, not a comment, got a Comment at %d", out[i].start)
+	}
+	ret_start := strings.index(line, "return")
+	found := false
+	for i in 0 ..< n {
+		if out[i].start == ret_start && out[i].kind == .Keyword {found = true}
+	}
+	testing.expectf(t, found, "C: 'return' after 'x--;' must still be a Keyword")
+}
+
+// 3. Every real table's marker, asserted by name. `line_comment`'s zero value
+//    is "" (no line comment), so a twelfth language that simply forgets the
+//    field would silently lose all its line comments and every existing test
+//    would still pass. This is the only check that catches that, and it is
+//    the same lesson as GO_KW shipping without `func`: a data table nobody
+//    tests for a SPECIFIC value is a table with a hole in it.
+@(test)
+test_lex_c_line_comment_marker_per_table :: proc(t: ^testing.T) {
+	cases := [?]struct {
+		name: string,
+		kw:   ^Keyword_Set,
+		want: string,
+	} {
+		{"C", &C_KW, "//"},
+		{"C++", &CPP_KW, "//"},
+		{"C#", &CS_KW, "//"},
+		{"Java", &JAVA_KW, "//"},
+		{"JS", &JS_KW, "//"},
+		{"TS", &TS_KW, "//"},
+		{"Go", &GO_KW, "//"},
+		{"Rust", &RUST_KW, "//"},
+		{"Odin", &ODIN_KW, "//"},
+		{"CSS", &CSS_KW, ""}, // no line comment at all -- deliberate, not forgotten
+		{"SQL", &SQL_KW, "--"},
+	}
+	for c in cases {
+		testing.expectf(t, c.kw.line_comment == c.want, "%s: line_comment must be %q, got %q", c.name, c.want, c.kw.line_comment)
+	}
 }
 
 // Block comment opened and closed on the same line: one Comment token, state
@@ -240,7 +323,7 @@ test_lex_c_char_literal :: proc(t: ^testing.T) {
 @(test)
 test_lex_c_rust_raw_string_same_line :: proc(t: ^testing.T) {
 	line := `let re = r#"a"quote"b"#;`
-	kw := Keyword_Set{raw_string = .Rust, digit_sep = '_'}
+	kw := Keyword_Set{raw_string = .Rust, digit_sep = '_', line_comment = "//"}
 	out: [8]Token
 	n, _ := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
 	rs_start := strings.index(line, `r#"`)
@@ -258,7 +341,7 @@ test_lex_c_rust_raw_string_same_line :: proc(t: ^testing.T) {
 @(test)
 test_lex_c_cpp_raw_string_same_line :: proc(t: ^testing.T) {
 	line := `auto re = R"delim(a)b)delim";`
-	kw := Keyword_Set{raw_string = .Cpp, digit_sep = '\''}
+	kw := Keyword_Set{raw_string = .Cpp, digit_sep = '\'', line_comment = "//"}
 	out: [8]Token
 	n, _ := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
 	rs_start := strings.index(line, `R"delim(`)
@@ -276,7 +359,7 @@ test_lex_c_cpp_raw_string_same_line :: proc(t: ^testing.T) {
 @(test)
 test_lex_c_backtick_same_line :: proc(t: ^testing.T) {
 	line := "x := `hello world`"
-	kw := Keyword_Set{backtick = true}
+	kw := Keyword_Set{backtick = true, line_comment = "//"}
 	out: [8]Token
 	n, _ := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
 	bt_start := strings.index(line, "`")
@@ -298,7 +381,7 @@ test_lex_c_backtick_same_line :: proc(t: ^testing.T) {
 @(test)
 test_lex_c_unterminated_backtick_left_plain :: proc(t: ^testing.T) {
 	line := "x := `hello"
-	kw := Keyword_Set{backtick = true}
+	kw := Keyword_Set{backtick = true, line_comment = "//"}
 	out: [8]Token
 	n, state := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
 	testing.expectf(t, state == .Normal, "backtick state is never carried across lines, got %v", state)
@@ -442,7 +525,7 @@ test_lex_c_preprocessor_disabled_for_language_without_it :: proc(t: ^testing.T) 
 	// all (e.g. a JS/TS private class field like "#count", or just stray
 	// punctuation) -- this is Keyword_Set data, not a hardcoded C assumption.
 	line := `#count = 1;`
-	kw := Keyword_Set{preproc = false, digit_sep = '_'}
+	kw := Keyword_Set{preproc = false, digit_sep = '_', line_comment = "//"}
 	out: [8]Token
 	n, _ := lex_c(transmute([]u8)line, .Normal, &kw, out[:])
 	for i in 0 ..< n {
