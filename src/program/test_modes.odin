@@ -983,15 +983,20 @@ when NEWTPAD_TESTS {
 				app_open_special(&ea, .Settings)
 				live: [dynamic]Command_Id
 				defer delete(live)
+				// found matters as much as live: without it, `len(live) == 0` reads the
+				// same whether every row is dead or the menu was never located, so
+				// renaming the menu would leave this passing while testing nothing.
+				found := false
 				for m in menus {
 					if m.title != "Encoding" {continue}
+					found = true
 					for it in m.items {
 						if it.cmd == .None {continue}
 						if it.enabled == nil || it.enabled(&ea) {append(&live, it.cmd)}
 					}
 				}
-				enc_dead := len(live) == 0
-				fmt.printfln("  %-6s no Encoding row is live on the Settings tab: still live=%v", "ok" if enc_dead else "FAIL", live[:])
+				enc_dead := found && len(live) == 0
+				fmt.printfln("  %-6s no Encoding row is live on the Settings tab: found=%v still live=%v", "ok" if enc_dead else "FAIL", found, live[:])
 				if !enc_dead {bad += 1}
 				app_destroy(&ea)
 			}
@@ -4421,6 +4426,47 @@ when NEWTPAD_TESTS {
 				return
 			}
 			if block_test_eol_clears_rect(&t) > 0 {fail = true}
+
+			// Same class one level up, found by the whole-branch review right after
+			// the line-ending one was fixed: .History_Jump is apply_snapshot ->
+			// pt_restore, a whole-tree replacement, exactly what .Undo and .Redo are,
+			// and it was missing from command_mutates_doc for the same reason -- it
+			// does not look like an edit.
+			//
+			// The RECTANGLE is not the property to assert on here: apply_snapshot
+			// clears one itself, so a rectangle-based check passes with or without the
+			// fix (it was written that way first, and sabotage caught it). What
+			// command_mutates_doc actually protects is the TABLE guard -- table view is
+			// a read-only grid whose only legal write is table_edit_commit's single
+			// splice, and a buffer rewritten under an in-progress cell edit leaves that
+			// splice landing at a captured span that no longer means anything.
+			block_test_history_jump_blocked_in_table :: proc(t: ^plat.Text) -> (bad: int) {
+				ha: App
+				hdummy: plat.Window
+				app_new_scratch(&ha)
+				hd := app_active(&ha)
+				doc_close(hd)
+				hd^ = doc_from_content(transmute([]u8)strings.clone("a,b\n1,2\n"), "", .UTF8)
+				hd.wrap = false
+				doc_insert_text(hd, transmute([]u8)string("Z")) // an earlier state to jump back to
+				after_edit := doc_debug_string(hd)
+				hd.table = true // the read-only grid
+				hd.table_delim = ','
+
+				ha.history.open = true
+				ha.history.sel = 0 // "As opened" -- the state before the insert
+				command_dispatch(.History_Jump, {}, &ha, &hdummy, t, 10)
+
+				unchanged := doc_debug_string(hd) == after_edit
+				fmt.printfln(
+					"  %-6s table view blocks a history jump: text=%q (want it unchanged at %q)",
+					"ok" if unchanged else "FAIL", doc_debug_string(hd), after_edit,
+				)
+				if !unchanged {bad += 1}
+				app_destroy(&ha)
+				return
+			}
+			if block_test_history_jump_blocked_in_table(&t) > 0 {fail = true}
 
 			// SEAM PROOF: the assertion the previous round's clipboard fix
 			// lacked. block_test_an (above) only proves block_test_ai's OWN

@@ -690,6 +690,16 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	// Toggle_Table holes fixed in earlier batches.
 	case .Eol_LF, .Eol_CRLF:
 		return true
+	// Same class one level up: jumping to a history state is apply_snapshot ->
+	// pt_restore, a whole-tree replacement, exactly what .Undo and .Redo above are.
+	// It was missed for the same reason -- it does not look like an edit. The
+	// rectangle is not what this protects (apply_snapshot clears one itself); the
+	// TABLE guard is. Edit > Undo History is enabled on any document, a click in
+	// the menu bar lands above CONTENT_TOP so an in-progress cell edit is never
+	// committed on the way, and without this the panel then rewrites the buffer
+	// under a captured cell span that table_edit_commit will splice into.
+	case .History_Jump:
+		return true
 	}
 	return false
 }
