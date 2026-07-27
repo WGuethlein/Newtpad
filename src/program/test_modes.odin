@@ -972,6 +972,30 @@ when NEWTPAD_TESTS {
 			fmt.printfln("  %-6s every menu mnemonic is unique", "ok" if mn_ok else "FAIL")
 			if !mn_ok {bad += 1}
 
+			// Settings and Font are TABS, so app_active returns a Document for them
+			// and has_doc is true. The Encoding menu's Save-as and Line-Endings rows
+			// used that predicate and were therefore live on a pseudo-tab: "Save as
+			// UTF-16 LE" set doc.modified on a page with no file, and Ctrl+W then
+			// asked whether to save it. Every row of the menu must be dead there --
+			// the Reopen_* rows already were, via has_file.
+			{
+				ea: App
+				app_open_special(&ea, .Settings)
+				live: [dynamic]Command_Id
+				defer delete(live)
+				for m in menus {
+					if m.title != "Encoding" {continue}
+					for it in m.items {
+						if it.cmd == .None {continue}
+						if it.enabled == nil || it.enabled(&ea) {append(&live, it.cmd)}
+					}
+				}
+				enc_dead := len(live) == 0
+				fmt.printfln("  %-6s no Encoding row is live on the Settings tab: still live=%v", "ok" if enc_dead else "FAIL", live[:])
+				if !enc_dead {bad += 1}
+				app_destroy(&ea)
+			}
+
 			fmt.printfln("menutest: %d failures", bad)
 			return true
 		}

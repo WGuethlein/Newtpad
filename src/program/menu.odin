@@ -41,6 +41,17 @@ Menu :: struct {
 @(private = "file")
 has_doc :: proc(app: ^App) -> bool {return app_active(app) != nil}
 
+// Settings and Font are tabs, not overlays, so app_active returns a Document for
+// them and has_doc is true — but they have no file, no encoding and no line
+// endings. Without this, Encoding > Save as UTF-16 LE on the Settings tab set
+// doc.modified on a pseudo-document, and request_close_tab then raised a
+// save-changes dialog for a page that has nothing to save.
+@(private = "file")
+has_text_doc :: proc(app: ^App) -> bool {
+	d := app_active(app)
+	return d != nil && d.kind == .Text
+}
+
 // Reload needs a file on disk to reload from; an untitled buffer has none.
 @(private = "file")
 has_file :: proc(app: ^App) -> bool {
@@ -186,12 +197,12 @@ menus := []Menu {
 			{cmd = .Reopen_UTF16LE, enabled = has_file},
 			{cmd = .Reopen_CP1252, enabled = has_file},
 			sep,
-			{cmd = .Enc_UTF8, checked = is_enc_utf8, enabled = has_doc},
-			{cmd = .Enc_UTF16LE, checked = is_enc_utf16le, enabled = has_doc},
-			{cmd = .Enc_CP1252, checked = is_enc_cp1252, enabled = has_doc},
+			{cmd = .Enc_UTF8, checked = is_enc_utf8, enabled = has_text_doc},
+			{cmd = .Enc_UTF16LE, checked = is_enc_utf16le, enabled = has_text_doc},
+			{cmd = .Enc_CP1252, checked = is_enc_cp1252, enabled = has_text_doc},
 			sep,
-			{cmd = .Eol_LF, checked = is_eol_lf, enabled = has_doc},
-			{cmd = .Eol_CRLF, checked = is_eol_crlf, enabled = has_doc},
+			{cmd = .Eol_LF, checked = is_eol_lf, enabled = has_text_doc},
+			{cmd = .Eol_CRLF, checked = is_eol_crlf, enabled = has_text_doc},
 		},
 	},
 }
