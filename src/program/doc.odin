@@ -974,6 +974,7 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.undo)
 	delete(doc.redo)
 	delete(doc.bookmarks)
+	doc.bookmarks = nil // same freed-but-live header hazard as lex_idx above
 	delete(doc.find.query)
 	delete(doc.find.replace)
 	delete(doc.filter_lines)
@@ -1689,9 +1690,12 @@ doc_absorb_append :: proc(doc: ^Document, new_size: i64) -> bool {
 	if !ok || len(chunk) == 0 {return false}
 
 	// Appending at the end never disturbs earlier offsets, so the caret,
-	// selection, search results and bookmarks all stay meaningful (every
-	// bookmark is < length, so bookmarks_shift_insert's `b > at` moves none of
-	// them).
+	// selection, search results and bookmarks all stay meaningful. A bookmark on
+	// the TRAILING EMPTY LINE is at offset == length, i.e. exactly at the
+	// insertion point, and bookmarks_shift_replace's pure-insert rule leaves it
+	// there -- correctly: that offset is still preceded by '\n', so it is still a
+	// line start, and it now names the first line that arrived from disk, which
+	// is the same line the mark was on, grown some content.
 	at_end := doc.cursor >= doc.pt.length
 	pt_edit_insert(doc, doc.pt.length, chunk)
 	for b in chunk {if b == '\n' {doc.nl_delta += 1}}
