@@ -274,11 +274,21 @@ main :: proc() {
 				palette_input_rune(&app, window.chars[i])
 			} else if doc.find.active {
 				find_input_rune(doc, window.chars[i])
-			} else if doc.table {
-				// Table view is read-only text; typing only does something once a
-				// cell is being edited (click a cell to start), and then it feeds the
-				// in-cell field, not the underlying document.
-				if doc.table_editing {table_edit_rune(doc, window.chars[i])}
+			} else if doc_read_only_view(doc) {
+				// A rendered view, not an editable one. Table view is read-only
+				// text; typing only does something once a cell is being edited
+				// (click a cell to start), and then it feeds the in-cell field, not
+				// the underlying document. Markdown Preview has no field at all --
+				// markdown_draw replaces the text pass, so there is not even a caret
+				// on screen -- so every character is swallowed.
+				//
+				// Preview reached this loop unguarded until 2026-07-28: `doc.table`
+				// was open-coded here, so typing in the rendered view ran
+				// editor_input_rune and edited the file blind, with nothing drawn to
+				// show where. Wyatt, live use. The keys that edit without producing a
+				// character (Backspace, Enter, Paste, Undo) come through
+				// command_dispatch and are stopped by the guard there.
+				if doc.table && doc.table_editing {table_edit_rune(doc, window.chars[i])}
 			} else {
 				// Not doc_insert_rune directly: with a column rectangle live
 				// one keystroke is an edit on every row it spans.

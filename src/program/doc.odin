@@ -346,6 +346,26 @@ doc_wraps :: proc(doc: ^Document) -> bool {
 	return doc != nil && (doc.wrap || (doc.kind == .Text && doc.md_mode == .Split))
 }
 
+// The views that RENDER the document instead of editing it: the CSV/TSV grid
+// and the full-window Markdown Preview. Both replace the text pass entirely
+// (table_draw, markdown_draw), so neither draws a caret, and both must refuse
+// every buffer write -- a caret left over from text view would otherwise edit
+// at an offset the user cannot see.
+//
+// Markdown Split is deliberately NOT here: its left half is the real editor and
+// is meant to be typed in. The preview half takes no caret either, but that is
+// a MOUSE question (which pane a press landed in) and belongs to
+// ro_surface_swallows; the keyboard always belongs to the editor half.
+//
+// One predicate rather than the condition open-coded per site, because that is
+// how Preview came to be editable at all: `doc.table` was spelled out at each
+// guard, so adding a second read-only view meant finding every one of them, and
+// nobody did. Consumed by the typed-character loop (main.odin) and the
+// mutating-command guard plus the Replace All arm (commands.odin).
+doc_read_only_view :: proc(doc: ^Document) -> bool {
+	return doc != nil && doc.kind == .Text && (doc.table || doc.md_mode == .Preview)
+}
+
 eff_wrap_at :: proc(doc: ^Document, t: ^plat.Text, off: int) -> (wrap: bool, ls: int) {
 	s, exact := base.pt_line_start_cap(&doc.pt, off, WRAP_START_CAP)
 	if doc_wraps(doc) {return true, s}
