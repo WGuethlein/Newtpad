@@ -205,18 +205,24 @@ tabs_layout :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text, width: f32, all
 		}
 	}
 
+	// Every tab gets its true position; whether it is DRAWN is a separate
+	// question. It used to stop advancing x at the first tab that did not fit,
+	// so every overflowing tab shared one position -- which made the strip's
+	// total width unknowable and any scroll offset computed from it nonsense.
+	// That is invisible while the rail never scrolls, which it never did.
 	place :: proc(app: ^App, rects: []Tab_Rect, nat: []f32, limit, scroll: f32) -> (drawn: int) {
 		x := MENU_W - scroll
 		i := 0
 		for d, slot in app.docs {
 			if d == nil {continue}
 			w := nat[i]
-			fits := x + w <= limit
+			// Fully inside the strip. Partially-visible tabs are not drawn: a tab
+			// clipped by the caption buttons is one whose click sends HT_CLOSE,
+			// and one clipped at the left shows a truncated name with no marker.
+			fits := x >= MENU_W - 0.5 && x + w <= limit
 			rects[i] = {slot = slot, x = x, w = w, close_x = x + w - TAB_CLOSE_W, drawn = fits}
-			if fits {
-				drawn += 1
-				x += w + TAB_GAP
-			}
+			if fits {drawn += 1}
+			x += w + TAB_GAP
 			i += 1
 		}
 		return
@@ -261,6 +267,49 @@ tab_elide :: proc(t: ^plat.Text, label: string, cells: int, allocator := context
 	tb := plat.text_bytes_for_cells(t, b, plat.text_cells(t, b, 0) - tail, 0)
 	if tb < hb {return label}
 	return strings.concatenate({label[:hb], "…", label[tb:]}, allocator)
+}
+
+// Scroll the rail so the active tab is on screen.
+//
+// app.tab_scroll was declared, read in four places, and NEVER WRITTEN -- so it
+// was always zero and the rail never scrolled. With more tabs than fit, Ctrl+Tab
+// could land on a tab that is simply not drawn: the overflow count said "+3" and
+// the only way to reach one of them was the palette. Switching to a tab you
+// cannot see is the worst version of that, because nothing on screen changes
+// except the document.
+//
+// Measured from the UNSCROLLED layout, so the answer does not depend on where
+// the rail happens to be sitting -- otherwise each call nudges the previous
+// call's result and the strip creeps.
+tabs_reveal_active :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text, width: f32) {
+	if app.active < 0 {return}
+	saved := app.tab_scroll
+	app.tab_scroll = 0
+	L := tabs_layout(app, win, t, width)
+	app.tab_scroll = saved
+
+	ax, aw := f32(0), f32(0)
+	total := MENU_W
+	found := false
+	for r in L.tabs {
+		if r.slot == app.active {
+			ax, aw, found = r.x, r.w, true
+		}
+		total = r.x + r.w
+	}
+	if !found {return}
+
+	span := L.limit - (L.over_w if L.over_on else 0)
+	// Nothing to scroll when everything fits; leaving a stale offset would push
+	// the strip off its own left edge.
+	if total <= span {
+		app.tab_scroll = 0
+		return
+	}
+	sc := app.tab_scroll
+	if ax - sc < MENU_W {sc = ax - MENU_W} // off the left
+	if ax + aw - sc > span {sc = ax + aw - span} // off the right
+	app.tab_scroll = clamp(sc, 0, max(0, total - span))
 }
 
 // The display index a pointer x falls on, for the reorder. Asks the layout

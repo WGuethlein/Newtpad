@@ -616,6 +616,14 @@ main :: proc() {
 		// its auto-scroll the instant the pointer touched the bar, so a selection
 		// could never be dragged below the last visible line. Consume only a fresh
 		// press; leave an ongoing drag to the auto-scroll below.
+		// A click on a status cell runs its command, before the strip swallows
+		// the press. UI spec 13: "Every cell is clickable."
+		if window.mouse_pressed {
+			scw := plat.text_char_width(&text, UI_SMALL_PX)
+			if c := status_cell_at(doc, f32(window.width), f32(window.height), scw, f32(window.mouse_x), f32(window.mouse_y)); c != .None {
+				command_dispatch(c, {}, &app, window, &text, rows)
+			}
+		}
 		if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
 			if window.mouse_pressed || window.mouse_middle_pressed {
 				window.mouse_pressed = false
@@ -1431,6 +1439,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		plat.text_draw(gfx, text, filter_banner_text(doc), sx(12), by + FILTER_BANNER_H - sx(7), UI_SMALL_PX, g_theme[.Text_Primary])
 	}
 
+	// Keep the active tab on screen before the rail is drawn -- and before the
+	// hit-test next frame reads the same layout.
+	tabs_reveal_active(rc.app, window, text, w)
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
 	if doc.kind == .Font {
 		font_page_draw(gfx, quad_pipe, text, rc.app, w, h)
@@ -1571,7 +1582,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			selected = true
 		}
 		left := fmt.tprintf("%s    %s%s%s%s%s%s%s", lncol, count, " *" if doc.modified else "", recovered, disk, indexing, atlas, nobackup)
-		right := fmt.tprintf("%s    %s%s", enc_name(doc.enc), base.line_ending_name(doc.eol), mode)
+		// `mode` is not a cell: it names the VIEW, which the menus own, and there
+		// is no single obvious action for a click on it.
+		right := mode // reassigned by the drop order below
 
 		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)
 		// Text_Muted, not Text_Dim. Text_Dim is the disabled-only tier at 2.9:1 --
@@ -1582,7 +1595,50 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		base_y := h - sx(8)
 		cw := plat.text_char_width(text, UI_SMALL_PX)
 		plat.text_draw(gfx, text, left, sx(12), base_y, UI_SMALL_PX, g_theme[.Accent] if selected else col)
-		plat.text_draw(gfx, text, right, w - sx(12) - f32(len(right)) * cw, base_y, UI_SMALL_PX, col)
+		// The cells, from the one geometry the click also reads, with a hairline
+		// divider in each gap. UI spec 13: "Cells, not a sentence... a fixed home
+		// for each, so the eye learns where to look."
+		// UI spec 5's drop order, enforced rather than implied.
+		//
+		// The window has a floor now (WM_GETMINMAXINFO), but between that floor
+		// and a comfortable width nothing DROPPED in order -- the right-hand
+		// cells simply kept being drawn until they ran into the left group and
+		// the two overlapped into an unreadable middle. The spec's order is
+		// explicit: "Status cells drop right-to-left: Tab width -> LF -> UTF-8 ->
+		// language. Ln/Col and the line count always stay."
+		//
+		// Measured against what the LEFT group actually needs, not against a
+		// hardcoded breakpoint, so it holds at any DPI and any font.
+		cbuf: [4]Status_Cell
+		cells := status_cells(doc, w, cw, cbuf[:])
+		{
+			need := sx(12) + f32(len(left)) * cw + sx(24)
+			// Drop from the left end of the right-hand group, which is the
+			// rightmost cell in reading order -- status_cells places them right
+			// to left, so the LAST entry is the leftmost on screen.
+			for len(cells) > 0 && cells[len(cells) - 1].x < need {
+				cells = cells[:len(cells) - 1]
+			}
+			// The view name goes before any cell does: it is the least useful of
+			// the three and the widest.
+			if len(cells) < 2 || (len(cells) > 0 && cells[len(cells) - 1].x - sx(24) - f32(len(right)) * cw < need) {
+				right = ""
+			}
+		}
+		for c, i in cells {
+			plat.text_draw(gfx, text, c.label, c.x, base_y, UI_SMALL_PX, col)
+			// A divider between cells, never after the last one -- the cells are
+			// placed right to left, so the LAST in this list is the leftmost.
+			if i + 1 < len(cells) {
+				dx := cells[i + 1].x + cells[i + 1].w + sx(12)
+				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {snap(dx), h - doc_bottom_bar_h(doc) + sx(6)}, size = {hairline(), doc_bottom_bar_h(doc) - sx(12)}, color = g_theme[.Border_Subtle]}})
+			}
+		}
+		// Whatever is left of the cells (the view name) keeps its own slot.
+		if right != "" {
+			rx := cells[len(cells) - 1].x - sx(24) - f32(len(right)) * cw if len(cells) > 0 else w - sx(12) - f32(len(right)) * cw
+			plat.text_draw(gfx, text, right, rx, base_y, UI_SMALL_PX, col)
+		}
 		// The transient notice sits between them, in Success when it is a
 		// confirmation and Warning otherwise -- "[SAVED]" is the one message that
 		// reports something going right.

@@ -32,6 +32,7 @@ PALETTE_HELP := []string {
 
 Palette_Result :: struct {
 	score: int,
+	used:  u32, // app.cmd_used at the time of the search; the tie-break
 	cmd:   Command_Id, // Commands mode
 	slot:  int, // Tabs mode
 }
@@ -50,6 +51,20 @@ Palette :: struct {
 @(private = "file")
 fuzzy_score :: proc(pattern, text: string) -> (score: int, ok: bool) {
 	if len(pattern) == 0 {return 0, true}
+	// An exact prefix outranks anything a subsequence can accumulate. UI spec 7:
+	// "Exact prefix > word-start subsequence > anywhere." Typing "sav" should put
+	// Save first rather than whichever longer command collects more
+	// consecutive-run bonuses, which is what a pure fzf score does.
+	if len(pattern) <= len(text) {
+		pre := true
+		for i in 0 ..< len(pattern) {
+			if lower_ascii(pattern[i]) != lower_ascii(text[i]) {
+				pre = false
+				break
+			}
+		}
+		if pre {score += 1000}
+	}
 	pi := 0
 	prev := -2
 	for ti := 0; ti < len(text) && pi < len(pattern); ti += 1 {
@@ -143,7 +158,15 @@ palette_move :: proc(app: ^App, delta: int) {
 }
 
 @(private = "file")
-by_score :: proc(a, b: Palette_Result) -> bool {return a.score > b.score}
+// Score first, then RECENCY. Two commands matching a short query equally well
+// is the common case, not the exotic one -- "Save" and "Save As..." both score
+// identically on "sav" -- and which of them you want is a question about you,
+// not about the strings. UI spec 7: "a palette that learns beats a clever
+// scorer."
+by_score :: proc(a, b: Palette_Result) -> bool {
+	if a.score != b.score {return a.score > b.score}
+	return a.used > b.used
+}
 
 palette_recompute :: proc(app: ^App) {
 	p := &app.palette
@@ -173,7 +196,7 @@ palette_recompute :: proc(app: ^App) {
 			if cmd == .Toggle_Table && !doc_can_table(d) {continue}
 			if cmd == .Toggle_Preview && !doc_can_markdown(d) {continue}
 			if s, ok := fuzzy_score(pat, command_table[cmd].title); ok {
-				append(&p.results, Palette_Result{score = s, cmd = cmd})
+				append(&p.results, Palette_Result{score = s, used = app.cmd_used[cmd], cmd = cmd})
 			}
 		}
 		slice.sort_by(p.results[:], by_score)
@@ -356,7 +379,7 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 	}
 
 	if p.mode == .Goto {
-		plat.text_draw(gfx, text, "type a line number, then Enter", x0 + sx(16), y0 + qh + sx(17), UI_PX, g_theme[.Text_Dim])
+		plat.text_draw(gfx, text, "type a line number, then Enter", x0 + sx(16), y0 + qh + sx(17), UI_PX, g_theme[.Text_Muted])
 		return
 	}
 	if p.mode == .Help {

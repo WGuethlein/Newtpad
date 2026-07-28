@@ -577,7 +577,7 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			y = yy + line_h
 		} else if bullet, content, depth := md_list(line); bullet != "" {
 			ind := x0 + f32(depth) * char_w * 2
-			plat.text_draw(gfx, text, bullet, ind, y, px, g_theme[.Text_Dim], .Doc)
+			plat.text_draw(gfx, text, bullet, ind, y, px, g_theme[.Accent], .Doc)
 			x := ind + char_w * f32(len(bullet) + 1)
 			yy := y
 			md_draw_inline(gfx, text, md_inline(content), ind + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
@@ -700,7 +700,7 @@ md_draw_table_row :: proc(
 		cx := x0 + md_col_x(c, i, char_w)
 		if cx >= x1 {break}
 		if i > 0 {
-			plat.text_draw(gfx, text, "│", cx - char_w, y, px, g_theme[.Text_Dim], .Doc)
+			plat.text_draw(gfx, text, "│", cx - char_w, y, px, g_theme[.Md_Quote], .Doc)
 		}
 		// col0 = 0, and it must match md_table_measure's origin for the same
 		// cell or the alignment padding below is computed against a width the

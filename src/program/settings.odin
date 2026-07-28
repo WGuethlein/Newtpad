@@ -495,7 +495,10 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 	// through and it reads as a distinct place, not an overlay.
 	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, CHROME_TOP}, size = {width, height - CHROME_TOP}, color = g_theme[.Bg_Base]}})
 
-	x := sx(32)
+	// 28, matching the value column's right inset -- UI spec 11 asks for the same
+	// margin on both sides, and the page indenting at 32 while the chrome pads at
+	// 8-14 is what made the two halves look unrelated.
+	x := sx(28)
 	y := CHROME_TOP + sx(40)
 	plat.text_draw(gfx, t, "Settings", x, y, UI_PX * 1.4, g_theme[.Text_Primary])
 	plat.text_draw(gfx, t, "Esc closes    Up/Down choose    Enter toggles", x, y + sx(22), UI_SMALL_PX, g_theme[.Text_Muted])
@@ -581,10 +584,10 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 	// Edit > Font there, and a short window with the Theme row selected is
 	// exactly the case that would otherwise recur here.
 	if app.settings_top > 0 {
-		plat.text_draw(gfx, t, "▲ more above", x, y0 - sx(14), UI_SMALL_PX, g_theme[.Text_Dim])
+		plat.text_draw(gfx, t, "▲ more above", x, y0 - sx(14), UI_SMALL_PX, g_theme[.Text_Muted])
 	}
 	if last < settings_row_count() {
-		plat.text_draw(gfx, t, "▼ more below", x, y0 + avail_h + sx(2), UI_SMALL_PX, g_theme[.Text_Dim])
+		plat.text_draw(gfx, t, "▼ more below", x, y0 + avail_h + sx(2), UI_SMALL_PX, g_theme[.Text_Muted])
 	}
 
 	// Version, bottom-left — the one always-visible surface for it in the GUI
