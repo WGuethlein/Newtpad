@@ -3584,6 +3584,54 @@ which is modal, so the headless run hung with no output — the fall-through tra
 - **§3.8's tab-edge alignment check** — still not meaningful; tabs start at `MENU_W`.
 - **No live pass on batches 12–15** beyond two screenshots.
 
+## 6an. Gamma, and the last of the orphaned debt (2026-07-29, v0.26.0, branch `fix/remaining-orphans`)
+
+The remainder of what no batch would pick up. Wyatt chose to ship gamma directly rather than behind a
+setting or after a live pass.
+
+### Blending now happens in linear light
+
+Text was composited as `text*cov + dst*(1-cov)` on **gamma-encoded** values. That weights
+partially-covered pixels wrongly and thins light glyphs on a dark page — §19 says so outright, and it
+is one honest candidate for the chrome text Wyatt reported as hard to read.
+
+The render-target **view** is sRGB-typed and both pixel shaders decode their colour. Two properties
+make this safe to land under everything at once:
+
+- **Opaque fills are unchanged by construction.** The shader decodes, the hardware encodes, so a solid
+  quad lands on the bytes it always did.
+- **Only blended pixels move** — glyph antialiasing and the SDF's edges. Measured: a square corner's
+  antialiased pixel 215 → 236, the focus ring 183 → 201. Heavier, which is the fix.
+
+The type is on the **view**, not the buffer: a view may only reinterpret a *typeless* resource, so the
+offscreen texture became `TYPELESS`. An sRGB view over a typed UNORM texture is `E_INVALIDARG`, which
+is what it returned first.
+
+**A test was asserting the wrong answer.** `quadsdftest` demanded 100..155 for a half-alpha blend and
+passed at 128. Half of linear 1.0 encodes to about 186; 128 is what you get by blending gamma-encoded
+values, which is exactly the defect. The check now expects the right figure and names the wrong one.
+
+### The program layer is off `core:os` paths
+
+`read_entire_file` goes through `_fix_long_path`, which returns the path **unchanged** without the HKLM
+opt-in — the registry dependency CLAUDE.md forbids relying on, and one that does nothing without a
+manifest entry this app deliberately does not ship. So every program-layer read had a silent
+260-character ceiling, reachable through `NEWTPAD_SESSION_DIR`.
+
+`plat.file_read_all` closes it; the creates, deletes, existence checks and the theme write route
+through `plat`. **`diag.odin`'s append-mode log handle remains** — it needs a `plat` append primitive
+that does not exist, and it is the least damaging of the set to lose.
+
+### Two debt entries were stale, not outstanding
+
+- **Arenas.** CLAUDE.md's Memory row was amended on 2026-07-27 and no longer specifies them. §5 kept
+  listing it as owed, and it was cited as outstanding several times after the amendment landed. The
+  entry is now marked resolved rather than deleted, because the failure mode was re-reporting it.
+- **§3.8's tab-edge alignment check** does not apply to this layout: the rail opens with the `>_`
+  button by deliberate choice (§7.1), so the tab edge and the text margin were never two views of one
+  measurement. Recorded as **declined**, not pending — it had been carried as "belongs with batch 13",
+  and batch 13 has been and gone.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
