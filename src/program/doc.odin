@@ -99,6 +99,38 @@ sx :: #force_inline proc(v: f32) -> f32 {
 	return r if r != 0 else (1 if v > 0 else -1)
 }
 
+// A one-device-pixel line at the current scale.
+//
+// FLOOR, never round -- and that is the whole point of it existing separately
+// from sx(1). At 125% `sx(1)` rounds 1.25 up to 2, and at 150% to 2, so a
+// hairline that should stay a hairline thickens; worse, at scales where the
+// rounded width and the (unrounded) position disagree, the line lands straddling
+// two device pixels and the rasteriser splits it into two half-alpha lines. That
+// is the "the menu separator looks blurry at 125%" class of defect, and it is
+// the one thing about hairlines the UI spec calls a hard rule (§3 item 4).
+//
+// Minimum 1: a hairline that scales away is a missing boundary, not a subtle
+// one. Same reasoning as sx()'s own never-round-to-nothing clamp.
+//
+// Callers should also SNAP THE POSITION to a whole pixel. This returns a width;
+// it cannot fix an x that arrives fractional.
+hairline :: #force_inline proc() -> f32 {return max(1, f32(int(UI_SCALE)))}
+
+// A chrome font size rounded to an even whole pixel.
+//
+// Even, not merely whole: line_height multiplies by LINE_SPACING and truncates,
+// and vertical centring inside a row divides by two. An odd px therefore puts
+// the centred baseline of a menu row or a tab label on a half pixel, which is
+// the difference between crisp chrome text and slightly soft chrome text at
+// 125% and 175% (UI spec §3 item 6). The document's own px is deliberately NOT
+// forced even -- it is the user's chosen size and line_height already rounds it
+// for the row grid.
+ui_px_even :: #force_inline proc(v: f32) -> f32 {
+	n := int(v + 0.5)
+	if n % 2 != 0 {n -= 1}
+	return f32(max(n, 2))
+}
+
 // Rounded to a whole pixel for the same reason cell width is (see
 // plat.text_char_width): row r's top is r*line_height, and every pass that
 // positions against rows — draw, caret, selection, find rects, hit-testing, and

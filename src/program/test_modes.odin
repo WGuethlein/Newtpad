@@ -10079,6 +10079,59 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad metricstest` covers the two DPI rounding rules the UI spec calls
+		// hard (§3 items 4 and 6), at the five scales its §3.8 test matrix names.
+		//
+		// It exists because neither rule is checkable by looking at a frame in this
+		// environment, and both fail in a way that reads as "the renderer is a bit
+		// soft" rather than as a bug: a hairline rounded up to 2px straddling two
+		// device pixels renders as two half-alpha lines, and an odd chrome font size
+		// puts every vertically-centred baseline on a half pixel.
+		if os.args[1] == "metricstest" {
+			bad := 0
+			mt_chk :: proc(bad: ^int, ok: bool, label: string) {
+				if !ok {bad^ += 1}
+				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+			}
+
+			fmt.println("metricstest:")
+			// UI_SCALE is a global the whole program reads, so it is saved and put
+			// back -- leaving it at 2.0 would follow every later mode in this
+			// process, exactly the way findtest's GUTTER_W note describes.
+			saved := UI_SCALE
+			defer UI_SCALE = saved
+
+			// 175% is in this list for a reason: it is the scale where floor and
+			// round DISAGREE (1.75 -> 1 vs 2), so it is the case that can tell the
+			// two rules apart. 100 and 200 agree under either and prove nothing on
+			// their own.
+			for s in ([]f32{1.0, 1.25, 1.5, 1.75, 2.0}) {
+				UI_SCALE = s
+				h := hairline()
+				mt_chk(&bad, h == max(1, f32(int(s))), fmt.tprintf("scale %.2f: hairline = %.0f (floor of the scale, min 1)", s, h))
+				mt_chk(&bad, h == f32(int(h)), fmt.tprintf("scale %.2f: hairline %.1f is a whole pixel", s, h))
+				// The rounded alternative, computed here rather than asserted
+				// against, so the report shows WHAT the rule is buying at each
+				// scale instead of only that it held.
+				rounded := max(1, f32(int(s + 0.5)))
+				if rounded != h {
+					fmt.printfln("         (round would give %.0f here -- this is a scale where the rule bites)", rounded)
+				}
+
+				p := ui_px_even(UI_PX_96 * s)
+				mt_chk(&bad, int(p) % 2 == 0, fmt.tprintf("scale %.2f: chrome px %.0f is even", s, p))
+				mt_chk(&bad, p >= 2, fmt.tprintf("scale %.2f: chrome px %.0f never collapses to zero", s, p))
+				lh := line_height(p)
+				mt_chk(&bad, lh == f32(int(lh)), fmt.tprintf("scale %.2f: line height %.1f is whole", s, lh))
+				// The property the evenness is FOR: a glyph centred in a row of
+				// even height lands on a whole pixel, not a half one.
+				mt_chk(&bad, f32(int(p * 0.5)) == p * 0.5, fmt.tprintf("scale %.2f: half of chrome px (%.1f) is whole -- centring cannot land mid-pixel", s, p * 0.5))
+			}
+
+			fmt.printfln("metricstest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad mdviewtest` covers the two markdown views as INPUT surfaces,
 		// which splittest (pure geometry) does not reach:
 		//
