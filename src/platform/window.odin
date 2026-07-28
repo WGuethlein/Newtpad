@@ -69,6 +69,31 @@ window_caption_btn_w :: proc "contextless" (w: ^Window) -> i32 {
 // when converted to int — negative row counts and out-of-range indices.
 window_scale :: proc "contextless" (w: ^Window) -> f32 {return f32(w.dpi) / 96}
 
+// The smallest the window may become, in LOGICAL pixels, scaled by DPI at the
+// point Windows asks.
+//
+// UI spec 5 gives a drop order -- status cells, then tabs to their floor, then
+// the >_ and + buttons, then the menu bar to a hamburger -- and then says the
+// actual fix: "Enforcing a real minimum is the actual fix; a drop order with no
+// floor still eventually overlaps." There was no floor at all, so the window
+// could be dragged until the tab rail ran under the caption buttons, which is
+// the one overlap that matters: WM_NCHITTEST claims that region first, so a tab
+// drawn there sends HT_CLOSE and one click exits the app.
+//
+// 318 is what the spec's own floor leaves room for: a hamburger, one tab at its
+// 132 minimum, and three caption buttons.
+MIN_W_96 :: i32(318)
+MIN_H_96 :: i32(240)
+
+// The clamped minimum at a given DPI. The wnd_proc computes this inline for
+// WM_GETMINMAXINFO; this is the same arithmetic, exposed so a headless mode can
+// assert it without a message pump. Kept beside the constants rather than in the
+// handler so there is one expression, not two that agree today.
+window_min_size :: proc "contextless" (dpi: u32) -> (w, h: i32) {
+	s := f32(dpi) / 96
+	return i32(f32(MIN_W_96) * s + 0.5), i32(f32(MIN_H_96) * s + 0.5)
+}
+
 DPI_MIN :: u32(96)
 DPI_MAX :: u32(960) // 1000% — well past what Windows offers
 
@@ -230,6 +255,12 @@ Window :: struct {
 	width:        i32,
 	height:       i32,
 	should_close: bool,
+	// Whether the last input was the KEYBOARD. UI spec 18: the focus ring
+	// "appears on keyboard focus only… never on mouse click" -- a ring that
+	// follows the mouse is noise on every click, and a ring that never appears
+	// makes the app unusable without one. Latched at the platform seam because
+	// this is the only place that sees both event kinds arrive.
+	kbd_nav:      bool,
 	resized:      bool,
 	maximized:    bool,
 	// custom title bar geometry (set by the program each frame, read by the NC
@@ -620,6 +651,14 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 			p.rgrc[0].bottom -= fy
 		}
 		return 0
+	case win.WM_GETMINMAXINFO:
+		// Scaled at the moment it is asked, not cached: this arrives before the
+		// first WM_DPICHANGED on a non-96 monitor, and it arrives again after
+		// each one, so reading the window's current DPI here is both simpler and
+		// more correct than keeping a mirrored value in step.
+		mmi := (^win.MINMAXINFO)(uintptr(lparam))
+		mmi.ptMinTrackSize.x, mmi.ptMinTrackSize.y = window_min_size(w.dpi)
+		return 0
 	case win.WM_DPICHANGED:
 		// Order matters. The SetWindowPos below sends WM_NCCALCSIZE and WM_SIZE
 		// nested, and WM_SIZE runs the program's repaint callback — so the DPI and
@@ -803,6 +842,7 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		shift := (int(win.GetKeyState(win.VK_SHIFT)) & 0x8000) != 0
 		alt := (int(win.GetKeyState(win.VK_MENU)) & 0x8000) != 0
 		if w.key_count < len(w.key_events) {
+			w.kbd_nav = true
 			w.key_events[w.key_count] = {key, ctrl, shift, alt}
 			w.key_count += 1
 		}
@@ -821,6 +861,7 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		}
 		w.last_click_ms = now;w.last_click_x = x;w.last_click_y = y
 		w.mouse_x = x;w.mouse_y = y
+		w.kbd_nav = false
 		w.mouse_pressed = true
 		w.mouse_count = w.click_count
 		w.mouse_shift = (int(win.GetKeyState(win.VK_SHIFT)) & 0x8000) != 0

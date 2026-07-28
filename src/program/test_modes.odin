@@ -10476,6 +10476,27 @@ when NEWTPAD_TESTS {
 					ts_chk(&bad, tab_elide(&txt, "a.md", 40) == "a.md", "a label that fits is not elided")
 				}
 
+				// The window floor. UI spec 5 ends "enforcing a real minimum is the
+				// actual fix -- a drop order with no floor still eventually
+				// overlaps", and there was no WM_GETMINMAXINFO handler at all.
+				{
+					for dpi in ([]u32{96, 120, 144, 168, 192}) {
+						mw, mh := plat.window_min_size(dpi)
+						sc := f32(dpi) / 96
+						ts_chk(&bad, mw > 0 && mh > 0, fmt.tprintf("dpi %d: minimum is positive (%dx%d)", dpi, mw, mh))
+						ts_chk(&bad, f32(mw) >= 318 * sc - 1, fmt.tprintf("dpi %d: minimum width %d scales with DPI (>= %.0f)", dpi, mw, 318 * sc - 1))
+						// The floor has to actually clear the chrome it exists for:
+						// the hamburger, one tab at its own minimum, and three
+						// caption buttons. If TAB_MIN_W is ever raised past this,
+						// the window can be sized to overlap them again.
+						saved := UI_SCALE
+						UI_SCALE = sc
+						need := sx(MENU_W_96) + sx(TAB_MIN_W_96) + 3 * sx(46)
+						UI_SCALE = saved
+						ts_chk(&bad, f32(mw) >= need - 1, fmt.tprintf("dpi %d: minimum %d fits menu + one tab + caption buttons (%.0f)", dpi, mw, need))
+					}
+				}
+
 				// tabs_index_at, on the case it exists for.
 				//
 				// Every check above runs against the real layout, where every tab
@@ -10693,6 +10714,30 @@ when NEWTPAD_TESTS {
 					_, _, r_far, _ := px(buf, 2, 32) // far outside: nothing
 					qs_chk(&bad, r_out > 0 && r_out < 255, fmt.tprintf("softness 8: the fill bleeds past the edge (r=%d)", r_out))
 					qs_chk(&bad, r_far == 0, fmt.tprintf("softness 8: it still falls off to nothing (r=%d)", r_far))
+				}
+
+				// 5. The focus ring is a RING: the border is drawn and the middle
+				// is not. Four quads with a hole, not a filled rect -- a filled
+				// one would pass any "is the ring coloured" check while covering
+				// the thing it is supposed to be pointing at.
+				{
+					// g_theme is a global the product fills at startup; a headless
+					// mode has to fill it or every role is transparent black and
+					// "is the ring drawn" answers no for the wrong reason.
+					saved_theme, saved_scale := g_theme, UI_SCALE
+					g_theme, UI_SCALE = theme_dark(), 1
+					defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+					plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+					focus_ring_draw(&h.gfx, &h.quads, 20, 20, 24, 24, 6)
+					buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					qs_chk(&bad, ok, "focus ring: readback")
+					if ok {
+						_, _, _, _ = px(buf, 0, 0)
+						b_top, g_top, r_top, _ := px(buf, 32, 17) // on the top edge
+						_, _, r_mid, _ := px(buf, 32, 32) // the middle: must be EMPTY
+						qs_chk(&bad, b_top + g_top + r_top > 0, fmt.tprintf("focus ring: the border is drawn (bgr %d,%d,%d)", b_top, g_top, r_top))
+						qs_chk(&bad, r_mid == 0, fmt.tprintf("focus ring: the middle is left alone (r=%d)", r_mid))
+					}
 				}
 
 				// 4. Alpha blends over what is already there. The pass bound NO blend

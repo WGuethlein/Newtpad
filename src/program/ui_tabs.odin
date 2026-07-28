@@ -50,6 +50,34 @@ tabs_limit :: proc(win: ^plat.Window, width: f32) -> f32 {
 	return max(MENU_W, width - 3 * f32(plat.window_caption_btn_w(win)))
 }
 
+// The keyboard focus ring: 2px in Focus_Ring, 1px outside the element, matching
+// its radius. UI spec 18 asks for "one implementation, everywhere… drawn as one
+// SDF instance with an annular parameter" -- this is four instances rather than
+// one, because the pipeline batch 12 built resolves a filled rounded box and has
+// no annular term, and adding one would change every quad's shader for a shape
+// used by a handful of widgets. Four edge quads is the cheaper honest version;
+// swap it for an annulus if the ring ever needs a radius that reads.
+//
+// Drawn OUTSIDE the element (spec's 1px offset), so it never eats into the
+// element's own content box and cannot shift what is inside it.
+focus_ring_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, x, y, w, h, radius: f32) {
+	t := max(1, sx(2)) // 2px, and never scaled away
+	o := hairline() // the 1px offset
+	col := g_theme[.Focus_Ring]
+	rx, ry := x - o - t, y - o - t
+	rw, rh := w + 2 * (o + t), h + 2 * (o + t)
+	plat.quads_draw(
+		gfx,
+		qp,
+		[]plat.Quad {
+			{pos = {rx, ry}, size = {rw, t}, color = col, radius = {radius, radius, 0, 0}},
+			{pos = {rx, ry + rh - t}, size = {rw, t}, color = col, radius = {0, 0, radius, radius}},
+			{pos = {rx, ry + t}, size = {t, rh - 2 * t}, color = col},
+			{pos = {rx + rw - t, ry + t}, size = {t, rh - 2 * t}, color = col},
+		},
+	)
+}
+
 // --- one layout for the tab rail ---
 //
 // CLAUDE.md: "A widget's geometry is produced by exactly one *_layout()
@@ -327,14 +355,73 @@ tabs_drag_update :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) {
 }
 
 @(private = "file")
-caption_btn :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, x, w: f32, glyph: string, hovered, is_close: bool) {
+Caption_Kind :: enum {
+	Minimise,
+	Maximise,
+	Close,
+}
+
+caption_btn :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, x, w: f32, kind: Caption_Kind, hovered, is_close: bool, restored := false) {
 	if hovered {
 		col := g_theme[.Danger] if is_close else g_theme[.Border_Strong]
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x, 0}, size = {w, TAB_STRIP_H}, color = col}})
 	}
 	fg := g_theme[.Text_Bright] if (hovered && is_close) else g_theme[.Text_Secondary]
-	cw := plat.text_char_width(text, UI_PX)
-	plat.text_draw(gfx, text, glyph, x + (w - cw) / 2, TAB_STRIP_H * 0.5 + sx(5), UI_PX, fg)
+	// Drawn as geometry, not as a glyph.
+	//
+	// These were text -- "–", "❐", "▢" -- which made them depend on the chrome
+	// font carrying them. Batch 12 moved chrome onto Cascadia Mono, so they had
+	// become one font substitution away from wrong, and a glyph cannot follow the
+	// caption sizing UI spec 2.1 gives. Strokes scale with DPI for the reason
+	// spec 3 item 5 states: a 1px stroke inside a 15px box at 150% looks broken.
+	box := sx(10)
+	st := max(1, sx(1) * max(1, f32(int(UI_SCALE)))) // 1px at 100%, 2px at 150%+
+	cx0 := x + (w - box) * 0.5
+	cy0 := TAB_STRIP_H * 0.5 - box * 0.5
+	switch kind {
+	case .Minimise:
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx0, cy0 + box * 0.5 - st * 0.5}, size = {box, st}, color = fg}})
+	case .Maximise:
+		// Four edges, so the middle stays the window behind it rather than a
+		// filled block. Restore draws the same square offset, with a second
+		// square behind it -- the standard pair, and the only place the two
+		// states differ.
+		e := []plat.Quad {
+			{pos = {cx0, cy0}, size = {box, st}, color = fg},
+			{pos = {cx0, cy0 + box - st}, size = {box, st}, color = fg},
+			{pos = {cx0, cy0}, size = {st, box}, color = fg},
+			{pos = {cx0 + box - st, cy0}, size = {st, box}, color = fg},
+		}
+		plat.quads_draw(gfx, qp, e)
+		if restored {
+			o := box * 0.28
+			plat.quads_draw(
+				gfx,
+				qp,
+				[]plat.Quad {
+					{pos = {cx0 + o, cy0 - o}, size = {box - o, st}, color = fg},
+					{pos = {cx0 + box, cy0 - o}, size = {st, box - o}, color = fg},
+				},
+			)
+		}
+	case .Close:
+		// Two diagonals cannot be axis-aligned quads, so the X is drawn as a
+		// short stack of stepped segments -- at 10px the step is under a pixel
+		// and reads as a line. Cheaper than adding a rotated-quad path to the
+		// pipeline for one glyph.
+		steps := int(box)
+		for i in 0 ..< steps {
+			f := f32(i)
+			plat.quads_draw(
+				gfx,
+				qp,
+				[]plat.Quad {
+					{pos = {cx0 + f, cy0 + f}, size = {st, st}, color = fg},
+					{pos = {cx0 + box - st - f, cy0 + f}, size = {st, st}, color = fg},
+				},
+			)
+		}
+	}
 }
 
 tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Text, app: ^App, win: ^plat.Window, width: f32) {
@@ -352,7 +439,11 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 	if in_bar && f32(cx) < MENU_W {
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, 0}, size = {MENU_W, TAB_STRIP_H}, color = g_theme[.Border_Strong]}})
 	}
-	plat.text_draw(gfx, text, "☰", MENU_W / 2 - sx(8), base_y, UI_PX, g_theme[.Text_Secondary])
+	// ">_", not a magnifier. UI spec 7.1: the magnifier-in-a-rounded-fill shape
+	// reads as "search your files", which is the wrong promise -- this opens the
+	// COMMAND palette. Showing the same prompt the palette itself shows makes the
+	// button and the thing it opens look like each other.
+	plat.text_draw(gfx, text, ">_", MENU_W / 2 - sx(9), base_y, UI_PX, g_theme[.Text_Secondary])
 
 	// tabs
 	// Nothing past `limit` may be drawn: the caption buttons are non-client and
@@ -365,7 +456,14 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 		x, slot := r.x, r.slot
 		max_cells := int((r.w - TAB_CLOSE_W - sx(8)) / char_w)
 		active := slot == app.active
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {r.w, TAB_STRIP_H - sx(4)}, color = g_theme[.Border_Subtle] if active else g_theme[.Bg_Panel]}})
+		// A pill: rounded on top, square along the bottom where it meets the
+		// content. One quad with two corner radii -- the shape batch 12's SDF
+		// pipeline was built for, and its first consumer.
+		fill := g_theme[.Bg_Raised] if active else (g_theme[.Bg_Hover] if (in_bar && f32(cx) >= r.x && f32(cx) < r.x + r.w) else g_theme[.Bg_Panel])
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {r.w, TAB_STRIP_H - sx(4)}, color = fill, radius = {RADIUS_TAB, RADIUS_TAB, 0, 0}}})
+		if active && win.kbd_nav {
+			focus_ring_draw(gfx, quad_pipe, x, sx(4), r.w, TAB_STRIP_H - sx(4), RADIUS_TAB)
+		}
 
 		title := tab_label(app, d, context.temp_allocator)
 		// Elide the MIDDLE, not the end. `2026-07-27-batch-11-sync.md` truncated
@@ -419,8 +517,8 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 	bw := f32(plat.window_caption_btn_w(win))
 	cxf, cyf := f32(cx), f32(cy)
 	hov := in_bar && cxf >= width - 3 * bw
-	caption_btn(gfx, quad_pipe, text, width - 3 * bw, bw, "–", hov && cxf < width - 2 * bw, false)
-	caption_btn(gfx, quad_pipe, text, width - 2 * bw, bw, "❐" if win.maximized else "▢", hov && cxf >= width - 2 * bw && cxf < width - bw, false)
-	caption_btn(gfx, quad_pipe, text, width - bw, bw, "✕", hov && cxf >= width - bw, true)
+	caption_btn(gfx, quad_pipe, text, width - 3 * bw, bw, .Minimise, hov && cxf < width - 2 * bw, false)
+	caption_btn(gfx, quad_pipe, text, width - 2 * bw, bw, .Maximise, hov && cxf >= width - 2 * bw && cxf < width - bw, false, win.maximized)
+	caption_btn(gfx, quad_pipe, text, width - bw, bw, .Close, hov && cxf >= width - bw, true)
 	_ = cyf
 }
