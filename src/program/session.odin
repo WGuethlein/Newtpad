@@ -73,7 +73,7 @@ pint :: proc(s: string) -> int {
 // Also used by settings.odin, which stores settings.txt alongside session.txt.
 session_dir :: proc() -> (dir: string, ok: bool) {
 	if over := os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator); over != "" {
-		os.make_directory(over)
+		plat.dir_create(over)
 		return over, true
 	}
 	appdata := os.get_env("APPDATA", context.temp_allocator)
@@ -81,7 +81,7 @@ session_dir :: proc() -> (dir: string, ok: bool) {
 		return "", false
 	}
 	dir = pjoin({appdata, "Newtpad"})
-	os.make_directory(dir) // ignore "already exists"
+	plat.dir_create(dir) // ignore "already exists"
 	return dir, true
 }
 
@@ -98,9 +98,9 @@ session_sweep_tmp :: proc() {
 		return
 	}
 	backups := pjoin({dir, "backups"})
-	os.remove(fmt.tprintf("%s%csession.txt.newtpad~", dir, filepath.SEPARATOR))
+	plat.file_delete(fmt.tprintf("%s%csession.txt.newtpad~", dir, filepath.SEPARATOR))
 	for i in 0 ..< MAX_SESSION_TABS {
-		os.remove(fmt.tprintf("%s.newtpad~", backup_path(backups, i)))
+		plat.file_delete(fmt.tprintf("%s.newtpad~", backup_path(backups, i)))
 	}
 }
 
@@ -115,7 +115,7 @@ session_exists :: proc() -> bool {
 	if !ok {
 		return false
 	}
-	return os.exists(pjoin({dir, "session.txt"}))
+	ex, _ := plat.path_exists(pjoin({dir, "session.txt"}));return ex
 }
 
 // `sweep_backups` deletes backup files the new session doesn't reference. Only
@@ -127,7 +127,7 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 		return false
 	}
 	backups := pjoin({dir, "backups"})
-	os.make_directory(backups)
+	plat.dir_create(backups)
 
 	tb := strings.builder_make(context.temp_allocator)
 	active_idx := 0
@@ -217,7 +217,7 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 	// session.txt now points only at backups we just wrote; delete the rest.
 	if sweep_backups {
 		for i in 0 ..< MAX_SESSION_TABS {
-			if !used[i] {os.remove(backup_path(backups, i))}
+			if !used[i] {plat.file_delete(backup_path(backups, i))}
 		}
 	}
 	return true
@@ -297,8 +297,8 @@ session_restore :: proc(a: ^App) -> bool {
 	}
 	backups := pjoin({dir, "backups"})
 	sp := pjoin({dir, "session.txt"})
-	data, rerr := os.read_entire_file(sp, context.temp_allocator)
-	if rerr != nil {
+	data, rerr := plat.file_read_all(sp, context.temp_allocator)
+	if !rerr {
 		return false
 	}
 	lines := strings.split_lines(string(data), context.temp_allocator)
@@ -396,7 +396,7 @@ session_restore :: proc(a: ^App) -> bool {
 		// key off this and not off bidx.
 		from_backup := false
 		if bidx >= 0 { // dirty/untitled: restore content from the backup
-			if content, cerr := os.read_entire_file(backup_path(backups, bidx), context.allocator); cerr == nil {
+			if content, cerr := plat.file_read_all(backup_path(backups, bidx), context.allocator); cerr {
 				d^ = doc_from_content(content, path, enc)
 				created = true
 				from_backup = true

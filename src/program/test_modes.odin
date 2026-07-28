@@ -10513,14 +10513,18 @@ when NEWTPAD_TESTS {
 				mt_chk(&bad, got == STATUS_BAR_H, fmt.tprintf("find closed: bottom bar %.0f == status bar %.0f", got, STATUS_BAR_H))
 			}
 
-			// NOT asserted, deliberately, and recorded so the next batch does not
-			// think it was forgotten: UI spec 3.8 lists "the active tab's left edge
-			// against the editor's left padding" as one of four checks that catch
-			// nearly everything. Tabs currently start at MENU_W (ui_tabs.odin) --
-			// the hamburger button occupies that space by design -- so the two are
-			// not meant to line up yet. Asserting it today would fail for a reason
-			// that is not a defect. It belongs with the rail rebuild in batch 13,
-			// where the spec's 4.2 pills replace the fixed-width tabs.
+			// NOT asserted, and now permanently rather than pending.
+			//
+			// UI spec 3.8 lists "the active tab's left edge against the editor's
+			// left padding" as one of four checks that catch nearly everything.
+			// It does not apply to this layout: the rail opens with the >_ button
+			// at MENU_W, which is a deliberate choice from spec 7.1, so the tab
+			// edge and the text margin are not two views of one measurement and
+			// were never meant to coincide. This was recorded as "belongs with
+			// batch 13"; batch 13 has been and gone, the rail was rebuilt, and the
+			// >_ stayed. Asserting it would pin an alignment nothing wants.
+			//
+			// The other three of the four ARE checked, in metricstest.
 
 			// Panel origins land on whole pixels.
 			//
@@ -11245,7 +11249,15 @@ when NEWTPAD_TESTS {
 					})
 					if buf == nil {return bad + 1}
 					b, _, r, _ := px(buf, 32, 32)
-					qs_chk(&bad, r > 100 && r < 155 && b > 100 && b < 155, fmt.tprintf("a 50%% quad blends with what is under it (r=%d b=%d)", r, b))
+					// A 50% blend in LINEAR light, not in sRGB. Half of linear 1.0 is
+					// linear 0.5, which encodes to sRGB 0.73 -- about 186, not the
+					// 128 a naive midpoint suggests. This check used to demand
+					// 100..155 and passed at 128, which was the WRONG answer
+					// faithfully asserted: blending gamma-encoded values is
+					// precisely what UI spec 19 says makes light text on a dark
+					// ground go thin. The window is wide because the two quads
+					// blend against each other, not against a known constant.
+					qs_chk(&bad, r > 160 && r < 215 && b > 160 && b < 215, fmt.tprintf("a 50%% quad blends in linear light (r=%d b=%d, sRGB blending would give ~128)", r, b))
 				}
 
 				return bad

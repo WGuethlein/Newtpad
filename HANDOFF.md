@@ -188,9 +188,12 @@ code); plugins post-V1 (narrow C-ABI). Refuted claims recorded in `research/`.
 on 2026-07-19). The list is kept because the reasoning is still the best statement of *why* these
 were the priorities. Read P2 as the live list, with these amendments:
 
-- **Arenas on VirtualAlloc: still zero implementation.** Heap plus `free_all(context.temp_allocator)`
-  per frame. Either build it or amend the locked decision — do not keep citing it as though it
-  describes the code.
+- ~~**Arenas on VirtualAlloc: still zero implementation.**~~ **RESOLVED by amendment, 2026-07-27.**
+  This entry was stale: CLAUDE.md's Memory row no longer specifies arenas. It records that the arena
+  text described something which never existed in any form and had no measured problem behind it, and
+  ends "build arenas only if a measurement asks for them, and amend this row again when you do." The
+  decision and the code agree; nothing is owed. Left visible rather than deleted because *this entry*
+  was cited as outstanding debt repeatedly after the amendment had already landed.
 - ~~**`\?\` long paths: still zero implementation.**~~ **Platform layer DONE (2026-07-26, batch 7
   task 3.)** `src/platform/path.odin` — `long_path_form` / `wide_path`, every file-I/O call in
   `file.odin` converted, `longpathtest` covering the rule table plus a real 292-character round trip.
@@ -200,10 +203,17 @@ were the priorities. Read P2 as the live list, with these amendments:
   `_fix_long_path`, which returns the path unchanged whenever HKLM `LongPathsEnabled` is set — the
   registry opt-in CLAUDE.md forbids depending on, and one that does nothing without the
   `longPathAware` manifest entry we deliberately do not ship. Not urgent: every one of those paths
-  is under `%APPDATA%\Newtpad` and short. **It is reachable, though** — `NEWTPAD_SESSION_DIR`
-  redirects the whole store, so a long override loses the session, the settings, the log and the
-  crash artefacts, each silently (see the comment on `write_minidump`, `crash.odin`). Converting
-  them means routing through `plat.dir_create` / a `plat` read-write pair rather than `core:os`.
+  is under `%APPDATA%\Newtpad` and short. **It was reachable, though** — `NEWTPAD_SESSION_DIR`
+  redirects the whole store, so a long override lost the session, the settings, the log and the crash
+  artefacts, each silently.
+
+  **DONE 2026-07-29 (§6an).** `plat.file_read_all` was added, because `core:os`'s `read_entire_file`
+  goes through `_fix_long_path`, which returns the path unchanged without the HKLM opt-in — so every
+  program-layer read had a silent 260-character ceiling. The directory creates, deletes, existence
+  checks, reads and the theme write in `session.odin`, `settings.odin`, `theme.odin` and `diag.odin`
+  now route through `plat`. What remains on `core:os` is `diag.odin`'s append-mode log handle
+  (`os.open` / `os.stat` / `os.rename`), which needs a `plat` append primitive that does not exist —
+  one file, and the least damaging of the set to lose.
 - ~~**Test modes ship in the release binary.**~~ **DONE (2026-07-26, §6z.)** `NEWTPAD_TESTS`
   (`#config`, defaults to `ODIN_DEBUG`) gates the whole file; release went 1,494,528 → 1,055,744
   bytes. `build.bat release tests` puts it back for `-o:speed` measurements.

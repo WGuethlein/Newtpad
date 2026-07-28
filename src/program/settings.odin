@@ -165,8 +165,8 @@ settings_load :: proc() -> Settings {
 	if !ok {
 		return s
 	}
-	data, err := os.read_entire_file(path, context.temp_allocator)
-	if err != nil {
+	data, err := plat.file_read_all(path, context.temp_allocator)
+	if !err {
 		return s
 	}
 	for line in strings.split_lines(string(data), context.temp_allocator) {

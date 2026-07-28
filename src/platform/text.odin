@@ -247,9 +247,22 @@ VSOut vs_main(VSIn i) {
 // This replaced ClearType's 3-channel subpixel coverage, whose colour fringes
 // read as soft/blurry when a glyph is magnified (viewport zoom). Grayscale has
 // no fringe and stays crisp at any size — what most editors use for scaled text.
+// sRGB -> linear. The render target is sRGB-TYPED, so whatever this shader
+// returns is treated as linear light and encoded on write. Colours arrive
+// authored in sRGB (a theme file says #CDC3B4), so they have to be decoded here
+// or every opaque fill would land a stop too bright.
+//
+// The round trip is the identity for an opaque pixel -- decode, then the
+// hardware encodes -- so solid quads and solid glyph interiors are byte for byte
+// what they were. What changes is BLENDING, which now happens in linear light,
+// which is the entire point.
+float3 srgb_to_linear(float3 c) {
+	return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
 float4 ps_main(VSOut i) : SV_Target {
 	float cov = atlas.Sample(samp, i.uv).r;
-	return float4(i.color.rgb, cov * i.color.a);
+	return float4(srgb_to_linear(i.color.rgb), cov * i.color.a);
 }
 `
 

@@ -23,6 +23,7 @@ package main
 
 import "core:fmt"
 import "core:os"
+import plat "src:platform"
 import "core:strconv"
 import "core:strings"
 
@@ -509,7 +510,7 @@ themes_dir_ensure :: proc() -> (string, bool) {
 	if !ok {
 		return "", false
 	}
-	os.make_directory(dir) // ignore "already exists"
+	plat.dir_create(dir) // ignore "already exists"
 	return dir, true
 }
 
@@ -639,8 +640,8 @@ theme_role_from_key :: proc(key: string) -> (role: Color_Role, ok: bool) {
 // input degrades, never fails" contract theme_parse_hex/theme_role_from_key
 // already use.
 theme_load_file :: proc(path: string, base: Theme) -> Theme {
-	data, err := os.read_entire_file(path, context.temp_allocator)
-	if err != nil {
+	data, err := plat.file_read_all(path, context.temp_allocator)
+	if !err {
 		return base
 	}
 	lines := strings.split_lines(string(data), context.temp_allocator)
@@ -798,7 +799,7 @@ theme_export :: proc(from_name: string, t: Theme) -> (target: string, path: stri
 		return target, "", false
 	}
 	path = fmt.tprintf("%s%c%s.theme", dir, '\\', target)
-	if os.exists(path) {
+	if ex, _ := plat.path_exists(path); ex {
 		return target, path, true // never clobber the user's edits
 	}
 
@@ -834,7 +835,7 @@ theme_export :: proc(from_name: string, t: Theme) -> (target: string, path: stri
 		)
 	}
 
-	if os.write_entire_file(path, transmute([]u8)strings.to_string(b)) != nil {
+	if !plat.file_write_atomic(path, transmute([]u8)strings.to_string(b)) {
 		return target, path, false
 	}
 	return target, path, true

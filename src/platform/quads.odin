@@ -102,6 +102,19 @@ VSOut vs_main(VSIn i) {
 	return o;
 }
 
+// sRGB -> linear. The render target is sRGB-TYPED, so whatever this shader
+// returns is treated as linear light and encoded on write. Colours arrive
+// authored in sRGB (a theme file says #CDC3B4), so they have to be decoded here
+// or every opaque fill would land a stop too bright.
+//
+// The round trip is the identity for an opaque pixel -- decode, then the
+// hardware encodes -- so solid quads and solid glyph interiors are byte for byte
+// what they were. What changes is BLENDING, which now happens in linear light,
+// which is the entire point.
+float3 srgb_to_linear(float3 c) {
+	return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4);
+}
+
 // Signed distance to a rounded box: negative inside, zero on the edge.
 // The per-corner radius is selected by which quadrant the point falls in, so a
 // single instance can carry four different corners -- a tab pill rounded on top
@@ -126,7 +139,7 @@ float4 ps_main(VSOut i) : SV_TARGET {
 	// change land under the whole UI at once. Uniform across an instance, so the
 	// branch costs a wavefront nothing.
 	if (i.soft <= 0.0 && dot(i.radius, float4(1, 1, 1, 1)) <= 0.0) {
-		return i.color;
+		return float4(srgb_to_linear(i.color.rgb), i.color.a);
 	}
 	float d = sd_round_box(i.local, i.half_s, i.radius);
 	float a;
@@ -143,7 +156,7 @@ float4 ps_main(VSOut i) : SV_TARGET {
 		float aa = max(fwidth(d), 1e-5);
 		a = 1.0 - smoothstep(-aa, aa, d);
 	}
-	return float4(i.color.rgb, i.color.a * a);
+	return float4(srgb_to_linear(i.color.rgb), i.color.a * a);
 }
 `
 
