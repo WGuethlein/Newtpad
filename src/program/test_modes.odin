@@ -10358,6 +10358,33 @@ when NEWTPAD_TESTS {
 			// that is not a defect. It belongs with the rail rebuild in batch 13,
 			// where the spec's 4.2 pills replace the fixed-width tabs.
 
+			// Panel origins land on whole pixels.
+			//
+			// Text is drawn FROM these, and a glyph at a half-pixel x samples
+			// between texels in the alpha atlas -- the run comes out smeared. The
+			// palette centres itself, so at its maximum width an odd window width
+			// put its origin on a half pixel and an even one did not. Both
+			// parities are checked at every scale for exactly that reason: testing
+			// one of them proves nothing, and the shipped bug was invisible at
+			// half the window sizes anyone would try.
+			{
+				a: App
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				saved := UI_SCALE
+				for sc in ([]f32{1.0, 1.25, 1.5, 2.0}) {
+					UI_SCALE = sc
+					worst_w := f32(-1)
+					for w in 1200 ..< 1260 { // both parities, either side of the max-width cutover
+						l := palette_layout(&a, f32(w), 900)
+						if l.x0 != f32(int(l.x0)) {worst_w = f32(w)}
+					}
+					mt_chk(&bad, worst_w < 0, fmt.tprintf("scale %.2f: the palette origin is a whole pixel at every window width (first fractional: %.0f)", sc, worst_w))
+				}
+				UI_SCALE = saved
+			}
+
 			fmt.printfln("metricstest: %d failures", bad)
 			return true
 		}
@@ -10495,6 +10522,30 @@ when NEWTPAD_TESTS {
 						UI_SCALE = saved
 						ts_chk(&bad, f32(mw) >= need - 1, fmt.tprintf("dpi %d: minimum %d fits menu + one tab + caption buttons (%.0f)", dpi, mw, need))
 					}
+				}
+
+				// The pill fits its rail, and the focus ring fits with it.
+				//
+				// v0.22.0 shipped a tab 36 tall starting 4px down a 40px rail, so
+				// the ring drawn outside it landed at y=43 and painted a bar over
+				// the menu bar below. Nothing checked that a tab, or anything
+				// decorating one, stays inside the strip it belongs to.
+				{
+					saved := UI_SCALE
+					for sc in ([]f32{1.0, 1.25, 1.5, 2.0}) {
+						UI_SCALE = sc
+						strip := sx(TAB_STRIP_H_96)
+						h := sx(TAB_H_96)
+						ty := (strip - h) * 0.5
+						ts_chk(&bad, h < strip, fmt.tprintf("scale %.2f: pill %.0f is shorter than the %.0f rail", sc, h, strip))
+						ts_chk(&bad, ty > 0 && ty + h <= strip, fmt.tprintf("scale %.2f: pill sits inside the rail (%.0f..%.0f in 0..%.0f)", sc, ty, ty + h, strip))
+						// The ring's own extent, computed the way focus_ring_draw
+						// computes it, must also fit -- that is the part that got out.
+						t := max(1, sx(2))
+						o := hairline()
+						ts_chk(&bad, ty - o - t >= 0 && ty + h + o + t <= strip, fmt.tprintf("scale %.2f: the focus ring fits the rail too (%.0f..%.0f)", sc, ty - o - t, ty + h + o + t))
+					}
+					UI_SCALE = saved
 				}
 
 				// tabs_index_at, on the case it exists for.
@@ -10714,6 +10765,32 @@ when NEWTPAD_TESTS {
 					_, _, r_far, _ := px(buf, 2, 32) // far outside: nothing
 					qs_chk(&bad, r_out > 0 && r_out < 255, fmt.tprintf("softness 8: the fill bleeds past the edge (r=%d)", r_out))
 					qs_chk(&bad, r_far == 0, fmt.tprintf("softness 8: it still falls off to nothing (r=%d)", r_far))
+				}
+
+				// 4b. ASYMMETRIC radius. Every earlier case used {10,10,10,10}, so
+				// the per-corner selection in sd_round_box was never actually
+				// exercised -- a mapping that returned the same corner for all four
+				// would have passed every one of them. The tab used {6,6,0,0} for a
+				// whole release on the strength of that.
+				{
+					plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+					plat.quads_draw(&h.gfx, &h.quads, []plat.Quad{{pos = {16, 16}, size = {32, 32}, color = {1, 0, 0, 1}, radius = {10, 0, 10, 0}}})
+					buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					qs_chk(&bad, ok, "asymmetric radius: readback")
+					if ok {
+						_, _, tl, _ := px(buf, 16, 16) // TL, rounded  -> cut away
+						_, _, tr, _ := px(buf, 47, 16) // TR, square   -> present
+						_, _, br, _ := px(buf, 47, 47) // BR, rounded  -> cut away
+						_, _, bl, _ := px(buf, 16, 47) // BL, square   -> present
+						qs_chk(&bad, tl == 0, fmt.tprintf("per-corner radius TL=10: rounded away (r=%d)", tl))
+						// A square corner inside a partly-rounded quad is ANTIALIASED, not exactly
+						// 255: any nonzero radius puts the whole instance on the SDF path, so
+						// every edge gets half a pixel of coverage. Strongly covered vs absent
+						// is what distinguishes square from rounded here.
+						qs_chk(&bad, tr > 200, fmt.tprintf("per-corner radius TR=0: stays square (r=%d, >200)", tr))
+						qs_chk(&bad, br == 0, fmt.tprintf("per-corner radius BR=10: rounded away (r=%d)", br))
+						qs_chk(&bad, bl > 200, fmt.tprintf("per-corner radius BL=0: stays square (r=%d, >200)", bl))
+					}
 				}
 
 				// 5. The focus ring is a RING: the border is drawn and the middle
