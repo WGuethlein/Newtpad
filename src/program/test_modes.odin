@@ -7122,7 +7122,7 @@ when NEWTPAD_TESTS {
 						gdoc.table_col = clamp(tc, 0, gm.max)
 						m2 := hscroll_model(&gdoc, &t, rows, 1000, cw)
 						b2 := hscrollbar_geo(&gdoc, 1000, 700, m2)
-						got := hscrollbar_pos_at(b2, b2.thumb_x + b2.thumb_w*0.5, m2)
+						got := hscrollbar_pos_at(b2, b2.thumb_x, m2)
 						if got != gdoc.table_col {
 							fmt.printfln("  FAIL grid: thumb round-trip col=%d -> %d", gdoc.table_col, got)
 							bad += 1;grid_bad += 1
@@ -7228,7 +7228,15 @@ when NEWTPAD_TESTS {
 			doc_update_hscroll(&doc) // leave the global reset
 
 			// The draggable bar's seam: dropping the thumb where it was drawn must
-			// recover the same offset (thumb-centre round-trip through pos_at).
+			// recover the same offset -- geo maps an offset to a thumb origin and
+			// pos_at maps it back, so the two have to be exact inverses.
+			//
+			// This used to round-trip the thumb CENTRE, because pos_at took a
+			// pointer and subtracted half a thumb from it. That made the check pass
+			// through the centring rather than through the geometry, and it is why
+			// the vertical bar's identical mismatch went unnoticed: no test on
+			// either axis ever compared a drawn thumb position with the position a
+			// drag recovers from it.
 			maxhs := doc_max_hscroll(&doc, &t, rows)
 			for hs in ([]int{0, 40, 120, maxhs}) {
 				doc.h_scroll = clamp(hs, 0, maxhs)
@@ -7239,7 +7247,7 @@ when NEWTPAD_TESTS {
 					bad += 1
 					continue
 				}
-				got := hscrollbar_pos_at(hb, hb.thumb_x + hb.thumb_w*0.5, hm)
+				got := hscrollbar_pos_at(hb, hb.thumb_x, hm)
 				if got != doc.h_scroll {
 					fmt.printfln("  FAIL: thumb round-trip hs=%d -> %d", doc.h_scroll, got)
 					bad += 1
@@ -10251,6 +10259,91 @@ when NEWTPAD_TESTS {
 			// where the spec's 4.2 pills replace the fixed-width tabs.
 
 			fmt.printfln("metricstest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad scrollgrabtest` covers the one thing a scrollbar has to do and
+		// this one did not: hold still when you take hold of it.
+		//
+		// Both bars mapped the raw pointer position onto the track on EVERY frame of
+		// a drag, so a press-and-hold re-ran the rail-click jump continuously --
+		// pressing the thumb near an edge snapped it under the cursor and then
+		// refused to be dragged from where it was grabbed. Wyatt, live use,
+		// 2026-07-28: "it shoots to make the cursor center, rather than staying in
+		// place and waiting for the user to move".
+		//
+		// The seam is grab -> drag: what vbar_grab_at latches at the press has to be
+		// exactly what vbar_drag_to gives back when the pointer has not moved.
+		if os.args[1] == "scrollgrabtest" {
+			sg_run :: proc() -> int {
+				bad := 0
+				sg_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				sb := strings.builder_make()
+				for i in 0 ..< 4000 {fmt.sbprintf(&sb, "line %d of a document long enough to need a scrollbar\n", i)}
+				doc := doc_from_content(transmute([]u8)strings.to_string(sb), "scroll.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				t: plat.Text
+				plat.text_load_faces(&t)
+				px := f32(16)
+				winh := f32(900)
+				rows := doc_visible_rows(&doc, winh, line_height(px))
+				doc.view_cols = 100
+
+				fmt.println("scrollgrabtest:")
+
+				// Park mid-document so the thumb is nowhere near either end.
+				doc_scroll(&doc, &t, 900, rows)
+				top0 := doc.top
+				bottom := doc.top + 2000 // a plausible last-visible offset
+				vb := vscrollbar_geo(&doc, 0, winh, bottom)
+				sg_chk(&bad, vb.shown && vb.thumb_h >= 8 && vb.thumb_y > vb.track_y, fmt.tprintf("the thumb is mid-track (y=%.0f h=%.0f in track %.0f..%.0f)", vb.thumb_y, vb.thumb_h, vb.track_y, vb.track_y + vb.track_h))
+
+				// 1. Press ON the thumb, at three points across it, and do not move.
+				// The view must not shift at all -- this is the whole bug.
+				for frac in ([]f32{0.02, 0.5, 0.98}) {
+					doc.top = top0
+					my := vb.thumb_y + vb.thumb_h * frac
+					grab := vbar_grab_at(vb, my)
+					vbar_drag_to(&doc, &t, vb, my, grab, rows)
+					sg_chk(&bad, doc.top == top0, fmt.tprintf("press at %.0f%% of the thumb and hold: top stays %d (got %d)", frac * 100, top0, doc.top))
+				}
+
+				// 2. The grab is preserved as the pointer moves: dragging down by N
+				// pixels from the TOP edge and from the BOTTOM edge must land on the
+				// same place, because both carry their own offset.
+				{
+					doc.top = top0
+					my_a := vb.thumb_y + 1
+					vbar_drag_to(&doc, &t, vb, my_a + 40, vbar_grab_at(vb, my_a), rows)
+					from_top := doc.top
+					doc.top = top0
+					my_b := vb.thumb_y + vb.thumb_h - 1
+					vbar_drag_to(&doc, &t, vb, my_b + 40, vbar_grab_at(vb, my_b), rows)
+					from_bot := doc.top
+					sg_chk(&bad, from_top == from_bot, fmt.tprintf("dragging 40px from either edge of the thumb agrees (%d vs %d)", from_top, from_bot))
+					sg_chk(&bad, from_top > top0, fmt.tprintf("...and it actually scrolled down (%d > %d)", from_top, top0))
+				}
+
+				// 3. A press on the bare RAIL still jumps -- thumb top to the cursor.
+				// Wyatt confirmed that behaviour is wanted, so it is pinned here
+				// rather than left to be "fixed" by someone reading only case 1.
+				{
+					doc.top = top0
+					rail := vb.track_y + vb.track_h * 0.85 // below the thumb
+					sg_chk(&bad, rail > vb.thumb_y + vb.thumb_h, "the sampled rail point is off the thumb")
+					grab := vbar_grab_at(vb, rail)
+					sg_chk(&bad, grab == 0, fmt.tprintf("a rail press latches no grab (%.1f)", grab))
+					vbar_drag_to(&doc, &t, vb, rail, grab, rows)
+					sg_chk(&bad, doc.top > top0, fmt.tprintf("a rail press below the thumb jumps down (%d -> %d)", top0, doc.top))
+				}
+				return bad
+			}
+			bad := sg_run()
+			fmt.printfln("scrollgrabtest: %d failures", bad)
 			return true
 		}
 
