@@ -208,8 +208,15 @@ menus := []Menu {
 			{cmd = .Zoom_Out},
 			{cmd = .Zoom_Reset},
 			sep,
+			// Split from the four below. UI spec 6: five groups, "nothing longer
+			// than four rows" -- this was one run of six mixing two different
+			// kinds of thing. Opening the palette or Settings is something you do
+			// while working; editing the theme, the keymap or the colour rules is
+			// customisation, and the log folder belongs with those because it is
+			// where you go when one of them misbehaves.
 			{cmd = .Palette_Open},
 			{cmd = .Settings_Open},
+			sep,
 			{cmd = .Theme_Edit},
 			{cmd = .Keys_Edit},
 			{cmd = .Rules_Edit},
@@ -390,6 +397,48 @@ consume_click :: proc(win: ^plat.Window) {
 // cannot be grey here and still run from the palette; the second is this row's
 // local availability -- a selection to cut, a file to reload, history to undo --
 // which only the menu has any reason to know.
+// Why a row is greyed out, in the accelerator's column.
+//
+// UI spec 6: "Table View greys out on a .md file with no explanation. Show the
+// reason in text_muted where the accelerator would be." A disabled row with no
+// reason is indistinguishable from a broken one, and the two commands this
+// mostly affects are gated on the FILE TYPE -- which the user can see, once
+// someone says that is what matters.
+//
+// Returns "" when there is nothing useful to say, in which case the accelerator
+// is drawn as usual. Deliberately not a general mechanism: only the gates whose
+// reason is both stable and actionable get wording, because "unavailable" in
+// the accelerator column is worse than an empty one.
+// The wording, as a pure function of the command. Separate from the decision
+// below so dropdown_w can budget for it: the panel is sized from the widest
+// TRAILING text, and a reason is longer than the accelerator it replaces --
+// "Markdown files only" against "Ctrl+M". Without this the reason would be
+// clipped by exactly the width the shortcut used to need.
+command_disabled_hint :: proc(cmd: Command_Id) -> string {
+	#partial switch cmd {
+	case .Toggle_Table:
+		return "CSV and TSV only"
+	case .Toggle_Preview:
+		return "Markdown files only"
+	case .Reopen_UTF8, .Reopen_UTF16LE, .Reopen_CP1252:
+		return "unsaved file"
+	}
+	return ""
+}
+
+item_disabled_reason :: proc(app: ^App, it: Menu_Item) -> string {
+	d := app_active(app)
+	#partial switch it.cmd {
+	case .Toggle_Table:
+		if d != nil && d.kind == .Text && !doc_can_table(d) {return command_disabled_hint(it.cmd)}
+	case .Toggle_Preview:
+		if d != nil && d.kind == .Text && !doc_can_markdown(d) {return command_disabled_hint(it.cmd)}
+	case .Reopen_UTF8, .Reopen_UTF16LE, .Reopen_CP1252:
+		if d != nil && d.path == "" {return command_disabled_hint(it.cmd)}
+	}
+	return ""
+}
+
 item_enabled :: proc(app: ^App, it: Menu_Item) -> bool {
 	if it.cmd == .None {return false} // separator
 	if !command_allowed_on(it.cmd, app_active(app)) {return false}
@@ -538,8 +587,14 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 			plat.text_draw(gfx, t, "✓", x0 + sx(8), ty, UI_PX, g_theme[.Success])
 		}
 		plat.text_draw(gfx, t, command_table[it.cmd].title, x0 + sx(28), ty, UI_PX, g_theme[.Text_Primary] if on else g_theme[.Text_Muted])
-		if chord := command_chord(it.cmd); chord != "" {
-			plat.text_draw(gfx, t, chord, x0 + dw - sx(12) - f32(len(chord)) * cw, ty, UI_PX, g_theme[.Text_Muted] if on else g_theme[.Text_Muted])
+		// The accelerator, or -- when the row is greyed out for a reason worth
+		// giving -- that reason in its place.
+		trailing := command_chord(it.cmd)
+		if !on {
+			if why := item_disabled_reason(app, it); why != "" {trailing = why}
+		}
+		if trailing != "" {
+			plat.text_draw(gfx, t, trailing, x0 + dw - sx(12) - f32(len(trailing)) * cw, ty, UI_PX, g_theme[.Text_Muted])
 		}
 		y += MENU_ITEM_H
 	}
@@ -561,7 +616,7 @@ menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0,
 	if app.menu.open < 0 {return 0, 0, 0}
 	items := menus[app.menu.open].items
 	x0, _ = menu_title_rect(t, app.menu.open)
-	w = dropdown_w(t)
+	w = dropdown_w(t, app.menu.open)
 	y0 := TAB_STRIP_H + MENU_BAR_H
 	for it in items {h += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
 	// Clamped to the window: a client-space quad cannot leave it, and items drawn
@@ -653,16 +708,25 @@ menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> in
 	return -1
 }
 
-@(private = "file")
-dropdown_w :: proc(t: ^plat.Text) -> f32 {
+// Not file-private: menutest asserts that every dropdown is wide enough for its
+// own widest row, which is the seam this sizing exists to hold.
+// Width of ONE menu's dropdown. UI spec 6: "widest label + check gutter + gap +
+// widest accelerator + padding. Measure once on open; never a fixed width."
+//
+// Per menu, not across all of them. It used to take the widest row anywhere, so
+// every dropdown was as wide as the longest item in the whole menu bar -- File
+// inherited its width from View's longest row and looked padded for no reason.
+//
+// The trailing budget is the larger of the accelerator and the disabled reason,
+// because either can occupy that column.
+dropdown_w :: proc(t: ^plat.Text, mi: int) -> f32 {
 	cw := plat.text_char_width(t, UI_PX)
 	widest := 0
-	for m in menus {
-		for it in m.items {
-			if it.cmd == .None {continue}
-			n := len(command_table[it.cmd].title) + len(command_chord(it.cmd)) + 8
-			if n > widest {widest = n}
-		}
+	if mi < 0 || mi >= len(menus) {return 0}
+	for it in menus[mi].items {
+		if it.cmd == .None {continue}
+		trailing := max(len(command_chord(it.cmd)), len(command_disabled_hint(it.cmd)))
+		if n := len(command_table[it.cmd].title) + trailing + 8; n > widest {widest = n}
 	}
 	return f32(widest) * cw
 }

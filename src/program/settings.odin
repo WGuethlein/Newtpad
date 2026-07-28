@@ -515,7 +515,21 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 		r := SETTINGS_ROWS[i]
 		sel := i == app.settings_row
 		if sel {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x - sx(12), y - sx(16)}, size = {width - sx(52), rowh - sx(6)}, color = g_theme[.Accent_Wash]}})
+			// A wash PLUS a 2px accent bar, not a full-width band. UI spec 11:
+			// "the full-width blue band in the screenshot is the loudest thing on
+			// it; a wash plus a bar is unmistakable and quiet". The bar is also
+			// what keeps the selection legible for anyone the wash alone is too
+			// subtle for -- never colour alone (spec 18, 1.4.1).
+			rx, ry := x - sx(12), y - sx(16)
+			rw, rh := width - sx(52), rowh - sx(6)
+			plat.quads_draw(
+				gfx,
+				qp,
+				[]plat.Quad {
+					{pos = {rx, ry}, size = {rw, rh}, color = g_theme[.Accent_Wash], radius = {RADIUS_ROW, RADIUS_ROW, RADIUS_ROW, RADIUS_ROW}},
+					{pos = {rx, ry}, size = {max(2, sx(2)), rh}, color = g_theme[.Accent]},
+				},
+			)
 		}
 		plat.text_draw(gfx, t, r.label, x, y, UI_PX, g_theme[.Text_Primary])
 		plat.text_draw(gfx, t, r.help, x, y + sx(16), UI_SMALL_PX, g_theme[.Text_Muted])
@@ -544,7 +558,21 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			val = app.settings.ui_font_family
 		}
 		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Muted]
-		plat.text_draw(gfx, t, val, width - sx(220), y, UI_PX, vc)
+		// The selected row's value brightens, per UI spec 11 -- the row you are
+		// about to change should say which value you are about to change.
+		if sel && val != "Off" {vc = g_theme[.Md_Heading]}
+		vx := width - sx(220)
+		plat.text_draw(gfx, t, val, vx, y, UI_PX, vc)
+		// Show the affordance ON the row: a cycling value gets guillemets, so a
+		// row you can step through looks different from one you cannot. Dimmed
+		// on the rows that only toggle, which have nowhere to step to.
+		if sel {
+			cw := plat.text_char_width(t, UI_SMALL_PX)
+			cyc := i == 2 || i == 4 || i == 5 || i == 7 || i == 8 || i == 9
+			ac := g_theme[.Text_Muted] if cyc else g_theme[.Text_Dim]
+			plat.text_draw(gfx, t, "<", vx - sx(18), y, UI_SMALL_PX, ac)
+			plat.text_draw(gfx, t, ">", width - sx(40) - cw, y, UI_SMALL_PX, ac)
+		}
 		y += rowh
 	}
 

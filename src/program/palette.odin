@@ -6,6 +6,7 @@
 // Filter-as-you-type, Up/Down to move, Enter to run, Esc to close.
 package main
 
+import "core:fmt"
 import "core:slice"
 import "core:strconv"
 import "core:unicode/utf8"
@@ -269,6 +270,61 @@ palette_click :: proc(app: ^App, mx, my, width, height: f32) -> (chose: bool, co
 	return false, true // inside the box but not on a row: swallow, stay open
 }
 
+// The widest category and accelerator in the whole command table, in cells.
+//
+// Measured across the table rather than per row so the two right-hand columns
+// are FIXED: they must not shift as the result list changes under the caret,
+// and the accelerators have to line up vertically or the mono face they are
+// drawn in is buying nothing. Computed once and cached -- the table is a
+// compile-time constant, so this can never go stale.
+@(private = "file")
+g_cat_cells, g_chord_cells: int
+
+palette_widest_category :: proc() -> int {
+	if g_cat_cells == 0 {
+		for c in Command_Id {
+			if n := len(command_table[c].category); n > g_cat_cells {g_cat_cells = n}
+		}
+	}
+	return g_cat_cells
+}
+
+palette_widest_chord :: proc() -> int {
+	if g_chord_cells == 0 {
+		for c in Command_Id {
+			if n := len(command_chord(c)); n > g_chord_cells {g_chord_cells = n}
+		}
+	}
+	return g_chord_cells
+}
+
+// Draw `label`, accenting the characters the query matched.
+//
+// The match is recomputed here rather than carried on the result, because the
+// ranking already walks the same subsequence and storing per-character flags
+// would make Palette_Result variable-sized for a purely visual concern. Same
+// left-to-right subsequence walk the filter uses, so what lights up is exactly
+// what matched.
+palette_draw_match :: proc(gfx: ^plat.Gfx, text: ^plat.Text, label, query: string, x, y: f32, fg: [4]f32) {
+	if query == "" {
+		plat.text_draw(gfx, text, label, x, y, UI_PX, fg)
+		return
+	}
+	cw := plat.text_char_width(text, UI_PX)
+	qi := 0
+	for i in 0 ..< len(label) {
+		hit := false
+		if qi < len(query) && ascii_lower(label[i]) == ascii_lower(query[qi]) {
+			hit = true
+			qi += 1
+		}
+		plat.text_draw(gfx, text, label[i:i + 1], x + f32(i) * cw, y, UI_PX, g_theme[.Accent] if hit else fg)
+	}
+}
+
+@(private = "file")
+ascii_lower :: proc(c: u8) -> u8 {return c + 32 if c >= 'A' && c <= 'Z' else c}
+
 palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Text, app: ^App, width, height: f32) {
 	p := &app.palette
 	l := palette_layout(app, width, height)
@@ -288,6 +344,16 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 		qcol = g_theme[.Text_Muted]
 	}
 	plat.text_draw(gfx, text, qs, x0 + sx(12), y0 + sx(22), UI_PX, qcol)
+	// The result count, in the input row. UI spec 7: "it is feedback on what was
+	// just typed and belongs next to the caret", not 700 pixels away in the
+	// status bar. Only while something has been typed -- a count of everything
+	// is not information.
+	if len(p.query) > 0 && (p.mode == .Commands || p.mode == .Tabs) {
+		n := fmt.tprintf("%d", len(p.results))
+		cw := plat.text_char_width(text, UI_SMALL_PX)
+		col := g_theme[.Text_Muted] if len(p.results) > 0 else g_theme[.Danger]
+		plat.text_draw(gfx, text, n, x0 + PW - sx(16) - f32(len(n)) * cw, y0 + sx(22), UI_SMALL_PX, col)
+	}
 
 	if p.mode == .Goto {
 		plat.text_draw(gfx, text, "type a line number, then Enter", x0 + sx(16), y0 + qh + sx(17), UI_PX, g_theme[.Text_Dim])
@@ -308,14 +374,34 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 		r := p.results[i]
 		fg := g_theme[.Text_Primary] if i == p.selected else g_theme[.Text_Secondary]
 		if p.mode == .Commands {
-			plat.text_draw(gfx, text, command_table[r.cmd].title, x0 + sx(16), ry + sx(17), UI_PX, fg)
+			// The label, with the matched characters in the accent. UI spec 7:
+			// "Matched characters carry the accent -- that is the whole ranking
+			// display. No second colour, no bold, no score bar."
+			title := command_table[r.cmd].title
+			palette_draw_match(gfx, text, title, string(p.query[:]), x0 + sx(16), ry + sx(17), fg)
+
+			// Category and accelerator, both RIGHT-aligned into fixed columns.
+			//
+			// The category used to be drawn left-aligned at a fixed 130px from the
+			// right edge while the accelerator was right-aligned, so the gap
+			// between them was whatever the category's length left over -- a long
+			// one ran up against the shortcut and a short one floated. UI spec 7
+			// names it: "the two columns are different sizes and neither aligns
+			// with the label". Wyatt's screenshot has "CursorCtrl+Home".
+			//
+			// Both columns are sized from the WIDEST value in the table, not from
+			// this row's, so neither column moves as you type and the accelerators
+			// line up down the list -- which is the reason they are drawn in the
+			// mono face at all.
+			cw := plat.text_char_width(text, UI_SMALL_PX)
+			chord_col := f32(palette_widest_chord()) * cw
+			cat_col := f32(palette_widest_category()) * cw
+			chord_x := x0 + PW - sx(16) - chord_col
+			cat_x := chord_x - sx(16) - cat_col
 			cat := command_table[r.cmd].category
-			plat.text_draw(gfx, text, cat, x0 + PW - sx(130), ry + sx(17), UI_SMALL_PX, g_theme[.Text_Muted])
-			// The shortcut, right-aligned. The palette is the one place a user can
-			// learn the keymap, and it was showing title + category only.
+			plat.text_draw(gfx, text, cat, cat_x + (cat_col - f32(len(cat)) * cw), ry + sx(17), UI_SMALL_PX, g_theme[.Text_Muted])
 			if chord := command_chord(r.cmd); chord != "" {
-				cw := plat.text_char_width(text, UI_SMALL_PX)
-				plat.text_draw(gfx, text, chord, x0 + PW - sx(16) - f32(len(chord)) * cw, ry + sx(17), UI_SMALL_PX, g_theme[.Text_Muted])
+				plat.text_draw(gfx, text, chord, chord_x + (chord_col - f32(len(chord)) * cw), ry + sx(17), UI_SMALL_PX, g_theme[.Text_Muted])
 			}
 		} else if r.slot >= 0 && r.slot < len(app.docs) && app.docs[r.slot] != nil {
 			plat.text_draw(gfx, text, doc_display_name(app.docs[r.slot]), x0 + sx(16), ry + sx(17), UI_PX, fg)

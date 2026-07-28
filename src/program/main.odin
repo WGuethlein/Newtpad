@@ -1489,10 +1489,43 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		if notice_live {
 			notice = fmt.tprintf("    %s", rc.app.notice)
 		}
-		status := fmt.tprintf("%s    %s    %s    %d lines%s%s%s%s%s%s%s%s", lncol, enc_name(doc.enc), base.line_ending_name(doc.eol), doc_line_count(doc), " *" if doc.modified else "", mode, recovered, disk, indexing, atlas, nobackup, notice)
-		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc) || notice_live
-		col := g_theme[.Warning] if warn else g_theme[.Text_Dim]
-		plat.text_draw(gfx, text, status, sx(12), h - sx(8), UI_SMALL_PX, col)
+		// Two groups, not one sentence. UI spec 13: facts about POSITION on the
+		// left, facts about the FILE on the right, "a fixed home for each, so the
+		// eye learns where to look". Everything transient -- warnings, the disk
+		// state, the indexing progress, the notice -- rides with the left group,
+		// because that is the half that is already changing as you work.
+		//
+		// A selection replaces the line count while it exists, in the accent, per
+		// the same section: when you have selected something, how much you have
+		// selected is the number you want in that slot.
+		count := fmt.tprintf("%d lines", doc_line_count(doc))
+		selected := false
+		if lo, hi := doc_sel_range(doc); hi > lo {
+			count = fmt.tprintf("%d selected", hi - lo)
+			selected = true
+		}
+		left := fmt.tprintf("%s    %s%s%s%s%s%s%s", lncol, count, " *" if doc.modified else "", recovered, disk, indexing, atlas, nobackup)
+		right := fmt.tprintf("%s    %s%s", enc_name(doc.enc), base.line_ending_name(doc.eol), mode)
+
+		warn := doc.recovered || doc.disk_changed || doc.disk_gone || plat.text_atlas_full(text) || doc_backup_skipped(doc)
+		// Text_Muted, not Text_Dim. Text_Dim is the disabled-only tier at 2.9:1 --
+		// below the AA floor by design and labelled "never live text" in
+		// theme.odin -- and the status bar is live text on every frame. Same
+		// defect the tab labels carried.
+		col := g_theme[.Warning] if warn else g_theme[.Text_Muted]
+		base_y := h - sx(8)
+		cw := plat.text_char_width(text, UI_SMALL_PX)
+		plat.text_draw(gfx, text, left, sx(12), base_y, UI_SMALL_PX, g_theme[.Accent] if selected else col)
+		plat.text_draw(gfx, text, right, w - sx(12) - f32(len(right)) * cw, base_y, UI_SMALL_PX, col)
+		// The transient notice sits between them, in Success when it is a
+		// confirmation and Warning otherwise -- "[SAVED]" is the one message that
+		// reports something going right.
+		if notice_live {
+			nt := rc.app.notice
+			ncol := g_theme[.Success] if (len(nt) >= 6 && nt[:6] == "[SAVED") else g_theme[.Warning]
+			plat.text_draw(gfx, text, nt, snap((w - f32(len(nt)) * cw) * 0.5), base_y, UI_SMALL_PX, ncol)
+		}
+		_ = notice
 	}
 
 	plat.gfx_end_frame(gfx, 1 if vsync else 0)
