@@ -10777,8 +10777,53 @@ when NEWTPAD_TESTS {
 			fmt.println("--- Markdown Split: one row grid, drawn == scrolled ---")
 			mv_seam(&bad, false)
 			mv_seam(&bad, true)
+			// Alt+Z in a view that ignores it must REFUSE and say why, not flip a
+			// flag nothing reads. This environment cannot press Alt+Z, so the
+			// symptom Wyatt reported -- "it wasn't toggling in the viewport" --
+			// is invisible to every test here; what IS checkable is that the
+			// command leaves doc.wrap alone and posts a reason.
+			mv_wrap_refusal :: proc(bad: ^int) {
+				a: App
+				dummy: plat.Window
+				t: plat.Text
+				plat.text_load_faces(&t)
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				d := app_active(&a)
+				doc_insert_text(d, transmute([]u8)string("# Title\n\nalpha beta\n"), .Paste)
+				d.kind = .Text
+
+				cases := []struct {
+					label: string,
+					table: bool,
+					md:    Md_Mode,
+					want:  bool, // does the toggle apply here?
+				} {
+					{"plain text", false, .Off, true},
+					{"table view", true, .Off, false},
+					{"markdown preview", false, .Preview, false},
+					{"markdown split", false, .Split, false},
+				}
+				for c in cases {
+					d.table, d.md_mode = c.table, c.md
+					d.wrap = false
+					a.notice_started = {} // an expired notice reads as "none posted"
+					command_dispatch(.Toggle_Wrap, {}, &a, &dummy, &t, 10)
+					noted := app_notice_active(&a)
+					if c.want {
+						mv_chk(bad, d.wrap && !noted, fmt.tprintf("Alt+Z in %s toggles it (wrap=%v, silent=%v)", c.label, d.wrap, !noted))
+					} else {
+						mv_chk(bad, !d.wrap && noted, fmt.tprintf("Alt+Z in %s refuses and says why (wrap unchanged=%v, noted=%v)", c.label, !d.wrap, noted))
+					}
+				}
+				d.table, d.md_mode = false, .Off
+			}
+
 			fmt.println("--- Markdown Preview: read-only ---")
 			mv_preview_ro(&bad)
+			fmt.println("--- Alt+Z where it does not apply ---")
+			mv_wrap_refusal(&bad)
 			fmt.printfln("mdviewtest: %d failures", bad)
 			return true
 		}
