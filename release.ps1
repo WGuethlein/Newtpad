@@ -28,6 +28,56 @@ $version = $verLine.Matches[0].Groups[1].Value
 $tag = "v$version"
 Write-Host "Releasing $tag" -ForegroundColor Cyan
 
+# --- code signing (stub) -----------------------------------------------------
+#
+# Blocked on a purchased certificate, and deliberately inert until then. Read
+# docs/development-loop.md "Signing" before touching this: no certificate, no
+# .pfx path and no password is ever handled here, prompted for, or committed.
+#
+# When it becomes real it stays that way. NEWTPAD_SIGN_THUMBPRINT names a
+# certificate ALREADY INSTALLED in the current user's certificate store;
+# signtool finds the private key through the store, so there is no file to point
+# at and nothing to type. A hardware- or HSM-backed EV certificate prompts for
+# its PIN in the driver's own dialog, outside this script.
+#
+# Called for BOTH artifacts: the exe before the installer wraps it, and the
+# setup.exe afterwards. Signing only the setup would leave an unsigned binary on
+# disk after install - and that is the one users actually run.
+function Invoke-CodeSign {
+    param([Parameter(Mandatory = $true)][string[]]$Paths)
+
+    if (-not $env:NEWTPAD_SIGN_THUMBPRINT) {
+        Write-Host "  signing: skipped, no certificate configured ($($Paths.Count) file(s))" -ForegroundColor DarkGray
+        return
+    }
+    Write-Host '  signing: NEWTPAD_SIGN_THUMBPRINT is set, but signing is still a stub - nothing was signed.' -ForegroundColor Yellow
+    Write-Host '  signing: uncomment the block in release.ps1 once the certificate exists.' -ForegroundColor Yellow
+
+    # --- uncomment from here -------------------------------------------------
+    # signtool ships with the Windows SDK and is not on PATH by default.
+    # $signtool = (Get-Command signtool.exe -ErrorAction SilentlyContinue).Source
+    # if (-not $signtool) {
+    #     $found = Get-ChildItem 'C:\Program Files (x86)\Windows Kits\10\bin' -Filter signtool.exe -Recurse -ErrorAction SilentlyContinue |
+    #         Where-Object { $_.FullName -like '*\x64\*' } | Sort-Object FullName -Descending | Select-Object -First 1
+    #     if ($found) { $signtool = $found.FullName }
+    # }
+    # if (-not $signtool) { Write-Error 'signtool.exe not found - install the Windows SDK signing tools.'; exit 1 }
+    #
+    # /sha1 selects a certificate already in the store, by thumbprint. Never /f
+    # with a .pfx path and never /p with a password: either would put
+    # certificate material into this file or into a shell history. /fd and /td
+    # pin SHA256 because SHA1 signatures are no longer accepted, and /tr
+    # timestamps so signatures keep verifying after the certificate expires.
+    # & $signtool sign /sha1 $env:NEWTPAD_SIGN_THUMBPRINT /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /v @Paths
+    # if ($LASTEXITCODE -ne 0) { Write-Error 'signtool sign failed.'; exit 1 }
+    # & $signtool verify /pa /v @Paths
+    # if ($LASTEXITCODE -ne 0) { Write-Error 'signtool verify failed - the artifacts are not properly signed.'; exit 1 }
+    # Write-Host "  signed $($Paths.Count) file(s)" -ForegroundColor Green
+    #
+    # Also delete the "This build is unsigned" paragraph from $notes below.
+    # --- to here --------------------------------------------------------------
+}
+
 # --- refuse to release a dirty or already-tagged tree ---
 if ((git status --porcelain).Length -gt 0) { Write-Error 'Working tree is dirty. Commit the version bump and fixes first.'; exit 1 }
 if (git tag --list $tag) { Write-Error "$tag already exists. Bump NEWTPAD_VERSION before cutting a new release."; exit 1 }
@@ -44,6 +94,8 @@ if (-not $DryRun -and -not (Test-Path $exe)) { Write-Error "Release exe missing:
 if (-not $DryRun) {
     $mb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
     Write-Host "  built $exe ($mb MB)" -ForegroundColor Green
+    # Before the installer wraps it, so the copy that lands on disk is signed too.
+    Invoke-CodeSign -Paths @($exe)
 }
 
 # --- installer (optional) ---
@@ -54,6 +106,7 @@ $setupExe = "build\newtpad-$version-setup.exe"
 if ($Installer) {
     & (Join-Path $PSScriptRoot 'build-installer.ps1') -SkipBuild -DryRun:$DryRun
     if ($LASTEXITCODE -ne 0) { Write-Error 'Installer build failed.'; exit 1 }
+    if (-not $DryRun -and (Test-Path $setupExe)) { Invoke-CodeSign -Paths @($setupExe) }
 }
 
 if ($DryRun) { Write-Host "[dry run] would tag $tag and push"; exit 0 }
