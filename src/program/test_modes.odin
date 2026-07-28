@@ -3255,6 +3255,38 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad glyphsnaptest` proves every glyph text_draw_spans emits lands on
+		// a whole pixel. Live use (2026-07-28): "all characters/glyphs in the tabs
+		// and menus are split vertically" -- an integer-sized glyph quad sampled at
+		// a fractional position straddles a texel boundary, putting a seam through
+		// every character. The origins below are not arbitrary: 13.37/24.2 and
+		// 7.999/12.001 are the shapes tab_base_y and a shrunk tab's x actually
+		// produce, so a snap that only special-cases whole numbers would pass this
+		// test and still show the bug live.
+		if os.args[1] == "glyphsnaptest" {
+			gs_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-52s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			gs_run :: proc(bad: ^int) {
+				t: plat.Text
+				plat.text_load_faces(&t)
+				for origin in ([][2]f32{{13.37, 24.2}, {0.5, 0.5}, {100.0, 50.0}, {7.999, 12.001}}) {
+					plat.text_probe_reset(&t)
+					plat.text_probe_capture(&t, "Version.odin", origin.x, origin.y, UI_SMALL_PX)
+					all_int := true
+					for p in plat.text_probe_positions(&t) {
+						if p.x != math.trunc(p.x) || p.y != math.trunc(p.y) {all_int = false}
+					}
+					gs_chk(bad, all_int, fmt.tprintf("origin (%.3f, %.3f) -> integral glyph positions", origin.x, origin.y))
+				}
+			}
+			bad := 0
+			gs_run(&bad)
+			fmt.printfln("%d failures", bad)
+			return true
+		}
+
 		// `newtpad celltest` prints the monospace cell width of sample codepoints and
 		// a byte<->cell round-trip (no GPU; uses text_load_faces).
 		// `newtpad blurtest` verifies the grayscale glyph path rasterizes real

@@ -25,6 +25,7 @@
 package platform
 
 import "core:fmt"
+import "core:math"
 import "core:mem"
 import "core:os"
 import "core:strings"
@@ -207,7 +208,21 @@ Text :: struct {
 	sampler:   ^d3d.ISamplerState,
 	instances: ^d3d.IBuffer,
 	constants: ^d3d.IBuffer,
+
+	// Diagnostic capture of the glyph positions text_draw_spans would emit, so a
+	// headless test can assert on placement without a device. Off unless armed;
+	// costs one branch in the emit loop.
+	probe: Text_Probe,
 }
+
+Text_Probe :: struct {
+	armed: bool,
+	n:     int,
+	pos:   [256][2]f32,
+}
+
+text_probe_reset :: proc(t: ^Text) {t.probe.armed = true; t.probe.n = 0}
+text_probe_positions :: proc(t: ^Text) -> [][2]f32 {return t.probe.pos[:t.probe.n]}
 
 @(private)
 TEXT_HLSL := `
@@ -686,22 +701,28 @@ Text_Span :: struct {
 	color: [4]f32,
 }
 
-text_draw_spans :: proc(
+// The measure-and-place walk shared by text_draw_spans (the real GPU draw,
+// which passes `instances` to append to) and text_probe_capture (a headless
+// test hook, which passes instances=nil and only wants the positions, via
+// t.probe). Both call this SAME walk rather than each having their own copy,
+// because a probe that measures something the draw does not is a test that
+// cannot fail for the right reason.
+//
+// `gfx` may be nil: it is only touched inside glyph_get to upload a freshly
+// rasterized glyph into the GPU atlas, which the probe has no device for and
+// does not need -- it only reads back g.left/g.top/g.w/g.h, all computed from
+// DirectWrite metrics before gfx is ever touched.
+@(private = "file")
+text_walk_glyphs :: proc(
 	gfx: ^Gfx,
 	t: ^Text,
 	str: string,
 	x, y, px: f32,
 	base: [4]f32,
 	spans: []Text_Span,
-	set := Font_Set.UI,
+	set: Font_Set,
+	instances: ^[dynamic]Text_Instance,
 ) {
-	g_draw.text_calls += 1 // see draw_trace.odin
-	instances := make([dynamic]Text_Instance, 0, len(str))
-	defer delete(instances)
-	// The atlas must hold still while these UVs are being collected.
-	t.drawing = true
-	defer t.drawing = false
-
 	cell_w := text_char_width(t, px, set) // same rounded advance the program's grid uses
 	pen := x
 	// The cell column, tracked alongside the pen. `pen` is pixels and cannot
@@ -746,17 +767,63 @@ text_draw_spans :: proc(
 		if g.w > 0 && g.h > 0 {
 			// Combining marks (0 cells) sit over the previous cell, not after it.
 			glyph_x := pen - cell_w if cells == 0 else pen
-			append(&instances, Text_Instance {
-				pos    = {glyph_x + f32(g.left), y + f32(g.top)},
-				size   = {f32(g.w), f32(g.h)},
-				color  = color,
-				uv_min = g.uv_min,
-				uv_max = g.uv_max,
-			})
+			// Snap to whole pixels. An integer-sized glyph quad at a fractional
+			// position is resampled across texel boundaries, which puts a vertical
+			// seam through every glyph -- Wyatt, live use: "all characters/glyphs
+			// in the tabs and menus are split vertically".
+			//
+			// Fixed HERE and not in the callers, of which there are dozens:
+			// document text already lands on integers (text_char_width rounds the
+			// advance so column n's left edge is exactly n*cell_w), so this is a
+			// no-op for the grid and cannot regress it. The chrome is what has
+			// fractional origins -- tab_base_y is ty + TAB_H*0.5 + UI_SMALL_PX*0.35,
+			// and a shrunk tab's x comes off a fractional step -- and fixing each
+			// caller would leave the next one added to reintroduce it.
+			pos := [2]f32{math.trunc(glyph_x + f32(g.left) + 0.5), math.trunc(y + f32(g.top) + 0.5)}
+			if t.probe.armed && t.probe.n < len(t.probe.pos) {
+				t.probe.pos[t.probe.n] = pos
+				t.probe.n += 1
+			}
+			if instances != nil {
+				append(instances, Text_Instance {
+					pos    = pos,
+					size   = {f32(g.w), f32(g.h)},
+					color  = color,
+					uv_min = g.uv_min,
+					uv_max = g.uv_max,
+				})
+			}
 		}
 		pen += f32(cells) * cell_w // grid advance, not the glyph's natural advance
 		col += cells
 	}
+}
+
+// Runs text_walk_glyphs with `s` drawn at (x, y) in `set`, recording each
+// glyph's placed position into t.probe (see text_probe_reset) without
+// touching the device. Lets a headless test assert on where text_draw_spans
+// would actually put pixels.
+text_probe_capture :: proc(t: ^Text, s: string, x, y, px: f32, set: Font_Set = .UI) {
+	text_walk_glyphs(nil, t, s, x, y, px, {1, 1, 1, 1}, nil, set, nil)
+}
+
+text_draw_spans :: proc(
+	gfx: ^Gfx,
+	t: ^Text,
+	str: string,
+	x, y, px: f32,
+	base: [4]f32,
+	spans: []Text_Span,
+	set := Font_Set.UI,
+) {
+	g_draw.text_calls += 1 // see draw_trace.odin
+	instances := make([dynamic]Text_Instance, 0, len(str))
+	defer delete(instances)
+	// The atlas must hold still while these UVs are being collected.
+	t.drawing = true
+	defer t.drawing = false
+
+	text_walk_glyphs(gfx, t, str, x, y, px, base, spans, set, &instances)
 	if len(instances) == 0 {
 		return
 	}
@@ -812,6 +879,20 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, set: Font_Set, face: int, index: u16, px:
 	g.h = gh
 	g.left = left
 	g.top = top
+	// gfx is nil when called from text_probe_capture (no device, e.g.
+	// glyphsnaptest): there is no atlas to pack into, since atlas_w/atlas_h are
+	// only ever set by atlas_create, which text_init (not text_load_faces) runs.
+	// Packing anyway would read atlas_w/atlas_h as 0, atlas_pack would report
+	// every glyph too big to fit, and g.w/g.h would get zeroed below as if the
+	// atlas were full -- silently breaking position math for a probe that never
+	// asked for pixels, only placement. g.w/h/left/top above are already the
+	// real DirectWrite metrics, which is everything position math needs, so
+	// return before the atlas is ever touched. Not cached: this Glyph has no
+	// valid uv, and a later real draw of the same key must still pack for real.
+	if gfx == nil {
+		if cov != nil {delete(cov)}
+		return g
+	}
 	if cov != nil && gw > 0 && gh > 0 {
 		rx, ry, packed := atlas_pack(t, gw, gh)
 		if !packed {
