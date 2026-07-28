@@ -10521,6 +10521,77 @@ when NEWTPAD_TESTS {
 				}
 			}
 
+			// The three find-bar owed items, all of which shipped visible and
+			// inert in v0.24.0.
+			{
+				od := doc_from_content(transmute([]u8)strings.clone("Cat cat concat cat_x cat"), "owed.txt", .UTF8)
+				defer doc_close(&od)
+				od.kind = .Text
+				UI_SCALE = 1
+				find_open(&od, false)
+
+				// 1. The chips are hit-testable, and each maps to its own command.
+				// They were drawn to look pressable with nothing behind them.
+				W := f32(1280)
+				buf: [3]Find_Toggle
+				ts := find_toggles(&od, W, buf[:])
+				mt_chk(&bad, len(ts) == 3, fmt.tprintf("three mode chips exist (%d)", len(ts)))
+				seen := 0
+				for t in ts {
+					// The chip's own middle, and the row it is drawn on.
+					got := find_toggle_at(&od, W, t.x + t.w * 0.5, CHROME_TOP + sx(FIND_BAR_H_96) * 0.5)
+					if got == t.cmd {seen += 1}
+				}
+				mt_chk(&bad, seen == 3, fmt.tprintf("every chip hit-tests to its own command (%d/3)", seen))
+				// Off the chips, and off the row, must both miss.
+				mt_chk(&bad, find_toggle_at(&od, W, sx(20), CHROME_TOP + sx(FIND_BAR_H_96) * 0.5) == .None, "a click in the query field is not a chip")
+				mt_chk(&bad, find_toggle_at(&od, W, ts[0].x + ts[0].w * 0.5, CHROME_TOP + sx(FIND_BAR_H_96) * 2) == .None, "a click below the chip row is not a chip")
+
+				// 2. Regex honours case and whole word. Both were ignored: the
+				// scan hardcoded Case_Insensitive and never looked at word
+				// boundaries, so two of the three chips did nothing in regex mode.
+				rcount :: proc(d: ^Document, q: string, case_sens, whole: bool) -> int {
+					find_close(d)
+					find_open(d, false)
+					clear(&d.find.query)
+					d.find.regex = true
+					d.find.case_sens, d.find.whole_word = case_sens, whole
+					for r in q {find_input_rune(d, r)}
+					find_wait(d)
+					return len(d.find.matches)
+				}
+				rany := rcount(&od, "cat", false, false)
+				rcase := rcount(&od, "cat", true, false)
+				rword := rcount(&od, "cat", false, true)
+				mt_chk(&bad, rany > 0, fmt.tprintf("regex finds the fixture at all (%d)", rany))
+				mt_chk(&bad, rcase < rany, fmt.tprintf("regex honours match case (%d < %d)", rcase, rany))
+				mt_chk(&bad, rword < rany, fmt.tprintf("regex honours whole word (%d < %d)", rword, rany))
+
+				// 3. An invalid pattern says so, rather than reading as "no
+				// matches" -- which is what an uncompilable regex looked like.
+				find_close(&od)
+				find_open(&od, false)
+				clear(&od.find.query)
+				od.find.regex = true
+				od.find.case_sens, od.find.whole_word = false, false
+				for r in "cat(" {find_input_rune(&od, r)}
+				find_wait(&od)
+				info := find_status_info(&od)
+				mt_chk(&bad, search_bad_pattern(&od), "an uncompilable pattern is flagged")
+				mt_chk(&bad, strings.contains(info, "invalid"), fmt.tprintf("...and the count says so: %q", info))
+				// And a corrected pattern clears it -- a sticky flag would mark
+				// every later search invalid, including the fixed one.
+				find_close(&od)
+				find_open(&od, false)
+				clear(&od.find.query)
+				od.find.regex = true
+				for r in "cat" {find_input_rune(&od, r)}
+				find_wait(&od)
+				mt_chk(&bad, !search_bad_pattern(&od), "correcting the pattern clears the flag")
+				find_close(&od)
+				od.find.regex = false
+			}
+
 			fmt.printfln("metricstest: %d failures", bad)
 			return true
 		}
