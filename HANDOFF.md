@@ -3112,6 +3112,119 @@ run to prove anything, and got one.
   and it carries the same risk: `main.odin` can drift from the predicate without a test noticing.
 - Wyatt's live pass over batches 7–11 is still owed; these were its first two findings.
 
+## 6ah. UI foundation (2026-07-28, v0.21.0, branch `feat/batch-12-ui-foundation`)
+
+The first batch of the UI overhaul (CLAUDE.md priority 2). Source material: a 21-section UI
+specification produced with Claude Design, plus an HTML visual reference with the same content
+rendered. Spec: `docs/superpowers/specs/2026-07-28-batch-12-ui-foundation-design.md`. Plan:
+`docs/superpowers/plans/2026-07-28-batch-12-ui-foundation.md`.
+
+**Shipped:** six new colour roles and both built-ins repainted warm · `hairline()` and `ui_px_even()`
+· the §2 chrome metrics · a rounded-box SDF in the quad pipeline with a real-device readback test ·
+the interface font separated from the document font.
+
+### Read the specification the way it asks to be read
+
+It says so itself, and it earns the caveat:
+
+> This is a target state, not an audit of the codebase. It was written from screenshots,
+> `Light Custom.theme`, and the colour-rules file — nothing else. **If the code and this document
+> conflict on a fact, the code wins.**
+
+Auditing it first is most of the value this batch produced, because **three of its sections describe
+work that is already done**: §3 (DPI) is ~80% built — `newtpad.manifest` declares `PerMonitorV2` and
+`window.odin:623` already does suggested-rect → resize → rebuild with *"Order matters"* written above
+it; §4.1 (caption ownership) is complete; §14 (10 GB) is two-thirds built. Its 13 build steps are
+about 8 batches, not 13, and the batch map is in the design spec's last section.
+
+### Four values in the specification are wrong, and the tests are what said so
+
+- **`scrollbar_thumb` is annotated "3.0 against bg_base" in both theme files and measures 1.42 (Dark)
+  and 1.67 (Light).** Two themes, one mistake, so it is systematic rather than a typo — and §18 cites
+  that 3.0 as a WCAG 1.4.11 compliance point, so shipping the literal values would have made an
+  accessibility claim the palette does not meet. Replaced with values that measure 3.14 and 3.10, and
+  `themetest` now asserts the pair so a later retune cannot quietly drop back under.
+- **`syn_comment` is set to `text_muted`'s exact value in both files.** `themetest` has required those
+  to differ since §6w, because the gutter line numbers are `Text_Muted` and sit immediately beside
+  comment text — a fact no screenshot shows. Wyatt's call was to make comments green and keep the dark
+  one muted; the check then caught the *first* green too (0.055 channel diff against a 0.10 floor).
+- **`md_bold`, `md_list_mark` and `table_zebra` are aliases**, each set to the value of a role that
+  already exists. Folded into `Text_Bright`, `Accent` and a derivation instead. Six roles, not nine.
+- The §19 code shapes are illustrative and the spec says so; `Quad` keeps its name and
+  `metrics_recompute` keeps its globals.
+
+### The metrics work was smaller than the specification thought, for a good reason
+
+§3 rule 3 — *"round every metric once, at the point of scaling, into a struct… never scale at the call
+site"* — is a defect the spec correctly predicted from screenshots. But `metrics_recompute`
+(`main.odin:1448`) **already writes 21 named globals in exactly one place**, and already carries the
+incident: a value scaled at its call site *"was being scaled a second time by one of them, squaring it
+and pushing the OS drag region into the content."* So this extended a working pattern rather than
+introducing the spec's struct, per the spec's own §0.
+
+The rule used for what earns a name: a value in §2.1–2.4, or one two procedures must agree on, or one
+a hit-test and a draw both read. A genuinely local offset with one reader stays on `sx()` — 167
+globals would be worse than 167 call sites, and `UI_SCALE`'s own comment says it exists for exactly
+those.
+
+**The scrollbar had one number doing two jobs** and nobody had noticed, because they were only ever
+the same number: every "right edge of content" computation subtracts `SCROLLBAR_W`, and the track quad
+used it as its width. Split into a 14px lane and the 8px bar drawn inside it, which is where §2.3's
+6px inset comes from. Same shape as the `Border_Subtle` split `theme.odin` records as **still open**.
+
+### The pipeline: three things the test found that reasoning had not
+
+`quadsdftest` renders on a real offscreen D3D11 device and reads the pixels back — which needed a
+readback path in `gfx.odin`. CLAUDE.md asks for a real device over arithmetic when the claim is about
+the GPU, and this claim rests on `fwidth`, a hardware derivative no CPU port of the distance function
+would exercise. It earned that:
+
+1. **The pass bound no blend state at all** (*"opaque; don't inherit the text pass's blend"*), which
+   was correct while every edge was hard. A distance field resolves its edge *in alpha*, so without
+   blending every antialiased boundary wrote partial coverage as an opaque colour.
+2. **A shadow's falloff lies outside the rectangle, and the pixel shader only runs where there is
+   geometry.** Shadows rendered as *nothing whatsoever* until the vertex shader grew the quad by the
+   blur radius.
+3. **`fwidth` ramps coverage over the last pixel or two inside *any* edge**, so routing every quad
+   through the field would have softened the border of every existing piece of chrome — measured at
+   r=244 where it had been 255. `radius == 0 && softness == 0` therefore returns the colour and never
+   touches the field. That bypass is the compatibility contract, not an optimisation, and it is what
+   lets this land under the whole UI at once.
+
+### Two things this batch got wrong
+
+- **The plan's first draft cited three things that do not exist as described**: it invented
+  `Font_Set.Ui` and a chrome-routing step when `Font_Set.UI`/`.Doc` have existed since the atlas was
+  written (Task 5 shrank to one field and one load call); it told the implementer to "confirm" whether
+  the theme key table is generated when it is keyed over `Color_Role` and therefore compile-enforced;
+  and it described the metrics work as building a struct from nothing. All three were caught by
+  checking the plan against the code *before* committing it — which is the plan self-review step
+  earning its place, since `development-loop.md` §1 lists cited-but-nonexistent procedures as the
+  characteristic plan failure.
+- **The first `quadsdftest` read the wrong channel.** It asserted coverage on alpha, but the frame is
+  cleared to *opaque* black, so every pixel returns `a=255` whether drawn over or not — three checks
+  failed for that reason rather than for a defect in the shader. Coverage is the colour channel.
+
+### Owed
+
+- **The absorbed-set assertions in `themetest` are gone.** They required every role to still hold one
+  of its pre-migration literals — the right guard while §6v's migration was in flight, and a lock on
+  ever retuning the palette afterwards. All 25 fired at once here and not one reported a defect. The
+  contrast pairs replace them.
+- **§3.8's fourth alignment check is not asserted**, and `metricstest` says why: tabs start at
+  `MENU_W` because the hamburger sits there, so the active tab's left edge is not meant to match the
+  editor's left padding until batch 13 rebuilds the rail.
+- **Monaspace embedding is batch 20.** Fonts resolve by filename from `%SystemRoot%\Fonts\`; embedding
+  needs hand-written `IDWriteFontFileLoader`/`IDWriteFontFileStream` vtables and a rewrite of
+  `THIRD-PARTY-NOTICES.txt`'s claim that the project *"bundles and redistributes no third-party
+  components."*
+- **Nothing passes a radius or a softness yet.** The pipeline is built and tested; the tab pills,
+  menu panels, focus rings and shadows that use it are batch 13.
+- **§19's gamma-correct linear blending is not done.** It changes every measured ratio in §1 and
+  deserves its own before/after, not a line in a four-item batch.
+- **No live pass yet.** Every claim here is a headless measurement; the chrome sizes, the warm palette
+  and the green comments have not been looked at on screen.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -3134,7 +3247,8 @@ run to prove anything, and got one.
     `linktest`, `tabreordertest`
   - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
     `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `tablereadonlytest`,
-    `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`
+    `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
+    `quadsdftest`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest <file>`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest <dir>`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
