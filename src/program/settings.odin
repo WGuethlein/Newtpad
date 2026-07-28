@@ -483,7 +483,7 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 		r := SETTINGS_ROWS[i]
 		sel := i == app.settings_row
 		if sel {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x - sx(12), y - sx(16)}, size = {width - sx(52), rowh - sx(6)}, color = g_theme[.Selection_List]}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x - sx(12), y - sx(16)}, size = {width - sx(52), rowh - sx(6)}, color = g_theme[.Accent_Wash]}})
 		}
 		plat.text_draw(gfx, t, r.label, x, y, UI_PX, g_theme[.Text_Primary])
 		plat.text_draw(gfx, t, r.help, x, y + sx(16), UI_SMALL_PX, g_theme[.Text_Muted])

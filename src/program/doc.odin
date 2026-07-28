@@ -34,9 +34,9 @@ BASE_PX_96 :: f32(16) // default document text size at 96 DPI
 BASE_PX := BASE_PX_96 // current, from settings (see settings.odin)
 UI_PX_96 :: f32(15) // chrome: menu/caption glyphs, palette rows, find bar
 UI_SMALL_PX_96 :: f32(13) // secondary: tab labels, status bar, category labels
-TEXT_MARGIN_X_96 :: f32(12) // left gutter before text
-TEXT_MARGIN_Y_96 :: f32(10) // top gutter above the first line
-TAB_STRIP_H_96 :: f32(36) // height of the custom title bar (tabs + window buttons)
+TEXT_MARGIN_X_96 :: f32(24) // side padding (UI spec 2.3; was 12)
+TEXT_MARGIN_Y_96 :: f32(16) // top padding -- "never 0, the first line needs air" (UI spec 2.3; was 10)
+TAB_STRIP_H_96 :: f32(40) // the tab rail (UI spec 2.1; was 36)
 
 LINE_SPACING :: f32(1.5) // line height = font px * this (a ratio; DPI-independent)
 
@@ -53,7 +53,36 @@ LINE_SPACING :: f32(1.5) // line height = font px * this (a ratio; DPI-independe
 // hit-test gutter, the drawn track, and the width reserved when wrapping — which
 // merely looked sloppy at 96 DPI but would have rendered wrapped text underneath
 // the bar once they scaled independently.
-SCROLLBAR_W_96 :: f32(16)
+SCROLLBAR_W_96 :: f32(14) // the reserved LANE: track width + inset from the edge
+// The drawn bar inside that lane. UI spec 2.3 asks for 8 wide, 6 inset from the
+// right edge; 8 + 6 is the 14 above, so the bar is drawn at
+// `right - SCROLLBAR_W` with this width and the inset falls out.
+//
+// Two names because SCROLLBAR_W had two jobs: every "right edge of the content"
+// computation subtracts it (doc_view_cols, the markdown panes, four table
+// widths), AND the track quad used it as its width. Those were the same number
+// only because the bar used to fill its lane. Same shape as the Border_Subtle
+// role split recorded in theme.odin -- one value serving a boundary and a fill.
+SCROLLBAR_TRACK_W_96 :: f32(8)
+
+// The status line along the bottom (UI spec 2.1; was an inline sx(20)).
+//
+// The find bar's own heights are deliberately NOT changed here even though UI
+// spec 12 gives them (38, and 76 in replace mode): 12 MOVES that bar to the top
+// of the editor, which is batch 15, and retuning a bar's height in the batch
+// before the one that relocates it is churn. doc_bottom_bar_h still owns both
+// numbers.
+STATUS_BAR_H_96 :: f32(26)
+
+// Corner radii -- the whole list from UI spec 2.4, nothing above 8. Consumed by
+// the rounded-rect pipeline; no caller passes a radius until the tab rail and
+// menus are rebuilt in batch 13, so these are declared here (beside every other
+// metric) rather than invented per widget then.
+RADIUS_MENU_BAR_ITEM_96 :: f32(4)
+RADIUS_ROW_96 :: f32(5) // menu rows, palette rows, close button, tooltips
+RADIUS_TAB_96 :: f32(6) // tabs, find bar, commands control
+RADIUS_PANEL_96 :: f32(7) // menu and palette panels
+RADIUS_CARD_96 :: f32(8) // settings cards, the window itself
 
 UI_PX := UI_PX_96
 UI_SMALL_PX := UI_SMALL_PX_96
@@ -61,6 +90,13 @@ TEXT_MARGIN_X := TEXT_MARGIN_X_96
 TEXT_MARGIN_Y := TEXT_MARGIN_Y_96
 TAB_STRIP_H := TAB_STRIP_H_96
 SCROLLBAR_W := SCROLLBAR_W_96
+SCROLLBAR_TRACK_W := SCROLLBAR_TRACK_W_96
+STATUS_BAR_H := STATUS_BAR_H_96
+RADIUS_MENU_BAR_ITEM := RADIUS_MENU_BAR_ITEM_96
+RADIUS_ROW := RADIUS_ROW_96
+RADIUS_TAB := RADIUS_TAB_96
+RADIUS_PANEL := RADIUS_PANEL_96
+RADIUS_CARD := RADIUS_CARD_96
 
 // Bottom edge of the chrome: below the tab strip AND the menu bar. Anything
 // positioned against the top of the content area (the scrollbar, its drag
@@ -605,7 +641,7 @@ doc_bottom_bar_h :: proc(doc: ^Document) -> f32 {
 	if doc != nil && doc.find.active {
 		return sx(48) if doc.find.replace_mode else sx(26)
 	}
-	return sx(20) // status line
+	return STATUS_BAR_H // status line
 }
 
 // Visible document rows, excluding the bottom bar and the filter banner inset.

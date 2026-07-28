@@ -59,7 +59,7 @@ font_page_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, a
 	rowh := sx(38)
 	for i in 0 ..< FONT_ROWS {
 		if i == app.font_row {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x - sx(12), y - sx(16)}, size = {width - sx(64), rowh - sx(4)}, color = g_theme[.Selection_List]}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x - sx(12), y - sx(16)}, size = {width - sx(64), rowh - sx(4)}, color = g_theme[.Accent_Wash]}})
 		}
 		plat.text_draw(gfx, t, labels[i], x, y, UI_PX, g_theme[.Text_Primary])
 		plat.text_draw(gfx, t, vals[i], x + sx(160), y, UI_PX, g_theme[.Success])

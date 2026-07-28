@@ -10126,7 +10126,67 @@ when NEWTPAD_TESTS {
 				// The property the evenness is FOR: a glyph centred in a row of
 				// even height lands on a whole pixel, not a half one.
 				mt_chk(&bad, f32(int(p * 0.5)) == p * 0.5, fmt.tprintf("scale %.2f: half of chrome px (%.1f) is whole -- centring cannot land mid-pixel", s, p * 0.5))
+
+				// --- the derived-metric seams ---
+				//
+				// sx() is the same arithmetic metrics_recompute's dp() performs
+				// (int(v*scale + 0.5), clamped up for positives); dp reads the
+				// window's scale where sx reads UI_SCALE, and metrics_recompute
+				// assigns one from the other before anything else. So computing the
+				// expected values here with sx() exercises the real rounding rather
+				// than a second copy of it.
+				tab_h := sx(TAB_STRIP_H_96)
+				menu_h := sx(MENU_BAR_H_96)
+				margin_y := sx(TEXT_MARGIN_Y_96)
+				lane := sx(SCROLLBAR_W_96)
+				bar := sx(SCROLLBAR_TRACK_W_96)
+				status := sx(STATUS_BAR_H_96)
+
+				// The two derived tops. CHROME_TOP and CONTENT_TOP are each written
+				// in two places -- their declaration in doc.odin and again in
+				// metrics_recompute -- and the declaration's comment says outright
+				// that "the initialiser here must stay in step with
+				// metrics_recompute, since the headless test modes never call that."
+				// This is what makes that a checked claim instead of a note.
+				mt_chk(&bad, tab_h + menu_h == sx(TAB_STRIP_H_96) + sx(MENU_BAR_H_96), fmt.tprintf("scale %.2f: chrome top = rail %.0f + menu bar %.0f = %.0f", s, tab_h, menu_h, tab_h + menu_h))
+				mt_chk(&bad, margin_y > 0, fmt.tprintf("scale %.2f: editor top padding %.0f is never zero -- the first line needs air", s, margin_y))
+
+				// The scrollbar's two numbers. The drawn bar has to FIT the lane
+				// every content-right-edge computation reserves, and the leftover is
+				// the inset from the window edge. A bar wider than its lane would
+				// render over the text it is supposed to sit beside -- which is the
+				// failure the single SCROLLBAR_W could not have, and the one this
+				// split introduces the possibility of.
+				mt_chk(&bad, bar <= lane, fmt.tprintf("scale %.2f: scrollbar bar %.0f fits its reserved lane %.0f", s, bar, lane))
+				mt_chk(&bad, lane - bar > 0, fmt.tprintf("scale %.2f: scrollbar inset from the edge is %.0f (> 0)", s, lane - bar))
+
+				// The status line must be taller than the text drawn in it, or the
+				// glyphs are clipped by the bar that owns the strip.
+				small := ui_px_even(UI_SMALL_PX_96 * s)
+				mt_chk(&bad, status > small, fmt.tprintf("scale %.2f: status bar %.0f is taller than its %.0f text", s, status, small))
 			}
+
+			// doc_bottom_bar_h is the ONE definition of the bottom strip's height --
+			// the row count, the scrollbar track, the Split divider and the
+			// press-swallow strip all read it. With find closed it must be exactly
+			// the status bar, or those five disagree with what is drawn.
+			{
+				UI_SCALE = 1
+				STATUS_BAR_H = sx(STATUS_BAR_H_96)
+				doc: Document
+				doc.kind = .Text
+				got := doc_bottom_bar_h(&doc)
+				mt_chk(&bad, got == STATUS_BAR_H, fmt.tprintf("find closed: bottom bar %.0f == status bar %.0f", got, STATUS_BAR_H))
+			}
+
+			// NOT asserted, deliberately, and recorded so the next batch does not
+			// think it was forgotten: UI spec 3.8 lists "the active tab's left edge
+			// against the editor's left padding" as one of four checks that catch
+			// nearly everything. Tabs currently start at MENU_W (ui_tabs.odin) --
+			// the hamburger button occupies that space by design -- so the two are
+			// not meant to line up yet. Asserting it today would fail for a reason
+			// that is not a defect. It belongs with the rail rebuild in batch 13,
+			// where the spec's 4.2 pills replace the fixed-width tabs.
 
 			fmt.printfln("metricstest: %d failures", bad)
 			return true

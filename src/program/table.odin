@@ -245,7 +245,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	for c := start_col; c < len(colw); c += 1 {
 		if cx >= right {break}
 		if c > start_col {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx - char_w * 0.5, top}, size = {max(sx(1), 1), bot - top}, color = sep}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx - char_w * 0.5, top}, size = {hairline(), bot - top}, color = sep}})
 		}
 		cellcells := colw[c] + TABLE_COL_PAD
 		for row, r in vis {
@@ -283,7 +283,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 				// the line above, and the caret offsets from that same x.
 				caret_cells := plat.text_cells(text, doc.table_edit_buf[:doc.table_edit_caret], 0, .Doc)
 				cxp := ex + f32(caret_cells) * char_w
-				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cxp, row_rect_y(px, er)}, size = {max(sx(1), 1), lh}, color = g_theme[.Text_Bright]}})
+				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cxp, row_rect_y(px, er)}, size = {hairline(), lh}, color = g_theme[.Text_Bright]}})
 			}
 		}
 	}
