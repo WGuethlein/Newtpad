@@ -4,12 +4,19 @@
 # creates a GitHub Release with the exe attached; otherwise it prints the manual
 # upload step.
 #
-#   .\release.ps1            build, tag, push (and gh release if available)
-#   .\release.ps1 -NoPush    build + tag locally only
-#   .\release.ps1 -DryRun    print what it would do, change nothing
+#   .\release.ps1              build, tag, push (and gh release if available)
+#   .\release.ps1 -NoPush      build + tag locally only
+#   .\release.ps1 -DryRun      print what it would do, change nothing
+#   .\release.ps1 -Installer   also build and attach setup.exe (needs Inno Setup)
+#
+# -Installer is additive, never a substitute: the bare newtpad.exe is attached
+# either way. Principle 5 is "no install required", so the portable exe stays the
+# primary artifact and the setup.exe is an extra asset. If Inno Setup is absent
+# the installer step says so and skips; the release still goes out.
 param(
     [switch]$NoPush,
-    [switch]$DryRun
+    [switch]$DryRun,
+    [switch]$Installer
 )
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
@@ -37,6 +44,16 @@ if (-not $DryRun -and -not (Test-Path $exe)) { Write-Error "Release exe missing:
 if (-not $DryRun) {
     $mb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
     Write-Host "  built $exe ($mb MB)" -ForegroundColor Green
+}
+
+# --- installer (optional) ---
+# build-installer.ps1 owns the ISCC hunt and exits 0 when Inno Setup is absent,
+# so a missing toolchain never costs us a release. -SkipBuild because the exe it
+# wraps was just built above.
+$setupExe = "build\newtpad-$version-setup.exe"
+if ($Installer) {
+    & (Join-Path $PSScriptRoot 'build-installer.ps1') -SkipBuild -DryRun:$DryRun
+    if ($LASTEXITCODE -ne 0) { Write-Error 'Installer build failed.'; exit 1 }
 }
 
 if ($DryRun) { Write-Host "[dry run] would tag $tag and push"; exit 0 }
@@ -77,6 +94,13 @@ if (-not $gh) {
 $notes = @"
 **This build is unsigned.** Windows SmartScreen will warn when you download or first run it. Choose **More info**, then **Run anyway**. Code signing needs a purchased certificate and is tracked as ship-readiness work.
 "@
-& $gh release create $tag $exe --title "Newtpad $tag" --notes $notes --generate-notes
+
+# The exe first, always: it is the one that needs no install.
+$assets = @($exe)
+if ($Installer -and (Test-Path $setupExe)) {
+    $assets += $setupExe
+    $notes = $notes + "`n`nTwo downloads: ``newtpad.exe`` runs as-is from anywhere, and the setup.exe installs it per-user with an ""Open with"" registration and an uninstaller. Either is fine."
+}
+& $gh release create $tag @assets --title "Newtpad $tag" --notes $notes --generate-notes
 if ($LASTEXITCODE -ne 0) { Write-Error "gh release create failed for $tag."; exit 1 }
-Write-Host "GitHub Release $tag created with the exe attached." -ForegroundColor Green
+Write-Host "GitHub Release $tag created with $($assets.Count) asset(s) attached." -ForegroundColor Green
