@@ -46,9 +46,9 @@ diag_init :: proc() {
 	dir, ok := session_dir()
 	if ok {
 		logs := djoin(dir, "logs")
-		os.make_directory(logs)
+		plat.dir_create(logs)
 		crashes := djoin(dir, "crashes")
-		os.make_directory(crashes)
+		plat.dir_create(crashes)
 		diag_open_log(djoin(logs, "newtpad.log"))
 		plat.crash_install(crashes, NEWTPAD_VERSION, diag_on_fatal)
 	}

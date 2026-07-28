@@ -188,9 +188,12 @@ code); plugins post-V1 (narrow C-ABI). Refuted claims recorded in `research/`.
 on 2026-07-19). The list is kept because the reasoning is still the best statement of *why* these
 were the priorities. Read P2 as the live list, with these amendments:
 
-- **Arenas on VirtualAlloc: still zero implementation.** Heap plus `free_all(context.temp_allocator)`
-  per frame. Either build it or amend the locked decision — do not keep citing it as though it
-  describes the code.
+- ~~**Arenas on VirtualAlloc: still zero implementation.**~~ **RESOLVED by amendment, 2026-07-27.**
+  This entry was stale: CLAUDE.md's Memory row no longer specifies arenas. It records that the arena
+  text described something which never existed in any form and had no measured problem behind it, and
+  ends "build arenas only if a measurement asks for them, and amend this row again when you do." The
+  decision and the code agree; nothing is owed. Left visible rather than deleted because *this entry*
+  was cited as outstanding debt repeatedly after the amendment had already landed.
 - ~~**`\?\` long paths: still zero implementation.**~~ **Platform layer DONE (2026-07-26, batch 7
   task 3.)** `src/platform/path.odin` — `long_path_form` / `wide_path`, every file-I/O call in
   `file.odin` converted, `longpathtest` covering the rule table plus a real 292-character round trip.
@@ -200,10 +203,17 @@ were the priorities. Read P2 as the live list, with these amendments:
   `_fix_long_path`, which returns the path unchanged whenever HKLM `LongPathsEnabled` is set — the
   registry opt-in CLAUDE.md forbids depending on, and one that does nothing without the
   `longPathAware` manifest entry we deliberately do not ship. Not urgent: every one of those paths
-  is under `%APPDATA%\Newtpad` and short. **It is reachable, though** — `NEWTPAD_SESSION_DIR`
-  redirects the whole store, so a long override loses the session, the settings, the log and the
-  crash artefacts, each silently (see the comment on `write_minidump`, `crash.odin`). Converting
-  them means routing through `plat.dir_create` / a `plat` read-write pair rather than `core:os`.
+  is under `%APPDATA%\Newtpad` and short. **It was reachable, though** — `NEWTPAD_SESSION_DIR`
+  redirects the whole store, so a long override lost the session, the settings, the log and the crash
+  artefacts, each silently.
+
+  **DONE 2026-07-29 (§6an).** `plat.file_read_all` was added, because `core:os`'s `read_entire_file`
+  goes through `_fix_long_path`, which returns the path unchanged without the HKLM opt-in — so every
+  program-layer read had a silent 260-character ceiling. The directory creates, deletes, existence
+  checks, reads and the theme write in `session.odin`, `settings.odin`, `theme.odin` and `diag.odin`
+  now route through `plat`. What remains on `core:os` is `diag.odin`'s append-mode log handle
+  (`os.open` / `os.stat` / `os.rename`), which needs a `plat` append primitive that does not exist —
+  one file, and the least damaging of the set to lose.
 - ~~**Test modes ship in the release binary.**~~ **DONE (2026-07-26, §6z.)** `NEWTPAD_TESTS`
   (`#config`, defaults to `ODIN_DEBUG`) gates the whole file; release went 1,494,528 → 1,055,744
   bytes. `build.bat release tests` puts it back for `-o:speed` measurements.
@@ -3573,6 +3583,54 @@ which is modal, so the headless run hung with no output — the fall-through tra
 - **Arenas on VirtualAlloc** — CLAUDE.md's locked-decision row says build them or amend the row.
 - **§3.8's tab-edge alignment check** — still not meaningful; tabs start at `MENU_W`.
 - **No live pass on batches 12–15** beyond two screenshots.
+
+## 6an. Gamma, and the last of the orphaned debt (2026-07-29, v0.26.0, branch `fix/remaining-orphans`)
+
+The remainder of what no batch would pick up. Wyatt chose to ship gamma directly rather than behind a
+setting or after a live pass.
+
+### Blending now happens in linear light
+
+Text was composited as `text*cov + dst*(1-cov)` on **gamma-encoded** values. That weights
+partially-covered pixels wrongly and thins light glyphs on a dark page — §19 says so outright, and it
+is one honest candidate for the chrome text Wyatt reported as hard to read.
+
+The render-target **view** is sRGB-typed and both pixel shaders decode their colour. Two properties
+make this safe to land under everything at once:
+
+- **Opaque fills are unchanged by construction.** The shader decodes, the hardware encodes, so a solid
+  quad lands on the bytes it always did.
+- **Only blended pixels move** — glyph antialiasing and the SDF's edges. Measured: a square corner's
+  antialiased pixel 215 → 236, the focus ring 183 → 201. Heavier, which is the fix.
+
+The type is on the **view**, not the buffer: a view may only reinterpret a *typeless* resource, so the
+offscreen texture became `TYPELESS`. An sRGB view over a typed UNORM texture is `E_INVALIDARG`, which
+is what it returned first.
+
+**A test was asserting the wrong answer.** `quadsdftest` demanded 100..155 for a half-alpha blend and
+passed at 128. Half of linear 1.0 encodes to about 186; 128 is what you get by blending gamma-encoded
+values, which is exactly the defect. The check now expects the right figure and names the wrong one.
+
+### The program layer is off `core:os` paths
+
+`read_entire_file` goes through `_fix_long_path`, which returns the path **unchanged** without the HKLM
+opt-in — the registry dependency CLAUDE.md forbids relying on, and one that does nothing without a
+manifest entry this app deliberately does not ship. So every program-layer read had a silent
+260-character ceiling, reachable through `NEWTPAD_SESSION_DIR`.
+
+`plat.file_read_all` closes it; the creates, deletes, existence checks and the theme write route
+through `plat`. **`diag.odin`'s append-mode log handle remains** — it needs a `plat` append primitive
+that does not exist, and it is the least damaging of the set to lose.
+
+### Two debt entries were stale, not outstanding
+
+- **Arenas.** CLAUDE.md's Memory row was amended on 2026-07-27 and no longer specifies them. §5 kept
+  listing it as owed, and it was cited as outstanding several times after the amendment landed. The
+  entry is now marked resolved rather than deleted, because the failure mode was re-reporting it.
+- **§3.8's tab-edge alignment check** does not apply to this layout: the rail opens with the `>_`
+  button by deliberate choice (§7.1), so the tab edge and the text margin were never two views of one
+  measurement. Recorded as **declined**, not pending — it had been carried as "belongs with batch 13",
+  and batch 13 has been and gone.
 
 ## 7. Build environment (Windows, this machine)
 

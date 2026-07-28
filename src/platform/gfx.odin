@@ -8,6 +8,31 @@ import win "core:sys/windows"
 import d3d "vendor:directx/d3d11"
 import dxgi "vendor:directx/dxgi"
 
+// An sRGB-typed view over a UNORM buffer, so the GPU converts on read and write
+// and every BLEND happens in linear light.
+//
+// UI spec 19: "Gamma matters more than antialiasing here. Light text on a dark
+// ground gets thin if blended in sRGB." Text is composited as
+// text*cov + dst*(1-cov), and doing that on gamma-encoded values weights the
+// partially-covered pixels wrongly -- light glyphs on a dark page lose stem
+// weight, which is one honest candidate for the chrome text Wyatt reported as
+// hard to read.
+//
+// The TYPE is on the VIEW, not the buffer: a flip-model swapchain is created
+// UNORM, and the offscreen path keeps UNORM too so gfx_readback_bgra's staging
+// copy still matches formats.
+//
+// What this does NOT change: opaque fills. Writing a colour through an sRGB
+// view converts it once, and the value was authored in sRGB, so a solid quad
+// lands on the same bytes it always did. Only BLENDED pixels move -- glyph
+// antialiasing and the rounded-rect SDF's edges -- which is exactly the target,
+// and what makes the theme's measured ratios true rather than optimistic.
+@(private)
+SRGB_RTV := d3d.RENDER_TARGET_VIEW_DESC {
+	Format        = .B8G8R8A8_UNORM_SRGB,
+	ViewDimension = .TEXTURE2D,
+}
+
 Gfx :: struct {
 	device:        ^d3d.IDevice,
 	ctx:           ^d3d.IDeviceContext,
@@ -117,7 +142,14 @@ gfx_init_offscreen :: proc(width, height: i32) -> (gfx: Gfx, ok: bool) {
 		Height     = u32(height),
 		MipLevels  = 1,
 		ArraySize  = 1,
-		Format     = .B8G8R8A8_UNORM, // as CreateSwapChainForHwnd's below
+		// _SRGB, so blending happens in LINEAR light. See gfx_srgb_note below for
+		// why this matters and what it does and does not change.
+		// TYPELESS, so the sRGB-typed RTV below is legal. A view may only
+		// reinterpret a typeless resource -- an _SRGB view over a typed UNORM
+		// texture is E_INVALIDARG, which is what this returned first. The
+		// swapchain path needs no equivalent: a flip-model backbuffer created
+		// UNORM accepts an _SRGB view, and that is the documented pattern.
+		Format     = .B8G8R8A8_TYPELESS,
 		SampleDesc = {Count = 1},
 		Usage      = .DEFAULT,
 		BindFlags  = {.RENDER_TARGET},
@@ -126,7 +158,7 @@ gfx_init_offscreen :: proc(width, height: i32) -> (gfx: Gfx, ok: bool) {
 		fmt.eprintfln("CreateTexture2D(offscreen %dx%d) failed: 0x%X", width, height, u32(hr))
 		return gfx, false
 	}
-	if hr := gfx.device->CreateRenderTargetView((^d3d.IResource)(gfx.offscreen), nil, &gfx.rtv); !win.SUCCEEDED(hr) {
+	if hr := gfx.device->CreateRenderTargetView((^d3d.IResource)(gfx.offscreen), &SRGB_RTV, &gfx.rtv); !win.SUCCEEDED(hr) {
 		fmt.eprintfln("CreateRenderTargetView(offscreen) failed: 0x%X", u32(hr))
 		return gfx, false
 	}
@@ -153,7 +185,9 @@ gfx_readback_bgra :: proc(gfx: ^Gfx, allocator := context.allocator) -> (pixels:
 		Height         = u32(gfx.height),
 		MipLevels      = 1,
 		ArraySize      = 1,
-		Format         = .B8G8R8A8_UNORM,
+		// Matches the offscreen texture's type so CopyResource is legal; the
+		// readback wants raw bytes either way.
+		Format         = .B8G8R8A8_TYPELESS,
 		SampleDesc     = {Count = 1},
 		Usage          = .STAGING,
 		CPUAccessFlags = {.READ},
@@ -257,7 +291,7 @@ gfx_create_rtv :: proc(gfx: ^Gfx) {
 		return
 	}
 	defer backbuffer->Release()
-	if hr := gfx.device->CreateRenderTargetView((^d3d.IResource)(backbuffer), nil, &gfx.rtv); !win.SUCCEEDED(hr) {
+	if hr := gfx.device->CreateRenderTargetView((^d3d.IResource)(backbuffer), &SRGB_RTV, &gfx.rtv); !win.SUCCEEDED(hr) {
 		gfx.rtv = nil
 	}
 }

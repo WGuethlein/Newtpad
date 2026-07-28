@@ -203,6 +203,23 @@ file_read_range :: proc(path: string, offset: i64, count: int, allocator := cont
 // even when the original is memory-mapped (delete+rename succeed; see bench/).
 // (This header had drifted up the file and was sitting above File_Stamp, which
 // it says nothing true about.)
+// Read a whole file, through the long-path form.
+//
+// core:os's read_entire_file goes through _fix_long_path, which returns the path
+// UNCHANGED unless the HKLM LongPathsEnabled opt-in is set -- the registry
+// dependency CLAUDE.md forbids relying on, and one that does nothing at all
+// without the longPathAware manifest entry this app deliberately does not ship.
+// Every program-layer read that used it therefore had a silent 260-character
+// ceiling. Reachable in practice: NEWTPAD_SESSION_DIR relocates the whole store,
+// so a long override lost the session, the settings, the keymap and the log --
+// each without saying anything.
+file_read_all :: proc(path: string, allocator := context.allocator) -> ([]u8, bool) {
+	st := file_stamp(path)
+	if !st.ok {return nil, false}
+	if st.size == 0 {return make([]u8, 0, allocator), true}
+	return file_read_range(path, 0, int(st.size), allocator)
+}
+
 file_write_atomic :: proc(path: string, data: []u8) -> bool {
 	err := file_write_atomic_err(path, data)
 	return err == .None
