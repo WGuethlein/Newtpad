@@ -2554,7 +2554,12 @@ when NEWTPAD_TESTS {
 			w: plat.Window
 			w.mouse_y = 5
 			w.mouse_x = 0 // far left -> target display index 0
-			tabs_drag_update(&app, &w)
+			// A real Text: tab widths are measured from their labels now, so the
+			// reorder's target index comes from a layout that has to measure them.
+			rt: plat.Text
+			plat.text_load_faces(&rt)
+			w.width = 1280
+			tabs_drag_update(&app, &w, &rt)
 			front_ok := app.docs[0] == ds[0] // ds[0] bubbled back to the front
 			fmt.printfln("  drag last tab to front: %v %s", front_ok, "OK" if front_ok else "FAIL")
 			if !front_ok {bad += 1}
@@ -10374,6 +10379,8 @@ when NEWTPAD_TESTS {
 				}
 				a: App
 				win: plat.Window
+				txt: plat.Text
+				plat.text_load_faces(&txt)
 				win.dpi = 96
 				a.settings = settings_default()
 				app_new_scratch(&a)
@@ -10387,7 +10394,7 @@ when NEWTPAD_TESTS {
 					for len(a.docs) < ntabs {app_new_scratch(&a, true)}
 					for width in ([]f32{320, 700, 1280, 2560}) {
 						win.width = i32(width)
-						L := tabs_layout(&a, &win, width)
+						L := tabs_layout(&a, &win, &txt, width)
 
 						// 1. No two drawn tabs overlap, and none crosses the limit --
 						// a tab drawn past it sits under the caption buttons, where a
@@ -10448,6 +10455,27 @@ when NEWTPAD_TESTS {
 						}
 					}
 				}
+				// Middle elision keeps both ends. End-elision is what this
+				// replaces, and the failure it caused is that a run of tabs whose
+				// names share a prefix all truncate to the SAME visible string.
+				{
+					long := "2026-07-27-batch-11-sync.md"
+					full := plat.text_cells(&txt, transmute([]u8)long, 0)
+					got := tab_elide(&txt, long, full - 6)
+					gb := transmute([]u8)got
+					ts_chk(&bad, plat.text_cells(&txt, gb, 0) <= full - 6, fmt.tprintf("elide fits the budget: %q is %d cells (max %d)", got, plat.text_cells(&txt, gb, 0), full - 6))
+					ts_chk(&bad, strings.has_suffix(got, ".md"), fmt.tprintf("elide keeps the extension: %q", got))
+					ts_chk(&bad, strings.has_prefix(got, "2026"), fmt.tprintf("elide keeps the start: %q", got))
+					ts_chk(&bad, strings.contains(got, "…"), fmt.tprintf("elide marks the cut: %q", got))
+					// Two names sharing a long prefix must stay distinguishable --
+					// the property end-elision loses and the reason for the change.
+					a1 := tab_elide(&txt, "2026-07-27-batch-11-sync.md", 18)
+					a2 := tab_elide(&txt, "2026-07-27-batch-12-plan.md", 18)
+					ts_chk(&bad, a1 != a2, fmt.tprintf("two names sharing a prefix stay distinct: %q vs %q", a1, a2))
+					// A label that already fits is returned untouched.
+					ts_chk(&bad, tab_elide(&txt, "a.md", 40) == "a.md", "a label that fits is not elided")
+				}
+
 				// tabs_index_at, on the case it exists for.
 				//
 				// Every check above runs against the real layout, where every tab

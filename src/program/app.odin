@@ -318,7 +318,10 @@ doc_display_name :: proc(d: ^Document) -> string {
 	return "untitled"
 }
 
-// Tab label: display name with a leading "*" when modified.
+// The tab label proper. The dirty marker used to be a "*" prepended HERE,
+// which is exactly what UI spec 4.2 says not to do: it moves the point at which
+// a long name truncates the moment a file becomes modified. It is now a mark the
+// layout reserves room for on every tab (ui_tabs.odin).
 tab_title :: proc(d: ^Document, allocator := context.temp_allocator) -> string {
 	#partial switch d.kind {
 	case .Settings:
@@ -326,9 +329,36 @@ tab_title :: proc(d: ^Document, allocator := context.temp_allocator) -> string {
 	case .Font:
 		return strings.clone("Font", allocator)
 	}
-	name := doc_display_name(d)
-	if d.modified {
-		return strings.concatenate({"*", name}, allocator)
+	return strings.clone(doc_display_name(d), allocator)
+}
+
+// Two open tabs called `notes.md` are indistinguishable, and the filename is the
+// only thing a tab shows. When a name repeats, both get their parent folder --
+// BOTH, not just the later one, because disambiguating only the duplicate leaves
+// the first tab looking like the canonical one.
+//
+// Compared on the display name rather than the path: two files with the same
+// name in the same folder cannot happen, and two untitled buffers are both
+// "Untitled" with no folder to tell them apart, so they are left alone rather
+// than given a misleading suffix.
+tab_name_ambiguous :: proc(a: ^App, d: ^Document) -> bool {
+	if d == nil || d.kind != .Text || d.path == "" {return false}
+	mine := doc_display_name(d)
+	for o in a.docs {
+		if o == nil || o == d || o.kind != .Text || o.path == "" {continue}
+		if doc_display_name(o) == mine {return true}
 	}
-	return strings.clone(name, allocator)
+	return false
+}
+
+// The tab's label: the filename, plus its parent folder when that filename is
+// open twice. The dirty marker is NOT here -- it lives in a reserved slot the
+// layout keeps on every tab, so a file becoming modified never moves the point
+// at which the label truncates (UI spec 4.2).
+tab_label :: proc(a: ^App, d: ^Document, allocator := context.temp_allocator) -> string {
+	name := tab_title(d, allocator)
+	if !tab_name_ambiguous(a, d) {return name}
+	parent := filepath.base(filepath.dir(d.path))
+	if parent == "" || parent == "." {return name}
+	return strings.concatenate({parent, "/", name}, allocator)
 }

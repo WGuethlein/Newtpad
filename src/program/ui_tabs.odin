@@ -10,13 +10,30 @@ import "core:strings"
 import plat "src:platform"
 
 // 96-DPI design values; the live ones below are scaled per window DPI.
-TAB_W_96 :: f32(160) // fixed tab width
+TAB_W_96 :: f32(160) // the width a tab wants before its label is measured
+// UI spec 2.1. A tab sizes to its label between these, so short names stop
+// wasting rail and long ones stay readable. The floor is a real floor: 5 says
+// not to shrink below it because "a tab with two visible characters is worse
+// than a scroll".
+TAB_MIN_W_96 :: f32(132)
+TAB_MAX_W_96 :: f32(220)
+// Reserved on EVERY tab, occupied only when the document is modified. The point
+// is that it is reserved: a file becoming dirty must not move the label or its
+// truncation point.
+TAB_DIRTY_W_96 :: f32(8)
+TAB_PAD_L_96 :: f32(4) // before the dirty slot; 4 + 8 = the spec's 12 to the text
+TAB_PAD_R_96 :: f32(9)
 TAB_GAP_96 :: f32(1)
 TAB_CLOSE_W_96 :: f32(20) // right-edge hit zone that closes instead of switches
 MENU_W_96 :: f32(44) // hamburger menu button
 PLUS_W_96 :: f32(32) // new-tab button
 
 TAB_W := TAB_W_96
+TAB_MIN_W := TAB_MIN_W_96
+TAB_MAX_W := TAB_MAX_W_96
+TAB_DIRTY_W := TAB_DIRTY_W_96
+TAB_PAD_L := TAB_PAD_L_96
+TAB_PAD_R := TAB_PAD_R_96
 TAB_GAP := TAB_GAP_96
 TAB_CLOSE_W := TAB_CLOSE_W_96
 MENU_W := MENU_W_96
@@ -70,7 +87,18 @@ Tabs_Layout :: struct {
 }
 
 // The rail's geometry. `width` is the client width.
-tabs_layout :: proc(app: ^App, win: ^plat.Window, width: f32, allocator := context.temp_allocator) -> (L: Tabs_Layout) {
+// A tab's natural width: everything it must show, clamped to the spec's range.
+// Reserved-not-conditional on the dirty slot and the close zone -- both occupy
+// room whether or not they are currently drawn, so neither appearing nor
+// disappearing moves the label.
+tab_natural_w :: proc(app: ^App, d: ^Document, t: ^plat.Text) -> f32 {
+	label := tab_label(app, d)
+	text_w := f32(plat.text_cells(t, transmute([]u8)label, 0)) * plat.text_char_width(t, UI_SMALL_PX)
+	want := TAB_PAD_L + TAB_DIRTY_W + text_w + TAB_CLOSE_W + TAB_PAD_R
+	return clamp(want, TAB_MIN_W, TAB_MAX_W)
+}
+
+tabs_layout :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text, width: f32, allocator := context.temp_allocator) -> (L: Tabs_Layout) {
 	L.limit = tabs_limit(win, width)
 	n := 0
 	for d in app.docs {
@@ -83,12 +111,52 @@ tabs_layout :: proc(app: ^App, win: ^plat.Window, width: f32, allocator := conte
 	// so the count has to be recomputed with that reservation in place or it
 	// comes out one too low. The first pass only answers "does anything
 	// overflow at all".
-	place :: proc(app: ^App, rects: []Tab_Rect, limit, scroll: f32) -> (drawn: int) {
+	// Natural widths first, then one fitting pass. UI spec 5: tabs shrink toward
+	// the 132 floor BEFORE the rail scrolls, so a few extra tabs cost width
+	// rather than reachability -- but never below the floor, because a tab with
+	// two visible characters is worse than a scroll.
+	nat := make([]f32, n, allocator)
+	{
+		i, total := 0, f32(0)
+		for d in app.docs {
+			if d == nil {continue}
+			nat[i] = tab_natural_w(app, d, t)
+			total += nat[i] + TAB_GAP
+			i += 1
+		}
+		avail := L.limit - MENU_W - PLUS_W
+		if n > 0 && total > avail && avail > 0 {
+			// Take the overshoot off the widest tabs first: shrinking a 220 down
+			// to 160 costs nothing a reader notices, while shrinking a name that
+			// already fits in 132 costs the whole name.
+			for pass in 0 ..< 8 {
+				total = 0
+				for w in nat {total += w + TAB_GAP}
+				if total <= avail {break}
+				over := total - avail
+				widest := f32(0)
+				count := 0
+				for w in nat {
+					if w > TAB_MIN_W + 0.5 {
+						count += 1
+						if w > widest {widest = w}
+					}
+				}
+				if count == 0 {break} // everything is already at the floor
+				step := max(1, over / f32(count))
+				for &w in nat {
+					if w > TAB_MIN_W {w = max(TAB_MIN_W, w - step)}
+				}
+			}
+		}
+	}
+
+	place :: proc(app: ^App, rects: []Tab_Rect, nat: []f32, limit, scroll: f32) -> (drawn: int) {
 		x := MENU_W - scroll
 		i := 0
 		for d, slot in app.docs {
 			if d == nil {continue}
-			w := TAB_W
+			w := nat[i]
 			fits := x + w <= limit
 			rects[i] = {slot = slot, x = x, w = w, close_x = x + w - TAB_CLOSE_W, drawn = fits}
 			if fits {
@@ -99,12 +167,12 @@ tabs_layout :: proc(app: ^App, win: ^plat.Window, width: f32, allocator := conte
 		}
 		return
 	}
-	drawn := place(app, rects, L.limit, app.tab_scroll)
+	drawn := place(app, rects, nat, L.limit, app.tab_scroll)
 	if drawn < n {
 		L.over_w = sx(52)
 		L.over_x = L.limit - L.over_w
 		L.over_on = true
-		drawn = place(app, rects, L.limit - L.over_w, app.tab_scroll)
+		drawn = place(app, rects, nat, L.limit - L.over_w, app.tab_scroll)
 	}
 	L.tabs = rects
 	L.hidden = n - drawn
@@ -120,6 +188,27 @@ tabs_layout :: proc(app: ^App, win: ^plat.Window, width: f32, allocator := conte
 	return
 }
 
+// Elide a label to `cells`, keeping BOTH ends.
+//
+// The tail is what identifies a file -- the extension, and whatever suffix
+// distinguishes it from its neighbours -- so an end-elided run of tabs can show
+// nothing but a shared prefix. Splits the budget with the larger half at the
+// front, since the front carries the name and the back carries the type.
+tab_elide :: proc(t: ^plat.Text, label: string, cells: int, allocator := context.temp_allocator) -> string {
+	b := transmute([]u8)label
+	if cells <= 1 || plat.text_cells(t, b, 0) <= cells {return label}
+	keep := cells - 1 // one cell for the ellipsis
+	if keep < 2 {return "…"}
+	head := (keep + 1) / 2
+	tail := keep - head
+	hb := plat.text_bytes_for_cells(t, b, head, 0)
+	// Walk back from the end for the tail: bytes_for_cells measures forward from
+	// a start, so the tail's start is found by asking for everything but it.
+	tb := plat.text_bytes_for_cells(t, b, plat.text_cells(t, b, 0) - tail, 0)
+	if tb < hb {return label}
+	return strings.concatenate({label[:hb], "…", label[tb:]}, allocator)
+}
+
 // The display index a pointer x falls on, for the reorder. Asks the layout
 // rather than dividing by a uniform width -- which is the whole reason the
 // layout exists.
@@ -133,18 +222,18 @@ tabs_index_at :: proc(L: Tabs_Layout, mx: f32) -> int {
 
 // Tabs that don't fit. Drawn as a count rather than silently dropped — with no
 // indicator there was nothing to say the other tabs existed at all.
-tabs_hidden_count :: proc(app: ^App, win: ^plat.Window, width: f32) -> int {
-	return tabs_layout(app, win, width).hidden
+tabs_hidden_count :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text, width: f32) -> int {
+	return tabs_layout(app, win, t, width).hidden
 }
 
 @(private = "file")
-tabs_right :: proc(app: ^App, win: ^plat.Window, width: f32) -> f32 {
+tabs_right :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text, width: f32) -> f32 {
 	// The sixth walker, and the least obvious: it feeds win.tabs_right, which
 	// WM_NCHITTEST uses to decide where dragging the WINDOW is allowed. It also
 	// ignored tab_scroll, so it was already approximate; with variable widths it
 	// would be wrong outright, and being wrong here means either a dead strip of
 	// rail or a tab you cannot click because the OS took the press as a drag.
-	L := tabs_layout(app, win, width)
+	L := tabs_layout(app, win, t, width)
 	right := MENU_W
 	for r in L.tabs {
 		if r.drawn {right = r.x + r.w + TAB_GAP}
@@ -155,14 +244,14 @@ tabs_right :: proc(app: ^App, win: ^plat.Window, width: f32) -> f32 {
 
 // Handle a click on the title bar during the input phase. Returns true (and
 // consumes the click) if it landed on the menu / a tab / the + button.
-tabs_hit_test :: proc(app: ^App, win: ^plat.Window) -> bool {
+tabs_hit_test :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) -> bool {
 	if !(win.mouse_pressed || win.mouse_middle_pressed) {return false}
 	if f32(win.mouse_y) >= TAB_STRIP_H {return false}
 	mx := f32(win.mouse_x)
 
 	consumed := true
 	// The SAME layout tabs_draw consumes -- that is the point of it existing.
-	L := tabs_layout(app, win, f32(win.width))
+	L := tabs_layout(app, win, t, f32(win.width))
 	if L.over_on && mx >= L.over_x && mx < L.over_x + L.over_w {
 		// The overflow count opens the palette's tab list, which can reach any
 		// tab regardless of whether the strip has room to show it.
@@ -209,7 +298,7 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window) -> bool {
 // Reorder the dragged tab as the pointer moves along the strip. Called each frame
 // while the drag is held. The tab bubbles past its neighbours (adjacent swaps),
 // so the active/highlighted tab follows the cursor — no floating render needed.
-tabs_drag_update :: proc(app: ^App, win: ^plat.Window) {
+tabs_drag_update :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) {
 	if f32(win.mouse_y) < 0 {return}
 	live := make([dynamic]int, 0, len(app.docs), context.temp_allocator)
 	for d, s in app.docs {
@@ -223,7 +312,7 @@ tabs_drag_update :: proc(app: ^App, win: ^plat.Window) {
 	// Target display index from the cursor x, ASKED of the layout the strip is
 	// drawn with. It used to divide by (TAB_W + TAB_GAP), which recovers an
 	// index only while every tab is the same width.
-	L := tabs_layout(app, win, f32(win.width))
+	L := tabs_layout(app, win, t, f32(win.width))
 	target := clamp(tabs_index_at(L, f32(win.mouse_x)), 0, len(live) - 1)
 	for di < target { // move right: swap with the next display neighbour
 		app_swap_tabs(app, live[di], live[di + 1])
@@ -251,7 +340,7 @@ caption_btn :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, x
 tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Text, app: ^App, win: ^plat.Window, width: f32) {
 	win.titlebar_h = i32(TAB_STRIP_H)
 	char_w := plat.text_char_width(text, UI_SMALL_PX)
-	win.tabs_right = i32(tabs_right(app, win, width))
+	win.tabs_right = i32(tabs_right(app, win, text, width))
 
 	cx, cy := plat.window_cursor_client(win)
 	in_bar := f32(cy) >= 0 && f32(cy) < TAB_STRIP_H
@@ -269,7 +358,7 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 	// Nothing past `limit` may be drawn: the caption buttons are non-client and
 	// WM_NCHITTEST claims that region first, so a tab drawn under them looks
 	// clickable but sends HT_CLOSE — one click and the app exits.
-	L := tabs_layout(app, win, width)
+	L := tabs_layout(app, win, text, width)
 	for r in L.tabs {
 		if !r.drawn {continue} // overflow; the count is drawn below
 		d := app.docs[r.slot]
@@ -278,14 +367,13 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 		active := slot == app.active
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {r.w, TAB_STRIP_H - sx(4)}, color = g_theme[.Border_Subtle] if active else g_theme[.Bg_Panel]}})
 
-		title := tab_title(d, context.temp_allocator)
-		tb := transmute([]u8)title
-		// Both col0 = 0: a tab title is a whole label drawn from its own x, and
-		// these two are the measure/inverse pair for that one label.
-		if plat.text_cells(text, tb, 0) > max_cells && max_cells > 1 {
-			cut := plat.text_bytes_for_cells(text, tb, max_cells - 1, 0)
-			title = strings.concatenate({title[:cut], "…"}, context.temp_allocator)
-		}
+		title := tab_label(app, d, context.temp_allocator)
+		// Elide the MIDDLE, not the end. `2026-07-27-batch-11-sync.md` truncated
+		// at the end becomes `2026-07-27-batch-…`, which loses the extension --
+		// the part that says what the file IS -- and leaves a run of tabs whose
+		// visible halves are identical. Keeping the tail keeps the extension and
+		// whatever distinguishes the name (UI spec 4.2).
+		title = tab_elide(text, title, max_cells, context.temp_allocator)
 		// Text_Secondary for the inactive label, NOT Text_Dim. Text_Dim is the
 		// disabled-only tier -- 2.9:1 in Dark, 2.8:1 in Light, below the AA floor
 		// by design, and theme.odin labels it "DISABLED ONLY -- never live text".
@@ -293,8 +381,19 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 		// carries the filename you are looking for. Reported by Wyatt as chrome
 		// text being hard to read in both themes; it measured as exactly that.
 		fg := g_theme[.Text_Primary] if active else g_theme[.Text_Secondary]
-		plat.text_draw(gfx, text, title, x + sx(8), base_y, UI_SMALL_PX, fg)
-		plat.text_draw(gfx, text, "×", x + r.w - sx(15), base_y, UI_SMALL_PX, g_theme[.Text_Secondary])
+		// The dirty marker, in the slot the layout reserved on every tab. Accent
+		// AND a glyph, not colour alone -- UI spec 18, 1.4.1.
+		if d.modified {
+			plat.text_draw(gfx, text, "*", x + TAB_PAD_L, base_y, UI_SMALL_PX, g_theme[.Accent])
+		}
+		plat.text_draw(gfx, text, title, x + TAB_PAD_L + TAB_DIRTY_W, base_y, UI_SMALL_PX, fg)
+		// The close button shows on the ACTIVE tab and on hover only, so a row of
+		// idle tabs is quiet (UI spec 4.2). Middle-click still closes any tab --
+		// that path is in the hit-test and does not depend on the glyph.
+		hot_tab := in_bar && f32(cx) >= r.x && f32(cx) < r.x + r.w
+		if active || hot_tab {
+			plat.text_draw(gfx, text, "×", r.close_x + sx(5), base_y, UI_SMALL_PX, g_theme[.Text_Secondary])
+		}
 	}
 
 	// Overflow count, clickable to reach the hidden tabs via the palette.
