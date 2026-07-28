@@ -342,7 +342,10 @@ begin
 end;
 
 { Mirrors install.ps1's PATH block. Done in code rather than a [Registry] entry
-  because {olddata} would append a duplicate on every reinstall, and because
+  because the olddata constant would append a duplicate on every reinstall
+  (written without braces on purpose: Pascal brace comments do NOT nest, so an
+  inner brace closes the comment early and the rest parses as code -- this
+  exact line failed the very first compile with "BEGIN expected"), and because
   uninsdeletevalue on HKCU\Environment\Path would delete the user's entire PATH
   at uninstall. }
 procedure AddDirToUserPath(const Dir: String);

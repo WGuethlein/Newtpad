@@ -106,7 +106,12 @@ $iscc = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
 if (-not $iscc) {
     foreach ($candidate in @(
         (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'),
-        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe')
+        (Join-Path $env:ProgramFiles 'Inno Setup 6\ISCC.exe'),
+        # winget installs Inno Setup PER-USER by default, not into Program Files.
+        # Checking only the two machine-wide paths meant the tool could be
+        # installed and the script would still report it missing and skip -- a
+        # silent skip that looks exactly like not having it at all.
+        (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')
     )) {
         if ((-not $iscc) -and $candidate -and (Test-Path $candidate)) { $iscc = $candidate }
     }
