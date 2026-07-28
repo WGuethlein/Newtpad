@@ -3278,11 +3278,27 @@ when NEWTPAD_TESTS {
 					// vacuously. If the gfx == nil branch in glyph_get is ever
 					// refactored so nothing gets probed, this mode has to go red,
 					// not report "0 failures" having measured nothing.
-					all_int := len(plat.text_probe_positions(&t)) > 0
-					for p in plat.text_probe_positions(&t) {
+					positions := plat.text_probe_positions(&t)
+					raws := plat.text_probe_raw(&t)
+					all_int := len(positions) > 0
+					for p in positions {
 						if p.x != math.trunc(p.x) || p.y != math.trunc(p.y) {all_int = false}
 					}
 					gs_chk(bad, all_int, fmt.tprintf("origin (%.3f, %.3f) -> integral glyph positions", origin.x, origin.y))
+
+					// The integrality check above cannot distinguish floor(v+0.5)
+					// (correct) from trunc(v+0.5) (the regression): both always
+					// produce whole numbers, they just sometimes disagree on WHICH
+					// whole number for a negative integral v, a 1px shift. Recompute
+					// the expected snap from the recorded pre-snap position here,
+					// independently of text.odin's own floor call, and check the
+					// actual relationship text_walk_glyphs is supposed to guarantee.
+					snap_ok := len(positions) > 0 && len(positions) == len(raws)
+					for p, i in positions {
+						want := [2]f32{math.floor(raws[i].x + 0.5), math.floor(raws[i].y + 0.5)}
+						if p.x != want.x || p.y != want.y {snap_ok = false}
+					}
+					gs_chk(bad, snap_ok, fmt.tprintf("origin (%.3f, %.3f) -> pos == floor(raw + 0.5)", origin.x, origin.y))
 				}
 			}
 			bad := 0

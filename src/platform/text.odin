@@ -219,10 +219,17 @@ Text_Probe :: struct {
 	armed: bool,
 	n:     int,
 	pos:   [256][2]f32,
+	// The pre-snap position for the same glyph at the same index, i.e.
+	// glyph_x + g.left / y + g.top before floor(v + 0.5) is applied. Recorded
+	// so a test can check pos == floor(raw + 0.5) -- the actual relationship
+	// -- rather than only that pos happens to be a whole number, which both
+	// floor(v+0.5) and the buggy trunc(v+0.5) satisfy for every v.
+	raw:   [256][2]f32,
 }
 
 text_probe_reset :: proc(t: ^Text) {t.probe.armed = true; t.probe.n = 0}
 text_probe_positions :: proc(t: ^Text) -> [][2]f32 {return t.probe.pos[:t.probe.n]}
+text_probe_raw :: proc(t: ^Text) -> [][2]f32 {return t.probe.raw[:t.probe.n]}
 
 @(private)
 TEXT_HLSL := `
@@ -784,9 +791,11 @@ text_walk_glyphs :: proc(
 			// over it. round(v + 0.5) is not a fix either: it is the same
 			// half-away-from-zero asymmetry under a different name. floor is
 			// the one call that is a true round for every v, negative or not.
-			pos := [2]f32{math.floor(glyph_x + f32(g.left) + 0.5), math.floor(y + f32(g.top) + 0.5)}
+			raw := [2]f32{glyph_x + f32(g.left), y + f32(g.top)}
+			pos := [2]f32{math.floor(raw.x + 0.5), math.floor(raw.y + 0.5)}
 			if t.probe.armed && t.probe.n < len(t.probe.pos) {
 				t.probe.pos[t.probe.n] = pos
+				t.probe.raw[t.probe.n] = raw
 				t.probe.n += 1
 			}
 			if instances != nil {
