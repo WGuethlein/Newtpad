@@ -20,10 +20,12 @@ A file that triggers it is worth more than a description of it.
 
 Each of these is a fix that *nearly shipped inverted*, or a path where the failure is silent.
 
-- [ ] **1.1 `Alt+F4` closes the window.**
+- [x] **1.1 `Alt+F4` closes the window.** — **CONFIRMED by Wyatt, 2026-07-27, on v0.19.0.**
   Adding F1-F12 to the key table silently broke this — the pump only let Alt+F4 reach Windows because
-  those keys previously resolved to nothing. Every switch still compiled and every test stayed green.
-  Also check **F10 alone** does not do something strange (Windows treats it as a menu key).
+  those keys previously resolved to nothing. Every switch still compiled and every test stayed green,
+  so this was the highest-risk item on the list and it is now the first one with real evidence behind
+  it rather than inference.
+  Still unchecked: **F10 alone** does not do something strange (Windows treats it as a menu key).
 
 - [ ] **1.2 A held key over a column rectangle, then ONE `Ctrl+Z`.**
   Alt+drag a rectangle ~20 rows tall, hold a character down for a second, release. **One** undo must
