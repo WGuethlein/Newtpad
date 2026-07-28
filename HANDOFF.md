@@ -3317,6 +3317,70 @@ text as the control — is that the command leaves the flag alone and posts a re
 - The batch-12 owed list (§6ah) is unchanged: nothing passes a radius yet, gamma-correct blending, and
   Monaspace embedding.
 
+## 6aj. The shell (2026-07-29, v0.22.0, branch `feat/batch-13-shell`)
+
+Batch 13 of the UI overhaul: the tab rail, the focus ring, caption geometry and the window floor.
+Spec: `docs/superpowers/specs/2026-07-29-batch-13-shell-design.md`.
+
+**Motion is dropped deliberately, and the reason is in the spec so it is not re-added by someone
+reading §18.** 50ms fades mean waking the message loop per hover, which trades away the idle-cost-zero
+property CLAUDE.md and §19 both state outright. For a notepad whose whole pitch is instant, it is the
+least valuable thing in the specification and the only one that costs an architectural property.
+
+### Six walkers, agreeing by coincidence
+
+The rail had **six** places computing their own `x` from `MENU_W - tab_scroll` and stepping by
+`TAB_W`. They agreed because the width was a constant. Two were already wrong in ways that hid:
+
+- `tabs_drag_update` recovered a tab index with `int(rel / (TAB_W + TAB_GAP))` — meaningless the moment
+  widths differ.
+- `tabs_right` ignored `tab_scroll` entirely, **and it feeds the non-client hit-test that decides where
+  the window can be dragged.** Wrong there is either a dead strip of rail or a tab you cannot click
+  because the OS took the press as a window drag.
+
+`tabs_layout` is now the one geometry. The extraction landed first, with widths still fixed, so
+anything that moved on screen was a bug; variable width came second, on top of it.
+
+### What the audit corrected about the spec — and about me
+
+- **§4.2's dirty marker existed**, as a `*` prepended to the label in `tab_title`. I told Wyatt it did
+  not exist at all; that was wrong, and the correction matters because prepending is *precisely* what
+  §4.2 says not to do — it moves the truncation point the moment a file is modified. It is now a mark
+  in a slot reserved on every tab whether occupied or not.
+- **End-elision was losing the extension.** Middle elision keeps both ends, and sabotage shows why
+  directly: two different files both render as `2026-07-27-batch-…`.
+
+### Two places the specification was not followed, both deliberate
+
+- **The focus ring is four edge quads, not one annular SDF instance.** §18 asks for the latter; the
+  pipeline resolves a *filled* rounded box and has no annular term, and adding one changes every quad's
+  shader for a shape a handful of widgets use. Recorded rather than silently substituted — swap it if
+  the ring ever needs a radius that reads.
+- **The `×` in the close button and the `>_` are still glyphs**, while minimise/maximise/close became
+  geometry. The caption buttons had to change because they sit in the non-client strip and had to
+  follow §2.1's sizing; the rest can wait for a reason.
+
+### What this batch got wrong
+
+**The first sabotage passed.** Reintroducing the uniform-width division in the seam test did not fail,
+because with fixed widths the old arithmetic still agrees — the test was vacuous for the check that
+mattered most. Rather than record it as covered, `tabseamtest` gained a hand-built *non-uniform*
+layout where sabotage does fail. That case then failed immediately, and it was the **test's** arithmetic
+that was wrong, not the code (a tab at `x=100, w=132` ends at 231, not 232).
+
+The focus-ring test also failed for the wrong reason first: `g_theme` is filled at startup by the
+product and is all-zero in a headless mode, so "is the ring drawn" answered no because every role was
+transparent black.
+
+### Owed
+
+- **Nothing enforces the §5 drop order above the floor.** `WM_GETMINMAXINFO` stops the overlap, but
+  status cells, the `+` and the menu bar do not yet drop in order as the window narrows — they simply
+  stop being drawn when they no longer fit.
+- **The rail does not scroll to follow the active tab** when it is off-screen; the overflow count opens
+  the palette instead, which reaches it but does not show it in place.
+- **No live pass.** Pills, the ring, the caption geometry and the elision are all unverified on screen.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -3340,7 +3404,7 @@ text as the control — is that the command leaves the flag alone and posts a re
   - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
     `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `tablereadonlytest`,
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
-    `quadsdftest`, `scrollgrabtest`
+    `quadsdftest`, `scrollgrabtest`, `tabseamtest`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest <file>`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest <dir>`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
