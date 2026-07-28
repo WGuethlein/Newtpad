@@ -14639,6 +14639,89 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad crashurltest` -- the prefilled GitHub issue URL the crash
+		// dialog's "report it" button opens (platform/crash.odin).
+		//
+		// The property under test is a privacy one and it is absolute: the URL
+		// must carry the version, the OS build and the exception, and NOTHING
+		// else. A crash while editing resignation-letter.txt must not put that
+		// filename -- or the crash report's own path, which contains the user's
+		// account name -- into a public issue. Asserting "the path is absent" is
+		// weak on its own, so this also asserts the shape: printable ASCII, one
+		// colon, no separators, nothing that could be a path at all.
+		if os.args[1] == "crashurltest" {
+			cu_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			cu_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				// A path with the shape of a real one: a user name and a document
+				// name that must never appear in the output.
+				SECRET_DIR :: "C:\\Users\\Wyatt\\AppData\\Roaming\\Newtpad\\crashes"
+				plat.crash_install(SECRET_DIR, "0.19.0", nil)
+
+				buf: [1024]u8
+				CODE :: u32(0xC000_0005)
+				ADDR :: uintptr(0x7FF7_232E_A746)
+				url := plat.crash_issue_url(CODE, ADDR, buf[:])
+				fmt.printfln("  url (%d bytes): %s", len(url), url)
+
+				chk(bad, url != "", "a URL was built")
+				chk(bad, strings.has_prefix(url, plat.CRASH_ISSUE_BASE + "?"), "it is the issues/new endpoint and nothing else")
+				chk(bad, plat.url_is_openable(url), "it passes the shell's scheme whitelist")
+
+				// What it must carry.
+				chk(bad, strings.contains(url, "ACCESS_VIOLATION"), "the exception is named")
+				chk(bad, strings.contains(url, "c0000005"), "the exception code is present")
+				chk(bad, strings.contains(url, "7ff7232ea746"), "the fault address is present")
+				chk(bad, strings.contains(url, "0.19.0"), "the product version is present")
+				chk(bad, strings.contains(url, "build%20"), "the OS build is present")
+
+				// What it must NOT carry. The directory handed to crash_install is
+				// the closest thing the filter has to user data, and it is not an
+				// argument to crash_issue_url at all.
+				chk(bad, !strings.contains(url, SECRET_DIR), "the crash directory is absent")
+				chk(bad, !strings.contains(url, "Wyatt"), "the account name is absent")
+				chk(bad, !strings.contains(url, "AppData"), "no part of the path leaked")
+				chk(bad, !strings.contains(url, ".txt") && !strings.contains(url, ".dmp"), "neither report file is named")
+				chk(bad, !strings.contains(url, "\\"), "no backslash anywhere")
+
+				// Shape: printable ASCII only, and exactly one colon -- the one in
+				// "https:". Anything path-like would have brought a second.
+				printable, colons := true, 0
+				for i in 0 ..< len(url) {
+					c := url[i]
+					if c < 0x21 || c > 0x7E {printable = false}
+					if c == ':' {colons += 1}
+				}
+				chk(bad, printable, "every byte is printable ASCII with no spaces")
+				chk(bad, colons == 1, fmt.tprintf("exactly one colon (the scheme): %d", colons))
+
+				// A version string that is not a version must not reach the URL
+				// intact. Nothing passes one today; the point is that the builder
+				// does not depend on that staying true.
+				plat.crash_install(SECRET_DIR, "0.1 & <script>alert()</script>", nil)
+				b2: [1024]u8
+				u2 := plat.crash_issue_url(CODE, ADDR, b2[:])
+				fmt.printfln("  hostile version -> %s", u2[min(len(u2), 60):min(len(u2), 130)])
+				chk(bad, !strings.contains(u2, "<") && !strings.contains(u2, ">") && !strings.contains(u2, "&script"), "a hostile version is reduced, not escaped")
+				chk(bad, !strings.contains(u2, " "), "no raw space survived the sanitizer")
+				chk(bad, strings.contains(u2, "Newtpad%200.1script"), "the version was REPLACED, not appended to the previous one")
+
+				// Too small a buffer must refuse rather than emit a truncated URL
+				// that means something different from what it says.
+				small: [64]u8
+				chk(bad, plat.crash_issue_url(CODE, ADDR, small[:]) == "", "a buffer that cannot hold it yields no URL")
+			}
+
+			bad := 0
+			base.log_init(.Warn)
+			cu_cases(&bad, cu_chk)
+			fmt.printfln("crashurltest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad updatetest` -- the update check's pure half (update.odin).
 		//
 		// No socket anywhere in here. http_get is the only part that needs one and
