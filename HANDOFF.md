@@ -3457,6 +3457,51 @@ comment is not one.
 - **§11's page margins and row padding** are untouched; only the selected-row treatment changed.
 - **No live pass.**
 
+## 6al. Find, replace and filter (2026-07-29, v0.24.0, branch `feat/batch-15-find`)
+
+Batch 15: UI spec §12. Decisions taken with Wyatt — move the bar to the top rather than fixing its
+content in place, build the two missing search modes, and fold the filter band into `Accent_Wash`.
+
+### The bar was hiding the status line
+
+Find and the status line shared the bottom strip through **one `if/else`**, so opening find removed the
+file's encoding, line endings and cursor position from the window entirely. They are independent now.
+`doc_bottom_bar_h` answered two different questions depending on state; it answers one.
+
+**`TOP_INSET` is deliberately a single value.** The filter banner and the find bar both inset the
+content, and `row_baseline_y`, `row_rect_y`, `row_at_y`, `doc_visible_rows`, the markdown panes and the
+table all measure from it. Two addends is how a hit-test ends up one bar out of step with the draw —
+the §6j shape, on the one change most able to produce it.
+
+### Moving the bar moved a hazard with it
+
+The bottom strip has always swallowed a fresh press, because `doc_pos_at` clamps an out-of-range row
+onto the last visible one. The **top had no such guard**, and `row_at_y` goes *negative* above the
+content — so a click in the search field would have clamped to row 0 and silently moved the caret. The
+guard moved with the bar. It swallows only a fresh press, leaving an in-progress selection drag to keep
+auto-scrolling, for the same reason the bottom one does.
+
+### Two search modes that did not exist
+
+Search was **always case-folded**, with no way to ask for exact case, and there was **no whole-word mode
+at all** — so §12's "three toggles, always visible" was showing one. Both are in the literal scan now.
+
+Whole-word carries **one byte across block boundaries** rather than re-reading: the scan's buffer
+overlaps *forward* by `len(q)-1` so a match spanning a boundary is found, but the character *before* a
+match at a block's first byte lives in the previous block. Underscore counts as a word character, which
+is what stops `cat` matching inside `cat_x` — and is precisely what a naive alphanumeric test lets
+through. That is the case the test pins.
+
+### Owed
+
+- **Regex ignores both new modes.** `scan_regex` builds its own pattern and has no case or word
+  handling; the toggles are literal-scan only. Nothing says so in the UI yet.
+- **Invalid regex is still not reported inline** (§12: the field's ring goes `danger` and the reason
+  replaces the count). The count colours red on zero results, which is not the same thing.
+- **The toggles are not clickable** — Alt+C / Alt+W / Ctrl+R only. They are drawn as chips, so they
+  look clickable, which is worse than not drawing them.
+- **No live pass.**
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
