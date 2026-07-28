@@ -4,6 +4,7 @@
 package platform
 
 import "core:fmt"
+import "core:math"
 import win "core:sys/windows"
 import d3d "vendor:directx/d3d11"
 import dxgi "vendor:directx/dxgi"
@@ -322,7 +323,20 @@ gfx_begin_frame :: proc(gfx: ^Gfx, r, g, b: f32) {
 	// Nothing may be issued against a dead device, and rtv is nil when the target
 	// could not be created — binding it would render into nothing at best.
 	if gfx.lost || gfx.rtv == nil {return}
-	color := [4]f32{r, g, b, 1}
+	// Linearised, because ClearRenderTargetView on an sRGB-typed view treats the
+	// colour it is given as LINEAR and encodes it on write -- exactly as a shader
+	// return value is treated. The caller hands us an sRGB value (a theme file
+	// says #221F1C), so passing it through raw brightens the whole canvas by a
+	// full gamma stop.
+	//
+	// That shipped in v0.26.0 and Wyatt's word for it was "all washed out". The
+	// shaders were converted and the CLEAR was not, which is the failure mode of
+	// changing a pipeline's colour space: every producer has to move, and the one
+	// that is not a shader is the one you forget.
+	srgb_lin :: proc(c: f32) -> f32 {
+		return c / 12.92 if c <= 0.04045 else math.pow((c + 0.055) / 1.055, 2.4)
+	}
+	color := [4]f32{srgb_lin(r), srgb_lin(g), srgb_lin(b), 1}
 	viewport := d3d.VIEWPORT{0, 0, f32(gfx.width), f32(gfx.height), 0, 1}
 
 	gfx.ctx->OMSetRenderTargets(1, &gfx.rtv, nil)
