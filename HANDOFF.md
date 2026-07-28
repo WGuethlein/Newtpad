@@ -37,6 +37,10 @@ worth reading before trusting any other "X is missing" claim in this file.
 **The installed binary is still v0.16.0.** Batch 7 merged under Wyatt's overnight policy: merge, do
 not `install.ps1`. Run it after the live pass in §6ab's "Owed".
 
+**Live-pass checklist for everything since v0.16.0:
+[docs/live-pass-batches-7-11.md](docs/live-pass-batches-7-11.md).** Five batches, ~120 commits, none
+of it verified against real GUI input. Section 1 is the six that would be worst to ship broken.
+
 **Batch 11 is merged; v0.20.0 — ship-readiness, the last batch before the beta.** Check for Updates,
 a crash-report path, LICENSE (PolyForm Internal Use 1.0.0), and an Inno Setup installer. §6af ends
 with the **beta checklist**: what is buildable, and what is Wyatt's. Two items there block a beta —
