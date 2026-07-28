@@ -3285,6 +3285,30 @@ disabled control; it is a document you can click, carrying the filename you are 
 The decorative `Text_Dim` uses were left alone (scroll-hint arrows, markdown bullets and the quote
 bar) — batch 14 re-picks those against new layouts.
 
+### "it wasn't toggling in the viewport" (v0.21.2)
+
+Reported as everything word-wrapping with no horizontal scrollbar, then withdrawn as unreproducible
+with the detail that mattered: Alt+Z was not taking effect until the files were closed and reopened.
+
+**Most likely not a defect in what it did, but in what it said.** Wyatt's `settings.txt` carries
+`md_default 1` — `.Preview` — so every `.md` file opens rendered. In that view `hscroll_model` returns
+early (a preview has no horizontal axis), `markdown_draw` lays out to the pane, and nothing reads
+`doc.wrap`. All three symptoms, all designed.
+
+What was **not** designed: `.Toggle_Wrap` flipped `doc.wrap` unconditionally in three views that
+ignore it — the grid, Preview and Split — so the key did nothing, silently, with no way to tell that
+from a broken build. It now refuses and names the key that leaves the view, matching block.odin's
+`Wrap_On`/`Split_On` refusals. Refusing rather than flipping quietly is the point: a flip you cannot
+see leaves the setting somewhere you did not choose, and you find out later in a different file.
+
+**The diagnosis is unconfirmed and the hole is worth recording**: the status bar reads
+`Markdown Preview (Ctrl+M)` throughout, so it should have said so the whole time. If a later report
+describes the same symptoms on a plain `.txt`, this fix is not the cause and the search starts again.
+
+**And this class is not reachable from here.** This environment cannot press Alt+Z, so "the key did
+nothing visible" is invisible to every headless test. What is checkable — and now checked, with plain
+text as the control — is that the command leaves the flag alone and posts a reason.
+
 ### Owed
 
 - **`Text_Dim` misuse has no guard.** Nothing stops the next widget reaching for it; the roles carry
