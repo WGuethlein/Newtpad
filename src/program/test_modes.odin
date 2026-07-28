@@ -8555,6 +8555,101 @@ when NEWTPAD_TESTS {
 				}
 			}
 
+			// Colourblind separation, simulated.
+			//
+			// Wyatt is orange/green colourblind and the first version of this
+			// palette was unusable for him: "it's like there's not enough of a
+			// difference between the text and comments and strings". Measured,
+			// body text and strings sat at dE 6.4 under simulation and strings
+			// and numbers at 12.8 -- the exact pair he named, both far below what
+			// a person can separate.
+			//
+			// Vienot-Brettel-Mollon 1999: project LINEAR rgb through the
+			// dichromat matrix, then compare in CIE Lab. Deuteranopia
+			// (green-blind) and protanopia (red-blind) are both simulated and the
+			// WORSE of the two is the score, because a palette safe for one and
+			// not the other is not safe.
+			//
+			// Only pairs that actually sit next to each other in code are checked.
+			// "Every pair must differ" is unachievable under a deficiency that
+			// flattens the palette onto two dimensions, and chasing it produces
+			// exactly the garish result Wyatt asked to avoid.
+			{
+				cvd_lin :: proc(v: f32) -> f64 {
+					x := f64(v)
+					return x / 12.92 if x <= 0.04045 else math.pow((x + 0.055) / 1.055, 2.4)
+				}
+				cvd_enc :: proc(v: f64) -> f32 {
+					x := clamp(v, 0, 1)
+					return f32(x * 12.92) if x <= 0.0031308 else f32(1.055 * math.pow(x, 1.0 / 2.4) - 0.055)
+				}
+				cvd_sim :: proc(c: [4]f32, m: [3][3]f64) -> [4]f32 {
+					l := [3]f64{cvd_lin(c[0]), cvd_lin(c[1]), cvd_lin(c[2])}
+					out: [4]f32 = {0, 0, 0, 1}
+					for i in 0 ..< 3 {out[i] = cvd_enc(m[i][0] * l[0] + m[i][1] * l[1] + m[i][2] * l[2])}
+					return out
+				}
+				cvd_f :: proc(t: f64) -> f64 {
+					return math.pow(t, 1.0 / 3.0) if t > 0.008856 else 7.787 * t + 16.0 / 116.0
+				}
+				to_lab :: proc(c: [4]f32) -> [3]f64 {
+					r, g, b := cvd_lin(c[0]), cvd_lin(c[1]), cvd_lin(c[2])
+					X := (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047
+					Y := 0.2126 * r + 0.7152 * g + 0.0722 * b
+					Z := (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883
+					fx, fy, fz := cvd_f(X), cvd_f(Y), cvd_f(Z)
+					return {116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)}
+				}
+				sep :: proc(a, b: [4]f32) -> f64 {
+					DEUT := [3][3]f64{{0.29275, 0.70725, 0}, {0.29275, 0.70725, 0}, {-0.02234, 0.02234, 1}}
+					PROT := [3][3]f64{{0.11238, 0.88762, 0}, {0.11238, 0.88762, 0}, {0.00401, -0.00401, 1}}
+					worst := f64(1e9)
+					for m in ([][3][3]f64{DEUT, PROT}) {
+						la, lb := to_lab(cvd_sim(a, m)), to_lab(cvd_sim(b, m))
+						d0, d1, d2 := la[0] - lb[0], la[1] - lb[1], la[2] - lb[2]
+						d := math.sqrt(d0 * d0 + d1 * d1 + d2 * d2)
+						if d < worst {worst = d}
+					}
+					return worst
+				}
+				// A regression bar, not a target. Dark scores 15.5 and Light 11.0;
+				// the floor has to be reachable by Light, which has less lightness
+				// headroom for dark text. The job is to stop the next retune
+				// sliding back to 6, not to freeze today's numbers.
+				FLOOR :: 10.0
+				adj := []struct {
+					a, b: Color_Role,
+				} {
+					{.Text_Primary, .Syn_String},
+					{.Text_Primary, .Syn_Comment},
+					{.Text_Primary, .Syn_Number},
+					{.Text_Primary, .Syn_Punct},
+					{.Syn_String, .Syn_Comment},
+					{.Syn_String, .Syn_Number},
+					{.Syn_String, .Syn_Type},
+					{.Syn_String, .Syn_Keyword},
+					{.Syn_Json_Key, .Syn_String},
+					{.Syn_Keyword, .Syn_Type},
+					{.Syn_Comment, .Syn_Punct},
+					{.Syn_Number, .Syn_Comment},
+				}
+				cvl := theme_light()
+				for th, ti in ([]Theme{d, cvl}) {
+					name := "Dark " if ti == 0 else "Light"
+					worst, wa, wb := f64(1e9), Color_Role.Text_Primary, Color_Role.Text_Primary
+					for pr in adj {
+						v := sep(th[pr.a], th[pr.b])
+						if v < worst {worst, wa, wb = v, pr.a, pr.b}
+					}
+					ok := worst >= FLOOR
+					if !ok {fail = true}
+					fmt.printfln(
+						"  %-6s %s colourblind separation: worst adjacent pair %v/%v at dE %.1f (need %.0f)",
+						"ok" if ok else "FAIL", name, wa, wb, worst, FLOOR,
+					)
+				}
+			}
+
 			// WCAG contrast on the six pairs spec 17 names -- "those cover every
 			// place text sits on a themeable fill" -- plus the scrollbar thumb at the
 			// 3:1 non-text floor.

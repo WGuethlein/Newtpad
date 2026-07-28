@@ -539,7 +539,7 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 		}
 		plat.text_draw(gfx, t, command_table[it.cmd].title, x0 + sx(28), ty, UI_PX, g_theme[.Text_Primary] if on else g_theme[.Text_Muted])
 		if chord := command_chord(it.cmd); chord != "" {
-			plat.text_draw(gfx, t, chord, x0 + dw - sx(12) - f32(len(chord)) * cw, ty, UI_PX, g_theme[.Text_Dim] if on else g_theme[.Text_Muted])
+			plat.text_draw(gfx, t, chord, x0 + dw - sx(12) - f32(len(chord)) * cw, ty, UI_PX, g_theme[.Text_Muted] if on else g_theme[.Text_Muted])
 		}
 		y += MENU_ITEM_H
 	}

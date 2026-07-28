@@ -338,15 +338,15 @@ theme_dark :: proc() -> Theme {
 		// green in the dark mode"), at 4.7:1, still above the AA floor so
 		// comments stay readable rather than merely present.
 		// Syn_Punct is likewise kept clear of Text_Primary.
-		.Syn_Keyword     = {0.827, 0.663, 0.804, 1}, // #D3A9CD  7.4  mauve -- language words
-		.Syn_String      = {0.616, 0.788, 0.627, 1}, // #9DC9A0  8.6  green -- literal content
-		.Syn_Number      = {0.898, 0.710, 0.498, 1}, // #E5B57F  8.4  amber -- numbers, true/false/null
-		.Syn_Comment     = {0.455, 0.565, 0.478, 1}, // #74907A  4.7  muted green -- see the note above
-		.Syn_Type        = {0.592, 0.765, 0.847, 1}, // #97C3D8  8.2  blue -- types, tags, references
-		.Syn_Punct       = {0.651, 0.608, 0.545, 1}, // #A69B8B  5.6  braces, pipes, commas
+		.Syn_Keyword     = {0.820, 0.576, 0.820, 1}, // #D193D1  6.9  violet -- language words
+		.Syn_String      = {0.404, 0.635, 0.635, 1}, // #67A2A2  5.7  teal -- literal content
+		.Syn_Number      = {0.894, 0.714, 0.490, 1}, // #E4B67D  8.8  amber -- numbers, true/false/null
+		.Syn_Comment     = {0.369, 0.561, 0.337, 1}, // #5E8F56  4.3  green, dim -- see the note above
+		.Syn_Type        = {0.408, 0.529, 0.910, 1}, // #6887E8  4.9  blue -- types, tags, references
+		.Syn_Punct       = {0.533, 0.506, 0.463, 1}, // #888176  4.2  braces, pipes, commas
 		.Syn_Json_Key    = {0.937, 0.906, 0.859, 1}, // #EFE7DB  12.7 keys are the index you scan: brightest
-		.Syn_Xml_Tag     = {0.827, 0.663, 0.804, 1}, // #D3A9CD  tags are keywords
-		.Syn_Xml_Attr    = {0.898, 0.710, 0.498, 1}, // #E5B57F
+		.Syn_Xml_Tag     = {0.820, 0.576, 0.820, 1}, // #D193D1  tags are keywords
+		.Syn_Xml_Attr    = {0.894, 0.714, 0.490, 1}, // #E4B67D
 	}
 }
 
@@ -449,15 +449,15 @@ theme_light :: proc() -> Theme {
 		// and themetest asserts the separation. The old note here said Light
 		// "deliberately placed those two close together"; that is no longer
 		// true, and the assertion now applies to both themes equally.
-		.Syn_Keyword     = {0.478, 0.247, 0.467, 1}, // #7A3F77  6.8  mauve
-		.Syn_String      = {0.184, 0.420, 0.278, 1}, // #2F6B47  5.9  green
-		.Syn_Number      = {0.541, 0.329, 0.086, 1}, // #8A5416  6.1  amber
-		.Syn_Comment     = {0.275, 0.376, 0.247, 1}, // #46603F  6.6  sage -- separated from Text_Muted
-		.Syn_Type        = {0.122, 0.373, 0.471, 1}, // #1F5F78  6.4  blue
-		.Syn_Punct       = {0.373, 0.341, 0.302, 1}, // #5F574D  7.2
+		.Syn_Keyword     = {0.494, 0.306, 0.494, 1}, // #7E4E7E  6.0  violet
+		.Syn_String      = {0.231, 0.408, 0.408, 1}, // #3B6868  5.9  teal
+		.Syn_Number      = {0.565, 0.416, 0.231, 1}, // #906A3B  4.6  amber
+		.Syn_Comment     = {0.227, 0.325, 0.212, 1}, // #3A5336  8.0  green, dim
+		.Syn_Type        = {0.275, 0.353, 0.600, 1}, // #465A99  6.2  blue
+		.Syn_Punct       = {0.416, 0.388, 0.349, 1}, // #6A6359  5.6
 		.Syn_Json_Key    = {0.173, 0.149, 0.125, 1}, // #2C2620  13.6 keys are the index you scan: darkest
-		.Syn_Xml_Tag     = {0.478, 0.247, 0.467, 1}, // #7A3F77
-		.Syn_Xml_Attr    = {0.541, 0.329, 0.086, 1}, // #8A5416
+		.Syn_Xml_Tag     = {0.494, 0.306, 0.494, 1}, // #7E4E7E
+		.Syn_Xml_Attr    = {0.565, 0.416, 0.231, 1}, // #906A3B
 	}
 }
 

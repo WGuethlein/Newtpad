@@ -312,7 +312,7 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 			// learn the keymap, and it was showing title + category only.
 			if chord := command_chord(r.cmd); chord != "" {
 				cw := plat.text_char_width(text, UI_SMALL_PX)
-				plat.text_draw(gfx, text, chord, x0 + PW - sx(16) - f32(len(chord)) * cw, ry + sx(17), UI_SMALL_PX, g_theme[.Text_Dim])
+				plat.text_draw(gfx, text, chord, x0 + PW - sx(16) - f32(len(chord)) * cw, ry + sx(17), UI_SMALL_PX, g_theme[.Text_Muted])
 			}
 		} else if r.slot >= 0 && r.slot < len(app.docs) && app.docs[r.slot] != nil {
 			plat.text_draw(gfx, text, doc_display_name(app.docs[r.slot]), x0 + sx(16), ry + sx(17), UI_PX, fg)

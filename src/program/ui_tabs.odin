@@ -212,9 +212,15 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 			cut := plat.text_bytes_for_cells(text, tb, max_cells - 1, 0)
 			title = strings.concatenate({title[:cut], "…"}, context.temp_allocator)
 		}
-		fg := g_theme[.Text_Primary] if active else g_theme[.Text_Dim]
+		// Text_Secondary for the inactive label, NOT Text_Dim. Text_Dim is the
+		// disabled-only tier -- 2.9:1 in Dark, 2.8:1 in Light, below the AA floor
+		// by design, and theme.odin labels it "DISABLED ONLY -- never live text".
+		// An inactive tab is not disabled: it is a document you can click, and it
+		// carries the filename you are looking for. Reported by Wyatt as chrome
+		// text being hard to read in both themes; it measured as exactly that.
+		fg := g_theme[.Text_Primary] if active else g_theme[.Text_Secondary]
 		plat.text_draw(gfx, text, title, x + sx(8), base_y, UI_SMALL_PX, fg)
-		plat.text_draw(gfx, text, "×", x + TAB_W - sx(15), base_y, UI_SMALL_PX, g_theme[.Text_Dim])
+		plat.text_draw(gfx, text, "×", x + TAB_W - sx(15), base_y, UI_SMALL_PX, g_theme[.Text_Secondary])
 		x += TAB_W + TAB_GAP
 	}
 
