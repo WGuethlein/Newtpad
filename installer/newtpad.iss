@@ -14,7 +14,7 @@
 ;
 ; Build it with build-installer.ps1 -- do not invoke ISCC by hand. The script
 ; supplies the version, checks the extension list against text_exts.txt, and
-; re-encodes LICENSE.txt so the licence page is not mojibake (see LicenseFile).
+; re-encodes LICENSE.txt so the license page is not mojibake (see LicenseFile).
 ;
 ; Requires Inno Setup 6. Not compiled or run on the authoring machine: Inno
 ; Setup is deliberately not installed there.
@@ -24,7 +24,7 @@
   #pragma message "newtpad.iss: no /DMyAppVersion given -- defaulting to 0.0.0. Build with build-installer.ps1."
 #endif
 
-; The licence page and the copy installed next to the exe. Inno reads a
+; The license page and the copy installed next to the exe. Inno reads a
 ; plain-text LicenseFile as ANSI unless it carries a UTF-8 BOM, and
 ; LICENSE.txt is BOM-less UTF-8 containing em dashes -- pointed at directly it
 ; renders as "a-EUR-quote" garbage on the first page a stranger ever sees.

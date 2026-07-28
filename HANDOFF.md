@@ -40,7 +40,7 @@ not `install.ps1`. Run it after the live pass in §6ab's "Owed".
 **Batch 11 is merged; v0.20.0 — ship-readiness, the last batch before the beta.** Check for Updates,
 a crash-report path, LICENSE (PolyForm Internal Use 1.0.0), and an Inno Setup installer. §6af ends
 with the **beta checklist**: what is buildable, and what is Wyatt's. Two items there block a beta —
-the licence grants a hobbyist tester nothing, and the installer has never been compiled.
+the license grants a hobbyist tester nothing, and the installer has never been compiled.
 
 **Batch 10 is merged; v0.19.0 — the last feature batch before the beta.** Sort lines, remove
 duplicate lines, and `rules.txt` keyword colouring. §6ae's "what it got wrong" is the useful half:
@@ -2387,7 +2387,7 @@ misread the state.
    research wins — shipping is what produces the use cases the rewrite is supposed to be informed
    by. It is also the difference between V1 being four batches away and ten.
 2. **A free public beta precedes the paid V1.** "V1" is therefore two milestones, and the commerce
-   work (trial, offline licence key, storefront) sits *after* the beta rather than before it.
+   work (trial, offline license key, storefront) sits *after* the beta rather than before it.
 3. **Rebindable keys are in V1.** Named in CLAUDE.md principle 4; the hard half — the data-declared
    `[Command_Id]Command` table with its `#assert` — has existed since the tabs batch. Only the user
    overlay is missing.
@@ -2406,7 +2406,7 @@ misread the state.
 | **10** | Text operations | Sort lines / remove duplicates · keyword→colour rules · whatever live use has surfaced by then |
 | **11** | Distribution | Real self-contained installer · signing pipeline built signing-*ready* · updater · LICENSE/EULA · a way for a beta tester to send a crash |
 | — | **BETA** | Landing page, download, publish the price early and hold it (File Pilot precedent) |
-| **12** | Commerce | Trial · offline licence key · storefront — informed by beta feedback |
+| **12** | Commerce | Trial · offline license key · storefront — informed by beta feedback |
 | — | **V1** | |
 
 Batches 9 and 10 are one body of work split on a guess; the split is provisional and belongs to
@@ -2927,10 +2927,10 @@ the folder, offer a prefilled issue**, nothing sent automatically. **No beta exp
 per `research/newtpad-research-report.md:117`, which also removes the worst failure mode: a time bomb
 that bricks every tester's editor if V1 slips.
 
-**The licence went round twice, and the second answer is the one to keep.** A hand-drafted EULA was
-written, and Wyatt's call was that a bespoke AI-written licence is the wrong artifact when standard
+**The license went round twice, and the second answer is the one to keep.** A hand-drafted EULA was
+written, and Wyatt's call was that a bespoke AI-written license is the wrong artifact when standard
 lawyer-drafted ones exist. It was dropped unpushed. Reading the actual PolyForm texts rather than
-trusting memory then showed that **no single standard licence covers all four constraints** — usable
+trusting memory then showed that **no single standard license covers all four constraints** — usable
 at work, usable by hobbyists, plugins permitted, no redistribution:
 
 | | commercial | hobby | new works | no redistribution |
@@ -2982,7 +2982,7 @@ Newtpad first, and never `-Force`."
 
 ### Deliberately carried
 
-- **The licence grants a hobbyist tester nothing.** PolyForm Internal Use's only permitted purpose is
+- **The license grants a hobbyist tester nothing.** PolyForm Internal Use's only permitted purpose is
   *internal business operations*, and it is the installer's first page. Accepted knowingly as the
   cheapest of the four holes — but the beta audience is substantially hobbyists, so **this needs
   Wyatt's decision before the beta is announced, not after.** The standard fix is dual-licensing with
@@ -3008,13 +3008,13 @@ invocation.
 
 **Not verified, and this is the batch where it matters most: the installer has never been compiled.**
 Inno Setup is deliberately absent from this machine. `newtpad.iss` has never been run, and neither
-has install, `/SILENT`, upgrade, upgrade-over-running, uninstall, the PATH code, the licence page, or
+has install, `/SILENT`, upgrade, upgrade-over-running, uninstall, the PATH code, the license page, or
 the graceful-close path — **which is the single most important thing in the batch and the one whose
 failure loses work.** Wyatt installing it on a real machine is the test.
 
 ### Owed — and this is now the beta checklist
 
-**Wyatt's, and blocking a beta:** decide the hobbyist licence hole; buy a code-signing certificate
+**Wyatt's, and blocking a beta:** decide the hobbyist license hole; buy a code-signing certificate
 (the pipeline is stubbed and ready; note `research/newtpad-research-report.md:116` — signing barely
 helps SmartScreen for an unknown publisher, so budget reputation time, not just money); a storefront
 and a landing page; and the two live passes — §6x's theme tuning, and a real pass over batches 7-11,

@@ -16,8 +16,8 @@ https://odin-lang.org
 BSD-3-Clause. Copyright (c) 2016-2024 Ginger Bill. All rights reserved.
 
 Used: the `core` collection (including `core:text/regex`) and
-`vendor:directx/d3d11`. Odin's own copyright and licence terms apply to those
-portions. The full licence text ships with the Odin distribution as LICENSE.
+`vendor:directx/d3d11`. Odin's own copyright and license terms apply to those
+portions. The full license text ships with the Odin distribution as LICENSE.
 
 --------------------------------------------------------------------------------
 Microsoft Windows APIs
@@ -28,7 +28,7 @@ redistributed.
 
 The DirectWrite and WinHTTP bindings in this project (src/platform/dwrite.odin,
 src/platform/http.odin) are hand-written declarations of the public API,
-authored for Newtpad and covered by Newtpad's own licence.
+authored for Newtpad and covered by Newtpad's own license.
 
 --------------------------------------------------------------------------------
 Fonts

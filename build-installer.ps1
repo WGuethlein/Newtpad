@@ -142,7 +142,7 @@ if (-not $SkipBuild) {
 }
 if (-not (Test-Path $exePath)) { Write-Error "No exe at $exePath - run without -SkipBuild"; exit 1 }
 
-# --- licence page encoding ----------------------------------------------------
+# --- license page encoding ----------------------------------------------------
 #
 # Inno reads a plain-text LicenseFile as ANSI unless it carries a UTF-8 BOM.
 # LICENSE.txt is BOM-less UTF-8 with LF endings and contains em dashes, so

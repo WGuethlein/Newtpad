@@ -92,10 +92,10 @@ version and OS are known then and only the exception code is not.
 ## Item 3 — LICENSE and the notices
 
 - **`LICENSE.txt` at the repo root** — proprietary, all rights reserved; the beta licensed free for
-  evaluation; no redistribution; no warranty; the licence converts or terminates when V1 ships. It
+  evaluation; no redistribution; no warranty; the license converts or terminates when V1 ships. It
   must carry a plain line saying it was drafted by an AI and needs a lawyer's eye before money
   changes hands. **Wyatt reviews it; nobody should treat it as advice.**
-- The installer shows it as the licence page (Inno Setup has one) — which is the whole reason a real
+- The installer shows it as the license page (Inno Setup has one) — which is the whole reason a real
   installer matters for a paid product later.
 - A short **third-party notices** section: the tree depends on OS APIs plus Odin's `core`/`vendor`.
   That is a short list today and it is far easier to write now than to reconstruct at V1.
@@ -127,7 +127,7 @@ additional asset, not a replacement.
 ## Out of scope
 
 Actually obtaining or using a certificate; a storefront; a landing page; auto-download/self-update
-(decided: manual check only, and it wants signing first anyway); trial/licence-key machinery (batch
+(decided: manual check only, and it wants signing first anyway); trial/license-key machinery (batch
 12, after the beta); crash upload; any beta expiry.
 
 ## Verification
