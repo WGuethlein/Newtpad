@@ -166,6 +166,13 @@ main :: proc() {
 	} else if app.settings.font_style != .Regular {
 		plat.text_load_family(&text, "Consolas", app.settings.font_style)
 	}
+	// The chrome's family, on the .UI set. Same failure rule as the document's
+	// above -- a family that is no longer installed leaves Consolas in place
+	// rather than stopping the app -- and deliberately a SEPARATE call, because
+	// the whole point of Font_Set is that these two never move together.
+	if app.settings.ui_font_family != "" && app.settings.ui_font_family != "Consolas" {
+		plat.text_load_family(&text, app.settings.ui_font_family, .Regular, .UI)
+	}
 	metrics_recompute(&rc)
 	window.on_resize = on_resize
 	window.resize_user = &rc
@@ -1102,7 +1109,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// Underline links in the cells while Ctrl is held (or Show-links is on).
 		if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 			for tl in table_links(doc, text, px, char_w, rows, f32(window.width)) {
-				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {tl.x, tl.y + sx(2)}, size = {tl.w, max(sx(1), 1)}, color = g_theme[.Link]}})
+				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {tl.x, tl.y + sx(2)}, size = {tl.w, hairline()}, color = g_theme[.Link]}})
 			}
 		}
 	} else {
@@ -1141,7 +1148,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 						[]plat.Quad {
 							{
 								pos = {col_x(char_w, h.col, 0 if h.wrapped else H_SCROLL), row_baseline_y(px, h.row) + sx(2)},
-								size = {f32(h.cells) * char_w, max(sx(1), 1)},
+								size = {f32(h.cells) * char_w, hairline()},
 								color = g_theme[.Link],
 							},
 						},
@@ -1199,7 +1206,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// makes common, since the last visible row of a wrapped line lands close to
 		// the document end.
 		ty := clamp(CHROME_TOP + f32(doc.top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
-		track := plat.Quad{pos = {er - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = g_theme[.Bg_Raised]}
+		track := plat.Quad{pos = {er - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_TRACK_W, sb_h}, color = g_theme[.Bg_Raised]}
 		// Find-match ticks, drawn BETWEEN the track and the thumb.
 		//
 		// Under the thumb rather than over it, deliberately. No single colour
@@ -1218,7 +1225,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// open and 4 with it shut, which is what it was before this existed.
 		if mc := find_mark_cap(doc, sb_h); mc > 0 {
 			marks := make([]plat.Quad, mc, context.temp_allocator)
-			nmk, _ := find_mark_rects(doc, er - SCROLLBAR_W, SCROLLBAR_W, CHROME_TOP, sb_h, marks)
+			nmk, _ := find_mark_rects(doc, er - SCROLLBAR_W, SCROLLBAR_TRACK_W, CHROME_TOP, sb_h, marks)
 			if nmk > 0 {
 				plat.quads_draw(gfx, quad_pipe, []plat.Quad{track})
 				plat.quads_draw(gfx, quad_pipe, marks[:nmk])
@@ -1228,7 +1235,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		} else {
 			bars[nb] = track;nb += 1
 		}
-		bars[nb] = {pos = {er - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = g_theme[.Text_Muted]};nb += 1
+		bars[nb] = {pos = {er - SCROLLBAR_W, ty}, size = {SCROLLBAR_TRACK_W, th}, color = g_theme[.Scrollbar_Thumb]};nb += 1
 	}
 	if caret {
 		bars[nb] = {pos = {cx, cy - px}, size = {sx(2), line_h}, color = g_theme[.Caret]};nb += 1
@@ -1250,7 +1257,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// The visible accent line is thinner than the draggable band; both come from
 		// md_divider_rect so the drawn line always sits exactly where a drag grabs it.
 		dr := md_divider_rect(doc, w, h, rc.app.settings.split_frac)
-		line_w := max(sx(1), 1)
+		line_w := hairline()
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {dr.pos.x + dr.size.x * 0.5 - line_w * 0.5, dr.pos.y}, size = {line_w, dr.size.y}, color = g_theme[.Border_Strong]}})
 		// Preview follows the editor's scroll (doc.top): one synced position, both
 		// panes anchored to the same source line.
@@ -1263,8 +1270,8 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 				gfx,
 				quad_pipe,
 				[]plat.Quad {
-					{pos = {w - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_W, sb_h}, color = g_theme[.Bg_Raised]},
-					{pos = {w - SCROLLBAR_W + dp(rc, 1), ty}, size = {SCROLLBAR_W - dp(rc, 2), th}, color = g_theme[.Text_Muted]},
+					{pos = {w - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_TRACK_W, sb_h}, color = g_theme[.Bg_Raised]},
+					{pos = {w - SCROLLBAR_W, ty}, size = {SCROLLBAR_TRACK_W, th}, color = g_theme[.Scrollbar_Thumb]},
 				},
 			)
 		}
@@ -1468,6 +1475,13 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	MENU_W = dp(rc, MENU_W_96)
 	PLUS_W = dp(rc, PLUS_W_96)
 	SCROLLBAR_W = dp(rc, SCROLLBAR_W_96)
+	SCROLLBAR_TRACK_W = dp(rc, SCROLLBAR_TRACK_W_96)
+	STATUS_BAR_H = dp(rc, STATUS_BAR_H_96)
+	RADIUS_MENU_BAR_ITEM = dp(rc, RADIUS_MENU_BAR_ITEM_96)
+	RADIUS_ROW = dp(rc, RADIUS_ROW_96)
+	RADIUS_TAB = dp(rc, RADIUS_TAB_96)
+	RADIUS_PANEL = dp(rc, RADIUS_PANEL_96)
+	RADIUS_CARD = dp(rc, RADIUS_CARD_96)
 	HISTORY_ROW = dp(rc, HISTORY_ROW_96)
 	HISTORY_W = dp(rc, HISTORY_W_96)
 

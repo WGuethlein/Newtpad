@@ -46,6 +46,14 @@ Color_Role :: enum u8 {
 	// #292E38 (3: main.odin:923,959,972 scrollbar track) + #293345 (1:
 	// table.odin:205 header row band). Winner: #292E38 (3 sites).
 	Bg_Raised,
+	// Hover fill for any tab, menu row, settings row or palette row.
+	//
+	// Implicit today: every hover surface reaches for Selection_List or
+	// Border_Subtle, so an author cannot make hover quieter than the keyboard
+	// cursor -- which is the one distinction two-weight selection needs (spec
+	// §6, "mouse hover uses bg_hover; keyboard cursor uses the accent fill").
+	// A themer cannot change what has no name.
+	Bg_Hover,
 	// #333B4C (3: ui_tabs.odin:29,231,239 active-tab/overflow/plus fill) +
 	// #3D4554 (1: table.odin:204 column separator). Winner: #333B4C (3 sites).
 	Border_Subtle,
@@ -111,6 +119,33 @@ Color_Role :: enum u8 {
 	// #F2E08C (3: main.odin:1050,1055,1121 find-bar accent) + #CCC280 (1:
 	// settings.odin:345 warning note). Winner: #F2E08C (3 sites).
 	Accent,
+	// Fill behind a selected settings row and the filter band.
+	//
+	// A role and not "12% Accent over the surface", deliberately: an alpha wash
+	// inverts on a light theme, where it must be DARKER than the page rather
+	// than lighter. Storing the resolved surface colour is the only form that
+	// survives an author replacing Accent in either direction.
+	Accent_Wash,
+	// The keyboard focus ring. Both built-ins give it the same value as Accent,
+	// and it is still its own role: an author may want the accent quiet and
+	// focus loud, and focus is the one cue that must never be tuned away for
+	// aesthetics (spec §18, "if a thing can be reached with Tab, it draws the
+	// ring"). Consumed by batch 13 through the pipeline this batch adds.
+	Focus_Ring,
+	// The scrollbar thumb. THE role this file has already asked for -- see the
+	// second-candidate note on Text_Muted above, which records that Text_Muted
+	// is both a text colour (gutter numbers, every hint line) AND this fill, so
+	// "an author darkening it for gutter legibility unavoidably darkens the
+	// thumb too; Light already shows this as a heavy near-black bar on a pale
+	// track." That note ends "recorded so the next batch finds both candidates
+	// together instead of re-discovering this one alone." This is that batch,
+	// and the UI spec arrived at the same split independently.
+	//
+	// Border_Subtle, the other candidate recorded there, is NOT split here: its
+	// two jobs (table hairline, active-tab fill) are both chrome on chrome,
+	// while this one is a fill on the document canvas judged at 3:1 for
+	// non-text contrast. Still open.
+	Scrollbar_Thumb,
 	// #6B6129 (1: find.odin:581 "muted amber" match highlight).
 	Find_Match_Bg,
 	// #73B2FA (1: doc.odin:2158 LINK_COL).
@@ -130,10 +165,20 @@ Color_Role :: enum u8 {
 	Md_Heading,
 	// #F2CCA6 (1: markdown.odin MD_CODE).
 	Md_Code,
+	// Fill behind a code span and a fenced block. Md_Code is a foreground and
+	// there is no matching background, so a code span renders as coloured text
+	// on the page rather than as a block -- the one markdown construct whose
+	// whole visual job is to be a container.
+	Md_Code_Bg,
 	// #CCDBC7 (1: markdown.odin MD_ITALIC).
 	Md_Italic,
 	// #A8B89E (1: markdown.odin MD_QUOTE).
 	Md_Quote,
+	// Thematic breaks, table borders, and the h1/h2 underline in the preview.
+	// All three draw with Border_Strong today (markdown.odin:559,694) -- a
+	// CHROME role, shared with dropdown borders and the split divider -- so an
+	// author tuning menu borders moves every markdown rule with them.
+	Md_Rule,
 	// The bookmark mark in the left margin (doc_bookmark_rects). A new role
 	// rather than a reuse: the nearest existing candidates are Accent (the find
 	// bar) and Caret, and a mark that changes colour when an author retunes the
@@ -216,61 +261,92 @@ doc_canvas_clear :: proc() -> [4]f32 {
 // of consolidating 66 roles down to 25.
 theme_dark :: proc() -> Theme {
 	return Theme {
-		.Bg_Base        = {0.10, 0.12, 0.16, 1}, // #1A1F29
-		.Bg_Panel       = {0.12, 0.14, 0.18, 1}, // #1F242E
-		.Bg_Raised      = {0.16, 0.18, 0.22, 1}, // #292E38
-		.Border_Subtle  = {0.20, 0.23, 0.30, 1}, // #333B4C
-		.Border_Strong  = {0.30, 0.34, 0.42, 1}, // #4C576B
-		.Text_Muted     = {0.50, 0.55, 0.64, 1}, // #808CA3
-		.Text_Dim       = {0.55, 0.60, 0.70, 1}, // #8C99B2
-		.Text_Secondary = {0.80, 0.84, 0.90, 1}, // #CCD6E6
-		.Text_Primary   = {0.92, 0.94, 0.98, 1}, // #EBF0FA
-		.Text_Bright    = {1, 1, 1, 1}, // #FFFFFF
-
-		.Selection_Doc  = {0.20, 0.30, 0.48, 1}, // #334C7A
-		.Selection_List = {0.20, 0.28, 0.42, 1}, // #33476B
-		.Caret          = {0.95, 0.85, 0.35, 1}, // #F2D959
-		.Accent         = {0.95, 0.88, 0.55, 1}, // #F2E08C
-		.Find_Match_Bg  = {0.42, 0.38, 0.16, 1}, // #6B6129
-		.Link           = {0.45, 0.70, 0.98, 1}, // #73B2FA
-		.Warning        = {0.95, 0.55, 0.35, 1}, // #F28C59
-		.Danger         = {0.75, 0.16, 0.16, 1}, // #BF2929
-		.Success        = {0.55, 0.85, 0.60, 1}, // #8CD999
-		.Filter_Bg      = {0.18, 0.26, 0.20, 1}, // #2E4233
-		.Filter_Text    = {0.70, 0.90, 0.74, 1}, // #B2E6BD
-		.Md_Heading     = {0.72, 0.85, 1.0, 1}, // #B8D9FF
-		.Md_Code        = {0.95, 0.80, 0.65, 1}, // #F2CCA6
-		.Md_Italic      = {0.80, 0.86, 0.78, 1}, // #CCDBC7
-		.Md_Quote       = {0.66, 0.72, 0.62, 1}, // #A8B89E
-		.Bookmark       = {0.40, 0.66, 0.95, 1}, // #66A8F2
-		// #F2A93B -- 6.8:1 against Bg_Raised (#292E38), the scrollbar track it
-		// is drawn on. Brighter and more saturated than Find_Match_Bg's
-		// #6B6129, which measures 1.4:1 there and would be an invisible tick.
-		.Match_Mark     = {0.95, 0.66, 0.23, 1}, // #F2A93B
-
-		// Light's hue family per role, re-tuned for this theme's Bg_Base
-		// (#1A1F29). Ratios are WCAG relative luminance against Bg_Base,
+		// Warm neutrals, chroma under 0.02: every grey carries a trace of the
+		// accent's hue. Cold greys read as tooling, warm greys read as paper,
+		// and that is most of what the UI spec means by "cosy" (spec §1.3).
+		// Ratios in the comments are WCAG relative luminance against Bg_Base,
 		// computed rather than eyeballed -- this environment cannot render a
-		// frame, and computation is the standard theme_light already used.
-		// Every token colour clears 4.5:1 except Syn_Comment, which is
-		// deliberately de-emphasised and clears 3:1: a comment that shouts is
-		// a worse outcome than a comment that is slightly dim.
+		// frame, and computation is the standard both built-ins already used.
+		.Bg_Base         = {0.133, 0.122, 0.110, 1}, // #221F1C
+		.Bg_Panel        = {0.110, 0.098, 0.090, 1}, // #1C1917
+		.Bg_Raised       = {0.169, 0.153, 0.141, 1}, // #2B2724
+		.Bg_Hover        = {0.188, 0.169, 0.153, 1}, // #302B27
+		.Border_Subtle   = {0.196, 0.176, 0.157, 1}, // #322D28
+		.Border_Strong   = {0.290, 0.263, 0.224, 1}, // #4A4339
+		.Text_Muted      = {0.616, 0.573, 0.518, 1}, // #9D9284  5.4
+		.Text_Dim        = {0.435, 0.400, 0.361, 1}, // #6F665C  2.9 DISABLED ONLY
+		.Text_Secondary  = {0.702, 0.659, 0.592, 1}, // #B3A897  7.1
+		.Text_Primary    = {0.804, 0.765, 0.706, 1}, // #CDC3B4  9.4
+		.Text_Bright     = {0.949, 0.922, 0.878, 1}, // #F2EBE0  13.6
+
+		.Selection_Doc   = {0.200, 0.259, 0.290, 1}, // #33424A -- Text_Primary on it: 8.9
+		.Selection_List  = {0.227, 0.208, 0.184, 1}, // #3A352F
+		.Caret           = {0.851, 0.608, 0.384, 1}, // #D99B62  7.3, drawn 2px wide
+		// One accent, state only. If a colour is not saying selected / dirty /
+		// focused / found / dangerous, it is a neutral (spec §1.3) -- that
+		// single rule is what separates this palette from the accent-on-
+		// everything look, and it is why Caret, Focus_Ring, Match_Mark and
+		// Md_List_Mark's job all resolve to this one value.
+		.Accent          = {0.851, 0.608, 0.384, 1}, // #D99B62  7.3
+		.Accent_Wash     = {0.188, 0.157, 0.137, 1}, // #302823
+		.Focus_Ring      = {0.851, 0.608, 0.384, 1}, // #D99B62
+		// #746B61, 3.14:1 against Bg_Base -- NOT the UI spec's #3E3833.
 		//
-		// Syn_Comment is pulled away from Text_Muted (#808CA3) on purpose --
-		// the gutter line numbers are Text_Muted and sit directly beside
-		// comment text. Light deliberately placed those two close together;
-		// Dark must not, because Dark is the theme with the gutter beside it
-		// in daily use. Syn_Punct is likewise kept clear of Text_Primary.
-		// themetest asserts both separations.
-		.Syn_Keyword    = {0.56, 0.66, 1.00, 1}, // #8FA8FF -- periwinkle (Light: indigo #3B5BDB), 7.4:1
-		.Syn_String     = {0.56, 0.85, 0.66, 1}, // #8FD9A8 -- soft green (Light: green #17824E), 10.1:1
-		.Syn_Number     = {0.96, 0.72, 0.48, 1}, // #F5B87A -- peach (Light: burnt orange #B5560A), 9.5:1
-		.Syn_Comment    = {0.43, 0.52, 0.47, 1}, // #6E8578 -- sage grey (Light: slate #707A88), 4.2:1
-		.Syn_Type       = {0.44, 0.83, 0.88, 1}, // #70D4E0 -- cyan (Light: teal #0B7285), 9.5:1
-		.Syn_Punct      = {0.60, 0.65, 0.74, 1}, // #99A6BD -- mid neutral (Light: #444B58), 6.7:1
-		.Syn_Json_Key   = {0.94, 0.63, 0.54, 1}, // #F0A18A -- salmon (Light: rust #9C4221), 8.0:1
-		.Syn_Xml_Tag    = {0.96, 0.55, 0.71, 1}, // #F58CB5 -- pink (Light: rose #B5165A), 7.3:1
-		.Syn_Xml_Attr   = {0.77, 0.68, 0.96, 1}, // #C4ADF5 -- lavender (Light: violet #6B4FB6), 8.4:1
+		// That value is annotated "3.0 against bg_base" in the spec and does
+		// not measure it: #3E3833 computes to 1.42:1, less than half the
+		// stated figure. It matters because spec §18 lists "scrollbar thumb
+		// 3.0:1" as a WCAG 1.4.11 non-text-contrast compliance point, so
+		// shipping the literal value would have made an accessibility claim
+		// the palette does not meet. This is the lightest warm neutral that
+		// actually clears 3:1; themetest asserts it so the next retune cannot
+		// quietly drop back under.
+		.Scrollbar_Thumb = {0.455, 0.420, 0.380, 1}, // #746B61  3.14
+		.Find_Match_Bg   = {0.290, 0.220, 0.149, 1}, // #4A3826 -- Text_Primary on it: 7.3
+		.Link            = {0.592, 0.765, 0.847, 1}, // #97C3D8  8.2
+		.Warning         = {0.878, 0.643, 0.345, 1}, // #E0A458  7.6
+		.Danger          = {0.753, 0.271, 0.231, 1}, // #C0453B -- white on it: 4.7
+		.Success         = {0.616, 0.788, 0.627, 1}, // #9DC9A0  8.6
+		.Filter_Bg       = {0.180, 0.157, 0.137, 1}, // #2E2823
+		.Filter_Text     = {0.898, 0.710, 0.498, 1}, // #E5B57F  8.4 on Filter_Bg
+		.Md_Heading      = {0.898, 0.710, 0.498, 1}, // #E5B57F  8.4 -- all six levels
+		.Md_Code         = {0.592, 0.765, 0.847, 1}, // #97C3D8  8.2 -- same hue as Link: both point elsewhere
+		.Md_Code_Bg      = {0.165, 0.153, 0.137, 1}, // #2A2723
+		.Md_Italic       = {0.769, 0.718, 0.624, 1}, // #C4B79F  8.0
+		.Md_Quote        = {0.651, 0.608, 0.545, 1}, // #A69B8B  5.6
+		.Md_Rule         = {0.227, 0.204, 0.180, 1}, // #3A342E
+		.Bookmark        = {0.592, 0.765, 0.847, 1}, // #97C3D8
+		// 6.2:1 against Bg_Raised (#2B2724), the scrollbar track it is drawn
+		// on -- judged there, not against Bg_Base, because that is the surface
+		// under it. Find_Match_Bg measures 1.3:1 there and would be an
+		// invisible tick, which is why these two stay separate roles even
+		// though they are one feature.
+		.Match_Mark      = {0.851, 0.608, 0.384, 1}, // #D99B62  6.2 on Bg_Raised
+
+		// Five hues, one job each (spec §1.3). A sixth always looks arbitrary;
+		// further token types are distinguished by LIGHTNESS within a hue,
+		// which is why Syn_Json_Key is a bright neutral rather than a new
+		// colour.
+		//
+		// Syn_Comment is pulled away from Text_Muted deliberately -- the
+		// gutter line numbers are Text_Muted and sit immediately beside
+		// comment text, and themetest asserts the separation. The UI spec sets
+		// both to #9D9284, the SAME value, which would have failed that
+		// assertion: it was written from screenshots and could not know the
+		// gutter shares the role. Green instead -- comments are green nearly
+		// everywhere and the convention is worth more than palette tidiness --
+		// but muted rather than vivid (Wyatt: "maybe not such a vibrant bright
+		// green in the dark mode"), at 4.7:1, still above the AA floor so
+		// comments stay readable rather than merely present.
+		// Syn_Punct is likewise kept clear of Text_Primary.
+		.Syn_Keyword     = {0.827, 0.663, 0.804, 1}, // #D3A9CD  7.4  mauve -- language words
+		.Syn_String      = {0.616, 0.788, 0.627, 1}, // #9DC9A0  8.6  green -- literal content
+		.Syn_Number      = {0.898, 0.710, 0.498, 1}, // #E5B57F  8.4  amber -- numbers, true/false/null
+		.Syn_Comment     = {0.455, 0.565, 0.478, 1}, // #74907A  4.7  muted green -- see the note above
+		.Syn_Type        = {0.592, 0.765, 0.847, 1}, // #97C3D8  8.2  blue -- types, tags, references
+		.Syn_Punct       = {0.651, 0.608, 0.545, 1}, // #A69B8B  5.6  braces, pipes, commas
+		.Syn_Json_Key    = {0.937, 0.906, 0.859, 1}, // #EFE7DB  12.7 keys are the index you scan: brightest
+		.Syn_Xml_Tag     = {0.827, 0.663, 0.804, 1}, // #D3A9CD  tags are keywords
+		.Syn_Xml_Attr    = {0.898, 0.710, 0.498, 1}, // #E5B57F
 	}
 }
 
@@ -310,86 +386,78 @@ theme_dark :: proc() -> Theme {
 // opaque quad) didn't.
 theme_light :: proc() -> Theme {
 	return Theme {
-		.Bg_Base        = {1.00, 1.00, 1.00, 1}, // #FFFFFF -- document canvas + tab-strip rest state
-		.Bg_Panel       = {0.93, 0.95, 0.96, 1}, // #EEF1F6 -- menu bar, history, query field, inactive tab
-		.Bg_Raised      = {0.89, 0.91, 0.93, 1}, // #E2E7EE -- scrollbar track, table header band
-		.Border_Subtle  = {0.70, 0.74, 0.80, 1}, // #B3BDCC -- table separator + active-tab fill (see note above: weak pop)
-		.Border_Strong  = {0.45, 0.51, 0.60, 1}, // #748199 -- dividers, dropdown borders, caption-hover fill
-		.Text_Muted     = {0.36, 0.40, 0.46, 1}, // #5D6776 -- gutter numbers, hints, scrollbar thumb (5.8:1 on white)
-		.Text_Dim       = {0.30, 0.34, 0.40, 1}, // #4C5666 -- chords, bullets, inactive-tab fg (7.4:1 on white)
-		.Text_Secondary = {0.23, 0.26, 0.31, 1}, // #3A4250 -- default row/caption text (10.1:1 on white)
-		.Text_Primary   = {0.12, 0.14, 0.19, 1}, // #1E2430 -- document text, headings, active tab (15.6:1 on white)
-		.Text_Bright    = {0.06, 0.07, 0.10, 1}, // #10131A -- bold emphasis, table header/edit text (18.7:1 on white)
+		// Two deliberate departures from the previous light theme, both from
+		// spec §1.2: the page is #FAF8F3 rather than pure white so it does not
+		// glare beside a dark desktop, and the neutrals are warm rather than
+		// blue-grey -- which is most of what made the old light theme feel
+		// like a dev tool. Bg_Raised is LIGHTER than Bg_Base here; "raised"
+		// means nearer the light in a light theme, which is the one rule that
+		// does not survive inverting a dark palette.
+		.Bg_Base         = {0.980, 0.973, 0.953, 1}, // #FAF8F3 -- warm paper, not white
+		.Bg_Panel        = {0.933, 0.918, 0.886, 1}, // #EEEAE2
+		.Bg_Raised       = {1.000, 1.000, 1.000, 1}, // #FFFFFF
+		.Bg_Hover        = {0.910, 0.890, 0.851, 1}, // #E8E3D9
+		.Border_Subtle   = {0.871, 0.847, 0.800, 1}, // #DED8CC
+		.Border_Strong   = {0.725, 0.690, 0.635, 1}, // #B9B0A2
+		.Text_Muted      = {0.420, 0.380, 0.337, 1}, // #6B6156  6.0
+		.Text_Dim        = {0.604, 0.569, 0.525, 1}, // #9A9186  2.8 DISABLED ONLY
+		.Text_Secondary  = {0.373, 0.341, 0.302, 1}, // #5F574D  7.2
+		.Text_Primary    = {0.239, 0.216, 0.184, 1}, // #3D372F  10.6
+		.Text_Bright     = {0.173, 0.149, 0.125, 1}, // #2C2620  13.6
 
-		// #BFD6F2 measured 1.48:1 against Bg_Base -- the in-document text
-		// selection, drawn as an opaque quad behind unchanged Text_Primary
-		// glyphs (doc.odin:1989-2004) with NO other cue that anything is
-		// selected (no border, no text recolour), the same "the fill is the
-		// only cue" shape Selection_List had, and the single most-used
-		// highlight in the app. Darkened past the same 1.6:1 bar: this value
-		// measures 1.83:1 against Bg_Base, with Text_Primary still at 8.5:1
-		// on top of it (was 10.5:1 -- comfortably above the 4.5:1 AA text
-		// floor either way).
-		.Selection_Doc  = {0.68, 0.76, 0.85, 1}, // #ADC2D9
-		// #E1E6EE measured 1.12:1 against Bg_Panel -- menu-bar title hover, the
-		// gear hover, the dropdown item highlight, and the history selected row
-		// all use this fill with NO other cue (keyboard menu navigation has
-		// nothing else marking the selected item), so that was a near-invisible
-		// selection. Darkened to clear Dark's own separation (1.68:1 against its
-		// Bg_Panel): this value measures 1.64:1 against Light's Bg_Panel and
-		// 1.85:1 against Bg_Base, with Text_Primary still at 8.4:1 on top of it.
-		.Selection_List = {0.70, 0.75, 0.84, 1}, // #B3BFD6
-		.Caret          = {0.58, 0.38, 0.00, 1}, // #946200 -- deepened gold, not lightened (see note above)
-		.Accent         = {0.54, 0.43, 0.12, 1}, // #8A6D1F -- same gold family as Caret, lower chroma for running text
-		// #F0E4B8 measured 1.28:1 against Bg_Base -- find.odin's
-		// find_match_rects draws this as a dim wash behind unchanged fg text
-		// for every match but the one under the caret/selection, so most
-		// matches on screen have no cue but this fill: the same
-		// "fill-is-the-only-cue" shape as Selection_Doc/Selection_List, just
-		// not named in the original brief. Darkened past the same 1.6:1 bar:
-		// this value measures 1.64:1 against Bg_Base, staying deliberately
-		// closer to that floor than Selection_Doc's 1.83:1 so the match
-		// highlight stays visibly *dimmer* than the selection it can sit
-		// under (main.odin: "find-match highlights (dim), then the selection
-		// (bright)"). Text_Primary on top: 9.5:1 (was 12.1:1).
-		.Find_Match_Bg  = {0.84, 0.79, 0.64, 1}, // #D6C9A3 -- amber wash; text drawn on top is unchanged dark fg
-		.Link           = {0.11, 0.37, 0.66, 1}, // #1B5FA8 -- dark's #73B2FA is 2.2:1 on white; deepened to 6.5:1
-		.Warning        = {0.71, 0.28, 0.06, 1}, // #B5480F -- burnt orange, legible as status text on Bg_Panel (4.8:1)
-		.Danger         = {0.75, 0.16, 0.16, 1}, // #BF2929 -- SAME as Dark, deliberately (see note above)
-		.Success        = {0.12, 0.48, 0.24, 1}, // #1E7A3C -- deep green, legible on Bg_Base and Bg_Panel (5.3/4.8:1)
-		.Filter_Bg      = {0.86, 0.93, 0.87, 1}, // #DCEEDF -- pale green wash for the filter banner
-		.Filter_Text    = {0.12, 0.36, 0.20, 1}, // #1F5C34 -- deep green text on Filter_Bg (6.6:1)
-		.Md_Heading     = {0.09, 0.30, 0.53, 1}, // #164C86 -- deep blue heading text (8.6:1 on white)
-		.Md_Code        = {0.54, 0.29, 0.13, 1}, // #8A4A22 -- terracotta; legible on Bg_Base and the code-block Bg_Panel fill
-		.Md_Italic      = {0.25, 0.36, 0.23, 1}, // #3F5C3A -- deep moss green (7.5:1 on white)
-		.Md_Quote       = {0.33, 0.38, 0.30, 1}, // #55614C -- deep olive, used for both the quote bar and its text (6.6:1)
-		// A solid mark on the document canvas, so it is judged like Link is:
-		// Dark's #66A8F2 measures 2.6:1 on white and would be a pale smear in
-		// the margin. Deepened to the same blue family as Link, 5.9:1 against
-		// Bg_Base -- a 4px bar needs contrast more than text does, not less.
-		.Bookmark       = {0.13, 0.40, 0.71, 1}, // #2166B5
-		// Judged against Bg_Raised (#E2E7EE), not Bg_Base: this is the one
-		// accent drawn on the scrollbar track. 4.0:1 there -- above the 3:1
-		// non-text UI floor with margin, because a 2px tick has less area to
-		// carry its contrast than a glyph does. Deepened from Dark's #F2A93B
-		// (1.6:1 on the pale track) into the same amber family Find_Match_Bg
-		// keeps in this theme.
-		.Match_Mark     = {0.65, 0.37, 0.00, 1}, // #A65F00
+		.Selection_Doc   = {0.812, 0.859, 0.886, 1}, // #CFDBE2 -- Text_Primary on it: 9.6
+		.Selection_List  = {0.863, 0.839, 0.792, 1}, // #DCD6CA
+		.Caret           = {0.627, 0.353, 0.118, 1}, // #A05A1E  4.8, drawn 2px wide
+		.Accent          = {0.627, 0.353, 0.118, 1}, // #A05A1E  4.8
+		.Accent_Wash     = {0.949, 0.902, 0.847, 1}, // #F2E6D8
+		.Focus_Ring      = {0.627, 0.353, 0.118, 1}, // #A05A1E
+		// #948D80, 3.10:1 against Bg_Base -- NOT the UI spec's #C9C2B5, which
+		// is annotated "3.0 against bg_base" and measures 1.67:1. The same
+		// error appears in the Dark file (#3E3833, annotated 3.0, measures
+		// 1.42) -- two themes, one mistake, so it is systematic rather than a
+		// typo. See the Dark note for why it matters: spec §18 cites this
+		// 3.0 as a WCAG 1.4.11 compliance point.
+		.Scrollbar_Thumb = {0.580, 0.553, 0.502, 1}, // #948D80  3.10
+		.Find_Match_Bg   = {0.941, 0.875, 0.745, 1}, // #F0DFBE -- Text_Primary on it: 9.3
+		.Link            = {0.122, 0.373, 0.471, 1}, // #1F5F78  6.4
+		.Warning         = {0.604, 0.353, 0.071, 1}, // #9A5A12  5.1
+		.Danger          = {0.698, 0.227, 0.188, 1}, // #B23A30 -- white on it: 5.4
+		.Success         = {0.184, 0.420, 0.278, 1}, // #2F6B47  5.9
+		.Filter_Bg       = {0.953, 0.910, 0.851, 1}, // #F3E8D9
+		.Filter_Text     = {0.478, 0.290, 0.071, 1}, // #7A4A12  6.2 on Filter_Bg
+		.Md_Heading      = {0.541, 0.329, 0.086, 1}, // #8A5416  6.1
+		.Md_Code         = {0.122, 0.373, 0.471, 1}, // #1F5F78  6.4
+		.Md_Code_Bg      = {0.941, 0.929, 0.894, 1}, // #F0EDE4
+		.Md_Italic       = {0.361, 0.322, 0.251, 1}, // #5C5240  7.4
+		.Md_Quote        = {0.420, 0.380, 0.337, 1}, // #6B6156  6.0
+		.Md_Rule         = {0.871, 0.847, 0.800, 1}, // #DED8CC
+		.Bookmark        = {0.122, 0.373, 0.471, 1}, // #1F5F78
+		// Judged against Bg_Raised (#FFFFFF here), not Bg_Base: this is the
+		// one accent drawn on the scrollbar track. 4.9:1 there -- above the
+		// 3:1 non-text floor with margin, because a 2px tick has less area to
+		// carry its contrast than a glyph does.
+		.Match_Mark      = {0.627, 0.353, 0.118, 1}, // #A05A1E  4.9 on Bg_Raised
 
-		// Deliberate light-appropriate placeholders, not magenta: batch 4 has
-		// no consumer for these yet, but a light theme with magenta holes
-		// would be a trap for whoever wires syntax highlighting up next.
-		// Provisional -- chosen for legibility and mutual distinctness on
-		// Bg_Base, not validated against real code on screen.
-		.Syn_Keyword    = {0.23, 0.36, 0.86, 1}, // #3B5BDB -- indigo
-		.Syn_String     = {0.09, 0.51, 0.31, 1}, // #17824E -- green
-		.Syn_Number     = {0.71, 0.34, 0.04, 1}, // #B5560A -- burnt orange
-		.Syn_Comment    = {0.44, 0.48, 0.53, 1}, // #707A88 -- muted slate (deliberately near Text_Muted's tone)
-		.Syn_Type       = {0.04, 0.45, 0.52, 1}, // #0B7285 -- teal
-		.Syn_Punct      = {0.27, 0.29, 0.35, 1}, // #444B58 -- dark neutral, low-emphasis
-		.Syn_Json_Key   = {0.61, 0.26, 0.13, 1}, // #9C4221 -- rust
-		.Syn_Xml_Tag    = {0.71, 0.09, 0.35, 1}, // #B5165A -- rose/maroon
-		.Syn_Xml_Attr   = {0.42, 0.31, 0.71, 1}, // #6B4FB6 -- violet
+		// Five hues, matched to Dark's assignments so a file looks like the
+		// same file in either theme: mauve keywords, green strings, amber
+		// numbers, blue types, bright-neutral JSON keys. These are no longer
+		// the "provisional placeholders" the previous note described -- they
+		// are the spec's §1.2 values, chosen against this Bg_Base.
+		//
+		// Syn_Comment stays clear of Text_Muted for the reason recorded in
+		// Dark: the gutter numbers are Text_Muted and sit beside comment text,
+		// and themetest asserts the separation. The old note here said Light
+		// "deliberately placed those two close together"; that is no longer
+		// true, and the assertion now applies to both themes equally.
+		.Syn_Keyword     = {0.478, 0.247, 0.467, 1}, // #7A3F77  6.8  mauve
+		.Syn_String      = {0.184, 0.420, 0.278, 1}, // #2F6B47  5.9  green
+		.Syn_Number      = {0.541, 0.329, 0.086, 1}, // #8A5416  6.1  amber
+		.Syn_Comment     = {0.275, 0.376, 0.247, 1}, // #46603F  6.6  sage -- separated from Text_Muted
+		.Syn_Type        = {0.122, 0.373, 0.471, 1}, // #1F5F78  6.4  blue
+		.Syn_Punct       = {0.373, 0.341, 0.302, 1}, // #5F574D  7.2
+		.Syn_Json_Key    = {0.173, 0.149, 0.125, 1}, // #2C2620  13.6 keys are the index you scan: darkest
+		.Syn_Xml_Tag     = {0.478, 0.247, 0.467, 1}, // #7A3F77
+		.Syn_Xml_Attr    = {0.541, 0.329, 0.086, 1}, // #8A5416
 	}
 }
 
@@ -484,6 +552,7 @@ theme_role_keys := [Color_Role]string {
 	.Bg_Base        = "bg_base",
 	.Bg_Panel       = "bg_panel",
 	.Bg_Raised      = "bg_raised",
+	.Bg_Hover       = "bg_hover",
 	.Border_Subtle  = "border_subtle",
 	.Border_Strong  = "border_strong",
 	.Text_Muted     = "text_muted",
@@ -495,6 +564,9 @@ theme_role_keys := [Color_Role]string {
 	.Selection_List = "selection_list",
 	.Caret          = "caret",
 	.Accent         = "accent",
+	.Accent_Wash    = "accent_wash",
+	.Focus_Ring     = "focus_ring",
+	.Scrollbar_Thumb = "scrollbar_thumb",
 	.Find_Match_Bg  = "find_match_bg",
 	.Link           = "link",
 	.Warning        = "warning",
@@ -504,8 +576,10 @@ theme_role_keys := [Color_Role]string {
 	.Filter_Text    = "filter_text",
 	.Md_Heading     = "md_heading",
 	.Md_Code        = "md_code",
+	.Md_Code_Bg     = "md_code_bg",
 	.Md_Italic      = "md_italic",
 	.Md_Quote       = "md_quote",
+	.Md_Rule        = "md_rule",
 	.Bookmark       = "bookmark",
 	.Match_Mark     = "match_mark",
 	.Syn_Keyword    = "syn_keyword",

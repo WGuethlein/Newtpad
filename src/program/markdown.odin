@@ -498,7 +498,7 @@ md_inline :: proc(s: string, allocator := context.temp_allocator) -> []Md_Run {
 // xind. Advances y per wrapped row. Synthetic bold via a second draw one px over.
 @(private = "file")
 md_draw_inline :: proc(gfx: ^plat.Gfx, text: ^plat.Text, runs: []Md_Run, xind, x1: f32, x, y: ^f32, px, char_w, line_h: f32, base_col: [4]f32) {
-	boff := max(sx(1), 1)
+	boff := hairline()
 	for run in runs {
 		col := base_col
 		if run.code {col = g_theme[.Md_Code]}
@@ -550,13 +550,13 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			in_fence = !in_fence
 			y += line_h
 		} else if in_fence {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {x1 - x0, line_h}, color = g_theme[.Bg_Panel]}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {x1 - x0, line_h}, color = g_theme[.Md_Code_Bg]}})
 			plat.text_draw(gfx, text, line, x0 + char_w, y, px, g_theme[.Md_Code], .Doc)
 			y += line_h
 		} else if len(strings.trim_space(line)) == 0 {
 			y += line_h * 0.5 // blank line: a little gap
 		} else if md_is_rule(trimmed) {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {x1 - x0, max(sx(1), 1)}, color = g_theme[.Border_Strong]}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {x1 - x0, hairline()}, color = g_theme[.Md_Rule]}})
 			y += line_h
 		} else if lvl := md_heading_level(trimmed); lvl > 0 {
 			hpx := md_head_px(px, lvl)
@@ -691,7 +691,7 @@ md_draw_table_row :: proc(
 		// worth of gap that has nothing after it — trim it or the rule overhangs
 		// the last column by MD_TABLE_PAD cells.
 		w := min(max(0, md_col_x(c, c.ncols, char_w) - f32(MD_TABLE_PAD) * char_w), x1 - x0)
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {w, max(sx(1), 1)}, color = g_theme[.Border_Strong]}})
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {w, hairline()}, color = g_theme[.Md_Rule]}})
 		return
 	}
 	cells := md_split_cells(line, context.temp_allocator)

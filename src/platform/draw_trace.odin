@@ -34,7 +34,12 @@ package platform
 // two runs that drew identical frames. Both structs are all-f32 today and pack
 // exactly; these assert that nobody adds a field that breaks it.
 #assert(size_of(Text_Instance) == 12 * size_of(f32))
-#assert(size_of(Quad) == 8 * size_of(f32))
+// 16, not 8: batch 12 added radius [4]f32 and softness f32 for the rounded-box
+// SDF, plus [3]f32 of explicit padding to keep the instance 16-byte aligned.
+// The padding is DECLARED rather than left to the compiler precisely because of
+// the note above -- these bytes are hashed, and implicit padding would be
+// uninitialised and differ between two runs that drew the same frame.
+#assert(size_of(Quad) == 16 * size_of(f32))
 
 Draw_Stats :: struct {
 	// Calls into text_draw_spans, including those whose string produced no

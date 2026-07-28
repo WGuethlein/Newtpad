@@ -12,8 +12,8 @@ package main
 
 import plat "src:platform"
 
-MENU_BAR_H_96 :: f32(26)
-MENU_ITEM_H_96 :: f32(24)
+MENU_BAR_H_96 :: f32(30) // UI spec 2.1 (was 26)
+MENU_ITEM_H_96 :: f32(28) // dropdown row height, UI spec 2.2 (was 24)
 MENU_PAD_96 :: f32(12) // horizontal padding around a top-level title
 GEAR_W_96 :: f32(34) // settings gear hit box (wider than the glyph, so it's clickable)
 MENU_BAR_H := MENU_BAR_H_96
@@ -461,7 +461,7 @@ menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^
 		x0, x1 := menu_title_rect(t, i)
 		lit := i == app.menu.open || (app.menu.open < 0 && i == hover)
 		if lit {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, TAB_STRIP_H}, size = {x1 - x0, MENU_BAR_H}, color = g_theme[.Selection_List]}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, TAB_STRIP_H}, size = {x1 - x0, MENU_BAR_H}, color = g_theme[.Bg_Hover]}})
 		}
 		plat.text_draw(gfx, t, m.title, x0 + MENU_PAD, base_y, UI_PX, g_theme[.Text_Primary])
 		// Underline the mnemonic while in keyboard menu mode, the way Windows
@@ -477,7 +477,7 @@ menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^
 	gw := sx(GEAR_W_96)
 	gx := width - SCROLLBAR_W - gw
 	if in_bar && f32(cx) >= gx && f32(cx) < gx + gw {
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {gx, TAB_STRIP_H}, size = {gw, MENU_BAR_H}, color = g_theme[.Selection_List]}})
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {gx, TAB_STRIP_H}, size = {gw, MENU_BAR_H}, color = g_theme[.Bg_Hover]}})
 	}
 	gpx := UI_PX * 1.35
 	gcw := plat.text_char_width(t, gpx)

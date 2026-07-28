@@ -6,6 +6,7 @@ package main
 
 import "base:intrinsics"
 import "core:fmt"
+import "core:math"
 import "core:mem"
 import "core:os"
 import "core:path/filepath"
@@ -1132,6 +1133,10 @@ when NEWTPAD_TESTS {
 		// under the caret.
 		if os.args[1] == "fonttest" {
 			bad := 0
+			fnt_chk :: proc(bad: ^int, ok: bool, label: string) {
+				if !ok {bad^ += 1}
+				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+			}
 			t: plat.Text
 			if !plat.text_load_faces(&t) {
 				fmt.eprintln("fonttest: no fonts loaded")
@@ -1140,6 +1145,60 @@ when NEWTPAD_TESTS {
 			base_em := plat.text_char_em(&t)
 			fmt.printfln("default Consolas char_em %.4f", base_em)
 			if base_em <= 0 {bad += 1}
+
+			// --- the chrome font is independent of the document font ---
+			//
+			// Font_Set.UI and .Doc have existed since the atlas was written, but
+			// text_load_faces put Consolas in both and nothing ever moved one
+			// without the other, so the separation was structural and untested.
+			// What batch 12 adds is the setting; what this asserts is the
+			// property that setting is FOR.
+			//
+			// Skipped rather than failed when Cascadia Mono is absent: it ships
+			// with Windows 11 and not with 10, and a machine without it is not a
+			// broken build. The skip says so out loud instead of passing quietly.
+			{
+				alt := "Cascadia Mono"
+				have := false
+				for f in plat.FONT_FAMILIES {
+					if f.name == alt && plat.font_family_available(f) {have = true}
+				}
+				if !have {
+					fmt.printfln("  SKIP   %s is not installed; chrome/document independence unchecked", alt)
+				} else {
+					ui_before := plat.text_char_em(&t, .UI)
+					doc_before := plat.text_char_em(&t, .Doc)
+					// Precondition: both sets start on the same family, so a test
+					// that "passes" before the split is doing nothing.
+					//
+					// char_em, not char_width: the width is rounded to a whole
+					// pixel, and Consolas at 0.5498 em and Cascadia Mono at
+					// 0.5859 BOTH land on 9px at 16px -- so measuring the width
+					// here made every one of these checks compare 9.000 to
+					// 9.000 and two of them failed for that reason alone.
+					fnt_chk(&bad, ui_before == doc_before, fmt.tprintf("both sets start on one family (ui em %.4f == doc em %.4f)", ui_before, doc_before))
+
+					plat.text_load_family(&t, alt, .Regular, .UI)
+					ui_alt := plat.text_char_em(&t, .UI)
+					doc_after := plat.text_char_em(&t, .Doc)
+					// The families must actually differ in advance, or the next
+					// assertion cannot fail whatever the code does.
+					fnt_chk(&bad, ui_alt != ui_before, fmt.tprintf("%s has a different advance from Consolas (em %.4f vs %.4f) -- or the next check is vacuous", alt, ui_alt, ui_before))
+					fnt_chk(&bad, doc_after == doc_before, fmt.tprintf("moving the CHROME font left the document alone (doc em %.4f, was %.4f)", doc_after, doc_before))
+
+					// And the other direction, which is the one the Font_Set
+					// comment is actually about: "choosing a document font
+					// cannot make the menus unreadable".
+					plat.text_load_family(&t, alt, .Regular, .Doc)
+					ui_final := plat.text_char_em(&t, .UI)
+					doc_final := plat.text_char_em(&t, .Doc)
+					fnt_chk(&bad, doc_final != doc_before, fmt.tprintf("moving the DOCUMENT font changed it (em %.4f, was %.4f)", doc_final, doc_before))
+					fnt_chk(&bad, ui_final == ui_alt, fmt.tprintf("...and left the chrome alone (ui em %.4f, was %.4f)", ui_final, ui_alt))
+
+					plat.text_load_family(&t, "Consolas", .Regular, .UI)
+					plat.text_load_family(&t, "Consolas", .Regular, .Doc)
+				}
+			}
 
 			fmt.println("--- curated families ---")
 			found := 0
@@ -1575,13 +1634,17 @@ when NEWTPAD_TESTS {
 				tab_width       = 3, // non-default and in range, so the whole-struct compare below can see it
 				font_family     = "Courier New",
 				font_style      = .Italic,
+				// Non-default and different from font_family, so the round-trip
+				// covers the chrome family AND cannot pass by the two being
+				// confused for one another in the save format's argument order.
+				ui_font_family  = "Cascadia Code",
 				split_frac      = 0.25, // non-zero, non-default, exact in binary float (survives %.4f round-trip)
 				theme_name      = "Light", // non-blank, non-default -- see the blank-normalises check below for ""
 			}
 			settings_save(w)
 			r := settings_load()
 			ok := r == w
-			fmt.printfln("round-trip: restore=%v wrap=%v font=%d zoom=%d family=%q style=%v  %s", r.restore_session, r.wrap_default, r.font_size, r.zoom_pct, r.font_family, r.font_style, "OK" if ok else "FAIL")
+			fmt.printfln("round-trip: restore=%v wrap=%v font=%d zoom=%d family=%q ui=%q style=%v  %s", r.restore_session, r.wrap_default, r.font_size, r.zoom_pct, r.font_family, r.ui_font_family, r.font_style, "OK" if ok else "FAIL")
 			if !ok {bad += 1}
 
 			// An empty family must normalise on the way out, not persist as blank —
@@ -8469,6 +8532,73 @@ when NEWTPAD_TESTS {
 					if !ok {fail = true}
 					fmt.printfln("  %-6s Dark %v vs %v: max channel diff %.3f (need >= 0.10)", "ok" if ok else "FAIL", p.a, p.b, diff)
 				}
+				// The same separation in Light. It used to be asserted for Dark only,
+				// on the reasoning that "Light deliberately placed those two close
+				// together" -- but the gutter numbers are Text_Muted in BOTH themes and
+				// sit beside comment text in both, so the argument never actually
+				// turned on which theme was active. The UI spec setting syn_comment and
+				// text_muted to one value in both of its files is what surfaced it.
+				lt := theme_light()
+				for p in pairs {
+					diff := max_chan_diff(lt[p.a], lt[p.b])
+					ok := diff >= 0.10
+					if !ok {fail = true}
+					fmt.printfln("  %-6s Light %v vs %v: max channel diff %.3f (need >= 0.10)", "ok" if ok else "FAIL", p.a, p.b, diff)
+				}
+			}
+
+			// WCAG contrast on the six pairs spec 17 names -- "those cover every
+			// place text sits on a themeable fill" -- plus the scrollbar thumb at the
+			// 3:1 non-text floor.
+			//
+			// Computed from the theme values, never compared against the ratios
+			// written in the spec's own comments: asserting those would test the spec
+			// rather than the code, and two of them are wrong -- both built-ins
+			// annotate scrollbar_thumb "3.0 against bg_base" for values that measure
+			// 1.42 and 1.67. That pair is in this list precisely because it is the
+			// one the spec got wrong.
+			//
+			// Text_Dim is deliberately absent: it is disabled-only (2.9 and 2.8), and
+			// WCAG explicitly exempts disabled controls.
+			{
+				lum :: proc(c: [4]f32) -> f64 {
+					ch :: proc(v: f32) -> f64 {
+						x := f64(v)
+						return x / 12.92 if x <= 0.04045 else math.pow((x + 0.055) / 1.055, 2.4)
+					}
+					return 0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2])
+				}
+				ratio :: proc(fg, bg: [4]f32) -> f64 {
+					a, b := lum(fg), lum(bg)
+					if a < b {a, b = b, a}
+					return (a + 0.05) / (b + 0.05)
+				}
+				cpairs := []struct {
+					fg, bg: Color_Role,
+					min:    f64,
+					what:   string,
+				} {
+					{.Text_Primary, .Bg_Base, 4.5, "body on the page"},
+					{.Text_Secondary, .Bg_Panel, 4.5, "chrome text on the frame"},
+					{.Text_Muted, .Bg_Base, 4.5, "hints and accelerators"},
+					{.Text_Primary, .Selection_Doc, 4.5, "body inside a selection"},
+					{.Text_Primary, .Find_Match_Bg, 4.5, "body inside a find match"},
+					{.Filter_Text, .Filter_Bg, 4.5, "the filter band"},
+					{.Scrollbar_Thumb, .Bg_Base, 3.0, "scrollbar thumb (non-text, 1.4.11)"},
+				}
+				cl := theme_light()
+				for th, ti in ([]Theme{d, cl}) {
+					name := "Dark " if ti == 0 else "Light"
+					for p in cpairs {
+						r := ratio(th[p.fg], th[p.bg])
+						ok := r >= p.min
+						if !ok {fail = true}
+						fmt.printfln(
+							"  %-6s %s %v on %v: %.2f:1 (need %.1f) -- %s",
+							"ok" if ok else "FAIL", name, p.fg, p.bg, r, p.min, p.what,
+						)
+					}
+				}
 			}
 
 			// The role<->key mapping is a total array over Color_Role, so a role
@@ -8511,79 +8641,25 @@ when NEWTPAD_TESTS {
 				fmt.printfln("  %-6s \"base\" is not a role key", "ok" if ok else "FAIL")
 			}
 
-			in_set :: proc(got: [4]f32, set: [][4]f32) -> bool {
-				for v in set {if got == v {return true}}
-				return false
-			}
-			chk :: proc(d: Theme, role: Color_Role, absorbs: [][4]f32, fail: ^bool) {
-				got := d[role]
-				ok := in_set(got, absorbs)
-				if !ok {fail^ = true}
-				fmt.printfln("  %-6s %-16v got=%v absorbs=%v", "ok" if ok else "FAIL", role, got, absorbs)
-			}
-
 			fmt.println("themetest:")
-			// Neutrals: 10 roles absorbing 42 values across 81 sites.
-			chk(d, .Bg_Base, {{0.09, 0.11, 0.16, 1}, {0.10, 0.12, 0.16, 1}, {0.11, 0.13, 0.17, 1}}, &fail) // #171C29 #1A1F29 #1C212B
-			chk(
-				d,
-				.Bg_Panel,
-				{{0.12, 0.14, 0.18, 1}, {0.12, 0.14, 0.19, 1}, {0.13, 0.15, 0.20, 1}, {0.14, 0.16, 0.20, 1}, {0.14, 0.16, 0.21, 1}, {0.15, 0.17, 0.22, 1}},
-				&fail,
-			) // #1F242E #1F2430 #212633 #242933 #242936 #262B38
-			chk(d, .Bg_Raised, {{0.16, 0.18, 0.22, 1}, {0.16, 0.20, 0.27, 1}}, &fail) // #292E38 #293345
-			chk(d, .Border_Subtle, {{0.20, 0.23, 0.30, 1}, {0.24, 0.27, 0.33, 1}}, &fail) // #333B4C #3D4554
-			chk(d, .Border_Strong, {{0.28, 0.32, 0.40, 1}, {0.30, 0.34, 0.42, 1}}, &fail) // #475266 #4C576B
-			chk(
-				d,
-				.Text_Muted,
-				{
-					{0.42, 0.46, 0.54, 1},
-					{0.42, 0.47, 0.56, 1},
-					{0.42, 0.48, 0.60, 1},
-					{0.45, 0.49, 0.57, 1},
-					{0.48, 0.52, 0.60, 1},
-					{0.50, 0.54, 0.62, 1},
-					{0.50, 0.55, 0.64, 1},
-				},
-				&fail,
-			) // #6B758A #6B788F #6B7A99 #737D91 #7A8599 #808A9E #808CA3
-			chk(
-				d,
-				.Text_Dim,
-				{{0.55, 0.60, 0.70, 1}, {0.58, 0.64, 0.76, 1}, {0.60, 0.64, 0.72, 1}, {0.62, 0.68, 0.80, 1}, {0.66, 0.70, 0.78, 1}},
-				&fail,
-			) // #8C99B2 #94A3C2 #99A3B8 #9EADCC #A8B2C7
-			chk(
-				d,
-				.Text_Secondary,
-				{{0.72, 0.76, 0.84, 1}, {0.72, 0.78, 0.88, 1}, {0.75, 0.79, 0.86, 1}, {0.75, 0.80, 0.88, 1}, {0.80, 0.84, 0.90, 1}},
-				&fail,
-			) // #B8C2D6 #B8C7E0 #BFC9DB #BFCCE0 #CCD6E6
-			chk(
-				d,
-				.Text_Primary,
-				{{0.86, 0.90, 0.96, 1}, {0.88, 0.91, 0.96, 1}, {0.90, 0.92, 0.97, 1}, {0.92, 0.94, 0.98, 1}, {0.94, 0.96, 0.99, 1}, {0.95, 0.96, 0.99, 1}},
-				&fail,
-			) // #DBE6F5 #E0E8F5 #E6EBF7 #EBF0FA #F0F5FC #F2F5FC
-			chk(d, .Text_Bright, {{0.96, 0.96, 0.98, 1}, {0.98, 0.99, 1.0, 1}, {1, 1, 1, 1}, {0.82, 0.90, 0.98, 1}}, &fail) // #F5F5FA #FAFCFF #FFFFFF #D1E6FA
-
-			// Accents: 15 roles, each carrying real meaning.
-			chk(d, .Selection_Doc, {{0.20, 0.30, 0.48, 1}}, &fail) // #334C7A
-			chk(d, .Selection_List, {{0.20, 0.28, 0.42, 1}, {0.20, 0.30, 0.45, 1}, {0.24, 0.30, 0.42, 1}, {0.18, 0.24, 0.34, 1}}, &fail) // #33476B #334C73 #3D4C6B #2E3D57
-			chk(d, .Caret, {{0.95, 0.85, 0.35, 1}}, &fail) // #F2D959
-			chk(d, .Accent, {{0.95, 0.88, 0.55, 1}, {0.80, 0.76, 0.50, 1}}, &fail) // #F2E08C #CCC280
-			chk(d, .Find_Match_Bg, {{0.42, 0.38, 0.16, 1}}, &fail) // #6B6129
-			chk(d, .Link, {{0.45, 0.70, 0.98, 1}}, &fail) // #73B2FA
-			chk(d, .Warning, {{0.95, 0.55, 0.35, 1}}, &fail) // #F28C59
-			chk(d, .Danger, {{0.75, 0.16, 0.16, 1}}, &fail) // #BF2929
-			chk(d, .Success, {{0.55, 0.85, 0.60, 1}}, &fail) // #8CD999
-			chk(d, .Filter_Bg, {{0.18, 0.26, 0.20, 1}}, &fail) // #2E4233
-			chk(d, .Filter_Text, {{0.70, 0.90, 0.74, 1}}, &fail) // #B2E6BD
-			chk(d, .Md_Heading, {{0.72, 0.85, 1.0, 1}}, &fail) // #B8D9FF
-			chk(d, .Md_Code, {{0.95, 0.80, 0.65, 1}}, &fail) // #F2CCA6
-			chk(d, .Md_Italic, {{0.80, 0.86, 0.78, 1}}, &fail) // #CCDBC7
-			chk(d, .Md_Quote, {{0.66, 0.72, 0.62, 1}}, &fail) // #A8B89E
+			// The absorbed-set assertions that stood here are GONE, deliberately.
+			//
+			// They checked that every Dark role still held one of the pre-migration
+			// literals it was consolidated from, and theme.odin's header describes
+			// exactly why: "The mechanical guard for that migration isn't 'nothing
+			// changed', it's 'every changed pixel was one of the literals this
+			// role's comment lists below'." That guard was for the batch-3
+			// migration, which completed in 6v. What it becomes afterwards is a
+			// lock: the palette can never be RETUNED, because any new value is by
+			// definition not one of the 2026-07-25 literals. Batch 12 repaints both
+			// built-ins warm, so all 25 of these fired at once -- not one of them
+			// reporting a defect.
+			//
+			// Replaced by the contrast assertions above, which are a durable
+			// property of a palette rather than a one-time migration receipt: they
+			// constrain what a retune may do without dictating what it must be. The
+			// role comments in theme.odin still carry the absorbed-literal lists, so
+			// the consolidation history is not lost -- only the assertion is.
 
 			// Light is the theme that can actually fail (see theme.odin's
 			// theme_light comment and task-4-report.md): every one of Dark's
@@ -8604,11 +8680,17 @@ when NEWTPAD_TESTS {
 
 			// The only role deliberately identical between the two themes, and
 			// why -- see also the note above Danger's line in theme_light().
+			// NO role is shared any more. Danger used to be, on the argument that
+			// it is "a solid opaque hover fill, never blended with either theme's
+			// chrome" -- true as far as it goes, but it ignores what is drawn ON
+			// the fill. Batch 12 gives Light its own #B23A30, which carries white
+			// at 5.4:1 where Dark's #C0453B carries it at 4.7:1; a red tuned to sit
+			// in dark chrome is not automatically the right red beside warm paper.
+			//
+			// The proc stays rather than being deleted along with its one case: it
+			// is the seam the "every role differs" rule below is expressed through,
+			// and a future deliberately-shared role needs somewhere to say so.
 			is_shared_role :: proc(role: Color_Role) -> (shared: bool, reason: string) {
-				#partial switch role {
-				case .Danger:
-					return true, "solid opaque hover fill, never blended with either theme's chrome; Windows renders the close-tab hover in the same red regardless of system theme"
-				}
 				return false, ""
 			}
 
@@ -10056,6 +10138,237 @@ when NEWTPAD_TESTS {
 			}
 
 			fmt.println("splittest: FAILURES" if fail else "splittest: all ok")
+			return true
+		}
+
+		// `newtpad metricstest` covers the two DPI rounding rules the UI spec calls
+		// hard (§3 items 4 and 6), at the five scales its §3.8 test matrix names.
+		//
+		// It exists because neither rule is checkable by looking at a frame in this
+		// environment, and both fail in a way that reads as "the renderer is a bit
+		// soft" rather than as a bug: a hairline rounded up to 2px straddling two
+		// device pixels renders as two half-alpha lines, and an odd chrome font size
+		// puts every vertically-centred baseline on a half pixel.
+		if os.args[1] == "metricstest" {
+			bad := 0
+			mt_chk :: proc(bad: ^int, ok: bool, label: string) {
+				if !ok {bad^ += 1}
+				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+			}
+
+			fmt.println("metricstest:")
+			// UI_SCALE is a global the whole program reads, so it is saved and put
+			// back -- leaving it at 2.0 would follow every later mode in this
+			// process, exactly the way findtest's GUTTER_W note describes.
+			saved := UI_SCALE
+			defer UI_SCALE = saved
+
+			// 175% is in this list for a reason: it is the scale where floor and
+			// round DISAGREE (1.75 -> 1 vs 2), so it is the case that can tell the
+			// two rules apart. 100 and 200 agree under either and prove nothing on
+			// their own.
+			for s in ([]f32{1.0, 1.25, 1.5, 1.75, 2.0}) {
+				UI_SCALE = s
+				h := hairline()
+				mt_chk(&bad, h == max(1, f32(int(s))), fmt.tprintf("scale %.2f: hairline = %.0f (floor of the scale, min 1)", s, h))
+				mt_chk(&bad, h == f32(int(h)), fmt.tprintf("scale %.2f: hairline %.1f is a whole pixel", s, h))
+				// The rounded alternative, computed here rather than asserted
+				// against, so the report shows WHAT the rule is buying at each
+				// scale instead of only that it held.
+				rounded := max(1, f32(int(s + 0.5)))
+				if rounded != h {
+					fmt.printfln("         (round would give %.0f here -- this is a scale where the rule bites)", rounded)
+				}
+
+				p := ui_px_even(UI_PX_96 * s)
+				mt_chk(&bad, int(p) % 2 == 0, fmt.tprintf("scale %.2f: chrome px %.0f is even", s, p))
+				mt_chk(&bad, p >= 2, fmt.tprintf("scale %.2f: chrome px %.0f never collapses to zero", s, p))
+				lh := line_height(p)
+				mt_chk(&bad, lh == f32(int(lh)), fmt.tprintf("scale %.2f: line height %.1f is whole", s, lh))
+				// The property the evenness is FOR: a glyph centred in a row of
+				// even height lands on a whole pixel, not a half one.
+				mt_chk(&bad, f32(int(p * 0.5)) == p * 0.5, fmt.tprintf("scale %.2f: half of chrome px (%.1f) is whole -- centring cannot land mid-pixel", s, p * 0.5))
+
+				// --- the derived-metric seams ---
+				//
+				// sx() is the same arithmetic metrics_recompute's dp() performs
+				// (int(v*scale + 0.5), clamped up for positives); dp reads the
+				// window's scale where sx reads UI_SCALE, and metrics_recompute
+				// assigns one from the other before anything else. So computing the
+				// expected values here with sx() exercises the real rounding rather
+				// than a second copy of it.
+				tab_h := sx(TAB_STRIP_H_96)
+				menu_h := sx(MENU_BAR_H_96)
+				margin_y := sx(TEXT_MARGIN_Y_96)
+				lane := sx(SCROLLBAR_W_96)
+				bar := sx(SCROLLBAR_TRACK_W_96)
+				status := sx(STATUS_BAR_H_96)
+
+				// The two derived tops. CHROME_TOP and CONTENT_TOP are each written
+				// in two places -- their declaration in doc.odin and again in
+				// metrics_recompute -- and the declaration's comment says outright
+				// that "the initialiser here must stay in step with
+				// metrics_recompute, since the headless test modes never call that."
+				// This is what makes that a checked claim instead of a note.
+				mt_chk(&bad, tab_h + menu_h == sx(TAB_STRIP_H_96) + sx(MENU_BAR_H_96), fmt.tprintf("scale %.2f: chrome top = rail %.0f + menu bar %.0f = %.0f", s, tab_h, menu_h, tab_h + menu_h))
+				mt_chk(&bad, margin_y > 0, fmt.tprintf("scale %.2f: editor top padding %.0f is never zero -- the first line needs air", s, margin_y))
+
+				// The scrollbar's two numbers. The drawn bar has to FIT the lane
+				// every content-right-edge computation reserves, and the leftover is
+				// the inset from the window edge. A bar wider than its lane would
+				// render over the text it is supposed to sit beside -- which is the
+				// failure the single SCROLLBAR_W could not have, and the one this
+				// split introduces the possibility of.
+				mt_chk(&bad, bar <= lane, fmt.tprintf("scale %.2f: scrollbar bar %.0f fits its reserved lane %.0f", s, bar, lane))
+				mt_chk(&bad, lane - bar > 0, fmt.tprintf("scale %.2f: scrollbar inset from the edge is %.0f (> 0)", s, lane - bar))
+
+				// The status line must be taller than the text drawn in it, or the
+				// glyphs are clipped by the bar that owns the strip.
+				small := ui_px_even(UI_SMALL_PX_96 * s)
+				mt_chk(&bad, status > small, fmt.tprintf("scale %.2f: status bar %.0f is taller than its %.0f text", s, status, small))
+			}
+
+			// doc_bottom_bar_h is the ONE definition of the bottom strip's height --
+			// the row count, the scrollbar track, the Split divider and the
+			// press-swallow strip all read it. With find closed it must be exactly
+			// the status bar, or those five disagree with what is drawn.
+			{
+				UI_SCALE = 1
+				STATUS_BAR_H = sx(STATUS_BAR_H_96)
+				doc: Document
+				doc.kind = .Text
+				got := doc_bottom_bar_h(&doc)
+				mt_chk(&bad, got == STATUS_BAR_H, fmt.tprintf("find closed: bottom bar %.0f == status bar %.0f", got, STATUS_BAR_H))
+			}
+
+			// NOT asserted, deliberately, and recorded so the next batch does not
+			// think it was forgotten: UI spec 3.8 lists "the active tab's left edge
+			// against the editor's left padding" as one of four checks that catch
+			// nearly everything. Tabs currently start at MENU_W (ui_tabs.odin) --
+			// the hamburger button occupies that space by design -- so the two are
+			// not meant to line up yet. Asserting it today would fail for a reason
+			// that is not a defect. It belongs with the rail rebuild in batch 13,
+			// where the spec's 4.2 pills replace the fixed-width tabs.
+
+			fmt.printfln("metricstest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad quadsdftest` renders quads on a REAL D3D11 device (offscreen, no
+		// window) and reads the pixels back. The claim it checks is about the GPU --
+		// the antialiasing comes from fwidth, a hardware derivative -- and CLAUDE.md
+		// asks for a real device over arithmetic exactly there. A CPU port of
+		// sd_round_box would agree with itself and prove nothing.
+		//
+		// The property that matters most is the boring one: a quad with radius 0 and
+		// softness 0, on integer bounds, must come out EXACTLY as it did before the
+		// distance field existed. Every piece of chrome in the app is that quad.
+		if os.args[1] == "quadsdftest" {
+			qs_run :: proc() -> int {
+				bad := 0
+				qs_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				W :: 64
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, W, W, "quadsdftest") {return 1}
+				defer headless_gpu_destroy(&h)
+
+				// BGRA8, so channel 2 is red and channel 3 is alpha.
+				//
+				// Coverage is read off the COLOUR channel, never off alpha: the frame
+				// is cleared to OPAQUE black, so every pixel comes back a=255 whether
+				// it was drawn over or not. A half-covered red quad over that clear
+				// reads r=128, which is the actual evidence of a soft edge.
+				px :: proc(buf: []u8, x, y: int) -> (b, g, r, a: u8) {
+					i := (y * W + x) * 4
+					return buf[i], buf[i + 1], buf[i + 2], buf[i + 3]
+				}
+				shot :: proc(h: ^Headless_Gpu, quads: []plat.Quad) -> []u8 {
+					plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+					plat.quads_draw(&h.gfx, &h.quads, quads)
+					buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if !ok {return nil}
+					return buf
+				}
+
+				fmt.println("quadsdftest:")
+
+				// 1. The zero value is a hard-edged rectangle.
+				{
+					buf := shot(&h, []plat.Quad{{pos = {16, 16}, size = {32, 32}, color = {1, 0, 0, 1}}})
+					qs_chk(&bad, buf != nil, "readback from the offscreen target")
+					if buf == nil {return bad}
+					_, _, r_in, a_in := px(buf, 32, 32)
+					_, _, r_out, _ := px(buf, 4, 4)
+					// The corner pixel of a SQUARE rect must be fully covered. This is
+					// the assertion that fails if a radius leaks in when none was asked
+					// for, which is the one regression that would touch every widget.
+					_, _, r_corner, a_corner := px(buf, 16, 16)
+					qs_chk(&bad, r_in == 255 && a_in == 255, fmt.tprintf("radius 0: interior is opaque (r=%d a=%d)", r_in, a_in))
+					qs_chk(&bad, r_out == 0, fmt.tprintf("radius 0: outside is untouched (r=%d)", r_out))
+					qs_chk(&bad, r_corner == 255 && a_corner == 255, fmt.tprintf("radius 0: the CORNER pixel is fully covered (r=%d a=%d)", r_corner, a_corner))
+					// Every pixel of the interior, not just the middle one: a shader
+					// that antialiased the whole face rather than its edge would pass
+					// a single-point check.
+					solid := true
+					sx_, sy_, sv_ := -1, -1, -1
+					for y in 17 ..< 47 {for x in 17 ..< 47 {
+						_, _, rr, _ := px(buf, x, y)
+						if rr != 255 && solid {solid = false;sx_, sy_, sv_ = x, y, int(rr)}
+					}}
+					qs_chk(&bad, solid, fmt.tprintf("radius 0: the whole interior is uniformly opaque (first bad px %d,%d = %d)", sx_, sy_, sv_))
+				}
+
+				// 2. A radius actually rounds, and only the corner.
+				{
+					buf := shot(&h, []plat.Quad{{pos = {16, 16}, size = {32, 32}, color = {1, 0, 0, 1}, radius = {10, 10, 10, 10}}})
+					if buf == nil {return bad + 1}
+					_, _, r_corner, _ := px(buf, 16, 16)
+					_, _, r_mid, _ := px(buf, 32, 32)
+					_, _, r_edge, _ := px(buf, 32, 17) // top edge, away from any corner
+					qs_chk(&bad, r_corner == 0, fmt.tprintf("radius 10: the corner pixel is cut away (r=%d)", r_corner))
+					qs_chk(&bad, r_mid == 255, fmt.tprintf("radius 10: the centre is still solid (r=%d)", r_mid))
+					qs_chk(&bad, r_edge == 255, fmt.tprintf("radius 10: a mid-edge pixel is untouched (r=%d)", r_edge))
+					// The rounding is ANTIALIASED, not stair-stepped: somewhere along
+					// the corner arc there is a partially covered pixel. A hard cut
+					// would pass the three checks above and look wrong on screen.
+					partial := false
+					for y in 16 ..< 27 {for x in 16 ..< 27 {
+						_, _, rr, _ := px(buf, x, y)
+						if rr > 8 && rr < 247 {partial = true}
+					}}
+					qs_chk(&bad, partial, "radius 10: the arc is antialiased, not stair-stepped")
+				}
+
+				// 3. Softness spreads beyond the rect -- the shadow case, one quad.
+				{
+					buf := shot(&h, []plat.Quad{{pos = {24, 24}, size = {16, 16}, color = {1, 1, 1, 1}, softness = 8}})
+					if buf == nil {return bad + 1}
+					_, _, r_out, _ := px(buf, 20, 32) // 4px OUTSIDE the left edge
+					_, _, r_far, _ := px(buf, 2, 32) // far outside: nothing
+					qs_chk(&bad, r_out > 0 && r_out < 255, fmt.tprintf("softness 8: the fill bleeds past the edge (r=%d)", r_out))
+					qs_chk(&bad, r_far == 0, fmt.tprintf("softness 8: it still falls off to nothing (r=%d)", r_far))
+				}
+
+				// 4. Alpha blends over what is already there. The pass bound NO blend
+				// state before this batch, so a translucent quad wrote its colour
+				// opaque; the SDF resolves its edge in alpha and cannot work that way.
+				{
+					buf := shot(&h, []plat.Quad {
+						{pos = {0, 0}, size = {64, 64}, color = {1, 0, 0, 1}},
+						{pos = {16, 16}, size = {32, 32}, color = {0, 0, 1, 0.5}},
+					})
+					if buf == nil {return bad + 1}
+					b, _, r, _ := px(buf, 32, 32)
+					qs_chk(&bad, r > 100 && r < 155 && b > 100 && b < 155, fmt.tprintf("a 50%% quad blends with what is under it (r=%d b=%d)", r, b))
+				}
+
+				return bad
+			}
+			bad := qs_run()
+			fmt.printfln("quadsdftest: %d failures", bad)
 			return true
 		}
 
