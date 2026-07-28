@@ -1240,6 +1240,35 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Remove_Duplicate_Lines:
 		sort_lines_dispatch(app, doc, .Dedupe)
 	case .Toggle_Wrap:
+		// Refuse, with a reason, in the views that lay the document out
+		// themselves and therefore ignore this flag entirely.
+		//
+		// It used to flip doc.wrap unconditionally. In the grid, in Markdown
+		// Preview and in Markdown Split nothing reads the flag -- the grid draws
+		// cells, markdown_draw replaces the text pass, and Split force-wraps via
+		// doc_wraps regardless -- so Alt+Z was a key that did nothing, silently,
+		// with no way to tell that from a broken build. Wyatt hit exactly that
+		// and reported word wrap "wasn't toggling in the viewport".
+		//
+		// Refusing rather than flipping quietly is the point: a flip you cannot
+		// see leaves the setting somewhere you did not choose, and you find out
+		// when you leave the view. Same shape as block.odin's Wrap_On/Split_On
+		// refusals, and each note names the key that gets you out, because "does
+		// not apply here" is only useful with "here is how to leave here".
+		if doc != nil && doc.kind == .Text {
+			if doc.table {
+				app_note(app, "[WORD WRAP DOESN'T APPLY IN TABLE VIEW - press Ctrl+T]")
+				return
+			}
+			#partial switch doc.md_mode {
+			case .Preview:
+				app_note(app, "[WORD WRAP DOESN'T APPLY IN MARKDOWN PREVIEW - press Ctrl+M]")
+				return
+			case .Split:
+				app_note(app, "[MARKDOWN SPLIT ALWAYS WRAPS - press Ctrl+M to leave it]")
+				return
+			}
+		}
 		doc.wrap = !doc.wrap
 		doc.top = base.pt_line_start(&doc.pt, doc.top) // re-anchor top to a logical line start
 		// Wrap changes what a rectangle's (line, cell) pair even means -- a
