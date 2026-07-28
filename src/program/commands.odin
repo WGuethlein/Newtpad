@@ -127,6 +127,8 @@ Command_Id :: enum u8 {
 	Keys_Edit,
 	Rules_Edit,
 	Open_Logs_Folder,
+	// help
+	Check_For_Updates,
 	// font page (Edit > Font)
 	Font_Open,
 	Font_Close,
@@ -254,6 +256,10 @@ command_table := [Command_Id]Command {
 	.Keys_Edit                = {"Edit Keybindings...", "View"},
 	.Rules_Edit               = {"Edit Colour Rules...", "View"},
 	.Open_Logs_Folder         = {"Open Logs Folder", "View"},
+	// The only command in the product that touches the network, and the title
+	// says so. The user should not have to guess which row leaves the machine,
+	// and the menu row and the palette entry both read from this one string.
+	.Check_For_Updates        = {"Check for Updates (contacts GitHub)", "Help"},
 	.Font_Open                = {"Font...", "Edit"},
 	.Font_Close               = {"Font: Close", "Edit"},
 	.Font_Next                = {"Font: Next", "Edit"},
@@ -1474,6 +1480,16 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		} else {
 			app_note(app, "[COULD NOT OPEN THE LOGS FOLDER]")
 		}
+
+	// --- help ---
+	case .Check_For_Updates:
+		// Starts a worker and returns immediately. The request itself must never
+		// run here: this is the UI thread, and a synchronous connect on a captive
+		// portal would freeze the window for the whole timeout. update_poll (the
+		// frame loop) surfaces the answer. See update.odin.
+		menu_close(app)
+		update_start(app)
+
 	case .Settings_Close:
 		request_close_tab(app, app.active, w)
 	case .Settings_Next:

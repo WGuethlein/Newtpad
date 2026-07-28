@@ -235,6 +235,19 @@ menus := []Menu {
 			{cmd = .Eol_CRLF, checked = is_eol_crlf, enabled = has_doc},
 		},
 	},
+	{
+		// The header above notes that Windows 11 Notepad has no Help menu. It also
+		// does not ship outside the Store, so it has nothing to check for. A
+		// standalone exe a stranger downloaded needs one reachable place to ask
+		// whether it is current, and burying the product's only network command in
+		// View would be worse than a short menu.
+		//
+		// No `enabled` predicate: this is the one row that means the same thing on
+		// a Settings or Font pseudo-tab as it does on a document.
+		"Help",
+		'h',
+		[]Menu_Item{{cmd = .Check_For_Updates}},
+	},
 }
 
 // Menu bar / dropdown state. `mode` is menu-bar keyboard mode with nothing open

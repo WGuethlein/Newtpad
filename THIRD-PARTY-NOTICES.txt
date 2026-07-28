@@ -1,0 +1,46 @@
+Newtpad — third-party notices
+================================================================================
+
+Newtpad is written in Odin and links against Microsoft Windows system
+libraries. It bundles and redistributes no third-party components: there is no
+runtime to install, no DLL beside the exe, and nothing vendored into the tree.
+
+This list is short today and it is far cheaper to keep current than to
+reconstruct later. If a dependency is ever added, add it here in the same
+commit.
+
+--------------------------------------------------------------------------------
+Odin — standard library and vendor collections
+--------------------------------------------------------------------------------
+https://odin-lang.org
+BSD-3-Clause. Copyright (c) 2016-2024 Ginger Bill. All rights reserved.
+
+Used: the `core` collection (including `core:text/regex`) and
+`vendor:directx/d3d11`. Odin's own copyright and licence terms apply to those
+portions. The full licence text ships with the Odin distribution as LICENSE.
+
+--------------------------------------------------------------------------------
+Microsoft Windows APIs
+--------------------------------------------------------------------------------
+Direct3D 11, DXGI, DirectWrite, Win32, WinHTTP, DbgHelp, Shell, and common
+controls. Used through the operating system under its own terms; nothing is
+redistributed.
+
+The DirectWrite and WinHTTP bindings in this project (src/platform/dwrite.odin,
+src/platform/http.odin) are hand-written declarations of the public API,
+authored for Newtpad and covered by Newtpad's own licence.
+
+--------------------------------------------------------------------------------
+Fonts
+--------------------------------------------------------------------------------
+Newtpad renders using fonts already installed on the system — Consolas,
+Microsoft YaHei, Segoe UI and Segoe UI Symbol by default, and whichever family
+the user selects. No font files are bundled or redistributed.
+
+--------------------------------------------------------------------------------
+Build-time tools (not distributed, not linked)
+--------------------------------------------------------------------------------
+The Odin compiler, the Microsoft C/C++ toolchain (cl, rc, link) for the SEH
+shim and the DPI manifest resource, and — for producing the optional installer
+— Inno Setup (https://jrsoftware.org/isinfo.php). None of these is part of the
+shipped binary.

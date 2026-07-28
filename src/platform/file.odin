@@ -423,6 +423,8 @@ ID_NO :: 7
 MB_YESNO :: 0x00000004
 @(private = "file")
 MB_DEFBUTTON2 :: 0x00000100 // second button is default: Cancel, not the destructive one
+@(private = "file")
+MB_ICONQUESTION :: 0x00000020
 
 Save_Choice :: enum {
 	Save,
@@ -460,6 +462,15 @@ write_error_text :: proc(e: Write_Error, path: string) -> string {
 		return ""
 	}
 	return ""
+}
+
+// A plain Yes/No question with nothing destructive behind either answer, so Yes
+// is the default button (unlike confirm_reopen, where a mis-aimed Enter costs
+// unsaved work). The caller supplies the whole text; this only owns the framing.
+confirm_question :: proc(owner: win.HWND, text: string) -> bool {
+	wmsg := win.utf8_to_wstring(text, context.temp_allocator)
+	wcap := win.utf8_to_wstring("Newtpad", context.temp_allocator)
+	return win.MessageBoxW(owner, wmsg, wcap, MB_YESNO | MB_ICONQUESTION) == ID_YES
 }
 
 confirm_discard :: proc(owner: win.HWND, name: string) -> Save_Choice {

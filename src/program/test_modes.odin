@@ -14486,6 +14486,525 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad httptest [live]` -- platform/http.odin.
+		//
+		// Everything that can be checked without a socket is checked by default,
+		// and the one thing that cannot -- a real request -- is opt-in behind
+		// `live`. A suite that goes red on an offline machine, on a train, or
+		// behind a corporate proxy is a suite people learn to skip, and then it
+		// stops catching anything.
+		//
+		// The size cap is the interesting one, because "refuse rather than
+		// allocate whatever the server sends" is a property of the read loop and
+		// the read loop needs a server. It is testable here because http_get's
+		// loop does nothing to the body except hand each WinHttpReadData chunk to
+		// http_sink_push -- so pushing synthetic chunks exercises the same code
+		// that guards the real one. That seam is the reason the cap is not an
+		// untested claim.
+		if os.args[1] == "httptest" {
+			http_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			// The cap: at the boundary, one byte over, and sticky afterwards.
+			http_sink_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- size cap (Http_Sink) ---")
+				ten := make([]u8, 10, context.temp_allocator)
+				{
+					s := plat.Http_Sink{max = 10}
+					defer delete(s.buf)
+					chk(bad, plat.http_sink_push(&s, ten[:4]), "4 of 10 accepted")
+					chk(bad, len(s.buf) == 4, fmt.tprintf("buffered 4, got %d", len(s.buf)))
+					chk(bad, plat.http_sink_push(&s, ten[:6]), "exactly at the cap accepted")
+					chk(bad, len(s.buf) == 10, fmt.tprintf("buffered 10, got %d", len(s.buf)))
+					chk(bad, !plat.http_sink_push(&s, ten[:1]), "one byte past the cap refused")
+					chk(bad, s.over, "refusal latches `over`")
+					// The point of enforcing inside the loop: the refused chunk is
+					// never allocated. If the cap were applied after the read loop
+					// this would be 11.
+					chk(bad, len(s.buf) == 10, fmt.tprintf("refused chunk not buffered: len=%d", len(s.buf)))
+					// Sticky: a later small chunk must not un-refuse the response.
+					chk(bad, !plat.http_sink_push(&s, ten[:1]), "still refused after `over`")
+					chk(bad, len(s.buf) == 10, fmt.tprintf("still 10 after the second refusal: %d", len(s.buf)))
+				}
+				{
+					s := plat.Http_Sink{max = 10}
+					defer delete(s.buf)
+					chk(bad, plat.http_sink_push(&s, ten[:]), "a first chunk exactly at the cap is accepted")
+				}
+				{
+					// One oversized chunk on an empty sink: nothing is allocated at
+					// all, which is the case a hostile Content-Length produces.
+					s := plat.Http_Sink{max = 9}
+					defer delete(s.buf)
+					chk(bad, !plat.http_sink_push(&s, ten[:]), "an oversized first chunk is refused")
+					chk(bad, len(s.buf) == 0, fmt.tprintf("nothing buffered from the refused first chunk: %d", len(s.buf)))
+				}
+			}
+
+			// Host/path validation: the whole of http_get's input checking, since
+			// it is handed a host and a path rather than a URL to parse.
+			http_input_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- host / path validation ---")
+				good_hosts := []string{"api.github.com", "example.org", "a", "xn--80ak6aa92e.com"}
+				for h in good_hosts {
+					chk(bad, plat.http_host_ok(h), fmt.tprintf("host accepted: %q", h))
+				}
+				bad_hosts := []string {
+					"", // empty
+					"api.github.com/evil", // a path smuggled into the host
+					"api.github.com:8080", // a port
+					"user@api.github.com", // userinfo
+					"api github com", // space
+					"api.github.com\r\nHost: evil", // header injection
+					"[::1]", // bracketed literal
+					"exämple.com", // non-ASCII (must arrive punycoded)
+					"a%2fb", // percent-encoded separator
+				}
+				for h in bad_hosts {
+					chk(bad, !plat.http_host_ok(h), fmt.tprintf("host refused: %q", h))
+				}
+				long253 := strings.repeat("a", 253, context.temp_allocator)
+				long254 := strings.repeat("a", 254, context.temp_allocator)
+				chk(bad, plat.http_host_ok(long253), "253-char host accepted")
+				chk(bad, !plat.http_host_ok(long254), "254-char host refused")
+
+				chk(bad, plat.http_path_ok("/repos/WGuethlein/Newtpad/releases/latest"), "the update path is accepted")
+				chk(bad, plat.http_path_ok("/"), "bare / accepted")
+				chk(bad, !plat.http_path_ok(""), "empty path refused")
+				chk(bad, !plat.http_path_ok("repos/x"), "path without a leading / refused")
+				chk(bad, !plat.http_path_ok("/a b"), "path with a space refused")
+				chk(bad, !plat.http_path_ok("/a\r\nX-Evil: 1"), "request splitting refused")
+				chk(bad, !plat.http_path_ok("/ä"), "non-ASCII path refused")
+				long := strings.concatenate({"/", strings.repeat("a", 2048, context.temp_allocator)}, context.temp_allocator)
+				chk(bad, !plat.http_path_ok(long), "2049-char path refused")
+			}
+
+			// The two pure classifiers. Both decide whether the caller says
+			// "could not check", so both are worth pinning.
+			http_classify_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- result classification ---")
+				chk(bad, plat.http_result_for_error(12002) == .Timeout, "ERROR_WINHTTP_TIMEOUT -> .Timeout")
+				chk(bad, plat.http_result_for_error(12007) == .Network, "NAME_NOT_RESOLVED -> .Network")
+				chk(bad, plat.http_result_for_error(12029) == .Network, "CANNOT_CONNECT -> .Network")
+				chk(bad, plat.http_result_for_error(0) == .Network, "no error code -> .Network")
+				oks := []int{200, 201, 204, 299}
+				for s in oks {
+					chk(bad, plat.http_result_for_status(s) == .Ok, fmt.tprintf("HTTP %d -> .Ok", s))
+				}
+				// 301 matters specifically: redirects are disabled, so a moved
+				// endpoint must read as "could not check", never as an answer.
+				nots := []int{0, 100, 199, 301, 302, 304, 403, 404, 429, 500, 503}
+				for s in nots {
+					chk(bad, plat.http_result_for_status(s) == .Bad_Status, fmt.tprintf("HTTP %d -> .Bad_Status", s))
+				}
+			}
+
+			// The real request. Opt-in, and it asserts nothing about the network's
+			// mood -- only that http_get returns a coherent triple and never a
+			// body on a non-Ok result.
+			http_live_case :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				CAP :: 256 * 1024
+				fmt.println("--- live request (api.github.com) ---")
+				body, status, res := plat.http_get("api.github.com", "/repos/WGuethlein/Newtpad/releases/latest", CAP, 5000)
+				defer delete(body)
+				fmt.printfln("  res=%v status=%d bytes=%d", res, status, len(body))
+				chk(bad, res == .Ok || body == nil, "a non-Ok result returns no body")
+				if res == .Ok {
+					chk(bad, status >= 200 && status < 300, fmt.tprintf(".Ok came with status %d", status))
+					chk(bad, len(body) > 0 && len(body) <= CAP, fmt.tprintf("body within the cap: %d", len(body)))
+				}
+				// The cap, against a real socket: one byte of headroom is not
+				// enough for any real response, so this must refuse without
+				// allocating the whole thing.
+				tiny, _, tres := plat.http_get("api.github.com", "/repos/WGuethlein/Newtpad/releases/latest", 8, 5000)
+				defer delete(tiny)
+				fmt.printfln("  cap=8 -> res=%v bytes=%d", tres, len(tiny))
+				chk(bad, tres != .Ok, "an 8-byte cap does not return .Ok")
+				chk(bad, tiny == nil, "a refused response returns no body")
+			}
+
+			bad := 0
+			base.log_init(.Warn) // http_get logs; keep the transcript readable
+			http_sink_cases(&bad, http_chk)
+			http_input_cases(&bad, http_chk)
+			http_classify_cases(&bad, http_chk)
+			if len(os.args) > 2 && os.args[2] == "live" {
+				http_live_case(&bad, http_chk)
+			} else {
+				fmt.println("--- live request: SKIPPED (pass `live` to make one) ---")
+			}
+			fmt.printfln("httptest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad crashurltest` -- the prefilled GitHub issue URL the crash
+		// dialog's "report it" button opens (platform/crash.odin).
+		//
+		// The property under test is a privacy one and it is absolute: the URL
+		// must carry the version, the OS build and the exception, and NOTHING
+		// else. A crash while editing resignation-letter.txt must not put that
+		// filename -- or the crash report's own path, which contains the user's
+		// account name -- into a public issue. Asserting "the path is absent" is
+		// weak on its own, so this also asserts the shape: printable ASCII, one
+		// colon, no separators, nothing that could be a path at all.
+		if os.args[1] == "crashurltest" {
+			cu_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			cu_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				// A path with the shape of a real one: a user name and a document
+				// name that must never appear in the output.
+				SECRET_DIR :: "C:\\Users\\Wyatt\\AppData\\Roaming\\Newtpad\\crashes"
+				plat.crash_install(SECRET_DIR, "0.19.0", nil)
+
+				buf: [1024]u8
+				CODE :: u32(0xC000_0005)
+				ADDR :: uintptr(0x7FF7_232E_A746)
+				url := plat.crash_issue_url(CODE, ADDR, buf[:])
+				fmt.printfln("  url (%d bytes): %s", len(url), url)
+
+				chk(bad, url != "", "a URL was built")
+				chk(bad, strings.has_prefix(url, plat.CRASH_ISSUE_BASE + "?"), "it is the issues/new endpoint and nothing else")
+				chk(bad, plat.url_is_openable(url), "it passes the shell's scheme whitelist")
+
+				// What it must carry.
+				chk(bad, strings.contains(url, "ACCESS_VIOLATION"), "the exception is named")
+				chk(bad, strings.contains(url, "c0000005"), "the exception code is present")
+				chk(bad, strings.contains(url, "7ff7232ea746"), "the fault address is present")
+				chk(bad, strings.contains(url, "0.19.0"), "the product version is present")
+				chk(bad, strings.contains(url, "build%20"), "the OS build is present")
+
+				// What it must NOT carry. The directory handed to crash_install is
+				// the closest thing the filter has to user data, and it is not an
+				// argument to crash_issue_url at all.
+				chk(bad, !strings.contains(url, SECRET_DIR), "the crash directory is absent")
+				chk(bad, !strings.contains(url, "Wyatt"), "the account name is absent")
+				chk(bad, !strings.contains(url, "AppData"), "no part of the path leaked")
+				chk(bad, !strings.contains(url, ".txt") && !strings.contains(url, ".dmp"), "neither report file is named")
+				chk(bad, !strings.contains(url, "\\"), "no backslash anywhere")
+
+				// Shape: printable ASCII only, and exactly one colon -- the one in
+				// "https:". Anything path-like would have brought a second.
+				printable, colons := true, 0
+				for i in 0 ..< len(url) {
+					c := url[i]
+					if c < 0x21 || c > 0x7E {printable = false}
+					if c == ':' {colons += 1}
+				}
+				chk(bad, printable, "every byte is printable ASCII with no spaces")
+				chk(bad, colons == 1, fmt.tprintf("exactly one colon (the scheme): %d", colons))
+
+				// A version string that is not a version must not reach the URL
+				// intact. Nothing passes one today; the point is that the builder
+				// does not depend on that staying true.
+				plat.crash_install(SECRET_DIR, "0.1 & <script>alert()</script>", nil)
+				b2: [1024]u8
+				u2 := plat.crash_issue_url(CODE, ADDR, b2[:])
+				fmt.printfln("  hostile version -> %s", u2[min(len(u2), 60):min(len(u2), 130)])
+				chk(bad, !strings.contains(u2, "<") && !strings.contains(u2, ">") && !strings.contains(u2, "&script"), "a hostile version is reduced, not escaped")
+				chk(bad, !strings.contains(u2, " "), "no raw space survived the sanitizer")
+				chk(bad, strings.contains(u2, "Newtpad%200.1script"), "the version was REPLACED, not appended to the previous one")
+
+				// Too small a buffer must refuse rather than emit a truncated URL
+				// that means something different from what it says.
+				small: [64]u8
+				chk(bad, plat.crash_issue_url(CODE, ADDR, small[:]) == "", "a buffer that cannot hold it yields no URL")
+			}
+
+			bad := 0
+			base.log_init(.Warn)
+			cu_cases(&bad, cu_chk)
+			fmt.printfln("crashurltest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad updatetest` -- the update check's pure half (update.odin).
+		//
+		// No socket anywhere in here. http_get is the only part that needs one and
+		// httptest covers it; everything that decides what the user is TOLD is a
+		// pure function of the bytes that came back, and this drives all of it.
+		//
+		// The assertion that matters most is the first one in the compare section:
+		// 0.19.0 must be newer than 0.9.0. A string compare says the opposite, and
+		// a string compare is the shape this code would naturally have been
+		// written in.
+		if os.args[1] == "updatetest" {
+			up_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			up_parse_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- version_parse ---")
+				Good :: struct {
+					s:       string,
+					a, b, c: int,
+				}
+				good := []Good {
+					{"0.19.0", 0, 19, 0},
+					{"v0.19.0", 0, 19, 0}, // the leading v is optional
+					{"V1.2.3", 1, 2, 3},
+					{"0.9.0", 0, 9, 0},
+					{"0.0.0", 0, 0, 0},
+					{"10.20.30", 10, 20, 30},
+					{"01.02.03", 1, 2, 3}, // leading zeros are still digits
+					{"999999999.0.0", 999999999, 0, 0}, // the largest we accept
+				}
+				for g in good {
+					a, b, c, ok := version_parse(g.s)
+					hit := ok && a == g.a && b == g.b && c == g.c
+					chk(bad, hit, fmt.tprintf("%-16q -> (%d,%d,%d) ok=%v", g.s, a, b, c, ok))
+				}
+				// Every one of these must be ok=false, because the caller turns
+				// ok=false into "could not check" -- and the alternative, a
+				// zero-valued triple that silently compares as 0.0.0, would report
+				// "up to date" against a real release.
+				bads := []string {
+					"", // empty
+					"v", // just the prefix
+					"0.19", // missing component
+					"0", // one component
+					"0.19.0.1", // extra component
+					"0.19.", // empty trailing component
+					"0..0", // empty middle component
+					".19.0", // empty leading component
+					"0.x.0", // non-numeric component
+					"0.19.0-rc1", // pre-release suffix: no precedence rules here
+					"0.19.0+build", // build metadata
+					"0.19.0 ", // trailing space
+					" 0.19.0", // leading space
+					"0.19.0\n", // trailing newline (a tag read off a file)
+					"-1.0.0", // sign
+					"+1.0.0",
+					"vv1.0.0", // doubled prefix
+					"1234567890.0.0", // 10 digits: refused rather than wrapped
+					"0.0.99999999999999999999", // 20 digits
+					"latest", // a moving tag, not a version
+					"0,19,0", // wrong separator
+				}
+				for s in bads {
+					_, _, _, ok := version_parse(s)
+					chk(bad, !ok, fmt.tprintf("%-28q refused", s))
+				}
+				// The running build's own constant must parse, or every check
+				// answers "could not check" and nobody notices until a release.
+				_, _, _, cok := version_parse(NEWTPAD_VERSION)
+				chk(bad, cok, fmt.tprintf("NEWTPAD_VERSION %q parses", NEWTPAD_VERSION))
+			}
+
+			up_compare_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- version_newer ---")
+				// The four pairs where ASCII order and numeric order disagree. Each
+				// line prints what a string compare would have said, so a
+				// regression to strings.compare is visible in the output and not
+				// only in the pass/fail column.
+				Trap :: struct {
+					newer, older: string,
+				}
+				traps := []Trap {
+					{"0.19.0", "0.9.0"},
+					{"0.10.0", "0.9.9"},
+					{"10.0.0", "2.0.0"},
+					{"1.0.10", "1.0.9"},
+					{"0.100.0", "0.99.0"},
+				}
+				for t in traps {
+					na, nb, nc, _ := version_parse(t.newer)
+					oa, ob, oc, _ := version_parse(t.older)
+					got := version_newer({na, nb, nc}, {oa, ob, oc})
+					str := strings.compare(t.newer, t.older) > 0
+					chk(bad, got, fmt.tprintf("%s > %s (string compare would say %v)", t.newer, t.older, str))
+					// And the reverse must be false, or "newer" is just "different".
+					chk(bad, !version_newer({oa, ob, oc}, {na, nb, nc}), fmt.tprintf("%s is not newer than %s", t.older, t.newer))
+				}
+				chk(bad, !version_newer({0, 19, 0}, {0, 19, 0}), "equal is not newer")
+				chk(bad, version_newer({0, 0, 1}, {0, 0, 0}), "a patch bump is newer")
+				chk(bad, version_newer({0, 20, 0}, {0, 19, 9}), "a minor bump outranks a patch")
+				chk(bad, version_newer({1, 0, 0}, {0, 99, 99}), "a major bump outranks everything")
+				chk(bad, !version_newer({0, 99, 99}, {1, 0, 0}), "and not the other way round")
+			}
+
+			up_tag_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- tag_name extraction ---")
+				buf: [UPDATE_TAG_MAX]u8
+				Good :: struct {
+					body, want, why: string,
+				}
+				good := []Good {
+					{`{"tag_name":"v0.20.0"}`, "v0.20.0", "minimal"},
+					{`{ "tag_name" : "v0.20.0" }`, "v0.20.0", "spaces around the colon"},
+					{"{\n  \"tag_name\":\n    \"v0.20.0\",\n  \"name\": \"x\"\n}", "v0.20.0", "pretty-printed"},
+					{`{"url":"https://x","id":1,"tag_name":"v1.2.3","draft":false}`, "v1.2.3", "not the first field"},
+					// A decoy occurrence as a VALUE, not a key: it is not followed
+					// by a colon, so the scan steps over it to the real key.
+					{`{"field":"tag_name","tag_name":"v1.2.3"}`, "v1.2.3", "a decoy value named tag_name is skipped"},
+					{`{"tag_name":"0.20.0"}`, "0.20.0", "no v prefix"},
+				}
+				for g in good {
+					got, ok := update_extract_tag(transmute([]u8)g.body, buf[:])
+					chk(bad, ok && got == g.want, fmt.tprintf("%-42s -> %q ok=%v", g.why, got, ok))
+				}
+
+				// Hostile and malformed. Every one is "could not check": nothing in
+				// here may return ok=true, and nothing may crash or read past the
+				// end of the buffer.
+				Bad :: struct {
+					body, why: string,
+				}
+				bads := []Bad {
+					{``, "empty body"},
+					{`{}`, "no tag_name at all"},
+					{`{"tag_name"`, "truncated right after the key"},
+					{`{"tag_name":`, "truncated after the colon"},
+					{`{"tag_name":"`, "truncated after the opening quote"},
+					{`{"tag_name":"v0.20.0`, "truncated mid-value (no closing quote)"},
+					{`{"tag_name":null}`, "null value"},
+					{`{"tag_name":123}`, "numeric value"},
+					{`{"tag_name":["v1.0.0"]}`, "array value"},
+					{`{"tag_name":""}`, "empty value"},
+					{`{"tag_name" "v1.0.0"}`, "missing colon"},
+					{`{"tag_name":"a\"b"}`, "an escape in the value"},
+					{`{"tag_name":"v1.0.0\\"}`, "a trailing backslash escape"},
+					{`{"field":"tag_name"}`, "only a decoy, no real key"},
+					{"\x00\x01\x02\xff\xfe binary garbage", "binary garbage"},
+					{`{"tag_name":"` + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + `"}`, "a tag longer than the buffer"},
+				}
+				for b in bads {
+					got, ok := update_extract_tag(transmute([]u8)b.body, buf[:])
+					chk(bad, !ok, fmt.tprintf("%-42s refused (got %q)", b.why, got))
+				}
+			}
+
+			// The decision table: every way the check can end, and specifically
+			// that no failure can come out as "up to date".
+			up_decide_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- update_decide ---")
+				buf: [UPDATE_TAG_MAX]u8
+				ok_body := transmute([]u8)string(`{"tag_name":"v0.20.0"}`)
+
+				// Every non-Ok transport result is .Failed with a reason the user
+				// could be shown. None of them is silence, and none is .Up_To_Date.
+				for r in plat.Http_Result {
+					if r == .Ok {continue}
+					st, tag, why := update_decide(r, 0, ok_body, "0.19.0", buf[:])
+					hit := st == .Failed && why != "" && tag == ""
+					chk(bad, hit, fmt.tprintf("%-11v -> %v %q", r, st, why))
+				}
+
+				// .Ok with a body that cannot be read is also .Failed -- this is
+				// the "a tag that does not parse is could-not-check, never up to
+				// date" rule, at the level the user experiences it.
+				unusable := []string {
+					`{}`,
+					`{"tag_name":"latest"}`, // a real tag, not a version
+					`{"tag_name":"v0.20"}`, // missing a component
+					`{"tag_name":"v0.20.0-rc1"}`, // pre-release
+					`{"tag_name":"v0.20.0`, // truncated
+				}
+				for b in unusable {
+					st, _, why := update_decide(.Ok, 200, transmute([]u8)b, "0.19.0", buf[:])
+					chk(bad, st == .Failed && why != "", fmt.tprintf("%-30s -> %v %q", b, st, why))
+				}
+
+				// A build whose own version constant is broken must not answer
+				// "up to date" either.
+				st, _, why := update_decide(.Ok, 200, ok_body, "not-a-version", buf[:])
+				chk(bad, st == .Failed && why != "", fmt.tprintf("an unparseable running version -> %v %q", st, why))
+
+				// And the three real outcomes.
+				Case :: struct {
+					tag, current: string,
+					want:         Update_Status,
+				}
+				cases := []Case {
+					{"v0.20.0", "0.19.0", .Newer},
+					{"v0.19.0", "0.19.0", .Up_To_Date},
+					// The string-compare trap, end to end: 0.9.0 published against
+					// 0.19.0 running is NOT an update.
+					{"v0.9.0", "0.19.0", .Up_To_Date},
+					{"v0.19.0", "0.9.0", .Newer},
+					{"v1.0.0", "0.19.0", .Newer},
+					{"v0.18.9", "0.19.0", .Up_To_Date},
+				}
+				for c in cases {
+					body := strings.concatenate({`{"tag_name":"`, c.tag, `"}`}, context.temp_allocator)
+					got, tag, _ := update_decide(.Ok, 200, transmute([]u8)body, c.current, buf[:])
+					chk(bad, got == c.want, fmt.tprintf("published %-8s running %-8s -> %v (want %v)", c.tag, c.current, got, c.want))
+					if got != .Failed {
+						chk(bad, tag == c.tag, fmt.tprintf("  and the tag survives as %q", tag))
+					}
+				}
+			}
+
+			// The privacy and disclosure properties, asserted rather than trusted
+			// to a comment: the request carries no identifiers, and the row the
+			// user clicks says where it goes.
+			up_surface_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- command surface ---")
+				title := command_table[.Check_For_Updates].title
+				chk(bad, strings.contains(title, "GitHub"), fmt.tprintf("the row names GitHub: %q", title))
+				chk(bad, command_in_palette(.Check_For_Updates), "it is reachable from the palette")
+				in_help := false
+				for m in menus {
+					if m.title != "Help" {continue}
+					for it in m.items {
+						if it.cmd == .Check_For_Updates {in_help = true}
+					}
+				}
+				chk(bad, in_help, "it is on the Help menu")
+				// No query string, no identifiers: the URL is a bare path.
+				chk(bad, !strings.contains(UPDATE_PATH, "?") && !strings.contains(UPDATE_PATH, "&"), fmt.tprintf("no query parameters: %q", UPDATE_PATH))
+				chk(bad, plat.HTTP_USER_AGENT == "Newtpad", fmt.tprintf("the User-Agent names the product and nothing else: %q", plat.HTTP_USER_AGENT))
+				// The browser is only ever sent to a compile-time constant, never
+				// to anything the response supplied.
+				chk(bad, plat.url_is_openable(UPDATE_RELEASES_URL), fmt.tprintf("the releases URL passes the shell whitelist: %q", UPDATE_RELEASES_URL))
+			}
+
+			// One in flight, and teardown joins. This one does touch the network
+			// (it starts the real worker), so it asserts only on the lifecycle --
+			// not on what came back -- and passes offline.
+			up_lifecycle_case :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- worker lifecycle ---")
+				app: App
+				menu_init(&app.menu)
+				update_start(&app)
+				chk(bad, app.update.th != nil, "a check starts a worker")
+				// A second invocation must not spawn a second thread.
+				first := app.update.th
+				update_start(&app)
+				chk(bad, app.update.th == first, "a second invocation reuses the one in flight")
+				// app_destroy joins it. If it did not, this process would either
+				// hang at exit or the worker would write into freed memory -- and
+				// the pointer going nil is the observable half.
+				app_destroy(&app)
+				chk(bad, app.update.th == nil, "app_destroy joined and cleared the worker")
+			}
+
+			bad := 0
+			base.log_init(.Warn)
+			up_parse_cases(&bad, up_chk)
+			up_compare_cases(&bad, up_chk)
+			up_tag_cases(&bad, up_chk)
+			up_decide_cases(&bad, up_chk)
+			up_surface_cases(&bad, up_chk)
+			// Opt-in, exactly like httptest's live case: this one starts the REAL
+			// worker, so it makes a network request and app_destroy's join waits
+			// on it. It passes offline, but a suite that reaches the network on
+			// every run is one people stop running -- and on a black-holed route
+			// the join is bounded by UPDATE_TIMEOUT_MS per phase, not in total.
+			if len(os.args) > 2 && os.args[2] == "live" {
+				up_lifecycle_case(&bad, up_chk)
+			} else {
+				fmt.println("--- worker lifecycle: SKIPPED (pass `live` to start a real check) ---")
+			}
+			fmt.printfln("updatetest: %d failures", bad)
+			return true
+		}
+
 		if len(os.args) < 3 {return false}
 		path, mode := os.args[1], os.args[2]
 

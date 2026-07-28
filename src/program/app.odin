@@ -41,6 +41,10 @@ App :: struct {
 	// notice_started until NOTICE_SECONDS later; see app_notice_active.
 	notice:         string,
 	notice_started: time.Tick,
+	// The manual update check (update.odin). At most one in flight; joined by
+	// app_destroy below, because a network worker that outlives the window
+	// writes into freed memory.
+	update:         Update_Check,
 }
 
 // A short-lived status-bar message's display window. Wall-clock, not a frame
@@ -289,6 +293,10 @@ app_switch_relative :: proc(a: ^App, dir: int) {
 }
 
 app_destroy :: proc(a: ^App) {
+	// First: the update worker writes into `a.update` and must not still be
+	// running when this App's storage goes. Blocks for at most one WinHTTP
+	// timeout — see update_stop.
+	update_stop(&a.update)
 	for d in a.docs {
 		if d != nil {
 			doc_close(d)
