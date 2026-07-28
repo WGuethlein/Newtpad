@@ -205,9 +205,12 @@ command_table := [Command_Id]Command {
 	.Block_Extend_Right       = {"Extend Column Selection Right", "Edit"},
 	.Block_Extend_Up          = {"Extend Column Selection Up", "Edit"},
 	.Block_Extend_Down        = {"Extend Column Selection Down", "Edit"},
-	.Toggle_Wrap              = {"Toggle Word Wrap", "View"},
-	.Toggle_Table             = {"Toggle Table View (CSV/TSV)", "View"},
-	.Toggle_Preview           = {"Toggle Markdown Preview / Split", "View"},
+	// No "Toggle" verb: every one of these carries a check mark, which already
+	// says it is a toggle, and the word cost seven characters of menu width on
+	// three of the four longest rows (UI spec 6).
+	.Toggle_Wrap              = {"Word Wrap", "View"},
+	.Toggle_Table             = {"Table View (CSV/TSV)", "View"},
+	.Toggle_Preview           = {"Markdown Preview / Split", "View"},
 	.Bookmark_Toggle          = {"Toggle Bookmark on This Line", "Cursor"},
 	.Bookmark_Cycle           = {"Go to Next Bookmark (Shift: Previous)", "Cursor"},
 	// The titles carry the two things a user would otherwise have to discover by
@@ -505,6 +508,11 @@ save_checked :: proc(app: ^App, doc: ^Document, path: string, w: ^plat.Window) -
 	}
 	saved := report_save(doc_save_err(doc, path), path, w)
 	if saved && app != nil {
+		// UI spec 13: "Saved for 1.5s in success, then gone. No toast, no dialog,
+		// no sound." A save that succeeds currently says nothing at all, so the
+		// only confirmation is the asterisk disappearing from a tab you may not be
+		// looking at. app_note already owns the transient-message lifetime.
+		app_note(app, "[SAVED]")
 		// Saving the active theme's own file re-applies it -- this is the loop
 		// that makes tuning a theme possible without a rebuild. `path`, not
 		// doc.path: doc_save_err frees and reallocates doc.path.

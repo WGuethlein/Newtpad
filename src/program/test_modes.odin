@@ -2239,6 +2239,54 @@ when NEWTPAD_TESTS {
 			bad += checked_toggle_case(&t, .Toggle_Table, "Toggle_Table")
 			bad += checked_encoding_case()
 
+			// Every dropdown must be wide enough for its own widest row --
+			// including a disabled REASON, which replaces the accelerator and is
+			// longer than it ("Markdown files only" vs "Ctrl+M"). Sizing budgeted
+			// only for the shortcut, so a reason would have been clipped by
+			// exactly the width the shortcut used to need.
+			{
+				mt: plat.Text
+				plat.text_load_faces(&mt)
+				cw := plat.text_char_width(&mt, UI_PX)
+				for m, mi in menus {
+					w := dropdown_w(&mt, mi)
+					worst := ""
+					need := f32(0)
+					for it in m.items {
+						if it.cmd == .None {continue}
+						trailing := max(len(command_chord(it.cmd)), len(command_disabled_hint(it.cmd)))
+						n := f32(len(command_table[it.cmd].title) + trailing) * cw
+						if n > need {need, worst = n, command_table[it.cmd].title}
+					}
+					ok := w >= need
+					if !ok {bad += 1}
+					fmt.printfln("  %-6s %s dropdown %.0f fits its widest row (%q needs %.0f)", "ok" if ok else "FAIL", m.title, w, worst, need)
+				}
+				// And the reasons are actually reachable: a .md file cannot enter
+				// table view, so that row must be disabled AND say why.
+				a: App
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				d := app_active(&a)
+				d.kind = .Text
+				d.path = "notes.md"
+				found := false
+				for m in menus {
+					for it in m.items {
+						if it.cmd != .Toggle_Table {continue}
+						found = true
+						en := item_enabled(&a, it)
+						why := item_disabled_reason(&a, it)
+						okr := !en && why != ""
+						if !okr {bad += 1}
+						fmt.printfln("  %-6s Table View on a .md is disabled (%v) and says why (%q)", "ok" if okr else "FAIL", !en, why)
+					}
+				}
+				if !found {bad += 1;fmt.println("  FAIL   Toggle_Table is not in any menu")}
+				d.path = ""
+			}
+
 			fmt.printfln("menutest: %d failures", bad)
 			return true
 		}

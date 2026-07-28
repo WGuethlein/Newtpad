@@ -3411,6 +3411,52 @@ parities**: testing one proves nothing about a bug whose entire shape is parity.
   the palette instead, which reaches it but does not show it in place.
 - **No live pass.** Pills, the ring, the caption geometry and the elision are all unverified on screen.
 
+## 6ak. The chrome surfaces (2026-07-29, v0.23.0, branch `feat/batch-14-surfaces`)
+
+Batch 14: menus (§6), the command palette (§7), Settings (§11) and the status bar (§13).
+
+### What the spec got right, and the one thing it did not
+
+**§6's first complaint is already fixed here.** *"The check mark shifts the label — ✓ is drawn in the
+text run"* — it is not; `menu_draw_dropdown` draws the mark and the label as separate calls, the label
+at a fixed `x0 + sx(28)` gutter. The specification was written from a screenshot of an older build.
+The other three §6 defects were all real.
+
+**The palette collision Wyatt photographed** (`CursorCtrl+Home`, `FileCtrl+Alt+S`) was a column drawn
+**left-aligned at a fixed 130px from the right** while the accelerator beside it was right-aligned — so
+the gap between them was whatever the category's length left over. Both are now right-aligned into
+columns sized from the widest value in the whole table, so neither moves as you type and the
+accelerators line up vertically. That last part is the only reason to draw them in a mono face at all.
+
+### The width budget, which is where this could have gone wrong quietly
+
+Giving disabled rows a reason means the accelerator column sometimes holds `Markdown files only`
+instead of `Ctrl+M`. `dropdown_w` budgeted for the accelerator alone, so the reason would have been
+clipped **by exactly the width the shortcut used to need** — a defect that only appears on the rows
+that are disabled, which are the rows nobody clicks. The wording is therefore a pure function of the
+command (`command_disabled_hint`), separate from the decision about whether to *show* it, so the sizing
+can see it. `menutest` asserts every dropdown fits its own widest row; sabotaging the budget back to
+the accelerator alone fails on View at 304 against 344 needed.
+
+Dropdowns are also sized **per menu** now. Every one used to inherit the widest row in the entire menu
+bar, so File was as wide as View's longest item.
+
+### Text_Dim again
+
+The status bar was drawn in `Text_Dim` — the disabled-only tier at 2.9:1, labelled *"never live text"*
+in `theme.odin` — on every frame. That is the third surface carrying it (tab labels and the accelerator
+chords were the first two, §6ai). **The role still has no guard**, and this is the evidence that a
+comment is not one.
+
+### Owed
+
+- **The status bar's cells are not clickable** (§13: *"Encoding opens the encoding menu, LF toggles
+  line endings"*), and there are no dividers between them — it is two text runs, not cells.
+- **§7's ranking is unchanged**: still the existing filter, not the spec's exact-prefix >
+  word-start > anywhere with recency tie-breaks.
+- **§11's page margins and row padding** are untouched; only the selected-row treatment changed.
+- **No live pass.**
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
