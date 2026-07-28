@@ -151,6 +151,8 @@ Command_Id :: enum u8 {
 	Find_Confirm,
 	Find_Field_Toggle,
 	Find_Toggle_Regex,
+	Find_Toggle_Case,
+	Find_Toggle_Word,
 	Find_Toggle_Filter,
 	Find_Toggle_Replace_Mode,
 	Find_Filter_Page_Up,
@@ -281,7 +283,9 @@ command_table := [Command_Id]Command {
 	.Find_Backspace           = {"Find: Delete Backward", "Search"},
 	.Find_Confirm             = {"Find: Confirm", "Search"},
 	.Find_Field_Toggle        = {"Find: Toggle Field", "Search"},
-	.Find_Toggle_Regex        = {"Find: Toggle Regex", "Search"},
+	.Find_Toggle_Regex        = {"Find: Regular Expression", "Search"},
+	.Find_Toggle_Case         = {"Find: Match Case", "Search"},
+	.Find_Toggle_Word         = {"Find: Whole Word", "Search"},
 	.Find_Toggle_Filter       = {"Find: Toggle Filter View", "Search"},
 	.Find_Toggle_Replace_Mode = {"Find: Toggle Replace", "Search"},
 	.Find_Filter_Page_Up      = {"Find: Filter Page Up", "Search"},
@@ -396,6 +400,10 @@ default_bindings := []Binding {
 	{.Enter, false, false, .Find, .Find_Confirm},
 	{.Tab, false, false, .Find, .Find_Field_Toggle},
 	{.R, true, false, .Find, .Find_Toggle_Regex},
+	// Alt, not Ctrl: Ctrl+C and Ctrl+W already mean copy and close-tab, and a
+	// find bar that stole either would be worse than the modes are worth.
+	{.C, false, true, .Find, .Find_Toggle_Case},
+	{.W, false, true, .Find, .Find_Toggle_Word},
 	{.L, true, false, .Find, .Find_Toggle_Filter},
 	{.H, true, false, .Find, .Find_Toggle_Replace_Mode},
 	{.Page_Up, false, false, .Find, .Find_Filter_Page_Up},
@@ -1596,6 +1604,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		}
 	case .Find_Field_Toggle:
 		if doc.find.replace_mode {find_toggle_field(doc)}
+	case .Find_Toggle_Case:
+		find_toggle_case(doc)
+	case .Find_Toggle_Word:
+		find_toggle_word(doc)
 	case .Find_Toggle_Regex:
 		// Reachable from the palette with find closed, where it would otherwise
 		// flip an invisible mode and start a search worker for a UI that isn't on

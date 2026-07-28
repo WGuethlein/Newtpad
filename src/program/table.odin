@@ -354,7 +354,7 @@ csv_serialize :: proc(value: string, delim: u8, allocator := context.temp_alloca
 table_cell_at :: proc(doc: ^Document, mx, my, px, char_w: f32, rows: int, width: f32) -> (ok: bool, r, col, fs, fe: int, val: string) {
 	colw := doc.table_widths
 	if len(colw) == 0 {return}
-	top := CONTENT_TOP + FILTER_BANNER_H
+	top := CONTENT_TOP + TOP_INSET
 	if my < top {return}
 	r = int((my - top) / line_height(px))
 	if r < 0 || r >= rows {return}

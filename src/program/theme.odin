@@ -157,10 +157,6 @@ Color_Role :: enum u8 {
 	// #8CD999 (4: settings.odin:327 on, history.odin:129 current,
 	// fontpage.odin:65, menu.odin check).
 	Success,
-	// #2E4233 (1: main.odin:988 filter banner bg).
-	Filter_Bg,
-	// #B2E6BD (1: main.odin:994 filter banner text).
-	Filter_Text,
 	// #B8D9FF (1: markdown.odin MD_HEAD).
 	Md_Heading,
 	// #F2CCA6 (1: markdown.odin MD_CODE).
@@ -179,6 +175,12 @@ Color_Role :: enum u8 {
 	// CHROME role, shared with dropdown borders and the split divider -- so an
 	// author tuning menu borders moves every markdown rule with them.
 	Md_Rule,
+	// Filter_Bg and Filter_Text are GONE. They existed for one band, and UI spec
+	// 12 folds that band into the same Accent_Wash a selected settings row uses:
+	// "a mode must be obvious; it does not have to be the loudest thing on
+	// screen", and one fill meaning "something is active" everywhere is worth
+	// more than a bespoke green. Two fewer roles for a themer to reason about,
+	// which is the direction 6v set when it took 66 down to 25.
 	// The bookmark mark in the left margin (doc_bookmark_rects). A new role
 	// rather than a reuse: the nearest existing candidates are Accent (the find
 	// bar) and Caret, and a mark that changes colour when an author retunes the
@@ -306,8 +308,6 @@ theme_dark :: proc() -> Theme {
 		.Warning         = {0.878, 0.643, 0.345, 1}, // #E0A458  7.6
 		.Danger          = {0.753, 0.271, 0.231, 1}, // #C0453B -- white on it: 4.7
 		.Success         = {0.616, 0.788, 0.627, 1}, // #9DC9A0  8.6
-		.Filter_Bg       = {0.180, 0.157, 0.137, 1}, // #2E2823
-		.Filter_Text     = {0.898, 0.710, 0.498, 1}, // #E5B57F  8.4 on Filter_Bg
 		.Md_Heading      = {0.898, 0.710, 0.498, 1}, // #E5B57F  8.4 -- all six levels
 		.Md_Code         = {0.592, 0.765, 0.847, 1}, // #97C3D8  8.2 -- same hue as Link: both point elsewhere
 		.Md_Code_Bg      = {0.165, 0.153, 0.137, 1}, // #2A2723
@@ -423,8 +423,6 @@ theme_light :: proc() -> Theme {
 		.Warning         = {0.604, 0.353, 0.071, 1}, // #9A5A12  5.1
 		.Danger          = {0.698, 0.227, 0.188, 1}, // #B23A30 -- white on it: 5.4
 		.Success         = {0.184, 0.420, 0.278, 1}, // #2F6B47  5.9
-		.Filter_Bg       = {0.953, 0.910, 0.851, 1}, // #F3E8D9
-		.Filter_Text     = {0.478, 0.290, 0.071, 1}, // #7A4A12  6.2 on Filter_Bg
 		.Md_Heading      = {0.541, 0.329, 0.086, 1}, // #8A5416  6.1
 		.Md_Code         = {0.122, 0.373, 0.471, 1}, // #1F5F78  6.4
 		.Md_Code_Bg      = {0.941, 0.929, 0.894, 1}, // #F0EDE4
@@ -572,8 +570,6 @@ theme_role_keys := [Color_Role]string {
 	.Warning        = "warning",
 	.Danger         = "danger",
 	.Success        = "success",
-	.Filter_Bg      = "filter_bg",
-	.Filter_Text    = "filter_text",
 	.Md_Heading     = "md_heading",
 	.Md_Code        = "md_code",
 	.Md_Code_Bg     = "md_code_bg",
