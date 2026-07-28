@@ -3632,6 +3632,26 @@ that does not exist, and it is the least damaging of the set to lose.
   measurement. Recorded as **declined**, not pending — it had been carried as "belongs with batch 13",
   and batch 13 has been and gone.
 
+## 6ao. The gamma change shipped washed out (2026-07-29, v0.26.1)
+
+Wyatt, within minutes of v0.26.0, with a screenshot: *"all washed out"*.
+
+`ClearRenderTargetView` on an sRGB-typed view treats its colour as **linear** and encodes it on write —
+exactly as a shader return value is treated. The caller hands it an sRGB value, because a theme file
+says `#221F1C`. So the canvas came out a full gamma stop bright while everything drawn *on top of it*
+was correct. Measured: `#221F1C` landed as `#66625D`.
+
+**I asserted "opaque fills are unchanged by construction" in §6an and it was false.** It held for the
+two shaders, and I never looked at the clear. That is the failure mode of moving a pipeline's colour
+space: every producer has to move, and the one that is not a shader is the one you forget.
+
+`quadsdftest` now reads the cleared canvas back and requires the bytes the theme asked for. It asserts
+the **round trip** rather than a computed constant, because the property is that an opaque colour
+survives the pipeline unchanged — which is what makes an authored hex the hex you see. Sabotage
+reproduces `#66625D`.
+
+It is the only such producer; every other colour reaches the target through a shader.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

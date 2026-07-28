@@ -11189,6 +11189,32 @@ when NEWTPAD_TESTS {
 					qs_chk(&bad, r_far == 0, fmt.tprintf("softness 8: it still falls off to nothing (r=%d)", r_far))
 				}
 
+				// 0. The CLEAR lands on the bytes the theme asked for.
+				//
+				// This is the check that was missing when v0.26.0 shipped "all
+				// washed out". Moving the pipeline to linear blending converted
+				// both shaders and not ClearRenderTargetView, which treats its
+				// argument as linear exactly as a shader return value is treated
+				// -- so the canvas came out a full gamma stop bright while
+				// everything drawn on top of it was correct.
+				//
+				// Asserting the round trip rather than a hand-computed constant:
+				// the property is that an OPAQUE colour survives the pipeline
+				// unchanged, which is what makes the theme's authored hex the hex
+				// you actually see.
+				{
+					want := [3]u8{0x22, 0x1F, 0x1C} // Dark's Bg_Base
+					plat.gfx_begin_frame(&h.gfx, f32(want[0]) / 255, f32(want[1]) / 255, f32(want[2]) / 255)
+					buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					qs_chk(&bad, ok, "clear: readback")
+					if ok {
+						b, g, r, _ := px(buf, 32, 32)
+						// One count of slack for the encode/decode round trip.
+						near := abs(int(r) - int(want[0])) <= 1 && abs(int(g) - int(want[1])) <= 1 && abs(int(b) - int(want[2])) <= 1
+						qs_chk(&bad, near, fmt.tprintf("the clear survives the pipeline: asked #%02X%02X%02X, got #%02X%02X%02X", want[0], want[1], want[2], r, g, b))
+					}
+				}
+
 				// 4b. ASYMMETRIC radius. Every earlier case used {10,10,10,10}, so
 				// the per-corner selection in sd_round_box was never actually
 				// exercised -- a mapping that returned the same corner for all four

@@ -25,6 +25,54 @@ md_selftest :: proc() -> (bad: int) {
 		fmt.printfln("  %-40s %s", msg, "OK" if ok else "FAIL")
 		if !ok {bad^ += 1}
 	}
+	// --- GFM strikethrough, escapes, task lists (batch 16) ---
+	//
+	// Each of these is a construct md_inline silently mis-parsed rather than
+	// ignored, which is the worse failure: an unescaped asterisk did not render
+	// as an asterisk, it toggled italics and restyled the rest of the line.
+	{
+		runs := md_inline("a ~~gone~~ b")
+		hit := false
+		for r in runs {
+			if r.strike && r.text == "gone" {hit = true}
+		}
+		chk(&bad, hit, "~~gone~~ -> a struck run")
+		// And the text either side is NOT struck, or the toggle never closed.
+		clean := true
+		for r in runs {
+			if r.strike && r.text != "gone" {clean = false}
+		}
+		chk(&bad, clean, "...and nothing else on the line is struck")
+	}
+	{
+		// The escape has to survive as a literal AND not toggle the style.
+		runs := md_inline("literal \\* star")
+		joined := ""
+		ital := false
+		for r in runs {
+			joined = strings.concatenate({joined, r.text}, context.temp_allocator)
+			if r.ital {ital = true}
+		}
+		chk(&bad, joined == "literal * star", "\\* -> a literal asterisk")
+		chk(&bad, !ital, "...and it does not open italics")
+	}
+	{
+		// A backslash before a letter is not an escape -- it is a path.
+		runs := md_inline("C:\\temp\\file.txt")
+		joined := ""
+		for r in runs {joined = strings.concatenate({joined, r.text}, context.temp_allocator)}
+		chk(&bad, joined == "C:\\temp\\file.txt", "a path keeps its backslashes")
+	}
+	{
+		r1, d1, t1 := md_task("[ ] todo")
+		r2, d2, t2 := md_task("[x] done")
+		r3, _, t3 := md_task("[y] neither")
+		r4, _, t4 := md_task("not a task")
+		chk(&bad, t1 && !d1 && r1 == "todo", "[ ] todo -> unticked task")
+		chk(&bad, t2 && d2 && r2 == "done", "[x] done -> ticked task")
+		chk(&bad, !t3 && r3 == "[y] neither", "[y] is not a task box")
+		chk(&bad, !t4 && r4 == "not a task", "plain text is not a task")
+	}
 	chk(&bad, md_heading_level("# H") == 1, "# H -> h1")
 	chk(&bad, md_heading_level("### H") == 3, "### H -> h3")
 	chk(&bad, md_heading_level("####### H") == 0, "7 hashes -> not a heading")
@@ -404,9 +452,10 @@ md_col_x :: proc(c: ^Md_Table_Cache, i: int, char_w: f32) -> f32 {
 // One styled run of a line's inline content.
 @(private = "file")
 Md_Run :: struct {
-	text:            string,
-	bold, ital, code, link: bool,
-	url:             string,
+	text:                    string,
+	bold, ital, code, link:  bool,
+	strike:                  bool, // ~~text~~ (GFM)
+	url:                     string,
 }
 
 // Heading pixel scale by level (1..6).
@@ -435,11 +484,11 @@ is_space :: proc(b: u8) -> bool {return b == ' ' || b == '\t'}
 @(private = "file")
 md_inline :: proc(s: string, allocator := context.temp_allocator) -> []Md_Run {
 	out := make([dynamic]Md_Run, 0, 8, allocator)
-	bold, ital, code := false, false, false
+	bold, ital, code, strike := false, false, false, false
 	sb := strings.builder_make(allocator)
-	flush := proc(out: ^[dynamic]Md_Run, sb: ^strings.Builder, bold, ital, code: bool) {
+	flush := proc(out: ^[dynamic]Md_Run, sb: ^strings.Builder, bold, ital, code, strike: bool) {
 		if strings.builder_len(sb^) == 0 {return}
-		append(out, Md_Run{text = strings.clone(strings.to_string(sb^), context.temp_allocator), bold = bold, ital = ital, code = code})
+		append(out, Md_Run{text = strings.clone(strings.to_string(sb^), context.temp_allocator), bold = bold, ital = ital, code = code, strike = strike})
 		strings.builder_reset(sb)
 	}
 	i, n := 0, len(s)
@@ -447,7 +496,7 @@ md_inline :: proc(s: string, allocator := context.temp_allocator) -> []Md_Run {
 		c := s[i]
 		if code { // inside inline code: only ` ends it
 			if c == '`' {
-				flush(&out, &sb, false, false, true)
+				flush(&out, &sb, false, false, true, strike)
 				code = false
 				i += 1
 			} else {
@@ -457,16 +506,27 @@ md_inline :: proc(s: string, allocator := context.temp_allocator) -> []Md_Run {
 			continue
 		}
 		switch {
+		// A backslash escape takes the NEXT byte literally. Without this, a
+		// path like C:\*.txt or a literal asterisk toggled italics and the rest
+		// of the line changed style -- CommonMark's escapes are not optional
+		// once a document contains any punctuation at all.
+		case c == '\\' && i + 1 < n && md_escapable(s[i + 1]):
+			strings.write_byte(&sb, s[i + 1])
+			i += 2
 		case c == '`':
-			flush(&out, &sb, bold, ital, false)
+			flush(&out, &sb, bold, ital, false, strike)
 			code = true
 			i += 1
+		case c == '~' && i + 1 < n && s[i + 1] == '~':
+			flush(&out, &sb, bold, ital, false, strike)
+			strike = !strike
+			i += 2
 		case c == '*' && i + 1 < n && s[i + 1] == '*', c == '_' && i + 1 < n && s[i + 1] == '_':
-			flush(&out, &sb, bold, ital, false)
+			flush(&out, &sb, bold, ital, false, strike)
 			bold = !bold
 			i += 2
 		case c == '*' || c == '_':
-			flush(&out, &sb, bold, ital, false)
+			flush(&out, &sb, bold, ital, false, strike)
 			ital = !ital
 			i += 1
 		case c == '[':
@@ -477,8 +537,8 @@ md_inline :: proc(s: string, allocator := context.temp_allocator) -> []Md_Run {
 				j := us
 				for j < n && s[j] != ')' {j += 1}
 				if j < n {
-					flush(&out, &sb, bold, ital, false)
-					append(&out, Md_Run{text = s[i + 1:i + rb], bold = bold, ital = ital, link = true, url = s[us:j]})
+					flush(&out, &sb, bold, ital, false, strike)
+					append(&out, Md_Run{text = s[i + 1:i + rb], bold = bold, ital = ital, strike = strike, link = true, url = s[us:j]})
 					i = j + 1
 					continue
 				}
@@ -490,14 +550,64 @@ md_inline :: proc(s: string, allocator := context.temp_allocator) -> []Md_Run {
 			i += 1
 		}
 	}
-	flush(&out, &sb, bold, ital, code)
+	flush(&out, &sb, bold, ital, code, strike)
 	return out[:]
+}
+
+// The punctuation CommonMark lets a backslash escape. Restricted to that set on
+// purpose: escaping a letter is not an escape, it is a backslash followed by a
+// letter, and treating it as one would eat backslashes out of Windows paths.
+@(private = "file")
+md_escapable :: proc(c: u8) -> bool {
+	switch c {
+	case '\\', '`', '*', '_', '{', '}', '[', ']', '(', ')', '#', '+', '-', '.', '!', '|', '~', '<', '>', '"', '$', '\'', ',', ':', ';', '=', '?', '@', '^':
+		return true
+	}
+	return false
+}
+
+// A task list item: `- [ ] thing` or `- [x] thing`. Returns the text after the
+// box, and whether it is ticked. GFM, and the one list variant whose absence is
+// noticed immediately because a checklist renders as literal brackets.
+md_task :: proc(content: string) -> (rest: string, done, is_task: bool) {
+	if len(content) < 3 || content[0] != '[' || content[2] != ']' {return content, false, false}
+	switch content[1] {
+	case ' ':
+		done = false
+	case 'x', 'X':
+		done = true
+	case:
+		return content, false, false
+	}
+	rest = content[3:]
+	if len(rest) > 0 && rest[0] == ' ' {rest = rest[1:]}
+	return rest, done, true
+}
+
+// YAML front matter: a `---` fence on line 1, closed by `---` or `...`. Returns
+// the byte offset just past the closing fence, or 0 when the document does not
+// open with one. Bounded by a line budget so a file whose first line happens to
+// be `---` cannot make this scan to EOF looking for a close that is not there.
+md_front_matter_end :: proc(doc: ^Document) -> int {
+	if doc == nil || doc.pt.length < 4 {return 0}
+	buf: [512]u8
+	line, end, _ := md_line_at(doc, 0, buf[:])
+	if strings.trim_space(line) != "---" {return 0}
+	p := end + 1
+	for _ in 0 ..< 64 {
+		if p >= doc.pt.length {return 0} // never closed: not front matter
+		l2, e2, _ := md_line_at(doc, p, buf[:])
+		t := strings.trim_space(l2)
+		if t == "---" || t == "..." {return min(e2 + 1, doc.pt.length)}
+		p = e2 + 1
+	}
+	return 0
 }
 
 // Draw inline runs word-wrapped from (x,y) within [xind, x1]; new rows indent to
 // xind. Advances y per wrapped row. Synthetic bold via a second draw one px over.
 @(private = "file")
-md_draw_inline :: proc(gfx: ^plat.Gfx, text: ^plat.Text, runs: []Md_Run, xind, x1: f32, x, y: ^f32, px, char_w, line_h: f32, base_col: [4]f32) {
+md_draw_inline :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, runs: []Md_Run, xind, x1: f32, x, y: ^f32, px, char_w, line_h: f32, base_col: [4]f32) {
 	boff := hairline()
 	for run in runs {
 		col := base_col
@@ -505,6 +615,11 @@ md_draw_inline :: proc(gfx: ^plat.Gfx, text: ^plat.Text, runs: []Md_Run, xind, x
 		if run.ital {col = g_theme[.Md_Italic]}
 		if run.link {col = g_theme[.Link]}
 		if run.bold && !run.code && !run.link {col = g_theme[.Text_Bright]}
+		// Struck text drops to muted as well as getting its line. UI spec 18's
+		// "never colour alone" runs both ways: the LINE is the primary cue, so a
+		// reader who cannot see the tone still gets it, and the tone stops struck
+		// text competing with live text for attention.
+		if run.strike {col = g_theme[.Text_Muted]}
 		// Split into words, keeping each word's trailing space so wrapping is by word.
 		w := run.text
 		for len(w) > 0 {
@@ -525,6 +640,12 @@ md_draw_inline :: proc(gfx: ^plat.Gfx, text: ^plat.Text, runs: []Md_Run, xind, x
 			}
 			plat.text_draw(gfx, text, word, x^, y^, px, col, .Doc)
 			if run.bold {plat.text_draw(gfx, text, word, x^ + boff, y^, px, col, .Doc)}
+			if run.strike {
+				// At the x-height centre, per UI spec 9.2 -- through the middle
+				// of the lowercase, not through the baseline, or it reads as an
+				// underline that has slipped.
+				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x^, y^ - px * 0.28}, size = {ww, hairline()}, color = col}})
+			}
 			x^ += ww
 		}
 	}
@@ -567,20 +688,20 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			runs := md_inline(strings.trim_left(trimmed[lvl:], " "))
 			// force bold heading colour
 			for &r in runs {r.bold = true}
-			md_draw_inline(gfx, text, runs, x0, x1, &x, &yy, hpx, plat.text_char_width(text, hpx, .Doc), hh, g_theme[.Md_Heading])
+			md_draw_inline(gfx, qp, text, runs, x0, x1, &x, &yy, hpx, plat.text_char_width(text, hpx, .Doc), hh, g_theme[.Md_Heading])
 			y = yy + hh - px * 0.3
 		} else if q, qcontent := md_quote(trimmed); q {
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {max(sx(3), 2), line_h}, color = g_theme[.Md_Quote]}})
 			x := x0 + char_w * 2
 			yy := y
-			md_draw_inline(gfx, text, md_inline(qcontent), x0 + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Md_Quote])
+			md_draw_inline(gfx, qp, text, md_inline(qcontent), x0 + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Md_Quote])
 			y = yy + line_h
 		} else if bullet, content, depth := md_list(line); bullet != "" {
 			ind := x0 + f32(depth) * char_w * 2
 			plat.text_draw(gfx, text, bullet, ind, y, px, g_theme[.Accent], .Doc)
 			x := ind + char_w * f32(len(bullet) + 1)
 			yy := y
-			md_draw_inline(gfx, text, md_inline(content), ind + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
+			md_draw_inline(gfx, qp, text, md_inline(content), ind + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
 			y = yy + line_h
 		} else if md_is_table_row(line) {
 			if c := md_table_ensure(doc, text, p); c != nil {
@@ -590,7 +711,7 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		} else {
 			x := x0
 			yy := y
-			md_draw_inline(gfx, text, md_inline(line), x0, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
+			md_draw_inline(gfx, qp, text, md_inline(line), x0, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
 			y = yy + line_h
 		}
 
