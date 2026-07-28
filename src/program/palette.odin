@@ -206,7 +206,10 @@ palette_layout :: proc(app: ^App, width, height: f32) -> Palette_Layout {
 	p := &app.palette
 	l: Palette_Layout
 	l.w = min(sx(720), width - sx(80))
-	l.x0 = (width - l.w) / 2
+	// snap: a centred origin is a division by two, and half of an odd number is
+	// a half pixel -- which every glyph in the panel is then drawn from. See
+	// snap()'s own comment for what that looks like on screen.
+	l.x0 = snap((width - l.w) / 2)
 	l.y0 = sx(44)
 	l.qh = sx(34)
 	l.rowh = sx(26)

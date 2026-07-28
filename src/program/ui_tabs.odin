@@ -23,12 +23,24 @@ TAB_MAX_W_96 :: f32(220)
 TAB_DIRTY_W_96 :: f32(8)
 TAB_PAD_L_96 :: f32(4) // before the dirty slot; 4 + 8 = the spec's 12 to the text
 TAB_PAD_R_96 :: f32(9)
-TAB_GAP_96 :: f32(1)
+// The pill itself, inside the 40px rail. UI spec 2.1: "tab height / radius
+// 30 / 6", and the rail is 40 -- so the pill is INSET, not flush with the rail's
+// bottom edge, and the 5px above and below is what makes it read as a pill
+// rather than as a browser tab.
+//
+// It was TAB_STRIP_H - sx(4): 36 tall, hard against the bottom. Rounding only
+// its top two corners was correct for that shape and is wrong for this one --
+// something that floats is rounded on all four. Wyatt, live use: "the tabs not
+// actually being pills". The radius was drawing the whole time; the SHAPE was
+// the browser tab it had always been.
+TAB_H_96 :: f32(30)
+TAB_GAP_96 :: f32(3) // UI spec 2.1; was 1, which read as one continuous bar
 TAB_CLOSE_W_96 :: f32(20) // right-edge hit zone that closes instead of switches
 MENU_W_96 :: f32(44) // hamburger menu button
 PLUS_W_96 :: f32(32) // new-tab button
 
 TAB_W := TAB_W_96
+TAB_H := TAB_H_96
 TAB_MIN_W := TAB_MIN_W_96
 TAB_MAX_W := TAB_MAX_W_96
 TAB_DIRTY_W := TAB_DIRTY_W_96
@@ -60,12 +72,26 @@ tabs_limit :: proc(win: ^plat.Window, width: f32) -> f32 {
 //
 // Drawn OUTSIDE the element (spec's 1px offset), so it never eats into the
 // element's own content box and cannot shift what is inside it.
-focus_ring_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, x, y, w, h, radius: f32) {
+// `bound_lo`/`bound_hi` clamp the ring vertically to the surface it sits in.
+//
+// It is drawn OUTSIDE the element, so an element flush against its container's
+// edge pushes the ring past it -- which is exactly what shipped in v0.22.0: the
+// tab was 36 tall starting 4px down a 40px rail, so the ring's bottom edge
+// landed at y=43 and drew a bar across the menu bar below. Wyatt saw it and
+// took it for a highlighting bug, which is a fair reading of an accent line
+// appearing where nothing was focused.
+focus_ring_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, x, y, w, h, radius: f32, bound_lo: f32 = 0, bound_hi: f32 = 1e9) {
 	t := max(1, sx(2)) // 2px, and never scaled away
 	o := hairline() // the 1px offset
 	col := g_theme[.Focus_Ring]
 	rx, ry := x - o - t, y - o - t
 	rw, rh := w + 2 * (o + t), h + 2 * (o + t)
+	if ry < bound_lo {
+		rh -= bound_lo - ry
+		ry = bound_lo
+	}
+	if ry + rh > bound_hi {rh = bound_hi - ry}
+	if rh <= 2 * t {return} // nothing left to ring
 	plat.quads_draw(
 		gfx,
 		qp,
@@ -460,9 +486,15 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 		// content. One quad with two corner radii -- the shape batch 12's SDF
 		// pipeline was built for, and its first consumer.
 		fill := g_theme[.Bg_Raised] if active else (g_theme[.Bg_Hover] if (in_bar && f32(cx) >= r.x && f32(cx) < r.x + r.w) else g_theme[.Bg_Panel])
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, sx(4)}, size = {r.w, TAB_STRIP_H - sx(4)}, color = fill, radius = {RADIUS_TAB, RADIUS_TAB, 0, 0}}})
-		if active && win.kbd_nav {
-			focus_ring_draw(gfx, quad_pipe, x, sx(4), r.w, TAB_STRIP_H - sx(4), RADIUS_TAB)
+		// The pill's own vertical centre, and the label's baseline derived from
+		// it. base_y is measured from the RAIL's bottom edge, which was the same
+		// thing while the tab was flush with it and is not now -- using it here
+		// would sit the label low in the pill by exactly the inset.
+		ty := (TAB_STRIP_H - TAB_H) * 0.5
+		tab_base_y := ty + TAB_H * 0.5 + UI_SMALL_PX * 0.35
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x, ty}, size = {r.w, TAB_H}, color = fill, radius = {RADIUS_TAB, RADIUS_TAB, RADIUS_TAB, RADIUS_TAB}}})
+		if active && app.kbd_tab_focus {
+			focus_ring_draw(gfx, quad_pipe, x, ty, r.w, TAB_H, RADIUS_TAB, 0, TAB_STRIP_H)
 		}
 
 		title := tab_label(app, d, context.temp_allocator)
@@ -482,15 +514,15 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 		// The dirty marker, in the slot the layout reserved on every tab. Accent
 		// AND a glyph, not colour alone -- UI spec 18, 1.4.1.
 		if d.modified {
-			plat.text_draw(gfx, text, "*", x + TAB_PAD_L, base_y, UI_SMALL_PX, g_theme[.Accent])
+			plat.text_draw(gfx, text, "*", x + TAB_PAD_L, tab_base_y, UI_SMALL_PX, g_theme[.Accent])
 		}
-		plat.text_draw(gfx, text, title, x + TAB_PAD_L + TAB_DIRTY_W, base_y, UI_SMALL_PX, fg)
+		plat.text_draw(gfx, text, title, x + TAB_PAD_L + TAB_DIRTY_W, tab_base_y, UI_SMALL_PX, fg)
 		// The close button shows on the ACTIVE tab and on hover only, so a row of
 		// idle tabs is quiet (UI spec 4.2). Middle-click still closes any tab --
 		// that path is in the hit-test and does not depend on the glyph.
 		hot_tab := in_bar && f32(cx) >= r.x && f32(cx) < r.x + r.w
 		if active || hot_tab {
-			plat.text_draw(gfx, text, "×", r.close_x + sx(5), base_y, UI_SMALL_PX, g_theme[.Text_Secondary])
+			plat.text_draw(gfx, text, "×", r.close_x + (TAB_CLOSE_W - plat.text_char_width(text, UI_SMALL_PX)) * 0.5, tab_base_y, UI_SMALL_PX, g_theme[.Text_Secondary])
 		}
 	}
 

@@ -297,6 +297,8 @@ main :: proc() {
 				// command_dispatch and are stopped by the guard there.
 				if doc.table && doc.table_editing {table_edit_rune(doc, window.chars[i])}
 			} else {
+				// Typing goes to the DOCUMENT, so the rail no longer holds focus.
+				app.kbd_tab_focus = false
 				// Not doc_insert_rune directly: with a column rectangle live
 				// one keystroke is an edit on every row it spans.
 				editor_input_rune(&app, doc, &text, window.chars[i])
@@ -449,6 +451,7 @@ main :: proc() {
 		}
 
 		// The tab strip claims clicks in its region before the caret sees them.
+		if window.mouse_pressed {app.kbd_tab_focus = false} // a click is not keyboard focus
 		tabs_hit_test(&app, window, &text)
 		// An in-progress tab reorder follows the cursor and ends on release.
 		if app.tab_drag {
@@ -1555,6 +1558,7 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
 	CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 	TAB_W = dp(rc, TAB_W_96)
+	TAB_H = dp(rc, TAB_H_96)
 	TAB_MIN_W = dp(rc, TAB_MIN_W_96)
 	TAB_MAX_W = dp(rc, TAB_MAX_W_96)
 	TAB_DIRTY_W = dp(rc, TAB_DIRTY_W_96)

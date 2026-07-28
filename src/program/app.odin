@@ -35,6 +35,17 @@ App :: struct {
 	next_gen:   u64,
 	// Tab reorder: a tab is being dragged along the strip. tab_drag_slot follows
 	// the dragged document as it swaps places (the slot changes each swap).
+	// The tab rail was reached BY KEYBOARD and should draw its focus ring.
+	//
+	// Not the platform's kbd_nav, which latches on any key: typing a character
+	// in the document is a keypress, so gating on it put a focus ring on the
+	// active tab on every keystroke. Focus is about WHERE input is going, and a
+	// character goes to the document. Set only by Ctrl+Tab / Ctrl+PgUp/PgDn,
+	// cleared by anything that moves attention elsewhere.
+	//
+	// A stand-in for a real chrome focus model, which batch 14 needs anyway for
+	// menus and the palette. When that exists this becomes one case of it.
+	kbd_tab_focus: bool,
 	tab_drag:      bool,
 	tab_drag_slot: int,
 	// Transient status-bar message (dropped folder, etc). Live from

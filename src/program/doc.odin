@@ -152,6 +152,25 @@ sx :: #force_inline proc(v: f32) -> f32 {
 // it cannot fix an x that arrives fractional.
 hairline :: #force_inline proc() -> f32 {return max(1, f32(int(UI_SCALE)))}
 
+// Snap a coordinate to a whole pixel.
+//
+// For anything TEXT is positioned from. Glyphs come out of an alpha atlas, and
+// drawing one at a half-pixel x samples between texels: every stem picks up a
+// ghost on one side and the run reads as smeared or doubled. It is not subtle
+// and it is not obviously a coordinate problem when you see it.
+//
+// The palette shipped exactly this. Its origin is `(width - w) / 2`, so at the
+// panel's maximum width an ODD window width put x0 on a half pixel and an even
+// one did not -- which is why it looked intermittent and why dragging the window
+// edge one pixel toggled it. Wyatt, live use: "if i move the left edge of the
+// window 1 pixel it goes to look normal, when i expand 1 more pixel it goes
+// wonky again."
+//
+// Rounds rather than floors: a panel one pixel narrower on odd widths is
+// invisible, whereas floor would bias every centred thing left by half a pixel
+// at every size.
+snap :: #force_inline proc(v: f32) -> f32 {return f32(int(v + 0.5))}
+
 // A chrome font size rounded to an even whole pixel.
 //
 // Even, not merely whole: line_height multiplies by LINE_SPACING and truncates,

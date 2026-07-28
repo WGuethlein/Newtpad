@@ -1395,8 +1395,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Tab_Close:
 		request_close_tab(app, app.active, w)
 	case .Tab_Next:
+		app.kbd_tab_focus = true // reached the rail by keyboard: draw the ring
 		app_switch_relative(app, -1 if ev.shift else 1) // Shift+Ctrl+Tab -> previous
 	case .Tab_Prev:
+		app.kbd_tab_focus = true
 		app_switch_relative(app, -1)
 	case .Enc_UTF8:
 		doc_set_encoding(doc, .UTF8)
