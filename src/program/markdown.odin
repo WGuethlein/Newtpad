@@ -25,6 +25,38 @@ md_selftest :: proc() -> (bad: int) {
 		fmt.printfln("  %-40s %s", msg, "OK" if ok else "FAIL")
 		if !ok {bad^ += 1}
 	}
+	// --- fenced code picks a lexer from its tag (batch 16) ---
+	//
+	// The mapping goes through highlight_lexer_for, so this also asserts the
+	// fence and the file extension share one table rather than drifting.
+	{
+		chk(&bad, md_fence_lexer("```json") != nil, "```json -> a lexer")
+		chk(&bad, md_fence_lexer("```cs") != nil, "```cs -> a lexer")
+		chk(&bad, md_fence_lexer("~~~yaml") != nil, "~~~yaml -> a lexer")
+		// Aliases that are not their own extension.
+		chk(&bad, md_fence_lexer("```yml") != nil, "```yml -> a lexer (alias of yaml)")
+		chk(&bad, md_fence_lexer("```csharp") != nil, "```csharp -> a lexer (alias of cs)")
+		chk(&bad, md_fence_lexer("```bash") != nil, "```bash -> a lexer (alias of sh)")
+		// Info strings carry more than the tag in real documents.
+		chk(&bad, md_fence_lexer("```js title=\"x\"") != nil, "an info string past the tag is ignored")
+		// And the negative cases, or "returns non-nil" proves nothing.
+		chk(&bad, md_fence_lexer("```") == nil, "a bare fence has no lexer")
+		chk(&bad, md_fence_lexer("```notalanguage") == nil, "an unknown tag has no lexer")
+	}
+
+	// --- nested blockquotes, front matter (batch 16) ---
+	{
+		q1, c1, d1 := md_quote_depth("> one")
+		q2, c2, d2 := md_quote_depth(">> two")
+		q3, c3, d3 := md_quote_depth("> > spaced")
+		q4, _, d4 := md_quote_depth("plain")
+		chk(&bad, q1 && d1 == 1 && c1 == "one", "> one -> depth 1")
+		// The one that was broken: the second marker used to land in the TEXT.
+		chk(&bad, q2 && d2 == 2 && c2 == "two", ">> two -> depth 2, marker not in the text")
+		chk(&bad, q3 && d3 == 2 && c3 == "spaced", "> > spaced -> depth 2")
+		chk(&bad, !q4 && d4 == 0, "plain -> not a quote")
+	}
+
 	// --- GFM strikethrough, escapes, task lists (batch 16) ---
 	//
 	// Each of these is a construct md_inline silently mis-parsed rather than
@@ -566,6 +598,35 @@ md_escapable :: proc(c: u8) -> bool {
 	return false
 }
 
+// The lexer for a fence's info string, or nil when the tag names nothing known.
+//
+// Resolved through highlight_lexer_for by building a pseudo-path, so the fence
+// and the file extension share ONE table: adding a lexer for `.rs` makes
+// ```rust work for free, and the two can never disagree.
+md_fence_lexer :: proc(fence_line: string) -> Lexer_Proc {
+	tag := strings.trim_space(strings.trim_left(strings.trim_left(fence_line, "`"), "~"))
+	if tag == "" {return nil}
+	// Only the first word: ```js title="x" is a real thing people write.
+	if sp := strings.index_byte(tag, ' '); sp > 0 {tag = tag[:sp]}
+	// A handful of names that are not their own extension. Everything else is
+	// tried as one directly, which covers c, cs, cpp, json, xml, yaml, toml, ini,
+	// sh, bat, md and any lexer added later.
+	switch strings.to_lower(tag, context.temp_allocator) {
+	case "javascript", "js", "typescript", "ts":
+		tag = "c" // close enough for braces, strings and // comments
+	case "shell", "console", "bash", "zsh":
+		tag = "sh"
+	case "yml":
+		tag = "yaml"
+	case "csharp", "c#":
+		tag = "cs"
+	case "c++":
+		tag = "cpp"
+	}
+	lexer, _, _, _ := highlight_lexer_for(strings.concatenate({"x.", tag}, context.temp_allocator))
+	return lexer
+}
+
 // A task list item: `- [ ] thing` or `- [x] thing`. Returns the text after the
 // box, and whether it is ticked. GFM, and the one list variant whose absence is
 // noticed immediately because a checklist renders as literal brackets.
@@ -660,8 +721,36 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	y := ytop + px // first baseline
 	p := top_byte
 	in_fence := false
+	// The fence's language tag, resolved to a lexer. UI spec 9.2 item 4 asks for
+	// "fenced code + lexer -- syn_* inside", and a fenced block was drawn as flat
+	// Md_Code however it was tagged.
+	//
+	// The tag is turned into a pseudo-path and handed to highlight_lexer_for,
+	// rather than growing a second tag->lexer table beside the extension one.
+	// One mapping means a lexer added for a file type is immediately available
+	// inside a fence, and the two can never disagree about what "cs" means.
+	fence_lex: Lexer_Proc
+	fence_state: base.Lex_State
+	// YAML front matter reads as a small card rather than as body text with two
+	// horizontal rules around it, which is what `---` on its own line otherwise
+	// renders as (UI spec 9.2 item 12). Only when the view starts at the top of
+	// the file: scrolled past it, there is nothing to card.
+	fm_end := md_front_matter_end(doc) if top_byte == 0 else 0
 	for y < ybot && p <= doc.pt.length {
 		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+		if p < fm_end {
+			// Inside the front matter: one muted key/value line, no markdown
+			// parsing at all. It is YAML, and running `*` or `_` in a value
+			// through the inline parser would style it as emphasis.
+			fn := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
+			if fn > 0 && buf[fn - 1] == '' {fn -= 1}
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 - char_w, y - px}, size = {max(2, sx(2)), line_h}, color = g_theme[.Md_Rule]}})
+			plat.text_draw(gfx, text, string(buf[:fn]), x0 + char_w, y, px, g_theme[.Text_Muted], .Doc)
+			y += line_h
+			bottom = end
+			p = end + 1
+			continue
+		}
 		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
 		if n > 0 && buf[n - 1] == '\r' {n -= 1}
 		line := string(buf[:n])
@@ -669,10 +758,29 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 
 		if strings.has_prefix(trimmed, "```") || strings.has_prefix(trimmed, "~~~") {
 			in_fence = !in_fence
+			if in_fence {
+				fence_lex, fence_state = md_fence_lexer(trimmed), .Normal
+			} else {
+				fence_lex = nil
+			}
 			y += line_h
 		} else if in_fence {
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {x1 - x0, line_h}, color = g_theme[.Md_Code_Bg]}})
-			plat.text_draw(gfx, text, line, x0 + char_w, y, px, g_theme[.Md_Code], .Doc)
+			if fence_lex != nil {
+				toks: [128]base.Token
+				nt, st := fence_lex(transmute([]u8)line, fence_state, toks[:])
+				fence_state = st
+				spans: [128]plat.Text_Span
+				ns := 0
+				for i in 0 ..< nt {
+					if ns >= len(spans) {break}
+					spans[ns] = {start = toks[i].start, len = toks[i].len, color = g_theme[highlight_kind_role(toks[i].kind)]}
+					ns += 1
+				}
+				plat.text_draw_spans(gfx, text, line, x0 + char_w, y, px, g_theme[.Md_Code], spans[:ns], .Doc)
+			} else {
+				plat.text_draw(gfx, text, line, x0 + char_w, y, px, g_theme[.Md_Code], .Doc)
+			}
 			y += line_h
 		} else if len(strings.trim_space(line)) == 0 {
 			y += line_h * 0.5 // blank line: a little gap
@@ -690,18 +798,58 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			for &r in runs {r.bold = true}
 			md_draw_inline(gfx, qp, text, runs, x0, x1, &x, &yy, hpx, plat.text_char_width(text, hpx, .Doc), hh, g_theme[.Md_Heading])
 			y = yy + hh - px * 0.3
-		} else if q, qcontent := md_quote(trimmed); q {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {max(sx(3), 2), line_h}, color = g_theme[.Md_Quote]}})
-			x := x0 + char_w * 2
+		} else if q, qcontent, qdepth := md_quote_depth(trimmed); q {
+			// One bar per nesting level, indented per level (UI spec 9.2's "2px
+			// bar + 16px inset per level"), so a reply inside a reply is visibly
+			// deeper instead of identical to a single quote.
+			for d in 0 ..< qdepth {
+				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + f32(d) * char_w * 2, y - px}, size = {max(sx(3), 2), line_h}, color = g_theme[.Md_Quote]}})
+			}
+			qind := x0 + f32(qdepth) * char_w * 2
+			x := qind
 			yy := y
-			md_draw_inline(gfx, qp, text, md_inline(qcontent), x0 + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Md_Quote])
+			md_draw_inline(gfx, qp, text, md_inline(qcontent), qind, x1, &x, &yy, px, char_w, line_h, g_theme[.Md_Quote])
 			y = yy + line_h
 		} else if bullet, content, depth := md_list(line); bullet != "" {
 			ind := x0 + f32(depth) * char_w * 2
+			body := content
+			// A task item draws a real box instead of literal brackets, which is
+			// how `- [ ] thing` reads without this. Done items go muted, so a
+			// finished checklist recedes -- and the TICK carries the state as
+			// well as the tone, never colour alone (UI spec 18).
+			task_col := g_theme[.Text_Primary]
+			if rest, done, is_task := md_task(content); is_task {
+				body = rest
+				bx := ind
+				bs := char_w * 1.4
+				by := y - px * 0.75
+				edge := hairline()
+				bc := g_theme[.Accent] if done else g_theme[.Text_Muted]
+				plat.quads_draw(
+					gfx,
+					qp,
+					[]plat.Quad {
+						{pos = {bx, by}, size = {bs, edge}, color = bc},
+						{pos = {bx, by + bs - edge}, size = {bs, edge}, color = bc},
+						{pos = {bx, by}, size = {edge, bs}, color = bc},
+						{pos = {bx + bs - edge, by}, size = {edge, bs}, color = bc},
+					},
+				)
+				if done {
+					plat.text_draw(gfx, text, "x", bx + bs * 0.28, y, px, g_theme[.Accent], .Doc)
+					task_col = g_theme[.Text_Muted]
+				}
+				x := ind + bs + char_w
+				yy := y
+				md_draw_inline(gfx, qp, text, md_inline(body), ind + bs + char_w, x1, &x, &yy, px, char_w, line_h, task_col)
+				y = yy + line_h
+				p = end + 1
+				continue
+			}
 			plat.text_draw(gfx, text, bullet, ind, y, px, g_theme[.Accent], .Doc)
 			x := ind + char_w * f32(len(bullet) + 1)
 			yy := y
-			md_draw_inline(gfx, qp, text, md_inline(content), ind + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
+			md_draw_inline(gfx, qp, text, md_inline(body), ind + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
 			y = yy + line_h
 		} else if md_is_table_row(line) {
 			if c := md_table_ensure(doc, text, p); c != nil {
@@ -744,10 +892,24 @@ md_is_rule :: proc(s: string) -> bool {
 
 @(private = "file")
 md_quote :: proc(s: string) -> (bool, string) {
-	if strings.has_prefix(s, ">") {
-		return true, strings.trim_left(s[1:], " ")
+	q, c, _ := md_quote_depth(s)
+	return q, c
+}
+
+// A blockquote, with its NESTING DEPTH. `>> a` is a quote inside a quote and
+// used to render exactly like `> a` -- md_quote stripped one marker and returned
+// the rest verbatim, so the second ">" became part of the text. UI spec 9.2
+// lists "blockquote, nested" as one item for that reason.
+md_quote_depth :: proc(s: string) -> (is_quote: bool, content: string, depth: int) {
+	rest := s
+	for {
+		t := strings.trim_left(rest, " ")
+		if !strings.has_prefix(t, ">") {break}
+		rest = t[1:]
+		depth += 1
 	}
-	return false, ""
+	if depth == 0 {return false, "", 0}
+	return true, strings.trim_left(rest, " "), depth
 }
 
 // A list item: returns the bullet to draw ("•" or "1."), the content, and the
@@ -821,7 +983,10 @@ md_draw_table_row :: proc(
 		cx := x0 + md_col_x(c, i, char_w)
 		if cx >= x1 {break}
 		if i > 0 {
-			plat.text_draw(gfx, text, "│", cx - char_w, y, px, g_theme[.Md_Quote], .Doc)
+			// The TABLE column separator -- Md_Rule, which UI spec 1 assigns to
+			// "thematic breaks, table borders, h1/h2 underline". It was Text_Dim,
+			// the disabled-only tier, until the Text_Dim sweep.
+			plat.text_draw(gfx, text, "│", cx - char_w, y, px, g_theme[.Md_Rule], .Doc)
 		}
 		// col0 = 0, and it must match md_table_measure's origin for the same
 		// cell or the alignment padding below is computed against a width the

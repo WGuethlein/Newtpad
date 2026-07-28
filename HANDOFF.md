@@ -3652,6 +3652,48 @@ reproduces `#66625D`.
 
 It is the only such producer; every other colour reaches the target through a shader.
 
+## 6ap. Markdown, part one (2026-07-29, v0.27.0, branch `feat/batch-16-markdown` + `feat/batch-16-rest`)
+
+Batch 16 of the UI overhaul: §9.2's construct list, in the parser and the preview. Wyatt scoped it to
+the 13 numbered items and skipped the four dashed ones (images, footnotes, raw HTML, setext).
+
+### What landed
+
+**Inline:** strikethrough (`~~`), backslash escapes, task list items, YAML front matter.
+**Block:** nested blockquotes, fenced code coloured by its language tag.
+
+**The escape fix reaches past markdown.** `C:	empile.txt` used to toggle italics and restyle the
+rest of the line, and `\*` never produced a literal asterisk. The escapable set is restricted to
+CommonMark's punctuation on purpose — escaping a letter is not an escape, it is a backslash followed by
+a letter, and treating it as one eats backslashes out of Windows paths.
+
+**Nested blockquotes were silently wrong**, not missing: `md_quote` stripped one `>` and returned the
+rest verbatim, so `>> two` put the second marker into the quoted *text* and a reply inside a reply
+rendered identically to a single quote.
+
+**Fenced code resolves its lexer through `highlight_lexer_for`** by building a pseudo-path, rather than
+growing a second tag→lexer table. One mapping means a lexer added for a file extension works inside a
+fence for free, and the two cannot drift on what `cs` means.
+
+### Caught on the way
+
+The table column separator had been moved onto `Md_Quote` during the `Text_Dim` sweep. It is a table
+border, which §1 assigns to `Md_Rule`. Fixed.
+
+### Owed — and the largest item is deliberate
+
+- **Concealment is NOT done.** Wyatt chose §9.4's "hide the marks on non-caret lines, like Obsidian"
+  over dimming them. It is not built, and the reason is recorded rather than glossed: hiding characters
+  makes the *drawn* column stop matching the *byte* column, and `line_cell_col` / `line_offset_at_cell`
+  are the documented seam between those two. Concealment has to go **inside that pair and nowhere
+  else**, with the seam test extended — which is a batch's work, not a tail-end addition to a long
+  session that had already shipped one visibly broken release.
+- **Links, autolinks and reference links** (§9.2 item 8) are unchanged — inline `[a](b)` works, the
+  other two forms do not.
+- **Lists do not nest visually** beyond their indent; `md_list` reports depth and the preview indents,
+  but there is no per-level bullet cycling.
+- **§9.3's preview type scale and proportional face** are batch 17 and untouched.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
