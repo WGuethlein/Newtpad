@@ -25,6 +25,25 @@ md_selftest :: proc() -> (bad: int) {
 		fmt.printfln("  %-40s %s", msg, "OK" if ok else "FAIL")
 		if !ok {bad^ += 1}
 	}
+	// --- fenced code picks a lexer from its tag (batch 16) ---
+	//
+	// The mapping goes through highlight_lexer_for, so this also asserts the
+	// fence and the file extension share one table rather than drifting.
+	{
+		chk(&bad, md_fence_lexer("```json") != nil, "```json -> a lexer")
+		chk(&bad, md_fence_lexer("```cs") != nil, "```cs -> a lexer")
+		chk(&bad, md_fence_lexer("~~~yaml") != nil, "~~~yaml -> a lexer")
+		// Aliases that are not their own extension.
+		chk(&bad, md_fence_lexer("```yml") != nil, "```yml -> a lexer (alias of yaml)")
+		chk(&bad, md_fence_lexer("```csharp") != nil, "```csharp -> a lexer (alias of cs)")
+		chk(&bad, md_fence_lexer("```bash") != nil, "```bash -> a lexer (alias of sh)")
+		// Info strings carry more than the tag in real documents.
+		chk(&bad, md_fence_lexer("```js title=\"x\"") != nil, "an info string past the tag is ignored")
+		// And the negative cases, or "returns non-nil" proves nothing.
+		chk(&bad, md_fence_lexer("```") == nil, "a bare fence has no lexer")
+		chk(&bad, md_fence_lexer("```notalanguage") == nil, "an unknown tag has no lexer")
+	}
+
 	// --- nested blockquotes, front matter (batch 16) ---
 	{
 		q1, c1, d1 := md_quote_depth("> one")
@@ -579,6 +598,35 @@ md_escapable :: proc(c: u8) -> bool {
 	return false
 }
 
+// The lexer for a fence's info string, or nil when the tag names nothing known.
+//
+// Resolved through highlight_lexer_for by building a pseudo-path, so the fence
+// and the file extension share ONE table: adding a lexer for `.rs` makes
+// ```rust work for free, and the two can never disagree.
+md_fence_lexer :: proc(fence_line: string) -> Lexer_Proc {
+	tag := strings.trim_space(strings.trim_left(strings.trim_left(fence_line, "`"), "~"))
+	if tag == "" {return nil}
+	// Only the first word: ```js title="x" is a real thing people write.
+	if sp := strings.index_byte(tag, ' '); sp > 0 {tag = tag[:sp]}
+	// A handful of names that are not their own extension. Everything else is
+	// tried as one directly, which covers c, cs, cpp, json, xml, yaml, toml, ini,
+	// sh, bat, md and any lexer added later.
+	switch strings.to_lower(tag, context.temp_allocator) {
+	case "javascript", "js", "typescript", "ts":
+		tag = "c" // close enough for braces, strings and // comments
+	case "shell", "console", "bash", "zsh":
+		tag = "sh"
+	case "yml":
+		tag = "yaml"
+	case "csharp", "c#":
+		tag = "cs"
+	case "c++":
+		tag = "cpp"
+	}
+	lexer, _, _, _ := highlight_lexer_for(strings.concatenate({"x.", tag}, context.temp_allocator))
+	return lexer
+}
+
 // A task list item: `- [ ] thing` or `- [x] thing`. Returns the text after the
 // box, and whether it is ticked. GFM, and the one list variant whose absence is
 // noticed immediately because a checklist renders as literal brackets.
@@ -673,6 +721,16 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	y := ytop + px // first baseline
 	p := top_byte
 	in_fence := false
+	// The fence's language tag, resolved to a lexer. UI spec 9.2 item 4 asks for
+	// "fenced code + lexer -- syn_* inside", and a fenced block was drawn as flat
+	// Md_Code however it was tagged.
+	//
+	// The tag is turned into a pseudo-path and handed to highlight_lexer_for,
+	// rather than growing a second tag->lexer table beside the extension one.
+	// One mapping means a lexer added for a file type is immediately available
+	// inside a fence, and the two can never disagree about what "cs" means.
+	fence_lex: Lexer_Proc
+	fence_state: base.Lex_State
 	// YAML front matter reads as a small card rather than as body text with two
 	// horizontal rules around it, which is what `---` on its own line otherwise
 	// renders as (UI spec 9.2 item 12). Only when the view starts at the top of
@@ -700,10 +758,29 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 
 		if strings.has_prefix(trimmed, "```") || strings.has_prefix(trimmed, "~~~") {
 			in_fence = !in_fence
+			if in_fence {
+				fence_lex, fence_state = md_fence_lexer(trimmed), .Normal
+			} else {
+				fence_lex = nil
+			}
 			y += line_h
 		} else if in_fence {
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {x1 - x0, line_h}, color = g_theme[.Md_Code_Bg]}})
-			plat.text_draw(gfx, text, line, x0 + char_w, y, px, g_theme[.Md_Code], .Doc)
+			if fence_lex != nil {
+				toks: [128]base.Token
+				nt, st := fence_lex(transmute([]u8)line, fence_state, toks[:])
+				fence_state = st
+				spans: [128]plat.Text_Span
+				ns := 0
+				for i in 0 ..< nt {
+					if ns >= len(spans) {break}
+					spans[ns] = {start = toks[i].start, len = toks[i].len, color = g_theme[highlight_kind_role(toks[i].kind)]}
+					ns += 1
+				}
+				plat.text_draw_spans(gfx, text, line, x0 + char_w, y, px, g_theme[.Md_Code], spans[:ns], .Doc)
+			} else {
+				plat.text_draw(gfx, text, line, x0 + char_w, y, px, g_theme[.Md_Code], .Doc)
+			}
 			y += line_h
 		} else if len(strings.trim_space(line)) == 0 {
 			y += line_h * 0.5 // blank line: a little gap
