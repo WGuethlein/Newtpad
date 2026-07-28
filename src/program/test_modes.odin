@@ -14486,6 +14486,159 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad httptest [live]` -- platform/http.odin.
+		//
+		// Everything that can be checked without a socket is checked by default,
+		// and the one thing that cannot -- a real request -- is opt-in behind
+		// `live`. A suite that goes red on an offline machine, on a train, or
+		// behind a corporate proxy is a suite people learn to skip, and then it
+		// stops catching anything.
+		//
+		// The size cap is the interesting one, because "refuse rather than
+		// allocate whatever the server sends" is a property of the read loop and
+		// the read loop needs a server. It is testable here because http_get's
+		// loop does nothing to the body except hand each WinHttpReadData chunk to
+		// http_sink_push -- so pushing synthetic chunks exercises the same code
+		// that guards the real one. That seam is the reason the cap is not an
+		// untested claim.
+		if os.args[1] == "httptest" {
+			http_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			// The cap: at the boundary, one byte over, and sticky afterwards.
+			http_sink_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- size cap (Http_Sink) ---")
+				ten := make([]u8, 10, context.temp_allocator)
+				{
+					s := plat.Http_Sink{max = 10}
+					defer delete(s.buf)
+					chk(bad, plat.http_sink_push(&s, ten[:4]), "4 of 10 accepted")
+					chk(bad, len(s.buf) == 4, fmt.tprintf("buffered 4, got %d", len(s.buf)))
+					chk(bad, plat.http_sink_push(&s, ten[:6]), "exactly at the cap accepted")
+					chk(bad, len(s.buf) == 10, fmt.tprintf("buffered 10, got %d", len(s.buf)))
+					chk(bad, !plat.http_sink_push(&s, ten[:1]), "one byte past the cap refused")
+					chk(bad, s.over, "refusal latches `over`")
+					// The point of enforcing inside the loop: the refused chunk is
+					// never allocated. If the cap were applied after the read loop
+					// this would be 11.
+					chk(bad, len(s.buf) == 10, fmt.tprintf("refused chunk not buffered: len=%d", len(s.buf)))
+					// Sticky: a later small chunk must not un-refuse the response.
+					chk(bad, !plat.http_sink_push(&s, ten[:1]), "still refused after `over`")
+					chk(bad, len(s.buf) == 10, fmt.tprintf("still 10 after the second refusal: %d", len(s.buf)))
+				}
+				{
+					s := plat.Http_Sink{max = 10}
+					defer delete(s.buf)
+					chk(bad, plat.http_sink_push(&s, ten[:]), "a first chunk exactly at the cap is accepted")
+				}
+				{
+					// One oversized chunk on an empty sink: nothing is allocated at
+					// all, which is the case a hostile Content-Length produces.
+					s := plat.Http_Sink{max = 9}
+					defer delete(s.buf)
+					chk(bad, !plat.http_sink_push(&s, ten[:]), "an oversized first chunk is refused")
+					chk(bad, len(s.buf) == 0, fmt.tprintf("nothing buffered from the refused first chunk: %d", len(s.buf)))
+				}
+			}
+
+			// Host/path validation: the whole of http_get's input checking, since
+			// it is handed a host and a path rather than a URL to parse.
+			http_input_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- host / path validation ---")
+				good_hosts := []string{"api.github.com", "example.org", "a", "xn--80ak6aa92e.com"}
+				for h in good_hosts {
+					chk(bad, plat.http_host_ok(h), fmt.tprintf("host accepted: %q", h))
+				}
+				bad_hosts := []string {
+					"", // empty
+					"api.github.com/evil", // a path smuggled into the host
+					"api.github.com:8080", // a port
+					"user@api.github.com", // userinfo
+					"api github com", // space
+					"api.github.com\r\nHost: evil", // header injection
+					"[::1]", // bracketed literal
+					"exämple.com", // non-ASCII (must arrive punycoded)
+					"a%2fb", // percent-encoded separator
+				}
+				for h in bad_hosts {
+					chk(bad, !plat.http_host_ok(h), fmt.tprintf("host refused: %q", h))
+				}
+				long253 := strings.repeat("a", 253, context.temp_allocator)
+				long254 := strings.repeat("a", 254, context.temp_allocator)
+				chk(bad, plat.http_host_ok(long253), "253-char host accepted")
+				chk(bad, !plat.http_host_ok(long254), "254-char host refused")
+
+				chk(bad, plat.http_path_ok("/repos/WGuethlein/Newtpad/releases/latest"), "the update path is accepted")
+				chk(bad, plat.http_path_ok("/"), "bare / accepted")
+				chk(bad, !plat.http_path_ok(""), "empty path refused")
+				chk(bad, !plat.http_path_ok("repos/x"), "path without a leading / refused")
+				chk(bad, !plat.http_path_ok("/a b"), "path with a space refused")
+				chk(bad, !plat.http_path_ok("/a\r\nX-Evil: 1"), "request splitting refused")
+				chk(bad, !plat.http_path_ok("/ä"), "non-ASCII path refused")
+				long := strings.concatenate({"/", strings.repeat("a", 2048, context.temp_allocator)}, context.temp_allocator)
+				chk(bad, !plat.http_path_ok(long), "2049-char path refused")
+			}
+
+			// The two pure classifiers. Both decide whether the caller says
+			// "could not check", so both are worth pinning.
+			http_classify_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- result classification ---")
+				chk(bad, plat.http_result_for_error(12002) == .Timeout, "ERROR_WINHTTP_TIMEOUT -> .Timeout")
+				chk(bad, plat.http_result_for_error(12007) == .Network, "NAME_NOT_RESOLVED -> .Network")
+				chk(bad, plat.http_result_for_error(12029) == .Network, "CANNOT_CONNECT -> .Network")
+				chk(bad, plat.http_result_for_error(0) == .Network, "no error code -> .Network")
+				oks := []int{200, 201, 204, 299}
+				for s in oks {
+					chk(bad, plat.http_result_for_status(s) == .Ok, fmt.tprintf("HTTP %d -> .Ok", s))
+				}
+				// 301 matters specifically: redirects are disabled, so a moved
+				// endpoint must read as "could not check", never as an answer.
+				nots := []int{0, 100, 199, 301, 302, 304, 403, 404, 429, 500, 503}
+				for s in nots {
+					chk(bad, plat.http_result_for_status(s) == .Bad_Status, fmt.tprintf("HTTP %d -> .Bad_Status", s))
+				}
+			}
+
+			// The real request. Opt-in, and it asserts nothing about the network's
+			// mood -- only that http_get returns a coherent triple and never a
+			// body on a non-Ok result.
+			http_live_case :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				CAP :: 256 * 1024
+				fmt.println("--- live request (api.github.com) ---")
+				body, status, res := plat.http_get("api.github.com", "/repos/WGuethlein/Newtpad/releases/latest", CAP, 5000)
+				defer delete(body)
+				fmt.printfln("  res=%v status=%d bytes=%d", res, status, len(body))
+				chk(bad, res == .Ok || body == nil, "a non-Ok result returns no body")
+				if res == .Ok {
+					chk(bad, status >= 200 && status < 300, fmt.tprintf(".Ok came with status %d", status))
+					chk(bad, len(body) > 0 && len(body) <= CAP, fmt.tprintf("body within the cap: %d", len(body)))
+				}
+				// The cap, against a real socket: one byte of headroom is not
+				// enough for any real response, so this must refuse without
+				// allocating the whole thing.
+				tiny, _, tres := plat.http_get("api.github.com", "/repos/WGuethlein/Newtpad/releases/latest", 8, 5000)
+				defer delete(tiny)
+				fmt.printfln("  cap=8 -> res=%v bytes=%d", tres, len(tiny))
+				chk(bad, tres != .Ok, "an 8-byte cap does not return .Ok")
+				chk(bad, tiny == nil, "a refused response returns no body")
+			}
+
+			bad := 0
+			base.log_init(.Warn) // http_get logs; keep the transcript readable
+			http_sink_cases(&bad, http_chk)
+			http_input_cases(&bad, http_chk)
+			http_classify_cases(&bad, http_chk)
+			if len(os.args) > 2 && os.args[2] == "live" {
+				http_live_case(&bad, http_chk)
+			} else {
+				fmt.println("--- live request: SKIPPED (pass `live` to make one) ---")
+			}
+			fmt.printfln("httptest: %d failures", bad)
+			return true
+		}
+
 		if len(os.args) < 3 {return false}
 		path, mode := os.args[1], os.args[2]
 
