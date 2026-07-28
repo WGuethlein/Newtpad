@@ -3270,14 +3270,17 @@ doc_draw :: proc(
 	// past VISIBLE_COLS aren't drawn (crude long-line handling; proper horizontal
 	// scroll is a follow-up).
 	line_buf: [VISIBLE_COLS]u8
-	// Colour-rule spans for the row being drawn (rules.odin). Declared HERE
-	// rather than inside the row loop, unlike hl_buf below it: Odin
-	// zero-initialises a declared array, so a per-row declaration is an 8 KB
-	// memset per row -- 320 KB a frame on a full viewport, spent to clear a
-	// buffer that is written before it is read. Only the [:rules_n] prefix each
-	// row writes is ever consumed, so one buffer for the whole pass is
-	// equivalent and free. (hl_buf has the same 16 KB-per-row shape and
-	// predates this; left alone here rather than changed as a side effect.)
+	// Span buffers for the row being drawn: syntax spans (highlight.odin) and
+	// colour-rule spans (rules.odin). Declared HERE rather than inside the row
+	// loop: Odin zero-initialises a declared array, so a per-row declaration is
+	// a 16 KB memset for hl_buf plus an 8 KB one for rules_buf EVERY row -- 960
+	// KB a frame on a 40-row viewport, spent to clear buffers that are written
+	// before they are read. Each row consumes only the [:hl_n] / [:rules_n]
+	// prefix its own producer just wrote that row (doc_row_lex_spans and
+	// rules_row_spans both report what they wrote, and neither reads what was
+	// there before), so one buffer for the whole pass is equivalent and free.
+	// The counts stay per row; only the storage is shared.
+	hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
 	rules_buf: [RULES_MAX_ROW_SPANS]plat.Text_Span
 	bottom = doc.top
 	// Syntax highlighting: nil lexer for an extension with no grammar (.txt,
@@ -3356,8 +3359,7 @@ doc_draw :: proc(
 			// (highlight.odin), not inlined here, so highlighttest can exercise
 			// the exact proc this draws with rather than a duplicate that could
 			// quietly diverge from it.
-			hl_n := 0
-			hl_buf: [HL_MAX_ROW_TOKENS]plat.Text_Span
+			hl_n := 0 // hl_buf is hoisted above the loop -- see its comment there
 			if hl_lexer != nil {
 				if doc_filtering(doc) {
 					// Non-contiguous row: can't inherit state from the row
