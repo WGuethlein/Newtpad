@@ -332,13 +332,16 @@ theme_dark :: proc() -> Theme {
 		// comment text, and themetest asserts the separation. The UI spec sets
 		// both to #9D9284, the SAME value, which would have failed that
 		// assertion: it was written from screenshots and could not know the
-		// gutter shares the role. Kept as a sage grey in the warm family
-		// instead, 5.2:1 -- still comfortably AA, so comments stay readable.
+		// gutter shares the role. Green instead -- comments are green nearly
+		// everywhere and the convention is worth more than palette tidiness --
+		// but muted rather than vivid (Wyatt: "maybe not such a vibrant bright
+		// green in the dark mode"), at 4.7:1, still above the AA floor so
+		// comments stay readable rather than merely present.
 		// Syn_Punct is likewise kept clear of Text_Primary.
 		.Syn_Keyword     = {0.827, 0.663, 0.804, 1}, // #D3A9CD  7.4  mauve -- language words
 		.Syn_String      = {0.616, 0.788, 0.627, 1}, // #9DC9A0  8.6  green -- literal content
 		.Syn_Number      = {0.898, 0.710, 0.498, 1}, // #E5B57F  8.4  amber -- numbers, true/false/null
-		.Syn_Comment     = {0.494, 0.580, 0.502, 1}, // #7E9480  5.0  sage -- see the note above
+		.Syn_Comment     = {0.455, 0.565, 0.478, 1}, // #74907A  4.7  muted green -- see the note above
 		.Syn_Type        = {0.592, 0.765, 0.847, 1}, // #97C3D8  8.2  blue -- types, tags, references
 		.Syn_Punct       = {0.651, 0.608, 0.545, 1}, // #A69B8B  5.6  braces, pipes, commas
 		.Syn_Json_Key    = {0.937, 0.906, 0.859, 1}, // #EFE7DB  12.7 keys are the index you scan: brightest
