@@ -484,13 +484,12 @@ main :: proc() {
 		scrollbar_lo, scrollbar_hi := editor_scrollbar_hit_x(doc, ed_right)
 		if scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= scrollbar_lo && f32(window.mouse_x) < scrollbar_hi && window.mouse_y >= i32(CHROME_TOP) {
 			scrollbar_drag = true
+			vscroll_grab = vbar_grab_at(g_vbar_editor, f32(window.mouse_y))
 			window.mouse_pressed = false
 		}
 		if scrollbar_drag {
 			if window.mouse_down {
-				tt, th := scrollbar_track(doc, f32(window.height))
-				frac := (f32(window.mouse_y) - tt) / max(1, th)
-				doc_scroll_to_fraction(doc, &text, frac, rows)
+				vbar_drag_to(doc, &text, g_vbar_editor, f32(window.mouse_y), vscroll_grab, rows)
 			} else {
 				scrollbar_drag = false
 			}
@@ -498,14 +497,13 @@ main :: proc() {
 		// Preview scrollbar (Markdown Split only), at the window edge.
 		if doc.md_mode == .Split && scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - SCROLLBAR_W && window.mouse_y >= i32(CHROME_TOP) {
 			md_preview_drag = true
+			preview_grab = vbar_grab_at(g_vbar_preview, f32(window.mouse_y))
 			window.mouse_pressed = false
 		}
 		if md_preview_drag {
 			if window.mouse_down {
 				// Synced with the editor: the preview bar drives doc.top too.
-				tt, th := scrollbar_track(doc, f32(window.height))
-				frac := (f32(window.mouse_y) - tt) / max(1, th)
-				doc_scroll_to_fraction(doc, &text, frac, rows)
+				vbar_drag_to(doc, &text, g_vbar_preview, f32(window.mouse_y), preview_grab, rows)
 			} else {
 				md_preview_drag = false
 			}
@@ -549,11 +547,17 @@ main :: proc() {
 			   f32(window.mouse_y) >= hb.y && f32(window.mouse_y) <= hb.y + hb.h &&
 			   f32(window.mouse_x) >= hb.track_x && f32(window.mouse_x) <= hb.track_x + hb.track_w {
 				hscrollbar_drag = true
+				mx := f32(window.mouse_x)
+				// On the thumb: hold it where it was taken. On the bare rail:
+				// half the thumb, which reproduces the centre-on-the-cursor jump
+				// this bar has always made -- once, at the press, instead of on
+				// every frame of the drag.
+				hscroll_grab = (mx - hb.thumb_x) if (mx >= hb.thumb_x && mx < hb.thumb_x + hb.thumb_w) else hb.thumb_w * 0.5
 				window.mouse_pressed = false
 			}
 			if hscrollbar_drag {
 				if window.mouse_down && hb.shown {
-					hscroll_set(doc, hm, hscrollbar_pos_at(hb, f32(window.mouse_x), hm))
+					hscroll_set(doc, hm, hscrollbar_pos_at(hb, f32(window.mouse_x) - hscroll_grab, hm))
 				} else {
 					hscrollbar_drag = false
 				}
@@ -1020,9 +1024,17 @@ hscrollbar_geo :: proc(doc: ^Document, winw, winh: f32, m: Hscroll) -> (b: Hbar)
 	return
 }
 
-// Map a pointer x on the track to a horizontal scroll offset (thumb centred on
-// the cursor). Inverse of hscrollbar_geo's thumb_x; kept beside it so the two
-// stay consistent.
+// Map a thumb LEFT EDGE on the track to a horizontal scroll offset. The exact
+// inverse of hscrollbar_geo's thumb_x, and kept beside it so the two stay
+// consistent.
+//
+// It used to take the pointer x and subtract half the thumb width -- "thumb
+// centred on the cursor" -- which silently made every drag frame a fresh
+// centre-on-the-pointer jump, so grabbing the thumb by its edge snapped it under
+// the cursor and then refused to be dragged from where it was grabbed. The
+// caller now subtracts the grab offset it latched at the press, so a rail click
+// still centres (grab = half the thumb) and a thumb grab holds (grab = where you
+// actually took hold of it).
 // Every gesture that owns the pointer across frames. The read-only swallow must
 // exclude all of them, and this struct exists so the list is one thing that can
 // be tested rather than four `&&` clauses nobody re-reads.
@@ -1066,8 +1078,86 @@ scrollbar_track :: proc(doc: ^Document, winh: f32) -> (top, height: f32) {
 	return CHROME_TOP, max(1, winh - CHROME_TOP - doc_bottom_bar_h(doc))
 }
 
-hscrollbar_pos_at :: proc(b: Hbar, mx: f32, m: Hscroll) -> int {
-	frac := (mx - b.track_x - b.thumb_w * 0.5) / max(1, b.track_w - b.thumb_w)
+// The vertical scrollbar's track AND thumb, in client pixels. The hscrollbar_geo
+// of the vertical axis, and it exists for the same reason: the thumb's y and
+// height were computed inside render_frame -- twice, once for the editor bar and
+// once for the Split preview's -- so the DRAG could not see the thumb at all.
+// Not being able to see it is precisely why the drag re-derived the scroll
+// position from the raw pointer y on every frame, which is the bug Wyatt hit:
+// press-and-hold anywhere on the thumb re-ran the rail-click jump every frame
+// and the view lurched out from under the grab.
+//
+// `bottom` is the last visible byte offset, which the draw discovers -- so the
+// two callers pass their own (doc_draw's for the editor, markdown_draw's for the
+// preview) and this stays one geometry with two inputs rather than two
+// geometries.
+Vbar :: struct {
+	shown:                                bool,
+	x, track_y, track_h, thumb_y, thumb_h: f32,
+}
+
+vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int) -> (b: Vbar) {
+	if doc == nil || doc.pt.length <= 0 {return}
+	total := f32(doc.pt.length)
+	b.x = x
+	b.track_y, b.track_h = scrollbar_track(doc, winh)
+	b.thumb_h = clamp(f32(bottom - doc.top) / total * b.track_h, sx(24), b.track_h)
+	// The thumb travels the track MINUS its own height, not the whole track --
+	// at the document end its BOTTOM meets the track's bottom, not its top. The
+	// clamp is kept as a belt for the ends, but it is no longer what does the
+	// work, and that distinction is the fix: with the full track as the
+	// multiplier this map and vbar_drag_to's inverse disagreed by
+	// track_h / (track_h - thumb_h), so pressing the thumb and holding perfectly
+	// still moved the document by ~3% of its length. The two are exact inverses
+	// now, which is what makes "grab it and it does not move" true rather than
+	// approximately true.
+	travel := max(1, b.track_h - b.thumb_h)
+	b.thumb_y = clamp(b.track_y + f32(doc.top) / total * travel, b.track_y, b.track_y + b.track_h - b.thumb_h)
+	b.shown = true
+	return
+}
+
+// The two vertical bars as they were last DRAWN, written by render_frame and
+// read by the press hit-test in the frame loop.
+//
+// One frame stale, and that is the correct staleness rather than a compromise:
+// the question a press asks is "was the pointer on the thumb the user can see",
+// and the thumb the user can see is the one the last frame drew. Recomputing it
+// at press time would test against a thumb that has never been on screen.
+g_vbar_editor: Vbar
+g_vbar_preview: Vbar
+
+// Where the pointer sat inside the thumb when the drag began, so the thumb stays
+// under the cursor instead of jumping to it. Zero after a press on the bare rail,
+// which is what makes that press put the thumb's top at the cursor -- the jump
+// Wyatt confirmed is the wanted behaviour -- and then track smoothly from there.
+vscroll_grab: f32
+preview_grab: f32
+hscroll_grab: f32
+
+// Where in the thumb a press landed. On the thumb, that offset; on the bare
+// rail, zero -- which makes the first drag frame put the thumb's TOP at the
+// cursor, the jump this bar has always made and the one Wyatt confirmed is
+// right. The difference from before is that it now happens once, at the press,
+// rather than being recomputed from the raw pointer on every frame of the hold.
+vbar_grab_at :: proc(b: Vbar, my: f32) -> f32 {
+	if b.shown && my >= b.thumb_y && my < b.thumb_y + b.thumb_h {return my - b.thumb_y}
+	return 0
+}
+
+// One frame of a vertical scrollbar drag. Positions the THUMB (pointer minus the
+// grab) and converts that to a document fraction, rather than mapping the
+// pointer straight onto the track -- the difference between dragging a thumb and
+// teleporting it.
+vbar_drag_to :: proc(doc: ^Document, t: ^plat.Text, b: Vbar, my, grab: f32, rows: int) {
+	if !b.shown {return}
+	travel := max(1, b.track_h - b.thumb_h)
+	frac := ((my - grab) - b.track_y) / travel
+	doc_scroll_to_fraction(doc, t, clamp(frac, 0, 1), rows)
+}
+
+hscrollbar_pos_at :: proc(b: Hbar, thumb_x: f32, m: Hscroll) -> int {
+	frac := (thumb_x - b.track_x) / max(1, b.track_w - b.thumb_w)
 	return clamp(int(frac * f32(m.max) + 0.5), 0, m.max)
 }
 
@@ -1199,14 +1289,10 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	er := doc_editor_right(doc, w, rc.app.settings.split_frac)
 	total := doc.pt.length
 	if total > 0 && !doc.filter {
-		_, sb_h := scrollbar_track(doc, h)
-		th := clamp(f32(bottom - doc.top) / f32(total) * sb_h, sx(24), sb_h)
-		// Keep the thumb inside the track. Without the upper clamp it ran off the
-		// bottom of the window when doc.top sat near the end -- which force-wrapping
-		// makes common, since the last visible row of a wrapped line lands close to
-		// the document end.
-		ty := clamp(CHROME_TOP + f32(doc.top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
-		track := plat.Quad{pos = {er - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_TRACK_W, sb_h}, color = g_theme[.Bg_Raised]}
+		vb := vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom)
+		g_vbar_editor = vb // what the press hit-tests against next frame
+		sb_h, th, ty := vb.track_h, vb.thumb_h, vb.thumb_y
+		track := plat.Quad{pos = {vb.x, vb.track_y}, size = {SCROLLBAR_TRACK_W, sb_h}, color = g_theme[.Bg_Raised]}
 		// Find-match ticks, drawn BETWEEN the track and the thumb.
 		//
 		// Under the thumb rather than over it, deliberately. No single colour
@@ -1263,15 +1349,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// panes anchored to the same source line.
 		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.top)
 		if total > 0 {
-			_, sb_h := scrollbar_track(doc, h)
-			th := clamp(f32(pv_bottom - doc.top) / f32(total) * sb_h, sx(24), sb_h)
-			ty := clamp(CHROME_TOP + f32(doc.top) / f32(total) * sb_h, CHROME_TOP, CHROME_TOP + sb_h - th)
+			pvb := vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom)
+			g_vbar_preview = pvb
 			plat.quads_draw(
 				gfx,
 				quad_pipe,
 				[]plat.Quad {
-					{pos = {w - SCROLLBAR_W, CHROME_TOP}, size = {SCROLLBAR_TRACK_W, sb_h}, color = g_theme[.Bg_Raised]},
-					{pos = {w - SCROLLBAR_W, ty}, size = {SCROLLBAR_TRACK_W, th}, color = g_theme[.Scrollbar_Thumb]},
+					{pos = {pvb.x, pvb.track_y}, size = {SCROLLBAR_TRACK_W, pvb.track_h}, color = g_theme[.Bg_Raised]},
+					{pos = {pvb.x, pvb.thumb_y}, size = {SCROLLBAR_TRACK_W, pvb.thumb_h}, color = g_theme[.Scrollbar_Thumb]},
 				},
 			)
 		}

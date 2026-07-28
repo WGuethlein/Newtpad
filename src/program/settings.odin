@@ -543,7 +543,7 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 		case 9:
 			val = app.settings.ui_font_family
 		}
-		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Dim]
+		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Muted]
 		plat.text_draw(gfx, t, val, width - sx(220), y, UI_PX, vc)
 		y += rowh
 	}

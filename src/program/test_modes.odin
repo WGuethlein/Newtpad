@@ -7122,7 +7122,7 @@ when NEWTPAD_TESTS {
 						gdoc.table_col = clamp(tc, 0, gm.max)
 						m2 := hscroll_model(&gdoc, &t, rows, 1000, cw)
 						b2 := hscrollbar_geo(&gdoc, 1000, 700, m2)
-						got := hscrollbar_pos_at(b2, b2.thumb_x + b2.thumb_w*0.5, m2)
+						got := hscrollbar_pos_at(b2, b2.thumb_x, m2)
 						if got != gdoc.table_col {
 							fmt.printfln("  FAIL grid: thumb round-trip col=%d -> %d", gdoc.table_col, got)
 							bad += 1;grid_bad += 1
@@ -7228,7 +7228,15 @@ when NEWTPAD_TESTS {
 			doc_update_hscroll(&doc) // leave the global reset
 
 			// The draggable bar's seam: dropping the thumb where it was drawn must
-			// recover the same offset (thumb-centre round-trip through pos_at).
+			// recover the same offset -- geo maps an offset to a thumb origin and
+			// pos_at maps it back, so the two have to be exact inverses.
+			//
+			// This used to round-trip the thumb CENTRE, because pos_at took a
+			// pointer and subtracted half a thumb from it. That made the check pass
+			// through the centring rather than through the geometry, and it is why
+			// the vertical bar's identical mismatch went unnoticed: no test on
+			// either axis ever compared a drawn thumb position with the position a
+			// drag recovers from it.
 			maxhs := doc_max_hscroll(&doc, &t, rows)
 			for hs in ([]int{0, 40, 120, maxhs}) {
 				doc.h_scroll = clamp(hs, 0, maxhs)
@@ -7239,7 +7247,7 @@ when NEWTPAD_TESTS {
 					bad += 1
 					continue
 				}
-				got := hscrollbar_pos_at(hb, hb.thumb_x + hb.thumb_w*0.5, hm)
+				got := hscrollbar_pos_at(hb, hb.thumb_x, hm)
 				if got != doc.h_scroll {
 					fmt.printfln("  FAIL: thumb round-trip hs=%d -> %d", doc.h_scroll, got)
 					bad += 1
@@ -8544,6 +8552,101 @@ when NEWTPAD_TESTS {
 					ok := diff >= 0.10
 					if !ok {fail = true}
 					fmt.printfln("  %-6s Light %v vs %v: max channel diff %.3f (need >= 0.10)", "ok" if ok else "FAIL", p.a, p.b, diff)
+				}
+			}
+
+			// Colourblind separation, simulated.
+			//
+			// Wyatt is orange/green colourblind and the first version of this
+			// palette was unusable for him: "it's like there's not enough of a
+			// difference between the text and comments and strings". Measured,
+			// body text and strings sat at dE 6.4 under simulation and strings
+			// and numbers at 12.8 -- the exact pair he named, both far below what
+			// a person can separate.
+			//
+			// Vienot-Brettel-Mollon 1999: project LINEAR rgb through the
+			// dichromat matrix, then compare in CIE Lab. Deuteranopia
+			// (green-blind) and protanopia (red-blind) are both simulated and the
+			// WORSE of the two is the score, because a palette safe for one and
+			// not the other is not safe.
+			//
+			// Only pairs that actually sit next to each other in code are checked.
+			// "Every pair must differ" is unachievable under a deficiency that
+			// flattens the palette onto two dimensions, and chasing it produces
+			// exactly the garish result Wyatt asked to avoid.
+			{
+				cvd_lin :: proc(v: f32) -> f64 {
+					x := f64(v)
+					return x / 12.92 if x <= 0.04045 else math.pow((x + 0.055) / 1.055, 2.4)
+				}
+				cvd_enc :: proc(v: f64) -> f32 {
+					x := clamp(v, 0, 1)
+					return f32(x * 12.92) if x <= 0.0031308 else f32(1.055 * math.pow(x, 1.0 / 2.4) - 0.055)
+				}
+				cvd_sim :: proc(c: [4]f32, m: [3][3]f64) -> [4]f32 {
+					l := [3]f64{cvd_lin(c[0]), cvd_lin(c[1]), cvd_lin(c[2])}
+					out: [4]f32 = {0, 0, 0, 1}
+					for i in 0 ..< 3 {out[i] = cvd_enc(m[i][0] * l[0] + m[i][1] * l[1] + m[i][2] * l[2])}
+					return out
+				}
+				cvd_f :: proc(t: f64) -> f64 {
+					return math.pow(t, 1.0 / 3.0) if t > 0.008856 else 7.787 * t + 16.0 / 116.0
+				}
+				to_lab :: proc(c: [4]f32) -> [3]f64 {
+					r, g, b := cvd_lin(c[0]), cvd_lin(c[1]), cvd_lin(c[2])
+					X := (0.4124 * r + 0.3576 * g + 0.1805 * b) / 0.95047
+					Y := 0.2126 * r + 0.7152 * g + 0.0722 * b
+					Z := (0.0193 * r + 0.1192 * g + 0.9505 * b) / 1.08883
+					fx, fy, fz := cvd_f(X), cvd_f(Y), cvd_f(Z)
+					return {116 * fy - 16, 500 * (fx - fy), 200 * (fy - fz)}
+				}
+				sep :: proc(a, b: [4]f32) -> f64 {
+					DEUT := [3][3]f64{{0.29275, 0.70725, 0}, {0.29275, 0.70725, 0}, {-0.02234, 0.02234, 1}}
+					PROT := [3][3]f64{{0.11238, 0.88762, 0}, {0.11238, 0.88762, 0}, {0.00401, -0.00401, 1}}
+					worst := f64(1e9)
+					for m in ([][3][3]f64{DEUT, PROT}) {
+						la, lb := to_lab(cvd_sim(a, m)), to_lab(cvd_sim(b, m))
+						d0, d1, d2 := la[0] - lb[0], la[1] - lb[1], la[2] - lb[2]
+						d := math.sqrt(d0 * d0 + d1 * d1 + d2 * d2)
+						if d < worst {worst = d}
+					}
+					return worst
+				}
+				// A regression bar, not a target. Dark scores 15.5 and Light 11.0;
+				// the floor has to be reachable by Light, which has less lightness
+				// headroom for dark text. The job is to stop the next retune
+				// sliding back to 6, not to freeze today's numbers.
+				FLOOR :: 10.0
+				adj := []struct {
+					a, b: Color_Role,
+				} {
+					{.Text_Primary, .Syn_String},
+					{.Text_Primary, .Syn_Comment},
+					{.Text_Primary, .Syn_Number},
+					{.Text_Primary, .Syn_Punct},
+					{.Syn_String, .Syn_Comment},
+					{.Syn_String, .Syn_Number},
+					{.Syn_String, .Syn_Type},
+					{.Syn_String, .Syn_Keyword},
+					{.Syn_Json_Key, .Syn_String},
+					{.Syn_Keyword, .Syn_Type},
+					{.Syn_Comment, .Syn_Punct},
+					{.Syn_Number, .Syn_Comment},
+				}
+				cvl := theme_light()
+				for th, ti in ([]Theme{d, cvl}) {
+					name := "Dark " if ti == 0 else "Light"
+					worst, wa, wb := f64(1e9), Color_Role.Text_Primary, Color_Role.Text_Primary
+					for pr in adj {
+						v := sep(th[pr.a], th[pr.b])
+						if v < worst {worst, wa, wb = v, pr.a, pr.b}
+					}
+					ok := worst >= FLOOR
+					if !ok {fail = true}
+					fmt.printfln(
+						"  %-6s %s colourblind separation: worst adjacent pair %v/%v at dE %.1f (need %.0f)",
+						"ok" if ok else "FAIL", name, wa, wb, worst, FLOOR,
+					)
 				}
 			}
 
@@ -10251,6 +10354,91 @@ when NEWTPAD_TESTS {
 			// where the spec's 4.2 pills replace the fixed-width tabs.
 
 			fmt.printfln("metricstest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad scrollgrabtest` covers the one thing a scrollbar has to do and
+		// this one did not: hold still when you take hold of it.
+		//
+		// Both bars mapped the raw pointer position onto the track on EVERY frame of
+		// a drag, so a press-and-hold re-ran the rail-click jump continuously --
+		// pressing the thumb near an edge snapped it under the cursor and then
+		// refused to be dragged from where it was grabbed. Wyatt, live use,
+		// 2026-07-28: "it shoots to make the cursor center, rather than staying in
+		// place and waiting for the user to move".
+		//
+		// The seam is grab -> drag: what vbar_grab_at latches at the press has to be
+		// exactly what vbar_drag_to gives back when the pointer has not moved.
+		if os.args[1] == "scrollgrabtest" {
+			sg_run :: proc() -> int {
+				bad := 0
+				sg_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				sb := strings.builder_make()
+				for i in 0 ..< 4000 {fmt.sbprintf(&sb, "line %d of a document long enough to need a scrollbar\n", i)}
+				doc := doc_from_content(transmute([]u8)strings.to_string(sb), "scroll.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				t: plat.Text
+				plat.text_load_faces(&t)
+				px := f32(16)
+				winh := f32(900)
+				rows := doc_visible_rows(&doc, winh, line_height(px))
+				doc.view_cols = 100
+
+				fmt.println("scrollgrabtest:")
+
+				// Park mid-document so the thumb is nowhere near either end.
+				doc_scroll(&doc, &t, 900, rows)
+				top0 := doc.top
+				bottom := doc.top + 2000 // a plausible last-visible offset
+				vb := vscrollbar_geo(&doc, 0, winh, bottom)
+				sg_chk(&bad, vb.shown && vb.thumb_h >= 8 && vb.thumb_y > vb.track_y, fmt.tprintf("the thumb is mid-track (y=%.0f h=%.0f in track %.0f..%.0f)", vb.thumb_y, vb.thumb_h, vb.track_y, vb.track_y + vb.track_h))
+
+				// 1. Press ON the thumb, at three points across it, and do not move.
+				// The view must not shift at all -- this is the whole bug.
+				for frac in ([]f32{0.02, 0.5, 0.98}) {
+					doc.top = top0
+					my := vb.thumb_y + vb.thumb_h * frac
+					grab := vbar_grab_at(vb, my)
+					vbar_drag_to(&doc, &t, vb, my, grab, rows)
+					sg_chk(&bad, doc.top == top0, fmt.tprintf("press at %.0f%% of the thumb and hold: top stays %d (got %d)", frac * 100, top0, doc.top))
+				}
+
+				// 2. The grab is preserved as the pointer moves: dragging down by N
+				// pixels from the TOP edge and from the BOTTOM edge must land on the
+				// same place, because both carry their own offset.
+				{
+					doc.top = top0
+					my_a := vb.thumb_y + 1
+					vbar_drag_to(&doc, &t, vb, my_a + 40, vbar_grab_at(vb, my_a), rows)
+					from_top := doc.top
+					doc.top = top0
+					my_b := vb.thumb_y + vb.thumb_h - 1
+					vbar_drag_to(&doc, &t, vb, my_b + 40, vbar_grab_at(vb, my_b), rows)
+					from_bot := doc.top
+					sg_chk(&bad, from_top == from_bot, fmt.tprintf("dragging 40px from either edge of the thumb agrees (%d vs %d)", from_top, from_bot))
+					sg_chk(&bad, from_top > top0, fmt.tprintf("...and it actually scrolled down (%d > %d)", from_top, top0))
+				}
+
+				// 3. A press on the bare RAIL still jumps -- thumb top to the cursor.
+				// Wyatt confirmed that behaviour is wanted, so it is pinned here
+				// rather than left to be "fixed" by someone reading only case 1.
+				{
+					doc.top = top0
+					rail := vb.track_y + vb.track_h * 0.85 // below the thumb
+					sg_chk(&bad, rail > vb.thumb_y + vb.thumb_h, "the sampled rail point is off the thumb")
+					grab := vbar_grab_at(vb, rail)
+					sg_chk(&bad, grab == 0, fmt.tprintf("a rail press latches no grab (%.1f)", grab))
+					vbar_drag_to(&doc, &t, vb, rail, grab, rows)
+					sg_chk(&bad, doc.top > top0, fmt.tprintf("a rail press below the thumb jumps down (%d -> %d)", top0, doc.top))
+				}
+				return bad
+			}
+			bad := sg_run()
+			fmt.printfln("scrollgrabtest: %d failures", bad)
 			return true
 		}
 

@@ -3225,6 +3225,74 @@ would exercise. It earned that:
 - **No live pass yet.** Every claim here is a headless measurement; the chrome sizes, the warm palette
   and the green comments have not been looked at on screen.
 
+## 6ai. Wyatt's first live pass on batch 12 (2026-07-28, v0.21.1)
+
+Three reports, on branches `fix/scrollbar-grab` and the colour work merged with it. All three turned
+out to be measurable defects rather than taste, which is the useful pattern: a live pass finds things
+a headless suite is not looking for, and then the suite can be taught to look.
+
+### "if i click and hold on one of the edges of the rectangle it shoots to make the cursor center"
+
+Both scrollbars re-derived the scroll position from the raw pointer on **every frame of the drag**, so
+a press-and-hold re-ran the rail-click jump continuously. Wyatt's own follow-up diagnosis was the
+precise one: the rail-click jump is correct and *"it's overwriting the click, hold drag"*.
+
+Two things had to change for the fix to be exact rather than approximate:
+
+- **The vertical thumb's geometry lived inside `render_frame`, computed twice**, so the drag could not
+  see the thumb at all — which is *why* it mapped the pointer instead. `vscrollbar_geo` is now the one
+  layout, consumed by both draws and by the press hit-test. The hit-test reads the bar **as last
+  drawn**, one frame stale, and that is the correct staleness: the question a press asks is whether
+  the pointer was on the thumb the user can see.
+- **The forward and inverse maps disagreed.** `geo` positioned the thumb across the whole track while
+  the drag inverted across the thumb's *travel*, so pressing the thumb and holding perfectly still
+  moved the document by ~3% of its length. A thumb travels the track minus its own height.
+
+`hscrolltest` had a thumb round-trip and it passed throughout, because it round-tripped the thumb
+**centre** through a `pos_at` that took a pointer and subtracted half a thumb — so it round-tripped
+through the centring rather than through the geometry. **No test on either axis ever compared a drawn
+thumb position against the position a drag recovers from it.** That is the gap, not the arithmetic.
+
+### "as an orange/green colorblind person… not enough of a difference between the text and comments and strings"
+
+Measured under simulation, exactly right: body text vs strings **dE 6.4**, strings vs numbers **12.8**.
+Green strings beside amber numbers is the pair that collapses under red-green deficiency.
+
+Red-green deficiency flattens the palette onto lightness × blue-yellow, so five hues cannot be told
+apart by hue. **Strings moved to teal** (differing from amber on the axis that survives); **comments
+stayed green** — the convention is worth keeping — but now carry their cue in being *dim*. Worst
+adjacent pair: 6.4 → **15.7** (Dark), → **10.9** (Light).
+
+**The values came from a search against the simulation, not from taste, and that mattered:** a
+hand-tuned attempt at the same brief scored **7.9**, worse than the search *and* worse than it looked.
+Chroma is capped so nothing turned neon, and contrast is capped at **both** ends — an unconstrained
+search drove Light's comments to near-black to win on lightness, which is precisely the
+"contrastmaxxed" outcome Wyatt asked to avoid.
+
+`themetest` now simulates deuteranopia and protanopia (Viénot-Brettel-Mollon) and scores the worse of
+the two. It checks only pairs that sit adjacent in real code: requiring *every* pair to differ is
+unachievable under a deficiency that removes a dimension, and chasing it is what produces garish
+palettes.
+
+### "on light/dark it's a bit hard to see the text"
+
+Not perceived weight — **live chrome text was drawn in `Text_Dim`**, the disabled-only tier at 2.9:1
+(Dark) and 2.8:1 (Light), below the AA floor by design. `theme.odin` labels that role, in as many
+words, *"DISABLED ONLY -- never live text."* It was carrying inactive tab labels, the close button,
+the menu and palette accelerator chords, and a setting reading "Off". An inactive tab is not a
+disabled control; it is a document you can click, carrying the filename you are looking for.
+
+The decorative `Text_Dim` uses were left alone (scroll-hint arrows, markdown bullets and the quote
+bar) — batch 14 re-picks those against new layouts.
+
+### Owed
+
+- **`Text_Dim` misuse has no guard.** Nothing stops the next widget reaching for it; the roles carry
+  the contract only in a comment. A draw-time assertion would need the text pass to know which role it
+  was handed, which it does not.
+- The batch-12 owed list (§6ah) is unchanged: nothing passes a radius yet, gamma-correct blending, and
+  Monaspace embedding.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -3248,7 +3316,7 @@ would exercise. It earned that:
   - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
     `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `tablereadonlytest`,
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
-    `quadsdftest`
+    `quadsdftest`, `scrollgrabtest`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest <file>`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest <dir>`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
