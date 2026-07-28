@@ -3512,6 +3512,68 @@ All three were shipped visible and inert, which is the worst shape for a defect:
 
 - **No live pass.**
 
+## 6am. Clearing the orphaned debt (2026-07-29, v0.25.0, branch `fix/orphaned-debt`)
+
+Wyatt asked for everything outstanding that no future batch would pick up. Batches 16–20 cover §8, §9,
+§10, §14, §15, §16, §17 and Monaspace; everything below belonged to a batch that had already closed.
+
+### `Text_Dim` finally has a guard, and it needed one
+
+The disabled-only tier at 2.9:1 was drawn as **live text three separate times** — tab labels (§6ai),
+the accelerator chords (§6ai), the whole status bar (§6ak) — while `theme.odin` said *"DISABLED ONLY —
+never live text"* on that role the entire time. **A comment is not a mechanism.**
+
+`themetest` now `#load`s the program sources at compile time and counts `g_theme[.Text_Dim]` against a
+per-file allowlist. That is the only mechanism available: Odin cannot introspect a package, and the
+draw call takes a *colour*, not a role, so nothing at runtime can know which tier it was handed.
+
+Seven of the eight remaining uses were misuse and are fixed (markdown bullets → `Accent`, the quote bar
+→ `Md_Quote`, four "there is more" indicators and a palette hint → `Text_Muted`). **One survives and is
+correct**: the guillemet dimmed at the end of a settings range — a control that genuinely cannot step
+further, which is what §11.1 asks for.
+
+### A dead field, and the bug hiding under it
+
+`app.tab_scroll` was **declared, read in four places, and never written**. The rail had never scrolled,
+so Ctrl+Tab could land on a tab that was simply not drawn — the overflow count said "+3" and the
+palette was the only way to reach one.
+
+Fixing it exposed a second bug: `place` **stopped advancing `x`** at the first tab that did not fit, so
+every overflowing tab shared one position and the strip's total width was unknowable — which makes any
+scroll offset computed from it nonsense. Positions are absolute now; visibility is a separate question.
+Invisible for as long as the rail never scrolled, which was always.
+
+### The rest
+
+- **Status cells** (§13): dividers, each clickable to the command it names, and §5's drop order
+  enforced — measured against what the left group actually needs, so it holds at any DPI and font.
+  Previously the right group kept drawing until it collided with the left one.
+- **Palette ranking** (§7): exact prefix beats any subsequence score, ties break by recency. Recorded
+  in `command_dispatch`, where every route converges, so a command run from a *menu* teaches the
+  palette too.
+- **Settings page margin** 32 → 28, matching its own value column (§11).
+- **The stale worktree is gone.** Its one unique commit was byte-identical to one already on `main`
+  under a different SHA. The branch is kept — deleting that is the half that cannot be undone.
+
+### What this batch got wrong
+
+The palette ranking test dispatched `.Save_As` to seed recency. That command **opens a file dialog**,
+which is modal, so the headless run hung with no output — the fall-through trap `development-loop.md`
+§6 documents, reached from a direction it does not mention. The counter is seeded directly now.
+
+### Still owed, deliberately
+
+- **`src/renderer` and `src/ui` are still stubs.** I described §19's SDF pipeline as "the renderer
+  extraction" during batch 12; it is not. It was built in `platform/quads.odin` and is a *prerequisite*
+  for the extraction, not the extraction. CLAUDE.md's as-built caveat stands unchanged.
+- **§19's gamma-correct blending** — it changes every measured ratio in §1 and wants its own
+  before/after.
+- **`\?\` long paths, program layer** — ~15 `os.*` calls under `%APPDATA%`, reachable via
+  `NEWTPAD_SESSION_DIR`.
+- **Arenas on VirtualAlloc** — CLAUDE.md's locked-decision row says build them or amend the row.
+- **§3.8's tab-edge alignment check** — still not meaningful; tabs start at `MENU_W`.
+- **No live pass on batches 12–15** beyond two screenshots.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

@@ -937,6 +937,13 @@ leave_table_view :: proc(doc: ^Document) {
 
 command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^plat.Window, t: ^plat.Text, rows: int) {
 	if cmd != .None {diag_cmd(cmd)} // breadcrumb: what the user was doing
+	// Recency for the palette's tie-break. Recorded at the one point every route
+	// to a command converges, so a command run from a MENU teaches the palette
+	// exactly as one run from the palette does.
+	if cmd != .None && app != nil {
+		app.cmd_clock += 1
+		app.cmd_used[cmd] = app.cmd_clock
+	}
 	doc := app_active(app)
 	// The document-kind gate, ahead of every other guard: it is the one rule the
 	// menu and the palette have to agree on, and this is the point both of them

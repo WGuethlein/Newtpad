@@ -686,6 +686,50 @@ doc_top_bar_h :: proc(doc: ^Document) -> f32 {
 // now -- the find bar moved to doc_top_bar_h. Document rows must stop above it,
 // or text is drawn behind the bar and clicks in that strip land on rows the user
 // cannot see.
+// The status bar's right-hand cells, as rects. ONE geometry, consumed by the
+// draw and by the click -- UI spec 13: "Every cell is clickable. Encoding opens
+// the encoding menu, LF toggles line endings."
+//
+// Right-hand only. The left group is position and file facts that nothing can
+// usefully do anything with (clicking "Ln 124" has no meaning), whereas every
+// cell on the right names a SETTING with an obvious action.
+Status_Cell :: struct {
+	label: string,
+	x, w:  f32,
+	cmd:   Command_Id,
+}
+
+// Fills `out` and returns the used prefix. `cw` is the status font's advance.
+status_cells :: proc(doc: ^Document, winw, cw: f32, out: []Status_Cell) -> []Status_Cell {
+	if doc == nil || doc.kind != .Text || len(out) < 2 {return out[:0]}
+	n := 0
+	// Right to left, because they are right-aligned: each cell's x depends on
+	// the width of everything after it.
+	x := winw - sx(12)
+	add :: proc(out: []Status_Cell, n: ^int, x: ^f32, cw: f32, label: string, cmd: Command_Id) {
+		w := f32(len(label)) * cw
+		x^ -= w
+		out[n^] = {label = label, x = x^, w = w, cmd = cmd}
+		n^ += 1
+		x^ -= sx(24) // the gap a divider sits in the middle of
+	}
+	// Line endings, then encoding: the order they read left-to-right is the
+	// reverse of the order they are placed.
+	add(out, &n, &x, cw, base.line_ending_name(doc.eol), .Eol_CRLF if doc.eol == .LF else .Eol_LF)
+	add(out, &n, &x, cw, enc_name(doc.enc), .Enc_UTF8 if doc.enc != .UTF8 else .Enc_UTF16LE)
+	return out[:n]
+}
+
+// The cell a click landed on, or .None.
+status_cell_at :: proc(doc: ^Document, winw, winh, cw, mx, my: f32) -> Command_Id {
+	if my < winh - doc_bottom_bar_h(doc) {return .None}
+	buf: [4]Status_Cell
+	for c in status_cells(doc, winw, cw, buf[:]) {
+		if mx >= c.x && mx < c.x + c.w {return c.cmd}
+	}
+	return .None
+}
+
 doc_bottom_bar_h :: proc(doc: ^Document) -> f32 {
 	return STATUS_BAR_H
 }

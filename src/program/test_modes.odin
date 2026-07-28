@@ -8223,6 +8223,63 @@ when NEWTPAD_TESTS {
 				// Eol_CRLF rewrites the WHOLE buffer (doc_set_line_ending), which is why
 				// it counts as a mutation even though the pseudo-buffer is empty.
 				pbad += palette_pseudo_case(.Eol_CRLF, "")
+				// Ranking: an exact prefix wins, and equal scores break by
+				// recency. The scorer had word-boundary and consecutive bonuses
+				// but no prefix dominance, so a longer command could outscore the
+				// one you typed the start of -- and nothing broke a tie at all.
+				{
+					top_for :: proc(a: ^App, q: string) -> Command_Id {
+						palette_open(a)
+						a.palette.mode = .Commands
+						clear(&a.palette.query)
+						// ">" is how a user reaches the command list -- a bare
+						// query searches TABS. Setting p.mode by hand does not
+						// work: palette_recompute derives the mode from the query
+						// prefix every time, so it would be overwritten.
+						palette_input_rune(a, '>')
+						for r in q {palette_input_rune(a, r)}
+						if len(a.palette.results) == 0 {return .None}
+						return a.palette.results[0].cmd
+					}
+					ra: App
+					ra.settings = settings_default()
+					app_new_scratch(&ra)
+					defer app_destroy(&ra)
+					rw: plat.Window
+					rt: plat.Text
+					plat.text_load_faces(&rt)
+
+					// "sav" is a prefix of Save and Save As...; both match, and
+					// the longer one could previously win on accumulated bonuses.
+					first := top_for(&ra, "sav")
+					okp := first == .Save || first == .Save_As
+					if !okp {pbad += 1}
+					fmt.printfln("  %-6s a prefix query ranks a prefix match first (%v)", "ok" if okp else "FAIL", first)
+
+					// Then teach it. The recency counter is seeded DIRECTLY rather
+					// than by dispatching Save_As: that command opens a file
+					// dialog, which is modal, and a modal in a headless mode is a
+					// hang with no output -- exactly the fall-through trap
+					// development-loop.md warns about, reached from a different
+					// direction. What is under test is the ordering, not the
+					// bookkeeping, and command_dispatch's one-line bump is
+					// verified by the fact that it is the only writer.
+					palette_close(&ra)
+					ra.cmd_clock += 1
+					ra.cmd_used[.Save_As] = ra.cmd_clock
+					after := top_for(&ra, "sav")
+					oku := after == .Save_As
+					if !oku {pbad += 1}
+					fmt.printfln("  %-6s the more recently used of two equal matches ranks first (%v)", "ok" if oku else "FAIL", after)
+
+					// And recency must not override matching.
+					other := top_for(&ra, "undo")
+					oko := other != .Save_As
+					if !oko {pbad += 1}
+					fmt.printfln("  %-6s recency does not override matching (%v)", "ok" if oko else "FAIL", other)
+					palette_close(&ra)
+				}
+
 				fmt.printfln("palette pseudo-tab gate: %d failures", pbad)
 			}
 			return true
@@ -9360,6 +9417,61 @@ when NEWTPAD_TESTS {
 				g_theme[.Bg_Base] = saved
 				fmt.printfln("  %-6s doc_canvas_clear tracks g_theme[.Bg_Base] live", "ok" if tracks_live else "FAIL")
 				if !tracks_live {fail = true}
+			}
+
+			// Text_Dim is disabled-only, and saying so in a comment has not worked.
+			//
+			// It has been drawn as LIVE text three separate times -- inactive tab
+			// labels, the menu and palette accelerator chords, and the whole
+			// status bar -- each time at 2.9:1 in Dark and 2.8:1 in Light, below
+			// the AA floor by design. Wyatt reported the second and third as
+			// "hard to see". theme.odin has said "DISABLED ONLY -- never live
+			// text" on that role the entire time.
+			//
+			// So this counts the uses instead. The sources are embedded at compile
+			// time (the same #load links.odin already uses for text_exts.txt) and
+			// every occurrence is counted against an allowlist. A new one fails
+			// here and forces the question to be answered deliberately, which is
+			// all a guard can do -- the draw call takes a colour, not a role, so
+			// nothing at runtime can know which tier it was handed.
+			//
+			// This is the only mechanism available: Odin cannot introspect a
+			// package, and the test cannot read the filesystem for sources that
+			// may not be beside the exe.
+			{
+				SRC :: [?]struct {
+					name: string,
+					body: string,
+					want: int,
+					why:  string,
+				} {
+					{"main.odin", #load("main.odin", string), 0, ""},
+					{"ui_tabs.odin", #load("ui_tabs.odin", string), 0, ""},
+					{"menu.odin", #load("menu.odin", string), 0, ""},
+					{"palette.odin", #load("palette.odin", string), 0, ""},
+					{"markdown.odin", #load("markdown.odin", string), 0, ""},
+					{"doc.odin", #load("doc.odin", string), 0, ""},
+					{"table.odin", #load("table.odin", string), 0, ""},
+					{"find.odin", #load("find.odin", string), 0, ""},
+					{"history.odin", #load("history.odin", string), 0, ""},
+					{"fontpage.odin", #load("fontpage.odin", string), 0, ""},
+					// The one legitimate use in the tree: the guillemet at the end
+					// of a settings range, which is a control that genuinely
+					// cannot be stepped further. UI spec 11.1 asks for exactly
+					// that -- "dim the arrow at the range end".
+					{"settings.odin", #load("settings.odin", string), 1, "the range-end guillemet"},
+				}
+				NEEDLE :: "g_theme[.Text_Dim]"
+				for f in SRC {
+					n := strings.count(f.body, NEEDLE)
+					ok := n == f.want
+					if !ok {fail = true}
+					note := f.why if f.why != "" else "none allowed"
+					fmt.printfln(
+						"  %-6s %-14s uses Text_Dim %d time(s), allowed %d (%s)",
+						"ok" if ok else "FAIL", f.name, n, f.want, note,
+					)
+				}
 			}
 
 			fmt.println("themetest: FAILURES" if fail else "themetest: all ok")
@@ -10592,6 +10704,64 @@ when NEWTPAD_TESTS {
 				od.find.regex = false
 			}
 
+			// Status cells are clickable, and each maps to its own command.
+			// They were two text runs with no dividers and nothing behind them.
+			{
+				sd: Document
+				sd.kind = .Text
+				UI_SCALE = 1
+				W, H := f32(1280), f32(900)
+				cw := f32(7)
+				sbuf: [4]Status_Cell
+				cs := status_cells(&sd, W, cw, sbuf[:])
+				mt_chk(&bad, len(cs) == 2, fmt.tprintf("the right group has %d cells", len(cs)))
+				by := H - doc_bottom_bar_h(&sd) + doc_bottom_bar_h(&sd) * 0.5
+				hits := 0
+				for c in cs {
+					if status_cell_at(&sd, W, H, cw, c.x + c.w * 0.5, by) == c.cmd {hits += 1}
+				}
+				mt_chk(&bad, hits == len(cs), fmt.tprintf("every cell hit-tests to its own command (%d/%d)", hits, len(cs)))
+				// Cells must not overlap, or one swallows the other's clicks.
+				if len(cs) == 2 {
+					mt_chk(&bad, cs[1].x + cs[1].w <= cs[0].x, fmt.tprintf("cells do not overlap (%.0f <= %.0f)", cs[1].x + cs[1].w, cs[0].x))
+				}
+				// Above the bar is not a cell -- the editor owns that pixel.
+				mt_chk(&bad, status_cell_at(&sd, W, H, cw, cs[0].x + 2, H - doc_bottom_bar_h(&sd) - 4) == .None, "a click above the bar is not a cell")
+				// The line-ending cell toggles TO the other value, so clicking it
+				// twice returns where it started rather than sticking.
+				sd.eol = .LF
+				c1 := status_cells(&sd, W, cw, sbuf[:])[0].cmd
+				sd.eol = .CRLF
+				c2 := status_cells(&sd, W, cw, sbuf[:])[0].cmd
+				mt_chk(&bad, c1 != c2, fmt.tprintf("the line-ending cell offers the OTHER value (%v then %v)", c1, c2))
+
+				// Cells never collide with the left group, at any width. The
+				// window has a floor, but between the floor and a comfortable
+				// width nothing dropped IN ORDER -- the right group kept drawing
+				// until it ran into the left one and the two overlapped.
+				{
+					sd.eol = .LF
+					left_w := f32(30) * cw // a plausible "Ln 124, Col 94    778 lines"
+					worst := f32(-1)
+					for wpx := 320; wpx <= 1600; wpx += 7 {
+						W2 := f32(wpx)
+						cc := status_cells(&sd, W2, cw, sbuf[:])
+						need := sx(12) + left_w + sx(24)
+						for len(cc) > 0 && cc[len(cc) - 1].x < need {cc = cc[:len(cc) - 1]}
+						// Whatever survives must start clear of the left group.
+						for c in cc {
+							if c.x < need {worst = W2}
+						}
+					}
+					mt_chk(&bad, worst < 0, fmt.tprintf("no window width lets a cell collide with the left group (worst %.0f)", worst))
+					// And the order is right-to-left: at a width that drops one,
+					// the one dropped is the LEFTMOST of the group.
+					narrow := status_cells(&sd, 420, cw, sbuf[:])
+					wide := status_cells(&sd, 1600, cw, sbuf[:])
+					mt_chk(&bad, len(narrow) == len(wide), "status_cells itself does not drop -- the caller does, so the geometry stays one thing")
+				}
+			}
+
 			fmt.printfln("metricstest: %d failures", bad)
 			return true
 		}
@@ -10729,6 +10899,47 @@ when NEWTPAD_TESTS {
 						UI_SCALE = saved
 						ts_chk(&bad, f32(mw) >= need - 1, fmt.tprintf("dpi %d: minimum %d fits menu + one tab + caption buttons (%.0f)", dpi, mw, need))
 					}
+				}
+
+				// The rail reveals the active tab. app.tab_scroll was declared,
+				// read in four places and never written, so switching to a tab
+				// that did not fit left it undrawn -- the count said "+3" and the
+				// palette was the only way to reach one.
+				{
+					UI_SCALE = 1
+					for len(a.docs) < 12 {app_new_scratch(&a, true)}
+					win.width = 700 // narrow enough that most tabs cannot fit
+					vis :: proc(a: ^App, win: ^plat.Window, t: ^plat.Text, w: f32, slot: int) -> bool {
+						L := tabs_layout(a, win, t, w)
+						for r in L.tabs {
+							if r.slot == slot {return r.drawn && r.x >= MENU_W - 0.5 && r.x + r.w <= L.limit + 0.5}
+						}
+						return false
+					}
+					// The last tab, which is the one furthest off the right edge.
+					last := len(a.docs) - 1
+					a.active = last
+					a.tab_scroll = 0
+					before := vis(&a, &win, &txt, 700, last)
+					tabs_reveal_active(&a, &win, &txt, 700)
+					after := vis(&a, &win, &txt, 700, last)
+					ts_chk(&bad, !before, "precondition: the last tab is off screen unscrolled")
+					ts_chk(&bad, after, fmt.tprintf("revealing brings the active tab on screen (scroll %.0f)", a.tab_scroll))
+
+					// And back to the first, which is off the LEFT once scrolled.
+					a.active = 0
+					tabs_reveal_active(&a, &win, &txt, 700)
+					ts_chk(&bad, vis(&a, &win, &txt, 700, 0), fmt.tprintf("...and back again, the other direction (scroll %.0f)", a.tab_scroll))
+					ts_chk(&bad, a.tab_scroll >= 0, fmt.tprintf("scroll never goes negative (%.0f)", a.tab_scroll))
+
+					// A wide window fits everything, so the offset must reset --
+					// a stale one would push the strip off its own left edge.
+					win.width = 4000
+					tabs_reveal_active(&a, &win, &txt, 4000)
+					ts_chk(&bad, a.tab_scroll == 0, fmt.tprintf("a rail with room resets its scroll (%.0f)", a.tab_scroll))
+					win.width = 1280
+					a.active = 0
+					a.tab_scroll = 0
 				}
 
 				// The pill fits its rail, and the focus ring fits with it.

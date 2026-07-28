@@ -602,10 +602,10 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	// Say that there is more. Silently truncating is what hid Edit > Font on a
 	// short window.
 	if more_above {
-		plat.text_draw(gfx, t, "▲", x0 + dw - sx(16), y0 + sx(12), UI_SMALL_PX, g_theme[.Text_Dim])
+		plat.text_draw(gfx, t, "▲", x0 + dw - sx(16), y0 + sx(12), UI_SMALL_PX, g_theme[.Text_Muted])
 	}
 	if more_below {
-		plat.text_draw(gfx, t, "▼", x0 + dw - sx(16), y0 + h - sx(4), UI_SMALL_PX, g_theme[.Text_Dim])
+		plat.text_draw(gfx, t, "▼", x0 + dw - sx(16), y0 + h - sx(4), UI_SMALL_PX, g_theme[.Text_Muted])
 	}
 }
 

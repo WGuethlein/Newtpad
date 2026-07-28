@@ -45,6 +45,13 @@ App :: struct {
 	//
 	// A stand-in for a real chrome focus model, which batch 14 needs anyway for
 	// menus and the palette. When that exists this becomes one case of it.
+	// How recently each command was run, as a monotonic counter rather than a
+	// clock: UI spec 7 breaks ranking ties by "recency of use -- a palette that
+	// learns beats a clever scorer", and the only question it has to answer is
+	// which of two commands was used later. Not persisted; a session is the
+	// right horizon for "what am I doing today".
+	cmd_used:      [Command_Id]u32,
+	cmd_clock:     u32,
 	kbd_tab_focus: bool,
 	tab_drag:      bool,
 	tab_drag_slot: int,
