@@ -6,6 +6,7 @@ package main
 
 import "base:intrinsics"
 import "core:fmt"
+import "core:math"
 import "core:mem"
 import "core:os"
 import "core:path/filepath"
@@ -8469,6 +8470,73 @@ when NEWTPAD_TESTS {
 					if !ok {fail = true}
 					fmt.printfln("  %-6s Dark %v vs %v: max channel diff %.3f (need >= 0.10)", "ok" if ok else "FAIL", p.a, p.b, diff)
 				}
+				// The same separation in Light. It used to be asserted for Dark only,
+				// on the reasoning that "Light deliberately placed those two close
+				// together" -- but the gutter numbers are Text_Muted in BOTH themes and
+				// sit beside comment text in both, so the argument never actually
+				// turned on which theme was active. The UI spec setting syn_comment and
+				// text_muted to one value in both of its files is what surfaced it.
+				lt := theme_light()
+				for p in pairs {
+					diff := max_chan_diff(lt[p.a], lt[p.b])
+					ok := diff >= 0.10
+					if !ok {fail = true}
+					fmt.printfln("  %-6s Light %v vs %v: max channel diff %.3f (need >= 0.10)", "ok" if ok else "FAIL", p.a, p.b, diff)
+				}
+			}
+
+			// WCAG contrast on the six pairs spec 17 names -- "those cover every
+			// place text sits on a themeable fill" -- plus the scrollbar thumb at the
+			// 3:1 non-text floor.
+			//
+			// Computed from the theme values, never compared against the ratios
+			// written in the spec's own comments: asserting those would test the spec
+			// rather than the code, and two of them are wrong -- both built-ins
+			// annotate scrollbar_thumb "3.0 against bg_base" for values that measure
+			// 1.42 and 1.67. That pair is in this list precisely because it is the
+			// one the spec got wrong.
+			//
+			// Text_Dim is deliberately absent: it is disabled-only (2.9 and 2.8), and
+			// WCAG explicitly exempts disabled controls.
+			{
+				lum :: proc(c: [4]f32) -> f64 {
+					ch :: proc(v: f32) -> f64 {
+						x := f64(v)
+						return x / 12.92 if x <= 0.04045 else math.pow((x + 0.055) / 1.055, 2.4)
+					}
+					return 0.2126 * ch(c[0]) + 0.7152 * ch(c[1]) + 0.0722 * ch(c[2])
+				}
+				ratio :: proc(fg, bg: [4]f32) -> f64 {
+					a, b := lum(fg), lum(bg)
+					if a < b {a, b = b, a}
+					return (a + 0.05) / (b + 0.05)
+				}
+				cpairs := []struct {
+					fg, bg: Color_Role,
+					min:    f64,
+					what:   string,
+				} {
+					{.Text_Primary, .Bg_Base, 4.5, "body on the page"},
+					{.Text_Secondary, .Bg_Panel, 4.5, "chrome text on the frame"},
+					{.Text_Muted, .Bg_Base, 4.5, "hints and accelerators"},
+					{.Text_Primary, .Selection_Doc, 4.5, "body inside a selection"},
+					{.Text_Primary, .Find_Match_Bg, 4.5, "body inside a find match"},
+					{.Filter_Text, .Filter_Bg, 4.5, "the filter band"},
+					{.Scrollbar_Thumb, .Bg_Base, 3.0, "scrollbar thumb (non-text, 1.4.11)"},
+				}
+				cl := theme_light()
+				for th, ti in ([]Theme{d, cl}) {
+					name := "Dark " if ti == 0 else "Light"
+					for p in cpairs {
+						r := ratio(th[p.fg], th[p.bg])
+						ok := r >= p.min
+						if !ok {fail = true}
+						fmt.printfln(
+							"  %-6s %s %v on %v: %.2f:1 (need %.1f) -- %s",
+							"ok" if ok else "FAIL", name, p.fg, p.bg, r, p.min, p.what,
+						)
+					}
+				}
 			}
 
 			// The role<->key mapping is a total array over Color_Role, so a role
@@ -8511,79 +8579,25 @@ when NEWTPAD_TESTS {
 				fmt.printfln("  %-6s \"base\" is not a role key", "ok" if ok else "FAIL")
 			}
 
-			in_set :: proc(got: [4]f32, set: [][4]f32) -> bool {
-				for v in set {if got == v {return true}}
-				return false
-			}
-			chk :: proc(d: Theme, role: Color_Role, absorbs: [][4]f32, fail: ^bool) {
-				got := d[role]
-				ok := in_set(got, absorbs)
-				if !ok {fail^ = true}
-				fmt.printfln("  %-6s %-16v got=%v absorbs=%v", "ok" if ok else "FAIL", role, got, absorbs)
-			}
-
 			fmt.println("themetest:")
-			// Neutrals: 10 roles absorbing 42 values across 81 sites.
-			chk(d, .Bg_Base, {{0.09, 0.11, 0.16, 1}, {0.10, 0.12, 0.16, 1}, {0.11, 0.13, 0.17, 1}}, &fail) // #171C29 #1A1F29 #1C212B
-			chk(
-				d,
-				.Bg_Panel,
-				{{0.12, 0.14, 0.18, 1}, {0.12, 0.14, 0.19, 1}, {0.13, 0.15, 0.20, 1}, {0.14, 0.16, 0.20, 1}, {0.14, 0.16, 0.21, 1}, {0.15, 0.17, 0.22, 1}},
-				&fail,
-			) // #1F242E #1F2430 #212633 #242933 #242936 #262B38
-			chk(d, .Bg_Raised, {{0.16, 0.18, 0.22, 1}, {0.16, 0.20, 0.27, 1}}, &fail) // #292E38 #293345
-			chk(d, .Border_Subtle, {{0.20, 0.23, 0.30, 1}, {0.24, 0.27, 0.33, 1}}, &fail) // #333B4C #3D4554
-			chk(d, .Border_Strong, {{0.28, 0.32, 0.40, 1}, {0.30, 0.34, 0.42, 1}}, &fail) // #475266 #4C576B
-			chk(
-				d,
-				.Text_Muted,
-				{
-					{0.42, 0.46, 0.54, 1},
-					{0.42, 0.47, 0.56, 1},
-					{0.42, 0.48, 0.60, 1},
-					{0.45, 0.49, 0.57, 1},
-					{0.48, 0.52, 0.60, 1},
-					{0.50, 0.54, 0.62, 1},
-					{0.50, 0.55, 0.64, 1},
-				},
-				&fail,
-			) // #6B758A #6B788F #6B7A99 #737D91 #7A8599 #808A9E #808CA3
-			chk(
-				d,
-				.Text_Dim,
-				{{0.55, 0.60, 0.70, 1}, {0.58, 0.64, 0.76, 1}, {0.60, 0.64, 0.72, 1}, {0.62, 0.68, 0.80, 1}, {0.66, 0.70, 0.78, 1}},
-				&fail,
-			) // #8C99B2 #94A3C2 #99A3B8 #9EADCC #A8B2C7
-			chk(
-				d,
-				.Text_Secondary,
-				{{0.72, 0.76, 0.84, 1}, {0.72, 0.78, 0.88, 1}, {0.75, 0.79, 0.86, 1}, {0.75, 0.80, 0.88, 1}, {0.80, 0.84, 0.90, 1}},
-				&fail,
-			) // #B8C2D6 #B8C7E0 #BFC9DB #BFCCE0 #CCD6E6
-			chk(
-				d,
-				.Text_Primary,
-				{{0.86, 0.90, 0.96, 1}, {0.88, 0.91, 0.96, 1}, {0.90, 0.92, 0.97, 1}, {0.92, 0.94, 0.98, 1}, {0.94, 0.96, 0.99, 1}, {0.95, 0.96, 0.99, 1}},
-				&fail,
-			) // #DBE6F5 #E0E8F5 #E6EBF7 #EBF0FA #F0F5FC #F2F5FC
-			chk(d, .Text_Bright, {{0.96, 0.96, 0.98, 1}, {0.98, 0.99, 1.0, 1}, {1, 1, 1, 1}, {0.82, 0.90, 0.98, 1}}, &fail) // #F5F5FA #FAFCFF #FFFFFF #D1E6FA
-
-			// Accents: 15 roles, each carrying real meaning.
-			chk(d, .Selection_Doc, {{0.20, 0.30, 0.48, 1}}, &fail) // #334C7A
-			chk(d, .Selection_List, {{0.20, 0.28, 0.42, 1}, {0.20, 0.30, 0.45, 1}, {0.24, 0.30, 0.42, 1}, {0.18, 0.24, 0.34, 1}}, &fail) // #33476B #334C73 #3D4C6B #2E3D57
-			chk(d, .Caret, {{0.95, 0.85, 0.35, 1}}, &fail) // #F2D959
-			chk(d, .Accent, {{0.95, 0.88, 0.55, 1}, {0.80, 0.76, 0.50, 1}}, &fail) // #F2E08C #CCC280
-			chk(d, .Find_Match_Bg, {{0.42, 0.38, 0.16, 1}}, &fail) // #6B6129
-			chk(d, .Link, {{0.45, 0.70, 0.98, 1}}, &fail) // #73B2FA
-			chk(d, .Warning, {{0.95, 0.55, 0.35, 1}}, &fail) // #F28C59
-			chk(d, .Danger, {{0.75, 0.16, 0.16, 1}}, &fail) // #BF2929
-			chk(d, .Success, {{0.55, 0.85, 0.60, 1}}, &fail) // #8CD999
-			chk(d, .Filter_Bg, {{0.18, 0.26, 0.20, 1}}, &fail) // #2E4233
-			chk(d, .Filter_Text, {{0.70, 0.90, 0.74, 1}}, &fail) // #B2E6BD
-			chk(d, .Md_Heading, {{0.72, 0.85, 1.0, 1}}, &fail) // #B8D9FF
-			chk(d, .Md_Code, {{0.95, 0.80, 0.65, 1}}, &fail) // #F2CCA6
-			chk(d, .Md_Italic, {{0.80, 0.86, 0.78, 1}}, &fail) // #CCDBC7
-			chk(d, .Md_Quote, {{0.66, 0.72, 0.62, 1}}, &fail) // #A8B89E
+			// The absorbed-set assertions that stood here are GONE, deliberately.
+			//
+			// They checked that every Dark role still held one of the pre-migration
+			// literals it was consolidated from, and theme.odin's header describes
+			// exactly why: "The mechanical guard for that migration isn't 'nothing
+			// changed', it's 'every changed pixel was one of the literals this
+			// role's comment lists below'." That guard was for the batch-3
+			// migration, which completed in 6v. What it becomes afterwards is a
+			// lock: the palette can never be RETUNED, because any new value is by
+			// definition not one of the 2026-07-25 literals. Batch 12 repaints both
+			// built-ins warm, so all 25 of these fired at once -- not one of them
+			// reporting a defect.
+			//
+			// Replaced by the contrast assertions above, which are a durable
+			// property of a palette rather than a one-time migration receipt: they
+			// constrain what a retune may do without dictating what it must be. The
+			// role comments in theme.odin still carry the absorbed-literal lists, so
+			// the consolidation history is not lost -- only the assertion is.
 
 			// Light is the theme that can actually fail (see theme.odin's
 			// theme_light comment and task-4-report.md): every one of Dark's
@@ -8604,11 +8618,17 @@ when NEWTPAD_TESTS {
 
 			// The only role deliberately identical between the two themes, and
 			// why -- see also the note above Danger's line in theme_light().
+			// NO role is shared any more. Danger used to be, on the argument that
+			// it is "a solid opaque hover fill, never blended with either theme's
+			// chrome" -- true as far as it goes, but it ignores what is drawn ON
+			// the fill. Batch 12 gives Light its own #B23A30, which carries white
+			// at 5.4:1 where Dark's #C0453B carries it at 4.7:1; a red tuned to sit
+			// in dark chrome is not automatically the right red beside warm paper.
+			//
+			// The proc stays rather than being deleted along with its one case: it
+			// is the seam the "every role differs" rule below is expressed through,
+			// and a future deliberately-shared role needs somewhere to say so.
 			is_shared_role :: proc(role: Color_Role) -> (shared: bool, reason: string) {
-				#partial switch role {
-				case .Danger:
-					return true, "solid opaque hover fill, never blended with either theme's chrome; Windows renders the close-tab hover in the same red regardless of system theme"
-				}
 				return false, ""
 			}
 
