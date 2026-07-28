@@ -772,14 +772,19 @@ text_walk_glyphs :: proc(
 			// seam through every glyph -- Wyatt, live use: "all characters/glyphs
 			// in the tabs and menus are split vertically".
 			//
-			// Fixed HERE and not in the callers, of which there are dozens:
-			// document text already lands on integers (text_char_width rounds the
-			// advance so column n's left edge is exactly n*cell_w), so this is a
-			// no-op for the grid and cannot regress it. The chrome is what has
-			// fractional origins -- tab_base_y is ty + TAB_H*0.5 + UI_SMALL_PX*0.35,
-			// and a shrunk tab's x comes off a fractional step -- and fixing each
-			// caller would leave the next one added to reintroduce it.
-			pos := [2]f32{math.trunc(glyph_x + f32(g.left) + 0.5), math.trunc(y + f32(g.top) + 0.5)}
+			// Fixed HERE and not in the callers, of which there are dozens.
+			// Must be floor(v + 0.5), not trunc(v + 0.5): trunc rounds toward
+			// zero, so for a negative integral v it lands on v + 1, a 1px
+			// shift. Document text does land on integers today (text_char_width
+			// rounds the advance so column n's left edge is exactly n*cell_w),
+			// but under horizontal scroll col_x subtracts h_scroll*char_w and
+			// goes deeply negative (src/program/doc.odin, col_x with rhs), so
+			// trunc was not actually a no-op there -- it was only invisible
+			// because the h_scroll>0 cover strip repaints [0, TEXT_MARGIN_X)
+			// over it. round(v + 0.5) is not a fix either: it is the same
+			// half-away-from-zero asymmetry under a different name. floor is
+			// the one call that is a true round for every v, negative or not.
+			pos := [2]f32{math.floor(glyph_x + f32(g.left) + 0.5), math.floor(y + f32(g.top) + 0.5)}
 			if t.probe.armed && t.probe.n < len(t.probe.pos) {
 				t.probe.pos[t.probe.n] = pos
 				t.probe.n += 1

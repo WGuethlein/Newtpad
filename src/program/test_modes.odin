@@ -3271,10 +3271,14 @@ when NEWTPAD_TESTS {
 			gs_run :: proc(bad: ^int) {
 				t: plat.Text
 				plat.text_load_faces(&t)
-				for origin in ([][2]f32{{13.37, 24.2}, {0.5, 0.5}, {100.0, 50.0}, {7.999, 12.001}}) {
+				for origin in ([][2]f32{{13.37, 24.2}, {0.5, 0.5}, {100.0, 50.0}, {7.999, 12.001}, {-64.0, 50.0}}) {
 					plat.text_probe_reset(&t)
 					plat.text_probe_capture(&t, "Version.odin", origin.x, origin.y, UI_SMALL_PX)
-					all_int := true
+					// len > 0, not `true`: an empty recording must fail, not pass
+					// vacuously. If the gfx == nil branch in glyph_get is ever
+					// refactored so nothing gets probed, this mode has to go red,
+					// not report "0 failures" having measured nothing.
+					all_int := len(plat.text_probe_positions(&t)) > 0
 					for p in plat.text_probe_positions(&t) {
 						if p.x != math.trunc(p.x) || p.y != math.trunc(p.y) {all_int = false}
 					}
