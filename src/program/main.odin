@@ -210,7 +210,10 @@ main :: proc() {
 		// on disk still surfaces within the watcher's own ~1 s cadence).
 		if !(window.mouse_down || app.tab_drag) {
 			d0 := app_active(&app)
-			polling := session_dirty || !doc_index_done(d0) || search_running(d0) || scrollbar_drag || hscrollbar_drag
+			// update_running is in here so a finished check is picked up within
+			// 200 ms rather than sitting until the next keypress -- the app is
+			// idle by definition while the user waits for the answer.
+			polling := session_dirty || !doc_index_done(d0) || search_running(d0) || scrollbar_drag || hscrollbar_drag || update_running(&app.update)
 			plat.window_wait_message(window, 200 if polling else 1000)
 		}
 		plat.window_pump_events(window)
@@ -827,6 +830,11 @@ main :: proc() {
 			}
 			session_dirty = true
 		}
+
+		// Same rule as the watcher above: the update worker only reports, and
+		// every decision about what to tell the user is made here, once per
+		// frame, on the thread that owns the App.
+		update_poll(&app, window)
 
 		// Take whatever the search worker published since the last frame (and
 		// restart it if an edit invalidated the results).

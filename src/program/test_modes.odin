@@ -14639,6 +14639,280 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad updatetest` -- the update check's pure half (update.odin).
+		//
+		// No socket anywhere in here. http_get is the only part that needs one and
+		// httptest covers it; everything that decides what the user is TOLD is a
+		// pure function of the bytes that came back, and this drives all of it.
+		//
+		// The assertion that matters most is the first one in the compare section:
+		// 0.19.0 must be newer than 0.9.0. A string compare says the opposite, and
+		// a string compare is the shape this code would naturally have been
+		// written in.
+		if os.args[1] == "updatetest" {
+			up_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			up_parse_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- version_parse ---")
+				Good :: struct {
+					s:       string,
+					a, b, c: int,
+				}
+				good := []Good {
+					{"0.19.0", 0, 19, 0},
+					{"v0.19.0", 0, 19, 0}, // the leading v is optional
+					{"V1.2.3", 1, 2, 3},
+					{"0.9.0", 0, 9, 0},
+					{"0.0.0", 0, 0, 0},
+					{"10.20.30", 10, 20, 30},
+					{"01.02.03", 1, 2, 3}, // leading zeros are still digits
+					{"999999999.0.0", 999999999, 0, 0}, // the largest we accept
+				}
+				for g in good {
+					a, b, c, ok := version_parse(g.s)
+					hit := ok && a == g.a && b == g.b && c == g.c
+					chk(bad, hit, fmt.tprintf("%-16q -> (%d,%d,%d) ok=%v", g.s, a, b, c, ok))
+				}
+				// Every one of these must be ok=false, because the caller turns
+				// ok=false into "could not check" -- and the alternative, a
+				// zero-valued triple that silently compares as 0.0.0, would report
+				// "up to date" against a real release.
+				bads := []string {
+					"", // empty
+					"v", // just the prefix
+					"0.19", // missing component
+					"0", // one component
+					"0.19.0.1", // extra component
+					"0.19.", // empty trailing component
+					"0..0", // empty middle component
+					".19.0", // empty leading component
+					"0.x.0", // non-numeric component
+					"0.19.0-rc1", // pre-release suffix: no precedence rules here
+					"0.19.0+build", // build metadata
+					"0.19.0 ", // trailing space
+					" 0.19.0", // leading space
+					"0.19.0\n", // trailing newline (a tag read off a file)
+					"-1.0.0", // sign
+					"+1.0.0",
+					"vv1.0.0", // doubled prefix
+					"1234567890.0.0", // 10 digits: refused rather than wrapped
+					"0.0.99999999999999999999", // 20 digits
+					"latest", // a moving tag, not a version
+					"0,19,0", // wrong separator
+				}
+				for s in bads {
+					_, _, _, ok := version_parse(s)
+					chk(bad, !ok, fmt.tprintf("%-28q refused", s))
+				}
+				// The running build's own constant must parse, or every check
+				// answers "could not check" and nobody notices until a release.
+				_, _, _, cok := version_parse(NEWTPAD_VERSION)
+				chk(bad, cok, fmt.tprintf("NEWTPAD_VERSION %q parses", NEWTPAD_VERSION))
+			}
+
+			up_compare_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- version_newer ---")
+				// The four pairs where ASCII order and numeric order disagree. Each
+				// line prints what a string compare would have said, so a
+				// regression to strings.compare is visible in the output and not
+				// only in the pass/fail column.
+				Trap :: struct {
+					newer, older: string,
+				}
+				traps := []Trap {
+					{"0.19.0", "0.9.0"},
+					{"0.10.0", "0.9.9"},
+					{"10.0.0", "2.0.0"},
+					{"1.0.10", "1.0.9"},
+					{"0.100.0", "0.99.0"},
+				}
+				for t in traps {
+					na, nb, nc, _ := version_parse(t.newer)
+					oa, ob, oc, _ := version_parse(t.older)
+					got := version_newer({na, nb, nc}, {oa, ob, oc})
+					str := strings.compare(t.newer, t.older) > 0
+					chk(bad, got, fmt.tprintf("%s > %s (string compare would say %v)", t.newer, t.older, str))
+					// And the reverse must be false, or "newer" is just "different".
+					chk(bad, !version_newer({oa, ob, oc}, {na, nb, nc}), fmt.tprintf("%s is not newer than %s", t.older, t.newer))
+				}
+				chk(bad, !version_newer({0, 19, 0}, {0, 19, 0}), "equal is not newer")
+				chk(bad, version_newer({0, 0, 1}, {0, 0, 0}), "a patch bump is newer")
+				chk(bad, version_newer({0, 20, 0}, {0, 19, 9}), "a minor bump outranks a patch")
+				chk(bad, version_newer({1, 0, 0}, {0, 99, 99}), "a major bump outranks everything")
+				chk(bad, !version_newer({0, 99, 99}, {1, 0, 0}), "and not the other way round")
+			}
+
+			up_tag_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- tag_name extraction ---")
+				buf: [UPDATE_TAG_MAX]u8
+				Good :: struct {
+					body, want, why: string,
+				}
+				good := []Good {
+					{`{"tag_name":"v0.20.0"}`, "v0.20.0", "minimal"},
+					{`{ "tag_name" : "v0.20.0" }`, "v0.20.0", "spaces around the colon"},
+					{"{\n  \"tag_name\":\n    \"v0.20.0\",\n  \"name\": \"x\"\n}", "v0.20.0", "pretty-printed"},
+					{`{"url":"https://x","id":1,"tag_name":"v1.2.3","draft":false}`, "v1.2.3", "not the first field"},
+					// A decoy occurrence as a VALUE, not a key: it is not followed
+					// by a colon, so the scan steps over it to the real key.
+					{`{"field":"tag_name","tag_name":"v1.2.3"}`, "v1.2.3", "a decoy value named tag_name is skipped"},
+					{`{"tag_name":"0.20.0"}`, "0.20.0", "no v prefix"},
+				}
+				for g in good {
+					got, ok := update_extract_tag(transmute([]u8)g.body, buf[:])
+					chk(bad, ok && got == g.want, fmt.tprintf("%-42s -> %q ok=%v", g.why, got, ok))
+				}
+
+				// Hostile and malformed. Every one is "could not check": nothing in
+				// here may return ok=true, and nothing may crash or read past the
+				// end of the buffer.
+				Bad :: struct {
+					body, why: string,
+				}
+				bads := []Bad {
+					{``, "empty body"},
+					{`{}`, "no tag_name at all"},
+					{`{"tag_name"`, "truncated right after the key"},
+					{`{"tag_name":`, "truncated after the colon"},
+					{`{"tag_name":"`, "truncated after the opening quote"},
+					{`{"tag_name":"v0.20.0`, "truncated mid-value (no closing quote)"},
+					{`{"tag_name":null}`, "null value"},
+					{`{"tag_name":123}`, "numeric value"},
+					{`{"tag_name":["v1.0.0"]}`, "array value"},
+					{`{"tag_name":""}`, "empty value"},
+					{`{"tag_name" "v1.0.0"}`, "missing colon"},
+					{`{"tag_name":"a\"b"}`, "an escape in the value"},
+					{`{"tag_name":"v1.0.0\\"}`, "a trailing backslash escape"},
+					{`{"field":"tag_name"}`, "only a decoy, no real key"},
+					{"\x00\x01\x02\xff\xfe binary garbage", "binary garbage"},
+					{`{"tag_name":"` + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" + `"}`, "a tag longer than the buffer"},
+				}
+				for b in bads {
+					got, ok := update_extract_tag(transmute([]u8)b.body, buf[:])
+					chk(bad, !ok, fmt.tprintf("%-42s refused (got %q)", b.why, got))
+				}
+			}
+
+			// The decision table: every way the check can end, and specifically
+			// that no failure can come out as "up to date".
+			up_decide_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- update_decide ---")
+				buf: [UPDATE_TAG_MAX]u8
+				ok_body := transmute([]u8)string(`{"tag_name":"v0.20.0"}`)
+
+				// Every non-Ok transport result is .Failed with a reason the user
+				// could be shown. None of them is silence, and none is .Up_To_Date.
+				for r in plat.Http_Result {
+					if r == .Ok {continue}
+					st, tag, why := update_decide(r, 0, ok_body, "0.19.0", buf[:])
+					hit := st == .Failed && why != "" && tag == ""
+					chk(bad, hit, fmt.tprintf("%-11v -> %v %q", r, st, why))
+				}
+
+				// .Ok with a body that cannot be read is also .Failed -- this is
+				// the "a tag that does not parse is could-not-check, never up to
+				// date" rule, at the level the user experiences it.
+				unusable := []string {
+					`{}`,
+					`{"tag_name":"latest"}`, // a real tag, not a version
+					`{"tag_name":"v0.20"}`, // missing a component
+					`{"tag_name":"v0.20.0-rc1"}`, // pre-release
+					`{"tag_name":"v0.20.0`, // truncated
+				}
+				for b in unusable {
+					st, _, why := update_decide(.Ok, 200, transmute([]u8)b, "0.19.0", buf[:])
+					chk(bad, st == .Failed && why != "", fmt.tprintf("%-30s -> %v %q", b, st, why))
+				}
+
+				// A build whose own version constant is broken must not answer
+				// "up to date" either.
+				st, _, why := update_decide(.Ok, 200, ok_body, "not-a-version", buf[:])
+				chk(bad, st == .Failed && why != "", fmt.tprintf("an unparseable running version -> %v %q", st, why))
+
+				// And the three real outcomes.
+				Case :: struct {
+					tag, current: string,
+					want:         Update_Status,
+				}
+				cases := []Case {
+					{"v0.20.0", "0.19.0", .Newer},
+					{"v0.19.0", "0.19.0", .Up_To_Date},
+					// The string-compare trap, end to end: 0.9.0 published against
+					// 0.19.0 running is NOT an update.
+					{"v0.9.0", "0.19.0", .Up_To_Date},
+					{"v0.19.0", "0.9.0", .Newer},
+					{"v1.0.0", "0.19.0", .Newer},
+					{"v0.18.9", "0.19.0", .Up_To_Date},
+				}
+				for c in cases {
+					body := strings.concatenate({`{"tag_name":"`, c.tag, `"}`}, context.temp_allocator)
+					got, tag, _ := update_decide(.Ok, 200, transmute([]u8)body, c.current, buf[:])
+					chk(bad, got == c.want, fmt.tprintf("published %-8s running %-8s -> %v (want %v)", c.tag, c.current, got, c.want))
+					if got != .Failed {
+						chk(bad, tag == c.tag, fmt.tprintf("  and the tag survives as %q", tag))
+					}
+				}
+			}
+
+			// The privacy and disclosure properties, asserted rather than trusted
+			// to a comment: the request carries no identifiers, and the row the
+			// user clicks says where it goes.
+			up_surface_cases :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- command surface ---")
+				title := command_table[.Check_For_Updates].title
+				chk(bad, strings.contains(title, "GitHub"), fmt.tprintf("the row names GitHub: %q", title))
+				chk(bad, command_in_palette(.Check_For_Updates), "it is reachable from the palette")
+				in_help := false
+				for m in menus {
+					if m.title != "Help" {continue}
+					for it in m.items {
+						if it.cmd == .Check_For_Updates {in_help = true}
+					}
+				}
+				chk(bad, in_help, "it is on the Help menu")
+				// No query string, no identifiers: the URL is a bare path.
+				chk(bad, !strings.contains(UPDATE_PATH, "?") && !strings.contains(UPDATE_PATH, "&"), fmt.tprintf("no query parameters: %q", UPDATE_PATH))
+				chk(bad, plat.HTTP_USER_AGENT == "Newtpad", fmt.tprintf("the User-Agent names the product and nothing else: %q", plat.HTTP_USER_AGENT))
+				// The browser is only ever sent to a compile-time constant, never
+				// to anything the response supplied.
+				chk(bad, plat.url_is_openable(UPDATE_RELEASES_URL), fmt.tprintf("the releases URL passes the shell whitelist: %q", UPDATE_RELEASES_URL))
+			}
+
+			// One in flight, and teardown joins. This one does touch the network
+			// (it starts the real worker), so it asserts only on the lifecycle --
+			// not on what came back -- and passes offline.
+			up_lifecycle_case :: proc(bad: ^int, chk: proc(_: ^int, _: bool, _: string)) {
+				fmt.println("--- worker lifecycle ---")
+				app: App
+				menu_init(&app.menu)
+				update_start(&app)
+				chk(bad, app.update.th != nil, "a check starts a worker")
+				// A second invocation must not spawn a second thread.
+				first := app.update.th
+				update_start(&app)
+				chk(bad, app.update.th == first, "a second invocation reuses the one in flight")
+				// app_destroy joins it. If it did not, this process would either
+				// hang at exit or the worker would write into freed memory -- and
+				// the pointer going nil is the observable half.
+				app_destroy(&app)
+				chk(bad, app.update.th == nil, "app_destroy joined and cleared the worker")
+			}
+
+			bad := 0
+			base.log_init(.Warn)
+			up_parse_cases(&bad, up_chk)
+			up_compare_cases(&bad, up_chk)
+			up_tag_cases(&bad, up_chk)
+			up_decide_cases(&bad, up_chk)
+			up_surface_cases(&bad, up_chk)
+			up_lifecycle_case(&bad, up_chk)
+			fmt.printfln("updatetest: %d failures", bad)
+			return true
+		}
+
 		if len(os.args) < 3 {return false}
 		path, mode := os.args[1], os.args[2]
 
