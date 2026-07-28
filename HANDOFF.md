@@ -37,6 +37,11 @@ worth reading before trusting any other "X is missing" claim in this file.
 **The installed binary is still v0.16.0.** Batch 7 merged under Wyatt's overnight policy: merge, do
 not `install.ps1`. Run it after the live pass in §6ab's "Owed".
 
+**Batch 11 is merged; v0.20.0 — ship-readiness, the last batch before the beta.** Check for Updates,
+a crash-report path, LICENSE (PolyForm Internal Use 1.0.0), and an Inno Setup installer. §6af ends
+with the **beta checklist**: what is buildable, and what is Wyatt's. Two items there block a beta —
+the licence grants a hobbyist tester nothing, and the installer has never been compiled.
+
 **Batch 10 is merged; v0.19.0 — the last feature batch before the beta.** Sort lines, remove
 duplicate lines, and `rules.txt` keyword colouring. §6ae's "what it got wrong" is the useful half:
 a column rectangle silently escalated a sort to the whole file, and the colour rules' own seeded
@@ -2903,6 +2908,119 @@ Nothing was verified against real GUI input. Wyatt's pass: sort and dedupe on a 
 a whole file (and confirm one Ctrl+Z restores it); the refusal when a column rectangle is live; and
 *Edit Colour Rules...* — write `FATAL = Danger` on a `.log` and confirm it shows, then `ERROR` and
 confirm it does not, which is the behaviour the header now explains rather than the bug it looks like.
+
+## 6af. Ship-readiness (2026-07-27, v0.20.0, branch `feat/batch-11`)
+
+Batch 11 of §6aa — the last batch before a public beta, and the first that is not about the editor.
+It is about handing the editor to a stranger.
+
+**Shipped:** the first HTTP in the tree (`platform/http.odin`, hand-declared WinHTTP) · `Help ▸ Check
+for Updates` on a worker · a crash dialog that can open the crashes folder or a prefilled GitHub
+issue · `LICENSE.txt` + `THIRD-PARTY-NOTICES.txt` · `installer/newtpad.iss` with `build-installer.ps1`
+· a stubbed, documented signing step.
+
+### Decisions taken with Wyatt, 2026-07-27
+
+Installer: **Inno Setup**. Updater: **manual check only**, GitHub Releases API, no background traffic
+— research §D lists phoning home as something this audience actively rejects. Crash reports: **open
+the folder, offer a prefilled issue**, nothing sent automatically. **No beta expiry** — honour-system
+per `research/newtpad-research-report.md:117`, which also removes the worst failure mode: a time bomb
+that bricks every tester's editor if V1 slips.
+
+**The licence went round twice, and the second answer is the one to keep.** A hand-drafted EULA was
+written, and Wyatt's call was that a bespoke AI-written licence is the wrong artifact when standard
+lawyer-drafted ones exist. It was dropped unpushed. Reading the actual PolyForm texts rather than
+trusting memory then showed that **no single standard licence covers all four constraints** — usable
+at work, usable by hobbyists, plugins permitted, no redistribution:
+
+| | commercial | hobby | new works | no redistribution |
+|---|---|---|---|---|
+| Strict | ✗ | ✓ | **✗** | ✓ |
+| Internal Use | ✓ | **✗** | ✓ | ✓ |
+| Shield / Perimeter | ✓ | ✓ | ✓ | **✗** |
+
+**PolyForm Internal Use 1.0.0**, verbatim, on two grounds: it explicitly grants a *Changes and New
+Works License*, so a community plugin is unambiguously permitted (Strict forbids new works outright
+and is plugin-hostile), and it forbids distribution, which is what protects a product intended to be
+sold. **Its hole is live and named below.**
+
+### The finding that matters most, and it is about not losing work
+
+Inno Setup's **default** `CloseApplications=yes` hands a running application to the Windows Restart
+Manager, which asks via `WM_QUERYENDSESSION`/`WM_ENDSESSION` and **force-terminates anything that
+does not comply**. `window.odin:539` handles `WM_CLOSE` and `WM_DESTROY` and nothing else — there is
+no `WM_ENDSESSION` handler anywhere in the tree. So the default would have killed Newtpad, skipped
+the hot-exit write at `main.odin:902`, and **lost every unsaved tab, silently, while the install
+looked like it succeeded.**
+
+`CloseApplications=no`, with `PrepareToInstall` posting a real `WM_CLOSE` to the
+`NewtpadWindowClass` window and then waiting on the single-instance mutex for the *process* to exit
+— not the window, because the process outlives the window during the session write. 60 s, then
+abort with nothing written. **No `TerminateProcess` anywhere.** `AppMutex` is deliberately unset; it
+would block before `PrepareToInstall` could run.
+
+This is the requirement the whole task existed for: `install.ps1`'s answer has always been "close
+Newtpad first, and never `-Force`."
+
+### What this batch got wrong
+
+- **The exit bound was misdocumented.** `UPDATE_TIMEOUT_MS` is **per WinHTTP phase**, not for the
+  whole call — resolve, connect and send stack inside one `WinHttpSendRequest`, and
+  `WINHTTP_OPTION_CONNECT_RETRIES` defaults to 5. The true worst case on a black-holed route is tens
+  of seconds, not four. And there is **no `window_destroy` in this tree**, so the window sits on
+  screen with a dead pump for the whole join and Windows ghosts it as "Not Responding". No data is at
+  risk (`session_save` runs first). Comment corrected; the real fix is in §5.
+- **A comment was backwards on the one call that works.** `WINHTTP_OPTION_DISABLE_FEATURE` is
+  request-level only, so the session-level call silently fails — but the pair was commented as though
+  the session set it and the request merely restated it, inviting someone to delete the working half.
+- **`updatetest` reached the network on every run**, against a plan that asked for opt-in. Its
+  sibling `httptest` complied and it did not. Now gated behind `updatetest live`.
+- **A report claimed a `dropdown_w` regression that does not exist.** The new 35-char menu title was
+  said to widen every dropdown; measured, the widest existing row is `Toggle_Preview` at 31 + `Ctrl+M`
+  = 37. Worth recording because it is the one finding this session where the *implementer* was
+  pessimistic rather than optimistic.
+
+### Deliberately carried
+
+- **The licence grants a hobbyist tester nothing.** PolyForm Internal Use's only permitted purpose is
+  *internal business operations*, and it is the installer's first page. Accepted knowingly as the
+  cheapest of the four holes — but the beta audience is substantially hobbyists, so **this needs
+  Wyatt's decision before the beta is announced, not after.** The standard fix is dual-licensing with
+  PolyForm Noncommercial 1.0.0: two verbatim files, no bespoke text, hole closed.
+- **The update worker is joined at exit, and should not be.** The join exists only because
+  `Update_Check` lives in a local of `main` and `diag_shutdown` runs after `app_destroy`, so a
+  detached worker would write into a dead frame and log into a closed sink. Move it to package-level
+  storage and `update_stop` becomes `atomic_store(&cancel, true)` with no wait. ~15 lines.
+- The updater goes permanently silent on any tag not exactly `vN.N.N` — correct code, an undocumented
+  constraint on how releases must be named.
+- `.iss` writes `REG_EXPAND_SZ` where `install.ps1` writes `REG_SZ` (same string, verified no
+  duplicate PATH entry). No `.ico` yet. `install.ps1 -Force` still hard-kills, and that is the loop
+  run after every merge.
+- **Shape A, still open from §6ae:** `doc_move_lines`' `read_range` ignores `pt_read`'s return and the
+  fault flag across four reads and then writes.
+
+### Verified, and honestly not verified
+
+Verified: 11/11 commits build (harness proven falsifiable first); 201 base tests; the ISCC-absent
+skip exits 0; the `.iss` registration list matches `text_exts.txt` **exactly, 34 extensions** — the
+plan said "~24" and `install.ps1` won; no certificate material anywhere; `build.bat` still one Odin
+invocation.
+
+**Not verified, and this is the batch where it matters most: the installer has never been compiled.**
+Inno Setup is deliberately absent from this machine. `newtpad.iss` has never been run, and neither
+has install, `/SILENT`, upgrade, upgrade-over-running, uninstall, the PATH code, the licence page, or
+the graceful-close path — **which is the single most important thing in the batch and the one whose
+failure loses work.** Wyatt installing it on a real machine is the test.
+
+### Owed — and this is now the beta checklist
+
+**Wyatt's, and blocking a beta:** decide the hobbyist licence hole; buy a code-signing certificate
+(the pipeline is stubbed and ready; note `research/newtpad-research-report.md:116` — signing barely
+helps SmartScreen for an unknown publisher, so budget reputation time, not just money); a storefront
+and a landing page; and the two live passes — §6x's theme tuning, and a real pass over batches 7-11,
+none of which has been verified against real GUI input.
+
+**Buildable, not blocked:** `winget install JRSoftware.InnoSetup`, then compile the `.iss` and run it.
 
 ## 7. Build environment (Windows, this machine)
 
