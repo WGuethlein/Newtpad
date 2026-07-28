@@ -928,13 +928,20 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	// no note to show, because on a pseudo-tab there is no document the user
 	// meant this for.
 	if !command_allowed_on(cmd, doc) {return}
-	// Table view is a read-only grid. Block every document-mutating command so a
+	// A rendered view is read-only. Block every document-mutating command so a
 	// caret left over from text view can't silently corrupt the file at an
 	// unrelated offset, and so an in-cell edit's captured byte span can't be
 	// invalidated under it by an undo/paste before it commits. Cell editing has
 	// its own key path (intercepted before dispatch); the only buffer write in
 	// table view is table_edit_commit's single-field splice.
-	if doc != nil && doc.table && command_mutates_doc(cmd) {return}
+	//
+	// doc_read_only_view (doc.odin), not `doc.table`: this guard used to name the
+	// grid directly and so never covered the full Markdown Preview, which is
+	// documented read-only (markdown.odin) and draws no caret -- Backspace,
+	// Enter, Tab, Paste, Cut, Undo and the whole-buffer line-ending rewrite all
+	// ran against an invisible caret in the rendered view. Wyatt, live use,
+	// 2026-07-28.
+	if doc_read_only_view(doc) && command_mutates_doc(cmd) {return}
 	// A live rectangle is only meaningful to the handful of commands that know
 	// about it. Every OTHER document-mutating command edits at doc.cursor
 	// through a path that writes doc.cursor directly rather than via set_cursor
@@ -1518,6 +1525,18 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		find_backspace(doc)
 	case .Find_Confirm:
 		if doc.find.field == 1 {
+			// Replace is a buffer write, and this is the one that got away: it
+			// cannot go on command_mutates_doc (in the SEARCH field the very same
+			// command is find_next/find_prev, which a read-only view must still
+			// allow), so the guard at the top of this proc never saw it. That made
+			// the table guard's own claim -- "the only buffer write in table view is
+			// table_edit_commit's single-field splice" -- false for as long as it has
+			// been written, and it would have left the same hole open in Markdown
+			// Preview. Refuse here, in the one arm that actually writes.
+			//
+			// Silent, matching every other refusal these two views make; the Enter
+			// simply does nothing, exactly as it does for Backspace or Paste.
+			if doc_read_only_view(doc) {return}
 			if ev.ctrl {
 				// Say so when the pass could not have seen the whole document. The
 				// alternative -- replacing a prefix in silence -- looks exactly like

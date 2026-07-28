@@ -3026,6 +3026,92 @@ none of which has been verified against real GUI input.
 
 **Buildable, not blocked:** `winget install JRSoftware.InnoSetup`, then compile the `.iss` and run it.
 
+## 6ag. The two markdown views were never input surfaces (2026-07-28, v0.20.1, branch `fix/split-wrap-and-preview-readonly`)
+
+The first two findings from the live pass §6af asked for. Wyatt: *"when i was in the rendered view even
+though i cant see the cursor/flashing line i could still edit the file"* and *"on split view when i click
+my cursor to somewhere on the raw / editable side, it moves my screen and then itll make me highlight the
+entire page instantly."* Both were real, both were one bug written twice.
+
+### The shape
+
+Both views were built as **draw** paths and reviewed as draw paths. `markdown_draw` and `table_draw`
+replace the text pass, `md_divider_rect` and `doc_editor_right` were tested against each other
+(`splittest`), and `ro_surface_swallows` covers the mouse. Nothing asked what happens when you **type**
+into them, or where a **click** lands. So the rule each needed was spelled out at its call site — 
+`doc.table` at one guard, `doc.wrap` at another — instead of asked of the one procedure that owns it,
+and the second view was simply forgotten at every site.
+
+### Split: one widget, two row grids
+
+`visible_next` decides wrapping twice. For the first visible row it asks `eff_wrap_at`, which asks
+`doc_wraps` — word wrap **or** Markdown Split. For every logical line after that it asked
+`line_wrap_decision`, which opened `if doc.wrap`: the raw field, blind to Split. So with Split on and
+Alt+Z off, the draw and the hit-test laid out everything below the first row **unwrapped**, while
+`doc_scroll`, `eff_row_start` and `doc_ensure_cursor_visible` — all of which go through `eff_wrap_at` —
+kept wrapping.
+
+The user-visible chain: a click low in the editor pane resolves through `doc_pos_at` (unwrapped grid) to
+an offset the scroll machinery (wrapped grid) believes is below the viewport, so `doc_ensure_cursor_visible`
+scrolls to "reveal" a line that was already on screen — *it moves my screen* — and with the button still
+down, the next frame re-runs `doc_pos_at` against the moved view, giving a cursor far from the anchor —
+*highlight the entire page*. `line_wrap_decision` now asks `doc_wraps`.
+
+**§6ac asserted the opposite of this in writing**: *"Markdown Split was never affected — `doc_wraps`
+already returns true there, which the new tests confirm rather than assume."* Both halves were true and
+the conclusion was still wrong, because `doc_wraps` returning true says nothing about whether the layout
+path **asks** it. That is worth more than the fix: a predicate being correct is not evidence that its
+callers use it, and "the tests confirm rather than assume" was about a different test's subject.
+
+The same bug explains the comment at `main.odin`'s Split draw — *"the editor pass above draws full-window
+width, so its lines bleed into the right half"*. They bled because they were not being wrapped. The
+repaint that hides it is still there and is now genuinely just a scissor stand-in.
+
+### Preview: documented read-only, enforced nowhere
+
+`markdown.odin` has called `.Preview` a *"full-window rendered view (read-only)"* since it was written.
+The mouse honoured it (`ro_surface_swallows`); the keyboard never did. Typing ran `editor_input_rune`,
+and Backspace, Delete, Enter, Tab, Paste, Cut, Undo, the sort commands and the whole-buffer line-ending
+rewrite all reached the buffer through `command_dispatch` — every one of them editing at a caret that is
+not drawn. `doc_read_only_view` (`doc.odin`) is now the single answer, consumed by the typed-character
+loop and the mutating-command guard. Split is deliberately **not** in it: its left half is the editor.
+
+**One extra hole found on the way, and it was already open in the grid.** Replace cannot go on
+`command_mutates_doc` — in the search field that same `.Find_Confirm` is `find_next`, which a read-only
+view must still allow — so the top-of-proc guard never saw it. It therefore has its own refusal in the
+one arm that writes. Until this commit, the table guard's own comment claiming `table_edit_commit` is its
+only buffer write was **false**, and had been for as long as it had been written. Ctrl+H, Enter in the
+grid spliced the document.
+
+### Verification
+
+`mdviewtest`. The seam check compares the drawn row grid against the scrolled one row for row, then
+asserts the consequence — a click on any visible row must leave `doc.top` put. Sabotage, one fix at a
+time, rebuilt between each:
+
+- `doc.wrap` restored → `drawn row grid == scrolled row grid` FAILs at row 3 (`drawn=1628 scrolled=1545`),
+  and `a click ... leaves the view put` FAILs at row 27 (`top 1448 -> 1462`).
+- guard restored to `doc.table` → `first through: Backspace`, length 41 → 40.
+- Replace guard alone removed → length 41 → 39.
+
+**Two things this got right that are worth copying.** The seam runs at *both* wrap settings: with wrap on
+the two grids agreed even with the bug present, so a test covering only that case could never have caught
+it — the passing configuration is part of the test, as the control. And the first Replace check used a
+same-length replacement, so it rested entirely on the `modified` flag and would have missed a write that
+forgot to set it; the replacement is now shorter than the query, and the sabotage output is what exposed
+that, not review.
+
+**What it got wrong:** the `doc.table`-sabotage run also reddened the Replace check, because the leaked
+Backspace had already set `modified`. A contaminated signal is not a signal — it needed its own isolated
+run to prove anything, and got one.
+
+### Owed
+
+- The **typed-character** half rests on `doc_read_only_view` being asserted directly; the loop it guards
+  lives inside the frame loop and is not callable headless. Same arrangement as `ro_surface_swallows`,
+  and it carries the same risk: `main.odin` can drift from the predicate without a test noticing.
+- Wyatt's live pass over batches 7–11 is still owed; these were its first two findings.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -3048,7 +3134,7 @@ none of which has been verified against real GUI input.
     `linktest`, `tabreordertest`
   - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
     `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `tablereadonlytest`,
-    `mdtest`, `replacetest`, `findtest`, `regextest <mb>`
+    `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest <file>`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest <dir>`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`

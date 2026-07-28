@@ -260,6 +260,12 @@ cell_at_x :: #force_inline proc(char_w, mx: f32, hs := HS_GLOBAL) -> int {return
 // A line longer than this force-wraps even with global word wrap off, so a
 // minified JSON or a long log/CSV row is readable without horizontal scrolling
 // (which only reaches VISIBLE_COLS anyway). Wyatt, 2026-07-20.
+//
+// NOTE for anyone editing line_wrap_decision below: it must answer the SAME
+// question eff_wrap_at answers, because visible_next asks eff_wrap_at for the
+// first visible row and line_wrap_decision for every logical line after it. It
+// used to open with `if doc.wrap` rather than `if doc_wraps(doc)`, so Markdown
+// Split's forced wrap was invisible to it -- see the comment on doc_wraps.
 WRAP_LONG_CELLS :: 1024
 
 // How far back a force-wrap line-start scan will go, and how far forward the
@@ -280,7 +286,20 @@ WRAP_START_CAP :: RENDER_LINE_CAP
 // and never triggers an unbounded walk). Called once per visible logical line.
 @(private = "file")
 line_wrap_decision :: proc(doc: ^Document, t: ^plat.Text, ls: int) -> bool {
-	if doc.wrap {return true}
+	// doc_wraps, not doc.wrap: Markdown Split force-wraps the editor half
+	// whether or not Alt+Z is on, and this proc is one of the two answers
+	// visible_next uses to lay out a row. Reading the raw field here gave the
+	// draw and the hit-test a DIFFERENT row grid from the one doc_scroll /
+	// eff_row_start / doc_ensure_cursor_visible walk (those go through
+	// eff_wrap_at, which does ask doc_wraps) whenever Split was on with wrap
+	// off. Everything after the first visible row rendered unwrapped, so a
+	// click low in the pane resolved to an offset the scroll machinery
+	// believed was below the viewport -- it scrolled to "reveal" a line that
+	// was already on screen, and the still-held button then dragged a
+	// selection across the whole page from the freshly moved view. Reported by
+	// Wyatt in live use, 2026-07-28. The bug is CLAUDE.md's shape B exactly:
+	// one widget, two layouts.
+	if doc_wraps(doc) {return true}
 	buf: [4096]u8
 	L := doc.pt.length
 	limit := min(L, ls + WRAP_START_CAP)
@@ -325,6 +344,26 @@ line_wrap_decision :: proc(doc: ^Document, t: ^plat.Text, ls: int) -> bool {
 // preview.
 doc_wraps :: proc(doc: ^Document) -> bool {
 	return doc != nil && (doc.wrap || (doc.kind == .Text && doc.md_mode == .Split))
+}
+
+// The views that RENDER the document instead of editing it: the CSV/TSV grid
+// and the full-window Markdown Preview. Both replace the text pass entirely
+// (table_draw, markdown_draw), so neither draws a caret, and both must refuse
+// every buffer write -- a caret left over from text view would otherwise edit
+// at an offset the user cannot see.
+//
+// Markdown Split is deliberately NOT here: its left half is the real editor and
+// is meant to be typed in. The preview half takes no caret either, but that is
+// a MOUSE question (which pane a press landed in) and belongs to
+// ro_surface_swallows; the keyboard always belongs to the editor half.
+//
+// One predicate rather than the condition open-coded per site, because that is
+// how Preview came to be editable at all: `doc.table` was spelled out at each
+// guard, so adding a second read-only view meant finding every one of them, and
+// nobody did. Consumed by the typed-character loop (main.odin) and the
+// mutating-command guard plus the Replace All arm (commands.odin).
+doc_read_only_view :: proc(doc: ^Document) -> bool {
+	return doc != nil && doc.kind == .Text && (doc.table || doc.md_mode == .Preview)
 }
 
 eff_wrap_at :: proc(doc: ^Document, t: ^plat.Text, off: int) -> (wrap: bool, ls: int) {

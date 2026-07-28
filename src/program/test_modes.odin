@@ -10059,6 +10059,229 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad mdviewtest` covers the two markdown views as INPUT surfaces,
+		// which splittest (pure geometry) does not reach:
+		//
+		//   1. Markdown Split lays out ONE row grid. The draw and the hit-test walk
+		//      it with visible_begin/visible_next; doc_scroll, eff_row_start and
+		//      doc_ensure_cursor_visible walk it with eff_next_row. Those two used
+		//      to disagree whenever Split was on with word wrap off, because
+		//      line_wrap_decision read doc.wrap instead of doc_wraps -- so Split's
+		//      forced wrap was invisible to the draw for every logical line after
+		//      the first visible one. This asserts the grids row for row AND the
+		//      consequence a user actually meets: clicking a row that is already on
+		//      screen must not scroll the view.
+		//
+		//   2. Markdown Preview is documented read-only (markdown.odin) and draws
+		//      no caret, but nothing enforced it: typing and every editing key ran
+		//      against an invisible caret. This drives the real command_dispatch.
+		//
+		// Both were found in live use on 2026-07-28 and are one bug in two places:
+		// a rule spelled out per site (`doc.table`, `doc.wrap`) instead of asked of
+		// the one procedure that owns it.
+		if os.args[1] == "mdviewtest" {
+			if !require_scratch_session("mdviewtest") {return true}
+			bad := 0
+
+			mv_chk :: proc(bad: ^int, ok: bool, label: string) {
+				if !ok {bad^ += 1}
+				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+			}
+
+			// Prose markdown: paragraphs long enough to wrap several visual rows in
+			// a half-width editor pane, which is the only layout the seam bug shows
+			// up in. Short lines would wrap to one row each and the two grids would
+			// agree by accident.
+			mv_fixture :: proc() -> []u8 {
+				sb := strings.builder_make()
+				for i in 0 ..< 60 {
+					fmt.sbprintf(
+						&sb,
+						"## Heading %d\n\nThis is paragraph %d, written long enough that a half-width editor pane has to fold it across several visual rows, which is the layout the row-grid seam is tested in.\n\n",
+						i,
+						i,
+					)
+				}
+				return transmute([]u8)strings.to_string(sb)
+			}
+
+			// Run at BOTH wrap settings deliberately. With wrap on, doc.wrap and
+			// doc_wraps agree and the old code passed -- so a test that only ran
+			// that case could never have caught this. `wrap off` is the failing
+			// configuration; `wrap on` is the control that proves the fixture and
+			// the assertions are not simply green for everything.
+			mv_seam :: proc(bad: ^int, wrap: bool) {
+				winw, winh, px := f32(1600), f32(900), f32(16)
+				doc := doc_from_content(mv_fixture(), "seam.md", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				doc.md_mode = .Split
+				doc.wrap = wrap
+
+				t: plat.Text
+				plat.text_load_faces(&t)
+				cw := plat.text_char_width(&t, px)
+				doc.view_cols = doc_view_cols(doc_editor_right(&doc, winw, 0.5), cw)
+				rows := doc_visible_rows(&doc, winh, line_height(px))
+				doc_scroll(&doc, &t, 40, rows) // park mid-document, off row zero
+				top0 := doc.top
+				label := "wrap on " if wrap else "wrap off"
+
+				// The fixture has to actually wrap, or both assertions below are
+				// vacuous: an unwrapped document has one visual row per logical line
+				// under either walk.
+				mv_chk(
+					bad,
+					doc.view_cols > 0 && rows > 8 && top0 > 0,
+					fmt.tprintf("Split/%s: fixture parks mid-document (top=%d, %d rows of %d cells)", label, top0, rows, doc.view_cols),
+				)
+
+				// (a) the two walks, row for row.
+				diverge, vis_at, eff_at := -1, 0, 0
+				p := doc.top
+				it := visible_begin(&doc, &t, rows)
+				for r in 0 ..< rows {
+					_, s, _, _, _, _, ok := visible_next(&it)
+					if !ok {break}
+					if s != p {
+						diverge, vis_at, eff_at = r, s, p
+						break
+					}
+					np, more := eff_next_row(&doc, &t, p, doc.view_cols)
+					if !more {break}
+					p = np
+				}
+				mv_chk(
+					bad,
+					diverge < 0,
+					fmt.tprintf(
+						"Split/%s: drawn row grid == scrolled row grid across %d rows (first divergence: row %d, drawn=%d scrolled=%d)",
+						label, rows, diverge, vis_at, eff_at,
+					),
+				)
+
+				// (b) the consequence, which is what Wyatt actually reported. A press
+				// is replayed exactly as main.odin's frame runs it: doc_pos_at for the
+				// offset, then doc_ensure_cursor_visible because the cursor moved.
+				// Column 10 -- well inside the text, never past a row's end -- so a
+				// legitimate scroll-by-one at a row boundary can't be mistaken for the
+				// bug.
+				moved_at, moved_to := -1, 0
+				for r in 0 ..< rows {
+					doc.top = top0
+					doc.cursor, doc.anchor = top0, top0
+					my := row_rect_y(px, r) + line_height(px) * 0.5
+					mp := doc_pos_at(&doc, &t, i32(col_x(cw, 10, 0)), i32(my), px, cw, rows)
+					doc.cursor, doc.anchor = mp, mp
+					doc_ensure_cursor_visible(&doc, &t, rows)
+					if doc.top != top0 {
+						moved_at, moved_to = r, doc.top
+						break
+					}
+				}
+				mv_chk(
+					bad,
+					moved_at < 0,
+					fmt.tprintf(
+						"Split/%s: a click on any of the %d visible rows leaves the view put (first row that scrolled: %d, top %d -> %d)",
+						label, rows, moved_at, top0, moved_to,
+					),
+				)
+			}
+
+			// Preview takes no keyboard write at all. Driven through the real
+			// command_dispatch, not through a copy of its guard.
+			mv_preview_ro :: proc(bad: ^int) {
+				a: App
+				dummy: plat.Window
+				t: plat.Text
+				plat.text_load_faces(&t)
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				d := app_active(&a)
+				doc_insert_text(d, transmute([]u8)string("# Title\n\nalpha beta gamma\n\ndelta epsilon\n"), .Paste)
+				d.kind = .Text
+				d.md_mode = .Preview
+				d.cursor, d.anchor = 12, 12
+				d.modified = false
+				want := d.pt.length
+
+				// Every command command_mutates_doc names. Composed from that proc
+				// rather than re-listed, so a mutating command added there is covered
+				// here without a second edit -- the same reason command_allowed_on
+				// composes from it.
+				got_through := Command_Id.None
+				n_tried := 0
+				for c in Command_Id {
+					if !command_mutates_doc(c) {continue}
+					n_tried += 1
+					command_dispatch(c, {}, &a, &dummy, &t, 10)
+					if d.pt.length != want || d.modified {
+						got_through = c
+						break
+					}
+				}
+				mv_chk(
+					bad,
+					n_tried >= 15,
+					fmt.tprintf("Preview: %d mutating commands to try (a low count would make the next check vacuous)", n_tried),
+				)
+				mv_chk(
+					bad,
+					got_through == .None,
+					fmt.tprintf("Preview refuses every mutating command (length %d, want %d; first through: %v)", d.pt.length, want, got_through),
+				)
+
+				// Replace is the one buffer write that CANNOT go on that list -- in
+				// the search field the same command is find_next -- so it carries its
+				// own refusal and needs its own check.
+				find_open(d, true)
+				for r in "beta" {find_input_rune(d, r)}
+				find_wait(d)
+				d.find.field = 1
+				// Shorter than the query on purpose: a same-length replacement
+				// leaves pt.length alone, so the check would rest entirely on the
+				// `modified` flag and would miss a write that forgot to set it.
+				for r in "ZZ" {find_input_rune(d, r)}
+				// Without a live match find_replace_current returns early and this
+				// check would pass with the guard removed. Assert the precondition.
+				mv_chk(
+					bad,
+					d.find.current >= 0 && d.find.current < len(d.find.matches),
+					fmt.tprintf("Preview: a match is selected before Replace is tried (current=%d of %d)", d.find.current, len(d.find.matches)),
+				)
+				before := d.pt.length
+				command_dispatch(.Find_Confirm, {.Enter, false, false, false}, &a, &dummy, &t, 10)
+				mv_chk(
+					bad,
+					d.pt.length == before && !d.modified,
+					fmt.tprintf("Preview refuses Replace (length %d, want %d, modified=%v)", d.pt.length, before, d.modified),
+				)
+				find_close(d)
+
+				// The predicate main.odin's typed-character loop branches on. The
+				// loop itself is not callable from here (it lives inside the frame
+				// loop), so this pins the decision it makes -- the same arrangement
+				// ro_surface_swallows has for the mouse.
+				d.md_mode = .Preview
+				mv_chk(bad, doc_read_only_view(d), "Preview reads as a read-only view (what the typed-character loop tests)")
+				d.md_mode = .Off
+				mv_chk(bad, !doc_read_only_view(d), "...an ordinary text view does not")
+				d.md_mode = .Split
+				mv_chk(bad, !doc_read_only_view(d), "...and neither does Split, whose left half IS the editor")
+			}
+
+			fmt.println("mdviewtest:")
+			fmt.println("--- Markdown Split: one row grid, drawn == scrolled ---")
+			mv_seam(&bad, false)
+			mv_seam(&bad, true)
+			fmt.println("--- Markdown Preview: read-only ---")
+			mv_preview_ro(&bad)
+			fmt.printfln("mdviewtest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad revtest` drives every mutator and requires Document.revision to
 		// advance for each. A path that bypassed it would leave caches (markdown
 		// table column widths) stale on screen with no other symptom.
