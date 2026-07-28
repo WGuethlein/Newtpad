@@ -3492,14 +3492,24 @@ match at a block's first byte lives in the previous block. Underscore counts as 
 is what stops `cat` matching inside `cat_x` — and is precisely what a naive alphanumeric test lets
 through. That is the case the test pins.
 
+### The three holes, filled before moving on (v0.24.1)
+
+All three were shipped visible and inert, which is the worst shape for a defect: it looks finished.
+
+- **Regex ignored two of the three modes.** `{.Case_Insensitive}` was hardcoded into
+  `create_iterator`, and there was no word handling at all. Whole-word is a **post-filter** on the
+  regex path rather than wrapping the pattern in ``: the pattern is the user's, and splicing anchors
+  into it changes what alternation means (`a|b` becomes `a|b`). Filtering the *result* asks the
+  same question the literal path asks, through the same `is_word_byte`, so the two agree by
+  construction.
+- **An uncompilable pattern reported "no matches"** — indistinguishable from a pattern that compiled
+  and matched nothing, and meaning something entirely different. It says so where the count goes, and
+  the flag clears on the next search so a corrected pattern is not still marked invalid.
+- **The chips were computed inside `render_frame`**, so they were drawn to look pressable with nothing
+  to hit-test against. `find_toggles` is one geometry consumed by the draw and the click.
+
 ### Owed
 
-- **Regex ignores both new modes.** `scan_regex` builds its own pattern and has no case or word
-  handling; the toggles are literal-scan only. Nothing says so in the UI yet.
-- **Invalid regex is still not reported inline** (§12: the field's ring goes `danger` and the reason
-  replaces the count). The count colours red on zero results, which is not the same thing.
-- **The toggles are not clickable** — Alt+C / Alt+W / Ctrl+R only. They are drawn as chips, so they
-  look clickable, which is worse than not drawing them.
 - **No live pass.**
 
 ## 7. Build environment (Windows, this machine)
