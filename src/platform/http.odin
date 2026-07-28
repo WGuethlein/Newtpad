@@ -248,9 +248,13 @@ http_get :: proc(
 	}
 	defer WinHttpCloseHandle(req)
 
-	// The same disable set on the request handle. The session-level option covers
-	// handles created after it, but stating it here too costs one call and makes
-	// the guarantee local to the request being sent.
+	// THIS is the call that does the work, and the earlier session-level one does
+	// not: WINHTTP_OPTION_DISABLE_FEATURE is documented request-level only, so
+	// setting it on the session handle silently fails. The pair used to be
+	// commented the other way round — as if the session set it and this merely
+	// restated it locally — which would have invited someone to delete the one
+	// that works and keep the one that does nothing. Behaviour was always right;
+	// the comment was backwards. (Batch 11 whole-branch review.)
 	WinHttpSetOption(req, WINHTTP_OPTION_DISABLE_FEATURE, &feat, size_of(feat))
 
 	// No additional headers, no body. The User-Agent rides on the session agent

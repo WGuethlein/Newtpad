@@ -14991,7 +14991,16 @@ when NEWTPAD_TESTS {
 			up_tag_cases(&bad, up_chk)
 			up_decide_cases(&bad, up_chk)
 			up_surface_cases(&bad, up_chk)
-			up_lifecycle_case(&bad, up_chk)
+			// Opt-in, exactly like httptest's live case: this one starts the REAL
+			// worker, so it makes a network request and app_destroy's join waits
+			// on it. It passes offline, but a suite that reaches the network on
+			// every run is one people stop running -- and on a black-holed route
+			// the join is bounded by UPDATE_TIMEOUT_MS per phase, not in total.
+			if len(os.args) > 2 && os.args[2] == "live" {
+				up_lifecycle_case(&bad, up_chk)
+			} else {
+				fmt.println("--- worker lifecycle: SKIPPED (pass `live` to start a real check) ---")
+			}
 			fmt.printfln("updatetest: %d failures", bad)
 			return true
 		}

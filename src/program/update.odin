@@ -41,10 +41,24 @@ UPDATE_MAX_BYTES :: 256 * 1024
 
 // Per WinHTTP phase (resolve / connect / send / receive), not for the whole
 // call. It is deliberately short because `update_stop` JOINS this thread at
-// teardown and a blocking WinHTTP call cannot be interrupted — so this number is
-// also the worst case for how long closing the window can wait on a check that
-// is in flight. Longer is friendlier to a slow link and worse at exit; four
-// seconds is the compromise.
+// teardown and a blocking WinHTTP call cannot be interrupted.
+//
+// **It is NOT a 4-second bound on exit, and an earlier version of this comment
+// said it was.** Resolve, connect and send all stack inside one
+// `WinHttpSendRequest`, and `WINHTTP_OPTION_CONNECT_RETRIES` defaults to 5, so
+// the true worst case is tens of seconds on a black-holed route. Worse, there
+// is no `window_destroy` in this tree: the window is still on screen with its
+// pump dead for the whole join, so Windows ghosts it as "Not Responding".
+// No data is at risk — `session_save` has already run by then — but a slow,
+// visibly hung exit is the exact opposite of what this product is for.
+//
+// **The fix is to remove the reason to join, not to shorten this.** The join
+// exists only because `Update_Check` lives in a local of `main` and
+// `diag_shutdown` runs after `app_destroy`, so a detached worker would write
+// into a dead frame and log into a closed sink. Move it to package-level
+// storage (or heap-box it and abandon it) and `update_stop` becomes
+// `atomic_store(&cancel, true)` with no wait at all. ~15 lines, tracked in
+// HANDOFF §5.
 UPDATE_TIMEOUT_MS :: 4000
 
 // Longest tag we will keep. Real tags are "v0.19.0"; anything approaching this is
