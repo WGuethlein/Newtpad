@@ -120,11 +120,20 @@ UI_SCALE: f32 = 1
 // banner (taller than the 10px menu/content gap) was drawn half under the menu
 // bar, cut off and unreadable.
 FILTER_BANNER_H: f32 = 0
+
+// Everything between the chrome and the first document row: the filter banner
+// plus the find bar. ONE value, because it is the row grid's origin and every
+// pass that positions against a row -- the draw, the caret, the selection, the
+// find highlights, the hit-test and the frame loop's row count -- has to agree
+// on it exactly. Two separate addends is how a hit-test ends up one bar out of
+// step with the draw.
+TOP_INSET: f32 = 0
 FILTER_BANNER_H_96 :: f32(22)
 
 // The banner shows exactly when the filter view is engaged (see render_frame).
 doc_update_top_inset :: proc(doc: ^Document) {
 	FILTER_BANNER_H = sx(FILTER_BANNER_H_96) if (doc != nil && doc.filter && doc.find.active) else 0
+	TOP_INSET = FILTER_BANNER_H + doc_top_bar_h(doc)
 }
 
 // Scale a 96-DPI offset. Sign-preserving, and never rounds a non-zero value away
@@ -194,9 +203,9 @@ ui_px_even :: #force_inline proc(v: f32) -> f32 {
 // per row: a full row off by row 40.
 line_height :: #force_inline proc(px: f32) -> f32 {return f32(int(px * LINE_SPACING + 0.5))}
 // Text baseline y for visible row r (what text_draw wants).
-row_baseline_y :: #force_inline proc(px: f32, r: int) -> f32 {return px + CONTENT_TOP + FILTER_BANNER_H + f32(r) * line_height(px)}
+row_baseline_y :: #force_inline proc(px: f32, r: int) -> f32 {return px + CONTENT_TOP + TOP_INSET + f32(r) * line_height(px)}
 // Top y of a line-height-tall highlight box for row r.
-row_rect_y :: #force_inline proc(px: f32, r: int) -> f32 {return CONTENT_TOP + FILTER_BANNER_H + f32(r) * line_height(px)}
+row_rect_y :: #force_inline proc(px: f32, r: int) -> f32 {return CONTENT_TOP + TOP_INSET + f32(r) * line_height(px)}
 // Left x of column `col` (monospace).
 // Width of the line-number gutter, 0 when there isn't one. Set once per frame
 // (doc_update_gutter) and added by BOTH col_x and col_at_x, so the drawn column
@@ -331,7 +340,7 @@ HS_GLOBAL :: min(int)
 eff_hs :: #force_inline proc(hs: int) -> int {return H_SCROLL if hs == HS_GLOBAL else hs}
 col_x :: #force_inline proc(char_w: f32, col: int, hs := HS_GLOBAL) -> f32 {return TEXT_MARGIN_X + GUTTER_W + f32(col - eff_hs(hs)) * char_w}
 // Inverse mappings for hit-testing a client-space pixel.
-row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - CONTENT_TOP - FILTER_BANNER_H) / line_height(px))}
+row_at_y :: #force_inline proc(px, my: f32) -> int {return int((my - CONTENT_TOP - TOP_INSET) / line_height(px))}
 col_at_x :: #force_inline proc(char_w, mx: f32, hs := HS_GLOBAL) -> int {return eff_hs(hs) + max(0, int((mx - TEXT_MARGIN_X - GUTTER_W) / char_w + 0.5))}
 // Which cell a point is INSIDE, as opposed to col_at_x, which rounds to the
 // nearest caret boundary because that is what click-to-place-caret wants.
@@ -653,19 +662,37 @@ visible_begin :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> Visible_Iter 
 // filter armed but nothing matched yet — an empty query, or a worker that hasn't
 // published — the document renders normally instead of showing a blank screen.
 // That is what lets Ctrl+L arm the filter first and narrow as the user types.
-// Height of the bar along the bottom: the find bar when find is open, otherwise
-// the status line. Document rows must stop above it, or text is drawn behind the
-// bar and clicks in that strip land on rows the user cannot see.
-doc_bottom_bar_h :: proc(doc: ^Document) -> f32 {
-	if doc != nil && doc.find.active {
-		return sx(48) if doc.find.replace_mode else sx(26)
-	}
-	return STATUS_BAR_H // status line
+// UI spec 12 sizes: a 38px find bar, and replace adds a second 38px row.
+FIND_BAR_H_96 :: f32(38)
+
+// Height of the find bar, which sits at the TOP of the editor.
+//
+// It used to live in the bottom strip, sharing doc_bottom_bar_h with the status
+// line -- so one procedure answered two questions and every caller had to know
+// which one it was getting. UI spec 12 moves it: "the count is the number you
+// stare at while typing; in the screenshots it is the lowest-contrast text in
+// the window, at the bottom, 700 pixels from where you are looking."
+//
+// Returning a TOP inset rather than a bottom one is most of the work, because
+// the row math already has a top-inset mechanism (FILTER_BANNER_H) and had no
+// second one. Rows, the caret, the hit-test and the scrollbar track all measure
+// from CONTENT_TOP plus the insets, so adding to that sum is enough.
+doc_top_bar_h :: proc(doc: ^Document) -> f32 {
+	if doc == nil || !doc.find.active {return 0}
+	return sx(FIND_BAR_H_96) * (2 if doc.find.replace_mode else 1)
 }
 
-// Visible document rows, excluding the bottom bar and the filter banner inset.
+// Height of the bar along the bottom. The status line, and only the status line
+// now -- the find bar moved to doc_top_bar_h. Document rows must stop above it,
+// or text is drawn behind the bar and clicks in that strip land on rows the user
+// cannot see.
+doc_bottom_bar_h :: proc(doc: ^Document) -> f32 {
+	return STATUS_BAR_H
+}
+
+// Visible document rows, excluding both bars and the filter banner inset.
 doc_visible_rows :: proc(doc: ^Document, height, line_h: f32) -> int {
-	return max(0, int((height - CONTENT_TOP - FILTER_BANNER_H - doc_bottom_bar_h(doc)) / line_h))
+	return max(0, int((height - CONTENT_TOP - TOP_INSET - doc_bottom_bar_h(doc)) / line_h))
 }
 
 // Highest filter_top that still fills the screen. One definition: the wheel, the
@@ -978,6 +1005,11 @@ Find :: struct {
 	replace_mode: bool, // Ctrl+H shows the replace field
 	field:        int, // 0 = query field, 1 = replace field (Tab toggles)
 	regex:        bool, // regex vs literal substring
+	// Search has always been case-FOLDED with no way to ask for exact case, and
+	// has never had a whole-word mode at all. UI spec 12 wants all three shown as
+	// labelled toggles, which only means anything once all three exist.
+	case_sens:    bool, // match case exactly
+	whole_word:   bool, // the match must not be flanked by word characters
 	query:        [dynamic]u8, // UTF-8
 	replace:      [dynamic]u8,
 	// Slices into the Search arrays, re-sliced once per frame to whatever the

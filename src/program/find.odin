@@ -141,6 +141,24 @@ Scan_State :: struct {
 	n:       int, // matches emitted so far (the worker's private count)
 	last_nl: int, // offset of the last newline before pos, -1 if there is none
 	nlines:  int, // newlines passed before pos
+	// The byte immediately before `pos`, carried across blocks.
+	//
+	// Whole-word needs the character on EITHER side of a match, and the one
+	// before a match at a block's first byte lives in the previous block -- the
+	// read buffer only overlaps forward (len(q)-1 bytes, so a match spanning the
+	// boundary is found), never backward. Carrying one byte is cheaper than
+	// re-reading and cannot be got wrong by a budget that ends mid-block.
+	prev:    u8,
+}
+
+// Word characters, for whole-word matching. ASCII only, deliberately: the
+// literal scanner works on bytes and folds with `lower`, so pretending to know
+// where a word boundary falls in UTF-8 would be a promise the rest of the path
+// does not keep. A non-ASCII byte is treated as a word character, which makes
+// "cafe" not match inside "café" -- the conservative direction.
+@(private = "file")
+is_word_byte :: proc(c: u8) -> bool {
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80
 }
 
 Search :: struct {
@@ -148,6 +166,8 @@ Search :: struct {
 	at:         Scan_State, // resume point (see Scan_State)
 	query:      []u8, // private copy; the find bar's buffer keeps mutating
 	regex:      bool,
+	case_sens:  bool,
+	whole_word: bool,
 	matches:    []int, // fixed MAX_MATCHES capacity, written by index
 	match_len:  []int,
 	line_start: []int, // line start of each match, computed here (see below)
@@ -196,6 +216,8 @@ find_close :: proc(doc: ^Document) {
 
 find_toggle_field :: proc(doc: ^Document) {doc.find.field = 1 - doc.find.field}
 find_toggle_regex :: proc(doc: ^Document) {doc.find.regex = !doc.find.regex;find_query_changed(doc)}
+find_toggle_case :: proc(doc: ^Document) {doc.find.case_sens = !doc.find.case_sens;find_query_changed(doc)}
+find_toggle_word :: proc(doc: ^Document) {doc.find.whole_word = !doc.find.whole_word;find_query_changed(doc)}
 
 @(private = "file")
 active_buf :: proc(doc: ^Document) -> ^[dynamic]u8 {
@@ -283,6 +305,8 @@ search_reset :: proc(doc: ^Document) {
 	s.at = {pos = 0, n = 0, last_nl = -1, nlines = 0} // scan from the top again
 	s.total = doc.pt.length
 	s.regex = doc.find.regex
+	s.case_sens = doc.find.case_sens
+	s.whole_word = doc.find.whole_word
 
 	f := &doc.find
 	f.matches, f.match_len = s.matches[:0], s.match_len[:0]
@@ -531,9 +555,10 @@ emit :: proc(s: ^Search, n: ^int, at, length, line_start, line_no: int) -> bool 
 scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 	q := s.query
 	L := pt.length
+	// Folded copy, or the query as typed when the search is case-sensitive.
 	ql := make([]u8, len(q))
 	defer delete(ql)
-	for i in 0 ..< len(q) {ql[i] = lower(q[i])}
+	for i in 0 ..< len(q) {ql[i] = q[i] if s.case_sens else lower(q[i])}
 
 	// Overlap by len(q)-1 so a match spanning a block boundary is still found.
 	buf := make([]u8, SEARCH_BLOCK + len(q) - 1)
@@ -544,6 +569,7 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 	// is already walking every byte — deriving it later would mean re-scanning
 	// the file per match.
 	n, last_nl, nlines := s.at.n, s.at.last_nl, s.at.nlines
+	prev := s.at.prev
 	pos := s.at.pos
 	halted := false // cancel / fault / MAX_MATCHES: nothing more to publish here
 	ended := false // a read returned nothing: treat the buffer as exhausted
@@ -573,10 +599,22 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 		for k := 0; k < limit; k += 1 {
 			hit := true
 			for j in 0 ..< len(q) {
-				if lower(buf[k + j]) != ql[j] {
+				c := buf[k + j] if s.case_sens else lower(buf[k + j])
+				if c != ql[j] {
 					hit = false
 					break
 				}
+			}
+			// Whole word: neither side may be a word character. The byte BEFORE
+			// the match is buf[k-1] within this block, or the carried `prev` at
+			// the block's first byte. The byte after is inside the forward
+			// overlap; past what was read counts as a boundary, which is right
+			// at end-of-file.
+			if hit && s.whole_word {
+				before := prev if k == 0 else buf[k - 1]
+				after: u8 = 0
+				if k + len(q) < got {after = buf[k + len(q)]}
+				if is_word_byte(before) || is_word_byte(after) {hit = false}
 			}
 			// Check before updating last_nl: a match starting on a '\n' belongs
 			// to the line that newline terminates, not the one it begins.
@@ -589,13 +627,15 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 				nlines += 1
 			}
 		}
+		// Carry the last byte this block covered, for the next block's k == 0.
+		if bs > 0 && bs - 1 < got {prev = buf[bs - 1]}
 		was := pos
 		pos += bs
 		intrinsics.atomic_add(&s.swept, min(pos, L) - was) // see Search.swept
 		intrinsics.atomic_store(&s.count, n)
 		intrinsics.atomic_store(&s.scanned, min(pos, L))
 	}
-	s.at = {pos = pos, n = n, last_nl = last_nl, nlines = nlines}
+	s.at = {pos = pos, n = n, last_nl = last_nl, nlines = nlines, prev = prev}
 	if halted {return}
 	intrinsics.atomic_store(&s.count, n)
 	if ended || pos >= L {

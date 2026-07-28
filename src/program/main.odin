@@ -587,7 +587,7 @@ main :: proc() {
 		// already being edited first). Before the read-only consume below, which
 		// swallows the press for the grid. Ctrl is the link modifier, handled above.
 		if doc.table && doc.kind == .Text && window.mouse_pressed && !plat.key_ctrl_down() &&
-		   f32(window.mouse_y) >= CONTENT_TOP + FILTER_BANNER_H && f32(window.mouse_y) < f32(window.height) - doc_bottom_bar_h(doc) {
+		   f32(window.mouse_y) >= CONTENT_TOP + TOP_INSET && f32(window.mouse_y) < f32(window.height) - doc_bottom_bar_h(doc) {
 			if doc.table_editing {table_edit_commit(doc)}
 			if ok, r, col, fs, fe, val := table_cell_at(doc, f32(window.mouse_x), f32(window.mouse_y), px, char_w, rows, f32(window.width)); ok {
 				table_edit_start(doc, r, col, fs, fe, val)
@@ -617,6 +617,23 @@ main :: proc() {
 		// could never be dragged below the last visible line. Consume only a fresh
 		// press; leave an ongoing drag to the auto-scroll below.
 		if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
+			if window.mouse_pressed || window.mouse_middle_pressed {
+				window.mouse_pressed = false
+				window.mouse_middle_pressed = false
+				window.mouse_down = false
+			}
+		}
+
+		// The same rule at the TOP, now that the find bar and the filter banner
+		// inset the content from above. Without it a press in the find bar runs
+		// through doc_pos_at, whose row_at_y goes NEGATIVE there and clamps to
+		// row 0 -- so clicking the search field would silently move the caret to
+		// the first visible line. The bottom strip has had this guard since the
+		// find bar lived down there; moving the bar moved the hazard with it.
+		//
+		// A fresh press only, exactly like the bottom: an in-progress selection
+		// drag that reaches the bar must keep auto-scrolling rather than dying.
+		if f32(window.mouse_y) >= CHROME_TOP && f32(window.mouse_y) < CONTENT_TOP + TOP_INSET {
 			if window.mouse_pressed || window.mouse_middle_pressed {
 				window.mouse_pressed = false
 				window.mouse_middle_pressed = false
@@ -764,7 +781,7 @@ main :: proc() {
 				// for a drag that wasn't doing anything. A plain (non-Alt) drag is
 				// never refused, so this doesn't change its behavior.
 				if refusal == .None {
-					if f32(window.mouse_y) < CONTENT_TOP + FILTER_BANNER_H {
+					if f32(window.mouse_y) < CONTENT_TOP + TOP_INSET {
 						doc_scroll(doc, &text, -1, rows)
 					} else if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
 						doc_scroll(doc, &text, 1, rows)
@@ -1193,7 +1210,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	bottom := doc.top
 	if doc.kind == .Text && doc.md_mode == .Preview {
 		// Full-window rendered markdown (read-only) replaces the text pass.
-		ytop := CONTENT_TOP + FILTER_BANNER_H
+		ytop := CONTENT_TOP + TOP_INSET
 		ybot := f32(window.height) - doc_bottom_bar_h(doc)
 		bottom = markdown_draw(gfx, quad_pipe, text, doc, px, char_w, TEXT_MARGIN_X, f32(window.width) - SCROLLBAR_W, ytop, ybot, doc.top)
 	} else if doc.table && doc.kind == .Text {
@@ -1258,7 +1275,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// background (the caret sits at/after the margin, so it is never covered; the
 	// right-side overrun is already hidden by the scrollbar drawn below).
 	if H_SCROLL > 0 {
-		ctop := CONTENT_TOP + FILTER_BANNER_H
+		ctop := CONTENT_TOP + TOP_INSET
 		cbot := f32(window.height) - doc_bottom_bar_h(doc)
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, ctop}, size = {TEXT_MARGIN_X, cbot - ctop}, color = g_theme[.Bg_Base]}})
 	}
@@ -1336,7 +1353,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// Markdown Split: a divider, the live preview in the right half, and a second
 	// byte-proportional scrollbar mirroring the shared scroll (doc.top).
 	if doc.kind == .Text && doc.md_mode == .Split {
-		pvtop := CONTENT_TOP + FILTER_BANNER_H
+		pvtop := CONTENT_TOP + TOP_INSET
 		pvbot := h - doc_bottom_bar_h(doc)
 		// The editor pass above draws full-window width, so its lines bleed into the
 		// right half where the preview lives. There is no scissor rect (the H_SCROLL
@@ -1388,10 +1405,22 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// Sits in the reserved inset below the menu bar (see FILTER_BANNER_H), so
 		// it no longer draws half under the menu or over the first matching line.
 		by := CHROME_TOP
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, by}, size = {w, FILTER_BANNER_H}, color = g_theme[.Filter_Bg]}})
+		// Accent_Wash, the same fill a selected settings row uses. UI spec 12: "a
+		// mode must be obvious; it does not have to be the loudest thing on
+		// screen. Same fill as a selected settings row, so 'something is active'
+		// reads consistently across the app." The 2px accent bar is what keeps it
+		// from being colour alone.
+		plat.quads_draw(
+			gfx,
+			quad_pipe,
+			[]plat.Quad {
+				{pos = {0, by}, size = {w, FILTER_BANNER_H}, color = g_theme[.Accent_Wash]},
+				{pos = {0, by}, size = {max(2, sx(2)), FILTER_BANNER_H}, color = g_theme[.Accent]},
+			},
+		)
 		// filter_banner_text (find.odin) owns the wording, so "searching" and
 		// "no matching lines" cannot collapse into one string again.
-		plat.text_draw(gfx, text, filter_banner_text(doc), sx(12), by + FILTER_BANNER_H - sx(7), UI_SMALL_PX, g_theme[.Filter_Text])
+		plat.text_draw(gfx, text, filter_banner_text(doc), sx(12), by + FILTER_BANNER_H - sx(7), UI_SMALL_PX, g_theme[.Text_Primary])
 	}
 
 	tabs_draw(gfx, quad_pipe, text, rc.app, window, w)
@@ -1416,31 +1445,65 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// it expires on schedule whether or not find happens to be open.
 	notice_live := app_notice_active(rc.app)
 
+	// The find bar, at the TOP of the editor (UI spec 12). It used to occupy the
+	// bottom strip INSTEAD of the status line -- the two shared one if/else, so
+	// opening find hid the file's encoding, line endings and position. They are
+	// independent now: the bar insets the content from above, the status line
+	// keeps its own strip below, and both are visible at once.
 	if doc.find.active {
 		f := &doc.find
-		bar_h := sx(48) if f.replace_mode else sx(26)
-		bar := plat.Quad{pos = {0, h - bar_h}, size = {w, bar_h}, color = g_theme[.Bg_Panel]}
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{bar})
-		// One producer (find.odin), because the scrollbar's match marks are drawn
-		// from the same partial match list and rely on this "+" to say so.
-		info := find_status_info(doc)
-		mode := "regex" if f.regex else "text"
-		// The caret marks the focused field and reserves nothing in the other one.
-		// A blank placeholder here would keep the double gap that was the reported
-		// bug, just consistently. `info` owns the single space before the count.
-		fcaret := "_" if f.field == 0 else ""
-		rcaret := "_" if f.field == 1 else ""
-		fline := fmt.tprintf("Find [%s]%s: %s%s%s", mode, " filter" if doc.filter else "", string(f.query[:]), fcaret, info)
-		if f.replace_mode {
-			plat.text_draw(gfx, text, fline, sx(12), h - sx(30), UI_PX, g_theme[.Accent])
-			rline := fmt.tprintf("Replace: %s%s", string(f.replace[:]), rcaret)
-			plat.text_draw(gfx, text, rline, sx(12), h - sx(8), UI_PX, g_theme[.Text_Bright])
-			hint_find(gfx, text, f, doc, w, h - sx(30))
-		} else {
-			plat.text_draw(gfx, text, fline, sx(12), h - sx(8), UI_PX, g_theme[.Accent])
-			hint_find(gfx, text, f, doc, w, h - sx(8))
+		bar_h := doc_top_bar_h(doc)
+		by := CHROME_TOP
+		plat.quads_draw(
+			gfx,
+			quad_pipe,
+			[]plat.Quad {
+				{pos = {0, by}, size = {w, bar_h}, color = g_theme[.Bg_Panel]},
+				{pos = {0, by + bar_h - hairline()}, size = {w, hairline()}, color = g_theme[.Border_Subtle]},
+			},
+		)
+		row_h := sx(FIND_BAR_H_96)
+		fbase := by + row_h * 0.5 + UI_PX * 0.35
+		cw := plat.text_char_width(text, UI_PX)
+
+		// Three toggles, always visible and always labelled. UI spec 12: "while
+		// regex is a hidden Ctrl+R state, there is no way to tell why a search is
+		// behaving oddly." Active ones take the accent fill, so the state is
+		// readable without hovering anything.
+		tw := sx(30)
+		tx := w - sx(12) - 3 * (tw + sx(4))
+		for t, i in ([]struct {
+			label: string,
+			on:    bool,
+		}{{"Aa", f.case_sens}, {"ab|", f.whole_word}, {".*", f.regex}}) {
+			bx := tx + f32(i) * (tw + sx(4))
+			if t.on {
+				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {bx, by + sx(7)}, size = {tw, row_h - sx(14)}, color = g_theme[.Accent], radius = {RADIUS_ROW, RADIUS_ROW, RADIUS_ROW, RADIUS_ROW}}})
+			}
+			lc := g_theme[.Bg_Base] if t.on else g_theme[.Text_Muted]
+			plat.text_draw(gfx, text, t.label, bx + (tw - f32(len(t.label)) * cw) * 0.5, fbase, UI_PX, lc)
 		}
-	} else {
+
+		// The query, and the count beside it -- not in the status bar, "700
+		// pixels from where you are looking".
+		fcaret := "_" if f.field == 0 else ""
+		fline := fmt.tprintf("%s%s%s", "Filter: " if doc.filter else "Find: ", string(f.query[:]), fcaret)
+		plat.text_draw(gfx, text, fline, sx(12), fbase, UI_PX, g_theme[.Text_Primary])
+		info := find_status_info(doc)
+		if info != "" {
+			ix := sx(12) + f32(len(fline)) * cw + sx(16)
+			// Zero results colours the count rather than beeping or shaking.
+			ic := g_theme[.Danger] if len(f.matches) == 0 && len(f.query) > 0 else g_theme[.Text_Muted]
+			plat.text_draw(gfx, text, info, ix, fbase, UI_PX, ic)
+		}
+		if f.replace_mode {
+			rcaret := "_" if f.field == 1 else ""
+			rline := fmt.tprintf("Replace: %s%s", string(f.replace[:]), rcaret)
+			plat.text_draw(gfx, text, rline, sx(12), fbase + row_h, UI_PX, g_theme[.Text_Bright])
+			hint_find(gfx, text, f, doc, w, fbase + row_h)
+		}
+	}
+	{
 		// Either figure can be unknown on a huge file: both are capped so the status
 		// bar never spends an unbounded scan. Say what is known rather than printing
 		// a placeholder number that reads as fact.

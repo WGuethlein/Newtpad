@@ -8739,7 +8739,11 @@ when NEWTPAD_TESTS {
 					{.Text_Muted, .Bg_Base, 4.5, "hints and accelerators"},
 					{.Text_Primary, .Selection_Doc, 4.5, "body inside a selection"},
 					{.Text_Primary, .Find_Match_Bg, 4.5, "body inside a find match"},
-					{.Filter_Text, .Filter_Bg, 4.5, "the filter band"},
+					// The filter band folded into Accent_Wash (batch 15), so the pair
+					// is now the band's text on that wash rather than two roles
+					// that existed for one banner. Still one of the six places UI
+					// spec 17 names where text sits on a themeable fill.
+					{.Text_Primary, .Accent_Wash, 4.5, "the filter band"},
 					{.Scrollbar_Thumb, .Bg_Base, 3.0, "scrollbar thumb (non-text, 1.4.11)"},
 				}
 				cl := theme_light()
@@ -10431,6 +10435,90 @@ when NEWTPAD_TESTS {
 					mt_chk(&bad, worst_w < 0, fmt.tprintf("scale %.2f: the palette origin is a whole pixel at every window width (first fractional: %.0f)", sc, worst_w))
 				}
 				UI_SCALE = saved
+			}
+
+			// The two search modes that did not exist. Case-folding was
+			// unconditional and there was no whole-word mode at all, so UI spec
+			// 12's "three toggles, always visible" was showing one.
+			{
+				fix := "Cat cat concat CATALOG cat_x x_cat cat\n"
+				fdoc := doc_from_content(transmute([]u8)strings.clone(fix), "find.txt", .UTF8)
+				defer doc_close(&fdoc)
+				count :: proc(d: ^Document, q: string, case_sens, whole: bool) -> int {
+					find_close(d)
+					find_open(d, false)
+					// find_open does NOT clear the query -- it seeds from the
+					// selection and otherwise keeps what was there, which is what
+					// makes Ctrl+F reuse your last search. Without clearing it
+					// here the second call searches for "catcat" and every check
+					// after the first reads zero.
+					clear(&d.find.query)
+					d.find.case_sens, d.find.whole_word = case_sens, whole
+					for r in q {find_input_rune(d, r)}
+					find_wait(d)
+					return len(d.find.matches)
+				}
+				// Precondition: the fixture really does contain the cases that
+				// distinguish the modes, or every check below is vacuous.
+				any_ := count(&fdoc, "cat", false, false)
+				mt_chk(&bad, any_ >= 6, fmt.tprintf("fixture has enough hits to tell the modes apart (%d)", any_))
+
+				exact := count(&fdoc, "cat", true, false)
+				mt_chk(&bad, exact < any_, fmt.tprintf("match case finds FEWER than folded (%d < %d)", exact, any_))
+
+				whole := count(&fdoc, "cat", false, true)
+				mt_chk(&bad, whole < any_, fmt.tprintf("whole word finds fewer than any-position (%d < %d)", whole, any_))
+				// "concat" and "cat_x" and "x_cat" must all be excluded -- the
+				// underscore cases are the ones a naive alphanumeric-only test
+				// would let through, and _ is a word character in every editor.
+				mt_chk(&bad, whole == 3, fmt.tprintf("whole word finds exactly the 3 standalone cats (%d)", whole))
+
+				both := count(&fdoc, "cat", true, true)
+				mt_chk(&bad, both <= whole && both < exact, fmt.tprintf("the two modes compose (%d <= %d and < %d)", both, whole, exact))
+				find_close(&fdoc)
+			}
+
+			// The find bar insets the content from the TOP now, and the row grid,
+			// the hit-test and the row count all measure from that inset. They
+			// share TOP_INSET for exactly this reason -- two addends is how a
+			// hit-test ends up one bar out of step with the draw.
+			{
+				fd: Document
+				fd.kind = .Text
+				saved_scale, saved_inset, saved_banner := UI_SCALE, TOP_INSET, FILTER_BANNER_H
+				defer {UI_SCALE, TOP_INSET, FILTER_BANNER_H = saved_scale, saved_inset, saved_banner}
+				UI_SCALE = 1
+				px := f32(16)
+				lh := line_height(px)
+				H := f32(900)
+
+				for st, si in ([]struct {
+					find, replace: bool,
+					what:          string,
+				}{{false, false, "find closed"}, {true, false, "find open"}, {true, true, "replace open"}}) {
+					fd.find.active, fd.find.replace_mode = st.find, st.replace
+					doc_update_top_inset(&fd)
+					rows := doc_visible_rows(&fd, H, lh)
+
+					// Row 0 must be drawn BELOW the bar, and the pixel it is drawn
+					// at must hit-test back to row 0. That round trip is the seam.
+					y0 := row_rect_y(px, 0)
+					mt_chk(&bad, y0 >= CONTENT_TOP + TOP_INSET - 0.5, fmt.tprintf("%s: row 0 starts below the inset (%.0f >= %.0f)", st.what, y0, CONTENT_TOP + TOP_INSET))
+					mt_chk(&bad, row_at_y(px, y0 + lh * 0.5) == 0, fmt.tprintf("%s: the middle of drawn row 0 hit-tests as row 0 (got %d)", st.what, row_at_y(px, y0 + lh * 0.5)))
+					// And the last row must still clear the status bar.
+					ylast := row_rect_y(px, rows - 1) + lh
+					mt_chk(&bad, ylast <= H - doc_bottom_bar_h(&fd) + 0.5, fmt.tprintf("%s: the last of %d rows clears the status bar (%.0f <= %.0f)", st.what, rows, ylast, H - doc_bottom_bar_h(&fd)))
+					// Opening the bar must COST rows. If it did not, the inset is
+					// not reaching the row count and the bar is drawn over text.
+					if si > 0 {
+						fd.find.active, fd.find.replace_mode = false, false
+						doc_update_top_inset(&fd)
+						closed := doc_visible_rows(&fd, H, lh)
+						fd.find.active, fd.find.replace_mode = st.find, st.replace
+						doc_update_top_inset(&fd)
+						mt_chk(&bad, rows < closed, fmt.tprintf("%s: costs rows (%d < %d closed)", st.what, rows, closed))
+					}
+				}
 			}
 
 			fmt.printfln("metricstest: %d failures", bad)
