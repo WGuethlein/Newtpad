@@ -51,6 +51,17 @@ Settings :: struct {
 	tab_width:       int,
 	font_family:     string, // family NAME, not a path — paths differ per machine
 	font_style:      plat.Font_Style,
+	// The chrome's family, separate from the document's. plat.Font_Set has had
+	// .UI and .Doc since the atlas was written -- "the document's font is the
+	// user's choice; the chrome's is fixed, so choosing a document font cannot
+	// make the menus unreadable" -- and text_load_faces loaded Consolas into
+	// both "until settings say otherwise". This is settings saying otherwise.
+	//
+	// Defaults to Cascadia Mono, which ships on Windows 11 and is already in
+	// FONT_FAMILIES. The UI spec asks for Monaspace Argon here; embedding a font
+	// needs an in-memory DirectWrite loader that does not exist yet, so that
+	// lands as one more row in that table later rather than holding this up.
+	ui_font_family:  string,
 	link_style:      Link_Style, // when/how clickable links are shown
 	split_frac:      f32, // Markdown Split divider position; a global preference (not per-file/per-tab)
 	// Remembered per-FAMILY view (not per-extension, not per-file — Wyatt's call:
@@ -105,6 +116,7 @@ settings_default :: proc() -> Settings {
 		tab_width = plat.TAB_WIDTH_DEFAULT,
 		font_family = "Consolas",
 		font_style = .Regular,
+		ui_font_family = "Cascadia Mono",
 		link_style = .Hover,
 		split_frac = SPLIT_DEFAULT,
 		md_default = .Off,
@@ -181,6 +193,8 @@ settings_load :: proc() -> Settings {
 			}
 		case "font_family":
 			s.font_family = strings.clone(parts[1])
+		case "ui_font_family":
+			s.ui_font_family = strings.clone(parts[1])
 		case "font_style":
 			if n, pok := strconv.parse_int(parts[1]); pok && n >= 0 && n <= int(max(plat.Font_Style)) {
 				s.font_style = plat.Font_Style(n)
@@ -236,7 +250,7 @@ settings_save :: proc(s: Settings) -> bool {
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\nremember_views %d\ntheme_name %s\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\nremember_views %d\ntheme_name %s\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
@@ -244,6 +258,7 @@ settings_save :: proc(s: Settings) -> bool {
 		s.tab_width,
 		s.font_family if s.font_family != "" else "Consolas",
 		int(s.font_style),
+		s.ui_font_family if s.ui_font_family != "" else "Cascadia Mono",
 		int(s.link_style),
 		s.split_frac,
 		int(s.md_default),
@@ -276,6 +291,7 @@ SETTINGS_ROWS := []Setting_Row {
 	{"Remember last view used", "Toggling a view updates the two defaults above; off pins them"},
 	{"Theme", "Dark, Light, or a custom .theme file placed in the themes folder"},
 	{"Tab width", "Columns a Tab advances to; Left/Right adjust, Enter resets to 4"},
+	{"Interface font", "Tabs, menus, settings and the status bar; the document keeps its own font"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
@@ -430,6 +446,22 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		nn := len(names)
 		s.theme_name = strings.clone(names[((cur + step) % nn + nn) % nn])
 		g_theme = theme_resolve(s.theme_name)
+	case 9:
+		// Cycled through the same curated, installed-only list the Font screen
+		// offers, so the chrome can never land on a family that is not there.
+		// The document's font stays on Edit > Font: it is reached while working,
+		// where this is set once.
+		if len(font_choices) > 0 {
+			cur := 0
+			for n, i in font_choices {
+				if n == s.ui_font_family {
+					cur = i
+					break
+				}
+			}
+			step := dir if dir != 0 else 1
+			s.ui_font_family = font_choices[(cur + step + len(font_choices)) % len(font_choices)]
+		}
 	case 8:
 		// Stepped, not cycled: 16 values is too many to reach by pressing Enter,
 		// and the useful ones (2, 4, 8) are all within a few Rights of each
@@ -508,6 +540,8 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			val = app.settings.theme_name
 		case 8:
 			val = fmt.tprintf("%d", app.settings.tab_width)
+		case 9:
+			val = app.settings.ui_font_family
 		}
 		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Dim]
 		plat.text_draw(gfx, t, val, width - sx(220), y, UI_PX, vc)

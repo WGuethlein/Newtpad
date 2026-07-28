@@ -166,6 +166,13 @@ main :: proc() {
 	} else if app.settings.font_style != .Regular {
 		plat.text_load_family(&text, "Consolas", app.settings.font_style)
 	}
+	// The chrome's family, on the .UI set. Same failure rule as the document's
+	// above -- a family that is no longer installed leaves Consolas in place
+	// rather than stopping the app -- and deliberately a SEPARATE call, because
+	// the whole point of Font_Set is that these two never move together.
+	if app.settings.ui_font_family != "" && app.settings.ui_font_family != "Consolas" {
+		plat.text_load_family(&text, app.settings.ui_font_family, .Regular, .UI)
+	}
 	metrics_recompute(&rc)
 	window.on_resize = on_resize
 	window.resize_user = &rc

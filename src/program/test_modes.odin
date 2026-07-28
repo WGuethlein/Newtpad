@@ -1133,6 +1133,10 @@ when NEWTPAD_TESTS {
 		// under the caret.
 		if os.args[1] == "fonttest" {
 			bad := 0
+			fnt_chk :: proc(bad: ^int, ok: bool, label: string) {
+				if !ok {bad^ += 1}
+				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+			}
 			t: plat.Text
 			if !plat.text_load_faces(&t) {
 				fmt.eprintln("fonttest: no fonts loaded")
@@ -1141,6 +1145,60 @@ when NEWTPAD_TESTS {
 			base_em := plat.text_char_em(&t)
 			fmt.printfln("default Consolas char_em %.4f", base_em)
 			if base_em <= 0 {bad += 1}
+
+			// --- the chrome font is independent of the document font ---
+			//
+			// Font_Set.UI and .Doc have existed since the atlas was written, but
+			// text_load_faces put Consolas in both and nothing ever moved one
+			// without the other, so the separation was structural and untested.
+			// What batch 12 adds is the setting; what this asserts is the
+			// property that setting is FOR.
+			//
+			// Skipped rather than failed when Cascadia Mono is absent: it ships
+			// with Windows 11 and not with 10, and a machine without it is not a
+			// broken build. The skip says so out loud instead of passing quietly.
+			{
+				alt := "Cascadia Mono"
+				have := false
+				for f in plat.FONT_FAMILIES {
+					if f.name == alt && plat.font_family_available(f) {have = true}
+				}
+				if !have {
+					fmt.printfln("  SKIP   %s is not installed; chrome/document independence unchecked", alt)
+				} else {
+					ui_before := plat.text_char_em(&t, .UI)
+					doc_before := plat.text_char_em(&t, .Doc)
+					// Precondition: both sets start on the same family, so a test
+					// that "passes" before the split is doing nothing.
+					//
+					// char_em, not char_width: the width is rounded to a whole
+					// pixel, and Consolas at 0.5498 em and Cascadia Mono at
+					// 0.5859 BOTH land on 9px at 16px -- so measuring the width
+					// here made every one of these checks compare 9.000 to
+					// 9.000 and two of them failed for that reason alone.
+					fnt_chk(&bad, ui_before == doc_before, fmt.tprintf("both sets start on one family (ui em %.4f == doc em %.4f)", ui_before, doc_before))
+
+					plat.text_load_family(&t, alt, .Regular, .UI)
+					ui_alt := plat.text_char_em(&t, .UI)
+					doc_after := plat.text_char_em(&t, .Doc)
+					// The families must actually differ in advance, or the next
+					// assertion cannot fail whatever the code does.
+					fnt_chk(&bad, ui_alt != ui_before, fmt.tprintf("%s has a different advance from Consolas (em %.4f vs %.4f) -- or the next check is vacuous", alt, ui_alt, ui_before))
+					fnt_chk(&bad, doc_after == doc_before, fmt.tprintf("moving the CHROME font left the document alone (doc em %.4f, was %.4f)", doc_after, doc_before))
+
+					// And the other direction, which is the one the Font_Set
+					// comment is actually about: "choosing a document font
+					// cannot make the menus unreadable".
+					plat.text_load_family(&t, alt, .Regular, .Doc)
+					ui_final := plat.text_char_em(&t, .UI)
+					doc_final := plat.text_char_em(&t, .Doc)
+					fnt_chk(&bad, doc_final != doc_before, fmt.tprintf("moving the DOCUMENT font changed it (em %.4f, was %.4f)", doc_final, doc_before))
+					fnt_chk(&bad, ui_final == ui_alt, fmt.tprintf("...and left the chrome alone (ui em %.4f, was %.4f)", ui_final, ui_alt))
+
+					plat.text_load_family(&t, "Consolas", .Regular, .UI)
+					plat.text_load_family(&t, "Consolas", .Regular, .Doc)
+				}
+			}
 
 			fmt.println("--- curated families ---")
 			found := 0
@@ -1576,13 +1634,17 @@ when NEWTPAD_TESTS {
 				tab_width       = 3, // non-default and in range, so the whole-struct compare below can see it
 				font_family     = "Courier New",
 				font_style      = .Italic,
+				// Non-default and different from font_family, so the round-trip
+				// covers the chrome family AND cannot pass by the two being
+				// confused for one another in the save format's argument order.
+				ui_font_family  = "Cascadia Code",
 				split_frac      = 0.25, // non-zero, non-default, exact in binary float (survives %.4f round-trip)
 				theme_name      = "Light", // non-blank, non-default -- see the blank-normalises check below for ""
 			}
 			settings_save(w)
 			r := settings_load()
 			ok := r == w
-			fmt.printfln("round-trip: restore=%v wrap=%v font=%d zoom=%d family=%q style=%v  %s", r.restore_session, r.wrap_default, r.font_size, r.zoom_pct, r.font_family, r.font_style, "OK" if ok else "FAIL")
+			fmt.printfln("round-trip: restore=%v wrap=%v font=%d zoom=%d family=%q ui=%q style=%v  %s", r.restore_session, r.wrap_default, r.font_size, r.zoom_pct, r.font_family, r.ui_font_family, r.font_style, "OK" if ok else "FAIL")
 			if !ok {bad += 1}
 
 			// An empty family must normalise on the way out, not persist as blank —
