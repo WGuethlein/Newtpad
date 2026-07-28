@@ -10357,6 +10357,133 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad tabseamtest` compares the tab rail as DRAWN against the tab rail
+		// as HIT-TESTED, which is the one thing that was never checked while five
+		// separate walkers each computed their own x from MENU_W and stepped by
+		// TAB_W. They agreed because the width was a constant; the seam only exists
+		// once it is not.
+		//
+		// CLAUDE.md: "test the seam, not the unit -- compare what is DRAWN against
+		// what is CLICKABLE, at boundary sizes."
+		if os.args[1] == "tabseamtest" {
+			ts_run :: proc() -> int {
+				bad := 0
+				ts_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				a: App
+				win: plat.Window
+				win.dpi = 96
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				fmt.println("tabseamtest:")
+
+				// Boundary widths: one tab, a rail that exactly fits, one that
+				// overflows, and the narrow floor. A uniform-width bug hides at the
+				// comfortable size and shows at the edges.
+				for ntabs in ([]int{1, 3, 8}) {
+					for len(a.docs) < ntabs {app_new_scratch(&a, true)}
+					for width in ([]f32{320, 700, 1280, 2560}) {
+						win.width = i32(width)
+						L := tabs_layout(&a, &win, width)
+
+						// 1. No two drawn tabs overlap, and none crosses the limit --
+						// a tab drawn past it sits under the caption buttons, where a
+						// click sends HT_CLOSE and exits the app.
+						prev_end := f32(-1e9)
+						overlap, past := false, false
+						for r in L.tabs {
+							if !r.drawn {continue}
+							if r.x < prev_end {overlap = true}
+							if r.x + r.w > L.limit {past = true}
+							prev_end = r.x + r.w
+						}
+						ts_chk(&bad, !overlap, fmt.tprintf("%d tabs @ %.0f: drawn tabs do not overlap", ntabs, width))
+						ts_chk(&bad, !past, fmt.tprintf("%d tabs @ %.0f: no drawn tab crosses the caption limit", ntabs, width))
+
+						// 2. THE SEAM. Every pixel of a drawn tab must hit-test to that
+						// tab and no other -- sampled at both edges and the middle,
+						// because an off-by-one lives at an edge and nowhere else.
+						for r in L.tabs {
+							if !r.drawn {continue}
+							for px in ([]f32{r.x, r.x + r.w * 0.5, r.x + r.w - 1}) {
+								hit := -1
+								for q in L.tabs {
+									if q.drawn && px >= q.x && px < q.x + q.w {hit = q.slot}
+								}
+								if hit != r.slot {
+									ts_chk(&bad, false, fmt.tprintf("%d tabs @ %.0f: x=%.1f drawn as slot %d, hit-tests as %d", ntabs, width, px, r.slot, hit))
+								}
+							}
+						}
+
+						// 3. The close zone is inside its own tab. It used to be
+						// recomputed at the hit-test as `x + TAB_W - TAB_CLOSE_W`; if it
+						// ever drifts, clicking a tab's right edge closes its NEIGHBOUR.
+						for r in L.tabs {
+							if !r.drawn {continue}
+							ts_chk(&bad, r.close_x >= r.x && r.close_x + TAB_CLOSE_W <= r.x + r.w + 0.5, fmt.tprintf("%d tabs @ %.0f: slot %d close zone is inside its tab", ntabs, width, r.slot))
+						}
+
+						// 4. The reorder's index agrees with the hit-test. This is the
+						// walker that divided by a uniform width.
+						for r, i in L.tabs {
+							if !r.drawn {continue}
+							got := tabs_index_at(L, r.x + r.w * 0.5)
+							if got != i {
+								ts_chk(&bad, false, fmt.tprintf("%d tabs @ %.0f: centre of display index %d reorders to %d", ntabs, width, i, got))
+							}
+						}
+
+						// 5. The + button never overlaps a tab or the overflow count.
+						if L.plus_on {
+							clash := false
+							for r in L.tabs {
+								if r.drawn && L.plus_x < r.x + r.w && L.plus_x + PLUS_W > r.x {clash = true}
+							}
+							if L.over_on && L.plus_x + PLUS_W > L.over_x {clash = true}
+							ts_chk(&bad, !clash, fmt.tprintf("%d tabs @ %.0f: the + button clears the tabs and the overflow count", ntabs, width))
+						}
+					}
+				}
+				// tabs_index_at, on the case it exists for.
+				//
+				// Every check above runs against the real layout, where every tab
+				// is still TAB_W wide -- so the old `int(rel / (TAB_W + TAB_GAP))`
+				// division agrees with it and sabotaging check 4 does NOT fail.
+				// That is not the test being weak, it is the bug not being
+				// reachable yet: variable width arrives in the next task. Proving
+				// the procedure now, on a hand-built non-uniform layout, is what
+				// stops this landing untested and then being assumed covered.
+				{
+					synth := Tabs_Layout {
+						tabs = []Tab_Rect {
+							{slot = 0, x = 100, w = 132, drawn = true},
+							{slot = 1, x = 233, w = 220, drawn = true},
+							{slot = 2, x = 454, w = 150, drawn = true},
+						},
+					}
+					// A point inside each tab must recover that tab's index. The
+					// uniform division cannot do this: at x=560 it computes an
+					// index from a width no tab here has.
+					for r, i in synth.tabs {
+						got := tabs_index_at(synth, r.x + r.w * 0.5)
+						ts_chk(&bad, got == i, fmt.tprintf("non-uniform: centre of index %d (x=%.0f..%.0f) recovers %d", i, r.x, r.x + r.w, got))
+					}
+					// And the boundary between two differently-sized tabs lands on
+					// the right side of it.
+					ts_chk(&bad, tabs_index_at(synth, 231) == 0, "non-uniform: the last pixel of tab 0 (x=231, the tab spans 100..232) is tab 0")
+					ts_chk(&bad, tabs_index_at(synth, 233) == 1, "non-uniform: the first pixel of tab 1 is tab 1")
+				}
+				return bad
+			}
+			bad := ts_run()
+			fmt.printfln("tabseamtest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad scrollgrabtest` covers the one thing a scrollbar has to do and
 		// this one did not: hold still when you take hold of it.
 		//
