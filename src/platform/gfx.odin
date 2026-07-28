@@ -133,6 +133,58 @@ gfx_init_offscreen :: proc(width, height: i32) -> (gfx: Gfx, ok: bool) {
 	return gfx, true
 }
 
+// Read the offscreen render target back to the CPU, as BGRA8 rows.
+//
+// Offscreen ONLY -- there is deliberately no windowed path. This exists so a
+// headless mode can assert what the GPU actually produced instead of asserting
+// the arithmetic a shader was supposed to perform, which CLAUDE.md asks for
+// whenever the claim is about the GPU ("a real device over arithmetic"). The
+// rounded-rect pipeline is exactly that kind of claim: its antialiasing comes
+// from `fwidth`, a hardware derivative that no CPU-side reimplementation of the
+// distance function would exercise.
+//
+// Returns a freshly allocated [width*height*4] buffer the caller owns. A
+// STAGING copy is made per call rather than cached: this runs a handful of
+// times in a test mode, never in a frame.
+gfx_readback_bgra :: proc(gfx: ^Gfx, allocator := context.allocator) -> (pixels: []u8, ok: bool) {
+	if gfx.offscreen == nil {return nil, false}
+	desc := d3d.TEXTURE2D_DESC {
+		Width          = u32(gfx.width),
+		Height         = u32(gfx.height),
+		MipLevels      = 1,
+		ArraySize      = 1,
+		Format         = .B8G8R8A8_UNORM,
+		SampleDesc     = {Count = 1},
+		Usage          = .STAGING,
+		CPUAccessFlags = {.READ},
+	}
+	staging: ^d3d.ITexture2D
+	if hr := gfx.device->CreateTexture2D(&desc, nil, &staging); !win.SUCCEEDED(hr) {
+		fmt.eprintfln("CreateTexture2D(staging) failed: 0x%X", u32(hr))
+		return nil, false
+	}
+	defer staging->Release()
+	gfx.ctx->CopyResource((^d3d.IResource)(staging), (^d3d.IResource)(gfx.offscreen))
+
+	mapped: d3d.MAPPED_SUBRESOURCE
+	if hr := gfx.ctx->Map((^d3d.IResource)(staging), 0, .READ, {}, &mapped); !win.SUCCEEDED(hr) {
+		fmt.eprintfln("Map(staging) failed: 0x%X", u32(hr))
+		return nil, false
+	}
+	defer gfx.ctx->Unmap((^d3d.IResource)(staging), 0)
+
+	// RowPitch is the GPU's stride and is NOT width*4 in general -- it is padded
+	// to the driver's alignment. Copying the whole mapped block would shear the
+	// image; copy row by row.
+	out := make([]u8, int(gfx.width) * int(gfx.height) * 4, allocator)
+	src := ([^]u8)(mapped.pData)
+	row := int(gfx.width) * 4
+	for y in 0 ..< int(gfx.height) {
+		copy(out[y * row:][:row], src[y * int(mapped.RowPitch):][:row])
+	}
+	return out, true
+}
+
 // Release everything gfx_init / gfx_init_offscreen created, in reverse order.
 // The product leaks these deliberately (process exit reclaims them and the
 // teardown would only slow the exit), but a headless mode that creates and

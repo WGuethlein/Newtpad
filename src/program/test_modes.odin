@@ -10192,6 +10192,124 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad quadsdftest` renders quads on a REAL D3D11 device (offscreen, no
+		// window) and reads the pixels back. The claim it checks is about the GPU --
+		// the antialiasing comes from fwidth, a hardware derivative -- and CLAUDE.md
+		// asks for a real device over arithmetic exactly there. A CPU port of
+		// sd_round_box would agree with itself and prove nothing.
+		//
+		// The property that matters most is the boring one: a quad with radius 0 and
+		// softness 0, on integer bounds, must come out EXACTLY as it did before the
+		// distance field existed. Every piece of chrome in the app is that quad.
+		if os.args[1] == "quadsdftest" {
+			qs_run :: proc() -> int {
+				bad := 0
+				qs_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				W :: 64
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, W, W, "quadsdftest") {return 1}
+				defer headless_gpu_destroy(&h)
+
+				// BGRA8, so channel 2 is red and channel 3 is alpha.
+				//
+				// Coverage is read off the COLOUR channel, never off alpha: the frame
+				// is cleared to OPAQUE black, so every pixel comes back a=255 whether
+				// it was drawn over or not. A half-covered red quad over that clear
+				// reads r=128, which is the actual evidence of a soft edge.
+				px :: proc(buf: []u8, x, y: int) -> (b, g, r, a: u8) {
+					i := (y * W + x) * 4
+					return buf[i], buf[i + 1], buf[i + 2], buf[i + 3]
+				}
+				shot :: proc(h: ^Headless_Gpu, quads: []plat.Quad) -> []u8 {
+					plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+					plat.quads_draw(&h.gfx, &h.quads, quads)
+					buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if !ok {return nil}
+					return buf
+				}
+
+				fmt.println("quadsdftest:")
+
+				// 1. The zero value is a hard-edged rectangle.
+				{
+					buf := shot(&h, []plat.Quad{{pos = {16, 16}, size = {32, 32}, color = {1, 0, 0, 1}}})
+					qs_chk(&bad, buf != nil, "readback from the offscreen target")
+					if buf == nil {return bad}
+					_, _, r_in, a_in := px(buf, 32, 32)
+					_, _, r_out, _ := px(buf, 4, 4)
+					// The corner pixel of a SQUARE rect must be fully covered. This is
+					// the assertion that fails if a radius leaks in when none was asked
+					// for, which is the one regression that would touch every widget.
+					_, _, r_corner, a_corner := px(buf, 16, 16)
+					qs_chk(&bad, r_in == 255 && a_in == 255, fmt.tprintf("radius 0: interior is opaque (r=%d a=%d)", r_in, a_in))
+					qs_chk(&bad, r_out == 0, fmt.tprintf("radius 0: outside is untouched (r=%d)", r_out))
+					qs_chk(&bad, r_corner == 255 && a_corner == 255, fmt.tprintf("radius 0: the CORNER pixel is fully covered (r=%d a=%d)", r_corner, a_corner))
+					// Every pixel of the interior, not just the middle one: a shader
+					// that antialiased the whole face rather than its edge would pass
+					// a single-point check.
+					solid := true
+					sx_, sy_, sv_ := -1, -1, -1
+					for y in 17 ..< 47 {for x in 17 ..< 47 {
+						_, _, rr, _ := px(buf, x, y)
+						if rr != 255 && solid {solid = false;sx_, sy_, sv_ = x, y, int(rr)}
+					}}
+					qs_chk(&bad, solid, fmt.tprintf("radius 0: the whole interior is uniformly opaque (first bad px %d,%d = %d)", sx_, sy_, sv_))
+				}
+
+				// 2. A radius actually rounds, and only the corner.
+				{
+					buf := shot(&h, []plat.Quad{{pos = {16, 16}, size = {32, 32}, color = {1, 0, 0, 1}, radius = {10, 10, 10, 10}}})
+					if buf == nil {return bad + 1}
+					_, _, r_corner, _ := px(buf, 16, 16)
+					_, _, r_mid, _ := px(buf, 32, 32)
+					_, _, r_edge, _ := px(buf, 32, 17) // top edge, away from any corner
+					qs_chk(&bad, r_corner == 0, fmt.tprintf("radius 10: the corner pixel is cut away (r=%d)", r_corner))
+					qs_chk(&bad, r_mid == 255, fmt.tprintf("radius 10: the centre is still solid (r=%d)", r_mid))
+					qs_chk(&bad, r_edge == 255, fmt.tprintf("radius 10: a mid-edge pixel is untouched (r=%d)", r_edge))
+					// The rounding is ANTIALIASED, not stair-stepped: somewhere along
+					// the corner arc there is a partially covered pixel. A hard cut
+					// would pass the three checks above and look wrong on screen.
+					partial := false
+					for y in 16 ..< 27 {for x in 16 ..< 27 {
+						_, _, rr, _ := px(buf, x, y)
+						if rr > 8 && rr < 247 {partial = true}
+					}}
+					qs_chk(&bad, partial, "radius 10: the arc is antialiased, not stair-stepped")
+				}
+
+				// 3. Softness spreads beyond the rect -- the shadow case, one quad.
+				{
+					buf := shot(&h, []plat.Quad{{pos = {24, 24}, size = {16, 16}, color = {1, 1, 1, 1}, softness = 8}})
+					if buf == nil {return bad + 1}
+					_, _, r_out, _ := px(buf, 20, 32) // 4px OUTSIDE the left edge
+					_, _, r_far, _ := px(buf, 2, 32) // far outside: nothing
+					qs_chk(&bad, r_out > 0 && r_out < 255, fmt.tprintf("softness 8: the fill bleeds past the edge (r=%d)", r_out))
+					qs_chk(&bad, r_far == 0, fmt.tprintf("softness 8: it still falls off to nothing (r=%d)", r_far))
+				}
+
+				// 4. Alpha blends over what is already there. The pass bound NO blend
+				// state before this batch, so a translucent quad wrote its colour
+				// opaque; the SDF resolves its edge in alpha and cannot work that way.
+				{
+					buf := shot(&h, []plat.Quad {
+						{pos = {0, 0}, size = {64, 64}, color = {1, 0, 0, 1}},
+						{pos = {16, 16}, size = {32, 32}, color = {0, 0, 1, 0.5}},
+					})
+					if buf == nil {return bad + 1}
+					b, _, r, _ := px(buf, 32, 32)
+					qs_chk(&bad, r > 100 && r < 155 && b > 100 && b < 155, fmt.tprintf("a 50%% quad blends with what is under it (r=%d b=%d)", r, b))
+				}
+
+				return bad
+			}
+			bad := qs_run()
+			fmt.printfln("quadsdftest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad mdviewtest` covers the two markdown views as INPUT surfaces,
 		// which splittest (pure geometry) does not reach:
 		//

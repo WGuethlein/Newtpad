@@ -15,10 +15,22 @@ import dxc "vendor:directx/d3d_compiler"
 import win "core:sys/windows"
 
 // One instanced rectangle in pixel space. Plain data — safe to hand upward.
+//
+// `radius` and `softness` are ZERO-IS-DEFAULT deliberately: every existing
+// caller writes only pos/size/color, and a zero radius with zero softness must
+// draw exactly the hard-edged rectangle it always drew. quadsdftest asserts
+// that against a real device rather than trusting it.
+//
+// Rounded corners, hairlines, focus rings and panel shadows are all this one
+// shape with different parameters — the whole point of the signed-distance
+// form. No new geometry, no per-shape code, and still one draw call.
 Quad :: struct {
-	pos:   [2]f32, // top-left, pixels
-	size:  [2]f32, // width, height, pixels
-	color: [4]f32, // rgba, 0..1
+	pos:      [2]f32, // top-left, pixels
+	size:     [2]f32, // width, height, pixels
+	color:    [4]f32, // rgba, 0..1
+	radius:   [4]f32, // per corner: TL, TR, BR, BL. 0 = square
+	softness: f32, // 0 = a crisp antialiased edge; >0 = a shadow's blur radius
+	_pad:     [3]f32, // keep the instance 16-byte aligned
 }
 
 MAX_QUADS :: 4096
@@ -29,6 +41,13 @@ Quad_Pipeline :: struct {
 	layout:    ^d3d.IInputLayout,
 	instances: ^d3d.IBuffer, // dynamic; refilled each frame
 	constants: ^d3d.IBuffer, // screen size
+	// Straight alpha over the destination. The pass used to bind NO blend state
+	// at all ("opaque; don't inherit the text pass's blend"), which was fine
+	// while every edge was hard: a rect either covered a pixel or did not. The
+	// distance field resolves its edge IN alpha, so without blending every
+	// antialiased boundary would write its partial coverage as an opaque colour
+	// and the rounded corners would come out jagged and dark.
+	blend:     ^d3d.IBlendState,
 }
 
 @(private)
@@ -39,32 +58,92 @@ cbuffer Constants : register(b0) {
 };
 
 struct VSIn {
-	float2 ipos   : IPOS;
-	float2 isize  : ISIZE;
-	float4 icolor : ICOLOR;
-	uint   vid    : SV_VertexID;
+	float2 ipos    : IPOS;
+	float2 isize   : ISIZE;
+	float4 icolor  : ICOLOR;
+	float4 iradius : IRADIUS;
+	float  isoft   : ISOFT;
+	uint   vid     : SV_VertexID;
 };
 
 struct VSOut {
-	float4 pos   : SV_POSITION;
-	float4 color : COLOR;
+	float4 pos    : SV_POSITION;
+	float4 color  : COLOR;
+	float2 local  : LOCAL;   // position relative to the rect's centre, in pixels
+	float2 half_s : HALFSIZE;
+	float4 radius : RADIUS;
+	float  soft   : SOFT;
 };
 
 VSOut vs_main(VSIn i) {
 	// vid 0..3 -> corners (0,0)(1,0)(0,1)(1,1) drawn as a triangle strip.
 	float2 corner = float2(i.vid & 1, (i.vid >> 1) & 1);
-	float2 px = i.ipos + corner * i.isize;
+	// Grow the geometry by the blur radius. A shadow's falloff lies OUTSIDE the
+	// rectangle, and the pixel shader only runs where there is geometry -- so
+	// without this the distance field is evaluated correctly and then simply
+	// never sampled beyond the edge, and a shadow renders as nothing at all.
+	// Zero for every ordinary quad, which is why the expanded form costs the
+	// common case nothing.
+	float2 grow = float2(i.isoft, i.isoft);
+	float2 px = (i.ipos - grow) + corner * (i.isize + 2.0 * grow);
 	// Pixel space -> normalized device coords (y down to y up).
 	float2 ndc = float2(px.x / screen_size.x * 2.0 - 1.0,
 	                    1.0 - px.y / screen_size.y * 2.0);
 	VSOut o;
 	o.pos = float4(ndc, 0.0, 1.0);
 	o.color = i.icolor;
+	// The distance field is evaluated about the rect's centre, so the pixel
+	// shader needs the offset from it and the half extent. Both in pixels, so
+	// fwidth below is one screen pixel at any DPI without a scale uniform.
+	o.half_s = i.isize * 0.5;
+	o.local  = px - (i.ipos + o.half_s);
+	o.radius = i.iradius;
+	o.soft   = i.isoft;
 	return o;
 }
 
+// Signed distance to a rounded box: negative inside, zero on the edge.
+// The per-corner radius is selected by which quadrant the point falls in, so a
+// single instance can carry four different corners -- a tab pill rounded on top
+// and square along the bottom is one quad, not three.
+float sd_round_box(float2 p, float2 b, float4 r) {
+	float2 rr = (p.x > 0.0) ? r.yz : r.xw;   // right pair (TR,BR) : left pair (TL,BL)
+	float  cr = (p.y > 0.0) ? rr.y : rr.x;
+	cr = min(cr, min(b.x, b.y));             // a radius cannot exceed the half extent
+	float2 q = abs(p) - b + cr;
+	return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - cr;
+}
+
 float4 ps_main(VSOut i) : SV_TARGET {
-	return i.color;
+	// The plain rectangle takes no distance field at all.
+	//
+	// This is not an optimisation, it is the compatibility contract. fwidth-based
+	// AA ramps coverage over the last pixel or two INSIDE any edge, so running
+	// every quad through it would have softened the border of every existing
+	// piece of chrome -- measured at r=244 instead of 255 on the pixel just
+	// inside a hard edge. Nothing asked for that, and "radius 0, softness 0
+	// renders exactly what it always rendered" is the property that lets this
+	// change land under the whole UI at once. Uniform across an instance, so the
+	// branch costs a wavefront nothing.
+	if (i.soft <= 0.0 && dot(i.radius, float4(1, 1, 1, 1)) <= 0.0) {
+		return i.color;
+	}
+	float d = sd_round_box(i.local, i.half_s, i.radius);
+	float a;
+	if (i.soft > 0.0) {
+		// A shadow: widen the falloff instead of resolving an edge. One quad,
+		// no blur pass, no render target, no downsample.
+		a = 1.0 - smoothstep(-i.soft, i.soft, d);
+	} else {
+		// fwidth is the hardware derivative of the distance in screen space, so
+		// this is one pixel of gradient at 100% and at 200% alike -- the AA does
+		// not need to know the DPI. Guarded against zero, which happens where
+		// the field is flat (a fully interior pixel) and would make smoothstep
+		// undefined.
+		float aa = max(fwidth(d), 1e-5);
+		a = 1.0 - smoothstep(-aa, aa, d);
+	}
+	return float4(i.color.rgb, i.color.a * a);
 }
 `
 
@@ -95,6 +174,8 @@ quads_init :: proc(gfx: ^Gfx) -> (qp: Quad_Pipeline, ok: bool) {
 		{"IPOS", 0, .R32G32_FLOAT, 0, 0, .INSTANCE_DATA, 1},
 		{"ISIZE", 0, .R32G32_FLOAT, 0, 8, .INSTANCE_DATA, 1},
 		{"ICOLOR", 0, .R32G32B32A32_FLOAT, 0, 16, .INSTANCE_DATA, 1},
+		{"IRADIUS", 0, .R32G32B32A32_FLOAT, 0, 32, .INSTANCE_DATA, 1},
+		{"ISOFT", 0, .R32_FLOAT, 0, 48, .INSTANCE_DATA, 1},
 	}
 	if hr := gfx.device->CreateInputLayout(raw_data(layout[:]), u32(len(layout)), vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(), &qp.layout); !win.SUCCEEDED(hr) {
 		fmt.eprintln("CreateInputLayout failed")
@@ -109,6 +190,22 @@ quads_init :: proc(gfx: ^Gfx) -> (qp: Quad_Pipeline, ok: bool) {
 	}
 	if hr := gfx.device->CreateBuffer(&inst_desc, nil, &qp.instances); !win.SUCCEEDED(hr) {
 		fmt.eprintln("CreateBuffer(instances) failed")
+		return qp, false
+	}
+
+	bdesc: d3d.BLEND_DESC
+	bdesc.RenderTarget[0] = {
+		BlendEnable           = true,
+		SrcBlend              = .SRC_ALPHA,
+		DestBlend             = .INV_SRC_ALPHA,
+		BlendOp               = .ADD,
+		SrcBlendAlpha         = .ONE,
+		DestBlendAlpha        = .INV_SRC_ALPHA,
+		BlendOpAlpha          = .ADD,
+		RenderTargetWriteMask = u8(d3d.COLOR_WRITE_ENABLE_ALL),
+	}
+	if hr := gfx.device->CreateBlendState(&bdesc, &qp.blend); !win.SUCCEEDED(hr) {
+		fmt.eprintln("CreateBlendState failed")
 		return qp, false
 	}
 
@@ -152,7 +249,7 @@ quads_draw :: proc(gfx: ^Gfx, qp: ^Quad_Pipeline, quads: []Quad) {
 
 	stride := u32(size_of(Quad))
 	offset := u32(0)
-	ctx->OMSetBlendState(nil, nil, 0xFFFFFFFF) // opaque; don't inherit the text pass's blend
+	ctx->OMSetBlendState(qp.blend, nil, 0xFFFFFFFF) // straight alpha: the SDF resolves its edge in alpha
 	ctx->IASetInputLayout(qp.layout)
 	ctx->IASetPrimitiveTopology(.TRIANGLESTRIP)
 	ctx->IASetVertexBuffers(0, 1, &qp.instances, &stride, &offset)
