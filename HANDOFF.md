@@ -3372,8 +3372,38 @@ The focus-ring test also failed for the wrong reason first: `g_theme` is filled 
 product and is all-zero in a headless mode, so "is the ring drawn" answered no because every role was
 transparent black.
 
+### Wyatt's live pass on v0.22.0 (v0.22.1)
+
+*"13 looks good other than the tabs not actually being pills"*, then a screenshot, then the palette
+bug he had been chasing for days.
+
+- **The tabs were never pills.** `TAB_H_96` was written into the batch-12 plan and never into the
+  code, so a tab stayed `TAB_STRIP_H - sx(4)` — 36 tall in a 40 rail, hard against the bottom, rounded
+  on its top two corners. **The radius was drawing the whole time; the shape was the browser tab it had
+  always been.** Now 30 tall, centred with 5px above and below, rounded on all four, and `TAB_GAP` is
+  the specified 3 rather than 1 (at 1px the pills read as one bar).
+- **The orange line under the active tab was the focus ring escaping the rail.** It draws *outside* its
+  element, so an element flush against its container pushes it past — bottom edge at y=43 in a 40px
+  rail, painting over the menu bar. Wyatt read it as a highlighting bug, which is a fair reading of an
+  accent line where nothing is focused. It now clamps to its surface.
+- **The ring was lighting on every keystroke**, because it was gated on the platform's "last input was
+  a key" latch — and typing a character is a key. Focus is about where input is *going*, and a
+  character goes to the document.
+- **The palette drew its text on half pixels.** Its origin is `(width - w) / 2`; at the panel's maximum
+  width an odd window width put `x0` on a half pixel, so every glyph sampled between texels in the
+  alpha atlas and the run came out smeared. That is the whole reason it looked intermittent, and why
+  *"if i move the left edge of the window 1 pixel it goes to look normal"*. `snap()` now exists for
+  coordinates text is positioned from.
+
+**Two tests were passing on paths they never exercised.** The per-corner radius selection had only ever
+been checked with `{10,10,10,10}` — which a mapping returning one corner for all four would also pass —
+while the tab shipped a release on `{6,6,0,0}`. And `metricstest` now checks **both window-width
+parities**: testing one proves nothing about a bug whose entire shape is parity.
+
 ### Owed
 
+- **The palette's category and accelerator columns collide** (`CursorCtrl+Home`, `FileCtrl+Alt+S`) —
+  visible in Wyatt's screenshot and already named in UI spec §7. Batch 14.
 - **Nothing enforces the §5 drop order above the floor.** `WM_GETMINMAXINFO` stops the overlap, but
   status cells, the `+` and the menu bar do not yet drop in order as the window narrows — they simply
   stop being drawn when they no longer fit.
