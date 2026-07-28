@@ -633,6 +633,14 @@ main :: proc() {
 		//
 		// A fresh press only, exactly like the bottom: an in-progress selection
 		// drag that reaches the bar must keep auto-scrolling rather than dying.
+		// A click on a mode chip toggles it. Before the swallow below, which is
+		// what would otherwise eat the press -- and the chips are drawn to look
+		// pressable, so they have to be.
+		if window.mouse_pressed && doc.find.active {
+			if c := find_toggle_at(doc, f32(window.width), f32(window.mouse_x), f32(window.mouse_y)); c != .None {
+				command_dispatch(c, {}, &app, window, &text, rows)
+			}
+		}
 		if f32(window.mouse_y) >= CHROME_TOP && f32(window.mouse_y) < CONTENT_TOP + TOP_INSET {
 			if window.mouse_pressed || window.mouse_middle_pressed {
 				window.mouse_pressed = false
@@ -1470,18 +1478,13 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// regex is a hidden Ctrl+R state, there is no way to tell why a search is
 		// behaving oddly." Active ones take the accent fill, so the state is
 		// readable without hovering anything.
-		tw := sx(30)
-		tx := w - sx(12) - 3 * (tw + sx(4))
-		for t, i in ([]struct {
-			label: string,
-			on:    bool,
-		}{{"Aa", f.case_sens}, {"ab|", f.whole_word}, {".*", f.regex}}) {
-			bx := tx + f32(i) * (tw + sx(4))
+		tbuf: [3]Find_Toggle
+		for t in find_toggles(doc, w, tbuf[:]) {
 			if t.on {
-				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {bx, by + sx(7)}, size = {tw, row_h - sx(14)}, color = g_theme[.Accent], radius = {RADIUS_ROW, RADIUS_ROW, RADIUS_ROW, RADIUS_ROW}}})
+				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {t.x, by + sx(7)}, size = {t.w, row_h - sx(14)}, color = g_theme[.Accent], radius = {RADIUS_ROW, RADIUS_ROW, RADIUS_ROW, RADIUS_ROW}}})
 			}
 			lc := g_theme[.Bg_Base] if t.on else g_theme[.Text_Muted]
-			plat.text_draw(gfx, text, t.label, bx + (tw - f32(len(t.label)) * cw) * 0.5, fbase, UI_PX, lc)
+			plat.text_draw(gfx, text, t.label, t.x + (t.w - f32(len(t.label)) * cw) * 0.5, fbase, UI_PX, lc)
 		}
 
 		// The query, and the count beside it -- not in the status bar, "700

@@ -173,6 +173,9 @@ Search :: struct {
 	line_start: []int, // line start of each match, computed here (see below)
 	line_no:    []int, // 1-based line number of each match, counted in the same pass
 	count:      int, // atomic: how many entries are published
+	// The pattern would not compile. Atomic because the worker sets it and the
+	// UI thread reads it once a frame, exactly like `fault`.
+	bad_pattern: bool,
 	scanned:    int, // atomic: how far the scan has reached, for progress
 	// atomic: bytes the scans actually advanced over, ACCUMULATED across both
 	// passes. scanned is a position and a resume-from-zero would simply retrace
@@ -215,6 +218,50 @@ find_close :: proc(doc: ^Document) {
 }
 
 find_toggle_field :: proc(doc: ^Document) {doc.find.field = 1 - doc.find.field}
+// The find bar's three mode chips, as rects. ONE geometry, consumed by the draw
+// and by the click -- CLAUDE.md's rule, and the reason this exists at all: the
+// chips were computed inside render_frame, so they were drawn to look like
+// buttons and there was nothing to hit-test them against. A control that looks
+// pressable and is not is worse than one that was never drawn.
+Find_Toggle :: struct {
+	label:  string,
+	x, w:   f32,
+	on:     bool,
+	cmd:    Command_Id,
+}
+
+find_toggles :: proc(doc: ^Document, winw: f32, out: []Find_Toggle) -> []Find_Toggle {
+	if doc == nil || !doc.find.active || len(out) < 3 {return out[:0]}
+	f := &doc.find
+	tw := sx(30)
+	gap := sx(4)
+	x := winw - sx(12) - 3 * (tw + gap)
+	set := [3]Find_Toggle {
+		{"Aa", 0, tw, f.case_sens, .Find_Toggle_Case},
+		{"ab|", 0, tw, f.whole_word, .Find_Toggle_Word},
+		{".*", 0, tw, f.regex, .Find_Toggle_Regex},
+	}
+	for t, i in set {
+		out[i] = t
+		out[i].x = x + f32(i) * (tw + gap)
+	}
+	return out[:3]
+}
+
+// The chip a click at (mx, my) landed on, or .None. The bar occupies its own
+// strip at the top (doc_top_bar_h), and only the FIRST row carries the chips --
+// the replace row below has no controls of its own.
+find_toggle_at :: proc(doc: ^Document, winw, mx, my: f32) -> Command_Id {
+	if doc == nil || !doc.find.active {return .None}
+	row_h := sx(FIND_BAR_H_96)
+	if my < CHROME_TOP || my >= CHROME_TOP + row_h {return .None}
+	buf: [3]Find_Toggle
+	for t in find_toggles(doc, winw, buf[:]) {
+		if mx >= t.x && mx < t.x + t.w {return t.cmd}
+	}
+	return .None
+}
+
 find_toggle_regex :: proc(doc: ^Document) {doc.find.regex = !doc.find.regex;find_query_changed(doc)}
 find_toggle_case :: proc(doc: ^Document) {doc.find.case_sens = !doc.find.case_sens;find_query_changed(doc)}
 find_toggle_word :: proc(doc: ^Document) {doc.find.whole_word = !doc.find.whole_word;find_query_changed(doc)}
@@ -301,8 +348,12 @@ search_reset :: proc(doc: ^Document) {
 	intrinsics.atomic_store(&s.done, false)
 	intrinsics.atomic_store(&s.cancel, false)
 	intrinsics.atomic_store(&s.fault, false)
+	// Cleared with every other per-search flag. Left set, one bad pattern would
+	// mark every later search invalid -- including the corrected one the user
+	// just typed, which is the moment it matters most.
+	intrinsics.atomic_store(&s.bad_pattern, false)
 	intrinsics.atomic_store(&s.truncated, false)
-	s.at = {pos = 0, n = 0, last_nl = -1, nlines = 0} // scan from the top again
+	s.at = {pos = 0, n = 0, last_nl = -1, nlines = 0, prev = 0} // scan from the top again
 	s.total = doc.pt.length
 	s.regex = doc.find.regex
 	s.case_sens = doc.find.case_sens
@@ -502,6 +553,14 @@ find_swept :: proc(doc: ^Document) -> int {
 
 search_faulted :: proc(doc: ^Document) -> bool {
 	return intrinsics.atomic_load(&doc.search.fault)
+}
+
+// The regex would not compile. Only meaningful in regex mode, and only once
+// something has been typed -- a half-finished pattern is invalid on the way to
+// being valid, and calling that an error while the user is still typing would
+// paint the field red on almost every keystroke.
+search_bad_pattern :: proc(doc: ^Document) -> bool {
+	return doc.find.regex && len(doc.find.query) > 0 && intrinsics.atomic_load(&doc.search.bad_pattern)
 }
 
 // A background search worker is alive (or a restart is pending), so the main loop
@@ -731,8 +790,17 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 
 		// Recompiled per block: compilation scales with the pattern, not the
 		// file, so it stays negligible next to the scan itself.
-		it, err := regex.create_iterator(string(buf[:got]), string(s.query), {.Case_Insensitive}, context.temp_allocator, context.temp_allocator)
+		// Case-insensitivity used to be hardcoded here, so the Aa toggle did
+		// nothing in regex mode -- a toggle that is drawn, labelled and inert.
+		flags: regex.Flags
+		if !s.case_sens {flags += {.Case_Insensitive}}
+		it, err := regex.create_iterator(string(buf[:got]), string(s.query), flags, context.temp_allocator, context.temp_allocator)
 		if err != nil {
+			// Say so, rather than reporting "no matches" for a pattern that never
+			// compiled. Those two look identical from the find bar and mean
+			// completely different things: one is "your search found nothing",
+			// the other is "your search is not a search yet".
+			intrinsics.atomic_store(&s.bad_pattern, true)
 			ended = true // invalid pattern -> no matches, and none are coming
 			break scan
 		}
@@ -747,6 +815,29 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 				break
 			}
 			ms, me := cap.pos[0][0], cap.pos[0][1]
+			// Whole word, applied to the regex path as a post-filter rather than
+			// by wrapping the pattern in : the user's pattern is their own, and
+			// splicing anchors into it changes what alternation and anchoring mean
+			// ("a|b" becomes "a|b", which is not what anyone typed). Filtering
+			// the RESULT asks the same question the literal path asks, with the
+			// same is_word_byte, so both modes agree by construction.
+			if s.whole_word {
+				before: u8 = 0
+				if ms > 0 {before = buf[ms - 1]} else if pos > 0 {before = s.at.prev}
+				after: u8 = 0
+				if me < got {after = buf[me]}
+				if is_word_byte(before) || is_word_byte(after) {
+					// Advance the newline cursor past it anyway, or the line
+					// numbers of later matches in this block drift.
+					for ; c < ms; c += 1 {
+						if buf[c] == '\n' {
+							last_nl = pos + c
+							nlines += 1
+						}
+					}
+					continue
+				}
+			}
 			for ; c < ms; c += 1 {
 				if buf[c] == '\n' {
 					last_nl = pos + c
@@ -764,6 +855,7 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 				nlines += 1
 			}
 		}
+		if got > 0 {s.at.prev = buf[got - 1]} // carried for whole-word at a block's first byte
 		was := pos
 		pos += got
 		intrinsics.atomic_add(&s.swept, min(pos, L) - was) // see Search.swept
@@ -771,7 +863,7 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 		intrinsics.atomic_store(&s.scanned, min(pos, L))
 		mem.dynamic_arena_free_all(&arena)
 	}
-	s.at = {pos = pos, n = n, last_nl = last_nl, nlines = nlines}
+	s.at = {pos = pos, n = n, last_nl = last_nl, nlines = nlines, prev = s.at.prev}
 	if halted {return}
 	intrinsics.atomic_store(&s.count, n)
 	if ended || pos >= L {
@@ -1143,6 +1235,12 @@ find_status_info :: proc(doc: ^Document) -> string {
 	switch {
 	case len(f.query) == 0:
 		return ""
+	case search_bad_pattern(doc):
+		// UI spec 12: "Invalid regex is inline. The field's ring goes danger and
+		// the reason replaces the count. Never a dialog, never silent." An
+		// invalid pattern and a pattern with no matches look identical otherwise,
+		// and they mean entirely different things.
+		return " (invalid pattern)"
 	case len(f.matches) > 0:
 		// "+" marks a partial result: we stopped at the match limit, so there
 		// may be more further down the file.
