@@ -3687,6 +3687,30 @@ when NEWTPAD_TESTS {
 				}
 				doc_close(&doc)
 			}
+
+			// L10 (2026-07-29 review): `forced` (markdown.odin, right above the row
+			// loop) exempts only the very first row from the md_row_fits test above,
+			// so a pane too short for even one row still shows a clipped row instead
+			// of nothing -- "no frame ever shows emptiness" outranks the trim. The
+			// sweep above never reaches this: LEAD always puts three body rows ahead
+			// of the heading, so the first row admitted is never the one under test.
+			// Here the heading IS the first row, and ybot is pinned at ytop itself --
+			// tighter than any body row's ink, let alone a heading's -- so nothing
+			// but `forced` can admit it. Without `forced` this returns bottom == 0.
+			{
+				src := "# Hgjpqy\n"
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "forced.md", .UTF8)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ytop, 0)
+				hchk(
+					&bad,
+					bottom > 0,
+					fmt.tprintf("forced: a pane too short for its first row still advances past it (bottom=%d)", bottom),
+				)
+				doc_close(&doc)
+			}
 			return bad
 		}
 
@@ -3948,8 +3972,20 @@ when NEWTPAD_TESTS {
 		if os.args[1] == "tablereadonlytest" {
 			bad := 0
 			// 1. The exact guard condition in command_dispatch: doc.table && mutates.
+			//
+			// Item 2 (2026-07-29 regressions): this list, not just
+			// command_mutates_doc's own switch, is what pins membership --
+			// menutest's ro_menu_case enumerates THROUGH command_mutates_doc, so a
+			// reviewer who trims a case out of that switch (.Find_Replace_All was)
+			// makes menutest, mdviewtest and this test all agree with the broken
+			// classifier instead of catching it. Five entries added past .Paste for
+			// that reason: two find-bar mutators, the two encoding commands whose
+			// doc_set_line_ending rewrites the whole buffer, and History_Jump's
+			// apply_snapshot, which is the same whole-tree replacement .Undo/.Redo
+			// are. See command_mutates_doc's own comments for why each was missed.
 			mutating := []Command_Id {
 				.Backspace, .Delete_Fwd, .Delete_Word_Back, .Insert_Newline, .Insert_Tab, .Undo, .Redo, .Cut, .Paste,
+				.Find_Replace_One, .Find_Replace_All, .Eol_LF, .Eol_CRLF, .History_Jump,
 			}
 			for c in mutating {
 				if !command_mutates_doc(c) {
@@ -8169,6 +8205,17 @@ when NEWTPAD_TESTS {
 				{"log smb://server/share/a.txt:7 there", "smb://server/share/a.txt", 7, .Line_Ref},
 			}
 
+			// M4 (2026-07-29 review): '"' being a delimiter is not just a path-
+			// detection nicety (the "Quoted paths end at the quote" case above) --
+			// it is the only thing standing between link_follow's bare-reveal
+			// branch and argument injection into explorer.exe, since
+			// plat.explorer_select_arg quotes `abs` with no escaping (see the
+			// SECURITY NOTE on link_follow and the comment on explorer_select_arg
+			// itself). Pinned directly, independent of any path-detection case
+			// that happens to exercise it: relax is_delim to admit '"' later and
+			// this fails immediately instead of only showing up as a live exploit.
+			lk_chk(&bad, link_is_delim_for_test('"'), `M4. '"' is a link delimiter (explorer_select_arg's unescaped quoting depends on this)`)
+
 			fmt.println("--- detection ---")
 			for c in cases {
 				links := links_scan(c.text)
@@ -8814,11 +8861,27 @@ when NEWTPAD_TESTS {
 			// Item 5 (2026-07-29 regressions): Ctrl+click on a non-local target used
 			// to reach the generic "Could not resolve" branch and do nothing else.
 			// Now it skips resolution and routes straight to link_bare_reveal_target
-			// -> plat.shell_reveal, without a stat. plat.shell_reveal itself is not
-			// exercised here -- same reason shell_open_folder's ShellExecuteW call
-			// is not, above: it would pop a real Explorer window. What is exercised
-			// is the DECISION link_follow makes before it would call that, which is
-			// the part that can be wrong.
+			// -> plat.shell_reveal, without a stat.
+			//
+			// H1 (2026-07-29 review): assertions 1-3 below only ever exercised
+			// link_bare_reveal_target, the pure DECISION helper -- not link_follow,
+			// the consumer that is supposed to act on it. A reviewer deleted the
+			// entire bare-reveal branch from link_follow, rebuilt, and this whole
+			// mode still reported 0 failures, because nothing here called
+			// link_follow at all. Assertions 4-5 close that: they call link_follow
+			// itself and check plat.shell_reveal_count, so deleting the branch (or
+			// routing it through link_resolve instead, which refuses a UNC target
+			// without ever reaching shell_reveal -- see lk_non_local_never_stats
+			// above) leaves shell_reveal_count at 0 either way and both fail.
+			//
+			// plat.shell_reveal is silenced first via shell_reveal_set_silent, and
+			// plat.message_error is silenced via message_error_set_silent for the
+			// same reason shell_open_folder's ShellExecuteW call is untested above:
+			// a headless run has nobody to close the Explorer window a live
+			// ShellExecuteW would pop, or to dismiss the modal "Could not resolve"
+			// dialog a sabotaged build would show instead of reaching shell_reveal
+			// at all -- MessageBoxW blocks the thread until dismissed, so an
+			// unsilenced sabotage run would hang rather than print FAIL.
 			//
 			// Per the task brief: do not stat a real dead UNC path to verify
 			// anything. `\\localhost\newtpad_no_such_share_zz\...` is the same
@@ -8875,6 +8938,47 @@ when NEWTPAD_TESTS {
 				scheme := "run ms-msdt:/id PCWDiagnostic now"
 				sl := links_scan(scheme)
 				lk_chk(bad, len(sl) == 0, fmt.tprintf("3. a URI-scheme token is not detected as a link at all (got %d)", len(sl)))
+
+				// 4-5. link_follow itself, silenced so a real ShellExecuteW or a real
+				// MessageBoxW never runs -- see the header comment above this proc.
+				plat.shell_reveal_set_silent(true)
+				plat.message_error_set_silent(true)
+				defer plat.shell_reveal_set_silent(false)
+				defer plat.message_error_set_silent(false)
+
+				a: App
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+
+				// 4. link_follow on the UNC target reaches shell_reveal exactly once
+				//    and never reaches link_stat -- the seam H1 exists to close.
+				if len(ul) == 1 {
+					plat.shell_reveal_count = 0
+					link_stat_count = 0
+					link_follow(&a, nil, nil, &d, unc, ul[0])
+					lk_chk(
+						bad,
+						plat.shell_reveal_count == 1 && link_stat_count == 0,
+						fmt.tprintf(
+							"4. link_follow reaches shell_reveal for a UNC target without a stat (reveals=%d stats=%d)",
+							plat.shell_reveal_count,
+							link_stat_count,
+						),
+					)
+				}
+
+				// 5. link_follow on a local target never reaches shell_reveal at
+				//    all: it resolves and opens the tab, same as before item 5.
+				if len(ll) == 1 {
+					plat.shell_reveal_count = 0
+					link_follow(&a, nil, nil, &d, local, ll[0])
+					lk_chk(
+						bad,
+						plat.shell_reveal_count == 0,
+						fmt.tprintf("5. link_follow on a local target never reaches shell_reveal (reveals=%d)", plat.shell_reveal_count),
+					)
+				}
 			}
 			fmt.println("--- Ctrl+click on a non-local target reveals without resolving (item 5) ---")
 			lk_bare_reveal(&bad)
@@ -9232,7 +9336,7 @@ when NEWTPAD_TESTS {
 				gdoc.view_cols = 80
 				gdoc.view_rows = 5
 
-				gm := hscroll_model(&gdoc, &t, rows, 1000, cw)
+				gm := hscroll_model(&gdoc, &t, 1000, cw)
 				if gm.kind != .Columns {
 					fmt.printfln("  FAIL grid: hscroll kind is %v, want Columns", gm.kind)
 					bad += 1;grid_bad += 1
@@ -9264,7 +9368,7 @@ when NEWTPAD_TESTS {
 					// Thumb round-trip in column space.
 					for tc in ([]int{0, 1, gm.max / 2, gm.max}) {
 						gdoc.table_col = clamp(tc, 0, gm.max)
-						m2 := hscroll_model(&gdoc, &t, rows, 1000, cw)
+						m2 := hscroll_model(&gdoc, &t, 1000, cw)
 						b2 := hscrollbar_geo(&gdoc, 1000, 700, m2)
 						got := hscrollbar_pos_at(b2, b2.thumb_x, m2)
 						if got != gdoc.table_col {
@@ -9285,7 +9389,7 @@ when NEWTPAD_TESTS {
 				mdoc.view_rows = 5
 				for mode in ([]Md_Mode{.Preview, .Split}) {
 					mdoc.md_mode = mode
-					mm := hscroll_model(&mdoc, &t, rows, 1000, cw)
+					mm := hscroll_model(&mdoc, &t, 1000, cw)
 					if mm.kind != .None {
 						fmt.printfln("  FAIL markdown %v: hscroll kind is %v, want None", mode, mm.kind)
 						bad += 1;grid_bad += 1
@@ -9302,7 +9406,7 @@ when NEWTPAD_TESTS {
 				// asking, or this reads the unmeasured zero value instead of the
 				// 400-cell line's actual width.
 				doc_update_max_hscroll(&mdoc, &t, rows)
-				om := hscroll_model(&mdoc, &t, rows, 1000, cw)
+				om := hscroll_model(&mdoc, &t, 1000, cw)
 				if om.kind != .Cells {
 					fmt.printfln("  FAIL markdown Off: hscroll kind is %v, want Cells", om.kind)
 					bad += 1;grid_bad += 1
@@ -9390,7 +9494,7 @@ when NEWTPAD_TESTS {
 			maxhs := doc_update_max_hscroll(&doc, &t, rows)
 			for hs in ([]int{0, 40, 120, maxhs}) {
 				doc.h_scroll = clamp(hs, 0, maxhs)
-				hm := hscroll_model(&doc, &t, rows, 1000, cw)
+				hm := hscroll_model(&doc, &t, 1000, cw)
 				hb := hscrollbar_geo(&doc, 1000, 700, hm)
 				if !hb.shown {
 					fmt.println("  FAIL: scrollbar not shown though content overflows")

@@ -83,6 +83,12 @@ LINK_SCAN_CAP :: 4096
 
 // Characters that end a bare path or URL. Space is deliberately absent for
 // paths — see path_end below, where it is handled as a special case.
+//
+// `"` here is load-bearing beyond path detection: link_follow's bare-reveal
+// branch hands an unescaped path to plat.explorer_select_arg (see the
+// SECURITY NOTE on link_follow), which is only safe because a scanned token
+// can never contain a `"` -- which is to say, because of this line. See
+// link_is_delim_for_test below.
 @(private = "file")
 is_delim :: proc(b: u8) -> bool {
 	switch b {
@@ -91,6 +97,13 @@ is_delim :: proc(b: u8) -> bool {
 	}
 	return false
 }
+
+// Test-only mirror of is_delim, so linktest can pin the `"`-is-a-delimiter
+// dependency directly instead of relying on it as a side effect of an
+// unrelated path-detection case. Not gated behind NEWTPAD_TESTS: it is one
+// trivial forwarding call, and link_bare_reveal_target above is kept
+// ungated for the identical reason ("so the DECISION is testable").
+link_is_delim_for_test :: proc(b: u8) -> bool {return is_delim(b)}
 
 // Trailing bytes that are almost always sentence punctuation rather than part
 // of the target. `see http://example.com/x.` must not include the period.
@@ -848,15 +861,20 @@ link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, 
 // Should Ctrl+click on this link skip resolution entirely and reveal
 // directly, rather than going through link_resolve (which refuses a
 // non-local target outright, without a stat -- rule 3 at the top of this
-// file)? True only for a .Path/.Line_Ref link whose token names a target on
-// a UNC share or a mapped network drive.
+// file)? True whenever plat.path_is_local refuses the resolved absolute path
+// for a .Path/.Line_Ref link -- which is not just a UNC share or a mapped
+// network drive: path_is_local's own comment lists DRIVE_NO_ROOT_DIR (an
+// unmapped letter), DRIVE_UNKNOWN and DRIVE_CDROM as refused too, for their
+// own unrelated reasons (no volume to be confident about; possible spin-up
+// stall). So e.g. `Q:\anything` on an unmapped letter now routes here and
+// launches Explorer, where it used to say "Could not resolve" -- harmless
+// (rule 2 above, Explorer only navigates, never executes), but worth naming
+// correctly since a future reader may size the exposure from this comment.
 //
 // Pure: computes the same abs path link_resolve would, via link_target_path,
 // then asks plat.path_is_local -- a cached drive-type classification, never
 // a stat. Split out from link_follow so the DECISION is testable without
-// invoking the real shell (plat.shell_reveal is not exercised headlessly,
-// same reason shell_open_folder's ShellExecuteW call is not in linktest: it
-// would open a real Explorer window).
+// invoking the real shell.
 link_bare_reveal_target :: proc(doc: ^Document, text: string, l: Link) -> (abs: string, want: bool) {
 	if l.kind == .URL {return "", false}
 	raw := text[l.start:l.start + l.target_len]
@@ -910,6 +928,17 @@ link_bare_reveal_target :: proc(doc: ^Document, text: string, l: Link) -> (abs: 
 //   3. Reveal-not-execute is already the policy for every non-text target
 //      (link_activate below); this only removes the STAT that used to sit
 //      in front of that same policy for the non-local case.
+//   4. `abs` reaches plat.explorer_select_arg, which quotes it with plain
+//      concatenation and no escaping (see that proc's own comment in
+//      platform/file.odin) -- safe only because a filename containing `"`
+//      cannot exist on NTFS, and `abs` is built from document text rather
+//      than from something stat-confirmed to exist. The real guard is that a
+//      scanned path token can never contain a `"` in the first place: is_delim
+//      above lists it as a token boundary. UNDOCUMENTED DEPENDENCY, now
+//      pinned by a linktest assertion that `"` is a delimiter (M4, 2026-07-29
+//      review) -- relax is_delim later to support quoted paths with spaces
+//      and this concatenation becomes argument injection with no warning at
+//      either end.
 // Decoration stays off regardless of this change: we still cannot promise a
 // non-local target exists, only that asking Explorer to look is safe to do
 // unconditionally.
