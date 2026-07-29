@@ -7,10 +7,11 @@
 //
 // Line-based, deliberately: a block is classified from its own prefix and its
 // inline content is soft-wrapped to the pane. Consequences (v1): a paragraph's
-// hard line breaks show as breaks (adjacent lines are not joined); there is no
-// italic face loaded, so *italic* is shown as a tint, while **bold** is real via
-// a double-draw; inline code is coloured, not boxed; tables are cell-split but
-// not column-aligned across rows.
+// hard line breaks show as breaks (adjacent lines are not joined), and a link
+// inside a TABLE cell is not clickable (see the .Table case in md_layout_build).
+// Emphasis, inline code and tables are no longer among them -- batch 17 loaded
+// real bold and italic body faces, put a rounded Md_Code_Bg box behind an inline
+// code span, and md_table_ensure aligns a table's columns across its rows.
 package main
 
 import "core:fmt"
@@ -752,7 +753,15 @@ Md_Metrics :: struct {
 	body:         f32, // 1.00 S
 	code:         f32, // 0.92 S -- inline and fenced
 	table:        f32, // 0.95 S
-	caption:      f32, // 0.88 S
+	// 0.88 S. RESERVED, and deliberately still computed: 9.3 gives the preview a
+	// caption row, but every construct that would use one -- image captions,
+	// table captions, footnote text -- is in 9.2's unimplemented list, so nothing
+	// reads this today. Kept because the row is part of the type scale and the
+	// metrics test asserts the whole scale is round(k * S) in one place; dropping
+	// it would mean re-deriving 0.88 S at whichever draw site first needs it,
+	// which is the ratio-at-a-draw-site this struct's header forbids. Marked
+	// rather than deleted so "nothing reads it" reads as a decision (L6).
+	caption:      f32,
 	// Requested leading for body prose (1.65 S). NOT the leading you get: a face
 	// whose ascent + descent exceeds it is clamped up per line by the shaper, and
 	// Georgia's is 1.136 em, so this is a floor. Read Shaped.line_h /
@@ -784,6 +793,40 @@ Md_Metrics :: struct {
 	// own definition, and the only one that makes "72ch" mean a column of 72
 	// characters in a proportional face.
 	measure:      f32,
+	// Not type at all: the two globals a block's layout also depends on, sampled
+	// ONCE per pass here because this struct is already the thing md_pass builds
+	// once and hands to every block. Both are cache-key terms (see
+	// MD_LAYOUT_SLOTS); nothing draws with them.
+	ui_scale:     f32,
+	theme:        u64,
+}
+
+// The theme's identity as one number, for the layout cache key.
+//
+// A HASH of g_theme rather than a generation counter bumped at each assignment
+// site. The global is assigned from main.odin's startup, the Settings theme
+// cycle, theme_edit_current, theme_reapply_if_active and a dozen test modes, and
+// "every future assignment remembers to bump the counter" is exactly the promise
+// CLAUDE.md's one-producer rule exists to stop making -- a missed site is a
+// silent stale-colour bug, not a compile error.
+//
+// It also makes the test honest. A probe switches themes by assigning g_theme,
+// which is what the reviewer's probe did and what every existing themetest does;
+// under a counter the probe would have to bump the counter itself, and would
+// then be asserting that the cache reads a number the test just set rather than
+// that a theme switch invalidates.
+//
+// 40 roles x 4 channels, once per md_pass (at most three passes a frame): 160
+// multiply-xors against a pass that shapes text.
+@(private = "file")
+md_theme_gen :: proc() -> u64 {
+	h := u64(0xcbf29ce484222325) // FNV-1a
+	for role in g_theme {
+		for c in role {
+			h = (h ~ u64(transmute(u32)c)) * 0x100000001b3
+		}
+	}
+	return h
 }
 
 // round(k * S), floored at 1 so a degenerate S cannot produce a 0 px face.
@@ -817,6 +860,7 @@ md_metrics :: proc(t: ^plat.Text, s: f32) -> (m: Md_Metrics) {
 	m.task_box = sx(14)
 	m.pad_left = sx(40)
 	m.measure = 72 * plat.text_advance(nil, t, '0', m.body, .Body)
+	m.ui_scale, m.theme = UI_SCALE, md_theme_gen()
 	return
 }
 
@@ -1593,9 +1637,20 @@ md_fence_seed :: proc(doc: ^Document, top_byte: int) -> (in_fence: bool, fence_l
 // The start byte is the block's identity and does not move when the viewport
 // does.
 //
+// The start byte alone is NOT a sufficient identity, and this is the non-obvious
+// part. Two blocks cannot share a start byte -- but the same start byte can name
+// a block whose EXTENT changed while its stripped source text did not. md_pass
+// strips the trailing `\r` before handing `line` to the key, so a CRLF -> LF
+// conversion leaves every `src` byte-identical while every `end`/`next` shifts.
+// A hit then resumes the pass one byte late per converted line, and the next
+// block renders with its first character eaten. Hence `end` in the key: the
+// caller already has it from pt_line_end_cap, so it costs one compare.
+//
 // The rest of the key is everything a block's layout is a function of:
 //
 //	start        the block's first byte -- its identity
+//	end          its LAST byte, so a line whose raw length changed but whose
+//	             stripped text did not (CRLF <-> LF) misses. See above.
 //	src          its own source text, held as an OWNED copy. This is what makes
 //	             invalidation PER-BLOCK on edit: nothing here consults
 //	             doc.revision, so editing one line leaves every other block's
@@ -1604,6 +1659,16 @@ md_fence_seed :: proc(doc: ^Document, top_byte: int) -> (in_fence: bool, fence_l
 //	             not a property of this comparison.)
 //	measure      the column it was broken to -- "pane width"
 //	px           the base size S -- "zoom"
+//	ui_scale     the DPI scale. `indent` bakes sx()-scaled insets (a fence's 12px
+//	             pad, a list's 24px per level, a quote's 16px), and when the pane
+//	             is wide enough for the 72ch cap to bind, `measure` is a function
+//	             of S alone -- so a monitor change with no window-size change
+//	             moves every inset while nothing else in the key moves.
+//	theme        the palette the spans' colours were BAKED from. Md_Span.color is
+//	             resolved at build time now (the old code called md_run_color per
+//	             draw), so without this a theme switch leaves warm-white body text
+//	             and amber headings on a light background until the entries are
+//	             evicted. See md_theme_gen for why it is a hash and not a counter.
 //	fence in/out the lexer state it was coloured under; the SAME line is prose or
 //	             code depending on it, so it is part of the key and not a result
 //	revision     for kinds whose layout depends on bytes OUTSIDE their own src:
@@ -1613,8 +1678,9 @@ md_fence_seed :: proc(doc: ^Document, top_byte: int) -> (in_fence: bool, fence_l
 //	             their own text, so they take the coarse key; everything that
 //	             carries real shaping work takes the fine one.
 //
-// A resize changes `measure` and a zoom changes `px`, so both invalidate every
-// entry wholesale without a sweep -- every lookup simply misses.
+// A resize changes `measure`, a zoom changes `px`, a monitor change `ui_scale`
+// and a theme switch `theme`, so each invalidates every entry wholesale without
+// a sweep -- every lookup simply misses.
 MD_LAYOUT_SLOTS :: 128
 
 // The longest run of blank lines collapsed into one Blank block. Blank runs
@@ -1673,8 +1739,10 @@ Md_Layout :: struct {
 	fence_state: base.Lex_State,
 	measure:     f32,
 	px:          f32,
+	ui_scale:    f32, // sx()'s scale: `indent` is baked from it
+	theme:       u64, // md_theme_gen: the palette every span colour was baked from
 	revision:    u64, // consulted only for the kinds md_layout_extern_dep names
-	// --- the value ---
+	// --- the value, except `end` which is BOTH (see MD_LAYOUT_SLOTS) ---
 	end:         int, // what the pass reports as `bottom` after this block
 	next:        int, // where the pass continues from
 	cls:         Md_Class, // .content / .bullet slice into `src`
@@ -1692,6 +1760,12 @@ Md_Layout :: struct {
 	above:       f32, // 9.3's space above; adjacent margins COLLAPSE (see md_pass)
 	below:       f32, // 9.3's space below
 	indent:      f32, // the block's left inset from the content origin
+	// Where the block's MARKER goes, as an inset from the content origin: a list
+	// bullet or checkbox sits left of the prose, so it is not `indent`. Produced
+	// here for the same reason `indent` is -- md_block_draw used to re-derive it
+	// as `cx + level * m.list_indent`, a second expression that had to agree with
+	// the one this file computes two lines above.
+	marker:      f32,
 	out_fence:   bool,
 	out_lex:     Lexer_Proc,
 	out_state:   base.Lex_State,
@@ -1839,6 +1913,7 @@ md_layout_build :: proc(
 	e.src = strings.clone(line)
 	e.in_fence, e.fence_lex, e.fence_state = in_fence, fence_lex, fence_state
 	e.measure, e.px, e.revision = measure, m.s, doc.revision
+	e.ui_scale, e.theme = m.ui_scale, m.theme
 	e.out_fence, e.out_lex, e.out_state = in_fence, fence_lex, fence_state
 
 	trimmed := strings.trim_left(e.src, " \t")
@@ -1897,6 +1972,26 @@ md_layout_build :: proc(
 		// Tables keep the cell machinery: 9.3 puts them on the mono face
 		// precisely so their columns align, and column widths are a property of
 		// the whole block (md_table_ensure), not of one row.
+		//
+		// DISCLOSED REGRESSION, not an oversight: returning here means `spans`
+		// and `boxes` stay nil, so md_block_links emits nothing and a link inside
+		// a table cell is not clickable. The old preview's links_layout scanned
+		// every raw source line whatever its kind, so it was. Fenced code lost the
+		// same thing (see md_split_bare_links and the fence-body branch below) and
+		// that one is arguably right -- code should not be clickable -- but a link
+		// in a table cell is an ordinary thing to write and this is a loss.
+		//
+		// Not fixed here because it cannot be done without a SECOND producer of
+		// table cell geometry, which is the one defect this whole batch exists to
+		// remove. A row's glyphs are placed by md_draw_table_row from character
+		// CELLS (md_col_x over md_table_ensure's column widths, plus the alignment
+		// pad); the span boxes every other kind's link rects come from are the
+		// shaper's. Emitting link rects for a table today means re-deriving a
+		// cell's sub-string x in cell arithmetic and hoping it agrees with what
+		// text_draw actually advanced -- which is precisely "a correct function fed
+		// the wrong input" (CLAUDE.md, HANDOFF 6j). The honest fix is to route a
+		// table row through shape_spans with per-column origins so the columns and
+		// the links share the shaper's output, and that is its own task.
 		e.h = line_height(m.table)
 		return
 	case .Fence_Body:
@@ -1921,6 +2016,10 @@ md_layout_build :: proc(
 		e.above, e.below = m.quote_above, m.quote_below
 	case .List:
 		e.indent = f32(e.cls.level) * m.list_indent
+		// The bullet / checkbox sits at the item's nesting depth; the PROSE is
+		// indented one step further. Both come out of here, so md_block_draw has
+		// no expression of its own to keep in step (2026-07-29 review, L2).
+		e.marker = e.indent
 		e.below = m.list_gap
 		if e.cls.task {
 			e.indent += m.task_box + m.list_indent * 0.25
@@ -1964,13 +2063,28 @@ md_layout_build :: proc(
 			if len(run.text) == 0 {continue}
 			st := md_run_styles(run)
 			if e.cls.kind == .Heading {st += {.Bold}} // 9.3: weight 700, every level
+			col := md_run_color(run, base_col, mute)
+			// A heading keeps its OWN colour through emphasis (2026-07-29 review,
+			// L7). md_run_color repaints a bold run Text_Bright and an italic run
+			// Md_Italic, which is the exact base-colour override batch 17 removed
+			// from headings -- it survived in this sub-case because the run is
+			// handed to md_run_color unmodified, so `run.bold` still wins over the
+			// Md_Heading base. Deliberate, not incidental: a heading is already at
+			// weight 700 at every level, so `**bold**` inside one has no face
+			// change left to make and the colour was carrying emphasis on its own,
+			// which is the "colour alone" the UI spec's item 18 rejects. Browsers
+			// do the same -- <strong> inside <h1> inherits the heading's colour and
+			// its weight. Code, links and strikethrough still override, because
+			// each of those is saying something a heading is not: a code face, an
+			// affordance, a deletion.
+			if e.cls.kind == .Heading && !run.code && !run.link && !run.strike {col = base_col}
 			off := strings.builder_len(sb)
 			strings.write_string(&sb, run.text)
 			d := Md_Draft_Span {
 				off   = off,
 				len   = len(run.text),
 				style = st,
-				color = md_run_color(run, base_col, mute),
+				color = col,
 				px    = m.code if .Code in st else px,
 				set   = md_run_set(t, st),
 			}
@@ -2035,11 +2149,14 @@ md_layout_ensure :: proc(
 	if doc.md_layout == nil {doc.md_layout = make([]Md_Layout, MD_LAYOUT_SLOTS)}
 	for &e in doc.md_layout {
 		if !e.valid || e.start != p {continue}
-		if e.measure != measure || e.px != m.s {continue}
+		if e.measure != measure || e.px != m.s || e.ui_scale != m.ui_scale || e.theme != m.theme {continue}
 		if e.in_fence != in_fence || e.fence_lex != fence_lex || e.fence_state != fence_state {continue}
 		if md_layout_extern_dep(e.cls.kind) {
 			if e.revision != doc.revision {continue}
-		} else if e.src != line {
+		} else if e.src != line || e.end != line_end {
+			// `e.end != line_end` is NOT redundant with `e.src != line`: md_pass
+			// strips the trailing \r, so a CRLF -> LF conversion leaves `src`
+			// identical and every extent one byte shorter. See MD_LAYOUT_SLOTS.
 			continue
 		}
 		e.used = md_layout_pass
@@ -2053,7 +2170,7 @@ md_layout_ensure :: proc(
 }
 
 // The slot a new layout goes in: an empty one, else the LEAST RECENTLY USED
-// entry, and never one this pass has already touched.
+// entry.
 //
 // Round-robin -- what md_table_ensure's four slots use, and what this started
 // as -- has a hole that only shows once the table is full of entries from
@@ -2065,16 +2182,25 @@ md_layout_ensure :: proc(
 // landed on. LRU picks a stale entry from an old width or zoom instead, which
 // is exactly what should go.
 //
+// LRU is the WHOLE fix, and that is worth stating because this procedure used to
+// carry a second one -- an explicit `e.used == md_layout_pass {continue}` guard,
+// commented as what kept a live entry from being evicted. Under LRU it can never
+// select one: `used` is stamped with the current pass id on every hit and every
+// build, so a live entry holds the MAXIMUM `used` in the table and is chosen only
+// when every entry is live -- in which case the guard skips them all and the
+// `max(best, 0)` fallback returns slot 0, which is exactly where the unguarded
+// scan lands too. It was dead code crediting itself with the fix (2026-07-29
+// review, L1).
+//
 // If every slot was used by this pass -- a viewport with more than
 // MD_LAYOUT_SLOTS blocks in it -- there is nothing evictable that is not also
-// needed, and it falls back to slot 0. That thrashes, bounded and correctly;
-// the fix if it ever matters is more slots, not a cleverer policy.
+// needed, and slot 0 goes. That thrashes, bounded and correctly; the fix if it
+// ever matters is more slots, not a cleverer policy.
 @(private = "file")
 md_layout_slot :: proc(doc: ^Document) -> ^Md_Layout {
 	best := -1
 	for &e, i in doc.md_layout {
 		if !e.valid {return &e}
-		if e.used == md_layout_pass {continue}
 		if best < 0 || e.used < doc.md_layout[best].used {best = i}
 	}
 	return &doc.md_layout[max(best, 0)]
@@ -2302,12 +2428,16 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop}, size = {x1 - cx, lay.h}, color = g_theme[.Md_Code_Bg]}})
 	case .Quote:
 		// One bar per nesting level (9.2 item 7: "2px bar + 16px inset per
-		// level"), so a reply inside a reply is visibly deeper.
+		// level"), so a reply inside a reply is visibly deeper. The step comes
+		// out of the block's own indent rather than from m.quote_inset again --
+		// the layout set indent = level * quote_inset, so dividing it back is the
+		// same number by construction and cannot drift from it (L2).
+		step := lay.indent / f32(max(1, lay.cls.level))
 		for d in 0 ..< lay.cls.level {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * m.quote_inset, ytop}, size = {max(sx(2), 2), lay.h}, color = g_theme[.Md_Quote]}})
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(sx(2), 2), lay.h}, color = g_theme[.Md_Quote]}})
 		}
 	case .List:
-		lx := cx + f32(lay.cls.level) * m.list_indent
+		lx := cx + lay.marker // md_layout_build's own number, not a second copy
 		if lay.cls.task {
 			// A real box, not literal brackets, and the TICK carries the state as
 			// well as the tone -- never colour alone (UI spec 18).
