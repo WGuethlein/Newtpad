@@ -3422,6 +3422,127 @@ when NEWTPAD_TESTS {
 					// too-generous scan.
 					ab, ag, ar, _ := sample(buf, W, int(x0) + 50, int(rule_y) - 6)
 					dchk(&bad, !near(g_theme[.Md_Rule], ab, ag, ar, 10), "front matter: 6px above that row is NOT the rule (bound is tight, not a scan)")
+
+					// --- item 3 (2026-07-29): the `---` delimiters are BACK,
+					// as muted text ON the card ---
+					//
+					// Wyatt described the pre-batch rendering as "i see the
+					// start and end ---" and the card removed them without
+					// asking. They are restored as text rather than as the
+					// Md_Rule horizontal rules that made the block read as two
+					// separate lines, which is the thing the card fixed. So
+					// three properties, and each one rejects a different way of
+					// getting this wrong:
+					//
+					//   (a) there is INK on the opening and the closing
+					//       delimiter rows -- rejects "the rows were dropped
+					//       again" (the sabotage);
+					//   (b) the closing row sits on the CARD's surface --
+					//       rejects a card height that did not grow with the two
+					//       new rows, i.e. the two-producers defect md_fm_height
+					//       and md_draw_front_matter were split to prevent;
+					//   (c) no long horizontal run of Md_Rule inside the card --
+					//       rejects "restored them, but as rules again", which
+					//       would satisfy (a) and (b) on its own.
+					//
+					// Peak-sampled against the CARD, not Bg_Base: the ink sits
+					// on Md_Code_Bg here, and the pixel farthest from the
+					// surface it is drawn on is the one nearest full glyph
+					// coverage.
+					fm_peak :: proc(buf: []u8, gx0, gx1, gy0, gy1, W, H: int) -> (dist: int, b, g, r: u8) {
+						surf := g_theme[.Md_Code_Bg]
+						dist = -1
+						for yy in max(0, gy0) ..< min(H, gy1) {
+							for xx in max(0, gx0) ..< min(W, gx1) {
+								bb, gg, rr, _ := sample(buf, W, xx, yy)
+								d :=
+									abs(int(bb) - int(surf[2] * 255)) +
+									abs(int(gg) - int(surf[1] * 255)) +
+									abs(int(rr) - int(surf[0] * 255))
+								if d > dist {dist, b, g, r = d, bb, gg, rr}
+							}
+						}
+						return
+					}
+					pad := md_fm_pad()
+					card_top := ytop
+					card_bot := ytop + md_fm_height(line_h, fm_inner)
+					// Row 0 is the opening `---`, then the fixture's two
+					// key/value lines, then the closing `---`: `fm_inner + 1`
+					// rows down.
+					//
+					// Written as `fm_inner + 1` and NOT as `md_fm_rows(..) - 1`
+					// deliberately. Through md_fm_rows this is self-cancelling
+					// and was MEASURED to be: dropping the `+ 2` from
+					// md_fm_rows shrinks the card AND moves this expectation up
+					// with it by exactly the same amount, so the "inside the
+					// card" check below passed against a card two rows too
+					// short. Stating the row index makes the card the only
+					// thing that can move.
+					open_base := card_top + pad + px_
+					close_base := open_base + f32(fm_inner + 1) * line_h
+					dx0, dx1 := int(x0 + char_w) + 1, int(x0 + char_w * 4)
+					for c in ([]struct {
+						base: f32,
+						what: string,
+					}{{open_base, "opening"}, {close_base, "closing"}}) {
+						d, db, dg, dr := fm_peak(buf, dx0, dx1, int(c.base - px_ * 0.9), int(c.base + px_ * 0.15), W, H)
+						// The full separation between Text_Muted and
+						// Md_Code_Bg in Dark, summed over three channels, is
+						// ~319, and the hyphen's interior MEASURES 320 -- it
+						// reaches full coverage. 150 is therefore not a
+						// generous bound picked to be safe, it is under half of
+						// what a drawn delimiter actually produces, and the
+						// card's own bare surface scores 0.
+						dchk(
+							&bad, d >= 150,
+							fmt.tprintf("front matter: the %s `---` is drawn on the card (peak distance from the card surface %d, bgr %d,%d,%d)", c.what, d, db, dg, dr),
+						)
+						// ...and in the muted tier, not some other role's
+						// colour. The measured peak is bgr 132,146,157 --
+						// Text_Muted's #9D9284 EXACTLY -- so 12 is slack for a
+						// different face's hinting, not room for a different
+						// colour. Text_Primary, Md_Rule and Md_Code are all far
+						// outside it.
+						dchk(
+							&bad, near(g_theme[.Text_Muted], db, dg, dr, 12),
+							fmt.tprintf("front matter: the %s `---` is muted text (bgr %d,%d,%d)", c.what, db, dg, dr),
+						)
+					}
+					// (b): the card really covers the closing row. Sampled well
+					// to the RIGHT of the three hyphens, so this is the card's
+					// bare surface and not glyph ink. With the pre-item-3 height
+					// (inner rows only) this y is past the card's bottom edge and
+					// reads Bg_Base.
+					sb, sg, sr, _ := sample(buf, W, int(x0) + 300, int(close_base - px_ * 0.5))
+					dchk(
+						&bad, near(g_theme[.Md_Code_Bg], sb, sg, sr, 3),
+						fmt.tprintf("front matter: the closing `---` row is INSIDE the card (surface at y=%.0f is bgr %d,%d,%d)", close_base - px_ * 0.5, sb, sg, sr),
+					)
+					// (c): no rule inside the card. A run, not a pixel count --
+					// an antialiased glyph edge blends card -> Text_Muted and
+					// passes through Md_Rule's neighbourhood on the way, so
+					// "any Md_Rule pixel" would be a false positive. A real
+					// Md_Rule row here is the full content width; the widest
+					// thing the three hyphens can produce is ~3 cells.
+					worst_run := 0
+					for yy in int(card_top) ..< min(H, int(card_bot)) {
+						run := 0
+						for xx in int(x0) + 1 ..< min(W, int(x1) - 1) {
+							rb2, rg2, rr2, _ := sample(buf, W, xx, yy)
+							if near(g_theme[.Md_Rule], rb2, rg2, rr2, 6) {
+								run += 1
+								worst_run = max(worst_run, run)
+							} else {run = 0}
+						}
+					}
+					// Measured with the fix in place: 1px. 60 leaves room for a
+					// face whose hyphen antialiases wider, and is still 14x
+					// short of the full-width run a restored Md_Rule would give.
+					dchk(
+						&bad, worst_run < 60,
+						fmt.tprintf("front matter: no Md_Rule spans the card (longest Md_Rule-coloured run inside it: %dpx of %.0f)", worst_run, x1 - x0),
+					)
 				}
 
 				// The p==0 gate: scrolled to start exactly at the front matter's

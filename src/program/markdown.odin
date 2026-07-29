@@ -119,6 +119,11 @@ md_selftest :: proc() -> (bad: int) {
 		defer g_theme = old_theme
 		g_theme = theme_dark()
 		x0, x1, ytop, line_h := f32(40), f32(600), f32(100), f32(20)
+		// The delimiters are ROWS again (item 3, 2026-07-29). Stated as a
+		// number here so the card's height and md_draw_front_matter's row walk
+		// cannot both drop them and still agree with each other.
+		chk(&bad, md_fm_rows(0) == 2, fmt.tprintf("an empty front-matter block still draws its two `---` rows (%d)", md_fm_rows(0)))
+		chk(&bad, md_fm_rows(3) == 5, fmt.tprintf("3 key/value lines -> 5 rows, the two delimiters included (%d)", md_fm_rows(3)))
 		for inner in ([]int{1, 4, 12}) {
 			q: [MD_FM_MAX_LINES + 2]plat.Quad
 			n := md_front_matter_quads(x0, x1, ytop, line_h, inner, q[:])
@@ -131,9 +136,17 @@ md_selftest :: proc() -> (bad: int) {
 			chk(&bad, rules == 0, fmt.tprintf("%d-line front matter -> no Md_Rule quad (%d)", inner, rules))
 			chk(&bad, q[0].color == g_theme[.Md_Code_Bg], fmt.tprintf("%d-line front matter -> the card is Md_Code_Bg", inner))
 			// It spans the block, not one row: the panel must cover every inner
-			// line's row, plus an inset above the first and below the last.
+			// line's row, the TWO DELIMITER rows (item 3, 2026-07-29 -- the
+			// `---` lines are drawn as muted text on the card now, so they take
+			// rows the card has to cover), plus an inset above the first and
+			// below the last.
+			//
+			// Written out as `inner + 2` rather than through md_fm_rows on
+			// purpose: this is the arithmetic the test STATES, so dropping the
+			// delimiter rows from md_fm_rows fails here instead of quietly
+			// moving both sides together.
 			pad := md_fm_pad()
-			want_h := f32(inner) * line_h + pad * 2
+			want_h := f32(inner + 2) * line_h + pad * 2
 			chk(&bad, pad > 0 && q[0].size.y == want_h, fmt.tprintf("%d-line front matter -> card covers the block + inset (%.1f == %.1f)", inner, q[0].size.y, want_h))
 			// And it starts at the skipped fence's row rather than reaching up
 			// past the pane's top edge.
@@ -931,9 +944,9 @@ md_tick_quads :: proc(bx, by, bs: f32, col: [4]f32, out: []plat.Quad) -> (n: int
 // by a line budget so a file whose first line happens to be `---` cannot make
 // this scan to EOF looking for a close that is not there.
 //
-// `inner` is what sizes the card md_front_matter_quads draws: the two fence
-// lines are not rendered (the card is the delimiter), so the block's drawn
-// height is the inner lines alone.
+// `inner` is what sizes the card md_front_matter_quads draws, via md_fm_rows:
+// the block draws its two fence lines TOO (see md_fm_rows), so the card covers
+// inner + 2 rows.
 MD_FM_MAX_LINES :: 64
 
 md_front_matter_end :: proc(doc: ^Document) -> (end: int, inner: int) {
@@ -966,10 +979,28 @@ MD_FM_PAD_96 :: f32(5)
 
 md_fm_pad :: #force_inline proc() -> f32 {return max(2, sx(MD_FM_PAD_96))}
 
-// The card's height for a block of `inner_lines` key/value lines: the rows
-// themselves plus the inset above the first and below the last.
+// How many TEXT ROWS a front-matter block of `inner_lines` key/value lines
+// draws: the key/value lines plus the opening and the closing delimiter.
+//
+// The `+ 2` is item 3 of the 2026-07-29 live-pass regressions. The card
+// originally swallowed the `---` lines entirely -- "the card IS the delimiter"
+// -- but Wyatt's description of what he wants to see is "i see the start and
+// end ---", so the delimiters are back, drawn as muted TEXT on the card surface
+// rather than as the Md_Rule horizontal rules that made the block read as two
+// separate lines in the first place. Still a PLACEHOLDER for his eye: this
+// restores information he had, it does not settle the design.
+//
+// One producer, and this is the reason it exists as a named procedure rather
+// than a `+ 2` spelled inline: md_fm_height sizes the card, md_draw_front_matter
+// draws exactly this many rows onto it, and markdown_draw advances past the
+// block by md_fm_height. A row count that disagreed with the card's height would
+// put text outside the card, which mdtest samples for.
+md_fm_rows :: #force_inline proc(inner_lines: int) -> int {return max(0, inner_lines) + 2}
+
+// The card's height for a block of `inner_lines` key/value lines: every row it
+// draws (md_fm_rows) plus the inset above the first and below the last.
 md_fm_height :: #force_inline proc(line_h: f32, inner_lines: int) -> f32 {
-	return f32(max(0, inner_lines)) * line_h + md_fm_pad() * 2
+	return f32(md_fm_rows(inner_lines)) * line_h + md_fm_pad() * 2
 }
 
 // The card behind YAML front matter. ONE panel spanning the whole block, at
@@ -990,11 +1021,11 @@ md_fm_height :: #force_inline proc(line_h: f32, inner_lines: int) -> f32 {
 // Returns the quads instead of drawing them so mdtest can assert the shape
 // (one panel, no per-line rules) without a device -- the md_row_fits
 // precedent.
-// `ytop` is the TOP of the row the opening `---` would have occupied, and the
-// card starts exactly there rather than `pad` above it: the fence lines are
-// skipped, so that row's space is free, and taking the inset out of it keeps
-// the card off the pane's own top edge. markdown_draw pays for this by
-// advancing its baseline by md_fm_pad() at each fence.
+// `ytop` is the TOP of the block's first row -- the opening `---`, which since
+// item 3 of the 2026-07-29 regressions is drawn as muted text ON this card
+// rather than skipped. The card starts exactly at that row top and its `pad`
+// inset is taken out of the row, so the card never reaches up past the pane's
+// own top edge.
 md_front_matter_quads :: proc(x0, x1, ytop, line_h: f32, inner_lines: int, out: []plat.Quad) -> (n: int) {
 	if len(out) == 0 || inner_lines < 0 {return 0}
 	r := RADIUS_TAB
@@ -1005,6 +1036,51 @@ md_front_matter_quads :: proc(x0, x1, ytop, line_h: f32, inner_lines: int, out: 
 		radius = {r, r, r, r},
 	}
 	return 1
+}
+
+// The whole front-matter block: the card, then every one of its lines drawn on
+// top of it -- INCLUDING the two `---` delimiters.
+//
+// Drawn as ONE unit rather than a row at a time inside markdown_draw's loop,
+// which is what makes md_fm_height the single producer of the block's height.
+// The old shape composed that height TWICE: md_fm_height sized the card, while
+// the loop re-derived the same total as a sum of per-fence `md_fm_pad()` and
+// per-row `line_h` increments. Nothing forced the two to stay equal, and item 3
+// (which adds two rows) would have had to be applied to both. Here the caller
+// advances past the block by md_fm_height and nothing else, so a row count that
+// disagreed with the card would be visible as text spilling off the card --
+// which is exactly what mdtest samples for.
+//
+// PLACEHOLDER: the delimiters draw at Text_Muted, the same tier as the values,
+// which is the least invented thing available and reads as "muted text on a
+// muted card". Wyatt's to retune on the next live pass along with the card
+// itself.
+@(private = "file")
+md_draw_front_matter :: proc(
+	gfx: ^plat.Gfx,
+	qp: ^plat.Quad_Pipeline,
+	text: ^plat.Text,
+	doc: ^Document,
+	x0, x1, card_top, px, char_w, line_h: f32,
+	fm_end, fm_inner: int,
+) {
+	fq: [1]plat.Quad
+	nq := md_front_matter_quads(x0, x1, card_top, line_h, fm_inner, fq[:])
+	plat.quads_draw(gfx, qp, fq[:nq])
+	// No markdown parsing at all: it is YAML, and running a `*` or `_` in a
+	// value through the inline parser would style it as emphasis. The
+	// delimiters go through the same plain path for the same reason -- and
+	// because `---` through the block classifier is an Md_Rule, the horizontal
+	// rule this card exists to replace.
+	buf: [RENDER_LINE_CAP]u8
+	ry := card_top + md_fm_pad() + px // first baseline inside the card
+	for p := 0; p < fm_end; {
+		line, end, _ := md_line_at(doc, p, buf[:])
+		plat.text_draw(gfx, text, line, x0 + char_w, ry, px, g_theme[.Text_Muted], .Doc)
+		ry += line_h
+		if end >= doc.pt.length {break}
+		p = end + 1
+	}
 }
 
 // Lerp a colour toward the page background, for muting a completed task item.
@@ -1300,48 +1376,20 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	// the file: scrolled past it, there is nothing to card.
 	fm_end, fm_inner := md_front_matter_end(doc)
 	if top_byte != 0 {fm_end, fm_inner = 0, 0}
+	if fm_end > 0 {
+		// Drawn whole, before the row loop, and never admitted against the row
+		// budget: it is always the first thing in the pane when it is present
+		// at all, and "no frame ever shows emptiness" outranks a card whose
+		// bottom edge the cover strip trims on a very short pane.
+		card_top := y - px
+		md_draw_front_matter(gfx, qp, text, doc, x0, x1, card_top, px, char_w, line_h, fm_end, fm_inner)
+		// The ONE consumer of the block's height besides the card itself.
+		y = card_top + md_fm_height(line_h, fm_inner) + px
+		bottom = fm_end
+		p = fm_end
+	}
 	for md_row_fits(y, px, line_h, ybot) && p <= doc.pt.length {
 		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
-		if p < fm_end {
-			// Inside the front matter: one muted key/value line, no markdown
-			// parsing at all. It is YAML, and running `*` or `_` in a value
-			// through the inline parser would style it as emphasis.
-			fn := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
-			if fn > 0 && buf[fn - 1] == '' {fn -= 1}
-			if p == 0 {
-				// The opening fence. The CARD is the delimiter, so neither
-				// fence line is drawn and neither takes a row; the panel goes
-				// down here, before any of the block's text, so the text lands
-				// on top of it.
-				fq: [1]plat.Quad
-				nq := md_front_matter_quads(x0, x1, y - px, line_h, fm_inner, fq[:])
-				plat.quads_draw(gfx, qp, fq[:nq])
-				// The fence's row is not drawn, so its space pays for the
-				// card's top inset instead of the card reaching up past the
-				// pane's own top edge.
-				y += md_fm_pad()
-				bottom = end
-				p = end + 1
-				continue
-			}
-			if fl := strings.trim_space(string(buf[:fn])); fl == "---" || fl == "..." {
-				// The closing fence, skipped for the same reason. Within
-				// [0, fm_end) these are the only two lines that can equal a
-				// fence -- md_front_matter_end stops at the first close -- so
-				// this cannot swallow a value. The matching bottom inset, so
-				// the next block starts at the card's bottom edge and not
-				// inside it.
-				y += md_fm_pad()
-				bottom = end
-				p = end + 1
-				continue
-			}
-			plat.text_draw(gfx, text, string(buf[:fn]), x0 + char_w, y, px, g_theme[.Text_Muted], .Doc)
-			y += line_h
-			bottom = end
-			p = end + 1
-			continue
-		}
 		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
 		if n > 0 && buf[n - 1] == '\r' {n -= 1}
 		line := string(buf[:n])
