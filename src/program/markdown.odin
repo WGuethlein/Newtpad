@@ -793,12 +793,25 @@ Md_Metrics :: struct {
 	// own definition, and the only one that makes "72ch" mean a column of 72
 	// characters in a proportional face.
 	measure:      f32,
-	// Not type at all: the two globals a block's layout also depends on, sampled
-	// ONCE per pass here because this struct is already the thing md_pass builds
-	// once and hands to every block. Both are cache-key terms (see
-	// MD_LAYOUT_SLOTS); nothing draws with them.
+	// Not type at all: the state OUTSIDE this struct that a block's layout also
+	// depends on, sampled ONCE per pass here because this struct is already the
+	// thing md_pass builds once and hands to every block. All three are cache-key
+	// terms (see MD_LAYOUT_SLOTS); nothing draws with them.
 	ui_scale:     f32,
 	theme:        u64,
+	// Which faces are loaded (plat.text_face_gen). Sits in exactly the position
+	// `theme` does and for the same mechanism -- a layout bakes something that a
+	// global can move underneath it -- but what it protects is GEOMETRY, not
+	// colour: every glyph position, every soft-wrap point and every block height
+	// in a cached entry came out of the shaper at the advances of whichever
+	// families were loaded when it was built. Settings > Font reloads the .Doc
+	// chain (settings_apply_font), which is what inline code and fenced blocks
+	// draw on, and text_reset_atlas alone does not touch a laid-out entry: the
+	// atlas rasterizes the new family while the cache keeps the old family's
+	// spacing, wrap points, inline-code backgrounds and link rects. Note that
+	// `measure` cannot stand in for this -- it is 72 advances of the BODY face,
+	// invariant under a .Doc change.
+	faces:        u64,
 }
 
 // The theme's identity as one number, for the layout cache key.
@@ -860,7 +873,7 @@ md_metrics :: proc(t: ^plat.Text, s: f32) -> (m: Md_Metrics) {
 	m.task_box = sx(14)
 	m.pad_left = sx(40)
 	m.measure = 72 * plat.text_advance(nil, t, '0', m.body, .Body)
-	m.ui_scale, m.theme = UI_SCALE, md_theme_gen()
+	m.ui_scale, m.theme, m.faces = UI_SCALE, md_theme_gen(), plat.text_face_gen(t)
 	return
 }
 
@@ -1674,6 +1687,17 @@ md_fence_seed :: proc(doc: ^Document, top_byte: int) -> (in_fence: bool, fence_l
 //	             draw), so without this a theme switch leaves warm-white body text
 //	             and amber headings on a light background until the entries are
 //	             evicted. See md_theme_gen for why it is a hash and not a counter.
+//	faces        which font families were loaded when the entry was SHAPED. The
+//	             same mechanism as `theme` one row up, for geometry instead of
+//	             colour: glyph positions, soft-wrap points and the block's height
+//	             all come out of the shaper at the loaded faces' advances.
+//	             Settings > Font reloads the .Doc chain, which inline code and
+//	             fenced blocks draw on, and text_reset_atlas drops the rasterized
+//	             glyphs without touching a laid-out entry -- so the atlas fills
+//	             with the new family while the cache keeps the old family's
+//	             spacing, wrap points, code backgrounds and link rects. Every
+//	             other term is invariant under it, `measure` included: that is 72
+//	             advances of the BODY face, which a .Doc change does not move.
 //	fence in/out the lexer state it was coloured under; the SAME line is prose or
 //	             code depending on it, so it is part of the key and not a result
 //	revision     for kinds whose layout depends on bytes OUTSIDE their own src:
@@ -1683,9 +1707,9 @@ md_fence_seed :: proc(doc: ^Document, top_byte: int) -> (in_fence: bool, fence_l
 //	             their own text, so they take the coarse key; everything that
 //	             carries real shaping work takes the fine one.
 //
-// A resize changes `measure`, a zoom changes `px`, a monitor change `ui_scale`
-// and a theme switch `theme`, so each invalidates every entry wholesale without
-// a sweep -- every lookup simply misses.
+// A resize changes `measure`, a zoom changes `px`, a monitor change `ui_scale`,
+// a theme switch `theme` and a font change `faces`, so each invalidates every
+// entry wholesale without a sweep -- every lookup simply misses.
 // 256, not 128, since batch 17's pixel anchor: one walk now covers the pane
 // PLUS a pane below it (9.1's layout budget), and a walk that resolves an
 // anchor pays MD_RUNUP_LINES of run-up on top of that. Measured directly
@@ -1752,6 +1776,7 @@ Md_Layout :: struct {
 	px:          f32,
 	ui_scale:    f32, // sx()'s scale: `indent` is baked from it
 	theme:       u64, // md_theme_gen: the palette every span colour was baked from
+	faces:       u64, // plat.text_face_gen: the faces every advance was baked from
 	revision:    u64, // consulted only for the kinds md_layout_extern_dep names
 	// --- the value, except `end` which is BOTH (see MD_LAYOUT_SLOTS) ---
 	end:         int, // what the pass reports as `bottom` after this block
@@ -1924,7 +1949,7 @@ md_layout_build :: proc(
 	e.src = strings.clone(line)
 	e.in_fence, e.fence_lex, e.fence_state = in_fence, fence_lex, fence_state
 	e.measure, e.px, e.revision = measure, m.s, doc.revision
-	e.ui_scale, e.theme = m.ui_scale, m.theme
+	e.ui_scale, e.theme, e.faces = m.ui_scale, m.theme, m.faces
 	e.out_fence, e.out_lex, e.out_state = in_fence, fence_lex, fence_state
 
 	trimmed := strings.trim_left(e.src, " \t")
@@ -2160,7 +2185,7 @@ md_layout_ensure :: proc(
 	if doc.md_layout == nil {doc.md_layout = make([]Md_Layout, MD_LAYOUT_SLOTS)}
 	for &e in doc.md_layout {
 		if !e.valid || e.start != p {continue}
-		if e.measure != measure || e.px != m.s || e.ui_scale != m.ui_scale || e.theme != m.theme {continue}
+		if e.measure != measure || e.px != m.s || e.ui_scale != m.ui_scale || e.theme != m.theme || e.faces != m.faces {continue}
 		if e.in_fence != in_fence || e.fence_lex != fence_lex || e.fence_state != fence_state {continue}
 		if md_layout_extern_dep(e.cls.kind) {
 			if e.revision != doc.revision {continue}
@@ -2304,6 +2329,12 @@ Md_Max_Key :: struct {
 	px:       f32,
 	ui_scale: f32,
 	pane:     f32,
+	// Which faces are loaded. The ceiling is "the anchor at which the document's
+	// last block ends at the pane's bottom edge", so it is a function of block
+	// HEIGHTS -- and a family change moves every one of them. The layout cache's
+	// `theme` term has no counterpart here for the opposite reason: a palette
+	// changes colour and no height at all.
+	faces:    u64,
 	valid:    bool,
 }
 
@@ -2749,6 +2780,7 @@ md_max_anchor :: proc(c: ^Md_Scroll_Ctx) -> Md_Anchor {
 		px       = c.m.s,
 		ui_scale = c.m.ui_scale,
 		pane     = c.pane,
+		faces    = c.m.faces,
 		valid    = true,
 	}
 	if doc.md_max_key == key {return doc.md_max}

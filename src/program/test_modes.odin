@@ -4899,6 +4899,149 @@ when NEWTPAD_TESTS {
 					fmt.tprintf("crlf: ...and draws the same pixels -- no line resumed one byte late, no first character eaten (%d bytes differ of %d)", n, len(cold_pix)),
 				)
 			}
+
+			// --- (5) the loaded FACES are part of the key ------------------------
+			//
+			// The theme term one section up exists because a layout bakes colours a
+			// global can move underneath it. A layout also bakes GEOMETRY -- glyph
+			// positions, soft-wrap points, the block's own height -- out of the
+			// shaper at whatever advances the loaded families have, and Settings >
+			// Font (settings_apply_font) reloads the .Doc chain, which is what
+			// inline code, fenced blocks and tables draw on. text_reset_atlas drops
+			// the rasterized glyphs and nothing else, so without a key term the
+			// atlas fills with the new family while every cached entry keeps the old
+			// family's spacing: wrong advances, wrong wrap points, inline-code
+			// backgrounds and link rects on stale geometry, until an edit, resize,
+			// zoom or theme change happens to evict them.
+			//
+			// Every other term is provably invariant under this change, `measure`
+			// included -- it is 72 advances of the BODY face, and .Body is not
+			// reloaded here. That is what makes the term necessary rather than
+			// belt-and-braces.
+			//
+			// Driven through plat.text_load_family, the real path settings_apply_font
+			// takes, so the counter it bumps is bumped by the product's own code and
+			// not by the probe.
+			{
+				// Two curated monospace families with clearly different advances,
+				// picked at runtime so the check reports honestly on a machine that
+				// ships neither. Courier New's '0' is materially narrower than
+				// Consolas' at the same px, which is what makes the stale-advance
+				// failure observable in a link rect's x.
+				fams := [2]string{"Consolas", "Courier New"}
+				have := true
+				for f in fams {
+					found := false
+					for c in plat.FONT_FAMILIES {
+						if c.name == f && plat.font_family_available(c) {found = true}
+					}
+					if !found {have = false}
+				}
+				kchk(&bad, have, fmt.tprintf("faces: both probe families are installed (%s, %s)", fams[0], fams[1]))
+				if have {
+					// Inline code AND a link after it: the code span is what draws on
+					// the .Doc chain, and the link rect after it is where the .Doc
+					// advances land as a measurable x. One block, so nothing but this
+					// entry's own shaping can move the number.
+					doc := mk("text `AAAAAAAAAAAAAAAAAAAA` [see](http://face.example) tail\n", "face.md")
+					defer doc_close(&doc)
+					link_x :: proc(hits: []Md_Link_Hit) -> (x: f32, ok: bool) {
+						for hh in hits {
+							if hh.url == "http://face.example" {return hh.rect.pos.x, true}
+						}
+						return 0, false
+					}
+					kchk(&bad, plat.text_load_family(&h.text, fams[0], .Regular, .Doc), fmt.tprintf("faces: %s loads for the .Doc chain", fams[0]))
+					md_layout_reset(&doc)
+					g1 := plat.text_face_gen(&h.text)
+					w1 := plat.text_char_width(&h.text, md_metrics(&h.text, px_).code, .Doc)
+					hits1 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+					xa, oka := link_x(hits1)
+
+					// The switch, exactly as Settings > Font makes it: load the family,
+					// then draw the SAME document again with every block's entry still
+					// resident. No md_layout_reset here -- that is the whole point.
+					kchk(&bad, plat.text_load_family(&h.text, fams[1], .Regular, .Doc), fmt.tprintf("faces: %s loads for the .Doc chain", fams[1]))
+					g2 := plat.text_face_gen(&h.text)
+					w2 := plat.text_char_width(&h.text, md_metrics(&h.text, px_).code, .Doc)
+					hits2 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+					xb, okb := link_x(hits2)
+
+					// ...and back, cold, as the reference: what the second family's
+					// advances SHOULD have produced.
+					md_layout_reset(&doc)
+					hits3 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+					xc, okc := link_x(hits3)
+					// Put the harness back on what headless_gpu_init loaded, through
+					// the same loader -- assigning the chain directly would leak the
+					// faces this section created and skip the counter's only bump.
+					plat.text_load_family(&h.text, "Consolas", .Regular, .Doc)
+
+					// Non-vacuity, both halves. The counter moved, and the .Doc cell
+					// width really differs -- without the second the whole section
+					// would be asserting that two identical layouts are identical.
+					kchk(&bad, g2 != g1, fmt.tprintf("faces: loading a family moves text_face_gen (%d -> %d)", g1, g2))
+					kchk(&bad, w1 != w2, fmt.tprintf("faces: ...and the two families have different .Doc advances at the code size (%.2f vs %.2f)", w1, w2))
+					kchk(&bad, oka && okb && okc, fmt.tprintf("faces: the link is placed in all three passes (%d, %d, %d rects)", len(hits1), len(hits2), len(hits3)))
+					if oka && okb && okc {
+						// The fixture's inline code sits BEFORE the link, so a stale
+						// .Doc advance moves the link's x. Without the key term the
+						// warm pass returns the first family's number.
+						kchk(&bad, abs(xb - xc) <= 0.5, fmt.tprintf("faces: after the font change the WARM pass places the link where a cold one does (%.1f vs %.1f)", xb, xc))
+						kchk(&bad, abs(xb - xa) > 1, fmt.tprintf("faces: ...and NOT where the family it was shaped under put it (%.1f vs %.1f)", xb, xa))
+					}
+
+					// The SECOND cache the same change invalidates: md_max_anchor's.
+					// Its key is everything the preview's own end of travel is a
+					// function of, and the ceiling is "the anchor at which the last
+					// block ends at the pane's bottom edge" -- block HEIGHTS, which a
+					// family change moves.
+					//
+					// The fixture is paragraphs carrying long INLINE CODE spans, which
+					// is the construct the section above already proved moves under
+					// this change. Fenced code was the obvious choice and does not
+					// work: a `Md_Layout` for a fence body came out pixel-identical
+					// under both families, so a fence fixture asserts nothing here.
+					// (Worth its own look -- recorded rather than chased, since what
+					// this section is for is the cache key.)
+					{
+						fb := strings.builder_make()
+						defer strings.builder_destroy(&fb)
+						// 19 code spans per paragraph, and that number is measured, not
+						// arbitrary: it is a length whose greedy wrap count DIFFERS
+						// between the two families (132px of slot under one, 165px
+						// under the other). Every paragraph is the same length for the
+						// same reason -- the ceiling is a function of the LAST pane's
+						// blocks only, so a fixture that sweeps lengths and happens to
+						// end on a non-straddling one asserts nothing. A first draft
+						// swept 2..21 spans and the last three paragraphs came out
+						// identical under both families.
+						for i in 0 ..< 60 {
+							fmt.sbprintf(&fb, "line %02d of prose with ", i)
+							for k in 0 ..< 19 {fmt.sbprintf(&fb, "`code_%02d_span` and ", k)}
+							strings.write_string(&fb, "a tail.\n\n")
+						}
+						fsrc := strings.to_string(fb)
+						fdoc := mk(fsrc, "facemax.md")
+						defer doc_close(&fdoc)
+						fdoc.md_mode = .Preview
+						plat.text_load_family(&h.text, fams[0], .Regular, .Doc)
+						fc, fok := md_scroll_ctx(&h.gfx, &h.text, &fdoc, px_, f32(W), f32(H), 0.5)
+						kchk(&bad, fok, "faces: the inline-code fixture has a preview pane")
+						if fok {
+							m_a := md_max_anchor(&fc)
+							plat.text_load_family(&h.text, fams[1], .Regular, .Doc)
+							fc2, _ := md_scroll_ctx(&h.gfx, &h.text, &fdoc, px_, f32(W), f32(H), 0.5)
+							warm := md_max_anchor(&fc2) // the entry from before the change
+							fdoc.md_max_key = {} // ...against a recomputation of it
+							cold := md_max_anchor(&fc2)
+							kchk(&bad, m_a != cold, fmt.tprintf("faces: the two families really do give the fixture different ceilings (%d/%.1f vs %d/%.1f)", m_a.block, m_a.px, cold.block, cold.px))
+							kchk(&bad, warm == cold, fmt.tprintf("faces: ...and Md_Max_Key notices the change rather than serving the old ceiling (%d/%.1f vs %d/%.1f)", warm.block, warm.px, cold.block, cold.px))
+						}
+						plat.text_load_family(&h.text, "Consolas", .Regular, .Doc)
+					}
+				}
+			}
 			return
 		}
 

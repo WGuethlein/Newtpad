@@ -265,6 +265,19 @@ Text :: struct {
 	// user picks a font for their text: menus, tabs and the status bar are the
 	// application, not the document.
 	chains:     [Font_Set]Face_Chain,
+	// Bumped every time ANY chain is replaced. The identity of "which faces are
+	// loaded right now", for a caller that caches geometry derived from glyph
+	// advances -- read it through text_face_gen, never directly.
+	//
+	// A counter rather than a hash of the chains, and that is the opposite choice
+	// from md_theme_gen deliberately. The theme global is assigned from a dozen
+	// sites, so a counter there would need every one of them to remember to bump
+	// it; `chains` is assigned from exactly ONE place, four lines below, which is
+	// what makes a counter here a single producer rather than a promise. The
+	// alternative -- hashing char_em and the primary face POINTER -- would be
+	// identity by coincidence: a freed face's address is reusable, and two
+	// monospace families can share an 'x' advance ratio.
+	face_gen:   u64,
 	cell_cache: [Font_Set]map[rune]u8, // codepoint -> cells; depends on char_em, so per chain
 	// Tab-stop spacing. NOT per font set: a tab stop is a property of the text,
 	// not of the typeface it happens to be drawn in, and the chrome and the
@@ -643,10 +656,22 @@ text_load_family :: proc(t: ^Text, family: string, style: Font_Style, set := Fon
 		if old.faces[i] != nil {old.faces[i]->Release()}
 	}
 	t.chains[set] = fresh
+	// The ONE place a chain is replaced, so the ONE place face_gen is bumped.
+	t.face_gen += 1
 	// Every cached glyph and cell width belongs to the old face.
 	text_reset_atlas(t)
 	return true
 }
+
+// Which faces are loaded, as one number. Changes whenever any chain is replaced.
+//
+// For callers that cache LAID-OUT geometry rather than glyphs. text_reset_atlas
+// drops the rasterized bitmaps, which is enough for anything that re-measures
+// every frame -- but a cache of shaped positions, wrap points and block heights
+// keeps the previous family's advances while the atlas fills with the new
+// family's ink. That is a Settings > Font change in the markdown preview, where
+// inline code and fenced blocks draw on the .Doc chain: see md_metrics.
+text_face_gen :: proc(t: ^Text) -> u64 {return t.face_gen if t != nil else 0}
 
 text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
 	if !text_load_faces(&t) {
