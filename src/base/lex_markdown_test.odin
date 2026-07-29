@@ -70,6 +70,62 @@ test_lex_markdown_blockquote_with_inline_bold :: proc(t: ^testing.T) {
 	mtok_eq(t, out[1], bold_start, len("**important**"), .Keyword, "bold span")
 }
 
+// EVERY '>' in a nested blockquote prefix takes the same kind.
+//
+// The defect (live pass 0.27, source view): only the first marker was
+// tokenized, so `>> nested` drew one green '>' and one default-coloured one --
+// Wyatt: "the first `>` is green, where the rest are white". Written as "find
+// the token covering each '>' in the prefix and assert its kind", not "expect
+// exactly 2 Comment tokens": the assertion has to be about coverage of the
+// markers, or a future change that merged the prefix into one span would fail
+// a test it actually satisfies.
+@(test)
+test_lex_markdown_nested_blockquote_markers_share_one_kind :: proc(t: ^testing.T) {
+	// Both spellings of depth 2, plus a depth-3 case, plus the depth-1 control
+	// (which passed before the fix -- if it ever fails, the fixture is wrong,
+	// not the lexer).
+	for line in ([]string{`> one`, `>> two`, `> > spaced`, `>>> three`}) {
+		bytes := transmute([]u8)line
+		out: [16]Token
+		n, _ := lex_markdown(bytes, .Normal, out[:])
+		// The prefix is the leading run of '>' and spaces; content starts after
+		// the last marker.
+		last := strings.last_index_byte(line, '>')
+		markers := 0
+		covered := 0
+		for k in 0 ..= last {
+			if line[k] != '>' {continue}
+			markers += 1
+			for j in 0 ..< n {
+				if k >= out[j].start && k < out[j].start + out[j].len {
+					if out[j].kind == .Comment {covered += 1}
+					break
+				}
+			}
+		}
+		testing.expectf(t, markers > 0, "%q: fixture has markers", line)
+		testing.expectf(t, covered == markers, "%q: %d of %d quote markers are .Comment", line, covered, markers)
+	}
+}
+
+// The marker run must not swallow the content: `>> two` still leaves "two"
+// available to the inline scan, so a construct inside a nested quote is still
+// coloured. Without this, "consume every '>'" could pass the test above by
+// eating the whole line.
+@(test)
+test_lex_markdown_nested_blockquote_keeps_inline_content :: proc(t: ^testing.T) {
+	line := `>> **important**`
+	bytes := transmute([]u8)line
+	out: [16]Token
+	n, _ := lex_markdown(bytes, .Normal, out[:])
+	testing.expectf(t, n == 3, "want 3 tokens (two markers + bold), got %d", n)
+	if n != 3 {return}
+	mtok_eq(t, out[0], 0, 1, .Comment, "first '>' marker")
+	mtok_eq(t, out[1], 1, 1, .Comment, "second '>' marker")
+	bold_start := strings.index(line, "**important**")
+	mtok_eq(t, out[2], bold_start, len("**important**"), .Keyword, "bold span")
+}
+
 // A list marker ("- ") colours just the bullet as Punct.
 @(test)
 test_lex_markdown_list_marker :: proc(t: ^testing.T) {

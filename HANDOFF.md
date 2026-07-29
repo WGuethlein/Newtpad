@@ -306,6 +306,26 @@ were the priorities. Read P2 as the live list, with these amendments:
   `whole_line = false` on saturation makes the fall-through lex `[start,end)` with a `state_in`
   resolved at `lls`. Either re-lex the row's own extent for spans while keeping the cached state, or
   decide the refusal in `doc_row_lex_extent` before any state is resolved.
+- **`a.docs` can now grow without bound within a session.** `app_add` (`app.odin`) used to reuse the
+  first nil slot; it now only reclaims a *trailing* nil (see its comment) so tab display order stays
+  the order tabs were added, per Wyatt: "I don't want random order tabs, unacceptable." The cost is
+  one dead slot per middle-close/reopen cycle. Measured: 100 close/open cycles on a middle tab ->
+  `slots=104 live=4`, order still monotonic, `active` and every `mru` entry still pointing at a live
+  slot, and a restart (session save/restore) compacts back down. Carried deliberately, not fixed:
+  8 bytes per dead slot plus one skipped nil check in the ~10-15 walks over `a.docs` per frame is
+  unmeasurable at any session length a user would reach before restarting. **Constraint for whenever
+  this is compacted:** it must be a re-indexing pass that walks `a.docs`, builds an old-slot ->
+  new-slot map, and remaps `active`, every `mru` entry, and every in-flight `Watch_Entry.slot`
+  (`watch.odin`) through it -- never a hole-fill (reusing a freed slot for the next add). A hole-fill
+  is exactly the bug this entry exists because it was removed.
+- **`replace_sel_raw` (`doc.odin:2183`) does not clamp its range.** Pre-existing, shared with
+  `find_replace_current`, and out of scope for the Task 15 review that surfaced it (batch's live-pass
+  0.27.0 pass on Replace All). Until now the only caller reachable from the UI was a single-splice
+  path; making `find_replace_all` reachable from a button and a menu row means the same unclamped
+  range is now exercised up to `MAX_MATCHES` times per press instead of once, widening the blast
+  radius of any future out-of-range bug from one splice to a saturated pass's worth. Not fixed here —
+  the clamp belongs to whoever owns `replace_sel_raw`'s contract, not to the task that merely gave it
+  more callers.
 
 Ranked. P0 = fix before building more; P1 = cheap correctness/cleanliness now; P2 = deferred but
 tracked.
@@ -360,6 +380,10 @@ tracked.
   "your text silently vanishes" failure the 2026-07-25 audit ranked Tier 2 is **not reachable by a
   real document.** The belief traced to one stale comment in `text.odin` that outlived its fix by
   seven months. Do not re-add this without a measurement that contradicts the above.
+- **Non-local link targets never resolve** (`\\server\share\x`, `smb://`, and every link — even a
+  relative one — inside a document opened from a UNC path or mapped network drive). Refusing to stat
+  is what fixed the >100 s UI-thread freeze (§6aq); restoring the coverage needs an async resolver
+  worker, `watch.odin`-shaped. See §6aq's Owed list for the full writeup.
 - **reindex-on-edit** (line count/scrollbar drift approximately after big edits).
 - **Precompiled `.cso` shaders** (drop the `d3dcompiler_47.dll` runtime dep) — before ship.
 - **Per-frame allocations** in `text_draw` (make/delete per line) — reuse a scratch buffer.
@@ -3694,11 +3718,15 @@ border, which §1 assigns to `Md_Rule`. Fixed.
   but there is no per-level bullet cycling.
 - **§9.3's preview type scale and proportional face** are batch 17 and untouched.
 
-## 6aq. The first live pass on the UI overhaul — part one (2026-07-28, v0.28.0, branch `fix/live-pass-0.27`)
+## 6aq. The first live pass on the UI overhaul (2026-07-28/29, v0.28.0 + v0.29.0, branch `fix/live-pass-0.27`)
+
+**Read §6ar for the second release's summary and its cross-cutting findings.** This section grew as the
+batch ran, so it carries per-task detail for tasks 1–3 (shipped as v0.28.0) and, from "Part two"
+onward, for tasks 10–13 as well. §6ar covers the batch as a whole.
 
 Wyatt ran [the v0.27.0 checklist](docs/live-pass-v0.27.0.md) against his daily driver and annotated it.
-Seventeen defects. **This release carries the first three**, cut mid-batch at his request so the fixes
-reach his daily driver; the remaining thirteen are specced, planned and next. The spec is
+Seventeen defects. **v0.28.0 carried the first three**, cut mid-batch at his request so the fixes
+reached his daily driver; the remaining thirteen shipped as v0.29.0. The spec is
 [2026-07-28-live-pass-0.27-fixes-design.md](docs/superpowers/specs/2026-07-28-live-pass-0.27-fixes-design.md),
 the plan is [2026-07-28-live-pass-0.27-fixes.md](docs/superpowers/plans/2026-07-28-live-pass-0.27-fixes.md),
 and the live ledger is `.superpowers/sdd/progress.md`.
@@ -3779,6 +3807,218 @@ window, and locked the exe against the next build. Verify a mode before citing i
   two existing precedents. A real scissor is its own renderer task.
 - **Thirteen live-pass defects remain**, including both scrollbars, tab ordering, the link
   over-capture, and Replace All. See the ledger.
+- **The horizontal scrollbar's range never shrinks within a session.** `Document.max_cells_seen` is a
+  high-water mark: `doc_max_hscroll` scans only the visible rows (viewport-first) and raises the mark,
+  never lowers it. That is what fixed *"the horizontal scrollbar only allows expanding if the large row
+  is on screen"* — the range used to collapse the moment the wide line scrolled off. **The cost, which
+  Wyatt accepted (2026-07-28) rather than pay for a background full-document scan:** delete the longest
+  line and the bar keeps offering pan into content that no longer exists, for the rest of the session.
+  Measured — one 400-cell line plus 50 short ones gives `doc_max_hscroll` = 323; after deleting the long
+  line through `doc_replace_sel` it is still 323. Only a reload (`doc_reload_forced` replaces the whole
+  struct) clears it. A correct reset would have to know the new widest line, i.e. rescan the document on
+  every edit, which is exactly the work the high-water mark exists to avoid. **If this is ever revisited,
+  the shape is the async resolver's**: a worker that scans off the UI thread and lowers the mark between
+  frames. Note also that `doc_max_hscroll` is a getter that **mutates the `Document` from the draw path**
+  — main-thread only, not idempotent, not job-safe.
+- **Non-local link targets are not resolved on the UI thread** (task 9 of this batch, commit
+  `97f92fb` + a re-review fixup). `GetFileAttributesW` on an unreachable UNC host was measured
+  blocking the caller for over 100 seconds, and `links_layout` runs on the UI thread every frame
+  Ctrl is held or Show-links is "always" — so a single dead `\\host\share\out.log` in a pasted
+  build log froze the editor. `plat.path_is_local` (`file.odin`) now refuses to stat anything on a
+  `DRIVE_REMOTE` letter or a bare UNC path, and `links.odin`'s `link_stat` is the one place link
+  resolution touches the filesystem, so the refusal cannot be bypassed by any of the three routes
+  (Ctrl+click, the table view, the Open Link command). **What it costs the user:** `\\server\share\x`
+  and `smb://server/share/x` targets are permanently plain text — never underlined, never openable —
+  and so is every link (including a plain relative one) inside a document opened *from* a UNC path
+  or a mapped network drive, because the anchor folder fails the same check. Removable drives (USB)
+  and RAM disks are unaffected; only `DRIVE_REMOTE` (and `DRIVE_NO_ROOT_DIR`/`DRIVE_UNKNOWN`/
+  `DRIVE_CDROM`) are refused, not "anything but `DRIVE_FIXED`" — a re-review caught the broader
+  version. **The real fix** is an async resolver: a worker that stats off the UI thread and feeds
+  answers back into `link_cache` between frames, the same shape `watch.odin` already uses for
+  external-change polling (copy inputs, work in private memory, merge once per frame, poll a cancel
+  flag). Deliberately kept out of this batch as a design change, not a bug fix.
+- **And the async resolver is owed as a TIME bound, not just as network coverage.** `links_layout`
+  still performs filesystem stats **on the frame path** — up to three times per frame while Ctrl is
+  held, every frame when Show-links is "always", and `doc.top` is part of the cache generation, so
+  every scroll step re-stats the whole screen. The only bound today is `LINK_RESOLVE_BUDGET`, which
+  caps a **count of stats, not the time they take**, and `path_is_local` only excludes `DRIVE_REMOTE` /
+  `DRIVE_NO_ROOT_DIR` / `DRIVE_UNKNOWN` / `DRIVE_CDROM`. A **fixed** volume that happens to be slow —
+  a OneDrive/Dropbox sync root, a filesystem filter driver from an AV product, a cold spinning disk —
+  passes `path_is_local` and blocks the UI thread anyway. Measured: **3.32 ms/frame** scrolling a
+  document with 200 missing local targets. Nothing in the tree makes that impossible; only the async
+  resolver does, because it is the only design where a slow stat cannot be on the frame path at all.
+
+### Part two: tasks 10–13 — checkbox tick, done-item colour, quote markers, front matter (2026-07-29, branch `fix/live-pass-0.27`)
+
+Four more items off [the v0.27.0 checklist](docs/live-pass-v0.27.0.md), each its own commit
+(`.superpowers/sdd/task-10-13-report.md` has the full per-task writeup: what the brief got wrong, the
+test, the sabotage).
+
+**What landed:**
+- **Task 10 — the task-list checkbox's tick is centred on the box**, not low-and-right. It is now
+  geometry (`md_tick_quads`, a stepped X of small quads) rather than a glyph, so the centring is exact
+  by construction and mdtest asserts it to 0.05px.
+- **Task 11 — a completed task item mutes every colour, not just the base-coloured prose.** Themed runs
+  (bold, code, links, italics) used to ignore the mute entirely; `md_run_color` now applies it after role
+  resolution, and `MD_DONE_MUTE :: 0.26` is a *derived* placeholder (solves `mute(Text_Primary) ==
+  Text_Muted` for both themes, doesn't land exactly on either).
+- **Task 12 — every `>` in a nested blockquote gets the same syntax-colour role**, not just the first
+  marker (`src/base/lex_markdown.odin`).
+- **Task 13 — YAML front matter draws as one card**, not a 2px bar per line (the old bar was the
+  blockquote's own decoration, borrowed by accident).
+
+**A 2026-07 review found eight defects in that landing**, fixed in the same branch:
+
+- **A done item's prose was muted TWICE.** The done branch set the base colour to `Text_Muted` *and*
+  handed it to `md_run_color`'s mute step, which lerps toward the page a second time — contrast against
+  `Bg_Base` measured 5.4:1 → 3.58:1 in Dark and 6.0:1 → 3.28:1 in Light, both under the 4.5:1 floor every
+  text role in `theme.odin` is annotated against. Fixed by keeping the base at `Text_Primary` and letting
+  the mute step do the only muting (`md_task_prose_style`, `markdown.odin`).
+- **The fix for that bug had no test coverage at the call site.** Sabotaging `markdown_draw`'s task
+  branch directly (not the shared procedures underneath it) printed `0 failures` — mdtest only ever drove
+  `md_run_color`/`md_mute` with hand-picked arguments, never asked what the draw itself passes. Closed two
+  ways: `md_task_prose_style` is now the ONE procedure both the draw and mdtest call, and `mdtest` gained
+  a draw-level pass (`md_draw_selftest`, `test_modes.odin`) that renders through a real offscreen D3D11
+  device (the `quadsdftest`/`Headless_Gpu` precedent) and reads back actual pixels — the done-item prose
+  colour and the front-matter card's row-advance are both verified against a REAL render, not a copy of
+  the logic. **That claim originally read "sabotaging either call site now fails a test", and it was
+  false in one direction** — the whole-branch review restored the *original* Task 11 defect
+  (`task_col = g_theme[.Text_Muted]` with `task_mute` left at 0) and the whole suite still printed
+  `mdtest: 0 failures`. The draw-level pass sampled only the **plain prose** glyph, and asserted
+  `near(mute(Text_Primary, 0.26))` — which, by `MD_DONE_MUTE`'s own derivation, *is* ≈ `Text_Muted`,
+  i.e. the pre-fix colour. It rejected "muted twice" and could not tell "muted once" from "not muted at
+  all". Closed 2026-07-29 by sampling a **styled** run as well: the fixture is now ``- [x] IIII `II` ``
+  and its undone twin, and the code span is asserted muted relative to the undone item's identical
+  span. A styled run's colour does not depend on the base at all, so only the mute step can move it.
+  Verified by re-running the sabotage: **2 failures**. The front-matter call site was already covered
+  and still is.
+- **The `MD_DONE_MUTE` self-test pinned an exact tier** (0.05 per channel) when the true dual-theme
+  intersection is roughly [0.232, 0.264] — 0.003 from the shipped value, so a plausible eye-tune (0.30)
+  already failed it with a message that said nothing about the constant being tunable. Reframed as
+  direction/ordering assertions (mutes strictly toward the page, lands in the ballpark of `Text_Muted`,
+  widened and explicitly labelled as bounding a placeholder) plus a new assertion on the PLAIN prose run
+  specifically, which is the one the double-mute bug actually broke and the old test never reached.
+- **The checkbox tick could leave a sub-pixel gap along its diagonal** (spacing `span/(steps-1)` came out
+  to 1.15px against a 1px square) and, at a small enough box (`bs < 4·st`), **could escape the box
+  entirely** (`arm` exceeding `bs`). Both fixed in `md_tick_quads`; the escape case is now in mdtest too.
+- **Two `quads_draw` calls per done checkbox** (border, then tick) merged into one instance list and one
+  call.
+- **`md_front_matter_end`'s fence check read a shorter buffer (512B) than `markdown_draw`'s own**
+  (`RENDER_LINE_CAP`, 8192B), so a line that trims to `` --- `` within the short buffer but not in full
+  would be a fence to one and a plain row to the other, oversizing the card. Both now read the same
+  amount.
+
+**Placeholders, still awaiting Wyatt's eye** (unchanged from Task 11/13's own landing, restated here since
+this is the entry that was owed): `MD_DONE_MUTE` and the front-matter card's surface/radius/inset are
+first drafts, not tuned values — see their doc comments in `markdown.odin`. **The specific question for
+the next live pass:** Wyatt's original report on front matter was "I don't know what this is supposed to
+look like... it shows as muted, **I see the start and end `---`**, and I see like a quote bar on the side
+but it's thinner" (`docs/live-pass-v0.27.0.md`). The card fix intentionally removes those visible `---`
+delimiters — the card IS the delimiter now, per UI spec 9.2. Confirm that's what he meant, not just "stop
+drawing the quote bar."
+
+## 6ar. The live pass, finished (2026-07-29, v0.29.0, branch `fix/live-pass-0.27`)
+
+The remaining thirteen of Wyatt's seventeen. Per-task detail for tasks 1–3 and 10–13 is in §6aq; this
+section is the batch as a whole and the cross-cutting findings a per-task review structurally could not
+see. Wyatt was asleep for most of it, having granted control to finish and continue.
+
+### The defects he reported, and what they actually were
+
+Four of the thirteen were not what the report or the plan said they were, and finding that out was worth
+more than the fixes:
+
+- **The vertical scrollbar stopping at 80%** was the thumb mapped against `doc.pt.length` instead of the
+  scrollable range. `doc.top` peaks at `doc_max_top`, never the file length, so the thumb fell short by
+  exactly the visible fraction of the file. The real defect was in `doc_scroll_to_fraction`, not
+  `vbar_drag_to` where the plan pointed.
+- **"Ctrl+H has no replace all"** — Replace All *existed* and was **dead code**. It hung off `ev.ctrl`
+  inside `.Find_Confirm`, but `lookup_binding` matches `(key, ctrl, alt, ctx)` exactly and every `.Enter`
+  row is `ctrl=false`, so the branch was unreachable from every route. The symptom is fully explained.
+- **"The first `>` is green"** was not the table-separator role drift the plan suspected; `lex_markdown`
+  tokenised only the first marker. And `Md_Quote` is unreachable from a lexer at all — it is a
+  program-layer `Color_Role`, and lexers emit `Token_Kind`.
+- **Tabs appearing mid-rail** was `app_add` reusing the first nil slot. The plan's premise that session
+  restore stored slot indices was wrong — it already stored display order — but restore was still a
+  second route, by *persisting and re-serving* a scrambled order.
+
+### Found on the way, unreported by anyone
+
+- **Replace All corrupted the buffer while reporting success.** `"aa"` over `"aaaa"` publishes three
+  overlapping matches for four bytes; the loop applied all three, each splicing into what the last had
+  written, producing `"b"` instead of `"bb"` — and returning 3. A wrong document with a plausible count
+  is the worst combination there is. `find_keep_set` now takes the leftmost non-overlapping subset.
+- **The link resolve-gate introduced a content-triggered denial of service.** Gating decoration on
+  `link_resolve` put a `stat` on the frame path — up to three times per frame while Ctrl is merely held.
+  A single dead UNC path in a pasted stack trace froze the UI thread for **over 100 seconds**, measured.
+  Ctrl is held during Ctrl+S, so the unsaved buffer was held hostage. `watch.odin`'s own header records
+  why: "the main thread must never block on the filesystem." Fixed by refusing non-local targets without
+  any filesystem call.
+- **The silent no-op on link activation existed at three sites**, not the one the plan named — the
+  editor, the table view's Ctrl+click, and the `Open_Link` palette command. Neither of the latter two has
+  a decoration gate, so Wyatt's report may well have come from there.
+- **A done task item's prose was muted twice**, dropping contrast to 3.58:1 Dark and 3.28:1 Light —
+  under the 4.5 floor every text role in `theme.odin` is annotated against.
+
+### What this batch got wrong, and it is the same thing eight times
+
+**The plan's draft test code was wrong in every single task.** Not occasionally — every one. The shapes:
+
+- measured an **empty list** (a device-less `Text` reports its atlas full, so nothing was recorded and
+  "all positions are integral" was vacuously true);
+- asserted **integrality** when the bug was a 1px shift *between* integers;
+- **subtracted the same global** production added, so a wrong value cancelled out of both sides;
+- asserted a property **the bug also satisfies**;
+- used a tolerance **loose enough to admit the defect** (1px, where the error was 0.34px);
+- was verified only by **the number the function chose to report**;
+- **would not have compiled** — six of seven procedure names in one task did not exist;
+- and **would have failed a correct implementation** (an arithmetic error in the controller's own
+  derivation of `MD_DONE_MUTE`: the real factors are 0.298/0.220, not 0.28/0.24).
+
+Two survived to the whole-branch review and were caught only there: `mdtest` could not reject the
+done-item colour defect, and `tabseamtest` could not reject the tab-gap defect — **the exact bugs Wyatt
+reported, reintroducible with the whole suite green.** Worse, HANDOFF affirmatively claimed the coverage
+existed. Both are fixed and both now bite under sabotage.
+
+**The operational lesson, stated so the next session can use it:** "write a test" is not the discipline.
+The discipline is *ask what value this assertion would reject*, and then prove it by reintroducing the
+bug. Six of the eight above pass that question trivially once it is asked out loud.
+
+### Also worth knowing
+
+- **The plan cited four test modes that do not exist** (`seltest`, `keytest`, `scrollbartest`,
+  `tablayouttest`). `seltest` fell through to the GUI path, opened a window, and locked the exe against
+  the next build. List them with
+  `grep -o 'os.args\[1\] == "[a-z]*"' src/program/test_modes.odin | sort -u`.
+- **A headless-GPU markdown test now exists.** `md_draw_selftest` drives `markdown_draw` through
+  `Headless_Gpu` + `gfx_readback_bgra` and samples pixels. That closes a class of blindness the project
+  carried for two batches, and it is reusable — the fence-seed coverage gap §6aq lists as owed can now be
+  closed with it rather than carried further. **That is the highest-value follow-up on the list.**
+- **Task 16 correctly produced no code.** The encoding dropdown's width was measured against its own
+  longest row and they match; the labels are simply long. "No defect, here are the numbers" is a
+  successful outcome.
+
+### Owed (in addition to §6aq's list)
+
+- **The batch made the `renderer`/`ui` extraction harder in five places**, none fatal, all worth having
+  before that work is planned: `find_actions` is UI geometry in a program-layer file that now depends on
+  `UI_SCALE`, the text metrics, the keymap *and* document state at once; `vscrollbar_geo` stopped being
+  arithmetic and became a document query (it walks the piece tree); `doc_max_hscroll` writes to the
+  `Document` from the draw path, so the draw is no longer idempotent; `links_layout` performs filesystem
+  I/O and owns a process-global cache, and the draw calls it; and `render_frame` now queries the live OS
+  cursor inside the draw for a hover fill, against "events queue to the frame arena".
+- **The front-matter card is a third consumer of the no-scissor cover strip.** Measured at 2170px tall
+  for a 60-line block, drawn as one unclipped quad. A real scissor facility is its own renderer task.
+- **`Replace All`'s Edit-menu row draws enabled and no-ops in table view and full Preview.** `item_enabled`
+  consults `command_allowed_on` but not `doc_read_only_view`. Pre-existing pattern (`.Paste` has it too),
+  but it is the same defect Task 15 deliberately fixed for the buttons, in the same commit that added the
+  row.
+- **Literal `$1` in a regex replacement writes the characters `$1`.** Pinned by a test so it cannot change
+  silently, but Replace All made it far more reachable — it now has a key, a palette entry and a button.
+  Product call for Wyatt.
+- **`replace_sel_raw` does not clamp its range**, unlike `doc_replace_range`. Pre-existing and shared with
+  `find_replace_current`, but making `find_replace_all` reachable widens the blast radius from one splice
+  to many.
 
 ## 7. Build environment (Windows, this machine)
 

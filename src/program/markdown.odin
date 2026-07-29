@@ -105,6 +105,229 @@ md_selftest :: proc() -> (bad: int) {
 		chk(&bad, !t3 && r3 == "[y] neither", "[y] is not a task box")
 		chk(&bad, !t4 && r4 == "not a task", "plain text is not a task")
 	}
+	// --- front matter draws as ONE card, not a bar per line (live pass 0.27) ---
+	//
+	// Wyatt: "I see like a quote bar on the side but it's thinner" -- the old
+	// code drew a 2px Md_Rule at the left of every front-matter line, which is
+	// the blockquote's own decoration. Two assertions, and the second is the
+	// one the old shape fails: exactly one quad comes back (the pre-fix shape
+	// is N of them, one per line), and NONE of them is Md_Rule. The panel's
+	// height is checked against the block, since "one quad" alone would also
+	// be satisfied by a single 2px bar.
+	{
+		old_theme := g_theme
+		defer g_theme = old_theme
+		g_theme = theme_dark()
+		x0, x1, ytop, line_h := f32(40), f32(600), f32(100), f32(20)
+		for inner in ([]int{1, 4, 12}) {
+			q: [MD_FM_MAX_LINES + 2]plat.Quad
+			n := md_front_matter_quads(x0, x1, ytop, line_h, inner, q[:])
+			chk(&bad, n == 1, fmt.tprintf("%d-line front matter -> exactly 1 quad (%d)", inner, n))
+			if n != 1 {continue}
+			rules := 0
+			for i in 0 ..< n {
+				if q[i].color == g_theme[.Md_Rule] {rules += 1}
+			}
+			chk(&bad, rules == 0, fmt.tprintf("%d-line front matter -> no Md_Rule quad (%d)", inner, rules))
+			chk(&bad, q[0].color == g_theme[.Md_Code_Bg], fmt.tprintf("%d-line front matter -> the card is Md_Code_Bg", inner))
+			// It spans the block, not one row: the panel must cover every inner
+			// line's row, plus an inset above the first and below the last.
+			pad := md_fm_pad()
+			want_h := f32(inner) * line_h + pad * 2
+			chk(&bad, pad > 0 && q[0].size.y == want_h, fmt.tprintf("%d-line front matter -> card covers the block + inset (%.1f == %.1f)", inner, q[0].size.y, want_h))
+			// And it starts at the skipped fence's row rather than reaching up
+			// past the pane's top edge.
+			chk(&bad, q[0].pos.y == ytop, fmt.tprintf("%d-line front matter -> card top is the fence's own row (%.1f == %.1f)", inner, q[0].pos.y, ytop))
+			// And it is a PANEL: full content width and rounded, not a bar.
+			chk(&bad, q[0].size.x == x1 - x0 && q[0].radius[0] > 0, fmt.tprintf("%d-line front matter -> full-width, rounded panel", inner))
+		}
+		// The card's height comes from md_front_matter_end's inner count, so
+		// that count is checked against real documents too -- a card sized from
+		// a wrong count is the same bug one level up.
+		//
+		// Its own procedure so md_selftest's frame does not also carry a
+		// Document; `content` is DEFAULT-allocated on purpose, since
+		// doc_from_content sets owned_orig and doc_close frees it.
+		md_fm_probe :: proc(src: string) -> (end, inner: int) {
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "fm.md", .UTF8)
+			defer doc_close(&doc)
+			return md_front_matter_end(&doc)
+		}
+		{
+			e1, i1 := md_fm_probe("---\ntitle: x\ntags: y\n---\nbody\n")
+			chk(&bad, e1 == len("---\ntitle: x\ntags: y\n---\n") && i1 == 2, fmt.tprintf("two keys between the fences -> end %d, inner %d", e1, i1))
+			e2, i2 := md_fm_probe("---\n...\nbody\n")
+			chk(&bad, e2 == len("---\n...\n") && i2 == 0, fmt.tprintf("an empty block closed by ... -> end %d, inner %d", e2, i2))
+			e3, i3 := md_fm_probe("---\ntitle: x\nnever closed\n")
+			chk(&bad, e3 == 0 && i3 == 0, fmt.tprintf("an unclosed opener is not front matter (end %d, inner %d)", e3, i3))
+			e4, i4 := md_fm_probe("# heading\n---\nnot front matter\n")
+			chk(&bad, e4 == 0 && i4 == 0, fmt.tprintf("a `---` that is not on line 1 is a rule (end %d, inner %d)", e4, i4))
+		}
+	}
+
+	// --- a done task item mutes EVERY colour, not just the prose (live pass 0.27) ---
+	//
+	// Two halves, and only the second one is about the defect.
+	//
+	// (a) MD_DONE_MUTE reproduces each theme's own muted tier -- roughly. This is
+	// what makes 0.26 a derived placeholder rather than a number picked by eye,
+	// but it is explicitly marked PLACEHOLDER in its own comment (see
+	// MD_DONE_MUTE) precisely because it is Wyatt's to eye-tune on the next live
+	// pass. A prior version of this test bound the miss to 0.05 per channel,
+	// which is tight enough that the two built-ins' own disagreement (Dark wants
+	// ~0.298, Light ~0.220) leaves an intersection of roughly [0.232, 0.264] --
+	// 0.003 from the shipped 0.26, not the "[0.19, 0.33]" that comment claimed
+	// (2026-07 review, Finding 3). A plausible eye-tune (0.30) already fails it.
+	//
+	// So this asserts DIRECTION AND ORDERING instead of pinning a tier -- the
+	// property that has to hold whatever Wyatt retunes MD_DONE_MUTE to, not just
+	// at today's 0.26: muting must move STRICTLY toward the page (rules out
+	// k <= 0, "no mute happened") and must not overshoot past Bg_Base (rules out
+	// k >= 1, "muted all the way to invisible"). The "lands near Text_Muted"
+	// reading is kept too, widened to 0.10 -- comfortably past both themes' own
+	// spread AND past a same-ballpark future retune -- so it still catches "the
+	// constant regressed to something unreasonable" without being a tripwire on
+	// "the constant moved". If a retune DOES trip this, the message says why.
+	{
+		old_theme := g_theme
+		defer g_theme = old_theme
+		for th, ti in ([]Theme{theme_dark(), theme_light()}) {
+			g_theme = th
+			name := "dark" if ti == 0 else "light"
+			bg := g_theme[.Bg_Base]
+			primary := g_theme[.Text_Primary]
+			got := md_mute(primary, MD_DONE_MUTE)
+			toward := true
+			for i in 0 ..< 3 {
+				if abs(got[i] - bg[i]) >= abs(primary[i] - bg[i]) {toward = false}
+			}
+			chk(&bad, toward, fmt.tprintf("%s: mute(Text_Primary, MD_DONE_MUTE) moves strictly toward Bg_Base", name))
+			want := g_theme[.Text_Muted]
+			worst := f32(0)
+			for i in 0 ..< 3 {worst = max(worst, abs(got[i] - want[i]))}
+			chk(
+				&bad,
+				worst <= 0.10,
+				fmt.tprintf(
+					"%s: mute(Text_Primary, MD_DONE_MUTE) is in the ballpark of Text_Muted (worst %.3f) -- MD_DONE_MUTE is a documented PLACEHOLDER; if retuning it trips this, widen THIS bound, it is not a regression",
+					name, worst,
+				),
+			)
+			// Alpha is a compositing decision, not a tone: it must survive.
+			chk(&bad, got.a == g_theme[.Text_Primary].a, fmt.tprintf("%s: muting leaves alpha alone", name))
+		}
+		g_theme = theme_dark()
+		bg := g_theme[.Bg_Base]
+		// One line exercising every role md_run_color can pick: bold
+		// (Text_Bright), code (Md_Code), a link (Link) and italics (Md_Italic).
+		runs := md_inline("plain **bold** `code` [label](http://u) *ital*")
+		styled := 0
+		for run in runs {
+			lit := md_run_color(run, g_theme[.Text_Muted], 0)
+			dim := md_run_color(run, g_theme[.Text_Muted], MD_DONE_MUTE)
+			if !(run.bold || run.code || run.link || run.ital) {continue}
+			styled += 1
+			// It moved at all -- this is the assertion the old code fails: it
+			// returned `lit` for every themed run regardless of the mute.
+			moved := lit != dim
+			// ...and it moved TOWARD the page, not to some unrelated colour.
+			toward := true
+			for i in 0 ..< 3 {
+				if abs(dim[i] - bg[i]) > abs(lit[i] - bg[i]) {toward = false}
+			}
+			chk(&bad, moved && toward, fmt.tprintf("styled run %q mutes toward the page", run.text))
+		}
+		chk(&bad, styled == 4, fmt.tprintf("...and the fixture really produced 4 themed runs (%d)", styled))
+		// The DEFAULT run -- plain prose carrying no role of its own -- is what
+		// Finding 1 (2026-07 review) got wrong and the block above cannot catch,
+		// since it only walks STYLED runs. Driven through md_task_prose_style,
+		// the exact procedure markdown_draw's task branch calls: the bug was
+		// task_col = Text_Muted (an already-muted base), so a plain run muted
+		// TWICE and landed well past Text_Muted toward Bg_Base, not on it.
+		plain_col, plain_mute := md_task_prose_style(true)
+		plain_checked := false
+		for run in runs {
+			if run.bold || run.code || run.link || run.ital || run.strike {continue}
+			got := md_run_color(run, plain_col, plain_mute)
+			want := g_theme[.Text_Muted]
+			worst := f32(0)
+			for i in 0 ..< 3 {worst = max(worst, abs(got[i] - want[i]))}
+			chk(&bad, worst <= 0.10, fmt.tprintf("done item's plain run %q mutes to Text_Muted's own tier, not past it (worst %.3f)", run.text, worst))
+			plain_checked = true
+		}
+		chk(&bad, plain_checked, "...and the fixture produced a plain run to check")
+	}
+
+	// --- the ticked checkbox's tick is centred on the BOX (live pass 0.27) ---
+	//
+	// Wyatt: "the X is at the bottom right of the box, not in the center". The
+	// tick is now geometry, so its placement is measurable without a device:
+	// take the union bounding box of the quads md_tick_quads emits and compare
+	// its centre against the box's. Run at three UI scales, because the
+	// stroke width is hairline() (scale-dependent) while the box size is not,
+	// and an off-by-one-stroke centring error only shows up when they differ.
+	{
+		old_scale := UI_SCALE
+		defer UI_SCALE = old_scale
+		for scale in ([]f32{1.0, 1.5, 2.0}) {
+			UI_SCALE = scale
+			bx, by := f32(100), f32(200)
+			bs := f32(11.2) * scale
+			tq: [MD_TICK_STEPS * 2]plat.Quad
+			n := md_tick_quads(bx, by, bs, {1, 1, 1, 1}, tq[:])
+			chk(&bad, n >= 4, fmt.tprintf("scale %.1f: the tick draws at all (%d quads)", scale, n))
+			if n == 0 {continue}
+			lo, hi := tq[0].pos, tq[0].pos + tq[0].size
+			for q in tq[1:n] {
+				lo = {min(lo.x, q.pos.x), min(lo.y, q.pos.y)}
+				hi = {max(hi.x, q.pos.x + q.size.x), max(hi.y, q.pos.y + q.size.y)}
+			}
+			cx, cy := (lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5
+			bcx, bcy := bx + bs * 0.5, by + bs * 0.5
+			// The tolerance is 0.05px, not the "within one pixel" the task
+			// asked for, and deliberately: md_tick_quads centres EXACTLY by
+			// construction (each diagonal's f runs 0 ..= arm-st and a step is
+			// st wide, so the union spans exactly arm), leaving only float
+			// error. A 1px tolerance was measured to ADMIT the defect -- the
+			// shipped `bx + bs*0.28` origin offset is 0.34px off centre at
+			// scale 1, so it passed a 1px bound and the assertion proved
+			// nothing. A bound that cannot reject the bug is not a test.
+			chk(&bad, abs(cx - bcx) <= 0.05 && abs(cy - bcy) <= 0.05, fmt.tprintf("scale %.1f: tick centre (%.2f,%.2f) is the box centre (%.2f,%.2f)", scale, cx, cy, bcx, bcy))
+			// ...and it stays inside the box, or "centred" could be satisfied by
+			// a tick that overhangs symmetrically.
+			chk(&bad, lo.x >= bx && lo.y >= by && hi.x <= bx + bs && hi.y <= by + bs, fmt.tprintf("scale %.1f: tick stays inside the box", scale))
+		}
+		// --- the degenerate case: a box smaller than 4*st (Finding 5, 2026-07
+		// review) ---
+		//
+		// Every case above uses `bs = 11.2*scale`, which never gets close to
+		// `st*2` (the OTHER side of `arm`'s max), so the clamp this exercises was
+		// never reached by the fixture above -- `chk`'s own "stays inside the
+		// box" assertion could not have caught the bug it was meant to catch.
+		// Unclamped, `arm := max(st*2, bs*0.5)` picks `st*2` here and OVERSHOOTS
+		// `bs`, pushing the tick's origin (`bx + (bs-arm)*0.5`) past `bx` itself.
+		{
+			UI_SCALE = 1
+			bx, by := f32(300), f32(400)
+			bs := f32(1.5) // < 4*st (st=1 at UI_SCALE 1)
+			tq: [MD_TICK_STEPS * 2]plat.Quad
+			n := md_tick_quads(bx, by, bs, {1, 1, 1, 1}, tq[:])
+			chk(&bad, n >= 4, fmt.tprintf("degenerate box (bs=%.1f < 4*st): the tick draws at all (%d quads)", bs, n))
+			if n > 0 {
+				lo, hi := tq[0].pos, tq[0].pos + tq[0].size
+				for q in tq[1:n] {
+					lo = {min(lo.x, q.pos.x), min(lo.y, q.pos.y)}
+					hi = {max(hi.x, q.pos.x + q.size.x), max(hi.y, q.pos.y + q.size.y)}
+				}
+				chk(
+					&bad, lo.x >= bx && lo.y >= by && hi.x <= bx + bs && hi.y <= by + bs,
+					fmt.tprintf("degenerate box (bs=%.1f): tick stays inside it (got [%.2f,%.2f]-[%.2f,%.2f], box [%.2f,%.2f]-[%.2f,%.2f])", bs, lo.x, lo.y, hi.x, hi.y, bx, by, bx + bs, by + bs),
+				)
+			}
+		}
+	}
 	chk(&bad, md_heading_level("# H") == 1, "# H -> h1")
 	chk(&bad, md_heading_level("### H") == 3, "### H -> h3")
 	chk(&bad, md_heading_level("####### H") == 0, "7 hashes -> not a heading")
@@ -645,42 +868,237 @@ md_task :: proc(content: string) -> (rest: string, done, is_task: bool) {
 	return rest, done, true
 }
 
+// The most steps md_tick_quads will emit per diagonal; the buffer a caller
+// needs is twice this, since the X has two of them.
+MD_TICK_STEPS :: 32
+
+// The tick inside a ticked task checkbox, as geometry, CENTRED on the box.
+//
+// Two things were wrong with drawing it as `text_draw(.., "x", bx + bs*0.28,
+// y, ..)`. The one Wyatt saw -- "the X is at the bottom right of the box, not
+// in the center" -- is that a glyph's ink box is not its layout box: that x is
+// a pen origin and that y is a BASELINE, so an "x" placed from the box's
+// ORIGIN lands wherever the face's advance and x-height happen to put its ink,
+// which for Cascadia Mono at a box of 1.4 cells is low and to the right. The
+// second is the reason caption_btn's `.Close` case (ui_tabs.odin) already
+// draws its X as a stepped stack of quads: batch 12 moved the chrome onto
+// Cascadia Mono, so a glyph is one font substitution away from being a box.
+//
+// Centring is on the box's CENTRE, not its origin: the returned quads' union
+// bounding box is exactly [cx-arm/2, cx+arm/2] x [cy-arm/2, cy+arm/2] by
+// construction (each diagonal's f runs 0 ..= arm-st, and a step is st wide),
+// which is what the mdtest assertion checks.
+//
+// Returns the quads rather than drawing them so that assertion needs no device
+// -- the md_row_fits precedent.
+md_tick_quads :: proc(bx, by, bs: f32, col: [4]f32, out: []plat.Quad) -> (n: int) {
+	st := max(1, hairline())
+	// Half the box, so the tick clears the 1-2px border on every side instead
+	// of touching it. Clamped to bs itself (Finding 5, 2026-07 review): at a
+	// small enough box (bs < 4*st) the unclamped `bs*0.5` still loses to
+	// `st*2`, so arm could exceed bs and the tick's origin (`bx + (bs-arm)*0.5`)
+	// went negative -- the tick escaped the box it is supposed to sit inside.
+	arm := min(bs, max(st * 2, bs * 0.5))
+	x0 := bx + (bs - arm) * 0.5
+	y0 := by + (bs - arm) * 0.5
+	span := max(0, arm - st)
+	// `+2`, not `+1` (Finding 4, 2026-07 review): steps-1 must be >= span/st or
+	// consecutive st-sized squares leave a gap along the diagonal (measured:
+	// `clamp(int(arm),...)` gave 5 steps for the mdtest fixture, spacing
+	// span/(steps-1) = 1.15px against a 1px square -- a ~0.15px break, the one
+	// ui_tabs.odin's `.Close` case avoids by stepping exactly 1px). `int()`
+	// truncates, so `int(span/st)+1` is only ever <= the true minimum step
+	// count (floor(x)+1 can equal ceil(x), never exceed it) and can still leave
+	// a gap; `+2` is strictly more steps than `span/st` requires, which is what
+	// guarantees spacing < st -- overlap or an exact touch, never a break. The
+	// endpoints stay EXACT regardless of the step count: `f` below always runs
+	// 0 to span inclusive, which is what keeps the centring assertions valid to
+	// 0.05px.
+	steps := clamp(int(span / st) + 2, 2, MD_TICK_STEPS)
+	for i in 0 ..< steps {
+		if n + 2 > len(out) {break}
+		f := span * f32(i) / f32(steps - 1)
+		out[n] = {pos = {x0 + f, y0 + f}, size = {st, st}, color = col}
+		out[n + 1] = {pos = {x0 + span - f, y0 + f}, size = {st, st}, color = col}
+		n += 2
+	}
+	return
+}
+
 // YAML front matter: a `---` fence on line 1, closed by `---` or `...`. Returns
-// the byte offset just past the closing fence, or 0 when the document does not
-// open with one. Bounded by a line budget so a file whose first line happens to
-// be `---` cannot make this scan to EOF looking for a close that is not there.
-md_front_matter_end :: proc(doc: ^Document) -> int {
-	if doc == nil || doc.pt.length < 4 {return 0}
-	buf: [512]u8
-	line, end, _ := md_line_at(doc, 0, buf[:])
-	if strings.trim_space(line) != "---" {return 0}
-	p := end + 1
-	for _ in 0 ..< 64 {
-		if p >= doc.pt.length {return 0} // never closed: not front matter
+// the byte offset just past the closing fence, and how many lines sit BETWEEN
+// the two fences; `end` is 0 when the document does not open with one. Bounded
+// by a line budget so a file whose first line happens to be `---` cannot make
+// this scan to EOF looking for a close that is not there.
+//
+// `inner` is what sizes the card md_front_matter_quads draws: the two fence
+// lines are not rendered (the card is the delimiter), so the block's drawn
+// height is the inner lines alone.
+MD_FM_MAX_LINES :: 64
+
+md_front_matter_end :: proc(doc: ^Document) -> (end: int, inner: int) {
+	if doc == nil || doc.pt.length < 4 {return 0, 0}
+	// RENDER_LINE_CAP, not a smaller local cap (Finding 7, 2026-07 review): this
+	// scan and markdown_draw's own closing-fence check (`buf: [RENDER_LINE_CAP]u8`
+	// there) must agree on what a line's TEXT is, or a line that trims to `---`
+	// within a shorter buffer but not in full is a fence to one and a plain row
+	// to the other -- the card and the draw's row-advance would then size
+	// themselves from different inputs and disagree. md_line_at already bounds
+	// the line's END at RENDER_LINE_CAP regardless of `buf`'s size; only the
+	// returned TEXT was truncated shorter here, which is what this fixes.
+	buf: [RENDER_LINE_CAP]u8
+	line, e0, _ := md_line_at(doc, 0, buf[:])
+	if strings.trim_space(line) != "---" {return 0, 0}
+	p := e0 + 1
+	for _ in 0 ..< MD_FM_MAX_LINES {
+		if p >= doc.pt.length {return 0, 0} // never closed: not front matter
 		l2, e2, _ := md_line_at(doc, p, buf[:])
 		t := strings.trim_space(l2)
-		if t == "---" || t == "..." {return min(e2 + 1, doc.pt.length)}
+		if t == "---" || t == "..." {return min(e2 + 1, doc.pt.length), inner}
+		inner += 1
 		p = e2 + 1
 	}
-	return 0
+	return 0, 0
+}
+
+// Inset between the front-matter card's top/bottom edge and its text, at 96 dpi.
+MD_FM_PAD_96 :: f32(5)
+
+md_fm_pad :: #force_inline proc() -> f32 {return max(2, sx(MD_FM_PAD_96))}
+
+// The card's height for a block of `inner_lines` key/value lines: the rows
+// themselves plus the inset above the first and below the last.
+md_fm_height :: #force_inline proc(line_h: f32, inner_lines: int) -> f32 {
+	return f32(max(0, inner_lines)) * line_h + md_fm_pad() * 2
+}
+
+// The card behind YAML front matter. ONE panel spanning the whole block, at
+// the surface fenced code already uses (Md_Code_Bg) and the radius tabs and
+// the find bar use, with the text inset from its edges.
+//
+// PLACEHOLDER, and stated as one: this is a first draft for Wyatt to react to
+// on the next live pass, per "I don't know about the colour shades... just put
+// in a placeholder that would be close to the final anyways". It reuses a
+// surface he has already accepted rather than inventing a value, so it sits
+// consistently with the rest of the preview, but the final treatment is his
+// call. What it REPLACES is not a placeholder question, though: the old code
+// drew a 2px Md_Rule down the left of every front-matter line, which is the
+// blockquote's own decoration -- "I see like a quote bar on the side but it's
+// thinner" -- so front matter and a quote read as the same construct. UI spec
+// 9.2 item 12 asks for a muted card.
+//
+// Returns the quads instead of drawing them so mdtest can assert the shape
+// (one panel, no per-line rules) without a device -- the md_row_fits
+// precedent.
+// `ytop` is the TOP of the row the opening `---` would have occupied, and the
+// card starts exactly there rather than `pad` above it: the fence lines are
+// skipped, so that row's space is free, and taking the inset out of it keeps
+// the card off the pane's own top edge. markdown_draw pays for this by
+// advancing its baseline by md_fm_pad() at each fence.
+md_front_matter_quads :: proc(x0, x1, ytop, line_h: f32, inner_lines: int, out: []plat.Quad) -> (n: int) {
+	if len(out) == 0 || inner_lines < 0 {return 0}
+	r := RADIUS_TAB
+	out[0] = {
+		pos = {x0, ytop},
+		size = {max(0, x1 - x0), md_fm_height(line_h, inner_lines)},
+		color = g_theme[.Md_Code_Bg],
+		radius = {r, r, r, r},
+	}
+	return 1
+}
+
+// Lerp a colour toward the page background, for muting a completed task item.
+//
+// A TRANSFORM applied per run, not a base colour substituted for the whole
+// line. The bug it replaces: task_col was set to Text_Muted and handed to
+// md_draw_inline as `base_col`, but every run that carries its own role --
+// code, links, emphasis, bold -- resolves that role and ignores the base
+// entirely. So the prose muted and nothing else did, which is exactly what
+// Wyatt reported: "the base color text gets muted but the theme colors don't,
+// maybe we just add a filter over all colors dropping them the same percent".
+// This is that filter.
+//
+// Alpha is carried through untouched: muting is a tone change, and folding it
+// into alpha would make a done item composite differently over the find-match
+// wash than a live one.
+md_mute :: proc(c: [4]f32, k: f32) -> [4]f32 {
+	bg := g_theme[.Bg_Base]
+	return {c.r + k * (bg.r - c.r), c.g + k * (bg.g - c.g), c.b + k * (bg.b - c.b), c.a}
+}
+
+// PLACEHOLDER -- Wyatt, on this batch: "I don't know about the colour shades...
+// just put in a placeholder that would be close to the final anyways." Tune it
+// on the next live pass.
+//
+// Not a guess, though. Muting is a lerp toward Bg_Base, so solving
+// mute(Text_Primary) == Text_Muted per channel asks "what k reproduces the
+// muted tier this theme already ships?" Against theme.odin's actual values
+// that is 0.280/0.299/0.315 in Dark (mean 0.298) and 0.244/0.217/0.199 in
+// Light (mean 0.220) -- the two themes disagree, so one constant cannot hit
+// both, and 0.26 sits between them. Worst per-channel miss is 0.033 in Dark
+// and 0.047 in Light (Light's blue, whose two tiers are furthest apart), which
+// is why mdtest's bound below is 0.05 rather than the 0.02 the task brief
+// assumed. The point of the derivation is that 0.26 lands on a tier Wyatt
+// already accepts rather than being picked by eye.
+MD_DONE_MUTE :: f32(0.26)
+
+// The prose base colour and mute fraction for a task item's inline content,
+// given whether it is done. Pulled out of markdown_draw's task branch (which
+// used to set both as two inline assignments) so mdtest can ask "what colour
+// does a done item's prose actually get" by calling the EXACT procedure the
+// draw calls, with the exact argument the draw passes -- not a copy of the
+// logic and not a hand-picked MD_DONE_MUTE disconnected from the call site.
+// A 2026-07 review found the old shape blind to precisely this: sabotaging the
+// call site alone (`task_mute = 0`) left every mdtest assertion green, because
+// the test only ever drove md_run_color directly.
+//
+// The base is ALWAYS Text_Primary, done or not: md_run_color's own mute step
+// (not a pre-muted base) is what drops a done item's prose to the muted tier.
+// Passing Text_Muted here would drop it TWICE -- once by starting from an
+// already-muted base, once more by lerping that base toward the page (Finding
+// 1, 2026-07 review): mute(Text_Muted, 0.26) measures 3.58:1 against Bg_Base in
+// Dark and 3.28:1 in Light, both under the 4.5:1 every text role in theme.odin
+// is annotated against, versus mute(Text_Primary, 0.26) at ~5.4:1 / ~6.0:1 --
+// which is Text_Muted's OWN contrast, restored rather than halved again.
+@(private = "file")
+md_task_prose_style :: proc(done: bool) -> (col: [4]f32, mute: f32) {
+	if !done {return g_theme[.Text_Primary], 0}
+	return g_theme[.Text_Primary], MD_DONE_MUTE
+}
+
+// One inline run's colour: its role, then the done-item mute.
+//
+// Split out of md_draw_inline so mdtest can assert the thing that actually
+// broke -- that a THEMED run mutes, not just the base-coloured prose -- without
+// a device. Asserting md_mute alone would prove nothing: "the lerp moves a
+// colour toward the background" is a property of any lerp, and the pre-fix code
+// would satisfy it too.
+@(private = "file")
+md_run_color :: proc(run: Md_Run, base_col: [4]f32, mute: f32) -> [4]f32 {
+	col := base_col
+	if run.code {col = g_theme[.Md_Code]}
+	if run.ital {col = g_theme[.Md_Italic]}
+	if run.link {col = g_theme[.Link]}
+	if run.bold && !run.code && !run.link {col = g_theme[.Text_Bright]}
+	// Struck text drops to muted as well as getting its line. UI spec 18's
+	// "never colour alone" runs both ways: the LINE is the primary cue, so a
+	// reader who cannot see the tone still gets it, and the tone stops struck
+	// text competing with live text for attention.
+	if run.strike {col = g_theme[.Text_Muted]}
+	if mute > 0 {col = md_mute(col, mute)}
+	return col
 }
 
 // Draw inline runs word-wrapped from (x,y) within [xind, x1]; new rows indent to
 // xind. Advances y per wrapped row. Synthetic bold via a second draw one px over.
+//
+// `mute` fades every run's resolved colour toward the page by that fraction;
+// 0 (the default, and every call site but the done-task one) leaves them alone.
 @(private = "file")
-md_draw_inline :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, runs: []Md_Run, xind, x1: f32, x, y: ^f32, px, char_w, line_h: f32, base_col: [4]f32) {
+md_draw_inline :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, runs: []Md_Run, xind, x1: f32, x, y: ^f32, px, char_w, line_h: f32, base_col: [4]f32, mute: f32 = 0) {
 	boff := hairline()
 	for run in runs {
-		col := base_col
-		if run.code {col = g_theme[.Md_Code]}
-		if run.ital {col = g_theme[.Md_Italic]}
-		if run.link {col = g_theme[.Link]}
-		if run.bold && !run.code && !run.link {col = g_theme[.Text_Bright]}
-		// Struck text drops to muted as well as getting its line. UI spec 18's
-		// "never colour alone" runs both ways: the LINE is the primary cue, so a
-		// reader who cannot see the tone still gets it, and the tone stops struck
-		// text competing with live text for attention.
-		if run.strike {col = g_theme[.Text_Muted]}
+		col := md_run_color(run, base_col, mute)
 		// Split into words, keeping each word's trailing space so wrapping is by word.
 		w := run.text
 		for len(w) > 0 {
@@ -880,7 +1298,8 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	// horizontal rules around it, which is what `---` on its own line otherwise
 	// renders as (UI spec 9.2 item 12). Only when the view starts at the top of
 	// the file: scrolled past it, there is nothing to card.
-	fm_end := md_front_matter_end(doc) if top_byte == 0 else 0
+	fm_end, fm_inner := md_front_matter_end(doc)
+	if top_byte != 0 {fm_end, fm_inner = 0, 0}
 	for md_row_fits(y, px, line_h, ybot) && p <= doc.pt.length {
 		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
 		if p < fm_end {
@@ -889,7 +1308,34 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			// through the inline parser would style it as emphasis.
 			fn := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
 			if fn > 0 && buf[fn - 1] == '' {fn -= 1}
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 - char_w, y - px}, size = {max(2, sx(2)), line_h}, color = g_theme[.Md_Rule]}})
+			if p == 0 {
+				// The opening fence. The CARD is the delimiter, so neither
+				// fence line is drawn and neither takes a row; the panel goes
+				// down here, before any of the block's text, so the text lands
+				// on top of it.
+				fq: [1]plat.Quad
+				nq := md_front_matter_quads(x0, x1, y - px, line_h, fm_inner, fq[:])
+				plat.quads_draw(gfx, qp, fq[:nq])
+				// The fence's row is not drawn, so its space pays for the
+				// card's top inset instead of the card reaching up past the
+				// pane's own top edge.
+				y += md_fm_pad()
+				bottom = end
+				p = end + 1
+				continue
+			}
+			if fl := strings.trim_space(string(buf[:fn])); fl == "---" || fl == "..." {
+				// The closing fence, skipped for the same reason. Within
+				// [0, fm_end) these are the only two lines that can equal a
+				// fence -- md_front_matter_end stops at the first close -- so
+				// this cannot swallow a value. The matching bottom inset, so
+				// the next block starts at the card's bottom edge and not
+				// inside it.
+				y += md_fm_pad()
+				bottom = end
+				p = end + 1
+				continue
+			}
 			plat.text_draw(gfx, text, string(buf[:fn]), x0 + char_w, y, px, g_theme[.Text_Muted], .Doc)
 			y += line_h
 			bottom = end
@@ -962,7 +1408,7 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			// how `- [ ] thing` reads without this. Done items go muted, so a
 			// finished checklist recedes -- and the TICK carries the state as
 			// well as the tone, never colour alone (UI spec 18).
-			task_col := g_theme[.Text_Primary]
+			task_col, task_mute := md_task_prose_style(false)
 			if rest, done, is_task := md_task(content); is_task {
 				body = rest
 				bx := ind
@@ -970,23 +1416,32 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 				by := y - px * 0.75
 				edge := hairline()
 				bc := g_theme[.Accent] if done else g_theme[.Text_Muted]
-				plat.quads_draw(
-					gfx,
-					qp,
-					[]plat.Quad {
-						{pos = {bx, by}, size = {bs, edge}, color = bc},
-						{pos = {bx, by + bs - edge}, size = {bs, edge}, color = bc},
-						{pos = {bx, by}, size = {edge, bs}, color = bc},
-						{pos = {bx + bs - edge, by}, size = {edge, bs}, color = bc},
-					},
-				)
+				// Border and tick are ONE instance list and one quads_draw call
+				// (Finding 6, 2026-07 review): two Map+Draw round trips for a
+				// single checkbox was pure waste. The border is always 4 quads;
+				// the tick, done items only, is appended after it.
+				bq: [4 + MD_TICK_STEPS * 2]plat.Quad
+				bq[0] = {pos = {bx, by}, size = {bs, edge}, color = bc}
+				bq[1] = {pos = {bx, by + bs - edge}, size = {bs, edge}, color = bc}
+				bq[2] = {pos = {bx, by}, size = {edge, bs}, color = bc}
+				bq[3] = {pos = {bx + bs - edge, by}, size = {edge, bs}, color = bc}
+				nq := 4
 				if done {
-					plat.text_draw(gfx, text, "x", bx + bs * 0.28, y, px, g_theme[.Accent], .Doc)
-					task_col = g_theme[.Text_Muted]
+					nt := md_tick_quads(bx, by, bs, g_theme[.Accent], bq[4:])
+					nq += nt
+					// The prose colour/mute is resolved through md_task_prose_style
+					// -- the SAME procedure mdtest calls to ask "what does a done
+					// item's prose actually get" (2026-07 review, Finding 2). The
+					// box and the tick just built are deliberately NOT muted -- they
+					// are the state cue (UI spec 18's "never colour alone"), and
+					// fading the one mark that says "done" is the opposite of the
+					// intent.
+					task_col, task_mute = md_task_prose_style(true)
 				}
+				plat.quads_draw(gfx, qp, bq[:nq])
 				x := ind + bs + char_w
 				yy := y
-				md_draw_inline(gfx, qp, text, md_inline(body), ind + bs + char_w, x1, &x, &yy, px, char_w, line_h, task_col)
+				md_draw_inline(gfx, qp, text, md_inline(body), ind + bs + char_w, x1, &x, &yy, px, char_w, line_h, task_col, task_mute)
 				y = yy + line_h
 				p = end + 1
 				continue

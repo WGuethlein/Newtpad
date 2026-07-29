@@ -595,11 +595,11 @@ main :: proc() {
 		// either way (the grid takes no caret).
 		if doc.table && doc.kind == .Text && window.mouse_pressed && plat.key_ctrl_down() {
 			if tl, found := table_link_hit(table_links(doc, &text, px, char_w, rows, f32(window.width)), f32(window.mouse_x), f32(window.mouse_y), px, line_h); found {
-				if t, rok := link_resolve(doc, tl.text, tl.link); rok {
-					if !link_activate(&app, &text, t) {
-						plat.message_error(window.hwnd, fmt.tprintf("Could not open:\n\n%s", t.url if t.is_url else t.path))
-					}
-				}
+				// Not resolution-gated the way the document view now is: table_links
+				// decorates whatever links_scan finds in a cell, so a dead target here
+				// still underlines. link_follow at least says so instead of doing
+				// nothing. (Gating the table's decoration too is HANDOFF §6l work.)
+				link_follow(&app, &text, window, doc, tl.text, tl.link)
 				window.mouse_pressed = false
 				window.mouse_down = false
 			}
@@ -663,11 +663,16 @@ main :: proc() {
 		//
 		// A fresh press only, exactly like the bottom: an in-progress selection
 		// drag that reaches the bar must keep auto-scrolling rather than dying.
-		// A click on a mode chip toggles it. Before the swallow below, which is
-		// what would otherwise eat the press -- and the chips are drawn to look
-		// pressable, so they have to be.
+		// A click on a mode chip toggles it, and a click on a replace-row button
+		// runs it. Before the swallow below, which is what would otherwise eat the
+		// press -- and both are drawn to look pressable, so they have to be. The
+		// buttons are tested first: the two rows do not overlap, but reading the
+		// precedence off the code beats inferring it from the geometry. Both come
+		// from the same layout the draw used (find_actions / find_toggles).
 		if window.mouse_pressed && doc.find.active {
-			if c := find_toggle_at(doc, f32(window.width), f32(window.mouse_x), f32(window.mouse_y)); c != .None {
+			if c := find_action_at(doc, &text, f32(window.width), f32(window.mouse_x), f32(window.mouse_y)); c != .None {
+				command_dispatch(c, {}, &app, window, &text, rows)
+			} else if c := find_toggle_at(doc, f32(window.width), f32(window.mouse_x), f32(window.mouse_y)); c != .None {
 				command_dispatch(c, {}, &app, window, &text, rows)
 			}
 		}
@@ -690,6 +695,11 @@ main :: proc() {
 			dvr := md_divider_rect(doc, f32(window.width), f32(window.height), app.settings.split_frac)
 			if divider_drag || (dvr.size.x > 0 && f32(cx) >= dvr.pos.x && f32(cx) < dvr.pos.x + dvr.size.x && f32(cy) >= dvr.pos.y && f32(cy) < dvr.pos.y + dvr.size.y) {
 				want = .SizeWE
+			} else if doc.find.active && find_action_at(doc, &text, f32(window.width), f32(cx), f32(cy)) != .None {
+				// Same geometry as the draw, the hover fill and the click. A
+				// button that looks pressable, fills on hover and does not change
+				// the pointer is three quarters of a control.
+				want = .Hand
 			} else if plat.key_ctrl_down() && !doc.filter {
 				if doc.table && doc.kind == .Text {
 					if _, over := table_link_hit(table_links(doc, &text, px, char_w, rows, f32(window.width)), f32(cx), f32(cy), px, line_h); over {
@@ -708,11 +718,7 @@ main :: proc() {
 		if window.mouse_pressed && plat.key_ctrl_down() && !doc.filter {
 			hits := links_layout(doc, &text, drawn)
 			if h, found := links_hit(hits, px, char_w, f32(window.mouse_x), f32(window.mouse_y)); found {
-				if t, rok := link_resolve(doc, h.text, h.link); rok {
-					if !link_activate(&app, &text, t) {
-						plat.message_error(window.hwnd, fmt.tprintf("Could not open:\n\n%s", t.url if t.is_url else t.path))
-					}
-				}
+				link_follow(&app, &text, window, doc, h.text, h.link)
 				window.mouse_pressed = false
 				window.mouse_down = false
 			}
@@ -1154,7 +1160,7 @@ Vbar :: struct {
 	x, track_y, track_h, thumb_y, thumb_h: f32,
 }
 
-vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int) -> (b: Vbar) {
+vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int, t: ^plat.Text, rows: int) -> (b: Vbar) {
 	if doc == nil || doc.pt.length <= 0 {return}
 	total := f32(doc.pt.length)
 	b.x = x
@@ -1169,8 +1175,18 @@ vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int) -> (b: Vbar) {
 	// still moved the document by ~3% of its length. The two are exact inverses
 	// now, which is what makes "grab it and it does not move" true rather than
 	// approximately true.
+	//
+	// Mapped against the SCROLLABLE range, not the document length. doc.top is
+	// the top visible line's offset, which at the end of the document is
+	// doc_max_top -- never pt.length. Dividing by pt.length made the ratio peak
+	// at (length - one screenful)/length, so the thumb stopped short by exactly
+	// the visible fraction of the file: on a document where a screen is a fifth
+	// of the content it halted at 80%, which is what Wyatt measured by eye.
+	// doc_scroll_to_fraction (the inverse vbar_drag_to calls through) maps by
+	// the same doc_max_top, so the two stay exact inverses of each other.
+	max_top := f32(max(1, doc_max_top(doc, t, rows)))
 	travel := max(1, b.track_h - b.thumb_h)
-	b.thumb_y = clamp(b.track_y + f32(doc.top) / total * travel, b.track_y, b.track_y + b.track_h - b.thumb_h)
+	b.thumb_y = clamp(b.track_y + f32(doc.top) / max_top * travel, b.track_y, b.track_y + b.track_h - b.thumb_h)
 	b.shown = true
 	return
 }
@@ -1354,7 +1370,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	er := doc_editor_right(doc, w, rc.app.settings.split_frac)
 	total := doc.pt.length
 	if total > 0 && !doc.filter {
-		vb := vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom)
+		vb := vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom, text, rows)
 		g_vbar_editor = vb // what the press hit-tests against next frame
 		sb_h, th, ty := vb.track_h, vb.thumb_h, vb.thumb_y
 		track := plat.Quad{pos = {vb.x, vb.track_y}, size = {SCROLLBAR_TRACK_W, sb_h}, color = g_theme[.Bg_Raised]}
@@ -1413,7 +1429,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// panes anchored to the same source line.
 		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.top)
 		if total > 0 {
-			pvb := vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom)
+			pvb := vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom, text, rows)
 			g_vbar_preview = pvb
 			plat.quads_draw(
 				gfx,
@@ -1563,7 +1579,49 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			rcaret := "_" if f.field == 1 else ""
 			rline := fmt.tprintf("Replace: %s%s", string(f.replace[:]), rcaret)
 			plat.text_draw(gfx, text, rline, sx(12), fbase + row_h, UI_PX, g_theme[.Text_Bright])
-			hint_find(gfx, text, f, doc, w, fbase + row_h)
+
+			// The two action buttons. Every coordinate here comes out of
+			// find_actions -- the box, the label origin, the chord origin -- and
+			// the same procedure answers the click (the frame loop), the hover
+			// fill below and the pointer cursor. Nothing on this row computes a
+			// coordinate twice; see Find_Action's comment for why that is the
+			// rule and not a preference.
+			abuf: [2]Find_Action
+			acts := find_actions(doc, text, w, abuf[:])
+			hovered := Command_Id.None
+			if len(acts) > 0 {
+				cx, cy := plat.window_cursor_client(window)
+				hovered = find_action_at(doc, text, w, f32(cx), f32(cy))
+			}
+			for a in acts {
+				plat.quads_draw(
+					gfx,
+					quad_pipe,
+					[]plat.Quad {
+						{
+							pos = {a.x, a.y},
+							size = {a.w, a.h},
+							color = g_theme[.Bg_Hover] if a.cmd == hovered else g_theme[.Bg_Raised],
+							radius = {RADIUS_ROW, RADIUS_ROW, RADIUS_ROW, RADIUS_ROW},
+						},
+					},
+				)
+				plat.text_draw(gfx, text, a.label, a.tx, a.ty, UI_SMALL_PX, g_theme[.Text_Primary])
+				// The chord in the muted tier beside the verb, which is exactly how
+				// the menus draw their shortcut column (menu.odin) -- one visual
+				// convention for "this is the key that does this", so the row
+				// teaches without needing a sentence.
+				if a.chord != "" {
+					plat.text_draw(gfx, text, a.chord, a.cx, a.ty, UI_SMALL_PX, g_theme[.Text_Muted])
+				}
+			}
+			// The mode hints keep the rest of the row, up to the buttons' left
+			// edge. They are drawn last and skipped when the space between the
+			// replace field and the buttons cannot hold them, so a narrow window
+			// loses the hints rather than overlapping three runs of text.
+			hint_right := w - sx(12)
+			if len(acts) > 0 {hint_right = acts[0].x - sx(12)}
+			hint_find(gfx, text, f, doc, hint_right, sx(12) + f32(len(rline) + 2) * cw, fbase + row_h)
 		}
 	}
 	{
@@ -1703,10 +1761,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 }
 
 // The find bar's own toggles, right-aligned, active ones lit. These commands
-// exist only inside find mode, so without this the only way to learn Ctrl+R and
+// exist only inside find mode, so without this the only way to learn Alt+R and
 // Ctrl+L was to be told they were there.
+// `right` is the edge to end at (the action buttons' left edge, once they are on
+// the row) and `min_x` the first pixel they may not cross -- the end of the
+// "Replace: ..." field. Purely decorative text, so the answer to not fitting is
+// to draw nothing: three overlapping runs are less readable than two.
 @(private = "file")
-hint_find :: proc(gfx: ^plat.Gfx, text: ^plat.Text, f: ^Find, doc: ^Document, w, y: f32) {
+hint_find :: proc(gfx: ^plat.Gfx, text: ^plat.Text, f: ^Find, doc: ^Document, right, min_x, y: f32) {
 	on := g_theme[.Accent]
 	off := g_theme[.Text_Muted]
 	cw := plat.text_char_width(text, UI_SMALL_PX)
@@ -1714,13 +1776,14 @@ hint_find :: proc(gfx: ^plat.Gfx, text: ^plat.Text, f: ^Find, doc: ^Document, w,
 		label: string,
 		lit:   bool,
 	} {
-		{"Ctrl+R regex", f.regex},
+		{"Alt+R regex", f.regex},
 		{"Ctrl+L filter", doc.filter},
 		{"Tab field", f.replace_mode},
 	}
 	total := 0
 	for h in hints {total += len(h.label) + 3}
-	x := w - sx(12) - f32(total) * cw
+	x := right - f32(total) * cw
+	if x < min_x {return}
 	for h in hints {
 		plat.text_draw(gfx, text, h.label, x, y, UI_SMALL_PX, on if h.lit else off)
 		x += f32(len(h.label) + 3) * cw
@@ -1770,6 +1833,7 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	TAB_PAD_R = dp(rc, TAB_PAD_R_96)
 	TAB_GAP = dp(rc, TAB_GAP_96)
 	TAB_CLOSE_W = dp(rc, TAB_CLOSE_W_96)
+	TAB_LABEL_GAP = dp(rc, TAB_LABEL_GAP_96)
 	MENU_W = dp(rc, MENU_W_96)
 	PLUS_W = dp(rc, PLUS_W_96)
 	SCROLLBAR_W = dp(rc, SCROLLBAR_W_96)

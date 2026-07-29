@@ -1041,6 +1041,402 @@ when NEWTPAD_TESTS {
 			return
 		}
 
+		// Replace All: every match replaced EXACTLY ONCE, and one undo entry for
+		// the lot. Both are data-shaped. A per-match entry means Ctrl+Z walks back
+		// through hundreds of steps to undo one press (and past UNDO_MAX, evicts
+		// the pre-replace state entirely -- replacetest owns that half); a match
+		// replaced twice, or a match skipped, is a wrong document that the
+		// operation reports as a success.
+		//
+		// Its own proc: test_mode_dispatch's frame is already large enough to have
+		// hit STATUS_STACK_OVERFLOW twice, and only one Document is live at a time
+		// in here.
+		findtest_replace_all :: proc() -> (bad: int) {
+			fmt.println("--- Replace All: exactly once, and one undo entry ---")
+			ra_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			// Set up find+replace on a document and run Replace All. Returns what
+			// find_replace_all reported plus the document before and after, so each
+			// caller asserts on the text rather than on the count alone -- the
+			// count was RIGHT and the document WRONG in the overlap bug below.
+			// `caret` is not decoration. Parked at 0 -- where a freshly opened
+			// document leaves it -- "replace from the start" and "replace from the
+			// current match" are the SAME loop, and every count below passes with
+			// either. The first sabotage run of this test proved it: making the
+			// loop start at f.current changed nothing and the suite stayed green.
+			// Placing the caret mid-document is what gives f.current a value that
+			// a from-the-caret loop would visibly truncate.
+			// `current` is returned as it stood when the button was pressed, not
+			// after: find_replace_all ends in find_recompute, which clears it and
+			// re-picks -- so reading doc.find.current at the call site measures the
+			// wrong moment and reports 0 for a caret that really was mid-list.
+			run :: proc(doc: ^Document, q, r: string, rx: bool, caret := 0) -> (replaced: int, complete: bool, matches, current: int) {
+				doc.cursor, doc.anchor = caret, caret
+				find_open(doc, true)
+				clear(&doc.find.query)
+				clear(&doc.find.replace)
+				doc.find.regex = rx
+				doc.find.field = 0
+				for c in q {find_input_rune(doc, c)}
+				doc.find.field = 1
+				for c in r {find_input_rune(doc, c)}
+				doc.find.field = 0
+				find_wait(doc)
+				matches = len(doc.find.matches)
+				current = doc.find.current
+				replaced, complete = find_replace_all(doc)
+				return
+			}
+
+			// 120 occurrences of "cat", none of them overlapping.
+			{
+				src := strings.repeat("cat cat cat\n", 40, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				// Precondition: without this every count below is vacuously true of
+				// an empty search.
+				before_undo := len(doc.undo)
+				before_hist := doc_history_len(&doc)
+				replaced, complete, matches, current := run(&doc, "cat", "dog", false, len(src) / 2)
+				ra_chk(&bad, matches == 120, fmt.tprintf("the fixture really holds 120 matches (%d)", matches))
+				// The caret really is mid-list, or the from-the-caret sabotage this
+				// section exists to reject is indistinguishable from the correct loop.
+				ra_chk(&bad, current > 10 && current < 110, fmt.tprintf("the caret sits mid-list before the replace (current=%d of %d)", current, matches))
+				ra_chk(&bad, complete, "the scan finished, so this was a complete pass")
+				ra_chk(&bad, replaced == 120, fmt.tprintf("it reports 120 replacements (%d)", replaced))
+				after := doc_debug_string(&doc)
+				ra_chk(&bad, strings.count(after, "cat") == 0, fmt.tprintf("no match survives (%d left)", strings.count(after, "cat")))
+				ra_chk(&bad, strings.count(after, "dog") == 120, fmt.tprintf("every match replaced exactly once (%d dogs, want 120)", strings.count(after, "dog")))
+				ra_chk(&bad, len(after) == len(src), fmt.tprintf("same-length replacement leaves the length alone (%d, want %d)", len(after), len(src)))
+				// One entry, not 120. len(doc.undo) is the stack the pre-replace
+				// state sits on; doc_history_len is what the History panel walks.
+				ra_chk(&bad, len(doc.undo) - before_undo == 1, fmt.tprintf("one undo entry for the whole operation (%d)", len(doc.undo) - before_undo))
+				ra_chk(&bad, doc_history_len(&doc) - before_hist == 1, fmt.tprintf("one history state added (%d)", doc_history_len(&doc) - before_hist))
+				// ...and it is the RIGHT entry: one Ctrl+Z returns the original
+				// byte for byte. A single entry holding the wrong snapshot passes
+				// the count check above and loses the document.
+				doc_undo(&doc)
+				back := doc_debug_string(&doc)
+				ra_chk(&bad, back == src, fmt.tprintf("one undo restores the original exactly (%d bytes vs %d)", len(back), len(src)))
+			}
+
+			// A replacement CONTAINING the search term must not feed itself. The
+			// matches are measured before the first splice and never re-scanned, so
+			// this terminates with each original occurrence expanded once.
+			{
+				src := strings.repeat("cat cat cat\n", 40, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra2.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				replaced, _, _, _ := run(&doc, "cat", "cat cat", false)
+				after := doc_debug_string(&doc)
+				ra_chk(&bad, replaced == 120, fmt.tprintf("'cat' -> 'cat cat' replaces the 120 that existed (%d)", replaced))
+				ra_chk(&bad, strings.count(after, "cat") == 240, fmt.tprintf("...and stops there: %d cats (want 240, not a growing number)", strings.count(after, "cat")))
+			}
+
+			// Overlapping candidates. "aa" over "aaaa" publishes three matches for
+			// four bytes; replacing all three splices each into what the last one
+			// wrote. Two replacements is the only answer that fits.
+			{
+				src := strings.repeat("aaaa\n", 30, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra3.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				replaced, _, matches, _ := run(&doc, "aa", "b", false)
+				after := doc_debug_string(&doc)
+				want := strings.repeat("bb\n", 30, context.temp_allocator)
+				ra_chk(&bad, matches == 90, fmt.tprintf("the scan really does publish overlapping matches (%d, want 3 per line)", matches))
+				ra_chk(&bad, replaced == 60, fmt.tprintf("only the non-overlapping ones are replaced (%d, want 2 per line)", replaced))
+				ra_chk(&bad, after == want, fmt.tprintf("'aaaa' -> 'bb', not 'b' (%q...)", after[:min(len(after), 12)]))
+			}
+
+			// An empty search string replaces nothing and leaves the buffer alone.
+			// find_recompute short-circuits before any scan, so there is no match
+			// list at all -- the interesting failure would be a zero-length match
+			// at every offset.
+			{
+				src := strings.repeat("cat cat cat\n", 4, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra4.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				before_undo := len(doc.undo)
+				replaced, _, matches, _ := run(&doc, "", "dog", false)
+				after := doc_debug_string(&doc)
+				ra_chk(&bad, matches == 0 && replaced == 0, fmt.tprintf("an empty search replaces nothing (%d matches, %d replaced)", matches, replaced))
+				ra_chk(&bad, after == src, "...and the buffer is byte-identical")
+				ra_chk(&bad, len(doc.undo) == before_undo, "...and pushes no undo entry")
+			}
+
+			// Regex mode. The replacement is LITERAL -- group substitution ($1) is
+			// unimplemented (find.odin's header says so), so this pins today's
+			// behaviour rather than leaving it to be discovered: a "$1" in the
+			// replace field lands in the file as those two characters.
+			{
+				src := strings.repeat("cat cat cat\n", 10, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra5.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				replaced, _, matches, _ := run(&doc, "c(a)t", "X$1", true)
+				after := doc_debug_string(&doc)
+				ra_chk(&bad, matches == 30 && replaced == 30, fmt.tprintf("a capture-group pattern matches and replaces all 30 (%d/%d)", matches, replaced))
+				ra_chk(&bad, strings.count(after, "X$1") == 30, fmt.tprintf("the replacement is literal today -- no $1 substitution (%d)", strings.count(after, "X$1")))
+				ra_chk(&bad, strings.count(after, "Xa") == 0, "...and specifically the group is NOT spliced in")
+			}
+
+			// WHAT IT COSTS THE UI THREAD AT THE CEILING.
+			//
+			// Replace All runs on the main thread and must: it is a buffer write,
+			// and every buffer write in Newtpad is the main thread's (undo
+			// snapshots, the piece tree, the line index all assume it). So the
+			// question is not "can it be moved off" but "is it BOUNDED" -- and it
+			// is, twice over: the match list is capped at MAX_MATCHES, and a pass
+			// that hit the cap reports complete=false so the user is told to run it
+			// again rather than left believing a rename finished.
+			//
+			// This measures the worst MATCH COUNT that bound allows -- a saturated
+			// list -- and fails if it ever crosses a second, which is the difference
+			// between a stutter and an app that looks hung. It is NOT the worst
+			// document: this fixture is a 480 KB in-memory buffer with no bookmarks,
+			// while a multi-GB mmap-backed file gives deeper piece-tree splices, and
+			// bookmarks_shift_replace (doc.odin) is O(matches x bookmarks) -- so
+			// 100k splices against a populated bookmark list pays for iterations
+			// this run never does. The <1s guard below is a genuine O(n^2) tripwire
+			// and should stay; just don't read it as a whole-file guarantee. The
+			// number is printed either way: it is the input to any future decision
+			// to chunk this across frames.
+			{
+				src := strings.repeat("cat\n", 120_000, context.temp_allocator) // > MAX_MATCHES
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra6.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				find_open(&doc, true)
+				clear(&doc.find.query)
+				clear(&doc.find.replace)
+				for c in "cat" {find_input_rune(&doc, c)}
+				doc.find.field = 1
+				for c in "dogs" {find_input_rune(&doc, c)}
+				doc.find.field = 0
+				find_wait(&doc)
+				matches := len(doc.find.matches)
+				before_undo := len(doc.undo)
+				start := time.tick_now()
+				replaced, complete := find_replace_all(&doc)
+				ms := time.duration_milliseconds(time.tick_since(start))
+				ra_chk(&bad, matches == MAX_MATCHES, fmt.tprintf("the match list really is saturated (%d of MAX_MATCHES=%d)", matches, MAX_MATCHES))
+				ra_chk(&bad, replaced == MAX_MATCHES, fmt.tprintf("all %d of them are replaced (%d)", MAX_MATCHES, replaced))
+				ra_chk(&bad, !complete, "a saturated pass reports itself INCOMPLETE, so the user is told to run it again")
+				fmt.printfln("  ---   %d replacements on the main thread: %.0f ms", replaced, ms)
+				ra_chk(&bad, ms < 1000, fmt.tprintf("the largest splice batch measured stays under a second (%.0f ms) -- not a whole-file guarantee: see the comment above on bookmarks_shift_replace", ms))
+
+				// The count the function reports is not the buffer -- that gap is
+				// exactly what the from-the-caret sabotage exploited earlier in this
+				// file, and it went undetected until something read the document. The
+				// saturated path is the largest, most splice-heavy path in the whole
+				// feature, so it gets the same buffer-reading proof the 120-match case
+				// above got, not just the number.
+				after := doc_debug_string(&doc)
+				ra_chk(&bad, strings.count(after, "dogs") == MAX_MATCHES, fmt.tprintf("the document actually holds %d replacements, not just the returned count (%d)", MAX_MATCHES, strings.count(after, "dogs")))
+				ra_chk(&bad, len(after) == len(src)+MAX_MATCHES, fmt.tprintf("length grew by exactly one byte per replacement ('cat'->'dogs') (%d, want %d)", len(after), len(src)+MAX_MATCHES))
+				ra_chk(&bad, len(doc.undo)-before_undo == 1, fmt.tprintf("a saturated pass is still one undo entry, not %d thousand (%d)", MAX_MATCHES/1000, len(doc.undo)-before_undo))
+				doc_undo(&doc)
+				back := doc_debug_string(&doc)
+				ra_chk(&bad, back == src, fmt.tprintf("a partial (incomplete) result is still undoable in one step, byte for byte (%d bytes vs %d)", len(back), len(src)))
+			}
+
+			// The overlap/zero-length rule on its own, on inputs the scanner cannot
+			// easily be made to produce. Two empty matches at one offset is the case
+			// that inserts the replacement twice in the same place.
+			{
+				cases := []struct {
+					m, l, want: []int,
+					what:       string,
+				} {
+					{{0, 1, 2}, {2, 2, 2}, {0, 2}, "overlapping 2-byte matches keep the leftmost pair"},
+					{{0, 3, 6}, {3, 3, 3}, {0, 1, 2}, "adjacent non-overlapping matches are all kept"},
+					{{5, 5}, {0, 0}, {0}, "two zero-length matches at one offset keep one"},
+					{{2, 3, 4}, {0, 0, 0}, {0, 1, 2}, "zero-length matches at distinct offsets are all kept"},
+					{{}, {}, {}, "an empty match list keeps nothing"},
+				}
+				for c in cases {
+					out := make([]int, max(len(c.m), 1), context.temp_allocator)
+					n := find_keep_set(c.m, c.l, out)
+					ok := n == len(c.want)
+					if ok {
+						for k in 0 ..< n {if out[k] != c.want[k] {ok = false}}
+					}
+					ra_chk(&bad, ok, fmt.tprintf("%s (got %v, want %v)", c.what, out[:n], c.want))
+				}
+			}
+			return
+		}
+
+		// The replace row's buttons: what the DRAW emits is what the CLICK
+		// accepts, at every width including the narrowest one that still renders
+		// them. HANDOFF 6j: sixteen bugs in one session were all a correct
+		// function fed the wrong input, or its answer read in the wrong space --
+		// and this row moved from the bottom of the window to the top earlier in
+		// this very release.
+		findtest_replace_seam :: proc() -> (bad: int) {
+			fmt.println("--- the replace row's buttons: drawn == clickable ---")
+			rs_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			t: plat.Text
+			plat.text_load_faces(&t)
+			saved := UI_SCALE
+			defer UI_SCALE = saved
+
+			doc := doc_from_content(transmute([]u8)strings.clone("cat cat cat\n"), "seam.txt", .UTF8)
+			defer doc_close(&doc)
+			doc.kind = .Text
+			find_open(&doc, true)
+			buf: [2]Find_Action
+
+			// The accelerators are read off the keymap, so the button teaches the
+			// chord that actually works. A button labelled with no chord at all is
+			// half the point of this row missing.
+			rs_chk(&bad, command_chord(.Find_Replace_One) == "Ctrl+Enter", fmt.tprintf("Replace Match teaches Ctrl+Enter (%q)", command_chord(.Find_Replace_One)))
+			rs_chk(&bad, command_chord(.Find_Replace_All) == "Ctrl+Alt+Enter", fmt.tprintf("Replace All teaches Ctrl+Alt+Enter (%q)", command_chord(.Find_Replace_All)))
+
+			for scale in ([]f32{1.0, 1.5, 2.0}) {
+				UI_SCALE = scale
+				row_h := sx(FIND_BAR_H_96)
+				// The narrowest width that renders them, found by ASKING the layout
+				// rather than by trusting a constant that could drift from it.
+				minw := f32(-1)
+				for wpx := f32(120); wpx <= 2400; wpx += 1 {
+					if len(find_actions(&doc, &t, wpx, buf[:])) == 2 {
+						minw = wpx
+						break
+					}
+				}
+				rs_chk(&bad, minw > 0, fmt.tprintf("scale %.2f: the buttons render at some width (%.0f)", scale, minw))
+				if minw < 0 {continue}
+
+				// One pixel narrower renders NONE -- and nothing is clickable
+				// there either. Both directions, or "drawn == clickable" is only
+				// checked where something is drawn.
+				narrow := find_actions(&doc, &t, minw - 1, buf[:])
+				rs_chk(&bad, len(narrow) == 0, fmt.tprintf("scale %.2f: one pixel narrower draws no buttons (%d)", scale, len(narrow)))
+				wide := find_actions(&doc, &t, minw, buf[:])
+				probe_x, probe_y := wide[0].x + wide[0].w * 0.5, wide[0].y + wide[0].h * 0.5
+				rs_chk(
+					&bad,
+					find_action_at(&doc, &t, minw - 1, probe_x, probe_y) == .None,
+					fmt.tprintf("scale %.2f: ...and nothing is clickable where they would have been", scale),
+				)
+
+				for wpx in ([]f32{minw, minw + 1, 800, 1280, 1920}) {
+					acts := find_actions(&doc, &t, wpx, buf[:])
+					if !(len(acts) == 2) {
+						rs_chk(&bad, false, fmt.tprintf("scale %.2f w=%.0f: both buttons render (%d)", scale, wpx, len(acts)))
+						continue
+					}
+					for a, i in acts {
+						lbl := fmt.tprintf("scale %.2f w=%.0f %v", scale, wpx, a.cmd)
+						// The seam itself: the centre, and every corner just inside
+						// the box, hit-tests back to this button's own command.
+						hits := 0
+						for p in ([][2]f32 {
+								{a.x + a.w * 0.5, a.y + a.h * 0.5},
+								{a.x, a.y},
+								{a.x + a.w - 1, a.y},
+								{a.x, a.y + a.h - 1},
+								{a.x + a.w - 1, a.y + a.h - 1},
+							}) {
+							if find_action_at(&doc, &t, wpx, p[0], p[1]) == a.cmd {hits += 1}
+						}
+						rs_chk(&bad, hits == 5, fmt.tprintf("%s: clickable at its centre and all four corners (%d/5)", lbl, hits))
+						// ...and NOT one pixel outside it, or the boxes are bigger
+						// than they look and the gap between them is a lie.
+						rs_chk(
+							&bad,
+							find_action_at(&doc, &t, wpx, a.x - 1, a.y + a.h * 0.5) != a.cmd &&
+							find_action_at(&doc, &t, wpx, a.x + a.w, a.y + a.h * 0.5) != a.cmd,
+							fmt.tprintf("%s: not clickable one pixel outside its own box", lbl),
+						)
+						// The band check. Without it every assertion above is
+						// self-consistent nonsense: a layout that put the buttons on
+						// the FIND row, or below the bar entirely, would still hit-test
+						// to itself. This is the one that fails when the bar moves and
+						// the buttons do not follow it.
+						rs_chk(
+							&bad,
+							a.y >= CHROME_TOP + row_h - 0.5 && a.y + a.h <= CHROME_TOP + doc_top_bar_h(&doc) + 0.5,
+							fmt.tprintf("%s: sits inside the REPLACE row [%.0f,%.0f), box [%.0f,%.0f)", lbl, CHROME_TOP + row_h, CHROME_TOP + doc_top_bar_h(&doc), a.y, a.y + a.h),
+						)
+						// A press on the find row above, at the same x, is not this
+						// button -- the other half of the same claim, read through
+						// the hit-test instead of through the geometry.
+						rs_chk(
+							&bad,
+							find_action_at(&doc, &t, wpx, a.x + a.w * 0.5, CHROME_TOP + row_h * 0.5) == .None,
+							fmt.tprintf("%s: the find row above it is not a button", lbl),
+						)
+						// On screen, and left of the right margin.
+						rs_chk(&bad, a.x >= 0 && a.x + a.w <= wpx, fmt.tprintf("%s: inside the window (%.0f..%.0f of %.0f)", lbl, a.x, a.x + a.w, wpx))
+						// The text the draw emits is inside the box it fills.
+						cw := plat.text_char_width(&t, UI_SMALL_PX)
+						rs_chk(
+							&bad,
+							a.tx >= a.x && a.cx + f32(len(a.chord)) * cw <= a.x + a.w + 0.5,
+							fmt.tprintf("%s: label and chord fit inside the button (%.0f..%.0f of %.0f..%.0f)", lbl, a.tx, a.cx + f32(len(a.chord)) * cw, a.x, a.x + a.w),
+						)
+						rs_chk(&bad, a.chord != "", fmt.tprintf("%s: carries an accelerator", lbl))
+						if i == 1 {
+							rs_chk(&bad, a.x >= acts[0].x + acts[0].w, fmt.tprintf("%s: does not overlap the button before it", lbl))
+						}
+					}
+				}
+			}
+
+			// With the replace row shut there is nothing to draw and nothing to
+			// click. Probed at a coordinate that IS a button while it is open, so
+			// the check cannot pass by testing empty space.
+			{
+				UI_SCALE = 1
+				acts := find_actions(&doc, &t, 1280, buf[:])
+				px, py := acts[0].x + acts[0].w * 0.5, acts[0].y + acts[0].h * 0.5
+				doc.find.replace_mode = false
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 0, "no buttons while the replace row is closed")
+				rs_chk(&bad, find_action_at(&doc, &t, 1280, px, py) == .None, "...and that spot is not clickable")
+				doc.find.replace_mode = true
+				doc.find.active = false
+				rs_chk(&bad, find_action_at(&doc, &t, 1280, px, py) == .None, "...nor is it with the find bar closed")
+				doc.find.active = true
+			}
+
+			// A read-only view (the table grid, a full Markdown Preview) takes no
+			// caret, so a press on these buttons never reaches find_action_at --
+			// ro_surface_swallows (main.odin) eats it before find_action_at is
+			// even asked. Before this fix that swallow was invisible from here:
+			// find_actions drew two live-looking, hover-filling, hand-cursored
+			// buttons in table view and Preview that did nothing when clicked.
+			// Wyatt, live use: "Ctrl+H has no ... explanation of what you're to
+			// do on this menu" -- the narrower shape of that same complaint.
+			// find_actions is the one producer of this row's geometry, so
+			// refusing there is what keeps the draw, the hover fill, the cursor
+			// and the hit-test from being four separate opinions.
+			{
+				UI_SCALE = 1
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 2, "precondition: an ordinary text view gets both buttons")
+				doc.table = true
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 0, "table view: no action boxes even with the replace row open")
+				doc.table = false
+				doc.md_mode = .Preview
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 0, "Markdown Preview: no action boxes either")
+				doc.md_mode = .Split
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 2, "...but Split's left half IS the editor, so its buttons stay live")
+				doc.md_mode = .Off
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 2, "...and back to normal once the view is text again")
+			}
+			return
+		}
+
 		// `newtpad findtest` covers the literal scan's block-boundary handling and
 		// the line starts the worker computes for the filter view — both of which
 		// are per-block bookkeeping that a single-block search would never exercise.
@@ -1123,6 +1519,8 @@ when NEWTPAD_TESTS {
 			bad += findtest_filter_click_frame()
 			bad += findtest_first_paint()
 			bad += findtest_autoselect()
+			bad += findtest_replace_all()
+			bad += findtest_replace_seam()
 			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")
 			return true
 		}
@@ -2390,10 +2788,276 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// mdtest's DRAW-level checks: markdown_draw itself, not just its pure
+		// helpers. A 2026-07 review found the pure-helper checks blind to two real
+		// defects that live only at markdown_draw's OWN call sites -- sabotaging
+		// the call site (not the shared procedure underneath it) left every
+		// md_selftest assertion green, because those only ever drove the shared
+		// procedures directly with hand-picked arguments, never asked what the
+		// draw itself passes:
+		//
+		//   - a done task item's prose colour (Finding 1/2): md_selftest's own
+		//     coverage calls md_task_prose_style directly, so a call site that
+		//     bypassed it (`task_mute = 0` after the call, or reverting to a
+		//     literal Text_Muted base) would go unnoticed.
+		//   - the front-matter card's row advance (Finding 2/7): the card's
+		//     HEIGHT is computed once (md_fm_height) and the draw re-derives the
+		//     same total as a sum of per-fence and per-row increments; nothing
+		//     forces the two to stay equal, and md_front_matter_end used to read
+		//     lines through a SHORTER buffer than markdown_draw's own fence
+		//     check, so they could already disagree on a long enough line.
+		//
+		// Both are read back from a REAL offscreen render (Headless_Gpu, the
+		// quadsdftest precedent) -- the only way to ask "what did markdown_draw
+		// actually draw" without hand-copying its logic into the test.
+		md_draw_selftest :: proc() -> (bad: int) {
+			dchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1000, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/draw") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			sample :: proc(buf: []u8, w, x, y: int) -> (b, g, r, a: u8) {
+				i := (y * w + x) * 4
+				return buf[i], buf[i + 1], buf[i + 2], buf[i + 3]
+			}
+			near :: proc(c: [4]f32, b, g, r: u8, tol: int) -> bool {
+				want := [3]u8{u8(c[2] * 255 + 0.5), u8(c[1] * 255 + 0.5), u8(c[0] * 255 + 0.5)}
+				return abs(int(b) - int(want[0])) <= tol && abs(int(g) - int(want[1])) <= tol && abs(int(r) - int(want[2])) <= tol
+			}
+
+			px_ := f32(24)
+			char_w := plat.text_char_width(&h.text, px_, .Doc)
+			x0, x1 := f32(40), f32(900)
+			ytop, ybot := f32(60), f32(650)
+
+			// --- a done item's prose lands where an undone item's does, muted --
+			// not muted twice (Finding 1/2), and not left at full strength either.
+			// "IIII": a monospace glyph whose vertical stroke gives a solid,
+			// near-full-coverage column, so the sampled pixel is close to the
+			// glyph's TRUE resolved colour and not an antialiasing blend.
+			//
+			// TWO samples off the same readback, because the plain one alone
+			// cannot see the defect Wyatt actually reported ("the base color text
+			// gets muted but the theme colors don't"). Restore the original bug at
+			// markdown.odin's call site -- `task_col = Text_Muted` with task_mute
+			// left at 0 -- and the plain glyph draws at Text_Muted; but
+			// MD_DONE_MUTE is DERIVED so that mute(Text_Primary, 0.26) ~=
+			// Text_Muted, so `want` below and the bug's output are the same colour
+			// and no tolerance can separate them. That assertion rejects "muted
+			// twice" and is blind to "not muted at all" (2026-07 whole-branch
+			// review).
+			//
+			// A STYLED run can tell them apart: md_run_color overwrites the base
+			// colour for a code/bold/link/italic run, so the base is irrelevant
+			// there and only the MUTE step distinguishes done from undone. With
+			// task_mute at 0 the code span draws at full Md_Code -- pixel-identical
+			// to an undone item's -- which is exactly the two checks below.
+			{
+				// The backtick pair is load-bearing: it is what puts a styled run
+				// on the line to sample.
+				mk :: proc(done: bool) -> Document {
+					src := "- [x] IIII `II`\n" if done else "- [ ] IIII `II`\n"
+					content := make([]u8, len(src))
+					copy(content, src)
+					return doc_from_content(content, "t.md", .UTF8)
+				}
+				// The glyph cell right after the checkbox + its gap, same geometry
+				// markdown_draw itself computes for the task branch.
+				gx0 := int(x0 + char_w * 1.4 + char_w)
+				gx1 := int(x0 + char_w * 1.4 + char_w * 2.2)
+				// ...and the code span: md_inline splits `IIII \`II\`` into the
+				// plain word "IIII " (5 cells, trailing space kept by
+				// md_draw_inline's word split) and then the code run, so the code
+				// run's first cell starts 5 cells further right.
+				cx0 := int(x0 + char_w * 1.4 + char_w * 6)
+				cx1 := int(x0 + char_w * 1.4 + char_w * 7.2)
+				gy0 := int(ytop)
+				gy1 := int(ytop + px_ * 1.3)
+				render :: proc(h: ^Headless_Gpu, doc: ^Document, x0, x1, ytop, ybot, px_, char_w: f32) -> (buf: []u8, ok: bool) {
+					bg := g_theme[.Bg_Base]
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, char_w, x0, x1, ytop, ybot, 0)
+					return plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				}
+				// The sample FARTHEST from the background is the pixel closest to
+				// full glyph coverage -- an antialiased edge pixel is a blend along
+				// the [bg, glyph-colour] segment, so it is always nearer bg than
+				// the fully-covered interior is.
+				peak :: proc(buf: []u8, gx0, gx1, gy0, gy1, W, H: int) -> (found: bool, b, g, r: u8) {
+					bg := g_theme[.Bg_Base]
+					best := -1
+					for yy in max(0, gy0) ..< min(H, gy1) {
+						for xx in max(0, gx0) ..< min(W, gx1) {
+							bb, gg, rr, _ := sample(buf, W, xx, yy)
+							d := abs(int(bb) - int(bg[2] * 255)) + abs(int(gg) - int(bg[1] * 255)) + abs(int(rr) - int(bg[0] * 255))
+							if d > best {best, b, g, r = d, bb, gg, rr}
+						}
+					}
+					return best > 0, b, g, r
+				}
+				doc_done := mk(true)
+				buf_d, ok_d := render(&h, &doc_done, x0, x1, ytop, ybot, px_, char_w)
+				doc_close(&doc_done)
+				doc_undone := mk(false)
+				buf_u, ok_u := render(&h, &doc_undone, x0, x1, ytop, ybot, px_, char_w)
+				doc_close(&doc_undone)
+				dchk(&bad, ok_d && ok_u, "task items: both readbacks succeeded")
+				if ok_d && ok_u {
+					fnd, b, g, r := peak(buf_d, gx0, gx1, gy0, gy1, W, H)
+					dchk(&bad, fnd, "done task item: the plain-prose glyph is found on screen at all")
+					if fnd {
+						want := md_mute(g_theme[.Text_Primary], MD_DONE_MUTE)
+						bad_want := md_mute(g_theme[.Text_Muted], MD_DONE_MUTE) // the double-mute this test must reject
+						dchk(
+							&bad, near(want, b, g, r, 24) && !near(bad_want, b, g, r, 10),
+							fmt.tprintf(
+								"done task item: markdown_draw's OWN call site does not mute prose TWICE (got bgr %d,%d,%d; single-mute #%02X%02X%02X; double-mute #%02X%02X%02X)",
+								b, g, r,
+								u8(want[0] * 255), u8(want[1] * 255), u8(want[2] * 255),
+								u8(bad_want[0] * 255), u8(bad_want[1] * 255), u8(bad_want[2] * 255),
+							),
+						)
+					}
+
+					dfnd, db, dg, dr := peak(buf_d, cx0, cx1, gy0, gy1, W, H)
+					ufnd, ub, ug, ur := peak(buf_u, cx0, cx1, gy0, gy1, W, H)
+					dchk(&bad, dfnd && ufnd, "task items: the code-span glyph is found on screen in both")
+					if dfnd && ufnd {
+						// 1. An UNDONE item's code span is plain Md_Code. This is
+						// the control: it pins the sample window on the right
+						// glyph, so a failure of (2) means "the mute is missing",
+						// not "we sampled empty background".
+						lit := g_theme[.Md_Code]
+						dchk(
+							&bad, near(lit, ub, ug, ur, 24),
+							fmt.tprintf("undone task item: its code span draws at full Md_Code (got bgr %d,%d,%d; want #%02X%02X%02X)", ub, ug, ur, u8(lit[0] * 255), u8(lit[1] * 255), u8(lit[2] * 255)),
+						)
+						// 2. ...and the DONE item's same code span is muted from
+						// it. `!near(lit, .., 10)` is the half that fails when the
+						// call site stops passing a mute -- the styled run's colour
+						// does not depend on the base at all, so nothing else in
+						// this suite can observe that.
+						dim := md_mute(lit, MD_DONE_MUTE)
+						dchk(
+							&bad, near(dim, db, dg, dr, 24) && !near(lit, db, dg, dr, 10),
+							fmt.tprintf(
+								"done task item: markdown_draw's OWN call site mutes a STYLED run too (got bgr %d,%d,%d; muted #%02X%02X%02X; unmuted #%02X%02X%02X)",
+								db, dg, dr,
+								u8(dim[0] * 255), u8(dim[1] * 255), u8(dim[2] * 255),
+								u8(lit[0] * 255), u8(lit[1] * 255), u8(lit[2] * 255),
+							),
+						)
+						// 3. And stated as a direct comparison, independent of
+						// MD_DONE_MUTE's value: done and undone must not render the
+						// same styled pixel.
+						delta := abs(int(db) - int(ub)) + abs(int(dg) - int(ug)) + abs(int(dr) - int(ur))
+						dchk(&bad, delta >= 24, fmt.tprintf("done vs undone: the code span is visibly dimmer when the item is done (channel delta %d)", delta))
+					}
+				}
+			}
+
+			// --- front matter: the card only appears when the view starts at the
+			// top of the file (the p==0 gate), and the block after it starts
+			// EXACTLY where md_fm_height says the card ends -- not wherever
+			// markdown_draw's own per-line/per-fence increments happen to sum to
+			// (Finding 2's "two producers", Finding 7's buffer-size mismatch).
+			{
+				inner :: 2
+				src := "---\na: 1\nb: 2\n---\n***\n"
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "fm.md", .UTF8)
+				defer doc_close(&doc)
+				fm_end, fm_inner := md_front_matter_end(&doc)
+				dchk(&bad, fm_inner == inner, fmt.tprintf("front matter fixture: inner lines counted as %d (want %d)", fm_inner, inner))
+
+				line_h := line_height(px_)
+				bg := g_theme[.Bg_Base]
+
+				// `bottom` alone, on a doc with NOTHING after the closing fence:
+				// with the "***" trailing line present, markdown_draw keeps going
+				// (it fits the viewport), so `bottom` would legitimately run past
+				// `fm_end` -- that is not evidence of anything. Bare front matter
+				// is the only fixture where "the front-matter branch's own last
+				// `bottom = end` IS the returned bottom" is actually what a
+				// bottom == fm_end comparison is asking.
+				{
+					bare_src := "---\na: 1\nb: 2\n---\n"
+					bare_content := make([]u8, len(bare_src))
+					copy(bare_content, bare_src)
+					bare_doc := doc_from_content(bare_content, "fmbare.md", .UTF8)
+					defer doc_close(&bare_doc)
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					bare_bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &bare_doc, px_, char_w, x0, x1, ytop, ybot, 0)
+					dchk(&bad, bare_bottom == fm_end, fmt.tprintf("front matter: with nothing after it, markdown_draw's `bottom` (%d) is md_front_matter_end's `end` (%d)", bare_bottom, fm_end))
+				}
+
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, 0)
+				buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				dchk(&bad, ok, "front matter: readback")
+				if ok {
+					// Card presence, top-left corner. A tight tolerance (3, not
+					// the usual 10): Md_Code_Bg and Bg_Base are both near-neutral
+					// darks only ~7-8/255 apart per channel in Dark, so a loose
+					// bound would call the bare background "the card" and this
+					// check would pass whether or not anything was drawn.
+					cb, cg, cr, _ := sample(buf, W, int(x0) + 3, int(ytop) + 3)
+					dchk(&bad, near(g_theme[.Md_Code_Bg], cb, cg, cr, 3), "front matter: the card is drawn (Md_Code_Bg at its top-left corner)")
+
+					// The RULE line ("***") right after the block is a SOLID,
+					// unantialiased-interior quad -- unlike prose, its colour is
+					// exact evidence of where markdown_draw's y actually landed,
+					// with no glyph coverage guesswork. Expected row is computed
+					// INDEPENDENTLY, from md_fm_height/md_fm_pad, not by copying
+					// markdown_draw's increments.
+					rule_y := ytop + px_ * 0.5 + md_fm_height(line_h, fm_inner)
+					rb, rg, rr, _ := sample(buf, W, int(x0) + 50, int(rule_y) + int(hairline() * 0.5))
+					dchk(
+						&bad, near(g_theme[.Md_Rule], rb, rg, rr, 10),
+						fmt.tprintf("front matter: the rule after the block sits exactly at md_fm_height's row (y=%.1f)", rule_y),
+					)
+					// A row clearly ABOVE that must NOT already be the rule -- or
+					// "found the rule somewhere" could pass by accident from a
+					// too-generous scan.
+					ab, ag, ar, _ := sample(buf, W, int(x0) + 50, int(rule_y) - 6)
+					dchk(&bad, !near(g_theme[.Md_Rule], ab, ag, ar, 10), "front matter: 6px above that row is NOT the rule (bound is tight, not a scan)")
+				}
+
+				// The p==0 gate: scrolled to start exactly at the front matter's
+				// end, the card must NOT be drawn at all.
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				bottom2 := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, fm_end)
+				dchk(&bad, bottom2 > fm_end, "front matter: scrolled past it, markdown_draw advances past fm_end (the rule line), not stuck")
+				buf2, ok2 := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				if ok2 {
+					cb, cg, cr, _ := sample(buf2, W, int(x0) + 3, int(ytop) + 3)
+					// Same tight tolerance as the presence check above, for the
+					// same reason: Bg_Base sits within a loose bound of
+					// Md_Code_Bg, which would make an undrawn card look drawn.
+					dchk(&bad, !near(g_theme[.Md_Code_Bg], cb, cg, cr, 3), "front matter: scrolled past it, NO card is drawn (the p==0 gate)")
+				}
+			}
+			return bad
+		}
+
 		// `newtpad mdtest` covers the markdown block classifiers and inline parser
-		// (the rendering itself needs a live eye).
+		// (the rendering itself needs a live eye), PLUS the draw-level checks
+		// above that exercise markdown_draw's own call sites through a real
+		// offscreen device.
 		if os.args[1] == "mdtest" {
 			bad := md_selftest()
+			bad += md_draw_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
 			return true
 		}
@@ -2808,6 +3472,113 @@ when NEWTPAD_TESTS {
 
 			app_destroy(&app)
 			fmt.printfln("tabreordertest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad taborder` pins the tab-order INVARIANT rather than one symptom:
+		// the rail's display order is the order tabs were added, and the only thing
+		// that ever reorders it is an explicit user drag. Not closing a tab, not
+		// opening one, not restoring a session. Wyatt: "sometimes tabs get added in
+		// the middle of the tab list... it should always appear at the end", and on
+		// being shown the diagnosis, "I don't want random order tabs, unacceptable."
+		//
+		// The order is asserted after EVERY step, because the invariant has more
+		// than one way to break: app_add used to reuse the first freed slot (so a
+		// file opened after closing a middle tab landed in the hole), and the
+		// save/restore round-trip is a second, independent route to the same rail.
+		// Checking only open-after-close would pass while leaving the others open.
+		//
+		// Set NEWTPAD_SESSION_DIR to a temp dir first -- this mode writes a session.
+		if os.args[1] == "taborder" {
+			if !require_scratch_session("taborder") {return true}
+			to_chk :: proc(bad: ^int, got, want, msg: string) {
+				ok := got == want
+				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				if !ok {
+					fmt.printfln("         got  %q", got)
+					fmt.printfln("         want %q", want)
+					bad^ += 1
+				}
+			}
+			// The rail draws a.docs in slot order and skips nil slots (tabs_layout),
+			// so the live slots' labels, in slot order, ARE the display order.
+			to_order :: proc(a: ^App) -> string {
+				sb := strings.builder_make(context.temp_allocator)
+				for d in a.docs {
+					if d == nil {continue}
+					strings.write_string(&sb, tab_label(a, d))
+					strings.write_byte(&sb, '|')
+				}
+				return strings.to_string(sb)
+			}
+			// Real files in their own directory, not bare Documents carrying a made-up
+			// path. A clean tab is saved with bidx -1 and restored by REOPENING THE
+			// PATH, so a fabricated path is dropped by the restore and the second half
+			// of this test could never fail for the reason it exists. The directory
+			// keeps the labels short (tab_label is the base name) so a mismatch prints
+			// readably.
+			to_open :: proc(a: ^App, name: string) -> bool {
+				dir := fmt.tprintf("%s%cnewtpad_taborder", os.get_env("TEMP", context.temp_allocator), '\\')
+				plat.dir_create(dir)
+				p := fmt.tprintf("%s%c%s", dir, '\\', name)
+				plat.file_write_atomic(p, transmute([]u8)string("tab order fixture\n"))
+				return app_open_path(a, p)
+			}
+			// PART ONE: open / close / open / drag. One App live in this proc, and
+			// part two's App is in a proc of its own -- test_mode_dispatch already has
+			// a large frame and has hit a real STATUS_STACK_OVERFLOW from two Apps
+			// held live together.
+			to_opens :: proc(bad: ^int) {
+				app: App
+				defer app_destroy(&app)
+				for name in ([]string{"a.txt", "b.txt", "c.txt", "d.txt"}) {
+					if !to_open(&app, name) {fmt.printfln("  (could not open %s)", name)}
+				}
+				to_chk(bad, to_order(&app), "a.txt|b.txt|c.txt|d.txt|", "four opens keep their order")
+				app_close(&app, 1) // b.txt, a middle tab
+				to_chk(bad, to_order(&app), "a.txt|c.txt|d.txt|", "closing the middle does not reorder the rest")
+				if !to_open(&app, "e.txt") {fmt.printfln("  (could not open %s)", "e.txt")}
+				to_chk(bad, to_order(&app), "a.txt|c.txt|d.txt|e.txt|", "a new tab appends after the last live tab")
+				session_save(&app)
+				// The one legal reorder. Asserted so the invariant is "only a drag
+				// moves a tab", not "nothing ever moves a tab" -- a proc that simply
+				// refused to reorder would pass every check above. Driven through
+				// tabs_drag_update itself (not app_swap_tabs directly), the same way
+				// tabreordertest does, so the label is true -- an explicit drag really
+				// is what runs here -- and this is the only test covering the drag
+				// path with a nil hole present (slot 1, freed above by closing
+				// b.txt, sits between the live tabs the whole time). Dragging c.txt
+				// (slot 2, display index 1) to the front produces exactly the
+				// slot-0/slot-2 swap this assertion checked before.
+				app.tab_drag_slot = 2 // c.txt's slot
+				w: plat.Window
+				w.mouse_y = 5
+				w.mouse_x = 0 // far left -> target display index 0
+				rt: plat.Text
+				plat.text_load_faces(&rt)
+				w.width = 1280
+				tabs_drag_update(&app, &w, &rt)
+				to_chk(bad, to_order(&app), "c.txt|a.txt|d.txt|e.txt|", "an explicit drag is the one thing that does reorder")
+			}
+			// PART TWO: the same rail, rebuilt from the session part one wrote.
+			to_restores :: proc(bad: ^int) {
+				app: App
+				defer app_destroy(&app)
+				if !session_restore(&app) {fmt.println("  (session_restore returned false)")}
+				to_chk(bad, to_order(&app), "a.txt|c.txt|d.txt|e.txt|", "a session restore preserves display order")
+			}
+			// Leave a clean session behind so a later GUI launch doesn't adopt these.
+			to_reset :: proc() {
+				empty: App
+				defer app_destroy(&empty)
+				app_new_scratch(&empty)
+				session_save(&empty)
+			}
+			bad := 0
+			to_opens(&bad)
+			to_restores(&bad)
+			to_reset()
+			fmt.printfln("taborder: %d failures", bad)
 			return true
 		}
 
@@ -7034,6 +7805,372 @@ when NEWTPAD_TESTS {
 				if !okd {bad += 1}
 			}
 
+			// --- a bare separator is not evidence of a path ---
+			// Wyatt: "it captures a LOT more than it should. For example this gets
+			// caught: hello/world ... also the click to goto link/explorer doesn't
+			// work." One defect, two faces: looks_like_path took any '/' or '\' as
+			// proof, so tokens that could never resolve got underlined, and the
+			// click handler then returned silently on the unresolvable target.
+			//
+			// Local procs, not inline blocks: this dispatcher's frame has hit
+			// STATUS_STACK_OVERFLOW twice.
+			lk_chk :: proc(bad: ^int, ok: bool, what: string) {
+				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", what)
+				if !ok {bad^ += 1}
+			}
+
+			lk_false_positives :: proc(bad: ^int) {
+				// Prose. A slash between two words is a slash between two words.
+				for s in ([]string {
+					"hello/world",
+					"and/or",
+					"24/7",
+					"he/she",
+					"07/28/2026",
+					"read/write",
+					"TODO/FIXME",
+					"n/a",
+					"input/output",
+					"km/h",
+				}) {
+					n := len(links_scan(s))
+					lk_chk(bad, n == 0, fmt.tprintf("%-14q is not a link (got %d)", s, n))
+				}
+				// ...and everything that must still be one. The first group carries a
+				// known text extension, the second only a path-ish prefix -- both are
+				// real evidence, and dropping either branch fails here.
+				for s in ([]string {
+					"readme.md",
+					"src/main.odin",
+					"./notes.md",
+					"../a/b.txt",
+					"..\\a\\b.txt",
+					"~/notes.md",
+					"./buildlog",
+					".\\buildlog",
+					"../out",
+					"/etc/hosts",
+					"C:\\temp\\thing",
+					"C:/temp/x.txt",
+					"\\\\srv\\share\\thing",
+					"https://example.com/x",
+				}) {
+					n := len(links_scan(s))
+					lk_chk(bad, n == 1, fmt.tprintf("%-22q is still a link (got %d)", s, n))
+				}
+			}
+
+			// The seam: everything DECORATED must be openable. Asserted directly on
+			// links_layout's output rather than inferred from links_scan, because the
+			// decoration is what promises a target -- and a promise detection invented
+			// and resolution declines is exactly the "click doesn't work" report.
+			lk_underline_implies_openable :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				real := fmt.tprintf("%s\\newtpad_lk_real.txt", dir)
+				plat.file_write_atomic(real, transmute([]u8)string("real"))
+				anchor := fmt.tprintf("%s\\newtpad_lk_anchor.txt", dir)
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				// One resolvable path, one prose token detection used to invent, and
+				// one well-formed absolute path that simply is not there.
+				body := "see ./newtpad_lk_real.txt and hello/world and C:\\newtpad_no_such_dir_zz\\missing.txt\n"
+				d := doc_from_content(transmute([]u8)strings.clone(body), anchor, .UTF8)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 200
+				d.view_rows = 10
+				hits := links_layout(&d, &tt, 10)
+				all_ok := true
+				for h in hits {
+					if _, rok := link_resolve(&d, h.text, h.link); !rok {
+						all_ok = false
+						fmt.printfln(
+							"    decorated but unresolvable: %q",
+							h.text[h.link.start:h.link.start + h.link.target_len],
+						)
+					}
+				}
+				lk_chk(bad, all_ok, "every decorated span resolves")
+				// ...and the gate is not vacuous: dropping EVERYTHING would satisfy the
+				// line above, so the one real path has to survive it.
+				kept := ""
+				if len(hits) == 1 {
+					kept = hits[0].text[hits[0].link.start:hits[0].link.start + hits[0].link.target_len]
+				}
+				lk_chk(
+					bad,
+					kept == "./newtpad_lk_real.txt",
+					fmt.tprintf("exactly the resolvable path is decorated (%d hits, kept %q)", len(hits), kept),
+				)
+			}
+
+			// The gate is only affordable because of the resolution cache, so the
+			// cache's own behaviour is asserted rather than assumed. Three claims,
+			// each of which some plausible wrong implementation would break:
+			//
+			//   - a missing target is not decorated              (the gate works)
+			//   - it stays undecorated after the file appears    (the cache is REAL:
+			//     a gate that re-stats every pass reports 1 here)
+			//   - an edit drops it and it becomes a link         (invalidation works:
+			//     a cache that never clears reports 0 here)
+			lk_cache_invalidation :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				late := fmt.tprintf("%s\\newtpad_lk_late.txt", dir)
+				plat.file_delete(late)
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				d := doc_from_content(
+					transmute([]u8)strings.clone("see ./newtpad_lk_late.txt now\n"),
+					fmt.tprintf("%s\\newtpad_lk_anchor.txt", dir),
+					.UTF8,
+				)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 200
+				d.view_rows = 10
+				n0 := len(links_layout(&d, &tt, 10))
+				lk_chk(bad, n0 == 0, fmt.tprintf("a missing target is not decorated (%d hits)", n0))
+				plat.file_write_atomic(late, transmute([]u8)string("late"))
+				n1 := len(links_layout(&d, &tt, 10))
+				lk_chk(bad, n1 == 0, fmt.tprintf("the answer is cached, not re-stat'd per pass (%d hits)", n1))
+				d.revision += 1 // exactly what any edit does
+				n2 := len(links_layout(&d, &tt, 10))
+				lk_chk(bad, n2 == 1, fmt.tprintf("an edit drops the cache and it becomes a link (%d hits)", n2))
+				plat.file_delete(late)
+			}
+
+			// ...and it is keyed on the ANCHOR as well as the token, so a `true` for
+			// one document cannot leak into another whose relative links mean a
+			// different folder. Runs straight after the proc above, whose last act was
+			// to cache this exact token as resolvable.
+			lk_cache_anchor :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				sub := fmt.tprintf("%s\\newtpad_lk_sub", dir)
+				os.make_directory(sub)
+				plat.file_delete(fmt.tprintf("%s\\newtpad_lk_late.txt", sub))
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				d := doc_from_content(
+					transmute([]u8)strings.clone("see ./newtpad_lk_late.txt now\n"),
+					fmt.tprintf("%s\\newtpad_lk_anchor.txt", sub),
+					.UTF8,
+				)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 200
+				d.view_rows = 10
+				// Matched to the revision the previous document ended on, so that the
+				// anchor is the only part of the cache generation that differs. (Its
+				// address may or may not coincide; that is not controllable from here.)
+				d.revision = 1
+				n := len(links_layout(&d, &tt, 10))
+				lk_chk(bad, n == 0, fmt.tprintf("a cached hit does not leak across anchors (%d hits)", n))
+			}
+
+			// ...and here is the same claim tested where it can actually fail.
+			//
+			// The proc above cannot see the anchor term at all: its second document is
+			// a fresh stack local, so `link_cache.doc == rawptr(doc)` already differs
+			// and the generation resets on the pointer no matter what the anchor
+			// comparison says. Deleting `link_cache.anchor == doc.path` from
+			// link_cache_sync leaves it at 0 failures — a test that cannot fail.
+			//
+			// The hazard's real shape is Save As: the SAME Document object, same
+			// revision, same top, doc.path re-pointed. Every other term of the
+			// generation matches, so the anchor is the only thing that can invalidate
+			// the cache, and a `true` cached against the old folder leaks to the new
+			// one where that relative link resolves to nothing. Sabotage the anchor
+			// term and this prints after_reanchor=1.
+			lk_cache_anchor_same_doc :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				sub := fmt.tprintf("%s\\newtpad_lk_sub", dir)
+				os.make_directory(sub)
+				plat.file_write_atomic(fmt.tprintf("%s\\newtpad_lk_sv.txt", dir), transmute([]u8)string("here"))
+				plat.file_delete(fmt.tprintf("%s\\newtpad_lk_sv.txt", sub)) // NOT beside the new anchor
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				d := doc_from_content(
+					transmute([]u8)strings.clone("see ./newtpad_lk_sv.txt now\n"),
+					fmt.tprintf("%s\\newtpad_lk_anchor.txt", dir),
+					.UTF8,
+				)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 200
+				d.view_rows = 10
+				before := len(links_layout(&d, &tt, 10))
+				// Save As, exactly: nothing moves but doc.path. doc_from_content owns
+				// the old string (path_owned), so it is freed rather than leaked.
+				old := d.path
+				d.path = strings.clone(fmt.tprintf("%s\\newtpad_lk_anchor.txt", sub))
+				delete(old)
+				after := len(links_layout(&d, &tt, 10))
+				lk_chk(
+					bad,
+					before == 1 && after == 0,
+					fmt.tprintf("re-anchoring one document drops the cache (before=%d after_reanchor=%d)", before, after),
+				)
+			}
+
+			// The UI thread must never stat a target it cannot reach quickly.
+			//
+			// GetFileAttributesW has no timeout. A single stat of a path on an
+			// unreachable UNC host was measured here at over 100 seconds, and
+			// links_layout runs every frame Ctrl is merely HELD (Ctrl+S is enough) and
+			// every frame unconditionally when Show-links is on "always" — so one
+			// `\\deadhost\share\out.log` in a build log froze the editor for minutes
+			// with the unsaved buffer held hostage, with no click involved. The text is
+			// untrusted, so that is a denial of service, not an edge case.
+			//
+			// What is asserted is the DECISION, not the stall: the guard keys on the
+			// shape of the path, so reachable fixtures exercise the identical branch.
+			// Sabotage by dropping the plat.path_is_local check from link_stat
+			// (links.odin) and the stat count goes from 1 to 4.
+			lk_non_local_never_stats :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				plat.file_write_atomic(fmt.tprintf("%s\\newtpad_lk_real.txt", dir), transmute([]u8)string("real"))
+
+				// The predicate itself, on shapes rather than on this machine's volumes.
+				lk_chk(bad, !plat.path_is_local("\\\\host\\share\\x.log"), "UNC is not local")
+				lk_chk(bad, !plat.path_is_local("\\\\?\\UNC\\host\\share\\x.log"), "extended-prefix UNC is not local")
+				lk_chk(bad, !plat.path_is_local("sub\\x.log"), "a relative path has no volume to judge")
+				lk_chk(
+					bad,
+					plat.path_is_local("C:\\Windows\\notepad.exe") == plat.path_is_local("\\\\?\\C:\\Windows\\notepad.exe"),
+					"the extended prefix does not change a drive's answer",
+				)
+
+				// A lettered drive that is not a fixed volume. An unmapped letter reads
+				// as DRIVE_NO_ROOT_DIR, which is the same not-fixed branch a mapped
+				// network drive takes, and unlike one it exists on every machine.
+				nonfixed := ""
+				for c := u8('Z'); c >= 'A'; c -= 1 {
+					p := fmt.tprintf("%c:\\newtpad_lk_nonfixed.txt", rune(c))
+					if !plat.path_is_local(p) {
+						nonfixed = p
+						break
+					}
+				}
+				lk_chk(bad, nonfixed != "", "found a non-fixed drive letter to test with")
+				if nonfixed == "" {return}
+
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				// A loopback share that does not exist, so a SABOTAGED build fails fast
+				// here rather than hanging this suite for the redirector timeout. The
+				// guard never looks at the host, only at the leading `\\`.
+				body := fmt.tprintf(
+					"unc \\\\localhost\\newtpad_no_such_share_zz\\out.log and drive %s and smb://localhost/newtpad_no_such_share_zz/x.log and ./newtpad_lk_real.txt\n",
+					nonfixed,
+				)
+				d := doc_from_content(
+					transmute([]u8)strings.clone(body),
+					fmt.tprintf("%s\\newtpad_lk_anchor.txt", dir),
+					.UTF8,
+				)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 400
+				d.view_rows = 10
+				link_stat_count = 0
+				hits := links_layout(&d, &tt, 10)
+				stats := link_stat_count
+				kept := ""
+				if len(hits) == 1 {
+					kept = hits[0].text[hits[0].link.start:hits[0].link.start + hits[0].link.target_len]
+				}
+				lk_chk(
+					bad,
+					kept == "./newtpad_lk_real.txt",
+					fmt.tprintf("only the local target is decorated (%d hits, kept %q)", len(hits), kept),
+				)
+				lk_chk(bad, stats == 1, fmt.tprintf("only the local target was stat'd (%d stats, want 1)", stats))
+
+				// ...and the click path, which is not gated on decoration: the palette
+				// command and the table view both reach link_follow -> link_resolve
+				// directly. It must refuse without touching the filesystem, so the user
+				// gets "Could not resolve" now instead of a frozen editor later.
+				unc := "\\\\localhost\\newtpad_no_such_share_zz\\out.log"
+				ul := links_scan(unc)
+				if len(ul) != 1 {
+					lk_chk(bad, false, fmt.tprintf("the UNC fixture scans as one link (got %d)", len(ul)))
+					return
+				}
+				link_stat_count = 0
+				_, rok := link_resolve(&d, unc, ul[0])
+				lk_chk(
+					bad,
+					!rok && link_stat_count == 0,
+					fmt.tprintf("link_resolve refuses a UNC target without a stat (ok=%v stats=%d)", rok, link_stat_count),
+				)
+			}
+
+			// Re-review finding I2: the first cut of the guard reused the exact
+			// predicate file_open_readonly's mmap-vs-copy choice uses -- "is this
+			// DRIVE_FIXED" -- so a document opened from a USB stick or a RAM disk lost
+			// EVERY relative link, not only the ones that reach a network host. Only
+			// DRIVE_REMOTE carries the redirector timeout; path_is_local now refuses
+			// DRIVE_REMOTE, DRIVE_NO_ROOT_DIR, DRIVE_UNKNOWN and DRIVE_CDROM and
+			// accepts everything else, including DRIVE_REMOVABLE and DRIVE_RAMDISK.
+			//
+			// This machine has no removable drive or RAM disk attached to open a real
+			// document from, so per the task brief the DRIVE_* -> local/non-local
+			// mapping is asserted directly against plat.drive_type_is_local, the pure
+			// (no-syscall) classifier path_is_local calls after GetDriveTypeW --
+			// covering every DRIVE_* constant this file declares, not just the two
+			// (FIXED, NO_ROOT_DIR) a real machine can exercise.
+			//
+			// What IS exercised end-to-end below is the other half of the finding: a
+			// document opened from a UNC path refuses even a PLAIN RELATIVE link, not
+			// merely a UNC-shaped target -- because the anchor folder itself, not the
+			// target, is what fails path_is_local. No real host is stat'd: the guard
+			// fires on the anchor's own shape before link_stat's plat.path_exists call.
+			lk_anchor_kind_scope :: proc(bad: ^int) {
+				lk_chk(bad, plat.drive_type_is_local(plat.DRIVE_FIXED), "DRIVE_FIXED is local")
+				lk_chk(bad, plat.drive_type_is_local(plat.DRIVE_REMOVABLE), "DRIVE_REMOVABLE is local")
+				lk_chk(bad, plat.drive_type_is_local(plat.DRIVE_RAMDISK), "DRIVE_RAMDISK is local")
+				lk_chk(bad, !plat.drive_type_is_local(plat.DRIVE_REMOTE), "DRIVE_REMOTE is not local")
+				lk_chk(bad, !plat.drive_type_is_local(plat.DRIVE_NO_ROOT_DIR), "DRIVE_NO_ROOT_DIR is not local")
+				lk_chk(bad, !plat.drive_type_is_local(plat.DRIVE_UNKNOWN), "DRIVE_UNKNOWN is not local")
+				lk_chk(bad, !plat.drive_type_is_local(plat.DRIVE_CDROM), "DRIVE_CDROM is not local")
+
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				// A loopback share that does not exist: the anchor never needs to be
+				// reachable, because path_is_local judges its SHAPE (leading `\\`), and
+				// a sabotaged build (see below) would otherwise pay the redirector
+				// timeout for a plain relative link.
+				d := doc_from_content(
+					transmute([]u8)strings.clone("see ./sibling.txt now\n"),
+					"\\\\localhost\\newtpad_no_such_share_zz\\anchor.txt",
+					.UTF8,
+				)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 200
+				d.view_rows = 10
+				link_stat_count = 0
+				n := len(links_layout(&d, &tt, 10))
+				lk_chk(
+					bad,
+					n == 0 && link_stat_count == 0,
+					fmt.tprintf("a UNC-anchored document refuses a plain relative link (%d hits, %d stats)", n, link_stat_count),
+				)
+			}
+
+			fmt.println("--- a bare separator is not a path ---")
+			lk_false_positives(&bad)
+			fmt.println("--- underlined implies openable ---")
+			lk_underline_implies_openable(&bad)
+			fmt.println("--- the resolution cache ---")
+			lk_cache_invalidation(&bad)
+			lk_cache_anchor(&bad)
+			lk_cache_anchor_same_doc(&bad)
+			fmt.println("--- a non-local target is never stat'd on the UI thread ---")
+			lk_non_local_never_stats(&bad)
+			fmt.println("--- only DRIVE_REMOTE is refused, not \"anything but DRIVE_FIXED\" ---")
+			lk_anchor_kind_scope(&bad)
+
 			fmt.printfln("linktest: %d failures", bad)
 			return true
 		}
@@ -7589,6 +8726,65 @@ when NEWTPAD_TESTS {
 				ld.h_scroll = 0
 				doc_update_hscroll(&ld)
 			}
+
+			// The horizontal range is a HIGH-WATER MARK (Document.max_cells_seen), not
+			// a re-derivation from whatever is on screen right now. Before this fix,
+			// doc_max_hscroll walked only the visible rows, so scrolling the widest
+			// line off the top collapsed the range and the bar vanished -- Wyatt, live
+			// use: "the horizontal scroll bar only allows for expanding left/right if
+			// the large row is on screen." Body in its own proc: test_mode_dispatch's
+			// frame is already large enough to have hit STATUS_STACK_OVERFLOW twice,
+			// and this holds exactly one Document.
+			hw_bad := 0
+			{
+				hw_chk :: proc(bad: ^int, ok: bool, msg: string) {
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+					if !ok {bad^ += 1}
+				}
+				hw_run :: proc(bad: ^int) {
+					sb := strings.builder_make()
+					defer strings.builder_destroy(&sb)
+					strings.write_string(&sb, strings.repeat("x", 400))
+					strings.write_string(&sb, "\n")
+					for i in 0 ..< 200 {strings.write_string(&sb, "short\n")}
+					// DEFAULT allocator, not temp: doc_from_content sets owned_orig, so
+					// doc_close frees this slice. A temp-allocated fixture here is heap
+					// corruption, not a leak.
+					doc := doc_from_content(transmute([]u8)strings.clone(strings.to_string(sb)), "", .UTF8)
+					defer doc_close(&doc)
+					t: plat.Text
+					if !plat.text_load_faces(&t) {
+						fmt.eprintln("hscrolltest (highwater): no fonts loaded")
+						bad^ += 1
+						return
+					}
+					rows := 20
+					doc.wrap = false
+					doc.view_cols = 80
+					doc.top = 0
+
+					wide := doc_max_hscroll(&doc, &t, rows)
+					hw_chk(bad, wide > 0, fmt.tprintf("the long line gives a range while it is visible (%d)", wide))
+
+					// Scroll the wide line off the top: doc.top lands on line 100
+					// ("short"), well past line 0's 400-cell line. md_line_offset does
+					// not exist in the tree yet (Task 3 has not landed under that
+					// name), so this is the four-line equivalent over
+					// base.pt_line_end_cap the brief calls for in that case.
+					off := 0
+					for i in 0 ..< 100 {
+						e := base.pt_line_end_cap(&doc.pt, off, RENDER_LINE_CAP)
+						if e >= doc.pt.length {break}
+						off = e + 1 // past the newline, to the next line's start
+					}
+					doc.top = off
+
+					after := doc_max_hscroll(&doc, &t, rows)
+					hw_chk(bad, after == wide, fmt.tprintf("the range survives the long line leaving the viewport (%d -> %d)", wide, after))
+				}
+				hw_run(&hw_bad)
+			}
+			bad += hw_bad
 
 			if bad == 0 {fmt.println("  drawn column == hit-tested column, and the scrollbar thumb round-trips: OK")}
 			fmt.printfln("hscrolltest: %d failures", bad)
@@ -11203,7 +12399,7 @@ when NEWTPAD_TESTS {
 				// overflows, and the narrow floor. A uniform-width bug hides at the
 				// comfortable size and shows at the edges.
 				for ntabs in ([]int{1, 3, 8}) {
-					for len(a.docs) < ntabs {app_new_scratch(&a, true)}
+					for len(a.docs) < ntabs {app_new_scratch(&a)}
 					for width in ([]f32{320, 700, 1280, 2560}) {
 						win.width = i32(width)
 						L := tabs_layout(&a, &win, &txt, width)
@@ -11315,7 +12511,7 @@ when NEWTPAD_TESTS {
 				// palette was the only way to reach one.
 				{
 					UI_SCALE = 1
-					for len(a.docs) < 12 {app_new_scratch(&a, true)}
+					for len(a.docs) < 12 {app_new_scratch(&a)}
 					win.width = 700 // narrow enough that most tabs cannot fit
 					vis :: proc(a: ^App, win: ^plat.Window, t: ^plat.Text, w: f32, slot: int) -> bool {
 						L := tabs_layout(a, win, t, w)
@@ -11405,7 +12601,129 @@ when NEWTPAD_TESTS {
 				}
 				return bad
 			}
+
+			// Task 7: a long label must clear the close zone by TAB_LABEL_GAP, not
+			// run straight into it. The budget the draw elides to
+			// (tab_label_cells) has to agree with where the draw actually PLACES
+			// the label (TAB_PAD_L + TAB_DIRTY_W in), or the two disagree exactly
+			// the way the old hand-copied `- sx(8)` did.
+			tg_gap :: proc(bad: ^int) {
+				tg_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				app: App
+				defer app_destroy(&app)
+				d := new(Document)
+				d^ = doc_new()
+				// The real fixture Wyatt has on disk, and long enough to elide at every width.
+				d.path = strings.clone("test1\\thisisatestofareallylongnameinnewtpad.txt")
+				app_add(&app, d)
+				t: plat.Text
+				plat.text_load_faces(&t)
+				win: plat.Window
+				rc := Render_Ctx{window = &win, text = &t, app = &app}
+				// TAB_LABEL_GAP and TAB_DIRTY_W are `_96` constants scaled by
+				// metrics_recompute -- checking only 96 DPI cannot tell "wired into
+				// dp()" apart from "hardcoded and coincidentally right at 1x". Proven
+				// by sabotage: commenting out either scaling assignment in
+				// metrics_recompute and rerunning tabseamtest must fail one of these.
+				for dpi in ([]u32{96, 144, 192}) {
+					win.dpi = dpi
+					metrics_recompute(&rc)
+					// The geometry check below re-derives its own bound from
+					// TAB_LABEL_GAP, the same global tab_label_cells subtracts to
+					// build the elision budget -- so a TAB_LABEL_GAP that is wrong
+					// in the SAME way on both sides cancels out and the geometry
+					// check passes no matter what the global holds (proven: this
+					// self-cancellation is why commenting out `TAB_LABEL_GAP =
+					// dp(rc, TAB_LABEL_GAP_96)` in metrics_recompute left the
+					// geometry check at 0 failures even with this DPI loop in
+					// place). Assert the global against an independently computed
+					// dp() call so a stuck-at-_96 value has something to disagree
+					// with.
+					tg_chk(bad, abs(TAB_LABEL_GAP - dp(&rc, TAB_LABEL_GAP_96)) < 0.01, fmt.tprintf("dpi=%d: TAB_LABEL_GAP is the DPI-scaled value (%.1f)", dpi, TAB_LABEL_GAP))
+					// ...and that pins only "the global is DPI-scaled", which
+					// `0 == dp(0)` satisfies perfectly. Set TAB_LABEL_GAP_96 back
+					// to 0 -- literally Wyatt's "there's no pixel gap between the X
+					// and the end of the file name, they blend together" -- and
+					// every check in this proc still passed (2026-07 whole-branch
+					// review). The MAGNITUDE needs a literal bound of its own, the
+					// way tm_marker's `>= sx(4)` already gives one to TAB_DIRTY_W.
+					// 3px is the floor at which a gap reads as a gap; the shipped
+					// value is 4.
+					tg_chk(bad, TAB_LABEL_GAP >= sx(3), fmt.tprintf("dpi=%d: TAB_LABEL_GAP is a real gap, not zero (%.1f >= %.1f)", dpi, TAB_LABEL_GAP, sx(3)))
+					cw := plat.text_char_width(&t, UI_SMALL_PX)
+					for width in ([]f32{600, 1200, 1920}) {
+						win.width = i32(width)
+						L := tabs_layout(&app, &win, &t, width)
+						for r in L.tabs {
+							if !r.drawn {continue}
+							max_cells := tab_label_cells(r.w, cw)
+							label := tab_elide(&t, tab_label(&app, app.docs[r.slot]), max_cells)
+							right := r.x + TAB_PAD_L + TAB_DIRTY_W + f32(plat.text_cells(&t, transmute([]u8)label, 0)) * cw
+							tg_chk(bad, right <= r.close_x - TAB_LABEL_GAP + 0.5, fmt.tprintf("dpi=%d w=%.0f: label clears the close zone", dpi, width))
+						}
+					}
+				}
+				win.dpi = 96
+				metrics_recompute(&rc) // leave globals alone for later modes
+			}
+
+			// Task 8: the dirty-marker slot must be wide enough that the '*' clears
+			// the label -- and widening the slot must not itself move the label,
+			// which is the property the slot exists for in the first place. Two
+			// assertions that catch different things: the first already passes
+			// before the fix (the slot already stabilises the label); only the
+			// second is expected to fail.
+			tm_marker :: proc(bad: ^int) {
+				tm_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				app: App
+				defer app_destroy(&app)
+				d := new(Document)
+				d^ = doc_new()
+				d.path = strings.clone("test\\test.txt")
+				app_add(&app, d)
+				t: plat.Text
+				plat.text_load_faces(&t)
+				win: plat.Window
+				win.width = 1200
+				rc := Render_Ctx{window = &win, text = &t, app = &app}
+				// Same reasoning as tg_gap: TAB_DIRTY_W only proves it is wired into
+				// dp() if it is checked somewhere other than 96 DPI, where the raw
+				// `_96` value and the scaled value are numerically identical.
+				for dpi in ([]u32{96, 144, 192}) {
+					win.dpi = dpi
+					metrics_recompute(&rc)
+					// Direct check, same reasoning as tg_gap's: assert the live
+					// global against an independently computed dp() call so a
+					// TAB_DIRTY_W stuck at its _96 value has something to disagree
+					// with, rather than relying only on the geometry checks below
+					// noticing via char-width growth.
+					tm_chk(bad, abs(TAB_DIRTY_W - dp(&rc, TAB_DIRTY_W_96)) < 0.01, fmt.tprintf("dpi=%d: TAB_DIRTY_W is the DPI-scaled value (%.1f)", dpi, TAB_DIRTY_W))
+					cw := plat.text_char_width(&t, UI_SMALL_PX)
+					app.docs[0].modified = false
+					L := tabs_layout(&app, &win, &t, 1200)
+					clean_x := L.tabs[0].x + TAB_PAD_L + TAB_DIRTY_W
+					app.docs[L.tabs[0].slot].modified = true
+					L2 := tabs_layout(&app, &win, &t, 1200)
+					dirty_x := L2.tabs[0].x + TAB_PAD_L + TAB_DIRTY_W
+					// 1. The slot exists so the label does not move when a file becomes dirty.
+					tm_chk(bad, clean_x == dirty_x, fmt.tprintf("dpi=%d: the label start is identical clean and dirty", dpi))
+					// 2. And the marker no longer touches it.
+					star_right := L2.tabs[0].x + TAB_PAD_L + cw
+					tm_chk(bad, dirty_x - star_right >= sx(4) - 0.5, fmt.tprintf("dpi=%d: at least 4px between the marker and the label", dpi))
+				}
+				win.dpi = 96
+				metrics_recompute(&rc) // leave globals alone for later modes
+			}
+
 			bad := ts_run()
+			tg_gap(&bad)
+			tm_marker(&bad)
 			fmt.printfln("tabseamtest: %d failures", bad)
 			return true
 		}
@@ -11447,7 +12765,7 @@ when NEWTPAD_TESTS {
 				doc_scroll(&doc, &t, 900, rows)
 				top0 := doc.top
 				bottom := doc.top + 2000 // a plausible last-visible offset
-				vb := vscrollbar_geo(&doc, 0, winh, bottom)
+				vb := vscrollbar_geo(&doc, 0, winh, bottom, &t, rows)
 				sg_chk(&bad, vb.shown && vb.thumb_h >= 8 && vb.thumb_y > vb.track_y, fmt.tprintf("the thumb is mid-track (y=%.0f h=%.0f in track %.0f..%.0f)", vb.thumb_y, vb.thumb_h, vb.track_y, vb.track_y + vb.track_h))
 
 				// 1. Press ON the thumb, at three points across it, and do not move.
@@ -11490,7 +12808,47 @@ when NEWTPAD_TESTS {
 				}
 				return bad
 			}
+			// sg_run above covers the grab-and-hold seam mid-track. It does not
+			// cover the complaint that sent Wyatt looking in the first place --
+			// "the thumb doesn't go to the bottom of the screen anymore, only
+			// about 80% of the way" -- which only shows up AT doc_max_top, and
+			// only if the forward map (vscrollbar_geo) is checked against the
+			// scrollable range rather than against itself.
+			sb_end :: proc() -> int {
+				bad := 0
+				sb_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				doc := doc_from_content(transmute([]u8)strings.repeat("a line\n", 500), "", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				t: plat.Text
+				plat.text_load_faces(&t)
+				rows := 25
+				winh := f32(800)
+				doc.top = doc_max_top(&doc, &t, rows)
+				b := vscrollbar_geo(&doc, 1000, winh, doc.pt.length, &t, rows)
+				// At the end of the document the thumb's BOTTOM meets the track's bottom.
+				sb_chk(&bad, abs((b.thumb_y + b.thumb_h) - (b.track_y + b.track_h)) < 0.5, "at max_top the thumb bottom meets the track bottom")
+				// And the pair stays an exact inverse, which is what makes "grab it and it
+				// does not move" true rather than approximately true.
+				//
+				// vbar_drag_to(doc, t, b, my, grab, rows) RETURNS NOTHING -- it scrolls the
+				// document through doc_scroll_to_fraction. So the round trip is: set top,
+				// take the geometry, drag the thumb to exactly where it already is with a
+				// zero grab, and read top back. It must not have moved.
+				for frac in ([]f32{0, 0.25, 0.5, 0.75, 1.0}) {
+					want := int(f32(doc_max_top(&doc, &t, rows)) * frac)
+					doc.top = want
+					g := vscrollbar_geo(&doc, 1000, winh, doc.pt.length, &t, rows)
+					vbar_drag_to(&doc, &t, g, g.thumb_y, 0, rows)
+					sb_chk(&bad, abs(doc.top - want) <= 1, fmt.tprintf("round trip at %.2f", frac))
+				}
+				return bad
+			}
 			bad := sg_run()
+			bad += sb_end()
 			fmt.printfln("scrollgrabtest: %d failures", bad)
 			return true
 		}
@@ -13923,6 +15281,27 @@ when NEWTPAD_TESTS {
 				chk(&bad, resolve_key(.K, true, false, .Find) == .Undo, fmt.tprintf("find falls back to the overlaid editor chord -> %v (want Undo)", resolve_key(.K, true, false, .Find)))
 				chk(&bad, resolve_key(.K, true, false, .Menu) == .Undo, fmt.tprintf("the menu falls back too -> %v", resolve_key(.K, true, false, .Menu)))
 				chk(&bad, resolve_key(.Left, false, false, .Find) == .None, "unmodified keys still stay owned by find (Left)")
+
+				// --- find-bar toggles are unified on Alt, matching VS Code -------------------
+				// Wyatt: "Alt+C/W work, I'm not sure about having some be Alt and some be
+				// Ctrl. Need to have some sort of standard..." The standard is all-Alt, and
+				// Ctrl+R is retired outright -- not left as a second way to reach the same
+				// command. Both halves are asserted: a claim that only checks Alt+R now
+				// works would pass just as well if Ctrl+R had been left bound alongside it,
+				// which is not what "retired" means.
+				fmt.println("--- find-bar toggles are unified on Alt ---")
+				chk(&bad, resolve_key(.R, false, true, .Find) == .Find_Toggle_Regex, fmt.tprintf("Alt+R -> %v (want Find_Toggle_Regex)", resolve_key(.R, false, true, .Find)))
+				chk(&bad, resolve_key(.C, false, true, .Find) == .Find_Toggle_Case, fmt.tprintf("Alt+C -> %v (want Find_Toggle_Case)", resolve_key(.C, false, true, .Find)))
+				chk(&bad, resolve_key(.W, false, true, .Find) == .Find_Toggle_Word, fmt.tprintf("Alt+W -> %v (want Find_Toggle_Word)", resolve_key(.W, false, true, .Find)))
+				// The retirement: Ctrl+R must resolve to NOTHING in find context, not just
+				// "not regex". If it fell through to some other command that would be its
+				// own bug, and a check of the shape != .Find_Toggle_Regex would miss it.
+				chk(&bad, resolve_key(.R, true, false, .Find) == .None, fmt.tprintf("Ctrl+R is retired -> %v (want None)", resolve_key(.R, true, false, .Find)))
+				// command_chord (what the View menu row and the palette teach) has to
+				// have moved with it -- the "any other context's default" fallback proved
+				// earlier is what makes the View menu row correct without a second table
+				// to keep in sync.
+				chk(&bad, command_chord(.Find_Toggle_Regex) == "Alt+R", fmt.tprintf("command_chord(Find_Toggle_Regex) -> %q (want \"Alt+R\")", command_chord(.Find_Toggle_Regex)))
 
 				// --- an entirely garbage file leaves the defaults intact --------------------
 				fmt.println("--- a file that is nothing but garbage ---")

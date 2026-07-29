@@ -188,6 +188,7 @@ menus := []Menu {
 			sep,
 			{cmd = .Find_Open, enabled = has_doc},
 			{cmd = .Replace_Open, enabled = has_doc},
+			{cmd = .Find_Replace_All, enabled = has_doc},
 			{cmd = .Goto_Line, enabled = has_doc},
 			sep,
 			{cmd = .Font_Open},

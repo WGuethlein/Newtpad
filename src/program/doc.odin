@@ -772,11 +772,18 @@ doc_content_box :: proc(doc: ^Document, height: f32) -> (top, bot: f32) {
 // Deliberately separate from doc_visible_rows rather than replacing it.
 // doc_visible_rows answers "how many rows are WHOLLY on screen", which is the
 // right question for the scroll clamp and the page keys -- paging by a count
-// that includes a sliver would scroll a hair further each press, and
-// doc_ensure_cursor_visible would call a half-hidden caret "visible". The draw
-// and the HIT-TEST ask this one instead: a half-visible line is clickable,
-// because it is on screen. Two questions, two procedures; conflating them is
-// the CLAUDE.md / HANDOFF §6j shape that has cost sixteen bugs in one session.
+// that includes a sliver would scroll a hair further each press. The draw and
+// the HIT-TEST ask this one instead: a half-visible line is clickable, because
+// it is on screen. Two questions, two procedures; conflating them is the
+// CLAUDE.md / HANDOFF §6j shape that has cost sixteen bugs in one session.
+//
+// doc_ensure_cursor_visible takes BOTH, and this comment used to cite "it would
+// call a half-hidden caret visible" as a hazard. That is now exactly what it
+// deliberately does, and on purpose: it asks `drawn` whether the caret counts as
+// on screen, because doc_pos_at hit-tests against `drawn` too -- judging a
+// clicked row "below the viewport" scrolled the file out from under the click.
+// It still asks `rows` for WHERE to land after an actual scroll. Do not
+// "correct" that call site back to `rows` on both sides; see its own comment.
 //
 // PARTIAL_ROW_MIN is the policy: below it the sliver is not worth a row, and
 // drawing one would put its whole line height under the status strip for no
@@ -1018,6 +1025,40 @@ Document :: struct {
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)
+	// High-water mark for doc_max_hscroll: the widest line MEASURED so far this
+	// session, not the widest currently on screen. See that proc's comment for
+	// why.
+	//
+	// No site in the tree sets this back to 0 explicitly. For the two
+	// whole-buffer replacements that is fine and deliberate: doc_reload_forced
+	// (an actual reload/reopen-as swap in different file content) replaces the
+	// WHOLE Document struct (`doc^ = fresh`) rather than mutating fields in
+	// place, so a reloaded document's mark is zero for free --
+	// doc_view_apply/Doc_View, the one thing carried forward across that swap,
+	// holds wrap/md_mode/table only, never this field. doc_set_line_ending
+	// rewrites the whole buffer in place (pt_edit_replace(0, length, ...)) but
+	// only touches line-TERMINATOR bytes -- line_cell_col never measures past a
+	// line's content into its terminator -- so no line's measured width can
+	// change and there is nothing stale to clear.
+	//
+	// ORDINARY EDITING IS NOT COVERED BY THAT, and no reset is coming. Delete
+	// the file's longest line through doc_replace_sel (or any other edit path)
+	// and this stays at the deleted line's width for the rest of the session:
+	// measured, a 400-cell line plus 50 short ones gives doc_max_hscroll = 323,
+	// and it is still 323 after the long line is gone. The horizontal bar then
+	// offers pan into content that no longer exists. That is the accepted cost
+	// of the high-water design, which Wyatt chose (2026-07-28) over a background
+	// full-document scan: a correct reset would have to know the new widest
+	// line, which means scanning the whole document on every edit -- the exact
+	// job the high-water mark exists to avoid. Stale-wide is a few cells of
+	// blank at the far right; the alternative it replaced was the bar vanishing
+	// whenever the wide line scrolled off, which is the bug Wyatt reported.
+	//
+	// Note also that doc_max_hscroll is a getter that MUTATES the Document: it
+	// raises this mark from the draw path, on the main thread, once per frame.
+	// It is not safe to call from a job, and it is not idempotent with respect
+	// to the struct.
+	max_cells_seen: int,
 	status_cursor: int, // cursor pos the cached status line was computed for
 	status_line:   int, // 1-based line of the cursor (0 = beyond the cap / unknown)
 	// Same for the column, which was neither cached nor capped and cost an
@@ -2883,11 +2924,30 @@ doc_cursor_col :: proc(doc: ^Document, t: ^plat.Text) -> int {
 }
 
 // Scroll so the top of the view is the line start at fraction `frac` of the
-// buffer (byte-proportional; used by the draggable scrollbar), bounded so the
-// last line stays at the bottom.
+// SCROLLABLE RANGE (0 = doc.top's minimum, 1 = doc_max_top) -- used by the
+// draggable scrollbar, whose thumb travels the same range (vscrollbar_geo).
+//
+// This used to be a fraction of the raw buffer length, which was the exact
+// mirror of the bug vscrollbar_geo had: it made the two consistent with each
+// other (so a press-and-hold round trip landed back where it started) but
+// both wrong against the track, since the true 1.0 point -- doc_max_top -- is
+// short of pt.length by one screenful. Fixing only one side would have kept
+// the round trip passing while making the drag land somewhere other than
+// where the thumb visibly was.
+//
+// `+ 0.5` before truncating, matching hscrollbar_pos_at's rounding: a floor
+// here is not a harmless rounding choice, it is a coin flip on which LINE you
+// land on. vscrollbar_geo's forward map and this inverse recover the same
+// frac up to f32 noise, and when that noise lands target a fraction of a byte
+// under the real row start, `eff_row_start` reads it as the trailing '\n' of
+// the PREVIOUS row and snaps a whole line short -- caught by scrollgrabtest's
+// existing mid-document hold case once max_top (a smaller, differently-valued
+// denominator than the old pt.length) shifted which side of the byte the
+// truncation fell on.
 doc_scroll_to_fraction :: proc(doc: ^Document, t: ^plat.Text, frac: f32, rows: int) {
-	target := int(clamp(frac, 0, 1) * f32(doc.pt.length))
-	doc.top = min(eff_row_start(doc, t, target, doc.view_cols), doc_max_top(doc, t, rows))
+	max_top := doc_max_top(doc, t, rows)
+	target := int(clamp(frac, 0, 1) * f32(max_top) + 0.5)
+	doc.top = min(eff_row_start(doc, t, target, doc.view_cols), max_top)
 }
 
 // Move the caret to the start of 1-based line `n` (O(n) line walk from the top).
@@ -3217,6 +3277,19 @@ HSCROLL_PAD :: 3
 // scan cap while only VISIBLE_COLS cells are ever drawn. (Panning the tail of a
 // line longer than VISIBLE_COLS needs the draw to window on h_scroll — a separate
 // follow-up; this just makes the bar stop where the text does.)
+//
+// The widest line SEEN SO FAR this session, not the widest currently on screen.
+// This used to walk only the visible rows and derive `reach` from that scan
+// alone, so scrolling the wide line off the top collapsed the range and the bar
+// vanished -- Wyatt, live use: the horizontal scrollbar only allows expanding if
+// the large row is on screen. Viewport-first still holds: nothing here scans
+// off-screen content, the measurement just stops throwing itself away once
+// something wider has actually been looked at.
+//
+// Chosen over a background full-document scan (Wyatt, 2026-07-28) because it
+// needs no job, no invalidation and no rule bent. The accepted cost: on first
+// open the range is only as wide as what has been looked at, so it grows as the
+// user scrolls rather than being right from frame one.
 doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 	if doc == nil || doc_wraps(doc) || doc.filter {return 0}
 	widest := 0
@@ -3227,7 +3300,8 @@ doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 		if wrapped {continue} // wrapped rows fit the window; they don't pan
 		if w := line_cell_col(doc, t, start, vis_end); w > widest {widest = w}
 	}
-	reach := min(widest + HSCROLL_PAD, VISIBLE_COLS)
+	if widest > doc.max_cells_seen {doc.max_cells_seen = widest}
+	reach := min(doc.max_cells_seen + HSCROLL_PAD, VISIBLE_COLS)
 	return max(0, reach - max(1, doc.view_cols))
 }
 

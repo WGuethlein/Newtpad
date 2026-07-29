@@ -262,6 +262,107 @@ find_toggle_at :: proc(doc: ^Document, winw, mx, my: f32) -> Command_Id {
 	return .None
 }
 
+// --- the replace row's action buttons ---
+
+// One labelled button on the replace row, with the accelerator that runs it.
+//
+// The replace row shipped as two text fields and nothing else: no button, no
+// verb, no key named anywhere on it. Wyatt, live use 2026-07-28: "Ctrl+H has no
+// replace all button/keybind, also no explanation of what you're to do on this
+// menu." The fix is not a tooltip -- it is the two actions, drawn where the
+// thing they act on is, with their chords beside them the way every menu row
+// already shows one.
+//
+// ONE geometry, exactly like Find_Toggle above and for the same reason. This
+// struct carries the label origins too (`tx`, `ty`, `cx`), not just the box:
+// find_actions is the only procedure in the program that computes a coordinate
+// on this row, and the draw, the click, the hover fill and the pointer cursor
+// all consume what it returns. A draw that positioned its own text would be a
+// second producer, which is the shape HANDOFF 6j is a list of.
+Find_Action :: struct {
+	label:  string,
+	chord:  string, // from command_chord: the keymap is the only place that knows
+	x, y:   f32, // box origin
+	w, h:   f32,
+	tx, ty: f32, // label origin (ty is the baseline)
+	cx:     f32, // chord origin, same baseline
+	cmd:    Command_Id,
+}
+
+FIND_ACTION_PAD_96 :: f32(9) // inside a button, either side of its text
+FIND_ACTION_GAP_96 :: f32(6) // between buttons
+FIND_ACTION_EDGE_96 :: f32(12) // from the window's right edge
+// Left margin the row keeps clear for "Replace: ..." even when nothing is typed
+// into it. Below this the buttons are DROPPED rather than clipped or overlapped
+// -- a button half off the window is a control the user can see and cannot
+// press, and one drawn over the replace field is worse.
+FIND_ACTION_MIN_LEFT_96 :: f32(150)
+
+// The replace row's buttons, as boxes with their text already placed. Empty
+// when the replace row is not on screen, or when the window is too narrow to
+// hold them clear of the field (see FIND_ACTION_MIN_LEFT_96) -- so "is this
+// drawn?" and "is this clickable?" are the same question at every width.
+find_actions :: proc(doc: ^Document, t: ^plat.Text, winw: f32, out: []Find_Action) -> []Find_Action {
+	if doc == nil || !doc.find.active || !doc.find.replace_mode || len(out) < 2 {return out[:0]}
+	// A read-only view (table grid, full Preview) takes no caret and the mouse
+	// press never reaches find_action_at -- ro_surface_swallows eats it in
+	// main.odin. Refusing here, at the one producer of this row's geometry,
+	// means the draw, the hover fill, the hand cursor and the hit-test all
+	// agree in one change instead of four call sites separately guarding
+	// against a control that looks live and does nothing. Split is NOT
+	// included: doc_read_only_view deliberately excludes it because Split's
+	// left half is the real editor.
+	if doc_read_only_view(doc) {return out[:0]}
+	cw := plat.text_char_width(t, UI_SMALL_PX)
+	row_h := sx(FIND_BAR_H_96)
+	pad := sx(FIND_ACTION_PAD_96)
+	gap := sx(FIND_ACTION_GAP_96)
+	set := [2]Find_Action {
+		{label = "Replace", cmd = .Find_Replace_One},
+		{label = "Replace All", cmd = .Find_Replace_All},
+	}
+	total := gap
+	for &a in set {
+		a.chord = command_chord(a.cmd)
+		cells := len(a.label)
+		if a.chord != "" {cells += 2 + len(a.chord)}
+		a.w = f32(int(f32(cells) * cw + pad * 2 + 0.5)) // whole pixels: text is drawn from these
+		a.h = f32(int(row_h - sx(12)))
+		total += a.w
+	}
+	x := winw - sx(FIND_ACTION_EDGE_96) - total
+	if x < sx(FIND_ACTION_MIN_LEFT_96) {return out[:0]}
+	x = f32(int(x))
+	y := f32(int(CHROME_TOP + row_h + (row_h - set[0].h) * 0.5))
+	for a, i in set {
+		out[i] = a
+		out[i].x = x
+		out[i].y = y
+		out[i].tx = f32(int(x + pad))
+		// Baseline inside the box, the same 0.35-of-the-size drop the find bar's
+		// own rows use (main.odin's `fbase`), snapped so the glyphs land on whole
+		// pixels rather than sampling between texels in the alpha atlas.
+		out[i].ty = f32(int(y + a.h * 0.5 + UI_SMALL_PX * 0.35))
+		out[i].cx = f32(int(x + pad + f32(len(a.label) + 2) * cw))
+		x += a.w + gap
+	}
+	return out[:2]
+}
+
+// The button a click at (mx, my) landed on, or .None.
+//
+// Reads find_actions' boxes and nothing else -- no row arithmetic of its own,
+// which is what stops it drifting from the draw when the bar moves again (it
+// moved from the bottom of the window to the top earlier in this release, and
+// twelve call sites had to follow).
+find_action_at :: proc(doc: ^Document, t: ^plat.Text, winw, mx, my: f32) -> Command_Id {
+	buf: [2]Find_Action
+	for a in find_actions(doc, t, winw, buf[:]) {
+		if mx >= a.x && mx < a.x + a.w && my >= a.y && my < a.y + a.h {return a.cmd}
+	}
+	return .None
+}
+
 find_toggle_regex :: proc(doc: ^Document) {doc.find.regex = !doc.find.regex;find_query_changed(doc)}
 find_toggle_case :: proc(doc: ^Document) {doc.find.case_sens = !doc.find.case_sens;find_query_changed(doc)}
 find_toggle_word :: proc(doc: ^Document) {doc.find.whole_word = !doc.find.whole_word;find_query_changed(doc)}
@@ -483,7 +584,7 @@ find_merge :: proc(doc: ^Document) {
 	// clears it.
 	//
 	// Reference the START of any selection, not the caret. Selecting a match
-	// leaves the caret at its end, so re-running this after a toggle (Ctrl+R,
+	// leaves the caret at its end, so re-running this after a toggle (Alt+R,
 	// Ctrl+L) would pick the *next* match every time — the selection walked
 	// forward one match per keypress.
 	//
@@ -940,6 +1041,31 @@ find_replace_current :: proc(doc: ^Document) {
 	find_recompute(doc)
 }
 
+// The indices of `matches` that Replace All will actually replace: the leftmost
+// non-overlapping subset. `out` must be at least len(matches) long; returns how
+// many entries were written.
+//
+// Its own procedure rather than a loop inside find_replace_all so the rule can
+// be tested on inputs the scanner cannot easily be made to produce -- above all
+// two ZERO-LENGTH matches at one offset, which regex mode can publish and which
+// would otherwise insert the replacement there twice. The barrier advances by
+// max(len, 1) for exactly that, which is the same rule a global regex replace
+// uses everywhere else.
+//
+// `matches` is sorted ascending (both scans emit in order), which is what makes
+// one forward pass with a single barrier sufficient.
+find_keep_set :: proc(matches, lens: []int, out: []int) -> int {
+	kept, next := 0, 0
+	for m, i in matches {
+		if i >= len(lens) || kept >= len(out) {break}
+		if m < next {continue}
+		out[kept] = i
+		kept += 1
+		next = m + max(lens[i], 1)
+	}
+	return kept
+}
+
 // Replace every match. Applied last->first so earlier offsets stay valid.
 // Each edit invalidates the search, but find_invalidate only marks it dirty, so
 // this costs one restart at the end rather than one per match.
@@ -971,16 +1097,49 @@ find_replace_all :: proc(doc: ^Document) -> (replaced: int, complete: bool) {
 	n := len(f.matches)
 	complete = intrinsics.atomic_load(&doc.search.done) && !f.truncated
 	if n == 0 {return 0, complete}
+
+	// OVERLAPPING MATCHES ARE DROPPED BEFORE ANYTHING IS WRITTEN.
+	//
+	// The literal scanner steps one byte at a time, so it publishes overlapping
+	// hits: "aa" over "aaaa" is three matches (0, 1, 2) covering four bytes, and
+	// three replacements cannot fit in them. Applying all three last->first
+	// spliced each one into the text the previous one had just written --
+	// "aaaa" with "aa" -> "b" came out "b" where it should be "bb". The count
+	// this proc returned was 3 and the document was wrong, which is the worst
+	// available combination: the report agreed with the user's expectation while
+	// the buffer did not.
+	//
+	// The kept set is chosen LEFT TO RIGHT, which is the order find_next steps
+	// through matches and therefore the order the user would have watched them
+	// being replaced one at a time -- so Replace All and repeated Enter produce
+	// the same document. (Choosing right-to-left instead would be equally
+	// "non-overlapping" and would disagree with the button next to it.)
+	//
+	// max(len, 1) advances the barrier past a ZERO-LENGTH match, which regex
+	// mode can produce ("x*", an empty alternative). Without it, two empty
+	// matches at the same offset both pass `>= next` and the replacement is
+	// inserted there twice. This is the same rule a global regex replace uses
+	// everywhere else for the same reason.
+	keep := make([]int, n, context.temp_allocator)
+	kept := find_keep_set(f.matches, f.match_len, keep)
+	if kept == 0 {return 0, complete}
+
+	// Applied last->first so the offsets ahead of each edit are still the ones
+	// the scan measured. Nothing is re-scanned in this pass, which is what makes
+	// a replacement CONTAINING the search term terminate: "cat" -> "cat cat"
+	// replaces the matches that existed when the button was pressed and stops,
+	// rather than finding the ones it just wrote.
 	doc_batch_begin(doc, .Replace)
-	for i := n - 1; i >= 0; i -= 1 {
+	for j := kept - 1; j >= 0; j -= 1 {
+		i := keep[j]
 		m := f.matches[i]
 		doc.anchor = m
 		doc.cursor = m + f.match_len[i]
 		doc_replace_sel(doc, f.replace[:])
 	}
-	doc_batch_end(doc, n)
+	doc_batch_end(doc, kept)
 	find_recompute(doc)
-	return n, complete
+	return kept, complete
 }
 
 // Highlight rectangles for visible matches (dim; behind text and the selection).

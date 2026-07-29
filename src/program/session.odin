@@ -430,6 +430,12 @@ session_restore :: proc(a: ^App) -> bool {
 				d.eol = eol
 			}
 			session_restore_bookmarks(d, bm_field, stamp, from_backup)
+			// In FILE order, which IS display order: session_save walks a.docs in
+			// slot order and writes one line per live tab, and `active` is that same
+			// display index (ti), not a slot. app_add appends, so replaying the lines
+			// top to bottom rebuilds the rail exactly as it was left -- restore is a
+			// second, independent route to a scrambled rail and is pinned by
+			// `newtpad taborder` as well.
 			slot := app_add(a, d)
 			if ti == active {active_slot = slot}
 			restored += 1

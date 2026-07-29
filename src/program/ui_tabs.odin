@@ -20,8 +20,13 @@ TAB_MAX_W_96 :: f32(220)
 // Reserved on EVERY tab, occupied only when the document is modified. The point
 // is that it is reserved: a file becoming dirty must not move the label or its
 // truncation point.
-TAB_DIRTY_W_96 :: f32(8)
-TAB_PAD_L_96 :: f32(4) // before the dirty slot; 4 + 8 = the spec's 12 to the text
+//
+// 12, not 8: at 8 the '*' filled the slot edge to edge and butted against the
+// name -- `*version.odin` in Wyatt's screenshot. Widening the SLOT rather than
+// moving the marker keeps the stability property the slot exists for, and
+// tab_natural_w picks the new width up for free since it already sums this.
+TAB_DIRTY_W_96 :: f32(12)
+TAB_PAD_L_96 :: f32(4) // before the dirty slot; was 4 + 8 = the spec's 12 to the text, now 4 + 12 = 16 since the slot widened
 TAB_PAD_R_96 :: f32(9)
 // The pill itself, inside the 40px rail. UI spec 2.1: "tab height / radius
 // 30 / 6", and the rail is 40 -- so the pill is INSET, not flush with the rail's
@@ -36,6 +41,12 @@ TAB_PAD_R_96 :: f32(9)
 TAB_H_96 :: f32(30)
 TAB_GAP_96 :: f32(3) // UI spec 2.1; was 1, which read as one continuous bar
 TAB_CLOSE_W_96 :: f32(20) // right-edge hit zone that closes instead of switches
+// Reserved between the end of the (possibly elided) label and the close zone.
+// The budget used to be `r.w - TAB_CLOSE_W - sx(8)` with nothing held back for
+// this at all, so a long name ran straight into the ×. Wyatt, live use: "with a
+// really long name there's no pixel gap between the X and the end of the file
+// name, they blend together."
+TAB_LABEL_GAP_96 :: f32(4)
 MENU_W_96 :: f32(44) // hamburger menu button
 PLUS_W_96 :: f32(32) // new-tab button
 
@@ -48,6 +59,7 @@ TAB_PAD_L := TAB_PAD_L_96
 TAB_PAD_R := TAB_PAD_R_96
 TAB_GAP := TAB_GAP_96
 TAB_CLOSE_W := TAB_CLOSE_W_96
+TAB_LABEL_GAP := TAB_LABEL_GAP_96
 MENU_W := MENU_W_96
 PLUS_W := PLUS_W_96
 
@@ -150,6 +162,18 @@ tab_natural_w :: proc(app: ^App, d: ^Document, t: ^plat.Text) -> f32 {
 	text_w := f32(plat.text_cells(t, transmute([]u8)label, 0)) * plat.text_char_width(t, UI_SMALL_PX)
 	want := TAB_PAD_L + TAB_DIRTY_W + text_w + TAB_CLOSE_W + TAB_PAD_R
 	return clamp(want, TAB_MIN_W, TAB_MAX_W)
+}
+
+// The label's cell budget: the pill's width less everything reserved around it.
+//
+// Derived from the SAME constants the draw places the label with. It used to be
+// `r.w - TAB_CLOSE_W - sx(8)`, hand-copied and wrong twice over: the label
+// starts at TAB_PAD_L + TAB_DIRTY_W (12 at 96 DPI), not 8, and nothing was
+// reserved between the label and the close zone at all -- so a long name ran
+// straight into the ×. Wyatt: "with a really long name there's no pixel gap
+// between the X and the end of the file name, they blend together."
+tab_label_cells :: proc(tab_w, char_w: f32) -> int {
+	return max(1, int((tab_w - TAB_PAD_L - TAB_DIRTY_W - TAB_CLOSE_W - TAB_LABEL_GAP) / char_w))
 }
 
 tabs_layout :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text, width: f32, allocator := context.temp_allocator) -> (L: Tabs_Layout) {
@@ -388,7 +412,7 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) -> bool {
 				app.tab_drag_slot = hit_slot
 			}
 		} else if L.plus_on && mx >= L.plus_x && mx < L.plus_x + PLUS_W { // + -> new tab
-			app_new_scratch(app, true) // always after the last tab
+			app_new_scratch(app) // app_add always appends after the last live tab
 		}
 	}
 
@@ -529,7 +553,7 @@ tabs_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat.Te
 		if !r.drawn {continue} // overflow; the count is drawn below
 		d := app.docs[r.slot]
 		x, slot := r.x, r.slot
-		max_cells := int((r.w - TAB_CLOSE_W - sx(8)) / char_w)
+		max_cells := tab_label_cells(r.w, char_w)
 		active := slot == app.active
 		// A pill: rounded on top, square along the bottom where it meets the
 		// content. One quad with two corner radii -- the shape batch 12's SDF
