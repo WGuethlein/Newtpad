@@ -105,6 +105,63 @@ md_selftest :: proc() -> (bad: int) {
 		chk(&bad, !t3 && r3 == "[y] neither", "[y] is not a task box")
 		chk(&bad, !t4 && r4 == "not a task", "plain text is not a task")
 	}
+	// --- a done task item mutes EVERY colour, not just the prose (live pass 0.27) ---
+	//
+	// Two halves, and only the second one is about the defect.
+	//
+	// (a) MD_DONE_MUTE reproduces each theme's own muted tier. This is what
+	// makes 0.26 a derived placeholder rather than a number picked by eye. The
+	// bound is 0.05 per channel because the two built-ins disagree about the
+	// exact factor (Dark wants ~0.298, Light ~0.220 -- see MD_DONE_MUTE) and no
+	// single constant can hit both; it still rejects any k outside roughly
+	// [0.19, 0.33], so it is a real bound on "lands on the muted tier".
+	//
+	// (b) The defect itself: a run carrying its OWN role must mute too. Asserting
+	// md_mute in isolation would be vacuous -- "a lerp toward the background
+	// moves a colour toward the background" is true of any lerp and was true
+	// before the fix. So this drives md_run_color, the resolution the drawer
+	// actually uses, over runs md_inline really produced, and requires each
+	// resolved colour to DIFFER from its unmuted role colour. The pre-fix code
+	// (base_col = Text_Muted, no transform) returns the bare role colour for
+	// every one of them, so it fails this and cannot fail (a).
+	{
+		old_theme := g_theme
+		defer g_theme = old_theme
+		for th, ti in ([]Theme{theme_dark(), theme_light()}) {
+			g_theme = th
+			name := "dark" if ti == 0 else "light"
+			got := md_mute(g_theme[.Text_Primary], MD_DONE_MUTE)
+			want := g_theme[.Text_Muted]
+			worst := f32(0)
+			for i in 0 ..< 3 {worst = max(worst, abs(got[i] - want[i]))}
+			chk(&bad, worst <= 0.05, fmt.tprintf("%s: mute(Text_Primary) lands on Text_Muted (worst %.3f)", name, worst))
+			// Alpha is a compositing decision, not a tone: it must survive.
+			chk(&bad, got.a == g_theme[.Text_Primary].a, fmt.tprintf("%s: muting leaves alpha alone", name))
+		}
+		g_theme = theme_dark()
+		bg := g_theme[.Bg_Base]
+		// One line exercising every role md_run_color can pick: bold
+		// (Text_Bright), code (Md_Code), a link (Link) and italics (Md_Italic).
+		runs := md_inline("plain **bold** `code` [label](http://u) *ital*")
+		styled := 0
+		for run in runs {
+			lit := md_run_color(run, g_theme[.Text_Muted], 0)
+			dim := md_run_color(run, g_theme[.Text_Muted], MD_DONE_MUTE)
+			if !(run.bold || run.code || run.link || run.ital) {continue}
+			styled += 1
+			// It moved at all -- this is the assertion the old code fails: it
+			// returned `lit` for every themed run regardless of the mute.
+			moved := lit != dim
+			// ...and it moved TOWARD the page, not to some unrelated colour.
+			toward := true
+			for i in 0 ..< 3 {
+				if abs(dim[i] - bg[i]) > abs(lit[i] - bg[i]) {toward = false}
+			}
+			chk(&bad, moved && toward, fmt.tprintf("styled run %q mutes toward the page", run.text))
+		}
+		chk(&bad, styled == 4, fmt.tprintf("...and the fixture really produced 4 themed runs (%d)", styled))
+	}
+
 	// --- the ticked checkbox's tick is centred on the BOX (live pass 0.27) ---
 	//
 	// Wyatt: "the X is at the bottom right of the box, not in the center". The
@@ -747,22 +804,74 @@ md_front_matter_end :: proc(doc: ^Document) -> int {
 	return 0
 }
 
+// Lerp a colour toward the page background, for muting a completed task item.
+//
+// A TRANSFORM applied per run, not a base colour substituted for the whole
+// line. The bug it replaces: task_col was set to Text_Muted and handed to
+// md_draw_inline as `base_col`, but every run that carries its own role --
+// code, links, emphasis, bold -- resolves that role and ignores the base
+// entirely. So the prose muted and nothing else did, which is exactly what
+// Wyatt reported: "the base color text gets muted but the theme colors don't,
+// maybe we just add a filter over all colors dropping them the same percent".
+// This is that filter.
+//
+// Alpha is carried through untouched: muting is a tone change, and folding it
+// into alpha would make a done item composite differently over the find-match
+// wash than a live one.
+md_mute :: proc(c: [4]f32, k: f32) -> [4]f32 {
+	bg := g_theme[.Bg_Base]
+	return {c.r + k * (bg.r - c.r), c.g + k * (bg.g - c.g), c.b + k * (bg.b - c.b), c.a}
+}
+
+// PLACEHOLDER -- Wyatt, on this batch: "I don't know about the colour shades...
+// just put in a placeholder that would be close to the final anyways." Tune it
+// on the next live pass.
+//
+// Not a guess, though. Muting is a lerp toward Bg_Base, so solving
+// mute(Text_Primary) == Text_Muted per channel asks "what k reproduces the
+// muted tier this theme already ships?" Against theme.odin's actual values
+// that is 0.280/0.299/0.315 in Dark (mean 0.298) and 0.244/0.217/0.199 in
+// Light (mean 0.220) -- the two themes disagree, so one constant cannot hit
+// both, and 0.26 sits between them. Worst per-channel miss is 0.033 in Dark
+// and 0.047 in Light (Light's blue, whose two tiers are furthest apart), which
+// is why mdtest's bound below is 0.05 rather than the 0.02 the task brief
+// assumed. The point of the derivation is that 0.26 lands on a tier Wyatt
+// already accepts rather than being picked by eye.
+MD_DONE_MUTE :: f32(0.26)
+
+// One inline run's colour: its role, then the done-item mute.
+//
+// Split out of md_draw_inline so mdtest can assert the thing that actually
+// broke -- that a THEMED run mutes, not just the base-coloured prose -- without
+// a device. Asserting md_mute alone would prove nothing: "the lerp moves a
+// colour toward the background" is a property of any lerp, and the pre-fix code
+// would satisfy it too.
+@(private = "file")
+md_run_color :: proc(run: Md_Run, base_col: [4]f32, mute: f32) -> [4]f32 {
+	col := base_col
+	if run.code {col = g_theme[.Md_Code]}
+	if run.ital {col = g_theme[.Md_Italic]}
+	if run.link {col = g_theme[.Link]}
+	if run.bold && !run.code && !run.link {col = g_theme[.Text_Bright]}
+	// Struck text drops to muted as well as getting its line. UI spec 18's
+	// "never colour alone" runs both ways: the LINE is the primary cue, so a
+	// reader who cannot see the tone still gets it, and the tone stops struck
+	// text competing with live text for attention.
+	if run.strike {col = g_theme[.Text_Muted]}
+	if mute > 0 {col = md_mute(col, mute)}
+	return col
+}
+
 // Draw inline runs word-wrapped from (x,y) within [xind, x1]; new rows indent to
 // xind. Advances y per wrapped row. Synthetic bold via a second draw one px over.
+//
+// `mute` fades every run's resolved colour toward the page by that fraction;
+// 0 (the default, and every call site but the done-task one) leaves them alone.
 @(private = "file")
-md_draw_inline :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, runs: []Md_Run, xind, x1: f32, x, y: ^f32, px, char_w, line_h: f32, base_col: [4]f32) {
+md_draw_inline :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, runs: []Md_Run, xind, x1: f32, x, y: ^f32, px, char_w, line_h: f32, base_col: [4]f32, mute: f32 = 0) {
 	boff := hairline()
 	for run in runs {
-		col := base_col
-		if run.code {col = g_theme[.Md_Code]}
-		if run.ital {col = g_theme[.Md_Italic]}
-		if run.link {col = g_theme[.Link]}
-		if run.bold && !run.code && !run.link {col = g_theme[.Text_Bright]}
-		// Struck text drops to muted as well as getting its line. UI spec 18's
-		// "never colour alone" runs both ways: the LINE is the primary cue, so a
-		// reader who cannot see the tone still gets it, and the tone stops struck
-		// text competing with live text for attention.
-		if run.strike {col = g_theme[.Text_Muted]}
+		col := md_run_color(run, base_col, mute)
 		// Split into words, keeping each word's trailing space so wrapping is by word.
 		w := run.text
 		for len(w) > 0 {
@@ -1045,6 +1154,7 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			// finished checklist recedes -- and the TICK carries the state as
 			// well as the tone, never colour alone (UI spec 18).
 			task_col := g_theme[.Text_Primary]
+			task_mute := f32(0)
 			if rest, done, is_task := md_task(content); is_task {
 				body = rest
 				bx := ind
@@ -1066,11 +1176,18 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 					tq: [MD_TICK_STEPS * 2]plat.Quad
 					nt := md_tick_quads(bx, by, bs, g_theme[.Accent], tq[:])
 					plat.quads_draw(gfx, qp, tq[:nt])
+					// The base colour still drops a tier, so unstyled prose in a
+					// done item reads the same as it always did; the MUTE is what
+					// reaches the runs that carry their own role. The box and the
+					// tick above are deliberately NOT muted -- they are the state
+					// cue (UI spec 18's "never colour alone"), and fading the one
+					// mark that says "done" is the opposite of the intent.
 					task_col = g_theme[.Text_Muted]
+					task_mute = MD_DONE_MUTE
 				}
 				x := ind + bs + char_w
 				yy := y
-				md_draw_inline(gfx, qp, text, md_inline(body), ind + bs + char_w, x1, &x, &yy, px, char_w, line_h, task_col)
+				md_draw_inline(gfx, qp, text, md_inline(body), ind + bs + char_w, x1, &x, &yy, px, char_w, line_h, task_col, task_mute)
 				y = yy + line_h
 				p = end + 1
 				continue
