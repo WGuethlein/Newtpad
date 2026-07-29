@@ -4113,6 +4113,123 @@ uncommitted, and destroyed it. Commit the fix *before* verifying that removing i
 - **Front-matter rows are no longer individually admitted** — the block draws whole (bounded at 64 lines)
   and the cover strip trims it on a very short pane.
 
+## 6at. The preview stops being a monospace document, and Newtpad gets an icon (2026-07-29, v0.31.0, branch `feat/batch-17-preview`)
+
+Batch 17: [UI spec](docs/ui-spec/newtpad-ui-spec-v1.md) §9.1's block/span/shaper model, §9.3's type scale,
+§9.4's Split sync, and §16's application icon — the last of which was a **beta blocker**, since no `.ico`
+existed in the tree at all. Thirty commits, all bisectable.
+
+**The spec landed in the tree this session** (`docs/ui-spec/`). It had lived in a chat upload folder, so
+batches 12–16 all cited it *secondhand* through each other's design docs and no session ever read the
+source. That is how §9.3's "serif, **deliberately**" got carried forward as an unqualified "proportional
+face", and how §16 stayed an unspecified TODO when it names a recommended direction and its exact
+palette. Read `docs/ui-spec/README.md` before designing any UI change.
+
+### What landed
+
+**The preview no longer uses the character grid.** §9.1's argument is that it never needed to: the grid
+exists to make caret arithmetic, column selection and hit-testing O(1), and the preview has no caret, no
+selection anchor, no column and no editing. So it now has a block list, a span list per block, a real
+proportional shaper, a layout cache, and a scroll offset in **pixels**.
+
+**§9.3's type scale in full** — all seven heading sizes as `round(k * S)`, weight 700 from **real Georgia
+bold** rather than the synthetic double-draw, the colour roles, body-vs-mono faces, all eleven
+space-above/below values, 1.65 line height, the 72ch measure and 40px padding. Georgia because §9.3 says
+serif deliberately — *"it is what separates 'document' from 'UI'"* — and because Wyatt chose not to embed
+a face this batch. Source Serif 4 and Monaspace Neon ride with batch 20's in-memory font path.
+
+**The icon: §16's "Caret on paper"**, seven sizes each drawn at its own size (the 16px and 20px variants
+drop the third text line, because three 2px bars inside 16px mush), fixed warm paper in both themes
+because Windows caches the icon and one that flickers looks broken.
+
+### What this batch got wrong
+
+**Three tasks refused to half-land work and proposed splits. Two were right, and that is the batch's best
+outcome.** Task 2 was dispatched to do the whole rewrite and came back `NEEDS_CONTEXT` having found two
+prerequisites nobody had scoped: `shape_run` took one face and one size per call, so §9.3's inline code
+at 0.92 S mono *inside* 1.00 S prose was inexpressible — and it cannot be composed per-span, because
+greedy breaking reaches **backwards** and rewrites already-placed glyphs when a word straddles a span
+boundary. Separately there was no bold body face at all, so the type scale would have shipped its size
+column and silently dropped its weight column. Both became task 2a.
+
+**The whole-branch review found four blockers, and the worst was in the headline feature.** Scrolling up
+inside the document's **first block** teleported to the top — 100% reproducible on any file whose first
+block is taller than one wheel notch, which is any heading, any fence, any front-matter card, any
+wrapping paragraph. `md_probe_back` returns `n == 0` exactly when the anchor is in block 0, and that
+branch discarded the target it had just computed.
+
+**And the assertion covering that region asserted the buggy value.** *"900px back up returns to the top
+exactly (0/0.0)"* — the fixture only ever scrolled up from a position where `{0,0}` was correct. This is
+the batch's sharpest lesson: **a point assertion at a convenient position is how a 100%-reproducible bug
+ships.** What found it was a *sweep* — wheel reversibility over many positions and six fixtures — and the
+same sweep found a second defect nobody had reported: `md_at_offset`'s clamp was inclusive, so it emitted
+`px == gap + h`, a position that is really the next block's origin expressed in the previous block's
+coordinates. 18–45% of wheel round-trips were not the identity, and the scrollbar could read a full block
+ahead of the content.
+
+**Ten sabotages came back green.** The review sabotaged 28 properties; 15 failed with assertions naming
+the actual defect, and ten passed — among them §9.3's 72ch measure for *indented* blocks, the cover strip
+without which the anchor block paints over the tab rail, `md_pane_owns`'s left bound (without which
+Split's *editor* half routes to the preview), and `.Blank`'s revision key. All four now have tests. The
+link seam was verified in x and **not in y**: the rect's `y` could move a pixel and the underline's
+`base_y` nine, with the suite green.
+
+**A guard that credited itself with a fix, twice.** `md_layout_slot`'s live-entry check was dead code —
+LRU already provided the property — and the branch correctly found and deleted it. Then the branch's own
+final commit added `md_split_click_gate`'s pane bound, which duplicated the identical predicate inside
+`md_block_at_y`; removing either alone left the suite green. Deleted, and the two mis-named assertions
+renamed to say what they actually test.
+
+### Performance, measured rather than inferred
+
+`md_preview_frac` was doing **two anchor-resolving walks inside the draw** — 1.95 ms of a 3.4 ms scroll
+frame, more than `markdown_draw` itself, re-deriving geometry the draw had produced three lines earlier.
+Against CLAUDE.md's *"scroll resolution must not happen inside the draw."* Now cached: **3.322 → 0.001
+ms**, whole scroll frame **7.24 → 4.17 ms**.
+
+Everything else inside budget: cold first pass 2.26 ms, warm 1.10, theme change 0.32, DPI 100→150% 0.31,
+resize 0.42 per width step, edit 0.84.
+
+### Size
+
+Release **1,249,792** bytes against `main`'s 1,206,272 — **+43,520 (+3.6%)** for a shaper, a block model,
+a layout cache, a pixel scroll model and an icon. The icon's first version was **+296 KB** on its own,
+because its 256px entry was an *uncompressed* PNG — a quarter-megabyte for five rectangles, against
+product principle 5. A hand-rolled DEFLATE took that entry 262 KB → 3.1 KB, and a later pass stored the
+48 and 64 entries as PNG too, taking 24 KB off the branch.
+
+### Owed
+
+- **§9.3:** h6 caps and tracking (h6 is currently identical to h5); the *Preview font* setting §9.3 asks
+  for; the caption/meta row (computed, deliberately unread).
+- **§9.4:** preview selection and copy — **a silent omission, not a recorded deferral**; the heading
+  tick-mark rail; the divider's `border_subtle` colour and 320px minimum pane.
+- **§9.1:** the screen *below* the viewport is laid out; the screen *above* only on the scroll-up gesture.
+  Disclosed and defensible — three screens per pass, three passes a frame, thrashes the cache — but not
+  what §9.1 says.
+- **An untagged or unknown-tag fence body draws on the proportional body face**, because the
+  `fence_lex == nil` path falls through to `md_inline` whose runs carry no `.Code` style. There is no
+  `odin` lexer, so most fences in this project's own docs render proportional. A product decision.
+- **And a stronger suspicion worth its own task:** a fence body's slot heights came out pixel-identical
+  under two font families with materially different advances, while inline code moved as expected — so
+  something on the fence-body path is not advance-aware, and if so its wrap points are wrong.
+- **`Md_Walk_Block.lay`'s pointer-safety argument holds only for `md_pass`**, the sole incrementer of
+  `md_layout_pass`. Every `md_scroll_ctx`-based walk stamps entries with the *previous* pass id, so a full
+  table can evict entries those walks hold. Safe today only because none of them dereferences `lay` — the
+  first scroll-path consumer that does gets a use-after-free.
+- **`MD_RUNUP_LINES :: 24` does not reliably clear front matter** (`MD_FM_MAX_LINES` is 64). Self-disclosed.
+  **HANDOFF §4 Shape A, instance eight.**
+- **"An edit rebuilds exactly ONE block" is fixture-specific.** Measured on the UI spec it is ~22 blocks
+  per keystroke, because every `Blank`, `Table` and `Front_Matter` block keys on `doc.revision`.
+- **What this added to the `renderer`/`ui` extraction debt:** `shape.odin` is three layers in one file (a
+  pure line breaker, a GPU submit path that touches `g_draw`, and a DirectWrite metrics query);
+  `Document.md_layout` puts a platform type permanently in the document model, ~75 KB per markdown
+  document freed only by `doc_close`; `markdown.odin` went 1,113 → 3,214 lines and is now parser plus
+  layout engine plus cache plus widget; `main.odin` gained four more widget procedures.
+- **Links inside markdown tables are not clickable.** Disclosed, with the right reason: a table row's
+  glyphs are placed in character cells, so emitting rects today means a second producer of the same
+  positions — the defect this batch exists to remove. Owed: route a table row through `shape_spans`.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
