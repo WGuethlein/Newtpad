@@ -2390,10 +2390,207 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// mdtest's DRAW-level checks: markdown_draw itself, not just its pure
+		// helpers. A 2026-07 review found the pure-helper checks blind to two real
+		// defects that live only at markdown_draw's OWN call sites -- sabotaging
+		// the call site (not the shared procedure underneath it) left every
+		// md_selftest assertion green, because those only ever drove the shared
+		// procedures directly with hand-picked arguments, never asked what the
+		// draw itself passes:
+		//
+		//   - a done task item's prose colour (Finding 1/2): md_selftest's own
+		//     coverage calls md_task_prose_style directly, so a call site that
+		//     bypassed it (`task_mute = 0` after the call, or reverting to a
+		//     literal Text_Muted base) would go unnoticed.
+		//   - the front-matter card's row advance (Finding 2/7): the card's
+		//     HEIGHT is computed once (md_fm_height) and the draw re-derives the
+		//     same total as a sum of per-fence and per-row increments; nothing
+		//     forces the two to stay equal, and md_front_matter_end used to read
+		//     lines through a SHORTER buffer than markdown_draw's own fence
+		//     check, so they could already disagree on a long enough line.
+		//
+		// Both are read back from a REAL offscreen render (Headless_Gpu, the
+		// quadsdftest precedent) -- the only way to ask "what did markdown_draw
+		// actually draw" without hand-copying its logic into the test.
+		md_draw_selftest :: proc() -> (bad: int) {
+			dchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1000, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/draw") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			sample :: proc(buf: []u8, w, x, y: int) -> (b, g, r, a: u8) {
+				i := (y * w + x) * 4
+				return buf[i], buf[i + 1], buf[i + 2], buf[i + 3]
+			}
+			near :: proc(c: [4]f32, b, g, r: u8, tol: int) -> bool {
+				want := [3]u8{u8(c[2] * 255 + 0.5), u8(c[1] * 255 + 0.5), u8(c[0] * 255 + 0.5)}
+				return abs(int(b) - int(want[0])) <= tol && abs(int(g) - int(want[1])) <= tol && abs(int(r) - int(want[2])) <= tol
+			}
+
+			px_ := f32(24)
+			char_w := plat.text_char_width(&h.text, px_, .Doc)
+			x0, x1 := f32(40), f32(900)
+			ytop, ybot := f32(60), f32(650)
+
+			// --- a done item's PLAIN prose lands where an undone item's does,
+			// muted -- not muted twice (Finding 1/2). "IIII": a monospace glyph
+			// whose vertical stroke gives a solid, near-full-coverage column, so
+			// the sampled pixel is close to the glyph's TRUE resolved colour and
+			// not an antialiasing blend.
+			{
+				mk :: proc(done: bool) -> Document {
+					src := "- [x] IIII\n" if done else "- [ ] IIII\n"
+					content := make([]u8, len(src))
+					copy(content, src)
+					return doc_from_content(content, "t.md", .UTF8)
+				}
+				// The glyph cell right after the checkbox + its gap, same geometry
+				// markdown_draw itself computes for the task branch.
+				gx0 := int(x0 + char_w * 1.4 + char_w)
+				gx1 := int(x0 + char_w * 1.4 + char_w * 2.2)
+				gy0 := int(ytop)
+				gy1 := int(ytop + px_ * 1.3)
+				render_and_sample :: proc(h: ^Headless_Gpu, doc: ^Document, x0, x1, ytop, ybot, px_, char_w: f32, gx0, gx1, gy0, gy1, W, H: int) -> (found: bool, b, g, r: u8) {
+					bg := g_theme[.Bg_Base]
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, char_w, x0, x1, ytop, ybot, 0)
+					buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if !ok {return false, 0, 0, 0}
+					// The sample FARTHEST from the background is the pixel closest
+					// to full glyph coverage -- an antialiased edge pixel is a
+					// blend along the [bg, glyph-colour] segment, so it is always
+					// nearer bg than the fully-covered interior is.
+					best := -1
+					for yy in max(0, gy0) ..< min(H, gy1) {
+						for xx in max(0, gx0) ..< min(W, gx1) {
+							bb, gg, rr, _ := sample(buf, W, xx, yy)
+							d := abs(int(bb) - int(bg[2] * 255)) + abs(int(gg) - int(bg[1] * 255)) + abs(int(rr) - int(bg[0] * 255))
+							if d > best {best, b, g, r = d, bb, gg, rr}
+						}
+					}
+					return best > 0, b, g, r
+				}
+				doc_done := mk(true)
+				fnd, b, g, r := render_and_sample(&h, &doc_done, x0, x1, ytop, ybot, px_, char_w, gx0, gx1, gy0, gy1, W, H)
+				doc_close(&doc_done)
+				dchk(&bad, fnd, "done task item: the plain-prose glyph is found on screen at all")
+				if fnd {
+					want := md_mute(g_theme[.Text_Primary], MD_DONE_MUTE)
+					bad_want := md_mute(g_theme[.Text_Muted], MD_DONE_MUTE) // the double-mute this test must reject
+					dchk(
+						&bad, near(want, b, g, r, 24) && !near(bad_want, b, g, r, 10),
+						fmt.tprintf(
+							"done task item: markdown_draw's OWN call site mutes prose once, not twice (got bgr %d,%d,%d; single-mute #%02X%02X%02X; double-mute #%02X%02X%02X)",
+							b, g, r,
+							u8(want[0] * 255), u8(want[1] * 255), u8(want[2] * 255),
+							u8(bad_want[0] * 255), u8(bad_want[1] * 255), u8(bad_want[2] * 255),
+						),
+					)
+				}
+			}
+
+			// --- front matter: the card only appears when the view starts at the
+			// top of the file (the p==0 gate), and the block after it starts
+			// EXACTLY where md_fm_height says the card ends -- not wherever
+			// markdown_draw's own per-line/per-fence increments happen to sum to
+			// (Finding 2's "two producers", Finding 7's buffer-size mismatch).
+			{
+				inner :: 2
+				src := "---\na: 1\nb: 2\n---\n***\n"
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "fm.md", .UTF8)
+				defer doc_close(&doc)
+				fm_end, fm_inner := md_front_matter_end(&doc)
+				dchk(&bad, fm_inner == inner, fmt.tprintf("front matter fixture: inner lines counted as %d (want %d)", fm_inner, inner))
+
+				line_h := line_height(px_)
+				bg := g_theme[.Bg_Base]
+
+				// `bottom` alone, on a doc with NOTHING after the closing fence:
+				// with the "***" trailing line present, markdown_draw keeps going
+				// (it fits the viewport), so `bottom` would legitimately run past
+				// `fm_end` -- that is not evidence of anything. Bare front matter
+				// is the only fixture where "the front-matter branch's own last
+				// `bottom = end` IS the returned bottom" is actually what a
+				// bottom == fm_end comparison is asking.
+				{
+					bare_src := "---\na: 1\nb: 2\n---\n"
+					bare_content := make([]u8, len(bare_src))
+					copy(bare_content, bare_src)
+					bare_doc := doc_from_content(bare_content, "fmbare.md", .UTF8)
+					defer doc_close(&bare_doc)
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					bare_bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &bare_doc, px_, char_w, x0, x1, ytop, ybot, 0)
+					dchk(&bad, bare_bottom == fm_end, fmt.tprintf("front matter: with nothing after it, markdown_draw's `bottom` (%d) is md_front_matter_end's `end` (%d)", bare_bottom, fm_end))
+				}
+
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, 0)
+				buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				dchk(&bad, ok, "front matter: readback")
+				if ok {
+					// Card presence, top-left corner. A tight tolerance (3, not
+					// the usual 10): Md_Code_Bg and Bg_Base are both near-neutral
+					// darks only ~7-8/255 apart per channel in Dark, so a loose
+					// bound would call the bare background "the card" and this
+					// check would pass whether or not anything was drawn.
+					cb, cg, cr, _ := sample(buf, W, int(x0) + 3, int(ytop) + 3)
+					dchk(&bad, near(g_theme[.Md_Code_Bg], cb, cg, cr, 3), "front matter: the card is drawn (Md_Code_Bg at its top-left corner)")
+
+					// The RULE line ("***") right after the block is a SOLID,
+					// unantialiased-interior quad -- unlike prose, its colour is
+					// exact evidence of where markdown_draw's y actually landed,
+					// with no glyph coverage guesswork. Expected row is computed
+					// INDEPENDENTLY, from md_fm_height/md_fm_pad, not by copying
+					// markdown_draw's increments.
+					rule_y := ytop + px_ * 0.5 + md_fm_height(line_h, fm_inner)
+					rb, rg, rr, _ := sample(buf, W, int(x0) + 50, int(rule_y) + int(hairline() * 0.5))
+					dchk(
+						&bad, near(g_theme[.Md_Rule], rb, rg, rr, 10),
+						fmt.tprintf("front matter: the rule after the block sits exactly at md_fm_height's row (y=%.1f)", rule_y),
+					)
+					// A row clearly ABOVE that must NOT already be the rule -- or
+					// "found the rule somewhere" could pass by accident from a
+					// too-generous scan.
+					ab, ag, ar, _ := sample(buf, W, int(x0) + 50, int(rule_y) - 6)
+					dchk(&bad, !near(g_theme[.Md_Rule], ab, ag, ar, 10), "front matter: 6px above that row is NOT the rule (bound is tight, not a scan)")
+				}
+
+				// The p==0 gate: scrolled to start exactly at the front matter's
+				// end, the card must NOT be drawn at all.
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				bottom2 := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, fm_end)
+				dchk(&bad, bottom2 > fm_end, "front matter: scrolled past it, markdown_draw advances past fm_end (the rule line), not stuck")
+				buf2, ok2 := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				if ok2 {
+					cb, cg, cr, _ := sample(buf2, W, int(x0) + 3, int(ytop) + 3)
+					// Same tight tolerance as the presence check above, for the
+					// same reason: Bg_Base sits within a loose bound of
+					// Md_Code_Bg, which would make an undrawn card look drawn.
+					dchk(&bad, !near(g_theme[.Md_Code_Bg], cb, cg, cr, 3), "front matter: scrolled past it, NO card is drawn (the p==0 gate)")
+				}
+			}
+			return bad
+		}
+
 		// `newtpad mdtest` covers the markdown block classifiers and inline parser
-		// (the rendering itself needs a live eye).
+		// (the rendering itself needs a live eye), PLUS the draw-level checks
+		// above that exercise markdown_draw's own call sites through a real
+		// offscreen device.
 		if os.args[1] == "mdtest" {
 			bad := md_selftest()
+			bad += md_draw_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
 			return true
 		}
