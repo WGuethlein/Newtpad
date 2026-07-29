@@ -5286,6 +5286,20 @@ when NEWTPAD_TESTS {
 				)
 				vb0 := md_vscrollbar_geo(&doc, winw - SCROLLBAR_W, winh, bot_end, 0)
 				schk(&bad, abs(vb0.thumb_y - vb0.track_y) < 0.5, fmt.tprintf("bar: ...and at the top its TOP meets the track's (%.1f vs %.1f)", vb0.thumb_y, vb0.track_y))
+				// The MIDDLE of the range, which the two ends cannot see: the clamp
+				// in md_vscrollbar_geo pins both ends whatever the multiplier is, so
+				// a bar that travelled the whole track instead of the track minus
+				// the thumb would still pass the two rows above. What separates
+				// them is that the geometry and vbar_frac_at are exact inverses --
+				// press the thumb, hold still, and the document does not move.
+				worst_grab := f32(0)
+				for i in 0 ..= 10 {
+					want := f32(i) / 10
+					g := md_vscrollbar_geo(&doc, winw - SCROLLBAR_W, winh, bot_end, want)
+					grab := g.thumb_h * 0.5
+					worst_grab = max(worst_grab, abs(vbar_frac_at(g, g.thumb_y + grab, grab) - want))
+				}
+				schk(&bad, worst_grab < 0.001, fmt.tprintf("bar: the thumb's position and the drag's read of it are exact inverses (worst %.4f)", worst_grab))
 
 				// Grab it and hold it and it does not move: the fraction map and
 				// its inverse are exact inverses, which is the property
