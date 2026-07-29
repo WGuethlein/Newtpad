@@ -729,6 +729,62 @@ md_row_fits :: #force_inline proc(y, px, line_h, ybot: f32) -> bool {
 	return y - px + line_h <= ybot
 }
 
+// Does this line (already left-trimmed) open or close a fenced code block?
+//
+// One predicate, used by markdown_draw's toggle AND by mdfencetest's walk, so
+// the test cannot pass while agreeing with a rule the draw doesn't apply. Note
+// it is LOOSER than base.lex_markdown's own fence rule in one respect: that one
+// caps the indent at 3 spaces (CommonMark) and never sees tabs. The looser side
+// is the drawing one, which only ever means md_fence_seed below declines to
+// seed -- i.e. falls back to exactly the pre-fix behaviour -- never that it
+// seeds a fence the draw would not have entered. See md_fence_seed.
+md_is_fence_line :: #force_inline proc(trimmed: string) -> bool {
+	return strings.has_prefix(trimmed, "```") || strings.has_prefix(trimmed, "~~~")
+}
+
+// The fence state markdown_draw must START in when it begins drawing at
+// `top_byte`, and the lexer for that fence's language.
+//
+// The bug this exists to kill: markdown_draw seeded `in_fence := false` and
+// began scanning at top_byte, so scrolling past an opening fence lost the bit.
+// The block's contents then drew as ordinary markdown AND the CLOSING fence
+// toggled in_fence ON -- turning the whole rest of the file into a code block.
+// Wyatt reported both halves separately ("when the code block start goes off
+// screen, the viewport stops rendering the whole codeblock" and "it just makes
+// the rest of the file a codeblock"); they are the same lost bit, seen before
+// and after the closing fence.
+//
+// Nothing new is invented here. The plain editor already answers "what is the
+// lexer's state at this byte" for exactly this reason -- doc_lex_state_at, via
+// the background per-line index with a bounded resync fallback -- and
+// base.lex_markdown's Lex_State already encodes "inside an unterminated fence"
+// as .In_Comment (see that file's header). markdown_draw simply never asked.
+//
+// The one thing the state cannot carry is the fence's language tag, since
+// Lex_State is a scalar. lex_index_fence_open finds the fence-open LINE through
+// the index in O(log n) and the tag is read off it. When that lookup declines
+// (huge mapped file, or an index stale against the current revision) the block
+// draws UNCOLOURED: still correctly a fence, just without syntax colours.
+//
+// Two documented ways this seeds `false` where a draw from byte 0 would have
+// been inside a fence, both of them the pre-fix behaviour and neither of them a
+// new wrong answer:
+//   - doc.path has no .md/.markdown extension (an unsaved buffer switched into
+//     preview), so highlight_lexer_for picks no lexer and the state is .Normal.
+//   - the opening fence is indented 4+ spaces or by a tab, which md_is_fence_line
+//     accepts and base.lex_markdown deliberately does not.
+md_fence_seed :: proc(doc: ^Document, top_byte: int) -> (in_fence: bool, fence_lex: Lexer_Proc) {
+	if doc == nil || top_byte <= 0 {return false, nil}
+	if doc_lex_state_at(doc, top_byte, LEX_RESYNC_WINDOW) == .Normal {return false, nil}
+	in_fence = true
+	if open, ok := lex_index_fence_open(doc, top_byte); ok {
+		buf: [RENDER_LINE_CAP]u8
+		line, _, _ := md_line_at(doc, open, buf[:])
+		fence_lex = md_fence_lexer(strings.trim_left(line, " \t"))
+	}
+	return
+}
+
 // Render markdown source from `top_byte`, laid out in [x0,x1] x [ytop,ybot].
 // Returns the byte offset just past the last line drawn (for scroll clamping).
 markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px, char_w: f32, x0, x1, ytop, ybot: f32, top_byte: int) -> (bottom: int) {
@@ -737,7 +793,9 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	buf: [RENDER_LINE_CAP]u8
 	y := ytop + px // first baseline
 	p := top_byte
-	in_fence := false
+	// Seeded from the document's own lexer state at top_byte, NOT from `false`:
+	// the opening fence can be anywhere above the viewport. See md_fence_seed.
+	in_fence, seed_lex := md_fence_seed(doc, top_byte)
 	// The fence's language tag, resolved to a lexer. UI spec 9.2 item 4 asks for
 	// "fenced code + lexer -- syn_* inside", and a fenced block was drawn as flat
 	// Md_Code however it was tagged.
@@ -746,7 +804,7 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	// rather than growing a second tag->lexer table beside the extension one.
 	// One mapping means a lexer added for a file type is immediately available
 	// inside a fence, and the two can never disagree about what "cs" means.
-	fence_lex: Lexer_Proc
+	fence_lex: Lexer_Proc = seed_lex
 	fence_state: base.Lex_State
 	// YAML front matter reads as a small card rather than as body text with two
 	// horizontal rules around it, which is what `---` on its own line otherwise
@@ -773,7 +831,7 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		line := string(buf[:n])
 		trimmed := strings.trim_left(line, " \t")
 
-		if strings.has_prefix(trimmed, "```") || strings.has_prefix(trimmed, "~~~") {
+		if md_is_fence_line(trimmed) {
 			in_fence = !in_fence
 			if in_fence {
 				fence_lex, fence_state = md_fence_lexer(trimmed), .Normal

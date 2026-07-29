@@ -1235,6 +1235,7 @@ doc_close :: proc(doc: ^Document) {
 	lex_index_stop(doc) // joins before the arrays below are freed
 	delete(doc.lex_idx.line_starts)
 	delete(doc.lex_idx.states)
+	delete(doc.lex_idx.opens)
 	// delete() frees the backing storage but leaves the [dynamic] header
 	// (len/cap/data) pointing at now-freed memory -- harmless here only
 	// because doc_reload immediately overwrites doc^ with a fresh zero value
@@ -1244,6 +1245,7 @@ doc_close :: proc(doc: ^Document) {
 	// not just a stale read).
 	doc.lex_idx.line_starts = nil
 	doc.lex_idx.states = nil
+	doc.lex_idx.opens = nil
 	// Before pt_destroy: the worker's view aliases the add chunks it frees.
 	search_release(doc)
 	for s in doc.undo {snapshot_free(s)}

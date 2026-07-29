@@ -73,6 +73,20 @@ Lex_State_Index :: struct {
 	// plat.FILE_MMAP_THRESHOLD.
 	line_starts: [dynamic]int,
 	states:      [dynamic]base.Lex_State,
+
+	// Ascending byte offsets of every line that OPENS a stateful construct --
+	// the line whose own state was .Normal and whose state afterwards is not.
+	// For markdown that is a fence-open line; for C it is a `/*` line; the
+	// index doesn't care which grammar it indexed.
+	//
+	// One entry per construct, NOT one per line: this is a handful of ints for
+	// a normal file, unlike line_starts/states above. It exists because
+	// Lex_State is a scalar -- it can say "inside a fence", which is all a
+	// renderer needs to suppress parsing, but not WHICH fence, and markdown's
+	// language tag (```json) lives on the opening line. See
+	// lex_index_fence_open for why this array can be binary-searched when
+	// `states` alone cannot.
+	opens:       [dynamic]int,
 }
 
 @(private = "file")
@@ -95,7 +109,12 @@ lex_index_worker :: proc(data: rawptr) {
 			}
 		}
 		line_end := nl if nl >= 0 else len(c)
+		before := state
 		_, state = idx.lexer(c[pos:line_end], state, tok_buf[:])
+		// A .Normal -> non-.Normal transition: THIS line opened the construct.
+		// Recorded here rather than reconstructed later because only the worker
+		// sees both sides of the transition in O(1); see `opens`' comment.
+		if before == .Normal && state != .Normal {append(&idx.opens, pos)}
 		intrinsics.atomic_store(&idx.scanned, line_end)
 		if nl < 0 {break}
 		pos = nl + 1
@@ -166,6 +185,52 @@ lex_index_lookup :: proc(idx: ^Lex_State_Index, offset: int) -> base.Lex_State {
 		}
 	}
 	return idx.states[lo]
+}
+
+// The byte offset of the line that OPENED the stateful construct in effect at
+// `before` -- for markdown, the ``` line whose info string names the language.
+//
+// Exists because Lex_State is a scalar. doc_lex_state_at can say we are INSIDE
+// a fence, which is all markdown_draw needs to suppress parsing and paint the
+// code background -- but not that the fence said `json`, and the tag is what
+// picks the lexer. The transition point is where the tag is written down.
+//
+// Only meaningful when the state at `before` is already known to be non-.Normal
+// (markdown_draw's only call site checks that first). Given that, the governing
+// open IS the last recorded open at or before `before`: if an earlier fence had
+// closed, the state at `before` could only be non-.Normal because a LATER fence
+// opened, and that later one is the last entry <= `before`. So an O(log n)
+// binary search over `opens` is exact, with no scan.
+//
+// This is why `opens` exists at all rather than the search running over
+// `states`: `states` is an arbitrary alternating sequence, and "the last
+// .Normal at or before line j" is not a monotone predicate over it -- a binary
+// search there would be plausible-looking and wrong, and a backward scan would
+// be O(lines inside the fence), unbounded on a file that is one enormous
+// unterminated fence. `opens` is sorted by construction, so the same question
+// becomes an ordinary lower-bound search.
+//
+// Returns found=false when the index is absent, unfinished or stale (a huge
+// mapped file, or an edit past built_for_revision). The caller degrades to an
+// UNCOLOURED code block: still correctly a fence, just without syntax colours.
+// That is honest and bounded. Scanning backward a fixed distance through the
+// document looking for a ``` instead would be the Shape A bug (HANDOFF §4) --
+// a fence can be arbitrarily far above the viewport, so a bounded backward
+// scan returns a confident wrong answer.
+lex_index_fence_open :: proc(doc: ^Document, before: int) -> (line_start: int, found: bool) {
+	if !lex_index_valid(doc) {return 0, false}
+	opens := doc.lex_idx.opens
+	if len(opens) == 0 || opens[0] > before {return 0, false}
+	lo, hi := 0, len(opens) - 1
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if opens[mid] <= before {
+			lo = mid
+		} else {
+			hi = mid - 1
+		}
+	}
+	return opens[lo], true
 }
 
 // Resync windows. The normal contiguous viewport (doc.top downward) needs

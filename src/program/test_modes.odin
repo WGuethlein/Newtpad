@@ -2398,6 +2398,151 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad mdfencetest` covers the fenced-code state ABOVE the viewport.
+		// Live use (2026-07-28): "when the code block start goes off screen, the
+		// viewport stops rendering the whole codeblock" and "it just makes the rest
+		// of the file a codeblock". One defect -- markdown_draw seeded
+		// `in_fence := false` at doc.top, so an opening fence above the viewport was
+		// lost, the block drew as ordinary markdown, and the CLOSING fence then
+		// toggled the state ON for everything after it.
+		//
+		// The draw itself needs a device, so what is driven here is md_fence_seed
+		// (the seed markdown_draw now starts from) plus md_is_fence_line (the very
+		// predicate its toggle uses) -- the md_row_fits precedent. The walk below is
+		// compared against the SAME walk from byte 0, which is correct by
+		// construction, so this asserts an invariant the bug violates in both
+		// directions rather than a property the bug also satisfies.
+		if os.args[1] == "mdfencetest" {
+			mf_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-58s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			// Byte offset of logical line `n` (0-based); doc.pt.length past EOF.
+			mf_line_offset :: proc(doc: ^Document, n: int) -> int {
+				p := 0
+				for _ in 0 ..< n {
+					if p >= doc.pt.length {return doc.pt.length}
+					p = min(base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP) + 1, doc.pt.length)
+				}
+				return p
+			}
+			// markdown_draw's fence walk, hand-rolled from `start_line`: out[i] is
+			// "line start_line+i draws as fenced code". Seeded exactly as the draw
+			// seeds, toggled on exactly the predicate the draw toggles on.
+			mf_walk :: proc(doc: ^Document, start_line: int, out: []bool) {
+				p := mf_line_offset(doc, start_line)
+				in_fence, _ := md_fence_seed(doc, p)
+				buf: [1024]u8
+				for i in 0 ..< len(out) {
+					if p > doc.pt.length {
+						out[i] = false
+						continue
+					}
+					end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+					n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
+					if n > 0 && buf[n - 1] == '\r' {n -= 1}
+					trimmed := strings.trim_left(string(buf[:n]), " \t")
+					if md_is_fence_line(trimmed) {
+						in_fence = !in_fence
+						out[i] = false // the fence line draws no body of its own
+					} else {
+						out[i] = in_fence
+					}
+					p = end + 1
+				}
+			}
+			// `open` is the whole opening fence line (e.g. "```json"); its first
+			// three bytes close the block. Run for both marker characters: the
+			// preview toggles on either, so base.lex_markdown -- which is what the
+			// seed reads -- has to recognise both or the tilde case stays broken in
+			// exactly the way Wyatt reported.
+			mf_run :: proc(bad: ^int, open: string, label: string) {
+				// Lines: 0 "# Heading", 1 "", 2 open, 3..102 json,
+				// 103 close, 104 "", 105 "After the block.", 106 "" (post-EOL).
+				OPEN_LINE :: 2
+				FIRST_CODE :: 3
+				LAST_CODE :: 102
+				CLOSE_LINE :: 103
+				AFTER_LINE :: 105
+				TOTAL_LINES :: 107
+				fmt.printfln("%s (%q):", label, open)
+				sb := strings.builder_make()
+				defer strings.builder_destroy(&sb)
+				strings.write_string(&sb, "# Heading\n\n")
+				strings.write_string(&sb, open)
+				strings.write_string(&sb, "\n")
+				for _ in 0 ..< 100 {strings.write_string(&sb, "  {\"k\": 1},\n")}
+				strings.write_string(&sb, open[:3])
+				strings.write_string(&sb, "\n\nAfter the block.\n")
+				// DEFAULT allocator: doc_from_content sets owned_orig, so doc_close
+				// frees this slice. A temp fixture here is heap corruption.
+				doc := doc_from_content(transmute([]u8)strings.clone(strings.to_string(sb)), "x.md", .UTF8)
+				defer doc_close(&doc)
+				doc.md_mode = .Preview
+
+				lex_index_start(&doc)
+				t0 := time.tick_now()
+				for !lex_index_done(&doc) && time.duration_seconds(time.tick_since(t0)) < 5 {
+					time.sleep(time.Millisecond)
+				}
+				mf_chk(bad, lex_index_done(&doc), "the background lex index built")
+
+				// Ground truth: the walk from byte 0, which no seed is involved in.
+				// Checked against the fixture's own shape first -- an off-by-one in
+				// the line numbering above would otherwise make every later
+				// comparison agree about the wrong thing.
+				truth: [TOTAL_LINES]bool
+				mf_walk(&doc, 0, truth[:])
+				shape :=
+					truth[FIRST_CODE] &&
+					truth[LAST_CODE] &&
+					!truth[OPEN_LINE] &&
+					!truth[CLOSE_LINE] &&
+					!truth[AFTER_LINE] &&
+					!truth[0]
+				mf_chk(bad, shape, "fixture: drawn from byte 0, only the block's body is code")
+
+				// 60 lines into the block: the case markdown_draw could not see.
+				inside := mf_line_offset(&doc, 60)
+				mf_chk(bad, doc_lex_state_at(&doc, inside, LEX_RESYNC_WINDOW) != .Normal, "lexer state 60 lines into a fence is not Normal")
+				open, found := lex_index_fence_open(&doc, inside)
+				mf_chk(bad, found && open == mf_line_offset(&doc, OPEN_LINE), "the fence-open line is findable from inside the block")
+
+				seed_in, seed_lex := md_fence_seed(&doc, inside)
+				mf_chk(bad, seed_in, "seeding at a scrolled top says: inside a fence")
+				mf_chk(bad, seed_lex != nil, "the recovered fence line still yields its tag's lexer")
+
+				// The symptom Wyatt reported, both halves: with the bit lost, lines
+				// 60..102 draw as prose and everything from the CLOSING fence on
+				// draws as code. Compared against the from-byte-0 walk, so a seed
+				// that is wrong in either direction fails here.
+				got: [TOTAL_LINES - 60]bool
+				mf_walk(&doc, 60, got[:])
+				same := true
+				for i in 0 ..< len(got) {
+					if got[i] != truth[60 + i] {same = false}
+				}
+				mf_chk(bad, same, "scrolled into the block: every later line matches the top walk")
+
+				// And a top BELOW the closing fence must not seed a fence -- a seed
+				// that answered "true" unconditionally would pass everything above.
+				after := mf_line_offset(&doc, AFTER_LINE)
+				after_in, _ := md_fence_seed(&doc, after)
+				mf_chk(bad, !after_in, "a top below the closing fence is not in a fence")
+				got2: [TOTAL_LINES - AFTER_LINE]bool
+				mf_walk(&doc, AFTER_LINE, got2[:])
+				same2 := true
+				for i in 0 ..< len(got2) {
+					if got2[i] != truth[AFTER_LINE + i] {same2 = false}
+				}
+				mf_chk(bad, same2, "scrolled past the block: nothing after it is code")
+			}
+			bad := 0
+			mf_run(&bad, "```json", "backtick fence")
+			fmt.printfln("mdfencetest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad csvtest` covers the table-view field parser: delimiters, empties,
 		// quoted fields with embedded delimiters, and "" escapes.
 		if os.args[1] == "csvtest" {
