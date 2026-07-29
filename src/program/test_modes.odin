@@ -10473,6 +10473,127 @@ when NEWTPAD_TESTS {
 		// soft" rather than as a bug: a hairline rounded up to 2px straddling two
 		// device pixels renders as two half-alpha lines, and an odd chrome font size
 		// puts every vertically-centred baseline on a half pixel.
+		// The two row budgets, and the seam between them.
+		//
+		// doc_visible_rows answers "how many rows fit WHOLLY" -- the scroll
+		// clamp's, the page keys' and doc_ensure_cursor_visible's question.
+		// doc_drawn_rows answers "how many rows does the draw emit" -- which
+		// includes a partial last row, and is therefore also the HIT-TEST's
+		// question, because a half-visible line is on screen and must be
+		// clickable. Putting a consumer on the wrong side of that split is the
+		// HANDOFF §6j shape exactly, so nothing here compares either procedure
+		// against a restatement of itself: the counts are hardcoded from a
+		// viewport built to hold exactly twenty rows, and the seam assertions
+		// compare DRAWN ROWS against CLICKABLE PIXELS.
+		//
+		// All the arithmetic is exact: line_height truncates to a whole pixel
+		// and CONTENT_TOP / TOP_INSET / STATUS_BAR_H are whole at 100%, so the
+		// boundary cases below are integers, not values a float could land
+		// either side of.
+		if os.args[1] == "rowbudgettest" {
+			rb_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			// The body lives in its own proc: test_mode_dispatch's frame is
+			// already large enough to have hit STATUS_STACK_OVERFLOW twice, and
+			// this holds exactly one Document.
+			rb_run :: proc(bad: ^int) {
+				// DEFAULT allocator, never temp -- doc_from_content sets
+				// owned_orig, so doc_close frees this slice. A temp-allocated
+				// fixture here is a heap corruption (0xC0000374), not a leak.
+				doc := doc_from_content(transmute([]u8)strings.repeat("line of text\n", 200), "", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				doc_update_top_inset(&doc)
+				px := f32(16)
+				line_h := line_height(px)
+				bar := doc_bottom_bar_h(&doc)
+				// A viewport whose content box is EXACTLY twenty rows tall, so
+				// every expectation below is a number this test states rather
+				// than one it recomputes from the code under test.
+				base_h := CONTENT_TOP + TOP_INSET + bar + line_h * 20
+				fmt.printfln(
+					"  content top %.0f, status bar %.0f, line height %.0f, 20-row height %.0f",
+					CONTENT_TOP + TOP_INSET,
+					bar,
+					line_h,
+					base_h,
+				)
+				// Flush, one pixel of slack, one pixel short of a whole row, and
+				// a whole row. A single height would pass with an off-by-one in
+				// either direction; the two flush cases are what reject an
+				// unconditional +1 and the two partial ones are what reject
+				// never adding it.
+				for c in ([]struct {
+					slack:               f32,
+					want_full, want_drawn: int,
+					what:                string,
+				} {
+					{0, 20, 20, "flush"},
+					{1, 20, 21, "1px of slack"},
+					{line_h - 1, 20, 21, "1px short of a row"},
+					{line_h, 21, 21, "one whole extra row"},
+				}) {
+					h := base_h + c.slack
+					ctop, cbot := doc_content_box(&doc, h)
+					full := doc_visible_rows(&doc, h, line_h)
+					drawn := doc_drawn_rows(&doc, h, line_h)
+
+					rb_chk(bad, full == c.want_full, fmt.tprintf("%-20s: %d rows fit wholly (want %d)", c.what, full, c.want_full))
+					rb_chk(bad, drawn == c.want_drawn, fmt.tprintf("%-20s: %d rows are drawn (want %d)", c.what, drawn, c.want_drawn))
+					rb_chk(bad, drawn == full || drawn == full + 1, fmt.tprintf("%-20s: drawn (%d) is full (%d) or one more", c.what, drawn, full))
+
+					// SEAM, drawn -> clickable. Every row the draw emits has a
+					// pixel inside the content box that hit-tests back to it.
+					// The bottom strip owns everything at or below cbot
+					// (main.odin swallows presses there), so a "drawn" row with
+					// no pixel above cbot is a row the user can see nothing of
+					// and click nothing on -- which is what an unconditional
+					// full+1 produces on a flush viewport.
+					ok_down := true
+					worst := -1
+					for r in 0 ..< drawn {
+						y := row_rect_y(px, r) + 0.25
+						if row_at_y(px, y) != r || y >= cbot {
+							ok_down = false
+							if worst < 0 {worst = r}
+						}
+					}
+					rb_chk(bad, ok_down, fmt.tprintf("%-20s: every drawn row has a clickable pixel (first bad row %d)", c.what, worst))
+
+					// SEAM, clickable -> drawn. The lowest pixel the content box
+					// owns must not name a row the draw never emitted; if it
+					// does, a click there falls through doc_pos_at's clamp onto
+					// some other line. This is the assertion that fails while
+					// the draw is stuck on doc_visible_rows.
+					low := row_at_y(px, cbot - 0.25)
+					rb_chk(bad, low <= drawn - 1, fmt.tprintf("%-20s: lowest content pixel is row %d, within the %d drawn", c.what, low, drawn))
+
+					// The markdown panes share the same content box but walk
+					// BASELINES, so they get their own bound. Two properties:
+					// the block of rows md_row_fits admits never crosses cbot
+					// (the overlap Wyatt reported), and it is maximal (no
+					// gratuitous whitespace).
+					k := 0
+					for y := ctop + px; md_row_fits(y, px, line_h, cbot); y += line_h {
+						k += 1
+						if k > 64 {break}
+					}
+					rb_chk(bad, ctop + f32(k) * line_h <= cbot, fmt.tprintf("%-20s: %d markdown rows end at %.0f, above the bar at %.0f", c.what, k, ctop + f32(k) * line_h, cbot))
+					rb_chk(bad, ctop + f32(k + 1) * line_h > cbot, fmt.tprintf("%-20s: a %dth markdown row would not have fit", c.what, k + 1))
+				}
+			}
+			fmt.println("rowbudgettest:")
+			saved := UI_SCALE
+			UI_SCALE = 1
+			bad := 0
+			rb_run(&bad)
+			UI_SCALE = saved
+			fmt.printfln("%d failures", bad)
+			return true
+		}
+
 		if os.args[1] == "metricstest" {
 			bad := 0
 			mt_chk :: proc(bad: ^int, ok: bool, label: string) {

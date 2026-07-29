@@ -256,9 +256,25 @@ main :: proc() {
 		// The filter banner (Ctrl+L) insets the content top; set it before any
 		// row math this frame so the rows, hit-test and count agree.
 		doc_update_top_inset(doc)
-		// Rows stop above the find/status bar, so no row is drawn behind it and
-		// no click in that strip lands on a row the user cannot see.
+		// Two row budgets, and which one a consumer gets is load-bearing.
+		//
+		// `rows` is the FULLY visible count: everything that reasons about
+		// reachability takes it -- the scroll clamp, the page keys, the wheel,
+		// doc_ensure_cursor_visible, doc_filter_max_top, doc_max_hscroll -- so
+		// paging never advances by a sliver and the caret is never called
+		// "visible" while half of it is under the status bar.
+		//
+		// `drawn` adds the partial last row, and goes to the DRAW and the
+		// HIT-TEST only. A half-visible line is on screen, so it must be
+		// clickable; before this there was a full row's worth of dead space at
+		// the bottom of the viewport (Wyatt, live use). See doc_drawn_rows.
+		//
+		// The GRID view stays on `rows` for both its draw and its hit-test:
+		// table_draw has its own header/row geometry, and splitting a layout
+		// this task does not otherwise touch is how the two halves of a widget
+		// end up one row apart (HANDOFF §6j).
 		rows := doc_visible_rows(doc, f32(window.height), line_h)
+		drawn := doc_drawn_rows(doc, f32(window.height), line_h)
 		// Usable content width in cells (word wrap breaks here).
 		doc_update_gutter(doc, char_w) // before view_cols: the gutter narrows the text
 		doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), app.settings.split_frac), char_w)
@@ -673,7 +689,7 @@ main :: proc() {
 					if _, over := table_link_hit(table_links(doc, &text, px, char_w, rows, f32(window.width)), f32(cx), f32(cy), px, line_h); over {
 						want = .Hand
 					}
-				} else if _, over := links_hit(links_layout(doc, &text, rows), px, char_w, f32(cx), f32(cy)); over {
+				} else if _, over := links_hit(links_layout(doc, &text, drawn), px, char_w, f32(cx), f32(cy)); over {
 					want = .Hand
 				}
 			}
@@ -684,7 +700,7 @@ main :: proc() {
 		// also move the caret, and gated on Ctrl so a plain click still means what
 		// it always meant — you can click into the middle of a URL to edit it.
 		if window.mouse_pressed && plat.key_ctrl_down() && !doc.filter {
-			hits := links_layout(doc, &text, rows)
+			hits := links_layout(doc, &text, drawn)
 			if h, found := links_hit(hits, px, char_w, f32(window.mouse_x), f32(window.mouse_y)); found {
 				if t, rok := link_resolve(doc, h.text, h.link); rok {
 					if !link_activate(&app, &text, t) {
@@ -708,14 +724,14 @@ main :: proc() {
 		// with it so the next frames cannot turn the same gesture into a
 		// selection drag across the document the jump has just revealed.
 		if window.mouse_pressed && doc_filtering(doc) {
-			_ = find_filter_click(doc, &text, f32(window.mouse_x), f32(window.mouse_y), px, rows)
+			_ = find_filter_click(doc, &text, f32(window.mouse_x), f32(window.mouse_y), px, drawn)
 			window.mouse_pressed = false
 			window.mouse_down = false
 		}
 
 		// Mouse: press places/extends the caret (double=word, triple=line); drag extends.
 		if window.mouse_pressed {
-			mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
+			mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, drawn)
 			switch window.mouse_count {
 			case 2:
 				doc_select_word_at(doc, mp)
@@ -758,7 +774,7 @@ main :: proc() {
 				sel_dragging = true
 			}
 			if sel_dragging {
-				mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, rows)
+				mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, drawn)
 				// block_drag_update (block.odin) now owns whether doc.cursor commits
 				// to mp this frame, not just whether a rectangle gets built: always
 				// for a plain drag, only on an ACCEPTED rectangle for an Alt-drag. A
@@ -1205,7 +1221,13 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	px, char_w, line_h := rc.px, rc.char_w, rc.line_h
 	doc := app_active(rc.app)
 	doc_update_top_inset(doc) // filter banner inset; must match the main loop's value
+	// The same split the frame loop makes (see its comment): `rows` is what
+	// fits wholly and feeds the scroll/scrollbar geometry, `drawn` adds the
+	// partial last row and feeds every pass that puts pixels on a text row.
+	// The frame loop's hit-test reads `drawn` too, so what is clickable is what
+	// was drawn.
 	rows := doc_visible_rows(doc, f32(window.height), line_h)
+	drawn := doc_drawn_rows(doc, f32(window.height), line_h)
 	doc_update_gutter(doc, char_w) // resize repaints come through here too
 	// Recompute the wrap width here (not just in the main loop) so word wrap
 	// re-flows live during a resize, which repaints through this path.
@@ -1226,8 +1248,10 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	bottom := doc.top
 	if doc.kind == .Text && doc.md_mode == .Preview {
 		// Full-window rendered markdown (read-only) replaces the text pass.
-		ytop := CONTENT_TOP + TOP_INSET
-		ybot := f32(window.height) - doc_bottom_bar_h(doc)
+		// Bounds from doc_content_box, the same producer the Split preview, the
+		// H_SCROLL cover and the bottom clip below all read -- so "where the
+		// document ends" is one expression, not four that agree today.
+		ytop, ybot := doc_content_box(doc, f32(window.height))
 		bottom = markdown_draw(gfx, quad_pipe, text, doc, px, char_w, TEXT_MARGIN_X, f32(window.width) - SCROLLBAR_W, ytop, ybot, doc.top)
 	} else if doc.table && doc.kind == .Text {
 		// Read-only grid view (CSV/TSV) replaces the text pass entirely.
@@ -1242,7 +1266,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// Behind the text: find-match highlights (dim), then the selection (bright).
 		if !doc.filter {
 			findq: [80]plat.Quad
-			if nfq := find_match_rects(doc, text, px, char_w, rows, findq[:]); nfq > 0 {
+			if nfq := find_match_rects(doc, text, px, char_w, drawn, findq[:]); nfq > 0 {
 				plat.quads_draw(gfx, quad_pipe, findq[:nfq])
 			}
 			selq: [80]plat.Quad
@@ -1250,7 +1274,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			// Selection_Doc) -- it just gets its geometry from block_row_range
 			// instead of the linear anchor/cursor pair, so the draw call
 			// swaps procedures rather than branching inside one of them.
-			ns := block_selection_rects(doc, text, px, char_w, rows, selq[:]) if block_active(doc) else doc_selection_rects(doc, text, px, char_w, rows, selq[:])
+			ns := block_selection_rects(doc, text, px, char_w, drawn, selq[:]) if block_active(doc) else doc_selection_rects(doc, text, px, char_w, drawn, selq[:])
 			if ns > 0 {
 				plat.quads_draw(gfx, quad_pipe, selq[:ns])
 			}
@@ -1265,7 +1289,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		ctrl := plat.key_ctrl_down()
 		style := rc.app.settings.link_style
 		if !doc.filter && (ctrl || style != .Hover) {
-			links = links_layout(doc, text, rows)
+			links = links_layout(doc, text, drawn)
 			if ctrl || style == .Underline {
 				for h in links {
 					plat.quads_draw(
@@ -1283,7 +1307,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			}
 		}
 
-		cx, cy, caret, bottom = doc_draw(gfx, text, doc, px, char_w, rows, links)
+		cx, cy, caret, bottom = doc_draw(gfx, text, doc, px, char_w, drawn, links)
 	}
 
 	// Horizontal scroll draws each line shifted left, so glyphs left of the first
@@ -1291,8 +1315,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// background (the caret sits at/after the margin, so it is never covered; the
 	// right-side overrun is already hidden by the scrollbar drawn below).
 	if H_SCROLL > 0 {
-		ctop := CONTENT_TOP + TOP_INSET
-		cbot := f32(window.height) - doc_bottom_bar_h(doc)
+		ctop, cbot := doc_content_box(doc, f32(window.height))
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, ctop}, size = {TEXT_MARGIN_X, cbot - ctop}, color = g_theme[.Bg_Base]}})
 	}
 
@@ -1310,7 +1333,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// left margin pointing at nothing.
 	if doc != nil && doc.kind == .Text && !doc.table && doc.md_mode != .Preview {
 		bmq: [80]plat.Quad
-		if nbq := doc_bookmark_rects(doc, text, px, rows, bmq[:]); nbq > 0 {
+		if nbq := doc_bookmark_rects(doc, text, px, drawn, bmq[:]); nbq > 0 {
 			plat.quads_draw(gfx, quad_pipe, bmq[:nbq])
 		}
 	}
@@ -1369,8 +1392,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// Markdown Split: a divider, the live preview in the right half, and a second
 	// byte-proportional scrollbar mirroring the shared scroll (doc.top).
 	if doc.kind == .Text && doc.md_mode == .Split {
-		pvtop := CONTENT_TOP + TOP_INSET
-		pvbot := h - doc_bottom_bar_h(doc)
+		pvtop, pvbot := doc_content_box(doc, h)
 		// The editor pass above draws full-window width, so its lines bleed into the
 		// right half where the preview lives. There is no scissor rect (the H_SCROLL
 		// margin above uses the same trick), so paint the right half back to the
@@ -1396,6 +1418,27 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 				},
 			)
 		}
+	}
+
+	// Clip the document to the content box, by repainting the bottom strip.
+	//
+	// There is no scissor rect in this renderer (see the H_SCROLL cover strip
+	// above and the Split preview's repaint, which are the same trick), and the
+	// status line is NOT drawn on an opaque band -- it is text on the bare
+	// canvas. So anything a content pass puts below doc_content_box's `bot`
+	// stays on screen sitting on top of the status bar. Two passes can now do
+	// that on purpose: doc_draw's partial last row, and a markdown heading whose
+	// larger line height overhangs the body-height bound md_row_fits admits it
+	// by. Both are meant to be cut off here rather than not drawn at all.
+	//
+	// Placed after every DOCUMENT pass (editor, grid, preview, both scrollbars,
+	// the caret) and before every CHROME pass -- the horizontal scrollbar sits
+	// at bot - its height, and the tab rail, menus, palette and status text all
+	// draw later -- so it clips content without erasing anything that is allowed
+	// to overlap the strip.
+	{
+		_, cbot := doc_content_box(doc, h)
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {0, cbot}, size = {w, h - cbot}, color = doc_canvas_clear()}})
 	}
 
 	// Horizontal scrollbar: cells in the text view, columns in the grid, hidden

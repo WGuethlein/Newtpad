@@ -712,6 +712,23 @@ md_draw_inline :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text
 	}
 }
 
+// Does a markdown row whose BASELINE is `y` fit entirely above `ybot`?
+//
+// The row occupies [y - px, y - px + line_h): the baseline sits px down from
+// the row's top, not at it. The loop below used to ask `y < ybot`, which admits
+// a row whose baseline is one pixel above the content bottom and then draws a
+// whole line height of it -- up to line_h - px pixels of glyphs painted on top
+// of the status bar. That is the overlap Wyatt reported in Markdown Preview and
+// in Split, and BOTH call sites already pass ybot = winh - doc_bottom_bar_h(doc)
+// (main.odin), so the bug was the bound, not the bound's input.
+//
+// Its own procedure so the test can drive it without a GPU device: reverting it
+// to `y < ybot` makes rowbudgettest's markdown walk fail rather than only
+// showing up on Wyatt's screen.
+md_row_fits :: #force_inline proc(y, px, line_h, ybot: f32) -> bool {
+	return y - px + line_h <= ybot
+}
+
 // Render markdown source from `top_byte`, laid out in [x0,x1] x [ytop,ybot].
 // Returns the byte offset just past the last line drawn (for scroll clamping).
 markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px, char_w: f32, x0, x1, ytop, ybot: f32, top_byte: int) -> (bottom: int) {
@@ -736,7 +753,7 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	// renders as (UI spec 9.2 item 12). Only when the view starts at the top of
 	// the file: scrolled past it, there is nothing to card.
 	fm_end := md_front_matter_end(doc) if top_byte == 0 else 0
-	for y < ybot && p <= doc.pt.length {
+	for md_row_fits(y, px, line_h, ybot) && p <= doc.pt.length {
 		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
 		if p < fm_end {
 			// Inside the front matter: one muted key/value line, no markdown

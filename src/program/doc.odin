@@ -735,8 +735,48 @@ doc_bottom_bar_h :: proc(doc: ^Document) -> f32 {
 }
 
 // Visible document rows, excluding both bars and the filter banner inset.
+//
+// FULLY visible: a row that only partly fits is not counted. That is the right
+// question for every consumer reasoning about REACHABILITY -- the scroll clamp
+// (doc_scroll, doc_max_top), the page keys, doc_filter_max_top,
+// doc_ensure_cursor_visible -- and it must stay that question. See
+// doc_drawn_rows for the other one.
 doc_visible_rows :: proc(doc: ^Document, height, line_h: f32) -> int {
 	return max(0, int((height - CONTENT_TOP - TOP_INSET - doc_bottom_bar_h(doc)) / line_h))
+}
+
+// The content box the document draws into: everything between the chrome (plus
+// the find bar / filter banner inset) and the bottom status strip. One
+// definition, so the draw's clip, the row budget and the tests cannot each
+// grow their own.
+doc_content_box :: proc(doc: ^Document, height: f32) -> (top, bot: f32) {
+	return CONTENT_TOP + TOP_INSET, height - doc_bottom_bar_h(doc)
+}
+
+// Rows the DRAW emits: the fully visible ones, plus a partial row when the
+// remainder can show any useful part of it. The bottom strip is repainted over
+// the content afterwards (render_frame), so a partial row cannot leave glyphs
+// on top of the status bar.
+//
+// Deliberately separate from doc_visible_rows rather than replacing it.
+// doc_visible_rows answers "how many rows are WHOLLY on screen", which is the
+// right question for the scroll clamp and the page keys -- paging by a count
+// that includes a sliver would scroll a hair further each press, and
+// doc_ensure_cursor_visible would call a half-hidden caret "visible". The draw
+// and the HIT-TEST ask this one instead: a half-visible line is clickable,
+// because it is on screen. Two questions, two procedures; conflating them is
+// the CLAUDE.md / HANDOFF §6j shape that has cost sixteen bugs in one session.
+//
+// PARTIAL_ROW_MIN is the policy: below it the sliver is not worth a row, and
+// drawing one would put its whole line height under the status strip for no
+// visible gain. It also keeps an exactly-flush viewport from gaining a phantom
+// row on floating-point noise.
+PARTIAL_ROW_MIN :: f32(0.5)
+doc_drawn_rows :: proc(doc: ^Document, height, line_h: f32) -> int {
+	full := doc_visible_rows(doc, height, line_h)
+	top, bot := doc_content_box(doc, height)
+	if bot - top - f32(full) * line_h > PARTIAL_ROW_MIN {return full + 1}
+	return full
 }
 
 // Highest filter_top that still fills the screen. One definition: the wheel, the
