@@ -3718,11 +3718,15 @@ border, which §1 assigns to `Md_Rule`. Fixed.
   but there is no per-level bullet cycling.
 - **§9.3's preview type scale and proportional face** are batch 17 and untouched.
 
-## 6aq. The first live pass on the UI overhaul — part one (2026-07-28, v0.28.0, branch `fix/live-pass-0.27`)
+## 6aq. The first live pass on the UI overhaul (2026-07-28/29, v0.28.0 + v0.29.0, branch `fix/live-pass-0.27`)
+
+**Read §6ar for the second release's summary and its cross-cutting findings.** This section grew as the
+batch ran, so it carries per-task detail for tasks 1–3 (shipped as v0.28.0) and, from "Part two"
+onward, for tasks 10–13 as well. §6ar covers the batch as a whole.
 
 Wyatt ran [the v0.27.0 checklist](docs/live-pass-v0.27.0.md) against his daily driver and annotated it.
-Seventeen defects. **This release carries the first three**, cut mid-batch at his request so the fixes
-reach his daily driver; the remaining thirteen are specced, planned and next. The spec is
+Seventeen defects. **v0.28.0 carried the first three**, cut mid-batch at his request so the fixes
+reached his daily driver; the remaining thirteen shipped as v0.29.0. The spec is
 [2026-07-28-live-pass-0.27-fixes-design.md](docs/superpowers/specs/2026-07-28-live-pass-0.27-fixes-design.md),
 the plan is [2026-07-28-live-pass-0.27-fixes.md](docs/superpowers/plans/2026-07-28-live-pass-0.27-fixes.md),
 and the live ledger is `.superpowers/sdd/progress.md`.
@@ -3912,6 +3916,109 @@ look like... it shows as muted, **I see the start and end `---`**, and I see lik
 but it's thinner" (`docs/live-pass-v0.27.0.md`). The card fix intentionally removes those visible `---`
 delimiters — the card IS the delimiter now, per UI spec 9.2. Confirm that's what he meant, not just "stop
 drawing the quote bar."
+
+## 6ar. The live pass, finished (2026-07-29, v0.29.0, branch `fix/live-pass-0.27`)
+
+The remaining thirteen of Wyatt's seventeen. Per-task detail for tasks 1–3 and 10–13 is in §6aq; this
+section is the batch as a whole and the cross-cutting findings a per-task review structurally could not
+see. Wyatt was asleep for most of it, having granted control to finish and continue.
+
+### The defects he reported, and what they actually were
+
+Four of the thirteen were not what the report or the plan said they were, and finding that out was worth
+more than the fixes:
+
+- **The vertical scrollbar stopping at 80%** was the thumb mapped against `doc.pt.length` instead of the
+  scrollable range. `doc.top` peaks at `doc_max_top`, never the file length, so the thumb fell short by
+  exactly the visible fraction of the file. The real defect was in `doc_scroll_to_fraction`, not
+  `vbar_drag_to` where the plan pointed.
+- **"Ctrl+H has no replace all"** — Replace All *existed* and was **dead code**. It hung off `ev.ctrl`
+  inside `.Find_Confirm`, but `lookup_binding` matches `(key, ctrl, alt, ctx)` exactly and every `.Enter`
+  row is `ctrl=false`, so the branch was unreachable from every route. The symptom is fully explained.
+- **"The first `>` is green"** was not the table-separator role drift the plan suspected; `lex_markdown`
+  tokenised only the first marker. And `Md_Quote` is unreachable from a lexer at all — it is a
+  program-layer `Color_Role`, and lexers emit `Token_Kind`.
+- **Tabs appearing mid-rail** was `app_add` reusing the first nil slot. The plan's premise that session
+  restore stored slot indices was wrong — it already stored display order — but restore was still a
+  second route, by *persisting and re-serving* a scrambled order.
+
+### Found on the way, unreported by anyone
+
+- **Replace All corrupted the buffer while reporting success.** `"aa"` over `"aaaa"` publishes three
+  overlapping matches for four bytes; the loop applied all three, each splicing into what the last had
+  written, producing `"b"` instead of `"bb"` — and returning 3. A wrong document with a plausible count
+  is the worst combination there is. `find_keep_set` now takes the leftmost non-overlapping subset.
+- **The link resolve-gate introduced a content-triggered denial of service.** Gating decoration on
+  `link_resolve` put a `stat` on the frame path — up to three times per frame while Ctrl is merely held.
+  A single dead UNC path in a pasted stack trace froze the UI thread for **over 100 seconds**, measured.
+  Ctrl is held during Ctrl+S, so the unsaved buffer was held hostage. `watch.odin`'s own header records
+  why: "the main thread must never block on the filesystem." Fixed by refusing non-local targets without
+  any filesystem call.
+- **The silent no-op on link activation existed at three sites**, not the one the plan named — the
+  editor, the table view's Ctrl+click, and the `Open_Link` palette command. Neither of the latter two has
+  a decoration gate, so Wyatt's report may well have come from there.
+- **A done task item's prose was muted twice**, dropping contrast to 3.58:1 Dark and 3.28:1 Light —
+  under the 4.5 floor every text role in `theme.odin` is annotated against.
+
+### What this batch got wrong, and it is the same thing eight times
+
+**The plan's draft test code was wrong in every single task.** Not occasionally — every one. The shapes:
+
+- measured an **empty list** (a device-less `Text` reports its atlas full, so nothing was recorded and
+  "all positions are integral" was vacuously true);
+- asserted **integrality** when the bug was a 1px shift *between* integers;
+- **subtracted the same global** production added, so a wrong value cancelled out of both sides;
+- asserted a property **the bug also satisfies**;
+- used a tolerance **loose enough to admit the defect** (1px, where the error was 0.34px);
+- was verified only by **the number the function chose to report**;
+- **would not have compiled** — six of seven procedure names in one task did not exist;
+- and **would have failed a correct implementation** (an arithmetic error in the controller's own
+  derivation of `MD_DONE_MUTE`: the real factors are 0.298/0.220, not 0.28/0.24).
+
+Two survived to the whole-branch review and were caught only there: `mdtest` could not reject the
+done-item colour defect, and `tabseamtest` could not reject the tab-gap defect — **the exact bugs Wyatt
+reported, reintroducible with the whole suite green.** Worse, HANDOFF affirmatively claimed the coverage
+existed. Both are fixed and both now bite under sabotage.
+
+**The operational lesson, stated so the next session can use it:** "write a test" is not the discipline.
+The discipline is *ask what value this assertion would reject*, and then prove it by reintroducing the
+bug. Six of the eight above pass that question trivially once it is asked out loud.
+
+### Also worth knowing
+
+- **The plan cited four test modes that do not exist** (`seltest`, `keytest`, `scrollbartest`,
+  `tablayouttest`). `seltest` fell through to the GUI path, opened a window, and locked the exe against
+  the next build. List them with
+  `grep -o 'os.args\[1\] == "[a-z]*"' src/program/test_modes.odin | sort -u`.
+- **A headless-GPU markdown test now exists.** `md_draw_selftest` drives `markdown_draw` through
+  `Headless_Gpu` + `gfx_readback_bgra` and samples pixels. That closes a class of blindness the project
+  carried for two batches, and it is reusable — the fence-seed coverage gap §6aq lists as owed can now be
+  closed with it rather than carried further. **That is the highest-value follow-up on the list.**
+- **Task 16 correctly produced no code.** The encoding dropdown's width was measured against its own
+  longest row and they match; the labels are simply long. "No defect, here are the numbers" is a
+  successful outcome.
+
+### Owed (in addition to §6aq's list)
+
+- **The batch made the `renderer`/`ui` extraction harder in five places**, none fatal, all worth having
+  before that work is planned: `find_actions` is UI geometry in a program-layer file that now depends on
+  `UI_SCALE`, the text metrics, the keymap *and* document state at once; `vscrollbar_geo` stopped being
+  arithmetic and became a document query (it walks the piece tree); `doc_max_hscroll` writes to the
+  `Document` from the draw path, so the draw is no longer idempotent; `links_layout` performs filesystem
+  I/O and owns a process-global cache, and the draw calls it; and `render_frame` now queries the live OS
+  cursor inside the draw for a hover fill, against "events queue to the frame arena".
+- **The front-matter card is a third consumer of the no-scissor cover strip.** Measured at 2170px tall
+  for a 60-line block, drawn as one unclipped quad. A real scissor facility is its own renderer task.
+- **`Replace All`'s Edit-menu row draws enabled and no-ops in table view and full Preview.** `item_enabled`
+  consults `command_allowed_on` but not `doc_read_only_view`. Pre-existing pattern (`.Paste` has it too),
+  but it is the same defect Task 15 deliberately fixed for the buttons, in the same commit that added the
+  row.
+- **Literal `$1` in a regex replacement writes the characters `$1`.** Pinned by a test so it cannot change
+  silently, but Replace All made it far more reachable — it now has a key, a palette entry and a button.
+  Product call for Wyatt.
+- **`replace_sel_raw` does not clamp its range**, unlike `doc_replace_range`. Pre-existing and shared with
+  `find_replace_current`, but making `find_replace_all` reachable widens the blast radius from one splice
+  to many.
 
 ## 7. Build environment (Windows, this machine)
 
