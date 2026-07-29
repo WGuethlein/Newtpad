@@ -2321,6 +2321,23 @@ Md_Walk_Block :: struct {
 // knob, it is the layout cache's slot count, and the two must move together.
 MD_WALK_BLOCKS :: MD_LAYOUT_SLOTS
 
+// Lines of run-up a walk takes before the block it is resolving.
+//
+// The collapsed gap ABOVE a block is a function of the block BEFORE it
+// (max(prev.below, this.above)), so a walk that starts at the anchor gets the
+// anchor's own gap wrong -- it sees no predecessor and falls back to the
+// block's own `above`. Measured on a paragraph following a paragraph that is 19
+// px at S=24, and it is not a cosmetic error: it makes the anchor's slot a
+// different height in different procedures, so scrolling one pixel across a
+// block boundary and back landed 19 px from where it started, and the drag's
+// inverse stopped agreeing with the map. Every walk that RESOLVES an anchor
+// takes this run-up, so the gap is the same number everywhere.
+//
+// 24 lines is chosen to clear front matter as well: front matter is a block only
+// at byte 0, so a run-up that reaches 0 classifies it correctly, and one that
+// stops inside it would read its lines as rules and paragraphs.
+MD_RUNUP_LINES :: 24
+
 // Lay blocks out forward from `from`, stopping at `limit_h` pixels of height, at
 // `stop_at` bytes, or at a bound -- whichever comes first.
 //
@@ -2329,6 +2346,9 @@ MD_WALK_BLOCKS :: MD_LAYOUT_SLOTS
 // no path that walks to the end of a document: `limit_h` and `len(out)` are both
 // hard, and the zero-height bound (MD_MAX_EMPTY_BLOCKS) covers the case a height
 // limit cannot see.
+//
+// `limit_from` is where the height limit starts counting -- the run-up above an
+// anchor is not part of the pane's budget and must not eat it.
 @(private = "file")
 md_walk :: proc(
 	gfx: ^plat.Gfx,
@@ -2338,6 +2358,7 @@ md_walk :: proc(
 	measure: f32,
 	from: int,
 	stop_at: int,
+	limit_from: int,
 	limit_h: f32,
 	out: []Md_Walk_Block,
 ) -> (
@@ -2346,6 +2367,8 @@ md_walk :: proc(
 	reached: bool,
 ) {
 	if doc == nil {return}
+	base_h := f32(0)
+	counting := from >= limit_from
 	buf: [RENDER_LINE_CAP]u8
 	p := clamp(from, 0, doc.pt.length)
 	// Seeded from the document's own lexer state at `from`, NOT from `false`: the
@@ -2360,6 +2383,7 @@ md_walk :: proc(
 	empties := 0
 	reached = p > doc.pt.length || p >= stop_at
 	for p <= doc.pt.length && p < stop_at && n < len(out) && empties < MD_MAX_EMPTY_BLOCKS {
+		if !counting && p >= limit_from {counting, base_h = true, total}
 		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
 		nb := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
 		if nb > 0 && buf[nb - 1] == '\r' {nb -= 1}
@@ -2379,7 +2403,28 @@ md_walk :: proc(
 		}
 		p = lay.next
 		reached = p >= stop_at
-		if total >= limit_h {break}
+		if counting && total - base_h >= limit_h {break}
+	}
+	return
+}
+
+// The walk that RESOLVES an anchor: MD_RUNUP_LINES of run-up before it, so the
+// anchor block's collapsed gap is the document's and not an artefact of where
+// the walk began (see MD_RUNUP_LINES), plus the index of the block the anchor
+// falls in.
+//
+// Every consumer of an anchor goes through here -- the draw, the slot height,
+// the downward scroll -- which is what makes "the anchor's slot" one number.
+// `limit_h` is measured from the anchor, not from the run-up.
+@(private = "file")
+md_anchor_walk :: proc(c: ^Md_Scroll_Ctx, block: int, limit_h: f32, out: []Md_Walk_Block) -> (n, idx: int) {
+	from := md_line_start_back(c.doc, block, MD_RUNUP_LINES)
+	n, _, _ = md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, from, max(int), block, limit_h, out)
+	// The last block starting at or before the anchor byte IS the block the
+	// anchor names -- blocks tile the document -- so a stale anchor left
+	// mid-block by an edit resolves to its container instead of misreading.
+	for i in 0 ..< n {
+		if out[i].start <= block {idx = i}
 	}
 	return
 }
@@ -2417,20 +2462,25 @@ md_pass :: proc(
 	m := md_metrics(text, px)
 	cx, measure := md_content_span(&m, x0, x1)
 	pane := max(1, ybot - ytop)
+	c := Md_Scroll_Ctx{gfx, text, doc, m, measure, ytop, pane}
 	blocks := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
-	// The anchor's own scrolled-off part, the pane, and one pane below it.
-	n, _, _ := md_walk(gfx, text, doc, &m, measure, at.block, max(int), at.px + pane * 2, blocks)
+	// The anchor's own scrolled-off part, the pane, and one pane below it -- 9.1's
+	// budget. The run-up md_anchor_walk takes is NOT part of that budget and is
+	// never drawn; it is what makes the anchor's gap the document's own.
+	n, idx := md_anchor_walk(&c, at.block, at.px + pane * 2, blocks)
 	if links != nil {link_cache_begin(doc)}
 	// The anchor block's SLOT top, in client pixels. Everything else in the pass
 	// is this plus the walk's own relative offsets -- one origin, so a block's
 	// draw y and its link rect's y cannot be two different numbers.
-	y0 := ytop - at.px
+	y0 := ytop - at.px - (blocks[idx].slot_top if n > 0 else 0)
 	// The very first block is admitted unconditionally. A pane shorter than one
 	// h1 is reachable (the window floor is 240dp and the document font size is a
 	// user setting), and "no frame ever shows emptiness" outranks a heading whose
 	// bottom edge the cover strip trims. Spent once.
 	forced := true
-	for i in 0 ..< n {
+	// From the anchor, not from the walk's start: the blocks before `idx` are the
+	// run-up, and they exist only so the anchor's gap is right.
+	for i in idx ..< n {
 		b := blocks[i]
 		y := y0 + b.slot_top + b.gap
 		// Wholly above the pane: a zero-height anchor (a blank run), or an anchor
@@ -2579,10 +2629,10 @@ md_line_start_back :: proc(doc: ^Document, p, k: int) -> int {
 @(private = "file")
 md_probe_back :: proc(c: ^Md_Scroll_Ctx, at, stop_at: int, want_h: f32, out: []Md_Walk_Block) -> (n, s: int, total: f32) {
 	s = clamp(at, 0, c.doc.pt.length)
-	lines := 24
+	lines := MD_RUNUP_LINES
 	for _ in 0 ..< 4 {
 		try := md_line_start_back(c.doc, at, lines)
-		tn, tt, reached := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, try, stop_at, max(f32), out)
+		tn, tt, reached := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, try, stop_at, try, max(f32), out)
 		// The walk could not span [try, stop_at) inside one walk's block budget,
 		// so `try` is further back than this model can represent. Keep the last
 		// span that did span, which is what the caller's arithmetic assumes.
@@ -2611,26 +2661,27 @@ md_block_at_byte :: proc(c: ^Md_Scroll_Ctx, b: int) -> (start, next: int, slot: 
 	if c.doc == nil {return}
 	target := clamp(b, 0, c.doc.pt.length)
 	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
-	// Eight lines is enough to swallow the only constructs whose block starts
-	// above their own line: a collapsed blank run and front matter. It is a
-	// bound, not a guess about content -- landing mid-run only means the anchor
-	// names a blank block that starts one line later, and a blank block is zero
-	// pixels tall, so no y moves.
-	from := md_line_start_back(c.doc, target, 8)
-	n, _, _ := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, from, target + 1, max(f32), out)
+	// The run-up is what makes the slot returned here the same number md_pass
+	// will use; without it the gap above the block would be its own `above`
+	// rather than the document's collapsed one. It also swallows the only
+	// constructs whose block starts above their own line -- a collapsed blank
+	// run and front matter.
+	from := md_line_start_back(c.doc, target, MD_RUNUP_LINES)
+	n, _, _ := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, from, target + 1, from, max(f32), out)
 	if n == 0 {return target, target + 1, 0}
 	last := out[n - 1]
 	return last.start, last.next, last.gap + last.h
 }
 
-// One block's slot height and extent, without a search. `start` must be a block
-// start; if it is not, the walk simply treats it as one.
+// One block's slot height and extent. Goes through md_anchor_walk for the run-up
+// (see MD_RUNUP_LINES): this number is the denominator of the scrollbar's
+// fraction and the divisor of its inverse, so it has to be the one the draw uses.
 @(private = "file")
 md_slot_at :: proc(c: ^Md_Scroll_Ctx, start: int) -> (next: int, slot: f32) {
-	one: [1]Md_Walk_Block
-	n, _, _ := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, start, start + 1, max(f32), one[:])
+	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	n, idx := md_anchor_walk(c, start, 1, out)
 	if n == 0 {return start + 1, 0}
-	return one[0].next, one[0].gap + one[0].h
+	return out[idx].next, out[idx].gap + out[idx].h
 }
 
 // The scroll position as ONE monotone scalar: bytes, with the fraction of the
@@ -2676,13 +2727,11 @@ md_max_anchor :: proc(c: ^Md_Scroll_Ctx) -> Md_Anchor {
 	n, s, total := md_probe_back(c, doc.pt.length, max(int), c.pane, out)
 	a := Md_Anchor{s, 0}
 	if rel := total - c.pane; rel > 0 && n > 0 {
-		for i in 0 ..< n {
-			b := out[i]
-			if rel < b.slot_top + b.gap + b.h || i == n - 1 {
-				a = {b.start, clamp(rel - b.slot_top, 0, b.gap + b.h)}
-				break
-			}
-		}
+		// Same rule as md_scroll_px's upward branch: the walk's first block has no
+		// predecessor here, so it is only a legitimate anchor when it is the
+		// document's own first block.
+		lo := 0 if s <= 0 else min(1, n - 1)
+		a = md_at_offset(out[:n], lo, max(rel, out[lo].slot_top))
 	}
 	doc.md_max, doc.md_max_key = a, key
 	return a
@@ -2710,36 +2759,45 @@ md_scroll_px :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, dy: f32) -> Md_Anchor {
 	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
 	res := a
 	if dy > 0 {
-		target := a.px + dy
 		// One pane past the target, so the blocks the next frame draws are laid
 		// out here and the frame after it is a cache hit -- 9.1's "a screen
 		// below", on the gesture that needs it.
-		n, _, _ := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, a.block, max(int), target + c.pane, out)
-		for i in 0 ..< n {
-			b := out[i]
-			if target < b.slot_top + b.gap + b.h || i == n - 1 {
-				res = {b.start, target - b.slot_top}
-				break
-			}
-		}
+		n, idx := md_anchor_walk(c, a.block, a.px + dy + c.pane, out)
+		if n == 0 {return a}
+		target := out[idx].slot_top + a.px + dy
+		res = md_at_offset(out[:n], idx, target)
 	} else {
 		// 9.1's "a screen above": ask the probe for the step PLUS a pane, so the
 		// blocks above the new position are warm rather than rebuilt next frame.
 		n, s, total := md_probe_back(c, a.block, a.block, -dy + c.pane, out)
 		target := total + a.px + dy
-		if target <= 0 || n == 0 {
+		if n == 0 {
 			res = {s, 0}
 		} else {
-			for i in 0 ..< n {
-				b := out[i]
-				if target < b.slot_top + b.gap + b.h || i == n - 1 {
-					res = {b.start, clamp(target - b.slot_top, 0, b.gap + b.h)}
-					break
-				}
-			}
+			// Never resolve onto the walk's FIRST block unless it is the document's
+			// -- that one has no predecessor here, so its gap is its own `above`
+			// and not the document's collapsed one (MD_RUNUP_LINES). Clamping to
+			// the second block instead costs one block of travel on a jump larger
+			// than the probe could reach; the next step continues from there.
+			lo := 0 if s <= 0 else min(1, n - 1)
+			res = md_at_offset(out[:n], lo, max(target, out[lo].slot_top))
 		}
 	}
 	return md_scroll_clamp(c, res)
+}
+
+// The anchor naming the position `target` in a walk's own space, searched from
+// `lo` forward. One place resolves an offset to an anchor, so the invariant
+// px in [0, gap + h) holds however the offset was arrived at.
+@(private = "file")
+md_at_offset :: proc(w: []Md_Walk_Block, lo: int, target: f32) -> Md_Anchor {
+	for i in lo ..< len(w) {
+		b := w[i]
+		if target < b.slot_top + b.gap + b.h || i == len(w) - 1 {
+			return {b.start, clamp(target - b.slot_top, 0, b.gap + b.h)}
+		}
+	}
+	return {w[lo].start, 0}
 }
 
 // The scroll position as a fraction of the scrollable range, for the scrollbar.
@@ -2791,10 +2849,10 @@ md_anchor_top_byte :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> int {
 md_block_at_y :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, y: f32) -> (start: int, ok: bool) {
 	if c.doc == nil {return}
 	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
-	n, _, _ := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, a.block, max(int), a.px + c.pane, out)
+	n, idx := md_anchor_walk(c, a.block, a.px + c.pane, out)
 	if n == 0 {return}
-	rel := (y - c.ytop) + a.px // into the walk's own space
-	lo, hi := 0, n - 1
+	rel := (y - c.ytop) + a.px + out[idx].slot_top // into the walk's own space
+	lo, hi := idx, n - 1
 	for lo < hi {
 		mid := (lo + hi + 1) / 2
 		if out[mid].slot_top <= rel {lo = mid} else {hi = mid - 1}

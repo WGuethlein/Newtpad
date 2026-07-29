@@ -5044,6 +5044,349 @@ when NEWTPAD_TESTS {
 			return
 		}
 
+		// Batch 17 task 2c: the preview's PIXEL scroll offset (UI spec 9.1 item 4),
+		// 9.1's layout budget, and 9.4's Split sync.
+		//
+		// Its own procedure, not more sections in md_draw_selftest, for the reason
+		// this file keeps learning: these frames are enormous and three of them
+		// have already hit STATUS_STACK_OVERFLOW. One Headless_Gpu, one Document
+		// live at a time, each fixture in its own scope.
+		//
+		// Everything here is asserted against the DRAW where it can be. "The
+		// offset is in pixels" is not observable from the scroll state -- a model
+		// that quantised the offset to whole lines would return the same anchors
+		// -- so the assertion is that the readback moved by exactly the number of
+		// pixels asked for, which only a real pixel offset can satisfy.
+		md_scroll_selftest :: proc() -> (bad: int) {
+			schk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 800, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/scroll") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(24)
+			winw, winh := f32(W), f32(H)
+
+			render :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot: f32, at: Md_Anchor) -> (buf: []u8, ok: bool) {
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, at)
+				return plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+			}
+			// A pixel that is not the canvas. The pane is painted with Bg_Base and
+			// nothing else, so "differs from Bg_Base" is "something was drawn".
+			inked :: proc(buf: []u8, x, y: int) -> bool {
+				bg := g_theme[.Bg_Base]
+				i := (y * W + x) * 4
+				want := [3]u8{u8(bg[2] * 255 + 0.5), u8(bg[1] * 255 + 0.5), u8(bg[0] * 255 + 0.5)}
+				return abs(int(buf[i]) - int(want[0])) > 6 || abs(int(buf[i + 1]) - int(want[1])) > 6 || abs(int(buf[i + 2]) - int(want[2])) > 6
+			}
+			// The first and last rows of the band [y0, y1) carrying any ink; -1 for
+			// neither.
+			ink_rows :: proc(buf: []u8, x0, x1, y0, y1: int) -> (first, last: int) {
+				first, last = -1, -1
+				for y in max(0, y0) ..< min(H, y1) {
+					for x in max(0, x0) ..< min(W, x1) {
+						if inked(buf, x, y) {
+							if first < 0 {first = y}
+							last = y
+							break
+						}
+					}
+				}
+				return
+			}
+
+			// --- A. the offset is PIXELS, not lines --------------------------
+			//
+			// The whole point of 9.1 item 4, and the one claim the scroll state
+			// cannot witness on its own. Rendered twice and compared: at {0, K}
+			// every pixel the preview drew must be exactly K rows higher than it
+			// was at {0, 0}.
+			//
+			// K deliberately includes values that are not multiples of anything --
+			// 1, 7, 13, 29 -- because a model that still moved in rows, or that
+			// rounded to the leading, would pass at 0 and at a line height and
+			// nowhere else.
+			{
+				src := "# Heading one\n\nalpha alpha alpha\n\nbravo bravo bravo\n\ncharlie charlie charlie\n\ndelta delta delta\n\necho echo echo\n\nfoxtrot foxtrot\n\ngolf golf golf\n\nhotel hotel hotel"
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "px.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, winw, winh, 0.5)
+				schk(&bad, box_ok, "pixels: the fixture has a preview pane")
+
+				base_buf, ok0 := render(&h, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				schk(&bad, ok0, "pixels: readback")
+				bf, bl := ink_rows(base_buf, int(x0), int(x1), int(ytop), int(ybot))
+				schk(&bad, bf >= 0 && bl > bf + 100, fmt.tprintf("pixels: the unscrolled pane is full of content (ink rows %d..%d)", bf, bl))
+
+				for k in ([]int{1, 7, 13, 29}) {
+					buf, okk := render(&h, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{0, f32(k)})
+					if !okk {
+						schk(&bad, false, fmt.tprintf("pixels: readback at px=%d", k))
+						continue
+					}
+					// The topmost inked row moved up by exactly k. Rejects an
+					// ignored offset (delta 0), a quantised one (delta 0 until a
+					// whole line has accumulated) and an inverted one.
+					f2, _ := ink_rows(buf, int(x0), int(x1), 0, int(ybot))
+					schk(&bad, f2 == bf - k, fmt.tprintf("pixels: px=%d moves the first inked row up by exactly %d (%d -> %d)", k, k, bf, f2))
+
+					// And every pixel with it, not just the first row. Compared over
+					// a band that stops well short of ybot: the block admitted at
+					// the BOTTOM edge legitimately differs between the two renders
+					// (a scrolled pane has room for one more), and that is the fit
+					// test working, not a layout that moved.
+					band_lo, band_hi := int(ytop) + k, int(ybot) - 140
+					diff := 0
+					for y in band_lo ..< band_hi {
+						for x in int(x0) ..< int(x1) {
+							i := (y * W + x) * 4
+							j := ((y + k) * W + x) * 4
+							if base_buf[j] != buf[i] || base_buf[j + 1] != buf[i + 1] || base_buf[j + 2] != buf[i + 2] {diff += 1}
+						}
+					}
+					total := (band_hi - band_lo) * (int(x1) - int(x0))
+					schk(&bad, diff == 0, fmt.tprintf("pixels: ...and so does every other pixel (%d of %d differ, band %d..%d)", diff, total, band_lo, band_hi))
+				}
+			}
+
+			// --- B. 9.1's layout budget: the visible blocks plus a screen -----
+			//
+			// "Layout only the visible blocks plus a screen above and below."
+			// Asserted from BOTH sides, and the second side is the one that
+			// matters: an upper bound alone is satisfied by a pass that lays out
+			// only what is visible, and a lower bound alone by a pass that lays
+			// out the document. Only the pair says "a screen, and a screen".
+			//
+			// Counted in BUILDS (md_layout_builds), because "how much of the
+			// document did this pass touch" is exactly what a build count is, and
+			// a wall-clock bound would be an assertion about this machine.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				// Fixed-width lines, so a byte offset divided by 12 is a block
+				// index and `bottom` can be read as "how many blocks were visible".
+				for i in 0 ..< 200 {fmt.sbprintf(&b, "para %03d xx\n", i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "budget.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
+
+				md_layout_reset(&doc)
+				before := md_layout_builds
+				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				builds := md_layout_builds - before
+				vis := bottom / 12 + 1
+				schk(&bad, vis >= 5 && vis <= 40, fmt.tprintf("budget: the pane holds several blocks, and the fixture is far longer (%d of 200)", vis))
+				schk(&bad, builds <= vis * 3, fmt.tprintf("budget: a pass lays out a bounded window, NOT the document (%d builds, %d visible, 200 blocks)", builds, vis))
+				schk(&bad, builds >= vis * 2 - 2, fmt.tprintf("budget: ...and it really does lay out the screen BELOW, not just the visible blocks (%d builds vs %d visible)", builds, vis))
+			}
+
+			// --- C. the preview's own end of travel, and its scrollbar --------
+			//
+			// The defect 2b measured and left for this task: a blank RUN is one
+			// zero-height block, so a preview screen covers about three times the
+			// source an editor screen does -- and the preview was clamped by the
+			// EDITOR's doc_max_top. The last stretch of the scroll travel showed
+			// nothing new. The fixture is the one the brief names.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< 200 {fmt.sbprintf(&b, "word %03d\n\n\n\n\n\n\n\n", i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "blanks.md", .UTF8)
+				doc.md_mode = .Preview
+				doc.view_cols = 80
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				schk(&bad, cok, "end: the scroll context comes from the same md_pane_box the draw does")
+
+				mx := md_max_anchor(&c)
+				ed_rows := int((ybot - ytop) / line_height(px_))
+				ed_max := doc_max_top(&doc, &h.text, ed_rows)
+				schk(&bad, ed_max > 0 && mx.block > 0, fmt.tprintf("end: both ceilings are inside the document (preview %d, editor %d)", mx.block, ed_max))
+				schk(&bad, mx.block < ed_max, fmt.tprintf("end: the preview's ceiling is its OWN, and well short of the editor's (%d vs %d)", mx.block, ed_max))
+
+				// The teeth. At the preview's own ceiling the pane is FULL -- ink
+				// runs down to its bottom edge -- and at the editor's ceiling it is
+				// not, which is precisely "the last stretch shows nothing new".
+				pane_bot := int(ybot)
+				buf_mx, _ := render(&h, &doc, px_, x0, x1, ytop, ybot, mx)
+				_, last_mx := ink_rows(buf_mx, int(x0), int(x1), int(ytop), pane_bot)
+				buf_ed, _ := render(&h, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{ed_max, 0})
+				_, last_ed := ink_rows(buf_ed, int(x0), int(x1), int(ytop), pane_bot)
+				lh := int(line_height(px_))
+				schk(&bad, last_mx >= pane_bot - 3 * lh, fmt.tprintf("end: at the preview's ceiling the pane is full (last ink %d, pane bottom %d)", last_mx, pane_bot))
+				schk(&bad, last_ed < last_mx - 3 * lh, fmt.tprintf("end: at the EDITOR's ceiling most of the pane is empty (last ink %d vs %d)", last_ed, last_mx))
+
+				// Nothing scrolls past it, from either gesture. Iterated, because
+				// ONE md_scroll_px is deliberately bounded by the walk -- a single
+				// gesture cannot cross more blocks than a walk holds, which is the
+				// viewport-first rule and not a shortfall. What must be true is
+				// that repeating it converges on the ceiling and never goes past.
+				far := Md_Anchor{}
+				steps := 0
+				for steps < 30 {
+					nxt := md_scroll_px(&c, far, 1e7)
+					steps += 1
+					if nxt == far {break}
+					far = nxt
+				}
+				schk(&bad, far == mx, fmt.tprintf("end: scrolling down repeatedly stops exactly at the ceiling (%d/%.1f vs %d/%.1f, %d steps)", far.block, far.px, mx.block, mx.px, steps))
+				schk(&bad, md_scroll_px(&c, mx, 5000) == mx, "end: ...and a step from the ceiling moves nothing")
+				// Sub-pixel tolerance, not equality: the drag's inverse goes through
+				// a byte-with-a-fraction scalar, so it lands within a rounding of
+				// the ceiling rather than on its exact f32 bits. Half a pixel is
+				// well inside "the same place on screen".
+				drag_end := md_scroll_to_fraction(&c, 2)
+				schk(
+					&bad,
+					drag_end.block == mx.block && abs(drag_end.px - mx.px) < 0.5,
+					fmt.tprintf("end: ...and so does dragging the thumb past the bottom (%d/%.3f vs %d/%.3f)", drag_end.block, drag_end.px, mx.block, mx.px),
+				)
+
+				// The scrollbar. Two independent halves of "the thumb reaches the
+				// bottom": the FRACTION is 1 at the end of the range (this is what
+				// dividing by pt.length instead of the range breaks), and the
+				// GEOMETRY puts the thumb's bottom edge on the track's at a
+				// fraction of 1 (this is what multiplying by the whole track
+				// instead of track-minus-thumb breaks). vscrollbar_geo's comment
+				// records both; the preview's bar has to earn them again.
+				f_top := md_scroll_frac(&c, Md_Anchor{})
+				f_end := md_scroll_frac(&c, mx)
+				schk(&bad, f_top == 0, fmt.tprintf("bar: the fraction is 0 at the top (%.4f)", f_top))
+				schk(&bad, f_end >= 0.9999, fmt.tprintf("bar: the fraction is 1 at the preview's OWN end of travel (%.4f)", f_end))
+				bot_end := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, mx)
+				doc.md_top = mx
+				vb := md_vscrollbar_geo(&doc, winw - SCROLLBAR_W, winh, bot_end, f_end)
+				schk(&bad, vb.shown && vb.thumb_h > 0, fmt.tprintf("bar: the thumb has a size (%.1f of %.1f)", vb.thumb_h, vb.track_h))
+				schk(
+					&bad,
+					abs((vb.thumb_y + vb.thumb_h) - (vb.track_y + vb.track_h)) < 0.5,
+					fmt.tprintf("bar: at the end of travel the thumb's BOTTOM meets the track's (%.1f vs %.1f)", vb.thumb_y + vb.thumb_h, vb.track_y + vb.track_h),
+				)
+				vb0 := md_vscrollbar_geo(&doc, winw - SCROLLBAR_W, winh, bot_end, 0)
+				schk(&bad, abs(vb0.thumb_y - vb0.track_y) < 0.5, fmt.tprintf("bar: ...and at the top its TOP meets the track's (%.1f vs %.1f)", vb0.thumb_y, vb0.track_y))
+
+				// Grab it and hold it and it does not move: the fraction map and
+				// its inverse are exact inverses, which is the property
+				// scrollgrabtest pins for the editor's bar.
+				worst := f32(0)
+				for i in 0 ..= 10 {
+					want := f32(i) / 10
+					got := md_scroll_frac(&c, md_scroll_to_fraction(&c, want))
+					worst = max(worst, abs(got - want))
+				}
+				schk(&bad, worst < 0.01, fmt.tprintf("bar: fraction -> anchor -> fraction is the identity (worst error %.4f)", worst))
+
+				// Down then up returns to where it started -- the probe-back path,
+				// which is the half of the pixel model with no other witness.
+				a1 := md_scroll_px(&c, Md_Anchor{}, 900)
+				a2 := md_scroll_px(&c, a1, -900)
+				schk(&bad, a1.block > 0, fmt.tprintf("scroll: 900px down moves off the first block (%d/%.1f)", a1.block, a1.px))
+				schk(&bad, a2 == Md_Anchor{}, fmt.tprintf("scroll: ...and 900px back up returns to the top exactly (%d/%.1f)", a2.block, a2.px))
+				a3 := md_scroll_px(&c, a1, -200)
+				a4 := md_scroll_px(&c, a3, 200)
+				schk(&bad, a4 == a1, fmt.tprintf("scroll: a partial step up and back is the identity too (%d/%.1f vs %d/%.1f)", a4.block, a4.px, a1.block, a1.px))
+
+				// 9.4's sync, on the fixture that can tell block from line: eight
+				// blank lines are ONE block, so every one of them maps to the same
+				// preview position. A line-based map returns eight different ones.
+				// "word 000" is 8 bytes and the group's 8 newlines follow, so the
+				// blank run is the 7 empty lines at bytes 9..15 and the next word
+				// block starts at 16. (The first draft said eight and read 7 of 8 --
+				// the test was wrong, not the map.)
+				run_start := 9
+				same := 0
+				a0 := md_anchor_from_top(&c, run_start)
+				for k in 0 ..< 7 {
+					if md_anchor_from_top(&c, run_start + k) == a0 {same += 1}
+				}
+				schk(&bad, same == 7, fmt.tprintf("sync: every line of a 7-line blank RUN maps to one preview block (%d of 7, block %d)", same, a0.block))
+				// ...and the line after it does NOT, or the check above would be
+				// satisfied by a map that returns the same block for everything.
+				schk(&bad, md_anchor_from_top(&c, 16) != a0, fmt.tprintf("sync: ...and the block after the run is a DIFFERENT one (%d)", md_anchor_from_top(&c, 16).block))
+				schk(&bad, a0.block == run_start, fmt.tprintf("sync: ...and that block is the run's own start (%d)", a0.block))
+				// And the inverse maps back onto a line start inside that block,
+				// so the two directions cannot walk the document apart.
+				back := md_anchor_top_byte(&c, a0)
+				schk(&bad, back == a0.block, fmt.tprintf("sync: the reverse map returns the block's line (%d vs %d)", back, a0.block))
+				schk(&bad, md_anchor_from_top(&c, back) == a0, "sync: ...and mapping it forward again is the identity")
+			}
+
+			// --- D. 9.1's pixel -> block search ------------------------------
+			//
+			// "click-to-sync-scroll, which only needs the nearest BLOCK, not the
+			// nearest glyph. Store each block's y range and binary-search it."
+			//
+			// Checked against the DRAW, not against a second walk: each line
+			// carries a link whose target names its own index, so markdown_links
+			// says where the block was actually painted and md_block_at_y has to
+			// agree with that.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				// A real https target, not a bare word: link rects are GATED on
+				// "underlined implies openable" (link_gate_visible), so a fixture
+				// whose targets do not resolve places no rectangles at all -- which
+				// is what the first draft did, and it reported zero links.
+				for i in 0 ..< 40 {fmt.sbprintf(&b, "row [%03d](https://e.test/p%03d) here\n", i, i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "aty.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
+				c, _ := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				line_len := len("row [000](https://e.test/p000) here\n")
+
+				// Off the top by a fraction of a block, so the search is asked a
+				// question the anchor alone cannot answer.
+				at := Md_Anchor{line_len * 3, 11}
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at, context.temp_allocator)
+				schk(&bad, len(hits) >= 6, fmt.tprintf("at_y: the fixture places links to search against (%d)", len(hits)))
+				wrong, checked := 0, 0
+				for hit in hits {
+					idx := -1
+					if len(hit.url) >= 4 {
+						t := hit.url[len(hit.url) - 4:]
+						if t[0] == 'p' {idx = int(t[1] - '0') * 100 + int(t[2] - '0') * 10 + int(t[3] - '0')}
+					}
+					if idx < 0 {continue}
+					checked += 1
+					got, ok := md_block_at_y(&c, at, hit.rect.pos.y + hit.rect.size.y * 0.5)
+					if !ok || got != idx * line_len {wrong += 1}
+				}
+				schk(&bad, checked >= 6, fmt.tprintf("at_y: the targets decoded (%d)", checked))
+				schk(&bad, wrong == 0, fmt.tprintf("at_y: every drawn block's own y searches back to that block (%d of %d wrong)", wrong, checked))
+				// The block at the pane's top edge is the anchor's, which is the
+				// one case the search must not get from a fallback.
+				top_blk, top_ok := md_block_at_y(&c, at, ytop + 1)
+				schk(&bad, top_ok && top_blk == at.block, fmt.tprintf("at_y: the pane's top row is the anchor's own block (%d vs %d)", top_blk, at.block))
+			}
+			return
+		}
+
 		// `newtpad mdtest` covers the markdown block classifiers and inline parser
 		// (the rendering itself needs a live eye), PLUS the draw-level checks
 		// above that exercise markdown_draw's own call sites through a real
@@ -5057,6 +5400,7 @@ when NEWTPAD_TESTS {
 			bad += md_cache_selftest()
 			bad += md_key_selftest()
 			bad += md_gap_selftest()
+			bad += md_scroll_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
 			return true
 		}
