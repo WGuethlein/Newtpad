@@ -23,3 +23,7 @@ desktop.ini
 
 # SDD session scratch (subagent-driven-development progress ledger)
 .superpowers/
+
+# Live-pass scratch: empty files used to exercise same-name and long-name tabs
+/test/
+/test1/
