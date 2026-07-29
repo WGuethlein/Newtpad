@@ -1018,6 +1018,23 @@ Document :: struct {
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)
+	// High-water mark for doc_max_hscroll: the widest line MEASURED so far this
+	// session, not the widest currently on screen. See that proc's comment for
+	// why.
+	//
+	// No site in the tree sets this back to 0 explicitly, and that is by
+	// design, not an oversight. doc_reload_forced (an actual reload/reopen-as
+	// swap in different file content) replaces the WHOLE Document struct
+	// (`doc^ = fresh`) rather than mutating fields in place, so a reloaded
+	// document's mark is zero for free -- doc_view_apply/Doc_View, the one
+	// thing carried forward across that swap, holds wrap/md_mode/table only,
+	// never this field. doc_set_line_ending rewrites the whole buffer in place
+	// (pt_edit_replace(0, length, ...)) but only touches line-TERMINATOR
+	// bytes -- line_cell_col never measures past a line's content into its
+	// terminator -- so no line's measured width can change and there is
+	// nothing stale to clear. An explicit `= 0` at either site would be
+	// fighting zero-is-initialization for no correctness gain.
+	max_cells_seen: int,
 	status_cursor: int, // cursor pos the cached status line was computed for
 	status_line:   int, // 1-based line of the cursor (0 = beyond the cap / unknown)
 	// Same for the column, which was neither cached nor capped and cost an
@@ -3236,6 +3253,19 @@ HSCROLL_PAD :: 3
 // scan cap while only VISIBLE_COLS cells are ever drawn. (Panning the tail of a
 // line longer than VISIBLE_COLS needs the draw to window on h_scroll — a separate
 // follow-up; this just makes the bar stop where the text does.)
+//
+// The widest line SEEN SO FAR this session, not the widest currently on screen.
+// This used to walk only the visible rows and derive `reach` from that scan
+// alone, so scrolling the wide line off the top collapsed the range and the bar
+// vanished -- Wyatt, live use: the horizontal scrollbar only allows expanding if
+// the large row is on screen. Viewport-first still holds: nothing here scans
+// off-screen content, the measurement just stops throwing itself away once
+// something wider has actually been looked at.
+//
+// Chosen over a background full-document scan (Wyatt, 2026-07-28) because it
+// needs no job, no invalidation and no rule bent. The accepted cost: on first
+// open the range is only as wide as what has been looked at, so it grows as the
+// user scrolls rather than being right from frame one.
 doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 	if doc == nil || doc_wraps(doc) || doc.filter {return 0}
 	widest := 0
@@ -3246,7 +3276,8 @@ doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 		if wrapped {continue} // wrapped rows fit the window; they don't pan
 		if w := line_cell_col(doc, t, start, vis_end); w > widest {widest = w}
 	}
-	reach := min(widest + HSCROLL_PAD, VISIBLE_COLS)
+	if widest > doc.max_cells_seen {doc.max_cells_seen = widest}
+	reach := min(doc.max_cells_seen + HSCROLL_PAD, VISIBLE_COLS)
 	return max(0, reach - max(1, doc.view_cols))
 }
 

@@ -7590,6 +7590,65 @@ when NEWTPAD_TESTS {
 				doc_update_hscroll(&ld)
 			}
 
+			// The horizontal range is a HIGH-WATER MARK (Document.max_cells_seen), not
+			// a re-derivation from whatever is on screen right now. Before this fix,
+			// doc_max_hscroll walked only the visible rows, so scrolling the widest
+			// line off the top collapsed the range and the bar vanished -- Wyatt, live
+			// use: "the horizontal scroll bar only allows for expanding left/right if
+			// the large row is on screen." Body in its own proc: test_mode_dispatch's
+			// frame is already large enough to have hit STATUS_STACK_OVERFLOW twice,
+			// and this holds exactly one Document.
+			hw_bad := 0
+			{
+				hw_chk :: proc(bad: ^int, ok: bool, msg: string) {
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+					if !ok {bad^ += 1}
+				}
+				hw_run :: proc(bad: ^int) {
+					sb := strings.builder_make()
+					defer strings.builder_destroy(&sb)
+					strings.write_string(&sb, strings.repeat("x", 400))
+					strings.write_string(&sb, "\n")
+					for i in 0 ..< 200 {strings.write_string(&sb, "short\n")}
+					// DEFAULT allocator, not temp: doc_from_content sets owned_orig, so
+					// doc_close frees this slice. A temp-allocated fixture here is heap
+					// corruption, not a leak.
+					doc := doc_from_content(transmute([]u8)strings.clone(strings.to_string(sb)), "", .UTF8)
+					defer doc_close(&doc)
+					t: plat.Text
+					if !plat.text_load_faces(&t) {
+						fmt.eprintln("hscrolltest (highwater): no fonts loaded")
+						bad^ += 1
+						return
+					}
+					rows := 20
+					doc.wrap = false
+					doc.view_cols = 80
+					doc.top = 0
+
+					wide := doc_max_hscroll(&doc, &t, rows)
+					hw_chk(bad, wide > 0, fmt.tprintf("the long line gives a range while it is visible (%d)", wide))
+
+					// Scroll the wide line off the top: doc.top lands on line 100
+					// ("short"), well past line 0's 400-cell line. md_line_offset does
+					// not exist in the tree yet (Task 3 has not landed under that
+					// name), so this is the four-line equivalent over
+					// base.pt_line_end_cap the brief calls for in that case.
+					off := 0
+					for i in 0 ..< 100 {
+						e := base.pt_line_end_cap(&doc.pt, off, RENDER_LINE_CAP)
+						if e >= doc.pt.length {break}
+						off = e + 1 // past the newline, to the next line's start
+					}
+					doc.top = off
+
+					after := doc_max_hscroll(&doc, &t, rows)
+					hw_chk(bad, after == wide, fmt.tprintf("the range survives the long line leaving the viewport (%d -> %d)", wide, after))
+				}
+				hw_run(&hw_bad)
+			}
+			bad += hw_bad
+
 			if bad == 0 {fmt.println("  drawn column == hit-tested column, and the scrollbar thumb round-trips: OK")}
 			fmt.printfln("hscrolltest: %d failures", bad)
 			return true
