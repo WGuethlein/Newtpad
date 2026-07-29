@@ -46,9 +46,17 @@ MAX_FACES :: 8
 // Which typeface a piece of text belongs to. The document's font is the user's
 // choice; the chrome's is fixed, so choosing a document font cannot make the
 // menus unreadable.
+//
+// .Body is the markdown preview's proportional face (UI spec §9.3: "Serif over
+// sans, deliberately -- it is what separates 'document' from 'UI'"). It is a
+// third chain rather than a mode on .Doc because the preview and the editor are
+// on screen at the same time in split view, and because every cached glyph is
+// keyed by its set (Glyph_Key.set), so sharing a chain would mean sharing the
+// cell_cache and the atlas entries of a face with completely different metrics.
 Font_Set :: enum u8 {
 	UI,
 	Doc,
+	Body,
 }
 
 // A primary face plus its per-codepoint fallbacks.
@@ -57,6 +65,12 @@ Face_Chain :: struct {
 	units:   [MAX_FACES]f32, // designUnitsPerEm per face
 	n:       int,
 	char_em: f32, // primary 'x' advance as a fraction of em == one cell's width
+	// Primary-face vertical metrics as fractions of em. The shaper's line box is
+	// built from these (see text_vmetrics / shape_run in shape.odin) so that the
+	// height a run reports and the height its glyphs occupy come from one place.
+	ascent_em:   f32,
+	descent_em:  f32,
+	line_gap_em: f32,
 }
 
 Font_Style :: enum u8 {
@@ -110,6 +124,25 @@ FONT_FAMILIES := [?]Font_Family {
 	{"Hack", "Hack-Regular.ttf", "Hack-Bold.ttf", "Hack-Italic.ttf", ""},
 	{"Iosevka", "iosevka-regular.ttf", "iosevka-bold.ttf", "iosevka-italic.ttf", ""},
 	{"Ubuntu Mono", "UbuntuMono-R.ttf", "UbuntuMono-B.ttf", "UbuntuMono-RI.ttf", ""},
+}
+
+// Proportional body faces for the markdown preview, in preference order.
+//
+// DELIBERATELY a separate table from FONT_FAMILIES rather than more rows in it:
+// FONT_FAMILIES is the curated list of MONOSPACE families the font page offers
+// (font_choices_refresh walks exactly that array), and a proportional serif in
+// it would appear as a choice for the editor grid, where its varying advances
+// would wreck column arithmetic. Same struct, same loader, different menu.
+//
+// Georgia first because §9.3 names it: "fall back to Georgia, which is on every
+// Windows install". The rest are stock Windows serifs, then Segoe UI as a
+// last-ditch proportional face -- Newtpad embeds no fonts until batch 20, so
+// everything here has to already be on the machine.
+BODY_FAMILIES := [?]Font_Family {
+	{"Georgia", "georgia.ttf", "georgiab.ttf", "georgiai.ttf", "georgiaz.ttf"},
+	{"Constantia", "constan.ttf", "constanb.ttf", "constani.ttf", "constanz.ttf"},
+	{"Times New Roman", "times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf"},
+	{"Segoe UI", "segoeui.ttf", "segoeuib.ttf", "segoeuii.ttf", "segoeuiz.ttf"},
 }
 
 // The Windows font directory. Read from the environment rather than hardcoded:
@@ -300,7 +333,55 @@ text_load_faces :: proc(t: ^Text) -> (ok: bool) {
 	// The chrome's typeface is fixed and loaded once; the document starts on the
 	// same family until settings say otherwise.
 	if !text_load_family(t, "Consolas", .Regular, .UI) {return false}
-	return text_load_family(t, "Consolas", .Regular, .Doc)
+	if !text_load_family(t, "Consolas", .Regular, .Doc) {return false}
+	// The preview's proportional face. Not fatal if it fails: text_load_body_face
+	// degrades to the mono family rather than leaving .Body faceless, and a
+	// missing serif must never stop the app from starting.
+	text_load_body_face(t)
+	return true
+}
+
+// Load the markdown preview's proportional body face onto the .Body chain, and
+// report which family won. `ok` is false when no proportional face could be
+// loaded and the mono fallback was used instead — the preview then looks like
+// the editor, which is a cosmetic loss, not a failure to start.
+//
+// Every Text — product and headless test alike — reaches this through
+// text_load_faces, so there is one body face and one place it is chosen.
+text_load_body_face :: proc(t: ^Text) -> (family: string, ok: bool) {
+	for f in BODY_FAMILIES {
+		if text_load_family(t, f.name, .Regular, .Body) {return f.name, true}
+	}
+	// Nothing proportional is installed (or DirectWrite refused all of them).
+	// text_load_family falls back to FONT_FAMILIES[0] for an unknown name, so
+	// this is the mono face the editor already uses.
+	if text_load_family(t, "", .Regular, .Body) {return FONT_FAMILIES[0].name, false}
+	return "", false
+}
+
+// The curated family named `name`, for the chain it is destined for. Unknown
+// names resolve to FONT_FAMILIES[0] with found=false: a settings file copied from
+// another machine can name a font that is not here, and that must fall back
+// rather than fail.
+//
+// BODY_FAMILIES is searched ONLY for .Body, and that asymmetry is deliberate.
+// .UI and .Doc drive the cell grid, whose whole premise is one advance for every
+// character; letting a settings.txt that says `font_family Georgia` actually
+// load Georgia there would put proportional glyphs on a monospace grid. It has
+// always fallen back to Consolas and it still does. The reverse direction is
+// allowed, because §9.3 asks for a "Preview font" setting offering the editor's
+// face "for people who want the preview to match the source".
+@(private = "file")
+find_family :: proc(name: string, set: Font_Set) -> (fam: Font_Family, found: bool) {
+	if set == .Body {
+		for f in BODY_FAMILIES {
+			if f.name == name {return f, true}
+		}
+	}
+	for f in FONT_FAMILIES {
+		if f.name == name {return f, true}
+	}
+	return FONT_FAMILIES[0], false
 }
 
 // The 'x' advance of a face as a fraction of em — one cell's width.
@@ -352,13 +433,7 @@ text_load_family :: proc(t: ^Text, family: string, style: Font_Style, set := Fon
 		}
 	}
 
-	chosen := FONT_FAMILIES[0]
-	for f in FONT_FAMILIES {
-		if f.name == family {
-			chosen = f
-			break
-		}
-	}
+	chosen, _ := find_family(family, set)
 	// A style the family doesn't ship falls back to regular rather than letting
 	// DirectWrite synthesise one: algorithmic bold/oblique changes the advance,
 	// and the pen steps by a single cell width, so glyphs would bleed into the
@@ -386,6 +461,14 @@ text_load_family :: proc(t: ^Text, family: string, style: Font_Style, set := Fon
 		add_face(t, &fresh, fdef.file, fdef.kind, fdef.face)
 	}
 	fresh.char_em = face_char_em(fresh.faces[0], fresh.units[0])
+	// Vertical metrics of the primary face, in em. Read here rather than at every
+	// shape_run so the line box cannot be built from one face's ascent while the
+	// glyphs come from another's.
+	fm: FONT_METRICS
+	fresh.faces[0]->GetMetrics(&fm)
+	fresh.ascent_em = f32(fm.ascent) / fresh.units[0]
+	fresh.descent_em = f32(fm.descent) / fresh.units[0]
+	fresh.line_gap_em = f32(fm.lineGap) / fresh.units[0]
 
 	// Release the faces we are replacing, then adopt the new ones.
 	old := &t.chains[set]
@@ -514,7 +597,10 @@ text_char_width :: proc(t: ^Text, px: f32, set := Font_Set.UI) -> f32 {
 // can't detect them. Covers the common unambiguous blocks (decomposed accents,
 // Hebrew niqqud, Arabic harakat, variation selectors, zero-width format); Indic
 // spacing/nonspacing ambiguity is left to the deferred shaping work.
-@(private = "file")
+// Package-private, not file-private: the proportional shaper (shape.odin) has to
+// make the same zero-advance decision the grid does, and a second copy of this
+// table is exactly how the two would drift.
+@(private)
 is_zero_width :: proc(r: rune) -> bool {
 	switch r {
 	case 0x0000 ..= 0x001F: // C0 controls, including CR/LF: no glyph, no advance.
@@ -1091,6 +1177,19 @@ text_atlas_dim :: proc(t: ^Text) -> i32 {return t.atlas_w}
 // The primary face's cell width as a fraction of em. Exposed so a test can check
 // that a family's styles agree — the cell grid assumes one advance for all text.
 text_char_em :: proc(t: ^Text, set := Font_Set.Doc) -> f32 {return t.chains[set].char_em}
+
+// The primary face's vertical metrics at `px`, in pixels. `ascent` is above the
+// baseline and `descent` below, both positive; `line_gap` is the face's own
+// recommended extra leading.
+//
+// The shaper is the only consumer today and it is the single producer of a run's
+// height, so these must not be recomputed anywhere else — a block that positions
+// itself from one ascent while the glyphs are placed from another is the
+// two-producer shape this project has recorded sixteen instances of.
+text_vmetrics :: proc(t: ^Text, px: f32, set := Font_Set.Body) -> (ascent, descent, line_gap: f32) {
+	c := &t.chains[set]
+	return c.ascent_em * px, c.descent_em * px, c.line_gap_em * px
+}
 
 // How many `gw`x`gh` boxes the shelf packer fits in a `dim` square. Pure
 // arithmetic mirroring atlas_pack, so capacity can be checked without a GPU.

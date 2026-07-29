@@ -4985,6 +4985,325 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad shapetest` exercises src/platform/shape.odin, the proportional
+		// text shaper the markdown preview lays out with (UI spec §9.1). The one
+		// property everything else hangs off is that the shaper is NOT the cell
+		// grid: text_char_width deliberately ROUNDS each advance to a whole pixel
+		// so column n's left edge is exactly n*cell_w, and the shaper must
+		// accumulate the true fractional advance instead. "40 'a's measure exactly
+		// 40 * the unrounded advance" below is the assertion that proves it — a
+		// shaper that rounded per glyph would still pass every ordering check
+		// ("iiii" < "WWWW"), still break greedily, and still be on the grid.
+		if os.args[1] == "shapetest" {
+			sh_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-68s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			sh_shape :: proc(t: ^plat.Text, s: string, mw, lh, px: f32) -> plat.Shaped {
+				return plat.shape_run(nil, t, s, px, mw, lh, .Body, context.temp_allocator)
+			}
+			// Ink width of one line, recomputed from the emitted glyphs rather than
+			// read back from Shaped — so it can disagree with Shaped.width.
+			sh_line_ink :: proc(t: ^plat.Text, s: plat.Shaped, px: f32, line: i32) -> f32 {
+				w := f32(0)
+				for g in s.glyphs {
+					if g.line != line || g.r == ' ' || g.r == '\t' {continue}
+					w = max(w, g.x + plat.text_advance(nil, t, g.r, px, .Body))
+				}
+				return w
+			}
+			// The height a run REPORTS against the height its own glyphs occupy.
+			// Two separate failures, and both must be caught:
+			//   * too small — a glyph's ink box falls outside [0, height);
+			//   * too large — the final line slot holds nothing, which `tight`
+			//     rejects by requiring the lowest baseline to reach into the last
+			//     line's band. A `lines` counted from break events rather than from
+			//     the glyphs actually placed (so "a\n" reports two lines) fails
+			//     exactly here.
+			sh_height_ok :: proc(bad: ^int, s: plat.Shaped, what: string) {
+				sh_chk(bad, abs(s.height - f32(s.lines) * s.line_h) < 0.001, fmt.tprintf("%s: height == lines * line_h", what))
+				inside, maxy := true, f32(0)
+				for g, i in s.glyphs {
+					if g.y - s.ascent < -0.001 {inside = false}
+					if g.y + s.descent > s.height + 0.001 {inside = false}
+					if i == 0 || g.y > maxy {maxy = g.y}
+				}
+				sh_chk(bad, inside, fmt.tprintf("%s: every glyph's ink box lies inside [0, height]", what))
+				tight := s.height == 0 if len(s.glyphs) == 0 else maxy + s.descent > s.height - s.line_h
+				sh_chk(bad, tight, fmt.tprintf("%s: the last line slot is actually occupied", what))
+			}
+			sh_run :: proc(bad: ^int) {
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.println("  FAIL: text_load_faces")
+					bad^ += 1
+					return
+				}
+				px := f32(16)
+				WIDE := f32(100000)
+				fam, prop := plat.text_load_body_face(&t)
+				fmt.printfln("  body face: %q  proportional=%v", fam, prop)
+				sh_chk(bad, prop, "a proportional body face loaded (§9.3 names Georgia)")
+
+				// --- per-glyph fractional advances: the anti-grid property -----
+				fmt.println("--- advances are per-glyph and fractional ---")
+				ai := plat.text_advance(nil, &t, 'i', px, .Body)
+				aW := plat.text_advance(nil, &t, 'W', px, .Body)
+				di := plat.text_advance(nil, &t, 'i', px, .Doc)
+				dW := plat.text_advance(nil, &t, 'W', px, .Doc)
+				fmt.printfln("  @%.0fpx  body i=%.4f W=%.4f   doc i=%.4f W=%.4f", px, ai, aW, di, dW)
+				sh_chk(bad, aW > ai * 1.5, "body face: adv(W) is more than 1.5x adv(i)")
+				sh_chk(bad, di == dW, "the editor's .Doc chain is still monospace (untouched)")
+
+				si := sh_shape(&t, "iiii", WIDE, 0, px)
+				sW := sh_shape(&t, "WWWW", WIDE, 0, px)
+				fmt.printfln("  width(\"iiii\")=%.3f  width(\"WWWW\")=%.3f", si.width, sW.width)
+				sh_chk(bad, sW.width > si.width * 1.5, "\"iiii\" is far narrower than \"WWWW\"")
+
+				// 40 identical glyphs, at a dozen sizes. If the shaper rounded each
+				// advance to a whole pixel the way the grid does, the total would be
+				// 40*round(adv), which is up to 20px away from 40*adv — so the first
+				// check below fails outright. text_advance is the unrounded design
+				// advance, computed before any of the shaper's arithmetic.
+				A40 := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+				frac_sizes := 0
+				acc_ok, div_ok := true, true
+				for p in ([]f32{13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24}) {
+					adv := plat.text_advance(nil, &t, 'a', p, .Body)
+					s := sh_shape(&t, A40, WIDE, 0, p)
+					if len(s.glyphs) != 40 {acc_ok = false;continue}
+					if abs(s.width - 40 * adv) > 0.01 {acc_ok = false}
+					if abs(s.glyphs[39].x - 39 * adv) > 0.01 {acc_ok = false}
+					rounded := math.floor(adv + 0.5)
+					if abs(adv - rounded) > 0.05 {
+						frac_sizes += 1
+						// A grid would land within a rounding error of this.
+						if abs(s.width - 40 * rounded) < 0.5 {div_ok = false}
+					}
+				}
+				fmt.printfln("  %d of 12 sizes have a fractional 'a' advance", frac_sizes)
+				sh_chk(bad, acc_ok, "40 'a's measure exactly 40 * the unrounded advance")
+				sh_chk(bad, frac_sizes >= 1, "at least one size is fractional (the check is not vacuous)")
+				sh_chk(bad, div_ok, "at those sizes the total differs from the per-glyph-rounded one")
+
+				// --- greedy breaking -------------------------------------------
+				fmt.println("--- greedy breaking at the last space ---")
+				TXT := "alpha beta gamma delta"
+				sp := plat.text_advance(nil, &t, ' ', px, .Body)
+				two := sh_shape(&t, "alpha beta", WIDE, 0, px)
+				sh_chk(bad, two.lines == 1, "a run that fits returns one line")
+				mw := two.width + sp * 0.5
+				s := sh_shape(&t, TXT, mw, 0, px)
+				fmt.printfln("  measure %.2f -> %d lines", mw, s.lines)
+				sh_chk(bad, s.lines >= 2, "a run that does not fit breaks")
+				nomid, nolead := true, true
+				for g, i in s.glyphs {
+					if i == 0 || g.line == s.glyphs[i - 1].line {continue}
+					if g.off == 0 || TXT[g.off - 1] != ' ' {nomid = false}
+					if g.r == ' ' {nolead = false}
+				}
+				sh_chk(bad, nomid, "every break lands after a space, never mid-word")
+				sh_chk(bad, nolead, "no line begins with a space")
+				first1 := -1
+				for g, i in s.glyphs {
+					if g.line == 1 {first1 = i;break}
+				}
+				sh_chk(
+					bad,
+					first1 >= 0 && s.glyphs[first1].off == 11 && s.glyphs[first1].r == 'g',
+					"the break is the LAST space that fits (line 2 starts at \"gamma\")",
+				)
+				fits, widest := true, f32(0)
+				for l in 0 ..< i32(s.lines) {
+					li := sh_line_ink(&t, s, px, l)
+					if li > mw + 0.01 {fits = false}
+					widest = max(widest, li)
+				}
+				sh_chk(bad, fits, "every line's ink width stays within the measure")
+				sh_chk(bad, abs(s.width - widest) < 0.01, "Shaped.width equals the widest line actually emitted")
+				lead0 := true
+				for g, i in s.glyphs {
+					if i == 0 || g.line != s.glyphs[i - 1].line {
+						if abs(g.x) > 0.001 {lead0 = false}
+					}
+				}
+				sh_chk(bad, lead0, "each line's first glyph is re-origined to x = 0")
+
+				// The measure above admits exactly whole words, so a breaker that
+				// split at the OVERFLOWING GLYPH instead of at the last space lands
+				// on the same offset for the first break and the check above cannot
+				// tell them apart (verified by sabotage: forcing the char-break path
+				// left every assertion above green except "never mid-word"). This
+				// measure admits "alpha beta g" but not "alpha beta ga", so the two
+				// disagree by one character on the FIRST break — and it is the only
+				// case here that exercises carrying already-placed glyphs down to
+				// the next line, since every other break happens at a word's first
+				// glyph, which has not been placed yet.
+				adv_g := plat.text_advance(nil, &t, 'g', px, .Body)
+				adv_a2 := plat.text_advance(nil, &t, 'a', px, .Body)
+				mw3 := two.width + sp + adv_g + adv_a2 * 0.5
+				s7 := sh_shape(&t, TXT, mw3, 0, px)
+				f7 := -1
+				for g, i in s7.glyphs {
+					if g.line == 1 {f7 = i;break}
+				}
+				sh_chk(bad, f7 >= 0 && s7.glyphs[f7].off == 11, "the break moves BACK to the last space, not to the overflowing glyph")
+				sh_chk(bad, f7 >= 0 && abs(s7.glyphs[f7].x) < 0.001, "the carried glyph is re-origined to x = 0 on its new line")
+
+				// --- trailing spaces at a break --------------------------------
+				fmt.println("--- trailing spaces ---")
+				// "bb" first, deliberately: Shaped.width is the widest LINE, so the
+				// trailing spaces can only show up in it if line 0 is the widest
+				// line. With the narrow word first (the obvious way to write this)
+				// line 1 wins and the assertion measures nothing — which is what the
+				// first draft of this test did, and it failed for that reason rather
+				// than for the shaper's.
+				w_bb := sh_shape(&t, "bb", WIDE, 0, px).width
+				w_aa := sh_shape(&t, "aa", WIDE, 0, px).width
+				mw2 := w_bb + sp * 0.5
+				sh_chk(bad, w_bb > w_aa + 0.01, "(precondition) \"bb\" is wider than \"aa\", so line 0 is the widest")
+				sh_chk(bad, w_bb + 3 * sp > mw2 + 0.01, "(precondition) counting the spaces really would exceed the measure")
+				s2 := sh_shape(&t, "bb   aa", mw2, 0, px)
+				sh_chk(bad, s2.lines == 2, "\"bb   aa\" at the measure of \"bb\" gives two lines")
+				sh_chk(bad, abs(s2.width - w_bb) < 0.01, "the three trailing spaces do not count toward the width")
+				sh_chk(bad, abs(sh_line_ink(&t, s2, px, 0) - w_bb) < 0.01, "line 0's own ink is exactly \"bb\"")
+				sh_chk(bad, s2.width <= mw2 + 0.01, "so the broken line does not exceed the measure")
+				b0 := -1
+				for g, i in s2.glyphs {
+					if g.line == 1 {b0 = i;break}
+				}
+				sh_chk(bad, b0 >= 0 && s2.glyphs[b0].off == 5 && s2.glyphs[b0].r == 'a', "the next line starts at 'a', not at a space")
+				sp0 := 0
+				for g in s2.glyphs {
+					if g.line == 0 && g.r == ' ' {sp0 += 1}
+				}
+				sh_chk(bad, sp0 == 3, "all three spaces hang on the finished line")
+
+				// --- a word longer than the measure ----------------------------
+				fmt.println("--- the over-long word (the classic infinite loop) ---")
+				A36 := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+				adv_a := plat.text_advance(nil, &t, 'a', px, .Body)
+				s3 := sh_shape(&t, A36, adv_a * 5 + 0.1, 0, px)
+				sh_chk(bad, len(s3.glyphs) == 36, "over-long word: every glyph is still emitted")
+				sh_chk(bad, s3.lines == 8, "over-long word: breaks between characters, 5 per line -> 8 lines")
+				per := [32]int{}
+				ordered := true
+				for g, i in s3.glyphs {
+					if int(g.line) < len(per) {per[g.line] += 1}
+					if i > 0 && g.off <= s3.glyphs[i - 1].off {ordered = false}
+				}
+				empt := false
+				for l in 0 ..< s3.lines {
+					if per[l] == 0 {empt = true}
+				}
+				sh_chk(bad, !empt, "over-long word: no line left empty, so every break made progress")
+				sh_chk(bad, ordered, "over-long word: glyphs stay in source order")
+				sh_chk(bad, s3.lines <= len(s3.glyphs), "line count never exceeds glyph count (a runaway breaker would)")
+				s4 := sh_shape(&t, "abc", 0.5, 0, px)
+				sh_chk(bad, s4.lines == 3 && len(s4.glyphs) == 3, "a glyph wider than the whole measure gets a line to itself")
+				sh_chk(bad, s4.width > 0.5, "...and overflows deliberately rather than vanishing")
+				s5 := sh_shape(&t, "abc", 0, 0, px)
+				sh_chk(bad, s5.lines == 3, "a measure of 0 degenerates to one glyph per line, not a hang")
+				s6 := sh_shape(&t, "hi supercalifragilisticexpialidocious ok", adv_a * 8, 0, px)
+				sh_chk(bad, len(s6.glyphs) == 40 && s6.lines > 1, "a long word among short ones still emits everything")
+
+				// The general invariant, swept over many measures rather than one
+				// hand-picked one: a line may exceed the measure ONLY when it holds
+				// a single glyph that is itself wider than the measure, because
+				// there is nowhere else for that glyph to go. Everything else,
+				// including the line a greedy break carried a partial word onto,
+				// must fit. Found a real overhang: after carrying a tail down, the
+				// glyph that triggered the break was placed without re-testing, so
+				// it hung past the measure whenever the leading word was narrower
+				// than one glyph. Every single-measure case above passed with that
+				// bug present.
+				over_ok, over_seen := true, 0
+				for txt in ([]string{"i WWWWWW", "a aaaaaaaaaaaa", "alpha beta gamma delta", "WW i WWWW", "iiii WWWW iiii"}) {
+					for k in 1 ..< 26 {
+						mwk := f32(k) * 4
+						sk := sh_shape(&t, txt, mwk, 0, px)
+						ink_n := [64]int{}
+						for g in sk.glyphs {
+							if int(g.line) < 64 && g.r != ' ' && g.r != '\t' {ink_n[g.line] += 1}
+						}
+						for l in 0 ..< min(sk.lines, 64) {
+							if sh_line_ink(&t, sk, px, i32(l)) > mwk + 0.01 {
+								over_seen += 1
+								if ink_n[l] > 1 {over_ok = false}
+							}
+						}
+					}
+				}
+				fmt.printfln("  swept 125 (text, measure) pairs; %d lines exceeded their measure", over_seen)
+				sh_chk(bad, over_ok, "a line exceeds the measure only when it holds one over-wide glyph")
+				sh_chk(bad, over_seen > 0, "the sweep really did reach measures narrower than a glyph")
+
+				// --- the reported height vs the height consumed ----------------
+				fmt.println("--- height agrees with the glyphs emitted ---")
+				sh_height_ok(bad, sh_shape(&t, "alpha beta", WIDE, 0, px), "single line")
+				sh_height_ok(bad, s, "wrapped run")
+				sh_height_ok(bad, s3, "over-long word")
+				sh_height_ok(bad, sh_shape(&t, "   ", WIDE, 0, px), "spaces only")
+				sh_height_ok(bad, sh_shape(&t, "a\n", WIDE, 0, px), "trailing newline")
+				sh_height_ok(bad, sh_shape(&t, "a\nb", WIDE, 0, px), "hard break")
+				sh_height_ok(bad, sh_shape(&t, "", WIDE, 0, px), "empty")
+				// §9.3 asks for a 1.65 line on body text, so the requested leading
+				// has to reach the height; a leading below the face's own ink has to
+				// be clamped up rather than letting glyphs escape the box.
+				sl := sh_shape(&t, "alpha beta gamma", WIDE, 1.65 * px, px)
+				sh_chk(bad, abs(sl.line_h - 1.65 * px) < 0.001, "the requested line height is used verbatim")
+				sh_chk(bad, abs(sl.height - f32(sl.lines) * 1.65 * px) < 0.001, "and reaches the reported height")
+				sh_height_ok(bad, sl, "1.65 leading")
+				asc, desc, _ := plat.text_vmetrics(&t, px, .Body)
+				sc := sh_shape(&t, "alpha", WIDE, 1, px)
+				sh_chk(bad, abs(sc.line_h - (asc + desc)) < 0.001, "a line height below the face's ink is clamped up to it")
+
+				// --- degenerate input ------------------------------------------
+				fmt.println("--- empty and whitespace-only input ---")
+				se := sh_shape(&t, "", WIDE, 0, px)
+				sh_chk(bad, len(se.glyphs) == 0 && se.lines == 0 && se.height == 0 && se.width == 0, "empty input: no glyphs, no height, no crash")
+				sh_chk(bad, se.line_h > 0 && se.ascent > 0, "empty input still reports the line box")
+				ss := sh_shape(&t, "     ", WIDE, 0, px)
+				sh_chk(bad, len(ss.glyphs) == 5 && ss.lines == 1, "spaces only: one line of space glyphs")
+				sh_chk(bad, ss.width < 0.001 && abs(ss.height - ss.line_h) < 0.001, "spaces only: zero ink width, one line of height")
+				sn := sh_shape(&t, "\r\n", WIDE, 0, px)
+				sh_chk(bad, len(sn.glyphs) == 0 && sn.lines == 0, "a bare CRLF emits nothing")
+
+				// --- one measurement path, one cache ---------------------------
+				// The x deltas the shaper emits ARE the advances glyph_get caches in
+				// Text.cache (keyed by Glyph_Key{set, face, index, px}) — the same map
+				// that holds the atlas UVs. There is no second cache to go stale.
+				fmt.println("--- the advances come from the atlas's own glyph cache ---")
+				sa := sh_shape(&t, "Wave", WIDE, 0, px)
+				same := len(sa.glyphs) == 4
+				for i in 0 ..< len(sa.glyphs) - 1 {
+					d := sa.glyphs[i + 1].x - sa.glyphs[i].x
+					if abs(d - plat.text_advance(nil, &t, sa.glyphs[i].r, px, .Body)) > 0.001 {same = false}
+				}
+				sh_chk(bad, same, "each x delta equals the cached Glyph's advance")
+				sh_chk(
+					bad,
+					abs(plat.text_advance(nil, &t, 'W', px, .Body) - plat.text_advance(nil, &t, 'W', px, .Doc)) > 0.5,
+					"the .Body chain is a genuinely different face from .Doc",
+				)
+				// Adding BODY_FAMILIES must not make a serif reachable from the
+				// editor's font setting: the cell grid's premise is one advance for
+				// every character, and a hand-edited settings.txt saying
+				// `font_family Georgia` has always fallen back to Consolas.
+				// (Left last: this reloads the .Doc chain and resets the atlas.)
+				plat.text_load_family(&t, "Georgia", .Regular, .Doc)
+				sh_chk(
+					bad,
+					plat.text_advance(nil, &t, 'i', px, .Doc) == plat.text_advance(nil, &t, 'W', px, .Doc),
+					"a proportional family named for .Doc still falls back to mono",
+				)
+			}
+			bad := 0
+			sh_run(&bad)
+			fmt.printfln("shapetest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad celltest` prints the monospace cell width of sample codepoints and
 		// a byte<->cell round-trip (no GPU; uses text_load_faces).
 		// `newtpad blurtest` verifies the grayscale glyph path rasterizes real
