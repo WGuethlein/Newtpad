@@ -1041,6 +1041,356 @@ when NEWTPAD_TESTS {
 			return
 		}
 
+		// Replace All: every match replaced EXACTLY ONCE, and one undo entry for
+		// the lot. Both are data-shaped. A per-match entry means Ctrl+Z walks back
+		// through hundreds of steps to undo one press (and past UNDO_MAX, evicts
+		// the pre-replace state entirely -- replacetest owns that half); a match
+		// replaced twice, or a match skipped, is a wrong document that the
+		// operation reports as a success.
+		//
+		// Its own proc: test_mode_dispatch's frame is already large enough to have
+		// hit STATUS_STACK_OVERFLOW twice, and only one Document is live at a time
+		// in here.
+		findtest_replace_all :: proc() -> (bad: int) {
+			fmt.println("--- Replace All: exactly once, and one undo entry ---")
+			ra_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			// Set up find+replace on a document and run Replace All. Returns what
+			// find_replace_all reported plus the document before and after, so each
+			// caller asserts on the text rather than on the count alone -- the
+			// count was RIGHT and the document WRONG in the overlap bug below.
+			// `caret` is not decoration. Parked at 0 -- where a freshly opened
+			// document leaves it -- "replace from the start" and "replace from the
+			// current match" are the SAME loop, and every count below passes with
+			// either. The first sabotage run of this test proved it: making the
+			// loop start at f.current changed nothing and the suite stayed green.
+			// Placing the caret mid-document is what gives f.current a value that
+			// a from-the-caret loop would visibly truncate.
+			// `current` is returned as it stood when the button was pressed, not
+			// after: find_replace_all ends in find_recompute, which clears it and
+			// re-picks -- so reading doc.find.current at the call site measures the
+			// wrong moment and reports 0 for a caret that really was mid-list.
+			run :: proc(doc: ^Document, q, r: string, rx: bool, caret := 0) -> (replaced: int, complete: bool, matches, current: int) {
+				doc.cursor, doc.anchor = caret, caret
+				find_open(doc, true)
+				clear(&doc.find.query)
+				clear(&doc.find.replace)
+				doc.find.regex = rx
+				doc.find.field = 0
+				for c in q {find_input_rune(doc, c)}
+				doc.find.field = 1
+				for c in r {find_input_rune(doc, c)}
+				doc.find.field = 0
+				find_wait(doc)
+				matches = len(doc.find.matches)
+				current = doc.find.current
+				replaced, complete = find_replace_all(doc)
+				return
+			}
+
+			// 120 occurrences of "cat", none of them overlapping.
+			{
+				src := strings.repeat("cat cat cat\n", 40, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				// Precondition: without this every count below is vacuously true of
+				// an empty search.
+				before_undo := len(doc.undo)
+				before_hist := doc_history_len(&doc)
+				replaced, complete, matches, current := run(&doc, "cat", "dog", false, len(src) / 2)
+				ra_chk(&bad, matches == 120, fmt.tprintf("the fixture really holds 120 matches (%d)", matches))
+				// The caret really is mid-list, or the from-the-caret sabotage this
+				// section exists to reject is indistinguishable from the correct loop.
+				ra_chk(&bad, current > 10 && current < 110, fmt.tprintf("the caret sits mid-list before the replace (current=%d of %d)", current, matches))
+				ra_chk(&bad, complete, "the scan finished, so this was a complete pass")
+				ra_chk(&bad, replaced == 120, fmt.tprintf("it reports 120 replacements (%d)", replaced))
+				after := doc_debug_string(&doc)
+				ra_chk(&bad, strings.count(after, "cat") == 0, fmt.tprintf("no match survives (%d left)", strings.count(after, "cat")))
+				ra_chk(&bad, strings.count(after, "dog") == 120, fmt.tprintf("every match replaced exactly once (%d dogs, want 120)", strings.count(after, "dog")))
+				ra_chk(&bad, len(after) == len(src), fmt.tprintf("same-length replacement leaves the length alone (%d, want %d)", len(after), len(src)))
+				// One entry, not 120. len(doc.undo) is the stack the pre-replace
+				// state sits on; doc_history_len is what the History panel walks.
+				ra_chk(&bad, len(doc.undo) - before_undo == 1, fmt.tprintf("one undo entry for the whole operation (%d)", len(doc.undo) - before_undo))
+				ra_chk(&bad, doc_history_len(&doc) - before_hist == 1, fmt.tprintf("one history state added (%d)", doc_history_len(&doc) - before_hist))
+				// ...and it is the RIGHT entry: one Ctrl+Z returns the original
+				// byte for byte. A single entry holding the wrong snapshot passes
+				// the count check above and loses the document.
+				doc_undo(&doc)
+				back := doc_debug_string(&doc)
+				ra_chk(&bad, back == src, fmt.tprintf("one undo restores the original exactly (%d bytes vs %d)", len(back), len(src)))
+			}
+
+			// A replacement CONTAINING the search term must not feed itself. The
+			// matches are measured before the first splice and never re-scanned, so
+			// this terminates with each original occurrence expanded once.
+			{
+				src := strings.repeat("cat cat cat\n", 40, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra2.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				replaced, _, _, _ := run(&doc, "cat", "cat cat", false)
+				after := doc_debug_string(&doc)
+				ra_chk(&bad, replaced == 120, fmt.tprintf("'cat' -> 'cat cat' replaces the 120 that existed (%d)", replaced))
+				ra_chk(&bad, strings.count(after, "cat") == 240, fmt.tprintf("...and stops there: %d cats (want 240, not a growing number)", strings.count(after, "cat")))
+			}
+
+			// Overlapping candidates. "aa" over "aaaa" publishes three matches for
+			// four bytes; replacing all three splices each into what the last one
+			// wrote. Two replacements is the only answer that fits.
+			{
+				src := strings.repeat("aaaa\n", 30, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra3.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				replaced, _, matches, _ := run(&doc, "aa", "b", false)
+				after := doc_debug_string(&doc)
+				want := strings.repeat("bb\n", 30, context.temp_allocator)
+				ra_chk(&bad, matches == 90, fmt.tprintf("the scan really does publish overlapping matches (%d, want 3 per line)", matches))
+				ra_chk(&bad, replaced == 60, fmt.tprintf("only the non-overlapping ones are replaced (%d, want 2 per line)", replaced))
+				ra_chk(&bad, after == want, fmt.tprintf("'aaaa' -> 'bb', not 'b' (%q...)", after[:min(len(after), 12)]))
+			}
+
+			// An empty search string replaces nothing and leaves the buffer alone.
+			// find_recompute short-circuits before any scan, so there is no match
+			// list at all -- the interesting failure would be a zero-length match
+			// at every offset.
+			{
+				src := strings.repeat("cat cat cat\n", 4, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra4.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				before_undo := len(doc.undo)
+				replaced, _, matches, _ := run(&doc, "", "dog", false)
+				after := doc_debug_string(&doc)
+				ra_chk(&bad, matches == 0 && replaced == 0, fmt.tprintf("an empty search replaces nothing (%d matches, %d replaced)", matches, replaced))
+				ra_chk(&bad, after == src, "...and the buffer is byte-identical")
+				ra_chk(&bad, len(doc.undo) == before_undo, "...and pushes no undo entry")
+			}
+
+			// Regex mode. The replacement is LITERAL -- group substitution ($1) is
+			// unimplemented (find.odin's header says so), so this pins today's
+			// behaviour rather than leaving it to be discovered: a "$1" in the
+			// replace field lands in the file as those two characters.
+			{
+				src := strings.repeat("cat cat cat\n", 10, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra5.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				replaced, _, matches, _ := run(&doc, "c(a)t", "X$1", true)
+				after := doc_debug_string(&doc)
+				ra_chk(&bad, matches == 30 && replaced == 30, fmt.tprintf("a capture-group pattern matches and replaces all 30 (%d/%d)", matches, replaced))
+				ra_chk(&bad, strings.count(after, "X$1") == 30, fmt.tprintf("the replacement is literal today -- no $1 substitution (%d)", strings.count(after, "X$1")))
+				ra_chk(&bad, strings.count(after, "Xa") == 0, "...and specifically the group is NOT spliced in")
+			}
+
+			// WHAT IT COSTS THE UI THREAD AT THE CEILING.
+			//
+			// Replace All runs on the main thread and must: it is a buffer write,
+			// and every buffer write in Newtpad is the main thread's (undo
+			// snapshots, the piece tree, the line index all assume it). So the
+			// question is not "can it be moved off" but "is it BOUNDED" -- and it
+			// is, twice over: the match list is capped at MAX_MATCHES, and a pass
+			// that hit the cap reports complete=false so the user is told to run it
+			// again rather than left believing a rename finished.
+			//
+			// This measures the worst case that bound allows -- a saturated list --
+			// and fails if it ever crosses a second, which is the difference
+			// between a stutter and an app that looks hung. The number is printed
+			// either way: it is the input to any future decision to chunk this
+			// across frames.
+			{
+				src := strings.repeat("cat\n", 120_000, context.temp_allocator) // > MAX_MATCHES
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra6.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				find_open(&doc, true)
+				clear(&doc.find.query)
+				clear(&doc.find.replace)
+				for c in "cat" {find_input_rune(&doc, c)}
+				doc.find.field = 1
+				for c in "dogs" {find_input_rune(&doc, c)}
+				doc.find.field = 0
+				find_wait(&doc)
+				matches := len(doc.find.matches)
+				start := time.tick_now()
+				replaced, complete := find_replace_all(&doc)
+				ms := time.duration_milliseconds(time.tick_since(start))
+				ra_chk(&bad, matches == MAX_MATCHES, fmt.tprintf("the match list really is saturated (%d of MAX_MATCHES=%d)", matches, MAX_MATCHES))
+				ra_chk(&bad, replaced == MAX_MATCHES, fmt.tprintf("all %d of them are replaced (%d)", MAX_MATCHES, replaced))
+				ra_chk(&bad, !complete, "a saturated pass reports itself INCOMPLETE, so the user is told to run it again")
+				fmt.printfln("  ---   %d replacements on the main thread: %.0f ms", replaced, ms)
+				ra_chk(&bad, ms < 1000, fmt.tprintf("the worst bounded case stays under a second (%.0f ms)", ms))
+			}
+
+			// The overlap/zero-length rule on its own, on inputs the scanner cannot
+			// easily be made to produce. Two empty matches at one offset is the case
+			// that inserts the replacement twice in the same place.
+			{
+				cases := []struct {
+					m, l, want: []int,
+					what:       string,
+				} {
+					{{0, 1, 2}, {2, 2, 2}, {0, 2}, "overlapping 2-byte matches keep the leftmost pair"},
+					{{0, 3, 6}, {3, 3, 3}, {0, 1, 2}, "adjacent non-overlapping matches are all kept"},
+					{{5, 5}, {0, 0}, {0}, "two zero-length matches at one offset keep one"},
+					{{2, 3, 4}, {0, 0, 0}, {0, 1, 2}, "zero-length matches at distinct offsets are all kept"},
+					{{}, {}, {}, "an empty match list keeps nothing"},
+				}
+				for c in cases {
+					out := make([]int, max(len(c.m), 1), context.temp_allocator)
+					n := find_keep_set(c.m, c.l, out)
+					ok := n == len(c.want)
+					if ok {
+						for k in 0 ..< n {if out[k] != c.want[k] {ok = false}}
+					}
+					ra_chk(&bad, ok, fmt.tprintf("%s (got %v, want %v)", c.what, out[:n], c.want))
+				}
+			}
+			return
+		}
+
+		// The replace row's buttons: what the DRAW emits is what the CLICK
+		// accepts, at every width including the narrowest one that still renders
+		// them. HANDOFF 6j: sixteen bugs in one session were all a correct
+		// function fed the wrong input, or its answer read in the wrong space --
+		// and this row moved from the bottom of the window to the top earlier in
+		// this very release.
+		findtest_replace_seam :: proc() -> (bad: int) {
+			fmt.println("--- the replace row's buttons: drawn == clickable ---")
+			rs_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			t: plat.Text
+			plat.text_load_faces(&t)
+			saved := UI_SCALE
+			defer UI_SCALE = saved
+
+			doc := doc_from_content(transmute([]u8)strings.clone("cat cat cat\n"), "seam.txt", .UTF8)
+			defer doc_close(&doc)
+			doc.kind = .Text
+			find_open(&doc, true)
+			buf: [2]Find_Action
+
+			// The accelerators are read off the keymap, so the button teaches the
+			// chord that actually works. A button labelled with no chord at all is
+			// half the point of this row missing.
+			rs_chk(&bad, command_chord(.Find_Replace_One) == "Ctrl+Enter", fmt.tprintf("Replace Match teaches Ctrl+Enter (%q)", command_chord(.Find_Replace_One)))
+			rs_chk(&bad, command_chord(.Find_Replace_All) == "Ctrl+Alt+Enter", fmt.tprintf("Replace All teaches Ctrl+Alt+Enter (%q)", command_chord(.Find_Replace_All)))
+
+			for scale in ([]f32{1.0, 1.5, 2.0}) {
+				UI_SCALE = scale
+				row_h := sx(FIND_BAR_H_96)
+				// The narrowest width that renders them, found by ASKING the layout
+				// rather than by trusting a constant that could drift from it.
+				minw := f32(-1)
+				for wpx := f32(120); wpx <= 2400; wpx += 1 {
+					if len(find_actions(&doc, &t, wpx, buf[:])) == 2 {
+						minw = wpx
+						break
+					}
+				}
+				rs_chk(&bad, minw > 0, fmt.tprintf("scale %.2f: the buttons render at some width (%.0f)", scale, minw))
+				if minw < 0 {continue}
+
+				// One pixel narrower renders NONE -- and nothing is clickable
+				// there either. Both directions, or "drawn == clickable" is only
+				// checked where something is drawn.
+				narrow := find_actions(&doc, &t, minw - 1, buf[:])
+				rs_chk(&bad, len(narrow) == 0, fmt.tprintf("scale %.2f: one pixel narrower draws no buttons (%d)", scale, len(narrow)))
+				wide := find_actions(&doc, &t, minw, buf[:])
+				probe_x, probe_y := wide[0].x + wide[0].w * 0.5, wide[0].y + wide[0].h * 0.5
+				rs_chk(
+					&bad,
+					find_action_at(&doc, &t, minw - 1, probe_x, probe_y) == .None,
+					fmt.tprintf("scale %.2f: ...and nothing is clickable where they would have been", scale),
+				)
+
+				for wpx in ([]f32{minw, minw + 1, 800, 1280, 1920}) {
+					acts := find_actions(&doc, &t, wpx, buf[:])
+					if !(len(acts) == 2) {
+						rs_chk(&bad, false, fmt.tprintf("scale %.2f w=%.0f: both buttons render (%d)", scale, wpx, len(acts)))
+						continue
+					}
+					for a, i in acts {
+						lbl := fmt.tprintf("scale %.2f w=%.0f %v", scale, wpx, a.cmd)
+						// The seam itself: the centre, and every corner just inside
+						// the box, hit-tests back to this button's own command.
+						hits := 0
+						for p in ([][2]f32 {
+								{a.x + a.w * 0.5, a.y + a.h * 0.5},
+								{a.x, a.y},
+								{a.x + a.w - 1, a.y},
+								{a.x, a.y + a.h - 1},
+								{a.x + a.w - 1, a.y + a.h - 1},
+							}) {
+							if find_action_at(&doc, &t, wpx, p[0], p[1]) == a.cmd {hits += 1}
+						}
+						rs_chk(&bad, hits == 5, fmt.tprintf("%s: clickable at its centre and all four corners (%d/5)", lbl, hits))
+						// ...and NOT one pixel outside it, or the boxes are bigger
+						// than they look and the gap between them is a lie.
+						rs_chk(
+							&bad,
+							find_action_at(&doc, &t, wpx, a.x - 1, a.y + a.h * 0.5) != a.cmd &&
+							find_action_at(&doc, &t, wpx, a.x + a.w, a.y + a.h * 0.5) != a.cmd,
+							fmt.tprintf("%s: not clickable one pixel outside its own box", lbl),
+						)
+						// The band check. Without it every assertion above is
+						// self-consistent nonsense: a layout that put the buttons on
+						// the FIND row, or below the bar entirely, would still hit-test
+						// to itself. This is the one that fails when the bar moves and
+						// the buttons do not follow it.
+						rs_chk(
+							&bad,
+							a.y >= CHROME_TOP + row_h - 0.5 && a.y + a.h <= CHROME_TOP + doc_top_bar_h(&doc) + 0.5,
+							fmt.tprintf("%s: sits inside the REPLACE row [%.0f,%.0f), box [%.0f,%.0f)", lbl, CHROME_TOP + row_h, CHROME_TOP + doc_top_bar_h(&doc), a.y, a.y + a.h),
+						)
+						// A press on the find row above, at the same x, is not this
+						// button -- the other half of the same claim, read through
+						// the hit-test instead of through the geometry.
+						rs_chk(
+							&bad,
+							find_action_at(&doc, &t, wpx, a.x + a.w * 0.5, CHROME_TOP + row_h * 0.5) == .None,
+							fmt.tprintf("%s: the find row above it is not a button", lbl),
+						)
+						// On screen, and left of the right margin.
+						rs_chk(&bad, a.x >= 0 && a.x + a.w <= wpx, fmt.tprintf("%s: inside the window (%.0f..%.0f of %.0f)", lbl, a.x, a.x + a.w, wpx))
+						// The text the draw emits is inside the box it fills.
+						cw := plat.text_char_width(&t, UI_SMALL_PX)
+						rs_chk(
+							&bad,
+							a.tx >= a.x && a.cx + f32(len(a.chord)) * cw <= a.x + a.w + 0.5,
+							fmt.tprintf("%s: label and chord fit inside the button (%.0f..%.0f of %.0f..%.0f)", lbl, a.tx, a.cx + f32(len(a.chord)) * cw, a.x, a.x + a.w),
+						)
+						rs_chk(&bad, a.chord != "", fmt.tprintf("%s: carries an accelerator", lbl))
+						if i == 1 {
+							rs_chk(&bad, a.x >= acts[0].x + acts[0].w, fmt.tprintf("%s: does not overlap the button before it", lbl))
+						}
+					}
+				}
+			}
+
+			// With the replace row shut there is nothing to draw and nothing to
+			// click. Probed at a coordinate that IS a button while it is open, so
+			// the check cannot pass by testing empty space.
+			{
+				UI_SCALE = 1
+				acts := find_actions(&doc, &t, 1280, buf[:])
+				px, py := acts[0].x + acts[0].w * 0.5, acts[0].y + acts[0].h * 0.5
+				doc.find.replace_mode = false
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 0, "no buttons while the replace row is closed")
+				rs_chk(&bad, find_action_at(&doc, &t, 1280, px, py) == .None, "...and that spot is not clickable")
+				doc.find.replace_mode = true
+				doc.find.active = false
+				rs_chk(&bad, find_action_at(&doc, &t, 1280, px, py) == .None, "...nor is it with the find bar closed")
+				doc.find.active = true
+			}
+			return
+		}
+
 		// `newtpad findtest` covers the literal scan's block-boundary handling and
 		// the line starts the worker computes for the filter view — both of which
 		// are per-block bookkeeping that a single-block search would never exercise.
@@ -1123,6 +1473,8 @@ when NEWTPAD_TESTS {
 			bad += findtest_filter_click_frame()
 			bad += findtest_first_paint()
 			bad += findtest_autoselect()
+			bad += findtest_replace_all()
+			bad += findtest_replace_seam()
 			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")
 			return true
 		}

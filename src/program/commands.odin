@@ -155,6 +155,17 @@ Command_Id :: enum u8 {
 	Find_Toggle_Word,
 	Find_Toggle_Filter,
 	Find_Toggle_Replace_Mode,
+	// The two replace verbs, as commands rather than as branches inside
+	// .Find_Confirm. They have to be their own rows to be REACHABLE: a palette
+	// entry, a menu row and a button all dispatch a Command_Id and carry no key
+	// event, so "Enter with ctrl held, in the replace field" could be spelled by
+	// exactly one gesture and named nowhere. It was worse than that -- the ctrl
+	// branch was dead. Binding matches (key, ctrl, alt, ctx) exactly and the
+	// only Enter rows were ctrl=false, so Ctrl+Enter resolved to .None and
+	// Replace All had no key, no palette entry and no button. That is precisely
+	// the report this fixes.
+	Find_Replace_One,
+	Find_Replace_All,
 	Find_Filter_Page_Up,
 	Find_Filter_Page_Down,
 }
@@ -288,6 +299,10 @@ command_table := [Command_Id]Command {
 	.Find_Toggle_Word         = {"Find: Whole Word", "Search"},
 	.Find_Toggle_Filter       = {"Find: Toggle Filter View", "Search"},
 	.Find_Toggle_Replace_Mode = {"Find: Toggle Replace", "Search"},
+	// Plain names, not "Find: ..." -- these are the two things a user came to
+	// the replace row to do, and they are what gets typed into the palette.
+	.Find_Replace_One         = {"Replace Match", "Search"},
+	.Find_Replace_All         = {"Replace All", "Search"},
 	.Find_Filter_Page_Up      = {"Find: Filter Page Up", "Search"},
 	.Find_Filter_Page_Down    = {"Find: Filter Page Down", "Search"},
 }
@@ -335,6 +350,15 @@ default_bindings := []Binding {
 	{.L, true, false, .Editor, .Filter_Open}, // Ctrl+L opens find with the filter armed
 	{.G, true, false, .Editor, .Goto_Line}, // Ctrl+G
 	{.S, true, true, .Editor, .Save_As}, // Ctrl+Alt+S (Ctrl+Shift+S can't be expressed: shift isn't part of a chord)
+	// The two replace verbs, declared in .Editor and NOT in .Find, deliberately.
+	// resolve_key falls the Find context back to the editor keymap for modified
+	// chords (see its comment), so one row here binds the chord in both places --
+	// and command_chord prefers an Editor row, so the palette, the menus and the
+	// buttons on the replace row all teach the same string. Two rows would be two
+	// chances to disagree. From the document (find shut) they open the replace
+	// bar rather than doing nothing, which is the honest answer to "replace what?".
+	{.Enter, true, false, .Editor, .Find_Replace_One}, // Ctrl+Enter
+	{.Enter, true, true, .Editor, .Find_Replace_All}, // Ctrl+Alt+Enter
 	{.Escape, false, false, .Editor, .Clear_Selection},
 	{.Up, false, true, .Editor, .Move_Line_Up}, // Alt+Up (Alt+Shift+Up extends a column selection -- shift read in the action)
 	{.Down, false, true, .Editor, .Move_Line_Down}, // Alt+Down (Alt+Shift+Down extends a column selection -- shift read in the action)
@@ -746,6 +770,53 @@ block_extend_dispatch :: proc(app: ^App, doc: ^Document, t: ^plat.Text, dline, d
 	}
 }
 
+// The single path for both replace verbs, from every surface that can run them:
+// the two buttons on the replace row, the palette, and Ctrl+Enter /
+// Ctrl+Alt+Enter (which reach here from the document as well as from the bar,
+// because resolve_key falls Find back to the editor keymap for modified chords).
+//
+// The opening guard is the one that matters. Run from the palette with find
+// SHUT, there is no query and f.matches is nil, and doc.search.done has never
+// been set -- so find_replace_all would return (0, complete=false) and the
+// caller below would put up a modal warning that a file it never looked at may
+// have more matches. Opening the replace bar instead answers the only question
+// the user can actually be asked at that point, which is "replace what, with
+// what". Same for an empty query: the bar is the answer, not a dialog.
+@(private = "file")
+replace_dispatch :: proc(app: ^App, doc: ^Document, w: ^plat.Window, all: bool) {
+	if doc == nil {return}
+	if !doc.find.active || !doc.find.replace_mode || len(doc.find.query) == 0 {
+		find_open(doc, true)
+		return
+	}
+	if !all {
+		find_replace_current(doc)
+		return
+	}
+	replaced, complete := find_replace_all(doc)
+	// Say so when the pass could not have seen the whole document. The
+	// alternative -- replacing a prefix in silence -- looks exactly like
+	// replacing everything, so a half-finished rename reads as a finished one
+	// until something downstream breaks.
+	if !complete {
+		plat.message_error(
+			w.hwnd if w != nil else nil,
+			fmt.tprintf(
+				"Replaced %d occurrence(s).\n\nThe search had not finished scanning the file, or there were more matches than Newtpad tracks at once, so there may be more.\n\nRun Replace All again to continue.",
+				replaced,
+			),
+		)
+		return
+	}
+	// A completed Replace All that matched nothing changes no pixel, so without
+	// this the button reads as broken -- the same argument sort_lines_dispatch's
+	// .Unchanged note makes. The success count is worth saying too: the whole
+	// complaint behind this feature was a row that never told you anything.
+	if app != nil {
+		app_note(app, "[NO MATCHES TO REPLACE]" if replaced == 0 else fmt.tprintf("[REPLACED %d OCCURRENCE(S)]", replaced))
+	}
+}
+
 // The one note every rectangle-wide EDIT refusal posts. block_replace and
 // block_delete refuse for exactly the two reasons the copy and the cut already
 // refuse for -- an unresolvable row, or a rectangle deeper than
@@ -885,6 +956,15 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	// committed on the way, and without this the panel then rewrites the buffer
 	// under a captured cell span that table_edit_commit will splice into.
 	case .History_Jump:
+		return true
+	// Both write to the buffer, and unlike .Find_Confirm -- which is find_next in
+	// the search field and a replace in the replace field, so it can be neither
+	// on this list nor off it -- these two mean one thing wherever they are run
+	// from. Membership is what gets them the read-only-view refusal and the
+	// stale-rectangle drop at the top of command_dispatch; the find procs clear a
+	// live rectangle themselves as well (find.odin explains why that belt is
+	// worth its braces), so the guard here is additive, not a substitute.
+	case .Find_Replace_One, .Find_Replace_All:
 		return true
 	}
 	return false
@@ -1594,21 +1674,13 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			// Silent, matching every other refusal these two views make; the Enter
 			// simply does nothing, exactly as it does for Backspace or Paste.
 			if doc_read_only_view(doc) {return}
-			if ev.ctrl {
-				// Say so when the pass could not have seen the whole document. The
-				// alternative -- replacing a prefix in silence -- looks exactly like
-				// replacing everything, so a half-finished rename reads as a finished
-				// one until something downstream breaks.
-				if replaced, complete := find_replace_all(doc); !complete {
-					plat.message_error(
-						w.hwnd if w != nil else nil,
-						fmt.tprintf(
-							"Replaced %d occurrence(s).\n\nThe search had not finished scanning the file, or there were more matches than Newtpad tracks at once, so there may be more.\n\nRun Replace All again to continue.",
-							replaced,
-						),
-					)
-				}
-			} else {find_replace_current(doc)}
+			// Enter in the replace field replaces the current match and advances
+			// (find_recompute re-selects the caret-nearest match, which after the
+			// splice is the next one). Replace All used to hang off `ev.ctrl` here
+			// and was unreachable: Ctrl+Enter matched no Binding row, so the branch
+			// never ran. It is .Find_Replace_All now -- a command with a chord, a
+			// palette entry and a button.
+			find_replace_current(doc)
 		} else {
 			if ev.shift {find_prev(doc)} else {find_next(doc)}
 		}
@@ -1634,6 +1706,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// is where the reason lives. Clicking a filtered row leaves through the
 		// same proc.
 		find_set_filter(doc, !doc.filter)
+	case .Find_Replace_One:
+		replace_dispatch(app, doc, w, false)
+	case .Find_Replace_All:
+		replace_dispatch(app, doc, w, true)
 	case .Find_Toggle_Replace_Mode:
 		doc.find.replace_mode = !doc.find.replace_mode
 	case .Find_Filter_Page_Up:
