@@ -2840,14 +2840,33 @@ when NEWTPAD_TESTS {
 			x0, x1 := f32(40), f32(900)
 			ytop, ybot := f32(60), f32(650)
 
-			// --- a done item's PLAIN prose lands where an undone item's does,
-			// muted -- not muted twice (Finding 1/2). "IIII": a monospace glyph
-			// whose vertical stroke gives a solid, near-full-coverage column, so
-			// the sampled pixel is close to the glyph's TRUE resolved colour and
-			// not an antialiasing blend.
+			// --- a done item's prose lands where an undone item's does, muted --
+			// not muted twice (Finding 1/2), and not left at full strength either.
+			// "IIII": a monospace glyph whose vertical stroke gives a solid,
+			// near-full-coverage column, so the sampled pixel is close to the
+			// glyph's TRUE resolved colour and not an antialiasing blend.
+			//
+			// TWO samples off the same readback, because the plain one alone
+			// cannot see the defect Wyatt actually reported ("the base color text
+			// gets muted but the theme colors don't"). Restore the original bug at
+			// markdown.odin's call site -- `task_col = Text_Muted` with task_mute
+			// left at 0 -- and the plain glyph draws at Text_Muted; but
+			// MD_DONE_MUTE is DERIVED so that mute(Text_Primary, 0.26) ~=
+			// Text_Muted, so `want` below and the bug's output are the same colour
+			// and no tolerance can separate them. That assertion rejects "muted
+			// twice" and is blind to "not muted at all" (2026-07 whole-branch
+			// review).
+			//
+			// A STYLED run can tell them apart: md_run_color overwrites the base
+			// colour for a code/bold/link/italic run, so the base is irrelevant
+			// there and only the MUTE step distinguishes done from undone. With
+			// task_mute at 0 the code span draws at full Md_Code -- pixel-identical
+			// to an undone item's -- which is exactly the two checks below.
 			{
+				// The backtick pair is load-bearing: it is what puts a styled run
+				// on the line to sample.
 				mk :: proc(done: bool) -> Document {
-					src := "- [x] IIII\n" if done else "- [ ] IIII\n"
+					src := "- [x] IIII `II`\n" if done else "- [ ] IIII `II`\n"
 					content := make([]u8, len(src))
 					copy(content, src)
 					return doc_from_content(content, "t.md", .UTF8)
@@ -2856,18 +2875,26 @@ when NEWTPAD_TESTS {
 				// markdown_draw itself computes for the task branch.
 				gx0 := int(x0 + char_w * 1.4 + char_w)
 				gx1 := int(x0 + char_w * 1.4 + char_w * 2.2)
+				// ...and the code span: md_inline splits `IIII \`II\`` into the
+				// plain word "IIII " (5 cells, trailing space kept by
+				// md_draw_inline's word split) and then the code run, so the code
+				// run's first cell starts 5 cells further right.
+				cx0 := int(x0 + char_w * 1.4 + char_w * 6)
+				cx1 := int(x0 + char_w * 1.4 + char_w * 7.2)
 				gy0 := int(ytop)
 				gy1 := int(ytop + px_ * 1.3)
-				render_and_sample :: proc(h: ^Headless_Gpu, doc: ^Document, x0, x1, ytop, ybot, px_, char_w: f32, gx0, gx1, gy0, gy1, W, H: int) -> (found: bool, b, g, r: u8) {
+				render :: proc(h: ^Headless_Gpu, doc: ^Document, x0, x1, ytop, ybot, px_, char_w: f32) -> (buf: []u8, ok: bool) {
 					bg := g_theme[.Bg_Base]
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
 					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, char_w, x0, x1, ytop, ybot, 0)
-					buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
-					if !ok {return false, 0, 0, 0}
-					// The sample FARTHEST from the background is the pixel closest
-					// to full glyph coverage -- an antialiased edge pixel is a
-					// blend along the [bg, glyph-colour] segment, so it is always
-					// nearer bg than the fully-covered interior is.
+					return plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				}
+				// The sample FARTHEST from the background is the pixel closest to
+				// full glyph coverage -- an antialiased edge pixel is a blend along
+				// the [bg, glyph-colour] segment, so it is always nearer bg than
+				// the fully-covered interior is.
+				peak :: proc(buf: []u8, gx0, gx1, gy0, gy1, W, H: int) -> (found: bool, b, g, r: u8) {
+					bg := g_theme[.Bg_Base]
 					best := -1
 					for yy in max(0, gy0) ..< min(H, gy1) {
 						for xx in max(0, gx0) ..< min(W, gx1) {
@@ -2879,21 +2906,63 @@ when NEWTPAD_TESTS {
 					return best > 0, b, g, r
 				}
 				doc_done := mk(true)
-				fnd, b, g, r := render_and_sample(&h, &doc_done, x0, x1, ytop, ybot, px_, char_w, gx0, gx1, gy0, gy1, W, H)
+				buf_d, ok_d := render(&h, &doc_done, x0, x1, ytop, ybot, px_, char_w)
 				doc_close(&doc_done)
-				dchk(&bad, fnd, "done task item: the plain-prose glyph is found on screen at all")
-				if fnd {
-					want := md_mute(g_theme[.Text_Primary], MD_DONE_MUTE)
-					bad_want := md_mute(g_theme[.Text_Muted], MD_DONE_MUTE) // the double-mute this test must reject
-					dchk(
-						&bad, near(want, b, g, r, 24) && !near(bad_want, b, g, r, 10),
-						fmt.tprintf(
-							"done task item: markdown_draw's OWN call site mutes prose once, not twice (got bgr %d,%d,%d; single-mute #%02X%02X%02X; double-mute #%02X%02X%02X)",
-							b, g, r,
-							u8(want[0] * 255), u8(want[1] * 255), u8(want[2] * 255),
-							u8(bad_want[0] * 255), u8(bad_want[1] * 255), u8(bad_want[2] * 255),
-						),
-					)
+				doc_undone := mk(false)
+				buf_u, ok_u := render(&h, &doc_undone, x0, x1, ytop, ybot, px_, char_w)
+				doc_close(&doc_undone)
+				dchk(&bad, ok_d && ok_u, "task items: both readbacks succeeded")
+				if ok_d && ok_u {
+					fnd, b, g, r := peak(buf_d, gx0, gx1, gy0, gy1, W, H)
+					dchk(&bad, fnd, "done task item: the plain-prose glyph is found on screen at all")
+					if fnd {
+						want := md_mute(g_theme[.Text_Primary], MD_DONE_MUTE)
+						bad_want := md_mute(g_theme[.Text_Muted], MD_DONE_MUTE) // the double-mute this test must reject
+						dchk(
+							&bad, near(want, b, g, r, 24) && !near(bad_want, b, g, r, 10),
+							fmt.tprintf(
+								"done task item: markdown_draw's OWN call site does not mute prose TWICE (got bgr %d,%d,%d; single-mute #%02X%02X%02X; double-mute #%02X%02X%02X)",
+								b, g, r,
+								u8(want[0] * 255), u8(want[1] * 255), u8(want[2] * 255),
+								u8(bad_want[0] * 255), u8(bad_want[1] * 255), u8(bad_want[2] * 255),
+							),
+						)
+					}
+
+					dfnd, db, dg, dr := peak(buf_d, cx0, cx1, gy0, gy1, W, H)
+					ufnd, ub, ug, ur := peak(buf_u, cx0, cx1, gy0, gy1, W, H)
+					dchk(&bad, dfnd && ufnd, "task items: the code-span glyph is found on screen in both")
+					if dfnd && ufnd {
+						// 1. An UNDONE item's code span is plain Md_Code. This is
+						// the control: it pins the sample window on the right
+						// glyph, so a failure of (2) means "the mute is missing",
+						// not "we sampled empty background".
+						lit := g_theme[.Md_Code]
+						dchk(
+							&bad, near(lit, ub, ug, ur, 24),
+							fmt.tprintf("undone task item: its code span draws at full Md_Code (got bgr %d,%d,%d; want #%02X%02X%02X)", ub, ug, ur, u8(lit[0] * 255), u8(lit[1] * 255), u8(lit[2] * 255)),
+						)
+						// 2. ...and the DONE item's same code span is muted from
+						// it. `!near(lit, .., 10)` is the half that fails when the
+						// call site stops passing a mute -- the styled run's colour
+						// does not depend on the base at all, so nothing else in
+						// this suite can observe that.
+						dim := md_mute(lit, MD_DONE_MUTE)
+						dchk(
+							&bad, near(dim, db, dg, dr, 24) && !near(lit, db, dg, dr, 10),
+							fmt.tprintf(
+								"done task item: markdown_draw's OWN call site mutes a STYLED run too (got bgr %d,%d,%d; muted #%02X%02X%02X; unmuted #%02X%02X%02X)",
+								db, dg, dr,
+								u8(dim[0] * 255), u8(dim[1] * 255), u8(dim[2] * 255),
+								u8(lit[0] * 255), u8(lit[1] * 255), u8(lit[2] * 255),
+							),
+						)
+						// 3. And stated as a direct comparison, independent of
+						// MD_DONE_MUTE's value: done and undone must not render the
+						// same styled pixel.
+						delta := abs(int(db) - int(ub)) + abs(int(dg) - int(ug)) + abs(int(dr) - int(ur))
+						dchk(&bad, delta >= 24, fmt.tprintf("done vs undone: the code span is visibly dimmer when the item is done (channel delta %d)", delta))
+					}
 				}
 			}
 
@@ -12574,6 +12643,16 @@ when NEWTPAD_TESTS {
 					// dp() call so a stuck-at-_96 value has something to disagree
 					// with.
 					tg_chk(bad, abs(TAB_LABEL_GAP - dp(&rc, TAB_LABEL_GAP_96)) < 0.01, fmt.tprintf("dpi=%d: TAB_LABEL_GAP is the DPI-scaled value (%.1f)", dpi, TAB_LABEL_GAP))
+					// ...and that pins only "the global is DPI-scaled", which
+					// `0 == dp(0)` satisfies perfectly. Set TAB_LABEL_GAP_96 back
+					// to 0 -- literally Wyatt's "there's no pixel gap between the X
+					// and the end of the file name, they blend together" -- and
+					// every check in this proc still passed (2026-07 whole-branch
+					// review). The MAGNITUDE needs a literal bound of its own, the
+					// way tm_marker's `>= sx(4)` already gives one to TAB_DIRTY_W.
+					// 3px is the floor at which a gap reads as a gap; the shipped
+					// value is 4.
+					tg_chk(bad, TAB_LABEL_GAP >= sx(3), fmt.tprintf("dpi=%d: TAB_LABEL_GAP is a real gap, not zero (%.1f >= %.1f)", dpi, TAB_LABEL_GAP, sx(3)))
 					cw := plat.text_char_width(&t, UI_SMALL_PX)
 					for width in ([]f32{600, 1200, 1920}) {
 						win.width = i32(width)

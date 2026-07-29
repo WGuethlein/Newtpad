@@ -3803,6 +3803,19 @@ window, and locked the exe against the next build. Verify a mode before citing i
   two existing precedents. A real scissor is its own renderer task.
 - **Thirteen live-pass defects remain**, including both scrollbars, tab ordering, the link
   over-capture, and Replace All. See the ledger.
+- **The horizontal scrollbar's range never shrinks within a session.** `Document.max_cells_seen` is a
+  high-water mark: `doc_max_hscroll` scans only the visible rows (viewport-first) and raises the mark,
+  never lowers it. That is what fixed *"the horizontal scrollbar only allows expanding if the large row
+  is on screen"* — the range used to collapse the moment the wide line scrolled off. **The cost, which
+  Wyatt accepted (2026-07-28) rather than pay for a background full-document scan:** delete the longest
+  line and the bar keeps offering pan into content that no longer exists, for the rest of the session.
+  Measured — one 400-cell line plus 50 short ones gives `doc_max_hscroll` = 323; after deleting the long
+  line through `doc_replace_sel` it is still 323. Only a reload (`doc_reload_forced` replaces the whole
+  struct) clears it. A correct reset would have to know the new widest line, i.e. rescan the document on
+  every edit, which is exactly the work the high-water mark exists to avoid. **If this is ever revisited,
+  the shape is the async resolver's**: a worker that scans off the UI thread and lowers the mark between
+  frames. Note also that `doc_max_hscroll` is a getter that **mutates the `Document` from the draw path**
+  — main-thread only, not idempotent, not job-safe.
 - **Non-local link targets are not resolved on the UI thread** (task 9 of this batch, commit
   `97f92fb` + a re-review fixup). `GetFileAttributesW` on an unreachable UNC host was measured
   blocking the caller for over 100 seconds, and `links_layout` runs on the UI thread every frame
@@ -3820,6 +3833,16 @@ window, and locked the exe against the next build. Verify a mode before citing i
   answers back into `link_cache` between frames, the same shape `watch.odin` already uses for
   external-change polling (copy inputs, work in private memory, merge once per frame, poll a cancel
   flag). Deliberately kept out of this batch as a design change, not a bug fix.
+- **And the async resolver is owed as a TIME bound, not just as network coverage.** `links_layout`
+  still performs filesystem stats **on the frame path** — up to three times per frame while Ctrl is
+  held, every frame when Show-links is "always", and `doc.top` is part of the cache generation, so
+  every scroll step re-stats the whole screen. The only bound today is `LINK_RESOLVE_BUDGET`, which
+  caps a **count of stats, not the time they take**, and `path_is_local` only excludes `DRIVE_REMOTE` /
+  `DRIVE_NO_ROOT_DIR` / `DRIVE_UNKNOWN` / `DRIVE_CDROM`. A **fixed** volume that happens to be slow —
+  a OneDrive/Dropbox sync root, a filesystem filter driver from an AV product, a cold spinning disk —
+  passes `path_is_local` and blocks the UI thread anyway. Measured: **3.32 ms/frame** scrolling a
+  document with 200 missing local targets. Nothing in the tree makes that impossible; only the async
+  resolver does, because it is the only design where a slow stat cannot be on the frame path at all.
 
 ### Part two: tasks 10–13 — checkbox tick, done-item colour, quote markers, front matter (2026-07-29, branch `fix/live-pass-0.27`)
 
@@ -3854,7 +3877,17 @@ test, the sabotage).
   a draw-level pass (`md_draw_selftest`, `test_modes.odin`) that renders through a real offscreen D3D11
   device (the `quadsdftest`/`Headless_Gpu` precedent) and reads back actual pixels — the done-item prose
   colour and the front-matter card's row-advance are both verified against a REAL render, not a copy of
-  the logic. Sabotaging either call site now fails a test.
+  the logic. **That claim originally read "sabotaging either call site now fails a test", and it was
+  false in one direction** — the whole-branch review restored the *original* Task 11 defect
+  (`task_col = g_theme[.Text_Muted]` with `task_mute` left at 0) and the whole suite still printed
+  `mdtest: 0 failures`. The draw-level pass sampled only the **plain prose** glyph, and asserted
+  `near(mute(Text_Primary, 0.26))` — which, by `MD_DONE_MUTE`'s own derivation, *is* ≈ `Text_Muted`,
+  i.e. the pre-fix colour. It rejected "muted twice" and could not tell "muted once" from "not muted at
+  all". Closed 2026-07-29 by sampling a **styled** run as well: the fixture is now ``- [x] IIII `II` ``
+  and its undone twin, and the code span is asserted muted relative to the undone item's identical
+  span. A styled run's colour does not depend on the base at all, so only the mute step can move it.
+  Verified by re-running the sabotage: **2 failures**. The front-matter call site was already covered
+  and still is.
 - **The `MD_DONE_MUTE` self-test pinned an exact tier** (0.05 per channel) when the true dual-theme
   intersection is roughly [0.232, 0.264] — 0.003 from the shipped value, so a plausible eye-tune (0.30)
   already failed it with a message that said nothing about the constant being tunable. Reframed as

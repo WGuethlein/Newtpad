@@ -772,11 +772,18 @@ doc_content_box :: proc(doc: ^Document, height: f32) -> (top, bot: f32) {
 // Deliberately separate from doc_visible_rows rather than replacing it.
 // doc_visible_rows answers "how many rows are WHOLLY on screen", which is the
 // right question for the scroll clamp and the page keys -- paging by a count
-// that includes a sliver would scroll a hair further each press, and
-// doc_ensure_cursor_visible would call a half-hidden caret "visible". The draw
-// and the HIT-TEST ask this one instead: a half-visible line is clickable,
-// because it is on screen. Two questions, two procedures; conflating them is
-// the CLAUDE.md / HANDOFF §6j shape that has cost sixteen bugs in one session.
+// that includes a sliver would scroll a hair further each press. The draw and
+// the HIT-TEST ask this one instead: a half-visible line is clickable, because
+// it is on screen. Two questions, two procedures; conflating them is the
+// CLAUDE.md / HANDOFF §6j shape that has cost sixteen bugs in one session.
+//
+// doc_ensure_cursor_visible takes BOTH, and this comment used to cite "it would
+// call a half-hidden caret visible" as a hazard. That is now exactly what it
+// deliberately does, and on purpose: it asks `drawn` whether the caret counts as
+// on screen, because doc_pos_at hit-tests against `drawn` too -- judging a
+// clicked row "below the viewport" scrolled the file out from under the click.
+// It still asks `rows` for WHERE to land after an actual scroll. Do not
+// "correct" that call site back to `rows` on both sides; see its own comment.
 //
 // PARTIAL_ROW_MIN is the policy: below it the sliver is not worth a row, and
 // drawing one would put its whole line height under the status strip for no
@@ -1022,18 +1029,35 @@ Document :: struct {
 	// session, not the widest currently on screen. See that proc's comment for
 	// why.
 	//
-	// No site in the tree sets this back to 0 explicitly, and that is by
-	// design, not an oversight. doc_reload_forced (an actual reload/reopen-as
-	// swap in different file content) replaces the WHOLE Document struct
-	// (`doc^ = fresh`) rather than mutating fields in place, so a reloaded
-	// document's mark is zero for free -- doc_view_apply/Doc_View, the one
-	// thing carried forward across that swap, holds wrap/md_mode/table only,
-	// never this field. doc_set_line_ending rewrites the whole buffer in place
-	// (pt_edit_replace(0, length, ...)) but only touches line-TERMINATOR
-	// bytes -- line_cell_col never measures past a line's content into its
-	// terminator -- so no line's measured width can change and there is
-	// nothing stale to clear. An explicit `= 0` at either site would be
-	// fighting zero-is-initialization for no correctness gain.
+	// No site in the tree sets this back to 0 explicitly. For the two
+	// whole-buffer replacements that is fine and deliberate: doc_reload_forced
+	// (an actual reload/reopen-as swap in different file content) replaces the
+	// WHOLE Document struct (`doc^ = fresh`) rather than mutating fields in
+	// place, so a reloaded document's mark is zero for free --
+	// doc_view_apply/Doc_View, the one thing carried forward across that swap,
+	// holds wrap/md_mode/table only, never this field. doc_set_line_ending
+	// rewrites the whole buffer in place (pt_edit_replace(0, length, ...)) but
+	// only touches line-TERMINATOR bytes -- line_cell_col never measures past a
+	// line's content into its terminator -- so no line's measured width can
+	// change and there is nothing stale to clear.
+	//
+	// ORDINARY EDITING IS NOT COVERED BY THAT, and no reset is coming. Delete
+	// the file's longest line through doc_replace_sel (or any other edit path)
+	// and this stays at the deleted line's width for the rest of the session:
+	// measured, a 400-cell line plus 50 short ones gives doc_max_hscroll = 323,
+	// and it is still 323 after the long line is gone. The horizontal bar then
+	// offers pan into content that no longer exists. That is the accepted cost
+	// of the high-water design, which Wyatt chose (2026-07-28) over a background
+	// full-document scan: a correct reset would have to know the new widest
+	// line, which means scanning the whole document on every edit -- the exact
+	// job the high-water mark exists to avoid. Stale-wide is a few cells of
+	// blank at the far right; the alternative it replaced was the bar vanishing
+	// whenever the wide line scrolled off, which is the bug Wyatt reported.
+	//
+	// Note also that doc_max_hscroll is a getter that MUTATES the Document: it
+	// raises this mark from the draw path, on the main thread, once per frame.
+	// It is not safe to call from a job, and it is not idempotent with respect
+	// to the struct.
 	max_cells_seen: int,
 	status_cursor: int, // cursor pos the cached status line was computed for
 	status_line:   int, // 1-based line of the cursor (0 = beyond the cap / unknown)
