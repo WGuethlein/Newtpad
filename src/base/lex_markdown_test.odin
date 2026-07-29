@@ -228,6 +228,38 @@ test_lex_markdown_fence_spans_lines :: proc(t: ^testing.T) {
 	if n3 == 1 {mtok_eq(t, out[0], 0, 3, .Punct, "closing fence")}
 }
 
+// A `~~~` fence opens and closes exactly like a ``` one, and `~~struck~~`
+// (a run of TWO) is not a fence at all. The preview has always toggled on
+// `~~~` (md_fence_lexer maps `~~~yaml`); the lexer must agree, because the
+// preview now seeds its fence state from it -- a marker only one side counts
+// is what turns "the opening fence scrolled off screen" into "the rest of the
+// file is a code block".
+@(test)
+test_lex_markdown_tilde_fence :: proc(t: ^testing.T) {
+	out: [8]Token
+	line_open := "~~~yaml"
+	line_body := "key: **not bold, this is code**"
+	line_close := "~~~"
+	line_strike := "~~struck~~ and more prose"
+
+	n1, s1 := lex_markdown(transmute([]u8)line_open, .Normal, out[:])
+	testing.expectf(t, n1 == 1, "open: want 1 token (the fence marker), got %d", n1)
+	testing.expectf(t, s1 == .In_Comment, "open: want In_Comment (fence open), got %v", s1)
+	if n1 == 1 {mtok_eq(t, out[0], 0, 3, .Punct, "opening tilde fence")}
+
+	n2, s2 := lex_markdown(transmute([]u8)line_body, s1, out[:])
+	testing.expectf(t, n2 == 0, "body: want 0 tokens inside the fence, got %d", n2)
+	testing.expectf(t, s2 == .In_Comment, "body: still inside the fence, got %v", s2)
+
+	_, s3 := lex_markdown(transmute([]u8)line_close, s2, out[:])
+	testing.expectf(t, s3 == .Normal, "close: fence closes here, got %v", s3)
+
+	// Two tildes is strikethrough, not a fence: this must NOT change state, or
+	// every `~~struck~~` line would grey out the rest of the document.
+	_, s4 := lex_markdown(transmute([]u8)line_strike, .Normal, out[:])
+	testing.expectf(t, s4 == .Normal, "`~~struck~~` is not a fence, got %v", s4)
+}
+
 // Empty input: no tokens, no state change, no crash.
 @(test)
 test_lex_markdown_empty :: proc(t: ^testing.T) {

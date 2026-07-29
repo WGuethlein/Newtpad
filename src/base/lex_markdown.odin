@@ -41,10 +41,13 @@
 // "this is opaque content in some other language," so trying to apply
 // markdown's own inline grammar to it would be exactly backwards.
 //
-// Fence matching is deliberately loose: ANY run of 3+ backticks at (up to 3
-// spaces of) a line's start toggles the state, regardless of whether the
-// closing run's length matches the opener's (real CommonMark requires the
-// closer to be at least as long as the opener). This is a toggle, not a
+// Fence matching is deliberately loose: ANY run of 3+ backticks OR 3+ tildes
+// at (up to 3 spaces of) a line's start toggles the state, regardless of
+// whether the closing run's length or its MARKER CHARACTER matches the
+// opener's (real CommonMark requires the closer to be at least as long as the
+// opener and to use the same character). This matches the Ctrl+M preview's own
+// toggle exactly, which matters because the preview seeds its fence state from
+// this lexer -- see mk_match_fence. This is a toggle, not a
 // counted-nesting construct — see EXT_LEXERS's registration comment
 // (program/highlight.odin) for why that shape defeats the bounded backward
 // resync used for huge/mapped files specifically (unlike XML's "-->" or
@@ -82,11 +85,24 @@ mk_run_len :: proc(line: []u8, i: int, ch: u8) -> int {
 }
 
 // Whether `lead` is a valid fence-marker position (<=3, per header) and
-// line[lead] starts a run of 3+ backticks. Returns the run's length, or 0.
+// line[lead] starts a run of 3+ backticks OR 3+ tildes. Returns the run's
+// length, or 0.
+//
+// Tildes are here because the Ctrl+M preview (program/markdown.odin) has always
+// toggled on `~~~` as well as ``` -- md_fence_lexer even maps `~~~yaml` -- and
+// the preview now SEEDS its fence state from this lexer (md_fence_seed). A
+// marker one side treats as a fence and the other does not is a disagreement
+// that shows up as "the rest of the file became a code block" the moment the
+// opening fence scrolls off screen, which is the bug that seed exists to fix.
+//
+// Two tildes is `~~struck~~`, not a fence: the >= 3 run length is what keeps
+// them apart, exactly as it does for an inline `` `code` `` span.
 @(private = "file")
 mk_match_fence :: proc(line: []u8, lead: int) -> int {
-	if lead > 3 || lead >= len(line) || line[lead] != '`' {return 0}
-	l := mk_run_len(line, lead, '`')
+	if lead > 3 || lead >= len(line) {return 0}
+	ch := line[lead]
+	if ch != '`' && ch != '~' {return 0}
+	l := mk_run_len(line, lead, ch)
 	if l < 3 {return 0}
 	return l
 }

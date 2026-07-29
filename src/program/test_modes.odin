@@ -2539,6 +2539,7 @@ when NEWTPAD_TESTS {
 			}
 			bad := 0
 			mf_run(&bad, "```json", "backtick fence")
+			mf_run(&bad, "~~~yaml", "tilde fence")
 			fmt.printfln("mdfencetest: %d failures", bad)
 			return true
 		}
