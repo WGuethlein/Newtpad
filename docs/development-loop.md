@@ -188,7 +188,14 @@ than each deriving it and diverging.
 5. **Run `install.ps1`** — a standing instruction after every merge. Check `Get-Process newtpad`
    first, and **never use `-Force` while it is running**: a hard kill skips the hot-exit session
    write and loses unsaved tabs.
-6. **Push only when Wyatt asks.** Every time.
+6. **Push and cut the release, every time, without asking.** Wyatt, 2026-07-29: *"just always
+   put out a push and release."* Run `release.ps1` **bare** — never piped through `2>&1`, see the
+   trap in §6. This replaces the old rule ("push only when Wyatt asks, every time"), which cost a
+   round trip that never changed the answer: he runs Newtpad as his daily driver on more than one
+   machine, and a fix sitting unpushed is a fix he does not have.
+
+   **`install.ps1` is still conditional.** Check `Get-Process newtpad` first; if it is running, say
+   so and leave it to him. `-Force` skips the hot-exit session write and loses unsaved tabs.
 
 ---
 
