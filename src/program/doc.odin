@@ -2883,11 +2883,30 @@ doc_cursor_col :: proc(doc: ^Document, t: ^plat.Text) -> int {
 }
 
 // Scroll so the top of the view is the line start at fraction `frac` of the
-// buffer (byte-proportional; used by the draggable scrollbar), bounded so the
-// last line stays at the bottom.
+// SCROLLABLE RANGE (0 = doc.top's minimum, 1 = doc_max_top) -- used by the
+// draggable scrollbar, whose thumb travels the same range (vscrollbar_geo).
+//
+// This used to be a fraction of the raw buffer length, which was the exact
+// mirror of the bug vscrollbar_geo had: it made the two consistent with each
+// other (so a press-and-hold round trip landed back where it started) but
+// both wrong against the track, since the true 1.0 point -- doc_max_top -- is
+// short of pt.length by one screenful. Fixing only one side would have kept
+// the round trip passing while making the drag land somewhere other than
+// where the thumb visibly was.
+//
+// `+ 0.5` before truncating, matching hscrollbar_pos_at's rounding: a floor
+// here is not a harmless rounding choice, it is a coin flip on which LINE you
+// land on. vscrollbar_geo's forward map and this inverse recover the same
+// frac up to f32 noise, and when that noise lands target a fraction of a byte
+// under the real row start, `eff_row_start` reads it as the trailing '\n' of
+// the PREVIOUS row and snaps a whole line short -- caught by scrollgrabtest's
+// existing mid-document hold case once max_top (a smaller, differently-valued
+// denominator than the old pt.length) shifted which side of the byte the
+// truncation fell on.
 doc_scroll_to_fraction :: proc(doc: ^Document, t: ^plat.Text, frac: f32, rows: int) {
-	target := int(clamp(frac, 0, 1) * f32(doc.pt.length))
-	doc.top = min(eff_row_start(doc, t, target, doc.view_cols), doc_max_top(doc, t, rows))
+	max_top := doc_max_top(doc, t, rows)
+	target := int(clamp(frac, 0, 1) * f32(max_top) + 0.5)
+	doc.top = min(eff_row_start(doc, t, target, doc.view_cols), max_top)
 }
 
 // Move the caret to the start of 1-based line `n` (O(n) line walk from the top).

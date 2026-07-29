@@ -1154,7 +1154,7 @@ Vbar :: struct {
 	x, track_y, track_h, thumb_y, thumb_h: f32,
 }
 
-vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int) -> (b: Vbar) {
+vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int, t: ^plat.Text, rows: int) -> (b: Vbar) {
 	if doc == nil || doc.pt.length <= 0 {return}
 	total := f32(doc.pt.length)
 	b.x = x
@@ -1169,8 +1169,18 @@ vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int) -> (b: Vbar) {
 	// still moved the document by ~3% of its length. The two are exact inverses
 	// now, which is what makes "grab it and it does not move" true rather than
 	// approximately true.
+	//
+	// Mapped against the SCROLLABLE range, not the document length. doc.top is
+	// the top visible line's offset, which at the end of the document is
+	// doc_max_top -- never pt.length. Dividing by pt.length made the ratio peak
+	// at (length - one screenful)/length, so the thumb stopped short by exactly
+	// the visible fraction of the file: on a document where a screen is a fifth
+	// of the content it halted at 80%, which is what Wyatt measured by eye.
+	// doc_scroll_to_fraction (the inverse vbar_drag_to calls through) maps by
+	// the same doc_max_top, so the two stay exact inverses of each other.
+	max_top := f32(max(1, doc_max_top(doc, t, rows)))
 	travel := max(1, b.track_h - b.thumb_h)
-	b.thumb_y = clamp(b.track_y + f32(doc.top) / total * travel, b.track_y, b.track_y + b.track_h - b.thumb_h)
+	b.thumb_y = clamp(b.track_y + f32(doc.top) / max_top * travel, b.track_y, b.track_y + b.track_h - b.thumb_h)
 	b.shown = true
 	return
 }
@@ -1354,7 +1364,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	er := doc_editor_right(doc, w, rc.app.settings.split_frac)
 	total := doc.pt.length
 	if total > 0 && !doc.filter {
-		vb := vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom)
+		vb := vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom, text, rows)
 		g_vbar_editor = vb // what the press hit-tests against next frame
 		sb_h, th, ty := vb.track_h, vb.thumb_h, vb.thumb_y
 		track := plat.Quad{pos = {vb.x, vb.track_y}, size = {SCROLLBAR_TRACK_W, sb_h}, color = g_theme[.Bg_Raised]}
@@ -1413,7 +1423,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// panes anchored to the same source line.
 		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.top)
 		if total > 0 {
-			pvb := vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom)
+			pvb := vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom, text, rows)
 			g_vbar_preview = pvb
 			plat.quads_draw(
 				gfx,

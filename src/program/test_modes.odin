@@ -11447,7 +11447,7 @@ when NEWTPAD_TESTS {
 				doc_scroll(&doc, &t, 900, rows)
 				top0 := doc.top
 				bottom := doc.top + 2000 // a plausible last-visible offset
-				vb := vscrollbar_geo(&doc, 0, winh, bottom)
+				vb := vscrollbar_geo(&doc, 0, winh, bottom, &t, rows)
 				sg_chk(&bad, vb.shown && vb.thumb_h >= 8 && vb.thumb_y > vb.track_y, fmt.tprintf("the thumb is mid-track (y=%.0f h=%.0f in track %.0f..%.0f)", vb.thumb_y, vb.thumb_h, vb.track_y, vb.track_y + vb.track_h))
 
 				// 1. Press ON the thumb, at three points across it, and do not move.
@@ -11490,7 +11490,47 @@ when NEWTPAD_TESTS {
 				}
 				return bad
 			}
+			// sg_run above covers the grab-and-hold seam mid-track. It does not
+			// cover the complaint that sent Wyatt looking in the first place --
+			// "the thumb doesn't go to the bottom of the screen anymore, only
+			// about 80% of the way" -- which only shows up AT doc_max_top, and
+			// only if the forward map (vscrollbar_geo) is checked against the
+			// scrollable range rather than against itself.
+			sb_end :: proc() -> int {
+				bad := 0
+				sb_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				doc := doc_from_content(transmute([]u8)strings.repeat("a line\n", 500), "", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				t: plat.Text
+				plat.text_load_faces(&t)
+				rows := 25
+				winh := f32(800)
+				doc.top = doc_max_top(&doc, &t, rows)
+				b := vscrollbar_geo(&doc, 1000, winh, doc.pt.length, &t, rows)
+				// At the end of the document the thumb's BOTTOM meets the track's bottom.
+				sb_chk(&bad, abs((b.thumb_y + b.thumb_h) - (b.track_y + b.track_h)) < 0.5, "at max_top the thumb bottom meets the track bottom")
+				// And the pair stays an exact inverse, which is what makes "grab it and it
+				// does not move" true rather than approximately true.
+				//
+				// vbar_drag_to(doc, t, b, my, grab, rows) RETURNS NOTHING -- it scrolls the
+				// document through doc_scroll_to_fraction. So the round trip is: set top,
+				// take the geometry, drag the thumb to exactly where it already is with a
+				// zero grab, and read top back. It must not have moved.
+				for frac in ([]f32{0, 0.25, 0.5, 0.75, 1.0}) {
+					want := int(f32(doc_max_top(&doc, &t, rows)) * frac)
+					doc.top = want
+					g := vscrollbar_geo(&doc, 1000, winh, doc.pt.length, &t, rows)
+					vbar_drag_to(&doc, &t, g, g.thumb_y, 0, rows)
+					sb_chk(&bad, abs(doc.top - want) <= 1, fmt.tprintf("round trip at %.2f", frac))
+				}
+				return bad
+			}
 			bad := sg_run()
+			bad += sb_end()
 			fmt.printfln("scrollgrabtest: %d failures", bad)
 			return true
 		}
