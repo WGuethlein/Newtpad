@@ -3782,6 +3782,98 @@ when NEWTPAD_TESTS {
 					dchk(&bad, !near(g_theme[.Md_Code_Bg], cb, cg, cr, 3), "front matter: scrolled past it, NO card is drawn (the p==0 gate)")
 				}
 			}
+
+			// --- a heading draws in Md_Heading, not Text_Bright ------------------
+			//
+			// 9.3 gives every heading level its own colour role. The preview used
+			// Text_Bright -- the plain-prose emphasis tier -- so headings were the
+			// same near-white as bold body text and the six levels were told apart
+			// by size alone. Reverting `base_col = g_theme[.Md_Heading]` to
+			// `g_theme[.Text_Bright]` left mdtest, mdviewtest, blurtest and
+			// themetest green (2026-07-29 review, M3): nothing sampled a heading's
+			// ink at all.
+			//
+			// "IIIIII" for the same reason the task-item fixture uses it: a stack of
+			// vertical strokes gives a near-full-coverage interior pixel, so the
+			// peak sample is the glyph's resolved colour rather than an antialiased
+			// blend. Every level, because the role is assigned per level in 9.3 and
+			// a fix that only reached h1 would be a different bug.
+			{
+				hpeak :: proc(buf: []u8, gx0, gx1, gy0, gy1, W, H: int) -> (found: bool, b, g, r: u8) {
+					bg := g_theme[.Bg_Base]
+					best := -1
+					for yy in max(0, gy0) ..< min(H, gy1) {
+						for xx in max(0, gx0) ..< min(W, gx1) {
+							bb, gg, rr, _ := sample(buf, W, xx, yy)
+							d := abs(int(bb) - int(bg[2] * 255)) + abs(int(gg) - int(bg[1] * 255)) + abs(int(rr) - int(bg[0] * 255))
+							if d > best {best, b, g, r = d, bb, gg, rr}
+						}
+					}
+					return best > 40, b, g, r
+				}
+				// Non-degenerate: if the two roles carried the same value this
+				// whole section would pass against the bug it exists to reject.
+				head, bright := g_theme[.Md_Heading], g_theme[.Text_Bright]
+				sep := abs(int(head[0] * 255) - int(bright[0] * 255)) + abs(int(head[1] * 255) - int(bright[1] * 255)) + abs(int(head[2] * 255) - int(bright[2] * 255))
+				dchk(&bad, sep > 100, fmt.tprintf("heading colour: Md_Heading and Text_Bright are different roles (channel separation %d)", sep))
+				for lvl in 1 ..= 6 {
+					hashes := strings.repeat("#", lvl, context.temp_allocator)
+					src := strings.concatenate({hashes, " IIIIII\n"}, context.temp_allocator)
+					content := make([]u8, len(src))
+					copy(content, src)
+					doc := doc_from_content(content, "head.md", .UTF8)
+					bgc := g_theme[.Bg_Base]
+					plat.gfx_begin_frame(&h.gfx, bgc[0], bgc[1], bgc[2])
+					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+					doc_close(&doc)
+					pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if !pok {
+						dchk(&bad, false, fmt.tprintf("h%d colour: readback", lvl))
+						continue
+					}
+					// Bounded to the glyph band: h1 and h2 carry an Md_Rule line at
+					// the BOTTOM of their own block height, and this must sample the
+					// text rather than the decoration. The band starts at the
+					// heading's own space-ABOVE, which md_pass applies to the first
+					// block as well (`forced` waives the fit test, not the gap) --
+					// h2's 1.6 S of it put the glyphs below a window pinned at ytop.
+					hy := ytop + m.head_above[lvl]
+					fnd, b, g, r := hpeak(pix, int(cx), int(cx) + 300, int(hy), int(hy + m.head[lvl]), W, H)
+					dchk(&bad, fnd, fmt.tprintf("h%d colour: the heading's glyphs are on screen", lvl))
+					if !fnd {continue}
+					dchk(
+						&bad, near(head, b, g, r, 24) && !near(bright, b, g, r, 20),
+						fmt.tprintf("h%d draws in Md_Heading, not Text_Bright (bgr %d,%d,%d; want #%02X%02X%02X)", lvl, b, g, r, u8(head[0] * 255), u8(head[1] * 255), u8(head[2] * 255)),
+					)
+				}
+				// ...and emphasis INSIDE a heading keeps the heading's colour
+				// (2026-07-29 review, L7). md_run_color repaints a bold run
+				// Text_Bright, which is the exact override this section rejects,
+				// surviving in a sub-case: the heading already forces weight 700, so
+				// `**bold**` inside one has no face change left to make and the
+				// colour was carrying the emphasis alone.
+				{
+					src := "# **IIIIII**\n"
+					content := make([]u8, len(src))
+					copy(content, src)
+					doc := doc_from_content(content, "headbold.md", .UTF8)
+					bgc := g_theme[.Bg_Base]
+					plat.gfx_begin_frame(&h.gfx, bgc[0], bgc[1], bgc[2])
+					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+					doc_close(&doc)
+					pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if pok {
+						fnd, b, g, r := hpeak(pix, int(cx), int(cx) + 300, int(ytop), int(ytop + m.head[1]), W, H)
+						dchk(&bad, fnd, "heading colour: the bold-inside-a-heading fixture is on screen")
+						if fnd {
+							dchk(
+								&bad, near(head, b, g, r, 24) && !near(bright, b, g, r, 20),
+								fmt.tprintf("**bold** inside a heading keeps Md_Heading (bgr %d,%d,%d)", b, g, r),
+							)
+						}
+					}
+				}
+			}
 			return bad
 		}
 
@@ -4029,10 +4121,13 @@ when NEWTPAD_TESTS {
 						{m.head_above[3], r(s, 1.40), "h3 space above 1.4 S"},
 						{m.head_above[4], r(s, 1.20), "h4 space above 1.2 S"},
 						{m.head_above[5], r(s, 1.00), "h5 space above 1.0 S"},
+						{m.head_above[6], r(s, 1.00), "h6 space above 1.0 S"},
 						{m.head_below[1], r(s, 0.60), "h1 space below 0.6 S"},
 						{m.head_below[2], r(s, 0.50), "h2 space below 0.5 S"},
 						{m.head_below[3], r(s, 0.40), "h3 space below 0.4 S"},
 						{m.head_below[4], r(s, 0.30), "h4 space below 0.3 S"},
+						{m.head_below[5], r(s, 0.30), "h5 space below 0.3 S"},
+						{m.head_below[6], r(s, 0.30), "h6 space below 0.3 S"},
 						{m.para_below, r(s, 0.80), "paragraph space below 0.8 S"},
 						{m.list_gap, r(s, 0.25), "list gap 0.25 S"},
 						{m.quote_above, r(s, 0.80), "blockquote space above 0.8 S"},
@@ -4488,6 +4583,467 @@ when NEWTPAD_TESTS {
 		}
 
 
+		// mdtest's CACHE-KEY checks: the four inputs a block's layout is a
+		// function of that its own SOURCE TEXT cannot witness (2026-07-29 review,
+		// H1 / H1b / M1 / M2). Each of these was a live stale-render bug, and each
+		// one is invisible to md_cache_selftest, which only ever changes the pane
+		// width, the zoom and the text.
+		//
+		// The pane here is deliberately WIDE -- wider than 72ch at this S. That is
+		// load-bearing twice over. It is the only configuration in the whole suite
+		// where 9.3's measure cap actually binds (every other fixture's pane is
+		// narrower than 72ch, so `min` in md_content_span never chooses the cap and
+		// the cap could be deleted outright with the suite still green), and it is
+		// what makes the UI_SCALE check an isolation: with the cap binding, the
+		// measure is a function of S alone, so a DPI change moves the baked insets
+		// and moves NOTHING else in the key.
+		md_key_selftest :: proc() -> (bad: int) {
+			kchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1400, 620
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/key") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(20)
+			x0, x1 := f32(40), f32(1340)
+			ytop, ybot := f32(20), f32(600)
+			mk :: proc(s: string, name: string) -> Document {
+				content := make([]u8, len(s))
+				copy(content, s)
+				return doc_from_content(content, name, .UTF8)
+			}
+
+			// --- (1) 9.3's "measure: 72ch max" (M2) ------------------------------
+			m := md_metrics(&h.text, px_)
+			cx, meas := md_content_span(&m, x0, x1)
+			kchk(
+				&bad, x1 - cx > m.measure * 1.25,
+				fmt.tprintf("measure: the fixture pane is genuinely wider than 72ch (%.0fpx of room against a %.0fpx measure)", x1 - cx, m.measure),
+			)
+			kchk(
+				&bad, meas == m.measure,
+				fmt.tprintf("measure: ...so md_content_span returns the 72ch CAP and not the pane (%.0f, pane %.0f)", meas, x1 - cx),
+			)
+			// ...and the cap is 72 of the BODY face's '0', CSS's own definition of
+			// `ch` -- not 72 of the editor's monospace cell, which is what a preview
+			// that forgot it went proportional would use.
+			adv := plat.text_advance(nil, &h.text, '0', m.body, .Body)
+			kchk(&bad, abs(m.measure - 72 * adv) < 0.01, fmt.tprintf("measure: 72ch is 72 body-face '0' advances (%.2f vs %.2f)", m.measure, 72 * adv))
+			// The other side: in a NARROW pane the pane binds, or "the cap binds"
+			// above would also be satisfied by a measure that ignores the pane.
+			ncx, nmeas := md_content_span(&m, x0, x0 + 300)
+			kchk(
+				&bad, nmeas == x0 + 300 - ncx && nmeas < m.measure,
+				fmt.tprintf("measure: in a narrow pane the PANE binds instead (%.0f, cap %.0f)", nmeas, m.measure),
+			)
+
+			// The cap as the draw actually applies it, not as arithmetic: a
+			// paragraph far too long for one line must wrap AT the measure, leaving
+			// the rest of this very wide pane empty. Without the cap the same
+			// paragraph runs to the pane edge, which is ~560px further right.
+			{
+				long := strings.repeat("wrap ", 200, context.temp_allocator)
+				doc := mk(strings.concatenate({long, "\n"}, context.temp_allocator), "measure.md")
+				defer doc_close(&doc)
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+				pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				kchk(&bad, ok, "measure: readback")
+				if ok {
+					minx, maxx, miny, maxy := W, -1, H, -1
+					for yy in int(ytop) ..< min(H, int(ybot)) {
+						for xx in int(x0) ..< min(W, int(x1)) {
+							i := (yy * W + xx) * 4
+							d :=
+								abs(int(pix[i]) - int(bg[2] * 255)) +
+								abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+								abs(int(pix[i + 2]) - int(bg[0] * 255))
+							if d <= 24 {continue}
+							minx, maxx = min(minx, xx), max(maxx, xx)
+							miny, maxy = min(miny, yy), max(maxy, yy)
+						}
+					}
+					// Bounded against 72 body-face advances computed HERE, not
+					// against md_content_span's own answer: with the cap deleted
+					// `meas` becomes the pane and a bound derived from it moves out
+					// to the pane edge with the ink, passing.
+					cap72 := 72 * adv
+					kchk(
+						&bad, maxx >= 0 && f32(maxx) <= cx + cap72 + 2,
+						fmt.tprintf("measure: the drawn paragraph stops at the 72ch measure (rightmost ink x=%d, 72ch ends at %.0f, pane at %.0f)", maxx, cx + cap72, x1),
+					)
+					// ...and it really did fill the measure and wrap, or the bound
+					// above is satisfied by any short line.
+					kchk(&bad, f32(maxx) > cx + cap72 * 0.8, fmt.tprintf("measure: ...having actually filled it (rightmost ink x=%d of %.0f)", maxx, cx + cap72))
+					kchk(
+						&bad, f32(maxy - miny) > line_height(m.body) * 1.5,
+						fmt.tprintf("measure: ...over several wrapped lines (ink spans %dpx, one line is %.0f)", maxy - miny, line_height(m.body)),
+					)
+					_ = minx
+				}
+			}
+
+			// --- (2) UI_SCALE is part of the key (H1b) ---------------------------
+			//
+			// `indent` bakes sx()-scaled insets at BUILD time (a list's 24px per
+			// level, a quote's 16px, a fenced block's 12px pad). A monitor change
+			// with no window-size change moves every one of them while `measure`,
+			// `px`, `src`, `start`, `end` and `theme` all stay put -- so without
+			// ui_scale in the key every cached block keeps the old DPI's insets and
+			// the preview's left edge is wrong until something else evicts it.
+			//
+			// Probed through markdown_links because a link rect's x IS the block's
+			// glyph origin (md_block_origin), which is exactly the quantity `indent`
+			// contributes to.
+			{
+				// The label is NOT "x": `- [x]` is GFM task-list syntax, so
+				// `- [x](url)` classifies as a checked task whose content is
+				// "(url) ..." and the link disappears before md_inline sees it.
+				doc := mk("- [see](http://ui.example) item text\n", "ui.md")
+				defer doc_close(&doc)
+				first_x :: proc(hits: []Md_Link_Hit, url: string) -> (x: f32, ok: bool) {
+					for hh in hits {
+						if hh.url == url {return hh.rect.pos.x, true}
+					}
+					return 0, false
+				}
+				UI_SCALE = 1
+				m1 := md_metrics(&h.text, px_)
+				cx1, meas1 := md_content_span(&m1, x0, x1)
+				h1 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0, context.temp_allocator)
+				// The SAME document, the SAME pane, the cache warm from the pass
+				// above -- only the DPI moved.
+				UI_SCALE = 2
+				m2 := md_metrics(&h.text, px_)
+				cx2, meas2 := md_content_span(&m2, x0, x1)
+				h2 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0, context.temp_allocator)
+				UI_SCALE = 1
+				// The isolation, stated: if the measure moved too, this would be a
+				// test of the measure term and would pass with ui_scale absent.
+				kchk(&bad, meas1 == meas2, fmt.tprintf("ui scale: the 72ch cap binds at BOTH scales, so the measure is unchanged (%.0f, %.0f)", meas1, meas2))
+				kchk(&bad, m2.list_indent > m1.list_indent, fmt.tprintf("ui scale: ...while the list indent really does move (%.0f -> %.0f)", m1.list_indent, m2.list_indent))
+				xa, oka := first_x(h1, "http://ui.example")
+				xb, okb := first_x(h2, "http://ui.example")
+				kchk(&bad, oka && okb, fmt.tprintf("ui scale: the list item's link is placed at both scales (%d rects at 100%%, %d at 200%%)", len(h1), len(h2)))
+				if oka && okb {
+					kchk(&bad, abs(xa - (cx1 + m1.list_indent)) <= 1, fmt.tprintf("ui scale: at 100%% the item's prose starts at one list indent (%.1f vs %.1f)", xa, cx1 + m1.list_indent))
+					kchk(&bad, abs(xb - (cx2 + m2.list_indent)) <= 1, fmt.tprintf("ui scale: at 200%% it starts at the SCALED indent, not the cached one (%.1f vs %.1f)", xb, cx2 + m2.list_indent))
+				}
+			}
+
+			// --- (3) the theme is part of the key (H1) ---------------------------
+			//
+			// Md_Span.color is resolved when the block is BUILT (the old renderer
+			// called md_run_color per draw), so a theme switch that does not
+			// invalidate leaves the previous palette's ink on the new palette's
+			// canvas -- warm-white body text and amber headings on white. Live
+			// through the Settings theme cycle, theme_edit_current and
+			// theme_reapply_if_active.
+			//
+			// Asserted on PIXELS, and on a heading, because a heading is the one
+			// role whose colour this batch changed (Md_Heading, not Text_Bright);
+			// the same entry therefore has to be wrong under a stale key in a way
+			// no other assertion in the suite would notice.
+			{
+				doc := mk("# IIIIIIII\n", "theme.md")
+				defer doc_close(&doc)
+				// Peak: the pixel farthest from the CURRENT background is the one
+				// nearest full glyph coverage. Bounded to the heading's own glyph
+				// band so the h1 rule below it cannot be sampled instead.
+				ink :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot, hpx, cx: f32, W, H: int) -> (b, g, r: u8, ok: bool) {
+					bg := g_theme[.Bg_Base]
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, 0)
+					pix, rok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if !rok {return}
+					best := -1
+					for yy in int(ytop) ..< min(H, int(ytop + hpx)) {
+						for xx in int(cx) ..< min(W, int(cx + 300)) {
+							i := (yy * W + xx) * 4
+							bb, gg, rr := pix[i], pix[i + 1], pix[i + 2]
+							d :=
+								abs(int(bb) - int(bg[2] * 255)) +
+								abs(int(gg) - int(bg[1] * 255)) +
+								abs(int(rr) - int(bg[0] * 255))
+							if d > best {best, b, g, r = d, bb, gg, rr}
+						}
+					}
+					return b, g, r, best > 40
+				}
+				close :: proc(c: [4]f32, b, g, r: u8, tol: int) -> bool {
+					return(
+						abs(int(b) - int(c[2] * 255 + 0.5)) <= tol &&
+						abs(int(g) - int(c[1] * 255 + 0.5)) <= tol &&
+						abs(int(r) - int(c[0] * 255 + 0.5)) <= tol \
+					)
+				}
+				dark_head := theme_dark()[.Md_Heading]
+				light_head := theme_light()[.Md_Heading]
+				// Non-degenerate, or "the colour changed" is unobservable.
+				sep := abs(int(dark_head[0] * 255) - int(light_head[0] * 255)) + abs(int(dark_head[1] * 255) - int(light_head[1] * 255)) + abs(int(dark_head[2] * 255) - int(light_head[2] * 255))
+				kchk(&bad, sep > 100, fmt.tprintf("theme: Dark and Light really give a heading different colours (channel separation %d)", sep))
+
+				g_theme = theme_dark()
+				db, dg, dr, dok := ink(&h, &doc, px_, x0, x1, ytop, ybot, m.head[1], cx, W, H)
+				kchk(&bad, dok, "theme: the heading's glyphs are on screen under Dark")
+				kchk(&bad, dok && close(dark_head, db, dg, dr, 24), fmt.tprintf("theme: ...drawn in Dark's Md_Heading (bgr %d,%d,%d)", db, dg, dr))
+
+				// The switch, exactly as the Settings cycle makes it: assign
+				// g_theme, draw the SAME document again with every block's entry
+				// still resident.
+				g_theme = theme_light()
+				lb, lg, lr, lok := ink(&h, &doc, px_, x0, x1, ytop, ybot, m.head[1], cx, W, H)
+				kchk(&bad, lok, "theme: the heading's glyphs are on screen under Light")
+				kchk(
+					&bad, lok && close(light_head, lb, lg, lr, 24),
+					fmt.tprintf("theme: after the switch the SAME cached block draws in Light's Md_Heading (bgr %d,%d,%d, want #%02X%02X%02X)", lb, lg, lr, u8(light_head[0] * 255), u8(light_head[1] * 255), u8(light_head[2] * 255)),
+				)
+				kchk(
+					&bad, lok && !close(dark_head, lb, lg, lr, 20),
+					fmt.tprintf("theme: ...and NOT in the palette it was baked under (bgr %d,%d,%d against Dark's #%02X%02X%02X)", lb, lg, lr, u8(dark_head[0] * 255), u8(dark_head[1] * 255), u8(dark_head[2] * 255)),
+				)
+				g_theme = theme_dark()
+			}
+
+			// --- (4) a block's EXTENT is part of the key (M1) ---------------------
+			//
+			// md_pass strips the trailing \r before handing `line` to the key, so a
+			// CRLF -> LF conversion leaves every `src` byte-identical while every
+			// `end`/`next` shrinks by one. A cache hit then carries the OLD `next`,
+			// the pass resumes one byte late, and the following block renders with
+			// its first character eaten -- which for a line beginning with `[` eats
+			// the link.
+			//
+			// The reference is the same document laid out COLD as LF, so this
+			// asserts "converting gets you what loading would have", not an
+			// arithmetic guess about byte offsets.
+			//
+			// Asserted on PIXELS, and that is not belt-and-braces -- it is the only
+			// form that fails. The stale `next` is SELF-CORRECTING after exactly one
+			// block: the pass resumes at byte 9 instead of 8, and pt_line_end_cap
+			// then finds the same newline it would have found from 8, so the block
+			// after it starts in the right place and `bottom`, the link count and
+			// the link rectangles all come out identical. What is actually wrong is
+			// the one character the late resume ate out of the middle block -- and
+			// nothing but the ink can see it. (Written first as a `bottom` + link-x
+			// comparison, which stayed green under the sabotage.)
+			{
+				crlf := "# Title\r\nsecond line here\r\n[third](http://crlf.example) tail\r\n"
+				lf := "# Title\nsecond line here\n[third](http://crlf.example) tail\n"
+				shot :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot: f32) -> (pix: []u8, bottom: int, ok: bool) {
+					bg := g_theme[.Bg_Base]
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					bottom = markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, 0)
+					pix, ok = plat.gfx_readback_bgra(&h.gfx, context.allocator)
+					return
+				}
+
+				cold := mk(lf, "cold.md")
+				cold_pix, cold_bottom, cok := shot(&h, &cold, px_, x0, x1, ytop, ybot)
+				doc_close(&cold)
+
+				conv := mk(crlf, "conv.md")
+				// doc_from_content does not detect the line ending (the loader does
+				// it separately), and doc_set_line_ending early-returns when the
+				// document already claims the target -- so without this the fixture
+				// silently converts nothing.
+				conv.eol = base.detect_line_ending(conv.original)
+				before := conv.pt.length
+				warm_pix, _, wok := shot(&h, &conv, px_, x0, x1, ytop, ybot) // warm every block under CRLF
+				doc_set_line_ending(&conv, .LF) // Encoding > Line Endings > LF
+				after := conv.pt.length
+				conv_pix, conv_bottom, vok := shot(&h, &conv, px_, x0, x1, ytop, ybot)
+				doc_close(&conv)
+				defer if cok {delete(cold_pix)}
+				defer if wok {delete(warm_pix)}
+				defer if vok {delete(conv_pix)}
+
+				// Non-vacuity: the conversion really did move every extent.
+				kchk(&bad, after == before - 3, fmt.tprintf("crlf: the conversion shortened the buffer by one byte per line (%d -> %d)", before, after))
+				kchk(&bad, cok && wok && vok, "crlf: all three readbacks succeeded")
+				if !(cok && wok && vok) {return}
+				diff :: proc(a, b: []u8) -> (n: int) {
+					for i in 0 ..< min(len(a), len(b)) {
+						if a[i] != b[i] {n += 1}
+					}
+					return
+				}
+				// ...and the comparison can see a difference at all: the CRLF
+				// rendering is NOT already pixel-identical to the LF one for some
+				// reason unrelated to the cache. (It is not -- CRLF's `\r` is
+				// stripped, so what is drawn is the same text; what differs is
+				// that this pass is the one that laid the entries down. Asserted as
+				// ink present rather than as a difference, because a correct
+				// implementation makes warm_pix and cold_pix equal too.)
+				ink := 0
+				bgc := g_theme[.Bg_Base]
+				for i := 0; i + 3 < len(cold_pix); i += 4 {
+					d := abs(int(cold_pix[i]) - int(bgc[2] * 255)) + abs(int(cold_pix[i + 1]) - int(bgc[1] * 255)) + abs(int(cold_pix[i + 2]) - int(bgc[0] * 255))
+					if d > 24 {ink += 1}
+				}
+				kchk(&bad, ink > 500, fmt.tprintf("crlf: the reference rendering has ink to compare (%d pixels)", ink))
+				kchk(&bad, conv_bottom == cold_bottom, fmt.tprintf("crlf: after the conversion the warm pass reaches the same byte a cold LF pass does (%d vs %d)", conv_bottom, cold_bottom))
+				n := diff(conv_pix, cold_pix)
+				kchk(
+					&bad, n == 0,
+					fmt.tprintf("crlf: ...and draws the same pixels -- no line resumed one byte late, no first character eaten (%d bytes differ of %d)", n, len(cold_pix)),
+				)
+			}
+			return
+		}
+
+		// mdtest's SPACE ABOVE / BELOW checks (UI spec 9.3's most easily skipped
+		// column, 2026-07-29 review M4).
+		//
+		// md_metrics_selftest asserts the NUMBERS are round(k * S); nothing asserted
+		// that md_pass puts them between the blocks. Measured: zeroing a heading's
+		// above and below gave 0 failures across the whole suite, and zeroing the
+		// inter-block gap entirely gave 1.
+		//
+		// Every measurement here is the y of a PROBE PARAGRAPH's link rect -- the
+		// same walk the draw makes, through the same layout cache. Two fixtures per
+		// row, differing only by the block under test being present, so the probe's
+		// own offset inside its block (which depends on its face, not on any gap)
+		// cancels exactly:
+		//
+		//	base   "LEAD\n[q]probe\n"          -> y_base
+		//	with   "LEAD\nK\n[q]probe\n"       -> y_with
+		//	y_with - y_base == max(lead_below, K.above) - lead_below + K.h + K.below
+		//
+		// Run over TWO leads: a paragraph (0.8 S below) and a list item (0.25 S
+		// below). A kind whose space-above is smaller than the paragraph's
+		// space-below is invisible in the first -- adjacent margins collapse to the
+		// larger -- and the list lead is what makes it observable. That the two
+		// leads agree wherever the collapse dominates is itself the margin-collapse
+		// assertion.
+		//
+		// K.h comes from the shaper, at the same px / leading / face md_layout_build
+		// hands it. A second producer, deliberately and only in the test: it is the
+		// only thing that can state the height without re-deriving the layout, and
+		// it is the pattern md_head_fit_selftest already uses.
+		md_gap_selftest :: proc() -> (bad: int) {
+			gchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 900, 1400
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/gap") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(20)
+			x0, x1 := f32(40), f32(860)
+			ytop, ybot := f32(20), f32(1380)
+			m := md_metrics(&h.text, px_)
+			_, measure := md_content_span(&m, x0, x1)
+			PROBE :: "[q](http://probe.example) probe"
+
+			// The probe's y in a document built from `parts`, or -1.
+			probe_y :: proc(h: ^Headless_Gpu, src: string, px_, x0, x1, ytop, ybot: f32) -> f32 {
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "gap.md", .UTF8)
+				defer doc_close(&doc)
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0, context.temp_allocator)
+				for hh in hits {
+					if hh.url == "http://probe.example" {return hh.rect.pos.y}
+				}
+				return -1
+			}
+
+			// A one-line block's height, through the shaper the layout uses.
+			one_line :: proc(h: ^Headless_Gpu, s: string, px, measure, lead: f32, set: plat.Font_Set) -> f32 {
+				return plat.shape_run(&h.gfx, &h.text, s, px, measure, lead, set, context.temp_allocator).height
+			}
+			body_h := one_line(&h, "block text", m.body, measure, m.body_lead, .Body)
+			bold := plat.text_styled_set(&h.text, .Body, .Bold)
+			// A fenced block is THREE blocks -- an open pad, the body, a close pad --
+			// so its "height" for this test is the whole run, and its space-above and
+			// space-below are the open block's and the close block's.
+			fence_h := m.fence_pad * 2 + one_line(&h, "code", m.code, measure - m.fence_pad, line_height(m.code), .Doc)
+
+			Row :: struct {
+				what:   string,
+				src:    string, // the block under test, WITHOUT its trailing newline
+				height: f32,
+				above:  f32,
+				below:  f32,
+			}
+			rows := []Row {
+				{"paragraph", "block text", body_h, 0, m.para_below},
+				// A list item and a quote lay out at the body face and do not wrap
+				// at this measure, so their block height is a paragraph's.
+				{"list item", "- block text", body_h, 0, m.list_gap},
+				{"blockquote", "> block text", body_h, m.quote_above, m.quote_below},
+				// h1 and h2 carry their rule INSIDE their own height (9.2 item 1).
+				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, line_height(m.head[1]), bold) + hairline(), m.head_above[1], m.head_below[1]},
+				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, line_height(m.head[2]), bold) + hairline(), m.head_above[2], m.head_below[2]},
+				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, line_height(m.head[3]), bold), m.head_above[3], m.head_below[3]},
+				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, line_height(m.head[4]), bold), m.head_above[4], m.head_below[4]},
+				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below},
+				{"thematic break", "***", hairline(), m.rule_gap, m.rule_gap},
+			}
+			leads := []struct {
+				what:  string,
+				src:   string,
+				below: f32,
+			}{{"a paragraph", "lead text", m.para_below}, {"a list item", "- lead text", m.list_gap}}
+
+			for ld in leads {
+				base_src := strings.concatenate({ld.src, "\n", PROBE, "\n"}, context.temp_allocator)
+				y_base := probe_y(&h, base_src, px_, x0, x1, ytop, ybot)
+				gchk(&bad, y_base >= 0, fmt.tprintf("gap: the probe is placed after %s", ld.what))
+				if y_base < 0 {continue}
+				for r in rows {
+					src := strings.concatenate({ld.src, "\n", r.src, "\n", PROBE, "\n"}, context.temp_allocator)
+					y := probe_y(&h, src, px_, x0, x1, ytop, ybot)
+					if y < 0 {
+						gchk(&bad, false, fmt.tprintf("gap: [%s] the probe is placed after a %s", ld.what, r.what))
+						continue
+					}
+					// max(lead.below, K.above) is the COLLAPSED gap above K; the
+					// lead's own below is already inside y_base, so it comes back
+					// out. K.below is the collapsed gap under it (a paragraph has
+					// no space above, so the max is K.below itself).
+					want := max(ld.below, r.above) - ld.below + r.height + r.below
+					got := y - y_base
+					gchk(
+						&bad, abs(got - want) <= 1,
+						fmt.tprintf("gap: [%s] a %s costs h=%.0f + above=%.0f + below=%.0f (got %.1f, want %.1f)", ld.what, r.what, r.height, r.above, r.below, got, want),
+					)
+				}
+			}
+			// Non-degeneracy: if every kind happened to carry the same space, the
+			// table above would pass against an implementation that applied one
+			// number everywhere -- which is very nearly the sabotage.
+			distinct_below := 0
+			for r, i in rows {
+				seen := false
+				for j in 0 ..< i {
+					if abs(rows[j].below - r.below) < 0.5 {seen = true}
+				}
+				if !seen {distinct_below += 1}
+			}
+			gchk(&bad, distinct_below >= 4, fmt.tprintf("gap: the fixture spans several DIFFERENT space-below values (%d distinct)", distinct_below))
+			return
+		}
+
 		// `newtpad mdtest` covers the markdown block classifiers and inline parser
 		// (the rendering itself needs a live eye), PLUS the draw-level checks
 		// above that exercise markdown_draw's own call sites through a real
@@ -4499,6 +5055,8 @@ when NEWTPAD_TESTS {
 			bad += md_metrics_selftest()
 			bad += md_seam_selftest()
 			bad += md_cache_selftest()
+			bad += md_key_selftest()
+			bad += md_gap_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
 			return true
 		}
