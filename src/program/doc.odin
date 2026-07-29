@@ -1014,9 +1014,29 @@ Document :: struct {
 	table_edit_buf:    [dynamic]u8,
 	table_edit_caret:  int, // byte offset within table_edit_buf
 	// Markdown view (see markdown.odin): Off / Preview (full) / Split (editor +
-	// live preview). Both Preview and Split scroll from doc.top -- Split keeps the
-	// two panes anchored to the same source line.
+	// live preview).
 	md_mode:     Md_Mode,
+	// The preview pane's own scroll position, in PIXELS (UI spec 9.1 item 4).
+	//
+	// doc.top stays the EDITOR's and is untouched by this: the editor pane keeps
+	// the row grid, the byte anchor and its own scrollbar. The preview does not,
+	// because it has no grid to anchor to -- a blank run is one zero-height block,
+	// so a preview screen covers about three times the source an editor screen
+	// does, and sharing one byte offset made the last stretch of the preview's
+	// scroll travel show nothing new (2b's measurement: bottom=194 against the
+	// editor's ceiling).
+	//
+	// Kept in step with doc.top by md_sync_top, which records the doc.top the
+	// preview last mirrored: they differ => the editor moved => the preview
+	// re-anchors by BLOCK (9.4). Not persisted -- see session.odin's format
+	// comment: a session records doc.top, and the preview is derived from it on
+	// restore, so there is no format change and no saved position to lose.
+	md_top:      Md_Anchor,
+	md_sync_top: int,
+	// md_max_anchor's answer and the key it was computed under. See Md_Max_Key:
+	// a scroll moves no term of the key, which is the case that has to be free.
+	md_max:      Md_Anchor,
+	md_max_key:  Md_Max_Key,
 	// Per-block column measure (markdown.odin). Four slots, not one, so two table
 	// blocks on screen at once don't thrash a single slot every frame; no
 	// allocation, so nothing to free on doc close.

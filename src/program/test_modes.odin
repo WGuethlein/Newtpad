@@ -3469,7 +3469,7 @@ when NEWTPAD_TESTS {
 				render :: proc(h: ^Headless_Gpu, doc: ^Document, x0, x1, ytop, ybot, px_: f32) -> (buf: []u8, ok: bool) {
 					bg := g_theme[.Bg_Base]
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, 0)
+					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 					return plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				}
 				// The sample FARTHEST from the background is the pixel closest to
@@ -3587,12 +3587,12 @@ when NEWTPAD_TESTS {
 					bare_doc := doc_from_content(bare_content, "fmbare.md", .UTF8)
 					defer doc_close(&bare_doc)
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					bare_bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &bare_doc, px_, x0, x1, ytop, ybot, 0)
+					bare_bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &bare_doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 					dchk(&bad, bare_bottom == fm_end, fmt.tprintf("front matter: with nothing after it, markdown_draw's `bottom` (%d) is md_front_matter_end's `end` (%d)", bare_bottom, fm_end))
 				}
 
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 				buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				dchk(&bad, ok, "front matter: readback")
 				if ok {
@@ -3771,7 +3771,7 @@ when NEWTPAD_TESTS {
 				// The p==0 gate: scrolled to start exactly at the front matter's
 				// end, the card must NOT be drawn at all.
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				bottom2 := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, fm_end)
+				bottom2 := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{fm_end, 0})
 				dchk(&bad, bottom2 > fm_end, "front matter: scrolled past it, markdown_draw advances past fm_end (the rule line), not stuck")
 				buf2, ok2 := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				if ok2 {
@@ -3824,7 +3824,7 @@ when NEWTPAD_TESTS {
 					doc := doc_from_content(content, "head.md", .UTF8)
 					bgc := g_theme[.Bg_Base]
 					plat.gfx_begin_frame(&h.gfx, bgc[0], bgc[1], bgc[2])
-					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 					doc_close(&doc)
 					pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 					if !pok {
@@ -3859,7 +3859,7 @@ when NEWTPAD_TESTS {
 					doc := doc_from_content(content, "headbold.md", .UTF8)
 					bgc := g_theme[.Bg_Base]
 					plat.gfx_begin_frame(&h.gfx, bgc[0], bgc[1], bgc[2])
-					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 					doc_close(&doc)
 					pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 					if pok {
@@ -4012,7 +4012,7 @@ when NEWTPAD_TESTS {
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
 					// `bottom` is "just past the last line drawn": it only reaches
 					// the heading's line end if the heading was admitted.
-					bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+					bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 					if bottom < head_end {
 						refused += 1
 						continue
@@ -4055,7 +4055,7 @@ when NEWTPAD_TESTS {
 				copy(content, src)
 				doc := doc_from_content(content, "forced.md", .UTF8)
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ytop, 0)
+				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ytop, Md_Anchor{})
 				hchk(
 					&bad,
 					bottom > 0,
@@ -4258,13 +4258,13 @@ when NEWTPAD_TESTS {
 
 			bg := g_theme[.Bg_Base]
 			plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-			markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+			markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 			pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 			schk(&bad, pok, "seam: readback")
 			if !pok {return}
 			// The SAME arguments the draw was given. md_pane_box is what keeps
 			// main.odin's two call sites from having to be trusted to do this.
-			hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+			hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 			schk(&bad, len(hits) >= 4, fmt.tprintf("seam: all four fixture links are placed (%d rects)", len(hits)))
 
 			// A pixel is "link ink" when it is strongly the Link colour: close to
@@ -4466,7 +4466,7 @@ when NEWTPAD_TESTS {
 				before := md_layout_builds
 				bg := g_theme[.Bg_Base]
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				bottom = markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, 0)
+				bottom = markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 				return md_layout_builds - before, bottom
 			}
 
@@ -4481,8 +4481,8 @@ when NEWTPAD_TESTS {
 			// The rectangles are identical too, not merely the count: a cache that
 			// returned a stale layout after a width change would still return the
 			// right COUNT here.
-			ha := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0, context.temp_allocator)
-			hb := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0, context.temp_allocator)
+			ha := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+			hb := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
 			same := len(ha) == len(hb)
 			if same {
 				for i in 0 ..< len(ha) {
@@ -4552,7 +4552,7 @@ when NEWTPAD_TESTS {
 			// A Blank block has zero height, so md_block_fits never stops one. A
 			// document that is nothing but empty lines is therefore a chain of
 			// them, each doing a bounded forward line walk. Without
-			// MD_MAX_EMPTY_BLOCKS the walk is MD_MAX_BLOCKS * MD_BLANK_RUN_MAX
+			// MD_MAX_EMPTY_BLOCKS the walk is MD_WALK_BLOCKS * MD_BLANK_RUN_MAX
 			// capped line reads on the UI thread, up to three times a frame.
 			//
 			// Asserted on BUILDS rather than on wall-clock: a timing bound would
@@ -4656,7 +4656,7 @@ when NEWTPAD_TESTS {
 				defer doc_close(&doc)
 				bg := g_theme[.Bg_Base]
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 				pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				kchk(&bad, ok, "measure: readback")
 				if ok {
@@ -4720,13 +4720,13 @@ when NEWTPAD_TESTS {
 				UI_SCALE = 1
 				m1 := md_metrics(&h.text, px_)
 				cx1, meas1 := md_content_span(&m1, x0, x1)
-				h1 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0, context.temp_allocator)
+				h1 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
 				// The SAME document, the SAME pane, the cache warm from the pass
 				// above -- only the DPI moved.
 				UI_SCALE = 2
 				m2 := md_metrics(&h.text, px_)
 				cx2, meas2 := md_content_span(&m2, x0, x1)
-				h2 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0, context.temp_allocator)
+				h2 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
 				UI_SCALE = 1
 				// The isolation, stated: if the measure moved too, this would be a
 				// test of the measure term and would pass with ui_scale absent.
@@ -4763,7 +4763,7 @@ when NEWTPAD_TESTS {
 				ink :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot, hpx, cx: f32, W, H: int) -> (b, g, r: u8, ok: bool) {
 					bg := g_theme[.Bg_Base]
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, 0)
+					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 					pix, rok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 					if !rok {return}
 					best := -1
@@ -4843,7 +4843,7 @@ when NEWTPAD_TESTS {
 				shot :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot: f32) -> (pix: []u8, bottom: int, ok: bool) {
 					bg := g_theme[.Bg_Base]
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					bottom = markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, 0)
+					bottom = markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 					pix, ok = plat.gfx_readback_bgra(&h.gfx, context.allocator)
 					return
 				}
@@ -4960,7 +4960,7 @@ when NEWTPAD_TESTS {
 				copy(content, src)
 				doc := doc_from_content(content, "gap.md", .UTF8)
 				defer doc_close(&doc)
-				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0, context.temp_allocator)
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
 				for hh in hits {
 					if hh.url == "http://probe.example" {return hh.rect.pos.y}
 				}

@@ -512,7 +512,12 @@ main :: proc() {
 		// line still looked centred. editor_scrollbar_hit_x cedes the divider's
 		// left half back to it, so the reachable band matches the drawn line.
 		scrollbar_lo, scrollbar_hi := editor_scrollbar_hit_x(doc, ed_right)
-		if scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= scrollbar_lo && f32(window.mouse_x) < scrollbar_hi && window.mouse_y >= i32(CHROME_TOP) {
+		// In full Preview there IS no editor pane, so the one bar at the window
+		// edge belongs to the preview and is handled by the branch below. Without
+		// this the same pixels would start a byte-model drag on doc.top, and the
+		// preview would then be dragged around by the sync in row steps -- the
+		// model this task replaces, reachable through the bar alone.
+		if scrollbar_shown && doc.md_mode != .Preview && window.mouse_pressed && f32(window.mouse_x) >= scrollbar_lo && f32(window.mouse_x) < scrollbar_hi && window.mouse_y >= i32(CHROME_TOP) {
 			scrollbar_drag = true
 			vscroll_grab = vbar_grab_at(g_vbar_editor, f32(window.mouse_y))
 			window.mouse_pressed = false
@@ -524,16 +529,22 @@ main :: proc() {
 				scrollbar_drag = false
 			}
 		}
-		// Preview scrollbar (Markdown Split only), at the window edge.
-		if doc.md_mode == .Split && scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - SCROLLBAR_W && window.mouse_y >= i32(CHROME_TOP) {
+		// Preview scrollbar, at the window edge. In Split it is the second bar (the
+		// editor's sits at the divider); in Preview it is the only one.
+		if doc.md_mode != .Off && scrollbar_shown && window.mouse_pressed && f32(window.mouse_x) >= f32(window.width) - SCROLLBAR_W && window.mouse_y >= i32(CHROME_TOP) {
 			md_preview_drag = true
 			preview_grab = vbar_grab_at(g_vbar_preview, f32(window.mouse_y))
 			window.mouse_pressed = false
 		}
 		if md_preview_drag {
 			if window.mouse_down {
-				// Synced with the editor: the preview bar drives doc.top too.
-				vbar_drag_to(doc, &text, g_vbar_preview, f32(window.mouse_y), preview_grab, rows)
+				// The PREVIEW's own model: a fraction of md_max_anchor's range,
+				// inverted back to a pixel anchor. md_preview_scroll then carries
+				// the editor along by block (9.4).
+				if c, ok := md_scroll_ctx(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac); ok {
+					f := vbar_frac_at(g_vbar_preview, f32(window.mouse_y), preview_grab)
+					md_preview_scroll(doc, &c, &text, md_scroll_to_fraction(&c, f), rows)
+				}
 			} else {
 				md_preview_drag = false
 			}
@@ -866,9 +877,16 @@ main :: proc() {
 		// so Ctrl+wheel is how you scroll through a document while its links are lit.
 		// Zoom lives on the keyboard instead (Ctrl+= / Ctrl+- / Ctrl+0) and Settings.
 		if window.scroll_delta != 0 {
-			// In Markdown Split both halves share one scroll (doc.top), so the wheel
-			// over the preview falls through to the same doc_scroll as the editor.
-			if doc.table {
+			// The preview pane scrolls in PIXELS (9.1 item 4). Dispatch is by PANE,
+			// not by mode -- md_pane_owns, the same producer the link hit-test uses
+			// -- so in Split the wheel over the left half still moves the editor's
+			// rows and the wheel over the right half moves the preview's pixels,
+			// each carrying the other along by block.
+			if doc.kind == .Text && doc.md_mode != .Off && md_pane_owns(doc, f32(window.width), f32(window.height), app.settings.split_frac, f32(window.mouse_x)) {
+				if c, ok := md_scroll_ctx(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac); ok {
+					md_preview_scroll(doc, &c, &text, md_scroll_px(&c, doc.md_top, f32(window.scroll_delta) * md_wheel_px(&c)), rows)
+				}
+			} else if doc.table {
 				if doc.table_editing {table_edit_commit(doc)} // rows shift underfoot
 				if plat.key_shift_down() { // Shift+wheel pans table columns
 					doc.table_col = clamp(doc.table_col + window.scroll_delta, 0, table_max_col(doc))
@@ -969,6 +987,27 @@ main :: proc() {
 				plat.window_set_title(window, title)
 				copy(last[:], transmute([]u8)title)
 				last_len = len(title)
+			}
+		}
+
+		// 9.4's scroll sync, resolved at ONE point per frame, after every path
+		// that could have moved either side and before the draw reads them.
+		//
+		// The editor is byte-anchored and the preview is pixel-anchored, so this
+		// is a MAPPING, not the identity it used to be. doc.md_sync_top is the
+		// doc.top the preview last mirrored: every path that moves the PREVIEW
+		// writes it (md_preview_scroll), so a mismatch means the EDITOR moved --
+		// a caret reveal, the page keys, its own wheel or scrollbar, a session
+		// restore, or Ctrl+M turning the preview on -- and the preview re-anchors
+		// to the block containing that line.
+		//
+		// It runs in Preview as well as Split, and that is what makes a restored
+		// session, Ctrl+Home/End and the page keys all still move the preview
+		// without any of them knowing it exists.
+		if doc.kind == .Text && doc.md_mode != .Off && doc.top != doc.md_sync_top {
+			if c, ok := md_scroll_ctx(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac); ok {
+				doc.md_top = md_anchor_from_top(&c, doc.top)
+				doc.md_sync_top = doc.top
 			}
 		}
 
@@ -1253,15 +1292,65 @@ vbar_grab_at :: proc(b: Vbar, my: f32) -> f32 {
 	return 0
 }
 
-// One frame of a vertical scrollbar drag. Positions the THUMB (pointer minus the
-// grab) and converts that to a document fraction, rather than mapping the
-// pointer straight onto the track -- the difference between dragging a thumb and
-// teleporting it.
+// The fraction of the scrollable range a vertical drag is pointing at.
+//
+// Positions the THUMB (pointer minus the grab) and converts THAT, rather than
+// mapping the pointer straight onto the track -- the difference between dragging
+// a thumb and teleporting it. One expression, shared by the editor's bar and the
+// preview's, because the two bars now map onto different models and the only
+// thing keeping them honest is that the pointer-to-fraction half is identical.
+vbar_frac_at :: proc(b: Vbar, my, grab: f32) -> f32 {
+	return clamp(((my - grab) - b.track_y) / max(1, b.track_h - b.thumb_h), 0, 1)
+}
+
+// One frame of a vertical scrollbar drag, on the editor's byte model.
 vbar_drag_to :: proc(doc: ^Document, t: ^plat.Text, b: Vbar, my, grab: f32, rows: int) {
 	if !b.shown {return}
-	travel := max(1, b.track_h - b.thumb_h)
-	frac := ((my - grab) - b.track_y) / travel
-	doc_scroll_to_fraction(doc, t, clamp(frac, 0, 1), rows)
+	doc_scroll_to_fraction(doc, t, vbar_frac_at(b, my, grab), rows)
+}
+
+// The preview's vertical scrollbar geometry -- vscrollbar_geo's counterpart for
+// a pane that scrolls in pixels.
+//
+// It has to keep that procedure's hard-won property, and by the same argument:
+// the thumb's BOTTOM meets the track's bottom at the end of the scrollable
+// range, not its top, so the multiplier is the track minus the thumb and the
+// fraction is measured against the range's end. The range is the PREVIEW's own
+// (md_max_anchor) rather than the editor's doc_max_top, which is the defect this
+// replaces -- the preview covers roughly three times the source per screen that
+// the editor does, so mapping it against the editor's ceiling left the thumb
+// short and the last stretch of travel showing nothing new.
+//
+// The thumb's SIZE stays byte-proportional -- the visible byte span over the
+// document's length, exactly as the editor's is. A pixel-proportional size would
+// need the document's total HEIGHT, and measuring that means laying the document
+// out, which is the one thing viewport-first forbids.
+md_vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int, frac: f32) -> (b: Vbar) {
+	if doc == nil || doc.pt.length <= 0 {return}
+	b.x = x
+	b.track_y, b.track_h = scrollbar_track(doc, winh)
+	b.thumb_h = clamp(f32(bottom - doc.md_top.block) / f32(doc.pt.length) * b.track_h, sx(24), b.track_h)
+	b.thumb_y = clamp(b.track_y + frac * max(1, b.track_h - b.thumb_h), b.track_y, b.track_y + b.track_h - b.thumb_h)
+	b.shown = true
+	return
+}
+
+// One movement of the preview, and 9.4's write-back to the editor.
+//
+// THE producer of doc.md_top outside the sync itself: the wheel, the preview's
+// scrollbar drag and anything added later all come through here, so the
+// md_sync_top latch cannot be left behind by a path that forgot it -- which
+// would make the next frame's sync snap the preview back to the editor's line
+// and undo the gesture.
+//
+// 9.4, "scroll sync by block, not by line": the editor's top goes to the START
+// of the block the preview is showing. By block and not by line deliberately --
+// a line-based map drifts the moment a heading or a fence changes height, which
+// is the usual reason split views feel broken.
+md_preview_scroll :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, t: ^plat.Text, a: Md_Anchor, rows: int) {
+	doc.md_top = a
+	doc.top = min(md_anchor_top_byte(c, a), doc_max_top(doc, t, rows))
+	doc.md_sync_top = doc.top
 }
 
 hscrollbar_pos_at :: proc(b: Hbar, thumb_x: f32, m: Hscroll) -> int {
@@ -1308,10 +1397,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// reads -- so what is clickable and what is drawn cannot be laid out in
 		// two different rectangles.
 		if mx0, mx1, mytop, mybot, mok := md_pane_box(doc, f32(window.width), f32(window.height), rc.app.settings.split_frac); mok {
-			bottom = markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.top)
+			bottom = markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top)
 			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac))
 			}
+			// The anchor block is routinely PARTLY above the pane -- that is what a
+			// pixel offset is -- and there is no scissor rect here. See
+			// md_preview_clip.
+			md_preview_clip(gfx, quad_pipe, doc, f32(window.width), f32(window.height), rc.app.settings.split_frac)
 		}
 	} else if doc.table && doc.kind == .Text {
 		// Read-only grid view (CSV/TSV) replaces the text pass entirely.
@@ -1408,8 +1501,18 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	er := doc_editor_right(doc, w, rc.app.settings.split_frac)
 	total := doc.pt.length
 	if total > 0 && !doc.filter {
-		vb := vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom, text, rows)
-		g_vbar_editor = vb // what the press hit-tests against next frame
+		vb: Vbar
+		if doc.kind == .Text && doc.md_mode == .Preview {
+			// Full Preview replaces the editor pane, so the one bar at the window
+			// edge is the PREVIEW's and maps the preview's own pixel range. It goes
+			// to g_vbar_preview, which is the latch the press hit-test reads for
+			// this mode (the editor branch there is disabled in Preview).
+			vb = md_vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom, md_preview_frac(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
+			g_vbar_preview = vb
+		} else {
+			vb = vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom, text, rows)
+			g_vbar_editor = vb // what the press hit-tests against next frame
+		}
 		sb_h, th, ty := vb.track_h, vb.thumb_h, vb.thumb_y
 		track := plat.Quad{pos = {vb.x, vb.track_y}, size = {SCROLLBAR_TRACK_W, sb_h}, color = g_theme[.Bg_Raised]}
 		// Find-match ticks, drawn BETWEEN the track and the thumb.
@@ -1473,12 +1576,13 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// md_content_span a negative span, which max(1, ..) turns into a 1px
 		// measure and a column of one glyph per line.
 		if mx0, mx1, mytop, mybot, mok := md_pane_box(doc, w, h, rc.app.settings.split_frac); mok {
-			pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.top)
+			pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top)
 			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
 			}
+			md_preview_clip(gfx, quad_pipe, doc, w, h, rc.app.settings.split_frac)
 			if total > 0 {
-				pvb := vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom, text, rows)
+				pvb := md_vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom, md_preview_frac(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
 				g_vbar_preview = pvb
 				plat.quads_draw(
 					gfx,

@@ -1681,7 +1681,13 @@ md_fence_seed :: proc(doc: ^Document, top_byte: int) -> (in_fence: bool, fence_l
 // A resize changes `measure`, a zoom changes `px`, a monitor change `ui_scale`
 // and a theme switch `theme`, so each invalidates every entry wholesale without
 // a sweep -- every lookup simply misses.
-MD_LAYOUT_SLOTS :: 128
+// 256, not 128, since batch 17's pixel anchor: one walk now covers the pane
+// PLUS a pane below it (9.1's layout budget), and md_probe_back adds a pane
+// above on the scroll-up path. At ~40 blocks a pane, 128 slots would be
+// saturated by the walk itself and every frame would rebuild what the last one
+// built -- the cache turning into a cost, which is the exact thing
+// md_layout_slot's comment warns about.
+MD_LAYOUT_SLOTS :: 256
 
 // The longest run of blank lines collapsed into one Blank block. Blank runs
 // collapse so that a file of nothing but empty lines is a handful of blocks
@@ -1690,19 +1696,13 @@ MD_LAYOUT_SLOTS :: 128
 // walked to EOF on the UI thread by the first block.
 MD_BLANK_RUN_MAX :: 64
 
-// Blocks laid out in one pass. A Blank block has zero height, so the fit test
-// alone does not bound the walk; every other kind has a positive height and
-// blanks collapse into runs, which means at most two blocks per unit of height.
-// This is the belt to that braces.
-MD_MAX_BLOCKS :: 512
-
 // Zero-height blocks admitted in one pass.
 //
 // The fit test cannot stop a block that costs nothing, and blank runs only
 // alternate with content while every run FITS in one block. A file that is
 // nothing but empty lines produces a CHAIN of Blank blocks, each capped at
 // MD_BLANK_RUN_MAX and each costing a bounded forward line walk -- so without
-// this the worst case is MD_MAX_BLOCKS * MD_BLANK_RUN_MAX = 32k capped line
+// this the worst case is MD_WALK_BLOCKS * MD_BLANK_RUN_MAX = 16k capped line
 // reads on the UI thread, up to three times a frame while Ctrl is held. 64 * 64
 // = 4096 is the same order as MD_TABLE_MAX_ROWS and covers any real document:
 // content is what fills a pane, and content is not free.
@@ -2253,6 +2253,137 @@ md_content_span :: proc(m: ^Md_Metrics, x0, x1: f32) -> (cx, measure: f32) {
 	return cx, max(1, min(x1 - cx, m.measure))
 }
 
+// UI spec 9.1 item 4: "a scroll offset in PIXELS, not lines".
+//
+// The preview's position is a BLOCK plus a pixel offset into it -- the start
+// byte of the block at the top of the pane, and how many pixels of that block's
+// SLOT are scrolled above the pane's top edge.
+//
+// It is not a single pixel count measured from the document's first byte, and
+// that is the whole design decision. A pure offset cannot be resolved to a
+// position without laying out every block above it, which is exactly the
+// failure viewport-first exists to prevent (and exactly the temptation the 2c
+// brief names). The block byte is an identity that survives scrolling and costs
+// nothing to resolve; the `px` is the sub-block resolution the row grid used to
+// deny the preview.
+//
+// A block's SLOT is the collapsed gap that PRECEDES it plus the block itself,
+// so `px` lives in [0, gap + h). The gap is attributed to the block below it,
+// not above, because a scroll position inside a gap has to name one block and
+// the block below is the one whose glyphs are about to appear.
+//
+// Consequence, decided deliberately (2c brief, "md_pass applies the first
+// visible block's above"): the anchor block's space-ABOVE is drawn, and it is
+// now SCROLLABLE rather than a constant inset at the top of the pane. At
+// {0, 0} -- the top of the document -- the first block's `above` shows exactly
+// as it did under the byte anchor, so 9.3's spacing table is unchanged and so
+// is every assertion about it.
+Md_Anchor :: struct {
+	block: int, // start byte of the block at the top of the pane
+	px:    f32, // pixels of that block's slot scrolled above the pane top
+}
+
+// Everything md_max_anchor's answer is a function of. Compared whole, so a term
+// added to the layout later cannot be forgotten here without the compiler
+// noticing the struct changed shape -- and a SCROLL moves none of these, which
+// is what makes the cache free in the case that matters.
+Md_Max_Key :: struct {
+	rev:      u64,
+	measure:  f32,
+	px:       f32,
+	ui_scale: f32,
+	pane:     f32,
+	valid:    bool,
+}
+
+// One block as a walk measured it. `slot_top` is the top of the block's slot --
+// the gap that precedes it -- relative to the walk's own start, so the block's
+// glyphs begin at slot_top + gap and the slot ends at slot_top + gap + h.
+//
+// The layout POINTER is carried, not a copy, and that is safe only because
+// MD_WALK_BLOCKS == MD_LAYOUT_SLOTS: a walk performs at most one
+// md_layout_ensure per slot, every entry it touches is stamped with the current
+// md_layout_pass, and md_layout_slot picks the least recently used -- so it can
+// never select an entry this walk is still holding. Raise one constant without
+// the other and these pointers become use-after-free on `src`/`store`/`shape`.
+@(private = "file")
+Md_Walk_Block :: struct {
+	start:    int,
+	end:      int,
+	next:     int,
+	slot_top: f32,
+	gap:      f32,
+	h:        f32,
+	lay:      ^Md_Layout,
+}
+
+// Blocks one walk may hold at once. See Md_Walk_Block: this is not a tuning
+// knob, it is the layout cache's slot count, and the two must move together.
+MD_WALK_BLOCKS :: MD_LAYOUT_SLOTS
+
+// Lay blocks out forward from `from`, stopping at `limit_h` pixels of height, at
+// `stop_at` bytes, or at a bound -- whichever comes first.
+//
+// THE viewport-first primitive. Every walk over blocks in this file goes through
+// here, and every caller passes a height limit derived from the PANE. There is
+// no path that walks to the end of a document: `limit_h` and `len(out)` are both
+// hard, and the zero-height bound (MD_MAX_EMPTY_BLOCKS) covers the case a height
+// limit cannot see.
+@(private = "file")
+md_walk :: proc(
+	gfx: ^plat.Gfx,
+	text: ^plat.Text,
+	doc: ^Document,
+	m: ^Md_Metrics,
+	measure: f32,
+	from: int,
+	stop_at: int,
+	limit_h: f32,
+	out: []Md_Walk_Block,
+) -> (
+	n: int,
+	total: f32,
+	reached: bool,
+) {
+	if doc == nil {return}
+	buf: [RENDER_LINE_CAP]u8
+	p := clamp(from, 0, doc.pt.length)
+	// Seeded from the document's own lexer state at `from`, NOT from `false`: the
+	// opening fence can be anywhere above. See md_fence_seed.
+	in_fence, fence_lex := md_fence_seed(doc, p)
+	fence_state: base.Lex_State
+	// Adjacent margins collapse: the gap between two blocks is the larger of the
+	// upper one's space-below and the lower one's space-above, which is what
+	// browsers do and what 9.3's own numbers assume (a paragraph's 0.8 S and an
+	// h2's 1.6 S are not meant to sum). `prev_below` carries the upper half.
+	prev_below := f32(0)
+	empties := 0
+	reached = p > doc.pt.length || p >= stop_at
+	for p <= doc.pt.length && p < stop_at && n < len(out) && empties < MD_MAX_EMPTY_BLOCKS {
+		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+		nb := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
+		if nb > 0 && buf[nb - 1] == '\r' {nb -= 1}
+		lay := md_layout_ensure(gfx, text, doc, m, p, end, string(buf[:nb]), in_fence, fence_lex, fence_state, measure)
+		gap := max(prev_below, lay.above)
+		out[n] = {start = p, end = lay.end, next = lay.next, slot_top = total, gap = gap, h = lay.h, lay = lay}
+		n += 1
+		total += gap + lay.h
+		// See MD_MAX_EMPTY_BLOCKS: a zero-height block is invisible to a height
+		// limit, so it needs a bound of its own.
+		empties = empties + 1 if lay.h <= 0 else empties
+		prev_below = lay.below
+		in_fence, fence_lex, fence_state = lay.out_fence, lay.out_lex, lay.out_state
+		if lay.next > doc.pt.length {
+			reached = true
+			break
+		}
+		p = lay.next
+		reached = p >= stop_at
+		if total >= limit_h {break}
+	}
+	return
+}
+
 // One walk over the visible blocks, consumed by the draw and by the link pass.
 //
 // There is exactly ONE of these because the two consumers must not be able to
@@ -2261,11 +2392,12 @@ md_content_span :: proc(m: ^Md_Metrics, x0, x1: f32) -> (cx, measure: f32) {
 // the same inputs. `qp` is nil for the link pass, which is what turns the
 // painting off -- nothing else differs, not even the order.
 //
-// Viewport-first: blocks are built from `top_byte` forward and the walk stops
-// as soon as the pane is full. Nothing is laid out for the document. (9.1 also
-// asks for "a screen above" to be laid out; under a byte anchor there is no
-// such thing -- top_byte IS the first drawn byte, and nothing above it can be
-// on screen. It becomes reachable, and owed, with the pixel scroll offset.)
+// Viewport-first, and 9.1's layout budget: blocks are built from the anchor
+// forward and the walk stops one PANE past the bottom edge -- "the visible
+// blocks plus a screen below". The screen ABOVE is laid out by md_probe_back,
+// on the scroll-up path, where it is the thing being asked for rather than work
+// repeated three times a frame; see that procedure. Nothing is ever laid out
+// for the document.
 @(private = "file")
 md_pass :: proc(
 	gfx: ^plat.Gfx,
@@ -2274,65 +2406,61 @@ md_pass :: proc(
 	doc: ^Document,
 	px: f32,
 	x0, x1, ytop, ybot: f32,
-	top_byte: int,
+	at: Md_Anchor,
 	links: ^[dynamic]Md_Link_Hit,
 ) -> (
 	bottom: int,
 ) {
-	bottom = top_byte
+	bottom = at.block
 	if doc == nil {return}
 	md_layout_pass += 1 // see md_layout_slot: this pass's entries are not evictable
 	m := md_metrics(text, px)
 	cx, measure := md_content_span(&m, x0, x1)
-	buf: [RENDER_LINE_CAP]u8
-	y := ytop
-	p := top_byte
-	// Seeded from the document's own lexer state at top_byte, NOT from `false`:
-	// the opening fence can be anywhere above the viewport. See md_fence_seed.
-	in_fence, fence_lex := md_fence_seed(doc, top_byte)
-	fence_state: base.Lex_State
+	pane := max(1, ybot - ytop)
+	blocks := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	// The anchor's own scrolled-off part, the pane, and one pane below it.
+	n, _, _ := md_walk(gfx, text, doc, &m, measure, at.block, max(int), at.px + pane * 2, blocks)
 	if links != nil {link_cache_begin(doc)}
-	// Adjacent margins collapse: the gap between two blocks is the larger of the
-	// upper one's space-below and the lower one's space-above, which is what
-	// browsers do and what 9.3's own numbers assume (a paragraph's 0.8 S and an
-	// h2's 1.6 S are not meant to sum). `prev_below` carries the upper half.
-	prev_below := f32(0)
+	// The anchor block's SLOT top, in client pixels. Everything else in the pass
+	// is this plus the walk's own relative offsets -- one origin, so a block's
+	// draw y and its link rect's y cannot be two different numbers.
+	y0 := ytop - at.px
 	// The very first block is admitted unconditionally. A pane shorter than one
 	// h1 is reachable (the window floor is 240dp and the document font size is a
 	// user setting), and "no frame ever shows emptiness" outranks a heading whose
 	// bottom edge the cover strip trims. Spent once.
 	forced := true
-	empties := 0
-	for nblk := 0; p <= doc.pt.length && nblk < MD_MAX_BLOCKS && empties < MD_MAX_EMPTY_BLOCKS; nblk += 1 {
-		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
-		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
-		if n > 0 && buf[n - 1] == '\r' {n -= 1}
-		lay := md_layout_ensure(gfx, text, doc, &m, p, end, string(buf[:n]), in_fence, fence_lex, fence_state, measure)
-		gap := max(prev_below, lay.above)
+	for i in 0 ..< n {
+		b := blocks[i]
+		y := y0 + b.slot_top + b.gap
+		// Wholly above the pane: a zero-height anchor (a blank run), or an anchor
+		// whose px invariant an edit has broken underneath it. Reported as passed
+		// rather than drawn into the chrome, and it does NOT spend `forced` -- that
+		// belongs to the first block with something to show.
+		if y + b.h <= ytop {
+			bottom = b.end
+			continue
+		}
 		// The ONE consumer pair of the height the layout produced: this test and
-		// the advance below. Nothing else may size this block.
-		if !forced && !md_block_fits(y + gap, lay.h, ybot) {break}
+		// the walk's own advance. Nothing else may size this block.
+		if !forced && !md_block_fits(y, b.h, ybot) {break}
 		forced = false
-		y += gap
-		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, lay, cx, x1, y)}
-		if links != nil {md_block_links(doc, lay, cx, y, links)}
-		y += lay.h
-		// See MD_MAX_EMPTY_BLOCKS: a zero-height block is invisible to the fit
-		// test above, so it needs a bound of its own.
-		empties = empties + 1 if lay.h <= 0 else empties
-		prev_below = lay.below
-		bottom = lay.end
-		in_fence, fence_lex, fence_state = lay.out_fence, lay.out_lex, lay.out_state
-		if lay.next > doc.pt.length {break}
-		p = lay.next
+		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, b.lay, cx, x1, y)}
+		if links != nil {md_block_links(doc, b.lay, cx, y, links)}
+		bottom = b.end
 	}
 	return
 }
 
-// Render markdown source from `top_byte`, laid out in [x0,x1] x [ytop,ybot].
+// Render markdown source from `at`, laid out in [x0,x1] x [ytop,ybot].
 // Returns the byte offset just past the last line drawn (for scroll clamping).
-markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px: f32, x0, x1, ytop, ybot: f32, top_byte: int) -> (bottom: int) {
-	return md_pass(gfx, qp, text, doc, px, x0, x1, ytop, ybot, top_byte, nil)
+//
+// A partially-scrolled anchor block draws ABOVE ytop -- that is what a pixel
+// offset is -- and there is no scissor rect in this renderer, so the caller owes
+// this pane a cover strip over [0, ytop) exactly as it already owes one below
+// ybot. md_preview_clip is that strip.
+markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px: f32, x0, x1, ytop, ybot: f32, at: Md_Anchor) -> (bottom: int) {
+	return md_pass(gfx, qp, text, doc, px, x0, x1, ytop, ybot, at, nil)
 }
 
 // The links the preview would draw, in absolute client coordinates. The same
@@ -2342,9 +2470,9 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 // Called from the input phase (the hand cursor and the Ctrl+click test) where
 // the frame's draw has not run yet; the layout cache makes it a lookup per
 // block rather than a second shaping pass.
-markdown_links :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px: f32, x0, x1, ytop, ybot: f32, top_byte: int, allocator := context.temp_allocator) -> []Md_Link_Hit {
+markdown_links :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px: f32, x0, x1, ytop, ybot: f32, at: Md_Anchor, allocator := context.temp_allocator) -> []Md_Link_Hit {
 	out := make([dynamic]Md_Link_Hit, 0, 8, allocator)
-	md_pass(gfx, nil, text, doc, px, x0, x1, ytop, ybot, top_byte, &out)
+	md_pass(gfx, nil, text, doc, px, x0, x1, ytop, ybot, at, &out)
 	return out[:]
 }
 
@@ -2358,7 +2486,320 @@ markdown_links :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px: f32
 md_preview_links :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac: f32, allocator := context.temp_allocator) -> []Md_Link_Hit {
 	x0, x1, ytop, ybot, ok := md_pane_box(doc, winw, winh, split_frac)
 	if !ok {return nil}
-	return markdown_links(gfx, text, doc, px, x0, x1, ytop, ybot, doc.top, allocator)
+	return markdown_links(gfx, text, doc, px, x0, x1, ytop, ybot, doc.md_top, allocator)
+}
+
+// The preview's scroll fraction for this frame, or 0 when it has no pane. The
+// scrollbar's one call: it takes the pane box from md_pane_box, the same
+// producer the draw takes, so the thumb cannot be positioned against a pane the
+// content was not laid out in.
+md_preview_frac :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac: f32) -> f32 {
+	c, ok := md_scroll_ctx(gfx, text, doc, px, winw, winh, split_frac)
+	if !ok {return 0}
+	return md_scroll_frac(&c, doc.md_top)
+}
+
+// The cover strip a pixel-anchored preview owes its own pane, painted over
+// [0, ytop) of the pane's columns.
+//
+// There is no scissor rect in this renderer -- clipping is a strip painted after
+// the content (see main.odin's bottom strip and Split's right-half repaint) --
+// and a pixel offset means the anchor block is routinely drawn PARTIALLY above
+// the pane. Under the byte anchor nothing could sit above ytop, so this is
+// net-new and it is not optional: without it the top of the anchor block draws
+// across the tab rail's band. Called immediately after the preview's content
+// pass and before any chrome, exactly like the bottom strip.
+md_preview_clip :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, doc: ^Document, winw, winh, split_frac: f32) {
+	x0, x1, ytop, _, ok := md_pane_box(doc, winw, winh, split_frac)
+	if !ok || ytop <= 0 {return}
+	l := max(0, x0 - TEXT_MARGIN_X)
+	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {l, 0}, size = {x1 + SCROLLBAR_W - l, ytop}, color = doc_canvas_clear()}})
+}
+
+// --- the pixel scroll model (UI spec 9.1 item 4, 9.4) ------------------------
+//
+// Everything below moves an Md_Anchor. It is deliberately ALL in this file and
+// all built on md_walk: main.odin owns the gestures (wheel, drag, keys) and this
+// file owns what a pixel of preview means, so there is no second place that
+// knows how tall a block is.
+//
+// The one rule every procedure here obeys: no walk is unbounded, and no walk is
+// seeded from the document's start "to find out where we are". A position is
+// resolved from the anchor outwards, over a pane's worth of blocks.
+
+// The inputs every scroll query needs, taken ONCE from md_pane_box -- the same
+// producer markdown_draw and markdown_links take their box from. A scroll query
+// that measured a different pane than the draw would put the thumb somewhere the
+// content is not.
+Md_Scroll_Ctx :: struct {
+	gfx:     ^plat.Gfx,
+	text:    ^plat.Text,
+	doc:     ^Document,
+	m:       Md_Metrics,
+	measure: f32,
+	ytop:    f32,
+	pane:    f32,
+}
+
+md_scroll_ctx :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac: f32) -> (c: Md_Scroll_Ctx, ok: bool) {
+	x0, x1, ytop, ybot, box_ok := md_pane_box(doc, winw, winh, split_frac)
+	if !box_ok {return}
+	c = {gfx = gfx, text = text, doc = doc, m = md_metrics(text, px), ytop = ytop, pane = max(1, ybot - ytop)}
+	_, c.measure = md_content_span(&c.m, x0, x1)
+	return c, true
+}
+
+// `k` line starts back from `p`, bounded by the line-start scan cap. The only
+// backward motion in the preview, and the only reason it is safe is that every
+// caller bounds `k`.
+@(private = "file")
+md_line_start_back :: proc(doc: ^Document, p, k: int) -> int {
+	q := clamp(p, 0, doc.pt.length)
+	for _ in 0 ..< k {
+		if q <= 0 {break}
+		s, _ := base.pt_line_start_cap(&doc.pt, q - 1, RENDER_LINE_CAP)
+		if s >= q {break}
+		q = s
+	}
+	return q
+}
+
+// The starting point a forward walk needs so that laying out [s, stop_at) yields
+// at least `want_h` pixels -- 9.1's "a screen above", and the only way to move a
+// pixel anchor UPWARDS without a document-wide layout.
+//
+// It works by guessing a line count, walking forward, and doubling out if the
+// guess was short. The guess grows geometrically and is capped, so a blank-heavy
+// region (where a screen of height can cost thousands of source lines) simply
+// stops producing more height rather than walking to the top of the file -- the
+// anchor then clamps at the furthest point actually measured, and the next
+// scroll step continues from there. The walk that produced the height is
+// RETURNED, not thrown away, so the caller pays for one walk and the blocks land
+// in the layout cache warm for the frames that follow.
+@(private = "file")
+md_probe_back :: proc(c: ^Md_Scroll_Ctx, at, stop_at: int, want_h: f32, out: []Md_Walk_Block) -> (n, s: int, total: f32) {
+	s = clamp(at, 0, c.doc.pt.length)
+	lines := 24
+	for _ in 0 ..< 4 {
+		try := md_line_start_back(c.doc, at, lines)
+		tn, tt, reached := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, try, stop_at, max(f32), out)
+		// The walk could not span [try, stop_at) inside one walk's block budget,
+		// so `try` is further back than this model can represent. Keep the last
+		// span that did span, which is what the caller's arithmetic assumes.
+		if !reached {break}
+		n, s, total = tn, try, tt
+		if total >= want_h || try <= 0 {break}
+		lines *= 4
+	}
+	return
+}
+
+// One wheel step, in preview pixels: the preview's OWN body line height, so a
+// notch moves a line of what is on screen rather than a line of the source the
+// preview no longer lays out in rows. The notch count the platform reports is
+// unchanged, which keeps the feel identical at the default type scale.
+md_wheel_px :: proc(c: ^Md_Scroll_Ctx) -> f32 {
+	return c.m.body_lead
+}
+
+// The block containing byte `b`, and the height of its slot.
+//
+// Blocks tile the document ([start, next) with no gaps), so "the last block that
+// starts at or before b" IS the block containing b -- which a forward walk with
+// a stop_at of b+1 produces without a search.
+md_block_at_byte :: proc(c: ^Md_Scroll_Ctx, b: int) -> (start, next: int, slot: f32) {
+	if c.doc == nil {return}
+	target := clamp(b, 0, c.doc.pt.length)
+	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	// Eight lines is enough to swallow the only constructs whose block starts
+	// above their own line: a collapsed blank run and front matter. It is a
+	// bound, not a guess about content -- landing mid-run only means the anchor
+	// names a blank block that starts one line later, and a blank block is zero
+	// pixels tall, so no y moves.
+	from := md_line_start_back(c.doc, target, 8)
+	n, _, _ := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, from, target + 1, max(f32), out)
+	if n == 0 {return target, target + 1, 0}
+	last := out[n - 1]
+	return last.start, last.next, last.gap + last.h
+}
+
+// One block's slot height and extent, without a search. `start` must be a block
+// start; if it is not, the walk simply treats it as one.
+@(private = "file")
+md_slot_at :: proc(c: ^Md_Scroll_Ctx, start: int) -> (next: int, slot: f32) {
+	one: [1]Md_Walk_Block
+	n, _, _ := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, start, start + 1, max(f32), one[:])
+	if n == 0 {return start + 1, 0}
+	return one[0].next, one[0].gap + one[0].h
+}
+
+// The scroll position as ONE monotone scalar: bytes, with the fraction of the
+// anchor block that is scrolled past.
+//
+// This is what the scrollbar maps and what its drag inverts, and the two are
+// EXACT inverses by construction -- md_scroll_to_fraction rebuilds an anchor
+// whose scalar is the number it was given, so grabbing the thumb and holding
+// still moves nothing. (That property is vscrollbar_geo's, hard won; see its
+// comment. The fraction is here rather than plain bytes for the same reason
+// vscrollbar_geo divides by doc_max_top and not pt.length: without it the thumb
+// reads 1.0 while a block of travel is still left.)
+md_scroll_scalar :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> f32 {
+	next, slot := md_slot_at(c, a.block)
+	f := clamp(a.px / max(1, slot), 0, 1)
+	return f32(a.block) + f * f32(max(1, next - a.block))
+}
+
+// The last anchor with content still to show: the position at which the document
+// ends exactly at the pane's bottom edge. The preview's own doc_max_top.
+//
+// This is the fix for the measured defect 2b recorded: the preview covers about
+// three times as much SOURCE per screen as the editor does (a blank run is one
+// zero-height block), so the editor's doc_max_top let the preview scroll a long
+// way past its own last block and show nothing new. Its ceiling is its own now.
+//
+// Computed from the document's END, backwards -- one pane of layout, never the
+// document -- and cached on the key every term of it depends on, so scrolling
+// (which moves none of them) costs nothing after the first frame.
+md_max_anchor :: proc(c: ^Md_Scroll_Ctx) -> Md_Anchor {
+	doc := c.doc
+	if doc == nil || doc.pt.length <= 0 {return {}}
+	key := Md_Max_Key {
+		rev      = doc.revision,
+		measure  = c.measure,
+		px       = c.m.s,
+		ui_scale = c.m.ui_scale,
+		pane     = c.pane,
+		valid    = true,
+	}
+	if doc.md_max_key == key {return doc.md_max}
+	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	n, s, total := md_probe_back(c, doc.pt.length, max(int), c.pane, out)
+	a := Md_Anchor{s, 0}
+	if rel := total - c.pane; rel > 0 && n > 0 {
+		for i in 0 ..< n {
+			b := out[i]
+			if rel < b.slot_top + b.gap + b.h || i == n - 1 {
+				a = {b.start, clamp(rel - b.slot_top, 0, b.gap + b.h)}
+				break
+			}
+		}
+	}
+	doc.md_max, doc.md_max_key = a, key
+	return a
+}
+
+// Is `a` at or past `b` in scroll order? Byte first, pixels inside a block --
+// the same order md_scroll_scalar is monotone in, without its walk.
+@(private = "file")
+md_anchor_ge :: #force_inline proc(a, b: Md_Anchor) -> bool {
+	return a.block > b.block || (a.block == b.block && a.px >= b.px)
+}
+
+// Clamp an anchor into [{0,0}, md_max_anchor]. Every producer of an anchor ends
+// here, so "you cannot scroll past the end" is one expression and not five.
+md_scroll_clamp :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> Md_Anchor {
+	mx := md_max_anchor(c)
+	if md_anchor_ge(a, mx) {return mx}
+	if a.block <= 0 && a.px <= 0 {return {}}
+	return a
+}
+
+// Move the preview by `dy` PIXELS. Positive is down. 9.1 item 4, as a gesture.
+md_scroll_px :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, dy: f32) -> Md_Anchor {
+	if c.doc == nil || dy == 0 {return a}
+	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	res := a
+	if dy > 0 {
+		target := a.px + dy
+		// One pane past the target, so the blocks the next frame draws are laid
+		// out here and the frame after it is a cache hit -- 9.1's "a screen
+		// below", on the gesture that needs it.
+		n, _, _ := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, a.block, max(int), target + c.pane, out)
+		for i in 0 ..< n {
+			b := out[i]
+			if target < b.slot_top + b.gap + b.h || i == n - 1 {
+				res = {b.start, target - b.slot_top}
+				break
+			}
+		}
+	} else {
+		// 9.1's "a screen above": ask the probe for the step PLUS a pane, so the
+		// blocks above the new position are warm rather than rebuilt next frame.
+		n, s, total := md_probe_back(c, a.block, a.block, -dy + c.pane, out)
+		target := total + a.px + dy
+		if target <= 0 || n == 0 {
+			res = {s, 0}
+		} else {
+			for i in 0 ..< n {
+				b := out[i]
+				if target < b.slot_top + b.gap + b.h || i == n - 1 {
+					res = {b.start, clamp(target - b.slot_top, 0, b.gap + b.h)}
+					break
+				}
+			}
+		}
+	}
+	return md_scroll_clamp(c, res)
+}
+
+// The scroll position as a fraction of the scrollable range, for the scrollbar.
+// 0 at the top, exactly 1 at md_max_anchor -- so the thumb's BOTTOM meets the
+// track's bottom when the document's last block does the pane's, which is the
+// property vscrollbar_geo's comment exists to protect.
+md_scroll_frac :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> f32 {
+	mx := md_max_anchor(c)
+	den := md_scroll_scalar(c, mx)
+	if den <= 0 {return 0}
+	return clamp(md_scroll_scalar(c, a) / den, 0, 1)
+}
+
+// The inverse of md_scroll_frac, for a scrollbar drag. Exact: the anchor this
+// returns has the scalar it was asked for (see md_scroll_scalar).
+md_scroll_to_fraction :: proc(c: ^Md_Scroll_Ctx, frac: f32) -> Md_Anchor {
+	mx := md_max_anchor(c)
+	t := clamp(frac, 0, 1) * md_scroll_scalar(c, mx)
+	start, next, slot := md_block_at_byte(c, int(t))
+	px := (t - f32(start)) / f32(max(1, next - start)) * slot
+	return md_scroll_clamp(c, {start, clamp(px, 0, slot)})
+}
+
+// 9.4, "scroll sync by block, not by line": the preview position that
+// corresponds to the editor's top line. The editor stays byte-anchored and the
+// preview is pixel-anchored, so the sync is a MAPPING -- this is the map, and
+// md_anchor_top_byte below is its inverse.
+md_anchor_from_top :: proc(c: ^Md_Scroll_Ctx, top: int) -> Md_Anchor {
+	start, _, _ := md_block_at_byte(c, top)
+	return md_scroll_clamp(c, {start, 0})
+}
+
+// The other direction of 9.4's sync: the source line the editor should put at
+// its top when the preview is at `a`. A block start is a line start, so this is
+// the block's own byte -- the mapping is by BLOCK, which is the point: mapping
+// by line drifts the moment a heading or a fence changes height.
+md_anchor_top_byte :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> int {
+	if c.doc == nil {return 0}
+	return base.pt_line_start(&c.doc.pt, clamp(a.block, 0, c.doc.pt.length))
+}
+
+// 9.1's one surviving pixel -> content mapping: "click-to-sync-scroll, which
+// only needs the nearest BLOCK, not the nearest glyph. Store each block's y
+// range and binary-search it."
+//
+// The y ranges are the walk's, so they are the ranges the draw used; the search
+// is a binary one over them because they are sorted by construction. Returns the
+// start byte of the block under `y`, and false when the pane holds nothing.
+md_block_at_y :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, y: f32) -> (start: int, ok: bool) {
+	if c.doc == nil {return}
+	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	n, _, _ := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, a.block, max(int), a.px + c.pane, out)
+	if n == 0 {return}
+	rel := (y - c.ytop) + a.px // into the walk's own space
+	lo, hi := 0, n - 1
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if out[mid].slot_top <= rel {lo = mid} else {hi = mid - 1}
+	}
+	return out[lo].start, true
 }
 
 // Collect one block's link rectangles, gated exactly as the editor pane's are:
