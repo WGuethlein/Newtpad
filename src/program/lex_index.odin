@@ -243,7 +243,9 @@ lex_index_fence_open :: proc(doc: ^Document, before: int) -> (line_start: int, f
 // on a huge file in filter mode. So filtered rows get a much smaller window:
 // bounded per-frame cost, traded against being more likely to bail to
 // .Normal on a long comment. That trade is a documented limitation of the
-// filter view on huge files, not something hidden — see task-3-report.md.
+// filter view on huge files, not something hidden -- it is written down right
+// here, at the constant it explains, rather than in a per-batch scratch
+// report that stops resolving to anything once the batch ships.
 LEX_RESYNC_WINDOW :: 64 * 1024
 LEX_FILTER_RESYNC_WINDOW :: 4 * 1024
 

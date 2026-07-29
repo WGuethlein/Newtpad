@@ -729,17 +729,39 @@ md_row_fits :: #force_inline proc(y, px, line_h, ybot: f32) -> bool {
 	return y - px + line_h <= ybot
 }
 
-// Does this line (already left-trimmed) open or close a fenced code block?
+// Does this line (RAW, not pre-trimmed -- see below) open or close a fenced
+// code block?
 //
 // One predicate, used by markdown_draw's toggle AND by mdfencetest's walk, so
-// the test cannot pass while agreeing with a rule the draw doesn't apply. Note
-// it is LOOSER than base.lex_markdown's own fence rule in one respect: that one
-// caps the indent at 3 spaces (CommonMark) and never sees tabs. The looser side
-// is the drawing one, which only ever means md_fence_seed below declines to
-// seed -- i.e. falls back to exactly the pre-fix behaviour -- never that it
-// seeds a fence the draw would not have entered. See md_fence_seed.
-md_is_fence_line :: #force_inline proc(trimmed: string) -> bool {
-	return strings.has_prefix(trimmed, "```") || strings.has_prefix(trimmed, "~~~")
+// the test cannot pass while agreeing with a rule the draw doesn't apply.
+//
+// CORRECTED (2026-07 review, Finding 2): this used to take an already
+// `strings.trim_left(line, " \t")`-ed string and check only the prefix, which
+// made it LOOSER than base.lex_markdown's mk_leading_spaces/mk_match_fence in
+// a way that mattered once the drawer's toggle started SEEDING from the
+// lexer's state (md_fence_seed): a line indented 4+ spaces, or led by a tab,
+// toggled here but was invisible to the lexer. The old comment claimed that
+// divergence "only ever means md_fence_seed declines to seed... never that it
+// seeds a fence the draw would not have entered" -- false. The fence bit is
+// PARITY (an even/odd count of toggle lines since the top), not membership in
+// a set, so an ODD number of such lines above top_byte flips md_fence_seed's
+// answer the WRONG way relative to what a walk from byte 0 actually draws
+// (mdfencetest's indented-fence case pins this). Fixed by mirroring
+// mk_leading_spaces + mk_match_fence exactly instead of trimming: an indent of
+// 4+ columns is CommonMark's indented-code-block rule, not a fence-opener, and
+// a tab does not count as indent at all here (matching mk_leading_spaces,
+// which only ever advances past `' '`) -- so a tab-led line's lead is 0 and
+// its first byte is the tab itself, never a backtick or tilde. This is now
+// the SAME rule the lexer applies, not merely a looser one that fails safe.
+md_is_fence_line :: proc(line: string) -> bool {
+	lead := 0
+	for lead < len(line) && lead < 4 && line[lead] == ' ' {lead += 1}
+	if lead > 3 || lead >= len(line) {return false}
+	ch := line[lead]
+	if ch != '`' && ch != '~' {return false}
+	run := 0
+	for lead + run < len(line) && line[lead + run] == ch {run += 1}
+	return run >= 3
 }
 
 // The fence state markdown_draw must START in when it begins drawing at
@@ -769,12 +791,48 @@ md_is_fence_line :: #force_inline proc(trimmed: string) -> bool {
 // Two documented ways this seeds `false` where a draw from byte 0 would have
 // been inside a fence, both of them the pre-fix behaviour and neither of them a
 // new wrong answer:
-//   - doc.path has no .md/.markdown extension (an unsaved buffer switched into
-//     preview), so highlight_lexer_for picks no lexer and the state is .Normal.
-//   - the opening fence is indented 4+ spaces or by a tab, which md_is_fence_line
-//     accepts and base.lex_markdown deliberately does not.
+//   - doc.path's extension isn't in EXT_LEXERS with base.lex_markdown (an
+//     unsaved buffer switched into preview, or -- before this task's Finding 1
+//     fix -- one of .mkd/.mdown/.mdwn/.mdtext/.mdx/.mtext, which
+//     doc_is_markdownish (doc.odin's MARKDOWN_EXTS) let into Preview but
+//     EXT_LEXERS never gave a lexer), so highlight_lexer_for picks no lexer
+//     and the state is .Normal.
+//   - the opening fence is indented 4+ spaces or led by a tab, which
+//     base.lex_markdown deliberately does not treat as a fence-opener
+//     (CommonMark: 4+ columns is an indented code block instead) and
+//     md_is_fence_line now agrees (see its own comment, Finding 2) -- so the
+//     seed correctly stays out, matching what a walk from byte 0 would do.
 md_fence_seed :: proc(doc: ^Document, top_byte: int) -> (in_fence: bool, fence_lex: Lexer_Proc) {
 	if doc == nil || top_byte <= 0 {return false, nil}
+	// Finding 4 (2026-07 review): in .Preview mode markdown_draw REPLACES the
+	// text pass (main.odin's .Preview branch), so doc_draw's bootstrap resync
+	// never runs and this doc_lex_state_at call is net-new per-frame work.
+	// base.lex_markdown_resync_valid ALWAYS rejects (see its own comment --
+	// "```" toggles rather than having distinct open/close forms, so a bounded
+	// window can't know the state without full parity since byte 0), and a
+	// mapped document never gets the background per-line index
+	// (lex_index_start refuses to run over mapped content -- see
+	// Lex_State_Index's struct comment), so doc_lex_state_at always falls
+	// through to lex_resync_state for one. lex_resync_state's own
+	// window-exhausted branch (`if win_start != 0 {return .Normal, true}`)
+	// means: whenever top_byte sits further than LEX_RESYNC_WINDOW past byte
+	// 0, the backward anchor scan can never reach byte 0, every candidate gets
+	// rejected by the always-false validator, and the answer is PROVABLY
+	// .Normal -- bought at a 64 KiB pt_read plus the candidate-validation loop
+	// (up to LEX_RESYNC_MAX_VALIDATE_BYTES), every frame, for a constant.
+	// Skipping straight to that constant in exactly this case is a pure cost
+	// cut, not a behaviour change.
+	//
+	// Deliberately NOT "if doc.fv.mapped {return false, nil}" unconditionally:
+	// when top_byte <= LEX_RESYNC_WINDOW the backward scan DOES reach byte 0
+	// (unambiguously .Normal on its own -- see lex_resync_state), so
+	// lex_resync_state does a real forward lex from byte 0 to top_byte and can
+	// return a genuine non-.Normal answer. That is exactly the case this
+	// task's fix exists for on a large (mapped, >= plat.FILE_MMAP_THRESHOLD)
+	// file scrolled only partway in -- an unconditional mapped-skip would
+	// silently reintroduce Wyatt's original bug for it, so the guard checks
+	// top_byte against the window too, not "mapped" alone.
+	if doc.fv.mapped && top_byte > LEX_RESYNC_WINDOW {return false, nil}
 	if doc_lex_state_at(doc, top_byte, LEX_RESYNC_WINDOW) == .Normal {return false, nil}
 	in_fence = true
 	if open, ok := lex_index_fence_open(doc, top_byte); ok {
@@ -805,6 +863,18 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	// One mapping means a lexer added for a file type is immediately available
 	// inside a fence, and the two can never disagree about what "cs" means.
 	fence_lex: Lexer_Proc = seed_lex
+	// Finding 3 (2026-07 review): always starts .Normal, even when md_fence_seed
+	// supplied a seed_lex -- Lex_State is scalar (see md_fence_seed's own
+	// comment on why it cannot carry the fence's language tag), and there is
+	// nowhere to seed a fence LANGUAGE's internal state (e.g. an open `/* */`
+	// in a json/c block) FROM, since lex_index_fence_open only ever locates the
+	// fence-open LINE, not the token state partway through the block's body at
+	// top_byte. Net effect: scrolling into the MIDDLE of a fenced block whose
+	// language lexer is itself stateful (a `/* */` comment spanning into the
+	// visible region) colours the visible remainder as if the comment were
+	// closed, until scrolled up to where it actually opens. Bounded to the
+	// viewport, and strictly better than the pre-fix "whole rest of the file
+	// is a code block" bug -- not fixed here, just no longer a surprise.
 	fence_state: base.Lex_State
 	// YAML front matter reads as a small card rather than as body text with two
 	// horizontal rules around it, which is what `---` on its own line otherwise
@@ -831,7 +901,7 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		line := string(buf[:n])
 		trimmed := strings.trim_left(line, " \t")
 
-		if md_is_fence_line(trimmed) {
+		if md_is_fence_line(line) {
 			in_fence = !in_fence
 			if in_fence {
 				fence_lex, fence_state = md_fence_lexer(trimmed), .Normal

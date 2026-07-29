@@ -256,6 +256,12 @@ EXT_LEXERS := [?]struct {
 	{".sql", lex_c_sql_adapt, true, "*/", lex_c_sql_valid},
 	{".md", base.lex_markdown, true, "```", base.lex_markdown_resync_valid},
 	{".markdown", base.lex_markdown, true, "```", base.lex_markdown_resync_valid},
+	{".mkd", base.lex_markdown, true, "```", base.lex_markdown_resync_valid},
+	{".mdown", base.lex_markdown, true, "```", base.lex_markdown_resync_valid},
+	{".mdwn", base.lex_markdown, true, "```", base.lex_markdown_resync_valid},
+	{".mdtext", base.lex_markdown, true, "```", base.lex_markdown_resync_valid},
+	{".mdx", base.lex_markdown, true, "```", base.lex_markdown_resync_valid},
+	{".mtext", base.lex_markdown, true, "```", base.lex_markdown_resync_valid},
 	{".csv", lex_delimited_csv_adapt, false, "", nil},
 	{".tsv", lex_delimited_tsv_adapt, false, "", nil},
 	{".ini", lex_config_adapt, false, "", nil},
@@ -304,6 +310,29 @@ highlight_check_ext_tables :: proc() {
 		base.log_error("EXT_LEXERS: stateful entry %q has no resync_anchor -- its rows will silently mis-colour", offender)
 		panic("EXT_LEXERS: a stateful lexer must register a resync_anchor")
 	}
+	if ok, offender := highlight_markdown_exts_ok(); !ok {
+		base.log_error("EXT_LEXERS: %q is in doc_is_markdownish (doc.odin's MARKDOWN_EXTS) but has no base.lex_markdown entry here -- Ctrl+M preview on that extension gets no fence-state seeding", offender)
+		panic("EXT_LEXERS: every MARKDOWN_EXTS entry must register base.lex_markdown")
+	}
+}
+
+// The guard that keeps doc.odin's MARKDOWN_EXTS (what Ctrl+M preview will
+// enter) and this file's EXT_LEXERS (what actually gets a lexer) from
+// drifting apart the way they did when six of MARKDOWN_EXTS's eight
+// extensions were only ever wired into the doc.odin list: highlight_lexer_for
+// returned nil for those, so doc_lex_state_at reported .Normal unconditionally
+// and md_fence_seed's fence-state seeding was silently dead on everything but
+// .md/.markdown. Not expressible as a compile-time #assert for the same
+// reason highlight_ext_tables_ok above isn't (EXT_LEXERS is a runtime array
+// of composite literals; Odin has no compile-time loop to fold it with) --
+// so this is a runtime predicate, checked at startup (highlight_check_ext_tables)
+// and asserted directly by lexcoveragetest.
+highlight_markdown_exts_ok :: proc() -> (ok: bool, offender: string) {
+	for ext in MARKDOWN_EXTS {
+		lexer, _, _, _ := highlight_lexer_for(ext) // ext already starts with '.', a valid "path" for the extension-matching logic
+		if lexer == nil {return false, ext}
+	}
+	return true, ""
 }
 
 // The complete, EXPLICIT list of extensions in text_exts.txt that

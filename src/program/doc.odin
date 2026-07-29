@@ -318,8 +318,16 @@ path_has_ext :: proc(path: string, exts: []string) -> bool {
 doc_is_tabular :: proc(doc: ^Document) -> bool {
 	return doc != nil && path_has_ext(doc.path, {".csv", ".tsv", ".tab", ".psv"})
 }
+// The extensions Ctrl+M preview will enter. EXT_LEXERS (highlight.odin) must
+// register base.lex_markdown for every one of these, or a file with one of
+// the six less-common extensions enters Preview with no lexer at all --
+// md_fence_seed's doc_lex_state_at then always reports .Normal, silently
+// undoing the fence-state seeding fix these two lists exist together to
+// support. highlight_markdown_exts_ok (highlight.odin) is the guard that
+// keeps the two lists from drifting apart again; lexcoveragetest asserts it.
+MARKDOWN_EXTS := []string{".md", ".markdown", ".mkd", ".mdown", ".mdwn", ".mdtext", ".mdx", ".mtext"}
 doc_is_markdownish :: proc(doc: ^Document) -> bool {
-	return doc != nil && path_has_ext(doc.path, {".md", ".markdown", ".mkd", ".mdown", ".mdwn", ".mdtext", ".mdx", ".mtext"})
+	return doc != nil && path_has_ext(doc.path, MARKDOWN_EXTS)
 }
 
 // May the active document enter (or leave) each view? Already being in the view

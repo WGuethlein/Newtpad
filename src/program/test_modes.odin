@@ -2432,7 +2432,13 @@ when NEWTPAD_TESTS {
 			mf_walk :: proc(doc: ^Document, start_line: int, out: []bool) {
 				p := mf_line_offset(doc, start_line)
 				in_fence, _ := md_fence_seed(doc, p)
-				buf: [1024]u8
+				// Finding 5 (2026-07 review): must match markdown_draw's own
+				// [RENDER_LINE_CAP]u8 line buffer, not an independent [1024]u8 --
+				// the "same walk" this test's own header comment claims only
+				// holds if a line longer than 1024 bytes (shorter than
+				// RENDER_LINE_CAP) doesn't get silently truncated here while the
+				// draw reads the whole thing.
+				buf: [RENDER_LINE_CAP]u8
 				for i in 0 ..< len(out) {
 					if p > doc.pt.length {
 						out[i] = false
@@ -2441,8 +2447,8 @@ when NEWTPAD_TESTS {
 					end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
 					n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
 					if n > 0 && buf[n - 1] == '\r' {n -= 1}
-					trimmed := strings.trim_left(string(buf[:n]), " \t")
-					if md_is_fence_line(trimmed) {
+					line := string(buf[:n])
+					if md_is_fence_line(line) {
 						in_fence = !in_fence
 						out[i] = false // the fence line draws no body of its own
 					} else {
@@ -2540,6 +2546,48 @@ when NEWTPAD_TESTS {
 			bad := 0
 			mf_run(&bad, "```json", "backtick fence")
 			mf_run(&bad, "~~~yaml", "tilde fence")
+
+			// Finding 2 (2026-07 review): md_is_fence_line used to
+			// `strings.trim_left(line, " \t")` unconditionally before checking
+			// the "```"/"~~~" prefix -- LOOSER than base.lex_markdown's
+			// mk_leading_spaces/mk_match_fence, which caps the indent at 3
+			// columns (CommonMark: 4+ is an indented code block, not a
+			// fence-opener) and never treats a tab as indent at all. The fence
+			// bit is PARITY, not set membership, so a line the drawer toggled
+			// on but the lexer never saw could flip md_fence_seed's answer the
+			// WRONG way -- not merely "decline to seed" as the old (also
+			// fixed) comment claimed. This fixture is the reviewer's exact
+			// failing case: line 0 is a 4-space-indented "```json" (the lexer
+			// never opens a fence there), line 1 is an UNINDENTED "```" (both
+			// sides must agree this opens one), so "body text" on line 2 is
+			// genuinely inside a fence. Before the fix, the drawer's own walk
+			// from byte 0 counted line 0 as a toggle too, so two toggles
+			// cancelled out and it disagreed with the lexer-driven seed.
+			{
+				fixture := "    ```json\n```\nbody text\n"
+				doc := doc_from_content(transmute([]u8)strings.clone(fixture), "x.md", .UTF8)
+				defer doc_close(&doc)
+				doc.md_mode = .Preview
+				lex_index_start(&doc)
+				t0 := time.tick_now()
+				for !lex_index_done(&doc) && time.duration_seconds(time.tick_since(t0)) < 5 {
+					time.sleep(time.Millisecond)
+				}
+				mf_chk(&bad, lex_index_done(&doc), "indent fixture: background lex index built")
+
+				truth: [3]bool
+				mf_walk(&doc, 0, truth[:])
+				// The discriminating assertion: false under the reverted
+				// (trim-based) predicate, since there line 0 also toggles and
+				// cancels line 1's real toggle.
+				mf_chk(&bad, truth[2], "indent fixture: walk from byte 0 says body text is inside the fence line 1 opened")
+
+				body_off := mf_line_offset(&doc, 2)
+				seed_in, _ := md_fence_seed(&doc, body_off)
+				mf_chk(&bad, seed_in, "indent fixture: seed at body text also says inside a fence")
+				mf_chk(&bad, seed_in == truth[2], "indent fixture: seed agrees with the walk from byte 0")
+			}
+
 			fmt.printfln("mdfencetest: %d failures", bad)
 			return true
 		}
@@ -13652,6 +13700,19 @@ when NEWTPAD_TESTS {
 				"  %-6s every stateful EXT_LEXERS entry registers a resync_anchor%s",
 				"ok" if anchors_ok else "FAIL",
 				"" if anchors_ok else fmt.tprintf(" (%s does not)", offender),
+			)
+			// The other list this table must agree with: doc_is_markdownish's
+			// MARKDOWN_EXTS (doc.odin) admits eight extensions into Ctrl+M preview,
+			// and every one of them needs a base.lex_markdown row here or
+			// md_fence_seed's fence-state seeding is silently dead on it (see
+			// highlight_markdown_exts_ok's own comment). Six of the eight were
+			// missing until this task.
+			md_exts_ok, md_offender := highlight_markdown_exts_ok()
+			if !md_exts_ok {fail = true}
+			fmt.printfln(
+				"  %-6s every MARKDOWN_EXTS entry has an EXT_LEXERS lexer%s",
+				"ok" if md_exts_ok else "FAIL",
+				"" if md_exts_ok else fmt.tprintf(" (%s does not)", md_offender),
 			)
 			fmt.printfln("  examined %d extensions from text_exts.txt", seen)
 			fmt.println("lexcoveragetest: FAILURES" if fail else "lexcoveragetest: all ok")
