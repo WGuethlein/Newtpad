@@ -5198,6 +5198,53 @@ when NEWTPAD_TESTS {
 				schk(&bad, builds >= vis * 2 - 2, fmt.tprintf("budget: ...and it really does lay out the screen BELOW, not just the visible blocks (%d builds vs %d visible)", builds, vis))
 			}
 
+			// --- B2. the same budget, at a MID-document anchor ------------------
+			//
+			// Section B's bound is calibrated at Md_Anchor{} -- the origin -- where
+			// MD_RUNUP_LINES' run-up costs nothing: there is no predecessor before
+			// byte 0 to walk back to. A resolved anchor further into the document
+			// pays that run-up on every walk that resolves it (md_anchor_walk), and
+			// the origin's bound says nothing about that cost. This is its OWN
+			// assertion rather than a loosening of B's: they are different costs
+			// (one screen's worth vs. one screen's worth plus a fixed run-up), and
+			// folding them into one bound would hide that a click deep in the
+			// document costs more per pass than one at the top.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< 200 {fmt.sbprintf(&b, "para %03d xx\n", i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "budget_mid.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				schk(&bad, cok, "budget-mid: the scroll context comes from the same md_pane_box the draw does")
+
+				// Block 100 of 200 -- resolved through the same mapping a Split
+				// click's sync uses (md_anchor_from_top), not hand-built, so the
+				// anchor is one the product can actually land on.
+				at := md_anchor_from_top(&c, 100 * 12)
+				schk(&bad, at.block == 100 * 12, fmt.tprintf("budget-mid: the anchor resolves to the block boundary it named (%d)", at.block))
+
+				md_layout_reset(&doc)
+				before := md_layout_builds
+				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				builds := md_layout_builds - before
+				vis := (bottom - at.block) / 12 + 1
+				schk(&bad, vis >= 3 && vis <= 40, fmt.tprintf("budget-mid: the pane holds several blocks from the anchor (%d)", vis))
+				// The honest bound: section B's pane-plus-a-screen-below budget,
+				// PLUS the fixed MD_RUNUP_LINES cost the origin case never pays.
+				// One block per source line on this fixture, so MD_RUNUP_LINES
+				// lines of run-up is MD_RUNUP_LINES blocks of build, not a fraction
+				// of it -- if the run-up ever stops being bounded by that constant,
+				// this is the assertion that notices.
+				schk(&bad, builds <= vis * 3 + MD_RUNUP_LINES, fmt.tprintf("budget-mid: a mid-anchor pass lays out the pane, a screen below, and its OWN run-up -- not the document (%d builds, %d visible, +%d run-up allowance)", builds, vis, MD_RUNUP_LINES))
+				schk(&bad, builds >= vis * 2 - 2, fmt.tprintf("budget-mid: ...and it still lays out the screen BELOW too (%d builds vs %d visible)", builds, vis))
+			}
+
 			// --- C. the preview's own end of travel, and its scrollbar --------
 			//
 			// The defect 2b measured and left for this task: a blank RUN is one
@@ -5397,6 +5444,85 @@ when NEWTPAD_TESTS {
 				// one case the search must not get from a fallback.
 				top_blk, top_ok := md_block_at_y(&c, at, ytop + 1)
 				schk(&bad, top_ok && top_blk == at.block, fmt.tprintf("at_y: the pane's top row is the anchor's own block (%d vs %d)", top_blk, at.block))
+			}
+
+			// --- E. the Split click's own gate: bounded to the preview pane ---
+			//
+			// Review defect: main.odin's click-to-sync-scroll gated on `ro` alone.
+			// `ro` (ro_surface_swallows) is true for the status bar and the find
+			// bar too -- both run through this code before their OWN guards,
+			// further down the same frame -- and true for the EDITOR half
+			// whenever the document is also a table, since ro_surface_swallows
+			// answers from `table` alone, not from which pane the press is in.
+			// Fixed by requiring x >= ed_right and y inside the pane box
+			// md_scroll_ctx already returns -- now md_split_click_gate's own
+			// job (main.odin), not something re-derived here.
+			//
+			// `gated` calls THAT proc, the same one main()'s WM_LBUTTONDOWN path
+			// calls, rather than a copy of its condition -- main() itself cannot
+			// run in a headless test, but the gate it delegates to can, and a
+			// dropped term in the real gate fails these checks, not just a
+			// hand-rolled stand-in for it.
+			{
+				gated :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ed_right, mx, my: f32) -> (blk: int, hit: bool) {
+					ro := ro_surface_swallows(doc.table, doc.md_mode, mx >= ed_right, Drag_Latches{})
+					return md_split_click_gate(doc, c, ro, ed_right, mx, my)
+				}
+
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< 60 {fmt.sbprintf(&b, "para %03d text here\n", i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "gate.md", .UTF8)
+				doc.md_mode = .Split
+				defer doc_close(&doc)
+
+				split_frac := f32(0.5)
+				ed_right := doc_editor_right(&doc, winw, split_frac)
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, split_frac)
+				schk(&bad, cok, "gate: the scroll context resolves for a Split document")
+
+				// 1. The status bar's right portion: doc_content_box already
+				// excludes the bar from the pane box, so this y is genuinely
+				// past ybot.
+				_, hit1 := gated(&doc, &c, ed_right, ed_right + 20, winh - 4)
+				schk(&bad, !hit1, "gate: a press on the status bar in Split does not sync")
+
+				// 2. The find bar's right portion: above ytop, which insets for it.
+				_, hit2 := gated(&doc, &c, ed_right, ed_right + 20, 2)
+				schk(&bad, !hit2, "gate: a press in the find bar's right portion does not sync")
+
+				// 3. The editor half, with the document ALSO a table: this is the
+				// exact case ro_surface_swallows answers true from `table` alone.
+				doc.table = true
+				schk(&bad, ro_surface_swallows(doc.table, doc.md_mode, false, Drag_Latches{}), "gate: precondition -- table+Split swallows the editor half too (ro_surface_swallows)")
+				_, hit3 := gated(&doc, &c, ed_right, ed_right * 0.5, c.ytop + 10)
+				schk(&bad, !hit3, "gate: a press in the editor half, table+Split, does not sync")
+				doc.table = false
+
+				// Positive control: a bound broad enough to exclude everything
+				// above would pass 1-3 for the wrong reason. A press inside the
+				// pane, on real content, DOES sync.
+				blk5, hit5 := gated(&doc, &c, ed_right, ed_right + 20, c.ytop + 10)
+				schk(&bad, hit5, fmt.tprintf("gate: precondition -- a press inside the pane on real content DOES sync (blk=%d)", blk5))
+
+				// 4. The blank strip below the last drawn block, still inside the
+				// pane's geometric box -- a SHORT document, so the pane has room
+				// left over below its content. md_block_at_y's own fit test
+				// (added alongside this gate) must refuse it, not clamp onto the
+				// last block laid out.
+				short_src := "first\n\nsecond\n"
+				short_content := make([]u8, len(short_src))
+				copy(short_content, short_src)
+				short := doc_from_content(short_content, "gate_short.md", .UTF8)
+				short.md_mode = .Split
+				defer doc_close(&short)
+				sc, sc_ok := md_scroll_ctx(&h.gfx, &h.text, &short, px_, winw, winh, split_frac)
+				schk(&bad, sc_ok, "gate: the scroll context resolves for the short Split document")
+				_, hit4 := gated(&short, &sc, ed_right, ed_right + 20, sc.ytop + sc.pane - 2)
+				schk(&bad, !hit4, "gate: a press in the empty strip below the last drawn block does not sync")
 			}
 			return
 		}

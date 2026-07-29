@@ -1046,10 +1046,13 @@ Document :: struct {
 	// the block's start byte and its own source text -- see MD_LAYOUT_SLOTS.
 	//
 	// A SLICE, allocated lazily on the first preview pass, not a fixed array
-	// like md_table above it. Md_Layout is ~300 bytes and there are 128 slots,
-	// so inline it would put ~38 KB into every Document -- and a Document is
-	// created BY VALUE in several places (doc_from_content returns one;
-	// test_mode_dispatch holds them as locals in an already-enormous frame).
+	// like md_table above it. Md_Layout is ~300 bytes and there are 256 slots
+	// (MD_LAYOUT_SLOTS) -- doubled since batch 17's pixel anchor, see that
+	// constant's comment -- so inline it would put ~75 KB into every Document.
+	// The argument holds a fortiori now that the slot count is bigger; only
+	// the numbers below moved. And a Document is created BY VALUE in several
+	// places (doc_from_content returns one; test_mode_dispatch holds them as
+	// locals in an already-enormous frame).
 	// Measured: making it inline turned every headless mode into an immediate
 	// STATUS_STACK_OVERFLOW (0xC00000FD), including modes that never open a
 	// document, which is the third time this frame has done that. Freed

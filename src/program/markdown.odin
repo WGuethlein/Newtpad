@@ -1687,11 +1687,17 @@ md_fence_seed :: proc(doc: ^Document, top_byte: int) -> (in_fence: bool, fence_l
 // and a theme switch `theme`, so each invalidates every entry wholesale without
 // a sweep -- every lookup simply misses.
 // 256, not 128, since batch 17's pixel anchor: one walk now covers the pane
-// PLUS a pane below it (9.1's layout budget), and md_probe_back adds a pane
-// above on the scroll-up path. At ~40 blocks a pane, 128 slots would be
-// saturated by the walk itself and every frame would rebuild what the last one
-// built -- the cache turning into a cost, which is the exact thing
-// md_layout_slot's comment warns about.
+// PLUS a pane below it (9.1's layout budget), and a walk that resolves an
+// anchor pays MD_RUNUP_LINES of run-up on top of that. Measured directly
+// (test_modes.odin's "budget-mid" case, a resolved mid-document anchor on a
+// one-block-per-line fixture): 44 live entries for one such walk. The draw,
+// the link pass and the scrollbar fraction each walk independently and can
+// each be first to touch a given anchor in a frame, so the real budget is
+// per-PASS live entries times the up-to-three passes a frame can make:
+// 44 * 3 = 132, which is already past 128 -- at 128 slots the three passes
+// would evict each other's blocks within a single frame instead of sharing
+// them, turning the cache into a cost every frame rather than just the first
+// one after a scroll. 256 covers 132 with room to spare.
 MD_LAYOUT_SLOTS :: 256
 
 // The longest run of blank lines collapsed into one Blank block. Blank runs
@@ -2308,9 +2314,14 @@ Md_Max_Key :: struct {
 // The layout POINTER is carried, not a copy, and that is safe only because
 // MD_WALK_BLOCKS == MD_LAYOUT_SLOTS: a walk performs at most one
 // md_layout_ensure per slot, every entry it touches is stamped with the current
-// md_layout_pass, and md_layout_slot picks the least recently used -- so it can
-// never select an entry this walk is still holding. Raise one constant without
-// the other and these pointers become use-after-free on `src`/`store`/`shape`.
+// md_layout_pass, and md_layout_slot picks the least recently used -- so it
+// cannot select an entry this walk is still holding, PROVIDED the walk holds
+// fewer than MD_WALK_BLOCKS entries. At exactly MD_WALK_BLOCKS every slot
+// shares this pass's stamp and md_layout_slot's `best` search falls through to
+// slot 0 -- which the walk holds -- but that walk is already at its own array
+// bound (`n < len(out)` in md_walk) and can take no further slot, so the stale
+// pointer it hands back is never written through. Bounded and, short of
+// raising one constant without the other, unreachable in practice.
 @(private = "file")
 Md_Walk_Block :: struct {
 	start:    int,
@@ -2338,9 +2349,15 @@ MD_WALK_BLOCKS :: MD_LAYOUT_SLOTS
 // inverse stopped agreeing with the map. Every walk that RESOLVES an anchor
 // takes this run-up, so the gap is the same number everywhere.
 //
-// 24 lines is chosen to clear front matter as well: front matter is a block only
-// at byte 0, so a run-up that reaches 0 classifies it correctly, and one that
-// stops inside it would read its lines as rules and paragraphs.
+// 24 lines is headroom, not a derived bound: the fix above only needs the ONE
+// block before the anchor, which is rarely more than a couple of source lines
+// away, so 24 is generous margin for that case and nothing more precise than
+// "comfortably more than one block usually costs". It does NOT reliably clear
+// front matter -- MD_FM_MAX_LINES is 64, so a run-up landing inside front
+// matter of 25-65 lines reads its lines as rules and paragraphs rather than
+// reaching byte 0. A 30-line front-matter fixture showed no visible spacing
+// divergence from this (the window checked is one block wide), but that is an
+// absence of a demonstrated defect, not a proof the case is handled.
 MD_RUNUP_LINES :: 24
 
 // Lay blocks out forward from `from`, stopping at `limit_h` pixels of height, at
@@ -2640,8 +2657,15 @@ md_probe_back :: proc(c: ^Md_Scroll_Ctx, at, stop_at: int, want_h: f32, out: []M
 		tn, tt, reached := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, try, stop_at, try, max(f32), out)
 		// The walk could not span [try, stop_at) inside one walk's block budget,
 		// so `try` is further back than this model can represent. Keep the last
-		// span that did span, which is what the caller's arithmetic assumes.
-		if !reached {break}
+		// span that did span, which is what the caller's arithmetic assumes --
+		// but THIS walk already overwrote `out` with the failed span's blocks,
+		// so `out` and (n, s, total) would otherwise describe two different
+		// walks. Re-walk the last good `s` to put `out` back in agreement with
+		// the numbers being returned.
+		if !reached {
+			if n > 0 {md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, s, stop_at, s, max(f32), out)}
+			break
+		}
 		n, s, total = tn, try, tt
 		if total >= want_h || try <= 0 {break}
 		lines *= 4
@@ -2853,11 +2877,42 @@ md_anchor_top_byte :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> int {
 // start byte of the block under `y`, and false when the pane holds nothing.
 md_block_at_y :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, y: f32) -> (start: int, ok: bool) {
 	if c.doc == nil {return}
+	// Outside the pane: refused here rather than left to the clamp below, which
+	// otherwise answers for a y meant for the status bar or the find bar just as
+	// readily as it does for an actual block. (Callers are expected to bound
+	// this too -- see the Split click gate in main.odin -- but a procedure that
+	// returns ok=true for any input is exactly the shape that made that
+	// reachable, so it is bounded here as well.)
+	if y < c.ytop || y >= c.ytop + c.pane {return}
 	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
 	n, idx := md_anchor_walk(c, a.block, a.px + c.pane, out)
 	if n == 0 {return}
+	// Mirror md_pass's own fit test (md_block_fits, same forced-first-block
+	// rule). md_anchor_walk's budget is a HEIGHT limit, not "did this block
+	// fit inside ybot", so a block that straddles the pane's bottom edge is
+	// walked (and cached) but never painted. Without this, a click in the
+	// blank strip below the last PAINTED block clamps onto that unpainted
+	// block instead of naming nothing -- the same "clamps to whatever the
+	// binary search's last entry is" shape the pane bound above exists to
+	// close off, just for a y still inside the pane.
+	y0 := c.ytop - a.px - out[idx].slot_top
+	forced := true
+	last := idx - 1
+	for i in idx ..< n {
+		b := out[i]
+		by := y0 + b.slot_top + b.gap
+		if by + b.h <= c.ytop {
+			last = i
+			continue
+		}
+		if !forced && !md_block_fits(by, b.h, c.ytop + c.pane) {break}
+		forced = false
+		last = i
+	}
+	if last < idx {return}
 	rel := (y - c.ytop) + a.px + out[idx].slot_top // into the walk's own space
-	lo, hi := idx, n - 1
+	if rel >= out[last].slot_top + out[last].gap + out[last].h {return}
+	lo, hi := idx, last
 	for lo < hi {
 		mid := (lo + hi + 1) / 2
 		if out[mid].slot_top <= rel {lo = mid} else {hi = mid - 1}

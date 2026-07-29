@@ -646,9 +646,11 @@ main :: proc() {
 			// is the only one where a block in the preview names somewhere the
 			// editor could go. In full Preview a press stays inert, as it is today.
 			// The press is still swallowed below; this reads it on the way past.
-			if ro && doc.md_mode == .Split && window.mouse_pressed && !plat.key_ctrl_down() {
+			// The gate itself (bounding this to the preview pane) is
+			// md_split_click_gate -- see its comment for why it is not inlined.
+			if window.mouse_pressed && !plat.key_ctrl_down() {
 				if c, ok := md_scroll_ctx(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac); ok {
-					if blk, hit := md_block_at_y(&c, doc.md_top, f32(window.mouse_y)); hit {
+					if blk, hit := md_split_click_gate(doc, &c, ro, ed_right, f32(window.mouse_x), f32(window.mouse_y)); hit {
 						doc.top = min(base.pt_line_start(&doc.pt, blk), doc_max_top(doc, &text, rows))
 						doc.md_sync_top = doc.top // the preview keeps its own pixel offset
 					}
@@ -1212,6 +1214,28 @@ Drag_Latches :: struct {
 ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool, d: Drag_Latches) -> bool {
 	if d.vscroll || d.hscroll || d.preview || d.divider {return false}
 	return table || md_mode == .Preview || (md_mode == .Split && in_preview_half)
+}
+
+// Whether a press at (mx, my) is Split's click-to-sync-scroll gesture, and the
+// block it names if so. `ro` alone is not enough of a gate: it is true for the
+// status bar and the find bar too (both run through the caller's block before
+// their OWN guards, later in the same frame), and it is true for the EDITOR
+// half whenever the document is also a table (ro_surface_swallows answers
+// from `table` alone, not from which pane the press is in). x >= ed_right
+// restricts this to the preview pane's columns; the y bound against `c`'s own
+// ytop/pane restricts it to the preview pane's rows, using the SAME box the
+// draw and the scroll model read (md_pane_box, once, via md_scroll_ctx) so
+// this cannot disagree with where the pane actually is.
+//
+// A separate, named proc rather than inlined in main()'s loop: main() is the
+// live WM_* loop and cannot run in a headless test, so a gate that lived only
+// there could not be exercised at its own boundaries -- exactly the shape
+// that let the original `ro`-only gate ship unbounded. mdtest's "gate:"
+// checks call this directly.
+md_split_click_gate :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ro: bool, ed_right, mx, my: f32) -> (blk: int, hit: bool) {
+	if !ro || doc.md_mode != .Split || mx < ed_right {return}
+	if my < c.ytop || my >= c.ytop + c.pane {return}
+	return md_block_at_y(c, doc.md_top, my)
 }
 
 // The vertical scrollbar's track, in client pixels. ONE definition, consumed by
