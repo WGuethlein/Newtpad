@@ -33,6 +33,43 @@ when NEWTPAD_TESTS {
 		fmt.printfln("%-22s -> %-16v %s", label, got, ok)
 	}
 
+	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the
+	// icontest mode's independent PNG decoder below. File-scope (not local to
+	// the icontest block) because Odin's nested proc declarations don't close
+	// over enclosing local variables -- these need to be visible from several
+	// nested `ico_*` decode procs.
+	@(private = "file")
+	Ico_Code_Info :: struct {
+		base, extra: int,
+	}
+	@(private = "file")
+	ico_length_info := [29]Ico_Code_Info {
+		{3, 0}, {4, 0}, {5, 0}, {6, 0}, {7, 0}, {8, 0}, {9, 0}, {10, 0},
+		{11, 1}, {13, 1}, {15, 1}, {17, 1},
+		{19, 2}, {23, 2}, {27, 2}, {31, 2},
+		{35, 3}, {43, 3}, {51, 3}, {59, 3},
+		{67, 4}, {83, 4}, {99, 4}, {115, 4},
+		{131, 5}, {163, 5}, {195, 5}, {227, 5},
+		{258, 0},
+	}
+	@(private = "file")
+	ico_distance_info := [30]Ico_Code_Info {
+		{1, 0}, {2, 0}, {3, 0}, {4, 0},
+		{5, 1}, {7, 1},
+		{9, 2}, {13, 2},
+		{17, 3}, {25, 3},
+		{33, 4}, {49, 4},
+		{65, 5}, {97, 5},
+		{129, 6}, {193, 6},
+		{257, 7}, {385, 7},
+		{513, 8}, {769, 8},
+		{1025, 9}, {1537, 9},
+		{2049, 10}, {3073, 10},
+		{4097, 11}, {6145, 11},
+		{8193, 12}, {12289, 12},
+		{16385, 13}, {24577, 13},
+	}
+
 	// Guard for any headless mode that writes settings.txt, session.txt, or crash
 	// backups. Without NEWTPAD_SESSION_DIR set, session_dir() falls back to the
 	// real %APPDATA%\Newtpad (see session_dir's own doc comment), so a bare
@@ -19194,8 +19231,178 @@ when NEWTPAD_TESTS {
 				return rgba, w, h, true
 			}
 
-			// Signature + IHDR + IDAT(s) + IEND, 8-bit RGBA, filter type 0 on every
-			// row, IDAT built from stored deflate blocks inside a zlib stream.
+			// Inflate (RFC 1951) supporting stored (BTYPE 00) and fixed Huffman
+			// (BTYPE 01) blocks -- the two shapes tools/gen_icon/main.odin's
+			// deflate_fixed can produce. Dynamic Huffman (BTYPE 10) is
+			// unimplemented, deliberately: this decoder exists only to check
+			// gen_icon's own output, and gen_icon never emits it. Independent
+			// implementation from gen_icon's -- written from RFC 1951 directly,
+			// not copy-pasted -- so this is a real second decoder, not the same
+			// bug reflected back at itself. The length/distance tables
+			// (ico_length_info, ico_distance_info) live at file scope above.
+			Ico_Bit_Reader :: struct {
+				data:   []u8,
+				pos:    int,
+				bitpos: int,
+			}
+			ico_read_bit :: proc(br: ^Ico_Bit_Reader) -> (bit: u32, ok: bool) {
+				if br.pos >= len(br.data) {return 0, false}
+				b := br.data[br.pos]
+				bit = u32((b >> u32(br.bitpos)) & 1)
+				br.bitpos += 1
+				if br.bitpos == 8 {
+					br.bitpos = 0
+					br.pos += 1
+				}
+				return bit, true
+			}
+			ico_read_bits :: proc(br: ^Ico_Bit_Reader, n: int) -> (val: u32, ok: bool) {
+				for i in 0 ..< n {
+					bit, o := ico_read_bit(br)
+					if !o {return 0, false}
+					val |= bit << u32(i)
+				}
+				return val, true
+			}
+			ico_align_byte :: proc(br: ^Ico_Bit_Reader) {
+				if br.bitpos != 0 {
+					br.bitpos = 0
+					br.pos += 1
+				}
+			}
+			// Huffman codes are packed MSB-first (RFC 1951 3.1.1); accumulate bit
+			// by bit and recognise the canonical fixed-code ranges (3.2.6).
+			ico_decode_litlen :: proc(br: ^Ico_Bit_Reader) -> (sym: int, ok: bool) {
+				code := 0
+				for nbits in 1 ..= 9 {
+					bit, o := ico_read_bit(br)
+					if !o {return 0, false}
+					code = (code << 1) | int(bit)
+					if nbits == 7 && code <= 23 {return 256 + code, true}
+					if nbits == 8 {
+						if code >= 48 && code <= 191 {return code - 48, true}
+						if code >= 192 && code <= 199 {return 280 + (code - 192), true}
+					}
+					if nbits == 9 && code >= 400 && code <= 511 {return 144 + (code - 400), true}
+				}
+				return 0, false
+			}
+			ico_decode_dist :: proc(br: ^Ico_Bit_Reader) -> (code: int, ok: bool) {
+				v := 0
+				for i in 0 ..< 5 {
+					bit, o := ico_read_bit(br)
+					if !o {return 0, false}
+					v = (v << 1) | int(bit)
+				}
+				if v > 29 {return 0, false}
+				return v, true
+			}
+			ico_inflate :: proc(data: []u8, length_info, distance_info: []Ico_Code_Info) -> (out: []u8, ok: bool) {
+				br := Ico_Bit_Reader{data = data}
+				result: [dynamic]u8
+				for {
+					final, o1 := ico_read_bits(&br, 1)
+					if !o1 {return nil, false}
+					btype, o2 := ico_read_bits(&br, 2)
+					if !o2 {return nil, false}
+					switch btype {
+					case 0:
+						ico_align_byte(&br)
+						if br.pos + 4 > len(data) {return nil, false}
+						blen := int(data[br.pos]) | int(data[br.pos + 1]) << 8
+						nlen := int(data[br.pos + 2]) | int(data[br.pos + 3]) << 8
+						if blen != (~nlen & 0xFFFF) {return nil, false}
+						br.pos += 4
+						if br.pos + blen > len(data) {return nil, false}
+						append(&result, ..data[br.pos:br.pos + blen])
+						br.pos += blen
+					case 1:
+						block_ok := false
+						for {
+							sym, sok := ico_decode_litlen(&br)
+							if !sok {return nil, false}
+							if sym < 256 {
+								append(&result, u8(sym))
+							} else if sym == 256 {
+								block_ok = true
+								break
+							} else {
+								idx := sym - 257
+								if idx < 0 || idx >= len(length_info) {return nil, false}
+								extra, eok := ico_read_bits(&br, length_info[idx].extra)
+								if !eok {return nil, false}
+								mlen := length_info[idx].base + int(extra)
+								dcode, dok := ico_decode_dist(&br)
+								if !dok {return nil, false}
+								dextra, deok := ico_read_bits(&br, distance_info[dcode].extra)
+								if !deok {return nil, false}
+								dist := distance_info[dcode].base + int(dextra)
+								if dist <= 0 || dist > len(result) {return nil, false}
+								start := len(result) - dist
+								for k in 0 ..< mlen {
+									append(&result, result[start + k])
+								}
+							}
+						}
+						if !block_ok {return nil, false}
+					case:
+						return nil, false // dynamic Huffman: unimplemented, unused
+					}
+					if final == 1 {break}
+				}
+				return result[:], true
+			}
+
+			// PNG Paeth predictor (PNG spec 9.4), and the inverse of filter
+			// types 0-4 applied per scanline (spec 9.2/9.3).
+			ico_paeth :: proc(a, b, c: int) -> int {
+				p := a + b - c
+				pa, pb, pc := abs(p - a), abs(p - b), abs(p - c)
+				if pa <= pb && pa <= pc {return a}
+				if pb <= pc {return b}
+				return c
+			}
+			ico_unfilter :: proc(raw: []u8, w, h: int) -> (rgba: []u8, ok: bool) {
+				bpp :: 4
+				stride := w * bpp
+				if len(raw) < (1 + stride) * h {return nil, false}
+				rgba = make([]u8, w * h * 4, context.temp_allocator)
+				prev := make([]u8, stride, context.temp_allocator)
+				cur := make([]u8, stride, context.temp_allocator)
+				for y in 0 ..< h {
+					row_start := y * (1 + stride)
+					ftype := raw[row_start]
+					data := raw[row_start + 1:row_start + 1 + stride]
+					for x in 0 ..< stride {
+						a := int(cur[x - bpp]) if x >= bpp else 0
+						b := int(prev[x])
+						c := int(prev[x - bpp]) if x >= bpp else 0
+						recon: int
+						switch ftype {
+						case 0:
+							recon = int(data[x])
+						case 1:
+							recon = int(data[x]) + a
+						case 2:
+							recon = int(data[x]) + b
+						case 3:
+							recon = int(data[x]) + (a + b) / 2
+						case 4:
+							recon = int(data[x]) + ico_paeth(a, b, c)
+						case:
+							return nil, false
+						}
+						cur[x] = u8(recon)
+					}
+					copy(rgba[y * stride:(y + 1) * stride], cur[:])
+					copy(prev[:], cur[:])
+				}
+				return rgba, true
+			}
+
+			// Signature + IHDR + IDAT(s) + IEND, 8-bit RGBA, one of PNG's five
+			// per-row filter types on each scanline, IDAT a zlib stream (stored
+			// or fixed-Huffman deflate blocks -- see ico_inflate above).
 			ico_decode_png :: proc(blob: []u8) -> (rgba: []u8, w: int, h: int, ok: bool) {
 				sig := [8]u8{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
 				if len(blob) < 8 {return nil, 0, 0, false}
@@ -19219,36 +19426,20 @@ when NEWTPAD_TESTS {
 					pos += 8 + length + 4
 					if ctype == "IEND" {break}
 				}
-				if w <= 0 || h <= 0 || len(idat) < 2 {return nil, 0, 0, false}
+				if w <= 0 || h <= 0 || len(idat) < 6 {return nil, 0, 0, false}
 
-				raw: [dynamic]u8
-				zp := 2 // skip the 2-byte zlib CMF/FLG header
-				for zp < len(idat) {
-					hdr := idat[zp]
-					final := hdr & 1
-					btype := (hdr >> 1) & 3
-					if btype != 0 {
-						fmt.println("    icontest: PNG has a non-stored deflate block; decoder only reads stored")
-						return nil, 0, 0, false
-					}
-					zp += 1
-					if zp + 4 > len(idat) {return nil, 0, 0, false}
-					length := int(idat[zp]) | int(idat[zp + 1]) << 8
-					zp += 4 // LEN + NLEN
-					if zp + length > len(idat) {return nil, 0, 0, false}
-					append(&raw, ..idat[zp:zp + length])
-					zp += length
-					if final == 1 {break}
+				raw, iok := ico_inflate(idat[2:len(idat) - 4], ico_length_info[:], ico_distance_info[:])
+				if !iok {
+					fmt.println("    icontest: PNG deflate stream failed to inflate")
+					return nil, 0, 0, false
 				}
 
-				stride := 1 + w * 4
-				if len(raw) < stride * h {return nil, 0, 0, false}
-				rgba = make([]u8, w * h * 4, context.temp_allocator)
-				for y in 0 ..< h {
-					row_start := y * stride
-					copy(rgba[y * w * 4:(y + 1) * w * 4], raw[row_start + 1:row_start + 1 + w * 4])
+				unfiltered, uok := ico_unfilter(raw, w, h)
+				if !uok {
+					fmt.println("    icontest: PNG scanline un-filter failed")
+					return nil, 0, 0, false
 				}
-				return rgba, w, h, true
+				return unfiltered, w, h, true
 			}
 
 			ICO := #load("../platform/newtpad.ico")

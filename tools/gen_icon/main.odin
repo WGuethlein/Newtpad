@@ -58,12 +58,18 @@
 //   1 where alpha==0 (transparent), 0 elsewhere.
 //
 // PNG blob layout: signature + IHDR + IDAT + IEND chunks, 8-bit RGBA
-// (colour type 6), no interlacing. The IDAT payload is a zlib stream built
-// from "stored" (uncompressed) deflate blocks -- valid per RFC 1950/1951,
-// just not compressed. That is a deliberate simplification: a real Huffman
-// deflate is a lot of code for one 256x256 image (~262 KB raw, well under
-// any icon-cache size limit Windows enforces), and PNG readers do not care
-// how well the stream compressed, only that it decodes correctly.
+// (colour type 6), no interlacing. The IDAT payload is a real zlib stream:
+// each scanline gets the PNG row filter (types 0-4) that minimises the
+// sum-of-absolute-differences heuristic, then the filtered bytes are
+// compressed with DEFLATE using fixed Huffman codes (RFC 1951 BTYPE=01) over
+// a hash-chain LZ77 match search. This image is five flat-colour rectangles
+// on a flat background, so the Up filter turns most scanlines into runs of
+// zero and LZ77 collapses those runs hard -- no dynamic Huffman tables
+// needed to get from ~262 KB raw down to a few KB. See verify_png below:
+// every encoded PNG is decoded again in-process (chunk CRCs, zlib Adler-32,
+// inflate, un-filter) and compared byte-for-byte against the source pixels
+// before gen_icon will write the .ico, so a broken deflate stream fails the
+// build instead of shipping a silently-corrupt icon.
 //
 // ---------------------------------------------------------------------------
 // ANTI-ALIASING
@@ -350,6 +356,525 @@ encode_bmp_entry :: proc(rgba: []u8, size: int) -> []u8 {
 	return buf
 }
 
+// -------------------------------------------------------------- PNG filters
+
+// Standard PNG Paeth predictor (PNG spec §9.4): picks whichever of a, b, c
+// is closest to a+b-c, with ties broken a, then b, then c.
+paeth_predictor :: proc(a, b, c: int) -> int {
+	p := a + b - c
+	pa := abs(p - a)
+	pb := abs(p - b)
+	pc := abs(p - c)
+	if pa <= pb && pa <= pc {
+		return a
+	}
+	if pb <= pc {
+		return b
+	}
+	return c
+}
+
+// Applies each of PNG's five per-scanline filters (spec §9.2) to an RGBA8
+// image, bpp=4, and keeps whichever filter minimises the sum of the
+// filtered bytes read as signed values -- the standard "minimum sum of
+// absolute differences" heuristic (libpng's default). The image is only
+// 256 rows even at its largest, so this is a full per-row search across all
+// five filter types rather than a partial heuristic.
+// Returns size*(1+size*4) bytes: one filter-type byte followed by the
+// filtered scanline, per row -- exactly the layout DEFLATE will compress.
+filter_scanlines :: proc(rgba: []u8, size: int) -> []u8 {
+	bpp :: 4
+	stride := size * bpp
+	out := make([]u8, size * (1 + stride))
+	prev := make([]u8, stride) // row "above" row 0 is defined as all zero
+	defer delete(prev)
+	trial := make([]u8, stride)
+	defer delete(trial)
+	best := make([]u8, stride)
+	defer delete(best)
+
+	for row in 0 ..< size {
+		line := rgba[row * stride:(row + 1) * stride]
+
+		best_type := 0
+		best_sum := max(int)
+		for ftype in 0 ..= 4 {
+			sum := 0
+			for x in 0 ..< stride {
+				raw := int(line[x])
+				a := int(line[x - bpp]) if x >= bpp else 0
+				b := int(prev[x])
+				c := int(prev[x - bpp]) if x >= bpp else 0
+				v: int
+				switch ftype {
+				case 0:
+					v = raw
+				case 1:
+					v = raw - a
+				case 2:
+					v = raw - b
+				case 3:
+					v = raw - (a + b) / 2
+				case 4:
+					v = raw - paeth_predictor(a, b, c)
+				}
+				fb := u8(v)
+				trial[x] = fb
+				sum += abs(int(transmute(i8)fb)) // signed-byte abs, per the heuristic
+			}
+			if sum < best_sum {
+				best_sum = sum
+				best_type = ftype
+				copy(best[:], trial[:])
+			}
+		}
+
+		out_row := out[row * (1 + stride):(row + 1) * (1 + stride)]
+		out_row[0] = u8(best_type)
+		copy(out_row[1:], best[:])
+		copy(prev[:], line)
+	}
+
+	return out
+}
+
+// Inverse of filter_scanlines: reconstructs raw RGBA8 scanlines from
+// filtered ones. Used only by verify_png below (this tool's own round-trip
+// check), never by the encoder.
+unfilter_scanlines :: proc(raw: []u8, size: int) -> (rgba: []u8, ok: bool) {
+	bpp :: 4
+	stride := size * bpp
+	if len(raw) != size * (1 + stride) {
+		return nil, false
+	}
+	rgba = make([]u8, size * stride)
+	prev := make([]u8, stride)
+	defer delete(prev)
+	cur := make([]u8, stride)
+	defer delete(cur)
+
+	for row in 0 ..< size {
+		row_start := row * (1 + stride)
+		ftype := raw[row_start]
+		data := raw[row_start + 1:row_start + 1 + stride]
+		for x in 0 ..< stride {
+			a := int(cur[x - bpp]) if x >= bpp else 0
+			b := int(prev[x])
+			c := int(prev[x - bpp]) if x >= bpp else 0
+			recon: int
+			switch ftype {
+			case 0:
+				recon = int(data[x])
+			case 1:
+				recon = int(data[x]) + a
+			case 2:
+				recon = int(data[x]) + b
+			case 3:
+				recon = int(data[x]) + (a + b) / 2
+			case 4:
+				recon = int(data[x]) + paeth_predictor(a, b, c)
+			case:
+				return nil, false
+			}
+			cur[x] = u8(recon)
+		}
+		copy(rgba[row * stride:(row + 1) * stride], cur[:])
+		copy(prev[:], cur[:])
+	}
+	return rgba, true
+}
+
+// ------------------------------------------------------------- DEFLATE (RFC 1951)
+//
+// Fixed-Huffman-only encoder and decoder. No dynamic Huffman tables (BTYPE
+// 10) -- fixed codes (BTYPE 01) need no tree construction and, combined with
+// LZ77 back-references over the mostly-zero filtered rows this image
+// produces, are already sufficient (see the file header). The decoder here
+// also accepts stored blocks (BTYPE 00) since that costs nothing extra and
+// keeps the decoder generally useful, but the encoder never emits them.
+
+Code_Info :: struct {
+	base, extra: int,
+}
+
+// Index i corresponds to length/literal symbol 257+i.
+LENGTH_INFO := [29]Code_Info {
+	{3, 0}, {4, 0}, {5, 0}, {6, 0}, {7, 0}, {8, 0}, {9, 0}, {10, 0},
+	{11, 1}, {13, 1}, {15, 1}, {17, 1},
+	{19, 2}, {23, 2}, {27, 2}, {31, 2},
+	{35, 3}, {43, 3}, {51, 3}, {59, 3},
+	{67, 4}, {83, 4}, {99, 4}, {115, 4},
+	{131, 5}, {163, 5}, {195, 5}, {227, 5},
+	{258, 0},
+}
+
+// Index i is distance code i (fixed Huffman: distance codes are their own
+// 5-bit value, no separate symbol table).
+DISTANCE_INFO := [30]Code_Info {
+	{1, 0}, {2, 0}, {3, 0}, {4, 0},
+	{5, 1}, {7, 1},
+	{9, 2}, {13, 2},
+	{17, 3}, {25, 3},
+	{33, 4}, {49, 4},
+	{65, 5}, {97, 5},
+	{129, 6}, {193, 6},
+	{257, 7}, {385, 7},
+	{513, 8}, {769, 8},
+	{1025, 9}, {1537, 9},
+	{2049, 10}, {3073, 10},
+	{4097, 11}, {6145, 11},
+	{8193, 12}, {12289, 12},
+	{16385, 13}, {24577, 13},
+}
+
+length_to_code :: proc(length: int) -> (code, extra_bits, extra_val: int) {
+	for i := len(LENGTH_INFO) - 1; i >= 0; i -= 1 {
+		if length >= LENGTH_INFO[i].base {
+			return 257 + i, LENGTH_INFO[i].extra, length - LENGTH_INFO[i].base
+		}
+	}
+	return 257, 0, 0
+}
+
+distance_to_code :: proc(dist: int) -> (code, extra_bits, extra_val: int) {
+	for i := len(DISTANCE_INFO) - 1; i >= 0; i -= 1 {
+		if dist >= DISTANCE_INFO[i].base {
+			return i, DISTANCE_INFO[i].extra, dist - DISTANCE_INFO[i].base
+		}
+	}
+	return 0, 0, 0
+}
+
+// Fixed Huffman literal/length code table, RFC 1951 §3.2.6.
+fixed_lit_code :: proc(sym: int) -> (code: u32, nbits: int) {
+	switch {
+	case sym <= 143:
+		return u32(0x30 + sym), 8
+	case sym <= 255:
+		return u32(0x190 + (sym - 144)), 9
+	case sym <= 279:
+		return u32(sym - 256), 7
+	case:
+		return u32(0xC0 + (sym - 280)), 8
+	}
+}
+
+Bit_Writer :: struct {
+	out:   [dynamic]u8,
+	buf:   u32,
+	nbits: int,
+}
+
+// LSB-first packing -- used for the block header (BFINAL/BTYPE) and every
+// "extra bits" field. Huffman codes use bw_put_huffman instead (see below).
+bw_put_bits :: proc(bw: ^Bit_Writer, value: u32, n: int) {
+	bw.buf |= value << u32(bw.nbits)
+	bw.nbits += n
+	for bw.nbits >= 8 {
+		append(&bw.out, u8(bw.buf & 0xFF))
+		bw.buf >>= 8
+		bw.nbits -= 8
+	}
+}
+
+// Huffman codes are packed starting with the code's most-significant bit
+// (RFC 1951 §3.1.1) -- the opposite order from every other field in the
+// stream -- so reverse it into the normal LSB-first bit packer one bit at a
+// time. n is at most 9 here, so this never gets to matter for speed.
+bw_put_huffman :: proc(bw: ^Bit_Writer, code: u32, n: int) {
+	for i := n - 1; i >= 0; i -= 1 {
+		bw_put_bits(bw, (code >> u32(i)) & 1, 1)
+	}
+}
+
+bw_flush :: proc(bw: ^Bit_Writer) {
+	if bw.nbits > 0 {
+		append(&bw.out, u8(bw.buf & 0xFF))
+		bw.buf = 0
+		bw.nbits = 0
+	}
+}
+
+MIN_MATCH :: 3
+MAX_MATCH :: 258
+LZ_WINDOW :: 32768
+LZ_HASH_BITS :: 15
+LZ_HASH_SIZE :: 1 << LZ_HASH_BITS
+LZ_MAX_CHAIN :: 128 // bounded search; this image's redundancy makes long chains rare
+
+lz_hash :: proc(data: []u8, i: int) -> u32 {
+	h := u32(data[i]) << 10 ~ u32(data[i + 1]) << 5 ~ u32(data[i + 2])
+	return h & (LZ_HASH_SIZE - 1)
+}
+
+// LZ77 (hash-chain match search, greedy -- no lazy matching) + fixed Huffman
+// deflate, RFC 1951 §3.2.5/3.2.6. Emits a single final block (BFINAL=1,
+// BTYPE=01); deflate blocks have no size limit the way stored blocks do, so
+// one block for the whole image is fine.
+deflate_fixed :: proc(data: []u8) -> []u8 {
+	bw: Bit_Writer
+	bw.out = make([dynamic]u8, 0, len(data) / 4 + 16)
+
+	bw_put_bits(&bw, 1, 1) // BFINAL = 1
+	bw_put_bits(&bw, 1, 2) // BTYPE = 01 (fixed Huffman)
+
+	n := len(data)
+	head := make([]int, LZ_HASH_SIZE)
+	defer delete(head)
+	for i in 0 ..< LZ_HASH_SIZE {
+		head[i] = -1
+	}
+	prev := make([]int, max(n, 1))
+	defer delete(prev)
+
+	insert_hash :: proc(data: []u8, pos: int, head: []int, prev: []int) {
+		h := lz_hash(data, pos)
+		prev[pos] = head[h]
+		head[h] = pos
+	}
+
+	i := 0
+	for i < n {
+		best_len := 0
+		best_dist := 0
+		if i + MIN_MATCH <= n {
+			h := lz_hash(data, i)
+			cand := head[h]
+			chain := 0
+			max_len := min(MAX_MATCH, n - i)
+			for cand >= 0 && chain < LZ_MAX_CHAIN {
+				dist := i - cand
+				if dist > LZ_WINDOW {
+					break
+				}
+				l := 0
+				for l < max_len && data[cand + l] == data[i + l] {
+					l += 1
+				}
+				if l > best_len {
+					best_len = l
+					best_dist = dist
+					if l >= MAX_MATCH {
+						break
+					}
+				}
+				cand = prev[cand]
+				chain += 1
+			}
+		}
+
+		if best_len >= MIN_MATCH {
+			code, ebits, eval := length_to_code(best_len)
+			lcode, lnbits := fixed_lit_code(code)
+			bw_put_huffman(&bw, lcode, lnbits)
+			if ebits > 0 {
+				bw_put_bits(&bw, u32(eval), ebits)
+			}
+
+			dcode, debits, deval := distance_to_code(best_dist)
+			bw_put_huffman(&bw, u32(dcode), 5)
+			if debits > 0 {
+				bw_put_bits(&bw, u32(deval), debits)
+			}
+
+			end := i + best_len
+			for i < end {
+				if i + MIN_MATCH <= n {
+					insert_hash(data, i, head, prev)
+				}
+				i += 1
+			}
+		} else {
+			lit := int(data[i])
+			lcode, lnbits := fixed_lit_code(lit)
+			bw_put_huffman(&bw, lcode, lnbits)
+			if i + MIN_MATCH <= n {
+				insert_hash(data, i, head, prev)
+			}
+			i += 1
+		}
+	}
+
+	ecode, enbits := fixed_lit_code(256) // end-of-block symbol
+	bw_put_huffman(&bw, ecode, enbits)
+
+	bw_flush(&bw)
+	return bw.out[:]
+}
+
+Bit_Reader :: struct {
+	data:   []u8,
+	pos:    int,
+	bitpos: int,
+}
+
+br_read_bit :: proc(br: ^Bit_Reader) -> (bit: u32, ok: bool) {
+	if br.pos >= len(br.data) {
+		return 0, false
+	}
+	b := br.data[br.pos]
+	bit = u32((b >> u32(br.bitpos)) & 1)
+	br.bitpos += 1
+	if br.bitpos == 8 {
+		br.bitpos = 0
+		br.pos += 1
+	}
+	return bit, true
+}
+
+br_read_bits :: proc(br: ^Bit_Reader, n: int) -> (val: u32, ok: bool) {
+	for i in 0 ..< n {
+		bit, o := br_read_bit(br)
+		if !o {
+			return 0, false
+		}
+		val |= bit << u32(i)
+	}
+	return val, true
+}
+
+br_align_byte :: proc(br: ^Bit_Reader) {
+	if br.bitpos != 0 {
+		br.bitpos = 0
+		br.pos += 1
+	}
+}
+
+// Reverse of fixed_lit_code: Huffman codes arrive MSB-first, so accumulate
+// bit by bit and check the canonical ranges from RFC 1951 §3.2.6 after each
+// bit -- 7-bit codes (256-279) are a strict prefix range of the 8/9-bit ones.
+decode_fixed_litlen :: proc(br: ^Bit_Reader) -> (sym: int, ok: bool) {
+	code := 0
+	for nbits in 1 ..= 9 {
+		bit, o := br_read_bit(br)
+		if !o {
+			return 0, false
+		}
+		code = (code << 1) | int(bit)
+		if nbits == 7 && code <= 23 {
+			return 256 + code, true
+		}
+		if nbits == 8 {
+			if code >= 48 && code <= 191 {
+				return code - 48, true
+			}
+			if code >= 192 && code <= 199 {
+				return 280 + (code - 192), true
+			}
+		}
+		if nbits == 9 && code >= 400 && code <= 511 {
+			return 144 + (code - 400), true
+		}
+	}
+	return 0, false
+}
+
+decode_fixed_dist :: proc(br: ^Bit_Reader) -> (code: int, ok: bool) {
+	v := 0
+	for i in 0 ..< 5 {
+		bit, o := br_read_bit(br)
+		if !o {
+			return 0, false
+		}
+		v = (v << 1) | int(bit)
+	}
+	if v > 29 {
+		return 0, false
+	}
+	return v, true
+}
+
+// Inflate supporting stored (BTYPE 00) and fixed Huffman (BTYPE 01) blocks
+// -- dynamic Huffman (BTYPE 10) is unimplemented since deflate_fixed never
+// emits it. Used only by verify_png, to decode this tool's own output.
+inflate :: proc(data: []u8) -> (out: []u8, ok: bool) {
+	br := Bit_Reader{data = data}
+	result: [dynamic]u8
+
+	for {
+		final, o1 := br_read_bits(&br, 1)
+		if !o1 {
+			return nil, false
+		}
+		btype, o2 := br_read_bits(&br, 2)
+		if !o2 {
+			return nil, false
+		}
+
+		switch btype {
+		case 0:
+			br_align_byte(&br)
+			if br.pos + 4 > len(data) {
+				return nil, false
+			}
+			length := int(data[br.pos]) | int(data[br.pos + 1]) << 8
+			nlen := int(data[br.pos + 2]) | int(data[br.pos + 3]) << 8
+			if length != (~nlen & 0xFFFF) {
+				return nil, false
+			}
+			br.pos += 4
+			if br.pos + length > len(data) {
+				return nil, false
+			}
+			append(&result, ..data[br.pos:br.pos + length])
+			br.pos += length
+		case 1:
+			block_ok := false
+			for {
+				sym, sok := decode_fixed_litlen(&br)
+				if !sok {
+					return nil, false
+				}
+				if sym < 256 {
+					append(&result, u8(sym))
+				} else if sym == 256 {
+					block_ok = true
+					break
+				} else {
+					idx := sym - 257
+					if idx < 0 || idx >= len(LENGTH_INFO) {
+						return nil, false
+					}
+					extra, eok := br_read_bits(&br, LENGTH_INFO[idx].extra)
+					if !eok {
+						return nil, false
+					}
+					length := LENGTH_INFO[idx].base + int(extra)
+
+					dcode, dok := decode_fixed_dist(&br)
+					if !dok {
+						return nil, false
+					}
+					dextra, deok := br_read_bits(&br, DISTANCE_INFO[dcode].extra)
+					if !deok {
+						return nil, false
+					}
+					dist := DISTANCE_INFO[dcode].base + int(dextra)
+
+					if dist <= 0 || dist > len(result) {
+						return nil, false
+					}
+					start := len(result) - dist
+					for k in 0 ..< length {
+						append(&result, result[start + k])
+					}
+				}
+			}
+			if !block_ok {
+				return nil, false
+			}
+		case:
+			return nil, false // dynamic Huffman: unimplemented, unused
+		}
+
+		if final == 1 {
+			break
+		}
+	}
+
+	return result[:], true
+}
+
 // ------------------------------------------------------------------- PNG
 
 PNG_SIGNATURE :: [8]u8{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
@@ -390,37 +915,42 @@ adler32 :: proc(data: []u8) -> u32 {
 	return (b << 16) | a
 }
 
-// zlib stream (2-byte header + deflate stream + 4-byte Adler32) built from
-// uncompressed ("stored") deflate blocks, RFC 1951 §3.2.4. Valid deflate,
-// just not compressed -- see the file header comment for why that is fine
-// here.
-zlib_stored :: proc(data: []u8) -> []u8 {
+// zlib stream (2-byte header + deflate stream + 4-byte Adler32), RFC 1950,
+// with the deflate payload compressed via deflate_fixed (LZ77 + fixed
+// Huffman) rather than stored uncompressed.
+zlib_deflate :: proc(data: []u8) -> []u8 {
 	out: [dynamic]u8
 	append(&out, 0x78, 0x01) // CMF, FLG -- chosen so (CMF*256+FLG) % 31 == 0
-
-	i := 0
-	for {
-		remain := len(data) - i
-		chunk := min(remain, 65535)
-		final: u8 = 1 if i + chunk >= len(data) else 0
-		// The 3-bit block header (BFINAL, BTYPE=00) fits in the low bits of
-		// one byte; a stored block is then required to be byte-aligned, so
-		// the rest of this byte is padding zero and nothing else is needed.
-		append(&out, final)
-		dput_u16le(&out, u16(chunk))
-		dput_u16le(&out, ~u16(chunk))
-		if chunk > 0 {
-			append(&out, ..data[i:i + chunk])
-		}
-		i += chunk
-		if i >= len(data) {
-			break
-		}
-	}
-
+	compressed := deflate_fixed(data)
+	append(&out, ..compressed)
+	delete(compressed)
 	adler := adler32(data)
 	dput_u32be(&out, adler)
 	return out[:]
+}
+
+// Inverse of zlib_deflate: validates the 2-byte header's mod-31 checksum,
+// inflates, and checks the trailing Adler-32 against the decompressed data.
+zlib_inflate :: proc(zdata: []u8) -> (out: []u8, ok: bool) {
+	if len(zdata) < 6 {
+		return nil, false
+	}
+	cmf := zdata[0]
+	flg := zdata[1]
+	if (int(cmf) * 256 + int(flg)) % 31 != 0 {
+		return nil, false
+	}
+	deflate_data := zdata[2:len(zdata) - 4]
+	result, dok := inflate(deflate_data)
+	if !dok {
+		return nil, false
+	}
+	tail := zdata[len(zdata) - 4:]
+	want_adler := u32(tail[0]) << 24 | u32(tail[1]) << 16 | u32(tail[2]) << 8 | u32(tail[3])
+	if adler32(result) != want_adler {
+		return nil, false
+	}
+	return result, true
 }
 
 append_chunk :: proc(out: ^[dynamic]u8, typ: string, data: []u8) {
@@ -436,19 +966,13 @@ append_chunk :: proc(out: ^[dynamic]u8, typ: string, data: []u8) {
 	dput_u32be(out, crc)
 }
 
-// Whole PNG file: signature + IHDR + one IDAT + IEND. 8-bit RGBA, filter
-// type 0 (None) on every scanline -- simplest correct choice; filtering for
-// better compression would matter for a photo, not a few flat rectangles.
+// Whole PNG file: signature + IHDR + one IDAT + IEND. 8-bit RGBA. Each
+// scanline gets its best-fit filter (filter_scanlines), then the filtered
+// bytes are compressed for real (zlib_deflate) instead of stored raw.
 png_encode :: proc(rgba: []u8, size: int) -> []u8 {
-	raw := make([]u8, size * (1 + size * 4))
-	pos := 0
-	for row in 0 ..< size {
-		raw[pos] = 0 // filter type: None
-		pos += 1
-		copy(raw[pos:pos + size * 4], rgba[row * size * 4:row * size * 4 + size * 4])
-		pos += size * 4
-	}
-	zdata := zlib_stored(raw)
+	raw := filter_scanlines(rgba, size)
+	defer delete(raw)
+	zdata := zlib_deflate(raw)
 
 	out: [dynamic]u8
 	sig := PNG_SIGNATURE
@@ -470,6 +994,93 @@ png_encode :: proc(rgba: []u8, size: int) -> []u8 {
 	return out[:]
 }
 
+// Parses a PNG byte stream back apart: validates the signature, walks every
+// chunk verifying its CRC32 against the bytes actually present, collects
+// IDAT payloads (a real encoder may split IDAT across chunks; concatenation
+// before zlib decoding is required by the PNG spec), and reads width/height
+// from IHDR. Independent of png_encode's internals -- it only assumes the
+// general PNG chunk format, not this tool's specific chunk ordering.
+png_parse :: proc(png_bytes: []u8) -> (w, h: int, idat: []u8, ok: bool) {
+	sig := PNG_SIGNATURE
+	if len(png_bytes) < 8 {
+		return 0, 0, nil, false
+	}
+	for i in 0 ..< 8 {
+		if png_bytes[i] != sig[i] {
+			return 0, 0, nil, false
+		}
+	}
+	pos := 8
+	idat_buf: [dynamic]u8
+	for pos + 8 <= len(png_bytes) {
+		length := int(
+			u32(png_bytes[pos]) << 24 |
+			u32(png_bytes[pos + 1]) << 16 |
+			u32(png_bytes[pos + 2]) << 8 |
+			u32(png_bytes[pos + 3]),
+		)
+		ctype := string(png_bytes[pos + 4:pos + 8])
+		if pos + 8 + length + 4 > len(png_bytes) {
+			return 0, 0, nil, false
+		}
+		chunk_data := png_bytes[pos + 8:pos + 8 + length]
+		crc_stored :=
+			u32(png_bytes[pos + 8 + length]) << 24 |
+			u32(png_bytes[pos + 9 + length]) << 16 |
+			u32(png_bytes[pos + 10 + length]) << 8 |
+			u32(png_bytes[pos + 11 + length])
+		crc_calc := crc32(png_bytes[pos + 4:pos + 8 + length]) // type + data
+		if crc_calc != crc_stored {
+			return 0, 0, nil, false
+		}
+		switch ctype {
+		case "IHDR":
+			if length < 8 {
+				return 0, 0, nil, false
+			}
+			w = int(u32(chunk_data[0]) << 24 | u32(chunk_data[1]) << 16 | u32(chunk_data[2]) << 8 | u32(chunk_data[3]))
+			h = int(u32(chunk_data[4]) << 24 | u32(chunk_data[5]) << 16 | u32(chunk_data[6]) << 8 | u32(chunk_data[7]))
+		case "IDAT":
+			append(&idat_buf, ..chunk_data)
+		}
+		pos += 8 + length + 4
+		if ctype == "IEND" {
+			break
+		}
+	}
+	return w, h, idat_buf[:], true
+}
+
+// Round-trips a just-encoded PNG through this tool's own decoder (chunk
+// CRCs, zlib Adler-32 and inflate, PNG un-filtering) and compares the
+// result byte-for-byte against the source pixels. A malformed PNG loads
+// silently-wrong in some viewers and not at all in others, so this is the
+// check that keeps a broken deflate stream from ever reaching the .ico --
+// see main() below, which treats a false return here as a build failure.
+verify_png :: proc(png_bytes: []u8, size: int, orig_rgba: []u8) -> bool {
+	w, h, idat, pok := png_parse(png_bytes)
+	if !pok || w != size || h != size {
+		return false
+	}
+	raw, zok := zlib_inflate(idat)
+	if !zok {
+		return false
+	}
+	rgba, uok := unfilter_scanlines(raw, size)
+	if !uok {
+		return false
+	}
+	if len(rgba) != len(orig_rgba) {
+		return false
+	}
+	for i in 0 ..< len(rgba) {
+		if rgba[i] != orig_rgba[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // ------------------------------------------------------------------- main
 
 main :: proc() {
@@ -478,7 +1089,12 @@ main :: proc() {
 		spec := SPECS[i]
 		rgba := render(spec)
 		if spec.size >= 256 {
-			image_data[i] = png_encode(rgba, spec.size)
+			png := png_encode(rgba, spec.size)
+			if !verify_png(png, spec.size, rgba) {
+				fmt.println("gen_icon: FAILED round-trip verification of the", spec.size, "px PNG -- refusing to write a possibly-corrupt icon")
+				os.exit(1)
+			}
+			image_data[i] = png
 		} else {
 			image_data[i] = encode_bmp_entry(rgba, spec.size)
 		}
