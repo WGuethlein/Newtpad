@@ -5527,6 +5527,204 @@ when NEWTPAD_TESTS {
 			return
 		}
 
+		// The wheel's REVERSIBILITY, swept -- and the invariant Md_Anchor's own
+		// doc comment states.
+		//
+		// This exists because the two defects it covers BOTH PRODUCED THE VALUE
+		// section C asserts. C's up-scroll runs 900px back from a position where
+		// {0, 0} is the right answer, so an up-step that discarded its target and
+		// returned {0, 0} passed it; C's partial-step check runs at block 240 and
+		// never enters the region where the discard happened at all. A point
+		// assertion cannot see either one. A SWEEP can, and did:
+		//
+		//   F1: md_scroll_px's upward branch computed `target` and then threw it
+		//       away whenever md_probe_back returned n == 0 -- which is exactly
+		//       "the anchor is in the document's FIRST block", since
+		//       md_line_start_back(doc, p, 24) == p only for p == 0. Every
+		//       up-step taken inside block 0 of a document whose first block is
+		//       taller than two wheel notches teleported to the top.
+		//
+		//   F2: md_at_offset clamped px INCLUSIVELY into gap + h, so it emitted
+		//       px == gap + h -- the next block's {start, 0} written in the
+		//       previous block's coordinates. Md_Anchor documents px in
+		//       [0, gap + h) and md_at_offset's own header claims to be the one
+		//       place that guarantees it. md_scroll_scalar then read that as a
+		//       whole block of travel already made, putting the thumb a block
+		//       ahead of the content.
+		//
+		// Swept over fixtures rather than one, because the first block's height is
+		// what decides whether F1's region is reachable at all: a document opening
+		// with an h1 has a slot barely one notch tall and cannot show it.
+		//
+		// Front matter is here in three sizes on purpose. MD_RUNUP_LINES is 24 and
+		// MD_FM_MAX_LINES is 64, so a probe's run-up clears a 20-line card and does
+		// NOT clear a 30- or 50-line one; that seam is asserted as a BOUNDED
+		// exception rather than papered over, and it is the finding recorded as F10.
+		md_wheel_selftest :: proc() -> (bad: int) {
+			wchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 800, 900
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/wheel") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(18)
+			winw, winh := f32(W), f32(H)
+
+			Wheel_Fixture :: struct {
+				name:   string,
+				fm:     int, // lines of front-matter body, 0 for none
+				open:   string, // what the body opens with, before the paragraphs
+				blanks: bool, // a blank line between paragraphs
+				strict: bool, // is exact reversibility claimed at EVERY position?
+			}
+			// Long enough to wrap across three visual lines at the 72ch measure,
+			// which is what makes the FIRST block taller than two wheel notches --
+			// the precondition F1's region needs, and the reason a one-line fixture
+			// cannot see the defect at all.
+			PARA :: "para %02d carries enough words on it to wrap across three whole visual lines at the seventy two character measure the preview holds itself to, which is what gives the block a slot several notches tall\n"
+			fixtures := []Wheel_Fixture {
+				{"plain paragraphs", 0, "", true, true},
+				{"no blank lines", 0, "", false, true},
+				{"opens with a heading", 0, "# Title of the document\n\n", true, true},
+				{"opens with a fence", 0, "```odin\nx := 1\ny := 2\nz := 3\nw := 4\n```\n\n", true, true},
+				{"20 lines of front matter", 20, "", true, true},
+				{"30 lines of front matter", 30, "", true, false},
+				{"50 lines of front matter", 50, "", true, false},
+			}
+
+			// Accumulated across every fixture: the sweep is only meaningful if it
+			// actually ENTERS the two regions, and no single fixture reaches both.
+			saw_f1_region, saw_f2_region := false, false
+
+			for fx in fixtures {
+				b := strings.builder_make()
+				if fx.fm > 0 {
+					strings.write_string(&b, "---\n")
+					for i in 0 ..< fx.fm {fmt.sbprintf(&b, "key%02d: value %02d\n", i, i)}
+					strings.write_string(&b, "---\n")
+				}
+				strings.write_string(&b, fx.open)
+				for i in 0 ..< 40 {
+					fmt.sbprintf(&b, PARA, i)
+					if fx.blanks {strings.write_string(&b, "\n")}
+				}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				strings.builder_destroy(&b)
+
+				doc := doc_from_content(content, "wheel.md", .UTF8)
+				doc.md_mode = .Preview
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				if !cok {
+					wchk(&bad, false, fmt.tprintf("wheel[%s]: the scroll context resolves", fx.name))
+					doc_close(&doc)
+					continue
+				}
+				notch := md_wheel_px(&c)
+
+				// The sweep: one notch at a time from the top, recorded. A NOTCH,
+				// not 900px, because a notch is what the wheel sends and because
+				// the positions that matter are the ones INSIDE a block.
+				pos := make([dynamic]Md_Anchor, 0, 80)
+				append(&pos, Md_Anchor{})
+				for len(pos) < 60 {
+					nxt := md_scroll_px(&c, pos[len(pos) - 1], notch)
+					if nxt == pos[len(pos) - 1] {break}
+					append(&pos, nxt)
+				}
+
+				blocks := 0
+				for p, i in pos {
+					if i == 0 || p.block != pos[i - 1].block {blocks += 1}
+					if p.block == 0 && p.px > notch {saw_f1_region = true}
+					if p.block > 0 && p.px >= notch {saw_f2_region = true}
+				}
+				wchk(&bad, len(pos) >= 20 && blocks >= 3, fmt.tprintf("wheel[%s]: the sweep covers %d positions over %d blocks", fx.name, len(pos), blocks))
+
+				// --- the invariant: px lives in [0, gap + h) --------------------
+				//
+				// Read through md_block_at_byte, the PUBLIC producer of a block's
+				// slot, which takes the same MD_RUNUP_LINES run-up md_pass does --
+				// so "the slot" here is the slot the draw uses. px == slot is the
+				// defect: the next block's origin spelled in this block's units.
+				//
+				// Checked over the up-steps as well as the down sweep, and that is
+				// not thoroughness -- it is where the defect lives. A downward step
+				// resolves inside a walk that continues past the target, so it can
+				// never land on a slot's far edge; the UPWARD step's walk stops AT
+				// the anchor block, so a step smaller than the anchor's own offset
+				// has nowhere in the walk to land and got clamped onto the previous
+				// block's last pixel. Sweeping the down positions alone reported
+				// zero breaks against a model with the defect fully present.
+				inv, worst, scalar_bad := 0, "", 0
+				check_inv :: proc(c: ^Md_Scroll_Ctx, p: Md_Anchor, inv: ^int, worst: ^string, scalar_bad: ^int, how: string) {
+					_, nxt_byte, slot := md_block_at_byte(c, p.block)
+					if p.px < 0 || (slot > 0 && p.px >= slot) || (slot <= 0 && p.px != 0) {
+						inv^ += 1
+						if len(worst^) == 0 {worst^ = fmt.tprintf("%s %d/%.1f of slot %.1f", how, p.block, p.px, slot)}
+					}
+					// The scrollbar's half of the same defect, asserted where it is
+					// visible: the scalar is bytes-plus-a-fraction, so an anchor
+					// inside a block must read STRICTLY less than the byte the next
+					// block begins at. px == slot makes them equal, which is a thumb
+					// a whole block ahead of the content.
+					if md_scroll_scalar(c, p) >= f32(nxt_byte) {scalar_bad^ += 1}
+				}
+				for p in pos {check_inv(&c, p, &inv, &worst, &scalar_bad, "down")}
+				for p in pos {check_inv(&c, md_scroll_px(&c, p, -notch), &inv, &worst, &scalar_bad, "up")}
+				wchk(&bad, inv == 0, fmt.tprintf("wheel[%s]: every anchor either step produces has px in [0, slot) (%d break it; %s)", fx.name, inv, worst))
+				wchk(&bad, scalar_bad == 0, fmt.tprintf("wheel[%s]: ...and none reads as a whole block of travel already made (%d)", fx.name, scalar_bad))
+
+				// --- reversibility: one notch up undoes one notch down ----------
+				//
+				// Walked backwards over the recorded sweep, so EVERY position is
+				// tested, including the ones inside block 0. A tolerance on px and
+				// exact equality on the block: the two directions sum the same
+				// gap + h values in different orders, so a fraction of a pixel is
+				// f32 arithmetic and not a model that lost the position.
+				rev, fail_msg := 0, ""
+				for k := len(pos) - 1; k >= 1; k -= 1 {
+					up := md_scroll_px(&c, pos[k], -notch)
+					if up.block == pos[k - 1].block && abs(up.px - pos[k - 1].px) < 0.05 {continue}
+					rev += 1
+					if len(fail_msg) == 0 {
+						fail_msg = fmt.tprintf("%d/%.1f -up-> %d/%.1f, want %d/%.1f", pos[k].block, pos[k].px, up.block, up.px, pos[k - 1].block, pos[k - 1].px)
+					}
+				}
+				if fx.strict {
+					wchk(&bad, rev == 0, fmt.tprintf("wheel[%s]: a notch up undoes a notch down at all %d positions (%d fail; %s)", fx.name, len(pos) - 1, rev, fail_msg))
+				} else {
+					// Front matter of 30 or 50 lines: MD_RUNUP_LINES cannot reach
+					// byte 0 from the first block BELOW the card, so the probe's
+					// run-up lands INSIDE the card and reads its lines as rules and
+					// paragraphs. MEASURED: exactly ONE up-step diverges, the one
+					// crossing that seam, and every other position on these two
+					// fixtures is exact. The bound is 1 rather than "a few" so it
+					// is an assertion about the seam and not a licence -- a second
+					// divergence means the defect spread. Recorded as F10.
+					wchk(&bad, rev <= 1, fmt.tprintf("wheel[%s]: reversibility is exact but for the ONE up-step crossing the front-matter seam MD_RUNUP_LINES cannot clear (%d of %d fail; %s)", fx.name, rev, len(pos) - 1, fail_msg))
+				}
+				delete(pos)
+				doc_close(&doc)
+			}
+
+			// Without these the sweep could be green on a model that never left the
+			// first notch, and F1's and F2's regions are the whole point of it.
+			wchk(&bad, saw_f1_region, "wheel: the sweep reaches a position inside the FIRST block more than one notch down (F1's region)")
+			wchk(&bad, saw_f2_region, "wheel: ...and one whose offset exceeds a notch, so an up-step stays inside its own block (F2's region)")
+			return
+		}
+
 		// `newtpad mdtest` covers the markdown block classifiers and inline parser
 		// (the rendering itself needs a live eye), PLUS the draw-level checks
 		// above that exercise markdown_draw's own call sites through a real
@@ -5541,6 +5739,7 @@ when NEWTPAD_TESTS {
 			bad += md_key_selftest()
 			bad += md_gap_selftest()
 			bad += md_scroll_selftest()
+			bad += md_wheel_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
 			return true
 		}

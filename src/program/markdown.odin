@@ -2794,14 +2794,33 @@ md_scroll_px :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, dy: f32) -> Md_Anchor {
 		n, idx := md_anchor_walk(c, a.block, a.px + dy + c.pane, out)
 		if n == 0 {return a}
 		target := out[idx].slot_top + a.px + dy
-		res = md_at_offset(out[:n], idx, target)
+		// A step larger than the walk could span lands at the furthest position
+		// the walk actually MEASURED, and the next step continues from there --
+		// md_probe_back's header states the same rule for the other direction. The
+		// height limit above normally makes this a no-op (the walk is asked for the
+		// step plus a pane, so the target is inside it); what it bounds is the walk
+		// truncating on its block budget or on MD_MAX_EMPTY_BLOCKS instead, where
+		// the offset past the last slot names a distance over blocks nothing has
+		// laid out. Without it md_at_offset's past-the-walk case below would carry
+		// that unmeasured distance into `px`.
+		last := out[n - 1]
+		res = md_at_offset(out[:n], idx, min(target, last.slot_top + last.gap + last.h))
 	} else {
 		// 9.1's "a screen above": ask the probe for the step PLUS a pane, so the
 		// blocks above the new position are warm rather than rebuilt next frame.
 		n, s, total := md_probe_back(c, a.block, a.block, -dy + c.pane, out)
 		target := total + a.px + dy
 		if n == 0 {
-			res = {s, 0}
+			// The probe could not move: md_line_start_back(doc, p, k) returns `p`
+			// only for p == 0, so n == 0 IS "the anchor is in the document's first
+			// block", and `target` is then simply a.px + dy measured from byte 0.
+			// This used to return {s, 0} and DISCARD the target, which teleported
+			// every up-step taken inside block 0 to the top of the document --
+			// reachable on any file whose first block is taller than one wheel
+			// notch, which is any heading, any fence, any front-matter card and any
+			// wrapping paragraph. The clamp at 0 is the top of the document; the
+			// clamp at the other end is md_scroll_clamp's, as everywhere else.
+			res = {s, max(0, target)}
 		} else {
 			// Never resolve onto the walk's FIRST block unless it is the document's
 			// -- that one has no predecessor here, so its gap is its own `above`
@@ -2818,15 +2837,35 @@ md_scroll_px :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, dy: f32) -> Md_Anchor {
 // The anchor naming the position `target` in a walk's own space, searched from
 // `lo` forward. One place resolves an offset to an anchor, so the invariant
 // px in [0, gap + h) holds however the offset was arrived at.
+//
+// A target past everything the walk measured names a position in the block
+// AFTER the last one -- which is what `next` is, and which on the UPWARD path is
+// the anchor block itself, since md_probe_back's walk deliberately stops at it
+// (stop_at == a.block). So a step smaller than the anchor's own offset has no
+// entry in the walk to land in, and that is the common case, not an edge: it is
+// every up-step of less than px.
+//
+// This used to clamp the offset into the last entry's slot instead, which
+// emitted px == gap + h: the next block's {start, 0} written in the previous
+// block's coordinates. That is the same PLACE on screen, so it looked harmless,
+// and it is not -- it breaks the [0, gap + h) invariant this procedure's header
+// claims to be the one guarantor of, it loses the sub-block remainder (a notch
+// up from px = 32 returned the previous block's last pixel rather than px = 2),
+// and md_scroll_scalar's `px / slot` then reads 1.0, putting the scrollbar thumb
+// a whole block ahead of the content.
 @(private = "file")
 md_at_offset :: proc(w: []Md_Walk_Block, lo: int, target: f32) -> Md_Anchor {
 	for i in lo ..< len(w) {
 		b := w[i]
-		if target < b.slot_top + b.gap + b.h || i == len(w) - 1 {
-			return {b.start, clamp(target - b.slot_top, 0, b.gap + b.h)}
+		if target < b.slot_top + b.gap + b.h {
+			return {b.start, max(0, target - b.slot_top)}
+		}
+		if i == len(w) - 1 {
+			return {b.next, max(0, target - (b.slot_top + b.gap + b.h))}
 		}
 	}
-	return {w[lo].start, 0}
+	if lo < len(w) {return {w[lo].start, 0}}
+	return {}
 }
 
 // The scroll position as a fraction of the scrollable range, for the scrollbar.
