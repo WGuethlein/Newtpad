@@ -1301,6 +1301,9 @@ when NEWTPAD_TESTS {
 			// --- the grammar, on hand-written captures ---
 			{
 				// "abbbc" with group 1 = "bbb" -- the design doc's own example.
+				// TWO groups declared (len(pos) == 3), the second unset, so this
+				// fixture can express all three states a `$n` can be in: set,
+				// declared-but-unset, and not a group at all.
 				src := "abbbc"
 				pos := [][2]int{{0, 5}, {1, 4}, {-1, -1}}
 				for c in ([]struct {
@@ -1318,13 +1321,22 @@ when NEWTPAD_TESTS {
 					{"${1}", "bbb"},
 					{"${1}2", "bbb2"}, // the reason braces exist
 					{"$12", "bbb2"}, // group 12 does not exist -> group 1, then '2'
-					{"${12}", ""}, // ...but spelled with braces it is out of range: empty
+					{"${12}", "${12}"}, // ...and braced it names nothing at all: LITERAL
 					{"${0}", "abbbc"},
 					{"${}", "${}"},
 					{"${x}", "${x}"},
 					{"${1", "${1"},
-					{"$2", ""}, // declared-but-unset (or absent) -> empty, not an error
-					{"$9", ""},
+					// THE SPLIT THE STANDARDS MAKE AND THE SPEC GOT WRONG. Group 2
+					// is DECLARED here and did not capture -> empty. Group 5 is not
+					// a group at all -> the characters `$5`, as .NET ("$number is
+					// interpreted as a literal character sequence") and ECMA-262
+					// GetSubstitution ("no replacement is done") both require. The
+					// two must be distinguishable; collapsing them to empty, which
+					// is what shipped, silently deletes bytes the user typed.
+					{"$2", ""}, // declared, unset -> empty
+					{"$5", "$5"}, // no such group -> literal
+					{"$9", "$9"},
+					{"a$7b", "a$7b"},
 					{"plain text", "plain text"},
 					{"", ""},
 					{"a${1}b$&c$$d", "abbbbabbbcc$d"},
@@ -1414,6 +1426,17 @@ when NEWTPAD_TESTS {
 			// lines, one document, so a fix that returns empty for everything
 			// cannot pass.
 			e2e(&bad, "xz\nxyz\n", "x(y)?z", "[$1]", "[]\n[y]\n", "an unset optional group is empty, a set one is not")
+			// EXISTS-BUT-UNSET vs DOES-NOT-EXIST, end to end and in ONE document,
+			// so the group count really is read off the compiled program. `$2` is
+			// declared and did not capture on the first line -> empty; `$5` is not
+			// a group at all -> the characters `$5`. A fix that collapses both to
+			// empty passes neither line, and one that makes both literal fails the
+			// second. Sabotage by ignoring len(pos) in find_subst_expand.
+			e2e(&bad, "a-\na-b\n", "(a)-(b)?", "<$2|$5>", "<|$5>\n<b|$5>\n", "an out-of-range group is LITERAL while a declared-but-unset one is empty")
+			// ...and with NO groups at all, every `$n` is literal -- the case where
+			// a query-text group count and a program walk would most easily
+			// disagree, since `\(` and `(?:` are not groups.
+			e2e(&bad, "cat\n", "c(?:a)t", "[$1]", "[$1]\n", "a pattern whose only paren is non-capturing declares no group, so $1 is literal")
 			// A capture whose own text contains a $ is copied out verbatim: no
 			// second round of substitution over the group's bytes.
 			e2e(&bad, "Qa$bQ", "Q([^Q]+)Q", "[$1]", "[a$b]", "a $ inside the captured text is not re-expanded")
@@ -1428,6 +1451,38 @@ when NEWTPAD_TESTS {
 			// ...and its mirror: `\b` must still be FALSE where the scan said it
 			// was false, so a seeded byte cannot be turned into a free pass.
 			e2e(&bad, "xcat cat", "\\b(cat)", "[$1]", "xcat [cat]", "...and \\b still fails where the scan said it failed")
+
+			// `$` AT AN ORDINARY LINE END, THE OTHER HALF OF THE ANCHOR TRAP AND
+			// THE ONE THAT SHIPPED WRONG. pt_line_end_cap returns the offset OF
+			// the '\n', so a window that stops there ends where the scan's 256 KB
+			// block does not, and `Assert_End` (`sp == len(memory)`) is TRUE here
+			// and was FALSE there. That is the NON-conservative direction and it
+			// fires on every line, not at some 256 KB boundary.
+			//
+			// Both cases are alternations whose branches cover the same bytes,
+			// which is the only shape where the span check in find_subst_one (4)
+			// cannot save us: it verifies WHICH BYTES were matched and says
+			// nothing about WHICH BRANCH matched them.
+			//
+			//   - the first is a silent WRONG GROUP: the scan takes `(a)` because
+			//     `$` is false mid-block; a window ending at the newline lets
+			//     `(a)$` win instead, the span is identical, verification passes,
+			//     and `<$1/$2>` comes out `<a/>` where it must be `</a>`.
+			//   - the second is DATA LOSS: `(ab)$` wins the re-match, matches two
+			//     bytes where the scan published one, the span check rejects it,
+			//     and EVERY group falls back to empty -- the captured `a` is gone
+			//     from the document.
+			//
+			// Fixed by extending the window one byte past the line's text (see
+			// find_subst_one (3)), so `$` is false at a line end exactly as it was
+			// in the block. Sabotage by dropping `w1 += 1`: both fail with the
+			// outputs named above.
+			e2e(&bad, "pa\npa\npa\n", "(a)$|(a)", "<$1/$2>", "p</a>\np</a>\np</a>\n", "`$` is false at an ordinary line end, so the scan's branch is the one re-matched")
+			e2e(&bad, "xab\n", "(ab)$|(a)", "[$1|$2]", "x[|a]b\n", "...and a longer `$` branch cannot steal the span and take the captures with it")
+			// The same anchor, at END OF BUFFER, where `$` genuinely IS true and
+			// the window has nothing to add: the fix must not turn it off. Same
+			// pattern, no trailing newline, so the first branch is the right one.
+			e2e(&bad, "pa", "(a)$|(a)", "<$1/$2>", "p<a/>", "...but `$` at end of buffer still matches, where the scan had it true too")
 
 			// REPLACE MATCH, not Replace All. A second, independent path through
 			// the same expansion (find_replacement_for), and the one where the
@@ -1532,8 +1587,37 @@ when NEWTPAD_TESTS {
 				got := doc_debug_string(&doc)
 				sb_chk(&bad, matches == MAX_MATCHES && replaced == MAX_MATCHES, fmt.tprintf("the match list is saturated and all of it is replaced (%d/%d)", matches, replaced))
 				sb_chk(&bad, strings.count(got, "<a>") == MAX_MATCHES, fmt.tprintf("every one of them substituted the group (%d, want %d)", strings.count(got, "<a>"), MAX_MATCHES))
-				fmt.printfln("  ---   %d substituting replacements (scan included) on the main thread: %.0f ms", replaced, ms)
-				sb_chk(&bad, ms < 3000, fmt.tprintf("...and it stays inside the tripwire (%.0f ms)", ms))
+				fmt.printfln("  ---   %d substituting replacements (scan included) on the main thread, SHORT LINES: %.0f ms", replaced, ms)
+				sb_chk(&bad, ms < 3000, fmt.tprintf("...and the short-line shape stays inside the tripwire (%.0f ms)", ms))
+			}
+
+			// THE SAME CEILING ON ONE LONG LINE, WHICH IS THE SHAPE THIS DESIGN
+			// ACTUALLY COSTS. The fixture above is 4-byte lines, so its re-match
+			// window is 4 bytes and REGEX_SUBST_TAIL never binds -- it could not
+			// see a regression in the cap if one were introduced, and it did not
+			// see the one that was: rx_vm.run walks the WHOLE window per match
+			// (the injected opening keeps a thread alive to the last byte, and
+			// `case .Match` breaks the thread loop rather than returning), so on a
+			// single-line file every match pays the full cap. At the shipped 4096
+			// this fixture measured 1452 ms and PASSED the 3000 ms tripwire -- a
+			// second and a half of frozen UI that the guard could not see, on
+			// minified JSON and single-line log dumps, both named use cases.
+			//
+			// Same match count as above so the two numbers are directly
+			// comparable: the only variable is the line length.
+			{
+				src := strings.repeat("cat ", 120_000, context.temp_allocator) // ONE line, no newline
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub6.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				start := time.tick_now()
+				replaced, matches := run(&doc, "c(a)t", "<$1>")
+				ms := time.duration_milliseconds(time.tick_since(start))
+				got := doc_debug_string(&doc)
+				sb_chk(&bad, matches == MAX_MATCHES && replaced == MAX_MATCHES, fmt.tprintf("one long line: the match list is saturated and all of it is replaced (%d/%d)", matches, replaced))
+				sb_chk(&bad, strings.count(got, "<a>") == MAX_MATCHES, fmt.tprintf("one long line: every one of them substituted the group (%d, want %d)", strings.count(got, "<a>"), MAX_MATCHES))
+				fmt.printfln("  ---   %d substituting replacements (scan included) on the main thread, ONE %d-BYTE LINE: %.0f ms", replaced, len(src), ms)
+				sb_chk(&bad, ms < 3000, fmt.tprintf("...and the LONG-LINE shape stays inside the tripwire too (%.0f ms) -- this is the one REGEX_SUBST_TAIL bounds", ms))
 			}
 			return
 		}

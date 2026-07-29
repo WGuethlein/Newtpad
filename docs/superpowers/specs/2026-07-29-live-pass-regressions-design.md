@@ -34,9 +34,22 @@ the *replacement* too invites the confusion this feature exists to remove.
 | `$$` | a literal `$` |
 | `$` followed by anything else | literal, emitted as-is |
 
-An out-of-range group substitutes **empty**, matching .NET. It is not an error: a pattern with an
-optional group legitimately produces an unset capture, and refusing the whole replace over it would be
-worse than the alternative.
+**Corrected 2026-07-29.** This section originally read *"An out-of-range group substitutes **empty**,
+matching .NET."* That is wrong about both standards it names, and it shipped that way — `$5` against a
+two-group pattern silently deleted the two characters the user typed. The rule is a **split**, and the
+two halves are different things:
+
+| Case | Result | Authority |
+|---|---|---|
+| Group is **declared** by the pattern and did not capture | **empty** | ECMA-262 `GetSubstitution`: a declared group that is `undefined` contributes the empty String |
+| Group is **not declared** at all (`$5` against two groups) | **literal**, the characters as typed | .NET: *"If number doesn't specify a valid capturing group … `$number` is interpreted as a literal character sequence."* ECMA-262: for `$n` past the group count, no replacement is performed |
+
+Neither is an error: a pattern with an optional group legitimately produces an unset capture, and
+refusing the whole replace over a typo would be worse than writing the typo back out.
+
+The group count is read off the **compiled program** — `compile` emits `Save 2*id` / `Save 2*id+1` per
+capturing group, so the highest `Save` operand halved is the count — rather than counted from the query
+text, which would have to reimplement the tokenizer to agree about `\(` and `(?:`.
 
 **How captures are recovered, and why not by storing them.** `Search` keeps matches as parallel arrays
 (`matches`, `match_len`, `line_start`, `line_no`) with no capture data. Storing groups would cost
@@ -55,9 +68,19 @@ at search time. If `core:text/regex` cannot express "match starting exactly here
 rather than shipping a subtly different match.
 
 **Test.** `a(b+)c` over `abbbc` with `[$1]` → `[bbb]`; `$&` → the whole match; `$$` → one `$`; `${12}`
-against a 12-group pattern; an unset optional group → empty; `$x` → literal `$x`; a group whose text
-contains a `$`. Plus: a replacement with no `$` at all must take the cheap path and produce identical
-output to today. **Sabotage:** emit groups in the wrong order and confirm the test fails.
+against a 12-group pattern; an unset optional group → empty; an out-of-range group → literal, in the
+same document as a declared-but-unset one so the two are provably distinguishable; `$x` → literal `$x`;
+a group whose text contains a `$`. Plus: a replacement with no `$` at all must take the cheap path and
+produce identical output to today. **Sabotage:** emit groups in the wrong order and confirm the test
+fails; collapse out-of-range back to empty and confirm the literal case fails.
+
+**Anchors, as built.** `core:text/regex` cannot express "match starting exactly here", so the re-match
+runs over a window read from the piece table: one byte of left context (which is what `\b`/`\B` need),
+and everything up to **and including** the newline that ends the match's line (which is what `$` needs —
+`Assert_End` is `sp == len(memory)`, so a window stopping *at* the newline makes `$` true on every
+ordinary line where the scan's 256 KB block had it false). The result is then verified against the
+published span. `^` remains window-relative and is left alone: that direction only ever costs a match.
+See `find_subst_one`'s header for the full residual list.
 
 ---
 
