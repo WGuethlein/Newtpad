@@ -5512,8 +5512,220 @@ when NEWTPAD_TESTS {
 					"a proportional family named for .Doc still falls back to mono",
 				)
 			}
+			// `shape_spans` (batch 17 task 2a): one line, several faces and sizes.
+			// Its own proc and its own plat.Text — sh_run's last act is to reload
+			// the .Doc chain onto Georgia, and half of what follows compares the
+			// body face against the mono one.
+			sh_spans :: proc(bad: ^int) {
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					sh_chk(bad, false, "text_load_faces (spans)")
+					return
+				}
+				WIDE := f32(100000)
+				// §9.3's own rounding rule: "compute every size as round(k * S)".
+				// Integral sizes are not cosmetic here — Glyph_Key.px is a u16 and
+				// glyph_get truncates into it, so 14.72 and 14.0 would share a
+				// cache entry while rasterizing at different sizes.
+				S := f32(16) // base document size
+				S_CODE := f32(15) // round(0.92 * S), §9.3 inline code
+				S_H1 := f32(30) // round(1.85 * S), §9.3 h1
+
+				// --- a word straddling a span boundary ------------------------
+				//
+				// THE case that makes per-span composition impossible: the break
+				// has to reach backwards into a span that was already emitted and
+				// carry its tail down, which a per-span call cannot do because it
+				// has never seen that glyph array.
+				fmt.println("--- shape_spans: a word straddling a span boundary ---")
+				JOIN := "an alphabe"
+				two := [2]plat.Shape_Span{{"an alpha", S, .Body}, {"be", S, .Body}}
+				// The measure has to sit in a window with three walls, all of them
+				// MEASURED rather than guessed:
+				//   lower: >= width("an alpha"), so span 0 alone would NOT break
+				//          — otherwise the per-span breaker this test rules out
+				//          would have broken too and the comparison proves nothing;
+				//   lower: >= width("alphabe"), so the carried tail plus span 1
+				//          fits and the run is exactly two lines;
+				//   upper: <  width("an alpha") + adv('b'), so span 1's first
+				//          glyph really does overflow and force the break.
+				// The first draft used width("an alpha") + half a 'b' with span 1
+				// = "beta", which left a 0.05px window: it happened to pass, but
+				// on any other body face it would have been a coin toss.
+				w_span0 := plat.shape_run(nil, &t, "an alpha", S, WIDE, 0, .Body, context.temp_allocator).width
+				w_carried := plat.shape_run(nil, &t, "alphabe", S, WIDE, 0, .Body, context.temp_allocator).width
+				lo := max(w_span0, w_carried)
+				hi := w_span0 + plat.text_advance(nil, &t, 'b', S, .Body)
+				fmt.printfln("  two-line measure window: [%.2f, %.2f), %.2fpx wide", lo, hi, hi - lo)
+				sh_chk(bad, hi-lo > 2, "(precondition) the two-line measure window is comfortably wide, not a coin toss")
+				mw := (lo + hi) * 0.5
+				ref := plat.shape_run(nil, &t, JOIN, S, mw, 0, .Body, context.temp_allocator)
+				got := plat.shape_spans(nil, &t, two[:], mw, 0, context.temp_allocator)
+				// Non-vacuity, stated as code: this is what a per-span
+				// composition would have produced. If span 0 alone does not fit
+				// on one line at this measure, the test below proves nothing.
+				naive := plat.shape_run(nil, &t, "an alpha", S, mw, 0, .Body, context.temp_allocator)
+				sh_chk(bad, naive.lines == 1, "(precondition) span 0 alone fits on one line, so a per-span breaker would NOT break it")
+				sh_chk(bad, ref.lines == 2, "(precondition) the joined string does break, at the space before \"alpha\"")
+
+				same := len(got.glyphs) == len(ref.glyphs)
+				if same {
+					for g, i in got.glyphs {
+						r := ref.glyphs[i]
+						if g.r != r.r || g.line != r.line || abs(g.x - r.x) > 0.001 || abs(g.y - r.y) > 0.001 {same = false}
+					}
+				}
+				sh_chk(bad, same, "two spans lay out glyph-for-glyph like ONE run over the joined string")
+				sh_chk(bad, got.lines == ref.lines && abs(got.width - ref.width) < 0.001 && abs(got.height - ref.height) < 0.001, "...and report the same lines, width and height")
+				// The specific thing a per-span breaker gets wrong: "alpha" is in
+				// span 0 and has to end up on line 1, next to span 1's "beta".
+				span0_on_1, span1_on_1 := 0, 0
+				for g in got.glyphs {
+					if g.line != 1 {continue}
+					if g.span == 0 {span0_on_1 += 1}
+					if g.span == 1 {span1_on_1 += 1}
+				}
+				sh_chk(bad, span0_on_1 == 5 && span1_on_1 == 2, fmt.tprintf("the break carried span 0's tail across the boundary (line 1 = %d from span 0 + %d from span 1)", span0_on_1, span1_on_1))
+				f1 := -1
+				for g, i in got.glyphs {
+					if g.line == 1 {f1 = i;break}
+				}
+				sh_chk(bad, f1 >= 0 && got.glyphs[f1].span == 0 && got.glyphs[f1].off == 3 && abs(got.glyphs[f1].x) < 0.001, "line 1 starts at span 0's 'a' (off 3), re-origined to x = 0")
+
+				// (span, off) is the glyph's address in the caller's text, and the
+				// link seam will read it back. Check every glyph's pair actually
+				// decodes to the rune that was emitted — a bookkeeping slip that
+				// leaves `off` measured from the joined string instead of the span
+				// shows up here and nowhere else.
+				addr_ok := true
+				for g in got.glyphs {
+					if int(g.span) >= len(two) {addr_ok = false;continue}
+					txt := two[g.span].text
+					if int(g.off) >= len(txt) {addr_ok = false;continue}
+					r, _ := utf8.decode_rune(txt[g.off:])
+					if r != g.r {addr_ok = false}
+				}
+				sh_chk(bad, addr_ok, "every glyph's (span, off) decodes back to the rune it emitted")
+
+				// --- the line box is the per-line maximum ---------------------
+				fmt.println("--- shape_spans: the line box is the per-LINE maximum ---")
+				a_big, d_big, _ := plat.text_vmetrics(&t, S_H1, .Body_Bold)
+				a_sml, d_sml, _ := plat.text_vmetrics(&t, S_CODE, .Doc)
+				sh_chk(bad, a_big > a_sml + 1 && d_big > d_sml + 0.1, fmt.tprintf("(precondition) the two faces really differ (asc %.3f vs %.3f, desc %.3f vs %.3f)", a_big, a_sml, d_big, d_sml))
+				// Run it BOTH WAYS. Taking spans[0]'s box instead of the maximum
+				// gives the right answer for exactly one of these two orders,
+				// which is why one ordering on its own is not a test.
+				for order in 0 ..< 2 {
+					mix: [2]plat.Shape_Span
+					if order == 0 {
+						mix = {{"Head", S_H1, .Body_Bold}, {"code", S_CODE, .Doc}}
+					} else {
+						mix = {{"code", S_CODE, .Doc}, {"Head", S_H1, .Body_Bold}}
+					}
+					what := "big first" if order == 0 else "small first"
+					m := plat.shape_spans(nil, &t, mix[:], WIDE, 0, context.temp_allocator)
+					if m.lines != 1 || len(m.line_boxes) != 1 {
+						sh_chk(bad, false, fmt.tprintf("%s: expected one line with one box", what))
+						continue
+					}
+					b := m.line_boxes[0]
+					sh_chk(bad, abs(b.ascent - max(a_big, a_sml)) < 0.001, fmt.tprintf("%s: the line's ascent is the TALLER span's (%.3f)", what, b.ascent))
+					sh_chk(bad, abs(b.descent - max(d_big, d_sml)) < 0.001, fmt.tprintf("%s: the line's descent is the DEEPER span's (%.3f)", what, b.descent))
+					// The common baseline, which is what the box is for: inline
+					// code sitting off the prose baseline is the visible defect.
+					one_base := true
+					for g in m.glyphs {
+						if abs(g.y - b.y) > 0.001 {one_base = false}
+					}
+					sh_chk(bad, one_base, fmt.tprintf("%s: every glyph on the line sits on the ONE baseline line_boxes[0].y", what))
+					// And the box actually contains both faces' ink, measured
+					// against each glyph's OWN span metrics rather than the run's.
+					inside := true
+					for g in m.glyphs {
+						asc, desc, _ := plat.text_vmetrics(&t, mix[g.span].px, mix[g.span].set)
+						if g.y - asc < b.top - 0.001 {inside = false}
+						if g.y + desc > b.top + b.h + 0.001 {inside = false}
+					}
+					sh_chk(bad, inside, fmt.tprintf("%s: every glyph's own ink box lies inside the line box", what))
+				}
+
+				// --- per LINE, not per run ------------------------------------
+				//
+				// Two lines, each holding only one of the two sizes: their boxes
+				// must differ. A shaper that gave every line the run's nominal box
+				// passes every check above and fails here.
+				fmt.println("--- shape_spans: different lines get different boxes ---")
+				stack := [2]plat.Shape_Span{{"Head\n", S_H1, .Body_Bold}, {"code", S_CODE, .Doc}}
+				st := plat.shape_spans(nil, &t, stack[:], WIDE, 0, context.temp_allocator)
+				sh_chk(bad, st.lines == 2 && len(st.line_boxes) == 2, "a hard break inside span 0 gives two lines")
+				if st.lines == 2 {
+					h0, h1x := st.line_boxes[0].h, st.line_boxes[1].h
+					fmt.printfln("  line boxes: %.3f (30px body bold) and %.3f (15px mono)", h0, h1x)
+					sh_chk(bad, h0 > h1x + 1, "the heading line's box is taller than the code line's")
+					sh_chk(bad, abs(st.height - (h0 + h1x)) < 0.001, "height is the SUM of the line boxes, not lines * line_h")
+					sh_chk(bad, abs(st.height - f32(st.lines) * st.line_h) > 0.5, "...and is genuinely smaller than lines * line_h, so the check above is not vacuous")
+					sh_chk(bad, abs(st.line_h - max(h0, h1x)) < 0.001, "Shaped.line_h is the NOMINAL box: the tallest a line here can be")
+				}
+				// The boxes tile the run exactly, and every glyph reads its own
+				// line's baseline. Two producers of a y is the bug this rules out.
+				tile, reads := true, true
+				top := f32(0)
+				for b, l in st.line_boxes {
+					if abs(b.top - top) > 0.001 {tile = false}
+					top += b.h
+					_ = l
+				}
+				if abs(top - st.height) > 0.001 {tile = false}
+				for g in st.glyphs {
+					if abs(g.y - st.line_boxes[g.line].y) > 0.001 {reads = false}
+				}
+				sh_chk(bad, tile, "the line boxes tile [0, height) with no gap and no overlap")
+				sh_chk(bad, reads, "every glyph's y IS its line's line_boxes[].y")
+
+				// --- an empty line still owes a height ------------------------
+				blank := [2]plat.Shape_Span{{"Head\n\n", S_H1, .Body_Bold}, {"code", S_CODE, .Doc}}
+				bl := plat.shape_spans(nil, &t, blank[:], WIDE, 0, context.temp_allocator)
+				sh_chk(bad, bl.lines == 3, "two hard breaks leave an empty line in the middle")
+				if bl.lines == 3 {
+					sh_chk(bad, bl.line_boxes[1].h > 0, "the empty line has a height (it takes the box of the span that opened it)")
+					sh_chk(bad, abs(bl.line_boxes[1].h - bl.line_boxes[0].h) < 0.001, "...which is the heading's box, not the code's")
+				}
+
+				// --- widths ---------------------------------------------------
+				fmt.println("--- shape_spans: per-line widths ---")
+				sh_chk(bad, len(ref.line_boxes) == ref.lines, "shape_run fills line_boxes too (one entry per line)")
+				wmax, wagree := f32(0), true
+				for b in got.line_boxes {wmax = max(wmax, b.width)}
+				for b, l in got.line_boxes {
+					if abs(b.width - ref.line_boxes[l].width) > 0.001 {wagree = false}
+				}
+				sh_chk(bad, abs(got.width - wmax) < 0.001, "Shaped.width is the max of the per-line widths")
+				sh_chk(bad, wagree, "and the spanned run's per-line widths match the joined run's")
+
+				// --- degenerate input -----------------------------------------
+				fmt.println("--- shape_spans: degenerate input ---")
+				empty := plat.shape_spans(nil, &t, nil, WIDE, 0, context.temp_allocator)
+				sh_chk(bad, empty.lines == 0 && len(empty.glyphs) == 0 && empty.height == 0, "no spans at all: nothing, and no crash")
+				only := [1]plat.Shape_Span{{"", S, .Body}}
+				eo := plat.shape_spans(nil, &t, only[:], WIDE, 0, context.temp_allocator)
+				sh_chk(bad, eo.lines == 0 && eo.line_h > 0 && eo.ascent > 0, "one empty span: no glyphs, but the line box is still reported")
+				// An empty span BETWEEN two others must not renumber anything or
+				// break the carry — the block model will produce them (an empty
+				// `` `` code span, a zero-length emphasis run).
+				gap3 := [3]plat.Shape_Span{{"an alpha", S, .Body}, {"", S_CODE, .Doc}, {"be", S, .Body}}
+				g3 := plat.shape_spans(nil, &t, gap3[:], mw, 0, context.temp_allocator)
+				g3ok := len(g3.glyphs) == len(ref.glyphs)
+				if g3ok {
+					for g, i in g3.glyphs {
+						if g.r != ref.glyphs[i].r || g.line != ref.glyphs[i].line || abs(g.x - ref.glyphs[i].x) > 0.001 {g3ok = false}
+					}
+				}
+				sh_chk(bad, g3ok, "an empty span in the middle changes nothing about the layout")
+				sh_chk(bad, abs(g3.height - ref.height) < 0.001, "...and does not drag the line box to its own (unused) size")
+			}
 			bad := 0
 			sh_run(&bad)
+			sh_spans(&bad)
 			fmt.printfln("shapetest: %d failures", bad)
 			return true
 		}
