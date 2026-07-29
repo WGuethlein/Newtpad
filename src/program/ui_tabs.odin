@@ -388,7 +388,7 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) -> bool {
 				app.tab_drag_slot = hit_slot
 			}
 		} else if L.plus_on && mx >= L.plus_x && mx < L.plus_x + PLUS_W { // + -> new tab
-			app_new_scratch(app, true) // always after the last tab
+			app_new_scratch(app) // app_add always appends after the last live tab
 		}
 	}
 

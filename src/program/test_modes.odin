@@ -2811,6 +2811,99 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad taborder` pins the tab-order INVARIANT rather than one symptom:
+		// the rail's display order is the order tabs were added, and the only thing
+		// that ever reorders it is an explicit user drag. Not closing a tab, not
+		// opening one, not restoring a session. Wyatt: "sometimes tabs get added in
+		// the middle of the tab list... it should always appear at the end", and on
+		// being shown the diagnosis, "I don't want random order tabs, unacceptable."
+		//
+		// The order is asserted after EVERY step, because the invariant has more
+		// than one way to break: app_add used to reuse the first freed slot (so a
+		// file opened after closing a middle tab landed in the hole), and the
+		// save/restore round-trip is a second, independent route to the same rail.
+		// Checking only open-after-close would pass while leaving the others open.
+		//
+		// Set NEWTPAD_SESSION_DIR to a temp dir first -- this mode writes a session.
+		if os.args[1] == "taborder" {
+			if !require_scratch_session("taborder") {return true}
+			to_chk :: proc(bad: ^int, got, want, msg: string) {
+				ok := got == want
+				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				if !ok {
+					fmt.printfln("         got  %q", got)
+					fmt.printfln("         want %q", want)
+					bad^ += 1
+				}
+			}
+			// The rail draws a.docs in slot order and skips nil slots (tabs_layout),
+			// so the live slots' labels, in slot order, ARE the display order.
+			to_order :: proc(a: ^App) -> string {
+				sb := strings.builder_make(context.temp_allocator)
+				for d in a.docs {
+					if d == nil {continue}
+					strings.write_string(&sb, tab_label(a, d))
+					strings.write_byte(&sb, '|')
+				}
+				return strings.to_string(sb)
+			}
+			// Real files in their own directory, not bare Documents carrying a made-up
+			// path. A clean tab is saved with bidx -1 and restored by REOPENING THE
+			// PATH, so a fabricated path is dropped by the restore and the second half
+			// of this test could never fail for the reason it exists. The directory
+			// keeps the labels short (tab_label is the base name) so a mismatch prints
+			// readably.
+			to_open :: proc(a: ^App, name: string) -> bool {
+				dir := fmt.tprintf("%s%cnewtpad_taborder", os.get_env("TEMP", context.temp_allocator), '\\')
+				plat.dir_create(dir)
+				p := fmt.tprintf("%s%c%s", dir, '\\', name)
+				plat.file_write_atomic(p, transmute([]u8)string("tab order fixture\n"))
+				return app_open_path(a, p)
+			}
+			// PART ONE: open / close / open / drag. One App live in this proc, and
+			// part two's App is in a proc of its own -- test_mode_dispatch already has
+			// a large frame and has hit a real STATUS_STACK_OVERFLOW from two Apps
+			// held live together.
+			to_opens :: proc(bad: ^int) {
+				app: App
+				defer app_destroy(&app)
+				for name in ([]string{"a.txt", "b.txt", "c.txt", "d.txt"}) {
+					if !to_open(&app, name) {fmt.printfln("  (could not open %s)", name)}
+				}
+				to_chk(bad, to_order(&app), "a.txt|b.txt|c.txt|d.txt|", "four opens keep their order")
+				app_close(&app, 1) // b.txt, a middle tab
+				to_chk(bad, to_order(&app), "a.txt|c.txt|d.txt|", "closing the middle does not reorder the rest")
+				to_open(&app, "e.txt")
+				to_chk(bad, to_order(&app), "a.txt|c.txt|d.txt|e.txt|", "a new tab appends after the last live tab")
+				session_save(&app)
+				// The one legal reorder. Asserted so the invariant is "only a drag
+				// moves a tab", not "nothing ever moves a tab" -- a proc that simply
+				// refused to reorder would pass every check above.
+				app_swap_tabs(&app, 0, 2) // the swap tabs_drag_update makes
+				to_chk(bad, to_order(&app), "c.txt|a.txt|d.txt|e.txt|", "an explicit drag is the one thing that does reorder")
+			}
+			// PART TWO: the same rail, rebuilt from the session part one wrote.
+			to_restores :: proc(bad: ^int) {
+				app: App
+				defer app_destroy(&app)
+				if !session_restore(&app) {fmt.println("  (session_restore returned false)")}
+				to_chk(bad, to_order(&app), "a.txt|c.txt|d.txt|e.txt|", "a session restore preserves display order")
+			}
+			// Leave a clean session behind so a later GUI launch doesn't adopt these.
+			to_reset :: proc() {
+				empty: App
+				defer app_destroy(&empty)
+				app_new_scratch(&empty)
+				session_save(&empty)
+			}
+			bad := 0
+			to_opens(&bad)
+			to_restores(&bad)
+			to_reset()
+			fmt.printfln("taborder: %d failures", bad)
+			return true
+		}
+
 		// `newtpad savestreamtest` proves the streamed save (rune-aligned chunks) is
 		// byte-identical to the reference whole-buffer encoder across the 1 MB chunk
 		// boundary, for every encoding — the risk being a multibyte rune split at a
@@ -11262,7 +11355,7 @@ when NEWTPAD_TESTS {
 				// overflows, and the narrow floor. A uniform-width bug hides at the
 				// comfortable size and shows at the edges.
 				for ntabs in ([]int{1, 3, 8}) {
-					for len(a.docs) < ntabs {app_new_scratch(&a, true)}
+					for len(a.docs) < ntabs {app_new_scratch(&a)}
 					for width in ([]f32{320, 700, 1280, 2560}) {
 						win.width = i32(width)
 						L := tabs_layout(&a, &win, &txt, width)
@@ -11374,7 +11467,7 @@ when NEWTPAD_TESTS {
 				// palette was the only way to reach one.
 				{
 					UI_SCALE = 1
-					for len(a.docs) < 12 {app_new_scratch(&a, true)}
+					for len(a.docs) < 12 {app_new_scratch(&a)}
 					win.width = 700 // narrow enough that most tabs cannot fit
 					vis :: proc(a: ^App, win: ^plat.Window, t: ^plat.Text, w: f32, slot: int) -> bool {
 						L := tabs_layout(a, win, t, w)

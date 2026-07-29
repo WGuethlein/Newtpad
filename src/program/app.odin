@@ -131,27 +131,33 @@ app_live_count :: proc(a: ^App) -> (n: int) {
 	return
 }
 
-// Place a document in a free slot (reusing a nil one) and return its slot.
-// `at_end` places the tab after all existing ones instead of reusing a freed
-// slot. Reuse keeps the slot array compact, but it makes a new tab appear in the
-// middle of the strip wherever a tab was last closed, which is not where the
-// user just clicked "+".
-app_add :: proc(a: ^App, d: ^Document, at_end := false) -> int {
+// Place a document after every live tab and return its slot.
+//
+// Tab order is an invariant, not a placement heuristic: the rail's display order
+// is the order tabs were added, and the only thing that ever reorders it is an
+// explicit user drag (app_swap_tabs). This used to reuse the first nil slot, so
+// closing a middle tab and then opening a file put the new tab in the hole --
+// Wyatt: "sometimes tabs get added in the middle of the tab list... it should
+// always appear at the end if it was newly created, dragged in, or opened", and
+// on seeing the diagnosis, "I don't want random order tabs, unacceptable."
+//
+// The `at_end` parameter that opted into the right behaviour is GONE rather than
+// defaulted: three of its four callers omitted it and got the wrong placement,
+// and a parameter with one legal value is the next caller's chance to get it
+// wrong again. Same for app_new_scratch's.
+//
+// Slots still never shift (see the header comment): a closed middle tab leaves a
+// nil hole that stays a hole, so every live slot index -- a.active, a.mru,
+// Watch_Entry.slot, Palette_Result.slot -- keeps meaning what it meant.
+app_add :: proc(a: ^App, d: ^Document) -> int {
 	a.next_gen += 1
 	d.gen = a.next_gen // identifies this document across slot reuse
-	if !at_end {
-		for slot, i in a.docs {
-			if slot == nil {
-				a.docs[i] = d
-				return i
-			}
-		}
-	} else {
-		// Trailing empty slots would still put it before live tabs; drop them
-		// first so "end" really is the end.
-		for len(a.docs) > 0 && a.docs[len(a.docs) - 1] == nil {
-			pop(&a.docs)
-		}
+	// Trailing empty slots would still put it before live tabs; drop them first
+	// so "end" really is the end. This is also what keeps `docs` from growing
+	// without bound over a long session: closing and reopening the last tab
+	// reclaims its slot, and only a hole with live tabs to its right persists.
+	for len(a.docs) > 0 && a.docs[len(a.docs) - 1] == nil {
+		pop(&a.docs)
 	}
 	append(&a.docs, d)
 	return len(a.docs) - 1
@@ -192,11 +198,11 @@ app_activate :: proc(a: ^App, slot: int) {
 	}
 }
 
-app_new_scratch :: proc(a: ^App, at_end := false) {
+app_new_scratch :: proc(a: ^App) {
 	d := new(Document)
 	d^ = doc_new()
 	d.wrap = a.settings.wrap_default
-	app_activate(a, app_add(a, d, at_end))
+	app_activate(a, app_add(a, d))
 }
 
 // Open a Settings or Font tab, or switch to it if one is already open — these
