@@ -1922,6 +1922,127 @@ when NEWTPAD_TESTS {
 				if !ok {bad^ += 1}
 				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
 			}
+			// The styled body faces §9.3's weight column needs (batch 17 task 2a).
+			// Its own proc, and its own plat.Text, for two reasons: the locals are
+			// large and test_mode_dispatch's frame has overflowed twice, and the
+			// checks below are about a FRESHLY loaded Text — the block above
+			// deliberately reloads .UI and .Doc onto other families, and asserting
+			// "the styled chains came from BODY_FAMILIES" against a Text somebody
+			// else has been rearranging proves less than it looks like it does.
+			fnt_styles :: proc(bad: ^int) {
+				fmt.println("--- styled body faces (§9.3 weight 700) ---")
+
+				// 1. FONT_SETS is a bijection from (base, style) to member.
+				//    A copy-pasted row -- .Body_Italic left saying {.Body, .Bold}
+				//    -- would make one member unreachable from text_styled_set and
+				//    silently draw bold where italic was asked for, with every
+				//    other check here still green because the bold face IS real.
+				dup := false
+				for a in plat.Font_Set {
+					ab, as_ := plat.font_set_def(a)
+					// A base must be its own family's regular member, or the
+					// whole grid is hanging off a member that is itself styled.
+					bb, bs := plat.font_set_def(ab)
+					if bb != ab || bs != .Regular {dup = true}
+					for b in plat.Font_Set {
+						if b == a {continue}
+						cb, cs := plat.font_set_def(b)
+						if cb == ab && cs == as_ {dup = true}
+					}
+				}
+				fnt_chk(bad, !dup, "FONT_SETS: every (base, style) pair names exactly one member")
+
+				// 2. font_style_file, the single producer of "which file is this
+				//    style", driven with families this machine may not have. The
+				//    no-bold case is the one that matters: it is what keeps the
+				//    caller's synthetic emphasis reachable, and on a machine where
+				//    every installed family ships all four files it is otherwise
+				//    never executed.
+				full := plat.Font_Family{"F", "r.ttf", "b.ttf", "i.ttf", "z.ttf"}
+				none := plat.Font_Family{"N", "r.ttf", "", "", ""}
+				boldonly := plat.Font_Family{"B", "r.ttf", "b.ttf", "", ""}
+				f1, g1 := plat.font_style_file(full, .Bold)
+				f2, g2 := plat.font_style_file(full, .Bold_Italic)
+				f3, g3 := plat.font_style_file(none, .Bold)
+				f4, g4 := plat.font_style_file(none, .Italic)
+				f5, g5 := plat.font_style_file(boldonly, .Bold_Italic)
+				f6, g6 := plat.font_style_file(full, .Regular)
+				fnt_chk(bad, f1 == "b.ttf" && g1 == .Bold, "font_style_file: a complete family returns its own bold file")
+				fnt_chk(bad, f2 == "z.ttf" && g2 == .Bold_Italic, "font_style_file: ...and its own bold-italic file")
+				fnt_chk(bad, f6 == "r.ttf" && g6 == .Regular, "font_style_file: regular is the regular file")
+				fnt_chk(bad, f3 == "r.ttf" && g3 == .Regular, "font_style_file: NO bold file -> regular file AND got=.Regular")
+				fnt_chk(bad, f4 == "r.ttf" && g4 == .Regular, "font_style_file: no italic file -> regular file AND got=.Regular")
+				fnt_chk(bad, f5 == "b.ttf" && g5 == .Bold, "font_style_file: bold-italic degrades to bold before regular")
+
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fnt_chk(bad, false, "text_load_faces (styled section)")
+					return
+				}
+				px := f32(16)
+
+				// 3. The styled body chains loaded the BODY family, not the mono
+				//    one. find_family tests FONT_SETS[set].base rather than
+				//    `set == .Body`; with the naive test every styled chain would
+				//    have silently been Consolas, and a monospace chain is exactly
+				//    what "i and W advance the same" detects.
+				for s in ([]plat.Font_Set{.Body_Bold, .Body_Italic, .Body_Bold_Italic}) {
+					ai := plat.text_advance(nil, &t, 'i', px, s)
+					aW := plat.text_advance(nil, &t, 'W', px, s)
+					fmt.printfln("    %v: i=%.4f W=%.4f  em=%.4f", s, ai, aW, plat.text_char_em(&t, s))
+					fnt_chk(bad, aW > ai * 1.5, fmt.tprintf("%v is proportional (it came from BODY_FAMILIES, not Consolas)", s))
+				}
+
+				// 4. A REAL bold face, not the regular one wearing the name. If
+				//    text_load_body_face never loaded georgiab.ttf, .Body_Bold's
+				//    chain is byte-for-byte .Body's, so every one of these is an
+				//    exact equality and the check cannot pass by luck.
+				em_r := plat.text_char_em(&t, .Body)
+				em_b := plat.text_char_em(&t, .Body_Bold)
+				em_i := plat.text_char_em(&t, .Body_Italic)
+				em_z := plat.text_char_em(&t, .Body_Bold_Italic)
+				fmt.printfln("    body em: regular=%.5f bold=%.5f italic=%.5f bolditalic=%.5f", em_r, em_b, em_i, em_z)
+				fnt_chk(bad, em_b != em_r, "the bold body chain measures differently from the regular one")
+				fnt_chk(bad, em_i != em_r, "...and so does the italic one")
+				fnt_chk(bad, em_z != em_r, "...and the bold-italic one")
+				// em alone would also move if the chain had loaded some OTHER
+				// family, so pin the PIXELS too: the same rune at the same size
+				// out of a different file rasterizes to different coverage.
+				//
+				// The checksum, not the box: Georgia Italic's 'W' at 24px is the
+				// same 26x17 box as Georgia Regular's, so the box comparison this
+				// replaced went red against a correctly-loaded italic face. That
+				// was the test being wrong, not the loader.
+				wr, hr, ir, sr := plat.text_glyph_coverage_probe(&t, 'W', 24, .Body)
+				wb, hb, ib, sb := plat.text_glyph_coverage_probe(&t, 'W', 24, .Body_Bold)
+				wi, hi, ii, si := plat.text_glyph_coverage_probe(&t, 'W', 24, .Body_Italic)
+				fmt.printfln("    'W' @24px: regular %dx%d cov=%d  bold %dx%d cov=%d  italic %dx%d cov=%d", wr, hr, sr, wb, hb, sb, wi, hi, si)
+				fnt_chk(bad, ir && ib && ii && sr > 0, "(precondition) all three rasterize real coverage")
+				fnt_chk(bad, sb != sr, "bold 'W' rasterizes to different pixels than regular 'W'")
+				fnt_chk(bad, si != sr, "italic 'W' rasterizes to different pixels than regular 'W'")
+
+				// 5. The lookup a caller actually uses.
+				fnt_chk(bad, plat.text_styled_set(&t, .Body, .Bold) == .Body_Bold, "text_styled_set(.Body, .Bold) == .Body_Bold")
+				fnt_chk(bad, plat.text_styled_set(&t, .Body, .Italic) == .Body_Italic, "text_styled_set(.Body, .Italic) == .Body_Italic")
+				fnt_chk(bad, plat.text_styled_set(&t, .Body, .Regular) == .Body, "text_styled_set(.Body, .Regular) == .Body")
+				// Idempotent: asking a styled set for another style resolves
+				// through its base, so a caller holding .Body_Bold can still ask
+				// for italic without knowing it is already styled.
+				fnt_chk(bad, plat.text_styled_set(&t, .Body_Bold, .Italic) == .Body_Italic, "asking an already-styled set for another style goes via its base")
+				fnt_chk(bad, plat.text_styled_set(&t, .Body_Bold, .Regular) == .Body, "...and .Regular takes it back to the base")
+				fnt_chk(bad, plat.text_has_style(&t, .Body, .Bold), "text_has_style(.Body, .Bold)")
+
+				// 6. The cell grid keeps no styled members, so markdown.odin's
+				//    hairline double-draw stays the answer for .UI and .Doc. This
+				//    is the regression the brief calls out: a caller that switched
+				//    blindly to text_styled_set must get the same set back here.
+				for s in ([]plat.Font_Set{.UI, .Doc}) {
+					for st in ([]plat.Font_Style{.Bold, .Italic, .Bold_Italic}) {
+						fnt_chk(bad, plat.text_styled_set(&t, s, st) == s, fmt.tprintf("%v has no real %v face: styled_set returns %v itself", s, st, s))
+						fnt_chk(bad, !plat.text_has_style(&t, s, st), fmt.tprintf("...and text_has_style(%v, %v) is false, so synthetic emphasis stays", s, st))
+					}
+				}
+			}
 			t: plat.Text
 			if !plat.text_load_faces(&t) {
 				fmt.eprintln("fonttest: no fonts loaded")
@@ -2053,6 +2174,8 @@ when NEWTPAD_TESTS {
 				if !(unchanged && differs) {bad += 1}
 				plat.text_load_family(&t, "Consolas", .Regular, .Doc)
 			}
+
+			fnt_styles(&bad)
 
 			fmt.printfln("fonttest: %d failures", bad)
 			return true
@@ -5411,7 +5534,7 @@ when NEWTPAD_TESTS {
 				bad += 1
 			}
 			for c in ([]struct{r: rune, px: f32}{{'A', 16}, {'g', 16}, {'5', 16}, {'中', 24}, {'W', 200}}) {
-				w, h, inked := plat.text_glyph_coverage_probe(&t, c.r, c.px)
+				w, h, inked, _ := plat.text_glyph_coverage_probe(&t, c.r, c.px)
 				ok := w > 0 && h > 0 && inked
 				fmt.printfln("  %q @ %.0fpx -> %dx%d inked=%v %s", c.r, c.px, w, h, inked, "OK" if ok else "FAIL")
 				if !ok {bad += 1}

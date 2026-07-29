@@ -104,8 +104,8 @@ text_advance :: proc(gfx: ^Gfx, t: ^Text, r: rune, px: f32, set := Font_Set.Body
 		return f32(text_tab_width(t)) * text_advance(gfx, t, ' ', px, set)
 	}
 	if is_zero_width(r) {return 0}
-	face, gi := rune_face(t, r, set)
-	return glyph_get(gfx, t, set, face, gi, px).advance
+	fset, face, gi := rune_face(t, r, set)
+	return glyph_get(gfx, t, fset, face, gi, px).advance
 }
 
 // Shape `str` at `px` into a column `max_width` pixels wide.

@@ -53,10 +53,66 @@ MAX_FACES :: 8
 // on screen at the same time in split view, and because every cached glyph is
 // keyed by its set (Glyph_Key.set), so sharing a chain would mean sharing the
 // cell_cache and the atlas entries of a face with completely different metrics.
+//
+// STYLE IS A MEMBER, NOT A PARAMETER. §9.3 gives weight 700 to every heading
+// row, so the preview needs a real Georgia Bold rather than the synthetic
+// hairline-offset double-draw (at 1.85 S that is a smear, not weight 700). The
+// two shapes considered were (a) a `style` parameter alongside every existing
+// `set` parameter, making Text.chains two-dimensional, and (b) more members.
+//
+// (b), for a reason that is about call sites rather than taste: `set` appears in
+// ten public signatures here (text_draw, text_draw_spans, text_cells,
+// text_cell_width_at, text_bytes_for_cells, text_span_cells, text_char_width,
+// text_vmetrics, text_advance, shape_run) and roughly a hundred call sites in
+// src/program. A parallel `style` parameter would have to be threaded through
+// every one of them, and every site that forgot would silently keep drawing
+// regular text. As members, a caller asks for bold by naming .Body_Bold, the
+// atlas key (Glyph_Key.set) already separates the faces, and nothing else moves.
+//
+// It also makes the NEXT face cheap, which was the deciding argument: Monaspace
+// Neon (batch 20) is four members and four rows of FONT_SETS below, with no
+// signature touched anywhere. The cost is that (role x style) is enumerated by
+// hand -- which is why FONT_SETS is a single table and `fonttest` asserts its
+// (base, style) pairs are unique, so a copy-pasted row cannot go unnoticed.
 Font_Set :: enum u8 {
 	UI,
 	Doc,
 	Body,
+	Body_Bold,
+	Body_Italic,
+	Body_Bold_Italic,
+}
+
+// Which regular set a member is a style of, and which style. The SINGLE table
+// describing the (role, style) grid: text_load_faces loads exactly the rows it
+// names, text_styled_set reads it back to answer "give me this face in bold",
+// and find_family uses `base` to decide which family list a set draws from.
+//
+// A member whose base is itself and whose style is .Regular has no styled
+// companions, which is deliberate for .UI and .Doc: those drive the cell grid,
+// whose premise is one advance for every character, and a bold face's different
+// advance would slide glyphs out from under the caret.
+Font_Set_Def :: struct {
+	base:  Font_Set, // the .Regular member of the same family
+	style: Font_Style, // which style of it this member is
+}
+
+@(private)
+FONT_SETS := [Font_Set]Font_Set_Def {
+	.UI               = {.UI, .Regular},
+	.Doc              = {.Doc, .Regular},
+	.Body             = {.Body, .Regular},
+	.Body_Bold        = {.Body, .Bold},
+	.Body_Italic      = {.Body, .Italic},
+	.Body_Bold_Italic = {.Body, .Bold_Italic},
+}
+
+// The (base, style) of `set`. Exposed so a test can assert the table above is a
+// bijection -- a duplicated row would otherwise make one member unreachable
+// from text_styled_set and silently draw regular text where bold was asked for.
+font_set_def :: proc(set: Font_Set) -> (base: Font_Set, style: Font_Style) {
+	d := FONT_SETS[set]
+	return d.base, d.style
 }
 
 // A primary face plus its per-codepoint fallbacks.
@@ -71,6 +127,14 @@ Face_Chain :: struct {
 	ascent_em:   f32,
 	descent_em:  f32,
 	line_gap_em: f32,
+	// The style whose FILE actually loaded, which is not always the style that
+	// was asked for: a family with no italic file falls back to its regular one
+	// (see font_style_file), and a chain that did so must not claim to be
+	// italic. text_styled_set reads this rather than the request, so a caller
+	// that asks for bold and gets regular finds out (text_has_style) and can
+	// keep its synthetic emphasis instead of drawing regular text believing it
+	// is bold.
+	style:       Font_Style,
 }
 
 Font_Style :: enum u8 {
@@ -341,21 +405,52 @@ text_load_faces :: proc(t: ^Text) -> (ok: bool) {
 	return true
 }
 
-// Load the markdown preview's proportional body face onto the .Body chain, and
-// report which family won. `ok` is false when no proportional face could be
-// loaded and the mono fallback was used instead — the preview then looks like
-// the editor, which is a cosmetic loss, not a failure to start.
+// Load the markdown preview's proportional body face — regular AND every styled
+// member FONT_SETS gives it — and report which family won. `ok` is false when no
+// proportional face could be loaded and the mono fallback was used instead: the
+// preview then looks like the editor, which is a cosmetic loss, not a failure to
+// start.
+//
+// The styled chains are loaded EAGERLY, all four, rather than on first use. Lazy
+// loading would mean text_load_family running mid-layout, and text_load_family
+// calls text_reset_atlas, which drops every cached glyph — including ones a
+// text_draw in flight has already handed UVs to. The whole family is loaded from
+// files that are already in the page cache next to the regular one. Measured
+// (2026-07-29, three runs of `fonttest` with the styled loads on and off):
+// text_load_faces is 0.80-0.88 ms with all six chains against 0.68-0.77 ms with
+// three, i.e. ~0.13 ms for twelve extra DirectWrite faces. Nothing here is worth
+// a lazy path's hazards.
+//
+// A family that ships no italic (or no bold) is not an error: text_load_family
+// falls back to the regular file and records that it did, so text_has_style says
+// no and the caller keeps its synthetic emphasis.
 //
 // Every Text — product and headless test alike — reaches this through
 // text_load_faces, so there is one body face and one place it is chosen.
 text_load_body_face :: proc(t: ^Text) -> (family: string, ok: bool) {
+	// The styled members of .Body, driven off FONT_SETS rather than a second
+	// hand-written list: adding .Body_Small_Caps one day must not need an edit
+	// here as well as there.
+	styles :: proc(t: ^Text, name: string) {
+		for s in Font_Set {
+			d := FONT_SETS[s]
+			if d.base != .Body || d.style == .Regular {continue}
+			text_load_family(t, name, d.style, s)
+		}
+	}
 	for f in BODY_FAMILIES {
-		if text_load_family(t, f.name, .Regular, .Body) {return f.name, true}
+		if text_load_family(t, f.name, .Regular, .Body) {
+			styles(t, f.name)
+			return f.name, true
+		}
 	}
 	// Nothing proportional is installed (or DirectWrite refused all of them).
 	// text_load_family falls back to FONT_FAMILIES[0] for an unknown name, so
 	// this is the mono face the editor already uses.
-	if text_load_family(t, "", .Regular, .Body) {return FONT_FAMILIES[0].name, false}
+	if text_load_family(t, "", .Regular, .Body) {
+		styles(t, FONT_FAMILIES[0].name)
+		return FONT_FAMILIES[0].name, false
+	}
 	return "", false
 }
 
@@ -364,7 +459,8 @@ text_load_body_face :: proc(t: ^Text) -> (family: string, ok: bool) {
 // another machine can name a font that is not here, and that must fall back
 // rather than fail.
 //
-// BODY_FAMILIES is searched ONLY for .Body, and that asymmetry is deliberate.
+// BODY_FAMILIES is searched ONLY for the .Body family, and that asymmetry is
+// deliberate.
 // .UI and .Doc drive the cell grid, whose whole premise is one advance for every
 // character; letting a settings.txt that says `font_family Georgia` actually
 // load Georgia there would put proportional glyphs on a monospace grid. It has
@@ -373,7 +469,11 @@ text_load_body_face :: proc(t: ^Text) -> (family: string, ok: bool) {
 // face "for people who want the preview to match the source".
 @(private = "file")
 find_family :: proc(name: string, set: Font_Set) -> (fam: Font_Family, found: bool) {
-	if set == .Body {
+	// FONT_SETS[set].base, not `set == .Body`: .Body_Bold and friends draw from
+	// the same family list as .Body, and testing the member itself would send
+	// them to FONT_FAMILIES, where "Georgia" is absent, so every styled body
+	// chain would have silently loaded Consolas.
+	if FONT_SETS[set].base == .Body {
 		for f in BODY_FAMILIES {
 			if f.name == name {return f, true}
 		}
@@ -382,6 +482,82 @@ find_family :: proc(name: string, set: Font_Set) -> (fam: Font_Family, found: bo
 		if f.name == name {return f, true}
 	}
 	return FONT_FAMILIES[0], false
+}
+
+// The file `fam` ships for `style`, and the style that file ACTUALLY is.
+//
+// A style the family doesn't ship falls back rather than letting DirectWrite
+// synthesise one: algorithmic bold/oblique changes the advance, and the editor's
+// pen steps by a single cell width, so glyphs would bleed into the next column.
+// Bold-italic degrades to bold before regular — a real weight with no slant is
+// closer to what was asked for than neither.
+//
+// Pure, and exported, so `fonttest` can drive it with a Font_Family that ships
+// no bold at all. That case is not otherwise reachable on a machine where every
+// installed family happens to be complete, which is exactly when the "keep the
+// caller's synthetic bold" path would go untested and rot.
+font_style_file :: proc(fam: Font_Family, style: Font_Style) -> (file: string, got: Font_Style) {
+	file, got = fam.regular, .Regular
+	switch style {
+	case .Bold:
+		if fam.bold != "" {file, got = fam.bold, .Bold}
+	case .Italic:
+		if fam.italic != "" {file, got = fam.italic, .Italic}
+	case .Bold_Italic:
+		if fam.bolditalic != "" {
+			file, got = fam.bolditalic, .Bold_Italic
+		} else if fam.bold != "" {
+			file, got = fam.bold, .Bold
+		}
+	case .Regular:
+	}
+	return
+}
+
+// The set that draws `set`'s family in `style` — the one thing a caller wanting
+// bold body text asks. Returns the REGULAR set when no real face for that style
+// is loaded, so a caller can compare the answer to what it asked for (or call
+// text_has_style) and fall back to synthetic emphasis rather than quietly
+// drawing regular text at weight 700's size.
+//
+// Requesting a style of a set that has no styled members (.UI, .Doc — the cell
+// grid) always yields the set itself, which is what keeps the editor's synthetic
+// bold working unchanged.
+text_styled_set :: proc(t: ^Text, set: Font_Set, style: Font_Style) -> Font_Set {
+	base := FONT_SETS[set].base
+	if style == .Regular {return base}
+	// Degradation order, most-wanted first. Regular is the caller's problem, not
+	// a member to search for: it is `base`.
+	want: [3]Font_Style
+	n := 1
+	want[0] = style
+	if style == .Bold_Italic {
+		want[1], want[2] = .Bold, .Italic
+		n = 3
+	}
+	for k in 0 ..< n {
+		for s in Font_Set {
+			d := FONT_SETS[s]
+			// d.style is the style this MEMBER is for; t.chains[s].style is the
+			// style whose file actually loaded into it. Both must match, or a
+			// family missing an italic file would hand back .Body_Italic holding
+			// Georgia Regular.
+			if d.base == base && d.style == want[k] && t.chains[s].n > 0 && t.chains[s].style == want[k] {
+				return s
+			}
+		}
+	}
+	return base
+}
+
+// Whether a REAL face for `style` is loaded for `set`'s family, i.e. whether
+// text_styled_set will give the caller something other than the regular face.
+// The question markdown.odin has to answer before choosing between a real bold
+// and its hairline double-draw.
+text_has_style :: proc(t: ^Text, set: Font_Set, style: Font_Style) -> bool {
+	base := FONT_SETS[set].base
+	if style == .Regular {return t.chains[base].n > 0}
+	return text_styled_set(t, set, style) != base
 }
 
 // The 'x' advance of a face as a fraction of em — one cell's width.
@@ -434,20 +610,7 @@ text_load_family :: proc(t: ^Text, family: string, style: Font_Style, set := Fon
 	}
 
 	chosen, _ := find_family(family, set)
-	// A style the family doesn't ship falls back to regular rather than letting
-	// DirectWrite synthesise one: algorithmic bold/oblique changes the advance,
-	// and the pen steps by a single cell width, so glyphs would bleed into the
-	// next column.
-	file := chosen.regular
-	switch style {
-	case .Bold:
-		if chosen.bold != "" {file = chosen.bold}
-	case .Italic:
-		if chosen.italic != "" {file = chosen.italic}
-	case .Bold_Italic:
-		if chosen.bolditalic != "" {file = chosen.bolditalic} else if chosen.bold != "" {file = chosen.bold}
-	case .Regular:
-	}
+	file, got := font_style_file(chosen, style)
 
 	// Build into a scratch chain so a failure can't strand us faceless.
 	fresh: Face_Chain
@@ -456,7 +619,11 @@ text_load_family :: proc(t: ^Text, family: string, style: Font_Style, set := Fon
 			for i in 0 ..< fresh.n {fresh.faces[i]->Release()}
 			return false
 		}
+		// The styled file named by the family is not actually on this machine.
+		// The chain is regular now, and must say so.
+		got = .Regular
 	}
+	fresh.style = got
 	for fdef in FALLBACK_FONTS {
 		add_face(t, &fresh, fdef.file, fdef.kind, fdef.face)
 	}
@@ -588,7 +755,7 @@ text_init :: proc(gfx: ^Gfx) -> (t: Text, ok: bool) {
 // is 400px of divergence by VISIBLE_COLS. Both sides must call this one proc.
 // Guarded by `newtpad dpitest`.
 text_char_width :: proc(t: ^Text, px: f32, set := Font_Set.UI) -> f32 {
-	return max(1, f32(int(t.chains[set].char_em * px + 0.5)))
+	return max(1, f32(int(t.chains[loaded_set(t, set)].char_em * px + 0.5)))
 }
 
 // Nonspacing combining marks and zero-width format characters. These need a
@@ -694,12 +861,12 @@ text_cell_width_at :: proc(t: ^Text, r: rune, col: int, set := Font_Set.UI) -> i
 		return n - (col % n) // in [1, n]; never 0, so measuring loops advance
 	}
 	if c, found := t.cell_cache[set][r]; found {return int(c)}
-	c := &t.chains[set]
 	cells: u8 = 1
 	if is_zero_width(r) {
 		cells = 0
 	} else {
-		face, gi := rune_face(t, r, set)
+		fset, face, gi := rune_face(t, r, set)
+		c := &t.chains[fset]
 		if gi != 0 {
 			gm: GLYPH_METRICS
 			idx := gi
@@ -753,22 +920,46 @@ text_bytes_for_cells :: proc(t: ^Text, s: []u8, target: int, col0: int, set := F
 	return i
 }
 
+// The set whose chain is actually read for `set`: itself when it has faces, its
+// base otherwise.
+//
+// A styled member whose family ships no file for it, on a machine where even the
+// regular fallback would not load, leaves an EMPTY chain — and every read below
+// then dereferences a nil faces[0]. Found by sabotage: disabling the styled
+// loads in text_load_body_face turned `fonttest` from a set of red assertions
+// into an access violation, which proves nothing about the code under test.
+// Loading normally fills all six chains, so this is the guard for the machine
+// where it did not, and it must be applied at every entry that indexes chains.
+@(private)
+loaded_set :: proc(t: ^Text, set: Font_Set) -> Font_Set {
+	if t.chains[set].n > 0 {return set}
+	return FONT_SETS[set].base
+}
+
 // Pick the first loaded face that has a glyph for r; fall back to the primary
 // (which renders .notdef) if none does. Per-codepoint fallback, no shaping.
+//
+// Returns the SET it resolved as well as the face index within it. `face`
+// indexes one specific chain, and every caller goes on to index a chain with it
+// (glyph_get's cache key, glyph_rasterize's faces[face]) — so handing back the
+// index without the chain it belongs to is the two-producer shape: caller and
+// callee would each decide, separately, which set an empty chain falls back to.
 @(private)
-rune_face :: proc(t: ^Text, r: rune, set := Font_Set.UI) -> (face: int, gi: u16) {
+rune_face :: proc(t: ^Text, r: rune, set_in := Font_Set.UI) -> (set: Font_Set, face: int, gi: u16) {
+	set = loaded_set(t, set_in)
 	c := &t.chains[set]
+	if c.n == 0 {return set, 0, 0} // faceless Text: no glyph, and no fault
 	cp := u32(r)
 	for fi in 0 ..< c.n {
 		g: u16
 		c.faces[fi]->GetGlyphIndices(&cp, 1, &g)
 		if g != 0 {
-			return fi, g
+			return set, fi, g
 		}
 	}
 	g: u16
 	c.faces[0]->GetGlyphIndices(&cp, 1, &g)
-	return 0, g
+	return set, 0, g
 }
 
 // Draw a UTF-8 string with its baseline at (x, y), left-to-right.
@@ -855,8 +1046,8 @@ text_walk_glyphs :: proc(
 			col += cells
 			continue
 		}
-		face, gi := rune_face(t, r, set)
-		g := glyph_get(gfx, t, set, face, gi, px)
+		fset, face, gi := rune_face(t, r, set)
+		g := glyph_get(gfx, t, fset, face, gi, px)
 		if g.w > 0 && g.h > 0 {
 			// Combining marks (0 cells) sit over the previous cell, not after it.
 			glyph_x := pen - cell_w if cells == 0 else pen
@@ -1192,7 +1383,7 @@ text_atlas_dim :: proc(t: ^Text) -> i32 {return t.atlas_w}
 
 // The primary face's cell width as a fraction of em. Exposed so a test can check
 // that a family's styles agree — the cell grid assumes one advance for all text.
-text_char_em :: proc(t: ^Text, set := Font_Set.Doc) -> f32 {return t.chains[set].char_em}
+text_char_em :: proc(t: ^Text, set := Font_Set.Doc) -> f32 {return t.chains[loaded_set(t, set)].char_em}
 
 // The primary face's vertical metrics at `px`, in pixels. `ascent` is above the
 // baseline and `descent` below, both positive; `line_gap` is the face's own
@@ -1203,7 +1394,7 @@ text_char_em :: proc(t: ^Text, set := Font_Set.Doc) -> f32 {return t.chains[set]
 // itself from one ascent while the glyphs are placed from another is the
 // two-producer shape this project has recorded sixteen instances of.
 text_vmetrics :: proc(t: ^Text, px: f32, set := Font_Set.Body) -> (ascent, descent, line_gap: f32) {
-	c := &t.chains[set]
+	c := &t.chains[loaded_set(t, set)]
 	return c.ascent_em * px, c.descent_em * px, c.line_gap_em * px
 }
 
@@ -1296,16 +1487,26 @@ text_shaders_compile_ok :: proc() -> bool {
 }
 
 // Test probe (no D3D device needed): rasterize `r` at `px` and report the
-// coverage size and whether any pixel is inked. Verifies the glyph path
-// produces real coverage — the pixels themselves still need a live eye.
-text_glyph_coverage_probe :: proc(t: ^Text, r: rune, px: f32, set := Font_Set.Doc) -> (w, h: int, inked: bool) {
-	face, gi := rune_face(t, r, set)
-	cov, gw, gh, _, _ := glyph_rasterize(t, set, face, gi, px)
+// coverage size, whether any pixel is inked, and a checksum of the coverage
+// itself. Verifies the glyph path produces real coverage — the pixels
+// themselves still need a live eye.
+//
+// `sum` exists because the box alone is not a fingerprint of the FACE: Georgia
+// Italic's 'W' at 24px rasterizes to the same 26x17 box as Georgia Regular's,
+// so a test asserting "a different style has a different box" failed against a
+// correctly-loaded italic. The position-weighted sum below differs whenever any
+// pixel of coverage differs, which two different font files essentially always
+// do — and unlike a plain byte sum it also separates two bitmaps that merely
+// permute their coverage.
+text_glyph_coverage_probe :: proc(t: ^Text, r: rune, px: f32, set := Font_Set.Doc) -> (w, h: int, inked: bool, sum: u64) {
+	fset, face, gi := rune_face(t, r, set)
+	cov, gw, gh, _, _ := glyph_rasterize(t, fset, face, gi, px)
 	defer if cov != nil {delete(cov)}
-	for b in cov {
-		if b > 0 {inked = true;break}
+	for b, i in cov {
+		if b > 0 {inked = true}
+		sum += u64(b) * u64(i + 1)
 	}
-	return int(gw), int(gh), inked
+	return int(gw), int(gh), inked, sum
 }
 
 // Shelf packer. Returns ok=false when the atlas is full; the caller then skips
