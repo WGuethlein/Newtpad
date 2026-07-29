@@ -8,6 +8,29 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
+## Ctrl+V with the filter bar open pastes into the document, not the filter
+
+**Reported 2026-07-29.** Wyatt: *"ctrl+V when the filter menu is open doesn't paste into the filter menu,
+it adds it to the viewport. also you aren't able to edit/remove it from the viewport while that menu is
+open."*
+
+**Two defects, and the second is what makes this urgent.** The paste is routed to the wrong target — but
+the text then lands in the document *and cannot be removed*, because the viewport is not editable while
+the filter bar has focus. So an accidental Ctrl+V silently modifies the file and leaves the user with no
+way to undo it without first closing the filter. That is a data-modification bug wearing a focus-routing
+bug's clothes, and it should be triaged as the former.
+
+**Where to look:** the filter bar is a focused input surface, like the find and replace fields. Those
+route `Ctrl+V` correctly, so the question is why the filter does not — most likely the paste command is
+dispatched against the document context rather than the focused-field context. Compare against how
+`Find` and `Replace` claim the key, and check whether the fix belongs in the keymap's context resolution
+rather than in the filter itself. If it is the context resolution, **the same hole probably exists for
+other editing keys** — check Ctrl+X, Ctrl+Z and Delete while the filter is focused before calling it
+fixed.
+
+**Also confirm:** does the document actually become `modified` (a dirty tab, a save prompt on close)?
+If so the blast radius is larger than a stray paste, and this jumps the queue.
+
 ## Ctrl+A includes trailing blank rows
 
 **Reported 2026-07-29.** Wyatt: *"if you ctrl+A on a document with a lot of blank rows at the end, it
