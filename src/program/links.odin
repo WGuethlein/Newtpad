@@ -793,6 +793,41 @@ link_stat :: proc(abs: string) -> (exists, is_dir: bool) {
 // this file: `\\server\share\x.log` and `smb://server/share/x` are plain text
 // until the async resolver exists, and so is anything anchored under a document
 // opened from a UNC path or a mapped network drive.
+// The absolute-path construction shared by link_resolve (which stats the
+// result, refusing anything non-local without a syscall) and link_follow's
+// Ctrl+click bare-reveal branch (which reveals a non-local result WITHOUT
+// stat'ing it -- see that proc's header for the security tradeoff). Never
+// touches the filesystem itself: smb://host/share/path is rewritten to
+// \\host\share\path (Windows has no smb: handler, so this becomes an
+// ordinary UNC path), an already-absolute token is cloned as-is, and a
+// relative one is anchored to the document's own folder with a parent walk
+// refused outright. Not called for a .URL-kind Link; those go through
+// plat.url_is_openable instead.
+link_target_path :: proc(doc: ^Document, raw: string) -> (abs: string, ok: bool) {
+	if is_smb_url(raw) {
+		body, _ := strings.replace_all(raw[6:], "/", "\\", context.temp_allocator)
+		return strings.concatenate({"\\\\", body}, context.temp_allocator), true
+	}
+	is_abs :=
+		(len(raw) >= 2 && raw[0] == '\\' && raw[1] == '\\') ||
+		(len(raw) >= 3 && is_alpha(raw[0]) && raw[1] == ':' && (raw[2] == '\\' || raw[2] == '/'))
+	if is_abs {
+		return strings.clone(raw, context.temp_allocator), true
+	}
+	if doc == nil || doc.path == "" {return "", false} // no anchor
+	dir := doc.path
+	ci := strings.last_index_any(dir, "\\/")
+	if ci < 0 {return "", false}
+	dir = dir[:ci]
+	rel := raw
+	// "./x" and ".\x" are the same anchor, just drop the prefix.
+	if len(rel) > 2 && rel[0] == '.' && (rel[1] == '\\' || rel[1] == '/') {rel = rel[2:]}
+	// A parent walk is refused rather than resolved: the anchor is the
+	// document's folder, full stop.
+	if strings.contains(rel, "..") {return "", false}
+	return strings.concatenate({dir, "\\", rel}, context.temp_allocator), true
+}
+
 link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, ok: bool) {
 	raw := text[l.start:l.start + l.target_len]
 	if l.kind == .URL {
@@ -800,45 +835,34 @@ link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, 
 		return Link_Target{url = strings.clone(raw, context.temp_allocator), is_url = true}, true
 	}
 
-	// smb://host/share/path -> \\host\share\path. Windows has no smb: handler, so
-	// this becomes an ordinary UNC path and takes the path branch: stat'd first,
-	// text-ish opens in a tab, anything else is revealed in Explorer.
-	if is_smb_url(raw) {
-		body, _ := strings.replace_all(raw[6:], "/", "\\", context.temp_allocator)
-		abs := strings.concatenate({"\\\\", body}, context.temp_allocator)
-		// Always UNC by construction, so link_stat always refuses it today.
-		if exists, _ := link_stat(abs); !exists {return {}, false}
-		return Link_Target{path = abs, line = l.line, col = l.col}, true
-	}
-
-	abs := ""
-	is_abs :=
-		(len(raw) >= 2 && raw[0] == '\\' && raw[1] == '\\') ||
-		(len(raw) >= 3 && is_alpha(raw[0]) && raw[1] == ':' && (raw[2] == '\\' || raw[2] == '/'))
-	if is_abs {
-		abs = strings.clone(raw, context.temp_allocator)
-	} else {
-		if doc == nil || doc.path == "" {return {}, false} // no anchor
-		dir := doc.path
-		if ci := strings.last_index_any(dir, "\\/"); ci >= 0 {
-			dir = dir[:ci]
-		} else {
-			return {}, false
-		}
-		rel := raw
-		// "./x" and ".\x" are the same anchor, just drop the prefix.
-		if len(rel) > 2 && rel[0] == '.' && (rel[1] == '\\' || rel[1] == '/') {rel = rel[2:]}
-		// A parent walk is refused rather than resolved: the anchor is the
-		// document's folder, full stop.
-		if strings.contains(rel, "..") {return {}, false}
-		abs = strings.concatenate({dir, "\\", rel}, context.temp_allocator)
-	}
+	abs, aok := link_target_path(doc, raw)
+	if !aok {return {}, false}
 
 	exists, _ := link_stat(abs)
 	// A broken link reaches no handler -- and so does a non-local one, which
 	// link_stat declined to look at rather than blocking the UI thread on.
 	if !exists {return {}, false}
 	return Link_Target{path = abs, line = l.line, col = l.col}, true
+}
+
+// Should Ctrl+click on this link skip resolution entirely and reveal
+// directly, rather than going through link_resolve (which refuses a
+// non-local target outright, without a stat -- rule 3 at the top of this
+// file)? True only for a .Path/.Line_Ref link whose token names a target on
+// a UNC share or a mapped network drive.
+//
+// Pure: computes the same abs path link_resolve would, via link_target_path,
+// then asks plat.path_is_local -- a cached drive-type classification, never
+// a stat. Split out from link_follow so the DECISION is testable without
+// invoking the real shell (plat.shell_reveal is not exercised headlessly,
+// same reason shell_open_folder's ShellExecuteW call is not in linktest: it
+// would open a real Explorer window).
+link_bare_reveal_target :: proc(doc: ^Document, text: string, l: Link) -> (abs: string, want: bool) {
+	if l.kind == .URL {return "", false}
+	raw := text[l.start:l.start + l.target_len]
+	a, aok := link_target_path(doc, raw)
+	if !aok || plat.path_is_local(a) {return "", false}
+	return a, true
 }
 
 // Follow a link the user asked to follow: resolve it, act on it, and SAY SO if
@@ -857,13 +881,46 @@ link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, 
 // and the keyboard command have no such gate in front of them at all, so for
 // them this is the only thing standing between a dead target and silence.
 //
-// A non-local target (UNC, mapped drive) now lands in that same failure branch,
-// deliberately: link_resolve refuses it without a syscall, so what the user gets
-// is "Could not resolve" immediately instead of a frozen editor for the length of
-// the SMB timeout. It is still reachable here — the table view and the Open Link
-// command are not gated on decoration — which is exactly why the refusal lives in
-// link_resolve rather than in links_layout's gate.
+// A non-local target (UNC, mapped drive) used to land in that same failure
+// branch unconditionally: link_resolve refuses it without a syscall, so what
+// the user got was "Could not resolve" immediately instead of a frozen
+// editor for the length of the SMB timeout. That refusal is still correct
+// for DECORATION -- rule 2 at the top of this file, "never advertise a
+// target we would decline" -- links_layout is untouched and still declines
+// to underline anything non-local.
+//
+// But Ctrl+click is a stronger signal than an underline: the user is asking,
+// explicitly, right now, and there is a middle ground that costs nothing.
+// `explorer.exe /select,"path"` resolves and reveals the path IN ITS OWN
+// PROCESS, off this thread (ShellExecuteW just launches it and returns), so
+// handing it an unstat'd path here does not cost this thread the redirector
+// timeout the way a stat would.
+//
+// SECURITY NOTE (2026-07-29): this is new ground -- every other path through
+// this file is stat'd (link_stat, gated on plat.path_is_local) before
+// anything touches it, and this one is not. What keeps it safe:
+//   1. `/select` does not execute the target; it opens a folder window with
+//      the item selected. The exposure is "Explorer navigates somewhere",
+//      never "something runs".
+//   2. The existing scheme whitelist (has_uri_scheme, enforced at SCAN time
+//      in looks_like_path -- before a token can ever become a .Path-kind
+//      Link at all) still refuses a URI-scheme-carrying token before
+//      link_follow is ever called on it. Nothing here loosens that guard or
+//      routes around it.
+//   3. Reveal-not-execute is already the policy for every non-text target
+//      (link_activate below); this only removes the STAT that used to sit
+//      in front of that same policy for the non-local case.
+// Decoration stays off regardless of this change: we still cannot promise a
+// non-local target exists, only that asking Explorer to look is safe to do
+// unconditionally.
 link_follow :: proc(app: ^App, t: ^plat.Text, w: ^plat.Window, doc: ^Document, text: string, l: Link) {
+	if abs, want := link_bare_reveal_target(doc, text, l); want {
+		if !plat.shell_reveal(abs) {
+			plat.message_error(w.hwnd if w != nil else nil, fmt.tprintf("Could not open:\n\n%s", abs))
+		}
+		return
+	}
+
 	if tgt, rok := link_resolve(doc, text, l); rok {
 		if !link_activate(app, t, tgt) {
 			plat.message_error(

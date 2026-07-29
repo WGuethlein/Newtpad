@@ -8561,6 +8561,74 @@ when NEWTPAD_TESTS {
 			fmt.println("--- only DRIVE_REMOTE is refused, not \"anything but DRIVE_FIXED\" ---")
 			lk_anchor_kind_scope(&bad)
 
+			// Item 5 (2026-07-29 regressions): Ctrl+click on a non-local target used
+			// to reach the generic "Could not resolve" branch and do nothing else.
+			// Now it skips resolution and routes straight to link_bare_reveal_target
+			// -> plat.shell_reveal, without a stat. plat.shell_reveal itself is not
+			// exercised here -- same reason shell_open_folder's ShellExecuteW call
+			// is not, above: it would pop a real Explorer window. What is exercised
+			// is the DECISION link_follow makes before it would call that, which is
+			// the part that can be wrong.
+			//
+			// Per the task brief: do not stat a real dead UNC path to verify
+			// anything. `\\localhost\newtpad_no_such_share_zz\...` is the same
+			// loopback fixture lk_non_local_never_stats uses above -- path_is_local
+			// refuses on the leading `\\` alone, a pure string-shape check, so this
+			// never asks the redirector anything and cannot hang.
+			lk_bare_reveal :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				anchor := fmt.tprintf("%s\\newtpad_lk_bare_anchor.txt", dir)
+				plat.file_write_atomic(anchor, transmute([]u8)string("anchor"))
+				d, dok := doc_open(anchor)
+				lk_chk(bad, dok, "bare-reveal fixture: anchor document opens")
+				if !dok {return}
+				defer doc_close(&d)
+
+				// 1. A UNC target routes to reveal, without a stat.
+				unc := "\\\\localhost\\newtpad_no_such_share_zz\\out.log"
+				ul := links_scan(unc)
+				lk_chk(bad, len(ul) == 1, fmt.tprintf("the UNC fixture scans as one link (got %d)", len(ul)))
+				if len(ul) == 1 {
+					link_stat_count = 0
+					abs, want := link_bare_reveal_target(&d, unc, ul[0])
+					lk_chk(
+						bad,
+						want && abs == unc && link_stat_count == 0,
+						fmt.tprintf("1. UNC target routes to bare reveal without a stat (want=%v abs=%q stats=%d)", want, abs, link_stat_count),
+					)
+				}
+
+				// 2. A local target is unaffected: the bare-reveal decision says no,
+				//    and link_resolve -- the path every target used to take -- still
+				//    succeeds exactly as it did before this change.
+				local := "see newtpad_lk_bare_local.txt for details"
+				target := fmt.tprintf("%s\\newtpad_lk_bare_local.txt", dir)
+				plat.file_write_atomic(target, transmute([]u8)string("x"))
+				ll := links_scan(local)
+				lk_chk(bad, len(ll) == 1, fmt.tprintf("the local fixture scans as one link (got %d)", len(ll)))
+				if len(ll) == 1 {
+					_, lwant := link_bare_reveal_target(&d, local, ll[0])
+					lk_chk(bad, !lwant, "2a. a local target does not route to bare reveal")
+					link_stat_count = 0
+					rt, rok := link_resolve(&d, local, ll[0])
+					lk_chk(
+						bad,
+						rok && rt.path == target && link_stat_count == 1,
+						fmt.tprintf("2b. a local target still resolves normally through link_resolve (ok=%v path=%q stats=%d)", rok, rt.path, link_stat_count),
+					)
+				}
+
+				// 3. A URI-scheme-carrying token is still refused: it never becomes a
+				//    Link at all (has_uri_scheme, enforced upstream in
+				//    looks_like_path at SCAN time), so neither link_resolve nor the
+				//    new bare-reveal branch is ever asked about it.
+				scheme := "run ms-msdt:/id PCWDiagnostic now"
+				sl := links_scan(scheme)
+				lk_chk(bad, len(sl) == 0, fmt.tprintf("3. a URI-scheme token is not detected as a link at all (got %d)", len(sl)))
+			}
+			fmt.println("--- Ctrl+click on a non-local target reveals without resolving (item 5) ---")
+			lk_bare_reveal(&bad)
+
 			fmt.printfln("linktest: %d failures", bad)
 			return true
 		}
