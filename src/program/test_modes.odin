@@ -5041,7 +5041,22 @@ when NEWTPAD_TESTS {
 				}
 				px := f32(16)
 				WIDE := f32(100000)
-				fam, prop := plat.text_load_body_face(&t)
+				// text_load_faces (above) already loaded .Body once, via its own
+				// internal call to text_load_body_face. Calling text_load_body_face
+				// again here to learn which family won would reload the chain and
+				// text_reset_atlas it a second time (text_load_family does that on
+				// every call, by design -- every cached glyph belongs to the old
+				// face). font_family_available is a plain file-existence check with
+				// no side effects, so replay text_load_body_face's own preference
+				// order against it to report the same answer without touching `t`.
+				fam, prop := "", false
+				for f in plat.BODY_FAMILIES {
+					if plat.font_family_available(f) {
+						fam, prop = f.name, true
+						break
+					}
+				}
+				if fam == "" {fam = plat.FONT_FAMILIES[0].name}
 				fmt.printfln("  body face: %q  proportional=%v", fam, prop)
 				sh_chk(bad, prop, "a proportional body face loaded (§9.3 names Georgia)")
 
@@ -5217,7 +5232,18 @@ when NEWTPAD_TESTS {
 				// it hung past the measure whenever the leading word was narrower
 				// than one glyph. Every single-measure case above passed with that
 				// bug present.
-				over_ok, over_seen := true, 0
+				// width_ok rides the same sweep: the sweep already recomputes every
+				// line's ink from the emitted glyphs (sh_line_ink), independently of
+				// Shaped.width, so it is also the cheapest place to pin
+				// Shaped.width against the widest of those -- over all 125 pairs
+				// rather than the single hand-picked run at "Shaped.width equals the
+				// widest line actually emitted" above. That single-run check cannot
+				// reach the carry-then-character-break window (both breaks firing on
+				// the same glyph): every carry in "alpha beta gamma delta" is empty,
+				// so `ink = pen` after a carry (shape.odin) is live but untested
+				// there. Sabotaged by setting that carried `ink` to 0: the
+				// single-run check above still passed, only this one went red.
+				over_ok, over_seen, width_ok := true, 0, true
 				for txt in ([]string{"i WWWWWW", "a aaaaaaaaaaaa", "alpha beta gamma delta", "WW i WWWW", "iiii WWWW iiii"}) {
 					for k in 1 ..< 26 {
 						mwk := f32(k) * 4
@@ -5226,17 +5252,22 @@ when NEWTPAD_TESTS {
 						for g in sk.glyphs {
 							if int(g.line) < 64 && g.r != ' ' && g.r != '\t' {ink_n[g.line] += 1}
 						}
+						widest_k := f32(0)
 						for l in 0 ..< min(sk.lines, 64) {
-							if sh_line_ink(&t, sk, px, i32(l)) > mwk + 0.01 {
+							li := sh_line_ink(&t, sk, px, i32(l))
+							widest_k = max(widest_k, li)
+							if li > mwk + 0.01 {
 								over_seen += 1
 								if ink_n[l] > 1 {over_ok = false}
 							}
 						}
+						if abs(sk.width - widest_k) > 0.01 {width_ok = false}
 					}
 				}
 				fmt.printfln("  swept 125 (text, measure) pairs; %d lines exceeded their measure", over_seen)
 				sh_chk(bad, over_ok, "a line exceeds the measure only when it holds one over-wide glyph")
 				sh_chk(bad, over_seen > 0, "the sweep really did reach measures narrower than a glyph")
+				sh_chk(bad, width_ok, "Shaped.width equals the widest line's ink, swept over all 125 pairs")
 
 				// --- the reported height vs the height consumed ----------------
 				fmt.println("--- height agrees with the glyphs emitted ---")
@@ -5270,17 +5301,77 @@ when NEWTPAD_TESTS {
 				sh_chk(bad, len(sn.glyphs) == 0 && sn.lines == 0, "a bare CRLF emits nothing")
 
 				// --- one measurement path, one cache ---------------------------
-				// The x deltas the shaper emits ARE the advances glyph_get caches in
-				// Text.cache (keyed by Glyph_Key{set, face, index, px}) — the same map
-				// that holds the atlas UVs. There is no second cache to go stale.
-				fmt.println("--- the advances come from the atlas's own glyph cache ---")
-				sa := sh_shape(&t, "Wave", WIDE, 0, px)
-				same := len(sa.glyphs) == 4
-				for i in 0 ..< len(sa.glyphs) - 1 {
-					d := sa.glyphs[i + 1].x - sa.glyphs[i].x
-					if abs(d - plat.text_advance(nil, &t, sa.glyphs[i].r, px, .Body)) > 0.001 {same = false}
+				// The x deltas the shaper emits ARE the advances glyph_get returns --
+				// text_advance is a five-line wrapper over glyph_get and adds no
+				// storage of its own. But comparing shape_run's output to
+				// text_advance, as this section used to, only proves shape_run
+				// calls text_advance -- which it obviously does, since it is the
+				// ONLY place shape_run learns an advance -- it says nothing about
+				// Text.cache, the map glyph_get actually shares with the atlas. Worse,
+				// every call above runs with gfx == nil, and glyph_get explicitly does
+				// NOT cache when gfx is nil (see its comment): "cached" was false on
+				// the very path under test. Demonstrated by sabotage: giving
+				// text_advance a second GetDesignGlyphMetrics path that never touches
+				// Text.cache still passed the old assertion.
+				//
+				// The genuine claim needs a live gfx and an actual look at Text.cache's
+				// occupancy, so stand one up (Headless_Gpu, the mdtest/md_draw_selftest
+				// precedent) rather than rename the old assertion to something true but
+				// smaller.
+				fmt.println("--- the glyph cache is genuinely shared with the atlas (live gfx) ---")
+				{
+					h: Headless_Gpu
+					if headless_gpu_init(&h, 64, 64, "shapetest/cache") {
+						defer headless_gpu_destroy(&h)
+						RUN :: "Wave"
+						// Distinct glyph count shape_run should ask Text.cache for --
+						// counted without assuming ASCII byte offsets line up with rune
+						// indices, since RUN could in principle stop being all-ASCII.
+						seen := [8]rune{}
+						nseen := 0
+						distinct_glyphs := 0
+						for r in RUN {
+							if r == ' ' || r == '\t' {continue}
+							dup := false
+							for k in 0 ..< nseen {
+								if seen[k] == r {
+									dup = true
+									break
+								}
+							}
+							if !dup {
+								seen[nseen] = r
+								nseen += 1
+								distinct_glyphs += 1
+							}
+						}
+
+						before_n := len(h.text.cache)
+						first := plat.shape_run(&h.gfx, &h.text, RUN, px, WIDE, 0, .Body, context.temp_allocator)
+						after1_n := len(h.text.cache)
+						sh_chk(bad, len(first.glyphs) == len(RUN), "live gfx: shaping still emits one glyph per rune")
+						sh_chk(
+							bad,
+							after1_n - before_n == distinct_glyphs,
+							"shaping populates Text.cache with exactly one entry per distinct glyph",
+						)
+
+						// Shape the identical run again: every glyph is now a cache hit,
+						// so neither the cache's size nor the atlas packer's cursor
+						// should move.
+						pack_x0, pack_y0 := h.text.pack_x, h.text.pack_y
+						_ = plat.shape_run(&h.gfx, &h.text, RUN, px, WIDE, 0, .Body, context.temp_allocator)
+						after2_n := len(h.text.cache)
+						sh_chk(bad, after2_n == after1_n, "shaping the same run again adds no new cache entries")
+						sh_chk(
+							bad,
+							h.text.pack_x == pack_x0 && h.text.pack_y == pack_y0,
+							"...and packs nothing new into the atlas",
+						)
+					} else {
+						fmt.println("  (skipped: could not stand up a headless gfx device)")
+					}
 				}
-				sh_chk(bad, same, "each x delta equals the cached Glyph's advance")
 				sh_chk(
 					bad,
 					abs(plat.text_advance(nil, &t, 'W', px, .Body) - plat.text_advance(nil, &t, 'W', px, .Doc)) > 0.5,

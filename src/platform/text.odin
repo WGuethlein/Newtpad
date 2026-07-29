@@ -996,14 +996,30 @@ glyph_get :: proc(gfx: ^Gfx, t: ^Text, set: Font_Set, face: int, index: u16, px:
 	if cov != nil && gw > 0 && gh > 0 {
 		rx, ry, packed := atlas_pack(t, gw, gh)
 		if !packed {
-			// Out of room. Relief cannot happen here: this is always reached from
-			// inside text_draw, which holds queued UVs normalised against the
-			// current atlas, and atlas_relieve refuses while `drawing` for exactly
-			// that reason. Asking anyway is what broke it -- this line was
-			// atlas_relieve's only caller, so its guard was always true, so the
-			// atlas never grew past ATLAS_START and never recycled. ATLAS_MAX was
-			// dead code and atlas_full latched for the life of the process, which
-			// is glyphs silently missing from the user's file.
+			// Out of room. Do not relieve the atlas here. When this was written,
+			// this branch really was reached only from inside text_draw, which
+			// holds queued UVs normalised against the current atlas, and
+			// atlas_relieve refuses while `drawing` for exactly that reason. That
+			// premise no longer holds: shape_run (src/platform/shape.odin) can
+			// call glyph_get with a real gfx directly, via text_advance, from
+			// OUTSIDE any text_draw call -- so `t.drawing` can be false here too.
+			// It is still correct not to relieve from inside glyph_get: this proc
+			// has no way to know whether some other in-flight UV collection
+			// elsewhere is relying on the atlas staying put, so it always defers
+			// to the one place that does know, text_frame_begin, at the boundary
+			// where the queue is empty, regardless of who the caller was. No
+			// layout correctness breaks in the meantime: the Glyph returned here
+			// still carries the real metrics computed above (advance, left, top,
+			// w, h); only the atlas fields are left at zero, and the miss is not
+			// cached (see below), so a shape_run that hits a full atlas still
+			// lays out correctly -- the glyph just has no pixels until relief
+			// runs.
+			//
+			// Asking anyway is what broke it -- this line was atlas_relieve's
+			// only caller, so its guard was always true, so the atlas never grew
+			// past ATLAS_START and never recycled. ATLAS_MAX was dead code and
+			// atlas_full latched for the life of the process, which is glyphs
+			// silently missing from the user's file.
 			//
 			// Record that relief is owed, skip this glyph for this frame, and let
 			// text_frame_begin do it at the boundary where the queue is empty. The

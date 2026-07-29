@@ -56,9 +56,15 @@ Shaped_Glyph :: struct {
 // actually reaches the final line slot — so the number cannot be one line too
 // large or too small without a test going red.
 //
-// `width` is the widest line's INK width: trailing spaces at a break hang past
-// the measure (as they do in every browser) and are not counted, so a run that
-// broke correctly reports width <= max_width.
+// `width` is the widest line's ADVANCE width, not its true ink width: it is the
+// pen position after the last non-space glyph, so it excludes right side
+// bearing and does not include ink that overhangs the advance (an italic `f`,
+// a swash serif). It is the right measure for "does this line fit the column"
+// (which is what greedy breaking needs) and for reporting a fit width back to
+// a caller, but the link-rect seam — which needs a true ink bound around a
+// span, not an advance bound — will have to compute that separately. Trailing
+// spaces at a break hang past the measure (as they do in every browser) and
+// are not counted, so a run that broke correctly reports width <= max_width.
 //
 // `lines` is the number of line slots the glyphs occupy — max(glyph.line) + 1,
 // or 0 when nothing was emitted. An empty run therefore costs nothing; what an
@@ -256,6 +262,14 @@ shape_run :: proc(
 	base0 := (lh - (asc + desc)) * 0.5 + asc
 	for &g in ga {g.y = base0 + f32(g.line) * lh}
 
+	// cap was len(str) (one glyph per byte, the worst case); the actual glyph
+	// count is smaller whenever the run has multi-byte runes or dropped
+	// zero-width/CR runes. shrink to the real length before slicing, so
+	// `shaped_free`'s `delete(s.glyphs, allocator)` frees exactly what was
+	// allocated — `allocator` exists so the §9.1 block/span cache can own this
+	// memory, and a tracking or sized allocator will reject a delete whose
+	// length disagrees with what was handed out.
+	shrink(&ga)
 	s.glyphs = ga[:]
 	s.lines = lines
 	s.height = f32(lines) * lh
