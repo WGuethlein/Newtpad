@@ -3035,6 +3035,46 @@ when NEWTPAD_TESTS {
 				d.path = ""
 			}
 
+			// Item 2 (2026-07-29 regressions): the Replace All row -- and every
+			// other row whose command mutates the document -- must report
+			// DISABLED in table view and full Preview, not just refuse on
+			// click. Enumerated from command_mutates_doc rather than
+			// hand-listed, so a command added there is covered here without a
+			// second edit.
+			ro_menu_case :: proc(table: bool, md: Md_Mode, label: string) -> (bad: int) {
+				a: App
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				d := app_active(&a)
+				d.kind = .Text
+				d.table = table
+				d.md_mode = md
+				n_checked := 0
+				for m in menus {
+					for it in m.items {
+						if it.cmd == .None {continue}
+						if !command_mutates_doc(it.cmd) {continue}
+						n_checked += 1
+						if item_enabled(&a, it) {
+							fmt.printfln("  FAIL %s: %v reports enabled", label, it.cmd)
+							bad += 1
+						}
+					}
+				}
+				// A low count would make the loop above vacuous -- guard against a
+				// menu table that stopped listing mutating commands at all.
+				if n_checked < 5 {
+					fmt.printfln("  FAIL %s: only %d mutating rows found in the menus (too few to trust)", label, n_checked)
+					bad += 1
+				}
+				fmt.printfln("  %-6s %s: %d mutating rows all report disabled", "ok" if bad == 0 else "FAIL", label, n_checked)
+				return
+			}
+			fmt.println("--- mutating rows are dead in table view and Preview (item 2) ---")
+			bad += ro_menu_case(true, .Off, "table view")
+			bad += ro_menu_case(false, .Preview, "Preview")
+
 			fmt.printfln("menutest: %d failures", bad)
 			return true
 		}
