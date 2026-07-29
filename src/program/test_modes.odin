@@ -11592,19 +11592,42 @@ when NEWTPAD_TESTS {
 				t: plat.Text
 				plat.text_load_faces(&t)
 				win: plat.Window
-				win.dpi = 96
-				cw := plat.text_char_width(&t, UI_SMALL_PX)
-				for width in ([]f32{600, 1200, 1920}) {
-					win.width = i32(width)
-					L := tabs_layout(&app, &win, &t, width)
-					for r in L.tabs {
-						if !r.drawn {continue}
-						max_cells := tab_label_cells(r.w, cw)
-						label := tab_elide(&t, tab_label(&app, app.docs[r.slot]), max_cells)
-						right := r.x + TAB_PAD_L + TAB_DIRTY_W + f32(plat.text_cells(&t, transmute([]u8)label, 0)) * cw
-						tg_chk(bad, right <= r.close_x - TAB_LABEL_GAP + 0.5, fmt.tprintf("w=%.0f: label clears the close zone", width))
+				rc := Render_Ctx{window = &win, text = &t, app = &app}
+				// TAB_LABEL_GAP and TAB_DIRTY_W are `_96` constants scaled by
+				// metrics_recompute -- checking only 96 DPI cannot tell "wired into
+				// dp()" apart from "hardcoded and coincidentally right at 1x". Proven
+				// by sabotage: commenting out either scaling assignment in
+				// metrics_recompute and rerunning tabseamtest must fail one of these.
+				for dpi in ([]u32{96, 144, 192}) {
+					win.dpi = dpi
+					metrics_recompute(&rc)
+					// The geometry check below re-derives its own bound from
+					// TAB_LABEL_GAP, the same global tab_label_cells subtracts to
+					// build the elision budget -- so a TAB_LABEL_GAP that is wrong
+					// in the SAME way on both sides cancels out and the geometry
+					// check passes no matter what the global holds (proven: this
+					// self-cancellation is why commenting out `TAB_LABEL_GAP =
+					// dp(rc, TAB_LABEL_GAP_96)` in metrics_recompute left the
+					// geometry check at 0 failures even with this DPI loop in
+					// place). Assert the global against an independently computed
+					// dp() call so a stuck-at-_96 value has something to disagree
+					// with.
+					tg_chk(bad, abs(TAB_LABEL_GAP - dp(&rc, TAB_LABEL_GAP_96)) < 0.01, fmt.tprintf("dpi=%d: TAB_LABEL_GAP is the DPI-scaled value (%.1f)", dpi, TAB_LABEL_GAP))
+					cw := plat.text_char_width(&t, UI_SMALL_PX)
+					for width in ([]f32{600, 1200, 1920}) {
+						win.width = i32(width)
+						L := tabs_layout(&app, &win, &t, width)
+						for r in L.tabs {
+							if !r.drawn {continue}
+							max_cells := tab_label_cells(r.w, cw)
+							label := tab_elide(&t, tab_label(&app, app.docs[r.slot]), max_cells)
+							right := r.x + TAB_PAD_L + TAB_DIRTY_W + f32(plat.text_cells(&t, transmute([]u8)label, 0)) * cw
+							tg_chk(bad, right <= r.close_x - TAB_LABEL_GAP + 0.5, fmt.tprintf("dpi=%d w=%.0f: label clears the close zone", dpi, width))
+						}
 					}
 				}
+				win.dpi = 96
+				metrics_recompute(&rc) // leave globals alone for later modes
 			}
 
 			// Task 8: the dirty-marker slot must be wide enough that the '*' clears
@@ -11627,19 +11650,35 @@ when NEWTPAD_TESTS {
 				t: plat.Text
 				plat.text_load_faces(&t)
 				win: plat.Window
-				win.dpi = 96
 				win.width = 1200
-				cw := plat.text_char_width(&t, UI_SMALL_PX)
-				L := tabs_layout(&app, &win, &t, 1200)
-				clean_x := L.tabs[0].x + TAB_PAD_L + TAB_DIRTY_W
-				app.docs[L.tabs[0].slot].modified = true
-				L2 := tabs_layout(&app, &win, &t, 1200)
-				dirty_x := L2.tabs[0].x + TAB_PAD_L + TAB_DIRTY_W
-				// 1. The slot exists so the label does not move when a file becomes dirty.
-				tm_chk(bad, clean_x == dirty_x, "the label start is identical clean and dirty")
-				// 2. And the marker no longer touches it.
-				star_right := L2.tabs[0].x + TAB_PAD_L + cw
-				tm_chk(bad, dirty_x - star_right >= sx(4) - 0.5, "at least 4px between the marker and the label")
+				rc := Render_Ctx{window = &win, text = &t, app = &app}
+				// Same reasoning as tg_gap: TAB_DIRTY_W only proves it is wired into
+				// dp() if it is checked somewhere other than 96 DPI, where the raw
+				// `_96` value and the scaled value are numerically identical.
+				for dpi in ([]u32{96, 144, 192}) {
+					win.dpi = dpi
+					metrics_recompute(&rc)
+					// Direct check, same reasoning as tg_gap's: assert the live
+					// global against an independently computed dp() call so a
+					// TAB_DIRTY_W stuck at its _96 value has something to disagree
+					// with, rather than relying only on the geometry checks below
+					// noticing via char-width growth.
+					tm_chk(bad, abs(TAB_DIRTY_W - dp(&rc, TAB_DIRTY_W_96)) < 0.01, fmt.tprintf("dpi=%d: TAB_DIRTY_W is the DPI-scaled value (%.1f)", dpi, TAB_DIRTY_W))
+					cw := plat.text_char_width(&t, UI_SMALL_PX)
+					app.docs[0].modified = false
+					L := tabs_layout(&app, &win, &t, 1200)
+					clean_x := L.tabs[0].x + TAB_PAD_L + TAB_DIRTY_W
+					app.docs[L.tabs[0].slot].modified = true
+					L2 := tabs_layout(&app, &win, &t, 1200)
+					dirty_x := L2.tabs[0].x + TAB_PAD_L + TAB_DIRTY_W
+					// 1. The slot exists so the label does not move when a file becomes dirty.
+					tm_chk(bad, clean_x == dirty_x, fmt.tprintf("dpi=%d: the label start is identical clean and dirty", dpi))
+					// 2. And the marker no longer touches it.
+					star_right := L2.tabs[0].x + TAB_PAD_L + cw
+					tm_chk(bad, dirty_x - star_right >= sx(4) - 0.5, fmt.tprintf("dpi=%d: at least 4px between the marker and the label", dpi))
+				}
+				win.dpi = 96
+				metrics_recompute(&rc) // leave globals alone for later modes
 			}
 
 			bad := ts_run()
