@@ -1466,22 +1466,29 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// Preview follows the editor's scroll (doc.top): one synced position, both
 		// panes anchored to the same source line. Pane box from md_pane_box, the
 		// producer the link pass reads too.
-		mx0, mx1, mytop, mybot, _ := md_pane_box(doc, w, h, rc.app.settings.split_frac)
-		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.top)
-		if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
-			md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
-		}
-		if total > 0 {
-			pvb := vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom, text, rows)
-			g_vbar_preview = pvb
-			plat.quads_draw(
-				gfx,
-				quad_pipe,
-				[]plat.Quad {
-					{pos = {pvb.x, pvb.track_y}, size = {SCROLLBAR_TRACK_W, pvb.track_h}, color = g_theme[.Bg_Raised]},
-					{pos = {pvb.x, pvb.thumb_y}, size = {SCROLLBAR_TRACK_W, pvb.thumb_h}, color = g_theme[.Scrollbar_Thumb]},
-				},
-			)
+		// `mok` is CHECKED here, as the .Preview branch above already checks it
+		// (L4, 2026-07-29): md_pane_box returns ok=false for a pane with no width
+		// -- a split fraction dragged to the right edge, or a window narrower than
+		// the divider plus the scrollbar -- and drawing into x1 <= x0 would hand
+		// md_content_span a negative span, which max(1, ..) turns into a 1px
+		// measure and a column of one glyph per line.
+		if mx0, mx1, mytop, mybot, mok := md_pane_box(doc, w, h, rc.app.settings.split_frac); mok {
+			pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.top)
+			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
+				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
+			}
+			if total > 0 {
+				pvb := vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom, text, rows)
+				g_vbar_preview = pvb
+				plat.quads_draw(
+					gfx,
+					quad_pipe,
+					[]plat.Quad {
+						{pos = {pvb.x, pvb.track_y}, size = {SCROLLBAR_TRACK_W, pvb.track_h}, color = g_theme[.Bg_Raised]},
+						{pos = {pvb.x, pvb.thumb_y}, size = {SCROLLBAR_TRACK_W, pvb.thumb_h}, color = g_theme[.Scrollbar_Thumb]},
+					},
+				)
+			}
 		}
 	}
 
@@ -1492,15 +1499,18 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// status line is NOT drawn on an opaque band -- it is text on the bare
 	// canvas. So anything a content pass puts below doc_content_box's `bot`
 	// stays on screen sitting on top of the status bar. Two passes can still do
-	// that on purpose: doc_draw's partial last row, and markdown_draw's own two
-	// deliberate overhangs -- a row's soft-wrap continuation (wrap is added to
-	// the advance, not to the admit budget, since it is not known until the
-	// draw) and the `forced` first row (spent once, so a pane too short for
-	// even one row still shows something instead of nothing -- see markdown.odin
-	// around md_row_fits). A markdown HEADING overhanging its own row is no
-	// longer one of these: item 6 made md_row_fits admit against the row's own
-	// classified height, so a heading is cut off by not being drawn at all,
-	// same as any other row that does not fit.
+	// that on purpose: doc_draw's partial last row, and markdown_draw's ONE
+	// remaining deliberate overhang -- the `forced` first block, spent once, so a
+	// pane too short for even one block shows something instead of nothing (see
+	// md_pass in markdown.odin).
+	//
+	// The soft-wrap overhang that used to be listed here is gone: batch 17 lays
+	// the preview out in BLOCKS, and a block's height comes back from the shaper
+	// with its wrapped lines already in it (Md_Layout.h), so the admit test and
+	// the advance read the same number. So does a heading's -- md_block_fits
+	// takes the block's own height, which for h1/h2 includes its rule, so a
+	// heading that does not fit is not drawn at all rather than cut through the
+	// middle of its glyphs.
 	//
 	// Placed after every DOCUMENT pass (editor, grid, preview, both scrollbars,
 	// the caret) and before every CHROME pass -- the horizontal scrollbar sits
