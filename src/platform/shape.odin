@@ -30,6 +30,8 @@
 // consequence of that, not a separate promise.
 package platform
 
+import "core:math"
+
 // One positioned glyph. `x` and `y` are pixels relative to the run's origin,
 // with `y` on the BASELINE (the same convention text_draw takes) rather than at
 // the top of the line box — text_draw_spans wants a baseline, and converting in
@@ -432,6 +434,67 @@ shape_spans :: proc(
 	s.line_boxes = boxes
 	s.height = top
 	return
+}
+
+// Draw a shaped run with its origin at (x, y), where y is the TOP of the run's
+// first line box (not a baseline — the baselines are inside Shaped.line_boxes,
+// which is the whole point of shaping first and drawing second).
+//
+// THE CONSUMER SIDE OF THE SEAM. It computes no position of its own: every
+// glyph is placed at the (x, y) the shaper already assigned it, and the only
+// arithmetic here is the origin translation and the whole-pixel snap
+// text_walk_glyphs already applies for the same reason (an integer-sized glyph
+// quad sampled at a fractional position puts a vertical seam through every
+// character). A caller that wants to know where a glyph landed must ask the
+// same Shaped this was handed, never re-derive it — that re-derivation is the
+// bug class HANDOFF §6j counts sixteen instances of.
+//
+// `spans` must be the SAME slice the run was shaped from: each glyph's `span`
+// indexes it for the face and size to rasterize at. `colors` is parallel to it,
+// one colour per span; a short or nil `colors` falls back to `base` for the
+// spans it does not cover, which is what a single-colour block wants.
+//
+// Reaches the GPU through text_submit_instances, the same call text_draw_spans
+// makes.
+shaped_draw :: proc(
+	gfx: ^Gfx,
+	t: ^Text,
+	s: ^Shaped,
+	spans: []Shape_Span,
+	x, y: f32,
+	base: [4]f32,
+	colors: [][4]f32 = nil,
+) {
+	if s == nil || len(s.glyphs) == 0 {return}
+	g_draw.text_calls += 1 // see draw_trace.odin
+	instances := make([dynamic]Text_Instance, 0, len(s.glyphs), context.temp_allocator)
+	// The atlas must hold still while these UVs are being collected.
+	t.drawing = true
+	defer t.drawing = false
+	for sg in s.glyphs {
+		si := int(sg.span)
+		if si < 0 || si >= len(spans) {continue}
+		sp := spans[si]
+		color := base
+		if si < len(colors) {color = colors[si]}
+		// A fully transparent span emits nothing at all. That is what lets a
+		// caller run this twice over one Shaped to draw a SUBSET of its spans —
+		// the synthetic-bold second pass in the markdown preview, which must
+		// embolden the bold spans and leave the prose between them alone.
+		if color.a <= 0 {continue}
+		fset, face, gi := rune_face(t, sg.r, sp.set)
+		g := glyph_get(gfx, t, fset, face, gi, sp.px)
+		if g.w <= 0 || g.h <= 0 {continue}
+		raw := [2]f32{x + sg.x + f32(g.left), y + sg.y + f32(g.top)}
+		append(&instances, Text_Instance {
+			pos    = {math.floor(raw.x + 0.5), math.floor(raw.y + 0.5)},
+			size   = {f32(g.w), f32(g.h)},
+			color  = color,
+			uv_min = g.uv_min,
+			uv_max = g.uv_max,
+		})
+	}
+	text_submit_instances(gfx, t, instances[:])
 }
 
 @(private = "file")

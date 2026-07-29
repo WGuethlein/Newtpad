@@ -3386,9 +3386,16 @@ when NEWTPAD_TESTS {
 			}
 
 			px_ := f32(24)
-			char_w := plat.text_char_width(&h.text, px_, .Doc)
 			x0, x1 := f32(40), f32(900)
 			ytop, ybot := f32(60), f32(650)
+			// The type scale and the content origin, from the SAME producers the
+			// draw reads (batch 17). Every sample window below is derived from
+			// these rather than from `char_w` multiples: the preview is
+			// proportional now, so a cell count no longer names a pixel, and a
+			// window guessed in cells would drift onto the wrong glyph without any
+			// assertion noticing.
+			m := md_metrics(&h.text, px_)
+			cx, measure := md_content_span(&m, x0, x1)
 
 			// --- a done item's prose lands where an undone item's does, muted --
 			// not muted twice (Finding 1/2), and not left at full strength either.
@@ -3421,22 +3428,48 @@ when NEWTPAD_TESTS {
 					copy(content, src)
 					return doc_from_content(content, "t.md", .UTF8)
 				}
-				// The glyph cell right after the checkbox + its gap, same geometry
-				// markdown_draw itself computes for the task branch.
-				gx0 := int(x0 + char_w * 1.4 + char_w)
-				gx1 := int(x0 + char_w * 1.4 + char_w * 2.2)
-				// ...and the code span: md_inline splits `IIII \`II\`` into the
-				// plain word "IIII " (5 cells, trailing space kept by
-				// md_draw_inline's word split) and then the code run, so the code
-				// run's first cell starts 5 cells further right.
-				cx0 := int(x0 + char_w * 1.4 + char_w * 6)
-				cx1 := int(x0 + char_w * 1.4 + char_w * 7.2)
+				// WHERE the two glyph runs land, shaped rather than guessed.
+				//
+				// md_inline splits the fixture into the plain run "IIII " (the
+				// trailing space belongs to it) and the code run "II", and
+				// md_layout_build gives them the body face at m.body and the mono
+				// face at m.code. Shaping that exact span pair through the exact same
+				// shaper the layout uses is what says where span 1 starts -- there is
+				// no cell arithmetic that can answer it, because a proportional 'I' is
+				// not a cell wide.
+				//
+				// A second producer of these positions, yes -- deliberately, and only
+				// in the test: it drives plat.shape_spans directly, so it can disagree
+				// with the layout only if the layout stopped going through the shaper.
+				task_ind := m.task_box + m.list_indent * 0.25
+				probe_spans := []plat.Shape_Span{
+					{text = "IIII ", px = m.body, set = .Body},
+					{text = "II", px = m.code, set = .Doc},
+				}
+				probe := plat.shape_spans(&h.gfx, &h.text, probe_spans, measure - task_ind, m.body_lead, context.temp_allocator)
+				span_x :: proc(s: ^plat.Shaped, span: int) -> (lo, hi: f32, found: bool) {
+					for g in s.glyphs {
+						if int(g.span) != span {continue}
+						if !found {lo, hi, found = g.x, g.x, true}
+						lo, hi = min(lo, g.x), max(hi, g.x)
+					}
+					return
+				}
+				plo, phi, pfound := span_x(&probe, 0)
+				clo, chi, cfound := span_x(&probe, 1)
+				dchk(&bad, pfound && cfound, "task items: the probe shaped both spans")
+				bx := cx + task_ind
+				// A narrow window at each run's FIRST glyph: a wider one would let the
+				// peak scan wander onto the neighbouring run and pass while sampling
+				// something else entirely.
+				gx0, gx1 := int(bx + plo), int(bx + plo + (phi - plo) / 3 + 2)
+				cx0, cx1 := int(bx + clo), int(bx + chi + 2)
 				gy0 := int(ytop)
-				gy1 := int(ytop + px_ * 1.3)
-				render :: proc(h: ^Headless_Gpu, doc: ^Document, x0, x1, ytop, ybot, px_, char_w: f32) -> (buf: []u8, ok: bool) {
+				gy1 := int(ytop + probe.height)
+				render :: proc(h: ^Headless_Gpu, doc: ^Document, x0, x1, ytop, ybot, px_: f32) -> (buf: []u8, ok: bool) {
 					bg := g_theme[.Bg_Base]
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, char_w, x0, x1, ytop, ybot, 0)
+					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, 0)
 					return plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				}
 				// The sample FARTHEST from the background is the pixel closest to
@@ -3456,10 +3489,10 @@ when NEWTPAD_TESTS {
 					return best > 0, b, g, r
 				}
 				doc_done := mk(true)
-				buf_d, ok_d := render(&h, &doc_done, x0, x1, ytop, ybot, px_, char_w)
+				buf_d, ok_d := render(&h, &doc_done, x0, x1, ytop, ybot, px_)
 				doc_close(&doc_done)
 				doc_undone := mk(false)
-				buf_u, ok_u := render(&h, &doc_undone, x0, x1, ytop, ybot, px_, char_w)
+				buf_u, ok_u := render(&h, &doc_undone, x0, x1, ytop, ybot, px_)
 				doc_close(&doc_undone)
 				dchk(&bad, ok_d && ok_u, "task items: both readbacks succeeded")
 				if ok_d && ok_u {
@@ -3531,7 +3564,13 @@ when NEWTPAD_TESTS {
 				fm_end, fm_inner := md_front_matter_end(&doc)
 				dchk(&bad, fm_inner == inner, fmt.tprintf("front matter fixture: inner lines counted as %d (want %d)", fm_inner, inner))
 
-				line_h := line_height(px_)
+				// The card's own line height is the CODE face's, not the body
+				// document's (batch 17): front matter is YAML source and 9.3 puts
+				// source on the mono face. The card's height, the rows
+				// md_draw_front_matter writes onto it and this test's expected row
+				// positions all come from this ONE number, exactly as they all came
+				// from line_height(px_) before it.
+				line_h := line_height(m.code)
 				bg := g_theme[.Bg_Base]
 
 				// `bottom` alone, on a doc with NOTHING after the closing fence:
@@ -3548,12 +3587,12 @@ when NEWTPAD_TESTS {
 					bare_doc := doc_from_content(bare_content, "fmbare.md", .UTF8)
 					defer doc_close(&bare_doc)
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					bare_bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &bare_doc, px_, char_w, x0, x1, ytop, ybot, 0)
+					bare_bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &bare_doc, px_, x0, x1, ytop, ybot, 0)
 					dchk(&bad, bare_bottom == fm_end, fmt.tprintf("front matter: with nothing after it, markdown_draw's `bottom` (%d) is md_front_matter_end's `end` (%d)", bare_bottom, fm_end))
 				}
 
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, 0)
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
 				buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				dchk(&bad, ok, "front matter: readback")
 				if ok {
@@ -3562,8 +3601,18 @@ when NEWTPAD_TESTS {
 					// darks only ~7-8/255 apart per channel in Dark, so a loose
 					// bound would call the bare background "the card" and this
 					// check would pass whether or not anything was drawn.
-					cb, cg, cr, _ := sample(buf, W, int(x0) + 3, int(ytop) + 3)
+					// Sampled from the CONTENT origin, not from the pane edge (batch
+					// 17): 9.3 gives the preview a 40px left padding, so the card's
+					// top-left corner is at md_content_span's cx. x0 + 3 is inside
+					// that padding and is bare canvas now -- the assertion moved to
+					// where the card is, it did not loosen.
+					cb, cg, cr, _ := sample(buf, W, int(cx) + 3, int(ytop) + 3)
 					dchk(&bad, near(g_theme[.Md_Code_Bg], cb, cg, cr, 3), "front matter: the card is drawn (Md_Code_Bg at its top-left corner)")
+					// ...and the 40px padding to its LEFT really is bare canvas, or
+					// "the card starts at cx" would also be satisfied by a card that
+					// starts further left and happens to cover cx.
+					pb, pg, pr, _ := sample(buf, W, int(x0) + 3, int(ytop) + 3)
+					dchk(&bad, !near(g_theme[.Md_Code_Bg], pb, pg, pr, 3), "front matter: the 40px left padding is not part of the card")
 
 					// The RULE line ("***") right after the block is a SOLID,
 					// unantialiased-interior quad -- unlike prose, its colour is
@@ -3571,16 +3620,25 @@ when NEWTPAD_TESTS {
 					// with no glyph coverage guesswork. Expected row is computed
 					// INDEPENDENTLY, from md_fm_height/md_fm_pad, not by copying
 					// markdown_draw's increments.
-					rule_y := ytop + px_ * 0.5 + md_fm_height(line_h, fm_inner)
-					rb, rg, rr, _ := sample(buf, W, int(x0) + 50, int(rule_y) + int(hairline() * 0.5))
+					// RESTATED for the block model: the gap between two blocks is
+					// max(upper.below, lower.above) -- adjacent margins collapse -- so
+					// the rule's top is the card's bottom plus that gap, and the
+					// old `px_ * 0.5` (the half-row a blank line used to advance) has
+					// nothing left to describe. Both terms come from md_metrics and
+					// md_fm_height, i.e. from the producers, not from md_pass's own
+					// increments. NOTE: at px_=24 the old expression happens to give
+					// the same 226 as this one, so leaving it alone would have left a
+					// green assertion that describes nothing.
+					rule_y := ytop + md_fm_height(line_h, fm_inner) + max(m.para_below, m.rule_gap)
+					rb, rg, rr, _ := sample(buf, W, int(cx) + 50, int(rule_y) + int(hairline() * 0.5))
 					dchk(
 						&bad, near(g_theme[.Md_Rule], rb, rg, rr, 10),
-						fmt.tprintf("front matter: the rule after the block sits exactly at md_fm_height's row (y=%.1f)", rule_y),
+						fmt.tprintf("front matter: the rule after the block sits exactly at md_fm_height + the collapsed gap (y=%.1f)", rule_y),
 					)
 					// A row clearly ABOVE that must NOT already be the rule -- or
 					// "found the rule somewhere" could pass by accident from a
 					// too-generous scan.
-					ab, ag, ar, _ := sample(buf, W, int(x0) + 50, int(rule_y) - 6)
+					ab, ag, ar, _ := sample(buf, W, int(cx) + 50, int(rule_y) - 6)
 					dchk(&bad, !near(g_theme[.Md_Rule], ab, ag, ar, 10), "front matter: 6px above that row is NOT the rule (bound is tight, not a scan)")
 
 					// --- item 3 (2026-07-29): the `---` delimiters are BACK,
@@ -3639,14 +3697,19 @@ when NEWTPAD_TESTS {
 					// card" check below passed against a card two rows too
 					// short. Stating the row index makes the card the only
 					// thing that can move.
-					open_base := card_top + pad + px_
+					// px_ -> m.code and x0 -> cx (batch 17): the card's rows are drawn
+					// at the code size on the mono face, from the content origin. Both
+					// substitutions come from md_block_draw's own arguments to
+					// md_draw_front_matter, which is the single producer of this text.
+					open_base := card_top + pad + m.code
 					close_base := open_base + f32(fm_inner + 1) * line_h
-					dx0, dx1 := int(x0 + char_w) + 1, int(x0 + char_w * 4)
+					fm_cw := plat.text_char_width(&h.text, m.code, .Doc)
+					dx0, dx1 := int(cx + fm_cw) + 1, int(cx + fm_cw * 4)
 					for c in ([]struct {
 						base: f32,
 						what: string,
 					}{{open_base, "opening"}, {close_base, "closing"}}) {
-						d, db, dg, dr := fm_peak(buf, dx0, dx1, int(c.base - px_ * 0.9), int(c.base + px_ * 0.15), W, H)
+						d, db, dg, dr := fm_peak(buf, dx0, dx1, int(c.base - m.code * 0.9), int(c.base + m.code * 0.15), W, H)
 						// The full separation between Text_Muted and
 						// Md_Code_Bg in Dark, summed over three channels, is
 						// ~319, and the hyphen's interior MEASURES 320 -- it
@@ -3674,10 +3737,10 @@ when NEWTPAD_TESTS {
 					// bare surface and not glyph ink. With the pre-item-3 height
 					// (inner rows only) this y is past the card's bottom edge and
 					// reads Bg_Base.
-					sb, sg, sr, _ := sample(buf, W, int(x0) + 300, int(close_base - px_ * 0.5))
+					sb, sg, sr, _ := sample(buf, W, int(cx) + 300, int(close_base - m.code * 0.5))
 					dchk(
 						&bad, near(g_theme[.Md_Code_Bg], sb, sg, sr, 3),
-						fmt.tprintf("front matter: the closing `---` row is INSIDE the card (surface at y=%.0f is bgr %d,%d,%d)", close_base - px_ * 0.5, sb, sg, sr),
+						fmt.tprintf("front matter: the closing `---` row is INSIDE the card (surface at y=%.0f is bgr %d,%d,%d)", close_base - m.code * 0.5, sb, sg, sr),
 					)
 					// (c): no rule inside the card. A run, not a pixel count --
 					// an antialiased glyph edge blends card -> Text_Muted and
@@ -3688,7 +3751,7 @@ when NEWTPAD_TESTS {
 					worst_run := 0
 					for yy in int(card_top) ..< min(H, int(card_bot)) {
 						run := 0
-						for xx in int(x0) + 1 ..< min(W, int(x1) - 1) {
+						for xx in int(cx) + 1 ..< min(W, int(x1) - 1) {
 							rb2, rg2, rr2, _ := sample(buf, W, xx, yy)
 							if near(g_theme[.Md_Rule], rb2, rg2, rr2, 6) {
 								run += 1
@@ -3701,18 +3764,18 @@ when NEWTPAD_TESTS {
 					// short of the full-width run a restored Md_Rule would give.
 					dchk(
 						&bad, worst_run < 60,
-						fmt.tprintf("front matter: no Md_Rule spans the card (longest Md_Rule-coloured run inside it: %dpx of %.0f)", worst_run, x1 - x0),
+						fmt.tprintf("front matter: no Md_Rule spans the card (longest Md_Rule-coloured run inside it: %dpx of %.0f)", worst_run, x1 - cx),
 					)
 				}
 
 				// The p==0 gate: scrolled to start exactly at the front matter's
 				// end, the card must NOT be drawn at all.
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				bottom2 := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, fm_end)
+				bottom2 := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, fm_end)
 				dchk(&bad, bottom2 > fm_end, "front matter: scrolled past it, markdown_draw advances past fm_end (the rule line), not stuck")
 				buf2, ok2 := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				if ok2 {
-					cb, cg, cr, _ := sample(buf2, W, int(x0) + 3, int(ytop) + 3)
+					cb, cg, cr, _ := sample(buf2, W, int(cx) + 3, int(ytop) + 3)
 					// Same tight tolerance as the presence check above, for the
 					// same reason: Bg_Base sits within a loose bound of
 					// Md_Code_Bg, which would make an undrawn card look drawn.
@@ -3722,40 +3785,42 @@ when NEWTPAD_TESTS {
 			return bad
 		}
 
-		// mdtest's HEADING-FIT checks (item 6, 2026-07-29 live-pass regressions).
+		// mdtest's BLOCK-FIT checks (item 6, 2026-07-29 live-pass regressions,
+		// restated for batch 17's block model).
 		//
-		// markdown_draw advanced `y` past a heading by `hh + (hpx - px) -
-		// px*0.3` while md_row_fits admitted the row on the BODY `line_h`. A
-		// heading near the bottom of the pane was therefore let in against a
-		// budget smaller than the space it actually needs, drawn taller than
-		// that budget, and then cut through the middle of its glyphs by the
-		// cover strip main.odin paints afterwards. There is no scissor rect
-		// anywhere in this renderer, so not admitting the row is the only way
-		// not to cut it.
+		// The defect: markdown_draw advanced past a heading by its own taller
+		// line height while the admit test used the BODY line height. A heading
+		// near the bottom of the pane was let in against a budget smaller than
+		// the space it needs, drawn taller than that budget, and cut through the
+		// middle of its glyphs by the cover strip main.odin paints afterwards.
+		// There is no scissor rect anywhere in this renderer, so not admitting
+		// the block is the only way not to cut it.
 		//
-		// Two independent assertions, PER HEADING LEVEL -- the six levels have
-		// six different sizes, and a fix that only got h1 right would sail
-		// through a single-level test:
+		// WHAT CHANGED, and why it is a correction rather than an accommodation.
+		// The old version's assertion 1 was geometric: it computed the heading's
+		// baseline itself as `ytop + px + 3*line_h`, which was only sayable
+		// because every row was exactly one body line high. Under the block model
+		// a paragraph's height comes from the shaper (proportional, soft-wrapped,
+		// clamped up to the face's own ascent + descent) and 9.3's space-between
+		// columns sit between blocks, so that expression is no longer true of
+		// anything -- and rewriting it would mean re-deriving the whole layout
+		// inside the test, which is a second producer of exactly the number under
+		// test. So assertion 1 is replaced by the PROPERTY it was a proxy for,
+		// asserted directly and at every ybot rather than at one:
 		//
-		//   1. GEOMETRIC, swept across every `ybot` in the window where the old
-		//      bound and the new one disagree. If markdown_draw drew the heading
-		//      at all, the heading's whole row [y-px, y-px+hh) must be above
-		//      ybot. `y` is known to the test independently -- the three rows
-		//      above the heading are plain paragraphs, each exactly line_h -- so
-		//      this compares markdown_draw's admit decision against arithmetic
-		//      the test states, not against markdown_draw's own.
-		//   2. PIXEL, at a ybot the old bound admits and the new one does not:
-		//      nothing may be drawn at or below ybot. The heading text carries
-		//      DESCENDERS on purpose. An all-caps heading's ink sits entirely
-		//      above its baseline and would clear ybot even with the row
-		//      overhanging, which makes the pixel check vacuous -- measured, not
-		//      assumed. Measured with the bound sabotaged back to `line_h`:
-		//      assertion 1 fails at all six levels, assertion 2 at h1 (674
-		//      inked pixels below ybot) and h2 (216). It does NOT fail at
-		//      h3..h6, whose rows exceed a body row by only 4-9px -- too little
-		//      for the overhang to push glyph ink past ybot at this font size.
-		//      Assertion 1 is what carries those levels, and that is why there
-		//      are two.
+		//   if markdown_draw admitted the heading, NOTHING it drew may sit at or
+		//   below ybot.
+		//
+		// That is strictly stronger than the pair it replaces (the old assertion
+		// 2 checked pixels at a single hand-picked ybot; this checks them at
+		// every ybot in the window, and covers the h1/h2 rule and the soft-wrap
+		// overhang the old geometric form could not see), and it needs no
+		// arithmetic of its own at all -- the only thing it reads back from the
+		// draw is `bottom`, which says whether the heading was admitted.
+		//
+		// The heading text carries DESCENDERS on purpose: an all-caps heading's
+		// ink sits entirely above its baseline and would clear ybot even with the
+		// block overhanging, which would make the pixel check vacuous.
 		//
 		// Its own procedure with its own device, and exactly ONE Document alive
 		// at a time: test_mode_dispatch's frame has hit STATUS_STACK_OVERFLOW
@@ -3778,14 +3843,37 @@ when NEWTPAD_TESTS {
 			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
 
 			px_ := f32(24)
-			char_w := plat.text_char_width(&h.text, px_, .Doc)
 			x0, x1, ytop := f32(40), f32(900), f32(60)
-			line_h := line_height(px_)
 			bg := g_theme[.Bg_Base]
-			// Three plain paragraph rows ahead of the heading, so the heading's
-			// baseline is `ytop + px + 3*line_h` by arithmetic the test owns.
+			m := md_metrics(&h.text, px_)
+			// Three plain paragraph blocks ahead of the heading, so the heading is
+			// never the block `forced` admits unconditionally.
 			LEAD :: "body\nbody\nbody\n"
-			y_head := ytop + px_ + 3 * line_h
+			// How many levels come out TALLER than a body block. At least one must,
+			// or the sweep below cannot reproduce the original overhang at all: a
+			// body-sized budget that is too LARGE refuses blocks that would fit
+			// (gratuitous whitespace), one too SMALL cuts glyphs (the reported bug).
+			taller := 0
+
+			// How much ink sits at or below `ybot`. Zero is the property.
+			ink_below :: proc(pix: []u8, ybot: f32, x0, x1: f32, W, H: int) -> (inked, topmost: int) {
+				bg := g_theme[.Bg_Base]
+				topmost = -1
+				for yy in max(0, int(ybot)) ..< H {
+					for xx in int(x0) ..< int(x1) {
+						i := (yy * W + xx) * 4
+						d :=
+							abs(int(pix[i]) - int(bg[2] * 255)) +
+							abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+							abs(int(pix[i + 2]) - int(bg[0] * 255))
+						if d > 24 {
+							inked += 1
+							if topmost < 0 {topmost = yy}
+						}
+					}
+				}
+				return
+			}
 
 			for lvl in 1 ..= 6 {
 				hashes := strings.repeat("#", lvl, context.temp_allocator)
@@ -3795,79 +3883,91 @@ when NEWTPAD_TESTS {
 				copy(content, src)
 				doc := doc_from_content(content, "h.md", .UTF8)
 
-				hh := line_height(md_head_px(px_, lvl))
-				row_bot := y_head - px_ + hh
-				// Without this the whole case could be vacuous: if a level's row
-				// were no taller than a body row there would be nothing for the
-				// old bound to get wrong, and both assertions would pass on any
-				// implementation.
-				hchk(&bad, hh > line_h, fmt.tprintf("h%d: fixture is non-degenerate -- its row is %.0fpx against a body row's %.0f", lvl, hh, line_h))
-
-				// (1) Sweep the disagreement window: [old bound - 2, new bound + 2].
-				first_bad := -1
-				for yb := int(y_head - px_ + line_h) - 2; yb <= int(row_bot) + 2; yb += 1 {
-					ybot := f32(yb)
-					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, 0)
-					// `bottom` is "just past the last line drawn": it only
-					// reaches the heading's line end if the heading was admitted.
-					if bottom >= head_end && row_bot > ybot && first_bad < 0 {first_bad = yb}
-				}
+				// Non-degeneracy, and it is not decoration: if a level's block were
+				// exactly a body block's height there would be nothing for a body-sized
+				// budget to get wrong, and the sweep below would pass against any
+				// implementation. Measured through the same shaper the layout uses, at
+				// the same measure, so it states what the block actually costs rather
+				// than a ratio copied out of 9.3.
+				//
+				// `hh != bh`, NOT `hh > bh` (batch 17). The old form held at every level
+				// only because md_head_px sized h5/h6 at 1.03 * S. 9.3 puts them at
+				// 1.00 * S -- "h6 is the same size as body, distinguished by caps +
+				// tracking, not size" -- and gives a heading a heading's tighter leading
+				// rather than a paragraph's 1.65, so h4-h6 now come out SHORTER than a
+				// body block. Keeping `>` would have been asserting a type scale the
+				// spec does not have; what the precondition actually needs is that a
+				// body-sized budget is the WRONG budget for this block, which is what
+				// `!=` says. The direction that reproduces the original defect is
+				// covered by the separate check after the loop.
+				cx, measure := md_content_span(&m, x0, x1)
+				_ = cx
+				hh := plat.shape_run(&h.gfx, &h.text, "Hgjpqy", m.head[lvl], measure, line_height(m.head[lvl]), .Body, context.temp_allocator).height
+				bh := plat.shape_run(&h.gfx, &h.text, "body", m.body, measure, m.body_lead, .Body, context.temp_allocator).height
+				if hh > bh {taller += 1}
 				hchk(
-					&bad, first_bad < 0,
-					fmt.tprintf("h%d: never admitted with its row overhanging (row ends at %.0f; first bad ybot %d)", lvl, row_bot, first_bad),
+					&bad, hh != bh,
+					fmt.tprintf("h%d: fixture is non-degenerate -- its block is %.0fpx against a body block's %.0f", lvl, hh, bh),
 				)
 
-				// (2) One ybot inside the old bound's admit range and outside the
-				// new one, read back and scanned for ink below the content box.
-				ybot_pix := y_head - px_ + line_h + 1
-				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot_pix, 0)
-				if pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); ok {
-					inked, wy := 0, -1
-					for yy in int(ybot_pix) ..< H {
-						for xx in int(x0) ..< int(x1) {
-							i := (yy * W + xx) * 4
-							d :=
-								abs(int(pix[i]) - int(bg[2] * 255)) +
-								abs(int(pix[i + 1]) - int(bg[1] * 255)) +
-								abs(int(pix[i + 2]) - int(bg[0] * 255))
-							if d > 24 {
-								inked += 1
-								if wy < 0 {wy = yy}
-							}
-						}
+				// Sweep every ybot across the window where the heading goes from
+				// "admitted" to "not admitted", plus a margin either side. At every
+				// one of them: admitted implies nothing at or below ybot.
+				worst_yb, worst_ink, worst_top := -1, 0, -1
+				admitted, refused := 0, 0
+				for yb := int(ytop) + 1; yb <= H - 1; yb += 1 {
+					ybot := f32(yb)
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					// `bottom` is "just past the last line drawn": it only reaches
+					// the heading's line end if the heading was admitted.
+					bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+					if bottom < head_end {
+						refused += 1
+						continue
 					}
-					hchk(
-						&bad, inked == 0,
-						fmt.tprintf("h%d: nothing drawn at or below ybot=%.0f (%d inked pixels, topmost at y=%d)", lvl, ybot_pix, inked, wy),
-					)
-				} else {
-					hchk(&bad, false, fmt.tprintf("h%d: readback", lvl))
+					admitted += 1
+					pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if !ok {continue}
+					if inked, top := ink_below(pix, ybot, x0, x1, W, H); inked > 0 && worst_yb < 0 {
+						worst_yb, worst_ink, worst_top = yb, inked, top
+					}
 				}
+				// Both counts non-zero, or the sweep never crossed the boundary and
+				// the assertion above it is about nothing.
+				hchk(
+					&bad, admitted > 0 && refused > 0,
+					fmt.tprintf("h%d: the sweep really crosses the admit boundary (%d admitted, %d refused)", lvl, admitted, refused),
+				)
+				hchk(
+					&bad, worst_yb < 0,
+					fmt.tprintf("h%d: every ybot that admits the heading draws nothing at or below it (first bad ybot %d: %d inked pixels, topmost y=%d)", lvl, worst_yb, worst_ink, worst_top),
+				)
 				doc_close(&doc)
 			}
 
-			// L10 (2026-07-29 review): `forced` (markdown.odin, right above the row
-			// loop) exempts only the very first row from the md_row_fits test above,
-			// so a pane too short for even one row still shows a clipped row instead
-			// of nothing -- "no frame ever shows emptiness" outranks the trim. The
-			// sweep above never reaches this: LEAD always puts three body rows ahead
-			// of the heading, so the first row admitted is never the one under test.
-			// Here the heading IS the first row, and ybot is pinned at ytop itself --
-			// tighter than any body row's ink, let alone a heading's -- so nothing
-			// but `forced` can admit it. Without `forced` this returns bottom == 0.
+			hchk(&bad, taller >= 1, fmt.tprintf("at least one heading level is taller than a body block (%d of 6)", taller))
+
+			// L10 (2026-07-29 review): `forced` (markdown.odin, in md_pass) exempts
+			// only the very first block from the md_block_fits test above, so a pane
+			// too short for even one block still shows a clipped one instead of
+			// nothing -- "no frame ever shows emptiness" outranks the trim. The
+			// sweep above never reaches this: LEAD always puts three body blocks
+			// ahead of the heading, so the first block admitted is never the one
+			// under test. Here the heading IS the first block, and ybot is pinned at
+			// ytop itself -- tighter than any body block, let alone a heading's --
+			// so nothing but `forced` can admit it. Without `forced` this returns
+			// bottom == 0.
 			{
 				src := "# Hgjpqy\n"
 				content := make([]u8, len(src))
 				copy(content, src)
 				doc := doc_from_content(content, "forced.md", .UTF8)
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ytop, 0)
+				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ytop, 0)
 				hchk(
 					&bad,
 					bottom > 0,
-					fmt.tprintf("forced: a pane too short for its first row still advances past it (bottom=%d)", bottom),
+					fmt.tprintf("forced: a pane too short for its first block still advances past it (bottom=%d)", bottom),
 				)
 				doc_close(&doc)
 			}
@@ -13613,13 +13713,25 @@ when NEWTPAD_TESTS {
 					low := row_at_y(px, cbot - 0.25)
 					rb_chk(bad, low <= drawn - 1, fmt.tprintf("%-20s: lowest content pixel is row %d, within the %d drawn", c.what, low, drawn))
 
-					// The markdown panes share the same content box but walk
-					// BASELINES, so they get their own bound. Two properties:
-					// the block of rows md_row_fits admits never crosses cbot
-					// (the overlap Wyatt reported), and it is maximal (no
-					// gratuitous whitespace).
+					// The markdown pane shares the same content box but stacks
+					// BLOCKS, so it gets its own bound. Two properties: the run
+					// of blocks md_block_fits admits never crosses cbot (the
+					// overlap Wyatt reported), and it is maximal (no gratuitous
+					// whitespace).
+					//
+					// RESTATED for the block model (batch 17): the predicate was
+					// md_row_fits(y, px, line_h, cbot) walking BASELINES, whose
+					// `- px` term turned a baseline back into a row top. The
+					// preview no longer has baselines at the block level -- it
+					// stacks block tops -- so the same walk is now stated in tops
+					// with no correction term. The two are the same arithmetic
+					// (`ctop + px - px + line_h <= cbot` is `ctop + line_h <=
+					// cbot`), so both assertions below are unchanged and still
+					// bound the same edge; what changed is that the predicate is
+					// now written in the units the draw actually uses, which is
+					// the whole reason this assertion exists in the first place.
 					k := 0
-					for y := ctop + px; md_row_fits(y, px, line_h, cbot); y += line_h {
+					for y := ctop; md_block_fits(y, line_h, cbot); y += line_h {
 						k += 1
 						if k > 64 {break}
 					}

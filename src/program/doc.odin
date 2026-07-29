@@ -1022,6 +1022,20 @@ Document :: struct {
 	// allocation, so nothing to free on doc close.
 	md_table:      [MD_TABLE_SLOTS]Md_Table_Cache,
 	md_table_next: int, // round-robin replacement cursor
+	// Per-block laid-out glyph positions (UI spec 9.1's layout cache). Keyed on
+	// the block's start byte and its own source text -- see MD_LAYOUT_SLOTS.
+	//
+	// A SLICE, allocated lazily on the first preview pass, not a fixed array
+	// like md_table above it. Md_Layout is ~300 bytes and there are 128 slots,
+	// so inline it would put ~38 KB into every Document -- and a Document is
+	// created BY VALUE in several places (doc_from_content returns one;
+	// test_mode_dispatch holds them as locals in an already-enormous frame).
+	// Measured: making it inline turned every headless mode into an immediate
+	// STATUS_STACK_OVERFLOW (0xC00000FD), including modes that never open a
+	// document, which is the third time this frame has done that. Freed
+	// explicitly by md_layout_reset, which doc_close calls.
+	md_layout:      []Md_Layout,
+	md_layout_next: int, // round-robin replacement cursor
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)
@@ -1305,6 +1319,12 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.filter_line_nos)
 	delete(doc.table_widths)
 	delete(doc.table_edit_buf)
+	// The markdown preview's per-block layout cache owns heap storage (a source
+	// copy, a span text store, the shaper's glyph and line-box arrays, and the
+	// span boxes) for every filled slot. Freed here rather than left to the
+	// process because a session that opens and closes many markdown files would
+	// otherwise leak a screenful of shaped glyphs per file.
+	md_layout_reset(doc)
 	base.pt_destroy(&doc.pt)
 	if doc.owned_orig {
 		delete(doc.original)

@@ -710,8 +710,22 @@ main :: proc() {
 					if _, over := table_link_hit(table_links(doc, &text, px, char_w, rows, f32(window.width)), f32(cx), f32(cy), px, line_h); over {
 						want = .Hand
 					}
-				} else if _, over := links_hit(links_layout(doc, &text, drawn), px, char_w, f32(cx), f32(cy)); over {
+				} else if _, over := md_link_at(md_preview_links(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac), f32(cx), f32(cy)); over {
+					// The preview pane's own links: rectangles from the shaper,
+					// not columns from the cell grid the preview does not have.
+					// nil in every mode but Preview/Split, and its rectangles
+					// only ever cover the preview pane, so this cannot claim a
+					// point in Split's editor half.
 					want = .Hand
+				} else if !md_pane_owns(doc, f32(window.width), f32(window.height), app.settings.split_frac, f32(cx)) {
+					// The editor's grid path, and ONLY where the editor really
+					// is. In Split the editor pass draws full-window width (the
+					// preview repaints over it), so its Link_Hits run on into
+					// the right half and would put a hand cursor over preview
+					// prose that has nothing under it.
+					if _, over := links_hit(links_layout(doc, &text, drawn), px, char_w, f32(cx), f32(cy)); over {
+						want = .Hand
+					}
 				}
 			}
 			plat.window_set_cursor(window, want)
@@ -721,11 +735,20 @@ main :: proc() {
 		// also move the caret, and gated on Ctrl so a plain click still means what
 		// it always meant — you can click into the middle of a URL to edit it.
 		if window.mouse_pressed && plat.key_ctrl_down() && !doc.filter {
-			hits := links_layout(doc, &text, drawn)
-			if h, found := links_hit(hits, px, char_w, f32(window.mouse_x), f32(window.mouse_y)); found {
+			mmx, mmy := f32(window.mouse_x), f32(window.mouse_y)
+			// Same dispatch, same producers, same order as the hover cursor
+			// above: the preview pane's shaped rectangles first, the editor's
+			// grid only where the editor actually is.
+			if h, found := md_link_at(md_preview_links(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac), mmx, mmy); found {
 				link_follow(&app, &text, window, doc, h.text, h.link)
 				window.mouse_pressed = false
 				window.mouse_down = false
+			} else if !md_pane_owns(doc, f32(window.width), f32(window.height), app.settings.split_frac, mmx) {
+				if h, hfound := links_hit(links_layout(doc, &text, drawn), px, char_w, mmx, mmy); hfound {
+					link_follow(&app, &text, window, doc, h.text, h.link)
+					window.mouse_pressed = false
+					window.mouse_down = false
+				}
 			}
 		}
 
@@ -1281,11 +1304,15 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	bottom := doc.top
 	if doc.kind == .Text && doc.md_mode == .Preview {
 		// Full-window rendered markdown (read-only) replaces the text pass.
-		// Bounds from doc_content_box, the same producer the Split preview, the
-		// H_SCROLL cover and the bottom clip below all read -- so "where the
-		// document ends" is one expression, not four that agree today.
-		ytop, ybot := doc_content_box(doc, f32(window.height))
-		bottom = markdown_draw(gfx, quad_pipe, text, doc, px, char_w, TEXT_MARGIN_X, f32(window.width) - SCROLLBAR_W, ytop, ybot, doc.top)
+		// The pane box comes from md_pane_box, the SAME producer the link pass
+		// reads -- so what is clickable and what is drawn cannot be laid out in
+		// two different rectangles.
+		if mx0, mx1, mytop, mybot, mok := md_pane_box(doc, f32(window.width), f32(window.height), rc.app.settings.split_frac); mok {
+			bottom = markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.top)
+			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
+				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac))
+			}
+		}
 	} else if doc.table && doc.kind == .Text {
 		// Read-only grid view (CSV/TSV) replaces the text pass entirely.
 		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, rows, f32(window.width))
@@ -1437,8 +1464,13 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		line_w := hairline()
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {dr.pos.x + dr.size.x * 0.5 - line_w * 0.5, dr.pos.y}, size = {line_w, dr.size.y}, color = g_theme[.Border_Strong]}})
 		// Preview follows the editor's scroll (doc.top): one synced position, both
-		// panes anchored to the same source line.
-		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, char_w, er + TEXT_MARGIN_X, w - SCROLLBAR_W, pvtop, pvbot, doc.top)
+		// panes anchored to the same source line. Pane box from md_pane_box, the
+		// producer the link pass reads too.
+		mx0, mx1, mytop, mybot, _ := md_pane_box(doc, w, h, rc.app.settings.split_frac)
+		pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.top)
+		if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
+			md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
+		}
 		if total > 0 {
 			pvb := vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom, text, rows)
 			g_vbar_preview = pvb

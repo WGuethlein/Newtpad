@@ -1115,6 +1115,23 @@ text_draw_spans :: proc(
 	defer t.drawing = false
 
 	text_walk_glyphs(gfx, t, str, x, y, px, base, spans, set, &instances)
+	text_submit_instances(gfx, t, instances[:])
+}
+
+// Upload a batch of placed glyph quads and issue the instanced draw.
+//
+// Split out of text_draw_spans so the SHAPER's draw (shaped_draw, shape.odin)
+// reaches the GPU through the same path rather than a second copy of this
+// plumbing. The grid walk and the proportional walk place glyphs differently —
+// that is the whole point of the shaper — but there is exactly one place that
+// maps, binds and draws them, so a pipeline-state change cannot land in one and
+// miss the other.
+//
+// The caller owns `instances` and is responsible for the t.drawing guard around
+// the walk that produced them: the UVs inside are only valid while the atlas
+// holds still.
+@(private)
+text_submit_instances :: proc(gfx: ^Gfx, t: ^Text, instances: []Text_Instance) {
 	if len(instances) == 0 {
 		return
 	}
