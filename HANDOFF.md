@@ -3813,6 +3813,65 @@ window, and locked the exe against the next build. Verify a mode before citing i
   external-change polling (copy inputs, work in private memory, merge once per frame, poll a cancel
   flag). Deliberately kept out of this batch as a design change, not a bug fix.
 
+### Part two: tasks 10–13 — checkbox tick, done-item colour, quote markers, front matter (2026-07-29, branch `fix/live-pass-0.27`)
+
+Four more items off [the v0.27.0 checklist](docs/live-pass-v0.27.0.md), each its own commit
+(`.superpowers/sdd/task-10-13-report.md` has the full per-task writeup: what the brief got wrong, the
+test, the sabotage).
+
+**What landed:**
+- **Task 10 — the task-list checkbox's tick is centred on the box**, not low-and-right. It is now
+  geometry (`md_tick_quads`, a stepped X of small quads) rather than a glyph, so the centring is exact
+  by construction and mdtest asserts it to 0.05px.
+- **Task 11 — a completed task item mutes every colour, not just the base-coloured prose.** Themed runs
+  (bold, code, links, italics) used to ignore the mute entirely; `md_run_color` now applies it after role
+  resolution, and `MD_DONE_MUTE :: 0.26` is a *derived* placeholder (solves `mute(Text_Primary) ==
+  Text_Muted` for both themes, doesn't land exactly on either).
+- **Task 12 — every `>` in a nested blockquote gets the same syntax-colour role**, not just the first
+  marker (`src/base/lex_markdown.odin`).
+- **Task 13 — YAML front matter draws as one card**, not a 2px bar per line (the old bar was the
+  blockquote's own decoration, borrowed by accident).
+
+**A 2026-07 review found eight defects in that landing**, fixed in the same branch:
+
+- **A done item's prose was muted TWICE.** The done branch set the base colour to `Text_Muted` *and*
+  handed it to `md_run_color`'s mute step, which lerps toward the page a second time — contrast against
+  `Bg_Base` measured 5.4:1 → 3.58:1 in Dark and 6.0:1 → 3.28:1 in Light, both under the 4.5:1 floor every
+  text role in `theme.odin` is annotated against. Fixed by keeping the base at `Text_Primary` and letting
+  the mute step do the only muting (`md_task_prose_style`, `markdown.odin`).
+- **The fix for that bug had no test coverage at the call site.** Sabotaging `markdown_draw`'s task
+  branch directly (not the shared procedures underneath it) printed `0 failures` — mdtest only ever drove
+  `md_run_color`/`md_mute` with hand-picked arguments, never asked what the draw itself passes. Closed two
+  ways: `md_task_prose_style` is now the ONE procedure both the draw and mdtest call, and `mdtest` gained
+  a draw-level pass (`md_draw_selftest`, `test_modes.odin`) that renders through a real offscreen D3D11
+  device (the `quadsdftest`/`Headless_Gpu` precedent) and reads back actual pixels — the done-item prose
+  colour and the front-matter card's row-advance are both verified against a REAL render, not a copy of
+  the logic. Sabotaging either call site now fails a test.
+- **The `MD_DONE_MUTE` self-test pinned an exact tier** (0.05 per channel) when the true dual-theme
+  intersection is roughly [0.232, 0.264] — 0.003 from the shipped value, so a plausible eye-tune (0.30)
+  already failed it with a message that said nothing about the constant being tunable. Reframed as
+  direction/ordering assertions (mutes strictly toward the page, lands in the ballpark of `Text_Muted`,
+  widened and explicitly labelled as bounding a placeholder) plus a new assertion on the PLAIN prose run
+  specifically, which is the one the double-mute bug actually broke and the old test never reached.
+- **The checkbox tick could leave a sub-pixel gap along its diagonal** (spacing `span/(steps-1)` came out
+  to 1.15px against a 1px square) and, at a small enough box (`bs < 4·st`), **could escape the box
+  entirely** (`arm` exceeding `bs`). Both fixed in `md_tick_quads`; the escape case is now in mdtest too.
+- **Two `quads_draw` calls per done checkbox** (border, then tick) merged into one instance list and one
+  call.
+- **`md_front_matter_end`'s fence check read a shorter buffer (512B) than `markdown_draw`'s own**
+  (`RENDER_LINE_CAP`, 8192B), so a line that trims to `` --- `` within the short buffer but not in full
+  would be a fence to one and a plain row to the other, oversizing the card. Both now read the same
+  amount.
+
+**Placeholders, still awaiting Wyatt's eye** (unchanged from Task 11/13's own landing, restated here since
+this is the entry that was owed): `MD_DONE_MUTE` and the front-matter card's surface/radius/inset are
+first drafts, not tuned values — see their doc comments in `markdown.odin`. **The specific question for
+the next live pass:** Wyatt's original report on front matter was "I don't know what this is supposed to
+look like... it shows as muted, **I see the start and end `---`**, and I see like a quote bar on the side
+but it's thinner" (`docs/live-pass-v0.27.0.md`). The card fix intentionally removes those visible `---`
+delimiters — the card IS the delimiter now, per UI spec 9.2. Confirm that's what he meant, not just "stop
+drawing the quote bar."
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
