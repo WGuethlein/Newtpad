@@ -3562,6 +3562,134 @@ when NEWTPAD_TESTS {
 			return bad
 		}
 
+		// mdtest's HEADING-FIT checks (item 6, 2026-07-29 live-pass regressions).
+		//
+		// markdown_draw advanced `y` past a heading by `hh + (hpx - px) -
+		// px*0.3` while md_row_fits admitted the row on the BODY `line_h`. A
+		// heading near the bottom of the pane was therefore let in against a
+		// budget smaller than the space it actually needs, drawn taller than
+		// that budget, and then cut through the middle of its glyphs by the
+		// cover strip main.odin paints afterwards. There is no scissor rect
+		// anywhere in this renderer, so not admitting the row is the only way
+		// not to cut it.
+		//
+		// Two independent assertions, PER HEADING LEVEL -- the six levels have
+		// six different sizes, and a fix that only got h1 right would sail
+		// through a single-level test:
+		//
+		//   1. GEOMETRIC, swept across every `ybot` in the window where the old
+		//      bound and the new one disagree. If markdown_draw drew the heading
+		//      at all, the heading's whole row [y-px, y-px+hh) must be above
+		//      ybot. `y` is known to the test independently -- the three rows
+		//      above the heading are plain paragraphs, each exactly line_h -- so
+		//      this compares markdown_draw's admit decision against arithmetic
+		//      the test states, not against markdown_draw's own.
+		//   2. PIXEL, at a ybot the old bound admits and the new one does not:
+		//      nothing may be drawn at or below ybot. The heading text carries
+		//      DESCENDERS on purpose. An all-caps heading's ink sits entirely
+		//      above its baseline and would clear ybot even with the row
+		//      overhanging, which makes the pixel check vacuous -- measured, not
+		//      assumed. Measured with the bound sabotaged back to `line_h`:
+		//      assertion 1 fails at all six levels, assertion 2 at h1 (674
+		//      inked pixels below ybot) and h2 (216). It does NOT fail at
+		//      h3..h6, whose rows exceed a body row by only 4-9px -- too little
+		//      for the overhang to push glyph ink past ybot at this font size.
+		//      Assertion 1 is what carries those levels, and that is why there
+		//      are two.
+		//
+		// Its own procedure with its own device, and exactly ONE Document alive
+		// at a time: test_mode_dispatch's frame has hit STATUS_STACK_OVERFLOW
+		// twice. `content` is DEFAULT-allocated because doc_from_content sets
+		// owned_orig and doc_close frees it.
+		md_head_fit_selftest :: proc() -> (bad: int) {
+			hchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1000, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/headfit") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(24)
+			char_w := plat.text_char_width(&h.text, px_, .Doc)
+			x0, x1, ytop := f32(40), f32(900), f32(60)
+			line_h := line_height(px_)
+			bg := g_theme[.Bg_Base]
+			// Three plain paragraph rows ahead of the heading, so the heading's
+			// baseline is `ytop + px + 3*line_h` by arithmetic the test owns.
+			LEAD :: "body\nbody\nbody\n"
+			y_head := ytop + px_ + 3 * line_h
+
+			for lvl in 1 ..= 6 {
+				hashes := strings.repeat("#", lvl, context.temp_allocator)
+				src := strings.concatenate({LEAD, hashes, " Hgjpqy\n"}, context.temp_allocator)
+				head_end := len(src) - 1 // the newline ending the heading's line
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "h.md", .UTF8)
+
+				hh := line_height(md_head_px(px_, lvl))
+				row_bot := y_head - px_ + hh
+				// Without this the whole case could be vacuous: if a level's row
+				// were no taller than a body row there would be nothing for the
+				// old bound to get wrong, and both assertions would pass on any
+				// implementation.
+				hchk(&bad, hh > line_h, fmt.tprintf("h%d: fixture is non-degenerate -- its row is %.0fpx against a body row's %.0f", lvl, hh, line_h))
+
+				// (1) Sweep the disagreement window: [old bound - 2, new bound + 2].
+				first_bad := -1
+				for yb := int(y_head - px_ + line_h) - 2; yb <= int(row_bot) + 2; yb += 1 {
+					ybot := f32(yb)
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, 0)
+					// `bottom` is "just past the last line drawn": it only
+					// reaches the heading's line end if the heading was admitted.
+					if bottom >= head_end && row_bot > ybot && first_bad < 0 {first_bad = yb}
+				}
+				hchk(
+					&bad, first_bad < 0,
+					fmt.tprintf("h%d: never admitted with its row overhanging (row ends at %.0f; first bad ybot %d)", lvl, row_bot, first_bad),
+				)
+
+				// (2) One ybot inside the old bound's admit range and outside the
+				// new one, read back and scanned for ink below the content box.
+				ybot_pix := y_head - px_ + line_h + 1
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot_pix, 0)
+				if pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); ok {
+					inked, wy := 0, -1
+					for yy in int(ybot_pix) ..< H {
+						for xx in int(x0) ..< int(x1) {
+							i := (yy * W + xx) * 4
+							d :=
+								abs(int(pix[i]) - int(bg[2] * 255)) +
+								abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+								abs(int(pix[i + 2]) - int(bg[0] * 255))
+							if d > 24 {
+								inked += 1
+								if wy < 0 {wy = yy}
+							}
+						}
+					}
+					hchk(
+						&bad, inked == 0,
+						fmt.tprintf("h%d: nothing drawn at or below ybot=%.0f (%d inked pixels, topmost at y=%d)", lvl, ybot_pix, inked, wy),
+					)
+				} else {
+					hchk(&bad, false, fmt.tprintf("h%d: readback", lvl))
+				}
+				doc_close(&doc)
+			}
+			return bad
+		}
+
 		// `newtpad mdtest` covers the markdown block classifiers and inline parser
 		// (the rendering itself needs a live eye), PLUS the draw-level checks
 		// above that exercise markdown_draw's own call sites through a real
@@ -3569,6 +3697,7 @@ when NEWTPAD_TESTS {
 		if os.args[1] == "mdtest" {
 			bad := md_selftest()
 			bad += md_draw_selftest()
+			bad += md_head_fit_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
 			return true
 		}

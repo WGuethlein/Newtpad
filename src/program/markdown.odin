@@ -727,7 +727,11 @@ Md_Run :: struct {
 }
 
 // Heading pixel scale by level (1..6).
-@(private = "file")
+//
+// Package-visible rather than file-private so mdtest's heading-fit checks can
+// state a heading row's expected height from the SAME table markdown_draw sizes
+// it from, instead of copying six ratios into the test where they could drift
+// (the md_row_fits precedent).
 md_head_px :: proc(px: f32, level: int) -> f32 {
 	switch level {
 	case 1:
@@ -1206,21 +1210,136 @@ md_draw_inline :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text
 	}
 }
 
-// Does a markdown row whose BASELINE is `y` fit entirely above `ybot`?
+// Does a markdown row whose BASELINE is `y` and whose drawn height is `row_h`
+// fit entirely above `ybot`?
 //
-// The row occupies [y - px, y - px + line_h): the baseline sits px down from
-// the row's top, not at it. The loop below used to ask `y < ybot`, which admits
-// a row whose baseline is one pixel above the content bottom and then draws a
-// whole line height of it -- up to line_h - px pixels of glyphs painted on top
+// The row occupies [y - px, y - px + row_h): the baseline sits px down from the
+// row's top, not at it. The loop below used to ask `y < ybot`, which admits a
+// row whose baseline is one pixel above the content bottom and then draws a
+// whole line height of it -- up to row_h - px pixels of glyphs painted on top
 // of the status bar. That is the overlap Wyatt reported in Markdown Preview and
 // in Split, and BOTH call sites already pass ybot = winh - doc_bottom_bar_h(doc)
 // (main.odin), so the bug was the bound, not the bound's input.
 //
+// `row_h` is the ROW'S OWN height, not the body line height -- item 6 of the
+// 2026-07-29 live-pass regressions. The loop used to pass `line_h` for every
+// row while a heading draws `line_height(md_head_px(px, lvl))`, so a heading
+// near the bottom was admitted against a budget it then overran and the cover
+// strip cut it through the middle of its glyphs. See Md_Row_Geom: the height is
+// produced once, before the admit decision, and the same value drives the
+// advance.
+//
 // Its own procedure so the test can drive it without a GPU device: reverting it
 // to `y < ybot` makes rowbudgettest's markdown walk fail rather than only
 // showing up on Wyatt's screen.
-md_row_fits :: #force_inline proc(y, px, line_h, ybot: f32) -> bool {
-	return y - px + line_h <= ybot
+md_row_fits :: #force_inline proc(y, px, row_h, ybot: f32) -> bool {
+	return y - px + row_h <= ybot
+}
+
+// What KIND of block one markdown line is.
+//
+// These are exactly the branches markdown_draw's row loop has -- the enum and
+// that switch are the same list, and Odin's exhaustiveness check is what keeps
+// them the same list. Front matter is deliberately absent: it is a multi-line
+// BLOCK, drawn whole before the loop starts (md_draw_front_matter).
+@(private = "file")
+Md_Kind :: enum u8 {
+	Para, // the fallthrough case, so a zeroed geom is the harmless one
+	Fence_Line,
+	Fence_Body,
+	Blank,
+	Rule,
+	Heading,
+	Quote,
+	List,
+	Table,
+}
+
+// One row's geometry, produced BEFORE the loop decides whether the row fits.
+//
+// This is the shape of item 6. The loop used to classify a line *inside* the
+// draw, having already admitted it against the BODY line height -- so a heading
+// was let in on a budget of `line_h` and then drawn `line_height(md_head_px)`
+// tall (61px against 36px for an h1 at px=24), overhanging the content box.
+// There is no scissor rect anywhere in this renderer; clipping is a cover strip
+// painted afterwards, so the only way for a row not to be cut in half is for it
+// not to be admitted. Hence: classify, then admit.
+//
+// `ink` and `adv` are produced HERE and nowhere else. The loop consumes `ink`
+// for md_row_fits and `adv` for the advance; if the two sites ever computed
+// their own, they would diverge, which is the exact failure shape this project
+// has recorded sixteen instances of (HANDOFF 6j).
+//
+//   ink -- the row's DRAWN height, measured down from the row top (y - px).
+//          A heading sinks its baseline by (hpx - px) precisely so its row top
+//          is still y - px, so one origin covers every kind.
+//   adv -- how far the baseline moves to reach the next row. Not the same
+//          number: a heading also carries the sink and the -0.3px tuck, and a
+//          blank line advances half a row while drawing nothing.
+//
+// Every kind keeps `ink > 0` even when it draws nothing (a fence line, a blank
+// line). A row admitted on zero ink always fits, and a file of blank lines
+// would then be walked to EOF on the UI thread instead of the pass stopping
+// when the pane filled.
+@(private = "file")
+Md_Row_Geom :: struct {
+	kind:      Md_Kind,
+	hpx, hh:   f32, // the row's own font size and line height (px / line_h for body rows)
+	ink:       f32,
+	adv:       f32,
+	// What the classifier already worked out, so the draw never re-derives it.
+	bullet:    string,
+	content:   string,
+	depth:     int,
+	task:      bool,
+	task_done: bool,
+}
+
+// Classify one line and size its row. Pure: same order of tests as the draw's
+// old if/else chain, so no line changes kind.
+@(private = "file")
+md_row_geom :: proc(line, trimmed: string, in_fence: bool, px, line_h: f32) -> (g: Md_Row_Geom) {
+	g.hpx, g.hh = px, line_h
+	g.ink, g.adv = line_h, line_h
+	switch {
+	case md_is_fence_line(line):
+		g.kind = .Fence_Line
+	case in_fence:
+		g.kind = .Fence_Body
+	case len(strings.trim_space(line)) == 0:
+		g.kind = .Blank
+		g.ink, g.adv = line_h * 0.5, line_h * 0.5
+	case md_is_rule(trimmed):
+		g.kind = .Rule
+	case:
+		if lvl := md_heading_level(trimmed); lvl > 0 {
+			g.kind = .Heading
+			g.hpx = md_head_px(px, lvl)
+			g.hh = line_height(g.hpx)
+			g.content = strings.trim_left(trimmed[lvl:], " ")
+			g.ink = g.hh
+			g.adv = (g.hpx - px) + g.hh - px * 0.3
+			return
+		}
+		if q, qcontent, qdepth := md_quote_depth(trimmed); q {
+			g.kind, g.content, g.depth = .Quote, qcontent, qdepth
+			return
+		}
+		// md_list reads the RAW line: its leading indent is the nesting depth.
+		if bullet, content, depth := md_list(line); bullet != "" {
+			g.kind, g.bullet, g.content, g.depth = .List, bullet, content, depth
+			if rest, done, is_task := md_task(content); is_task {
+				g.task, g.task_done, g.content = true, done, rest
+			}
+			return
+		}
+		if md_is_table_row(line) {
+			g.kind = .Table
+			return
+		}
+		g.kind, g.content = .Para, line
+	}
+	return
 }
 
 // Does this line (RAW, not pre-trimmed -- see below) open or close a fenced
@@ -1388,22 +1507,44 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		bottom = fm_end
 		p = fm_end
 	}
-	for md_row_fits(y, px, line_h, ybot) && p <= doc.pt.length {
+	// The fit test is INSIDE the loop now, after md_row_geom: it needs the row's
+	// own height, which is not known until the line is classified. See
+	// Md_Row_Geom.
+	//
+	// `forced` exempts the very first row from the test. Without it a pane
+	// shorter than one h1 (reachable: the window floor is 240dp and the doc font
+	// size is a user setting) would draw NOTHING for a document that opens with
+	// a heading -- an empty pane, which "no frame ever shows emptiness" rules
+	// out and which is a worse thing to look at than a heading the cover strip
+	// trims. It is spent once. The front-matter card above has already used it
+	// when there is one, hence the initialiser.
+	forced := fm_end == 0
+	for p <= doc.pt.length {
 		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
 		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
 		if n > 0 && buf[n - 1] == '\r' {n -= 1}
 		line := string(buf[:n])
 		trimmed := strings.trim_left(line, " \t")
+		g := md_row_geom(line, trimmed, in_fence, px, line_h)
+		if !forced && !md_row_fits(y, px, g.ink, ybot) {break}
+		forced = false
 
-		if md_is_fence_line(line) {
+		// How far md_draw_inline soft-wrapped past the row's first line. Soft
+		// wrap is the one part of a row's height that cannot be known before
+		// the draw (it depends on where each word lands), so it is added to the
+		// advance rather than to the admit budget -- the same treatment body
+		// text has always had, and it is why at most ONE block can overhang.
+		wrap := f32(0)
+
+		switch g.kind {
+		case .Fence_Line:
 			in_fence = !in_fence
 			if in_fence {
 				fence_lex, fence_state = md_fence_lexer(trimmed), .Normal
 			} else {
 				fence_lex = nil
 			}
-			y += line_h
-		} else if in_fence {
+		case .Fence_Body:
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {x1 - x0, line_h}, color = g_theme[.Md_Code_Bg]}})
 			if fence_lex != nil {
 				toks: [128]base.Token
@@ -1420,50 +1561,45 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			} else {
 				plat.text_draw(gfx, text, line, x0 + char_w, y, px, g_theme[.Md_Code], .Doc)
 			}
-			y += line_h
-		} else if len(strings.trim_space(line)) == 0 {
-			y += line_h * 0.5 // blank line: a little gap
-		} else if md_is_rule(trimmed) {
+		// A blank line draws nothing at all; md_row_geom halves its advance so
+		// it reads as a gap.
+		case .Blank:
+		case .Rule:
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {x1 - x0, hairline()}, color = g_theme[.Md_Rule]}})
-			y += line_h
-		} else if lvl := md_heading_level(trimmed); lvl > 0 {
-			hpx := md_head_px(px, lvl)
-			hh := line_height(hpx)
-			by := y + (hpx - px) // sink the larger baseline so it sits on the row
+		case .Heading:
+			by := y + (g.hpx - px) // sink the larger baseline so it sits on the row
 			x := x0
 			yy := by
-			runs := md_inline(strings.trim_left(trimmed[lvl:], " "))
+			runs := md_inline(g.content)
 			// force bold heading colour
 			for &r in runs {r.bold = true}
-			md_draw_inline(gfx, qp, text, runs, x0, x1, &x, &yy, hpx, plat.text_char_width(text, hpx, .Doc), hh, g_theme[.Md_Heading])
-			y = yy + hh - px * 0.3
-		} else if q, qcontent, qdepth := md_quote_depth(trimmed); q {
+			md_draw_inline(gfx, qp, text, runs, x0, x1, &x, &yy, g.hpx, plat.text_char_width(text, g.hpx, .Doc), g.hh, g_theme[.Md_Heading])
+			wrap = yy - by
+		case .Quote:
 			// One bar per nesting level, indented per level (UI spec 9.2's "2px
 			// bar + 16px inset per level"), so a reply inside a reply is visibly
 			// deeper instead of identical to a single quote.
-			for d in 0 ..< qdepth {
+			for d in 0 ..< g.depth {
 				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + f32(d) * char_w * 2, y - px}, size = {max(sx(3), 2), line_h}, color = g_theme[.Md_Quote]}})
 			}
-			qind := x0 + f32(qdepth) * char_w * 2
+			qind := x0 + f32(g.depth) * char_w * 2
 			x := qind
 			yy := y
-			md_draw_inline(gfx, qp, text, md_inline(qcontent), qind, x1, &x, &yy, px, char_w, line_h, g_theme[.Md_Quote])
-			y = yy + line_h
-		} else if bullet, content, depth := md_list(line); bullet != "" {
-			ind := x0 + f32(depth) * char_w * 2
-			body := content
+			md_draw_inline(gfx, qp, text, md_inline(g.content), qind, x1, &x, &yy, px, char_w, line_h, g_theme[.Md_Quote])
+			wrap = yy - y
+		case .List:
+			ind := x0 + f32(g.depth) * char_w * 2
 			// A task item draws a real box instead of literal brackets, which is
 			// how `- [ ] thing` reads without this. Done items go muted, so a
 			// finished checklist recedes -- and the TICK carries the state as
 			// well as the tone, never colour alone (UI spec 18).
-			task_col, task_mute := md_task_prose_style(false)
-			if rest, done, is_task := md_task(content); is_task {
-				body = rest
+			if g.task {
+				task_col, task_mute := md_task_prose_style(false)
 				bx := ind
 				bs := char_w * 1.4
 				by := y - px * 0.75
 				edge := hairline()
-				bc := g_theme[.Accent] if done else g_theme[.Text_Muted]
+				bc := g_theme[.Accent] if g.task_done else g_theme[.Text_Muted]
 				// Border and tick are ONE instance list and one quads_draw call
 				// (Finding 6, 2026-07 review): two Map+Draw round trips for a
 				// single checkbox was pure waste. The border is always 4 quads;
@@ -1474,7 +1610,7 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 				bq[2] = {pos = {bx, by}, size = {edge, bs}, color = bc}
 				bq[3] = {pos = {bx + bs - edge, by}, size = {edge, bs}, color = bc}
 				nq := 4
-				if done {
+				if g.task_done {
 					nt := md_tick_quads(bx, by, bs, g_theme[.Accent], bq[4:])
 					nq += nt
 					// The prose colour/mute is resolved through md_task_prose_style
@@ -1489,27 +1625,31 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 				plat.quads_draw(gfx, qp, bq[:nq])
 				x := ind + bs + char_w
 				yy := y
-				md_draw_inline(gfx, qp, text, md_inline(body), ind + bs + char_w, x1, &x, &yy, px, char_w, line_h, task_col, task_mute)
-				y = yy + line_h
-				p = end + 1
-				continue
+				md_draw_inline(gfx, qp, text, md_inline(g.content), ind + bs + char_w, x1, &x, &yy, px, char_w, line_h, task_col, task_mute)
+				wrap = yy - y
+			} else {
+				plat.text_draw(gfx, text, g.bullet, ind, y, px, g_theme[.Accent], .Doc)
+				x := ind + char_w * f32(len(g.bullet) + 1)
+				yy := y
+				md_draw_inline(gfx, qp, text, md_inline(g.content), ind + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
+				wrap = yy - y
 			}
-			plat.text_draw(gfx, text, bullet, ind, y, px, g_theme[.Accent], .Doc)
-			x := ind + char_w * f32(len(bullet) + 1)
-			yy := y
-			md_draw_inline(gfx, qp, text, md_inline(body), ind + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
-			y = yy + line_h
-		} else if md_is_table_row(line) {
+		case .Table:
 			if c := md_table_ensure(doc, text, p); c != nil {
 				md_draw_table_row(gfx, qp, text, c, line, x0, x1, y, px, char_w, md_row_is_sep(line))
 			}
-			y += line_h
-		} else {
+		case .Para:
 			x := x0
 			yy := y
-			md_draw_inline(gfx, qp, text, md_inline(line), x0, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
-			y = yy + line_h
+			md_draw_inline(gfx, qp, text, md_inline(g.content), x0, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
+			wrap = yy - y
 		}
+		// The ONE consumer of the height md_row_geom produced. Every branch
+		// above advances through here -- the task branch used to `continue` out
+		// of the loop with its own `p = end + 1` and never reached `bottom =
+		// end`, so a document ending in a task item under-reported its bottom
+		// to the scroll clamp.
+		y += g.adv + wrap
 
 		bottom = end
 		if end >= doc.pt.length {break}
