@@ -640,6 +640,20 @@ main :: proc() {
 		if doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) {
 			drags := Drag_Latches{scrollbar_drag, hscrollbar_drag, md_preview_drag, divider_drag}
 			ro := ro_surface_swallows(doc.table, doc.md_mode, f32(window.mouse_x) >= ed_right, drags)
+			// 9.1's one surviving pixel -> content mapping, wired to the gesture it
+			// exists for: "click-to-sync-scroll, which only needs the nearest
+			// BLOCK". SPLIT only -- it is the mode with both panes on screen, so it
+			// is the only one where a block in the preview names somewhere the
+			// editor could go. In full Preview a press stays inert, as it is today.
+			// The press is still swallowed below; this reads it on the way past.
+			if ro && doc.md_mode == .Split && window.mouse_pressed && !plat.key_ctrl_down() {
+				if c, ok := md_scroll_ctx(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac); ok {
+					if blk, hit := md_block_at_y(&c, doc.md_top, f32(window.mouse_y)); hit {
+						doc.top = min(base.pt_line_start(&doc.pt, blk), doc_max_top(doc, &text, rows))
+						doc.md_sync_top = doc.top // the preview keeps its own pixel offset
+					}
+				}
+			}
 			if ro && (window.mouse_pressed || window.mouse_down) {
 				window.mouse_pressed = false
 				window.mouse_middle_pressed = false
