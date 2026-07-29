@@ -16,49 +16,72 @@ foreign kernel32_fs {
 	GetDriveTypeW :: proc(lpRootPathName: win.wstring) -> u32 ---
 	ReplaceFileW :: proc(lpReplacedFileName, lpReplacementFileName, lpBackupFileName: win.wstring, dwReplaceFlags: win.DWORD, lpExclude, lpReserved: rawptr) -> win.BOOL ---
 }
+DRIVE_UNKNOWN :: 0
+DRIVE_NO_ROOT_DIR :: 1
+DRIVE_REMOVABLE :: 2
 DRIVE_FIXED :: 3
+DRIVE_REMOTE :: 4
+DRIVE_CDROM :: 5
+DRIVE_RAMDISK :: 6
 REPLACEFILE_WRITE_THROUGH :: win.DWORD(0x1)
 REPLACEFILE_IGNORE_MERGE_ERRORS :: win.DWORD(0x2)
 
 FILE_MMAP_THRESHOLD :: 16 * 1024 * 1024 // copy below, mmap above
 
+// Live, uncached GetDriveTypeW for one letter. Microsoft does not document that
+// this call never touches the volume -- only that it reads the type Windows
+// already recorded for the mount -- so treat it as fast-in-practice, not as a
+// guaranteed-local call; nothing here depends on it being instant, only on it
+// being current.
+@(private = "file")
+get_drive_type :: proc(letter: u8) -> u32 {
+	up := letter
+	if up >= 'a' && up <= 'z' {up -= 32}
+	if up < 'A' || up > 'Z' {return 0}
+	// No wide_path here: the argument is the three-character volume root, which
+	// can never approach MAX_PATH, and GetDriveTypeW wants a plain root anyway.
+	root := [4]u16{u16(up), u16(':'), u16('\\'), 0} // "C:\"
+	return GetDriveTypeW(win.wstring(raw_data(root[:])))
+}
+
 // Volume type per drive letter, answered once and kept for the process lifetime.
 //
-// GetDriveTypeW reads the local mount table -- it does not contact the volume, so
-// even a disconnected mapped drive answers promptly -- but this predicate now sits
-// on the per-frame link gate, whose entire purpose is that no filesystem call with
-// an unbounded wait may run on the UI thread. A 26-entry table removes the
-// question rather than arguing it, and removes a temp allocation and a syscall
-// from every frame besides. The trade is that re-mapping a letter to a different
-// KIND of volume mid-session is not noticed until restart; letters get re-mapped,
-// but a letter changing from removable to fixed does not happen in practice.
+// This cache feeds ONLY path_is_local's link-safety judgment below, where a
+// stale answer costs at most one skipped (or one over-eager) decoration -- never
+// a data-safety decision. It is NOT used by the mmap-vs-copy choice in
+// file_open_readonly, which calls get_drive_type live instead: a drive letter
+// that was a local fixed volume when first asked and is later ejected and
+// `net use`'d to the same letter (or vice versa) must be seen immediately there,
+// because a stale "fixed" would both bypass the UI-thread stat guard AND mmap a
+// file over SMB -- which the CAUTION comment on the mapping path below forbids
+// outright. The trade this cache still makes, for the link guard alone, is that
+// such a re-mapping is not noticed there until restart.
 //
 // 0 is DRIVE_UNKNOWN, which is also the zero value, so an unknown answer is simply
-// re-asked. It is not DRIVE_FIXED either way.
+// re-asked. It is folded into "not safe to treat as local" wherever it is read.
 @(private = "file")
 drive_type_cache: [26]u32
 
 @(private = "file")
-drive_type_of :: proc(letter: u8) -> u32 {
+drive_type_cached :: proc(letter: u8) -> u32 {
 	up := letter
 	if up >= 'a' && up <= 'z' {up -= 32}
 	if up < 'A' || up > 'Z' {return 0}
 	i := int(up - 'A')
 	if drive_type_cache[i] == 0 {
-		// No wide_path here: the argument is the three-character volume root, which
-		// can never approach MAX_PATH, and GetDriveTypeW wants a plain root anyway.
-		root := [4]u16{u16(up), u16(':'), u16('\\'), 0} // "C:\"
-		drive_type_cache[i] = GetDriveTypeW(win.wstring(raw_data(root[:])))
+		drive_type_cache[i] = get_drive_type(up)
 	}
 	return drive_type_cache[i]
 }
 
-// mmap only on a local fixed drive. Drive-letter paths are checked by volume
-// type; UNC / relative paths are treated as non-fixed (copy, crash-safe).
+// mmap only on a local fixed drive, using a LIVE volume-type call (see the
+// comment on drive_type_cache -- this must never read the cache). Drive-letter
+// paths are checked by volume type; UNC / relative paths are treated as
+// non-fixed (copy, crash-safe).
 @(private = "file")
-drive_is_fixed :: proc(path: string) -> bool {
+drive_is_fixed_live :: proc(path: string) -> bool {
 	if len(path) >= 3 && path[1] == ':' {
-		return drive_type_of(path[0]) == DRIVE_FIXED
+		return get_drive_type(path[0]) == DRIVE_FIXED
 	}
 	return false
 }
@@ -74,11 +97,27 @@ drive_is_fixed :: proc(path: string) -> bool {
 // because the alternative is a content-triggered freeze: a UNC path in a pasted
 // stack trace or a downloaded build log is attacker-controllable text.
 //
-// Only a lettered FIXED volume qualifies. A UNC path is refused without asking
-// Windows anything at all -- there is no local answer for `\\host\share`, and
-// obtaining one is precisely the call being avoided -- and so is a letter whose
-// volume is remote, removable or optical. A relative path is refused too: it has
-// no volume to judge, and callers here deal in resolved absolute paths.
+// A UNC path is refused without asking Windows anything at all -- there is no
+// local answer for `\\host\share`, and obtaining one is precisely the call being
+// avoided. A relative path is refused too: it has no volume to judge, and
+// callers here deal in resolved absolute paths.
+//
+// A lettered volume is judged by KIND, not narrowed to DRIVE_FIXED: only
+// DRIVE_REMOTE carries the redirector timeout that this guard exists to avoid.
+// DRIVE_REMOVABLE (USB sticks, SD cards) and DRIVE_RAMDISK are local and fast,
+// so refusing them along with network shares would silently break links in any
+// document opened from removable media for no safety benefit. DRIVE_CDROM is
+// refused too -- optical media can stall on spin-up or a missing disc, and nothing
+// depends on that case working. DRIVE_NO_ROOT_DIR (unmapped letter) and
+// DRIVE_UNKNOWN are refused because there is no volume to be confident about.
+//
+// This judges the PATH's shape and the drive letter it names, nothing more. A
+// directory symlink or junction that lives on a fixed drive but points at a UNC
+// target still traverses and still blocks, because Windows resolves the reparse
+// point during the stat itself -- this predicate never sees the redirection. Not
+// resolved here deliberately: it requires a pre-existing reparse point, which is
+// low-probability, and resolving one would itself need a filesystem call of the
+// exact shape this guard exists to avoid.
 path_is_local :: proc(path: string) -> bool {
 	p := path
 	// `\\?\C:\...` and `\\?\UNC\host\...` are a local drive and a UNC wearing the
@@ -88,7 +127,22 @@ path_is_local :: proc(path: string) -> bool {
 		if len(p) >= 4 && strings.equal_fold(p[:4], "UNC\\") {return false}
 	}
 	if len(p) >= 2 && (p[0] == '\\' || p[0] == '/') && (p[1] == '\\' || p[1] == '/') {return false}
-	return drive_is_fixed(p)
+	if len(p) < 3 || p[1] != ':' {return false} // no volume to judge
+	return drive_type_is_local(drive_type_cached(p[0]))
+}
+
+// Pure classification of a GetDriveTypeW answer, no syscall: is this KIND of
+// drive safe to treat as local? Split out from path_is_local above so the
+// DRIVE_* -> local/non-local mapping can be asserted directly, one constant at
+// a time, without needing a machine that actually has a removable drive, a RAM
+// disk and a mapped network drive all attached — see linktest.
+drive_type_is_local :: proc(kind: u32) -> bool {
+	switch kind {
+	case DRIVE_REMOTE, DRIVE_NO_ROOT_DIR, DRIVE_UNKNOWN, DRIVE_CDROM:
+		return false
+	case:
+		return true
+	}
 }
 
 File_View :: struct {
@@ -118,8 +172,11 @@ file_open_readonly :: proc(path: string) -> (fv: File_View, ok: bool) {
 
 	// Copy (crash-immune) unless the file is large AND on a local fixed drive.
 	// mmap'd pages on a network/removable volume fault - and block the faulting
-	// thread for the SMB timeout - if the media drops; copying avoids that.
-	if n < FILE_MMAP_THRESHOLD || !drive_is_fixed(path) {
+	// thread for the SMB timeout - if the media drops; copying avoids that. Live
+	// call, deliberately not the link guard's cache above: this decision governs
+	// whether a fault can block the UI thread, so a stale answer here is a data-
+	// safety bug, not a missed optimisation.
+	if n < FILE_MMAP_THRESHOLD || !drive_is_fixed_live(path) {
 		data, rerr := os.read_entire_file(long, context.allocator)
 		if rerr != nil {
 			return

@@ -372,6 +372,10 @@ tracked.
   "your text silently vanishes" failure the 2026-07-25 audit ranked Tier 2 is **not reachable by a
   real document.** The belief traced to one stale comment in `text.odin` that outlived its fix by
   seven months. Do not re-add this without a measurement that contradicts the above.
+- **Non-local link targets never resolve** (`\\server\share\x`, `smb://`, and every link — even a
+  relative one — inside a document opened from a UNC path or mapped network drive). Refusing to stat
+  is what fixed the >100 s UI-thread freeze (§6aq); restoring the coverage needs an async resolver
+  worker, `watch.odin`-shaped. See §6aq's Owed list for the full writeup.
 - **reindex-on-edit** (line count/scrollbar drift approximately after big edits).
 - **Precompiled `.cso` shaders** (drop the `d3dcompiler_47.dll` runtime dep) — before ship.
 - **Per-frame allocations** in `text_draw` (make/delete per line) — reuse a scratch buffer.
@@ -3791,6 +3795,23 @@ window, and locked the exe against the next build. Verify a mode before citing i
   two existing precedents. A real scissor is its own renderer task.
 - **Thirteen live-pass defects remain**, including both scrollbars, tab ordering, the link
   over-capture, and Replace All. See the ledger.
+- **Non-local link targets are not resolved on the UI thread** (task 9 of this batch, commit
+  `97f92fb` + a re-review fixup). `GetFileAttributesW` on an unreachable UNC host was measured
+  blocking the caller for over 100 seconds, and `links_layout` runs on the UI thread every frame
+  Ctrl is held or Show-links is "always" — so a single dead `\\host\share\out.log` in a pasted
+  build log froze the editor. `plat.path_is_local` (`file.odin`) now refuses to stat anything on a
+  `DRIVE_REMOTE` letter or a bare UNC path, and `links.odin`'s `link_stat` is the one place link
+  resolution touches the filesystem, so the refusal cannot be bypassed by any of the three routes
+  (Ctrl+click, the table view, the Open Link command). **What it costs the user:** `\\server\share\x`
+  and `smb://server/share/x` targets are permanently plain text — never underlined, never openable —
+  and so is every link (including a plain relative one) inside a document opened *from* a UNC path
+  or a mapped network drive, because the anchor folder fails the same check. Removable drives (USB)
+  and RAM disks are unaffected; only `DRIVE_REMOTE` (and `DRIVE_NO_ROOT_DIR`/`DRIVE_UNKNOWN`/
+  `DRIVE_CDROM`) are refused, not "anything but `DRIVE_FIXED`" — a re-review caught the broader
+  version. **The real fix** is an async resolver: a worker that stats off the UI thread and feeds
+  answers back into `link_cache` between frames, the same shape `watch.odin` already uses for
+  external-change polling (copy inputs, work in private memory, merge once per frame, poll a cancel
+  flag). Deliberately kept out of this batch as a design change, not a bug fix.
 
 ## 7. Build environment (Windows, this machine)
 

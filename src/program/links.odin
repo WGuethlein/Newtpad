@@ -14,16 +14,20 @@
 //     may have been written by anyone. A text-ish file opens in a tab, anything
 //     else is revealed in Explorer, and only whitelisted URL schemes reach the
 //     browser.
-//  3. **Never stat a non-local target.** Same threat model as (2), different
+//  3. **Never stat a network target.** Same threat model as (2), different
 //     weapon: `GetFileAttributesW` on an unreachable UNC host blocks the caller
 //     for the redirector timeout (>100 s measured), and the caller here is the
-//     UI thread. link_resolve refuses UNC and non-fixed drives outright, so
-//     `\\deadhost\share\out.log` in a build log costs nothing. See
-//     plat.path_is_local and OWED below.
+//     UI thread. link_resolve refuses UNC paths and DRIVE_REMOTE letters
+//     outright, so `\\deadhost\share\out.log` in a build log costs nothing. A
+//     USB stick, a RAM disk and an ordinary fixed drive are all still resolved —
+//     see plat.path_is_local and OWED below.
 //
-// OWED (HANDOFF): resolving non-local targets needs an async resolver — a worker
+// OWED (HANDOFF): resolving network targets needs an async resolver — a worker
 // that stats off-thread and feeds answers back into link_cache, the same shape
-// watch.odin already uses. Until it exists, a UNC or mapped-drive link is text.
+// watch.odin already uses. Until it exists, a UNC or mapped-network-drive link
+// is text; links anchored under a UNC/mapped-network document folder don't
+// resolve either, even a plain relative one, because the anchor itself fails
+// plat.path_is_local. Removable and RAM-disk anchors are unaffected.
 package main
 
 import "core:fmt"
@@ -747,11 +751,16 @@ Link_Target :: struct {
 	is_url: bool,
 }
 
-// Every stat link resolution has performed, for the tests. The claim "a non-local
-// target is never stat'd" cannot be checked by looking at the answer -- a dead
-// UNC and a refused UNC both come back `false` -- so the call itself is counted.
-// Incremented immediately before each plat.path_exists below and nowhere else.
-link_stat_count: int
+when NEWTPAD_TESTS {
+	// Every stat link resolution has performed, for the tests. The claim "a
+	// non-local target is never stat'd" cannot be checked by looking at the
+	// answer -- a dead UNC and a refused UNC both come back `false` -- so the
+	// call itself is counted. Incremented immediately before each
+	// plat.path_exists below and nowhere else. Test-only scaffolding: gated
+	// behind the same NEWTPAD_TESTS the rest of the headless harness uses, so it
+	// costs nothing (not even the `int`) in a release build.
+	link_stat_count: int
+}
 
 // Stat a resolved absolute path, or refuse it because reaching the filesystem
 // for it could block this thread for minutes. The single door: every stat on the
@@ -760,7 +769,9 @@ link_stat_count: int
 @(private = "file")
 link_stat :: proc(abs: string) -> (exists, is_dir: bool) {
 	if !plat.path_is_local(abs) {return false, false}
-	link_stat_count += 1
+	when NEWTPAD_TESTS {
+		link_stat_count += 1
+	}
 	return plat.path_exists(abs)
 }
 
@@ -771,13 +782,17 @@ link_stat :: proc(abs: string) -> (exists, is_dir: bool) {
 // never a walk up through parents. An untitled buffer has no anchor, so
 // relative links simply do not resolve there.
 //
-// A target that is not on a local fixed volume does not resolve, full stop --
-// which also means links_layout never decorates one. Of the two ways to keep the
-// UI thread off a network stat, refusing to decorate is the one that stays
-// refused: decorating optimistically would just move the multi-minute block from
-// the frame that draws the underline to the click that follows it. The cost is
-// real and is recorded as owed at the top of this file: `\\server\share\x.log`
-// and `smb://server/share/x` are plain text until the async resolver exists.
+// A UNC target, or one on a letter GetDriveTypeW reports as DRIVE_REMOTE, does
+// not resolve, full stop -- which also means links_layout never decorates one.
+// A removable (USB) or RAM-disk target, and the same for the folder a relative
+// link anchors to, is not penalized: only the network case carries an unbounded
+// wait. Of the two ways to keep the UI thread off a network stat, refusing to
+// decorate is the one that stays refused: decorating optimistically would just
+// move the multi-minute block from the frame that draws the underline to the
+// click that follows it. The cost is real and is recorded as owed at the top of
+// this file: `\\server\share\x.log` and `smb://server/share/x` are plain text
+// until the async resolver exists, and so is anything anchored under a document
+// opened from a UNC path or a mapped network drive.
 link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, ok: bool) {
 	raw := text[l.start:l.start + l.target_len]
 	if l.kind == .URL {
@@ -870,9 +885,12 @@ link_activate :: proc(app: ^App, txt: ^plat.Text, t: Link_Target) -> bool {
 	if t.is_url {
 		return plat.shell_open_url(t.url)
 	}
-	// Safe to stat directly: t.path only ever comes from a successful
-	// link_resolve, which means it already passed link_stat's local-volume guard.
-	_, is_dir := plat.path_exists(t.path)
+	// Routed through link_stat, not plat.path_exists directly, so the single-door
+	// invariant (rule 3 above) holds by construction rather than by the comment
+	// this replaced: t.path only ever comes from a successful link_resolve, which
+	// means it already passed the local-volume guard, so this costs one cached
+	// predicate call and never a second stat of the same path.
+	_, is_dir := link_stat(t.path)
 	if is_dir || !link_is_text_ext(t.path) {
 		return plat.shell_reveal(t.path)
 	}

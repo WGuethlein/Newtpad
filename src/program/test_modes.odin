@@ -7441,6 +7441,59 @@ when NEWTPAD_TESTS {
 				)
 			}
 
+			// Re-review finding I2: the first cut of the guard reused the exact
+			// predicate file_open_readonly's mmap-vs-copy choice uses -- "is this
+			// DRIVE_FIXED" -- so a document opened from a USB stick or a RAM disk lost
+			// EVERY relative link, not only the ones that reach a network host. Only
+			// DRIVE_REMOTE carries the redirector timeout; path_is_local now refuses
+			// DRIVE_REMOTE, DRIVE_NO_ROOT_DIR, DRIVE_UNKNOWN and DRIVE_CDROM and
+			// accepts everything else, including DRIVE_REMOVABLE and DRIVE_RAMDISK.
+			//
+			// This machine has no removable drive or RAM disk attached to open a real
+			// document from, so per the task brief the DRIVE_* -> local/non-local
+			// mapping is asserted directly against plat.drive_type_is_local, the pure
+			// (no-syscall) classifier path_is_local calls after GetDriveTypeW --
+			// covering every DRIVE_* constant this file declares, not just the two
+			// (FIXED, NO_ROOT_DIR) a real machine can exercise.
+			//
+			// What IS exercised end-to-end below is the other half of the finding: a
+			// document opened from a UNC path refuses even a PLAIN RELATIVE link, not
+			// merely a UNC-shaped target -- because the anchor folder itself, not the
+			// target, is what fails path_is_local. No real host is stat'd: the guard
+			// fires on the anchor's own shape before link_stat's plat.path_exists call.
+			lk_anchor_kind_scope :: proc(bad: ^int) {
+				lk_chk(bad, plat.drive_type_is_local(plat.DRIVE_FIXED), "DRIVE_FIXED is local")
+				lk_chk(bad, plat.drive_type_is_local(plat.DRIVE_REMOVABLE), "DRIVE_REMOVABLE is local")
+				lk_chk(bad, plat.drive_type_is_local(plat.DRIVE_RAMDISK), "DRIVE_RAMDISK is local")
+				lk_chk(bad, !plat.drive_type_is_local(plat.DRIVE_REMOTE), "DRIVE_REMOTE is not local")
+				lk_chk(bad, !plat.drive_type_is_local(plat.DRIVE_NO_ROOT_DIR), "DRIVE_NO_ROOT_DIR is not local")
+				lk_chk(bad, !plat.drive_type_is_local(plat.DRIVE_UNKNOWN), "DRIVE_UNKNOWN is not local")
+				lk_chk(bad, !plat.drive_type_is_local(plat.DRIVE_CDROM), "DRIVE_CDROM is not local")
+
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				// A loopback share that does not exist: the anchor never needs to be
+				// reachable, because path_is_local judges its SHAPE (leading `\\`), and
+				// a sabotaged build (see below) would otherwise pay the redirector
+				// timeout for a plain relative link.
+				d := doc_from_content(
+					transmute([]u8)strings.clone("see ./sibling.txt now\n"),
+					"\\\\localhost\\newtpad_no_such_share_zz\\anchor.txt",
+					.UTF8,
+				)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 200
+				d.view_rows = 10
+				link_stat_count = 0
+				n := len(links_layout(&d, &tt, 10))
+				lk_chk(
+					bad,
+					n == 0 && link_stat_count == 0,
+					fmt.tprintf("a UNC-anchored document refuses a plain relative link (%d hits, %d stats)", n, link_stat_count),
+				)
+			}
+
 			fmt.println("--- a bare separator is not a path ---")
 			lk_false_positives(&bad)
 			fmt.println("--- underlined implies openable ---")
@@ -7451,6 +7504,8 @@ when NEWTPAD_TESTS {
 			lk_cache_anchor_same_doc(&bad)
 			fmt.println("--- a non-local target is never stat'd on the UI thread ---")
 			lk_non_local_never_stats(&bad)
+			fmt.println("--- only DRIVE_REMOTE is refused, not \"anything but DRIVE_FIXED\" ---")
+			lk_anchor_kind_scope(&bad)
 
 			fmt.printfln("linktest: %d failures", bad)
 			return true
