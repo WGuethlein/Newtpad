@@ -4248,6 +4248,11 @@ when NEWTPAD_TESTS {
 					// behind a fixture whose indents all happen to be zero.
 					"  - [inlist](http://example.com/e) item text\n",
 					"> [inquote](http://example.com/f) quoted text\n",
+					// A label with NO DESCENDERS, for the vertical half of the seam:
+					// its ink's last row is the baseline, which is what makes base_y
+					// checkable against the ink rather than only against the rect.
+					"\n",
+					"[TALL](http://example.com/g) baseline probe\n",
 				},
 				context.temp_allocator,
 			)
@@ -4337,6 +4342,95 @@ when NEWTPAD_TESTS {
 				}
 			}
 			schk(&bad, checked > 0 && empty == 0, fmt.tprintf("seam: every link rect contains drawn link ink (%d of %d empty)", empty, checked))
+
+			// --- the seam VERTICALLY: base_y against rect.y, and both against ink -
+			//
+			// Md_Link_Hit carries `rect` and `base_y` as independent fields. The
+			// underline (md_draw_links) is drawn from base_y; the hit-test
+			// (md_link_at) is against rect. Nothing above asserts they describe the
+			// same glyphs, and nothing can: `inside` above applies its 2px allowance
+			// in X only, but a glyph's ink starts well below the line box's top and
+			// ends above its bottom (that slack IS the face's ascent and descent), so
+			// a whole rect shifted a pixel down still contains every pixel of its own
+			// ink. Sabotage, before this section existed: rect.x +3px was caught, rect
+			// .y +1px gave 0 failures, and base_y +9px gave 0 failures.
+			//
+			// Two assertions, because either alone is satisfiable:
+			//
+			//   the two fields against EACH OTHER, via the shaper's own line box. A
+			//     Shaped_Line puts its baseline at top + (h - (asc + desc))/2 + asc,
+			//     so base_y - rect.y is a property of the face and the leading and
+			//     nothing else. Computed here from plat.shape_run -- a second producer
+			//     used deliberately and only in the test, the pattern
+			//     md_head_fit_selftest and md_gap_selftest already take, because it is
+			//     the only way to state the number without re-deriving the layout.
+			//     Catches either field moving relative to the other.
+			//
+			//   base_y against the INK, on a label chosen to have no descenders, so
+			//     its last inked row IS the baseline. Catches the pair moving
+			//     TOGETHER, which the first assertion cannot see.
+			{
+				ref := plat.shape_run(&h.gfx, &h.text, "Ag", m.body, 1e6, m.body_lead, .Body, context.temp_allocator)
+				schk(&bad, ref.lines == 1 && len(ref.line_boxes) == 1, fmt.tprintf("seam/v: the reference run is one line (%d)", ref.lines))
+				if ref.lines == 1 {
+					lb := ref.line_boxes[0]
+					want_h, want_asc := lb.h, lb.y - lb.top
+					// Non-degenerate: a zero ascent would make the row below pass
+					// against any base_y at all.
+					schk(&bad, want_h > 4 && want_asc > 4 && want_asc < want_h, fmt.tprintf("seam/v: the reference line box is real (h %.1f, baseline %.1f into it)", want_h, want_asc))
+					bad_h, bad_asc := 0, 0
+					worst_h, worst_asc := f32(0), f32(0)
+					for hh in hits {
+						if abs(hh.rect.size.y - want_h) > 0.01 {
+							bad_h += 1
+							worst_h = max(worst_h, abs(hh.rect.size.y - want_h))
+						}
+						if abs((hh.base_y - hh.rect.pos.y) - want_asc) > 0.01 {
+							bad_asc += 1
+							worst_asc = max(worst_asc, abs((hh.base_y - hh.rect.pos.y) - want_asc))
+						}
+					}
+					// Every link in this fixture is body prose at the body size, so
+					// one reference box covers all of them -- including the indented
+					// list and quote, whose indent is horizontal only.
+					schk(&bad, bad_h == 0, fmt.tprintf("seam/v: every rect is exactly one line box tall (%d of %d wrong, worst %.2fpx off %.1f)", bad_h, len(hits), worst_h, want_h))
+					schk(&bad, bad_asc == 0, fmt.tprintf("seam/v: ...and every base_y sits that box's own ascent below its rect's top (%d of %d wrong, worst %.2fpx off %.1f)", bad_asc, len(hits), worst_asc, want_asc))
+				}
+				plat.shaped_free(&ref, context.temp_allocator)
+
+				// base_y against the ink. "TALL" has no descenders, so the lowest row
+				// its glyphs ink is the baseline itself -- one row above base_y, since
+				// a baseline is the line the glyphs SIT on.
+				probe, pfound := Md_Link_Hit{}, false
+				for hh in hits {
+					if hh.url == "http://example.com/g" {probe, pfound = hh, true}
+				}
+				schk(&bad, pfound, "seam/v: the no-descender probe link is placed")
+				if pfound {
+					first, last := -1, -1
+					for yy in max(0, int(probe.rect.pos.y) - 12) ..< min(H, int(probe.rect.pos.y + probe.rect.size.y) + 12) {
+						for xx in max(0, int(probe.rect.pos.x)) ..< min(W, int(probe.rect.pos.x + probe.rect.size.x)) {
+							if !link_ink(pix, W, xx, yy) {continue}
+							if first < 0 {first = yy}
+							last = yy
+							break
+						}
+					}
+					schk(&bad, first >= 0, fmt.tprintf("seam/v: the probe's glyphs are on screen (rows %d..%d)", first, last))
+					// Two rows of tolerance and no more: the whole point is that a
+					// baseline off by a few pixels is a visibly misplaced underline.
+					schk(
+						&bad, first >= 0 && abs(f32(last) - (probe.base_y - 1)) <= 2,
+						fmt.tprintf("seam/v: base_y IS the baseline the ink sits on (lowest inked row %d, base_y %.1f)", last, probe.base_y),
+					)
+					// ...and the ink is inside the rect vertically, which is the
+					// property the underline's own position depends on.
+					schk(
+						&bad, first >= 0 && f32(first) >= probe.rect.pos.y && f32(last) < probe.rect.pos.y + probe.rect.size.y,
+						fmt.tprintf("seam/v: ...and the ink is inside the rect (%d..%d against %.1f..%.1f)", first, last, probe.rect.pos.y, probe.rect.pos.y + probe.rect.size.y),
+					)
+				}
+			}
 
 			// --- the round trip the hand cursor and Ctrl+click actually take ----
 			round, bad_round := 0, 0
