@@ -335,6 +335,16 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 	// RegisterClassExW copies the class name, so a temp wstring is fine here.
 	class_name := win.utf8_to_wstring(WINDOW_CLASS)
 
+	// Resource id 1 in the ICON namespace, embedded by newtpad.rc (see that
+	// file's comment) from src/platform/newtpad.ico. Setting both hIcon and
+	// hIconSm here is what gives the *window* its icon — title bar, taskbar,
+	// Alt+Tab — as opposed to the .exe's own file icon, which Explorer takes
+	// straight from the resource without any code running at all. A LoadIconW
+	// failure (e.g. a corrupt or missing resource) yields a nil HICON, which
+	// Windows quietly falls back to a default system icon for, so this is not
+	// worth failing the whole window creation over.
+	app_icon := win.LoadIconW(hinstance, transmute(win.LPCWSTR)win.MAKEINTRESOURCEW(1))
+
 	wc := win.WNDCLASSEXW {
 		cbSize        = size_of(win.WNDCLASSEXW),
 		style         = win.CS_HREDRAW | win.CS_VREDRAW | win.CS_OWNDC,
@@ -343,6 +353,8 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 		// IDC_ARROW is an integer resource id typed as cstring; reinterpret it
 		// as the wide-string form LoadCursorW expects.
 		hCursor       = win.LoadCursorW(nil, transmute(win.wstring)win.IDC_ARROW),
+		hIcon         = app_icon,
+		hIconSm       = app_icon,
 		lpszClassName = class_name,
 	}
 	win.RegisterClassExW(&wc)

@@ -19137,6 +19137,229 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad icontest` parses the committed src/platform/newtpad.ico back out
+		// of its own bytes -- embedded at compile time via #load, so this checks
+		// whatever is actually in the built exe, not a file on disk that could be
+		// stale -- and verifies the properties the batch-17 icon spec calls for:
+		// seven entries at their declared sizes, no two sharing a bitmap offset
+		// (which would mean a scaled duplicate instead of a size-specific render),
+		// 256px stored as a real PNG and the rest as uncompressed BGRA, the warm
+		// paper colour surviving in every size, and the two/three-line rule. An
+		// icon that silently regressed to a blank or truncated resource would
+		// otherwise go unnoticed until someone looked at a real taskbar.
+		//
+		// The BMP and PNG decoders here are deliberately minimal: they invert
+		// exactly what tools/gen_icon/main.odin writes (PNG IDAT is always
+		// "stored"/uncompressed deflate blocks, since that is all the generator
+		// ever produces) rather than being general-purpose decoders.
+		if os.args[1] == "icontest" {
+			ico_u16le :: proc(b: []u8, off: int) -> u16 {
+				return u16(b[off]) | u16(b[off + 1]) << 8
+			}
+			ico_u32le :: proc(b: []u8, off: int) -> u32 {
+				return u32(b[off]) | u32(b[off + 1]) << 8 | u32(b[off + 2]) << 16 | u32(b[off + 3]) << 24
+			}
+			ico_i32le :: proc(b: []u8, off: int) -> i32 {
+				return i32(ico_u32le(b, off))
+			}
+			ico_u32be :: proc(b: []u8, off: int) -> u32 {
+				return u32(b[off]) << 24 | u32(b[off + 1]) << 16 | u32(b[off + 2]) << 8 | u32(b[off + 3])
+			}
+			ico_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			// Bottom-up BGRA XOR data + 1bpp AND mask behind a BITMAPINFOHEADER --
+			// see tools/gen_icon/main.odin's header comment for the full layout.
+			ico_decode_bmp :: proc(blob: []u8) -> (rgba: []u8, w: int, h: int, ok: bool) {
+				if len(blob) < 40 || ico_u32le(blob, 0) != 40 {return nil, 0, 0, false}
+				w = int(ico_i32le(blob, 4))
+				h = int(ico_i32le(blob, 8)) / 2
+				if w <= 0 || h <= 0 {return nil, 0, 0, false}
+				xor_off := 40
+				if len(blob) < xor_off + w * h * 4 {return nil, 0, 0, false}
+				rgba = make([]u8, w * h * 4, context.temp_allocator)
+				for y in 0 ..< h {
+					file_row := (h - 1) - y
+					for x in 0 ..< w {
+						idx := xor_off + (file_row * w + x) * 4
+						oidx := (y * w + x) * 4
+						rgba[oidx + 0] = blob[idx + 2] // R
+						rgba[oidx + 1] = blob[idx + 1] // G
+						rgba[oidx + 2] = blob[idx + 0] // B
+						rgba[oidx + 3] = blob[idx + 3] // A
+					}
+				}
+				return rgba, w, h, true
+			}
+
+			// Signature + IHDR + IDAT(s) + IEND, 8-bit RGBA, filter type 0 on every
+			// row, IDAT built from stored deflate blocks inside a zlib stream.
+			ico_decode_png :: proc(blob: []u8) -> (rgba: []u8, w: int, h: int, ok: bool) {
+				sig := [8]u8{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
+				if len(blob) < 8 {return nil, 0, 0, false}
+				for i in 0 ..< 8 {
+					if blob[i] != sig[i] {return nil, 0, 0, false}
+				}
+				pos := 8
+				idat: [dynamic]u8
+				for pos + 8 <= len(blob) {
+					length := int(ico_u32be(blob, pos))
+					ctype := string(blob[pos + 4:pos + 8])
+					if pos + 8 + length + 4 > len(blob) {return nil, 0, 0, false}
+					data := blob[pos + 8:pos + 8 + length]
+					switch ctype {
+					case "IHDR":
+						w = int(ico_u32be(data, 0))
+						h = int(ico_u32be(data, 4))
+					case "IDAT":
+						append(&idat, ..data)
+					}
+					pos += 8 + length + 4
+					if ctype == "IEND" {break}
+				}
+				if w <= 0 || h <= 0 || len(idat) < 2 {return nil, 0, 0, false}
+
+				raw: [dynamic]u8
+				zp := 2 // skip the 2-byte zlib CMF/FLG header
+				for zp < len(idat) {
+					hdr := idat[zp]
+					final := hdr & 1
+					btype := (hdr >> 1) & 3
+					if btype != 0 {
+						fmt.println("    icontest: PNG has a non-stored deflate block; decoder only reads stored")
+						return nil, 0, 0, false
+					}
+					zp += 1
+					if zp + 4 > len(idat) {return nil, 0, 0, false}
+					length := int(idat[zp]) | int(idat[zp + 1]) << 8
+					zp += 4 // LEN + NLEN
+					if zp + length > len(idat) {return nil, 0, 0, false}
+					append(&raw, ..idat[zp:zp + length])
+					zp += length
+					if final == 1 {break}
+				}
+
+				stride := 1 + w * 4
+				if len(raw) < stride * h {return nil, 0, 0, false}
+				rgba = make([]u8, w * h * 4, context.temp_allocator)
+				for y in 0 ..< h {
+					row_start := y * stride
+					copy(rgba[y * w * 4:(y + 1) * w * 4], raw[row_start + 1:row_start + 1 + w * 4])
+				}
+				return rgba, w, h, true
+			}
+
+			ICO := #load("../platform/newtpad.ico")
+			bad := 0
+
+			ico_chk(&bad, ico_u16le(ICO, 0) == 0 && ico_u16le(ICO, 2) == 1, "ICONDIR: reserved=0, type=1 (icon)")
+			count := int(ico_u16le(ICO, 4))
+			ico_chk(&bad, count == 7, fmt.tprintf("ICONDIR: 7 entries (got %d)", count))
+
+			Entry :: struct {
+				w, h, bytes_in_res, image_off: int,
+			}
+			entries: [dynamic]Entry
+			for i in 0 ..< count {
+				eoff := 6 + i * 16
+				if eoff + 16 > len(ICO) {break}
+				ew := int(ICO[eoff]);   if ew == 0 {ew = 256}
+				eh := int(ICO[eoff + 1]); if eh == 0 {eh = 256}
+				append(&entries, Entry{ew, eh, int(ico_u32le(ICO, eoff + 8)), int(ico_u32le(ICO, eoff + 12))})
+			}
+
+			want_sizes := []int{16, 20, 24, 32, 48, 64, 256}
+			for i in 0 ..< min(len(entries), len(want_sizes)) {
+				e := entries[i]
+				ico_chk(&bad, e.w == want_sizes[i] && e.h == want_sizes[i], fmt.tprintf("entry %d declares %dx%d", i, want_sizes[i], want_sizes[i]))
+			}
+
+			seen: map[int]int
+			dup := false
+			for e, i in entries {
+				if prev, exists := seen[e.image_off]; exists {
+					dup = true
+					fmt.printfln("    entry %d shares its bitmap offset with entry %d", i, prev)
+				}
+				seen[e.image_off] = i
+			}
+			delete(seen)
+			ico_chk(&bad, !dup, "no two entries share a bitmap offset (no scaled duplicates)")
+
+			Decoded :: struct {
+				w, h:  int,
+				rgba:  []u8,
+				valid: bool,
+			}
+			decoded: [dynamic]Decoded
+			for e, i in entries {
+				if e.image_off < 0 || e.image_off + e.bytes_in_res > len(ICO) {
+					ico_chk(&bad, false, fmt.tprintf("entry %d: bitmap offset/length inside the file", i))
+					append(&decoded, Decoded{})
+					continue
+				}
+				blob := ICO[e.image_off:e.image_off + e.bytes_in_res]
+				is_png := len(blob) >= 4 && blob[0] == 0x89 && blob[1] == 0x50 && blob[2] == 0x4E && blob[3] == 0x47
+				want_png := e.w == 256
+				ico_chk(&bad, is_png == want_png, fmt.tprintf("entry %d (%dpx) stored as %s", i, e.w, "PNG" if want_png else "uncompressed BGRA"))
+
+				rgba: []u8
+				dw, dh: int
+				ok: bool
+				if is_png {
+					rgba, dw, dh, ok = ico_decode_png(blob)
+				} else {
+					rgba, dw, dh, ok = ico_decode_bmp(blob)
+				}
+				ico_chk(&bad, ok && dw == e.w && dh == e.h, fmt.tprintf("entry %d (%dpx) bitmap dimensions match the directory", i, e.w))
+				append(&decoded, Decoded{dw, dh, rgba, ok})
+			}
+
+			// Paper colour: sampled at the right edge, mid-height. By construction
+			// (see gen_icon's inside_rounded_rect) that point is always fully
+			// inside the opaque paper fill and to the right of every rectangle in
+			// the design, unlike the literal geometric centre -- the spec's own
+			// hand-tuned 96/48/32px artwork puts the second text line exactly on
+			// the centre pixel, so asserting paper there would be asserting
+			// against the source spec, not for it.
+			for d, i in decoded {
+				if !d.valid {continue}
+				x, y := d.w - 2, d.h / 2
+				idx := (y * d.w + x) * 4
+				ok := d.rgba[idx] == 0xF2 && d.rgba[idx + 1] == 0xEB && d.rgba[idx + 2] == 0xE0 && d.rgba[idx + 3] == 255
+				ico_chk(&bad, ok, fmt.tprintf("entry %d (%dpx) paper colour #F2EBE0 at (%d,%d)", i, d.w, x, y))
+			}
+
+			// Text-line bar count, walking straight down the column at x = w/2
+			// (inside every line rect at every shipped size). 16px and 20px drop
+			// the third line -- it would render under ~2px -- everything 24px and
+			// up keeps all three.
+			want_bars := []int{2, 2, 3, 3, 3, 3, 3}
+			for d, i in decoded {
+				if !d.valid {continue}
+				x := d.w / 2
+				bars, in_bar := 0, false
+				for y in 0 ..< d.h {
+					idx := (y * d.w + x) * 4
+					is_paper := d.rgba[idx] == 0xF2 && d.rgba[idx + 1] == 0xEB && d.rgba[idx + 2] == 0xE0
+					is_content := d.rgba[idx + 3] == 255 && !is_paper
+					if is_content && !in_bar {
+						bars += 1
+						in_bar = true
+					} else if !is_content {
+						in_bar = false
+					}
+				}
+				want := want_bars[i] if i < len(want_bars) else -1
+				ico_chk(&bad, bars == want, fmt.tprintf("entry %d (%dpx) has %d text-line bar(s), want %d", i, d.w, bars, want))
+			}
+
+			fmt.printfln("icontest: %d failures", bad)
+			return true
+		}
+
 		if len(os.args) < 3 {return false}
 		path, mode := os.args[1], os.args[2]
 
