@@ -1780,6 +1780,7 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	TAB_PAD_R = dp(rc, TAB_PAD_R_96)
 	TAB_GAP = dp(rc, TAB_GAP_96)
 	TAB_CLOSE_W = dp(rc, TAB_CLOSE_W_96)
+	TAB_LABEL_GAP = dp(rc, TAB_LABEL_GAP_96)
 	MENU_W = dp(rc, MENU_W_96)
 	PLUS_W = dp(rc, PLUS_W_96)
 	SCROLLBAR_W = dp(rc, SCROLLBAR_W_96)

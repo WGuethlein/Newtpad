@@ -11571,7 +11571,44 @@ when NEWTPAD_TESTS {
 				}
 				return bad
 			}
+
+			// Task 7: a long label must clear the close zone by TAB_LABEL_GAP, not
+			// run straight into it. The budget the draw elides to
+			// (tab_label_cells) has to agree with where the draw actually PLACES
+			// the label (TAB_PAD_L + TAB_DIRTY_W in), or the two disagree exactly
+			// the way the old hand-copied `- sx(8)` did.
+			tg_gap :: proc(bad: ^int) {
+				tg_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				app: App
+				defer app_destroy(&app)
+				d := new(Document)
+				d^ = doc_new()
+				// The real fixture Wyatt has on disk, and long enough to elide at every width.
+				d.path = strings.clone("test1\\thisisatestofareallylongnameinnewtpad.txt")
+				app_add(&app, d)
+				t: plat.Text
+				plat.text_load_faces(&t)
+				win: plat.Window
+				win.dpi = 96
+				cw := plat.text_char_width(&t, UI_SMALL_PX)
+				for width in ([]f32{600, 1200, 1920}) {
+					win.width = i32(width)
+					L := tabs_layout(&app, &win, &t, width)
+					for r in L.tabs {
+						if !r.drawn {continue}
+						max_cells := tab_label_cells(r.w, cw)
+						label := tab_elide(&t, tab_label(&app, app.docs[r.slot]), max_cells)
+						right := r.x + TAB_PAD_L + TAB_DIRTY_W + f32(plat.text_cells(&t, transmute([]u8)label, 0)) * cw
+						tg_chk(bad, right <= r.close_x - TAB_LABEL_GAP + 0.5, fmt.tprintf("w=%.0f: label clears the close zone", width))
+					}
+				}
+			}
+
 			bad := ts_run()
+			tg_gap(&bad)
 			fmt.printfln("tabseamtest: %d failures", bad)
 			return true
 		}
