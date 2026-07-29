@@ -22435,8 +22435,9 @@ when NEWTPAD_TESTS {
 		// stale -- and verifies the properties the batch-17 icon spec calls for:
 		// seven entries at their declared sizes, no two sharing a bitmap offset
 		// (which would mean a scaled duplicate instead of a size-specific render),
-		// 256px stored as a real PNG and the rest as uncompressed BGRA, the warm
-		// paper colour surviving in every size, and the two/three-line rule. An
+		// 48px and up stored as real PNGs and the four smallest as uncompressed
+		// BGRA, the warm paper colour surviving in every size, and the
+		// two/three-line rule. An
 		// icon that silently regressed to a blank or truncated resource would
 		// otherwise go unnoticed until someone looked at a real taskbar.
 		//
@@ -22748,7 +22749,15 @@ when NEWTPAD_TESTS {
 				}
 				blob := ICO[e.image_off:e.image_off + e.bytes_in_res]
 				is_png := len(blob) >= 4 && blob[0] == 0x89 && blob[1] == 0x50 && blob[2] == 0x4E && blob[3] == 0x47
-				want_png := e.w == 256
+				// CORRECTED, not relaxed (2026-07-29 review, F8). This asserted
+				// `e.w == 256`, i.e. that 16/20/24/32/48/64 were all raw BGRA -- and
+				// they were, which is why 36 KB of a 39 KB resource was uncompressed
+				// bitmap in a file made entirely of flat colour. The 48 and 64 entries
+				// are where the bytes are (25 KB of the 36) and are PNG now; the four
+				// smallest stay BMP for shell compatibility and cost 6 KB together.
+				// The threshold matches gen_icon's ICO_PNG_FROM, and is asserted here
+				// off the committed bytes rather than trusted from the generator.
+				want_png := e.w >= 48
 				ico_chk(&bad, is_png == want_png, fmt.tprintf("entry %d (%dpx) stored as %s", i, e.w, "PNG" if want_png else "uncompressed BGRA"))
 
 				rgba: []u8

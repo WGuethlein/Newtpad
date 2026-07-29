@@ -39,13 +39,25 @@
 //     imageOffset      u32 = byte offset from the start of the FILE
 //   image data[]    concatenated, one blob per entry, at the offsets above.
 //
-// Two blob shapes are legal per entry (rule 3 of the batch-17 spec picks one
-// per size): a BMP (BITMAPINFOHEADER + XOR color data + AND mask, no file
-// header -- unlike a standalone .bmp, an icon's DIB has no BITMAPFILEHEADER)
-// or a complete PNG file. We use BMP for 16..64 (uncompressed, matches "the
-// smaller sizes as uncompressed BGRA") and PNG for 256 (the standard choice
-// for icon sizes >= 256, and the one size where a raw 256*256*4-byte BMP
-// blob would be wasteful).
+// Two blob shapes are legal per entry: a BMP (BITMAPINFOHEADER + XOR color
+// data + AND mask, no file header -- unlike a standalone .bmp, an icon's DIB
+// has no BITMAPFILEHEADER) or a complete PNG file.
+//
+// PNG from 48px up, BMP for 16/20/24/32. CHANGED (2026-07-29 review, F8): this
+// was PNG for 256 only, which left 36 KB of the 39 KB resource as raw BGRA --
+// 44% of the whole batch's exe growth, in a file whose every entry is flat
+// colour and therefore almost pure run-length. DEFLATE of each stored entry
+// measured: 16 -> 94 bytes, 20 -> 102, 24 -> 114, 32 -> 139, 48 -> 205,
+// 64 -> 247. The two largest are where the bytes are (48*48*4 + 64*64*4 is
+// 25 KB of the 36), so those two move and the four smallest stay.
+//
+// The four smallest stay for compatibility, not for size: PNG-in-ICO works from
+// Vista on and the app's manifest already requires PerMonitorV2, so nothing
+// Newtpad supports could fail to read a PNG entry -- but the small sizes are
+// the ones consumed by the widest variety of shell surfaces and third-party
+// code (Alt+Tab, tray, jump lists, file-dialog lists, older shell extensions),
+// and 449 bytes of BMP is not worth finding out. The 16..32 entries are 6 KB
+// together, which is the whole remaining cost.
 //
 // BMP blob layout, BITMAPINFOHEADER (40 bytes) then pixels:
 //   biHeight is doubled (XOR height + AND height) -- that doubling is how a
@@ -135,6 +147,12 @@ Icon_Spec :: struct {
 // lines sit 1px apart rather than a scaled 2-3px) -- expected, and still
 // clearly separated at every size; see the batch spec for why the four
 // hand-tuned sizes are authoritative and these four are not.
+//
+// The smallest size stored as a PNG rather than as raw BGRA. See the file
+// header for why the line is here and not at 256 or at 16. `newtpad icontest`
+// asserts the same split from the other side, off the committed bytes.
+ICO_PNG_FROM :: 48
+
 SPECS := [7]Icon_Spec {
 	{
 		size = 16,
@@ -1088,7 +1106,11 @@ main :: proc() {
 	for i in 0 ..< len(SPECS) {
 		spec := SPECS[i]
 		rgba := render(spec)
-		if spec.size >= 256 {
+		// See the header comment: PNG from 48px up. Every PNG written goes through
+		// verify_png first, so a broken deflate stream fails the build rather than
+		// shipping an icon Windows renders as nothing -- which matters more now
+		// that six of the seven entries take that path instead of one.
+		if spec.size >= ICO_PNG_FROM {
 			png := png_encode(rgba, spec.size)
 			if !verify_png(png, spec.size, rgba) {
 				fmt.println("gen_icon: FAILED round-trip verification of the", spec.size, "px PNG -- refusing to write a possibly-corrupt icon")
