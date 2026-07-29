@@ -14805,6 +14805,27 @@ when NEWTPAD_TESTS {
 				chk(&bad, resolve_key(.K, true, false, .Menu) == .Undo, fmt.tprintf("the menu falls back too -> %v", resolve_key(.K, true, false, .Menu)))
 				chk(&bad, resolve_key(.Left, false, false, .Find) == .None, "unmodified keys still stay owned by find (Left)")
 
+				// --- find-bar toggles are unified on Alt, matching VS Code -------------------
+				// Wyatt: "Alt+C/W work, I'm not sure about having some be Alt and some be
+				// Ctrl. Need to have some sort of standard..." The standard is all-Alt, and
+				// Ctrl+R is retired outright -- not left as a second way to reach the same
+				// command. Both halves are asserted: a claim that only checks Alt+R now
+				// works would pass just as well if Ctrl+R had been left bound alongside it,
+				// which is not what "retired" means.
+				fmt.println("--- find-bar toggles are unified on Alt ---")
+				chk(&bad, resolve_key(.R, false, true, .Find) == .Find_Toggle_Regex, fmt.tprintf("Alt+R -> %v (want Find_Toggle_Regex)", resolve_key(.R, false, true, .Find)))
+				chk(&bad, resolve_key(.C, false, true, .Find) == .Find_Toggle_Case, fmt.tprintf("Alt+C -> %v (want Find_Toggle_Case)", resolve_key(.C, false, true, .Find)))
+				chk(&bad, resolve_key(.W, false, true, .Find) == .Find_Toggle_Word, fmt.tprintf("Alt+W -> %v (want Find_Toggle_Word)", resolve_key(.W, false, true, .Find)))
+				// The retirement: Ctrl+R must resolve to NOTHING in find context, not just
+				// "not regex". If it fell through to some other command that would be its
+				// own bug, and a check of the shape != .Find_Toggle_Regex would miss it.
+				chk(&bad, resolve_key(.R, true, false, .Find) == .None, fmt.tprintf("Ctrl+R is retired -> %v (want None)", resolve_key(.R, true, false, .Find)))
+				// command_chord (what the View menu row and the palette teach) has to
+				// have moved with it -- the "any other context's default" fallback proved
+				// earlier is what makes the View menu row correct without a second table
+				// to keep in sync.
+				chk(&bad, command_chord(.Find_Toggle_Regex) == "Alt+R", fmt.tprintf("command_chord(Find_Toggle_Regex) -> %q (want \"Alt+R\")", command_chord(.Find_Toggle_Regex)))
+
 				// --- an entirely garbage file leaves the defaults intact --------------------
 				fmt.println("--- a file that is nothing but garbage ---")
 				k = load("\x00\x01 binary junk\n!!!!\nctrl+shift+q = Nope\n= = =\n\xff\xfe\nhello world\n")

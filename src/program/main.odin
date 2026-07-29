@@ -1709,7 +1709,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 }
 
 // The find bar's own toggles, right-aligned, active ones lit. These commands
-// exist only inside find mode, so without this the only way to learn Ctrl+R and
+// exist only inside find mode, so without this the only way to learn Alt+R and
 // Ctrl+L was to be told they were there.
 @(private = "file")
 hint_find :: proc(gfx: ^plat.Gfx, text: ^plat.Text, f: ^Find, doc: ^Document, w, y: f32) {
@@ -1720,7 +1720,7 @@ hint_find :: proc(gfx: ^plat.Gfx, text: ^plat.Text, f: ^Find, doc: ^Document, w,
 		label: string,
 		lit:   bool,
 	} {
-		{"Ctrl+R regex", f.regex},
+		{"Alt+R regex", f.regex},
 		{"Ctrl+L filter", doc.filter},
 		{"Tab field", f.replace_mode},
 	}

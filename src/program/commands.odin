@@ -399,9 +399,14 @@ default_bindings := []Binding {
 	{.Backspace, false, false, .Find, .Find_Backspace},
 	{.Enter, false, false, .Find, .Find_Confirm},
 	{.Tab, false, false, .Find, .Find_Field_Toggle},
-	{.R, true, false, .Find, .Find_Toggle_Regex},
-	// Alt, not Ctrl: Ctrl+C and Ctrl+W already mean copy and close-tab, and a
-	// find bar that stole either would be worse than the modes are worth.
+	// All three toggles are Alt, matching VS Code: Alt+C case, Alt+W whole
+	// word, Alt+R regex. Not Ctrl -- Ctrl+C, Ctrl+W and Ctrl+R already mean
+	// copy, close-tab and (until this line) regex-via-a-different-chord, and a
+	// find bar that stole any of them would be worse than the modes are
+	// worth. Ctrl+R is retired outright, not left as a second way to toggle
+	// regex: one chord per command, and the seeded keys.txt header only
+	// documents alt+<letter> as the mnemonic-shadowing surprise, not this one.
+	{.R, false, true, .Find, .Find_Toggle_Regex},
 	{.C, false, true, .Find, .Find_Toggle_Case},
 	{.W, false, true, .Find, .Find_Toggle_Word},
 	{.L, true, false, .Find, .Find_Toggle_Filter},

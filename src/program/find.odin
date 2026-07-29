@@ -483,7 +483,7 @@ find_merge :: proc(doc: ^Document) {
 	// clears it.
 	//
 	// Reference the START of any selection, not the caret. Selecting a match
-	// leaves the caret at its end, so re-running this after a toggle (Ctrl+R,
+	// leaves the caret at its end, so re-running this after a toggle (Alt+R,
 	// Ctrl+L) would pick the *next* match every time — the selection walked
 	// forward one match per keypress.
 	//
