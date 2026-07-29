@@ -286,8 +286,13 @@ main :: proc() {
 		doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), app.settings.split_frac), char_w)
 		doc.view_rows = rows
 		// Horizontal scroll: clamp to real content, then mirror into H_SCROLL for
-		// this frame so the whole frame's column geometry agrees.
-		doc.h_scroll = clamp(doc.h_scroll, 0, doc_max_hscroll(doc, &text, rows))
+		// this frame so the whole frame's column geometry agrees. This is the
+		// one call per frame to the MUTATING scan (doc_update_max_hscroll) --
+		// it runs here, in the update phase, before render_frame, so every
+		// later read this frame (the wheel below, hscroll_model, the draw) can
+		// use the pure doc_max_hscroll and see a value already current for
+		// this frame without re-scanning or mutating from the draw path.
+		doc.h_scroll = clamp(doc.h_scroll, 0, doc_update_max_hscroll(doc, &text, rows))
 		doc_update_hscroll(doc)
 		// Re-center on the caret only when it actually moves on THIS tab — never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
@@ -564,7 +569,7 @@ main :: proc() {
 		// Horizontal scrollbar: a press on its track starts a drag mapping the
 		// pointer's x to the scroll offset (same geometry the bar is drawn from).
 		{
-			hm := hscroll_model(doc, &text, rows, ed_right, char_w)
+			hm := hscroll_model(doc, &text, ed_right, char_w)
 			// Scope the bar to the editor half in Markdown Split (ed_right), so it
 			// doesn't run across the preview pane; full width otherwise.
 			hb := hscrollbar_geo(doc, ed_right, f32(window.height), hm)
@@ -854,7 +859,7 @@ main :: proc() {
 			} else if plat.key_shift_down() && !doc.wrap {
 				// Shift+wheel pans horizontally (no-op when wrapping — nothing runs
 				// off the edge then). A few cells per notch, clamped to real content.
-				doc.h_scroll = clamp(doc.h_scroll + window.scroll_delta * 4, 0, doc_max_hscroll(doc, &text, rows))
+				doc.h_scroll = clamp(doc.h_scroll + window.scroll_delta * 4, 0, doc_max_hscroll(doc))
 			} else {
 				doc_scroll(doc, &text, window.scroll_delta, rows)
 			}
@@ -1033,7 +1038,13 @@ Hscroll :: struct {
 	span:     int, // how much is visible in the same unit; sizes the thumb
 }
 
-hscroll_model :: proc(doc: ^Document, t: ^plat.Text, rows: int, winw, char_w: f32) -> (m: Hscroll) {
+// L8 (2026-07-29 review): `rows` was in this signature for symmetry with the
+// vertical model, but neither branch below reads it -- the .Columns branch
+// sizes its span from the pixel width (table_cols_fitting), and the .Cells
+// branch reads doc_max_hscroll, which doc_update_max_hscroll (the caller's
+// job, once per frame) already measured against the actual row count. Removed
+// rather than documented, since there was nothing to document.
+hscroll_model :: proc(doc: ^Document, t: ^plat.Text, winw, char_w: f32) -> (m: Hscroll) {
 	if doc == nil || doc.filter {return}
 	// The grid replaces the text pass entirely, so its axis is columns and the
 	// widest source line is irrelevant to it.
@@ -1053,7 +1064,7 @@ hscroll_model :: proc(doc: ^Document, t: ^plat.Text, rows: int, winw, char_w: f3
 	// needing the table to scroll, not the pane. Tracked in HANDOFF 5.)
 	if doc.kind == .Text && doc.md_mode != .Off {return}
 	if doc_wraps(doc) {return}
-	m.max = doc_max_hscroll(doc, t, rows)
+	m.max = doc_max_hscroll(doc)
 	if m.max <= 0 {return}
 	m.pos = clamp(doc.h_scroll, 0, m.max)
 	m.span = max(1, doc.view_cols)
@@ -1448,10 +1459,16 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// above and the Split preview's repaint, which are the same trick), and the
 	// status line is NOT drawn on an opaque band -- it is text on the bare
 	// canvas. So anything a content pass puts below doc_content_box's `bot`
-	// stays on screen sitting on top of the status bar. Two passes can now do
-	// that on purpose: doc_draw's partial last row, and a markdown heading whose
-	// larger line height overhangs the body-height bound md_row_fits admits it
-	// by. Both are meant to be cut off here rather than not drawn at all.
+	// stays on screen sitting on top of the status bar. Two passes can still do
+	// that on purpose: doc_draw's partial last row, and markdown_draw's own two
+	// deliberate overhangs -- a row's soft-wrap continuation (wrap is added to
+	// the advance, not to the admit budget, since it is not known until the
+	// draw) and the `forced` first row (spent once, so a pane too short for
+	// even one row still shows something instead of nothing -- see markdown.odin
+	// around md_row_fits). A markdown HEADING overhanging its own row is no
+	// longer one of these: item 6 made md_row_fits admit against the row's own
+	// classified height, so a heading is cut off by not being drawn at all,
+	// same as any other row that does not fit.
 	//
 	// Placed after every DOCUMENT pass (editor, grid, preview, both scrollbars,
 	// the caret) and before every CHROME pass -- the horizontal scrollbar sits
@@ -1465,7 +1482,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 
 	// Horizontal scrollbar: cells in the text view, columns in the grid, hidden
 	// where the content lays out to fit. hscroll_model is the one authority.
-	if hb := hscrollbar_geo(doc, er, h, hscroll_model(doc, text, rows, er, char_w)); hb.shown {
+	if hb := hscrollbar_geo(doc, er, h, hscroll_model(doc, text, er, char_w)); hb.shown {
 		plat.quads_draw(
 			gfx,
 			quad_pipe,

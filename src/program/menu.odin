@@ -443,6 +443,14 @@ item_disabled_reason :: proc(app: ^App, it: Menu_Item) -> string {
 item_enabled :: proc(app: ^App, it: Menu_Item) -> bool {
 	if it.cmd == .None {return false} // separator
 	if !command_allowed_on(it.cmd, app_active(app)) {return false}
+	// command_allowed_on only knows about pseudo-tabs (doc.kind != .Text); it
+	// says nothing about table view or Preview, which ARE .Text documents that
+	// merely refuse writes. Without this, Replace All (and .Paste, which had
+	// the identical pre-existing hole) painted live, hovered live, and no-oped
+	// on click there -- the refusal happened later, in command_dispatch. This
+	// is the same fix find_actions already got for the find-bar buttons: one
+	// predicate change so the draw, hover and hit-test all agree.
+	if command_mutates_doc(it.cmd) && doc_read_only_view(app_active(app)) {return false}
 	return it.enabled == nil || it.enabled(app)
 }
 

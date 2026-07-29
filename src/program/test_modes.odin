@@ -1170,10 +1170,13 @@ when NEWTPAD_TESTS {
 				ra_chk(&bad, len(doc.undo) == before_undo, "...and pushes no undo entry")
 			}
 
-			// Regex mode. The replacement is LITERAL -- group substitution ($1) is
-			// unimplemented (find.odin's header says so), so this pins today's
-			// behaviour rather than leaving it to be discovered: a "$1" in the
-			// replace field lands in the file as those two characters.
+			// Regex mode. This used to pin the OPPOSITE: "$1" landed in the file as
+			// those two characters, because group substitution was unimplemented.
+			// It is implemented now (find.odin, find_subst_expand), so the pin is
+			// inverted rather than deleted -- the assertion that the group is NOT
+			// spliced in is what would have caught a regression, and its mirror
+			// image is what catches one now. findtest_subst below owns the grammar;
+			// this one keeps the Replace All path itself honest.
 			{
 				src := strings.repeat("cat cat cat\n", 10, context.temp_allocator)
 				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra5.txt", .UTF8)
@@ -1182,8 +1185,8 @@ when NEWTPAD_TESTS {
 				replaced, _, matches, _ := run(&doc, "c(a)t", "X$1", true)
 				after := doc_debug_string(&doc)
 				ra_chk(&bad, matches == 30 && replaced == 30, fmt.tprintf("a capture-group pattern matches and replaces all 30 (%d/%d)", matches, replaced))
-				ra_chk(&bad, strings.count(after, "X$1") == 30, fmt.tprintf("the replacement is literal today -- no $1 substitution (%d)", strings.count(after, "X$1")))
-				ra_chk(&bad, strings.count(after, "Xa") == 0, "...and specifically the group is NOT spliced in")
+				ra_chk(&bad, strings.count(after, "Xa") == 30, fmt.tprintf("$1 substitutes the group in every one (%d Xa, want 30)", strings.count(after, "Xa")))
+				ra_chk(&bad, strings.count(after, "$") == 0, fmt.tprintf("...and no literal $ survives (%d)", strings.count(after, "$")))
 			}
 
 			// WHAT IT COSTS THE UI THREAD AT THE CEILING.
@@ -1269,6 +1272,352 @@ when NEWTPAD_TESTS {
 					}
 					ra_chk(&bad, ok, fmt.tprintf("%s (got %v, want %v)", c.what, out[:n], c.want))
 				}
+			}
+			return
+		}
+
+		// Capture-group substitution in the replacement: the .NET/JavaScript
+		// grammar ($1, ${12}, $&, $$) that VS Code's find widget implements.
+		//
+		// Two halves, and they fail for different reasons. The first drives
+		// find_subst_expand directly with hand-written capture positions, so the
+		// token grammar is checked without a regex engine anywhere near it -- and
+		// so an UNSET middle group can be expressed at all, which is the case
+		// core:text/regex's own Capture cannot represent (it compacts the -1
+		// entries out and silently renumbers everything after them; that is why
+		// find_subst_one drives the VM itself rather than calling regex.match).
+		// The second runs whole documents through find_replace_all, where the
+		// window read, the re-match and the offset bookkeeping are all live.
+		//
+		// Its own proc for the usual reason: test_mode_dispatch's frame has hit
+		// STATUS_STACK_OVERFLOW twice, and only one Document is live at a time.
+		findtest_subst :: proc() -> (bad: int) {
+			fmt.println("--- regex replacement: capture-group substitution ---")
+			sb_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+
+			// --- the grammar, on hand-written captures ---
+			{
+				// "abbbc" with group 1 = "bbb" -- the design doc's own example.
+				// TWO groups declared (len(pos) == 3), the second unset, so this
+				// fixture can express all three states a `$n` can be in: set,
+				// declared-but-unset, and not a group at all.
+				src := "abbbc"
+				pos := [][2]int{{0, 5}, {1, 4}, {-1, -1}}
+				for c in ([]struct {
+					repl, want: string,
+				} {
+					{"[$1]", "[bbb]"},
+					{"$&", "abbbc"},
+					{"$0", "abbbc"},
+					{"$$", "$"},
+					{"$$1", "$1"}, // "$$" consumes BOTH, so the 1 is a literal
+					{"$$$1", "$bbb"}, // ...and the next $ opens a real token
+					{"$x", "$x"},
+					{"$", "$"},
+					{"a$", "a$"},
+					{"${1}", "bbb"},
+					{"${1}2", "bbb2"}, // the reason braces exist
+					{"$12", "bbb2"}, // group 12 does not exist -> group 1, then '2'
+					{"${12}", "${12}"}, // ...and braced it names nothing at all: LITERAL
+					{"${0}", "abbbc"},
+					{"${}", "${}"},
+					{"${x}", "${x}"},
+					{"${1", "${1"},
+					// THE SPLIT THE STANDARDS MAKE AND THE SPEC GOT WRONG. Group 2
+					// is DECLARED here and did not capture -> empty. Group 5 is not
+					// a group at all -> the characters `$5`, as .NET ("$number is
+					// interpreted as a literal character sequence") and ECMA-262
+					// GetSubstitution ("no replacement is done") both require. The
+					// two must be distinguishable; collapsing them to empty, which
+					// is what shipped, silently deletes bytes the user typed.
+					{"$2", ""}, // declared, unset -> empty
+					{"$5", "$5"}, // no such group -> literal
+					{"$9", "$9"},
+					{"a$7b", "a$7b"},
+					{"plain text", "plain text"},
+					{"", ""},
+					{"a${1}b$&c$$d", "abbbbabbbcc$d"},
+				}) {
+					out := make([dynamic]u8, 0, 32, context.temp_allocator)
+					find_subst_expand(transmute([]u8)c.repl, transmute([]u8)src, pos, &out)
+					got := string(out[:])
+					sb_chk(&bad, got == c.want, fmt.tprintf("%-12q -> %q (want %q)", c.repl, got, c.want))
+				}
+			}
+			{
+				// AN UNSET GROUP IN THE MIDDLE. This is the one shape that proves
+				// the group numbering is positional rather than an index into
+				// whatever captured: regex.Capture would report {0,4} and {1,3}
+				// here and $1 would come out "bc".
+				src := "abcd"
+				pos := [][2]int{{0, 4}, {-1, -1}, {1, 3}}
+				out := make([dynamic]u8, 0, 32, context.temp_allocator)
+				repl := "[$1][$2]"
+				find_subst_expand(transmute([]u8)repl, transmute([]u8)src, pos, &out)
+				sb_chk(&bad, string(out[:]) == "[][bc]", fmt.tprintf("an unset group 1 does not renumber group 2: %q (want %q)", string(out[:]), "[][bc]"))
+			}
+			// The gate itself. A replacement with no token must not reach any of
+			// the above -- that is what keeps a plain replace byte-identical to
+			// what it was before substitution existed.
+			for c in ([]struct {
+				repl: string,
+				want: bool,
+			} {
+				{"dog", false},
+				{"", false},
+				{"costs $", false},
+				{"$x", false},
+				{"a$ b", false},
+				{"$1", true},
+				{"$0", true},
+				{"x$&y", true},
+				{"$$", true},
+				{"${1}", true},
+				{"${x}", true}, // over-inclusive on purpose: costs a regex run, not a bug
+			}) {
+				got := find_subst_wanted(transmute([]u8)c.repl)
+				sb_chk(&bad, got == c.want, fmt.tprintf("find_subst_wanted(%q) = %v (want %v)", c.repl, got, c.want))
+			}
+
+			// --- whole documents through find_replace_all ---
+			run :: proc(doc: ^Document, q, r: string) -> (replaced, matches: int) {
+				doc.cursor, doc.anchor = 0, 0
+				find_open(doc, true)
+				clear(&doc.find.query)
+				clear(&doc.find.replace)
+				doc.find.regex = true
+				doc.find.field = 0
+				for c in q {find_input_rune(doc, c)}
+				doc.find.field = 1
+				for c in r {find_input_rune(doc, c)}
+				doc.find.field = 0
+				find_wait(doc)
+				matches = len(doc.find.matches)
+				replaced, _ = find_replace_all(doc)
+				return
+			}
+			e2e :: proc(bad: ^int, src, q, r, want, what: string) {
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				replaced, matches := run(&doc, q, r)
+				got := doc_debug_string(&doc)
+				ok := got == want && matches > 0 && replaced > 0
+				fmt.printfln("  %-5s %s: %q -> %q (want %q, %d matches, %d replaced)", "ok" if ok else "FAIL", what, src, got, want, matches, replaced)
+				if !ok {bad^ += 1}
+			}
+			e2e(&bad, "abbbc", "a(b+)c", "[$1]", "[bbb]", "the design doc's own example")
+			e2e(&bad, "abbbc", "a(b+)c", "<$&>", "<abbbc>", "$& is the whole match")
+			e2e(&bad, "abbbc", "a(b+)c", "<$0>", "<abbbc>", "$0 is the whole match too")
+			e2e(&bad, "abbbc", "a(b+)c", "$$", "$", "$$ is one literal dollar")
+			e2e(&bad, "abbbc", "a(b+)c", "$x", "$x", "$x is literal")
+			e2e(&bad, "aa-bbb", "(a+)-(b+)", "$2:$1", "bbb:aa", "the groups come out in the order they were numbered")
+			e2e(&bad, "aa-bbb", "(a+)-(b+)", "${2}${1}", "bbbaa", "...and the braced form agrees")
+			// The maximum this engine can express: core:text/regex caps at
+			// MAX_CAPTURE_GROUPS (10) counting the whole match, so 9 is the
+			// highest group a pattern can have -- and ${9} is the two-token proof
+			// that braces are parsed for more than a single digit.
+			e2e(&bad, "abcdefghi", "(a)(b)(c)(d)(e)(f)(g)(h)(i)", "${9}${8}$1", "iha", "${9} reaches the last group a 9-group pattern has")
+			// An optional group that did not participate substitutes EMPTY, and
+			// the same pattern with the group present still substitutes it. Both
+			// lines, one document, so a fix that returns empty for everything
+			// cannot pass.
+			e2e(&bad, "xz\nxyz\n", "x(y)?z", "[$1]", "[]\n[y]\n", "an unset optional group is empty, a set one is not")
+			// EXISTS-BUT-UNSET vs DOES-NOT-EXIST, end to end and in ONE document,
+			// so the group count really is read off the compiled program. `$2` is
+			// declared and did not capture on the first line -> empty; `$5` is not
+			// a group at all -> the characters `$5`. A fix that collapses both to
+			// empty passes neither line, and one that makes both literal fails the
+			// second. Sabotage by ignoring len(pos) in find_subst_expand.
+			e2e(&bad, "a-\na-b\n", "(a)-(b)?", "<$2|$5>", "<|$5>\n<b|$5>\n", "an out-of-range group is LITERAL while a declared-but-unset one is empty")
+			// ...and with NO groups at all, every `$n` is literal -- the case where
+			// a query-text group count and a program walk would most easily
+			// disagree, since `\(` and `(?:` are not groups.
+			e2e(&bad, "cat\n", "c(?:a)t", "[$1]", "[$1]\n", "a pattern whose only paren is non-capturing declares no group, so $1 is literal")
+			// A capture whose own text contains a $ is copied out verbatim: no
+			// second round of substitution over the group's bytes.
+			e2e(&bad, "Qa$bQ", "Q([^Q]+)Q", "[$1]", "[a$b]", "a $ inside the captured text is not re-expanded")
+			e2e(&bad, "Qa$1bQ", "Q([^Q]+)Q", "[$1]", "[a$1b]", "...nor is a $1 inside it")
+			// THE ANCHOR TRAP, MADE OBSERVABLE. `\B` matches only where the byte
+			// BEFORE the match is a word character -- exactly the byte a re-match
+			// over a copied slice of the matched text cannot see. The scan finds
+			// one match here, in "xcat"; if find_subst_one did not hand the VM that
+			// preceding 'x', the re-match would not reproduce the span, the
+			// verification would reject it and this would come out "x[] cat".
+			e2e(&bad, "xcat cat", "\\B(cat)", "[$1]", "x[cat] cat", "the byte before the match is visible to \\B at replace time")
+			// ...and its mirror: `\b` must still be FALSE where the scan said it
+			// was false, so a seeded byte cannot be turned into a free pass.
+			e2e(&bad, "xcat cat", "\\b(cat)", "[$1]", "xcat [cat]", "...and \\b still fails where the scan said it failed")
+
+			// `$` AT AN ORDINARY LINE END, THE OTHER HALF OF THE ANCHOR TRAP AND
+			// THE ONE THAT SHIPPED WRONG. pt_line_end_cap returns the offset OF
+			// the '\n', so a window that stops there ends where the scan's 256 KB
+			// block does not, and `Assert_End` (`sp == len(memory)`) is TRUE here
+			// and was FALSE there. That is the NON-conservative direction and it
+			// fires on every line, not at some 256 KB boundary.
+			//
+			// Both cases are alternations whose branches cover the same bytes,
+			// which is the only shape where the span check in find_subst_one (4)
+			// cannot save us: it verifies WHICH BYTES were matched and says
+			// nothing about WHICH BRANCH matched them.
+			//
+			//   - the first is a silent WRONG GROUP: the scan takes `(a)` because
+			//     `$` is false mid-block; a window ending at the newline lets
+			//     `(a)$` win instead, the span is identical, verification passes,
+			//     and `<$1/$2>` comes out `<a/>` where it must be `</a>`.
+			//   - the second is DATA LOSS: `(ab)$` wins the re-match, matches two
+			//     bytes where the scan published one, the span check rejects it,
+			//     and EVERY group falls back to empty -- the captured `a` is gone
+			//     from the document.
+			//
+			// Fixed by extending the window one byte past the line's text (see
+			// find_subst_one (3)), so `$` is false at a line end exactly as it was
+			// in the block. Sabotage by dropping `w1 += 1`: both fail with the
+			// outputs named above.
+			e2e(&bad, "pa\npa\npa\n", "(a)$|(a)", "<$1/$2>", "p</a>\np</a>\np</a>\n", "`$` is false at an ordinary line end, so the scan's branch is the one re-matched")
+			e2e(&bad, "xab\n", "(ab)$|(a)", "[$1|$2]", "x[|a]b\n", "...and a longer `$` branch cannot steal the span and take the captures with it")
+			// The same anchor, at END OF BUFFER, where `$` genuinely IS true and
+			// the window has nothing to add: the fix must not turn it off. Same
+			// pattern, no trailing newline, so the first branch is the right one.
+			e2e(&bad, "pa", "(a)$|(a)", "<$1/$2>", "p<a/>", "...but `$` at end of buffer still matches, where the scan had it true too")
+
+			// REPLACE MATCH, not Replace All. A second, independent path through
+			// the same expansion (find_replacement_for), and the one where the
+			// ordering hazard is sharpest: doc_replace_sel ends in find_invalidate
+			// -> search_stop, which frees search.query, so an expansion built after
+			// the splice would be re-matching with a freed pattern.
+			{
+				src := "aa-bbb aa-bbb\n"
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub4.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				doc.cursor, doc.anchor = 0, 0
+				find_open(&doc, true)
+				clear(&doc.find.query)
+				clear(&doc.find.replace)
+				doc.find.regex = true
+				doc.find.field = 0
+				for c in "(a+)-(b+)" {find_input_rune(&doc, c)}
+				doc.find.field = 1
+				for c in "$2:$1" {find_input_rune(&doc, c)}
+				doc.find.field = 0
+				find_wait(&doc)
+				n0 := len(doc.find.matches)
+				doc.find.current = 0
+				find_replace_current(&doc)
+				once := doc_debug_string(&doc)
+				find_wait(&doc)
+				doc.find.current = 0
+				find_replace_current(&doc)
+				twice := doc_debug_string(&doc)
+				sb_chk(&bad, n0 == 2, fmt.tprintf("the fixture holds two matches (%d)", n0))
+				sb_chk(&bad, once == "bbb:aa aa-bbb\n", fmt.tprintf("Replace Match substitutes the groups too: %q", once))
+				sb_chk(&bad, twice == "bbb:aa bbb:aa\n", fmt.tprintf("...and the second one, re-found after the first edit shifted it: %q", twice))
+			}
+
+			// A replacement with NO token takes the cheap path, and the cheap path
+			// is the one that was there before any of this. Checked two ways: the
+			// gate says so, and the document says so.
+			{
+				src := strings.repeat("cat cat\n", 50, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub2.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				plain := "dog"
+				replaced, matches := run(&doc, "c(a)t", plain)
+				want := strings.repeat("dog dog\n", 50, context.temp_allocator)
+				got := doc_debug_string(&doc)
+				sb_chk(&bad, !find_subst_wanted(transmute([]u8)plain), "a replacement with no $ is refused by the gate...")
+				sb_chk(&bad, matches == 100 && replaced == 100, fmt.tprintf("...the regex still matches and replaces all 100 (%d/%d)", matches, replaced))
+				sb_chk(&bad, got == want, fmt.tprintf("...and the buffer is byte-identical to the literal splice (%d bytes, want %d)", len(got), len(want)))
+			}
+
+			// LENGTH-CHANGING EXPANSIONS ACROSS MANY MATCHES. Every line expands
+			// by a DIFFERENT number of bytes (the index is doubled, and the index
+			// grows from one digit to three), so a single wrong offset anywhere in
+			// the last->first apply loop leaves a document that does not compare
+			// equal -- which a fixture of uniform-length replacements would not
+			// catch, and which the equal-length case above cannot catch at all.
+			{
+				sb := strings.builder_make(context.temp_allocator)
+				want_sb := strings.builder_make(context.temp_allocator)
+				N :: 250
+				for i in 0 ..< N {
+					fmt.sbprintf(&sb, "xn%dey\n", i)
+					fmt.sbprintf(&want_sb, "x<%d%d>y\n", i, i)
+				}
+				src := strings.to_string(sb)
+				want := strings.to_string(want_sb)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub3.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				replaced, matches := run(&doc, "n([0-9]+)e", "<$1$1>")
+				got := doc_debug_string(&doc)
+				sb_chk(&bad, matches == N && replaced == N, fmt.tprintf("all %d matches are found and replaced (%d/%d)", N, matches, replaced))
+				sb_chk(&bad, len(got) == len(want), fmt.tprintf("the length-changing expansions total up exactly (%d bytes, want %d)", len(got), len(want)))
+				diff := -1
+				for k in 0 ..< min(len(got), len(want)) {
+					if got[k] != want[k] {
+						diff = k
+						break
+					}
+				}
+				sb_chk(&bad, got == want, fmt.tprintf("every later offset survives a growing replacement (first difference at byte %d)", diff))
+			}
+
+			// WHAT SUBSTITUTION COSTS THE UI THREAD AT THE CEILING. Replace All is
+			// a buffer write and so is the main thread's by construction; the
+			// question is whether it stays BOUNDED once each match also costs a
+			// piece-table read and a regex run. Same saturated fixture the literal
+			// path is measured against in findtest_replace_all, so the two numbers
+			// are directly comparable and the surcharge is visible rather than
+			// asserted. The guard is a tripwire for an O(n^2), not a promise about
+			// any particular file.
+			{
+				src := strings.repeat("cat\n", 120_000, context.temp_allocator) // > MAX_MATCHES
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub5.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				start := time.tick_now()
+				replaced, matches := run(&doc, "c(a)t", "<$1>")
+				ms := time.duration_milliseconds(time.tick_since(start))
+				got := doc_debug_string(&doc)
+				sb_chk(&bad, matches == MAX_MATCHES && replaced == MAX_MATCHES, fmt.tprintf("the match list is saturated and all of it is replaced (%d/%d)", matches, replaced))
+				sb_chk(&bad, strings.count(got, "<a>") == MAX_MATCHES, fmt.tprintf("every one of them substituted the group (%d, want %d)", strings.count(got, "<a>"), MAX_MATCHES))
+				fmt.printfln("  ---   %d substituting replacements (scan included) on the main thread, SHORT LINES: %.0f ms", replaced, ms)
+				sb_chk(&bad, ms < 3000, fmt.tprintf("...and the short-line shape stays inside the tripwire (%.0f ms)", ms))
+			}
+
+			// THE SAME CEILING ON ONE LONG LINE, WHICH IS THE SHAPE THIS DESIGN
+			// ACTUALLY COSTS. The fixture above is 4-byte lines, so its re-match
+			// window is 4 bytes and REGEX_SUBST_TAIL never binds -- it could not
+			// see a regression in the cap if one were introduced, and it did not
+			// see the one that was: rx_vm.run walks the WHOLE window per match
+			// (the injected opening keeps a thread alive to the last byte, and
+			// `case .Match` breaks the thread loop rather than returning), so on a
+			// single-line file every match pays the full cap. At the shipped 4096
+			// this fixture measured 1452 ms and PASSED the 3000 ms tripwire -- a
+			// second and a half of frozen UI that the guard could not see, on
+			// minified JSON and single-line log dumps, both named use cases.
+			//
+			// Same match count as above so the two numbers are directly
+			// comparable: the only variable is the line length.
+			{
+				src := strings.repeat("cat ", 120_000, context.temp_allocator) // ONE line, no newline
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub6.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				start := time.tick_now()
+				replaced, matches := run(&doc, "c(a)t", "<$1>")
+				ms := time.duration_milliseconds(time.tick_since(start))
+				got := doc_debug_string(&doc)
+				sb_chk(&bad, matches == MAX_MATCHES && replaced == MAX_MATCHES, fmt.tprintf("one long line: the match list is saturated and all of it is replaced (%d/%d)", matches, replaced))
+				sb_chk(&bad, strings.count(got, "<a>") == MAX_MATCHES, fmt.tprintf("one long line: every one of them substituted the group (%d, want %d)", strings.count(got, "<a>"), MAX_MATCHES))
+				fmt.printfln("  ---   %d substituting replacements (scan included) on the main thread, ONE %d-BYTE LINE: %.0f ms", replaced, len(src), ms)
+				sb_chk(&bad, ms < 3000, fmt.tprintf("...and the LONG-LINE shape stays inside the tripwire too (%.0f ms) -- this is the one REGEX_SUBST_TAIL bounds", ms))
 			}
 			return
 		}
@@ -1520,6 +1869,7 @@ when NEWTPAD_TESTS {
 			bad += findtest_first_paint()
 			bad += findtest_autoselect()
 			bad += findtest_replace_all()
+			bad += findtest_subst()
 			bad += findtest_replace_seam()
 			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")
 			return true
@@ -2685,6 +3035,46 @@ when NEWTPAD_TESTS {
 				d.path = ""
 			}
 
+			// Item 2 (2026-07-29 regressions): the Replace All row -- and every
+			// other row whose command mutates the document -- must report
+			// DISABLED in table view and full Preview, not just refuse on
+			// click. Enumerated from command_mutates_doc rather than
+			// hand-listed, so a command added there is covered here without a
+			// second edit.
+			ro_menu_case :: proc(table: bool, md: Md_Mode, label: string) -> (bad: int) {
+				a: App
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				d := app_active(&a)
+				d.kind = .Text
+				d.table = table
+				d.md_mode = md
+				n_checked := 0
+				for m in menus {
+					for it in m.items {
+						if it.cmd == .None {continue}
+						if !command_mutates_doc(it.cmd) {continue}
+						n_checked += 1
+						if item_enabled(&a, it) {
+							fmt.printfln("  FAIL %s: %v reports enabled", label, it.cmd)
+							bad += 1
+						}
+					}
+				}
+				// A low count would make the loop above vacuous -- guard against a
+				// menu table that stopped listing mutating commands at all.
+				if n_checked < 5 {
+					fmt.printfln("  FAIL %s: only %d mutating rows found in the menus (too few to trust)", label, n_checked)
+					bad += 1
+				}
+				fmt.printfln("  %-6s %s: %d mutating rows all report disabled", "ok" if bad == 0 else "FAIL", label, n_checked)
+				return
+			}
+			fmt.println("--- mutating rows are dead in table view and Preview (item 2) ---")
+			bad += ro_menu_case(true, .Off, "table view")
+			bad += ro_menu_case(false, .Preview, "Preview")
+
 			fmt.printfln("menutest: %d failures", bad)
 			return true
 		}
@@ -3032,6 +3422,127 @@ when NEWTPAD_TESTS {
 					// too-generous scan.
 					ab, ag, ar, _ := sample(buf, W, int(x0) + 50, int(rule_y) - 6)
 					dchk(&bad, !near(g_theme[.Md_Rule], ab, ag, ar, 10), "front matter: 6px above that row is NOT the rule (bound is tight, not a scan)")
+
+					// --- item 3 (2026-07-29): the `---` delimiters are BACK,
+					// as muted text ON the card ---
+					//
+					// Wyatt described the pre-batch rendering as "i see the
+					// start and end ---" and the card removed them without
+					// asking. They are restored as text rather than as the
+					// Md_Rule horizontal rules that made the block read as two
+					// separate lines, which is the thing the card fixed. So
+					// three properties, and each one rejects a different way of
+					// getting this wrong:
+					//
+					//   (a) there is INK on the opening and the closing
+					//       delimiter rows -- rejects "the rows were dropped
+					//       again" (the sabotage);
+					//   (b) the closing row sits on the CARD's surface --
+					//       rejects a card height that did not grow with the two
+					//       new rows, i.e. the two-producers defect md_fm_height
+					//       and md_draw_front_matter were split to prevent;
+					//   (c) no long horizontal run of Md_Rule inside the card --
+					//       rejects "restored them, but as rules again", which
+					//       would satisfy (a) and (b) on its own.
+					//
+					// Peak-sampled against the CARD, not Bg_Base: the ink sits
+					// on Md_Code_Bg here, and the pixel farthest from the
+					// surface it is drawn on is the one nearest full glyph
+					// coverage.
+					fm_peak :: proc(buf: []u8, gx0, gx1, gy0, gy1, W, H: int) -> (dist: int, b, g, r: u8) {
+						surf := g_theme[.Md_Code_Bg]
+						dist = -1
+						for yy in max(0, gy0) ..< min(H, gy1) {
+							for xx in max(0, gx0) ..< min(W, gx1) {
+								bb, gg, rr, _ := sample(buf, W, xx, yy)
+								d :=
+									abs(int(bb) - int(surf[2] * 255)) +
+									abs(int(gg) - int(surf[1] * 255)) +
+									abs(int(rr) - int(surf[0] * 255))
+								if d > dist {dist, b, g, r = d, bb, gg, rr}
+							}
+						}
+						return
+					}
+					pad := md_fm_pad()
+					card_top := ytop
+					card_bot := ytop + md_fm_height(line_h, fm_inner)
+					// Row 0 is the opening `---`, then the fixture's two
+					// key/value lines, then the closing `---`: `fm_inner + 1`
+					// rows down.
+					//
+					// Written as `fm_inner + 1` and NOT as `md_fm_rows(..) - 1`
+					// deliberately. Through md_fm_rows this is self-cancelling
+					// and was MEASURED to be: dropping the `+ 2` from
+					// md_fm_rows shrinks the card AND moves this expectation up
+					// with it by exactly the same amount, so the "inside the
+					// card" check below passed against a card two rows too
+					// short. Stating the row index makes the card the only
+					// thing that can move.
+					open_base := card_top + pad + px_
+					close_base := open_base + f32(fm_inner + 1) * line_h
+					dx0, dx1 := int(x0 + char_w) + 1, int(x0 + char_w * 4)
+					for c in ([]struct {
+						base: f32,
+						what: string,
+					}{{open_base, "opening"}, {close_base, "closing"}}) {
+						d, db, dg, dr := fm_peak(buf, dx0, dx1, int(c.base - px_ * 0.9), int(c.base + px_ * 0.15), W, H)
+						// The full separation between Text_Muted and
+						// Md_Code_Bg in Dark, summed over three channels, is
+						// ~319, and the hyphen's interior MEASURES 320 -- it
+						// reaches full coverage. 150 is therefore not a
+						// generous bound picked to be safe, it is under half of
+						// what a drawn delimiter actually produces, and the
+						// card's own bare surface scores 0.
+						dchk(
+							&bad, d >= 150,
+							fmt.tprintf("front matter: the %s `---` is drawn on the card (peak distance from the card surface %d, bgr %d,%d,%d)", c.what, d, db, dg, dr),
+						)
+						// ...and in the muted tier, not some other role's
+						// colour. The measured peak is bgr 132,146,157 --
+						// Text_Muted's #9D9284 EXACTLY -- so 12 is slack for a
+						// different face's hinting, not room for a different
+						// colour. Text_Primary, Md_Rule and Md_Code are all far
+						// outside it.
+						dchk(
+							&bad, near(g_theme[.Text_Muted], db, dg, dr, 12),
+							fmt.tprintf("front matter: the %s `---` is muted text (bgr %d,%d,%d)", c.what, db, dg, dr),
+						)
+					}
+					// (b): the card really covers the closing row. Sampled well
+					// to the RIGHT of the three hyphens, so this is the card's
+					// bare surface and not glyph ink. With the pre-item-3 height
+					// (inner rows only) this y is past the card's bottom edge and
+					// reads Bg_Base.
+					sb, sg, sr, _ := sample(buf, W, int(x0) + 300, int(close_base - px_ * 0.5))
+					dchk(
+						&bad, near(g_theme[.Md_Code_Bg], sb, sg, sr, 3),
+						fmt.tprintf("front matter: the closing `---` row is INSIDE the card (surface at y=%.0f is bgr %d,%d,%d)", close_base - px_ * 0.5, sb, sg, sr),
+					)
+					// (c): no rule inside the card. A run, not a pixel count --
+					// an antialiased glyph edge blends card -> Text_Muted and
+					// passes through Md_Rule's neighbourhood on the way, so
+					// "any Md_Rule pixel" would be a false positive. A real
+					// Md_Rule row here is the full content width; the widest
+					// thing the three hyphens can produce is ~3 cells.
+					worst_run := 0
+					for yy in int(card_top) ..< min(H, int(card_bot)) {
+						run := 0
+						for xx in int(x0) + 1 ..< min(W, int(x1) - 1) {
+							rb2, rg2, rr2, _ := sample(buf, W, xx, yy)
+							if near(g_theme[.Md_Rule], rb2, rg2, rr2, 6) {
+								run += 1
+								worst_run = max(worst_run, run)
+							} else {run = 0}
+						}
+					}
+					// Measured with the fix in place: 1px. 60 leaves room for a
+					// face whose hyphen antialiases wider, and is still 14x
+					// short of the full-width run a restored Md_Rule would give.
+					dchk(
+						&bad, worst_run < 60,
+						fmt.tprintf("front matter: no Md_Rule spans the card (longest Md_Rule-coloured run inside it: %dpx of %.0f)", worst_run, x1 - x0),
+					)
 				}
 
 				// The p==0 gate: scrolled to start exactly at the front matter's
@@ -3051,6 +3562,158 @@ when NEWTPAD_TESTS {
 			return bad
 		}
 
+		// mdtest's HEADING-FIT checks (item 6, 2026-07-29 live-pass regressions).
+		//
+		// markdown_draw advanced `y` past a heading by `hh + (hpx - px) -
+		// px*0.3` while md_row_fits admitted the row on the BODY `line_h`. A
+		// heading near the bottom of the pane was therefore let in against a
+		// budget smaller than the space it actually needs, drawn taller than
+		// that budget, and then cut through the middle of its glyphs by the
+		// cover strip main.odin paints afterwards. There is no scissor rect
+		// anywhere in this renderer, so not admitting the row is the only way
+		// not to cut it.
+		//
+		// Two independent assertions, PER HEADING LEVEL -- the six levels have
+		// six different sizes, and a fix that only got h1 right would sail
+		// through a single-level test:
+		//
+		//   1. GEOMETRIC, swept across every `ybot` in the window where the old
+		//      bound and the new one disagree. If markdown_draw drew the heading
+		//      at all, the heading's whole row [y-px, y-px+hh) must be above
+		//      ybot. `y` is known to the test independently -- the three rows
+		//      above the heading are plain paragraphs, each exactly line_h -- so
+		//      this compares markdown_draw's admit decision against arithmetic
+		//      the test states, not against markdown_draw's own.
+		//   2. PIXEL, at a ybot the old bound admits and the new one does not:
+		//      nothing may be drawn at or below ybot. The heading text carries
+		//      DESCENDERS on purpose. An all-caps heading's ink sits entirely
+		//      above its baseline and would clear ybot even with the row
+		//      overhanging, which makes the pixel check vacuous -- measured, not
+		//      assumed. Measured with the bound sabotaged back to `line_h`:
+		//      assertion 1 fails at all six levels, assertion 2 at h1 (674
+		//      inked pixels below ybot) and h2 (216). It does NOT fail at
+		//      h3..h6, whose rows exceed a body row by only 4-9px -- too little
+		//      for the overhang to push glyph ink past ybot at this font size.
+		//      Assertion 1 is what carries those levels, and that is why there
+		//      are two.
+		//
+		// Its own procedure with its own device, and exactly ONE Document alive
+		// at a time: test_mode_dispatch's frame has hit STATUS_STACK_OVERFLOW
+		// twice. `content` is DEFAULT-allocated because doc_from_content sets
+		// owned_orig and doc_close frees it.
+		md_head_fit_selftest :: proc() -> (bad: int) {
+			hchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1000, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/headfit") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(24)
+			char_w := plat.text_char_width(&h.text, px_, .Doc)
+			x0, x1, ytop := f32(40), f32(900), f32(60)
+			line_h := line_height(px_)
+			bg := g_theme[.Bg_Base]
+			// Three plain paragraph rows ahead of the heading, so the heading's
+			// baseline is `ytop + px + 3*line_h` by arithmetic the test owns.
+			LEAD :: "body\nbody\nbody\n"
+			y_head := ytop + px_ + 3 * line_h
+
+			for lvl in 1 ..= 6 {
+				hashes := strings.repeat("#", lvl, context.temp_allocator)
+				src := strings.concatenate({LEAD, hashes, " Hgjpqy\n"}, context.temp_allocator)
+				head_end := len(src) - 1 // the newline ending the heading's line
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "h.md", .UTF8)
+
+				hh := line_height(md_head_px(px_, lvl))
+				row_bot := y_head - px_ + hh
+				// Without this the whole case could be vacuous: if a level's row
+				// were no taller than a body row there would be nothing for the
+				// old bound to get wrong, and both assertions would pass on any
+				// implementation.
+				hchk(&bad, hh > line_h, fmt.tprintf("h%d: fixture is non-degenerate -- its row is %.0fpx against a body row's %.0f", lvl, hh, line_h))
+
+				// (1) Sweep the disagreement window: [old bound - 2, new bound + 2].
+				first_bad := -1
+				for yb := int(y_head - px_ + line_h) - 2; yb <= int(row_bot) + 2; yb += 1 {
+					ybot := f32(yb)
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, 0)
+					// `bottom` is "just past the last line drawn": it only
+					// reaches the heading's line end if the heading was admitted.
+					if bottom >= head_end && row_bot > ybot && first_bad < 0 {first_bad = yb}
+				}
+				hchk(
+					&bad, first_bad < 0,
+					fmt.tprintf("h%d: never admitted with its row overhanging (row ends at %.0f; first bad ybot %d)", lvl, row_bot, first_bad),
+				)
+
+				// (2) One ybot inside the old bound's admit range and outside the
+				// new one, read back and scanned for ink below the content box.
+				ybot_pix := y_head - px_ + line_h + 1
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot_pix, 0)
+				if pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); ok {
+					inked, wy := 0, -1
+					for yy in int(ybot_pix) ..< H {
+						for xx in int(x0) ..< int(x1) {
+							i := (yy * W + xx) * 4
+							d :=
+								abs(int(pix[i]) - int(bg[2] * 255)) +
+								abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+								abs(int(pix[i + 2]) - int(bg[0] * 255))
+							if d > 24 {
+								inked += 1
+								if wy < 0 {wy = yy}
+							}
+						}
+					}
+					hchk(
+						&bad, inked == 0,
+						fmt.tprintf("h%d: nothing drawn at or below ybot=%.0f (%d inked pixels, topmost at y=%d)", lvl, ybot_pix, inked, wy),
+					)
+				} else {
+					hchk(&bad, false, fmt.tprintf("h%d: readback", lvl))
+				}
+				doc_close(&doc)
+			}
+
+			// L10 (2026-07-29 review): `forced` (markdown.odin, right above the row
+			// loop) exempts only the very first row from the md_row_fits test above,
+			// so a pane too short for even one row still shows a clipped row instead
+			// of nothing -- "no frame ever shows emptiness" outranks the trim. The
+			// sweep above never reaches this: LEAD always puts three body rows ahead
+			// of the heading, so the first row admitted is never the one under test.
+			// Here the heading IS the first row, and ybot is pinned at ytop itself --
+			// tighter than any body row's ink, let alone a heading's -- so nothing
+			// but `forced` can admit it. Without `forced` this returns bottom == 0.
+			{
+				src := "# Hgjpqy\n"
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "forced.md", .UTF8)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ytop, 0)
+				hchk(
+					&bad,
+					bottom > 0,
+					fmt.tprintf("forced: a pane too short for its first row still advances past it (bottom=%d)", bottom),
+				)
+				doc_close(&doc)
+			}
+			return bad
+		}
+
 		// `newtpad mdtest` covers the markdown block classifiers and inline parser
 		// (the rendering itself needs a live eye), PLUS the draw-level checks
 		// above that exercise markdown_draw's own call sites through a real
@@ -3058,6 +3721,7 @@ when NEWTPAD_TESTS {
 		if os.args[1] == "mdtest" {
 			bad := md_selftest()
 			bad += md_draw_selftest()
+			bad += md_head_fit_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
 			return true
 		}
@@ -3308,8 +3972,20 @@ when NEWTPAD_TESTS {
 		if os.args[1] == "tablereadonlytest" {
 			bad := 0
 			// 1. The exact guard condition in command_dispatch: doc.table && mutates.
+			//
+			// Item 2 (2026-07-29 regressions): this list, not just
+			// command_mutates_doc's own switch, is what pins membership --
+			// menutest's ro_menu_case enumerates THROUGH command_mutates_doc, so a
+			// reviewer who trims a case out of that switch (.Find_Replace_All was)
+			// makes menutest, mdviewtest and this test all agree with the broken
+			// classifier instead of catching it. Five entries added past .Paste for
+			// that reason: two find-bar mutators, the two encoding commands whose
+			// doc_set_line_ending rewrites the whole buffer, and History_Jump's
+			// apply_snapshot, which is the same whole-tree replacement .Undo/.Redo
+			// are. See command_mutates_doc's own comments for why each was missed.
 			mutating := []Command_Id {
 				.Backspace, .Delete_Fwd, .Delete_Word_Back, .Insert_Newline, .Insert_Tab, .Undo, .Redo, .Cut, .Paste,
+				.Find_Replace_One, .Find_Replace_All, .Eol_LF, .Eol_CRLF, .History_Jump,
 			}
 			for c in mutating {
 				if !command_mutates_doc(c) {
@@ -7529,6 +8205,17 @@ when NEWTPAD_TESTS {
 				{"log smb://server/share/a.txt:7 there", "smb://server/share/a.txt", 7, .Line_Ref},
 			}
 
+			// M4 (2026-07-29 review): '"' being a delimiter is not just a path-
+			// detection nicety (the "Quoted paths end at the quote" case above) --
+			// it is the only thing standing between link_follow's bare-reveal
+			// branch and argument injection into explorer.exe, since
+			// plat.explorer_select_arg quotes `abs` with no escaping (see the
+			// SECURITY NOTE on link_follow and the comment on explorer_select_arg
+			// itself). Pinned directly, independent of any path-detection case
+			// that happens to exercise it: relax is_delim to admit '"' later and
+			// this fails immediately instead of only showing up as a live exploit.
+			lk_chk(&bad, link_is_delim_for_test('"'), `M4. '"' is a link delimiter (explorer_select_arg's unescaped quoting depends on this)`)
+
 			fmt.println("--- detection ---")
 			for c in cases {
 				links := links_scan(c.text)
@@ -8171,6 +8858,131 @@ when NEWTPAD_TESTS {
 			fmt.println("--- only DRIVE_REMOTE is refused, not \"anything but DRIVE_FIXED\" ---")
 			lk_anchor_kind_scope(&bad)
 
+			// Item 5 (2026-07-29 regressions): Ctrl+click on a non-local target used
+			// to reach the generic "Could not resolve" branch and do nothing else.
+			// Now it skips resolution and routes straight to link_bare_reveal_target
+			// -> plat.shell_reveal, without a stat.
+			//
+			// H1 (2026-07-29 review): assertions 1-3 below only ever exercised
+			// link_bare_reveal_target, the pure DECISION helper -- not link_follow,
+			// the consumer that is supposed to act on it. A reviewer deleted the
+			// entire bare-reveal branch from link_follow, rebuilt, and this whole
+			// mode still reported 0 failures, because nothing here called
+			// link_follow at all. Assertions 4-5 close that: they call link_follow
+			// itself and check plat.shell_reveal_count, so deleting the branch (or
+			// routing it through link_resolve instead, which refuses a UNC target
+			// without ever reaching shell_reveal -- see lk_non_local_never_stats
+			// above) leaves shell_reveal_count at 0 either way and both fail.
+			//
+			// plat.shell_reveal is silenced first via shell_reveal_set_silent, and
+			// plat.message_error is silenced via message_error_set_silent for the
+			// same reason shell_open_folder's ShellExecuteW call is untested above:
+			// a headless run has nobody to close the Explorer window a live
+			// ShellExecuteW would pop, or to dismiss the modal "Could not resolve"
+			// dialog a sabotaged build would show instead of reaching shell_reveal
+			// at all -- MessageBoxW blocks the thread until dismissed, so an
+			// unsilenced sabotage run would hang rather than print FAIL.
+			//
+			// Per the task brief: do not stat a real dead UNC path to verify
+			// anything. `\\localhost\newtpad_no_such_share_zz\...` is the same
+			// loopback fixture lk_non_local_never_stats uses above -- path_is_local
+			// refuses on the leading `\\` alone, a pure string-shape check, so this
+			// never asks the redirector anything and cannot hang.
+			lk_bare_reveal :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				anchor := fmt.tprintf("%s\\newtpad_lk_bare_anchor.txt", dir)
+				plat.file_write_atomic(anchor, transmute([]u8)string("anchor"))
+				d, dok := doc_open(anchor)
+				lk_chk(bad, dok, "bare-reveal fixture: anchor document opens")
+				if !dok {return}
+				defer doc_close(&d)
+
+				// 1. A UNC target routes to reveal, without a stat.
+				unc := "\\\\localhost\\newtpad_no_such_share_zz\\out.log"
+				ul := links_scan(unc)
+				lk_chk(bad, len(ul) == 1, fmt.tprintf("the UNC fixture scans as one link (got %d)", len(ul)))
+				if len(ul) == 1 {
+					link_stat_count = 0
+					abs, want := link_bare_reveal_target(&d, unc, ul[0])
+					lk_chk(
+						bad,
+						want && abs == unc && link_stat_count == 0,
+						fmt.tprintf("1. UNC target routes to bare reveal without a stat (want=%v abs=%q stats=%d)", want, abs, link_stat_count),
+					)
+				}
+
+				// 2. A local target is unaffected: the bare-reveal decision says no,
+				//    and link_resolve -- the path every target used to take -- still
+				//    succeeds exactly as it did before this change.
+				local := "see newtpad_lk_bare_local.txt for details"
+				target := fmt.tprintf("%s\\newtpad_lk_bare_local.txt", dir)
+				plat.file_write_atomic(target, transmute([]u8)string("x"))
+				ll := links_scan(local)
+				lk_chk(bad, len(ll) == 1, fmt.tprintf("the local fixture scans as one link (got %d)", len(ll)))
+				if len(ll) == 1 {
+					_, lwant := link_bare_reveal_target(&d, local, ll[0])
+					lk_chk(bad, !lwant, "2a. a local target does not route to bare reveal")
+					link_stat_count = 0
+					rt, rok := link_resolve(&d, local, ll[0])
+					lk_chk(
+						bad,
+						rok && rt.path == target && link_stat_count == 1,
+						fmt.tprintf("2b. a local target still resolves normally through link_resolve (ok=%v path=%q stats=%d)", rok, rt.path, link_stat_count),
+					)
+				}
+
+				// 3. A URI-scheme-carrying token is still refused: it never becomes a
+				//    Link at all (has_uri_scheme, enforced upstream in
+				//    looks_like_path at SCAN time), so neither link_resolve nor the
+				//    new bare-reveal branch is ever asked about it.
+				scheme := "run ms-msdt:/id PCWDiagnostic now"
+				sl := links_scan(scheme)
+				lk_chk(bad, len(sl) == 0, fmt.tprintf("3. a URI-scheme token is not detected as a link at all (got %d)", len(sl)))
+
+				// 4-5. link_follow itself, silenced so a real ShellExecuteW or a real
+				// MessageBoxW never runs -- see the header comment above this proc.
+				plat.shell_reveal_set_silent(true)
+				plat.message_error_set_silent(true)
+				defer plat.shell_reveal_set_silent(false)
+				defer plat.message_error_set_silent(false)
+
+				a: App
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+
+				// 4. link_follow on the UNC target reaches shell_reveal exactly once
+				//    and never reaches link_stat -- the seam H1 exists to close.
+				if len(ul) == 1 {
+					plat.shell_reveal_count = 0
+					link_stat_count = 0
+					link_follow(&a, nil, nil, &d, unc, ul[0])
+					lk_chk(
+						bad,
+						plat.shell_reveal_count == 1 && link_stat_count == 0,
+						fmt.tprintf(
+							"4. link_follow reaches shell_reveal for a UNC target without a stat (reveals=%d stats=%d)",
+							plat.shell_reveal_count,
+							link_stat_count,
+						),
+					)
+				}
+
+				// 5. link_follow on a local target never reaches shell_reveal at
+				//    all: it resolves and opens the tab, same as before item 5.
+				if len(ll) == 1 {
+					plat.shell_reveal_count = 0
+					link_follow(&a, nil, nil, &d, local, ll[0])
+					lk_chk(
+						bad,
+						plat.shell_reveal_count == 0,
+						fmt.tprintf("5. link_follow on a local target never reaches shell_reveal (reveals=%d)", plat.shell_reveal_count),
+					)
+				}
+			}
+			fmt.println("--- Ctrl+click on a non-local target reveals without resolving (item 5) ---")
+			lk_bare_reveal(&bad)
+
 			fmt.printfln("linktest: %d failures", bad)
 			return true
 		}
@@ -8421,7 +9233,7 @@ when NEWTPAD_TESTS {
 			y := row_baseline_y(px, 0) - line_height(px) * 0.5
 
 			for hs in ([]int{0, 50, 100, 250}) {
-				doc.h_scroll = clamp(hs, 0, doc_max_hscroll(&doc, &t, rows))
+				doc.h_scroll = clamp(hs, 0, doc_update_max_hscroll(&doc, &t, rows))
 				doc_update_hscroll(&doc)
 				for cell in ([]int{doc.h_scroll, doc.h_scroll + doc.view_cols / 2, doc.h_scroll + doc.view_cols - 1}) {
 					base_x := col_x(cw, cell)
@@ -8524,7 +9336,7 @@ when NEWTPAD_TESTS {
 				gdoc.view_cols = 80
 				gdoc.view_rows = 5
 
-				gm := hscroll_model(&gdoc, &t, rows, 1000, cw)
+				gm := hscroll_model(&gdoc, &t, 1000, cw)
 				if gm.kind != .Columns {
 					fmt.printfln("  FAIL grid: hscroll kind is %v, want Columns", gm.kind)
 					bad += 1;grid_bad += 1
@@ -8556,7 +9368,7 @@ when NEWTPAD_TESTS {
 					// Thumb round-trip in column space.
 					for tc in ([]int{0, 1, gm.max / 2, gm.max}) {
 						gdoc.table_col = clamp(tc, 0, gm.max)
-						m2 := hscroll_model(&gdoc, &t, rows, 1000, cw)
+						m2 := hscroll_model(&gdoc, &t, 1000, cw)
 						b2 := hscrollbar_geo(&gdoc, 1000, 700, m2)
 						got := hscrollbar_pos_at(b2, b2.thumb_x, m2)
 						if got != gdoc.table_col {
@@ -8577,7 +9389,7 @@ when NEWTPAD_TESTS {
 				mdoc.view_rows = 5
 				for mode in ([]Md_Mode{.Preview, .Split}) {
 					mdoc.md_mode = mode
-					mm := hscroll_model(&mdoc, &t, rows, 1000, cw)
+					mm := hscroll_model(&mdoc, &t, 1000, cw)
 					if mm.kind != .None {
 						fmt.printfln("  FAIL markdown %v: hscroll kind is %v, want None", mode, mm.kind)
 						bad += 1;grid_bad += 1
@@ -8588,7 +9400,13 @@ when NEWTPAD_TESTS {
 					}
 				}
 				mdoc.md_mode = .Off
-				om := hscroll_model(&mdoc, &t, rows, 1000, cw)
+				// hscroll_model's .Cells branch now reads the pure doc_max_hscroll,
+				// which only reports what doc_update_max_hscroll last measured --
+				// mirror the frame loop's once-per-frame update (main.odin) before
+				// asking, or this reads the unmeasured zero value instead of the
+				// 400-cell line's actual width.
+				doc_update_max_hscroll(&mdoc, &t, rows)
+				om := hscroll_model(&mdoc, &t, 1000, cw)
 				if om.kind != .Cells {
 					fmt.printfln("  FAIL markdown Off: hscroll kind is %v, want Cells", om.kind)
 					bad += 1;grid_bad += 1
@@ -8673,10 +9491,10 @@ when NEWTPAD_TESTS {
 			// the vertical bar's identical mismatch went unnoticed: no test on
 			// either axis ever compared a drawn thumb position with the position a
 			// drag recovers from it.
-			maxhs := doc_max_hscroll(&doc, &t, rows)
+			maxhs := doc_update_max_hscroll(&doc, &t, rows)
 			for hs in ([]int{0, 40, 120, maxhs}) {
 				doc.h_scroll = clamp(hs, 0, maxhs)
-				hm := hscroll_model(&doc, &t, rows, 1000, cw)
+				hm := hscroll_model(&doc, &t, 1000, cw)
 				hb := hscrollbar_geo(&doc, 1000, 700, hm)
 				if !hb.shown {
 					fmt.println("  FAIL: scrollbar not shown though content overflows")
@@ -8719,7 +9537,7 @@ when NEWTPAD_TESTS {
 				}
 				// The scroll range must stop at what doc_draw actually renders
 				// (VISIBLE_COLS), not run thousands of cells into blank space.
-				if mh := doc_max_hscroll(&ld, &t, ld.view_rows); mh > VISIBLE_COLS {
+				if mh := doc_update_max_hscroll(&ld, &t, ld.view_rows); mh > VISIBLE_COLS {
 					fmt.printfln("  FAIL: max h-scroll %d exceeds the drawn width %d (blank space)", mh, VISIBLE_COLS)
 					bad += 1
 				}
@@ -8763,8 +9581,8 @@ when NEWTPAD_TESTS {
 					doc.view_cols = 80
 					doc.top = 0
 
-					wide := doc_max_hscroll(&doc, &t, rows)
-					hw_chk(bad, wide > 0, fmt.tprintf("the long line gives a range while it is visible (%d)", wide))
+					wide := doc_update_max_hscroll(&doc, &t, rows)
+					hw_chk(bad, wide > 0, fmt.tprintf("1. the long line gives a range while it is visible (%d)", wide))
 
 					// Scroll the wide line off the top: doc.top lands on line 100
 					// ("short"), well past line 0's 400-cell line. md_line_offset does
@@ -8779,8 +9597,24 @@ when NEWTPAD_TESTS {
 					}
 					doc.top = off
 
-					after := doc_max_hscroll(&doc, &t, rows)
-					hw_chk(bad, after == wide, fmt.tprintf("the range survives the long line leaving the viewport (%d -> %d)", wide, after))
+					// Assertion 2, the property that must not regress: a mere SCROLL
+					// (doc.top moving, doc.revision untouched) must not collapse the
+					// range. This is the original bug -- doc_max_hscroll used to
+					// derive `reach` from only the currently-visible rows.
+					after := doc_update_max_hscroll(&doc, &t, rows)
+					hw_chk(bad, after == wide, fmt.tprintf("2. the range survives the long line leaving the viewport (%d -> %d)", wide, after))
+
+					// Assertion 3, independent of assertion 2: an actual EDIT that
+					// removes the long line (doc.revision moves) must shrink the
+					// range. Delete line 0's 400 'x' bytes plus its newline through
+					// doc_replace_range, the same path Alt+Up/Down and Replace All
+					// take, so push_undo runs and doc.revision bumps for real.
+					doc.top = 0 // back on screen so the scan below has something to see
+					before_rev := doc.revision
+					doc_replace_range(&doc, 0, 401, nil) // "x"*400 + "\n"
+					hw_chk(bad, doc.revision != before_rev, fmt.tprintf("(precondition) deleting the long line bumped doc.revision (%d -> %d)", before_rev, doc.revision))
+					shrunk := doc_update_max_hscroll(&doc, &t, rows)
+					hw_chk(bad, shrunk < wide, fmt.tprintf("3. deleting the long line shrinks the range (%d -> %d, was %d)", wide, shrunk, wide))
 				}
 				hw_run(&hw_bad)
 			}
@@ -8835,7 +9669,7 @@ when NEWTPAD_TESTS {
 			}
 			// The h-scroll range must come from the 200-cell non-wrapped line, not the
 			// 3000-cell wrapped one.
-			if mh := doc_max_hscroll(&doc, &t, rows); mh != 200 + HSCROLL_PAD - 80 {
+			if mh := doc_update_max_hscroll(&doc, &t, rows); mh != 200 + HSCROLL_PAD - 80 {
 				fmt.printfln("  FAIL: h-scroll range %d, want %d (from the 200-cell line)", mh, 200 + HSCROLL_PAD - 80)
 				bad += 1
 			}

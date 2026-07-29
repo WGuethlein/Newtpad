@@ -210,7 +210,7 @@ pipeline.
 | Where | Promise | User-visible? |
 |---|---|---|
 | `platform/text.odin:492` | *"tabs are one cell for now (tab stops are a later feature)"* | **Yes** — indented code and `.tsv` display wrong |
-| `program/find.odin:6` | regex group substitution (`$1`) is a follow-up | Yes, for regex replace |
+| `program/find.odin:6` | regex group substitution (`$1`) is a follow-up | **Done** (v0.30.0) — `$1`/`${12}`/`$&`/`$$`, the .NET/JS grammar |
 | `program/session.odin:33` | serialize blocks the main thread while dirty | Only on very large dirty buffers |
 | `platform/text.odin:455` | complex-script shaping (Arabic/Indic/ligatures) | Yes for those scripts; locked deferral |
 | `program/doc.odin:21` | *"Real horizontal scroll is a later feature"* | **Stale** — h-scroll works; what's true is `VISIBLE_COLS :: 2048` caps its reach |

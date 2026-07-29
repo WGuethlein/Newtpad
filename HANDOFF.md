@@ -4020,6 +4020,99 @@ bug. Six of the eight above pass that question trivially once it is asked out lo
   `find_replace_current`, but making `find_replace_all` reachable widens the blast radius from one splice
   to many.
 
+## 6as. The regressions the live pass created, and regex to a standard (2026-07-29, v0.30.0, branch `fix/live-pass-regressions`)
+
+Five defects v0.28.0/v0.29.0 introduced or made reachable, plus one feature Wyatt asked for by name:
+*"fix the bugs these generated that you mentioned… regex should be true to a standard."*
+Spec: [2026-07-29-live-pass-regressions-design.md](docs/superpowers/specs/2026-07-29-live-pass-regressions-design.md).
+
+### Regex replacement now implements the .NET / JavaScript substitution standard
+
+`$1`–`$9`, `${n}`, `$0`/`$&`, `$$`. The standard was chosen because the find bar already matches VS Code
+deliberately — Wyatt picked all-Alt toggles for that reason — so a user who knows one knows the other.
+
+**Two things made this much harder than it looks, and both are worth knowing before touching it.**
+
+**Odin's `regex.Capture` compacts unset groups out and silently renumbers everything after them.** With
+`x(y)?(z)`, `pos[1]` is group 2. All three capture-building paths in the stdlib `continue` past every
+unset pair and pack. There is no way to recover true numbering through the public API, so **Newtpad
+drives the regex VM directly**. That couples us to non-public stdlib internals: a signature change
+breaks the build (fine), but a *semantic* change to the `saved` layout would be silent. The `${9}` and
+`\B` tests are the guard.
+
+**The engine cannot anchor a match at an offset** — the compiler injects a forward scan and
+`Assert_Start` is literally `sp == 0`. Captures are therefore recovered by re-matching over a window read
+from the piece table, then **verifying the re-match reproduces the published span**. The window carries
+one byte of left context (what `\b`/`\B` need) and runs to and *including* the line's newline (what `$`
+needs).
+
+**That last clause was a shipped data-loss bug for one commit.** Excluding the newline made `Assert_End`
+true at every ordinary line end where the scan, over a 256 KB block, had it false. `/(a)$|(a)/` wrote the
+wrong group on every line, and `/(ab)$|(a)/` fell back to empty groups and **deleted the captured text
+from the document**. The span check does not save you: it accepts any *route* to the same span,
+including a different alternation branch with different groups.
+
+**Owed:** `$` is still window-relative on a line longer than `REGEX_SUBST_TAIL` (64 bytes past the match).
+Bounded — verification rejects, groups go empty, `$0`/`$&` stay correct, no wrong bytes — but real. `^`
+has the same shape and needs a 256 KB block boundary. A proper fix needs the engine to distinguish
+end-of-window from end-of-string, which `core:text/regex` cannot express.
+
+### The other five
+
+- **Mutating menu rows now grey out in table view and Preview.** `item_enabled` consulted
+  `command_allowed_on` but not `doc_read_only_view`, so `Replace All` painted live and no-opped — *the
+  same defect the Replace All task had deliberately fixed for the buttons*, in the commit that added the
+  row. `.Paste` had the identical hole; fixing the predicate fixed both.
+- **The horizontal scroll range shrinks again when you delete the longest line.** The high-water mark is
+  now keyed on `doc.revision`. Every revision bump is a genuine content change — nothing bumps it on a
+  repaint, scroll, resize, tab switch or settings change — with one benign exception: `doc_set_line_ending`
+  bumps it without changing any measured width, so LF↔CRLF momentarily collapses the range and it re-grows.
+- **A non-local link now reveals in Explorer on Ctrl+click** instead of doing nothing. `explorer.exe
+  /select` resolves the path in *its own process*, off our UI thread, so it costs nothing. Decoration
+  stays off — we still cannot promise it will open.
+- **Front matter shows its `---` delimiters again**, as muted text inside the card. Wyatt had said "i see
+  the start and end `---`"; the card removed them and he was never asked. The card is `2 × line_h` taller
+  for it. Still a placeholder.
+- **Markdown rows are admitted against their own height**, so a heading is no longer let in against the
+  body line height and then clipped through the middle of its glyphs. `md_row_geom` produces `ink` and
+  `adv` once, consumed by the fit decision and the advance — the two-producers shape §6j records sixteen
+  instances of.
+
+### What this batch got wrong
+
+**Two more tests that could not fail**, both caught only by the reviewer deleting the fix and watching
+the suite stay green:
+
+- The non-local-link fix had **no seam coverage at all** — the whole branch could be removed with
+  `linktest` reporting zero failures, because the test only exercised the pure helper.
+- The menu fix and its test both enumerated through **the same classifier**, so removing
+  `.Find_Replace_All` from `command_mutates_doc` — the exact command the bug was reported for — broke
+  nothing.
+
+**An implementer caught themselves writing a third**, and their generalisation is the useful artifact:
+*any test expression that calls the code under test is suspect.* Theirs located a row via the same
+procedure that sized the card, so shrinking the card moved the expectation with it.
+
+**A security coupling was left undocumented and is now recorded.** Dropping the stat means
+`explorer_select_arg` builds `/select,"<path>"` by plain concatenation from arbitrary document text.
+That is safe **only** because `is_delim` lists `"` as a token boundary, so a scanned token can never
+contain a quote. Relax `is_delim` later to support quoted paths with spaces — a plausible request — and a
+Ctrl+click becomes argument injection. A test now pins `"` as a delimiter.
+
+**Process note, mine:** a sabotage experiment ended in `git checkout` on a file whose fix was still
+uncommitted, and destroyed it. Commit the fix *before* verifying that removing it breaks something.
+
+### Owed
+
+- **Soft wrap is still not in the admit budget**, so a wrapped block at the bottom can overhang by its
+  continuation rows. Affects every block kind equally. Producing that height ahead of the draw needs
+  either a second walk of `md_draw_inline`'s word loop or a bound passed into it.
+- **`render_frame` still mutates the `Document`** via `hscroll_model`'s `.Columns` branch and
+  `md_table_ensure`. This batch removed one mutation, not the class.
+- **`hscroll_model`'s `rows` parameter is unused** in the whole procedure.
+- **Front-matter rows are no longer individually admitted** — the block draws whole (bounded at 64 lines)
+  and the cover strip trims it on a very short pane.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

@@ -28,6 +28,14 @@ REPLACEFILE_IGNORE_MERGE_ERRORS :: win.DWORD(0x2)
 
 FILE_MMAP_THRESHOLD :: 16 * 1024 * 1024 // copy below, mmap above
 
+// Mirrors program/test_modes.odin's NEWTPAD_TESTS -- same name, same default,
+// so one -define:NEWTPAD_TESTS=... on the odin build command line gates both
+// packages' test-only scaffolding together. Needed on this side for
+// shell_reveal's call counter and message_error's headless-silence flag: the
+// platform half of the program/links.odin link_follow seam test (see
+// link_stat_count in links.odin for the sibling that lives on that side).
+NEWTPAD_TESTS :: #config(NEWTPAD_TESTS, ODIN_DEBUG)
+
 // Live, uncached GetDriveTypeW for one letter. Microsoft does not document that
 // this call never touches the volume -- only that it reads the type Windows
 // already recorded for the mount -- so treat it as fast-in-practice, not as a
@@ -562,11 +570,27 @@ Save_Choice :: enum {
 	Cancel,
 }
 
+when NEWTPAD_TESTS {
+	// Suppresses the real MessageBoxW below. A headless caller that
+	// deliberately drives a failure path (a broken resolution, a sabotaged
+	// branch under test) has nobody at the keyboard to dismiss a modal
+	// dialog — MessageBoxW blocks the calling thread until it is, which would
+	// hang the run instead of failing it. Same shape as crash_set_silent in
+	// crash.odin, same reason. Off by default, so an ordinary interactive
+	// session against a debug build (also NEWTPAD_TESTS) still shows real
+	// errors; only a caller that opts in gets silence.
+	message_error_silent: bool
+	message_error_set_silent :: proc(v: bool) {message_error_silent = v}
+}
+
 // Ask whether to save changes to `name` before closing. Yes/No/Cancel.
 // Report a failure the user must know about. Release builds are -subsystem:windows,
 // so anything printed to stderr is discarded — a failed save reported that way is
 // indistinguishable from a successful one.
 message_error :: proc(owner: win.HWND, text: string) {
+	when NEWTPAD_TESTS {
+		if message_error_silent {return}
+	}
 	wmsg := win.utf8_to_wstring(text, context.temp_allocator)
 	wcap := win.utf8_to_wstring("Newtpad", context.temp_allocator)
 	win.MessageBoxW(owner, wmsg, wcap, MB_ICONWARNING)
@@ -715,6 +739,16 @@ shell_open_url :: proc(url: string) -> bool {
 // space, for instance) doesn't truncate it or get split into extra arguments.
 // Pure and allocator-parameterized so a test can assert on its output without
 // touching ShellExecuteW.
+//
+// SECURITY: plain concatenation, no escaping of `path` itself. Safe only
+// because `path` cannot contain a `"` -- not because this proc guarantees it.
+// The one caller that matters, link_follow's bare-reveal branch in
+// program/links.odin (see the SECURITY NOTE there), builds `path` from a
+// scanned link token, and program/links.odin's is_delim treats `"` as a token
+// boundary, so a token can never carry one through to here. That dependency
+// lives in is_delim, not in this proc -- a future change there that lets a
+// path token contain a `"` (to support quoted paths with spaces, say) turns
+// this concatenation into argument injection with no warning at this end.
 explorer_select_arg :: proc(path: string, allocator := context.temp_allocator) -> string {
 	return strings.concatenate({"/select,\"", path, "\""}, allocator)
 }
@@ -726,10 +760,32 @@ explorer_folder_arg :: proc(path: string, allocator := context.temp_allocator) -
 	return strings.concatenate({"\"", path, "\""}, allocator)
 }
 
+when NEWTPAD_TESTS {
+	// Every call shell_reveal has received, for the tests. Mirrors
+	// link_stat_count in program/links.odin: the claim under test is
+	// "link_follow's bare-reveal branch actually reached shell_reveal", and
+	// that can't be read off ShellExecuteW's own return value, which succeeds
+	// or fails for reasons unrelated to whether this proc was even called.
+	// Test-only scaffolding, gated behind the same NEWTPAD_TESTS the rest of
+	// the headless harness uses, so it costs nothing (not even the `int`) in
+	// a release build.
+	shell_reveal_count: int
+	// When set, shell_reveal counts the call but does not hand it to
+	// ShellExecuteW -- a headless run has nobody to close the Explorer window
+	// a real call would pop. Off by default, so an interactive debug-build
+	// session still reveals for real; a headless caller opts in explicitly.
+	shell_reveal_silent: bool
+	shell_reveal_set_silent :: proc(v: bool) {shell_reveal_silent = v}
+}
+
 // Select `path` in Explorer rather than opening it. This is what a non-text
 // file gets: the user sees where it is and decides what to do, and nothing we
 // did executed it.
 shell_reveal :: proc(path: string) -> bool {
+	when NEWTPAD_TESTS {
+		shell_reveal_count += 1
+		if shell_reveal_silent {return true}
+	}
 	arg := explorer_select_arg(path)
 	// NOT wide_path: `arg` is an Explorer command line, and the path inside it is
 	// handed to another process. explorer.exe does not accept \\?\, so a long path

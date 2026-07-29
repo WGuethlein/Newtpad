@@ -3,13 +3,16 @@
 // blocks over the piece table. Small buffers scan inline; larger ones scan on a
 // worker thread that publishes results incrementally, so a keystroke never waits
 // on the file size. Replace reuses the doc's public edit path (undo + nl-delta
-// handled). Group substitution ($1) is a follow-up.
+// handled). In regex mode the replacement understands .NET/JavaScript capture
+// substitution ($1, ${12}, $&, $$) — see find_subst_wanted.
 package main
 
 import "base:intrinsics"
 import "core:fmt"
 import "core:mem"
 import "core:text/regex"
+import rx_common "core:text/regex/common"
+import rx_vm "core:text/regex/virtual_machine"
 import "core:thread"
 import "core:unicode/utf8"
 import base "src:base"
@@ -975,6 +978,389 @@ scan_regex :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 	}
 }
 
+// --- capture-group substitution in the replacement ---
+//
+// THE STANDARD IS .NET / JAVASCRIPT `String.replace`, which is what VS Code's
+// find widget implements — the same reference the find bar's chips and its
+// all-Alt toggles were built against, so a user who knows one knows the other.
+// PCRE's `\1` was the other candidate and is rejected: backslash already means
+// escape inside the PATTERN, and giving it a second meaning in the REPLACEMENT
+// invites exactly the confusion this feature exists to remove.
+//
+//	$1 … $9   capture group n
+//	$12       group 12 where the pattern has one, else group 1 then a literal 2
+//	${12}     group 12, unambiguously — the escape hatch for the line above
+//	$0, $&    the whole match
+//	$$        a literal $
+//	$x        literal, emitted as typed (and so is a trailing $)
+//
+// AN OUT-OF-RANGE OR UNSET GROUP SUBSTITUTES EMPTY, not an error. A pattern
+// with an optional group legitimately produces an unset capture, and refusing
+// the whole replace over one would be worse than the alternative — the same
+// call .NET makes.
+//
+// How the captures are recovered, and why not by storing them: `Search` keeps
+// matches as parallel arrays with no capture data, and adding some would cost
+// MAX_MATCHES x groups x 2 ints on EVERY search whether or not a replacement
+// ever reads one. Instead the pattern is re-matched at replace time, and only
+// when the replacement actually references a group — find_subst_wanted decides
+// that once, before the loop, so a plain replacement takes the byte-for-byte
+// path it took before any of this existed.
+
+// How far past a match the re-match window may reach. Bounds the per-match cost
+// on a pathologically long line (a multi-GB single-line JSON dump); ordinary
+// text stops at the line end long before this.
+//
+// 64, NOT 4096, AND THE DIFFERENCE IS A SECOND AND A HALF OF FROZEN UI. This is
+// a per-match ceiling on a main-thread loop, and rx_vm.run walks the WHOLE window
+// for every match, not just up to the match end: the injected opening (a `.*?`
+// or a self-requeueing `Wait_For_*`) keeps a thread alive to the last byte, and
+// `case .Match` breaks the thread loop rather than returning. So the cost of one
+// substitution is O(window), and on a single-line file the window is always the
+// full cap. Measured on the debug build, 100k matches on one 480 KB line
+// (findtest's own fixture): 1423 ms at 4096, 362 ms at 64. The cap is the only
+// term that moves, because everything else is per-match.
+//
+// Nothing reads past the match end except `$` and the trailing `\b`/`\B`, and
+// both need exactly one byte — the newline the window now includes (see
+// find_subst_one (3)). 64 leaves that an order of magnitude of slack for a line
+// end that lands just past the match, at 1/64th of the ceiling.
+REGEX_SUBST_TAIL :: 64
+
+// Does this replacement reference a capture group at all?
+//
+// Deliberately over-inclusive rather than exact: every token starts with `$`
+// followed by one of these four, so a false positive costs one regex run on a
+// path the user explicitly invoked, while a false negative would silently write
+// `$1` into the file. `$$` is in the set because it too expands (to one `$`).
+find_subst_wanted :: proc(repl: []u8) -> bool {
+	for i := 0; i + 1 < len(repl); i += 1 {
+		if repl[i] != '$' {continue}
+		c := repl[i + 1]
+		if c == '$' || c == '&' || c == '{' || (c >= '0' && c <= '9') {return true}
+	}
+	return false
+}
+
+// Write `repl` into `out` with its `$` tokens expanded.
+//
+// `pos[g]` is group g's {start, end} within `src`, or a negative start when the
+// group exists and did not capture. LEN(POS) IS LOAD-BEARING: it is the number of
+// groups the pattern declares, plus one for the whole match, and it is the whole
+// of how a group that did not capture is told apart from a group that does not
+// exist. The two are NOT the same thing and the standards are explicit about it:
+//
+//   - .NET: "If number doesn't specify a valid capturing group in the pattern
+//     ... $number is interpreted as a literal character sequence."
+//   - ECMA-262 GetSubstitution: for `$n` with n greater than the group count, no
+//     replacement is performed and the token stays literal; for a declared group
+//     that is `undefined`, the empty String is used.
+//
+// So: INSIDE the range and unset -> empty; OUTSIDE it -> the characters as typed.
+// The design doc originally specified empty for both, which was simply wrong
+// about both standards it named, and meant `$5` against a two-group pattern
+// deleted two bytes the user had typed instead of writing them.
+//
+// Pure: no document, no regex, no allocation beyond `out` — which is what lets
+// findtest drive it directly with hand-written capture positions and check the
+// token grammar on its own, separately from the re-match that produces those
+// positions. Hand-written positions are also the only way to express an UNSET
+// MIDDLE group: the engine's own `regex.Capture` compacts the -1 entries out and
+// silently renumbers everything after them, which is why find_subst_one drives
+// the VM directly rather than calling regex.match.
+//
+// A group's own text is copied out verbatim and never re-scanned, so a capture
+// containing a `$` cannot introduce a second round of substitution.
+find_subst_expand :: proc(repl: []u8, src: []u8, pos: [][2]int, out: ^[dynamic]u8) {
+	// The pattern HAS this group (whether or not it captured). This, not `set`,
+	// is what decides literal-versus-substitution.
+	exists :: proc(pos: [][2]int, g: int) -> bool {
+		return g >= 0 && g < len(pos)
+	}
+	set :: proc(pos: [][2]int, g: int) -> bool {
+		return exists(pos, g) && pos[g][0] >= 0 && pos[g][1] >= pos[g][0]
+	}
+	emit :: proc(src: []u8, pos: [][2]int, g: int, out: ^[dynamic]u8) {
+		if !set(pos, g) || pos[g][1] > len(src) {return} // declared but unset -> empty
+		append(out, ..src[pos[g][0]:pos[g][1]])
+	}
+	i := 0
+	for i < len(repl) {
+		if repl[i] != '$' || i + 1 >= len(repl) {
+			append(out, repl[i])
+			i += 1
+			continue
+		}
+		n := repl[i + 1]
+		switch {
+		case n == '$':
+			append(out, '$')
+			i += 2
+		case n == '&':
+			emit(src, pos, 0, out)
+			i += 2
+		case n == '{':
+			// ${digits}. Anything else — no digits, a non-digit inside, no
+			// closing brace, or digits naming a group the pattern does not have
+			// — is not a group reference and is emitted as typed.
+			j, v := i + 2, 0
+			for j < len(repl) && repl[j] >= '0' && repl[j] <= '9' && j - i <= 8 {
+				v = v * 10 + int(repl[j] - '0')
+				j += 1
+			}
+			if j > i + 2 && j < len(repl) && repl[j] == '}' && exists(pos, v) {
+				emit(src, pos, v, out)
+				i = j + 1
+			} else {
+				append(out, '$')
+				i += 1
+			}
+		case n >= '0' && n <= '9':
+			// The longest run of digits that names a group THE PATTERN HAS,
+			// falling back to fewer digits — .NET's and JavaScript's rule, and
+			// the whole reason `${n}` exists. "$12" is group 12 in a pattern that
+			// has one and group 1 followed by a literal 2 in a pattern that does
+			// not. Existence, not capturedness: an optional group that did not
+			// participate still consumes its digits and expands to nothing, or
+			// `x(y)?z` with "[$1]" would emit "[$1]" on the lines where the
+			// group is absent and "[y]" on the ones where it is not.
+			j, v, best, best_end := i + 1, 0, -1, i + 2
+			for j < len(repl) && repl[j] >= '0' && repl[j] <= '9' && j - i <= 8 {
+				v = v * 10 + int(repl[j] - '0')
+				j += 1
+				if exists(pos, v) {best, best_end = v, j}
+			}
+			if best >= 0 {
+				emit(src, pos, best, out)
+				i = best_end
+			} else {
+				// No prefix names a group the pattern has. The whole token is
+				// literal (.NET/ECMA-262 both), and emitting just the '$' gets
+				// there: the digits fall through as ordinary bytes next pass.
+				append(out, '$')
+				i += 1
+			}
+		case:
+			append(out, '$') // "$x" is literal
+			i += 1
+		}
+	}
+}
+
+// A compiled pattern plus the memory the re-matches run in, held across one
+// replace operation.
+//
+// TWO arenas, and the split is the point. core:text/regex allocates its
+// per-match `saved` arrays from the ambient allocator and NEVER frees them
+// (scan_regex carries the same note and the same fix), so every re-match must
+// be able to drop its garbage — but the compiled program has to outlive all of
+// them, or the pattern would be recompiled once per match. `pat` owns the
+// program for the whole operation; `run` is reset before each match.
+//
+// Private arenas rather than context.temp_allocator because this runs on the
+// main thread, where temp holds other live allocations for the frame — and in
+// find_replace_all the expansions themselves live in temp across the whole loop.
+Subst :: struct {
+	live:    bool, // arenas initialised (find_subst_end is safe on a zero value)
+	pat:     mem.Dynamic_Arena, // owns `re` for the whole operation
+	run:     mem.Dynamic_Arena, // reset per match
+	re:      regex.Regular_Expression,
+	ok:      bool, // the pattern compiled; false means fall back to a literal splice
+	ngroups: int, // capture groups the pattern declares, NOT counting the whole match
+}
+
+// How many capture groups the compiled pattern declares.
+//
+// This is the number find_subst_expand needs to tell `$2` against a two-group
+// pattern (a group that exists and happens not to have captured -> empty) from
+// `$5` against the same pattern (no such group -> the characters `$5`, literally,
+// which is what .NET and ECMA-262 both specify). Collapsing the two was a real
+// defect: a user typing `$5` had those two bytes silently deleted where VS Code,
+// .NET and JavaScript would all have written them.
+//
+// Read off the PROGRAM rather than counted from the query text, and the
+// difference matters: `\(` is not a group, `(?:` is not a group, and a query
+// scanner would have to reimplement the tokenizer to agree with the thing that
+// actually compiled. `compile` emits `Save 2*id` / `Save 2*id+1` per capturing
+// group (compiler.odin), wrapping the whole match as group 0, so the highest Save
+// operand halved IS the group count. `iterate_opcodes` is the engine's own walker
+// and knows every operand width, so an operand byte can never be mistaken for an
+// opcode.
+find_subst_groups :: proc(program: []rx_vm.Opcode) -> int {
+	hi := 0
+	iter := rx_vm.Opcode_Iterator{program, 0}
+	for op, pc in rx_vm.iterate_opcodes(&iter) {
+		if op != .Save || pc + 1 >= len(program) {continue}
+		if g := int(program[pc + 1]) / 2; g > hi {hi = g}
+	}
+	return min(hi, rx_common.MAX_CAPTURE_GROUPS - 1)
+}
+
+// `query` must be search.query — the pattern the published matches were found
+// with, not whatever is in the find bar now.
+find_subst_begin :: proc(sub: ^Subst, query: []u8, case_sens: bool) {
+	mem.dynamic_arena_init(&sub.pat)
+	mem.dynamic_arena_init(&sub.run)
+	sub.live = true
+	flags: regex.Flags
+	if !case_sens {flags += {.Case_Insensitive}} // exactly scan_regex's flags
+	a := mem.dynamic_arena_allocator(&sub.pat)
+	re, err := regex.create(string(query), flags, a, a)
+	if err != nil {return} // cannot happen with matches published; falls back to literal
+	sub.re = re
+	sub.ngroups = find_subst_groups(re.program)
+	sub.ok = true
+}
+
+find_subst_end :: proc(sub: ^Subst) {
+	if !sub.live {return}
+	mem.dynamic_arena_destroy(&sub.run)
+	mem.dynamic_arena_destroy(&sub.pat)
+	sub^ = {}
+}
+
+// Expand `repl` for the match at [m, m+mlen) of `pt`, appending to `out`.
+//
+// THE ANCHOR TRAP, AND WHAT IS ACTUALLY DONE ABOUT IT. Re-matching a freshly
+// copied slice of the matched bytes changes what `^`, `$` and `\b` can see, so
+// a pattern like `\Bcat` would behave differently at replace time than it did
+// at search time and the user would get a replacement for a match that was
+// never really there. core:text/regex has no way to say "match starting exactly
+// at this offset": every compiled program is a forward SCAN from wherever the VM
+// is started, and the VM's `Assert_Start` is literally `sp == 0` of
+// `Machine.memory` — there is no notion of text before the string. (The scan is
+// spelled two ways, and it is worth being exact because the earlier version of
+// this comment was not: `compile` first tries `optimize_opening`, and a pattern
+// beginning with a literal byte/rune/class gets a `Wait_For_*` opcode instead —
+// which re-queues itself on a mismatch and so scans forward too. Only when the
+// opening is unpredictable, e.g. an alternation, is an unconditional `.*?`
+// injected; a pattern opening with `^` gets neither.)
+// So four things are done here instead, in descending order of how much they
+// matter:
+//
+//  1. The window is read FROM THE PIECE TABLE and runs on to the end of the
+//     match's line, so everything to the right of the match — which is what
+//     greedy quantifiers, `$` and the trailing `\b` read — is the real document,
+//     not a truncation at the match's last byte.
+//  2. The window STARTS ONE BYTE BEFORE the match (whenever there is one) and
+//     the VM is started at offset 1 inside it, with `current_rune` seeded to
+//     that byte and `current_rune_size` left at 0 — exactly the state add_thread
+//     reads when it seeds the first thread. That is what makes the LEADING `\b`
+//     / `\B` see the real preceding byte. Seeding `current_rune` alone is NOT
+//     enough and the test for it caught that: the VM's boundary check is
+//     `sp > 0 && is_word_class(current_rune)`, so at offset 0 it decides there
+//     is no left context whatever `current_rune` says. The byte has to actually
+//     be in the string. (The scan runs the VM in byte mode — no .Unicode flag —
+//     so the previous byte is the previous rune by construction.)
+//  3. The window RUNS ONE BYTE PAST the line's last text byte whenever there is
+//     one, i.e. it INCLUDES the '\n'. `$` compiles to `Assert_End`, which is
+//     `sp == len(memory)` — a pure window-relative test — so a window ending at
+//     the newline makes `$` TRUE at every ordinary line end, where the scan
+//     (reading a 256 KB block that runs on past that newline) had it FALSE.
+//     That is not the conservative direction and it is not rare: it fires on
+//     every line. See the residual note below for what this does and does not
+//     buy.
+//  4. The result is VERIFIED: the captures are used only if the re-match lands
+//     on exactly [at, at+mlen) of the window, i.e. reproduces the span the scan
+//     published. If it does not, every group substitutes empty and `$0`/`$&`
+//     still give the real matched bytes, which are known without matching
+//     anything. Nothing is ever spliced from a match that was not reproduced.
+//
+// WHAT REMAINS, stated rather than glossed — and stated carefully, because the
+// version of this comment that shipped claimed a safety property the code did
+// not have. (4) alone is NOT enough: a span check accepts any route to the same
+// span, so an alternation whose branches cover the same bytes — `(a)$|(a)` —
+// can be resolved differently by the scan and by the re-match and hand back a
+// DIFFERENT GROUP for a span that verified. (3) is what closes that for `$`;
+// nothing closes it for `^`.
+//
+//   - `^` is still window-relative against the scan's block-relative one (the
+//     flags carry no .Multiline, so `^` means start-of-block, not start-of-line).
+//     A match at offset 0 of the buffer keeps it; everywhere else `^` is simply
+//     false here. That direction only ever costs a match, so the worst case is a
+//     rejection: `(^a)|(a)` at a block start reports group 2 where the scan
+//     reported group 1. Genuinely rare — it needs the match to sit at a 256 KB
+//     block boundary — which is why it is left alone.
+//   - `$` is fixed for every line SHORT ENOUGH to reach its newline inside
+//     REGEX_SUBST_TAIL. On a longer line the window still ends at a synthetic
+//     cap break, so `$` is true there and the scan had it false. That cannot
+//     write a wrong group — reaching the false end costs REGEX_SUBST_TAIL more
+//     bytes than the published span, so (4) rejects it — but it does cost the
+//     groups (they all come out empty while `$0`/`$&` stay right). Ordinary
+//     text, source and config never see it; a minified single-line JSON with a
+//     `$` in the pattern can.
+//   - The engine has no lookaround at all, so that side of the trap does not
+//     arise.
+find_subst_one :: proc(sub: ^Subst, pt: ^base.Piece_Table, m, mlen: int, repl: []u8, out: ^[dynamic]u8) {
+	ctx := context
+	ctx.allocator = mem.dynamic_arena_allocator(&sub.run)
+	ctx.temp_allocator = ctx.allocator
+	context = ctx
+	defer mem.dynamic_arena_free_all(&sub.run)
+
+	// [w0, w1): one byte of left context (see (2)) and everything up to and
+	// INCLUDING the newline that ends the match's line (see (3)), bounded by
+	// REGEX_SUBST_TAIL so a multi-GB single-line file cannot turn one replacement
+	// into a whole-file scan.
+	at := 1 if m > 0 else 0
+	w0 := m - at
+	w1 := max(base.pt_line_end_cap(pt, m + mlen, REGEX_SUBST_TAIL), m + mlen)
+	// ...AND ONE BYTE PAST IT, which is the whole of `$`'s correctness (see (3)).
+	// pt_line_end_cap returns the offset OF the '\n', so without this the window
+	// would end exactly where the line's text ends and `Assert_End` (`sp ==
+	// len(memory)`) would be TRUE at a position where the scan -- reading a 256 KB
+	// block that runs on past the newline -- had it FALSE. At end of buffer w1 is
+	// already pt.length and there is nothing to add, which is also right: `$` is
+	// true there in both.
+	if w1 < pt.length {w1 += 1}
+	win := make([]u8, max(w1 - w0, 0))
+	win = win[:base.pt_read(pt, w0, win)]
+
+	// `pos` is sized to the groups the pattern ACTUALLY DECLARES, not to the
+	// engine's ceiling, because its length is what tells find_subst_expand a group
+	// apart from a typo: an index inside it that never captured expands empty, one
+	// past the end is not a group reference at all and stays literal. See
+	// find_subst_groups.
+	//
+	// Group 0 is seeded from the offsets the scan published, so `$&` and `$0`
+	// are right whatever the re-match does. Everything else starts unset.
+	pos := make([][2]int, sub.ngroups + 1)
+	for i in 0 ..< len(pos) {pos[i] = {-1, -1}}
+	pos[0] = {at, min(at + mlen, len(win))}
+
+	// `at < len(win)` is not belt and braces: rx_vm.run reads memory[sp] with
+	// bounds checking off, so starting it at the very end of the window would
+	// read past it. Only reachable from a zero-length match at end of buffer.
+	if sub.ok && at < len(win) && len(win) >= at + mlen {
+		vm := rx_vm.create(sub.re.program, string(win))
+		vm.class_data = sub.re.class_data
+		vm.string_pointer = at
+		if at > 0 {
+			vm.current_rune = rune(win[at - 1]) // see (2)
+			// The SECOND thing add_thread's seed carries, and free to get right
+			// while we are here. `Assert_Start_Multiline` is `sp == 0 ||
+			// last_rune == '\n' || last_rune == '\r'`, so leaving last_rune at
+			// zero would make `^` silently stop matching in the re-match the day
+			// anyone adds .Multiline to scan_regex's flags. It never fires today
+			// (the flag is never set, so the compiler emits Assert_Start), which
+			// is exactly why it is worth one line now rather than a bug later.
+			vm.last_rune = rune(win[at - 1])
+		}
+		// `false`, not a flag test: scan_regex never sets .Unicode, so the scan
+		// itself runs in byte mode and matching in rune mode here would be the
+		// divergence this whole procedure exists to avoid. UNICODE_MODE is a
+		// compile-time parameter, so this has to be a literal either way.
+		saved, ok := rx_vm.run(&vm, false)
+		if ok && saved != nil && saved[0] == at && saved[1] == at + mlen { // (4)
+			for g in 1 ..< len(pos) {
+				a, b := saved[2 * g], saved[2 * g + 1]
+				if a >= 0 && b >= a && b <= len(win) {pos[g] = {a, b}}
+			}
+		}
+	}
+	find_subst_expand(repl, win, pos, out)
+}
+
 // --- navigation & replace ---
 
 @(private = "file")
@@ -1035,10 +1421,38 @@ find_replace_current :: proc(doc: ^Document) {
 		return
 	}
 	m := f.matches[f.current]
+	// BEFORE the edit, not inside doc_replace_sel's wake: doc_replace_sel ends in
+	// find_invalidate -> search_stop, which frees search.query -- the pattern the
+	// expansion has to be re-matched with.
+	rep := find_replacement_for(doc, m, f.match_len[f.current])
 	doc.anchor = m
 	doc.cursor = m + f.match_len[f.current]
-	doc_replace_sel(doc, f.replace[:]) // handles an empty replacement as a delete
+	doc_replace_sel(doc, rep) // handles an empty replacement as a delete
 	find_recompute(doc)
+}
+
+// The bytes to splice in for the match at [m, m+mlen): f.replace as typed, or
+// its `$` expansion when the search was a regex and the replacement references a
+// group. The expansion is allocated from context.temp_allocator, so it outlives
+// the Subst arenas it was copied out of and dies with the frame.
+//
+// The gate reads doc.search, not doc.find: the published matches were produced
+// by search.query with search.case_sens, and the find bar's fields can already
+// have moved on.
+@(private = "file")
+find_replacement_for :: proc(doc: ^Document, m, mlen: int) -> []u8 {
+	f := &doc.find
+	s := &doc.search
+	if !s.regex || len(s.query) == 0 || !find_subst_wanted(f.replace[:]) {
+		return f.replace[:] // the cheap path: byte-for-byte what it always was
+	}
+	sub: Subst
+	find_subst_begin(&sub, s.query, s.case_sens)
+	defer find_subst_end(&sub)
+	if !sub.ok {return f.replace[:]}
+	out := make([dynamic]u8, 0, len(f.replace) + 16, context.temp_allocator)
+	find_subst_one(&sub, &doc.pt, m, mlen, f.replace[:], &out)
+	return out[:]
 }
 
 // The indices of `matches` that Replace All will actually replace: the leftmost
@@ -1094,6 +1508,7 @@ find_keep_set :: proc(matches, lens: []int, out: []int) -> int {
 find_replace_all :: proc(doc: ^Document) -> (replaced: int, complete: bool) {
 	if block_active(doc) {block_clear(doc)}
 	f := &doc.find
+	s := &doc.search
 	n := len(f.matches)
 	complete = intrinsics.atomic_load(&doc.search.done) && !f.truncated
 	if n == 0 {return 0, complete}
@@ -1124,6 +1539,39 @@ find_replace_all :: proc(doc: ^Document) -> (replaced: int, complete: bool) {
 	kept := find_keep_set(f.matches, f.match_len, keep)
 	if kept == 0 {return 0, complete}
 
+	// EVERY EXPANSION IS COMPUTED BEFORE THE FIRST SPLICE, IN MATCH ORDER,
+	// AGAINST THE UNTOUCHED BUFFER. Two independent reasons, either one on its
+	// own sufficient:
+	//
+	//   - the apply loop below runs last->first, so by the time it reaches match
+	//     j every later match has already been rewritten -- and the re-match
+	//     window runs on to the end of the match's line, so a window read down
+	//     there would be reading text this very operation had just changed;
+	//   - doc_replace_sel ends in find_invalidate -> search_stop, which FREES
+	//     search.query. The pattern is gone after the first edit.
+	//
+	// One `blob` with one end offset per match, rather than a slice per match:
+	// at MAX_MATCHES that is one allocation instead of a hundred thousand, and
+	// the apply loop indexes it with the same j it already has.
+	sub: Subst
+	defer find_subst_end(&sub)
+	blob: [dynamic]u8
+	ends: []int
+	use_sub := s.regex && len(s.query) > 0 && find_subst_wanted(f.replace[:])
+	if use_sub {
+		find_subst_begin(&sub, s.query, s.case_sens)
+		use_sub = sub.ok
+	}
+	if use_sub {
+		blob = make([dynamic]u8, 0, kept * (len(f.replace) + 8), context.temp_allocator)
+		ends = make([]int, kept, context.temp_allocator)
+		for j in 0 ..< kept {
+			i := keep[j]
+			find_subst_one(&sub, &doc.pt, f.matches[i], f.match_len[i], f.replace[:], &blob)
+			ends[j] = len(blob)
+		}
+	}
+
 	// Applied last->first so the offsets ahead of each edit are still the ones
 	// the scan measured. Nothing is re-scanned in this pass, which is what makes
 	// a replacement CONTAINING the search term terminate: "cat" -> "cat cat"
@@ -1133,9 +1581,14 @@ find_replace_all :: proc(doc: ^Document) -> (replaced: int, complete: bool) {
 	for j := kept - 1; j >= 0; j -= 1 {
 		i := keep[j]
 		m := f.matches[i]
+		rep := f.replace[:]
+		if use_sub {
+			lo := 0 if j == 0 else ends[j - 1]
+			rep = blob[lo:ends[j]]
+		}
 		doc.anchor = m
 		doc.cursor = m + f.match_len[i]
-		doc_replace_sel(doc, f.replace[:])
+		doc_replace_sel(doc, rep)
 	}
 	doc_batch_end(doc, kept)
 	find_recompute(doc)
