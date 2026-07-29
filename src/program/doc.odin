@@ -1037,6 +1037,19 @@ Document :: struct {
 	// a scroll moves no term of the key, which is the case that has to be free.
 	md_max:      Md_Anchor,
 	md_max_key:  Md_Max_Key,
+	// md_scroll_frac's DENOMINATOR -- md_scroll_scalar at md_max -- under the same
+	// key. Cached with the anchor rather than recomputed from it because deriving
+	// the scalar costs a walk of its own, and the fraction is asked for once per
+	// frame by the scrollbar. See md_scroll_frac.
+	md_max_scalar: f32,
+	// One block's slot height and extent: md_slot_at's answer, warmed by whichever
+	// pass last walked that block. See Md_Slot_Key and md_pass -- the point is that
+	// the walk the DRAW makes is the one the scrollbar's fraction then reads,
+	// instead of the fraction making a second walk over the same blocks inside
+	// render_frame.
+	md_slot_key:  Md_Slot_Key,
+	md_slot_next: int,
+	md_slot_h:    f32,
 	// Per-block column measure (markdown.odin). Four slots, not one, so two table
 	// blocks on screen at once don't thrash a single slot every frame; no
 	// allocation, so nothing to free on doc close.

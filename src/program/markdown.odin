@@ -2338,6 +2338,29 @@ Md_Max_Key :: struct {
 	valid:    bool,
 }
 
+// Everything ONE block's slot height and extent is a function of. Md_Max_Key's
+// terms minus `pane` -- a block's own height does not depend on how much of the
+// window is showing it -- plus the block itself.
+//
+// This exists so that the walk which DREW a block is the walk the scrollbar's
+// fraction reads, rather than the fraction walking the same blocks again from
+// inside render_frame. Measured before it existed (-o:speed, 1085-line file,
+// 1340x800, mean of 200 frames): md_preview_frac 3.322 ms against
+// markdown_draw's 1.660 -- the thumb's position costing twice the content it
+// describes, because md_scroll_frac calls md_scroll_scalar twice and each one
+// ran an md_slot_at -> md_anchor_walk with a 24-line run-up and a 256-entry
+// Md_Walk_Block array. CLAUDE.md: "scroll resolution must not happen inside the
+// draw".
+Md_Slot_Key :: struct {
+	block:    int,
+	rev:      u64,
+	measure:  f32,
+	px:       f32,
+	ui_scale: f32,
+	faces:    u64,
+	valid:    bool,
+}
+
 // One block as a walk measured it. `slot_top` is the top of the block's slot --
 // the gap that precedes it -- relative to the walk's own start, so the block's
 // glyphs begin at slot_top + gap and the slot ends at slot_top + gap + h.
@@ -2521,6 +2544,15 @@ md_pass :: proc(
 	// budget. The run-up md_anchor_walk takes is NOT part of that budget and is
 	// never drawn; it is what makes the anchor's gap the document's own.
 	n, idx := md_anchor_walk(&c, at.block, at.px + pane * 2, blocks)
+	// The anchor block's slot, handed to md_slot_at rather than left for it to
+	// re-derive. This walk already has the number: `md_slot_at` runs the SAME
+	// md_anchor_walk from the same byte with the same run-up, differing only in a
+	// height limit that cannot affect any block at or before `idx`. Publishing it
+	// here is what stops the scrollbar's fraction from resolving the scroll
+	// position a second time inside render_frame, three lines after this pass
+	// produced it (CLAUDE.md's one-producer rule, and its "scroll resolution must
+	// not happen inside the draw").
+	if n > 0 {md_slot_store(&c, at.block, blocks[idx])}
 	if links != nil {link_cache_begin(doc)}
 	// The anchor block's SLOT top, in client pixels. Everything else in the pass
 	// is this plus the walk's own relative offsets -- one origin, so a block's
@@ -2733,14 +2765,53 @@ md_block_at_byte :: proc(c: ^Md_Scroll_Ctx, b: int) -> (start, next: int, slot: 
 	return last.start, last.next, last.gap + last.h
 }
 
+// The cache key for one block's slot, from a context. One producer, so the key
+// md_pass writes and the key md_slot_at looks up cannot drift apart.
+@(private = "file")
+md_slot_key_of :: proc(c: ^Md_Scroll_Ctx, block: int) -> Md_Slot_Key {
+	return {
+		block    = block,
+		rev      = c.doc.revision,
+		measure  = c.measure,
+		px       = c.m.s,
+		ui_scale = c.m.ui_scale,
+		faces    = c.m.faces,
+		valid    = true,
+	}
+}
+
+// Record one block's slot on the document, for md_slot_at to find. Called by the
+// pass that has just walked it -- see md_pass.
+@(private = "file")
+md_slot_store :: proc(c: ^Md_Scroll_Ctx, block: int, b: Md_Walk_Block) {
+	c.doc.md_slot_key = md_slot_key_of(c, block)
+	c.doc.md_slot_next, c.doc.md_slot_h = b.next, b.gap + b.h
+}
+
+// Walks md_slot_at had to make because nothing had already measured the block.
+// Test-visible on purpose: "the scrollbar's fraction rides the draw's own walk"
+// is not observable from the fraction -- a cached and an uncached answer are the
+// same number -- so the only honest way to assert it is to count the walks.
+md_slot_walks: int
+
 // One block's slot height and extent. Goes through md_anchor_walk for the run-up
 // (see MD_RUNUP_LINES): this number is the denominator of the scrollbar's
 // fraction and the divisor of its inverse, so it has to be the one the draw uses.
+//
+// Reads the cache md_pass fills, which is what makes "the one the draw uses"
+// literal rather than "computed the same way the draw computes it". On a hit
+// this costs a struct compare; on a miss it is the walk it always was.
 @(private = "file")
 md_slot_at :: proc(c: ^Md_Scroll_Ctx, start: int) -> (next: int, slot: f32) {
+	if c.doc == nil {return start + 1, 0}
+	if key := md_slot_key_of(c, start); c.doc.md_slot_key == key {
+		return c.doc.md_slot_next, c.doc.md_slot_h
+	}
+	md_slot_walks += 1
 	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
 	n, idx := md_anchor_walk(c, start, 1, out)
 	if n == 0 {return start + 1, 0}
+	md_slot_store(c, start, out[idx])
 	return out[idx].next, out[idx].gap + out[idx].h
 }
 
@@ -2794,7 +2865,12 @@ md_max_anchor :: proc(c: ^Md_Scroll_Ctx) -> Md_Anchor {
 		lo := 0 if s <= 0 else min(1, n - 1)
 		a = md_at_offset(out[:n], lo, max(rel, out[lo].slot_top))
 	}
+	// The fraction's denominator, computed here because this is where the key is
+	// written and because it is a function of exactly the same terms. Costs one
+	// md_slot_at on a miss -- a resize, a zoom, a monitor change or an edit -- and
+	// nothing on the scroll frames in between, which is the case that matters.
 	doc.md_max, doc.md_max_key = a, key
+	doc.md_max_scalar = md_scroll_scalar(c, a)
 	return a
 }
 
@@ -2904,9 +2980,17 @@ md_at_offset :: proc(w: []Md_Walk_Block, lo: int, target: f32) -> Md_Anchor {
 // 0 at the top, exactly 1 at md_max_anchor -- so the thumb's BOTTOM meets the
 // track's bottom when the document's last block does the pane's, which is the
 // property vscrollbar_geo's comment exists to protect.
+// The denominator comes from md_max_anchor's cache and not from a second
+// md_scroll_scalar. This used to call md_scroll_scalar TWICE, each one an
+// md_slot_at -> md_anchor_walk with a 24-line run-up and a 256-entry
+// Md_Walk_Block array, from inside render_frame, over blocks markdown_draw had
+// laid out three lines earlier -- 3.322 ms a frame against the draw's 1.660.
+// Both halves are now lookups: the denominator on Md_Max_Key (a scroll moves no
+// term of it) and the numerator on the slot md_pass published.
 md_scroll_frac :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> f32 {
-	mx := md_max_anchor(c)
-	den := md_scroll_scalar(c, mx)
+	if c.doc == nil {return 0}
+	md_max_anchor(c) // ensures md_max_scalar holds this key's denominator
+	den := c.doc.md_max_scalar
 	if den <= 0 {return 0}
 	return clamp(md_scroll_scalar(c, a) / den, 0, 1)
 }
@@ -2914,8 +2998,13 @@ md_scroll_frac :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> f32 {
 // The inverse of md_scroll_frac, for a scrollbar drag. Exact: the anchor this
 // returns has the scalar it was asked for (see md_scroll_scalar).
 md_scroll_to_fraction :: proc(c: ^Md_Scroll_Ctx, frac: f32) -> Md_Anchor {
-	mx := md_max_anchor(c)
-	t := clamp(frac, 0, 1) * md_scroll_scalar(c, mx)
+	if c.doc == nil {return {}}
+	// md_max_anchor's cached scalar, the same field md_scroll_frac divides by --
+	// so the map and its inverse multiply and divide by literally one number
+	// rather than by two walks that have to agree. (It also takes the drag off
+	// the walk: a held thumb asks for this every frame.)
+	md_max_anchor(c)
+	t := clamp(frac, 0, 1) * c.doc.md_max_scalar
 	start, next, slot := md_block_at_byte(c, int(t))
 	px := (t - f32(start)) / f32(max(1, next - start)) * slot
 	return md_scroll_clamp(c, {start, clamp(px, 0, slot)})

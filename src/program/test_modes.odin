@@ -5585,6 +5585,31 @@ when NEWTPAD_TESTS {
 				}
 				schk(&bad, worst_grab < 0.001, fmt.tprintf("bar: the thumb's position and the drag's read of it are exact inverses (worst %.4f)", worst_grab))
 
+					// ...and the fraction costs the frame NO walk of its own. The
+					// scrollbar asks for it once per frame from inside render_frame,
+					// three lines after markdown_draw laid out the same blocks, and it
+					// used to answer by resolving the scroll position twice over:
+					// md_scroll_frac -> md_scroll_scalar x2 -> md_slot_at ->
+					// md_anchor_walk, each with a 24-line run-up and a 256-entry
+					// Md_Walk_Block array. Measured at 3.322 ms a frame against
+					// markdown_draw's 1.660 (-o:speed, `newtpad mdperftest`).
+					//
+					// Counted in WALKS, because a cached answer and an uncached one are
+					// the same number -- the only honest witness is the work. The draw
+					// runs first, exactly as render_frame orders them.
+					{
+						doc.md_top = Md_Anchor{}
+						markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, doc.md_top)
+						before_walks := md_slot_walks
+						f := md_scroll_frac(&c, doc.md_top)
+						schk(&bad, md_slot_walks == before_walks, fmt.tprintf("bar: after the draw, the fraction costs no walk of its own (%d walks, frac %.4f)", md_slot_walks - before_walks, f))
+						// Non-vacuity: a block the draw did NOT walk still costs one,
+						// so the row above is the cache working and not a counter that
+						// never moves.
+						other := md_scroll_frac(&c, Md_Anchor{mx.block, 0})
+						schk(&bad, md_slot_walks > before_walks, fmt.tprintf("bar: ...while a block it did not walk still costs one (%d, frac %.4f)", md_slot_walks - before_walks, other))
+					}
+
 				// Grab it and hold it and it does not move: the fraction map and
 				// its inverse are exact inverses, which is the property
 				// scrollgrabtest pins for the editor's bar.
@@ -12348,6 +12373,121 @@ when NEWTPAD_TESTS {
 			}
 			if bad == 0 {fmt.println("  bounded, and short-line scrolling still lands on line starts: OK")}
 			fmt.printfln("scrollperftest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad mdperftest` measures what one WHEEL FRAME of the markdown preview
+		// costs, broken down by the four procedures a scroll frame calls.
+		//
+		// It exists because the 2026-07-29 review measured md_preview_frac at 1.954ms
+		// against markdown_draw's 1.616 -- the scrollbar's fraction costing more than
+		// the content it describes -- and that number had no reproducible harness
+		// behind it. Now it does, so the claim can be re-checked rather than
+		// remembered.
+		//
+		// Meaningful only against `build.bat release tests` (-o:speed). A debug build
+		// measures the debug build.
+		//
+		// The loop is a real frame: scroll, draw, collect links, ask for the
+		// fraction, free the frame arena. The arena free is deliberately OUTSIDE the
+		// timed regions -- it is one call per frame in the product and attributing it
+		// to whichever procedure allocated last would be a lie.
+		if os.args[1] == "mdperftest" {
+			W, H :: 1340, 800
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdperftest") {
+				fmt.println("mdperftest: (skipped: offscreen device init failed)")
+				return true
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			// ~1085 lines of mixed markdown: the review's fixture size, and mixed
+			// because a file of nothing but paragraphs understates the walk (a table
+			// and a blank run are the blocks whose layout keys on doc.revision).
+			b := strings.builder_make()
+			defer strings.builder_destroy(&b)
+			lines := 0
+			for lines < 1085 {
+				i := lines
+				fmt.sbprintf(&b, "## Section %03d\n\n", i)
+				fmt.sbprintf(&b, "A paragraph of body prose with `inline code` and a [link](https://e.test/p%03d) in it, long enough to wrap across the measure more than once so the shaper has real work to do.\n\n", i)
+				fmt.sbprintf(&b, "- first item %03d\n- second item with a little more text on it\n\n", i)
+				strings.write_string(&b, "| col a | col b |\n|---|---|\n| one | two |\n\n")
+				strings.write_string(&b, "```json\n{ \"key\": \"value\", \"n\": 12 }\n```\n\n")
+				lines += 14
+			}
+			src := strings.to_string(b)
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "perf.md", .UTF8)
+			defer doc_close(&doc)
+			doc.md_mode = .Preview
+			px_ := BASE_PX
+			winw, winh := f32(W), f32(H)
+			x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, winw, winh, 0.5)
+			if !box_ok {
+				fmt.println("mdperftest: FAIL no preview pane")
+				return true
+			}
+			c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+			if !cok {
+				fmt.println("mdperftest: FAIL no scroll context")
+				return true
+			}
+			notch := md_wheel_px(&c)
+			mid := doc.pt.length / 3
+			restart := md_anchor_from_top(&c, mid)
+
+			N :: 200
+			// Warm the layout cache and md_max_anchor, so what is measured is a
+			// STEADY-STATE scroll frame and not the first one after an open.
+			at := restart
+			for _ in 0 ..< 8 {
+				at = md_scroll_px(&c, at, notch)
+				doc.md_top = at
+				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				free_all(context.temp_allocator)
+			}
+
+			t_scroll, t_draw, t_links, t_frac, t_frame: time.Duration
+			at = restart
+			for _ in 0 ..< N {
+				f0 := time.tick_now()
+				s0 := time.tick_now()
+				nxt := md_scroll_px(&c, at, notch)
+				// The ceiling is reachable inside 200 notches, and a step that moves
+				// nothing is not a scroll frame. Wrap rather than measure a no-op.
+				at = restart if nxt == at else nxt
+				t_scroll += time.tick_since(s0)
+				doc.md_top = at
+
+				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+				d0 := time.tick_now()
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				t_draw += time.tick_since(d0)
+				l0 := time.tick_now()
+				markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				t_links += time.tick_since(l0)
+				r0 := time.tick_now()
+				md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				t_frac += time.tick_since(r0)
+				t_frame += time.tick_since(f0)
+				free_all(context.temp_allocator)
+			}
+			ms :: proc(d: time.Duration, n: int) -> f64 {return time.duration_milliseconds(d) / f64(n)}
+			fmt.printfln("mdperftest: %d lines, %dx%d, S=%.0f, mean of %d frames", 1085, W, H, px_, N)
+			fmt.printfln("  md_scroll_px (one notch)   %.3f ms", ms(t_scroll, N))
+			fmt.printfln("  markdown_draw              %.3f ms", ms(t_draw, N))
+			fmt.printfln("  markdown_links             %.3f ms", ms(t_links, N))
+			fmt.printfln("  md_preview_frac            %.3f ms", ms(t_frac, N))
+			fmt.printfln("  whole scroll frame         %.3f ms", ms(t_frame, N))
+			fmt.println("mdperftest: 0 failures")
 			return true
 		}
 
