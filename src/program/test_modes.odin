@@ -4144,6 +4144,15 @@ when NEWTPAD_TESTS {
 					"[a link label deliberately long enough that greedy breaking has to carry part of it onto a second visual line](http://example.com/c)\n",
 					"\n",
 					"one two three four five six seven eight nine ten [edge](http://example.com/d) x\n",
+					"\n",
+					// Two INDENTED blocks. Without them nothing in this fixture has
+					// a non-zero block indent, so md_block_links could take its
+					// origin from the pane instead of from md_block_origin and
+					// every assertion above would still be green -- which is the
+					// exact two-producer defect the seam exists to catch, hiding
+					// behind a fixture whose indents all happen to be zero.
+					"  - [inlist](http://example.com/e) item text\n",
+					"> [inquote](http://example.com/f) quoted text\n",
 				},
 				context.temp_allocator,
 			)
@@ -4284,6 +4293,23 @@ when NEWTPAD_TESTS {
 			}
 			schk(&bad, ax >= 0 && abs(ax - cx) <= 1, fmt.tprintf("seam: the line-start link begins at the content origin (%.1f vs %.1f)", ax, cx))
 			schk(&bad, bx2 > cx + measure * 0.3, fmt.tprintf("seam: the line-end link is well down its line (%.1f, origin %.1f)", bx2, cx))
+
+			// The two INDENTED blocks: their links start at their block's own
+			// origin, which is NOT the content origin. Stated as its own assertion
+			// because the pixel checks above localise ink to a rect, and a rect
+			// and the ink can be wrong together only if both come from the same
+			// place -- which is the point, but it means "the indent is applied at
+			// all" needs saying separately.
+			ne, _ := by_url(hits, "http://example.com/e")
+			nf, _ := by_url(hits, "http://example.com/f")
+			ex, fx := f32(-1), f32(-1)
+			for hh in hits {
+				if hh.url == "http://example.com/e" {ex = hh.rect.pos.x}
+				if hh.url == "http://example.com/f" {fx = hh.rect.pos.x}
+			}
+			schk(&bad, ne == 1 && nf == 1, fmt.tprintf("seam: the list and quote links are placed (%d, %d)", ne, nf))
+			schk(&bad, ex > cx + 1, fmt.tprintf("seam: a link inside a LIST item starts at the item's indent, not the pane's (%.1f vs %.1f)", ex, cx))
+			schk(&bad, fx > cx + 1, fmt.tprintf("seam: a link inside a BLOCKQUOTE starts at the quote's inset (%.1f vs %.1f)", fx, cx))
 			return
 		}
 
