@@ -11607,8 +11607,44 @@ when NEWTPAD_TESTS {
 				}
 			}
 
+			// Task 8: the dirty-marker slot must be wide enough that the '*' clears
+			// the label -- and widening the slot must not itself move the label,
+			// which is the property the slot exists for in the first place. Two
+			// assertions that catch different things: the first already passes
+			// before the fix (the slot already stabilises the label); only the
+			// second is expected to fail.
+			tm_marker :: proc(bad: ^int) {
+				tm_chk :: proc(bad: ^int, ok: bool, label: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
+				}
+				app: App
+				defer app_destroy(&app)
+				d := new(Document)
+				d^ = doc_new()
+				d.path = strings.clone("test\\test.txt")
+				app_add(&app, d)
+				t: plat.Text
+				plat.text_load_faces(&t)
+				win: plat.Window
+				win.dpi = 96
+				win.width = 1200
+				cw := plat.text_char_width(&t, UI_SMALL_PX)
+				L := tabs_layout(&app, &win, &t, 1200)
+				clean_x := L.tabs[0].x + TAB_PAD_L + TAB_DIRTY_W
+				app.docs[L.tabs[0].slot].modified = true
+				L2 := tabs_layout(&app, &win, &t, 1200)
+				dirty_x := L2.tabs[0].x + TAB_PAD_L + TAB_DIRTY_W
+				// 1. The slot exists so the label does not move when a file becomes dirty.
+				tm_chk(bad, clean_x == dirty_x, "the label start is identical clean and dirty")
+				// 2. And the marker no longer touches it.
+				star_right := L2.tabs[0].x + TAB_PAD_L + cw
+				tm_chk(bad, dirty_x - star_right >= sx(4) - 0.5, "at least 4px between the marker and the label")
+			}
+
 			bad := ts_run()
 			tg_gap(&bad)
+			tm_marker(&bad)
 			fmt.printfln("tabseamtest: %d failures", bad)
 			return true
 		}

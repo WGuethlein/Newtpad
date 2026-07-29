@@ -20,8 +20,13 @@ TAB_MAX_W_96 :: f32(220)
 // Reserved on EVERY tab, occupied only when the document is modified. The point
 // is that it is reserved: a file becoming dirty must not move the label or its
 // truncation point.
-TAB_DIRTY_W_96 :: f32(8)
-TAB_PAD_L_96 :: f32(4) // before the dirty slot; 4 + 8 = the spec's 12 to the text
+//
+// 12, not 8: at 8 the '*' filled the slot edge to edge and butted against the
+// name -- `*version.odin` in Wyatt's screenshot. Widening the SLOT rather than
+// moving the marker keeps the stability property the slot exists for, and
+// tab_natural_w picks the new width up for free since it already sums this.
+TAB_DIRTY_W_96 :: f32(12)
+TAB_PAD_L_96 :: f32(4) // before the dirty slot; was 4 + 8 = the spec's 12 to the text, now 4 + 12 = 16 since the slot widened
 TAB_PAD_R_96 :: f32(9)
 // The pill itself, inside the 40px rail. UI spec 2.1: "tab height / radius
 // 30 / 6", and the rail is 40 -- so the pill is INSET, not flush with the rail's
