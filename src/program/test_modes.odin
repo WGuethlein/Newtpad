@@ -1196,11 +1196,17 @@ when NEWTPAD_TESTS {
 			// that hit the cap reports complete=false so the user is told to run it
 			// again rather than left believing a rename finished.
 			//
-			// This measures the worst case that bound allows -- a saturated list --
-			// and fails if it ever crosses a second, which is the difference
-			// between a stutter and an app that looks hung. The number is printed
-			// either way: it is the input to any future decision to chunk this
-			// across frames.
+			// This measures the worst MATCH COUNT that bound allows -- a saturated
+			// list -- and fails if it ever crosses a second, which is the difference
+			// between a stutter and an app that looks hung. It is NOT the worst
+			// document: this fixture is a 480 KB in-memory buffer with no bookmarks,
+			// while a multi-GB mmap-backed file gives deeper piece-tree splices, and
+			// bookmarks_shift_replace (doc.odin) is O(matches x bookmarks) -- so
+			// 100k splices against a populated bookmark list pays for iterations
+			// this run never does. The <1s guard below is a genuine O(n^2) tripwire
+			// and should stay; just don't read it as a whole-file guarantee. The
+			// number is printed either way: it is the input to any future decision
+			// to chunk this across frames.
 			{
 				src := strings.repeat("cat\n", 120_000, context.temp_allocator) // > MAX_MATCHES
 				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra6.txt", .UTF8)
@@ -1215,6 +1221,7 @@ when NEWTPAD_TESTS {
 				doc.find.field = 0
 				find_wait(&doc)
 				matches := len(doc.find.matches)
+				before_undo := len(doc.undo)
 				start := time.tick_now()
 				replaced, complete := find_replace_all(&doc)
 				ms := time.duration_milliseconds(time.tick_since(start))
@@ -1222,7 +1229,21 @@ when NEWTPAD_TESTS {
 				ra_chk(&bad, replaced == MAX_MATCHES, fmt.tprintf("all %d of them are replaced (%d)", MAX_MATCHES, replaced))
 				ra_chk(&bad, !complete, "a saturated pass reports itself INCOMPLETE, so the user is told to run it again")
 				fmt.printfln("  ---   %d replacements on the main thread: %.0f ms", replaced, ms)
-				ra_chk(&bad, ms < 1000, fmt.tprintf("the worst bounded case stays under a second (%.0f ms)", ms))
+				ra_chk(&bad, ms < 1000, fmt.tprintf("the largest splice batch measured stays under a second (%.0f ms) -- not a whole-file guarantee: see the comment above on bookmarks_shift_replace", ms))
+
+				// The count the function reports is not the buffer -- that gap is
+				// exactly what the from-the-caret sabotage exploited earlier in this
+				// file, and it went undetected until something read the document. The
+				// saturated path is the largest, most splice-heavy path in the whole
+				// feature, so it gets the same buffer-reading proof the 120-match case
+				// above got, not just the number.
+				after := doc_debug_string(&doc)
+				ra_chk(&bad, strings.count(after, "dogs") == MAX_MATCHES, fmt.tprintf("the document actually holds %d replacements, not just the returned count (%d)", MAX_MATCHES, strings.count(after, "dogs")))
+				ra_chk(&bad, len(after) == len(src)+MAX_MATCHES, fmt.tprintf("length grew by exactly one byte per replacement ('cat'->'dogs') (%d, want %d)", len(after), len(src)+MAX_MATCHES))
+				ra_chk(&bad, len(doc.undo)-before_undo == 1, fmt.tprintf("a saturated pass is still one undo entry, not %d thousand (%d)", MAX_MATCHES/1000, len(doc.undo)-before_undo))
+				doc_undo(&doc)
+				back := doc_debug_string(&doc)
+				ra_chk(&bad, back == src, fmt.tprintf("a partial (incomplete) result is still undoable in one step, byte for byte (%d bytes vs %d)", len(back), len(src)))
 			}
 
 			// The overlap/zero-length rule on its own, on inputs the scanner cannot
@@ -1387,6 +1408,31 @@ when NEWTPAD_TESTS {
 				doc.find.active = false
 				rs_chk(&bad, find_action_at(&doc, &t, 1280, px, py) == .None, "...nor is it with the find bar closed")
 				doc.find.active = true
+			}
+
+			// A read-only view (the table grid, a full Markdown Preview) takes no
+			// caret, so a press on these buttons never reaches find_action_at --
+			// ro_surface_swallows (main.odin) eats it before find_action_at is
+			// even asked. Before this fix that swallow was invisible from here:
+			// find_actions drew two live-looking, hover-filling, hand-cursored
+			// buttons in table view and Preview that did nothing when clicked.
+			// Wyatt, live use: "Ctrl+H has no ... explanation of what you're to
+			// do on this menu" -- the narrower shape of that same complaint.
+			// find_actions is the one producer of this row's geometry, so
+			// refusing there is what keeps the draw, the hover fill, the cursor
+			// and the hit-test from being four separate opinions.
+			{
+				UI_SCALE = 1
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 2, "precondition: an ordinary text view gets both buttons")
+				doc.table = true
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 0, "table view: no action boxes even with the replace row open")
+				doc.table = false
+				doc.md_mode = .Preview
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 0, "Markdown Preview: no action boxes either")
+				doc.md_mode = .Split
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 2, "...but Split's left half IS the editor, so its buttons stay live")
+				doc.md_mode = .Off
+				rs_chk(&bad, len(find_actions(&doc, &t, 1280, buf[:])) == 2, "...and back to normal once the view is text again")
 			}
 			return
 		}

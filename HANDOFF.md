@@ -318,6 +318,14 @@ were the priorities. Read P2 as the live list, with these amendments:
   new-slot map, and remaps `active`, every `mru` entry, and every in-flight `Watch_Entry.slot`
   (`watch.odin`) through it -- never a hole-fill (reusing a freed slot for the next add). A hole-fill
   is exactly the bug this entry exists because it was removed.
+- **`replace_sel_raw` (`doc.odin:2183`) does not clamp its range.** Pre-existing, shared with
+  `find_replace_current`, and out of scope for the Task 15 review that surfaced it (batch's live-pass
+  0.27.0 pass on Replace All). Until now the only caller reachable from the UI was a single-splice
+  path; making `find_replace_all` reachable from a button and a menu row means the same unclamped
+  range is now exercised up to `MAX_MATCHES` times per press instead of once, widening the blast
+  radius of any future out-of-range bug from one splice to a saturated pass's worth. Not fixed here —
+  the clamp belongs to whoever owns `replace_sel_raw`'s contract, not to the task that merely gave it
+  more callers.
 
 Ranked. P0 = fix before building more; P1 = cheap correctness/cleanliness now; P2 = deferred but
 tracked.

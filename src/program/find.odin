@@ -304,6 +304,15 @@ FIND_ACTION_MIN_LEFT_96 :: f32(150)
 // drawn?" and "is this clickable?" are the same question at every width.
 find_actions :: proc(doc: ^Document, t: ^plat.Text, winw: f32, out: []Find_Action) -> []Find_Action {
 	if doc == nil || !doc.find.active || !doc.find.replace_mode || len(out) < 2 {return out[:0]}
+	// A read-only view (table grid, full Preview) takes no caret and the mouse
+	// press never reaches find_action_at -- ro_surface_swallows eats it in
+	// main.odin. Refusing here, at the one producer of this row's geometry,
+	// means the draw, the hover fill, the hand cursor and the hit-test all
+	// agree in one change instead of four call sites separately guarding
+	// against a control that looks live and does nothing. Split is NOT
+	// included: doc_read_only_view deliberately excludes it because Split's
+	// left half is the real editor.
+	if doc_read_only_view(doc) {return out[:0]}
 	cw := plat.text_char_width(t, UI_SMALL_PX)
 	row_h := sx(FIND_BAR_H_96)
 	pad := sx(FIND_ACTION_PAD_96)
