@@ -306,6 +306,18 @@ were the priorities. Read P2 as the live list, with these amendments:
   `whole_line = false` on saturation makes the fall-through lex `[start,end)` with a `state_in`
   resolved at `lls`. Either re-lex the row's own extent for spans while keeping the cached state, or
   decide the refusal in `doc_row_lex_extent` before any state is resolved.
+- **`a.docs` can now grow without bound within a session.** `app_add` (`app.odin`) used to reuse the
+  first nil slot; it now only reclaims a *trailing* nil (see its comment) so tab display order stays
+  the order tabs were added, per Wyatt: "I don't want random order tabs, unacceptable." The cost is
+  one dead slot per middle-close/reopen cycle. Measured: 100 close/open cycles on a middle tab ->
+  `slots=104 live=4`, order still monotonic, `active` and every `mru` entry still pointing at a live
+  slot, and a restart (session save/restore) compacts back down. Carried deliberately, not fixed:
+  8 bytes per dead slot plus one skipped nil check in the ~10-15 walks over `a.docs` per frame is
+  unmeasurable at any session length a user would reach before restarting. **Constraint for whenever
+  this is compacted:** it must be a re-indexing pass that walks `a.docs`, builds an old-slot ->
+  new-slot map, and remaps `active`, every `mru` entry, and every in-flight `Watch_Entry.slot`
+  (`watch.odin`) through it -- never a hole-fill (reusing a freed slot for the next add). A hole-fill
+  is exactly the bug this entry exists because it was removed.
 
 Ranked. P0 = fix before building more; P1 = cheap correctness/cleanliness now; P2 = deferred but
 tracked.

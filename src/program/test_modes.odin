@@ -2873,13 +2873,27 @@ when NEWTPAD_TESTS {
 				to_chk(bad, to_order(&app), "a.txt|b.txt|c.txt|d.txt|", "four opens keep their order")
 				app_close(&app, 1) // b.txt, a middle tab
 				to_chk(bad, to_order(&app), "a.txt|c.txt|d.txt|", "closing the middle does not reorder the rest")
-				to_open(&app, "e.txt")
+				if !to_open(&app, "e.txt") {fmt.printfln("  (could not open %s)", "e.txt")}
 				to_chk(bad, to_order(&app), "a.txt|c.txt|d.txt|e.txt|", "a new tab appends after the last live tab")
 				session_save(&app)
 				// The one legal reorder. Asserted so the invariant is "only a drag
 				// moves a tab", not "nothing ever moves a tab" -- a proc that simply
-				// refused to reorder would pass every check above.
-				app_swap_tabs(&app, 0, 2) // the swap tabs_drag_update makes
+				// refused to reorder would pass every check above. Driven through
+				// tabs_drag_update itself (not app_swap_tabs directly), the same way
+				// tabreordertest does, so the label is true -- an explicit drag really
+				// is what runs here -- and this is the only test covering the drag
+				// path with a nil hole present (slot 1, freed above by closing
+				// b.txt, sits between the live tabs the whole time). Dragging c.txt
+				// (slot 2, display index 1) to the front produces exactly the
+				// slot-0/slot-2 swap this assertion checked before.
+				app.tab_drag_slot = 2 // c.txt's slot
+				w: plat.Window
+				w.mouse_y = 5
+				w.mouse_x = 0 // far left -> target display index 0
+				rt: plat.Text
+				plat.text_load_faces(&rt)
+				w.width = 1280
+				tabs_drag_update(&app, &w, &rt)
 				to_chk(bad, to_order(&app), "c.txt|a.txt|d.txt|e.txt|", "an explicit drag is the one thing that does reorder")
 			}
 			// PART TWO: the same rail, rebuilt from the session part one wrote.

@@ -1,8 +1,10 @@
 // Layer: program — the open-document set and tab state. Documents are heap-boxed
 // (new(Document)) so their addresses are STABLE: the index worker holds a pointer
 // into its Document, and tab/active state references slot indices, so nothing may
-// move a Document. `docs` is a slot array — a closed tab's slot goes nil and is
-// reused, never shifted, so indices stay valid. (Per the tabs decision: stable
+// move a Document. `docs` is a slot array — a closed tab's slot goes nil and STAYS
+// nil; it is never shifted, and app_add reclaims only a TRAILING nil (see its
+// comment), so a hole with a live tab to its right persists until that tab
+// closes too. Indices stay valid either way. (Per the tabs decision: stable
 // addresses, plain slot indices, no generational handles until a job re-resolves
 // a handle across a frame; see HANDOFF Decisions.)
 package main
@@ -114,7 +116,9 @@ app_swap_tabs :: proc(a: ^App, sa, sb: int) {
 	}
 }
 
-// Upper bound on watched files; matches the session's tab limit.
+// Upper bound on watched files. Independent of the session's tab limit
+// (MAX_SESSION_TABS, session.odin, currently 64) — the watcher cap is its own
+// budget, not a mirror of it.
 MAX_TABS :: 32
 
 app_active :: proc(a: ^App) -> ^Document {
