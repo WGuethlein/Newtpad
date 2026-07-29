@@ -7029,7 +7029,7 @@ when NEWTPAD_TESTS {
 			doc.cursor = n
 			doc.top = 0
 			s4 := time.tick_now()
-			doc_ensure_cursor_visible(&doc, &t, rows)
+			doc_ensure_cursor_visible(&doc, &t, rows, rows)
 			d4 := time.duration_milliseconds(time.tick_since(s4))
 
 			fmt.printfln("--- viewport ops on a %d MB single-line buffer ---", max(mbn, 1))
@@ -7379,7 +7379,7 @@ when NEWTPAD_TESTS {
 				my := row_baseline_y(px, 0) - line_height(px)*0.5
 				ld.cursor = doc_pos_at(&ld, &t, i32(mx), i32(my), px, cw, rows)
 				before := ld.h_scroll
-				doc_ensure_cursor_visible(&ld, &t, ld.view_rows)
+				doc_ensure_cursor_visible(&ld, &t, ld.view_rows, ld.view_rows)
 				if ld.h_scroll > before + ld.view_cols {
 					fmt.printfln("  FAIL: click on a long line flung h_scroll %d -> %d", before, ld.h_scroll)
 					bad += 1
@@ -10506,9 +10506,19 @@ when NEWTPAD_TESTS {
 				defer doc_close(&doc)
 				doc.kind = .Text
 				doc_update_top_inset(&doc)
+				doc.view_cols = 100
 				px := f32(16)
 				line_h := line_height(px)
 				bar := doc_bottom_bar_h(&doc)
+				// For the partial-row click check below: doc_pos_at and
+				// doc_ensure_cursor_visible both need real glyph metrics.
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("rowbudgettest: no fonts loaded")
+					bad^ += 1
+					return
+				}
+				cw := plat.text_char_width(&t, px, .Doc)
 				// A viewport whose content box is EXACTLY twenty rows tall, so
 				// every expectation below is a number this test states rather
 				// than one it recomputes from the code under test.
@@ -10542,7 +10552,34 @@ when NEWTPAD_TESTS {
 
 					rb_chk(bad, full == c.want_full, fmt.tprintf("%-20s: %d rows fit wholly (want %d)", c.what, full, c.want_full))
 					rb_chk(bad, drawn == c.want_drawn, fmt.tprintf("%-20s: %d rows are drawn (want %d)", c.what, drawn, c.want_drawn))
-					rb_chk(bad, drawn == full || drawn == full + 1, fmt.tprintf("%-20s: drawn (%d) is full (%d) or one more", c.what, drawn, full))
+
+					// A click on the partial last row (when there is one) must place the
+					// caret there WITHOUT scrolling the view -- replayed through the exact
+					// pair main.odin's frame loop calls on a press: doc_pos_at (drawn) to
+					// resolve the caret, then doc_ensure_cursor_visible (rows, drawn)
+					// because the cursor moved. Before this fix doc_ensure_cursor_visible
+					// walked only `full` rows, judged the partial row "below the viewport",
+					// and scrolled the file out from under the click -- one row per click,
+					// one row per drag frame while held.
+					if drawn > full {
+						doc.top = 0
+						doc.cursor, doc.anchor = 0, 0
+						// Just above cbot: the partial row's clickable slice runs from
+						// row_rect_y(px, drawn-1) to cbot and can be less than a whole
+						// line_h tall, so row_rect_y + line_h*0.5 would land in (or past)
+						// the status bar on a one-pixel sliver. cbot - 0.5 is always
+						// inside it and still resolves to row (drawn-1): see the
+						// drawn->clickable SEAM check below, which is this same fact.
+						my := cbot - 0.5
+						mp := doc_pos_at(&doc, &t, i32(col_x(cw, 2, 0)), i32(my), px, cw, drawn)
+						doc.cursor, doc.anchor = mp, mp
+						doc_ensure_cursor_visible(&doc, &t, full, drawn)
+						rb_chk(
+							bad,
+							doc.top == 0,
+							fmt.tprintf("%-20s: clicking the partial row (drawn row %d) leaves the view put (top 0 -> %d)", c.what, drawn - 1, doc.top),
+						)
+					}
 
 					// SEAM, drawn -> clickable. Every row the draw emits has a
 					// pixel inside the content box that hit-tests back to it.
@@ -11580,7 +11617,7 @@ when NEWTPAD_TESTS {
 					my := row_rect_y(px, r) + line_height(px) * 0.5
 					mp := doc_pos_at(&doc, &t, i32(col_x(cw, 10, 0)), i32(my), px, cw, rows)
 					doc.cursor, doc.anchor = mp, mp
-					doc_ensure_cursor_visible(&doc, &t, rows)
+					doc_ensure_cursor_visible(&doc, &t, rows, rows)
 					if doc.top != top0 {
 						moved_at, moved_to = r, doc.top
 						break

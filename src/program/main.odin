@@ -260,14 +260,20 @@ main :: proc() {
 		//
 		// `rows` is the FULLY visible count: everything that reasons about
 		// reachability takes it -- the scroll clamp, the page keys, the wheel,
-		// doc_ensure_cursor_visible, doc_filter_max_top, doc_max_hscroll -- so
-		// paging never advances by a sliver and the caret is never called
-		// "visible" while half of it is under the status bar.
+		// doc_filter_max_top, doc_max_hscroll -- so paging never advances by a
+		// sliver.
 		//
 		// `drawn` adds the partial last row, and goes to the DRAW and the
-		// HIT-TEST only. A half-visible line is on screen, so it must be
+		// HIT-TEST. A half-visible line is on screen, so it must be
 		// clickable; before this there was a full row's worth of dead space at
 		// the bottom of the viewport (Wyatt, live use). See doc_drawn_rows.
+		//
+		// doc_ensure_cursor_visible takes BOTH: `drawn` decides whether the
+		// caret already counts as on screen (it must agree with doc_pos_at, or
+		// a click on the partial row scrolls the view out from under itself --
+		// that was a live regression, not a hypothetical); `rows` still decides
+		// where the caret lands once an actual scroll is needed, so it parks on
+		// the last WHOLLY visible row rather than the partial one.
 		//
 		// The GRID view stays on `rows` for both its draw and its hit-test:
 		// table_draw has its own header/row geometry, and splitting a layout
@@ -916,7 +922,7 @@ main :: proc() {
 
 		// Keep the caret on screen only when it moved on this tab this frame.
 		if !doc.filter && app.active == active_before && doc.cursor != cursor_before {
-			doc_ensure_cursor_visible(doc, &text, rows)
+			doc_ensure_cursor_visible(doc, &text, rows, drawn)
 		}
 
 		// Window title = [*]filename - Newtpad, set only when it changes.

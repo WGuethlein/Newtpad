@@ -738,11 +738,14 @@ doc_bottom_bar_h :: proc(doc: ^Document) -> f32 {
 //
 // FULLY visible: a row that only partly fits is not counted. That is the right
 // question for every consumer reasoning about REACHABILITY -- the scroll clamp
-// (doc_scroll, doc_max_top), the page keys, doc_filter_max_top,
-// doc_ensure_cursor_visible -- and it must stay that question. See
-// doc_drawn_rows for the other one.
+// (doc_scroll, doc_max_top), the page keys, doc_filter_max_top -- and it must
+// stay that question. doc_ensure_cursor_visible takes this too, but only to
+// decide where to land the caret after an actual scroll; see its own comment
+// for why the on-screen check itself has to ask doc_drawn_rows instead. See
+// doc_drawn_rows for the other question.
 doc_visible_rows :: proc(doc: ^Document, height, line_h: f32) -> int {
-	return max(0, int((height - CONTENT_TOP - TOP_INSET - doc_bottom_bar_h(doc)) / line_h))
+	top, bot := doc_content_box(doc, height)
+	return max(0, int((bot - top) / line_h))
 }
 
 // The content box the document draws into: everything between the chrome (plus
@@ -3189,6 +3192,15 @@ HSCROLL_PAD :: 3
 // to the visible rows, never the whole file, so it costs about what a frame's
 // draw does. 0 while wrapping/filtering (no horizontal scroll there).
 //
+// Takes `rows` (doc_visible_rows), not the partial-row-inclusive `drawn`
+// (doc_drawn_rows): if the partial last row happens to hold the widest line
+// on screen, its tail is one h-scroll step out of reach. That is a real, small
+// inconsistency, not a hazard, and it is not needed for agreement with the
+// bar's other two readers (hscroll_model at main.odin:561 and :1446) -- both
+// just read whatever this returns, so they would still agree with each other
+// if this scanned `drawn` instead. The reason to leave it on `rows` is only
+// that the sliver is not worth the extra row's scan.
+//
 // Capped at VISIBLE_COLS because that is all doc_draw renders of a line — without
 // the cap the bar ran far past the drawn text into blank space on a long line
 // (a minified JSON, a long log/CSV row), since the width was measured up to the
@@ -3227,8 +3239,17 @@ doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta, rows: int) {
 	doc.top = min(doc.top, doc_max_top(doc, t, rows))
 }
 
-// Keep the caret on screen: scroll so its visual row is within [top, top+rows).
-doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
+// Keep the caret on screen: scroll so its visual row is within [top, top+drawn).
+//
+// `drawn` (doc_drawn_rows), not `rows` (doc_visible_rows), decides whether the
+// caret already counts as on screen: doc_pos_at hit-tests against `drawn`
+// too, since a half-visible last row is clickable. Judging the same row
+// "below the viewport" here scrolled the file out from under a click or drag
+// landing on that row -- one line per click, one line per drag frame. `rows`
+// still decides WHERE to land after an actual scroll (below): the caret is
+// parked on the last WHOLLY visible row, not the partial one, so the very
+// next move down doesn't have to scroll again immediately.
+doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows, drawn: int) {
 	// Horizontal follow first (plain view only; wrap/filter have no h-scroll):
 	// keep the caret's column inside [h_scroll, h_scroll+view_cols) so typing or
 	// arrowing off the right edge pans instead of hiding the caret.
@@ -3258,15 +3279,18 @@ doc_ensure_cursor_visible :: proc(doc: ^Document, t: ^plat.Text, rows: int) {
 		doc.top = cls
 		return
 	}
-	// walk `rows` visual rows from top; if we pass the caret's row, it's visible
+	// walk `drawn` visual rows from top; if we pass the caret's row, it's on
+	// screen (see doc_pos_at, which hit-tests the same budget)
 	p := doc.top
-	for _ in 0 ..< rows {
+	for _ in 0 ..< drawn {
 		if p >= cls {return}
 		np, more := eff_next_row(doc, t, p, doc.view_cols)
 		if !more {break}
 		p = np
 	}
-	// caret is below the viewport: put its row at the bottom
+	// caret is below the viewport: put its row at the bottom of the WHOLLY
+	// visible rows (rows, not drawn) -- landing it on the partial row would
+	// leave the very next down-move needing to scroll again right away
 	doc.top = cls
 	doc_scroll(doc, t, -(rows - 1), rows)
 }
