@@ -4451,6 +4451,39 @@ when NEWTPAD_TESTS {
 			)
 			b7, _ := pass(&h, &doc, px_, x0, x1, ytop, ybot)
 			cchk(&bad, b7 == 0, fmt.tprintf("cache: ...and the pass after it is warm again (%d)", b7))
+
+			// --- viewport-first, against the one input the fit test cannot see ---
+			//
+			// A Blank block has zero height, so md_block_fits never stops one. A
+			// document that is nothing but empty lines is therefore a chain of
+			// them, each doing a bounded forward line walk. Without
+			// MD_MAX_EMPTY_BLOCKS the walk is MD_MAX_BLOCKS * MD_BLANK_RUN_MAX
+			// capped line reads on the UI thread, up to three times a frame.
+			//
+			// Asserted on BUILDS rather than on wall-clock: a timing bound would
+			// be a flaky assertion about this machine, and the build count is what
+			// "how much of the document did this pass touch" actually is.
+			{
+				blanks := make([]u8, 20000)
+				for i in 0 ..< len(blanks) {blanks[i] = '\n'}
+				bdoc := doc_from_content(blanks, "blank.md", .UTF8)
+				defer doc_close(&bdoc)
+				before := md_layout_builds
+				bb, bbot := pass(&h, &bdoc, px_, x0, x1, ytop, ybot)
+				cchk(
+					&bad, bb <= MD_MAX_EMPTY_BLOCKS + 2,
+					fmt.tprintf("viewport-first: 20000 blank lines lay out %d blocks, not the document (cap %d)", bb, MD_MAX_EMPTY_BLOCKS),
+				)
+				// ...and it is not vacuous the other way: the pass has to have
+				// COLLAPSED the run, or 20000 lines would be 20000 blocks and the
+				// bound above would be the only thing standing between the UI
+				// thread and the whole file.
+				cchk(
+					&bad, bbot > MD_MAX_EMPTY_BLOCKS * 2 && bbot < len(blanks),
+					fmt.tprintf("viewport-first: ...having collapsed the run (reached byte %d of %d in %d blocks)", bbot, len(blanks), bb),
+				)
+				_ = before
+			}
 			return
 		}
 

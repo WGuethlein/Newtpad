@@ -1630,6 +1630,22 @@ MD_BLANK_RUN_MAX :: 64
 // This is the belt to that braces.
 MD_MAX_BLOCKS :: 512
 
+// Zero-height blocks admitted in one pass.
+//
+// The fit test cannot stop a block that costs nothing, and blank runs only
+// alternate with content while every run FITS in one block. A file that is
+// nothing but empty lines produces a CHAIN of Blank blocks, each capped at
+// MD_BLANK_RUN_MAX and each costing a bounded forward line walk -- so without
+// this the worst case is MD_MAX_BLOCKS * MD_BLANK_RUN_MAX = 32k capped line
+// reads on the UI thread, up to three times a frame while Ctrl is held. 64 * 64
+// = 4096 is the same order as MD_TABLE_MAX_ROWS and covers any real document:
+// content is what fills a pane, and content is not free.
+//
+// Stopping early only under-reports `bottom`, which makes the scrollbar thumb
+// conservative over a region that has nothing to show. It cannot lose content:
+// reaching this cap means the pane below the last drawn block is empty.
+MD_MAX_EMPTY_BLOCKS :: 64
+
 // Layouts BUILT since the process started. Test-visible on purpose: "a second
 // layout at the same width does no work" is not observable from the result --
 // a correct cache and no cache at all return the same glyphs -- so the only
@@ -2160,7 +2176,8 @@ md_pass :: proc(
 	// user setting), and "no frame ever shows emptiness" outranks a heading whose
 	// bottom edge the cover strip trims. Spent once.
 	forced := true
-	for nblk := 0; p <= doc.pt.length && nblk < MD_MAX_BLOCKS; nblk += 1 {
+	empties := 0
+	for nblk := 0; p <= doc.pt.length && nblk < MD_MAX_BLOCKS && empties < MD_MAX_EMPTY_BLOCKS; nblk += 1 {
 		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
 		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
 		if n > 0 && buf[n - 1] == '\r' {n -= 1}
@@ -2174,6 +2191,9 @@ md_pass :: proc(
 		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, lay, cx, x1, y)}
 		if links != nil {md_block_links(doc, lay, cx, y, links)}
 		y += lay.h
+		// See MD_MAX_EMPTY_BLOCKS: a zero-height block is invisible to the fit
+		// test above, so it needs a bound of its own.
+		empties = empties + 1 if lay.h <= 0 else empties
 		prev_below = lay.below
 		bottom = lay.end
 		in_fence, fence_lex, fence_state = lay.out_fence, lay.out_lex, lay.out_state
