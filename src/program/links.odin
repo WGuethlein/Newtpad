@@ -14,6 +14,16 @@
 //     may have been written by anyone. A text-ish file opens in a tab, anything
 //     else is revealed in Explorer, and only whitelisted URL schemes reach the
 //     browser.
+//  3. **Never stat a non-local target.** Same threat model as (2), different
+//     weapon: `GetFileAttributesW` on an unreachable UNC host blocks the caller
+//     for the redirector timeout (>100 s measured), and the caller here is the
+//     UI thread. link_resolve refuses UNC and non-fixed drives outright, so
+//     `\\deadhost\share\out.log` in a build log costs nothing. See
+//     plat.path_is_local and OWED below.
+//
+// OWED (HANDOFF): resolving non-local targets needs an async resolver — a worker
+// that stats off-thread and feeds answers back into link_cache, the same shape
+// watch.odin already uses. Until it exists, a UNC or mapped-drive link is text.
 package main
 
 import "core:fmt"
@@ -425,14 +435,24 @@ LINK_RESOLVE_BUDGET :: 256
 
 // Why links_layout can afford to resolve at all.
 //
-// link_resolve stats the target (plat.path_exists -> GetFileAttributesW), and a
-// stat on a UNC or a mapped network drive can block the calling thread -- which
-// here is the thread that builds the UI. links_layout runs up to three times in
-// one frame (the hover cursor, the Ctrl+click test, the draw), and with the
-// Show-links setting on "always" it runs every frame whether or not Ctrl is
-// held. Without a cache the gate would pay for every one of those.
+// link_resolve stats the target (plat.path_exists -> GetFileAttributesW). That
+// call has no timeout, and on a UNC or mapped-drive target it can block the
+// calling thread for minutes -- which here is the thread that builds the UI.
+// links_layout runs up to three times in one frame (the hover cursor, the
+// Ctrl+click test, the draw), it runs every frame while Ctrl is merely HELD (so
+// Ctrl+S is enough), and with the Show-links setting on "always" it runs every
+// frame with no gesture at all. doc.top is part of the generation below, so every
+// scroll step is a fresh generation that re-stats the screen.
 //
-// Four properties, each load-bearing:
+// Two things make that affordable, and they are not interchangeable:
+//
+//   - link_resolve refuses non-local targets WITHOUT a syscall
+//     (plat.path_is_local), which is what bounds the worst case in TIME. The
+//     budget below bounds a count; a count is no defence when one call is
+//     unbounded.
+//   - this cache bounds how often the local ones are paid for.
+//
+// Four properties of the cache, each load-bearing:
 //
 //   1. It is filled ONLY from links_layout's own row walk, which is
 //      visible_begin/visible_next -- the viewport and nothing else. There is no
@@ -453,6 +473,12 @@ LINK_RESOLVE_BUDGET :: 256
 //
 // Keys are cloned into the ordinary allocator and freed on reset: the tokens
 // they are cloned from point into frame-arena text that is gone next frame.
+//
+// The key is the token ALONE, not (token, kind), and that is safe only because
+// has_uri_scheme keeps a URL-shaped token off the .Path branch (see its comment).
+// So no two Links with the same token text can ever have kinds that link_resolve
+// answers differently. Loosen has_uri_scheme and this key becomes wrong: add
+// `kind` to it in the same change.
 @(private = "file")
 Link_Cache :: struct {
 	doc:      rawptr, // identity only, never dereferenced
@@ -499,9 +525,12 @@ link_cache_sync :: proc(doc: ^Document) {
 
 // Would this candidate actually open? The gate links_layout gives every hit
 // before it is allowed on screen.
+//
+// There is no `target_len <= 0` guard here: split_line_ref returns len(s) or a
+// colon index >= 2 on every path, so every Link links_scan emits has target_len
+// >= 2. A check that cannot fire is a check nobody maintains.
 @(private = "file")
 link_gate :: proc(doc: ^Document, text: string, l: Link) -> bool {
-	if l.target_len <= 0 {return false}
 	raw := text[l.start:l.start + l.target_len]
 	if v, hit := link_cache.entries[raw]; hit {return v}
 	if link_cache.budget <= 0 {return false}
@@ -718,12 +747,37 @@ Link_Target :: struct {
 	is_url: bool,
 }
 
+// Every stat link resolution has performed, for the tests. The claim "a non-local
+// target is never stat'd" cannot be checked by looking at the answer -- a dead
+// UNC and a refused UNC both come back `false` -- so the call itself is counted.
+// Incremented immediately before each plat.path_exists below and nowhere else.
+link_stat_count: int
+
+// Stat a resolved absolute path, or refuse it because reaching the filesystem
+// for it could block this thread for minutes. The single door: every stat on the
+// resolution path goes through here, so the guard cannot be forgotten by one
+// branch. See plat.path_is_local and rule 3 in this file's header.
+@(private = "file")
+link_stat :: proc(abs: string) -> (exists, is_dir: bool) {
+	if !plat.path_is_local(abs) {return false, false}
+	link_stat_count += 1
+	return plat.path_exists(abs)
+}
+
 // Resolve a link against the document that contains it.
 //
 // Relative paths are anchored to the open document's folder and nothing else:
 // never the process CWD (which is wherever Explorer launched us), never PATH,
 // never a walk up through parents. An untitled buffer has no anchor, so
 // relative links simply do not resolve there.
+//
+// A target that is not on a local fixed volume does not resolve, full stop --
+// which also means links_layout never decorates one. Of the two ways to keep the
+// UI thread off a network stat, refusing to decorate is the one that stays
+// refused: decorating optimistically would just move the multi-minute block from
+// the frame that draws the underline to the click that follows it. The cost is
+// real and is recorded as owed at the top of this file: `\\server\share\x.log`
+// and `smb://server/share/x` are plain text until the async resolver exists.
 link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, ok: bool) {
 	raw := text[l.start:l.start + l.target_len]
 	if l.kind == .URL {
@@ -737,7 +791,8 @@ link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, 
 	if is_smb_url(raw) {
 		body, _ := strings.replace_all(raw[6:], "/", "\\", context.temp_allocator)
 		abs := strings.concatenate({"\\\\", body}, context.temp_allocator)
-		if exists, _ := plat.path_exists(abs); !exists {return {}, false}
+		// Always UNC by construction, so link_stat always refuses it today.
+		if exists, _ := link_stat(abs); !exists {return {}, false}
 		return Link_Target{path = abs, line = l.line, col = l.col}, true
 	}
 
@@ -764,8 +819,10 @@ link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, 
 		abs = strings.concatenate({dir, "\\", rel}, context.temp_allocator)
 	}
 
-	exists, _ := plat.path_exists(abs)
-	if !exists {return {}, false} // a broken link reaches no handler
+	exists, _ := link_stat(abs)
+	// A broken link reaches no handler -- and so does a non-local one, which
+	// link_stat declined to look at rather than blocking the UI thread on.
+	if !exists {return {}, false}
 	return Link_Target{path = abs, line = l.line, col = l.col}, true
 }
 
@@ -784,6 +841,13 @@ link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, 
 // between the frame that drew the underline and the click -- but the table view
 // and the keyboard command have no such gate in front of them at all, so for
 // them this is the only thing standing between a dead target and silence.
+//
+// A non-local target (UNC, mapped drive) now lands in that same failure branch,
+// deliberately: link_resolve refuses it without a syscall, so what the user gets
+// is "Could not resolve" immediately instead of a frozen editor for the length of
+// the SMB timeout. It is still reachable here — the table view and the Open Link
+// command are not gated on decoration — which is exactly why the refusal lives in
+// link_resolve rather than in links_layout's gate.
 link_follow :: proc(app: ^App, t: ^plat.Text, w: ^plat.Window, doc: ^Document, text: string, l: Link) {
 	if tgt, rok := link_resolve(doc, text, l); rok {
 		if !link_activate(app, t, tgt) {
@@ -806,6 +870,8 @@ link_activate :: proc(app: ^App, txt: ^plat.Text, t: Link_Target) -> bool {
 	if t.is_url {
 		return plat.shell_open_url(t.url)
 	}
+	// Safe to stat directly: t.path only ever comes from a successful
+	// link_resolve, which means it already passed link_stat's local-volume guard.
 	_, is_dir := plat.path_exists(t.path)
 	if is_dir || !link_is_text_ext(t.path) {
 		return plat.shell_reveal(t.path)

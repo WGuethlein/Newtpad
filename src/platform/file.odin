@@ -22,17 +22,73 @@ REPLACEFILE_IGNORE_MERGE_ERRORS :: win.DWORD(0x2)
 
 FILE_MMAP_THRESHOLD :: 16 * 1024 * 1024 // copy below, mmap above
 
+// Volume type per drive letter, answered once and kept for the process lifetime.
+//
+// GetDriveTypeW reads the local mount table -- it does not contact the volume, so
+// even a disconnected mapped drive answers promptly -- but this predicate now sits
+// on the per-frame link gate, whose entire purpose is that no filesystem call with
+// an unbounded wait may run on the UI thread. A 26-entry table removes the
+// question rather than arguing it, and removes a temp allocation and a syscall
+// from every frame besides. The trade is that re-mapping a letter to a different
+// KIND of volume mid-session is not noticed until restart; letters get re-mapped,
+// but a letter changing from removable to fixed does not happen in practice.
+//
+// 0 is DRIVE_UNKNOWN, which is also the zero value, so an unknown answer is simply
+// re-asked. It is not DRIVE_FIXED either way.
+@(private = "file")
+drive_type_cache: [26]u32
+
+@(private = "file")
+drive_type_of :: proc(letter: u8) -> u32 {
+	up := letter
+	if up >= 'a' && up <= 'z' {up -= 32}
+	if up < 'A' || up > 'Z' {return 0}
+	i := int(up - 'A')
+	if drive_type_cache[i] == 0 {
+		// No wide_path here: the argument is the three-character volume root, which
+		// can never approach MAX_PATH, and GetDriveTypeW wants a plain root anyway.
+		root := [4]u16{u16(up), u16(':'), u16('\\'), 0} // "C:\"
+		drive_type_cache[i] = GetDriveTypeW(win.wstring(raw_data(root[:])))
+	}
+	return drive_type_cache[i]
+}
+
 // mmap only on a local fixed drive. Drive-letter paths are checked by volume
 // type; UNC / relative paths are treated as non-fixed (copy, crash-safe).
 @(private = "file")
 drive_is_fixed :: proc(path: string) -> bool {
 	if len(path) >= 3 && path[1] == ':' {
-		// No wide_path here: the argument is the three-character volume root, which
-		// can never approach MAX_PATH, and GetDriveTypeW wants a plain root anyway.
-		root := win.utf8_to_wstring(path[:3], context.temp_allocator) // "C:\"
-		return GetDriveTypeW(root) == DRIVE_FIXED
+		return drive_type_of(path[0]) == DRIVE_FIXED
 	}
 	return false
+}
+
+// May this path be stat'd from the UI thread?
+//
+// GetFileAttributesW has no timeout. A stat of a path on an unreachable UNC host
+// does not return until the SMB redirector gives up -- measured at over 100
+// seconds for a single call on this machine -- and the thread that asked is stuck
+// for the duration. watch.odin's header states the rule this enforces: "The main
+// thread must never block on the filesystem." Anything on the frame path that
+// wants to stat must ask here first and treat `false` as "the answer is no",
+// because the alternative is a content-triggered freeze: a UNC path in a pasted
+// stack trace or a downloaded build log is attacker-controllable text.
+//
+// Only a lettered FIXED volume qualifies. A UNC path is refused without asking
+// Windows anything at all -- there is no local answer for `\\host\share`, and
+// obtaining one is precisely the call being avoided -- and so is a letter whose
+// volume is remote, removable or optical. A relative path is refused too: it has
+// no volume to judge, and callers here deal in resolved absolute paths.
+path_is_local :: proc(path: string) -> bool {
+	p := path
+	// `\\?\C:\...` and `\\?\UNC\host\...` are a local drive and a UNC wearing the
+	// extended-length prefix. Judge what is underneath, not the prefix.
+	if len(p) >= 4 && p[0] == '\\' && p[1] == '\\' && (p[2] == '?' || p[2] == '.') && p[3] == '\\' {
+		p = p[4:]
+		if len(p) >= 4 && strings.equal_fold(p[:4], "UNC\\") {return false}
+	}
+	if len(p) >= 2 && (p[0] == '\\' || p[0] == '/') && (p[1] == '\\' || p[1] == '/') {return false}
+	return drive_is_fixed(p)
 }
 
 File_View :: struct {

@@ -7303,6 +7303,144 @@ when NEWTPAD_TESTS {
 				lk_chk(bad, n == 0, fmt.tprintf("a cached hit does not leak across anchors (%d hits)", n))
 			}
 
+			// ...and here is the same claim tested where it can actually fail.
+			//
+			// The proc above cannot see the anchor term at all: its second document is
+			// a fresh stack local, so `link_cache.doc == rawptr(doc)` already differs
+			// and the generation resets on the pointer no matter what the anchor
+			// comparison says. Deleting `link_cache.anchor == doc.path` from
+			// link_cache_sync leaves it at 0 failures — a test that cannot fail.
+			//
+			// The hazard's real shape is Save As: the SAME Document object, same
+			// revision, same top, doc.path re-pointed. Every other term of the
+			// generation matches, so the anchor is the only thing that can invalidate
+			// the cache, and a `true` cached against the old folder leaks to the new
+			// one where that relative link resolves to nothing. Sabotage the anchor
+			// term and this prints after_reanchor=1.
+			lk_cache_anchor_same_doc :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				sub := fmt.tprintf("%s\\newtpad_lk_sub", dir)
+				os.make_directory(sub)
+				plat.file_write_atomic(fmt.tprintf("%s\\newtpad_lk_sv.txt", dir), transmute([]u8)string("here"))
+				plat.file_delete(fmt.tprintf("%s\\newtpad_lk_sv.txt", sub)) // NOT beside the new anchor
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				d := doc_from_content(
+					transmute([]u8)strings.clone("see ./newtpad_lk_sv.txt now\n"),
+					fmt.tprintf("%s\\newtpad_lk_anchor.txt", dir),
+					.UTF8,
+				)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 200
+				d.view_rows = 10
+				before := len(links_layout(&d, &tt, 10))
+				// Save As, exactly: nothing moves but doc.path. doc_from_content owns
+				// the old string (path_owned), so it is freed rather than leaked.
+				old := d.path
+				d.path = strings.clone(fmt.tprintf("%s\\newtpad_lk_anchor.txt", sub))
+				delete(old)
+				after := len(links_layout(&d, &tt, 10))
+				lk_chk(
+					bad,
+					before == 1 && after == 0,
+					fmt.tprintf("re-anchoring one document drops the cache (before=%d after_reanchor=%d)", before, after),
+				)
+			}
+
+			// The UI thread must never stat a target it cannot reach quickly.
+			//
+			// GetFileAttributesW has no timeout. A single stat of a path on an
+			// unreachable UNC host was measured here at over 100 seconds, and
+			// links_layout runs every frame Ctrl is merely HELD (Ctrl+S is enough) and
+			// every frame unconditionally when Show-links is on "always" — so one
+			// `\\deadhost\share\out.log` in a build log froze the editor for minutes
+			// with the unsaved buffer held hostage, with no click involved. The text is
+			// untrusted, so that is a denial of service, not an edge case.
+			//
+			// What is asserted is the DECISION, not the stall: the guard keys on the
+			// shape of the path, so reachable fixtures exercise the identical branch.
+			// Sabotage by dropping the plat.path_is_local check from link_stat
+			// (links.odin) and the stat count goes from 1 to 4.
+			lk_non_local_never_stats :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				plat.file_write_atomic(fmt.tprintf("%s\\newtpad_lk_real.txt", dir), transmute([]u8)string("real"))
+
+				// The predicate itself, on shapes rather than on this machine's volumes.
+				lk_chk(bad, !plat.path_is_local("\\\\host\\share\\x.log"), "UNC is not local")
+				lk_chk(bad, !plat.path_is_local("\\\\?\\UNC\\host\\share\\x.log"), "extended-prefix UNC is not local")
+				lk_chk(bad, !plat.path_is_local("sub\\x.log"), "a relative path has no volume to judge")
+				lk_chk(
+					bad,
+					plat.path_is_local("C:\\Windows\\notepad.exe") == plat.path_is_local("\\\\?\\C:\\Windows\\notepad.exe"),
+					"the extended prefix does not change a drive's answer",
+				)
+
+				// A lettered drive that is not a fixed volume. An unmapped letter reads
+				// as DRIVE_NO_ROOT_DIR, which is the same not-fixed branch a mapped
+				// network drive takes, and unlike one it exists on every machine.
+				nonfixed := ""
+				for c := u8('Z'); c >= 'A'; c -= 1 {
+					p := fmt.tprintf("%c:\\newtpad_lk_nonfixed.txt", rune(c))
+					if !plat.path_is_local(p) {
+						nonfixed = p
+						break
+					}
+				}
+				lk_chk(bad, nonfixed != "", "found a non-fixed drive letter to test with")
+				if nonfixed == "" {return}
+
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				// A loopback share that does not exist, so a SABOTAGED build fails fast
+				// here rather than hanging this suite for the redirector timeout. The
+				// guard never looks at the host, only at the leading `\\`.
+				body := fmt.tprintf(
+					"unc \\\\localhost\\newtpad_no_such_share_zz\\out.log and drive %s and smb://localhost/newtpad_no_such_share_zz/x.log and ./newtpad_lk_real.txt\n",
+					nonfixed,
+				)
+				d := doc_from_content(
+					transmute([]u8)strings.clone(body),
+					fmt.tprintf("%s\\newtpad_lk_anchor.txt", dir),
+					.UTF8,
+				)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 400
+				d.view_rows = 10
+				link_stat_count = 0
+				hits := links_layout(&d, &tt, 10)
+				stats := link_stat_count
+				kept := ""
+				if len(hits) == 1 {
+					kept = hits[0].text[hits[0].link.start:hits[0].link.start + hits[0].link.target_len]
+				}
+				lk_chk(
+					bad,
+					kept == "./newtpad_lk_real.txt",
+					fmt.tprintf("only the local target is decorated (%d hits, kept %q)", len(hits), kept),
+				)
+				lk_chk(bad, stats == 1, fmt.tprintf("only the local target was stat'd (%d stats, want 1)", stats))
+
+				// ...and the click path, which is not gated on decoration: the palette
+				// command and the table view both reach link_follow -> link_resolve
+				// directly. It must refuse without touching the filesystem, so the user
+				// gets "Could not resolve" now instead of a frozen editor later.
+				unc := "\\\\localhost\\newtpad_no_such_share_zz\\out.log"
+				ul := links_scan(unc)
+				if len(ul) != 1 {
+					lk_chk(bad, false, fmt.tprintf("the UNC fixture scans as one link (got %d)", len(ul)))
+					return
+				}
+				link_stat_count = 0
+				_, rok := link_resolve(&d, unc, ul[0])
+				lk_chk(
+					bad,
+					!rok && link_stat_count == 0,
+					fmt.tprintf("link_resolve refuses a UNC target without a stat (ok=%v stats=%d)", rok, link_stat_count),
+				)
+			}
+
 			fmt.println("--- a bare separator is not a path ---")
 			lk_false_positives(&bad)
 			fmt.println("--- underlined implies openable ---")
@@ -7310,6 +7448,9 @@ when NEWTPAD_TESTS {
 			fmt.println("--- the resolution cache ---")
 			lk_cache_invalidation(&bad)
 			lk_cache_anchor(&bad)
+			lk_cache_anchor_same_doc(&bad)
+			fmt.println("--- a non-local target is never stat'd on the UI thread ---")
+			lk_non_local_never_stats(&bad)
 
 			fmt.printfln("linktest: %d failures", bad)
 			return true
