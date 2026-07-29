@@ -5670,6 +5670,248 @@ when NEWTPAD_TESTS {
 			return
 		}
 
+		// Four properties the batch shipped with no test at all: each was sabotaged
+		// and the whole suite returned 0 failures, and each produces something
+		// visibly wrong. Grouped here rather than folded into the sections above
+		// because they have nothing to do with each other -- what they share is
+		// that nothing was watching them.
+		md_prop_selftest :: proc() -> (bad: int) {
+			pchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1400, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/prop") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(20)
+			winw, winh := f32(W), f32(H)
+			mk :: proc(s: string, name: string) -> Document {
+				content := make([]u8, len(s))
+				copy(content, s)
+				return doc_from_content(content, name, .UTF8)
+			}
+
+			// --- (1) the 72ch measure is a COLUMN, so an indent eats into it ------
+			//
+			// 9.3 caps the measure at 72ch. A list, a quote and a fenced block draw
+			// at cx + indent, so the width they may break to is measure - indent; if
+			// they break to `measure` instead, every one of them runs its own indent
+			// PAST the column that the paragraphs around it respect -- ragged right
+			// edges that step outward with nesting depth, in a pane wide enough that
+			// nothing clips it.
+			//
+			// Asserted on Shaped.width, which is the widest line's advance width and
+			// documented to satisfy width <= max_width for a run that broke
+			// correctly. Read off the cached entries, so this is the number the block
+			// was actually laid out with. Single-letter words, so the greedy break
+			// lands within ~one narrow word of the limit and a 12px fence indent is
+			// still visible in the result.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				words := strings.repeat("a b c d e f g h i j k l m n o p q r s t u v w x y z ", 6, context.temp_allocator)
+				fmt.sbprintf(&b, "%s\n\n", words) // a paragraph: indent 0, the control
+				fmt.sbprintf(&b, "- %s\n", words) // list level 1
+				fmt.sbprintf(&b, "  - %s\n\n", words) // list level 2
+				fmt.sbprintf(&b, "> %s\n", words) // quote level 1
+				fmt.sbprintf(&b, ">> %s\n\n", words) // quote level 2
+				strings.write_string(&b, "```json\n")
+				for _ in 0 ..< 4 {fmt.sbprintf(&b, "%s\n", words)}
+				strings.write_string(&b, "```\n")
+				doc := mk(strings.to_string(b), "indent.md")
+				defer doc_close(&doc)
+				doc.md_mode = .Preview
+				x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, winw, winh, 0.5)
+				pchk(&bad, box_ok, "indent: the fixture has a preview pane")
+				m := md_metrics(&h.text, px_)
+				cx, meas := md_content_span(&m, x0, x1)
+				// The cap must BIND, or every bound below is the pane's and the
+				// property is untestable on this fixture.
+				pchk(&bad, meas == m.measure && x1 - cx > m.measure + sx(100), fmt.tprintf("indent: the 72ch cap binds with room to spare (%.0f of %.0fpx)", meas, x1 - cx))
+
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				over, filled, kinds := 0, 0, 0
+				worst := ""
+				seen_list, seen_quote, seen_fence := false, false, false
+				for &e in doc.md_layout {
+					if !e.valid || e.indent <= 0 || e.sh.lines == 0 {continue}
+					kinds += 1
+					limit := e.measure - e.indent
+					if e.sh.width > limit + 0.5 {
+						over += 1
+						if len(worst) == 0 {worst = fmt.tprintf("%v indent %.0f wrapped to %.1f of %.1f", e.cls.kind, e.indent, e.sh.width, limit)}
+					}
+					// ...and it really did fill its column, or the bound above is
+					// satisfied by any short line.
+					if e.sh.width > limit * 0.75 {filled += 1}
+					switch e.cls.kind {
+					case .List:
+						seen_list = true
+					case .Quote:
+						seen_quote = true
+					case .Fence_Body:
+						seen_fence = true
+					case .Para, .Heading, .Rule, .Blank, .Table, .Fence_Open, .Fence_Close, .Front_Matter:
+					}
+				}
+				pchk(&bad, seen_list && seen_quote && seen_fence, fmt.tprintf("indent: the fixture produced indented list, quote AND fence-body blocks (%v/%v/%v of %d indented)", seen_list, seen_quote, seen_fence, kinds))
+				pchk(&bad, filled >= 5, fmt.tprintf("indent: ...and they really do fill their columns (%d of %d at over three quarters)", filled, kinds))
+				pchk(&bad, over == 0, fmt.tprintf("indent: every indented block breaks to measure MINUS its indent (%d overflow; %s)", over, worst))
+			}
+
+			// --- (2) md_preview_clip, the cover strip -----------------------------
+			//
+			// A pixel offset means the anchor block is routinely drawn PARTIALLY
+			// above the pane, and there is no scissor rect in this renderer -- so the
+			// preview owes its own pane a strip over [0, ytop) exactly as it already
+			// owes one below ybot. Without it the top of the anchor block paints
+			// across the tab rail, on every scroll, at every position that is not a
+			// block boundary.
+			//
+			// Net-new with the pixel anchor: under the byte anchor nothing could sit
+			// above ytop at all, which is why nothing was watching for it.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< 30 {fmt.sbprintf(&b, "# Heading %02d with a good long title on it\n\n", i)}
+				doc := mk(strings.to_string(b), "clip.md")
+				defer doc_close(&doc)
+				doc.md_mode = .Preview
+				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
+				pchk(&bad, ytop > 4, fmt.tprintf("clip: the pane's top edge leaves a strip to cover (ytop %.0f)", ytop))
+				// Scrolled well into the first block, so its glyphs genuinely start
+				// above ytop.
+				at := Md_Anchor{0, 24}
+				// The ink above ytop in the pane's own columns.
+				above :: proc(pix: []u8, x0, x1, ytop: f32) -> (n: int) {
+					bg := g_theme[.Bg_Base]
+					for y in 0 ..< int(ytop) {
+						for x in max(0, int(x0)) ..< min(W, int(x1)) {
+							i := (y * W + x) * 4
+							d := abs(int(pix[i]) - int(bg[2] * 255)) + abs(int(pix[i + 1]) - int(bg[1] * 255)) + abs(int(pix[i + 2]) - int(bg[0] * 255))
+							if d > 24 {n += 1}
+						}
+					}
+					return
+				}
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				raw, ok1 := plat.gfx_readback_bgra(&h.gfx, context.allocator)
+				defer if ok1 {delete(raw)}
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				md_preview_clip(&h.gfx, &h.quads, &doc, winw, winh, 0.5)
+				covered, ok2 := plat.gfx_readback_bgra(&h.gfx, context.allocator)
+				defer if ok2 {delete(covered)}
+				pchk(&bad, ok1 && ok2, "clip: both readbacks succeeded")
+				if ok1 && ok2 {
+					// Non-vacuity FIRST: the content pass really does paint above the
+					// pane at this anchor. Without this the row below is satisfied by
+					// a draw that never overflowed, and the strip is then untested
+					// however green the suite looks.
+					spill := above(raw, x0, x1, ytop)
+					pchk(&bad, spill > 50, fmt.tprintf("clip: the content pass alone paints above the pane at px=24 (%d pixels)", spill))
+					pchk(&bad, above(covered, x0, x1, ytop) == 0, fmt.tprintf("clip: ...and md_preview_clip leaves none of it (%d pixels)", above(covered, x0, x1, ytop)))
+				}
+			}
+
+			// --- (3) md_pane_owns' LEFT bound -------------------------------------
+			//
+			// The dispatch is by PANE, not by mode: in Split both models are on
+			// screen and the editor pass draws full-window width, so an editor link
+			// hit is only meaningful left of the divider. Drop the left bound and the
+			// wheel, the hand cursor and the Ctrl+click all route Split's EDITOR half
+			// to the preview -- scrolling the wrong pane, and hit-testing the
+			// preview's link rects against a press in the editor's text.
+			{
+				doc := mk("para with [a link](https://e.test/p) on it\n", "owns.md")
+				defer doc_close(&doc)
+				doc.md_mode = .Split
+				ed_right := doc_editor_right(&doc, winw, 0.5)
+				x0, _, _, _, box_ok := md_pane_box(&doc, winw, winh, 0.5)
+				pchk(&bad, box_ok && ed_right > sx(200) && ed_right < winw - sx(200), fmt.tprintf("owns: the divider is well inside the window (%.0f of %.0f)", ed_right, winw))
+				// The bound is the PANE's left edge, which is x0 - TEXT_MARGIN_X --
+				// stated here so the check is against md_pane_box's own answer and
+				// not against a second derivation of the divider.
+				left := x0 - TEXT_MARGIN_X
+				pchk(&bad, abs(left - ed_right) < 0.01, fmt.tprintf("owns: ...and the pane's left edge IS the divider (%.1f vs %.1f)", left, ed_right))
+				pchk(&bad, !md_pane_owns(&doc, winw, winh, 0.5, 8), "owns: a column deep in Split's editor half is NOT the preview's")
+				pchk(&bad, !md_pane_owns(&doc, winw, winh, 0.5, left - 1), fmt.tprintf("owns: ...nor is the column one pixel left of the divider (%.0f)", left - 1))
+				pchk(&bad, md_pane_owns(&doc, winw, winh, 0.5, left), fmt.tprintf("owns: the divider's own column IS the preview's (%.0f)", left))
+				pchk(&bad, md_pane_owns(&doc, winw, winh, 0.5, winw - 2), "owns: ...and so is the scrollbar's")
+				// Preview mode owns everything, or the two rows above would also be
+				// satisfied by a bound that refuses the whole window.
+				doc.md_mode = .Preview
+				pchk(&bad, md_pane_owns(&doc, winw, winh, 0.5, 8), "owns: in full Preview the left margin IS the preview's")
+				doc.md_mode = .Off
+				pchk(&bad, !md_pane_owns(&doc, winw, winh, 0.5, winw * 0.5), "owns: with the preview off no column is")
+			}
+
+			// --- (4) .Blank in md_layout_extern_dep -------------------------------
+			//
+			// A Blank block's extent is the RUN of blank lines after it, which its
+			// own `src` (the empty string) cannot witness -- so it keys on
+			// doc.revision instead. `end` in the key does not cover it: a run of ONE
+			// blank line has end == line_end, exactly what a fresh lookup computes,
+			// so the entry hits however much has changed below it.
+			//
+			// The consequence is 9.4's own sync property, across an edit: a run that
+			// GREW is served as one stale block plus fresh ones after it, so the
+			// lines of a single blank run stop mapping to a single preview position.
+			// That is the property section C of md_scroll_selftest asserts on a fresh
+			// document; here it is asserted on an edited one, which is the only place
+			// the revision term can be seen.
+			{
+				// Padded past one pane on purpose: md_anchor_from_top ends in
+				// md_scroll_clamp, and on a document that fits the pane every
+				// position clamps to {0, 0} and the map is unobservable. (The first
+				// draft used the four lines alone and read block 0 five times.)
+				bb := strings.builder_make()
+				defer strings.builder_destroy(&bb)
+				strings.write_string(&bb, "head\n\nXYZW\nfoot\n")
+				for i in 0 ..< 80 {fmt.sbprintf(&bb, "tail para %02d with some words on it\n\n", i)}
+				doc := mk(strings.to_string(bb), "blank.md")
+				defer doc_close(&doc)
+				doc.md_mode = .Preview
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				pchk(&bad, cok, "blank: the scroll context resolves")
+				if cok {
+					// Warm it: one blank line at byte 5, whose entry has end ==
+					// line_end and is therefore indistinguishable from a fresh lookup
+					// on its non-revision terms.
+					one := md_anchor_from_top(&c, 5)
+					pchk(&bad, one.block == 5, fmt.tprintf("blank: the run of one is a block at its own byte (%d)", one.block))
+					pchk(&bad, md_anchor_from_top(&c, 6).block == 6, fmt.tprintf("blank: ...and the line after it is a DIFFERENT block (%d)", md_anchor_from_top(&c, 6).block))
+
+					// One edit turns "XYZW" into three blank lines, so the run from
+					// byte 5 grows from one line to five. Nothing about byte 5's own
+					// line changed.
+					doc_replace_range(&doc, 6, 4, transmute([]u8)string("\n\n\n"))
+					c2, _ := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+					same, blocks := 0, ""
+					for k in 5 ..= 9 {
+						a := md_anchor_from_top(&c2, k)
+						if a.block == 5 {same += 1}
+						blocks = fmt.tprintf("%s %d", blocks, a.block)
+					}
+					pchk(&bad, same == 5, fmt.tprintf("blank: after the edit all five lines of the GROWN run map to one block (%d of 5;%s)", same, blocks))
+					// And the line after the run still does not, or a map that
+					// answered 5 for everything would pass.
+					pchk(&bad, md_anchor_from_top(&c2, 10).block == 10, fmt.tprintf("blank: ...and the line after it still does not (%d)", md_anchor_from_top(&c2, 10).block))
+				}
+			}
+			return
+		}
+
 		// The wheel's REVERSIBILITY, swept -- and the invariant Md_Anchor's own
 		// doc comment states.
 		//
@@ -5883,6 +6125,7 @@ when NEWTPAD_TESTS {
 			bad += md_gap_selftest()
 			bad += md_scroll_selftest()
 			bad += md_wheel_selftest()
+			bad += md_prop_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
 			return true
 		}
