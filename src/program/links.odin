@@ -16,6 +16,7 @@
 //     browser.
 package main
 
+import "core:fmt"
 import "core:strings"
 import base "src:base"
 import plat "src:platform"
@@ -177,15 +178,33 @@ has_uri_scheme :: proc(s: string) -> bool {
 	return false
 }
 
-// Does this look like a path worth offering? Requires either a directory
-// separator or a known text extension, so ordinary prose words do not become
-// links. This is the main false-positive guard for relative paths.
+// Does this look like a path worth offering?
+//
+// A bare separator is NOT evidence. This used to accept any token containing a
+// '/' or a '\', which made `hello/world`, `and/or`, `24/7`, `he/she`, `km/h`
+// and every date written `07/28/2026` into links -- Wyatt reported exactly that.
+// English writes a slash between two words all day long; a filesystem does not
+// care. So require a signal only a path has: a known text extension, or a
+// prefix that names a root or an anchor.
+//
+// Note what the tightening does NOT cost. `src/main.odin`, `build\out.log` and
+// every other compiler/linter line still match on their extension, which is the
+// case this feature exists for. What it drops is precisely the set that could
+// never resolve anyway -- see links_layout, which now refuses to decorate
+// anything link_resolve declines, so the two guards agree by construction
+// rather than by coincidence.
 @(private = "file")
 looks_like_path :: proc(s: string) -> bool {
 	if len(s) < 3 {return false}
-	if has_uri_scheme(s) {return false}
-	has_sep := strings.contains(s, "\\") || strings.contains(s, "/")
-	return has_sep || link_is_text_ext(s)
+	if has_uri_scheme(s) {return false} // ms-msdt:/id and friends: never a path
+	if link_is_text_ext(s) {return true}
+	if strings.has_prefix(s, "./") || strings.has_prefix(s, ".\\") {return true} // explicit "here"
+	if strings.has_prefix(s, "../") || strings.has_prefix(s, "..\\") {return true} // (link_resolve still refuses the walk)
+	if strings.has_prefix(s, "~/") {return true}
+	if strings.has_prefix(s, "\\\\") {return true} // UNC
+	if s[0] == '/' || s[0] == '\\' {return true} // rooted
+	if is_alpha(s[0]) && s[1] == ':' && (s[2] == '\\' || s[2] == '/') {return true} // drive
+	return false
 }
 
 // Split a trailing :line or :line:col from a candidate. Returns the target
@@ -395,6 +414,103 @@ links_scan :: proc(text: string, allocator := context.temp_allocator) -> []Link 
 	return out[:]
 }
 
+// Most distinct targets one viewport pass will stat. A bound, not a tuning
+// knob: it exists so that a pathological screen -- a generated file that is
+// nothing but thousands of paths, at a one-cell font -- cannot turn one frame
+// into thousands of blocking filesystem calls. A real viewport is a couple of
+// hundred rows with at most a link or two each, so this never bites in normal
+// use, and a candidate skipped for budget is simply not decorated (the safe
+// direction: it under-promises, never over-promises).
+LINK_RESOLVE_BUDGET :: 256
+
+// Why links_layout can afford to resolve at all.
+//
+// link_resolve stats the target (plat.path_exists -> GetFileAttributesW), and a
+// stat on a UNC or a mapped network drive can block the calling thread -- which
+// here is the thread that builds the UI. links_layout runs up to three times in
+// one frame (the hover cursor, the Ctrl+click test, the draw), and with the
+// Show-links setting on "always" it runs every frame whether or not Ctrl is
+// held. Without a cache the gate would pay for every one of those.
+//
+// Four properties, each load-bearing:
+//
+//   1. It is filled ONLY from links_layout's own row walk, which is
+//      visible_begin/visible_next -- the viewport and nothing else. There is no
+//      other writer. An off-screen row therefore cannot cost a stat, because no
+//      code path ever offers it one. (The Ctrl+click handler in main.odin calls
+//      link_resolve directly, but only for the row the user clicked, which by
+//      construction is on screen.)
+//   2. Keyed on the raw target token, so the several row-segments of a single
+//      force-wrapped link, and the repeated passes within a frame, share one
+//      stat rather than one each.
+//   3. Dropped whole when anything changes what the viewport is showing: a
+//      different document, an edit (doc.revision), a scroll (doc.top), or a
+//      re-anchor (doc.path moved, which changes what a relative link means).
+//      That keeps answers fresh -- a file created after we looked becomes a link
+//      on the next scroll or keystroke -- and bounds the map to one screenful of
+//      distinct tokens.
+//   4. Bounded per generation by LINK_RESOLVE_BUDGET above.
+//
+// Keys are cloned into the ordinary allocator and freed on reset: the tokens
+// they are cloned from point into frame-arena text that is gone next frame.
+@(private = "file")
+Link_Cache :: struct {
+	doc:      rawptr, // identity only, never dereferenced
+	revision: u64,
+	top:      int,
+	anchor:   string, // OWNED copy of doc.path; see link_cache_sync
+	budget:   int,
+	entries:  map[string]bool, // owned keys: raw target token -> resolves
+}
+
+@(private = "file")
+link_cache: Link_Cache
+
+// Drop everything and re-stamp the generation. Called once per links_layout,
+// and a no-op on the common case where the viewport has not moved.
+//
+// The anchor is held as an owned COPY and compared by value, not by pointer,
+// and that is the whole reason this is safe against address reuse. Documents are
+// heap-boxed and freed on close, so a fresh document can land on a just-closed
+// one's address with the same revision (0) and the same top (0) -- every other
+// field in the generation matches and the stale entries survive. Comparing the
+// anchor by value removes the hazard rather than arguing about it: the only
+// document-dependent input to link_resolve is the folder a relative link is
+// anchored to, so two documents with the same anchor genuinely have the same
+// answers, and two with different anchors reset. A pointer comparison would
+// instead be reading a field of a document that no longer exists.
+@(private = "file")
+link_cache_sync :: proc(doc: ^Document) {
+	if link_cache.doc == rawptr(doc) &&
+	   link_cache.revision == doc.revision &&
+	   link_cache.top == doc.top &&
+	   link_cache.anchor == doc.path {
+		return
+	}
+	for k in link_cache.entries {delete(k)}
+	clear(&link_cache.entries)
+	delete(link_cache.anchor)
+	link_cache.doc = rawptr(doc)
+	link_cache.revision = doc.revision
+	link_cache.top = doc.top
+	link_cache.anchor = strings.clone(doc.path)
+	link_cache.budget = LINK_RESOLVE_BUDGET
+}
+
+// Would this candidate actually open? The gate links_layout gives every hit
+// before it is allowed on screen.
+@(private = "file")
+link_gate :: proc(doc: ^Document, text: string, l: Link) -> bool {
+	if l.target_len <= 0 {return false}
+	raw := text[l.start:l.start + l.target_len]
+	if v, hit := link_cache.entries[raw]; hit {return v}
+	if link_cache.budget <= 0 {return false}
+	link_cache.budget -= 1
+	_, ok := link_resolve(doc, text, l)
+	link_cache.entries[strings.clone(raw)] = ok
+	return ok
+}
+
 // One link, placed on screen. This is the single producer of link geometry:
 // the draw, the hover and the click all consume it, so the span that underlines
 // and the span that is clickable cannot disagree. Producing geometry twice is
@@ -426,9 +542,18 @@ Link_Hit :: struct {
 // per visual row would see a link cut at the wrap point and mis-resolve the
 // halves) and then split into per-row segments. Unwrapped rows keep the simple
 // per-row scan.
+//
+// Every hit is gated on link_resolve before it is emitted, so the invariant the
+// draw, the hover cursor and the click all rely on is **underlined implies
+// openable**. It used to be possible to underline a target detection had
+// invented -- `hello/world`, `ms-msdt:/id` -- which the click handler then
+// silently declined to open, and that is what "the click doesn't work" was.
+// Resolution is a stat, so it goes through link_cache above; read its comment
+// before touching this.
 links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := context.temp_allocator) -> []Link_Hit {
 	out := make([dynamic]Link_Hit, 0, 8, allocator)
 	if doc == nil {return out[:]}
+	link_cache_sync(doc)
 	line_buf: [VISIBLE_COLS]u8
 	// Cache of the current wrapped logical line, so its rows don't each rescan it.
 	cur_lls := -1
@@ -488,6 +613,7 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 			if n <= 0 {continue}
 			text := strings.clone(string(line_buf[:n]), allocator) // outlive the loop
 			for l in links_scan(text, allocator) {
+				if !link_gate(doc, text, l) {continue} // underlined implies openable
 				// col0 = 0: `text` was read from `start`, the VISUAL ROW's own
 				// start, which is the origin doc_draw draws the row from and
 				// therefore the origin tab stops are measured from (see
@@ -523,6 +649,10 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 			lo := max(l.start, row_off)
 			hi := min(l.start + l.len, row_end_off)
 			if lo >= hi {continue} // link doesn't touch this row
+			// Gated AFTER that check, deliberately: cur_links covers the whole
+			// (capped) logical line, whose other rows may be off-screen, and the
+			// cache must never be asked about a row the viewport is not showing.
+			if !link_gate(doc, cur_line, l) {continue} // underlined implies openable
 			ss := lo - row_off // row-relative draw span
 			// col0 = 0 even though `row_text` is a SLICE of the logical line:
 			// it is sliced at row_off, i.e. it starts exactly at this visual
@@ -637,6 +767,37 @@ link_resolve :: proc(doc: ^Document, text: string, l: Link) -> (t: Link_Target, 
 	exists, _ := plat.path_exists(abs)
 	if !exists {return {}, false} // a broken link reaches no handler
 	return Link_Target{path = abs, line = l.line, col = l.col}, true
+}
+
+// Follow a link the user asked to follow: resolve it, act on it, and SAY SO if
+// either step fails. The one procedure behind all three routes -- Ctrl+click in
+// the document, Ctrl+click in the table view, and the Open Link command -- which
+// each used to carry their own copy and each ended it the same way:
+//
+//	if t, rok := link_resolve(...); rok { ...open... }
+//	                                     <- and nothing at all otherwise
+//
+// Doing nothing is indistinguishable from a feature that does not work, and that
+// is exactly how it was reported ("the click to goto link/explorer doesn't
+// work"). links_layout now refuses to decorate anything that does not resolve,
+// so the document view reaches the failure branch only when the target went away
+// between the frame that drew the underline and the click -- but the table view
+// and the keyboard command have no such gate in front of them at all, so for
+// them this is the only thing standing between a dead target and silence.
+link_follow :: proc(app: ^App, t: ^plat.Text, w: ^plat.Window, doc: ^Document, text: string, l: Link) {
+	if tgt, rok := link_resolve(doc, text, l); rok {
+		if !link_activate(app, t, tgt) {
+			plat.message_error(
+				w.hwnd if w != nil else nil,
+				fmt.tprintf("Could not open:\n\n%s", tgt.url if tgt.is_url else tgt.path),
+			)
+		}
+		return
+	}
+	plat.message_error(
+		w.hwnd if w != nil else nil,
+		fmt.tprintf("Could not resolve:\n\n%s", text[l.start:l.start + l.target_len]),
+	)
 }
 
 // Act on a resolved link. Text-ish files become tabs; a directory (or any other

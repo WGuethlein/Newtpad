@@ -7141,6 +7141,176 @@ when NEWTPAD_TESTS {
 				if !okd {bad += 1}
 			}
 
+			// --- a bare separator is not evidence of a path ---
+			// Wyatt: "it captures a LOT more than it should. For example this gets
+			// caught: hello/world ... also the click to goto link/explorer doesn't
+			// work." One defect, two faces: looks_like_path took any '/' or '\' as
+			// proof, so tokens that could never resolve got underlined, and the
+			// click handler then returned silently on the unresolvable target.
+			//
+			// Local procs, not inline blocks: this dispatcher's frame has hit
+			// STATUS_STACK_OVERFLOW twice.
+			lk_chk :: proc(bad: ^int, ok: bool, what: string) {
+				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", what)
+				if !ok {bad^ += 1}
+			}
+
+			lk_false_positives :: proc(bad: ^int) {
+				// Prose. A slash between two words is a slash between two words.
+				for s in ([]string {
+					"hello/world",
+					"and/or",
+					"24/7",
+					"he/she",
+					"07/28/2026",
+					"read/write",
+					"TODO/FIXME",
+					"n/a",
+					"input/output",
+					"km/h",
+				}) {
+					n := len(links_scan(s))
+					lk_chk(bad, n == 0, fmt.tprintf("%-14q is not a link (got %d)", s, n))
+				}
+				// ...and everything that must still be one. The first group carries a
+				// known text extension, the second only a path-ish prefix -- both are
+				// real evidence, and dropping either branch fails here.
+				for s in ([]string {
+					"readme.md",
+					"src/main.odin",
+					"./notes.md",
+					"../a/b.txt",
+					"..\\a\\b.txt",
+					"~/notes.md",
+					"./buildlog",
+					".\\buildlog",
+					"../out",
+					"/etc/hosts",
+					"C:\\temp\\thing",
+					"C:/temp/x.txt",
+					"\\\\srv\\share\\thing",
+					"https://example.com/x",
+				}) {
+					n := len(links_scan(s))
+					lk_chk(bad, n == 1, fmt.tprintf("%-22q is still a link (got %d)", s, n))
+				}
+			}
+
+			// The seam: everything DECORATED must be openable. Asserted directly on
+			// links_layout's output rather than inferred from links_scan, because the
+			// decoration is what promises a target -- and a promise detection invented
+			// and resolution declines is exactly the "click doesn't work" report.
+			lk_underline_implies_openable :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				real := fmt.tprintf("%s\\newtpad_lk_real.txt", dir)
+				plat.file_write_atomic(real, transmute([]u8)string("real"))
+				anchor := fmt.tprintf("%s\\newtpad_lk_anchor.txt", dir)
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				// One resolvable path, one prose token detection used to invent, and
+				// one well-formed absolute path that simply is not there.
+				body := "see ./newtpad_lk_real.txt and hello/world and C:\\newtpad_no_such_dir_zz\\missing.txt\n"
+				d := doc_from_content(transmute([]u8)strings.clone(body), anchor, .UTF8)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 200
+				d.view_rows = 10
+				hits := links_layout(&d, &tt, 10)
+				all_ok := true
+				for h in hits {
+					if _, rok := link_resolve(&d, h.text, h.link); !rok {
+						all_ok = false
+						fmt.printfln(
+							"    decorated but unresolvable: %q",
+							h.text[h.link.start:h.link.start + h.link.target_len],
+						)
+					}
+				}
+				lk_chk(bad, all_ok, "every decorated span resolves")
+				// ...and the gate is not vacuous: dropping EVERYTHING would satisfy the
+				// line above, so the one real path has to survive it.
+				kept := ""
+				if len(hits) == 1 {
+					kept = hits[0].text[hits[0].link.start:hits[0].link.start + hits[0].link.target_len]
+				}
+				lk_chk(
+					bad,
+					kept == "./newtpad_lk_real.txt",
+					fmt.tprintf("exactly the resolvable path is decorated (%d hits, kept %q)", len(hits), kept),
+				)
+			}
+
+			// The gate is only affordable because of the resolution cache, so the
+			// cache's own behaviour is asserted rather than assumed. Three claims,
+			// each of which some plausible wrong implementation would break:
+			//
+			//   - a missing target is not decorated              (the gate works)
+			//   - it stays undecorated after the file appears    (the cache is REAL:
+			//     a gate that re-stats every pass reports 1 here)
+			//   - an edit drops it and it becomes a link         (invalidation works:
+			//     a cache that never clears reports 0 here)
+			lk_cache_invalidation :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				late := fmt.tprintf("%s\\newtpad_lk_late.txt", dir)
+				plat.file_delete(late)
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				d := doc_from_content(
+					transmute([]u8)strings.clone("see ./newtpad_lk_late.txt now\n"),
+					fmt.tprintf("%s\\newtpad_lk_anchor.txt", dir),
+					.UTF8,
+				)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 200
+				d.view_rows = 10
+				n0 := len(links_layout(&d, &tt, 10))
+				lk_chk(bad, n0 == 0, fmt.tprintf("a missing target is not decorated (%d hits)", n0))
+				plat.file_write_atomic(late, transmute([]u8)string("late"))
+				n1 := len(links_layout(&d, &tt, 10))
+				lk_chk(bad, n1 == 0, fmt.tprintf("the answer is cached, not re-stat'd per pass (%d hits)", n1))
+				d.revision += 1 // exactly what any edit does
+				n2 := len(links_layout(&d, &tt, 10))
+				lk_chk(bad, n2 == 1, fmt.tprintf("an edit drops the cache and it becomes a link (%d hits)", n2))
+				plat.file_delete(late)
+			}
+
+			// ...and it is keyed on the ANCHOR as well as the token, so a `true` for
+			// one document cannot leak into another whose relative links mean a
+			// different folder. Runs straight after the proc above, whose last act was
+			// to cache this exact token as resolvable.
+			lk_cache_anchor :: proc(bad: ^int) {
+				dir := os.get_env("TEMP", context.temp_allocator)
+				sub := fmt.tprintf("%s\\newtpad_lk_sub", dir)
+				os.make_directory(sub)
+				plat.file_delete(fmt.tprintf("%s\\newtpad_lk_late.txt", sub))
+				tt: plat.Text
+				plat.text_load_faces(&tt)
+				d := doc_from_content(
+					transmute([]u8)strings.clone("see ./newtpad_lk_late.txt now\n"),
+					fmt.tprintf("%s\\newtpad_lk_anchor.txt", sub),
+					.UTF8,
+				)
+				defer doc_close(&d)
+				d.wrap = false
+				d.view_cols = 200
+				d.view_rows = 10
+				// Matched to the revision the previous document ended on, so that the
+				// anchor is the only part of the cache generation that differs. (Its
+				// address may or may not coincide; that is not controllable from here.)
+				d.revision = 1
+				n := len(links_layout(&d, &tt, 10))
+				lk_chk(bad, n == 0, fmt.tprintf("a cached hit does not leak across anchors (%d hits)", n))
+			}
+
+			fmt.println("--- a bare separator is not a path ---")
+			lk_false_positives(&bad)
+			fmt.println("--- underlined implies openable ---")
+			lk_underline_implies_openable(&bad)
+			fmt.println("--- the resolution cache ---")
+			lk_cache_invalidation(&bad)
+			lk_cache_anchor(&bad)
+
 			fmt.printfln("linktest: %d failures", bad)
 			return true
 		}

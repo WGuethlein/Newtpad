@@ -595,11 +595,11 @@ main :: proc() {
 		// either way (the grid takes no caret).
 		if doc.table && doc.kind == .Text && window.mouse_pressed && plat.key_ctrl_down() {
 			if tl, found := table_link_hit(table_links(doc, &text, px, char_w, rows, f32(window.width)), f32(window.mouse_x), f32(window.mouse_y), px, line_h); found {
-				if t, rok := link_resolve(doc, tl.text, tl.link); rok {
-					if !link_activate(&app, &text, t) {
-						plat.message_error(window.hwnd, fmt.tprintf("Could not open:\n\n%s", t.url if t.is_url else t.path))
-					}
-				}
+				// Not resolution-gated the way the document view now is: table_links
+				// decorates whatever links_scan finds in a cell, so a dead target here
+				// still underlines. link_follow at least says so instead of doing
+				// nothing. (Gating the table's decoration too is HANDOFF §6l work.)
+				link_follow(&app, &text, window, doc, tl.text, tl.link)
 				window.mouse_pressed = false
 				window.mouse_down = false
 			}
@@ -708,11 +708,7 @@ main :: proc() {
 		if window.mouse_pressed && plat.key_ctrl_down() && !doc.filter {
 			hits := links_layout(doc, &text, drawn)
 			if h, found := links_hit(hits, px, char_w, f32(window.mouse_x), f32(window.mouse_y)); found {
-				if t, rok := link_resolve(doc, h.text, h.link); rok {
-					if !link_activate(&app, &text, t) {
-						plat.message_error(window.hwnd, fmt.tprintf("Could not open:\n\n%s", t.url if t.is_url else t.path))
-					}
-				}
+				link_follow(&app, &text, window, doc, h.text, h.link)
 				window.mouse_pressed = false
 				window.mouse_down = false
 			}

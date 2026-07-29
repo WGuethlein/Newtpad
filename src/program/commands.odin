@@ -1189,15 +1189,13 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// The keyboard route to what Ctrl+click does, so links are not a mouse-only
 		// feature and the action shows up in the palette by name. Scans only the
 		// caret's own line rather than the viewport.
+		//
+		// It also had the same silent return the Ctrl+click path did, with no
+		// decoration in front of it to have filtered the target first:
+		// link_at_cursor reports whatever links_scan finds on the caret's line.
+		// link_follow says so rather than swallowing it.
 		if line, l, found := link_at_cursor(doc); found {
-			if tgt, rok := link_resolve(doc, line, l); rok {
-				if !link_activate(app, t, tgt) {
-					plat.message_error(
-						w.hwnd if w != nil else nil,
-						fmt.tprintf("Could not open:\n\n%s", tgt.url if tgt.is_url else tgt.path),
-					)
-				}
-			}
+			link_follow(app, t, w, doc, line, l)
 		}
 	case .Clear_Selection:
 		doc.anchor = doc.cursor
