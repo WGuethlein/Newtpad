@@ -1025,40 +1025,36 @@ Document :: struct {
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)
-	// High-water mark for doc_max_hscroll: the widest line MEASURED so far this
-	// session, not the widest currently on screen. See that proc's comment for
-	// why.
+	// High-water mark for doc_update_max_hscroll: the widest line MEASURED
+	// since max_cells_rev (below) was last set, not the widest currently on
+	// screen. See that proc's comment for the scan that raises it.
 	//
-	// No site in the tree sets this back to 0 explicitly. For the two
-	// whole-buffer replacements that is fine and deliberate: doc_reload_forced
-	// (an actual reload/reopen-as swap in different file content) replaces the
-	// WHOLE Document struct (`doc^ = fresh`) rather than mutating fields in
-	// place, so a reloaded document's mark is zero for free --
-	// doc_view_apply/Doc_View, the one thing carried forward across that swap,
-	// holds wrap/md_mode/table only, never this field. doc_set_line_ending
-	// rewrites the whole buffer in place (pt_edit_replace(0, length, ...)) but
+	// The two whole-buffer-replacement paths both bump doc.revision, so the
+	// revision check below covers them for free: doc_reload_forced (an actual
+	// reload/reopen-as swap in different file content) replaces the WHOLE
+	// Document struct (`doc^ = fresh`), so a reloaded document's mark is zero
+	// regardless; doc_set_line_ending rewrites the whole buffer in place but
 	// only touches line-TERMINATOR bytes -- line_cell_col never measures past a
-	// line's content into its terminator -- so no line's measured width can
-	// change and there is nothing stale to clear.
+	// line's content into its terminator -- so no line's measured width
+	// actually changes even though revision moves.
 	//
-	// ORDINARY EDITING IS NOT COVERED BY THAT, and no reset is coming. Delete
-	// the file's longest line through doc_replace_sel (or any other edit path)
-	// and this stays at the deleted line's width for the rest of the session:
-	// measured, a 400-cell line plus 50 short ones gives doc_max_hscroll = 323,
-	// and it is still 323 after the long line is gone. The horizontal bar then
-	// offers pan into content that no longer exists. That is the accepted cost
-	// of the high-water design, which Wyatt chose (2026-07-28) over a background
-	// full-document scan: a correct reset would have to know the new widest
-	// line, which means scanning the whole document on every edit -- the exact
-	// job the high-water mark exists to avoid. Stale-wide is a few cells of
-	// blank at the far right; the alternative it replaced was the bar vanishing
-	// whenever the wide line scrolled off, which is the bug Wyatt reported.
-	//
-	// Note also that doc_max_hscroll is a getter that MUTATES the Document: it
-	// raises this mark from the draw path, on the main thread, once per frame.
-	// It is not safe to call from a job, and it is not idempotent with respect
-	// to the struct.
+	// ORDINARY EDITING (fixed 2026-07-29): this used to survive every edit,
+	// keyed on nothing. Delete the file's longest line through doc_replace_sel
+	// (or any other edit path) and the mark stayed at the deleted line's width
+	// for the rest of the session -- measured, a 400-cell line plus 50 short
+	// ones gave doc_max_hscroll = 323, and it was still 323 after the long
+	// line was gone, offering pan into content that no longer existed. Now
+	// keyed on max_cells_rev: an edit bumps doc.revision (push_undo does, and
+	// every edit path routes through it), and doc_update_max_hscroll drops the
+	// mark back to 0 the next time it runs, letting it re-grow from whatever
+	// is on screen. A mere SCROLL does not bump doc.revision, so the mark
+	// still survives that -- the property Wyatt chose the high-water design
+	// for in the first place (2026-07-28): a background full-document rescan
+	// on every edit would defeat the point of not doing one on every scroll.
 	max_cells_seen: int,
+	// doc.revision the mark above was last measured against. See the field
+	// comment; read and written only by doc_update_max_hscroll.
+	max_cells_rev: u64,
 	status_cursor: int, // cursor pos the cached status line was computed for
 	status_line:   int, // 1-based line of the cursor (0 = beyond the cap / unknown)
 	// Same for the column, which was neither cached nor capped and cost an
@@ -3278,20 +3274,38 @@ HSCROLL_PAD :: 3
 // line longer than VISIBLE_COLS needs the draw to window on h_scroll — a separate
 // follow-up; this just makes the bar stop where the text does.)
 //
-// The widest line SEEN SO FAR this session, not the widest currently on screen.
-// This used to walk only the visible rows and derive `reach` from that scan
-// alone, so scrolling the wide line off the top collapsed the range and the bar
-// vanished -- Wyatt, live use: the horizontal scrollbar only allows expanding if
-// the large row is on screen. Viewport-first still holds: nothing here scans
-// off-screen content, the measurement just stops throwing itself away once
-// something wider has actually been looked at.
+// The widest line SEEN SO FAR since the mark was last dropped (see
+// max_cells_rev), not the widest currently on screen. This used to walk only
+// the visible rows and derive `reach` from that scan alone, so scrolling the
+// wide line off the top collapsed the range and the bar vanished -- Wyatt,
+// live use: the horizontal scrollbar only allows expanding if the large row
+// is on screen. Viewport-first still holds: nothing here scans off-screen
+// content, the measurement just stops throwing itself away once something
+// wider has actually been looked at.
 //
 // Chosen over a background full-document scan (Wyatt, 2026-07-28) because it
 // needs no job, no invalidation and no rule bent. The accepted cost: on first
 // open the range is only as wide as what has been looked at, so it grows as the
 // user scrolls rather than being right from frame one.
-doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
+//
+// MUTATING: raises max_cells_seen, and first drops it if an edit has moved
+// doc.revision since it was last measured (2026-07-29 fix -- see the field
+// comment). Call exactly once per frame, from the frame's UPDATE phase in
+// main.odin -- never from render_frame. Not safe to call from a job, and not
+// idempotent with respect to the struct. doc_max_hscroll (below) is the pure
+// read that render_frame and everything else should use instead; splitting
+// the two is what makes the draw idempotent again.
+doc_update_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 	if doc == nil || doc_wraps(doc) || doc.filter {return 0}
+	if doc.max_cells_rev != doc.revision {
+		// An edit happened since this was last measured. It may have SHRUNK
+		// the content (deleted the line that set the mark), so the mark
+		// cannot simply be trusted forward -- drop it and let the scan below
+		// re-grow it from whatever is on screen right now. A mere scroll
+		// never reaches this branch, because a scroll never bumps revision.
+		doc.max_cells_seen = 0
+		doc.max_cells_rev = doc.revision
+	}
 	widest := 0
 	it := visible_begin(doc, t, rows)
 	for {
@@ -3301,6 +3315,15 @@ doc_max_hscroll :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
 		if w := line_cell_col(doc, t, start, vis_end); w > widest {widest = w}
 	}
 	if widest > doc.max_cells_seen {doc.max_cells_seen = widest}
+	return doc_max_hscroll(doc)
+}
+
+// Pure read of the range doc_update_max_hscroll last computed: no scan, no
+// mutation. Safe to call from render_frame (hscroll_model) or anywhere else
+// that only wants the number for this frame, since the update above already
+// ran once before the draw.
+doc_max_hscroll :: proc(doc: ^Document) -> int {
+	if doc == nil || doc_wraps(doc) || doc.filter {return 0}
 	reach := min(doc.max_cells_seen + HSCROLL_PAD, VISIBLE_COLS)
 	return max(0, reach - max(1, doc.view_cols))
 }

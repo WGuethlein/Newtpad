@@ -8811,7 +8811,7 @@ when NEWTPAD_TESTS {
 			y := row_baseline_y(px, 0) - line_height(px) * 0.5
 
 			for hs in ([]int{0, 50, 100, 250}) {
-				doc.h_scroll = clamp(hs, 0, doc_max_hscroll(&doc, &t, rows))
+				doc.h_scroll = clamp(hs, 0, doc_update_max_hscroll(&doc, &t, rows))
 				doc_update_hscroll(&doc)
 				for cell in ([]int{doc.h_scroll, doc.h_scroll + doc.view_cols / 2, doc.h_scroll + doc.view_cols - 1}) {
 					base_x := col_x(cw, cell)
@@ -8978,6 +8978,12 @@ when NEWTPAD_TESTS {
 					}
 				}
 				mdoc.md_mode = .Off
+				// hscroll_model's .Cells branch now reads the pure doc_max_hscroll,
+				// which only reports what doc_update_max_hscroll last measured --
+				// mirror the frame loop's once-per-frame update (main.odin) before
+				// asking, or this reads the unmeasured zero value instead of the
+				// 400-cell line's actual width.
+				doc_update_max_hscroll(&mdoc, &t, rows)
 				om := hscroll_model(&mdoc, &t, rows, 1000, cw)
 				if om.kind != .Cells {
 					fmt.printfln("  FAIL markdown Off: hscroll kind is %v, want Cells", om.kind)
@@ -9063,7 +9069,7 @@ when NEWTPAD_TESTS {
 			// the vertical bar's identical mismatch went unnoticed: no test on
 			// either axis ever compared a drawn thumb position with the position a
 			// drag recovers from it.
-			maxhs := doc_max_hscroll(&doc, &t, rows)
+			maxhs := doc_update_max_hscroll(&doc, &t, rows)
 			for hs in ([]int{0, 40, 120, maxhs}) {
 				doc.h_scroll = clamp(hs, 0, maxhs)
 				hm := hscroll_model(&doc, &t, rows, 1000, cw)
@@ -9109,7 +9115,7 @@ when NEWTPAD_TESTS {
 				}
 				// The scroll range must stop at what doc_draw actually renders
 				// (VISIBLE_COLS), not run thousands of cells into blank space.
-				if mh := doc_max_hscroll(&ld, &t, ld.view_rows); mh > VISIBLE_COLS {
+				if mh := doc_update_max_hscroll(&ld, &t, ld.view_rows); mh > VISIBLE_COLS {
 					fmt.printfln("  FAIL: max h-scroll %d exceeds the drawn width %d (blank space)", mh, VISIBLE_COLS)
 					bad += 1
 				}
@@ -9153,8 +9159,8 @@ when NEWTPAD_TESTS {
 					doc.view_cols = 80
 					doc.top = 0
 
-					wide := doc_max_hscroll(&doc, &t, rows)
-					hw_chk(bad, wide > 0, fmt.tprintf("the long line gives a range while it is visible (%d)", wide))
+					wide := doc_update_max_hscroll(&doc, &t, rows)
+					hw_chk(bad, wide > 0, fmt.tprintf("1. the long line gives a range while it is visible (%d)", wide))
 
 					// Scroll the wide line off the top: doc.top lands on line 100
 					// ("short"), well past line 0's 400-cell line. md_line_offset does
@@ -9169,8 +9175,24 @@ when NEWTPAD_TESTS {
 					}
 					doc.top = off
 
-					after := doc_max_hscroll(&doc, &t, rows)
-					hw_chk(bad, after == wide, fmt.tprintf("the range survives the long line leaving the viewport (%d -> %d)", wide, after))
+					// Assertion 2, the property that must not regress: a mere SCROLL
+					// (doc.top moving, doc.revision untouched) must not collapse the
+					// range. This is the original bug -- doc_max_hscroll used to
+					// derive `reach` from only the currently-visible rows.
+					after := doc_update_max_hscroll(&doc, &t, rows)
+					hw_chk(bad, after == wide, fmt.tprintf("2. the range survives the long line leaving the viewport (%d -> %d)", wide, after))
+
+					// Assertion 3, independent of assertion 2: an actual EDIT that
+					// removes the long line (doc.revision moves) must shrink the
+					// range. Delete line 0's 400 'x' bytes plus its newline through
+					// doc_replace_range, the same path Alt+Up/Down and Replace All
+					// take, so push_undo runs and doc.revision bumps for real.
+					doc.top = 0 // back on screen so the scan below has something to see
+					before_rev := doc.revision
+					doc_replace_range(&doc, 0, 401, nil) // "x"*400 + "\n"
+					hw_chk(bad, doc.revision != before_rev, fmt.tprintf("(precondition) deleting the long line bumped doc.revision (%d -> %d)", before_rev, doc.revision))
+					shrunk := doc_update_max_hscroll(&doc, &t, rows)
+					hw_chk(bad, shrunk < wide, fmt.tprintf("3. deleting the long line shrinks the range (%d -> %d, was %d)", wide, shrunk, wide))
 				}
 				hw_run(&hw_bad)
 			}
@@ -9225,7 +9247,7 @@ when NEWTPAD_TESTS {
 			}
 			// The h-scroll range must come from the 200-cell non-wrapped line, not the
 			// 3000-cell wrapped one.
-			if mh := doc_max_hscroll(&doc, &t, rows); mh != 200 + HSCROLL_PAD - 80 {
+			if mh := doc_update_max_hscroll(&doc, &t, rows); mh != 200 + HSCROLL_PAD - 80 {
 				fmt.printfln("  FAIL: h-scroll range %d, want %d (from the 200-cell line)", mh, 200 + HSCROLL_PAD - 80)
 				bad += 1
 			}

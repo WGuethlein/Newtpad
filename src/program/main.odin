@@ -286,8 +286,13 @@ main :: proc() {
 		doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), app.settings.split_frac), char_w)
 		doc.view_rows = rows
 		// Horizontal scroll: clamp to real content, then mirror into H_SCROLL for
-		// this frame so the whole frame's column geometry agrees.
-		doc.h_scroll = clamp(doc.h_scroll, 0, doc_max_hscroll(doc, &text, rows))
+		// this frame so the whole frame's column geometry agrees. This is the
+		// one call per frame to the MUTATING scan (doc_update_max_hscroll) --
+		// it runs here, in the update phase, before render_frame, so every
+		// later read this frame (the wheel below, hscroll_model, the draw) can
+		// use the pure doc_max_hscroll and see a value already current for
+		// this frame without re-scanning or mutating from the draw path.
+		doc.h_scroll = clamp(doc.h_scroll, 0, doc_update_max_hscroll(doc, &text, rows))
 		doc_update_hscroll(doc)
 		// Re-center on the caret only when it actually moves on THIS tab — never
 		// after a wheel/page scroll (which leaves the caret put) or a tab switch.
@@ -854,7 +859,7 @@ main :: proc() {
 			} else if plat.key_shift_down() && !doc.wrap {
 				// Shift+wheel pans horizontally (no-op when wrapping — nothing runs
 				// off the edge then). A few cells per notch, clamped to real content.
-				doc.h_scroll = clamp(doc.h_scroll + window.scroll_delta * 4, 0, doc_max_hscroll(doc, &text, rows))
+				doc.h_scroll = clamp(doc.h_scroll + window.scroll_delta * 4, 0, doc_max_hscroll(doc))
 			} else {
 				doc_scroll(doc, &text, window.scroll_delta, rows)
 			}
@@ -1053,7 +1058,7 @@ hscroll_model :: proc(doc: ^Document, t: ^plat.Text, rows: int, winw, char_w: f3
 	// needing the table to scroll, not the pane. Tracked in HANDOFF 5.)
 	if doc.kind == .Text && doc.md_mode != .Off {return}
 	if doc_wraps(doc) {return}
-	m.max = doc_max_hscroll(doc, t, rows)
+	m.max = doc_max_hscroll(doc)
 	if m.max <= 0 {return}
 	m.pos = clamp(doc.h_scroll, 0, m.max)
 	m.span = max(1, doc.view_cols)
