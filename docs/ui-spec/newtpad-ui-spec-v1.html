@@ -1,0 +1,1119 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+@font-face { font-family: 'Monaspace Neon'; font-style: normal; font-display: swap; font-weight: 400; src: url(https://cdn.jsdelivr.net/fontsource/fonts/monaspace-neon@5.2.5/latin-400-normal.woff2) format('woff2'); }
+@font-face { font-family: 'Monaspace Neon'; font-style: normal; font-display: swap; font-weight: 700; src: url(https://cdn.jsdelivr.net/fontsource/fonts/monaspace-neon@5.2.5/latin-700-normal.woff2) format('woff2'); }
+@font-face { font-family: 'Monaspace Argon'; font-style: normal; font-display: swap; font-weight: 400; src: url(https://cdn.jsdelivr.net/fontsource/fonts/monaspace-argon@5.2.5/latin-400-normal.woff2) format('woff2'); }
+@font-face { font-family: 'Monaspace Argon'; font-style: normal; font-display: swap; font-weight: 700; src: url(https://cdn.jsdelivr.net/fontsource/fonts/monaspace-argon@5.2.5/latin-700-normal.woff2) format('woff2'); }
+html, body { margin: 0; padding: 0; background: #15130f; }
+a { color: #d99b62; text-decoration: none; border-bottom: 1px solid rgba(217,155,98,0.35); }
+a:hover { color: #eab27c; border-bottom-color: rgba(234,178,124,0.7); }
+</style>
+</helmet>
+
+<div style="font-family: 'Monaspace Argon', 'Cascadia Code', Consolas, monospace; background: #15130f; color: #cdc3b4; padding: 0 0 96px 0;">
+
+  <div style="max-width: 1240px; margin: 0 auto; padding: 72px 48px 0 48px;">
+    <div style="font-size: 12px; letter-spacing: 0.14em; text-transform: uppercase; color: #9d9284;">Newtpad · UI specification · v1</div>
+    <h1 style="margin: 14px 0 0 0; font-size: 40px; font-weight: 700; letter-spacing: -0.015em; line-height: 1.1; color: #f2ebe0;">Newtpad UI specification</h1>
+    <p style="margin: 18px 0 0 0; font-size: 16px; line-height: 1.65; color: #b3a897; max-width: 800px; text-wrap: pretty;">Every screen and every colour, written against the existing theme-file role names so §1 is two files that can be pasted in and seen immediately. Shell is direction 2a: a 40px tab rail with pill tabs, a visible 30px menu bar that can be hidden, and a 26px status bar. This document is a target state, not an audit — see <i>How to use this document</i> below.</p>
+
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px 32px; margin-top: 30px; padding: 22px 26px; background: #1c1917; border-radius: 8px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); max-width: 940px;">
+      <div style="grid-column: 1 / -1; font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase; color: #8f8578; padding-bottom: 4px;">Locked from your answers</div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">It will be sold.</b> Conventions beat cleverness; nothing invented where a standard exists.</div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Menu bar ships visible.</b> You live in menus, buyers may live in the palette. Both first-class.</div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">You own the title bar.</b> §4 lists what that obliges you to handle.</div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">1440p + 1080p, unknown future.</b> DPI rounding is a hard rule — §3.</div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Markdown is the priority.</b> Redesigned inside the fixed cell grid — §9.</div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Filter stays smooth to 10 GB.</b> Streaming pass, no modal — §14.</div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Themes may use any colour.</b> Warn once, never clamp — §17.</div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Icon needed.</b> Three directions in §16.</div>
+    </div>
+
+    <div style="margin-top: 26px; padding: 22px 26px; background: #1c1917; border-radius: 8px; box-shadow: 0 0 0 1px rgba(224,164,88,0.28); max-width: 940px;">
+      <div style="font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase; color: #e0a458; padding-bottom: 12px;">How to use this document</div>
+      <div style="display: flex; flex-direction: column; gap: 10px; font-size: 13px; line-height: 1.65; color: #cdc3b4;">
+        <div><b style="color: #f2ebe0; font-weight: 500;">This is a target state, not an audit of the codebase.</b> It was written from screenshots, the theme file, and the colour-rules file — nothing else. It does not know what is already implemented. Every item is a value to verify against the code, and only changed where the code disagrees.</div>
+        <div><b style="color: #f2ebe0; font-weight: 500;">Read <span style="color: #d99b62;">NEW</span> as "if not already present."</b> The badge marks something not visible in the screenshots. If it exists, the badge is wrong and the surrounding spec still applies.</div>
+        <div><b style="color: #f2ebe0; font-weight: 500;">Where the text says "in the screenshots", that is the entire evidence.</b> Treat those as observations to confirm, not as defects to fix on sight.</div>
+        <div><b style="color: #f2ebe0; font-weight: 500;">Do not refactor working code to match the structure implied here.</b> Struct names, file layout, and function boundaries in §7, §9 and §14 are illustrative. The numbers, colours, role names, and behaviours are the deliverable; the code shape is not.</div>
+        <div><b style="color: #f2ebe0; font-weight: 500;">Effort estimates in §19 assume building from nothing.</b> Subtract whatever already exists. The ordering still holds, because it is driven by dependencies: theme → metrics struct → DPI → everything else.</div>
+        <div><b style="color: #f2ebe0; font-weight: 500;">If the code and this document conflict on a fact, the code wins.</b> If they conflict on a value — a size, a colour, a ratio — this document is the intended value and the reason is stated next to it.</div>
+        <div style="padding-top: 4px; border-top: 1px solid #322d28; margin-top: 4px;"><b style="color: #f2ebe0; font-weight: 500;">Handing this to a coding session:</b> use <a href="newtpad-ui-spec.md">newtpad-ui-spec.md</a> — the same content as plain markdown, plus the rendering pipeline and rasterisation notes, in a form a coding agent reads reliably. This page is the visual reference: keep it open alongside for the rendered examples of every screen.</div>
+      </div>
+    </div>
+
+    <div style="display: flex; flex-wrap: wrap; gap: 8px 18px; margin-top: 26px; font-size: 13px; color: #8f8578; max-width: 1000px;">
+      <a href="#s1">1 Theme files</a><a href="#s2">2 Metrics</a><a href="#s3">3 DPI</a><a href="#s4">4 Shell</a><a href="#s5">5 Narrow</a><a href="#s6">6 Menus</a><a href="#s7">7 Palette</a><a href="#s8">8 Editor</a><a href="#s9">9 Markdown</a><a href="#s10">10 Table</a><a href="#s11">11 Settings</a><a href="#s12">12 Find</a><a href="#s13">13 Status</a><a href="#s14">14 Huge files</a><a href="#s15">15 Empty tab</a><a href="#s16">16 Icon</a><a href="#s17">17 Themes</a><a href="#s18">18 Motion &amp; a11y</a><a href="#s19">19 Build order</a>
+    </div>
+  </div>
+
+  <!-- ===== 1 ===== -->
+  <div id="s1" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">1</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Theme files</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 26px;"></div>
+
+    <p style="margin: 0 0 18px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 860px;">Your format needs nine more roles. Everything in this document is hard-coded to nothing — every colour on every screen resolves through one of these names, so a themer can restyle the whole app and a colour rule keeps working in both themes. New roles are marked <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; color: #d99b62;">NEW</span>.</p>
+
+    <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px 26px; max-width: 1140px; margin-bottom: 30px;">
+      <div style="font-size: 13px; line-height: 1.6;"><b style="font-family: 'Monaspace Neon', monospace; color: #d99b62; font-weight: 400;">bg_hover</b> <span style="color: #9d9284;">— hover fill for any tab, menu item, settings row or palette row. If the hover colour is currently implicit, it needs a key: a themer cannot change what has no name.</span></div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="font-family: 'Monaspace Neon', monospace; color: #d99b62; font-weight: 400;">accent_wash</b> <span style="color: #9d9284;">— the fill behind a selected settings row. Deriving it from <span style="font-family: 'Monaspace Neon', monospace;">accent</span> by alpha breaks on a light custom theme.</span></div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="font-family: 'Monaspace Neon', monospace; color: #d99b62; font-weight: 400;">focus_ring</b> <span style="color: #9d9284;">— defaults to <span style="font-family: 'Monaspace Neon', monospace;">accent</span>, separable because a themer may want accent quiet and focus loud.</span></div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="font-family: 'Monaspace Neon', monospace; color: #d99b62; font-weight: 400;">scrollbar_thumb</b> <span style="color: #9d9284;">— if the thumb colour is not already a role, make it one. It sits on <span style="font-family: 'Monaspace Neon', monospace;">bg_base</span> and needs 3:1.</span></div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="font-family: 'Monaspace Neon', monospace; color: #d99b62; font-weight: 400;">table_zebra</b> <span style="color: #9d9284;">— alternating row fill in table view, replacing the column rules (§10).</span></div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="font-family: 'Monaspace Neon', monospace; color: #d99b62; font-weight: 400;">md_bold</b> <span style="color: #9d9284;">— the role list has <span style="font-family: 'Monaspace Neon', monospace;">md_italic</span> but no bold. If that is still true, bold has nowhere to go.</span></div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="font-family: 'Monaspace Neon', monospace; color: #d99b62; font-weight: 400;">md_code_bg</b> <span style="color: #9d9284;">— code spans and fenced blocks need a fill, not just a foreground (§9).</span></div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="font-family: 'Monaspace Neon', monospace; color: #d99b62; font-weight: 400;">md_rule</b> <span style="color: #9d9284;">— thematic breaks, table borders, and the heading underline in preview.</span></div>
+      <div style="font-size: 13px; line-height: 1.6;"><b style="font-family: 'Monaspace Neon', monospace; color: #d99b62; font-weight: 400;">md_list_mark</b> <span style="color: #9d9284;">— bullets and ordinals. Wants to be quieter than <span style="font-family: 'Monaspace Neon', monospace;">md_heading</span> but louder than body.</span></div>
+    </div>
+
+    <h3 style="margin: 0 0 12px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">1.1 Dark.theme — paste-ready</h3>
+    <div style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 1.75; color: #cdc3b4; background: #1c1917; border-radius: 8px; padding: 20px 22px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); white-space: pre; max-width: 1140px;"><span style="color: #9d9284;"># Newtpad theme -- Dark
+#
+# base dark
+# Ratios in comments are against bg_base unless marked. All clear WCAG AA
+# for body text except text_dim, which is disabled-only (see §18).</span>
+
+base dark
+
+<span style="color: #9d9284;"># --- neutrals ---</span>
+bg_base        <span style="color: #97c3d8;">#221F1C</span>   <span style="color: #9d9284;"># document surface, menu bar, settings page</span>
+bg_panel       <span style="color: #97c3d8;">#1C1917</span>   <span style="color: #9d9284;"># tab rail, status bar -- the frame</span>
+bg_raised      <span style="color: #97c3d8;">#2B2724</span>   <span style="color: #9d9284;"># active tab, menus, palette, table header</span>
+bg_hover       <span style="color: #97c3d8;">#302B27</span>   <span style="color: #9d9284;"># NEW  any hoverable row or pill</span>
+border_subtle  <span style="color: #97c3d8;">#322D28</span>   <span style="color: #9d9284;"># the only separator in the app, 1px</span>
+border_strong  <span style="color: #97c3d8;">#4A4339</span>   <span style="color: #9d9284;"># table header rule, input underline</span>
+text_muted     <span style="color: #97c3d8;">#9D9284</span>   <span style="color: #9d9284;"># 4.9  accelerators, help lines, hints</span>
+text_dim       <span style="color: #97c3d8;">#6F665C</span>   <span style="color: #9d9284;"># 2.6  DISABLED ONLY -- never live text</span>
+text_secondary <span style="color: #97c3d8;">#B3A897</span>   <span style="color: #9d9284;"># 6.6  inactive tabs, status bar, chrome</span>
+text_primary   <span style="color: #97c3d8;">#CDC3B4</span>   <span style="color: #9d9284;"># 9.2  document body -- the default</span>
+text_bright    <span style="color: #97c3d8;">#F2EBE0</span>   <span style="color: #9d9284;"># 13.4 active tab label, titles</span>
+
+<span style="color: #9d9284;"># --- accents ---</span>
+selection_doc  <span style="color: #97c3d8;">#33424A</span>   <span style="color: #9d9284;"># text_primary on it: 8.9 -- test this, not bg_base</span>
+selection_list <span style="color: #97c3d8;">#3A352F</span>   <span style="color: #9d9284;"># keyboard cursor in settings/palette/table</span>
+caret          <span style="color: #97c3d8;">#D99B62</span>   <span style="color: #9d9284;"># 7.3, drawn 2px wide (was 1px)</span>
+accent         <span style="color: #97c3d8;">#D99B62</span>   <span style="color: #9d9284;"># 7.3  one accent, state only, never decoration</span>
+accent_wash    <span style="color: #97c3d8;">#302823</span>   <span style="color: #9d9284;"># NEW  selected settings row, filter band</span>
+focus_ring     <span style="color: #97c3d8;">#D99B62</span>   <span style="color: #9d9284;"># NEW  2px, 1px offset, every focusable thing</span>
+scrollbar_thumb <span style="color: #97c3d8;">#3E3833</span>  <span style="color: #9d9284;"># NEW  3.0 against bg_base</span>
+table_zebra    <span style="color: #97c3d8;">#262320</span>   <span style="color: #9d9284;"># NEW  every other table row</span>
+find_match_bg  <span style="color: #97c3d8;">#4A3826</span>   <span style="color: #9d9284;"># non-current hits; current hit uses accent fill</span>
+match_mark     <span style="color: #97c3d8;">#D99B62</span>   <span style="color: #9d9284;"># scrollbar tick marks</span>
+link           <span style="color: #97c3d8;">#97C3D8</span>   <span style="color: #9d9284;"># 8.2, plus a 1px 35%-alpha underline</span>
+warning        <span style="color: #97c3d8;">#E0A458</span>   <span style="color: #9d9284;"># 7.6</span>
+danger         <span style="color: #97c3d8;">#C0453B</span>   <span style="color: #9d9284;"># white on it: 4.7 -- close hover, unsaved-close</span>
+success        <span style="color: #97c3d8;">#9DC9A0</span>   <span style="color: #9d9284;"># 8.6</span>
+filter_bg      <span style="color: #97c3d8;">#2E2823</span>   <span style="color: #9d9284;"># filter mode band -- a mode must be obvious</span>
+filter_text    <span style="color: #97c3d8;">#E5B57F</span>   <span style="color: #9d9284;"># 8.4 on filter_bg</span>
+bookmark       <span style="color: #97c3d8;">#97C3D8</span>
+
+<span style="color: #9d9284;"># --- markdown ---</span>
+md_heading     <span style="color: #97c3d8;">#E5B57F</span>   <span style="color: #9d9284;"># 8.4  all levels; size carries the level, not hue</span>
+md_bold        <span style="color: #97c3d8;">#EFE7DB</span>   <span style="color: #9d9284;"># NEW  12.7 -- weight does the work, colour assists</span>
+md_italic      <span style="color: #97c3d8;">#C4B79F</span>   <span style="color: #9d9284;"># 8.0  slanted face, very slightly cooler</span>
+md_code        <span style="color: #97c3d8;">#97C3D8</span>   <span style="color: #9d9284;"># 8.2  same hue as link: both point elsewhere</span>
+md_code_bg     <span style="color: #97c3d8;">#2A2723</span>   <span style="color: #9d9284;"># NEW  code span and fence fill</span>
+md_quote       <span style="color: #97c3d8;">#A69B8B</span>   <span style="color: #9d9284;"># 5.6  quieter than body, plus a 2px accent bar</span>
+md_rule        <span style="color: #97c3d8;">#3A342E</span>   <span style="color: #9d9284;"># NEW  --- breaks, table borders, h1/h2 underline</span>
+md_list_mark   <span style="color: #97c3d8;">#D99B62</span>   <span style="color: #9d9284;"># NEW  bullets and ordinals only</span>
+
+<span style="color: #9d9284;"># --- syntax: five hues, one job each ---</span>
+syn_keyword    <span style="color: #97c3d8;">#D3A9CD</span>   <span style="color: #9d9284;"># 7.4  mauve -- language words</span>
+syn_string     <span style="color: #97c3d8;">#9DC9A0</span>   <span style="color: #9d9284;"># 8.6  green -- literal content</span>
+syn_number     <span style="color: #97c3d8;">#E5B57F</span>   <span style="color: #9d9284;"># 8.4  amber -- numbers, true/false/null</span>
+syn_comment    <span style="color: #97c3d8;">#9D9284</span>   <span style="color: #9d9284;"># 4.9  grey -- AA, so comments stay readable</span>
+syn_type       <span style="color: #97c3d8;">#97C3D8</span>   <span style="color: #9d9284;"># 8.2  blue -- types, tags, references</span>
+syn_punct      <span style="color: #97c3d8;">#A69B8B</span>   <span style="color: #9d9284;"># 5.6  braces, pipes, commas</span>
+syn_json_key   <span style="color: #97c3d8;">#EFE7DB</span>   <span style="color: #9d9284;"># 12.7 keys are the index you scan: brightest</span>
+syn_xml_tag    <span style="color: #97c3d8;">#D3A9CD</span>   <span style="color: #9d9284;"># tags are keywords</span>
+syn_xml_attr   <span style="color: #97c3d8;">#E5B57F</span></div>
+
+    <h3 style="margin: 36px 0 12px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">1.2 Light.theme — paste-ready</h3>
+    <p style="margin: 0 0 14px 0; font-size: 13.5px; line-height: 1.7; color: #cdc3b4; max-width: 860px;">Not a second design — the same file with different values. Two deliberate departures from your current light theme: the page is <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; color: #97c3d8;">#FAF8F3</span> rather than pure white so it does not glare beside a dark desktop, and the neutrals are warm rather than blue-grey, which is most of what makes the current light theme feel like a dev tool.</p>
+    <div style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 1.75; color: #cdc3b4; background: #1c1917; border-radius: 8px; padding: 20px 22px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); white-space: pre; max-width: 1140px;"><span style="color: #9d9284;"># Newtpad theme -- Light</span>
+
+base light
+
+<span style="color: #9d9284;"># --- neutrals ---</span>
+bg_base        <span style="color: #97c3d8;">#FAF8F3</span>   <span style="color: #9d9284;"># warm paper, not white</span>
+bg_panel       <span style="color: #97c3d8;">#EEEAE2</span>
+bg_raised      <span style="color: #97c3d8;">#FFFFFF</span>   <span style="color: #9d9284;"># raised is lighter than base in light themes</span>
+bg_hover       <span style="color: #97c3d8;">#E8E3D9</span>
+border_subtle  <span style="color: #97c3d8;">#DED8CC</span>
+border_strong  <span style="color: #97c3d8;">#B9B0A2</span>
+text_muted     <span style="color: #97c3d8;">#6B6156</span>   <span style="color: #9d9284;"># 5.4</span>
+text_dim       <span style="color: #97c3d8;">#9A9186</span>   <span style="color: #9d9284;"># 2.6  disabled only</span>
+text_secondary <span style="color: #97c3d8;">#5F574D</span>   <span style="color: #9d9284;"># 7.1</span>
+text_primary   <span style="color: #97c3d8;">#3D372F</span>   <span style="color: #9d9284;"># 10.4</span>
+text_bright    <span style="color: #97c3d8;">#2C2620</span>   <span style="color: #9d9284;"># 13.9</span>
+
+<span style="color: #9d9284;"># --- accents ---</span>
+selection_doc  <span style="color: #97c3d8;">#CFDBE2</span>   <span style="color: #9d9284;"># text_primary on it: 9.6</span>
+selection_list <span style="color: #97c3d8;">#DCD6CA</span>
+caret          <span style="color: #97c3d8;">#A05A1E</span>   <span style="color: #9d9284;"># 4.8</span>
+accent         <span style="color: #97c3d8;">#A05A1E</span>   <span style="color: #9d9284;"># 4.8</span>
+accent_wash    <span style="color: #97c3d8;">#F2E6D8</span>
+focus_ring     <span style="color: #97c3d8;">#A05A1E</span>
+scrollbar_thumb <span style="color: #97c3d8;">#C9C2B5</span>  <span style="color: #9d9284;"># 3.0 against bg_base</span>
+table_zebra    <span style="color: #97c3d8;">#F4F1EA</span>
+find_match_bg  <span style="color: #97c3d8;">#F0DFBE</span>
+match_mark     <span style="color: #97c3d8;">#A05A1E</span>
+link           <span style="color: #97c3d8;">#1F5F78</span>   <span style="color: #9d9284;"># 6.4</span>
+warning        <span style="color: #97c3d8;">#9A5A12</span>   <span style="color: #9d9284;"># 5.1</span>
+danger         <span style="color: #97c3d8;">#B23A30</span>   <span style="color: #9d9284;"># white on it: 5.4</span>
+success        <span style="color: #97c3d8;">#2F6B47</span>   <span style="color: #9d9284;"># 5.9</span>
+filter_bg      <span style="color: #97c3d8;">#F3E8D9</span>
+filter_text    <span style="color: #97c3d8;">#7A4A12</span>   <span style="color: #9d9284;"># 6.2 on filter_bg</span>
+bookmark       <span style="color: #97c3d8;">#1F5F78</span>
+
+<span style="color: #9d9284;"># --- markdown ---</span>
+md_heading     <span style="color: #97c3d8;">#8A5416</span>   <span style="color: #9d9284;"># 6.1</span>
+md_bold        <span style="color: #97c3d8;">#2C2620</span>   <span style="color: #9d9284;"># 13.9</span>
+md_italic      <span style="color: #97c3d8;">#5C5240</span>   <span style="color: #9d9284;"># 7.4</span>
+md_code        <span style="color: #97c3d8;">#1F5F78</span>   <span style="color: #9d9284;"># 6.4</span>
+md_code_bg     <span style="color: #97c3d8;">#F0EDE4</span>
+md_quote       <span style="color: #97c3d8;">#6B6156</span>   <span style="color: #9d9284;"># 5.4</span>
+md_rule        <span style="color: #97c3d8;">#DED8CC</span>
+md_list_mark   <span style="color: #97c3d8;">#A05A1E</span>
+
+<span style="color: #9d9284;"># --- syntax ---</span>
+syn_keyword    <span style="color: #97c3d8;">#7A3F77</span>   <span style="color: #9d9284;"># 6.8</span>
+syn_string     <span style="color: #97c3d8;">#2F6B47</span>   <span style="color: #9d9284;"># 5.9</span>
+syn_number     <span style="color: #97c3d8;">#8A5416</span>   <span style="color: #9d9284;"># 6.1</span>
+syn_comment    <span style="color: #97c3d8;">#6B6156</span>   <span style="color: #9d9284;"># 5.4</span>
+syn_type       <span style="color: #97c3d8;">#1F5F78</span>   <span style="color: #9d9284;"># 6.4</span>
+syn_punct      <span style="color: #97c3d8;">#5F574D</span>   <span style="color: #9d9284;"># 7.1</span>
+syn_json_key   <span style="color: #97c3d8;">#2C2620</span>   <span style="color: #9d9284;"># 13.9</span>
+syn_xml_tag    <span style="color: #97c3d8;">#7A3F77</span>
+syn_xml_attr   <span style="color: #97c3d8;">#8A5416</span></div>
+
+    <h3 style="margin: 36px 0 12px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">1.3 Rules the palette obeys</h3>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">One accent, state only.</b> If a colour is not telling you something is selected, dirty, focused, found, or dangerous, it is a neutral. That single rule is what separates this from the accent-on-everything look.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Warm neutrals, chroma under 0.02.</b> Every grey has a trace of the accent's hue in it. Cold greys read as tooling; warm greys read as paper. This is most of the "cosy".</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Five syntax hues, no more.</b> A sixth hue always looks arbitrary. Distinguish more token types by lightness within a hue instead — that is why <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">syn_json_key</span> is bright neutral rather than a new colour.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Type does hierarchy, colour does state.</b> Heading level is size and weight, never hue — which is why all six markdown heading levels share <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">md_heading</span>.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Measure text on what it sits on.</b> Selection, find matches, and the filter band all change the background under text; each of those pairs is listed with its own ratio above.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Store alphas, not resolved hex.</b> Where a value is "12% accent", keep it as an alpha over the surface so it stays correct when a user replaces <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">accent</span>. The two files above resolve them only for readability.</div>
+    </div>
+  </div>
+
+  <!-- ===== 2 METRICS ===== -->
+  <div id="s2" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">2</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Metrics &amp; type</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 26px;"></div>
+
+    <p style="margin: 0 0 20px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 860px;">All values in logical pixels at 100%. 4px base unit; every row height is a multiple of 2. Scale by DPI then round per §3 — never emit a fractional rect.</p>
+
+    <div style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 1.8; color: #cdc3b4; background: #1c1917; border-radius: 8px; padding: 20px 22px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); white-space: pre; max-width: 1140px;"><span style="color: #e5b57f;">CHROME</span>
+tab rail height          40      bg_panel
+tab height / radius      30 / 6  bg_raised when active, bg_hover on hover, else none
+tab min / max width      132 / 220
+tab padding              0 9 0 12    (0 9 0 4 when the dirty slot is present)
+dirty slot               8       reserved on EVERY tab so nothing shifts
+tab gap                  3
+close button             16 box inside a 24 hit area
+new-tab button           30 x 30, radius 6
+caption button           46 x 40, 1px geometry inside a 10 x 10 box
+menu bar height          30      bg_base
+menu item                22 tall, radius 4, padding 0 10
+status bar height        26      bg_panel, 1px border_subtle on top
+status cell padding      0 12, 1px border_subtle between cells
+
+<span style="color: #e5b57f;">SURFACES</span>
+menu panel               5 padding, radius 7, 1px border_subtle ring
+menu row                 28 tall, radius 5, padding 0 10
+menu divider             1px, 5 margin, 10 inset each side
+palette panel            520 wide, radius 8
+palette input row        42 tall
+palette result row       30 tall, radius 5
+tooltip                  24 tall, radius 5, padding 0 8, 11.5px
+
+<span style="color: #e5b57f;">EDITOR</span>
+top padding              16      never 0 -- the first line needs air
+side padding             24
+line height              1.6 x font size, rounded to an even integer
+caret width              2       (was 1)
+gutter width             44 right-aligned + 12 gap, optional, off by default
+scrollbar                8 wide, 4 radius, 6 inset from the right edge
+tick marks               3 wide, 2 tall, in the scrollbar track
+
+<span style="color: #e5b57f;">RADII -- the whole list</span>
+0    editor, menu bar, status bar, table rows
+4    menu bar items
+5    menu rows, palette rows, close button, tooltips
+6    tabs, find bar, commands control
+7    menu and palette panels
+8    settings cards, the window itself
+<span style="color: #9d9284;">Nothing is larger than 8. No gradients. No blur. No glow. Shadows on
+menus and the palette only -- those are the only things that float.</span></div>
+
+    <h3 style="margin: 34px 0 12px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">2.1 Type</h3>
+    <p style="margin: 0 0 16px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 860px;">Two families by one designer, so they never clash. <b style="color: #f2ebe0; font-weight: 500;">Monaspace Neon</b> for the document — the setting you already have, and your Font screen already says why proportional families are not offered. <b style="color: #f2ebe0; font-weight: 500;">Monaspace Argon</b> for chrome, which is the single change that most removes the developer-tool feel. Ship both as static regular + bold (~1.1 MB for four faces) and keep Consolas as the fallback so a missing font is never fatal.</p>
+    <div style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 1.8; color: #cdc3b4; background: #1c1917; border-radius: 8px; padding: 20px 22px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); white-space: pre; max-width: 1140px;">document        Neon    user-set, default 11pt / 1.6 line     text_primary
+tab label       Argon   12.5px / 400                          text_secondary
+menu item       Argon   12.5px / 400                          text_primary
+status bar      Argon   11.5px / 400  -- the floor, nothing smaller
+settings title  Argon   13.5px / 400                          text_primary
+settings desc   Argon   12px / 400                            text_muted
+settings value  Argon   13px / 400                            text_secondary
+screen title    Argon   19px / 500                            text_bright
+group header    Argon   11.5px / 500, 0.1em tracking, caps     text_muted
+palette query   Neon    13.5px                                text_bright
+palette row     Argon   12.5px                                text_primary
+accelerator     Neon    11.5px  -- mono so Ctrl+ columns align text_muted
+tabular data    Neon    12.5px, tnum always on
+<span style="color: #9d9284;">Chrome sets calt off (no ligatures). The document leaves it user-controlled.
+Nothing below 11.5px anywhere, at any zoom level, in any screen.</span></div>
+  </div>
+
+  <!-- ===== 3 DPI ===== -->
+  <div id="s3" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">3</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">DPI — the most likely source of "still looks a bit off"</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 26px;"></div>
+
+    <p style="margin: 0 0 20px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">This is a checklist to verify against the existing code, not an assumption that any of it is missing. A 1440p and a 1080p monitor side by side is the worst case, because dragging the window between them changes DPI mid-session and Windows hands back a suggested rect at the new scale. Where an item is already handled, the value it should be verified against is stated so it can be checked rather than rewritten.</p>
+
+    <ol style="margin: 0; padding-left: 22px; font-size: 13.5px; line-height: 1.75; color: #cdc3b4; max-width: 900px; display: flex; flex-direction: column; gap: 11px;">
+      <li><b style="color: #f2ebe0; font-weight: 500;">Per-monitor v2 awareness declared in the manifest</b> (<span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">dpiAwareness = PerMonitorV2</span>), not by calling <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">SetProcessDpiAwareness</span> at runtime. Manifest-declared awareness applies before the first window exists, so the first frame is already correct. v2 also gets you correctly scaled non-client area and dialogs.</li>
+      <li><b style="color: #f2ebe0; font-weight: 500;">Confirm the <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">WM_DPICHANGED</span> order:</b> take the suggested rect from <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">lParam</span> and <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">SetWindowPos</span> to it exactly, then rebuild the metrics struct, then re-bake the glyph atlas at the new pixel size, then invalidate. In that order — rebuilding the atlas before resizing wastes a bake.</li>
+      <li><b style="color: #f2ebe0; font-weight: 500;">Round every metric once, at the point of scaling, into a struct.</b> Compute <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">m.tab_h = round(30 * s)</span> once per DPI change and read <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">m.tab_h</span> everywhere. Never scale at the call site — that is how two things that should align end up one pixel apart at 125%.</li>
+      <li><b style="color: #f2ebe0; font-weight: 500;">Hairlines: <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">max(1, floor(s))</span>, never <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">round</span>.</b> At 125% a rounded hairline becomes 1px at an offset that straddles two device pixels and renders as two half-alpha lines — grey mush. Floor it and snap its position to an integer.</li>
+      <li><b style="color: #f2ebe0; font-weight: 500;">Caption geometry is drawn, so scale the stroke too.</b> The 10×10 box becomes <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">round(10*s)</span> and the 1px stroke becomes <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">max(1, round(s))</span>. At 150% that is a 15px box with a 2px stroke, which is right; a 1px stroke in a 15px box looks broken.</li>
+      <li><b style="color: #f2ebe0; font-weight: 500;">Font size is the one thing to round to even.</b> Cell width and line height derive from it, and an odd line height makes vertical centring inside a 30px row land on a half pixel. Round the pixel size to even, then derive.</li>
+      <li><b style="color: #f2ebe0; font-weight: 500;">One atlas per (family, size, weight, DPI).</b> Keep the previous DPI's atlas alive for a few seconds when dragging between monitors — users drag back and forth, and re-baking twice a second is the one place this design could actually stutter.</li>
+      <li><b style="color: #f2ebe0; font-weight: 500;">Test matrix, whatever the current state:</b> 100 / 125 / 150 / 175 / 200%, and the drag between the two real monitors. At each one, check the menu-bar hairline, the caption stroke, the status-bar cell dividers, and the active tab's left edge against the editor's left padding. Those four catch nearly everything.</li>
+    </ol>
+  </div>
+
+  <!-- ===== 4 SHELL ===== -->
+  <div id="s4" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">4</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Window shell</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 26px;"></div>
+
+    <div style="width: 1140px; border-radius: 8px; overflow: hidden; background: #221f1c; box-shadow: 0 18px 50px -12px rgba(0,0,0,0.7), 0 0 0 1px rgba(255,246,232,0.07); margin-bottom: 18px;">
+      <div style="height: 40px; display: flex; align-items: stretch; background: #1c1917;">
+        <div style="display: flex; align-items: center; gap: 3px; flex: 1; min-width: 0; padding: 0 4px;">
+          <div style="height: 30px; display: flex; align-items: center; gap: 9px; padding: 0 9px 0 12px; border-radius: 6px; background: #2b2724;"><span style="font-size: 12.5px; color: #f2ebe0;">clients.json</span><span style="width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; border-radius: 3px; color: #b3a897; font-size: 11px;">✕</span></div>
+          <div style="height: 30px; display: flex; align-items: center; gap: 9px; padding: 0 9px 0 12px; border-radius: 6px;"><span style="font-size: 12.5px; color: #b3a897;">projects.json</span><span style="width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; color: #8f8578; font-size: 11px;">✕</span></div>
+          <div style="height: 30px; display: flex; align-items: center; gap: 9px; padding: 0 9px 0 12px; border-radius: 6px; background: #302b27;"><span style="font-size: 12.5px; color: #cdc3b4;">wbs.json</span><span style="width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; border-radius: 3px; color: #b3a897; font-size: 11px;">✕</span></div>
+          <div style="height: 30px; display: flex; align-items: center; gap: 9px; padding: 0 9px 0 4px; border-radius: 6px;"><span style="width: 8px; text-align: center; font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">*</span><span style="font-size: 12.5px; color: #b3a897; margin-left: -3px;">20260723.csv</span><span style="width: 16px; height: 16px; display: flex; align-items: center; justify-content: center; color: #8f8578; font-size: 11px;">✕</span></div>
+          <div style="height: 30px; width: 30px; display: flex; align-items: center; justify-content: center; border-radius: 6px; color: #b3a897; font-size: 15px;">+</div>
+        </div>
+        <div style="display: flex; align-items: center; padding: 0 6px;"><span style="width: 26px; height: 26px; display: flex; align-items: center; justify-content: center; border-radius: 5px; font-family: 'Monaspace Neon', monospace; font-size: 14px; color: #b3a897;">&gt;_</span></div>
+        <div style="display: flex; align-items: stretch;">
+          <div style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 1px; background: #cdc3b4;"></span></div>
+          <div style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 10px; border: 1px solid #cdc3b4; box-sizing: border-box;"></span></div>
+          <div style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 10px; position: relative;"><span style="position: absolute; top: 4.5px; left: -2px; width: 14px; height: 1px; background: #cdc3b4; transform: rotate(45deg);"></span><span style="position: absolute; top: 4.5px; left: -2px; width: 14px; height: 1px; background: #cdc3b4; transform: rotate(-45deg);"></span></span></div>
+        </div>
+      </div>
+      <div style="height: 30px; display: flex; align-items: center; gap: 2px; padding: 0 6px; background: #221f1c; border-bottom: 1px solid #322d28; box-sizing: border-box;">
+        <span style="height: 22px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 12.5px; color: #cdc3b4;">File</span>
+        <span style="height: 22px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 12.5px; color: #cdc3b4;">Edit</span>
+        <span style="height: 22px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 12.5px; color: #cdc3b4;">View</span>
+        <span style="height: 22px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 12.5px; color: #cdc3b4;">Encoding</span>
+        <span style="height: 22px; display: flex; align-items: center; padding: 0 10px; border-radius: 4px; font-size: 12.5px; color: #cdc3b4;">Help</span>
+        <span style="width: 1px; height: 16px; background: #322d28; margin: 0 6px;"></span>
+        <span style="height: 22px; display: flex; align-items: center; gap: 8px; padding: 0 10px; border-radius: 4px; font-size: 12.5px; color: #b3a897;">Commands<span style="font-size: 11.5px; color: #9d9284; font-family: 'Monaspace Neon', monospace;">Ctrl+P</span></span>
+      </div>
+      <div style="height: 150px; background: #221f1c; padding: 16px 24px; font-family: 'Monaspace Neon', monospace; font-size: 13.5px; line-height: 22px; color: #cdc3b4; white-space: pre; box-sizing: border-box;"><div><span style="color: #efe7db;">{</span></div><div>    <span style="color: #efe7db;">"name"</span><span style="color: #a69b8b;">:</span> <span style="color: #9dc9a0;">"Clients"</span><span style="color: #a69b8b;">,</span></div><div>    <span style="color: #efe7db;">"properties"</span><span style="color: #a69b8b;">:</span> <span style="color: #efe7db;">{</span></div><div>        <span style="color: #efe7db;">"retry"</span><span style="color: #a69b8b;">:</span> <span style="color: #e5b57f;">0</span><span style="color: #a69b8b;">,</span> <span style="color: #efe7db;">"secureOutput"</span><span style="color: #a69b8b;">:</span> <span style="color: #e5b57f;">false</span></div><div>    <span style="color: #efe7db;">}</span></div><div><span style="color: #efe7db;">}</span></div></div>
+      <div style="height: 26px; display: flex; align-items: center; justify-content: space-between; background: #1c1917; border-top: 1px solid #322d28; font-size: 11.5px; color: #b3a897; box-sizing: border-box;">
+        <div style="display: flex; height: 100%;"><span style="padding: 0 12px; display: flex; align-items: center;">Ln 4, Col 18</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">6 lines</span></div>
+        <div style="display: flex; height: 100%;"><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">JSON</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">UTF-8</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">LF</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">Tab 4</span></div>
+      </div>
+    </div>
+    <p style="margin: 0 0 24px 0; font-size: 12.5px; color: #8f8578;">Tab 3 shown hovered. <span style="font-family: 'Monaspace Neon', monospace; color: #cdc3b4;">&gt;_</span> is the palette entry (3a); <i>Commands</i> after the menu-bar divider is 3b. JSON keys are <span style="font-family: 'Monaspace Neon', monospace; color: #efe7db;">syn_json_key</span> — brightest, because keys are the index you scan.</p>
+
+    <h3 style="margin: 0 0 12px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">4.1 Owning the caption area — the checklist</h3>
+    <p style="margin: 0 0 14px 0; font-size: 13.5px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">You said you own the title bar and that a few of these are missing, so this is a checklist rather than a list of gaps. Each one gets reported as a bug when absent, because every other Windows app has it.</p>
+    <div style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 1.85; color: #cdc3b4; background: #1c1917; border-radius: 8px; padding: 20px 22px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); white-space: pre; max-width: 1140px;">WM_NCHITTEST     return HTCAPTION for empty rail space  -> drag the window
+                 HTCLIENT over tabs, buttons, the >_     -> they stay clickable
+                 HTMINBUTTON/HTMAXBUTTON/HTCLOSE for the three caption buttons
+                 <span style="color: #9d9284;">HTMAXBUTTON is what makes Win11 snap layouts appear on hover.</span>
+                 <span style="color: #9d9284;">Without it, hovering maximise shows nothing and users think it is broken.</span>
+WM_NCCALCSIZE    extend the client area over the caption; keep the 8px resize
+                 border or the window cannot be resized from the top edge
+double-click     on empty rail space = maximise / restore
+right-click      on empty rail space = the system menu (Move, Size, Close)
+                 <span style="color: #9d9284;">Cheap to forget, and its absence feels non-native immediately.</span>
+Win+arrow, snap  work for free once NCCALCSIZE and NCHITTEST are right
+DWM corners      Win11 rounds the window; do not draw your own 8px radius on
+                 top of it -- set DWMWCP_ROUND and let the compositor do it
+inactive window  dim text_secondary -> text_muted on deactivate. One value,
+                 and it is how a user tells which window has focus
+maximised state  drop the window radius to 0 and remove the outer ring
+</div>
+    <h3 style="margin: 30px 0 12px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">4.2 Tabs</h3>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Dirty marker.</b> Accent asterisk in a reserved 8px slot on every tab, so the label's truncation point never moves when a file becomes dirty. Not prepended to the filename string.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Truncation.</b> Shrink from 220 toward the 132 floor first; then ellipsise the middle, not the end — <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">2026-07-27…-sync.md</span> keeps the extension, which is what identifies the file.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Ambiguous names.</b> When two open tabs share a filename, append the parent folder to both in <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_muted</span>. Full path in a tooltip after 500ms, always.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Close.</b> 16px geometry in a 24px hit area; visible only on the active tab and on hover, so a row of idle tabs is quiet. Middle-click closes any tab.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Reorder.</b> Drag with a 4px threshold; the dragged pill lifts to <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">bg_raised</span> with the panel shadow and others slide 50ms. Drop outside the rail does nothing (no tear-off).</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Closing a dirty tab.</b> Not a modal — the tab turns <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">danger</span>-tinted and shows <i>Save · Discard · Cancel</i> inline in the rail for 4 seconds. Keyboard: Enter saves, Esc cancels.</div>
+    </div>
+  </div>
+
+  <!-- ===== 5 NARROW ===== -->
+  <div id="s5" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">5</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Narrow windows — the drop order</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 26px;"></div>
+    <p style="margin: 0 0 22px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">Your instinct was right and it generalises: things leave in reverse order of need, and the survivors are the ones the OS requires. Define this now and it is a table; discover it later and it is a bug report about overlapping controls. Widths are the window's client width at 100%.</p>
+
+    <div style="display: flex; flex-direction: column; gap: 18px; max-width: 1140px;">
+      <div style="display: flex; flex-direction: column; gap: 7px;">
+        <div style="font-size: 12px; color: #9d9284;"><b style="color: #cdc3b4; font-weight: 500;">≥ 900px</b> — everything</div>
+        <div style="height: 40px; display: flex; align-items: stretch; background: #1c1917; border-radius: 6px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); overflow: hidden;">
+          <div style="display: flex; align-items: center; gap: 3px; flex: 1; padding: 0 4px; min-width: 0;">
+            <span style="height: 30px; display: flex; align-items: center; gap: 9px; padding: 0 9px 0 12px; border-radius: 6px; background: #2b2724; font-size: 12.5px; color: #f2ebe0;">clients.json <span style="color: #b3a897; font-size: 11px;">✕</span></span>
+            <span style="height: 30px; display: flex; align-items: center; gap: 9px; padding: 0 9px 0 12px; border-radius: 6px; font-size: 12.5px; color: #b3a897;">projects.json <span style="color: #8f8578; font-size: 11px;">✕</span></span>
+            <span style="height: 30px; display: flex; align-items: center; gap: 9px; padding: 0 9px 0 12px; border-radius: 6px; font-size: 12.5px; color: #b3a897;">wbs.json <span style="color: #8f8578; font-size: 11px;">✕</span></span>
+            <span style="height: 30px; width: 30px; display: flex; align-items: center; justify-content: center; border-radius: 6px; color: #b3a897; font-size: 15px;">+</span>
+          </div>
+          <div style="display: flex; align-items: center; padding: 0 6px;"><span style="width: 26px; height: 26px; display: flex; align-items: center; justify-content: center; font-family: 'Monaspace Neon', monospace; font-size: 14px; color: #b3a897;">&gt;_</span></div>
+          <div style="display: flex;"><span style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 1px; background: #cdc3b4;"></span></span><span style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 10px; border: 1px solid #cdc3b4; box-sizing: border-box;"></span></span><span style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 10px; position: relative;"><span style="position: absolute; top: 4.5px; left: -2px; width: 14px; height: 1px; background: #cdc3b4; transform: rotate(45deg);"></span><span style="position: absolute; top: 4.5px; left: -2px; width: 14px; height: 1px; background: #cdc3b4; transform: rotate(-45deg);"></span></span></span></div>
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 7px;">
+        <div style="font-size: 12px; color: #9d9284;"><b style="color: #cdc3b4; font-weight: 500;">700px</b> — <span style="color: #d99b62;">status cells drop</span> right-to-left: Tab width, then LF, then UTF-8, then the language. Ln/Col and the line count always stay.</div>
+        <div style="height: 26px; display: flex; align-items: center; justify-content: space-between; background: #1c1917; border-radius: 6px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); font-size: 11.5px; color: #b3a897; width: 700px;">
+          <div style="display: flex; height: 100%;"><span style="padding: 0 12px; display: flex; align-items: center;">Ln 124, Col 94</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">778 lines</span></div>
+          <div style="display: flex; height: 100%;"><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">Markdown</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">UTF-8</span></div>
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 7px;">
+        <div style="font-size: 12px; color: #9d9284;"><b style="color: #cdc3b4; font-weight: 500;">560px</b> — <span style="color: #d99b62;">tabs hit the 132px floor and the rail scrolls.</span> A chevron appears at each end when there is more; Ctrl+Tab lists all tabs in the palette. Do not shrink below 132: a tab with two visible characters is worse than a scroll.</div>
+        <div style="height: 40px; display: flex; align-items: stretch; background: #1c1917; border-radius: 6px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); width: 560px; overflow: hidden;">
+          <div style="width: 20px; display: flex; align-items: center; justify-content: center; color: #8f8578; font-size: 12px;">‹</div>
+          <div style="display: flex; align-items: center; gap: 3px; flex: 1; min-width: 0;">
+            <span style="height: 30px; width: 132px; display: flex; align-items: center; justify-content: space-between; padding: 0 9px 0 12px; border-radius: 6px; background: #2b2724; font-size: 12.5px; color: #f2ebe0; box-sizing: border-box;">clients.json <span style="color: #b3a897; font-size: 11px;">✕</span></span>
+            <span style="height: 30px; width: 132px; display: flex; align-items: center; padding: 0 9px 0 12px; border-radius: 6px; font-size: 12.5px; color: #b3a897; box-sizing: border-box;">projec…ts.json</span>
+          </div>
+          <div style="width: 20px; display: flex; align-items: center; justify-content: center; color: #b3a897; font-size: 12px;">›</div>
+          <div style="display: flex;"><span style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 1px; background: #cdc3b4;"></span></span><span style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 10px; border: 1px solid #cdc3b4; box-sizing: border-box;"></span></span><span style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 10px; position: relative;"><span style="position: absolute; top: 4.5px; left: -2px; width: 14px; height: 1px; background: #cdc3b4; transform: rotate(45deg);"></span><span style="position: absolute; top: 4.5px; left: -2px; width: 14px; height: 1px; background: #cdc3b4; transform: rotate(-45deg);"></span></span></span></div>
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 7px;">
+        <div style="font-size: 12px; color: #9d9284;"><b style="color: #cdc3b4; font-weight: 500;">460px</b> — <span style="color: #d99b62;">the <span style="font-family: 'Monaspace Neon', monospace;">&gt;_</span> button and the new-tab button drop.</span> Both still have keyboard routes (Ctrl+P, Ctrl+N) and the menu bar still has <i>Commands</i>, so nothing becomes unreachable.</div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 7px;">
+        <div style="font-size: 12px; color: #9d9284;"><b style="color: #cdc3b4; font-weight: 500;">360px</b> — <span style="color: #d99b62;">the menu bar collapses to ☰</span> in the rail, regardless of the setting, and one tab remains. Below this the rail is: ☰ + one tab + three caption buttons = <b style="color: #cdc3b4;">318px</b>, which is the enforced minimum window width.</div>
+        <div style="height: 40px; display: flex; align-items: stretch; background: #1c1917; border-radius: 6px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); width: 318px; overflow: hidden;">
+          <div style="width: 34px; display: flex; align-items: center; justify-content: center; color: #b3a897; font-size: 15px;">☰</div>
+          <div style="display: flex; align-items: center; flex: 1; min-width: 0;"><span style="height: 30px; display: flex; align-items: center; gap: 8px; padding: 0 6px 0 8px; border-radius: 6px; background: #2b2724; font-size: 12.5px; color: #f2ebe0; min-width: 0;"><span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">clients.json</span><span style="color: #b3a897; font-size: 11px;">✕</span></span></div>
+          <div style="display: flex;"><span style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 1px; background: #cdc3b4;"></span></span><span style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 10px; border: 1px solid #cdc3b4; box-sizing: border-box;"></span></span><span style="width: 46px; display: flex; align-items: center; justify-content: center;"><span style="width: 10px; height: 10px; position: relative;"><span style="position: absolute; top: 4.5px; left: -2px; width: 14px; height: 1px; background: #cdc3b4; transform: rotate(45deg);"></span><span style="position: absolute; top: 4.5px; left: -2px; width: 14px; height: 1px; background: #cdc3b4; transform: rotate(-45deg);"></span></span></span></div>
+        </div>
+      </div>
+    </div>
+    <p style="margin: 20px 0 0 0; font-size: 13.5px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">Set <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; color: #97c3d8;">WM_GETMINMAXINFO</span> to 318 × 240 logical, scaled. Enforcing a real minimum is the actual fix for the bug you predicted — a drop order with no floor still eventually overlaps. Breakpoints compare against the metrics struct, so they scale with DPI for free.</p>
+  </div>
+
+  <!-- ===== 6 MENUS ===== -->
+  <div id="s6" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">6</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Menus</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 26px;"></div>
+
+    <div style="display: flex; gap: 30px; flex-wrap: wrap; align-items: flex-start;">
+      <div style="display: flex; flex-direction: column; gap: 12px;">
+        <div style="width: 292px; padding: 5px; border-radius: 7px; background: #2b2724; box-shadow: 0 12px 32px -8px rgba(0,0,0,0.75), 0 0 0 1px #322d28; box-sizing: border-box;">
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Toggle Word Wrap</span><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #9d9284;">Alt+Z</span></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #6f665c;"><span>Toggle Table View (CSV/TSV)</span><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #6f665c;">Ctrl+T</span></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px 0 0; border-radius: 5px; font-size: 12.5px; color: #cdc3b4; background: #302b27;"><span style="display: flex; align-items: center;"><span style="width: 26px; text-align: center; color: #d99b62; font-size: 12px;">✓</span>Toggle Markdown Preview</span><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #9d9284;">Ctrl+M</span></div>
+          <div style="height: 1px; margin: 5px 10px; background: #322d28;"></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Filter to Matching Lines</span><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #9d9284;">Ctrl+L</span></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px 0 0; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span style="display: flex; align-items: center;"><span style="width: 26px; text-align: center; color: #d99b62; font-size: 12px;">✓</span>Find: Regex</span><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #9d9284;">Ctrl+R</span></div>
+          <div style="height: 1px; margin: 5px 10px; background: #322d28;"></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Zoom In</span><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #9d9284;">Ctrl+=</span></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Zoom Out</span><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #9d9284;">Ctrl+-</span></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Reset Zoom <span style="color: #9d9284;">(125%)</span></span><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #9d9284;">Ctrl+0</span></div>
+          <div style="height: 1px; margin: 5px 10px; background: #322d28;"></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Command Palette</span><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #9d9284;">Ctrl+P</span></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #221f1c; background: #d99b62;"><span>Settings</span></div>
+          <div style="height: 1px; margin: 5px 10px; background: #322d28;"></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Show Menu Bar <span style="font-size: 11px; color: #d99b62;">NEW</span></span><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #9d9284;">Alt</span></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Edit Current Theme…</span></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Edit Keybindings…</span></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Edit Colour Rules…</span></div>
+          <div style="height: 28px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Open Logs Folder</span></div>
+        </div>
+      </div>
+
+      <div style="flex: 1 1 620px; display: flex; flex-direction: column; gap: 14px;">
+        <div style="font-size: 13.5px; line-height: 1.7; color: #cdc3b4;">Four problems are visible in the View menu screenshot. Verify each still applies before changing anything:</div>
+        <ol style="margin: 0; padding-left: 22px; font-size: 13.5px; line-height: 1.7; color: #cdc3b4; display: flex; flex-direction: column; gap: 9px;">
+          <li><b style="color: #f2ebe0; font-weight: 500;">The check mark shifts the label.</b> ✓ is drawn in the text run, so <i>Toggle Markdown Preview</i> sits further right than its neighbours. Fix: a fixed <b style="color: #cdc3b4;">26px</b> check gutter reserved on every row of a menu that contains any checkable item, and none on menus that do not.</li>
+          <li><b style="color: #f2ebe0; font-weight: 500;">Eighteen items, three dividers, one rhythm.</b> The five settings-ish items at the bottom are a different kind of thing from the view toggles. Group as: view toggles / search modes / zoom / palette + settings / customisation. Five groups, four dividers, nothing longer than four rows.</li>
+          <li><b style="color: #f2ebe0; font-weight: 500;">"Toggle" ×3 is noise.</b> Word Wrap, Table View, Markdown Preview are all toggles and all carry a check mark, which already says so. Drop the verb: <i>Word Wrap</i>, <i>Table View</i>, <i>Markdown Preview</i>. Saves 7 characters of width on every row and reads faster.</li>
+          <li><b style="color: #f2ebe0; font-weight: 500;">Disabled items give no reason.</b> <i>Table View</i> greys out on a .md file with no explanation. Show the reason in <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_muted</span> where the accelerator would be, or in a tooltip: <i>CSV and TSV files only</i>.</li>
+        </ol>
+        <div style="height: 1px; background: #322d28; margin: 4px 0;"></div>
+        <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 11px 26px;">
+          <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Alt accelerators.</b> The underline appears only after Alt is pressed, which is the Windows convention — permanent underlines look like a 1990s app. Underline is 1px <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_primary</span>, snapped to an integer y.</div>
+          <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Accelerator column.</b> Right-aligned, <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_muted</span>, in Monaspace Neon — mono means every <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">Ctrl+</span> lines up vertically without measuring.</div>
+          <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Panel width.</b> Widest label + 26 check gutter + 24 gap + widest accelerator + 20 padding. Measure once when the menu opens; never a fixed width.</div>
+          <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Placement.</b> Left edge aligns with its menu-bar item's left edge; 2px gap below the bar. Flip to the left if it would leave the work area.</div>
+          <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Highlight inset.</b> 5px panel padding means the accent row never touches the panel edge — the single biggest reason the menus read as unfinished in the screenshots.</div>
+          <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Motion.</b> Opacity only, 50ms. No slide, no scale. Mouse-driven highlight moves instantly; keyboard-driven highlight moves instantly.</div>
+          <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Live values in labels.</b> <i>Reset Zoom (125%)</i> tells you the state without opening Settings. Same for <i>Tab Width (4)</i>.</div>
+          <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Keyboard selection colour.</b> Mouse hover uses <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">bg_hover</span>; keyboard cursor uses the accent fill with <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">bg_base</span> text. Two different states, two different weights.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 7 PALETTE ===== -->
+  <div id="s7" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">7</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Command palette</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 26px;"></div>
+    <div style="display: flex; gap: 30px; flex-wrap: wrap; align-items: flex-start;">
+      <div style="width: 560px; border-radius: 8px; background: #2b2724; box-shadow: 0 20px 44px -10px rgba(0,0,0,0.8), 0 0 0 1px #322d28; overflow: hidden;">
+        <div style="height: 42px; display: flex; align-items: center; gap: 10px; padding: 0 14px; border-bottom: 1px solid #322d28; box-sizing: border-box;">
+          <span style="color: #d99b62; font-family: 'Monaspace Neon', monospace; font-size: 13.5px;">&gt;</span>
+          <span style="font-family: 'Monaspace Neon', monospace; font-size: 13.5px; color: #f2ebe0;">wrap</span>
+          <span style="width: 2px; height: 17px; background: #d99b62;"></span>
+          <span style="flex: 1;"></span>
+          <span style="font-size: 11.5px; color: #9d9284;">4 of 62</span>
+        </div>
+        <div style="padding: 5px;">
+          <div style="height: 30px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; background: #3a352f; font-size: 12.5px; color: #f2ebe0;"><span>Word <span style="color: #d99b62;">Wrap</span></span><span style="display: flex; gap: 16px; align-items: center;"><span style="color: #9d9284; font-size: 11.5px;">View</span><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #cdc3b4;">Alt+Z</span></span></div>
+          <div style="height: 30px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span><span style="color: #d99b62;">Wrap</span> New Documents by Default</span><span style="display: flex; gap: 16px; align-items: center;"><span style="color: #9d9284; font-size: 11.5px;">Settings</span></span></div>
+          <div style="height: 30px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Un<span style="color: #d99b62;">wrap</span> Selected Lines</span><span style="display: flex; gap: 16px; align-items: center;"><span style="color: #9d9284; font-size: 11.5px;">Edit</span></span></div>
+          <div style="height: 30px; display: flex; align-items: center; justify-content: space-between; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #cdc3b4;"><span>Reflow Paragraph at <span style="color: #d99b62;">Wrap</span> Column</span><span style="display: flex; gap: 16px; align-items: center;"><span style="color: #9d9284; font-size: 11.5px;">Edit</span></span></div>
+          <div style="height: 1px; margin: 5px 10px; background: #322d28;"></div>
+          <div style="height: 30px; display: flex; align-items: center; gap: 10px; padding: 0 10px; border-radius: 5px; font-size: 12.5px; color: #9d9284;"><span style="font-family: 'Monaspace Neon', monospace;">:</span><span>124</span><span style="color: #6f665c;">go to line · type a number</span></div>
+        </div>
+      </div>
+      <div style="flex: 1 1 520px; display: grid; grid-template-columns: 1fr; gap: 11px;">
+        <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Matched characters carry the accent</b> — that is the whole ranking display. No second colour, no bold, no score bar.</div>
+        <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Category is <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_muted</span> and right-aligned</b> next to the accelerator, both on the row's single baseline. In the palette screenshot the two columns are different sizes and neither aligns with the label.</div>
+        <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Fuzzy, subsequence, case-insensitive</b> with a bias to word starts. Rank: exact prefix &gt; word-start subsequence &gt; anywhere. Ties break by recency of use — a palette that learns is worth more than one with a clever scorer.</div>
+        <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Result count in the input row</b>, not the status bar. It is feedback on what you just typed and belongs next to the caret.</div>
+        <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Prefixes.</b> <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; color: #d99b62;">:</span>124 goes to a line, <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; color: #d99b62;">&gt;</span> forces commands only, bare text searches both commands and open tabs. Show the available prefixes as a dimmed hint row when the query is empty.</div>
+        <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Open tabs are results.</b> With seven tabs open and a 132px floor, the palette is the real tab switcher. Ctrl+Tab opens it pre-filtered to tabs, ordered most-recent-first.</div>
+        <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Geometry.</b> 560 wide, top edge 88px below the window top, horizontally centred, max 12 rows then scroll. Never full-height: a palette that fills the window looks like a mode, and it is not one.</div>
+        <div style="font-size: 13px; line-height: 1.6;"><b style="color: #f2ebe0; font-weight: 500;">Every command in it is also in a menu.</b> The palette is a faster route, never the only route — that is what keeps it optional for you and complete for everyone else.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 8 EDITOR ===== -->
+  <div id="s8" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">8</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Editor surface</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 26px;"></div>
+
+    <div style="width: 1140px; border-radius: 8px; overflow: hidden; background: #221f1c; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); margin-bottom: 16px; position: relative;">
+      <div style="display: flex; padding: 16px 0 16px 0;">
+        <div style="width: 56px; flex: none; font-family: 'Monaspace Neon', monospace; font-size: 13.5px; line-height: 22px; color: #9d9284; text-align: right; padding-right: 12px; box-sizing: border-box;"><div>121</div><div>122</div><div style="color: #cdc3b4;">123</div><div>124</div><div>125</div><div>126</div><div>127</div><div>128</div></div>
+        <div style="flex: 1; font-family: 'Monaspace Neon', monospace; font-size: 13.5px; line-height: 22px; color: #cdc3b4; white-space: pre; padding-right: 24px;"><div>optional, so omitting them yields a complete, valid object. This</div><div>closes the <span style="color: #97c3d8;">`/wbs`</span> portion of findings open question 7.</div><div style="background: #2a2a26;">The <span style="color: #97c3d8;">`/projects`</span> portion remains open and is not this build's<span style="display: inline-block; width: 2px; height: 15px; background: #d99b62; vertical-align: -2px; margin-left: 1px;"></span></div><div>concern. See <span style="color: #97c3d8; border-bottom: 1px solid rgba(151,195,216,0.35);">docs/bst-metafield-sync-v2-findings_1.md</span> for the</div><div>full <span style="background: #4a3826;">context</span>. Every <span style="background: #d99b62; color: #221f1c;">context</span> here means the same thing, and</div><div>the <span style="background: #4a3826;">context</span> of section 14 is the one that matters.</div><div> </div><div><span style="color: #a69b8b;">| </span><span style="color: #efe7db;">`id`</span><span style="color: #a69b8b;"> | string | </span><span style="color: #e5b57f;">31</span><span style="color: #a69b8b;"> |</span></div></div>
+      </div>
+      <div style="position: absolute; top: 16px; right: 6px; width: 8px; height: 178px; border-radius: 4px; background: #221f1c;">
+        <div style="position: absolute; top: 40px; left: 0; width: 8px; height: 62px; border-radius: 4px; background: #3e3833;"></div>
+        <div style="position: absolute; top: 18px; left: 2.5px; width: 3px; height: 2px; background: #d99b62;"></div>
+        <div style="position: absolute; top: 62px; left: 2.5px; width: 3px; height: 2px; background: #d99b62;"></div>
+        <div style="position: absolute; top: 71px; left: 2.5px; width: 3px; height: 2px; background: #d99b62;"></div>
+        <div style="position: absolute; top: 140px; left: 2.5px; width: 3px; height: 2px; background: #d99b62;"></div>
+      </div>
+    </div>
+    <p style="margin: 0 0 22px 0; font-size: 12.5px; color: #8f8578;">Gutter on (optional), current line tinted, 2px accent caret, a link with its 35%-alpha underline, the current find hit in accent fill with <span style="font-family: 'Monaspace Neon', monospace;">bg_base</span> text, other hits in <span style="font-family: 'Monaspace Neon', monospace;">find_match_bg</span>, and scrollbar tick marks in <span style="font-family: 'Monaspace Neon', monospace;">match_mark</span>.</p>
+
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">16px of top padding.</b> Text starting flush against the menu bar is the clearest "unfinished" signal in the screenshots. This one change does more for the feel than any colour.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Caret 2px, <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">caret</span> role, 500ms blink.</b> 1px carets disappear at 150% on a bright line. Stop blinking while typing and for 500ms after, which is what every editor does and no one notices until it is missing.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Gutter: 44px right-aligned + 12px gap.</b> Off by default. Current line number in <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_primary</span>, others <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_muted</span> — that alone tells you where you are without a line highlight.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Current-line tint off by default.</b> 3% is enough when it is on. Any more and a wrapped paragraph turns into stripes.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Selection is a run of rects, not per-glyph.</b> One instance per visual line, so a 10,000-line selection is 40 quads (only the visible lines exist).</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Scrollbar 8px wide, 6px inset, thumb min 24px.</b> No arrows, no track fill. Overlay style, always visible — auto-hiding scrollbars hide the tick marks, which are load-bearing during a find.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Tick marks in the track.</b> 3×2px <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">match_mark</span> per find hit, plus <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">bookmark</span> ticks. Your markdown preview already does this; the editor should too.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Links.</b> <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">link</span> colour plus a 1px 35%-alpha underline — colour alone fails WCAG 1.4.1. Underline thickens to 100% on Ctrl-hover, which is also the affordance that it is now clickable.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Wrap indent.</b> A wrapped line continues at the original line's indent + 2 columns, so wrapped prose stays visually distinct from a new line. Cheap and a big readability win in your own markdown files.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Wrap column cap.</b> In wrap mode, cap the text column at 100 characters and left-align it. On a 1440p maximised window an uncapped wrap gives 200-character lines, which is unreadable regardless of styling.</div>
+    </div>
+  </div>
+
+  <!-- ===== 9 MARKDOWN ===== -->
+  <div id="s9" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">9</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Markdown — the priority</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 26px;"></div>
+
+    <h3 style="margin: 0 0 12px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">9.1 The grid is not the obstacle you think it is</h3>
+    <p style="margin: 0 0 14px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">You said the viewport is a fixed cell grid, so a real preview looks like a heavy lift. It is much lighter than it appears, because <b style="color: #f2ebe0; font-weight: 500;">the preview pane does not need the grid at all.</b> The grid exists to make caret arithmetic, column selection, and hit-testing O(1). The preview has no caret, no selection anchor, no column, and no editing — it is read-only output. So it can use free proportional layout while the editor pane keeps the grid untouched.</p>
+    <div style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 1.8; color: #cdc3b4; background: #1c1917; border-radius: 8px; padding: 20px 22px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); white-space: pre; max-width: 1140px; margin-bottom: 14px;"><span style="color: #e5b57f;">What the preview actually needs</span>
+1. a block list          Block :: struct { kind, level, spans: []Span, indent }
+2. a span list per block  Span  :: struct { text, style_flags, colour_role }
+3. one text shaper        given a font + a max width, emit positioned glyphs
+                          and a height  -- this is the only new code
+4. a scroll offset in <span style="color: #9d9284;">pixels</span>, not lines
+
+<span style="color: #9d9284;">Because it is read-only, you never map a pixel back to a character except
+for one case: click-to-sync-scroll, which only needs the nearest BLOCK, not
+the nearest glyph. Store each block's y range and binary-search it -- eight
+lines of code instead of a reverse layout.</span>
+
+<span style="color: #e5b57f;">The shaper, in full</span>
+<span style="color: #9d9284;">Proportional text needs per-glyph advances. That is one DirectWrite call
+(IDWriteFontFace-&gt;GetDesignGlyphMetrics) or one stbtt_GetCodepointHMetrics
+per glyph, cached in the same atlas map you already keep. Line breaking is
+greedy: accumulate advances, break at the last space before max width.
+Greedy is what browsers do for body text. No Knuth-Plass, no hyphenation.</span>
+
+<span style="color: #e5b57f;">Cost</span>
+<span style="color: #9d9284;">Layout only the visible blocks plus a screen above and below. Cache each
+block's laid-out glyph positions, keyed by (block index, pane width).
+Invalidate a block on edit; invalidate all on resize or zoom. A 778-line
+document lays out ~40 visible blocks -- microseconds, once, per width.</span></div>
+    <p style="margin: 0 0 30px 0; font-size: 13.5px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">That is the whole lift: a block/span parser you half have, a greedy shaper, and a per-block layout cache. No change to the editor's grid, no new pipeline — preview glyphs go into the same atlas and the same instanced draw call as everything else.</p>
+
+    <h3 style="margin: 0 0 12px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">9.2 What to support, and in what order</h3>
+    <p style="margin: 0 0 16px 0; font-size: 13.5px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">You put support at roughly 50%, so treat this as a target list to diff against the parser rather than a list of what is missing. It is CommonMark plus the four GFM extensions people actually type, ordered by how often the absence is noticed. Anything below the line is optional.</p>
+    <div style="border-radius: 8px; overflow: hidden; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); font-family: 'Monaspace Neon', monospace; font-size: 12.5px; max-width: 1140px; margin-bottom: 30px;">
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; height: 30px; background: #2b2724; color: #cdc3b4;"><span></span><span style="padding: 0 10px;">feature</span><span style="padding: 0 10px;">editor pane (in grid)</span><span style="padding: 0 10px;">preview pane</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4;"><span style="justify-self: center; color: #d99b62;">1</span><span style="padding: 0 10px;">ATX headings 1–6</span><span style="padding: 0 10px; color: #9d9284;">md_heading, bold, marks dimmed</span><span style="padding: 0 10px; color: #9d9284;">size scale §9.3, h1/h2 get a rule</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; color: #d99b62;">2</span><span style="padding: 0 10px;">bold / italic / both</span><span style="padding: 0 10px; color: #9d9284;">md_bold weight, md_italic slant</span><span style="padding: 0 10px; color: #9d9284;">real bold + italic faces, marks hidden</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4;"><span style="justify-self: center; color: #d99b62;">3</span><span style="padding: 0 10px;">inline code</span><span style="padding: 0 10px; color: #9d9284;">md_code on md_code_bg, 3px radius</span><span style="padding: 0 10px; color: #9d9284;">same, always Neon even in serif body</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; color: #d99b62;">4</span><span style="padding: 0 10px;">fenced code + lexer</span><span style="padding: 0 10px; color: #9d9284;">md_code_bg block, syn_* inside</span><span style="padding: 0 10px; color: #9d9284;">6px radius block, 12px padding, lang label</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4;"><span style="justify-self: center; color: #d99b62;">5</span><span style="padding: 0 10px;">lists, nested, ordered</span><span style="padding: 0 10px; color: #9d9284;">md_list_mark, indent guides off</span><span style="padding: 0 10px; color: #9d9284;">hanging indent, real bullets, 24px per level</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; color: #d99b62;">6</span><span style="padding: 0 10px;">tables + alignment</span><span style="padding: 0 10px; color: #9d9284;">syn_punct pipes, aligned columns</span><span style="padding: 0 10px; color: #9d9284;">real table, md_rule borders, zebra</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4;"><span style="justify-self: center; color: #d99b62;">7</span><span style="padding: 0 10px;">blockquote, nested</span><span style="padding: 0 10px; color: #9d9284;">md_quote text, 2px accent bar</span><span style="padding: 0 10px; color: #9d9284;">2px bar + 16px inset per level</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; color: #d99b62;">8</span><span style="padding: 0 10px;">links, autolinks, refs</span><span style="padding: 0 10px; color: #9d9284;">link + underline, target dimmed</span><span style="padding: 0 10px; color: #9d9284;">text only, Ctrl+click opens, title tooltip</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4;"><span style="justify-self: center; color: #d99b62;">9</span><span style="padding: 0 10px;">task list items</span><span style="padding: 0 10px; color: #9d9284;">accent [x], text_muted [ ]</span><span style="padding: 0 10px; color: #9d9284;">14px box, accent tick, done text dimmed</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; color: #d99b62;">10</span><span style="padding: 0 10px;">thematic break ---</span><span style="padding: 0 10px; color: #9d9284;">md_rule, as typed</span><span style="padding: 0 10px; color: #9d9284;">1px md_rule, 24px above and below</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4;"><span style="justify-self: center; color: #d99b62;">11</span><span style="padding: 0 10px;">strikethrough</span><span style="padding: 0 10px; color: #9d9284;">text_muted + 1px line</span><span style="padding: 0 10px; color: #9d9284;">1px line at x-height centre</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; color: #d99b62;">12</span><span style="padding: 0 10px;">YAML front matter</span><span style="padding: 0 10px; color: #9d9284;">syn_comment, collapsible</span><span style="padding: 0 10px; color: #9d9284;">a small key/value card at the top</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #cdc3b4;"><span style="justify-self: center; color: #d99b62;">13</span><span style="padding: 0 10px;">escapes, hard breaks</span><span style="padding: 0 10px; color: #9d9284;">backslash in syn_punct</span><span style="padding: 0 10px; color: #9d9284;">honoured</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; height: 8px; background: #322d28;"><span style="grid-column: 1 / -1;"></span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #9d9284;"><span style="justify-self: center;">—</span><span style="padding: 0 10px;">images</span><span style="padding: 0 10px;">path as a link</span><span style="padding: 0 10px;">placeholder box with the alt text; loading images means a decoder</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #9d9284; background: rgba(255,246,232,0.025);"><span style="justify-self: center;">—</span><span style="padding: 0 10px;">footnotes</span><span style="padding: 0 10px;">link colour</span><span style="padding: 0 10px;">superscript + a list at the end</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #9d9284;"><span style="justify-self: center;">—</span><span style="padding: 0 10px;">raw HTML</span><span style="padding: 0 10px;">syn_xml_tag</span><span style="padding: 0 10px;">show the source verbatim, never render it</span></div>
+      <div style="display: grid; grid-template-columns: 30px 1fr 1.15fr 1.5fr; align-items: center; min-height: 29px; color: #9d9284; background: rgba(255,246,232,0.025);"><span style="justify-self: center;">—</span><span style="padding: 0 10px;">setext headings</span><span style="padding: 0 10px;">md_heading</span><span style="padding: 0 10px;">treat as h1/h2 — cheap, rarely typed</span></div>
+    </div>
+
+    <h3 style="margin: 0 0 12px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">9.3 Preview type scale</h3>
+    <p style="margin: 0 0 16px 0; font-size: 13.5px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">This is the single biggest "this is a real application" lever you have. A proportional body face for prose and Monaspace Neon for code is exactly the split Obsidian and VS Code use, and it is what makes a preview feel like a document instead of a differently-coloured source view. Sizes are multiples of the base document size <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">S</span> so the whole preview scales with Ctrl+= for free.</p>
+    <div style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 1.8; color: #cdc3b4; background: #1c1917; border-radius: 8px; padding: 20px 22px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); white-space: pre; max-width: 1140px; margin-bottom: 14px;">                size        weight  face      colour       space above / below
+h1              1.85 S      700     body      md_heading   0 / 0.6 S  + md_rule
+h2              1.50 S      700     body      md_heading   1.6 S / 0.5 S + md_rule
+h3              1.25 S      700     body      md_heading   1.4 S / 0.4 S
+h4              1.10 S      700     body      md_heading   1.2 S / 0.3 S
+h5 / h6         1.00 S      700     body      md_heading   1.0 S / 0.3 S  (h6 caps)
+paragraph       1.00 S      400     body      text_primary 0 / 0.8 S, line 1.65
+list item       1.00 S      400     body      text_primary 0.25 S between items
+blockquote      1.00 S      400     body      md_quote     0.8 S / 0.8 S
+code, inline    0.92 S      400     Neon      md_code      md_code_bg, 3px radius
+code, fenced    0.92 S      400     Neon      syn_*        1.0 S / 1.0 S, 6px, 12 pad
+table           0.95 S      400     Neon      text_primary always mono: columns align
+caption / meta  0.88 S      400     body      text_muted
+<span style="color: #9d9284;">measure         72ch max, left-aligned, 40px left padding
+Rounding: compute every size as round(k * S) into the metrics struct once.
+h6 is the same size as body, distinguished by caps + tracking, not size --
+six visibly different heading sizes is more levels than any document needs.</span></div>
+    <p style="margin: 0 0 30px 0; font-size: 13.5px; line-height: 1.7; color: #cdc3b4; max-width: 880px;"><b style="color: #f2ebe0; font-weight: 500;">Which body face:</b> ship one proportional serif (Source Serif 4 subset to Latin is ~120 KB and OFL) or fall back to Georgia, which is on every Windows install. Serif over sans, deliberately — it is what separates "document" from "UI", and it is the cosiest thing you can do to a wall of prose. Make it a setting: <i>Preview font</i>, defaulting to the shipped serif, with the editor font as one of the options for people who want the preview to match the source.</p>
+
+    <h3 style="margin: 0 0 14px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">9.4 Split view — worked example</h3>
+    <div style="width: 1140px; border-radius: 8px; overflow: hidden; background: #221f1c; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); display: flex; margin-bottom: 14px;">
+      <div style="width: 500px; flex: none; padding: 16px 0 20px 20px; font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 21px; color: #cdc3b4; white-space: pre; box-sizing: border-box;"><div><span style="color: #9d9284;"># </span><span style="color: #e5b57f; font-weight: 700;">Shaping Layer Design</span></div><div> </div><div>Specification for the shaping layer of</div><div>the BST sync rewrite.</div><div> </div><div><span style="color: #9d9284;">## </span><span style="color: #e5b57f; font-weight: 700;">1. Scope</span></div><div> </div><div><span style="color: #d99b62;">- </span>the hierarchy walk</div><div><span style="color: #d99b62;">- </span>org attachment and <span style="color: #97c3d8; background: #2a2723;">`EffectiveStatus`</span></div><div><span style="color: #d99b62;">  - </span>nested one level</div><div> </div><div><span style="color: #9d9284;">**</span><span style="color: #efe7db; font-weight: 700;">The unit of work is one project.</span><span style="color: #9d9284;">**</span></div><div>Path composition needs the <span style="color: #9d9284;">*</span><span style="color: #c4b79f; font-style: italic;">full</span><span style="color: #9d9284;">*</span> chain.</div><div> </div><div><span style="color: #d99b62;">&gt; </span><span style="color: #a69b8b;">Deletes are not propagated.</span></div><div> </div><div><span style="color: #9d9284;">| </span>Field<span style="color: #9d9284;"> | </span>Max<span style="color: #9d9284;"> |</span></div><div><span style="color: #9d9284;">|---|---|</span></div><div><span style="color: #9d9284;">| </span><span style="color: #97c3d8; background: #2a2723;">`id`</span><span style="color: #9d9284;"> | </span><span style="color: #e5b57f;">31</span><span style="color: #9d9284;"> |</span></div><div> </div><div><span style="color: #d99b62;">- [x] </span><span style="color: #9d9284;">v1.json read</span></div><div><span style="color: #d99b62;">- [ ] </span>shadow compare</div></div>
+      <div style="width: 1px; background: #322d28; flex: none;"></div>
+      <div style="flex: 1; padding: 22px 40px 20px 32px; box-sizing: border-box; min-width: 0;">
+        <div style="font-family: Georgia, serif; font-size: 25px; font-weight: 700; color: #e5b57f; line-height: 1.25;">Shaping Layer Design</div>
+        <div style="height: 1px; background: #3a342e; margin: 10px 0 14px 0;"></div>
+        <div style="font-family: Georgia, serif; font-size: 13.5px; line-height: 1.65; color: #cdc3b4;">Specification for the shaping layer of the BST sync rewrite.</div>
+        <div style="font-family: Georgia, serif; font-size: 20px; font-weight: 700; color: #e5b57f; margin-top: 22px; line-height: 1.3;">1. Scope</div>
+        <div style="height: 1px; background: #3a342e; margin: 8px 0 12px 0;"></div>
+        <div style="display: flex; flex-direction: column; gap: 4px;">
+          <div style="display: flex; gap: 10px; font-family: Georgia, serif; font-size: 13.5px; line-height: 1.6; color: #cdc3b4;"><span style="color: #d99b62; flex: none;">•</span><span>the hierarchy walk</span></div>
+          <div style="display: flex; gap: 10px; font-family: Georgia, serif; font-size: 13.5px; line-height: 1.6; color: #cdc3b4;"><span style="color: #d99b62; flex: none;">•</span><span>org attachment and <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; color: #97c3d8; background: #2a2723; padding: 1px 4px; border-radius: 3px;">EffectiveStatus</span></span></div>
+          <div style="display: flex; gap: 10px; font-family: Georgia, serif; font-size: 13.5px; line-height: 1.6; color: #cdc3b4; padding-left: 24px;"><span style="color: #d99b62; flex: none;">◦</span><span>nested one level</span></div>
+        </div>
+        <div style="font-family: Georgia, serif; font-size: 13.5px; line-height: 1.65; color: #cdc3b4; margin-top: 16px;"><b style="color: #efe7db;">The unit of work is one project.</b> Path composition needs the <i style="color: #c4b79f;">full</i> chain.</div>
+        <div style="margin-top: 16px; padding-left: 16px; border-left: 2px solid #d99b62; font-family: Georgia, serif; font-size: 13.5px; line-height: 1.65; color: #a69b8b;">Deletes are not propagated.</div>
+        <div style="margin-top: 18px; border: 1px solid #3a342e; border-radius: 6px; overflow: hidden; font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">
+          <div style="display: grid; grid-template-columns: 1fr 70px; background: #2b2724; color: #f2ebe0; height: 26px; align-items: center;"><span style="padding: 0 10px;">Field</span><span style="padding: 0 10px;">Max</span></div>
+          <div style="display: grid; grid-template-columns: 1fr 70px; height: 26px; align-items: center; color: #cdc3b4;"><span style="padding: 0 10px; color: #97c3d8;">id</span><span style="padding: 0 10px; color: #e5b57f;">31</span></div>
+        </div>
+        <div style="display: flex; flex-direction: column; gap: 7px; margin-top: 18px;">
+          <div style="display: flex; gap: 10px; align-items: center; font-family: Georgia, serif; font-size: 13.5px; color: #9d9284;"><span style="width: 14px; height: 14px; border-radius: 3px; background: #d99b62; display: flex; align-items: center; justify-content: center; color: #221f1c; font-size: 10px; flex: none;">✓</span><span style="text-decoration: line-through;">v1.json read</span></div>
+          <div style="display: flex; gap: 10px; align-items: center; font-family: Georgia, serif; font-size: 13.5px; color: #cdc3b4;"><span style="width: 14px; height: 14px; border-radius: 3px; border: 1px solid #4a4339; box-sizing: border-box; flex: none;"></span><span>shadow compare</span></div>
+        </div>
+      </div>
+    </div>
+    <p style="margin: 0 0 26px 0; font-size: 12.5px; line-height: 1.6; color: #8f8578; max-width: 1140px;">Left: the editor pane, still on the cell grid, with markdown syntax characters dimmed to <span style="font-family: 'Monaspace Neon', monospace;">syn_punct</span> so the content reads through them. Right: free layout, Georgia standing in for the shipped serif, code always in Neon, the table always mono so columns align. Split defaults to 50/50 with a 1px <span style="font-family: 'Monaspace Neon', monospace;">border_subtle</span> divider that drags (4px hit area, min 320px each side).</p>
+
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Dim the syntax, don't hide it.</b> In the editor pane the <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">#</span>, <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">**</span> and <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">`</span> characters stay — this is a text editor and hiding characters that exist in the file breaks column arithmetic and trust. Dimming them to <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">syn_punct</span> gets 90% of the benefit for none of the risk.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Scroll sync by block, not by line.</b> Map the caret's block index to the preview's block y and vice versa. Line-based sync drifts badly the moment a heading or a code fence changes height, which is the usual reason split views feel broken.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Re-parse incrementally.</b> Keep block boundaries; on an edit, re-parse from the start of the containing block to the next blank line. Only a fence or a table can extend past that, so widen to the fence end when one is open.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Ctrl+M cycles three states.</b> Source → split → preview only, as your View menu already implies. Remember per file type, per §11's <i>Remember last view used</i>.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Preview is selectable and copyable.</b> Read-only does not mean inert. Selection uses <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">selection_doc</span>; copy yields the rendered text, not the markdown. This needs pixel→glyph hit-testing after all, but only within one block, which the layout cache already has.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Keep the tick-mark rail.</b> The preview already has a coloured mini-map of headings down its right edge and it is genuinely good — keep it, at 8px wide with <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">md_heading</span> ticks, and give the editor pane the same treatment for find hits.</div>
+    </div>
+  </div>
+
+  <!-- ===== 10 TABLE ===== -->
+  <div id="s10" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">10</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Table view</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 26px;"></div>
+    <div style="width: 1140px; border-radius: 8px; overflow: hidden; background: #221f1c; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); font-family: 'Monaspace Neon', monospace; font-size: 12.5px; margin-bottom: 14px;">
+      <div style="display: grid; grid-template-columns: 56px 1.5fr 1fr 1fr 1.4fr 1.2fr 96px; background: #2b2724; color: #f2ebe0; height: 30px; align-items: center; border-bottom: 1px solid #4a4339;">
+        <span style="padding: 0 10px; text-align: right; color: #9d9284;">#</span><span style="padding: 0 10px;">User Name</span><span style="padding: 0 10px;">First Name</span><span style="padding: 0 10px;">Last Name</span><span style="padding: 0 10px;">Office</span><span style="padding: 0 10px;">Package</span><span style="padding: 0 10px; text-align: right;">Activated <span style="color: #d99b62;">↓</span></span>
+      </div>
+      <div style="display: grid; grid-template-columns: 56px 1.5fr 1fr 1fr 1.4fr 1.2fr 96px; height: 26px; align-items: center; color: #cdc3b4;"><span style="padding: 0 10px; text-align: right; color: #6f665c;">1</span><span style="padding: 0 10px;">adavis@dlz.com</span><span style="padding: 0 10px;">Austin</span><span style="padding: 0 10px;">Davis</span><span style="padding: 0 10px;">Columbus, OH</span><span style="padding: 0 10px;">Standard</span><span style="padding: 0 10px; text-align: right;">01/30/2026</span></div>
+      <div style="display: grid; grid-template-columns: 56px 1.5fr 1fr 1fr 1.4fr 1.2fr 96px; height: 26px; align-items: center; color: #cdc3b4; background: #262320;"><span style="padding: 0 10px; text-align: right; color: #6f665c;">2</span><span style="padding: 0 10px;">astein@dlz.com</span><span style="padding: 0 10px;">Allison</span><span style="padding: 0 10px;">Stein</span><span style="padding: 0 10px;">Bridgeville, PA</span><span style="padding: 0 10px;">Field Dispatch</span><span style="padding: 0 10px; text-align: right;">04/23/2026</span></div>
+      <div style="display: grid; grid-template-columns: 56px 1.5fr 1fr 1fr 1.4fr 1.2fr 96px; height: 26px; align-items: center; color: #f2ebe0; background: #3a352f; box-shadow: inset 2px 0 0 #d99b62;"><span style="padding: 0 10px; text-align: right; color: #b3a897;">3</span><span style="padding: 0 10px;">ayoung@dlz.com</span><span style="padding: 0 10px;">Anthony</span><span style="padding: 0 10px;">Young</span><span style="padding: 0 10px;">Cleveland, OH</span><span style="padding: 0 10px;">LIMS</span><span style="padding: 0 10px; text-align: right;">12/24/2025</span></div>
+      <div style="display: grid; grid-template-columns: 56px 1.5fr 1fr 1fr 1.4fr 1.2fr 96px; height: 26px; align-items: center; color: #cdc3b4; background: #262320;"><span style="padding: 0 10px; text-align: right; color: #6f665c;">4</span><span style="padding: 0 10px;">barnold@dlz.com</span><span style="padding: 0 10px;">Breka</span><span style="padding: 0 10px;">Arnold</span><span style="padding: 0 10px;">Columbus, OH</span><span style="padding: 0 10px;">Standard</span><span style="padding: 0 10px; text-align: right;">06/05/2026</span></div>
+      <div style="display: grid; grid-template-columns: 56px 1.5fr 1fr 1fr 1.4fr 1.2fr 96px; height: 26px; align-items: center; color: #cdc3b4;"><span style="padding: 0 10px; text-align: right; color: #6f665c;">5</span><span style="padding: 0 10px;">bburton@dlz.com</span><span style="padding: 0 10px;">Brian</span><span style="padding: 0 10px;">Burton</span><span style="padding: 0 10px;">Burns Harbor, IN</span><span style="padding: 0 10px;">Field Dispatch</span><span style="padding: 0 10px; text-align: right;">09/29/2025</span></div>
+      <div style="display: grid; grid-template-columns: 56px 1.5fr 1fr 1fr 1.4fr 1.2fr 96px; height: 26px; align-items: center; color: #cdc3b4; background: #262320;"><span style="padding: 0 10px; text-align: right; color: #6f665c;">6</span><span style="padding: 0 10px;"><span style="color: #6f665c;">—</span></span><span style="padding: 0 10px;">Brian</span><span style="padding: 0 10px;">Gawronski</span><span style="padding: 0 10px;"><span style="color: #6f665c;">—</span></span><span style="padding: 0 10px;">Standard</span><span style="padding: 0 10px; text-align: right;">01/30/2026</span></div>
+      <div style="height: 26px; display: flex; align-items: center; padding: 0 12px; background: #1c1917; border-top: 1px solid #322d28; font-family: 'Monaspace Argon', monospace; font-size: 11.5px; color: #b3a897; box-sizing: border-box;">2,847 rows · 8 columns · sorted by Activated, descending</div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Column rules are gone.</b> <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">table_zebra</span> carries the eye instead. If the view draws a vertical line per column — that is 8 extra quads per screen and it makes the grid louder than the data.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Row numbers.</b> 56px right-aligned gutter in <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_dim</span>, <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_secondary</span> on the current row. Where there is no row-number gutter, counting rows by hand is the gap.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Empty cells show an em dash</b> in <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_dim</span>. In your screenshot the blank first column reads as broken parsing; a dash says "empty, and we know it".</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Header is a real header.</b> <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">bg_raised</span> + a 1px <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">border_strong</span> rule beneath, sticky on scroll, click to sort with an accent arrow. Sorting is view-only and never rewrites the file.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Numeric and date columns right-align.</b> Detect by sampling the first 200 rows. Right-aligned numbers with <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">tnum</span> is the difference between a table and a text dump.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Column widths from a sample.</b> Measure the first 200 rows, clamp each column to 8–40 characters, then distribute leftover width proportionally. Drag a header edge to resize; double-click it to fit content.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Summary row at the bottom.</b> Row count, column count, and the active sort — the questions you actually have about a CSV, in the place you already look for file facts.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Malformed rows are marked, not hidden.</b> A row with the wrong field count gets a 2px <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">warning</span> bar on its left edge and stays in place. Silently dropping data in a data viewer is the worst possible failure.</div>
+    </div>
+  </div>
+
+  <!-- ===== 11 SETTINGS ===== -->
+  <div id="s11" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">11</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Settings, Font, and the other tab-screens</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 22px;"></div>
+    <p style="margin: 0 0 20px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">Screens that open as tabs — Settings, Font, and any future one — share a single layout: 28px page margin, a title block, group headers, and label/description/value rows. Your Font screen is already the closest thing in the app to right; this makes the rest match it.</p>
+
+    <div style="width: 1140px; border-radius: 8px; overflow: hidden; background: #221f1c; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); margin-bottom: 12px;">
+      <div style="padding: 26px 28px 16px 28px;">
+        <div style="font-size: 19px; font-weight: 500; color: #f2ebe0;">Settings</div>
+        <div style="display: flex; gap: 22px; padding-top: 7px; font-size: 12px; color: #9d9284;"><span>Esc closes</span><span>↑↓ choose</span><span>Enter toggles</span><span>←→ adjust</span></div>
+      </div>
+      <div style="padding: 2px 28px 6px 28px; font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase; color: #9d9284;">Session</div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px; background: #302823; box-shadow: inset 2px 0 0 #d99b62;">
+        <div><div style="font-size: 13.5px; color: #f2ebe0;">Restore session on launch</div><div style="font-size: 12px; color: #b3a897; padding-top: 3px;">Reopen the tabs you had open, including unsaved ones</div></div>
+        <div style="font-size: 13px; color: #e5b57f; white-space: nowrap; padding-top: 1px;">On</div>
+      </div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px;">
+        <div><div style="font-size: 13.5px; color: #cdc3b4;">Word wrap new documents</div><div style="font-size: 12px; color: #9d9284; padding-top: 3px;">Long lines fold to the window width instead of running off</div></div>
+        <div style="font-size: 13px; color: #b3a897; white-space: nowrap; padding-top: 1px;">Off</div>
+      </div>
+      <div style="height: 1px; margin: 8px 28px; background: #322d28;"></div>
+      <div style="padding: 2px 28px 6px 28px; font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase; color: #9d9284;">Appearance</div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px;">
+        <div><div style="font-size: 13.5px; color: #cdc3b4;">Theme</div><div style="font-size: 12px; color: #9d9284; padding-top: 3px;">Dark, Light, Follow Windows, or a custom .theme file</div></div>
+        <div style="display: flex; align-items: center; gap: 12px; padding-top: 1px;"><span style="font-size: 12px; color: #6f665c;">‹</span><span style="font-size: 13px; color: #b3a897;">Dark</span><span style="font-size: 12px; color: #b3a897;">›</span></div>
+      </div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px;">
+        <div><div style="font-size: 13.5px; color: #cdc3b4;">Editor font</div><div style="font-size: 12px; color: #9d9284; padding-top: 3px;">Family, style, and size for the document surface</div></div>
+        <div style="font-size: 13px; color: #b3a897; white-space: nowrap; padding-top: 1px;">Monaspace Neon · 11 &nbsp;<span style="color: #6f665c;">›</span></div>
+      </div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px; box-shadow: inset 2px 0 0 rgba(217,155,98,0.35);">
+        <div><div style="font-size: 13.5px; color: #cdc3b4;">Interface font <span style="font-size: 11px; color: #d99b62;">NEW</span></div><div style="font-size: 12px; color: #9d9284; padding-top: 3px;">Tabs, menus, settings, and status bar — separate from the document</div></div>
+        <div style="font-size: 13px; color: #b3a897; white-space: nowrap; padding-top: 1px;">Monaspace Argon · 10 &nbsp;<span style="color: #6f665c;">›</span></div>
+      </div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px; box-shadow: inset 2px 0 0 rgba(217,155,98,0.35);">
+        <div><div style="font-size: 13.5px; color: #cdc3b4;">Preview font <span style="font-size: 11px; color: #d99b62;">NEW</span></div><div style="font-size: 12px; color: #9d9284; padding-top: 3px;">Body face for the markdown preview; code stays monospaced</div></div>
+        <div style="font-size: 13px; color: #b3a897; white-space: nowrap; padding-top: 1px;">Source Serif · 11 &nbsp;<span style="color: #6f665c;">›</span></div>
+      </div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px;">
+        <div><div style="font-size: 13.5px; color: #cdc3b4;">Zoom</div><div style="font-size: 12px; color: #9d9284; padding-top: 3px;">Ctrl+= / Ctrl+- / Ctrl+0 anywhere</div></div>
+        <div style="display: flex; align-items: center; gap: 12px; padding-top: 1px;"><span style="font-size: 12px; color: #b3a897;">‹</span><span style="font-size: 13px; color: #b3a897;">125%</span><span style="font-size: 12px; color: #b3a897;">›</span></div>
+      </div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px;">
+        <div><div style="font-size: 13.5px; color: #cdc3b4;">Show menu bar <span style="font-size: 11px; color: #d99b62;">NEW</span></div><div style="font-size: 12px; color: #9d9284; padding-top: 3px;">When off, Alt reveals it and ☰ opens the same menus</div></div>
+        <div style="font-size: 13px; color: #b3a897; white-space: nowrap; padding-top: 1px;">On</div>
+      </div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px;">
+        <div><div style="font-size: 13.5px; color: #cdc3b4;">Reduce motion <span style="font-size: 11px; color: #d99b62;">NEW</span></div><div style="font-size: 12px; color: #9d9284; padding-top: 3px;">Follows the Windows animation setting by default</div></div>
+        <div style="font-size: 13px; color: #b3a897; white-space: nowrap; padding-top: 1px;">Follow system</div>
+      </div>
+      <div style="height: 1px; margin: 8px 28px; background: #322d28;"></div>
+      <div style="padding: 2px 28px 6px 28px; font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase; color: #9d9284;">Views</div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px;">
+        <div><div style="font-size: 13.5px; color: #cdc3b4;">Markdown default view</div><div style="font-size: 12px; color: #9d9284; padding-top: 3px;">Applied when a .md file opens fresh (Ctrl+M cycles)</div></div>
+        <div style="display: flex; align-items: center; gap: 12px; padding-top: 1px;"><span style="font-size: 12px; color: #b3a897;">‹</span><span style="font-size: 13px; color: #b3a897;">Split</span><span style="font-size: 12px; color: #b3a897;">›</span></div>
+      </div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px;">
+        <div><div style="font-size: 13.5px; color: #cdc3b4;">Table default view</div><div style="font-size: 12px; color: #9d9284; padding-top: 3px;">Applied when a .csv/.tsv file opens fresh (Ctrl+T toggles)</div></div>
+        <div style="display: flex; align-items: center; gap: 12px; padding-top: 1px;"><span style="font-size: 12px; color: #b3a897;">‹</span><span style="font-size: 13px; color: #b3a897;">Table</span><span style="font-size: 12px; color: #b3a897;">›</span></div>
+      </div>
+      <div style="display: flex; align-items: flex-start; justify-content: space-between; gap: 24px; padding: 11px 28px 20px 28px;">
+        <div><div style="font-size: 13.5px; color: #cdc3b4;">Tab width</div><div style="font-size: 12px; color: #9d9284; padding-top: 3px;">Columns a Tab advances to; ←→ adjust, Enter resets to 4</div></div>
+        <div style="display: flex; align-items: center; gap: 12px; padding-top: 1px;"><span style="font-size: 12px; color: #b3a897;">‹</span><span style="font-size: 13px; color: #b3a897; font-family: 'Monaspace Neon', monospace;">4</span><span style="font-size: 12px; color: #b3a897;">›</span></div>
+      </div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px; margin-bottom: 26px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Rows pad, they do not fix.</b> 11px top and bottom around a two-line block. Fixed-height rows clip the moment a description gets longer or the interface font gets larger.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">28px margin on both sides.</b> The value column right-aligns to the same 28px as the title's left edge. In the screenshots the page indents at ~32 while the chrome pads at 8–14; if that still holds, it is why the two halves look unrelated.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Selected row: <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">accent_wash</span> + a 2px accent bar</b>, and the value brightens to <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">md_heading</span>. The full-width blue band in the screenshot is the loudest thing on it; a wash plus a bar is unmistakable and quiet.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Show the affordance on the row.</b> A cycling value shows <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">‹ ›</span> (dimmed at the ends of the range, as on Zoom), a sub-screen shows <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">›</span>, a toggle shows just its state. Three row types, visibly different, no icons.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Group headers earn their keep at ten rows.</b> This spec lists thirteen. Session / Appearance / Views, with the new ones folded in where they belong rather than appended.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Mouse works everywhere.</b> Click a row to select, click the value to cycle, click <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">‹ ›</span> to step. The help line lists keys because keys are faster, not because the mouse is unsupported.</div>
+    </div>
+
+    <h3 style="margin: 0 0 12px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">11.1 Font screen</h3>
+    <div style="width: 1140px; border-radius: 8px; overflow: hidden; background: #221f1c; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); margin-bottom: 12px;">
+      <div style="padding: 26px 28px 16px 28px;">
+        <div style="display: flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 500; color: #f2ebe0;"><span style="font-size: 13px; color: #9d9284; font-weight: 400;">Settings</span><span style="font-size: 12px; color: #6f665c;">›</span><span>Editor font</span></div>
+        <div style="display: flex; gap: 22px; padding-top: 7px; font-size: 12px; color: #9d9284;"><span>Esc goes back</span><span>↑↓ choose</span><span>←→ change</span></div>
+      </div>
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 11px 28px; background: #302823; box-shadow: inset 2px 0 0 #d99b62;">
+        <div style="font-size: 13.5px; color: #f2ebe0;">Family</div>
+        <div style="display: flex; align-items: center; gap: 12px;"><span style="font-size: 12px; color: #b3a897;">‹</span><span style="font-size: 13px; color: #e5b57f;">Monaspace Neon</span><span style="font-size: 12px; color: #b3a897;">›</span></div>
+      </div>
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 11px 28px;">
+        <div style="font-size: 13.5px; color: #cdc3b4;">Style</div>
+        <div style="display: flex; align-items: center; gap: 12px;"><span style="font-size: 12px; color: #6f665c;">‹</span><span style="font-size: 13px; color: #b3a897;">Regular</span><span style="font-size: 12px; color: #b3a897;">›</span></div>
+      </div>
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 11px 28px;">
+        <div style="font-size: 13.5px; color: #cdc3b4;">Size</div>
+        <div style="display: flex; align-items: center; gap: 12px;"><span style="font-size: 12px; color: #b3a897;">‹</span><span style="font-size: 13px; color: #b3a897; font-family: 'Monaspace Neon', monospace;">11</span><span style="font-size: 12px; color: #b3a897;">›</span></div>
+      </div>
+      <div style="display: flex; align-items: center; justify-content: space-between; gap: 24px; padding: 11px 28px;">
+        <div style="font-size: 13.5px; color: #cdc3b4;">Ligatures <span style="font-size: 11px; color: #d99b62;">NEW</span></div>
+        <div style="font-size: 13px; color: #b3a897;">On</div>
+      </div>
+      <div style="height: 1px; margin: 10px 28px 0 28px; background: #322d28;"></div>
+      <div style="padding: 16px 28px 22px 28px;">
+        <div style="font-size: 11.5px; letter-spacing: 0.1em; text-transform: uppercase; color: #9d9284; padding-bottom: 12px;">Preview</div>
+        <div style="font-family: 'Monaspace Neon', monospace; font-size: 15px; line-height: 26px; color: #cdc3b4;"><div>The quick brown fox jumps over the lazy dog</div><div>0123456789 &nbsp;{}[]()&lt;&gt; &nbsp;il1| oO0 &nbsp;-&gt; &nbsp;== &nbsp;!=</div></div>
+        <div style="margin-top: 14px; padding: 12px 14px; background: #1c1917; border-radius: 6px; font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 21px; white-space: pre;"><div><span style="color: #efe7db;">"sqlReaderQuery"</span><span style="color: #a69b8b;">:</span> <span style="color: #9dc9a0;">"SELECT TOP (1000)"</span><span style="color: #a69b8b;">,</span></div><div><span style="color: #efe7db;">"retry"</span><span style="color: #a69b8b;">:</span> <span style="color: #e5b57f;">0</span><span style="color: #a69b8b;">,</span> <span style="color: #9d9284;">// comment</span></div></div>
+        <div style="margin-top: 14px; font-size: 12px; color: #9d9284; line-height: 1.6;">6 monospaced families found. Proportional fonts are not offered: the editor lays text out on a fixed cell grid.</div>
+      </div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Breadcrumb title.</b> <i>Settings › Editor font</i>, so a screen opened from another screen says where Esc goes back to. In the screenshot the Font tab gives no clue it came from Settings.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">The preview should show real work.</b> Pangram, then the disambiguation set, then <b style="color: #cdc3b4;">an actual coloured code sample</b> — you choose a coding font by looking at code in it, not at a sentence about a fox.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Keep that explanatory line.</b> It is the best copy in the current app: it answers "where are my other fonts" before the user asks. Move it under the preview and set it in <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_muted</span> at 12px.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Dim the arrow at the range end.</b> <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">‹</span> goes to <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_dim</span> at the first family. Free feedback that the list has ends.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Live application, no Apply button.</b> Changing a value re-bakes the atlas and repaints immediately, exactly as your theme file does. Esc is the only exit, and it keeps the change.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Same screen, three uses.</b> Editor font, interface font, and preview font are one screen parameterised by which target it edits — the preview block is the only part that differs.</div>
+    </div>
+  </div>
+
+  <!-- ===== 12 FIND ===== -->
+  <div id="s12" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">12</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Find, Replace, and Filter</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 24px;"></div>
+    <p style="margin: 0 0 20px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">Find lives in a bar at the top of the editor, not in the status line. The count is the number you stare at while typing, and in the screenshots it is the lowest-contrast text in the window, at the bottom, 700 pixels from where you are looking.</p>
+
+    <div style="display: flex; flex-direction: column; gap: 20px; max-width: 1140px;">
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div style="font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: #8f8578;">Find</div>
+        <div style="width: 1140px; height: 38px; display: flex; align-items: center; gap: 14px; padding: 0 12px; background: #2b2724; border-bottom: 1px solid #322d28; box-sizing: border-box;">
+          <span style="font-size: 12px; color: #9d9284; width: 46px;">Find</span>
+          <span style="flex: 1; height: 26px; display: flex; align-items: center; gap: 1px; padding: 0 10px; background: #221f1c; border-radius: 6px; box-shadow: inset 0 0 0 2px #d99b62; font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #f2ebe0; box-sizing: border-box;">context<span style="width: 2px; height: 15px; background: #d99b62;"></span></span>
+          <span style="font-family: 'Monaspace Neon', monospace; font-size: 12px; color: #cdc3b4; width: 62px; text-align: right;">3 / 349</span>
+          <span style="display: flex; gap: 3px;">
+            <span style="height: 24px; display: flex; align-items: center; padding: 0 8px; border-radius: 5px; font-size: 11.5px; color: #9d9284;">Aa</span>
+            <span style="height: 24px; display: flex; align-items: center; padding: 0 8px; border-radius: 5px; font-size: 11.5px; color: #9d9284;">ab|</span>
+            <span style="height: 24px; display: flex; align-items: center; padding: 0 8px; border-radius: 5px; font-family: 'Monaspace Neon', monospace; font-size: 11.5px; color: #221f1c; background: #d99b62;">.*</span>
+          </span>
+          <span style="width: 1px; height: 18px; background: #322d28;"></span>
+          <span style="display: flex; gap: 3px;"><span style="width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; border-radius: 5px; color: #b3a897; font-size: 11px;">↑</span><span style="width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; border-radius: 5px; color: #b3a897; font-size: 11px;">↓</span></span>
+          <span style="height: 24px; display: flex; align-items: center; padding: 0 8px; border-radius: 5px; font-size: 11.5px; color: #b3a897;">Filter <span style="font-family: 'Monaspace Neon', monospace; color: #9d9284; padding-left: 6px;">Ctrl+L</span></span>
+          <span style="width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; border-radius: 5px; color: #b3a897; font-size: 11px;">✕</span>
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div style="font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: #8f8578;">Replace — one row taller, same bar</div>
+        <div style="width: 1140px; background: #2b2724; border-bottom: 1px solid #322d28;">
+          <div style="height: 38px; display: flex; align-items: center; gap: 14px; padding: 0 12px; box-sizing: border-box;">
+            <span style="font-size: 12px; color: #9d9284; width: 46px;">Find</span>
+            <span style="flex: 1; height: 26px; display: flex; align-items: center; padding: 0 10px; background: #221f1c; border-radius: 6px; font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #f2ebe0; box-sizing: border-box;">context</span>
+            <span style="font-family: 'Monaspace Neon', monospace; font-size: 12px; color: #cdc3b4; width: 62px; text-align: right;">3 / 349</span>
+            <span style="width: 132px;"></span>
+          </div>
+          <div style="height: 38px; display: flex; align-items: center; gap: 14px; padding: 0 12px 6px 12px; box-sizing: border-box;">
+            <span style="font-size: 12px; color: #9d9284; width: 46px;">Replace</span>
+            <span style="flex: 1; height: 26px; display: flex; align-items: center; padding: 0 10px; background: #221f1c; border-radius: 6px; font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #f2ebe0; box-sizing: border-box;">scope</span>
+            <span style="display: flex; gap: 6px;">
+              <span style="height: 26px; display: flex; align-items: center; padding: 0 10px; border-radius: 6px; font-size: 12px; color: #cdc3b4; background: #34302c;">Replace</span>
+              <span style="height: 26px; display: flex; align-items: center; padding: 0 10px; border-radius: 6px; font-size: 12px; color: #cdc3b4; background: #34302c;">All 349</span>
+            </span>
+          </div>
+        </div>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 8px;">
+        <div style="font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: #8f8578;">Filter mode — a mode, so it stays obvious</div>
+        <div style="width: 1140px; border-radius: 8px; overflow: hidden; background: #221f1c; box-shadow: 0 0 0 1px rgba(255,246,232,0.07);">
+          <div style="height: 30px; display: flex; align-items: center; gap: 14px; padding: 0 12px; background: #2e2823; box-sizing: border-box;">
+            <span style="font-size: 11.5px; font-weight: 500; letter-spacing: 0.08em; color: #e5b57f;">FILTER</span>
+            <span style="font-family: 'Monaspace Neon', monospace; font-size: 12px; color: #cdc3b4;">context</span>
+            <span style="font-size: 11.5px; color: #b3a897;">249 of 778 lines</span>
+            <span style="flex: 1;"></span>
+            <span style="font-size: 11.5px; color: #9d9284;">Ctrl+L shows the whole file · ↑↓ moves · Enter jumps there</span>
+          </div>
+          <div style="display: flex; padding: 12px 0;">
+            <div style="width: 56px; flex: none; font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 21px; color: #9d9284; text-align: right; padding-right: 12px; box-sizing: border-box;"><div>34</div><div>60</div><div>66</div><div>112</div></div>
+            <div style="flex: 1; font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 21px; color: #cdc3b4; white-space: pre;"><div>Path composition needs a task's full ancestor <span style="background: #4a3826;">context</span></div><div>The invariant that replaces the gate, in <span style="background: #4a3826;">context</span></div><div>Any symmetric selection satisfies this <span style="background: #d99b62; color: #221f1c;">context</span></div><div>Confirmed by the GET /wbs parameter <span style="background: #4a3826;">context</span></div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px; margin-top: 22px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Count next to the field, at 9.2:1.</b> <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">3 / 349</span> in mono so the digits do not shift as you type. Zero results turns the field's focus ring <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">danger</span> and the count reads <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">0 / 0</span> — no beep, no shake.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Current hit vs the rest.</b> Current is accent fill with <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">bg_base</span> text; others are <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">find_match_bg</span> keeping <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_primary</span>. Both pairs clear AA — measure the text on the highlight, not on the page.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Three toggles, always visible, always labelled.</b> <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">Aa</span> case, <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">ab|</span> whole word, <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">.*</span> regex. Active = accent fill. While regex is a hidden Ctrl+R state, there is no way to tell why a search is behaving oddly.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Invalid regex is inline.</b> The field's ring goes <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">danger</span> and the reason replaces the count: <i>unterminated group</i>. Never a dialog, and never silent.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Filter keeps original line numbers.</b> That is the whole value of the feature — the screenshots show it already working, and it is the best thing in them. Keep the numbers in <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_muted</span>, not <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_dim</span>.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Filter band is 12% accent, not a green fill.</b> A mode must be obvious; it does not have to be the loudest thing on screen. Same fill as a selected settings row, so "something is active" reads consistently across the app.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Selection seeds the search.</b> Ctrl+F with a selection puts it in the field, selected, so typing replaces it. Ctrl+F with no selection keeps the previous term.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Esc closes and keeps the caret</b> at the current hit, and clears the highlight. Enter goes to the next; Shift+Enter the previous; F3 works with the bar closed.</div>
+    </div>
+  </div>
+
+  <!-- ===== 13 STATUS ===== -->
+  <div id="s13" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">13</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Status bar</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 24px;"></div>
+    <div style="display: flex; flex-direction: column; gap: 14px; max-width: 1140px;">
+      <div style="height: 26px; display: flex; align-items: center; justify-content: space-between; background: #1c1917; border-radius: 6px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); font-size: 11.5px; color: #b3a897; overflow: hidden;">
+        <div style="display: flex; height: 100%;"><span style="padding: 0 12px; display: flex; align-items: center; font-family: 'Monaspace Neon', monospace;">Ln 124, Col 94</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28; font-family: 'Monaspace Neon', monospace;">778 lines</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28; font-family: 'Monaspace Neon', monospace;">42.1 KB</span></div>
+        <div style="display: flex; height: 100%;"><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">Markdown</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">UTF-8</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">LF</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28; font-family: 'Monaspace Neon', monospace;">Tab 4</span></div>
+      </div>
+      <div style="height: 26px; display: flex; align-items: center; justify-content: space-between; background: #1c1917; border-radius: 6px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); font-size: 11.5px; color: #b3a897; overflow: hidden;">
+        <div style="display: flex; height: 100%;"><span style="padding: 0 12px; display: flex; align-items: center; font-family: 'Monaspace Neon', monospace;">Ln 124, Col 94</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28; font-family: 'Monaspace Neon', monospace; color: #d99b62;">42 selected, 3 lines</span></div>
+        <div style="display: flex; height: 100%;"><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28; color: #9dc9a0;">Saved</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">Markdown</span><span style="padding: 0 12px; display: flex; align-items: center; border-left: 1px solid #322d28;">UTF-8</span></div>
+      </div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px; margin-top: 20px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Cells, not a sentence.</b> 12px padding each side, a 1px <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">border_subtle</span> between. Facts about position on the left, facts about the file on the right — a fixed home for each, so your eye learns where to look.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Numbers in Neon, words in Argon.</b> Mono digits stop <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">Ln 9 → Ln 10</span> from shifting the whole row.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Selection count replaces the line count</b> when a selection exists, in accent. It is the answer to the only question you have while selecting.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Save confirmation lives here.</b> <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; color: #9dc9a0;">Saved</span> for 1.5s in <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">success</span>, then gone. No toast, no dialog, no sound.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Every cell is clickable.</b> Encoding opens the encoding menu, LF toggles line endings, Tab 4 opens tab width, the language opens the lexer list. A status bar that only reports is half a status bar.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Errors take the whole bar</b> in <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">danger</span> until dismissed — <i>Could not save: file is read-only</i>. Nothing in this app should ever need a modal dialog.</div>
+    </div>
+  </div>
+
+  <!-- ===== 14 HUGE FILES ===== -->
+  <div id="s14" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">14</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">10 GB and still smooth</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 24px;"></div>
+    <p style="margin: 0 0 20px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">You said you do not care how, as long as it is seamless. "Seamless" has a precise UI meaning here: the caret never stops responding, no progress dialog ever appears, and partial results are visible while the rest is still being found. That is achievable, and the UI rules matter as much as the threading.</p>
+    <div style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 1.8; color: #cdc3b4; background: #1c1917; border-radius: 8px; padding: 20px 22px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); white-space: pre; max-width: 1140px; margin-bottom: 20px;"><span style="color: #e5b57f;">The one rule</span>
+<span style="color: #9d9284;">The UI thread never touches the file. It reads two things: a results
+buffer that a worker appends to, and an atomic progress counter.
+Both are read-only from the UI side, so there is no lock and no stall.</span>
+
+<span style="color: #e5b57f;">Mechanism</span>
+memory-map the file        CreateFileMapping + MapViewOfFile in 256 MB views
+                          <span style="color: #9d9284;">The OS pages in what you touch. A 10 GB file costs no RAM until read.</span>
+line index, lazily         a []i64 of line-start offsets, built by the worker
+                          <span style="color: #9d9284;">10 GB / ~80 bytes per line = ~134M lines = ~1 GB of index. Too much.
+                          Index every 1024th line instead: ~1 MB, and scan
+                          forward at most 1023 lines to find any line. Instant.</span>
+filter on a worker        chunk on 4 MB boundaries snapped to newlines,
+                          one job per hardware thread
+                          <span style="color: #9d9284;">Odin: core:thread pool. Each job appends matches to its OWN buffer;
+                          the UI reads them in chunk order, so results stay sorted
+                          with no shared-state contention.</span>
+results appear live       the filter list grows as chunks land, top-down
+progress                  atomic bytes_scanned / total, read once per frame
+
+<span style="color: #e5b57f;">UI rules</span>
+1. no modal, ever         the file opens instantly; the first screen of text
+                          is available before the index exists
+2. progress is a hairline 2px accent bar along the BOTTOM of the filter band,
+                          width = fraction scanned. It disappears at 100%.
+                          <span style="color: #9d9284;">This is the only "loading" affordance in the whole application.</span>
+3. count is provisional   "1,284 lines so far…" while scanning, then
+                          "1,284 of 134,217,728 lines". Never a spinner.
+4. Esc cancels            sets an atomic flag; workers check it per chunk.
+                          Cancelling is instant and keeps the partial results.
+5. scrollbar is honest    thumb size reflects total bytes, not lines found
+6. typing stays live      the filter query debounces 120ms, then restarts the
+                          scan. Restarting a scan must be cheaper than a
+                          keystroke feels -- cancel, don't queue.
+7. degrade one thing only at >2 GB, disable word wrap by default (wrap needs
+                          the full line index) and say so in the status bar:
+                          "Word wrap off -- large file". One honest sentence
+                          beats a silently different behaviour.</div>
+    <div style="display: flex; flex-direction: column; gap: 8px; max-width: 1140px;">
+      <div style="font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: #8f8578;">Filter band, mid-scan</div>
+      <div style="width: 1140px; height: 32px; position: relative; display: flex; align-items: center; gap: 14px; padding: 0 12px; background: #2e2823; border-radius: 6px; box-sizing: border-box; overflow: hidden;">
+        <span style="font-size: 11.5px; font-weight: 500; letter-spacing: 0.08em; color: #e5b57f;">FILTER</span>
+        <span style="font-family: 'Monaspace Neon', monospace; font-size: 12px; color: #cdc3b4;">timeout</span>
+        <span style="font-size: 11.5px; color: #b3a897;">1,284 lines so far…</span>
+        <span style="flex: 1;"></span>
+        <span style="font-size: 11.5px; color: #9d9284;">3.1 GB of 9.7 GB · Esc cancels and keeps these</span>
+        <span style="position: absolute; bottom: 0; left: 0; width: 32%; height: 2px; background: #d99b62;"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== 15 EMPTY TAB ===== -->
+  <div id="s15" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">15</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">The empty tab</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 24px;"></div>
+    <div style="width: 1140px; height: 240px; border-radius: 8px; background: #221f1c; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); position: relative; margin-bottom: 14px;">
+      <div style="position: absolute; top: 16px; left: 24px; width: 2px; height: 18px; background: #d99b62;"></div>
+      <div style="position: absolute; bottom: 26px; left: 24px; display: flex; flex-direction: column; gap: 7px; font-size: 12px; color: #6f665c;">
+        <div style="display: flex; gap: 14px;"><span style="font-family: 'Monaspace Neon', monospace; width: 66px; color: #8f8578;">Ctrl+O</span><span>open a file</span></div>
+        <div style="display: flex; gap: 14px;"><span style="font-family: 'Monaspace Neon', monospace; width: 66px; color: #8f8578;">Ctrl+P</span><span>commands</span></div>
+        <div style="display: flex; gap: 14px;"><span style="font-family: 'Monaspace Neon', monospace; width: 66px; color: #8f8578;">drop</span><span>a file anywhere in this window</span></div>
+      </div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">The caret is already there,</b> top-left, blinking. The page is empty because it is an empty document, not because the app has not loaded.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Three hints, bottom-left, <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_dim</span>.</b> Bottom-left keeps them out of the way of the first thing you type, and they vanish on the first keystroke — never fade, never animate.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">No logo, no welcome, no recent-files grid.</b> This is a notepad; it opens in under a second and you type. A splash screen would undo the one thing the app is best at.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Drop target.</b> Dragging a file over the window draws a 2px accent inset ring on the editor area only — no overlay, no text, no dimming.</div>
+    </div>
+  </div>
+
+  <!-- ===== 16 ICON ===== -->
+  <div id="s16" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">16</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Icon</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 24px;"></div>
+    <p style="margin: 0 0 22px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">Three directions, all buildable from rectangles and one letterform, all legible at 16px — which is the only size that really matters, because it is the taskbar, the alt-tab list, and the file association. Ship 16, 20, 24, 32, 48, 64, 256 in one .ico; do not scale one bitmap. These are drawn here with plain shapes so you can judge the idea, not the craft — the final asset should be drawn properly in a vector tool.</p>
+
+    <div style="display: flex; gap: 36px; flex-wrap: wrap; align-items: flex-start;">
+      <div style="display: flex; flex-direction: column; gap: 14px; width: 340px;">
+        <div style="display: flex; align-items: baseline; gap: 10px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; font-weight: 700; color: #221f1c; background: #d99b62; padding: 3px 7px; border-radius: 4px;">16a</span><span style="font-size: 15px; font-weight: 500; color: #f2ebe0;">Caret on paper</span><span style="font-size: 12px; color: #d99b62;">recommended</span></div>
+        <div style="display: flex; align-items: flex-end; gap: 18px;">
+          <div style="width: 96px; height: 96px; border-radius: 14px; background: #f2ebe0; position: relative; flex: none;"><span style="position: absolute; left: 26px; top: 24px; width: 6px; height: 48px; background: #d99b62;"></span><span style="position: absolute; left: 44px; top: 30px; width: 26px; height: 5px; background: #b3a897;"></span><span style="position: absolute; left: 44px; top: 46px; width: 26px; height: 5px; background: #b3a897;"></span><span style="position: absolute; left: 44px; top: 62px; width: 16px; height: 5px; background: #cdc3b4;"></span></div>
+          <div style="width: 48px; height: 48px; border-radius: 7px; background: #f2ebe0; position: relative; flex: none;"><span style="position: absolute; left: 13px; top: 12px; width: 3px; height: 24px; background: #d99b62;"></span><span style="position: absolute; left: 22px; top: 15px; width: 13px; height: 3px; background: #b3a897;"></span><span style="position: absolute; left: 22px; top: 23px; width: 13px; height: 3px; background: #b3a897;"></span><span style="position: absolute; left: 22px; top: 31px; width: 8px; height: 3px; background: #cdc3b4;"></span></div>
+          <div style="width: 32px; height: 32px; border-radius: 5px; background: #f2ebe0; position: relative; flex: none;"><span style="position: absolute; left: 9px; top: 8px; width: 2px; height: 16px; background: #d99b62;"></span><span style="position: absolute; left: 15px; top: 10px; width: 9px; height: 2px; background: #b3a897;"></span><span style="position: absolute; left: 15px; top: 15px; width: 9px; height: 2px; background: #b3a897;"></span><span style="position: absolute; left: 15px; top: 20px; width: 5px; height: 2px; background: #cdc3b4;"></span></div>
+          <div style="width: 16px; height: 16px; border-radius: 3px; background: #f2ebe0; position: relative; flex: none;"><span style="position: absolute; left: 4px; top: 4px; width: 2px; height: 8px; background: #d99b62;"></span><span style="position: absolute; left: 8px; top: 5px; width: 5px; height: 2px; background: #b3a897;"></span><span style="position: absolute; left: 8px; top: 10px; width: 5px; height: 2px; background: #b3a897;"></span></div>
+        </div>
+        <p style="margin: 0; font-size: 12.5px; line-height: 1.65; color: #9d9284;">Warm paper, the accent caret, two lines of text. Says "type here" with no letterform, so it needs no localisation and reads at 16px where a letter would mush. It also matches the app: the same warm white and the same accent, which is what makes an icon feel like it belongs to its window.</p>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 14px; width: 340px;">
+        <div style="display: flex; align-items: baseline; gap: 10px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; font-weight: 700; color: #221f1c; background: #d99b62; padding: 3px 7px; border-radius: 4px;">16b</span><span style="font-size: 15px; font-weight: 500; color: #f2ebe0;">Letterform</span></div>
+        <div style="display: flex; align-items: flex-end; gap: 18px;">
+          <div style="width: 96px; height: 96px; border-radius: 14px; background: #2b2724; display: flex; align-items: center; justify-content: center; flex: none;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 56px; font-weight: 700; color: #d99b62; line-height: 1;">N</span></div>
+          <div style="width: 48px; height: 48px; border-radius: 7px; background: #2b2724; display: flex; align-items: center; justify-content: center; flex: none;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 28px; font-weight: 700; color: #d99b62; line-height: 1;">N</span></div>
+          <div style="width: 32px; height: 32px; border-radius: 5px; background: #2b2724; display: flex; align-items: center; justify-content: center; flex: none;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 19px; font-weight: 700; color: #d99b62; line-height: 1;">N</span></div>
+          <div style="width: 16px; height: 16px; border-radius: 3px; background: #2b2724; display: flex; align-items: center; justify-content: center; flex: none;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 10px; font-weight: 700; color: #d99b62; line-height: 1;">N</span></div>
+        </div>
+        <p style="margin: 0; font-size: 12.5px; line-height: 1.65; color: #9d9284;">The product's own typeface as the mark. Cheapest to produce, instantly recognisable in a taskbar, and it makes the Monaspace choice part of the brand. Risk: a single letter on a dark rounded square is the most common indie-app icon there is, so it will not stand out in a crowded taskbar.</p>
+      </div>
+
+      <div style="display: flex; flex-direction: column; gap: 14px; width: 340px;">
+        <div style="display: flex; align-items: baseline; gap: 10px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 11.5px; font-weight: 700; color: #221f1c; background: #d99b62; padding: 3px 7px; border-radius: 4px;">16c</span><span style="font-size: 15px; font-weight: 500; color: #f2ebe0;">Tabs</span></div>
+        <div style="display: flex; align-items: flex-end; gap: 18px;">
+          <div style="width: 96px; height: 96px; border-radius: 14px; background: #221f1c; position: relative; overflow: hidden; flex: none;"><span style="position: absolute; left: 16px; top: 22px; width: 30px; height: 12px; border-radius: 4px 4px 0 0; background: #6f665c;"></span><span style="position: absolute; left: 50px; top: 22px; width: 30px; height: 12px; border-radius: 4px 4px 0 0; background: #d99b62;"></span><span style="position: absolute; left: 16px; top: 34px; width: 64px; height: 40px; border-radius: 0 0 4px 4px; background: #f2ebe0;"></span></div>
+          <div style="width: 48px; height: 48px; border-radius: 7px; background: #221f1c; position: relative; overflow: hidden; flex: none;"><span style="position: absolute; left: 8px; top: 11px; width: 15px; height: 6px; border-radius: 2px 2px 0 0; background: #6f665c;"></span><span style="position: absolute; left: 25px; top: 11px; width: 15px; height: 6px; border-radius: 2px 2px 0 0; background: #d99b62;"></span><span style="position: absolute; left: 8px; top: 17px; width: 32px; height: 20px; border-radius: 0 0 2px 2px; background: #f2ebe0;"></span></div>
+          <div style="width: 32px; height: 32px; border-radius: 5px; background: #221f1c; position: relative; overflow: hidden; flex: none;"><span style="position: absolute; left: 5px; top: 7px; width: 10px; height: 4px; border-radius: 1px 1px 0 0; background: #6f665c;"></span><span style="position: absolute; left: 17px; top: 7px; width: 10px; height: 4px; border-radius: 1px 1px 0 0; background: #d99b62;"></span><span style="position: absolute; left: 5px; top: 11px; width: 22px; height: 14px; border-radius: 0 0 1px 1px; background: #f2ebe0;"></span></div>
+          <div style="width: 16px; height: 16px; border-radius: 3px; background: #221f1c; position: relative; overflow: hidden; flex: none;"><span style="position: absolute; left: 2px; top: 3px; width: 5px; height: 2px; background: #6f665c;"></span><span style="position: absolute; left: 9px; top: 3px; width: 5px; height: 2px; background: #d99b62;"></span><span style="position: absolute; left: 2px; top: 5px; width: 12px; height: 8px; background: #f2ebe0;"></span></div>
+        </div>
+        <p style="margin: 0; font-size: 12.5px; line-height: 1.65; color: #9d9284;">Names the one feature that differentiates it from Notepad: tabs. Strongest at 48px and above, weakest at 16 — the two tab stubs merge. If you pick this, simplify to a single accent tab at 16px, which is a normal thing for an .ico to do.</p>
+      </div>
+    </div>
+    <p style="margin: 22px 0 0 0; font-size: 13.5px; line-height: 1.7; color: #cdc3b4; max-width: 880px;"><b style="color: #f2ebe0; font-weight: 500;">Also needed for a product:</b> a document icon per associated extension (same shape, extension label in the corner), a monochrome variant for the Windows notification area, and an app icon that does <i>not</i> change with the theme — Windows caches it, and an icon that flickers between light and dark looks broken.</p>
+  </div>
+
+  <!-- ===== 17 THEMES ===== -->
+  <div id="s17" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">17</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Themes &amp; colour rules</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 24px;"></div>
+    <p style="margin: 0 0 18px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">You said any colour is allowed, so: <b style="color: #f2ebe0; font-weight: 500;">never clamp, warn once, and make the warning useful.</b> Clamping a user's colour is a bug from their point of view. But a product that ships an accessibility claim should tell them when they have broken it.</p>
+    <div style="display: flex; flex-direction: column; gap: 10px; max-width: 1140px; margin-bottom: 22px;">
+      <div style="font-size: 12px; letter-spacing: 0.1em; text-transform: uppercase; color: #8f8578;">On saving a theme that drops below AA — status bar, dismissible, once per save</div>
+      <div style="height: 26px; display: flex; align-items: center; gap: 10px; padding: 0 12px; background: #1c1917; border-radius: 6px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); font-size: 11.5px; box-sizing: border-box;">
+        <span style="color: #e0a458; font-weight: 500;">Contrast</span>
+        <span style="color: #cdc3b4;">text_primary on bg_base is 2.9:1 — below the 4.5:1 needed for body text. Applied anyway.</span>
+        <span style="flex: 1;"></span>
+        <span style="color: #9d9284;">Ctrl+click to see all 6</span>
+        <span style="color: #b3a897;">✕</span>
+      </div>
+    </div>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px; margin-bottom: 30px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Check six pairs, not everything.</b> body-on-base, secondary-on-panel, muted-on-base, body-on-selection_doc, body-on-find_match_bg, filter_text-on-filter_bg. Those six cover every place text sits on a fill that a theme can change.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Keep <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">base dark</span> / <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">base light</span> inheritance.</b> It is the best decision in your current format: a nine-line theme file works, and adding a role later does not break every existing theme.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">Follow Windows</span> as a theme choice, if it is not already one.</b> Read the system light/dark preference and switch on <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">WM_SETTINGCHANGE</span>. Expected in a paid app now, and it is one registry read.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Theme editing is a normal tab.</b> It already is — the file opens as a tab and Ctrl+S applies it live. That is better than a colour-picker dialog and you should not replace it. Do add a 20px swatch in the gutter beside each colour line.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">High contrast mode overrides everything.</b> On <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">SPI_GETHIGHCONTRAST</span>, build the theme from <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">GetSysColor</span> and set every alpha fill to solid. Cheap, because the theme is already one struct.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Ship three, not one.</b> Dark, Light, and one high-contrast — plus the two files in §1 as the defaults. A product with a theme system and one theme looks unfinished.</div>
+    </div>
+
+    <h3 style="margin: 0 0 12px 0; font-size: 17px; font-weight: 500; color: #e5b57f;">17.1 Colour rules — the UI side</h3>
+    <p style="margin: 0 0 16px 0; font-size: 13.5px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">The rules file is the best-written document in the project and the reasoning about literal patterns versus regex is right. Two UI notes only:</p>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Rule 3 needs to be visible, not just documented.</b> "Syntax highlighting wins, including .log" is genuinely surprising, and the file admits it. Surface it where it bites: when a rule is skipped because the lexer got there first, the status bar can say <i>3 colour rules inactive on this file — the log lexer already colours them</i>, clickable to the log. Otherwise the first-time user writes <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">ERROR = Danger</span>, sees nothing change, and concludes the feature is broken.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Hide the <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">Bg_*</span> roles from the rules docs.</b> The file lists them "for completeness" and then warns they make text unreadable. A role list that includes six choices which are always wrong is a trap; move them to a footnote or drop them. For a product, also validate on save: a rule using a <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">Bg_*</span> role warns in the status bar the same way a low-contrast theme does.</div>
+    </div>
+  </div>
+
+  <!-- ===== 18 MOTION / A11Y ===== -->
+  <div id="s18" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">18</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Motion, focus, accessibility</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 24px;"></div>
+    <div style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px; line-height: 1.8; color: #cdc3b4; background: #1c1917; border-radius: 8px; padding: 20px 22px; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); white-space: pre; max-width: 1140px; margin-bottom: 22px;"><span style="color: #e5b57f;">MOTION -- 50ms, five places, nothing else</span>
+tab / menu / row hover fill   50ms  ease-out cubic  colour only
+active tab pill move          50ms  ease-out cubic  x + width, on reorder only
+menu &amp; palette appear         50ms  ease-out cubic  opacity only -- no scale, no slide
+split divider drag            0ms   follows the pointer exactly
+"Saved" in the status bar     0ms in, 1.5s hold, 0ms out
+
+everything else                 0ms  caret, scroll, typing, selection, resize,
+                                     filter results, theme switch, zoom
+
+<span style="color: #9d9284;">Reduced motion: SystemParametersInfo(SPI_GETCLIENTAREAANIMATION) at startup,
+re-read on WM_SETTINGCHANGE. When false, every duration above becomes 0 and
+the caret stops blinking. The new Reduce motion setting defaults to following
+it, and can be forced on or off.</span>
+
+<span style="color: #e5b57f;">FOCUS RING -- one implementation, everywhere</span>
+2px focus_ring, 1px offset, matching the element's radius, drawn as one
+SDF instance with an annular parameter. Appears on keyboard focus only
+(track a "last input was keyboard" flag), never on mouse click.
+Applies to: tabs, the &gt;_ button, caption buttons, menu-bar items, menu rows,
+palette rows, settings rows, find fields and toggles, table headers,
+the split divider. If a thing can be reached with Tab, it draws the ring.</div>
+    <div style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px 30px; max-width: 1140px;">
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">1.4.3 AA on all body text.</b> Every pair in §1 is measured. The single exception is <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">text_dim</span> for disabled controls, which WCAG explicitly exempts and which is redundant with the control not responding.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">1.4.11 non-text 3:1.</b> Caret at 2px in <span style="font-family: 'Monaspace Neon', monospace; font-size: 12.5px;">caret</span> (7.3:1), focus ring 2px, scrollbar thumb 3.0:1, checkbox borders 3:1. Hairlines are decorative and exempt — they never carry the only cue for a boundary.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">1.4.1 never colour alone.</b> Links get an underline; the dirty tab gets an asterisk as well as accent; the current find hit differs by fill and by the count; malformed table rows get a bar, not a tint.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Hit targets.</b> Nothing interactive smaller than 24×24 — the close glyph is 16px in a 24px box, toggles are 24 tall, caption buttons 46×40. 24 is the WCAG 2.2 minimum and the smallest a mouse finds reliably.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Keyboard completeness.</b> Every command is in a menu with an accelerator; the palette lists all of them. Tab order follows visual order: rail → menu bar → editor → find bar. Esc always backs out one level and never loses work.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Screen readers — be honest.</b> A custom-drawn editor is invisible to Narrator unless you implement UI Automation. That is a real project. For v1, say so in the docs rather than shipping a half-working provider; if a buyer needs it, the text control pattern is where to start.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Zoom is your text-resize story.</b> Ctrl+= scales the document; the chrome scales with the interface font setting. Together those cover 1.4.4 without a separate mechanism.</div>
+      <div style="font-size: 13.5px; line-height: 1.65;"><b style="color: #f2ebe0; font-weight: 500;">Gamma-correct text blending.</b> Not an accessibility checkbox, but it is why the measured ratios are true. Blend light-on-dark text in linear space or every value in §1 is optimistic by roughly a weight.</div>
+    </div>
+  </div>
+
+  <!-- ===== 19 BUILD ORDER ===== -->
+  <div id="s19" style="max-width: 1240px; margin: 0 auto; padding: 68px 48px 0 48px;">
+    <div style="display: flex; align-items: baseline; gap: 14px; padding-bottom: 6px;"><span style="font-family: 'Monaspace Neon', monospace; font-size: 13px; color: #d99b62;">19</span><h2 style="margin: 0; font-size: 27px; font-weight: 700; color: #f2ebe0;">Build order</h2></div>
+    <div style="height: 1px; background: rgba(255,246,232,0.09); margin-bottom: 24px;"></div>
+    <p style="margin: 0 0 22px 0; font-size: 14px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">Ordered by visible improvement per hour. The first three are an afternoon each and between them they fix most of "it looks like a developer threw it together".</p>
+    <div style="display: flex; flex-direction: column; gap: 0; border-radius: 8px; overflow: hidden; box-shadow: 0 0 0 1px rgba(255,246,232,0.07); max-width: 1140px; font-size: 13px;">
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; height: 30px; background: #2b2724; color: #cdc3b4; font-family: 'Monaspace Neon', monospace; font-size: 12.5px;"><span></span><span style="padding: 0 10px;">step</span><span style="padding: 0 10px;">size</span><span style="padding: 0 10px;">why here</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4;"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">1</span><span style="padding: 0 10px;">Paste the two theme files</span><span style="padding: 0 10px; color: #9dc9a0;">an hour</span><span style="padding: 0 10px; color: #9d9284;">Warm neutrals, one accent, AA everywhere. Biggest change, least code.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">2</span><span style="padding: 0 10px;">Metrics struct + §2 values + 16px editor padding</span><span style="padding: 0 10px; color: #9dc9a0;">half a day</span><span style="padding: 0 10px; color: #9d9284;">Fixes the alignment and sizing you called out. Prerequisite for §3.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4;"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">3</span><span style="padding: 0 10px;">Interface font setting + Monaspace Argon in chrome</span><span style="padding: 0 10px; color: #9dc9a0;">half a day</span><span style="padding: 0 10px; color: #9d9284;">The single strongest anti-dev-tool move. Needs a second atlas, nothing more.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">4</span><span style="padding: 0 10px;">SDF rounded-rect instance pipeline</span><span style="padding: 0 10px; color: #e0a458;">a day</span><span style="padding: 0 10px; color: #9d9284;">Radii, hairlines, shadows and focus rings all become the same shader. Everything after this gets cheaper.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4;"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">5</span><span style="padding: 0 10px;">Tab rail: pills, dirty asterisk, close hit area, focus ring</span><span style="padding: 0 10px; color: #e0a458;">a day</span><span style="padding: 0 10px; color: #9d9284;">The part of the window users look at most.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">6</span><span style="padding: 0 10px;">Caption buttons as geometry + the §4.1 checklist</span><span style="padding: 0 10px; color: #e0a458;">a day</span><span style="padding: 0 10px; color: #9d9284;">Snap layouts and the system menu are the "missing features" users will report first.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4;"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">7</span><span style="padding: 0 10px;">DPI: manifest, WM_DPICHANGED, rounding rules</span><span style="padding: 0 10px; color: #e0a458;">a day</span><span style="padding: 0 10px; color: #9d9284;">Belongs before the polish, not after — every metric depends on it.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">8</span><span style="padding: 0 10px;">Menus, palette, settings and font screens to §6/7/11</span><span style="padding: 0 10px; color: #e0a458;">2 days</span><span style="padding: 0 10px; color: #9d9284;">Mostly re-laying-out what exists, once the metrics struct is in place.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4;"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">9</span><span style="padding: 0 10px;">Find/replace bar out of the status line</span><span style="padding: 0 10px; color: #e0a458;">a day</span><span style="padding: 0 10px; color: #9d9284;">Fixes the worst contrast problem in the app and adds visible search modes.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">10</span><span style="padding: 0 10px;">Markdown: block/span parser to §9.2 level 13</span><span style="padding: 0 10px; color: #c0453b;">a week</span><span style="padding: 0 10px; color: #9d9284;">The priority, but it wants the pipeline and the metrics struct in place first.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4;"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">11</span><span style="padding: 0 10px;">Preview pane: shaper, proportional face, type scale</span><span style="padding: 0 10px; color: #c0453b;">a week</span><span style="padding: 0 10px; color: #9d9284;">Where "looks like Obsidian" actually happens. Independent of the editor grid.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4; background: rgba(255,246,232,0.025);"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">12</span><span style="padding: 0 10px;">Table view, narrow-window drop order, icon</span><span style="padding: 0 10px; color: #e0a458;">3 days</span><span style="padding: 0 10px; color: #9d9284;">Independent of everything above; slot wherever convenient.</span></div>
+      <div style="display: grid; grid-template-columns: 34px 1fr 108px 1fr; align-items: center; min-height: 34px; color: #cdc3b4;"><span style="justify-self: center; font-family: 'Monaspace Neon', monospace; color: #d99b62;">13</span><span style="padding: 0 10px;">Huge-file worker + progress hairline</span><span style="padding: 0 10px; color: #c0453b;">a week</span><span style="padding: 0 10px; color: #9d9284;">Last, because it is the only item where the UI work is the small half.</span></div>
+    </div>
+    <p style="margin: 24px 0 0 0; font-size: 13.5px; line-height: 1.7; color: #cdc3b4; max-width: 880px;">Steps 1–3 are worth doing on their own even if nothing else here happens. If you want, I can mock any single screen at full fidelity next — the markdown preview is the one where seeing it will change decisions.</p>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>
