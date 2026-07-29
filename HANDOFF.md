@@ -3694,6 +3694,92 @@ border, which §1 assigns to `Md_Rule`. Fixed.
   but there is no per-level bullet cycling.
 - **§9.3's preview type scale and proportional face** are batch 17 and untouched.
 
+## 6aq. The first live pass on the UI overhaul — part one (2026-07-28, v0.28.0, branch `fix/live-pass-0.27`)
+
+Wyatt ran [the v0.27.0 checklist](docs/live-pass-v0.27.0.md) against his daily driver and annotated it.
+Seventeen defects. **This release carries the first three**, cut mid-batch at his request so the fixes
+reach his daily driver; the remaining thirteen are specced, planned and next. The spec is
+[2026-07-28-live-pass-0.27-fixes-design.md](docs/superpowers/specs/2026-07-28-live-pass-0.27-fixes-design.md),
+the plan is [2026-07-28-live-pass-0.27-fixes.md](docs/superpowers/plans/2026-07-28-live-pass-0.27-fixes.md),
+and the live ledger is `.superpowers/sdd/progress.md`.
+
+### What landed
+
+**Chrome glyphs were drawn at fractional pixel positions.** An integer-sized glyph quad at a
+fractional origin resamples across texel boundaries, which put a seam through every character in the
+tabs and menus. Document text was never affected, because `text_char_width` rounds the advance so
+column *n* starts exactly at *n·cell_w* — the chrome had no equivalent discipline
+(`tab_base_y = ty + TAB_H*0.5 + UI_SMALL_PX*0.35`, and tab x positions off a fractional shrink step).
+Fixed in one place, `text_draw_spans`, rather than in the dozens of callers.
+
+**The viewport wasted a row, and the markdown preview overhung the status bar.** Both are row-budget
+bugs but not the same one, and the *reported* cause was wrong: both `markdown_draw` call sites already
+subtracted the status bar height. The real fault was that the loop bound compared a **baseline**
+against the content bottom and then drew a full line height below it. Separately, `doc_visible_rows`
+truncated the partial row away entirely.
+
+**Fenced code blocks lost their state above the viewport.** `markdown_draw` began at `top_byte` with
+`in_fence := false`, so scrolling past an opening fence rendered the block as prose *and* let the
+closing fence toggle the state ON — turning the rest of the file into a code block. Wyatt reported
+those as two defects; they are one lost bit. The plain editor had already solved this
+(`doc_lex_state_at`), and the preview simply never asked.
+
+### What this batch got wrong
+
+**The plan's test code was wrong in all three tasks, in the way that matters.** Task 1's measured an
+empty list (a device-less `Text` reports its atlas full, so nothing was recorded and "all positions
+are integral" was vacuously true). Task 2's permitted a full row of overflow, and a second assertion
+would have *failed a correct implementation*. Task 3's read lexer state directly — nothing it asserted
+changed when the bug was reintroduced, so its own sabotage step would have printed `0 failures`.
+Every one was caught downstream, none by the plan's self-review. **The lesson is narrower than "write
+better tests": ask what value each assertion would reject.** Two of these asserted a property the bug
+also satisfied.
+
+**Two of the plan's root-cause hypotheses were wrong**, and the investigate-first steps are what caught
+them — Task 2's `ybot` premise, and Task 3's "binary search the index", which is not implementable
+over an alternating run sequence (no monotone predicate; galloping backward can step over a nearer
+transition). The latter needed a sorted `opens` array of fence-open offsets instead.
+
+**Task 2 introduced a regression and fixed it before merge.** Making the partial row clickable meant
+`doc_pos_at` moved to the drawn budget while `doc_ensure_cursor_visible` stayed on the visible one, so
+a click in the bottom sliver scrolled the view one line and a drag there scrolled one row *per frame* —
+inside the band the code explicitly reserves as non-auto-scrolling. Exactly the §6j shape, inside the
+task that had been warned about §6j.
+
+**The plan cited four test modes that do not exist.** `seltest` fell through to the GUI path, opened a
+window, and locked the exe against the next build. Verify a mode before citing it:
+`grep -o 'os.args\[1\] == "[a-z]*"' src/program/test_modes.odin | sort -u`.
+
+### Found on the way, unreported by anyone
+
+- **The markdown lexer never recognised `~~~` fences** — only backticks. Seeding the preview from the
+  lexer is sound only if both agree what a fence is, so tilde fences would have kept the bug intact.
+- **Six of the eight extensions `doc_is_markdownish` admits had no lexer registered.** `.mkd`, `.mdx`,
+  `.mdown`, `.mdwn`, `.mdtext` and `.mtext` reach Ctrl+M preview but resolved to a nil lexer, so the
+  fence fix would not have applied to them at all. Both lists are now guarded against drifting again.
+- **The drawer and the lexer disagreed about indented fences** in a way that is *parity*, not set
+  membership: an odd number of 4-space-indented fence lines above the viewport flipped the seed the
+  wrong way and painted code background over prose. That would have been a **new** wrong answer
+  introduced by the fix. The two now share one indent rule.
+
+### Owed
+
+- **The fence fix has no end-to-end coverage.** Reverting `markdown_draw` to `in_fence := false` while
+  leaving `md_fence_seed` intact leaves every suite green — a reviewer proved it. The draw needs a D3D
+  device, so the seam is verified by reading code only. Closing it means driving `markdown_draw`
+  through a headless GPU and inspecting the emitted `Md_Code_Bg` quads.
+- **Keyboard navigation past the drawn boundary is untested.** Correct by inspection (the landing
+  calculation is unchanged), but no assertion covers "cursor moves beyond `drawn` → view scrolls".
+- **`fence_state` is not seeded**, so scrolling into the middle of a `json`/`c` fence whose content has
+  an open `/* */` colours the visible remainder wrong. Bounded to the viewport; better than pre-fix.
+- **Markdown headings can still overhang** the content box and are now clipped mid-glyph. Better than
+  painting over the status bar, but the loop needs per-row height measurement to do properly.
+- **The grid/CSV view still wastes its last row** — it stayed wholly on `doc_visible_rows`.
+- **There is no scissor-rect facility anywhere in the renderer.** Task 2 used a cover strip, matching
+  two existing precedents. A real scissor is its own renderer task.
+- **Thirteen live-pass defects remain**, including both scrollbars, tab ordering, the link
+  over-capture, and Replace All. See the ledger.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

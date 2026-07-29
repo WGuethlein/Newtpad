@@ -2398,6 +2398,200 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad mdfencetest` covers the fenced-code state ABOVE the viewport.
+		// Live use (2026-07-28): "when the code block start goes off screen, the
+		// viewport stops rendering the whole codeblock" and "it just makes the rest
+		// of the file a codeblock". One defect -- markdown_draw seeded
+		// `in_fence := false` at doc.top, so an opening fence above the viewport was
+		// lost, the block drew as ordinary markdown, and the CLOSING fence then
+		// toggled the state ON for everything after it.
+		//
+		// The draw itself needs a device, so what is driven here is md_fence_seed
+		// (the seed markdown_draw now starts from) plus md_is_fence_line (the very
+		// predicate its toggle uses) -- the md_row_fits precedent. The walk below is
+		// compared against the SAME walk from byte 0, which is correct by
+		// construction, so this asserts an invariant the bug violates in both
+		// directions rather than a property the bug also satisfies.
+		if os.args[1] == "mdfencetest" {
+			mf_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-58s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			// Byte offset of logical line `n` (0-based); doc.pt.length past EOF.
+			mf_line_offset :: proc(doc: ^Document, n: int) -> int {
+				p := 0
+				for _ in 0 ..< n {
+					if p >= doc.pt.length {return doc.pt.length}
+					p = min(base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP) + 1, doc.pt.length)
+				}
+				return p
+			}
+			// markdown_draw's fence walk, hand-rolled from `start_line`: out[i] is
+			// "line start_line+i draws as fenced code". Seeded exactly as the draw
+			// seeds, toggled on exactly the predicate the draw toggles on.
+			mf_walk :: proc(doc: ^Document, start_line: int, out: []bool) {
+				p := mf_line_offset(doc, start_line)
+				in_fence, _ := md_fence_seed(doc, p)
+				// Finding 5 (2026-07 review): must match markdown_draw's own
+				// [RENDER_LINE_CAP]u8 line buffer, not an independent [1024]u8 --
+				// the "same walk" this test's own header comment claims only
+				// holds if a line longer than 1024 bytes (shorter than
+				// RENDER_LINE_CAP) doesn't get silently truncated here while the
+				// draw reads the whole thing.
+				buf: [RENDER_LINE_CAP]u8
+				for i in 0 ..< len(out) {
+					if p > doc.pt.length {
+						out[i] = false
+						continue
+					}
+					end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+					n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
+					if n > 0 && buf[n - 1] == '\r' {n -= 1}
+					line := string(buf[:n])
+					if md_is_fence_line(line) {
+						in_fence = !in_fence
+						out[i] = false // the fence line draws no body of its own
+					} else {
+						out[i] = in_fence
+					}
+					p = end + 1
+				}
+			}
+			// `open` is the whole opening fence line (e.g. "```json"); its first
+			// three bytes close the block. Run for both marker characters: the
+			// preview toggles on either, so base.lex_markdown -- which is what the
+			// seed reads -- has to recognise both or the tilde case stays broken in
+			// exactly the way Wyatt reported.
+			mf_run :: proc(bad: ^int, open: string, label: string) {
+				// Lines: 0 "# Heading", 1 "", 2 open, 3..102 json,
+				// 103 close, 104 "", 105 "After the block.", 106 "" (post-EOL).
+				OPEN_LINE :: 2
+				FIRST_CODE :: 3
+				LAST_CODE :: 102
+				CLOSE_LINE :: 103
+				AFTER_LINE :: 105
+				TOTAL_LINES :: 107
+				fmt.printfln("%s (%q):", label, open)
+				sb := strings.builder_make()
+				defer strings.builder_destroy(&sb)
+				strings.write_string(&sb, "# Heading\n\n")
+				strings.write_string(&sb, open)
+				strings.write_string(&sb, "\n")
+				for _ in 0 ..< 100 {strings.write_string(&sb, "  {\"k\": 1},\n")}
+				strings.write_string(&sb, open[:3])
+				strings.write_string(&sb, "\n\nAfter the block.\n")
+				// DEFAULT allocator: doc_from_content sets owned_orig, so doc_close
+				// frees this slice. A temp fixture here is heap corruption.
+				doc := doc_from_content(transmute([]u8)strings.clone(strings.to_string(sb)), "x.md", .UTF8)
+				defer doc_close(&doc)
+				doc.md_mode = .Preview
+
+				lex_index_start(&doc)
+				t0 := time.tick_now()
+				for !lex_index_done(&doc) && time.duration_seconds(time.tick_since(t0)) < 5 {
+					time.sleep(time.Millisecond)
+				}
+				mf_chk(bad, lex_index_done(&doc), "the background lex index built")
+
+				// Ground truth: the walk from byte 0, which no seed is involved in.
+				// Checked against the fixture's own shape first -- an off-by-one in
+				// the line numbering above would otherwise make every later
+				// comparison agree about the wrong thing.
+				truth: [TOTAL_LINES]bool
+				mf_walk(&doc, 0, truth[:])
+				shape :=
+					truth[FIRST_CODE] &&
+					truth[LAST_CODE] &&
+					!truth[OPEN_LINE] &&
+					!truth[CLOSE_LINE] &&
+					!truth[AFTER_LINE] &&
+					!truth[0]
+				mf_chk(bad, shape, "fixture: drawn from byte 0, only the block's body is code")
+
+				// 60 lines into the block: the case markdown_draw could not see.
+				inside := mf_line_offset(&doc, 60)
+				mf_chk(bad, doc_lex_state_at(&doc, inside, LEX_RESYNC_WINDOW) != .Normal, "lexer state 60 lines into a fence is not Normal")
+				open, found := lex_index_fence_open(&doc, inside)
+				mf_chk(bad, found && open == mf_line_offset(&doc, OPEN_LINE), "the fence-open line is findable from inside the block")
+
+				seed_in, seed_lex := md_fence_seed(&doc, inside)
+				mf_chk(bad, seed_in, "seeding at a scrolled top says: inside a fence")
+				mf_chk(bad, seed_lex != nil, "the recovered fence line still yields its tag's lexer")
+
+				// The symptom Wyatt reported, both halves: with the bit lost, lines
+				// 60..102 draw as prose and everything from the CLOSING fence on
+				// draws as code. Compared against the from-byte-0 walk, so a seed
+				// that is wrong in either direction fails here.
+				got: [TOTAL_LINES - 60]bool
+				mf_walk(&doc, 60, got[:])
+				same := true
+				for i in 0 ..< len(got) {
+					if got[i] != truth[60 + i] {same = false}
+				}
+				mf_chk(bad, same, "scrolled into the block: every later line matches the top walk")
+
+				// And a top BELOW the closing fence must not seed a fence -- a seed
+				// that answered "true" unconditionally would pass everything above.
+				after := mf_line_offset(&doc, AFTER_LINE)
+				after_in, _ := md_fence_seed(&doc, after)
+				mf_chk(bad, !after_in, "a top below the closing fence is not in a fence")
+				got2: [TOTAL_LINES - AFTER_LINE]bool
+				mf_walk(&doc, AFTER_LINE, got2[:])
+				same2 := true
+				for i in 0 ..< len(got2) {
+					if got2[i] != truth[AFTER_LINE + i] {same2 = false}
+				}
+				mf_chk(bad, same2, "scrolled past the block: nothing after it is code")
+			}
+			bad := 0
+			mf_run(&bad, "```json", "backtick fence")
+			mf_run(&bad, "~~~yaml", "tilde fence")
+
+			// Finding 2 (2026-07 review): md_is_fence_line used to
+			// `strings.trim_left(line, " \t")` unconditionally before checking
+			// the "```"/"~~~" prefix -- LOOSER than base.lex_markdown's
+			// mk_leading_spaces/mk_match_fence, which caps the indent at 3
+			// columns (CommonMark: 4+ is an indented code block, not a
+			// fence-opener) and never treats a tab as indent at all. The fence
+			// bit is PARITY, not set membership, so a line the drawer toggled
+			// on but the lexer never saw could flip md_fence_seed's answer the
+			// WRONG way -- not merely "decline to seed" as the old (also
+			// fixed) comment claimed. This fixture is the reviewer's exact
+			// failing case: line 0 is a 4-space-indented "```json" (the lexer
+			// never opens a fence there), line 1 is an UNINDENTED "```" (both
+			// sides must agree this opens one), so "body text" on line 2 is
+			// genuinely inside a fence. Before the fix, the drawer's own walk
+			// from byte 0 counted line 0 as a toggle too, so two toggles
+			// cancelled out and it disagreed with the lexer-driven seed.
+			{
+				fixture := "    ```json\n```\nbody text\n"
+				doc := doc_from_content(transmute([]u8)strings.clone(fixture), "x.md", .UTF8)
+				defer doc_close(&doc)
+				doc.md_mode = .Preview
+				lex_index_start(&doc)
+				t0 := time.tick_now()
+				for !lex_index_done(&doc) && time.duration_seconds(time.tick_since(t0)) < 5 {
+					time.sleep(time.Millisecond)
+				}
+				mf_chk(&bad, lex_index_done(&doc), "indent fixture: background lex index built")
+
+				truth: [3]bool
+				mf_walk(&doc, 0, truth[:])
+				// The discriminating assertion: false under the reverted
+				// (trim-based) predicate, since there line 0 also toggles and
+				// cancels line 1's real toggle.
+				mf_chk(&bad, truth[2], "indent fixture: walk from byte 0 says body text is inside the fence line 1 opened")
+
+				body_off := mf_line_offset(&doc, 2)
+				seed_in, _ := md_fence_seed(&doc, body_off)
+				mf_chk(&bad, seed_in, "indent fixture: seed at body text also says inside a fence")
+				mf_chk(&bad, seed_in == truth[2], "indent fixture: seed agrees with the walk from byte 0")
+			}
+
+			fmt.printfln("mdfencetest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad csvtest` covers the table-view field parser: delimiters, empties,
 		// quoted fields with embedded delimiters, and "" escapes.
 		if os.args[1] == "csvtest" {
@@ -3252,6 +3446,58 @@ when NEWTPAD_TESTS {
 			}
 			fmt.printfln("column grid linear: %v  %s", lin_ok, "OK" if lin_ok else "FAIL")
 			fmt.printfln("%d/%d scales failed", bad, 7)
+			return true
+		}
+
+		// `newtpad glyphsnaptest` proves every glyph text_draw_spans emits lands on
+		// a whole pixel. Live use (2026-07-28): "all characters/glyphs in the tabs
+		// and menus are split vertically" -- an integer-sized glyph quad sampled at
+		// a fractional position straddles a texel boundary, putting a seam through
+		// every character. The origins below are not arbitrary: 13.37/24.2 and
+		// 7.999/12.001 are the shapes tab_base_y and a shrunk tab's x actually
+		// produce, so a snap that only special-cases whole numbers would pass this
+		// test and still show the bug live.
+		if os.args[1] == "glyphsnaptest" {
+			gs_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-52s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			gs_run :: proc(bad: ^int) {
+				t: plat.Text
+				plat.text_load_faces(&t)
+				for origin in ([][2]f32{{13.37, 24.2}, {0.5, 0.5}, {100.0, 50.0}, {7.999, 12.001}, {-64.0, 50.0}}) {
+					plat.text_probe_reset(&t)
+					plat.text_probe_capture(&t, "Version.odin", origin.x, origin.y, UI_SMALL_PX)
+					// len > 0, not `true`: an empty recording must fail, not pass
+					// vacuously. If the gfx == nil branch in glyph_get is ever
+					// refactored so nothing gets probed, this mode has to go red,
+					// not report "0 failures" having measured nothing.
+					positions := plat.text_probe_positions(&t)
+					raws := plat.text_probe_raw(&t)
+					all_int := len(positions) > 0
+					for p in positions {
+						if p.x != math.trunc(p.x) || p.y != math.trunc(p.y) {all_int = false}
+					}
+					gs_chk(bad, all_int, fmt.tprintf("origin (%.3f, %.3f) -> integral glyph positions", origin.x, origin.y))
+
+					// The integrality check above cannot distinguish floor(v+0.5)
+					// (correct) from trunc(v+0.5) (the regression): both always
+					// produce whole numbers, they just sometimes disagree on WHICH
+					// whole number for a negative integral v, a 1px shift. Recompute
+					// the expected snap from the recorded pre-snap position here,
+					// independently of text.odin's own floor call, and check the
+					// actual relationship text_walk_glyphs is supposed to guarantee.
+					snap_ok := len(positions) > 0 && len(positions) == len(raws)
+					for p, i in positions {
+						want := [2]f32{math.floor(raws[i].x + 0.5), math.floor(raws[i].y + 0.5)}
+						if p.x != want.x || p.y != want.y {snap_ok = false}
+					}
+					gs_chk(bad, snap_ok, fmt.tprintf("origin (%.3f, %.3f) -> pos == floor(raw + 0.5)", origin.x, origin.y))
+				}
+			}
+			bad := 0
+			gs_run(&bad)
+			fmt.printfln("%d failures", bad)
 			return true
 		}
 
@@ -6977,7 +7223,7 @@ when NEWTPAD_TESTS {
 			doc.cursor = n
 			doc.top = 0
 			s4 := time.tick_now()
-			doc_ensure_cursor_visible(&doc, &t, rows)
+			doc_ensure_cursor_visible(&doc, &t, rows, rows)
 			d4 := time.duration_milliseconds(time.tick_since(s4))
 
 			fmt.printfln("--- viewport ops on a %d MB single-line buffer ---", max(mbn, 1))
@@ -7327,7 +7573,7 @@ when NEWTPAD_TESTS {
 				my := row_baseline_y(px, 0) - line_height(px)*0.5
 				ld.cursor = doc_pos_at(&ld, &t, i32(mx), i32(my), px, cw, rows)
 				before := ld.h_scroll
-				doc_ensure_cursor_visible(&ld, &t, ld.view_rows)
+				doc_ensure_cursor_visible(&ld, &t, ld.view_rows, ld.view_rows)
 				if ld.h_scroll > before + ld.view_cols {
 					fmt.printfln("  FAIL: click on a long line flung h_scroll %d -> %d", before, ld.h_scroll)
 					bad += 1
@@ -10421,6 +10667,164 @@ when NEWTPAD_TESTS {
 		// soft" rather than as a bug: a hairline rounded up to 2px straddling two
 		// device pixels renders as two half-alpha lines, and an odd chrome font size
 		// puts every vertically-centred baseline on a half pixel.
+		// The two row budgets, and the seam between them.
+		//
+		// doc_visible_rows answers "how many rows fit WHOLLY" -- the scroll
+		// clamp's, the page keys' and doc_ensure_cursor_visible's question.
+		// doc_drawn_rows answers "how many rows does the draw emit" -- which
+		// includes a partial last row, and is therefore also the HIT-TEST's
+		// question, because a half-visible line is on screen and must be
+		// clickable. Putting a consumer on the wrong side of that split is the
+		// HANDOFF §6j shape exactly, so nothing here compares either procedure
+		// against a restatement of itself: the counts are hardcoded from a
+		// viewport built to hold exactly twenty rows, and the seam assertions
+		// compare DRAWN ROWS against CLICKABLE PIXELS.
+		//
+		// All the arithmetic is exact: line_height truncates to a whole pixel
+		// and CONTENT_TOP / TOP_INSET / STATUS_BAR_H are whole at 100%, so the
+		// boundary cases below are integers, not values a float could land
+		// either side of.
+		if os.args[1] == "rowbudgettest" {
+			rb_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+			// The body lives in its own proc: test_mode_dispatch's frame is
+			// already large enough to have hit STATUS_STACK_OVERFLOW twice, and
+			// this holds exactly one Document.
+			rb_run :: proc(bad: ^int) {
+				// DEFAULT allocator, never temp -- doc_from_content sets
+				// owned_orig, so doc_close frees this slice. A temp-allocated
+				// fixture here is a heap corruption (0xC0000374), not a leak.
+				doc := doc_from_content(transmute([]u8)strings.repeat("line of text\n", 200), "", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				doc_update_top_inset(&doc)
+				doc.view_cols = 100
+				px := f32(16)
+				line_h := line_height(px)
+				bar := doc_bottom_bar_h(&doc)
+				// For the partial-row click check below: doc_pos_at and
+				// doc_ensure_cursor_visible both need real glyph metrics.
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("rowbudgettest: no fonts loaded")
+					bad^ += 1
+					return
+				}
+				cw := plat.text_char_width(&t, px, .Doc)
+				// A viewport whose content box is EXACTLY twenty rows tall, so
+				// every expectation below is a number this test states rather
+				// than one it recomputes from the code under test.
+				base_h := CONTENT_TOP + TOP_INSET + bar + line_h * 20
+				fmt.printfln(
+					"  content top %.0f, status bar %.0f, line height %.0f, 20-row height %.0f",
+					CONTENT_TOP + TOP_INSET,
+					bar,
+					line_h,
+					base_h,
+				)
+				// Flush, one pixel of slack, one pixel short of a whole row, and
+				// a whole row. A single height would pass with an off-by-one in
+				// either direction; the two flush cases are what reject an
+				// unconditional +1 and the two partial ones are what reject
+				// never adding it.
+				for c in ([]struct {
+					slack:               f32,
+					want_full, want_drawn: int,
+					what:                string,
+				} {
+					{0, 20, 20, "flush"},
+					{1, 20, 21, "1px of slack"},
+					{line_h - 1, 20, 21, "1px short of a row"},
+					{line_h, 21, 21, "one whole extra row"},
+				}) {
+					h := base_h + c.slack
+					ctop, cbot := doc_content_box(&doc, h)
+					full := doc_visible_rows(&doc, h, line_h)
+					drawn := doc_drawn_rows(&doc, h, line_h)
+
+					rb_chk(bad, full == c.want_full, fmt.tprintf("%-20s: %d rows fit wholly (want %d)", c.what, full, c.want_full))
+					rb_chk(bad, drawn == c.want_drawn, fmt.tprintf("%-20s: %d rows are drawn (want %d)", c.what, drawn, c.want_drawn))
+
+					// A click on the partial last row (when there is one) must place the
+					// caret there WITHOUT scrolling the view -- replayed through the exact
+					// pair main.odin's frame loop calls on a press: doc_pos_at (drawn) to
+					// resolve the caret, then doc_ensure_cursor_visible (rows, drawn)
+					// because the cursor moved. Before this fix doc_ensure_cursor_visible
+					// walked only `full` rows, judged the partial row "below the viewport",
+					// and scrolled the file out from under the click -- one row per click,
+					// one row per drag frame while held.
+					if drawn > full {
+						doc.top = 0
+						doc.cursor, doc.anchor = 0, 0
+						// Just above cbot: the partial row's clickable slice runs from
+						// row_rect_y(px, drawn-1) to cbot and can be less than a whole
+						// line_h tall, so row_rect_y + line_h*0.5 would land in (or past)
+						// the status bar on a one-pixel sliver. cbot - 0.5 is always
+						// inside it and still resolves to row (drawn-1): see the
+						// drawn->clickable SEAM check below, which is this same fact.
+						my := cbot - 0.5
+						mp := doc_pos_at(&doc, &t, i32(col_x(cw, 2, 0)), i32(my), px, cw, drawn)
+						doc.cursor, doc.anchor = mp, mp
+						doc_ensure_cursor_visible(&doc, &t, full, drawn)
+						rb_chk(
+							bad,
+							doc.top == 0,
+							fmt.tprintf("%-20s: clicking the partial row (drawn row %d) leaves the view put (top 0 -> %d)", c.what, drawn - 1, doc.top),
+						)
+					}
+
+					// SEAM, drawn -> clickable. Every row the draw emits has a
+					// pixel inside the content box that hit-tests back to it.
+					// The bottom strip owns everything at or below cbot
+					// (main.odin swallows presses there), so a "drawn" row with
+					// no pixel above cbot is a row the user can see nothing of
+					// and click nothing on -- which is what an unconditional
+					// full+1 produces on a flush viewport.
+					ok_down := true
+					worst := -1
+					for r in 0 ..< drawn {
+						y := row_rect_y(px, r) + 0.25
+						if row_at_y(px, y) != r || y >= cbot {
+							ok_down = false
+							if worst < 0 {worst = r}
+						}
+					}
+					rb_chk(bad, ok_down, fmt.tprintf("%-20s: every drawn row has a clickable pixel (first bad row %d)", c.what, worst))
+
+					// SEAM, clickable -> drawn. The lowest pixel the content box
+					// owns must not name a row the draw never emitted; if it
+					// does, a click there falls through doc_pos_at's clamp onto
+					// some other line. This is the assertion that fails while
+					// the draw is stuck on doc_visible_rows.
+					low := row_at_y(px, cbot - 0.25)
+					rb_chk(bad, low <= drawn - 1, fmt.tprintf("%-20s: lowest content pixel is row %d, within the %d drawn", c.what, low, drawn))
+
+					// The markdown panes share the same content box but walk
+					// BASELINES, so they get their own bound. Two properties:
+					// the block of rows md_row_fits admits never crosses cbot
+					// (the overlap Wyatt reported), and it is maximal (no
+					// gratuitous whitespace).
+					k := 0
+					for y := ctop + px; md_row_fits(y, px, line_h, cbot); y += line_h {
+						k += 1
+						if k > 64 {break}
+					}
+					rb_chk(bad, ctop + f32(k) * line_h <= cbot, fmt.tprintf("%-20s: %d markdown rows end at %.0f, above the bar at %.0f", c.what, k, ctop + f32(k) * line_h, cbot))
+					rb_chk(bad, ctop + f32(k + 1) * line_h > cbot, fmt.tprintf("%-20s: a %dth markdown row would not have fit", c.what, k + 1))
+				}
+			}
+			fmt.println("rowbudgettest:")
+			saved := UI_SCALE
+			UI_SCALE = 1
+			bad := 0
+			rb_run(&bad)
+			UI_SCALE = saved
+			fmt.printfln("%d failures", bad)
+			return true
+		}
+
 		if os.args[1] == "metricstest" {
 			bad := 0
 			mt_chk :: proc(bad: ^int, ok: bool, label: string) {
@@ -11407,7 +11811,7 @@ when NEWTPAD_TESTS {
 					my := row_rect_y(px, r) + line_height(px) * 0.5
 					mp := doc_pos_at(&doc, &t, i32(col_x(cw, 10, 0)), i32(my), px, cw, rows)
 					doc.cursor, doc.anchor = mp, mp
-					doc_ensure_cursor_visible(&doc, &t, rows)
+					doc_ensure_cursor_visible(&doc, &t, rows, rows)
 					if doc.top != top0 {
 						moved_at, moved_to = r, doc.top
 						break
@@ -13296,6 +13700,19 @@ when NEWTPAD_TESTS {
 				"  %-6s every stateful EXT_LEXERS entry registers a resync_anchor%s",
 				"ok" if anchors_ok else "FAIL",
 				"" if anchors_ok else fmt.tprintf(" (%s does not)", offender),
+			)
+			// The other list this table must agree with: doc_is_markdownish's
+			// MARKDOWN_EXTS (doc.odin) admits eight extensions into Ctrl+M preview,
+			// and every one of them needs a base.lex_markdown row here or
+			// md_fence_seed's fence-state seeding is silently dead on it (see
+			// highlight_markdown_exts_ok's own comment). Six of the eight were
+			// missing until this task.
+			md_exts_ok, md_offender := highlight_markdown_exts_ok()
+			if !md_exts_ok {fail = true}
+			fmt.printfln(
+				"  %-6s every MARKDOWN_EXTS entry has an EXT_LEXERS lexer%s",
+				"ok" if md_exts_ok else "FAIL",
+				"" if md_exts_ok else fmt.tprintf(" (%s does not)", md_offender),
 			)
 			fmt.printfln("  examined %d extensions from text_exts.txt", seen)
 			fmt.println("lexcoveragetest: FAILURES" if fail else "lexcoveragetest: all ok")
