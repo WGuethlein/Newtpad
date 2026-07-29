@@ -1222,10 +1222,20 @@ ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool
 // their OWN guards, later in the same frame), and it is true for the EDITOR
 // half whenever the document is also a table (ro_surface_swallows answers
 // from `table` alone, not from which pane the press is in). x >= ed_right
-// restricts this to the preview pane's columns; the y bound against `c`'s own
-// ytop/pane restricts it to the preview pane's rows, using the SAME box the
-// draw and the scroll model read (md_pane_box, once, via md_scroll_ctx) so
-// this cannot disagree with where the pane actually is.
+// restricts this to the preview pane's columns.
+//
+// The ROWS are md_block_at_y's own business, and that is a correction: this
+// procedure used to carry `my < c.ytop || my >= c.ytop + c.pane` as well, and
+// commented it as what kept the status bar and the find bar out. md_block_at_y
+// is the only thing this calls, and it applies that identical predicate to the
+// identical `c` two lines later -- so the copy could never refuse a press the
+// callee would have accepted. Removing it: 0 failures across the suite.
+// Removing BOTH: exactly one of the three "gate:" rows that name a y bound
+// fails (the find bar, which is the only one genuinely above ytop); the status
+// bar and the empty-strip cases are refused by md_block_at_y's fit test
+// instead, whatever their assertion names say. Same shape the branch already
+// diagnosed and removed at md_layout_slot -- a guard crediting itself with a
+// fix (2026-07-29 review, F5).
 //
 // A separate, named proc rather than inlined in main()'s loop: main() is the
 // live WM_* loop and cannot run in a headless test, so a gate that lived only
@@ -1234,7 +1244,6 @@ ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool
 // checks call this directly.
 md_split_click_gate :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ro: bool, ed_right, mx, my: f32) -> (blk: int, hit: bool) {
 	if !ro || doc.md_mode != .Split || mx < ed_right {return}
-	if my < c.ytop || my >= c.ytop + c.pane {return}
 	return md_block_at_y(c, doc.md_top, my)
 }
 

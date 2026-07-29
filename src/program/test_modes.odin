@@ -5724,12 +5724,22 @@ when NEWTPAD_TESTS {
 				// 1. The status bar's right portion: doc_content_box already
 				// excludes the bar from the pane box, so this y is genuinely
 				// past ybot.
+				//
+				// RENAMED to say what refuses it (2026-07-29 review, F5). Deleting
+				// BOTH pane-bound predicates -- md_split_click_gate's and
+				// md_block_at_y's -- leaves this row green: a y past ybot is also
+				// past the last block the walk laid out, so the fit test refuses it
+				// first. The row was named for a bound it does not exercise.
 				_, hit1 := gated(&doc, &c, ed_right, ed_right + 20, winh - 4)
-				schk(&bad, !hit1, "gate: a press on the status bar in Split does not sync")
+				schk(&bad, !hit1, "gate: a press on the status bar in Split does not sync (past the last block)")
 
 				// 2. The find bar's right portion: above ytop, which insets for it.
+				// The ONE case that is genuinely carried by the pane's y bound --
+				// nothing below the divider can refuse a y that is above the pane,
+				// and this row is the only one of the three that goes red when that
+				// bound is removed.
 				_, hit2 := gated(&doc, &c, ed_right, ed_right + 20, 2)
-				schk(&bad, !hit2, "gate: a press in the find bar's right portion does not sync")
+				schk(&bad, !hit2, "gate: a press in the find bar's right portion does not sync (above the pane)")
 
 				// 3. The editor half, with the document ALSO a table: this is the
 				// exact case ro_surface_swallows answers true from `table` alone.
@@ -5759,7 +5769,17 @@ when NEWTPAD_TESTS {
 				sc, sc_ok := md_scroll_ctx(&h.gfx, &h.text, &short, px_, winw, winh, split_frac)
 				schk(&bad, sc_ok, "gate: the scroll context resolves for the short Split document")
 				_, hit4 := gated(&short, &sc, ed_right, ed_right + 20, sc.ytop + sc.pane - 2)
-				schk(&bad, !hit4, "gate: a press in the empty strip below the last drawn block does not sync")
+				schk(&bad, !hit4, "gate: a press in the empty strip below the last drawn block does not sync (the fit test)")
+
+				// The gate's own y bound is GONE (F5), and this is the row that says
+				// so rather than leaving it to a comment: md_block_at_y is the only
+				// thing md_split_click_gate calls, and it applies the same pane bound,
+				// so calling the callee directly at a y outside the pane must give the
+				// same answer the gate does. A gate that grew a second bound of its
+				// own would make these two disagree.
+				_, direct_above := md_block_at_y(&c, doc.md_top, 2)
+				_, direct_below := md_block_at_y(&c, doc.md_top, winh - 4)
+				schk(&bad, !direct_above && !direct_below, fmt.tprintf("gate: md_block_at_y alone refuses both out-of-pane rows, so the gate needs no copy of the bound (%v, %v)", direct_above, direct_below))
 			}
 			return
 		}

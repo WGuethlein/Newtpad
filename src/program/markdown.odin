@@ -2950,10 +2950,18 @@ md_block_at_y :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, y: f32) -> (start: int, o
 	if c.doc == nil {return}
 	// Outside the pane: refused here rather than left to the clamp below, which
 	// otherwise answers for a y meant for the status bar or the find bar just as
-	// readily as it does for an actual block. (Callers are expected to bound
-	// this too -- see the Split click gate in main.odin -- but a procedure that
-	// returns ok=true for any input is exactly the shape that made that
-	// reachable, so it is bounded here as well.)
+	// readily as it does for an actual block.
+	//
+	// This is the ONLY copy of that predicate now. md_split_click_gate carried a
+	// second one and no longer does (see its comment): it called nothing but this
+	// procedure, so its copy could never refuse a press this one would accept.
+	// MEASURED, so the division of labour is on the record rather than assumed:
+	// of the three "gate:" cases that read as pane-bound checks, only the FIND BAR
+	// is actually refused by this line. The status bar and the empty strip below
+	// the last drawn block are both inside or below the pane's rows and are
+	// refused by the fit test further down instead. Deleting this line therefore
+	// costs exactly one case -- which is one more than zero, which is why it stays
+	// here while the duplicate went.
 	if y < c.ytop || y >= c.ytop + c.pane {return}
 	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
 	n, idx := md_anchor_walk(c, a.block, a.px + c.pane, out)
