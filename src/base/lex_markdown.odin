@@ -263,12 +263,24 @@ lex_markdown :: proc(line: []u8, state_in: Lex_State, out: []Token) -> (n: int, 
 
 	i := lead
 	if i < len(line) && line[i] == '>' {
-		if n < len(out) {
-			out[n] = Token{i, 1, .Comment}
-			n += 1
+		// EVERY marker in the prefix, not just the first. This used to emit one
+		// token and step past one marker, so on `>> nested` the second '>' fell
+		// through to the inline scan below, matched no construct, and drew in
+		// the default text colour -- Wyatt, on the source view: "the first `>`
+		// is green, where the rest are white". One construct, one kind.
+		//
+		// A marker takes at most one following space, exactly as before; that
+		// is what lets `> > spaced` reach its second marker. Wider gaps
+		// (`>   > x`) stop at the first marker, which is the same rule the
+		// single-marker version applied and not something this changes.
+		for i < len(line) && line[i] == '>' {
+			if n < len(out) {
+				out[n] = Token{i, 1, .Comment}
+				n += 1
+			}
+			i += 1
+			if i < len(line) && mk_is_space(line[i]) {i += 1}
 		}
-		i += 1
-		if i < len(line) && mk_is_space(line[i]) {i += 1}
 	} else if l := mk_match_bullet(line, i); l > 0 {
 		if n < len(out) {
 			out[n] = Token{i, l, .Punct}
