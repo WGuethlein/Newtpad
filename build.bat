@@ -8,11 +8,25 @@ if not exist build mkdir build
 
 REM Two artifacts need MSVC tooling: the SEH shim (cl) and the manifest resource
 REM (rc). Both are compiled once and cached, and both need the same vcvars
-REM environment, so one check covers them. IF YOU EDIT guarded_copy.c OR
-REM newtpad.manifest, delete the matching file in build\ to force a rebuild.
+REM environment, so one check covers them.
+REM
+REM The cache is invalidated by TIMESTAMP, not just by absence. It used to be
+REM absence only, which meant editing newtpad.rc, the manifest or the icon left
+REM a stale build\newtpad.res in place and the build silently shipped the old
+REM resource. That cost a wrong release-size measurement the day the icon
+REM landed, and would have shipped a stale icon just as quietly.
+REM IF YOU EDIT guarded_copy.c, delete build\guarded.obj to force a rebuild.
 set "NEED_MSVC="
 if not exist build\guarded.obj set "NEED_MSVC=1"
 if not exist build\newtpad.res set "NEED_MSVC=1"
+if exist build\newtpad.res (
+	set "RES_STALE="
+	for /f "usebackq delims=" %%T in (`powershell -NoProfile -ExecutionPolicy Bypass -File tools\res-stale.ps1`) do set "RES_STALE=%%T"
+	if "!RES_STALE!"=="stale" (
+		del /q build\newtpad.res
+		set "NEED_MSVC=1"
+	)
+)
 if defined NEED_MSVC call :msvc_artifacts || exit /b 1
 
 REM Release is the shipped app: GUI subsystem, so launching it never flashes a

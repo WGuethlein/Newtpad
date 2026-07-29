@@ -7,10 +7,11 @@
 //
 // Line-based, deliberately: a block is classified from its own prefix and its
 // inline content is soft-wrapped to the pane. Consequences (v1): a paragraph's
-// hard line breaks show as breaks (adjacent lines are not joined); there is no
-// italic face loaded, so *italic* is shown as a tint, while **bold** is real via
-// a double-draw; inline code is coloured, not boxed; tables are cell-split but
-// not column-aligned across rows.
+// hard line breaks show as breaks (adjacent lines are not joined), and a link
+// inside a TABLE cell is not clickable (see the .Table case in md_layout_build).
+// Emphasis, inline code and tables are no longer among them -- batch 17 loaded
+// real bold and italic body faces, put a rounded Md_Code_Bg box behind an inline
+// code span, and md_table_ensure aligns a table's columns across its rows.
 package main
 
 import "core:fmt"
@@ -726,26 +727,159 @@ Md_Run :: struct {
 	url:                     string,
 }
 
-// Heading pixel scale by level (1..6).
+// --- UI spec 9.3, the preview type scale ------------------------------------
 //
-// Package-visible rather than file-private so mdtest's heading-fit checks can
-// state a heading row's expected height from the SAME table markdown_draw sizes
-// it from, instead of copying six ratios into the test where they could drift
-// (the md_row_fits precedent).
-md_head_px :: proc(px: f32, level: int) -> f32 {
-	switch level {
-	case 1:
-		return px * 1.7
-	case 2:
-		return px * 1.45
-	case 3:
-		return px * 1.25
-	case 4:
-		return px * 1.12
-	case:
-		return px * 1.03
-	}
+// Every size is a multiple of the base document size S, so Ctrl+= scales the
+// whole preview for free, and every one of them is `round(k * S)` computed ONCE
+// into this struct.
+//
+// The rounding is load-bearing, not cosmetic, and it is the one rule in this
+// file that is enforced by a hazard rather than by taste. Glyph_Key.px is a u16
+// and glyph_get truncates into it (`u16(px)`, platform/text.odin), so two
+// fractional sizes that truncate to the same integer SHARE one cache entry —
+// and that entry carries whichever advance and rasterized bitmap arrived first.
+// Let 0.92 * S = 14.72 reach the atlas and it silently collides with a 14 px
+// entry: the shaper then lays out with 14 px advances while asking for 14.72 px
+// ink, or the other way round, depending on which size was seen first. Task 2a
+// flagged this rather than changing the key (it belongs to its own change with
+// its own test); honouring the rounding here is the other side of that contract.
+//
+// So: nothing in the preview may multiply S by a ratio at a draw site. It reads
+// a field of this struct, which was rounded when the struct was built.
+Md_Metrics :: struct {
+	s:            f32, // the base document size S, as handed in
+	// Sizes, round(k * S). head[0] is unused so head[level] indexes directly.
+	head:         [7]f32,
+	body:         f32, // 1.00 S
+	code:         f32, // 0.92 S -- inline and fenced
+	table:        f32, // 0.95 S
+	// 0.88 S. RESERVED, and deliberately still computed: 9.3 gives the preview a
+	// caption row, but every construct that would use one -- image captions,
+	// table captions, footnote text -- is in 9.2's unimplemented list, so nothing
+	// reads this today. Kept because the row is part of the type scale and the
+	// metrics test asserts the whole scale is round(k * S) in one place; dropping
+	// it would mean re-deriving 0.88 S at whichever draw site first needs it,
+	// which is the ratio-at-a-draw-site this struct's header forbids. Marked
+	// rather than deleted so "nothing reads it" reads as a decision (L6).
+	caption:      f32,
+	// Requested leading for body prose (1.65 S). NOT the leading you get: a face
+	// whose ascent + descent exceeds it is clamped up per line by the shaper, and
+	// Georgia's is 1.136 em, so this is a floor. Read Shaped.line_h /
+	// Shaped.line_boxes[l].h back for what actually happened.
+	body_lead:    f32,
+	// Vertical rhythm, all round(k * S). Adjacent margins COLLAPSE (the gap
+	// between two blocks is max(prev.below, next.above)), which is what browsers
+	// do and what the spec's own numbers assume -- a paragraph's 0.8 S below and
+	// an h2's 1.6 S above are not meant to sum to 2.4 S.
+	head_above:   [7]f32,
+	head_below:   [7]f32,
+	para_below:   f32, // 0.8 S
+	list_gap:     f32, // 0.25 S between items
+	quote_above:  f32, // 0.8 S
+	quote_below:  f32, // 0.8 S
+	fence_above:  f32, // 1.0 S
+	fence_below:  f32, // 1.0 S
+	// Fixed pixel quantities from 9.2/9.3, DPI-scaled rather than S-scaled: they
+	// are decorations, not type.
+	rule_gap:     f32, // 24px above and below a thematic break (9.2 item 10)
+	fence_pad:    f32, // 12px inside a fenced block
+	code_radius:  f32, // 3px behind an inline code span
+	fence_radius: f32, // 6px on the fenced block
+	quote_inset:  f32, // 16px per blockquote level (9.2 item 7)
+	list_indent:  f32, // 24px per list level (9.2 item 5)
+	task_box:     f32, // 14px checkbox (9.2 item 9)
+	pad_left:     f32, // 40px left padding (9.3 measure line)
+	// 72ch, where a `ch` is the body face's advance for '0' at body size -- CSS's
+	// own definition, and the only one that makes "72ch" mean a column of 72
+	// characters in a proportional face.
+	measure:      f32,
+	// Not type at all: the state OUTSIDE this struct that a block's layout also
+	// depends on, sampled ONCE per pass here because this struct is already the
+	// thing md_pass builds once and hands to every block. All three are cache-key
+	// terms (see MD_LAYOUT_SLOTS); nothing draws with them.
+	ui_scale:     f32,
+	theme:        u64,
+	// Which faces are loaded (plat.text_face_gen). Sits in exactly the position
+	// `theme` does and for the same mechanism -- a layout bakes something that a
+	// global can move underneath it -- but what it protects is GEOMETRY, not
+	// colour: every glyph position, every soft-wrap point and every block height
+	// in a cached entry came out of the shaper at the advances of whichever
+	// families were loaded when it was built. Settings > Font reloads the .Doc
+	// chain (settings_apply_font), which is what inline code and fenced blocks
+	// draw on, and text_reset_atlas alone does not touch a laid-out entry: the
+	// atlas rasterizes the new family while the cache keeps the old family's
+	// spacing, wrap points, inline-code backgrounds and link rects. Note that
+	// `measure` cannot stand in for this -- it is 72 advances of the BODY face,
+	// invariant under a .Doc change.
+	faces:        u64,
 }
+
+// The theme's identity as one number, for the layout cache key.
+//
+// A HASH of g_theme rather than a generation counter bumped at each assignment
+// site. The global is assigned from main.odin's startup, the Settings theme
+// cycle, theme_edit_current, theme_reapply_if_active and a dozen test modes, and
+// "every future assignment remembers to bump the counter" is exactly the promise
+// CLAUDE.md's one-producer rule exists to stop making -- a missed site is a
+// silent stale-colour bug, not a compile error.
+//
+// It also makes the test honest. A probe switches themes by assigning g_theme,
+// which is what the reviewer's probe did and what every existing themetest does;
+// under a counter the probe would have to bump the counter itself, and would
+// then be asserting that the cache reads a number the test just set rather than
+// that a theme switch invalidates.
+//
+// 40 roles x 4 channels, once per md_pass (at most three passes a frame): 160
+// multiply-xors against a pass that shapes text.
+@(private = "file")
+md_theme_gen :: proc() -> u64 {
+	h := u64(0xcbf29ce484222325) // FNV-1a
+	for role in g_theme {
+		for c in role {
+			h = (h ~ u64(transmute(u32)c)) * 0x100000001b3
+		}
+	}
+	return h
+}
+
+// round(k * S), floored at 1 so a degenerate S cannot produce a 0 px face.
+@(private = "file")
+md_scale :: #force_inline proc(s, k: f32) -> f32 {return max(1, f32(int(s * k + 0.5)))}
+
+// The whole type scale for base size `s`. Built once per pass, never per block
+// and never per draw call.
+//
+// `t` is needed only for the `ch` measure, which is a property of the body face.
+md_metrics :: proc(t: ^plat.Text, s: f32) -> (m: Md_Metrics) {
+	m.s = s
+	m.head = {0, md_scale(s, 1.85), md_scale(s, 1.50), md_scale(s, 1.25), md_scale(s, 1.10), md_scale(s, 1.00), md_scale(s, 1.00)}
+	m.body = md_scale(s, 1.00)
+	m.code = md_scale(s, 0.92)
+	m.table = md_scale(s, 0.95)
+	m.caption = md_scale(s, 0.88)
+	m.body_lead = md_scale(s, 1.65)
+	m.head_above = {0, 0, md_scale(s, 1.60), md_scale(s, 1.40), md_scale(s, 1.20), md_scale(s, 1.00), md_scale(s, 1.00)}
+	m.head_below = {0, md_scale(s, 0.60), md_scale(s, 0.50), md_scale(s, 0.40), md_scale(s, 0.30), md_scale(s, 0.30), md_scale(s, 0.30)}
+	m.para_below = md_scale(s, 0.80)
+	m.list_gap = md_scale(s, 0.25)
+	m.quote_above, m.quote_below = md_scale(s, 0.80), md_scale(s, 0.80)
+	m.fence_above, m.fence_below = md_scale(s, 1.00), md_scale(s, 1.00)
+	m.rule_gap = sx(24)
+	m.fence_pad = sx(12)
+	m.code_radius = sx(3)
+	m.fence_radius = sx(6)
+	m.quote_inset = sx(16)
+	m.list_indent = sx(24)
+	m.task_box = sx(14)
+	m.pad_left = sx(40)
+	m.measure = 72 * plat.text_advance(nil, t, '0', m.body, .Body)
+	m.ui_scale, m.theme, m.faces = UI_SCALE, md_theme_gen(), plat.text_face_gen(t)
+	return
+}
+
+// h1 and h2 carry a rule under them (9.2 item 1, 9.3's "+ md_rule").
+@(private = "file")
+md_head_rules :: #force_inline proc(level: int) -> bool {return level == 1 || level == 2}
 
 @(private = "file")
 is_space :: proc(b: u8) -> bool {return b == ' ' || b == '\t'}
@@ -1169,177 +1303,229 @@ md_run_color :: proc(run: Md_Run, base_col: [4]f32, mute: f32) -> [4]f32 {
 	return col
 }
 
-// Draw inline runs word-wrapped from (x,y) within [xind, x1]; new rows indent to
-// xind. Advances y per wrapped row. Synthetic bold via a second draw one px over.
+// Does a block whose TOP edge is `ytop` and whose height is `h` fit entirely
+// above `ybot`?
 //
-// `mute` fades every run's resolved colour toward the page by that fraction;
-// 0 (the default, and every call site but the done-task one) leaves them alone.
-@(private = "file")
-md_draw_inline :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, runs: []Md_Run, xind, x1: f32, x, y: ^f32, px, char_w, line_h: f32, base_col: [4]f32, mute: f32 = 0) {
-	boff := hairline()
-	for run in runs {
-		col := md_run_color(run, base_col, mute)
-		// Split into words, keeping each word's trailing space so wrapping is by word.
-		w := run.text
-		for len(w) > 0 {
-			// take one word (up to and including trailing spaces)
-			e := 0
-			for e < len(w) && !is_space(w[e]) {e += 1}
-			for e < len(w) && is_space(w[e]) {e += 1}
-			word := w[:e]
-			w = w[e:]
-			// col0 = 0: one word, drawn from x^ by the text_draw immediately
-			// below and advancing x^ by exactly this width. Measuring it from
-			// the row's column instead would make the measurement disagree with
-			// the draw, which measures every string it is given from 0.
-			ww := f32(plat.text_cells(text, transmute([]u8)word, 0, .Doc)) * char_w
-			if x^ + ww > x1 && x^ > xind { // wrap
-				x^ = xind
-				y^ += line_h
-			}
-			plat.text_draw(gfx, text, word, x^, y^, px, col, .Doc)
-			if run.bold {plat.text_draw(gfx, text, word, x^ + boff, y^, px, col, .Doc)}
-			if run.strike {
-				// At the x-height centre, per UI spec 9.2 -- through the middle
-				// of the lowercase, not through the baseline, or it reads as an
-				// underline that has slipped.
-				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x^, y^ - px * 0.28}, size = {ww, hairline()}, color = col}})
-			}
-			x^ += ww
-		}
-	}
+// One expression, and its own procedure so a test can drive it without a
+// device. It replaces md_row_fits, which asked the same question about a
+// BASELINE (`y - px + row_h <= ybot`); the preview no longer walks baselines,
+// so the -px correction that turned a baseline into a row top has nothing left
+// to correct. The property it exists to protect is unchanged and is the reason
+// it is a named procedure at all: there is no scissor rect in this renderer
+// (clipping is the cover strip main.odin paints afterwards), so the only way a
+// block is not cut through the middle of its glyphs is for it not to be
+// ADMITTED. `h` must be the block's OWN height -- the number the shaper
+// produced -- never the body line height, which is the bug item 6 of the
+// 2026-07-29 regressions fixed and which the block model must not reintroduce.
+md_block_fits :: #force_inline proc(ytop, h, ybot: f32) -> bool {
+	return ytop + h <= ybot
 }
 
-// Does a markdown row whose BASELINE is `y` and whose drawn height is `row_h`
-// fit entirely above `ybot`?
+// --- UI spec 9.1, the block/span model --------------------------------------
 //
-// The row occupies [y - px, y - px + row_h): the baseline sits px down from the
-// row's top, not at it. The loop below used to ask `y < ybot`, which admits a
-// row whose baseline is one pixel above the content bottom and then draws a
-// whole line height of it -- up to row_h - px pixels of glyphs painted on top
-// of the status bar. That is the overlap Wyatt reported in Markdown Preview and
-// in Split, and BOTH call sites already pass ybot = winh - doc_bottom_bar_h(doc)
-// (main.odin), so the bug was the bound, not the bound's input.
+//	Block :: struct { kind, level, spans: []Span, indent }
+//	Span  :: struct { text, style_flags, colour_role }
 //
-// `row_h` is the ROW'S OWN height, not the body line height -- item 6 of the
-// 2026-07-29 live-pass regressions. The loop used to pass `line_h` for every
-// row while a heading draws `line_height(md_head_px(px, lvl))`, so a heading
-// near the bottom was admitted against a budget it then overran and the cover
-// strip cut it through the middle of its glyphs. See Md_Row_Geom: the height is
-// produced once, before the admit decision, and the same value drives the
-// advance.
+// A block is still derived from ONE source line (a blank run, front matter and
+// a table's column measure are the exceptions, and each is bounded).
 //
-// Its own procedure so the test can drive it without a GPU device: reverting it
-// to `y < ybot` makes rowbudgettest's markdown walk fail rather than only
-// showing up on Wyatt's screen.
-md_row_fits :: #force_inline proc(y, px, row_h, ybot: f32) -> bool {
-	return y - px + row_h <= ybot
-}
+// PARAGRAPH JOINING -- treating a paragraph's hard line breaks as soft, per
+// 9.2 -- is still not done, and it is deliberately not part of the pixel
+// anchor either. Its original reason to wait is gone: a long joined block is
+// no longer unscrollable, because the anchor can now sit part way down one.
+// What it is now is a PARSER change, not a scroll change -- it alters which
+// source lines form a block, which moves every block start byte, which is the
+// layout cache's key, the anchor's identity, 9.4's sync map and the fence
+// seed's input. Batching it with the scroll model would mean neither could be
+// bisected from the other. It is its own task, and the pixel anchor is what
+// unblocks it.
 
-// What KIND of block one markdown line is.
-//
-// These are exactly the branches markdown_draw's row loop has -- the enum and
-// that switch are the same list, and Odin's exhaustiveness check is what keeps
-// them the same list. Front matter is deliberately absent: it is a multi-line
-// BLOCK, drawn whole before the loop starts (md_draw_front_matter).
-@(private = "file")
+Md_Style :: enum u8 {
+	Bold,
+	Italic,
+	Code,
+	Link,
+	Strike,
+}
+Md_Styles :: bit_set[Md_Style;u8]
+
+// What KIND of block one source line is. The switch in md_block_draw has
+// exactly these branches and Odin's exhaustiveness check keeps the two lists
+// the same list.
 Md_Kind :: enum u8 {
-	Para, // the fallthrough case, so a zeroed geom is the harmless one
-	Fence_Line,
+	Para, // the fallthrough case, so a zeroed block is the harmless one
+	Blank, // a RUN of blank lines, collapsed (see MD_BLANK_RUN_MAX)
+	Fence_Open,
 	Fence_Body,
-	Blank,
+	Fence_Close,
 	Rule,
 	Heading,
 	Quote,
 	List,
 	Table,
+	Front_Matter,
 }
 
-// One row's geometry, produced BEFORE the loop decides whether the row fits.
+// One styled span of a block's inline content, parallel to the plat.Shape_Span
+// the shaper was handed: index i of one describes index i of the other.
 //
-// This is the shape of item 6. The loop used to classify a line *inside* the
-// draw, having already admitted it against the BODY line height -- so a heading
-// was let in on a budget of `line_h` and then drawn `line_height(md_head_px)`
-// tall (61px against 36px for an h1 at px=24), overhanging the content box.
-// There is no scissor rect anywhere in this renderer; clipping is a cover strip
-// painted afterwards, so the only way for a row not to be cut in half is for it
-// not to be admitted. Hence: classify, then admit.
-//
-// `ink` and `adv` are produced HERE and nowhere else. The loop consumes `ink`
-// for md_row_fits and `adv` for the advance; if the two sites ever computed
-// their own, they would diverge, which is the exact failure shape this project
-// has recorded sixteen instances of (HANDOFF 6j).
-//
-//   ink -- the row's DRAWN height, measured down from the row top (y - px).
-//          A heading sinks its baseline by (hpx - px) precisely so its row top
-//          is still y - px, so one origin covers every kind.
-//   adv -- how far the baseline moves to reach the next row. Not the same
-//          number: a heading also carries the sink and the -0.3px tuck, and a
-//          blank line advances half a row while drawing nothing.
-//
-// Every kind keeps `ink > 0` even when it draws nothing (a fence line, a blank
-// line). A row admitted on zero ink always fits, and a file of blank lines
-// would then be walked to EOF on the UI thread instead of the pass stopping
-// when the pane filled.
-@(private = "file")
-Md_Row_Geom :: struct {
+// Split in two rather than carried as one struct because the shaper's input is
+// deliberately (text, px, set) and nothing else -- it needs a face and a size to
+// lay out, and colour is not its business. `span` on every Shaped_Glyph is the
+// join key between the two.
+Md_Span :: struct {
+	style: Md_Styles,
+	color: [4]f32,
+	url:   string, // .Link spans only; slices into the block's own text store
+}
+
+// What one source line classifies as, before anything is measured or laid out.
+// Pure, and the same order of tests the old row loop applied, so no line
+// changes kind.
+Md_Class :: struct {
 	kind:      Md_Kind,
-	hpx, hh:   f32, // the row's own font size and line height (px / line_h for body rows)
-	ink:       f32,
-	adv:       f32,
-	// What the classifier already worked out, so the draw never re-derives it.
-	bullet:    string,
-	content:   string,
-	depth:     int,
+	level:     int, // heading level, quote depth, or list nesting depth
+	content:   string, // the inline content (a slice of the line handed in)
+	bullet:    string, // the list marker to draw (a slice, or the "•" literal)
 	task:      bool,
 	task_done: bool,
+	is_sep:    bool, // a table separator row draws as a rule, not as cells
 }
 
-// Classify one line and size its row. Pure: same order of tests as the draw's
-// old if/else chain, so no line changes kind.
-@(private = "file")
-md_row_geom :: proc(line, trimmed: string, in_fence: bool, px, line_h: f32) -> (g: Md_Row_Geom) {
-	g.hpx, g.hh = px, line_h
-	g.ink, g.adv = line_h, line_h
+md_classify :: proc(line, trimmed: string, in_fence: bool) -> (c: Md_Class) {
 	switch {
 	case md_is_fence_line(line):
-		g.kind = .Fence_Line
+		c.kind = .Fence_Close if in_fence else .Fence_Open
 	case in_fence:
-		g.kind = .Fence_Body
+		c.kind, c.content = .Fence_Body, line
 	case len(strings.trim_space(line)) == 0:
-		g.kind = .Blank
-		g.ink, g.adv = line_h * 0.5, line_h * 0.5
+		c.kind = .Blank
 	case md_is_rule(trimmed):
-		g.kind = .Rule
+		c.kind = .Rule
 	case:
 		if lvl := md_heading_level(trimmed); lvl > 0 {
-			g.kind = .Heading
-			g.hpx = md_head_px(px, lvl)
-			g.hh = line_height(g.hpx)
-			g.content = strings.trim_left(trimmed[lvl:], " ")
-			g.ink = g.hh
-			g.adv = (g.hpx - px) + g.hh - px * 0.3
+			c.kind, c.level = .Heading, lvl
+			c.content = strings.trim_left(trimmed[lvl:], " ")
 			return
 		}
 		if q, qcontent, qdepth := md_quote_depth(trimmed); q {
-			g.kind, g.content, g.depth = .Quote, qcontent, qdepth
+			c.kind, c.content, c.level = .Quote, qcontent, qdepth
 			return
 		}
 		// md_list reads the RAW line: its leading indent is the nesting depth.
 		if bullet, content, depth := md_list(line); bullet != "" {
-			g.kind, g.bullet, g.content, g.depth = .List, bullet, content, depth
+			c.kind, c.bullet, c.content, c.level = .List, bullet, content, depth
 			if rest, done, is_task := md_task(content); is_task {
-				g.task, g.task_done, g.content = true, done, rest
+				c.task, c.task_done, c.content = true, done, rest
 			}
 			return
 		}
 		if md_is_table_row(line) {
-			g.kind = .Table
+			c.kind, c.is_sep = .Table, md_row_is_sep(line)
 			return
 		}
-		g.kind, g.content = .Para, line
+		c.kind, c.content = .Para, line
 	}
 	return
+}
+
+// One span's box on ONE visual line of a shaped block, in the block's own
+// coordinate space (x from the block's content origin, y from its top).
+//
+// THIS IS THE SEAM. It is the single producer of every pixel rectangle derived
+// from a span: the inline-code background, the strikethrough rule, the link
+// underline, the link hit-test and the hand cursor all read a box from here and
+// none of them computes one. A span that wraps across a soft break produces one
+// box per visual line it touches, which is what makes a wrapped link clickable
+// on both of its rows rather than on a rectangle spanning the gap between them.
+//
+// `w` is an ADVANCE bound, not an ink bound: the right edge is the last glyph's
+// pen position plus that glyph's advance, so it excludes right side bearing and
+// any ink overhanging the advance (an italic `f`). That is a deliberate choice
+// for a HIT-TEST -- the advance box is the region a reader perceives as
+// belonging to the character, an ink box would leave dead gaps between adjacent
+// glyphs of a link, and the underline drawn from the same number then matches
+// the clickable region EXACTLY, which is the property that actually matters
+// here. The cost is that up to a fraction of a pixel of an italic tail can sit
+// outside the box.
+Md_Span_Box :: struct {
+	span:     int,
+	line:     int,
+	x, y:     f32, // left edge, and the TOP of the line box
+	w, h:     f32,
+	baseline: f32, // the line's baseline, for the strike rule
+}
+
+// Every span's boxes, one per (span, visual line) it has glyphs on.
+//
+// Reads nothing but the Shaped the shaper produced plus the same advance oracle
+// the shaper laid out with (plat.text_advance -> glyph_get -> the atlas map), so
+// the right edge cannot be a different number from the one the break decision
+// used. Glyphs arrive in span-then-offset order within a line, so a single pass
+// with a "same (span, line) as the last box" test collects them.
+md_span_boxes :: proc(gfx: ^plat.Gfx, t: ^plat.Text, sh: ^plat.Shaped, shape: []plat.Shape_Span, allocator := context.temp_allocator) -> []Md_Span_Box {
+	out := make([dynamic]Md_Span_Box, 0, 8, allocator)
+	for g in sh.glyphs {
+		si, li := int(g.span), int(g.line)
+		if si < 0 || si >= len(shape) || li < 0 || li >= len(sh.line_boxes) {continue}
+		adv := plat.text_advance(gfx, t, g.r, shape[si].px, shape[si].set)
+		if n := len(out); n > 0 && out[n - 1].span == si && out[n - 1].line == li {
+			// Right edge first, then the left, then the width from the two.
+			// Widening in place (`w = max(w, g.x + adv - x)`) is only correct
+			// while `x` never moves, which is true of the order glyphs arrive in
+			// today and is exactly the assumption that stops being true the
+			// moment anything reorders them.
+			b := &out[n - 1]
+			right := max(b.x + b.w, g.x + adv)
+			b.x = min(b.x, g.x)
+			b.w = right - b.x
+			continue
+		}
+		lb := sh.line_boxes[li]
+		append(&out, Md_Span_Box{span = si, line = li, x = g.x, y = lb.top, w = adv, h = lb.h, baseline = lb.y})
+	}
+	return out[:]
+}
+
+// A link placed on screen by the preview: an ABSOLUTE-coordinate rectangle plus
+// what it points at.
+//
+// The preview's answer to Link_Hit, and deliberately not the same struct: a
+// Link_Hit is (row, col, cells) on the editor's cell grid, which the preview
+// does not have. Everything downstream of this -- the underline main.odin
+// draws, md_link_at's hit-test and the hand cursor -- consumes the `rect` this
+// carries and never re-derives it from a column.
+Md_Link_Hit :: struct {
+	rect:   plat.Quad, // pos/size only; colour is the consumer's business
+	base_y: f32, // the baseline the link's glyphs sit on, for the underline
+	url:    string, // the raw target text, as written in the document
+	text:   string, // the text `link`'s offsets index into
+	link:   Link, // for link_resolve / link_follow
+}
+
+// Underline every placed link. The affordance, drawn from the SAME rectangles
+// md_link_at accepts and offset to the baseline exactly as the editor pane's is
+// (row_baseline_y + 2). Nothing here recomputes a position.
+md_draw_links :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, hits: []Md_Link_Hit) {
+	for h in hits {
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {h.rect.pos.x, h.base_y + sx(2)}, size = {h.rect.size.x, hairline()}, color = g_theme[.Link]}})
+	}
+}
+
+// The link under a client-space point, or nil. Point-in-rect against the SAME
+// rectangles the underline is drawn from, produced by md_span_boxes and by
+// nothing else. There is no row_at_y and no cell_at_x here on purpose: the
+// preview's glyphs do not sit on the cell grid those two describe, and asking
+// them would be the "correct function fed the wrong input" bug this project has
+// sixteen recorded instances of.
+md_link_at :: proc(hits: []Md_Link_Hit, mx, my: f32) -> (Md_Link_Hit, bool) {
+	for h in hits {
+		r := h.rect
+		if mx >= r.pos.x && mx < r.pos.x + r.size.x && my >= r.pos.y && my < r.pos.y + r.size.y {
+			return h, true
+		}
+	}
+	return {}, false
 }
 
 // Does this line (RAW, not pre-trimmed -- see below) open or close a fenced
@@ -1456,207 +1642,1606 @@ md_fence_seed :: proc(doc: ^Document, top_byte: int) -> (in_fence: bool, fence_l
 	return
 }
 
-// Render markdown source from `top_byte`, laid out in [x0,x1] x [ytop,ybot].
-// Returns the byte offset just past the last line drawn (for scroll clamping).
-markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px, char_w: f32, x0, x1, ytop, ybot: f32, top_byte: int) -> (bottom: int) {
-	bottom = top_byte
-	line_h := line_height(px)
-	buf: [RENDER_LINE_CAP]u8
-	y := ytop + px // first baseline
-	p := top_byte
-	// Seeded from the document's own lexer state at top_byte, NOT from `false`:
-	// the opening fence can be anywhere above the viewport. See md_fence_seed.
-	in_fence, seed_lex := md_fence_seed(doc, top_byte)
-	// The fence's language tag, resolved to a lexer. UI spec 9.2 item 4 asks for
-	// "fenced code + lexer -- syn_* inside", and a fenced block was drawn as flat
-	// Md_Code however it was tagged.
-	//
-	// The tag is turned into a pseudo-path and handed to highlight_lexer_for,
-	// rather than growing a second tag->lexer table beside the extension one.
-	// One mapping means a lexer added for a file type is immediately available
-	// inside a fence, and the two can never disagree about what "cs" means.
-	fence_lex: Lexer_Proc = seed_lex
-	// Finding 3 (2026-07 review): always starts .Normal, even when md_fence_seed
-	// supplied a seed_lex -- Lex_State is scalar (see md_fence_seed's own
-	// comment on why it cannot carry the fence's language tag), and there is
-	// nowhere to seed a fence LANGUAGE's internal state (e.g. an open `/* */`
-	// in a json/c block) FROM, since lex_index_fence_open only ever locates the
-	// fence-open LINE, not the token state partway through the block's body at
-	// top_byte. Net effect: scrolling into the MIDDLE of a fenced block whose
-	// language lexer is itself stateful (a `/* */` comment spanning into the
-	// visible region) colours the visible remainder as if the comment were
-	// closed, until scrolled up to where it actually opens. Bounded to the
-	// viewport, and strictly better than the pre-fix "whole rest of the file
-	// is a code block" bug -- not fixed here, just no longer a surprise.
-	fence_state: base.Lex_State
-	// YAML front matter reads as a small card rather than as body text with two
-	// horizontal rules around it, which is what `---` on its own line otherwise
-	// renders as (UI spec 9.2 item 12). Only when the view starts at the top of
-	// the file: scrolled past it, there is nothing to card.
-	fm_end, fm_inner := md_front_matter_end(doc)
-	if top_byte != 0 {fm_end, fm_inner = 0, 0}
-	if fm_end > 0 {
-		// Drawn whole, before the row loop, and never admitted against the row
-		// budget: it is always the first thing in the pane when it is present
-		// at all, and "no frame ever shows emptiness" outranks a card whose
-		// bottom edge the cover strip trims on a very short pane.
-		card_top := y - px
-		md_draw_front_matter(gfx, qp, text, doc, x0, x1, card_top, px, char_w, line_h, fm_end, fm_inner)
-		// The ONE consumer of the block's height besides the card itself.
-		y = card_top + md_fm_height(line_h, fm_inner) + px
-		bottom = fm_end
-		p = fm_end
+// --- the layout cache (UI spec 9.1) -----------------------------------------
+//
+// "Cache each block's laid-out glyph positions, keyed by (block index, pane
+// width). Invalidate a block on edit; invalidate all on resize or zoom."
+//
+// CORRECTION, and it is the one place this deviates from the spec's wording: the
+// key is the block's START BYTE, not its index. The block list is built lazily
+// from the scroll anchor forward (viewport-first is a hard rule, so there is no
+// document-wide list to index into), which means "block 3" is a different block
+// after every scroll step, and an index key would return another block's glyphs.
+// The start byte is the block's identity and does not move when the viewport
+// does.
+//
+// The start byte alone is NOT a sufficient identity, and this is the non-obvious
+// part. Two blocks cannot share a start byte -- but the same start byte can name
+// a block whose EXTENT changed while its stripped source text did not. md_pass
+// strips the trailing `\r` before handing `line` to the key, so a CRLF -> LF
+// conversion leaves every `src` byte-identical while every `end`/`next` shifts.
+// A hit then resumes the pass one byte late per converted line, and the next
+// block renders with its first character eaten. Hence `end` in the key: the
+// caller already has it from pt_line_end_cap, so it costs one compare.
+//
+// The rest of the key is everything a block's layout is a function of:
+//
+//	start        the block's first byte -- its identity
+//	end          its LAST byte, so a line whose raw length changed but whose
+//	             stripped text did not (CRLF <-> LF) misses. See above.
+//	src          its own source text, held as an OWNED copy. This is what makes
+//	             invalidation PER-BLOCK on edit: nothing here consults
+//	             doc.revision, so editing one line leaves every other block's
+//	             entry usable. (An insert shifts the start byte of everything
+//	             after it, so those rebuild; that is inherent to a byte identity,
+//	             not a property of this comparison.)
+//	measure      the column it was broken to -- "pane width"
+//	px           the base size S -- "zoom"
+//	ui_scale     the DPI scale. `indent` bakes sx()-scaled insets (a fence's 12px
+//	             pad, a list's 24px per level, a quote's 16px), and when the pane
+//	             is wide enough for the 72ch cap to bind, `measure` is a function
+//	             of S alone -- so a monitor change with no window-size change
+//	             moves every inset while nothing else in the key moves.
+//	theme        the palette the spans' colours were BAKED from. Md_Span.color is
+//	             resolved at build time now (the old code called md_run_color per
+//	             draw), so without this a theme switch leaves warm-white body text
+//	             and amber headings on a light background until the entries are
+//	             evicted. See md_theme_gen for why it is a hash and not a counter.
+//	faces        which font families were loaded when the entry was SHAPED. The
+//	             same mechanism as `theme` one row up, for geometry instead of
+//	             colour: glyph positions, soft-wrap points and the block's height
+//	             all come out of the shaper at the loaded faces' advances.
+//	             Settings > Font reloads the .Doc chain, which inline code and
+//	             fenced blocks draw on, and text_reset_atlas drops the rasterized
+//	             glyphs without touching a laid-out entry -- so the atlas fills
+//	             with the new family while the cache keeps the old family's
+//	             spacing, wrap points, code backgrounds and link rects. Every
+//	             other term is invariant under it, `measure` included: that is 72
+//	             advances of the BODY face, which a .Doc change does not move.
+//	fence in/out the lexer state it was coloured under; the SAME line is prose or
+//	             code depending on it, so it is part of the key and not a result
+//	revision     for kinds whose layout depends on bytes OUTSIDE their own src:
+//	             a table row (its columns are measured across the whole block), a
+//	             blank RUN (its extent is the following lines) and front matter
+//	             (drawn from the document). Those three cannot be validated by
+//	             their own text, so they take the coarse key; everything that
+//	             carries real shaping work takes the fine one.
+//
+// A resize changes `measure`, a zoom changes `px`, a monitor change `ui_scale`,
+// a theme switch `theme` and a font change `faces`, so each invalidates every
+// entry wholesale without a sweep -- every lookup simply misses.
+// 256, not 128, since batch 17's pixel anchor: one walk now covers the pane
+// PLUS a pane below it (9.1's layout budget), and a walk that resolves an
+// anchor pays MD_RUNUP_LINES of run-up on top of that. Measured directly
+// (test_modes.odin's "budget-mid" case, a resolved mid-document anchor on a
+// one-block-per-line fixture): 44 live entries for one such walk. The draw,
+// the link pass and the scrollbar fraction each walk independently and can
+// each be first to touch a given anchor in a frame, so the real budget is
+// per-PASS live entries times the up-to-three passes a frame can make:
+// 44 * 3 = 132, which is already past 128 -- at 128 slots the three passes
+// would evict each other's blocks within a single frame instead of sharing
+// them, turning the cache into a cost every frame rather than just the first
+// one after a scroll. 256 covers 132 with room to spare.
+MD_LAYOUT_SLOTS :: 256
+
+// The longest run of blank lines collapsed into one Blank block. Blank runs
+// collapse so that a file of nothing but empty lines is a handful of blocks
+// rather than one per line -- but the scan that finds the run's end is a
+// forward line walk, so it needs a bound of its own or that same file would be
+// walked to EOF on the UI thread by the first block.
+MD_BLANK_RUN_MAX :: 64
+
+// Zero-height blocks admitted in one pass.
+//
+// The fit test cannot stop a block that costs nothing, and blank runs only
+// alternate with content while every run FITS in one block. A file that is
+// nothing but empty lines produces a CHAIN of Blank blocks, each capped at
+// MD_BLANK_RUN_MAX and each costing a bounded forward line walk -- so without
+// this the worst case is MD_WALK_BLOCKS * MD_BLANK_RUN_MAX = 16k capped line
+// reads on the UI thread, up to three times a frame while Ctrl is held. 64 * 64
+// = 4096 is the same order as MD_TABLE_MAX_ROWS and covers any real document:
+// content is what fills a pane, and content is not free.
+//
+// Stopping early only under-reports `bottom`, which makes the scrollbar thumb
+// conservative over a region that has nothing to show. It cannot lose content:
+// reaching this cap means the pane below the last drawn block is empty.
+MD_MAX_EMPTY_BLOCKS :: 64
+
+// Layouts BUILT since the process started. Test-visible on purpose: "a second
+// layout at the same width does no work" is not observable from the result --
+// a correct cache and no cache at all return the same glyphs -- so the only
+// honest way to assert it is to count the builds.
+md_layout_builds: int
+
+// Bumped once per md_pass. An entry stamped with the CURRENT id was already
+// used by this pass, so evicting it would make the pass rebuild a block it has
+// already laid out -- and that rebuild takes another slot, which can evict
+// another live entry, and so on. Round-robin alone has that hole: measured, a
+// one-byte edit rebuilt TWO blocks, the edited one plus whichever live entry
+// its replacement happened to land on. See md_layout_slot.
+md_layout_pass: u64
+
+// One block's laid-out geometry. Owned storage: `src`, `store`, `shape`,
+// `spans`, `sh` and `boxes` are all heap-allocated and freed by md_layout_free,
+// which doc_close calls for every slot.
+Md_Layout :: struct {
+	valid:       bool,
+	// --- the key (see MD_LAYOUT_SLOTS) ---
+	start:       int,
+	src:         string, // OWNED copy of the block's source line
+	in_fence:    bool,
+	fence_lex:   Lexer_Proc,
+	fence_state: base.Lex_State,
+	measure:     f32,
+	px:          f32,
+	ui_scale:    f32, // sx()'s scale: `indent` is baked from it
+	theme:       u64, // md_theme_gen: the palette every span colour was baked from
+	faces:       u64, // plat.text_face_gen: the faces every advance was baked from
+	revision:    u64, // consulted only for the kinds md_layout_extern_dep names
+	// --- the value, except `end` which is BOTH (see MD_LAYOUT_SLOTS) ---
+	end:         int, // what the pass reports as `bottom` after this block
+	next:        int, // where the pass continues from
+	cls:         Md_Class, // .content / .bullet slice into `src`
+	store:       string, // OWNED; every span's text and url slices into this
+	shape:       []plat.Shape_Span,
+	spans:       []Md_Span,
+	sh:          plat.Shaped,
+	boxes:       []Md_Span_Box,
+	// THE height. Produced here, once, and consumed by BOTH the admit decision
+	// and the advance -- md_row_geom's lesson, carried into the block model. The
+	// two must never be computed separately: a block admitted against one number
+	// and advanced by another is how a heading got cut through the middle of its
+	// glyphs (item 6, 2026-07-29).
+	h:           f32,
+	above:       f32, // 9.3's space above; adjacent margins COLLAPSE (see md_pass)
+	below:       f32, // 9.3's space below
+	indent:      f32, // the block's left inset from the content origin
+	// Where the block's MARKER goes, as an inset from the content origin: a list
+	// bullet or checkbox sits left of the prose, so it is not `indent`. Produced
+	// here for the same reason `indent` is -- md_block_draw used to re-derive it
+	// as `cx + level * m.list_indent`, a second expression that had to agree with
+	// the one this file computes two lines above.
+	marker:      f32,
+	out_fence:   bool,
+	out_lex:     Lexer_Proc,
+	out_state:   base.Lex_State,
+	fm_inner:    int, // Front_Matter only: key/value lines between the fences
+	used:        u64, // the md_layout_pass that last read or built this entry
+}
+
+// Does this kind's layout depend on bytes outside its own `src`? Those take
+// doc.revision as part of their key, since their own text cannot witness the
+// change. See MD_LAYOUT_SLOTS.
+@(private = "file")
+md_layout_extern_dep :: #force_inline proc(k: Md_Kind) -> bool {
+	return k == .Table || k == .Blank || k == .Front_Matter
+}
+
+md_layout_free :: proc(e: ^Md_Layout) {
+	if !e.valid {return}
+	delete(e.src)
+	delete(e.store)
+	delete(e.shape)
+	delete(e.spans)
+	delete(e.boxes)
+	plat.shaped_free(&e.sh)
+	e^ = {}
+}
+
+// Every slot dropped. doc_close's audited free, and the reset a test uses to
+// make "did this rebuild?" a question with a defined starting point.
+md_layout_reset :: proc(doc: ^Document) {
+	if doc == nil {return}
+	for &e in doc.md_layout {md_layout_free(&e)}
+	delete(doc.md_layout)
+	doc.md_layout = nil
+}
+
+// One span under construction. Offsets into a temp builder rather than strings,
+// because the block's text is copied into ONE owned allocation at the end and
+// slices taken from that -- a builder reallocs, so a slice taken during the
+// build would dangle.
+@(private = "file")
+Md_Draft_Span :: struct {
+	off, len: int,
+	url_off:  int,
+	url_len:  int,
+	style:    Md_Styles,
+	color:    [4]f32,
+	px:       f32,
+	set:      plat.Font_Set,
+}
+
+// The face for an inline run: real bold/italic faces when the body chain has
+// them (9.3 asks for weight 700 on every heading row and "real bold + italic
+// faces" for emphasis), the base face when it does not. Code is always the mono
+// chain -- 9.2 item 3, "always Neon even in serif body"; Neon is not embedded
+// until batch 20, so the mono chain here is .Doc, the editor's own face.
+@(private = "file")
+md_run_set :: proc(t: ^plat.Text, style: Md_Styles) -> plat.Font_Set {
+	if .Code in style {return .Doc}
+	switch {
+	case .Bold in style && .Italic in style:
+		return plat.text_styled_set(t, .Body, .Bold_Italic)
+	case .Bold in style:
+		return plat.text_styled_set(t, .Body, .Bold)
+	case .Italic in style:
+		return plat.text_styled_set(t, .Body, .Italic)
 	}
-	// The fit test is INSIDE the loop now, after md_row_geom: it needs the row's
-	// own height, which is not known until the line is classified. See
-	// Md_Row_Geom.
-	//
-	// `forced` exempts the very first row from the test. Without it a pane
-	// shorter than one h1 (reachable: the window floor is 240dp and the doc font
-	// size is a user setting) would draw NOTHING for a document that opens with
-	// a heading -- an empty pane, which "no frame ever shows emptiness" rules
-	// out and which is a worse thing to look at than a heading the cover strip
-	// trims. It is spent once. The front-matter card above has already used it
-	// when there is one, hence the initialiser.
-	forced := fm_end == 0
-	for p <= doc.pt.length {
-		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
-		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
-		if n > 0 && buf[n - 1] == '\r' {n -= 1}
-		line := string(buf[:n])
-		trimmed := strings.trim_left(line, " \t")
-		g := md_row_geom(line, trimmed, in_fence, px, line_h)
-		if !forced && !md_row_fits(y, px, g.ink, ybot) {break}
-		forced = false
+	return .Body
+}
 
-		// How far md_draw_inline soft-wrapped past the row's first line. Soft
-		// wrap is the one part of a row's height that cannot be known before
-		// the draw (it depends on where each word lands), so it is added to the
-		// advance rather than to the admit budget -- the same treatment body
-		// text has always had, and it is why at most ONE block can overhang.
-		wrap := f32(0)
+@(private = "file")
+md_run_styles :: proc(r: Md_Run) -> (s: Md_Styles) {
+	if r.bold {s += {.Bold}}
+	if r.ital {s += {.Italic}}
+	if r.code {s += {.Code}}
+	if r.link {s += {.Link}}
+	if r.strike {s += {.Strike}}
+	return
+}
 
-		switch g.kind {
-		case .Fence_Line:
-			in_fence = !in_fence
-			if in_fence {
-				fence_lex, fence_state = md_fence_lexer(trimmed), .Normal
-			} else {
-				fence_lex = nil
-			}
-		case .Fence_Body:
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px}, size = {x1 - x0, line_h}, color = g_theme[.Md_Code_Bg]}})
-			if fence_lex != nil {
-				toks: [128]base.Token
-				nt, st := fence_lex(transmute([]u8)line, fence_state, toks[:])
-				fence_state = st
-				spans: [128]plat.Text_Span
-				ns := 0
-				for i in 0 ..< nt {
-					if ns >= len(spans) {break}
-					spans[ns] = {start = toks[i].start, len = toks[i].len, color = g_theme[highlight_kind_role(toks[i].kind)]}
-					ns += 1
-				}
-				plat.text_draw_spans(gfx, text, line, x0 + char_w, y, px, g_theme[.Md_Code], spans[:ns], .Doc)
-			} else {
-				plat.text_draw(gfx, text, line, x0 + char_w, y, px, g_theme[.Md_Code], .Doc)
-			}
-		// A blank line draws nothing at all; md_row_geom halves its advance so
-		// it reads as a gap.
-		case .Blank:
-		case .Rule:
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {x1 - x0, hairline()}, color = g_theme[.Md_Rule]}})
-		case .Heading:
-			by := y + (g.hpx - px) // sink the larger baseline so it sits on the row
-			x := x0
-			yy := by
-			runs := md_inline(g.content)
-			// force bold heading colour
-			for &r in runs {r.bold = true}
-			md_draw_inline(gfx, qp, text, runs, x0, x1, &x, &yy, g.hpx, plat.text_char_width(text, g.hpx, .Doc), g.hh, g_theme[.Md_Heading])
-			wrap = yy - by
-		case .Quote:
-			// One bar per nesting level, indented per level (UI spec 9.2's "2px
-			// bar + 16px inset per level"), so a reply inside a reply is visibly
-			// deeper instead of identical to a single quote.
-			for d in 0 ..< g.depth {
-				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + f32(d) * char_w * 2, y - px}, size = {max(sx(3), 2), line_h}, color = g_theme[.Md_Quote]}})
-			}
-			qind := x0 + f32(g.depth) * char_w * 2
-			x := qind
-			yy := y
-			md_draw_inline(gfx, qp, text, md_inline(g.content), qind, x1, &x, &yy, px, char_w, line_h, g_theme[.Md_Quote])
-			wrap = yy - y
-		case .List:
-			ind := x0 + f32(g.depth) * char_w * 2
-			// A task item draws a real box instead of literal brackets, which is
-			// how `- [ ] thing` reads without this. Done items go muted, so a
-			// finished checklist recedes -- and the TICK carries the state as
-			// well as the tone, never colour alone (UI spec 18).
-			if g.task {
-				task_col, task_mute := md_task_prose_style(false)
-				bx := ind
-				bs := char_w * 1.4
-				by := y - px * 0.75
-				edge := hairline()
-				bc := g_theme[.Accent] if g.task_done else g_theme[.Text_Muted]
-				// Border and tick are ONE instance list and one quads_draw call
-				// (Finding 6, 2026-07 review): two Map+Draw round trips for a
-				// single checkbox was pure waste. The border is always 4 quads;
-				// the tick, done items only, is appended after it.
-				bq: [4 + MD_TICK_STEPS * 2]plat.Quad
-				bq[0] = {pos = {bx, by}, size = {bs, edge}, color = bc}
-				bq[1] = {pos = {bx, by + bs - edge}, size = {bs, edge}, color = bc}
-				bq[2] = {pos = {bx, by}, size = {edge, bs}, color = bc}
-				bq[3] = {pos = {bx + bs - edge, by}, size = {edge, bs}, color = bc}
-				nq := 4
-				if g.task_done {
-					nt := md_tick_quads(bx, by, bs, g_theme[.Accent], bq[4:])
-					nq += nt
-					// The prose colour/mute is resolved through md_task_prose_style
-					// -- the SAME procedure mdtest calls to ask "what does a done
-					// item's prose actually get" (2026-07 review, Finding 2). The
-					// box and the tick just built are deliberately NOT muted -- they
-					// are the state cue (UI spec 18's "never colour alone"), and
-					// fading the one mark that says "done" is the opposite of the
-					// intent.
-					task_col, task_mute = md_task_prose_style(true)
-				}
-				plat.quads_draw(gfx, qp, bq[:nq])
-				x := ind + bs + char_w
-				yy := y
-				md_draw_inline(gfx, qp, text, md_inline(g.content), ind + bs + char_w, x1, &x, &yy, px, char_w, line_h, task_col, task_mute)
-				wrap = yy - y
-			} else {
-				plat.text_draw(gfx, text, g.bullet, ind, y, px, g_theme[.Accent], .Doc)
-				x := ind + char_w * f32(len(g.bullet) + 1)
-				yy := y
-				md_draw_inline(gfx, qp, text, md_inline(g.content), ind + char_w * 2, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
-				wrap = yy - y
-			}
-		case .Table:
-			if c := md_table_ensure(doc, text, p); c != nil {
-				md_draw_table_row(gfx, qp, text, c, line, x0, x1, y, px, char_w, md_row_is_sep(line))
-			}
-		case .Para:
-			x := x0
-			yy := y
-			md_draw_inline(gfx, qp, text, md_inline(g.content), x0, x1, &x, &yy, px, char_w, line_h, g_theme[.Text_Primary])
-			wrap = yy - y
+// Split a drafted span at the bare URLs and paths inside it, so a link written
+// without markdown syntax stays clickable in the preview.
+//
+// links_scan is the SAME detector the editor pane uses -- not a second rule
+// about what a path looks like. It runs on the span's own text, which is what
+// the reader sees, so a `*` that md_inline consumed as an emphasis marker
+// cannot end up inside a detected token.
+@(private = "file")
+md_split_bare_links :: proc(out: ^[dynamic]Md_Draft_Span, d: Md_Draft_Span, text: string) {
+	if .Code in d.style || .Link in d.style || d.len <= 0 {
+		append(out, d)
+		return
+	}
+	found := links_scan(text, context.temp_allocator)
+	if len(found) == 0 {
+		append(out, d)
+		return
+	}
+	cut := 0
+	for l in found {
+		if l.start > cut {
+			pre := d
+			pre.off, pre.len = d.off + cut, l.start - cut
+			append(out, pre)
 		}
-		// The ONE consumer of the height md_row_geom produced. Every branch
-		// above advances through here -- the task branch used to `continue` out
-		// of the loop with its own `p = end + 1` and never reached `bottom =
-		// end`, so a document ending in a task item under-reported its bottom
-		// to the scroll clamp.
-		y += g.adv + wrap
+		lk := d
+		lk.off, lk.len = d.off + l.start, l.len
+		lk.url_off, lk.url_len = d.off + l.start, l.target_len
+		lk.style += {.Link}
+		lk.color = g_theme[.Link]
+		append(out, lk)
+		cut = l.start + l.len
+	}
+	if cut < d.len {
+		post := d
+		post.off, post.len = d.off + cut, d.len - cut
+		append(out, post)
+	}
+}
 
-		bottom = end
-		if end >= doc.pt.length {break}
-		p = end + 1
+// Lay one block out: classify it, turn it into spans, shape them and produce
+// its height and its span boxes. Allocates into the ordinary allocator; the
+// cache owns the result.
+//
+// `line` is the block's FIRST source line, already read and CR-stripped by the
+// caller. Kinds that span more than one line (a blank run, front matter) read
+// the rest through `doc` themselves and set `end`/`next` accordingly.
+@(private = "file")
+md_layout_build :: proc(
+	gfx: ^plat.Gfx,
+	t: ^plat.Text,
+	doc: ^Document,
+	m: ^Md_Metrics,
+	p, line_end: int,
+	line: string,
+	in_fence: bool,
+	fence_lex: Lexer_Proc,
+	fence_state: base.Lex_State,
+	measure: f32,
+) -> (
+	e: Md_Layout,
+) {
+	md_layout_builds += 1
+	e.valid = true
+	e.start, e.end, e.next = p, line_end, line_end + 1
+	e.src = strings.clone(line)
+	e.in_fence, e.fence_lex, e.fence_state = in_fence, fence_lex, fence_state
+	e.measure, e.px, e.revision = measure, m.s, doc.revision
+	e.ui_scale, e.theme, e.faces = m.ui_scale, m.theme, m.faces
+	e.out_fence, e.out_lex, e.out_state = in_fence, fence_lex, fence_state
+
+	trimmed := strings.trim_left(e.src, " \t")
+	e.cls = md_classify(e.src, trimmed, in_fence)
+
+	// Front matter is a BLOCK, not a pre-loop special case. Its height comes
+	// from md_fm_height and from nowhere else, which is what removed its
+	// two-producer risk; here it is simply this block's `h`.
+	if p == 0 && !in_fence {
+		if fm_end, fm_inner := md_front_matter_end(doc); fm_end > 0 {
+			e.cls = Md_Class{kind = .Front_Matter}
+			e.fm_inner = fm_inner
+			e.end, e.next = fm_end, fm_end
+			e.h = md_fm_height(line_height(m.code), fm_inner)
+			e.below = m.para_below
+			return
+		}
+	}
+
+	base_col := g_theme[.Text_Primary]
+	mute := f32(0)
+	px := m.body
+	lead := m.body_lead
+
+	switch e.cls.kind {
+	case .Blank:
+		// Collapse the run. Bounded by MD_BLANK_RUN_MAX so a file of empty lines
+		// costs a bounded scan rather than a walk to EOF. Zero height: 9.3's
+		// space-above/below columns are what put air between blocks now, so a
+		// blank line is a separator in the source and nothing on screen.
+		buf: [RENDER_LINE_CAP]u8
+		q := line_end
+		for _ in 0 ..< MD_BLANK_RUN_MAX {
+			if q >= doc.pt.length {break}
+			nl, ne, _ := md_line_at(doc, q + 1, buf[:])
+			if len(strings.trim_space(nl)) != 0 || md_is_fence_line(nl) {break}
+			e.end, e.next, q = ne, ne + 1, ne
+		}
+		return
+	case .Rule:
+		e.h = hairline()
+		e.above, e.below = m.rule_gap, m.rule_gap
+		return
+	case .Fence_Open:
+		e.out_fence = true
+		e.out_lex, e.out_state = md_fence_lexer(trimmed), .Normal
+		e.h = m.fence_pad
+		e.above = m.fence_above
+		return
+	case .Fence_Close:
+		e.out_fence, e.out_lex = false, nil
+		e.h = m.fence_pad
+		e.below = m.fence_below
+		return
+	case .Table:
+		// Tables keep the cell machinery: 9.3 puts them on the mono face
+		// precisely so their columns align, and column widths are a property of
+		// the whole block (md_table_ensure), not of one row.
+		//
+		// DISCLOSED REGRESSION, not an oversight: returning here means `spans`
+		// and `boxes` stay nil, so md_block_links emits nothing and a link inside
+		// a table cell is not clickable. The old preview's links_layout scanned
+		// every raw source line whatever its kind, so it was. Fenced code lost the
+		// same thing (see md_split_bare_links and the fence-body branch below) and
+		// that one is arguably right -- code should not be clickable -- but a link
+		// in a table cell is an ordinary thing to write and this is a loss.
+		//
+		// Not fixed here because it cannot be done without a SECOND producer of
+		// table cell geometry, which is the one defect this whole batch exists to
+		// remove. A row's glyphs are placed by md_draw_table_row from character
+		// CELLS (md_col_x over md_table_ensure's column widths, plus the alignment
+		// pad); the span boxes every other kind's link rects come from are the
+		// shaper's. Emitting link rects for a table today means re-deriving a
+		// cell's sub-string x in cell arithmetic and hoping it agrees with what
+		// text_draw actually advanced -- which is precisely "a correct function fed
+		// the wrong input" (CLAUDE.md, HANDOFF 6j). The honest fix is to route a
+		// table row through shape_spans with per-column origins so the columns and
+		// the links share the shaper's output, and that is its own task.
+		e.h = line_height(m.table)
+		return
+	case .Fence_Body:
+		px, lead = m.code, line_height(m.code)
+		base_col = g_theme[.Md_Code]
+		// 9.3's 12px fenced-code padding, as the block's INDENT rather than as a
+		// number the draw adds on its own. The glyph origin has exactly one
+		// producer (md_block_origin) and the link rects are built from it, so an
+		// inset applied at the draw and not at the layout would put the underline
+		// and the hit-test 12px apart -- which is the whole failure this task
+		// exists to make impossible.
+		e.indent = m.fence_pad
+	case .Heading:
+		px = m.head[clamp(e.cls.level, 1, 6)]
+		lead = line_height(px)
+		base_col = g_theme[.Md_Heading]
+		e.above = m.head_above[clamp(e.cls.level, 1, 6)]
+		e.below = m.head_below[clamp(e.cls.level, 1, 6)]
+	case .Quote:
+		base_col = g_theme[.Md_Quote]
+		e.indent = f32(e.cls.level) * m.quote_inset
+		e.above, e.below = m.quote_above, m.quote_below
+	case .List:
+		e.indent = f32(e.cls.level) * m.list_indent
+		// The bullet / checkbox sits at the item's nesting depth; the PROSE is
+		// indented one step further. Both come out of here, so md_block_draw has
+		// no expression of its own to keep in step (2026-07-29 review, L2).
+		e.marker = e.indent
+		e.below = m.list_gap
+		if e.cls.task {
+			e.indent += m.task_box + m.list_indent * 0.25
+		} else {
+			e.indent += m.list_indent
+		}
+		if e.cls.task_done {base_col, mute = md_task_prose_style(true)}
+	case .Para:
+		e.below = m.para_below
+	case .Front_Matter:
+	}
+
+	// --- spans ---------------------------------------------------------------
+	sb := strings.builder_make(context.temp_allocator)
+	draft := make([dynamic]Md_Draft_Span, 0, 8, context.temp_allocator)
+	if e.cls.kind == .Fence_Body && fence_lex != nil {
+		// Syntax colours inside a fenced block: one span per token, all on the
+		// mono face at the code size. The lexer's outgoing state is carried to
+		// the next block, and is part of that block's cache key.
+		toks: [128]base.Token
+		nt, st := fence_lex(transmute([]u8)e.src, fence_state, toks[:])
+		e.out_state = st
+		cut := 0
+		emit :: proc(sb: ^strings.Builder, draft: ^[dynamic]Md_Draft_Span, s: string, col: [4]f32, px: f32) {
+			if len(s) == 0 {return}
+			off := strings.builder_len(sb^)
+			strings.write_string(sb, s)
+			append(draft, Md_Draft_Span{off = off, len = len(s), color = col, px = px, set = .Doc})
+		}
+		for i in 0 ..< nt {
+			tk := toks[i]
+			if tk.start > cut {emit(&sb, &draft, e.src[cut:tk.start], base_col, px)}
+			hi := min(tk.start + tk.len, len(e.src))
+			if hi > tk.start {emit(&sb, &draft, e.src[tk.start:hi], g_theme[highlight_kind_role(tk.kind)], px)}
+			cut = hi
+		}
+		if cut < len(e.src) {emit(&sb, &draft, e.src[cut:], base_col, px)}
+	} else {
+		content := e.cls.content
+		for run in md_inline(content) {
+			if len(run.text) == 0 {continue}
+			st := md_run_styles(run)
+			if e.cls.kind == .Heading {st += {.Bold}} // 9.3: weight 700, every level
+			col := md_run_color(run, base_col, mute)
+			// A heading keeps its OWN colour through emphasis (2026-07-29 review,
+			// L7). md_run_color repaints a bold run Text_Bright and an italic run
+			// Md_Italic, which is the exact base-colour override batch 17 removed
+			// from headings -- it survived in this sub-case because the run is
+			// handed to md_run_color unmodified, so `run.bold` still wins over the
+			// Md_Heading base. Deliberate, not incidental: a heading is already at
+			// weight 700 at every level, so `**bold**` inside one has no face
+			// change left to make and the colour was carrying emphasis on its own,
+			// which is the "colour alone" the UI spec's item 18 rejects. Browsers
+			// do the same -- <strong> inside <h1> inherits the heading's colour and
+			// its weight. Code, links and strikethrough still override, because
+			// each of those is saying something a heading is not: a code face, an
+			// affordance, a deletion.
+			if e.cls.kind == .Heading && !run.code && !run.link && !run.strike {col = base_col}
+			off := strings.builder_len(sb)
+			strings.write_string(&sb, run.text)
+			d := Md_Draft_Span {
+				off   = off,
+				len   = len(run.text),
+				style = st,
+				color = col,
+				px    = m.code if .Code in st else px,
+				set   = md_run_set(t, st),
+			}
+			if .Link in st {
+				d.url_off = strings.builder_len(sb)
+				d.url_len = len(run.url)
+				strings.write_string(&sb, run.url)
+			}
+			md_split_bare_links(&draft, d, run.text)
+		}
+	}
+
+	// One owned allocation for every span's text and url; the slices below index
+	// into it, so nothing here points at the temp arena.
+	e.store = strings.clone(strings.to_string(sb))
+	e.shape = make([]plat.Shape_Span, len(draft))
+	e.spans = make([]Md_Span, len(draft))
+	for d, i in draft {
+		e.shape[i] = {text = e.store[d.off:d.off + d.len], px = d.px, set = d.set}
+		e.spans[i] = {style = d.style, color = d.color}
+		if d.url_len > 0 {e.spans[i].url = e.store[d.url_off:d.url_off + d.url_len]}
+	}
+
+	e.sh = plat.shape_spans(gfx, t, e.shape, max(1, measure - e.indent), lead)
+	e.boxes = md_span_boxes(gfx, t, &e.sh, e.shape, context.allocator)
+	// THE height, read back rather than assumed: Shaped.height is the SUM of the
+	// per-line boxes, and a line box is clamped UP to its own face's ascent +
+	// descent (Georgia's is 1.136 em), so the leading asked for above is a floor
+	// and not an answer. An empty block still owes one line.
+	e.h = e.sh.height
+	if e.h <= 0 {e.h = plat.shape_run(gfx, t, " ", px, measure, lead, .Body, context.temp_allocator).line_h}
+	// h1 and h2 carry a rule (9.2 item 1). It is part of the block's OWN height,
+	// not decoration painted after it: a rule drawn at the block's bottom edge
+	// while the height stopped above it is a row of pixels the admit decision
+	// never budgeted for, which on the last block of a pane is a line painted
+	// on the status bar. Same single-producer rule as everything else here --
+	// md_block_draw derives the rule's y from this h, it does not add its own.
+	if e.cls.kind == .Heading && md_head_rules(e.cls.level) {e.h += hairline()}
+	return
+}
+
+// The cached layout for the block at `p`, building it if no slot holds one.
+// Round-robin replacement, like md_table_ensure's four slots and for the same
+// reason: a viewport walk touches its blocks top to bottom, so anything that
+// evicts the block it is about to need again next frame turns the cache into a
+// cost.
+@(private = "file")
+md_layout_ensure :: proc(
+	gfx: ^plat.Gfx,
+	t: ^plat.Text,
+	doc: ^Document,
+	m: ^Md_Metrics,
+	p, line_end: int,
+	line: string,
+	in_fence: bool,
+	fence_lex: Lexer_Proc,
+	fence_state: base.Lex_State,
+	measure: f32,
+) -> ^Md_Layout {
+	// Allocated on the first preview pass and never before: a document that is
+	// never previewed pays nothing, which is most of them.
+	if doc.md_layout == nil {doc.md_layout = make([]Md_Layout, MD_LAYOUT_SLOTS)}
+	for &e in doc.md_layout {
+		if !e.valid || e.start != p {continue}
+		if e.measure != measure || e.px != m.s || e.ui_scale != m.ui_scale || e.theme != m.theme || e.faces != m.faces {continue}
+		if e.in_fence != in_fence || e.fence_lex != fence_lex || e.fence_state != fence_state {continue}
+		if md_layout_extern_dep(e.cls.kind) {
+			if e.revision != doc.revision {continue}
+		} else if e.src != line || e.end != line_end {
+			// `e.end != line_end` is NOT redundant with `e.src != line`: md_pass
+			// strips the trailing \r, so a CRLF -> LF conversion leaves `src`
+			// identical and every extent one byte shorter. See MD_LAYOUT_SLOTS.
+			continue
+		}
+		e.used = md_layout_pass
+		return &e
+	}
+	slot := md_layout_slot(doc)
+	md_layout_free(slot)
+	slot^ = md_layout_build(gfx, t, doc, m, p, line_end, line, in_fence, fence_lex, fence_state, measure)
+	slot.used = md_layout_pass
+	return slot
+}
+
+// The slot a new layout goes in: an empty one, else the LEAST RECENTLY USED
+// entry.
+//
+// Round-robin -- what md_table_ensure's four slots use, and what this started
+// as -- has a hole that only shows once the table is full of entries from
+// earlier configurations. A pass that must rebuild one block takes the next
+// slot round; if that slot holds a live entry for a block FURTHER DOWN THE SAME
+// PASS, that block then misses too, rebuilds, and takes the slot after it.
+// Measured on a six-block fixture with 128 slots: a one-byte edit to one line
+// rebuilt TWO blocks, the edited one and whichever neighbour its replacement
+// landed on. LRU picks a stale entry from an old width or zoom instead, which
+// is exactly what should go.
+//
+// LRU is the WHOLE fix, and that is worth stating because this procedure used to
+// carry a second one -- an explicit `e.used == md_layout_pass {continue}` guard,
+// commented as what kept a live entry from being evicted. Under LRU it can never
+// select one: `used` is stamped with the current pass id on every hit and every
+// build, so a live entry holds the MAXIMUM `used` in the table and is chosen only
+// when every entry is live -- in which case the guard skips them all and the
+// `max(best, 0)` fallback returns slot 0, which is exactly where the unguarded
+// scan lands too. It was dead code crediting itself with the fix (2026-07-29
+// review, L1).
+//
+// If every slot was used by this pass -- a viewport with more than
+// MD_LAYOUT_SLOTS blocks in it -- there is nothing evictable that is not also
+// needed, and slot 0 goes. That thrashes, bounded and correctly; the fix if it
+// ever matters is more slots, not a cleverer policy.
+@(private = "file")
+md_layout_slot :: proc(doc: ^Document) -> ^Md_Layout {
+	best := -1
+	for &e, i in doc.md_layout {
+		if !e.valid {return &e}
+		if best < 0 || e.used < doc.md_layout[best].used {best = i}
+	}
+	return &doc.md_layout[max(best, 0)]
+}
+
+// The preview pane's content box, for the mode the document is actually in.
+//
+// ONE producer, read by markdown_draw, by markdown_links and by main.odin's own
+// call sites. The draw and the hit-test must agree about where the pane is down
+// to the pixel or the link seam is broken before either of them starts, and
+// "both call sites evaluate the same expression" is not the same promise as
+// "there is one expression".
+md_pane_box :: proc(doc: ^Document, winw, winh, split_frac: f32) -> (x0, x1, ytop, ybot: f32, ok: bool) {
+	if doc == nil || doc.kind != .Text {return}
+	switch doc.md_mode {
+	case .Off:
+		return
+	case .Preview:
+		x0 = TEXT_MARGIN_X
+	case .Split:
+		x0 = doc_editor_right(doc, winw, split_frac) + TEXT_MARGIN_X
+	}
+	x1 = winw - SCROLLBAR_W
+	ytop, ybot = doc_content_box(doc, winh)
+	return x0, x1, ytop, ybot, x1 > x0
+}
+
+// Does the preview pane own the column at `mx`? True for every x in .Preview
+// mode and for the right half in .Split.
+//
+// The dispatch is BY PANE, not by mode, and that is the point: in Split both
+// models are on screen at once, the editor pass draws full-window width (the
+// preview repaints over it), so an editor link hit is only meaningful left of
+// the divider. Reads md_pane_box, so it cannot disagree with where the preview
+// was actually drawn.
+md_pane_owns :: proc(doc: ^Document, winw, winh, split_frac, mx: f32) -> bool {
+	x0, x1, _, _, ok := md_pane_box(doc, winw, winh, split_frac)
+	if !ok {return false}
+	return mx >= x0 - TEXT_MARGIN_X && mx < x1 + SCROLLBAR_W
+}
+
+// The content origin and the measure inside a pane spanning [x0, x1].
+//
+// 9.3: "measure 72ch max, left-aligned, 40px left padding". The padding is
+// measured from the PANE's own left edge, which is x0 - TEXT_MARGIN_X (both
+// call sites hand this the margin already added), so the preview gets its 40px
+// without either of them having to know that.
+md_content_span :: proc(m: ^Md_Metrics, x0, x1: f32) -> (cx, measure: f32) {
+	cx = max(x0, x0 - TEXT_MARGIN_X + m.pad_left)
+	return cx, max(1, min(x1 - cx, m.measure))
+}
+
+// UI spec 9.1 item 4: "a scroll offset in PIXELS, not lines".
+//
+// The preview's position is a BLOCK plus a pixel offset into it -- the start
+// byte of the block at the top of the pane, and how many pixels of that block's
+// SLOT are scrolled above the pane's top edge.
+//
+// It is not a single pixel count measured from the document's first byte, and
+// that is the whole design decision. A pure offset cannot be resolved to a
+// position without laying out every block above it, which is exactly the
+// failure viewport-first exists to prevent (and exactly the temptation the 2c
+// brief names). The block byte is an identity that survives scrolling and costs
+// nothing to resolve; the `px` is the sub-block resolution the row grid used to
+// deny the preview.
+//
+// A block's SLOT is the collapsed gap that PRECEDES it plus the block itself,
+// so `px` lives in [0, gap + h). The gap is attributed to the block below it,
+// not above, because a scroll position inside a gap has to name one block and
+// the block below is the one whose glyphs are about to appear.
+//
+// Consequence, decided deliberately (2c brief, "md_pass applies the first
+// visible block's above"): the anchor block's space-ABOVE is drawn, and it is
+// now SCROLLABLE rather than a constant inset at the top of the pane. At
+// {0, 0} -- the top of the document -- the first block's `above` shows exactly
+// as it did under the byte anchor, so 9.3's spacing table is unchanged and so
+// is every assertion about it.
+Md_Anchor :: struct {
+	block: int, // start byte of the block at the top of the pane
+	px:    f32, // pixels of that block's slot scrolled above the pane top
+}
+
+// Everything md_max_anchor's answer is a function of. Compared whole, so a term
+// added to the layout later cannot be forgotten here without the compiler
+// noticing the struct changed shape -- and a SCROLL moves none of these, which
+// is what makes the cache free in the case that matters.
+Md_Max_Key :: struct {
+	rev:      u64,
+	measure:  f32,
+	px:       f32,
+	ui_scale: f32,
+	pane:     f32,
+	// Which faces are loaded. The ceiling is "the anchor at which the document's
+	// last block ends at the pane's bottom edge", so it is a function of block
+	// HEIGHTS -- and a family change moves every one of them. The layout cache's
+	// `theme` term has no counterpart here for the opposite reason: a palette
+	// changes colour and no height at all.
+	faces:    u64,
+	valid:    bool,
+}
+
+// Everything ONE block's slot height and extent is a function of. Md_Max_Key's
+// terms minus `pane` -- a block's own height does not depend on how much of the
+// window is showing it -- plus the block itself.
+//
+// This exists so that the walk which DREW a block is the walk the scrollbar's
+// fraction reads, rather than the fraction walking the same blocks again from
+// inside render_frame. Measured before it existed (-o:speed, 1085-line file,
+// 1340x800, mean of 200 frames): md_preview_frac 3.322 ms against
+// markdown_draw's 1.660 -- the thumb's position costing twice the content it
+// describes, because md_scroll_frac calls md_scroll_scalar twice and each one
+// ran an md_slot_at -> md_anchor_walk with a 24-line run-up and a 256-entry
+// Md_Walk_Block array. CLAUDE.md: "scroll resolution must not happen inside the
+// draw".
+Md_Slot_Key :: struct {
+	block:    int,
+	rev:      u64,
+	measure:  f32,
+	px:       f32,
+	ui_scale: f32,
+	faces:    u64,
+	valid:    bool,
+}
+
+// One block as a walk measured it. `slot_top` is the top of the block's slot --
+// the gap that precedes it -- relative to the walk's own start, so the block's
+// glyphs begin at slot_top + gap and the slot ends at slot_top + gap + h.
+//
+// The layout POINTER is carried, not a copy, and that is safe only because
+// MD_WALK_BLOCKS == MD_LAYOUT_SLOTS: a walk performs at most one
+// md_layout_ensure per slot, every entry it touches is stamped with the current
+// md_layout_pass, and md_layout_slot picks the least recently used -- so it
+// cannot select an entry this walk is still holding, PROVIDED the walk holds
+// fewer than MD_WALK_BLOCKS entries. At exactly MD_WALK_BLOCKS every slot
+// shares this pass's stamp and md_layout_slot's `best` search falls through to
+// slot 0 -- which the walk holds -- but that walk is already at its own array
+// bound (`n < len(out)` in md_walk) and can take no further slot, so the stale
+// pointer it hands back is never written through. Bounded and, short of
+// raising one constant without the other, unreachable in practice.
+@(private = "file")
+Md_Walk_Block :: struct {
+	start:    int,
+	end:      int,
+	next:     int,
+	slot_top: f32,
+	gap:      f32,
+	h:        f32,
+	lay:      ^Md_Layout,
+}
+
+// Blocks one walk may hold at once. See Md_Walk_Block: this is not a tuning
+// knob, it is the layout cache's slot count, and the two must move together.
+MD_WALK_BLOCKS :: MD_LAYOUT_SLOTS
+
+// Lines of run-up a walk takes before the block it is resolving.
+//
+// The collapsed gap ABOVE a block is a function of the block BEFORE it
+// (max(prev.below, this.above)), so a walk that starts at the anchor gets the
+// anchor's own gap wrong -- it sees no predecessor and falls back to the
+// block's own `above`. Measured on a paragraph following a paragraph that is 19
+// px at S=24, and it is not a cosmetic error: it makes the anchor's slot a
+// different height in different procedures, so scrolling one pixel across a
+// block boundary and back landed 19 px from where it started, and the drag's
+// inverse stopped agreeing with the map. Every walk that RESOLVES an anchor
+// takes this run-up, so the gap is the same number everywhere.
+//
+// 24 lines is headroom, not a derived bound: the fix above only needs the ONE
+// block before the anchor, which is rarely more than a couple of source lines
+// away, so 24 is generous margin for that case and nothing more precise than
+// "comfortably more than one block usually costs". It does NOT reliably clear
+// front matter -- MD_FM_MAX_LINES is 64, so a run-up landing inside front
+// matter of 25-65 lines reads its lines as rules and paragraphs rather than
+// reaching byte 0. A 30-line front-matter fixture showed no visible spacing
+// divergence from this (the window checked is one block wide), but that is an
+// absence of a demonstrated defect, not a proof the case is handled.
+MD_RUNUP_LINES :: 24
+
+// Lay blocks out forward from `from`, stopping at `limit_h` pixels of height, at
+// `stop_at` bytes, or at a bound -- whichever comes first.
+//
+// THE viewport-first primitive. Every walk over blocks in this file goes through
+// here, and every caller passes a height limit derived from the PANE. There is
+// no path that walks to the end of a document: `limit_h` and `len(out)` are both
+// hard, and the zero-height bound (MD_MAX_EMPTY_BLOCKS) covers the case a height
+// limit cannot see.
+//
+// `limit_from` is where the height limit starts counting -- the run-up above an
+// anchor is not part of the pane's budget and must not eat it.
+@(private = "file")
+md_walk :: proc(
+	gfx: ^plat.Gfx,
+	text: ^plat.Text,
+	doc: ^Document,
+	m: ^Md_Metrics,
+	measure: f32,
+	from: int,
+	stop_at: int,
+	limit_from: int,
+	limit_h: f32,
+	out: []Md_Walk_Block,
+) -> (
+	n: int,
+	total: f32,
+	reached: bool,
+) {
+	if doc == nil {return}
+	base_h := f32(0)
+	counting := from >= limit_from
+	buf: [RENDER_LINE_CAP]u8
+	p := clamp(from, 0, doc.pt.length)
+	// Seeded from the document's own lexer state at `from`, NOT from `false`: the
+	// opening fence can be anywhere above. See md_fence_seed.
+	in_fence, fence_lex := md_fence_seed(doc, p)
+	fence_state: base.Lex_State
+	// Adjacent margins collapse: the gap between two blocks is the larger of the
+	// upper one's space-below and the lower one's space-above, which is what
+	// browsers do and what 9.3's own numbers assume (a paragraph's 0.8 S and an
+	// h2's 1.6 S are not meant to sum). `prev_below` carries the upper half.
+	prev_below := f32(0)
+	empties := 0
+	reached = p > doc.pt.length || p >= stop_at
+	for p <= doc.pt.length && p < stop_at && n < len(out) && empties < MD_MAX_EMPTY_BLOCKS {
+		if !counting && p >= limit_from {counting, base_h = true, total}
+		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+		nb := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
+		if nb > 0 && buf[nb - 1] == '\r' {nb -= 1}
+		lay := md_layout_ensure(gfx, text, doc, m, p, end, string(buf[:nb]), in_fence, fence_lex, fence_state, measure)
+		gap := max(prev_below, lay.above)
+		out[n] = {start = p, end = lay.end, next = lay.next, slot_top = total, gap = gap, h = lay.h, lay = lay}
+		n += 1
+		total += gap + lay.h
+		// See MD_MAX_EMPTY_BLOCKS: a zero-height block is invisible to a height
+		// limit, so it needs a bound of its own.
+		empties = empties + 1 if lay.h <= 0 else empties
+		prev_below = lay.below
+		in_fence, fence_lex, fence_state = lay.out_fence, lay.out_lex, lay.out_state
+		if lay.next > doc.pt.length {
+			reached = true
+			break
+		}
+		p = lay.next
+		reached = p >= stop_at
+		if counting && total - base_h >= limit_h {break}
 	}
 	return
 }
+
+// The walk that RESOLVES an anchor: MD_RUNUP_LINES of run-up before it, so the
+// anchor block's collapsed gap is the document's and not an artefact of where
+// the walk began (see MD_RUNUP_LINES), plus the index of the block the anchor
+// falls in.
+//
+// Every consumer of an anchor goes through here -- the draw, the slot height,
+// the downward scroll -- which is what makes "the anchor's slot" one number.
+// `limit_h` is measured from the anchor, not from the run-up.
+@(private = "file")
+md_anchor_walk :: proc(c: ^Md_Scroll_Ctx, block: int, limit_h: f32, out: []Md_Walk_Block) -> (n, idx: int) {
+	from := md_line_start_back(c.doc, block, MD_RUNUP_LINES)
+	n, _, _ = md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, from, max(int), block, limit_h, out)
+	// The last block starting at or before the anchor byte IS the block the
+	// anchor names -- blocks tile the document -- so a stale anchor left
+	// mid-block by an edit resolves to its container instead of misreading.
+	for i in 0 ..< n {
+		if out[i].start <= block {idx = i}
+	}
+	return
+}
+
+// One walk over the visible blocks, consumed by the draw and by the link pass.
+//
+// There is exactly ONE of these because the two consumers must not be able to
+// disagree: what is clickable is what is drawn, and the only way to guarantee
+// that is for both to come out of the same walk over the same layout cache with
+// the same inputs. `qp` is nil for the link pass, which is what turns the
+// painting off -- nothing else differs, not even the order.
+//
+// Viewport-first, and 9.1's layout budget: blocks are built from the anchor
+// forward and the walk stops one PANE past the bottom edge -- "the visible
+// blocks plus a screen below". The screen ABOVE is laid out by md_probe_back,
+// on the scroll-up path, where it is the thing being asked for rather than work
+// repeated three times a frame; see that procedure. Nothing is ever laid out
+// for the document.
+@(private = "file")
+md_pass :: proc(
+	gfx: ^plat.Gfx,
+	qp: ^plat.Quad_Pipeline,
+	text: ^plat.Text,
+	doc: ^Document,
+	px: f32,
+	x0, x1, ytop, ybot: f32,
+	at: Md_Anchor,
+	links: ^[dynamic]Md_Link_Hit,
+) -> (
+	bottom: int,
+) {
+	bottom = at.block
+	if doc == nil {return}
+	md_layout_pass += 1 // see md_layout_slot: this pass's entries are not evictable
+	m := md_metrics(text, px)
+	cx, measure := md_content_span(&m, x0, x1)
+	pane := max(1, ybot - ytop)
+	c := Md_Scroll_Ctx{gfx, text, doc, m, measure, ytop, pane}
+	blocks := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	// The anchor's own scrolled-off part, the pane, and one pane below it -- 9.1's
+	// budget. The run-up md_anchor_walk takes is NOT part of that budget and is
+	// never drawn; it is what makes the anchor's gap the document's own.
+	n, idx := md_anchor_walk(&c, at.block, at.px + pane * 2, blocks)
+	// The anchor block's slot, handed to md_slot_at rather than left for it to
+	// re-derive. This walk already has the number: `md_slot_at` runs the SAME
+	// md_anchor_walk from the same byte with the same run-up, differing only in a
+	// height limit that cannot affect any block at or before `idx`. Publishing it
+	// here is what stops the scrollbar's fraction from resolving the scroll
+	// position a second time inside render_frame, three lines after this pass
+	// produced it (CLAUDE.md's one-producer rule, and its "scroll resolution must
+	// not happen inside the draw").
+	if n > 0 {md_slot_store(&c, at.block, blocks[idx])}
+	if links != nil {link_cache_begin(doc)}
+	// The anchor block's SLOT top, in client pixels. Everything else in the pass
+	// is this plus the walk's own relative offsets -- one origin, so a block's
+	// draw y and its link rect's y cannot be two different numbers.
+	y0 := ytop - at.px - (blocks[idx].slot_top if n > 0 else 0)
+	// The very first block is admitted unconditionally. A pane shorter than one
+	// h1 is reachable (the window floor is 240dp and the document font size is a
+	// user setting), and "no frame ever shows emptiness" outranks a heading whose
+	// bottom edge the cover strip trims. Spent once.
+	forced := true
+	// From the anchor, not from the walk's start: the blocks before `idx` are the
+	// run-up, and they exist only so the anchor's gap is right.
+	for i in idx ..< n {
+		b := blocks[i]
+		y := y0 + b.slot_top + b.gap
+		// Wholly above the pane: a zero-height anchor (a blank run), or an anchor
+		// whose px invariant an edit has broken underneath it. Reported as passed
+		// rather than drawn into the chrome, and it does NOT spend `forced` -- that
+		// belongs to the first block with something to show.
+		if y + b.h <= ytop {
+			bottom = b.end
+			continue
+		}
+		// The ONE consumer pair of the height the layout produced: this test and
+		// the walk's own advance. Nothing else may size this block.
+		if !forced && !md_block_fits(y, b.h, ybot) {break}
+		forced = false
+		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, b.lay, cx, x1, y)}
+		if links != nil {md_block_links(doc, b.lay, cx, y, links)}
+		bottom = b.end
+	}
+	return
+}
+
+// Render markdown source from `at`, laid out in [x0,x1] x [ytop,ybot].
+// Returns the byte offset just past the last line drawn (for scroll clamping).
+//
+// A partially-scrolled anchor block draws ABOVE ytop -- that is what a pixel
+// offset is -- and there is no scissor rect in this renderer, so the caller owes
+// this pane a cover strip over [0, ytop) exactly as it already owes one below
+// ybot. md_preview_clip is that strip.
+markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px: f32, x0, x1, ytop, ybot: f32, at: Md_Anchor) -> (bottom: int) {
+	return md_pass(gfx, qp, text, doc, px, x0, x1, ytop, ybot, at, nil)
+}
+
+// The links the preview would draw, in absolute client coordinates. The same
+// walk markdown_draw makes, with the painting off -- so a link's rectangle here
+// IS the rectangle its glyphs were drawn inside, not a second derivation of it.
+//
+// Called from the input phase (the hand cursor and the Ctrl+click test) where
+// the frame's draw has not run yet; the layout cache makes it a lookup per
+// block rather than a second shaping pass.
+markdown_links :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px: f32, x0, x1, ytop, ybot: f32, at: Md_Anchor, allocator := context.temp_allocator) -> []Md_Link_Hit {
+	out := make([dynamic]Md_Link_Hit, 0, 8, allocator)
+	md_pass(gfx, nil, text, doc, px, x0, x1, ytop, ybot, at, &out)
+	return out[:]
+}
+
+// The preview pane's links for this frame, or nil when the document has no
+// preview pane on screen.
+//
+// The hand cursor, the Ctrl+click and the underline all call THIS, and it takes
+// its pane box from md_pane_box, which is also what the draw takes. Three
+// consumers, one producer, one pane box -- so none of them can end up hit-
+// testing a rectangle the draw placed somewhere else.
+md_preview_links :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac: f32, allocator := context.temp_allocator) -> []Md_Link_Hit {
+	x0, x1, ytop, ybot, ok := md_pane_box(doc, winw, winh, split_frac)
+	if !ok {return nil}
+	return markdown_links(gfx, text, doc, px, x0, x1, ytop, ybot, doc.md_top, allocator)
+}
+
+// The preview's scroll fraction for this frame, or 0 when it has no pane. The
+// scrollbar's one call: it takes the pane box from md_pane_box, the same
+// producer the draw takes, so the thumb cannot be positioned against a pane the
+// content was not laid out in.
+md_preview_frac :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac: f32) -> f32 {
+	c, ok := md_scroll_ctx(gfx, text, doc, px, winw, winh, split_frac)
+	if !ok {return 0}
+	return md_scroll_frac(&c, doc.md_top)
+}
+
+// The cover strip a pixel-anchored preview owes its own pane, painted over
+// [0, ytop) of the pane's columns.
+//
+// There is no scissor rect in this renderer -- clipping is a strip painted after
+// the content (see main.odin's bottom strip and Split's right-half repaint) --
+// and a pixel offset means the anchor block is routinely drawn PARTIALLY above
+// the pane. Under the byte anchor nothing could sit above ytop, so this is
+// net-new and it is not optional: without it the top of the anchor block draws
+// across the tab rail's band. Called immediately after the preview's content
+// pass and before any chrome, exactly like the bottom strip.
+md_preview_clip :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, doc: ^Document, winw, winh, split_frac: f32) {
+	x0, x1, ytop, _, ok := md_pane_box(doc, winw, winh, split_frac)
+	if !ok || ytop <= 0 {return}
+	l := max(0, x0 - TEXT_MARGIN_X)
+	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {l, 0}, size = {x1 + SCROLLBAR_W - l, ytop}, color = doc_canvas_clear()}})
+}
+
+// --- the pixel scroll model (UI spec 9.1 item 4, 9.4) ------------------------
+//
+// Everything below moves an Md_Anchor. It is deliberately ALL in this file and
+// all built on md_walk: main.odin owns the gestures (wheel, drag, keys) and this
+// file owns what a pixel of preview means, so there is no second place that
+// knows how tall a block is.
+//
+// The one rule every procedure here obeys: no walk is unbounded, and no walk is
+// seeded from the document's start "to find out where we are". A position is
+// resolved from the anchor outwards, over a pane's worth of blocks.
+
+// The inputs every scroll query needs, taken ONCE from md_pane_box -- the same
+// producer markdown_draw and markdown_links take their box from. A scroll query
+// that measured a different pane than the draw would put the thumb somewhere the
+// content is not.
+Md_Scroll_Ctx :: struct {
+	gfx:     ^plat.Gfx,
+	text:    ^plat.Text,
+	doc:     ^Document,
+	m:       Md_Metrics,
+	measure: f32,
+	ytop:    f32,
+	pane:    f32,
+}
+
+md_scroll_ctx :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac: f32) -> (c: Md_Scroll_Ctx, ok: bool) {
+	x0, x1, ytop, ybot, box_ok := md_pane_box(doc, winw, winh, split_frac)
+	if !box_ok {return}
+	c = {gfx = gfx, text = text, doc = doc, m = md_metrics(text, px), ytop = ytop, pane = max(1, ybot - ytop)}
+	_, c.measure = md_content_span(&c.m, x0, x1)
+	return c, true
+}
+
+// `k` line starts back from `p`, bounded by the line-start scan cap. The only
+// backward motion in the preview, and the only reason it is safe is that every
+// caller bounds `k`.
+@(private = "file")
+md_line_start_back :: proc(doc: ^Document, p, k: int) -> int {
+	q := clamp(p, 0, doc.pt.length)
+	for _ in 0 ..< k {
+		if q <= 0 {break}
+		s, _ := base.pt_line_start_cap(&doc.pt, q - 1, RENDER_LINE_CAP)
+		if s >= q {break}
+		q = s
+	}
+	return q
+}
+
+// The starting point a forward walk needs so that laying out [s, stop_at) yields
+// at least `want_h` pixels -- 9.1's "a screen above", and the only way to move a
+// pixel anchor UPWARDS without a document-wide layout.
+//
+// It works by guessing a line count, walking forward, and doubling out if the
+// guess was short. The guess grows geometrically and is capped, so a blank-heavy
+// region (where a screen of height can cost thousands of source lines) simply
+// stops producing more height rather than walking to the top of the file -- the
+// anchor then clamps at the furthest point actually measured, and the next
+// scroll step continues from there. The walk that produced the height is
+// RETURNED, not thrown away, so the caller pays for one walk and the blocks land
+// in the layout cache warm for the frames that follow.
+@(private = "file")
+md_probe_back :: proc(c: ^Md_Scroll_Ctx, at, stop_at: int, want_h: f32, out: []Md_Walk_Block) -> (n, s: int, total: f32) {
+	s = clamp(at, 0, c.doc.pt.length)
+	lines := MD_RUNUP_LINES
+	for _ in 0 ..< 4 {
+		try := md_line_start_back(c.doc, at, lines)
+		tn, tt, reached := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, try, stop_at, try, max(f32), out)
+		// The walk could not span [try, stop_at) inside one walk's block budget,
+		// so `try` is further back than this model can represent. Keep the last
+		// span that did span, which is what the caller's arithmetic assumes --
+		// but THIS walk already overwrote `out` with the failed span's blocks,
+		// so `out` and (n, s, total) would otherwise describe two different
+		// walks. Re-walk the last good `s` to put `out` back in agreement with
+		// the numbers being returned.
+		if !reached {
+			if n > 0 {md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, s, stop_at, s, max(f32), out)}
+			break
+		}
+		n, s, total = tn, try, tt
+		if total >= want_h || try <= 0 {break}
+		lines *= 4
+	}
+	return
+}
+
+// One wheel step, in preview pixels: the preview's OWN body line height, so a
+// notch moves a line of what is on screen rather than a line of the source the
+// preview no longer lays out in rows. The notch count the platform reports is
+// unchanged, which keeps the feel identical at the default type scale.
+md_wheel_px :: proc(c: ^Md_Scroll_Ctx) -> f32 {
+	return c.m.body_lead
+}
+
+// The block containing byte `b`, and the height of its slot.
+//
+// Blocks tile the document ([start, next) with no gaps), so "the last block that
+// starts at or before b" IS the block containing b -- which a forward walk with
+// a stop_at of b+1 produces without a search.
+md_block_at_byte :: proc(c: ^Md_Scroll_Ctx, b: int) -> (start, next: int, slot: f32) {
+	if c.doc == nil {return}
+	target := clamp(b, 0, c.doc.pt.length)
+	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	// The run-up is what makes the slot returned here the same number md_pass
+	// will use; without it the gap above the block would be its own `above`
+	// rather than the document's collapsed one. It also swallows the only
+	// constructs whose block starts above their own line -- a collapsed blank
+	// run and front matter.
+	from := md_line_start_back(c.doc, target, MD_RUNUP_LINES)
+	n, _, _ := md_walk(c.gfx, c.text, c.doc, &c.m, c.measure, from, target + 1, from, max(f32), out)
+	if n == 0 {return target, target + 1, 0}
+	last := out[n - 1]
+	return last.start, last.next, last.gap + last.h
+}
+
+// The cache key for one block's slot, from a context. One producer, so the key
+// md_pass writes and the key md_slot_at looks up cannot drift apart.
+@(private = "file")
+md_slot_key_of :: proc(c: ^Md_Scroll_Ctx, block: int) -> Md_Slot_Key {
+	return {
+		block    = block,
+		rev      = c.doc.revision,
+		measure  = c.measure,
+		px       = c.m.s,
+		ui_scale = c.m.ui_scale,
+		faces    = c.m.faces,
+		valid    = true,
+	}
+}
+
+// Record one block's slot on the document, for md_slot_at to find. Called by the
+// pass that has just walked it -- see md_pass.
+@(private = "file")
+md_slot_store :: proc(c: ^Md_Scroll_Ctx, block: int, b: Md_Walk_Block) {
+	c.doc.md_slot_key = md_slot_key_of(c, block)
+	c.doc.md_slot_next, c.doc.md_slot_h = b.next, b.gap + b.h
+}
+
+// Walks md_slot_at had to make because nothing had already measured the block.
+// Test-visible on purpose: "the scrollbar's fraction rides the draw's own walk"
+// is not observable from the fraction -- a cached and an uncached answer are the
+// same number -- so the only honest way to assert it is to count the walks.
+md_slot_walks: int
+
+// One block's slot height and extent. Goes through md_anchor_walk for the run-up
+// (see MD_RUNUP_LINES): this number is the denominator of the scrollbar's
+// fraction and the divisor of its inverse, so it has to be the one the draw uses.
+//
+// Reads the cache md_pass fills, which is what makes "the one the draw uses"
+// literal rather than "computed the same way the draw computes it". On a hit
+// this costs a struct compare; on a miss it is the walk it always was.
+@(private = "file")
+md_slot_at :: proc(c: ^Md_Scroll_Ctx, start: int) -> (next: int, slot: f32) {
+	if c.doc == nil {return start + 1, 0}
+	if key := md_slot_key_of(c, start); c.doc.md_slot_key == key {
+		return c.doc.md_slot_next, c.doc.md_slot_h
+	}
+	md_slot_walks += 1
+	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	n, idx := md_anchor_walk(c, start, 1, out)
+	if n == 0 {return start + 1, 0}
+	md_slot_store(c, start, out[idx])
+	return out[idx].next, out[idx].gap + out[idx].h
+}
+
+// The scroll position as ONE monotone scalar: bytes, with the fraction of the
+// anchor block that is scrolled past.
+//
+// This is what the scrollbar maps and what its drag inverts, and the two are
+// EXACT inverses by construction -- md_scroll_to_fraction rebuilds an anchor
+// whose scalar is the number it was given, so grabbing the thumb and holding
+// still moves nothing. (That property is vscrollbar_geo's, hard won; see its
+// comment. The fraction is here rather than plain bytes for the same reason
+// vscrollbar_geo divides by doc_max_top and not pt.length: without it the thumb
+// reads 1.0 while a block of travel is still left.)
+md_scroll_scalar :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> f32 {
+	next, slot := md_slot_at(c, a.block)
+	f := clamp(a.px / max(1, slot), 0, 1)
+	return f32(a.block) + f * f32(max(1, next - a.block))
+}
+
+// The last anchor with content still to show: the position at which the document
+// ends exactly at the pane's bottom edge. The preview's own doc_max_top.
+//
+// This is the fix for the measured defect 2b recorded: the preview covers about
+// three times as much SOURCE per screen as the editor does (a blank run is one
+// zero-height block), so the editor's doc_max_top let the preview scroll a long
+// way past its own last block and show nothing new. Its ceiling is its own now.
+//
+// Computed from the document's END, backwards -- one pane of layout, never the
+// document -- and cached on the key every term of it depends on, so scrolling
+// (which moves none of them) costs nothing after the first frame.
+md_max_anchor :: proc(c: ^Md_Scroll_Ctx) -> Md_Anchor {
+	doc := c.doc
+	if doc == nil || doc.pt.length <= 0 {return {}}
+	key := Md_Max_Key {
+		rev      = doc.revision,
+		measure  = c.measure,
+		px       = c.m.s,
+		ui_scale = c.m.ui_scale,
+		pane     = c.pane,
+		faces    = c.m.faces,
+		valid    = true,
+	}
+	if doc.md_max_key == key {return doc.md_max}
+	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	n, s, total := md_probe_back(c, doc.pt.length, max(int), c.pane, out)
+	a := Md_Anchor{s, 0}
+	if rel := total - c.pane; rel > 0 && n > 0 {
+		// Same rule as md_scroll_px's upward branch: the walk's first block has no
+		// predecessor here, so it is only a legitimate anchor when it is the
+		// document's own first block.
+		lo := 0 if s <= 0 else min(1, n - 1)
+		a = md_at_offset(out[:n], lo, max(rel, out[lo].slot_top))
+	}
+	// The fraction's denominator, computed here because this is where the key is
+	// written and because it is a function of exactly the same terms. Costs one
+	// md_slot_at on a miss -- a resize, a zoom, a monitor change or an edit -- and
+	// nothing on the scroll frames in between, which is the case that matters.
+	doc.md_max, doc.md_max_key = a, key
+	doc.md_max_scalar = md_scroll_scalar(c, a)
+	return a
+}
+
+// Is `a` at or past `b` in scroll order? Byte first, pixels inside a block --
+// the same order md_scroll_scalar is monotone in, without its walk.
+@(private = "file")
+md_anchor_ge :: #force_inline proc(a, b: Md_Anchor) -> bool {
+	return a.block > b.block || (a.block == b.block && a.px >= b.px)
+}
+
+// Clamp an anchor into [{0,0}, md_max_anchor]. Every producer of an anchor ends
+// here, so "you cannot scroll past the end" is one expression and not five.
+md_scroll_clamp :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> Md_Anchor {
+	mx := md_max_anchor(c)
+	if md_anchor_ge(a, mx) {return mx}
+	if a.block <= 0 && a.px <= 0 {return {}}
+	return a
+}
+
+// Move the preview by `dy` PIXELS. Positive is down. 9.1 item 4, as a gesture.
+md_scroll_px :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, dy: f32) -> Md_Anchor {
+	if c.doc == nil || dy == 0 {return a}
+	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	res := a
+	if dy > 0 {
+		// One pane past the target, so the blocks the next frame draws are laid
+		// out here and the frame after it is a cache hit -- 9.1's "a screen
+		// below", on the gesture that needs it.
+		n, idx := md_anchor_walk(c, a.block, a.px + dy + c.pane, out)
+		if n == 0 {return a}
+		target := out[idx].slot_top + a.px + dy
+		// A step larger than the walk could span lands at the furthest position
+		// the walk actually MEASURED, and the next step continues from there --
+		// md_probe_back's header states the same rule for the other direction. The
+		// height limit above normally makes this a no-op (the walk is asked for the
+		// step plus a pane, so the target is inside it); what it bounds is the walk
+		// truncating on its block budget or on MD_MAX_EMPTY_BLOCKS instead, where
+		// the offset past the last slot names a distance over blocks nothing has
+		// laid out. Without it md_at_offset's past-the-walk case below would carry
+		// that unmeasured distance into `px`.
+		last := out[n - 1]
+		res = md_at_offset(out[:n], idx, min(target, last.slot_top + last.gap + last.h))
+	} else {
+		// 9.1's "a screen above": ask the probe for the step PLUS a pane, so the
+		// blocks above the new position are warm rather than rebuilt next frame.
+		n, s, total := md_probe_back(c, a.block, a.block, -dy + c.pane, out)
+		target := total + a.px + dy
+		if n == 0 {
+			// The probe could not move: md_line_start_back(doc, p, k) returns `p`
+			// only for p == 0, so n == 0 IS "the anchor is in the document's first
+			// block", and `target` is then simply a.px + dy measured from byte 0.
+			// This used to return {s, 0} and DISCARD the target, which teleported
+			// every up-step taken inside block 0 to the top of the document --
+			// reachable on any file whose first block is taller than one wheel
+			// notch, which is any heading, any fence, any front-matter card and any
+			// wrapping paragraph. The clamp at 0 is the top of the document; the
+			// clamp at the other end is md_scroll_clamp's, as everywhere else.
+			res = {s, max(0, target)}
+		} else {
+			// Never resolve onto the walk's FIRST block unless it is the document's
+			// -- that one has no predecessor here, so its gap is its own `above`
+			// and not the document's collapsed one (MD_RUNUP_LINES). Clamping to
+			// the second block instead costs one block of travel on a jump larger
+			// than the probe could reach; the next step continues from there.
+			lo := 0 if s <= 0 else min(1, n - 1)
+			res = md_at_offset(out[:n], lo, max(target, out[lo].slot_top))
+		}
+	}
+	return md_scroll_clamp(c, res)
+}
+
+// The anchor naming the position `target` in a walk's own space, searched from
+// `lo` forward. One place resolves an offset to an anchor, so the invariant
+// px in [0, gap + h) holds however the offset was arrived at.
+//
+// A target past everything the walk measured names a position in the block
+// AFTER the last one -- which is what `next` is, and which on the UPWARD path is
+// the anchor block itself, since md_probe_back's walk deliberately stops at it
+// (stop_at == a.block). So a step smaller than the anchor's own offset has no
+// entry in the walk to land in, and that is the common case, not an edge: it is
+// every up-step of less than px.
+//
+// This used to clamp the offset into the last entry's slot instead, which
+// emitted px == gap + h: the next block's {start, 0} written in the previous
+// block's coordinates. That is the same PLACE on screen, so it looked harmless,
+// and it is not -- it breaks the [0, gap + h) invariant this procedure's header
+// claims to be the one guarantor of, it loses the sub-block remainder (a notch
+// up from px = 32 returned the previous block's last pixel rather than px = 2),
+// and md_scroll_scalar's `px / slot` then reads 1.0, putting the scrollbar thumb
+// a whole block ahead of the content.
+@(private = "file")
+md_at_offset :: proc(w: []Md_Walk_Block, lo: int, target: f32) -> Md_Anchor {
+	for i in lo ..< len(w) {
+		b := w[i]
+		if target < b.slot_top + b.gap + b.h {
+			return {b.start, max(0, target - b.slot_top)}
+		}
+		if i == len(w) - 1 {
+			return {b.next, max(0, target - (b.slot_top + b.gap + b.h))}
+		}
+	}
+	if lo < len(w) {return {w[lo].start, 0}}
+	return {}
+}
+
+// The scroll position as a fraction of the scrollable range, for the scrollbar.
+// 0 at the top, exactly 1 at md_max_anchor -- so the thumb's BOTTOM meets the
+// track's bottom when the document's last block does the pane's, which is the
+// property vscrollbar_geo's comment exists to protect.
+// The denominator comes from md_max_anchor's cache and not from a second
+// md_scroll_scalar. This used to call md_scroll_scalar TWICE, each one an
+// md_slot_at -> md_anchor_walk with a 24-line run-up and a 256-entry
+// Md_Walk_Block array, from inside render_frame, over blocks markdown_draw had
+// laid out three lines earlier -- 3.322 ms a frame against the draw's 1.660.
+// Both halves are now lookups: the denominator on Md_Max_Key (a scroll moves no
+// term of it) and the numerator on the slot md_pass published.
+md_scroll_frac :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> f32 {
+	if c.doc == nil {return 0}
+	md_max_anchor(c) // ensures md_max_scalar holds this key's denominator
+	den := c.doc.md_max_scalar
+	if den <= 0 {return 0}
+	return clamp(md_scroll_scalar(c, a) / den, 0, 1)
+}
+
+// The inverse of md_scroll_frac, for a scrollbar drag. Exact: the anchor this
+// returns has the scalar it was asked for (see md_scroll_scalar).
+md_scroll_to_fraction :: proc(c: ^Md_Scroll_Ctx, frac: f32) -> Md_Anchor {
+	if c.doc == nil {return {}}
+	// md_max_anchor's cached scalar, the same field md_scroll_frac divides by --
+	// so the map and its inverse multiply and divide by literally one number
+	// rather than by two walks that have to agree. (It also takes the drag off
+	// the walk: a held thumb asks for this every frame.)
+	md_max_anchor(c)
+	t := clamp(frac, 0, 1) * c.doc.md_max_scalar
+	start, next, slot := md_block_at_byte(c, int(t))
+	px := (t - f32(start)) / f32(max(1, next - start)) * slot
+	return md_scroll_clamp(c, {start, clamp(px, 0, slot)})
+}
+
+// 9.4, "scroll sync by block, not by line": the preview position that
+// corresponds to the editor's top line. The editor stays byte-anchored and the
+// preview is pixel-anchored, so the sync is a MAPPING -- this is the map, and
+// md_anchor_top_byte below is its inverse.
+md_anchor_from_top :: proc(c: ^Md_Scroll_Ctx, top: int) -> Md_Anchor {
+	start, _, _ := md_block_at_byte(c, top)
+	return md_scroll_clamp(c, {start, 0})
+}
+
+// The other direction of 9.4's sync: the source line the editor should put at
+// its top when the preview is at `a`. A block start is a line start, so this is
+// the block's own byte -- the mapping is by BLOCK, which is the point: mapping
+// by line drifts the moment a heading or a fence changes height.
+md_anchor_top_byte :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor) -> int {
+	if c.doc == nil {return 0}
+	return base.pt_line_start(&c.doc.pt, clamp(a.block, 0, c.doc.pt.length))
+}
+
+// 9.1's one surviving pixel -> content mapping: "click-to-sync-scroll, which
+// only needs the nearest BLOCK, not the nearest glyph. Store each block's y
+// range and binary-search it."
+//
+// The y ranges are the walk's, so they are the ranges the draw used; the search
+// is a binary one over them because they are sorted by construction. Returns the
+// start byte of the block under `y`, and false when the pane holds nothing.
+md_block_at_y :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, y: f32) -> (start: int, ok: bool) {
+	if c.doc == nil {return}
+	// Outside the pane: refused here rather than left to the clamp below, which
+	// otherwise answers for a y meant for the status bar or the find bar just as
+	// readily as it does for an actual block.
+	//
+	// This is the ONLY copy of that predicate now. md_split_click_gate carried a
+	// second one and no longer does (see its comment): it called nothing but this
+	// procedure, so its copy could never refuse a press this one would accept.
+	// MEASURED, so the division of labour is on the record rather than assumed:
+	// of the three "gate:" cases that read as pane-bound checks, only the FIND BAR
+	// is actually refused by this line. The status bar and the empty strip below
+	// the last drawn block are both inside or below the pane's rows and are
+	// refused by the fit test further down instead. Deleting this line therefore
+	// costs exactly one case -- which is one more than zero, which is why it stays
+	// here while the duplicate went.
+	if y < c.ytop || y >= c.ytop + c.pane {return}
+	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	n, idx := md_anchor_walk(c, a.block, a.px + c.pane, out)
+	if n == 0 {return}
+	// Mirror md_pass's own fit test (md_block_fits, same forced-first-block
+	// rule). md_anchor_walk's budget is a HEIGHT limit, not "did this block
+	// fit inside ybot", so a block that straddles the pane's bottom edge is
+	// walked (and cached) but never painted. Without this, a click in the
+	// blank strip below the last PAINTED block clamps onto that unpainted
+	// block instead of naming nothing -- the same "clamps to whatever the
+	// binary search's last entry is" shape the pane bound above exists to
+	// close off, just for a y still inside the pane.
+	y0 := c.ytop - a.px - out[idx].slot_top
+	forced := true
+	last := idx - 1
+	for i in idx ..< n {
+		b := out[i]
+		by := y0 + b.slot_top + b.gap
+		if by + b.h <= c.ytop {
+			last = i
+			continue
+		}
+		if !forced && !md_block_fits(by, b.h, c.ytop + c.pane) {break}
+		forced = false
+		last = i
+	}
+	if last < idx {return}
+	rel := (y - c.ytop) + a.px + out[idx].slot_top // into the walk's own space
+	if rel >= out[last].slot_top + out[last].gap + out[last].h {return}
+	lo, hi := idx, last
+	for lo < hi {
+		mid := (lo + hi + 1) / 2
+		if out[mid].slot_top <= rel {lo = mid} else {hi = mid - 1}
+	}
+	return out[lo].start, true
+}
+
+// Collect one block's link rectangles, gated exactly as the editor pane's are:
+// underlined implies openable. The colour a link's TEXT draws in is not gated
+// -- a markdown link is a link in the document whether or not the target
+// resolves -- but the affordance and the click are, which is the invariant
+// links.odin's header states.
+// Where a block's GLYPHS start, horizontally. The single producer: the draw
+// places the shaped run at this x and the link rects are offset from this x, so
+// the underline, the hit-test and the ink are the same geometry by
+// construction rather than by two call sites agreeing.
+@(private = "file")
+md_block_origin :: #force_inline proc(lay: ^Md_Layout, cx: f32) -> f32 {return cx + lay.indent}
+
+@(private = "file")
+md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, out: ^[dynamic]Md_Link_Hit) {
+	x := md_block_origin(lay, cx)
+	for b in lay.boxes {
+		if b.span < 0 || b.span >= len(lay.spans) {continue}
+		sp := lay.spans[b.span]
+		if .Link not_in sp.style || len(sp.url) == 0 {continue}
+		l, lok := link_whole(sp.url)
+		if !lok || !link_gate_visible(doc, sp.url, l) {continue}
+		append(out, Md_Link_Hit {
+			rect   = {pos = {x + b.x, ytop + b.y}, size = {b.w, b.h}},
+			base_y = ytop + b.baseline,
+			url    = sp.url,
+			text   = sp.url,
+			link   = l,
+		})
+	}
+}
+
+// Paint one laid-out block at (cx, ytop). Consumes the layout and produces no
+// geometry of its own beyond the decorations that are not text: every glyph
+// position comes from lay.sh, every span rectangle from lay.boxes.
+@(private = "file")
+md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32) {
+	x := md_block_origin(lay, cx)
+	switch lay.cls.kind {
+	case .Blank:
+		return
+	case .Front_Matter:
+		md_draw_front_matter(gfx, qp, text, doc, cx, x1, ytop, m.code, plat.text_char_width(text, m.code, .Doc), line_height(m.code), lay.end, lay.fm_inner)
+		return
+	case .Rule:
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop}, size = {x1 - cx, lay.h}, color = g_theme[.Md_Rule]}})
+		return
+	case .Fence_Open:
+		r := m.fence_radius
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop}, size = {x1 - cx, lay.h}, color = g_theme[.Md_Code_Bg], radius = {r, r, 0, 0}}})
+		return
+	case .Fence_Close:
+		r := m.fence_radius
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop}, size = {x1 - cx, lay.h}, color = g_theme[.Md_Code_Bg], radius = {0, 0, r, r}}})
+		return
+	case .Table:
+		if c := md_table_ensure(doc, text, lay.start); c != nil {
+			cw := plat.text_char_width(text, m.table, .Doc)
+			// The baseline inside the row: the row's top plus its ascent, so a
+			// table row sits on the same rhythm every other block does.
+			asc, _, _ := plat.text_vmetrics(text, m.table, .Doc)
+			md_draw_table_row(gfx, qp, text, c, lay.src, cx, x1, ytop + asc, m.table, cw, lay.cls.is_sep)
+		}
+		return
+	case .Fence_Body:
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop}, size = {x1 - cx, lay.h}, color = g_theme[.Md_Code_Bg]}})
+	case .Quote:
+		// One bar per nesting level (9.2 item 7: "2px bar + 16px inset per
+		// level"), so a reply inside a reply is visibly deeper. The step comes
+		// out of the block's own indent rather than from m.quote_inset again --
+		// the layout set indent = level * quote_inset, so dividing it back is the
+		// same number by construction and cannot drift from it (L2).
+		step := lay.indent / f32(max(1, lay.cls.level))
+		for d in 0 ..< lay.cls.level {
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(sx(2), 2), lay.h}, color = g_theme[.Md_Quote]}})
+		}
+	case .List:
+		lx := cx + lay.marker // md_layout_build's own number, not a second copy
+		if lay.cls.task {
+			// A real box, not literal brackets, and the TICK carries the state as
+			// well as the tone -- never colour alone (UI spec 18).
+			bs := m.task_box
+			asc, _, _ := plat.text_vmetrics(text, m.body, .Body)
+			by := ytop + max(0, asc - bs)
+			edge := hairline()
+			bc := g_theme[.Accent] if lay.cls.task_done else g_theme[.Text_Muted]
+			bq: [4 + MD_TICK_STEPS * 2]plat.Quad
+			bq[0] = {pos = {lx, by}, size = {bs, edge}, color = bc}
+			bq[1] = {pos = {lx, by + bs - edge}, size = {bs, edge}, color = bc}
+			bq[2] = {pos = {lx, by}, size = {edge, bs}, color = bc}
+			bq[3] = {pos = {lx + bs - edge, by}, size = {edge, bs}, color = bc}
+			nq := 4
+			if lay.cls.task_done {nq += md_tick_quads(lx, by, bs, g_theme[.Accent], bq[4:])}
+			plat.quads_draw(gfx, qp, bq[:nq])
+		} else if len(lay.cls.bullet) > 0 {
+			asc, _, _ := plat.text_vmetrics(text, m.body, .Body)
+			plat.text_draw(gfx, text, lay.cls.bullet, lx, ytop + asc, m.body, g_theme[.Accent], .Body)
+		}
+	case .Heading:
+	case .Para:
+	}
+
+	// --- span decorations, then the glyphs -----------------------------------
+	//
+	// Every rectangle below comes from lay.boxes, which md_span_boxes produced
+	// from the shaper's own glyph positions. The inline-code background, the
+	// strike rule and the link underline are therefore the SAME geometry the
+	// link hit-test accepts; there is no second derivation anywhere.
+	for b in lay.boxes {
+		if b.span < 0 || b.span >= len(lay.spans) {continue}
+		sp := lay.spans[b.span]
+		bx, by := x + b.x, ytop + b.y
+		if .Code in sp.style && .Link not_in sp.style {
+			r := m.code_radius
+			pad := max(1, m.code_radius * 0.5)
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {bx - pad, by}, size = {b.w + pad * 2, b.h}, color = g_theme[.Md_Code_Bg], radius = {r, r, r, r}}})
+		}
+	}
+	colors := make([][4]f32, len(lay.spans), context.temp_allocator)
+	for s, i in lay.spans {colors[i] = s.color}
+	plat.shaped_draw(gfx, text, &lay.sh, lay.shape, x, ytop, g_theme[.Text_Primary], colors)
+	// Synthetic emphasis, only where a real face is missing. With Georgia loaded
+	// this never runs; on a machine whose body family ships no bold it is what
+	// keeps a heading from rendering at weight 400. The second pass draws ONLY
+	// the emphasised spans -- shaped_draw skips a glyph whose colour is fully
+	// transparent -- so it cannot embolden the prose around them.
+	if !plat.text_has_style(text, .Body, .Bold) {
+		any := false
+		for s, i in lay.spans {
+			if .Bold in s.style && .Code not_in s.style {
+				colors[i] = s.color
+				any = true
+			} else {
+				colors[i] = {0, 0, 0, 0}
+			}
+		}
+		if any {plat.shaped_draw(gfx, text, &lay.sh, lay.shape, x + hairline(), ytop, g_theme[.Text_Primary], colors)}
+	}
+	for b in lay.boxes {
+		if b.span < 0 || b.span >= len(lay.spans) {continue}
+		sp := lay.spans[b.span]
+		if .Strike not_in sp.style {continue}
+		// At the x-height centre per UI spec 9.2 -- through the middle of the
+		// lowercase, not through the baseline, or it reads as a slipped
+		// underline.
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x + b.x, ytop + b.baseline - lay.shape[b.span].px * 0.28}, size = {b.w, hairline()}, color = sp.color}})
+	}
+	// h1 and h2 carry a rule (9.2 item 1), on the LAST row of the block's own
+	// height -- md_layout_build already made room for it, so this consumes that
+	// height rather than reaching past it.
+	if lay.cls.kind == .Heading && md_head_rules(lay.cls.level) {
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop + lay.h - hairline()}, size = {x1 - cx, hairline()}, color = g_theme[.Md_Rule]}})
+	}
+}
+
 
 @(private = "file")
 md_heading_level :: proc(s: string) -> int {
@@ -1717,8 +3302,12 @@ md_list :: proc(line: string) -> (bullet, content: string, depth: int) {
 	// ordered: digits then '.' or ')'
 	j := 0
 	for j < len(rest) && rest[j] >= '0' && rest[j] <= '9' {j += 1}
+	// A SLICE of `line`, not a clone: the block layout cache holds an owned copy
+	// of the source line and every field of Md_Class points into it, so a marker
+	// cloned into the frame arena here would dangle the moment the cache outlived
+	// the frame that built it.
 	if j > 0 && j + 1 < len(rest) && (rest[j] == '.' || rest[j] == ')') && rest[j + 1] == ' ' {
-		return strings.clone(rest[:j + 1], context.temp_allocator), strings.trim_left(rest[j + 2:], " "), depth
+		return rest[:j + 1], strings.trim_left(rest[j + 2:], " "), depth
 	}
 	return "", "", 0
 }

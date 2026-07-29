@@ -33,6 +33,43 @@ when NEWTPAD_TESTS {
 		fmt.printfln("%-22s -> %-16v %s", label, got, ok)
 	}
 
+	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the
+	// icontest mode's independent PNG decoder below. File-scope (not local to
+	// the icontest block) because Odin's nested proc declarations don't close
+	// over enclosing local variables -- these need to be visible from several
+	// nested `ico_*` decode procs.
+	@(private = "file")
+	Ico_Code_Info :: struct {
+		base, extra: int,
+	}
+	@(private = "file")
+	ico_length_info := [29]Ico_Code_Info {
+		{3, 0}, {4, 0}, {5, 0}, {6, 0}, {7, 0}, {8, 0}, {9, 0}, {10, 0},
+		{11, 1}, {13, 1}, {15, 1}, {17, 1},
+		{19, 2}, {23, 2}, {27, 2}, {31, 2},
+		{35, 3}, {43, 3}, {51, 3}, {59, 3},
+		{67, 4}, {83, 4}, {99, 4}, {115, 4},
+		{131, 5}, {163, 5}, {195, 5}, {227, 5},
+		{258, 0},
+	}
+	@(private = "file")
+	ico_distance_info := [30]Ico_Code_Info {
+		{1, 0}, {2, 0}, {3, 0}, {4, 0},
+		{5, 1}, {7, 1},
+		{9, 2}, {13, 2},
+		{17, 3}, {25, 3},
+		{33, 4}, {49, 4},
+		{65, 5}, {97, 5},
+		{129, 6}, {193, 6},
+		{257, 7}, {385, 7},
+		{513, 8}, {769, 8},
+		{1025, 9}, {1537, 9},
+		{2049, 10}, {3073, 10},
+		{4097, 11}, {6145, 11},
+		{8193, 12}, {12289, 12},
+		{16385, 13}, {24577, 13},
+	}
+
 	// Guard for any headless mode that writes settings.txt, session.txt, or crash
 	// backups. Without NEWTPAD_SESSION_DIR set, session_dir() falls back to the
 	// real %APPDATA%\Newtpad (see session_dir's own doc comment), so a bare
@@ -1885,6 +1922,127 @@ when NEWTPAD_TESTS {
 				if !ok {bad^ += 1}
 				fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", label)
 			}
+			// The styled body faces §9.3's weight column needs (batch 17 task 2a).
+			// Its own proc, and its own plat.Text, for two reasons: the locals are
+			// large and test_mode_dispatch's frame has overflowed twice, and the
+			// checks below are about a FRESHLY loaded Text — the block above
+			// deliberately reloads .UI and .Doc onto other families, and asserting
+			// "the styled chains came from BODY_FAMILIES" against a Text somebody
+			// else has been rearranging proves less than it looks like it does.
+			fnt_styles :: proc(bad: ^int) {
+				fmt.println("--- styled body faces (§9.3 weight 700) ---")
+
+				// 1. FONT_SETS is a bijection from (base, style) to member.
+				//    A copy-pasted row -- .Body_Italic left saying {.Body, .Bold}
+				//    -- would make one member unreachable from text_styled_set and
+				//    silently draw bold where italic was asked for, with every
+				//    other check here still green because the bold face IS real.
+				dup := false
+				for a in plat.Font_Set {
+					ab, as_ := plat.font_set_def(a)
+					// A base must be its own family's regular member, or the
+					// whole grid is hanging off a member that is itself styled.
+					bb, bs := plat.font_set_def(ab)
+					if bb != ab || bs != .Regular {dup = true}
+					for b in plat.Font_Set {
+						if b == a {continue}
+						cb, cs := plat.font_set_def(b)
+						if cb == ab && cs == as_ {dup = true}
+					}
+				}
+				fnt_chk(bad, !dup, "FONT_SETS: every (base, style) pair names exactly one member")
+
+				// 2. font_style_file, the single producer of "which file is this
+				//    style", driven with families this machine may not have. The
+				//    no-bold case is the one that matters: it is what keeps the
+				//    caller's synthetic emphasis reachable, and on a machine where
+				//    every installed family ships all four files it is otherwise
+				//    never executed.
+				full := plat.Font_Family{"F", "r.ttf", "b.ttf", "i.ttf", "z.ttf"}
+				none := plat.Font_Family{"N", "r.ttf", "", "", ""}
+				boldonly := plat.Font_Family{"B", "r.ttf", "b.ttf", "", ""}
+				f1, g1 := plat.font_style_file(full, .Bold)
+				f2, g2 := plat.font_style_file(full, .Bold_Italic)
+				f3, g3 := plat.font_style_file(none, .Bold)
+				f4, g4 := plat.font_style_file(none, .Italic)
+				f5, g5 := plat.font_style_file(boldonly, .Bold_Italic)
+				f6, g6 := plat.font_style_file(full, .Regular)
+				fnt_chk(bad, f1 == "b.ttf" && g1 == .Bold, "font_style_file: a complete family returns its own bold file")
+				fnt_chk(bad, f2 == "z.ttf" && g2 == .Bold_Italic, "font_style_file: ...and its own bold-italic file")
+				fnt_chk(bad, f6 == "r.ttf" && g6 == .Regular, "font_style_file: regular is the regular file")
+				fnt_chk(bad, f3 == "r.ttf" && g3 == .Regular, "font_style_file: NO bold file -> regular file AND got=.Regular")
+				fnt_chk(bad, f4 == "r.ttf" && g4 == .Regular, "font_style_file: no italic file -> regular file AND got=.Regular")
+				fnt_chk(bad, f5 == "b.ttf" && g5 == .Bold, "font_style_file: bold-italic degrades to bold before regular")
+
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fnt_chk(bad, false, "text_load_faces (styled section)")
+					return
+				}
+				px := f32(16)
+
+				// 3. The styled body chains loaded the BODY family, not the mono
+				//    one. find_family tests FONT_SETS[set].base rather than
+				//    `set == .Body`; with the naive test every styled chain would
+				//    have silently been Consolas, and a monospace chain is exactly
+				//    what "i and W advance the same" detects.
+				for s in ([]plat.Font_Set{.Body_Bold, .Body_Italic, .Body_Bold_Italic}) {
+					ai := plat.text_advance(nil, &t, 'i', px, s)
+					aW := plat.text_advance(nil, &t, 'W', px, s)
+					fmt.printfln("    %v: i=%.4f W=%.4f  em=%.4f", s, ai, aW, plat.text_char_em(&t, s))
+					fnt_chk(bad, aW > ai * 1.5, fmt.tprintf("%v is proportional (it came from BODY_FAMILIES, not Consolas)", s))
+				}
+
+				// 4. A REAL bold face, not the regular one wearing the name. If
+				//    text_load_body_face never loaded georgiab.ttf, .Body_Bold's
+				//    chain is byte-for-byte .Body's, so every one of these is an
+				//    exact equality and the check cannot pass by luck.
+				em_r := plat.text_char_em(&t, .Body)
+				em_b := plat.text_char_em(&t, .Body_Bold)
+				em_i := plat.text_char_em(&t, .Body_Italic)
+				em_z := plat.text_char_em(&t, .Body_Bold_Italic)
+				fmt.printfln("    body em: regular=%.5f bold=%.5f italic=%.5f bolditalic=%.5f", em_r, em_b, em_i, em_z)
+				fnt_chk(bad, em_b != em_r, "the bold body chain measures differently from the regular one")
+				fnt_chk(bad, em_i != em_r, "...and so does the italic one")
+				fnt_chk(bad, em_z != em_r, "...and the bold-italic one")
+				// em alone would also move if the chain had loaded some OTHER
+				// family, so pin the PIXELS too: the same rune at the same size
+				// out of a different file rasterizes to different coverage.
+				//
+				// The checksum, not the box: Georgia Italic's 'W' at 24px is the
+				// same 26x17 box as Georgia Regular's, so the box comparison this
+				// replaced went red against a correctly-loaded italic face. That
+				// was the test being wrong, not the loader.
+				wr, hr, ir, sr := plat.text_glyph_coverage_probe(&t, 'W', 24, .Body)
+				wb, hb, ib, sb := plat.text_glyph_coverage_probe(&t, 'W', 24, .Body_Bold)
+				wi, hi, ii, si := plat.text_glyph_coverage_probe(&t, 'W', 24, .Body_Italic)
+				fmt.printfln("    'W' @24px: regular %dx%d cov=%d  bold %dx%d cov=%d  italic %dx%d cov=%d", wr, hr, sr, wb, hb, sb, wi, hi, si)
+				fnt_chk(bad, ir && ib && ii && sr > 0, "(precondition) all three rasterize real coverage")
+				fnt_chk(bad, sb != sr, "bold 'W' rasterizes to different pixels than regular 'W'")
+				fnt_chk(bad, si != sr, "italic 'W' rasterizes to different pixels than regular 'W'")
+
+				// 5. The lookup a caller actually uses.
+				fnt_chk(bad, plat.text_styled_set(&t, .Body, .Bold) == .Body_Bold, "text_styled_set(.Body, .Bold) == .Body_Bold")
+				fnt_chk(bad, plat.text_styled_set(&t, .Body, .Italic) == .Body_Italic, "text_styled_set(.Body, .Italic) == .Body_Italic")
+				fnt_chk(bad, plat.text_styled_set(&t, .Body, .Regular) == .Body, "text_styled_set(.Body, .Regular) == .Body")
+				// Idempotent: asking a styled set for another style resolves
+				// through its base, so a caller holding .Body_Bold can still ask
+				// for italic without knowing it is already styled.
+				fnt_chk(bad, plat.text_styled_set(&t, .Body_Bold, .Italic) == .Body_Italic, "asking an already-styled set for another style goes via its base")
+				fnt_chk(bad, plat.text_styled_set(&t, .Body_Bold, .Regular) == .Body, "...and .Regular takes it back to the base")
+				fnt_chk(bad, plat.text_has_style(&t, .Body, .Bold), "text_has_style(.Body, .Bold)")
+
+				// 6. The cell grid keeps no styled members, so markdown.odin's
+				//    hairline double-draw stays the answer for .UI and .Doc. This
+				//    is the regression the brief calls out: a caller that switched
+				//    blindly to text_styled_set must get the same set back here.
+				for s in ([]plat.Font_Set{.UI, .Doc}) {
+					for st in ([]plat.Font_Style{.Bold, .Italic, .Bold_Italic}) {
+						fnt_chk(bad, plat.text_styled_set(&t, s, st) == s, fmt.tprintf("%v has no real %v face: styled_set returns %v itself", s, st, s))
+						fnt_chk(bad, !plat.text_has_style(&t, s, st), fmt.tprintf("...and text_has_style(%v, %v) is false, so synthetic emphasis stays", s, st))
+					}
+				}
+			}
 			t: plat.Text
 			if !plat.text_load_faces(&t) {
 				fmt.eprintln("fonttest: no fonts loaded")
@@ -2016,6 +2174,8 @@ when NEWTPAD_TESTS {
 				if !(unchanged && differs) {bad += 1}
 				plat.text_load_family(&t, "Consolas", .Regular, .Doc)
 			}
+
+			fnt_styles(&bad)
 
 			fmt.printfln("fonttest: %d failures", bad)
 			return true
@@ -3226,9 +3386,16 @@ when NEWTPAD_TESTS {
 			}
 
 			px_ := f32(24)
-			char_w := plat.text_char_width(&h.text, px_, .Doc)
 			x0, x1 := f32(40), f32(900)
 			ytop, ybot := f32(60), f32(650)
+			// The type scale and the content origin, from the SAME producers the
+			// draw reads (batch 17). Every sample window below is derived from
+			// these rather than from `char_w` multiples: the preview is
+			// proportional now, so a cell count no longer names a pixel, and a
+			// window guessed in cells would drift onto the wrong glyph without any
+			// assertion noticing.
+			m := md_metrics(&h.text, px_)
+			cx, measure := md_content_span(&m, x0, x1)
 
 			// --- a done item's prose lands where an undone item's does, muted --
 			// not muted twice (Finding 1/2), and not left at full strength either.
@@ -3261,22 +3428,48 @@ when NEWTPAD_TESTS {
 					copy(content, src)
 					return doc_from_content(content, "t.md", .UTF8)
 				}
-				// The glyph cell right after the checkbox + its gap, same geometry
-				// markdown_draw itself computes for the task branch.
-				gx0 := int(x0 + char_w * 1.4 + char_w)
-				gx1 := int(x0 + char_w * 1.4 + char_w * 2.2)
-				// ...and the code span: md_inline splits `IIII \`II\`` into the
-				// plain word "IIII " (5 cells, trailing space kept by
-				// md_draw_inline's word split) and then the code run, so the code
-				// run's first cell starts 5 cells further right.
-				cx0 := int(x0 + char_w * 1.4 + char_w * 6)
-				cx1 := int(x0 + char_w * 1.4 + char_w * 7.2)
+				// WHERE the two glyph runs land, shaped rather than guessed.
+				//
+				// md_inline splits the fixture into the plain run "IIII " (the
+				// trailing space belongs to it) and the code run "II", and
+				// md_layout_build gives them the body face at m.body and the mono
+				// face at m.code. Shaping that exact span pair through the exact same
+				// shaper the layout uses is what says where span 1 starts -- there is
+				// no cell arithmetic that can answer it, because a proportional 'I' is
+				// not a cell wide.
+				//
+				// A second producer of these positions, yes -- deliberately, and only
+				// in the test: it drives plat.shape_spans directly, so it can disagree
+				// with the layout only if the layout stopped going through the shaper.
+				task_ind := m.task_box + m.list_indent * 0.25
+				probe_spans := []plat.Shape_Span{
+					{text = "IIII ", px = m.body, set = .Body},
+					{text = "II", px = m.code, set = .Doc},
+				}
+				probe := plat.shape_spans(&h.gfx, &h.text, probe_spans, measure - task_ind, m.body_lead, context.temp_allocator)
+				span_x :: proc(s: ^plat.Shaped, span: int) -> (lo, hi: f32, found: bool) {
+					for g in s.glyphs {
+						if int(g.span) != span {continue}
+						if !found {lo, hi, found = g.x, g.x, true}
+						lo, hi = min(lo, g.x), max(hi, g.x)
+					}
+					return
+				}
+				plo, phi, pfound := span_x(&probe, 0)
+				clo, chi, cfound := span_x(&probe, 1)
+				dchk(&bad, pfound && cfound, "task items: the probe shaped both spans")
+				bx := cx + task_ind
+				// A narrow window at each run's FIRST glyph: a wider one would let the
+				// peak scan wander onto the neighbouring run and pass while sampling
+				// something else entirely.
+				gx0, gx1 := int(bx + plo), int(bx + plo + (phi - plo) / 3 + 2)
+				cx0, cx1 := int(bx + clo), int(bx + chi + 2)
 				gy0 := int(ytop)
-				gy1 := int(ytop + px_ * 1.3)
-				render :: proc(h: ^Headless_Gpu, doc: ^Document, x0, x1, ytop, ybot, px_, char_w: f32) -> (buf: []u8, ok: bool) {
+				gy1 := int(ytop + probe.height)
+				render :: proc(h: ^Headless_Gpu, doc: ^Document, x0, x1, ytop, ybot, px_: f32) -> (buf: []u8, ok: bool) {
 					bg := g_theme[.Bg_Base]
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, char_w, x0, x1, ytop, ybot, 0)
+					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 					return plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				}
 				// The sample FARTHEST from the background is the pixel closest to
@@ -3296,10 +3489,10 @@ when NEWTPAD_TESTS {
 					return best > 0, b, g, r
 				}
 				doc_done := mk(true)
-				buf_d, ok_d := render(&h, &doc_done, x0, x1, ytop, ybot, px_, char_w)
+				buf_d, ok_d := render(&h, &doc_done, x0, x1, ytop, ybot, px_)
 				doc_close(&doc_done)
 				doc_undone := mk(false)
-				buf_u, ok_u := render(&h, &doc_undone, x0, x1, ytop, ybot, px_, char_w)
+				buf_u, ok_u := render(&h, &doc_undone, x0, x1, ytop, ybot, px_)
 				doc_close(&doc_undone)
 				dchk(&bad, ok_d && ok_u, "task items: both readbacks succeeded")
 				if ok_d && ok_u {
@@ -3371,7 +3564,13 @@ when NEWTPAD_TESTS {
 				fm_end, fm_inner := md_front_matter_end(&doc)
 				dchk(&bad, fm_inner == inner, fmt.tprintf("front matter fixture: inner lines counted as %d (want %d)", fm_inner, inner))
 
-				line_h := line_height(px_)
+				// The card's own line height is the CODE face's, not the body
+				// document's (batch 17): front matter is YAML source and 9.3 puts
+				// source on the mono face. The card's height, the rows
+				// md_draw_front_matter writes onto it and this test's expected row
+				// positions all come from this ONE number, exactly as they all came
+				// from line_height(px_) before it.
+				line_h := line_height(m.code)
 				bg := g_theme[.Bg_Base]
 
 				// `bottom` alone, on a doc with NOTHING after the closing fence:
@@ -3388,12 +3587,12 @@ when NEWTPAD_TESTS {
 					bare_doc := doc_from_content(bare_content, "fmbare.md", .UTF8)
 					defer doc_close(&bare_doc)
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					bare_bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &bare_doc, px_, char_w, x0, x1, ytop, ybot, 0)
+					bare_bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &bare_doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 					dchk(&bad, bare_bottom == fm_end, fmt.tprintf("front matter: with nothing after it, markdown_draw's `bottom` (%d) is md_front_matter_end's `end` (%d)", bare_bottom, fm_end))
 				}
 
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, 0)
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 				buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				dchk(&bad, ok, "front matter: readback")
 				if ok {
@@ -3402,8 +3601,18 @@ when NEWTPAD_TESTS {
 					// darks only ~7-8/255 apart per channel in Dark, so a loose
 					// bound would call the bare background "the card" and this
 					// check would pass whether or not anything was drawn.
-					cb, cg, cr, _ := sample(buf, W, int(x0) + 3, int(ytop) + 3)
+					// Sampled from the CONTENT origin, not from the pane edge (batch
+					// 17): 9.3 gives the preview a 40px left padding, so the card's
+					// top-left corner is at md_content_span's cx. x0 + 3 is inside
+					// that padding and is bare canvas now -- the assertion moved to
+					// where the card is, it did not loosen.
+					cb, cg, cr, _ := sample(buf, W, int(cx) + 3, int(ytop) + 3)
 					dchk(&bad, near(g_theme[.Md_Code_Bg], cb, cg, cr, 3), "front matter: the card is drawn (Md_Code_Bg at its top-left corner)")
+					// ...and the 40px padding to its LEFT really is bare canvas, or
+					// "the card starts at cx" would also be satisfied by a card that
+					// starts further left and happens to cover cx.
+					pb, pg, pr, _ := sample(buf, W, int(x0) + 3, int(ytop) + 3)
+					dchk(&bad, !near(g_theme[.Md_Code_Bg], pb, pg, pr, 3), "front matter: the 40px left padding is not part of the card")
 
 					// The RULE line ("***") right after the block is a SOLID,
 					// unantialiased-interior quad -- unlike prose, its colour is
@@ -3411,16 +3620,25 @@ when NEWTPAD_TESTS {
 					// with no glyph coverage guesswork. Expected row is computed
 					// INDEPENDENTLY, from md_fm_height/md_fm_pad, not by copying
 					// markdown_draw's increments.
-					rule_y := ytop + px_ * 0.5 + md_fm_height(line_h, fm_inner)
-					rb, rg, rr, _ := sample(buf, W, int(x0) + 50, int(rule_y) + int(hairline() * 0.5))
+					// RESTATED for the block model: the gap between two blocks is
+					// max(upper.below, lower.above) -- adjacent margins collapse -- so
+					// the rule's top is the card's bottom plus that gap, and the
+					// old `px_ * 0.5` (the half-row a blank line used to advance) has
+					// nothing left to describe. Both terms come from md_metrics and
+					// md_fm_height, i.e. from the producers, not from md_pass's own
+					// increments. NOTE: at px_=24 the old expression happens to give
+					// the same 226 as this one, so leaving it alone would have left a
+					// green assertion that describes nothing.
+					rule_y := ytop + md_fm_height(line_h, fm_inner) + max(m.para_below, m.rule_gap)
+					rb, rg, rr, _ := sample(buf, W, int(cx) + 50, int(rule_y) + int(hairline() * 0.5))
 					dchk(
 						&bad, near(g_theme[.Md_Rule], rb, rg, rr, 10),
-						fmt.tprintf("front matter: the rule after the block sits exactly at md_fm_height's row (y=%.1f)", rule_y),
+						fmt.tprintf("front matter: the rule after the block sits exactly at md_fm_height + the collapsed gap (y=%.1f)", rule_y),
 					)
 					// A row clearly ABOVE that must NOT already be the rule -- or
 					// "found the rule somewhere" could pass by accident from a
 					// too-generous scan.
-					ab, ag, ar, _ := sample(buf, W, int(x0) + 50, int(rule_y) - 6)
+					ab, ag, ar, _ := sample(buf, W, int(cx) + 50, int(rule_y) - 6)
 					dchk(&bad, !near(g_theme[.Md_Rule], ab, ag, ar, 10), "front matter: 6px above that row is NOT the rule (bound is tight, not a scan)")
 
 					// --- item 3 (2026-07-29): the `---` delimiters are BACK,
@@ -3479,14 +3697,19 @@ when NEWTPAD_TESTS {
 					// card" check below passed against a card two rows too
 					// short. Stating the row index makes the card the only
 					// thing that can move.
-					open_base := card_top + pad + px_
+					// px_ -> m.code and x0 -> cx (batch 17): the card's rows are drawn
+					// at the code size on the mono face, from the content origin. Both
+					// substitutions come from md_block_draw's own arguments to
+					// md_draw_front_matter, which is the single producer of this text.
+					open_base := card_top + pad + m.code
 					close_base := open_base + f32(fm_inner + 1) * line_h
-					dx0, dx1 := int(x0 + char_w) + 1, int(x0 + char_w * 4)
+					fm_cw := plat.text_char_width(&h.text, m.code, .Doc)
+					dx0, dx1 := int(cx + fm_cw) + 1, int(cx + fm_cw * 4)
 					for c in ([]struct {
 						base: f32,
 						what: string,
 					}{{open_base, "opening"}, {close_base, "closing"}}) {
-						d, db, dg, dr := fm_peak(buf, dx0, dx1, int(c.base - px_ * 0.9), int(c.base + px_ * 0.15), W, H)
+						d, db, dg, dr := fm_peak(buf, dx0, dx1, int(c.base - m.code * 0.9), int(c.base + m.code * 0.15), W, H)
 						// The full separation between Text_Muted and
 						// Md_Code_Bg in Dark, summed over three channels, is
 						// ~319, and the hyphen's interior MEASURES 320 -- it
@@ -3514,10 +3737,10 @@ when NEWTPAD_TESTS {
 					// bare surface and not glyph ink. With the pre-item-3 height
 					// (inner rows only) this y is past the card's bottom edge and
 					// reads Bg_Base.
-					sb, sg, sr, _ := sample(buf, W, int(x0) + 300, int(close_base - px_ * 0.5))
+					sb, sg, sr, _ := sample(buf, W, int(cx) + 300, int(close_base - m.code * 0.5))
 					dchk(
 						&bad, near(g_theme[.Md_Code_Bg], sb, sg, sr, 3),
-						fmt.tprintf("front matter: the closing `---` row is INSIDE the card (surface at y=%.0f is bgr %d,%d,%d)", close_base - px_ * 0.5, sb, sg, sr),
+						fmt.tprintf("front matter: the closing `---` row is INSIDE the card (surface at y=%.0f is bgr %d,%d,%d)", close_base - m.code * 0.5, sb, sg, sr),
 					)
 					// (c): no rule inside the card. A run, not a pixel count --
 					// an antialiased glyph edge blends card -> Text_Muted and
@@ -3528,7 +3751,7 @@ when NEWTPAD_TESTS {
 					worst_run := 0
 					for yy in int(card_top) ..< min(H, int(card_bot)) {
 						run := 0
-						for xx in int(x0) + 1 ..< min(W, int(x1) - 1) {
+						for xx in int(cx) + 1 ..< min(W, int(x1) - 1) {
 							rb2, rg2, rr2, _ := sample(buf, W, xx, yy)
 							if near(g_theme[.Md_Rule], rb2, rg2, rr2, 6) {
 								run += 1
@@ -3541,61 +3764,155 @@ when NEWTPAD_TESTS {
 					// short of the full-width run a restored Md_Rule would give.
 					dchk(
 						&bad, worst_run < 60,
-						fmt.tprintf("front matter: no Md_Rule spans the card (longest Md_Rule-coloured run inside it: %dpx of %.0f)", worst_run, x1 - x0),
+						fmt.tprintf("front matter: no Md_Rule spans the card (longest Md_Rule-coloured run inside it: %dpx of %.0f)", worst_run, x1 - cx),
 					)
 				}
 
 				// The p==0 gate: scrolled to start exactly at the front matter's
 				// end, the card must NOT be drawn at all.
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				bottom2 := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, fm_end)
+				bottom2 := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{fm_end, 0})
 				dchk(&bad, bottom2 > fm_end, "front matter: scrolled past it, markdown_draw advances past fm_end (the rule line), not stuck")
 				buf2, ok2 := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				if ok2 {
-					cb, cg, cr, _ := sample(buf2, W, int(x0) + 3, int(ytop) + 3)
+					cb, cg, cr, _ := sample(buf2, W, int(cx) + 3, int(ytop) + 3)
 					// Same tight tolerance as the presence check above, for the
 					// same reason: Bg_Base sits within a loose bound of
 					// Md_Code_Bg, which would make an undrawn card look drawn.
 					dchk(&bad, !near(g_theme[.Md_Code_Bg], cb, cg, cr, 3), "front matter: scrolled past it, NO card is drawn (the p==0 gate)")
 				}
 			}
+
+			// --- a heading draws in Md_Heading, not Text_Bright ------------------
+			//
+			// 9.3 gives every heading level its own colour role. The preview used
+			// Text_Bright -- the plain-prose emphasis tier -- so headings were the
+			// same near-white as bold body text and the six levels were told apart
+			// by size alone. Reverting `base_col = g_theme[.Md_Heading]` to
+			// `g_theme[.Text_Bright]` left mdtest, mdviewtest, blurtest and
+			// themetest green (2026-07-29 review, M3): nothing sampled a heading's
+			// ink at all.
+			//
+			// "IIIIII" for the same reason the task-item fixture uses it: a stack of
+			// vertical strokes gives a near-full-coverage interior pixel, so the
+			// peak sample is the glyph's resolved colour rather than an antialiased
+			// blend. Every level, because the role is assigned per level in 9.3 and
+			// a fix that only reached h1 would be a different bug.
+			{
+				hpeak :: proc(buf: []u8, gx0, gx1, gy0, gy1, W, H: int) -> (found: bool, b, g, r: u8) {
+					bg := g_theme[.Bg_Base]
+					best := -1
+					for yy in max(0, gy0) ..< min(H, gy1) {
+						for xx in max(0, gx0) ..< min(W, gx1) {
+							bb, gg, rr, _ := sample(buf, W, xx, yy)
+							d := abs(int(bb) - int(bg[2] * 255)) + abs(int(gg) - int(bg[1] * 255)) + abs(int(rr) - int(bg[0] * 255))
+							if d > best {best, b, g, r = d, bb, gg, rr}
+						}
+					}
+					return best > 40, b, g, r
+				}
+				// Non-degenerate: if the two roles carried the same value this
+				// whole section would pass against the bug it exists to reject.
+				head, bright := g_theme[.Md_Heading], g_theme[.Text_Bright]
+				sep := abs(int(head[0] * 255) - int(bright[0] * 255)) + abs(int(head[1] * 255) - int(bright[1] * 255)) + abs(int(head[2] * 255) - int(bright[2] * 255))
+				dchk(&bad, sep > 100, fmt.tprintf("heading colour: Md_Heading and Text_Bright are different roles (channel separation %d)", sep))
+				for lvl in 1 ..= 6 {
+					hashes := strings.repeat("#", lvl, context.temp_allocator)
+					src := strings.concatenate({hashes, " IIIIII\n"}, context.temp_allocator)
+					content := make([]u8, len(src))
+					copy(content, src)
+					doc := doc_from_content(content, "head.md", .UTF8)
+					bgc := g_theme[.Bg_Base]
+					plat.gfx_begin_frame(&h.gfx, bgc[0], bgc[1], bgc[2])
+					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+					doc_close(&doc)
+					pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if !pok {
+						dchk(&bad, false, fmt.tprintf("h%d colour: readback", lvl))
+						continue
+					}
+					// Bounded to the glyph band: h1 and h2 carry an Md_Rule line at
+					// the BOTTOM of their own block height, and this must sample the
+					// text rather than the decoration. The band starts at the
+					// heading's own space-ABOVE, which md_pass applies to the first
+					// block as well (`forced` waives the fit test, not the gap) --
+					// h2's 1.6 S of it put the glyphs below a window pinned at ytop.
+					hy := ytop + m.head_above[lvl]
+					fnd, b, g, r := hpeak(pix, int(cx), int(cx) + 300, int(hy), int(hy + m.head[lvl]), W, H)
+					dchk(&bad, fnd, fmt.tprintf("h%d colour: the heading's glyphs are on screen", lvl))
+					if !fnd {continue}
+					dchk(
+						&bad, near(head, b, g, r, 24) && !near(bright, b, g, r, 20),
+						fmt.tprintf("h%d draws in Md_Heading, not Text_Bright (bgr %d,%d,%d; want #%02X%02X%02X)", lvl, b, g, r, u8(head[0] * 255), u8(head[1] * 255), u8(head[2] * 255)),
+					)
+				}
+				// ...and emphasis INSIDE a heading keeps the heading's colour
+				// (2026-07-29 review, L7). md_run_color repaints a bold run
+				// Text_Bright, which is the exact override this section rejects,
+				// surviving in a sub-case: the heading already forces weight 700, so
+				// `**bold**` inside one has no face change left to make and the
+				// colour was carrying the emphasis alone.
+				{
+					src := "# **IIIIII**\n"
+					content := make([]u8, len(src))
+					copy(content, src)
+					doc := doc_from_content(content, "headbold.md", .UTF8)
+					bgc := g_theme[.Bg_Base]
+					plat.gfx_begin_frame(&h.gfx, bgc[0], bgc[1], bgc[2])
+					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+					doc_close(&doc)
+					pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if pok {
+						fnd, b, g, r := hpeak(pix, int(cx), int(cx) + 300, int(ytop), int(ytop + m.head[1]), W, H)
+						dchk(&bad, fnd, "heading colour: the bold-inside-a-heading fixture is on screen")
+						if fnd {
+							dchk(
+								&bad, near(head, b, g, r, 24) && !near(bright, b, g, r, 20),
+								fmt.tprintf("**bold** inside a heading keeps Md_Heading (bgr %d,%d,%d)", b, g, r),
+							)
+						}
+					}
+				}
+			}
 			return bad
 		}
 
-		// mdtest's HEADING-FIT checks (item 6, 2026-07-29 live-pass regressions).
+		// mdtest's BLOCK-FIT checks (item 6, 2026-07-29 live-pass regressions,
+		// restated for batch 17's block model).
 		//
-		// markdown_draw advanced `y` past a heading by `hh + (hpx - px) -
-		// px*0.3` while md_row_fits admitted the row on the BODY `line_h`. A
-		// heading near the bottom of the pane was therefore let in against a
-		// budget smaller than the space it actually needs, drawn taller than
-		// that budget, and then cut through the middle of its glyphs by the
-		// cover strip main.odin paints afterwards. There is no scissor rect
-		// anywhere in this renderer, so not admitting the row is the only way
-		// not to cut it.
+		// The defect: markdown_draw advanced past a heading by its own taller
+		// line height while the admit test used the BODY line height. A heading
+		// near the bottom of the pane was let in against a budget smaller than
+		// the space it needs, drawn taller than that budget, and cut through the
+		// middle of its glyphs by the cover strip main.odin paints afterwards.
+		// There is no scissor rect anywhere in this renderer, so not admitting
+		// the block is the only way not to cut it.
 		//
-		// Two independent assertions, PER HEADING LEVEL -- the six levels have
-		// six different sizes, and a fix that only got h1 right would sail
-		// through a single-level test:
+		// WHAT CHANGED, and why it is a correction rather than an accommodation.
+		// The old version's assertion 1 was geometric: it computed the heading's
+		// baseline itself as `ytop + px + 3*line_h`, which was only sayable
+		// because every row was exactly one body line high. Under the block model
+		// a paragraph's height comes from the shaper (proportional, soft-wrapped,
+		// clamped up to the face's own ascent + descent) and 9.3's space-between
+		// columns sit between blocks, so that expression is no longer true of
+		// anything -- and rewriting it would mean re-deriving the whole layout
+		// inside the test, which is a second producer of exactly the number under
+		// test. So assertion 1 is replaced by the PROPERTY it was a proxy for,
+		// asserted directly and at every ybot rather than at one:
 		//
-		//   1. GEOMETRIC, swept across every `ybot` in the window where the old
-		//      bound and the new one disagree. If markdown_draw drew the heading
-		//      at all, the heading's whole row [y-px, y-px+hh) must be above
-		//      ybot. `y` is known to the test independently -- the three rows
-		//      above the heading are plain paragraphs, each exactly line_h -- so
-		//      this compares markdown_draw's admit decision against arithmetic
-		//      the test states, not against markdown_draw's own.
-		//   2. PIXEL, at a ybot the old bound admits and the new one does not:
-		//      nothing may be drawn at or below ybot. The heading text carries
-		//      DESCENDERS on purpose. An all-caps heading's ink sits entirely
-		//      above its baseline and would clear ybot even with the row
-		//      overhanging, which makes the pixel check vacuous -- measured, not
-		//      assumed. Measured with the bound sabotaged back to `line_h`:
-		//      assertion 1 fails at all six levels, assertion 2 at h1 (674
-		//      inked pixels below ybot) and h2 (216). It does NOT fail at
-		//      h3..h6, whose rows exceed a body row by only 4-9px -- too little
-		//      for the overhang to push glyph ink past ybot at this font size.
-		//      Assertion 1 is what carries those levels, and that is why there
-		//      are two.
+		//   if markdown_draw admitted the heading, NOTHING it drew may sit at or
+		//   below ybot.
+		//
+		// That is strictly stronger than the pair it replaces (the old assertion
+		// 2 checked pixels at a single hand-picked ybot; this checks them at
+		// every ybot in the window, and covers the h1/h2 rule and the soft-wrap
+		// overhang the old geometric form could not see), and it needs no
+		// arithmetic of its own at all -- the only thing it reads back from the
+		// draw is `bottom`, which says whether the heading was admitted.
+		//
+		// The heading text carries DESCENDERS on purpose: an all-caps heading's
+		// ink sits entirely above its baseline and would clear ybot even with the
+		// block overhanging, which would make the pixel check vacuous.
 		//
 		// Its own procedure with its own device, and exactly ONE Document alive
 		// at a time: test_mode_dispatch's frame has hit STATUS_STACK_OVERFLOW
@@ -3618,14 +3935,37 @@ when NEWTPAD_TESTS {
 			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
 
 			px_ := f32(24)
-			char_w := plat.text_char_width(&h.text, px_, .Doc)
 			x0, x1, ytop := f32(40), f32(900), f32(60)
-			line_h := line_height(px_)
 			bg := g_theme[.Bg_Base]
-			// Three plain paragraph rows ahead of the heading, so the heading's
-			// baseline is `ytop + px + 3*line_h` by arithmetic the test owns.
+			m := md_metrics(&h.text, px_)
+			// Three plain paragraph blocks ahead of the heading, so the heading is
+			// never the block `forced` admits unconditionally.
 			LEAD :: "body\nbody\nbody\n"
-			y_head := ytop + px_ + 3 * line_h
+			// How many levels come out TALLER than a body block. At least one must,
+			// or the sweep below cannot reproduce the original overhang at all: a
+			// body-sized budget that is too LARGE refuses blocks that would fit
+			// (gratuitous whitespace), one too SMALL cuts glyphs (the reported bug).
+			taller := 0
+
+			// How much ink sits at or below `ybot`. Zero is the property.
+			ink_below :: proc(pix: []u8, ybot: f32, x0, x1: f32, W, H: int) -> (inked, topmost: int) {
+				bg := g_theme[.Bg_Base]
+				topmost = -1
+				for yy in max(0, int(ybot)) ..< H {
+					for xx in int(x0) ..< int(x1) {
+						i := (yy * W + xx) * 4
+						d :=
+							abs(int(pix[i]) - int(bg[2] * 255)) +
+							abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+							abs(int(pix[i + 2]) - int(bg[0] * 255))
+						if d > 24 {
+							inked += 1
+							if topmost < 0 {topmost = yy}
+						}
+					}
+				}
+				return
+			}
 
 			for lvl in 1 ..= 6 {
 				hashes := strings.repeat("#", lvl, context.temp_allocator)
@@ -3635,83 +3975,2278 @@ when NEWTPAD_TESTS {
 				copy(content, src)
 				doc := doc_from_content(content, "h.md", .UTF8)
 
-				hh := line_height(md_head_px(px_, lvl))
-				row_bot := y_head - px_ + hh
-				// Without this the whole case could be vacuous: if a level's row
-				// were no taller than a body row there would be nothing for the
-				// old bound to get wrong, and both assertions would pass on any
-				// implementation.
-				hchk(&bad, hh > line_h, fmt.tprintf("h%d: fixture is non-degenerate -- its row is %.0fpx against a body row's %.0f", lvl, hh, line_h))
-
-				// (1) Sweep the disagreement window: [old bound - 2, new bound + 2].
-				first_bad := -1
-				for yb := int(y_head - px_ + line_h) - 2; yb <= int(row_bot) + 2; yb += 1 {
-					ybot := f32(yb)
-					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot, 0)
-					// `bottom` is "just past the last line drawn": it only
-					// reaches the heading's line end if the heading was admitted.
-					if bottom >= head_end && row_bot > ybot && first_bad < 0 {first_bad = yb}
-				}
+				// Non-degeneracy, and it is not decoration: if a level's block were
+				// exactly a body block's height there would be nothing for a body-sized
+				// budget to get wrong, and the sweep below would pass against any
+				// implementation. Measured through the same shaper the layout uses, at
+				// the same measure, so it states what the block actually costs rather
+				// than a ratio copied out of 9.3.
+				//
+				// `hh != bh`, NOT `hh > bh` (batch 17). The old form held at every level
+				// only because md_head_px sized h5/h6 at 1.03 * S. 9.3 puts them at
+				// 1.00 * S -- "h6 is the same size as body, distinguished by caps +
+				// tracking, not size" -- and gives a heading a heading's tighter leading
+				// rather than a paragraph's 1.65, so h4-h6 now come out SHORTER than a
+				// body block. Keeping `>` would have been asserting a type scale the
+				// spec does not have; what the precondition actually needs is that a
+				// body-sized budget is the WRONG budget for this block, which is what
+				// `!=` says. The direction that reproduces the original defect is
+				// covered by the separate check after the loop.
+				cx, measure := md_content_span(&m, x0, x1)
+				_ = cx
+				hh := plat.shape_run(&h.gfx, &h.text, "Hgjpqy", m.head[lvl], measure, line_height(m.head[lvl]), .Body, context.temp_allocator).height
+				bh := plat.shape_run(&h.gfx, &h.text, "body", m.body, measure, m.body_lead, .Body, context.temp_allocator).height
+				if hh > bh {taller += 1}
 				hchk(
-					&bad, first_bad < 0,
-					fmt.tprintf("h%d: never admitted with its row overhanging (row ends at %.0f; first bad ybot %d)", lvl, row_bot, first_bad),
+					&bad, hh != bh,
+					fmt.tprintf("h%d: fixture is non-degenerate -- its block is %.0fpx against a body block's %.0f", lvl, hh, bh),
 				)
 
-				// (2) One ybot inside the old bound's admit range and outside the
-				// new one, read back and scanned for ink below the content box.
-				ybot_pix := y_head - px_ + line_h + 1
-				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ybot_pix, 0)
-				if pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); ok {
-					inked, wy := 0, -1
-					for yy in int(ybot_pix) ..< H {
-						for xx in int(x0) ..< int(x1) {
-							i := (yy * W + xx) * 4
-							d :=
-								abs(int(pix[i]) - int(bg[2] * 255)) +
-								abs(int(pix[i + 1]) - int(bg[1] * 255)) +
-								abs(int(pix[i + 2]) - int(bg[0] * 255))
-							if d > 24 {
-								inked += 1
-								if wy < 0 {wy = yy}
-							}
-						}
+				// Sweep every ybot across the window where the heading goes from
+				// "admitted" to "not admitted", plus a margin either side. At every
+				// one of them: admitted implies nothing at or below ybot.
+				worst_yb, worst_ink, worst_top := -1, 0, -1
+				admitted, refused := 0, 0
+				for yb := int(ytop) + 1; yb <= H - 1; yb += 1 {
+					ybot := f32(yb)
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					// `bottom` is "just past the last line drawn": it only reaches
+					// the heading's line end if the heading was admitted.
+					bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+					if bottom < head_end {
+						refused += 1
+						continue
 					}
-					hchk(
-						&bad, inked == 0,
-						fmt.tprintf("h%d: nothing drawn at or below ybot=%.0f (%d inked pixels, topmost at y=%d)", lvl, ybot_pix, inked, wy),
-					)
-				} else {
-					hchk(&bad, false, fmt.tprintf("h%d: readback", lvl))
+					admitted += 1
+					pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if !ok {continue}
+					if inked, top := ink_below(pix, ybot, x0, x1, W, H); inked > 0 && worst_yb < 0 {
+						worst_yb, worst_ink, worst_top = yb, inked, top
+					}
 				}
+				// Both counts non-zero, or the sweep never crossed the boundary and
+				// the assertion above it is about nothing.
+				hchk(
+					&bad, admitted > 0 && refused > 0,
+					fmt.tprintf("h%d: the sweep really crosses the admit boundary (%d admitted, %d refused)", lvl, admitted, refused),
+				)
+				hchk(
+					&bad, worst_yb < 0,
+					fmt.tprintf("h%d: every ybot that admits the heading draws nothing at or below it (first bad ybot %d: %d inked pixels, topmost y=%d)", lvl, worst_yb, worst_ink, worst_top),
+				)
 				doc_close(&doc)
 			}
 
-			// L10 (2026-07-29 review): `forced` (markdown.odin, right above the row
-			// loop) exempts only the very first row from the md_row_fits test above,
-			// so a pane too short for even one row still shows a clipped row instead
-			// of nothing -- "no frame ever shows emptiness" outranks the trim. The
-			// sweep above never reaches this: LEAD always puts three body rows ahead
-			// of the heading, so the first row admitted is never the one under test.
-			// Here the heading IS the first row, and ybot is pinned at ytop itself --
-			// tighter than any body row's ink, let alone a heading's -- so nothing
-			// but `forced` can admit it. Without `forced` this returns bottom == 0.
+			hchk(&bad, taller >= 1, fmt.tprintf("at least one heading level is taller than a body block (%d of 6)", taller))
+
+			// L10 (2026-07-29 review): `forced` (markdown.odin, in md_pass) exempts
+			// only the very first block from the md_block_fits test above, so a pane
+			// too short for even one block still shows a clipped one instead of
+			// nothing -- "no frame ever shows emptiness" outranks the trim. The
+			// sweep above never reaches this: LEAD always puts three body blocks
+			// ahead of the heading, so the first block admitted is never the one
+			// under test. Here the heading IS the first block, and ybot is pinned at
+			// ytop itself -- tighter than any body block, let alone a heading's --
+			// so nothing but `forced` can admit it. Without `forced` this returns
+			// bottom == 0.
 			{
 				src := "# Hgjpqy\n"
 				content := make([]u8, len(src))
 				copy(content, src)
 				doc := doc_from_content(content, "forced.md", .UTF8)
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, char_w, x0, x1, ytop, ytop, 0)
+				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ytop, Md_Anchor{})
 				hchk(
 					&bad,
 					bottom > 0,
-					fmt.tprintf("forced: a pane too short for its first row still advances past it (bottom=%d)", bottom),
+					fmt.tprintf("forced: a pane too short for its first block still advances past it (bottom=%d)", bottom),
 				)
 				doc_close(&doc)
 			}
 			return bad
+		}
+		// mdtest's TYPE-SCALE checks (UI spec 9.3).
+		//
+		// Pure arithmetic, and it is pinned exactly rather than approximately for
+		// a reason that is not aesthetic. Glyph_Key.px is a u16 and glyph_get
+		// truncates into it (`u16(px)`, platform/text.odin), so two sizes that
+		// truncate to the same integer share ONE atlas entry, carrying whichever
+		// advance and rasterized bitmap arrived first. 9.3's answer is "compute
+		// every size as round(k * S) into the metrics struct once", and the
+		// assertions below are that rule stated in the two forms that can fail:
+		// every size is the rounded product, and every size survives the
+		// truncation the atlas key performs.
+		md_metrics_selftest :: proc() -> (bad: int) {
+			mchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			// A device only for the font faces: md_metrics reads the body face's
+			// advance for '0' to turn 9.3's "72ch" into pixels. Its own, and
+			// destroyed before the next proc stands one up -- one at a time.
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, 64, 64, "mdtest/metrics") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			t := &h.text
+			saved := UI_SCALE
+			defer UI_SCALE = saved
+			// Both an integral and a fractional UI scale: the S-derived sizes must
+			// not move with it (they are multiples of S), while the fixed-pixel
+			// decorations must.
+			for scale in ([]f32{1.0, 1.5}) {
+				UI_SCALE = scale
+				for s in ([]f32{12, 14, 16, 20, 24, 31}) {
+					m := md_metrics(t, s)
+					r :: proc(s, k: f32) -> f32 {return max(1, f32(int(s * k + 0.5)))}
+					rows := []struct {
+						got:  f32,
+						want: f32,
+						what: string,
+					} {
+						{m.head[1], r(s, 1.85), "h1 1.85 S"},
+						{m.head[2], r(s, 1.50), "h2 1.50 S"},
+						{m.head[3], r(s, 1.25), "h3 1.25 S"},
+						{m.head[4], r(s, 1.10), "h4 1.10 S"},
+						{m.head[5], r(s, 1.00), "h5 1.00 S"},
+						{m.head[6], r(s, 1.00), "h6 1.00 S"},
+						{m.body, r(s, 1.00), "paragraph 1.00 S"},
+						{m.code, r(s, 0.92), "code 0.92 S"},
+						{m.table, r(s, 0.95), "table 0.95 S"},
+						{m.caption, r(s, 0.88), "caption 0.88 S"},
+						{m.body_lead, r(s, 1.65), "body leading 1.65 S"},
+						{m.head_above[2], r(s, 1.60), "h2 space above 1.6 S"},
+						{m.head_above[3], r(s, 1.40), "h3 space above 1.4 S"},
+						{m.head_above[4], r(s, 1.20), "h4 space above 1.2 S"},
+						{m.head_above[5], r(s, 1.00), "h5 space above 1.0 S"},
+						{m.head_above[6], r(s, 1.00), "h6 space above 1.0 S"},
+						{m.head_below[1], r(s, 0.60), "h1 space below 0.6 S"},
+						{m.head_below[2], r(s, 0.50), "h2 space below 0.5 S"},
+						{m.head_below[3], r(s, 0.40), "h3 space below 0.4 S"},
+						{m.head_below[4], r(s, 0.30), "h4 space below 0.3 S"},
+						{m.head_below[5], r(s, 0.30), "h5 space below 0.3 S"},
+						{m.head_below[6], r(s, 0.30), "h6 space below 0.3 S"},
+						{m.para_below, r(s, 0.80), "paragraph space below 0.8 S"},
+						{m.list_gap, r(s, 0.25), "list gap 0.25 S"},
+						{m.quote_above, r(s, 0.80), "blockquote space above 0.8 S"},
+						{m.quote_below, r(s, 0.80), "blockquote space below 0.8 S"},
+						{m.fence_above, r(s, 1.00), "fenced code space above 1.0 S"},
+						{m.fence_below, r(s, 1.00), "fenced code space below 1.0 S"},
+					}
+					wrong, first := 0, ""
+					for row in rows {
+						if row.got != row.want {
+							wrong += 1
+							if first == "" {first = fmt.tprintf("%s: got %.3f want %.3f", row.what, row.got, row.want)}
+						}
+					}
+					mchk(&bad, wrong == 0, fmt.tprintf("scale %.1f S=%.0f: every row of 9.3's table is round(k*S) (%d wrong; %s)", scale, s, wrong, first))
+					// 9.3's own "space above / below" column, which is the part of
+					// the table most easily dropped: h1 alone has no space above.
+					mchk(&bad, m.head_above[1] == 0, fmt.tprintf("scale %.1f S=%.0f: h1 has no space above (9.3's `0 /`)", scale, s))
+
+					// THE hazard. Every size must survive u16 truncation unchanged,
+					// or it shares an atlas entry with the integer below it.
+					sizes := []f32{m.head[1], m.head[2], m.head[3], m.head[4], m.head[5], m.head[6], m.body, m.code, m.table, m.caption}
+					lossy := 0
+					for v in sizes {
+						if f32(u16(v)) != v {lossy += 1}
+					}
+					mchk(&bad, lossy == 0, fmt.tprintf("scale %.1f S=%.0f: every size survives Glyph_Key.px's u16 truncation (%d lossy)", scale, s, lossy))
+					// ...and the check above is NOT vacuous: the unrounded product
+					// really would have been lossy at these sizes. If this ever goes
+					// false for every S in the sweep, the rounding rule stopped
+					// being testable here and the sweep needs a size that exercises
+					// it, not a weaker assertion.
+					if s == 16 {
+						mchk(&bad, m.code == 15 && int(0.92 * s) == 14, fmt.tprintf("S=16: 0.92*S rounds to %.0f, where TRUNCATING it would key %d instead", m.code, int(0.92 * s)))
+					}
+				}
+			}
+			// The fixed-pixel decorations DO scale with the UI, and the S-derived
+			// sizes do not -- otherwise one of the two families is being computed
+			// through the wrong path.
+			UI_SCALE = 1
+			m1 := md_metrics(t, 16)
+			UI_SCALE = 2
+			m2 := md_metrics(t, 16)
+			mchk(&bad, m1.body == m2.body && m1.head[1] == m2.head[1], "type sizes are multiples of S, not of UI_SCALE")
+			mchk(&bad, m2.list_indent > m1.list_indent && m2.fence_pad > m1.fence_pad && m2.pad_left > m1.pad_left, "the fixed-pixel insets (24/12/40px) DO scale with the UI")
+			return
+		}
+
+		// mdtest's SEAM checks: what is drawn against what is clickable.
+		//
+		// This is the whole risk of the block/span rewrite and the rule it is
+		// checking is CLAUDE.md's, unmodified -- the shaper is the single producer
+		// of glyph positions, and the draw, the underline, the link hit-test and
+		// the hand cursor all consume its output. links_layout's preview path used
+		// cell arithmetic (row_at_y / cell_at_x) against a layout that is now
+		// proportional, which is by construction the "correct function fed the
+		// wrong input" defect this project has sixteen recorded instances of.
+		//
+		// The assertion is stated on PIXELS, in both directions, because either
+		// one alone is satisfiable by a wrong implementation:
+		//
+		//   drawn -> clickable: every strongly Link-coloured pixel markdown_draw
+		//     put on screen lies inside some rectangle markdown_links returned.
+		//     Rejects a rect that is short, or in the wrong place, or missing.
+		//   clickable -> drawn: every rectangle markdown_links returned contains
+		//     strongly Link-coloured pixels. Rejects a rect invented where no link
+		//     was drawn -- which is what one covering a whole row would be.
+		//
+		// Plus the round trip through md_link_at, which is what the Ctrl+click and
+		// the hand cursor actually call.
+		//
+		// The fixture puts links at the four boundaries that break this class of
+		// code: the start of a line, the end of a line, across a soft wrap, and at
+		// the measure's exact edge. Nothing else in it is Link-coloured (no inline
+		// code -- Dark gives Md_Code and Link the SAME value, deliberately, and a
+		// code span would make the classifier below ambiguous).
+		md_seam_selftest :: proc() -> (bad: int) {
+			schk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 900, 800
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/seam") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(20)
+			x0, x1 := f32(40), f32(520)
+			ytop, ybot := f32(20), f32(780)
+			m := md_metrics(&h.text, px_)
+			cx, measure := md_content_span(&m, x0, x1)
+
+			// (a) line start, (b) line end, (c) a label long enough to cross the
+			// soft wrap at this measure, (d) a link pushed out to the measure's
+			// edge by the prose in front of it.
+			src := strings.concatenate(
+				{
+					"[alpha](http://example.com/a) then some plain words after it\n",
+					"\n",
+					"plain words first and then [omega](http://example.com/b)\n",
+					"\n",
+					"[a link label deliberately long enough that greedy breaking has to carry part of it onto a second visual line](http://example.com/c)\n",
+					"\n",
+					"one two three four five six seven eight nine ten [edge](http://example.com/d) x\n",
+					"\n",
+					// Two INDENTED blocks. Without them nothing in this fixture has
+					// a non-zero block indent, so md_block_links could take its
+					// origin from the pane instead of from md_block_origin and
+					// every assertion above would still be green -- which is the
+					// exact two-producer defect the seam exists to catch, hiding
+					// behind a fixture whose indents all happen to be zero.
+					"  - [inlist](http://example.com/e) item text\n",
+					"> [inquote](http://example.com/f) quoted text\n",
+					// A label with NO DESCENDERS, for the vertical half of the seam:
+					// its ink's last row is the baseline, which is what makes base_y
+					// checkable against the ink rather than only against the rect.
+					"\n",
+					"[TALL](http://example.com/g) baseline probe\n",
+				},
+				context.temp_allocator,
+			)
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "seam.md", .UTF8)
+			defer doc_close(&doc)
+
+			bg := g_theme[.Bg_Base]
+			plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+			markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+			pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+			schk(&bad, pok, "seam: readback")
+			if !pok {return}
+			// The SAME arguments the draw was given. md_pane_box is what keeps
+			// main.odin's two call sites from having to be trusted to do this.
+			hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+			schk(&bad, len(hits) >= 4, fmt.tprintf("seam: all four fixture links are placed (%d rects)", len(hits)))
+
+			// A pixel is "link ink" when it is strongly the Link colour: close to
+			// it, and much closer to it than to the only other foreground on
+			// screen. An antialiased edge blends bg -> Link and is deliberately
+			// NOT counted -- what is being localised is where the glyphs are, and
+			// a coverage threshold makes that a question about the same pixels
+			// whichever direction the assertion runs.
+			link_ink :: proc(pix: []u8, W, x, y: int) -> bool {
+				i := (y * W + x) * 4
+				b, g, r := int(pix[i]), int(pix[i + 1]), int(pix[i + 2])
+				d :: proc(c: [4]f32, b, g, r: int) -> int {
+					return abs(b - int(c[2] * 255)) + abs(g - int(c[1] * 255)) + abs(r - int(c[0] * 255))
+				}
+				dl := d(g_theme[.Link], b, g, r)
+				return dl <= 40 && dl < d(g_theme[.Text_Primary], b, g, r) && dl < d(g_theme[.Bg_Base], b, g, r)
+			}
+			inside :: proc(hits: []Md_Link_Hit, x, y, slack: f32) -> bool {
+				for hh in hits {
+					r := hh.rect
+					if x >= r.pos.x - slack && x < r.pos.x + r.size.x + slack && y >= r.pos.y && y < r.pos.y + r.size.y {
+						return true
+					}
+				}
+				return false
+			}
+
+			// --- drawn -> clickable, and how far outside the worst pixel is -----
+			//
+			// Md_Span_Box's right edge is an ADVANCE bound, not an ink bound, so a
+			// glyph's side bearing can put ink a little outside it. That is a
+			// deliberate choice (see Md_Span_Box) and the point of measuring the
+			// overshoot rather than assuming it: the bound below is 2px, and the
+			// number this actually produces is printed so a face change that made
+			// it grow shows up as a number rather than as a silent pass.
+			stray, worst := 0, f32(0)
+			for yy in 0 ..< H {
+				for xx in 0 ..< W {
+					if !link_ink(pix, W, xx, yy) {continue}
+					if inside(hits, f32(xx), f32(yy), 0) {continue}
+					// How far out, horizontally, from the nearest rect on this row.
+					best := f32(1e9)
+					for hh in hits {
+						r := hh.rect
+						if f32(yy) < r.pos.y || f32(yy) >= r.pos.y + r.size.y {continue}
+						best = min(best, max(r.pos.x - f32(xx), f32(xx) - (r.pos.x + r.size.x)))
+					}
+					if best > 2 {stray += 1}
+					if best < 1e8 {worst = max(worst, best)}
+				}
+			}
+			schk(
+				&bad, stray == 0,
+				fmt.tprintf("seam: every drawn link pixel is inside a link rect (%d stray, worst overshoot %.1fpx against a 2px side-bearing allowance)", stray, worst),
+			)
+
+			// --- clickable -> drawn ---------------------------------------------
+			empty, checked := 0, 0
+			for hh, hi in hits {
+				n := 0
+				for yy in max(0, int(hh.rect.pos.y)) ..< min(H, int(hh.rect.pos.y + hh.rect.size.y)) {
+					for xx in max(0, int(hh.rect.pos.x)) ..< min(W, int(hh.rect.pos.x + hh.rect.size.x)) {
+						if link_ink(pix, W, xx, yy) {n += 1}
+					}
+				}
+				checked += 1
+				if n == 0 {
+					empty += 1
+					fmt.printfln("      rect %d (%s) at %.0f,%.0f %.0fx%.0f has no link ink", hi, hh.url, hh.rect.pos.x, hh.rect.pos.y, hh.rect.size.x, hh.rect.size.y)
+				}
+			}
+			schk(&bad, checked > 0 && empty == 0, fmt.tprintf("seam: every link rect contains drawn link ink (%d of %d empty)", empty, checked))
+
+			// --- the seam VERTICALLY: base_y against rect.y, and both against ink -
+			//
+			// Md_Link_Hit carries `rect` and `base_y` as independent fields. The
+			// underline (md_draw_links) is drawn from base_y; the hit-test
+			// (md_link_at) is against rect. Nothing above asserts they describe the
+			// same glyphs, and nothing can: `inside` above applies its 2px allowance
+			// in X only, but a glyph's ink starts well below the line box's top and
+			// ends above its bottom (that slack IS the face's ascent and descent), so
+			// a whole rect shifted a pixel down still contains every pixel of its own
+			// ink. Sabotage, before this section existed: rect.x +3px was caught, rect
+			// .y +1px gave 0 failures, and base_y +9px gave 0 failures.
+			//
+			// Two assertions, because either alone is satisfiable:
+			//
+			//   the two fields against EACH OTHER, via the shaper's own line box. A
+			//     Shaped_Line puts its baseline at top + (h - (asc + desc))/2 + asc,
+			//     so base_y - rect.y is a property of the face and the leading and
+			//     nothing else. Computed here from plat.shape_run -- a second producer
+			//     used deliberately and only in the test, the pattern
+			//     md_head_fit_selftest and md_gap_selftest already take, because it is
+			//     the only way to state the number without re-deriving the layout.
+			//     Catches either field moving relative to the other.
+			//
+			//   base_y against the INK, on a label chosen to have no descenders, so
+			//     its last inked row IS the baseline. Catches the pair moving
+			//     TOGETHER, which the first assertion cannot see.
+			{
+				ref := plat.shape_run(&h.gfx, &h.text, "Ag", m.body, 1e6, m.body_lead, .Body, context.temp_allocator)
+				schk(&bad, ref.lines == 1 && len(ref.line_boxes) == 1, fmt.tprintf("seam/v: the reference run is one line (%d)", ref.lines))
+				if ref.lines == 1 {
+					lb := ref.line_boxes[0]
+					want_h, want_asc := lb.h, lb.y - lb.top
+					// Non-degenerate: a zero ascent would make the row below pass
+					// against any base_y at all.
+					schk(&bad, want_h > 4 && want_asc > 4 && want_asc < want_h, fmt.tprintf("seam/v: the reference line box is real (h %.1f, baseline %.1f into it)", want_h, want_asc))
+					bad_h, bad_asc := 0, 0
+					worst_h, worst_asc := f32(0), f32(0)
+					for hh in hits {
+						if abs(hh.rect.size.y - want_h) > 0.01 {
+							bad_h += 1
+							worst_h = max(worst_h, abs(hh.rect.size.y - want_h))
+						}
+						if abs((hh.base_y - hh.rect.pos.y) - want_asc) > 0.01 {
+							bad_asc += 1
+							worst_asc = max(worst_asc, abs((hh.base_y - hh.rect.pos.y) - want_asc))
+						}
+					}
+					// Every link in this fixture is body prose at the body size, so
+					// one reference box covers all of them -- including the indented
+					// list and quote, whose indent is horizontal only.
+					schk(&bad, bad_h == 0, fmt.tprintf("seam/v: every rect is exactly one line box tall (%d of %d wrong, worst %.2fpx off %.1f)", bad_h, len(hits), worst_h, want_h))
+					schk(&bad, bad_asc == 0, fmt.tprintf("seam/v: ...and every base_y sits that box's own ascent below its rect's top (%d of %d wrong, worst %.2fpx off %.1f)", bad_asc, len(hits), worst_asc, want_asc))
+				}
+				plat.shaped_free(&ref, context.temp_allocator)
+
+				// base_y against the ink. "TALL" has no descenders, so the lowest row
+				// its glyphs ink is the baseline itself -- one row above base_y, since
+				// a baseline is the line the glyphs SIT on.
+				probe, pfound := Md_Link_Hit{}, false
+				for hh in hits {
+					if hh.url == "http://example.com/g" {probe, pfound = hh, true}
+				}
+				schk(&bad, pfound, "seam/v: the no-descender probe link is placed")
+				if pfound {
+					first, last := -1, -1
+					for yy in max(0, int(probe.rect.pos.y) - 12) ..< min(H, int(probe.rect.pos.y + probe.rect.size.y) + 12) {
+						for xx in max(0, int(probe.rect.pos.x)) ..< min(W, int(probe.rect.pos.x + probe.rect.size.x)) {
+							if !link_ink(pix, W, xx, yy) {continue}
+							if first < 0 {first = yy}
+							last = yy
+							break
+						}
+					}
+					schk(&bad, first >= 0, fmt.tprintf("seam/v: the probe's glyphs are on screen (rows %d..%d)", first, last))
+					// Two rows of tolerance and no more: the whole point is that a
+					// baseline off by a few pixels is a visibly misplaced underline.
+					schk(
+						&bad, first >= 0 && abs(f32(last) - (probe.base_y - 1)) <= 2,
+						fmt.tprintf("seam/v: base_y IS the baseline the ink sits on (lowest inked row %d, base_y %.1f)", last, probe.base_y),
+					)
+					// ...and the ink is inside the rect vertically, which is the
+					// property the underline's own position depends on.
+					schk(
+						&bad, first >= 0 && f32(first) >= probe.rect.pos.y && f32(last) < probe.rect.pos.y + probe.rect.size.y,
+						fmt.tprintf("seam/v: ...and the ink is inside the rect (%d..%d against %.1f..%.1f)", first, last, probe.rect.pos.y, probe.rect.pos.y + probe.rect.size.y),
+					)
+				}
+			}
+
+			// --- the round trip the hand cursor and Ctrl+click actually take ----
+			round, bad_round := 0, 0
+			for hh in hits {
+				mx := hh.rect.pos.x + hh.rect.size.x * 0.5
+				my := hh.rect.pos.y + hh.rect.size.y * 0.5
+				got, found := md_link_at(hits, mx, my)
+				if !found || got.url != hh.url {bad_round += 1}
+				round += 1
+			}
+			schk(&bad, round > 0 && bad_round == 0, fmt.tprintf("seam: every rect's centre hit-tests back to its own link (%d of %d wrong)", bad_round, round))
+			// ...and a point OUTSIDE every rect hits nothing, or the round trip
+			// above would be satisfied by a hit-test that accepts everything.
+			_, off1 := md_link_at(hits, cx - 5, ytop + 2)
+			_, off2 := md_link_at(hits, x1 + 20, ytop + 2)
+			schk(&bad, !off1 && !off2, "seam: a point outside every rect hits no link")
+
+			// --- the four boundary cases, named ---------------------------------
+			//
+			// Named rather than left implicit: "4 rects came back" does not say
+			// that the wrapped one produced TWO, and the wrapped one is the case a
+			// row/column hit-test gets wrong most obviously.
+			by_url :: proc(hits: []Md_Link_Hit, url: string) -> (n: int, ys: [8]f32) {
+				for hh in hits {
+					if hh.url != url {continue}
+					if n < len(ys) {ys[n] = hh.rect.pos.y}
+					n += 1
+				}
+				return
+			}
+			na, _ := by_url(hits, "http://example.com/a")
+			nb, _ := by_url(hits, "http://example.com/b")
+			nc, ysc := by_url(hits, "http://example.com/c")
+			nd, _ := by_url(hits, "http://example.com/d")
+			schk(&bad, na == 1, fmt.tprintf("seam: a link at the START of a line gets one rect (%d)", na))
+			schk(&bad, nb == 1, fmt.tprintf("seam: a link at the END of a line gets one rect (%d)", nb))
+			schk(&bad, nd == 1, fmt.tprintf("seam: a link at the measure's edge gets one rect (%d)", nd))
+			schk(&bad, nc >= 2, fmt.tprintf("seam: a link across a SOFT WRAP gets one rect per visual line (%d)", nc))
+			if nc >= 2 {
+				schk(&bad, ysc[1] > ysc[0], fmt.tprintf("seam: ...on different rows (%.0f then %.0f)", ysc[0], ysc[1]))
+			}
+			// The line-start link really does start at the content origin, and the
+			// line-end one really does not -- otherwise "start" and "end" name the
+			// same case and two of the four boundaries above are one.
+			ax, bx2 := f32(-1), f32(-1)
+			for hh in hits {
+				if hh.url == "http://example.com/a" {ax = hh.rect.pos.x}
+				if hh.url == "http://example.com/b" {bx2 = hh.rect.pos.x}
+			}
+			schk(&bad, ax >= 0 && abs(ax - cx) <= 1, fmt.tprintf("seam: the line-start link begins at the content origin (%.1f vs %.1f)", ax, cx))
+			schk(&bad, bx2 > cx + measure * 0.3, fmt.tprintf("seam: the line-end link is well down its line (%.1f, origin %.1f)", bx2, cx))
+
+			// The two INDENTED blocks: their links start at their block's own
+			// origin, which is NOT the content origin. Stated as its own assertion
+			// because the pixel checks above localise ink to a rect, and a rect
+			// and the ink can be wrong together only if both come from the same
+			// place -- which is the point, but it means "the indent is applied at
+			// all" needs saying separately.
+			ne, _ := by_url(hits, "http://example.com/e")
+			nf, _ := by_url(hits, "http://example.com/f")
+			ex, fx := f32(-1), f32(-1)
+			for hh in hits {
+				if hh.url == "http://example.com/e" {ex = hh.rect.pos.x}
+				if hh.url == "http://example.com/f" {fx = hh.rect.pos.x}
+			}
+			schk(&bad, ne == 1 && nf == 1, fmt.tprintf("seam: the list and quote links are placed (%d, %d)", ne, nf))
+			schk(&bad, ex > cx + 1, fmt.tprintf("seam: a link inside a LIST item starts at the item's indent, not the pane's (%.1f vs %.1f)", ex, cx))
+			schk(&bad, fx > cx + 1, fmt.tprintf("seam: a link inside a BLOCKQUOTE starts at the quote's inset (%.1f vs %.1f)", fx, cx))
+			return
+		}
+
+		// mdtest's LAYOUT-CACHE checks (UI spec 9.1's "cache each block's
+		// laid-out glyph positions").
+		//
+		// "Did no work" is not observable from the result -- a correct cache and
+		// no cache at all return identical glyphs -- so the only honest assertion
+		// counts BUILDS (md_layout_builds). Three properties, and the third is
+		// the one that is easy to claim and hard to have:
+		//
+		//   1. a second pass at the same width builds nothing and returns the same
+		//      rectangles;
+		//   2. a width change invalidates -- wholesale, which is what "invalidate
+		//      all on resize" means;
+		//   3. an edit invalidates ONLY the edited block. The edit below replaces
+		//      one byte with another of the same length so no following block's
+		//      start byte moves; a cache keyed on doc.revision rebuilds every
+		//      block, one keyed on each block's own source text rebuilds one.
+		md_cache_selftest :: proc() -> (bad: int) {
+			cchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 700, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/cache") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(18)
+			x0, x1 := f32(40), f32(600)
+			ytop, ybot := f32(20), f32(680)
+			// The long line is load-bearing: it wraps at the narrow measure below
+			// and not at the wide one, which is what makes "the width is part of
+			// the key" an observable claim about the LAYOUT rather than a claim
+			// about rebuild counts.
+			// NO trailing newline, deliberately. With one, the pass sees a final
+			// empty "line" at p == doc.pt.length, which is a Blank block -- and
+			// Blank is one of the three kinds keyed on doc.revision rather than on
+			// its own text (md_layout_extern_dep: a blank RUN's extent is the
+			// lines after it, which its own bytes cannot witness). It therefore
+			// rebuilds after ANY edit, correctly, and the "exactly one block"
+			// count below would be two. Dropping the terminator makes the count
+			// say what it means; the first draft of this test did not, and read as
+			// a per-block cache failing when it was the extern-dep rule working.
+			src := "# One\nalpha alpha\nbravo bravo\ncharlie charlie plus a good deal more text so this block wraps once the pane narrows\ndelta delta\necho echo"
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "cache.md", .UTF8)
+			defer doc_close(&doc)
+
+			pass :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot: f32) -> (builds: int, bottom: int) {
+				before := md_layout_builds
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				bottom = markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				return md_layout_builds - before, bottom
+			}
+
+			b1, bot1 := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			cchk(&bad, b1 >= 6, fmt.tprintf("cache: a cold pass builds every visible block (%d)", b1))
+			cchk(&bad, bot1 > 0, fmt.tprintf("cache: ...and the pass actually reached the end of the fixture (bottom %d)", bot1))
+
+			b2, bot2 := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			cchk(&bad, b2 == 0, fmt.tprintf("cache: a second pass at the same width builds NOTHING (%d)", b2))
+			cchk(&bad, bot2 == bot1, fmt.tprintf("cache: ...and returns the same bottom (%d == %d)", bot2, bot1))
+
+			// The rectangles are identical too, not merely the count: a cache that
+			// returned a stale layout after a width change would still return the
+			// right COUNT here.
+			ha := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+			hb := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+			same := len(ha) == len(hb)
+			if same {
+				for i in 0 ..< len(ha) {
+					if ha[i].rect.pos != hb[i].rect.pos || ha[i].rect.size != hb[i].rect.size {same = false}
+				}
+			}
+			cchk(&bad, same, "cache: two link passes return byte-identical rectangles")
+
+			// --- (2) a width change invalidates ---------------------------------
+			narrow := x1 - 260 // narrow enough that the long paragraph must wrap
+			b3, nbot := pass(&h, &doc, px_, x0, narrow, ytop, ybot)
+			cchk(&bad, b3 >= 6, fmt.tprintf("cache: a narrower pane rebuilds every block (%d)", b3))
+			// ...and it really laid out DIFFERENTLY, or "rebuilt" is a claim about
+			// work rather than about correctness. The fixture's long paragraph wraps
+			// at the narrow measure and not at the wide one, so its block is taller
+			// and the pass reaches fewer bytes before the pane fills.
+			// Compared in a pane SHORT enough to fill: the tall one above fits the
+			// whole fixture at either width, so its `bottom` is EOF both times and
+			// says nothing at all. The narrow measure wraps the long paragraph, so
+			// that block is taller and fewer bytes fit above the same ybot -- swept
+			// for rather than hand-picked, so a change to 9.3's spacing moves the
+			// height at which the two diverge without silently making this vacuous.
+			sw, sn, sy := -1, -1, -1
+			for y := int(ytop) + 20; y <= int(ybot); y += 4 {
+				_, a := pass(&h, &doc, px_, x0, x1, ytop, f32(y))
+				_, b := pass(&h, &doc, px_, x0, narrow, ytop, f32(y))
+				if a != b {sw, sn, sy = a, b, y;break}
+			}
+			cchk(&bad, sy >= 0 && sn < sw, fmt.tprintf("cache: ...and the narrow layout really differs from the wide one (at ybot %d: %d bytes fit vs %d)", sy, sn, sw))
+			// Alternating widths: each returns ITS OWN layout, not the other's.
+			// Deliberately NOT asserted as "the second narrow pass rebuilds again":
+			// with 128 slots and six blocks BOTH widths stay resident, so a rebuild
+			// count of 0 there is the cache working, not failing. The property that
+			// matters is that the width is part of the KEY -- which is what these
+			// two say, and what a cache that went stale across a resize fails.
+			// (The first draft of this assertion demanded the rebuild and went red
+			// against a correct cache.)
+			_, wbot2 := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			_, nbot2 := pass(&h, &doc, px_, x0, narrow, ytop, ybot)
+			cchk(&bad, wbot2 == bot1 && nbot2 == nbot, fmt.tprintf("cache: alternating widths each return their own layout (wide %d==%d, narrow %d==%d)", wbot2, bot1, nbot2, nbot))
+
+			// A zoom (a different S) invalidates the same way.
+			b5, _ := pass(&h, &doc, px_ + 2, x0, x1, ytop, ybot)
+			cchk(&bad, b5 >= 6, fmt.tprintf("cache: a zoom rebuilds every block (%d)", b5))
+
+			// --- (3) an edit invalidates only the edited block -------------------
+			//
+			// Back to the original width first, so the cache is warm for it.
+			pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			warm, _ := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			cchk(&bad, warm == 0, fmt.tprintf("cache: warm again before the edit (%d builds)", warm))
+			// "charlie charlie" starts at a known offset; replace one byte with a
+			// different byte of the SAME length, so nothing after it moves.
+			at := strings.index(src, "charlie")
+			cchk(&bad, at > 0, "cache: the edit fixture's target line was found")
+			doc_replace_range(&doc, at, 1, transmute([]u8)string("X"))
+			b6, _ := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			cchk(
+				&bad, b6 == 1,
+				fmt.tprintf("cache: a one-byte edit rebuilds exactly ONE block, not the document (%d)", b6),
+			)
+			b7, _ := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			cchk(&bad, b7 == 0, fmt.tprintf("cache: ...and the pass after it is warm again (%d)", b7))
+
+			// --- viewport-first, against the one input the fit test cannot see ---
+			//
+			// A Blank block has zero height, so md_block_fits never stops one. A
+			// document that is nothing but empty lines is therefore a chain of
+			// them, each doing a bounded forward line walk. Without
+			// MD_MAX_EMPTY_BLOCKS the walk is MD_WALK_BLOCKS * MD_BLANK_RUN_MAX
+			// capped line reads on the UI thread, up to three times a frame.
+			//
+			// Asserted on BUILDS rather than on wall-clock: a timing bound would
+			// be a flaky assertion about this machine, and the build count is what
+			// "how much of the document did this pass touch" actually is.
+			{
+				blanks := make([]u8, 20000)
+				for i in 0 ..< len(blanks) {blanks[i] = '\n'}
+				bdoc := doc_from_content(blanks, "blank.md", .UTF8)
+				defer doc_close(&bdoc)
+				before := md_layout_builds
+				bb, bbot := pass(&h, &bdoc, px_, x0, x1, ytop, ybot)
+				cchk(
+					&bad, bb <= MD_MAX_EMPTY_BLOCKS + 2,
+					fmt.tprintf("viewport-first: 20000 blank lines lay out %d blocks, not the document (cap %d)", bb, MD_MAX_EMPTY_BLOCKS),
+				)
+				// ...and it is not vacuous the other way: the pass has to have
+				// COLLAPSED the run, or 20000 lines would be 20000 blocks and the
+				// bound above would be the only thing standing between the UI
+				// thread and the whole file.
+				cchk(
+					&bad, bbot > MD_MAX_EMPTY_BLOCKS * 2 && bbot < len(blanks),
+					fmt.tprintf("viewport-first: ...having collapsed the run (reached byte %d of %d in %d blocks)", bbot, len(blanks), bb),
+				)
+				_ = before
+			}
+			return
+		}
+
+
+		// mdtest's CACHE-KEY checks: the four inputs a block's layout is a
+		// function of that its own SOURCE TEXT cannot witness (2026-07-29 review,
+		// H1 / H1b / M1 / M2). Each of these was a live stale-render bug, and each
+		// one is invisible to md_cache_selftest, which only ever changes the pane
+		// width, the zoom and the text.
+		//
+		// The pane here is deliberately WIDE -- wider than 72ch at this S. That is
+		// load-bearing twice over. It is the only configuration in the whole suite
+		// where 9.3's measure cap actually binds (every other fixture's pane is
+		// narrower than 72ch, so `min` in md_content_span never chooses the cap and
+		// the cap could be deleted outright with the suite still green), and it is
+		// what makes the UI_SCALE check an isolation: with the cap binding, the
+		// measure is a function of S alone, so a DPI change moves the baked insets
+		// and moves NOTHING else in the key.
+		md_key_selftest :: proc() -> (bad: int) {
+			kchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1400, 620
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/key") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(20)
+			x0, x1 := f32(40), f32(1340)
+			ytop, ybot := f32(20), f32(600)
+			mk :: proc(s: string, name: string) -> Document {
+				content := make([]u8, len(s))
+				copy(content, s)
+				return doc_from_content(content, name, .UTF8)
+			}
+
+			// --- (1) 9.3's "measure: 72ch max" (M2) ------------------------------
+			m := md_metrics(&h.text, px_)
+			cx, meas := md_content_span(&m, x0, x1)
+			kchk(
+				&bad, x1 - cx > m.measure * 1.25,
+				fmt.tprintf("measure: the fixture pane is genuinely wider than 72ch (%.0fpx of room against a %.0fpx measure)", x1 - cx, m.measure),
+			)
+			kchk(
+				&bad, meas == m.measure,
+				fmt.tprintf("measure: ...so md_content_span returns the 72ch CAP and not the pane (%.0f, pane %.0f)", meas, x1 - cx),
+			)
+			// ...and the cap is 72 of the BODY face's '0', CSS's own definition of
+			// `ch` -- not 72 of the editor's monospace cell, which is what a preview
+			// that forgot it went proportional would use.
+			adv := plat.text_advance(nil, &h.text, '0', m.body, .Body)
+			kchk(&bad, abs(m.measure - 72 * adv) < 0.01, fmt.tprintf("measure: 72ch is 72 body-face '0' advances (%.2f vs %.2f)", m.measure, 72 * adv))
+			// The other side: in a NARROW pane the pane binds, or "the cap binds"
+			// above would also be satisfied by a measure that ignores the pane.
+			ncx, nmeas := md_content_span(&m, x0, x0 + 300)
+			kchk(
+				&bad, nmeas == x0 + 300 - ncx && nmeas < m.measure,
+				fmt.tprintf("measure: in a narrow pane the PANE binds instead (%.0f, cap %.0f)", nmeas, m.measure),
+			)
+
+			// The cap as the draw actually applies it, not as arithmetic: a
+			// paragraph far too long for one line must wrap AT the measure, leaving
+			// the rest of this very wide pane empty. Without the cap the same
+			// paragraph runs to the pane edge, which is ~560px further right.
+			{
+				long := strings.repeat("wrap ", 200, context.temp_allocator)
+				doc := mk(strings.concatenate({long, "\n"}, context.temp_allocator), "measure.md")
+				defer doc_close(&doc)
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				pix, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				kchk(&bad, ok, "measure: readback")
+				if ok {
+					minx, maxx, miny, maxy := W, -1, H, -1
+					for yy in int(ytop) ..< min(H, int(ybot)) {
+						for xx in int(x0) ..< min(W, int(x1)) {
+							i := (yy * W + xx) * 4
+							d :=
+								abs(int(pix[i]) - int(bg[2] * 255)) +
+								abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+								abs(int(pix[i + 2]) - int(bg[0] * 255))
+							if d <= 24 {continue}
+							minx, maxx = min(minx, xx), max(maxx, xx)
+							miny, maxy = min(miny, yy), max(maxy, yy)
+						}
+					}
+					// Bounded against 72 body-face advances computed HERE, not
+					// against md_content_span's own answer: with the cap deleted
+					// `meas` becomes the pane and a bound derived from it moves out
+					// to the pane edge with the ink, passing.
+					cap72 := 72 * adv
+					kchk(
+						&bad, maxx >= 0 && f32(maxx) <= cx + cap72 + 2,
+						fmt.tprintf("measure: the drawn paragraph stops at the 72ch measure (rightmost ink x=%d, 72ch ends at %.0f, pane at %.0f)", maxx, cx + cap72, x1),
+					)
+					// ...and it really did fill the measure and wrap, or the bound
+					// above is satisfied by any short line.
+					kchk(&bad, f32(maxx) > cx + cap72 * 0.8, fmt.tprintf("measure: ...having actually filled it (rightmost ink x=%d of %.0f)", maxx, cx + cap72))
+					kchk(
+						&bad, f32(maxy - miny) > line_height(m.body) * 1.5,
+						fmt.tprintf("measure: ...over several wrapped lines (ink spans %dpx, one line is %.0f)", maxy - miny, line_height(m.body)),
+					)
+					_ = minx
+				}
+			}
+
+			// --- (2) UI_SCALE is part of the key (H1b) ---------------------------
+			//
+			// `indent` bakes sx()-scaled insets at BUILD time (a list's 24px per
+			// level, a quote's 16px, a fenced block's 12px pad). A monitor change
+			// with no window-size change moves every one of them while `measure`,
+			// `px`, `src`, `start`, `end` and `theme` all stay put -- so without
+			// ui_scale in the key every cached block keeps the old DPI's insets and
+			// the preview's left edge is wrong until something else evicts it.
+			//
+			// Probed through markdown_links because a link rect's x IS the block's
+			// glyph origin (md_block_origin), which is exactly the quantity `indent`
+			// contributes to.
+			{
+				// The label is NOT "x": `- [x]` is GFM task-list syntax, so
+				// `- [x](url)` classifies as a checked task whose content is
+				// "(url) ..." and the link disappears before md_inline sees it.
+				doc := mk("- [see](http://ui.example) item text\n", "ui.md")
+				defer doc_close(&doc)
+				first_x :: proc(hits: []Md_Link_Hit, url: string) -> (x: f32, ok: bool) {
+					for hh in hits {
+						if hh.url == url {return hh.rect.pos.x, true}
+					}
+					return 0, false
+				}
+				UI_SCALE = 1
+				m1 := md_metrics(&h.text, px_)
+				cx1, meas1 := md_content_span(&m1, x0, x1)
+				h1 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+				// The SAME document, the SAME pane, the cache warm from the pass
+				// above -- only the DPI moved.
+				UI_SCALE = 2
+				m2 := md_metrics(&h.text, px_)
+				cx2, meas2 := md_content_span(&m2, x0, x1)
+				h2 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+				UI_SCALE = 1
+				// The isolation, stated: if the measure moved too, this would be a
+				// test of the measure term and would pass with ui_scale absent.
+				kchk(&bad, meas1 == meas2, fmt.tprintf("ui scale: the 72ch cap binds at BOTH scales, so the measure is unchanged (%.0f, %.0f)", meas1, meas2))
+				kchk(&bad, m2.list_indent > m1.list_indent, fmt.tprintf("ui scale: ...while the list indent really does move (%.0f -> %.0f)", m1.list_indent, m2.list_indent))
+				xa, oka := first_x(h1, "http://ui.example")
+				xb, okb := first_x(h2, "http://ui.example")
+				kchk(&bad, oka && okb, fmt.tprintf("ui scale: the list item's link is placed at both scales (%d rects at 100%%, %d at 200%%)", len(h1), len(h2)))
+				if oka && okb {
+					kchk(&bad, abs(xa - (cx1 + m1.list_indent)) <= 1, fmt.tprintf("ui scale: at 100%% the item's prose starts at one list indent (%.1f vs %.1f)", xa, cx1 + m1.list_indent))
+					kchk(&bad, abs(xb - (cx2 + m2.list_indent)) <= 1, fmt.tprintf("ui scale: at 200%% it starts at the SCALED indent, not the cached one (%.1f vs %.1f)", xb, cx2 + m2.list_indent))
+				}
+			}
+
+			// --- (3) the theme is part of the key (H1) ---------------------------
+			//
+			// Md_Span.color is resolved when the block is BUILT (the old renderer
+			// called md_run_color per draw), so a theme switch that does not
+			// invalidate leaves the previous palette's ink on the new palette's
+			// canvas -- warm-white body text and amber headings on white. Live
+			// through the Settings theme cycle, theme_edit_current and
+			// theme_reapply_if_active.
+			//
+			// Asserted on PIXELS, and on a heading, because a heading is the one
+			// role whose colour this batch changed (Md_Heading, not Text_Bright);
+			// the same entry therefore has to be wrong under a stale key in a way
+			// no other assertion in the suite would notice.
+			{
+				doc := mk("# IIIIIIII\n", "theme.md")
+				defer doc_close(&doc)
+				// Peak: the pixel farthest from the CURRENT background is the one
+				// nearest full glyph coverage. Bounded to the heading's own glyph
+				// band so the h1 rule below it cannot be sampled instead.
+				ink :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot, hpx, cx: f32, W, H: int) -> (b, g, r: u8, ok: bool) {
+					bg := g_theme[.Bg_Base]
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+					pix, rok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if !rok {return}
+					best := -1
+					for yy in int(ytop) ..< min(H, int(ytop + hpx)) {
+						for xx in int(cx) ..< min(W, int(cx + 300)) {
+							i := (yy * W + xx) * 4
+							bb, gg, rr := pix[i], pix[i + 1], pix[i + 2]
+							d :=
+								abs(int(bb) - int(bg[2] * 255)) +
+								abs(int(gg) - int(bg[1] * 255)) +
+								abs(int(rr) - int(bg[0] * 255))
+							if d > best {best, b, g, r = d, bb, gg, rr}
+						}
+					}
+					return b, g, r, best > 40
+				}
+				close :: proc(c: [4]f32, b, g, r: u8, tol: int) -> bool {
+					return(
+						abs(int(b) - int(c[2] * 255 + 0.5)) <= tol &&
+						abs(int(g) - int(c[1] * 255 + 0.5)) <= tol &&
+						abs(int(r) - int(c[0] * 255 + 0.5)) <= tol \
+					)
+				}
+				dark_head := theme_dark()[.Md_Heading]
+				light_head := theme_light()[.Md_Heading]
+				// Non-degenerate, or "the colour changed" is unobservable.
+				sep := abs(int(dark_head[0] * 255) - int(light_head[0] * 255)) + abs(int(dark_head[1] * 255) - int(light_head[1] * 255)) + abs(int(dark_head[2] * 255) - int(light_head[2] * 255))
+				kchk(&bad, sep > 100, fmt.tprintf("theme: Dark and Light really give a heading different colours (channel separation %d)", sep))
+
+				g_theme = theme_dark()
+				db, dg, dr, dok := ink(&h, &doc, px_, x0, x1, ytop, ybot, m.head[1], cx, W, H)
+				kchk(&bad, dok, "theme: the heading's glyphs are on screen under Dark")
+				kchk(&bad, dok && close(dark_head, db, dg, dr, 24), fmt.tprintf("theme: ...drawn in Dark's Md_Heading (bgr %d,%d,%d)", db, dg, dr))
+
+				// The switch, exactly as the Settings cycle makes it: assign
+				// g_theme, draw the SAME document again with every block's entry
+				// still resident.
+				g_theme = theme_light()
+				lb, lg, lr, lok := ink(&h, &doc, px_, x0, x1, ytop, ybot, m.head[1], cx, W, H)
+				kchk(&bad, lok, "theme: the heading's glyphs are on screen under Light")
+				kchk(
+					&bad, lok && close(light_head, lb, lg, lr, 24),
+					fmt.tprintf("theme: after the switch the SAME cached block draws in Light's Md_Heading (bgr %d,%d,%d, want #%02X%02X%02X)", lb, lg, lr, u8(light_head[0] * 255), u8(light_head[1] * 255), u8(light_head[2] * 255)),
+				)
+				kchk(
+					&bad, lok && !close(dark_head, lb, lg, lr, 20),
+					fmt.tprintf("theme: ...and NOT in the palette it was baked under (bgr %d,%d,%d against Dark's #%02X%02X%02X)", lb, lg, lr, u8(dark_head[0] * 255), u8(dark_head[1] * 255), u8(dark_head[2] * 255)),
+				)
+				g_theme = theme_dark()
+			}
+
+			// --- (4) a block's EXTENT is part of the key (M1) ---------------------
+			//
+			// md_pass strips the trailing \r before handing `line` to the key, so a
+			// CRLF -> LF conversion leaves every `src` byte-identical while every
+			// `end`/`next` shrinks by one. A cache hit then carries the OLD `next`,
+			// the pass resumes one byte late, and the following block renders with
+			// its first character eaten -- which for a line beginning with `[` eats
+			// the link.
+			//
+			// The reference is the same document laid out COLD as LF, so this
+			// asserts "converting gets you what loading would have", not an
+			// arithmetic guess about byte offsets.
+			//
+			// Asserted on PIXELS, and that is not belt-and-braces -- it is the only
+			// form that fails. The stale `next` is SELF-CORRECTING after exactly one
+			// block: the pass resumes at byte 9 instead of 8, and pt_line_end_cap
+			// then finds the same newline it would have found from 8, so the block
+			// after it starts in the right place and `bottom`, the link count and
+			// the link rectangles all come out identical. What is actually wrong is
+			// the one character the late resume ate out of the middle block -- and
+			// nothing but the ink can see it. (Written first as a `bottom` + link-x
+			// comparison, which stayed green under the sabotage.)
+			{
+				crlf := "# Title\r\nsecond line here\r\n[third](http://crlf.example) tail\r\n"
+				lf := "# Title\nsecond line here\n[third](http://crlf.example) tail\n"
+				shot :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot: f32) -> (pix: []u8, bottom: int, ok: bool) {
+					bg := g_theme[.Bg_Base]
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					bottom = markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+					pix, ok = plat.gfx_readback_bgra(&h.gfx, context.allocator)
+					return
+				}
+
+				cold := mk(lf, "cold.md")
+				cold_pix, cold_bottom, cok := shot(&h, &cold, px_, x0, x1, ytop, ybot)
+				doc_close(&cold)
+
+				conv := mk(crlf, "conv.md")
+				// doc_from_content does not detect the line ending (the loader does
+				// it separately), and doc_set_line_ending early-returns when the
+				// document already claims the target -- so without this the fixture
+				// silently converts nothing.
+				conv.eol = base.detect_line_ending(conv.original)
+				before := conv.pt.length
+				warm_pix, _, wok := shot(&h, &conv, px_, x0, x1, ytop, ybot) // warm every block under CRLF
+				doc_set_line_ending(&conv, .LF) // Encoding > Line Endings > LF
+				after := conv.pt.length
+				conv_pix, conv_bottom, vok := shot(&h, &conv, px_, x0, x1, ytop, ybot)
+				doc_close(&conv)
+				defer if cok {delete(cold_pix)}
+				defer if wok {delete(warm_pix)}
+				defer if vok {delete(conv_pix)}
+
+				// Non-vacuity: the conversion really did move every extent.
+				kchk(&bad, after == before - 3, fmt.tprintf("crlf: the conversion shortened the buffer by one byte per line (%d -> %d)", before, after))
+				kchk(&bad, cok && wok && vok, "crlf: all three readbacks succeeded")
+				if !(cok && wok && vok) {return}
+				diff :: proc(a, b: []u8) -> (n: int) {
+					for i in 0 ..< min(len(a), len(b)) {
+						if a[i] != b[i] {n += 1}
+					}
+					return
+				}
+				// ...and the comparison can see a difference at all: the CRLF
+				// rendering is NOT already pixel-identical to the LF one for some
+				// reason unrelated to the cache. (It is not -- CRLF's `\r` is
+				// stripped, so what is drawn is the same text; what differs is
+				// that this pass is the one that laid the entries down. Asserted as
+				// ink present rather than as a difference, because a correct
+				// implementation makes warm_pix and cold_pix equal too.)
+				ink := 0
+				bgc := g_theme[.Bg_Base]
+				for i := 0; i + 3 < len(cold_pix); i += 4 {
+					d := abs(int(cold_pix[i]) - int(bgc[2] * 255)) + abs(int(cold_pix[i + 1]) - int(bgc[1] * 255)) + abs(int(cold_pix[i + 2]) - int(bgc[0] * 255))
+					if d > 24 {ink += 1}
+				}
+				kchk(&bad, ink > 500, fmt.tprintf("crlf: the reference rendering has ink to compare (%d pixels)", ink))
+				kchk(&bad, conv_bottom == cold_bottom, fmt.tprintf("crlf: after the conversion the warm pass reaches the same byte a cold LF pass does (%d vs %d)", conv_bottom, cold_bottom))
+				n := diff(conv_pix, cold_pix)
+				kchk(
+					&bad, n == 0,
+					fmt.tprintf("crlf: ...and draws the same pixels -- no line resumed one byte late, no first character eaten (%d bytes differ of %d)", n, len(cold_pix)),
+				)
+			}
+
+			// --- (5) the loaded FACES are part of the key ------------------------
+			//
+			// The theme term one section up exists because a layout bakes colours a
+			// global can move underneath it. A layout also bakes GEOMETRY -- glyph
+			// positions, soft-wrap points, the block's own height -- out of the
+			// shaper at whatever advances the loaded families have, and Settings >
+			// Font (settings_apply_font) reloads the .Doc chain, which is what
+			// inline code, fenced blocks and tables draw on. text_reset_atlas drops
+			// the rasterized glyphs and nothing else, so without a key term the
+			// atlas fills with the new family while every cached entry keeps the old
+			// family's spacing: wrong advances, wrong wrap points, inline-code
+			// backgrounds and link rects on stale geometry, until an edit, resize,
+			// zoom or theme change happens to evict them.
+			//
+			// Every other term is provably invariant under this change, `measure`
+			// included -- it is 72 advances of the BODY face, and .Body is not
+			// reloaded here. That is what makes the term necessary rather than
+			// belt-and-braces.
+			//
+			// Driven through plat.text_load_family, the real path settings_apply_font
+			// takes, so the counter it bumps is bumped by the product's own code and
+			// not by the probe.
+			{
+				// Two curated monospace families with clearly different advances,
+				// picked at runtime so the check reports honestly on a machine that
+				// ships neither. Courier New's '0' is materially narrower than
+				// Consolas' at the same px, which is what makes the stale-advance
+				// failure observable in a link rect's x.
+				fams := [2]string{"Consolas", "Courier New"}
+				have := true
+				for f in fams {
+					found := false
+					for c in plat.FONT_FAMILIES {
+						if c.name == f && plat.font_family_available(c) {found = true}
+					}
+					if !found {have = false}
+				}
+				kchk(&bad, have, fmt.tprintf("faces: both probe families are installed (%s, %s)", fams[0], fams[1]))
+				if have {
+					// Inline code AND a link after it: the code span is what draws on
+					// the .Doc chain, and the link rect after it is where the .Doc
+					// advances land as a measurable x. One block, so nothing but this
+					// entry's own shaping can move the number.
+					doc := mk("text `AAAAAAAAAAAAAAAAAAAA` [see](http://face.example) tail\n", "face.md")
+					defer doc_close(&doc)
+					link_x :: proc(hits: []Md_Link_Hit) -> (x: f32, ok: bool) {
+						for hh in hits {
+							if hh.url == "http://face.example" {return hh.rect.pos.x, true}
+						}
+						return 0, false
+					}
+					kchk(&bad, plat.text_load_family(&h.text, fams[0], .Regular, .Doc), fmt.tprintf("faces: %s loads for the .Doc chain", fams[0]))
+					md_layout_reset(&doc)
+					g1 := plat.text_face_gen(&h.text)
+					w1 := plat.text_char_width(&h.text, md_metrics(&h.text, px_).code, .Doc)
+					hits1 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+					xa, oka := link_x(hits1)
+
+					// The switch, exactly as Settings > Font makes it: load the family,
+					// then draw the SAME document again with every block's entry still
+					// resident. No md_layout_reset here -- that is the whole point.
+					kchk(&bad, plat.text_load_family(&h.text, fams[1], .Regular, .Doc), fmt.tprintf("faces: %s loads for the .Doc chain", fams[1]))
+					g2 := plat.text_face_gen(&h.text)
+					w2 := plat.text_char_width(&h.text, md_metrics(&h.text, px_).code, .Doc)
+					hits2 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+					xb, okb := link_x(hits2)
+
+					// ...and back, cold, as the reference: what the second family's
+					// advances SHOULD have produced.
+					md_layout_reset(&doc)
+					hits3 := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+					xc, okc := link_x(hits3)
+					// Put the harness back on what headless_gpu_init loaded, through
+					// the same loader -- assigning the chain directly would leak the
+					// faces this section created and skip the counter's only bump.
+					plat.text_load_family(&h.text, "Consolas", .Regular, .Doc)
+
+					// Non-vacuity, both halves. The counter moved, and the .Doc cell
+					// width really differs -- without the second the whole section
+					// would be asserting that two identical layouts are identical.
+					kchk(&bad, g2 != g1, fmt.tprintf("faces: loading a family moves text_face_gen (%d -> %d)", g1, g2))
+					kchk(&bad, w1 != w2, fmt.tprintf("faces: ...and the two families have different .Doc advances at the code size (%.2f vs %.2f)", w1, w2))
+					kchk(&bad, oka && okb && okc, fmt.tprintf("faces: the link is placed in all three passes (%d, %d, %d rects)", len(hits1), len(hits2), len(hits3)))
+					if oka && okb && okc {
+						// The fixture's inline code sits BEFORE the link, so a stale
+						// .Doc advance moves the link's x. Without the key term the
+						// warm pass returns the first family's number.
+						kchk(&bad, abs(xb - xc) <= 0.5, fmt.tprintf("faces: after the font change the WARM pass places the link where a cold one does (%.1f vs %.1f)", xb, xc))
+						kchk(&bad, abs(xb - xa) > 1, fmt.tprintf("faces: ...and NOT where the family it was shaped under put it (%.1f vs %.1f)", xb, xa))
+					}
+
+					// The SECOND cache the same change invalidates: md_max_anchor's.
+					// Its key is everything the preview's own end of travel is a
+					// function of, and the ceiling is "the anchor at which the last
+					// block ends at the pane's bottom edge" -- block HEIGHTS, which a
+					// family change moves.
+					//
+					// The fixture is paragraphs carrying long INLINE CODE spans, which
+					// is the construct the section above already proved moves under
+					// this change. Fenced code was the obvious choice and does not
+					// work: a `Md_Layout` for a fence body came out pixel-identical
+					// under both families, so a fence fixture asserts nothing here.
+					// (Worth its own look -- recorded rather than chased, since what
+					// this section is for is the cache key.)
+					{
+						fb := strings.builder_make()
+						defer strings.builder_destroy(&fb)
+						// 19 code spans per paragraph, and that number is measured, not
+						// arbitrary: it is a length whose greedy wrap count DIFFERS
+						// between the two families (132px of slot under one, 165px
+						// under the other). Every paragraph is the same length for the
+						// same reason -- the ceiling is a function of the LAST pane's
+						// blocks only, so a fixture that sweeps lengths and happens to
+						// end on a non-straddling one asserts nothing. A first draft
+						// swept 2..21 spans and the last three paragraphs came out
+						// identical under both families.
+						for i in 0 ..< 60 {
+							fmt.sbprintf(&fb, "line %02d of prose with ", i)
+							for k in 0 ..< 19 {fmt.sbprintf(&fb, "`code_%02d_span` and ", k)}
+							strings.write_string(&fb, "a tail.\n\n")
+						}
+						fsrc := strings.to_string(fb)
+						fdoc := mk(fsrc, "facemax.md")
+						defer doc_close(&fdoc)
+						fdoc.md_mode = .Preview
+						plat.text_load_family(&h.text, fams[0], .Regular, .Doc)
+						fc, fok := md_scroll_ctx(&h.gfx, &h.text, &fdoc, px_, f32(W), f32(H), 0.5)
+						kchk(&bad, fok, "faces: the inline-code fixture has a preview pane")
+						if fok {
+							m_a := md_max_anchor(&fc)
+							plat.text_load_family(&h.text, fams[1], .Regular, .Doc)
+							fc2, _ := md_scroll_ctx(&h.gfx, &h.text, &fdoc, px_, f32(W), f32(H), 0.5)
+							warm := md_max_anchor(&fc2) // the entry from before the change
+							fdoc.md_max_key = {} // ...against a recomputation of it
+							cold := md_max_anchor(&fc2)
+							kchk(&bad, m_a != cold, fmt.tprintf("faces: the two families really do give the fixture different ceilings (%d/%.1f vs %d/%.1f)", m_a.block, m_a.px, cold.block, cold.px))
+							kchk(&bad, warm == cold, fmt.tprintf("faces: ...and Md_Max_Key notices the change rather than serving the old ceiling (%d/%.1f vs %d/%.1f)", warm.block, warm.px, cold.block, cold.px))
+						}
+						plat.text_load_family(&h.text, "Consolas", .Regular, .Doc)
+					}
+				}
+			}
+			return
+		}
+
+		// mdtest's SPACE ABOVE / BELOW checks (UI spec 9.3's most easily skipped
+		// column, 2026-07-29 review M4).
+		//
+		// md_metrics_selftest asserts the NUMBERS are round(k * S); nothing asserted
+		// that md_pass puts them between the blocks. Measured: zeroing a heading's
+		// above and below gave 0 failures across the whole suite, and zeroing the
+		// inter-block gap entirely gave 1.
+		//
+		// Every measurement here is the y of a PROBE PARAGRAPH's link rect -- the
+		// same walk the draw makes, through the same layout cache. Two fixtures per
+		// row, differing only by the block under test being present, so the probe's
+		// own offset inside its block (which depends on its face, not on any gap)
+		// cancels exactly:
+		//
+		//	base   "LEAD\n[q]probe\n"          -> y_base
+		//	with   "LEAD\nK\n[q]probe\n"       -> y_with
+		//	y_with - y_base == max(lead_below, K.above) - lead_below + K.h + K.below
+		//
+		// Run over TWO leads: a paragraph (0.8 S below) and a list item (0.25 S
+		// below). A kind whose space-above is smaller than the paragraph's
+		// space-below is invisible in the first -- adjacent margins collapse to the
+		// larger -- and the list lead is what makes it observable. That the two
+		// leads agree wherever the collapse dominates is itself the margin-collapse
+		// assertion.
+		//
+		// K.h comes from the shaper, at the same px / leading / face md_layout_build
+		// hands it. A second producer, deliberately and only in the test: it is the
+		// only thing that can state the height without re-deriving the layout, and
+		// it is the pattern md_head_fit_selftest already uses.
+		md_gap_selftest :: proc() -> (bad: int) {
+			gchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 900, 1400
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/gap") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(20)
+			x0, x1 := f32(40), f32(860)
+			ytop, ybot := f32(20), f32(1380)
+			m := md_metrics(&h.text, px_)
+			_, measure := md_content_span(&m, x0, x1)
+			PROBE :: "[q](http://probe.example) probe"
+
+			// The probe's y in a document built from `parts`, or -1.
+			probe_y :: proc(h: ^Headless_Gpu, src: string, px_, x0, x1, ytop, ybot: f32) -> f32 {
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "gap.md", .UTF8)
+				defer doc_close(&doc)
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+				for hh in hits {
+					if hh.url == "http://probe.example" {return hh.rect.pos.y}
+				}
+				return -1
+			}
+
+			// A one-line block's height, through the shaper the layout uses.
+			one_line :: proc(h: ^Headless_Gpu, s: string, px, measure, lead: f32, set: plat.Font_Set) -> f32 {
+				return plat.shape_run(&h.gfx, &h.text, s, px, measure, lead, set, context.temp_allocator).height
+			}
+			body_h := one_line(&h, "block text", m.body, measure, m.body_lead, .Body)
+			bold := plat.text_styled_set(&h.text, .Body, .Bold)
+			// A fenced block is THREE blocks -- an open pad, the body, a close pad --
+			// so its "height" for this test is the whole run, and its space-above and
+			// space-below are the open block's and the close block's.
+			fence_h := m.fence_pad * 2 + one_line(&h, "code", m.code, measure - m.fence_pad, line_height(m.code), .Doc)
+
+			Row :: struct {
+				what:   string,
+				src:    string, // the block under test, WITHOUT its trailing newline
+				height: f32,
+				above:  f32,
+				below:  f32,
+			}
+			rows := []Row {
+				{"paragraph", "block text", body_h, 0, m.para_below},
+				// A list item and a quote lay out at the body face and do not wrap
+				// at this measure, so their block height is a paragraph's.
+				{"list item", "- block text", body_h, 0, m.list_gap},
+				{"blockquote", "> block text", body_h, m.quote_above, m.quote_below},
+				// h1 and h2 carry their rule INSIDE their own height (9.2 item 1).
+				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, line_height(m.head[1]), bold) + hairline(), m.head_above[1], m.head_below[1]},
+				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, line_height(m.head[2]), bold) + hairline(), m.head_above[2], m.head_below[2]},
+				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, line_height(m.head[3]), bold), m.head_above[3], m.head_below[3]},
+				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, line_height(m.head[4]), bold), m.head_above[4], m.head_below[4]},
+				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below},
+				{"thematic break", "***", hairline(), m.rule_gap, m.rule_gap},
+			}
+			leads := []struct {
+				what:  string,
+				src:   string,
+				below: f32,
+			}{{"a paragraph", "lead text", m.para_below}, {"a list item", "- lead text", m.list_gap}}
+
+			for ld in leads {
+				base_src := strings.concatenate({ld.src, "\n", PROBE, "\n"}, context.temp_allocator)
+				y_base := probe_y(&h, base_src, px_, x0, x1, ytop, ybot)
+				gchk(&bad, y_base >= 0, fmt.tprintf("gap: the probe is placed after %s", ld.what))
+				if y_base < 0 {continue}
+				for r in rows {
+					src := strings.concatenate({ld.src, "\n", r.src, "\n", PROBE, "\n"}, context.temp_allocator)
+					y := probe_y(&h, src, px_, x0, x1, ytop, ybot)
+					if y < 0 {
+						gchk(&bad, false, fmt.tprintf("gap: [%s] the probe is placed after a %s", ld.what, r.what))
+						continue
+					}
+					// max(lead.below, K.above) is the COLLAPSED gap above K; the
+					// lead's own below is already inside y_base, so it comes back
+					// out. K.below is the collapsed gap under it (a paragraph has
+					// no space above, so the max is K.below itself).
+					want := max(ld.below, r.above) - ld.below + r.height + r.below
+					got := y - y_base
+					gchk(
+						&bad, abs(got - want) <= 1,
+						fmt.tprintf("gap: [%s] a %s costs h=%.0f + above=%.0f + below=%.0f (got %.1f, want %.1f)", ld.what, r.what, r.height, r.above, r.below, got, want),
+					)
+				}
+			}
+			// Non-degeneracy: if every kind happened to carry the same space, the
+			// table above would pass against an implementation that applied one
+			// number everywhere -- which is very nearly the sabotage.
+			distinct_below := 0
+			for r, i in rows {
+				seen := false
+				for j in 0 ..< i {
+					if abs(rows[j].below - r.below) < 0.5 {seen = true}
+				}
+				if !seen {distinct_below += 1}
+			}
+			gchk(&bad, distinct_below >= 4, fmt.tprintf("gap: the fixture spans several DIFFERENT space-below values (%d distinct)", distinct_below))
+			return
+		}
+
+		// Batch 17 task 2c: the preview's PIXEL scroll offset (UI spec 9.1 item 4),
+		// 9.1's layout budget, and 9.4's Split sync.
+		//
+		// Its own procedure, not more sections in md_draw_selftest, for the reason
+		// this file keeps learning: these frames are enormous and three of them
+		// have already hit STATUS_STACK_OVERFLOW. One Headless_Gpu, one Document
+		// live at a time, each fixture in its own scope.
+		//
+		// Everything here is asserted against the DRAW where it can be. "The
+		// offset is in pixels" is not observable from the scroll state -- a model
+		// that quantised the offset to whole lines would return the same anchors
+		// -- so the assertion is that the readback moved by exactly the number of
+		// pixels asked for, which only a real pixel offset can satisfy.
+		md_scroll_selftest :: proc() -> (bad: int) {
+			schk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 800, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/scroll") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(24)
+			winw, winh := f32(W), f32(H)
+
+			render :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot: f32, at: Md_Anchor) -> (buf: []u8, ok: bool) {
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, at)
+				return plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+			}
+			// A pixel that is not the canvas. The pane is painted with Bg_Base and
+			// nothing else, so "differs from Bg_Base" is "something was drawn".
+			inked :: proc(buf: []u8, x, y: int) -> bool {
+				bg := g_theme[.Bg_Base]
+				i := (y * W + x) * 4
+				want := [3]u8{u8(bg[2] * 255 + 0.5), u8(bg[1] * 255 + 0.5), u8(bg[0] * 255 + 0.5)}
+				return abs(int(buf[i]) - int(want[0])) > 6 || abs(int(buf[i + 1]) - int(want[1])) > 6 || abs(int(buf[i + 2]) - int(want[2])) > 6
+			}
+			// The first and last rows of the band [y0, y1) carrying any ink; -1 for
+			// neither.
+			ink_rows :: proc(buf: []u8, x0, x1, y0, y1: int) -> (first, last: int) {
+				first, last = -1, -1
+				for y in max(0, y0) ..< min(H, y1) {
+					for x in max(0, x0) ..< min(W, x1) {
+						if inked(buf, x, y) {
+							if first < 0 {first = y}
+							last = y
+							break
+						}
+					}
+				}
+				return
+			}
+
+			// --- A. the offset is PIXELS, not lines --------------------------
+			//
+			// The whole point of 9.1 item 4, and the one claim the scroll state
+			// cannot witness on its own. Rendered twice and compared: at {0, K}
+			// every pixel the preview drew must be exactly K rows higher than it
+			// was at {0, 0}.
+			//
+			// K deliberately includes values that are not multiples of anything --
+			// 1, 7, 13, 29 -- because a model that still moved in rows, or that
+			// rounded to the leading, would pass at 0 and at a line height and
+			// nowhere else.
+			{
+				src := "# Heading one\n\nalpha alpha alpha\n\nbravo bravo bravo\n\ncharlie charlie charlie\n\ndelta delta delta\n\necho echo echo\n\nfoxtrot foxtrot\n\ngolf golf golf\n\nhotel hotel hotel"
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "px.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, winw, winh, 0.5)
+				schk(&bad, box_ok, "pixels: the fixture has a preview pane")
+
+				base_buf, ok0 := render(&h, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				schk(&bad, ok0, "pixels: readback")
+				bf, bl := ink_rows(base_buf, int(x0), int(x1), int(ytop), int(ybot))
+				schk(&bad, bf >= 0 && bl > bf + 100, fmt.tprintf("pixels: the unscrolled pane is full of content (ink rows %d..%d)", bf, bl))
+
+				for k in ([]int{1, 7, 13, 29}) {
+					buf, okk := render(&h, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{0, f32(k)})
+					if !okk {
+						schk(&bad, false, fmt.tprintf("pixels: readback at px=%d", k))
+						continue
+					}
+					// The topmost inked row moved up by exactly k. Rejects an
+					// ignored offset (delta 0), a quantised one (delta 0 until a
+					// whole line has accumulated) and an inverted one.
+					f2, _ := ink_rows(buf, int(x0), int(x1), 0, int(ybot))
+					schk(&bad, f2 == bf - k, fmt.tprintf("pixels: px=%d moves the first inked row up by exactly %d (%d -> %d)", k, k, bf, f2))
+
+					// And every pixel with it, not just the first row. Compared over
+					// a band that stops well short of ybot: the block admitted at
+					// the BOTTOM edge legitimately differs between the two renders
+					// (a scrolled pane has room for one more), and that is the fit
+					// test working, not a layout that moved.
+					band_lo, band_hi := int(ytop) + k, int(ybot) - 140
+					diff := 0
+					for y in band_lo ..< band_hi {
+						for x in int(x0) ..< int(x1) {
+							i := (y * W + x) * 4
+							j := ((y + k) * W + x) * 4
+							if base_buf[j] != buf[i] || base_buf[j + 1] != buf[i + 1] || base_buf[j + 2] != buf[i + 2] {diff += 1}
+						}
+					}
+					total := (band_hi - band_lo) * (int(x1) - int(x0))
+					schk(&bad, diff == 0, fmt.tprintf("pixels: ...and so does every other pixel (%d of %d differ, band %d..%d)", diff, total, band_lo, band_hi))
+				}
+			}
+
+			// --- B. 9.1's layout budget: the visible blocks plus a screen -----
+			//
+			// "Layout only the visible blocks plus a screen above and below."
+			// Asserted from BOTH sides, and the second side is the one that
+			// matters: an upper bound alone is satisfied by a pass that lays out
+			// only what is visible, and a lower bound alone by a pass that lays
+			// out the document. Only the pair says "a screen, and a screen".
+			//
+			// Counted in BUILDS (md_layout_builds), because "how much of the
+			// document did this pass touch" is exactly what a build count is, and
+			// a wall-clock bound would be an assertion about this machine.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				// Fixed-width lines, so a byte offset divided by 12 is a block
+				// index and `bottom` can be read as "how many blocks were visible".
+				for i in 0 ..< 200 {fmt.sbprintf(&b, "para %03d xx\n", i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "budget.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
+
+				md_layout_reset(&doc)
+				before := md_layout_builds
+				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				builds := md_layout_builds - before
+				vis := bottom / 12 + 1
+				schk(&bad, vis >= 5 && vis <= 40, fmt.tprintf("budget: the pane holds several blocks, and the fixture is far longer (%d of 200)", vis))
+				schk(&bad, builds <= vis * 3, fmt.tprintf("budget: a pass lays out a bounded window, NOT the document (%d builds, %d visible, 200 blocks)", builds, vis))
+				schk(&bad, builds >= vis * 2 - 2, fmt.tprintf("budget: ...and it really does lay out the screen BELOW, not just the visible blocks (%d builds vs %d visible)", builds, vis))
+			}
+
+			// --- B2. the same budget, at a MID-document anchor ------------------
+			//
+			// Section B's bound is calibrated at Md_Anchor{} -- the origin -- where
+			// MD_RUNUP_LINES' run-up costs nothing: there is no predecessor before
+			// byte 0 to walk back to. A resolved anchor further into the document
+			// pays that run-up on every walk that resolves it (md_anchor_walk), and
+			// the origin's bound says nothing about that cost. This is its OWN
+			// assertion rather than a loosening of B's: they are different costs
+			// (one screen's worth vs. one screen's worth plus a fixed run-up), and
+			// folding them into one bound would hide that a click deep in the
+			// document costs more per pass than one at the top.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< 200 {fmt.sbprintf(&b, "para %03d xx\n", i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "budget_mid.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				schk(&bad, cok, "budget-mid: the scroll context comes from the same md_pane_box the draw does")
+
+				// Block 100 of 200 -- resolved through the same mapping a Split
+				// click's sync uses (md_anchor_from_top), not hand-built, so the
+				// anchor is one the product can actually land on.
+				at := md_anchor_from_top(&c, 100 * 12)
+				schk(&bad, at.block == 100 * 12, fmt.tprintf("budget-mid: the anchor resolves to the block boundary it named (%d)", at.block))
+
+				md_layout_reset(&doc)
+				before := md_layout_builds
+				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				builds := md_layout_builds - before
+				vis := (bottom - at.block) / 12 + 1
+				schk(&bad, vis >= 3 && vis <= 40, fmt.tprintf("budget-mid: the pane holds several blocks from the anchor (%d)", vis))
+				// The honest bound: section B's pane-plus-a-screen-below budget,
+				// PLUS the fixed MD_RUNUP_LINES cost the origin case never pays.
+				// One block per source line on this fixture, so MD_RUNUP_LINES
+				// lines of run-up is MD_RUNUP_LINES blocks of build, not a fraction
+				// of it -- if the run-up ever stops being bounded by that constant,
+				// this is the assertion that notices.
+				schk(&bad, builds <= vis * 3 + MD_RUNUP_LINES, fmt.tprintf("budget-mid: a mid-anchor pass lays out the pane, a screen below, and its OWN run-up -- not the document (%d builds, %d visible, +%d run-up allowance)", builds, vis, MD_RUNUP_LINES))
+				schk(&bad, builds >= vis * 2 - 2, fmt.tprintf("budget-mid: ...and it still lays out the screen BELOW too (%d builds vs %d visible)", builds, vis))
+			}
+
+			// --- C. the preview's own end of travel, and its scrollbar --------
+			//
+			// The defect 2b measured and left for this task: a blank RUN is one
+			// zero-height block, so a preview screen covers about three times the
+			// source an editor screen does -- and the preview was clamped by the
+			// EDITOR's doc_max_top. The last stretch of the scroll travel showed
+			// nothing new. The fixture is the one the brief names.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< 200 {fmt.sbprintf(&b, "word %03d\n\n\n\n\n\n\n\n", i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "blanks.md", .UTF8)
+				doc.md_mode = .Preview
+				doc.view_cols = 80
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				schk(&bad, cok, "end: the scroll context comes from the same md_pane_box the draw does")
+
+				mx := md_max_anchor(&c)
+				ed_rows := int((ybot - ytop) / line_height(px_))
+				ed_max := doc_max_top(&doc, &h.text, ed_rows)
+				schk(&bad, ed_max > 0 && mx.block > 0, fmt.tprintf("end: both ceilings are inside the document (preview %d, editor %d)", mx.block, ed_max))
+				schk(&bad, mx.block < ed_max, fmt.tprintf("end: the preview's ceiling is its OWN, and well short of the editor's (%d vs %d)", mx.block, ed_max))
+
+				// The teeth. At the preview's own ceiling the pane is FULL -- ink
+				// runs down to its bottom edge -- and at the editor's ceiling it is
+				// not, which is precisely "the last stretch shows nothing new".
+				pane_bot := int(ybot)
+				buf_mx, _ := render(&h, &doc, px_, x0, x1, ytop, ybot, mx)
+				_, last_mx := ink_rows(buf_mx, int(x0), int(x1), int(ytop), pane_bot)
+				buf_ed, _ := render(&h, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{ed_max, 0})
+				_, last_ed := ink_rows(buf_ed, int(x0), int(x1), int(ytop), pane_bot)
+				lh := int(line_height(px_))
+				schk(&bad, last_mx >= pane_bot - 3 * lh, fmt.tprintf("end: at the preview's ceiling the pane is full (last ink %d, pane bottom %d)", last_mx, pane_bot))
+				schk(&bad, last_ed < last_mx - 3 * lh, fmt.tprintf("end: at the EDITOR's ceiling most of the pane is empty (last ink %d vs %d)", last_ed, last_mx))
+
+				// Nothing scrolls past it, from either gesture. Iterated, because
+				// ONE md_scroll_px is deliberately bounded by the walk -- a single
+				// gesture cannot cross more blocks than a walk holds, which is the
+				// viewport-first rule and not a shortfall. What must be true is
+				// that repeating it converges on the ceiling and never goes past.
+				far := Md_Anchor{}
+				steps := 0
+				for steps < 30 {
+					nxt := md_scroll_px(&c, far, 1e7)
+					steps += 1
+					if nxt == far {break}
+					far = nxt
+				}
+				schk(&bad, far == mx, fmt.tprintf("end: scrolling down repeatedly stops exactly at the ceiling (%d/%.1f vs %d/%.1f, %d steps)", far.block, far.px, mx.block, mx.px, steps))
+				schk(&bad, md_scroll_px(&c, mx, 5000) == mx, "end: ...and a step from the ceiling moves nothing")
+				// Sub-pixel tolerance, not equality: the drag's inverse goes through
+				// a byte-with-a-fraction scalar, so it lands within a rounding of
+				// the ceiling rather than on its exact f32 bits. Half a pixel is
+				// well inside "the same place on screen".
+				drag_end := md_scroll_to_fraction(&c, 2)
+				schk(
+					&bad,
+					drag_end.block == mx.block && abs(drag_end.px - mx.px) < 0.5,
+					fmt.tprintf("end: ...and so does dragging the thumb past the bottom (%d/%.3f vs %d/%.3f)", drag_end.block, drag_end.px, mx.block, mx.px),
+				)
+
+				// The scrollbar. Two independent halves of "the thumb reaches the
+				// bottom": the FRACTION is 1 at the end of the range (this is what
+				// dividing by pt.length instead of the range breaks), and the
+				// GEOMETRY puts the thumb's bottom edge on the track's at a
+				// fraction of 1 (this is what multiplying by the whole track
+				// instead of track-minus-thumb breaks). vscrollbar_geo's comment
+				// records both; the preview's bar has to earn them again.
+				f_top := md_scroll_frac(&c, Md_Anchor{})
+				f_end := md_scroll_frac(&c, mx)
+				schk(&bad, f_top == 0, fmt.tprintf("bar: the fraction is 0 at the top (%.4f)", f_top))
+				schk(&bad, f_end >= 0.9999, fmt.tprintf("bar: the fraction is 1 at the preview's OWN end of travel (%.4f)", f_end))
+				bot_end := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, mx)
+				doc.md_top = mx
+				vb := md_vscrollbar_geo(&doc, winw - SCROLLBAR_W, winh, bot_end, f_end)
+				schk(&bad, vb.shown && vb.thumb_h > 0, fmt.tprintf("bar: the thumb has a size (%.1f of %.1f)", vb.thumb_h, vb.track_h))
+				schk(
+					&bad,
+					abs((vb.thumb_y + vb.thumb_h) - (vb.track_y + vb.track_h)) < 0.5,
+					fmt.tprintf("bar: at the end of travel the thumb's BOTTOM meets the track's (%.1f vs %.1f)", vb.thumb_y + vb.thumb_h, vb.track_y + vb.track_h),
+				)
+				vb0 := md_vscrollbar_geo(&doc, winw - SCROLLBAR_W, winh, bot_end, 0)
+				schk(&bad, abs(vb0.thumb_y - vb0.track_y) < 0.5, fmt.tprintf("bar: ...and at the top its TOP meets the track's (%.1f vs %.1f)", vb0.thumb_y, vb0.track_y))
+				// The MIDDLE of the range, which the two ends cannot see: the clamp
+				// in md_vscrollbar_geo pins both ends whatever the multiplier is, so
+				// a bar that travelled the whole track instead of the track minus
+				// the thumb would still pass the two rows above. What separates
+				// them is that the geometry and vbar_frac_at are exact inverses --
+				// press the thumb, hold still, and the document does not move.
+				worst_grab := f32(0)
+				for i in 0 ..= 10 {
+					want := f32(i) / 10
+					g := md_vscrollbar_geo(&doc, winw - SCROLLBAR_W, winh, bot_end, want)
+					grab := g.thumb_h * 0.5
+					worst_grab = max(worst_grab, abs(vbar_frac_at(g, g.thumb_y + grab, grab) - want))
+				}
+				schk(&bad, worst_grab < 0.001, fmt.tprintf("bar: the thumb's position and the drag's read of it are exact inverses (worst %.4f)", worst_grab))
+
+					// ...and the fraction costs the frame NO walk of its own. The
+					// scrollbar asks for it once per frame from inside render_frame,
+					// three lines after markdown_draw laid out the same blocks, and it
+					// used to answer by resolving the scroll position twice over:
+					// md_scroll_frac -> md_scroll_scalar x2 -> md_slot_at ->
+					// md_anchor_walk, each with a 24-line run-up and a 256-entry
+					// Md_Walk_Block array. Measured at 3.322 ms a frame against
+					// markdown_draw's 1.660 (-o:speed, `newtpad mdperftest`).
+					//
+					// Counted in WALKS, because a cached answer and an uncached one are
+					// the same number -- the only honest witness is the work. The draw
+					// runs first, exactly as render_frame orders them.
+					{
+						doc.md_top = Md_Anchor{}
+						markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, doc.md_top)
+						before_walks := md_slot_walks
+						f := md_scroll_frac(&c, doc.md_top)
+						schk(&bad, md_slot_walks == before_walks, fmt.tprintf("bar: after the draw, the fraction costs no walk of its own (%d walks, frac %.4f)", md_slot_walks - before_walks, f))
+						// Non-vacuity: a block the draw did NOT walk still costs one,
+						// so the row above is the cache working and not a counter that
+						// never moves.
+						other := md_scroll_frac(&c, Md_Anchor{mx.block, 0})
+						schk(&bad, md_slot_walks > before_walks, fmt.tprintf("bar: ...while a block it did not walk still costs one (%d, frac %.4f)", md_slot_walks - before_walks, other))
+					}
+
+				// Grab it and hold it and it does not move: the fraction map and
+				// its inverse are exact inverses, which is the property
+				// scrollgrabtest pins for the editor's bar.
+				worst := f32(0)
+				for i in 0 ..= 10 {
+					want := f32(i) / 10
+					got := md_scroll_frac(&c, md_scroll_to_fraction(&c, want))
+					worst = max(worst, abs(got - want))
+				}
+				schk(&bad, worst < 0.01, fmt.tprintf("bar: fraction -> anchor -> fraction is the identity (worst error %.4f)", worst))
+
+				// Down then up returns to where it started -- the probe-back path,
+				// which is the half of the pixel model with no other witness.
+				a1 := md_scroll_px(&c, Md_Anchor{}, 900)
+				a2 := md_scroll_px(&c, a1, -900)
+				schk(&bad, a1.block > 0, fmt.tprintf("scroll: 900px down moves off the first block (%d/%.1f)", a1.block, a1.px))
+				schk(&bad, a2 == Md_Anchor{}, fmt.tprintf("scroll: ...and 900px back up returns to the top exactly (%d/%.1f)", a2.block, a2.px))
+				a3 := md_scroll_px(&c, a1, -200)
+				a4 := md_scroll_px(&c, a3, 200)
+				schk(&bad, a4 == a1, fmt.tprintf("scroll: a partial step up and back is the identity too (%d/%.1f vs %d/%.1f)", a4.block, a4.px, a1.block, a1.px))
+
+				// 9.4's sync, on the fixture that can tell block from line: eight
+				// blank lines are ONE block, so every one of them maps to the same
+				// preview position. A line-based map returns eight different ones.
+				// "word 000" is 8 bytes and the group's 8 newlines follow, so the
+				// blank run is the 7 empty lines at bytes 9..15 and the next word
+				// block starts at 16. (The first draft said eight and read 7 of 8 --
+				// the test was wrong, not the map.)
+				run_start := 9
+				same := 0
+				a0 := md_anchor_from_top(&c, run_start)
+				for k in 0 ..< 7 {
+					if md_anchor_from_top(&c, run_start + k) == a0 {same += 1}
+				}
+				schk(&bad, same == 7, fmt.tprintf("sync: every line of a 7-line blank RUN maps to one preview block (%d of 7, block %d)", same, a0.block))
+				// ...and the line after it does NOT, or the check above would be
+				// satisfied by a map that returns the same block for everything.
+				schk(&bad, md_anchor_from_top(&c, 16) != a0, fmt.tprintf("sync: ...and the block after the run is a DIFFERENT one (%d)", md_anchor_from_top(&c, 16).block))
+				schk(&bad, a0.block == run_start, fmt.tprintf("sync: ...and that block is the run's own start (%d)", a0.block))
+				// And the inverse maps back onto a line start inside that block,
+				// so the two directions cannot walk the document apart.
+				back := md_anchor_top_byte(&c, a0)
+				schk(&bad, back == a0.block, fmt.tprintf("sync: the reverse map returns the block's line (%d vs %d)", back, a0.block))
+				schk(&bad, md_anchor_from_top(&c, back) == a0, "sync: ...and mapping it forward again is the identity")
+			}
+
+			// --- D. 9.1's pixel -> block search ------------------------------
+			//
+			// "click-to-sync-scroll, which only needs the nearest BLOCK, not the
+			// nearest glyph. Store each block's y range and binary-search it."
+			//
+			// Checked against the DRAW, not against a second walk: each line
+			// carries a link whose target names its own index, so markdown_links
+			// says where the block was actually painted and md_block_at_y has to
+			// agree with that.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				// A real https target, not a bare word: link rects are GATED on
+				// "underlined implies openable" (link_gate_visible), so a fixture
+				// whose targets do not resolve places no rectangles at all -- which
+				// is what the first draft did, and it reported zero links.
+				for i in 0 ..< 40 {fmt.sbprintf(&b, "row [%03d](https://e.test/p%03d) here\n", i, i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "aty.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
+				c, _ := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				line_len := len("row [000](https://e.test/p000) here\n")
+
+				// Off the top by a fraction of a block, so the search is asked a
+				// question the anchor alone cannot answer.
+				at := Md_Anchor{line_len * 3, 11}
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at, context.temp_allocator)
+				schk(&bad, len(hits) >= 6, fmt.tprintf("at_y: the fixture places links to search against (%d)", len(hits)))
+				wrong, checked := 0, 0
+				for hit in hits {
+					idx := -1
+					if len(hit.url) >= 4 {
+						t := hit.url[len(hit.url) - 4:]
+						if t[0] == 'p' {idx = int(t[1] - '0') * 100 + int(t[2] - '0') * 10 + int(t[3] - '0')}
+					}
+					if idx < 0 {continue}
+					checked += 1
+					got, ok := md_block_at_y(&c, at, hit.rect.pos.y + hit.rect.size.y * 0.5)
+					if !ok || got != idx * line_len {wrong += 1}
+				}
+				schk(&bad, checked >= 6, fmt.tprintf("at_y: the targets decoded (%d)", checked))
+				schk(&bad, wrong == 0, fmt.tprintf("at_y: every drawn block's own y searches back to that block (%d of %d wrong)", wrong, checked))
+				// The block at the pane's top edge is the anchor's, which is the
+				// one case the search must not get from a fallback.
+				top_blk, top_ok := md_block_at_y(&c, at, ytop + 1)
+				schk(&bad, top_ok && top_blk == at.block, fmt.tprintf("at_y: the pane's top row is the anchor's own block (%d vs %d)", top_blk, at.block))
+			}
+
+			// --- E. the Split click's own gate: bounded to the preview pane ---
+			//
+			// Review defect: main.odin's click-to-sync-scroll gated on `ro` alone.
+			// `ro` (ro_surface_swallows) is true for the status bar and the find
+			// bar too -- both run through this code before their OWN guards,
+			// further down the same frame -- and true for the EDITOR half
+			// whenever the document is also a table, since ro_surface_swallows
+			// answers from `table` alone, not from which pane the press is in.
+			// Fixed by requiring x >= ed_right and y inside the pane box
+			// md_scroll_ctx already returns -- now md_split_click_gate's own
+			// job (main.odin), not something re-derived here.
+			//
+			// `gated` calls THAT proc, the same one main()'s WM_LBUTTONDOWN path
+			// calls, rather than a copy of its condition -- main() itself cannot
+			// run in a headless test, but the gate it delegates to can, and a
+			// dropped term in the real gate fails these checks, not just a
+			// hand-rolled stand-in for it.
+			{
+				gated :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ed_right, mx, my: f32) -> (blk: int, hit: bool) {
+					ro := ro_surface_swallows(doc.table, doc.md_mode, mx >= ed_right, Drag_Latches{})
+					return md_split_click_gate(doc, c, ro, ed_right, mx, my)
+				}
+
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< 60 {fmt.sbprintf(&b, "para %03d text here\n", i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "gate.md", .UTF8)
+				doc.md_mode = .Split
+				defer doc_close(&doc)
+
+				split_frac := f32(0.5)
+				ed_right := doc_editor_right(&doc, winw, split_frac)
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, split_frac)
+				schk(&bad, cok, "gate: the scroll context resolves for a Split document")
+
+				// 1. The status bar's right portion: doc_content_box already
+				// excludes the bar from the pane box, so this y is genuinely
+				// past ybot.
+				//
+				// RENAMED to say what refuses it (2026-07-29 review, F5). Deleting
+				// BOTH pane-bound predicates -- md_split_click_gate's and
+				// md_block_at_y's -- leaves this row green: a y past ybot is also
+				// past the last block the walk laid out, so the fit test refuses it
+				// first. The row was named for a bound it does not exercise.
+				_, hit1 := gated(&doc, &c, ed_right, ed_right + 20, winh - 4)
+				schk(&bad, !hit1, "gate: a press on the status bar in Split does not sync (past the last block)")
+
+				// 2. The find bar's right portion: above ytop, which insets for it.
+				// The ONE case that is genuinely carried by the pane's y bound --
+				// nothing below the divider can refuse a y that is above the pane,
+				// and this row is the only one of the three that goes red when that
+				// bound is removed.
+				_, hit2 := gated(&doc, &c, ed_right, ed_right + 20, 2)
+				schk(&bad, !hit2, "gate: a press in the find bar's right portion does not sync (above the pane)")
+
+				// 3. The editor half, with the document ALSO a table: this is the
+				// exact case ro_surface_swallows answers true from `table` alone.
+				doc.table = true
+				schk(&bad, ro_surface_swallows(doc.table, doc.md_mode, false, Drag_Latches{}), "gate: precondition -- table+Split swallows the editor half too (ro_surface_swallows)")
+				_, hit3 := gated(&doc, &c, ed_right, ed_right * 0.5, c.ytop + 10)
+				schk(&bad, !hit3, "gate: a press in the editor half, table+Split, does not sync")
+				doc.table = false
+
+				// Positive control: a bound broad enough to exclude everything
+				// above would pass 1-3 for the wrong reason. A press inside the
+				// pane, on real content, DOES sync.
+				blk5, hit5 := gated(&doc, &c, ed_right, ed_right + 20, c.ytop + 10)
+				schk(&bad, hit5, fmt.tprintf("gate: precondition -- a press inside the pane on real content DOES sync (blk=%d)", blk5))
+
+				// 4. The blank strip below the last drawn block, still inside the
+				// pane's geometric box -- a SHORT document, so the pane has room
+				// left over below its content. md_block_at_y's own fit test
+				// (added alongside this gate) must refuse it, not clamp onto the
+				// last block laid out.
+				short_src := "first\n\nsecond\n"
+				short_content := make([]u8, len(short_src))
+				copy(short_content, short_src)
+				short := doc_from_content(short_content, "gate_short.md", .UTF8)
+				short.md_mode = .Split
+				defer doc_close(&short)
+				sc, sc_ok := md_scroll_ctx(&h.gfx, &h.text, &short, px_, winw, winh, split_frac)
+				schk(&bad, sc_ok, "gate: the scroll context resolves for the short Split document")
+				_, hit4 := gated(&short, &sc, ed_right, ed_right + 20, sc.ytop + sc.pane - 2)
+				schk(&bad, !hit4, "gate: a press in the empty strip below the last drawn block does not sync (the fit test)")
+
+				// The gate's own y bound is GONE (F5), and this is the row that says
+				// so rather than leaving it to a comment: md_block_at_y is the only
+				// thing md_split_click_gate calls, and it applies the same pane bound,
+				// so calling the callee directly at a y outside the pane must give the
+				// same answer the gate does. A gate that grew a second bound of its
+				// own would make these two disagree.
+				_, direct_above := md_block_at_y(&c, doc.md_top, 2)
+				_, direct_below := md_block_at_y(&c, doc.md_top, winh - 4)
+				schk(&bad, !direct_above && !direct_below, fmt.tprintf("gate: md_block_at_y alone refuses both out-of-pane rows, so the gate needs no copy of the bound (%v, %v)", direct_above, direct_below))
+			}
+			return
+		}
+
+		// Four properties the batch shipped with no test at all: each was sabotaged
+		// and the whole suite returned 0 failures, and each produces something
+		// visibly wrong. Grouped here rather than folded into the sections above
+		// because they have nothing to do with each other -- what they share is
+		// that nothing was watching them.
+		md_prop_selftest :: proc() -> (bad: int) {
+			pchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1400, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/prop") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(20)
+			winw, winh := f32(W), f32(H)
+			mk :: proc(s: string, name: string) -> Document {
+				content := make([]u8, len(s))
+				copy(content, s)
+				return doc_from_content(content, name, .UTF8)
+			}
+
+			// --- (1) the 72ch measure is a COLUMN, so an indent eats into it ------
+			//
+			// 9.3 caps the measure at 72ch. A list, a quote and a fenced block draw
+			// at cx + indent, so the width they may break to is measure - indent; if
+			// they break to `measure` instead, every one of them runs its own indent
+			// PAST the column that the paragraphs around it respect -- ragged right
+			// edges that step outward with nesting depth, in a pane wide enough that
+			// nothing clips it.
+			//
+			// Asserted on Shaped.width, which is the widest line's advance width and
+			// documented to satisfy width <= max_width for a run that broke
+			// correctly. Read off the cached entries, so this is the number the block
+			// was actually laid out with. Single-letter words, so the greedy break
+			// lands within ~one narrow word of the limit and a 12px fence indent is
+			// still visible in the result.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				words := strings.repeat("a b c d e f g h i j k l m n o p q r s t u v w x y z ", 6, context.temp_allocator)
+				fmt.sbprintf(&b, "%s\n\n", words) // a paragraph: indent 0, the control
+				fmt.sbprintf(&b, "- %s\n", words) // list level 1
+				fmt.sbprintf(&b, "  - %s\n\n", words) // list level 2
+				fmt.sbprintf(&b, "> %s\n", words) // quote level 1
+				fmt.sbprintf(&b, ">> %s\n\n", words) // quote level 2
+				strings.write_string(&b, "```json\n")
+				for _ in 0 ..< 4 {fmt.sbprintf(&b, "%s\n", words)}
+				strings.write_string(&b, "```\n")
+				doc := mk(strings.to_string(b), "indent.md")
+				defer doc_close(&doc)
+				doc.md_mode = .Preview
+				x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, winw, winh, 0.5)
+				pchk(&bad, box_ok, "indent: the fixture has a preview pane")
+				m := md_metrics(&h.text, px_)
+				cx, meas := md_content_span(&m, x0, x1)
+				// The cap must BIND, or every bound below is the pane's and the
+				// property is untestable on this fixture.
+				pchk(&bad, meas == m.measure && x1 - cx > m.measure + sx(100), fmt.tprintf("indent: the 72ch cap binds with room to spare (%.0f of %.0fpx)", meas, x1 - cx))
+
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				over, filled, kinds := 0, 0, 0
+				worst := ""
+				seen_list, seen_quote, seen_fence := false, false, false
+				for &e in doc.md_layout {
+					if !e.valid || e.indent <= 0 || e.sh.lines == 0 {continue}
+					kinds += 1
+					limit := e.measure - e.indent
+					if e.sh.width > limit + 0.5 {
+						over += 1
+						if len(worst) == 0 {worst = fmt.tprintf("%v indent %.0f wrapped to %.1f of %.1f", e.cls.kind, e.indent, e.sh.width, limit)}
+					}
+					// ...and it really did fill its column, or the bound above is
+					// satisfied by any short line.
+					if e.sh.width > limit * 0.75 {filled += 1}
+					switch e.cls.kind {
+					case .List:
+						seen_list = true
+					case .Quote:
+						seen_quote = true
+					case .Fence_Body:
+						seen_fence = true
+					case .Para, .Heading, .Rule, .Blank, .Table, .Fence_Open, .Fence_Close, .Front_Matter:
+					}
+				}
+				pchk(&bad, seen_list && seen_quote && seen_fence, fmt.tprintf("indent: the fixture produced indented list, quote AND fence-body blocks (%v/%v/%v of %d indented)", seen_list, seen_quote, seen_fence, kinds))
+				pchk(&bad, filled >= 5, fmt.tprintf("indent: ...and they really do fill their columns (%d of %d at over three quarters)", filled, kinds))
+				pchk(&bad, over == 0, fmt.tprintf("indent: every indented block breaks to measure MINUS its indent (%d overflow; %s)", over, worst))
+			}
+
+			// --- (2) md_preview_clip, the cover strip -----------------------------
+			//
+			// A pixel offset means the anchor block is routinely drawn PARTIALLY
+			// above the pane, and there is no scissor rect in this renderer -- so the
+			// preview owes its own pane a strip over [0, ytop) exactly as it already
+			// owes one below ybot. Without it the top of the anchor block paints
+			// across the tab rail, on every scroll, at every position that is not a
+			// block boundary.
+			//
+			// Net-new with the pixel anchor: under the byte anchor nothing could sit
+			// above ytop at all, which is why nothing was watching for it.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< 30 {fmt.sbprintf(&b, "# Heading %02d with a good long title on it\n\n", i)}
+				doc := mk(strings.to_string(b), "clip.md")
+				defer doc_close(&doc)
+				doc.md_mode = .Preview
+				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
+				pchk(&bad, ytop > 4, fmt.tprintf("clip: the pane's top edge leaves a strip to cover (ytop %.0f)", ytop))
+				// Scrolled well into the first block, so its glyphs genuinely start
+				// above ytop.
+				at := Md_Anchor{0, 24}
+				// The ink above ytop in the pane's own columns.
+				above :: proc(pix: []u8, x0, x1, ytop: f32) -> (n: int) {
+					bg := g_theme[.Bg_Base]
+					for y in 0 ..< int(ytop) {
+						for x in max(0, int(x0)) ..< min(W, int(x1)) {
+							i := (y * W + x) * 4
+							d := abs(int(pix[i]) - int(bg[2] * 255)) + abs(int(pix[i + 1]) - int(bg[1] * 255)) + abs(int(pix[i + 2]) - int(bg[0] * 255))
+							if d > 24 {n += 1}
+						}
+					}
+					return
+				}
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				raw, ok1 := plat.gfx_readback_bgra(&h.gfx, context.allocator)
+				defer if ok1 {delete(raw)}
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				md_preview_clip(&h.gfx, &h.quads, &doc, winw, winh, 0.5)
+				covered, ok2 := plat.gfx_readback_bgra(&h.gfx, context.allocator)
+				defer if ok2 {delete(covered)}
+				pchk(&bad, ok1 && ok2, "clip: both readbacks succeeded")
+				if ok1 && ok2 {
+					// Non-vacuity FIRST: the content pass really does paint above the
+					// pane at this anchor. Without this the row below is satisfied by
+					// a draw that never overflowed, and the strip is then untested
+					// however green the suite looks.
+					spill := above(raw, x0, x1, ytop)
+					pchk(&bad, spill > 50, fmt.tprintf("clip: the content pass alone paints above the pane at px=24 (%d pixels)", spill))
+					pchk(&bad, above(covered, x0, x1, ytop) == 0, fmt.tprintf("clip: ...and md_preview_clip leaves none of it (%d pixels)", above(covered, x0, x1, ytop)))
+				}
+			}
+
+			// --- (3) md_pane_owns' LEFT bound -------------------------------------
+			//
+			// The dispatch is by PANE, not by mode: in Split both models are on
+			// screen and the editor pass draws full-window width, so an editor link
+			// hit is only meaningful left of the divider. Drop the left bound and the
+			// wheel, the hand cursor and the Ctrl+click all route Split's EDITOR half
+			// to the preview -- scrolling the wrong pane, and hit-testing the
+			// preview's link rects against a press in the editor's text.
+			{
+				doc := mk("para with [a link](https://e.test/p) on it\n", "owns.md")
+				defer doc_close(&doc)
+				doc.md_mode = .Split
+				ed_right := doc_editor_right(&doc, winw, 0.5)
+				x0, _, _, _, box_ok := md_pane_box(&doc, winw, winh, 0.5)
+				pchk(&bad, box_ok && ed_right > sx(200) && ed_right < winw - sx(200), fmt.tprintf("owns: the divider is well inside the window (%.0f of %.0f)", ed_right, winw))
+				// The bound is the PANE's left edge, which is x0 - TEXT_MARGIN_X --
+				// stated here so the check is against md_pane_box's own answer and
+				// not against a second derivation of the divider.
+				left := x0 - TEXT_MARGIN_X
+				pchk(&bad, abs(left - ed_right) < 0.01, fmt.tprintf("owns: ...and the pane's left edge IS the divider (%.1f vs %.1f)", left, ed_right))
+				pchk(&bad, !md_pane_owns(&doc, winw, winh, 0.5, 8), "owns: a column deep in Split's editor half is NOT the preview's")
+				pchk(&bad, !md_pane_owns(&doc, winw, winh, 0.5, left - 1), fmt.tprintf("owns: ...nor is the column one pixel left of the divider (%.0f)", left - 1))
+				pchk(&bad, md_pane_owns(&doc, winw, winh, 0.5, left), fmt.tprintf("owns: the divider's own column IS the preview's (%.0f)", left))
+				pchk(&bad, md_pane_owns(&doc, winw, winh, 0.5, winw - 2), "owns: ...and so is the scrollbar's")
+				// Preview mode owns everything, or the two rows above would also be
+				// satisfied by a bound that refuses the whole window.
+				doc.md_mode = .Preview
+				pchk(&bad, md_pane_owns(&doc, winw, winh, 0.5, 8), "owns: in full Preview the left margin IS the preview's")
+				doc.md_mode = .Off
+				pchk(&bad, !md_pane_owns(&doc, winw, winh, 0.5, winw * 0.5), "owns: with the preview off no column is")
+			}
+
+			// --- (4) .Blank in md_layout_extern_dep -------------------------------
+			//
+			// A Blank block's extent is the RUN of blank lines after it, which its
+			// own `src` (the empty string) cannot witness -- so it keys on
+			// doc.revision instead. `end` in the key does not cover it: a run of ONE
+			// blank line has end == line_end, exactly what a fresh lookup computes,
+			// so the entry hits however much has changed below it.
+			//
+			// The consequence is 9.4's own sync property, across an edit: a run that
+			// GREW is served as one stale block plus fresh ones after it, so the
+			// lines of a single blank run stop mapping to a single preview position.
+			// That is the property section C of md_scroll_selftest asserts on a fresh
+			// document; here it is asserted on an edited one, which is the only place
+			// the revision term can be seen.
+			{
+				// Padded past one pane on purpose: md_anchor_from_top ends in
+				// md_scroll_clamp, and on a document that fits the pane every
+				// position clamps to {0, 0} and the map is unobservable. (The first
+				// draft used the four lines alone and read block 0 five times.)
+				bb := strings.builder_make()
+				defer strings.builder_destroy(&bb)
+				strings.write_string(&bb, "head\n\nXYZW\nfoot\n")
+				for i in 0 ..< 80 {fmt.sbprintf(&bb, "tail para %02d with some words on it\n\n", i)}
+				doc := mk(strings.to_string(bb), "blank.md")
+				defer doc_close(&doc)
+				doc.md_mode = .Preview
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				pchk(&bad, cok, "blank: the scroll context resolves")
+				if cok {
+					// Warm it: one blank line at byte 5, whose entry has end ==
+					// line_end and is therefore indistinguishable from a fresh lookup
+					// on its non-revision terms.
+					one := md_anchor_from_top(&c, 5)
+					pchk(&bad, one.block == 5, fmt.tprintf("blank: the run of one is a block at its own byte (%d)", one.block))
+					pchk(&bad, md_anchor_from_top(&c, 6).block == 6, fmt.tprintf("blank: ...and the line after it is a DIFFERENT block (%d)", md_anchor_from_top(&c, 6).block))
+
+					// One edit turns "XYZW" into three blank lines, so the run from
+					// byte 5 grows from one line to five. Nothing about byte 5's own
+					// line changed.
+					doc_replace_range(&doc, 6, 4, transmute([]u8)string("\n\n\n"))
+					c2, _ := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+					same, blocks := 0, ""
+					for k in 5 ..= 9 {
+						a := md_anchor_from_top(&c2, k)
+						if a.block == 5 {same += 1}
+						blocks = fmt.tprintf("%s %d", blocks, a.block)
+					}
+					pchk(&bad, same == 5, fmt.tprintf("blank: after the edit all five lines of the GROWN run map to one block (%d of 5;%s)", same, blocks))
+					// And the line after the run still does not, or a map that
+					// answered 5 for everything would pass.
+					pchk(&bad, md_anchor_from_top(&c2, 10).block == 10, fmt.tprintf("blank: ...and the line after it still does not (%d)", md_anchor_from_top(&c2, 10).block))
+				}
+			}
+			return
+		}
+
+		// The wheel's REVERSIBILITY, swept -- and the invariant Md_Anchor's own
+		// doc comment states.
+		//
+		// This exists because the two defects it covers BOTH PRODUCED THE VALUE
+		// section C asserts. C's up-scroll runs 900px back from a position where
+		// {0, 0} is the right answer, so an up-step that discarded its target and
+		// returned {0, 0} passed it; C's partial-step check runs at block 240 and
+		// never enters the region where the discard happened at all. A point
+		// assertion cannot see either one. A SWEEP can, and did:
+		//
+		//   F1: md_scroll_px's upward branch computed `target` and then threw it
+		//       away whenever md_probe_back returned n == 0 -- which is exactly
+		//       "the anchor is in the document's FIRST block", since
+		//       md_line_start_back(doc, p, 24) == p only for p == 0. Every
+		//       up-step taken inside block 0 of a document whose first block is
+		//       taller than two wheel notches teleported to the top.
+		//
+		//   F2: md_at_offset clamped px INCLUSIVELY into gap + h, so it emitted
+		//       px == gap + h -- the next block's {start, 0} written in the
+		//       previous block's coordinates. Md_Anchor documents px in
+		//       [0, gap + h) and md_at_offset's own header claims to be the one
+		//       place that guarantees it. md_scroll_scalar then read that as a
+		//       whole block of travel already made, putting the thumb a block
+		//       ahead of the content.
+		//
+		// Swept over fixtures rather than one, because the first block's height is
+		// what decides whether F1's region is reachable at all: a document opening
+		// with an h1 has a slot barely one notch tall and cannot show it.
+		//
+		// Front matter is here in three sizes on purpose. MD_RUNUP_LINES is 24 and
+		// MD_FM_MAX_LINES is 64, so a probe's run-up clears a 20-line card and does
+		// NOT clear a 30- or 50-line one; that seam is asserted as a BOUNDED
+		// exception rather than papered over, and it is the finding recorded as F10.
+		md_wheel_selftest :: proc() -> (bad: int) {
+			wchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 800, 900
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/wheel") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(18)
+			winw, winh := f32(W), f32(H)
+
+			Wheel_Fixture :: struct {
+				name:   string,
+				fm:     int, // lines of front-matter body, 0 for none
+				open:   string, // what the body opens with, before the paragraphs
+				blanks: bool, // a blank line between paragraphs
+				strict: bool, // is exact reversibility claimed at EVERY position?
+			}
+			// Long enough to wrap across three visual lines at the 72ch measure,
+			// which is what makes the FIRST block taller than two wheel notches --
+			// the precondition F1's region needs, and the reason a one-line fixture
+			// cannot see the defect at all.
+			PARA :: "para %02d carries enough words on it to wrap across three whole visual lines at the seventy two character measure the preview holds itself to, which is what gives the block a slot several notches tall\n"
+			fixtures := []Wheel_Fixture {
+				{"plain paragraphs", 0, "", true, true},
+				{"no blank lines", 0, "", false, true},
+				{"opens with a heading", 0, "# Title of the document\n\n", true, true},
+				{"opens with a fence", 0, "```odin\nx := 1\ny := 2\nz := 3\nw := 4\n```\n\n", true, true},
+				{"20 lines of front matter", 20, "", true, true},
+				{"30 lines of front matter", 30, "", true, false},
+				{"50 lines of front matter", 50, "", true, false},
+			}
+
+			// Accumulated across every fixture: the sweep is only meaningful if it
+			// actually ENTERS the two regions, and no single fixture reaches both.
+			saw_f1_region, saw_f2_region := false, false
+
+			for fx in fixtures {
+				b := strings.builder_make()
+				if fx.fm > 0 {
+					strings.write_string(&b, "---\n")
+					for i in 0 ..< fx.fm {fmt.sbprintf(&b, "key%02d: value %02d\n", i, i)}
+					strings.write_string(&b, "---\n")
+				}
+				strings.write_string(&b, fx.open)
+				for i in 0 ..< 40 {
+					fmt.sbprintf(&b, PARA, i)
+					if fx.blanks {strings.write_string(&b, "\n")}
+				}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				strings.builder_destroy(&b)
+
+				doc := doc_from_content(content, "wheel.md", .UTF8)
+				doc.md_mode = .Preview
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				if !cok {
+					wchk(&bad, false, fmt.tprintf("wheel[%s]: the scroll context resolves", fx.name))
+					doc_close(&doc)
+					continue
+				}
+				notch := md_wheel_px(&c)
+
+				// The sweep: one notch at a time from the top, recorded. A NOTCH,
+				// not 900px, because a notch is what the wheel sends and because
+				// the positions that matter are the ones INSIDE a block.
+				pos := make([dynamic]Md_Anchor, 0, 80)
+				append(&pos, Md_Anchor{})
+				for len(pos) < 60 {
+					nxt := md_scroll_px(&c, pos[len(pos) - 1], notch)
+					if nxt == pos[len(pos) - 1] {break}
+					append(&pos, nxt)
+				}
+
+				blocks := 0
+				for p, i in pos {
+					if i == 0 || p.block != pos[i - 1].block {blocks += 1}
+					if p.block == 0 && p.px > notch {saw_f1_region = true}
+					if p.block > 0 && p.px >= notch {saw_f2_region = true}
+				}
+				wchk(&bad, len(pos) >= 20 && blocks >= 3, fmt.tprintf("wheel[%s]: the sweep covers %d positions over %d blocks", fx.name, len(pos), blocks))
+
+				// --- the invariant: px lives in [0, gap + h) --------------------
+				//
+				// Read through md_block_at_byte, the PUBLIC producer of a block's
+				// slot, which takes the same MD_RUNUP_LINES run-up md_pass does --
+				// so "the slot" here is the slot the draw uses. px == slot is the
+				// defect: the next block's origin spelled in this block's units.
+				//
+				// Checked over the up-steps as well as the down sweep, and that is
+				// not thoroughness -- it is where the defect lives. A downward step
+				// resolves inside a walk that continues past the target, so it can
+				// never land on a slot's far edge; the UPWARD step's walk stops AT
+				// the anchor block, so a step smaller than the anchor's own offset
+				// has nowhere in the walk to land and got clamped onto the previous
+				// block's last pixel. Sweeping the down positions alone reported
+				// zero breaks against a model with the defect fully present.
+				inv, worst, scalar_bad := 0, "", 0
+				check_inv :: proc(c: ^Md_Scroll_Ctx, p: Md_Anchor, inv: ^int, worst: ^string, scalar_bad: ^int, how: string) {
+					_, nxt_byte, slot := md_block_at_byte(c, p.block)
+					if p.px < 0 || (slot > 0 && p.px >= slot) || (slot <= 0 && p.px != 0) {
+						inv^ += 1
+						if len(worst^) == 0 {worst^ = fmt.tprintf("%s %d/%.1f of slot %.1f", how, p.block, p.px, slot)}
+					}
+					// The scrollbar's half of the same defect, asserted where it is
+					// visible: the scalar is bytes-plus-a-fraction, so an anchor
+					// inside a block must read STRICTLY less than the byte the next
+					// block begins at. px == slot makes them equal, which is a thumb
+					// a whole block ahead of the content.
+					if md_scroll_scalar(c, p) >= f32(nxt_byte) {scalar_bad^ += 1}
+				}
+				for p in pos {check_inv(&c, p, &inv, &worst, &scalar_bad, "down")}
+				for p in pos {check_inv(&c, md_scroll_px(&c, p, -notch), &inv, &worst, &scalar_bad, "up")}
+				wchk(&bad, inv == 0, fmt.tprintf("wheel[%s]: every anchor either step produces has px in [0, slot) (%d break it; %s)", fx.name, inv, worst))
+				wchk(&bad, scalar_bad == 0, fmt.tprintf("wheel[%s]: ...and none reads as a whole block of travel already made (%d)", fx.name, scalar_bad))
+
+				// --- reversibility: one notch up undoes one notch down ----------
+				//
+				// Walked backwards over the recorded sweep, so EVERY position is
+				// tested, including the ones inside block 0. A tolerance on px and
+				// exact equality on the block: the two directions sum the same
+				// gap + h values in different orders, so a fraction of a pixel is
+				// f32 arithmetic and not a model that lost the position.
+				rev, fail_msg := 0, ""
+				for k := len(pos) - 1; k >= 1; k -= 1 {
+					up := md_scroll_px(&c, pos[k], -notch)
+					if up.block == pos[k - 1].block && abs(up.px - pos[k - 1].px) < 0.05 {continue}
+					rev += 1
+					if len(fail_msg) == 0 {
+						fail_msg = fmt.tprintf("%d/%.1f -up-> %d/%.1f, want %d/%.1f", pos[k].block, pos[k].px, up.block, up.px, pos[k - 1].block, pos[k - 1].px)
+					}
+				}
+				if fx.strict {
+					wchk(&bad, rev == 0, fmt.tprintf("wheel[%s]: a notch up undoes a notch down at all %d positions (%d fail; %s)", fx.name, len(pos) - 1, rev, fail_msg))
+				} else {
+					// Front matter of 30 or 50 lines: MD_RUNUP_LINES cannot reach
+					// byte 0 from the first block BELOW the card, so the probe's
+					// run-up lands INSIDE the card and reads its lines as rules and
+					// paragraphs. MEASURED: exactly ONE up-step diverges, the one
+					// crossing that seam, and every other position on these two
+					// fixtures is exact. The bound is 1 rather than "a few" so it
+					// is an assertion about the seam and not a licence -- a second
+					// divergence means the defect spread. Recorded as F10.
+					wchk(&bad, rev <= 1, fmt.tprintf("wheel[%s]: reversibility is exact but for the ONE up-step crossing the front-matter seam MD_RUNUP_LINES cannot clear (%d of %d fail; %s)", fx.name, rev, len(pos) - 1, fail_msg))
+				}
+				delete(pos)
+				doc_close(&doc)
+			}
+
+			// Without these the sweep could be green on a model that never left the
+			// first notch, and F1's and F2's regions are the whole point of it.
+			wchk(&bad, saw_f1_region, "wheel: the sweep reaches a position inside the FIRST block more than one notch down (F1's region)")
+			wchk(&bad, saw_f2_region, "wheel: ...and one whose offset exceeds a notch, so an up-step stays inside its own block (F2's region)")
+			return
 		}
 
 		// `newtpad mdtest` covers the markdown block classifiers and inline parser
@@ -3722,6 +6257,14 @@ when NEWTPAD_TESTS {
 			bad := md_selftest()
 			bad += md_draw_selftest()
 			bad += md_head_fit_selftest()
+			bad += md_metrics_selftest()
+			bad += md_seam_selftest()
+			bad += md_cache_selftest()
+			bad += md_key_selftest()
+			bad += md_gap_selftest()
+			bad += md_scroll_selftest()
+			bad += md_wheel_selftest()
+			bad += md_prop_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
 			return true
 		}
@@ -4948,6 +7491,628 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad shapetest` exercises src/platform/shape.odin, the proportional
+		// text shaper the markdown preview lays out with (UI spec §9.1). The one
+		// property everything else hangs off is that the shaper is NOT the cell
+		// grid: text_char_width deliberately ROUNDS each advance to a whole pixel
+		// so column n's left edge is exactly n*cell_w, and the shaper must
+		// accumulate the true fractional advance instead. "40 'a's measure exactly
+		// 40 * the unrounded advance" below is the assertion that proves it — a
+		// shaper that rounded per glyph would still pass every ordering check
+		// ("iiii" < "WWWW"), still break greedily, and still be on the grid.
+		if os.args[1] == "shapetest" {
+			sh_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-68s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			sh_shape :: proc(t: ^plat.Text, s: string, mw, lh, px: f32) -> plat.Shaped {
+				return plat.shape_run(nil, t, s, px, mw, lh, .Body, context.temp_allocator)
+			}
+			// Ink width of one line, recomputed from the emitted glyphs rather than
+			// read back from Shaped — so it can disagree with Shaped.width.
+			sh_line_ink :: proc(t: ^plat.Text, s: plat.Shaped, px: f32, line: i32) -> f32 {
+				w := f32(0)
+				for g in s.glyphs {
+					if g.line != line || g.r == ' ' || g.r == '\t' {continue}
+					w = max(w, g.x + plat.text_advance(nil, t, g.r, px, .Body))
+				}
+				return w
+			}
+			// The height a run REPORTS against the height its own glyphs occupy.
+			// Two separate failures, and both must be caught:
+			//   * too small — a glyph's ink box falls outside [0, height);
+			//   * too large — the final line slot holds nothing, which `tight`
+			//     rejects by requiring the lowest baseline to reach into the last
+			//     line's band. A `lines` counted from break events rather than from
+			//     the glyphs actually placed (so "a\n" reports two lines) fails
+			//     exactly here.
+			sh_height_ok :: proc(bad: ^int, s: plat.Shaped, what: string) {
+				sh_chk(bad, abs(s.height - f32(s.lines) * s.line_h) < 0.001, fmt.tprintf("%s: height == lines * line_h", what))
+				inside, maxy := true, f32(0)
+				for g, i in s.glyphs {
+					if g.y - s.ascent < -0.001 {inside = false}
+					if g.y + s.descent > s.height + 0.001 {inside = false}
+					if i == 0 || g.y > maxy {maxy = g.y}
+				}
+				sh_chk(bad, inside, fmt.tprintf("%s: every glyph's ink box lies inside [0, height]", what))
+				tight := s.height == 0 if len(s.glyphs) == 0 else maxy + s.descent > s.height - s.line_h
+				sh_chk(bad, tight, fmt.tprintf("%s: the last line slot is actually occupied", what))
+			}
+			sh_run :: proc(bad: ^int) {
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.println("  FAIL: text_load_faces")
+					bad^ += 1
+					return
+				}
+				px := f32(16)
+				WIDE := f32(100000)
+				// text_load_faces (above) already loaded .Body once, via its own
+				// internal call to text_load_body_face. Calling text_load_body_face
+				// again here to learn which family won would reload the chain and
+				// text_reset_atlas it a second time (text_load_family does that on
+				// every call, by design -- every cached glyph belongs to the old
+				// face). font_family_available is a plain file-existence check with
+				// no side effects, so replay text_load_body_face's own preference
+				// order against it to report the same answer without touching `t`.
+				fam, prop := "", false
+				for f in plat.BODY_FAMILIES {
+					if plat.font_family_available(f) {
+						fam, prop = f.name, true
+						break
+					}
+				}
+				if fam == "" {fam = plat.FONT_FAMILIES[0].name}
+				fmt.printfln("  body face: %q  proportional=%v", fam, prop)
+				sh_chk(bad, prop, "a proportional body face loaded (§9.3 names Georgia)")
+
+				// --- per-glyph fractional advances: the anti-grid property -----
+				fmt.println("--- advances are per-glyph and fractional ---")
+				ai := plat.text_advance(nil, &t, 'i', px, .Body)
+				aW := plat.text_advance(nil, &t, 'W', px, .Body)
+				di := plat.text_advance(nil, &t, 'i', px, .Doc)
+				dW := plat.text_advance(nil, &t, 'W', px, .Doc)
+				fmt.printfln("  @%.0fpx  body i=%.4f W=%.4f   doc i=%.4f W=%.4f", px, ai, aW, di, dW)
+				sh_chk(bad, aW > ai * 1.5, "body face: adv(W) is more than 1.5x adv(i)")
+				sh_chk(bad, di == dW, "the editor's .Doc chain is still monospace (untouched)")
+
+				si := sh_shape(&t, "iiii", WIDE, 0, px)
+				sW := sh_shape(&t, "WWWW", WIDE, 0, px)
+				fmt.printfln("  width(\"iiii\")=%.3f  width(\"WWWW\")=%.3f", si.width, sW.width)
+				sh_chk(bad, sW.width > si.width * 1.5, "\"iiii\" is far narrower than \"WWWW\"")
+
+				// 40 identical glyphs, at a dozen sizes. If the shaper rounded each
+				// advance to a whole pixel the way the grid does, the total would be
+				// 40*round(adv), which is up to 20px away from 40*adv — so the first
+				// check below fails outright. text_advance is the unrounded design
+				// advance, computed before any of the shaper's arithmetic.
+				A40 := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+				frac_sizes := 0
+				acc_ok, div_ok := true, true
+				for p in ([]f32{13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24}) {
+					adv := plat.text_advance(nil, &t, 'a', p, .Body)
+					s := sh_shape(&t, A40, WIDE, 0, p)
+					if len(s.glyphs) != 40 {acc_ok = false;continue}
+					if abs(s.width - 40 * adv) > 0.01 {acc_ok = false}
+					if abs(s.glyphs[39].x - 39 * adv) > 0.01 {acc_ok = false}
+					rounded := math.floor(adv + 0.5)
+					if abs(adv - rounded) > 0.05 {
+						frac_sizes += 1
+						// A grid would land within a rounding error of this.
+						if abs(s.width - 40 * rounded) < 0.5 {div_ok = false}
+					}
+				}
+				fmt.printfln("  %d of 12 sizes have a fractional 'a' advance", frac_sizes)
+				sh_chk(bad, acc_ok, "40 'a's measure exactly 40 * the unrounded advance")
+				sh_chk(bad, frac_sizes >= 1, "at least one size is fractional (the check is not vacuous)")
+				sh_chk(bad, div_ok, "at those sizes the total differs from the per-glyph-rounded one")
+
+				// --- greedy breaking -------------------------------------------
+				fmt.println("--- greedy breaking at the last space ---")
+				TXT := "alpha beta gamma delta"
+				sp := plat.text_advance(nil, &t, ' ', px, .Body)
+				two := sh_shape(&t, "alpha beta", WIDE, 0, px)
+				sh_chk(bad, two.lines == 1, "a run that fits returns one line")
+				mw := two.width + sp * 0.5
+				s := sh_shape(&t, TXT, mw, 0, px)
+				fmt.printfln("  measure %.2f -> %d lines", mw, s.lines)
+				sh_chk(bad, s.lines >= 2, "a run that does not fit breaks")
+				nomid, nolead := true, true
+				for g, i in s.glyphs {
+					if i == 0 || g.line == s.glyphs[i - 1].line {continue}
+					if g.off == 0 || TXT[g.off - 1] != ' ' {nomid = false}
+					if g.r == ' ' {nolead = false}
+				}
+				sh_chk(bad, nomid, "every break lands after a space, never mid-word")
+				sh_chk(bad, nolead, "no line begins with a space")
+				first1 := -1
+				for g, i in s.glyphs {
+					if g.line == 1 {first1 = i;break}
+				}
+				sh_chk(
+					bad,
+					first1 >= 0 && s.glyphs[first1].off == 11 && s.glyphs[first1].r == 'g',
+					"the break is the LAST space that fits (line 2 starts at \"gamma\")",
+				)
+				fits, widest := true, f32(0)
+				for l in 0 ..< i32(s.lines) {
+					li := sh_line_ink(&t, s, px, l)
+					if li > mw + 0.01 {fits = false}
+					widest = max(widest, li)
+				}
+				sh_chk(bad, fits, "every line's ink width stays within the measure")
+				sh_chk(bad, abs(s.width - widest) < 0.01, "Shaped.width equals the widest line actually emitted")
+				lead0 := true
+				for g, i in s.glyphs {
+					if i == 0 || g.line != s.glyphs[i - 1].line {
+						if abs(g.x) > 0.001 {lead0 = false}
+					}
+				}
+				sh_chk(bad, lead0, "each line's first glyph is re-origined to x = 0")
+
+				// The measure above admits exactly whole words, so a breaker that
+				// split at the OVERFLOWING GLYPH instead of at the last space lands
+				// on the same offset for the first break and the check above cannot
+				// tell them apart (verified by sabotage: forcing the char-break path
+				// left every assertion above green except "never mid-word"). This
+				// measure admits "alpha beta g" but not "alpha beta ga", so the two
+				// disagree by one character on the FIRST break — and it is the only
+				// case here that exercises carrying already-placed glyphs down to
+				// the next line, since every other break happens at a word's first
+				// glyph, which has not been placed yet.
+				adv_g := plat.text_advance(nil, &t, 'g', px, .Body)
+				adv_a2 := plat.text_advance(nil, &t, 'a', px, .Body)
+				mw3 := two.width + sp + adv_g + adv_a2 * 0.5
+				s7 := sh_shape(&t, TXT, mw3, 0, px)
+				f7 := -1
+				for g, i in s7.glyphs {
+					if g.line == 1 {f7 = i;break}
+				}
+				sh_chk(bad, f7 >= 0 && s7.glyphs[f7].off == 11, "the break moves BACK to the last space, not to the overflowing glyph")
+				sh_chk(bad, f7 >= 0 && abs(s7.glyphs[f7].x) < 0.001, "the carried glyph is re-origined to x = 0 on its new line")
+
+				// --- trailing spaces at a break --------------------------------
+				fmt.println("--- trailing spaces ---")
+				// "bb" first, deliberately: Shaped.width is the widest LINE, so the
+				// trailing spaces can only show up in it if line 0 is the widest
+				// line. With the narrow word first (the obvious way to write this)
+				// line 1 wins and the assertion measures nothing — which is what the
+				// first draft of this test did, and it failed for that reason rather
+				// than for the shaper's.
+				w_bb := sh_shape(&t, "bb", WIDE, 0, px).width
+				w_aa := sh_shape(&t, "aa", WIDE, 0, px).width
+				mw2 := w_bb + sp * 0.5
+				sh_chk(bad, w_bb > w_aa + 0.01, "(precondition) \"bb\" is wider than \"aa\", so line 0 is the widest")
+				sh_chk(bad, w_bb + 3 * sp > mw2 + 0.01, "(precondition) counting the spaces really would exceed the measure")
+				s2 := sh_shape(&t, "bb   aa", mw2, 0, px)
+				sh_chk(bad, s2.lines == 2, "\"bb   aa\" at the measure of \"bb\" gives two lines")
+				sh_chk(bad, abs(s2.width - w_bb) < 0.01, "the three trailing spaces do not count toward the width")
+				sh_chk(bad, abs(sh_line_ink(&t, s2, px, 0) - w_bb) < 0.01, "line 0's own ink is exactly \"bb\"")
+				sh_chk(bad, s2.width <= mw2 + 0.01, "so the broken line does not exceed the measure")
+				b0 := -1
+				for g, i in s2.glyphs {
+					if g.line == 1 {b0 = i;break}
+				}
+				sh_chk(bad, b0 >= 0 && s2.glyphs[b0].off == 5 && s2.glyphs[b0].r == 'a', "the next line starts at 'a', not at a space")
+				sp0 := 0
+				for g in s2.glyphs {
+					if g.line == 0 && g.r == ' ' {sp0 += 1}
+				}
+				sh_chk(bad, sp0 == 3, "all three spaces hang on the finished line")
+
+				// --- a word longer than the measure ----------------------------
+				fmt.println("--- the over-long word (the classic infinite loop) ---")
+				A36 := "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+				adv_a := plat.text_advance(nil, &t, 'a', px, .Body)
+				s3 := sh_shape(&t, A36, adv_a * 5 + 0.1, 0, px)
+				sh_chk(bad, len(s3.glyphs) == 36, "over-long word: every glyph is still emitted")
+				sh_chk(bad, s3.lines == 8, "over-long word: breaks between characters, 5 per line -> 8 lines")
+				per := [32]int{}
+				ordered := true
+				for g, i in s3.glyphs {
+					if int(g.line) < len(per) {per[g.line] += 1}
+					if i > 0 && g.off <= s3.glyphs[i - 1].off {ordered = false}
+				}
+				empt := false
+				for l in 0 ..< s3.lines {
+					if per[l] == 0 {empt = true}
+				}
+				sh_chk(bad, !empt, "over-long word: no line left empty, so every break made progress")
+				sh_chk(bad, ordered, "over-long word: glyphs stay in source order")
+				sh_chk(bad, s3.lines <= len(s3.glyphs), "line count never exceeds glyph count (a runaway breaker would)")
+				s4 := sh_shape(&t, "abc", 0.5, 0, px)
+				sh_chk(bad, s4.lines == 3 && len(s4.glyphs) == 3, "a glyph wider than the whole measure gets a line to itself")
+				sh_chk(bad, s4.width > 0.5, "...and overflows deliberately rather than vanishing")
+				s5 := sh_shape(&t, "abc", 0, 0, px)
+				sh_chk(bad, s5.lines == 3, "a measure of 0 degenerates to one glyph per line, not a hang")
+				s6 := sh_shape(&t, "hi supercalifragilisticexpialidocious ok", adv_a * 8, 0, px)
+				sh_chk(bad, len(s6.glyphs) == 40 && s6.lines > 1, "a long word among short ones still emits everything")
+
+				// The general invariant, swept over many measures rather than one
+				// hand-picked one: a line may exceed the measure ONLY when it holds
+				// a single glyph that is itself wider than the measure, because
+				// there is nowhere else for that glyph to go. Everything else,
+				// including the line a greedy break carried a partial word onto,
+				// must fit. Found a real overhang: after carrying a tail down, the
+				// glyph that triggered the break was placed without re-testing, so
+				// it hung past the measure whenever the leading word was narrower
+				// than one glyph. Every single-measure case above passed with that
+				// bug present.
+				// width_ok rides the same sweep: the sweep already recomputes every
+				// line's ink from the emitted glyphs (sh_line_ink), independently of
+				// Shaped.width, so it is also the cheapest place to pin
+				// Shaped.width against the widest of those -- over all 125 pairs
+				// rather than the single hand-picked run at "Shaped.width equals the
+				// widest line actually emitted" above. That single-run check cannot
+				// reach the carry-then-character-break window (both breaks firing on
+				// the same glyph): every carry in "alpha beta gamma delta" is empty,
+				// so `ink = pen` after a carry (shape.odin) is live but untested
+				// there. Sabotaged by setting that carried `ink` to 0: the
+				// single-run check above still passed, only this one went red.
+				over_ok, over_seen, width_ok := true, 0, true
+				for txt in ([]string{"i WWWWWW", "a aaaaaaaaaaaa", "alpha beta gamma delta", "WW i WWWW", "iiii WWWW iiii"}) {
+					for k in 1 ..< 26 {
+						mwk := f32(k) * 4
+						sk := sh_shape(&t, txt, mwk, 0, px)
+						ink_n := [64]int{}
+						for g in sk.glyphs {
+							if int(g.line) < 64 && g.r != ' ' && g.r != '\t' {ink_n[g.line] += 1}
+						}
+						widest_k := f32(0)
+						for l in 0 ..< min(sk.lines, 64) {
+							li := sh_line_ink(&t, sk, px, i32(l))
+							widest_k = max(widest_k, li)
+							if li > mwk + 0.01 {
+								over_seen += 1
+								if ink_n[l] > 1 {over_ok = false}
+							}
+						}
+						if abs(sk.width - widest_k) > 0.01 {width_ok = false}
+					}
+				}
+				fmt.printfln("  swept 125 (text, measure) pairs; %d lines exceeded their measure", over_seen)
+				sh_chk(bad, over_ok, "a line exceeds the measure only when it holds one over-wide glyph")
+				sh_chk(bad, over_seen > 0, "the sweep really did reach measures narrower than a glyph")
+				sh_chk(bad, width_ok, "Shaped.width equals the widest line's ink, swept over all 125 pairs")
+
+				// --- the reported height vs the height consumed ----------------
+				fmt.println("--- height agrees with the glyphs emitted ---")
+				sh_height_ok(bad, sh_shape(&t, "alpha beta", WIDE, 0, px), "single line")
+				sh_height_ok(bad, s, "wrapped run")
+				sh_height_ok(bad, s3, "over-long word")
+				sh_height_ok(bad, sh_shape(&t, "   ", WIDE, 0, px), "spaces only")
+				sh_height_ok(bad, sh_shape(&t, "a\n", WIDE, 0, px), "trailing newline")
+				sh_height_ok(bad, sh_shape(&t, "a\nb", WIDE, 0, px), "hard break")
+				sh_height_ok(bad, sh_shape(&t, "", WIDE, 0, px), "empty")
+				// §9.3 asks for a 1.65 line on body text, so the requested leading
+				// has to reach the height; a leading below the face's own ink has to
+				// be clamped up rather than letting glyphs escape the box.
+				sl := sh_shape(&t, "alpha beta gamma", WIDE, 1.65 * px, px)
+				sh_chk(bad, abs(sl.line_h - 1.65 * px) < 0.001, "the requested line height is used verbatim")
+				sh_chk(bad, abs(sl.height - f32(sl.lines) * 1.65 * px) < 0.001, "and reaches the reported height")
+				sh_height_ok(bad, sl, "1.65 leading")
+				asc, desc, _ := plat.text_vmetrics(&t, px, .Body)
+				sc := sh_shape(&t, "alpha", WIDE, 1, px)
+				sh_chk(bad, abs(sc.line_h - (asc + desc)) < 0.001, "a line height below the face's ink is clamped up to it")
+
+				// --- degenerate input ------------------------------------------
+				fmt.println("--- empty and whitespace-only input ---")
+				se := sh_shape(&t, "", WIDE, 0, px)
+				sh_chk(bad, len(se.glyphs) == 0 && se.lines == 0 && se.height == 0 && se.width == 0, "empty input: no glyphs, no height, no crash")
+				sh_chk(bad, se.line_h > 0 && se.ascent > 0, "empty input still reports the line box")
+				ss := sh_shape(&t, "     ", WIDE, 0, px)
+				sh_chk(bad, len(ss.glyphs) == 5 && ss.lines == 1, "spaces only: one line of space glyphs")
+				sh_chk(bad, ss.width < 0.001 && abs(ss.height - ss.line_h) < 0.001, "spaces only: zero ink width, one line of height")
+				sn := sh_shape(&t, "\r\n", WIDE, 0, px)
+				sh_chk(bad, len(sn.glyphs) == 0 && sn.lines == 0, "a bare CRLF emits nothing")
+
+				// --- one measurement path, one cache ---------------------------
+				// The x deltas the shaper emits ARE the advances glyph_get returns --
+				// text_advance is a five-line wrapper over glyph_get and adds no
+				// storage of its own. But comparing shape_run's output to
+				// text_advance, as this section used to, only proves shape_run
+				// calls text_advance -- which it obviously does, since it is the
+				// ONLY place shape_run learns an advance -- it says nothing about
+				// Text.cache, the map glyph_get actually shares with the atlas. Worse,
+				// every call above runs with gfx == nil, and glyph_get explicitly does
+				// NOT cache when gfx is nil (see its comment): "cached" was false on
+				// the very path under test. Demonstrated by sabotage: giving
+				// text_advance a second GetDesignGlyphMetrics path that never touches
+				// Text.cache still passed the old assertion.
+				//
+				// The genuine claim needs a live gfx and an actual look at Text.cache's
+				// occupancy, so stand one up (Headless_Gpu, the mdtest/md_draw_selftest
+				// precedent) rather than rename the old assertion to something true but
+				// smaller.
+				fmt.println("--- the glyph cache is genuinely shared with the atlas (live gfx) ---")
+				{
+					h: Headless_Gpu
+					if headless_gpu_init(&h, 64, 64, "shapetest/cache") {
+						defer headless_gpu_destroy(&h)
+						RUN :: "Wave"
+						// Distinct glyph count shape_run should ask Text.cache for --
+						// counted without assuming ASCII byte offsets line up with rune
+						// indices, since RUN could in principle stop being all-ASCII.
+						seen := [8]rune{}
+						nseen := 0
+						distinct_glyphs := 0
+						for r in RUN {
+							if r == ' ' || r == '\t' {continue}
+							dup := false
+							for k in 0 ..< nseen {
+								if seen[k] == r {
+									dup = true
+									break
+								}
+							}
+							if !dup {
+								seen[nseen] = r
+								nseen += 1
+								distinct_glyphs += 1
+							}
+						}
+
+						before_n := len(h.text.cache)
+						first := plat.shape_run(&h.gfx, &h.text, RUN, px, WIDE, 0, .Body, context.temp_allocator)
+						after1_n := len(h.text.cache)
+						sh_chk(bad, len(first.glyphs) == len(RUN), "live gfx: shaping still emits one glyph per rune")
+						sh_chk(
+							bad,
+							after1_n - before_n == distinct_glyphs,
+							"shaping populates Text.cache with exactly one entry per distinct glyph",
+						)
+
+						// Shape the identical run again: every glyph is now a cache hit,
+						// so neither the cache's size nor the atlas packer's cursor
+						// should move.
+						pack_x0, pack_y0 := h.text.pack_x, h.text.pack_y
+						_ = plat.shape_run(&h.gfx, &h.text, RUN, px, WIDE, 0, .Body, context.temp_allocator)
+						after2_n := len(h.text.cache)
+						sh_chk(bad, after2_n == after1_n, "shaping the same run again adds no new cache entries")
+						sh_chk(
+							bad,
+							h.text.pack_x == pack_x0 && h.text.pack_y == pack_y0,
+							"...and packs nothing new into the atlas",
+						)
+					} else {
+						fmt.println("  (skipped: could not stand up a headless gfx device)")
+					}
+				}
+				sh_chk(
+					bad,
+					abs(plat.text_advance(nil, &t, 'W', px, .Body) - plat.text_advance(nil, &t, 'W', px, .Doc)) > 0.5,
+					"the .Body chain is a genuinely different face from .Doc",
+				)
+				// Adding BODY_FAMILIES must not make a serif reachable from the
+				// editor's font setting: the cell grid's premise is one advance for
+				// every character, and a hand-edited settings.txt saying
+				// `font_family Georgia` has always fallen back to Consolas.
+				// (Left last: this reloads the .Doc chain and resets the atlas.)
+				plat.text_load_family(&t, "Georgia", .Regular, .Doc)
+				sh_chk(
+					bad,
+					plat.text_advance(nil, &t, 'i', px, .Doc) == plat.text_advance(nil, &t, 'W', px, .Doc),
+					"a proportional family named for .Doc still falls back to mono",
+				)
+			}
+			// `shape_spans` (batch 17 task 2a): one line, several faces and sizes.
+			// Its own proc and its own plat.Text — sh_run's last act is to reload
+			// the .Doc chain onto Georgia, and half of what follows compares the
+			// body face against the mono one.
+			sh_spans :: proc(bad: ^int) {
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					sh_chk(bad, false, "text_load_faces (spans)")
+					return
+				}
+				WIDE := f32(100000)
+				// §9.3's own rounding rule: "compute every size as round(k * S)".
+				// Integral sizes are not cosmetic here — Glyph_Key.px is a u16 and
+				// glyph_get truncates into it, so 14.72 and 14.0 would share a
+				// cache entry while rasterizing at different sizes.
+				S := f32(16) // base document size
+				S_CODE := f32(15) // round(0.92 * S), §9.3 inline code
+				S_H1 := f32(30) // round(1.85 * S), §9.3 h1
+
+				// --- a word straddling a span boundary ------------------------
+				//
+				// THE case that makes per-span composition impossible: the break
+				// has to reach backwards into a span that was already emitted and
+				// carry its tail down, which a per-span call cannot do because it
+				// has never seen that glyph array.
+				fmt.println("--- shape_spans: a word straddling a span boundary ---")
+				JOIN := "an alphabe"
+				two := [2]plat.Shape_Span{{"an alpha", S, .Body}, {"be", S, .Body}}
+				// The measure has to sit in a window with three walls, all of them
+				// MEASURED rather than guessed:
+				//   lower: >= width("an alpha"), so span 0 alone would NOT break
+				//          — otherwise the per-span breaker this test rules out
+				//          would have broken too and the comparison proves nothing;
+				//   lower: >= width("alphabe"), so the carried tail plus span 1
+				//          fits and the run is exactly two lines;
+				//   upper: <  width("an alpha") + adv('b'), so span 1's first
+				//          glyph really does overflow and force the break.
+				// The first draft used width("an alpha") + half a 'b' with span 1
+				// = "beta", which left a 0.05px window: it happened to pass, but
+				// on any other body face it would have been a coin toss.
+				w_span0 := plat.shape_run(nil, &t, "an alpha", S, WIDE, 0, .Body, context.temp_allocator).width
+				w_carried := plat.shape_run(nil, &t, "alphabe", S, WIDE, 0, .Body, context.temp_allocator).width
+				lo := max(w_span0, w_carried)
+				hi := w_span0 + plat.text_advance(nil, &t, 'b', S, .Body)
+				fmt.printfln("  two-line measure window: [%.2f, %.2f), %.2fpx wide", lo, hi, hi - lo)
+				sh_chk(bad, hi-lo > 2, "(precondition) the two-line measure window is comfortably wide, not a coin toss")
+				mw := (lo + hi) * 0.5
+				ref := plat.shape_run(nil, &t, JOIN, S, mw, 0, .Body, context.temp_allocator)
+				got := plat.shape_spans(nil, &t, two[:], mw, 0, context.temp_allocator)
+				// Non-vacuity, stated as code: this is what a per-span
+				// composition would have produced. If span 0 alone does not fit
+				// on one line at this measure, the test below proves nothing.
+				naive := plat.shape_run(nil, &t, "an alpha", S, mw, 0, .Body, context.temp_allocator)
+				sh_chk(bad, naive.lines == 1, "(precondition) span 0 alone fits on one line, so a per-span breaker would NOT break it")
+				sh_chk(bad, ref.lines == 2, "(precondition) the joined string does break, at the space before \"alpha\"")
+
+				same := len(got.glyphs) == len(ref.glyphs)
+				if same {
+					for g, i in got.glyphs {
+						r := ref.glyphs[i]
+						if g.r != r.r || g.line != r.line || abs(g.x - r.x) > 0.001 || abs(g.y - r.y) > 0.001 {same = false}
+					}
+				}
+				sh_chk(bad, same, "two spans lay out glyph-for-glyph like ONE run over the joined string")
+				sh_chk(bad, got.lines == ref.lines && abs(got.width - ref.width) < 0.001 && abs(got.height - ref.height) < 0.001, "...and report the same lines, width and height")
+				// The specific thing a per-span breaker gets wrong: "alpha" is in
+				// span 0 and has to end up on line 1, next to span 1's "beta".
+				span0_on_1, span1_on_1 := 0, 0
+				for g in got.glyphs {
+					if g.line != 1 {continue}
+					if g.span == 0 {span0_on_1 += 1}
+					if g.span == 1 {span1_on_1 += 1}
+				}
+				sh_chk(bad, span0_on_1 == 5 && span1_on_1 == 2, fmt.tprintf("the break carried span 0's tail across the boundary (line 1 = %d from span 0 + %d from span 1)", span0_on_1, span1_on_1))
+				f1 := -1
+				for g, i in got.glyphs {
+					if g.line == 1 {f1 = i;break}
+				}
+				sh_chk(bad, f1 >= 0 && got.glyphs[f1].span == 0 && got.glyphs[f1].off == 3 && abs(got.glyphs[f1].x) < 0.001, "line 1 starts at span 0's 'a' (off 3), re-origined to x = 0")
+
+				// (span, off) is the glyph's address in the caller's text, and the
+				// link seam will read it back. Check every glyph's pair actually
+				// decodes to the rune that was emitted — a bookkeeping slip that
+				// leaves `off` measured from the joined string instead of the span
+				// shows up here and nowhere else.
+				addr_ok := true
+				for g in got.glyphs {
+					if int(g.span) >= len(two) {addr_ok = false;continue}
+					txt := two[g.span].text
+					if int(g.off) >= len(txt) {addr_ok = false;continue}
+					r, _ := utf8.decode_rune(txt[g.off:])
+					if r != g.r {addr_ok = false}
+				}
+				sh_chk(bad, addr_ok, "every glyph's (span, off) decodes back to the rune it emitted")
+
+				// --- the line box is the per-line maximum ---------------------
+				fmt.println("--- shape_spans: the line box is the per-LINE maximum ---")
+				a_big, d_big, _ := plat.text_vmetrics(&t, S_H1, .Body_Bold)
+				a_sml, d_sml, _ := plat.text_vmetrics(&t, S_CODE, .Doc)
+				sh_chk(bad, a_big > a_sml + 1 && d_big > d_sml + 0.1, fmt.tprintf("(precondition) the two faces really differ (asc %.3f vs %.3f, desc %.3f vs %.3f)", a_big, a_sml, d_big, d_sml))
+				// Run it BOTH WAYS. Taking spans[0]'s box instead of the maximum
+				// gives the right answer for exactly one of these two orders,
+				// which is why one ordering on its own is not a test.
+				for order in 0 ..< 2 {
+					mix: [2]plat.Shape_Span
+					if order == 0 {
+						mix = {{"Head", S_H1, .Body_Bold}, {"code", S_CODE, .Doc}}
+					} else {
+						mix = {{"code", S_CODE, .Doc}, {"Head", S_H1, .Body_Bold}}
+					}
+					what := "big first" if order == 0 else "small first"
+					m := plat.shape_spans(nil, &t, mix[:], WIDE, 0, context.temp_allocator)
+					if m.lines != 1 || len(m.line_boxes) != 1 {
+						sh_chk(bad, false, fmt.tprintf("%s: expected one line with one box", what))
+						continue
+					}
+					b := m.line_boxes[0]
+					sh_chk(bad, abs(b.ascent - max(a_big, a_sml)) < 0.001, fmt.tprintf("%s: the line's ascent is the TALLER span's (%.3f)", what, b.ascent))
+					sh_chk(bad, abs(b.descent - max(d_big, d_sml)) < 0.001, fmt.tprintf("%s: the line's descent is the DEEPER span's (%.3f)", what, b.descent))
+					// The common baseline, which is what the box is for: inline
+					// code sitting off the prose baseline is the visible defect.
+					one_base := true
+					for g in m.glyphs {
+						if abs(g.y - b.y) > 0.001 {one_base = false}
+					}
+					sh_chk(bad, one_base, fmt.tprintf("%s: every glyph on the line sits on the ONE baseline line_boxes[0].y", what))
+					// And the box actually contains both faces' ink, measured
+					// against each glyph's OWN span metrics rather than the run's.
+					inside := true
+					for g in m.glyphs {
+						asc, desc, _ := plat.text_vmetrics(&t, mix[g.span].px, mix[g.span].set)
+						if g.y - asc < b.top - 0.001 {inside = false}
+						if g.y + desc > b.top + b.h + 0.001 {inside = false}
+					}
+					sh_chk(bad, inside, fmt.tprintf("%s: every glyph's own ink box lies inside the line box", what))
+				}
+
+				// --- per LINE, not per run ------------------------------------
+				//
+				// Two lines, each holding only one of the two sizes: their boxes
+				// must differ. A shaper that gave every line the run's nominal box
+				// passes every check above and fails here.
+				fmt.println("--- shape_spans: different lines get different boxes ---")
+				stack := [2]plat.Shape_Span{{"Head\n", S_H1, .Body_Bold}, {"code", S_CODE, .Doc}}
+				st := plat.shape_spans(nil, &t, stack[:], WIDE, 0, context.temp_allocator)
+				sh_chk(bad, st.lines == 2 && len(st.line_boxes) == 2, "a hard break inside span 0 gives two lines")
+				if st.lines == 2 {
+					h0, h1x := st.line_boxes[0].h, st.line_boxes[1].h
+					fmt.printfln("  line boxes: %.3f (30px body bold) and %.3f (15px mono)", h0, h1x)
+					sh_chk(bad, h0 > h1x + 1, "the heading line's box is taller than the code line's")
+					sh_chk(bad, abs(st.height - (h0 + h1x)) < 0.001, "height is the SUM of the line boxes, not lines * line_h")
+					sh_chk(bad, abs(st.height - f32(st.lines) * st.line_h) > 0.5, "...and is genuinely smaller than lines * line_h, so the check above is not vacuous")
+					sh_chk(bad, abs(st.line_h - max(h0, h1x)) < 0.001, "Shaped.line_h is the NOMINAL box: the tallest a line here can be")
+				}
+				// The boxes tile the run exactly, and every glyph reads its own
+				// line's baseline. Two producers of a y is the bug this rules out.
+				tile, reads := true, true
+				top := f32(0)
+				for b, l in st.line_boxes {
+					if abs(b.top - top) > 0.001 {tile = false}
+					top += b.h
+					_ = l
+				}
+				if abs(top - st.height) > 0.001 {tile = false}
+				for g in st.glyphs {
+					if abs(g.y - st.line_boxes[g.line].y) > 0.001 {reads = false}
+				}
+				sh_chk(bad, tile, "the line boxes tile [0, height) with no gap and no overlap")
+				sh_chk(bad, reads, "every glyph's y IS its line's line_boxes[].y")
+
+				// --- an empty line still owes a height ------------------------
+				blank := [2]plat.Shape_Span{{"Head\n\n", S_H1, .Body_Bold}, {"code", S_CODE, .Doc}}
+				bl := plat.shape_spans(nil, &t, blank[:], WIDE, 0, context.temp_allocator)
+				sh_chk(bad, bl.lines == 3, "two hard breaks leave an empty line in the middle")
+				if bl.lines == 3 {
+					sh_chk(bad, bl.line_boxes[1].h > 0, "the empty line has a height (it takes the box of the span that opened it)")
+					sh_chk(bad, abs(bl.line_boxes[1].h - bl.line_boxes[0].h) < 0.001, "...which is the heading's box, not the code's")
+				}
+
+				// --- widths ---------------------------------------------------
+				fmt.println("--- shape_spans: per-line widths ---")
+				sh_chk(bad, len(ref.line_boxes) == ref.lines, "shape_run fills line_boxes too (one entry per line)")
+				wmax, wagree := f32(0), true
+				for b in got.line_boxes {wmax = max(wmax, b.width)}
+				for b, l in got.line_boxes {
+					if abs(b.width - ref.line_boxes[l].width) > 0.001 {wagree = false}
+				}
+				sh_chk(bad, abs(got.width - wmax) < 0.001, "Shaped.width is the max of the per-line widths")
+				sh_chk(bad, wagree, "and the spanned run's per-line widths match the joined run's")
+
+				// --- degenerate input -----------------------------------------
+				fmt.println("--- shape_spans: degenerate input ---")
+				empty := plat.shape_spans(nil, &t, nil, WIDE, 0, context.temp_allocator)
+				sh_chk(bad, empty.lines == 0 && len(empty.glyphs) == 0 && empty.height == 0, "no spans at all: nothing, and no crash")
+				only := [1]plat.Shape_Span{{"", S, .Body}}
+				eo := plat.shape_spans(nil, &t, only[:], WIDE, 0, context.temp_allocator)
+				sh_chk(bad, eo.lines == 0 && eo.line_h > 0 && eo.ascent > 0, "one empty span: no glyphs, but the line box is still reported")
+				// An empty span BETWEEN two others must not renumber anything or
+				// break the carry — the block model will produce them (an empty
+				// `` `` code span, a zero-length emphasis run).
+				gap3 := [3]plat.Shape_Span{{"an alpha", S, .Body}, {"", S_CODE, .Doc}, {"be", S, .Body}}
+				g3 := plat.shape_spans(nil, &t, gap3[:], mw, 0, context.temp_allocator)
+				g3ok := len(g3.glyphs) == len(ref.glyphs)
+				if g3ok {
+					for g, i in g3.glyphs {
+						if g.r != ref.glyphs[i].r || g.line != ref.glyphs[i].line || abs(g.x - ref.glyphs[i].x) > 0.001 {g3ok = false}
+					}
+				}
+				sh_chk(bad, g3ok, "an empty span in the middle changes nothing about the layout")
+				sh_chk(bad, abs(g3.height - ref.height) < 0.001, "...and does not drag the line box to its own (unused) size")
+			}
+			bad := 0
+			sh_run(&bad)
+			sh_spans(&bad)
+			fmt.printfln("shapetest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad celltest` prints the monospace cell width of sample codepoints and
 		// a byte<->cell round-trip (no GPU; uses text_load_faces).
 		// `newtpad blurtest` verifies the grayscale glyph path rasterizes real
@@ -4964,7 +8129,7 @@ when NEWTPAD_TESTS {
 				bad += 1
 			}
 			for c in ([]struct{r: rune, px: f32}{{'A', 16}, {'g', 16}, {'5', 16}, {'中', 24}, {'W', 200}}) {
-				w, h, inked := plat.text_glyph_coverage_probe(&t, c.r, c.px)
+				w, h, inked, _ := plat.text_glyph_coverage_probe(&t, c.r, c.px)
 				ok := w > 0 && h > 0 && inked
 				fmt.printfln("  %q @ %.0fpx -> %dx%d inked=%v %s", c.r, c.px, w, h, inked, "OK" if ok else "FAIL")
 				if !ok {bad += 1}
@@ -9211,6 +12376,121 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad mdperftest` measures what one WHEEL FRAME of the markdown preview
+		// costs, broken down by the four procedures a scroll frame calls.
+		//
+		// It exists because the 2026-07-29 review measured md_preview_frac at 1.954ms
+		// against markdown_draw's 1.616 -- the scrollbar's fraction costing more than
+		// the content it describes -- and that number had no reproducible harness
+		// behind it. Now it does, so the claim can be re-checked rather than
+		// remembered.
+		//
+		// Meaningful only against `build.bat release tests` (-o:speed). A debug build
+		// measures the debug build.
+		//
+		// The loop is a real frame: scroll, draw, collect links, ask for the
+		// fraction, free the frame arena. The arena free is deliberately OUTSIDE the
+		// timed regions -- it is one call per frame in the product and attributing it
+		// to whichever procedure allocated last would be a lie.
+		if os.args[1] == "mdperftest" {
+			W, H :: 1340, 800
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdperftest") {
+				fmt.println("mdperftest: (skipped: offscreen device init failed)")
+				return true
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			// ~1085 lines of mixed markdown: the review's fixture size, and mixed
+			// because a file of nothing but paragraphs understates the walk (a table
+			// and a blank run are the blocks whose layout keys on doc.revision).
+			b := strings.builder_make()
+			defer strings.builder_destroy(&b)
+			lines := 0
+			for lines < 1085 {
+				i := lines
+				fmt.sbprintf(&b, "## Section %03d\n\n", i)
+				fmt.sbprintf(&b, "A paragraph of body prose with `inline code` and a [link](https://e.test/p%03d) in it, long enough to wrap across the measure more than once so the shaper has real work to do.\n\n", i)
+				fmt.sbprintf(&b, "- first item %03d\n- second item with a little more text on it\n\n", i)
+				strings.write_string(&b, "| col a | col b |\n|---|---|\n| one | two |\n\n")
+				strings.write_string(&b, "```json\n{ \"key\": \"value\", \"n\": 12 }\n```\n\n")
+				lines += 14
+			}
+			src := strings.to_string(b)
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "perf.md", .UTF8)
+			defer doc_close(&doc)
+			doc.md_mode = .Preview
+			px_ := BASE_PX
+			winw, winh := f32(W), f32(H)
+			x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, winw, winh, 0.5)
+			if !box_ok {
+				fmt.println("mdperftest: FAIL no preview pane")
+				return true
+			}
+			c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+			if !cok {
+				fmt.println("mdperftest: FAIL no scroll context")
+				return true
+			}
+			notch := md_wheel_px(&c)
+			mid := doc.pt.length / 3
+			restart := md_anchor_from_top(&c, mid)
+
+			N :: 200
+			// Warm the layout cache and md_max_anchor, so what is measured is a
+			// STEADY-STATE scroll frame and not the first one after an open.
+			at := restart
+			for _ in 0 ..< 8 {
+				at = md_scroll_px(&c, at, notch)
+				doc.md_top = at
+				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				free_all(context.temp_allocator)
+			}
+
+			t_scroll, t_draw, t_links, t_frac, t_frame: time.Duration
+			at = restart
+			for _ in 0 ..< N {
+				f0 := time.tick_now()
+				s0 := time.tick_now()
+				nxt := md_scroll_px(&c, at, notch)
+				// The ceiling is reachable inside 200 notches, and a step that moves
+				// nothing is not a scroll frame. Wrap rather than measure a no-op.
+				at = restart if nxt == at else nxt
+				t_scroll += time.tick_since(s0)
+				doc.md_top = at
+
+				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+				d0 := time.tick_now()
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				t_draw += time.tick_since(d0)
+				l0 := time.tick_now()
+				markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+				t_links += time.tick_since(l0)
+				r0 := time.tick_now()
+				md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				t_frac += time.tick_since(r0)
+				t_frame += time.tick_since(f0)
+				free_all(context.temp_allocator)
+			}
+			ms :: proc(d: time.Duration, n: int) -> f64 {return time.duration_milliseconds(d) / f64(n)}
+			fmt.printfln("mdperftest: %d lines, %dx%d, S=%.0f, mean of %d frames", 1085, W, H, px_, N)
+			fmt.printfln("  md_scroll_px (one notch)   %.3f ms", ms(t_scroll, N))
+			fmt.printfln("  markdown_draw              %.3f ms", ms(t_draw, N))
+			fmt.printfln("  markdown_links             %.3f ms", ms(t_links, N))
+			fmt.printfln("  md_preview_frac            %.3f ms", ms(t_frac, N))
+			fmt.printfln("  whole scroll frame         %.3f ms", ms(t_frame, N))
+			fmt.println("mdperftest: 0 failures")
+			return true
+		}
+
 		// `newtpad hscrolltest` guards the horizontal-scroll seam: with the viewport
 		// panned right by H_SCROLL cells, the drawn column (col_x) and the hit-tested
 		// column (cell_at_x / doc_pos_at) must agree — the §6j "right function, wrong
@@ -12831,13 +16111,25 @@ when NEWTPAD_TESTS {
 					low := row_at_y(px, cbot - 0.25)
 					rb_chk(bad, low <= drawn - 1, fmt.tprintf("%-20s: lowest content pixel is row %d, within the %d drawn", c.what, low, drawn))
 
-					// The markdown panes share the same content box but walk
-					// BASELINES, so they get their own bound. Two properties:
-					// the block of rows md_row_fits admits never crosses cbot
-					// (the overlap Wyatt reported), and it is maximal (no
-					// gratuitous whitespace).
+					// The markdown pane shares the same content box but stacks
+					// BLOCKS, so it gets its own bound. Two properties: the run
+					// of blocks md_block_fits admits never crosses cbot (the
+					// overlap Wyatt reported), and it is maximal (no gratuitous
+					// whitespace).
+					//
+					// RESTATED for the block model (batch 17): the predicate was
+					// md_row_fits(y, px, line_h, cbot) walking BASELINES, whose
+					// `- px` term turned a baseline back into a row top. The
+					// preview no longer has baselines at the block level -- it
+					// stacks block tops -- so the same walk is now stated in tops
+					// with no correction term. The two are the same arithmetic
+					// (`ctop + px - px + line_h <= cbot` is `ctop + line_h <=
+					// cbot`), so both assertions below are unchanged and still
+					// bound the same edge; what changed is that the predicate is
+					// now written in the units the draw actually uses, which is
+					// the whole reason this assertion exists in the first place.
 					k := 0
-					for y := ctop + px; md_row_fits(y, px, line_h, cbot); y += line_h {
+					for y := ctop; md_block_fits(y, line_h, cbot); y += line_h {
 						k += 1
 						if k > 64 {break}
 					}
@@ -19134,6 +22426,392 @@ when NEWTPAD_TESTS {
 				fmt.println("--- worker lifecycle: SKIPPED (pass `live` to start a real check) ---")
 			}
 			fmt.printfln("updatetest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad icontest` parses the committed src/platform/newtpad.ico back out
+		// of its own bytes -- embedded at compile time via #load, so this checks
+		// whatever is actually in the built exe, not a file on disk that could be
+		// stale -- and verifies the properties the batch-17 icon spec calls for:
+		// seven entries at their declared sizes, no two sharing a bitmap offset
+		// (which would mean a scaled duplicate instead of a size-specific render),
+		// 48px and up stored as real PNGs and the four smallest as uncompressed
+		// BGRA, the warm paper colour surviving in every size, and the
+		// two/three-line rule. An
+		// icon that silently regressed to a blank or truncated resource would
+		// otherwise go unnoticed until someone looked at a real taskbar.
+		//
+		// The BMP and PNG decoders here are deliberately minimal: they invert
+		// exactly what tools/gen_icon/main.odin writes (PNG IDAT is always
+		// "stored"/uncompressed deflate blocks, since that is all the generator
+		// ever produces) rather than being general-purpose decoders.
+		if os.args[1] == "icontest" {
+			ico_u16le :: proc(b: []u8, off: int) -> u16 {
+				return u16(b[off]) | u16(b[off + 1]) << 8
+			}
+			ico_u32le :: proc(b: []u8, off: int) -> u32 {
+				return u32(b[off]) | u32(b[off + 1]) << 8 | u32(b[off + 2]) << 16 | u32(b[off + 3]) << 24
+			}
+			ico_i32le :: proc(b: []u8, off: int) -> i32 {
+				return i32(ico_u32le(b, off))
+			}
+			ico_u32be :: proc(b: []u8, off: int) -> u32 {
+				return u32(b[off]) << 24 | u32(b[off + 1]) << 16 | u32(b[off + 2]) << 8 | u32(b[off + 3])
+			}
+			ico_chk :: proc(bad: ^int, cond: bool, msg: string) {
+				fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+				if !cond {bad^ += 1}
+			}
+
+			// Bottom-up BGRA XOR data + 1bpp AND mask behind a BITMAPINFOHEADER --
+			// see tools/gen_icon/main.odin's header comment for the full layout.
+			ico_decode_bmp :: proc(blob: []u8) -> (rgba: []u8, w: int, h: int, ok: bool) {
+				if len(blob) < 40 || ico_u32le(blob, 0) != 40 {return nil, 0, 0, false}
+				w = int(ico_i32le(blob, 4))
+				h = int(ico_i32le(blob, 8)) / 2
+				if w <= 0 || h <= 0 {return nil, 0, 0, false}
+				xor_off := 40
+				if len(blob) < xor_off + w * h * 4 {return nil, 0, 0, false}
+				rgba = make([]u8, w * h * 4, context.temp_allocator)
+				for y in 0 ..< h {
+					file_row := (h - 1) - y
+					for x in 0 ..< w {
+						idx := xor_off + (file_row * w + x) * 4
+						oidx := (y * w + x) * 4
+						rgba[oidx + 0] = blob[idx + 2] // R
+						rgba[oidx + 1] = blob[idx + 1] // G
+						rgba[oidx + 2] = blob[idx + 0] // B
+						rgba[oidx + 3] = blob[idx + 3] // A
+					}
+				}
+				return rgba, w, h, true
+			}
+
+			// Inflate (RFC 1951) supporting stored (BTYPE 00) and fixed Huffman
+			// (BTYPE 01) blocks -- the two shapes tools/gen_icon/main.odin's
+			// deflate_fixed can produce. Dynamic Huffman (BTYPE 10) is
+			// unimplemented, deliberately: this decoder exists only to check
+			// gen_icon's own output, and gen_icon never emits it. Independent
+			// implementation from gen_icon's -- written from RFC 1951 directly,
+			// not copy-pasted -- so this is a real second decoder, not the same
+			// bug reflected back at itself. The length/distance tables
+			// (ico_length_info, ico_distance_info) live at file scope above.
+			Ico_Bit_Reader :: struct {
+				data:   []u8,
+				pos:    int,
+				bitpos: int,
+			}
+			ico_read_bit :: proc(br: ^Ico_Bit_Reader) -> (bit: u32, ok: bool) {
+				if br.pos >= len(br.data) {return 0, false}
+				b := br.data[br.pos]
+				bit = u32((b >> u32(br.bitpos)) & 1)
+				br.bitpos += 1
+				if br.bitpos == 8 {
+					br.bitpos = 0
+					br.pos += 1
+				}
+				return bit, true
+			}
+			ico_read_bits :: proc(br: ^Ico_Bit_Reader, n: int) -> (val: u32, ok: bool) {
+				for i in 0 ..< n {
+					bit, o := ico_read_bit(br)
+					if !o {return 0, false}
+					val |= bit << u32(i)
+				}
+				return val, true
+			}
+			ico_align_byte :: proc(br: ^Ico_Bit_Reader) {
+				if br.bitpos != 0 {
+					br.bitpos = 0
+					br.pos += 1
+				}
+			}
+			// Huffman codes are packed MSB-first (RFC 1951 3.1.1); accumulate bit
+			// by bit and recognise the canonical fixed-code ranges (3.2.6).
+			ico_decode_litlen :: proc(br: ^Ico_Bit_Reader) -> (sym: int, ok: bool) {
+				code := 0
+				for nbits in 1 ..= 9 {
+					bit, o := ico_read_bit(br)
+					if !o {return 0, false}
+					code = (code << 1) | int(bit)
+					if nbits == 7 && code <= 23 {return 256 + code, true}
+					if nbits == 8 {
+						if code >= 48 && code <= 191 {return code - 48, true}
+						if code >= 192 && code <= 199 {return 280 + (code - 192), true}
+					}
+					if nbits == 9 && code >= 400 && code <= 511 {return 144 + (code - 400), true}
+				}
+				return 0, false
+			}
+			ico_decode_dist :: proc(br: ^Ico_Bit_Reader) -> (code: int, ok: bool) {
+				v := 0
+				for i in 0 ..< 5 {
+					bit, o := ico_read_bit(br)
+					if !o {return 0, false}
+					v = (v << 1) | int(bit)
+				}
+				if v > 29 {return 0, false}
+				return v, true
+			}
+			ico_inflate :: proc(data: []u8, length_info, distance_info: []Ico_Code_Info) -> (out: []u8, ok: bool) {
+				br := Ico_Bit_Reader{data = data}
+				result: [dynamic]u8
+				for {
+					final, o1 := ico_read_bits(&br, 1)
+					if !o1 {return nil, false}
+					btype, o2 := ico_read_bits(&br, 2)
+					if !o2 {return nil, false}
+					switch btype {
+					case 0:
+						ico_align_byte(&br)
+						if br.pos + 4 > len(data) {return nil, false}
+						blen := int(data[br.pos]) | int(data[br.pos + 1]) << 8
+						nlen := int(data[br.pos + 2]) | int(data[br.pos + 3]) << 8
+						if blen != (~nlen & 0xFFFF) {return nil, false}
+						br.pos += 4
+						if br.pos + blen > len(data) {return nil, false}
+						append(&result, ..data[br.pos:br.pos + blen])
+						br.pos += blen
+					case 1:
+						block_ok := false
+						for {
+							sym, sok := ico_decode_litlen(&br)
+							if !sok {return nil, false}
+							if sym < 256 {
+								append(&result, u8(sym))
+							} else if sym == 256 {
+								block_ok = true
+								break
+							} else {
+								idx := sym - 257
+								if idx < 0 || idx >= len(length_info) {return nil, false}
+								extra, eok := ico_read_bits(&br, length_info[idx].extra)
+								if !eok {return nil, false}
+								mlen := length_info[idx].base + int(extra)
+								dcode, dok := ico_decode_dist(&br)
+								if !dok {return nil, false}
+								dextra, deok := ico_read_bits(&br, distance_info[dcode].extra)
+								if !deok {return nil, false}
+								dist := distance_info[dcode].base + int(dextra)
+								if dist <= 0 || dist > len(result) {return nil, false}
+								start := len(result) - dist
+								for k in 0 ..< mlen {
+									append(&result, result[start + k])
+								}
+							}
+						}
+						if !block_ok {return nil, false}
+					case:
+						return nil, false // dynamic Huffman: unimplemented, unused
+					}
+					if final == 1 {break}
+				}
+				return result[:], true
+			}
+
+			// PNG Paeth predictor (PNG spec 9.4), and the inverse of filter
+			// types 0-4 applied per scanline (spec 9.2/9.3).
+			ico_paeth :: proc(a, b, c: int) -> int {
+				p := a + b - c
+				pa, pb, pc := abs(p - a), abs(p - b), abs(p - c)
+				if pa <= pb && pa <= pc {return a}
+				if pb <= pc {return b}
+				return c
+			}
+			ico_unfilter :: proc(raw: []u8, w, h: int) -> (rgba: []u8, ok: bool) {
+				bpp :: 4
+				stride := w * bpp
+				if len(raw) < (1 + stride) * h {return nil, false}
+				rgba = make([]u8, w * h * 4, context.temp_allocator)
+				prev := make([]u8, stride, context.temp_allocator)
+				cur := make([]u8, stride, context.temp_allocator)
+				for y in 0 ..< h {
+					row_start := y * (1 + stride)
+					ftype := raw[row_start]
+					data := raw[row_start + 1:row_start + 1 + stride]
+					for x in 0 ..< stride {
+						a := int(cur[x - bpp]) if x >= bpp else 0
+						b := int(prev[x])
+						c := int(prev[x - bpp]) if x >= bpp else 0
+						recon: int
+						switch ftype {
+						case 0:
+							recon = int(data[x])
+						case 1:
+							recon = int(data[x]) + a
+						case 2:
+							recon = int(data[x]) + b
+						case 3:
+							recon = int(data[x]) + (a + b) / 2
+						case 4:
+							recon = int(data[x]) + ico_paeth(a, b, c)
+						case:
+							return nil, false
+						}
+						cur[x] = u8(recon)
+					}
+					copy(rgba[y * stride:(y + 1) * stride], cur[:])
+					copy(prev[:], cur[:])
+				}
+				return rgba, true
+			}
+
+			// Signature + IHDR + IDAT(s) + IEND, 8-bit RGBA, one of PNG's five
+			// per-row filter types on each scanline, IDAT a zlib stream (stored
+			// or fixed-Huffman deflate blocks -- see ico_inflate above).
+			ico_decode_png :: proc(blob: []u8) -> (rgba: []u8, w: int, h: int, ok: bool) {
+				sig := [8]u8{0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A}
+				if len(blob) < 8 {return nil, 0, 0, false}
+				for i in 0 ..< 8 {
+					if blob[i] != sig[i] {return nil, 0, 0, false}
+				}
+				pos := 8
+				idat: [dynamic]u8
+				for pos + 8 <= len(blob) {
+					length := int(ico_u32be(blob, pos))
+					ctype := string(blob[pos + 4:pos + 8])
+					if pos + 8 + length + 4 > len(blob) {return nil, 0, 0, false}
+					data := blob[pos + 8:pos + 8 + length]
+					switch ctype {
+					case "IHDR":
+						w = int(ico_u32be(data, 0))
+						h = int(ico_u32be(data, 4))
+					case "IDAT":
+						append(&idat, ..data)
+					}
+					pos += 8 + length + 4
+					if ctype == "IEND" {break}
+				}
+				if w <= 0 || h <= 0 || len(idat) < 6 {return nil, 0, 0, false}
+
+				raw, iok := ico_inflate(idat[2:len(idat) - 4], ico_length_info[:], ico_distance_info[:])
+				if !iok {
+					fmt.println("    icontest: PNG deflate stream failed to inflate")
+					return nil, 0, 0, false
+				}
+
+				unfiltered, uok := ico_unfilter(raw, w, h)
+				if !uok {
+					fmt.println("    icontest: PNG scanline un-filter failed")
+					return nil, 0, 0, false
+				}
+				return unfiltered, w, h, true
+			}
+
+			ICO := #load("../platform/newtpad.ico")
+			bad := 0
+
+			ico_chk(&bad, ico_u16le(ICO, 0) == 0 && ico_u16le(ICO, 2) == 1, "ICONDIR: reserved=0, type=1 (icon)")
+			count := int(ico_u16le(ICO, 4))
+			ico_chk(&bad, count == 7, fmt.tprintf("ICONDIR: 7 entries (got %d)", count))
+
+			Entry :: struct {
+				w, h, bytes_in_res, image_off: int,
+			}
+			entries: [dynamic]Entry
+			for i in 0 ..< count {
+				eoff := 6 + i * 16
+				if eoff + 16 > len(ICO) {break}
+				ew := int(ICO[eoff]);   if ew == 0 {ew = 256}
+				eh := int(ICO[eoff + 1]); if eh == 0 {eh = 256}
+				append(&entries, Entry{ew, eh, int(ico_u32le(ICO, eoff + 8)), int(ico_u32le(ICO, eoff + 12))})
+			}
+
+			want_sizes := []int{16, 20, 24, 32, 48, 64, 256}
+			for i in 0 ..< min(len(entries), len(want_sizes)) {
+				e := entries[i]
+				ico_chk(&bad, e.w == want_sizes[i] && e.h == want_sizes[i], fmt.tprintf("entry %d declares %dx%d", i, want_sizes[i], want_sizes[i]))
+			}
+
+			seen: map[int]int
+			dup := false
+			for e, i in entries {
+				if prev, exists := seen[e.image_off]; exists {
+					dup = true
+					fmt.printfln("    entry %d shares its bitmap offset with entry %d", i, prev)
+				}
+				seen[e.image_off] = i
+			}
+			delete(seen)
+			ico_chk(&bad, !dup, "no two entries share a bitmap offset (no scaled duplicates)")
+
+			Decoded :: struct {
+				w, h:  int,
+				rgba:  []u8,
+				valid: bool,
+			}
+			decoded: [dynamic]Decoded
+			for e, i in entries {
+				if e.image_off < 0 || e.image_off + e.bytes_in_res > len(ICO) {
+					ico_chk(&bad, false, fmt.tprintf("entry %d: bitmap offset/length inside the file", i))
+					append(&decoded, Decoded{})
+					continue
+				}
+				blob := ICO[e.image_off:e.image_off + e.bytes_in_res]
+				is_png := len(blob) >= 4 && blob[0] == 0x89 && blob[1] == 0x50 && blob[2] == 0x4E && blob[3] == 0x47
+				// CORRECTED, not relaxed (2026-07-29 review, F8). This asserted
+				// `e.w == 256`, i.e. that 16/20/24/32/48/64 were all raw BGRA -- and
+				// they were, which is why 36 KB of a 39 KB resource was uncompressed
+				// bitmap in a file made entirely of flat colour. The 48 and 64 entries
+				// are where the bytes are (25 KB of the 36) and are PNG now; the four
+				// smallest stay BMP for shell compatibility and cost 6 KB together.
+				// The threshold matches gen_icon's ICO_PNG_FROM, and is asserted here
+				// off the committed bytes rather than trusted from the generator.
+				want_png := e.w >= 48
+				ico_chk(&bad, is_png == want_png, fmt.tprintf("entry %d (%dpx) stored as %s", i, e.w, "PNG" if want_png else "uncompressed BGRA"))
+
+				rgba: []u8
+				dw, dh: int
+				ok: bool
+				if is_png {
+					rgba, dw, dh, ok = ico_decode_png(blob)
+				} else {
+					rgba, dw, dh, ok = ico_decode_bmp(blob)
+				}
+				ico_chk(&bad, ok && dw == e.w && dh == e.h, fmt.tprintf("entry %d (%dpx) bitmap dimensions match the directory", i, e.w))
+				append(&decoded, Decoded{dw, dh, rgba, ok})
+			}
+
+			// Paper colour: sampled at the right edge, mid-height. By construction
+			// (see gen_icon's inside_rounded_rect) that point is always fully
+			// inside the opaque paper fill and to the right of every rectangle in
+			// the design, unlike the literal geometric centre -- the spec's own
+			// hand-tuned 96/48/32px artwork puts the second text line exactly on
+			// the centre pixel, so asserting paper there would be asserting
+			// against the source spec, not for it.
+			for d, i in decoded {
+				if !d.valid {continue}
+				x, y := d.w - 2, d.h / 2
+				idx := (y * d.w + x) * 4
+				ok := d.rgba[idx] == 0xF2 && d.rgba[idx + 1] == 0xEB && d.rgba[idx + 2] == 0xE0 && d.rgba[idx + 3] == 255
+				ico_chk(&bad, ok, fmt.tprintf("entry %d (%dpx) paper colour #F2EBE0 at (%d,%d)", i, d.w, x, y))
+			}
+
+			// Text-line bar count, walking straight down the column at x = w/2
+			// (inside every line rect at every shipped size). 16px and 20px drop
+			// the third line -- it would render under ~2px -- everything 24px and
+			// up keeps all three.
+			want_bars := []int{2, 2, 3, 3, 3, 3, 3}
+			for d, i in decoded {
+				if !d.valid {continue}
+				x := d.w / 2
+				bars, in_bar := 0, false
+				for y in 0 ..< d.h {
+					idx := (y * d.w + x) * 4
+					is_paper := d.rgba[idx] == 0xF2 && d.rgba[idx + 1] == 0xEB && d.rgba[idx + 2] == 0xE0
+					is_content := d.rgba[idx + 3] == 255 && !is_paper
+					if is_content && !in_bar {
+						bars += 1
+						in_bar = true
+					} else if !is_content {
+						in_bar = false
+					}
+				}
+				want := want_bars[i] if i < len(want_bars) else -1
+				ico_chk(&bad, bars == want, fmt.tprintf("entry %d (%dpx) has %d text-line bar(s), want %d", i, d.w, bars, want))
+			}
+
+			fmt.printfln("icontest: %d failures", bad)
 			return true
 		}
 

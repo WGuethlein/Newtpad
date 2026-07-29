@@ -266,6 +266,47 @@ split_line_ref :: proc(s: string) -> (target_len, line, col: int) {
 	return
 }
 
+// A Link describing the WHOLE of `target`, as if it had been scanned on a line
+// consisting of nothing but that token. `start` comes back 0; a caller with a
+// containing line rebases it.
+//
+// Two callers, from opposite ends. links_scan's `[label](target)` branch has
+// found a target and needs it classified. The markdown preview's block layout
+// (md_block_links) already KNOWS the target -- md_inline parsed it out of the
+// same syntax -- and needs the (text, Link) pair link_resolve and link_follow
+// take. Building that pair by hand at either site would put a second copy of
+// "what a :line:col suffix means" and "which schemes are openable" in the tree.
+link_whole :: proc(target: string) -> (l: Link, ok: bool) {
+	if len(target) == 0 {return {}, false}
+	if plat.url_is_openable(target) {
+		return Link{start = 0, len = len(target), kind = .URL, target_len = len(target)}, true
+	}
+	tl, ln, cl := split_line_ref(target)
+	if tl <= 0 {return {}, false}
+	if !is_smb_url(target[:tl]) && !looks_like_path(target[:tl]) {return {}, false}
+	return Link {
+			start = 0,
+			len = len(target),
+			kind = .Line_Ref if ln > 0 else .Path,
+			line = ln,
+			col = cl,
+			target_len = tl,
+		},
+		true
+}
+
+// Stamp the resolution cache's generation for this frame's viewport walk. One
+// call per pass, exactly as links_layout makes for the editor pane -- the
+// markdown preview is a SECOND viewport walk over the same document and must
+// share the cache rather than stat the same targets again. See Link_Cache.
+link_cache_begin :: proc(doc: ^Document) {link_cache_sync(doc)}
+
+// links_layout's own gate -- "underlined implies openable" -- for the markdown
+// preview's block layout, which produces its link rectangles from the shaper
+// instead of from the cell grid but must apply the identical admission rule.
+// Requires link_cache_begin to have run for this pass.
+link_gate_visible :: proc(doc: ^Document, text: string, l: Link) -> bool {return link_gate(doc, text, l)}
+
 // Scan one line of text for links. Results are temp-allocated and point into
 // `text` by offset. `text` is expected to be already capped by the caller.
 links_scan :: proc(text: string, allocator := context.temp_allocator) -> []Link {
@@ -378,25 +419,14 @@ links_scan :: proc(text: string, allocator := context.temp_allocator) -> []Link 
 				j := us
 				for j < len(text) && text[j] != ')' && !is_delim(text[j]) {j += 1}
 				if j < len(text) && text[j] == ')' && j > us {
-					inner := text[us:j]
-					if plat.url_is_openable(inner) {
-						append(&out, Link{start = us, len = j - us, kind = .URL, target_len = j - us})
-						i = j + 1
-						continue
-					}
-					tl, ln, cl := split_line_ref(inner)
-					if tl > 0 && (is_smb_url(inner[:tl]) || looks_like_path(inner[:tl])) {
-						append(
-							&out,
-							Link {
-								start = us,
-								len = j - us,
-								kind = .Line_Ref if ln > 0 else .Path,
-								line = ln,
-								col = cl,
-								target_len = tl,
-							},
-						)
+					// link_whole, not a second copy of the URL/path/:line:col
+					// rules: the markdown preview reaches the same decision from
+					// the other end (it already knows the target, having parsed
+					// `[label](target)` itself) and the two must agree about what
+					// counts as a link.
+					if l, lok := link_whole(text[us:j]); lok {
+						l.start = us
+						append(&out, l)
 						i = j + 1
 						continue
 					}

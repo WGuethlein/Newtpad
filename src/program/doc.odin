@@ -1014,14 +1014,63 @@ Document :: struct {
 	table_edit_buf:    [dynamic]u8,
 	table_edit_caret:  int, // byte offset within table_edit_buf
 	// Markdown view (see markdown.odin): Off / Preview (full) / Split (editor +
-	// live preview). Both Preview and Split scroll from doc.top -- Split keeps the
-	// two panes anchored to the same source line.
+	// live preview).
 	md_mode:     Md_Mode,
+	// The preview pane's own scroll position, in PIXELS (UI spec 9.1 item 4).
+	//
+	// doc.top stays the EDITOR's and is untouched by this: the editor pane keeps
+	// the row grid, the byte anchor and its own scrollbar. The preview does not,
+	// because it has no grid to anchor to -- a blank run is one zero-height block,
+	// so a preview screen covers about three times the source an editor screen
+	// does, and sharing one byte offset made the last stretch of the preview's
+	// scroll travel show nothing new (2b's measurement: bottom=194 against the
+	// editor's ceiling).
+	//
+	// Kept in step with doc.top by md_sync_top, which records the doc.top the
+	// preview last mirrored: they differ => the editor moved => the preview
+	// re-anchors by BLOCK (9.4). Not persisted -- see session.odin's format
+	// comment: a session records doc.top, and the preview is derived from it on
+	// restore, so there is no format change and no saved position to lose.
+	md_top:      Md_Anchor,
+	md_sync_top: int,
+	// md_max_anchor's answer and the key it was computed under. See Md_Max_Key:
+	// a scroll moves no term of the key, which is the case that has to be free.
+	md_max:      Md_Anchor,
+	md_max_key:  Md_Max_Key,
+	// md_scroll_frac's DENOMINATOR -- md_scroll_scalar at md_max -- under the same
+	// key. Cached with the anchor rather than recomputed from it because deriving
+	// the scalar costs a walk of its own, and the fraction is asked for once per
+	// frame by the scrollbar. See md_scroll_frac.
+	md_max_scalar: f32,
+	// One block's slot height and extent: md_slot_at's answer, warmed by whichever
+	// pass last walked that block. See Md_Slot_Key and md_pass -- the point is that
+	// the walk the DRAW makes is the one the scrollbar's fraction then reads,
+	// instead of the fraction making a second walk over the same blocks inside
+	// render_frame.
+	md_slot_key:  Md_Slot_Key,
+	md_slot_next: int,
+	md_slot_h:    f32,
 	// Per-block column measure (markdown.odin). Four slots, not one, so two table
 	// blocks on screen at once don't thrash a single slot every frame; no
 	// allocation, so nothing to free on doc close.
 	md_table:      [MD_TABLE_SLOTS]Md_Table_Cache,
 	md_table_next: int, // round-robin replacement cursor
+	// Per-block laid-out glyph positions (UI spec 9.1's layout cache). Keyed on
+	// the block's start byte and its own source text -- see MD_LAYOUT_SLOTS.
+	//
+	// A SLICE, allocated lazily on the first preview pass, not a fixed array
+	// like md_table above it. Md_Layout is ~300 bytes and there are 256 slots
+	// (MD_LAYOUT_SLOTS) -- doubled since batch 17's pixel anchor, see that
+	// constant's comment -- so inline it would put ~75 KB into every Document.
+	// The argument holds a fortiori now that the slot count is bigger; only
+	// the numbers below moved. And a Document is created BY VALUE in several
+	// places (doc_from_content returns one; test_mode_dispatch holds them as
+	// locals in an already-enormous frame).
+	// Measured: making it inline turned every headless mode into an immediate
+	// STATUS_STACK_OVERFLOW (0xC00000FD), including modes that never open a
+	// document, which is the third time this frame has done that. Freed
+	// explicitly by md_layout_reset, which doc_close calls.
+	md_layout: []Md_Layout,
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)
@@ -1305,6 +1354,12 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.filter_line_nos)
 	delete(doc.table_widths)
 	delete(doc.table_edit_buf)
+	// The markdown preview's per-block layout cache owns heap storage (a source
+	// copy, a span text store, the shaper's glyph and line-box arrays, and the
+	// span boxes) for every filled slot. Freed here rather than left to the
+	// process because a session that opens and closes many markdown files would
+	// otherwise leak a screenful of shaped glyphs per file.
+	md_layout_reset(doc)
 	base.pt_destroy(&doc.pt)
 	if doc.owned_orig {
 		delete(doc.original)
