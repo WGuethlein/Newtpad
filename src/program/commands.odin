@@ -1433,8 +1433,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			}
 		}
 	case .Toggle_Preview:
-		// Cycle Off -> Preview -> Split -> Off. Both preview modes scroll from
-		// doc.top; Split anchors the editor and preview to the same source line.
+		// Cycle Off -> Preview -> Split -> Off. The preview scrolls in pixels from
+		// its own anchor (doc.md_top); re-anchoring doc.top to a line start here is
+		// what the frame's sync then maps onto it, so turning the preview on lands
+		// it on the block the caret's line is in.
 		if doc.kind == .Text && doc_can_markdown(doc) {
 			switch doc.md_mode {
 			case .Off:

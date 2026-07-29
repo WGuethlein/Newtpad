@@ -16,6 +16,17 @@
 // the reader keeps a tolerant ladder so a session written by any older build
 // still restores (see session_restore's per-version field counts). Format 5's
 // field is the bookmark list.
+//
+// The markdown preview's PIXEL scroll offset (doc.md_top, UI spec 9.1 item 4)
+// is deliberately NOT a field here, and the format is NOT bumped for it.
+// `top` is the editor's line and the preview is DERIVED from it on the first
+// frame after restore, by the same block map 9.4's Split sync uses -- so a
+// restored preview lands at the top of the block the saved line is in, which is
+// where the saved line is. Persisting the pixels instead would mean restoring a
+// sub-block offset into a layout whose block heights depend on the window size,
+// the type scale and the theme, none of which the session records: the same
+// number would mean a different place. This way there is no migration and no
+// saved position to lose.
 package main
 
 import "core:fmt"

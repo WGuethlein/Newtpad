@@ -1567,7 +1567,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	}
 
 	// Markdown Split: a divider, the live preview in the right half, and a second
-	// byte-proportional scrollbar mirroring the shared scroll (doc.top).
+	// scrollbar on the preview's OWN pixel range (md_vscrollbar_geo) -- the two
+	// panes no longer share one scroll position, they are mapped onto each other
+	// by block once a frame. See the sync in the frame loop.
 	if doc.kind == .Text && doc.md_mode == .Split {
 		pvtop, pvbot := doc_content_box(doc, h)
 		// The editor pass above draws full-window width, so its lines bleed into the
@@ -1580,9 +1582,9 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		dr := md_divider_rect(doc, w, h, rc.app.settings.split_frac)
 		line_w := hairline()
 		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {dr.pos.x + dr.size.x * 0.5 - line_w * 0.5, dr.pos.y}, size = {line_w, dr.size.y}, color = g_theme[.Border_Strong]}})
-		// Preview follows the editor's scroll (doc.top): one synced position, both
-		// panes anchored to the same source line. Pane box from md_pane_box, the
-		// producer the link pass reads too.
+		// The preview draws from its OWN pixel anchor (doc.md_top), which the
+		// frame's sync has already mapped onto doc.top by block. Pane box from
+		// md_pane_box, the producer the link pass reads too.
 		// `mok` is CHECKED here, as the .Preview branch above already checks it
 		// (L4, 2026-07-29): md_pane_box returns ok=false for a pane with no width
 		// -- a split fraction dragged to the right edge, or a window narrower than

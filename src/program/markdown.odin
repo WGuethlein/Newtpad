@@ -1314,13 +1314,18 @@ md_block_fits :: #force_inline proc(ytop, h, ybot: f32) -> bool {
 //	Span  :: struct { text, style_flags, colour_role }
 //
 // A block is still derived from ONE source line (a blank run, front matter and
-// a table's column measure are the exceptions, and each is bounded). That is
-// deliberate and it is what keeps the preview byte-anchored: doc.top, both
-// scrollbars, the wheel, session restore and Split's sync all still address a
-// source byte, so this change is a layout change with no state migration in it.
-// Joining a paragraph's hard-wrapped lines into one block turns a long
-// paragraph into an unscrollable unit under a byte anchor, so it waits for the
-// pixel scroll offset.
+// a table's column measure are the exceptions, and each is bounded).
+//
+// PARAGRAPH JOINING -- treating a paragraph's hard line breaks as soft, per
+// 9.2 -- is still not done, and it is deliberately not part of the pixel
+// anchor either. Its original reason to wait is gone: a long joined block is
+// no longer unscrollable, because the anchor can now sit part way down one.
+// What it is now is a PARSER change, not a scroll change -- it alters which
+// source lines form a block, which moves every block start byte, which is the
+// layout cache's key, the anchor's identity, 9.4's sync map and the fence
+// seed's input. Batching it with the scroll model would mean neither could be
+// bisected from the other. It is its own task, and the pixel anchor is what
+// unblocks it.
 
 Md_Style :: enum u8 {
 	Bold,
