@@ -105,6 +105,46 @@ md_selftest :: proc() -> (bad: int) {
 		chk(&bad, !t3 && r3 == "[y] neither", "[y] is not a task box")
 		chk(&bad, !t4 && r4 == "not a task", "plain text is not a task")
 	}
+	// --- the ticked checkbox's tick is centred on the BOX (live pass 0.27) ---
+	//
+	// Wyatt: "the X is at the bottom right of the box, not in the center". The
+	// tick is now geometry, so its placement is measurable without a device:
+	// take the union bounding box of the quads md_tick_quads emits and compare
+	// its centre against the box's. Run at three UI scales, because the
+	// stroke width is hairline() (scale-dependent) while the box size is not,
+	// and an off-by-one-stroke centring error only shows up when they differ.
+	{
+		old_scale := UI_SCALE
+		defer UI_SCALE = old_scale
+		for scale in ([]f32{1.0, 1.5, 2.0}) {
+			UI_SCALE = scale
+			bx, by := f32(100), f32(200)
+			bs := f32(11.2) * scale
+			tq: [MD_TICK_STEPS * 2]plat.Quad
+			n := md_tick_quads(bx, by, bs, {1, 1, 1, 1}, tq[:])
+			chk(&bad, n >= 4, fmt.tprintf("scale %.1f: the tick draws at all (%d quads)", scale, n))
+			if n == 0 {continue}
+			lo, hi := tq[0].pos, tq[0].pos + tq[0].size
+			for q in tq[1:n] {
+				lo = {min(lo.x, q.pos.x), min(lo.y, q.pos.y)}
+				hi = {max(hi.x, q.pos.x + q.size.x), max(hi.y, q.pos.y + q.size.y)}
+			}
+			cx, cy := (lo.x + hi.x) * 0.5, (lo.y + hi.y) * 0.5
+			bcx, bcy := bx + bs * 0.5, by + bs * 0.5
+			// The tolerance is 0.05px, not the "within one pixel" the task
+			// asked for, and deliberately: md_tick_quads centres EXACTLY by
+			// construction (each diagonal's f runs 0 ..= arm-st and a step is
+			// st wide, so the union spans exactly arm), leaving only float
+			// error. A 1px tolerance was measured to ADMIT the defect -- the
+			// shipped `bx + bs*0.28` origin offset is 0.34px off centre at
+			// scale 1, so it passed a 1px bound and the assertion proved
+			// nothing. A bound that cannot reject the bug is not a test.
+			chk(&bad, abs(cx - bcx) <= 0.05 && abs(cy - bcy) <= 0.05, fmt.tprintf("scale %.1f: tick centre (%.2f,%.2f) is the box centre (%.2f,%.2f)", scale, cx, cy, bcx, bcy))
+			// ...and it stays inside the box, or "centred" could be satisfied by
+			// a tick that overhangs symmetrically.
+			chk(&bad, lo.x >= bx && lo.y >= by && hi.x <= bx + bs && hi.y <= by + bs, fmt.tprintf("scale %.1f: tick stays inside the box", scale))
+		}
+	}
 	chk(&bad, md_heading_level("# H") == 1, "# H -> h1")
 	chk(&bad, md_heading_level("### H") == 3, "### H -> h3")
 	chk(&bad, md_heading_level("####### H") == 0, "7 hashes -> not a heading")
@@ -645,6 +685,48 @@ md_task :: proc(content: string) -> (rest: string, done, is_task: bool) {
 	return rest, done, true
 }
 
+// The most steps md_tick_quads will emit per diagonal; the buffer a caller
+// needs is twice this, since the X has two of them.
+MD_TICK_STEPS :: 32
+
+// The tick inside a ticked task checkbox, as geometry, CENTRED on the box.
+//
+// Two things were wrong with drawing it as `text_draw(.., "x", bx + bs*0.28,
+// y, ..)`. The one Wyatt saw -- "the X is at the bottom right of the box, not
+// in the center" -- is that a glyph's ink box is not its layout box: that x is
+// a pen origin and that y is a BASELINE, so an "x" placed from the box's
+// ORIGIN lands wherever the face's advance and x-height happen to put its ink,
+// which for Cascadia Mono at a box of 1.4 cells is low and to the right. The
+// second is the reason caption_btn's `.Close` case (ui_tabs.odin) already
+// draws its X as a stepped stack of quads: batch 12 moved the chrome onto
+// Cascadia Mono, so a glyph is one font substitution away from being a box.
+//
+// Centring is on the box's CENTRE, not its origin: the returned quads' union
+// bounding box is exactly [cx-arm/2, cx+arm/2] x [cy-arm/2, cy+arm/2] by
+// construction (each diagonal's f runs 0 ..= arm-st, and a step is st wide),
+// which is what the mdtest assertion checks.
+//
+// Returns the quads rather than drawing them so that assertion needs no device
+// -- the md_row_fits precedent.
+md_tick_quads :: proc(bx, by, bs: f32, col: [4]f32, out: []plat.Quad) -> (n: int) {
+	st := max(1, hairline())
+	// Half the box, so the tick clears the 1-2px border on every side instead
+	// of touching it.
+	arm := max(st * 2, bs * 0.5)
+	x0 := bx + (bs - arm) * 0.5
+	y0 := by + (bs - arm) * 0.5
+	span := max(0, arm - st)
+	steps := clamp(int(arm), 2, MD_TICK_STEPS)
+	for i in 0 ..< steps {
+		if n + 2 > len(out) {break}
+		f := span * f32(i) / f32(steps - 1)
+		out[n] = {pos = {x0 + f, y0 + f}, size = {st, st}, color = col}
+		out[n + 1] = {pos = {x0 + span - f, y0 + f}, size = {st, st}, color = col}
+		n += 2
+	}
+	return
+}
+
 // YAML front matter: a `---` fence on line 1, closed by `---` or `...`. Returns
 // the byte offset just past the closing fence, or 0 when the document does not
 // open with one. Bounded by a line budget so a file whose first line happens to
@@ -981,7 +1063,9 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 					},
 				)
 				if done {
-					plat.text_draw(gfx, text, "x", bx + bs * 0.28, y, px, g_theme[.Accent], .Doc)
+					tq: [MD_TICK_STEPS * 2]plat.Quad
+					nt := md_tick_quads(bx, by, bs, g_theme[.Accent], tq[:])
+					plat.quads_draw(gfx, qp, tq[:nt])
 					task_col = g_theme[.Text_Muted]
 				}
 				x := ind + bs + char_w
