@@ -1170,10 +1170,13 @@ when NEWTPAD_TESTS {
 				ra_chk(&bad, len(doc.undo) == before_undo, "...and pushes no undo entry")
 			}
 
-			// Regex mode. The replacement is LITERAL -- group substitution ($1) is
-			// unimplemented (find.odin's header says so), so this pins today's
-			// behaviour rather than leaving it to be discovered: a "$1" in the
-			// replace field lands in the file as those two characters.
+			// Regex mode. This used to pin the OPPOSITE: "$1" landed in the file as
+			// those two characters, because group substitution was unimplemented.
+			// It is implemented now (find.odin, find_subst_expand), so the pin is
+			// inverted rather than deleted -- the assertion that the group is NOT
+			// spliced in is what would have caught a regression, and its mirror
+			// image is what catches one now. findtest_subst below owns the grammar;
+			// this one keeps the Replace All path itself honest.
 			{
 				src := strings.repeat("cat cat cat\n", 10, context.temp_allocator)
 				doc := doc_from_content(transmute([]u8)strings.clone(src), "ra5.txt", .UTF8)
@@ -1182,8 +1185,8 @@ when NEWTPAD_TESTS {
 				replaced, _, matches, _ := run(&doc, "c(a)t", "X$1", true)
 				after := doc_debug_string(&doc)
 				ra_chk(&bad, matches == 30 && replaced == 30, fmt.tprintf("a capture-group pattern matches and replaces all 30 (%d/%d)", matches, replaced))
-				ra_chk(&bad, strings.count(after, "X$1") == 30, fmt.tprintf("the replacement is literal today -- no $1 substitution (%d)", strings.count(after, "X$1")))
-				ra_chk(&bad, strings.count(after, "Xa") == 0, "...and specifically the group is NOT spliced in")
+				ra_chk(&bad, strings.count(after, "Xa") == 30, fmt.tprintf("$1 substitutes the group in every one (%d Xa, want 30)", strings.count(after, "Xa")))
+				ra_chk(&bad, strings.count(after, "$") == 0, fmt.tprintf("...and no literal $ survives (%d)", strings.count(after, "$")))
 			}
 
 			// WHAT IT COSTS THE UI THREAD AT THE CEILING.
@@ -1269,6 +1272,268 @@ when NEWTPAD_TESTS {
 					}
 					ra_chk(&bad, ok, fmt.tprintf("%s (got %v, want %v)", c.what, out[:n], c.want))
 				}
+			}
+			return
+		}
+
+		// Capture-group substitution in the replacement: the .NET/JavaScript
+		// grammar ($1, ${12}, $&, $$) that VS Code's find widget implements.
+		//
+		// Two halves, and they fail for different reasons. The first drives
+		// find_subst_expand directly with hand-written capture positions, so the
+		// token grammar is checked without a regex engine anywhere near it -- and
+		// so an UNSET middle group can be expressed at all, which is the case
+		// core:text/regex's own Capture cannot represent (it compacts the -1
+		// entries out and silently renumbers everything after them; that is why
+		// find_subst_one drives the VM itself rather than calling regex.match).
+		// The second runs whole documents through find_replace_all, where the
+		// window read, the re-match and the offset bookkeeping are all live.
+		//
+		// Its own proc for the usual reason: test_mode_dispatch's frame has hit
+		// STATUS_STACK_OVERFLOW twice, and only one Document is live at a time.
+		findtest_subst :: proc() -> (bad: int) {
+			fmt.println("--- regex replacement: capture-group substitution ---")
+			sb_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+
+			// --- the grammar, on hand-written captures ---
+			{
+				// "abbbc" with group 1 = "bbb" -- the design doc's own example.
+				src := "abbbc"
+				pos := [][2]int{{0, 5}, {1, 4}, {-1, -1}}
+				for c in ([]struct {
+					repl, want: string,
+				} {
+					{"[$1]", "[bbb]"},
+					{"$&", "abbbc"},
+					{"$0", "abbbc"},
+					{"$$", "$"},
+					{"$$1", "$1"}, // "$$" consumes BOTH, so the 1 is a literal
+					{"$$$1", "$bbb"}, // ...and the next $ opens a real token
+					{"$x", "$x"},
+					{"$", "$"},
+					{"a$", "a$"},
+					{"${1}", "bbb"},
+					{"${1}2", "bbb2"}, // the reason braces exist
+					{"$12", "bbb2"}, // group 12 does not exist -> group 1, then '2'
+					{"${12}", ""}, // ...but spelled with braces it is out of range: empty
+					{"${0}", "abbbc"},
+					{"${}", "${}"},
+					{"${x}", "${x}"},
+					{"${1", "${1"},
+					{"$2", ""}, // declared-but-unset (or absent) -> empty, not an error
+					{"$9", ""},
+					{"plain text", "plain text"},
+					{"", ""},
+					{"a${1}b$&c$$d", "abbbbabbbcc$d"},
+				}) {
+					out := make([dynamic]u8, 0, 32, context.temp_allocator)
+					find_subst_expand(transmute([]u8)c.repl, transmute([]u8)src, pos, &out)
+					got := string(out[:])
+					sb_chk(&bad, got == c.want, fmt.tprintf("%-12q -> %q (want %q)", c.repl, got, c.want))
+				}
+			}
+			{
+				// AN UNSET GROUP IN THE MIDDLE. This is the one shape that proves
+				// the group numbering is positional rather than an index into
+				// whatever captured: regex.Capture would report {0,4} and {1,3}
+				// here and $1 would come out "bc".
+				src := "abcd"
+				pos := [][2]int{{0, 4}, {-1, -1}, {1, 3}}
+				out := make([dynamic]u8, 0, 32, context.temp_allocator)
+				repl := "[$1][$2]"
+				find_subst_expand(transmute([]u8)repl, transmute([]u8)src, pos, &out)
+				sb_chk(&bad, string(out[:]) == "[][bc]", fmt.tprintf("an unset group 1 does not renumber group 2: %q (want %q)", string(out[:]), "[][bc]"))
+			}
+			// The gate itself. A replacement with no token must not reach any of
+			// the above -- that is what keeps a plain replace byte-identical to
+			// what it was before substitution existed.
+			for c in ([]struct {
+				repl: string,
+				want: bool,
+			} {
+				{"dog", false},
+				{"", false},
+				{"costs $", false},
+				{"$x", false},
+				{"a$ b", false},
+				{"$1", true},
+				{"$0", true},
+				{"x$&y", true},
+				{"$$", true},
+				{"${1}", true},
+				{"${x}", true}, // over-inclusive on purpose: costs a regex run, not a bug
+			}) {
+				got := find_subst_wanted(transmute([]u8)c.repl)
+				sb_chk(&bad, got == c.want, fmt.tprintf("find_subst_wanted(%q) = %v (want %v)", c.repl, got, c.want))
+			}
+
+			// --- whole documents through find_replace_all ---
+			run :: proc(doc: ^Document, q, r: string) -> (replaced, matches: int) {
+				doc.cursor, doc.anchor = 0, 0
+				find_open(doc, true)
+				clear(&doc.find.query)
+				clear(&doc.find.replace)
+				doc.find.regex = true
+				doc.find.field = 0
+				for c in q {find_input_rune(doc, c)}
+				doc.find.field = 1
+				for c in r {find_input_rune(doc, c)}
+				doc.find.field = 0
+				find_wait(doc)
+				matches = len(doc.find.matches)
+				replaced, _ = find_replace_all(doc)
+				return
+			}
+			e2e :: proc(bad: ^int, src, q, r, want, what: string) {
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				replaced, matches := run(&doc, q, r)
+				got := doc_debug_string(&doc)
+				ok := got == want && matches > 0 && replaced > 0
+				fmt.printfln("  %-5s %s: %q -> %q (want %q, %d matches, %d replaced)", "ok" if ok else "FAIL", what, src, got, want, matches, replaced)
+				if !ok {bad^ += 1}
+			}
+			e2e(&bad, "abbbc", "a(b+)c", "[$1]", "[bbb]", "the design doc's own example")
+			e2e(&bad, "abbbc", "a(b+)c", "<$&>", "<abbbc>", "$& is the whole match")
+			e2e(&bad, "abbbc", "a(b+)c", "<$0>", "<abbbc>", "$0 is the whole match too")
+			e2e(&bad, "abbbc", "a(b+)c", "$$", "$", "$$ is one literal dollar")
+			e2e(&bad, "abbbc", "a(b+)c", "$x", "$x", "$x is literal")
+			e2e(&bad, "aa-bbb", "(a+)-(b+)", "$2:$1", "bbb:aa", "the groups come out in the order they were numbered")
+			e2e(&bad, "aa-bbb", "(a+)-(b+)", "${2}${1}", "bbbaa", "...and the braced form agrees")
+			// The maximum this engine can express: core:text/regex caps at
+			// MAX_CAPTURE_GROUPS (10) counting the whole match, so 9 is the
+			// highest group a pattern can have -- and ${9} is the two-token proof
+			// that braces are parsed for more than a single digit.
+			e2e(&bad, "abcdefghi", "(a)(b)(c)(d)(e)(f)(g)(h)(i)", "${9}${8}$1", "iha", "${9} reaches the last group a 9-group pattern has")
+			// An optional group that did not participate substitutes EMPTY, and
+			// the same pattern with the group present still substitutes it. Both
+			// lines, one document, so a fix that returns empty for everything
+			// cannot pass.
+			e2e(&bad, "xz\nxyz\n", "x(y)?z", "[$1]", "[]\n[y]\n", "an unset optional group is empty, a set one is not")
+			// A capture whose own text contains a $ is copied out verbatim: no
+			// second round of substitution over the group's bytes.
+			e2e(&bad, "Qa$bQ", "Q([^Q]+)Q", "[$1]", "[a$b]", "a $ inside the captured text is not re-expanded")
+			e2e(&bad, "Qa$1bQ", "Q([^Q]+)Q", "[$1]", "[a$1b]", "...nor is a $1 inside it")
+			// THE ANCHOR TRAP, MADE OBSERVABLE. `\B` matches only where the byte
+			// BEFORE the match is a word character -- exactly the byte a re-match
+			// over a copied slice of the matched text cannot see. The scan finds
+			// one match here, in "xcat"; if find_subst_one did not hand the VM that
+			// preceding 'x', the re-match would not reproduce the span, the
+			// verification would reject it and this would come out "x[] cat".
+			e2e(&bad, "xcat cat", "\\B(cat)", "[$1]", "x[cat] cat", "the byte before the match is visible to \\B at replace time")
+			// ...and its mirror: `\b` must still be FALSE where the scan said it
+			// was false, so a seeded byte cannot be turned into a free pass.
+			e2e(&bad, "xcat cat", "\\b(cat)", "[$1]", "xcat [cat]", "...and \\b still fails where the scan said it failed")
+
+			// REPLACE MATCH, not Replace All. A second, independent path through
+			// the same expansion (find_replacement_for), and the one where the
+			// ordering hazard is sharpest: doc_replace_sel ends in find_invalidate
+			// -> search_stop, which frees search.query, so an expansion built after
+			// the splice would be re-matching with a freed pattern.
+			{
+				src := "aa-bbb aa-bbb\n"
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub4.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				doc.cursor, doc.anchor = 0, 0
+				find_open(&doc, true)
+				clear(&doc.find.query)
+				clear(&doc.find.replace)
+				doc.find.regex = true
+				doc.find.field = 0
+				for c in "(a+)-(b+)" {find_input_rune(&doc, c)}
+				doc.find.field = 1
+				for c in "$2:$1" {find_input_rune(&doc, c)}
+				doc.find.field = 0
+				find_wait(&doc)
+				n0 := len(doc.find.matches)
+				doc.find.current = 0
+				find_replace_current(&doc)
+				once := doc_debug_string(&doc)
+				find_wait(&doc)
+				doc.find.current = 0
+				find_replace_current(&doc)
+				twice := doc_debug_string(&doc)
+				sb_chk(&bad, n0 == 2, fmt.tprintf("the fixture holds two matches (%d)", n0))
+				sb_chk(&bad, once == "bbb:aa aa-bbb\n", fmt.tprintf("Replace Match substitutes the groups too: %q", once))
+				sb_chk(&bad, twice == "bbb:aa bbb:aa\n", fmt.tprintf("...and the second one, re-found after the first edit shifted it: %q", twice))
+			}
+
+			// A replacement with NO token takes the cheap path, and the cheap path
+			// is the one that was there before any of this. Checked two ways: the
+			// gate says so, and the document says so.
+			{
+				src := strings.repeat("cat cat\n", 50, context.temp_allocator)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub2.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				plain := "dog"
+				replaced, matches := run(&doc, "c(a)t", plain)
+				want := strings.repeat("dog dog\n", 50, context.temp_allocator)
+				got := doc_debug_string(&doc)
+				sb_chk(&bad, !find_subst_wanted(transmute([]u8)plain), "a replacement with no $ is refused by the gate...")
+				sb_chk(&bad, matches == 100 && replaced == 100, fmt.tprintf("...the regex still matches and replaces all 100 (%d/%d)", matches, replaced))
+				sb_chk(&bad, got == want, fmt.tprintf("...and the buffer is byte-identical to the literal splice (%d bytes, want %d)", len(got), len(want)))
+			}
+
+			// LENGTH-CHANGING EXPANSIONS ACROSS MANY MATCHES. Every line expands
+			// by a DIFFERENT number of bytes (the index is doubled, and the index
+			// grows from one digit to three), so a single wrong offset anywhere in
+			// the last->first apply loop leaves a document that does not compare
+			// equal -- which a fixture of uniform-length replacements would not
+			// catch, and which the equal-length case above cannot catch at all.
+			{
+				sb := strings.builder_make(context.temp_allocator)
+				want_sb := strings.builder_make(context.temp_allocator)
+				N :: 250
+				for i in 0 ..< N {
+					fmt.sbprintf(&sb, "xn%dey\n", i)
+					fmt.sbprintf(&want_sb, "x<%d%d>y\n", i, i)
+				}
+				src := strings.to_string(sb)
+				want := strings.to_string(want_sb)
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub3.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				replaced, matches := run(&doc, "n([0-9]+)e", "<$1$1>")
+				got := doc_debug_string(&doc)
+				sb_chk(&bad, matches == N && replaced == N, fmt.tprintf("all %d matches are found and replaced (%d/%d)", N, matches, replaced))
+				sb_chk(&bad, len(got) == len(want), fmt.tprintf("the length-changing expansions total up exactly (%d bytes, want %d)", len(got), len(want)))
+				diff := -1
+				for k in 0 ..< min(len(got), len(want)) {
+					if got[k] != want[k] {
+						diff = k
+						break
+					}
+				}
+				sb_chk(&bad, got == want, fmt.tprintf("every later offset survives a growing replacement (first difference at byte %d)", diff))
+			}
+
+			// WHAT SUBSTITUTION COSTS THE UI THREAD AT THE CEILING. Replace All is
+			// a buffer write and so is the main thread's by construction; the
+			// question is whether it stays BOUNDED once each match also costs a
+			// piece-table read and a regex run. Same saturated fixture the literal
+			// path is measured against in findtest_replace_all, so the two numbers
+			// are directly comparable and the surcharge is visible rather than
+			// asserted. The guard is a tripwire for an O(n^2), not a promise about
+			// any particular file.
+			{
+				src := strings.repeat("cat\n", 120_000, context.temp_allocator) // > MAX_MATCHES
+				doc := doc_from_content(transmute([]u8)strings.clone(src), "sub5.txt", .UTF8)
+				defer doc_close(&doc)
+				doc.kind = .Text
+				start := time.tick_now()
+				replaced, matches := run(&doc, "c(a)t", "<$1>")
+				ms := time.duration_milliseconds(time.tick_since(start))
+				got := doc_debug_string(&doc)
+				sb_chk(&bad, matches == MAX_MATCHES && replaced == MAX_MATCHES, fmt.tprintf("the match list is saturated and all of it is replaced (%d/%d)", matches, replaced))
+				sb_chk(&bad, strings.count(got, "<a>") == MAX_MATCHES, fmt.tprintf("every one of them substituted the group (%d, want %d)", strings.count(got, "<a>"), MAX_MATCHES))
+				fmt.printfln("  ---   %d substituting replacements (scan included) on the main thread: %.0f ms", replaced, ms)
+				sb_chk(&bad, ms < 3000, fmt.tprintf("...and it stays inside the tripwire (%.0f ms)", ms))
 			}
 			return
 		}
@@ -1520,6 +1785,7 @@ when NEWTPAD_TESTS {
 			bad += findtest_first_paint()
 			bad += findtest_autoselect()
 			bad += findtest_replace_all()
+			bad += findtest_subst()
 			bad += findtest_replace_seam()
 			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")
 			return true
