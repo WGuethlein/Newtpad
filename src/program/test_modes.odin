@@ -3973,6 +3973,461 @@ when NEWTPAD_TESTS {
 			}
 			return bad
 		}
+		// mdtest's TYPE-SCALE checks (UI spec 9.3).
+		//
+		// Pure arithmetic, and it is pinned exactly rather than approximately for
+		// a reason that is not aesthetic. Glyph_Key.px is a u16 and glyph_get
+		// truncates into it (`u16(px)`, platform/text.odin), so two sizes that
+		// truncate to the same integer share ONE atlas entry, carrying whichever
+		// advance and rasterized bitmap arrived first. 9.3's answer is "compute
+		// every size as round(k * S) into the metrics struct once", and the
+		// assertions below are that rule stated in the two forms that can fail:
+		// every size is the rounded product, and every size survives the
+		// truncation the atlas key performs.
+		md_metrics_selftest :: proc() -> (bad: int) {
+			mchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			// A device only for the font faces: md_metrics reads the body face's
+			// advance for '0' to turn 9.3's "72ch" into pixels. Its own, and
+			// destroyed before the next proc stands one up -- one at a time.
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, 64, 64, "mdtest/metrics") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			t := &h.text
+			saved := UI_SCALE
+			defer UI_SCALE = saved
+			// Both an integral and a fractional UI scale: the S-derived sizes must
+			// not move with it (they are multiples of S), while the fixed-pixel
+			// decorations must.
+			for scale in ([]f32{1.0, 1.5}) {
+				UI_SCALE = scale
+				for s in ([]f32{12, 14, 16, 20, 24, 31}) {
+					m := md_metrics(t, s)
+					r :: proc(s, k: f32) -> f32 {return max(1, f32(int(s * k + 0.5)))}
+					rows := []struct {
+						got:  f32,
+						want: f32,
+						what: string,
+					} {
+						{m.head[1], r(s, 1.85), "h1 1.85 S"},
+						{m.head[2], r(s, 1.50), "h2 1.50 S"},
+						{m.head[3], r(s, 1.25), "h3 1.25 S"},
+						{m.head[4], r(s, 1.10), "h4 1.10 S"},
+						{m.head[5], r(s, 1.00), "h5 1.00 S"},
+						{m.head[6], r(s, 1.00), "h6 1.00 S"},
+						{m.body, r(s, 1.00), "paragraph 1.00 S"},
+						{m.code, r(s, 0.92), "code 0.92 S"},
+						{m.table, r(s, 0.95), "table 0.95 S"},
+						{m.caption, r(s, 0.88), "caption 0.88 S"},
+						{m.body_lead, r(s, 1.65), "body leading 1.65 S"},
+						{m.head_above[2], r(s, 1.60), "h2 space above 1.6 S"},
+						{m.head_above[3], r(s, 1.40), "h3 space above 1.4 S"},
+						{m.head_above[4], r(s, 1.20), "h4 space above 1.2 S"},
+						{m.head_above[5], r(s, 1.00), "h5 space above 1.0 S"},
+						{m.head_below[1], r(s, 0.60), "h1 space below 0.6 S"},
+						{m.head_below[2], r(s, 0.50), "h2 space below 0.5 S"},
+						{m.head_below[3], r(s, 0.40), "h3 space below 0.4 S"},
+						{m.head_below[4], r(s, 0.30), "h4 space below 0.3 S"},
+						{m.para_below, r(s, 0.80), "paragraph space below 0.8 S"},
+						{m.list_gap, r(s, 0.25), "list gap 0.25 S"},
+						{m.quote_above, r(s, 0.80), "blockquote space above 0.8 S"},
+						{m.quote_below, r(s, 0.80), "blockquote space below 0.8 S"},
+						{m.fence_above, r(s, 1.00), "fenced code space above 1.0 S"},
+						{m.fence_below, r(s, 1.00), "fenced code space below 1.0 S"},
+					}
+					wrong, first := 0, ""
+					for row in rows {
+						if row.got != row.want {
+							wrong += 1
+							if first == "" {first = fmt.tprintf("%s: got %.3f want %.3f", row.what, row.got, row.want)}
+						}
+					}
+					mchk(&bad, wrong == 0, fmt.tprintf("scale %.1f S=%.0f: every row of 9.3's table is round(k*S) (%d wrong; %s)", scale, s, wrong, first))
+					// 9.3's own "space above / below" column, which is the part of
+					// the table most easily dropped: h1 alone has no space above.
+					mchk(&bad, m.head_above[1] == 0, fmt.tprintf("scale %.1f S=%.0f: h1 has no space above (9.3's `0 /`)", scale, s))
+
+					// THE hazard. Every size must survive u16 truncation unchanged,
+					// or it shares an atlas entry with the integer below it.
+					sizes := []f32{m.head[1], m.head[2], m.head[3], m.head[4], m.head[5], m.head[6], m.body, m.code, m.table, m.caption}
+					lossy := 0
+					for v in sizes {
+						if f32(u16(v)) != v {lossy += 1}
+					}
+					mchk(&bad, lossy == 0, fmt.tprintf("scale %.1f S=%.0f: every size survives Glyph_Key.px's u16 truncation (%d lossy)", scale, s, lossy))
+					// ...and the check above is NOT vacuous: the unrounded product
+					// really would have been lossy at these sizes. If this ever goes
+					// false for every S in the sweep, the rounding rule stopped
+					// being testable here and the sweep needs a size that exercises
+					// it, not a weaker assertion.
+					if s == 16 {
+						mchk(&bad, m.code == 15 && int(0.92 * s) == 14, fmt.tprintf("S=16: 0.92*S rounds to %.0f, where TRUNCATING it would key %d instead", m.code, int(0.92 * s)))
+					}
+				}
+			}
+			// The fixed-pixel decorations DO scale with the UI, and the S-derived
+			// sizes do not -- otherwise one of the two families is being computed
+			// through the wrong path.
+			UI_SCALE = 1
+			m1 := md_metrics(t, 16)
+			UI_SCALE = 2
+			m2 := md_metrics(t, 16)
+			mchk(&bad, m1.body == m2.body && m1.head[1] == m2.head[1], "type sizes are multiples of S, not of UI_SCALE")
+			mchk(&bad, m2.list_indent > m1.list_indent && m2.fence_pad > m1.fence_pad && m2.pad_left > m1.pad_left, "the fixed-pixel insets (24/12/40px) DO scale with the UI")
+			return
+		}
+
+		// mdtest's SEAM checks: what is drawn against what is clickable.
+		//
+		// This is the whole risk of the block/span rewrite and the rule it is
+		// checking is CLAUDE.md's, unmodified -- the shaper is the single producer
+		// of glyph positions, and the draw, the underline, the link hit-test and
+		// the hand cursor all consume its output. links_layout's preview path used
+		// cell arithmetic (row_at_y / cell_at_x) against a layout that is now
+		// proportional, which is by construction the "correct function fed the
+		// wrong input" defect this project has sixteen recorded instances of.
+		//
+		// The assertion is stated on PIXELS, in both directions, because either
+		// one alone is satisfiable by a wrong implementation:
+		//
+		//   drawn -> clickable: every strongly Link-coloured pixel markdown_draw
+		//     put on screen lies inside some rectangle markdown_links returned.
+		//     Rejects a rect that is short, or in the wrong place, or missing.
+		//   clickable -> drawn: every rectangle markdown_links returned contains
+		//     strongly Link-coloured pixels. Rejects a rect invented where no link
+		//     was drawn -- which is what one covering a whole row would be.
+		//
+		// Plus the round trip through md_link_at, which is what the Ctrl+click and
+		// the hand cursor actually call.
+		//
+		// The fixture puts links at the four boundaries that break this class of
+		// code: the start of a line, the end of a line, across a soft wrap, and at
+		// the measure's exact edge. Nothing else in it is Link-coloured (no inline
+		// code -- Dark gives Md_Code and Link the SAME value, deliberately, and a
+		// code span would make the classifier below ambiguous).
+		md_seam_selftest :: proc() -> (bad: int) {
+			schk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 900, 800
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/seam") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(20)
+			x0, x1 := f32(40), f32(520)
+			ytop, ybot := f32(20), f32(780)
+			m := md_metrics(&h.text, px_)
+			cx, measure := md_content_span(&m, x0, x1)
+
+			// (a) line start, (b) line end, (c) a label long enough to cross the
+			// soft wrap at this measure, (d) a link pushed out to the measure's
+			// edge by the prose in front of it.
+			src := strings.concatenate(
+				{
+					"[alpha](http://example.com/a) then some plain words after it\n",
+					"\n",
+					"plain words first and then [omega](http://example.com/b)\n",
+					"\n",
+					"[a link label deliberately long enough that greedy breaking has to carry part of it onto a second visual line](http://example.com/c)\n",
+					"\n",
+					"one two three four five six seven eight nine ten [edge](http://example.com/d) x\n",
+				},
+				context.temp_allocator,
+			)
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "seam.md", .UTF8)
+			defer doc_close(&doc)
+
+			bg := g_theme[.Bg_Base]
+			plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+			markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+			pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+			schk(&bad, pok, "seam: readback")
+			if !pok {return}
+			// The SAME arguments the draw was given. md_pane_box is what keeps
+			// main.odin's two call sites from having to be trusted to do this.
+			hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0)
+			schk(&bad, len(hits) >= 4, fmt.tprintf("seam: all four fixture links are placed (%d rects)", len(hits)))
+
+			// A pixel is "link ink" when it is strongly the Link colour: close to
+			// it, and much closer to it than to the only other foreground on
+			// screen. An antialiased edge blends bg -> Link and is deliberately
+			// NOT counted -- what is being localised is where the glyphs are, and
+			// a coverage threshold makes that a question about the same pixels
+			// whichever direction the assertion runs.
+			link_ink :: proc(pix: []u8, W, x, y: int) -> bool {
+				i := (y * W + x) * 4
+				b, g, r := int(pix[i]), int(pix[i + 1]), int(pix[i + 2])
+				d :: proc(c: [4]f32, b, g, r: int) -> int {
+					return abs(b - int(c[2] * 255)) + abs(g - int(c[1] * 255)) + abs(r - int(c[0] * 255))
+				}
+				dl := d(g_theme[.Link], b, g, r)
+				return dl <= 40 && dl < d(g_theme[.Text_Primary], b, g, r) && dl < d(g_theme[.Bg_Base], b, g, r)
+			}
+			inside :: proc(hits: []Md_Link_Hit, x, y, slack: f32) -> bool {
+				for hh in hits {
+					r := hh.rect
+					if x >= r.pos.x - slack && x < r.pos.x + r.size.x + slack && y >= r.pos.y && y < r.pos.y + r.size.y {
+						return true
+					}
+				}
+				return false
+			}
+
+			// --- drawn -> clickable, and how far outside the worst pixel is -----
+			//
+			// Md_Span_Box's right edge is an ADVANCE bound, not an ink bound, so a
+			// glyph's side bearing can put ink a little outside it. That is a
+			// deliberate choice (see Md_Span_Box) and the point of measuring the
+			// overshoot rather than assuming it: the bound below is 2px, and the
+			// number this actually produces is printed so a face change that made
+			// it grow shows up as a number rather than as a silent pass.
+			stray, worst := 0, f32(0)
+			for yy in 0 ..< H {
+				for xx in 0 ..< W {
+					if !link_ink(pix, W, xx, yy) {continue}
+					if inside(hits, f32(xx), f32(yy), 0) {continue}
+					// How far out, horizontally, from the nearest rect on this row.
+					best := f32(1e9)
+					for hh in hits {
+						r := hh.rect
+						if f32(yy) < r.pos.y || f32(yy) >= r.pos.y + r.size.y {continue}
+						best = min(best, max(r.pos.x - f32(xx), f32(xx) - (r.pos.x + r.size.x)))
+					}
+					if best > 2 {stray += 1}
+					if best < 1e8 {worst = max(worst, best)}
+				}
+			}
+			schk(
+				&bad, stray == 0,
+				fmt.tprintf("seam: every drawn link pixel is inside a link rect (%d stray, worst overshoot %.1fpx against a 2px side-bearing allowance)", stray, worst),
+			)
+
+			// --- clickable -> drawn ---------------------------------------------
+			empty, checked := 0, 0
+			for hh, hi in hits {
+				n := 0
+				for yy in max(0, int(hh.rect.pos.y)) ..< min(H, int(hh.rect.pos.y + hh.rect.size.y)) {
+					for xx in max(0, int(hh.rect.pos.x)) ..< min(W, int(hh.rect.pos.x + hh.rect.size.x)) {
+						if link_ink(pix, W, xx, yy) {n += 1}
+					}
+				}
+				checked += 1
+				if n == 0 {
+					empty += 1
+					fmt.printfln("      rect %d (%s) at %.0f,%.0f %.0fx%.0f has no link ink", hi, hh.url, hh.rect.pos.x, hh.rect.pos.y, hh.rect.size.x, hh.rect.size.y)
+				}
+			}
+			schk(&bad, checked > 0 && empty == 0, fmt.tprintf("seam: every link rect contains drawn link ink (%d of %d empty)", empty, checked))
+
+			// --- the round trip the hand cursor and Ctrl+click actually take ----
+			round, bad_round := 0, 0
+			for hh in hits {
+				mx := hh.rect.pos.x + hh.rect.size.x * 0.5
+				my := hh.rect.pos.y + hh.rect.size.y * 0.5
+				got, found := md_link_at(hits, mx, my)
+				if !found || got.url != hh.url {bad_round += 1}
+				round += 1
+			}
+			schk(&bad, round > 0 && bad_round == 0, fmt.tprintf("seam: every rect's centre hit-tests back to its own link (%d of %d wrong)", bad_round, round))
+			// ...and a point OUTSIDE every rect hits nothing, or the round trip
+			// above would be satisfied by a hit-test that accepts everything.
+			_, off1 := md_link_at(hits, cx - 5, ytop + 2)
+			_, off2 := md_link_at(hits, x1 + 20, ytop + 2)
+			schk(&bad, !off1 && !off2, "seam: a point outside every rect hits no link")
+
+			// --- the four boundary cases, named ---------------------------------
+			//
+			// Named rather than left implicit: "4 rects came back" does not say
+			// that the wrapped one produced TWO, and the wrapped one is the case a
+			// row/column hit-test gets wrong most obviously.
+			by_url :: proc(hits: []Md_Link_Hit, url: string) -> (n: int, ys: [8]f32) {
+				for hh in hits {
+					if hh.url != url {continue}
+					if n < len(ys) {ys[n] = hh.rect.pos.y}
+					n += 1
+				}
+				return
+			}
+			na, _ := by_url(hits, "http://example.com/a")
+			nb, _ := by_url(hits, "http://example.com/b")
+			nc, ysc := by_url(hits, "http://example.com/c")
+			nd, _ := by_url(hits, "http://example.com/d")
+			schk(&bad, na == 1, fmt.tprintf("seam: a link at the START of a line gets one rect (%d)", na))
+			schk(&bad, nb == 1, fmt.tprintf("seam: a link at the END of a line gets one rect (%d)", nb))
+			schk(&bad, nd == 1, fmt.tprintf("seam: a link at the measure's edge gets one rect (%d)", nd))
+			schk(&bad, nc >= 2, fmt.tprintf("seam: a link across a SOFT WRAP gets one rect per visual line (%d)", nc))
+			if nc >= 2 {
+				schk(&bad, ysc[1] > ysc[0], fmt.tprintf("seam: ...on different rows (%.0f then %.0f)", ysc[0], ysc[1]))
+			}
+			// The line-start link really does start at the content origin, and the
+			// line-end one really does not -- otherwise "start" and "end" name the
+			// same case and two of the four boundaries above are one.
+			ax, bx2 := f32(-1), f32(-1)
+			for hh in hits {
+				if hh.url == "http://example.com/a" {ax = hh.rect.pos.x}
+				if hh.url == "http://example.com/b" {bx2 = hh.rect.pos.x}
+			}
+			schk(&bad, ax >= 0 && abs(ax - cx) <= 1, fmt.tprintf("seam: the line-start link begins at the content origin (%.1f vs %.1f)", ax, cx))
+			schk(&bad, bx2 > cx + measure * 0.3, fmt.tprintf("seam: the line-end link is well down its line (%.1f, origin %.1f)", bx2, cx))
+			return
+		}
+
+		// mdtest's LAYOUT-CACHE checks (UI spec 9.1's "cache each block's
+		// laid-out glyph positions").
+		//
+		// "Did no work" is not observable from the result -- a correct cache and
+		// no cache at all return identical glyphs -- so the only honest assertion
+		// counts BUILDS (md_layout_builds). Three properties, and the third is
+		// the one that is easy to claim and hard to have:
+		//
+		//   1. a second pass at the same width builds nothing and returns the same
+		//      rectangles;
+		//   2. a width change invalidates -- wholesale, which is what "invalidate
+		//      all on resize" means;
+		//   3. an edit invalidates ONLY the edited block. The edit below replaces
+		//      one byte with another of the same length so no following block's
+		//      start byte moves; a cache keyed on doc.revision rebuilds every
+		//      block, one keyed on each block's own source text rebuilds one.
+		md_cache_selftest :: proc() -> (bad: int) {
+			cchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 700, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/cache") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(18)
+			x0, x1 := f32(40), f32(600)
+			ytop, ybot := f32(20), f32(680)
+			// The long line is load-bearing: it wraps at the narrow measure below
+			// and not at the wide one, which is what makes "the width is part of
+			// the key" an observable claim about the LAYOUT rather than a claim
+			// about rebuild counts.
+			// NO trailing newline, deliberately. With one, the pass sees a final
+			// empty "line" at p == doc.pt.length, which is a Blank block -- and
+			// Blank is one of the three kinds keyed on doc.revision rather than on
+			// its own text (md_layout_extern_dep: a blank RUN's extent is the
+			// lines after it, which its own bytes cannot witness). It therefore
+			// rebuilds after ANY edit, correctly, and the "exactly one block"
+			// count below would be two. Dropping the terminator makes the count
+			// say what it means; the first draft of this test did not, and read as
+			// a per-block cache failing when it was the extern-dep rule working.
+			src := "# One\nalpha alpha\nbravo bravo\ncharlie charlie plus a good deal more text so this block wraps once the pane narrows\ndelta delta\necho echo"
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "cache.md", .UTF8)
+			defer doc_close(&doc)
+
+			pass :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot: f32) -> (builds: int, bottom: int) {
+				before := md_layout_builds
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				bottom = markdown_draw(&h.gfx, &h.quads, &h.text, doc, px_, x0, x1, ytop, ybot, 0)
+				return md_layout_builds - before, bottom
+			}
+
+			b1, bot1 := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			cchk(&bad, b1 >= 6, fmt.tprintf("cache: a cold pass builds every visible block (%d)", b1))
+			cchk(&bad, bot1 > 0, fmt.tprintf("cache: ...and the pass actually reached the end of the fixture (bottom %d)", bot1))
+
+			b2, bot2 := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			cchk(&bad, b2 == 0, fmt.tprintf("cache: a second pass at the same width builds NOTHING (%d)", b2))
+			cchk(&bad, bot2 == bot1, fmt.tprintf("cache: ...and returns the same bottom (%d == %d)", bot2, bot1))
+
+			// The rectangles are identical too, not merely the count: a cache that
+			// returned a stale layout after a width change would still return the
+			// right COUNT here.
+			ha := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0, context.temp_allocator)
+			hb := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, 0, context.temp_allocator)
+			same := len(ha) == len(hb)
+			if same {
+				for i in 0 ..< len(ha) {
+					if ha[i].rect.pos != hb[i].rect.pos || ha[i].rect.size != hb[i].rect.size {same = false}
+				}
+			}
+			cchk(&bad, same, "cache: two link passes return byte-identical rectangles")
+
+			// --- (2) a width change invalidates ---------------------------------
+			narrow := x1 - 260 // narrow enough that the long paragraph must wrap
+			b3, nbot := pass(&h, &doc, px_, x0, narrow, ytop, ybot)
+			cchk(&bad, b3 >= 6, fmt.tprintf("cache: a narrower pane rebuilds every block (%d)", b3))
+			// ...and it really laid out DIFFERENTLY, or "rebuilt" is a claim about
+			// work rather than about correctness. The fixture's long paragraph wraps
+			// at the narrow measure and not at the wide one, so its block is taller
+			// and the pass reaches fewer bytes before the pane fills.
+			// Compared in a pane SHORT enough to fill: the tall one above fits the
+			// whole fixture at either width, so its `bottom` is EOF both times and
+			// says nothing at all. The narrow measure wraps the long paragraph, so
+			// that block is taller and fewer bytes fit above the same ybot -- swept
+			// for rather than hand-picked, so a change to 9.3's spacing moves the
+			// height at which the two diverge without silently making this vacuous.
+			sw, sn, sy := -1, -1, -1
+			for y := int(ytop) + 20; y <= int(ybot); y += 4 {
+				_, a := pass(&h, &doc, px_, x0, x1, ytop, f32(y))
+				_, b := pass(&h, &doc, px_, x0, narrow, ytop, f32(y))
+				if a != b {sw, sn, sy = a, b, y;break}
+			}
+			cchk(&bad, sy >= 0 && sn < sw, fmt.tprintf("cache: ...and the narrow layout really differs from the wide one (at ybot %d: %d bytes fit vs %d)", sy, sn, sw))
+			// Alternating widths: each returns ITS OWN layout, not the other's.
+			// Deliberately NOT asserted as "the second narrow pass rebuilds again":
+			// with 128 slots and six blocks BOTH widths stay resident, so a rebuild
+			// count of 0 there is the cache working, not failing. The property that
+			// matters is that the width is part of the KEY -- which is what these
+			// two say, and what a cache that went stale across a resize fails.
+			// (The first draft of this assertion demanded the rebuild and went red
+			// against a correct cache.)
+			_, wbot2 := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			_, nbot2 := pass(&h, &doc, px_, x0, narrow, ytop, ybot)
+			cchk(&bad, wbot2 == bot1 && nbot2 == nbot, fmt.tprintf("cache: alternating widths each return their own layout (wide %d==%d, narrow %d==%d)", wbot2, bot1, nbot2, nbot))
+
+			// A zoom (a different S) invalidates the same way.
+			b5, _ := pass(&h, &doc, px_ + 2, x0, x1, ytop, ybot)
+			cchk(&bad, b5 >= 6, fmt.tprintf("cache: a zoom rebuilds every block (%d)", b5))
+
+			// --- (3) an edit invalidates only the edited block -------------------
+			//
+			// Back to the original width first, so the cache is warm for it.
+			pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			warm, _ := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			cchk(&bad, warm == 0, fmt.tprintf("cache: warm again before the edit (%d builds)", warm))
+			// "charlie charlie" starts at a known offset; replace one byte with a
+			// different byte of the SAME length, so nothing after it moves.
+			at := strings.index(src, "charlie")
+			cchk(&bad, at > 0, "cache: the edit fixture's target line was found")
+			doc_replace_range(&doc, at, 1, transmute([]u8)string("X"))
+			b6, _ := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			cchk(
+				&bad, b6 == 1,
+				fmt.tprintf("cache: a one-byte edit rebuilds exactly ONE block, not the document (%d)", b6),
+			)
+			b7, _ := pass(&h, &doc, px_, x0, x1, ytop, ybot)
+			cchk(&bad, b7 == 0, fmt.tprintf("cache: ...and the pass after it is warm again (%d)", b7))
+			return
+		}
+
 
 		// `newtpad mdtest` covers the markdown block classifiers and inline parser
 		// (the rendering itself needs a live eye), PLUS the draw-level checks
@@ -3982,6 +4437,9 @@ when NEWTPAD_TESTS {
 			bad := md_selftest()
 			bad += md_draw_selftest()
 			bad += md_head_fit_selftest()
+			bad += md_metrics_selftest()
+			bad += md_seam_selftest()
+			bad += md_cache_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
 			return true
 		}

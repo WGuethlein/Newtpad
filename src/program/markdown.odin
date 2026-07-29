@@ -1636,6 +1636,14 @@ MD_MAX_BLOCKS :: 512
 // honest way to assert it is to count the builds.
 md_layout_builds: int
 
+// Bumped once per md_pass. An entry stamped with the CURRENT id was already
+// used by this pass, so evicting it would make the pass rebuild a block it has
+// already laid out -- and that rebuild takes another slot, which can evict
+// another live entry, and so on. Round-robin alone has that hole: measured, a
+// one-byte edit rebuilt TWO blocks, the edited one plus whichever live entry
+// its replacement happened to land on. See md_layout_slot.
+md_layout_pass: u64
+
 // One block's laid-out geometry. Owned storage: `src`, `store`, `shape`,
 // `spans`, `sh` and `boxes` are all heap-allocated and freed by md_layout_free,
 // which doc_close calls for every slot.
@@ -1672,6 +1680,7 @@ Md_Layout :: struct {
 	out_lex:     Lexer_Proc,
 	out_state:   base.Lex_State,
 	fm_inner:    int, // Front_Matter only: key/value lines between the fences
+	used:        u64, // the md_layout_pass that last read or built this entry
 }
 
 // Does this kind's layout depend on bytes outside its own `src`? Those take
@@ -1700,7 +1709,6 @@ md_layout_reset :: proc(doc: ^Document) {
 	for &e in doc.md_layout {md_layout_free(&e)}
 	delete(doc.md_layout)
 	doc.md_layout = nil
-	doc.md_layout_next = 0
 }
 
 // One span under construction. Offsets into a temp builder rather than strings,
@@ -2018,13 +2026,42 @@ md_layout_ensure :: proc(
 		} else if e.src != line {
 			continue
 		}
+		e.used = md_layout_pass
 		return &e
 	}
-	slot := &doc.md_layout[doc.md_layout_next]
-	doc.md_layout_next = (doc.md_layout_next + 1) % MD_LAYOUT_SLOTS
+	slot := md_layout_slot(doc)
 	md_layout_free(slot)
 	slot^ = md_layout_build(gfx, t, doc, m, p, line_end, line, in_fence, fence_lex, fence_state, measure)
+	slot.used = md_layout_pass
 	return slot
+}
+
+// The slot a new layout goes in: an empty one, else the LEAST RECENTLY USED
+// entry, and never one this pass has already touched.
+//
+// Round-robin -- what md_table_ensure's four slots use, and what this started
+// as -- has a hole that only shows once the table is full of entries from
+// earlier configurations. A pass that must rebuild one block takes the next
+// slot round; if that slot holds a live entry for a block FURTHER DOWN THE SAME
+// PASS, that block then misses too, rebuilds, and takes the slot after it.
+// Measured on a six-block fixture with 128 slots: a one-byte edit to one line
+// rebuilt TWO blocks, the edited one and whichever neighbour its replacement
+// landed on. LRU picks a stale entry from an old width or zoom instead, which
+// is exactly what should go.
+//
+// If every slot was used by this pass -- a viewport with more than
+// MD_LAYOUT_SLOTS blocks in it -- there is nothing evictable that is not also
+// needed, and it falls back to slot 0. That thrashes, bounded and correctly;
+// the fix if it ever matters is more slots, not a cleverer policy.
+@(private = "file")
+md_layout_slot :: proc(doc: ^Document) -> ^Md_Layout {
+	best := -1
+	for &e, i in doc.md_layout {
+		if !e.valid {return &e}
+		if e.used == md_layout_pass {continue}
+		if best < 0 || e.used < doc.md_layout[best].used {best = i}
+	}
+	return &doc.md_layout[max(best, 0)]
 }
 
 // The preview pane's content box, for the mode the document is actually in.
@@ -2102,6 +2139,7 @@ md_pass :: proc(
 ) {
 	bottom = top_byte
 	if doc == nil {return}
+	md_layout_pass += 1 // see md_layout_slot: this pass's entries are not evictable
 	m := md_metrics(text, px)
 	cx, measure := md_content_span(&m, x0, x1)
 	buf: [RENDER_LINE_CAP]u8

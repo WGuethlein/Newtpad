@@ -1034,8 +1034,7 @@ Document :: struct {
 	// STATUS_STACK_OVERFLOW (0xC00000FD), including modes that never open a
 	// document, which is the third time this frame has done that. Freed
 	// explicitly by md_layout_reset, which doc_close calls.
-	md_layout:      []Md_Layout,
-	md_layout_next: int, // round-robin replacement cursor
+	md_layout: []Md_Layout,
 	view_cols:  int, // usable content width in cells (set per frame when wrapping)
 	view_rows:  int, // visible row count (set per frame; filter scrolling clamps to it)
 	h_scroll:   int, // horizontal scroll offset in cells (non-wrap only; 0 otherwise)
