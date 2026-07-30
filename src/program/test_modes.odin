@@ -2058,6 +2058,46 @@ when NEWTPAD_TESTS {
 			fk_chk(&bad, string(d.find.query[:]) == "one", fmt.tprintf("a multi-line paste takes the first line only (%q)", string(d.find.query[:])))
 			find_wait(d)
 
+			// ...for every spelling of "line terminator", not just the two the
+			// original split handled. It was index_byte('\n') plus a trailing-\r
+			// trim, so a CR-ONLY clipboard (classic Mac, old Excel exports) has no
+			// LF to split on and the whole thing became one field value with a raw
+			// control byte inside it. find_paste is pure over the clipboard's text
+			// by design, so these drive it directly rather than round-tripping the
+			// user's real clipboard fifteen times.
+			for src in ([]string{"one\ntwo", "one\r\ntwo", "one\rtwo", "one\rtwo\nthree"}) {
+				clear(&d.find.query)
+				find_paste(d, src)
+				q := string(d.find.query[:])
+				clean := true
+				for i in 0 ..< len(q) {if q[i] < 32 {clean = false}}
+				fk_chk(&bad, q == "one" && clean, fmt.tprintf("%q pastes as %q, no control byte", src, q))
+				find_wait(d)
+			}
+
+			// A paste is not bounded by typing speed. Every byte into field 0 goes
+			// through find_query_changed, which restarts the search worker, so an
+			// uncapped paste of a copied log file hands the scan a multi-megabyte
+			// pattern in one keystroke.
+			clear(&d.find.query)
+			find_paste(d, strings.repeat("x", FIND_PASTE_CAP * 4, context.temp_allocator))
+			fk_chk(&bad, len(d.find.query) == FIND_PASTE_CAP, fmt.tprintf("a %d-byte single-line paste is capped at %d (got %d)", FIND_PASTE_CAP * 4, FIND_PASTE_CAP, len(d.find.query)))
+			find_wait(d)
+			// ...and the cap lands on a rune boundary. The em dash below starts one
+			// byte before the cap, so a byte-exact truncation would leave the field
+			// holding a lone 0xE2.
+			clear(&d.find.query)
+			find_paste(d, fmt.tprintf("%s—%s", strings.repeat("a", FIND_PASTE_CAP - 1, context.temp_allocator), strings.repeat("b", 32, context.temp_allocator)))
+			fk_chk(
+				&bad,
+				len(d.find.query) == FIND_PASTE_CAP - 1 && utf8.valid_string(string(d.find.query[:])),
+				fmt.tprintf("a multi-byte rune straddling the cap is dropped whole (%d bytes, valid=%v)", len(d.find.query), utf8.valid_string(string(d.find.query[:]))),
+			)
+			find_wait(d)
+			clear(&d.find.query)
+			for r in "beta" {find_input_rune(d, r)} // restore the fixture's query
+			find_wait(d)
+
 			// The replace field is the other half of the same bar and takes the
 			// paste too -- Find_Paste writes whichever field has focus.
 			d.find.replace_mode = true
@@ -4557,11 +4597,21 @@ when NEWTPAD_TESTS {
 				_, over := md_preview_link_at(&h.gfx, &h.text, &doc, px_, W, H, 0.5, r.pos.x + r.size.x * 0.5, r.pos.y + r.size.y * 0.5)
 				lchk(&bad, over, "linkbound: a link inside the pane is still clickable")
 			}
-			// ...and a point below the FULL pane's bottom is not, which is the same
-			// refusal at the size the app normally runs at.
+			// ...and the full pane does not overflow in the first place, which is the
+			// premise sections 2 and 3 contrast against and the falsifiable half of
+			// this pair. The hit-test below it CANNOT FAIL and is not evidence for
+			// the bound: at the app's normal size no rect reaches past ybot, so a
+			// point below the pane misses on geometry whether the bound is there or
+			// not (verified -- it stayed OK with the bound removed). It is kept as
+			// the statement that the two agree, not as a check of the refusal, and
+			// the assertion above it is the one that would notice a pane whose rects
+			// started spilling at ordinary sizes.
 			{
+				worst_full := f32(0)
+				for hit in full {worst_full = max(worst_full, hit.rect.pos.y + hit.rect.size.y)}
+				lchk(&bad, worst_full <= ybot + 1, fmt.tprintf("linkbound: no rect overflows the FULL pane (%.1f <= %.1f)", worst_full, ybot))
 				_, over := md_preview_link_at(&h.gfx, &h.text, &doc, px_, W, H, 0.5, full[0].rect.pos.x + 1, ybot + 2)
-				lchk(&bad, !over, "linkbound: a point below the full pane's bottom is not")
+				lchk(&bad, !over, "linkbound: ...and consistently, a point below it is not clickable (follows from the line above)")
 			}
 
 			// --- 2. the hazard: a pane too short for one line overflows ----------
@@ -9057,6 +9107,20 @@ when NEWTPAD_TESTS {
 			// bytes, or it is still open AND still drawn on the line it will write.
 			// Never that it wrote somewhere else.
 			//
+			// .Wheel IS NOT EVIDENCE FOR THE GUARD, and saying so is the point of
+			// this paragraph. main.odin's wheel arm has committed inline since the
+			// grid shipped ("rows shift underfoot"), the arm is hand-copied into the
+			// route below because the handling is inline in the frame loop, and the
+			// inline commit fires before table_edit_hold is ever reached -- so those
+			// four assertions stay green with the guard deleted. They document the
+			// pre-existing commit, which is worth having (the copy can drift), but
+			// four of the twenty-four assertions here are not the guard's.
+			//
+			// .Wheel_Bare exists so the wheel IS covered by something falsifiable:
+			// the same scroll with the inline commit omitted, which is exactly what
+			// the frame loop would look like if that line were ever removed or moved
+			// after the scroll. It is the guard or nothing on that route.
+			//
 			// Its own proc for the same stack-frame reason as tg_page.
 			tg_edit_anchor :: proc() -> (bad: int) {
 				chk :: proc(bad: ^int, ok: bool, msg: string) {
@@ -9083,6 +9147,7 @@ when NEWTPAD_TESTS {
 				// fixture would have each route judging the previous one's damage.
 				Route :: enum {
 					Wheel,
+					Wheel_Bare,
 					Scrollbar,
 					Page_Down,
 					Page_Up,
@@ -9162,8 +9227,17 @@ when NEWTPAD_TESTS {
 					case .Wheel:
 						// main.odin's wheel arm, in its own order: it commits first
 						// ("rows shift underfoot") and normalises doc.top through
-						// table_data_start on both sides of the scroll.
+						// table_data_start on both sides of the scroll. The commit
+						// below is the arm's own, so this route passes with or
+						// without the guard -- see the note above the proc.
 						if d.table_editing {table_edit_commit(d)}
+						if s, sok := table_data_start(d); sok {d.top = s}
+						doc_scroll(d, t, 5, trows)
+						if s, sok := table_data_start(d); sok {d.top = s}
+					case .Wheel_Bare:
+						// The same scroll with the arm's inline commit omitted: the
+						// guard is the only thing left that can catch it, so this
+						// route fails if the guard is removed and .Wheel does not.
 						if s, sok := table_data_start(d); sok {d.top = s}
 						doc_scroll(d, t, 5, trows)
 						if s, sok := table_data_start(d); sok {d.top = s}
