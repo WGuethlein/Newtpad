@@ -646,14 +646,12 @@ main :: proc() {
 			// is the only one where a block in the preview names somewhere the
 			// editor could go. In full Preview a press stays inert, as it is today.
 			// The press is still swallowed below; this reads it on the way past.
-			// The gate itself (bounding this to the preview pane) is
-			// md_split_click_gate -- see its comment for why it is not inlined.
+			// The gate itself (bounding this to the preview pane, and to the
+			// DOUBLE press) is md_split_click_gate; the scroll it applies is
+			// md_split_click_sync -- see their comments for why neither is inlined.
 			if window.mouse_pressed && !plat.key_ctrl_down() {
 				if c, ok := md_scroll_ctx(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac); ok {
-					if blk, hit := md_split_click_gate(doc, &c, ro, ed_right, f32(window.mouse_x), f32(window.mouse_y)); hit {
-						doc.top = min(base.pt_line_start(&doc.pt, blk), doc_max_top(doc, &text, rows))
-						doc.md_sync_top = doc.top // the preview keeps its own pixel offset
-					}
+					md_split_click_sync(doc, &text, &c, ro, window.mouse_count, ed_right, f32(window.mouse_x), f32(window.mouse_y), rows)
 				}
 			}
 			if ro && (window.mouse_pressed || window.mouse_down) {
@@ -1224,6 +1222,23 @@ ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool
 // from `table` alone, not from which pane the press is in). x >= ed_right
 // restricts this to the preview pane's columns.
 //
+// THE GESTURE IS A DOUBLE PRESS, and that is the fix for Wyatt's report -- "when
+// you click in the markdown preview on split mode it shifts the edit side
+// up/down" (live use, 2026-07-29). The capability is spec'd (9.1 names
+// click-to-sync-scroll, 9.4 lists scroll sync as a Split rule) and stays; only
+// the binding changes. A single click is what people use to focus a pane or
+// dismiss something, and the other half of the window jumping in response to
+// one is hostile.
+//
+// `clicks` is window.mouse_count, which is the press INDEX within a
+// double-click-time/4px cluster: WM_LBUTTONDOWN increments it and wraps 3 -> 1
+// (platform/window.odin), so it is 1 on a lone press, 2 on the second press of
+// a double click, 3 on a triple's third. `>= 2` therefore means "not the first
+// press of a cluster": the second press syncs, and a triple's third press
+// re-syncs to the block the second one already named, which is where the view
+// is. Nothing else in the preview half claims a double press -- ro_surface_swallows
+// eats it before doc_select_word_at ever sees it -- so this takes no gesture away.
+//
 // The ROWS are md_block_at_y's own business, and that is a correction: this
 // procedure used to carry `my < c.ytop || my >= c.ytop + c.pane` as well, and
 // commented it as what kept the status bar and the find bar out. md_block_at_y
@@ -1232,8 +1247,8 @@ ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool
 // callee would have accepted. Removing it: 0 failures across the suite.
 // Removing BOTH: exactly one of the three "gate:" rows that name a y bound
 // fails (the find bar, which is the only one genuinely above ytop); the status
-// bar and the empty-strip cases are refused by md_block_at_y's fit test
-// instead, whatever their assertion names say. Same shape the branch already
+// bar and the empty-strip cases are refused by the placement md_block_at_y reads
+// instead (md_place_next), whatever their assertion names say. Same shape the branch already
 // diagnosed and removed at md_layout_slot -- a guard crediting itself with a
 // fix (2026-07-29 review, F5).
 //
@@ -1242,9 +1257,33 @@ ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool
 // there could not be exercised at its own boundaries -- exactly the shape
 // that let the original `ro`-only gate ship unbounded. mdtest's "gate:"
 // checks call this directly.
-md_split_click_gate :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ro: bool, ed_right, mx, my: f32) -> (blk: int, hit: bool) {
-	if !ro || doc.md_mode != .Split || mx < ed_right {return}
+md_split_click_gate :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ro: bool, clicks: int, ed_right, mx, my: f32) -> (blk: int, hit: bool) {
+	if !ro || doc.md_mode != .Split || mx < ed_right || clicks < 2 {return}
 	return md_block_at_y(c, doc.md_top, my)
+}
+
+// The gesture's EFFECT, extracted from main()'s loop for the same reason the gate
+// was: main() is the live WM_* loop and cannot run headless, so the only thing a
+// test could reach was the gate's return value -- and a gate returning `false` is
+// not the same claim as "the editor did not move". The bug Wyatt reported is
+// about `doc.top` moving, so `doc.top` is what a test has to be able to watch.
+//
+// Returns whether it scrolled. `doc.md_sync_top` follows `doc.top` because the
+// preview keeps its own pixel offset, and the sync is what re-anchors it.
+md_split_click_sync :: proc(
+	doc: ^Document,
+	t: ^plat.Text,
+	c: ^Md_Scroll_Ctx,
+	ro: bool,
+	clicks: int,
+	ed_right, mx, my: f32,
+	rows: int,
+) -> bool {
+	blk, hit := md_split_click_gate(doc, c, ro, clicks, ed_right, mx, my)
+	if !hit {return false}
+	doc.top = min(base.pt_line_start(&doc.pt, blk), doc_max_top(doc, t, rows))
+	doc.md_sync_top = doc.top
+	return true
 }
 
 // The vertical scrollbar's track, in client pixels. ONE definition, consumed by
@@ -1372,11 +1411,22 @@ vbar_drag_to :: proc(doc: ^Document, t: ^plat.Text, b: Vbar, my, grab: f32, rows
 // document's length, exactly as the editor's is. A pixel-proportional size would
 // need the document's total HEIGHT, and measuring that means laying the document
 // out, which is the one thing viewport-first forbids.
-md_vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int, frac: f32) -> (b: Vbar) {
+//
+// `shown_end` is markdown_draw's `shown` out-param, NOT its `bottom` return
+// (2026-07-29 review, F1). `bottom` only advances past a block the pane
+// FINISHED, so when the topmost visible block is taller than the pane --
+// one long paragraph, Split at half width or a larger font -- `bottom` sits at
+// `doc.md_top.block` for the entire scroll through it: `shown_end - doc.md_top.block`
+// is always 0, `clamp(0, sx(24), track)` pins the thumb at its 24px floor, and it
+// snaps to full height the instant the block clears the top edge. `shown_end`
+// instead credits a partial block with the fraction of its span actually put on
+// screen, so the thumb shrinks and grows with what is visible rather than
+// collapsing to a stub and popping.
+md_vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, shown_end: int, frac: f32) -> (b: Vbar) {
 	if doc == nil || doc.pt.length <= 0 {return}
 	b.x = x
 	b.track_y, b.track_h = scrollbar_track(doc, winh)
-	b.thumb_h = clamp(f32(bottom - doc.md_top.block) / f32(doc.pt.length) * b.track_h, sx(24), b.track_h)
+	b.thumb_h = clamp(f32(shown_end - doc.md_top.block) / f32(doc.pt.length) * b.track_h, sx(24), b.track_h)
 	b.thumb_y = clamp(b.track_y + frac * max(1, b.track_h - b.thumb_h), b.track_y, b.track_y + b.track_h - b.thumb_h)
 	b.shown = true
 	return
@@ -1438,13 +1488,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	cx, cy: f32
 	caret := false
 	bottom := doc.top
+	shown := doc.md_top.block // markdown_draw's out-param; feeds md_vscrollbar_geo's thumb, not bottom (F1)
 	if doc.kind == .Text && doc.md_mode == .Preview {
 		// Full-window rendered markdown (read-only) replaces the text pass.
 		// The pane box comes from md_pane_box, the SAME producer the link pass
 		// reads -- so what is clickable and what is drawn cannot be laid out in
 		// two different rectangles.
 		if mx0, mx1, mytop, mybot, mok := md_pane_box(doc, f32(window.width), f32(window.height), rc.app.settings.split_frac); mok {
-			bottom = markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top)
+			bottom = markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top, &shown)
 			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac))
 			}
@@ -1554,7 +1605,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			// edge is the PREVIEW's and maps the preview's own pixel range. It goes
 			// to g_vbar_preview, which is the latch the press hit-test reads for
 			// this mode (the editor branch there is disabled in Preview).
-			vb = md_vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom, md_preview_frac(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
+			vb = md_vscrollbar_geo(doc, er - SCROLLBAR_W, h, shown, md_preview_frac(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
 			g_vbar_preview = vb
 		} else {
 			vb = vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom, text, rows)
@@ -1625,13 +1676,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// md_content_span a negative span, which max(1, ..) turns into a 1px
 		// measure and a column of one glyph per line.
 		if mx0, mx1, mytop, mybot, mok := md_pane_box(doc, w, h, rc.app.settings.split_frac); mok {
-			pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top)
+			pv_shown: int
+			markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top, &pv_shown)
 			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
 			}
 			md_preview_clip(gfx, quad_pipe, doc, w, h, rc.app.settings.split_frac)
 			if total > 0 {
-				pvb := md_vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom, md_preview_frac(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
+				pvb := md_vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_shown, md_preview_frac(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
 				g_vbar_preview = pvb
 				plat.quads_draw(
 					gfx,
@@ -1653,17 +1705,24 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// canvas. So anything a content pass puts below doc_content_box's `bot`
 	// stays on screen sitting on top of the status bar. Two passes can still do
 	// that on purpose: doc_draw's partial last row, and markdown_draw's ONE
-	// remaining deliberate overhang -- the `forced` first block, spent once, so a
-	// pane too short for even one block shows something instead of nothing (see
-	// md_pass in markdown.odin).
+	// remaining deliberate overhang -- the `forced` first LINE, spent once, so a
+	// pane too short for even one line shows something instead of nothing (see
+	// md_block_admit in markdown.odin).
 	//
 	// The soft-wrap overhang that used to be listed here is gone: batch 17 lays
 	// the preview out in BLOCKS, and a block's height comes back from the shaper
 	// with its wrapped lines already in it (Md_Layout.h), so the admit test and
-	// the advance read the same number. So does a heading's -- md_block_fits
-	// takes the block's own height, which for h1/h2 includes its rule, so a
-	// heading that does not fit is not drawn at all rather than cut through the
-	// middle of its glyphs.
+	// the advance read the same number.
+	//
+	// 2026-07-29: admission is now per LINE within a block, not per block, because
+	// refusing a whole paragraph left up to a paragraph's height of blank pane
+	// under the last heading (Wyatt, live use) -- "no frame ever shows emptiness".
+	// That does NOT widen what overhangs this strip: a line is admitted only when
+	// its own bottom edge clears ybot, and the block's trailing decoration (an
+	// h1/h2 rule) belongs to its last line's bottom (md_line_bottom), so a heading
+	// whose rule will not fit still draws without the rule rather than painting it
+	// down here. The `forced` waiver above is the only thing that overhangs, and it
+	// is now one line rather than one whole block.
 	//
 	// Placed after every DOCUMENT pass (editor, grid, preview, both scrollbars,
 	// the caret) and before every CHROME pass -- the horizontal scrollbar sits

@@ -4143,6 +4143,1311 @@ when NEWTPAD_TESTS {
 			}
 			return bad
 		}
+
+		// PARTIAL BLOCKS: a block taller than the pane's remaining room draws the
+		// lines that FIT, not nothing.
+		//
+		// Wyatt's report from live use of v0.31.x, with screenshots: a heading
+		// rendered, then roughly 200px of blank pane, and widening the window by ONE
+		// pixel brought the whole following paragraph in at once. The cause was
+		// whole-block admission -- md_block_fits against Md_Layout.h at md_pass's
+		// admit site -- which is defensible for a heading (one line, fits or does
+		// not) and wrong for a paragraph, which since batch 17 is an arbitrary
+		// number of shaped lines. CLAUDE.md's "Viewport-first: no frame ever shows
+		// emptiness" is the rule it broke.
+		//
+		// HOW THIS IS MEASURED, and why it is not a second derivation of the draw:
+		// the fixture's paragraph is nothing but links, one per word, so
+		// markdown_links places at least one rectangle on every wrapped line the
+		// pass emits. Those rectangles are md_span_boxes over the SHAPER's own glyph
+		// positions, offset by md_block_origin -- the same geometry the glyphs are
+		// drawn at, by construction. So the line count, each line's bottom edge and
+		// the hit-test all come off one pass. The pixels are then read back
+		// separately, because a rectangle nobody painted into would satisfy every
+		// rectangle-level assertion here.
+		//
+		// Its own procedure with its own device and one Document alive at a time:
+		// test_mode_dispatch's frame has hit STATUS_STACK_OVERFLOW twice.
+		md_partial_selftest :: proc() -> (bad: int) {
+			pchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1000, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/partial") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			px_ := f32(24)
+			bg := g_theme[.Bg_Base]
+
+			// Ink in the half-open row band [lo, hi), inside the pane's columns.
+			ink_band :: proc(pix: []u8, lo, hi: f32, x0, x1: f32, W, H: int) -> (inked, topmost: int) {
+				bgc := g_theme[.Bg_Base]
+				topmost = -1
+				for yy in clamp(int(lo), 0, H) ..< clamp(int(hi), 0, H) {
+					for xx in clamp(int(x0), 0, W) ..< clamp(int(x1), 0, W) {
+						i := (yy * W + xx) * 4
+						d :=
+							abs(int(pix[i]) - int(bgc[2] * 255)) +
+							abs(int(pix[i + 1]) - int(bgc[1] * 255)) +
+							abs(int(pix[i + 2]) - int(bgc[0] * 255))
+						if d > 24 {
+							inked += 1
+							if topmost < 0 {topmost = yy}
+						}
+					}
+				}
+				return
+			}
+			// Which block a link rectangle belongs to, read off the URL the fixture
+			// wrote -- so a rectangle is attributed by the DOCUMENT's own text and
+			// never by comparing its y against a boundary this test computed.
+			is_para :: proc(url: string) -> bool {
+				return len(url) >= 5 && url[len(url) - 5] == '/' && url[len(url) - 4] == 'w'
+			}
+			// Distinct line tops among a pass's paragraph rectangles == the number of
+			// the paragraph's lines that pass DREW.
+			para_lines :: proc(hits: []Md_Link_Hit) -> (n: int, top, bot, line_h: f32) {
+				tops := make([dynamic]f32, 0, 24, context.temp_allocator)
+				top = max(f32)
+				for hit in hits {
+					if !is_para(hit.url) {continue}
+					line_h = max(line_h, hit.rect.size.y)
+					top = min(top, hit.rect.pos.y)
+					bot = max(bot, hit.rect.pos.y + hit.rect.size.y)
+					seen := false
+					for t in tops {
+						if abs(t - hit.rect.pos.y) < 0.5 {
+							seen = true
+							break
+						}
+					}
+					if !seen {append(&tops, hit.rect.pos.y)}
+				}
+				n = len(tops)
+				if n == 0 {top = 0}
+				return
+			}
+
+			// A one-line lead paragraph, then the tall one. The lead is load-bearing:
+			// under whole-block admission the last thing the pane paints IS the lead,
+			// so the distance from its bottom edge to ybot is exactly the hole in
+			// Wyatt's screenshot, and it gives the "unused pane" measurement below a
+			// number to report instead of nothing at all.
+			b := strings.builder_make()
+			defer strings.builder_destroy(&b)
+			strings.write_string(&b, "[lead](https://e.test/lead) line\n\n")
+			for i in 0 ..< 90 {
+				if i > 0 {strings.write_string(&b, " ")}
+				fmt.sbprintf(&b, "[w%03d](https://e.test/w%03d)", i, i)
+			}
+			strings.write_string(&b, "\n")
+			src := strings.to_string(b)
+			para_start := len("[lead](https://e.test/lead) line\n\n")
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "partial.md", .UTF8)
+			doc.md_mode = .Preview
+			defer doc_close(&doc)
+			x0, x1, ytop, ybot_full, box_ok := md_pane_box(&doc, W, H, 0.5)
+			pchk(&bad, box_ok, "partial: the pane box resolves")
+			if !box_ok {return}
+
+			// Calibration, from a pass with the WHOLE pane: the paragraph's line
+			// geometry is the draw's, not the test's idea of the shaper's.
+			plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+			markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot_full, Md_Anchor{})
+			full := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot_full, Md_Anchor{}, context.temp_allocator)
+			nlines, para_top, para_bot, line_h := para_lines(full)
+			pchk(&bad, nlines >= 4, fmt.tprintf("partial: the fixture's paragraph wraps to several lines (%d)", nlines))
+			pchk(&bad, line_h > 1, fmt.tprintf("partial: ...and its line height came back from the draw (%.1f)", line_h))
+			// Uniform line boxes -- one face, one size -- which is what makes "one
+			// more line per line-height of pane" a statement about a constant below.
+			pchk(
+				&bad, nlines > 0 && abs(para_bot - para_top - f32(nlines) * line_h) < 1.5,
+				fmt.tprintf("partial: ...and its line boxes tile uniformly (%.1f over %d x %.1f)", para_bot - para_top, nlines, line_h),
+			)
+			if nlines < 4 || line_h <= 1 {return}
+			// The paragraph must be taller than the whole pane is NOT the case here
+			// on purpose: the defect needs a paragraph that fits SOMEWHERE, so the
+			// sweep can cross every one of its line boundaries inside one window.
+			pchk(&bad, para_bot < ybot_full, fmt.tprintf("partial: ...and it fits the full pane, so the sweep can cross every boundary (%.0f < %.0f)", para_bot, ybot_full))
+
+			// --- the sweep -------------------------------------------------------
+			//
+			// ybot from "the paragraph's first line ought to fit" up to one line past
+			// "all of it fits". `lo` is derived from the calibration draw, so the
+			// sweep's own start is not an assumption about the type scale.
+			lo := int(para_top + line_h) + 1
+			hi := min(int(para_bot + line_h), int(ybot_full))
+			cnt := make([]int, nlines + 2, context.temp_allocator)
+			prev := -1
+			nonmono, over, hole, seam, ghost, pix_hole, pix_over := 0, 0, 0, 0, 0, 0, 0
+			worst_hole, worst_hole_yb := f32(0), -1
+			worst_over, worst_over_yb := f32(0), -1
+			pix_hole_yb, pix_over_yb, pix_over_top := -1, -1, -1
+			seam_yb, ghost_yb := -1, -1
+			// F3 (2026-07-29 review): the forward-seam row above hit-tests RECT
+			// MIDPOINTS, so it only touches a pixel near ybot on the heights where a
+			// line happens to land flush with the edge -- measured, 6 of 280. It is
+			// not a test of "the seam covers the pane's bottom edge" even though the
+			// old report claimed it was. This is that test: `md_block_at_y` asked
+			// directly for the row AT the edge, every sweep step, not incidentally.
+			edge_wrong, edge_wrong_yb := 0, -1
+			flush_n, flush_bad, flush_bad_yb := 0, 0, -1
+			swept := 0
+			for yb := lo; yb <= hi; yb += 1 {
+				ybot := f32(yb)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+				swept += 1
+				np, _, _, _ := para_lines(hits)
+				// The lowest edge anything the pass drew reaches.
+				last_bot := f32(0)
+				for hit in hits {last_bot = max(last_bot, hit.rect.pos.y + hit.rect.size.y)}
+				if np <= nlines + 1 {cnt[np] += 1}
+
+				// 1. Monotone: a taller pane never draws FEWER lines.
+				if prev >= 0 && np < prev {nonmono += 1}
+				prev = np
+
+				// 2. No drawn line's bottom exceeds ybot. This is the property
+				//    whole-block admission was protecting, and per-line admission
+				//    must keep: there is no scissor rect here.
+				if last_bot > ybot + 0.01 {
+					over += 1
+					if last_bot - ybot > worst_over {worst_over, worst_over_yb = last_bot - ybot, yb}
+				}
+
+				// 3. THE REPORTED BUG. While the paragraph is incomplete, the pane
+				//    cannot have a whole line-height of room going unused below the
+				//    last line drawn -- if it did, another line would have fitted.
+				//    Whole-block admission fails this by the paragraph's entire
+				//    height, because the last thing drawn is the LEAD.
+				if np < nlines {
+					if g := ybot - last_bot; g > line_h + 0.5 {
+						hole += 1
+						if g > worst_hole {worst_hole, worst_hole_yb = g, yb}
+					}
+				}
+
+				// 4. THE SEAM. Every rectangle the pass emitted must hit-test back to
+				//    its OWN block -- including the last line drawn, which sits at the
+				//    pane's bottom edge. md_block_at_y mirrors the admit rule; if the
+				//    draw admits three lines of a paragraph and the map still believes
+				//    the block was refused, a click names a block that is not there.
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, W, H, 0.5)
+				c.pane = ybot - c.ytop
+				if !cok {
+					seam += 1
+				} else {
+					for hit in hits {
+						want := para_start if is_para(hit.url) else 0
+						got, ok := md_block_at_y(&c, Md_Anchor{}, hit.rect.pos.y + hit.rect.size.y * 0.5)
+						if !ok || got != want {
+							seam += 1
+							if seam_yb < 0 {seam_yb = yb}
+						}
+					}
+					// ...and the other direction: a row below the last line DRAWN is a
+					// row the pane never painted, so it must name nothing. Without this
+					// the map could simply accept the block's whole slot and pass 4.
+					if np < nlines && last_bot + 1 < ybot {
+						if _, gok := md_block_at_y(&c, Md_Anchor{}, last_bot + 1); gok {
+							ghost += 1
+							if ghost_yb < 0 {ghost_yb = yb}
+						}
+					}
+
+					// 4b. THE BOTTOM-EDGE SEAM (F3). The row directly AT the pane's
+					// bottom edge, asked for on its own terms rather than inferred from
+					// wherever a rectangle's midpoint happened to land. Two things:
+					// this row must never resolve BACKWARD, to a block before the
+					// paragraph (edge_wrong) -- once past the paragraph's own content a
+					// WHOLE block's trailing blank/EOF entry is a legitimate answer
+					// (the same "collapsed margin resolves to the zero-height Blank
+					// block" behaviour §8.2 of this task's own report calls "arguably
+					// correct"), so this only catches the genuinely wrong direction --
+					// and on the heights where the drawn content really is flush with
+					// ybot (within half a pixel -- "the seam sits at the pane's bottom
+					// edge", the design's own claim), it must resolve to the paragraph
+					// EXACTLY (flush_bad). `flush_n > 0` is what proves the second check
+					// is not vacuous: the sweep must actually produce at least one
+					// flush height for "never wrong when flush" to mean anything.
+					edge_y := ybot - 0.5
+					got_e, ok_e := md_block_at_y(&c, Md_Anchor{}, edge_y)
+					if ok_e && got_e < para_start {
+						edge_wrong += 1
+						if edge_wrong_yb < 0 {edge_wrong_yb = yb}
+					}
+					if abs(ybot - last_bot) <= 0.5 {
+						flush_n += 1
+						if !(ok_e && got_e == para_start) {
+							flush_bad += 1
+							if flush_bad_yb < 0 {flush_bad_yb = yb}
+						}
+					}
+				}
+
+				// 5. The same two properties in PIXELS, because 2 and 3 are claims
+				//    about rectangles and this is a claim about ink.
+				if pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); pok {
+					if inked, topmost := ink_band(pix, ybot, f32(H), x0, x1, W, H); inked > 0 {
+						pix_over += 1
+						if pix_over_yb < 0 {pix_over_yb, pix_over_top = yb, topmost}
+					}
+					// Two line-heights, not one: the last drawn line's box ends at
+					// last_bot <= ybot and its ink is inside [last_bot - line_h,
+					// last_bot), which a one-line-high window at ybot can miss
+					// entirely when ybot - last_bot approaches line_h.
+					if np < nlines {
+						if inked, _ := ink_band(pix, ybot - line_h * 2, ybot, x0, x1, W, H); inked == 0 {
+							pix_hole += 1
+							if pix_hole_yb < 0 {pix_hole_yb = yb}
+						}
+					}
+				}
+			}
+
+			pchk(&bad, swept >= int(line_h) * 3, fmt.tprintf("partial: the sweep crosses several line boundaries (%d ybot values, line_h %.1f)", swept, line_h))
+			// Non-vacuity: the sweep must actually see the paragraph go from
+			// partially drawn to whole, or 3 and 5 are assertions about nothing.
+			partial_seen := 0
+			for k in 1 ..< nlines {partial_seen += cnt[k]}
+			pchk(&bad, partial_seen > 0, fmt.tprintf("partial: ...and really does spend most of it PARTWAY through the paragraph (%d of %d ybots)", partial_seen, swept))
+			pchk(&bad, cnt[nlines] > 0, fmt.tprintf("partial: ...and reaches the whole paragraph too (%d ybots)", cnt[nlines]))
+
+			// One more line per line-height of pane, stated as the count of ybot
+			// values that draw exactly k lines. A rule that admitted two lines at a
+			// step, or none, moves these counts off line_h.
+			steps_bad, worst_k, worst_cnt := 0, -1, -1
+			for k in 1 ..< nlines {
+				if abs(f32(cnt[k]) - line_h) > 1.5 {
+					steps_bad += 1
+					if worst_k < 0 {worst_k, worst_cnt = k, cnt[k]}
+				}
+			}
+			pchk(
+				&bad, steps_bad == 0,
+				fmt.tprintf("partial: the pane draws exactly one MORE line per line-height (%d of %d steps off; k=%d held for %d px, want %.1f)", steps_bad, nlines - 1, worst_k, worst_cnt, line_h),
+			)
+			pchk(&bad, nonmono == 0, fmt.tprintf("partial: a taller pane never draws fewer lines (%d regressions)", nonmono))
+			pchk(&bad, over == 0, fmt.tprintf("partial: no drawn line's bottom passes ybot (%d ybots, worst %.1fpx over at ybot=%d)", over, worst_over, worst_over_yb))
+			pchk(
+				&bad, hole == 0,
+				fmt.tprintf("partial: never a line-height of unused pane below the last line (%d ybots, worst %.1fpx of %.1f at ybot=%d)", hole, worst_hole, line_h, worst_hole_yb),
+			)
+			pchk(&bad, seam == 0, fmt.tprintf("partial: every drawn line hit-tests back to its own block (%d wrong, first at ybot=%d)", seam, seam_yb))
+			pchk(&bad, ghost == 0, fmt.tprintf("partial: ...and a row below the last line drawn names nothing (%d wrong, first at ybot=%d)", ghost, ghost_yb))
+			// F3: the bottom-edge pixel itself, not a rect midpoint that happens to
+			// be nearby. `flush_n` proves the sweep produced real flush heights (a
+			// zero here would make `flush_bad == 0` vacuous); `flush_bad` is the
+			// design's own claim -- "the seam sits at the pane's bottom edge" --
+			// asked of the one row that actually IS the bottom edge.
+			pchk(&bad, edge_wrong == 0, fmt.tprintf("partial: the bottom-edge pixel never names the WRONG block (%d wrong, first at ybot=%d)", edge_wrong, edge_wrong_yb))
+			pchk(&bad, flush_n > 0, fmt.tprintf("partial: ...and the sweep really does land flush with ybot somewhere (%d of %d ybots)", flush_n, swept))
+			pchk(&bad, flush_bad == 0, fmt.tprintf("partial: ...and when flush, the edge pixel names the block that IS there (%d wrong of %d flush, first at ybot=%d)", flush_bad, flush_n, flush_bad_yb))
+			pchk(&bad, pix_over == 0, fmt.tprintf("partial: PIXELS -- nothing is inked at or below ybot (%d ybots, first ybot=%d topmost y=%d)", pix_over, pix_over_yb, pix_over_top))
+			pchk(
+				&bad, pix_hole == 0,
+				fmt.tprintf("partial: PIXELS -- the bottom two line-heights of pane are never blank (%d ybots, first ybot=%d)", pix_hole, pix_hole_yb),
+			)
+
+			// --- the wheel over a partial block, and the ceiling ------------------
+			//
+			// md_pass leaves `bottom` at a partially drawn block's START, so the only
+			// thing that advances into one is the PIXEL anchor (Md_Anchor.px). Two
+			// things have to be true of that for the reader: stepping down must
+			// REVEAL the paragraph's next line rather than step over it, and the
+			// ceiling md_max_anchor derives must still let its LAST line be reached.
+			//
+			// Asserted as coverage over the fixture's 90 words rather than as
+			// arithmetic about anchors: in a pane too short to hold the paragraph at
+			// once, every word must be drawn at some scroll position on the way to the
+			// ceiling. A skipped line, or a ceiling that stops short, leaves words
+			// behind. The step is exactly one line-height -- the sharpest version of
+			// "did it step over a line".
+			{
+				sybot := para_top + line_h * 3 // three of the paragraph's lines fit
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, W, H, 0.5)
+				c.pane = sybot - c.ytop
+				pchk(&bad, cok, "partial: the scroll context resolves for the short pane")
+				seen := make([]bool, 90, context.temp_allocator)
+				// THE THUMB (2026-07-29 review, F1). markdown_draw's `bottom` return
+				// stops at a partial block's START, so feeding it to md_vscrollbar_geo
+				// pins the thumb at its 24px floor for every step this loop takes while
+				// the paragraph is still partly drawn, then snaps to near-full the
+				// instant it clears -- a bigger lie than whole-block admission told, and
+				// a visible pop. `shown`, the out-param, is the fix: it credits a
+				// partial block with the fraction of its own byte span the admitted
+				// lines cover, so it has to track this wheel step for step.
+				thumbs := make([dynamic]f32, 0, 16, context.temp_allocator)
+				track_h := f32(0)
+				a := Md_Anchor{}
+				steps, at_top := 0, 0
+				for steps = 0; steps < 400; steps += 1 {
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					step_shown: int
+					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, c.ytop, sybot, a, &step_shown)
+					hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, c.ytop, sybot, a, context.temp_allocator)
+					if steps == 0 {at_top, _, _, _ = para_lines(hits)}
+					for hit in hits {
+						if !is_para(hit.url) || len(hit.url) < 3 {continue}
+						t := hit.url[len(hit.url) - 3:]
+						w := int(t[0] - '0') * 100 + int(t[1] - '0') * 10 + int(t[2] - '0')
+						if w >= 0 && w < 90 {seen[w] = true}
+					}
+					// The thumb this frame would actually draw: doc.md_top is the
+					// producer md_vscrollbar_geo reads (main.odin), set here exactly as
+					// md_preview_scroll sets it after every real wheel step.
+					doc.md_top = a
+					vb := md_vscrollbar_geo(&doc, 0, f32(H), step_shown, 0)
+					track_h = vb.track_h
+					append(&thumbs, vb.thumb_h)
+					nxt := md_scroll_clamp(&c, md_scroll_px(&c, a, line_h))
+					if nxt == a {break}
+					a = nxt
+				}
+				miss, first_miss := 0, -1
+				for s, i in seen {
+					if !s {
+						miss += 1
+						if first_miss < 0 {first_miss = i}
+					}
+				}
+				pchk(
+					&bad, at_top > 0 && at_top < nlines,
+					fmt.tprintf("partial: the wheel's pane is genuinely too short for the paragraph (%d of %d lines at the top)", at_top, nlines),
+				)
+				pchk(&bad, steps > 2 && steps < 400, fmt.tprintf("partial: ...and the wheel reaches the ceiling in a bounded number of steps (%d)", steps))
+				// This assertion went unfailed across the original task's seven
+				// sabotages -- the sole evidence for md_max_anchor's ceiling still
+				// admitting a partial block's last line, argued rather than tested.
+				// Closed 2026-07-29: shrinking md_max_anchor's `rel` by 35px (just
+				// under one line-height) DOES fail it -- "6 of 90 words never drawn,
+				// first w084" -- and nothing else in the suite even blinks, which is
+				// the point: `miss == 0` is the only check that would have caught the
+				// ceiling coming up short. (The other candidate, md_line_bottom's
+				// last-line rule -- 2026-07-29 review sabotage 5 -- does NOT move
+				// this row: a plain paragraph has no trailing decoration, so lay.h
+				// already equals the shaper's own last-line bottom, and that
+				// sabotage's effect is confined to h1/h2's rule, caught instead by
+				// md_head_fit_selftest. Both were tried; only shrinking the ceiling
+				// reproduces here.)
+				pchk(
+					&bad, miss == 0,
+					fmt.tprintf("partial: scrolling a partly drawn paragraph reveals every one of its lines (%d of 90 words never drawn, first w%03d)", miss, first_miss),
+				)
+
+				// The floor is sx(24) (md_vscrollbar_geo's clamp). Landing on it for
+				// ONE step can be an honest small fraction; landing on it for TWO
+				// steps running, while the wheel is genuinely moving the anchor through
+				// the same partial block, is the pin the bug report measured (four
+				// consecutive 24.0s).
+				floor := sx(24)
+				pin_run, worst_pin_run := 0, 0
+				for th in thumbs {
+					if abs(th - floor) < 0.05 {
+						pin_run += 1
+						worst_pin_run = max(worst_pin_run, pin_run)
+					} else {
+						pin_run = 0
+					}
+				}
+				pchk(
+					&bad, worst_pin_run <= 1,
+					fmt.tprintf("partial: the thumb is never pinned at its floor across consecutive scroll steps (worst run %d of %d steps)", worst_pin_run, len(thumbs)),
+				)
+				// One wheel notch reveals roughly one more visual line of the block
+				// (the "exactly one MORE line per line-height" property the ybot sweep
+				// above already pins); the thumb's growth per step should track that
+				// same share of the block, not sit flat and then jump most of the
+				// track in one step. `line_share` is that fraction of the TRACK,
+				// scaled generously (block gaps and the final whole-block transition
+				// both add slop this is not trying to pin exactly).
+				para_bytes := f32(len(src) - para_start)
+				line_share := (para_bytes / f32(nlines)) / f32(doc.pt.length) * track_h
+				step_bound := line_share * 3 + sx(2)
+				worst_step, worst_step_i := f32(0), -1
+				for i in 1 ..< len(thumbs) {
+					d := abs(thumbs[i] - thumbs[i - 1])
+					if d > worst_step {worst_step, worst_step_i = d, i}
+				}
+				pchk(
+					&bad, worst_step <= step_bound,
+					fmt.tprintf("partial: ...and grows by no more than one line's share of the track per step (worst %.1fpx at step %d, want <= %.1fpx)", worst_step, worst_step_i, step_bound),
+				)
+			}
+
+			// --- `forced`, narrowed from the first BLOCK to its first LINE --------
+			//
+			// The waiver exists so a pane too short for even one block shows something
+			// rather than nothing (md_head_fit_selftest's "forced:" row pins that, for
+			// a one-line heading, and it is unchanged). What changed here is its
+			// EXTENT: it used to admit the whole first block, so a pane pinned at ytop
+			// with a seven-line paragraph first drew all seven and let the cover strip
+			// eat six -- six lines of glyphs painted over the tab rail and the status
+			// bar in the frames before the strip lands, and six lines of link
+			// rectangles nobody could see. It now admits exactly one line. Stated as
+			// its own assertion because it is a behaviour change, not a bug fix.
+			{
+				b2 := strings.builder_make()
+				defer strings.builder_destroy(&b2)
+				for i in 0 ..< 90 {
+					if i > 0 {strings.write_string(&b2, " ")}
+					fmt.sbprintf(&b2, "[w%03d](https://e.test/w%03d)", i, i)
+				}
+				strings.write_string(&b2, "\n")
+				fsrc := strings.to_string(b2)
+				fcontent := make([]u8, len(fsrc))
+				copy(fcontent, fsrc)
+				fdoc := doc_from_content(fcontent, "forcedpara.md", .UTF8)
+				fdoc.md_mode = .Preview
+				defer doc_close(&fdoc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &fdoc, px_, x0, x1, ytop, ytop, Md_Anchor{})
+				fh := markdown_links(&h.gfx, &h.text, &fdoc, px_, x0, x1, ytop, ytop, Md_Anchor{}, context.temp_allocator)
+				fn, _, _, _ := para_lines(fh)
+				pchk(&bad, fn == 1, fmt.tprintf("partial: a pane too short for one line still shows exactly ONE (%d lines)", fn))
+			}
+
+			// --- the F4 pairing guard, exercised from `mdtest` itself -------------
+			//
+			// mdtabletest never draws a REAL Table block through md_block_draw -- it
+			// is cell arithmetic against md_table_ensure only -- so nothing in the
+			// STANDARD suite drew a table through the shaped_draw/md_kind_lines
+			// pairing guard (markdown.odin, md_block_draw's `defer`) until this. A
+			// one-row table here is not testing table rendering; it is proving the
+			// guard does not fire for correct code, from the same `mdtest` gate the
+			// verification loop already runs on every change -- so a future change
+			// that puts `.Table` on only one side of the pairing (the exact landmine
+			// F4 describes: the next task shapes table cells) is caught here rather
+			// than only by the `mdperftest` extra, which is not part of that loop.
+			// A panic there aborts the whole process before this proc's `bad` count
+			// or mdtest's own summary line can print -- the loudest failure mode
+			// available, which is the point.
+			{
+				tsrc := "| a | b |\n|---|---|\n| c | d |\n"
+				tcontent := make([]u8, len(tsrc))
+				copy(tcontent, tsrc)
+				tdoc := doc_from_content(tcontent, "guardtable.md", .UTF8)
+				tdoc.md_mode = .Preview
+				defer doc_close(&tdoc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				tbottom := markdown_draw(&h.gfx, &h.quads, &h.text, &tdoc, px_, x0, x1, ytop, ybot_full, Md_Anchor{})
+				pchk(&bad, tbottom > 0, "partial: a table block draws (and does not trip the F4 shaped_draw pairing guard)")
+			}
+			return
+		}
+
+		// F2 (2026-07-29 review): the two `ad.h` band changes in md_block_draw --
+		// Fence_Body's background band and Quote's bars -- had NO fixture that
+		// could exercise them at all. md_partial_selftest's fixture is a bare
+		// paragraph, and a paragraph draws no band; every OTHER mdtest fixture
+		// that touches a fence or a quote is short enough to be admitted whole.
+		// Reverting BOTH `ad.h`s back to `lay.h` left the full regression suite
+		// (mdtest mdviewtest mdfencetest mdtabletest linktest rowbudgettest
+		// themetest) at 0 failures. This closes that gap: one over-long fenced
+		// line and one long blockquote, each admitted PARTIALLY, checked for the
+		// one thing `ad.h` exists to prevent -- a band is a QUAD painted from a
+		// SECOND, independent height, so nothing about per-line admission of
+		// GLYPHS (which F1's fixture already covers) bounds it on its own.
+		md_band_admit_selftest :: proc() -> (bad: int) {
+			pchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1000, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/band") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			px_ := f32(24)
+			bg := g_theme[.Bg_Base]
+
+			// The contiguous rows, inside [x0,x1), painted (approximately) `col` --
+			// a calibration of where a QUAD-drawn band lives on screen, independent
+			// of the shaper's line boxes (a fence/quote band is not one of those).
+			band_rows :: proc(pix: []u8, col: [4]f32, x0, x1: f32, W, H: int) -> (top, bot: int) {
+				top, bot = -1, -1
+				for yy in 0 ..< H {
+					found := false
+					for xx in clamp(int(x0), 0, W) ..< clamp(int(x1), 0, W) {
+						i := (yy * W + xx) * 4
+						d :=
+							abs(int(pix[i]) - int(col[2] * 255)) +
+							abs(int(pix[i + 1]) - int(col[1] * 255)) +
+							abs(int(pix[i + 2]) - int(col[0] * 255))
+						if d < 10 {
+							found = true
+							break
+						}
+					}
+					if found {
+						if top < 0 {top = yy}
+						bot = yy + 1
+					}
+				}
+				return
+			}
+			// Any row in [lo, H) inside [x0,x1) painted (approximately) `col`.
+			band_below :: proc(pix: []u8, col: [4]f32, lo: int, x0, x1: f32, W, H: int) -> bool {
+				t, b := band_rows(pix[:], col, x0, x1, W, H)
+				_ = t
+				return b > lo
+			}
+
+			// One fixture: a one-line lead (so the target block is not the anchor's
+			// waiver -- `forced` always draws SOMETHING of the first block, which
+			// would make a too-short pane vacuous rather than partial), then the
+			// target block, long enough to wrap several visual lines.
+			run :: proc(bad: ^int, h: ^Headless_Gpu, bg: [4]f32, px_: f32, name, src: string, col: Color_Role, W, H: int) {
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, name, .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot_full, box_ok := md_pane_box(&doc, f32(W), f32(H), 0.5)
+				pchk(bad, box_ok, fmt.tprintf("band[%s]: the pane box resolves", name))
+				if !box_ok {return}
+
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				full_bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot_full, Md_Anchor{})
+				pchk(bad, full_bottom > 0, fmt.tprintf("band[%s]: the fixture fits and draws whole at full pane height", name))
+				pix_full, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				pchk(bad, pok, fmt.tprintf("band[%s]: the full-pane readback resolves", name))
+				if !pok {return}
+				bandcol := g_theme[col]
+				btop, bbot := band_rows(pix_full, bandcol, x0, x1, W, H)
+				pchk(bad, btop >= 0 && bbot - btop > 60, fmt.tprintf("band[%s]: the band itself is tall enough to cut through (%d..%d)", name, btop, bbot))
+				if btop < 0 || bbot - btop <= 60 {return}
+
+				// Sweep the middle of the band's own extent: ybot values that, by
+				// construction, cut through rows the FULL pane painted -- so the
+				// block was NOT admitted whole at this height, or nothing below is
+				// testing anything.
+				partial_seen, over := 0, 0
+				worst_yb := -1
+				steps := 8
+				for i in 1 ..< steps {
+					ybot := f32(btop) + f32(bbot - btop) * f32(i) / f32(steps)
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					bt := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+					if bt >= full_bottom {continue} // admitted whole at this height; not a partial sample
+					partial_seen += 1
+					pix, pok2 := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if !pok2 {continue}
+					if band_below(pix, bandcol, int(ybot) + 1, x0, x1, W, H) {
+						over += 1
+						if worst_yb < 0 {worst_yb = int(ybot)}
+					}
+				}
+				pchk(bad, partial_seen > 0, fmt.tprintf("band[%s]: the sweep really does admit the block partially (%d of %d ybots)", name, partial_seen, steps - 1))
+				pchk(bad, over == 0, fmt.tprintf("band[%s]: the band never paints below ybot while partial (%d of %d, first at ybot=%d)", name, over, partial_seen, worst_yb))
+			}
+
+			fence_src := "lead line\n\n```\n"
+			for i in 0 ..< 20 {fence_src = fmt.tprintf("%slet token_%02d = some_long_identifier_value_%02d; ", fence_src, i, i)}
+			fence_src = fmt.tprintf("%s\n```\n", fence_src)
+			run(&bad, &h, bg, px_, "fence.md", fence_src, .Md_Code_Bg, W, H)
+
+			quote_src := "lead line\n\n> "
+			for i in 0 ..< 40 {quote_src = fmt.tprintf("%sword%02d ", quote_src, i)}
+			quote_src = fmt.tprintf("%s\n", quote_src)
+			run(&bad, &h, bg, px_, "quote.md", quote_src, .Md_Quote, W, H)
+			return
+		}
+
+		// A table column is fitted in CELLS and shaped in ADVANCES, and the two have
+		// to be the same pixel. This is the defect behind Wyatt's "it looks like it's
+		// not respecting the spaces all the time" (2026-07-29, with a screenshot of a
+		// markdown table): md_table_cols was handed plat.text_char_width, which ROUNDS
+		// the cell to a whole pixel for the editor's grid, while the cell text goes
+		// through the proportional shaper, which advances by the font's real advance.
+		// At the default 16px document size m.table is 15px, where the rounded cell is
+		// 8.0000 and the real advance 8.2471 -- so a column fitted to exactly its
+		// content's natural cell count came out 3% too NARROW, the greedy break fired
+		// on the cell's last glyph, and every cell at its natural width dropped its
+		// last word onto a second line.
+		//
+		// WHY THE EXISTING TABLE SECTIONS ARE BLIND TO IT: the rounding error changes
+		// SIGN with the size. md_scale rounds m.table to a whole px, so at mdtest's
+		// px_=24 the rounded cell is 13.0000 against a real 12.6455 -- columns come
+		// out too WIDE there, nothing wraps early, and every assertion in
+		// md_table_wrap_selftest is satisfied. Hence the sweep below rather than one
+		// size, and hence the precondition row that says which sizes the case even
+		// exists at.
+		md_table_fit_selftest :: proc() -> (bad: int) {
+			fchk :: proc(bad: ^int, ok: bool, msg: string) -> bool {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+				return ok
+			}
+			W, H :: 1500, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/tablefit") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			x0, x1 := f32(40), f32(1400)
+			ytop, ybot := f32(60), f32(650)
+			bg := g_theme[.Bg_Base]
+
+			// --- A. the invariant, swept across document sizes ---------------------
+			//
+			// A table narrower than the measure is fitted at its NATURAL widths (rule 2
+			// of md_table_fit_cells), so every column's pixel width must be at least
+			// what its widest cell SHAPES to. If it is less, the shaper has no choice
+			// but to break the cell -- there is no third possibility, which is what
+			// makes this the whole claim rather than a proxy for it.
+			//
+			// The natural width comes from plat.shape_spans at an unbounded measure: a
+			// second producer, deliberately, and the same one section 3 of
+			// md_table_wrap_selftest uses for a row's height. It can disagree with the
+			// layout only if the layout stopped shaping its cells.
+			CELL0 :: "aa  bb" // 6 cells; the double space is what the break lands on
+			CELL1 :: "cc  dd"
+			src := "| h1 | h2 |\n|---|---|\n| " + CELL0 + " | x |\n| " + CELL1 + " | y |\n"
+			sizes := []f32{16, 18, 20, 22, 24}
+			gap_sizes := 0 // sizes where the rounded cell really is narrower than the real advance
+			for px_ in sizes {
+				m := md_metrics(&h.text, px_)
+				_, measure := md_content_span(&m, x0, x1)
+				// The two candidate pixels, both read INDEPENDENTLY of what
+				// md_table_char_w chose between them: the editor grid's rounded cell,
+				// and the advance the shaper will actually lay a mono glyph out with.
+				// Reading `exact` off md_table_char_w instead would make this row agree
+				// with whatever the producer does and say nothing about the sizes the
+				// case exists at.
+				rounded := plat.text_char_width(&h.text, m.table, .Doc)
+				exact := plat.text_advance(&h.gfx, &h.text, '0', m.table, .Doc)
+				if rounded < exact {gap_sizes += 1}
+
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "fit.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				tc := md_table_ensure(&doc, &h.text, 0)
+				cols := md_table_cols(tc, measure, md_table_char_w(&h.gfx, &h.text, &m), context.temp_allocator)
+				if !fchk(&bad, len(cols) == 2, fmt.tprintf("fit[%.0f]: the block fits to 2 columns at its natural widths (%d)", px_, len(cols))) {continue}
+
+				widest := f32(0)
+				for cell in ([]string{"h1", CELL0, CELL1}) {
+					one := []plat.Shape_Span{{text = cell, px = m.table, set = .Doc}}
+					sh := plat.shape_spans(&h.gfx, &h.text, one, 1e6, line_height(m.table), context.temp_allocator)
+					widest = max(widest, sh.width)
+					// The unbounded shape must be ONE line, or `width` is not a natural
+					// width and the comparison below means nothing.
+					fchk(&bad, sh.lines == 1, fmt.tprintf("fit[%.0f]: |%s| shapes to one line at an unbounded measure (%d)", px_, cell, sh.lines))
+				}
+				fchk(
+					&bad, cols[0].w >= widest - 0.01,
+					fmt.tprintf("fit[%.0f]: column 0 is at least as wide as its widest cell SHAPES to (%.4f vs %.4f; rounded cell %.4f, real %.4f)", px_, cols[0].w, widest, rounded, exact),
+				)
+			}
+			// Without this the sweep could be green because no size in it has a
+			// rounding gap at all -- which is exactly the state md_table_wrap_selftest's
+			// single px_=24 was in.
+			fchk(&bad, gap_sizes > 0, fmt.tprintf("fit: the sweep includes sizes where the rounded cell IS narrower than the real advance (%d of %d)", gap_sizes, len(sizes)))
+
+			// --- B. the effect, at the size Wyatt actually runs ---------------------
+			//
+			// BASE_PX_96 is 16, which is the broken side of the rounding. Two ADJACENT
+			// body rows, each with a link in column 1: a link rect's y locates that
+			// row's first visual line (markdown_links, the same producer sections 3
+			// and 4 of md_table_wrap_selftest read), and blocks tile with no collapsed
+			// gap between table rows -- so row 2's top minus row 1's top IS row 1's
+			// height. One table row tall means the cell did not wrap; two means it did.
+			//
+			// The MINIMUM y per link, because with the bug present the link cell itself
+			// breaks between characters and contributes a rect per visual line.
+			{
+				px_ := BASE_PX_96
+				m := md_metrics(&h.text, px_)
+				lsrc := "| h1 | h2 |\n|---|---|\n| " + CELL0 + " | [r1](https://e.test/r1) |\n| " + CELL1 + " | [r2](https://e.test/r2) |\n"
+				content := make([]u8, len(lsrc))
+				copy(content, lsrc)
+				doc := doc_from_content(content, "fitlinks.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+				r1_y, r2_y := f32(1e9), f32(1e9)
+				for hit in hits {
+					if strings.has_suffix(hit.url, "/r1") {r1_y = min(r1_y, hit.rect.pos.y)}
+					if strings.has_suffix(hit.url, "/r2") {r2_y = min(r2_y, hit.rect.pos.y)}
+				}
+				trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, line_height(m.table), .Doc, context.temp_allocator).line_h
+				located := r1_y < 1e9 && r2_y < 1e9 && r2_y > r1_y && trow > 0
+				fchk(&bad, located, fmt.tprintf("fit: both rows' links locate them (%.1f, %.1f; row %.1f)", r1_y, r2_y, trow))
+				if located {
+					fchk(
+						&bad, abs((r2_y - r1_y) - trow) <= 1,
+						fmt.tprintf("fit: at %.0fpx a table row whose cells are at their natural width is ONE line tall, not two (%.1f vs %.1f)", px_, r2_y - r1_y, trow),
+					)
+				}
+			}
+
+			// --- C. the control: a cell genuinely too long for its column STILL wraps.
+			//
+			// Without it, "make every column wider" satisfies A and B by never breaking
+			// anything -- which is the opposite defect, and the screenshot this batch
+			// started from (a table running off the pane).
+			//
+			// Asserted the same way B is, on the ROW HEIGHT taken from link rects, not
+			// on the fitted extent: a fitted extent inside the measure is compatible
+			// with columns 1.5x too wide (verified -- that sabotage leaves an extent
+			// check green, because MD_TABLE_MAX_CELLS clamps this fixture's 280-cell
+			// column long before the measure binds). The row being more than one line
+			// tall is not.
+			{
+				px_ := BASE_PX_96
+				m := md_metrics(&h.text, px_)
+				b := strings.builder_make(context.temp_allocator)
+				strings.write_string(&b, "| id | long |\n|:---|:---|\n| [c1](https://e.test/c1) | ")
+				for i in 0 ..< 40 {fmt.sbprintf(&b, "word%02d ", i)}
+				strings.write_string(&b, "|\n| [c2](https://e.test/c2) | z |\n")
+				content := make([]u8, len(strings.to_string(b)))
+				copy(content, strings.to_string(b))
+				doc := doc_from_content(content, "fitlong.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+				c1_y, c2_y := f32(1e9), f32(1e9)
+				for hit in hits {
+					if strings.has_suffix(hit.url, "/c1") {c1_y = min(c1_y, hit.rect.pos.y)}
+					if strings.has_suffix(hit.url, "/c2") {c2_y = min(c2_y, hit.rect.pos.y)}
+				}
+				trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, line_height(m.table), .Doc, context.temp_allocator).line_h
+				located := c1_y < 1e9 && c2_y < 1e9 && c2_y > c1_y && trow > 0
+				fchk(&bad, located, fmt.tprintf("fit: both rows of the long fixture locate them (%.1f, %.1f)", c1_y, c2_y))
+				if located {
+					fchk(
+						&bad, (c2_y - c1_y) > 2.5 * trow,
+						fmt.tprintf("fit: a cell far too long for its column STILL wraps -- the row is several lines tall (%.1f vs one row %.1f)", c2_y - c1_y, trow),
+					)
+				}
+			}
+			return
+		}
+
+		// The 2026-07-29 table task (design doc §2). Wyatt's screenshot: a wide
+		// markdown table in Preview with its rightmost column cut off by the pane
+		// edge, because md_layout_build's `case .Table` returned before the span
+		// section and so a table got no shaping, no measure and no idea the 72ch
+		// column existed.
+		//
+		// Why the checks below are the ones they are: mdtabletest asserts the CELL
+		// ARITHMETIC (md_table_measure's per-block widths, the oversize guards) and
+		// nothing about pixels, so every one of its assertions is satisfied by the
+		// reported bug. What the bug violated is the relationship between those
+		// widths and the pane, and between a row's height and its tallest cell --
+		// both of which only exist once something is placed on screen. So this drives
+		// markdown_draw / markdown_links through a real device and asserts on the
+		// output, plus the fit rule itself as pure arithmetic where it has no device
+		// to need.
+		md_table_wrap_selftest :: proc() -> (bad: int) {
+			tchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+
+			// --- 1. the measure fit, as pure arithmetic ---------------------------
+			//
+			// md_table_fit_cells is the whole of the fit decision and takes no device,
+			// so it is driven directly. The invariant asserted on every case is the one
+			// the defect breaks: the fitted widths PLUS the gutters never exceed the
+			// cells the measure holds. The give-back is asserted separately, because
+			// "fits" alone is also satisfied by an implementation that just clamps
+			// every column to the same narrow width and throws away the natural
+			// measurement -- which would make a `| x |` column as wide as a prose one.
+			{
+				fit :: proc(natural: []int, avail: int) -> (out: [MD_TABLE_MAX_COLS]int, n, used: int) {
+					n = md_table_fit_cells(natural, avail, out[:])
+					for i in 0 ..< n {used += out[i]}
+					if n > 1 {used += (n - 1) * MD_TABLE_PAD}
+					return
+				}
+				// (a) Already narrower than the measure: the natural widths survive
+				// UNTOUCHED. This is the assertion that stops the fit from being a
+				// blunt clamp -- the common case must lay out exactly as it did before
+				// the fit existed.
+				{
+					nat := []int{3, 7, 27}
+					out, n, used := fit(nat, 72)
+					ok := n == 3 && out[0] == 3 && out[1] == 7 && out[2] == 27 && used <= 72
+					tchk(&bad, ok, fmt.tprintf("fit: a table that already fits keeps its natural widths (%v, %d of 72 cells)", out[:n], used))
+				}
+				// (b) Wider than the measure: it fits, the two small columns keep their
+				// natural width, and the greedy one absorbs the whole shortfall. The
+				// `out[2] < nat[2]` half is the non-vacuity guard -- without it the
+				// case passes on a fixture that never needed fitting.
+				{
+					nat := []int{3, 7, 200}
+					out, n, used := fit(nat, 40)
+					ok := n == 3 && used <= 40 && out[0] == 3 && out[1] == 7 && out[2] < nat[2] && out[2] == 40 - 2 * MD_TABLE_PAD - 10
+					tchk(&bad, ok, fmt.tprintf("fit: the over-wide column absorbs the shortfall and the small ones are given their width back (%v, %d of 40)", out[:n], used))
+				}
+				// (c) §10's upper clamp, reused: one enormous cell cannot claim the
+				// whole measure when its neighbour also wants room -- neither lands
+				// anywhere near its own natural width (40 and 300 cells).
+				//
+				// UNEQUAL naturals on purpose: {300, 300} used to sit here, and a
+				// test that gives both columns the identical want cannot tell §10's
+				// "distribute proportionally" apart from splitting what's left
+				// evenly -- both rules land on the same [share, share] regardless of
+				// which one the code runs. {20, 300} keeps both columns competing
+				// for the same leftover pool (neither is satisfied at any point in
+				// the water-fill, so this is still the free-for-all branch, not the
+				// keeps-its-natural-width one) while wanting different amounts of
+				// it, so the two rules produce different numbers and this rejects
+				// whichever one is NOT running.
+				{
+					nat := []int{20, 300}
+					out, n, used := fit(nat, 40)
+					ok := n == 2 && used <= 40 && out[0] <= MD_TABLE_MAX_CELLS && out[1] <= MD_TABLE_MAX_CELLS
+					// THE distinguishing assertion. Even split gives both columns the
+					// same width (19 and 19, sabotage this back to `out[i] =
+					// max(minc, share)` to see it); proportional gives the column that
+					// wanted 15x as much noticeably more of the leftover.
+					ok = ok && out[1] > out[0]
+					tchk(&bad, ok, fmt.tprintf("fit: two competing columns split the leftover PROPORTIONALLY to what each still wants, not evenly (%v, %d of 40)", out[:n], used))
+				}
+				// (d) A SWEEP, because the three hand-picked cases above each pin one
+				// branch and none of them pins the arithmetic between the branches.
+				// Every combination must satisfy the one invariant; the count of cases
+				// that actually needed fitting is printed so a change that makes the
+				// sweep vacuous is visible.
+				{
+					over, tight := 0, 0
+					worst := ""
+					for ncols in 1 ..= 12 {
+						for wide in ([]int{1, 4, 12, 30, 120}) {
+							for avail in ([]int{8, 20, 40, 72, 200}) {
+								nat := make([]int, ncols, context.temp_allocator)
+								for i in 0 ..< ncols {nat[i] = 1 + (i % 3) * 5 + (wide if i == ncols - 1 else 0)}
+								out, n, used := fit(nat, avail)
+								natural_used := 0
+								for i in 0 ..< ncols {natural_used += nat[i]}
+								if ncols > 1 {natural_used += (ncols - 1) * MD_TABLE_PAD}
+								if natural_used > avail {tight += 1}
+								// n < ncols is a dropped column -- the last resort, and only
+								// legal when even one cell each could not fit.
+								if used > avail && !(n == 1 && avail < MD_TABLE_MIN_CELLS) {
+									over += 1
+									if worst == "" {worst = fmt.tprintf("ncols=%d wide=%d avail=%d -> %v (%d)", ncols, wide, avail, out[:n], used)}
+								}
+							}
+						}
+					}
+					tchk(&bad, tight > 0, fmt.tprintf("fit sweep: %d of 300 cases really do need fitting", tight))
+					tchk(&bad, over == 0, fmt.tprintf("fit sweep: no case exceeds its measure (%d bad; first: %s)", over, worst))
+				}
+				// (e) The oversized block (past MD_TABLE_BUDGET) keeps its FIXED
+				// columns and only has their COUNT bounded by the measure.
+				// md_table_measure's ncols there is MD_TABLE_MAX_COLS -- a deliberate
+				// over-estimate that scanned nothing -- so water-filling it would
+				// squeeze 32 imaginary columns into one character each and lose the real
+				// data that was in the first few. Still needs to fit the measure, which
+				// it did not before this task.
+				{
+					c := Md_Table_Cache {
+						valid    = true,
+						ncols    = MD_TABLE_MAX_COLS,
+						oversize = true,
+					}
+					for i in 0 ..< MD_TABLE_MAX_COLS {c.widths[i] = MD_TABLE_FIXED_CELLS}
+					cw := f32(10)
+					cols := md_table_cols(&c, 800, cw, context.temp_allocator)
+					ext := f32(0)
+					if len(cols) > 0 {ext = cols[len(cols) - 1].x + cols[len(cols) - 1].w}
+					ok := len(cols) > 0 && len(cols) < MD_TABLE_MAX_COLS && ext <= 800
+					for col in cols {
+						if col.w != f32(MD_TABLE_FIXED_CELLS) * cw {ok = false}
+					}
+					tchk(&bad, ok, fmt.tprintf("fit: an oversized block keeps 16-cell fixed columns and drops the count to %d, ending at %.0f of 800px", len(cols), ext))
+				}
+			}
+
+			// A pane wide enough that the 72ch measure BINDS inside it: x1 is 1400 but
+			// the measure is ~880, so "the table fits the measure" is a stronger claim
+			// than "the table fits the pane" and the region between the two is real
+			// screen the assertions below require to be empty. At the 900px pane every
+			// other md test uses, the two claims coincide and the 72ch cap is untested.
+			W, H :: 1500, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/table") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			px_ := f32(24)
+			bg := g_theme[.Bg_Base]
+			x0, x1 := f32(40), f32(1400)
+			ytop, ybot := f32(60), f32(650)
+			m := md_metrics(&h.text, px_)
+			cx, measure := md_content_span(&m, x0, x1)
+			// The SAME producer md_layout_build denominates its columns in
+			// (md_table_char_w). Was plat.text_char_width spelled out here, which is a
+			// second copy of the layout's choice -- and when that choice turned out to
+			// be the wrong pixel (md_table_fit_selftest) this copy would have quietly
+			// kept testing the old geometry.
+			char_w := md_table_char_w(&h.gfx, &h.text, &m)
+			// One table row's line height, from the same shaper the layout uses at the
+			// same face and size. A probe, not a second producer: if the layout stopped
+			// going through the shaper this would stop agreeing with it.
+			trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, line_height(m.table), .Doc, context.temp_allocator).line_h
+			tchk(&bad, measure < x1 - cx - 100, fmt.tprintf("pane: the 72ch measure binds well inside the pane (measure %.0f, pane %.0f)", measure, x1 - cx))
+			tchk(&bad, char_w > 0 && trow > 0, fmt.tprintf("pane: the table face resolves (char_w %.2f, row %.1f)", char_w, trow))
+
+			mkdoc :: proc(src, name: string) -> Document {
+				content := make([]u8, len(src))
+				copy(content, src)
+				d := doc_from_content(content, name, .UTF8)
+				d.md_mode = .Preview
+				return d
+			}
+			// Any pixel in [xlo, xhi) x [ylo, yhi) that is not the page background.
+			// Returns the ink's own extent, so one scan answers both "is there ink out
+			// there" and "where does the ink end".
+			ink :: proc(pix: []u8, bg: [4]f32, xlo, xhi, ylo, yhi, W, H: int) -> (lo, hi: int, found: bool) {
+				lo, hi = W, -1
+				for yy in max(0, ylo) ..< min(H, yhi) {
+					for xx in max(0, xlo) ..< min(W, xhi) {
+						i := (yy * W + xx) * 4
+						d :=
+							abs(int(pix[i]) - int(bg[2] * 255)) +
+							abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+							abs(int(pix[i + 2]) - int(bg[0] * 255))
+						if d > 24 {
+							lo, hi, found = min(lo, xx), max(hi, xx + 1), true
+						}
+					}
+				}
+				return
+			}
+
+			// --- 2. a table wider than the measure fits inside it ------------------
+			//
+			// Six 30-character columns: ~190 character cells of natural width against a
+			// measure that holds about 60. Before the fit this drew every column at its
+			// natural width from the block's left edge, so the last three ran off the
+			// pane entirely -- which is the screenshot. There is no scissor rect here,
+			// so "off the pane" means painted over the scrollbar and the other split
+			// half, not clipped.
+			{
+				sb := strings.builder_make(context.temp_allocator)
+				for r in 0 ..< 4 {
+					for c in 0 ..< 6 {
+						strings.write_string(&sb, "| ")
+						if r == 1 {
+							strings.write_string(&sb, "---")
+						} else {
+							for k in 0 ..< 30 {strings.write_byte(&sb, u8('a') + u8((c + r + k) % 26))}
+						}
+						strings.write_string(&sb, " ")
+					}
+					strings.write_string(&sb, "|\n")
+				}
+				doc := mkdoc(strings.to_string(sb), "wide.md")
+				defer doc_close(&doc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				tchk(&bad, pok, "wide: the readback resolves")
+				if pok {
+					// The control: the table really is on screen. Without it the
+					// overflow check below passes on an empty frame.
+					_, inside_hi, inside := ink(pix, bg, int(cx), int(cx + measure), int(ytop), int(ybot), W, H)
+					tchk(&bad, inside, "wide: the table is actually drawn inside the measure")
+					// The defect, stated: nothing at all past the measure. Scanned to
+					// the pane's own right edge, which is 400px beyond the measure.
+					over_lo, _, over := ink(pix, bg, int(cx + measure) + 2, int(x1), int(ytop), int(ybot), W, H)
+					tchk(
+						&bad, !over,
+						fmt.tprintf("wide: a table 190 cells wide paints NOTHING past the %.0fpx measure (ink ends at %d; first stray at %d)", measure, inside_hi, over_lo if over else -1),
+					)
+				}
+			}
+
+			// --- 3. wrapping, the row height, and the link seam --------------------
+			//
+			// One fixture for the three because they are one geometry. Row 2's second
+			// cell is a pile of links far too long for its column, so:
+			//   * how many DISTINCT y values those links land on is how many visual
+			//     lines the cell wrapped to -- read off the drawn output, not counted
+			//     from an arithmetic prediction;
+			//   * every one of their rects must sit inside that cell's own column,
+			//     which is what "wraps rather than overflowing" means;
+			//   * row 3's link tells us where row 2 ENDED, so the row's height can be
+			//     compared against its tallest cell's;
+			//   * and the rects existing at all closes batch 17's disclosed regression
+			//     (links in table cells were not clickable, because `case .Table`
+			//     returned before the spans were built).
+			{
+				sb := strings.builder_make(context.temp_allocator)
+				strings.write_string(&sb, "| id | links |\n|:---|:------|\n| [row2](https://e.test/row2) |")
+				for i in 0 ..< 30 {fmt.sbprintf(&sb, " [w%02d](https://e.test/w%02d)", i, i)}
+				strings.write_string(&sb, " |\n| [row3](https://e.test/row3) | z |\n")
+				doc := mkdoc(strings.to_string(sb), "wrap.md")
+				defer doc_close(&doc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+
+				// The same column geometry the layout fitted, from the same producer.
+				// Not a second derivation: md_table_cols is the one procedure that turns
+				// a measured block into pixel columns, and this asks it the identical
+				// question the layout asked.
+				tc := md_table_ensure(&doc, &h.text, 0)
+				cols := md_table_cols(tc, measure, char_w, context.temp_allocator)
+				tchk(&bad, len(cols) == 2, fmt.tprintf("wrap: the block fits to 2 columns (%d)", len(cols)))
+
+				// Row 2's cell links, row 2's id link, row 3's id link.
+				ys := make([dynamic]f32, 0, 16, context.temp_allocator)
+				r2_y, r3_y := f32(-1), f32(-1)
+				esc := 0 // rects outside the links column
+				for hit in hits {
+					switch {
+					case strings.has_suffix(hit.url, "/row2"):
+						r2_y = hit.rect.pos.y
+					case strings.has_suffix(hit.url, "/row3"):
+						r3_y = hit.rect.pos.y
+					case strings.contains(hit.url, "/w"):
+						seen := false
+						for y in ys {if abs(y - hit.rect.pos.y) < 1 {seen = true}}
+						if !seen {append(&ys, hit.rect.pos.y)}
+						if len(cols) == 2 {
+							l, r := cx + cols[1].x, cx + cols[1].x + cols[1].w
+							if hit.rect.pos.x < l - 1 || hit.rect.pos.x + hit.rect.size.x > r + 1 {esc += 1}
+						}
+					}
+				}
+				// THE regression closure. Zero rects is what shipped: `case .Table`
+				// returned before `spans`, so md_block_links had nothing to walk.
+				tchk(&bad, len(ys) > 0 && r2_y >= 0 && r3_y >= 0, fmt.tprintf("links: a link in a table cell gets a rect at all (%d wrapped lines, id rects %.0f / %.0f)", len(ys), r2_y, r3_y))
+				tchk(&bad, len(ys) >= 3, fmt.tprintf("wrap: the over-long cell wraps INSIDE its column to %d visual lines", len(ys)))
+				tchk(&bad, esc == 0, fmt.tprintf("wrap: no wrapped line escapes its own column (%d of %d rects)", esc, len(hits)))
+
+				// THE row height. Row 2 and row 3 are adjacent table blocks with no
+				// collapsed gap between them, so row 3's top is row 2's top plus row 2's
+				// height -- and row 2's height must be its TALLEST cell's, i.e. the
+				// wrapped links cell's, not the one-line id cell's. Both y values come
+				// from the shaper via md_block_links, so this compares the drawn
+				// geometry against the drawn line count.
+				if r2_y >= 0 && r3_y >= 0 && len(ys) > 0 {
+					want := f32(len(ys)) * trow
+					got := r3_y - r2_y
+					tchk(
+						&bad, abs(got - want) <= 1,
+						fmt.tprintf("height: row 2 is exactly as tall as its tallest cell (%d lines x %.1f = %.1f; next row starts %.1f lower)", len(ys), trow, want, got),
+					)
+					// ...and the one-line cell beside it did NOT grow: its own link sits
+					// on row 2's first line, so the extra height is below the id, not
+					// distributed into it. This rejects "every cell padded to the row
+					// height and then centred", which the check above cannot see.
+					if pok {
+						_, _, id_ink := ink(pix, bg, int(cx + cols[0].x), int(cx + cols[0].x + cols[0].w), int(r2_y), int(r2_y + trow), W, H)
+						tchk(&bad, id_ink, "height: the row's one-line cell still draws on the row's FIRST line")
+					}
+				}
+			}
+
+			// --- 4. column alignment holds across rows, on pixels ------------------
+			//
+			// The property §9.3 puts tables on the mono face for -- "always mono:
+			// columns align" -- and the reason it is asserted on PIXELS rather than on
+			// the fitted widths is that the widths agreeing is not the claim. The claim
+			// is that a column AFTER a wrapping column sits at the same x whether or not
+			// its neighbour wrapped, which is a statement about the merged glyph
+			// positions shape_columns produces, not about the fitted widths alone.
+			//
+			// THREE columns, not two, and the wrapping cell is column 0 -- not the last
+			// one. The previous fixture put the only long cell in the LAST column, so
+			// there was nothing after it that could shift, and the assertion rejected
+			// nothing: shape_columns sabotaged to shift a column's x by its PREVIOUS
+			// column's wrapped line count (`off -= f32(len(parts[i-1].line_boxes) - 1)
+			// * 40`, the exact change) still reported mdtest: 0 failures. Columns 1
+			// and 2 here are both AFTER the wrapping column, so a shift like that has
+			// somewhere to show up.
+			//
+			// Column 1 is right-aligned and wider than its content, so this also
+			// catches alignment being dropped altogether: a left-aligned "III" would
+			// sit at the column's left edge, not several cells into it. Column 2 is a
+			// link, which locates each row's first line exactly -- taken from the
+			// drawn output, not predicted. Row 3 exists only to bound row 2's height
+			// from below, the same trick section 3 uses for row 2 and row 3 there.
+			{
+				sb := strings.builder_make(context.temp_allocator)
+				strings.write_string(&sb, "| w | mmmmmmmm | id |\n|:---|---:|:---|\n")
+				strings.write_string(&sb, "| x | III | [ra](https://e.test/ra) |\n")
+				strings.write_string(&sb, "| wwww wwww wwww wwww wwww wwww wwww wwww wwww wwww | III | [rb](https://e.test/rb) |\n")
+				strings.write_string(&sb, "| y | III | [rc](https://e.test/rc) |\n")
+				doc := mkdoc(strings.to_string(sb), "align.md")
+				defer doc_close(&doc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				tchk(&bad, pok, "align: the readback resolves")
+				tc := md_table_ensure(&doc, &h.text, 0)
+				cols := md_table_cols(tc, measure, char_w, context.temp_allocator)
+				tchk(&bad, len(cols) == 3, fmt.tprintf("align: the block fits to 3 columns (%d)", len(cols)))
+				// Each row's own link (column 2) locates that row's first line -- taken
+				// from the drawn output, so nothing here predicts a y. The three id
+				// cells are "ra", "rb" and "rc", i.e. the same first glyph, which is
+				// what lets the x comparison below be exact instead of carrying a
+				// side-bearing tolerance.
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+				row1_x, row1_y := f32(-1), f32(-1)
+				row2_x, row2_y := f32(-1), f32(-1)
+				row3_y := f32(-1)
+				for hit in hits {
+					if strings.has_suffix(hit.url, "/ra") {row1_x, row1_y = hit.rect.pos.x, hit.rect.pos.y}
+					if strings.has_suffix(hit.url, "/rb") {row2_x, row2_y = hit.rect.pos.x, hit.rect.pos.y}
+					if strings.has_suffix(hit.url, "/rc") {row3_y = hit.rect.pos.y}
+				}
+				ok3 := row1_y > 0 && row2_y > row1_y && row3_y > row2_y && len(cols) == 3
+				tchk(&bad, ok3, fmt.tprintf("align: all three rows' links locate them (y %.0f, %.0f, %.0f; %d cols)", row1_y, row2_y, row3_y, len(cols)))
+				if pok && ok3 {
+					// THE precondition: row 2 really did wrap. Read off the drawn output,
+					// not predicted -- row 2's own row height, taken the same way section
+					// 3 takes row 2's, must be more than one line.
+					tchk(&bad, (row3_y - row2_y) > 1.5 * trow, fmt.tprintf("align: row 2's long cell actually wraps past one line (row height %.1f vs %.1f)", row3_y - row2_y, trow))
+					// THE assertion. Column 2's link -- the same two characters, "ra"
+					// and "rb" -- must land on the identical x in both rows, though row
+					// 2's neighbour (column 0) wraps to more than one line and row 1's
+					// does not.
+					tchk(
+						&bad, row1_x == row2_x,
+						fmt.tprintf("align: column 2 sits at the SAME x in both rows, though row 2's column 0 wraps (row1 %.1f vs row2 %.1f)", row1_x, row2_x),
+					)
+					// Column 1's "III", each inside its own row's first line -- same
+					// check, one column closer to the wrapping cell.
+					clo, chi := int(cx + cols[1].x) - 2, int(cx + cols[1].x + cols[1].w) + 4
+					a_lo, a_hi, a_ok := ink(pix, bg, clo, chi, int(row1_y), int(row1_y + trow), W, H)
+					b_lo, b_hi, b_ok := ink(pix, bg, clo, chi, int(row2_y), int(row2_y + trow), W, H)
+					tchk(&bad, a_ok && b_ok, fmt.tprintf("align: both rows' column-1 cell is on screen (row1 %d..%d, row2 %d..%d)", a_lo, a_hi, b_lo, b_hi))
+					if a_ok && b_ok {
+						// Identical content in identical columns, one row of which has a
+						// neighbour cell that wraps to several lines: the two must be
+						// pixel-identical, not merely close.
+						tchk(
+							&bad, a_lo == b_lo && a_hi == b_hi,
+							fmt.tprintf("align: the same cell in two rows lands on the SAME pixels, though one row's other cell wraps (row1 %d..%d vs row2 %d..%d)", a_lo, a_hi, b_lo, b_hi),
+						)
+						// ...and it is actually right-aligned. Without this the equality
+						// above is satisfied by alignment being ignored entirely.
+						shift := f32(a_lo) - (cx + cols[1].x)
+						tchk(
+							&bad, shift > 3 * char_w,
+							fmt.tprintf("align: the right-aligned cell really is pushed to its column's right edge (%.0fpx in, column %.0fpx wide)", shift, cols[1].w),
+						)
+					}
+					// Column 0's own left edge, in both rows, on pixels: row 2's cell
+					// wraps and row 1's does not, and both must start at the column's
+					// left edge.
+					l0, l1 := int(cx + cols[0].x) - 2, int(cx + cols[0].x + cols[0].w)
+					la, _, lok_a := ink(pix, bg, l0, l1, int(row1_y), int(row1_y + trow), W, H)
+					lb, _, lok_b := ink(pix, bg, l0, l1, int(row2_y), int(row2_y + trow), W, H)
+					tchk(&bad, lok_a && lok_b && la == lb, fmt.tprintf("align: the left-aligned column starts at the SAME pixel in a wrapping row and a plain one (%d vs %d)", la, lb))
+					// --- 4b. the separator rule sits where the draw intends it, on pixels --
+					//
+					// markdown.odin's separator-row quad is `ytop + ad.h * 0.5` -- vertically
+					// CENTRED in the separator row's own admitted height. The expression
+					// before this task was `ytop + ascent - px*0.5`, snug under the header
+					// text instead, and moved ~10px with nothing asserting either position
+					// -- disclosed as cosmetic, but a position nothing pins can drift again
+					// unnoticed. This pins the one the code draws now.
+					//
+					// The separator row is exactly one line tall (it draws no text, so only
+					// the empty-block fallback height applies) and sits directly above row 1
+					// with no gap, so its own top is row1_y - trow and its centre is
+					// row1_y - 0.5*trow.
+					rlo, rhi := int(cx) - 2, int(cx + cols[2].x + cols[2].w) + 2
+					want_y := row1_y - 0.5 * trow
+					_, _, at_centre := ink(pix, bg, rlo, rhi, int(want_y) - 1, int(want_y) + 2, W, H)
+					tchk(&bad, at_centre, fmt.tprintf("rule: the separator's rule sits centred in its row (row1_y %.1f, trow %.1f, want y~%.1f)", row1_y, trow, want_y))
+					// ...and NOT snug under the header, i.e. not near the separator row's
+					// own top edge -- the pre-task position, well clear of the centre band
+					// just confirmed above.
+					_, _, near_top := ink(pix, bg, rlo, rhi, int(row1_y - trow), int(row1_y - trow) + 3, W, H)
+					tchk(&bad, !near_top, fmt.tprintf("rule: ...and NOT snug under the header at the row's own top (nothing at y~%.1f)", row1_y - trow))
+				}
+			}
+			// --- 5. natural widths measure rendered text, not raw markdown ---------
+			//
+			// md_table_measure used to measure the CELL'S OWN RAW markdown source
+			// ("[docs](https://example.com/a/very/long/path)", 44 characters) instead
+			// of what md_layout_build actually shapes (md_inline(cell)'s runs, which
+			// render as "docs", 4 characters). A link column's raw text routinely
+			// clamps to the SAME 40-cell cap a genuinely wide prose column does, so
+			// the water-fill in md_table_fit_cells treated the two as equally greedy
+			// and starved the prose column to feed a link column that only needed a
+			// few cells on screen.
+			//
+			// THREE columns, not two: at this pane's measure (81 cells), a raw-
+			// measured link column ties the prose column's want at exactly 40 each,
+			// and the deficit is one cell -- small enough that which column absorbs
+			// it is an accident of loop order, not evidence of anything. The third
+			// (id) column eats a little more of the budget, which turns a 1-cell
+			// coincidence into a 3-cell one: under the bug BOTH big columns get
+			// clamped to the same reduced share (37 of the 40 they wanted), and
+			// which one that is does not depend on iteration order.
+			{
+				sb := strings.builder_make(context.temp_allocator)
+				strings.write_string(&sb, "| prose | link | id |\n|---|---|---|\n")
+				strings.write_string(&sb, "| wwww wwww wwww wwww wwww wwww wwww wwww wwww wwww wwww wwww | [docs](https://example.com/a/very/long/path) | 123 |\n")
+				doc := mkdoc(strings.to_string(sb), "linkwidth.md")
+				defer doc_close(&doc)
+				tc := md_table_ensure(&doc, &h.text, 0)
+				cols := md_table_cols(tc, measure, char_w, context.temp_allocator)
+				tchk(&bad, len(cols) == 3, fmt.tprintf("widths: the block fits to 3 columns (%d)", len(cols)))
+				if len(cols) == 3 {
+					// THE regression. Measuring the link's raw markdown makes it want
+					// the same 40 cells the prose column wants, so the two compete as
+					// equals and the prose column comes away with less than it asked
+					// for -- 37 of 40 under the bug (sabotage `md_table_measure` back
+					// to measuring `cell` raw to see it), 40 of 40 once the link
+					// column's want reflects what it actually draws.
+					prose_cells := int(cols[0].w / char_w + 0.5)
+					link_cells := int(cols[1].w / char_w + 0.5)
+					tchk(
+						&bad, prose_cells >= 39,
+						fmt.tprintf("widths: the prose column is NOT starved by the link's raw markdown (%d of 40 cells, link column %d cells)", prose_cells, link_cells),
+					)
+					// Non-vacuity: the link column really is only a few cells, so the
+					// row above is the measurement fix and not three columns that all
+					// happened to fit.
+					tchk(&bad, link_cells <= 10, fmt.tprintf("widths: the link column measures its RENDERED text, not its raw markdown (%d cells, want <= 10)", link_cells))
+				}
+			}
+			return
+		}
+
 		// mdtest's TYPE-SCALE checks (UI spec 9.3).
 		//
 		// Pure arithmetic, and it is pinned exactly rather than approximately for
@@ -5670,7 +6975,13 @@ when NEWTPAD_TESTS {
 					// md_scroll_frac -> md_scroll_scalar x2 -> md_slot_at ->
 					// md_anchor_walk, each with a 24-line run-up and a 256-entry
 					// Md_Walk_Block array. Measured at 3.322 ms a frame against
-					// markdown_draw's 1.660 (-o:speed, `newtpad mdperftest`).
+					// markdown_draw's 1.660 (-o:speed, `newtpad mdperftest`) -- both on
+					// the OLD 2-column mdperftest fixture. 2026-07-29's wider 12-column
+					// fixture (mdperftest's `newtpad mdperftest`, see its gate comment)
+					// measures markdown_draw itself at 2.79 ms on the same build; the
+					// walk-count assertion below is what actually holds this proc's
+					// claim, not the millisecond figures, which are historical context
+					// for why the walk was worth removing.
 					//
 					// Counted in WALKS, because a cached answer and an uncached one are
 					// the same number -- the only honest witness is the work. The draw
@@ -5804,9 +7115,14 @@ when NEWTPAD_TESTS {
 			// dropped term in the real gate fails these checks, not just a
 			// hand-rolled stand-in for it.
 			{
-				gated :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ed_right, mx, my: f32) -> (blk: int, hit: bool) {
+				// `clicks` defaults to 2 -- the gesture's own binding (a DOUBLE press,
+				// see md_split_click_gate) -- so every row below still exercises the
+				// PANE bound it was written for rather than being refused by the
+				// binding before it gets there. The binding itself is
+				// md_click_bind_selftest's subject.
+				gated :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ed_right, mx, my: f32, clicks := 2) -> (blk: int, hit: bool) {
 					ro := ro_surface_swallows(doc.table, doc.md_mode, mx >= ed_right, Drag_Latches{})
-					return md_split_click_gate(doc, c, ro, ed_right, mx, my)
+					return md_split_click_gate(doc, c, ro, clicks, ed_right, mx, my)
 				}
 
 				b := strings.builder_make()
@@ -6327,6 +7643,116 @@ when NEWTPAD_TESTS {
 			return
 		}
 
+		// Split's click-to-sync-scroll is bound to a DOUBLE press, and the subject
+		// here is that BINDING -- Wyatt's report, 2026-07-29: "when you click in the
+		// markdown preview on split mode it shifts the edit side up/down." The
+		// capability is spec'd (9.1, 9.4) and stays; what was wrong is that a plain
+		// single press moved the other half of the window.
+		//
+		// ASSERTED ON doc.top, not on the gate's return value. "The gate said no" and
+		// "the editor did not move" are different claims, and the one Wyatt made is
+		// the second -- which is why md_split_click_sync exists as a callable proc
+		// (main.odin) rather than four lines inside main()'s unreachable WM_* loop.
+		//
+		// The single-press rows cannot be vacuously green: every case fires the SAME
+		// (mx, my) through the SAME proc and differs only in `clicks`, and the
+		// double-press case in the middle proves those coordinates do name a block
+		// whose sync moves doc.top by a nonzero amount. A gate that refused this
+		// point for any other reason would fail that row, not pass these ones.
+		//
+		// Its own procedure for this file's usual reason: these frames are enormous
+		// and three have hit STATUS_STACK_OVERFLOW.
+		md_click_bind_selftest :: proc() -> (bad: int) {
+			bchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 800, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/clickbind") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(24)
+			winw, winh := f32(W), f32(H)
+
+			b := strings.builder_make()
+			defer strings.builder_destroy(&b)
+			for i in 0 ..< 60 {fmt.sbprintf(&b, "para %03d text here\n", i)}
+			src := strings.to_string(b)
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "clickbind.md", .UTF8)
+			doc.md_mode = .Split
+			doc.view_cols = 80
+			defer doc_close(&doc)
+
+			split_frac := f32(0.5)
+			ed_right := doc_editor_right(&doc, winw, split_frac)
+			c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, split_frac)
+			bchk(&bad, cok, "bind: the scroll context resolves for a Split document")
+			if !cok {return}
+
+			// ONE point, used by every case below: inside the preview pane's columns,
+			// and far enough down it that the block it names is not the one doc.top
+			// already sits on -- otherwise "did not move" would be true of both
+			// bindings.
+			mx := ed_right + 20
+			my := c.ytop + c.pane * 0.5
+			rows := max(1, int(c.pane / line_height(px_)))
+			ro := ro_surface_swallows(doc.table, doc.md_mode, mx >= ed_right, Drag_Latches{})
+			bchk(&bad, ro, "bind: precondition -- the preview half of a Split swallows the press (ro_surface_swallows)")
+
+			// 1. A SINGLE press. window.mouse_count is 1 for a lone press, so this is
+			// what Wyatt's stray click is.
+			doc.top, doc.md_sync_top = 0, 0
+			single := md_split_click_sync(&doc, &h.text, &c, ro, 1, ed_right, mx, my, rows)
+			top_single, sync_single := doc.top, doc.md_sync_top
+			bchk(&bad, !single, "bind: a single press in the preview half does not sync")
+			bchk(&bad, top_single == 0, fmt.tprintf("bind: a single press leaves doc.top ALONE -- the reported bug (%d)", top_single))
+			bchk(&bad, sync_single == 0, fmt.tprintf("bind: ...and leaves the preview's own anchor byte alone too (%d)", sync_single))
+
+			// 2. A DOUBLE press, same point. The positive control that makes row 1 mean
+			// something, and the spec'd capability still working.
+			doc.top, doc.md_sync_top = 0, 0
+			double := md_split_click_sync(&doc, &h.text, &c, ro, 2, ed_right, mx, my, rows)
+			top_double, sync_double := doc.top, doc.md_sync_top
+			bchk(&bad, double, "bind: a double press at the SAME point does sync")
+			bchk(&bad, top_double > 0, fmt.tprintf("bind: ...and moves doc.top off the start, so row 1 is not vacuous (%d)", top_double))
+			bchk(&bad, sync_double == top_double, fmt.tprintf("bind: ...with the preview's anchor byte following it (%d vs %d)", sync_double, top_double))
+
+			// 3. A TRIPLE press's third. mouse_count reaches 3 before wrapping, and the
+			// block it names is the one the second press already scrolled to -- so this
+			// must be a no-op in EFFECT, landing on the same doc.top rather than
+			// somewhere else.
+			doc.top, doc.md_sync_top = 0, 0
+			triple := md_split_click_sync(&doc, &h.text, &c, ro, 3, ed_right, mx, my, rows)
+			bchk(&bad, triple && doc.top == top_double, fmt.tprintf("bind: a triple press's third still syncs, to the same block (%v, %d vs %d)", triple, doc.top, top_double))
+
+			// 4. The FOURTH press of a cluster. window.mouse_count wraps 3 -> 1
+			// (platform/window.odin), so the platform hands back the same 1 a lone
+			// press gets and the gesture stops rather than firing on every click after
+			// the third.
+			doc.top, doc.md_sync_top = 0, 0
+			fourth := md_split_click_sync(&doc, &h.text, &c, ro, 1, ed_right, mx, my, rows)
+			bchk(&bad, !fourth && doc.top == 0, fmt.tprintf("bind: the fourth press of a cluster (mouse_count wraps to 1) does not sync (%v, %d)", fourth, doc.top))
+
+			// 5. The binding is not the ONLY gate: a double press in the EDITOR half of
+			// the same window still must not sync. Without this row the fix could have
+			// been "any double press anywhere".
+			doc.top, doc.md_sync_top = 0, 0
+			emx := ed_right * 0.5
+			ero := ro_surface_swallows(doc.table, doc.md_mode, emx >= ed_right, Drag_Latches{})
+			ed_double := md_split_click_sync(&doc, &h.text, &c, ero, 2, ed_right, emx, my, rows)
+			bchk(&bad, !ed_double && doc.top == 0, fmt.tprintf("bind: a DOUBLE press in the editor half does not sync either (%v, %d)", ed_double, doc.top))
+			return
+		}
+
 		// `newtpad mdtest` covers the markdown block classifiers and inline parser
 		// (the rendering itself needs a live eye), PLUS the draw-level checks
 		// above that exercise markdown_draw's own call sites through a real
@@ -6335,12 +7761,17 @@ when NEWTPAD_TESTS {
 			bad := md_selftest()
 			bad += md_draw_selftest()
 			bad += md_head_fit_selftest()
+			bad += md_partial_selftest()
+			bad += md_band_admit_selftest()
+			bad += md_table_fit_selftest()
+			bad += md_table_wrap_selftest()
 			bad += md_metrics_selftest()
 			bad += md_seam_selftest()
 			bad += md_cache_selftest()
 			bad += md_key_selftest()
 			bad += md_gap_selftest()
 			bad += md_scroll_selftest()
+			bad += md_click_bind_selftest()
 			bad += md_wheel_selftest()
 			bad += md_prop_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
@@ -8184,9 +9615,77 @@ when NEWTPAD_TESTS {
 				sh_chk(bad, g3ok, "an empty span in the middle changes nothing about the layout")
 				sh_chk(bad, abs(g3.height - ref.height) < 0.001, "...and does not drag the line box to its own (unused) size")
 			}
+			// F6 (2026-07-29 review): shaped_draw's `lines` default (-1, draw
+			// everything) and its `lines == 0` early return have no caller -- both
+			// product call sites (markdown.odin's md_block_draw) always pass
+			// `ad.lines` explicitly, and md_place_next never hands md_block_draw a
+			// block admitted zero lines (a refused block is never returned to the
+			// caller at all -- see md_place_next's header), so `lines == 0` is
+			// unreachable in the shipped product. Exercised here, directly on the
+			// entry point, rather than left silently unowned.
+			sh_draw :: proc(bad: ^int) {
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, 200, 120, "shapetest/draw") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return
+				}
+				defer headless_gpu_destroy(&h)
+				px := f32(20)
+				one_w := plat.shape_run(&h.gfx, &h.text, "aa", px, 100000, 0, .Body, context.temp_allocator).width
+				spans := [1]plat.Shape_Span{{"aa bb cc", px, .Body}}
+				// Narrow enough to force one word per line.
+				s := plat.shape_spans(&h.gfx, &h.text, spans[:], one_w + 1, 0, context.temp_allocator)
+				sh_chk(bad, s.lines >= 3, fmt.tprintf("shaped_draw: (precondition) the fixture wraps to several lines (%d)", s.lines))
+				if s.lines < 3 {return}
+
+				any_ink :: proc(pix: []u8, lo, hi: int, W, H: int) -> bool {
+					for yy in clamp(lo, 0, H) ..< clamp(hi, 0, H) {
+						for xx in 0 ..< W {
+							i := (yy * W + xx) * 4
+							if pix[i] > 8 || pix[i + 1] > 8 || pix[i + 2] > 8 {return true} // black bg
+						}
+					}
+					return false
+				}
+
+				W, H := int(h.window.width), int(h.window.height)
+				x0, y0 := f32(10), f32(10)
+				white := [4]f32{1, 1, 1, 1}
+
+				// The default: every line the run has, without a caller ever asking
+				// for `lines` by name.
+				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+				plat.shaped_draw(&h.gfx, &h.text, &s, spans[:], x0, y0, white)
+				pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				sh_chk(bad, pok, "shaped_draw: the readback resolves")
+				if pok {
+					all_lines := true
+					for l in 0 ..< s.lines {
+						lo := int(y0 + s.line_boxes[l].top)
+						hi := int(y0 + s.line_boxes[l].top + s.line_boxes[l].h)
+						if !any_ink(pix, lo, hi, W, H) {all_lines = false}
+					}
+					sh_chk(bad, all_lines, "shaped_draw: the default (lines omitted) draws every visual line, not just the first")
+				}
+
+				// `lines == 0`: unreachable from md_block_draw, but the early return
+				// is still product code and gets its own direct check rather than
+				// an assumption that a negative-length loop would do the same thing.
+				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+				plat.shaped_draw(&h.gfx, &h.text, &s, spans[:], x0, y0, white, nil, 0)
+				pix0, pok0 := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				sh_chk(bad, pok0, "shaped_draw: the lines=0 readback resolves")
+				if pok0 {
+					lo := int(y0)
+					hi := int(y0 + s.height) + 4
+					sh_chk(bad, !any_ink(pix0, lo, hi, W, H), "shaped_draw: lines=0 draws nothing at all")
+				}
+			}
+
 			bad := 0
 			sh_run(&bad)
 			sh_spans(&bad)
+			sh_draw(&bad)
 			fmt.printfln("shapetest: %d failures", bad)
 			return true
 		}
@@ -12493,7 +13992,7 @@ when NEWTPAD_TESTS {
 				fmt.sbprintf(&b, "## Section %03d\n\n", i)
 				fmt.sbprintf(&b, "A paragraph of body prose with `inline code` and a [link](https://e.test/p%03d) in it, long enough to wrap across the measure more than once so the shaper has real work to do.\n\n", i)
 				fmt.sbprintf(&b, "- first item %03d\n- second item with a little more text on it\n\n", i)
-				strings.write_string(&b, "| col a | col b |\n|---|---|\n| one | two |\n\n")
+				strings.write_string(&b, "| c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 | c9 | ca | cb |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n| one | two | three | four | five | six | seven | eight | nine | ten | eleven | twelve |\n| aaa | bbb | ccc | ddd | eee | fff | ggg | hhh | iii | jjj | kkk | lll |\n\n")
 				strings.write_string(&b, "```json\n{ \"key\": \"value\", \"n\": 12 }\n```\n\n")
 				lines += 14
 			}
@@ -12565,7 +14064,35 @@ when NEWTPAD_TESTS {
 			fmt.printfln("  markdown_links             %.3f ms", ms(t_links, N))
 			fmt.printfln("  md_preview_frac            %.3f ms", ms(t_frac, N))
 			fmt.printfln("  whole scroll frame         %.3f ms", ms(t_frame, N))
-			fmt.println("mdperftest: 0 failures")
+			// A threshold, so a regression here goes red instead of printing and
+			// passing regardless. Baseline is 2026-07-29's review measurement on
+			// this exact fixture at -o:speed: markdown_draw 2.79 ms, whole scroll
+			// frame 5.05 ms. The gate is ~1.8x that -- generous enough that normal
+			// machine noise does not flake it, tight enough that a 2x regression
+			// (what actually shipped once, undetected by this mode) trips it
+			// before it fully doubles.
+			//
+			// DEBUG_MULT exists for machine-to-machine noise, not for a
+			// debug/release gap: measured under -debug on this same fixture the
+			// numbers barely move (2.95 ms / 5.56 ms, ~1.1x), because the cost
+			// here is mostly DirectWrite and D3D11 calls outside Odin's own
+			// bounds checks, unlike a tight byte loop. Still generous, because a
+			// gate that flakes is one the next person learns to ignore.
+			DEBUG_MULT :: 1.3
+			dbg := f64(DEBUG_MULT) if ODIN_DEBUG else 1.0
+			draw_gate := 5.0 * dbg
+			frame_gate := 9.0 * dbg
+			perf_bad := 0
+			d_ms, f_ms := ms(t_draw, N), ms(t_frame, N)
+			if d_ms > draw_gate {
+				fmt.printfln("  FAIL: markdown_draw %.3f ms exceeds %.1f ms gate", d_ms, draw_gate)
+				perf_bad += 1
+			}
+			if f_ms > frame_gate {
+				fmt.printfln("  FAIL: whole scroll frame %.3f ms exceeds %.1f ms gate", f_ms, frame_gate)
+				perf_bad += 1
+			}
+			fmt.printfln("mdperftest: %d failures", perf_bad)
 			return true
 		}
 

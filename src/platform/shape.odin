@@ -436,6 +436,140 @@ shape_spans :: proc(
 	return
 }
 
+// How a column's visual lines sit inside its own width. A table's separator row
+// says :--- / :--: / ---: and every one of a cell's wrapped lines has to honour
+// it, which is why this is a per-line property of a COLUMN and not a one-off pad
+// applied to a cell.
+Shape_Align :: enum u8 {
+	Left,
+	Center,
+	Right,
+}
+
+// One column of a shaped ROW: the spans that fill it, where its left edge sits in
+// the row's own coordinate space, the width its text wraps inside, and how each
+// of its visual lines is aligned in that width.
+//
+// `spans` must be a CONTIGUOUS SUBSLICE of the one flat Shape_Span array the
+// caller will later hand shaped_draw, and the columns must appear in that array's
+// own order. shape_columns re-bases every glyph's `span` onto the flat array by
+// accumulating the columns' lengths, so a column whose spans came from a separate
+// allocation would draw in another column's colour and face.
+Shape_Column :: struct {
+	spans: []Shape_Span,
+	x:     f32, // left edge, in the row's coordinate space
+	w:     f32, // the width this column's text wraps inside
+	align: Shape_Align,
+}
+
+// Shape a ROW of independently wrapped columns into one Shaped.
+//
+// What §9.3's table row needs and shape_spans cannot express: a table cell wraps
+// inside ITS OWN column, not inside the pane, and the row is as tall as its
+// tallest cell. Every column goes through shape_spans — the same single greedy
+// breaker every paragraph goes through, at the same advance oracle — so a wrapped
+// cell breaks by exactly the rules a wrapped paragraph does.
+//
+// THE ROW'S HEIGHT is produced here and nowhere else. Line slot `l` of the row
+// takes the tallest box any column has in slot `l`, and Shaped.height is the sum
+// of those, so "a row is as tall as its tallest cell" is a consequence of the
+// geometry rather than a second `max` some caller must remember to take. Every
+// glyph on line `l` is placed on that slot's single baseline, which is what stops
+// a one-line cell from floating relative to a three-line one beside it.
+//
+// COLUMN ALIGNMENT IS THE INVARIANT this exists to protect: a glyph's x is its
+// column's `x` plus the position the shaper gave it inside that column plus the
+// alignment slack of the line it landed on. Nothing else contributes, so two rows
+// handed the same `cols` cannot put their columns in different places — which is
+// the property §9.3 puts tables on the mono face for.
+//
+// The per-column Shapeds are intermediates on the temp allocator; only the merged
+// result is built on `allocator`, which is the cache that owns it (see the
+// footgun note in markdown.odin's md_layout_build).
+shape_columns :: proc(
+	gfx: ^Gfx,
+	t: ^Text,
+	cols: []Shape_Column,
+	line_height: f32,
+	allocator := context.allocator,
+) -> (
+	s: Shaped,
+) {
+	parts := make([]Shaped, len(cols), context.temp_allocator)
+	lines, total := 0, 0
+	for c, i in cols {
+		parts[i] = shape_spans(gfx, t, c.spans, c.w, line_height, context.temp_allocator)
+		lines = max(lines, len(parts[i].line_boxes))
+		total += len(parts[i].glyphs)
+		s.line_h = max(s.line_h, parts[i].line_h)
+		s.ascent = max(s.ascent, parts[i].ascent)
+		s.descent = max(s.descent, parts[i].descent)
+	}
+	if lines == 0 || total == 0 {return}
+
+	boxes := make([]Shaped_Line, lines, allocator)
+	for p in parts {
+		for lb, l in p.line_boxes {
+			b := &boxes[l]
+			b.ascent = max(b.ascent, lb.ascent)
+			b.descent = max(b.descent, lb.descent)
+			b.h = max(b.h, lb.h)
+		}
+	}
+	top: f32 = 0
+	for &b in boxes {
+		// A slot no column reached (impossible while `lines` is a max over the
+		// columns' own box counts, but free to state) still owes the nominal box.
+		if b.h <= 0 {b.h = line_box_h(line_height, s.ascent, s.descent, 0)}
+		b.h = max(b.h, b.ascent + b.descent)
+		b.top = top
+		b.y = top + (b.h - (b.ascent + b.descent)) * 0.5 + b.ascent
+		top += b.h
+	}
+
+	// Exactly `total` glyphs, so shaped_free's `delete(s.glyphs, allocator)` frees
+	// what was allocated: every part's glyph is copied through, none is dropped.
+	ga := make([]Shaped_Glyph, total, allocator)
+	n, span_base := 0, 0
+	for c, i in cols {
+		p := &parts[i]
+		// The alignment slack of each of this column's lines, from the shaper's own
+		// per-line advance width (Shaped_Line.width, which excludes the trailing
+		// spaces that hang past a break). One value per line, read by every glyph on
+		// it, so a line cannot be aligned two ways.
+		offs := make([]f32, len(p.line_boxes), context.temp_allocator)
+		for lb, l in p.line_boxes {
+			slack := max(0, c.w - lb.width)
+			off := c.x
+			switch c.align {
+			case .Left:
+			case .Center:
+				off += slack * 0.5
+			case .Right:
+				off += slack
+			}
+			offs[l] = off
+			boxes[l].width = max(boxes[l].width, off + lb.width)
+		}
+		for g in p.glyphs {
+			li := int(g.line)
+			ga[n] = g
+			ga[n].x = g.x + offs[li]
+			ga[n].y = boxes[li].y
+			ga[n].span = i32(span_base + int(g.span))
+			n += 1
+		}
+		span_base += len(c.spans)
+	}
+	assert(n == total, "shape_columns: merged glyph count must match the parts'")
+	for b in boxes {s.width = max(s.width, b.width)}
+	s.glyphs = ga
+	s.line_boxes = boxes
+	s.lines = lines
+	s.height = top
+	return
+}
+
 // Draw a shaped run with its origin at (x, y), where y is the TOP of the run's
 // first line box (not a baseline — the baselines are inside Shaped.line_boxes,
 // which is the whole point of shaping first and drawing second).
@@ -454,6 +588,17 @@ shape_spans :: proc(
 // one colour per span; a short or nil `colors` falls back to `base` for the
 // spans it does not cover, which is what a single-colour block wants.
 //
+// `lines` draws only the run's FIRST `lines` visual lines; negative means all of
+// them, which is every caller that has no reason to care. It is expressed as a
+// line index rather than as a y bound on purpose: this renderer has no scissor
+// rect, so a caller that can only fit part of a run has to stop at a boundary the
+// SHAPER knows about, and Shaped_Glyph.line is that boundary. Nothing is clipped
+// and no glyph is moved -- a glyph is emitted or it is not. The markdown
+// preview's per-line block admission is the caller this exists for (see
+// md_block_admit); doing the same filtering outside would mean re-deriving which
+// glyphs are on which line, which is the re-derivation this file's header warns
+// about.
+//
 // Reaches the GPU through text_submit_instances, the same call text_draw_spans
 // makes.
 shaped_draw :: proc(
@@ -464,14 +609,24 @@ shaped_draw :: proc(
 	x, y: f32,
 	base: [4]f32,
 	colors: [][4]f32 = nil,
+	lines: int = -1,
 ) {
 	if s == nil || len(s.glyphs) == 0 {return}
+	// 2026-07-29 review, F6: behaviourally redundant with the per-glyph filter
+	// below (`lines >= 0 && int(sg.line) >= lines`, which already skips every
+	// glyph when lines == 0 -- verified by sabotage: deleting this line changes
+	// nothing shapetest can observe). Kept as the fast path that skips building
+	// `instances` at all for a wholly-refused block, which is unreachable from
+	// md_block_draw today (see md_place_next) but would matter the moment a
+	// caller passes `lines == 0` for real.
+	if lines == 0 {return}
 	g_draw.text_calls += 1 // see draw_trace.odin
 	instances := make([dynamic]Text_Instance, 0, len(s.glyphs), context.temp_allocator)
 	// The atlas must hold still while these UVs are being collected.
 	t.drawing = true
 	defer t.drawing = false
 	for sg in s.glyphs {
+		if lines >= 0 && int(sg.line) >= lines {continue}
 		si := int(sg.span)
 		if si < 0 || si >= len(spans) {continue}
 		sp := spans[si]

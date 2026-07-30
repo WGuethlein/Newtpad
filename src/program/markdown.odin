@@ -96,6 +96,107 @@ md_selftest :: proc() -> (bad: int) {
 		for r in runs {joined = strings.concatenate({joined, r.text}, context.temp_allocator)}
 		chk(&bad, joined == "C:\\temp\\file.txt", "a path keeps its backslashes")
 	}
+
+	// --- `_` cannot open/close emphasis intraword; `*` still can (found
+	// 2026-07-30 in research/newtpad-research-report.md itself: the source's
+	// "(stb_sprintf aside)" drew as "(stbsprintf aside)" with everything after
+	// it italicised, because md_inline treated every `_` as a toggle). These
+	// assert on the RENDERED RUNS (Md_Run, what markdown_draw actually draws),
+	// not just that classification changed, so a fix that reclassifies but
+	// still eats the byte would still fail here.
+	{
+		// The reported defect itself, first: the underscore must survive
+		// AND nothing past it may end up italicised.
+		runs := md_inline("(stb_sprintf aside)")
+		joined := ""
+		any_ital := false
+		for r in runs {
+			joined = strings.concatenate({joined, r.text}, context.temp_allocator)
+			if r.ital {any_ital = true}
+		}
+		chk(&bad, joined == "(stb_sprintf aside)", "stb_sprintf keeps its underscore")
+		chk(&bad, !any_ital, "...and nothing after it is italicised")
+	}
+	{
+		// Multiple intraword underscores on one identifier: every one of them
+		// is a toggle candidate under the old code, so this is the case that
+		// showed the damage scales with underscore count.
+		runs := md_inline("snake_case_with_many_underscores")
+		joined := ""
+		any_style := false
+		for r in runs {
+			joined = strings.concatenate({joined, r.text}, context.temp_allocator)
+			if r.ital || r.bold {any_style = true}
+		}
+		chk(&bad, joined == "snake_case_with_many_underscores", "snake_case_with_many_underscores survives whole")
+		chk(&bad, !any_style, "...and none of it is styled")
+	}
+	{
+		// A standalone `_word_` is still real emphasis -- the fix must not
+		// disable `_` entirely, only intraword use of it.
+		runs := md_inline("_italic_")
+		chk(&bad, len(runs) == 1 && runs[0].text == "italic" && runs[0].ital, "_italic_ -> one italic run, no underscores")
+	}
+	{
+		// One-sided intraword: `_leading` is left-flanking-only (can open,
+		// can't close) and `trailing_` is right-flanking-only (can close,
+		// can't open). Neither has a partner in its own string, which is
+		// exactly the case the single-pass toggle (no delimiter stack) does
+		// not resolve correctly -- `_leading` still opens italics with
+		// nothing to close it, so the run past the word is left italicised.
+		// That is the documented limitation, not a second bug: a real
+		// CommonMark parser would leave an unmatched delimiter literal.
+		{
+			runs := md_inline("_leading")
+			chk(&bad, len(runs) == 1 && runs[0].text == "leading" && runs[0].ital,
+				"_leading (unmatched opener) opens italics per the flanking rule -- known single-pass limitation")
+		}
+		{
+			// `trailing_` alone: right-flanking only, and we are not already
+			// in italics, so it cannot close what was never opened -- stays
+			// literal. This is the case that must NOT regress to eating the
+			// underscore the way stb_sprintf did.
+			runs := md_inline("trailing_")
+			joined := ""
+			any_ital := false
+			for r in runs {
+				joined = strings.concatenate({joined, r.text}, context.temp_allocator)
+				if r.ital {any_ital = true}
+			}
+			chk(&bad, joined == "trailing_", "trailing_ (unmatched closer) keeps its underscore literal")
+			chk(&bad, !any_ital, "...and does not open italics")
+		}
+	}
+	{
+		// Regression guard: `*` intraword is UNCHANGED by the `_` fix.
+		// **bold** and *italic* still toggle mid-word, since `*` has no
+		// intraword restriction in CommonMark (only `_` does).
+		runs := md_inline("wo*rd* mid**bo**ld")
+		joined := ""
+		saw_ital, saw_bold := false, false
+		for r in runs {
+			joined = strings.concatenate({joined, r.text}, context.temp_allocator)
+			if r.ital {saw_ital = true}
+			if r.bold {saw_bold = true}
+		}
+		chk(&bad, joined == "word midbold", "*/** still toggle intraword (asterisks consumed)")
+		chk(&bad, saw_ital, "...*rd* still italicised")
+		chk(&bad, saw_bold, "...**bo** still bold")
+	}
+	{
+		// An escaped underscore is untouched by any of this -- md_escapable
+		// wins before the flanking test is even reached.
+		runs := md_inline("snake\\_case")
+		joined := ""
+		any_ital := false
+		for r in runs {
+			joined = strings.concatenate({joined, r.text}, context.temp_allocator)
+			if r.ital {any_ital = true}
+		}
+		chk(&bad, joined == "snake_case", "\\_ -> a literal underscore")
+		chk(&bad, !any_ital, "...and it does not open italics")
+	}
+
 	{
 		r1, d1, t1 := md_task("[ ] todo")
 		r2, d2, t2 := md_task("[x] done")
@@ -420,6 +521,26 @@ MD_TABLE_MAX_COLS :: 32
 MD_TABLE_FIXED_CELLS :: 16 // fixed column width past the budget
 MD_TABLE_PAD :: 2 // cells of gap between columns
 
+// The clamps md_table_fit_cells fits a table's natural columns to the measure
+// with. UI spec §10 gives the TABLE VIEW's rule -- "measure the first 200 rows,
+// clamp each column to 8-40 characters, distribute leftover width proportionally"
+// -- and the shape of it applies here even though §10 governs a different surface:
+// the natural widths are already measured per block (md_table_measure), the upper
+// clamp is reused verbatim, and the leftover distribution is the same
+// water-filling.
+//
+// The LOWER clamp is where this deliberately diverges from §10's 8. A CSV grid's
+// columns are all data, so eight characters is a sensible floor; a markdown table
+// routinely has a one-character column (`| x |`, a tick, an index) and clamping
+// that up to eight would spend a third of a 3-column measure on it and take the
+// width from the prose column that needed it. The floor here is only what keeps a
+// column from collapsing to nothing under pressure, and it is SOFT: md_table_fit_
+// cells lowers it toward 1 rather than dropping a column, because a dropped column
+// is lost data and §10's own "malformed rows are marked, not hidden" is the same
+// instinct.
+MD_TABLE_MIN_CELLS :: 4
+MD_TABLE_MAX_CELLS :: 40 // §10's upper clamp, reused
+
 // The byte budget alone does not bound the WORK of finding a block's edges: a
 // renamed CSV with 20-byte rows and the 1 MB budget is ~50k short rows in each
 // direction, each costing a capped line-start scan plus a capped line-end scan
@@ -680,9 +801,20 @@ md_table_measure :: proc(doc: ^Document, t: ^plat.Text, start, end: int, oversiz
 			// The separator row is excluded, so its dashes never inflate a column.
 			for cell, i in cells {
 				if i >= MD_TABLE_MAX_COLS {break}
-				// col0 = 0: a table cell is measured from its own start,
-				// matching where md_draw_table_row draws it (see that proc).
-				w := plat.text_cells(t, transmute([]u8)cell, 0, .Doc)
+				// Measure what will be DRAWN, not the raw cell. md_layout_build shapes
+				// `md_inline(cell)`'s runs (see its .Table case above), which strips
+				// markdown syntax -- "[label](url)" draws as "label". Measuring the raw
+				// cell here counted the brackets and the whole URL as visible width, so
+				// a link column's natural width had nothing to do with what it actually
+				// rendered as, and the water-fill in md_table_fit_cells starved other
+				// columns to feed a link column that only needed a few cells.
+				// col0 = 0: a table cell's rendered text is measured from its own start,
+				// matching where the shaper starts it.
+				rb := strings.builder_make(context.temp_allocator)
+				for run in md_inline(cell) {
+					strings.write_string(&rb, run.text)
+				}
+				w := plat.text_cells(t, transmute([]u8)strings.to_string(rb), 0, .Doc)
 				if w > c.widths[i] {c.widths[i] = w}
 			}
 		}
@@ -710,12 +842,202 @@ md_table_ensure :: proc(doc: ^Document, t: ^plat.Text, p: int) -> ^Md_Table_Cach
 	return slot
 }
 
-// x offset of column `i`, in pixels from x0.
+// One fitted column of a table block: where it starts and how wide it is, in
+// pixels from the block's own origin.
+//
+// THE column geometry, produced once per table block by md_table_cols and stored
+// on the block's layout. The shaper wraps each cell inside `w` and places it at
+// `x`; the draw's column rules and the separator row's rule read the same two
+// numbers back. There is no second expression of a column's position anywhere --
+// md_col_x, which computed one from cell counts at the draw site while
+// md_table_measure computed the widths those counts came from, is gone.
+Md_Table_Col :: struct {
+	x, w: f32,
+}
+
+// Fit a table's NATURAL column widths (in character cells, as md_table_measure
+// derived them) into `avail` cells of measure. Returns how many columns survived
+// and writes their fitted cell widths into `out`.
+//
+// Pure integer arithmetic on purpose: it is the whole of the measure-fit decision,
+// it needs no device and no font, and a test can drive every branch of it directly.
+// Cells rather than pixels because the mono face is what makes a table's columns
+// line up (§9.3, "always mono: columns align") -- a column boundary on a whole
+// character cell keeps that true, where a proportional fraction of the measure
+// would not.
+//
+// The rule, which is §10's with the divergence documented at MD_TABLE_MIN_CELLS:
+//
+//  1. Clamp each natural width to [1, MD_TABLE_MAX_CELLS]. §10's upper clamp,
+//     reused: one 300-character cell must not claim the entire measure.
+//  2. If the clamped widths plus the gutters already fit, use them. A table
+//     narrower than the measure is therefore laid out exactly as it was before
+//     this existed -- which is why the fit cannot regress the common case.
+//  3. Otherwise water-fill: a column wanting no more than its equal share of what
+//     is left KEEPS its natural width, and the width it did not want goes back
+//     into the pool for the columns that did. Repeat until no column is under the
+//     share, then give every remaining column the soft floor and split what's
+//     left of the budget PROPORTIONALLY to how much each still wants beyond that
+//     floor -- §10's rule, reused: two greedy columns wanting 50 and 300 cells do
+//     not end up the same width. The integer remainder is handed out one cell at
+//     a time so the fitted widths sum to the budget EXACTLY and no rounding
+//     drift leaks past the measure.
+//
+// Under real pressure (many columns in a narrow pane) the floor is lowered toward
+// 1 cell before any column is dropped, and a column is dropped only when even one
+// cell each plus the gutters cannot fit -- 32 columns in a pane a dozen characters
+// wide. Dropping is the last resort rather than the first because there is no
+// scissor rect in this renderer: a column past the measure does not clip, it paints
+// over the scrollbar and the other split half.
+md_table_fit_cells :: proc(natural: []int, avail: int, out: []int) -> (ncols: int) {
+	n := min(len(natural), len(out))
+	if n <= 0 {return 0}
+	// The soft floor, then the column count. Both loops shrink monotonically and
+	// stop at 1, so neither can spin.
+	minc := MD_TABLE_MIN_CELLS
+	for minc > 1 && n * minc + (n - 1) * MD_TABLE_PAD > avail {minc -= 1}
+	for n > 1 && n * minc + (n - 1) * MD_TABLE_PAD > avail {n -= 1}
+	budget := max(n * minc, avail - (n - 1) * MD_TABLE_PAD)
+
+	want: [MD_TABLE_MAX_COLS]int
+	sum := 0
+	for i in 0 ..< n {
+		want[i] = clamp(natural[i], 1, MD_TABLE_MAX_CELLS)
+		sum += want[i]
+	}
+	if sum <= budget {
+		for i in 0 ..< n {out[i] = want[i]}
+		return n
+	}
+
+	fixed: [MD_TABLE_MAX_COLS]bool
+	remaining, free := budget, n
+	for free > 0 {
+		share := remaining / free
+		changed := false
+		for i in 0 ..< n {
+			if fixed[i] || want[i] > share {continue}
+			fixed[i], out[i] = true, want[i]
+			remaining -= want[i]
+			free -= 1
+			changed = true
+		}
+		if !changed {break}
+	}
+	if free > 0 {
+		// Every remaining column gets the floor first, then the rest of the
+		// budget splits PROPORTIONALLY to how much each still wants beyond that
+		// floor -- §10's rule ("distribute leftover width proportionally"),
+		// reused rather than diverged from. Basing the weight on want[i]-minc
+		// rather than want[i] itself is what keeps out[i] >= minc by
+		// construction: a column whose want IS the floor gets none of the
+		// leftover and stays exactly at minc, instead of an even split pushing
+		// it above its own natural want.
+		leftover := max(0, remaining - free * minc)
+		extra_sum := 0
+		for i in 0 ..< n {
+			if fixed[i] {continue}
+			extra_sum += max(0, want[i] - minc)
+		}
+		assigned := 0
+		for i in 0 ..< n {
+			if fixed[i] {continue}
+			add := 0
+			if extra_sum > 0 {add = leftover * max(0, want[i] - minc) / extra_sum}
+			out[i] = minc + add
+			assigned += add
+		}
+		// The proportional split's integer division rounds down, so up to
+		// (free - 1) cells of leftover go unassigned above; hand them out one
+		// at a time, same as the even split used to, so the fitted widths
+		// still sum to the budget EXACTLY.
+		extra := leftover - assigned
+		for i in 0 ..< n {
+			if fixed[i] {continue}
+			if extra <= 0 {break}
+			out[i] += 1
+			extra -= 1
+		}
+	}
+	return n
+}
+
+// THE advance a table's column arithmetic is denominated in.
+//
+// One producer, because there are two candidates and they are not the same pixel.
+// The cell COUNTS come from plat.text_cells; the cell TEXT is laid out by the
+// proportional shaper, which advances by the font's real advance. So the number
+// that turns a count into a pixel width has to be the shaper's, or a column
+// fitted to its content's own natural width is not wide enough to hold it.
+//
+// NOT plat.text_char_width, which is what this used to be: that ROUNDS to a whole
+// pixel, and has to -- the editor's grid needs an integral cell because text_draw
+// advances its pen by the same number, so the glyphs and every rect positioned
+// against column n*cell_w cannot drift. The preview's table is not on that grid.
+//
+// The cost of the mix-up, live: at the default 16px document size m.table is 15px,
+// where the rounded cell is 8.0000 and the real advance 8.2471. A table narrower
+// than the measure is fitted at its NATURAL widths, so a 6-cell column came out
+// 48.0px while its 6-character cell shapes to 49.48px -- the shaper's greedy break
+// then fired on the cell's last glyph and every such cell dropped its last word
+// (or, with no space in it, its last character) onto a second line. That is Wyatt's
+// "it looks like it's not respecting the spaces all the time" on a table
+// (2026-07-29): the break lands on the space, so the space is what appears to go
+// missing. The sign flips with the size -- at 24px the rounded 13.0000 exceeds the
+// real 12.6455, columns come out too wide instead and nothing wraps early, which
+// is why mdtest's px_=24 table sections were all green while the shipped default
+// size was broken. md_table_fit_selftest sweeps sizes for exactly that reason.
+md_table_char_w :: proc(gfx: ^plat.Gfx, t: ^plat.Text, m: ^Md_Metrics) -> f32 {
+	return plat.text_advance(gfx, t, '0', m.table, .Doc)
+}
+
+// The fitted pixel geometry of one table block's columns, for a pane whose content
+// column is `measure` pixels wide at a mono advance of `char_w` (md_table_char_w --
+// the shaper's advance, not the editor grid's rounded cell).
+//
+// The one production call site is md_layout_build, which stores the result on the
+// block's layout and lets the draw read it back. Package-visible rather than
+// file-private for the same reason md_table_measure is: mdtest asks it the
+// identical question the layout asked, so a pixel assertion about a column can be
+// written against the geometry the layout actually used instead of a copy of it.
+md_table_cols :: proc(c: ^Md_Table_Cache, measure, char_w: f32, allocator := context.allocator) -> []Md_Table_Col {
+	if c == nil || c.ncols <= 0 || char_w <= 0 {return nil}
+	cells: [MD_TABLE_MAX_COLS]int
+	avail := int(measure / char_w)
+	n := 0
+	if c.oversize {
+		// Past the budget the columns are FIXED and nothing was scanned, so
+		// md_table_measure's ncols is MD_TABLE_MAX_COLS -- a deliberate over-estimate
+		// (see its comment: a generous count costs nothing because the draw clips).
+		// Water-filling that fiction would spend the measure squeezing 32 imaginary
+		// columns into one character each, which is unreadable AND drops the real
+		// data that was in the first few. So the fixed width is kept -- that is the
+		// whole point of the fallback, and it is what makes it O(1) and
+		// entry-independent -- and only the COUNT is bounded by the measure.
+		for n < c.ncols && (n + 1) * MD_TABLE_FIXED_CELLS + n * MD_TABLE_PAD <= avail {n += 1}
+		n = max(1, n)
+		for i in 0 ..< n {cells[i] = MD_TABLE_FIXED_CELLS}
+	} else {
+		n = md_table_fit_cells(c.widths[:min(c.ncols, MD_TABLE_MAX_COLS)], avail, cells[:])
+	}
+	if n <= 0 {return nil}
+	out := make([]Md_Table_Col, n, allocator)
+	at := 0
+	for i in 0 ..< n {
+		out[i] = {x = f32(at) * char_w, w = f32(cells[i]) * char_w}
+		at += cells[i] + MD_TABLE_PAD
+	}
+	return out
+}
+
+// The pixel extent of a fitted row: its last column's right edge. Derived from the
+// stored geometry, so the separator row's rule cannot be a different width from
+// the columns it sits under.
 @(private = "file")
-md_col_x :: proc(c: ^Md_Table_Cache, i: int, char_w: f32) -> f32 {
-	cells := 0
-	for k in 0 ..< min(i, c.ncols) {cells += c.widths[k] + MD_TABLE_PAD}
-	return f32(cells) * char_w
+md_table_extent :: proc(cols: []Md_Table_Col) -> f32 {
+	if len(cols) == 0 {return 0}
+	last := cols[len(cols) - 1]
+	return last.x + last.w
 }
 
 // One styled run of a line's inline content.
@@ -884,6 +1206,42 @@ md_head_rules :: #force_inline proc(level: int) -> bool {return level == 1 || le
 @(private = "file")
 is_space :: proc(b: u8) -> bool {return b == ' ' || b == '\t'}
 
+// CommonMark's ASCII punctuation set, used only by the `_` flanking test
+// below. `*` doesn't need it -- `*` is allowed to open/close emphasis
+// mid-word, only `_` has the intraword restriction.
+@(private = "file")
+md_is_ascii_punct :: proc(b: u8) -> bool {
+	switch b {
+	case '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
+	     ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~':
+		return true
+	}
+	return false
+}
+
+// Whether the delimiter run s[start:end] (a run of `_` or `__`) can open
+// and/or can close emphasis, per CommonMark's left-/right-flanking rules
+// (spec 6.2). String boundaries count as whitespace. This is a single test,
+// not the full delimiter-stack algorithm -- see md_inline's `_` cases for
+// what that means in practice.
+@(private = "file")
+md_delim_flanks :: proc(s: string, start, end: int) -> (can_open, can_close: bool) {
+	before_ws := start == 0 || is_space(s[start - 1])
+	after_ws := end >= len(s) || is_space(s[end])
+	before_punct := !before_ws && start > 0 && md_is_ascii_punct(s[start - 1])
+	after_punct := !after_ws && end < len(s) && md_is_ascii_punct(s[end])
+	left_flank := !after_ws && (!after_punct || before_ws || before_punct)
+	right_flank := !before_ws && (!before_punct || after_ws || after_punct)
+	// _ can open only if left-flanking and (not right-flanking, or preceded
+	// by punctuation). _ can close only if right-flanking and (not
+	// left-flanking, or followed by punctuation). That asymmetric guard is
+	// exactly what keeps `_` out of the middle of a word like stb_sprintf
+	// while still letting `_italic_` and `snake_case_` (one-sided) work.
+	can_open = left_flank && (!right_flank || before_punct)
+	can_close = right_flank && (!left_flank || after_punct)
+	return
+}
+
 // Parse a line's inline content into styled runs. Small state machine: ** / __
 // bold, * / _ italic, ` code, [text](url) links. Non-nested (a link's label is
 // plain), which is enough for a preview.
@@ -927,14 +1285,39 @@ md_inline :: proc(s: string, allocator := context.temp_allocator) -> []Md_Run {
 			flush(&out, &sb, bold, ital, false, strike)
 			strike = !strike
 			i += 2
-		case c == '*' && i + 1 < n && s[i + 1] == '*', c == '_' && i + 1 < n && s[i + 1] == '_':
+		case c == '*' && i + 1 < n && s[i + 1] == '*':
 			flush(&out, &sb, bold, ital, false, strike)
 			bold = !bold
 			i += 2
-		case c == '*' || c == '_':
+		case c == '_' && i + 1 < n && s[i + 1] == '_':
+			// `*` may toggle emphasis mid-word; `_` may not (CommonMark's
+			// intraword exception applies only to `_`). Without this test,
+			// any `_` in a snake_case identifier eats a character and flips
+			// every later `_` on the line into an emphasis toggle.
+			can_open, can_close := md_delim_flanks(s, i, i + 2)
+			if (bold && can_close) || (!bold && can_open) {
+				flush(&out, &sb, bold, ital, false, strike)
+				bold = !bold
+				i += 2
+			} else {
+				strings.write_byte(&sb, c)
+				strings.write_byte(&sb, s[i + 1])
+				i += 2
+			}
+		case c == '*':
 			flush(&out, &sb, bold, ital, false, strike)
 			ital = !ital
 			i += 1
+		case c == '_':
+			can_open, can_close := md_delim_flanks(s, i, i + 1)
+			if (ital && can_close) || (!ital && can_open) {
+				flush(&out, &sb, bold, ital, false, strike)
+				ital = !ital
+				i += 1
+			} else {
+				strings.write_byte(&sb, c)
+				i += 1
+			}
 		case c == '[':
 			// [label](url)
 			rb := strings.index_byte(s[i:], ']')
@@ -1303,7 +1686,7 @@ md_run_color :: proc(run: Md_Run, base_col: [4]f32, mute: f32) -> [4]f32 {
 	return col
 }
 
-// Does a block whose TOP edge is `ytop` and whose height is `h` fit entirely
+// Does something whose TOP edge is `ytop` and whose extent is `h` fit entirely
 // above `ybot`?
 //
 // One expression, and its own procedure so a test can drive it without a
@@ -1312,13 +1695,117 @@ md_run_color :: proc(run: Md_Run, base_col: [4]f32, mute: f32) -> [4]f32 {
 // so the -px correction that turned a baseline into a row top has nothing left
 // to correct. The property it exists to protect is unchanged and is the reason
 // it is a named procedure at all: there is no scissor rect in this renderer
-// (clipping is the cover strip main.odin paints afterwards), so the only way a
-// block is not cut through the middle of its glyphs is for it not to be
-// ADMITTED. `h` must be the block's OWN height -- the number the shaper
-// produced -- never the body line height, which is the bug item 6 of the
-// 2026-07-29 regressions fixed and which the block model must not reintroduce.
+// (clipping is the cover strip main.odin paints afterwards), so the only way
+// GLYPHS are not cut through the middle is for them not to be ADMITTED.
+//
+// 2026-07-29, Wyatt's report: this used to be asked once per BLOCK, with `h` the
+// block's own height, and the admit site refused the whole block. That is right
+// for a heading -- one line, fits or does not -- and wrong for a paragraph,
+// which since batch 17 is an arbitrary number of shaped lines: a pane with room
+// for four of a paragraph's five lines showed a heading and then 200px of blank.
+// So the question is now asked once per LINE, `h` is md_line_bottom's answer,
+// and md_block_admit is the only place that asks it. A single-line block, and
+// every kind the shaper did not place, reduces to exactly the old call (see
+// md_block_lines), which is why no other kind's behaviour moved.
 md_block_fits :: #force_inline proc(ytop, h, ybot: f32) -> bool {
 	return ytop + h <= ybot
+}
+
+// Is this kind's height a stack of independently admissible SHAPED lines?
+//
+// False for everything the shaper did not place: a rule and a fence's open/close
+// padding strip are one indivisible band, and the front-matter card is drawn whole
+// (md_draw_front_matter paints its frame and all its rows in one call, so there is
+// no line to stop at). A Blank block has no height at all. Those kinds keep
+// whole-block admission, and md_block_lines returning 1 for them is what makes
+// that literally the same test they had before.
+//
+// .Table MOVED HERE 2026-07-29, and this is the pairing the guard in md_block_draw
+// exists for: a table row's cells are now shaped (plat.shape_columns), so a row is
+// a stack of visual lines exactly as a paragraph is and it reaches shaped_draw the
+// same way. Leaving it on the indivisible side would have made md_block_lines
+// return 1 for a three-line row and shaped_draw would have emitted only the first
+// line -- a wrapped table silently rendering one line per row, with mdtabletest
+// (cell arithmetic only) still green. The guard turns that into a panic.
+@(private = "file")
+md_kind_lines :: #force_inline proc(k: Md_Kind) -> bool {
+	switch k {
+	case .Para, .Heading, .Quote, .List, .Fence_Body, .Table:
+		return true
+	case .Blank, .Rule, .Fence_Open, .Fence_Close, .Front_Matter:
+		return false
+	}
+	return false
+}
+
+// How many independently admissible lines a block has. Never zero: a kind the
+// shaper did not place is ONE line whose bottom is the block's own height, so
+// md_block_admit degenerates to a single md_block_fits call for it.
+@(private = "file")
+md_block_lines :: #force_inline proc(lay: ^Md_Layout) -> int {
+	if lay == nil || !md_kind_lines(lay.cls.kind) {return 1}
+	return max(1, len(lay.sh.line_boxes))
+}
+
+// The bottom edge of visual line `l`, as an offset from the block's own top.
+//
+// THE last line's bottom is the block's `h`, not its line box's -- a block's
+// trailing decoration lives in the gap between the two (an h1/h2 rule is inside
+// Md_Layout.h, added after the shaper's height). Reading the line box there
+// would admit a last line whose rule then paints one row below what the admit
+// test budgeted for, which on the pane's last block is a hairline on the status
+// bar: the exact shape of item 6 of the 2026-07-29 regressions. It also keeps
+// `whole` and `md_block_fits(y, lay.h, ybot)` the same predicate, so a
+// single-line heading is admitted on precisely the terms it was before.
+@(private = "file")
+md_line_bottom :: #force_inline proc(lay: ^Md_Layout, l: int) -> f32 {
+	if lay == nil {return 0}
+	if l >= md_block_lines(lay) - 1 {return lay.h}
+	return lay.sh.line_boxes[l].top + lay.sh.line_boxes[l].h
+}
+
+// How much of one block a pane admits.
+//
+// `lines` is how many of its visual lines were admitted (0 == none: the block is
+// refused), `h` the height those lines occupy from the block's top, and `whole`
+// says the block has nothing left to reveal -- which is what lets the pass
+// advance past it and continue to the next.
+//
+// File-private on purpose: the only producer is md_block_admit and the only route
+// to it is md_place_next, so a value of this type outside this file would mean a
+// second answer to "what is on screen" existed.
+@(private = "file")
+Md_Admit :: struct {
+	lines: int,
+	h:     f32,
+	whole: bool,
+}
+
+// THE per-line admit rule, and its only expression.
+//
+// One producer, because a per-line draw with a per-block hit-test is CLAUDE.md's
+// "a correct function fed the wrong input" by construction -- HANDOFF 6j counts
+// sixteen instances of that shape. md_place_next is the only caller, and
+// md_pass's draw and md_block_at_y's click map both consume md_place_next, so
+// the ink and the click cannot be answering two different questions.
+//
+// `forced` is the first block's waiver, narrowed by this change from the whole
+// block to its first LINE: a pane too short for even one line still shows one
+// ("no frame ever shows emptiness" outranks the cover strip's trim), but a pane
+// too short for a five-line paragraph no longer draws all five and lets the
+// strip eat four.
+@(private = "file")
+md_block_admit :: proc(lay: ^Md_Layout, y, ybot: f32, forced: bool) -> (a: Md_Admit) {
+	n := md_block_lines(lay)
+	for l in 0 ..< n {
+		if !md_block_fits(y, md_line_bottom(lay, l), ybot) {break}
+		a.lines = l + 1
+	}
+	if a.lines == 0 && forced {a.lines = 1}
+	if a.lines == 0 {return}
+	a.whole = a.lines >= n
+	a.h = lay.h if a.whole else md_line_bottom(lay, a.lines - 1)
+	return
 }
 
 // --- UI spec 9.1, the block/span model --------------------------------------
@@ -1518,6 +2005,25 @@ md_draw_links :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, hits: []Md_Link_H
 // preview's glyphs do not sit on the cell grid those two describe, and asking
 // them would be the "correct function fed the wrong input" bug this project has
 // sixteen recorded instances of.
+//
+// NOT bounded to the pane box (2026-07-29 review, F2, correcting an earlier
+// wrong justification: md_pane_box's ybot IS doc_content_box's bot -- exactly
+// where the cover strip starts -- and the strip paints in the SAME frame
+// before any chrome, so there is no window of frames in which an admitted
+// line's own glyphs paint over the tab rail or the status bar; F1's per-line
+// admission already keeps every admitted rect inside [ytop, ybot]). The real,
+// reachable hazard is `forced` (md_block_admit): the pane's FIRST block, if it
+// is one of the kinds md_kind_lines calls indivisible (a fence's open/close
+// strip, front matter, a table row), is admitted `whole` even when it does not
+// fit -- ad.whole = lines >= n with n == 1, unconditionally -- so its
+// `ad.h == lay.h` can run well past ybot. Its link rects (md_block_links,
+// gated on `b.line >= ad.lines`, not on y) go with it. The GLYPHS are cut off
+// by the cover strip below ybot same as any overflow, but neither call site of
+// THIS proc (main.odin's hover cursor and Ctrl+click) applies a y bound, so a
+// forced, oversized block's link rects stay clickable -- invisible, but live
+// -- as far down as lay.h reaches, which can be past the status bar. Not fixed
+// here (out of this batch's scope); recorded so the next pass over this file
+// does not have to rediscover it.
 md_link_at :: proc(hits: []Md_Link_Hit, mx, my: f32) -> (Md_Link_Hit, bool) {
 	for h in hits {
 		r := h.rect
@@ -1787,6 +2293,11 @@ Md_Layout :: struct {
 	spans:       []Md_Span,
 	sh:          plat.Shaped,
 	boxes:       []Md_Span_Box,
+	// .Table only: the block's fitted column geometry (md_table_cols). OWNED.
+	// Produced once when the block is laid out and read back by the draw for the
+	// column rules and the separator row's width -- the same single-producer rule
+	// `h` and `indent` follow, and the reason md_col_x no longer exists.
+	tcols:       []Md_Table_Col,
 	// THE height. Produced here, once, and consumed by BOTH the admit decision
 	// and the advance -- md_row_geom's lesson, carried into the block model. The
 	// two must never be computed separately: a block admitted against one number
@@ -1824,6 +2335,7 @@ md_layout_free :: proc(e: ^Md_Layout) {
 	delete(e.shape)
 	delete(e.spans)
 	delete(e.boxes)
+	delete(e.tcols)
 	plat.shaped_free(&e.sh)
 	e^ = {}
 }
@@ -1973,6 +2485,15 @@ md_layout_build :: proc(
 	mute := f32(0)
 	px := m.body
 	lead := m.body_lead
+	// .Table only: the block's measured cache, kept because the span builder below
+	// needs its per-column alignments. Read once, here, so nothing downstream of the
+	// switch calls md_table_ensure a second time.
+	tcache: ^Md_Table_Cache
+	// The face the EMPTY-BLOCK height fallback at the end of this proc measures on.
+	// .Body for prose; the mono chain for the kinds that draw on it, so a table
+	// separator row -- which drafts no spans at all -- is one row of the TABLE face
+	// tall rather than one row of Georgia.
+	fallback_set := plat.Font_Set.Body
 
 	switch e.cls.kind {
 	case .Blank:
@@ -2005,31 +2526,43 @@ md_layout_build :: proc(
 		e.below = m.fence_below
 		return
 	case .Table:
-		// Tables keep the cell machinery: 9.3 puts them on the mono face
-		// precisely so their columns align, and column widths are a property of
-		// the whole block (md_table_ensure), not of one row.
+		// 9.3 keeps a table on the mono face at 0.95 S -- "always mono: columns
+		// align" -- and its column widths stay a property of the whole BLOCK, which
+		// is what md_table_ensure measures. Two things changed 2026-07-29, both from
+		// Wyatt's screenshot of a wide table with its last column cut off by the pane
+		// edge:
 		//
-		// DISCLOSED REGRESSION, not an oversight: returning here means `spans`
-		// and `boxes` stay nil, so md_block_links emits nothing and a link inside
-		// a table cell is not clickable. The old preview's links_layout scanned
-		// every raw source line whatever its kind, so it was. Fenced code lost the
-		// same thing (see md_split_bare_links and the fence-body branch below) and
-		// that one is arguably right -- code should not be clickable -- but a link
-		// in a table cell is an ordinary thing to write and this is a loss.
+		//   * the natural widths are FITTED to the measure (md_table_cols), so the
+		//     table cannot run off the right edge -- there is no scissor rect here,
+		//     so a column past the measure paints over the scrollbar rather than
+		//     clipping;
+		//   * each cell's text WRAPS inside its own column (plat.shape_columns), and
+		//     a row is as tall as its tallest cell. That is what GitHub, Obsidian and
+		//     VS Code do, and it is Wyatt's choice. Mono is about the FACE, not about
+		//     refusing to wrap.
 		//
-		// Not fixed here because it cannot be done without a SECOND producer of
-		// table cell geometry, which is the one defect this whole batch exists to
-		// remove. A row's glyphs are placed by md_draw_table_row from character
-		// CELLS (md_col_x over md_table_ensure's column widths, plus the alignment
-		// pad); the span boxes every other kind's link rects come from are the
-		// shaper's. Emitting link rects for a table today means re-deriving a
-		// cell's sub-string x in cell arithmetic and hoping it agrees with what
-		// text_draw actually advanced -- which is precisely "a correct function fed
-		// the wrong input" (CLAUDE.md, HANDOFF 6j). The honest fix is to route a
-		// table row through shape_spans with per-column origins so the columns and
-		// the links share the shaper's output, and that is its own task.
-		e.h = line_height(m.table)
-		return
+		// This case no longer returns, and that is load-bearing: the cells go through
+		// the shaper, so `spans`, `boxes` and `sh` are populated and a table row
+		// reaches shaped_draw exactly as a paragraph does. Which is why .Table is on
+		// md_kind_lines' DIVISIBLE side now -- see the pairing guard in md_block_draw.
+		//
+		// It also closes batch 17's disclosed regression: LINKS INSIDE TABLE CELLS
+		// ARE CLICKABLE AGAIN. That regression was disclosed on the grounds that
+		// emitting link rects would need a second producer of cell geometry; once the
+		// shaper places the cells, the second producer is gone -- md_span_boxes reads
+		// the same Shaped the glyphs were drawn from, so a table cell's link rect
+		// comes from the identical seam every other block's does.
+		px, lead = m.table, line_height(m.table)
+		fallback_set = .Doc
+		tcache = md_table_ensure(doc, t, p)
+		e.tcols = md_table_cols(tcache, measure, md_table_char_w(gfx, t, m))
+		// md_table_bounds refuses an entry point that is not a real line start (a
+		// physical row longer than RENDER_LINE_CAP, drawn in segments), and a refusal
+		// is nil here. The row still has to draw: one column, the whole measure.
+		if len(e.tcols) == 0 {
+			e.tcols = make([]Md_Table_Col, 1)
+			e.tcols[0] = {x = 0, w = max(1, measure)}
+		}
 	case .Fence_Body:
 		px, lead = m.code, line_height(m.code)
 		base_col = g_theme[.Md_Code]
@@ -2071,7 +2604,54 @@ md_layout_build :: proc(
 	// --- spans ---------------------------------------------------------------
 	sb := strings.builder_make(context.temp_allocator)
 	draft := make([dynamic]Md_Draft_Span, 0, 8, context.temp_allocator)
-	if e.cls.kind == .Fence_Body && fence_lex != nil {
+	// .Table only: one entry per fitted column, the index in `draft` where that
+	// column's spans END. Recorded while drafting because the flat
+	// plat.Shape_Span array the columns must subslice does not exist yet.
+	tcol_end := make([dynamic]int, 0, MD_TABLE_MAX_COLS, context.temp_allocator)
+	if e.cls.kind == .Table {
+		// A separator row draws as a rule and no text at all (the old
+		// md_draw_table_row did the same), so it drafts nothing and takes its height
+		// from the empty-block fallback at the end of this proc -- one mono row at
+		// m.table, which is what fallback_set is for.
+		if !e.cls.is_sep {
+			cells := md_split_cells(e.src, context.temp_allocator)
+			for ci in 0 ..< len(e.tcols) {
+				// A row with fewer cells than the block has columns contributes an
+				// EMPTY column, not a missing one: the columns are the block's, so
+				// every row must offer the same number of them or the spans and the
+				// geometry would index differently.
+				cell := cells[ci] if ci < len(cells) else ""
+				for run in md_inline(cell) {
+					if len(run.text) == 0 {continue}
+					st := md_run_styles(run)
+					off := strings.builder_len(sb)
+					strings.write_string(&sb, run.text)
+					d := Md_Draft_Span {
+						off   = off,
+						len   = len(run.text),
+						style = st,
+						color = md_run_color(run, base_col, mute),
+						// EVERY table span at m.table on the mono chain, inline code
+						// included -- which is the one place this deviates from what
+						// the same run would get in a paragraph. 9.3's "always mono:
+						// columns align" is a statement about the column grid, and a
+						// 0.92 S code run inside a 0.95 S row would advance on a
+						// different width from the cells around it, which is exactly
+						// the alignment the mono face is there to buy.
+						px    = m.table,
+						set   = .Doc,
+					}
+					if .Link in st {
+						d.url_off = strings.builder_len(sb)
+						d.url_len = len(run.url)
+						strings.write_string(&sb, run.url)
+					}
+					md_split_bare_links(&draft, d, run.text)
+				}
+				append(&tcol_end, len(draft))
+			}
+		}
+	} else if e.cls.kind == .Fence_Body && fence_lex != nil {
 		// Syntax colours inside a fenced block: one span per token, all on the
 		// mono face at the code size. The lexer's outgoing state is carried to
 		// the next block, and is part of that block's cache key.
@@ -2144,7 +2724,34 @@ md_layout_build :: proc(
 		if d.url_len > 0 {e.spans[i].url = e.store[d.url_off:d.url_off + d.url_len]}
 	}
 
-	e.sh = plat.shape_spans(gfx, t, e.shape, max(1, measure - e.indent), lead)
+	if e.cls.kind == .Table {
+		// Each column shaped in ITS OWN width, at the block's fitted geometry, and
+		// merged into one Shaped whose line slots are the per-line max over the
+		// columns. So the row's height is the tallest cell's, produced once by the
+		// shaper, and consumed by md_block_admit and by md_walk's advance through
+		// `e.h` below like every other kind's.
+		cols := make([]plat.Shape_Column, len(e.tcols), context.temp_allocator)
+		lo := 0
+		for i in 0 ..< len(e.tcols) {
+			hi := tcol_end[i] if i < len(tcol_end) else lo
+			al := plat.Shape_Align.Left
+			if tcache != nil && i < tcache.ncols {
+				switch tcache.align[i] {
+				case .Left:
+					al = .Left
+				case .Center:
+					al = .Center
+				case .Right:
+					al = .Right
+				}
+			}
+			cols[i] = {spans = e.shape[lo:hi], x = e.tcols[i].x, w = e.tcols[i].w, align = al}
+			lo = hi
+		}
+		e.sh = plat.shape_columns(gfx, t, cols, lead)
+	} else {
+		e.sh = plat.shape_spans(gfx, t, e.shape, max(1, measure - e.indent), lead)
+	}
 	e.boxes = md_span_boxes(gfx, t, &e.sh, e.shape, context.allocator)
 	// THE height, read back rather than assumed: Shaped.height is the SUM of the
 	// per-line boxes, and a line box is clamped UP to its own face's ascent +
@@ -2174,7 +2781,7 @@ md_layout_build :: proc(
 	// persisted fields (e.store, e.shape, e.spans, e.boxes above) are all built on
 	// context.allocator and md_layout_free deletes them through the same, so this
 	// is clean today -- but it is an invariant nothing enforces, only audits.
-	if e.h <= 0 {e.h = plat.shape_run(gfx, t, " ", px, measure, lead, .Body, context.temp_allocator).line_h}
+	if e.h <= 0 {e.h = plat.shape_run(gfx, t, " ", px, measure, lead, fallback_set, context.temp_allocator).line_h}
 	// h1 and h2 carry a rule (9.2 item 1). It is part of the block's OWN height,
 	// not decoration painted after it: a rule drawn at the block's bottom edge
 	// while the height stopped above it is a row of pixels the admit decision
@@ -2528,6 +3135,79 @@ md_anchor_walk :: proc(c: ^Md_Scroll_Ctx, block: int, limit_h: f32, out: []Md_Wa
 	return
 }
 
+// One block as a pane PUT IT ON SCREEN: the walk entry, the client y its top
+// landed at, and how much of it the pane admitted.
+@(private = "file")
+Md_Placed :: struct {
+	blk:   Md_Walk_Block,
+	y:     f32,
+	admit: Md_Admit,
+	// Wholly above ytop -- a zero-height anchor (a blank run), or an anchor whose
+	// px invariant an edit broke underneath it. Reported as PASSED rather than
+	// painted into the chrome, and it does not spend the first block's waiver:
+	// that belongs to the first block with something to show.
+	above: bool,
+}
+
+// The state of one pane's placement walk. See md_place_next.
+@(private = "file")
+Md_Placer :: struct {
+	blocks:         []Md_Walk_Block,
+	i, n:           int,
+	y0, ytop, ybot: f32,
+	forced:         bool,
+	done:           bool,
+}
+
+@(private = "file")
+md_placer :: proc(blocks: []Md_Walk_Block, idx, n: int, y0, ytop, ybot: f32) -> Md_Placer {
+	// `forced` starts true: the very first block with something to show is
+	// admitted whatever the pane's height. See md_block_admit.
+	return {blocks = blocks, i = idx, n = n, y0 = y0, ytop = ytop, ybot = ybot, forced = true}
+}
+
+// THE producer of "what this pane has on screen", stepped one block at a time.
+//
+// md_pass PAINTS exactly what this returns and md_block_at_y MAPS exactly what
+// this returns -- neither has an admit test of its own, and neither may grow one.
+// Before 2026-07-29 they each ran their own copy of the loop against
+// md_block_fits, and md_block_at_y's comment said in as many words that it
+// existed to "mirror md_pass's own fit test". That mirror was survivable only
+// while admission was per-BLOCK and both copies read one number; with per-line
+// admission a drifted copy means a click naming a block whose lines the pane
+// never painted, which is CLAUDE.md's one-layout-per-widget rule ("no procedure
+// may both compute a coordinate and consume it") stated for the preview's
+// blocks. So the loop itself is the shared thing, not just the predicate.
+//
+// Iterator rather than an out-slice because a second MD_WALK_BLOCKS array per
+// call is real temp-arena traffic three times a frame, and because a caller that
+// receives blocks one at a time cannot accidentally look past the one the pane
+// stopped at.
+@(private = "file")
+md_place_next :: proc(p: ^Md_Placer) -> (out: Md_Placed, ok: bool) {
+	if p == nil || p.done || p.i >= p.n {return}
+	b := p.blocks[p.i]
+	y := p.y0 + b.slot_top + b.gap
+	if y + b.h <= p.ytop {
+		p.i += 1
+		return Md_Placed{blk = b, y = y, above = true, admit = {lines = md_block_lines(b.lay), h = b.h, whole = true}}, true
+	}
+	// The ONE consumer pair of the height the layout produced: this test and the
+	// walk's own advance. Nothing else may size this block.
+	a := md_block_admit(b.lay, y, p.ybot, p.forced)
+	if a.lines == 0 {
+		p.done = true
+		return
+	}
+	p.forced = false
+	// A partially admitted block is the LAST thing on screen: there is no room
+	// below its unadmitted lines for anything else, and the pass must not report
+	// having finished it. Stop here.
+	if !a.whole {p.done = true}
+	p.i += 1
+	return Md_Placed{blk = b, y = y, admit = a}, true
+}
+
 // One walk over the visible blocks, consumed by the draw and by the link pass.
 //
 // There is exactly ONE of these because the two consumers must not be able to
@@ -2554,8 +3234,10 @@ md_pass :: proc(
 	links: ^[dynamic]Md_Link_Hit,
 ) -> (
 	bottom: int,
+	shown:  int,
 ) {
 	bottom = at.block
+	shown = at.block
 	if doc == nil {return}
 	md_layout_pass += 1 // see md_layout_slot: this pass's entries are not evictable
 	m := md_metrics(text, px)
@@ -2581,44 +3263,75 @@ md_pass :: proc(
 	// is this plus the walk's own relative offsets -- one origin, so a block's
 	// draw y and its link rect's y cannot be two different numbers.
 	y0 := ytop - at.px - (blocks[idx].slot_top if n > 0 else 0)
-	// The very first block is admitted unconditionally. A pane shorter than one
-	// h1 is reachable (the window floor is 240dp and the document font size is a
-	// user setting), and "no frame ever shows emptiness" outranks a heading whose
-	// bottom edge the cover strip trims. Spent once.
-	forced := true
 	// From the anchor, not from the walk's start: the blocks before `idx` are the
-	// run-up, and they exist only so the anchor's gap is right.
-	for i in idx ..< n {
-		b := blocks[i]
-		y := y0 + b.slot_top + b.gap
-		// Wholly above the pane: a zero-height anchor (a blank run), or an anchor
-		// whose px invariant an edit has broken underneath it. Reported as passed
-		// rather than drawn into the chrome, and it does NOT spend `forced` -- that
-		// belongs to the first block with something to show.
-		if y + b.h <= ytop {
-			bottom = b.end
+	// run-up, and they exist only so the anchor's gap is right. What is admitted
+	// is md_place_next's answer and nothing else -- see its header.
+	pl := md_placer(blocks, idx, n, y0, ytop, ybot)
+	for {
+		p, ok := md_place_next(&pl)
+		if !ok {break}
+		if p.above {
+			bottom = p.blk.end
+			shown = p.blk.end
 			continue
 		}
-		// The ONE consumer pair of the height the layout produced: this test and
-		// the walk's own advance. Nothing else may size this block.
-		if !forced && !md_block_fits(y, b.h, ybot) {break}
-		forced = false
-		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, b.lay, cx, x1, y)}
-		if links != nil {md_block_links(doc, b.lay, cx, y, links)}
-		bottom = b.end
+		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, p.blk.lay, cx, x1, p.y, p.admit)}
+		if links != nil {md_block_links(doc, p.blk.lay, cx, p.y, p.admit, links)}
+		// `bottom` advances only past a block that is FINISHED. A partially drawn
+		// block reports its own start (i.e. leaves `bottom` where the previous block
+		// left it), because lines of it the reader has never seen are not behind
+		// them. The preview scrolls in PIXELS (Md_Anchor{block, px}), so the pixel
+		// anchor is what advances into a partial block. `bottom` has no consumer
+		// left in the product (2026-07-29 review, F1) -- it is kept because it is
+		// still the honest "last FINISHED block" answer and something may want that
+		// again -- but it is no longer what sizes the thumb.
+		//
+		// `shown` is that different input. It credits a partial block with the
+		// FRACTION of its own byte span its admitted lines cover, using
+		// `p.admit.h / p.blk.h` -- the identical fraction md_block_draw already used
+		// to decide how tall the Fence_Body / Quote band gets (see its comments),
+		// so the thumb's extra credit can never disagree with what was actually
+		// painted. Byte-proportional, not line-proportional, because md_vscrollbar_geo
+		// is byte-proportional throughout (its own header: measuring the document's
+		// HEIGHT would mean laying it out, which viewport-first forbids). A block
+		// that is refused outright (p.admit.h == 0, e.g. `forced` pinned it to one
+		// line that still does not fit) contributes 0 of its span, same as before.
+		if !p.admit.whole {
+			frac := p.admit.h / max(1, p.blk.h)
+			shown = p.blk.start + int(f32(p.blk.end - p.blk.start) * clamp(frac, 0, 1))
+			break
+		}
+		bottom = p.blk.end
+		shown = p.blk.end
 	}
 	return
 }
 
 // Render markdown source from `at`, laid out in [x0,x1] x [ytop,ybot].
-// Returns the byte offset just past the last line drawn (for scroll clamping).
+//
+// Returns the byte offset just past the last FINISHED block -- NOT "for scroll
+// clamping" (the preview's clamp is md_scroll_clamp -> md_max_anchor, which
+// reads neither this nor any admit decision) and not "the last line drawn"
+// (a partially admitted block's lines ARE drawn and this does not advance past
+// them). Corrected 2026-07-29 review, F5: both halves of the old sentence were
+// false, and the false "for scroll clamping" half is what produced F1's wrong
+// premise that this value was safe to feed the thumb.
+//
+// `shown`, an optional out-param, is the DIFFERENT input the thumb actually
+// needs: the byte extent the pane put on screen, crediting a partially
+// admitted block with the fraction of its own span its admitted lines cover
+// instead of stopping dead at its start. See md_pass for why `bottom` itself
+// is kept rather than repurposed.
 //
 // A partially-scrolled anchor block draws ABOVE ytop -- that is what a pixel
 // offset is -- and there is no scissor rect in this renderer, so the caller owes
 // this pane a cover strip over [0, ytop) exactly as it already owes one below
 // ybot. md_preview_clip is that strip.
-markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px: f32, x0, x1, ytop, ybot: f32, at: Md_Anchor) -> (bottom: int) {
-	return md_pass(gfx, qp, text, doc, px, x0, x1, ytop, ybot, at, nil)
+markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px: f32, x0, x1, ytop, ybot: f32, at: Md_Anchor, shown: ^int = nil) -> (bottom: int) {
+	s: int
+	bottom, s = md_pass(gfx, qp, text, doc, px, x0, x1, ytop, ybot, at, nil)
+	if shown != nil {shown^ = s}
+	return
 }
 
 // The links the preview would draw, in absolute client coordinates. The same
@@ -3071,39 +3784,49 @@ md_block_at_y :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, y: f32) -> (start: int, o
 	// of the three "gate:" cases that read as pane-bound checks, only the FIND BAR
 	// is actually refused by this line. The status bar and the empty strip below
 	// the last drawn block are both inside or below the pane's rows and are
-	// refused by the fit test further down instead. Deleting this line therefore
-	// costs exactly one case -- which is one more than zero, which is why it stays
-	// here while the duplicate went.
+	// refused by the PLACEMENT further down instead (2026-07-29 review, F5:
+	// there is no "fit test" left to refuse them -- md_place_next's admit
+	// decision does, via the `rel >= last.blk...admit.h` bound just past the
+	// binary search below; its twin in main.odin, md_split_click_gate, already
+	// says it this way). Deleting this line therefore costs exactly one case --
+	// which is one more than zero, which is why it stays here while the
+	// duplicate went.
 	if y < c.ytop || y >= c.ytop + c.pane {return}
 	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
 	n, idx := md_anchor_walk(c, a.block, a.px + c.pane, out)
 	if n == 0 {return}
-	// Mirror md_pass's own fit test (md_block_fits, same forced-first-block
-	// rule). md_anchor_walk's budget is a HEIGHT limit, not "did this block
-	// fit inside ybot", so a block that straddles the pane's bottom edge is
-	// walked (and cached) but never painted. Without this, a click in the
-	// blank strip below the last PAINTED block clamps onto that unpainted
-	// block instead of naming nothing -- the same "clamps to whatever the
-	// binary search's last entry is" shape the pane bound above exists to
-	// close off, just for a y still inside the pane.
+	// The blocks the pane PUT ON SCREEN come from md_place_next, the same
+	// procedure md_pass paints from -- not from a fit test written out again here.
+	// md_anchor_walk's budget is a HEIGHT limit, not "did this block fit inside
+	// ybot", so a block that straddles the pane's bottom edge is walked (and
+	// cached) but only partly painted; without consulting the placement, a click
+	// in the strip below the last PAINTED line clamps onto lines that were never
+	// drawn -- the same "clamps to whatever the binary search's last entry is"
+	// shape the pane bound above exists to close off, just for a y still inside
+	// the pane.
+	//
+	// This used to be a hand-written mirror of md_pass's loop, and its own comment
+	// said so. Under per-line admission a mirror is not survivable: the two copies
+	// would have to agree about how many LINES of the last block were painted, not
+	// just about one height. See md_place_next.
 	y0 := c.ytop - a.px - out[idx].slot_top
-	forced := true
-	last := idx - 1
-	for i in idx ..< n {
-		b := out[i]
-		by := y0 + b.slot_top + b.gap
-		if by + b.h <= c.ytop {
-			last = i
-			continue
-		}
-		if !forced && !md_block_fits(by, b.h, c.ytop + c.pane) {break}
-		forced = false
-		last = i
+	pl := md_placer(out, idx, n, y0, c.ytop, c.ytop + c.pane)
+	last: Md_Placed
+	cnt := 0
+	// The last placed block's index in `out`, for the binary search below: the
+	// placer walks `out` in order from `idx`, so this is idx + cnt - 1.
+	for {
+		p, ok := md_place_next(&pl)
+		if !ok {break}
+		last = p
+		cnt += 1
 	}
-	if last < idx {return}
+	if cnt == 0 {return}
 	rel := (y - c.ytop) + a.px + out[idx].slot_top // into the walk's own space
-	if rel >= out[last].slot_top + out[last].gap + out[last].h {return}
-	lo, hi := idx, last
+	// `admit.h`, not `blk.h`: the last block on screen may be a partial one, and
+	// the rows below its admitted lines hold nothing to click.
+	if rel >= last.blk.slot_top + last.blk.gap + last.admit.h {return}
+	lo, hi := idx, idx + cnt - 1
 	for lo < hi {
 		mid := (lo + hi + 1) / 2
 		if out[mid].slot_top <= rel {lo = mid} else {hi = mid - 1}
@@ -3124,9 +3847,13 @@ md_block_at_y :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, y: f32) -> (start: int, o
 md_block_origin :: #force_inline proc(lay: ^Md_Layout, cx: f32) -> f32 {return cx + lay.indent}
 
 @(private = "file")
-md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, out: ^[dynamic]Md_Link_Hit) {
+md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, ad: Md_Admit, out: ^[dynamic]Md_Link_Hit) {
 	x := md_block_origin(lay, cx)
 	for b in lay.boxes {
+		// A line the pane did not admit has no glyphs on screen, so it has no link
+		// either. Same `ad.lines` the draw filters its glyphs by, out of the same
+		// Md_Admit -- so an unpainted line cannot be clickable.
+		if b.line >= ad.lines {continue}
 		if b.span < 0 || b.span >= len(lay.spans) {continue}
 		sp := lay.spans[b.span]
 		if .Link not_in sp.style || len(sp.url) == 0 {continue}
@@ -3142,12 +3869,44 @@ md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, out: ^[dy
 	}
 }
 
-// Paint one laid-out block at (cx, ytop). Consumes the layout and produces no
-// geometry of its own beyond the decorations that are not text: every glyph
-// position comes from lay.sh, every span rectangle from lay.boxes.
+// Paint one laid-out block at (cx, ytop), as much of it as `ad` admitted.
+// Consumes the layout and produces no geometry of its own beyond the decorations
+// that are not text: every glyph position comes from lay.sh, every span
+// rectangle from lay.boxes.
+//
+// `ad` is md_block_admit's answer, handed down rather than recomputed here. Its
+// two consequences: `ad.h` is the height every FULL-WIDTH band this block paints
+// (a fence body's background, a quote's bars) must use, since the band may not
+// run past the last admitted line; and `ad.lines` is the line cutoff for the
+// glyphs and for every rectangle in lay.boxes. A band drawn to lay.h under a
+// partial admit is exactly the overhang the admit test exists to prevent.
 @(private = "file")
-md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32) {
+md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32, ad: Md_Admit) {
 	x := md_block_origin(lay, cx)
+	// PAIRING GUARD (2026-07-29 review, F4). The kinds that `return` inside the
+	// switch below must be EXACTLY the kinds md_kind_lines calls indivisible, and
+	// the kinds that fall through to shaped_draw (below the switch) must be
+	// exactly the ones it calls divisible -- two hand-written expressions of the
+	// same fact, and until now nothing checked they agreed. `reached_shaped` is
+	// set true at the one place shaped_draw is actually called; the deferred
+	// check fires for EVERY block this proc ever draws, so a kind added to one
+	// side without the other panics the first time that kind is painted, rather
+	// than silently reducing `shaped_draw`'s `lines` to 1 and dropping every
+	// visual line but the first (see F4: the very next task shapes table cells,
+	// which turns `.Table` from an early return into a fall-through, and this is
+	// what stops `.Table` landing on only one side of the pairing).
+	reached_shaped := false
+	defer if reached_shaped != md_kind_lines(lay.cls.kind) {
+		fmt.panicf(
+			"md_block_draw: kind %v reaches shaped_draw=%v but md_kind_lines says divisible=%v -- add/remove it on BOTH sides (see F4)",
+			lay.cls.kind, reached_shaped, md_kind_lines(lay.cls.kind),
+		)
+	}
+	// The kinds that return inside this switch are the ones md_kind_lines calls
+	// indivisible, so md_block_lines is 1 for them, so an admitted one is always
+	// `whole` and ad.h == lay.h. They keep reading lay.h: it says "the block's own
+	// height", which for them is the truth, and swapping in ad.h would only
+	// obscure that they cannot be partial.
 	switch lay.cls.kind {
 	case .Blank:
 		return
@@ -3166,16 +3925,41 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop}, size = {x1 - cx, lay.h}, color = g_theme[.Md_Code_Bg], radius = {0, 0, r, r}}})
 		return
 	case .Table:
-		if c := md_table_ensure(doc, text, lay.start); c != nil {
-			cw := plat.text_char_width(text, m.table, .Doc)
-			// The baseline inside the row: the row's top plus its ascent, so a
-			// table row sits on the same rhythm every other block does.
-			asc, _, _ := plat.text_vmetrics(text, m.table, .Doc)
-			md_draw_table_row(gfx, qp, text, c, lay.src, cx, x1, ytop + asc, m.table, cw, lay.cls.is_sep)
+		// Decoration only. The CELLS fall through to shaped_draw below, from
+		// lay.sh -- there is no table-specific text path left, which is what made
+		// links in cells work again and what removed the second producer of cell
+		// geometry that md_col_x / md_draw_table_row were.
+		//
+		// Both quads below read lay.tcols, the geometry the layout fitted and the
+		// shaper placed the glyphs against, and ad.h, the height the pane actually
+		// admitted -- a rule or a column rule painted to lay.h under a partial
+		// admit is the overhang the admit test exists to prevent (same reason as
+		// Fence_Body's band).
+		if lay.cls.is_sep {
+			// The separator row becomes a rule (9.2 item 6: "md_rule borders"),
+			// vertically centred in its own row, and exactly as wide as the columns
+			// it sits under -- md_table_extent, not a re-summed cell count.
+			// `x` is md_block_origin -- the same origin the cells' glyphs are placed
+			// at, which for a table is cx (indent 0). Not `cx`: two names for one
+			// origin is how a decoration and its text drift apart.
+			w := min(md_table_extent(lay.tcols), x1 - x)
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x, ytop + ad.h * 0.5}, size = {max(0, w), hairline()}, color = g_theme[.Md_Rule]}})
+		} else {
+			// One rule per column boundary, down the middle of the gutter between
+			// two fitted columns, spanning the row's admitted height. A quad and not
+			// the "│" glyph the old row draw used: a glyph covers one line, and a row
+			// is now as many lines as its tallest wrapped cell.
+			for i in 1 ..< len(lay.tcols) {
+				prev, cur := lay.tcols[i - 1], lay.tcols[i]
+				mid := x + (prev.x + prev.w + cur.x) * 0.5
+				if mid >= x1 {break}
+				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {mid, ytop}, size = {hairline(), ad.h}, color = g_theme[.Md_Rule]}})
+			}
 		}
-		return
 	case .Fence_Body:
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop}, size = {x1 - cx, lay.h}, color = g_theme[.Md_Code_Bg]}})
+		// ad.h, not lay.h: a wrapped code line whose second half the pane refused
+		// must not have its background band painted below the glyphs that were.
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop}, size = {x1 - cx, ad.h}, color = g_theme[.Md_Code_Bg]}})
 	case .Quote:
 		// One bar per nesting level (9.2 item 7: "2px bar + 16px inset per
 		// level"), so a reply inside a reply is visibly deeper. The step comes
@@ -3184,7 +3968,9 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		// same number by construction and cannot drift from it (L2).
 		step := lay.indent / f32(max(1, lay.cls.level))
 		for d in 0 ..< lay.cls.level {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(sx(2), 2), lay.h}, color = g_theme[.Md_Quote]}})
+			// ad.h for the same reason the fence body's band uses it: the bar runs
+			// beside the quote's admitted lines, not past them.
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(sx(2), 2), ad.h}, color = g_theme[.Md_Quote]}})
 		}
 	case .List:
 		lx := cx + lay.marker // md_layout_build's own number, not a second copy
@@ -3218,7 +4004,13 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	// from the shaper's own glyph positions. The inline-code background, the
 	// strike rule and the link underline are therefore the SAME geometry the
 	// link hit-test accepts; there is no second derivation anywhere.
+	//
+	// `b.line >= ad.lines` is the line cutoff. It is applied to every box loop
+	// here, to the glyphs through shaped_draw's own `lines` argument, and to the
+	// link rects in md_block_links -- all off the one `ad.lines`, so a refused line
+	// has neither ink nor decoration nor a hit rectangle.
 	for b in lay.boxes {
+		if b.line >= ad.lines {continue}
 		if b.span < 0 || b.span >= len(lay.spans) {continue}
 		sp := lay.spans[b.span]
 		bx, by := x + b.x, ytop + b.y
@@ -3230,7 +4022,8 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	}
 	colors := make([][4]f32, len(lay.spans), context.temp_allocator)
 	for s, i in lay.spans {colors[i] = s.color}
-	plat.shaped_draw(gfx, text, &lay.sh, lay.shape, x, ytop, g_theme[.Text_Primary], colors)
+	reached_shaped = true // the pairing guard's flag -- see the defer above
+	plat.shaped_draw(gfx, text, &lay.sh, lay.shape, x, ytop, g_theme[.Text_Primary], colors, ad.lines)
 	// Synthetic emphasis, only where a real face is missing. With Georgia loaded
 	// this never runs; on a machine whose body family ships no bold it is what
 	// keeps a heading from rendering at weight 400. The second pass draws ONLY
@@ -3246,9 +4039,10 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 				colors[i] = {0, 0, 0, 0}
 			}
 		}
-		if any {plat.shaped_draw(gfx, text, &lay.sh, lay.shape, x + hairline(), ytop, g_theme[.Text_Primary], colors)}
+		if any {plat.shaped_draw(gfx, text, &lay.sh, lay.shape, x + hairline(), ytop, g_theme[.Text_Primary], colors, ad.lines)}
 	}
 	for b in lay.boxes {
+		if b.line >= ad.lines {continue}
 		if b.span < 0 || b.span >= len(lay.spans) {continue}
 		sp := lay.spans[b.span]
 		if .Strike not_in sp.style {continue}
@@ -3260,7 +4054,12 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	// h1 and h2 carry a rule (9.2 item 1), on the LAST row of the block's own
 	// height -- md_layout_build already made room for it, so this consumes that
 	// height rather than reaching past it.
-	if lay.cls.kind == .Heading && md_head_rules(lay.cls.level) {
+	//
+	// `ad.whole` gates it, and md_line_bottom is why that is the right gate: the
+	// last line's admitted bottom IS lay.h, so a heading whose rule the pane cannot
+	// hold is not `whole` and the rule is not painted. A wrapped h2 with three of
+	// four lines on screen would otherwise get its rule under line three.
+	if ad.whole && lay.cls.kind == .Heading && md_head_rules(lay.cls.level) {
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop + lay.h - hairline()}, size = {x1 - cx, hairline()}, color = g_theme[.Md_Rule]}})
 	}
 }
@@ -3355,51 +4154,12 @@ md_row_is_sep :: proc(line: string) -> bool {
 	return md_is_table_sep(strings.trim_left(line, " \t"))
 }
 
-// One row of a table, drawn at the block's cached column positions so every row
-// lines up. `qp` is needed for the header rule under the separator row, which
-// the old renderer skipped entirely.
-@(private = "file")
-md_draw_table_row :: proc(
-	gfx: ^plat.Gfx,
-	qp: ^plat.Quad_Pipeline,
-	text: ^plat.Text,
-	c: ^Md_Table_Cache,
-	line: string,
-	x0, x1, y, px, char_w: f32,
-	is_sep: bool,
-) {
-	if is_sep {
-		// The separator row becomes a rule, not text. md_col_x(c.ncols) sums a
-		// width+pad for every column including the last, so it includes one pad's
-		// worth of gap that has nothing after it — trim it or the rule overhangs
-		// the last column by MD_TABLE_PAD cells.
-		w := min(max(0, md_col_x(c, c.ncols, char_w) - f32(MD_TABLE_PAD) * char_w), x1 - x0)
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y - px * 0.5}, size = {w, hairline()}, color = g_theme[.Md_Rule]}})
-		return
-	}
-	cells := md_split_cells(line, context.temp_allocator)
-	for cell, i in cells {
-		if i >= c.ncols {break}
-		cx := x0 + md_col_x(c, i, char_w)
-		if cx >= x1 {break}
-		if i > 0 {
-			// The TABLE column separator -- Md_Rule, which UI spec 1 assigns to
-			// "thematic breaks, table borders, h1/h2 underline". It was Text_Dim,
-			// the disabled-only tier, until the Text_Dim sweep.
-			plat.text_draw(gfx, text, "│", cx - char_w, y, px, g_theme[.Md_Rule], .Doc)
-		}
-		// col0 = 0, and it must match md_table_measure's origin for the same
-		// cell or the alignment padding below is computed against a width the
-		// column was never sized for.
-		cw := plat.text_cells(text, transmute([]u8)cell, 0, .Doc)
-		pad := 0
-		switch c.align[i] {
-		case .Left:
-		case .Center:
-			pad = max(0, (c.widths[i] - cw) / 2)
-		case .Right:
-			pad = max(0, c.widths[i] - cw)
-		}
-		plat.text_draw(gfx, text, cell, cx + f32(pad) * char_w, y, px, g_theme[.Text_Primary], .Doc)
-	}
-}
+// md_draw_table_row and md_col_x are GONE (2026-07-29). They were the second
+// producer of table cell geometry -- a row's glyphs placed from character cells at
+// the draw site, while the widths those cells came from were computed in
+// md_table_measure -- and that is precisely why a link inside a table cell could
+// not be given a rectangle. A table row's cells now go through the shaper
+// (plat.shape_columns, from md_layout_build's .Table case), so the glyph positions,
+// the wrap points, the column rules and the link rects all come out of one place.
+// The only thing this removal loses is the "│" glyph, replaced by a quad that can
+// span a wrapped row's full height.

@@ -4380,6 +4380,88 @@ CLAUDE.md (gitignored — will not appear in this commit).
 - **The persisted-temp-pointer use-after-free invariant** the growing arena introduces — documented in
   place, not enforced by anything; added to §5.
 
+## 6av. Four live-use defects in the new preview (2026-07-30, v0.32.0, branch `fix/preview-partial-blocks`)
+
+Wyatt's first real pass over batch 17's preview, all four reported with screenshots. Spec:
+[2026-07-29-preview-partial-blocks-design.md](docs/superpowers/specs/2026-07-29-preview-partial-blocks-design.md).
+
+### What broke, and why each was invisible to the suite
+
+**A block that did not fit was refused whole, so the pane showed emptiness.** A heading rendered, then
+~200px of blank; expanding the window **one pixel** made the entire following paragraph appear. Blocks
+were atomic because `md_block_fits`'s own comment says *"there is no scissor rect in this renderer… so
+the only way a block is not cut through the middle of its glyphs is for it not to be ADMITTED."* True for
+a one-line heading; wrong for a paragraph of N shaped lines, and a violation of CLAUDE.md's *"No frame
+ever shows emptiness."* The pre-batch-17 renderer admitted per source line and simply stopped
+mid-paragraph. Now it admits per shaped line, which the shaper already had the boxes for.
+
+**Preview tables ignored the measure entirely** and ran off the pane edge, because `md_layout_build`'s
+`case .Table` returned *before* the span-building section — so a table got no spans, no shaping, and
+nothing in its path knew the measure existed. Cells now wrap inside columns fitted to the measure, and a
+row's height is its tallest cell.
+
+**Clicking the preview in Split shifted the editor.** That was §9.1's click-to-sync working as designed;
+**binding it to a plain single press was the defect.** A single click is how people focus a pane. Moved to
+a double press. `mouse_count` turned out to be the *press index* within a double-click cluster, wrapping
+3→1 — not a gesture count.
+
+**"It's not respecting the spaces all the time"** was **none of the three things it looked like.** Runs of
+spaces do not collapse (the preview is *more* literal than CommonMark), indentation is preserved, and the
+shaper drops nothing — 0 space drops across 175 blocks. The real cause: `md_table_cols` was fed
+`text_char_width`, which rounds the mono advance to a whole pixel **for the editor's grid**, while table
+cells are laid out by the proportional shaper at the font's *real* advance. 8.0000 against 8.2471 at 16px,
+so every table cell at its natural width broke at its last space and dropped a word onto a second line.
+**The rounding error changes sign with document size** — which is exactly why `mdtest`'s `px_=24` table
+sections were all green while the shipped 16px default was broken. The new test sweeps sizes and asserts
+its own precondition that the sweep covers the broken side.
+
+### Found on the way
+
+**An `_` inside a word opened emphasis and ate itself.** `(stb_sprintf aside)` drew as
+`(stbsprintf aside)` and italicised the rest of the block. CommonMark specifies that `_` cannot open or
+close emphasis intraword — the asymmetry with `*` exists so identifiers survive — and this repo's own docs
+are full of snake_case. Fixed with a flanking test at the two `_` branches.
+
+### What this batch got wrong
+
+**A guard was armed for a predicted failure, and it fired.** Batch 17's review found that
+`md_kind_lines`' divisible set had to be *exactly* the kinds reaching `shaped_draw`, with nothing
+enforcing it, and predicted the failure verbatim: shaping table cells would make `.Table` reach
+`shaped_draw`, and if it were not simultaneously added to the divisible side a wrapped table would
+**silently render one line** while `mdtabletest` stayed green. A deferred panic was added for exactly that.
+The tables task then hit it. **This is the first time a predicted-and-guarded failure was caught by its own
+guard rather than by a user** — worth repeating as a technique.
+
+**Two more vacuous tests, both proven by sabotage rather than argument.** The per-line task shipped a
+thumb that pinned at its 24px floor for the whole traversal of a paragraph taller than the pane and then
+snapped — nothing in the suite read `thumb_h`. And the tables task's entire column-alignment section
+rejected nothing: neither fixture row actually wrapped, so the assertion reading *"though one row's other
+cell wraps"* compared two identical one-line rows, and a real "columns don't align" sabotage passed green.
+**That is eight batches in a row where the draft test code was wrong**, and the recurring shape is the
+same: an assertion whose fixture does not reach the condition it names.
+
+**A report claimed a perf fixture change was reverted when it was not**, so a published baseline moved
+silently. `mdperftest` also had no threshold at all — it printed and unconditionally reported `0 failures`.
+It has one now.
+
+### Owed
+
+- **§9.2 item 6 asks for zebra rows in the preview table.** Still unimplemented, and the tables work
+  doubled down on per-column rules instead. Pre-existing, not introduced here.
+- **The oversize table fallback drops real columns as a first resort** — a >1 MB table is bounded to 4
+  columns at 16 cells, while the measured path squeezes toward 1 cell before dropping anything. The cheap
+  honest fix keeps the O(1) property: scan the entry row for its own cell count so the count is not
+  invented.
+- **`md_link_at` has no y bound**, and neither call site applies one, so a `forced` oversized block's link
+  rects stay clickable past the status bar. Found while reviewing the band changes; documented, not fixed.
+- **Every source line is its own `.Para`**, so two adjacent prose lines look like two paragraphs.
+  CommonMark joins them with a space at the break. **A design question, not a bug** — and the one remaining
+  reading of Wyatt's "spaces" report if the table fix turns out not to be what he saw.
+- **The intraword fix is a per-delimiter open/close test, not a delimiter stack.** An unmatched `_` opener
+  still leaks italics to the end of the block — the same pre-existing gap `*` has.
+- Partial table admission is correct but untested; `mdtabletest` still cannot fail for any
+  table-*rendering* reason at all.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
