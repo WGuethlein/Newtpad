@@ -326,6 +326,28 @@ were the priorities. Read P2 as the live list, with these amendments:
   radius of any future out-of-range bug from one splice to a saturated pass's worth. Not fixed here —
   the clamp belongs to whoever owns `replace_sel_raw`'s contract, not to the task that merely gave it
   more callers.
+- **~274 unchecked `make` calls on `context.temp_allocator` across the tree, all subject to the same
+  trap the resize crash used.** `#optional_allocator_error` silently drops the allocator error on every
+  one of them, so a genuine process-level out-of-memory anywhere else in a frame still produces a
+  zero-length slice fed to the next line, not a graceful degrade. §6au fixed the resize path's own
+  arena (which cannot refuse short of process OOM); it did not fix the shape everywhere. No plan to
+  audit all ~274 at once — the fix, if this is ever worth doing broadly, is a checked-alloc helper that
+  fails a frame instead of trapping it, applied where a reviewer next finds this shape.
+- **`markdown.odin:2154` passes `context.temp_allocator` as `shape_run`'s PERSISTENT allocator
+  argument** (the parameter is `allocator := context.allocator` at `shape.odin:184`, not a scratch
+  param). Benign today — only `.line_h` is read off the returned `Shaped`, the rest is discarded — but
+  `plat.shaped_free` called on a value built this way would `delete` temp-arena memory through the heap
+  allocator. Same shape as `shape.odin:397`, which indexes `boxes` allocated on `shape_spans`'
+  caller-supplied `allocator`, not a stray temp `make` inside `shape.odin` itself: whoever hands
+  `shape_spans`/`shape_run` a resize-scoped temp allocator and then persists or frees the result owns
+  this footgun. §6au.
+- **The growing resize arena (§6au) made a new invariant load-bearing that nothing enforces.**
+  `resize_temp_end` calls `arena_destroy`, which returns its block to the heap — unlike the old shared
+  `@(static)` buffer, which stayed mapped for the process's life. Any pointer that escapes a resize
+  repaint's temp arena and is dereferenced later is now a REAL use-after-free (freed, unmapped memory),
+  not a stale-but-readable value. Clear today: `Md_Layout`'s persisted fields are all on
+  `context.allocator` and `md_layout_free` deletes them through it. Audit-only, not enforced by any
+  assertion or type.
 
 Ranked. P0 = fix before building more; P1 = cheap correctness/cleanliness now; P2 = deferred but
 tracked.
@@ -4229,6 +4251,134 @@ product principle 5. A hand-rolled DEFLATE took that entry 262 KB → 3.1 KB, an
 - **Links inside markdown tables are not clickable.** Disclosed, with the right reason: a table row's
   glyphs are placed in character cells, so emitting rects today means a second producer of the same
   positions — the defect this batch exists to remove. Owed: route a table row through `shape_spans`.
+
+## 6au. The Split-resize crash, and the review that closed the gaps in the fix (2026-07-29, v0.31.1, branch `fix/split-resize-crash`)
+
+Wyatt's daily driver: drag the right window edge in markdown Split view and Newtpad died with
+`STATUS_ARRAY_BOUNDS_EXCEEDED` inside `plat.shape_spans`. §6at's shaper made every visible preview
+block rebuild on every width change (`measure` is part of the `Md_Layout` cache key), and `on_resize`
+ran that whole repaint on a **fixed 64 KB `mem.Arena`** over a **shared `@(static)` buffer**. Past the
+arena's end `make`'s `#optional_allocator_error` drops the allocator error, the caller gets a
+zero-length slice, and `shape.odin:246` indexes it. The fix — swap the fixed `mem.Arena` for a
+per-invocation, growing `runtime.Arena` (`resize_temp_begin`/`resize_temp_end`, `main.odin`) — is
+correct and genuinely cannot refuse short of process OOM. A review of that fix found four things
+needing a fix and two claims needing correction; this entry is that review closing out.
+
+### The test that documented the bug without preventing it
+
+`resizetemptest` compared demand against the *old* 64 KB constant, so it would go on passing whatever
+the new arena did — it never observed **growth**, the property the fix actually delivers. Proof: a
+reviewer sabotage restored a fixed 256 KB `mem.Arena` over a shared `@(static)` buffer (reinstating
+both original defects) and the suite stayed green. The test now also asks the allocator
+`resize_temp_begin` actually produces for `RESIZE_TEMP_BLOCK + 1` bytes in one request and asserts it
+succeeds — impossible on any fixed buffer, trivially true for a growing one. Sabotaged and confirmed:
+
+```
+  ok   the resize temp allocator refused nothing (0 refusals over 63 widths)
+  ok   one repaint outgrows v0.31.0's fixed 64 KB arena, so 1 is not vacuous (102865 > 65536)
+  ok   resize_temp_begin (growth probe) produced an allocator
+  FAIL a single 262145-byte request (RESIZE_TEMP_BLOCK + 1) succeeds -- impossible on any fixed-size buffer (err=Out_Of_Memory)
+resizetemptest: 1 failures
+```
+
+restored, and green again with `err=None`.
+
+### A failed `arena_init` used to permanently desync the swapchain
+
+`on_resize` returned before `plat.gfx_resize` whenever the arena failed to grow. v0.31.0 called
+`gfx_resize` unconditionally (its `arena_init` could not fail). `window.resized` is only set
+pre-callback (startup); once `main.odin` installs `on_resize`, nothing else ever re-syncs
+`gfx.width`/`gfx.height` to the window. Under memory pressure, an `arena_init` failing on the *last*
+`WM_SIZE` of a drag would leave the swapchain permanently mismatched with the window — content drawn
+outside the viewport, hit-tests disagreeing with the draw, until the next resize that happened to
+succeed. Fixed by hoisting `gfx_resize` above `resize_temp_begin`: `gfx_resize`/`gfx_create_rtv`
+allocate no Odin memory, so this is free and can no longer be the thing that fails.
+
+### A skipped test used to report success
+
+`rt_run` returned `0` on a missing fixture or a failed `headless_gpu_init`, so the mode printed
+`resizetemptest: 0 failures` with no `FAIL` token — a `Select-String -CaseSensitive "FAIL"` harness
+would record that as a pass. Any machine without the fixture, or without a D3D device (RDP, CI), got a
+permanent silent green on the one test guarding this crash. Same class as the fixture-below-
+`SEARCH_SYNC_MAX` incident (`docs/development-loop.md` §3). **Decision: a skip now fails loudly rather
+than passing silently** — both skip paths route through `rchk` with `ok=false`, so they print `FAIL
+... UNVERIFIED` and count against `bad`. Verified from a directory without the fixture:
+
+```
+resizetemptest:
+  FAIL could not open fixture -- resize regression UNVERIFIED (run from the repo root)
+resizetemptest: 1 failures
+```
+
+### Two claims the review corrected
+
+**The "one block" sizing claim was wrong.** `RESIZE_TEMP_BLOCK`'s comment said 256 KB covers "the
+measured 100.5 KB preview plus the rest of the frame in one block." Measured at a realistic pane
+height (the shipped harness pins pane height 900 and `UI_SCALE` 1, which cannot see this): the preview
+alone asks for **174.7 KB at 2100px** and **210.7 KB at 3200px**. The rest of the frame draws out of
+the same arena *before* the preview does, so the common case takes a **second** block, not one — 1–2
+mallocs per resize frame. The judgment call holds regardless: `arena_init(256 KB)` + `arena_destroy`
+measures **3.31 µs/frame** steady state (**6.41 µs** when a second block is taken) against 16,666 µs
+at 60 Hz — 0.02–0.04% of budget either way. Comment corrected in `main.odin`.
+
+**The "independent use-after-free from re-entrant `on_resize`" claim was not demonstrated.** The old
+comment stated as fact that a DPI change resizes the window from inside `on_dpi`, causing `WM_SIZE` to
+arrive nested with an outer `on_resize` still on the stack, and cited a comment line as if it were
+code proving it. It is not: `on_dpi` only calls `metrics_recompute` and `text_reset_atlas`; the
+`SetWindowPos` that actually resizes lives in `window.odin`'s `WM_DPICHANGED` handler and runs *after*
+`on_dpi` returns — so the real sequence is `WM_DPICHANGED → on_dpi (returns) → WM_SIZE → one
+on_resize`, not a nested one. The only message pump is `window_pump_events`, called only from the main
+loop, never from inside `render_frame`. A fault-stack review found exactly one `on_resize` frame. The
+aliasing bug in the old shared-`@(static)`-buffer design was real, and removing the static buffer
+closes it regardless of reachability — but the comment now says what is actually known: a closed
+latent defect, not a demonstrated crash mechanism. Hedged in `main.odin`.
+
+### The three trap sites, and what removing the static buffer changed about them
+
+All three ultimately trace to the same shape — an unchecked `make` past the arena's end returning a
+zero-length slice that the next line indexes — but they are not identical:
+
+1. `shape.odin:246` — the shipped crash. Indexes a `Span_Metrics` array built from an unchecked `make`.
+2. `shape.odin:397` — indexes `boxes`, which is allocated on the **caller-supplied** `allocator`
+   parameter to `shape_spans`, not a stray temp `make` inside `shape.odin` itself. Same shape, different
+   producer: whoever calls `shape_spans` with a resize-scoped temp allocator and then dereferences the
+   result owns this one.
+3. `markdown.odin:2154` — `plat.shape_run`'s **persistent** allocator argument is passed
+   `context.temp_allocator`, so a `Shaped`'s `glyphs`/`line_boxes` land on the resize arena. Benign
+   today (only `.line_h` is read), documented in place as the adjacent footgun it is.
+
+**A new invariant the growing arena creates, and nothing enforces it:** `resize_temp_end` calls
+`arena_destroy`, which returns the block to the **heap** — unlike the old shared `@(static)` buffer,
+which stayed mapped for the process's life. Any pointer that escapes a resize repaint's temp arena and
+is dereferenced later is now a **real** use-after-free (freed, unmapped memory), not a stale-but-
+readable value. Clear today — `Md_Layout`'s persisted fields are all on `context.allocator` and
+`md_layout_free` deletes them through it — but it is load-bearing and audit-only. Documented at the
+markdown.odin:2154 site.
+
+### The systemic residual, unfixed on purpose
+
+This batch fixed the resize path's OWN arena. It did not fix the shape everywhere: roughly 274 `make`
+calls across the tree run on `context.temp_allocator` with `#optional_allocator_error` silently
+discarding the result, unchecked. A genuine process-level OOM anywhere else in the frame still becomes
+a bounds trap identical in kind to the one this batch fixed — this batch narrowed the blast radius of
+*this* crash to zero, not the class of crash. Added to the §5 debt register.
+
+### Amending CLAUDE.md's Memory row
+
+The Memory row says *"Build arenas only if a measurement asks for them, and amend this row again when
+you do."* v0.31.0's fixed `mem.Arena` was itself an unamended arena that row would have forbidden —
+nobody amended it then, and that arena is what shipped the crash. `resize_temp_begin` needs its own
+arena because it must not share the main loop's: an outer frame may be mid-way through that one when
+`WM_SIZE` arrives. Measured (above): 174.7–210.7 KB real demand, 3.31–6.41 µs/frame cost. Amended in
+CLAUDE.md (gitignored — will not appear in this commit).
+
+### Owed
+
+- **The 274-unchecked-`make` exposure** (above) — added to §5.
+- **`markdown.odin:2154`'s temp-allocator-as-persistent-allocator footgun** — documented in place, not
+  fixed; added to §5.
+- **The persisted-temp-pointer use-after-free invariant** the growing arena introduces — documented in
+  place, not enforced by anything; added to §5.
 
 ## 7. Build environment (Windows, this machine)
 
