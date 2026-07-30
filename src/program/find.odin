@@ -13,6 +13,7 @@ import "core:mem"
 import "core:text/regex"
 import rx_common "core:text/regex/common"
 import rx_vm "core:text/regex/virtual_machine"
+import "core:strings"
 import "core:thread"
 import "core:unicode/utf8"
 import base "src:base"
@@ -378,6 +379,31 @@ active_buf :: proc(doc: ^Document) -> ^[dynamic]u8 {
 find_input_rune :: proc(doc: ^Document, r: rune) {
 	bytes, n := utf8.encode_rune(r)
 	append(active_buf(doc), ..bytes[:n])
+	if doc.find.field == 0 {find_query_changed(doc)}
+}
+
+// Ctrl+V into whichever field has focus. Pure over the clipboard's text so the
+// decision below can be driven headlessly -- the HWND read lives in the dispatch.
+//
+// ONE LINE ONLY, and this is a decision rather than a limitation. Both fields are
+// a single row of the find bar: there is no second row to draw a newline onto, so
+// pasting a multi-line clipboard would leave a query whose tail is invisible and,
+// in the search field, one that matches nothing on a line-oriented scan. The
+// first line is what a user copying a word out of the document meant, and it is
+// what VS Code's find box takes too. \r is dropped so a CRLF clipboard does not
+// leave a stray carriage return on the end of the query.
+//
+// Nothing is REPLACED: the paste appends at the end, exactly as find_input_rune
+// does. The fields have no caret and no selection of their own -- find_backspace
+// is the only other editor and it deletes from the end -- so an insertion point
+// would be a second, invisible model of a field that does not have one.
+find_paste :: proc(doc: ^Document, s: string) {
+	if doc == nil || !doc.find.active {return}
+	line := s
+	if i := strings.index_byte(line, '\n'); i >= 0 {line = line[:i]}
+	line = strings.trim_right(line, "\r")
+	if len(line) == 0 {return}
+	append(active_buf(doc), ..transmute([]u8)line)
 	if doc.find.field == 0 {find_query_changed(doc)}
 }
 

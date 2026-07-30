@@ -1743,6 +1743,188 @@ when NEWTPAD_TESTS {
 		// function fed the wrong input, or its answer read in the wrong space --
 		// and this row moved from the bottom of the window to the top earlier in
 		// this very release.
+		// The find/replace/filter bar is a TEXT FIELD, and every modified editor
+		// chord used to fall through resolve_key into the document behind it. The
+		// report was Ctrl+V (Wyatt, 2026-07-29): the clipboard landed in the
+		// viewport, which takes no keystrokes while the bar has focus, so it could
+		// not be taken back out without closing the bar first.
+		//
+		// Both halves are asserted, and the second is the one that matters:
+		//
+		//   1. the chord goes to the FIELD (the query grew, and by exactly the
+		//      pasted text), and
+		//   2. the DOCUMENT is untouched -- pt.length AND doc.modified. Length
+		//      alone would pass for a same-length replacement; `modified` alone
+		//      would pass for a paste into an already-dirty buffer. Neither can
+		//      pass with the old routing, which appends to the buffer and sets the
+		//      dirty flag on the way.
+		//
+		// The whole CLASS is driven, not just paste: Ctrl+X, Ctrl+Z, Ctrl+Y,
+		// Ctrl+Backspace and Alt+Up/Down are dispatched through the same path with
+		// a selection live and a real undo stack behind them, and each one has to
+		// leave the document byte-identical. And the fallback that must SURVIVE is
+		// asserted too (Ctrl+S, Ctrl+P, Ctrl+A, Ctrl+C, Ctrl+N, and both replace
+		// verbs), because "refuse everything" would pass part 2 and break the bar.
+		findtest_field_owns_editing_keys :: proc() -> (bad: int) {
+			fmt.println("--- the find bar owns its editing keys; the document is not written ---")
+			fk_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+
+			// --- part A: context resolution, pure over the keymap ---
+			//
+			// Every one of these resolved to the editor command in parentheses
+			// before the fix. .None means "the find bar swallows it", which is the
+			// right answer for a chord the field has no use for: doing nothing is
+			// not a data-loss path, and writing to an invisible caret is.
+			Blocked :: struct {
+				key:       plat.Key,
+				ctrl, alt: bool,
+				was:       Command_Id,
+			}
+			for b in ([]Blocked {
+					{.X, true, false, .Cut},
+					{.Z, true, false, .Undo},
+					{.Y, true, false, .Redo},
+					{.Backspace, true, false, .Delete_Word_Back},
+					{.Up, false, true, .Move_Line_Up},
+					{.Down, false, true, .Move_Line_Down},
+				}) {
+				got := resolve_key(b.key, b.ctrl, b.alt, .Find)
+				// The second half is what keeps this from being vacuous: it proves
+				// the EDITOR still binds that chord to that command, so a .None
+				// above is a refusal in the find context rather than a chord
+				// nobody ever bound. Asked through command_chord, which reads the
+				// same table resolve_key falls back to.
+				chord := fmt.tprintf("%s%s%s", "Ctrl+" if b.ctrl else "", "Alt+" if b.alt else "", key_name(b.key))
+				editor_has := command_chord(b.was) == chord
+				fk_chk(&bad, got == .None && editor_has, fmt.tprintf("Find: %s -> .None (editor still binds it to %v; got %v, chord %q)", chord, b.was, got, command_chord(b.was)))
+			}
+			fk_chk(&bad, resolve_key(.V, true, false, .Find) == .Find_Paste, fmt.tprintf("Find: Ctrl+V -> .Find_Paste (got %v)", resolve_key(.V, true, false, .Find)))
+			// Unmodified Delete never fell through (resolve_key's fallback needs
+			// ctrl or alt), and it must still not -- asserted so the claim in the
+			// bug report is checked rather than reasoned about.
+			fk_chk(&bad, resolve_key(.Delete, false, false, .Find) == .None, "Find: bare Delete -> .None")
+			// The fallback that has to survive.
+			Kept :: struct {
+				key:       plat.Key,
+				ctrl, alt: bool,
+				want:      Command_Id,
+			}
+			for k in ([]Kept {
+					{.S, true, false, .Save},
+					{.P, true, false, .Palette_Open},
+					{.A, true, false, .Select_All},
+					{.C, true, false, .Copy},
+					{.N, true, false, .Tab_New},
+					{.Enter, true, false, .Find_Replace_One},
+					{.Enter, true, true, .Find_Replace_All},
+				}) {
+				got := resolve_key(k.key, k.ctrl, k.alt, .Find)
+				fk_chk(&bad, got == k.want, fmt.tprintf("Find: %v still falls back to %v (got %v)", k.key, k.want, got))
+			}
+
+			// --- part B: drive the real dispatch and assert on the DOCUMENT ---
+			saved_clip, had_clip := plat.clipboard_get_text(nil, context.allocator)
+			defer if had_clip {
+				plat.clipboard_set_text(nil, saved_clip)
+				delete(saved_clip)
+			}
+			plat.clipboard_set_text(nil, "PASTED")
+
+			SRC :: "alpha\nbeta\ngamma\n"
+			a: App
+			defer app_destroy(&a)
+			d := new(Document)
+			d^ = doc_from_content(transmute([]u8)strings.clone(SRC), "", .UTF8)
+			app_add(&a, d)
+			app_activate(&a, 0)
+			wv: plat.Window
+			t: plat.Text
+			plat.text_load_faces(&t)
+
+			// A real undo stack, a real REDO stack and a real selection, so Ctrl+Z,
+			// Ctrl+Y and Ctrl+X below each have something to destroy. Without them
+			// all three would be no-ops and the "document unwritten" assertions
+			// would pass with the bug present -- which is the exact failure mode
+			// this suite has shipped before. Two inserts and one undo is the only
+			// arrangement that leaves both stacks non-empty at once.
+			doc_insert_text(d, transmute([]u8)string("X"))
+			doc_insert_text(d, transmute([]u8)string("Y"))
+			doc_undo(d)
+			d.modified = false
+
+			find_open(d, false)
+			d.filter = true // the surface Wyatt reported it on
+			for r in "beta" {find_input_rune(d, r)}
+			find_wait(d)
+			qlen0 := len(d.find.query)
+
+			// The selection is established AFTER the bar is open and the query has
+			// settled, so nothing in the find lifecycle can have collapsed it
+			// before Ctrl+X is driven. Asserted, not assumed: a collapsed selection
+			// makes Cut a no-op and every "document unwritten" line below would
+			// then pass with the bug present.
+			doc_select_all(d)
+			len0 := d.pt.length
+			fk_chk(
+				&bad,
+				len0 > len(SRC) && !d.modified && len(d.undo) > 0 && len(d.redo) > 0 && d.anchor != d.cursor,
+				fmt.tprintf("fixture: %d bytes, clean, undo %d redo %d, selection %d..%d", len0, len(d.undo), len(d.redo), d.anchor, d.cursor),
+			)
+
+			Drive :: struct {
+				key:       plat.Key,
+				ctrl, alt: bool,
+				name:      string,
+			}
+			for g in ([]Drive {
+					{.V, true, false, "Ctrl+V"},
+					{.X, true, false, "Ctrl+X"},
+					{.Z, true, false, "Ctrl+Z"},
+					{.Y, true, false, "Ctrl+Y"},
+					{.Backspace, true, false, "Ctrl+Backspace"},
+					{.Up, false, true, "Alt+Up"},
+					{.Down, false, true, "Alt+Down"},
+					{.Delete, false, false, "Delete"},
+				}) {
+				before := doc_debug_string(d)
+				cmd := resolve_key(g.key, g.ctrl, g.alt, .Find)
+				command_dispatch(cmd, plat.Key_Event{key = g.key, ctrl = g.ctrl, alt = g.alt}, &a, &wv, &t, 20)
+				after := doc_debug_string(d)
+				// Byte-for-byte, not just the length: Ctrl+X over a full selection
+				// followed by nothing else would change the length, but a same-size
+				// rewrite would not, and this catches both.
+				fk_chk(&bad, after == before && d.pt.length == len0 && !d.modified, fmt.tprintf("%v with the filter focused leaves the document unwritten (len %d, modified %v)", g.name, d.pt.length, d.modified))
+			}
+
+			// ...and the paste actually reached the field.
+			fk_chk(&bad, string(d.find.query[:]) == "betaPASTED", fmt.tprintf("Ctrl+V landed in the query (%q)", string(d.find.query[:])))
+			fk_chk(&bad, len(d.find.query) == qlen0 + 6, fmt.tprintf("query grew by exactly the pasted text (%d -> %d)", qlen0, len(d.find.query)))
+			find_wait(d)
+
+			// Multi-line clipboard: the first line only, and no stray CR. The bar
+			// is one row tall, so anything past the first line would be invisible.
+			clear(&d.find.query)
+			plat.clipboard_set_text(nil, "one\r\ntwo\r\nthree")
+			command_dispatch(.Find_Paste, plat.Key_Event{}, &a, &wv, &t, 20)
+			fk_chk(&bad, string(d.find.query[:]) == "one", fmt.tprintf("a multi-line paste takes the first line only (%q)", string(d.find.query[:])))
+			find_wait(d)
+
+			// The replace field is the other half of the same bar and takes the
+			// paste too -- Find_Paste writes whichever field has focus.
+			d.find.replace_mode = true
+			d.find.field = 1
+			plat.clipboard_set_text(nil, "REPL")
+			command_dispatch(.Find_Paste, plat.Key_Event{}, &a, &wv, &t, 20)
+			fk_chk(&bad, string(d.find.replace[:]) == "REPL", fmt.tprintf("Ctrl+V reaches the replace field too (%q)", string(d.find.replace[:])))
+			fk_chk(&bad, d.pt.length == len0 && !d.modified, "...and still without writing the document")
+			find_wait(d)
+			find_close(d)
+			return
+		}
+
 		findtest_replace_seam :: proc() -> (bad: int) {
 			fmt.println("--- the replace row's buttons: drawn == clickable ---")
 			rs_chk :: proc(bad: ^int, ok: bool, msg: string) {
@@ -1986,6 +2168,7 @@ when NEWTPAD_TESTS {
 			bad += findtest_replace_all()
 			bad += findtest_subst()
 			bad += findtest_replace_seam()
+			bad += findtest_field_owns_editing_keys()
 			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")
 			return true
 		}
@@ -22024,9 +22207,26 @@ when NEWTPAD_TESTS {
 				chk(&bad, resolve_key(.Escape, false, false, .Font) == .Font_Close, fmt.tprintf("Esc still closes the font page -> %v", resolve_key(.Escape, false, false, .Font)))
 				// The §6f fallbacks still work, and now carry the overlay's answer:
 				// a modified chord in find/menu/history resolves through .Editor.
-				chk(&bad, resolve_key(.K, true, false, .Find) == .Undo, fmt.tprintf("find falls back to the overlaid editor chord -> %v (want Undo)", resolve_key(.K, true, false, .Find)))
-				chk(&bad, resolve_key(.K, true, false, .Menu) == .Undo, fmt.tprintf("the menu falls back too -> %v", resolve_key(.K, true, false, .Menu)))
+				//
+				// A NON-mutating command, and that is the point rather than a
+				// detail: the find bar is a text field, and resolve_key refuses to
+				// fall a document-WRITING command back into it (find_fallback_writes_doc,
+				// commands.odin). This line used to bind ctrl+k to Undo and assert it
+				// reached find, which is the hole itself expressed as a passing test.
+				load("ctrl+k = Bookmark_Toggle\nenter = Undo\n")
+				chk(&bad, resolve_key(.K, true, false, .Find) == .Bookmark_Toggle, fmt.tprintf("find falls back to the overlaid editor chord -> %v (want Bookmark_Toggle)", resolve_key(.K, true, false, .Find)))
+				chk(&bad, resolve_key(.K, true, false, .Menu) == .Bookmark_Toggle, fmt.tprintf("the menu falls back too -> %v", resolve_key(.K, true, false, .Menu)))
 				chk(&bad, resolve_key(.Left, false, false, .Find) == .None, "unmodified keys still stay owned by find (Left)")
+				// ...and keys.txt cannot put the hole back. The refusal is on the
+				// COMMAND, applied after the overlay has answered, so binding a
+				// buffer writer to a fresh chord does not smuggle it into the field.
+				// The .Editor half is asserted alongside it: the overlay must still
+				// work in the document, or this would pass by the binding failing.
+				load("ctrl+j = Undo\nalt+j = Paste\n")
+				chk(&bad, resolve_key(.J, true, false, .Editor) == .Undo, fmt.tprintf("the overlay binds ctrl+j = Undo in the editor -> %v", resolve_key(.J, true, false, .Editor)))
+				chk(&bad, resolve_key(.J, true, false, .Find) == .None, fmt.tprintf("...but an overlaid Undo still cannot reach the find field -> %v (want None)", resolve_key(.J, true, false, .Find)))
+				chk(&bad, resolve_key(.J, false, true, .Editor) == .Paste, fmt.tprintf("the overlay binds alt+j = Paste in the editor -> %v", resolve_key(.J, false, true, .Editor)))
+				chk(&bad, resolve_key(.J, false, true, .Find) == .None, fmt.tprintf("...nor can an overlaid Paste -> %v (want None)", resolve_key(.J, false, true, .Find)))
 
 				// --- find-bar toggles are unified on Alt, matching VS Code -------------------
 				// Wyatt: "Alt+C/W work, I'm not sure about having some be Alt and some be
