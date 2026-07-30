@@ -17076,20 +17076,34 @@ when NEWTPAD_TESTS {
 					fmt.printfln("  %-4s %s", "ok" if ok else "FAIL", label)
 					if !ok {bad^ += 1}
 				}
+				fmt.println("resizetemptest:")
 				h: Headless_Gpu
 				if !headless_gpu_init(&h, 1400, 900, "resizetemptest") {
-					fmt.println("  (skipped: offscreen device init failed)")
-					return 0
+					// A skip is not a pass. This mode's whole job is to guard a shipped
+					// crash, so a machine with no D3D device (RDP, a headless CI runner)
+					// reporting "0 failures" would read as VERIFIED when nothing ran --
+					// same class as development-loop.md §3's fixture-below-
+					// SEARCH_SYNC_MAX incident, where a test that could never fail was
+					// mistaken for one that had passed. Route the skip through rchk so
+					// it prints FAIL and counts against `bad`: a case-sensitive
+					// `Select-String "FAIL"` harness has to stop on it, same as any
+					// other failure.
+					rchk(&bad, false, "offscreen device init failed -- resize regression UNVERIFIED on this run")
+					return
 				}
 				defer headless_gpu_destroy(&h)
 				doc: Document
-				if !rt_doc(&doc) {return 0}
+				if !rt_doc(&doc) {
+					// Same reasoning as above: rt_doc already explained itself on
+					// stderr, but the pass/fail line has to say UNVERIFIED, not nothing.
+					rchk(&bad, false, "could not open fixture -- resize regression UNVERIFIED (run from the repo root)")
+					return
+				}
 				defer doc_close(&doc)
 				saved_theme, saved_scale := g_theme, UI_SCALE
 				g_theme, UI_SCALE = theme_dark(), 1
 				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
 
-				fmt.println("resizetemptest:")
 				at := rt_anchor()
 				fmt.printfln("  %s, anchor=%d", RT_PATH, at)
 				meter := Rt_Meter{backing = context.allocator}
@@ -17124,6 +17138,32 @@ when NEWTPAD_TESTS {
 					meter.peak > 64 * 1024,
 					fmt.tprintf("one repaint outgrows v0.31.0's fixed 64 KB arena, so 1 is not vacuous (%d > %d)", meter.peak, 64 * 1024),
 				)
+				// The property neither check above can see: GROWTH. Both compare
+				// demand against the OLD 64 KB constant, so they go on passing
+				// unchanged if resize_temp_begin were reverted to any fixed buffer
+				// larger than what this sweep happens to demand -- which is exactly
+				// what a reviewer sabotage did (a 256 KB mem.Arena) and both checks
+				// above stayed green. Ask the allocator resize_temp_begin actually
+				// produces for one byte past its first block, directly. A fixed
+				// mem.Arena cannot satisfy this short of the block itself being
+				// unbounded; runtime.Arena takes a second heap block and it is
+				// impossible for this to fail short of process OOM.
+				grow_arena: runtime.Arena
+				grow_scratch, grow_ok := resize_temp_begin(&grow_arena)
+				rchk(&bad, grow_ok, "resize_temp_begin (growth probe) produced an allocator")
+				if grow_ok {
+					_, grow_err := mem.alloc_bytes(RESIZE_TEMP_BLOCK + 1, 1, grow_scratch)
+					rchk(
+						&bad,
+						grow_err == nil,
+						fmt.tprintf(
+							"a single %d-byte request (RESIZE_TEMP_BLOCK + 1) succeeds -- impossible on any fixed-size buffer (err=%v)",
+							RESIZE_TEMP_BLOCK + 1,
+							grow_err,
+						),
+					)
+					resize_temp_end(&grow_arena)
+				}
 				return
 			}
 
