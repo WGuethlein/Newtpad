@@ -5,6 +5,7 @@
 package main
 
 import "base:intrinsics"
+import "base:runtime"
 import "core:fmt"
 import "core:math"
 import "core:mem"
@@ -142,6 +143,83 @@ when NEWTPAD_TESTS {
 	headless_gpu_destroy :: proc(h: ^Headless_Gpu) {
 		plat.keys_ignore_physical(false)
 		plat.gfx_destroy(&h.gfx)
+	}
+
+	// An allocator that WRAPS the one under test and reports on it, for
+	// resizetemptest. Two jobs, and the second is what makes the test reportable:
+	//
+	//  - `demand`/`peak`: bytes asked for since the last Free_All. That is the
+	//    number a bump allocator has to be able to supply, so it is the honest
+	//    measure of what one repaint costs -- an arena never reuses the space a
+	//    `delete` gave back, so live-bytes accounting would flatter it.
+	//
+	//  - `fails`: requests the wrapped allocator refused, WITH the bytes served
+	//    from `backing` instead. Without the substitution the caller gets the
+	//    zero-length slice that `make`'s #optional_allocator_error hands back on
+	//    failure, indexes it, and the process dies on a bounds trap -- which is
+	//    the shipped crash, and useless as a test result. Substituting lets the
+	//    repaint finish so the count can be printed and asserted.
+	@(private = "file")
+	Rt_Meter :: struct {
+		wrapped: mem.Allocator, // the allocator on_resize installs
+		backing: mem.Allocator, // where a REFUSED request is served from instead
+		demand:  int,
+		peak:    int,
+		fails:   int,
+		subs:    [dynamic][]byte,
+	}
+
+	@(private = "file")
+	rt_meter_allocator :: proc(m: ^Rt_Meter) -> mem.Allocator {
+		return mem.Allocator{procedure = rt_meter_proc, data = m}
+	}
+
+	@(private = "file")
+	rt_meter_proc :: proc(
+		allocator_data: rawptr,
+		mode: mem.Allocator_Mode,
+		size, alignment: int,
+		old_memory: rawptr,
+		old_size: int,
+		loc := #caller_location,
+	) -> (
+		data: []byte,
+		err: mem.Allocator_Error,
+	) {
+		m := (^Rt_Meter)(allocator_data)
+		switch mode {
+		case .Alloc, .Alloc_Non_Zeroed, .Resize, .Resize_Non_Zeroed:
+			// The alignment padding a bump allocator would burn is part of the cost.
+			m.demand += mem.align_forward_int(size, max(alignment, 1))
+			m.peak = max(m.peak, m.demand)
+			data, err = m.wrapped.procedure(m.wrapped.data, mode, size, alignment, old_memory, old_size, loc)
+			if err == nil && (data != nil || size == 0) {return}
+			m.fails += 1
+			sub := mem.alloc_bytes(size, alignment, m.backing, loc) or_return
+			if m.subs == nil {m.subs = make([dynamic][]byte, 0, 64, m.backing)}
+			append(&m.subs, sub)
+			if (mode == .Resize || mode == .Resize_Non_Zeroed) && old_memory != nil && old_size > 0 {
+				mem.copy(raw_data(sub), old_memory, min(old_size, size))
+			}
+			return sub, nil
+		case .Free:
+			return m.wrapped.procedure(m.wrapped.data, mode, size, alignment, old_memory, old_size, loc)
+		case .Free_All:
+			for sub in m.subs {mem.free_bytes(sub, m.backing, loc)}
+			clear(&m.subs)
+			m.demand = 0
+			return m.wrapped.procedure(m.wrapped.data, mode, size, alignment, old_memory, old_size, loc)
+		case .Query_Features, .Query_Info:
+			return m.wrapped.procedure(m.wrapped.data, mode, size, alignment, old_memory, old_size, loc)
+		}
+		return
+	}
+
+	@(private = "file")
+	rt_meter_destroy :: proc(m: ^Rt_Meter) {
+		for sub in m.subs {mem.free_bytes(sub, m.backing)}
+		delete(m.subs)
+		m^ = {}
 	}
 
 	// No background job of this document's is still going to change what a frame
@@ -16851,6 +16929,257 @@ when NEWTPAD_TESTS {
 			tg_gap(&bad)
 			tm_marker(&bad)
 			fmt.printfln("tabseamtest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad resizetemptest` -- the shipped v0.31.0 crash: drag the right edge
+		// of the window while a markdown document is in Split view and Newtpad dies
+		// with STATUS_ARRAY_BOUNDS_EXCEEDED inside plat.shape_spans.
+		//
+		// The seam under test is WHICH TEMP ALLOCATOR a repaint runs on. There are
+		// two entries into render_frame -- the main loop, and on_resize from WM_SIZE
+		// during the OS's modal resize loop -- and they must hand it the same
+		// allocation semantics. on_resize gave it a 64 KB fixed mem.Arena instead.
+		// A resize repaint's temp appetite is not bounded by 64 KB and never was:
+		// changing the WIDTH changes `measure`, which is part of the Md_Layout cache
+		// key, so every visible block misses the cache and rebuilds, and every
+		// rebuild puts its draft spans, its string builder and shape_spans' own
+		// Span_Metrics array on the temp allocator. Past 64 KB the arena returns
+		// .Out_Of_Memory, `make`'s #optional_allocator_error drops it on the floor,
+		// and the caller gets a zero-length slice it goes on to index.
+		//
+		// `resizetemptest raw` reproduces the crash itself: it installs the old
+		// fixed arena and lets the trap fire, which on a debug build prints the
+		// index and the count. The default run is the regression test and does not
+		// crash -- see rt_run.
+		if os.args[1] == "resizetemptest" {
+			// THE document from the minidumps, and the position in it, both read out
+			// of the crash rather than chosen. Both dumps had ASCII in the integer
+			// registers -- rax "d-merge.", rcx " For an ", rdx "editor t", r8
+			// "ens, ext", r9 "ernal-ch", r10 "ange det", r11 "ction w" -- which is
+			// one contiguous stretch of research/newtpad-research-report.md at byte
+			// ~14000: "...reload-and-merge. For an editor this is table stakes:
+			// share-everything opens, external-change detection without pinning the
+			// file...". So the shaper was partway through THAT paragraph.
+			//
+			// It matters that it is that document and not a fixture. The blocks there
+			// are long wrapped paragraphs carrying inline bold and code, so one block
+			// drafts dozens of spans, and spans are what shape_spans' per-span
+			// Span_Metrics array is sized from. A short fixture never gets near the
+			// budget and the test would pass against the shipped bug.
+			RT_PATH :: "research/newtpad-research-report.md"
+			RT_BYTE :: 13950 // inside the paragraph the dumps died in
+			rt_doc :: proc(doc: ^Document) -> bool {
+				ok: bool
+				if doc^, ok = doc_open(RT_PATH); !ok {
+					fmt.eprintfln("  (skipped: could not open %s; run from the repo root)", RT_PATH)
+					return false
+				}
+				doc.kind = .Text
+				doc.md_mode = .Split
+				return true
+			}
+			// Md_Anchor.block is a BLOCK start, so snap to the line start at or before
+			// the byte the dumps point at rather than handing md_pass a mid-line offset.
+			rt_anchor :: proc() -> int {
+				src, err := os.read_entire_file_from_path(RT_PATH, context.allocator)
+				if err != nil {return 0}
+				defer delete(src)
+				i := min(RT_BYTE, len(src))
+				for i > 0 && src[i - 1] != '\n' {i -= 1}
+				return i
+			}
+			// One repaint of the preview pane at one window width, on whatever
+			// context.temp_allocator the caller installed. The width sweep IS the
+			// resize: `measure` is part of the Md_Layout cache key, so every new width
+			// misses every slot and rebuilds every visible block.
+			rt_paint :: proc(h: ^Headless_Gpu, doc: ^Document, winw, winh: f32, at: int) {
+				x0, x1, ytop, ybot, ok := md_pane_box(doc, winw, winh, 0.5)
+				if !ok {return}
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, doc, 24, x0, x1, ytop, ybot, Md_Anchor{at, 0})
+			}
+
+			// THE REPRODUCTION. `resizetemptest raw <bytes>` repaints once through
+			// v0.31.0's on_resize allocator -- a FIXED mem.Arena of <bytes>, never
+			// grown -- and either survives or dies exactly the way the shipped exe
+			// died. It exits 0 on survival so a caller can sweep the size.
+			//
+			// The size is a parameter and not the shipped 64 KB because the crash
+			// needs a NARROW coincidence, which is also why it took a live user to
+			// find it. Exhausting the arena is not enough on its own: within one
+			// md_layout_build the string builder and the draft-span array come FIRST
+			// and are the big requests, so once the arena is close to full they are
+			// what fails, `draft` stays empty, `e.shape` comes out zero-length, and
+			// shape_spans returns at its `total == 0` guard having never indexed
+			// anything. Every later block fails the same way. To reach the trap the
+			// arena has to still have room for one block's builder and draft, then run
+			// out on the small per-span Span_Metrics array inside shape_spans -- so
+			// only some fill levels crash, and a full-width sweep at 64 KB happens to
+			// miss. Sweep the size and the window is easy to find.
+			rt_raw :: proc(bytes: int, winw: f32, prefill: int) {
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, 1400, 900, "resizetemptest/raw") {return}
+				defer headless_gpu_destroy(&h)
+				doc: Document
+				if !rt_doc(&doc) {return}
+				defer doc_close(&doc)
+				saved_theme, saved_scale := g_theme, UI_SCALE
+				g_theme, UI_SCALE = theme_dark(), 1
+				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+				at := rt_anchor()
+				scratch := make([]u8, bytes)
+				defer delete(scratch)
+				// Exactly on_resize: a fresh fixed arena per WM_SIZE, installed as
+				// context.temp_allocator for the whole repaint.
+				arena: mem.Arena
+				mem.arena_init(&arena, scratch)
+				ctx := context
+				ctx.temp_allocator = mem.arena_allocator(&arena)
+				context = ctx
+				// The rest of the frame. render_frame draws the editor pane, the tab
+				// strip, the status bar and both scrollbars out of this SAME arena,
+				// and most of that happens before the preview pane -- so the preview
+				// never had the whole 64 KB, which is why the shipped size crashes in
+				// the field and survives a preview-only sweep here.
+				if prefill > 0 {_ = make([]u8, prefill, context.temp_allocator)}
+				rt_paint(&h, &doc, winw, 900, at)
+				context = ctx
+				fmt.printfln("raw %d bytes, winw=%.0f, prefill=%d: survived", bytes, winw, prefill)
+			}
+
+			// THE REGRESSION TEST, and it does not crash either way.
+			//
+			// It drives the REAL seam: a width sweep over a real document, repainting
+			// through the allocator resize_temp_begin installs -- the same call
+			// on_resize makes -- with Rt_Meter in between to count what that allocator
+			// refuses. Two assertions:
+			//
+			//   1. The resize temp allocator refuses NOTHING. This is the bug, stated
+			//      as a property: a repaint that cannot get its temp memory does not
+			//      degrade, it hands back zero-length slices that the next line
+			//      indexes.
+			//
+			//   2. One repaint's demand exceeds 64 KB. Measured and printed. This is
+			//      what keeps 1 honest -- with a document too small to pass 64 KB,
+			//      assertion 1 would go green against the shipped bug and prove
+			//      nothing. It is also why this test opens HANDOFF.md instead of a
+			//      string literal.
+			//
+			// What it deliberately does NOT assert: any particular arena size. A test
+			// pinned to 256 KB would pass the moment someone traded the growing arena
+			// back for a fixed buffer one size larger, which is the symptom fix.
+			rt_run :: proc() -> (bad: int) {
+				rchk :: proc(bad: ^int, ok: bool, label: string) {
+					fmt.printfln("  %-4s %s", "ok" if ok else "FAIL", label)
+					if !ok {bad^ += 1}
+				}
+				fmt.println("resizetemptest:")
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, 1400, 900, "resizetemptest") {
+					// A skip is not a pass. This mode's whole job is to guard a shipped
+					// crash, so a machine with no D3D device (RDP, a headless CI runner)
+					// reporting "0 failures" would read as VERIFIED when nothing ran --
+					// same class as development-loop.md §3's fixture-below-
+					// SEARCH_SYNC_MAX incident, where a test that could never fail was
+					// mistaken for one that had passed. Route the skip through rchk so
+					// it prints FAIL and counts against `bad`: a case-sensitive
+					// `Select-String "FAIL"` harness has to stop on it, same as any
+					// other failure.
+					rchk(&bad, false, "offscreen device init failed -- resize regression UNVERIFIED on this run")
+					return
+				}
+				defer headless_gpu_destroy(&h)
+				doc: Document
+				if !rt_doc(&doc) {
+					// Same reasoning as above: rt_doc already explained itself on
+					// stderr, but the pass/fail line has to say UNVERIFIED, not nothing.
+					rchk(&bad, false, "could not open fixture -- resize regression UNVERIFIED (run from the repo root)")
+					return
+				}
+				defer doc_close(&doc)
+				saved_theme, saved_scale := g_theme, UI_SCALE
+				g_theme, UI_SCALE = theme_dark(), 1
+				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+				at := rt_anchor()
+				fmt.printfln("  %s, anchor=%d", RT_PATH, at)
+				meter := Rt_Meter{backing = context.allocator}
+				defer rt_meter_destroy(&meter)
+				widths := 0
+				for w := f32(1400); w >= 900; w -= 8 {
+					// Exactly on_resize: a fresh arena from the one producer, per
+					// WM_SIZE, installed as context.temp_allocator for the repaint.
+					arena: runtime.Arena
+					scratch, ok := resize_temp_begin(&arena)
+					if !ok {
+						rchk(&bad, false, "resize_temp_begin failed")
+						return
+					}
+					meter.wrapped = scratch
+					ctx := context
+					ctx.temp_allocator = rt_meter_allocator(&meter)
+					context = ctx
+					rt_paint(&h, &doc, w, 900, at)
+					free_all(context.temp_allocator)
+					resize_temp_end(&arena)
+					widths += 1
+				}
+				fmt.printfln("  temp bytes ONE Split repaint asks for, peak over the sweep: %d (%.1f KB)", meter.peak, f32(meter.peak) / 1024)
+				rchk(
+					&bad,
+					meter.fails == 0,
+					fmt.tprintf("the resize temp allocator refused nothing (%d refusals over %d widths)", meter.fails, widths),
+				)
+				rchk(
+					&bad,
+					meter.peak > 64 * 1024,
+					fmt.tprintf("one repaint outgrows v0.31.0's fixed 64 KB arena, so 1 is not vacuous (%d > %d)", meter.peak, 64 * 1024),
+				)
+				// The property neither check above can see: GROWTH. Both compare
+				// demand against the OLD 64 KB constant, so they go on passing
+				// unchanged if resize_temp_begin were reverted to any fixed buffer
+				// larger than what this sweep happens to demand -- which is exactly
+				// what a reviewer sabotage did (a 256 KB mem.Arena) and both checks
+				// above stayed green. Ask the allocator resize_temp_begin actually
+				// produces for one byte past its first block, directly. A fixed
+				// mem.Arena cannot satisfy this short of the block itself being
+				// unbounded; runtime.Arena takes a second heap block and it is
+				// impossible for this to fail short of process OOM.
+				grow_arena: runtime.Arena
+				grow_scratch, grow_ok := resize_temp_begin(&grow_arena)
+				rchk(&bad, grow_ok, "resize_temp_begin (growth probe) produced an allocator")
+				if grow_ok {
+					_, grow_err := mem.alloc_bytes(RESIZE_TEMP_BLOCK + 1, 1, grow_scratch)
+					rchk(
+						&bad,
+						grow_err == nil,
+						fmt.tprintf(
+							"a single %d-byte request (RESIZE_TEMP_BLOCK + 1) succeeds -- impossible on any fixed-size buffer (err=%v)",
+							RESIZE_TEMP_BLOCK + 1,
+							grow_err,
+						),
+					)
+					resize_temp_end(&grow_arena)
+				}
+				return
+			}
+
+			if len(os.args) > 3 && os.args[2] == "raw" {
+				bytes, _ := strconv.parse_int(os.args[3])
+				winw := f32(1400)
+				if len(os.args) > 4 {
+					if w, wok := strconv.parse_f32(os.args[4]); wok {winw = w}
+				}
+				prefill := 0
+				if len(os.args) > 5 {prefill, _ = strconv.parse_int(os.args[5])}
+				rt_raw(bytes, winw, prefill)
+				return true
+			}
+			bad := rt_run()
+			fmt.printfln("resizetemptest: %d failures", bad)
 			return true
 		}
 

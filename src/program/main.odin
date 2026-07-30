@@ -2076,17 +2076,96 @@ on_dpi :: proc "contextless" (user: rawptr) {
 	plat.text_reset_atlas(rc.text)
 }
 
+// The FIRST block of a resize repaint's temp arena, and only the first: a
+// runtime.Arena takes another block from the heap when a request does not fit, so
+// this is a "how many mallocs" knob and never a correctness one. 256 KB is sized
+// against the preview pane's OWN demand, not the whole frame's: measured at a
+// realistic pane height (resizetemptest prints this), the preview alone asks for
+// 174.7 KB at 2100px and 210.7 KB at 3200px -- both under 256 KB individually, but
+// the rest of the frame (editor pane, tab strip, status bar, both scrollbars) draws
+// out of the SAME arena before the preview does, so the common case takes a SECOND
+// block, not one -- 1-2 mallocs per resize frame, not one. The corrected number
+// matters less than it looks: arena_init(256 KB) + arena_destroy measures 3.31
+// us/frame steady state (6.41 us when a second block is taken) against a 16,666 us
+// budget at 60 Hz -- 0.02-0.04% either way, so the size is not a performance knob
+// worth tuning further. The 900px-pane-height, UI_SCALE-1 harness this number comes
+// from cannot see either fact on its own; both were measured directly, not read off
+// resizetemptest's default sweep.
+RESIZE_TEMP_BLOCK :: 256 * 1024
+
+// The temp allocator a resize repaint runs on, and the ONE producer of it, so
+// resizetemptest exercises the allocator WM_SIZE actually installs rather than a
+// second copy of the same intent that has to agree with it.
+//
+// GROWING, and that is the whole fix. v0.31.0 used a fixed 64 KB mem.Arena over a
+// static buffer, which shipped the crash Wyatt hit: drag the right window edge in
+// markdown Split view and Newtpad died with STATUS_ARRAY_BOUNDS_EXCEEDED inside
+// plat.shape_spans. A repaint's temp appetite is not bounded by any constant and
+// never was -- changing the WIDTH changes `measure`, which is part of the
+// Md_Layout cache key, so every visible block misses the cache and rebuilds, and
+// every rebuild puts its draft spans, its string builder and shape_spans' own
+// Span_Metrics array on the temp allocator. Past the end of a fixed arena
+// mem.Arena returns .Out_Of_Memory; `make`'s #optional_allocator_error drops the
+// error, the caller gets a ZERO-LENGTH slice, and shape.odin:246 indexes it.
+// Nothing about that is specific to shape_spans -- it was simply the first
+// unchecked `make` past the 64 KB mark -- which is why the fix is here and not a
+// length guard there.
+//
+// Per-invocation, which also closes a LATENT second defect in the old code, though
+// this one was never demonstrated reachable and the comment used to overclaim that
+// it was. The old code re-ran `mem.arena_init` over one shared `@(static)` buffer on
+// every entry, so IF on_resize could ever re-enter itself -- e.g. a nested WM_SIZE
+// with an outer on_resize still on the stack -- the inner call would reset the
+// shared arena's offset to zero and hand out memory the outer call was still
+// holding. That is a real aliasing bug in the shared-buffer design, and removing
+// the static buffer removes it regardless of whether it was reachable. But
+// reachability was NOT shown: on_dpi (above) does not resize the window itself --
+// it only calls metrics_recompute and text_reset_atlas, and the SetWindowPos that
+// follows a DPI change lives in window.odin's WM_DPICHANGED handler, which runs
+// AFTER on_dpi returns, so that path is WM_DPICHANGED -> on_dpi (returns) -> WM_SIZE
+// -> one on_resize, not a nested one. The only PeekMessageW/DispatchMessageW pump is
+// window_pump_events, called only from the main loop, never from inside
+// render_frame. A fault-stack review found exactly one on_resize frame, not two. A
+// fresh arena per repaint is correct either way -- it just is not evidence of a
+// demonstrated crash, only of a closed latent one -- and costs one heap block per
+// resize frame: nothing against the render it is paying for.
+resize_temp_begin :: proc(arena: ^runtime.Arena) -> (a: mem.Allocator, ok: bool) {
+	if runtime.arena_init(arena, RESIZE_TEMP_BLOCK, context.allocator) != nil {return}
+	return runtime.arena_allocator(arena), true
+}
+
+resize_temp_end :: proc(arena: ^runtime.Arena) {
+	runtime.arena_destroy(arena)
+}
+
 // WM_SIZE calls this so the content re-renders live during a resize. It runs from
-// the "system" window proc (no Odin context) and uses a private scratch arena so
-// it never disturbs the main loop's temp allocator.
+// the "system" window proc (no Odin context) and uses a private growing arena so
+// it never disturbs the main loop's temp allocator (see resize_temp_begin).
 on_resize :: proc "contextless" (user: rawptr) {
 	context = diag_context()
 	rc := (^Render_Ctx)(user)
 	if rc.window.width <= 0 || rc.window.height <= 0 {return}
-	@(static) scratch: [64 * 1024]u8
-	arena: mem.Arena
-	mem.arena_init(&arena, scratch[:])
-	context.temp_allocator = mem.arena_allocator(&arena)
+	// Resize the swapchain and RTV FIRST, unconditionally, before anything that can
+	// fail. gfx_resize / gfx_create_rtv (gfx.odin) allocate no Odin memory, so this
+	// is free and cannot be the thing that fails below. It must not be gated on the
+	// arena: v0.31.0 called gfx_resize unconditionally because arena_init could not
+	// fail; now that it can, gating gfx_resize on `ok` would mean an arena failure on
+	// the LAST WM_SIZE of a drag leaves gfx.width/height stuck at the stale size
+	// permanently -- window.resized is only set pre-callback (startup, see
+	// window.odin's WM_SIZE handler), so no later WM_SIZE re-syncs it once this
+	// callback is installed, and every frame after draws a viewport that disagrees
+	// with the window: content outside the viewport, hit-tests that disagree with
+	// the draw (CLAUDE.md Shape B), until the next resize that happens to succeed.
 	plat.gfx_resize(rc.gfx, rc.window.width, rc.window.height)
+	arena: runtime.Arena
+	scratch, ok := resize_temp_begin(&arena)
+	// Out of memory before the repaint even starts: skip the CONTENT repaint this
+	// frame rather than run it on the main loop's arena, which an outer frame may be
+	// mid-way through. The swapchain is already correctly sized above, so the only
+	// cost of skipping here is one frame that does not repaint, not a desynced
+	// viewport. The OS sends another WM_SIZE for the next mouse position.
+	if !ok {return}
+	defer resize_temp_end(&arena)
+	context.temp_allocator = scratch
 	render_frame(rc, false) // immediate (allow-tearing) present: smooth live resize
 }
