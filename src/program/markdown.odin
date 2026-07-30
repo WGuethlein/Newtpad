@@ -2151,6 +2151,29 @@ md_layout_build :: proc(
 	// descent (Georgia's is 1.136 em), so the leading asked for above is a floor
 	// and not an answer. An empty block still owes one line.
 	e.h = e.sh.height
+	// FOOTGUN, not a bug today: shape_run's last argument is its PERSISTENT
+	// allocator (shape.odin:184), and this call passes context.temp_allocator for
+	// it -- so the returned Shaped's glyphs and line_boxes land on whatever temp
+	// arena is active, which during a resize repaint is resize_temp_begin's
+	// per-invocation arena. Benign here because only .line_h is read and the rest
+	// of the Shaped value is discarded; plat.shaped_free on a value built this way
+	// would `delete` temp-arena memory through the heap allocator instead. This is
+	// also the real mechanism behind the third trap site in the RESIZE_TEMP_BLOCK
+	// writeup above: shape.odin:397 indexes `boxes`, which is allocated on the
+	// CALLER-SUPPLIED allocator (shape_spans' `allocator` param), not on a stray
+	// temp `make` inside shape.odin itself -- so a caller that hands shape_spans a
+	// resize-scoped temp allocator and then persists the result has the exact same
+	// footgun as this line, just with the roles reversed.
+	//
+	// A second, load-bearing consequence of the growing-arena fix: resize_temp_end
+	// calls arena_destroy, which returns the block to the HEAP -- unlike the old
+	// shared @(static) buffer, which stayed mapped for the process's life. Any
+	// pointer that escapes a resize repaint's temp arena and gets dereferenced
+	// later is therefore now a REAL use-after-free (freed, unmapped memory) rather
+	// than a stale-but-still-readable value. Nothing here escapes: Md_Layout's
+	// persisted fields (e.store, e.shape, e.spans, e.boxes above) are all built on
+	// context.allocator and md_layout_free deletes them through the same, so this
+	// is clean today -- but it is an invariant nothing enforces, only audits.
 	if e.h <= 0 {e.h = plat.shape_run(gfx, t, " ", px, measure, lead, .Body, context.temp_allocator).line_h}
 	// h1 and h2 carry a rule (9.2 item 1). It is part of the block's OWN height,
 	// not decoration painted after it: a rule drawn at the block's bottom edge
