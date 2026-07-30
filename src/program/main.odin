@@ -1232,8 +1232,8 @@ ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool
 // callee would have accepted. Removing it: 0 failures across the suite.
 // Removing BOTH: exactly one of the three "gate:" rows that name a y bound
 // fails (the find bar, which is the only one genuinely above ytop); the status
-// bar and the empty-strip cases are refused by md_block_at_y's fit test
-// instead, whatever their assertion names say. Same shape the branch already
+// bar and the empty-strip cases are refused by the placement md_block_at_y reads
+// instead (md_place_next), whatever their assertion names say. Same shape the branch already
 // diagnosed and removed at md_layout_slot -- a guard crediting itself with a
 // fix (2026-07-29 review, F5).
 //
@@ -1653,17 +1653,24 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// canvas. So anything a content pass puts below doc_content_box's `bot`
 	// stays on screen sitting on top of the status bar. Two passes can still do
 	// that on purpose: doc_draw's partial last row, and markdown_draw's ONE
-	// remaining deliberate overhang -- the `forced` first block, spent once, so a
-	// pane too short for even one block shows something instead of nothing (see
-	// md_pass in markdown.odin).
+	// remaining deliberate overhang -- the `forced` first LINE, spent once, so a
+	// pane too short for even one line shows something instead of nothing (see
+	// md_block_admit in markdown.odin).
 	//
 	// The soft-wrap overhang that used to be listed here is gone: batch 17 lays
 	// the preview out in BLOCKS, and a block's height comes back from the shaper
 	// with its wrapped lines already in it (Md_Layout.h), so the admit test and
-	// the advance read the same number. So does a heading's -- md_block_fits
-	// takes the block's own height, which for h1/h2 includes its rule, so a
-	// heading that does not fit is not drawn at all rather than cut through the
-	// middle of its glyphs.
+	// the advance read the same number.
+	//
+	// 2026-07-29: admission is now per LINE within a block, not per block, because
+	// refusing a whole paragraph left up to a paragraph's height of blank pane
+	// under the last heading (Wyatt, live use) -- "no frame ever shows emptiness".
+	// That does NOT widen what overhangs this strip: a line is admitted only when
+	// its own bottom edge clears ybot, and the block's trailing decoration (an
+	// h1/h2 rule) belongs to its last line's bottom (md_line_bottom), so a heading
+	// whose rule will not fit still draws without the rule rather than painting it
+	// down here. The `forced` waiver above is the only thing that overhangs, and it
+	// is now one line rather than one whole block.
 	//
 	// Placed after every DOCUMENT pass (editor, grid, preview, both scrollbars,
 	// the caret) and before every CHROME pass -- the horizontal scrollbar sits

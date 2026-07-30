@@ -1303,7 +1303,7 @@ md_run_color :: proc(run: Md_Run, base_col: [4]f32, mute: f32) -> [4]f32 {
 	return col
 }
 
-// Does a block whose TOP edge is `ytop` and whose height is `h` fit entirely
+// Does something whose TOP edge is `ytop` and whose extent is `h` fit entirely
 // above `ybot`?
 //
 // One expression, and its own procedure so a test can drive it without a
@@ -1312,13 +1312,109 @@ md_run_color :: proc(run: Md_Run, base_col: [4]f32, mute: f32) -> [4]f32 {
 // so the -px correction that turned a baseline into a row top has nothing left
 // to correct. The property it exists to protect is unchanged and is the reason
 // it is a named procedure at all: there is no scissor rect in this renderer
-// (clipping is the cover strip main.odin paints afterwards), so the only way a
-// block is not cut through the middle of its glyphs is for it not to be
-// ADMITTED. `h` must be the block's OWN height -- the number the shaper
-// produced -- never the body line height, which is the bug item 6 of the
-// 2026-07-29 regressions fixed and which the block model must not reintroduce.
+// (clipping is the cover strip main.odin paints afterwards), so the only way
+// GLYPHS are not cut through the middle is for them not to be ADMITTED.
+//
+// 2026-07-29, Wyatt's report: this used to be asked once per BLOCK, with `h` the
+// block's own height, and the admit site refused the whole block. That is right
+// for a heading -- one line, fits or does not -- and wrong for a paragraph,
+// which since batch 17 is an arbitrary number of shaped lines: a pane with room
+// for four of a paragraph's five lines showed a heading and then 200px of blank.
+// So the question is now asked once per LINE, `h` is md_line_bottom's answer,
+// and md_block_admit is the only place that asks it. A single-line block, and
+// every kind the shaper did not place, reduces to exactly the old call (see
+// md_block_lines), which is why no other kind's behaviour moved.
 md_block_fits :: #force_inline proc(ytop, h, ybot: f32) -> bool {
 	return ytop + h <= ybot
+}
+
+// Is this kind's height a stack of independently admissible SHAPED lines?
+//
+// False for everything the shaper did not place: a rule, a fence's open/close
+// padding strip and a table row are one indivisible band, and the front-matter
+// card is drawn whole (md_draw_front_matter paints its frame and all its rows in
+// one call, so there is no line to stop at). A Blank block has no height at all.
+// Those kinds keep whole-block admission, and md_block_lines returning 1 for
+// them is what makes that literally the same test they had before.
+@(private = "file")
+md_kind_lines :: #force_inline proc(k: Md_Kind) -> bool {
+	switch k {
+	case .Para, .Heading, .Quote, .List, .Fence_Body:
+		return true
+	case .Blank, .Rule, .Fence_Open, .Fence_Close, .Table, .Front_Matter:
+		return false
+	}
+	return false
+}
+
+// How many independently admissible lines a block has. Never zero: a kind the
+// shaper did not place is ONE line whose bottom is the block's own height, so
+// md_block_admit degenerates to a single md_block_fits call for it.
+@(private = "file")
+md_block_lines :: #force_inline proc(lay: ^Md_Layout) -> int {
+	if lay == nil || !md_kind_lines(lay.cls.kind) {return 1}
+	return max(1, len(lay.sh.line_boxes))
+}
+
+// The bottom edge of visual line `l`, as an offset from the block's own top.
+//
+// THE last line's bottom is the block's `h`, not its line box's -- a block's
+// trailing decoration lives in the gap between the two (an h1/h2 rule is inside
+// Md_Layout.h, added after the shaper's height). Reading the line box there
+// would admit a last line whose rule then paints one row below what the admit
+// test budgeted for, which on the pane's last block is a hairline on the status
+// bar: the exact shape of item 6 of the 2026-07-29 regressions. It also keeps
+// `whole` and `md_block_fits(y, lay.h, ybot)` the same predicate, so a
+// single-line heading is admitted on precisely the terms it was before.
+@(private = "file")
+md_line_bottom :: #force_inline proc(lay: ^Md_Layout, l: int) -> f32 {
+	if lay == nil {return 0}
+	if l >= md_block_lines(lay) - 1 {return lay.h}
+	return lay.sh.line_boxes[l].top + lay.sh.line_boxes[l].h
+}
+
+// How much of one block a pane admits.
+//
+// `lines` is how many of its visual lines were admitted (0 == none: the block is
+// refused), `h` the height those lines occupy from the block's top, and `whole`
+// says the block has nothing left to reveal -- which is what lets the pass
+// advance past it and continue to the next.
+//
+// File-private on purpose: the only producer is md_block_admit and the only route
+// to it is md_place_next, so a value of this type outside this file would mean a
+// second answer to "what is on screen" existed.
+@(private = "file")
+Md_Admit :: struct {
+	lines: int,
+	h:     f32,
+	whole: bool,
+}
+
+// THE per-line admit rule, and its only expression.
+//
+// One producer, because a per-line draw with a per-block hit-test is CLAUDE.md's
+// "a correct function fed the wrong input" by construction -- HANDOFF 6j counts
+// sixteen instances of that shape. md_place_next is the only caller, and
+// md_pass's draw and md_block_at_y's click map both consume md_place_next, so
+// the ink and the click cannot be answering two different questions.
+//
+// `forced` is the first block's waiver, narrowed by this change from the whole
+// block to its first LINE: a pane too short for even one line still shows one
+// ("no frame ever shows emptiness" outranks the cover strip's trim), but a pane
+// too short for a five-line paragraph no longer draws all five and lets the
+// strip eat four.
+@(private = "file")
+md_block_admit :: proc(lay: ^Md_Layout, y, ybot: f32, forced: bool) -> (a: Md_Admit) {
+	n := md_block_lines(lay)
+	for l in 0 ..< n {
+		if !md_block_fits(y, md_line_bottom(lay, l), ybot) {break}
+		a.lines = l + 1
+	}
+	if a.lines == 0 && forced {a.lines = 1}
+	if a.lines == 0 {return}
+	a.whole = a.lines >= n
+	a.h = lay.h if a.whole else md_line_bottom(lay, a.lines - 1)
+	return
 }
 
 // --- UI spec 9.1, the block/span model --------------------------------------
@@ -2528,6 +2624,79 @@ md_anchor_walk :: proc(c: ^Md_Scroll_Ctx, block: int, limit_h: f32, out: []Md_Wa
 	return
 }
 
+// One block as a pane PUT IT ON SCREEN: the walk entry, the client y its top
+// landed at, and how much of it the pane admitted.
+@(private = "file")
+Md_Placed :: struct {
+	blk:   Md_Walk_Block,
+	y:     f32,
+	admit: Md_Admit,
+	// Wholly above ytop -- a zero-height anchor (a blank run), or an anchor whose
+	// px invariant an edit broke underneath it. Reported as PASSED rather than
+	// painted into the chrome, and it does not spend the first block's waiver:
+	// that belongs to the first block with something to show.
+	above: bool,
+}
+
+// The state of one pane's placement walk. See md_place_next.
+@(private = "file")
+Md_Placer :: struct {
+	blocks:         []Md_Walk_Block,
+	i, n:           int,
+	y0, ytop, ybot: f32,
+	forced:         bool,
+	done:           bool,
+}
+
+@(private = "file")
+md_placer :: proc(blocks: []Md_Walk_Block, idx, n: int, y0, ytop, ybot: f32) -> Md_Placer {
+	// `forced` starts true: the very first block with something to show is
+	// admitted whatever the pane's height. See md_block_admit.
+	return {blocks = blocks, i = idx, n = n, y0 = y0, ytop = ytop, ybot = ybot, forced = true}
+}
+
+// THE producer of "what this pane has on screen", stepped one block at a time.
+//
+// md_pass PAINTS exactly what this returns and md_block_at_y MAPS exactly what
+// this returns -- neither has an admit test of its own, and neither may grow one.
+// Before 2026-07-29 they each ran their own copy of the loop against
+// md_block_fits, and md_block_at_y's comment said in as many words that it
+// existed to "mirror md_pass's own fit test". That mirror was survivable only
+// while admission was per-BLOCK and both copies read one number; with per-line
+// admission a drifted copy means a click naming a block whose lines the pane
+// never painted, which is CLAUDE.md's one-layout-per-widget rule ("no procedure
+// may both compute a coordinate and consume it") stated for the preview's
+// blocks. So the loop itself is the shared thing, not just the predicate.
+//
+// Iterator rather than an out-slice because a second MD_WALK_BLOCKS array per
+// call is real temp-arena traffic three times a frame, and because a caller that
+// receives blocks one at a time cannot accidentally look past the one the pane
+// stopped at.
+@(private = "file")
+md_place_next :: proc(p: ^Md_Placer) -> (out: Md_Placed, ok: bool) {
+	if p == nil || p.done || p.i >= p.n {return}
+	b := p.blocks[p.i]
+	y := p.y0 + b.slot_top + b.gap
+	if y + b.h <= p.ytop {
+		p.i += 1
+		return Md_Placed{blk = b, y = y, above = true, admit = {lines = md_block_lines(b.lay), h = b.h, whole = true}}, true
+	}
+	// The ONE consumer pair of the height the layout produced: this test and the
+	// walk's own advance. Nothing else may size this block.
+	a := md_block_admit(b.lay, y, p.ybot, p.forced)
+	if a.lines == 0 {
+		p.done = true
+		return
+	}
+	p.forced = false
+	// A partially admitted block is the LAST thing on screen: there is no room
+	// below its unadmitted lines for anything else, and the pass must not report
+	// having finished it. Stop here.
+	if !a.whole {p.done = true}
+	p.i += 1
+	return Md_Placed{blk = b, y = y, admit = a}, true
+}
+
 // One walk over the visible blocks, consumed by the draw and by the link pass.
 //
 // There is exactly ONE of these because the two consumers must not be able to
@@ -2581,31 +2750,28 @@ md_pass :: proc(
 	// is this plus the walk's own relative offsets -- one origin, so a block's
 	// draw y and its link rect's y cannot be two different numbers.
 	y0 := ytop - at.px - (blocks[idx].slot_top if n > 0 else 0)
-	// The very first block is admitted unconditionally. A pane shorter than one
-	// h1 is reachable (the window floor is 240dp and the document font size is a
-	// user setting), and "no frame ever shows emptiness" outranks a heading whose
-	// bottom edge the cover strip trims. Spent once.
-	forced := true
 	// From the anchor, not from the walk's start: the blocks before `idx` are the
-	// run-up, and they exist only so the anchor's gap is right.
-	for i in idx ..< n {
-		b := blocks[i]
-		y := y0 + b.slot_top + b.gap
-		// Wholly above the pane: a zero-height anchor (a blank run), or an anchor
-		// whose px invariant an edit has broken underneath it. Reported as passed
-		// rather than drawn into the chrome, and it does NOT spend `forced` -- that
-		// belongs to the first block with something to show.
-		if y + b.h <= ytop {
-			bottom = b.end
+	// run-up, and they exist only so the anchor's gap is right. What is admitted
+	// is md_place_next's answer and nothing else -- see its header.
+	pl := md_placer(blocks, idx, n, y0, ytop, ybot)
+	for {
+		p, ok := md_place_next(&pl)
+		if !ok {break}
+		if p.above {
+			bottom = p.blk.end
 			continue
 		}
-		// The ONE consumer pair of the height the layout produced: this test and
-		// the walk's own advance. Nothing else may size this block.
-		if !forced && !md_block_fits(y, b.h, ybot) {break}
-		forced = false
-		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, b.lay, cx, x1, y)}
-		if links != nil {md_block_links(doc, b.lay, cx, y, links)}
-		bottom = b.end
+		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, p.blk.lay, cx, x1, p.y, p.admit)}
+		if links != nil {md_block_links(doc, p.blk.lay, cx, p.y, p.admit, links)}
+		// `bottom` advances only past a block that is FINISHED. A partially drawn
+		// block reports its own start (i.e. leaves `bottom` where the previous block
+		// left it), because lines of it the reader has never seen are not behind
+		// them. The preview scrolls in PIXELS (Md_Anchor{block, px}), so the pixel
+		// anchor is what advances into a partial block; `bottom` is read only by
+		// md_vscrollbar_geo's thumb height, and a thumb sized as though a paragraph
+		// were fully read is the same lie in a smaller font.
+		if !p.admit.whole {break}
+		bottom = p.blk.end
 	}
 	return
 }
@@ -3078,32 +3244,38 @@ md_block_at_y :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, y: f32) -> (start: int, o
 	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
 	n, idx := md_anchor_walk(c, a.block, a.px + c.pane, out)
 	if n == 0 {return}
-	// Mirror md_pass's own fit test (md_block_fits, same forced-first-block
-	// rule). md_anchor_walk's budget is a HEIGHT limit, not "did this block
-	// fit inside ybot", so a block that straddles the pane's bottom edge is
-	// walked (and cached) but never painted. Without this, a click in the
-	// blank strip below the last PAINTED block clamps onto that unpainted
-	// block instead of naming nothing -- the same "clamps to whatever the
-	// binary search's last entry is" shape the pane bound above exists to
-	// close off, just for a y still inside the pane.
+	// The blocks the pane PUT ON SCREEN come from md_place_next, the same
+	// procedure md_pass paints from -- not from a fit test written out again here.
+	// md_anchor_walk's budget is a HEIGHT limit, not "did this block fit inside
+	// ybot", so a block that straddles the pane's bottom edge is walked (and
+	// cached) but only partly painted; without consulting the placement, a click
+	// in the strip below the last PAINTED line clamps onto lines that were never
+	// drawn -- the same "clamps to whatever the binary search's last entry is"
+	// shape the pane bound above exists to close off, just for a y still inside
+	// the pane.
+	//
+	// This used to be a hand-written mirror of md_pass's loop, and its own comment
+	// said so. Under per-line admission a mirror is not survivable: the two copies
+	// would have to agree about how many LINES of the last block were painted, not
+	// just about one height. See md_place_next.
 	y0 := c.ytop - a.px - out[idx].slot_top
-	forced := true
-	last := idx - 1
-	for i in idx ..< n {
-		b := out[i]
-		by := y0 + b.slot_top + b.gap
-		if by + b.h <= c.ytop {
-			last = i
-			continue
-		}
-		if !forced && !md_block_fits(by, b.h, c.ytop + c.pane) {break}
-		forced = false
-		last = i
+	pl := md_placer(out, idx, n, y0, c.ytop, c.ytop + c.pane)
+	last: Md_Placed
+	cnt := 0
+	// The last placed block's index in `out`, for the binary search below: the
+	// placer walks `out` in order from `idx`, so this is idx + cnt - 1.
+	for {
+		p, ok := md_place_next(&pl)
+		if !ok {break}
+		last = p
+		cnt += 1
 	}
-	if last < idx {return}
+	if cnt == 0 {return}
 	rel := (y - c.ytop) + a.px + out[idx].slot_top // into the walk's own space
-	if rel >= out[last].slot_top + out[last].gap + out[last].h {return}
-	lo, hi := idx, last
+	// `admit.h`, not `blk.h`: the last block on screen may be a partial one, and
+	// the rows below its admitted lines hold nothing to click.
+	if rel >= last.blk.slot_top + last.blk.gap + last.admit.h {return}
+	lo, hi := idx, idx + cnt - 1
 	for lo < hi {
 		mid := (lo + hi + 1) / 2
 		if out[mid].slot_top <= rel {lo = mid} else {hi = mid - 1}
@@ -3124,9 +3296,13 @@ md_block_at_y :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, y: f32) -> (start: int, o
 md_block_origin :: #force_inline proc(lay: ^Md_Layout, cx: f32) -> f32 {return cx + lay.indent}
 
 @(private = "file")
-md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, out: ^[dynamic]Md_Link_Hit) {
+md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, ad: Md_Admit, out: ^[dynamic]Md_Link_Hit) {
 	x := md_block_origin(lay, cx)
 	for b in lay.boxes {
+		// A line the pane did not admit has no glyphs on screen, so it has no link
+		// either. Same `ad.lines` the draw filters its glyphs by, out of the same
+		// Md_Admit -- so an unpainted line cannot be clickable.
+		if b.line >= ad.lines {continue}
 		if b.span < 0 || b.span >= len(lay.spans) {continue}
 		sp := lay.spans[b.span]
 		if .Link not_in sp.style || len(sp.url) == 0 {continue}
@@ -3142,12 +3318,25 @@ md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, out: ^[dy
 	}
 }
 
-// Paint one laid-out block at (cx, ytop). Consumes the layout and produces no
-// geometry of its own beyond the decorations that are not text: every glyph
-// position comes from lay.sh, every span rectangle from lay.boxes.
+// Paint one laid-out block at (cx, ytop), as much of it as `ad` admitted.
+// Consumes the layout and produces no geometry of its own beyond the decorations
+// that are not text: every glyph position comes from lay.sh, every span
+// rectangle from lay.boxes.
+//
+// `ad` is md_block_admit's answer, handed down rather than recomputed here. Its
+// two consequences: `ad.h` is the height every FULL-WIDTH band this block paints
+// (a fence body's background, a quote's bars) must use, since the band may not
+// run past the last admitted line; and `ad.lines` is the line cutoff for the
+// glyphs and for every rectangle in lay.boxes. A band drawn to lay.h under a
+// partial admit is exactly the overhang the admit test exists to prevent.
 @(private = "file")
-md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32) {
+md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32, ad: Md_Admit) {
 	x := md_block_origin(lay, cx)
+	// The kinds that return inside this switch are the ones md_kind_lines calls
+	// indivisible, so md_block_lines is 1 for them, so an admitted one is always
+	// `whole` and ad.h == lay.h. They keep reading lay.h: it says "the block's own
+	// height", which for them is the truth, and swapping in ad.h would only
+	// obscure that they cannot be partial.
 	switch lay.cls.kind {
 	case .Blank:
 		return
@@ -3175,7 +3364,9 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		}
 		return
 	case .Fence_Body:
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop}, size = {x1 - cx, lay.h}, color = g_theme[.Md_Code_Bg]}})
+		// ad.h, not lay.h: a wrapped code line whose second half the pane refused
+		// must not have its background band painted below the glyphs that were.
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop}, size = {x1 - cx, ad.h}, color = g_theme[.Md_Code_Bg]}})
 	case .Quote:
 		// One bar per nesting level (9.2 item 7: "2px bar + 16px inset per
 		// level"), so a reply inside a reply is visibly deeper. The step comes
@@ -3184,7 +3375,9 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		// same number by construction and cannot drift from it (L2).
 		step := lay.indent / f32(max(1, lay.cls.level))
 		for d in 0 ..< lay.cls.level {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(sx(2), 2), lay.h}, color = g_theme[.Md_Quote]}})
+			// ad.h for the same reason the fence body's band uses it: the bar runs
+			// beside the quote's admitted lines, not past them.
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx + f32(d) * step, ytop}, size = {max(sx(2), 2), ad.h}, color = g_theme[.Md_Quote]}})
 		}
 	case .List:
 		lx := cx + lay.marker // md_layout_build's own number, not a second copy
@@ -3218,7 +3411,13 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	// from the shaper's own glyph positions. The inline-code background, the
 	// strike rule and the link underline are therefore the SAME geometry the
 	// link hit-test accepts; there is no second derivation anywhere.
+	//
+	// `b.line >= ad.lines` is the line cutoff. It is applied to every box loop
+	// here, to the glyphs through shaped_draw's own `lines` argument, and to the
+	// link rects in md_block_links -- all off the one `ad.lines`, so a refused line
+	// has neither ink nor decoration nor a hit rectangle.
 	for b in lay.boxes {
+		if b.line >= ad.lines {continue}
 		if b.span < 0 || b.span >= len(lay.spans) {continue}
 		sp := lay.spans[b.span]
 		bx, by := x + b.x, ytop + b.y
@@ -3230,7 +3429,7 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	}
 	colors := make([][4]f32, len(lay.spans), context.temp_allocator)
 	for s, i in lay.spans {colors[i] = s.color}
-	plat.shaped_draw(gfx, text, &lay.sh, lay.shape, x, ytop, g_theme[.Text_Primary], colors)
+	plat.shaped_draw(gfx, text, &lay.sh, lay.shape, x, ytop, g_theme[.Text_Primary], colors, ad.lines)
 	// Synthetic emphasis, only where a real face is missing. With Georgia loaded
 	// this never runs; on a machine whose body family ships no bold it is what
 	// keeps a heading from rendering at weight 400. The second pass draws ONLY
@@ -3246,9 +3445,10 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 				colors[i] = {0, 0, 0, 0}
 			}
 		}
-		if any {plat.shaped_draw(gfx, text, &lay.sh, lay.shape, x + hairline(), ytop, g_theme[.Text_Primary], colors)}
+		if any {plat.shaped_draw(gfx, text, &lay.sh, lay.shape, x + hairline(), ytop, g_theme[.Text_Primary], colors, ad.lines)}
 	}
 	for b in lay.boxes {
+		if b.line >= ad.lines {continue}
 		if b.span < 0 || b.span >= len(lay.spans) {continue}
 		sp := lay.spans[b.span]
 		if .Strike not_in sp.style {continue}
@@ -3260,7 +3460,12 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	// h1 and h2 carry a rule (9.2 item 1), on the LAST row of the block's own
 	// height -- md_layout_build already made room for it, so this consumes that
 	// height rather than reaching past it.
-	if lay.cls.kind == .Heading && md_head_rules(lay.cls.level) {
+	//
+	// `ad.whole` gates it, and md_line_bottom is why that is the right gate: the
+	// last line's admitted bottom IS lay.h, so a heading whose rule the pane cannot
+	// hold is not `whole` and the rule is not painted. A wrapped h2 with three of
+	// four lines on screen would otherwise get its rule under line three.
+	if ad.whole && lay.cls.kind == .Heading && md_head_rules(lay.cls.level) {
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {cx, ytop + lay.h - hairline()}, size = {x1 - cx, hairline()}, color = g_theme[.Md_Rule]}})
 	}
 }
