@@ -36,19 +36,6 @@ line between them adds nothing (blank runs are zero height, margins collapse). C
 lines into one paragraph with a space at the break. That is a design question, not a bug — ask before
 changing it.
 
-## An underscore inside a word opens emphasis, and is eaten
-
-**Found 2026-07-30** while reproducing the report above, in `research/newtpad-research-report.md` itself.
-The source says `(stb_sprintf aside)`; the preview draws `(stbsprintf aside)` **and italicises everything
-from there to the end of the block**. `md_inline` treats any `_` as an emphasis toggle, so a snake_case
-identifier in prose loses its underscore and flips the rest of the line into italics — every `_` after it
-toggles again, so the damage depends on how many the line has.
-
-CommonMark's rule is that `_` cannot open or close emphasis *inside* a word (left/right-flanking with the
-intraword exception); `*` can. Identifiers in prose are common in these docs, so this is worth fixing.
-`md_escapable` already covers the escaped case, so the fix is a flanking test at the two `_` branches,
-not new machinery.
-
 ## Ctrl+V with the filter bar open pastes into the document, not the filter
 
 **Reported 2026-07-29.** Wyatt: *"ctrl+V when the filter menu is open doesn't paste into the filter menu,

@@ -96,6 +96,107 @@ md_selftest :: proc() -> (bad: int) {
 		for r in runs {joined = strings.concatenate({joined, r.text}, context.temp_allocator)}
 		chk(&bad, joined == "C:\\temp\\file.txt", "a path keeps its backslashes")
 	}
+
+	// --- `_` cannot open/close emphasis intraword; `*` still can (found
+	// 2026-07-30 in research/newtpad-research-report.md itself: the source's
+	// "(stb_sprintf aside)" drew as "(stbsprintf aside)" with everything after
+	// it italicised, because md_inline treated every `_` as a toggle). These
+	// assert on the RENDERED RUNS (Md_Run, what markdown_draw actually draws),
+	// not just that classification changed, so a fix that reclassifies but
+	// still eats the byte would still fail here.
+	{
+		// The reported defect itself, first: the underscore must survive
+		// AND nothing past it may end up italicised.
+		runs := md_inline("(stb_sprintf aside)")
+		joined := ""
+		any_ital := false
+		for r in runs {
+			joined = strings.concatenate({joined, r.text}, context.temp_allocator)
+			if r.ital {any_ital = true}
+		}
+		chk(&bad, joined == "(stb_sprintf aside)", "stb_sprintf keeps its underscore")
+		chk(&bad, !any_ital, "...and nothing after it is italicised")
+	}
+	{
+		// Multiple intraword underscores on one identifier: every one of them
+		// is a toggle candidate under the old code, so this is the case that
+		// showed the damage scales with underscore count.
+		runs := md_inline("snake_case_with_many_underscores")
+		joined := ""
+		any_style := false
+		for r in runs {
+			joined = strings.concatenate({joined, r.text}, context.temp_allocator)
+			if r.ital || r.bold {any_style = true}
+		}
+		chk(&bad, joined == "snake_case_with_many_underscores", "snake_case_with_many_underscores survives whole")
+		chk(&bad, !any_style, "...and none of it is styled")
+	}
+	{
+		// A standalone `_word_` is still real emphasis -- the fix must not
+		// disable `_` entirely, only intraword use of it.
+		runs := md_inline("_italic_")
+		chk(&bad, len(runs) == 1 && runs[0].text == "italic" && runs[0].ital, "_italic_ -> one italic run, no underscores")
+	}
+	{
+		// One-sided intraword: `_leading` is left-flanking-only (can open,
+		// can't close) and `trailing_` is right-flanking-only (can close,
+		// can't open). Neither has a partner in its own string, which is
+		// exactly the case the single-pass toggle (no delimiter stack) does
+		// not resolve correctly -- `_leading` still opens italics with
+		// nothing to close it, so the run past the word is left italicised.
+		// That is the documented limitation, not a second bug: a real
+		// CommonMark parser would leave an unmatched delimiter literal.
+		{
+			runs := md_inline("_leading")
+			chk(&bad, len(runs) == 1 && runs[0].text == "leading" && runs[0].ital,
+				"_leading (unmatched opener) opens italics per the flanking rule -- known single-pass limitation")
+		}
+		{
+			// `trailing_` alone: right-flanking only, and we are not already
+			// in italics, so it cannot close what was never opened -- stays
+			// literal. This is the case that must NOT regress to eating the
+			// underscore the way stb_sprintf did.
+			runs := md_inline("trailing_")
+			joined := ""
+			any_ital := false
+			for r in runs {
+				joined = strings.concatenate({joined, r.text}, context.temp_allocator)
+				if r.ital {any_ital = true}
+			}
+			chk(&bad, joined == "trailing_", "trailing_ (unmatched closer) keeps its underscore literal")
+			chk(&bad, !any_ital, "...and does not open italics")
+		}
+	}
+	{
+		// Regression guard: `*` intraword is UNCHANGED by the `_` fix.
+		// **bold** and *italic* still toggle mid-word, since `*` has no
+		// intraword restriction in CommonMark (only `_` does).
+		runs := md_inline("wo*rd* mid**bo**ld")
+		joined := ""
+		saw_ital, saw_bold := false, false
+		for r in runs {
+			joined = strings.concatenate({joined, r.text}, context.temp_allocator)
+			if r.ital {saw_ital = true}
+			if r.bold {saw_bold = true}
+		}
+		chk(&bad, joined == "word midbold", "*/** still toggle intraword (asterisks consumed)")
+		chk(&bad, saw_ital, "...*rd* still italicised")
+		chk(&bad, saw_bold, "...**bo** still bold")
+	}
+	{
+		// An escaped underscore is untouched by any of this -- md_escapable
+		// wins before the flanking test is even reached.
+		runs := md_inline("snake\\_case")
+		joined := ""
+		any_ital := false
+		for r in runs {
+			joined = strings.concatenate({joined, r.text}, context.temp_allocator)
+			if r.ital {any_ital = true}
+		}
+		chk(&bad, joined == "snake_case", "\\_ -> a literal underscore")
+		chk(&bad, !any_ital, "...and it does not open italics")
+	}
+
 	{
 		r1, d1, t1 := md_task("[ ] todo")
 		r2, d2, t2 := md_task("[x] done")
@@ -1105,6 +1206,42 @@ md_head_rules :: #force_inline proc(level: int) -> bool {return level == 1 || le
 @(private = "file")
 is_space :: proc(b: u8) -> bool {return b == ' ' || b == '\t'}
 
+// CommonMark's ASCII punctuation set, used only by the `_` flanking test
+// below. `*` doesn't need it -- `*` is allowed to open/close emphasis
+// mid-word, only `_` has the intraword restriction.
+@(private = "file")
+md_is_ascii_punct :: proc(b: u8) -> bool {
+	switch b {
+	case '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/',
+	     ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~':
+		return true
+	}
+	return false
+}
+
+// Whether the delimiter run s[start:end] (a run of `_` or `__`) can open
+// and/or can close emphasis, per CommonMark's left-/right-flanking rules
+// (spec 6.2). String boundaries count as whitespace. This is a single test,
+// not the full delimiter-stack algorithm -- see md_inline's `_` cases for
+// what that means in practice.
+@(private = "file")
+md_delim_flanks :: proc(s: string, start, end: int) -> (can_open, can_close: bool) {
+	before_ws := start == 0 || is_space(s[start - 1])
+	after_ws := end >= len(s) || is_space(s[end])
+	before_punct := !before_ws && start > 0 && md_is_ascii_punct(s[start - 1])
+	after_punct := !after_ws && end < len(s) && md_is_ascii_punct(s[end])
+	left_flank := !after_ws && (!after_punct || before_ws || before_punct)
+	right_flank := !before_ws && (!before_punct || after_ws || after_punct)
+	// _ can open only if left-flanking and (not right-flanking, or preceded
+	// by punctuation). _ can close only if right-flanking and (not
+	// left-flanking, or followed by punctuation). That asymmetric guard is
+	// exactly what keeps `_` out of the middle of a word like stb_sprintf
+	// while still letting `_italic_` and `snake_case_` (one-sided) work.
+	can_open = left_flank && (!right_flank || before_punct)
+	can_close = right_flank && (!left_flank || after_punct)
+	return
+}
+
 // Parse a line's inline content into styled runs. Small state machine: ** / __
 // bold, * / _ italic, ` code, [text](url) links. Non-nested (a link's label is
 // plain), which is enough for a preview.
@@ -1148,14 +1285,39 @@ md_inline :: proc(s: string, allocator := context.temp_allocator) -> []Md_Run {
 			flush(&out, &sb, bold, ital, false, strike)
 			strike = !strike
 			i += 2
-		case c == '*' && i + 1 < n && s[i + 1] == '*', c == '_' && i + 1 < n && s[i + 1] == '_':
+		case c == '*' && i + 1 < n && s[i + 1] == '*':
 			flush(&out, &sb, bold, ital, false, strike)
 			bold = !bold
 			i += 2
-		case c == '*' || c == '_':
+		case c == '_' && i + 1 < n && s[i + 1] == '_':
+			// `*` may toggle emphasis mid-word; `_` may not (CommonMark's
+			// intraword exception applies only to `_`). Without this test,
+			// any `_` in a snake_case identifier eats a character and flips
+			// every later `_` on the line into an emphasis toggle.
+			can_open, can_close := md_delim_flanks(s, i, i + 2)
+			if (bold && can_close) || (!bold && can_open) {
+				flush(&out, &sb, bold, ital, false, strike)
+				bold = !bold
+				i += 2
+			} else {
+				strings.write_byte(&sb, c)
+				strings.write_byte(&sb, s[i + 1])
+				i += 2
+			}
+		case c == '*':
 			flush(&out, &sb, bold, ital, false, strike)
 			ital = !ital
 			i += 1
+		case c == '_':
+			can_open, can_close := md_delim_flanks(s, i, i + 1)
+			if (ital && can_close) || (!ital && can_open) {
+				flush(&out, &sb, bold, ital, false, strike)
+				ital = !ital
+				i += 1
+			} else {
+				strings.write_byte(&sb, c)
+				i += 1
+			}
 		case c == '[':
 			// [label](url)
 			rb := strings.index_byte(s[i:], ']')
