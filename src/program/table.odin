@@ -22,10 +22,19 @@ TABLE_SAMPLE :: 500 // rows scanned once to fix the column widths
 
 // An empty cell reads as broken parsing (UI spec §10: "in the screenshot the
 // blank first column reads as broken parsing; a dash says 'empty, and we know
-// it'"). Drawn in Text_Dim, which is the one place in the app that role is used
-// on live content rather than a disabled control -- deliberately, because the
-// dash is not data: it is the absence of data, and it must not compete with the
-// cells that have some.
+// it'"). Drawn in Text_Muted, not the Text_Dim §10 names: Text_Dim is
+// theme.odin's disabled-only tier (2.9:1 Dark / 2.8:1 Light, below the AA
+// floor), justified by WCAG's disabled-control exemption because a disabled
+// control's dimness is "redundant with the control not responding" (§18). The
+// dash is not that. Its entire job is to distinguish "empty, and we parsed
+// it" from "missing / short row" -- the distinction group C's warning bar
+// exists to give the OTHER case -- so a reader who cannot resolve the dash at
+// 2.8:1 loses exactly the information it was added to convey. That is live
+// content, not a disabled control, and it is a deviation from §10's literal
+// text-dim call-out, recorded in HANDOFF.md §5. Text_Muted (4.9:1 / 5.4:1,
+// §1.1's "accelerators, help lines, hints" tier) clears AA and is still
+// quieter than every cell that holds real data, which is the property the
+// dash actually needs.
 //
 // An EMPTY cell only. A row with FEWER fields than the table has columns is a
 // different thing -- malformed, not empty -- and §10 gives that a warning bar on
@@ -458,7 +467,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 
 	// Pass 2: the cell text, column by column.
 	fg := g_theme[.Text_Primary]
-	dim := g_theme[.Text_Dim]
+	dim := g_theme[.Text_Muted] // TABLE_EMPTY_CELL's comment records why not Text_Dim
 	for col in cols {
 		tx := table_cell_text_x(col)
 		for row, r in vis {
@@ -514,16 +523,21 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	// ascenders can reach up into the header's band on a zoomed font.
 	//
 	// Line 0 is read every frame regardless of doc.top -- one bounded pt_read at
-	// offset 0, which is what "sticky" costs.
-	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top()}, size = {right, table_header_h(px)}, color = g_theme[.Bg_Raised]}})
-	// A 1px Border_Strong rule beneath it (§10). Border_Strong and not
-	// Border_Subtle: this is the one boundary in the grid now that the column
-	// rules are gone, and §1.1 names "table header rule" as what Border_Strong is
-	// for. hairline() so it stays one device pixel at 125%/150% instead of
-	// straddling two and rasterising blurry.
-	plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top() + table_header_h(px) - hairline()}, size = {right, hairline()}, color = g_theme[.Border_Strong]}})
-	{
-		head := table_header_fields(doc)
+	// offset 0, which is what "sticky" costs. Fetched FIRST and checked before
+	// anything is drawn (F9): table_header_fields returns nil for an empty
+	// document, and the band + rule used to be emitted unconditionally ahead of
+	// this check, so opening a zero-length .csv drew a bare 30px raised band with
+	// a rule over a page that had nothing else on it. Nothing to be sticky ABOVE
+	// is nothing to draw.
+	head := table_header_fields(doc)
+	if len(head) > 0 {
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top()}, size = {right, table_header_h(px)}, color = g_theme[.Bg_Raised]}})
+		// A 1px Border_Strong rule beneath it (§10). Border_Strong and not
+		// Border_Subtle: this is the one boundary in the grid now that the column
+		// rules are gone, and §1.1 names "table header rule" as what Border_Strong is
+		// for. hairline() so it stays one device pixel at 125%/150% instead of
+		// straddling two and rasterising blurry.
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top() + table_header_h(px) - hairline()}, size = {right, hairline()}, color = g_theme[.Border_Strong]}})
 		hy := table_header_baseline_y(px)
 		for col in cols {
 			if col.c >= len(head) {continue}

@@ -437,7 +437,15 @@ main :: proc() {
 			if ctx == .Menu && cmd != .None && !is_menu_cmd(cmd) {
 				menu_close(&app)
 			}
-			command_dispatch(cmd, ev, &app, window, &text, rows)
+			// srows, not rows: .Page_Up/.Page_Down (commands.odin) scroll by
+			// `rows - 1` and clamp against doc_max_top(rows) -- the vertical
+			// SCROLL MODEL's count, which is the grid's own budget in a grid and
+			// the editor's everywhere else (see doc_scroll_rows). Passing the
+			// editor's `rows` here reaches the grid every time a page key is
+			// pressed, which is the one route batch 18's srows split did not
+			// cover: the wheel and the scrollbar already went through
+			// doc_scroll_rows, and this call site still had the old rows.
+			command_dispatch(cmd, ev, &app, window, &text, srows)
 		}
 		window.key_count = 0
 
@@ -457,7 +465,9 @@ main :: proc() {
 				window.mouse_down = false
 			}
 			if chose {
-				palette_execute(&app, window, &text, rows)
+				// srows: the command palette can run Page Up/Down like any other
+				// command (see the keyboard dispatch above).
+				palette_execute(&app, window, &text, srows)
 				doc = app_active(&app)
 			}
 		}
@@ -472,7 +482,7 @@ main :: proc() {
 		// top edge, and an open dropdown overlaps the content.
 		if mcmd, consumed := menu_hit_test(&app, &text, window, f32(window.width), f32(window.height)); consumed {
 			if mcmd != .None {
-				command_dispatch(mcmd, {}, &app, window, &text, rows)
+				command_dispatch(mcmd, {}, &app, window, &text, srows)
 				doc = app_active(&app)
 			}
 		}
@@ -687,7 +697,7 @@ main :: proc() {
 		if window.mouse_pressed {
 			scw := plat.text_char_width(&text, UI_SMALL_PX)
 			if c := status_cell_at(doc, f32(window.width), f32(window.height), scw, f32(window.mouse_x), f32(window.mouse_y)); c != .None {
-				command_dispatch(c, {}, &app, window, &text, rows)
+				command_dispatch(c, {}, &app, window, &text, srows)
 			}
 		}
 		if f32(window.mouse_y) >= f32(window.height) - doc_bottom_bar_h(doc) {
@@ -715,9 +725,9 @@ main :: proc() {
 		// from the same layout the draw used (find_actions / find_toggles).
 		if window.mouse_pressed && doc.find.active {
 			if c := find_action_at(doc, &text, f32(window.width), f32(window.mouse_x), f32(window.mouse_y)); c != .None {
-				command_dispatch(c, {}, &app, window, &text, rows)
+				command_dispatch(c, {}, &app, window, &text, srows)
 			} else if c := find_toggle_at(doc, f32(window.width), f32(window.mouse_x), f32(window.mouse_y)); c != .None {
-				command_dispatch(c, {}, &app, window, &text, rows)
+				command_dispatch(c, {}, &app, window, &text, srows)
 			}
 		}
 		if f32(window.mouse_y) >= CHROME_TOP && f32(window.mouse_y) < CONTENT_TOP + TOP_INSET {

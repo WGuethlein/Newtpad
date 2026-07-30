@@ -348,6 +348,60 @@ were the priorities. Read P2 as the live list, with these amendments:
   not a stale-but-readable value. Clear today: `Md_Layout`'s persisted fields are all on
   `context.allocator` and `md_layout_free` deletes them through it. Audit-only, not enforced by any
   assertion or type.
+- **Deviation from the UI spec, decided in review (batch 18, F5): the table view's empty-cell em dash
+  is `Text_Muted`, not the `text_dim` §10 literally names.** `theme.odin` labels `Text_Dim` "DISABLED
+  ONLY — never live text" at 2.9:1 Dark / 2.8:1 Light, below the AA floor; §18 justifies that exemption
+  as WCAG's disabled-control exemption, "redundant with the control not responding." The dash is
+  neither disabled nor redundant — its entire job is to distinguish "empty, and we parsed it" from
+  "missing / short row," a distinction group C's warning bar exists to give the *other* case — so a
+  reader who cannot resolve the dash loses exactly the information it was added to convey. That is
+  live content. `table.odin`'s `TABLE_EMPTY_CELL` comment and `themetest`'s allowlist (`test_modes.odin`,
+  the `Text_Dim` guard) were both reverted to reflect this: the guard is back to 0 uses in `table.odin`,
+  same as every file without a genuinely disabled control. The one real exemption left in the tree is
+  `settings.odin`'s range-end guillemet, which is dim *because* it is a control that cannot be stepped
+  further — the case the WCAG exemption actually describes.
+
+  **This decision settles three sites, not one** — §10 also names `text_dim` for group B's row-number
+  gutter (not yet built) and §15 for the empty-tab hints (ditto). Both should follow the same reasoning
+  (a hint or a row number a reader cannot resolve is lost information, not a disabled affordance) unless
+  whoever builds them finds a reason the dash's argument doesn't transfer. Overturn here, in one place,
+  rather than re-litigating per site.
+- **Carried from batch 18 review (F4): scrolling or resizing while a table cell edit is open
+  desynchronises the edit box from the bytes it writes.** `doc.table_edit_row` is a *visible* row index
+  redrawn every frame; `table_edit_s`/`table_edit_e` are absolute byte offsets captured once, at
+  `table_edit_start`. The mouse wheel and `leave_table_view` commit the edit before they scroll (see
+  `table_edit_commit`'s call sites), but **the vertical scrollbar drag and Page Up/Down do not** — so
+  start editing row 0, drag the thumb down 20 rows, and the highlight box + caret are drawn over
+  whatever is now row 0 while the eventual commit still splices the original line. Pre-existing, not
+  introduced by F1/F2's fixes. **Task 4's row sort makes this strictly worse** (a sort can move the
+  edited row anywhere, not just off the top of the viewport by scrolling), so it belongs on that task's
+  brief rather than being fixed here in isolation.
+- **Carried from batch 18 review (F6): table zebra-band parity is viewport-anchored, so every
+  odd-row scroll inverts every band.** Documented and accepted as shippable in `table_draw`'s own
+  comment (parity by visible row index, not absolute file position, because the absolute index needs an
+  unbounded newline count from byte 0). The reviewer's correction, recorded for whoever builds group B:
+  **parity needs one bit, not a count.** `doc.top` only ever moves by known row deltas from a known-even
+  anchor (the wheel, the page keys, the scrollbar), so a parity bit maintained alongside `doc.top` costs
+  nothing and needs no walk from byte 0 — unlike group B's row-number gutter, which needs the real
+  absolute row number and *is* unbounded. Decide count-on-demand-with-a-cache vs. viewport-relative
+  numbering once, in group B, and let the zebra's parity ride on whichever it picks rather than solving
+  the cheaper problem twice.
+- **Carried from batch 18 review (F10): a header line longer than `RENDER_LINE_CAP` puts
+  `table_data_start` inside line 0**, so "data row 0" becomes the header's own tail instead of the
+  first real data line. The draw and the hit-test still agree (both read through `table_data_start`), so
+  this is not a wrong-row write — but `table_data_start` is the single normalisation point the wheel
+  routes `doc.top` through on both sides of a scroll (§10's group A design), so a capped offset becomes
+  a *persisted* scroll position rather than a one-frame glitch. Not fixed: `RENDER_LINE_CAP` headers are
+  not a real CSV shape, and the fix (an `exact` flag on `pt_line_end_cap`, matching the `line_cell_col`
+  entry above) is shared infrastructure, not table-specific.
+- **Two brittle assertions from batch 18's `tablegridtest`, flagged in review for whoever touches
+  their neighbourhood next:** `nnorm == 2` (the wheel-normalisation check) counts occurrences of the
+  literal substring `"table_data_start(doc)"` across the whole of `main.odin`, so any unrelated third
+  call site — added for any reason — fails the test with no connection to what it is meant to guard.
+  `nsep == 0` rejects *any* `Border_Subtle` use in `table.odin` on the theory that the column rules are
+  gone for good; group C's planned malformed-row bar is exactly the kind of addition that would trip it
+  for a reason unrelated to column rules reappearing. Neither is wrong today; both are counting
+  substrings as a proxy for an intent the count cannot actually distinguish from an unrelated match.
 
 Ranked. P0 = fix before building more; P1 = cheap correctness/cleanliness now; P2 = deferred but
 tracked.

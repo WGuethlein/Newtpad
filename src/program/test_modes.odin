@@ -8236,9 +8236,20 @@ when NEWTPAD_TESTS {
 					//    the bytes the hit-test returns -> the fixture's field.
 					//    Includes row 0 (the one the sticky header's height can
 					//    push wrong) and trows-1 (the last visible row).
+					//
+					//    The probe is table_row_baseline_y -- the GLYPH producer,
+					//    not table_row_rect_y (the band producer) -- because
+					//    those are two different procedures (table.odin's "ONE
+					//    producer" comment notwithstanding: there are two, one
+					//    for the band and one for the text) and a band-centre
+					//    probe cannot tell them apart. A full-row divergence
+					//    between the two (table_row_baseline_y silently computing
+					//    row r+1's y) still lands well inside row r's BAND, so it
+					//    passed here forever; it does not still land inside row
+					//    r's glyph baseline, which is the point.
 					mism := 0
 					for r in 0 ..< trows {
-						my := table_row_rect_y(px, r) + table_row_h(px) * 0.5
+						my := table_row_baseline_y(px, r)
 						for col in cols {
 							mx := table_cell_text_x(col) // the x the glyphs are drawn at
 							ok, rr, cc, fs, fe, _ := table_cell_at(&doc, mx, my, px, cw, trows, W)
@@ -8301,7 +8312,7 @@ when NEWTPAD_TESTS {
 					//    the last pixel of a cell belongs to it and the first
 					//    pixel of the next belongs to the next.
 					{
-						my := table_row_rect_y(px, 0) + table_row_h(px) * 0.5
+						my := table_row_baseline_y(px, 0)
 						cb := 0
 						for col, i in cols {
 							for probe, kind in ([]f32{col.x, col.x + col.w - 0.5}) {
@@ -8328,7 +8339,7 @@ when NEWTPAD_TESTS {
 						head := table_header_fields(&doc)
 						hok := len(head) == 3 && head[0] == "h0" && head[2] == "h2"
 						chk(&bad, hok, fmt.tprintf("scale %.2f: scrolled to line 4, the header still reads line 0 (%v)", scale, head))
-						my := table_row_rect_y(px, 0) + table_row_h(px) * 0.5
+						my := table_row_baseline_y(px, 0)
 						oks, _, _, fss, fes, _ := table_cell_at(&doc, table_cell_text_x(cols[0]), my, px, cw, trows, W)
 						w4, _ := want_field(lines[:], 4, 0)
 						chk(
@@ -8363,10 +8374,10 @@ when NEWTPAD_TESTS {
 				//    warning bar to the other (group C), so the two have to be
 				//    distinguishable at the seam, not just in the draw.
 				{
-					my5 := table_row_rect_y(px, 4) + table_row_h(px) * 0.5 // data row 4 = line 5, "a4,,c4"
+					my5 := table_row_baseline_y(px, 4) // data row 4 = line 5, "a4,,c4"
 					ok5, _, _, fs5, fe5, val5 := table_cell_at(&doc, table_cell_text_x(cols[1]), my5, px, cw, trows, W)
 					chk(&bad, ok5 && val5 == "" && fs5 == fe5, fmt.tprintf("an EMPTY cell is a real field: hit=%v val=%q zero-width=%v", ok5, val5, fs5 == fe5))
-					my8 := table_row_rect_y(px, 7) + table_row_h(px) * 0.5 // data row 7 = line 8, "a7,b7"
+					my8 := table_row_baseline_y(px, 7) // data row 7 = line 8, "a7,b7"
 					ok8, _, _, _, _, _ := table_cell_at(&doc, table_cell_text_x(cols[2]), my8, px, cw, trows, W)
 					chk(&bad, !ok8, "a MISSING cell on a short row is not a field at all")
 					// And the draw's own skip condition is reachable: the short
@@ -8466,6 +8477,24 @@ when NEWTPAD_TESTS {
 					doc.table = true
 				}
 
+				// 9b. F1: doc_scroll_rows existed and agreed with itself (check 9
+				//    above) while main.odin's keyboard/palette dispatch still
+				//    handed .Page_Up/.Page_Down the EDITOR'S rows -- a fourth
+				//    thing that has to hold the same number, on top of the wheel,
+				//    the bar and its drag. main.odin's frame loop has no message
+				//    pump here, so nothing short of a real WM_KEYDOWN could
+				//    exercise the wiring directly; a source count is what item 7's
+				//    nnorm check uses for the identical reason, and it is what is
+				//    left. The keyboard path and the command palette are the two
+				//    routes a user reaches a page key through.
+				{
+					src := #load("main.odin", string)
+					nkey := strings.count(src, "command_dispatch(cmd, ev, &app, window, &text, srows)")
+					npal := strings.count(src, "palette_execute(&app, window, &text, srows)")
+					chk(&bad, nkey == 1, fmt.tprintf("the keyboard path dispatches with the scroll model's count (%d matches for srows)", nkey))
+					chk(&bad, npal == 1, fmt.tprintf("...and so does the command palette (%d matches for srows)", npal))
+				}
+
 				// 10. A zoomed font can never make rows overlap. The design values
 				//    are floors, not fixed heights -- at 200% zoom the line box is
 				//    48px and a flat 26px row would draw every cell over its
@@ -8478,7 +8507,228 @@ when NEWTPAD_TESTS {
 				}
 				return
 			}
+
+			// F1, the mechanism itself: Page_Down through the REAL
+			// command_dispatch, not doc_scroll called directly -- 9b above only
+			// proves main.odin's SOURCE hands it the right variable, and a source
+			// count cannot tell whether commands.odin's .Page_Down case still does
+			// the right thing with it. Its own proc, sibling to tg(): a fixture
+			// Document (tg's) and an App (this one's) alive in the same frame at
+			// once is the exact shape that has hit STATUS_STACK_OVERFLOW twice
+			// before (see docs/development-loop.md), so this does not nest inside
+			// tg() itself.
+			tg_page :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (page-key check): no fonts loaded")
+					bad += 1
+					return
+				}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				BASE_PX = BASE_PX_96
+				px := BASE_PX_96
+
+				lines := [?]string {
+					"h0,h1", "a0,b0", "a1,b1", "a2,b2", "a3,b3", "a4,b4", "a5,b5",
+					"a6,b6", "a7,b7", "a8,b8", "a9,b9", "a10,b10", "a11,b11", "a12,b12", "a13,b13",
+				}
+				off: [len(lines) + 1]int
+				for l, i in lines {off[i + 1] = off[i] + len(l) + 1}
+				content := make([]u8, off[len(lines)]) // default allocator: app_destroy -> doc_close owns it
+				for l, i in lines {copy(content[off[i]:], transmute([]u8)l);content[off[i] + len(l)] = '\n'}
+
+				a: App
+				a.settings = settings_default()
+				dummy: plat.Window
+				d := new(Document)
+				d^ = doc_from_content(content, "pd.csv", .UTF8)
+				d.table, d.table_delim = true, ','
+				app_activate(&a, app_add(&a, d))
+				defer app_destroy(&a)
+				doc_update_top_inset(d)
+
+				line_h := line_height(px)
+				// Shorter than tg()'s TG_ROWS on purpose -- a second, independent
+				// fixture that also has to land on "the editor's count and the
+				// grid's genuinely differ", not a re-use of the same numbers.
+				PG_ROWS :: 8
+				H := table_rows_top(px) + f32(PG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+				trows := table_visible_rows(d, H, px)
+				erows := doc_visible_rows(d, H, line_h)
+				pre := trows == PG_ROWS && trows < len(lines) - 1
+				chk(&bad, pre, fmt.tprintf("precondition -- %d grid rows fit (want %d), %d data rows exist", trows, PG_ROWS, len(lines) - 1))
+				if !pre {return}
+				chk(&bad, erows != trows, fmt.tprintf("the editor's rows (%d) and the grid's (%d) differ here too", erows, trows))
+
+				mt_grid := doc_max_top(d, &t, trows)
+				mt_edit := doc_max_top(d, &t, erows)
+				chk(&bad, mt_grid != mt_edit, fmt.tprintf("...and the two ends of the file differ (%d vs %d)", mt_grid, mt_edit))
+
+				// Land at the grid's own bottom -- what the wheel leaves doc.top
+				// at -- then Page_Down through command_dispatch itself. With the
+				// grid's own row count (what main.odin passes post-fix) the view
+				// must stay put; with the editor's (what it passed before) this
+				// reproduces F1 exactly: the thumb at the bottom of the track and
+				// the next Page_Down walking it backwards.
+				d.top = mt_grid
+				command_dispatch(.Page_Down, {}, &a, &dummy, &t, trows)
+				right_top := d.top
+				chk(&bad, right_top == mt_grid, fmt.tprintf("Page_Down at the grid's bottom with the grid's row count stays put: top %d (want %d)", right_top, mt_grid))
+
+				d.top = mt_grid
+				command_dispatch(.Page_Down, {}, &a, &dummy, &t, erows)
+				wrong_top := d.top
+				chk(&bad, wrong_top != mt_grid, fmt.tprintf("...and reproduces F1 with the editor's row count instead: top %d -> %d", mt_grid, wrong_top))
+				return
+			}
+
+			// F3: §10's appearance -- the header fill, the rule's colour AND
+			// thickness, and the zebra's parity -- asserted on PIXELS from a real
+			// device, not a source count. A source count can only prove a colour
+			// role's NAME appears somewhere in table.odin; it cannot say which
+			// rows get banded or which pixel a rule actually lands on, and a
+			// reviewer changing all three at once (header fill, rule colour +
+			// thickness, zebra parity) left every existing mode green. Its own
+			// proc for the same stack-frame reason as tg_page.
+			tg_appearance :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				W, H :: 1000, 700
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, W, H, "tablegridtest/appearance") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return 0
+				}
+				defer headless_gpu_destroy(&h)
+
+				saved_theme, saved_scale := g_theme, UI_SCALE
+				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				BASE_PX = BASE_PX_96
+
+				// Four sentinel colours, maximally far apart in every channel, in
+				// place of the real theme's -- Table_Zebra is DELIBERATELY close
+				// to Bg_Base (table.odin's own comment: "judged against Bg_Base
+				// ... for the LACK of contrast"), which is exactly the row this
+				// check cares about and exactly the pair a small-tolerance pixel
+				// sample could confuse with rendering noise. Sentinels turn "is
+				// this pixel close to a near-identical neighbour" into "is this
+				// pixel exactly A, B, C or D", which is what makes a tight
+				// tolerance safe to use below. Real device, real quad pipeline,
+				// real table_draw -- only the theme's VALUES are substituted.
+				bg_s := [4]f32{0, 0, 0, 1} // Bg_Base -- the unbanded row / page
+				hdr_s := [4]f32{1, 0, 0, 1} // Bg_Raised -- the header fill
+				rule_s := [4]f32{0, 1, 0, 1} // Border_Strong -- the header rule
+				zeb_s := [4]f32{0, 0, 1, 1} // Table_Zebra -- the banded row
+				g_theme[.Bg_Base] = bg_s
+				g_theme[.Bg_Raised] = hdr_s
+				g_theme[.Border_Strong] = rule_s
+				g_theme[.Table_Zebra] = zeb_s
+
+				sample :: proc(buf: []u8, w, x, y: int) -> (b, g, r: u8) {
+					i := (y * w + x) * 4
+					return buf[i], buf[i + 1], buf[i + 2]
+				}
+				near :: proc(c: [4]f32, b, g, r: u8, tol: int) -> bool {
+					want := [3]u8{u8(c[2] * 255 + 0.5), u8(c[1] * 255 + 0.5), u8(c[0] * 255 + 0.5)}
+					return abs(int(b) - int(want[0])) <= tol && abs(int(g) - int(want[1])) <= tol && abs(int(r) - int(want[2])) <= tol
+				}
+				TOL :: 2 // solid quad fills, not glyphs: exact short of rounding
+
+				content := transmute([]u8)strings.clone("h0,h1\na0,b0\na1,b1\na2,b2\na3,b3\na4,b4\na5,b5\n")
+				doc := doc_from_content(content, "appear.csv", .UTF8)
+				defer doc_close(&doc)
+				doc.table, doc.table_delim = true, ','
+
+				px := BASE_PX_96
+				char_w := plat.text_char_width(&h.text, px, .Doc)
+				rows := table_visible_rows(&doc, f32(H), px)
+
+				plat.gfx_begin_frame(&h.gfx, bg_s[0], bg_s[1], bg_s[2])
+				table_draw(&h.gfx, &h.quads, &h.text, &doc, px, char_w, rows, f32(W))
+				buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				chk(&bad, ok, "the readback succeeded")
+				if !ok {return}
+
+				// x=2: left of the grid's own left inset (§10's cell padding
+				// starts the TEXT at x=10; the band itself tiles from x=0), so
+				// every sample below is a pixel no glyph in this draw ever
+				// touches, whatever the row's content is.
+				sx := 2
+
+				// 1. The header fill is Bg_Raised, not Bg_Panel (or anything
+				//    else) -- sampled comfortably inside the band, above the
+				//    rule.
+				hy := int(table_grid_top() + table_header_h(px) * 0.3)
+				hb, hg, hr := sample(buf, W, sx, hy)
+				chk(&bad, near(hdr_s, hb, hg, hr, TOL), fmt.tprintf("header band fill is Bg_Raised at (%d,%d): got bgr=(%d,%d,%d)", sx, hy, hb, hg, hr))
+
+				// 2. The rule is Border_Strong, and exactly hairline() pixels
+				//    thick -- a real hairline() call, not a second copy of the
+				//    constant, so a sabotage that changes the DRAWN thickness
+				//    (table.odin) diverges from what this still computes.
+				want_thick := int(hairline())
+				scan_top := int(table_grid_top() + table_header_h(px)) - want_thick - 3
+				scan_bot := int(table_grid_top() + table_header_h(px)) + 3
+				got_thick := 0
+				for yy in scan_top ..< scan_bot {
+					b, g, r := sample(buf, W, sx, yy)
+					if near(rule_s, b, g, r, TOL) {got_thick += 1}
+				}
+				chk(&bad, got_thick == want_thick, fmt.tprintf("header rule is %d px thick (want hairline() = %d)", got_thick, want_thick))
+
+				// 3. Zebra parity: row 0 (visible index 0, under the header) is
+				//    UNBANDED -- it reads the page background, Bg_Base -- and
+				//    row 1 is banded, Table_Zebra. table.odin's own comment
+				//    names the reason (row 0 sits directly under the header
+				//    rule), so this is the specific parity §10 asks for, not
+				//    just "alternating".
+				y0 := int(table_row_rect_y(px, 0) + table_row_h(px) * 0.3)
+				y1 := int(table_row_rect_y(px, 1) + table_row_h(px) * 0.3)
+				b0, g0, r0 := sample(buf, W, sx, y0)
+				b1, g1, r1 := sample(buf, W, sx, y1)
+				chk(&bad, near(bg_s, b0, g0, r0, TOL), fmt.tprintf("row 0 is unbanded (reads Bg_Base) at (%d,%d): got bgr=(%d,%d,%d)", sx, y0, b0, g0, r0))
+				chk(&bad, near(zeb_s, b1, g1, r1, TOL), fmt.tprintf("row 1 is banded (reads Table_Zebra) at (%d,%d): got bgr=(%d,%d,%d)", sx, y1, b1, g1, r1))
+
+				// 4. F9: a ZERO-LENGTH document draws nothing -- not a bare header
+				//    band over an empty page. table_header_fields(doc) returns nil
+				//    when doc.pt.length == 0, and that used to be checked AFTER
+				//    the band + rule quads were already emitted.
+				empty_content := make([]u8, 0)
+				edoc := doc_from_content(empty_content, "empty.csv", .UTF8)
+				defer doc_close(&edoc)
+				edoc.table, edoc.table_delim = true, ','
+				erows := table_visible_rows(&edoc, f32(H), px)
+				plat.gfx_begin_frame(&h.gfx, bg_s[0], bg_s[1], bg_s[2])
+				table_draw(&h.gfx, &h.quads, &h.text, &edoc, px, char_w, erows, f32(W))
+				ebuf, eok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				chk(&bad, eok, "the empty-document readback succeeded")
+				if eok {
+					eb, eg, er := sample(ebuf, W, sx, hy)
+					chk(&bad, near(bg_s, eb, eg, er, TOL), fmt.tprintf("an empty document draws no header band at (%d,%d): got bgr=(%d,%d,%d)", sx, hy, eb, eg, er))
+				}
+				return
+			}
+
 			bad := tg()
+			bad += tg_page()
+			bad += tg_appearance()
 			fmt.printfln("tablegridtest: %d failures", bad)
 			return true
 		}
@@ -17115,28 +17365,25 @@ when NEWTPAD_TESTS {
 					{"palette.odin", #load("palette.odin", string), 0, ""},
 					{"markdown.odin", #load("markdown.odin", string), 0, ""},
 					{"doc.odin", #load("doc.odin", string), 0, ""},
-					// The em-dash placeholder in an EMPTY cell (§10, which names
-					// text_dim for it explicitly). Allowed on the same argument
-					// that admits the guillemet below, not as an exception to it:
-					// the dash is not data, it is the ABSENCE of data made
-					// visible, and it is fully redundant with the blank cell it
-					// replaces -- so nothing is lost by a reader who cannot
-					// resolve it at 2.8:1, which is the property WCAG's
-					// disabled-control exemption actually turns on. It must also
-					// be quieter than every cell that does hold data, or the
-					// empties become the thing the eye lands on first in a sparse
-					// CSV; any tier above this one is louder than the data.
-					//
-					// A SECOND use in this file would not be that, and is what the
-					// count still refuses.
-					{"table.odin", #load("table.odin", string), 1, "the em dash in an empty cell"},
+					// table.odin used to carry an allowlist entry here for the
+					// em-dash placeholder in an EMPTY cell. Reverted (batch 18
+					// review, F5, see HANDOFF.md §5): the dash is not redundant
+					// with a disabled control not responding -- its entire job is
+					// to distinguish "empty, and we parsed it" from "missing /
+					// short row", which is live information, not chrome. It now
+					// draws in Text_Muted (clears AA) and the guard here is back
+					// to 0 like every other file, which is what makes a THIRD use
+					// (anywhere) still fail it.
+					{"table.odin", #load("table.odin", string), 0, ""},
 					{"find.odin", #load("find.odin", string), 0, ""},
 					{"history.odin", #load("history.odin", string), 0, ""},
 					{"fontpage.odin", #load("fontpage.odin", string), 0, ""},
 					// The one legitimate use in the tree: the guillemet at the end
 					// of a settings range, which is a control that genuinely
-					// cannot be stepped further. UI spec 11.1 asks for exactly
-					// that -- "dim the arrow at the range end".
+					// cannot be stepped further -- dim BECAUSE it is disabled,
+					// which is the exemption WCAG actually grants and table.odin's
+					// dash (above) never qualified for. UI spec 11.1 asks for
+					// exactly this -- "dim the arrow at the range end".
 					{"settings.odin", #load("settings.odin", string), 1, "the range-end guillemet"},
 				}
 				NEEDLE :: "g_theme[.Text_Dim]"
