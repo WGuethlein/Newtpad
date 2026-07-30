@@ -11,6 +11,39 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
+## Two palette rows do nothing when run from the palette
+
+**Found 2026-07-30** while compiling `features.md`. `Extend Column Selection Left` and
+`Extend Column Selection Right` appear in the command palette — `command_in_palette` does not exclude
+them — but their dispatch arms in `commands.odin` are gated on `ev.shift`, and `palette_execute`
+(`palette.odin:443`) calls `command_dispatch(cmd, {}, ...)` with a **zero `Key_Event`**. So shift is
+false and running either from the palette silently does nothing.
+
+Their `Up`/`Down` siblings act unconditionally and do work, which is what makes this look like an
+oversight rather than a decision. The comment at the `Left` arm explains the shift gate for the
+*keyboard* path (a bare `Alt+Left` must keep doing nothing) — that reasoning is sound and should stay;
+it just does not transfer to a palette invocation, where the user named the command explicitly.
+
+**Two candidate fixes:** exclude both from the palette (matching the other plumbing commands the palette
+hides), or have `palette_execute` synthesise the modifier the command needs. The second is the better
+answer if any other command has the same shape — worth checking before choosing.
+
+## Only the first 32 open files get external-change detection
+
+**Found 2026-07-30** while compiling `features.md`. `MAX_TABS :: 32` (`app.odin:122`) is **not** a tab
+limit — its own comment says it is the watcher's budget, *"independent of the session's tab limit
+(MAX_SESSION_TABS, currently 64)"* — and `app_add` caps nothing. So the real behaviour is:
+
+- tabs are **unlimited**,
+- a session restores at most **64**,
+- and **only the first 32 watched files are polled for external changes.** The rest are silently
+  unwatched.
+
+A file edited by another program in tab 33 will not show the disk-changed indicator and will not offer
+to reload. Given "never lock the user's file" is a hard rule and timestamp polling is the whole
+mechanism that makes it safe, a silent cap on which files are covered is worth a decision rather than a
+constant. Either raise it, make it dynamic, or surface which tabs are unwatched.
+
 ## "The preview does not always respect spaces" — one defect fixed, needs Wyatt's confirmation
 
 **Reported 2026-07-29** with a side-by-side screenshot of the editor and the preview: *"it looks like it's
