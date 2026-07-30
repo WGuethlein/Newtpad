@@ -275,12 +275,26 @@ main :: proc() {
 		// where the caret lands once an actual scroll is needed, so it parks on
 		// the last WHOLLY visible row rather than the partial one.
 		//
-		// The GRID view stays on `rows` for both its draw and its hit-test:
-		// table_draw has its own header/row geometry, and splitting a layout
-		// this task does not otherwise touch is how the two halves of a widget
-		// end up one row apart (HANDOFF §6j).
+		// The GRID view takes NEITHER. It used to take `rows`, on the reasoning
+		// that "table_draw has its own header/row geometry, and splitting a
+		// layout this task does not otherwise touch is how the two halves of a
+		// widget end up one row apart" -- but §10's geometry is now genuinely
+		// different (a 30px sticky header band above 26px rows, neither of them
+		// the editor's line_height), so `rows` over-counts the grid outright.
+		// Over-counting is not benign in either direction it reaches: it feeds
+		// doc_scroll's clamp, so doc_max_top would stop the wheel short of the
+		// last line, and it bounds the CELL HIT-TEST, so a press in the dead
+		// strip below the last drawn row would resolve to a row and start editing
+		// it. `trows` is the grid's budget, from the same producer table_draw
+		// positions its rows with.
 		rows := doc_visible_rows(doc, f32(window.height), line_h)
 		drawn := doc_drawn_rows(doc, f32(window.height), line_h)
+		trows := table_visible_rows(doc, f32(window.height), px)
+		// The vertical scroll model's count: `trows` in the grid, `rows`
+		// everywhere else. Equal to `rows` for every non-grid document, so this
+		// changes nothing outside table view -- see doc_scroll_rows for why the
+		// scrollbar, its drag and the wheel cannot be allowed to differ.
+		srows := doc_scroll_rows(doc, f32(window.height), line_h, px)
 		// Usable content width in cells (word wrap breaks here).
 		doc_update_gutter(doc, char_w) // before view_cols: the gutter narrows the text
 		doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), app.settings.split_frac), char_w)
@@ -395,7 +409,7 @@ main :: proc() {
 				case .Tab:
 					next_row, next_col := doc.table_edit_row, doc.table_edit_col + 1
 					table_edit_commit(doc)
-					if ok, r, col, fs, fe, val := table_cell_at_index(doc, next_row, next_col, rows); ok {
+					if ok, r, col, fs, fe, val := table_cell_at_index(doc, next_row, next_col, trows); ok {
 						table_edit_start(doc, r, col, fs, fe, val)
 					}
 					continue
@@ -524,7 +538,7 @@ main :: proc() {
 		}
 		if scrollbar_drag {
 			if window.mouse_down {
-				vbar_drag_to(doc, &text, g_vbar_editor, f32(window.mouse_y), vscroll_grab, rows)
+				vbar_drag_to(doc, &text, g_vbar_editor, f32(window.mouse_y), vscroll_grab, srows)
 			} else {
 				scrollbar_drag = false
 			}
@@ -610,7 +624,7 @@ main :: proc() {
 		// read-only consume below so the click reaches the link first; consumes
 		// either way (the grid takes no caret).
 		if doc.table && doc.kind == .Text && window.mouse_pressed && plat.key_ctrl_down() {
-			if tl, found := table_link_hit(table_links(doc, &text, px, char_w, rows, f32(window.width)), f32(window.mouse_x), f32(window.mouse_y), px, line_h); found {
+			if tl, found := table_link_hit(table_links(doc, &text, px, char_w, trows, f32(window.width)), f32(window.mouse_x), f32(window.mouse_y), px, table_row_h(px)); found {
 				// Not resolution-gated the way the document view now is: table_links
 				// decorates whatever links_scan finds in a cell, so a dead target here
 				// still underlines. link_follow at least says so instead of doing
@@ -627,7 +641,7 @@ main :: proc() {
 		if doc.table && doc.kind == .Text && window.mouse_pressed && !plat.key_ctrl_down() &&
 		   f32(window.mouse_y) >= CONTENT_TOP + TOP_INSET && f32(window.mouse_y) < f32(window.height) - doc_bottom_bar_h(doc) {
 			if doc.table_editing {table_edit_commit(doc)}
-			if ok, r, col, fs, fe, val := table_cell_at(doc, f32(window.mouse_x), f32(window.mouse_y), px, char_w, rows, f32(window.width)); ok {
+			if ok, r, col, fs, fe, val := table_cell_at(doc, f32(window.mouse_x), f32(window.mouse_y), px, char_w, trows, f32(window.width)); ok {
 				table_edit_start(doc, r, col, fs, fe, val)
 			}
 			// don't consume: let the read-only block below swallow it uniformly
@@ -732,7 +746,7 @@ main :: proc() {
 				want = .Hand
 			} else if plat.key_ctrl_down() && !doc.filter {
 				if doc.table && doc.kind == .Text {
-					if _, over := table_link_hit(table_links(doc, &text, px, char_w, rows, f32(window.width)), f32(cx), f32(cy), px, line_h); over {
+					if _, over := table_link_hit(table_links(doc, &text, px, char_w, trows, f32(window.width)), f32(cx), f32(cy), px, table_row_h(px)); over {
 						want = .Hand
 					}
 				} else if _, over := md_link_at(md_preview_links(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac), f32(cx), f32(cy)); over {
@@ -905,7 +919,19 @@ main :: proc() {
 				if plat.key_shift_down() { // Shift+wheel pans table columns
 					doc.table_col = clamp(doc.table_col + window.scroll_delta, 0, table_max_col(doc))
 				} else {
-					doc_scroll(doc, &text, window.scroll_delta, rows)
+					// Normalised through table_data_start on BOTH sides of the
+					// scroll, because the header is sticky and therefore owns line
+					// 0: doc.top == 0 and doc.top == <start of line 1> are the same
+					// scroll position, so without the leading normalise the first
+					// notch off the top of a freshly-opened CSV moves doc.top from
+					// one to the other and renders an identical frame -- a wheel
+					// notch that visibly does nothing. Without the trailing one the
+					// last notch back up does the same in reverse. Same producer the
+					// draw and the hit-test read, so no third opinion about which
+					// line is the first data row.
+					if s, sok := table_data_start(doc); sok {doc.top = s}
+					doc_scroll(doc, &text, window.scroll_delta, trows)
+					if s, sok := table_data_start(doc); sok {doc.top = s}
 				}
 			} else if doc.filter {
 				// Stop at the point the list underfills the screen, rather than
@@ -1470,6 +1496,13 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// was drawn.
 	rows := doc_visible_rows(doc, f32(window.height), line_h)
 	drawn := doc_drawn_rows(doc, f32(window.height), line_h)
+	// The grid's budget, same producer and same reasoning as the frame loop's
+	// (see its comment). Recomputed here rather than passed in because a resize
+	// repaints through this path without going round the loop, and a grid drawn
+	// to a stale row count is a grid whose last row is not where the loop's
+	// hit-test thinks it is.
+	trows := table_visible_rows(doc, f32(window.height), px)
+	srows := doc_scroll_rows(doc, f32(window.height), line_h, px) // the bar's count; see doc_scroll_rows
 	doc_update_gutter(doc, char_w) // resize repaints come through here too
 	// Recompute the wrap width here (not just in the main loop) so word wrap
 	// re-flows live during a resize, which repaints through this path.
@@ -1506,10 +1539,10 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		}
 	} else if doc.table && doc.kind == .Text {
 		// Read-only grid view (CSV/TSV) replaces the text pass entirely.
-		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, rows, f32(window.width))
+		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, trows, f32(window.width))
 		// Underline links in the cells while Ctrl is held (or Show-links is on).
 		if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
-			for tl in table_links(doc, text, px, char_w, rows, f32(window.width)) {
+			for tl in table_links(doc, text, px, char_w, trows, f32(window.width)) {
 				plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {tl.x, tl.y + sx(2)}, size = {tl.w, hairline()}, color = g_theme[.Link]}})
 			}
 		}
@@ -1608,7 +1641,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			vb = md_vscrollbar_geo(doc, er - SCROLLBAR_W, h, shown, md_preview_frac(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
 			g_vbar_preview = vb
 		} else {
-			vb = vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom, text, rows)
+			vb = vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom, text, srows)
 			g_vbar_editor = vb // what the press hit-tests against next frame
 		}
 		sb_h, th, ty := vb.track_h, vb.thumb_h, vb.thumb_y
@@ -2117,6 +2150,9 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	RADIUS_CARD = dp(rc, RADIUS_CARD_96)
 	HISTORY_ROW = dp(rc, HISTORY_ROW_96)
 	HISTORY_W = dp(rc, HISTORY_W_96)
+	TABLE_HEADER_H = dp(rc, TABLE_HEADER_H_96)
+	TABLE_ROW_H = dp(rc, TABLE_ROW_H_96)
+	TABLE_CELL_PAD_X = dp(rc, TABLE_CELL_PAD_X_96)
 
 	// The non-client hit-test boundary is derived from the tab strip, so it is
 	// set here rather than at each call site — it was being scaled a second time

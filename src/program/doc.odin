@@ -221,10 +221,22 @@ GUTTER_W: f32 = 0
 H_SCROLL: int = 0
 
 // Mirror the active doc's horizontal scroll into H_SCROLL for this frame, off
-// unless the document is in the plain (non-wrap, non-filter) view. Set alongside
-// the gutter/top-inset so the whole frame agrees.
+// unless the document is in the plain view -- non-wrap, non-filter, and not one
+// of the two rendered views. Set alongside the gutter/top-inset so the whole
+// frame agrees.
+//
+// Zero in the views that REPLACE the text pass (doc_read_only_view: the grid and
+// full Markdown Preview), not just in the wrapped/filtered ones. Neither of those
+// two reads H_SCROLL -- table_draw pans doc.table_col instead and Preview lays out
+// to the pane -- but doc.h_scroll survives a view toggle, so a document panned in
+// text view and then switched to the grid left H_SCROLL non-zero with nothing
+// honouring it. The visible consequence was render_frame's left-margin cover strip
+// (drawn whenever H_SCROLL > 0, to hide glyphs panned off the left edge) painting
+// Bg_Base over the first TEXT_MARGIN_X of a view that had not panned anything.
+// That was latent while the grid's first column started at TEXT_MARGIN_X and went
+// live the moment §10's zebra bands and header reached x = 0.
 doc_update_hscroll :: proc(doc: ^Document) {
-	H_SCROLL = doc.h_scroll if (doc != nil && !doc_wraps(doc) && !doc.filter) else 0
+	H_SCROLL = doc.h_scroll if (doc != nil && !doc_wraps(doc) && !doc.filter && !doc_read_only_view(doc)) else 0
 }
 
 // Recompute the gutter for the active document. Only the filter view has one:
@@ -762,6 +774,25 @@ doc_visible_rows :: proc(doc: ^Document, height, line_h: f32) -> int {
 // grow their own.
 doc_content_box :: proc(doc: ^Document, height: f32) -> (top, bot: f32) {
 	return CONTENT_TOP + TOP_INSET, height - doc_bottom_bar_h(doc)
+}
+
+// The row count the VERTICAL SCROLL MODEL runs on: the grid's own budget when
+// this is a grid, the editor's otherwise.
+//
+// One producer because three things have to hold the same number or the view
+// scrolls to different places depending on how you asked. vscrollbar_geo maps
+// doc.top through doc_max_top(rows) and vbar_drag_to maps the pointer back
+// through doc_scroll_to_fraction(rows) -- vscrollbar_geo's comment records that
+// those two being exact inverses is what makes "grab the thumb and it does not
+// move" true rather than approximately true -- and the wheel calls doc_scroll
+// with a third copy. While the grid shared the editor's line grid all three were
+// the same by accident. §10's 26px rows under a 30px header end that, and the
+// failure is not subtle: the wheel would reach a doc.top past the bar's own
+// maximum, so the thumb would sit pinned at the bottom of the track while the
+// file kept scrolling, and the next press on it would jump the view backwards.
+doc_scroll_rows :: proc(doc: ^Document, height, line_h, px: f32) -> int {
+	if doc != nil && doc.kind == .Text && doc.table {return table_visible_rows(doc, height, px)}
+	return doc_visible_rows(doc, height, line_h)
 }
 
 // Rows the DRAW emits: the fully visible ones, plus a partial row when the

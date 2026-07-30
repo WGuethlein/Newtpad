@@ -8072,6 +8072,417 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad tablegridtest` covers UI spec §10 group A's geometry, and it is
+		// a DATA-LOSS test rather than a cosmetic one.
+		//
+		// table_cell_at maps a pixel to a field's byte range and table_edit_commit
+		// writes that range through the piece tree, so the grid is an editing
+		// surface whose pixel -> row mapping decides which line gets overwritten.
+		// Group A moves that mapping twice over: rows go from the editor's
+		// line_height to §10's 26px, and a sticky 30px header appears above them
+		// which means line 0 is no longer a scrolling row at all. Either change
+		// alone shifts every row by a different amount.
+		//
+		// So the assertions do not check a coordinate against a coordinate -- that
+		// would only prove the arithmetic agrees with itself. They take the y the
+		// DRAW positions row r at, hand it to the HIT-TEST, and compare the bytes
+		// the hit-test returns against a field text derived from the fixture by
+		// plain strings.split, which is independent of csv_fields, table_row_start
+		// and every other producer under test. A mapping that is off by one row, or
+		// that forgets the header owns line 0, returns a real byte range for a real
+		// field -- just the wrong one -- and only the fixture comparison can tell.
+		//
+		// Its own proc: test_mode_dispatch's frame has hit STATUS_STACK_OVERFLOW
+		// twice, and the fixture tables below are locals.
+		if os.args[1] == "tablegridtest" {
+			tg :: proc() -> (bad: int) {
+				// Rows the viewport is SIZED to hold, at every scale. Fewer than
+				// the fixture's data rows (so the last visible row is real content
+				// and doc_max_top is non-zero), and more than the highest row index
+				// any assertion below probes -- the short row is data row 7.
+				TG_ROWS :: 10
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+
+				// --- §10's metrics, as declared -----------------------------
+				chk(&bad, TABLE_HEADER_H_96 == 30, fmt.tprintf("header is %.0fpx at 96 DPI (§10: 30)", TABLE_HEADER_H_96))
+				chk(&bad, TABLE_ROW_H_96 == 26, fmt.tprintf("rows are %.0fpx at 96 DPI (§10: 26)", TABLE_ROW_H_96))
+				chk(&bad, TABLE_CELL_PAD_X_96 == 10, fmt.tprintf("cell padding is 0 %.0f at 96 DPI (§10: 0 10)", TABLE_CELL_PAD_X_96))
+
+				// The column rules are GONE, replaced by the band. A quad that is
+				// no longer emitted cannot be observed from outside the draw, so
+				// this is a source count -- the same #load mechanism themetest's
+				// Text_Dim guard uses, and for the same reason: it is the only
+				// instrument available. Border_Subtle was the old `sep` colour, so
+				// its absence here is the rule's removal, and one Table_Zebra use
+				// is what replaced it.
+				{
+					src :: #load("table.odin", string)
+					nsep := strings.count(src, "g_theme[.Border_Subtle]")
+					nzeb := strings.count(src, "g_theme[.Table_Zebra]")
+					chk(&bad, nsep == 0, fmt.tprintf("no column rules left in table.odin (%d Border_Subtle uses, want 0)", nsep))
+					chk(&bad, nzeb == 1, fmt.tprintf("the band replaced them (%d Table_Zebra uses, want 1)", nzeb))
+				}
+
+				t: plat.Text
+				plat.text_load_faces(&t)
+				BASE_PX = BASE_PX_96
+
+				// --- the fixture, and the expectation, built independently ---
+				//
+				// Line 0 is the header. Line 5 carries an EMPTY middle field and
+				// line 8 is SHORT (two fields where the table has three) -- §10
+				// treats those as different things, and the pair is here so the
+				// distinction is exercised rather than assumed.
+				lines := [?]string {
+					"h0,h1,h2",
+					"a0,b0,c0",
+					"a1,b1,c1",
+					"a2,b2,c2",
+					"a3,b3,c3",
+					"a4,,c4", // empty middle cell -> em dash, still a real field
+					"a5,b5,c5",
+					"a6,b6,c6",
+					"a7,b7", // short row -> malformed, NOT an empty cell
+					"a8,b8,c8",
+					"a9,b9,c9",
+					"a10,b10,c10",
+					"a11,b11,c11",
+					"a12,b12,c12",
+					"a13,b13,c13",
+					"a14,b14,c14",
+				}
+				// Absolute byte offset of each line, counted here rather than
+				// asked of the code under test.
+				off: [len(lines) + 1]int
+				for l, i in lines {off[i + 1] = off[i] + len(l) + 1}
+				content := make([]u8, off[len(lines)]) // default allocator: doc_close owns it
+				for l, i in lines {copy(content[off[i]:], transmute([]u8)l);content[off[i] + len(l)] = '\n'}
+
+				doc := doc_from_content(content, "grid.csv", .UTF8)
+				defer doc_close(&doc)
+				doc.table, doc.table_delim = true, ','
+
+				// Expected field text at (line, col), by plain split -- no
+				// csv_fields, no field-range parser. Valid because no fixture
+				// field is quoted or contains a comma, so the raw span and the
+				// unquoted value are the same string.
+				want_field :: proc(lines: []string, line, col: int) -> (string, bool) {
+					parts := strings.split(lines[line], ",", context.temp_allocator)
+					if col >= len(parts) {return "", false}
+					return parts[col], true
+				}
+				read_span :: proc(doc: ^Document, fs, fe: int) -> string {
+					if fe < fs {return "<inverted>"}
+					b := make([]u8, fe - fs, context.temp_allocator)
+					base.pt_read(&doc.pt, fs, b)
+					return string(b)
+				}
+
+				// --- the round trip, at three DPI scales ---------------------
+				//
+				// Three scales, because line_height and the scaled metrics round
+				// independently and a mapping can be exactly right at 100% while
+				// drifting half a pixel per row at 125% -- the defect class
+				// line_height's own comment was written for.
+				for scale in ([]f32{1.0, 1.25, 1.5}) {
+					UI_SCALE = scale
+					TEXT_MARGIN_Y = sx(TEXT_MARGIN_Y_96)
+					TAB_STRIP_H = sx(TAB_STRIP_H_96)
+					MENU_BAR_H = sx(MENU_BAR_H_96)
+					CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+					CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+					STATUS_BAR_H = sx(STATUS_BAR_H_96)
+					SCROLLBAR_W = sx(SCROLLBAR_W_96)
+					TABLE_HEADER_H = sx(TABLE_HEADER_H_96)
+					TABLE_ROW_H = sx(TABLE_ROW_H_96)
+					TABLE_CELL_PAD_X = sx(TABLE_CELL_PAD_X_96)
+					TOP_INSET, FILTER_BANNER_H = 0, 0
+
+					px := f32(int(BASE_PX_96 * scale + 0.5))
+					cw := plat.text_char_width(&t, px, .Doc)
+					// The window height is DERIVED from the row count wanted, not
+					// picked. A round 700px let 21 rows fit against 15 data rows,
+					// so the viewport was taller than the file: "the last visible
+					// row" was EOF, and doc_max_top clamped every scroll to 0 --
+					// the fixture never reached the conditions its own assertions
+					// named. The precondition below is what caught that, and this
+					// is what it caught.
+					W := f32(1000)
+					H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					clear(&doc.table_widths)
+					table_compute_widths(&doc, &t)
+					doc.table_cols = len(doc.table_widths)
+					doc.top = 0
+
+					trows := table_visible_rows(&doc, H, px)
+					// The fixture must be TALLER than the viewport, or "the last
+					// visible row" is EOF and the row below it is empty in both
+					// the right and the wrong implementation -- a bound that
+					// rejects nothing. len(lines)-1 data rows exist.
+					pre := trows == TG_ROWS && trows < len(lines) - 1
+					chk(&bad, pre, fmt.tprintf("scale %.2f: precondition -- %d rows fit (want %d), %d data rows exist", scale, trows, TG_ROWS, len(lines) - 1))
+					if !pre {
+						fmt.printfln("    (%d rows fit, %d data rows exist)", trows, len(lines) - 1)
+						continue
+					}
+					cols := table_cols_layout(&doc, cw, W, table_start_col(&doc))
+					chk(&bad, len(cols) == 3, fmt.tprintf("scale %.2f: all 3 columns are laid out (%d)", scale, len(cols)))
+					if len(cols) != 3 {continue}
+
+					// 1. Every visible row, every column: the y the draw uses ->
+					//    the bytes the hit-test returns -> the fixture's field.
+					//    Includes row 0 (the one the sticky header's height can
+					//    push wrong) and trows-1 (the last visible row).
+					mism := 0
+					for r in 0 ..< trows {
+						my := table_row_rect_y(px, r) + table_row_h(px) * 0.5
+						for col in cols {
+							mx := table_cell_text_x(col) // the x the glyphs are drawn at
+							ok, rr, cc, fs, fe, _ := table_cell_at(&doc, mx, my, px, cw, trows, W)
+							exp, has := want_field(lines[:], r + 1, col.c)
+							if !has {
+								// the short row's third field: nothing to edit
+								if ok {
+									mism += 1
+									fmt.printfln("    row %d col %d: resolved a field where line %d has none", r, col.c, r + 1)
+								}
+								continue
+							}
+							got := read_span(&doc, fs, fe) if ok else "<no hit>"
+							// The byte range must also LIE INSIDE line r+1, not
+							// merely spell the right text: two rows could share a
+							// field value in a real CSV.
+							inside := ok && fs >= off[r + 1] && fe <= off[r + 1] + len(lines[r + 1])
+							if !ok || rr != r || cc != col.c || got != exp || !inside {
+								mism += 1
+								if mism <= 4 {
+									fmt.printfln(
+										"    row %d col %d: hit=(%v,r%d,c%d) bytes[%d,%d)=%q want %q on line %d [%d,%d)",
+										r, col.c, ok, rr, cc, fs, fe, got, exp, r + 1, off[r + 1], off[r + 2] - 1,
+									)
+								}
+							}
+						}
+					}
+					chk(&bad, mism == 0, fmt.tprintf("scale %.2f: %d rows x 3 cols round-trip draw-y -> byte range -> fixture (%d wrong)", scale, trows, mism))
+
+					// 2. The sticky header is not a row. A press anywhere in the
+					//    band, and one half a pixel above the first row, must
+					//    refuse -- otherwise it edits data row 0's cell, which is
+					//    the specific way a sticky header corrupts an editing grid.
+					{
+						midband := table_grid_top() + table_header_h(px) * 0.5
+						okh, _, _, _, _, _ := table_cell_at(&doc, table_cell_text_x(cols[0]), midband, px, cw, trows, W)
+						chk(&bad, !okh, fmt.tprintf("scale %.2f: a press in the header band resolves to no cell", scale))
+						okj, _, _, _, _, _ := table_cell_at(&doc, table_cell_text_x(cols[0]), table_rows_top(px) - 0.5, px, cw, trows, W)
+						chk(&bad, !okj, fmt.tprintf("scale %.2f: ...and half a pixel above row 0 still refuses", scale))
+						// The pixel immediately below is row 0 and is line 1.
+						oke, re, _, fse, fee, _ := table_cell_at(&doc, table_cell_text_x(cols[0]), table_rows_top(px) + 0.5, px, cw, trows, W)
+						w0, _ := want_field(lines[:], 1, 0)
+						chk(
+							&bad,
+							oke && re == 0 && read_span(&doc, fse, fee) == w0,
+							fmt.tprintf("scale %.2f: the first pixel under the rule is row 0 = line 1 (%q, want %q)", scale, read_span(&doc, fse, fee) if oke else "<no hit>", w0),
+						)
+					}
+
+					// 3. The dead strip below the last drawn row refuses. This is
+					//    what the grid's own row budget buys: on the editor's
+					//    `rows` this y resolved to a row and started an edit.
+					{
+						okb, _, _, _, _, _ := table_cell_at(&doc, table_cell_text_x(cols[0]), table_row_rect_y(px, trows) + 1, px, cw, trows, W)
+						chk(&bad, !okb, fmt.tprintf("scale %.2f: a press below the last visible row resolves to no cell", scale))
+					}
+
+					// 4. Column boundaries, at the edges rather than the middles:
+					//    the last pixel of a cell belongs to it and the first
+					//    pixel of the next belongs to the next.
+					{
+						my := table_row_rect_y(px, 0) + table_row_h(px) * 0.5
+						cb := 0
+						for col, i in cols {
+							for probe, kind in ([]f32{col.x, col.x + col.w - 0.5}) {
+								_, _, cc, _, _, _ := table_cell_at(&doc, probe, my, px, cw, trows, W)
+								if cc != col.c {
+									cb += 1
+									fmt.printfln("    col %d edge %d at x=%.1f resolved to column %d", col.c, kind, probe, cc)
+								}
+							}
+							if i + 1 < len(cols) {
+								_, _, cn, _, _, _ := table_cell_at(&doc, cols[i + 1].x, my, px, cw, trows, W)
+								if cn != cols[i + 1].c {cb += 1}
+							}
+						}
+						chk(&bad, cb == 0, fmt.tprintf("scale %.2f: every column's own pixels hit-test to it (%d edge failures)", scale, cb))
+					}
+
+					// 5. Scrolled: the header still shows LINE 0 while the rows
+					//    underneath it have moved. That is the whole sticky rule,
+					//    and the previous draw ("the band, but only when doc.top
+					//    == 0") passes every unscrolled assertion above.
+					{
+						doc.top = off[4]
+						head := table_header_fields(&doc)
+						hok := len(head) == 3 && head[0] == "h0" && head[2] == "h2"
+						chk(&bad, hok, fmt.tprintf("scale %.2f: scrolled to line 4, the header still reads line 0 (%v)", scale, head))
+						my := table_row_rect_y(px, 0) + table_row_h(px) * 0.5
+						oks, _, _, fss, fes, _ := table_cell_at(&doc, table_cell_text_x(cols[0]), my, px, cw, trows, W)
+						w4, _ := want_field(lines[:], 4, 0)
+						chk(
+							&bad,
+							oks && fss >= off[4] && fes <= off[5] && read_span(&doc, fss, fes) == w4,
+							fmt.tprintf("scale %.2f: ...and row 0 is now line 4 (%q, want %q)", scale, read_span(&doc, fss, fes) if oks else "<no hit>", w4),
+						)
+						doc.top = 0
+					}
+				}
+
+				// --- the rest is scale-independent; pin 100% ----------------
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				px := BASE_PX_96
+				cw := plat.text_char_width(&t, px, .Doc)
+				W := f32(1000)
+				H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+				clear(&doc.table_widths)
+				table_compute_widths(&doc, &t)
+				doc.table_cols = len(doc.table_widths)
+				doc.top = 0
+				trows := table_visible_rows(&doc, H, px)
+				cols := table_cols_layout(&doc, cw, W, table_start_col(&doc))
+				chk(&bad, trows == TG_ROWS && trows < len(lines) - 1, fmt.tprintf("precondition -- %d rows fit (want %d), %d data rows exist", trows, TG_ROWS, len(lines) - 1))
+
+				// 6. EMPTY is not MISSING. §10 gives an em dash to one and a
+				//    warning bar to the other (group C), so the two have to be
+				//    distinguishable at the seam, not just in the draw.
+				{
+					my5 := table_row_rect_y(px, 4) + table_row_h(px) * 0.5 // data row 4 = line 5, "a4,,c4"
+					ok5, _, _, fs5, fe5, val5 := table_cell_at(&doc, table_cell_text_x(cols[1]), my5, px, cw, trows, W)
+					chk(&bad, ok5 && val5 == "" && fs5 == fe5, fmt.tprintf("an EMPTY cell is a real field: hit=%v val=%q zero-width=%v", ok5, val5, fs5 == fe5))
+					my8 := table_row_rect_y(px, 7) + table_row_h(px) * 0.5 // data row 7 = line 8, "a7,b7"
+					ok8, _, _, _, _, _ := table_cell_at(&doc, table_cell_text_x(cols[2]), my8, px, cw, trows, W)
+					chk(&bad, !ok8, "a MISSING cell on a short row is not a field at all")
+					// And the draw's own skip condition is reachable: the short
+					// row really does have fewer fields than the table has columns.
+					nshort := len(csv_fields("a7,b7", ','))
+					chk(&bad, nshort < len(doc.table_widths), fmt.tprintf("the short row has %d fields vs %d columns, so the draw's skip branch runs", nshort, len(doc.table_widths)))
+					// The dash is a placeholder, not data: it must not be a byte
+					// the file could contain in an empty cell.
+					chk(&bad, len(TABLE_EMPTY_CELL) > 1, fmt.tprintf("the empty-cell mark is a real em dash, not '-' (%q, %d bytes)", TABLE_EMPTY_CELL, len(TABLE_EMPTY_CELL)))
+				}
+
+				// 7. The wheel's first notch off the top of the file MOVES.
+				//
+				//    The header owns line 0, so doc.top == 0 and doc.top ==
+				//    off[1] are one scroll position. The first pair below is the
+				//    bug as it would be without the normalise in main.odin's
+				//    table wheel branch -- asserted to be a no-op, which is what
+				//    makes the second pair's success mean something. A test that
+				//    only checked the normalised path would pass with the
+				//    normalise deleted, since doc_scroll moves doc.top either way.
+				{
+					doc.top = 0
+					raw_before, _ := table_data_start(&doc)
+					doc_scroll(&doc, &t, 1, trows)
+					raw_after, _ := table_data_start(&doc)
+					chk(
+						&bad,
+						raw_before == off[1] && raw_after == off[1],
+						fmt.tprintf("un-normalised, the first notch is a DEAD notch: first data row %d -> %d (both want %d)", raw_before, raw_after, off[1]),
+					)
+
+					doc.top = 0
+					if s, sok := table_data_start(&doc); sok {doc.top = s}
+					doc_scroll(&doc, &t, 1, trows)
+					if s, sok := table_data_start(&doc); sok {doc.top = s}
+					norm_after, _ := table_data_start(&doc)
+					chk(&bad, norm_after == off[2], fmt.tprintf("normalised, it advances one row: first data row %d (want %d)", norm_after, off[2]))
+
+					// ...and scrolling back up cannot rest below line 1.
+					doc.top = off[1]
+					doc_scroll(&doc, &t, -1, trows)
+					if s, sok := table_data_start(&doc); sok {doc.top = s}
+					up, _ := table_data_start(&doc)
+					chk(&bad, up == off[1], fmt.tprintf("and the top of the file is line 1, not line 0: %d (want %d)", up, off[1]))
+					doc.top = 0
+
+					// The pair above proves the MECHANISM, and nothing more: it
+					// normalises doc.top itself, so deleting the normalise from
+					// main.odin's wheel branch leaves every row of it green. This
+					// counts the two calls that have to be there -- the only
+					// instrument available, since the wheel needs a real
+					// WM_MOUSEWHEEL and this environment cannot inject one.
+					nnorm := strings.count(#load("main.odin", string), "table_data_start(doc)")
+					chk(&bad, nnorm == 2, fmt.tprintf("main.odin normalises doc.top on BOTH sides of the grid's scroll (%d calls, want 2)", nnorm))
+				}
+
+				// 8. A header with nothing under it has no data rows -- the case
+				//    where treating the header as row 0 would put one line on
+				//    screen twice.
+				{
+					only := make([]u8, len("just,a,header"))
+					copy(only, transmute([]u8)string("just,a,header"))
+					hd := doc_from_content(only, "hdr.csv", .UTF8)
+					defer doc_close(&hd)
+					hd.table, hd.table_delim = true, ','
+					_, sok := table_data_start(&hd)
+					chk(&bad, !sok, "a header with no newline after it yields no data rows")
+					hf := table_header_fields(&hd)
+					chk(&bad, len(hf) == 3 && hf[0] == "just", fmt.tprintf("...but it is still drawn as the header (%v)", hf))
+				}
+
+				// 9. The scrollbar, its drag and the wheel stop at the same byte.
+				//
+				//    vscrollbar_geo maps doc.top through doc_max_top(rows) and
+				//    vbar_drag_to maps the pointer back through
+				//    doc_scroll_to_fraction(rows); the wheel calls doc_scroll with
+				//    a third copy. Handing the grid's wheel `trows` while the bar
+				//    kept the editor's `rows` pins the thumb at the bottom of the
+				//    track while the file keeps scrolling.
+				//
+				//    The first row is the one that stops this being vacuous: the
+				//    two counts must actually DIFFER for this fixture, or the rest
+				//    would hold with doc_scroll_rows deleted.
+				{
+					doc.top = 0
+					erows := doc_visible_rows(&doc, H, line_height(px))
+					chk(&bad, erows != trows, fmt.tprintf("the editor's budget (%d) and the grid's (%d) are genuinely different here", erows, trows))
+					srows := doc_scroll_rows(&doc, H, line_height(px), px)
+					chk(&bad, srows == trows, fmt.tprintf("the scroll model takes the grid's count in a grid (%d, want %d)", srows, trows))
+					mt_grid := doc_max_top(&doc, &t, trows)
+					mt_edit := doc_max_top(&doc, &t, erows)
+					chk(&bad, mt_grid != mt_edit, fmt.tprintf("...and the two counts reach different ends of the file (%d vs %d)", mt_grid, mt_edit))
+					chk(&bad, doc_max_top(&doc, &t, srows) == mt_grid, "so the bar's bottom and the wheel's bottom are the same byte")
+					// A non-grid document is untouched: same answer as before.
+					doc.table = false
+					chk(&bad, doc_scroll_rows(&doc, H, line_height(px), px) == erows, "a non-grid document still gets the editor's count")
+					doc.table = true
+				}
+
+				// 10. A zoomed font can never make rows overlap. The design values
+				//    are floors, not fixed heights -- at 200% zoom the line box is
+				//    48px and a flat 26px row would draw every cell over its
+				//    neighbour.
+				{
+					big := BASE_PX_96 * 3
+					chk(&bad, table_row_h(big) >= line_height(big), fmt.tprintf("at px=%.0f the row (%.0f) still holds the line box (%.0f)", big, table_row_h(big), line_height(big)))
+					chk(&bad, table_header_h(big) >= line_height(big), fmt.tprintf("...and so does the header (%.0f vs %.0f)", table_header_h(big), line_height(big)))
+					chk(&bad, table_row_h(BASE_PX_96) == TABLE_ROW_H, fmt.tprintf("at the default size the SPEC's number governs (%.0f)", table_row_h(BASE_PX_96)))
+				}
+				return
+			}
+			bad := tg()
+			fmt.printfln("tablegridtest: %d failures", bad)
+			return true
+		}
+
 		// `newtpad logtest` covers the base ring-buffer logger: level gating, the
 		// oldest-first dump order, wrap-around retention, and truncation.
 		if os.args[1] == "logtest" {
@@ -16704,7 +17115,21 @@ when NEWTPAD_TESTS {
 					{"palette.odin", #load("palette.odin", string), 0, ""},
 					{"markdown.odin", #load("markdown.odin", string), 0, ""},
 					{"doc.odin", #load("doc.odin", string), 0, ""},
-					{"table.odin", #load("table.odin", string), 0, ""},
+					// The em-dash placeholder in an EMPTY cell (§10, which names
+					// text_dim for it explicitly). Allowed on the same argument
+					// that admits the guillemet below, not as an exception to it:
+					// the dash is not data, it is the ABSENCE of data made
+					// visible, and it is fully redundant with the blank cell it
+					// replaces -- so nothing is lost by a reader who cannot
+					// resolve it at 2.8:1, which is the property WCAG's
+					// disabled-control exemption actually turns on. It must also
+					// be quieter than every cell that does hold data, or the
+					// empties become the thing the eye lands on first in a sparse
+					// CSV; any tier above this one is louder than the data.
+					//
+					// A SECOND use in this file would not be that, and is what the
+					// count still refuses.
+					{"table.odin", #load("table.odin", string), 1, "the em dash in an empty cell"},
 					{"find.odin", #load("find.odin", string), 0, ""},
 					{"history.odin", #load("history.odin", string), 0, ""},
 					{"fontpage.odin", #load("fontpage.odin", string), 0, ""},
