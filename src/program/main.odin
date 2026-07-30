@@ -759,12 +759,16 @@ main :: proc() {
 					if _, over := table_link_hit(table_links(doc, &text, px, char_w, trows, f32(window.width)), f32(cx), f32(cy), px, table_row_h(px)); over {
 						want = .Hand
 					}
-				} else if _, over := md_link_at(md_preview_links(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac), f32(cx), f32(cy)); over {
+				} else if _, over := md_preview_link_at(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac, f32(cx), f32(cy)); over {
 					// The preview pane's own links: rectangles from the shaper,
 					// not columns from the cell grid the preview does not have.
-					// nil in every mode but Preview/Split, and its rectangles
+					// false in every mode but Preview/Split, and its rectangles
 					// only ever cover the preview pane, so this cannot claim a
 					// point in Split's editor half.
+					//
+					// md_preview_link_at, not md_link_at over md_preview_links:
+					// the pane's y bound is inside it, so the hand cursor and the
+					// Ctrl+click below cannot disagree about where the pane ends.
 					want = .Hand
 				} else if !md_pane_owns(doc, f32(window.width), f32(window.height), app.settings.split_frac, f32(cx)) {
 					// The editor's grid path, and ONLY where the editor really
@@ -788,7 +792,7 @@ main :: proc() {
 			// Same dispatch, same producers, same order as the hover cursor
 			// above: the preview pane's shaped rectangles first, the editor's
 			// grid only where the editor actually is.
-			if h, found := md_link_at(md_preview_links(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac), mmx, mmy); found {
+			if h, found := md_preview_link_at(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac, mmx, mmy); found {
 				link_follow(&app, &text, window, doc, h.text, h.link)
 				window.mouse_pressed = false
 				window.mouse_down = false

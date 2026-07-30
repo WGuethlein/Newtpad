@@ -2006,24 +2006,12 @@ md_draw_links :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, hits: []Md_Link_H
 // them would be the "correct function fed the wrong input" bug this project has
 // sixteen recorded instances of.
 //
-// NOT bounded to the pane box (2026-07-29 review, F2, correcting an earlier
-// wrong justification: md_pane_box's ybot IS doc_content_box's bot -- exactly
-// where the cover strip starts -- and the strip paints in the SAME frame
-// before any chrome, so there is no window of frames in which an admitted
-// line's own glyphs paint over the tab rail or the status bar; F1's per-line
-// admission already keeps every admitted rect inside [ytop, ybot]). The real,
-// reachable hazard is `forced` (md_block_admit): the pane's FIRST block, if it
-// is one of the kinds md_kind_lines calls indivisible (a fence's open/close
-// strip, front matter, a table row), is admitted `whole` even when it does not
-// fit -- ad.whole = lines >= n with n == 1, unconditionally -- so its
-// `ad.h == lay.h` can run well past ybot. Its link rects (md_block_links,
-// gated on `b.line >= ad.lines`, not on y) go with it. The GLYPHS are cut off
-// by the cover strip below ybot same as any overflow, but neither call site of
-// THIS proc (main.odin's hover cursor and Ctrl+click) applies a y bound, so a
-// forced, oversized block's link rects stay clickable -- invisible, but live
-// -- as far down as lay.h reaches, which can be past the status bar. Not fixed
-// here (out of this batch's scope); recorded so the next pass over this file
-// does not have to rediscover it.
+// Deliberately NO y bound of its own. This is point-in-rect and nothing else;
+// the pane's bound lives in md_preview_link_at, its only caller, applied ONCE to
+// the point. A second bound here would make each of the two invisible to the
+// suite -- the failure a reviewer found the last time this codebase bounded the
+// same thing in two places -- and would also have to re-derive the pane box that
+// md_preview_link_at already has.
 md_link_at :: proc(hits: []Md_Link_Hit, mx, my: f32) -> (Md_Link_Hit, bool) {
 	for h in hits {
 		r := h.rect
@@ -3341,6 +3329,14 @@ markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 // Called from the input phase (the hand cursor and the Ctrl+click test) where
 // the frame's draw has not run yet; the layout cache makes it a lookup per
 // block rather than a second shaping pass.
+// DELIBERATELY UNBOUNDED IN Y, and that is load-bearing rather than an
+// oversight: this reports what the pass actually PUT ON SCREEN, overflow
+// included, and mdtest's partial-admission sweep reads exactly that -- "no drawn
+// line's bottom exceeds ybot" is an assertion about the admit rule that can only
+// be made if this producer is willing to report a rect that broke it. Clipping
+// here would make that assertion pass by construction. The pane's y bound for
+// CLICKING lives in md_preview_link_at, on the hit-test path, where it cannot
+// silence anything.
 markdown_links :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px: f32, x0, x1, ytop, ybot: f32, at: Md_Anchor, allocator := context.temp_allocator) -> []Md_Link_Hit {
 	out := make([dynamic]Md_Link_Hit, 0, 8, allocator)
 	md_pass(gfx, nil, text, doc, px, x0, x1, ytop, ybot, at, &out)
@@ -3358,6 +3354,38 @@ md_preview_links :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, w
 	x0, x1, ytop, ybot, ok := md_pane_box(doc, winw, winh, split_frac)
 	if !ok {return nil}
 	return markdown_links(gfx, text, doc, px, x0, x1, ytop, ybot, doc.md_top, allocator)
+}
+
+// The preview link under a client-space point -- THE hit-test, and the only
+// place the pane's y bound is applied.
+//
+// One proc for both consumers (main.odin's hand cursor and its Ctrl+click),
+// because it is the same question asked twice and they used to ask it as two
+// open-coded md_link_at(md_preview_links(...)) expressions with no bound in
+// either. md_link_at tests point-in-rect and nothing else; md_block_admit
+// force-admits the pane's first LINE even when it does not fit ("no frame ever
+// shows emptiness" outranks the cover strip's trim), and its link rects go with
+// it (md_block_links gates on b.line >= ad.lines, not on y). The glyphs are then
+// covered by md_preview_clip's strip -- so the rect was invisible and still
+// live, and Ctrl+clicking the status bar opened a link the user could not see.
+//
+// The bound is on the POINT, not on the rectangles, and that is what keeps it to
+// ONE bound. Clipping the rects would need the pane box in md_preview_links too,
+// and would silence the only assertion the suite has about the admit rule
+// overflowing (see markdown_links). Refusing a point the pane does not own is
+// exact for both cases at once: a rect wholly below ybot becomes unreachable,
+// and a rect that straddles ybot keeps exactly its visible half clickable --
+// which matters, because the alternative (dropping it) would make a link that IS
+// drawn and IS underlined stop responding.
+//
+// ytop as well as ybot: the pane owes a cover strip at BOTH ends (markdown_draw)
+// because a partially-scrolled anchor block draws above ytop, and rects go up
+// there for the same reason they go down past ybot.
+md_preview_link_at :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac, mx, my: f32) -> (Md_Link_Hit, bool) {
+	x0, x1, ytop, ybot, ok := md_pane_box(doc, winw, winh, split_frac)
+	if !ok {return {}, false}
+	if my < ytop || my >= ybot {return {}, false}
+	return md_link_at(markdown_links(gfx, text, doc, px, x0, x1, ytop, ybot, doc.md_top, context.temp_allocator), mx, my)
 }
 
 // The preview's scroll fraction for this frame, or 0 when it has no pane. The

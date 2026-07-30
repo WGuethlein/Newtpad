@@ -4341,6 +4341,129 @@ when NEWTPAD_TESTS {
 		//
 		// HOW THIS IS MEASURED, and why it is not a second derivation of the draw:
 		// the fixture's paragraph is nothing but links, one per word, so
+		// A link rectangle the pane does not own must not be clickable, and the
+		// hand cursor must not appear over the status bar.
+		//
+		// The hazard is `forced` (md_block_admit): a pane too short for even its
+		// first LINE still admits that line -- "no frame ever shows emptiness"
+		// outranks the cover strip's trim -- so the line's glyphs and its link
+		// rects run past ybot. md_preview_clip paints over the glyphs, which is
+		// exactly what made this invisible: the rect stayed live under a strip of
+		// status bar, and neither call site of md_link_at applied a y bound.
+		//
+		// THE PRECONDITION IS THE TEST. Section 2 below asserts that a rect really
+		// does extend past ybot before section 3 asserts it is unclickable there;
+		// without it, a fixture that never overflowed would make section 3 pass
+		// against nothing at all. The probe point is derived from that measured
+		// overflow, not chosen.
+		//
+		// Its own procedure with its own device, for the same stack-frame reason
+		// md_partial_selftest has one.
+		md_link_bound_selftest :: proc() -> (bad: int) {
+			lchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1000, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/linkbound") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+			CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+			CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+			STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+			px_ := f32(24)
+
+			b := strings.builder_make()
+			defer strings.builder_destroy(&b)
+			for i in 0 ..< 40 {
+				if i > 0 {strings.write_string(&b, " ")}
+				fmt.sbprintf(&b, "[w%03d](https://e.test/w%03d)", i, i)
+			}
+			strings.write_string(&b, "\n")
+			src := strings.to_string(b)
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "linkbound.md", .UTF8)
+			doc.md_mode = .Preview
+			defer doc_close(&doc)
+			doc_update_top_inset(&doc)
+
+			// --- 1. positive control: a link inside the pane IS clickable --------
+			//
+			// First, because a bound that refuses everything would sail through
+			// sections 2 and 3 and break the feature.
+			x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, W, H, 0.5)
+			lchk(&bad, box_ok, "linkbound: the full pane box resolves")
+			if !box_ok {return}
+			full := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+			lchk(&bad, len(full) > 0, fmt.tprintf("linkbound: the fixture places links in a full pane (%d)", len(full)))
+			if len(full) == 0 {return}
+			line_h := full[0].rect.size.y
+			{
+				r := full[0].rect
+				_, over := md_preview_link_at(&h.gfx, &h.text, &doc, px_, W, H, 0.5, r.pos.x + r.size.x * 0.5, r.pos.y + r.size.y * 0.5)
+				lchk(&bad, over, "linkbound: a link inside the pane is still clickable")
+			}
+			// ...and a point below the FULL pane's bottom is not, which is the same
+			// refusal at the size the app normally runs at.
+			{
+				_, over := md_preview_link_at(&h.gfx, &h.text, &doc, px_, W, H, 0.5, full[0].rect.pos.x + 1, ybot + 2)
+				lchk(&bad, !over, "linkbound: a point below the full pane's bottom is not")
+			}
+
+			// --- 2. the hazard: a pane too short for one line overflows ----------
+			//
+			// Height chosen so ybot - ytop is HALF a line: forced admits line 0 and
+			// its rect runs a half-line past the pane's bottom edge, into the strip
+			// where the status bar is drawn.
+			short_H := CONTENT_TOP + TOP_INSET + line_h * 0.5 + STATUS_BAR_H
+			sx0, sx1, sytop, sybot, sbox_ok := md_pane_box(&doc, W, short_H, 0.5)
+			lchk(&bad, sbox_ok && sybot - sytop < line_h && sybot > sytop, fmt.tprintf("linkbound: the short pane is under one line tall (%.1f of %.1f)", sybot - sytop, line_h))
+			if !sbox_ok {return}
+			short := markdown_links(&h.gfx, &h.text, &doc, px_, sx0, sx1, sytop, sybot, Md_Anchor{}, context.temp_allocator)
+			worst := f32(0)
+			for hit in short {worst = max(worst, hit.rect.pos.y + hit.rect.size.y)}
+			lchk(
+				&bad, len(short) > 0 && worst > sybot + 1,
+				fmt.tprintf("linkbound: forced admission really does put %d rect(s) past the pane (%.1f > %.1f)", len(short), worst, sybot),
+			)
+			if len(short) == 0 || worst <= sybot + 1 {return}
+			// ...and those pixels really are the status bar's, or "invisible but
+			// clickable" is not what is being described.
+			lchk(&bad, sybot >= short_H - STATUS_BAR_H - 0.5, fmt.tprintf("linkbound: the pane ends where the status bar begins (%.1f, bar from %.1f)", sybot, short_H - STATUS_BAR_H))
+
+			// --- 3. and it is not clickable there --------------------------------
+			//
+			// Every overflowing rect is probed at its own midpoint below the pane,
+			// through md_preview_link_at -- the one proc BOTH the hand cursor and
+			// the Ctrl+click go through. md_link_at over the same hits is asked as
+			// well, and is EXPECTED to say yes: that is the difference the bound
+			// makes, stated rather than assumed, so a reader can see the refusal is
+			// the wrapper's and not an accident of the rects.
+			probed, live, raw_live := 0, 0, 0
+			for hit in short {
+				bot := hit.rect.pos.y + hit.rect.size.y
+				if bot <= sybot + 1 {continue}
+				my := (max(hit.rect.pos.y, sybot) + bot) * 0.5
+				if my < sybot {continue}
+				mx := hit.rect.pos.x + hit.rect.size.x * 0.5
+				probed += 1
+				if _, over := md_preview_link_at(&h.gfx, &h.text, &doc, px_, W, short_H, 0.5, mx, my); over {live += 1}
+				if _, over := md_link_at(short, mx, my); over {raw_live += 1}
+			}
+			lchk(&bad, probed > 0, fmt.tprintf("linkbound: %d overflowing rect(s) probed below the pane", probed))
+			lchk(&bad, live == 0, fmt.tprintf("linkbound: none of them is clickable over the status bar (%d of %d live)", live, probed))
+			lchk(&bad, raw_live == probed, fmt.tprintf("linkbound: ...and the raw point-in-rect DOES hit all of them, so the refusal is the bound's (%d of %d)", raw_live, probed))
+			return
+		}
+
 		// markdown_links places at least one rectangle on every wrapped line the
 		// pass emits. Those rectangles are md_span_boxes over the SHAPER's own glyph
 		// positions, offset by md_block_origin -- the same geometry the glyphs are
@@ -7945,6 +8068,7 @@ when NEWTPAD_TESTS {
 			bad += md_draw_selftest()
 			bad += md_head_fit_selftest()
 			bad += md_partial_selftest()
+			bad += md_link_bound_selftest()
 			bad += md_band_admit_selftest()
 			bad += md_table_fit_selftest()
 			bad += md_table_wrap_selftest()
