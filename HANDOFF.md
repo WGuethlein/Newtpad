@@ -373,10 +373,14 @@ were the priorities. Read P2 as the live list, with these amendments:
   line the captured span lies on, and does that row still fit under the sticky header — so the
   scrollbar drag, Page Up/Down, a find jump, a session restore and a window resize are all covered.
   Covered by `tablegridtest`'s `tg_edit_anchor`; both halves of the guard were sabotaged separately and
-  each failed exactly the routes it owns. **Its Wheel route is not evidence for the guard**: the wheel
-  arm commits inline in the frame loop and the test replays that arm by hand, so those four assertions
-  stay green with the guard removed. Four of the five routes are the guard's; the Wheel route documents
-  the pre-existing inline commit.
+  each failed exactly the routes it owns. **Its Wheel route was never evidence for the guard**: the
+  wheel arm commits inline in the frame loop and the test replays that arm by hand, so those four
+  assertions stay green with the guard deleted — verified 2026-07-30, and the entry used to claim the
+  test *"drives all five routes."* It drives five; four of them were the guard's. A sixth route,
+  `Wheel_Bare`, now runs the same scroll with the inline commit omitted, which is what the frame loop
+  would look like if that line were ever removed: with the guard sabotaged, `Wheel` stays green on all
+  four assertions and `Wheel_Bare` fails all four. The wheel is covered by something falsifiable now,
+  and `Wheel` stays as documentation of the inline commit, whose hand-copy can drift.
 - **A REORDER under a live cell edit needed a third compare, and the first version of the guard did
   not have it** (reviewed 2026-07-30). The entry above used to claim the row-start compare caught a
   sort as well. **It did not, and the claim was the trap:** the compare was `table_row_start(doc, r) ==
@@ -400,6 +404,38 @@ were the priorities. Read P2 as the live list, with these amendments:
   and `.Toggle_Table` all reach the splice without passing the guard. Covered by `tg_edit_permute`
   (Guard / Enter / Control routes, equal-length fixture); with the byte-offset compare restored it
   fails 5 assertions, and the Enter route loses row 12's id outright (`"00013,…" appears 0 time(s)`).
+- ~~**Reported by Wyatt 2026-07-29 (D1): Ctrl+V with the find bar focused pasted into the DOCUMENT.**~~
+  **FIXED** in batch 18 (`resolve_key` / `find_fallback_writes_doc`, `commands.odin`; `.Find_Paste`,
+  `find_paste`, `find.odin`). Recorded here because `docs/reported-bugs.md`'s own rule says a shipped
+  item is deleted from the queue and written up here instead, and the first pass deleted it without
+  writing anything — the widest-blast-radius fix in the branch existed only in a commit message.
+  **It was never only about paste.** `resolve_key` falls the `.Find` context back to the `.Editor`
+  bindings for *modified* chords, which is deliberate and right for reads (Ctrl+S, Ctrl+P, the tab
+  chords should not die because a bar is open) — but it handed the find bar **six writers**: Ctrl+V
+  pasted, Ctrl+X cut the document's selection, Ctrl+Z/Ctrl+Y undid and redid it, Ctrl+Backspace deleted
+  a word behind an invisible caret, and Alt+Up/Down moved document lines. All of them under a bar whose
+  viewport takes no keystrokes, so **nothing typed there could be taken back without closing the bar
+  first.**
+  **The document really did become dirty**, which is what makes this data loss rather than a curiosity:
+  dirty tab, save prompt on close, and no undo reachable while the bar is open. Measured by walking
+  `pt.length` through the chords: **18 → 6 → 18 → 6 → 0**.
+  **And the filter bar IS the find bar** (`find_open(doc, …)` plus `doc.filter`), which is the surface
+  Wyatt reported it on — so plain Find and Replace had exactly the same hole on exactly the same chords.
+  **Fixed as a class, not as six chords**: `find_fallback_writes_doc` refuses the fallback for anything
+  `command_mutates_doc` names, with `.Find_Replace_One` / `.Find_Replace_All` as the two stated
+  exceptions (they are declared in `.Editor` and not in `.Find`, so the fallback is the only way they
+  reach the replace row). Ctrl+V then got a real binding, `.Find_Paste` → `find_paste`, which takes the
+  clipboard's first line into the focused field. **Read `find_fallback_writes_doc`'s own comment before
+  trusting the word "class"** — the predicate it composes from is the table-view read-only set, not the
+  buffer writers, and the difference is written up there.
+  **Two asymmetries were left behind on purpose, and they are the ones to look at first if this comes
+  back:** `Alt+Shift+Left/Right` still extends a **column rectangle** from the find bar while
+  `Alt+Shift+Up/Down` no longer does (the vertical pair are on the mutating predicate, the horizontal
+  pair are not — a column selection is not a write, so neither is wrong, but the pair now behaves
+  differently); and `Ctrl+C`/`Ctrl+A` still act on the **document**, not on the query, because the find
+  fields have no selection model at all (`find_backspace` deletes from the end; there is no caret). Both
+  are reads. A `Find_Select_All` / `Find_Copy` pair would close the second, and `keytest` pins both as
+  deliberate so the next reader knows nobody forgot them.
 - **Carried from batch 18 review (F6): table zebra-band parity is viewport-anchored, so every
   odd-row scroll inverts every band.** Documented and accepted as shippable in `table_draw`'s own
   comment (parity by visible row index, not absolute file position, because the absolute index needs an

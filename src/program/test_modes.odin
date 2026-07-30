@@ -114,6 +114,15 @@ when NEWTPAD_TESTS {
 		key_chk(&bad, resolve_key(.X, true, false, .Find), .None, "Ctrl+X / Find (no write)")
 		key_chk(&bad, resolve_key(.Up, false, true, .Find), .None, "Alt+Up / Find (no write)")
 		key_chk(&bad, resolve_key(.Down, false, true, .Find), .None, "Alt+Down / Find (no write)")
+		// The asymmetry D1 left behind, pinned so nobody rediscovers it as a bug.
+		// Alt+Shift+Left/Right still extends a COLUMN RECTANGLE from the find bar
+		// while Alt+Shift+Up/Down no longer does anything: the vertical pair resolve
+		// to .Move_Line_Up/.Move_Line_Down, which command_mutates_doc names, and the
+		// horizontal pair to .Block_Extend_Left/Right, which it does not, because a
+		// column selection is not a buffer write. Neither is wrong on its own and the
+		// pair is uneven, which is the kind of thing that reads as a defect later.
+		key_chk(&bad, resolve_key(.Left, false, true, .Find), .Block_Extend_Left, "Alt+Left / Find (still falls)")
+		key_chk(&bad, resolve_key(.Right, false, true, .Find), .Block_Extend_Right, "Alt+Right / Find (still falls)")
 		// The two replace verbs ARE the exception, and they have to be: they are
 		// declared in .Editor and not in .Find, so the fallback is the only way they
 		// reach the replace row. See find_fallback_writes_doc.
