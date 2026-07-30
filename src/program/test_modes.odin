@@ -4143,6 +4143,366 @@ when NEWTPAD_TESTS {
 			}
 			return bad
 		}
+
+		// PARTIAL BLOCKS: a block taller than the pane's remaining room draws the
+		// lines that FIT, not nothing.
+		//
+		// Wyatt's report from live use of v0.31.x, with screenshots: a heading
+		// rendered, then roughly 200px of blank pane, and widening the window by ONE
+		// pixel brought the whole following paragraph in at once. The cause was
+		// whole-block admission -- md_block_fits against Md_Layout.h at md_pass's
+		// admit site -- which is defensible for a heading (one line, fits or does
+		// not) and wrong for a paragraph, which since batch 17 is an arbitrary
+		// number of shaped lines. CLAUDE.md's "Viewport-first: no frame ever shows
+		// emptiness" is the rule it broke.
+		//
+		// HOW THIS IS MEASURED, and why it is not a second derivation of the draw:
+		// the fixture's paragraph is nothing but links, one per word, so
+		// markdown_links places at least one rectangle on every wrapped line the
+		// pass emits. Those rectangles are md_span_boxes over the SHAPER's own glyph
+		// positions, offset by md_block_origin -- the same geometry the glyphs are
+		// drawn at, by construction. So the line count, each line's bottom edge and
+		// the hit-test all come off one pass. The pixels are then read back
+		// separately, because a rectangle nobody painted into would satisfy every
+		// rectangle-level assertion here.
+		//
+		// Its own procedure with its own device and one Document alive at a time:
+		// test_mode_dispatch's frame has hit STATUS_STACK_OVERFLOW twice.
+		md_partial_selftest :: proc() -> (bad: int) {
+			pchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1000, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/partial") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			px_ := f32(24)
+			bg := g_theme[.Bg_Base]
+
+			// Ink in the half-open row band [lo, hi), inside the pane's columns.
+			ink_band :: proc(pix: []u8, lo, hi: f32, x0, x1: f32, W, H: int) -> (inked, topmost: int) {
+				bgc := g_theme[.Bg_Base]
+				topmost = -1
+				for yy in clamp(int(lo), 0, H) ..< clamp(int(hi), 0, H) {
+					for xx in clamp(int(x0), 0, W) ..< clamp(int(x1), 0, W) {
+						i := (yy * W + xx) * 4
+						d :=
+							abs(int(pix[i]) - int(bgc[2] * 255)) +
+							abs(int(pix[i + 1]) - int(bgc[1] * 255)) +
+							abs(int(pix[i + 2]) - int(bgc[0] * 255))
+						if d > 24 {
+							inked += 1
+							if topmost < 0 {topmost = yy}
+						}
+					}
+				}
+				return
+			}
+			// Which block a link rectangle belongs to, read off the URL the fixture
+			// wrote -- so a rectangle is attributed by the DOCUMENT's own text and
+			// never by comparing its y against a boundary this test computed.
+			is_para :: proc(url: string) -> bool {
+				return len(url) >= 5 && url[len(url) - 5] == '/' && url[len(url) - 4] == 'w'
+			}
+			// Distinct line tops among a pass's paragraph rectangles == the number of
+			// the paragraph's lines that pass DREW.
+			para_lines :: proc(hits: []Md_Link_Hit) -> (n: int, top, bot, line_h: f32) {
+				tops := make([dynamic]f32, 0, 24, context.temp_allocator)
+				top = max(f32)
+				for hit in hits {
+					if !is_para(hit.url) {continue}
+					line_h = max(line_h, hit.rect.size.y)
+					top = min(top, hit.rect.pos.y)
+					bot = max(bot, hit.rect.pos.y + hit.rect.size.y)
+					seen := false
+					for t in tops {
+						if abs(t - hit.rect.pos.y) < 0.5 {
+							seen = true
+							break
+						}
+					}
+					if !seen {append(&tops, hit.rect.pos.y)}
+				}
+				n = len(tops)
+				if n == 0 {top = 0}
+				return
+			}
+
+			// A one-line lead paragraph, then the tall one. The lead is load-bearing:
+			// under whole-block admission the last thing the pane paints IS the lead,
+			// so the distance from its bottom edge to ybot is exactly the hole in
+			// Wyatt's screenshot, and it gives the "unused pane" measurement below a
+			// number to report instead of nothing at all.
+			b := strings.builder_make()
+			defer strings.builder_destroy(&b)
+			strings.write_string(&b, "[lead](https://e.test/lead) line\n\n")
+			for i in 0 ..< 90 {
+				if i > 0 {strings.write_string(&b, " ")}
+				fmt.sbprintf(&b, "[w%03d](https://e.test/w%03d)", i, i)
+			}
+			strings.write_string(&b, "\n")
+			src := strings.to_string(b)
+			para_start := len("[lead](https://e.test/lead) line\n\n")
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "partial.md", .UTF8)
+			doc.md_mode = .Preview
+			defer doc_close(&doc)
+			x0, x1, ytop, ybot_full, box_ok := md_pane_box(&doc, W, H, 0.5)
+			pchk(&bad, box_ok, "partial: the pane box resolves")
+			if !box_ok {return}
+
+			// Calibration, from a pass with the WHOLE pane: the paragraph's line
+			// geometry is the draw's, not the test's idea of the shaper's.
+			plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+			markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot_full, Md_Anchor{})
+			full := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot_full, Md_Anchor{}, context.temp_allocator)
+			nlines, para_top, para_bot, line_h := para_lines(full)
+			pchk(&bad, nlines >= 4, fmt.tprintf("partial: the fixture's paragraph wraps to several lines (%d)", nlines))
+			pchk(&bad, line_h > 1, fmt.tprintf("partial: ...and its line height came back from the draw (%.1f)", line_h))
+			// Uniform line boxes -- one face, one size -- which is what makes "one
+			// more line per line-height of pane" a statement about a constant below.
+			pchk(
+				&bad, nlines > 0 && abs(para_bot - para_top - f32(nlines) * line_h) < 1.5,
+				fmt.tprintf("partial: ...and its line boxes tile uniformly (%.1f over %d x %.1f)", para_bot - para_top, nlines, line_h),
+			)
+			if nlines < 4 || line_h <= 1 {return}
+			// The paragraph must be taller than the whole pane is NOT the case here
+			// on purpose: the defect needs a paragraph that fits SOMEWHERE, so the
+			// sweep can cross every one of its line boundaries inside one window.
+			pchk(&bad, para_bot < ybot_full, fmt.tprintf("partial: ...and it fits the full pane, so the sweep can cross every boundary (%.0f < %.0f)", para_bot, ybot_full))
+
+			// --- the sweep -------------------------------------------------------
+			//
+			// ybot from "the paragraph's first line ought to fit" up to one line past
+			// "all of it fits". `lo` is derived from the calibration draw, so the
+			// sweep's own start is not an assumption about the type scale.
+			lo := int(para_top + line_h) + 1
+			hi := min(int(para_bot + line_h), int(ybot_full))
+			cnt := make([]int, nlines + 2, context.temp_allocator)
+			prev := -1
+			nonmono, over, hole, seam, ghost, pix_hole, pix_over := 0, 0, 0, 0, 0, 0, 0
+			worst_hole, worst_hole_yb := f32(0), -1
+			worst_over, worst_over_yb := f32(0), -1
+			pix_hole_yb, pix_over_yb, pix_over_top := -1, -1, -1
+			seam_yb, ghost_yb := -1, -1
+			swept := 0
+			for yb := lo; yb <= hi; yb += 1 {
+				ybot := f32(yb)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+				swept += 1
+				np, _, _, _ := para_lines(hits)
+				// The lowest edge anything the pass drew reaches.
+				last_bot := f32(0)
+				for hit in hits {last_bot = max(last_bot, hit.rect.pos.y + hit.rect.size.y)}
+				if np <= nlines + 1 {cnt[np] += 1}
+
+				// 1. Monotone: a taller pane never draws FEWER lines.
+				if prev >= 0 && np < prev {nonmono += 1}
+				prev = np
+
+				// 2. No drawn line's bottom exceeds ybot. This is the property
+				//    whole-block admission was protecting, and per-line admission
+				//    must keep: there is no scissor rect here.
+				if last_bot > ybot + 0.01 {
+					over += 1
+					if last_bot - ybot > worst_over {worst_over, worst_over_yb = last_bot - ybot, yb}
+				}
+
+				// 3. THE REPORTED BUG. While the paragraph is incomplete, the pane
+				//    cannot have a whole line-height of room going unused below the
+				//    last line drawn -- if it did, another line would have fitted.
+				//    Whole-block admission fails this by the paragraph's entire
+				//    height, because the last thing drawn is the LEAD.
+				if np < nlines {
+					if g := ybot - last_bot; g > line_h + 0.5 {
+						hole += 1
+						if g > worst_hole {worst_hole, worst_hole_yb = g, yb}
+					}
+				}
+
+				// 4. THE SEAM. Every rectangle the pass emitted must hit-test back to
+				//    its OWN block -- including the last line drawn, which sits at the
+				//    pane's bottom edge. md_block_at_y mirrors the admit rule; if the
+				//    draw admits three lines of a paragraph and the map still believes
+				//    the block was refused, a click names a block that is not there.
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, W, H, 0.5)
+				c.pane = ybot - c.ytop
+				if !cok {
+					seam += 1
+				} else {
+					for hit in hits {
+						want := para_start if is_para(hit.url) else 0
+						got, ok := md_block_at_y(&c, Md_Anchor{}, hit.rect.pos.y + hit.rect.size.y * 0.5)
+						if !ok || got != want {
+							seam += 1
+							if seam_yb < 0 {seam_yb = yb}
+						}
+					}
+					// ...and the other direction: a row below the last line DRAWN is a
+					// row the pane never painted, so it must name nothing. Without this
+					// the map could simply accept the block's whole slot and pass 4.
+					if np < nlines && last_bot + 1 < ybot {
+						if _, gok := md_block_at_y(&c, Md_Anchor{}, last_bot + 1); gok {
+							ghost += 1
+							if ghost_yb < 0 {ghost_yb = yb}
+						}
+					}
+				}
+
+				// 5. The same two properties in PIXELS, because 2 and 3 are claims
+				//    about rectangles and this is a claim about ink.
+				if pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); pok {
+					if inked, topmost := ink_band(pix, ybot, f32(H), x0, x1, W, H); inked > 0 {
+						pix_over += 1
+						if pix_over_yb < 0 {pix_over_yb, pix_over_top = yb, topmost}
+					}
+					// Two line-heights, not one: the last drawn line's box ends at
+					// last_bot <= ybot and its ink is inside [last_bot - line_h,
+					// last_bot), which a one-line-high window at ybot can miss
+					// entirely when ybot - last_bot approaches line_h.
+					if np < nlines {
+						if inked, _ := ink_band(pix, ybot - line_h * 2, ybot, x0, x1, W, H); inked == 0 {
+							pix_hole += 1
+							if pix_hole_yb < 0 {pix_hole_yb = yb}
+						}
+					}
+				}
+			}
+
+			pchk(&bad, swept >= int(line_h) * 3, fmt.tprintf("partial: the sweep crosses several line boundaries (%d ybot values, line_h %.1f)", swept, line_h))
+			// Non-vacuity: the sweep must actually see the paragraph go from
+			// partially drawn to whole, or 3 and 5 are assertions about nothing.
+			partial_seen := 0
+			for k in 1 ..< nlines {partial_seen += cnt[k]}
+			pchk(&bad, partial_seen > 0, fmt.tprintf("partial: ...and really does spend most of it PARTWAY through the paragraph (%d of %d ybots)", partial_seen, swept))
+			pchk(&bad, cnt[nlines] > 0, fmt.tprintf("partial: ...and reaches the whole paragraph too (%d ybots)", cnt[nlines]))
+
+			// One more line per line-height of pane, stated as the count of ybot
+			// values that draw exactly k lines. A rule that admitted two lines at a
+			// step, or none, moves these counts off line_h.
+			steps_bad, worst_k, worst_cnt := 0, -1, -1
+			for k in 1 ..< nlines {
+				if abs(f32(cnt[k]) - line_h) > 1.5 {
+					steps_bad += 1
+					if worst_k < 0 {worst_k, worst_cnt = k, cnt[k]}
+				}
+			}
+			pchk(
+				&bad, steps_bad == 0,
+				fmt.tprintf("partial: the pane draws exactly one MORE line per line-height (%d of %d steps off; k=%d held for %d px, want %.1f)", steps_bad, nlines - 1, worst_k, worst_cnt, line_h),
+			)
+			pchk(&bad, nonmono == 0, fmt.tprintf("partial: a taller pane never draws fewer lines (%d regressions)", nonmono))
+			pchk(&bad, over == 0, fmt.tprintf("partial: no drawn line's bottom passes ybot (%d ybots, worst %.1fpx over at ybot=%d)", over, worst_over, worst_over_yb))
+			pchk(
+				&bad, hole == 0,
+				fmt.tprintf("partial: never a line-height of unused pane below the last line (%d ybots, worst %.1fpx of %.1f at ybot=%d)", hole, worst_hole, line_h, worst_hole_yb),
+			)
+			pchk(&bad, seam == 0, fmt.tprintf("partial: every drawn line hit-tests back to its own block (%d wrong, first at ybot=%d)", seam, seam_yb))
+			pchk(&bad, ghost == 0, fmt.tprintf("partial: ...and a row below the last line drawn names nothing (%d wrong, first at ybot=%d)", ghost, ghost_yb))
+			pchk(&bad, pix_over == 0, fmt.tprintf("partial: PIXELS -- nothing is inked at or below ybot (%d ybots, first ybot=%d topmost y=%d)", pix_over, pix_over_yb, pix_over_top))
+			pchk(
+				&bad, pix_hole == 0,
+				fmt.tprintf("partial: PIXELS -- the bottom two line-heights of pane are never blank (%d ybots, first ybot=%d)", pix_hole, pix_hole_yb),
+			)
+
+			// --- the wheel over a partial block, and the ceiling ------------------
+			//
+			// md_pass leaves `bottom` at a partially drawn block's START, so the only
+			// thing that advances into one is the PIXEL anchor (Md_Anchor.px). Two
+			// things have to be true of that for the reader: stepping down must
+			// REVEAL the paragraph's next line rather than step over it, and the
+			// ceiling md_max_anchor derives must still let its LAST line be reached.
+			//
+			// Asserted as coverage over the fixture's 90 words rather than as
+			// arithmetic about anchors: in a pane too short to hold the paragraph at
+			// once, every word must be drawn at some scroll position on the way to the
+			// ceiling. A skipped line, or a ceiling that stops short, leaves words
+			// behind. The step is exactly one line-height -- the sharpest version of
+			// "did it step over a line".
+			{
+				sybot := para_top + line_h * 3 // three of the paragraph's lines fit
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, W, H, 0.5)
+				c.pane = sybot - c.ytop
+				pchk(&bad, cok, "partial: the scroll context resolves for the short pane")
+				seen := make([]bool, 90, context.temp_allocator)
+				a := Md_Anchor{}
+				steps, at_top := 0, 0
+				for steps = 0; steps < 400; steps += 1 {
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, c.ytop, sybot, a)
+					hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, c.ytop, sybot, a, context.temp_allocator)
+					if steps == 0 {at_top, _, _, _ = para_lines(hits)}
+					for hit in hits {
+						if !is_para(hit.url) || len(hit.url) < 3 {continue}
+						t := hit.url[len(hit.url) - 3:]
+						w := int(t[0] - '0') * 100 + int(t[1] - '0') * 10 + int(t[2] - '0')
+						if w >= 0 && w < 90 {seen[w] = true}
+					}
+					nxt := md_scroll_clamp(&c, md_scroll_px(&c, a, line_h))
+					if nxt == a {break}
+					a = nxt
+				}
+				miss, first_miss := 0, -1
+				for s, i in seen {
+					if !s {
+						miss += 1
+						if first_miss < 0 {first_miss = i}
+					}
+				}
+				pchk(
+					&bad, at_top > 0 && at_top < nlines,
+					fmt.tprintf("partial: the wheel's pane is genuinely too short for the paragraph (%d of %d lines at the top)", at_top, nlines),
+				)
+				pchk(&bad, steps > 2 && steps < 400, fmt.tprintf("partial: ...and the wheel reaches the ceiling in a bounded number of steps (%d)", steps))
+				pchk(
+					&bad, miss == 0,
+					fmt.tprintf("partial: scrolling a partly drawn paragraph reveals every one of its lines (%d of 90 words never drawn, first w%03d)", miss, first_miss),
+				)
+			}
+
+			// --- `forced`, narrowed from the first BLOCK to its first LINE --------
+			//
+			// The waiver exists so a pane too short for even one block shows something
+			// rather than nothing (md_head_fit_selftest's "forced:" row pins that, for
+			// a one-line heading, and it is unchanged). What changed here is its
+			// EXTENT: it used to admit the whole first block, so a pane pinned at ytop
+			// with a seven-line paragraph first drew all seven and let the cover strip
+			// eat six -- six lines of glyphs painted over the tab rail and the status
+			// bar in the frames before the strip lands, and six lines of link
+			// rectangles nobody could see. It now admits exactly one line. Stated as
+			// its own assertion because it is a behaviour change, not a bug fix.
+			{
+				b2 := strings.builder_make()
+				defer strings.builder_destroy(&b2)
+				for i in 0 ..< 90 {
+					if i > 0 {strings.write_string(&b2, " ")}
+					fmt.sbprintf(&b2, "[w%03d](https://e.test/w%03d)", i, i)
+				}
+				strings.write_string(&b2, "\n")
+				fsrc := strings.to_string(b2)
+				fcontent := make([]u8, len(fsrc))
+				copy(fcontent, fsrc)
+				fdoc := doc_from_content(fcontent, "forcedpara.md", .UTF8)
+				fdoc.md_mode = .Preview
+				defer doc_close(&fdoc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &fdoc, px_, x0, x1, ytop, ytop, Md_Anchor{})
+				fh := markdown_links(&h.gfx, &h.text, &fdoc, px_, x0, x1, ytop, ytop, Md_Anchor{}, context.temp_allocator)
+				fn, _, _, _ := para_lines(fh)
+				pchk(&bad, fn == 1, fmt.tprintf("partial: a pane too short for one line still shows exactly ONE (%d lines)", fn))
+			}
+			return
+		}
 		// mdtest's TYPE-SCALE checks (UI spec 9.3).
 		//
 		// Pure arithmetic, and it is pinned exactly rather than approximately for
@@ -6335,6 +6695,7 @@ when NEWTPAD_TESTS {
 			bad := md_selftest()
 			bad += md_draw_selftest()
 			bad += md_head_fit_selftest()
+			bad += md_partial_selftest()
 			bad += md_metrics_selftest()
 			bad += md_seam_selftest()
 			bad += md_cache_selftest()
