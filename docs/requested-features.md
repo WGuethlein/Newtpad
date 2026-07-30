@@ -1,8 +1,9 @@
 # Requested and owed features
 
-The counterpart to [reported-bugs.md](reported-bugs.md). **Bugs live there; features live here.**
-Same rule: **when an item ships, delete it from here and record it in the HANDOFF entry instead.** This
-is a queue, not a history.
+One of three lists: **bugs** live in [reported-bugs.md](reported-bugs.md), **what already works** in
+[features.md](features.md), and everything owed or asked for lives here.
+Same rule as the bug list: **when an item ships, delete it from here and record it in the HANDOFF entry
+instead** (and add it to `features.md`). This is a queue, not a history.
 
 Compiled 2026-07-30 by sweeping HANDOFF §5/§6 and every `### Owed` section, `docs/ui-spec/`,
 `docs/2026-07-25-forgotten-feature-audit.md`, `docs/live-pass-*.md`, and the project memory. Where an

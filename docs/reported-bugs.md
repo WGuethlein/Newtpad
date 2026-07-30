@@ -3,6 +3,9 @@
 Bugs Wyatt reports from daily use **between** live passes. A live-pass checklist covers one release;
 this file catches everything else, so a report made mid-batch is not lost to a chat transcript.
 
+The other two lists: [requested-features.md](requested-features.md) for what is owed or asked for, and
+[features.md](features.md) for what already works.
+
 **How to use it:** when a batch is being scoped, read this file. When an item ships, delete it from here
 and record it in the HANDOFF entry instead — this file is a queue, not a history.
 
