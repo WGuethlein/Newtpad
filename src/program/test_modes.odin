@@ -6929,9 +6929,14 @@ when NEWTPAD_TESTS {
 			// dropped term in the real gate fails these checks, not just a
 			// hand-rolled stand-in for it.
 			{
-				gated :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ed_right, mx, my: f32) -> (blk: int, hit: bool) {
+				// `clicks` defaults to 2 -- the gesture's own binding (a DOUBLE press,
+				// see md_split_click_gate) -- so every row below still exercises the
+				// PANE bound it was written for rather than being refused by the
+				// binding before it gets there. The binding itself is
+				// md_click_bind_selftest's subject.
+				gated :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ed_right, mx, my: f32, clicks := 2) -> (blk: int, hit: bool) {
 					ro := ro_surface_swallows(doc.table, doc.md_mode, mx >= ed_right, Drag_Latches{})
-					return md_split_click_gate(doc, c, ro, ed_right, mx, my)
+					return md_split_click_gate(doc, c, ro, clicks, ed_right, mx, my)
 				}
 
 				b := strings.builder_make()
@@ -7452,6 +7457,116 @@ when NEWTPAD_TESTS {
 			return
 		}
 
+		// Split's click-to-sync-scroll is bound to a DOUBLE press, and the subject
+		// here is that BINDING -- Wyatt's report, 2026-07-29: "when you click in the
+		// markdown preview on split mode it shifts the edit side up/down." The
+		// capability is spec'd (9.1, 9.4) and stays; what was wrong is that a plain
+		// single press moved the other half of the window.
+		//
+		// ASSERTED ON doc.top, not on the gate's return value. "The gate said no" and
+		// "the editor did not move" are different claims, and the one Wyatt made is
+		// the second -- which is why md_split_click_sync exists as a callable proc
+		// (main.odin) rather than four lines inside main()'s unreachable WM_* loop.
+		//
+		// The single-press rows cannot be vacuously green: every case fires the SAME
+		// (mx, my) through the SAME proc and differs only in `clicks`, and the
+		// double-press case in the middle proves those coordinates do name a block
+		// whose sync moves doc.top by a nonzero amount. A gate that refused this
+		// point for any other reason would fail that row, not pass these ones.
+		//
+		// Its own procedure for this file's usual reason: these frames are enormous
+		// and three have hit STATUS_STACK_OVERFLOW.
+		md_click_bind_selftest :: proc() -> (bad: int) {
+			bchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 800, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/clickbind") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+
+			px_ := f32(24)
+			winw, winh := f32(W), f32(H)
+
+			b := strings.builder_make()
+			defer strings.builder_destroy(&b)
+			for i in 0 ..< 60 {fmt.sbprintf(&b, "para %03d text here\n", i)}
+			src := strings.to_string(b)
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "clickbind.md", .UTF8)
+			doc.md_mode = .Split
+			doc.view_cols = 80
+			defer doc_close(&doc)
+
+			split_frac := f32(0.5)
+			ed_right := doc_editor_right(&doc, winw, split_frac)
+			c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, split_frac)
+			bchk(&bad, cok, "bind: the scroll context resolves for a Split document")
+			if !cok {return}
+
+			// ONE point, used by every case below: inside the preview pane's columns,
+			// and far enough down it that the block it names is not the one doc.top
+			// already sits on -- otherwise "did not move" would be true of both
+			// bindings.
+			mx := ed_right + 20
+			my := c.ytop + c.pane * 0.5
+			rows := max(1, int(c.pane / line_height(px_)))
+			ro := ro_surface_swallows(doc.table, doc.md_mode, mx >= ed_right, Drag_Latches{})
+			bchk(&bad, ro, "bind: precondition -- the preview half of a Split swallows the press (ro_surface_swallows)")
+
+			// 1. A SINGLE press. window.mouse_count is 1 for a lone press, so this is
+			// what Wyatt's stray click is.
+			doc.top, doc.md_sync_top = 0, 0
+			single := md_split_click_sync(&doc, &h.text, &c, ro, 1, ed_right, mx, my, rows)
+			top_single, sync_single := doc.top, doc.md_sync_top
+			bchk(&bad, !single, "bind: a single press in the preview half does not sync")
+			bchk(&bad, top_single == 0, fmt.tprintf("bind: a single press leaves doc.top ALONE -- the reported bug (%d)", top_single))
+			bchk(&bad, sync_single == 0, fmt.tprintf("bind: ...and leaves the preview's own anchor byte alone too (%d)", sync_single))
+
+			// 2. A DOUBLE press, same point. The positive control that makes row 1 mean
+			// something, and the spec'd capability still working.
+			doc.top, doc.md_sync_top = 0, 0
+			double := md_split_click_sync(&doc, &h.text, &c, ro, 2, ed_right, mx, my, rows)
+			top_double, sync_double := doc.top, doc.md_sync_top
+			bchk(&bad, double, "bind: a double press at the SAME point does sync")
+			bchk(&bad, top_double > 0, fmt.tprintf("bind: ...and moves doc.top off the start, so row 1 is not vacuous (%d)", top_double))
+			bchk(&bad, sync_double == top_double, fmt.tprintf("bind: ...with the preview's anchor byte following it (%d vs %d)", sync_double, top_double))
+
+			// 3. A TRIPLE press's third. mouse_count reaches 3 before wrapping, and the
+			// block it names is the one the second press already scrolled to -- so this
+			// must be a no-op in EFFECT, landing on the same doc.top rather than
+			// somewhere else.
+			doc.top, doc.md_sync_top = 0, 0
+			triple := md_split_click_sync(&doc, &h.text, &c, ro, 3, ed_right, mx, my, rows)
+			bchk(&bad, triple && doc.top == top_double, fmt.tprintf("bind: a triple press's third still syncs, to the same block (%v, %d vs %d)", triple, doc.top, top_double))
+
+			// 4. The FOURTH press of a cluster. window.mouse_count wraps 3 -> 1
+			// (platform/window.odin), so the platform hands back the same 1 a lone
+			// press gets and the gesture stops rather than firing on every click after
+			// the third.
+			doc.top, doc.md_sync_top = 0, 0
+			fourth := md_split_click_sync(&doc, &h.text, &c, ro, 1, ed_right, mx, my, rows)
+			bchk(&bad, !fourth && doc.top == 0, fmt.tprintf("bind: the fourth press of a cluster (mouse_count wraps to 1) does not sync (%v, %d)", fourth, doc.top))
+
+			// 5. The binding is not the ONLY gate: a double press in the EDITOR half of
+			// the same window still must not sync. Without this row the fix could have
+			// been "any double press anywhere".
+			doc.top, doc.md_sync_top = 0, 0
+			emx := ed_right * 0.5
+			ero := ro_surface_swallows(doc.table, doc.md_mode, emx >= ed_right, Drag_Latches{})
+			ed_double := md_split_click_sync(&doc, &h.text, &c, ero, 2, ed_right, emx, my, rows)
+			bchk(&bad, !ed_double && doc.top == 0, fmt.tprintf("bind: a DOUBLE press in the editor half does not sync either (%v, %d)", ed_double, doc.top))
+			return
+		}
+
 		// `newtpad mdtest` covers the markdown block classifiers and inline parser
 		// (the rendering itself needs a live eye), PLUS the draw-level checks
 		// above that exercise markdown_draw's own call sites through a real
@@ -7469,6 +7584,7 @@ when NEWTPAD_TESTS {
 			bad += md_key_selftest()
 			bad += md_gap_selftest()
 			bad += md_scroll_selftest()
+			bad += md_click_bind_selftest()
 			bad += md_wheel_selftest()
 			bad += md_prop_selftest()
 			fmt.printfln("mdtest: %d failures", bad)

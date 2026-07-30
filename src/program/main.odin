@@ -646,14 +646,12 @@ main :: proc() {
 			// is the only one where a block in the preview names somewhere the
 			// editor could go. In full Preview a press stays inert, as it is today.
 			// The press is still swallowed below; this reads it on the way past.
-			// The gate itself (bounding this to the preview pane) is
-			// md_split_click_gate -- see its comment for why it is not inlined.
+			// The gate itself (bounding this to the preview pane, and to the
+			// DOUBLE press) is md_split_click_gate; the scroll it applies is
+			// md_split_click_sync -- see their comments for why neither is inlined.
 			if window.mouse_pressed && !plat.key_ctrl_down() {
 				if c, ok := md_scroll_ctx(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac); ok {
-					if blk, hit := md_split_click_gate(doc, &c, ro, ed_right, f32(window.mouse_x), f32(window.mouse_y)); hit {
-						doc.top = min(base.pt_line_start(&doc.pt, blk), doc_max_top(doc, &text, rows))
-						doc.md_sync_top = doc.top // the preview keeps its own pixel offset
-					}
+					md_split_click_sync(doc, &text, &c, ro, window.mouse_count, ed_right, f32(window.mouse_x), f32(window.mouse_y), rows)
 				}
 			}
 			if ro && (window.mouse_pressed || window.mouse_down) {
@@ -1224,6 +1222,23 @@ ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool
 // from `table` alone, not from which pane the press is in). x >= ed_right
 // restricts this to the preview pane's columns.
 //
+// THE GESTURE IS A DOUBLE PRESS, and that is the fix for Wyatt's report -- "when
+// you click in the markdown preview on split mode it shifts the edit side
+// up/down" (live use, 2026-07-29). The capability is spec'd (9.1 names
+// click-to-sync-scroll, 9.4 lists scroll sync as a Split rule) and stays; only
+// the binding changes. A single click is what people use to focus a pane or
+// dismiss something, and the other half of the window jumping in response to
+// one is hostile.
+//
+// `clicks` is window.mouse_count, which is the press INDEX within a
+// double-click-time/4px cluster: WM_LBUTTONDOWN increments it and wraps 3 -> 1
+// (platform/window.odin), so it is 1 on a lone press, 2 on the second press of
+// a double click, 3 on a triple's third. `>= 2` therefore means "not the first
+// press of a cluster": the second press syncs, and a triple's third press
+// re-syncs to the block the second one already named, which is where the view
+// is. Nothing else in the preview half claims a double press -- ro_surface_swallows
+// eats it before doc_select_word_at ever sees it -- so this takes no gesture away.
+//
 // The ROWS are md_block_at_y's own business, and that is a correction: this
 // procedure used to carry `my < c.ytop || my >= c.ytop + c.pane` as well, and
 // commented it as what kept the status bar and the find bar out. md_block_at_y
@@ -1242,9 +1257,33 @@ ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool
 // there could not be exercised at its own boundaries -- exactly the shape
 // that let the original `ro`-only gate ship unbounded. mdtest's "gate:"
 // checks call this directly.
-md_split_click_gate :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ro: bool, ed_right, mx, my: f32) -> (blk: int, hit: bool) {
-	if !ro || doc.md_mode != .Split || mx < ed_right {return}
+md_split_click_gate :: proc(doc: ^Document, c: ^Md_Scroll_Ctx, ro: bool, clicks: int, ed_right, mx, my: f32) -> (blk: int, hit: bool) {
+	if !ro || doc.md_mode != .Split || mx < ed_right || clicks < 2 {return}
 	return md_block_at_y(c, doc.md_top, my)
+}
+
+// The gesture's EFFECT, extracted from main()'s loop for the same reason the gate
+// was: main() is the live WM_* loop and cannot run headless, so the only thing a
+// test could reach was the gate's return value -- and a gate returning `false` is
+// not the same claim as "the editor did not move". The bug Wyatt reported is
+// about `doc.top` moving, so `doc.top` is what a test has to be able to watch.
+//
+// Returns whether it scrolled. `doc.md_sync_top` follows `doc.top` because the
+// preview keeps its own pixel offset, and the sync is what re-anchors it.
+md_split_click_sync :: proc(
+	doc: ^Document,
+	t: ^plat.Text,
+	c: ^Md_Scroll_Ctx,
+	ro: bool,
+	clicks: int,
+	ed_right, mx, my: f32,
+	rows: int,
+) -> bool {
+	blk, hit := md_split_click_gate(doc, c, ro, clicks, ed_right, mx, my)
+	if !hit {return false}
+	doc.top = min(base.pt_line_start(&doc.pt, blk), doc_max_top(doc, t, rows))
+	doc.md_sync_top = doc.top
+	return true
 }
 
 // The vertical scrollbar's track, in client pixels. ONE definition, consumed by

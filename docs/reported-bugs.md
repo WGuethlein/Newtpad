@@ -8,25 +8,6 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
-## Clicking the markdown preview in Split shifts the editor pane
-
-**Reported 2026-07-29.** Wyatt: *"when you click in the markdown preview on split mode it shifts the
-edit side up/down."*
-
-**This is batch 17's click-to-sync working as designed, and he is reporting it as a bug.** UI spec §9.1
-asks for it by name — *"click-to-sync-scroll, which only needs the nearest BLOCK"* — and §9.4 lists
-scroll sync as a Split rule. So the capability is wanted; **binding it to a plain single press is what is
-wrong.** A single click is what people use to focus a pane or dismiss something, and having the other
-half of the window jump in response is hostile.
-
-**Recommended fix, needs his confirmation:** move it to **double-click**. That keeps the spec'd
-capability, makes it a deliberate gesture, and stops a stray click moving the editor. Alternatives worth
-putting to him: Ctrl+click (but Ctrl is already the link modifier), or a command in the palette with no
-mouse binding at all.
-
-**Do not simply delete it** — it is a spec'd feature, and the mapping underneath it is also what the
-scrollbar and the pane sync use.
-
 ## The preview does not always respect spaces
 
 **Reported 2026-07-29** with a side-by-side screenshot of the editor and the preview. Wyatt: *"it looks
