@@ -2076,17 +2076,65 @@ on_dpi :: proc "contextless" (user: rawptr) {
 	plat.text_reset_atlas(rc.text)
 }
 
+// The FIRST block of a resize repaint's temp arena, and only the first: a
+// runtime.Arena takes another block from the heap when a request does not fit, so
+// this is a "how many mallocs" knob and never a correctness one. 256 KB because
+// the PREVIEW PANE alone asks for 100.5 KB on the document and scroll position the
+// crash dumps point at (resizetemptest measures and prints it), and the rest of
+// the frame draws out of the same arena, so the common case is one block.
+RESIZE_TEMP_BLOCK :: 256 * 1024
+
+// The temp allocator a resize repaint runs on, and the ONE producer of it, so
+// resizetemptest exercises the allocator WM_SIZE actually installs rather than a
+// second copy of the same intent that has to agree with it.
+//
+// GROWING, and that is the whole fix. v0.31.0 used a fixed 64 KB mem.Arena over a
+// static buffer, which shipped the crash Wyatt hit: drag the right window edge in
+// markdown Split view and Newtpad died with STATUS_ARRAY_BOUNDS_EXCEEDED inside
+// plat.shape_spans. A repaint's temp appetite is not bounded by any constant and
+// never was -- changing the WIDTH changes `measure`, which is part of the
+// Md_Layout cache key, so every visible block misses the cache and rebuilds, and
+// every rebuild puts its draft spans, its string builder and shape_spans' own
+// Span_Metrics array on the temp allocator. Past the end of a fixed arena
+// mem.Arena returns .Out_Of_Memory; `make`'s #optional_allocator_error drops the
+// error, the caller gets a ZERO-LENGTH slice, and shape.odin:246 indexes it.
+// Nothing about that is specific to shape_spans -- it was simply the first
+// unchecked `make` past the 64 KB mark -- which is why the fix is here and not a
+// length guard there.
+//
+// Per-invocation, and that fixes a SECOND defect in the same four lines. WM_SIZE
+// arrives NESTED -- a DPI change resizes the window from inside on_dpi, and the
+// minidumps show the OS's modal SC_SIZE loop dispatching into this window proc
+// with an outer frame still on the stack -- and the old code re-ran
+// `mem.arena_init` over one `@(static)` buffer on every entry. A nested repaint
+// therefore reset the shared arena's offset to zero and handed out memory the
+// OUTER repaint was still holding. A fresh arena per repaint cannot make either
+// mistake, and costs one heap block per resize frame: nothing against the render
+// it is paying for.
+resize_temp_begin :: proc(arena: ^runtime.Arena) -> (a: mem.Allocator, ok: bool) {
+	if runtime.arena_init(arena, RESIZE_TEMP_BLOCK, context.allocator) != nil {return}
+	return runtime.arena_allocator(arena), true
+}
+
+resize_temp_end :: proc(arena: ^runtime.Arena) {
+	runtime.arena_destroy(arena)
+}
+
 // WM_SIZE calls this so the content re-renders live during a resize. It runs from
-// the "system" window proc (no Odin context) and uses a private scratch arena so
-// it never disturbs the main loop's temp allocator.
+// the "system" window proc (no Odin context) and uses a private growing arena so
+// it never disturbs the main loop's temp allocator (see resize_temp_begin).
 on_resize :: proc "contextless" (user: rawptr) {
 	context = diag_context()
 	rc := (^Render_Ctx)(user)
 	if rc.window.width <= 0 || rc.window.height <= 0 {return}
-	@(static) scratch: [64 * 1024]u8
-	arena: mem.Arena
-	mem.arena_init(&arena, scratch[:])
-	context.temp_allocator = mem.arena_allocator(&arena)
+	arena: runtime.Arena
+	scratch, ok := resize_temp_begin(&arena)
+	// Out of memory before the repaint even starts: skip this frame rather than
+	// run it on the main loop's arena, which an outer frame may be mid-way through.
+	// The OS sends another WM_SIZE for the next mouse position.
+	if !ok {return}
+	defer resize_temp_end(&arena)
+	context.temp_allocator = scratch
 	plat.gfx_resize(rc.gfx, rc.window.width, rc.window.height)
 	render_frame(rc, false) // immediate (allow-tearing) present: smooth live resize
 }
