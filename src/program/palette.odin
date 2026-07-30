@@ -106,7 +106,7 @@ command_in_palette :: proc(cmd: Command_Id) -> bool {
 	     .Word_Left, .Word_Right, .Page_Up, .Page_Down, .Backspace, .Delete_Fwd, .Delete_Word_Back,
 	     .Insert_Newline, .Insert_Tab, .Clear_Selection,
 	     .Palette_Open, .Palette_Close, .Palette_Confirm, .Palette_Next, .Palette_Prev, .Palette_Backspace,
-	     .Find_Close, .Find_Backspace, .Find_Confirm, .Find_Field_Toggle,
+	     .Find_Close, .Find_Backspace, .Find_Paste, .Find_Confirm, .Find_Field_Toggle,
 	     .Find_Filter_Page_Up, .Find_Filter_Page_Down,
 	     // Menu navigation verbs are plumbing, not commands a user runs.
 	     .Menu_Close, .Menu_Next, .Menu_Prev, .Menu_Item_Next, .Menu_Item_Prev, .Menu_Activate,

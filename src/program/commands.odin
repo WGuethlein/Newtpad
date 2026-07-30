@@ -148,6 +148,13 @@ Command_Id :: enum u8 {
 	// find mode
 	Find_Close,
 	Find_Backspace,
+	// Ctrl+V into the query/replace field. It has to be its own row, in the
+	// .Find context, because the alternative is what this fixes: with no .Find
+	// binding the chord fell through resolve_key to the editor's .Paste and the
+	// clipboard landed in the DOCUMENT while the find bar had focus -- and the
+	// viewport is not editable while it does, so the text could not be taken
+	// back out without closing the bar first. Wyatt, live use, 2026-07-29.
+	Find_Paste,
 	Find_Confirm,
 	Find_Field_Toggle,
 	Find_Toggle_Regex,
@@ -292,6 +299,7 @@ command_table := [Command_Id]Command {
 	.History_Jump             = {"History: Jump to State", "Edit"},
 	.Find_Close               = {"Close Find", "Search"},
 	.Find_Backspace           = {"Find: Delete Backward", "Search"},
+	.Find_Paste               = {"Find: Paste", "Search"},
 	.Find_Confirm             = {"Find: Confirm", "Search"},
 	.Find_Field_Toggle        = {"Find: Toggle Field", "Search"},
 	.Find_Toggle_Regex        = {"Find: Regular Expression", "Search"},
@@ -421,6 +429,11 @@ default_bindings := []Binding {
 	{.Escape, false, false, .Find, .Find_Close},
 	{.F, true, false, .Find, .Find_Open}, // switch to search view (leaves filter); Escape closes
 	{.Backspace, false, false, .Find, .Find_Backspace},
+	// Ctrl+V belongs to the FIELD, not to the document behind it. Declared here
+	// rather than left to resolve_key's editor fallback, which is what sent it to
+	// .Paste; find_fallback_writes_doc now refuses that fallback as well, so this
+	// row and that refusal are belt and braces for the same hole.
+	{.V, true, false, .Find, .Find_Paste},
 	{.Enter, false, false, .Find, .Find_Confirm},
 	{.Tab, false, false, .Find, .Find_Field_Toggle},
 	// All three toggles are Alt, matching VS Code: Alt+C case, Alt+W whole
@@ -717,6 +730,47 @@ lookup_binding :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 	return .None
 }
 
+// May a chord the FIND context did not claim reach the editor keymap? Composed
+// from command_mutates_doc rather than listing the buffer writers again, so the
+// six chords of the Ctrl+V report are refused as a class rather than one at a
+// time.
+//
+// BE PRECISE ABOUT WHICH CLASS. command_mutates_doc is the TABLE-VIEW READ-ONLY
+// predicate -- "commands table view and Markdown Preview must block" -- and that
+// set overlaps the buffer writers without being them. A writer added to it is
+// refused here for free; a writer that has no reason to be on it is not, and two
+// already exist: Ctrl+T (.Toggle_Table) and Ctrl+M (.Toggle_Preview) both reach a
+// doc_replace_range through table_edit_commit (the .Toggle_Table arm below, and
+// leave_table_view). Neither is on the predicate, so neither is refused here.
+//
+// That is benign and is left alone deliberately: what those two commit is the
+// user's own cell text into the cell the user typed it in, which is the intended
+// semantics of leaving the view, not a write behind an invisible caret. But it
+// means this proc guarantees "no command table view blocks falls through", NOT
+// "no command that writes the buffer falls through". Anyone adding a writer has to
+// think about this proc; the composition does not do it for them.
+//
+// The two replace verbs are the exception, and they are the reason this is a
+// predicate rather than `!command_mutates_doc`. Ctrl+Enter / Ctrl+Alt+Enter are
+// declared in .Editor and NOT in .Find deliberately (see default_bindings), so
+// the fallback is the ONLY way they reach the replace row -- the surface whose
+// whole purpose is running them. Refusing them here would take Replace Match and
+// Replace All off the keyboard everywhere they are meant to be pressed.
+//
+// They are also the safe exception rather than a hole: replace_dispatch writes
+// through find_replace_current / find_replace_all, which act on the query's
+// matches, and the .Find_Confirm arm carries its own doc_read_only_view refusal.
+// Neither writes at doc.cursor, which is the invisible caret this refusal exists
+// to keep out of reach.
+@(private = "file")
+find_fallback_writes_doc :: proc(cmd: Command_Id) -> bool {
+	#partial switch cmd {
+	case .Find_Replace_One, .Find_Replace_All:
+		return false
+	}
+	return command_mutates_doc(cmd)
+}
+
 // Map a key press to a command within the active context (shift ignored here; the
 // action reads it). First matching binding wins; a user overlay would prepend.
 //
@@ -737,7 +791,27 @@ resolve_key :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 	// The menu falls back for the same reason find does — a global chord should
 	// not die because a dropdown happens to be open. The palette is the one true
 	// exception, being a text field.
-	if (ctx == .Find || ctx == .Menu) && (ctrl || alt) {
+	//
+	// The find bar is a text field too, and the fallback above gave it every
+	// MODIFIED editor chord including the ones that write to the buffer. That is
+	// the whole of the Ctrl+V report (Wyatt, 2026-07-29) and it was never only
+	// about paste: with the query focused, Ctrl+X cut the document's selection,
+	// Ctrl+Z/Ctrl+Y undid and redid the document, Ctrl+Backspace deleted a word
+	// behind an invisible caret and Alt+Up/Down moved document lines -- all of
+	// them under a bar whose viewport takes no keystrokes, so nothing typed there
+	// could be taken back without closing the bar first. Refuse the fallback for
+	// the writers; the reads (Ctrl+S, Ctrl+P, Ctrl+A, Ctrl+C, the tab chords) are
+	// exactly why the fallback exists and are untouched.
+	//
+	// The menu is deliberately NOT covered: it is a dropdown, not a field, the
+	// document behind it is still the focused surface, and is_menu_cmd's caller
+	// closes the menu before the command runs.
+	if ctx == .Find && (ctrl || alt) {
+		cmd := lookup_binding(key, ctrl, alt, .Editor)
+		if find_fallback_writes_doc(cmd) {return .None}
+		return cmd
+	}
+	if ctx == .Menu && (ctrl || alt) {
 		return lookup_binding(key, ctrl, alt, .Editor)
 	}
 	// The history panel is a side panel, not a mode: it owns only its navigation
@@ -1662,6 +1736,21 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		find_close(doc)
 	case .Find_Backspace:
 		find_backspace(doc)
+	case .Find_Paste:
+		// Guarded on find being open, not on the chord. NOT because the palette
+		// can reach it -- it cannot: the same change that added this command put
+		// it on command_in_palette's exclusion list and no menu row dispatches
+		// it, so Ctrl+V with the bar open is the only route in today. The guard
+		// is here because "the only caller checks" is not an invariant, and the
+		// thing on the other side of it is a clipboard read: with the bar shut
+		// there is no field for the text to land in, and find_paste would refuse
+		// it anyway, so opening the Windows clipboard first would be work done
+		// for a refusal. Guard the effect where the effect is.
+		if doc != nil && doc.find.active {
+			if s, ok := plat.clipboard_get_text(w.hwnd, context.temp_allocator); ok {
+				find_paste(doc, s)
+			}
+		}
 	case .Find_Confirm:
 		if doc.find.field == 1 {
 			// Replace is a buffer write, and this is the one that got away: it

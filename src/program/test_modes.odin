@@ -28,10 +28,165 @@ NEWTPAD_TESTS :: #config(NEWTPAD_TESTS, ODIN_DEBUG)
 
 when NEWTPAD_TESTS {
 
+	// Counts, as well as prints. It printed only for a year, which made every
+	// assertion in `keytest` decorative: the mode had a live FAIL line in the tree
+	// (Ctrl+Z / Find, pinned as .Undo after the D1 fix made it .None) and still
+	// exited 0 with no summary, so neither a human skim nor a script noticed. A
+	// check that cannot fail is not a check.
 	@(private = "file")
-	key_chk :: proc(got, want: Command_Id, label: string) {
+	key_chk :: proc(bad: ^int, got, want: Command_Id, label: string) {
 		ok := "OK" if got == want else fmt.tprintf("FAIL want=%v", want)
+		if got != want {bad^ += 1}
 		fmt.printfln("%-22s -> %-16v %s", label, got, ok)
+	}
+
+	// `newtpad keytest` (and the historical `newtpad <path> keytest`) -- what the
+	// keymap resolves per context, and what dispatch then does with a handful of
+	// those commands.
+	//
+	// TAKES A PATH OR NOT, and that is the fix for the second half of its problem.
+	// It used to be two-argument only, so it was in no required list and no sweep
+	// ran it -- which is how the stale Ctrl+Z assertion above survived the D1 fix
+	// that invalidated it. One-argument now, like every other mode in the required
+	// list, with an empty path falling through to a scratch buffer exactly as an
+	// unopenable one already did. NOT folded into `keymaptest`: that mode is about
+	// the keys.txt user overlay and installs one, and its assertions would then be
+	// reading the defaults through an overlay rather than the defaults.
+	//
+	// Its own proc rather than a `case` body for the usual reason (§6,
+	// test_mode_dispatch's frame has hit STATUS_STACK_OVERFLOW twice) and because a
+	// summary line plus an exit code needs somewhere to live.
+	@(private = "file")
+	keytest_run :: proc(path: string) {
+		if !require_scratch_session("keytest") {return}
+		bad := 0
+		app: App
+		if !app_open_path(&app, path) {app_new_scratch(&app)} // e.g. "hello world foo"
+		dummy: plat.Window
+		dtext: plat.Text // these commands don't measure text
+		key_chk(&bad, resolve_key(.Left, false, false, .Editor), .Cursor_Left, "Left / Editor")
+		key_chk(&bad, resolve_key(.Left, true, false, .Editor), .Word_Left, "Ctrl+Left / Editor")
+		key_chk(&bad, resolve_key(.F, true, false, .Editor), .Find_Open, "Ctrl+F / Editor")
+		key_chk(&bad, resolve_key(.Up, false, true, .Editor), .Move_Line_Up, "Alt+Up / Editor")
+		key_chk(&bad, resolve_key(.Down, false, true, .Editor), .Move_Line_Down, "Alt+Down / Editor")
+		key_chk(&bad, resolve_key(.Z, false, true, .Editor), .Toggle_Wrap, "Alt+Z / Editor")
+		key_chk(&bad, resolve_key(.Enter, false, false, .Editor), .Insert_Newline, "Enter / Editor")
+		key_chk(&bad, resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find")
+		key_chk(&bad, resolve_key(.Escape, false, false, .Find), .Find_Close, "Esc / Find")
+		key_chk(&bad, resolve_key(.H, true, false, .Editor), .Replace_Open, "Ctrl+H / Editor")
+		key_chk(&bad, resolve_key(.H, true, false, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find")
+		key_chk(&bad, resolve_key(.A, false, false, .Editor), .None, "a (unbound)")
+		// Reported as dead in the GUI (2026-07-19); pin what the keymap resolves.
+		key_chk(&bad, resolve_key(.A, true, false, .Editor), .Select_All, "Ctrl+A / Editor")
+		key_chk(&bad, resolve_key(.P, true, false, .Editor), .Palette_Open, "Ctrl+P / Editor")
+		key_chk(&bad, resolve_key(.L, true, false, .Editor), .Filter_Open, "Ctrl+L / Editor")
+		// Reported missing by the 2026-07-19 audit as first-hour daily-driver gaps.
+		key_chk(&bad, resolve_key(.Tab, false, false, .Editor), .Insert_Tab, "Tab / Editor")
+		key_chk(&bad, resolve_key(.Home, true, false, .Editor), .Doc_Start, "Ctrl+Home / Editor")
+		key_chk(&bad, resolve_key(.End, true, false, .Editor), .Doc_End, "Ctrl+End / Editor")
+		key_chk(&bad, resolve_key(.G, true, false, .Editor), .Goto_Line, "Ctrl+G / Editor")
+		key_chk(&bad, resolve_key(.Tab, true, false, .Editor), .Tab_Next, "Ctrl+Tab still switches")
+		key_chk(&bad, resolve_key(.Home, false, false, .Editor), .Cursor_Home, "Home still line-start")
+		key_chk(&bad, resolve_key(.L, true, false, .Find), .Find_Toggle_Filter, "Ctrl+L / Find")
+		// Find falls back to the editor keymap for MODIFIED chords, which is why
+		// these four reach the document with the bar open. That is what the fallback
+		// is for (Ctrl+S, Ctrl+P and the tab chords should not die because a bar is
+		// open) and it is only safe for READS.
+		key_chk(&bad, resolve_key(.P, true, false, .Find), .Palette_Open, "Ctrl+P / Find")
+		key_chk(&bad, resolve_key(.S, true, false, .Find), .Save, "Ctrl+S / Find")
+		key_chk(&bad, resolve_key(.N, true, false, .Find), .Tab_New, "Ctrl+N / Find")
+		// DELIBERATE, not an accident of the fallback, and recorded as such because
+		// nobody ever decided it: Ctrl+A with the find bar focused selects the
+		// DOCUMENT, not the query, because the find fields have no selection model of
+		// their own (find_backspace deletes from the end; there is no caret). Same for
+		// Ctrl+C, which copies the document's selection. Both are reads, so neither is
+		// a data-safety question; if a Find_Select_All / Find_Copy pair is ever added,
+		// these two lines are the ones that change.
+		key_chk(&bad, resolve_key(.A, true, false, .Find), .Select_All, "Ctrl+A / Find (doc, by decision)")
+		key_chk(&bad, resolve_key(.C, true, false, .Find), .Copy, "Ctrl+C / Find (doc, by decision)")
+		// ...and the WRITERS do not fall through, which is D1 (2026-07-29). With the
+		// query focused these used to undo, redo, cut and move the document's lines
+		// behind an invisible caret, under a bar whose viewport takes no keystrokes --
+		// so nothing typed there could be taken back without closing the bar first.
+		// find_fallback_writes_doc refuses the class, not the six chords.
+		key_chk(&bad, resolve_key(.Z, true, false, .Find), .None, "Ctrl+Z / Find (no write)")
+		key_chk(&bad, resolve_key(.Y, true, false, .Find), .None, "Ctrl+Y / Find (no write)")
+		key_chk(&bad, resolve_key(.X, true, false, .Find), .None, "Ctrl+X / Find (no write)")
+		key_chk(&bad, resolve_key(.Up, false, true, .Find), .None, "Alt+Up / Find (no write)")
+		key_chk(&bad, resolve_key(.Down, false, true, .Find), .None, "Alt+Down / Find (no write)")
+		// The asymmetry D1 left behind, pinned so nobody rediscovers it as a bug.
+		// Alt+Shift+Left/Right still extends a COLUMN RECTANGLE from the find bar
+		// while Alt+Shift+Up/Down no longer does anything: the vertical pair resolve
+		// to .Move_Line_Up/.Move_Line_Down, which command_mutates_doc names, and the
+		// horizontal pair to .Block_Extend_Left/Right, which it does not, because a
+		// column selection is not a buffer write. Neither is wrong on its own and the
+		// pair is uneven, which is the kind of thing that reads as a defect later.
+		key_chk(&bad, resolve_key(.Left, false, true, .Find), .Block_Extend_Left, "Alt+Left / Find (still falls)")
+		key_chk(&bad, resolve_key(.Right, false, true, .Find), .Block_Extend_Right, "Alt+Right / Find (still falls)")
+		// The two replace verbs ARE the exception, and they have to be: they are
+		// declared in .Editor and not in .Find, so the fallback is the only way they
+		// reach the replace row. See find_fallback_writes_doc.
+		key_chk(&bad, resolve_key(.Enter, true, false, .Find), .Find_Replace_One, "Ctrl+Enter / Find (the exception)")
+		key_chk(&bad, resolve_key(.Enter, true, true, .Find), .Find_Replace_All, "Ctrl+Alt+Enter / Find (the exception)")
+		// These must NOT fall through — Find deliberately overrides them.
+		key_chk(&bad, resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find (override)")
+		key_chk(&bad, resolve_key(.Escape, false, false, .Find), .Find_Close, "Esc / Find (override)")
+		key_chk(&bad, resolve_key(.H, true, false, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find (override)")
+		key_chk(&bad, resolve_key(.V, true, false, .Find), .Find_Paste, "Ctrl+V / Find (override)")
+		// Unmodified keys must stay owned by the mode: falling these through would
+		// edit and navigate the document while the user types a query.
+		key_chk(&bad, resolve_key(.Delete, false, false, .Find), .None, "Delete / Find (no fall)")
+		key_chk(&bad, resolve_key(.Left, false, false, .Find), .None, "Left / Find (no fall)")
+		key_chk(&bad, resolve_key(.Home, false, false, .Find), .None, "Home / Find (no fall)")
+		// The palette is a text field: nothing falls through to the editor.
+		key_chk(&bad, resolve_key(.A, true, false, .Palette), .None, "Ctrl+A / Palette (no fall)")
+		key_chk(&bad, resolve_key(.S, true, false, .Palette), .None, "Ctrl+S / Palette (no fall)")
+		// ...and what dispatch actually does with them.
+		d0 := app_active(&app)
+		d0.cursor, d0.anchor = 0, 0
+		command_dispatch(.Select_All, {}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Ctrl+A   -> anchor=%d cursor=%d len=%d", d0.anchor, d0.cursor, d0.pt.length)
+		command_dispatch(resolve_key(.P, true, false, .Editor), {.P, true, false, false}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Ctrl+P   -> palette.active=%v results=%d", app.palette.active, len(app.palette.results))
+		// Arrowing past the drawn window (12 rows) — does selected stay visible?
+		for i in 0 ..< 30 {palette_move(&app, 1)}
+		fmt.printfln("palette Down x30  -> selected=%d of %d (drawn rows=12)", app.palette.selected, len(app.palette.results))
+		palette_close(&app)
+		// Every palette-visible command should teach its shortcut, and the ones
+		// that only exist inside find mode must be listed at all.
+		shown, with_chord := 0, 0
+		for cmd in Command_Id {
+			if !command_in_palette(cmd) {continue}
+			shown += 1
+			if command_chord(cmd) != "" {with_chord += 1}
+		}
+		fmt.printfln("palette lists %d commands, %d show a shortcut", shown, with_chord)
+		for c in ([]Command_Id{.Find_Toggle_Filter, .Find_Toggle_Regex, .Filter_Open, .Goto_Line, .Save_As}) {
+			fmt.printfln("  %-24v in palette=%-5v chord=%q", c, command_in_palette(c), command_chord(c))
+		}
+		// dispatch effects (dummy window/text; these commands don't touch them)
+		app_active(&app).cursor = 0
+		command_dispatch(resolve_key(.Right, false, false, .Editor), {.Right, false, false, false}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Right    -> cursor=%d", app_active(&app).cursor)
+		command_dispatch(.Toggle_Wrap, {}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Alt+Z    -> wrap=%v", app_active(&app).wrap)
+		command_dispatch(resolve_key(.F, true, false, .Editor), {.F, true, false, false}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Ctrl+F   -> find.active=%v", app_active(&app).find.active)
+		command_dispatch(resolve_key(.Escape, false, false, .Find), {.Escape, false, false, false}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Esc      -> find.active=%v", app_active(&app).find.active)
+		// tab commands
+		command_dispatch(.Tab_New, {}, &app, &dummy, &dtext, 10)
+		fmt.printfln("Tab_New           -> live tabs=%d active=%d", app_live_count(&app), app.active)
+		command_dispatch(.Tab_Close, {}, &app, &dummy, &dtext, 10)
+		fmt.printfln("Tab_Close         -> live tabs=%d", app_live_count(&app))
+		app_destroy(&app)
+		fmt.printfln("keytest: %d failures", bad)
+		// The only mode that exits non-zero, and it earns it: this one was invisible
+		// to every sweep for a year. A summary line a script has to remember to grep
+		// is what let the stale assertion sit here; an exit code is not optional to
+		// notice. `os.exit` skips the deferred teardown above -- everything it would
+		// free is process-lifetime scratch, and the process is ending either way.
+		if bad > 0 {os.exit(1)}
 	}
 
 	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the
@@ -1743,6 +1898,228 @@ when NEWTPAD_TESTS {
 		// function fed the wrong input, or its answer read in the wrong space --
 		// and this row moved from the bottom of the window to the top earlier in
 		// this very release.
+		// The find/replace/filter bar is a TEXT FIELD, and every modified editor
+		// chord used to fall through resolve_key into the document behind it. The
+		// report was Ctrl+V (Wyatt, 2026-07-29): the clipboard landed in the
+		// viewport, which takes no keystrokes while the bar has focus, so it could
+		// not be taken back out without closing the bar first.
+		//
+		// Both halves are asserted, and the second is the one that matters:
+		//
+		//   1. the chord goes to the FIELD (the query grew, and by exactly the
+		//      pasted text), and
+		//   2. the DOCUMENT is untouched -- pt.length AND doc.modified. Length
+		//      alone would pass for a same-length replacement; `modified` alone
+		//      would pass for a paste into an already-dirty buffer. Neither can
+		//      pass with the old routing, which appends to the buffer and sets the
+		//      dirty flag on the way.
+		//
+		// The whole CLASS is driven, not just paste: Ctrl+X, Ctrl+Z, Ctrl+Y,
+		// Ctrl+Backspace and Alt+Up/Down are dispatched through the same path with
+		// a selection live and a real undo stack behind them, and each one has to
+		// leave the document byte-identical. And the fallback that must SURVIVE is
+		// asserted too (Ctrl+S, Ctrl+P, Ctrl+A, Ctrl+C, Ctrl+N, and both replace
+		// verbs), because "refuse everything" would pass part 2 and break the bar.
+		findtest_field_owns_editing_keys :: proc() -> (bad: int) {
+			fmt.println("--- the find bar owns its editing keys; the document is not written ---")
+			fk_chk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-5s %s", "ok" if ok else "FAIL", msg)
+				if !ok {bad^ += 1}
+			}
+
+			// --- part A: context resolution, pure over the keymap ---
+			//
+			// Every one of these resolved to the editor command in parentheses
+			// before the fix. .None means "the find bar swallows it", which is the
+			// right answer for a chord the field has no use for: doing nothing is
+			// not a data-loss path, and writing to an invisible caret is.
+			Blocked :: struct {
+				key:       plat.Key,
+				ctrl, alt: bool,
+				was:       Command_Id,
+			}
+			for b in ([]Blocked {
+					{.X, true, false, .Cut},
+					{.Z, true, false, .Undo},
+					{.Y, true, false, .Redo},
+					{.Backspace, true, false, .Delete_Word_Back},
+					{.Up, false, true, .Move_Line_Up},
+					{.Down, false, true, .Move_Line_Down},
+				}) {
+				got := resolve_key(b.key, b.ctrl, b.alt, .Find)
+				// The second half is what keeps this from being vacuous: it proves
+				// the EDITOR still binds that chord to that command, so a .None
+				// above is a refusal in the find context rather than a chord
+				// nobody ever bound. Asked through command_chord, which reads the
+				// same table resolve_key falls back to.
+				chord := fmt.tprintf("%s%s%s", "Ctrl+" if b.ctrl else "", "Alt+" if b.alt else "", key_name(b.key))
+				editor_has := command_chord(b.was) == chord
+				fk_chk(&bad, got == .None && editor_has, fmt.tprintf("Find: %s -> .None (editor still binds it to %v; got %v, chord %q)", chord, b.was, got, command_chord(b.was)))
+			}
+			fk_chk(&bad, resolve_key(.V, true, false, .Find) == .Find_Paste, fmt.tprintf("Find: Ctrl+V -> .Find_Paste (got %v)", resolve_key(.V, true, false, .Find)))
+			// Unmodified Delete never fell through (resolve_key's fallback needs
+			// ctrl or alt), and it must still not -- asserted so the claim in the
+			// bug report is checked rather than reasoned about.
+			fk_chk(&bad, resolve_key(.Delete, false, false, .Find) == .None, "Find: bare Delete -> .None")
+			// The fallback that has to survive.
+			Kept :: struct {
+				key:       plat.Key,
+				ctrl, alt: bool,
+				want:      Command_Id,
+			}
+			for k in ([]Kept {
+					{.S, true, false, .Save},
+					{.P, true, false, .Palette_Open},
+					{.A, true, false, .Select_All},
+					{.C, true, false, .Copy},
+					{.N, true, false, .Tab_New},
+					{.Enter, true, false, .Find_Replace_One},
+					{.Enter, true, true, .Find_Replace_All},
+				}) {
+				got := resolve_key(k.key, k.ctrl, k.alt, .Find)
+				fk_chk(&bad, got == k.want, fmt.tprintf("Find: %v still falls back to %v (got %v)", k.key, k.want, got))
+			}
+
+			// --- part B: drive the real dispatch and assert on the DOCUMENT ---
+			saved_clip, had_clip := plat.clipboard_get_text(nil, context.allocator)
+			defer if had_clip {
+				plat.clipboard_set_text(nil, saved_clip)
+				delete(saved_clip)
+			}
+			plat.clipboard_set_text(nil, "PASTED")
+
+			SRC :: "alpha\nbeta\ngamma\n"
+			a: App
+			defer app_destroy(&a)
+			d := new(Document)
+			d^ = doc_from_content(transmute([]u8)strings.clone(SRC), "", .UTF8)
+			app_add(&a, d)
+			app_activate(&a, 0)
+			wv: plat.Window
+			t: plat.Text
+			plat.text_load_faces(&t)
+
+			// A real undo stack, a real REDO stack and a real selection, so Ctrl+Z,
+			// Ctrl+Y and Ctrl+X below each have something to destroy. Without them
+			// all three would be no-ops and the "document unwritten" assertions
+			// would pass with the bug present -- which is the exact failure mode
+			// this suite has shipped before. Two inserts and one undo is the only
+			// arrangement that leaves both stacks non-empty at once.
+			doc_insert_text(d, transmute([]u8)string("X"))
+			doc_insert_text(d, transmute([]u8)string("Y"))
+			doc_undo(d)
+			d.modified = false
+
+			find_open(d, false)
+			d.filter = true // the surface Wyatt reported it on
+			for r in "beta" {find_input_rune(d, r)}
+			find_wait(d)
+			qlen0 := len(d.find.query)
+
+			// The selection is established AFTER the bar is open and the query has
+			// settled, so nothing in the find lifecycle can have collapsed it
+			// before Ctrl+X is driven. Asserted, not assumed: a collapsed selection
+			// makes Cut a no-op and every "document unwritten" line below would
+			// then pass with the bug present.
+			doc_select_all(d)
+			len0 := d.pt.length
+			fk_chk(
+				&bad,
+				len0 > len(SRC) && !d.modified && len(d.undo) > 0 && len(d.redo) > 0 && d.anchor != d.cursor,
+				fmt.tprintf("fixture: %d bytes, clean, undo %d redo %d, selection %d..%d", len0, len(d.undo), len(d.redo), d.anchor, d.cursor),
+			)
+
+			Drive :: struct {
+				key:       plat.Key,
+				ctrl, alt: bool,
+				name:      string,
+			}
+			for g in ([]Drive {
+					{.V, true, false, "Ctrl+V"},
+					{.X, true, false, "Ctrl+X"},
+					{.Z, true, false, "Ctrl+Z"},
+					{.Y, true, false, "Ctrl+Y"},
+					{.Backspace, true, false, "Ctrl+Backspace"},
+					{.Up, false, true, "Alt+Up"},
+					{.Down, false, true, "Alt+Down"},
+					{.Delete, false, false, "Delete"},
+				}) {
+				before := doc_debug_string(d)
+				cmd := resolve_key(g.key, g.ctrl, g.alt, .Find)
+				command_dispatch(cmd, plat.Key_Event{key = g.key, ctrl = g.ctrl, alt = g.alt}, &a, &wv, &t, 20)
+				after := doc_debug_string(d)
+				// Byte-for-byte, not just the length: Ctrl+X over a full selection
+				// followed by nothing else would change the length, but a same-size
+				// rewrite would not, and this catches both.
+				fk_chk(&bad, after == before && d.pt.length == len0 && !d.modified, fmt.tprintf("%v with the filter focused leaves the document unwritten (len %d, modified %v)", g.name, d.pt.length, d.modified))
+			}
+
+			// ...and the paste actually reached the field.
+			fk_chk(&bad, string(d.find.query[:]) == "betaPASTED", fmt.tprintf("Ctrl+V landed in the query (%q)", string(d.find.query[:])))
+			fk_chk(&bad, len(d.find.query) == qlen0 + 6, fmt.tprintf("query grew by exactly the pasted text (%d -> %d)", qlen0, len(d.find.query)))
+			find_wait(d)
+
+			// Multi-line clipboard: the first line only, and no stray CR. The bar
+			// is one row tall, so anything past the first line would be invisible.
+			clear(&d.find.query)
+			plat.clipboard_set_text(nil, "one\r\ntwo\r\nthree")
+			command_dispatch(.Find_Paste, plat.Key_Event{}, &a, &wv, &t, 20)
+			fk_chk(&bad, string(d.find.query[:]) == "one", fmt.tprintf("a multi-line paste takes the first line only (%q)", string(d.find.query[:])))
+			find_wait(d)
+
+			// ...for every spelling of "line terminator", not just the two the
+			// original split handled. It was index_byte('\n') plus a trailing-\r
+			// trim, so a CR-ONLY clipboard (classic Mac, old Excel exports) has no
+			// LF to split on and the whole thing became one field value with a raw
+			// control byte inside it. find_paste is pure over the clipboard's text
+			// by design, so these drive it directly rather than round-tripping the
+			// user's real clipboard fifteen times.
+			for src in ([]string{"one\ntwo", "one\r\ntwo", "one\rtwo", "one\rtwo\nthree"}) {
+				clear(&d.find.query)
+				find_paste(d, src)
+				q := string(d.find.query[:])
+				clean := true
+				for i in 0 ..< len(q) {if q[i] < 32 {clean = false}}
+				fk_chk(&bad, q == "one" && clean, fmt.tprintf("%q pastes as %q, no control byte", src, q))
+				find_wait(d)
+			}
+
+			// A paste is not bounded by typing speed. Every byte into field 0 goes
+			// through find_query_changed, which restarts the search worker, so an
+			// uncapped paste of a copied log file hands the scan a multi-megabyte
+			// pattern in one keystroke.
+			clear(&d.find.query)
+			find_paste(d, strings.repeat("x", FIND_PASTE_CAP * 4, context.temp_allocator))
+			fk_chk(&bad, len(d.find.query) == FIND_PASTE_CAP, fmt.tprintf("a %d-byte single-line paste is capped at %d (got %d)", FIND_PASTE_CAP * 4, FIND_PASTE_CAP, len(d.find.query)))
+			find_wait(d)
+			// ...and the cap lands on a rune boundary. The em dash below starts one
+			// byte before the cap, so a byte-exact truncation would leave the field
+			// holding a lone 0xE2.
+			clear(&d.find.query)
+			find_paste(d, fmt.tprintf("%s—%s", strings.repeat("a", FIND_PASTE_CAP - 1, context.temp_allocator), strings.repeat("b", 32, context.temp_allocator)))
+			fk_chk(
+				&bad,
+				len(d.find.query) == FIND_PASTE_CAP - 1 && utf8.valid_string(string(d.find.query[:])),
+				fmt.tprintf("a multi-byte rune straddling the cap is dropped whole (%d bytes, valid=%v)", len(d.find.query), utf8.valid_string(string(d.find.query[:]))),
+			)
+			find_wait(d)
+			clear(&d.find.query)
+			for r in "beta" {find_input_rune(d, r)} // restore the fixture's query
+			find_wait(d)
+
+			// The replace field is the other half of the same bar and takes the
+			// paste too -- Find_Paste writes whichever field has focus.
+			d.find.replace_mode = true
+			d.find.field = 1
+			plat.clipboard_set_text(nil, "REPL")
+			command_dispatch(.Find_Paste, plat.Key_Event{}, &a, &wv, &t, 20)
+			fk_chk(&bad, string(d.find.replace[:]) == "REPL", fmt.tprintf("Ctrl+V reaches the replace field too (%q)", string(d.find.replace[:])))
+			fk_chk(&bad, d.pt.length == len0 && !d.modified, "...and still without writing the document")
+			find_wait(d)
+			find_close(d)
+			return
+		}
+
 		findtest_replace_seam :: proc() -> (bad: int) {
 			fmt.println("--- the replace row's buttons: drawn == clickable ---")
 			rs_chk :: proc(bad: ^int, ok: bool, msg: string) {
@@ -1986,6 +2363,7 @@ when NEWTPAD_TESTS {
 			bad += findtest_replace_all()
 			bad += findtest_subst()
 			bad += findtest_replace_seam()
+			bad += findtest_field_owns_editing_keys()
 			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")
 			return true
 		}
@@ -4158,6 +4536,139 @@ when NEWTPAD_TESTS {
 		//
 		// HOW THIS IS MEASURED, and why it is not a second derivation of the draw:
 		// the fixture's paragraph is nothing but links, one per word, so
+		// A link rectangle the pane does not own must not be clickable, and the
+		// hand cursor must not appear over the status bar.
+		//
+		// The hazard is `forced` (md_block_admit): a pane too short for even its
+		// first LINE still admits that line -- "no frame ever shows emptiness"
+		// outranks the cover strip's trim -- so the line's glyphs and its link
+		// rects run past ybot. md_preview_clip paints over the glyphs, which is
+		// exactly what made this invisible: the rect stayed live under a strip of
+		// status bar, and neither call site of md_link_at applied a y bound.
+		//
+		// THE PRECONDITION IS THE TEST. Section 2 below asserts that a rect really
+		// does extend past ybot before section 3 asserts it is unclickable there;
+		// without it, a fixture that never overflowed would make section 3 pass
+		// against nothing at all. The probe point is derived from that measured
+		// overflow, not chosen.
+		//
+		// Its own procedure with its own device, for the same stack-frame reason
+		// md_partial_selftest has one.
+		md_link_bound_selftest :: proc() -> (bad: int) {
+			lchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1000, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/linkbound") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+			CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+			CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+			STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+			px_ := f32(24)
+
+			b := strings.builder_make()
+			defer strings.builder_destroy(&b)
+			for i in 0 ..< 40 {
+				if i > 0 {strings.write_string(&b, " ")}
+				fmt.sbprintf(&b, "[w%03d](https://e.test/w%03d)", i, i)
+			}
+			strings.write_string(&b, "\n")
+			src := strings.to_string(b)
+			content := make([]u8, len(src))
+			copy(content, src)
+			doc := doc_from_content(content, "linkbound.md", .UTF8)
+			doc.md_mode = .Preview
+			defer doc_close(&doc)
+			doc_update_top_inset(&doc)
+
+			// --- 1. positive control: a link inside the pane IS clickable --------
+			//
+			// First, because a bound that refuses everything would sail through
+			// sections 2 and 3 and break the feature.
+			x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, W, H, 0.5)
+			lchk(&bad, box_ok, "linkbound: the full pane box resolves")
+			if !box_ok {return}
+			full := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+			lchk(&bad, len(full) > 0, fmt.tprintf("linkbound: the fixture places links in a full pane (%d)", len(full)))
+			if len(full) == 0 {return}
+			line_h := full[0].rect.size.y
+			{
+				r := full[0].rect
+				_, over := md_preview_link_at(&h.gfx, &h.text, &doc, px_, W, H, 0.5, r.pos.x + r.size.x * 0.5, r.pos.y + r.size.y * 0.5)
+				lchk(&bad, over, "linkbound: a link inside the pane is still clickable")
+			}
+			// ...and the full pane does not overflow in the first place, which is the
+			// premise sections 2 and 3 contrast against and the falsifiable half of
+			// this pair. The hit-test below it CANNOT FAIL and is not evidence for
+			// the bound: at the app's normal size no rect reaches past ybot, so a
+			// point below the pane misses on geometry whether the bound is there or
+			// not (verified -- it stayed OK with the bound removed). It is kept as
+			// the statement that the two agree, not as a check of the refusal, and
+			// the assertion above it is the one that would notice a pane whose rects
+			// started spilling at ordinary sizes.
+			{
+				worst_full := f32(0)
+				for hit in full {worst_full = max(worst_full, hit.rect.pos.y + hit.rect.size.y)}
+				lchk(&bad, worst_full <= ybot + 1, fmt.tprintf("linkbound: no rect overflows the FULL pane (%.1f <= %.1f)", worst_full, ybot))
+				_, over := md_preview_link_at(&h.gfx, &h.text, &doc, px_, W, H, 0.5, full[0].rect.pos.x + 1, ybot + 2)
+				lchk(&bad, !over, "linkbound: ...and consistently, a point below it is not clickable (follows from the line above)")
+			}
+
+			// --- 2. the hazard: a pane too short for one line overflows ----------
+			//
+			// Height chosen so ybot - ytop is HALF a line: forced admits line 0 and
+			// its rect runs a half-line past the pane's bottom edge, into the strip
+			// where the status bar is drawn.
+			short_H := CONTENT_TOP + TOP_INSET + line_h * 0.5 + STATUS_BAR_H
+			sx0, sx1, sytop, sybot, sbox_ok := md_pane_box(&doc, W, short_H, 0.5)
+			lchk(&bad, sbox_ok && sybot - sytop < line_h && sybot > sytop, fmt.tprintf("linkbound: the short pane is under one line tall (%.1f of %.1f)", sybot - sytop, line_h))
+			if !sbox_ok {return}
+			short := markdown_links(&h.gfx, &h.text, &doc, px_, sx0, sx1, sytop, sybot, Md_Anchor{}, context.temp_allocator)
+			worst := f32(0)
+			for hit in short {worst = max(worst, hit.rect.pos.y + hit.rect.size.y)}
+			lchk(
+				&bad, len(short) > 0 && worst > sybot + 1,
+				fmt.tprintf("linkbound: forced admission really does put %d rect(s) past the pane (%.1f > %.1f)", len(short), worst, sybot),
+			)
+			if len(short) == 0 || worst <= sybot + 1 {return}
+			// ...and those pixels really are the status bar's, or "invisible but
+			// clickable" is not what is being described.
+			lchk(&bad, sybot >= short_H - STATUS_BAR_H - 0.5, fmt.tprintf("linkbound: the pane ends where the status bar begins (%.1f, bar from %.1f)", sybot, short_H - STATUS_BAR_H))
+
+			// --- 3. and it is not clickable there --------------------------------
+			//
+			// Every overflowing rect is probed at its own midpoint below the pane,
+			// through md_preview_link_at -- the one proc BOTH the hand cursor and
+			// the Ctrl+click go through. md_link_at over the same hits is asked as
+			// well, and is EXPECTED to say yes: that is the difference the bound
+			// makes, stated rather than assumed, so a reader can see the refusal is
+			// the wrapper's and not an accident of the rects.
+			probed, live, raw_live := 0, 0, 0
+			for hit in short {
+				bot := hit.rect.pos.y + hit.rect.size.y
+				if bot <= sybot + 1 {continue}
+				my := (max(hit.rect.pos.y, sybot) + bot) * 0.5
+				if my < sybot {continue}
+				mx := hit.rect.pos.x + hit.rect.size.x * 0.5
+				probed += 1
+				if _, over := md_preview_link_at(&h.gfx, &h.text, &doc, px_, W, short_H, 0.5, mx, my); over {live += 1}
+				if _, over := md_link_at(short, mx, my); over {raw_live += 1}
+			}
+			lchk(&bad, probed > 0, fmt.tprintf("linkbound: %d overflowing rect(s) probed below the pane", probed))
+			lchk(&bad, live == 0, fmt.tprintf("linkbound: none of them is clickable over the status bar (%d of %d live)", live, probed))
+			lchk(&bad, raw_live == probed, fmt.tprintf("linkbound: ...and the raw point-in-rect DOES hit all of them, so the refusal is the bound's (%d of %d)", raw_live, probed))
+			return
+		}
+
 		// markdown_links places at least one rectangle on every wrapped line the
 		// pass emits. Those rectangles are md_span_boxes over the SHAPER's own glyph
 		// positions, offset by md_block_origin -- the same geometry the glyphs are
@@ -7762,6 +8273,7 @@ when NEWTPAD_TESTS {
 			bad += md_draw_selftest()
 			bad += md_head_fit_selftest()
 			bad += md_partial_selftest()
+			bad += md_link_bound_selftest()
 			bad += md_band_admit_selftest()
 			bad += md_table_fit_selftest()
 			bad += md_table_wrap_selftest()
@@ -8069,6 +8581,1032 @@ when NEWTPAD_TESTS {
 			doc_close(d)
 			free(d)
 			fmt.printfln("tablereadonlytest: %d failures", bad)
+			return true
+		}
+
+		// `newtpad tablegridtest` covers UI spec §10 group A's geometry, and it is
+		// a DATA-LOSS test rather than a cosmetic one.
+		//
+		// table_cell_at maps a pixel to a field's byte range and table_edit_commit
+		// writes that range through the piece tree, so the grid is an editing
+		// surface whose pixel -> row mapping decides which line gets overwritten.
+		// Group A moves that mapping twice over: rows go from the editor's
+		// line_height to §10's 26px, and a sticky 30px header appears above them
+		// which means line 0 is no longer a scrolling row at all. Either change
+		// alone shifts every row by a different amount.
+		//
+		// So the assertions do not check a coordinate against a coordinate -- that
+		// would only prove the arithmetic agrees with itself. They take the y the
+		// DRAW positions row r at, hand it to the HIT-TEST, and compare the bytes
+		// the hit-test returns against a field text derived from the fixture by
+		// plain strings.split, which is independent of csv_fields, table_row_start
+		// and every other producer under test. A mapping that is off by one row, or
+		// that forgets the header owns line 0, returns a real byte range for a real
+		// field -- just the wrong one -- and only the fixture comparison can tell.
+		//
+		// Its own proc: test_mode_dispatch's frame has hit STATUS_STACK_OVERFLOW
+		// twice, and the fixture tables below are locals.
+		if os.args[1] == "tablegridtest" {
+			tg :: proc() -> (bad: int) {
+				// Rows the viewport is SIZED to hold, at every scale. Fewer than
+				// the fixture's data rows (so the last visible row is real content
+				// and doc_max_top is non-zero), and more than the highest row index
+				// any assertion below probes -- the short row is data row 7.
+				TG_ROWS :: 10
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+
+				// --- §10's metrics, as declared -----------------------------
+				chk(&bad, TABLE_HEADER_H_96 == 30, fmt.tprintf("header is %.0fpx at 96 DPI (§10: 30)", TABLE_HEADER_H_96))
+				chk(&bad, TABLE_ROW_H_96 == 26, fmt.tprintf("rows are %.0fpx at 96 DPI (§10: 26)", TABLE_ROW_H_96))
+				chk(&bad, TABLE_CELL_PAD_X_96 == 10, fmt.tprintf("cell padding is 0 %.0f at 96 DPI (§10: 0 10)", TABLE_CELL_PAD_X_96))
+
+				// The column rules are GONE, replaced by the band. A quad that is
+				// no longer emitted cannot be observed from outside the draw, so
+				// this is a source count -- the same #load mechanism themetest's
+				// Text_Dim guard uses, and for the same reason: it is the only
+				// instrument available. Border_Subtle was the old `sep` colour, so
+				// its absence here is the rule's removal, and one Table_Zebra use
+				// is what replaced it.
+				{
+					src :: #load("table.odin", string)
+					nsep := strings.count(src, "g_theme[.Border_Subtle]")
+					nzeb := strings.count(src, "g_theme[.Table_Zebra]")
+					chk(&bad, nsep == 0, fmt.tprintf("no column rules left in table.odin (%d Border_Subtle uses, want 0)", nsep))
+					chk(&bad, nzeb == 1, fmt.tprintf("the band replaced them (%d Table_Zebra uses, want 1)", nzeb))
+				}
+
+				t: plat.Text
+				plat.text_load_faces(&t)
+				BASE_PX = BASE_PX_96
+
+				// --- the fixture, and the expectation, built independently ---
+				//
+				// Line 0 is the header. Line 5 carries an EMPTY middle field and
+				// line 8 is SHORT (two fields where the table has three) -- §10
+				// treats those as different things, and the pair is here so the
+				// distinction is exercised rather than assumed.
+				lines := [?]string {
+					"h0,h1,h2",
+					"a0,b0,c0",
+					"a1,b1,c1",
+					"a2,b2,c2",
+					"a3,b3,c3",
+					"a4,,c4", // empty middle cell -> em dash, still a real field
+					"a5,b5,c5",
+					"a6,b6,c6",
+					"a7,b7", // short row -> malformed, NOT an empty cell
+					"a8,b8,c8",
+					"a9,b9,c9",
+					"a10,b10,c10",
+					"a11,b11,c11",
+					"a12,b12,c12",
+					"a13,b13,c13",
+					"a14,b14,c14",
+				}
+				// Absolute byte offset of each line, counted here rather than
+				// asked of the code under test.
+				off: [len(lines) + 1]int
+				for l, i in lines {off[i + 1] = off[i] + len(l) + 1}
+				content := make([]u8, off[len(lines)]) // default allocator: doc_close owns it
+				for l, i in lines {copy(content[off[i]:], transmute([]u8)l);content[off[i] + len(l)] = '\n'}
+
+				doc := doc_from_content(content, "grid.csv", .UTF8)
+				defer doc_close(&doc)
+				doc.table, doc.table_delim = true, ','
+
+				// Expected field text at (line, col), by plain split -- no
+				// csv_fields, no field-range parser. Valid because no fixture
+				// field is quoted or contains a comma, so the raw span and the
+				// unquoted value are the same string.
+				want_field :: proc(lines: []string, line, col: int) -> (string, bool) {
+					parts := strings.split(lines[line], ",", context.temp_allocator)
+					if col >= len(parts) {return "", false}
+					return parts[col], true
+				}
+				read_span :: proc(doc: ^Document, fs, fe: int) -> string {
+					if fe < fs {return "<inverted>"}
+					b := make([]u8, fe - fs, context.temp_allocator)
+					base.pt_read(&doc.pt, fs, b)
+					return string(b)
+				}
+
+				// --- the round trip, at three DPI scales ---------------------
+				//
+				// Three scales, because line_height and the scaled metrics round
+				// independently and a mapping can be exactly right at 100% while
+				// drifting half a pixel per row at 125% -- the defect class
+				// line_height's own comment was written for.
+				for scale in ([]f32{1.0, 1.25, 1.5}) {
+					UI_SCALE = scale
+					TEXT_MARGIN_Y = sx(TEXT_MARGIN_Y_96)
+					TAB_STRIP_H = sx(TAB_STRIP_H_96)
+					MENU_BAR_H = sx(MENU_BAR_H_96)
+					CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+					CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+					STATUS_BAR_H = sx(STATUS_BAR_H_96)
+					SCROLLBAR_W = sx(SCROLLBAR_W_96)
+					TABLE_HEADER_H = sx(TABLE_HEADER_H_96)
+					TABLE_ROW_H = sx(TABLE_ROW_H_96)
+					TABLE_CELL_PAD_X = sx(TABLE_CELL_PAD_X_96)
+					TOP_INSET, FILTER_BANNER_H = 0, 0
+
+					px := f32(int(BASE_PX_96 * scale + 0.5))
+					cw := plat.text_char_width(&t, px, .Doc)
+					// The window height is DERIVED from the row count wanted, not
+					// picked. A round 700px let 21 rows fit against 15 data rows,
+					// so the viewport was taller than the file: "the last visible
+					// row" was EOF, and doc_max_top clamped every scroll to 0 --
+					// the fixture never reached the conditions its own assertions
+					// named. The precondition below is what caught that, and this
+					// is what it caught.
+					W := f32(1000)
+					H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					clear(&doc.table_widths)
+					table_compute_widths(&doc, &t)
+					doc.table_cols = len(doc.table_widths)
+					doc.top = 0
+
+					trows := table_visible_rows(&doc, H, px)
+					// The fixture must be TALLER than the viewport, or "the last
+					// visible row" is EOF and the row below it is empty in both
+					// the right and the wrong implementation -- a bound that
+					// rejects nothing. len(lines)-1 data rows exist.
+					pre := trows == TG_ROWS && trows < len(lines) - 1
+					chk(&bad, pre, fmt.tprintf("scale %.2f: precondition -- %d rows fit (want %d), %d data rows exist", scale, trows, TG_ROWS, len(lines) - 1))
+					if !pre {
+						fmt.printfln("    (%d rows fit, %d data rows exist)", trows, len(lines) - 1)
+						continue
+					}
+					cols := table_cols_layout(&doc, cw, W, table_start_col(&doc))
+					chk(&bad, len(cols) == 3, fmt.tprintf("scale %.2f: all 3 columns are laid out (%d)", scale, len(cols)))
+					if len(cols) != 3 {continue}
+
+					// 1. Every visible row, every column: the y the draw uses ->
+					//    the bytes the hit-test returns -> the fixture's field.
+					//    Includes row 0 (the one the sticky header's height can
+					//    push wrong) and trows-1 (the last visible row).
+					//
+					//    The probe is table_row_baseline_y -- the GLYPH producer,
+					//    not table_row_rect_y (the band producer) -- because
+					//    those are two different procedures (table.odin's "ONE
+					//    producer" comment notwithstanding: there are two, one
+					//    for the band and one for the text) and a band-centre
+					//    probe cannot tell them apart. A full-row divergence
+					//    between the two (table_row_baseline_y silently computing
+					//    row r+1's y) still lands well inside row r's BAND, so it
+					//    passed here forever; it does not still land inside row
+					//    r's glyph baseline, which is the point.
+					mism := 0
+					for r in 0 ..< trows {
+						my := table_row_baseline_y(px, r)
+						for col in cols {
+							mx := table_cell_text_x(col) // the x the glyphs are drawn at
+							ok, rr, cc, fs, fe, _ := table_cell_at(&doc, mx, my, px, cw, trows, W)
+							exp, has := want_field(lines[:], r + 1, col.c)
+							if !has {
+								// the short row's third field: nothing to edit
+								if ok {
+									mism += 1
+									fmt.printfln("    row %d col %d: resolved a field where line %d has none", r, col.c, r + 1)
+								}
+								continue
+							}
+							got := read_span(&doc, fs, fe) if ok else "<no hit>"
+							// The byte range must also LIE INSIDE line r+1, not
+							// merely spell the right text: two rows could share a
+							// field value in a real CSV.
+							inside := ok && fs >= off[r + 1] && fe <= off[r + 1] + len(lines[r + 1])
+							if !ok || rr != r || cc != col.c || got != exp || !inside {
+								mism += 1
+								if mism <= 4 {
+									fmt.printfln(
+										"    row %d col %d: hit=(%v,r%d,c%d) bytes[%d,%d)=%q want %q on line %d [%d,%d)",
+										r, col.c, ok, rr, cc, fs, fe, got, exp, r + 1, off[r + 1], off[r + 2] - 1,
+									)
+								}
+							}
+						}
+					}
+					chk(&bad, mism == 0, fmt.tprintf("scale %.2f: %d rows x 3 cols round-trip draw-y -> byte range -> fixture (%d wrong)", scale, trows, mism))
+
+					// 2. The sticky header is not a row. A press anywhere in the
+					//    band, and one half a pixel above the first row, must
+					//    refuse -- otherwise it edits data row 0's cell, which is
+					//    the specific way a sticky header corrupts an editing grid.
+					{
+						midband := table_grid_top() + table_header_h(px) * 0.5
+						okh, _, _, _, _, _ := table_cell_at(&doc, table_cell_text_x(cols[0]), midband, px, cw, trows, W)
+						chk(&bad, !okh, fmt.tprintf("scale %.2f: a press in the header band resolves to no cell", scale))
+						okj, _, _, _, _, _ := table_cell_at(&doc, table_cell_text_x(cols[0]), table_rows_top(px) - 0.5, px, cw, trows, W)
+						chk(&bad, !okj, fmt.tprintf("scale %.2f: ...and half a pixel above row 0 still refuses", scale))
+						// The pixel immediately below is row 0 and is line 1.
+						oke, re, _, fse, fee, _ := table_cell_at(&doc, table_cell_text_x(cols[0]), table_rows_top(px) + 0.5, px, cw, trows, W)
+						w0, _ := want_field(lines[:], 1, 0)
+						chk(
+							&bad,
+							oke && re == 0 && read_span(&doc, fse, fee) == w0,
+							fmt.tprintf("scale %.2f: the first pixel under the rule is row 0 = line 1 (%q, want %q)", scale, read_span(&doc, fse, fee) if oke else "<no hit>", w0),
+						)
+					}
+
+					// 3. The dead strip below the last drawn row refuses. This is
+					//    what the grid's own row budget buys: on the editor's
+					//    `rows` this y resolved to a row and started an edit.
+					{
+						okb, _, _, _, _, _ := table_cell_at(&doc, table_cell_text_x(cols[0]), table_row_rect_y(px, trows) + 1, px, cw, trows, W)
+						chk(&bad, !okb, fmt.tprintf("scale %.2f: a press below the last visible row resolves to no cell", scale))
+					}
+
+					// 4. Column boundaries, at the edges rather than the middles:
+					//    the last pixel of a cell belongs to it and the first
+					//    pixel of the next belongs to the next.
+					{
+						my := table_row_baseline_y(px, 0)
+						cb := 0
+						for col, i in cols {
+							for probe, kind in ([]f32{col.x, col.x + col.w - 0.5}) {
+								_, _, cc, _, _, _ := table_cell_at(&doc, probe, my, px, cw, trows, W)
+								if cc != col.c {
+									cb += 1
+									fmt.printfln("    col %d edge %d at x=%.1f resolved to column %d", col.c, kind, probe, cc)
+								}
+							}
+							if i + 1 < len(cols) {
+								_, _, cn, _, _, _ := table_cell_at(&doc, cols[i + 1].x, my, px, cw, trows, W)
+								if cn != cols[i + 1].c {cb += 1}
+							}
+						}
+						chk(&bad, cb == 0, fmt.tprintf("scale %.2f: every column's own pixels hit-test to it (%d edge failures)", scale, cb))
+					}
+
+					// 5. Scrolled: the header still shows LINE 0 while the rows
+					//    underneath it have moved. That is the whole sticky rule,
+					//    and the previous draw ("the band, but only when doc.top
+					//    == 0") passes every unscrolled assertion above.
+					{
+						doc.top = off[4]
+						head := table_header_fields(&doc)
+						hok := len(head) == 3 && head[0] == "h0" && head[2] == "h2"
+						chk(&bad, hok, fmt.tprintf("scale %.2f: scrolled to line 4, the header still reads line 0 (%v)", scale, head))
+						my := table_row_baseline_y(px, 0)
+						oks, _, _, fss, fes, _ := table_cell_at(&doc, table_cell_text_x(cols[0]), my, px, cw, trows, W)
+						w4, _ := want_field(lines[:], 4, 0)
+						chk(
+							&bad,
+							oks && fss >= off[4] && fes <= off[5] && read_span(&doc, fss, fes) == w4,
+							fmt.tprintf("scale %.2f: ...and row 0 is now line 4 (%q, want %q)", scale, read_span(&doc, fss, fes) if oks else "<no hit>", w4),
+						)
+						doc.top = 0
+					}
+				}
+
+				// --- the rest is scale-independent; pin 100% ----------------
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				px := BASE_PX_96
+				cw := plat.text_char_width(&t, px, .Doc)
+				W := f32(1000)
+				H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+				clear(&doc.table_widths)
+				table_compute_widths(&doc, &t)
+				doc.table_cols = len(doc.table_widths)
+				doc.top = 0
+				trows := table_visible_rows(&doc, H, px)
+				cols := table_cols_layout(&doc, cw, W, table_start_col(&doc))
+				chk(&bad, trows == TG_ROWS && trows < len(lines) - 1, fmt.tprintf("precondition -- %d rows fit (want %d), %d data rows exist", trows, TG_ROWS, len(lines) - 1))
+
+				// 6. EMPTY is not MISSING. §10 gives an em dash to one and a
+				//    warning bar to the other (group C), so the two have to be
+				//    distinguishable at the seam, not just in the draw.
+				{
+					my5 := table_row_baseline_y(px, 4) // data row 4 = line 5, "a4,,c4"
+					ok5, _, _, fs5, fe5, val5 := table_cell_at(&doc, table_cell_text_x(cols[1]), my5, px, cw, trows, W)
+					chk(&bad, ok5 && val5 == "" && fs5 == fe5, fmt.tprintf("an EMPTY cell is a real field: hit=%v val=%q zero-width=%v", ok5, val5, fs5 == fe5))
+					my8 := table_row_baseline_y(px, 7) // data row 7 = line 8, "a7,b7"
+					ok8, _, _, _, _, _ := table_cell_at(&doc, table_cell_text_x(cols[2]), my8, px, cw, trows, W)
+					chk(&bad, !ok8, "a MISSING cell on a short row is not a field at all")
+					// And the draw's own skip condition is reachable: the short
+					// row really does have fewer fields than the table has columns.
+					nshort := len(csv_fields("a7,b7", ','))
+					chk(&bad, nshort < len(doc.table_widths), fmt.tprintf("the short row has %d fields vs %d columns, so the draw's skip branch runs", nshort, len(doc.table_widths)))
+					// The dash is a placeholder, not data: it must not be a byte
+					// the file could contain in an empty cell.
+					chk(&bad, len(TABLE_EMPTY_CELL) > 1, fmt.tprintf("the empty-cell mark is a real em dash, not '-' (%q, %d bytes)", TABLE_EMPTY_CELL, len(TABLE_EMPTY_CELL)))
+				}
+
+				// 7. The wheel's first notch off the top of the file MOVES.
+				//
+				//    The header owns line 0, so doc.top == 0 and doc.top ==
+				//    off[1] are one scroll position. The first pair below is the
+				//    bug as it would be without the normalise in main.odin's
+				//    table wheel branch -- asserted to be a no-op, which is what
+				//    makes the second pair's success mean something. A test that
+				//    only checked the normalised path would pass with the
+				//    normalise deleted, since doc_scroll moves doc.top either way.
+				{
+					doc.top = 0
+					raw_before, _ := table_data_start(&doc)
+					doc_scroll(&doc, &t, 1, trows)
+					raw_after, _ := table_data_start(&doc)
+					chk(
+						&bad,
+						raw_before == off[1] && raw_after == off[1],
+						fmt.tprintf("un-normalised, the first notch is a DEAD notch: first data row %d -> %d (both want %d)", raw_before, raw_after, off[1]),
+					)
+
+					doc.top = 0
+					if s, sok := table_data_start(&doc); sok {doc.top = s}
+					doc_scroll(&doc, &t, 1, trows)
+					if s, sok := table_data_start(&doc); sok {doc.top = s}
+					norm_after, _ := table_data_start(&doc)
+					chk(&bad, norm_after == off[2], fmt.tprintf("normalised, it advances one row: first data row %d (want %d)", norm_after, off[2]))
+
+					// ...and scrolling back up cannot rest below line 1.
+					doc.top = off[1]
+					doc_scroll(&doc, &t, -1, trows)
+					if s, sok := table_data_start(&doc); sok {doc.top = s}
+					up, _ := table_data_start(&doc)
+					chk(&bad, up == off[1], fmt.tprintf("and the top of the file is line 1, not line 0: %d (want %d)", up, off[1]))
+					doc.top = 0
+
+					// The pair above proves the MECHANISM, and nothing more: it
+					// normalises doc.top itself, so deleting the normalise from
+					// main.odin's wheel branch leaves every row of it green. This
+					// counts the two calls that have to be there -- the only
+					// instrument available, since the wheel needs a real
+					// WM_MOUSEWHEEL and this environment cannot inject one.
+					nnorm := strings.count(#load("main.odin", string), "table_data_start(doc)")
+					chk(&bad, nnorm == 2, fmt.tprintf("main.odin normalises doc.top on BOTH sides of the grid's scroll (%d calls, want 2)", nnorm))
+				}
+
+				// 8. A header with nothing under it has no data rows -- the case
+				//    where treating the header as row 0 would put one line on
+				//    screen twice.
+				{
+					only := make([]u8, len("just,a,header"))
+					copy(only, transmute([]u8)string("just,a,header"))
+					hd := doc_from_content(only, "hdr.csv", .UTF8)
+					defer doc_close(&hd)
+					hd.table, hd.table_delim = true, ','
+					_, sok := table_data_start(&hd)
+					chk(&bad, !sok, "a header with no newline after it yields no data rows")
+					hf := table_header_fields(&hd)
+					chk(&bad, len(hf) == 3 && hf[0] == "just", fmt.tprintf("...but it is still drawn as the header (%v)", hf))
+				}
+
+				// 9. The scrollbar, its drag and the wheel stop at the same byte.
+				//
+				//    vscrollbar_geo maps doc.top through doc_max_top(rows) and
+				//    vbar_drag_to maps the pointer back through
+				//    doc_scroll_to_fraction(rows); the wheel calls doc_scroll with
+				//    a third copy. Handing the grid's wheel `trows` while the bar
+				//    kept the editor's `rows` pins the thumb at the bottom of the
+				//    track while the file keeps scrolling.
+				//
+				//    The first row is the one that stops this being vacuous: the
+				//    two counts must actually DIFFER for this fixture, or the rest
+				//    would hold with doc_scroll_rows deleted.
+				{
+					doc.top = 0
+					erows := doc_visible_rows(&doc, H, line_height(px))
+					chk(&bad, erows != trows, fmt.tprintf("the editor's budget (%d) and the grid's (%d) are genuinely different here", erows, trows))
+					srows := doc_scroll_rows(&doc, H, line_height(px), px)
+					chk(&bad, srows == trows, fmt.tprintf("the scroll model takes the grid's count in a grid (%d, want %d)", srows, trows))
+					mt_grid := doc_max_top(&doc, &t, trows)
+					mt_edit := doc_max_top(&doc, &t, erows)
+					chk(&bad, mt_grid != mt_edit, fmt.tprintf("...and the two counts reach different ends of the file (%d vs %d)", mt_grid, mt_edit))
+					chk(&bad, doc_max_top(&doc, &t, srows) == mt_grid, "so the bar's bottom and the wheel's bottom are the same byte")
+					// A non-grid document is untouched: same answer as before.
+					doc.table = false
+					chk(&bad, doc_scroll_rows(&doc, H, line_height(px), px) == erows, "a non-grid document still gets the editor's count")
+					doc.table = true
+				}
+
+				// 9b. F1: doc_scroll_rows existed and agreed with itself (check 9
+				//    above) while main.odin's keyboard/palette dispatch still
+				//    handed .Page_Up/.Page_Down the EDITOR'S rows -- a fourth
+				//    thing that has to hold the same number, on top of the wheel,
+				//    the bar and its drag. main.odin's frame loop has no message
+				//    pump here, so nothing short of a real WM_KEYDOWN could
+				//    exercise the wiring directly; a source count is what item 7's
+				//    nnorm check uses for the identical reason, and it is what is
+				//    left. The keyboard path and the command palette are the two
+				//    routes a user reaches a page key through.
+				{
+					src := #load("main.odin", string)
+					nkey := strings.count(src, "command_dispatch(cmd, ev, &app, window, &text, srows)")
+					npal := strings.count(src, "palette_execute(&app, window, &text, srows)")
+					chk(&bad, nkey == 1, fmt.tprintf("the keyboard path dispatches with the scroll model's count (%d matches for srows)", nkey))
+					chk(&bad, npal == 1, fmt.tprintf("...and so does the command palette (%d matches for srows)", npal))
+				}
+
+				// 10. A zoomed font can never make rows overlap. The design values
+				//    are floors, not fixed heights -- at 200% zoom the line box is
+				//    48px and a flat 26px row would draw every cell over its
+				//    neighbour.
+				{
+					big := BASE_PX_96 * 3
+					chk(&bad, table_row_h(big) >= line_height(big), fmt.tprintf("at px=%.0f the row (%.0f) still holds the line box (%.0f)", big, table_row_h(big), line_height(big)))
+					chk(&bad, table_header_h(big) >= line_height(big), fmt.tprintf("...and so does the header (%.0f vs %.0f)", table_header_h(big), line_height(big)))
+					chk(&bad, table_row_h(BASE_PX_96) == TABLE_ROW_H, fmt.tprintf("at the default size the SPEC's number governs (%.0f)", table_row_h(BASE_PX_96)))
+				}
+				return
+			}
+
+			// F1, the mechanism itself: Page_Down through the REAL
+			// command_dispatch, not doc_scroll called directly -- 9b above only
+			// proves main.odin's SOURCE hands it the right variable, and a source
+			// count cannot tell whether commands.odin's .Page_Down case still does
+			// the right thing with it. Its own proc, sibling to tg(): a fixture
+			// Document (tg's) and an App (this one's) alive in the same frame at
+			// once is the exact shape that has hit STATUS_STACK_OVERFLOW twice
+			// before (see docs/development-loop.md), so this does not nest inside
+			// tg() itself.
+			tg_page :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (page-key check): no fonts loaded")
+					bad += 1
+					return
+				}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				BASE_PX = BASE_PX_96
+				px := BASE_PX_96
+
+				lines := [?]string {
+					"h0,h1", "a0,b0", "a1,b1", "a2,b2", "a3,b3", "a4,b4", "a5,b5",
+					"a6,b6", "a7,b7", "a8,b8", "a9,b9", "a10,b10", "a11,b11", "a12,b12", "a13,b13",
+				}
+				off: [len(lines) + 1]int
+				for l, i in lines {off[i + 1] = off[i] + len(l) + 1}
+				content := make([]u8, off[len(lines)]) // default allocator: app_destroy -> doc_close owns it
+				for l, i in lines {copy(content[off[i]:], transmute([]u8)l);content[off[i] + len(l)] = '\n'}
+
+				a: App
+				a.settings = settings_default()
+				dummy: plat.Window
+				d := new(Document)
+				d^ = doc_from_content(content, "pd.csv", .UTF8)
+				d.table, d.table_delim = true, ','
+				app_activate(&a, app_add(&a, d))
+				defer app_destroy(&a)
+				doc_update_top_inset(d)
+
+				line_h := line_height(px)
+				// Shorter than tg()'s TG_ROWS on purpose -- a second, independent
+				// fixture that also has to land on "the editor's count and the
+				// grid's genuinely differ", not a re-use of the same numbers.
+				PG_ROWS :: 8
+				H := table_rows_top(px) + f32(PG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+				trows := table_visible_rows(d, H, px)
+				erows := doc_visible_rows(d, H, line_h)
+				pre := trows == PG_ROWS && trows < len(lines) - 1
+				chk(&bad, pre, fmt.tprintf("precondition -- %d grid rows fit (want %d), %d data rows exist", trows, PG_ROWS, len(lines) - 1))
+				if !pre {return}
+				chk(&bad, erows != trows, fmt.tprintf("the editor's rows (%d) and the grid's (%d) differ here too", erows, trows))
+
+				mt_grid := doc_max_top(d, &t, trows)
+				mt_edit := doc_max_top(d, &t, erows)
+				chk(&bad, mt_grid != mt_edit, fmt.tprintf("...and the two ends of the file differ (%d vs %d)", mt_grid, mt_edit))
+
+				// Land at the grid's own bottom -- what the wheel leaves doc.top
+				// at -- then Page_Down through command_dispatch itself. With the
+				// grid's own row count (what main.odin passes post-fix) the view
+				// must stay put; with the editor's (what it passed before) this
+				// reproduces F1 exactly: the thumb at the bottom of the track and
+				// the next Page_Down walking it backwards.
+				d.top = mt_grid
+				command_dispatch(.Page_Down, {}, &a, &dummy, &t, trows)
+				right_top := d.top
+				chk(&bad, right_top == mt_grid, fmt.tprintf("Page_Down at the grid's bottom with the grid's row count stays put: top %d (want %d)", right_top, mt_grid))
+
+				d.top = mt_grid
+				command_dispatch(.Page_Down, {}, &a, &dummy, &t, erows)
+				wrong_top := d.top
+				chk(&bad, wrong_top != mt_grid, fmt.tprintf("...and reproduces F1 with the editor's row count instead: top %d -> %d", mt_grid, wrong_top))
+				return
+			}
+
+			// An open cell edit must never end up drawn over a row it will not
+			// write. doc.table_edit_row is a VISIBLE row index; doc.table_edit_s/e
+			// are ABSOLUTE byte offsets captured at edit start, so any scroll
+			// separates them: the highlight box and the caret stay on row N while
+			// a commit still splices the line that USED to be row N.
+			//
+			// Every scroll route is driven -- wheel, scrollbar drag, Page Up, Page
+			// Down, and a resize that takes the row off screen -- and the assertion
+			// is the SEAM, phrased so a future "keep the box tracking the bytes"
+			// fix would also pass it: either the edit committed to its original
+			// bytes, or it is still open AND still drawn on the line it will write.
+			// Never that it wrote somewhere else.
+			//
+			// .Wheel IS NOT EVIDENCE FOR THE GUARD, and saying so is the point of
+			// this paragraph. main.odin's wheel arm has committed inline since the
+			// grid shipped ("rows shift underfoot"), the arm is hand-copied into the
+			// route below because the handling is inline in the frame loop, and the
+			// inline commit fires before table_edit_hold is ever reached -- so those
+			// four assertions stay green with the guard deleted. They document the
+			// pre-existing commit, which is worth having (the copy can drift), but
+			// four of the twenty-four assertions here are not the guard's.
+			//
+			// .Wheel_Bare exists so the wheel IS covered by something falsifiable:
+			// the same scroll with the inline commit omitted, which is exactly what
+			// the frame loop would look like if that line were ever removed or moved
+			// after the scroll. It is the guard or nothing on that route.
+			//
+			// Its own proc for the same stack-frame reason as tg_page.
+			tg_edit_anchor :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (edit-anchor check): no fonts loaded")
+					bad += 1
+					return
+				}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				BASE_PX = BASE_PX_96
+				px := BASE_PX_96
+				ER :: 6 // the data row edited: on screen at the start, off it after a page
+
+				// One document per route: a commit rewrites the buffer, so a shared
+				// fixture would have each route judging the previous one's damage.
+				Route :: enum {
+					Wheel,
+					Wheel_Bare,
+					Scrollbar,
+					Page_Down,
+					Page_Up,
+					Resize,
+				}
+				run :: proc(bad: ^int, t: ^plat.Text, px: f32, route: Route, ER: int) {
+					lines: [dynamic]string
+					defer delete(lines)
+					append(&lines, "h0,h1")
+					for i in 0 ..< 40 {append(&lines, fmt.aprintf("a%d,b%d", i, i))}
+					defer for i in 1 ..< len(lines) {delete(lines[i])}
+					total := 0
+					for l in lines {total += len(l) + 1}
+					content := make([]u8, total) // doc_close owns it (owned_orig)
+					{
+						o := 0
+						for l in lines {
+							copy(content[o:], transmute([]u8)l)
+							content[o + len(l)] = '\n'
+							o += len(l) + 1
+						}
+					}
+					a: App
+					a.settings = settings_default()
+					dummy: plat.Window
+					d := new(Document)
+					d^ = doc_from_content(content, "anchor.csv", .UTF8)
+					d.table, d.table_delim = true, ','
+					app_activate(&a, app_add(&a, d))
+					defer app_destroy(&a)
+					doc_update_top_inset(d)
+					// What table_draw's first frame does: the hit-tests refuse
+					// without the width sample and the column count.
+					table_compute_widths(d, t)
+					d.table_cols = len(d.table_widths)
+
+					ROWS :: 12
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					trows := table_visible_rows(d, H, px)
+					if trows != ROWS || ER >= trows {
+						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
+						return
+					}
+
+					// Start on a scrolled view for Page_Up, so the route actually
+					// moves. Every other route starts at the top.
+					if route == .Page_Up {
+						if s, sok := table_data_start(d); sok {d.top = s}
+						doc_scroll(d, t, 20, trows)
+					}
+
+					// The cell: data row ER, column 0. Resolved through the same
+					// hit-test path the click uses, so the span is the one a real
+					// edit would capture.
+					ok, r, col, fs, fe, val := table_cell_at_index(d, ER, 0, trows)
+					if !ok {
+						chk(bad, false, fmt.tprintf("%v: could not resolve the cell at row %d", route, ER))
+						return
+					}
+					// The line under the box BEFORE the scroll, read off the document
+					// rather than rebuilt from ER: with a scrolled start (Page_Up)
+					// visible row ER is not data row ER, and a `want` string built
+					// from the index would name a line the edit never touched.
+					home_line, _ := table_row_start(d, ER)
+					home_before := ""
+					{
+						before_text := doc_debug_string(d)
+						defer delete(before_text)
+						e := base.pt_line_end_cap(&d.pt, home_line, RENDER_LINE_CAP)
+						home_before = strings.clone(before_text[home_line:e], context.temp_allocator)
+					}
+					table_edit_start(d, r, col, fs, fe, val)
+					table_edit_rune(d, 'Z')
+					home_text := fmt.tprintf("%sZ", val)
+
+					switch route {
+					case .Wheel:
+						// main.odin's wheel arm, in its own order: it commits first
+						// ("rows shift underfoot") and normalises doc.top through
+						// table_data_start on both sides of the scroll. The commit
+						// below is the arm's own, so this route passes with or
+						// without the guard -- see the note above the proc.
+						if d.table_editing {table_edit_commit(d)}
+						if s, sok := table_data_start(d); sok {d.top = s}
+						doc_scroll(d, t, 5, trows)
+						if s, sok := table_data_start(d); sok {d.top = s}
+					case .Wheel_Bare:
+						// The same scroll with the arm's inline commit omitted: the
+						// guard is the only thing left that can catch it, so this
+						// route fails if the guard is removed and .Wheel does not.
+						if s, sok := table_data_start(d); sok {d.top = s}
+						doc_scroll(d, t, 5, trows)
+						if s, sok := table_data_start(d); sok {d.top = s}
+					case .Scrollbar:
+						// vbar_drag_to's whole body once b.shown is known.
+						doc_scroll_to_fraction(d, t, 0.5, trows)
+					case .Page_Down:
+						command_dispatch(.Page_Down, {}, &a, &dummy, t, trows)
+					case .Page_Up:
+						command_dispatch(.Page_Up, {}, &a, &dummy, t, trows)
+					case .Resize:
+						// doc.top does not move; the window does. The row budget
+						// the frame passes shrinks below the edited row.
+						trows = ER
+					}
+					table_edit_hold(d, trows)
+
+					// The seam. Independent of table_edit_anchored (the fix's own
+					// predicate): the drawn row's line start is walked here, and the
+					// line a commit would write is derived from the captured span.
+					drawn_line, dok := table_row_start(d, d.table_edit_row)
+					write_line, wexact := base.pt_line_start_cap(&d.pt, d.table_edit_s, RENDER_LINE_CAP)
+					seam := !d.table_editing || (dok && wexact && drawn_line == write_line && d.table_edit_row < trows)
+					chk(bad, seam, fmt.tprintf("%v: the box is never drawn on a row it will not write (editing=%v drawn=%d write=%d)", route, d.table_editing, drawn_line, write_line))
+
+					// ...and the data. The typed value must be on the ORIGINAL line
+					// and nowhere else. `count` rather than `contains`: a write to
+					// the wrong row would leave the marker present exactly once too,
+					// so only its POSITION distinguishes the two outcomes.
+					doc_text := doc_debug_string(d)
+					defer delete(doc_text)
+					got := ""
+					{
+						e := base.pt_line_end_cap(&d.pt, home_line, RENDER_LINE_CAP)
+						got = doc_text[home_line:e]
+					}
+					// The line it started as, with the typed byte appended to field 0
+					// -- derived from what was actually there, not from ER.
+					want := fmt.tprintf("%s%s", home_text, home_before[len(val):])
+					chk(bad, got == want, fmt.tprintf("%v: the edit landed on its own line (%q, want %q)", route, got, want))
+					chk(bad, strings.count(doc_text, home_text) == 1, fmt.tprintf("%v: %q appears exactly once in the file (%d)", route, home_text, strings.count(doc_text, home_text)))
+					chk(bad, len(doc_text) == total + 1, fmt.tprintf("%v: the file grew by exactly the typed byte (%d, want %d)", route, len(doc_text), total + 1))
+				}
+				for route in Route {run(&bad, &t, px, route, ER)}
+				return
+			}
+
+			// A REORDERING under a live cell edit -- the case the offset compare
+			// cannot see, and the trap batch 18's sort would have walked into.
+			//
+			// The fixture is the point: every line the SAME BYTE LENGTH, which is
+			// what an export looks like (zero-padded ids, ISO dates, fixed status
+			// codes). Permute two of them and the r-th line still starts at the
+			// r-th offset, so `table_row_start(doc, r) == doc.table_edit_line`
+			// still holds -- asserted here as a precondition, so this mode says out
+			// loud that the offset compare is blind to it -- while [s,e) has come to
+			// span the OTHER row's id field.
+			//
+			// The seam, not the unit: what is compared is the DOCUMENT'S BYTES
+			// before and after the commit attempt, and the assertion is phrased so a
+			// future "keep the edit tracking its line through a reorder" fix would
+			// also pass -- either nothing was written, or the typed value landed on
+			// the line it was captured from. Never on the other row.
+			//
+			// Three routes, and .Control is not optional: a guard that refused every
+			// commit would satisfy both permute routes and break cell editing
+			// outright, so the same fixture proves an undisturbed edit still lands.
+			tg_edit_permute :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (edit-permute check): no fonts loaded")
+					bad += 1
+					return
+				}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				BASE_PX = BASE_PX_96
+				px := BASE_PX_96
+				ER :: 11 // the row from the finding's own scenario
+
+				// Guard  = the once-per-frame check (main.odin's table_edit_hold call).
+				// Enter  = table_edit_commit straight off the dispatch, which is the
+				//          route the finding describes and the one no frame guard sits
+				//          on: sort, then press Enter.
+				// Control = no reorder at all; the edit must still commit.
+				Route :: enum {
+					Guard,
+					Enter,
+					Control,
+				}
+				run :: proc(bad: ^int, t: ^plat.Text, px: f32, route: Route, ER: int) {
+					lines: [dynamic]string
+					defer delete(lines)
+					append(&lines, "id,date,status")
+					for i in 0 ..< 20 {append(&lines, fmt.aprintf("%05d,2026-01-%02d,ACTIVE", i + 1, (i % 28) + 1))}
+					defer for i in 1 ..< len(lines) {delete(lines[i])}
+					equal := true
+					for i in 2 ..< len(lines) {if len(lines[i]) != len(lines[1]) {equal = false}}
+					chk(bad, equal, fmt.tprintf("%v: every data line is the same byte length (%d)", route, len(lines[1])))
+					total := 0
+					for l in lines {total += len(l) + 1}
+					content := make([]u8, total) // doc_close owns it (owned_orig)
+					{
+						o := 0
+						for l in lines {
+							copy(content[o:], transmute([]u8)l)
+							content[o + len(l)] = '\n'
+							o += len(l) + 1
+						}
+					}
+					a: App
+					a.settings = settings_default()
+					d := new(Document)
+					d^ = doc_from_content(content, "permute.csv", .UTF8)
+					d.table, d.table_delim = true, ','
+					app_activate(&a, app_add(&a, d))
+					defer app_destroy(&a)
+					doc_update_top_inset(d)
+					table_compute_widths(d, t)
+					d.table_cols = len(d.table_widths)
+
+					ROWS :: 14
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					trows := table_visible_rows(d, H, px)
+					if trows != ROWS || ER + 1 >= trows {
+						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
+						return
+					}
+
+					ok, r, col, fs, fe, val := table_cell_at_index(d, ER, 0, trows)
+					if !ok {
+						chk(bad, false, fmt.tprintf("%v: could not resolve the cell at row %d", route, ER))
+						return
+					}
+					home_line, _ := table_row_start(d, ER)
+					next_line, nok := table_row_start(d, ER + 1)
+					if !nok {
+						chk(bad, false, fmt.tprintf("%v: could not resolve row %d", route, ER + 1))
+						return
+					}
+					home_before, other_before := "", ""
+					{
+						txt := doc_debug_string(d)
+						defer delete(txt)
+						he := base.pt_line_end_cap(&d.pt, home_line, RENDER_LINE_CAP)
+						oe := base.pt_line_end_cap(&d.pt, next_line, RENDER_LINE_CAP)
+						home_before = strings.clone(txt[home_line:he], context.temp_allocator)
+						other_before = strings.clone(txt[next_line:oe], context.temp_allocator)
+					}
+					table_edit_start(d, r, col, fs, fe, val)
+					table_edit_rune(d, 'Z')
+					// What the edit MEANS: the typed value on field 0 of the line it
+					// was captured from. Derived from those bytes, not from ER.
+					home_edited := fmt.tprintf("%sZ%s", val, home_before[len(val):])
+
+					if route != .Control {
+						// THE SORT, reduced to the one move that matters: swap two
+						// equal-length lines through the same doc_replace_range a sort
+						// would use. No byte offset in the file changes.
+						oe := base.pt_line_end_cap(&d.pt, next_line, RENDER_LINE_CAP)
+						swapped := fmt.tprintf("%s\n%s", other_before, home_before)
+						doc_replace_range(d, home_line, oe - home_line, transmute([]u8)swapped)
+						p, pok := table_row_start(d, ER)
+						chk(bad, pok && p == d.table_edit_line, fmt.tprintf("%v: the swap left the row start where it was -- the offset compare is blind to it (%d vs %d)", route, p, d.table_edit_line))
+						chk(bad, !table_edit_anchored(d, trows), fmt.tprintf("%v: ...and the anchor refuses it anyway, on the bytes", route))
+					}
+
+					text_before := ""
+					{
+						tb := doc_debug_string(d)
+						defer delete(tb)
+						text_before = strings.clone(tb, context.temp_allocator)
+					}
+					switch route {
+					case .Guard:
+						table_edit_hold(d, trows)
+					case .Enter:
+						table_edit_commit(d)
+					case .Control:
+						table_edit_hold(d, trows) // must NOT fire
+						chk(bad, d.table_editing, "Control: an undisturbed edit is still open after the frame guard")
+						table_edit_commit(d)
+					}
+					text_after := doc_debug_string(d)
+					defer delete(text_after)
+
+					if route == .Control {
+						want, _ := strings.replace(text_before, home_before, home_edited, 1, context.temp_allocator)
+						chk(bad, text_after == want, fmt.tprintf("Control: an undisturbed edit still commits to its own field (%q)", home_edited))
+						return
+					}
+
+					// The seam. Either nothing was written, or the typed value is on
+					// the line it was captured from -- wherever the reorder put it.
+					refused := text_after == text_before
+					tracked_want, _ := strings.replace(text_before, home_before, home_edited, 1, context.temp_allocator)
+					tracked := text_after == tracked_want
+					chk(bad, refused || tracked, fmt.tprintf("%v: the edit is refused or lands on its own line (refused=%v tracked=%v)", route, refused, tracked))
+					// ...and the failure mode named directly. With the byte-offset
+					// compare back, [s,e) spans the OTHER row's id field and this is
+					// the line the splice destroys.
+					chk(bad, strings.count(text_after, other_before) == 1, fmt.tprintf("%v: the other row's line survives intact (%q appears %d time(s))", route, other_before, strings.count(text_after, other_before)))
+					// A stale edit must not be left open either: with only the offset
+					// compare, the frame guard reads the reorder as "nothing moved"
+					// and keystrokes keep accumulating into a box over the wrong row.
+					chk(bad, !d.table_editing, fmt.tprintf("%v: the edit is closed, not left accumulating over the wrong row", route))
+				}
+				for route in Route {run(&bad, &t, px, route, ER)}
+				return
+			}
+
+			// F3: §10's appearance -- the header fill, the rule's colour AND
+			// thickness, and the zebra's parity -- asserted on PIXELS from a real
+			// device, not a source count. A source count can only prove a colour
+			// role's NAME appears somewhere in table.odin; it cannot say which
+			// rows get banded or which pixel a rule actually lands on, and a
+			// reviewer changing all three at once (header fill, rule colour +
+			// thickness, zebra parity) left every existing mode green. Its own
+			// proc for the same stack-frame reason as tg_page.
+			tg_appearance :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				W, H :: 1000, 700
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, W, H, "tablegridtest/appearance") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return 0
+				}
+				defer headless_gpu_destroy(&h)
+
+				saved_theme, saved_scale := g_theme, UI_SCALE
+				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				BASE_PX = BASE_PX_96
+
+				// Four sentinel colours, maximally far apart in every channel, in
+				// place of the real theme's -- Table_Zebra is DELIBERATELY close
+				// to Bg_Base (table.odin's own comment: "judged against Bg_Base
+				// ... for the LACK of contrast"), which is exactly the row this
+				// check cares about and exactly the pair a small-tolerance pixel
+				// sample could confuse with rendering noise. Sentinels turn "is
+				// this pixel close to a near-identical neighbour" into "is this
+				// pixel exactly A, B, C or D", which is what makes a tight
+				// tolerance safe to use below. Real device, real quad pipeline,
+				// real table_draw -- only the theme's VALUES are substituted.
+				bg_s := [4]f32{0, 0, 0, 1} // Bg_Base -- the unbanded row / page
+				hdr_s := [4]f32{1, 0, 0, 1} // Bg_Raised -- the header fill
+				rule_s := [4]f32{0, 1, 0, 1} // Border_Strong -- the header rule
+				zeb_s := [4]f32{0, 0, 1, 1} // Table_Zebra -- the banded row
+				g_theme[.Bg_Base] = bg_s
+				g_theme[.Bg_Raised] = hdr_s
+				g_theme[.Border_Strong] = rule_s
+				g_theme[.Table_Zebra] = zeb_s
+
+				sample :: proc(buf: []u8, w, x, y: int) -> (b, g, r: u8) {
+					i := (y * w + x) * 4
+					return buf[i], buf[i + 1], buf[i + 2]
+				}
+				near :: proc(c: [4]f32, b, g, r: u8, tol: int) -> bool {
+					want := [3]u8{u8(c[2] * 255 + 0.5), u8(c[1] * 255 + 0.5), u8(c[0] * 255 + 0.5)}
+					return abs(int(b) - int(want[0])) <= tol && abs(int(g) - int(want[1])) <= tol && abs(int(r) - int(want[2])) <= tol
+				}
+				TOL :: 2 // solid quad fills, not glyphs: exact short of rounding
+
+				content := transmute([]u8)strings.clone("h0,h1\na0,b0\na1,b1\na2,b2\na3,b3\na4,b4\na5,b5\n")
+				doc := doc_from_content(content, "appear.csv", .UTF8)
+				defer doc_close(&doc)
+				doc.table, doc.table_delim = true, ','
+
+				px := BASE_PX_96
+				char_w := plat.text_char_width(&h.text, px, .Doc)
+				rows := table_visible_rows(&doc, f32(H), px)
+
+				plat.gfx_begin_frame(&h.gfx, bg_s[0], bg_s[1], bg_s[2])
+				table_draw(&h.gfx, &h.quads, &h.text, &doc, px, char_w, rows, f32(W))
+				buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				chk(&bad, ok, "the readback succeeded")
+				if !ok {return}
+
+				// x=2: left of the grid's own left inset (§10's cell padding
+				// starts the TEXT at x=10; the band itself tiles from x=0), so
+				// every sample below is a pixel no glyph in this draw ever
+				// touches, whatever the row's content is.
+				sx := 2
+
+				// 1. The header fill is Bg_Raised, not Bg_Panel (or anything
+				//    else) -- sampled comfortably inside the band, above the
+				//    rule.
+				hy := int(table_grid_top() + table_header_h(px) * 0.3)
+				hb, hg, hr := sample(buf, W, sx, hy)
+				chk(&bad, near(hdr_s, hb, hg, hr, TOL), fmt.tprintf("header band fill is Bg_Raised at (%d,%d): got bgr=(%d,%d,%d)", sx, hy, hb, hg, hr))
+
+				// 2. The rule is Border_Strong, and exactly hairline() pixels
+				//    thick -- a real hairline() call, not a second copy of the
+				//    constant, so a sabotage that changes the DRAWN thickness
+				//    (table.odin) diverges from what this still computes.
+				want_thick := int(hairline())
+				scan_top := int(table_grid_top() + table_header_h(px)) - want_thick - 3
+				scan_bot := int(table_grid_top() + table_header_h(px)) + 3
+				got_thick := 0
+				for yy in scan_top ..< scan_bot {
+					b, g, r := sample(buf, W, sx, yy)
+					if near(rule_s, b, g, r, TOL) {got_thick += 1}
+				}
+				chk(&bad, got_thick == want_thick, fmt.tprintf("header rule is %d px thick (want hairline() = %d)", got_thick, want_thick))
+
+				// 3. Zebra parity: row 0 (visible index 0, under the header) is
+				//    UNBANDED -- it reads the page background, Bg_Base -- and
+				//    row 1 is banded, Table_Zebra. table.odin's own comment
+				//    names the reason (row 0 sits directly under the header
+				//    rule), so this is the specific parity §10 asks for, not
+				//    just "alternating".
+				y0 := int(table_row_rect_y(px, 0) + table_row_h(px) * 0.3)
+				y1 := int(table_row_rect_y(px, 1) + table_row_h(px) * 0.3)
+				b0, g0, r0 := sample(buf, W, sx, y0)
+				b1, g1, r1 := sample(buf, W, sx, y1)
+				chk(&bad, near(bg_s, b0, g0, r0, TOL), fmt.tprintf("row 0 is unbanded (reads Bg_Base) at (%d,%d): got bgr=(%d,%d,%d)", sx, y0, b0, g0, r0))
+				chk(&bad, near(zeb_s, b1, g1, r1, TOL), fmt.tprintf("row 1 is banded (reads Table_Zebra) at (%d,%d): got bgr=(%d,%d,%d)", sx, y1, b1, g1, r1))
+
+				// 4. F9: a ZERO-LENGTH document draws nothing -- not a bare header
+				//    band over an empty page. table_header_fields(doc) returns nil
+				//    when doc.pt.length == 0, and that used to be checked AFTER
+				//    the band + rule quads were already emitted.
+				empty_content := make([]u8, 0)
+				edoc := doc_from_content(empty_content, "empty.csv", .UTF8)
+				defer doc_close(&edoc)
+				edoc.table, edoc.table_delim = true, ','
+				erows := table_visible_rows(&edoc, f32(H), px)
+				plat.gfx_begin_frame(&h.gfx, bg_s[0], bg_s[1], bg_s[2])
+				table_draw(&h.gfx, &h.quads, &h.text, &edoc, px, char_w, erows, f32(W))
+				ebuf, eok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				chk(&bad, eok, "the empty-document readback succeeded")
+				if eok {
+					eb, eg, er := sample(ebuf, W, sx, hy)
+					chk(&bad, near(bg_s, eb, eg, er, TOL), fmt.tprintf("an empty document draws no header band at (%d,%d): got bgr=(%d,%d,%d)", sx, hy, eb, eg, er))
+				}
+				return
+			}
+
+			bad := tg()
+			bad += tg_page()
+			bad += tg_edit_anchor()
+			bad += tg_edit_permute()
+			bad += tg_appearance()
+			fmt.printfln("tablegridtest: %d failures", bad)
 			return true
 		}
 
@@ -15962,6 +17500,12 @@ when NEWTPAD_TESTS {
 					// that existed for one banner. Still one of the six places UI
 					// spec 17 names where text sits on a themeable fill.
 					{.Text_Primary, .Accent_Wash, 4.5, "the filter band"},
+					// A zebra band is a surface text sits on, so it belongs in this
+					// list on exactly the same footing as the selection and the
+					// find match -- the unbanded rows clear 4.5 through
+					// Text_Primary/Bg_Base above, and half the rows in a table view
+					// are not on Bg_Base.
+					{.Text_Primary, .Table_Zebra, 4.5, "body on a table zebra band"},
 					{.Scrollbar_Thumb, .Bg_Base, 3.0, "scrollbar thumb (non-text, 1.4.11)"},
 				}
 				cl := theme_light()
@@ -15975,6 +17519,92 @@ when NEWTPAD_TESTS {
 							"  %-6s %s %v on %v: %.2f:1 (need %.1f) -- %s",
 							"ok" if ok else "FAIL", name, p.fg, p.bg, r, p.min, p.what,
 						)
+					}
+				}
+
+				// Table_Zebra, the one role whose job is to be *almost* the surface
+				// it sits on. Its floor is in cpairs above (text has to stay
+				// readable on it); what follows is the other side, and it is the
+				// only bound in this file that runs that direction.
+				//
+				// §10 deleted the per-column vertical rules because "it makes the
+				// grid louder than the data" and put this band in their place, so
+				// the band is now the ONLY thing separating one row from the next.
+				// Both failure modes are therefore live and neither is caught by
+				// any assertion above: a band equal to the page is the feature
+				// silently absent, and a band tuned like a chrome tier is the
+				// loudness §10 removed, moved from every column to every other row.
+				//
+				// NO absolute ceiling on the ratio. That was tried and it is very
+				// nearly vacuous: WCAG ratios compress hard at both ends of a warm
+				// palette, so Light's Bg_Raised measures 1.061 against Bg_Base while
+				// its zebra measures 1.063 -- two roles a person cannot confuse,
+				// separated by 0.002. Any ceiling loose enough to admit both themes'
+				// zebras admits half the neutral ramp with them. The bounds below
+				// are relative instead (so they survive a retune) plus two identity
+				// checks for the pair the relative bound provably cannot separate.
+				{
+					zmcd :: proc(a, b: [4]f32) -> int {
+						m := 0
+						for i in 0 ..< 3 {
+							dch := int(a[i] * 255 + 0.5) - int(b[i] * 255 + 0.5)
+							if dch < 0 {dch = -dch}
+							if dch > m {m = dch}
+						}
+						return m
+					}
+					for th, ti in ([]Theme{d, theme_light()}) {
+						name := "Dark " if ti == 0 else "Light"
+						zr := ratio(th[.Table_Zebra], th[.Bg_Base])
+
+						// 1. The band exists. Two 8-bit steps is the floor because
+						// the file format is 8 bits per channel (theme_chan_hex): a
+						// one-step tint cannot survive an export/import round trip
+						// as anything a person would see, and zero steps is
+						// Table_Zebra == Bg_Base -- which now means the rows have no
+						// separator of any kind, the column rules having gone.
+						md := zmcd(th[.Table_Zebra], th[.Bg_Base])
+						ok1 := md >= 2
+						if !ok1 {fail = true}
+						fmt.printfln(
+							"  %-6s %s Table_Zebra vs Bg_Base: %d/255 max channel step (need >= 2 -- the band has to exist)",
+							"ok" if ok1 else "FAIL", name, md,
+						)
+
+						// 2. The band is quieter than the palette's quietest LINE
+						// and its quietest hover FILL, measured in the same theme.
+						// Border_Subtle is the positive control that matters: it is
+						// the role the deleted column separators drew with
+						// (table.odin's old `sep`), so "reuse the separator colour
+						// for the band" is the actual mistake available in this
+						// change, and this row is what rejects it. Bg_Hover is the
+						// other end -- the quietest thing in the palette that is
+						// meant to read as a state.
+						for cand in ([]Color_Role{.Border_Subtle, .Bg_Hover}) {
+							cr := ratio(th[cand], th[.Bg_Base])
+							ok2 := zr < cr
+							if !ok2 {fail = true}
+							fmt.printfln(
+								"  %-6s %s Table_Zebra %.3f:1 < %v %.3f:1 vs Bg_Base (the band must be the quieter fill)",
+								"ok" if ok2 else "FAIL", name, zr, cand, cr,
+							)
+						}
+
+						// 3. Not either chrome tier, by identity. Check 2 cannot
+						// reject these -- Dark's Bg_Raised is 1.108 and Bg_Panel
+						// 1.067, both under Bg_Hover's 1.172 -- and identity is the
+						// right instrument anyway: their whole job is to read as a
+						// separate plane. Bg_Raised is also the table HEADER fill in
+						// this very view (§10), so a band equal to it makes every
+						// other data row look like a header.
+						for cand in ([]Color_Role{.Bg_Panel, .Bg_Raised}) {
+							ok3 := th[.Table_Zebra] != th[cand]
+							if !ok3 {fail = true}
+							fmt.printfln(
+								"  %-6s %s Table_Zebra is not %v (a chrome tier is a plane, not a band)",
+								"ok" if ok3 else "FAIL", name, cand,
+							)
+						}
 					}
 				}
 			}
@@ -16612,14 +18242,25 @@ when NEWTPAD_TESTS {
 					{"palette.odin", #load("palette.odin", string), 0, ""},
 					{"markdown.odin", #load("markdown.odin", string), 0, ""},
 					{"doc.odin", #load("doc.odin", string), 0, ""},
+					// table.odin used to carry an allowlist entry here for the
+					// em-dash placeholder in an EMPTY cell. Reverted (batch 18
+					// review, F5, see HANDOFF.md §5): the dash is not redundant
+					// with a disabled control not responding -- its entire job is
+					// to distinguish "empty, and we parsed it" from "missing /
+					// short row", which is live information, not chrome. It now
+					// draws in Text_Muted (clears AA) and the guard here is back
+					// to 0 like every other file, which is what makes a THIRD use
+					// (anywhere) still fail it.
 					{"table.odin", #load("table.odin", string), 0, ""},
 					{"find.odin", #load("find.odin", string), 0, ""},
 					{"history.odin", #load("history.odin", string), 0, ""},
 					{"fontpage.odin", #load("fontpage.odin", string), 0, ""},
 					// The one legitimate use in the tree: the guillemet at the end
 					// of a settings range, which is a control that genuinely
-					// cannot be stepped further. UI spec 11.1 asks for exactly
-					// that -- "dim the arrow at the range end".
+					// cannot be stepped further -- dim BECAUSE it is disabled,
+					// which is the exemption WCAG actually grants and table.odin's
+					// dash (above) never qualified for. UI spec 11.1 asks for
+					// exactly this -- "dim the arrow at the range end".
 					{"settings.odin", #load("settings.odin", string), 1, "the range-end guillemet"},
 				}
 				NEEDLE :: "g_theme[.Text_Dim]"
@@ -21260,9 +22901,26 @@ when NEWTPAD_TESTS {
 				chk(&bad, resolve_key(.Escape, false, false, .Font) == .Font_Close, fmt.tprintf("Esc still closes the font page -> %v", resolve_key(.Escape, false, false, .Font)))
 				// The §6f fallbacks still work, and now carry the overlay's answer:
 				// a modified chord in find/menu/history resolves through .Editor.
-				chk(&bad, resolve_key(.K, true, false, .Find) == .Undo, fmt.tprintf("find falls back to the overlaid editor chord -> %v (want Undo)", resolve_key(.K, true, false, .Find)))
-				chk(&bad, resolve_key(.K, true, false, .Menu) == .Undo, fmt.tprintf("the menu falls back too -> %v", resolve_key(.K, true, false, .Menu)))
+				//
+				// A NON-mutating command, and that is the point rather than a
+				// detail: the find bar is a text field, and resolve_key refuses to
+				// fall a document-WRITING command back into it (find_fallback_writes_doc,
+				// commands.odin). This line used to bind ctrl+k to Undo and assert it
+				// reached find, which is the hole itself expressed as a passing test.
+				load("ctrl+k = Bookmark_Toggle\nenter = Undo\n")
+				chk(&bad, resolve_key(.K, true, false, .Find) == .Bookmark_Toggle, fmt.tprintf("find falls back to the overlaid editor chord -> %v (want Bookmark_Toggle)", resolve_key(.K, true, false, .Find)))
+				chk(&bad, resolve_key(.K, true, false, .Menu) == .Bookmark_Toggle, fmt.tprintf("the menu falls back too -> %v", resolve_key(.K, true, false, .Menu)))
 				chk(&bad, resolve_key(.Left, false, false, .Find) == .None, "unmodified keys still stay owned by find (Left)")
+				// ...and keys.txt cannot put the hole back. The refusal is on the
+				// COMMAND, applied after the overlay has answered, so binding a
+				// buffer writer to a fresh chord does not smuggle it into the field.
+				// The .Editor half is asserted alongside it: the overlay must still
+				// work in the document, or this would pass by the binding failing.
+				load("ctrl+j = Undo\nalt+j = Paste\n")
+				chk(&bad, resolve_key(.J, true, false, .Editor) == .Undo, fmt.tprintf("the overlay binds ctrl+j = Undo in the editor -> %v", resolve_key(.J, true, false, .Editor)))
+				chk(&bad, resolve_key(.J, true, false, .Find) == .None, fmt.tprintf("...but an overlaid Undo still cannot reach the find field -> %v (want None)", resolve_key(.J, true, false, .Find)))
+				chk(&bad, resolve_key(.J, false, true, .Editor) == .Paste, fmt.tprintf("the overlay binds alt+j = Paste in the editor -> %v", resolve_key(.J, false, true, .Editor)))
+				chk(&bad, resolve_key(.J, false, true, .Find) == .None, fmt.tprintf("...nor can an overlaid Paste -> %v (want None)", resolve_key(.J, false, true, .Find)))
 
 				// --- find-bar toggles are unified on Alt, matching VS Code -------------------
 				// Wyatt: "Alt+C/W work, I'm not sure about having some be Alt and some be
@@ -24671,6 +26329,15 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad keytest` with no path, so the mode is sweepable. The two-argument
+		// spelling `newtpad <path> keytest` still works (it falls through to the
+		// switch below) because development-loop.md documents it and old scripts use
+		// it -- both reach keytest_run.
+		if os.args[1] == "keytest" {
+			keytest_run(os.args[2] if len(os.args) > 2 else "")
+			return true
+		}
+
 		if len(os.args) < 3 {return false}
 		path, mode := os.args[1], os.args[2]
 
@@ -24691,93 +26358,9 @@ when NEWTPAD_TESTS {
 			doc_close(&doc)
 
 		case mode == "keytest":
-			app: App
-			if !app_open_path(&app, path) {app_new_scratch(&app)} // e.g. "hello world foo"
-			dummy: plat.Window
-			dtext: plat.Text // these commands don't measure text
-			key_chk(resolve_key(.Left, false, false, .Editor), .Cursor_Left, "Left / Editor")
-			key_chk(resolve_key(.Left, true, false, .Editor), .Word_Left, "Ctrl+Left / Editor")
-			key_chk(resolve_key(.F, true, false, .Editor), .Find_Open, "Ctrl+F / Editor")
-			key_chk(resolve_key(.Up, false, true, .Editor), .Move_Line_Up, "Alt+Up / Editor")
-			key_chk(resolve_key(.Down, false, true, .Editor), .Move_Line_Down, "Alt+Down / Editor")
-			key_chk(resolve_key(.Z, false, true, .Editor), .Toggle_Wrap, "Alt+Z / Editor")
-			key_chk(resolve_key(.Enter, false, false, .Editor), .Insert_Newline, "Enter / Editor")
-			key_chk(resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find")
-			key_chk(resolve_key(.Escape, false, false, .Find), .Find_Close, "Esc / Find")
-			key_chk(resolve_key(.H, true, false, .Editor), .Replace_Open, "Ctrl+H / Editor")
-			key_chk(resolve_key(.H, true, false, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find")
-			key_chk(resolve_key(.A, false, false, .Editor), .None, "a (unbound)")
-			// Reported as dead in the GUI (2026-07-19); pin what the keymap resolves.
-			key_chk(resolve_key(.A, true, false, .Editor), .Select_All, "Ctrl+A / Editor")
-			key_chk(resolve_key(.P, true, false, .Editor), .Palette_Open, "Ctrl+P / Editor")
-			key_chk(resolve_key(.L, true, false, .Editor), .Filter_Open, "Ctrl+L / Editor")
-			// Reported missing by the 2026-07-19 audit as first-hour daily-driver gaps.
-			key_chk(resolve_key(.Tab, false, false, .Editor), .Insert_Tab, "Tab / Editor")
-			key_chk(resolve_key(.Home, true, false, .Editor), .Doc_Start, "Ctrl+Home / Editor")
-			key_chk(resolve_key(.End, true, false, .Editor), .Doc_End, "Ctrl+End / Editor")
-			key_chk(resolve_key(.G, true, false, .Editor), .Goto_Line, "Ctrl+G / Editor")
-			key_chk(resolve_key(.Tab, true, false, .Editor), .Tab_Next, "Ctrl+Tab still switches")
-			key_chk(resolve_key(.Home, false, false, .Editor), .Cursor_Home, "Home still line-start")
-			key_chk(resolve_key(.L, true, false, .Find), .Find_Toggle_Filter, "Ctrl+L / Find")
-			// The real defect: Find context has no fallback to the Editor bindings, so
-			// every editor chord is dead while the find bar is open.
-			key_chk(resolve_key(.A, true, false, .Find), .Select_All, "Ctrl+A / Find")
-			key_chk(resolve_key(.P, true, false, .Find), .Palette_Open, "Ctrl+P / Find")
-			key_chk(resolve_key(.S, true, false, .Find), .Save, "Ctrl+S / Find")
-			key_chk(resolve_key(.C, true, false, .Find), .Copy, "Ctrl+C / Find")
-			key_chk(resolve_key(.Z, true, false, .Find), .Undo, "Ctrl+Z / Find")
-			key_chk(resolve_key(.N, true, false, .Find), .Tab_New, "Ctrl+N / Find")
-			// These must NOT fall through — Find deliberately overrides them.
-			key_chk(resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find (override)")
-			key_chk(resolve_key(.Escape, false, false, .Find), .Find_Close, "Esc / Find (override)")
-			key_chk(resolve_key(.H, true, false, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find (override)")
-			// Unmodified keys must stay owned by the mode: falling these through would
-			// edit and navigate the document while the user types a query.
-			key_chk(resolve_key(.Delete, false, false, .Find), .None, "Delete / Find (no fall)")
-			key_chk(resolve_key(.Left, false, false, .Find), .None, "Left / Find (no fall)")
-			key_chk(resolve_key(.Home, false, false, .Find), .None, "Home / Find (no fall)")
-			// The palette is a text field: nothing falls through to the editor.
-			key_chk(resolve_key(.A, true, false, .Palette), .None, "Ctrl+A / Palette (no fall)")
-			key_chk(resolve_key(.S, true, false, .Palette), .None, "Ctrl+S / Palette (no fall)")
-			// ...and what dispatch actually does with them.
-			d0 := app_active(&app)
-			d0.cursor, d0.anchor = 0, 0
-			command_dispatch(.Select_All, {}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Ctrl+A   -> anchor=%d cursor=%d len=%d", d0.anchor, d0.cursor, d0.pt.length)
-			command_dispatch(resolve_key(.P, true, false, .Editor), {.P, true, false, false}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Ctrl+P   -> palette.active=%v results=%d", app.palette.active, len(app.palette.results))
-			// Arrowing past the drawn window (12 rows) — does selected stay visible?
-			for i in 0 ..< 30 {palette_move(&app, 1)}
-			fmt.printfln("palette Down x30  -> selected=%d of %d (drawn rows=12)", app.palette.selected, len(app.palette.results))
-			palette_close(&app)
-			// Every palette-visible command should teach its shortcut, and the ones
-			// that only exist inside find mode must be listed at all.
-			shown, with_chord := 0, 0
-			for cmd in Command_Id {
-				if !command_in_palette(cmd) {continue}
-				shown += 1
-				if command_chord(cmd) != "" {with_chord += 1}
-			}
-			fmt.printfln("palette lists %d commands, %d show a shortcut", shown, with_chord)
-			for c in ([]Command_Id{.Find_Toggle_Filter, .Find_Toggle_Regex, .Filter_Open, .Goto_Line, .Save_As}) {
-				fmt.printfln("  %-24v in palette=%-5v chord=%q", c, command_in_palette(c), command_chord(c))
-			}
-			// dispatch effects (dummy window/text; these commands don't touch them)
-			app_active(&app).cursor = 0
-			command_dispatch(resolve_key(.Right, false, false, .Editor), {.Right, false, false, false}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Right    -> cursor=%d", app_active(&app).cursor)
-			command_dispatch(.Toggle_Wrap, {}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Alt+Z    -> wrap=%v", app_active(&app).wrap)
-			command_dispatch(resolve_key(.F, true, false, .Editor), {.F, true, false, false}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Ctrl+F   -> find.active=%v", app_active(&app).find.active)
-			command_dispatch(resolve_key(.Escape, false, false, .Find), {.Escape, false, false, false}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Esc      -> find.active=%v", app_active(&app).find.active)
-			// tab commands
-			command_dispatch(.Tab_New, {}, &app, &dummy, &dtext, 10)
-			fmt.printfln("Tab_New           -> live tabs=%d active=%d", app_live_count(&app), app.active)
-			command_dispatch(.Tab_Close, {}, &app, &dummy, &dtext, 10)
-			fmt.printfln("Tab_Close         -> live tabs=%d", app_live_count(&app))
-			app_destroy(&app)
+			// The path-first spelling documented in development-loop.md; the
+			// one-argument form is handled above so a sweep can run it.
+			keytest_run(path)
 
 		case mode == "edittest":
 			doc, _ := doc_open(path)

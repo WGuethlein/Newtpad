@@ -13,6 +13,7 @@ import "core:mem"
 import "core:text/regex"
 import rx_common "core:text/regex/common"
 import rx_vm "core:text/regex/virtual_machine"
+import "core:strings"
 import "core:thread"
 import "core:unicode/utf8"
 import base "src:base"
@@ -378,6 +379,49 @@ active_buf :: proc(doc: ^Document) -> ^[dynamic]u8 {
 find_input_rune :: proc(doc: ^Document, r: rune) {
 	bytes, n := utf8.encode_rune(r)
 	append(active_buf(doc), ..bytes[:n])
+	if doc.find.field == 0 {find_query_changed(doc)}
+}
+
+// Ctrl+V into whichever field has focus. Pure over the clipboard's text so the
+// decision below can be driven headlessly -- the HWND read lives in the dispatch.
+//
+// ONE LINE ONLY, and this is a decision rather than a limitation. Both fields are
+// a single row of the find bar: there is no second row to draw a newline onto, so
+// pasting a multi-line clipboard would leave a query whose tail is invisible and,
+// in the search field, one that matches nothing on a line-oriented scan. The
+// first line is what a user copying a word out of the document meant, and it is
+// what VS Code's find box takes too.
+//
+// THE SPLIT IS ON EITHER TERMINATOR, not on LF. It was `index_byte('\n')` plus a
+// trailing-\r trim, which handles LF and CRLF and quietly fails on CR alone: a
+// classic-Mac or old-Excel clipboard ("one\rtwo") has no LF at all, so the whole
+// thing became one field value with a raw control byte inside it -- drawn as
+// whatever the font has for U+000D and carried into the search pattern. Whichever
+// terminator comes first ends the line; the \r trim stays for the CRLF case, where
+// the split lands after the \r.
+//
+// AND IT IS CAPPED. find_input_rune is bounded by how fast a human types; a paste
+// is bounded by the clipboard, and a copied log file is megabytes. Every byte
+// appended to field 0 goes through find_query_changed, which restarts the search
+// worker with the new pattern, so an uncapped paste hands a multi-megabyte pattern
+// to the scan in one keystroke. Latency, not data loss -- but the cap costs a
+// comparison, and the field cannot display a hundredth of what it admits anyway.
+// Truncation backs off to a rune boundary so a clipped multi-byte character is
+// never appended as a fragment.
+FIND_PASTE_CAP :: 1024 // ~10x what the widest find bar can ever show
+
+find_paste :: proc(doc: ^Document, s: string) {
+	if doc == nil || !doc.find.active {return}
+	line := s
+	if i := strings.index_any(line, "\n\r"); i >= 0 {line = line[:i]}
+	line = strings.trim_right(line, "\r")
+	if len(line) > FIND_PASTE_CAP {
+		n := FIND_PASTE_CAP
+		for n > 0 && (line[n] & 0xC0) == 0x80 {n -= 1} // don't split a rune
+		line = line[:n]
+	}
+	if len(line) == 0 {return}
+	append(active_buf(doc), ..transmute([]u8)line)
 	if doc.find.field == 0 {find_query_changed(doc)}
 }
 

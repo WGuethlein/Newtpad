@@ -221,10 +221,22 @@ GUTTER_W: f32 = 0
 H_SCROLL: int = 0
 
 // Mirror the active doc's horizontal scroll into H_SCROLL for this frame, off
-// unless the document is in the plain (non-wrap, non-filter) view. Set alongside
-// the gutter/top-inset so the whole frame agrees.
+// unless the document is in the plain view -- non-wrap, non-filter, and not one
+// of the two rendered views. Set alongside the gutter/top-inset so the whole
+// frame agrees.
+//
+// Zero in the views that REPLACE the text pass (doc_read_only_view: the grid and
+// full Markdown Preview), not just in the wrapped/filtered ones. Neither of those
+// two reads H_SCROLL -- table_draw pans doc.table_col instead and Preview lays out
+// to the pane -- but doc.h_scroll survives a view toggle, so a document panned in
+// text view and then switched to the grid left H_SCROLL non-zero with nothing
+// honouring it. The visible consequence was render_frame's left-margin cover strip
+// (drawn whenever H_SCROLL > 0, to hide glyphs panned off the left edge) painting
+// Bg_Base over the first TEXT_MARGIN_X of a view that had not panned anything.
+// That was latent while the grid's first column started at TEXT_MARGIN_X and went
+// live the moment §10's zebra bands and header reached x = 0.
 doc_update_hscroll :: proc(doc: ^Document) {
-	H_SCROLL = doc.h_scroll if (doc != nil && !doc_wraps(doc) && !doc.filter) else 0
+	H_SCROLL = doc.h_scroll if (doc != nil && !doc_wraps(doc) && !doc.filter && !doc_read_only_view(doc)) else 0
 }
 
 // Recompute the gutter for the active document. Only the filter view has one:
@@ -764,6 +776,25 @@ doc_content_box :: proc(doc: ^Document, height: f32) -> (top, bot: f32) {
 	return CONTENT_TOP + TOP_INSET, height - doc_bottom_bar_h(doc)
 }
 
+// The row count the VERTICAL SCROLL MODEL runs on: the grid's own budget when
+// this is a grid, the editor's otherwise.
+//
+// One producer because three things have to hold the same number or the view
+// scrolls to different places depending on how you asked. vscrollbar_geo maps
+// doc.top through doc_max_top(rows) and vbar_drag_to maps the pointer back
+// through doc_scroll_to_fraction(rows) -- vscrollbar_geo's comment records that
+// those two being exact inverses is what makes "grab the thumb and it does not
+// move" true rather than approximately true -- and the wheel calls doc_scroll
+// with a third copy. While the grid shared the editor's line grid all three were
+// the same by accident. §10's 26px rows under a 30px header end that, and the
+// failure is not subtle: the wheel would reach a doc.top past the bar's own
+// maximum, so the thumb would sit pinned at the bottom of the track while the
+// file kept scrolling, and the next press on it would jump the view backwards.
+doc_scroll_rows :: proc(doc: ^Document, height, line_h, px: f32) -> int {
+	if doc != nil && doc.kind == .Text && doc.table {return table_visible_rows(doc, height, px)}
+	return doc_visible_rows(doc, height, line_h)
+}
+
 // Rows the DRAW emits: the fully visible ones, plus a partial row when the
 // remainder can show any useful part of it. The bottom strip is repainted over
 // the content afterwards (render_frame), so a partial row cannot leave glyphs
@@ -1013,6 +1044,24 @@ Document :: struct {
 	table_edit_col:    int,
 	table_edit_buf:    [dynamic]u8,
 	table_edit_caret:  int, // byte offset within table_edit_buf
+	// The byte offset of the LINE table_edit_row named when the edit began. The
+	// two coordinates above are in different spaces -- table_edit_row is a
+	// VISIBLE row index and table_edit_s/e are ABSOLUTE byte offsets -- so a
+	// scroll silently breaks the correspondence between them: the box and the
+	// caret stay drawn at row N while [s,e) still names the line that USED to be
+	// row N, and Enter then writes into a row the user is not looking at.
+	// table_edit_anchored (table.odin) is the one check that keeps them together,
+	// and this is what it compares against.
+	table_edit_line:   int,
+	// The BYTES of that line, capped at RENDER_LINE_CAP, copied at edit start.
+	// The offset above answers "has the VIEW moved"; this answers "are the bytes
+	// under [s,e) still the bytes the user was looking at", which is a different
+	// question and the one a buffer REWRITE breaks. A permutation of equal-length
+	// lines (a sort of a fixed-width export: zero-padded ids, ISO dates, fixed
+	// status codes) leaves the r-th line starting at the same offset, so the
+	// offset compare alone reads a sort as "nothing moved" while [s,e) has come
+	// to span a different row's field. See table_edit_line_intact (table.odin).
+	table_edit_snap:   [dynamic]u8,
 	// Markdown view (see markdown.odin): Off / Preview (full) / Split (editor +
 	// live preview).
 	md_mode:     Md_Mode,
@@ -1354,6 +1403,7 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.filter_line_nos)
 	delete(doc.table_widths)
 	delete(doc.table_edit_buf)
+	delete(doc.table_edit_snap)
 	// The markdown preview's per-block layout cache owns heap storage (a source
 	// copy, a span text store, the shaper's glyph and line-box arrays, and the
 	// span boxes) for every filled slot. Freed here rather than left to the

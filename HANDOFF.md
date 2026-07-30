@@ -348,6 +348,120 @@ were the priorities. Read P2 as the live list, with these amendments:
   not a stale-but-readable value. Clear today: `Md_Layout`'s persisted fields are all on
   `context.allocator` and `md_layout_free` deletes them through it. Audit-only, not enforced by any
   assertion or type.
+- **Deviation from the UI spec, decided in review (batch 18, F5): the table view's empty-cell em dash
+  is `Text_Muted`, not the `text_dim` §10 literally names.** `theme.odin` labels `Text_Dim` "DISABLED
+  ONLY — never live text" at 2.9:1 Dark / 2.8:1 Light, below the AA floor; §18 justifies that exemption
+  as WCAG's disabled-control exemption, "redundant with the control not responding." The dash is
+  neither disabled nor redundant — its entire job is to distinguish "empty, and we parsed it" from
+  "missing / short row," a distinction group C's warning bar exists to give the *other* case — so a
+  reader who cannot resolve the dash loses exactly the information it was added to convey. That is
+  live content. `table.odin`'s `TABLE_EMPTY_CELL` comment and `themetest`'s allowlist (`test_modes.odin`,
+  the `Text_Dim` guard) were both reverted to reflect this: the guard is back to 0 uses in `table.odin`,
+  same as every file without a genuinely disabled control. The one real exemption left in the tree is
+  `settings.odin`'s range-end guillemet, which is dim *because* it is a control that cannot be stepped
+  further — the case the WCAG exemption actually describes.
+
+  **This decision settles three sites, not one** — §10 also names `text_dim` for group B's row-number
+  gutter (not yet built) and §15 for the empty-tab hints (ditto). Both should follow the same reasoning
+  (a hint or a row number a reader cannot resolve is lost information, not a disabled affordance) unless
+  whoever builds them finds a reason the dash's argument doesn't transfer. Overturn here, in one place,
+  rather than re-litigating per site.
+- ~~**Carried from batch 18 review (F4): scrolling or resizing while a table cell edit is open
+  desynchronises the edit box from the bytes it writes.**~~ **FIXED** in batch 18 (`table_edit_hold` /
+  `table_edit_anchored`, `table.odin`; one call per frame in `main.odin`). One guard rather than a
+  commit bolted onto each scroll route: it asks the seam directly — does the drawn row still name the
+  line the captured span lies on, and does that row still fit under the sticky header — so the
+  scrollbar drag, Page Up/Down, a find jump, a session restore and a window resize are all covered.
+  Covered by `tablegridtest`'s `tg_edit_anchor`; both halves of the guard were sabotaged separately and
+  each failed exactly the routes it owns. **Its Wheel route was never evidence for the guard**: the
+  wheel arm commits inline in the frame loop and the test replays that arm by hand, so those four
+  assertions stay green with the guard deleted — verified 2026-07-30, and the entry used to claim the
+  test *"drives all five routes."* It drives five; four of them were the guard's. A sixth route,
+  `Wheel_Bare`, now runs the same scroll with the inline commit omitted, which is what the frame loop
+  would look like if that line were ever removed: with the guard sabotaged, `Wheel` stays green on all
+  four assertions and `Wheel_Bare` fails all four. The wheel is covered by something falsifiable now,
+  and `Wheel` stays as documentation of the inline commit, whose hand-copy can drift.
+- **A REORDER under a live cell edit needed a third compare, and the first version of the guard did
+  not have it** (reviewed 2026-07-30). The entry above used to claim the row-start compare caught a
+  sort as well. **It did not, and the claim was the trap:** the compare was `table_row_start(doc, r) ==
+  doc.table_edit_line`, two *byte offsets*, and a permutation of lines that all have the same byte
+  length leaves the r-th line starting at the r-th offset. That is not a contrived fixture — it is what
+  an export looks like (`00012,2026-01-14,ACTIVE`: zero-padded ids, ISO dates, fixed status codes).
+  Edit row 11's id, sort, rows 11 and 12 swap, the compare reads "nothing moved", and `[s,e)` now spans
+  row 12's id field, which `table_edit_commit` then splices the typed value over. Not live — no sort
+  exists and `Sort_Lines` is refused in table view — but it was owed to the task that builds the sort,
+  in the exact document that task would have read.
+  **Fixed by making the identity the line's own bytes** (`table_edit_snap`, `table_edit_line_intact`):
+  the line, capped at `RENDER_LINE_CAP`, is copied at edit start and compared each frame. A reordering
+  cannot forge that — any line differing in one byte fails — and the one thing it cannot distinguish,
+  a swap of two *byte-identical* lines, is the case where it does not need to: the value lands on a row
+  indistinguishable from the one clicked and no other row's data is touched. A generation counter was
+  the alternative and was rejected because whoever writes the sort has to remember to bump it, which is
+  the exact class of miss the one-guard design exists to close.
+  **`table_edit_commit` now refuses a stale span outright rather than committing it** — the one case
+  where the user's keystrokes are dropped instead of kept, because a rewrite leaves nowhere safe to
+  write. It is in the *write*, not in the frame guard, because Enter, the wheel arm, `leave_table_view`
+  and `.Toggle_Table` all reach the splice without passing the guard. Covered by `tg_edit_permute`
+  (Guard / Enter / Control routes, equal-length fixture); with the byte-offset compare restored it
+  fails 5 assertions, and the Enter route loses row 12's id outright (`"00013,…" appears 0 time(s)`).
+- ~~**Reported by Wyatt 2026-07-29 (D1): Ctrl+V with the find bar focused pasted into the DOCUMENT.**~~
+  **FIXED** in batch 18 (`resolve_key` / `find_fallback_writes_doc`, `commands.odin`; `.Find_Paste`,
+  `find_paste`, `find.odin`). Recorded here because `docs/reported-bugs.md`'s own rule says a shipped
+  item is deleted from the queue and written up here instead, and the first pass deleted it without
+  writing anything — the widest-blast-radius fix in the branch existed only in a commit message.
+  **It was never only about paste.** `resolve_key` falls the `.Find` context back to the `.Editor`
+  bindings for *modified* chords, which is deliberate and right for reads (Ctrl+S, Ctrl+P, the tab
+  chords should not die because a bar is open) — but it handed the find bar **six writers**: Ctrl+V
+  pasted, Ctrl+X cut the document's selection, Ctrl+Z/Ctrl+Y undid and redid it, Ctrl+Backspace deleted
+  a word behind an invisible caret, and Alt+Up/Down moved document lines. All of them under a bar whose
+  viewport takes no keystrokes, so **nothing typed there could be taken back without closing the bar
+  first.**
+  **The document really did become dirty**, which is what makes this data loss rather than a curiosity:
+  dirty tab, save prompt on close, and no undo reachable while the bar is open. Measured by walking
+  `pt.length` through the chords: **18 → 6 → 18 → 6 → 0**.
+  **And the filter bar IS the find bar** (`find_open(doc, …)` plus `doc.filter`), which is the surface
+  Wyatt reported it on — so plain Find and Replace had exactly the same hole on exactly the same chords.
+  **Fixed as a class, not as six chords**: `find_fallback_writes_doc` refuses the fallback for anything
+  `command_mutates_doc` names, with `.Find_Replace_One` / `.Find_Replace_All` as the two stated
+  exceptions (they are declared in `.Editor` and not in `.Find`, so the fallback is the only way they
+  reach the replace row). Ctrl+V then got a real binding, `.Find_Paste` → `find_paste`, which takes the
+  clipboard's first line into the focused field. **Read `find_fallback_writes_doc`'s own comment before
+  trusting the word "class"** — the predicate it composes from is the table-view read-only set, not the
+  buffer writers, and the difference is written up there.
+  **Two asymmetries were left behind on purpose, and they are the ones to look at first if this comes
+  back:** `Alt+Shift+Left/Right` still extends a **column rectangle** from the find bar while
+  `Alt+Shift+Up/Down` no longer does (the vertical pair are on the mutating predicate, the horizontal
+  pair are not — a column selection is not a write, so neither is wrong, but the pair now behaves
+  differently); and `Ctrl+C`/`Ctrl+A` still act on the **document**, not on the query, because the find
+  fields have no selection model at all (`find_backspace` deletes from the end; there is no caret). Both
+  are reads. A `Find_Select_All` / `Find_Copy` pair would close the second, and `keytest` pins both as
+  deliberate so the next reader knows nobody forgot them.
+- **Carried from batch 18 review (F6): table zebra-band parity is viewport-anchored, so every
+  odd-row scroll inverts every band.** Documented and accepted as shippable in `table_draw`'s own
+  comment (parity by visible row index, not absolute file position, because the absolute index needs an
+  unbounded newline count from byte 0). The reviewer's correction, recorded for whoever builds group B:
+  **parity needs one bit, not a count.** `doc.top` only ever moves by known row deltas from a known-even
+  anchor (the wheel, the page keys, the scrollbar), so a parity bit maintained alongside `doc.top` costs
+  nothing and needs no walk from byte 0 — unlike group B's row-number gutter, which needs the real
+  absolute row number and *is* unbounded. Decide count-on-demand-with-a-cache vs. viewport-relative
+  numbering once, in group B, and let the zebra's parity ride on whichever it picks rather than solving
+  the cheaper problem twice.
+- **Carried from batch 18 review (F10): a header line longer than `RENDER_LINE_CAP` puts
+  `table_data_start` inside line 0**, so "data row 0" becomes the header's own tail instead of the
+  first real data line. The draw and the hit-test still agree (both read through `table_data_start`), so
+  this is not a wrong-row write — but `table_data_start` is the single normalisation point the wheel
+  routes `doc.top` through on both sides of a scroll (§10's group A design), so a capped offset becomes
+  a *persisted* scroll position rather than a one-frame glitch. Not fixed: `RENDER_LINE_CAP` headers are
+  not a real CSV shape, and the fix (an `exact` flag on `pt_line_end_cap`, matching the `line_cell_col`
+  entry above) is shared infrastructure, not table-specific.
+- **Two brittle assertions from batch 18's `tablegridtest`, flagged in review for whoever touches
+  their neighbourhood next:** `nnorm == 2` (the wheel-normalisation check) counts occurrences of the
+  literal substring `"table_data_start(doc)"` across the whole of `main.odin`, so any unrelated third
+  call site — added for any reason — fails the test with no connection to what it is meant to guard.
+  `nsep == 0` rejects *any* `Border_Subtle` use in `table.odin` on the theory that the column rules are
+  gone for good; group C's planned malformed-row bar is exactly the kind of addition that would trip it
+  for a reason unrelated to column rules reappearing. Neither is wrong today; both are counting
+  substrings as a proxy for an intent the count cannot actually distinguish from an unrelated match.
 
 Ranked. P0 = fix before building more; P1 = cheap correctness/cleanliness now; P2 = deferred but
 tracked.
@@ -4452,8 +4566,15 @@ It has one now.
   columns at 16 cells, while the measured path squeezes toward 1 cell before dropping anything. The cheap
   honest fix keeps the O(1) property: scan the entry row for its own cell count so the count is not
   invented.
-- **`md_link_at` has no y bound**, and neither call site applies one, so a `forced` oversized block's link
-  rects stay clickable past the status bar. Found while reviewing the band changes; documented, not fixed.
+- ~~**`md_link_at` has no y bound**, and neither call site applies one, so a `forced` oversized block's
+  link rects stay clickable past the status bar.~~ **FIXED** in batch 18. `md_preview_link_at`
+  (`markdown.odin`) is now the one entry point for both the hand cursor and the Ctrl+click, and the
+  bound is inside it, applied to the POINT rather than to the rectangles — one bound, and a straddling
+  rect keeps exactly its visible half clickable. Bounding the rects in `markdown_links` was rejected:
+  it needs the pane box in a second place, and it would make `mdtest`'s partial-admission sweep pass
+  by construction (its "no drawn line's bottom exceeds `ybot`" is only a real assertion while that
+  producer still reports overflow). Covered by `mdtest`'s `md_link_bound_selftest`, which measures the
+  overflow before probing it.
 - **Every source line is its own `.Para`**, so two adjacent prose lines look like two paragraphs.
   CommonMark joins them with a space at the break. **A design question, not a bug** — and the one remaining
   reading of Wyatt's "spaces" report if the table fix turns out not to be what he saw.
@@ -4461,6 +4582,93 @@ It has one now.
   still leaks italics to the end of the block — the same pre-existing gap `*` has.
 - Partial table admission is correct but untested; `mdtabletest` still cannot fail for any
   table-*rendering* reason at all.
+
+## 6aw. The table view's appearance, and three data paths that wrote to the wrong place (2026-07-30, v0.33.0, branch `feat/batch-18-table-view`)
+
+**Batch 18 is partial and shipped anyway**, on Wyatt's call, because one of the defects in it modified
+files. Spec: [2026-07-30-batch-18-table-view-design.md](docs/superpowers/specs/2026-07-30-batch-18-table-view-design.md).
+Tasks 1–2 of six are done; row numbers, column fit, numeric alignment, sort, malformed-row marking and
+the summary row are still owed, along with §15's empty tab and §8's editor details.
+
+### The table view got §10's appearance
+
+Wyatt asked directly whether the CSV work had shipped. It had not — the view had cell machinery, editing
+and links, but none of §10's treatment.
+
+**A `table_zebra` colour role had to exist first.** `grep Table src/program/theme.odin` returned nothing,
+and §10's central claim is *"Column rules are gone. `table_zebra` carries the eye instead."* Then: column
+rules deleted in favour of zebra banding (§10 — a line per column is *"8 extra quads per screen and it
+makes the grid louder than the data"*), an em dash in empty cells so a blank column stops reading as
+broken parsing, a real sticky header (`bg_raised` + a 1px `border_strong` rule), and §10's metrics —
+header 30px, rows 26px, padding `0 10`.
+
+**§10 was overruled on one colour, deliberately.** It names `text_dim` for the em dash, but `theme.odin`
+labels that role "DISABLED ONLY — never live text" at 2.8:1, below the AA floor, and §18 justifies the
+exemption as WCAG's *disabled-control* exemption. The em dash is live content whose entire job is
+distinguishing "empty, and we parsed it" from "missing". `Text_Muted` (4.9/5.4) instead. **That one
+decision also covers §10's row-number gutter and §15's empty-tab hints** — recorded in §5 so it can be
+overturned in one place rather than three.
+
+### Three data paths that wrote to the wrong place
+
+**The find and filter bars were writing into the document.** Wyatt reported `Ctrl+V` pasting into the
+viewport, unremovable while the bar had focus. The hole was `resolve_key`'s `.Find` → `.Editor` fallback
+for **every** Ctrl/Alt chord, so `Ctrl+X`, `Ctrl+Z`, `Ctrl+Y`, `Ctrl+Backspace` and `Alt+Up/Down` wrote
+too — and since the filter bar *is* the find bar, plain Find and Replace had the same hole. **The document
+did become `modified`**: dirty tab, save prompt, no undo without closing the bar, with `pt.length`
+measured walking 18 → 6 → 18 → 6 → 0 across six writers. Fixed at the context resolution, so the class
+rather than the instance. Full detail in §5.
+
+**A cell edit that scrolled off its own row wrote to the wrong line.** `doc.table_edit_row` is a *visible*
+index while `table_edit_s/e` are absolute bytes captured at edit start. Seven scroll routes existed and
+only two committed the edit. One per-frame guard now asks the seam directly rather than adding a commit
+to each route — the resize is not a scroll route at all and would have been missed again.
+
+**Link rects below the pane were invisible but clickable.** `md_link_at` had no y bound and neither call
+site applied one, so Ctrl+clicking the status bar could open a link the user could not see.
+
+### What this batch got wrong
+
+**A guard shipped that could not do the job its own HANDOFF entry claimed.** The cell-edit anchor compared
+byte *offsets*, so permuting equal-length lines — a fixed-width CSV with zero-padded IDs, ISO dates and
+fixed status codes, which is what exports look like — left the r-th line starting at the same offset. The
+guard passes and the edit writes onto the wrong row. **Not reachable today because no sort exists: it was
+a trap laid precisely for the task that builds the sort, in the entry that task would read.** Now anchored
+to the line's own bytes, and `table_edit_commit` refuses a stale span rather than committing it. A
+generation counter was rejected because the sort's author has to remember to bump it — the exact class of
+miss the one-guard design closes.
+
+**A mode whose assertions could not fail, running nowhere.** `keytest` had the find-bar hole *asserted as
+correct behaviour*, and its `key_chk` neither counted failures nor set an exit code — so it printed `FAIL`
+and exited 0. It was also a two-argument mode, so no sweep ran it. All three fixed. The question it
+raises is the useful one: **what else does the suite pin that nobody decided?**
+
+**Two more tests that rejected nothing**, both proven by sabotage rather than argument: the grid had two y
+producers — `table_row_rect_y` for the band, `table_row_baseline_y` for the glyphs — and `tablegridtest`
+probed only the band, so a **full-row** divergence between drawn and clickable passed every suite. And
+§10's colours, the rule's thickness and the band's parity were entirely unasserted; changing all three at
+once left everything green. **That is nine batches running where the draft test code was wrong**, and the
+shape is the same every time: an assertion whose fixture never reaches the condition it names.
+
+**Page Down in the grid scrolled backwards.** `doc_scroll_rows` was introduced because "three things have
+to hold the same number." There were four; the page keys got the editor's count.
+
+### Owed
+
+- **Batch 18 tasks 3–6:** row numbers, column fit, numeric right-align, header resize; then sort,
+  malformed-row marking and the summary row; then §15's empty tab and §8's editor details (of which the
+  caret blink is the one item with a non-obvious interaction — it needs a wakeup the frame loop schedules).
+- **Zebra parity is viewport-anchored**, so bands invert on an odd-row scroll. Parity needs one *bit*, not
+  a count, and should ride on whatever group B decides for the row-number gutter's absolute index.
+- **The sort inherits two constraints nothing enforces:** keystrokes are dropped on a reorder (a UX
+  decision worth making deliberately rather than inheriting), and `Sort_Lines` is still refused in table
+  view by `doc_read_only_view && command_mutates_doc`, so enabling it means loosening that guard.
+- **`keytest` is now the only mode that exits non-zero.** Correct here, but the suite's failure signalling
+  is inconsistent; worth deciding once for all modes.
+- Two asymmetries left by the find-bar fix: `Alt+Shift+Left/Right` still extends a column rectangle from
+  the find bar while `Alt+Shift+Up/Down` no longer does, and `Ctrl+C`/`Ctrl+A` still act on the document.
+- `find_paste` truncates silently at 1024 bytes — defensible for a one-row query field, but nobody was
+  asked.
 
 ## 7. Build environment (Windows, this machine)
 
