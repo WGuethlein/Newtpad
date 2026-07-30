@@ -4828,13 +4828,29 @@ when NEWTPAD_TESTS {
 					tchk(&bad, ok, fmt.tprintf("fit: the over-wide column absorbs the shortfall and the small ones are given their width back (%v, %d of 40)", out[:n], used))
 				}
 				// (c) §10's upper clamp, reused: one enormous cell cannot claim the
-				// whole measure when its neighbours also want room. Both columns want
-				// more than half, so both land at the share -- and neither at 300.
+				// whole measure when its neighbour also wants room -- neither lands
+				// anywhere near its own natural width (40 and 300 cells).
+				//
+				// UNEQUAL naturals on purpose: {300, 300} used to sit here, and a
+				// test that gives both columns the identical want cannot tell §10's
+				// "distribute proportionally" apart from splitting what's left
+				// evenly -- both rules land on the same [share, share] regardless of
+				// which one the code runs. {20, 300} keeps both columns competing
+				// for the same leftover pool (neither is satisfied at any point in
+				// the water-fill, so this is still the free-for-all branch, not the
+				// keeps-its-natural-width one) while wanting different amounts of
+				// it, so the two rules produce different numbers and this rejects
+				// whichever one is NOT running.
 				{
-					nat := []int{300, 300}
-					out, n, used := fit(nat, 60)
-					ok := n == 2 && used <= 60 && out[0] <= MD_TABLE_MAX_CELLS && out[1] <= MD_TABLE_MAX_CELLS && out[0] == out[1]
-					tchk(&bad, ok, fmt.tprintf("fit: two greedy columns split the measure evenly, each under the 40-cell clamp (%v, %d of 60)", out[:n], used))
+					nat := []int{20, 300}
+					out, n, used := fit(nat, 40)
+					ok := n == 2 && used <= 40 && out[0] <= MD_TABLE_MAX_CELLS && out[1] <= MD_TABLE_MAX_CELLS
+					// THE distinguishing assertion. Even split gives both columns the
+					// same width (19 and 19, sabotage this back to `out[i] =
+					// max(minc, share)` to see it); proportional gives the column that
+					// wanted 15x as much noticeably more of the leftover.
+					ok = ok && out[1] > out[0]
+					tchk(&bad, ok, fmt.tprintf("fit: two competing columns split the leftover PROPORTIONALLY to what each still wants, not evenly (%v, %d of 40)", out[:n], used))
 				}
 				// (d) A SWEEP, because the three hand-picked cases above each pin one
 				// branch and none of them pins the arithmetic between the branches.
@@ -5080,18 +5096,31 @@ when NEWTPAD_TESTS {
 			// The property §9.3 puts tables on the mono face for -- "always mono:
 			// columns align" -- and the reason it is asserted on PIXELS rather than on
 			// the fitted widths is that the widths agreeing is not the claim. The claim
-			// is that two rows whose OTHER cells differ in length (one of them wrapping
-			// to several lines) put the same cell content at the same x, which is a
-			// statement about the merged glyph positions shape_columns produces.
+			// is that a column AFTER a wrapping column sits at the same x whether or not
+			// its neighbour wrapped, which is a statement about the merged glyph
+			// positions shape_columns produces, not about the fitted widths alone.
+			//
+			// THREE columns, not two, and the wrapping cell is column 0 -- not the last
+			// one. The previous fixture put the only long cell in the LAST column, so
+			// there was nothing after it that could shift, and the assertion rejected
+			// nothing: shape_columns sabotaged to shift a column's x by its PREVIOUS
+			// column's wrapped line count (`off -= f32(len(parts[i-1].line_boxes) - 1)
+			// * 40`, the exact change) still reported mdtest: 0 failures. Columns 1
+			// and 2 here are both AFTER the wrapping column, so a shift like that has
+			// somewhere to show up.
 			//
 			// Column 1 is right-aligned and wider than its content, so this also
 			// catches alignment being dropped altogether: a left-aligned "III" would
-			// sit at the column's left edge, not five cells into it.
+			// sit at the column's left edge, not several cells into it. Column 2 is a
+			// link, which locates each row's first line exactly -- taken from the
+			// drawn output, not predicted. Row 3 exists only to bound row 2's height
+			// from below, the same trick section 3 uses for row 2 and row 3 there.
 			{
 				sb := strings.builder_make(context.temp_allocator)
-				strings.write_string(&sb, "| a | bbbbbbbb |\n|:---|-------:|\n")
-				strings.write_string(&sb, "| [ra](https://e.test/ra) | III |\n")
-				strings.write_string(&sb, "| [rb](https://e.test/rb) qqqq qqqq qqqq qqqq qqqq qqqq | III |\n")
+				strings.write_string(&sb, "| w | mmmmmmmm | id |\n|:---|---:|:---|\n")
+				strings.write_string(&sb, "| x | III | [ra](https://e.test/ra) |\n")
+				strings.write_string(&sb, "| wwww wwww wwww wwww wwww wwww wwww wwww wwww wwww | III | [rb](https://e.test/rb) |\n")
+				strings.write_string(&sb, "| y | III | [rc](https://e.test/rc) |\n")
 				doc := mkdoc(strings.to_string(sb), "align.md")
 				defer doc_close(&doc)
 				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
@@ -5100,33 +5129,49 @@ when NEWTPAD_TESTS {
 				tchk(&bad, pok, "align: the readback resolves")
 				tc := md_table_ensure(&doc, &h.text, 0)
 				cols := md_table_cols(tc, measure, char_w, context.temp_allocator)
-				// Each row's own link locates that row's first line -- taken from the
-				// drawn output, so nothing here predicts a y. The two id cells are "ra"
-				// and "rb", i.e. the same FIRST glyph, which is what lets the left-edge
-				// comparison below be exact instead of carrying a side-bearing tolerance.
+				tchk(&bad, len(cols) == 3, fmt.tprintf("align: the block fits to 3 columns (%d)", len(cols)))
+				// Each row's own link (column 2) locates that row's first line -- taken
+				// from the drawn output, so nothing here predicts a y. The three id
+				// cells are "ra", "rb" and "rc", i.e. the same first glyph, which is
+				// what lets the x comparison below be exact instead of carrying a
+				// side-bearing tolerance.
 				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
-				r3_y, r4_y := f32(-1), f32(-1)
+				row1_x, row1_y := f32(-1), f32(-1)
+				row2_x, row2_y := f32(-1), f32(-1)
+				row3_y := f32(-1)
 				for hit in hits {
-					if strings.has_suffix(hit.url, "/ra") {r3_y = hit.rect.pos.y}
-					if strings.has_suffix(hit.url, "/rb") {r4_y = hit.rect.pos.y}
+					if strings.has_suffix(hit.url, "/ra") {row1_x, row1_y = hit.rect.pos.x, hit.rect.pos.y}
+					if strings.has_suffix(hit.url, "/rb") {row2_x, row2_y = hit.rect.pos.x, hit.rect.pos.y}
+					if strings.has_suffix(hit.url, "/rc") {row3_y = hit.rect.pos.y}
 				}
-				tchk(&bad, r3_y > 0 && r4_y > r3_y && len(cols) == 2, fmt.tprintf("align: both rows' links locate them (y %.0f, %.0f; %d cols)", r3_y, r4_y, len(cols)))
-				if pok && r3_y > 0 && r4_y > r3_y && len(cols) == 2 {
-					// Row 3 has nothing long in it, so it is one line tall -- which is
-					// also the precondition for the two bands below not to overlap.
-					tchk(&bad, abs((r4_y - r3_y) - trow) <= 1, fmt.tprintf("align: the plain row is one line tall (%.1f vs %.1f)", r4_y - r3_y, trow))
-					// The two "III" cells, each inside its own row's first line.
+				ok3 := row1_y > 0 && row2_y > row1_y && row3_y > row2_y && len(cols) == 3
+				tchk(&bad, ok3, fmt.tprintf("align: all three rows' links locate them (y %.0f, %.0f, %.0f; %d cols)", row1_y, row2_y, row3_y, len(cols)))
+				if pok && ok3 {
+					// THE precondition: row 2 really did wrap. Read off the drawn output,
+					// not predicted -- row 2's own row height, taken the same way section
+					// 3 takes row 2's, must be more than one line.
+					tchk(&bad, (row3_y - row2_y) > 1.5 * trow, fmt.tprintf("align: row 2's long cell actually wraps past one line (row height %.1f vs %.1f)", row3_y - row2_y, trow))
+					// THE assertion. Column 2's link -- the same two characters, "ra"
+					// and "rb" -- must land on the identical x in both rows, though row
+					// 2's neighbour (column 0) wraps to more than one line and row 1's
+					// does not.
+					tchk(
+						&bad, row1_x == row2_x,
+						fmt.tprintf("align: column 2 sits at the SAME x in both rows, though row 2's column 0 wraps (row1 %.1f vs row2 %.1f)", row1_x, row2_x),
+					)
+					// Column 1's "III", each inside its own row's first line -- same
+					// check, one column closer to the wrapping cell.
 					clo, chi := int(cx + cols[1].x) - 2, int(cx + cols[1].x + cols[1].w) + 4
-					a_lo, a_hi, a_ok := ink(pix, bg, clo, chi, int(r3_y), int(r3_y + trow), W, H)
-					b_lo, b_hi, b_ok := ink(pix, bg, clo, chi, int(r4_y), int(r4_y + trow), W, H)
-					tchk(&bad, a_ok && b_ok, fmt.tprintf("align: both rows' right-hand cell is on screen (row3 %d..%d, row4 %d..%d)", a_lo, a_hi, b_lo, b_hi))
+					a_lo, a_hi, a_ok := ink(pix, bg, clo, chi, int(row1_y), int(row1_y + trow), W, H)
+					b_lo, b_hi, b_ok := ink(pix, bg, clo, chi, int(row2_y), int(row2_y + trow), W, H)
+					tchk(&bad, a_ok && b_ok, fmt.tprintf("align: both rows' column-1 cell is on screen (row1 %d..%d, row2 %d..%d)", a_lo, a_hi, b_lo, b_hi))
 					if a_ok && b_ok {
-						// THE assertion. Identical content in identical columns, one row
-						// of which has a neighbour cell four times as long that wraps: the
-						// two must be pixel-identical, not merely close.
+						// Identical content in identical columns, one row of which has a
+						// neighbour cell that wraps to several lines: the two must be
+						// pixel-identical, not merely close.
 						tchk(
 							&bad, a_lo == b_lo && a_hi == b_hi,
-							fmt.tprintf("align: the same cell in two rows lands on the SAME pixels, though one row's other cell wraps (row3 %d..%d vs row4 %d..%d)", a_lo, a_hi, b_lo, b_hi),
+							fmt.tprintf("align: the same cell in two rows lands on the SAME pixels, though one row's other cell wraps (row1 %d..%d vs row2 %d..%d)", a_lo, a_hi, b_lo, b_hi),
 						)
 						// ...and it is actually right-aligned. Without this the equality
 						// above is satisfied by alignment being ignored entirely.
@@ -5136,13 +5181,82 @@ when NEWTPAD_TESTS {
 							fmt.tprintf("align: the right-aligned cell really is pushed to its column's right edge (%.0fpx in, column %.0fpx wide)", shift, cols[1].w),
 						)
 					}
-					// The left-aligned column's own left edge, in both rows, on pixels:
-					// row 4's cell wraps and row 3's does not, and both must start at the
-					// column's left edge.
+					// Column 0's own left edge, in both rows, on pixels: row 2's cell
+					// wraps and row 1's does not, and both must start at the column's
+					// left edge.
 					l0, l1 := int(cx + cols[0].x) - 2, int(cx + cols[0].x + cols[0].w)
-					la, _, lok_a := ink(pix, bg, l0, l1, int(r3_y), int(r3_y + trow), W, H)
-					lb, _, lok_b := ink(pix, bg, l0, l1, int(r4_y), int(r4_y + trow), W, H)
+					la, _, lok_a := ink(pix, bg, l0, l1, int(row1_y), int(row1_y + trow), W, H)
+					lb, _, lok_b := ink(pix, bg, l0, l1, int(row2_y), int(row2_y + trow), W, H)
 					tchk(&bad, lok_a && lok_b && la == lb, fmt.tprintf("align: the left-aligned column starts at the SAME pixel in a wrapping row and a plain one (%d vs %d)", la, lb))
+					// --- 4b. the separator rule sits where the draw intends it, on pixels --
+					//
+					// markdown.odin's separator-row quad is `ytop + ad.h * 0.5` -- vertically
+					// CENTRED in the separator row's own admitted height. The expression
+					// before this task was `ytop + ascent - px*0.5`, snug under the header
+					// text instead, and moved ~10px with nothing asserting either position
+					// -- disclosed as cosmetic, but a position nothing pins can drift again
+					// unnoticed. This pins the one the code draws now.
+					//
+					// The separator row is exactly one line tall (it draws no text, so only
+					// the empty-block fallback height applies) and sits directly above row 1
+					// with no gap, so its own top is row1_y - trow and its centre is
+					// row1_y - 0.5*trow.
+					rlo, rhi := int(cx) - 2, int(cx + cols[2].x + cols[2].w) + 2
+					want_y := row1_y - 0.5 * trow
+					_, _, at_centre := ink(pix, bg, rlo, rhi, int(want_y) - 1, int(want_y) + 2, W, H)
+					tchk(&bad, at_centre, fmt.tprintf("rule: the separator's rule sits centred in its row (row1_y %.1f, trow %.1f, want y~%.1f)", row1_y, trow, want_y))
+					// ...and NOT snug under the header, i.e. not near the separator row's
+					// own top edge -- the pre-task position, well clear of the centre band
+					// just confirmed above.
+					_, _, near_top := ink(pix, bg, rlo, rhi, int(row1_y - trow), int(row1_y - trow) + 3, W, H)
+					tchk(&bad, !near_top, fmt.tprintf("rule: ...and NOT snug under the header at the row's own top (nothing at y~%.1f)", row1_y - trow))
+				}
+			}
+			// --- 5. natural widths measure rendered text, not raw markdown ---------
+			//
+			// md_table_measure used to measure the CELL'S OWN RAW markdown source
+			// ("[docs](https://example.com/a/very/long/path)", 44 characters) instead
+			// of what md_layout_build actually shapes (md_inline(cell)'s runs, which
+			// render as "docs", 4 characters). A link column's raw text routinely
+			// clamps to the SAME 40-cell cap a genuinely wide prose column does, so
+			// the water-fill in md_table_fit_cells treated the two as equally greedy
+			// and starved the prose column to feed a link column that only needed a
+			// few cells on screen.
+			//
+			// THREE columns, not two: at this pane's measure (81 cells), a raw-
+			// measured link column ties the prose column's want at exactly 40 each,
+			// and the deficit is one cell -- small enough that which column absorbs
+			// it is an accident of loop order, not evidence of anything. The third
+			// (id) column eats a little more of the budget, which turns a 1-cell
+			// coincidence into a 3-cell one: under the bug BOTH big columns get
+			// clamped to the same reduced share (37 of the 40 they wanted), and
+			// which one that is does not depend on iteration order.
+			{
+				sb := strings.builder_make(context.temp_allocator)
+				strings.write_string(&sb, "| prose | link | id |\n|---|---|---|\n")
+				strings.write_string(&sb, "| wwww wwww wwww wwww wwww wwww wwww wwww wwww wwww wwww wwww | [docs](https://example.com/a/very/long/path) | 123 |\n")
+				doc := mkdoc(strings.to_string(sb), "linkwidth.md")
+				defer doc_close(&doc)
+				tc := md_table_ensure(&doc, &h.text, 0)
+				cols := md_table_cols(tc, measure, char_w, context.temp_allocator)
+				tchk(&bad, len(cols) == 3, fmt.tprintf("widths: the block fits to 3 columns (%d)", len(cols)))
+				if len(cols) == 3 {
+					// THE regression. Measuring the link's raw markdown makes it want
+					// the same 40 cells the prose column wants, so the two compete as
+					// equals and the prose column comes away with less than it asked
+					// for -- 37 of 40 under the bug (sabotage `md_table_measure` back
+					// to measuring `cell` raw to see it), 40 of 40 once the link
+					// column's want reflects what it actually draws.
+					prose_cells := int(cols[0].w / char_w + 0.5)
+					link_cells := int(cols[1].w / char_w + 0.5)
+					tchk(
+						&bad, prose_cells >= 39,
+						fmt.tprintf("widths: the prose column is NOT starved by the link's raw markdown (%d of 40 cells, link column %d cells)", prose_cells, link_cells),
+					)
+					// Non-vacuity: the link column really is only a few cells, so the
+					// row above is the measurement fix and not three columns that all
+					// happened to fit.
+					tchk(&bad, link_cells <= 10, fmt.tprintf("widths: the link column measures its RENDERED text, not its raw markdown (%d cells, want <= 10)", link_cells))
 				}
 			}
 			return
@@ -6675,7 +6789,13 @@ when NEWTPAD_TESTS {
 					// md_scroll_frac -> md_scroll_scalar x2 -> md_slot_at ->
 					// md_anchor_walk, each with a 24-line run-up and a 256-entry
 					// Md_Walk_Block array. Measured at 3.322 ms a frame against
-					// markdown_draw's 1.660 (-o:speed, `newtpad mdperftest`).
+					// markdown_draw's 1.660 (-o:speed, `newtpad mdperftest`) -- both on
+					// the OLD 2-column mdperftest fixture. 2026-07-29's wider 12-column
+					// fixture (mdperftest's `newtpad mdperftest`, see its gate comment)
+					// measures markdown_draw itself at 2.79 ms on the same build; the
+					// walk-count assertion below is what actually holds this proc's
+					// claim, not the millisecond figures, which are historical context
+					// for why the walk was worth removing.
 					//
 					// Counted in WALKS, because a cached answer and an uncached one are
 					// the same number -- the only honest witness is the work. The draw
@@ -13641,7 +13761,35 @@ when NEWTPAD_TESTS {
 			fmt.printfln("  markdown_links             %.3f ms", ms(t_links, N))
 			fmt.printfln("  md_preview_frac            %.3f ms", ms(t_frac, N))
 			fmt.printfln("  whole scroll frame         %.3f ms", ms(t_frame, N))
-			fmt.println("mdperftest: 0 failures")
+			// A threshold, so a regression here goes red instead of printing and
+			// passing regardless. Baseline is 2026-07-29's review measurement on
+			// this exact fixture at -o:speed: markdown_draw 2.79 ms, whole scroll
+			// frame 5.05 ms. The gate is ~1.8x that -- generous enough that normal
+			// machine noise does not flake it, tight enough that a 2x regression
+			// (what actually shipped once, undetected by this mode) trips it
+			// before it fully doubles.
+			//
+			// DEBUG_MULT exists for machine-to-machine noise, not for a
+			// debug/release gap: measured under -debug on this same fixture the
+			// numbers barely move (2.95 ms / 5.56 ms, ~1.1x), because the cost
+			// here is mostly DirectWrite and D3D11 calls outside Odin's own
+			// bounds checks, unlike a tight byte loop. Still generous, because a
+			// gate that flakes is one the next person learns to ignore.
+			DEBUG_MULT :: 1.3
+			dbg := f64(DEBUG_MULT) if ODIN_DEBUG else 1.0
+			draw_gate := 5.0 * dbg
+			frame_gate := 9.0 * dbg
+			perf_bad := 0
+			d_ms, f_ms := ms(t_draw, N), ms(t_frame, N)
+			if d_ms > draw_gate {
+				fmt.printfln("  FAIL: markdown_draw %.3f ms exceeds %.1f ms gate", d_ms, draw_gate)
+				perf_bad += 1
+			}
+			if f_ms > frame_gate {
+				fmt.printfln("  FAIL: whole scroll frame %.3f ms exceeds %.1f ms gate", f_ms, frame_gate)
+				perf_bad += 1
+			}
+			fmt.printfln("mdperftest: %d failures", perf_bad)
 			return true
 		}
 

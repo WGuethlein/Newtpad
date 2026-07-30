@@ -700,9 +700,20 @@ md_table_measure :: proc(doc: ^Document, t: ^plat.Text, start, end: int, oversiz
 			// The separator row is excluded, so its dashes never inflate a column.
 			for cell, i in cells {
 				if i >= MD_TABLE_MAX_COLS {break}
-				// col0 = 0: a table cell is measured from its own start,
-				// matching where md_draw_table_row draws it (see that proc).
-				w := plat.text_cells(t, transmute([]u8)cell, 0, .Doc)
+				// Measure what will be DRAWN, not the raw cell. md_layout_build shapes
+				// `md_inline(cell)`'s runs (see its .Table case above), which strips
+				// markdown syntax -- "[label](url)" draws as "label". Measuring the raw
+				// cell here counted the brackets and the whole URL as visible width, so
+				// a link column's natural width had nothing to do with what it actually
+				// rendered as, and the water-fill in md_table_fit_cells starved other
+				// columns to feed a link column that only needed a few cells.
+				// col0 = 0: a table cell's rendered text is measured from its own start,
+				// matching where the shaper starts it.
+				rb := strings.builder_make(context.temp_allocator)
+				for run in md_inline(cell) {
+					strings.write_string(&rb, run.text)
+				}
+				w := plat.text_cells(t, transmute([]u8)strings.to_string(rb), 0, .Doc)
 				if w > c.widths[i] {c.widths[i] = w}
 			}
 		}
@@ -764,9 +775,12 @@ Md_Table_Col :: struct {
 //  3. Otherwise water-fill: a column wanting no more than its equal share of what
 //     is left KEEPS its natural width, and the width it did not want goes back
 //     into the pool for the columns that did. Repeat until no column is under the
-//     share, then split what remains evenly among the rest, handing the integer
-//     remainder out one cell at a time so the fitted widths sum to the budget
-//     EXACTLY and no rounding drift leaks past the measure.
+//     share, then give every remaining column the soft floor and split what's
+//     left of the budget PROPORTIONALLY to how much each still wants beyond that
+//     floor -- §10's rule, reused: two greedy columns wanting 50 and 300 cells do
+//     not end up the same width. The integer remainder is handed out one cell at
+//     a time so the fitted widths sum to the budget EXACTLY and no rounding
+//     drift leaks past the measure.
 //
 // Under real pressure (many columns in a narrow pane) the floor is lowered toward
 // 1 cell before any column is dropped, and a column is dropped only when even one
@@ -810,15 +824,38 @@ md_table_fit_cells :: proc(natural: []int, avail: int, out: []int) -> (ncols: in
 		if !changed {break}
 	}
 	if free > 0 {
-		share := remaining / free
-		extra := remaining - share * free
+		// Every remaining column gets the floor first, then the rest of the
+		// budget splits PROPORTIONALLY to how much each still wants beyond that
+		// floor -- §10's rule ("distribute leftover width proportionally"),
+		// reused rather than diverged from. Basing the weight on want[i]-minc
+		// rather than want[i] itself is what keeps out[i] >= minc by
+		// construction: a column whose want IS the floor gets none of the
+		// leftover and stays exactly at minc, instead of an even split pushing
+		// it above its own natural want.
+		leftover := max(0, remaining - free * minc)
+		extra_sum := 0
 		for i in 0 ..< n {
 			if fixed[i] {continue}
-			out[i] = max(minc, share)
-			if extra > 0 {
-				out[i] += 1
-				extra -= 1
-			}
+			extra_sum += max(0, want[i] - minc)
+		}
+		assigned := 0
+		for i in 0 ..< n {
+			if fixed[i] {continue}
+			add := 0
+			if extra_sum > 0 {add = leftover * max(0, want[i] - minc) / extra_sum}
+			out[i] = minc + add
+			assigned += add
+		}
+		// The proportional split's integer division rounds down, so up to
+		// (free - 1) cells of leftover go unassigned above; hand them out one
+		// at a time, same as the even split used to, so the fitted widths
+		// still sum to the budget EXACTLY.
+		extra := leftover - assigned
+		for i in 0 ..< n {
+			if fixed[i] {continue}
+			if extra <= 0 {break}
+			out[i] += 1
+			extra -= 1
 		}
 	}
 	return n
