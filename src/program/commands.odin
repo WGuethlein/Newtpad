@@ -731,9 +731,24 @@ lookup_binding :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> Command_Id {
 }
 
 // May a chord the FIND context did not claim reach the editor keymap? Composed
-// from command_mutates_doc rather than listing the buffer writers again, so a
-// mutating command added there is refused here for free -- which is the point:
-// this is a class fix, not a fix for Ctrl+V.
+// from command_mutates_doc rather than listing the buffer writers again, so the
+// six chords of the Ctrl+V report are refused as a class rather than one at a
+// time.
+//
+// BE PRECISE ABOUT WHICH CLASS. command_mutates_doc is the TABLE-VIEW READ-ONLY
+// predicate -- "commands table view and Markdown Preview must block" -- and that
+// set overlaps the buffer writers without being them. A writer added to it is
+// refused here for free; a writer that has no reason to be on it is not, and two
+// already exist: Ctrl+T (.Toggle_Table) and Ctrl+M (.Toggle_Preview) both reach a
+// doc_replace_range through table_edit_commit (the .Toggle_Table arm below, and
+// leave_table_view). Neither is on the predicate, so neither is refused here.
+//
+// That is benign and is left alone deliberately: what those two commit is the
+// user's own cell text into the cell the user typed it in, which is the intended
+// semantics of leaving the view, not a write behind an invisible caret. But it
+// means this proc guarantees "no command table view blocks falls through", NOT
+// "no command that writes the buffer falls through". Anyone adding a writer has to
+// think about this proc; the composition does not do it for them.
 //
 // The two replace verbs are the exception, and they are the reason this is a
 // predicate rather than `!command_mutates_doc`. Ctrl+Enter / Ctrl+Alt+Enter are
@@ -1722,11 +1737,15 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Find_Backspace:
 		find_backspace(doc)
 	case .Find_Paste:
-		// Guarded on find being open, not on the chord: this is reachable from
-		// the palette by name as well, and with the bar shut there is no field
-		// for the clipboard to land in. find_paste refuses that itself; the
-		// clipboard read is skipped here so the shut case does not open the
-		// Windows clipboard for nothing.
+		// Guarded on find being open, not on the chord. NOT because the palette
+		// can reach it -- it cannot: the same change that added this command put
+		// it on command_in_palette's exclusion list and no menu row dispatches
+		// it, so Ctrl+V with the bar open is the only route in today. The guard
+		// is here because "the only caller checks" is not an invariant, and the
+		// thing on the other side of it is a clipboard read: with the bar shut
+		// there is no field for the text to land in, and find_paste would refuse
+		// it anyway, so opening the Windows clipboard first would be work done
+		// for a refusal. Guard the effect where the effect is.
 		if doc != nil && doc.find.active {
 			if s, ok := plat.clipboard_get_text(w.hwnd, context.temp_allocator); ok {
 				find_paste(doc, s)

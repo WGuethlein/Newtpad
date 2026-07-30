@@ -1045,6 +1045,26 @@ main :: proc() {
 		//
 		// Ahead of the title block below on purpose, so the dirty star appears on
 		// the frame the commit happens rather than the one after it.
+		//
+		// TWO WAYS "once per frame, before the draw" IS NOT LITERALLY TRUE, both
+		// of them one frame wide and neither able to misplace a write -- a commit
+		// always targets [table_edit_s, table_edit_e), which this guard does not
+		// choose. Recorded because the design rests on the phrase:
+		//
+		//   1. on_resize (below) calls render_frame straight from the window proc
+		//      during a live resize drag, so the draw runs against its own freshly
+		//      recomputed `trows` while this guard has not run at all. The next
+		//      loop iteration runs it. During the drag the box can therefore be
+		//      drawn one frame past the row budget that would have retired it.
+		//   2. `trows` here is sampled near the top of the frame from the
+		//      pre-dispatch window.height, px and active document, so a zoom, a
+		//      tab switch or a bar toggle dispatched in the SAME frame hands this
+		//      guard a stale budget -- again one frame, again self-correcting.
+		//
+		// Fixing either means moving the sample after dispatch (1) or teaching
+		// on_resize the update phase (2). Neither is worth a data-safety guard's
+		// complexity for a one-frame cosmetic lag; if the guard ever has to CHOOSE
+		// a write target, both become real and must be fixed first.
 		if doc.table && doc.kind == .Text {table_edit_hold(doc, trows)}
 
 		// Window title = [*]filename - Newtpad, set only when it changes.
