@@ -366,16 +366,16 @@ were the priorities. Read P2 as the live list, with these amendments:
   (a hint or a row number a reader cannot resolve is lost information, not a disabled affordance) unless
   whoever builds them finds a reason the dash's argument doesn't transfer. Overturn here, in one place,
   rather than re-litigating per site.
-- **Carried from batch 18 review (F4): scrolling or resizing while a table cell edit is open
-  desynchronises the edit box from the bytes it writes.** `doc.table_edit_row` is a *visible* row index
-  redrawn every frame; `table_edit_s`/`table_edit_e` are absolute byte offsets captured once, at
-  `table_edit_start`. The mouse wheel and `leave_table_view` commit the edit before they scroll (see
-  `table_edit_commit`'s call sites), but **the vertical scrollbar drag and Page Up/Down do not** — so
-  start editing row 0, drag the thumb down 20 rows, and the highlight box + caret are drawn over
-  whatever is now row 0 while the eventual commit still splices the original line. Pre-existing, not
-  introduced by F1/F2's fixes. **Task 4's row sort makes this strictly worse** (a sort can move the
-  edited row anywhere, not just off the top of the viewport by scrolling), so it belongs on that task's
-  brief rather than being fixed here in isolation.
+- ~~**Carried from batch 18 review (F4): scrolling or resizing while a table cell edit is open
+  desynchronises the edit box from the bytes it writes.**~~ **FIXED** in batch 18 (`table_edit_hold` /
+  `table_edit_anchored`, `table.odin`; one call per frame in `main.odin`). One guard rather than a
+  commit bolted onto each scroll route: it asks the seam directly — does the drawn row still name the
+  line the captured span lies on, and does that row still fit under the sticky header — so the
+  scrollbar drag, Page Up/Down, a find jump, a session restore and a window resize are all covered,
+  and so is the row sort that made this urgent (a sort moves lines under a live edit without touching
+  `doc.top`, and the row-start compare catches that too). Covered by `tablegridtest`'s
+  `tg_edit_anchor`, which drives all five routes; both halves of the guard were sabotaged separately
+  and each failed exactly the routes it owns.
 - **Carried from batch 18 review (F6): table zebra-band parity is viewport-anchored, so every
   odd-row scroll inverts every band.** Documented and accepted as shippable in `table_draw`'s own
   comment (parity by visible row index, not absolute file position, because the absolute index needs an
@@ -4506,8 +4506,15 @@ It has one now.
   columns at 16 cells, while the measured path squeezes toward 1 cell before dropping anything. The cheap
   honest fix keeps the O(1) property: scan the entry row for its own cell count so the count is not
   invented.
-- **`md_link_at` has no y bound**, and neither call site applies one, so a `forced` oversized block's link
-  rects stay clickable past the status bar. Found while reviewing the band changes; documented, not fixed.
+- ~~**`md_link_at` has no y bound**, and neither call site applies one, so a `forced` oversized block's
+  link rects stay clickable past the status bar.~~ **FIXED** in batch 18. `md_preview_link_at`
+  (`markdown.odin`) is now the one entry point for both the hand cursor and the Ctrl+click, and the
+  bound is inside it, applied to the POINT rather than to the rectangles — one bound, and a straddling
+  rect keeps exactly its visible half clickable. Bounding the rects in `markdown_links` was rejected:
+  it needs the pane box in a second place, and it would make `mdtest`'s partial-admission sweep pass
+  by construction (its "no drawn line's bottom exceeds `ybot`" is only a real assertion while that
+  producer still reports overflow). Covered by `mdtest`'s `md_link_bound_selftest`, which measures the
+  overflow before probing it.
 - **Every source line is its own `.Para`**, so two adjacent prose lines look like two paragraphs.
   CommonMark joins them with a space at the break. **A design question, not a bug** — and the one remaining
   reading of Wyatt's "spaces" report if the table fix turns out not to be what he saw.
