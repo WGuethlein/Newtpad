@@ -218,8 +218,12 @@ Each of these cost real time at least once.
   `src/program/test_modes.odin`.
 - **Set `NEWTPAD_SESSION_DIR` to a temp directory first.** Six modes used to write to the real store
   under `%APPDATA%\Newtpad`; they now refuse without it, but set it anyway.
-- Argument order is per-mode and unforgiving: `keytest`/`edittest` take the path **first**;
-  `watchtest` takes a directory.
+- Argument order is per-mode and unforgiving: `edittest`/`seltest` take the path **first**;
+  `watchtest` takes a directory. **`keytest` no longer needs one** (2026-07-30) — `newtpad keytest`
+  works, `newtpad <path> keytest` still works, and it belongs in every regression sweep from now on.
+  It was two-argument-only, so it was in no required list, nothing ran it, and a stale assertion that
+  the D1 keymap fix had invalidated sat in the tree printing `FAIL` to nobody. **A mode nothing runs is
+  worse than no mode.** When you add one, make it one-argument and put it in a list.
 - **`drawcount` is safe to run as of batch 8** — `newtpad drawcount <file>` renders offscreen (no
   window, no message pump), prints its numbers and exits, and a bare `newtpad drawcount` prints
   usage. **The old rule here was right to forbid it but wrong about why**, and the difference is the
@@ -228,11 +232,11 @@ Each of these cost real time at least once.
   reason enough not to trust it, but it did not hang. What hung past 20 s was **bare `drawcount`
   with no path**, falling through to the real GUI. So the hazard was never this mode; it was the
   missing-argument fall-through, which is the trap the rest of this bullet describes. **That trap is
-  still live everywhere else, so keep reading.** `keytest` takes `<path> <mode>`, two
-  arguments, and with only one it falls through to opening the real GUI window and hangs. **`edittest`
-  and `seltest` do the same when their two arguments are in the wrong order** — the path comes
-  FIRST — and that cost a ten-minute timeout once. Any file-argument mode can do this; check the
-  argument order in `test_modes.odin` before running one.
+  still live everywhere else, so keep reading.** `keytest` used to take `<path> <mode>`, two
+  arguments, and with only one it fell through to opening the real GUI window and hung; it takes either
+  form now (see the bullet above). **`edittest` and `seltest` still do it when their two arguments are
+  in the wrong order** — the path comes FIRST — and that cost a ten-minute timeout once. Any
+  file-argument mode can do this; check the argument order in `test_modes.odin` before running one.
 - **A test mode can grow a stack overflow.** The trigger is total per-procedure frame size, not a
   sibling count — it is not "three or more inline blocks." `test_mode_dispatch` is one enormous
   procedure with an already-large frame; a callee that holds two `App` structs live at once

@@ -28,10 +28,156 @@ NEWTPAD_TESTS :: #config(NEWTPAD_TESTS, ODIN_DEBUG)
 
 when NEWTPAD_TESTS {
 
+	// Counts, as well as prints. It printed only for a year, which made every
+	// assertion in `keytest` decorative: the mode had a live FAIL line in the tree
+	// (Ctrl+Z / Find, pinned as .Undo after the D1 fix made it .None) and still
+	// exited 0 with no summary, so neither a human skim nor a script noticed. A
+	// check that cannot fail is not a check.
 	@(private = "file")
-	key_chk :: proc(got, want: Command_Id, label: string) {
+	key_chk :: proc(bad: ^int, got, want: Command_Id, label: string) {
 		ok := "OK" if got == want else fmt.tprintf("FAIL want=%v", want)
+		if got != want {bad^ += 1}
 		fmt.printfln("%-22s -> %-16v %s", label, got, ok)
+	}
+
+	// `newtpad keytest` (and the historical `newtpad <path> keytest`) -- what the
+	// keymap resolves per context, and what dispatch then does with a handful of
+	// those commands.
+	//
+	// TAKES A PATH OR NOT, and that is the fix for the second half of its problem.
+	// It used to be two-argument only, so it was in no required list and no sweep
+	// ran it -- which is how the stale Ctrl+Z assertion above survived the D1 fix
+	// that invalidated it. One-argument now, like every other mode in the required
+	// list, with an empty path falling through to a scratch buffer exactly as an
+	// unopenable one already did. NOT folded into `keymaptest`: that mode is about
+	// the keys.txt user overlay and installs one, and its assertions would then be
+	// reading the defaults through an overlay rather than the defaults.
+	//
+	// Its own proc rather than a `case` body for the usual reason (§6,
+	// test_mode_dispatch's frame has hit STATUS_STACK_OVERFLOW twice) and because a
+	// summary line plus an exit code needs somewhere to live.
+	@(private = "file")
+	keytest_run :: proc(path: string) {
+		if !require_scratch_session("keytest") {return}
+		bad := 0
+		app: App
+		if !app_open_path(&app, path) {app_new_scratch(&app)} // e.g. "hello world foo"
+		dummy: plat.Window
+		dtext: plat.Text // these commands don't measure text
+		key_chk(&bad, resolve_key(.Left, false, false, .Editor), .Cursor_Left, "Left / Editor")
+		key_chk(&bad, resolve_key(.Left, true, false, .Editor), .Word_Left, "Ctrl+Left / Editor")
+		key_chk(&bad, resolve_key(.F, true, false, .Editor), .Find_Open, "Ctrl+F / Editor")
+		key_chk(&bad, resolve_key(.Up, false, true, .Editor), .Move_Line_Up, "Alt+Up / Editor")
+		key_chk(&bad, resolve_key(.Down, false, true, .Editor), .Move_Line_Down, "Alt+Down / Editor")
+		key_chk(&bad, resolve_key(.Z, false, true, .Editor), .Toggle_Wrap, "Alt+Z / Editor")
+		key_chk(&bad, resolve_key(.Enter, false, false, .Editor), .Insert_Newline, "Enter / Editor")
+		key_chk(&bad, resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find")
+		key_chk(&bad, resolve_key(.Escape, false, false, .Find), .Find_Close, "Esc / Find")
+		key_chk(&bad, resolve_key(.H, true, false, .Editor), .Replace_Open, "Ctrl+H / Editor")
+		key_chk(&bad, resolve_key(.H, true, false, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find")
+		key_chk(&bad, resolve_key(.A, false, false, .Editor), .None, "a (unbound)")
+		// Reported as dead in the GUI (2026-07-19); pin what the keymap resolves.
+		key_chk(&bad, resolve_key(.A, true, false, .Editor), .Select_All, "Ctrl+A / Editor")
+		key_chk(&bad, resolve_key(.P, true, false, .Editor), .Palette_Open, "Ctrl+P / Editor")
+		key_chk(&bad, resolve_key(.L, true, false, .Editor), .Filter_Open, "Ctrl+L / Editor")
+		// Reported missing by the 2026-07-19 audit as first-hour daily-driver gaps.
+		key_chk(&bad, resolve_key(.Tab, false, false, .Editor), .Insert_Tab, "Tab / Editor")
+		key_chk(&bad, resolve_key(.Home, true, false, .Editor), .Doc_Start, "Ctrl+Home / Editor")
+		key_chk(&bad, resolve_key(.End, true, false, .Editor), .Doc_End, "Ctrl+End / Editor")
+		key_chk(&bad, resolve_key(.G, true, false, .Editor), .Goto_Line, "Ctrl+G / Editor")
+		key_chk(&bad, resolve_key(.Tab, true, false, .Editor), .Tab_Next, "Ctrl+Tab still switches")
+		key_chk(&bad, resolve_key(.Home, false, false, .Editor), .Cursor_Home, "Home still line-start")
+		key_chk(&bad, resolve_key(.L, true, false, .Find), .Find_Toggle_Filter, "Ctrl+L / Find")
+		// Find falls back to the editor keymap for MODIFIED chords, which is why
+		// these four reach the document with the bar open. That is what the fallback
+		// is for (Ctrl+S, Ctrl+P and the tab chords should not die because a bar is
+		// open) and it is only safe for READS.
+		key_chk(&bad, resolve_key(.P, true, false, .Find), .Palette_Open, "Ctrl+P / Find")
+		key_chk(&bad, resolve_key(.S, true, false, .Find), .Save, "Ctrl+S / Find")
+		key_chk(&bad, resolve_key(.N, true, false, .Find), .Tab_New, "Ctrl+N / Find")
+		// DELIBERATE, not an accident of the fallback, and recorded as such because
+		// nobody ever decided it: Ctrl+A with the find bar focused selects the
+		// DOCUMENT, not the query, because the find fields have no selection model of
+		// their own (find_backspace deletes from the end; there is no caret). Same for
+		// Ctrl+C, which copies the document's selection. Both are reads, so neither is
+		// a data-safety question; if a Find_Select_All / Find_Copy pair is ever added,
+		// these two lines are the ones that change.
+		key_chk(&bad, resolve_key(.A, true, false, .Find), .Select_All, "Ctrl+A / Find (doc, by decision)")
+		key_chk(&bad, resolve_key(.C, true, false, .Find), .Copy, "Ctrl+C / Find (doc, by decision)")
+		// ...and the WRITERS do not fall through, which is D1 (2026-07-29). With the
+		// query focused these used to undo, redo, cut and move the document's lines
+		// behind an invisible caret, under a bar whose viewport takes no keystrokes --
+		// so nothing typed there could be taken back without closing the bar first.
+		// find_fallback_writes_doc refuses the class, not the six chords.
+		key_chk(&bad, resolve_key(.Z, true, false, .Find), .None, "Ctrl+Z / Find (no write)")
+		key_chk(&bad, resolve_key(.Y, true, false, .Find), .None, "Ctrl+Y / Find (no write)")
+		key_chk(&bad, resolve_key(.X, true, false, .Find), .None, "Ctrl+X / Find (no write)")
+		key_chk(&bad, resolve_key(.Up, false, true, .Find), .None, "Alt+Up / Find (no write)")
+		key_chk(&bad, resolve_key(.Down, false, true, .Find), .None, "Alt+Down / Find (no write)")
+		// The two replace verbs ARE the exception, and they have to be: they are
+		// declared in .Editor and not in .Find, so the fallback is the only way they
+		// reach the replace row. See find_fallback_writes_doc.
+		key_chk(&bad, resolve_key(.Enter, true, false, .Find), .Find_Replace_One, "Ctrl+Enter / Find (the exception)")
+		key_chk(&bad, resolve_key(.Enter, true, true, .Find), .Find_Replace_All, "Ctrl+Alt+Enter / Find (the exception)")
+		// These must NOT fall through — Find deliberately overrides them.
+		key_chk(&bad, resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find (override)")
+		key_chk(&bad, resolve_key(.Escape, false, false, .Find), .Find_Close, "Esc / Find (override)")
+		key_chk(&bad, resolve_key(.H, true, false, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find (override)")
+		key_chk(&bad, resolve_key(.V, true, false, .Find), .Find_Paste, "Ctrl+V / Find (override)")
+		// Unmodified keys must stay owned by the mode: falling these through would
+		// edit and navigate the document while the user types a query.
+		key_chk(&bad, resolve_key(.Delete, false, false, .Find), .None, "Delete / Find (no fall)")
+		key_chk(&bad, resolve_key(.Left, false, false, .Find), .None, "Left / Find (no fall)")
+		key_chk(&bad, resolve_key(.Home, false, false, .Find), .None, "Home / Find (no fall)")
+		// The palette is a text field: nothing falls through to the editor.
+		key_chk(&bad, resolve_key(.A, true, false, .Palette), .None, "Ctrl+A / Palette (no fall)")
+		key_chk(&bad, resolve_key(.S, true, false, .Palette), .None, "Ctrl+S / Palette (no fall)")
+		// ...and what dispatch actually does with them.
+		d0 := app_active(&app)
+		d0.cursor, d0.anchor = 0, 0
+		command_dispatch(.Select_All, {}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Ctrl+A   -> anchor=%d cursor=%d len=%d", d0.anchor, d0.cursor, d0.pt.length)
+		command_dispatch(resolve_key(.P, true, false, .Editor), {.P, true, false, false}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Ctrl+P   -> palette.active=%v results=%d", app.palette.active, len(app.palette.results))
+		// Arrowing past the drawn window (12 rows) — does selected stay visible?
+		for i in 0 ..< 30 {palette_move(&app, 1)}
+		fmt.printfln("palette Down x30  -> selected=%d of %d (drawn rows=12)", app.palette.selected, len(app.palette.results))
+		palette_close(&app)
+		// Every palette-visible command should teach its shortcut, and the ones
+		// that only exist inside find mode must be listed at all.
+		shown, with_chord := 0, 0
+		for cmd in Command_Id {
+			if !command_in_palette(cmd) {continue}
+			shown += 1
+			if command_chord(cmd) != "" {with_chord += 1}
+		}
+		fmt.printfln("palette lists %d commands, %d show a shortcut", shown, with_chord)
+		for c in ([]Command_Id{.Find_Toggle_Filter, .Find_Toggle_Regex, .Filter_Open, .Goto_Line, .Save_As}) {
+			fmt.printfln("  %-24v in palette=%-5v chord=%q", c, command_in_palette(c), command_chord(c))
+		}
+		// dispatch effects (dummy window/text; these commands don't touch them)
+		app_active(&app).cursor = 0
+		command_dispatch(resolve_key(.Right, false, false, .Editor), {.Right, false, false, false}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Right    -> cursor=%d", app_active(&app).cursor)
+		command_dispatch(.Toggle_Wrap, {}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Alt+Z    -> wrap=%v", app_active(&app).wrap)
+		command_dispatch(resolve_key(.F, true, false, .Editor), {.F, true, false, false}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Ctrl+F   -> find.active=%v", app_active(&app).find.active)
+		command_dispatch(resolve_key(.Escape, false, false, .Find), {.Escape, false, false, false}, &app, &dummy, &dtext, 10)
+		fmt.printfln("dispatch Esc      -> find.active=%v", app_active(&app).find.active)
+		// tab commands
+		command_dispatch(.Tab_New, {}, &app, &dummy, &dtext, 10)
+		fmt.printfln("Tab_New           -> live tabs=%d active=%d", app_live_count(&app), app.active)
+		command_dispatch(.Tab_Close, {}, &app, &dummy, &dtext, 10)
+		fmt.printfln("Tab_Close         -> live tabs=%d", app_live_count(&app))
+		app_destroy(&app)
+		fmt.printfln("keytest: %d failures", bad)
+		// The only mode that exits non-zero, and it earns it: this one was invisible
+		// to every sweep for a year. A summary line a script has to remember to grep
+		// is what let the stale assertion sit here; an exit code is not optional to
+		// notice. `os.exit` skips the deferred teardown above -- everything it would
+		// free is process-lifetime scratch, and the process is ending either way.
+		if bad > 0 {os.exit(1)}
 	}
 
 	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the
@@ -26100,6 +26246,15 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad keytest` with no path, so the mode is sweepable. The two-argument
+		// spelling `newtpad <path> keytest` still works (it falls through to the
+		// switch below) because development-loop.md documents it and old scripts use
+		// it -- both reach keytest_run.
+		if os.args[1] == "keytest" {
+			keytest_run(os.args[2] if len(os.args) > 2 else "")
+			return true
+		}
+
 		if len(os.args) < 3 {return false}
 		path, mode := os.args[1], os.args[2]
 
@@ -26120,93 +26275,9 @@ when NEWTPAD_TESTS {
 			doc_close(&doc)
 
 		case mode == "keytest":
-			app: App
-			if !app_open_path(&app, path) {app_new_scratch(&app)} // e.g. "hello world foo"
-			dummy: plat.Window
-			dtext: plat.Text // these commands don't measure text
-			key_chk(resolve_key(.Left, false, false, .Editor), .Cursor_Left, "Left / Editor")
-			key_chk(resolve_key(.Left, true, false, .Editor), .Word_Left, "Ctrl+Left / Editor")
-			key_chk(resolve_key(.F, true, false, .Editor), .Find_Open, "Ctrl+F / Editor")
-			key_chk(resolve_key(.Up, false, true, .Editor), .Move_Line_Up, "Alt+Up / Editor")
-			key_chk(resolve_key(.Down, false, true, .Editor), .Move_Line_Down, "Alt+Down / Editor")
-			key_chk(resolve_key(.Z, false, true, .Editor), .Toggle_Wrap, "Alt+Z / Editor")
-			key_chk(resolve_key(.Enter, false, false, .Editor), .Insert_Newline, "Enter / Editor")
-			key_chk(resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find")
-			key_chk(resolve_key(.Escape, false, false, .Find), .Find_Close, "Esc / Find")
-			key_chk(resolve_key(.H, true, false, .Editor), .Replace_Open, "Ctrl+H / Editor")
-			key_chk(resolve_key(.H, true, false, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find")
-			key_chk(resolve_key(.A, false, false, .Editor), .None, "a (unbound)")
-			// Reported as dead in the GUI (2026-07-19); pin what the keymap resolves.
-			key_chk(resolve_key(.A, true, false, .Editor), .Select_All, "Ctrl+A / Editor")
-			key_chk(resolve_key(.P, true, false, .Editor), .Palette_Open, "Ctrl+P / Editor")
-			key_chk(resolve_key(.L, true, false, .Editor), .Filter_Open, "Ctrl+L / Editor")
-			// Reported missing by the 2026-07-19 audit as first-hour daily-driver gaps.
-			key_chk(resolve_key(.Tab, false, false, .Editor), .Insert_Tab, "Tab / Editor")
-			key_chk(resolve_key(.Home, true, false, .Editor), .Doc_Start, "Ctrl+Home / Editor")
-			key_chk(resolve_key(.End, true, false, .Editor), .Doc_End, "Ctrl+End / Editor")
-			key_chk(resolve_key(.G, true, false, .Editor), .Goto_Line, "Ctrl+G / Editor")
-			key_chk(resolve_key(.Tab, true, false, .Editor), .Tab_Next, "Ctrl+Tab still switches")
-			key_chk(resolve_key(.Home, false, false, .Editor), .Cursor_Home, "Home still line-start")
-			key_chk(resolve_key(.L, true, false, .Find), .Find_Toggle_Filter, "Ctrl+L / Find")
-			// The real defect: Find context has no fallback to the Editor bindings, so
-			// every editor chord is dead while the find bar is open.
-			key_chk(resolve_key(.A, true, false, .Find), .Select_All, "Ctrl+A / Find")
-			key_chk(resolve_key(.P, true, false, .Find), .Palette_Open, "Ctrl+P / Find")
-			key_chk(resolve_key(.S, true, false, .Find), .Save, "Ctrl+S / Find")
-			key_chk(resolve_key(.C, true, false, .Find), .Copy, "Ctrl+C / Find")
-			key_chk(resolve_key(.Z, true, false, .Find), .Undo, "Ctrl+Z / Find")
-			key_chk(resolve_key(.N, true, false, .Find), .Tab_New, "Ctrl+N / Find")
-			// These must NOT fall through — Find deliberately overrides them.
-			key_chk(resolve_key(.Enter, false, false, .Find), .Find_Confirm, "Enter / Find (override)")
-			key_chk(resolve_key(.Escape, false, false, .Find), .Find_Close, "Esc / Find (override)")
-			key_chk(resolve_key(.H, true, false, .Find), .Find_Toggle_Replace_Mode, "Ctrl+H / Find (override)")
-			// Unmodified keys must stay owned by the mode: falling these through would
-			// edit and navigate the document while the user types a query.
-			key_chk(resolve_key(.Delete, false, false, .Find), .None, "Delete / Find (no fall)")
-			key_chk(resolve_key(.Left, false, false, .Find), .None, "Left / Find (no fall)")
-			key_chk(resolve_key(.Home, false, false, .Find), .None, "Home / Find (no fall)")
-			// The palette is a text field: nothing falls through to the editor.
-			key_chk(resolve_key(.A, true, false, .Palette), .None, "Ctrl+A / Palette (no fall)")
-			key_chk(resolve_key(.S, true, false, .Palette), .None, "Ctrl+S / Palette (no fall)")
-			// ...and what dispatch actually does with them.
-			d0 := app_active(&app)
-			d0.cursor, d0.anchor = 0, 0
-			command_dispatch(.Select_All, {}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Ctrl+A   -> anchor=%d cursor=%d len=%d", d0.anchor, d0.cursor, d0.pt.length)
-			command_dispatch(resolve_key(.P, true, false, .Editor), {.P, true, false, false}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Ctrl+P   -> palette.active=%v results=%d", app.palette.active, len(app.palette.results))
-			// Arrowing past the drawn window (12 rows) — does selected stay visible?
-			for i in 0 ..< 30 {palette_move(&app, 1)}
-			fmt.printfln("palette Down x30  -> selected=%d of %d (drawn rows=12)", app.palette.selected, len(app.palette.results))
-			palette_close(&app)
-			// Every palette-visible command should teach its shortcut, and the ones
-			// that only exist inside find mode must be listed at all.
-			shown, with_chord := 0, 0
-			for cmd in Command_Id {
-				if !command_in_palette(cmd) {continue}
-				shown += 1
-				if command_chord(cmd) != "" {with_chord += 1}
-			}
-			fmt.printfln("palette lists %d commands, %d show a shortcut", shown, with_chord)
-			for c in ([]Command_Id{.Find_Toggle_Filter, .Find_Toggle_Regex, .Filter_Open, .Goto_Line, .Save_As}) {
-				fmt.printfln("  %-24v in palette=%-5v chord=%q", c, command_in_palette(c), command_chord(c))
-			}
-			// dispatch effects (dummy window/text; these commands don't touch them)
-			app_active(&app).cursor = 0
-			command_dispatch(resolve_key(.Right, false, false, .Editor), {.Right, false, false, false}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Right    -> cursor=%d", app_active(&app).cursor)
-			command_dispatch(.Toggle_Wrap, {}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Alt+Z    -> wrap=%v", app_active(&app).wrap)
-			command_dispatch(resolve_key(.F, true, false, .Editor), {.F, true, false, false}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Ctrl+F   -> find.active=%v", app_active(&app).find.active)
-			command_dispatch(resolve_key(.Escape, false, false, .Find), {.Escape, false, false, false}, &app, &dummy, &dtext, 10)
-			fmt.printfln("dispatch Esc      -> find.active=%v", app_active(&app).find.active)
-			// tab commands
-			command_dispatch(.Tab_New, {}, &app, &dummy, &dtext, 10)
-			fmt.printfln("Tab_New           -> live tabs=%d active=%d", app_live_count(&app), app.active)
-			command_dispatch(.Tab_Close, {}, &app, &dummy, &dtext, 10)
-			fmt.printfln("Tab_Close         -> live tabs=%d", app_live_count(&app))
-			app_destroy(&app)
+			// The path-first spelling documented in development-loop.md; the
+			// one-argument form is handled above so a sweep can run it.
+			keytest_run(path)
 
 		case mode == "edittest":
 			doc, _ := doc_open(path)
