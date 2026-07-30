@@ -454,6 +454,17 @@ shape_spans :: proc(
 // one colour per span; a short or nil `colors` falls back to `base` for the
 // spans it does not cover, which is what a single-colour block wants.
 //
+// `lines` draws only the run's FIRST `lines` visual lines; negative means all of
+// them, which is every caller that has no reason to care. It is expressed as a
+// line index rather than as a y bound on purpose: this renderer has no scissor
+// rect, so a caller that can only fit part of a run has to stop at a boundary the
+// SHAPER knows about, and Shaped_Glyph.line is that boundary. Nothing is clipped
+// and no glyph is moved -- a glyph is emitted or it is not. The markdown
+// preview's per-line block admission is the caller this exists for (see
+// md_block_admit); doing the same filtering outside would mean re-deriving which
+// glyphs are on which line, which is the re-derivation this file's header warns
+// about.
+//
 // Reaches the GPU through text_submit_instances, the same call text_draw_spans
 // makes.
 shaped_draw :: proc(
@@ -464,14 +475,17 @@ shaped_draw :: proc(
 	x, y: f32,
 	base: [4]f32,
 	colors: [][4]f32 = nil,
+	lines: int = -1,
 ) {
 	if s == nil || len(s.glyphs) == 0 {return}
+	if lines == 0 {return}
 	g_draw.text_calls += 1 // see draw_trace.odin
 	instances := make([dynamic]Text_Instance, 0, len(s.glyphs), context.temp_allocator)
 	// The atlas must hold still while these UVs are being collected.
 	t.drawing = true
 	defer t.drawing = false
 	for sg in s.glyphs {
+		if lines >= 0 && int(sg.line) >= lines {continue}
 		si := int(sg.span)
 		if si < 0 || si >= len(spans) {continue}
 		sp := spans[si]
