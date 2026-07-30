@@ -861,8 +861,38 @@ md_table_fit_cells :: proc(natural: []int, avail: int, out: []int) -> (ncols: in
 	return n
 }
 
+// THE advance a table's column arithmetic is denominated in.
+//
+// One producer, because there are two candidates and they are not the same pixel.
+// The cell COUNTS come from plat.text_cells; the cell TEXT is laid out by the
+// proportional shaper, which advances by the font's real advance. So the number
+// that turns a count into a pixel width has to be the shaper's, or a column
+// fitted to its content's own natural width is not wide enough to hold it.
+//
+// NOT plat.text_char_width, which is what this used to be: that ROUNDS to a whole
+// pixel, and has to -- the editor's grid needs an integral cell because text_draw
+// advances its pen by the same number, so the glyphs and every rect positioned
+// against column n*cell_w cannot drift. The preview's table is not on that grid.
+//
+// The cost of the mix-up, live: at the default 16px document size m.table is 15px,
+// where the rounded cell is 8.0000 and the real advance 8.2471. A table narrower
+// than the measure is fitted at its NATURAL widths, so a 6-cell column came out
+// 48.0px while its 6-character cell shapes to 49.48px -- the shaper's greedy break
+// then fired on the cell's last glyph and every such cell dropped its last word
+// (or, with no space in it, its last character) onto a second line. That is Wyatt's
+// "it looks like it's not respecting the spaces all the time" on a table
+// (2026-07-29): the break lands on the space, so the space is what appears to go
+// missing. The sign flips with the size -- at 24px the rounded 13.0000 exceeds the
+// real 12.6455, columns come out too wide instead and nothing wraps early, which
+// is why mdtest's px_=24 table sections were all green while the shipped default
+// size was broken. md_table_fit_selftest sweeps sizes for exactly that reason.
+md_table_char_w :: proc(gfx: ^plat.Gfx, t: ^plat.Text, m: ^Md_Metrics) -> f32 {
+	return plat.text_advance(gfx, t, '0', m.table, .Doc)
+}
+
 // The fitted pixel geometry of one table block's columns, for a pane whose content
-// column is `measure` pixels wide at a mono advance of `char_w`.
+// column is `measure` pixels wide at a mono advance of `char_w` (md_table_char_w --
+// the shaper's advance, not the editor grid's rounded cell).
 //
 // The one production call site is md_layout_build, which stores the result on the
 // block's layout and lets the draw read it back. Package-visible rather than
@@ -2363,7 +2393,7 @@ md_layout_build :: proc(
 		px, lead = m.table, line_height(m.table)
 		fallback_set = .Doc
 		tcache = md_table_ensure(doc, t, p)
-		e.tcols = md_table_cols(tcache, measure, plat.text_char_width(t, m.table, .Doc))
+		e.tcols = md_table_cols(tcache, measure, md_table_char_w(gfx, t, m))
 		// md_table_bounds refuses an entry point that is not a real line start (a
 		// physical row longer than RENDER_LINE_CAP, drawn in segments), and a refusal
 		// is nil here. The row still has to draw: one column, the whole measure.

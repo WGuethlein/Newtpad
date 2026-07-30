@@ -4770,6 +4770,187 @@ when NEWTPAD_TESTS {
 			return
 		}
 
+		// A table column is fitted in CELLS and shaped in ADVANCES, and the two have
+		// to be the same pixel. This is the defect behind Wyatt's "it looks like it's
+		// not respecting the spaces all the time" (2026-07-29, with a screenshot of a
+		// markdown table): md_table_cols was handed plat.text_char_width, which ROUNDS
+		// the cell to a whole pixel for the editor's grid, while the cell text goes
+		// through the proportional shaper, which advances by the font's real advance.
+		// At the default 16px document size m.table is 15px, where the rounded cell is
+		// 8.0000 and the real advance 8.2471 -- so a column fitted to exactly its
+		// content's natural cell count came out 3% too NARROW, the greedy break fired
+		// on the cell's last glyph, and every cell at its natural width dropped its
+		// last word onto a second line.
+		//
+		// WHY THE EXISTING TABLE SECTIONS ARE BLIND TO IT: the rounding error changes
+		// SIGN with the size. md_scale rounds m.table to a whole px, so at mdtest's
+		// px_=24 the rounded cell is 13.0000 against a real 12.6455 -- columns come
+		// out too WIDE there, nothing wraps early, and every assertion in
+		// md_table_wrap_selftest is satisfied. Hence the sweep below rather than one
+		// size, and hence the precondition row that says which sizes the case even
+		// exists at.
+		md_table_fit_selftest :: proc() -> (bad: int) {
+			fchk :: proc(bad: ^int, ok: bool, msg: string) -> bool {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+				return ok
+			}
+			W, H :: 1500, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/tablefit") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			x0, x1 := f32(40), f32(1400)
+			ytop, ybot := f32(60), f32(650)
+			bg := g_theme[.Bg_Base]
+
+			// --- A. the invariant, swept across document sizes ---------------------
+			//
+			// A table narrower than the measure is fitted at its NATURAL widths (rule 2
+			// of md_table_fit_cells), so every column's pixel width must be at least
+			// what its widest cell SHAPES to. If it is less, the shaper has no choice
+			// but to break the cell -- there is no third possibility, which is what
+			// makes this the whole claim rather than a proxy for it.
+			//
+			// The natural width comes from plat.shape_spans at an unbounded measure: a
+			// second producer, deliberately, and the same one section 3 of
+			// md_table_wrap_selftest uses for a row's height. It can disagree with the
+			// layout only if the layout stopped shaping its cells.
+			CELL0 :: "aa  bb" // 6 cells; the double space is what the break lands on
+			CELL1 :: "cc  dd"
+			src := "| h1 | h2 |\n|---|---|\n| " + CELL0 + " | x |\n| " + CELL1 + " | y |\n"
+			sizes := []f32{16, 18, 20, 22, 24}
+			gap_sizes := 0 // sizes where the rounded cell really is narrower than the real advance
+			for px_ in sizes {
+				m := md_metrics(&h.text, px_)
+				_, measure := md_content_span(&m, x0, x1)
+				// The two candidate pixels, both read INDEPENDENTLY of what
+				// md_table_char_w chose between them: the editor grid's rounded cell,
+				// and the advance the shaper will actually lay a mono glyph out with.
+				// Reading `exact` off md_table_char_w instead would make this row agree
+				// with whatever the producer does and say nothing about the sizes the
+				// case exists at.
+				rounded := plat.text_char_width(&h.text, m.table, .Doc)
+				exact := plat.text_advance(&h.gfx, &h.text, '0', m.table, .Doc)
+				if rounded < exact {gap_sizes += 1}
+
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "fit.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				tc := md_table_ensure(&doc, &h.text, 0)
+				cols := md_table_cols(tc, measure, md_table_char_w(&h.gfx, &h.text, &m), context.temp_allocator)
+				if !fchk(&bad, len(cols) == 2, fmt.tprintf("fit[%.0f]: the block fits to 2 columns at its natural widths (%d)", px_, len(cols))) {continue}
+
+				widest := f32(0)
+				for cell in ([]string{"h1", CELL0, CELL1}) {
+					one := []plat.Shape_Span{{text = cell, px = m.table, set = .Doc}}
+					sh := plat.shape_spans(&h.gfx, &h.text, one, 1e6, line_height(m.table), context.temp_allocator)
+					widest = max(widest, sh.width)
+					// The unbounded shape must be ONE line, or `width` is not a natural
+					// width and the comparison below means nothing.
+					fchk(&bad, sh.lines == 1, fmt.tprintf("fit[%.0f]: |%s| shapes to one line at an unbounded measure (%d)", px_, cell, sh.lines))
+				}
+				fchk(
+					&bad, cols[0].w >= widest - 0.01,
+					fmt.tprintf("fit[%.0f]: column 0 is at least as wide as its widest cell SHAPES to (%.4f vs %.4f; rounded cell %.4f, real %.4f)", px_, cols[0].w, widest, rounded, exact),
+				)
+			}
+			// Without this the sweep could be green because no size in it has a
+			// rounding gap at all -- which is exactly the state md_table_wrap_selftest's
+			// single px_=24 was in.
+			fchk(&bad, gap_sizes > 0, fmt.tprintf("fit: the sweep includes sizes where the rounded cell IS narrower than the real advance (%d of %d)", gap_sizes, len(sizes)))
+
+			// --- B. the effect, at the size Wyatt actually runs ---------------------
+			//
+			// BASE_PX_96 is 16, which is the broken side of the rounding. Two ADJACENT
+			// body rows, each with a link in column 1: a link rect's y locates that
+			// row's first visual line (markdown_links, the same producer sections 3
+			// and 4 of md_table_wrap_selftest read), and blocks tile with no collapsed
+			// gap between table rows -- so row 2's top minus row 1's top IS row 1's
+			// height. One table row tall means the cell did not wrap; two means it did.
+			//
+			// The MINIMUM y per link, because with the bug present the link cell itself
+			// breaks between characters and contributes a rect per visual line.
+			{
+				px_ := BASE_PX_96
+				m := md_metrics(&h.text, px_)
+				lsrc := "| h1 | h2 |\n|---|---|\n| " + CELL0 + " | [r1](https://e.test/r1) |\n| " + CELL1 + " | [r2](https://e.test/r2) |\n"
+				content := make([]u8, len(lsrc))
+				copy(content, lsrc)
+				doc := doc_from_content(content, "fitlinks.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+				r1_y, r2_y := f32(1e9), f32(1e9)
+				for hit in hits {
+					if strings.has_suffix(hit.url, "/r1") {r1_y = min(r1_y, hit.rect.pos.y)}
+					if strings.has_suffix(hit.url, "/r2") {r2_y = min(r2_y, hit.rect.pos.y)}
+				}
+				trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, line_height(m.table), .Doc, context.temp_allocator).line_h
+				located := r1_y < 1e9 && r2_y < 1e9 && r2_y > r1_y && trow > 0
+				fchk(&bad, located, fmt.tprintf("fit: both rows' links locate them (%.1f, %.1f; row %.1f)", r1_y, r2_y, trow))
+				if located {
+					fchk(
+						&bad, abs((r2_y - r1_y) - trow) <= 1,
+						fmt.tprintf("fit: at %.0fpx a table row whose cells are at their natural width is ONE line tall, not two (%.1f vs %.1f)", px_, r2_y - r1_y, trow),
+					)
+				}
+			}
+
+			// --- C. the control: a cell genuinely too long for its column STILL wraps.
+			//
+			// Without it, "make every column wider" satisfies A and B by never breaking
+			// anything -- which is the opposite defect, and the screenshot this batch
+			// started from (a table running off the pane).
+			//
+			// Asserted the same way B is, on the ROW HEIGHT taken from link rects, not
+			// on the fitted extent: a fitted extent inside the measure is compatible
+			// with columns 1.5x too wide (verified -- that sabotage leaves an extent
+			// check green, because MD_TABLE_MAX_CELLS clamps this fixture's 280-cell
+			// column long before the measure binds). The row being more than one line
+			// tall is not.
+			{
+				px_ := BASE_PX_96
+				m := md_metrics(&h.text, px_)
+				b := strings.builder_make(context.temp_allocator)
+				strings.write_string(&b, "| id | long |\n|:---|:---|\n| [c1](https://e.test/c1) | ")
+				for i in 0 ..< 40 {fmt.sbprintf(&b, "word%02d ", i)}
+				strings.write_string(&b, "|\n| [c2](https://e.test/c2) | z |\n")
+				content := make([]u8, len(strings.to_string(b)))
+				copy(content, strings.to_string(b))
+				doc := doc_from_content(content, "fitlong.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+				c1_y, c2_y := f32(1e9), f32(1e9)
+				for hit in hits {
+					if strings.has_suffix(hit.url, "/c1") {c1_y = min(c1_y, hit.rect.pos.y)}
+					if strings.has_suffix(hit.url, "/c2") {c2_y = min(c2_y, hit.rect.pos.y)}
+				}
+				trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, line_height(m.table), .Doc, context.temp_allocator).line_h
+				located := c1_y < 1e9 && c2_y < 1e9 && c2_y > c1_y && trow > 0
+				fchk(&bad, located, fmt.tprintf("fit: both rows of the long fixture locate them (%.1f, %.1f)", c1_y, c2_y))
+				if located {
+					fchk(
+						&bad, (c2_y - c1_y) > 2.5 * trow,
+						fmt.tprintf("fit: a cell far too long for its column STILL wraps -- the row is several lines tall (%.1f vs one row %.1f)", c2_y - c1_y, trow),
+					)
+				}
+			}
+			return
+		}
+
 		// The 2026-07-29 table task (design doc §2). Wyatt's screenshot: a wide
 		// markdown table in Preview with its rightmost column cut off by the pane
 		// edge, because md_layout_build's `case .Table` returned before the span
@@ -4929,7 +5110,12 @@ when NEWTPAD_TESTS {
 			ytop, ybot := f32(60), f32(650)
 			m := md_metrics(&h.text, px_)
 			cx, measure := md_content_span(&m, x0, x1)
-			char_w := plat.text_char_width(&h.text, m.table, .Doc)
+			// The SAME producer md_layout_build denominates its columns in
+			// (md_table_char_w). Was plat.text_char_width spelled out here, which is a
+			// second copy of the layout's choice -- and when that choice turned out to
+			// be the wrong pixel (md_table_fit_selftest) this copy would have quietly
+			// kept testing the old geometry.
+			char_w := md_table_char_w(&h.gfx, &h.text, &m)
 			// One table row's line height, from the same shaper the layout uses at the
 			// same face and size. A probe, not a second producer: if the layout stopped
 			// going through the shaper this would stop agreeing with it.
@@ -7577,6 +7763,7 @@ when NEWTPAD_TESTS {
 			bad += md_head_fit_selftest()
 			bad += md_partial_selftest()
 			bad += md_band_admit_selftest()
+			bad += md_table_fit_selftest()
 			bad += md_table_wrap_selftest()
 			bad += md_metrics_selftest()
 			bad += md_seam_selftest()

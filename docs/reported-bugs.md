@@ -8,26 +8,46 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
-## The preview does not always respect spaces
+## "The preview does not always respect spaces" — one defect fixed, needs Wyatt's confirmation
 
-**Reported 2026-07-29** with a side-by-side screenshot of the editor and the preview. Wyatt: *"it looks
-like it's not respecting the spaces all the time."*
+**Reported 2026-07-29** with a side-by-side screenshot of the editor and the preview: *"it looks like it's
+not respecting the spaces all the time."* **A defect matching that description was found and fixed**
+(table columns were fitted at `text_char_width`'s whole-pixel grid cell while the cells were shaped at
+the font's real advance, so at the default 16px size every table cell at its natural width broke at its
+last space and dropped the last word onto a second line — `md_table_char_w`, `md_table_fit_selftest`).
 
-**Needs reproduction before diagnosis** — the screenshot shows a markdown table and prose, and the
-statement could mean at least three different things:
+**Left here because it is not certain that is what he saw.** What was ruled out, with evidence, in case
+the report survives the fix:
 
-1. **Runs of consecutive spaces collapse in the preview.** That is what HTML/CommonMark actually
-   specifies, so it may be correct-but-unwanted rather than a defect. If that is what he means it is a
-   product decision, not a bug.
-2. **The shaper is losing or mis-measuring spaces.** `shape_spans` has deliberate space handling — a
-   space run moves the break point, trailing spaces at a break are allowed to hang past the measure, and
-   `ink` is recorded at the start of a space run. A bug in any of those shows up as wrong wrap points or
-   a missing gap between words. This is the one to check first, because it would be a real defect in new
-   code.
-3. **Leading indentation is not preserved** where markdown says it should be (a nested list, a code
-   block indented by four spaces — note the fence-indent rule changed in a recent batch).
+- **Runs of consecutive spaces do NOT collapse** — the preview draws every space with its own advance
+  (verified on rendered pixels: `AAAA    BBBB` keeps its four-space gap). It is *more* literal than
+  CommonMark here, not less.
+- **Leading indentation is preserved** — an indented paragraph line keeps its spaces, and nested list
+  items get their depth from the indent. It is drawn in proportional spaces, so it is visibly *narrower*
+  than the same indent in the monospace editor half, which may be what looked wrong.
+- **The shaper is not losing spaces** — every space in a block's classified content survives into the
+  spans and into the glyph stream (0 drops over the 144 blocks of `research/newtpad-research-report.md`
+  plus a 31-block fixture), and `shaped_draw` positions each glyph at the shaper's own `x`, so the draw
+  cannot collapse a run either.
 
-Ask him which, or find a fixture that shows it. Do not guess a fix.
+**If he still sees it, the remaining candidate is the line-per-block model:** every source line is its own
+`.Para` with a full `para_below` gap, so two adjacent prose lines look like two paragraphs and a blank
+line between them adds nothing (blank runs are zero height, margins collapse). CommonMark joins those
+lines into one paragraph with a space at the break. That is a design question, not a bug — ask before
+changing it.
+
+## An underscore inside a word opens emphasis, and is eaten
+
+**Found 2026-07-30** while reproducing the report above, in `research/newtpad-research-report.md` itself.
+The source says `(stb_sprintf aside)`; the preview draws `(stbsprintf aside)` **and italicises everything
+from there to the end of the block**. `md_inline` treats any `_` as an emphasis toggle, so a snake_case
+identifier in prose loses its underscore and flips the rest of the line into italics — every `_` after it
+toggles again, so the damage depends on how many the line has.
+
+CommonMark's rule is that `_` cannot open or close emphasis *inside* a word (left/right-flanking with the
+intraword exception); `*` can. Identifiers in prose are common in these docs, so this is worth fixing.
+`md_escapable` already covers the escaped case, so the fix is a flanking test at the two `_` branches,
+not new machinery.
 
 ## Ctrl+V with the filter bar open pastes into the document, not the filter
 
