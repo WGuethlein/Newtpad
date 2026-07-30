@@ -8774,6 +8774,173 @@ when NEWTPAD_TESTS {
 				return
 			}
 
+			// An open cell edit must never end up drawn over a row it will not
+			// write. doc.table_edit_row is a VISIBLE row index; doc.table_edit_s/e
+			// are ABSOLUTE byte offsets captured at edit start, so any scroll
+			// separates them: the highlight box and the caret stay on row N while
+			// a commit still splices the line that USED to be row N.
+			//
+			// Every scroll route is driven -- wheel, scrollbar drag, Page Up, Page
+			// Down, and a resize that takes the row off screen -- and the assertion
+			// is the SEAM, phrased so a future "keep the box tracking the bytes"
+			// fix would also pass it: either the edit committed to its original
+			// bytes, or it is still open AND still drawn on the line it will write.
+			// Never that it wrote somewhere else.
+			//
+			// Its own proc for the same stack-frame reason as tg_page.
+			tg_edit_anchor :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (edit-anchor check): no fonts loaded")
+					bad += 1
+					return
+				}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				BASE_PX = BASE_PX_96
+				px := BASE_PX_96
+				ER :: 6 // the data row edited: on screen at the start, off it after a page
+
+				// One document per route: a commit rewrites the buffer, so a shared
+				// fixture would have each route judging the previous one's damage.
+				Route :: enum {
+					Wheel,
+					Scrollbar,
+					Page_Down,
+					Page_Up,
+					Resize,
+				}
+				run :: proc(bad: ^int, t: ^plat.Text, px: f32, route: Route, ER: int) {
+					lines: [dynamic]string
+					defer delete(lines)
+					append(&lines, "h0,h1")
+					for i in 0 ..< 40 {append(&lines, fmt.aprintf("a%d,b%d", i, i))}
+					defer for i in 1 ..< len(lines) {delete(lines[i])}
+					total := 0
+					for l in lines {total += len(l) + 1}
+					content := make([]u8, total) // doc_close owns it (owned_orig)
+					{
+						o := 0
+						for l in lines {
+							copy(content[o:], transmute([]u8)l)
+							content[o + len(l)] = '\n'
+							o += len(l) + 1
+						}
+					}
+					a: App
+					a.settings = settings_default()
+					dummy: plat.Window
+					d := new(Document)
+					d^ = doc_from_content(content, "anchor.csv", .UTF8)
+					d.table, d.table_delim = true, ','
+					app_activate(&a, app_add(&a, d))
+					defer app_destroy(&a)
+					doc_update_top_inset(d)
+					// What table_draw's first frame does: the hit-tests refuse
+					// without the width sample and the column count.
+					table_compute_widths(d, t)
+					d.table_cols = len(d.table_widths)
+
+					ROWS :: 12
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					trows := table_visible_rows(d, H, px)
+					if trows != ROWS || ER >= trows {
+						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
+						return
+					}
+
+					// Start on a scrolled view for Page_Up, so the route actually
+					// moves. Every other route starts at the top.
+					if route == .Page_Up {
+						if s, sok := table_data_start(d); sok {d.top = s}
+						doc_scroll(d, t, 20, trows)
+					}
+
+					// The cell: data row ER, column 0. Resolved through the same
+					// hit-test path the click uses, so the span is the one a real
+					// edit would capture.
+					ok, r, col, fs, fe, val := table_cell_at_index(d, ER, 0, trows)
+					if !ok {
+						chk(bad, false, fmt.tprintf("%v: could not resolve the cell at row %d", route, ER))
+						return
+					}
+					// The line under the box BEFORE the scroll, read off the document
+					// rather than rebuilt from ER: with a scrolled start (Page_Up)
+					// visible row ER is not data row ER, and a `want` string built
+					// from the index would name a line the edit never touched.
+					home_line, _ := table_row_start(d, ER)
+					home_before := ""
+					{
+						before_text := doc_debug_string(d)
+						defer delete(before_text)
+						e := base.pt_line_end_cap(&d.pt, home_line, RENDER_LINE_CAP)
+						home_before = strings.clone(before_text[home_line:e], context.temp_allocator)
+					}
+					table_edit_start(d, r, col, fs, fe, val)
+					table_edit_rune(d, 'Z')
+					home_text := fmt.tprintf("%sZ", val)
+
+					switch route {
+					case .Wheel:
+						// main.odin's wheel arm, in its own order: it commits first
+						// ("rows shift underfoot") and normalises doc.top through
+						// table_data_start on both sides of the scroll.
+						if d.table_editing {table_edit_commit(d)}
+						if s, sok := table_data_start(d); sok {d.top = s}
+						doc_scroll(d, t, 5, trows)
+						if s, sok := table_data_start(d); sok {d.top = s}
+					case .Scrollbar:
+						// vbar_drag_to's whole body once b.shown is known.
+						doc_scroll_to_fraction(d, t, 0.5, trows)
+					case .Page_Down:
+						command_dispatch(.Page_Down, {}, &a, &dummy, t, trows)
+					case .Page_Up:
+						command_dispatch(.Page_Up, {}, &a, &dummy, t, trows)
+					case .Resize:
+						// doc.top does not move; the window does. The row budget
+						// the frame passes shrinks below the edited row.
+						trows = ER
+					}
+					table_edit_hold(d, trows)
+
+					// The seam. Independent of table_edit_anchored (the fix's own
+					// predicate): the drawn row's line start is walked here, and the
+					// line a commit would write is derived from the captured span.
+					drawn_line, dok := table_row_start(d, d.table_edit_row)
+					write_line, wexact := base.pt_line_start_cap(&d.pt, d.table_edit_s, RENDER_LINE_CAP)
+					seam := !d.table_editing || (dok && wexact && drawn_line == write_line && d.table_edit_row < trows)
+					chk(bad, seam, fmt.tprintf("%v: the box is never drawn on a row it will not write (editing=%v drawn=%d write=%d)", route, d.table_editing, drawn_line, write_line))
+
+					// ...and the data. The typed value must be on the ORIGINAL line
+					// and nowhere else. `count` rather than `contains`: a write to
+					// the wrong row would leave the marker present exactly once too,
+					// so only its POSITION distinguishes the two outcomes.
+					doc_text := doc_debug_string(d)
+					defer delete(doc_text)
+					got := ""
+					{
+						e := base.pt_line_end_cap(&d.pt, home_line, RENDER_LINE_CAP)
+						got = doc_text[home_line:e]
+					}
+					// The line it started as, with the typed byte appended to field 0
+					// -- derived from what was actually there, not from ER.
+					want := fmt.tprintf("%s%s", home_text, home_before[len(val):])
+					chk(bad, got == want, fmt.tprintf("%v: the edit landed on its own line (%q, want %q)", route, got, want))
+					chk(bad, strings.count(doc_text, home_text) == 1, fmt.tprintf("%v: %q appears exactly once in the file (%d)", route, home_text, strings.count(doc_text, home_text)))
+					chk(bad, len(doc_text) == total + 1, fmt.tprintf("%v: the file grew by exactly the typed byte (%d, want %d)", route, len(doc_text), total + 1))
+				}
+				for route in Route {run(&bad, &t, px, route, ER)}
+				return
+			}
+
 			// F3: §10's appearance -- the header fill, the rule's colour AND
 			// thickness, and the zebra's parity -- asserted on PIXELS from a real
 			// device, not a source count. A source count can only prove a colour
@@ -8911,6 +9078,7 @@ when NEWTPAD_TESTS {
 
 			bad := tg()
 			bad += tg_page()
+			bad += tg_edit_anchor()
 			bad += tg_appearance()
 			fmt.printfln("tablegridtest: %d failures", bad)
 			return true

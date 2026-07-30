@@ -679,9 +679,69 @@ table_edit_start :: proc(doc: ^Document, r, col, fs, fe: int, val: string) {
 	doc.table_edit_col = col
 	doc.table_edit_s = fs
 	doc.table_edit_e = fe
+	// Through table_row_start, the same producer table_field_at derived fs from,
+	// so the anchor is the line [fs,fe) lies on by construction rather than by
+	// two walks agreeing. Recorded here because this is the only place an edit
+	// begins; table_edit_anchored below is the only place it is read.
+	doc.table_edit_line, _ = table_row_start(doc, r)
 	clear(&doc.table_edit_buf)
 	append(&doc.table_edit_buf, ..transmute([]u8)val)
 	doc.table_edit_caret = len(doc.table_edit_buf)
+}
+
+// Is the open cell edit still ON the cell it was started on?
+//
+// THE SEAM, stated as a predicate. doc.table_edit_row is a VISIBLE row index and
+// doc.table_edit_s/e are ABSOLUTE byte offsets captured at edit start, so the two
+// only agree while the view has not moved. Scroll the grid and the highlight box,
+// the caret and the drawn buffer all stay at table_row_rect_y(px, table_edit_row)
+// over whatever line is now that row, while a commit still splices at [s,e) --
+// a write to a row the user is not looking at.
+//
+// commands.odin:939 already reasoned this through for BUFFER writes invalidating
+// a captured span (the line-ending rewrite, undo, history jump, find/replace).
+// This is the same shape one level out: the span stays valid, its ON-SCREEN
+// IDENTITY does not. It was never covered, and batch 18's sort will make it
+// strictly worse -- a sort moves every line under a live edit without touching
+// doc.top at all, and the row-start compare below catches that too.
+//
+// Both halves are the same question asked of the two spaces:
+//
+//   rows  -- the row must still EXIST on screen. Shrinking the window past the
+//            edited row stops the box being drawn (table_draw's `er < len(vis)`)
+//            while doc.table_editing stays true, so keystrokes keep accumulating
+//            into a buffer nothing shows and a later Enter still commits it.
+//   line  -- the row must still name the SAME line. This is the scroll case, and
+//            the compare is against table_row_start rather than against doc.top
+//            because table_data_start normalises doc.top (the header is sticky
+//            and owns line 0), so two different doc.top values can be the same
+//            scroll position and must not read as a move.
+table_edit_anchored :: proc(doc: ^Document, rows: int) -> bool {
+	if doc == nil || !doc.table_editing {return false}
+	if doc.table_edit_row < 0 || doc.table_edit_row >= rows {return false}
+	p, ok := table_row_start(doc, doc.table_edit_row)
+	return ok && p == doc.table_edit_line
+}
+
+// Commit an edit that has stopped sitting on its own cell -- the single guard,
+// called once per frame from the update phase (main.odin) after every path that
+// could have moved the view and before the draw reads any of it.
+//
+// COMMIT, not cancel, and that is a decision. The wheel has committed since the
+// grid shipped ("rows shift underfoot", main.odin) and leave_table_view commits
+// too, so the user's typing has always survived a scroll on the one route that
+// handled this at all; making the other routes cancel instead would mean the
+// same keystrokes are kept or thrown away depending on WHICH scroll gesture was
+// used. The commit goes to [table_edit_s, table_edit_e) -- the bytes the edit
+// was started on -- which is the cell the user was looking at when they typed.
+//
+// One guard rather than a commit bolted onto each scroll path: the wheel, the
+// scrollbar drag, Page Up/Down, Ctrl+Home/End, a find jump, a session restore
+// and a resize are seven routes and only two of them had it. A per-route commit
+// is seven chances to miss the eighth.
+table_edit_hold :: proc(doc: ^Document, rows: int) {
+	if doc == nil || !doc.table_editing {return}
+	if !table_edit_anchored(doc, rows) {table_edit_commit(doc)}
 }
 
 table_edit_rune :: proc(doc: ^Document, rn: rune) {

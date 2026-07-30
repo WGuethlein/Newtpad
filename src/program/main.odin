@@ -1027,6 +1027,22 @@ main :: proc() {
 			doc_ensure_cursor_visible(doc, &text, rows, drawn)
 		}
 
+		// An open cell edit that has stopped sitting on its own cell commits, at
+		// ONE point, after every path above that could have moved the view and
+		// before the draw reads doc.table_edit_row. See table_edit_hold: the wheel
+		// committed here already (and still does, inline, because it renormalises
+		// doc.top twice around its own scroll), but the scrollbar drag, the page
+		// keys and a window resize did not -- the box and the caret stayed drawn
+		// on a row that no longer held the bytes a commit would write.
+		//
+		// `trows`, the grid's own row budget, not `rows`: the resize half of the
+		// check asks whether the edited row still fits under the sticky header,
+		// which is exactly what table_visible_rows counts.
+		//
+		// Ahead of the title block below on purpose, so the dirty star appears on
+		// the frame the commit happens rather than the one after it.
+		if doc.table && doc.kind == .Text {table_edit_hold(doc, trows)}
+
 		// Window title = [*]filename - Newtpad, set only when it changes.
 		{
 			@(static) last: [512]u8

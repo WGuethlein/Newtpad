@@ -1044,6 +1044,15 @@ Document :: struct {
 	table_edit_col:    int,
 	table_edit_buf:    [dynamic]u8,
 	table_edit_caret:  int, // byte offset within table_edit_buf
+	// The byte offset of the LINE table_edit_row named when the edit began. The
+	// two coordinates above are in different spaces -- table_edit_row is a
+	// VISIBLE row index and table_edit_s/e are ABSOLUTE byte offsets -- so a
+	// scroll silently breaks the correspondence between them: the box and the
+	// caret stay drawn at row N while [s,e) still names the line that USED to be
+	// row N, and Enter then writes into a row the user is not looking at.
+	// table_edit_anchored (table.odin) is the one check that keeps them together,
+	// and this is what it compares against.
+	table_edit_line:   int,
 	// Markdown view (see markdown.odin): Off / Preview (full) / Split (editor +
 	// live preview).
 	md_mode:     Md_Mode,
