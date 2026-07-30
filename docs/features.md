@@ -46,9 +46,10 @@ the end is complete by construction.
   already-running window rather than starting a second process — the file lands as a new tab and the
   existing window is focused. `newtpad --version` prints the version and exits.
 - **A bare launch** gives you an empty scratch buffer (or your restored session).
-- **One portable exe, on the order of 1 MB.** No install required and nothing to ship beside it (the
-  only runtime dependencies are DLLs Windows already has). An optional Inno Setup installer exists
-  (`installer/newtpad.iss`) — per-user, HKCU and `%LOCALAPPDATA%` only, no elevation.
+- **One portable exe, 1.21 MB** (1,271,808 bytes, measured at v0.33.0 from a clean `build.bat release`).
+  No install required and nothing to ship beside it — the only runtime dependencies are DLLs Windows
+  already has. Well inside the ~2–3 MB the product principles set. An optional Inno Setup installer
+  exists (`installer/newtpad.iss`) — per-user, HKCU and `%LOCALAPPDATA%` only, no elevation.
   *Not verified:* the installer has never been compiled or run.
 
 ### External changes
