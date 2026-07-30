@@ -1614,6 +1614,25 @@ md_draw_links :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, hits: []Md_Link_H
 // preview's glyphs do not sit on the cell grid those two describe, and asking
 // them would be the "correct function fed the wrong input" bug this project has
 // sixteen recorded instances of.
+//
+// NOT bounded to the pane box (2026-07-29 review, F2, correcting an earlier
+// wrong justification: md_pane_box's ybot IS doc_content_box's bot -- exactly
+// where the cover strip starts -- and the strip paints in the SAME frame
+// before any chrome, so there is no window of frames in which an admitted
+// line's own glyphs paint over the tab rail or the status bar; F1's per-line
+// admission already keeps every admitted rect inside [ytop, ybot]). The real,
+// reachable hazard is `forced` (md_block_admit): the pane's FIRST block, if it
+// is one of the kinds md_kind_lines calls indivisible (a fence's open/close
+// strip, front matter, a table row), is admitted `whole` even when it does not
+// fit -- ad.whole = lines >= n with n == 1, unconditionally -- so its
+// `ad.h == lay.h` can run well past ybot. Its link rects (md_block_links,
+// gated on `b.line >= ad.lines`, not on y) go with it. The GLYPHS are cut off
+// by the cover strip below ybot same as any overflow, but neither call site of
+// THIS proc (main.odin's hover cursor and Ctrl+click) applies a y bound, so a
+// forced, oversized block's link rects stay clickable -- invisible, but live
+// -- as far down as lay.h reaches, which can be past the status bar. Not fixed
+// here (out of this batch's scope); recorded so the next pass over this file
+// does not have to rediscover it.
 md_link_at :: proc(hits: []Md_Link_Hit, mx, my: f32) -> (Md_Link_Hit, bool) {
 	for h in hits {
 		r := h.rect
@@ -2723,8 +2742,10 @@ md_pass :: proc(
 	links: ^[dynamic]Md_Link_Hit,
 ) -> (
 	bottom: int,
+	shown:  int,
 ) {
 	bottom = at.block
+	shown = at.block
 	if doc == nil {return}
 	md_layout_pass += 1 // see md_layout_slot: this pass's entries are not evictable
 	m := md_metrics(text, px)
@@ -2759,6 +2780,7 @@ md_pass :: proc(
 		if !ok {break}
 		if p.above {
 			bottom = p.blk.end
+			shown = p.blk.end
 			continue
 		}
 		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, p.blk.lay, cx, x1, p.y, p.admit)}
@@ -2767,24 +2789,57 @@ md_pass :: proc(
 		// block reports its own start (i.e. leaves `bottom` where the previous block
 		// left it), because lines of it the reader has never seen are not behind
 		// them. The preview scrolls in PIXELS (Md_Anchor{block, px}), so the pixel
-		// anchor is what advances into a partial block; `bottom` is read only by
-		// md_vscrollbar_geo's thumb height, and a thumb sized as though a paragraph
-		// were fully read is the same lie in a smaller font.
-		if !p.admit.whole {break}
+		// anchor is what advances into a partial block. `bottom` has no consumer
+		// left in the product (2026-07-29 review, F1) -- it is kept because it is
+		// still the honest "last FINISHED block" answer and something may want that
+		// again -- but it is no longer what sizes the thumb.
+		//
+		// `shown` is that different input. It credits a partial block with the
+		// FRACTION of its own byte span its admitted lines cover, using
+		// `p.admit.h / p.blk.h` -- the identical fraction md_block_draw already used
+		// to decide how tall the Fence_Body / Quote band gets (see its comments),
+		// so the thumb's extra credit can never disagree with what was actually
+		// painted. Byte-proportional, not line-proportional, because md_vscrollbar_geo
+		// is byte-proportional throughout (its own header: measuring the document's
+		// HEIGHT would mean laying it out, which viewport-first forbids). A block
+		// that is refused outright (p.admit.h == 0, e.g. `forced` pinned it to one
+		// line that still does not fit) contributes 0 of its span, same as before.
+		if !p.admit.whole {
+			frac := p.admit.h / max(1, p.blk.h)
+			shown = p.blk.start + int(f32(p.blk.end - p.blk.start) * clamp(frac, 0, 1))
+			break
+		}
 		bottom = p.blk.end
+		shown = p.blk.end
 	}
 	return
 }
 
 // Render markdown source from `at`, laid out in [x0,x1] x [ytop,ybot].
-// Returns the byte offset just past the last line drawn (for scroll clamping).
+//
+// Returns the byte offset just past the last FINISHED block -- NOT "for scroll
+// clamping" (the preview's clamp is md_scroll_clamp -> md_max_anchor, which
+// reads neither this nor any admit decision) and not "the last line drawn"
+// (a partially admitted block's lines ARE drawn and this does not advance past
+// them). Corrected 2026-07-29 review, F5: both halves of the old sentence were
+// false, and the false "for scroll clamping" half is what produced F1's wrong
+// premise that this value was safe to feed the thumb.
+//
+// `shown`, an optional out-param, is the DIFFERENT input the thumb actually
+// needs: the byte extent the pane put on screen, crediting a partially
+// admitted block with the fraction of its own span its admitted lines cover
+// instead of stopping dead at its start. See md_pass for why `bottom` itself
+// is kept rather than repurposed.
 //
 // A partially-scrolled anchor block draws ABOVE ytop -- that is what a pixel
 // offset is -- and there is no scissor rect in this renderer, so the caller owes
 // this pane a cover strip over [0, ytop) exactly as it already owes one below
 // ybot. md_preview_clip is that strip.
-markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px: f32, x0, x1, ytop, ybot: f32, at: Md_Anchor) -> (bottom: int) {
-	return md_pass(gfx, qp, text, doc, px, x0, x1, ytop, ybot, at, nil)
+markdown_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px: f32, x0, x1, ytop, ybot: f32, at: Md_Anchor, shown: ^int = nil) -> (bottom: int) {
+	s: int
+	bottom, s = md_pass(gfx, qp, text, doc, px, x0, x1, ytop, ybot, at, nil)
+	if shown != nil {shown^ = s}
+	return
 }
 
 // The links the preview would draw, in absolute client coordinates. The same
@@ -3237,9 +3292,13 @@ md_block_at_y :: proc(c: ^Md_Scroll_Ctx, a: Md_Anchor, y: f32) -> (start: int, o
 	// of the three "gate:" cases that read as pane-bound checks, only the FIND BAR
 	// is actually refused by this line. The status bar and the empty strip below
 	// the last drawn block are both inside or below the pane's rows and are
-	// refused by the fit test further down instead. Deleting this line therefore
-	// costs exactly one case -- which is one more than zero, which is why it stays
-	// here while the duplicate went.
+	// refused by the PLACEMENT further down instead (2026-07-29 review, F5:
+	// there is no "fit test" left to refuse them -- md_place_next's admit
+	// decision does, via the `rel >= last.blk...admit.h` bound just past the
+	// binary search below; its twin in main.odin, md_split_click_gate, already
+	// says it this way). Deleting this line therefore costs exactly one case --
+	// which is one more than zero, which is why it stays here while the
+	// duplicate went.
 	if y < c.ytop || y >= c.ytop + c.pane {return}
 	out := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
 	n, idx := md_anchor_walk(c, a.block, a.px + c.pane, out)
@@ -3332,6 +3391,25 @@ md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, ad: Md_Ad
 @(private = "file")
 md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32, ad: Md_Admit) {
 	x := md_block_origin(lay, cx)
+	// PAIRING GUARD (2026-07-29 review, F4). The kinds that `return` inside the
+	// switch below must be EXACTLY the kinds md_kind_lines calls indivisible, and
+	// the kinds that fall through to shaped_draw (below the switch) must be
+	// exactly the ones it calls divisible -- two hand-written expressions of the
+	// same fact, and until now nothing checked they agreed. `reached_shaped` is
+	// set true at the one place shaped_draw is actually called; the deferred
+	// check fires for EVERY block this proc ever draws, so a kind added to one
+	// side without the other panics the first time that kind is painted, rather
+	// than silently reducing `shaped_draw`'s `lines` to 1 and dropping every
+	// visual line but the first (see F4: the very next task shapes table cells,
+	// which turns `.Table` from an early return into a fall-through, and this is
+	// what stops `.Table` landing on only one side of the pairing).
+	reached_shaped := false
+	defer if reached_shaped != md_kind_lines(lay.cls.kind) {
+		fmt.panicf(
+			"md_block_draw: kind %v reaches shaped_draw=%v but md_kind_lines says divisible=%v -- add/remove it on BOTH sides (see F4)",
+			lay.cls.kind, reached_shaped, md_kind_lines(lay.cls.kind),
+		)
+	}
 	// The kinds that return inside this switch are the ones md_kind_lines calls
 	// indivisible, so md_block_lines is 1 for them, so an admitted one is always
 	// `whole` and ad.h == lay.h. They keep reading lay.h: it says "the block's own
@@ -3429,6 +3507,7 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	}
 	colors := make([][4]f32, len(lay.spans), context.temp_allocator)
 	for s, i in lay.spans {colors[i] = s.color}
+	reached_shaped = true // the pairing guard's flag -- see the defer above
 	plat.shaped_draw(gfx, text, &lay.sh, lay.shape, x, ytop, g_theme[.Text_Primary], colors, ad.lines)
 	// Synthetic emphasis, only where a real face is missing. With Georgia loaded
 	// this never runs; on a machine whose body family ships no bold it is what

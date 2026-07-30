@@ -4293,6 +4293,14 @@ when NEWTPAD_TESTS {
 			worst_over, worst_over_yb := f32(0), -1
 			pix_hole_yb, pix_over_yb, pix_over_top := -1, -1, -1
 			seam_yb, ghost_yb := -1, -1
+			// F3 (2026-07-29 review): the forward-seam row above hit-tests RECT
+			// MIDPOINTS, so it only touches a pixel near ybot on the heights where a
+			// line happens to land flush with the edge -- measured, 6 of 280. It is
+			// not a test of "the seam covers the pane's bottom edge" even though the
+			// old report claimed it was. This is that test: `md_block_at_y` asked
+			// directly for the row AT the edge, every sweep step, not incidentally.
+			edge_wrong, edge_wrong_yb := 0, -1
+			flush_n, flush_bad, flush_bad_yb := 0, 0, -1
 			swept := 0
 			for yb := lo; yb <= hi; yb += 1 {
 				ybot := f32(yb)
@@ -4357,6 +4365,35 @@ when NEWTPAD_TESTS {
 							if ghost_yb < 0 {ghost_yb = yb}
 						}
 					}
+
+					// 4b. THE BOTTOM-EDGE SEAM (F3). The row directly AT the pane's
+					// bottom edge, asked for on its own terms rather than inferred from
+					// wherever a rectangle's midpoint happened to land. Two things:
+					// this row must never resolve BACKWARD, to a block before the
+					// paragraph (edge_wrong) -- once past the paragraph's own content a
+					// WHOLE block's trailing blank/EOF entry is a legitimate answer
+					// (the same "collapsed margin resolves to the zero-height Blank
+					// block" behaviour §8.2 of this task's own report calls "arguably
+					// correct"), so this only catches the genuinely wrong direction --
+					// and on the heights where the drawn content really is flush with
+					// ybot (within half a pixel -- "the seam sits at the pane's bottom
+					// edge", the design's own claim), it must resolve to the paragraph
+					// EXACTLY (flush_bad). `flush_n > 0` is what proves the second check
+					// is not vacuous: the sweep must actually produce at least one
+					// flush height for "never wrong when flush" to mean anything.
+					edge_y := ybot - 0.5
+					got_e, ok_e := md_block_at_y(&c, Md_Anchor{}, edge_y)
+					if ok_e && got_e < para_start {
+						edge_wrong += 1
+						if edge_wrong_yb < 0 {edge_wrong_yb = yb}
+					}
+					if abs(ybot - last_bot) <= 0.5 {
+						flush_n += 1
+						if !(ok_e && got_e == para_start) {
+							flush_bad += 1
+							if flush_bad_yb < 0 {flush_bad_yb = yb}
+						}
+					}
 				}
 
 				// 5. The same two properties in PIXELS, because 2 and 3 are claims
@@ -4409,6 +4446,14 @@ when NEWTPAD_TESTS {
 			)
 			pchk(&bad, seam == 0, fmt.tprintf("partial: every drawn line hit-tests back to its own block (%d wrong, first at ybot=%d)", seam, seam_yb))
 			pchk(&bad, ghost == 0, fmt.tprintf("partial: ...and a row below the last line drawn names nothing (%d wrong, first at ybot=%d)", ghost, ghost_yb))
+			// F3: the bottom-edge pixel itself, not a rect midpoint that happens to
+			// be nearby. `flush_n` proves the sweep produced real flush heights (a
+			// zero here would make `flush_bad == 0` vacuous); `flush_bad` is the
+			// design's own claim -- "the seam sits at the pane's bottom edge" --
+			// asked of the one row that actually IS the bottom edge.
+			pchk(&bad, edge_wrong == 0, fmt.tprintf("partial: the bottom-edge pixel never names the WRONG block (%d wrong, first at ybot=%d)", edge_wrong, edge_wrong_yb))
+			pchk(&bad, flush_n > 0, fmt.tprintf("partial: ...and the sweep really does land flush with ybot somewhere (%d of %d ybots)", flush_n, swept))
+			pchk(&bad, flush_bad == 0, fmt.tprintf("partial: ...and when flush, the edge pixel names the block that IS there (%d wrong of %d flush, first at ybot=%d)", flush_bad, flush_n, flush_bad_yb))
 			pchk(&bad, pix_over == 0, fmt.tprintf("partial: PIXELS -- nothing is inked at or below ybot (%d ybots, first ybot=%d topmost y=%d)", pix_over, pix_over_yb, pix_over_top))
 			pchk(
 				&bad, pix_hole == 0,
@@ -4435,11 +4480,22 @@ when NEWTPAD_TESTS {
 				c.pane = sybot - c.ytop
 				pchk(&bad, cok, "partial: the scroll context resolves for the short pane")
 				seen := make([]bool, 90, context.temp_allocator)
+				// THE THUMB (2026-07-29 review, F1). markdown_draw's `bottom` return
+				// stops at a partial block's START, so feeding it to md_vscrollbar_geo
+				// pins the thumb at its 24px floor for every step this loop takes while
+				// the paragraph is still partly drawn, then snaps to near-full the
+				// instant it clears -- a bigger lie than whole-block admission told, and
+				// a visible pop. `shown`, the out-param, is the fix: it credits a
+				// partial block with the fraction of its own byte span the admitted
+				// lines cover, so it has to track this wheel step for step.
+				thumbs := make([dynamic]f32, 0, 16, context.temp_allocator)
+				track_h := f32(0)
 				a := Md_Anchor{}
 				steps, at_top := 0, 0
 				for steps = 0; steps < 400; steps += 1 {
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, c.ytop, sybot, a)
+					step_shown: int
+					markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, c.ytop, sybot, a, &step_shown)
 					hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, c.ytop, sybot, a, context.temp_allocator)
 					if steps == 0 {at_top, _, _, _ = para_lines(hits)}
 					for hit in hits {
@@ -4448,6 +4504,13 @@ when NEWTPAD_TESTS {
 						w := int(t[0] - '0') * 100 + int(t[1] - '0') * 10 + int(t[2] - '0')
 						if w >= 0 && w < 90 {seen[w] = true}
 					}
+					// The thumb this frame would actually draw: doc.md_top is the
+					// producer md_vscrollbar_geo reads (main.odin), set here exactly as
+					// md_preview_scroll sets it after every real wheel step.
+					doc.md_top = a
+					vb := md_vscrollbar_geo(&doc, 0, f32(H), step_shown, 0)
+					track_h = vb.track_h
+					append(&thumbs, vb.thumb_h)
 					nxt := md_scroll_clamp(&c, md_scroll_px(&c, a, line_h))
 					if nxt == a {break}
 					a = nxt
@@ -4464,9 +4527,62 @@ when NEWTPAD_TESTS {
 					fmt.tprintf("partial: the wheel's pane is genuinely too short for the paragraph (%d of %d lines at the top)", at_top, nlines),
 				)
 				pchk(&bad, steps > 2 && steps < 400, fmt.tprintf("partial: ...and the wheel reaches the ceiling in a bounded number of steps (%d)", steps))
+				// This assertion went unfailed across the original task's seven
+				// sabotages -- the sole evidence for md_max_anchor's ceiling still
+				// admitting a partial block's last line, argued rather than tested.
+				// Closed 2026-07-29: shrinking md_max_anchor's `rel` by 35px (just
+				// under one line-height) DOES fail it -- "6 of 90 words never drawn,
+				// first w084" -- and nothing else in the suite even blinks, which is
+				// the point: `miss == 0` is the only check that would have caught the
+				// ceiling coming up short. (The other candidate, md_line_bottom's
+				// last-line rule -- 2026-07-29 review sabotage 5 -- does NOT move
+				// this row: a plain paragraph has no trailing decoration, so lay.h
+				// already equals the shaper's own last-line bottom, and that
+				// sabotage's effect is confined to h1/h2's rule, caught instead by
+				// md_head_fit_selftest. Both were tried; only shrinking the ceiling
+				// reproduces here.)
 				pchk(
 					&bad, miss == 0,
 					fmt.tprintf("partial: scrolling a partly drawn paragraph reveals every one of its lines (%d of 90 words never drawn, first w%03d)", miss, first_miss),
+				)
+
+				// The floor is sx(24) (md_vscrollbar_geo's clamp). Landing on it for
+				// ONE step can be an honest small fraction; landing on it for TWO
+				// steps running, while the wheel is genuinely moving the anchor through
+				// the same partial block, is the pin the bug report measured (four
+				// consecutive 24.0s).
+				floor := sx(24)
+				pin_run, worst_pin_run := 0, 0
+				for th in thumbs {
+					if abs(th - floor) < 0.05 {
+						pin_run += 1
+						worst_pin_run = max(worst_pin_run, pin_run)
+					} else {
+						pin_run = 0
+					}
+				}
+				pchk(
+					&bad, worst_pin_run <= 1,
+					fmt.tprintf("partial: the thumb is never pinned at its floor across consecutive scroll steps (worst run %d of %d steps)", worst_pin_run, len(thumbs)),
+				)
+				// One wheel notch reveals roughly one more visual line of the block
+				// (the "exactly one MORE line per line-height" property the ybot sweep
+				// above already pins); the thumb's growth per step should track that
+				// same share of the block, not sit flat and then jump most of the
+				// track in one step. `line_share` is that fraction of the TRACK,
+				// scaled generously (block gaps and the final whole-block transition
+				// both add slop this is not trying to pin exactly).
+				para_bytes := f32(len(src) - para_start)
+				line_share := (para_bytes / f32(nlines)) / f32(doc.pt.length) * track_h
+				step_bound := line_share * 3 + sx(2)
+				worst_step, worst_step_i := f32(0), -1
+				for i in 1 ..< len(thumbs) {
+					d := abs(thumbs[i] - thumbs[i - 1])
+					if d > worst_step {worst_step, worst_step_i = d, i}
+				}
+				pchk(
+					&bad, worst_step <= step_bound,
+					fmt.tprintf("partial: ...and grows by no more than one line's share of the track per step (worst %.1fpx at step %d, want <= %.1fpx)", worst_step, worst_step_i, step_bound),
 				)
 			}
 
@@ -4501,8 +4617,159 @@ when NEWTPAD_TESTS {
 				fn, _, _, _ := para_lines(fh)
 				pchk(&bad, fn == 1, fmt.tprintf("partial: a pane too short for one line still shows exactly ONE (%d lines)", fn))
 			}
+
+			// --- the F4 pairing guard, exercised from `mdtest` itself -------------
+			//
+			// mdtabletest never draws a REAL Table block through md_block_draw -- it
+			// is cell arithmetic against md_table_ensure only -- so nothing in the
+			// STANDARD suite drew a table through the shaped_draw/md_kind_lines
+			// pairing guard (markdown.odin, md_block_draw's `defer`) until this. A
+			// one-row table here is not testing table rendering; it is proving the
+			// guard does not fire for correct code, from the same `mdtest` gate the
+			// verification loop already runs on every change -- so a future change
+			// that puts `.Table` on only one side of the pairing (the exact landmine
+			// F4 describes: the next task shapes table cells) is caught here rather
+			// than only by the `mdperftest` extra, which is not part of that loop.
+			// A panic there aborts the whole process before this proc's `bad` count
+			// or mdtest's own summary line can print -- the loudest failure mode
+			// available, which is the point.
+			{
+				tsrc := "| a | b |\n|---|---|\n| c | d |\n"
+				tcontent := make([]u8, len(tsrc))
+				copy(tcontent, tsrc)
+				tdoc := doc_from_content(tcontent, "guardtable.md", .UTF8)
+				tdoc.md_mode = .Preview
+				defer doc_close(&tdoc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				tbottom := markdown_draw(&h.gfx, &h.quads, &h.text, &tdoc, px_, x0, x1, ytop, ybot_full, Md_Anchor{})
+				pchk(&bad, tbottom > 0, "partial: a table block draws (and does not trip the F4 shaped_draw pairing guard)")
+			}
 			return
 		}
+
+		// F2 (2026-07-29 review): the two `ad.h` band changes in md_block_draw --
+		// Fence_Body's background band and Quote's bars -- had NO fixture that
+		// could exercise them at all. md_partial_selftest's fixture is a bare
+		// paragraph, and a paragraph draws no band; every OTHER mdtest fixture
+		// that touches a fence or a quote is short enough to be admitted whole.
+		// Reverting BOTH `ad.h`s back to `lay.h` left the full regression suite
+		// (mdtest mdviewtest mdfencetest mdtabletest linktest rowbudgettest
+		// themetest) at 0 failures. This closes that gap: one over-long fenced
+		// line and one long blockquote, each admitted PARTIALLY, checked for the
+		// one thing `ad.h` exists to prevent -- a band is a QUAD painted from a
+		// SECOND, independent height, so nothing about per-line admission of
+		// GLYPHS (which F1's fixture already covers) bounds it on its own.
+		md_band_admit_selftest :: proc() -> (bad: int) {
+			pchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+			W, H :: 1000, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/band") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			px_ := f32(24)
+			bg := g_theme[.Bg_Base]
+
+			// The contiguous rows, inside [x0,x1), painted (approximately) `col` --
+			// a calibration of where a QUAD-drawn band lives on screen, independent
+			// of the shaper's line boxes (a fence/quote band is not one of those).
+			band_rows :: proc(pix: []u8, col: [4]f32, x0, x1: f32, W, H: int) -> (top, bot: int) {
+				top, bot = -1, -1
+				for yy in 0 ..< H {
+					found := false
+					for xx in clamp(int(x0), 0, W) ..< clamp(int(x1), 0, W) {
+						i := (yy * W + xx) * 4
+						d :=
+							abs(int(pix[i]) - int(col[2] * 255)) +
+							abs(int(pix[i + 1]) - int(col[1] * 255)) +
+							abs(int(pix[i + 2]) - int(col[0] * 255))
+						if d < 10 {
+							found = true
+							break
+						}
+					}
+					if found {
+						if top < 0 {top = yy}
+						bot = yy + 1
+					}
+				}
+				return
+			}
+			// Any row in [lo, H) inside [x0,x1) painted (approximately) `col`.
+			band_below :: proc(pix: []u8, col: [4]f32, lo: int, x0, x1: f32, W, H: int) -> bool {
+				t, b := band_rows(pix[:], col, x0, x1, W, H)
+				_ = t
+				return b > lo
+			}
+
+			// One fixture: a one-line lead (so the target block is not the anchor's
+			// waiver -- `forced` always draws SOMETHING of the first block, which
+			// would make a too-short pane vacuous rather than partial), then the
+			// target block, long enough to wrap several visual lines.
+			run :: proc(bad: ^int, h: ^Headless_Gpu, bg: [4]f32, px_: f32, name, src: string, col: Color_Role, W, H: int) {
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, name, .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				x0, x1, ytop, ybot_full, box_ok := md_pane_box(&doc, f32(W), f32(H), 0.5)
+				pchk(bad, box_ok, fmt.tprintf("band[%s]: the pane box resolves", name))
+				if !box_ok {return}
+
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				full_bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot_full, Md_Anchor{})
+				pchk(bad, full_bottom > 0, fmt.tprintf("band[%s]: the fixture fits and draws whole at full pane height", name))
+				pix_full, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				pchk(bad, pok, fmt.tprintf("band[%s]: the full-pane readback resolves", name))
+				if !pok {return}
+				bandcol := g_theme[col]
+				btop, bbot := band_rows(pix_full, bandcol, x0, x1, W, H)
+				pchk(bad, btop >= 0 && bbot - btop > 60, fmt.tprintf("band[%s]: the band itself is tall enough to cut through (%d..%d)", name, btop, bbot))
+				if btop < 0 || bbot - btop <= 60 {return}
+
+				// Sweep the middle of the band's own extent: ybot values that, by
+				// construction, cut through rows the FULL pane painted -- so the
+				// block was NOT admitted whole at this height, or nothing below is
+				// testing anything.
+				partial_seen, over := 0, 0
+				worst_yb := -1
+				steps := 8
+				for i in 1 ..< steps {
+					ybot := f32(btop) + f32(bbot - btop) * f32(i) / f32(steps)
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					bt := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+					if bt >= full_bottom {continue} // admitted whole at this height; not a partial sample
+					partial_seen += 1
+					pix, pok2 := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+					if !pok2 {continue}
+					if band_below(pix, bandcol, int(ybot) + 1, x0, x1, W, H) {
+						over += 1
+						if worst_yb < 0 {worst_yb = int(ybot)}
+					}
+				}
+				pchk(bad, partial_seen > 0, fmt.tprintf("band[%s]: the sweep really does admit the block partially (%d of %d ybots)", name, partial_seen, steps - 1))
+				pchk(bad, over == 0, fmt.tprintf("band[%s]: the band never paints below ybot while partial (%d of %d, first at ybot=%d)", name, over, partial_seen, worst_yb))
+			}
+
+			fence_src := "lead line\n\n```\n"
+			for i in 0 ..< 20 {fence_src = fmt.tprintf("%slet token_%02d = some_long_identifier_value_%02d; ", fence_src, i, i)}
+			fence_src = fmt.tprintf("%s\n```\n", fence_src)
+			run(&bad, &h, bg, px_, "fence.md", fence_src, .Md_Code_Bg, W, H)
+
+			quote_src := "lead line\n\n> "
+			for i in 0 ..< 40 {quote_src = fmt.tprintf("%sword%02d ", quote_src, i)}
+			quote_src = fmt.tprintf("%s\n", quote_src)
+			run(&bad, &h, bg, px_, "quote.md", quote_src, .Md_Quote, W, H)
+			return
+		}
+
 		// mdtest's TYPE-SCALE checks (UI spec 9.3).
 		//
 		// Pure arithmetic, and it is pinned exactly rather than approximately for
@@ -6696,6 +6963,7 @@ when NEWTPAD_TESTS {
 			bad += md_draw_selftest()
 			bad += md_head_fit_selftest()
 			bad += md_partial_selftest()
+			bad += md_band_admit_selftest()
 			bad += md_metrics_selftest()
 			bad += md_seam_selftest()
 			bad += md_cache_selftest()
@@ -8545,9 +8813,77 @@ when NEWTPAD_TESTS {
 				sh_chk(bad, g3ok, "an empty span in the middle changes nothing about the layout")
 				sh_chk(bad, abs(g3.height - ref.height) < 0.001, "...and does not drag the line box to its own (unused) size")
 			}
+			// F6 (2026-07-29 review): shaped_draw's `lines` default (-1, draw
+			// everything) and its `lines == 0` early return have no caller -- both
+			// product call sites (markdown.odin's md_block_draw) always pass
+			// `ad.lines` explicitly, and md_place_next never hands md_block_draw a
+			// block admitted zero lines (a refused block is never returned to the
+			// caller at all -- see md_place_next's header), so `lines == 0` is
+			// unreachable in the shipped product. Exercised here, directly on the
+			// entry point, rather than left silently unowned.
+			sh_draw :: proc(bad: ^int) {
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, 200, 120, "shapetest/draw") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return
+				}
+				defer headless_gpu_destroy(&h)
+				px := f32(20)
+				one_w := plat.shape_run(&h.gfx, &h.text, "aa", px, 100000, 0, .Body, context.temp_allocator).width
+				spans := [1]plat.Shape_Span{{"aa bb cc", px, .Body}}
+				// Narrow enough to force one word per line.
+				s := plat.shape_spans(&h.gfx, &h.text, spans[:], one_w + 1, 0, context.temp_allocator)
+				sh_chk(bad, s.lines >= 3, fmt.tprintf("shaped_draw: (precondition) the fixture wraps to several lines (%d)", s.lines))
+				if s.lines < 3 {return}
+
+				any_ink :: proc(pix: []u8, lo, hi: int, W, H: int) -> bool {
+					for yy in clamp(lo, 0, H) ..< clamp(hi, 0, H) {
+						for xx in 0 ..< W {
+							i := (yy * W + xx) * 4
+							if pix[i] > 8 || pix[i + 1] > 8 || pix[i + 2] > 8 {return true} // black bg
+						}
+					}
+					return false
+				}
+
+				W, H := int(h.window.width), int(h.window.height)
+				x0, y0 := f32(10), f32(10)
+				white := [4]f32{1, 1, 1, 1}
+
+				// The default: every line the run has, without a caller ever asking
+				// for `lines` by name.
+				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+				plat.shaped_draw(&h.gfx, &h.text, &s, spans[:], x0, y0, white)
+				pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				sh_chk(bad, pok, "shaped_draw: the readback resolves")
+				if pok {
+					all_lines := true
+					for l in 0 ..< s.lines {
+						lo := int(y0 + s.line_boxes[l].top)
+						hi := int(y0 + s.line_boxes[l].top + s.line_boxes[l].h)
+						if !any_ink(pix, lo, hi, W, H) {all_lines = false}
+					}
+					sh_chk(bad, all_lines, "shaped_draw: the default (lines omitted) draws every visual line, not just the first")
+				}
+
+				// `lines == 0`: unreachable from md_block_draw, but the early return
+				// is still product code and gets its own direct check rather than
+				// an assumption that a negative-length loop would do the same thing.
+				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+				plat.shaped_draw(&h.gfx, &h.text, &s, spans[:], x0, y0, white, nil, 0)
+				pix0, pok0 := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				sh_chk(bad, pok0, "shaped_draw: the lines=0 readback resolves")
+				if pok0 {
+					lo := int(y0)
+					hi := int(y0 + s.height) + 4
+					sh_chk(bad, !any_ink(pix0, lo, hi, W, H), "shaped_draw: lines=0 draws nothing at all")
+				}
+			}
+
 			bad := 0
 			sh_run(&bad)
 			sh_spans(&bad)
+			sh_draw(&bad)
 			fmt.printfln("shapetest: %d failures", bad)
 			return true
 		}

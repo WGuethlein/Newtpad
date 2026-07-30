@@ -478,6 +478,13 @@ shaped_draw :: proc(
 	lines: int = -1,
 ) {
 	if s == nil || len(s.glyphs) == 0 {return}
+	// 2026-07-29 review, F6: behaviourally redundant with the per-glyph filter
+	// below (`lines >= 0 && int(sg.line) >= lines`, which already skips every
+	// glyph when lines == 0 -- verified by sabotage: deleting this line changes
+	// nothing shapetest can observe). Kept as the fast path that skips building
+	// `instances` at all for a wholly-refused block, which is unreachable from
+	// md_block_draw today (see md_place_next) but would matter the moment a
+	// caller passes `lines == 0` for real.
 	if lines == 0 {return}
 	g_draw.text_calls += 1 // see draw_trace.odin
 	instances := make([dynamic]Text_Instance, 0, len(s.glyphs), context.temp_allocator)

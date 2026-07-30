@@ -1372,11 +1372,22 @@ vbar_drag_to :: proc(doc: ^Document, t: ^plat.Text, b: Vbar, my, grab: f32, rows
 // document's length, exactly as the editor's is. A pixel-proportional size would
 // need the document's total HEIGHT, and measuring that means laying the document
 // out, which is the one thing viewport-first forbids.
-md_vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int, frac: f32) -> (b: Vbar) {
+//
+// `shown_end` is markdown_draw's `shown` out-param, NOT its `bottom` return
+// (2026-07-29 review, F1). `bottom` only advances past a block the pane
+// FINISHED, so when the topmost visible block is taller than the pane --
+// one long paragraph, Split at half width or a larger font -- `bottom` sits at
+// `doc.md_top.block` for the entire scroll through it: `shown_end - doc.md_top.block`
+// is always 0, `clamp(0, sx(24), track)` pins the thumb at its 24px floor, and it
+// snaps to full height the instant the block clears the top edge. `shown_end`
+// instead credits a partial block with the fraction of its span actually put on
+// screen, so the thumb shrinks and grows with what is visible rather than
+// collapsing to a stub and popping.
+md_vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, shown_end: int, frac: f32) -> (b: Vbar) {
 	if doc == nil || doc.pt.length <= 0 {return}
 	b.x = x
 	b.track_y, b.track_h = scrollbar_track(doc, winh)
-	b.thumb_h = clamp(f32(bottom - doc.md_top.block) / f32(doc.pt.length) * b.track_h, sx(24), b.track_h)
+	b.thumb_h = clamp(f32(shown_end - doc.md_top.block) / f32(doc.pt.length) * b.track_h, sx(24), b.track_h)
 	b.thumb_y = clamp(b.track_y + frac * max(1, b.track_h - b.thumb_h), b.track_y, b.track_y + b.track_h - b.thumb_h)
 	b.shown = true
 	return
@@ -1438,13 +1449,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	cx, cy: f32
 	caret := false
 	bottom := doc.top
+	shown := doc.md_top.block // markdown_draw's out-param; feeds md_vscrollbar_geo's thumb, not bottom (F1)
 	if doc.kind == .Text && doc.md_mode == .Preview {
 		// Full-window rendered markdown (read-only) replaces the text pass.
 		// The pane box comes from md_pane_box, the SAME producer the link pass
 		// reads -- so what is clickable and what is drawn cannot be laid out in
 		// two different rectangles.
 		if mx0, mx1, mytop, mybot, mok := md_pane_box(doc, f32(window.width), f32(window.height), rc.app.settings.split_frac); mok {
-			bottom = markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top)
+			bottom = markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top, &shown)
 			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, f32(window.width), f32(window.height), rc.app.settings.split_frac))
 			}
@@ -1554,7 +1566,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			// edge is the PREVIEW's and maps the preview's own pixel range. It goes
 			// to g_vbar_preview, which is the latch the press hit-test reads for
 			// this mode (the editor branch there is disabled in Preview).
-			vb = md_vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom, md_preview_frac(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
+			vb = md_vscrollbar_geo(doc, er - SCROLLBAR_W, h, shown, md_preview_frac(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
 			g_vbar_preview = vb
 		} else {
 			vb = vscrollbar_geo(doc, er - SCROLLBAR_W, h, bottom, text, rows)
@@ -1625,13 +1637,14 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// md_content_span a negative span, which max(1, ..) turns into a 1px
 		// measure and a column of one glyph per line.
 		if mx0, mx1, mytop, mybot, mok := md_pane_box(doc, w, h, rc.app.settings.split_frac); mok {
-			pv_bottom := markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top)
+			pv_shown: int
+			markdown_draw(gfx, quad_pipe, text, doc, px, mx0, mx1, mytop, mybot, doc.md_top, &pv_shown)
 			if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 				md_draw_links(gfx, quad_pipe, md_preview_links(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
 			}
 			md_preview_clip(gfx, quad_pipe, doc, w, h, rc.app.settings.split_frac)
 			if total > 0 {
-				pvb := md_vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_bottom, md_preview_frac(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
+				pvb := md_vscrollbar_geo(doc, w - SCROLLBAR_W, h, pv_shown, md_preview_frac(gfx, text, doc, px, w, h, rc.app.settings.split_frac))
 				g_vbar_preview = pvb
 				plat.quads_draw(
 					gfx,
