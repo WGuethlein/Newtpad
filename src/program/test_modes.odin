@@ -4770,6 +4770,384 @@ when NEWTPAD_TESTS {
 			return
 		}
 
+		// The 2026-07-29 table task (design doc §2). Wyatt's screenshot: a wide
+		// markdown table in Preview with its rightmost column cut off by the pane
+		// edge, because md_layout_build's `case .Table` returned before the span
+		// section and so a table got no shaping, no measure and no idea the 72ch
+		// column existed.
+		//
+		// Why the checks below are the ones they are: mdtabletest asserts the CELL
+		// ARITHMETIC (md_table_measure's per-block widths, the oversize guards) and
+		// nothing about pixels, so every one of its assertions is satisfied by the
+		// reported bug. What the bug violated is the relationship between those
+		// widths and the pane, and between a row's height and its tallest cell --
+		// both of which only exist once something is placed on screen. So this drives
+		// markdown_draw / markdown_links through a real device and asserts on the
+		// output, plus the fit rule itself as pure arithmetic where it has no device
+		// to need.
+		md_table_wrap_selftest :: proc() -> (bad: int) {
+			tchk :: proc(bad: ^int, ok: bool, msg: string) {
+				fmt.printfln("  %-70s %s", msg, "OK" if ok else "FAIL")
+				if !ok {bad^ += 1}
+			}
+
+			// --- 1. the measure fit, as pure arithmetic ---------------------------
+			//
+			// md_table_fit_cells is the whole of the fit decision and takes no device,
+			// so it is driven directly. The invariant asserted on every case is the one
+			// the defect breaks: the fitted widths PLUS the gutters never exceed the
+			// cells the measure holds. The give-back is asserted separately, because
+			// "fits" alone is also satisfied by an implementation that just clamps
+			// every column to the same narrow width and throws away the natural
+			// measurement -- which would make a `| x |` column as wide as a prose one.
+			{
+				fit :: proc(natural: []int, avail: int) -> (out: [MD_TABLE_MAX_COLS]int, n, used: int) {
+					n = md_table_fit_cells(natural, avail, out[:])
+					for i in 0 ..< n {used += out[i]}
+					if n > 1 {used += (n - 1) * MD_TABLE_PAD}
+					return
+				}
+				// (a) Already narrower than the measure: the natural widths survive
+				// UNTOUCHED. This is the assertion that stops the fit from being a
+				// blunt clamp -- the common case must lay out exactly as it did before
+				// the fit existed.
+				{
+					nat := []int{3, 7, 27}
+					out, n, used := fit(nat, 72)
+					ok := n == 3 && out[0] == 3 && out[1] == 7 && out[2] == 27 && used <= 72
+					tchk(&bad, ok, fmt.tprintf("fit: a table that already fits keeps its natural widths (%v, %d of 72 cells)", out[:n], used))
+				}
+				// (b) Wider than the measure: it fits, the two small columns keep their
+				// natural width, and the greedy one absorbs the whole shortfall. The
+				// `out[2] < nat[2]` half is the non-vacuity guard -- without it the
+				// case passes on a fixture that never needed fitting.
+				{
+					nat := []int{3, 7, 200}
+					out, n, used := fit(nat, 40)
+					ok := n == 3 && used <= 40 && out[0] == 3 && out[1] == 7 && out[2] < nat[2] && out[2] == 40 - 2 * MD_TABLE_PAD - 10
+					tchk(&bad, ok, fmt.tprintf("fit: the over-wide column absorbs the shortfall and the small ones are given their width back (%v, %d of 40)", out[:n], used))
+				}
+				// (c) §10's upper clamp, reused: one enormous cell cannot claim the
+				// whole measure when its neighbours also want room. Both columns want
+				// more than half, so both land at the share -- and neither at 300.
+				{
+					nat := []int{300, 300}
+					out, n, used := fit(nat, 60)
+					ok := n == 2 && used <= 60 && out[0] <= MD_TABLE_MAX_CELLS && out[1] <= MD_TABLE_MAX_CELLS && out[0] == out[1]
+					tchk(&bad, ok, fmt.tprintf("fit: two greedy columns split the measure evenly, each under the 40-cell clamp (%v, %d of 60)", out[:n], used))
+				}
+				// (d) A SWEEP, because the three hand-picked cases above each pin one
+				// branch and none of them pins the arithmetic between the branches.
+				// Every combination must satisfy the one invariant; the count of cases
+				// that actually needed fitting is printed so a change that makes the
+				// sweep vacuous is visible.
+				{
+					over, tight := 0, 0
+					worst := ""
+					for ncols in 1 ..= 12 {
+						for wide in ([]int{1, 4, 12, 30, 120}) {
+							for avail in ([]int{8, 20, 40, 72, 200}) {
+								nat := make([]int, ncols, context.temp_allocator)
+								for i in 0 ..< ncols {nat[i] = 1 + (i % 3) * 5 + (wide if i == ncols - 1 else 0)}
+								out, n, used := fit(nat, avail)
+								natural_used := 0
+								for i in 0 ..< ncols {natural_used += nat[i]}
+								if ncols > 1 {natural_used += (ncols - 1) * MD_TABLE_PAD}
+								if natural_used > avail {tight += 1}
+								// n < ncols is a dropped column -- the last resort, and only
+								// legal when even one cell each could not fit.
+								if used > avail && !(n == 1 && avail < MD_TABLE_MIN_CELLS) {
+									over += 1
+									if worst == "" {worst = fmt.tprintf("ncols=%d wide=%d avail=%d -> %v (%d)", ncols, wide, avail, out[:n], used)}
+								}
+							}
+						}
+					}
+					tchk(&bad, tight > 0, fmt.tprintf("fit sweep: %d of 300 cases really do need fitting", tight))
+					tchk(&bad, over == 0, fmt.tprintf("fit sweep: no case exceeds its measure (%d bad; first: %s)", over, worst))
+				}
+				// (e) The oversized block (past MD_TABLE_BUDGET) keeps its FIXED
+				// columns and only has their COUNT bounded by the measure.
+				// md_table_measure's ncols there is MD_TABLE_MAX_COLS -- a deliberate
+				// over-estimate that scanned nothing -- so water-filling it would
+				// squeeze 32 imaginary columns into one character each and lose the real
+				// data that was in the first few. Still needs to fit the measure, which
+				// it did not before this task.
+				{
+					c := Md_Table_Cache {
+						valid    = true,
+						ncols    = MD_TABLE_MAX_COLS,
+						oversize = true,
+					}
+					for i in 0 ..< MD_TABLE_MAX_COLS {c.widths[i] = MD_TABLE_FIXED_CELLS}
+					cw := f32(10)
+					cols := md_table_cols(&c, 800, cw, context.temp_allocator)
+					ext := f32(0)
+					if len(cols) > 0 {ext = cols[len(cols) - 1].x + cols[len(cols) - 1].w}
+					ok := len(cols) > 0 && len(cols) < MD_TABLE_MAX_COLS && ext <= 800
+					for col in cols {
+						if col.w != f32(MD_TABLE_FIXED_CELLS) * cw {ok = false}
+					}
+					tchk(&bad, ok, fmt.tprintf("fit: an oversized block keeps 16-cell fixed columns and drops the count to %d, ending at %.0f of 800px", len(cols), ext))
+				}
+			}
+
+			// A pane wide enough that the 72ch measure BINDS inside it: x1 is 1400 but
+			// the measure is ~880, so "the table fits the measure" is a stronger claim
+			// than "the table fits the pane" and the region between the two is real
+			// screen the assertions below require to be empty. At the 900px pane every
+			// other md test uses, the two claims coincide and the 72ch cap is untested.
+			W, H :: 1500, 700
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdtest/table") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return 0
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			px_ := f32(24)
+			bg := g_theme[.Bg_Base]
+			x0, x1 := f32(40), f32(1400)
+			ytop, ybot := f32(60), f32(650)
+			m := md_metrics(&h.text, px_)
+			cx, measure := md_content_span(&m, x0, x1)
+			char_w := plat.text_char_width(&h.text, m.table, .Doc)
+			// One table row's line height, from the same shaper the layout uses at the
+			// same face and size. A probe, not a second producer: if the layout stopped
+			// going through the shaper this would stop agreeing with it.
+			trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, line_height(m.table), .Doc, context.temp_allocator).line_h
+			tchk(&bad, measure < x1 - cx - 100, fmt.tprintf("pane: the 72ch measure binds well inside the pane (measure %.0f, pane %.0f)", measure, x1 - cx))
+			tchk(&bad, char_w > 0 && trow > 0, fmt.tprintf("pane: the table face resolves (char_w %.2f, row %.1f)", char_w, trow))
+
+			mkdoc :: proc(src, name: string) -> Document {
+				content := make([]u8, len(src))
+				copy(content, src)
+				d := doc_from_content(content, name, .UTF8)
+				d.md_mode = .Preview
+				return d
+			}
+			// Any pixel in [xlo, xhi) x [ylo, yhi) that is not the page background.
+			// Returns the ink's own extent, so one scan answers both "is there ink out
+			// there" and "where does the ink end".
+			ink :: proc(pix: []u8, bg: [4]f32, xlo, xhi, ylo, yhi, W, H: int) -> (lo, hi: int, found: bool) {
+				lo, hi = W, -1
+				for yy in max(0, ylo) ..< min(H, yhi) {
+					for xx in max(0, xlo) ..< min(W, xhi) {
+						i := (yy * W + xx) * 4
+						d :=
+							abs(int(pix[i]) - int(bg[2] * 255)) +
+							abs(int(pix[i + 1]) - int(bg[1] * 255)) +
+							abs(int(pix[i + 2]) - int(bg[0] * 255))
+						if d > 24 {
+							lo, hi, found = min(lo, xx), max(hi, xx + 1), true
+						}
+					}
+				}
+				return
+			}
+
+			// --- 2. a table wider than the measure fits inside it ------------------
+			//
+			// Six 30-character columns: ~190 character cells of natural width against a
+			// measure that holds about 60. Before the fit this drew every column at its
+			// natural width from the block's left edge, so the last three ran off the
+			// pane entirely -- which is the screenshot. There is no scissor rect here,
+			// so "off the pane" means painted over the scrollbar and the other split
+			// half, not clipped.
+			{
+				sb := strings.builder_make(context.temp_allocator)
+				for r in 0 ..< 4 {
+					for c in 0 ..< 6 {
+						strings.write_string(&sb, "| ")
+						if r == 1 {
+							strings.write_string(&sb, "---")
+						} else {
+							for k in 0 ..< 30 {strings.write_byte(&sb, u8('a') + u8((c + r + k) % 26))}
+						}
+						strings.write_string(&sb, " ")
+					}
+					strings.write_string(&sb, "|\n")
+				}
+				doc := mkdoc(strings.to_string(sb), "wide.md")
+				defer doc_close(&doc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				tchk(&bad, pok, "wide: the readback resolves")
+				if pok {
+					// The control: the table really is on screen. Without it the
+					// overflow check below passes on an empty frame.
+					_, inside_hi, inside := ink(pix, bg, int(cx), int(cx + measure), int(ytop), int(ybot), W, H)
+					tchk(&bad, inside, "wide: the table is actually drawn inside the measure")
+					// The defect, stated: nothing at all past the measure. Scanned to
+					// the pane's own right edge, which is 400px beyond the measure.
+					over_lo, _, over := ink(pix, bg, int(cx + measure) + 2, int(x1), int(ytop), int(ybot), W, H)
+					tchk(
+						&bad, !over,
+						fmt.tprintf("wide: a table 190 cells wide paints NOTHING past the %.0fpx measure (ink ends at %d; first stray at %d)", measure, inside_hi, over_lo if over else -1),
+					)
+				}
+			}
+
+			// --- 3. wrapping, the row height, and the link seam --------------------
+			//
+			// One fixture for the three because they are one geometry. Row 2's second
+			// cell is a pile of links far too long for its column, so:
+			//   * how many DISTINCT y values those links land on is how many visual
+			//     lines the cell wrapped to -- read off the drawn output, not counted
+			//     from an arithmetic prediction;
+			//   * every one of their rects must sit inside that cell's own column,
+			//     which is what "wraps rather than overflowing" means;
+			//   * row 3's link tells us where row 2 ENDED, so the row's height can be
+			//     compared against its tallest cell's;
+			//   * and the rects existing at all closes batch 17's disclosed regression
+			//     (links in table cells were not clickable, because `case .Table`
+			//     returned before the spans were built).
+			{
+				sb := strings.builder_make(context.temp_allocator)
+				strings.write_string(&sb, "| id | links |\n|:---|:------|\n| [row2](https://e.test/row2) |")
+				for i in 0 ..< 30 {fmt.sbprintf(&sb, " [w%02d](https://e.test/w%02d)", i, i)}
+				strings.write_string(&sb, " |\n| [row3](https://e.test/row3) | z |\n")
+				doc := mkdoc(strings.to_string(sb), "wrap.md")
+				defer doc_close(&doc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+
+				// The same column geometry the layout fitted, from the same producer.
+				// Not a second derivation: md_table_cols is the one procedure that turns
+				// a measured block into pixel columns, and this asks it the identical
+				// question the layout asked.
+				tc := md_table_ensure(&doc, &h.text, 0)
+				cols := md_table_cols(tc, measure, char_w, context.temp_allocator)
+				tchk(&bad, len(cols) == 2, fmt.tprintf("wrap: the block fits to 2 columns (%d)", len(cols)))
+
+				// Row 2's cell links, row 2's id link, row 3's id link.
+				ys := make([dynamic]f32, 0, 16, context.temp_allocator)
+				r2_y, r3_y := f32(-1), f32(-1)
+				esc := 0 // rects outside the links column
+				for hit in hits {
+					switch {
+					case strings.has_suffix(hit.url, "/row2"):
+						r2_y = hit.rect.pos.y
+					case strings.has_suffix(hit.url, "/row3"):
+						r3_y = hit.rect.pos.y
+					case strings.contains(hit.url, "/w"):
+						seen := false
+						for y in ys {if abs(y - hit.rect.pos.y) < 1 {seen = true}}
+						if !seen {append(&ys, hit.rect.pos.y)}
+						if len(cols) == 2 {
+							l, r := cx + cols[1].x, cx + cols[1].x + cols[1].w
+							if hit.rect.pos.x < l - 1 || hit.rect.pos.x + hit.rect.size.x > r + 1 {esc += 1}
+						}
+					}
+				}
+				// THE regression closure. Zero rects is what shipped: `case .Table`
+				// returned before `spans`, so md_block_links had nothing to walk.
+				tchk(&bad, len(ys) > 0 && r2_y >= 0 && r3_y >= 0, fmt.tprintf("links: a link in a table cell gets a rect at all (%d wrapped lines, id rects %.0f / %.0f)", len(ys), r2_y, r3_y))
+				tchk(&bad, len(ys) >= 3, fmt.tprintf("wrap: the over-long cell wraps INSIDE its column to %d visual lines", len(ys)))
+				tchk(&bad, esc == 0, fmt.tprintf("wrap: no wrapped line escapes its own column (%d of %d rects)", esc, len(hits)))
+
+				// THE row height. Row 2 and row 3 are adjacent table blocks with no
+				// collapsed gap between them, so row 3's top is row 2's top plus row 2's
+				// height -- and row 2's height must be its TALLEST cell's, i.e. the
+				// wrapped links cell's, not the one-line id cell's. Both y values come
+				// from the shaper via md_block_links, so this compares the drawn
+				// geometry against the drawn line count.
+				if r2_y >= 0 && r3_y >= 0 && len(ys) > 0 {
+					want := f32(len(ys)) * trow
+					got := r3_y - r2_y
+					tchk(
+						&bad, abs(got - want) <= 1,
+						fmt.tprintf("height: row 2 is exactly as tall as its tallest cell (%d lines x %.1f = %.1f; next row starts %.1f lower)", len(ys), trow, want, got),
+					)
+					// ...and the one-line cell beside it did NOT grow: its own link sits
+					// on row 2's first line, so the extra height is below the id, not
+					// distributed into it. This rejects "every cell padded to the row
+					// height and then centred", which the check above cannot see.
+					if pok {
+						_, _, id_ink := ink(pix, bg, int(cx + cols[0].x), int(cx + cols[0].x + cols[0].w), int(r2_y), int(r2_y + trow), W, H)
+						tchk(&bad, id_ink, "height: the row's one-line cell still draws on the row's FIRST line")
+					}
+				}
+			}
+
+			// --- 4. column alignment holds across rows, on pixels ------------------
+			//
+			// The property §9.3 puts tables on the mono face for -- "always mono:
+			// columns align" -- and the reason it is asserted on PIXELS rather than on
+			// the fitted widths is that the widths agreeing is not the claim. The claim
+			// is that two rows whose OTHER cells differ in length (one of them wrapping
+			// to several lines) put the same cell content at the same x, which is a
+			// statement about the merged glyph positions shape_columns produces.
+			//
+			// Column 1 is right-aligned and wider than its content, so this also
+			// catches alignment being dropped altogether: a left-aligned "III" would
+			// sit at the column's left edge, not five cells into it.
+			{
+				sb := strings.builder_make(context.temp_allocator)
+				strings.write_string(&sb, "| a | bbbbbbbb |\n|:---|-------:|\n")
+				strings.write_string(&sb, "| [ra](https://e.test/ra) | III |\n")
+				strings.write_string(&sb, "| [rb](https://e.test/rb) qqqq qqqq qqqq qqqq qqqq qqqq | III |\n")
+				doc := mkdoc(strings.to_string(sb), "align.md")
+				defer doc_close(&doc)
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
+				pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				tchk(&bad, pok, "align: the readback resolves")
+				tc := md_table_ensure(&doc, &h.text, 0)
+				cols := md_table_cols(tc, measure, char_w, context.temp_allocator)
+				// Each row's own link locates that row's first line -- taken from the
+				// drawn output, so nothing here predicts a y. The two id cells are "ra"
+				// and "rb", i.e. the same FIRST glyph, which is what lets the left-edge
+				// comparison below be exact instead of carrying a side-bearing tolerance.
+				hits := markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{}, context.temp_allocator)
+				r3_y, r4_y := f32(-1), f32(-1)
+				for hit in hits {
+					if strings.has_suffix(hit.url, "/ra") {r3_y = hit.rect.pos.y}
+					if strings.has_suffix(hit.url, "/rb") {r4_y = hit.rect.pos.y}
+				}
+				tchk(&bad, r3_y > 0 && r4_y > r3_y && len(cols) == 2, fmt.tprintf("align: both rows' links locate them (y %.0f, %.0f; %d cols)", r3_y, r4_y, len(cols)))
+				if pok && r3_y > 0 && r4_y > r3_y && len(cols) == 2 {
+					// Row 3 has nothing long in it, so it is one line tall -- which is
+					// also the precondition for the two bands below not to overlap.
+					tchk(&bad, abs((r4_y - r3_y) - trow) <= 1, fmt.tprintf("align: the plain row is one line tall (%.1f vs %.1f)", r4_y - r3_y, trow))
+					// The two "III" cells, each inside its own row's first line.
+					clo, chi := int(cx + cols[1].x) - 2, int(cx + cols[1].x + cols[1].w) + 4
+					a_lo, a_hi, a_ok := ink(pix, bg, clo, chi, int(r3_y), int(r3_y + trow), W, H)
+					b_lo, b_hi, b_ok := ink(pix, bg, clo, chi, int(r4_y), int(r4_y + trow), W, H)
+					tchk(&bad, a_ok && b_ok, fmt.tprintf("align: both rows' right-hand cell is on screen (row3 %d..%d, row4 %d..%d)", a_lo, a_hi, b_lo, b_hi))
+					if a_ok && b_ok {
+						// THE assertion. Identical content in identical columns, one row
+						// of which has a neighbour cell four times as long that wraps: the
+						// two must be pixel-identical, not merely close.
+						tchk(
+							&bad, a_lo == b_lo && a_hi == b_hi,
+							fmt.tprintf("align: the same cell in two rows lands on the SAME pixels, though one row's other cell wraps (row3 %d..%d vs row4 %d..%d)", a_lo, a_hi, b_lo, b_hi),
+						)
+						// ...and it is actually right-aligned. Without this the equality
+						// above is satisfied by alignment being ignored entirely.
+						shift := f32(a_lo) - (cx + cols[1].x)
+						tchk(
+							&bad, shift > 3 * char_w,
+							fmt.tprintf("align: the right-aligned cell really is pushed to its column's right edge (%.0fpx in, column %.0fpx wide)", shift, cols[1].w),
+						)
+					}
+					// The left-aligned column's own left edge, in both rows, on pixels:
+					// row 4's cell wraps and row 3's does not, and both must start at the
+					// column's left edge.
+					l0, l1 := int(cx + cols[0].x) - 2, int(cx + cols[0].x + cols[0].w)
+					la, _, lok_a := ink(pix, bg, l0, l1, int(r3_y), int(r3_y + trow), W, H)
+					lb, _, lok_b := ink(pix, bg, l0, l1, int(r4_y), int(r4_y + trow), W, H)
+					tchk(&bad, lok_a && lok_b && la == lb, fmt.tprintf("align: the left-aligned column starts at the SAME pixel in a wrapping row and a plain one (%d vs %d)", la, lb))
+				}
+			}
+			return
+		}
+
 		// mdtest's TYPE-SCALE checks (UI spec 9.3).
 		//
 		// Pure arithmetic, and it is pinned exactly rather than approximately for
@@ -6964,6 +7342,7 @@ when NEWTPAD_TESTS {
 			bad += md_head_fit_selftest()
 			bad += md_partial_selftest()
 			bad += md_band_admit_selftest()
+			bad += md_table_wrap_selftest()
 			bad += md_metrics_selftest()
 			bad += md_seam_selftest()
 			bad += md_cache_selftest()
@@ -13190,7 +13569,7 @@ when NEWTPAD_TESTS {
 				fmt.sbprintf(&b, "## Section %03d\n\n", i)
 				fmt.sbprintf(&b, "A paragraph of body prose with `inline code` and a [link](https://e.test/p%03d) in it, long enough to wrap across the measure more than once so the shaper has real work to do.\n\n", i)
 				fmt.sbprintf(&b, "- first item %03d\n- second item with a little more text on it\n\n", i)
-				strings.write_string(&b, "| col a | col b |\n|---|---|\n| one | two |\n\n")
+				strings.write_string(&b, "| c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 | c9 | ca | cb |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n| one | two | three | four | five | six | seven | eight | nine | ten | eleven | twelve |\n| aaa | bbb | ccc | ddd | eee | fff | ggg | hhh | iii | jjj | kkk | lll |\n\n")
 				strings.write_string(&b, "```json\n{ \"key\": \"value\", \"n\": 12 }\n```\n\n")
 				lines += 14
 			}
