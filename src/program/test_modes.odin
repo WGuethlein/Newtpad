@@ -15962,6 +15962,12 @@ when NEWTPAD_TESTS {
 					// that existed for one banner. Still one of the six places UI
 					// spec 17 names where text sits on a themeable fill.
 					{.Text_Primary, .Accent_Wash, 4.5, "the filter band"},
+					// A zebra band is a surface text sits on, so it belongs in this
+					// list on exactly the same footing as the selection and the
+					// find match -- the unbanded rows clear 4.5 through
+					// Text_Primary/Bg_Base above, and half the rows in a table view
+					// are not on Bg_Base.
+					{.Text_Primary, .Table_Zebra, 4.5, "body on a table zebra band"},
 					{.Scrollbar_Thumb, .Bg_Base, 3.0, "scrollbar thumb (non-text, 1.4.11)"},
 				}
 				cl := theme_light()
@@ -15975,6 +15981,92 @@ when NEWTPAD_TESTS {
 							"  %-6s %s %v on %v: %.2f:1 (need %.1f) -- %s",
 							"ok" if ok else "FAIL", name, p.fg, p.bg, r, p.min, p.what,
 						)
+					}
+				}
+
+				// Table_Zebra, the one role whose job is to be *almost* the surface
+				// it sits on. Its floor is in cpairs above (text has to stay
+				// readable on it); what follows is the other side, and it is the
+				// only bound in this file that runs that direction.
+				//
+				// §10 deleted the per-column vertical rules because "it makes the
+				// grid louder than the data" and put this band in their place, so
+				// the band is now the ONLY thing separating one row from the next.
+				// Both failure modes are therefore live and neither is caught by
+				// any assertion above: a band equal to the page is the feature
+				// silently absent, and a band tuned like a chrome tier is the
+				// loudness §10 removed, moved from every column to every other row.
+				//
+				// NO absolute ceiling on the ratio. That was tried and it is very
+				// nearly vacuous: WCAG ratios compress hard at both ends of a warm
+				// palette, so Light's Bg_Raised measures 1.061 against Bg_Base while
+				// its zebra measures 1.063 -- two roles a person cannot confuse,
+				// separated by 0.002. Any ceiling loose enough to admit both themes'
+				// zebras admits half the neutral ramp with them. The bounds below
+				// are relative instead (so they survive a retune) plus two identity
+				// checks for the pair the relative bound provably cannot separate.
+				{
+					zmcd :: proc(a, b: [4]f32) -> int {
+						m := 0
+						for i in 0 ..< 3 {
+							dch := int(a[i] * 255 + 0.5) - int(b[i] * 255 + 0.5)
+							if dch < 0 {dch = -dch}
+							if dch > m {m = dch}
+						}
+						return m
+					}
+					for th, ti in ([]Theme{d, theme_light()}) {
+						name := "Dark " if ti == 0 else "Light"
+						zr := ratio(th[.Table_Zebra], th[.Bg_Base])
+
+						// 1. The band exists. Two 8-bit steps is the floor because
+						// the file format is 8 bits per channel (theme_chan_hex): a
+						// one-step tint cannot survive an export/import round trip
+						// as anything a person would see, and zero steps is
+						// Table_Zebra == Bg_Base -- which now means the rows have no
+						// separator of any kind, the column rules having gone.
+						md := zmcd(th[.Table_Zebra], th[.Bg_Base])
+						ok1 := md >= 2
+						if !ok1 {fail = true}
+						fmt.printfln(
+							"  %-6s %s Table_Zebra vs Bg_Base: %d/255 max channel step (need >= 2 -- the band has to exist)",
+							"ok" if ok1 else "FAIL", name, md,
+						)
+
+						// 2. The band is quieter than the palette's quietest LINE
+						// and its quietest hover FILL, measured in the same theme.
+						// Border_Subtle is the positive control that matters: it is
+						// the role the deleted column separators drew with
+						// (table.odin's old `sep`), so "reuse the separator colour
+						// for the band" is the actual mistake available in this
+						// change, and this row is what rejects it. Bg_Hover is the
+						// other end -- the quietest thing in the palette that is
+						// meant to read as a state.
+						for cand in ([]Color_Role{.Border_Subtle, .Bg_Hover}) {
+							cr := ratio(th[cand], th[.Bg_Base])
+							ok2 := zr < cr
+							if !ok2 {fail = true}
+							fmt.printfln(
+								"  %-6s %s Table_Zebra %.3f:1 < %v %.3f:1 vs Bg_Base (the band must be the quieter fill)",
+								"ok" if ok2 else "FAIL", name, zr, cand, cr,
+							)
+						}
+
+						// 3. Not either chrome tier, by identity. Check 2 cannot
+						// reject these -- Dark's Bg_Raised is 1.108 and Bg_Panel
+						// 1.067, both under Bg_Hover's 1.172 -- and identity is the
+						// right instrument anyway: their whole job is to read as a
+						// separate plane. Bg_Raised is also the table HEADER fill in
+						// this very view (§10), so a band equal to it makes every
+						// other data row look like a header.
+						for cand in ([]Color_Role{.Bg_Panel, .Bg_Raised}) {
+							ok3 := th[.Table_Zebra] != th[cand]
+							if !ok3 {fail = true}
+							fmt.printfln(
+								"  %-6s %s Table_Zebra is not %v (a chrome tier is a plane, not a band)",
+								"ok" if ok3 else "FAIL", name, cand,
+							)
+						}
 					}
 				}
 			}

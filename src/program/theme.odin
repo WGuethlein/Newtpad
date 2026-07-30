@@ -147,6 +147,19 @@ Color_Role :: enum u8 {
 	// while this one is a fill on the document canvas judged at 3:1 for
 	// non-text contrast. Still open.
 	Scrollbar_Thumb,
+	// The alternating row fill in the table view (spec §10). A new role and not
+	// a reuse: §10's central claim is "Column rules are gone -- table_zebra
+	// carries the eye instead", so the banding is now the ONLY thing separating
+	// one CSV row from the next, and the value it needs is a hair off Bg_Base in
+	// the direction of the surface. Nothing existing sits there. Bg_Panel and
+	// Bg_Raised are the two candidates and both are wrong by a factor: they are
+	// CHROME tiers (the tab rail, the menu drop, and -- in this very view -- the
+	// header band), sized to read as a separate plane, and a band that loud is
+	// exactly the "grid louder than the data" failure §10 removed the column
+	// rules to avoid. Judged against Bg_Base, not for contrast but for the LACK
+	// of it: themetest asserts an upper bound on this pair, which is the only
+	// contrast assertion in the palette that runs that direction.
+	Table_Zebra,
 	// #6B6129 (1: find.odin:581 "muted amber" match highlight).
 	Find_Match_Bg,
 	// #73B2FA (1: doc.odin:2158 LINK_COL).
@@ -304,6 +317,15 @@ theme_dark :: proc() -> Theme {
 		// actually clears 3:1; themetest asserts it so the next retune cannot
 		// quietly drop back under.
 		.Scrollbar_Thumb = {0.455, 0.420, 0.380, 1}, // #746B61  3.14
+		// #262320, the spec's §1.1 value, kept because it measures what §10 needs
+		// where scrollbar_thumb's did not: 1.05:1 against Bg_Base -- present as a
+		// band, nowhere near a second surface -- while still carrying Text_Primary
+		// at 9.0:1, above the AA floor the unbanded rows clear at 9.4:1. Both
+		// figures are computed (themetest asserts them); the derivation is one
+		// step up the warm neutral ramp from Bg_Base (#221F1C -> #262320, +4 on
+		// each channel), which is the smallest move the 8-bit file format can
+		// express as more than dithering noise.
+		.Table_Zebra     = {0.149, 0.137, 0.125, 1}, // #262320  1.05 vs Bg_Base -- Text_Primary on it: 9.0
 		.Find_Match_Bg   = {0.290, 0.220, 0.149, 1}, // #4A3826 -- Text_Primary on it: 7.3
 		.Link            = {0.592, 0.765, 0.847, 1}, // #97C3D8  8.2
 		.Warning         = {0.878, 0.643, 0.345, 1}, // #E0A458  7.6
@@ -419,6 +441,12 @@ theme_light :: proc() -> Theme {
 		// typo. See the Dark note for why it matters: spec §18 cites this
 		// 3.0 as a WCAG 1.4.11 compliance point.
 		.Scrollbar_Thumb = {0.580, 0.553, 0.502, 1}, // #948D80  3.10
+		// #F4F1EA, the spec's §1.2 value. DARKER than Bg_Base here, not lighter:
+		// nothing can be lighter than warm paper, so the band moves the only
+		// direction available -- the same inversion Bg_Raised documents above and
+		// the reason Accent_Wash is a stored value rather than an alpha over the
+		// surface. 1.06:1 against Bg_Base, Text_Primary on it at 10.4:1.
+		.Table_Zebra     = {0.957, 0.945, 0.918, 1}, // #F4F1EA  1.06 vs Bg_Base -- Text_Primary on it: 10.4
 		.Find_Match_Bg   = {0.941, 0.875, 0.745, 1}, // #F0DFBE -- Text_Primary on it: 9.3
 		.Link            = {0.122, 0.373, 0.471, 1}, // #1F5F78  6.4
 		.Warning         = {0.604, 0.353, 0.071, 1}, // #9A5A12  5.1
@@ -566,6 +594,7 @@ theme_role_keys := [Color_Role]string {
 	.Accent_Wash    = "accent_wash",
 	.Focus_Ring     = "focus_ring",
 	.Scrollbar_Thumb = "scrollbar_thumb",
+	.Table_Zebra    = "table_zebra",
 	.Find_Match_Bg  = "find_match_bg",
 	.Link           = "link",
 	.Warning        = "warning",
@@ -598,9 +627,10 @@ theme_key_from_role :: proc(role: Color_Role) -> string {
 // Role name -> Color_Role. An unrecognized name returns ok=false so the caller
 // skips that line instead of failing the whole file -- the same "unknown key
 // ignored" contract settings_load uses, which is what lets an older build read
-// a newer file. A linear scan of 34 entries, run once per line at load time;
-// the switch this replaces bought nothing measurable and cost the second
-// mapping.
+// a newer file. A linear scan of the whole role list, run once per line at load
+// time; the switch this replaces bought nothing measurable and cost the second
+// mapping. (The count used to be written out here and was stale by six roles
+// within two batches, which is why it no longer is.)
 theme_role_from_key :: proc(key: string) -> (role: Color_Role, ok: bool) {
 	for k, r in theme_role_keys {
 		if k == key {
