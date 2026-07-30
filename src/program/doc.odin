@@ -1053,6 +1053,15 @@ Document :: struct {
 	// table_edit_anchored (table.odin) is the one check that keeps them together,
 	// and this is what it compares against.
 	table_edit_line:   int,
+	// The BYTES of that line, capped at RENDER_LINE_CAP, copied at edit start.
+	// The offset above answers "has the VIEW moved"; this answers "are the bytes
+	// under [s,e) still the bytes the user was looking at", which is a different
+	// question and the one a buffer REWRITE breaks. A permutation of equal-length
+	// lines (a sort of a fixed-width export: zero-padded ids, ISO dates, fixed
+	// status codes) leaves the r-th line starting at the same offset, so the
+	// offset compare alone reads a sort as "nothing moved" while [s,e) has come
+	// to span a different row's field. See table_edit_line_intact (table.odin).
+	table_edit_snap:   [dynamic]u8,
 	// Markdown view (see markdown.odin): Off / Preview (full) / Split (editor +
 	// live preview).
 	md_mode:     Md_Mode,
@@ -1394,6 +1403,7 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.filter_line_nos)
 	delete(doc.table_widths)
 	delete(doc.table_edit_buf)
+	delete(doc.table_edit_snap)
 	// The markdown preview's per-block layout cache owns heap storage (a source
 	// copy, a span text store, the shaper's glyph and line-box arrays, and the
 	// span boxes) for every filled slot. Freed here rather than left to the

@@ -684,6 +684,26 @@ table_edit_start :: proc(doc: ^Document, r, col, fs, fe: int, val: string) {
 	// two walks agreeing. Recorded here because this is the only place an edit
 	// begins; table_edit_anchored below is the only place it is read.
 	doc.table_edit_line, _ = table_row_start(doc, r)
+	// ...and the line's BYTES, which is the identity a reordering cannot forge.
+	// Same capped extent table_field_at derived fs/fe from, so [fs,fe) is a
+	// sub-range of what is copied here by construction.
+	//
+	// A SHORT read (a mapped original that faulted mid-copy, via safe_copy)
+	// leaves fewer bytes than the line's extent, and table_edit_line_intact then
+	// refuses on the length compare for the rest of the edit's life. That is
+	// deliberate and fail-closed: if the bytes could not be read at capture there
+	// is no identity to check a commit against, and refusing to splice is the
+	// only answer that cannot write over the wrong row.
+	clear(&doc.table_edit_snap)
+	{
+		e := base.pt_line_end_cap(&doc.pt, doc.table_edit_line, RENDER_LINE_CAP)
+		if n := e - doc.table_edit_line; n > 0 {
+			resize(&doc.table_edit_snap, n)
+			if got := base.pt_read(&doc.pt, doc.table_edit_line, doc.table_edit_snap[:]); got != n {
+				resize(&doc.table_edit_snap, got)
+			}
+		}
+	}
 	clear(&doc.table_edit_buf)
 	append(&doc.table_edit_buf, ..transmute([]u8)val)
 	doc.table_edit_caret = len(doc.table_edit_buf)
@@ -701,26 +721,79 @@ table_edit_start :: proc(doc: ^Document, r, col, fs, fe: int, val: string) {
 // commands.odin:939 already reasoned this through for BUFFER writes invalidating
 // a captured span (the line-ending rewrite, undo, history jump, find/replace).
 // This is the same shape one level out: the span stays valid, its ON-SCREEN
-// IDENTITY does not. It was never covered, and batch 18's sort will make it
-// strictly worse -- a sort moves every line under a live edit without touching
-// doc.top at all, and the row-start compare below catches that too.
+// IDENTITY does not. It was never covered.
 //
-// Both halves are the same question asked of the two spaces:
+// Three halves, and they are three different questions:
 //
 //   rows  -- the row must still EXIST on screen. Shrinking the window past the
 //            edited row stops the box being drawn (table_draw's `er < len(vis)`)
 //            while doc.table_editing stays true, so keystrokes keep accumulating
 //            into a buffer nothing shows and a later Enter still commits it.
-//   line  -- the row must still name the SAME line. This is the scroll case, and
-//            the compare is against table_row_start rather than against doc.top
-//            because table_data_start normalises doc.top (the header is sticky
-//            and owns line 0), so two different doc.top values can be the same
-//            scroll position and must not read as a move.
+//   line  -- the row must still name the SAME OFFSET. This is the scroll case,
+//            and the compare is against table_row_start rather than against
+//            doc.top because table_data_start normalises doc.top (the header is
+//            sticky and owns line 0), so two different doc.top values can be the
+//            same scroll position and must not read as a move.
+//   bytes -- the offset must still hold the SAME LINE. Offsets are not identities:
+//            a buffer REWRITE can leave the r-th line starting exactly where it
+//            started before, and then the two compares above both pass while
+//            [s,e) has come to span a different row's field. See
+//            table_edit_line_intact -- this is the half that catches a sort.
 table_edit_anchored :: proc(doc: ^Document, rows: int) -> bool {
 	if doc == nil || !doc.table_editing {return false}
 	if doc.table_edit_row < 0 || doc.table_edit_row >= rows {return false}
 	p, ok := table_row_start(doc, doc.table_edit_row)
-	return ok && p == doc.table_edit_line
+	if !ok || p != doc.table_edit_line {return false}
+	return table_edit_line_intact(doc)
+}
+
+// Does doc.table_edit_line still hold the bytes it held when the edit began?
+//
+// THE ANCHOR'S FORGERY-PROOF HALF, and the reason the two offset compares above
+// are not enough on their own. A byte offset is not a row identity: permute lines
+// that all have the SAME BYTE LENGTH -- a fixed-width export, which is what
+// exports look like: `00012,2026-01-14,ACTIVE`, zero-padded ids, ISO dates, fixed
+// status codes -- and the r-th line still starts at the r-th offset. Edit row 11's
+// first cell, sort, and rows 11 and 12 swap: table_row_start(doc, 11) still equals
+// doc.table_edit_line, the offset compare reads "nothing moved", and a commit
+// splices the user's typed value over row 12's id.
+//
+// So the identity is the line's OWN BYTES, copied at edit start (table_edit_start)
+// and compared here. A reordering cannot forge that: any line whose bytes differ
+// anywhere -- a different id, a different date, one different status code, a
+// different length -- fails the compare and the edit is refused. What it CANNOT
+// distinguish is a permutation that swaps two BYTE-IDENTICAL lines, and that is
+// the one case where it does not need to: both rows held the same value, the
+// commit writes the value the user typed into a row indistinguishable from the one
+// they clicked, and no other row's data is touched. Nothing is lost, which is the
+// property being defended.
+//
+// Chosen over the two alternatives on offer:
+//   - a generation counter bumped by any reordering -- whoever writes the sort has
+//     to remember to bump it, which is the exact class of miss this guard exists
+//     to close (seven scroll routes, two of them handled). The bytes need nobody
+//     to remember anything.
+//   - a hash of the line -- smaller, but only probabilistically unforgeable, and
+//     the line is already capped at RENDER_LINE_CAP so the exact bytes are cheap.
+//
+// Cost: one capped read per frame while a cell edit is open, in 512-byte chunks
+// so nothing here puts an 8 KB buffer on the frame loop's stack. table_row_start
+// already walks the same lines every frame; this walks one of them again.
+@(private = "file")
+table_edit_line_intact :: proc(doc: ^Document) -> bool {
+	if doc.table_edit_line < 0 || doc.table_edit_line > doc.pt.length {return false}
+	e := base.pt_line_end_cap(&doc.pt, doc.table_edit_line, RENDER_LINE_CAP)
+	n := e - doc.table_edit_line
+	if n != len(doc.table_edit_snap) {return false}
+	buf: [512]u8
+	off := 0
+	for off < n {
+		c := min(len(buf), n - off)
+		if got := base.pt_read(&doc.pt, doc.table_edit_line + off, buf[:c]); got != c {return false}
+		if string(buf[:c]) != string(doc.table_edit_snap[off:off + c]) {return false}
+		off += c
+	}
+	return true
 }
 
 // Commit an edit that has stopped sitting on its own cell -- the single guard,
@@ -739,6 +812,11 @@ table_edit_anchored :: proc(doc: ^Document, rows: int) -> bool {
 // scrollbar drag, Page Up/Down, Ctrl+Home/End, a find jump, a session restore
 // and a resize are seven routes and only two of them had it. A per-route commit
 // is seven chances to miss the eighth.
+//
+// COMMIT is right for the view-moved case and WRONG for the bytes-moved case, and
+// table_edit_commit itself makes that distinction rather than this proc -- see its
+// own refusal. A rewrite under [s,e) leaves nowhere safe to write, so the only
+// answer is to drop the keystrokes; a scroll leaves [s,e) exactly where it was.
 table_edit_hold :: proc(doc: ^Document, rows: int) {
 	if doc == nil || !doc.table_editing {return}
 	if !table_edit_anchored(doc, rows) {table_edit_commit(doc)}
@@ -788,6 +866,21 @@ table_edit_end :: proc(doc: ^Document) {doc.table_edit_caret = len(doc.table_edi
 table_edit_commit :: proc(doc: ^Document) {
 	if !doc.table_editing {return}
 	doc.table_editing = false
+	// GUARD THE WRITE, NOT THE ROUTES TO IT. If the bytes under [s,e) are no
+	// longer the bytes the edit was started on, this splice would land the user's
+	// typed value on somebody else's field, and there is no offset to redirect it
+	// to -- the line it belonged to has been moved by a rewrite this proc cannot
+	// see. Discard instead. That is the ONE case where the user's keystrokes are
+	// thrown away rather than kept (see table_edit_hold's own note on why every
+	// scroll route commits), and it is the only case where keeping them means
+	// overwriting data the user never touched.
+	//
+	// Here rather than only in table_edit_hold because the hold guard is not on
+	// every path in: Enter dispatches here directly, and so do the wheel arm
+	// (main.odin), leave_table_view and .Toggle_Table. Four more chances to miss
+	// the fifth -- the same argument that put one guard in the frame loop instead
+	// of seven commits in seven scroll handlers, applied to the write itself.
+	if !table_edit_line_intact(doc) {return}
 	// The one buffer write table view has, and therefore the one place a
 	// column rectangle can go stale without any command dispatch running.
 	// command_dispatch's own block-clear branch is unreachable here twice

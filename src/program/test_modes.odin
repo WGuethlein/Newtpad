@@ -9065,6 +9065,178 @@ when NEWTPAD_TESTS {
 				return
 			}
 
+			// A REORDERING under a live cell edit -- the case the offset compare
+			// cannot see, and the trap batch 18's sort would have walked into.
+			//
+			// The fixture is the point: every line the SAME BYTE LENGTH, which is
+			// what an export looks like (zero-padded ids, ISO dates, fixed status
+			// codes). Permute two of them and the r-th line still starts at the
+			// r-th offset, so `table_row_start(doc, r) == doc.table_edit_line`
+			// still holds -- asserted here as a precondition, so this mode says out
+			// loud that the offset compare is blind to it -- while [s,e) has come to
+			// span the OTHER row's id field.
+			//
+			// The seam, not the unit: what is compared is the DOCUMENT'S BYTES
+			// before and after the commit attempt, and the assertion is phrased so a
+			// future "keep the edit tracking its line through a reorder" fix would
+			// also pass -- either nothing was written, or the typed value landed on
+			// the line it was captured from. Never on the other row.
+			//
+			// Three routes, and .Control is not optional: a guard that refused every
+			// commit would satisfy both permute routes and break cell editing
+			// outright, so the same fixture proves an undisturbed edit still lands.
+			tg_edit_permute :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (edit-permute check): no fonts loaded")
+					bad += 1
+					return
+				}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				BASE_PX = BASE_PX_96
+				px := BASE_PX_96
+				ER :: 11 // the row from the finding's own scenario
+
+				// Guard  = the once-per-frame check (main.odin's table_edit_hold call).
+				// Enter  = table_edit_commit straight off the dispatch, which is the
+				//          route the finding describes and the one no frame guard sits
+				//          on: sort, then press Enter.
+				// Control = no reorder at all; the edit must still commit.
+				Route :: enum {
+					Guard,
+					Enter,
+					Control,
+				}
+				run :: proc(bad: ^int, t: ^plat.Text, px: f32, route: Route, ER: int) {
+					lines: [dynamic]string
+					defer delete(lines)
+					append(&lines, "id,date,status")
+					for i in 0 ..< 20 {append(&lines, fmt.aprintf("%05d,2026-01-%02d,ACTIVE", i + 1, (i % 28) + 1))}
+					defer for i in 1 ..< len(lines) {delete(lines[i])}
+					equal := true
+					for i in 2 ..< len(lines) {if len(lines[i]) != len(lines[1]) {equal = false}}
+					chk(bad, equal, fmt.tprintf("%v: every data line is the same byte length (%d)", route, len(lines[1])))
+					total := 0
+					for l in lines {total += len(l) + 1}
+					content := make([]u8, total) // doc_close owns it (owned_orig)
+					{
+						o := 0
+						for l in lines {
+							copy(content[o:], transmute([]u8)l)
+							content[o + len(l)] = '\n'
+							o += len(l) + 1
+						}
+					}
+					a: App
+					a.settings = settings_default()
+					d := new(Document)
+					d^ = doc_from_content(content, "permute.csv", .UTF8)
+					d.table, d.table_delim = true, ','
+					app_activate(&a, app_add(&a, d))
+					defer app_destroy(&a)
+					doc_update_top_inset(d)
+					table_compute_widths(d, t)
+					d.table_cols = len(d.table_widths)
+
+					ROWS :: 14
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					trows := table_visible_rows(d, H, px)
+					if trows != ROWS || ER + 1 >= trows {
+						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
+						return
+					}
+
+					ok, r, col, fs, fe, val := table_cell_at_index(d, ER, 0, trows)
+					if !ok {
+						chk(bad, false, fmt.tprintf("%v: could not resolve the cell at row %d", route, ER))
+						return
+					}
+					home_line, _ := table_row_start(d, ER)
+					next_line, nok := table_row_start(d, ER + 1)
+					if !nok {
+						chk(bad, false, fmt.tprintf("%v: could not resolve row %d", route, ER + 1))
+						return
+					}
+					home_before, other_before := "", ""
+					{
+						txt := doc_debug_string(d)
+						defer delete(txt)
+						he := base.pt_line_end_cap(&d.pt, home_line, RENDER_LINE_CAP)
+						oe := base.pt_line_end_cap(&d.pt, next_line, RENDER_LINE_CAP)
+						home_before = strings.clone(txt[home_line:he], context.temp_allocator)
+						other_before = strings.clone(txt[next_line:oe], context.temp_allocator)
+					}
+					table_edit_start(d, r, col, fs, fe, val)
+					table_edit_rune(d, 'Z')
+					// What the edit MEANS: the typed value on field 0 of the line it
+					// was captured from. Derived from those bytes, not from ER.
+					home_edited := fmt.tprintf("%sZ%s", val, home_before[len(val):])
+
+					if route != .Control {
+						// THE SORT, reduced to the one move that matters: swap two
+						// equal-length lines through the same doc_replace_range a sort
+						// would use. No byte offset in the file changes.
+						oe := base.pt_line_end_cap(&d.pt, next_line, RENDER_LINE_CAP)
+						swapped := fmt.tprintf("%s\n%s", other_before, home_before)
+						doc_replace_range(d, home_line, oe - home_line, transmute([]u8)swapped)
+						p, pok := table_row_start(d, ER)
+						chk(bad, pok && p == d.table_edit_line, fmt.tprintf("%v: the swap left the row start where it was -- the offset compare is blind to it (%d vs %d)", route, p, d.table_edit_line))
+						chk(bad, !table_edit_anchored(d, trows), fmt.tprintf("%v: ...and the anchor refuses it anyway, on the bytes", route))
+					}
+
+					text_before := ""
+					{
+						tb := doc_debug_string(d)
+						defer delete(tb)
+						text_before = strings.clone(tb, context.temp_allocator)
+					}
+					switch route {
+					case .Guard:
+						table_edit_hold(d, trows)
+					case .Enter:
+						table_edit_commit(d)
+					case .Control:
+						table_edit_hold(d, trows) // must NOT fire
+						chk(bad, d.table_editing, "Control: an undisturbed edit is still open after the frame guard")
+						table_edit_commit(d)
+					}
+					text_after := doc_debug_string(d)
+					defer delete(text_after)
+
+					if route == .Control {
+						want, _ := strings.replace(text_before, home_before, home_edited, 1, context.temp_allocator)
+						chk(bad, text_after == want, fmt.tprintf("Control: an undisturbed edit still commits to its own field (%q)", home_edited))
+						return
+					}
+
+					// The seam. Either nothing was written, or the typed value is on
+					// the line it was captured from -- wherever the reorder put it.
+					refused := text_after == text_before
+					tracked_want, _ := strings.replace(text_before, home_before, home_edited, 1, context.temp_allocator)
+					tracked := text_after == tracked_want
+					chk(bad, refused || tracked, fmt.tprintf("%v: the edit is refused or lands on its own line (refused=%v tracked=%v)", route, refused, tracked))
+					// ...and the failure mode named directly. With the byte-offset
+					// compare back, [s,e) spans the OTHER row's id field and this is
+					// the line the splice destroys.
+					chk(bad, strings.count(text_after, other_before) == 1, fmt.tprintf("%v: the other row's line survives intact (%q appears %d time(s))", route, other_before, strings.count(text_after, other_before)))
+					// A stale edit must not be left open either: with only the offset
+					// compare, the frame guard reads the reorder as "nothing moved"
+					// and keystrokes keep accumulating into a box over the wrong row.
+					chk(bad, !d.table_editing, fmt.tprintf("%v: the edit is closed, not left accumulating over the wrong row", route))
+				}
+				for route in Route {run(&bad, &t, px, route, ER)}
+				return
+			}
+
 			// F3: §10's appearance -- the header fill, the rule's colour AND
 			// thickness, and the zebra's parity -- asserted on PIXELS from a real
 			// device, not a source count. A source count can only prove a colour
@@ -9203,6 +9375,7 @@ when NEWTPAD_TESTS {
 			bad := tg()
 			bad += tg_page()
 			bad += tg_edit_anchor()
+			bad += tg_edit_permute()
 			bad += tg_appearance()
 			fmt.printfln("tablegridtest: %d failures", bad)
 			return true

@@ -371,11 +371,35 @@ were the priorities. Read P2 as the live list, with these amendments:
   `table_edit_anchored`, `table.odin`; one call per frame in `main.odin`). One guard rather than a
   commit bolted onto each scroll route: it asks the seam directly — does the drawn row still name the
   line the captured span lies on, and does that row still fit under the sticky header — so the
-  scrollbar drag, Page Up/Down, a find jump, a session restore and a window resize are all covered,
-  and so is the row sort that made this urgent (a sort moves lines under a live edit without touching
-  `doc.top`, and the row-start compare catches that too). Covered by `tablegridtest`'s
-  `tg_edit_anchor`, which drives all five routes; both halves of the guard were sabotaged separately
-  and each failed exactly the routes it owns.
+  scrollbar drag, Page Up/Down, a find jump, a session restore and a window resize are all covered.
+  Covered by `tablegridtest`'s `tg_edit_anchor`; both halves of the guard were sabotaged separately and
+  each failed exactly the routes it owns. **Its Wheel route is not evidence for the guard**: the wheel
+  arm commits inline in the frame loop and the test replays that arm by hand, so those four assertions
+  stay green with the guard removed. Four of the five routes are the guard's; the Wheel route documents
+  the pre-existing inline commit.
+- **A REORDER under a live cell edit needed a third compare, and the first version of the guard did
+  not have it** (reviewed 2026-07-30). The entry above used to claim the row-start compare caught a
+  sort as well. **It did not, and the claim was the trap:** the compare was `table_row_start(doc, r) ==
+  doc.table_edit_line`, two *byte offsets*, and a permutation of lines that all have the same byte
+  length leaves the r-th line starting at the r-th offset. That is not a contrived fixture — it is what
+  an export looks like (`00012,2026-01-14,ACTIVE`: zero-padded ids, ISO dates, fixed status codes).
+  Edit row 11's id, sort, rows 11 and 12 swap, the compare reads "nothing moved", and `[s,e)` now spans
+  row 12's id field, which `table_edit_commit` then splices the typed value over. Not live — no sort
+  exists and `Sort_Lines` is refused in table view — but it was owed to the task that builds the sort,
+  in the exact document that task would have read.
+  **Fixed by making the identity the line's own bytes** (`table_edit_snap`, `table_edit_line_intact`):
+  the line, capped at `RENDER_LINE_CAP`, is copied at edit start and compared each frame. A reordering
+  cannot forge that — any line differing in one byte fails — and the one thing it cannot distinguish,
+  a swap of two *byte-identical* lines, is the case where it does not need to: the value lands on a row
+  indistinguishable from the one clicked and no other row's data is touched. A generation counter was
+  the alternative and was rejected because whoever writes the sort has to remember to bump it, which is
+  the exact class of miss the one-guard design exists to close.
+  **`table_edit_commit` now refuses a stale span outright rather than committing it** — the one case
+  where the user's keystrokes are dropped instead of kept, because a rewrite leaves nowhere safe to
+  write. It is in the *write*, not in the frame guard, because Enter, the wheel arm, `leave_table_view`
+  and `.Toggle_Table` all reach the splice without passing the guard. Covered by `tg_edit_permute`
+  (Guard / Enter / Control routes, equal-length fixture); with the byte-offset compare restored it
+  fails 5 assertions, and the Enter route loses row 12's id outright (`"00013,…" appears 0 time(s)`).
 - **Carried from batch 18 review (F6): table zebra-band parity is viewport-anchored, so every
   odd-row scroll inverts every band.** Documented and accepted as shippable in `table_draw`'s own
   comment (parity by visible row index, not absolute file position, because the absolute index needs an
