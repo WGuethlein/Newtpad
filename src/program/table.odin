@@ -239,8 +239,11 @@ table_row_start :: proc(doc: ^Document, r: int) -> (p: int, ok: bool) {
 //
 // Entry r is TABLE_ABS_NONE when the file's numbering cannot answer for that row.
 // doc_line_no_at refuses when the background index has not reached the offset,
-// when the buffer has been edited at or below it, and after a faulted read of a
-// mapped original; all three arrive here as the same refusal. A caller draws
+// when an edit raced that initial scan and left the buffer diverged at or below
+// it, when a huge paste left the nearest checkpoint further than CKPT_SCAN_CAP
+// away, and after a faulted read of a mapped original; all of them arrive here as
+// the same refusal. An ordinary edit is NOT one of them any more -- the
+// checkpoints are repaired across it (Line_Index.ckpt_doc). A caller draws
 // NOTHING for a refused row (development-loop.md §4, Shape A) -- not a zero, not
 // a guess. The zebra is the single exception and only because a band carries no
 // information; see table_draw.
@@ -266,8 +269,9 @@ table_row_start :: proc(doc: ^Document, r: int) -> (p: int, ok: bool) {
 // index.
 //
 // One call per frame rather than a memo, deliberately. A cache would have to key
-// on every input doc_line_no_at reads -- the offset, edit_floor, ckpt_n, done,
-// pt.fault, idx.fault, and the identity of the ckpts array doc_index_start swaps
+// on every input doc_line_no_at reads -- the offset, edit_floor, ckpt_doc, the
+// CONTENTS of the ckpts array (every edit rewrites them now), ckpt_n, done,
+// pt.fault, idx.fault, and the identity of the array doc_index_start swaps
 // out from under it -- and a key that misses one of those is a stale row number
 // presented to the reader as fact. That is the failure this whole two-result
 // contract exists to prevent.
@@ -985,14 +989,19 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	// because the reader has no way to tell it apart from a right one. This is
 	// development-loop.md §4 Shape A, and blank is the honest answer.
 	//
-	// KNOWN, and accepted rather than papered over: nothing RAISES
-	// Line_Index.edit_floor once an edit has lowered it, and doc_save does not
-	// re-index, so after editing a cell the numbers at and below that row stay
-	// blank for the life of the tab -- including after a save, which is the moment
-	// a user would most expect them back. Guessing a number here would be exactly
-	// the Shape A the flag exists to prevent; the real fix is doc_save restarting
-	// the index over the saved bytes, which is a change to SAVE behaviour and
-	// Wyatt's call, not a drive-by in the gutter. See the batch-18 plan, §3a.
+	// That refusal used to be MUCH wider than it is now, and the difference is
+	// worth stating here because this gutter is what made it visible: nothing
+	// raised Line_Index.edit_floor once an edit had lowered it, and doc_save does
+	// not re-index, so editing one cell blanked every row number below it for the
+	// life of the tab -- including after a save, the moment a user would most
+	// expect them back. Fixed at the source rather than here: once the index is
+	// finished the checkpoints are repaired into document coordinates on every
+	// edit (Line_Index.ckpt_doc, doc.odin), so an edit and a save now leave the
+	// numbering intact. What still refuses is genuinely unanswerable -- the worker
+	// has not reached the row, the edit raced the initial scan, a huge paste left
+	// two checkpoints further apart than CKPT_SCAN_CAP, or a mapped read faulted.
+	// Guessing in any of those would be exactly the Shape A the flag exists to
+	// prevent.
 	//
 	// Text_Muted, not the Text_Dim §10 literally names, and the reasoning is
 	// TABLE_EMPTY_CELL's applied to a second case. Text_Dim is theme.odin's

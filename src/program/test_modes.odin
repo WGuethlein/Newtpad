@@ -275,11 +275,100 @@ when NEWTPAD_TESTS {
 		li_part_race(&bad)
 		li_part_concurrent(&bad)
 		li_part_edits(&bad)
+		li_part_saved(&bad)
+		li_part_destroyed(&bad)
+		li_part_bigpaste(&bad)
+		li_part_undo(&bad)
+		li_part_midscan_edits(&bad)
+		li_part_restart(&bad)
+		li_part_eolconv(&bad)
 		li_part_fault(&bad)
 		li_part_reuse(&bad)
+		li_part_cost(&bad)
 		li_part_memory(&bad, path)
 		fmt.printfln("lineidxtest: %d failures", bad)
 		if bad > 0 {os.exit(1)}
+	}
+
+	// The offset of the last live checkpoint at or below `at`, found by a LINEAR
+	// walk. Deliberately not the binary search doc_line_no_at uses: the point of
+	// the checks below is to decide independently which offsets the repaired array
+	// can answer for, and re-deriving that with the same code would only assert
+	// that the search agrees with itself.
+	@(private = "file")
+	li_near :: proc(d: ^Document, at: int) -> (off: int, ok: bool) {
+		cnt := intrinsics.atomic_load(&d.idx.ckpt_n)
+		for k in 0 ..< cnt {
+			if d.idx.ckpts[k].offset > at {break}
+			off, ok = d.idx.ckpts[k].offset, true
+		}
+		return
+	}
+
+	// The seam, for the repaired (document-coordinate) array: what doc_line_no_at
+	// ANSWERS, against what the checkpoints independently say it should be able to
+	// answer, against line numbers counted directly over the buffer's own bytes.
+	//
+	// `body` is the live buffer collected byte-for-byte, so li_truth over it shares
+	// nothing with the checkpoint arithmetic under test -- neither the stored
+	// line_no, nor the shift, nor the forward scan. That independence is what makes
+	// zeroing the repair's line delta a visible failure rather than a consistent
+	// pair of wrong answers.
+	//
+	// Three verdicts per probe rather than two. A probe further than CKPT_SCAN_CAP
+	// from the nearest checkpoint MUST refuse -- that is the bound existing, and a
+	// test that only demanded "exact everywhere" would fail honestly on a large
+	// paste and teach the next reader to widen the cap. A probe inside the cap MUST
+	// be exact AND right.
+	@(private = "file")
+	li_verify :: proc(bad: ^int, d: ^Document, body: []u8, label: string) -> (answered, refused: int) {
+		if !d.idx.ckpt_doc {
+			li_chk(bad, false, fmt.tprintf("%s: PRECONDITION -- the array is not in document coordinates", label))
+			return
+		}
+		p := make([dynamic]int, context.temp_allocator)
+		n := len(body)
+		append(&p, 0, 1, max(0, n - 1), n)
+		// Every live checkpoint and its two neighbours. These are the probes that
+		// matter: an entry shifted by the wrong amount still lands on the right LINE
+		// for most mid-stride offsets and is wrong only within a byte or two of the
+		// entry itself.
+		cnt := intrinsics.atomic_load(&d.idx.ckpt_n)
+		for k in 0 ..< cnt {
+			o := d.idx.ckpts[k].offset
+			append(&p, max(0, o - 1), o, min(n, o + 1))
+		}
+		rng: u64 = 0xABCD_1234_5678_9AB
+		for _ in 0 ..< 128 {
+			rng = rng * 6364136223846793005 + 1442695040888963407
+			append(&p, int((rng >> 33) % u64(n + 1)))
+		}
+		wrong, bad_refusal, bad_answer, first_bad := 0, 0, 0, -1
+		for at in p {
+			off, ok := li_near(d, at)
+			reachable := ok && at - off <= CKPT_SCAN_CAP && at <= n
+			got, exact := doc_line_no_at(d, at)
+			switch {
+			case exact && !reachable:
+				bad_answer += 1
+				if first_bad < 0 {first_bad = at}
+			case !exact && reachable:
+				bad_refusal += 1
+				if first_bad < 0 {first_bad = at}
+			case exact:
+				answered += 1
+				if got != li_truth(body, at) {
+					wrong += 1
+					if first_bad < 0 {first_bad = at}
+				}
+			case:
+				refused += 1
+			}
+		}
+		li_chk(bad, wrong == 0, fmt.tprintf("%s: every answer equals newlines counted over the buffer (%d wrong of %d, first at %d)", label, wrong, answered, first_bad))
+		li_chk(bad, bad_refusal == 0, fmt.tprintf("%s: nothing within CKPT_SCAN_CAP of a checkpoint was refused (%d, first at %d)", label, bad_refusal, first_bad))
+		li_chk(bad, bad_answer == 0, fmt.tprintf("%s: nothing beyond the cap was answered (%d, first at %d)", label, bad_answer, first_bad))
+		return
 	}
 
 	// A finished index over a fixture spanning eight checkpoint strides: every
@@ -512,13 +601,302 @@ when NEWTPAD_TESTS {
 		li_chk(bad, wrong == 0, fmt.tprintf("every answer during the scan was correct (%d wrong of %d)", wrong, exacts))
 	}
 
-	// The index scans the immutable original; edits live in the add arena. A
-	// prefix below every edit still describes the same bytes, so it stays exact;
-	// at and above the lowest edit the two spaces have diverged and the lookup
-	// must refuse rather than answer off offsets that moved.
+	// Edits against a FINISHED index. The array is main-thread-owned from that
+	// point, so every edit shifts it into the document's own coordinates instead of
+	// lowering a floor that only ever falls -- which is what used to blank every
+	// row number below an edited cell, permanently, because nothing (a save least
+	// of all) ever raised the floor again.
+	//
+	// Each edit is a different shape of the repair rule, and each is followed by a
+	// full re-verification rather than one probe: an insert that adds newlines, a
+	// delete that removes them, and a replace whose range straddles a live
+	// checkpoint. The edits are cumulative on purpose -- a repair that is only
+	// correct against a pristine array is not a repair.
 	@(private = "file")
 	li_part_edits :: proc(bad: ^int) {
-		fmt.println("-- pending edits --")
+		fmt.println("-- edits against a finished index --")
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		before_n := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, !d.idx.ckpt_doc, "a freshly indexed buffer is NOT yet in document coordinates (nothing has edited it)")
+
+		check :: proc(bad: ^int, d: ^Document, label: string) {
+			body := base.pt_collect(&d.pt)
+			defer delete(body)
+			li_verify(bad, d, body, label)
+		}
+
+		// 1. An insert that ADDS newlines, in the middle. Every checkpoint above it
+		//    moves by 14 bytes and by 3 lines; get either delta wrong and the
+		//    ground-truth comparison sees it within a byte of each entry.
+		at1 := 2 * LINE_CKPT_STRIDE + 100
+		doc_replace_range(&d, at1, 0, transmute([]u8)string("one\ntwo\nthree\n"))
+		li_chk(bad, d.idx.ckpt_doc, "the first edit promotes the array into document coordinates")
+		check(bad, &d, "after an insert of 3 newlines")
+
+		// 2. A delete that REMOVES newlines. This is the direction that needs the
+		//    removed count taken BEFORE the mutation -- counted after, it counts the
+		//    replacement (here, nothing) and every entry above lands on the wrong
+		//    line.
+		at2 := 4 * LINE_CKPT_STRIDE + 50
+		doc_replace_range(&d, at2, 400, nil)
+		check(bad, &d, "after a 400-byte delete")
+
+		// 3. A replace whose range STRADDLES a live checkpoint: the entry it names
+		//    is inside the replaced text, so it is destroyed and compacted out while
+		//    everything above it shifts.
+		o := d.idx.ckpts[5].offset
+		was := intrinsics.atomic_load(&d.idx.ckpt_n)
+		doc_replace_range(&d, o - 40, 80, transmute([]u8)string("A\nB\n"))
+		now := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, now == was - 1, fmt.tprintf("a replace across a checkpoint destroys exactly that one entry (%d -> %d)", was, now))
+		check(bad, &d, "after a replace across a checkpoint")
+
+		// 4. An edit at offset 0 -- the case that used to poison the whole file,
+		//    because every later offset shifted and nothing shifted with it.
+		doc_replace_range(&d, 0, 0, transmute([]u8)string("x\n"))
+		check(bad, &d, "after an edit at offset 0")
+		li_chk(bad, intrinsics.atomic_load(&d.idx.ckpt_n) == before_n - 1, fmt.tprintf("...and the array is still %d entries, not rebuilt (%d)", before_n - 1, intrinsics.atomic_load(&d.idx.ckpt_n)))
+	}
+
+	// The case Wyatt reported, end to end: edit a cell near the top of a CSV, SAVE,
+	// and ask for the row numbers below the edit.
+	//
+	// This is the assertion the whole change exists for, and it is written through
+	// doc_save_err rather than around it because the old failure was specifically
+	// that a save reconciles NOTHING -- it writes the buffer to disk and leaves both
+	// the piece tree and the indexed original exactly as they were, so the floor an
+	// edit dropped stayed dropped and only closing and reopening the file brought
+	// the numbers back.
+	@(private = "file")
+	li_part_saved :: proc(bad: ^int) {
+		fmt.println("-- edit a cell, save, read the row numbers below it --")
+		tmp := os.get_env("TEMP", context.temp_allocator)
+		if tmp == "" {
+			fmt.println("  (TEMP is unset -- skipping rather than writing into the cwd)")
+			return
+		}
+		p, _ := filepath.join({tmp, "newtpad-ckpt-save.csv"}, context.temp_allocator)
+		defer os.remove(p)
+
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		// "A cell near the top": inside the third line, a few hundred bytes in, so
+		// that everything the table view would draw sits BELOW it.
+		at := 300
+		doc_replace_range(&d, at, 6, transmute([]u8)string("EDITED"))
+		li_chk(bad, d.idx.ckpt_doc, "the cell edit promoted the array")
+
+		err := doc_save_err(&d, p)
+		li_chk(bad, err == .None, fmt.tprintf("the save succeeded (%v)", err))
+		li_chk(bad, !d.modified, "...and the document is no longer modified")
+
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		answered, _ := li_verify(bad, &d, body, "after the save")
+		li_chk(bad, answered > 100, fmt.tprintf("...and it answered for real (%d probes, not a vacuous pass)", answered))
+		// Named on its own, in the exact shape the table view asks in: a row far
+		// below the edit, which is what went blank.
+		far := 6 * LINE_CKPT_STRIDE
+		got, exact := doc_line_no_at(&d, far)
+		want := li_truth(body, far)
+		li_chk(bad, exact && got == want, fmt.tprintf("a row %d bytes below the edited cell reads line %d, exact=%v (want %d)", far - at, got, exact, want))
+	}
+
+	// A delete that swallows more than one whole stride: the entries it spans name
+	// bytes that no longer exist, so they are DESTROYED rather than shifted. Left
+	// in place they would name whatever moved up into them -- a checkpoint quietly
+	// describing a different line, which every lookup above would then inherit.
+	@(private = "file")
+	li_part_destroyed :: proc(bad: ^int) {
+		fmt.println("-- a delete that destroys whole checkpoints --")
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		// One edit to take the promotion, well away from the delete below.
+		doc_replace_range(&d, 10, 0, transmute([]u8)string("z"))
+		was := intrinsics.atomic_load(&d.idx.ckpt_n)
+
+		lo := d.idx.ckpts[2].offset - 10
+		hi := d.idx.ckpts[4].offset + 10
+		li_chk(bad, hi - lo > 2 * LINE_CKPT_STRIDE, fmt.tprintf("the delete really does span more than one whole stride (%d bytes)", hi - lo))
+		doc_replace_range(&d, lo, hi - lo, nil)
+		now := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, now == was - 3, fmt.tprintf("the three entries inside the deleted range were compacted out (%d -> %d, want %d)", was, now, was - 3))
+		// Sortedness is what the binary search rests on, and compaction is the one
+		// rule that can break it by leaving a hole.
+		sorted := true
+		for k in 1 ..< now {
+			if d.idx.ckpts[k].offset <= d.idx.ckpts[k - 1].offset {sorted = false}
+		}
+		li_chk(bad, sorted, "...and the surviving entries are still strictly increasing")
+
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		li_verify(bad, &d, body, "after the multi-stride delete")
+	}
+
+	// A paste bigger than CKPT_SCAN_CAP. Two surviving checkpoints are now further
+	// apart than the lookup will scan, so the offsets between them are REFUSED --
+	// which is the bound being real. The rest of the file must be unaffected: the
+	// whole reason the cap exists is that a huge paste should cost the rows near it
+	// their numbers, not the file its numbering.
+	@(private = "file")
+	li_part_bigpaste :: proc(bad: ^int) {
+		fmt.println("-- a paste wider than the scan cap --")
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		doc_replace_range(&d, 10, 0, transmute([]u8)string("z")) // take the promotion
+
+		blob := li_fixture(3 * CKPT_SCAN_CAP, 0x1234_5678_9ABC_DEF)
+		defer delete(blob)
+		at := d.idx.ckpts[3].offset + 20
+		doc_replace_range(&d, at, 0, blob)
+
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		answered, refused := li_verify(bad, &d, body, "after a 384 KB paste")
+		li_chk(bad, refused > 0, fmt.tprintf("the cap really did refuse something (%d refused)", refused))
+		li_chk(bad, answered > 100, fmt.tprintf("...and the rest of the file still answers (%d)", answered))
+		// The refusal is local, stated as a place rather than a count: an offset a
+		// stride BELOW the paste is nowhere near it and must still be exact.
+		below := d.idx.ckpts[3].offset - LINE_CKPT_STRIDE / 2
+		got, exact := doc_line_no_at(&d, below)
+		li_chk(bad, exact && got == li_truth(body, below), fmt.tprintf("an offset below the paste is unaffected (%d, exact=%v, want %d)", got, exact, li_truth(body, below)))
+	}
+
+	// Undo and redo restore a whole piece tree through pt_restore and do NOT go
+	// through the edit path, so the repair never sees them. The checkpoints belong
+	// to the state, so they travel with it on the Snapshot.
+	//
+	// The assertion that matters is not "exact" -- it is exact AND equal to line
+	// numbers counted over the restored buffer. A stale array survives an
+	// exactness-only check perfectly: it answers confidently, off the previous
+	// buffer's offsets. Never wrong-and-exact is the contract; blank would have
+	// been acceptable, a wrong number never.
+	@(private = "file")
+	li_part_undo :: proc(bad: ^int) {
+		fmt.println("-- undo and redo --")
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		check :: proc(bad: ^int, d: ^Document, label: string) {
+			body := base.pt_collect(&d.pt)
+			defer delete(body)
+			li_verify(bad, d, body, label)
+		}
+
+		// Two edits of different shapes, so undo has to restore an array that
+		// differs from the current one both by a shift and by a destroyed entry.
+		doc_replace_range(&d, 3 * LINE_CKPT_STRIDE + 7, 0, transmute([]u8)string("aa\nbb\ncc\n"))
+		after_first := intrinsics.atomic_load(&d.idx.ckpt_n)
+		o := d.idx.ckpts[6].offset
+		doc_replace_range(&d, o - 50, 100, transmute([]u8)string("Q\n"))
+		after_second := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, after_second == after_first - 1, fmt.tprintf("precondition -- the second edit destroyed an entry (%d -> %d)", after_first, after_second))
+		check(bad, &d, "before any undo")
+
+		doc_undo(&d)
+		li_chk(bad, intrinsics.atomic_load(&d.idx.ckpt_n) == after_first, fmt.tprintf("undo brought the destroyed entry back (%d, want %d)", intrinsics.atomic_load(&d.idx.ckpt_n), after_first))
+		check(bad, &d, "after one undo")
+
+		doc_undo(&d)
+		check(bad, &d, "after undoing back to the opened state")
+
+		doc_redo(&d)
+		check(bad, &d, "after one redo")
+		doc_redo(&d)
+		li_chk(bad, intrinsics.atomic_load(&d.idx.ckpt_n) == after_second, fmt.tprintf("redo restored the compacted array (%d, want %d)", intrinsics.atomic_load(&d.idx.ckpt_n), after_second))
+		check(bad, &d, "after redoing back to the edited state")
+
+		// And the path where the array CANNOT be restored: a snapshot taken before
+		// the index was ever adopted carries no clone, so the restore must fall back
+		// to refusing rather than keep the live array. Reached here by undoing to
+		// the opened state and asking with the flag forced off -- the same state
+		// apply_snapshot lands in when a doc_index_start has run in between.
+		doc_undo(&d)
+		doc_undo(&d)
+		d.idx.ckpt_doc = false
+		wrong := 0
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		for at := 0; at <= len(body); at += LINE_CKPT_STRIDE / 4 {
+			got, exact := doc_line_no_at(&d, at)
+			if exact && got != li_truth(body, at) {wrong += 1}
+		}
+		li_chk(bad, wrong == 0, fmt.tprintf("with the array unusable, nothing is answered WRONG (%d)", wrong))
+	}
+
+	// The one case the repair genuinely cannot fix, kept as an explicit contract
+	// rather than left to be rediscovered: an edit made WHILE the worker is still
+	// scanning. The array is being written concurrently in the ORIGINAL's
+	// coordinates, so the main thread must not shift it, and nothing records what
+	// the shift would have been. The old edit_floor gate is the answer, and it is
+	// still exactly the old gate -- exact below the lowest edit, refusing at and
+	// above it.
+	@(private = "file")
+	li_part_midscan_edits :: proc(bad: ^int) {
+		fmt.println("-- an edit DURING the scan keeps the floor gate --")
+		c := li_fixture(64 * 1024 * 1024)
+		n := len(c)
+		snapshot := make([]u8, n) // c is handed to the document below
+		copy(snapshot, c)
+		defer delete(snapshot)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for intrinsics.atomic_load(&d.idx.ckpt_n) < 8 && !doc_index_done(&d) {}
+		mid := 5 * LINE_CKPT_STRIDE
+		doc_replace_range(&d, mid, 0, transmute([]u8)string("mid\n"))
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		li_chk(bad, !d.idx.ckpt_doc, "the array was never promoted (the edit raced the worker)")
+		li_chk(bad, d.idx.edit_floor == mid, fmt.tprintf("...and the floor records where they diverged (%d, want %d)", d.idx.edit_floor, mid))
+		below := mid - 9
+		bgot, bexact := doc_line_no_at(&d, below)
+		li_chk(bad, bexact && bgot == li_truth(snapshot, below), fmt.tprintf("offset %d below the edit is still exact (%d, want %d)", below, bgot, li_truth(snapshot, below)))
+		// Strictly INSIDE the indexed content, so this is the floor refusing and not
+		// the length check: a probe past the end is refused before the floor is ever
+		// consulted and would stay green with the gate deleted.
+		above := mid + 9
+		_, past := doc_line_no_at(&d, above)
+		li_chk(bad, !past, fmt.tprintf("offset %d above it refuses, and is inside the content (%d bytes) (exact=%v)", above, len(d.idx.content), past))
+
+		// A later edit, now that the worker HAS finished, must not promote: the
+		// array it would adopt was already invalidated by the edit above.
+		doc_replace_range(&d, 20 * LINE_CKPT_STRIDE, 0, transmute([]u8)string("late\n"))
+		li_chk(bad, !d.idx.ckpt_doc, "a later edit still does not promote a raced array")
+		_, still := doc_line_no_at(&d, above)
+		li_chk(bad, !still, fmt.tprintf("...and offset %d still refuses (exact=%v)", above, still))
+	}
+
+	// The index RESTARTS under a repaired array. doc_detach_mapping and
+	// doc_recover_from_fault both do this: they copy the mapped original into
+	// private memory and re-scan it, which produces checkpoints in `content`'s
+	// coordinates again. The repaired-mode flag has to go off with the array it
+	// described -- left on, the fresh grid is read as document offsets and every
+	// row below the edit comes back exact and wrong.
+	//
+	// edit_floor is what carries the divergence across the restart, which is why it
+	// is still maintained in the repaired mode where nothing reads it.
+	@(private = "file")
+	li_part_restart :: proc(bad: ^int) {
+		fmt.println("-- the index restarts under a repaired array --")
 		c := li_fixture(512 * 1024)
 		n := len(c)
 		snapshot := make([]u8, n) // c is handed to the document below
@@ -529,41 +907,121 @@ when NEWTPAD_TESTS {
 		doc_index_start(&d)
 		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
 
-		mid := 3 * LINE_CKPT_STRIDE
-		_, before := doc_line_no_at(&d, mid)
-		li_chk(bad, before, "clean buffer answers at 3 strides in")
+		mid := 5 * LINE_CKPT_STRIDE
+		doc_replace_range(&d, mid, 0, transmute([]u8)string("inserted\n"))
+		li_chk(bad, d.idx.ckpt_doc, "precondition -- the array was repaired before the restart")
 
-		// An edit near the end: everything below it must survive. This is the
-		// log-tailing and edit-a-cell-below case, and the reason the gate is a
-		// floor and not a modified bit.
-		d.cursor, d.anchor = n, n
-		doc_insert_text(&d, transmute([]u8)string("appended\nline\n"))
-		probe := 2 * LINE_CKPT_STRIDE + 7
-		got, exact := doc_line_no_at(&d, probe)
-		li_chk(bad, exact && got == li_truth(snapshot, probe), fmt.tprintf("offset %d below the edit is still exact (%d, want %d)", probe, got, li_truth(snapshot, probe)))
+		doc_index_start(&d) // the shape doc_detach_mapping / doc_recover_from_fault have
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		li_chk(bad, !d.idx.ckpt_doc, "the restart put the array back into content coordinates")
+		li_chk(bad, d.idx.edit_floor == mid, fmt.tprintf("...and edit_floor still knows where they diverged (%d, want %d)", d.idx.edit_floor, mid))
 
-		// An edit in the MIDDLE, and a probe strictly between the new floor and the
-		// end of the indexed content. That "strictly between" is the whole point:
-		// the obvious probe -- one past the end of the buffer -- is refused by
-		// doc_line_no_at's `at > len(idx.content)` clause before the floor is ever
-		// consulted, so it stays green with the floor gate deleted and proves
-		// nothing about it. This is the case the table view actually has (edit row
-		// 500, rows 501+ go blank) and the only one that fails when the gate goes.
-		d.cursor, d.anchor = 5 * LINE_CKPT_STRIDE, 5 * LINE_CKPT_STRIDE
-		doc_insert_text(&d, transmute([]u8)string("mid\n"))
-		below := 5 * LINE_CKPT_STRIDE - 9
+		below := mid - 100
 		bgot, bexact := doc_line_no_at(&d, below)
-		li_chk(bad, bexact && bgot == li_truth(snapshot, below), fmt.tprintf("offset %d below a MID-BUFFER edit is still exact (%d, want %d)", below, bgot, li_truth(snapshot, below)))
-		above := 5 * LINE_CKPT_STRIDE + 9
-		_, past := doc_line_no_at(&d, above)
-		li_chk(bad, !past, fmt.tprintf("offset %d above it refuses, and is inside the content (%d bytes) (exact=%v)", above, len(d.idx.content), past))
+		li_chk(bad, bexact && bgot == li_truth(snapshot, below), fmt.tprintf("below the edit is exact off the fresh scan (%d, want %d)", bgot, li_truth(snapshot, below)))
+		wrong, exacts := 0, 0
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		for at := 0; at <= len(body); at += LINE_CKPT_STRIDE / 8 {
+			got, exact := doc_line_no_at(&d, at)
+			if !exact {continue}
+			exacts += 1
+			if got != li_truth(body, at) {wrong += 1}
+		}
+		li_chk(bad, wrong == 0, fmt.tprintf("nothing above the floor is answered wrong after the restart (%d wrong of %d exact)", wrong, exacts))
+	}
 
-		// ...and an edit at the front poisons everything, because every later
-		// offset shifted.
+	// The same restart, through the product path that makes it worst: a line-ending
+	// conversion rewrites every terminator and then re-indexes the UNCONVERTED
+	// original, so document offsets are wrong by one byte per preceding line all
+	// the way down. Nothing here may be answered at all above offset 0, and
+	// certainly nothing wrongly.
+	@(private = "file")
+	li_part_eolconv :: proc(bad: ^int) {
+		fmt.println("-- a line-ending conversion re-indexes the old original --")
+		lf := li_fixture(256 * 1024)
+		defer delete(lf)
+		b := make([dynamic]u8, 0, 2 * len(lf))
+		for x in lf {
+			if x == '\n' {append(&b, '\r')}
+			append(&b, x)
+		}
+		c := make([]u8, len(b))
+		copy(c, b[:])
+		delete(b)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		d.eol = .CRLF
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		doc_replace_range(&d, 100, 0, transmute([]u8)string("z")) // adopt the array
+		li_chk(bad, d.idx.ckpt_doc, "precondition -- the array was repaired before the conversion")
+
+		doc_set_line_ending(&d, .LF)
+		li_chk(bad, d.eol == .LF, "the conversion ran")
+		li_chk(bad, !d.idx.ckpt_doc, "...and it put the array back into content coordinates")
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		li_chk(bad, len(body) < len(d.idx.content), fmt.tprintf("the document really is shorter than what is indexed (%d vs %d)", len(body), len(d.idx.content)))
+		wrong, exacts := 0, 0
+		for at := 0; at <= len(body); at += LINE_CKPT_STRIDE / 8 {
+			got, exact := doc_line_no_at(&d, at)
+			if !exact {continue}
+			exacts += 1
+			if got != li_truth(body, at) {wrong += 1}
+		}
+		li_chk(bad, wrong == 0, fmt.tprintf("nothing is answered off the unconverted original (%d wrong of %d exact)", wrong, exacts))
+	}
+
+	// What the repair costs per edit, measured as a difference rather than
+	// asserted: typing at the FRONT of the buffer (every entry shifts) against
+	// typing at the END (ckpt_repair's early-out fires and nothing shifts).
+	//
+	// Both loops let the caret advance with the text instead of resetting it,
+	// because push_undo coalesces a typing run only while `cursor == last_edit_at`
+	// -- reset the caret and every keystroke takes a full Snapshot (a cloned piece
+	// tree AND a cloned checkpoint array), which is a real cost but not the one
+	// this part is named after. Measured with the reset in place the gap read
+	// 220.6 us/edit and was almost entirely pt_snapshot. Coalescing both loops
+	// leaves the piece-table insert, the bookmark pass and the newline accounting
+	// identical between them, so the gap is the repair loop and nothing else.
+	@(private = "file")
+	li_part_cost :: proc(bad: ^int) {
+		fmt.println("-- cost of the repair, per edit --")
+		c := li_fixture(64 * 1024 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		entries := intrinsics.atomic_load(&d.idx.ckpt_n)
+		doc_replace_range(&d, d.pt.length, 0, transmute([]u8)string("z")) // promote
+		li_chk(bad, d.idx.ckpt_doc, "precondition -- the array is being repaired")
+
+		REP :: 20000
+		undo_before := len(d.undo)
+		d.cursor, d.anchor = d.pt.length, d.pt.length
+		t0 := time.tick_now()
+		for _ in 0 ..< REP {doc_insert_rune(&d, 'x')} // at the end: the early-out
+		tail := f64(time.duration_nanoseconds(time.tick_since(t0))) / REP
 		d.cursor, d.anchor = 0, 0
-		doc_insert_text(&d, transmute([]u8)string("x"))
-		_, after := doc_line_no_at(&d, probe)
-		li_chk(bad, !after, fmt.tprintf("after an edit at offset 0, offset %d refuses (exact=%v)", probe, after))
+		t1 := time.tick_now()
+		for _ in 0 ..< REP {doc_insert_rune(&d, 'x')} // at the front: every entry shifts
+		head := f64(time.duration_nanoseconds(time.tick_since(t1))) / REP
+		// The coalescing really did hold: two runs, two undo entries, not 40000.
+		// Without this the two numbers are dominated by snapshot cloning and the
+		// difference between them means nothing.
+		li_chk(bad, len(d.undo) - undo_before <= 2, fmt.tprintf("both runs coalesced into one undo entry each (%d added)", len(d.undo) - undo_before))
+		fmt.printfln(
+			"  %d checkpoints: %.0f ns/edit at the tail (early-out), %.0f ns/edit at the front, repair = %.0f ns (%.2f ns/entry) [debug build]",
+			entries,
+			tail,
+			head,
+			head - tail,
+			max(head - tail, 0) / f64(max(entries, 1)),
+		)
+		li_chk(bad, entries > 500, fmt.tprintf("...measured over a genuinely large array (%d entries)", entries))
 	}
 
 	// A read that faulted must not come back as `exact`.

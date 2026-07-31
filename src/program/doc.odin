@@ -942,10 +942,36 @@ visible_next :: proc(it: ^Visible_Iter) -> (row, start, end, vis_end: int, line_
 // worker already knows its running line total at each chunk boundary.
 LINE_CKPT_STRIDE :: 64 * 1024
 
-// One sparse offset->line checkpoint. `offset` is always k*LINE_CKPT_STRIDE for
-// entry k -- deliberately NOT a line start, which is what bounds the scan: a
-// checkpoint that had to land on a line start could not be placed at all inside a
-// single 500 MB line, and the lookup would fall back to walking from byte 0.
+// How far doc_line_no_at will scan forward from a checkpoint before refusing.
+//
+// While the checkpoints sit on the stride grid this is the same thing as the
+// stride, and the guard in doc_line_no_at says so. Once the array has been
+// repaired into document coordinates (Line_Index.ckpt_doc) it is NOT: an insert
+// widens the gap between two surviving checkpoints by exactly the inserted
+// length, and a delete that swallows whole strides removes the entries between
+// them, so a large paste or a large cut can leave two neighbours arbitrarily far
+// apart. The grid is what USED to make "bounded" true for free; with the grid
+// gone the bound has to be stated, and this is it.
+//
+// Two strides rather than one, so an ordinary edit -- a typed character, a table
+// cell rewritten, a pasted line -- never pushes a neighbouring row over the edge
+// and blanks it. Beyond this the answer is refused, which degrades a huge paste
+// to a blank number for the rows near it rather than for the whole file. That is
+// the trade the whole repair exists to make: bounded work per call, and a refusal
+// that is narrow instead of total.
+CKPT_SCAN_CAP :: 2 * LINE_CKPT_STRIDE
+
+// One sparse offset->line checkpoint. `offset` is k*LINE_CKPT_STRIDE for entry k
+// as the worker writes it -- deliberately NOT a line start, which is what bounds
+// the scan: a checkpoint that had to land on a line start could not be placed at
+// all inside a single 500 MB line, and the lookup would fall back to walking from
+// byte 0.
+//
+// The grid property holds only until the array is repaired into document
+// coordinates (Line_Index.ckpt_doc); after that the entries are still SORTED and
+// still unique, but their offsets are wherever the edits left them. Anything that
+// derived an index from an offset by division has to become a search -- see
+// ckpt_at_or_below.
 Line_Ckpt :: struct {
 	offset:  int, // byte offset in `content` this checkpoint describes
 	line_no: int, // 0-based line number containing `offset` (= newlines before it)
@@ -987,7 +1013,43 @@ Line_Index :: struct {
 	// a log growing at its tail, or a table cell edited on screen -- moves only
 	// the end of the buffer, and blanking every row number for it would be a
 	// self-inflicted regression.
+	//
+	// Still maintained exactly as before even when ckpt_doc is true and nothing
+	// reads it, because doc_index_start can throw the repaired array away and
+	// re-scan `content` at any time (doc_detach_mapping, doc_recover_from_fault,
+	// doc_set_line_ending). The moment it does, the surviving state has to be able
+	// to say where the document and the original diverge, and this is the only
+	// field that knows.
 	edit_floor: int,
+
+	// True once this array has been taken over by the main thread and is being
+	// maintained in DOCUMENT coordinates rather than `content`'s.
+	//
+	// This is the fix for "editing one cell blanks every row number below it, and
+	// saving does not bring them back". The worker scans `content`, the immutable
+	// original, so its checkpoints are in the ORIGINAL's coordinate space; the
+	// lookup is asked in DOCUMENT offsets. Those two spaces coincide only while
+	// the document is unedited, which is precisely what edit_floor detects -- and
+	// a save writes the buffer to disk without touching either the piece tree or
+	// `content`, so it reconciles nothing and the floor stays where the edit put
+	// it. Only a reopen ever cleared it.
+	//
+	// So instead of detecting the divergence, remove it: once the worker is done
+	// the array is stable and main-thread-owned, and every subsequent edit shifts
+	// the entries above it (ckpt_repair). From then on the array IS in document
+	// coordinates and edit_floor is not consulted at all.
+	//
+	// It is a one-way promotion, taken in pt_edit_replace at the first edit that
+	// finds a finished index and an untouched buffer. It can never be taken later:
+	// an edit made WHILE the worker was still scanning shifted document offsets
+	// under an array that was concurrently being written in original coordinates,
+	// and nothing recorded what to shift by. That case keeps the old edit_floor
+	// gate, which is the honest answer for it -- see doc_line_no_at.
+	//
+	// Reset by doc_index_start (the array it describes is about to be freed and
+	// re-scanned in `content` coordinates) and carried on the undo Snapshot, since
+	// undo/redo replace the whole piece tree without going through any edit path.
+	ckpt_doc:   bool,
 }
 
 // What produced an edit. Used to decide whether the next one continues it (so a
@@ -1002,7 +1064,21 @@ Edit_Kind :: enum u8 {
 	Newline,
 }
 
-UNDO_MAX :: 200 // entries kept; oldest dropped. Each holds a cloned piece tree.
+// Entries kept; oldest dropped. Each holds a cloned piece tree, a cloned bookmark
+// set, and a cloned checkpoint array.
+//
+// That last one is the only clone whose size follows the FILE rather than the
+// edit history: len(original)/LINE_CKPT_STRIDE + 1 entries of 16 bytes, i.e.
+// 0.024% of the original per entry, so a full stack costs ~4.9% of the file. On
+// the sizes this editor is actually used at (a 10 MB CSV: 2.5 KB per entry, 500 KB
+// full) that is noise. On a 2 GB log it is ~100 MB, and that is the honest upper
+// bound of the checkpoint repair -- named here rather than discovered later. The
+// cheaper design is a per-snapshot log of the repairs applied since it was taken,
+// inverted on restore; it is proportional to edits instead of to file size, and it
+// was not built because it needs the destroyed entries carried anyway and a new
+// invariant ("every edit between two snapshots appends to the log") that
+// development-loop.md §4 says is where this project's bugs come from.
+UNDO_MAX :: 200
 
 Snapshot :: struct {
 	root:      ^base.Node, // cloned piece tree
@@ -1019,6 +1095,29 @@ Snapshot :: struct {
 	// bookmarks it spanned, and nothing in the forward direction remembers what
 	// they were. Carrying the set is what makes undo restore them.
 	bookmarks: []int,
+	// The line-offset checkpoints belonging to this state, cloned, and whether
+	// they were in document coordinates when it was taken. Owned by the snapshot
+	// exactly like `root` and `bookmarks` are, and freed wherever they are.
+	//
+	// Here for the same reason the bookmarks are, one level worse. Undo and redo
+	// restore a whole piece tree through pt_restore and do NOT go through
+	// pt_edit_replace, so ckpt_repair never sees them: without this the array
+	// would go on describing a buffer that no longer exists, and doc_line_no_at
+	// would answer from it with `exact = true`. That is not a blank row number,
+	// it is a confident wrong one -- development-loop.md §4 Shape A, and the worst
+	// available outcome for a procedure whose second result exists to prevent
+	// exactly that.
+	//
+	// A snapshot rather than a replay, and here there is no choice about it: the
+	// repair DESTROYS the checkpoints a delete swallowed, so the forward rules are
+	// lossy and cannot be run backwards. Cloned only when ckpt_doc is set, which
+	// also means only when the worker has finished -- while it is still scanning
+	// the array is being written by another thread and is not ours to copy.
+	//
+	// Cost: 16 bytes per 64 KB of ORIGINAL content, per undo entry. See the note
+	// on UNDO_MAX.
+	ckpts:     []Line_Ckpt,
+	ckpt_doc:  bool,
 	kind:      Edit_Kind, // the edit that PRODUCED this state (.None = as opened)
 	count:     int, // characters/edits involved, for the label
 }
@@ -1467,6 +1566,15 @@ doc_index_start :: proc(doc: ^Document) {
 	// exact line numbers off offsets that are wrong by one byte per preceding
 	// line. The floor is established where a document is CONSTRUCTED and only ever
 	// falls from there.
+	//
+	// ckpt_doc, unlike edit_floor, MUST be cleared: the array below is a fresh one
+	// the worker is about to fill in `content` coordinates, and leaving the flag
+	// set would tell doc_line_no_at to read it as document offsets and ignore the
+	// floor. doc_set_line_ending is the case that makes this load-bearing -- it
+	// rewrites every terminator (so edit_floor goes to 0) and then re-indexes the
+	// UNCONVERTED original, and with the flag left set every row number in the file
+	// would come back exact and wrong by one byte per preceding line.
+	doc.idx.ckpt_doc = false
 	doc.idx.th = thread.create_and_start_with_data(&doc.idx, index_worker)
 }
 
@@ -1481,6 +1589,7 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.idx.ckpts)
 	doc.idx.ckpts = nil // same freed-but-live header hazard as lex_idx below
 	intrinsics.atomic_store(&doc.idx.ckpt_n, 0)
+	doc.idx.ckpt_doc = false // the array it claims to describe has just been freed
 	lex_index_stop(doc) // joins before the arrays below are freed
 	delete(doc.lex_idx.line_starts)
 	delete(doc.lex_idx.states)
@@ -1702,27 +1811,66 @@ doc_line_count :: proc(doc: ^Document) -> int {
 	return lc + doc.nl_delta if intrinsics.atomic_load(&doc.idx.done) else lc
 }
 
+// Index of the last checkpoint whose offset is <= `at`, or -1 if there is none.
+//
+// A search, not a division, because the repaired array (Line_Index.ckpt_doc) is
+// no longer on the stride grid: every insert below an entry moves it and every
+// delete that swallows one removes it. Sortedness is what survives, and it
+// survives by construction -- ckpt_repair's three cases are each monotone in
+// `offset`, exactly as bookmarks_shift_replace's are, so no entry can overtake
+// its neighbour and no re-sort is needed.
+//
+// Deliberately the same lower-bound shape as bookmark_find rather than a second
+// idiom for the same job.
+@(private = "file")
+ckpt_at_or_below :: proc(ck: []Line_Ckpt, at: int) -> int {
+	lo, hi := 0, len(ck)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		if ck[mid].offset <= at {lo = mid + 1} else {hi = mid}
+	}
+	return lo - 1
+}
+
 // 0-based line number containing byte `at` (a DOCUMENT offset, the same space
 // doc.cursor and doc.top live in).
 //
-// Bounded, and that is the point of it. Checkpoints sit at fixed byte strides, so
-// the one at or before `at` is found by a division rather than a search, and the
-// forward newline count from it reads at most LINE_CKPT_STRIDE bytes. It never
-// walks from byte 0 -- which is what the table view's row-number gutter, the
-// zebra parity and the sort each needed and none of them could have.
+// Bounded, and that is the point of it. The checkpoint at or before `at` is found
+// without touching the buffer, and the forward newline count from it reads at
+// most CKPT_SCAN_CAP bytes. It never walks from byte 0 -- which is what the table
+// view's row-number gutter, the zebra parity and the sort each needed and none of
+// them could have.
 //
-// `exact = false` means "the index cannot answer this yet", and every caller must
+// TWO MODES, and which one is running is the whole subtlety of this procedure:
+//
+//   - `ckpt_doc` set: the array has been repaired into DOCUMENT coordinates by
+//     every edit since the index finished (ckpt_repair). Offsets are no longer on
+//     the stride grid, so the entry is found by search; the bound is the explicit
+//     CKPT_SCAN_CAP rather than the stride; and edit_floor is not consulted at
+//     all, because there is no divergence left for it to describe. This is the
+//     mode an edited-and-saved buffer runs in, and it is the whole point of the
+//     repair: editing one cell used to blank every row number below it, and
+//     saving did not bring them back.
+//
+//   - `ckpt_doc` clear: the original scheme unchanged. Entries are on the grid in
+//     `content`'s coordinates, so the index is a division, and edit_floor gates
+//     everything at or above the lowest edit. This is the mode a document is in
+//     while the worker is still scanning -- and permanently, for a document that
+//     was edited DURING that scan, since nothing recorded what to repair by.
+//
+// `exact = false` means "the index cannot answer this", and every caller must
 // draw NOTHING rather than a plausible number. This is development-loop.md §4
 // Shape A -- a bounded scan reporting a confident wrong answer -- and returning
-// the flag is the whole reason this signature has two results. The three ways to
-// get it:
+// the flag is the whole reason this signature has two results. The ways to get it:
 //
 //   - the worker has not reached `at` (no checkpoint covers it, or none exist);
-//   - `at` is past the end of the indexed content;
-//   - the buffer has been edited at or below `at`, so document offsets and the
-//     indexed original's offsets no longer describe the same bytes. Edits below
-//     an untouched prefix (a log growing at its tail, a table cell edited further
-//     down) leave that prefix exact -- see Line_Index.edit_floor;
+//   - `at` is past the end of the buffer (of `content`, in the unrepaired mode);
+//   - unrepaired only: the buffer has been edited at or below `at`, so document
+//     offsets and the indexed original's offsets no longer describe the same
+//     bytes. Edits below an untouched prefix (a log growing at its tail, a table
+//     cell edited further down) leave that prefix exact -- see edit_floor;
+//   - repaired only: the nearest checkpoint below `at` is further than
+//     CKPT_SCAN_CAP away, which is what a huge paste or a huge cut leaves behind;
 //   - a read of the mapped original faulted, so the bytes counted are not the
 //     file's (see the fault check below the scan).
 //
@@ -1734,35 +1882,59 @@ doc_line_count :: proc(doc: ^Document) -> int {
 // Note what it is NOT: it does not add nl_delta the way doc_line_count does. A
 // total can be corrected forward by a net newline count; a position cannot,
 // because which side of the edit `at` falls on decides whether the correction
-// applies at all. Refusing is the honest answer and the floor keeps the refusal
-// narrow.
+// applies at all. Refusing is the honest answer and the two mechanisms above keep
+// the refusal narrow.
 doc_line_no_at :: proc(doc: ^Document, at: int) -> (line_no: int, exact: bool) {
 	idx := &doc.idx
-	if at < 0 || at > len(idx.content) || at > idx.edit_floor {return 0, false}
+	if at < 0 {return 0, false}
 	// Loaded before the entry is touched: everything below index `n` is complete
 	// and will not be rewritten, so the plain reads that follow are ordered behind
-	// this load. See index_worker for the publishing side.
+	// this load. See index_worker for the publishing side. In the repaired mode
+	// the worker is long gone and this is ckpt_repair's own compacted count, stored
+	// through the same atomic so there is one field rather than two.
 	n := intrinsics.atomic_load(&idx.ckpt_n)
 	if n == 0 {return 0, false}
-	k := at / LINE_CKPT_STRIDE
-	if k >= n {
-		// `at` is past the last published checkpoint. One case is legitimate: a
-		// query at exactly len(content) on a finished index rounds up into a
-		// stride that holds no bytes and so never got a checkpoint of its own.
-		// Answer that from the last one -- still under a stride of scanning,
-		// since the final checkpoint is at most one stride below the end. Refuse
-		// everything else, which is the worker simply not being there yet.
-		if !intrinsics.atomic_load(&idx.done) {return 0, false}
-		k = n - 1
+	ck: Line_Ckpt
+	scan_cap: int
+	if idx.ckpt_doc {
+		// The document's own length, not len(idx.content): a buffer that has grown
+		// past the original it was opened from is exactly the case this mode
+		// exists for, and refusing on the original's length would blank every row
+		// a log or a paste added.
+		if at > doc.pt.length {return 0, false}
+		j := ckpt_at_or_below(idx.ckpts[:n], at)
+		// Entry 0 sits at offset 0 and no repair rule can move it (`offset <= at`
+		// is the untouched case and 0 <= at for every edit), so this cannot trip
+		// while the array behaves -- checked anyway, for the same reason the bound
+		// below is checked rather than argued.
+		if j < 0 {return 0, false}
+		ck = idx.ckpts[j]
+		scan_cap = CKPT_SCAN_CAP
+	} else {
+		if at > len(idx.content) || at > idx.edit_floor {return 0, false}
+		k := at / LINE_CKPT_STRIDE
+		if k >= n {
+			// `at` is past the last published checkpoint. One case is legitimate: a
+			// query at exactly len(content) on a finished index rounds up into a
+			// stride that holds no bytes and so never got a checkpoint of its own.
+			// Answer that from the last one -- still under a stride of scanning,
+			// since the final checkpoint is at most one stride below the end. Refuse
+			// everything else, which is the worker simply not being there yet.
+			if !intrinsics.atomic_load(&idx.done) {return 0, false}
+			k = n - 1
+		}
+		ck = idx.ckpts[k]
+		scan_cap = LINE_CKPT_STRIDE
 	}
-	ck := idx.ckpts[k]
 	// What actually bounds the scan below, checked here rather than argued from
-	// the worker's invariants. It cannot trip while the index behaves (entry k
-	// sits at k*LINE_CKPT_STRIDE and `done` is published after every entry), but a
-	// bounded scan whose bound lives in another procedure is §4's Shape A waiting
-	// to happen -- the last four instances were all a scan that could not tell it
-	// had been handed the wrong floor.
-	if at < ck.offset || at - ck.offset > LINE_CKPT_STRIDE {return 0, false}
+	// the worker's invariants. In the unrepaired mode it cannot trip while the
+	// index behaves (entry k sits at k*LINE_CKPT_STRIDE and `done` is published
+	// after every entry); in the repaired mode it is the ONLY thing standing
+	// between a large paste and an unbounded walk. Either way, a bounded scan
+	// whose bound lives in another procedure is §4's Shape A waiting to happen --
+	// the last four instances were all a scan that could not tell it had been
+	// handed the wrong floor.
+	if at < ck.offset || at - ck.offset > scan_cap {return 0, false}
 	// Through the piece tree rather than idx.content directly: reads of a mapped
 	// original must go through the SEH shim, and pt_read is where that lives. It
 	// is also the read that matches `at`'s space -- exact against document offsets
@@ -1984,12 +2156,115 @@ bookmarks_shift_replace :: proc(doc: ^Document, at, n: int, text: []u8) {
 // same offset through the two thin wrappers is exactly the bug
 // bookmarks_shift_replace's comment describes, so there is no pair of calls that
 // can express it.
+// Move the line-offset checkpoints across the edit that is ABOUT TO BE APPLIED:
+// the document range [at, at+n) is being replaced by `text`.
+//
+// Only runs once the array is in document coordinates (Line_Index.ckpt_doc); see
+// that field for why the promotion happens where it does and why it can never
+// happen after an edit has already raced the worker.
+//
+// MUST run BEFORE the mutation. The line delta needs the newline count of the
+// bytes being REMOVED, and after pt_delete those bytes are gone -- counting after
+// the fact counts the replacement instead, which is silently right for a pure
+// insert and silently wrong for everything else. Same constraint, same reason, as
+// bookmarks_shift_replace's byte_at(at-1) read directly below the call site.
+//
+// The three cases, with m = len(text):
+//
+//   offset <= at        untouched. Nothing at or before `at` moved, and the
+//                       entry's line_no counts newlines STRICTLY BEFORE its
+//                       offset -- so an insert exactly AT a checkpoint leaves
+//                       both halves of it correct.
+//   at < offset < at+n  DESTROYED, and compacted out. The byte the entry names
+//                       is being deleted; afterwards the offset would name
+//                       whatever moved up into it, which is a checkpoint quietly
+//                       describing a different line -- the same outcome
+//                       bookmarks_shift_replace drops a bookmark to avoid, and
+//                       worse here because nothing downstream would notice.
+//   offset >= at+n      offset += m - n, line_no += (newlines in text) -
+//                       (newlines removed). The entry lands at at+m for
+//                       offset == at+n, which is exactly where those bytes now
+//                       begin.
+//
+// Every case is monotone in `offset`, so the array stays sorted and unique
+// without a re-sort and ckpt_at_or_below's binary search stays valid.
+@(private = "file")
+ckpt_repair :: proc(doc: ^Document, at, n: int, text: []u8) {
+	idx := &doc.idx
+	if !idx.ckpt_doc {return}
+	cnt := intrinsics.atomic_load(&idx.ckpt_n)
+	if cnt == 0 {return}
+	// The everyday case, and the reason a log tailing at 60 Hz pays nothing: an
+	// edit at or past the last checkpoint moves no entry and destroys none. Taken
+	// BEFORE the newline counting below, which is the expensive half -- a
+	// doc_absorb_append of a 1 MB chunk would otherwise re-scan it for a delta
+	// that could not apply to anything.
+	if idx.ckpts[cnt - 1].offset <= at {return}
+	d_bytes := len(text) - n
+	d_lines := 0
+	for b in text {if b == '\n' {d_lines += 1}}
+	// The bytes on their way out, read from the LIVE buffer. Bounded by the size
+	// of the edit, not by the file: a huge cut pays for its own size here, which
+	// is what doc_replace_range and replace_sel_raw already pay for nl_delta.
+	if n > 0 {d_lines -= count_newlines(doc, at, n)}
+	keep := 0
+	for k in 0 ..< cnt {
+		c := idx.ckpts[k]
+		switch {
+		case c.offset <= at:
+			idx.ckpts[keep] = c
+			keep += 1
+		case c.offset < at + n: // named a byte inside the replaced range: destroyed
+		case:
+			idx.ckpts[keep] = Line_Ckpt{offset = c.offset + d_bytes, line_no = c.line_no + d_lines}
+			keep += 1
+		}
+	}
+	// Stored through the worker's atomic even though the worker is finished and
+	// gone: one field for "entries a reader may look at" rather than two that can
+	// disagree. `done` was published before this thread could ever have set
+	// ckpt_doc, so there is no writer left to race.
+	intrinsics.atomic_store(&idx.ckpt_n, keep)
+}
+
+// Take the checkpoint array over from the worker, if it is there to take.
+//
+// The three conditions are the whole promotion rule. `edit_floor == max(int)` is
+// exactly "no edit has ever touched this buffer", so together with a finished
+// worker it means the published checkpoints already ARE document offsets and the
+// array can be adopted as-is, with nothing to reconcile. Miss either and the
+// array describes `content` at some offset the document has already moved, and
+// nothing recorded by how much.
+//
+// Called from the two places that can be the FIRST thing to happen to a clean
+// buffer: an edit (pt_edit_replace), and the undo snapshot taken just before one
+// (snapshot). Both, not just the edit -- push_undo runs first, so a promotion
+// only in pt_edit_replace would let the very first snapshot record "no usable
+// index" and undoing all the way back to the opened state would then refuse for
+// a document that had never had anything wrong with it.
+@(private = "file")
+ckpt_adopt :: proc(doc: ^Document) {
+	if doc.idx.ckpt_doc || doc.idx.edit_floor != max(int) {return}
+	if !intrinsics.atomic_load(&doc.idx.done) {return}
+	doc.idx.ckpt_doc = true
+}
+
 @(private = "file")
 pt_edit_replace :: proc(doc: ^Document, at, n: int, text: []u8) {
 	// The one place every edit passes through, so the one place the line index's
-	// divergence floor can be maintained. Below `at` the document and the indexed
-	// original are still byte-for-byte the same; see Line_Index.edit_floor.
-	if n > 0 || len(text) > 0 {doc.idx.edit_floor = min(doc.idx.edit_floor, at)}
+	// checkpoints can be kept honest across an edit.
+	//
+	// The promotion first, and it reads edit_floor BEFORE the line below lowers
+	// it -- see ckpt_adopt.
+	if n > 0 || len(text) > 0 {
+		ckpt_adopt(doc)
+		ckpt_repair(doc, at, n, text) // before the mutation: it counts the removed bytes
+		// Still maintained even when ckpt_doc makes nobody read it. Below `at` the
+		// document and the indexed original are byte-for-byte the same, and if
+		// doc_index_start ever throws the repaired array away and re-scans
+		// `content`, this is the only record of where the two part company.
+		doc.idx.edit_floor = min(doc.idx.edit_floor, at)
+	}
 	bookmarks_shift_replace(doc, at, n, text) // before the mutation: it reads byte_at(at-1)
 	if n > 0 {base.pt_delete(&doc.pt, at, n)}
 	if len(text) > 0 {base.pt_insert(&doc.pt, at, text)}
@@ -2060,6 +2335,22 @@ doc_bookmark_cycle :: proc(doc: ^Document, back: bool) -> bool {
 
 @(private = "file")
 snapshot :: proc(doc: ^Document) -> Snapshot {
+	// Cloned only in the repaired mode. Unrepaired, the array is the worker's --
+	// it may be mid-write, and copying entries the publishing scheme has not
+	// published yet is exactly the torn read that scheme exists to prevent.
+	// Restoring one over a live worker would be worse still: doc_index_start
+	// promises the base pointer does not move for the duration of a scan.
+	//
+	// The adopt runs here as well as in pt_edit_replace because push_undo takes
+	// this snapshot BEFORE the edit reaches pt_edit_replace: without it the first
+	// snapshot of every session records "no usable index", and undoing back to the
+	// opened state refuses on a buffer that is byte-for-byte the file.
+	ckpt_adopt(doc)
+	ckpts: []Line_Ckpt
+	if doc.idx.ckpt_doc {
+		n := intrinsics.atomic_load(&doc.idx.ckpt_n)
+		if n > 0 {ckpts = slice.clone(doc.idx.ckpts[:n])}
+	}
 	return {
 		root = base.pt_snapshot(&doc.pt),
 		length = doc.pt.length,
@@ -2067,6 +2358,8 @@ snapshot :: proc(doc: ^Document) -> Snapshot {
 		anchor = doc.anchor,
 		nl_delta = doc.nl_delta,
 		bookmarks = slice.clone(doc.bookmarks[:]) if len(doc.bookmarks) > 0 else nil,
+		ckpts = ckpts,
+		ckpt_doc = doc.idx.ckpt_doc,
 	}
 }
 
@@ -2079,6 +2372,7 @@ snapshot :: proc(doc: ^Document) -> Snapshot {
 snapshot_free :: proc(s: Snapshot) {
 	base.pt_free_node_tree(s.root)
 	delete(s.bookmarks)
+	delete(s.ckpts)
 }
 
 @(private = "file")
@@ -2096,6 +2390,50 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 	clear(&doc.bookmarks)
 	append(&doc.bookmarks, ..s.bookmarks)
 	delete(s.bookmarks)
+	// ...and the checkpoints belonging to it, for the same reason and with more at
+	// stake. pt_restore above replaced the whole buffer without any edit path
+	// running, so ckpt_repair never saw this transition: leaving the live array
+	// alone would leave it describing a document that no longer exists, and
+	// doc_line_no_at would keep answering from it with `exact = true`. A blank row
+	// number is a nuisance; a confident wrong one is development-loop.md §4's
+	// Shape A, which is what this restore exists to prevent.
+	//
+	// Three conditions, all required, and the fall-through is the SAME refusal the
+	// unrepaired mode already runs on rather than a new path:
+	//
+	//   s.ckpt_doc  -- the snapshot was taken in the repaired mode, so its clone
+	//                  is a complete array in that state's document coordinates.
+	//   done        -- no worker is writing the live array right now. A
+	//                  doc_index_start between the snapshot and this restore
+	//                  (doc_detach_mapping, doc_recover_from_fault) would have one
+	//                  running, and clobbering its array mid-scan is the exact
+	//                  hazard doc_index_start's stable-base-pointer promise rules
+	//                  out.
+	//   it fits     -- that same restart also RESIZES the array; a clone from
+	//                  before it may be longer than what is allocated now.
+	//
+	// Copied into the existing allocation rather than swapping the slice header,
+	// so nothing that already holds `ckpts` can be left pointing at freed memory.
+	if s.ckpt_doc && intrinsics.atomic_load(&doc.idx.done) && len(s.ckpts) <= len(doc.idx.ckpts) {
+		copy(doc.idx.ckpts, s.ckpts)
+		intrinsics.atomic_store(&doc.idx.ckpt_n, len(s.ckpts))
+		doc.idx.ckpt_doc = true
+	} else {
+		// Refuse from here on rather than answer from an array that describes the
+		// wrong buffer -- the same narrow refusal a document edited mid-scan lives
+		// with, not a new one.
+		//
+		// The unrepaired mode still answers everything at or below edit_floor, and
+		// that stays SOUND over a repaired array even though it indexes by
+		// division: every repair rule leaves entries whose offset is <= the edit's
+		// offset completely alone, and edit_floor is the minimum over every edit,
+		// so an entry at or below it was never moved and never compacted out --
+		// its array index is still offset/LINE_CKPT_STRIDE and its line_no is still
+		// `content`'s, which is still the document's down there. Above the floor
+		// the gate refuses before any of it is read.
+		doc.idx.ckpt_doc = false
+	}
+	delete(s.ckpts)
 	// This bypasses set_cursor, so a live rectangle would otherwise survive
 	// undo/redo describing line/cell offsets a just-restored tree may no
 	// longer have.
