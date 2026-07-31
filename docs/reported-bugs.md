@@ -11,56 +11,6 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
-## The table has no right edge, and its horizontal scroll snaps to two different things
-
-**Reported 2026-07-31 by Wyatt** on v0.34.1, with screenshots, minutes after the previous four landed.
-
-### 1. The row bands run to the window edge with no content in them
-
-*"this looks wrong... table doesn't end on the right."* The zebra bands, the hover lift and the header
-band are all drawn to `table_right(width)` — the whole window minus the scrollbar — while the columns
-now stop at their content width. On a wide window that is a few hundred pixels of banded emptiness,
-and the table reads as broken rather than as narrow.
-
-**This is a consequence of the v0.34.1 content-width fix, not an independent bug.** It was invisible
-while columns stretched to fill the window, because then the content edge *was* the window edge. The
-band width and the column layout were two expressions of the same number and nobody noticed, which is
-the same shape as every other seam defect in this file.
-
-**The fix: bands end at the last column's right edge**, i.e. `min(content_right, table_right(width))`.
-Beyond it is plain `bg_base`. Note `table_cols_layout`'s existing comment argues the band must reach
-the **left** window edge or *"a band starting 24px in reads as a box"* — that reasoning is about the
-left and does not transfer to the right, where the opposite is true. Say so in the comment, or the two
-will look contradictory.
-
-### 2. The horizontal scroll snaps, and to two different models at once
-
-*"the horizontal scroll gets buggy right around here, it's like it's trying to snap to two different
-things... i'm not sure the horizontal scroll should snap at all, maybe just act like any other view."*
-
-**He is right, and the diagnosis is literal.** `doc.table_col` is a **column index**, not a pixel
-offset (`doc.odin:1184`), and `hscroll_model` has a whole mode named `.Columns` for it
-(`main.odin:1288`) whose comment says *"the editor scrolls by CELLS (doc.h_scroll), while the grid
-scrolls by COLUMNS (doc.table_col)"*. So:
-
-- panning moves a **whole column** per step, which with content-width columns of unequal width is a
-  jump of wildly varying size;
-- the thumb's `span` is `table_cols_fitting` — a **column count** derived from a pixel measurement —
-  while its `pos` is a **column index**. Those two only agree when every column is the same width, so
-  the thumb changes size as it moves. That is the second "thing" it appears to snap to.
-
-**Decision: make the grid's horizontal scroll pixel-based, like every other view.** There is no reason
-for the grid to be the one surface that scrolls in a different unit, and column snapping only ever
-looked acceptable while columns were uniform.
-
-**This is a seam change and must be treated as one.** `doc.table_col` feeds `table_start_col` →
-`table_cols_layout`, which is the single producer of the grid's x axis, consumed by the draw, the cell
-hit-test, the link layout, the in-cell edit box and the scrollbar — and `table_cell_at` resolves to a
-byte range that `table_edit_commit` writes. Changing the unit of that value without changing every
-consumer writes an edit into the wrong column. Check the wheel (`main.odin:1032`), `table_max_col`,
-`table_cols_fitting`, and **whether `table_col` is persisted in the session** — if it is, a saved
-column index read back as a pixel offset silently restores the wrong scroll position.
-
 ## "The preview does not always respect spaces" — one defect fixed, needs Wyatt's confirmation
 
 **Reported 2026-07-29** with a side-by-side screenshot of the editor and the preview: *"it looks like it's

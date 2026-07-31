@@ -227,7 +227,7 @@ H_SCROLL: int = 0
 //
 // Zero in the views that REPLACE the text pass (doc_read_only_view: the grid and
 // full Markdown Preview), not just in the wrapped/filtered ones. Neither of those
-// two reads H_SCROLL -- table_draw pans doc.table_col instead and Preview lays out
+// two reads H_SCROLL -- table_draw pans doc.table_hscroll_px instead and Preview lays out
 // to the pane -- but doc.h_scroll survives a view toggle, so a document panned in
 // text view and then switched to the grid left H_SCROLL non-zero with nothing
 // honouring it. The visible consequence was render_frame's left-margin cover strip
@@ -1181,7 +1181,26 @@ Document :: struct {
 	// Read-only table view of a CSV/TSV (see table.odin), toggled per document.
 	table:       bool,
 	table_delim: u8, // ',' or '\t'; chosen when the view is turned on
-	table_col:    int, // horizontal scroll: first visible table column
+	// The grid's horizontal scroll, in PIXELS from the left edge of the first
+	// column -- the same kind of number doc.h_scroll is for the text view, which
+	// is why the name says its unit out loud.
+	//
+	// It was `table_col`, a COLUMN INDEX, until 2026-07-31. That made the grid the
+	// one surface in the app that panned in a different unit from every other, so
+	// a drag moved by a whole column at a time -- a jump of wildly varying size
+	// once columns were laid out at their content width -- and the scrollbar's
+	// thumb sized itself from a column COUNT while positioning itself from a
+	// column INDEX, so it changed size as it moved. Wyatt, live use, v0.34.1:
+	// *"it's like it's trying to snap to two different things."* Renamed rather
+	// than repurposed, deliberately: every consumer of the old field had to be
+	// visited (table_cols_layout and everything downstream of it resolves a pixel
+	// to a byte range that table_edit_commit WRITES), and a field that kept its
+	// name while changing its meaning is the one shape that lets a consumer be
+	// missed silently.
+	//
+	// The row-number gutter is NOT part of this axis -- it is sticky, so the
+	// pannable width is table_view_w, not table_right.
+	table_hscroll_px: int,
 	table_cols:   int, // column count seen this frame (set by table_draw)
 	table_widths: [dynamic]int, // per-column cell widths, computed once from a
 	// sample when the view opens — so columns don't shift as different rows scroll

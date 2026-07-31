@@ -47,8 +47,8 @@ import plat "src:platform"
 // from the same sentence. md_table_fit_cells SHRINKS natural widths into a fixed
 // measure and, under real pressure, drops columns -- correct for the markdown
 // preview, which has no horizontal scroll and would otherwise paint a table over
-// the scrollbar. The grid does have horizontal scroll (doc.table_col,
-// table_start_col, the h-scrollbar), so a column too wide for the window is
+// the scrollbar. The grid does have horizontal scroll (doc.table_hscroll_px,
+// table_scroll_x, the h-scrollbar), so a column too wide for the window is
 // reached by scrolling, never by compression: shrinking a 40-cell column to 4
 // because a CSV has thirty of them would make the data unreadable and the
 // h-scrollbar pointless, and dropping one outright is the same instinct §10
@@ -685,6 +685,24 @@ table_abs_rows :: proc(doc: ^Document, rows: int, allocator := context.temp_allo
 		if line_end {line += 1}
 	}
 	return out
+}
+
+// Which zebra band visible row `r` belongs to: 1 = banded, 0 = on the page.
+//
+// ONE producer, because two passes now ask. The zebra pass paints the band and
+// the gutter pass paints a COVER STRIP over the first 56px of the same row (the
+// cells scroll under the sticky gutter and there is no scissor rect here), so
+// the strip has to come back the same colour as what it covers. Two copies of
+// `absn[r] % 2 if ... else r % 2` would be two chances for the gutter to end up
+// a shade off the row it sits in, on alternating rows, which reads as a
+// rendering fault rather than as a colour bug.
+//
+// The FALLBACK to `r % 2` on a refused row is the one place this draw is allowed
+// to guess: a band carries no information, so a wrong band is a cosmetic hiccup,
+// where a wrong row NUMBER is a lie about which line the reader is looking at.
+// The gutter draws no number on the same refusal this papers over.
+table_row_band :: #force_inline proc(absn: []int, r: int) -> int {
+	return absn[r] % 2 if absn[r] != TABLE_ABS_NONE else r % 2
 }
 
 // --- §10's view-only sort: ONE producer for the row order -----------------
@@ -1360,24 +1378,87 @@ Table_Col :: struct {
 	align: Table_Align,
 }
 
-// Right edge of the grid: the window minus the vertical scrollbar.
+// The furthest right anything in this view may be DRAWN: the window minus the
+// vertical scrollbar. Not where the table ends -- that is table_content_right,
+// and conflating the two is what left the bands running into empty space.
 table_right :: #force_inline proc(width: f32) -> f32 {return width - SCROLLBAR_W}
 
-// The leftmost visible column, clamped. One expression, because the draw, both
-// hit-tests and the horizontal scrollbar all need the same answer and
-// doc.table_col can be stale by a frame after a resize narrows the grid.
-table_start_col :: #force_inline proc(doc: ^Document) -> int {
-	return clamp(doc.table_col, 0, table_max_col(doc))
+// The width the horizontal scroll actually pans: everything between the sticky
+// row-number gutter and the grid's right edge.
+//
+// The gutter is EXCLUDED because it does not scroll. It carries the row's
+// identity rather than its content (table_gutter_w), so it stays put while the
+// cells slide under it, and a pannable width that included it would let the last
+// column stop 56px short of the right edge at full scroll.
+table_view_w :: #force_inline proc(width: f32) -> f32 {
+	return max(0, table_right(width) - table_gutter_w())
 }
 
-// Every visible column's cell rectangle, left to right from `start_col`. THE
-// producer for the grid's x axis: consumed by the draw, the cell hit-test, the
-// link layout, the in-cell edit box and the horizontal scrollbar's thumb
-// (table_cols_fitting). Four of those five used to advance their own copy of
+// One column's laid-out width in pixels: its cells plus §10's padding on both
+// sides. THE definition, so table_cols_layout (which places the columns) and
+// table_content_w (which measures all of them for the scroll range) cannot come
+// to disagree about how wide a column is -- the scroll range would then either
+// refuse to reach the last column or pan past the end of the table.
+table_col_w :: #force_inline proc(cells: int, char_w: f32) -> f32 {
+	return f32(cells) * char_w + TABLE_CELL_PAD_X * 2
+}
+
+// Every column's width added up -- the full extent of the pannable axis.
+//
+// A SUM, and it has to be: table_cols_layout only knows about the columns that
+// are on screen, so it cannot answer "how much is there in total". That is the
+// one thing the layout is not the producer of, and the two are kept honest by
+// both going through table_col_w rather than by both spelling out the same
+// expression.
+table_content_w :: proc(doc: ^Document, char_w: f32) -> f32 {
+	w := f32(0)
+	for cells in doc.table_widths {w += table_col_w(cells, char_w)}
+	return w
+}
+
+// The furthest right the grid may be panned, in PIXELS. Zero when the whole
+// table fits, which is also what makes the h-scrollbar hide itself
+// (hscrollbar_geo refuses on max <= 0).
+//
+// Rounded UP (the +0.5 is a round-to-nearest on a value that is then used as an
+// inclusive bound) so that full scroll puts the last column's right edge AT the
+// grid's right edge rather than a fraction of a pixel short of it -- char_w is
+// fractional, so a truncated bound leaves a sliver of the last column
+// permanently unreachable.
+table_max_scroll_x :: proc(doc: ^Document, char_w, width: f32) -> int {
+	over := table_content_w(doc, char_w) - table_view_w(width)
+	if over <= 0 {return 0}
+	return int(over + 0.5)
+}
+
+// The grid's horizontal scroll offset, clamped. One expression, because the
+// draw, all three hit-tests and the horizontal scrollbar need the same answer
+// and doc.table_hscroll_px can be stale by a frame after a resize widens the
+// grid or after a column is dragged narrower.
+//
+// This is table_start_col's replacement and it answers in PIXELS. The old one
+// answered with a column INDEX, which is why panning jumped a whole column at a
+// time; see doc.table_hscroll_px for the report and the decision.
+table_scroll_x :: proc(doc: ^Document, char_w, width: f32) -> f32 {
+	return f32(clamp(doc.table_hscroll_px, 0, table_max_scroll_x(doc, char_w, width)))
+}
+
+// Every visible column's cell rectangle, left to right. THE producer for the
+// grid's x axis: consumed by the draw, the cell hit-test, the header hit-test,
+// the resize-edge hit-test, the link layout, the in-cell edit box and the
+// horizontal scrollbar. Four of those used to advance their own copy of
 // `cx += (colw[c] + TABLE_COL_PAD) * char_w` from their own origin, which is
 // precisely the divergence that writes an edit into the wrong column.
 //
-// Cells tile from table_gutter_w(), not from x = 0 and not from TEXT_MARGIN_X.
+// THE SCROLL OFFSET IS NOT A PARAMETER, as of 2026-07-31. It used to take a
+// `start_col` and every caller passed `table_start_col(doc)`; taking the pixel
+// offset from doc directly (through table_scroll_x, which clamps) removes the
+// last way a caller could lay out one x axis while the hit-test beside it laid
+// out another. There is no caller that wants a scroll position other than the
+// document's own.
+//
+// Cells tile from table_gutter_w() MINUS the scroll, not from x = 0 and not
+// from TEXT_MARGIN_X.
 // §10's "cell padding 0 10" is the grid's own left inset, and §10's row-number
 // gutter takes its 56px from the origin ahead of the first cell. The gutter is
 // added HERE, inside the one producer, precisely so that the draw, the cell
@@ -1388,12 +1469,25 @@ table_start_col :: #force_inline proc(doc: ^Document) -> int {
 // an edit committing there).
 //
 // The zebra band and the header band still span from x = 0 and cover the gutter:
-// a band has to reach the window edge to read as a row at all -- one starting
-// 56px in reads as a box around the data.
+// a band has to reach the LEFT window edge to read as a row at all -- one
+// starting 56px in reads as a box around the data.
+//
+// **That argument is about the LEFT edge only, and the opposite holds on the
+// right.** A band drawn to table_right on a table narrower than its window is
+// hundreds of pixels of banded emptiness, and the table reads as broken rather
+// than as narrow (Wyatt, live use, v0.34.1: *"table doesn't end on the right"*).
+// So the bands stop at table_content_right and plain canvas follows. The two
+// rules are not in tension: on the left the band ends where the WINDOW does, and
+// on the right it ends where the DATA does, because that is the edge the reader
+// is looking for in each case.
 //
 // A column that STARTS before the right edge is included even if it runs past
 // it, so a partly-visible column is drawn and clickable rather than dead; the
-// text inside it is clipped to the edge by the draw.
+// text inside it is clipped to the edge by the draw. Symmetrically, a column
+// whose right edge is still past the gutter is included even though its left
+// edge has scrolled under it -- pixel scrolling means the leftmost column is
+// usually partly hidden, and dropping it would blank a column the reader can
+// see most of. The gutter re-covers it: see the gutter pass in table_draw.
 //
 // --- §10's "distribute leftover width proportionally" IS DELIBERATELY NOT DONE
 //
@@ -1425,21 +1519,47 @@ table_start_col :: #force_inline proc(doc: ^Document) -> int {
 // table_col_resize measures against the LAID-OUT rectangle, which is still the
 // rectangle on screen; it is simply no longer wider than the sample. §10's other
 // two column rules -- the 8-40 clamp and the bounded sample -- are untouched.
-table_cols_layout :: proc(doc: ^Document, char_w, width: f32, start_col: int, allocator := context.temp_allocator) -> []Table_Col {
+table_cols_layout :: proc(doc: ^Document, char_w, width: f32, allocator := context.temp_allocator) -> []Table_Col {
 	out := make([dynamic]Table_Col, 0, 16, allocator)
 	colw := doc.table_widths
 	if len(colw) == 0 {return out[:]}
 	right := table_right(width)
-	x := table_gutter_w()
-	for c := clamp(start_col, 0, max(0, len(colw) - 1)); c < len(colw); c += 1 {
+	gw := table_gutter_w()
+	x := gw - table_scroll_x(doc, char_w, width)
+	for c in 0 ..< len(colw) {
 		if x >= right {break}
 		cells := colw[c]
-		w := f32(cells) * char_w + TABLE_CELL_PAD_X * 2
-		al := doc.table_align[c] if c < len(doc.table_align) else Table_Align.Left
-		append(&out, Table_Col{c = c, x = x, w = w, cells = cells, align = al})
+		w := table_col_w(cells, char_w)
+		// Scrolled entirely under the sticky gutter: stepped over, not laid out.
+		// At most ONE column can straddle the gutter's edge, so the columns this
+		// skips are behind the reader and the walk is the cheapest way to reach
+		// the first visible one -- an add per column, no allocation.
+		if x + w > gw {
+			al := doc.table_align[c] if c < len(doc.table_align) else Table_Align.Left
+			append(&out, Table_Col{c = c, x = x, w = w, cells = cells, align = al})
+		}
 		x += w
 	}
 	return out[:]
+}
+
+// Where the TABLE ends on screen -- the last laid-out column's right edge, never
+// past the grid's own right edge.
+//
+// THE producer for the bands' right edge, and it takes the LAYOUT rather than
+// the document, deliberately: re-summing the widths here would be a second
+// expression for a number table_cols_layout has already produced, and a draw
+// that sums while a hit-test lays out is exactly the divergence this file is
+// arranged against. Every caller already has the layout in hand.
+//
+// With no columns at all (an empty document, or the frame before
+// table_compute_widths has run) the table is just its gutter, so that is where
+// it ends. A band the full width of the window at that moment would be a
+// promise of content that is not there.
+table_content_right :: proc(cols: []Table_Col, width: f32) -> f32 {
+	if len(cols) == 0 {return min(table_gutter_w(), table_right(width))}
+	last := cols[len(cols) - 1]
+	return min(last.x + last.w, table_right(width))
 }
 
 // --- §10's "drag a header edge to resize; double-click to fit content" ------
@@ -1491,9 +1611,16 @@ table_edge_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (c: int
 	if my < top || my >= top + table_header_h(px) {return 0, false}
 	tol := sx(TABLE_RESIZE_HIT_96)
 	right := table_right(width)
-	for col in table_cols_layout(doc, char_w, width, table_start_col(doc)) {
+	gw := table_gutter_w()
+	if mx < gw {return 0, false} // the sticky gutter is not the table's x axis
+	for col in table_cols_layout(doc, char_w, width) {
 		e := col.x + col.w
 		if e > right {break} // an edge past the grid's right edge is not on screen
+		// ...and an edge scrolled under the gutter is not on screen either. The
+		// gutter covers it (table_draw's gutter pass), so grabbing it would be a
+		// drag on a divider the user cannot see -- the "affordance where the
+		// gesture is not" failure in reverse.
+		if e <= gw {continue}
 		if mx >= e - tol && mx <= e + tol {return col.c, true}
 	}
 	return 0, false
@@ -1504,9 +1631,12 @@ table_edge_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (c: int
 // Through table_cols_layout, so the cell a click sorts is the cell the header text
 // was drawn in, and through the same header-band gate table_edge_at uses, so the
 // same x inside the rows keeps starting a cell edit. The gutter is not a column
-// and table_cols_layout starts past it, so a press on a row number resolves to
-// nothing and sorts nothing -- which is the wanted answer: the numbering is not
-// data and has no order of its own.
+// and this refuses inside it, so a press on a row number resolves to nothing and
+// sorts nothing -- which is the wanted answer: the numbering is not data and has
+// no order of its own. That refusal is EXPLICIT now rather than falling out of
+// the layout starting at the gutter's edge: with pixel scrolling a column's
+// rectangle genuinely extends under the gutter, and the pixels the gutter covers
+// must not sort the column hiding behind them.
 //
 // The EDGE zone wins where the two overlap, and the caller (main.odin) tests it
 // first for that reason: within ±4px of a boundary the user is aiming at the
@@ -1516,7 +1646,8 @@ table_header_col_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (
 	if doc == nil || len(doc.table_widths) == 0 {return 0, false}
 	top := table_grid_top()
 	if my < top || my >= top + table_header_h(px) {return 0, false}
-	for col in table_cols_layout(doc, char_w, width, table_start_col(doc)) {
+	if mx < table_gutter_w() {return 0, false}
+	for col in table_cols_layout(doc, char_w, width) {
 		if mx >= col.x && mx < col.x + col.w {return col.c, true}
 	}
 	return 0, false
@@ -1585,7 +1716,7 @@ table_edge_at_cursor :: #force_inline proc(doc: ^Document, char_w, width, mx, my
 table_col_resize :: proc(doc: ^Document, c: int, edge_x, char_w, width: f32) {
 	if doc == nil || c < 0 || c >= len(doc.table_widths) || char_w <= 0 {return}
 	col, found := Table_Col{}, false
-	for k in table_cols_layout(doc, char_w, width, table_start_col(doc)) {
+	for k in table_cols_layout(doc, char_w, width) {
 		if k.c == c {col, found = k, true;break}
 	}
 	if !found {return} // scrolled out from under the drag
@@ -2002,20 +2133,25 @@ csv_field_into :: proc(line: string, delim: u8, n: int, out: []u8) -> string {
 	}
 }
 
-// Largest table_col that still shows content (keeps the last column reachable).
-table_max_col :: proc(doc: ^Document) -> int {
-	return max(0, doc.table_cols - 1)
-}
-
-// How many columns fit on screen starting at `start_col`. Now literally the
-// length of the draw's own layout rather than a second loop that advances the
-// same way -- the divergence CLAUDE.md's "one layout per widget" exists to
-// prevent, and this proc's previous comment claimed the two loops matched while
-// they were free to drift. Always at least 1, so a single column wider than the
-// window still yields a sane thumb rather than a zero-width one.
-table_cols_fitting :: proc(doc: ^Document, char_w, width: f32, start_col: int) -> int {
-	return max(1, len(table_cols_layout(doc, char_w, width, start_col)))
-}
+// table_max_col and table_cols_fitting used to live here, and both were DELETED
+// on 2026-07-31 rather than adapted, because both were column COUNTS answering
+// questions the grid no longer asks in columns:
+//
+//   table_max_col      the largest column index the view could start at. Its
+//                      replacement is table_max_scroll_x, in pixels -- the
+//                      scroll's bound is now a distance, not an index.
+//   table_cols_fitting the h-scrollbar's thumb span, "how many columns fit".
+//                      **This is the second of the two things Wyatt's report
+//                      said the scroll was snapping to.** It was a column COUNT
+//                      derived from a pixel measurement, paired with a pos that
+//                      was a column INDEX; the two only agree when every column
+//                      has the same width, so the thumb changed size as it moved.
+//                      Its replacement is table_view_w -- the same unit as the
+//                      pos and the max, which is the whole fix.
+//
+// Deleted rather than left unused for table_leftover_cells' reason, recorded at
+// table_cols_layout: an uncalled procedure whose comments describe a rule the
+// file no longer follows is worse than an absent one.
 
 // A link inside a table cell, positioned in pixels (cells sit at arbitrary
 // column x's, not the uniform text grid, so links here can't use Link_Hit).
@@ -2037,8 +2173,9 @@ table_links :: proc(doc: ^Document, text: ^plat.Text, px, char_w: f32, rows: int
 	p, pok := table_row_start(doc, 0)
 	if !pok {return out[:]}
 	delim := doc.table_delim if doc.table_delim != 0 else ','
-	cols := table_cols_layout(doc, char_w, width, table_start_col(doc), allocator)
+	cols := table_cols_layout(doc, char_w, width, allocator)
 	right := table_right(width)
+	gw := table_gutter_w()
 	buf: [RENDER_LINE_CAP]u8
 	for r in 0 ..< rows {
 		if p > doc.pt.length {break}
@@ -2071,8 +2208,19 @@ table_links :: proc(doc: ^Document, text: ^plat.Text, px, char_w: f32, rows: int
 				// offset from the field's own text x just below.
 				lcol, lcells := plat.text_span_cells(text, field, l.start, l.len, 0, .Doc)
 				lx := tx + f32(lcol) * char_w
-				if lx < cellright {
-					append(&out, Table_Link{x = lx, y = ry, w = min(f32(lcells) * char_w, cellright - lx), text = field, link = l})
+				// Clipped at BOTH ends, and the left clip is new with pixel
+				// scrolling: a cell scrolled under the sticky gutter is covered by
+				// the gutter pass, but this rect is drawn by render_frame AFTER
+				// table_draw returns, so an unclipped underline would be painted
+				// over the row numbers -- and, worse, would still be clickable
+				// there (table_link_hit reads exactly this rect). Clipping the rect
+				// fixes the draw and the hit-test at once, which is why the rect is
+				// clipped rather than the draw. `text`/`link` are untouched, so the
+				// URL a partly-hidden link resolves to is still the whole URL.
+				l0 := max(lx, gw)
+				l1 := min(lx + f32(lcells) * char_w, cellright)
+				if l1 > l0 {
+					append(&out, Table_Link{x = l0, y = ry, w = l1 - l0, text = field, link = l})
 				}
 			}
 		}
@@ -2121,7 +2269,12 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	if len(doc.table_widths) == 0 {table_compute_widths(doc, text)}
 	colw := doc.table_widths
 	doc.table_cols = len(colw)
-	cols := table_cols_layout(doc, char_w, width, table_start_col(doc))
+	cols := table_cols_layout(doc, char_w, width)
+	// Where the table ENDS, from the one x-axis producer rather than by re-summing
+	// the widths here. Every band below stops at it; beyond it is plain canvas.
+	// See table_content_right, and table_cols_layout for why the left edge and the
+	// right edge answer this question differently.
+	cright := table_content_right(cols, width)
 
 	// The header's fields, fetched HERE rather than at the sticky-header pass at
 	// the bottom of this proc, because two passes now need them and one bounded
@@ -2172,8 +2325,12 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 
 	// Zebra banding, in place of the per-column vertical rules this draw used to
 	// emit (§10: a rule per column is "8 extra quads per screen and it makes the
-	// grid louder than the data"). One quad per banded row, spanning the full
-	// grid width so the band reads as a row rather than as a box around the text.
+	// grid louder than the data"). One quad per banded row, from the window's left
+	// edge to the TABLE's right edge -- so the band reads as a row rather than as a
+	// box around the text, and stops where the data does rather than trailing a few
+	// hundred pixels of empty colour to the scrollbar (Wyatt, live use, v0.34.1).
+	// table_cols_layout's comment has the full argument for why those two edges
+	// answer differently.
 	//
 	// Parity rides the row's ABSOLUTE position in the file (table_abs_rows), not
 	// its visible index. It used to ride the visible index because the absolute
@@ -2195,119 +2352,8 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	// screenshot shows and the one tg_appearance pins.
 	zebra := g_theme[.Table_Zebra]
 	for _, r in vis {
-		band := absn[r] % 2 if absn[r] != TABLE_ABS_NONE else r % 2
-		if band == 0 {continue}
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_row_rect_y(px, r)}, size = {right, row_h}, color = zebra}})
-	}
-
-	// §10's malformed-row mark: "a row with the wrong field count gets a 2px
-	// warning bar on its left edge and stays in place. Silently dropping data in a
-	// data viewer is the worst possible failure." STAYS IN PLACE is the load-bearing
-	// half -- nothing above filters `vis`, and nothing may start.
-	//
-	// AT x = 0, the row's own left edge, and not at the gutter's right edge where it
-	// would sit between the numbers and the first cell. Three reasons, in order of
-	// weight:
-	//
-	//   - x = 0 IS the row's left edge. The zebra band and the header band both span
-	//     from 0 for the same reason (a band that starts 56px in reads as a box
-	//     around the data, not as a row), so the row the mark belongs to begins
-	//     there. §10 says "on its left edge", and the gutter is part of the row.
-	//   - a 2px vertical bar at the gutter/cell boundary, repeated down the screen,
-	//     is a COLUMN RULE. §10 deleted those in this very view ("8 extra quads per
-	//     screen and it makes the grid louder than the data"), and re-introducing one
-	//     as the malformed mark would read as grid furniture -- exactly the thing a
-	//     warning must not look like.
-	//   - it cannot collide with the row number. The number is right-aligned to
-	//     gutter_w - TABLE_CELL_PAD_X, so at 56px and 10px padding a label would have
-	//     to be ~44px wide before its left edge reached the bar. The gutter's own
-	//     comment records what happens past that (a six-digit number runs left to the
-	//     window edge rather than truncating, which would change which row it names);
-	//     at that point it overlaps the bar. A cosmetic overlap at a million rows,
-	//     against a mark that is either at the row's edge or in the middle of it at
-	//     every row count.
-	//
-	// Over the zebra, under the numbers and the cells: the band is painted first so
-	// the bar has to come after it to be visible on a banded row at all, and nothing
-	// after this draws inside the first 2px.
-	{
-		warn := g_theme[.Warning]
-		ww := sx(TABLE_WARN_W_96)
-		for row, r in vis {
-			if !table_row_malformed(len(row.fields), len(head)) {continue}
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_row_rect_y(px, r)}, size = {ww, row_h}, color = warn}})
-		}
-	}
-
-	// The row-number gutter (§10: "56px right-aligned gutter"). Over the bands,
-	// under nothing -- it occupies the 56px table_cols_layout already stepped the
-	// first cell past, so it cannot collide with any cell's text by construction
-	// rather than by two numbers agreeing.
-	//
-	// A REFUSED row draws NO NUMBER. table_abs_rows hands back TABLE_ABS_NONE
-	// when the file's numbering cannot be answered -- the background index has not
-	// reached the row, the buffer was edited at or below it, or a mapped read
-	// faulted -- and a plausible-looking wrong row number is worse than a blank,
-	// because the reader has no way to tell it apart from a right one. This is
-	// development-loop.md §4 Shape A, and blank is the honest answer.
-	//
-	// That refusal used to be MUCH wider than it is now, and the difference is
-	// worth stating here because this gutter is what made it visible: nothing
-	// raised Line_Index.edit_floor once an edit had lowered it, and doc_save does
-	// not re-index, so editing one cell blanked every row number below it for the
-	// life of the tab -- including after a save, the moment a user would most
-	// expect them back. Fixed at the source rather than here: once the index is
-	// finished the checkpoints are repaired into document coordinates on every
-	// edit (Line_Index.ckpt_doc, doc.odin), so an edit and a save now leave the
-	// numbering intact. What still refuses is genuinely unanswerable -- the worker
-	// has not reached the row, the edit raced the initial scan, a huge paste left
-	// two checkpoints further apart than CKPT_SCAN_CAP, or a mapped read faulted.
-	// Guessing in any of those would be exactly the Shape A the flag exists to
-	// prevent.
-	//
-	// Text_Muted, not the Text_Dim §10 literally names, and the reasoning is
-	// TABLE_EMPTY_CELL's applied to a second case. Text_Dim is theme.odin's
-	// disabled-only tier (2.9:1 Dark / 2.8:1 Light, below the AA floor); the
-	// exemption it rests on is that a disabled control's dimness is redundant with
-	// the control not responding. A row number is not redundant with anything --
-	// §10's own justification for the gutter is that "counting rows by hand is the
-	// gap", so the number IS the information, and a reader who cannot resolve it
-	// has lost the whole feature. themetest's Text_Dim allowlist already holds
-	// table.odin at zero for precisely this argument (it was raised as a review
-	// finding against the em dash and the dash was moved off Text_Dim), and the
-	// editor's own line-number gutter has always drawn in Text_Muted. Three
-	// precedents, one answer. Recorded here because the batch-18 plan recommended
-	// Text_Dim and this deviates from it deliberately.
-	//
-	// Text_Secondary on the current row is §10's, kept as written: that role
-	// clears AA in both themes, so it is a legitimate brightening rather than a
-	// second dim tier. "Current" is the row with an open cell edit -- the grid
-	// takes no caret, so that is the only row this surface ever calls current.
-	{
-		num_fg := g_theme[.Text_Muted]
-		cur_fg := g_theme[.Text_Secondary]
-		gw := table_gutter_w()
-		for _, r in vis {
-			if absn[r] == TABLE_ABS_NONE {continue}
-			// 1-based, because a reader counts from one. It coincides with the
-			// FILE's line number (data row 0 is line 1, the header being line 0),
-			// which is a convenience rather than a second meaning: both readings
-			// name the same row.
-			label := fmt.tprintf("%d", absn[r] + 1)
-			w := f32(plat.text_cells(text, transmute([]u8)label, 0, .Doc)) * char_w
-			// Right-aligned to the gutter's inner edge, and CLAMPED AT 0 rather
-			// than truncated. Cutting digits off a row number silently changes
-			// which row it names -- 10432 truncated to 1043 is not a shortened
-			// label, it is a different row -- so a number too wide for 56px runs
-			// left to the window edge and then keeps its full value, encroaching
-			// on the first cell's left padding instead. That is a cosmetic
-			// collision at six digits and up; a truncated number would be a lie at
-			// every zoom level.
-			gx := max(f32(0), gw - TABLE_CELL_PAD_X - w)
-			colour := num_fg
-			if doc.table_editing && doc.table_edit_row == r {colour = cur_fg}
-			plat.text_draw(gfx, text, label, gx, table_row_baseline_y(px, r), px, colour, .Doc)
-		}
+		if table_row_band(absn, r) == 0 {continue}
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_row_rect_y(px, r)}, size = {cright, row_h}, color = zebra}})
 	}
 
 	// Pass 2: the cell text, column by column.
@@ -2375,6 +2421,130 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 		}
 	}
 
+	// The row-number gutter (§10: "56px right-aligned gutter"), LAST of the row
+	// passes rather than first, and now a COVER STRIP.
+	//
+	// The reordering is what pixel scrolling costs. The gutter is sticky -- it
+	// carries the row's identity, so it must not pan -- while the cells now slide
+	// under it by any number of pixels (doc.table_hscroll_px), so the leftmost
+	// column's glyphs genuinely land inside the gutter's 56px. There is no scissor
+	// rect in this renderer (see md_preview_clip): clipping IS painting over, which
+	// is the same convention the sticky header below rests on. Drawn first, as it
+	// used to be, a scrolled cell's text was painted on top of the row numbers.
+	//
+	// Each row's strip is repainted in its OWN band colour, through table_row_band
+	// -- the parity producer the zebra pass reads -- so a cover can never come back
+	// a different colour from the band it covers. Bg_Base for an unbanded row is
+	// the canvas the frame was cleared to (doc_canvas_clear), not a second opinion
+	// about what the page colour is.
+	//
+	// §10's MALFORMED-ROW MARK rides along here for a mechanical reason: it is a
+	// 2px bar at x = 0, inside the strip, so a cover painted after it would erase
+	// it. It is still over the band and under nothing, which is all its placement
+	// ever required.
+	//
+	// "a row with the wrong field count gets a 2px warning bar on its left edge and
+	// stays in place. Silently dropping data in a data viewer is the worst possible
+	// failure." STAYS IN PLACE is the load-bearing half -- nothing above filters
+	// `vis`, and nothing may start.
+	//
+	// AT x = 0, the row's own left edge, and not at the gutter's right edge where it
+	// would sit between the numbers and the first cell. Three reasons, in order of
+	// weight:
+	//
+	//   - x = 0 IS the row's left edge. The zebra band and the header band both span
+	//     from 0 for the same reason (a band that starts 56px in reads as a box
+	//     around the data, not as a row), so the row the mark belongs to begins
+	//     there. §10 says "on its left edge", and the gutter is part of the row.
+	//   - a 2px vertical bar at the gutter/cell boundary, repeated down the screen,
+	//     is a COLUMN RULE. §10 deleted those in this very view ("8 extra quads per
+	//     screen and it makes the grid louder than the data"), and re-introducing one
+	//     as the malformed mark would read as grid furniture -- exactly the thing a
+	//     warning must not look like.
+	//   - it cannot collide with the row number. The number is right-aligned to
+	//     gutter_w - TABLE_CELL_PAD_X, so at 56px and 10px padding a label would have
+	//     to be ~44px wide before its left edge reached the bar. The gutter's own
+	//     comment records what happens past that (a six-digit number runs left to the
+	//     window edge rather than truncating, which would change which row it names);
+	//     at that point it overlaps the bar. A cosmetic overlap at a million rows,
+	//     against a mark that is either at the row's edge or in the middle of it at
+	//     every row count.
+	//
+	// A REFUSED row draws NO NUMBER. table_abs_rows hands back TABLE_ABS_NONE
+	// when the file's numbering cannot be answered -- the background index has not
+	// reached the row, the buffer was edited at or below it, or a mapped read
+	// faulted -- and a plausible-looking wrong row number is worse than a blank,
+	// because the reader has no way to tell it apart from a right one. This is
+	// development-loop.md §4 Shape A, and blank is the honest answer.
+	//
+	// That refusal used to be MUCH wider than it is now, and the difference is
+	// worth stating here because this gutter is what made it visible: nothing
+	// raised Line_Index.edit_floor once an edit had lowered it, and doc_save does
+	// not re-index, so editing one cell blanked every row number below it for the
+	// life of the tab -- including after a save, the moment a user would most
+	// expect them back. Fixed at the source rather than here: once the index is
+	// finished the checkpoints are repaired into document coordinates on every
+	// edit (Line_Index.ckpt_doc, doc.odin), so an edit and a save now leave the
+	// numbering intact. What still refuses is genuinely unanswerable -- the worker
+	// has not reached the row, the edit raced the initial scan, a huge paste left
+	// two checkpoints further apart than CKPT_SCAN_CAP, or a mapped read faulted.
+	// Guessing in any of those would be exactly the Shape A the flag exists to
+	// prevent.
+	//
+	// Text_Muted, not the Text_Dim §10 literally names, and the reasoning is
+	// TABLE_EMPTY_CELL's applied to a second case. Text_Dim is theme.odin's
+	// disabled-only tier (2.9:1 Dark / 2.8:1 Light, below the AA floor); the
+	// exemption it rests on is that a disabled control's dimness is redundant with
+	// the control not responding. A row number is not redundant with anything --
+	// §10's own justification for the gutter is that "counting rows by hand is the
+	// gap", so the number IS the information, and a reader who cannot resolve it
+	// has lost the whole feature. themetest's Text_Dim allowlist already holds
+	// table.odin at zero for precisely this argument (it was raised as a review
+	// finding against the em dash and the dash was moved off Text_Dim), and the
+	// editor's own line-number gutter has always drawn in Text_Muted. Three
+	// precedents, one answer. Recorded here because the batch-18 plan recommended
+	// Text_Dim and this deviates from it deliberately.
+	//
+	// Text_Secondary on the current row is §10's, kept as written: that role
+	// clears AA in both themes, so it is a legitimate brightening rather than a
+	// second dim tier. "Current" is the row with an open cell edit -- the grid
+	// takes no caret, so that is the only row this surface ever calls current.
+	{
+		num_fg := g_theme[.Text_Muted]
+		cur_fg := g_theme[.Text_Secondary]
+		warn := g_theme[.Warning]
+		zeb := g_theme[.Table_Zebra]
+		bg := doc_canvas_clear()
+		ww := sx(TABLE_WARN_W_96)
+		gw := min(table_gutter_w(), cright)
+		for row, r in vis {
+			ry := table_row_rect_y(px, r)
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, ry}, size = {gw, row_h}, color = zeb if table_row_band(absn, r) != 0 else bg}})
+			if table_row_malformed(len(row.fields), len(head)) {
+				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, ry}, size = {ww, row_h}, color = warn}})
+			}
+			if absn[r] == TABLE_ABS_NONE {continue}
+			// 1-based, because a reader counts from one. It coincides with the
+			// FILE's line number (data row 0 is line 1, the header being line 0),
+			// which is a convenience rather than a second meaning: both readings
+			// name the same row.
+			label := fmt.tprintf("%d", absn[r] + 1)
+			w := f32(plat.text_cells(text, transmute([]u8)label, 0, .Doc)) * char_w
+			// Right-aligned to the gutter's inner edge, and CLAMPED AT 0 rather
+			// than truncated. Cutting digits off a row number silently changes
+			// which row it names -- 10432 truncated to 1043 is not a shortened
+			// label, it is a different row -- so a number too wide for 56px runs
+			// left to the window edge and then keeps its full value, encroaching
+			// on the first cell's left padding instead. That is a cosmetic
+			// collision at six digits and up; a truncated number would be a lie at
+			// every zoom level.
+			gx := max(f32(0), table_gutter_w() - TABLE_CELL_PAD_X - w)
+			colour := num_fg
+			if doc.table_editing && doc.table_edit_row == r {colour = cur_fg}
+			plat.text_draw(gfx, text, label, gx, table_row_baseline_y(px, r), px, colour, .Doc)
+		}
+	}
+
 	// The sticky header, LAST -- after every content pass, which is what makes it
 	// sticky. There is no scissor facility here (see md_preview_clip): clipping is
 	// a cover strip painted over the content, so painting the band and its rule
@@ -2389,7 +2559,9 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	// a rule over a page that had nothing else on it. Nothing to be sticky ABOVE
 	// is nothing to draw.
 	if len(head) > 0 {
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top()}, size = {right, table_header_h(px)}, color = g_theme[.Bg_Raised]}})
+		// To cright, not to `right`: the header band is a band like the zebra's and
+		// stops where the table does. See table_cols_layout.
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top()}, size = {cright, table_header_h(px)}, color = g_theme[.Bg_Raised]}})
 		// The HOVER LIFT, over the band and under the rule, the text and the arrow.
 		// Bg_Hover is §1.1's role for exactly this ("hover fill for any tab, menu
 		// row, settings row or palette row"), so a hovered header reads as the same
@@ -2399,16 +2571,10 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 		if hover_col != TABLE_SORT_NONE {
 			for col in cols {
 				if col.c != hover_col {continue}
-				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {col.x, table_grid_top()}, size = {min(col.w, right - col.x), table_header_h(px)}, color = g_theme[.Bg_Hover]}})
+				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {col.x, table_grid_top()}, size = {min(col.w, cright - col.x), table_header_h(px)}, color = g_theme[.Bg_Hover]}})
 				break
 			}
 		}
-		// A 1px Border_Strong rule beneath it (§10). Border_Strong and not
-		// Border_Subtle: this is the one boundary in the grid now that the column
-		// rules are gone, and §1.1 names "table header rule" as what Border_Strong is
-		// for. hairline() so it stays one device pixel at 125%/150% instead of
-		// straddling two and rasterising blurry.
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top() + table_header_h(px) - hairline()}, size = {right, hairline()}, color = g_theme[.Border_Strong]}})
 		hy := table_header_baseline_y(px)
 		for col in cols {
 			if col.c >= len(head) {continue}
@@ -2483,6 +2649,20 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 				table_sort_arrow(gfx, qp, a, up, colour)
 			}
 		}
+		// The gutter's cover strip, in the header band -- the same clip the row pass
+		// applies, for the same reason. A column scrolled part-way under the gutter
+		// has its NAME and its sort arrow in the header band at the same negative
+		// offset its cells have in the rows, and leaving the header uncovered would
+		// make the sticky 56px look sticky on the data and porous on the heading.
+		// Bg_Raised because that is what the band under it is.
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top()}, size = {min(table_gutter_w(), cright), table_header_h(px)}, color = g_theme[.Bg_Raised]}})
+		// A 1px Border_Strong rule beneath it (§10), LAST so it survives both cover
+		// strips and any descender from a tall header name. Border_Strong and not
+		// Border_Subtle: this is the one boundary in the grid now that the column
+		// rules are gone, and §1.1 names "table header rule" as what Border_Strong is
+		// for. hairline() so it stays one device pixel at 125%/150% instead of
+		// straddling two and rasterising blurry. To cright, with the band it underlines.
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top() + table_header_h(px) - hairline()}, size = {cright, hairline()}, color = g_theme[.Border_Strong]}})
 	}
 
 	// §10's summary row, LAST of all: "row count, column count, active sort -- the
@@ -2505,6 +2685,17 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	// Bg_Raised and a rule ABOVE it, mirroring the sticky header's fill and its rule
 	// BELOW: the two bands bracket the data, which is what makes a strip read as
 	// chrome rather than as one more row of the table.
+	//
+	// THE ONE BAND THAT STILL SPANS THE FULL WIDTH, deliberately, while the zebra
+	// and the header now stop at cright (2026-07-31). It is not a row of the table
+	// -- it is a strip of chrome directly above the status bar, and it reads as one
+	// only if it behaves like one. Two concrete consequences settle it: a
+	// full-width strip matches the status bar it sits on top of, where a strip
+	// clipped to the columns would read as a fourth row of a three-column table;
+	// and its TEXT is not bounded by the columns at all (`1,000 rows · 1 column ·
+	// sorted by Date desc · click to clear` is far wider than a one-column CSV), so
+	// a band clipped to cright would leave its own words -- and the clickable run
+	// among them -- hanging off the end of it.
 	{
 		sm := table_summary_layout(doc, text, height, px, char_w)
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, sm.y}, size = {right, sm.h}, color = g_theme[.Bg_Raised]}})
@@ -2666,9 +2857,15 @@ table_cell_at :: proc(doc: ^Document, mx, my, px, char_w: f32, rows: int, width:
 	if len(doc.table_widths) == 0 {return}
 	rr, rok := table_row_at_y(px, my)
 	if !rok || rr >= rows {return}
+	// The sticky row-number gutter is not a cell, and it covers whatever cell has
+	// scrolled under it. Without this an edit could be started -- and committed --
+	// on a value the gutter is painted over, which is a write to a cell the user
+	// cannot see. Explicit rather than implied by where the layout starts, for the
+	// reason table_header_col_at's comment gives.
+	if mx < table_gutter_w() {return}
 	r = rr
 	col = -1
-	for c in table_cols_layout(doc, char_w, width, table_start_col(doc)) {
+	for c in table_cols_layout(doc, char_w, width) {
 		if mx >= c.x && mx < c.x + c.w {col = c.c;break}
 	}
 	if col < 0 {return}
