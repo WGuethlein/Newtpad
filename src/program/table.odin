@@ -755,7 +755,7 @@ sort_number :: proc(s: string, scratch: ^[64]u8) -> f64 {
 		scratch[n] = s[i]
 		n += 1
 	}
-	v, _ := strconv.parse_f64(string(scratch[n > 0 ? 0 : 0:n]))
+	v, _ := strconv.parse_f64(string(scratch[:n]))
 	return v
 }
 
