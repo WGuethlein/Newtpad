@@ -1094,6 +1094,34 @@ leave_table_view :: proc(doc: ^Document) {
 	clear(&doc.table_widths)
 }
 
+// Was this command invoked BY NAME -- a palette row, a menu row, a status-bar
+// cell, a find-bar button -- rather than by pressing its chord?
+//
+// The discriminator is Key.None, which is zero (platform/window.odin) and which
+// the keyboard can never deliver: the message pump translates the VK code first
+// and drops the event outright when vk_to_key returns .None, so nothing with a
+// .None key is ever queued. So main.odin's key drain and .Menu_Activate (which
+// forwards the Enter that activated the row) always carry a real key, while
+// every by-name route dispatches a zero Key_Event -- palette_execute
+// (palette.odin), and main.odin's menu hit-test, status-bar cell and find-bar
+// button/mode chip. That already made ev.key the thing telling the two routes
+// apart; this only gives it a name, so an arm can say which one it means.
+//
+// What it is FOR: an arm gated on a modifier in order to preserve what the BARE
+// chord does must not apply that gate to a named invocation. A bare Alt+Left has
+// to keep doing nothing, exactly as an unbound key does -- but a user who found
+// "Extend Column Selection Left" in the palette and pressed Enter on it has
+// already said what they want, and there is no bare chord to protect. Without
+// this the command was listed, matched, highlighted, run, and did nothing.
+//
+// NOT a general "was a modifier held" question. An arm that reads ev.shift as a
+// DIRECTION (.Bookmark_Cycle, .Tab_Next, .Find_Confirm, the cursor moves) is
+// already right without it -- unshifted means forward, and forward is what a
+// named invocation should do. Only an arm whose non-modifier path is EMPTY has
+// the shape this fixes; as of this writing that is .Block_Extend_Left and
+// .Block_Extend_Right and nothing else.
+command_named :: proc(ev: plat.Key_Event) -> bool {return ev.key == .None}
+
 command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^plat.Window, t: ^plat.Text, rows: int) {
 	if cmd != .None {diag_cmd(cmd)} // breadcrumb: what the user was doing
 	// Recency for the palette's tie-break. Recorded at the one point every route
@@ -1384,9 +1412,15 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// Move_Line_Up above), and this binding used to not exist at all --
 		// so a bare Alt+Left must keep doing nothing, exactly as an unbound
 		// key does. Only Alt+Shift+Left may act.
-		if ev.shift {block_extend_dispatch(app, doc, t, 0, -1)}
+		//
+		// command_named is the escape hatch for the route that has no chord to
+		// protect: both of these are in the palette, and palette_execute
+		// dispatches a zero Key_Event, so on the shift test alone they were rows
+		// that ran and did nothing. Their Up/Down siblings below never needed the
+		// gate and so never grew the hole.
+		if ev.shift || command_named(ev) {block_extend_dispatch(app, doc, t, 0, -1)}
 	case .Block_Extend_Right:
-		if ev.shift {block_extend_dispatch(app, doc, t, 0, 1)}
+		if ev.shift || command_named(ev) {block_extend_dispatch(app, doc, t, 0, 1)}
 	case .Block_Extend_Up:
 		// Unreachable from the default keymap (Alt+Up already means
 		// Move_Line_Up, handled above) -- reachable only from the palette or
