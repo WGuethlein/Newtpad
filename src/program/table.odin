@@ -33,9 +33,13 @@ import plat "src:platform"
 //   min       §10 says 8, this said 3 -- MOVED TO 8, and this is the one that
 //             actually showed. A 3-cell column cannot hold its own header, so
 //             every short column drew a truncated heading over data that fit.
-//   leftover  §10 says distribute proportionally, this did not do it at all --
-//             IMPLEMENTED, in table_cols_layout (see there for why it belongs in
-//             the layout and not in the sample).
+//   leftover  §10 says distribute proportionally -- IMPLEMENTED, then DELIBERATELY
+//             REVERSED on 2026-07-31 by Wyatt's decision on live evidence. See
+//             table_cols_layout: a column is now laid out at its CONTENT width and
+//             the spare width is left empty on the right. This is a deviation from
+//             §10's literal rule and is recorded as one -- CLAUDE.md gives the spec
+//             the last word about what SHOULD exist, and the product owner
+//             overruled it here after seeing the result. Do not "fix" it back.
 //
 // NOT shared with markdown's md_table_fit_cells, and that is a considered answer
 // to "two implementations of one rule is the shape this project keeps getting
@@ -206,13 +210,44 @@ table_row_at_y :: #force_inline proc(px, my: f32) -> (r: int, ok: bool) {
 // asked to be the same size as a row, and it is.
 table_summary_h :: #force_inline proc(px: f32) -> f32 {return table_row_h(px)}
 
-// Top y of that band: pinned to the bottom of the content box, not to the last row.
-// Anchored to the row grid it would jitter up and down by the viewport's remainder
-// as the window is resized, and a strip whose position depends on how the rows
-// happened to divide is not a bar.
+// EVERYTHING the grid reserves along its bottom edge: the summary row AND the
+// horizontal scrollbar's strip. THE producer -- the row budget subtracts it, the
+// summary's own y is measured off it, and the tests size their windows with it.
+//
+// The two used to be laid out independently and they collided: hscrollbar_geo
+// pins the bar to `winh - doc_bottom_bar_h - h` and table_summary_y pinned the
+// summary to `doc_content_box's bot - summary_h`, which is the same bottom edge,
+// so the bar was painted across the bottom 8px of the summary text (Wyatt, live
+// use, v0.34.0, with a screenshot). Neither band is optional -- a grid wider than
+// its window has to be pannable, and §10's summary answers the questions a reader
+// has about a CSV -- so the newer arrival yields and the summary sits ABOVE the
+// bar.
+//
+// FIXED IN THE ONE PRODUCER, not by nudging the summary's y in the draw. The
+// h-scrollbar's drag hit-test reads hscrollbar_geo, so a draw-side nudge would
+// leave the painted summary and the clickable bar disagreeing about which strip
+// is which -- CLAUDE.md's "one layout per widget" in its most expensive form,
+// since the disagreement is invisible until somebody drags.
+//
+// The bar's strip is reserved UNCONDITIONALLY, even on a table narrow enough that
+// hscrollbar_geo returns shown = false (one column, or a window too narrow for a
+// 30px track). Making the reservation conditional would mean asking hscroll_model
+// -- which needs a ^plat.Text and a char_w that neither this procedure nor
+// doc_scroll_rows has -- and would make the grid's ROW COUNT change when a column
+// is dragged wide enough to need panning, i.e. the number of visible rows would
+// depend on a horizontal gesture. A permanently empty 8px strip under a
+// single-column CSV is the cheaper answer by a wide margin.
+table_bottom_band_h :: #force_inline proc(px: f32) -> f32 {
+	return table_summary_h(px) + hscrollbar_h()
+}
+
+// Top y of the summary band: pinned to the bottom of the content box less the
+// h-scrollbar's strip, not to the last row. Anchored to the row grid it would
+// jitter up and down by the viewport's remainder as the window is resized, and a
+// strip whose position depends on how the rows happened to divide is not a bar.
 table_summary_y :: #force_inline proc(doc: ^Document, height, px: f32) -> f32 {
 	_, bot := doc_content_box(doc, height)
-	return bot - table_summary_h(px)
+	return bot - table_bottom_band_h(px)
 }
 
 // Data rows that fit below the sticky header. The grid's answer to
@@ -222,14 +257,15 @@ table_summary_y :: #force_inline proc(doc: ^Document, height, px: f32) -> f32 {
 // Feeds the draw, both hit-tests and -- through doc_scroll -- the scroll clamp,
 // which is why it exists rather than each of them trimming `rows` by eye.
 //
-// The summary band is subtracted HERE, in the one producer, for exactly that
-// reason. Trimming it in the draw alone would leave the hit-test resolving a click
-// on the summary strip to a data row underneath it -- and in this view that is a
-// cell edit started on a row the user cannot see, which is the data-loss shape the
-// whole file is arranged against.
+// The bottom band -- the summary row AND the h-scrollbar's strip -- is subtracted
+// HERE, in the one producer, for exactly that reason. Trimming it in the draw
+// alone would leave the hit-test resolving a click on the summary strip to a data
+// row underneath it -- and in this view that is a cell edit started on a row the
+// user cannot see, which is the data-loss shape the whole file is arranged
+// against.
 table_visible_rows :: proc(doc: ^Document, height, px: f32) -> int {
 	_, bot := doc_content_box(doc, height)
-	return max(0, int((bot - table_summary_h(px) - table_rows_top(px)) / table_row_h(px)))
+	return max(0, int((bot - table_bottom_band_h(px) - table_rows_top(px)) / table_row_h(px)))
 }
 
 // --- §10's summary row: "row count, column count, active sort" ------------
@@ -292,7 +328,28 @@ group_int :: proc(v: int, allocator := context.temp_allocator) -> string {
 // "a file too large to index refuses the sort". A header that does nothing when
 // clicked is indistinguishable from a broken build; a summary that says
 // "12,438,201 rows - too large to sort" is a product decision the reader can see.
-table_summary_text :: proc(doc: ^Document, allocator := context.temp_allocator) -> string {
+// THE SORT CLAUSE SAYS THE UNDO IN WORDS, and that is the second half of the
+// answer to "there is no discoverable way to reset the sort" (Wyatt, live use,
+// v0.34.0). table_sort_click has cycled ascending -> descending -> the file's own
+// order since the sort shipped; nothing anywhere said so, and Wyatt rejected three
+// proposals that added another unlabelled target with *"how will the person know
+// what to click and where to reset."* He is right, and the principle generalises:
+// **a bare three-click cycle cannot be made discoverable, only labelled.** So the
+// sentence reads `sorted by Date desc  ·  click to clear`, and the run of text
+// that says it is itself the target (table_summary_layout).
+//
+// The WORDS are the point. Not an icon, not an ×, not a tooltip: the two questions
+// a first-time reader has are "can I click this?" -- answered by the header's
+// hover state (table_header_hover_col) -- and "how do I undo it?", which is this,
+// and only prose answers the second one without the reader already knowing.
+//
+// `clear_s`/`clear_e` bound that run inside the returned string so the layout can
+// measure it. They are a byte span into `text`, zero-length when there is no sort,
+// and they are produced HERE, beside the sbprintf that writes the words, because a
+// second procedure computing "where does the sort clause start" from the finished
+// string would be re-deriving what this one already knows -- and would silently
+// name the wrong bytes the first time the wording changed.
+table_summary_parts :: proc(doc: ^Document, allocator := context.temp_allocator) -> (text: string, clear_s, clear_e: int) {
 	n, exact := table_row_count(doc)
 	sb := strings.builder_make(allocator)
 	if exact {
@@ -316,9 +373,73 @@ table_summary_text :: proc(doc: ^Document, allocator := context.temp_allocator) 
 	case doc.table_sort.refused:
 		fmt.sbprintf(&sb, "  ·  too large to sort (over %s rows)", group_int(TABLE_SORT_MAX, allocator))
 	case table_sorted(doc):
-		fmt.sbprintf(&sb, "  ·  sorted by %s %s", table_col_name(doc, doc.table_sort.col, allocator), "desc" if doc.table_sort.desc else "asc")
+		// The separator stays OUTSIDE the clickable run: it is punctuation between
+		// two facts, not part of the sentence that offers the action, and a target
+		// that starts on a middle dot would extend three characters left of the
+		// first word that explains it.
+		fmt.sbprint(&sb, "  ·  ")
+		clear_s = strings.builder_len(sb)
+		fmt.sbprintf(&sb, "sorted by %s %s  ·  click to clear", table_col_name(doc, doc.table_sort.col, allocator), "desc" if doc.table_sort.desc else "asc")
+		clear_e = strings.builder_len(sb)
 	}
-	return strings.to_string(sb)
+	return strings.to_string(sb), clear_s, clear_e
+}
+
+// The line alone, for every reader that only wants the words.
+table_summary_text :: proc(doc: ^Document, allocator := context.temp_allocator) -> string {
+	t, _, _ := table_summary_parts(doc, allocator)
+	return t
+}
+
+// --- the summary band's geometry: ONE producer ----------------------------
+//
+// The band's rect, the text's origin, and the rect of the `sorted by ... · click
+// to clear` run -- produced once, consumed by the draw AND by the press
+// (main.odin). The run is a NEW HIT REGION at the bottom of the grid, immediately
+// above the horizontal scrollbar's strip, so the two are laid out from the one
+// bottom-band producer (table_bottom_band_h) and cannot overlap the way the
+// summary and the bar themselves did.
+//
+// Measured in CELLS and multiplied by char_w, which is exact rather than
+// approximate: the summary draws in the document face on the same fixed cell grid
+// every other measurement in this file uses, so the x this returns is the x the
+// glyphs land on and not an estimate of it.
+//
+// `clearable` is false whenever there is no sort, and then the rect is zero -- a
+// dead region cannot be clicked into by a caller that forgets to check, because
+// there is nothing there to hit.
+Table_Summary :: struct {
+	text:             string, // the whole line
+	head:             string, // everything before the clickable run (== text when there is none)
+	clear_text:       string, // the run itself, empty when nothing is sorted
+	x, y, h:          f32, // the band: y/h, and the text's left origin
+	clear_x, clear_w: f32, // the clickable run's rect, empty when nothing is sorted
+	clearable:        bool,
+}
+
+table_summary_layout :: proc(doc: ^Document, t: ^plat.Text, height, px, char_w: f32, allocator := context.temp_allocator) -> (sm: Table_Summary) {
+	text, cs, ce := table_summary_parts(doc, allocator)
+	sm.text, sm.head = text, text
+	sm.x = TABLE_CELL_PAD_X
+	sm.y = table_summary_y(doc, height, px)
+	sm.h = table_summary_h(px)
+	if ce <= cs || char_w <= 0 {return}
+	sm.head, sm.clear_text = text[:cs], text[cs:ce]
+	hcells := plat.text_cells(t, transmute([]u8)sm.head, 0, .Doc)
+	run := plat.text_cells(t, transmute([]u8)sm.clear_text, hcells, .Doc)
+	sm.clear_x = sm.x + f32(hcells) * char_w
+	sm.clear_w = f32(run) * char_w
+	sm.clearable = true
+	return
+}
+
+// Is this point on the run that says `click to clear`? The hit-test half of the
+// producer above, so the pixels that carry the words are the pixels that clear the
+// sort -- and no others. The whole band is deliberately NOT the target: at the
+// left end it reads `30 rows`, which promises nothing and should do nothing.
+table_summary_clear_hit :: proc(sm: Table_Summary, mx, my: f32) -> bool {
+	if !sm.clearable {return false}
+	return my >= sm.y && my < sm.y + sm.h && mx >= sm.clear_x && mx < sm.clear_x + sm.clear_w
 }
 
 // A column's name for the summary: its header cell, or a positional fallback when
@@ -1226,12 +1347,15 @@ table_row_malformed :: #force_inline proc(nfields, ncols: int) -> bool {
 Table_Col :: struct {
 	c:     int, // column index into doc.table_widths
 	x, w:  f32,
-	// The width the cell is LAID OUT at, in cells -- the sampled width plus this
-	// column's share of any leftover (§10's proportional distribution). It is
-	// what the text is truncated to, and it is carried here rather than read back
-	// out of doc.table_widths by each consumer: `w` and this are two views of one
-	// number, and a consumer truncating to the SAMPLED width inside a WIDENED
-	// rectangle would leave a gap it had no reason to leave.
+	// The width the cell is LAID OUT at, in cells. Equal to doc.table_widths[c]
+	// now that the leftover distribution is gone (see table_cols_layout), and
+	// still carried here rather than read back out of doc.table_widths by each
+	// consumer: `w` and this are two views of one number, and every consumer that
+	// truncates, clips or nudges asks the LAYOUT rather than the sample, so a
+	// future change to how a column's width is chosen reaches all of them at once.
+	// That is not hypothetical -- while the distribution existed, a consumer
+	// reading the sample inside a widened rectangle clipped short of where the
+	// draw put its glyphs, and this field is what fixed it.
 	cells: int,
 	align: Table_Align,
 }
@@ -1270,83 +1394,52 @@ table_start_col :: #force_inline proc(doc: ^Document) -> int {
 // A column that STARTS before the right edge is included even if it runs past
 // it, so a partly-visible column is drawn and clickable rather than dead; the
 // text inside it is clipped to the edge by the draw.
+//
+// --- §10's "distribute leftover width proportionally" IS DELIBERATELY NOT DONE
+//
+// A column is laid out at its CONTENT width -- doc.table_widths[c], the widest
+// sampled cell clamped to 8-40, or the user's own width if they dragged one --
+// and any spare window width is left EMPTY on the right.
+//
+// **This is a deviation from §10's literal rule, decided by Wyatt on 2026-07-31
+// from live evidence, and it must not be "fixed" back.** CLAUDE.md says the spec
+// wins about what should exist; this is the product owner overruling it after
+// seeing the result, the same way TABLE_EMPTY_CELL's dash colour deviates from
+// §10's `text_dim` call-out and records why above. §10's sentence reads perfectly
+// sensibly and only looks wrong once it runs: three narrow columns on a wide
+// display gave a 10-character date column ~400px, because proportional
+// distribution has nothing to divide BY except the columns that exist, so a table
+// with few columns hands each of them an enormous share. A column stretched five
+// times past anything in it is not using the space, it is hiding the data at the
+// two ends of a mostly-empty rectangle.
+//
+// The distribution's implementation (table_leftover_cells) was DELETED rather
+// than left unused. It was file-private with exactly one caller, so keeping it
+// would have meant an untestable, uncalled procedure whose comments describe a
+// rule the file no longer follows -- which is worse than absent, because the next
+// reader has to work out that it is dead before they can trust anything it says.
+// The rule it implemented is recorded here, where the decision lives, and in git.
+//
+// WHAT DID NOT CHANGE, and Wyatt asked for this explicitly: drag-a-header-edge to
+// resize and double-click-to-fit both still work exactly as they did.
+// table_col_resize measures against the LAID-OUT rectangle, which is still the
+// rectangle on screen; it is simply no longer wider than the sample. §10's other
+// two column rules -- the 8-40 clamp and the bounded sample -- are untouched.
 table_cols_layout :: proc(doc: ^Document, char_w, width: f32, start_col: int, allocator := context.temp_allocator) -> []Table_Col {
 	out := make([dynamic]Table_Col, 0, 16, allocator)
 	colw := doc.table_widths
 	if len(colw) == 0 {return out[:]}
 	right := table_right(width)
-	extra := table_leftover_cells(doc, char_w, width, allocator)
 	x := table_gutter_w()
 	for c := clamp(start_col, 0, max(0, len(colw) - 1)); c < len(colw); c += 1 {
 		if x >= right {break}
-		cells := colw[c] + (extra[c] if c < len(extra) else 0)
+		cells := colw[c]
 		w := f32(cells) * char_w + TABLE_CELL_PAD_X * 2
 		al := doc.table_align[c] if c < len(doc.table_align) else Table_Align.Left
 		append(&out, Table_Col{c = c, x = x, w = w, cells = cells, align = al})
 		x += w
 	}
 	return out[:]
-}
-
-// §10's "distribute leftover width proportionally", as extra CELLS per column.
-//
-// In the LAYOUT rather than in table_compute_widths, and that placement is the
-// whole of the design. The leftover depends on the window width, and
-// table_compute_widths runs when the grid opens and after an edit -- never on a
-// resize -- so a distribution baked into the sample would be stale from the
-// first drag of the window's edge, silently, with no route to notice. Computed
-// here it is correct on every frame by construction and costs one pass over the
-// column list.
-//
-// Applies ONLY when every column already fits. There is no leftover otherwise,
-// and the grid answers overflow by scrolling horizontally rather than by
-// shrinking (see the reconciliation note at TABLE_COL_MIN for why the grid must
-// not borrow md_table_fit_cells' compression). `start_col` is deliberately not a
-// parameter: the leftover belongs to the table, not to whatever part of it
-// happens to be scrolled into view, so a column keeps the same width whether or
-// not it is the first one on screen.
-//
-// Proportional to each column's own sampled width, with the integer remainder
-// handed out one cell at a time from the left so the widened columns sum to the
-// leftover EXACTLY -- md_table_fit_cells does the same for the same reason, and
-// the shape is worth mirroring even though the direction is opposite: rounding
-// drift left over at the right edge is a ragged column boundary that moves with
-// the window width.
-@(private = "file")
-table_leftover_cells :: proc(doc: ^Document, char_w, width: f32, allocator := context.temp_allocator) -> []int {
-	colw := doc.table_widths
-	out := make([]int, len(colw), allocator)
-	if len(colw) == 0 || char_w <= 0 {return out}
-	avail := table_right(width) - table_gutter_w()
-	// A column the user dragged to a width is EXCLUDED from the distribution --
-	// it keeps neither a share of the leftover nor a vote in the weights. They
-	// asked for twelve cells; handing them nineteen because the window is wide
-	// would make the drag look like it had been ignored, which is worse than a
-	// strip of unused width on the right. It still counts toward `total`: the
-	// space it occupies is space there is no leftover of.
-	total, sum := f32(0), 0
-	for w, i in colw {
-		total += f32(w) * char_w + TABLE_CELL_PAD_X * 2
-		if i < len(doc.table_user_w) && doc.table_user_w[i] > 0 {continue}
-		sum += w
-	}
-	if total >= avail || sum <= 0 {return out}
-	leftover := int((avail - total) / char_w)
-	if leftover <= 0 {return out}
-	given := 0
-	for w, i in colw {
-		if i < len(doc.table_user_w) && doc.table_user_w[i] > 0 {continue}
-		out[i] = leftover * w / sum
-		given += out[i]
-	}
-	// The integer remainder, one cell at a time, skipping the fixed columns. The
-	// loop cannot spin: `sum > 0` means at least one column is free.
-	for i := 0; given < leftover; i = (i + 1) %% len(out) {
-		if i < len(doc.table_user_w) && doc.table_user_w[i] > 0 {continue}
-		out[i] += 1
-		given += 1
-	}
-	return out
 }
 
 // --- §10's "drag a header edge to resize; double-click to fit content" ------
@@ -1364,12 +1457,17 @@ TABLE_RESIZE_HIT_96 :: f32(4)
 //
 // NOT TABLE_COL_MAX, and the difference is a real defect rather than a
 // preference. §10's 40 bounds the AUTOMATIC sizing: it stops one 300-character
-// cell claiming the whole window before anybody has asked for it. §10's own
-// leftover distribution then routinely lays a column out WIDER than 40 on a wide
-// window, so clamping a drag at 40 means grabbing such an edge and nudging it
-// one pixel snaps the column twenty cells narrower -- the automatic bound
-// reaching back through a gesture whose entire purpose is to override it. What
-// is left here is a guard against absurdity, not a design opinion; the pointer
+// cell claiming the whole window before anybody has asked for it. A drag is the
+// gesture whose entire purpose is to override that bound, so clamping it at 40
+// would mean a user with a wide window and a long field simply cannot see the
+// field -- the automatic guard reaching back through the manual escape from it.
+//
+// This used to be argued from the leftover distribution as well ("§10's own
+// distribution routinely lays a column out past 40, so a drag clamped at 40 would
+// snap the column twenty cells narrower the moment it was grabbed"). That half of
+// the argument retired with the distribution on 2026-07-31 -- automatic widths are
+// now never above 40 -- and the number stays where it is on the first half alone.
+// What is left is a guard against absurdity, not a design opinion; the pointer
 // cannot leave the window, so a real drag never approaches it.
 TABLE_COL_DRAG_MAX :: 500
 
@@ -1384,8 +1482,9 @@ TABLE_COL_DRAG_MAX :: 500
 //
 // Gated to the header band, because that is where §10 puts the affordance and
 // because the same x inside the ROWS must keep starting a cell edit. Edges are
-// taken from table_cols_layout, so they move with the gutter and with §10's
-// leftover distribution without this knowing either exists.
+// taken from table_cols_layout, so they move with the gutter, with a user's
+// dragged width, and with any future change to how a column's width is chosen,
+// without this knowing any of them exists.
 table_edge_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (c: int, ok: bool) {
 	if doc == nil || len(doc.table_widths) == 0 {return 0, false}
 	top := table_grid_top()
@@ -1423,6 +1522,37 @@ table_header_col_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (
 	return 0, false
 }
 
+// The header cell the pointer is hovering FOR THE SORT GESTURE, or ok = false.
+//
+// §10 gives the header a click-to-sort and gives no discoverable sign of it.
+// Wyatt, rejecting three proposals that added a second control: *"how will the
+// person know what to click and where to reset."* The answer is not another hidden
+// target, it is to LABEL the one that exists -- so the header lifts under the
+// pointer and shows the arrow it would gain, and the summary row says the undo in
+// words (table_summary_layout). This is the producer for the first half.
+//
+// PRECEDENCE, stated once here rather than left to each consumer:
+//
+//   the ±4px RESIZE EDGE ZONE WINS. Inside it this returns nothing -- no lift, no
+//   ghost arrow -- because that is exactly where the press does not sort either
+//   (main.odin tests table_edge_at first, and its own comment records why:
+//   reordering a whole file on a slightly-off resize grab is not a recoverable
+//   surprise). The cursor there is already .SizeWE. Showing a sort affordance over
+//   a pixel that resizes would be the "affordance appears where the gesture does
+//   not work" failure table_edge_at's comment was written about, with the added
+//   insult that the gesture it advertises is the destructive-looking one.
+//
+// THREE BEHAVIOURS ON ONE RECT -- sort click, resize drag, and now hover -- and
+// all three resolve through table_cols_layout and this file's two band gates, so
+// the ordering above is the whole of the interaction. Note the DATA rows are
+// unaffected in every case: table_edge_at and table_header_col_at both refuse
+// outside the header band, which is what keeps the same x one row down a cell
+// edit.
+table_header_hover_col :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (c: int, ok: bool) {
+	if _, on_edge := table_edge_at(doc, char_w, width, mx, my, px); on_edge {return 0, false}
+	return table_header_col_at(doc, char_w, width, mx, my, px)
+}
+
 // The boolean form, for the hover cursor -- which wants "is there an edge here"
 // and has no use for which column it is. Through table_edge_at rather than
 // beside it, so there is still exactly one definition of the zone.
@@ -1437,11 +1567,14 @@ table_edge_at_cursor :: #force_inline proc(doc: ^Document, char_w, width, mx, my
 // produce; the ceiling is TABLE_COL_DRAG_MAX rather than §10's 40, for the
 // reason recorded there.
 //
-// The edge is measured against the column's LAID-OUT rectangle, leftover
-// distribution included, because that rectangle is what the user grabbed. Drag
-// the visible edge five cells right and the column becomes five cells wider than
-// it looked -- which is the only reading under which the edge follows the
-// pointer.
+// The edge is measured against the column's LAID-OUT rectangle -- whatever that
+// rectangle is made of -- because it is what the user grabbed. Drag the visible
+// edge five cells right and the column becomes five cells wider than it looked,
+// which is the only reading under which the edge follows the pointer. The layout
+// and the sample used to be different numbers (the leftover distribution widened
+// the one but not the other) and measuring against the sample put the edge a
+// hand's width from the pointer; they coincide again since 2026-07-31, and this
+// still asks the layout so that it stays right if they ever diverge a second time.
 //
 // Recorded in table_user_w, NOT only in table_widths, and that is the whole
 // difficulty of this feature. table_compute_widths reruns whenever the widths
@@ -1512,6 +1645,88 @@ table_cell_text_x :: #force_inline proc(col: Table_Col) -> f32 {return col.x + T
 table_cell_align_dx :: #force_inline proc(col: Table_Col, cells: int, char_w: f32) -> f32 {
 	if col.align != .Right {return 0}
 	return max(0, col.w - TABLE_CELL_PAD_X * 2 - f32(cells) * char_w)
+}
+
+// --- the header's sort arrow: ONE producer for its rect AND its slot --------
+//
+// §10: "click to sort with an accent arrow." The arrow is drawn twice from two
+// different states -- solid on the sorted column, dimmed on a HOVERED one, which
+// is the affordance that says the header is clickable at all -- and it was
+// positioned by an expression inlined in the draw. Two call sites deriving one
+// rectangle is the divergence CLAUDE.md's "one layout per widget" names, and the
+// dimmed preview has to land in EXACTLY the slot the solid one will occupy or it
+// is a lie about what the click does.
+//
+// The width tracks the text (px * 0.6) and lands on whole pixels, so the stacked
+// bars table_sort_arrow builds do not straddle two device pixels at 125%/150%.
+// Height is half the width: the proportion that reads as an arrowhead rather than
+// as a wedge at the sizes a header uses.
+Table_Arrow :: struct {
+	x, y, w, h: f32,
+}
+
+table_arrow_w :: #force_inline proc(px: f32) -> f32 {return f32(int(px * 0.6))}
+
+// The gap between the header label and the arrow, in pixels. Half a cell pad --
+// enough that the two read as separate marks, small enough that reserving it
+// costs a narrow column no more than one extra character of its name.
+table_arrow_gap :: #force_inline proc() -> f32 {return f32(int(TABLE_CELL_PAD_X * 0.5))}
+
+// The arrow's rectangle inside a column's header cell: hard against the cell's
+// right inner edge, vertically centred in the header band, and clamped so it
+// stays on screen in a column that runs past the grid's right edge.
+table_sort_arrow_rect :: proc(col: Table_Col, px, right: f32) -> Table_Arrow {
+	w := table_arrow_w(px)
+	h := w * 0.5
+	return Table_Arrow {
+		x = min(col.x + col.w - TABLE_CELL_PAD_X - w, right - w),
+		y = table_grid_top() + f32(int((table_header_h(px) - h) * 0.5)),
+		w = w,
+		h = h,
+	}
+}
+
+// The cells the arrow's slot takes out of a header cell -- the arrow plus its gap,
+// rounded UP to a whole cell because the label is truncated in cells and half a
+// cell of overlap is still overlap.
+table_arrow_cells :: proc(char_w, px: f32) -> int {
+	if char_w <= 0 {return 0}
+	need := table_arrow_w(px) + table_arrow_gap()
+	n := int(need / char_w)
+	if f32(n) * char_w < need {n += 1}
+	return n
+}
+
+// The header LABEL's own box: the column's cell with the arrow's slot taken off
+// its right end. THE producer for where a header name is truncated AND for how
+// far a right-aligned one is nudged -- both, because doing only the first is the
+// bug this exists to fix in its other half.
+//
+// The arrow used to be drawn after the header text and on top of it, with the
+// label truncated to the FULL cell width, so any name that filled its column had
+// the triangle painted through it ("a smear below Date", Wyatt, live use,
+// v0.34.0). Reserving the slot before the truncation is the fix, and the
+// alignment nudge has to read the same narrowed box or a right-aligned header --
+// which §10 pushes hard against the cell's right inner edge, precisely where the
+// arrow lives -- would sit under the arrow however short it was.
+//
+// RESERVED ON EVERY COLUMN, sorted or not, hovered or not. The alternative is to
+// reserve it only where an arrow is actually drawn, and that makes the header
+// label re-truncate as the pointer crosses it: text that changes under the mouse,
+// on the surface whose whole problem is that a click on it does something
+// surprising. Every column is sortable, so every column is a column the arrow can
+// appear in; paying the slot once, uniformly, keeps the header row still. The
+// cost is at most one or two characters of a header name, and only for a name
+// that already filled its column.
+//
+// x is unchanged, so table_cell_text_x still answers for the label; only the
+// width narrows.
+table_header_label_col :: proc(col: Table_Col, char_w, px: f32) -> Table_Col {
+	lab := col
+	n := min(table_arrow_cells(char_w, px), max(0, col.cells - 1)) // never below one cell of name
+	lab.cells = col.cells - n
+	lab.w = col.w - f32(n) * char_w
+	return lab
 }
 
 // Compute the per-column widths AND alignments from the first TABLE_SAMPLE rows
@@ -1836,11 +2051,12 @@ table_links :: proc(doc: ^Document, text: ^plat.Text, px, char_w: f32, rows: int
 			if col.c >= len(fields) {continue}
 			field := strings.clone(fields[col.c], allocator)
 			// Both the cell's clip edge and the underline's origin come from
-			// col.cells, the width the LAYOUT gave this column -- not from
-			// doc.table_widths[col.c], which is the pre-distribution sample and is
-			// narrower whenever §10's leftover has been handed out. Reading the
-			// sample here would have left every link in a widened column clipped
-			// short of where the draw actually put its glyphs.
+			// col.cells, the width the LAYOUT gave this column, rather than from
+			// doc.table_widths[col.c] -- one producer for the x axis, as everywhere
+			// else in this file. The two are the same number since the leftover
+			// distribution was removed; while it existed the sample was the narrower
+			// of the two, and reading it here left every link in a widened column
+			// clipped short of where the draw put its glyphs.
 			//
 			// ...and the same alignment nudge the draw applies, so an underline in
 			// a right-aligned column sits under its text rather than beside it.
@@ -1886,7 +2102,14 @@ table_link_hit :: proc(links: []Table_Link, mx, my, px, row_h: f32) -> (Table_Li
 // Draw the visible rows as a grid. `doc.table_cols` is set here (the column count
 // this frame) so input can clamp horizontal scroll. Returns the byte offset just
 // past the last visible row, for the byte-proportional scrollbar.
-table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px, char_w: f32, rows: int, width, height: f32) -> (bottom: int) {
+//
+// `hover_col` is the header cell under the pointer, or TABLE_SORT_NONE. Passed in
+// rather than resolved here because the live cursor position lives on the platform
+// window and this file is one layer below it -- and because the caller has to ask
+// table_header_hover_col anyway for the cursor shape, so asking twice would be two
+// chances for the drawn affordance and the pointer to disagree about the same
+// pixel.
+table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, px, char_w: f32, rows: int, width, height: f32, hover_col := TABLE_SORT_NONE) -> (bottom: int) {
 	delim := doc.table_delim if doc.table_delim != 0 else ','
 	row_h := table_row_h(px)
 	right := table_right(width)
@@ -2167,6 +2390,19 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	// is nothing to draw.
 	if len(head) > 0 {
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top()}, size = {right, table_header_h(px)}, color = g_theme[.Bg_Raised]}})
+		// The HOVER LIFT, over the band and under the rule, the text and the arrow.
+		// Bg_Hover is §1.1's role for exactly this ("hover fill for any tab, menu
+		// row, settings row or palette row"), so a hovered header reads as the same
+		// kind of thing as every other hoverable row in the app -- which is the
+		// whole point: the reader has met this signal elsewhere. The cell rect is
+		// the layout's, so the lift covers precisely the pixels that sort.
+		if hover_col != TABLE_SORT_NONE {
+			for col in cols {
+				if col.c != hover_col {continue}
+				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {col.x, table_grid_top()}, size = {min(col.w, right - col.x), table_header_h(px)}, color = g_theme[.Bg_Hover]}})
+				break
+			}
+		}
 		// A 1px Border_Strong rule beneath it (§10). Border_Strong and not
 		// Border_Subtle: this is the one boundary in the grid now that the column
 		// rules are gone, and §1.1 names "table header rule" as what Border_Strong is
@@ -2178,11 +2414,18 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			if col.c >= len(head) {continue}
 			field := head[col.c]
 			if len(field) == 0 {continue} // a nameless column: leave it blank, don't dash a header
+			// The LABEL's box, not the cell's: the arrow's slot is reserved off the
+			// right end BEFORE the truncation, which is what stops a name that fills
+			// its column having the triangle painted through it. See
+			// table_header_label_col -- the nudge below reads the same narrowed box,
+			// because a right-aligned header pushed to the cell's right inner edge
+			// would otherwise land under the arrow no matter how short it was.
+			lab := table_header_label_col(col, char_w, px)
 			fb := transmute([]u8)field
 			hcells := plat.text_cells(text, fb, 0, .Doc)
-			if hcells > col.cells {
-				field = field[:plat.text_bytes_for_cells(text, fb, col.cells, 0, .Doc)]
-				hcells = col.cells
+			if hcells > lab.cells {
+				field = field[:plat.text_bytes_for_cells(text, fb, lab.cells, 0, .Doc)]
+				hcells = lab.cells
 			}
 			// The header takes its column's alignment, so a right-aligned numeric
 			// column reads as ONE column rather than as a left-aligned label with
@@ -2191,25 +2434,53 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			// the header is now a real header (§10) and the previous draw made no
 			// distinction at all: both branches of its `hl` resolved to
 			// Text_Primary, so the "highlighted" header row was a no-op.
-			hx := table_cell_text_x(col) + table_cell_align_dx(col, hcells, char_w)
+			hx := table_cell_text_x(lab) + table_cell_align_dx(lab, hcells, char_w)
 			plat.text_draw(gfx, text, field, hx, hy, px, g_theme[.Text_Bright], .Doc)
 		}
-		// §10's "click to sort with an accent arrow". Drawn AFTER the header text so
-		// it is on top of a name that runs the full width of its cell.
-		if table_sorted(doc) {
+		// §10's "click to sort with an accent arrow", and the DIMMED preview of it on
+		// a hovered column. Both through table_sort_arrow_rect, so the ghost lands in
+		// exactly the slot the solid arrow will occupy -- an affordance that moved
+		// once the click landed would be worse than none.
+		//
+		// The sorted column wins where the two would coincide: hovering the column
+		// that is already sorted shows its real arrow at full strength rather than
+		// replacing it with a preview of itself. `up` is what the NEXT click
+		// produces on an unsorted column, which is ascending (table_sort_click), so
+		// the ghost is a prediction rather than a decoration.
+		//
+		// Drawn after the header text either way. It no longer overlaps it -- the
+		// slot above is reserved -- but the ordering is free and a header whose name
+		// somehow reached the slot would still lose to the mark rather than hide it.
+		{
+			sorted_col := doc.table_sort.col if table_sorted(doc) else TABLE_SORT_NONE
 			for col in cols {
-				if col.c != doc.table_sort.col {continue}
+				dim := false
+				switch {
+				case col.c == sorted_col:
+				case col.c == hover_col:
+					dim = true
+				case:
+					continue
+				}
 				// Quads, not a glyph. The document face is the user's monospace font
 				// and nothing guarantees it has U+25B2/U+25BC -- a missing glyph is a
 				// tofu box or nothing at all, and "nothing at all" would leave the
 				// sorted column indistinguishable from the others, which is the one
 				// thing this mark exists to prevent. Four stacked bars are a triangle
 				// at any font, any DPI and any theme.
-				aw := f32(int(px * 0.6)) // scales with the text, whole pixels
-				ax := min(col.x + col.w - TABLE_CELL_PAD_X - aw, right - aw)
-				ay := table_grid_top() + f32(int((table_header_h(px) - aw * 0.5) * 0.5))
-				table_sort_arrow(gfx, qp, ax, ay, aw, !doc.table_sort.desc)
-				break
+				a := table_sort_arrow_rect(col, px, right)
+				colour := g_theme[.Accent]
+				up := true
+				if dim {
+					// Straight alpha over whatever is behind it (quads.odin binds a
+					// SRC_ALPHA blend), so the ghost is the accent at reduced weight
+					// rather than a second colour role that would have to be added to
+					// every theme and kept in step with Accent by hand.
+					colour[3] *= TABLE_ARROW_GHOST_A
+				} else {
+					up = !doc.table_sort.desc
+				}
+				table_sort_arrow(gfx, qp, a, up, colour)
 			}
 		}
 	}
@@ -2225,44 +2496,76 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	// out of the row budget, so nothing is drawn under it and nothing hit-tests into
 	// it -- see that procedure for why the reservation is there and not here.
 	//
+	// It sits above the HORIZONTAL SCROLLBAR's strip now, not across it. Both bands
+	// are pinned to the same bottom edge and both were laid out from it
+	// independently, so the bar was painted through the summary's text (Wyatt, live
+	// use, v0.34.0); table_bottom_band_h reserves the pair and table_summary_y is
+	// measured off it.
+	//
 	// Bg_Raised and a rule ABOVE it, mirroring the sticky header's fill and its rule
 	// BELOW: the two bands bracket the data, which is what makes a strip read as
 	// chrome rather than as one more row of the table.
 	{
-		sy := table_summary_y(doc, height, px)
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, sy}, size = {right, table_summary_h(px)}, color = g_theme[.Bg_Raised]}})
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, sy}, size = {right, hairline()}, color = g_theme[.Border_Strong]}})
+		sm := table_summary_layout(doc, text, height, px, char_w)
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, sm.y}, size = {right, sm.h}, color = g_theme[.Bg_Raised]}})
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, sm.y}, size = {right, hairline()}, color = g_theme[.Border_Strong]}})
 		// Text_Muted, the same tier the row-number gutter and the em dash take, and
 		// for the third time the same argument: this is live content that has to be
 		// readable, not a disabled control, so Text_Dim's below-AA exemption does not
 		// cover it.
-		base_y := sy + px + f32(int((table_summary_h(px) - line_height(px)) * 0.5))
-		plat.text_draw(gfx, text, table_summary_text(doc), TABLE_CELL_PAD_X, base_y, px, g_theme[.Text_Muted], .Doc)
+		base_y := sm.y + px + f32(int((sm.h - line_height(px)) * 0.5))
+		if !sm.clearable {
+			plat.text_draw(gfx, text, sm.text, sm.x, base_y, px, g_theme[.Text_Muted], .Doc)
+		} else {
+			// The `sorted by ... · click to clear` run is a control, so it is drawn
+			// as one: Text_Secondary against the muted rest of the line, the same
+			// brightening the row-number gutter gives the current row, and a role
+			// that clears AA in both themes.
+			//
+			// TWO DRAWS AT THE TWO x's THE LAYOUT PRODUCED, not one draw with the
+			// bright run painted over it: glyph coverage alpha-blends, so overdrawing
+			// would leave every antialiased edge carrying the muted colour underneath
+			// and the run would read as slightly bolder than it is. Both origins come
+			// out of sm, so the split cannot land anywhere the hit-test does not
+			// expect -- sm.clear_x IS where the bright text starts, by construction.
+			plat.text_draw(gfx, text, sm.head, sm.x, base_y, px, g_theme[.Text_Muted], .Doc)
+			plat.text_draw(gfx, text, sm.clear_text, sm.clear_x, base_y, px, g_theme[.Text_Secondary], .Doc)
+		}
 	}
 	return
 }
 
 // The sort direction mark: a solid triangle built from stacked bars, pointing up
-// for ascending. `w` is its width and it is half as tall, which is the proportion
-// that reads as an arrowhead rather than as a wedge at the sizes a header uses.
+// for ascending, drawn into the rectangle table_sort_arrow_rect produced.
 //
 // ARROW_STEPS bars rather than a real triangle because the renderer draws quads and
 // only quads (CLAUDE.md's layer boundary: "renderer -- quads only"). Four is enough
 // that the staircase is invisible at 10-16px and few enough that a sorted header
 // costs four quads, not a mesh.
+//
+// It takes the RECT rather than an x/y/w triple so that the one producer's answer
+// is passed around whole -- a caller cannot hand it three of the four numbers from
+// the layout and the fourth from somewhere else -- and it takes the COLOUR because
+// the hover ghost is the same triangle at a lower alpha, and a `dim: bool` here
+// would put a second policy decision inside a drawing primitive.
 @(private = "file")
 TABLE_ARROW_STEPS :: 4
 
+// The hover ghost's alpha, as a fraction of the solid arrow's. Low enough that it
+// cannot be mistaken for a live sort at a glance -- the reader must be able to see
+// which column IS sorted while hovering a different one -- and high enough to read
+// against Bg_Hover in both themes.
+TABLE_ARROW_GHOST_A :: f32(0.45)
+
 @(private = "file")
-table_sort_arrow :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, x, y, w: f32, up: bool) {
-	col := g_theme[.Accent]
-	h := max(hairline(), f32(int(w * 0.5 / TABLE_ARROW_STEPS)))
+table_sort_arrow :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, a: Table_Arrow, up: bool, col: [4]f32) {
+	h := max(hairline(), f32(int(a.h / TABLE_ARROW_STEPS)))
 	for i in 0 ..< TABLE_ARROW_STEPS {
 		// Widest at the base, narrowest at the tip; `up` only decides which end the
 		// tip is at, so one expression covers both directions.
 		k := f32(i if up else TABLE_ARROW_STEPS - 1 - i)
-		bw := w * (k + 1) / TABLE_ARROW_STEPS
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x + (w - bw) * 0.5, y + f32(i) * h}, size = {bw, h}, color = col}})
+		bw := a.w * (k + 1) / TABLE_ARROW_STEPS
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {a.x + (a.w - bw) * 0.5, a.y + f32(i) * h}, size = {bw, h}, color = col}})
 	}
 }
 

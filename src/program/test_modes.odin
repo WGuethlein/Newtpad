@@ -9983,7 +9983,7 @@ when NEWTPAD_TESTS {
 					// named. The precondition below is what caught that, and this
 					// is what it caught.
 					W := f32(1000)
-					H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 					clear(&doc.table_widths)
 					table_compute_widths(&doc, &t)
 					doc.table_cols = len(doc.table_widths)
@@ -10134,7 +10134,7 @@ when NEWTPAD_TESTS {
 				px := BASE_PX_96
 				cw := plat.text_char_width(&t, px, .Doc)
 				W := f32(1000)
-				H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 				clear(&doc.table_widths)
 				table_compute_widths(&doc, &t)
 				doc.table_cols = len(doc.table_widths)
@@ -10342,9 +10342,11 @@ when NEWTPAD_TESTS {
 					// to the pixel. Probed at the exact boundary: a column is laid
 					// out when its x is strictly left of table_right, so column 1
 					// appears at one pixel past `gutter + column 0 + scrollbar`
-					// and not before. Both probes use the NATURAL width, at a
-					// window too narrow for §10's leftover distribution to run, so
-					// this measures the origin rather than the distribution.
+					// and not before. Both probes use the NATURAL width, which is
+					// the laid-out width at every window size now that §10's
+					// leftover distribution is gone (2026-07-31); it was already
+					// true here, because the probe window is far too narrow for the
+					// distribution to have fired.
 					nat0 := f32(doc.table_widths[0]) * cw + TABLE_CELL_PAD_X * 2
 					edge := gw + nat0 + SCROLLBAR_W
 					n1 := table_cols_fitting(&doc, cw, edge, 0)
@@ -10412,7 +10414,7 @@ when NEWTPAD_TESTS {
 				// fixture that also has to land on "the editor's count and the
 				// grid's genuinely differ", not a re-use of the same numbers.
 				PG_ROWS :: 8
-				H := table_rows_top(px) + f32(PG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(PG_ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 				trows := table_visible_rows(d, H, px)
 				erows := doc_visible_rows(d, H, line_h)
 				pre := trows == PG_ROWS && trows < len(lines) - 1
@@ -10534,7 +10536,7 @@ when NEWTPAD_TESTS {
 					d.table_cols = len(d.table_widths)
 
 					ROWS :: 12
-					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 					trows := table_visible_rows(d, H, px)
 					if trows != ROWS || ER >= trows {
 						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
@@ -10718,7 +10720,7 @@ when NEWTPAD_TESTS {
 					d.table_cols = len(d.table_widths)
 
 					ROWS :: 14
-					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 					trows := table_visible_rows(d, H, px)
 					if trows != ROWS || ER + 1 >= trows {
 						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
@@ -11499,50 +11501,44 @@ when NEWTPAD_TESTS {
 					chk(&bad, table_cell_align_dx(rc, 3, cw) == want_dx, fmt.tprintf("a 3-cell value ends on the right inner edge (dx %.1f, want %.1f)", table_cell_align_dx(rc, 3, cw), want_dx))
 				}
 
-				// §10's "distribute leftover width proportionally" (3b). It lives
-				// in table_cols_layout rather than in the sample precisely so that
-				// it tracks the window, so both directions get probed: a window
-				// with room to spare must be FILLED, and one without must leave the
-				// sampled widths alone.
+				// §10's "distribute leftover width proportionally" IS DELIBERATELY
+				// NOT DONE (Wyatt, 2026-07-31, on live evidence: three narrow
+				// columns on a wide display gave a 10-character date column
+				// ~400px). A column is laid out at its CONTENT width and the spare
+				// width is left empty on the right.
+				//
+				// The check is the WINDOW-INDEPENDENCE of the layout, not "the
+				// numbers are equal at 2400px". A distribution that fires only past
+				// some threshold, or that hands out a single cell, would satisfy an
+				// equality at one width and still stretch the column Wyatt
+				// complained about -- so the assertion sweeps a range of widths from
+				// snug to enormous and demands the SAME layout out of all of them.
 				{
-					WIDE :: f32(2400)
-					wide := table_cols_layout(&d, cw, WIDE, 0)
-					avail := table_right(WIDE) - table_gutter_w()
-					total, shrunk, extra_of := f32(0), 0, make([]int, len(wide), context.temp_allocator)
-					for c, i in wide {
-						total += c.w
-						extra_of[i] = c.cells - d.table_widths[c.c]
-						if extra_of[i] < 0 {shrunk += 1}
+					WIDTHS :: [?]f32{800, 1200, 2400, 6000}
+					drifted, widest := 0, -1
+					for W in WIDTHS {
+						cs := table_cols_layout(&d, cw, W, 0)
+						for c in cs {
+							if c.cells != d.table_widths[c.c] {drifted += 1}
+							if c.cells > widest {widest = c.cells}
+						}
 					}
-					chk(&bad, len(wide) == len(d.table_widths), fmt.tprintf("every column is on screen at %.0fpx (%d of %d)", WIDE, len(wide), len(d.table_widths)))
-					chk(&bad, shrunk == 0, fmt.tprintf("no column is ever SHRUNK -- the grid scrolls, it does not compress (%d were)", shrunk))
-					// Filled to within one cell: the integer remainder is handed
-					// out one cell at a time, so what is left over is less than a
-					// character, not a ragged strip on the right.
-					gap := avail - total
-					chk(&bad, gap >= 0 && gap < cw, fmt.tprintf("the leftover is distributed to within one cell (%.1fpx of %.1fpx spare, cell %.1f)", gap, avail, cw))
-					// Proportional, not equal: the widest sampled column takes more
-					// of the leftover than the narrowest. An even split would give
-					// them the same number and pass every check above.
-					wi, ni := 0, 0
-					for c, i in wide {
-						if d.table_widths[c.c] > d.table_widths[wide[wi].c] {wi = i}
-						if d.table_widths[c.c] < d.table_widths[wide[ni].c] {ni = i}
-					}
-					chk(
-						&bad,
-						d.table_widths[wide[wi].c] > d.table_widths[wide[ni].c],
-						fmt.tprintf("precondition -- the fixture has columns of different widths (%d vs %d)", d.table_widths[wide[wi].c], d.table_widths[wide[ni].c]),
-					)
-					chk(
-						&bad,
-						extra_of[wi] > extra_of[ni],
-						fmt.tprintf("the leftover goes out PROPORTIONALLY, not evenly (widest gained %d cells, narrowest %d)", extra_of[wi], extra_of[ni]),
-					)
-					// And a window with nothing spare leaves the sample untouched.
+					chk(&bad, drifted == 0, fmt.tprintf("a column is laid out at its CONTENT width at every window size (%d of the laid-out columns differed from their sample)", drifted))
+					chk(&bad, widest <= TABLE_COL_MAX, fmt.tprintf("...so nothing is ever laid out past §10's automatic 40 (widest %d)", widest))
+					// The spare width is LEFT EMPTY, which is the visible half of
+					// the decision: on a very wide window the columns must stop well
+					// short of the right edge rather than filling it.
+					huge := table_cols_layout(&d, cw, 6000, 0)
+					total := f32(0)
+					for c in huge {total += c.w}
+					avail := table_right(6000) - table_gutter_w()
+					chk(&bad, len(huge) == len(d.table_widths), fmt.tprintf("every column is on screen at 6000px (%d of %d)", len(huge), len(d.table_widths)))
+					chk(&bad, avail - total > 40 * cw, fmt.tprintf("the spare width is left EMPTY on the right (%.0fpx of %.0fpx unused)", avail - total, avail))
+					// ...and nothing SHRINKS either: the grid answers overflow by
+					// scrolling horizontally, never by compression.
 					NARROW := table_gutter_w() + SCROLLBAR_W + 60
 					narrow := table_cols_layout(&d, cw, NARROW, 0)
-					chk(&bad, len(narrow) > 0 && narrow[0].cells == d.table_widths[0], fmt.tprintf("a full window distributes nothing (col 0 laid out at %d cells, sampled %d)", narrow[0].cells if len(narrow) > 0 else -1, d.table_widths[0]))
+					chk(&bad, len(narrow) > 0 && narrow[0].cells == d.table_widths[0], fmt.tprintf("a window with no room compresses nothing (col 0 laid out at %d cells, sampled %d)", narrow[0].cells if len(narrow) > 0 else -1, d.table_widths[0]))
 				}
 				return
 			}
@@ -11594,7 +11590,7 @@ when NEWTPAD_TESTS {
 				d.table, d.table_delim = true, ','
 				table_compute_widths(&d, &t)
 				d.table_cols = len(d.table_widths)
-				H := table_rows_top(px) + 6 * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + 6 * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 				rows := table_visible_rows(&d, H, px)
 
 				cols := table_cols_layout(&d, cw, W, 0)
@@ -11618,19 +11614,28 @@ when NEWTPAD_TESTS {
 				chk(&bad, !onrow, "the same x in a DATA row is not an edge -- a cell click still lands there")
 
 				// 2. The drag itself, and both bounds. The edge is measured against
-				//    the LAID-OUT rectangle -- §10's leftover distribution
-				//    included, since that is the edge the user grabbed -- so five
-				//    cells of pointer travel is five cells of column, counted from
-				//    what was on screen and not from the sample.
+				//    the LAID-OUT rectangle, since that is the edge the user
+				//    grabbed -- so five cells of pointer travel is five cells of
+				//    column.
+				//
+				//    The laid-out width and the sampled width are the SAME number
+				//    since §10's leftover distribution was removed (2026-07-31), so
+				//    this no longer distinguishes the two origins the way it did.
+				//    Asserted as an equality rather than deleted, because that
+				//    equality is now the property Wyatt asked for -- a wide window
+				//    must not stretch a column -- observed on the same layout the
+				//    drag below measures against.
 				nat0 := d.table_widths[0]
-				chk(&bad, cols[0].cells > nat0, fmt.tprintf("precondition -- column 0 is laid out wider than sampled (%d vs %d), so the two origins differ", cols[0].cells, nat0))
+				chk(&bad, cols[0].cells == nat0, fmt.tprintf("precondition -- column 0 is laid out at its content width, not stretched (%d vs sampled %d)", cols[0].cells, nat0))
 				table_col_resize(&d, 0, edge + 5 * cw, cw, W)
 				chk(&bad, d.table_widths[0] == cols[0].cells + 5, fmt.tprintf("dragging the drawn edge right by 5 cells widens by 5 (%d -> %d)", cols[0].cells, d.table_widths[0]))
 				table_col_resize(&d, 0, edge - 4000 * cw, cw, W)
 				chk(&bad, d.table_widths[0] == TABLE_COL_MIN, fmt.tprintf("dragging far left clamps to TABLE_COL_MIN (%d, want %d)", d.table_widths[0], TABLE_COL_MIN))
 				// Past §10's automatic 40, deliberately: a manual drag overrides
-				// the bound that exists to stop ONE wide cell claiming the window,
-				// and the distribution already lays columns out past 40 anyway.
+				// the bound that exists to stop ONE wide cell claiming the window
+				// before anybody asked. It is the only route past 40 now that the
+				// leftover distribution is gone, which makes it matter more, not
+				// less.
 				table_col_resize(&d, 0, edge + 60 * cw, cw, W)
 				chk(&bad, d.table_widths[0] > TABLE_COL_MAX, fmt.tprintf("a drag may pass §10's automatic 40 (%d)", d.table_widths[0]))
 				table_col_resize(&d, 0, edge + 4000 * cw, cw, W)
@@ -11675,17 +11680,22 @@ when NEWTPAD_TESTS {
 				chk(&bad, d.table_widths[1] == nat1, fmt.tprintf("...and column 1 is back to its own content width (%d, want %d)", d.table_widths[1], nat1))
 				chk(&bad, nat1 != d.table_widths[0] && nat1 != d.table_widths[2], fmt.tprintf("...which is distinct from its neighbours' (%d vs %d, %d)", nat1, d.table_widths[0], d.table_widths[2]))
 
-				// 5. A fixed column takes no share of §10's leftover: the user asked
-				//    for a width, not for a proportion of the window.
+				// 5. A WIDE WINDOW STRETCHES NOTHING -- the user's dragged column
+				//    and the automatic ones alike. This case used to assert the
+				//    opposite half ("the others still absorb the leftover"), which
+				//    is the behaviour Wyatt reported as a defect on 2026-07-31; it
+				//    now asserts the decision that replaced it, on the same fixture
+				//    and through the same drag, so the reversal is visible in the
+				//    test rather than only in a comment.
 				table_col_resize(&d, 0, cols[0].x + cols[0].w + 4 * cw, cw, W)
 				fixedw := d.table_widths[0]
 				wide := table_cols_layout(&d, cw, 2400, 0)
-				got, others := -1, 0
+				got, grew := -1, 0
 				for c in wide {
-					if c.c == 0 {got = c.cells} else if c.cells > d.table_widths[c.c] {others += 1}
+					if c.c == 0 {got = c.cells} else if c.cells != d.table_widths[c.c] {grew += 1}
 				}
 				chk(&bad, got == fixedw, fmt.tprintf("a user-set column keeps its exact width in a wide window (%d, want %d)", got, fixedw))
-				chk(&bad, others > 0, fmt.tprintf("...while the others still absorb the leftover (%d of them grew)", others))
+				chk(&bad, grew == 0, fmt.tprintf("...and so does every automatic one (%d of them changed)", grew))
 				return
 			}
 
@@ -11904,7 +11914,7 @@ when NEWTPAD_TESTS {
 				table_compute_widths(d, t)
 				d.table_cols = len(d.table_widths)
 				ROWS :: 5
-				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 				trows := table_visible_rows(d, H, px)
 				cw := plat.text_char_width(t, px, .Doc)
 				if trows != ROWS {
@@ -12095,7 +12105,7 @@ when NEWTPAD_TESTS {
 				table_compute_widths(d, t)
 				d.table_cols = len(d.table_widths)
 				ROWS :: 5
-				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 				trows := table_visible_rows(d, H, px)
 				cw := plat.text_char_width(t, px, .Doc)
 				if trows != ROWS {
@@ -12214,11 +12224,26 @@ when NEWTPAD_TESTS {
 						chk(&bad, absn[r] == want[r], fmt.tprintf("with the index finished, visible row %d numbers as data row %d (want %d)", r, absn[r], want[r]))
 					}
 				}
+				// The sort clause NAMES ITS OWN UNDO, in words. Wyatt rejected three
+				// affordances that added another unlabelled target -- "how will the
+				// person know what to click and where to reset" -- so the sentence
+				// itself is the answer, and it is asserted as a literal because the
+				// wording IS the feature.
 				s := table_summary_text(d)
-				chk(&bad, s == "5 rows  ·  2 columns  ·  sorted by v asc", fmt.tprintf("an active sort is in the summary: %q", s))
+				chk(&bad, s == "5 rows  ·  2 columns  ·  sorted by v asc  ·  click to clear", fmt.tprintf("an active sort is in the summary, with its undo in words: %q", s))
 				table_sort_click(d, 1)
 				s2 := table_summary_text(d)
-				chk(&bad, s2 == "5 rows  ·  2 columns  ·  sorted by v desc", fmt.tprintf("...and its direction: %q", s2))
+				chk(&bad, s2 == "5 rows  ·  2 columns  ·  sorted by v desc  ·  click to clear", fmt.tprintf("...and its direction: %q", s2))
+				// The clickable RUN, as a byte span, and the two properties that
+				// make it a control rather than a label: it starts on the first word
+				// that explains the action (not on the separator before it) and it
+				// reaches the end of the line.
+				{
+					full, cs, ce := table_summary_parts(d)
+					chk(&bad, cs > 0 && ce == len(full), fmt.tprintf("the clickable run reaches the end of the line ([%d,%d) of %d)", cs, ce, len(full)))
+					chk(&bad, full[cs:ce] == "sorted by v desc  ·  click to clear", fmt.tprintf("...and is exactly the sentence that offers the action: %q", full[cs:ce]))
+					chk(&bad, !strings.contains(full[:cs], "sorted"), fmt.tprintf("...with nothing of it left in the muted head: %q", full[:cs]))
+				}
 
 				// 5. The refusal, as TEXT. sort_ceiling proves a big file sets the flag;
 				//    this proves the flag is what the reader sees, which is the half
@@ -12484,7 +12509,233 @@ when NEWTPAD_TESTS {
 				return
 			}
 
+			// The four defects Wyatt reported from the first live pass on v0.34.0,
+			// as SEAM checks: what is drawn against what is clickable, at more than
+			// one DPI scale. Every one of them was a second producer -- two bands
+			// laid out from the same edge, a label truncated to a width the arrow
+			// had already claimed, an affordance with no rect at all -- so each
+			// assertion below compares two consumers of one geometry rather than a
+			// coordinate against a coordinate.
+			tg_live_pass :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (live pass): no fonts loaded")
+					return 1
+				}
+				// Wide enough that a 40-cell name could not be truncated by the
+				// window, and enough columns that the h-scrollbar has something to
+				// pan -- otherwise hscrollbar_geo returns shown = false and the
+				// overlap check below would pass against a bar that is not there.
+				//
+				// `dateiso` is exactly as wide as its own column (7 cells clamps up
+				// to TABLE_COL_MIN = 8, and the dates below are 10), so there is a
+				// header that FILLS its cell -- which is the only case where the
+				// arrow could be drawn through the label, and the case Wyatt
+				// screenshotted. `quantity_measured` is the same at the other end:
+				// long enough to be truncated whatever happens.
+				src := strings.join(
+					[]string {
+						"name,dateiso,quantity_measured,note",
+						"alpha,2026-01-14,10,first",
+						"bravo,2026-02-15,200,second",
+						"charlie,2026-03-16,30,third",
+						"delta,2026-04-17,4000,fourth",
+						"echo,2026-05-18,5,fifth",
+					},
+					"\n",
+					context.temp_allocator,
+				)
+				content := make([]u8, len(src) + 1)
+				copy(content, transmute([]u8)src)
+				content[len(src)] = '\n'
+				d := doc_from_content(content, "live.csv", .UTF8)
+				defer doc_close(&d)
+				d.table, d.table_delim = true, ','
+
+				// Three scales. The bottom band is the sum of a line-height metric
+				// and an sx()-rounded one, and the arrow's slot is a whole-pixel
+				// width divided by a fractional cell -- both round independently, so
+				// a reservation that is exactly right at 100% can be a pixel short at
+				// 125% and the overlap comes back one DPI at a time.
+				for sc in ([]f32{1.0, 1.25, 1.5}) {
+					UI_SCALE = sc
+					TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = sx(TEXT_MARGIN_Y_96), sx(TAB_STRIP_H_96), sx(MENU_BAR_H_96)
+					CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+					CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+					STATUS_BAR_H, SCROLLBAR_W = sx(STATUS_BAR_H_96), sx(SCROLLBAR_W_96)
+					TABLE_HEADER_H, TABLE_ROW_H = sx(TABLE_HEADER_H_96), sx(TABLE_ROW_H_96)
+					TABLE_CELL_PAD_X, TABLE_GUTTER_W = sx(TABLE_CELL_PAD_X_96), sx(TABLE_GUTTER_W_96)
+					TOP_INSET, FILTER_BANNER_H = 0, 0
+					BASE_PX = sx(BASE_PX_96)
+					px := BASE_PX
+					cw := plat.text_char_width(&t, px, .Doc)
+					W := f32(1400)
+					clear(&d.table_widths)
+					clear(&d.table_align)
+					table_compute_widths(&d, &t)
+					d.table_cols = len(d.table_widths)
+					ROWS :: 4
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
+					rows := table_visible_rows(&d, H, px)
+					cols := table_cols_layout(&d, cw, W, 0)
+					tag := fmt.tprintf("scale %.2f", sc)
+					if len(cols) != 4 || rows != ROWS {
+						chk(&bad, false, fmt.tprintf("%s: precondition -- 4 columns and %d rows (got %d, %d)", tag, ROWS, len(cols), rows))
+						continue
+					}
+
+					// --- 1. The summary row and the h-scrollbar do not overlap ---
+					//
+					// Both rects from their OWN producers, not from one restated
+					// here: hscrollbar_geo is what the drag hit-tests against and
+					// table_summary_y is what the summary is painted at, so this is
+					// exactly the pair that disagreed.
+					hm := hscroll_model(&d, &t, W, cw)
+					hb := hscrollbar_geo(&d, W, H, hm)
+					sy := table_summary_y(&d, H, px)
+					sh := table_summary_h(px)
+					chk(&bad, hb.shown && hm.kind == .Columns, fmt.tprintf("%s: precondition -- the h-scrollbar is really shown (%v, %v)", tag, hb.shown, hm.kind))
+					chk(&bad, sy + sh <= hb.y, fmt.tprintf("%s: the summary row ENDS above the h-scrollbar (%.1f vs %.1f)", tag, sy + sh, hb.y))
+					chk(&bad, hb.y + hb.h <= H - doc_bottom_bar_h(&d), fmt.tprintf("%s: ...and the bar still ends on the status bar (%.1f vs %.1f)", tag, hb.y + hb.h, H - doc_bottom_bar_h(&d)))
+					// The row budget reserves BOTH, so the last drawn row's bottom
+					// clears the summary. This is the half that makes the fix a
+					// layout change rather than a nudge: trim the band in the draw
+					// alone and a click on the summary resolves to a data row.
+					last := table_row_rect_y(px, rows - 1) + table_row_h(px)
+					chk(&bad, last <= sy, fmt.tprintf("%s: the last data row's bottom clears the summary band (%.1f vs %.1f)", tag, last, sy))
+					// ...and neither strip hit-tests as a cell. A press in either one
+					// must not start an edit on a row underneath it -- that is the
+					// data-loss shape, and the two strips are now adjacent.
+					okc, _, _, _, _, _ := table_cell_at(&d, table_cell_text_x(cols[0]), sy + sh * 0.5, px, cw, rows, W)
+					chk(&bad, !okc, fmt.tprintf("%s: a press on the summary band starts no cell edit", tag))
+					okb, _, _, _, _, _ := table_cell_at(&d, table_cell_text_x(cols[0]), hb.y + hb.h * 0.5, px, cw, rows, W)
+					chk(&bad, !okb, fmt.tprintf("%s: ...nor one on the h-scrollbar's strip", tag))
+
+					// --- 4. The arrow's slot is reserved BEFORE the label ---------
+					//
+					// The seam: the rectangle the arrow is drawn into against the
+					// right edge of the header text as the draw would truncate and
+					// nudge it. Checked on EVERY column and in BOTH alignments --
+					// `dateiso` is right-aligned (its column is dates) and fills its
+					// cell exactly, which is the case that smeared.
+					{
+						head := table_header_fields(&d)
+						overlaps, gaps_ok := 0, 0
+						for col in cols {
+							if col.c >= len(head) {continue}
+							a := table_sort_arrow_rect(col, px, table_right(W))
+							lab := table_header_label_col(col, cw, px)
+							hcells := plat.text_cells(&t, transmute([]u8)head[col.c], 0, .Doc)
+							if hcells > lab.cells {hcells = lab.cells}
+							hx := table_cell_text_x(lab) + table_cell_align_dx(lab, hcells, cw)
+							right_edge := hx + f32(hcells) * cw
+							if right_edge > a.x {overlaps += 1}
+							if a.x - right_edge >= table_arrow_gap() {gaps_ok += 1}
+						}
+						chk(&bad, overlaps == 0, fmt.tprintf("%s: no header label reaches into the arrow's slot (%d of %d did)", tag, overlaps, len(cols)))
+						chk(&bad, gaps_ok == len(cols), fmt.tprintf("%s: ...and every one keeps the gap beside it (%d of %d)", tag, gaps_ok, len(cols)))
+						// The slot is inside its own cell and on screen, so the
+						// arrow cannot be drawn over the neighbouring column.
+						strays := 0
+						for col in cols {
+							a := table_sort_arrow_rect(col, px, table_right(W))
+							if a.x < col.x || a.x + a.w > col.x + col.w || a.x + a.w > table_right(W) {strays += 1}
+						}
+						chk(&bad, strays == 0, fmt.tprintf("%s: every arrow slot stays inside its own column (%d strayed)", tag, strays))
+						// A column that FILLS its header is present, or the checks
+						// above are vacuous -- an all-short fixture satisfies them
+						// however the label is truncated.
+						filled := 0
+						for col in cols {
+							if col.c >= len(head) {continue}
+							if plat.text_cells(&t, transmute([]u8)head[col.c], 0, .Doc) >= col.cells {filled += 1}
+						}
+						chk(&bad, filled > 0, fmt.tprintf("%s: precondition -- at least one header fills its column (%d)", tag, filled))
+					}
+
+					// --- 3a. The header's hover state, and its precedence ---------
+					//
+					// The resize edge zone WINS: inside +/-4px of a boundary there is
+					// no hover affordance, because that is where the press does not
+					// sort either. Asserted as the exclusive-or over the whole header
+					// band rather than at three hand-picked x's, so a tolerance that
+					// changed on one side only cannot slip through.
+					{
+						hy := table_grid_top() + table_header_h(px) * 0.5
+						edge := cols[0].x + cols[0].w
+						tol := sx(TABLE_RESIZE_HIT_96)
+						_, hov_on_edge := table_header_hover_col(&d, cw, W, edge, hy, px)
+						_, cell_on_edge := table_header_col_at(&d, cw, W, edge, hy, px)
+						chk(&bad, cell_on_edge && !hov_on_edge, fmt.tprintf("%s: the resize zone wins -- the header cell is there (%v) but the sort hover is not (%v)", tag, cell_on_edge, hov_on_edge))
+						hc, hov_off := table_header_hover_col(&d, cw, W, edge - tol - 2, hy, px)
+						chk(&bad, hov_off && hc == 0, fmt.tprintf("%s: ...and %.0fpx further in it lights column 0 (%v, %d)", tag, tol + 2, hov_off, hc))
+						// Never both, anywhere along the band, and never a hover the
+						// press would not honour: main.odin tests the edge first and
+						// then this same producer, so hover == "a press here sorts".
+						both, mismatched := 0, 0
+						for x := table_gutter_w(); x < table_right(W); x += 3 {
+							_, on_edge := table_edge_at(&d, cw, W, x, hy, px)
+							hcol, on_hov := table_header_hover_col(&d, cw, W, x, hy, px)
+							ccol, on_cell := table_header_col_at(&d, cw, W, x, hy, px)
+							if on_edge && on_hov {both += 1}
+							// What the main loop's press does, re-derived: edge
+							// first, header second. It must agree with the hover.
+							press_sorts := !on_edge && on_cell
+							if press_sorts != on_hov || (on_hov && hcol != ccol) {mismatched += 1}
+						}
+						chk(&bad, both == 0, fmt.tprintf("%s: no pixel is both a resize edge and a sort hover (%d were)", tag, both))
+						chk(&bad, mismatched == 0, fmt.tprintf("%s: the hover lights exactly the pixels whose press sorts, and the same column (%d disagreed)", tag, mismatched))
+						// A DATA row is untouched by all of it -- the same x one row
+						// down still starts a cell edit.
+						_, hov_row := table_header_hover_col(&d, cw, W, cols[1].x + cols[1].w * 0.5, table_row_baseline_y(px, 0), px)
+						chk(&bad, !hov_row, fmt.tprintf("%s: a data row never hovers as a header", tag))
+					}
+
+					// --- 3b. The summary row's `click to clear` run ---------------
+					{
+						table_sort_clear(&d)
+						cold := table_summary_layout(&d, &t, H, px, cw)
+						chk(&bad, !cold.clearable, fmt.tprintf("%s: with no sort there is no clickable run at all", tag))
+						chk(&bad, !table_summary_clear_hit(cold, cold.x + 4, cold.y + cold.h * 0.5), fmt.tprintf("%s: ...so a press on the summary text does nothing", tag))
+
+						table_sort_click(&d, 1)
+						chk(&bad, table_sorted(&d), fmt.tprintf("%s: precondition -- sorted by column 1", tag))
+						sm := table_summary_layout(&d, &t, H, px, cw)
+						chk(&bad, sm.clearable, fmt.tprintf("%s: a live sort makes the run clickable", tag))
+						chk(&bad, strings.contains(sm.clear_text, "click to clear"), fmt.tprintf("%s: ...and it says so in words: %q", tag, sm.clear_text))
+						// The x is DERIVED INDEPENDENTLY here -- the head is ASCII
+						// plus middle dots, so its cell count is its rune count --
+						// rather than read back out of the same layout that produced
+						// it. A layout that measured the head with the wrong face
+						// would still be self-consistent and would still put the
+						// bright run somewhere the click is not.
+						want_x := TABLE_CELL_PAD_X + f32(utf8.rune_count(sm.head)) * cw
+						chk(&bad, abs(sm.clear_x - want_x) < 0.5, fmt.tprintf("%s: the run starts where the words start (%.1f, want %.1f)", tag, sm.clear_x, want_x))
+						want_w := f32(utf8.rune_count(sm.clear_text)) * cw
+						chk(&bad, abs(sm.clear_w - want_w) < 0.5, fmt.tprintf("%s: ...and is as wide as them (%.1f, want %.1f)", tag, sm.clear_w, want_w))
+						// The hit region: on the words yes, on `N rows` no, and
+						// outside the band in either direction no. The last two are
+						// the boundary this fix created -- a data row above it and
+						// the h-scrollbar's strip below it.
+						midy := sm.y + sm.h * 0.5
+						chk(&bad, table_summary_clear_hit(sm, sm.clear_x + sm.clear_w * 0.5, midy), fmt.tprintf("%s: a press on the words clears", tag))
+						chk(&bad, !table_summary_clear_hit(sm, sm.x + 2, midy), fmt.tprintf("%s: ...one on `N rows` does not", tag))
+						chk(&bad, !table_summary_clear_hit(sm, sm.clear_x + 2, sm.y - 1), fmt.tprintf("%s: ...nor one a pixel above the band", tag))
+						chk(&bad, !table_summary_clear_hit(sm, sm.clear_x + 2, sm.y + sm.h), fmt.tprintf("%s: ...nor one in the h-scrollbar's strip below it", tag))
+						chk(&bad, sm.y + sm.h <= hb.y, fmt.tprintf("%s: ...which is exactly where the bar begins (%.1f vs %.1f)", tag, sm.y + sm.h, hb.y))
+						table_sort_clear(&d)
+					}
+				}
+				UI_SCALE = 1
+				return
+			}
+
 			bad := tg_abs_cost()
+			bad += tg_live_pass()
 			bad += tg_abs_overcap()
 			bad += tg_sort_leaves()
 			bad += tg_gutter_pixels()
