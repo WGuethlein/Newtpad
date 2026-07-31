@@ -37,6 +37,13 @@ doc_view_apply :: proc(doc: ^Document, v: Doc_View) {
 	doc.wrap = v.wrap
 	doc.md_mode = .Off
 	doc.table = false
+	// The third place the grid is left, after leave_table_view and .Toggle_Table's
+	// off-branch, and it clears the sort for the same reason they do: the sort is a
+	// property of the view and nothing here restores one (Doc_View does not carry
+	// it). Cleared unconditionally rather than only when the grid stays off -- a
+	// view being applied means the view it describes, and this one describes no
+	// sort.
+	table_sort_clear(doc)
 
 	if doc.kind == .Text && v.md_mode != .Off && doc_can_markdown(doc) {
 		doc.md_mode = v.md_mode

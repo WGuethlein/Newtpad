@@ -690,8 +690,12 @@ Table_Sort :: struct {
 // `doc.table` is part of it deliberately. doc_scroll and doc_max_top ask this on
 // EVERY document, including ones that have never been a table, and a permutation
 // left behind by a view that has since been switched off must not steer the text
-// view's scroll. table_sort_clear is called when the view is left, so this is a
-// belt; it is the cheap kind.
+// view's scroll. It used to be called a belt on the grounds that table_sort_clear
+// runs whenever the view is left -- which was not true of .Toggle_Table's own
+// off-branch, the primary way to leave, so for a Ctrl+T'd document this term was
+// the only thing holding. All three leave paths clear now (leave_table_view,
+// .Toggle_Table, doc_view_apply) and it is a belt again, but it stays: the cost is
+// one field compare and what it guards is the text view's scroll model.
 table_sorted :: #force_inline proc(doc: ^Document) -> bool {
 	return doc != nil && doc.table && doc.table_sort.col != TABLE_SORT_NONE && len(doc.table_sort.perm) > 0
 }
@@ -1052,6 +1056,18 @@ sort_range_has_newline :: proc(doc: ^Document, at, n: int) -> bool {
 	return false
 }
 
+// NOT gated on doc.table, and that is a decision rather than an omission. The
+// whole-branch review found this pass running per keystroke in the plain text
+// editor for any document that had once been in the grid, and the tempting fix
+// was a `!doc.table` early return. It would be the wrong one: this procedure's
+// job is to keep `offs` describing the bytes it was built from, and skipping it
+// while the grid is off would leave a permutation that resolves visible rows to
+// lines that have moved -- and the next Ctrl+T would commit a cell edit onto one
+// of them. That is the data-loss failure this whole block exists to prevent,
+// traded for a saved pass. table_sorted gates the VIEW on doc.table; this gates
+// the DATA, and the data has to stay honest for exactly as long as it exists. The
+// real fix was to stop it existing: every leave path clears the sort now, so
+// there is nothing here to shift.
 table_sort_shift :: proc(doc: ^Document, at, n: int, text: []u8) {
 	s := &doc.table_sort
 	if s.col == TABLE_SORT_NONE || len(s.offs) == 0 {return}

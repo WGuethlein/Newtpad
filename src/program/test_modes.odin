@@ -12382,8 +12382,98 @@ when NEWTPAD_TESTS {
 				return
 			}
 
+			// F8: LEAVING the grid leaves the sort behind, through Ctrl+T itself.
+			//
+			// leave_table_view states the policy -- "the sort is a property of the
+			// VIEW, not of the document" -- and .Toggle_Table's own off-branch, the
+			// primary way to leave, did not follow it. Two consequences, and the
+			// second is the one that cost something: the sort silently reappeared on
+			// the next Ctrl+T with its accent arrow and summary text, and
+			// table_sort_shift kept running an O(rows) pass on every keystroke in the
+			// plain text editor for any document that had been in the grid once.
+			//
+			// Driven through command_dispatch rather than by calling the helper: the
+			// bug WAS that the command did something different from the helper, so a
+			// test that called leave_table_view could never have seen it.
+			tg_sort_leaves :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (sort leaves): no fonts loaded")
+					bad += 1
+					return
+				}
+				make_doc :: proc(name: string) -> ^Document {
+					src := "id,name\n1,delta\n2,alpha\n3,charlie\n"
+					content := make([]u8, len(src)) // app_destroy -> doc_close owns it
+					copy(content, transmute([]u8)src)
+					d := new(Document)
+					d^ = doc_from_content(content, name, .UTF8)
+					return d
+				}
+				a: App
+				a.settings = settings_default()
+				// OFF deliberately: .Toggle_Table's tail calls settings_save when it is
+				// on, and a test has no business writing the real settings store.
+				a.settings.remember_views = false
+				dummy: plat.Window
+				defer app_destroy(&a)
+				d := make_doc("leave.csv")
+				app_activate(&a, app_add(&a, d))
+
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
+				chk(&bad, d.table, "Ctrl+T opens the grid")
+				table_sort_click(d, 1)
+				chk(&bad, table_sorted(d) && len(d.table_sort.offs) == 3, fmt.tprintf("...a header click sorts its 3 data rows (sorted=%v, %d offsets)", table_sorted(d), len(d.table_sort.offs)))
+				// A refusal recorded on the way out has to go too, or the next grid
+				// session opens saying the file is too large to sort. Set by hand
+				// rather than by building a TABLE_SORT_MAX-row file for one field.
+				d.table_sort.refused = true
+
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
+				chk(&bad, !d.table, "Ctrl+T closes it again")
+				s := &d.table_sort
+				chk(&bad, s.col == TABLE_SORT_NONE, fmt.tprintf("...and the sort goes with the view (col %d, want %d)", s.col, TABLE_SORT_NONE))
+				chk(&bad, len(s.offs) == 0 && len(s.perm) == 0 && len(s.rank) == 0, fmt.tprintf("...arrays and all (%d offs, %d perm, %d rank)", len(s.offs), len(s.perm), len(s.rank)))
+				chk(&bad, !s.refused, "...and the refusal with them")
+
+				// A keystroke in the TEXT view. This is the expensive half: with a sort
+				// left behind, every edit ran the shift pass over up to TABLE_SORT_MAX
+				// offsets; with it cleared, table_sort_shift's first line returns.
+				// Asserted on that line's own condition rather than on a stopwatch.
+				doc_replace_range(d, 0, 0, transmute([]u8)string("Z"))
+				chk(&bad, len(d.table_sort.offs) == 0, fmt.tprintf("a text-view edit finds no sort to shift (%d offsets)", len(d.table_sort.offs)))
+
+				// ...and the same edit on a document whose grid IS open really does
+				// move the offsets, so the check above is observing something.
+				d2 := make_doc("control.csv")
+				app_activate(&a, app_add(&a, d2))
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
+				table_sort_click(d2, 1)
+				before := make([]int, len(d2.table_sort.offs), context.temp_allocator)
+				copy(before, d2.table_sort.offs[:])
+				doc_replace_range(d2, 0, 0, transmute([]u8)string("Z"))
+				moved := len(before) > 0 && len(d2.table_sort.offs) == len(before)
+				if moved {for o, i in d2.table_sort.offs {if o != before[i] + 1 {moved = false}}}
+				chk(&bad, moved, "control -- with the grid open the same edit shifts every offset by one")
+
+				// And the visible half: turning the grid back on opens on the file's
+				// own order, with nothing in the summary claiming otherwise.
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10) // d2 off
+				app_activate(&a, 0)
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10) // d back on
+				chk(&bad, d.table && !table_sorted(d), fmt.tprintf("the next Ctrl+T opens unsorted (table=%v, sorted=%v)", d.table, table_sorted(d)))
+				sum := table_summary_text(d)
+				chk(&bad, !strings.contains(sum, "sorted by"), fmt.tprintf("...and the summary does not claim a sort: %q", sum))
+				return
+			}
+
 			bad := tg_abs_cost()
 			bad += tg_abs_overcap()
+			bad += tg_sort_leaves()
 			bad += tg_gutter_pixels()
 			bad += tg_align()
 			bad += tg_resize()

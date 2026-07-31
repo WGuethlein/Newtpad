@@ -1537,6 +1537,15 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				// longer: the next open re-samples, and the column at index 3
 				// after an edit may not be the column the user narrowed.
 				table_user_widths_clear(doc)
+				// ...and so does the sort, by leave_table_view's written policy: it
+				// is a property of the VIEW, so leaving the grid leaves the file's
+				// own order. This is the PRIMARY way to leave and it was the one
+				// path that did not clear -- so the sort silently came back on the
+				// next Ctrl+T, accent arrow and summary text and all, with nothing
+				// having said it survived. It also left table_sort_shift running an
+				// O(rows) pass per keystroke in the plain text editor for any
+				// document that had been in the grid once.
+				table_sort_clear(doc)
 			}
 			// Learn the family default so the next tabular file opens the same way.
 			// Gated on remember_views: with it off the Settings value is a pin, not a
