@@ -11,21 +11,62 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
-## Only the first 32 open files get external-change detection
+## Four table-view defects from the first live pass on v0.34.0
 
-**Found 2026-07-30** while compiling `features.md`. `MAX_TABS :: 32` (`app.odin:122`) is **not** a tab
-limit — its own comment says it is the watcher's budget, *"independent of the session's tab limit
-(MAX_SESSION_TABS, currently 64)"* — and `app_add` caps nothing. So the real behaviour is:
+**Reported 2026-07-31 by Wyatt**, with screenshots, within an hour of v0.34.0 installing. All four are
+in the batch that just shipped.
 
-- tabs are **unlimited**,
-- a session restores at most **64**,
-- and **only the first 32 watched files are polled for external changes.** The rest are silently
-  unwatched.
+### 1. The summary row is underneath the horizontal scrollbar
 
-A file edited by another program in tab 33 will not show the disk-changed indicator and will not offer
-to reload. Given "never lock the user's file" is a hard rule and timestamp polling is the whole
-mechanism that makes it safe, a silent cap on which files are covered is worth a decision rather than a
-constant. Either raise it, make it dynamic, or surface which tabs are unwatched.
+`30 rows · 3 columns · sorted by Date desc` is drawn in the same band as the h-scrollbar and the two
+overlap. A straight layout collision — the summary row was given its own band without reserving it
+against the scrollbar's. **Neither is optional, so one has to move**; the summary row is the newer
+arrival and should yield.
+
+### 2. Widening the window stretches the columns instead of leaving them alone
+
+**This is §10's own rule producing a bad result, not a coding error.** `table_leftover_cells`
+implements *"distribute leftover width proportionally"* exactly as §10 specifies: when every column
+already fits, the spare window width is handed out to them. On a wide window that makes a
+10-character date column ~400px.
+
+**Wyatt's decision: default each column to its CONTENT width, and keep manual resizing.** The leftover
+is not distributed at all — a column grows only to what its widest sampled cell needs, and the spare
+width is left empty on the right. Drag-to-resize and double-click-to-fit (both shipped in v0.34.0)
+stay as the way to override it.
+
+**This is a deliberate deviation from §10 and must be recorded as one.** CLAUDE.md says the spec wins
+about what *should* exist, and this overrules it on the product owner's live evidence. §10's rule
+reads perfectly sensibly and only looks wrong once three narrow columns are on a wide display.
+
+### 3. There is no discoverable way to reset the sort
+
+**The mechanism exists; the affordance does not.** `table_sort_click` already cycles ascending →
+descending → the file's own order, so a third click clears it. Nothing anywhere says so.
+
+Wyatt, rejecting three proposed fixes (clickable summary text, a palette command, an × on the header):
+*"my issue with these, how will the person know what to click and where to reset."* He is right, and
+the principle generalises: **a bare 3-click cycle cannot be made discoverable, only labelled.** Either
+the interface says the words or the user must already know. The two questions a first-time user has
+are separate and need separate answers:
+
+- **"Can I click this?"** → a **hover state on the header**: background lift, plus the sort arrow
+  appearing dimmed in the slot it would occupy. The universal grid signal, and the hit rect already
+  exists for drag-resize.
+- **"How do I undo it?"** → **the summary row says it in words** — `sorted by Date desc · click to
+  clear`. Not an icon, not a hidden target.
+
+**The real answer is the per-column dropdown** in `requested-features.md` (Excel/PowerBI-style), where
+Sort ascending / Sort descending / Clear sort / Filter are all named and visible. The two fixes above
+are worth doing now and are not wasted work: the hover state is needed regardless, and the summary
+row's wording is one string.
+
+### 4. The sort arrow is drawn underneath the header text
+
+It should sit beside the label with a gap, not under it — visible in the screenshot as a smear below
+`Date`. Fold this into whatever positions the arrow for item 3's hover state: **one producer for the
+arrow's rect**, consumed by both the hover draw and the sorted draw, rather than two that will
+diverge.
 
 ## "The preview does not always respect spaces" — one defect fixed, needs Wyatt's confirmation
 

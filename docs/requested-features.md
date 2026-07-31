@@ -44,6 +44,44 @@ Decisions that change the build:
 highlighting. A formatter over its token stream inherits the bounding and cannot disagree with the
 highlighter about what a token is. **Do not write a second JSON parser.**
 
+### Multi-column sort, and Excel-style column filtering
+
+**Requested 2026-07-31 by Wyatt**, alongside the four table bugs: *"multiple sort of columns, first
+column selected to sort takes precedence. would also be nice to filter columns, and have a dropdown
+list of all items in the column to filter like powerbi/excel has."* He raised the scope question
+himself: *"maybe this is a csv/xslx expansion since it doesn't really match the stated goals so far."*
+
+**That instinct deserves a real answer rather than a reflex, because the mermaid decision just showed
+how easy it is to reach for the wrong test.** The question is not "is this spreadsheet-like" — it is
+*whether a CSV viewer that cannot answer "which rows say ACTIVE" is finished*. Newtpad already has a
+table view with a sort, and §10 committed to it. Filtering is the second question anyone has of a CSV,
+and the app already has a **filter-as-you-type over lines** (`Ctrl+L`) — so the capability exists, just
+not per-column. That makes this much closer to "finish the table view" than to "become Excel".
+
+Where the caution IS warranted: **a per-column dropdown with a distinct-value list is the first UI in
+Newtpad that cannot be viewport-bounded.** Listing every distinct value in a column requires reading
+every row — the same wall the sort hit, and the sort's answer (refuse past `TABLE_SORT_MAX`, say so)
+is available here too. Decide that before building, not after.
+
+**It also subsumes a shipped defect.** `reported-bugs.md` item 3 is that there is no discoverable way
+to reset the sort, and a labelled dropdown — Sort ascending / Sort descending / Clear sort / Filter —
+is the answer to it rather than a patch over it. If this gets built, the interim hover-state and
+summary-row wording become redundant; if it does not, they stand on their own.
+
+Design decisions that would change the build:
+
+- **Multi-sort precedence is stated as first-selected-wins**, which is the opposite of Excel (last
+  applied becomes primary) and matches PowerBI/Windows Explorer. Worth confirming, because it is the
+  one place users' muscle memory disagrees.
+- **The sort must stay view-only** — the same permutation model, extended to a key vector. It must not
+  become a reason to rewrite the file.
+- **Filter versus the existing line filter.** `Ctrl+L` filters lines document-wide; a column filter is
+  a different predicate over the same rows. Two filter mechanisms that do not compose is the kind of
+  option-leakage principle 3 warns about — decide whether they stack or are exclusive.
+- **`.xlsx` is a separate product decision and is NOT implied by any of this.** It is a ZIP of XML with
+  a shared string table, not a text format, and CLAUDE.md scopes Newtpad to text-ish files. If it is
+  ever wanted it is its own entry, and reading it does not follow from having a good CSV grid.
+
 ### Mermaid diagrams in the markdown preview
 
 **Requested 2026-07-31 by Wyatt**, with the reason attached: *"I will be using spec driven design
@@ -54,17 +92,28 @@ question himself — built-in, or a V2 plugin?
 that's why i mentioned v2 plugin/'dlc'."* So the plugin framing was not "defer this" — it was a
 **packaging** proposal: mermaid as a separately-shipped add-on rather than core Newtpad.
 
-**DECIDED, same day, by Wyatt: this is not core Newtpad.** His words: *"it also is more of an ide
-feature rather than notepad."* That is the scope row's own test — CLAUDE.md rules out LSP, project
-trees and terminals on the grounds that Newtpad is a notepad and not an IDE, and **a graph layout
-engine is the same category of thing.** It is also the largest feature ever proposed here: more code
-than the product currently is. So it ships as an add-on or it does not ship, and principle 5 (*"small
-standalone exe — size reflects absence of complexity"*) is protected structurally rather than by
-willpower.
+**DECIDED 2026-07-31: not in the core exe — deferred on COST, not on scope.** The distinction is the
+whole point of this paragraph, so it is written out.
 
-**Do not re-propose this as a core feature.** If a later audit finds mermaid in this file and reads it
-as unscheduled work, the answer is that it was ruled out of core on 2026-07-31 and the reason has not
-changed.
+Wyatt's first framing was *"it also is more of an ide feature rather than notepad"*, and that was
+initially agreed to. **On review that test does not hold, and recording it would have been worse than
+recording nothing.** Newtpad already renders markdown — headings, tables, links, proportional text, a
+real shaper — and `docs/ui-spec` §9 is titled *"Markdown — the priority"*. Rendering a fenced block the
+way every other markdown renderer does is the same category of work as rendering a table, which is
+built. LSP and code folding are IDE features because they are about **authoring code**; mermaid in a
+preview is about **reading a document correctly**. The "IDE feature" test, applied consistently, would
+also have cut the markdown preview, the syntax highlighting and the table view — so it is the wrong
+test, and leaving it in the log would have aimed it at the wrong things a year from now.
+
+**The reason that does survive is cost.** A Sugiyama-style layered layout is 1,500–2,500 lines before
+any parsing, in a product that is ~11k lines and a 1.24 MB exe. That is a real argument for an add-on,
+and it is a *price* argument, which means it can be revisited on price: if the add-on proves the engine
+and it lands nearer 800 lines than 2,500, reopening this is a cost conversation and not a
+re-litigation of what Newtpad is.
+
+**The consequence, accepted knowingly:** the markdown preview shows raw mermaid source indefinitely.
+Given §9 is the stated priority and spec-driven work is the use case, that is a visible hole in the
+product's own priority — small, but present every time.
 
 **What remains open is only WHEN and against what boundary.** The two words in the original request
 are separate decisions with different deadlines:
@@ -370,8 +419,9 @@ Recorded so an audit does not raise them again. From HANDOFF §6aa unless noted.
 - **Arenas on VirtualAlloc with grouped lifetimes** — the CLAUDE.md row was amended twice; build an arena
   only when a measurement asks, and amend the row again when you do.
 - **Beta expiry / DRM / online checks** — honour-system, per research.
-- **Mermaid diagrams in core Newtpad** — ruled out of the core product 2026-07-31 by Wyatt (*"it also
-  is more of an ide feature rather than notepad"*), on the same test CLAUDE.md's scope row applies to
-  LSP, project trees and terminals. **Not ruled out as an add-on** — it is the plugin system's best
-  motivating example. The full entry, including the subset worth building and the source-offset
-  decision that must be made on day one, is in §1 above.
+- **Mermaid in the core exe** — **deferred on cost, and deliberately NOT filed as ruled out.** The
+  first framing was "it is an IDE feature"; that test was withdrawn on review because it would equally
+  have cut the markdown preview and the table view (see §1). What stands is the price: a layout engine
+  is 1,500–2,500 lines in an 11k-line product. It is listed here only so an audit does not read it as
+  unscheduled core work — **it is live as an add-on**, and it is the plugin system's best motivating
+  example.
