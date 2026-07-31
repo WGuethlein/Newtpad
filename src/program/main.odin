@@ -666,7 +666,7 @@ main :: proc() {
 						table_col_fit(doc, c) // double-click: back to the measured width
 					} else {
 						table_resize_col = c
-						for k in table_cols_layout(doc, char_w, f32(window.width), table_start_col(doc)) {
+						for k in table_cols_layout(doc, char_w, f32(window.width)) {
 							if k.c == c {table_resize_grab = f32(window.mouse_x) - (k.x + k.w);break}
 						}
 					}
@@ -1028,8 +1028,16 @@ main :: proc() {
 				}
 			} else if doc.table {
 				if doc.table_editing {table_edit_commit(doc)} // rows shift underfoot
-				if plat.key_shift_down() { // Shift+wheel pans table columns
-					doc.table_col = clamp(doc.table_col + window.scroll_delta, 0, table_max_col(doc))
+				if plat.key_shift_down() { // Shift+wheel pans the grid horizontally
+					// FOUR CELLS a notch, in pixels, which is the same distance the
+					// text view's Shift+wheel moves (`* 4` on doc.h_scroll, which is
+					// measured in cells). It used to be ONE COLUMN a notch, and with
+					// columns laid out at their content width that was a jump of
+					// wildly varying size -- 8 cells here, 40 there -- which is half
+					// of what Wyatt reported as the scroll "snapping" (v0.34.1). A
+					// notch is now the same distance wherever it is taken.
+					step := int(char_w * 4 + 0.5)
+					doc.table_hscroll_px = clamp(doc.table_hscroll_px + window.scroll_delta * step, 0, table_max_scroll_x(doc, char_w, f32(window.width)))
 				} else {
 					// Normalised through table_data_start on BOTH sides of the
 					// scroll, because the header is sticky and therefore owns line
@@ -1269,23 +1277,39 @@ Hbar :: struct {
 	track_x, track_w, y, h, thumb_x, thumb_w: f32,
 }
 
-// What the horizontal scrollbar actually pans. There is more than one answer,
-// which is the whole bug this type exists to close: the text view scrolls by
-// CELLS (doc.h_scroll), while the grid scrolls by COLUMNS (doc.table_col) and
-// has done since before the bar existed -- Shift+wheel drives it. The bar used
-// to compute its range from doc_max_hscroll unconditionally, i.e. from the
-// widest source-text line, and to write doc.h_scroll on drag. In the grid that
-// meant a bar that appeared (source lines are long), dragged, and moved
-// nothing, because table_draw never reads H_SCROLL. Markdown Preview was the
-// same, with no pan axis at all.
+// Which FIELD the horizontal scrollbar pans. There is more than one answer,
+// which is the whole bug this type exists to close: the text view scrolls
+// doc.h_scroll, the grid scrolls doc.table_hscroll_px, and Preview has no
+// horizontal axis at all. The bar used to compute its range from
+// doc_max_hscroll unconditionally, i.e. from the widest source-text line, and
+// to write doc.h_scroll on drag. In the grid that meant a bar that appeared
+// (source lines are long), dragged, and moved nothing, because table_draw never
+// reads H_SCROLL. Markdown Preview was the same, with no pan axis at all.
 //
 // Resolving it here once, and having the geometry, the drag and the draw all
 // ask, is CLAUDE.md's "one layout per widget" applied to the question "which
 // number am I scrolling?".
+//
+// THE TWO KINDS NO LONGER DISAGREE ABOUT UNITS, and that distinction is the
+// v0.34.1 fix. `.Columns` used to mean the grid panned by column INDEX while its
+// thumb was sized by a column COUNT, and the two only agree when every column is
+// the same width -- so the thumb changed size as it moved and a notch jumped a
+// whole column. The grid pans in pixels now, like every other view, and what is
+// left in this enum is purely the destination field. Deleting the kind outright
+// was considered and rejected: `.Cells` writes doc.h_scroll, which the grid must
+// NOT touch (doc.odin zeroes h_scroll for read-only views precisely so a
+// document panned in text view does not arrive in the grid pre-scrolled), so a
+// shared kind would need a shared field. The unit disagreement is gone; the
+// field difference is real.
+//
+// Nothing in Hscroll, hscrollbar_geo or hscrollbar_pos_at knows which unit it
+// holds -- pos/max/span are a linear offset, a bound and a visible span, and the
+// thumb is a ratio of them. That is why the grid's switch to pixels needed no
+// change below this line.
 Hscroll_Kind :: enum u8 {
 	None, // wrapped, filtered, or a view that lays out to fit (Preview, Split)
-	Cells, // plain text view: doc.h_scroll
-	Columns, // grid view: doc.table_col
+	Cells, // plain text view: doc.h_scroll, in cells
+	Grid_Px, // grid view: doc.table_hscroll_px, in pixels
 }
 
 Hscroll :: struct {
@@ -1295,11 +1319,11 @@ Hscroll :: struct {
 }
 
 // L8 (2026-07-29 review): `rows` was in this signature for symmetry with the
-// vertical model, but neither branch below reads it -- the .Columns branch
-// sizes its span from the pixel width (table_cols_fitting), and the .Cells
-// branch reads doc_max_hscroll, which doc_update_max_hscroll (the caller's
-// job, once per frame) already measured against the actual row count. Removed
-// rather than documented, since there was nothing to document.
+// vertical model, but neither branch below reads it -- the grid branch sizes
+// its span from the pixel width, and the .Cells branch reads doc_max_hscroll,
+// which doc_update_max_hscroll (the caller's job, once per frame) already
+// measured against the actual row count. Removed rather than documented, since
+// there was nothing to document.
 hscroll_model :: proc(doc: ^Document, t: ^plat.Text, winw, char_w: f32) -> (m: Hscroll) {
 	if doc == nil || doc.filter {return}
 	// The grid replaces the text pass entirely, so its axis is columns and the
@@ -1307,11 +1331,16 @@ hscroll_model :: proc(doc: ^Document, t: ^plat.Text, winw, char_w: f32) -> (m: H
 	if doc.table && doc.kind == .Text {
 		if len(doc.table_widths) == 0 {table_compute_widths(doc, t)} // idempotent; one-time sample
 		if doc.table_cols == 0 {doc.table_cols = len(doc.table_widths)} // table_draw sets this, but not before frame 1
-		m.max = table_max_col(doc)
+		m.max = table_max_scroll_x(doc, char_w, winw)
 		if m.max <= 0 {return}
-		m.pos = clamp(doc.table_col, 0, m.max)
-		m.span = table_cols_fitting(doc, char_w, winw, m.pos)
-		m.kind = .Columns
+		m.pos = clamp(doc.table_hscroll_px, 0, m.max)
+		// The pannable width, in the SAME unit as pos and max. That is the whole
+		// of the second half of Wyatt's v0.34.1 report: this used to be
+		// table_cols_fitting, a column COUNT, paired with a pos that was a column
+		// INDEX, so hscrollbar_geo's `max + span` total was two units added
+		// together and the thumb resized as it moved.
+		m.span = max(1, int(table_view_w(winw)))
+		m.kind = .Grid_Px
 		return
 	}
 	// Preview lays markdown out to the pane width, so there is nothing to pan
@@ -1335,8 +1364,8 @@ hscroll_set :: proc(doc: ^Document, m: Hscroll, pos: int) {
 	switch m.kind {
 	case .Cells:
 		doc.h_scroll = p
-	case .Columns:
-		doc.table_col = p
+	case .Grid_Px:
+		doc.table_hscroll_px = p
 	case .None: // nothing to write; the bar is not shown
 	}
 }

@@ -59,7 +59,12 @@ doc_view_apply :: proc(doc: ^Document, v: Doc_View) {
 		// draw one enormous column. Re-choosing costs one bounded line read and
 		// is why the delimiter is not persisted in session.txt.
 		doc.table_delim = v.table_delim if v.table_delim != 0 else table_choose_delim(doc)
-		doc.table_col = 0
+		// The grid's horizontal scroll is NOT persisted (session.odin writes
+		// doc.top and the caret, not this), so a restored grid always opens at the
+		// left edge. That is also the answer to the 2026-07-31 unit change: there
+		// is no stored column index anywhere on disk that could be read back as a
+		// pixel offset, because the field was never written to disk in either unit.
+		doc.table_hscroll_px = 0
 		// Left empty on purpose: table_draw recomputes when the widths are empty
 		// (table.odin:183), so this needs no ^plat.Text and can run from
 		// session_restore and doc_reload, neither of which has one.
