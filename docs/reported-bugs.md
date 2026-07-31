@@ -11,23 +11,6 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
-## Two palette rows do nothing when run from the palette
-
-**Found 2026-07-30** while compiling `features.md`. `Extend Column Selection Left` and
-`Extend Column Selection Right` appear in the command palette — `command_in_palette` does not exclude
-them — but their dispatch arms in `commands.odin` are gated on `ev.shift`, and `palette_execute`
-(`palette.odin:443`) calls `command_dispatch(cmd, {}, ...)` with a **zero `Key_Event`**. So shift is
-false and running either from the palette silently does nothing.
-
-Their `Up`/`Down` siblings act unconditionally and do work, which is what makes this look like an
-oversight rather than a decision. The comment at the `Left` arm explains the shift gate for the
-*keyboard* path (a bare `Alt+Left` must keep doing nothing) — that reasoning is sound and should stay;
-it just does not transfer to a palette invocation, where the user named the command explicitly.
-
-**Two candidate fixes:** exclude both from the palette (matching the other plumbing commands the palette
-hides), or have `palette_execute` synthesise the modifier the command needs. The second is the better
-answer if any other command has the same shape — worth checking before choosing.
-
 ## Only the first 32 open files get external-change detection
 
 **Found 2026-07-30** while compiling `features.md`. `MAX_TABS :: 32` (`app.odin:122`) is **not** a tab
