@@ -17213,6 +17213,13 @@ when NEWTPAD_TESTS {
 
 		// `newtpad palettetest` exercises the command palette's fuzzy match + modes.
 		if os.args[1] == "palettetest" {
+			// One counter for the WHOLE mode, and a non-zero exit off it. This mode
+			// printed FAIL from four places and exited 0 from all of them, which is
+			// the keytest hole (development-loop.md 6aw) one mode over: a summary a
+			// sweep has to remember to grep is a summary that eventually is not
+			// grepped. The pseudo-tab block keeps its own local count and folds into
+			// this one, so its line still reads as its own section.
+			bad := 0
 			a: App
 			mk :: proc(a: ^App, name: string) {
 				c := make([]u8, 4);copy(c, transmute([]u8)string("data"))
@@ -17253,6 +17260,7 @@ when NEWTPAD_TESTS {
 			rr := palette_row_at(&a, l.x0 + l.w + sx(20), rowtop + l.rowh * 0.5, W, H) // right
 			rb := palette_row_at(&a, inx, rowtop + l.rowh * f32(l.nres + 3), W, H) // below
 			ok := r0 == 0 && rq == -1 && rl == -1 && rr == -1 && rb == -1
+			if !ok {bad += 1}
 			fmt.printfln("palette rows: first=%d query=%d L=%d R=%d below=%d  %s", r0, rq, rl, rr, rb, "OK" if ok else "FAIL")
 
 			// Clicking away closes; clicking a row selects without closing.
@@ -17265,6 +17273,7 @@ when NEWTPAD_TESTS {
 			rowtop = l.y0 + l.qh
 			chose, c2 := palette_click(&a, l.x0 + l.w * 0.5, rowtop + l.rowh * 0.5, W, H)
 			row_ok := chose && c2
+			if !(away_ok && row_ok) {bad += 1}
 			fmt.printfln("click away closes=%v, click row chooses=%v  %s", away_ok, row_ok, "OK" if away_ok && row_ok else "FAIL")
 			a.palette.active = false
 			app_destroy(&a)
@@ -17392,7 +17401,100 @@ when NEWTPAD_TESTS {
 				}
 
 				fmt.printfln("palette pseudo-tab gate: %d failures", pbad)
+				bad += pbad
 			}
+
+			// Extend Column Selection Left/Right, run the way the PALETTE runs them.
+			// Both arms are gated on ev.shift so that a bare Alt+Left keeps doing
+			// nothing (commands.odin), and palette_execute dispatches a ZERO
+			// Key_Event -- so on the shift test alone these two were palette rows
+			// that matched, highlighted, ran, and left the document exactly as it
+			// was, while their Up/Down siblings worked. command_named is what lets a
+			// named invocation past the gate, and this is the only check in the tree
+			// that can see it: keytest exercises the CHORDS, and blocktest calls
+			// command_dispatch with a synthesised Alt+Shift event, so neither one
+			// goes through palette_execute.
+			//
+			// Asserts on the RECTANGLE, not on a return value -- palette_execute
+			// returns nothing, and "did anything happen" is a fact about
+			// doc.block_cursor_cell. Its own proc holding one App, per
+			// development-loop.md 6 (test_mode_dispatch's frame has overflowed twice).
+			palette_block_case :: proc(cmd: Command_Id, want_cell: int) -> (bad: int) {
+				a: App
+				wv: plat.Window
+				bt: plat.Text
+				// Real faces. block_extend only measures when it has to SEED a
+				// rectangle (caret_line_start_cell -> line_cell_col ->
+				// plat.text_cells), which the seeded fixture below avoids -- but that
+				// is a property of today's control flow, not a contract, and a zero
+				// Text would turn a future change into a null deref inside a test
+				// rather than a red line.
+				if !plat.text_load_faces(&bt) {
+					fmt.println("  FAIL   no fonts loaded, so the column-extend cases prove nothing")
+					return 1
+				}
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				d := app_active(&a)
+				doc_close(d)
+				d^ = doc_from_content(transmute([]u8)strings.clone("alpha beta\nsecond line\nthird line\n"), "", .UTF8)
+				d.wrap = false // block_extend refuses outright under wrap
+				// A live one-cell rectangle at column 2 of row 0, caret to match.
+				// SEEDED rather than started from nothing on purpose: with no
+				// rectangle block_extend seeds one as well as stepping it, so a bare
+				// block_active(d) afterwards would go green on the seeding alone and
+				// could not tell a step from a start. Here the anchor corner is
+				// pinned at cell 2 and only the cursor corner may move, so what the
+				// assertion below observes is this dispatch and nothing else.
+				d.cursor, d.anchor = 2, 2
+				d.block = true
+				d.block_anchor_line_start, d.block_anchor_cell = 0, 2
+				d.block_cursor_line_start, d.block_cursor_cell = 0, 2
+
+				palette_open(&a)
+				palette_input_rune(&a, '>')
+				for r in command_table[cmd].title {palette_input_rune(&a, r)}
+				// Find the row rather than trusting the ranking, and count a missing
+				// row as a failure -- same reason as palette_pseudo_case above. A
+				// command that quietly left the palette would otherwise take this
+				// case green with it while testing nothing at all.
+				row := -1
+				for res, i in a.palette.results {
+					if res.cmd == cmd {row = i}
+				}
+				if row < 0 {
+					fmt.printfln("  FAIL   %v is not in the palette at all, so this case proves nothing", cmd)
+					return 1
+				}
+				a.palette.selected = row
+				palette_execute(&a, &wv, &bt, 10)
+				ok :=
+					block_active(d) &&
+					d.block_cursor_cell == want_cell &&
+					d.block_anchor_cell == 2 &&
+					d.block_anchor_line_start == 0 &&
+					d.block_cursor_line_start == 0
+				fmt.printfln(
+					"  %-6s palette %-19v steps the rectangle: cursor_cell=%d (want %d) anchor_cell=%d (want 2) active=%v",
+					"ok" if ok else "FAIL",
+					cmd,
+					d.block_cursor_cell,
+					want_cell,
+					d.block_anchor_cell,
+					block_active(d),
+				)
+				if !ok {bad += 1}
+				return
+			}
+			fmt.println("-- column-extend rows run from the palette --")
+			bad += palette_block_case(.Block_Extend_Right, 3)
+			bad += palette_block_case(.Block_Extend_Left, 1)
+
+			fmt.printfln("palettetest: %d failures", bad)
+			// Non-zero exit, for the reason keytest grew one: a mode that only ever
+			// prints its verdict is a mode whose verdict a sweep can miss.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
