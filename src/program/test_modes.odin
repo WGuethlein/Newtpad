@@ -11892,6 +11892,37 @@ when NEWTPAD_TESTS {
 					chk(&bad, pok && p == noff[want[r] + 1], fmt.tprintf("after the edit, visible row %d is still line %d: got %d, want %d", r, want[r] + 1, p, noff[want[r] + 1]))
 				}
 
+				// --- KEYSTROKES ARE NOT DROPPED WHEN THE USER REORDERS. HANDOFF §6aw
+				//     left "keystrokes are dropped on a reorder" as an inherited
+				//     constraint nothing enforced; the decision taken here is that the
+				//     click COMMITS the open edit first, while the anchor is still
+				//     intact, so the value lands on the row it was typed into.
+				//     table_edit_commit's discard survives only as the fail-closed
+				//     guard for a reorder this code did not initiate.
+				{
+					eok, r, c, fs, fe, val := table_cell_at_index(d, 0, 1, trows)
+					chk(&bad, eok && val == "alpha", fmt.tprintf("an edit is open on %q...", val))
+					table_edit_start(d, r, c, fs, fe, val)
+					table_edit_rune(d, '!')
+					pre := doc_debug_string(d)
+					defer delete(pre)
+					table_sort_click(d, 0) // reorder, with the edit still open
+					post := doc_debug_string(d)
+					defer delete(post)
+					chk(&bad, !d.table_editing, "...clicking a header closes it")
+					chk(&bad, strings.contains(post, "alpha!") && !strings.contains(pre, "alpha!"), "...by COMMITTING it, not by throwing the keystrokes away")
+					chk(&bad, strings.count(post, "alpha!,200") == 1, fmt.tprintf("...onto its own field and nowhere else (%q)", post))
+					// Undo the typed character so the qty expectations below still
+					// describe the file. Through the same cell editor, not doc_undo,
+					// which the read-only view refuses.
+					uok, ur, uc, ufs, ufe, _ := table_cell_at_index(d, 0, 1, trows)
+					if uok && sort_read_span(d, ufs, ufe) == "alpha!" {
+						table_edit_start(d, ur, uc, ufs, ufe, "alpha")
+						table_edit_commit(d)
+					}
+					chk(&bad, strings.count(doc_debug_string(d), "alpha,200") == 1, "...and the fixture is back to what the checks below describe")
+				}
+
 				// --- by QTY: numeric, so 4 < 10 < 30 < 200 rather than "10" < "200" <
 				//     "30" < "4", and the row with no qty at all goes last in BOTH
 				//     directions. A byte sort passes none of this.
