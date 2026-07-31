@@ -1751,6 +1751,39 @@ when NEWTPAD_TESTS {
 		// six: doc_selection_rects skips the empty row past the final newline,
 		// which is the drawing the bug report was actually looking at.
 		li_chk(bad, whole == 5, fmt.tprintf("...%d of them (want 5; the row past the final newline is never painted)", whole))
+		sa_scroll_after(bad, &h)
+	}
+
+	// The post-Ctrl+A scroll, the last consumer on the list. main.odin runs
+	// doc_ensure_cursor_visible on any frame where the cursor moved, and Ctrl+A
+	// moves it -- so the trim also decides where the view lands. It must land on
+	// the last CONTENT row rather than at the bottom of the blank tail, which is
+	// the visible half of the complaint: the file scrolled somewhere with nothing
+	// on it.
+	//
+	// Its own proc so this and sa_part_rects never hold two Documents at once.
+	@(private = "file")
+	sa_scroll_after :: proc(bad: ^int, h: ^Headless_Gpu) {
+		b := make([dynamic]u8)
+		defer delete(b)
+		for i in 0 ..< 40 {
+			s := fmt.tprintf("row%02d\n", i) // 6 bytes each, so row i starts at 6*i
+			append(&b, ..transmute([]u8)s)
+		}
+		for _ in 0 ..< 10 {append(&b, '\n')}
+		d := sa_doc(string(b[:]))
+		defer doc_close(&d)
+		d.view_cols = 80
+		ROWS :: 10
+		doc_select_all(&d)
+		doc_ensure_cursor_visible(&d, &h.text, ROWS, ROWS)
+		top_trim := d.top
+		doc_select_all(&d) // the extend
+		doc_ensure_cursor_visible(&d, &h.text, ROWS, ROWS)
+		top_whole := d.top
+		li_chk(bad, top_trim == 186, fmt.tprintf("the trimming press scrolls to top=%d, the last content row's screen (want 186 = row 31)", top_trim))
+		li_chk(bad, top_whole == 241, fmt.tprintf("the extending press scrolls a further ten rows into the blank tail, top=%d (want 241)", top_whole))
+		li_chk(bad, top_trim < top_whole, fmt.tprintf("...so the trim really does stop the view short of the tail (%d < %d)", top_trim, top_whole))
 	}
 
 	// The two read-only views. Ctrl+A is not a mutating command, so it runs there
