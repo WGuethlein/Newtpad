@@ -190,6 +190,110 @@ when NEWTPAD_TESTS {
 		if bad > 0 {os.exit(1)}
 	}
 
+	// `newtpad resavetest [file]` -- a save must REPLACE the file's contents, not
+	// substitute a fresh file in its place.
+	//
+	// The atomic write used to rename a brand-new temp file over the target, which
+	// silently drops the original's attributes, ACLs, alternate data streams and
+	// creation time. atomic_write_commit uses ReplaceFileW for exactly that reason,
+	// and falls back to MoveFileExW -- the substituting kind -- when it fails, so
+	// the regression this guards against is a silent fall-back, not a failed save.
+	//
+	// Those properties are easiest to observe from OUTSIDE the process, which is
+	// why the mode originally took a path and did nothing but print: an external
+	// script looked at the file afterwards. That made it two-argument, and
+	// `newtpad resavetest` bare fell through to opening the real GUI and hung -- so
+	// no sweep could run it, so nothing ran it, so it asserted nothing for nine
+	// batches. development-loop.md §6: a mode nothing runs is worse than no mode.
+	//
+	// One-argument now. With no path it builds its own fixture under %TEMP%, stamps
+	// it with an alternate data stream, saves over it and checks in-process what an
+	// external script would have checked: the bytes, the creation time, and the
+	// stream. It exits non-zero when any of that is wrong. With a path it behaves
+	// as before AND runs the same checks, and leaves the file behind.
+	@(private = "file")
+	resave_test_run :: proc(arg: string) {
+		bad := 0
+		path := arg
+		ours := false
+		if path == "" {
+			tmp := os.get_env("TEMP", context.temp_allocator)
+			if tmp == "" {
+				fmt.println("resavetest: no file given and TEMP is unset")
+				os.exit(1)
+			}
+			dir, _ := filepath.join({tmp, "newtpad-resavetest"}, context.temp_allocator)
+			if !os.exists(dir) {
+				if derr := os.make_directory(dir); derr != nil {
+					fmt.printfln("resavetest: could not create %q: %v", dir, derr)
+					os.exit(1)
+				}
+			}
+			path, _ = filepath.join({dir, "resave.txt"}, context.temp_allocator)
+			if werr := os.write_entire_file(path, transmute([]u8)string("alpha\nbravo\ncharlie\n")); werr != nil {
+				fmt.printfln("resavetest: could not write %q: %v", path, werr)
+				os.exit(1)
+			}
+			ours = true
+		}
+
+		// An alternate data stream on the target. This is the property ReplaceFileW
+		// carries and a rename does not, and it is the one an ordinary
+		// bytes-and-size check cannot see at all. NTFS-only, so a failure to create
+		// it skips the check rather than failing it -- a %TEMP% on FAT32 or a
+		// network share is a reason to say nothing, not to cry wolf.
+		ads := fmt.tprintf("%s:newtpad", path)
+		STAMP :: "resavetest stream marker"
+		has_ads := os.write_entire_file(ads, transmute([]u8)string(STAMP)) == nil
+		if !has_ads {fmt.println("  (no alternate data stream on this volume -- skipping that check)")}
+
+		before, berr := os.stat(path, context.temp_allocator)
+		if berr != nil {li_chk(&bad, false, fmt.tprintf("could not stat %q before the save: %v", path, berr))}
+
+		doc, ok := doc_open(path)
+		if !ok {
+			fmt.eprintfln("resavetest: could not open %q", path)
+			os.exit(1)
+		}
+		doc.cursor = doc.pt.length
+		doc.anchor = doc.cursor
+		doc_insert_text(&doc, transmute([]u8)string("appended\n"))
+		want := base.pt_collect(&doc.pt)
+		defer delete(want)
+		err := doc_save_err(&doc, path)
+		fmt.printfln("resavetest: save err=%v size=%d path=%q", err, doc.pt.length, path)
+		li_chk(&bad, err == .None, fmt.tprintf("the save succeeded (%v)", err))
+		doc_close(&doc) // before reading back: releases any mapping on the target
+
+		// The bytes. Not an assertion about the atomic write so much as the floor
+		// under the other two -- a preserved creation time on a file with the wrong
+		// contents is not a pass.
+		got, rerr := os.read_entire_file(path, context.allocator)
+		defer delete(got)
+		li_chk(&bad, rerr == nil, fmt.tprintf("the file reads back (%d bytes, %v)", len(got), rerr))
+		li_chk(&bad, string(got) == string(want), fmt.tprintf("...and its bytes are the buffer's (%d on disk, %d in the buffer)", len(got), len(want)))
+
+		after, aerr := os.stat(path, context.temp_allocator)
+		if berr == nil && aerr == nil {
+			b := time.time_to_unix_nano(before.creation_time)
+			a := time.time_to_unix_nano(after.creation_time)
+			li_chk(&bad, a == b, fmt.tprintf("the creation time survived the save (%d -> %d)", b, a))
+		}
+
+		if has_ads {
+			s, serr := os.read_entire_file(ads, context.allocator)
+			defer delete(s)
+			li_chk(&bad, serr == nil && string(s) == STAMP, fmt.tprintf("the alternate data stream survived the save (read=%v, %q)", serr, string(s)))
+		}
+
+		if ours {os.remove(path)} // takes the stream with it; a path you named is yours
+		fmt.printfln("resavetest: %d failures", bad)
+		// Non-zero for the same reason keytest grew one: this mode spent nine
+		// batches printing to nobody, and a summary line a script has to remember to
+		// grep is what let that happen.
+		if bad > 0 {os.exit(1)}
+	}
+
 	@(private = "file")
 	li_chk :: proc(bad: ^int, ok: bool, label: string) {
 		if !ok {bad^ += 1}
@@ -17211,27 +17315,6 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
-		// `newtpad resavetest <file>` opens a file, edits it and saves, so an external
-		// checker can assert what the save preserved. The atomic write used to rename
-		// a brand-new temp file over the target, which substitutes a fresh file and
-		// silently drops the original's attributes, ACLs and alternate data streams --
-		// the properties are easiest to observe from outside, hence this mode.
-		if os.args[1] == "resavetest" && len(os.args) > 2 {
-			path := os.args[2]
-			doc, ok := doc_open(path)
-			if !ok {
-				fmt.eprintfln("resavetest: could not open %q", path)
-				return true
-			}
-			defer doc_close(&doc)
-			doc.cursor = doc.pt.length
-			doc.anchor = doc.cursor
-			doc_insert_text(&doc, transmute([]u8)string("appended\n"))
-			err := doc_save_err(&doc, path)
-			fmt.printfln("resavetest: save err=%v size=%d", err, doc.pt.length)
-			return true
-		}
-
 		// `newtpad colperftest <mb>` measures the status bar's caret column on a
 		// single-line file -- minified JSON, an unrotated log, a CSV with no newlines.
 		// doc_cursor_col called pt_line_start, an uncapped backward scan, and the
@@ -28334,6 +28417,14 @@ when NEWTPAD_TESTS {
 		// path only substitutes a bigger real file for the memory measurement.
 		if os.args[1] == "lineidxtest" {
 			line_idx_test_run(os.args[2] if len(os.args) > 2 else "")
+			return true
+		}
+
+		// `newtpad resavetest` -- one-argument as of 2026-07-31. An optional path
+		// saves over a file of your choosing and leaves it there for an external
+		// checker, which is what the mode was originally for.
+		if os.args[1] == "resavetest" {
+			resave_test_run(os.args[2] if len(os.args) > 2 else "")
 			return true
 		}
 

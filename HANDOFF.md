@@ -4663,8 +4663,10 @@ to hold the same number." There were four; the page keys got the editor's count.
 - **The sort inherits two constraints nothing enforces:** keystrokes are dropped on a reorder (a UX
   decision worth making deliberately rather than inheriting), and `Sort_Lines` is still refused in table
   view by `doc_read_only_view && command_mutates_doc`, so enabling it means loosening that guard.
-- **`keytest` is now the only mode that exits non-zero.** Correct here, but the suite's failure signalling
-  is inconsistent; worth deciding once for all modes.
+- **`keytest`, `palettetest`, `lineidxtest` and `resavetest` exit non-zero; nothing else does** — notably
+  not `tablegridtest`, which asserts a hundred things about a data-loss seam and still only prints them.
+  Correct in each case that has one, but the suite's failure signalling is inconsistent and a sweep that
+  greps for `FAIL` case-insensitively matches "0 failures"; worth deciding once for all modes.
 - Two asymmetries left by the find-bar fix: `Alt+Shift+Left/Right` still extends a column rectangle from
   the find bar while `Alt+Shift+Up/Down` no longer does, and `Ctrl+C`/`Ctrl+A` still act on the document.
 - `find_paste` truncates silently at 1024 bytes — defensible for a one-row query field, but nobody was
@@ -4695,7 +4697,7 @@ to hold the same number." There were four; the page keys got the editor's count.
     `tablegridtest`,
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
     `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`
-  - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest <file>`,
+  - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
   - Two are **falsifiers**, not regression tests — they measure a claim rather than guard a
