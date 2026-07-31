@@ -189,6 +189,418 @@ when NEWTPAD_TESTS {
 		if bad > 0 {os.exit(1)}
 	}
 
+	@(private = "file")
+	li_chk :: proc(bad: ^int, ok: bool, label: string) {
+		if !ok {bad^ += 1}
+		fmt.printfln("  %-4s %s", "ok" if ok else "FAIL", label)
+	}
+
+	// Ground truth for doc_line_no_at, derived the dumb way over the raw bytes:
+	// the 0-based line number containing `at` is the number of newlines strictly
+	// before it. Deliberately shares no code with the thing it checks -- comparing
+	// two derivations of the same expression is what §4 warns about.
+	@(private = "file")
+	li_truth :: proc(c: []u8, at: int) -> (n: int) {
+		for i in 0 ..< at {if c[i] == '\n' {n += 1}}
+		return
+	}
+
+	// Deterministic fixture with RAGGED line lengths (1..200 bytes). Ragged on
+	// purpose: with fixed-width lines a checkpoint's line number is derivable from
+	// its offset by division, so an implementation that ignored the recorded
+	// line_no entirely could still pass every probe.
+	//
+	// `seed` matters more than it looks: the reuse part indexes one fixture and
+	// then swaps a SHORTER one under it, and with a shared seed the short one is a
+	// byte-for-byte prefix of the long one -- so every stale checkpoint would
+	// still be right and the test could not see a stale answer at all.
+	@(private = "file")
+	li_fixture :: proc(target: int, seed: u64 = 0x9E37_79B9_7F4A_7C15) -> []u8 {
+		b := make([dynamic]u8, 0, target + 256)
+		defer delete(b)
+		rng := seed
+		for len(b) < target {
+			rng = rng * 6364136223846793005 + 1442695040888963407
+			n := int((rng >> 33) % 200) + 1
+			for i in 0 ..< n {append(&b, u8('a') + u8(i % 26))}
+			append(&b, '\n')
+		}
+		out := make([]u8, len(b))
+		copy(out, b[:])
+		return out
+	}
+
+	// Every offset worth probing in a fixture of `n` bytes: both sides of every
+	// checkpoint boundary and the checkpoint itself, the two ends, and a spread of
+	// interior offsets. The boundary triples are the ones that matter -- a lookup
+	// that picks the checkpoint one slot off is correct at mid-stride offsets and
+	// wrong only within a byte of a multiple of LINE_CKPT_STRIDE.
+	@(private = "file")
+	li_probes :: proc(n: int) -> []int {
+		p := make([dynamic]int)
+		append(&p, 0, 1, max(0, n - 1), n)
+		// Every boundary at the shipped stride; a sampled 64 of them if the stride
+		// has been shrunk for an experiment. Without the cap, re-running this mode
+		// at a small stride is quadratic in the fixture (li_truth is O(at)) and
+		// takes long enough that nobody would run it -- which would make the
+		// "same answers at a different stride" check theoretical.
+		step := LINE_CKPT_STRIDE * max(1, (n / LINE_CKPT_STRIDE) / 64)
+		for at := 0; at <= n; at += step {
+			append(&p, max(0, at - 1), at, min(n, at + 1))
+		}
+		rng: u64 = 12345
+		for _ in 0 ..< 64 {
+			rng = rng * 6364136223846793005 + 1442695040888963407
+			append(&p, int((rng >> 33) % u64(n + 1)))
+		}
+		return p[:]
+	}
+
+	// `newtpad lineidxtest [path]` -- Line_Index's sparse checkpoints and
+	// doc_line_no_at. One-argument by construction (the optional path only picks a
+	// bigger real file for the memory figure), per the keytest incident: a
+	// two-argument mode is a mode nothing runs.
+	//
+	// Its own proc for the usual reason (test_mode_dispatch's frame has hit
+	// STATUS_STACK_OVERFLOW twice) and because a failure count needs somewhere to
+	// live. Each part is also its own proc so no two Documents are live in one
+	// frame at a time.
+	@(private = "file")
+	line_idx_test_run :: proc(path: string) {
+		bad := 0
+		li_part_full(&bad)
+		li_part_partial(&bad)
+		li_part_race(&bad)
+		li_part_concurrent(&bad)
+		li_part_edits(&bad)
+		li_part_reuse(&bad)
+		li_part_memory(&bad, path)
+		fmt.printfln("lineidxtest: %d failures", bad)
+		if bad > 0 {os.exit(1)}
+	}
+
+	// A finished index over a fixture spanning eight checkpoint strides: every
+	// probe must be exact and must equal ground truth.
+	@(private = "file")
+	li_part_full :: proc(bad: ^int) {
+		fmt.println("-- finished index over 512 KB --")
+		// Sized in BYTES, not in strides. Sized in strides, shrinking the stride
+		// for the "same answers at a different stride" experiment shrinks the
+		// fixture with it -- at a stride of 1 the whole fixture would have been 8
+		// bytes and every assertion below would have been vacuous.
+		c := li_fixture(512 * 1024)
+		truth_len := len(c)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		want_n := (truth_len + LINE_CKPT_STRIDE - 1) / LINE_CKPT_STRIDE
+		got_n := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, got_n == want_n, fmt.tprintf("%d checkpoints published over %d bytes (want %d)", got_n, truth_len, want_n))
+		li_chk(bad, got_n >= 3, fmt.tprintf("...and the fixture really does cross several boundaries (%d)", got_n))
+
+		wrong, refused, first_bad := 0, 0, -1
+		probes := li_probes(truth_len)
+		for at in probes {
+			got, exact := doc_line_no_at(&d, at)
+			if !exact {
+				refused += 1
+				if first_bad < 0 {first_bad = at}
+				continue
+			}
+			if got != li_truth(d.original, at) {
+				wrong += 1
+				if first_bad < 0 {first_bad = at}
+			}
+		}
+		li_chk(bad, refused == 0, fmt.tprintf("no probe refused (%d of %d, first at %d)", refused, len(probes), first_bad))
+		li_chk(bad, wrong == 0, fmt.tprintf("no probe disagreed with ground truth (%d of %d, first at %d)", wrong, len(probes), first_bad))
+		// Named separately because they are the two that a mid-stride-only probe
+		// set would miss, and the report has to be able to point at them.
+		for at in ([]int{LINE_CKPT_STRIDE - 1, LINE_CKPT_STRIDE, LINE_CKPT_STRIDE + 1, 3 * LINE_CKPT_STRIDE, truth_len}) {
+			got, exact := doc_line_no_at(&d, at)
+			want := li_truth(d.original, at)
+			li_chk(bad, exact && got == want, fmt.tprintf("boundary at=%d -> line %d exact=%v (want %d, true)", at, got, exact, want))
+		}
+		delete(probes)
+	}
+
+	// The mid-scan state, built by hand rather than raced for. doc_line_no_at is a
+	// pure function of (ckpts, ckpt_n, done, edit_floor, content), so publishing a
+	// partial state directly pins its behaviour at the boundary EXACTLY, with no
+	// dependence on how fast the machine is. li_part_race below then checks a real
+	// worker agrees.
+	@(private = "file")
+	li_part_partial :: proc(bad: ^int) {
+		fmt.println("-- mid-scan (hand-published state, no worker) --")
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		M :: 3 // checkpoints "published" so far
+		d.idx.ckpts = make([]Line_Ckpt, len(c) / LINE_CKPT_STRIDE + 1)
+		for k in 0 ..< M {
+			at := k * LINE_CKPT_STRIDE
+			d.idx.ckpts[k] = Line_Ckpt {
+				offset  = at,
+				line_no = li_truth(c, at),
+			}
+		}
+		intrinsics.atomic_store(&d.idx.ckpt_n, M)
+		// Entry M is WRITTEN but not PUBLISHED -- the state the worker is in for
+		// the instant between filling a slot and storing the new count, and the
+		// state a reader must treat as absent. Poisoned with a line number that
+		// could not be right so that trusting it is a visible wrong answer rather
+		// than a plausible one; a zeroed slot would be masked by the bounds guard
+		// in doc_line_no_at and this check could not fail.
+		d.idx.ckpts[M] = Line_Ckpt {
+			offset  = M * LINE_CKPT_STRIDE,
+			line_no = 999_999,
+		}
+
+		lo := M * LINE_CKPT_STRIDE - 1
+		got, exact := doc_line_no_at(&d, lo)
+		li_chk(bad, exact && got == li_truth(c, lo), fmt.tprintf("last covered byte %d is exact (%d, want %d)", lo, got, li_truth(c, lo)))
+		for at in ([]int{M * LINE_CKPT_STRIDE, M * LINE_CKPT_STRIDE + 1, 5 * LINE_CKPT_STRIDE, len(c)}) {
+			_, e := doc_line_no_at(&d, at)
+			li_chk(bad, !e, fmt.tprintf("uncovered byte %d refuses (exact=%v)", at, e))
+		}
+		// `done` is the one thing that lets a lookup reach past the last published
+		// checkpoint. Lying about it here proves the scan is bounded LOCALLY: with
+		// only 3 of 8 strides recorded, the last checkpoint is ~320 KB below the
+		// end, and the local guard refuses rather than scanning that far.
+		intrinsics.atomic_store(&d.idx.done, true)
+		_, e := doc_line_no_at(&d, len(c))
+		li_chk(bad, !e, fmt.tprintf("done+truncated checkpoints still refuses a far offset (exact=%v)", e))
+		intrinsics.atomic_store(&d.idx.done, false)
+	}
+
+	// The same properties against a REAL worker, frozen partway by cancelling it
+	// as soon as it has published a few checkpoints. Asserts its own precondition:
+	// if the worker somehow finished first the fixture is vacuous and that is a
+	// failure, not a pass.
+	@(private = "file")
+	li_part_race :: proc(bad: ^int) {
+		fmt.println("-- mid-scan (real worker, cancelled partway) --")
+		c := li_fixture(64 * 1024 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		total := (len(c) + LINE_CKPT_STRIDE - 1) / LINE_CKPT_STRIDE
+		doc_index_start(&d)
+		for intrinsics.atomic_load(&d.idx.ckpt_n) < 4 && !doc_index_done(&d) {}
+		doc_index_stop(&d) // stores cancel, then joins: the state below is frozen
+		n := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, n > 0 && n < total, fmt.tprintf("caught the worker mid-scan: %d of %d checkpoints", n, total))
+		if n == 0 || n >= total {
+			fmt.println("  (skipping the rest of this part -- the fixture did not stay partial)")
+			return
+		}
+		lo := n * LINE_CKPT_STRIDE - 1
+		got, exact := doc_line_no_at(&d, lo)
+		li_chk(bad, exact && got == li_truth(c, lo), fmt.tprintf("last covered byte %d is exact (%d, want %d)", lo, got, li_truth(c, lo)))
+		hi := n * LINE_CKPT_STRIDE
+		_, e := doc_line_no_at(&d, hi)
+		li_chk(bad, !e, fmt.tprintf("first uncovered byte %d refuses (exact=%v)", hi, e))
+		_, e2 := doc_line_no_at(&d, len(c))
+		li_chk(bad, !e2, fmt.tprintf("end of an unfinished index refuses (exact=%v)", e2))
+	}
+
+	// A reader hammering doc_line_no_at on the main thread for the whole duration
+	// of a real scan -- which is how it will actually be used, since the point of
+	// the checkpoints is answering for the visible rows before the index finishes.
+	//
+	// Probes land exactly ON stride boundaries, so the forward scan is zero bytes
+	// and the answer IS the checkpoint's recorded line_no. That makes this the
+	// read that can see a half-written entry: a torn Line_Ckpt whose offset landed
+	// but whose line_no had not would come back as a confident zero. Every exact
+	// answer is checked against a table computed before the worker started.
+	@(private = "file")
+	li_part_concurrent :: proc(bad: ^int) {
+		fmt.println("-- concurrent reads during a live scan --")
+		c := li_fixture(64 * 1024 * 1024)
+		strides := len(c) / LINE_CKPT_STRIDE + 1
+		truth := make([]int, strides)
+		defer delete(truth)
+		n := 0
+		for i in 0 ..< len(c) {
+			if i % LINE_CKPT_STRIDE == 0 {truth[i / LINE_CKPT_STRIDE] = n}
+			if c[i] == '\n' {n += 1}
+		}
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		wrong, exacts, refusals, passes := 0, 0, 0, 0
+		for !doc_index_done(&d) {
+			passes += 1
+			for k in 0 ..< strides {
+				got, exact := doc_line_no_at(&d, k * LINE_CKPT_STRIDE)
+				if !exact {
+					refusals += 1
+					continue
+				}
+				exacts += 1
+				if got != truth[k] {wrong += 1}
+			}
+		}
+		li_chk(bad, refusals > 0, fmt.tprintf("the reader really did race the scan: %d refusals over %d passes", refusals, passes))
+		li_chk(bad, exacts > 0, fmt.tprintf("...and really did get answers while it ran (%d)", exacts))
+		li_chk(bad, wrong == 0, fmt.tprintf("every answer during the scan was correct (%d wrong of %d)", wrong, exacts))
+	}
+
+	// The index scans the immutable original; edits live in the add arena. A
+	// prefix below every edit still describes the same bytes, so it stays exact;
+	// at and above the lowest edit the two spaces have diverged and the lookup
+	// must refuse rather than answer off offsets that moved.
+	@(private = "file")
+	li_part_edits :: proc(bad: ^int) {
+		fmt.println("-- pending edits --")
+		c := li_fixture(512 * 1024)
+		n := len(c)
+		snapshot := make([]u8, n) // c is handed to the document below
+		copy(snapshot, c)
+		defer delete(snapshot)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		mid := 3 * LINE_CKPT_STRIDE
+		_, before := doc_line_no_at(&d, mid)
+		li_chk(bad, before, "clean buffer answers at 3 strides in")
+
+		// An edit near the end: everything below it must survive. This is the
+		// log-tailing and edit-a-cell-below case, and the reason the gate is a
+		// floor and not a modified bit.
+		d.cursor, d.anchor = n, n
+		doc_insert_text(&d, transmute([]u8)string("appended\nline\n"))
+		probe := 2 * LINE_CKPT_STRIDE + 7
+		got, exact := doc_line_no_at(&d, probe)
+		li_chk(bad, exact && got == li_truth(snapshot, probe), fmt.tprintf("offset %d below the edit is still exact (%d, want %d)", probe, got, li_truth(snapshot, probe)))
+		_, past := doc_line_no_at(&d, n + 3)
+		li_chk(bad, !past, fmt.tprintf("offset %d past the edit refuses (exact=%v)", n + 3, past))
+
+		// ...and an edit at the front poisons everything, because every later
+		// offset shifted.
+		d.cursor, d.anchor = 0, 0
+		doc_insert_text(&d, transmute([]u8)string("x"))
+		_, after := doc_line_no_at(&d, probe)
+		li_chk(bad, !after, fmt.tprintf("after an edit at offset 0, offset %d refuses (exact=%v)", probe, after))
+	}
+
+	// A Document whose indexed content is swapped underneath it -- the shape
+	// doc_detach_mapping and doc_recover_from_fault both have. Without a reset in
+	// doc_index_start the published count outlives the file it described, and the
+	// next lookup answers from the previous file's offsets.
+	@(private = "file")
+	li_part_reuse :: proc(bad: ^int) {
+		fmt.println("-- content swapped underneath the index --")
+		big := li_fixture(16 * 1024 * 1024)
+		d := doc_from_content(big, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		was := intrinsics.atomic_load(&d.idx.ckpt_n)
+
+		// A different seed AND a smaller size, so a checkpoint left over from the
+		// first file is both present and wrong for the second.
+		small := li_fixture(4 * 1024 * 1024, 0xDEAD_BEEF_0123_4567)
+		strides := len(small) / LINE_CKPT_STRIDE + 1
+		truth := make([]int, strides)
+		defer delete(truth)
+		n := 0
+		for i in 0 ..< len(small) {
+			if i % LINE_CKPT_STRIDE == 0 {truth[i / LINE_CKPT_STRIDE] = n}
+			if small[i] == '\n' {n += 1}
+		}
+
+		doc_index_stop(&d)
+		base.pt_destroy(&d.pt)
+		delete(d.original)
+		d.original = small
+		d.pt = base.pt_init(small)
+		d.idx.content = small
+		d.idx.total = len(small)
+		doc_index_start(&d)
+		// Probed WHILE the new scan runs, which is the only window in which a
+		// stale checkpoint can be read: once the shorter file finishes, its own
+		// count has overwritten the longer one's and every entry below it has been
+		// rewritten. An answer here must be the new file's or none at all.
+		wrong, exacts, refusals := 0, 0, 0
+		for !doc_index_done(&d) {
+			for k in 0 ..< strides {
+				got, exact := doc_line_no_at(&d, k * LINE_CKPT_STRIDE)
+				if !exact {
+					refusals += 1
+					continue
+				}
+				exacts += 1
+				if got != truth[k] {wrong += 1}
+			}
+		}
+		li_chk(bad, refusals > 0, fmt.tprintf("the swap really was probed mid-scan (%d refusals)", refusals))
+		li_chk(bad, wrong == 0, fmt.tprintf("no answer came from the PREVIOUS file (%d wrong of %d exact)", wrong, exacts))
+
+		want := (len(small) + LINE_CKPT_STRIDE - 1) / LINE_CKPT_STRIDE
+		got_n := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, was > want, fmt.tprintf("the first file really was the bigger one (%d vs %d checkpoints)", was, want))
+		li_chk(bad, got_n == want, fmt.tprintf("published count follows the new content: %d (want %d, stale would be %d)", got_n, want, was))
+		li_chk(bad, len(d.idx.ckpts) == strides, fmt.tprintf("the array itself was resized: %d entries (want %d, stale would be %d)", len(d.idx.ckpts), strides, 16 * 1024 * 1024 / LINE_CKPT_STRIDE + 1))
+		wrong2 := 0
+		probes := li_probes(len(small))
+		for at in probes {
+			got, exact := doc_line_no_at(&d, at)
+			if !exact || got != li_truth(small, at) {wrong2 += 1}
+		}
+		delete(probes)
+		li_chk(bad, wrong2 == 0, fmt.tprintf("every probe answers from the NEW content (%d wrong)", wrong2))
+	}
+
+	// The memory figure, measured rather than computed: index a real file off
+	// disk and read back the array the index actually allocated.
+	@(private = "file")
+	li_part_memory :: proc(bad: ^int, path: string) {
+		fmt.println("-- checkpoint memory, real file --")
+		p := path
+		if p == "" {
+			p, _ = filepath.join({os.get_env("TEMP", context.temp_allocator), "newtpad-lineidx-fixture.csv"})
+			if !os.exists(p) {
+				body := li_fixture(16 * 1024 * 1024)
+				defer delete(body)
+				if werr := os.write_entire_file(p, body); werr != nil {
+					fmt.printfln("  (could not write %s -- skipping)", p)
+					return
+				}
+			}
+		}
+		d, ok := doc_open(p)
+		if !ok {
+			fmt.printfln("  (could not open %s -- skipping)", p)
+			return
+		}
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) && !doc_index_faulted(&d) {time.sleep(time.Millisecond)}
+		if doc_index_faulted(&d) {
+			fmt.println("  (mapped read faulted -- skipping)")
+			return
+		}
+		bytes := len(d.idx.ckpts) * size_of(Line_Ckpt)
+		fmt.printfln(
+			"  %s: %.2f MB, %d lines, %d checkpoints (%d entries allocated) = %.1f KB, %.4f%% of the file",
+			filepath.base(p),
+			f64(d.idx.total) / (1024 * 1024),
+			doc_line_count(&d),
+			intrinsics.atomic_load(&d.idx.ckpt_n),
+			len(d.idx.ckpts),
+			f64(bytes) / 1024,
+			100 * f64(bytes) / f64(max(1, d.idx.total)),
+		)
+		// The last line is where the whole scheme would be caught wasting memory,
+		// so it gets an assertion rather than only a print.
+		li_chk(bad, bytes < d.idx.total / 100, "checkpoints cost under 1% of the file")
+		li_chk(bad, d.idx.total > 4 * 1024 * 1024, fmt.tprintf("...measured on a genuinely multi-MB file (%d bytes)", d.idx.total))
+	}
+
 	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the
 	// icontest mode's independent PNG decoder below. File-scope (not local to
 	// the icontest block) because Odin's nested proc declarations don't close
@@ -26335,6 +26747,13 @@ when NEWTPAD_TESTS {
 		// it -- both reach keytest_run.
 		if os.args[1] == "keytest" {
 			keytest_run(os.args[2] if len(os.args) > 2 else "")
+			return true
+		}
+
+		// `newtpad lineidxtest` -- one-argument, so a sweep can run it. An optional
+		// path only substitutes a bigger real file for the memory measurement.
+		if os.args[1] == "lineidxtest" {
+			line_idx_test_run(os.args[2] if len(os.args) > 2 else "")
 			return true
 		}
 
