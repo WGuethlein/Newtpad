@@ -243,6 +243,19 @@ main :: proc() {
 	// three assignments at the press and the same one call per drag frame.
 	block_drag: Block_Drag
 
+	// The window is created hidden (platform/window.odin) and shown after the
+	// first present, so the user never sees the empty frame. Two consequences
+	// the loop below has to honour, and the first one is not obvious:
+	//
+	//  1. A HIDDEN window is sent no WM_PAINT, and nothing else is queued at
+	//     this point either -- so the idle wait at the top of the loop would
+	//     block for its full timeout before the first frame was ever drawn,
+	//     turning a 220 ms startup into a 1220 ms one. The first iteration
+	//     therefore skips the wait entirely.
+	//  2. The show has to happen after render_frame's present, not before it,
+	//     or the flash is exactly back.
+	first_frame := true
+
 	for !window.should_close {
 		// Sleep when idle instead of spinning at vsync (which pinned a core the whole
 		// time the app was open). Keep spinning only for the one thing that needs a
@@ -251,7 +264,7 @@ main :: proc() {
 		// a short timeout while a worker is publishing (so indexing/search/autosave
 		// still tick), and a long one when there is nothing to poll (so a file changed
 		// on disk still surfaces within the watcher's own ~1 s cadence).
-		if !(window.mouse_down || app.tab_drag) {
+		if !first_frame && !(window.mouse_down || app.tab_drag) {
 			d0 := app_active(&app)
 			// update_running is in here so a finished check is picked up within
 			// 200 ms rather than sitting until the next keypress -- the app is
@@ -1244,9 +1257,11 @@ main :: proc() {
 		}
 
 		render_frame(&rc)
-		if !perf_first_present {
-			perf_first_present = true
+		if first_frame {
+			first_frame = false
 			perf_mark("start: FIRST PRESENT")
+			plat.window_show(window) // see first_frame above: after the present, never before
+			perf_mark("start: window_show")
 		}
 
 		// The GPU went away mid-frame (driver update, TDR, eGPU unplug, an RDP
@@ -1287,17 +1302,13 @@ main :: proc() {
 	}
 
 	perf_mark("exit: loop exited (WM_CLOSE)")
+	// Off screen first, then do the teardown. See window_hide.
+	plat.window_hide(window)
 	if primary {
 		session_save(&app, session_can_sweep) // hot-exit: persist tabs + unsaved buffers
 	}
 	perf_mark("exit: session_save")
 }
-
-// One-shot latch for the FIRST PRESENT mark. A package-level bool rather than a
-// local so the mark sits at the render call itself, not behind another flag the
-// frame loop has to carry.
-@(private = "file")
-perf_first_present: bool
 
 // Everything render_frame needs; built once in main and handed to the resize
 // callback via the window so a live resize can repaint.
