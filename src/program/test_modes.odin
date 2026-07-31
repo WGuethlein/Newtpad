@@ -273,6 +273,7 @@ when NEWTPAD_TESTS {
 		li_part_race(&bad)
 		li_part_concurrent(&bad)
 		li_part_edits(&bad)
+		li_part_fault(&bad)
 		li_part_reuse(&bad)
 		li_part_memory(&bad, path)
 		fmt.printfln("lineidxtest: %d failures", bad)
@@ -485,6 +486,70 @@ when NEWTPAD_TESTS {
 		doc_insert_text(&d, transmute([]u8)string("x"))
 		_, after := doc_line_no_at(&d, probe)
 		li_chk(bad, !after, fmt.tprintf("after an edit at offset 0, offset %d refuses (exact=%v)", probe, after))
+	}
+
+	// A read that faulted must not come back as `exact`.
+	//
+	// The forward scan goes through pt_read -> safe_copy, which on a mapped
+	// original that has been truncated underneath us ZERO-FILLS what it could not
+	// read, returns false, and sets pt.fault. Nothing in the returned count says
+	// so, so the honest-looking answer is a confidently TOO-LOW line number -- the
+	// bounded scan reporting a confident wrong answer that this signature's second
+	// result exists to prevent.
+	//
+	// safe_copy is a mutable global (base/piecetable.odin) exactly so a test can be
+	// the failing mapping. The fixture leaves the BYTES correct and only reports
+	// the copy as failed, so what is under test is the guard rather than garbage
+	// input -- and the answer it suppresses is a plausible one, not an obvious one.
+	@(private = "file")
+	li_part_fault :: proc(bad: ^int) {
+		fmt.println("-- a faulted read refuses --")
+		c := li_fixture(512 * 1024)
+		snapshot := make([]u8, len(c))
+		copy(snapshot, c)
+		defer delete(snapshot)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		// Deliberately NOT on a stride boundary: a probe that lands on one counts
+		// zero bytes forward, reads nothing, and so could not fault however broken
+		// the mapping is. The bug needs a scan to hide in.
+		probe := 3 * LINE_CKPT_STRIDE + 4321
+		want := li_truth(snapshot, probe)
+		got, exact := doc_line_no_at(&d, probe)
+		li_chk(bad, exact && got == want, fmt.tprintf("clean read at %d is exact (%d, want %d)", probe, got, want))
+
+		faulting :: proc(dst, src: []u8) -> bool {
+			// Exactly what the SEH shim leaves behind for a page it could not read:
+			// the destination zeroed, and `false` returned. Zeros hold no newlines,
+			// so the count comes back genuinely too LOW rather than merely flagged --
+			// the assertion below is then about a confident WRONG ANSWER, which is
+			// the failure this guard exists to stop, not about a bookkeeping bit.
+			for i in 0 ..< len(dst) {dst[i] = 0}
+			return false
+		}
+		base.safe_copy = faulting
+		fgot, fexact := doc_line_no_at(&d, probe)
+		base.safe_copy = base.default_copy
+		li_chk(bad, !fexact, fmt.tprintf("...and refuses once that read faults (%d, exact=%v)", fgot, fexact))
+		// PEEKED, not taken. doc_fault_pending is what arms the recovery, and a
+		// reader that consumed the flag would refuse correctly and then leave the
+		// document attached to a mapping it can no longer read.
+		li_chk(bad, base.pt_take_fault(&d.pt), "...and the flag survives for doc_fault_pending to take")
+
+		// The index worker's own copy of the same event: it aborts mid-chunk, so
+		// the checkpoints it published describe bytes that have since changed.
+		intrinsics.atomic_store(&d.idx.fault, true)
+		_, wexact := doc_line_no_at(&d, probe)
+		intrinsics.atomic_store(&d.idx.fault, false)
+		li_chk(bad, !wexact, fmt.tprintf("a faulted index WORKER refuses too (exact=%v)", wexact))
+
+		// ...and the refusals really were the faults. Without this the two checks
+		// above pass for a procedure that has simply stopped answering.
+		rgot, rexact := doc_line_no_at(&d, probe)
+		li_chk(bad, rexact && rgot == want, fmt.tprintf("and it answers again once both flags clear (%d, want %d, exact=%v)", rgot, want, rexact))
 	}
 
 	// A Document whose indexed content is swapped underneath it -- the shape

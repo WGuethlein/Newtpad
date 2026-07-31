@@ -1707,7 +1707,14 @@ doc_line_count :: proc(doc: ^Document) -> int {
 //   - the buffer has been edited at or below `at`, so document offsets and the
 //     indexed original's offsets no longer describe the same bytes. Edits below
 //     an untouched prefix (a log growing at its tail, a table cell edited further
-//     down) leave that prefix exact -- see Line_Index.edit_floor.
+//     down) leave that prefix exact -- see Line_Index.edit_floor;
+//   - a read of the mapped original faulted, so the bytes counted are not the
+//     file's (see the fault check below the scan).
+//
+// MAIN THREAD ONLY. Not merely because of edit_floor: this reads the `ckpts`
+// SLICE HEADER, which doc_index_start swaps and frees. A worker calling it would
+// race the header rather than the entries, which the publishing scheme does not
+// defend against and could not.
 //
 // Note what it is NOT: it does not add nl_delta the way doc_line_count does. A
 // total can be corrected forward by a net newline count; a position cannot,
@@ -1745,7 +1752,29 @@ doc_line_no_at :: proc(doc: ^Document, at: int) -> (line_no: int, exact: bool) {
 	// original must go through the SEH shim, and pt_read is where that lives. It
 	// is also the read that matches `at`'s space -- exact against document offsets
 	// by the edit_floor gate above.
-	return ck.line_no + count_newlines(doc, ck.offset, at - ck.offset), true
+	c := count_newlines(doc, ck.offset, at - ck.offset)
+	// ...and that shim can come back SHORT AND SILENT. safe_copy zero-fills a page
+	// it could not read, returns false, and read_rec sets pt.fault
+	// (base/piecetable.odin) -- so a mapped file truncated underneath us yields a
+	// too-low newline count with nothing in `c` to say so. Returning it as exact
+	// is development-loop.md §4 Shape A in the one procedure whose second result
+	// exists to prevent it. PEEKED via pt_faulted, never taken: doc_fault_pending
+	// is what arms the recovery, and consuming the flag here would leave the
+	// document attached to a mapping it can no longer read.
+	//
+	// This is deliberately stricter than the rest of the tree, and the difference
+	// is worth naming because doc_apply_region's comment argues the other way:
+	// every OTHER reader of a faulted region only DISPLAYS it, for the one frame
+	// before recovery runs, so a stale glyph is the whole cost. `exact` is not a
+	// pixel -- it is an explicit promise the caller ACTS on, and the row-number
+	// gutter draws that number as fact with no way to know it is wrong.
+	//
+	// idx.fault is the worker's own copy of the same event: it aborted mid-chunk
+	// on a page it could not read, so its published checkpoints describe bytes
+	// that have since changed. Both flags clear when the document is re-indexed
+	// over recovered private memory (doc_recover_from_fault).
+	if base.pt_faulted(&doc.pt) || intrinsics.atomic_load(&idx.fault) {return 0, false}
+	return ck.line_no + c, true
 }
 
 doc_index_done :: proc(doc: ^Document) -> bool {return intrinsics.atomic_load(&doc.idx.done)}
