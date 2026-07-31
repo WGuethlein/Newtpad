@@ -1613,12 +1613,14 @@ doc_index_start :: proc(doc: ^Document) {
 }
 
 doc_close :: proc(doc: ^Document) {
+	perf_mark("  doc_close: enter")
 	if doc.idx.th != nil {
 		intrinsics.atomic_store(&doc.idx.cancel, true)
 		thread.join(doc.idx.th)
 		thread.destroy(doc.idx.th)
 		doc.idx.th = nil
 	}
+	perf_mark("  doc_close: line index joined")
 	// After the join, never before: the worker writes into this array.
 	delete(doc.idx.ckpts)
 	doc.idx.ckpts = nil // same freed-but-live header hazard as lex_idx below
@@ -1640,10 +1642,12 @@ doc_close :: proc(doc: ^Document) {
 	doc.lex_idx.opens = nil
 	// Before pt_destroy: the worker's view aliases the add chunks it frees.
 	search_release(doc)
+	perf_mark("  doc_close: lex+search released")
 	for s in doc.undo {snapshot_free(s)}
 	for s in doc.redo {snapshot_free(s)}
 	delete(doc.undo)
 	delete(doc.redo)
+	perf_mark("  doc_close: snapshots freed")
 	delete(doc.bookmarks)
 	doc.bookmarks = nil // same freed-but-live header hazard as lex_idx above
 	delete(doc.find.query)
@@ -1670,6 +1674,7 @@ doc_close :: proc(doc: ^Document) {
 		delete(doc.path)
 	}
 	plat.file_close(&doc.fv)
+	perf_mark("  doc_close: done")
 }
 
 @(private = "file")

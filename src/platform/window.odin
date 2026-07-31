@@ -375,12 +375,24 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 	// the 96-DPI size and rescale immediately below.
 	w.dpi = DPI_MIN
 
+	// NOT WS_VISIBLE. The window is created hidden and shown by window_show
+	// once the first frame has been presented.
+	//
+	// Measured 2026-07-31 on real desktop pixels (docs/reported-bugs.md, "white
+	// box for a split second"): with WS_VISIBLE here the window appeared 20 ms
+	// into startup, DWM faded it to solid white by ~85 ms, and it stayed white
+	// until the first present at ~220 ms -- a 196 ms white box, on every build
+	// back to v0.32.0. hbrBackground is deliberately still unset (an erase brush
+	// would only choose the colour of the flash, not remove it); creating hidden
+	// removes the gap itself. The cost being covered is gfx_init, which measured
+	// 132-145 ms of that 196 -- D3D11 device + swapchain creation, which cannot
+	// usefully be made faster and must simply not be watched.
 	title_w := win.utf8_to_wstring(title)
 	w.hwnd = win.CreateWindowExW(
 		0,
 		class_name,
 		title_w,
-		win.WS_OVERLAPPEDWINDOW | win.WS_VISIBLE,
+		win.WS_OVERLAPPEDWINDOW,
 		win.CW_USEDEFAULT,
 		win.CW_USEDEFAULT,
 		width,
@@ -423,6 +435,52 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 	// contract and one consumer rather than two to keep in sync.
 	win.DragAcceptFiles(w.hwnd, true)
 	return w
+}
+
+// Make the window visible. Called ONCE, immediately after the first frame has
+// been presented -- see the WS_VISIBLE note in window_create for the measurement
+// that put it there.
+//
+// SetForegroundWindow as well as ShowWindow because WS_VISIBLE at creation used
+// to get the activation for free from the shell's launch rules; a window shown
+// later is not covered by them, and starting behind the window the user launched
+// from would be a worse bug than the flash. This process still holds the
+// foreground right at this point (it was launched by the user seconds earlier),
+// so the call is not the "steal focus" case the API refuses.
+//
+// Idempotent by construction: the caller latches it to the first frame, and
+// ShowWindow/SetForegroundWindow on an already-visible foreground window are
+// both no-ops anyway.
+window_show :: proc(w: ^Window) {
+	if w.hwnd == nil {return}
+	win.ShowWindow(w.hwnd, win.SW_SHOW)
+	win.SetForegroundWindow(w.hwnd)
+}
+
+// Take the window off screen at the START of shutdown, so the teardown that
+// follows it is not something the user sits and watches.
+//
+// The mirror of window_show, and it exists for the measurement in the same bug
+// report: WM_CLOSE to process exit measured 94-157 ms, of which only ~46-80 ms
+// is inside main() -- the rest is CRT/DLL detach, chiefly the D3D11 and DXGI
+// unload, which is not ours to speed up. All of it used to happen with the
+// window still on screen and its message pump dead.
+//
+// Deliberately NOT a DestroyWindow: the crash handler can still be reached from
+// the exit-path save below, message_error takes this hwnd as its parent, and a
+// destroyed handle would make that message box parentless mid-crash. Hidden is
+// enough -- the pixels are what the user is waiting on.
+window_hide :: proc(w: ^Window) {
+	if w.hwnd == nil {return}
+	win.ShowWindow(w.hwnd, win.SW_HIDE)
+}
+
+// Is the window on screen? Exists so `windowshowtest` can assert the create-
+// hidden / show-after-present ordering against the OS rather than against the
+// source, and so nothing above the platform layer has to name IsWindowVisible.
+window_is_visible :: proc(w: ^Window) -> bool {
+	if w.hwnd == nil {return false}
+	return bool(win.IsWindowVisible(w.hwnd))
 }
 
 // Live Ctrl state, for gestures that aren't key presses (Ctrl+wheel).
