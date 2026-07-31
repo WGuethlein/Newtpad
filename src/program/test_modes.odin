@@ -19200,11 +19200,21 @@ when NEWTPAD_TESTS {
 				// DEFAULT allocator, not temp: doc_from_content sets owned_orig, so
 				// doc_close frees this slice. A temp-allocated fixture here is a
 				// heap corruption (0xC0000374), not a leak -- cost one crash.
+				//
+				// COLUMNS 7 AND 20 ARE MUCH WIDER than the rest, and that is load
+				// bearing as of 2026-07-31: `r%dc%d` alone clamps every column to
+				// §10's 8-cell floor, and with uniform columns a column-count span
+				// and a pixel span are the same number scaled -- so the thumb-size
+				// check below could not fail however wrong the model was.
 				sb := strings.builder_make()
 				for r in 0 ..< 4 {
 					for c in 0 ..< 40 {
 						if c > 0 {strings.write_byte(&sb, ',')}
-						fmt.sbprintf(&sb, "r%dc%d", r, c)
+						if c == 7 || c == 20 {
+							fmt.sbprintf(&sb, "r%dc%d_wwwwwwwwwwwwwwwwwwwwwwww", r, c)
+						} else {
+							fmt.sbprintf(&sb, "r%dc%d", r, c)
+						}
 					}
 					strings.write_byte(&sb, '\n')
 				}
@@ -19246,12 +19256,26 @@ when NEWTPAD_TESTS {
 				// genuinely uneven (`r0c0` vs `r0c39`), so this rejects the old model.
 				{
 					wpos := [3]f32{}
-					for tc, i in ([]int{0, gm.max / 2, gm.max}) {
+					// The probe offsets come from table_max_scroll_x, NOT from
+					// gm.max. gm.max is the model's own opinion of its range, so a
+					// model that got the unit wrong would also mis-scale the probes
+					// and all three would land in the same place -- the check would
+					// then report "constant" about a thumb that never moved.
+					real_max := table_max_scroll_x(&gdoc, cw, 1000)
+					for tc, i in ([]int{0, real_max / 2, real_max}) {
 						gdoc.table_hscroll_px = tc
 						mw := hscroll_model(&gdoc, &t, 1000, cw)
 						wpos[i] = hscrollbar_geo(&gdoc, 1000, 700, mw).thumb_w
 					}
 					gdoc.table_hscroll_px = 0
+					// NOT AT THE FLOOR. hscrollbar_geo clamps thumb_w to sx(24), and
+					// a thumb pinned there is the same width at every position
+					// whatever the model does -- so without this the check above
+					// could report "constant" about a number nothing computed.
+					if wpos[0] <= sx(24) + 1 {
+						fmt.printfln("  FAIL grid: the thumb is at its %0.f px floor, so its width proves nothing (%.2f)", sx(24), wpos[0])
+						bad += 1;grid_bad += 1
+					}
 					if wpos[0] != wpos[1] || wpos[1] != wpos[2] {
 						fmt.printfln("  FAIL grid: the thumb resizes as it moves (%.2f, %.2f, %.2f px)", wpos[0], wpos[1], wpos[2])
 						bad += 1;grid_bad += 1
@@ -19548,6 +19572,12 @@ when NEWTPAD_TESTS {
 
 			if bad == 0 {fmt.println("  drawn column == hit-tested column, and the scrollbar thumb round-trips: OK")}
 			fmt.printfln("hscrolltest: %d failures", bad)
+			// Exit non-zero, like tablegridtest / keytest / resavetest. It used to
+			// only print, and that was found the way the others were: a sabotage
+			// pass reintroduced the column-count thumb span, this mode printed
+			// `FAIL grid: thumb span is 11, want 930` -- and exited 0. A sweep that
+			// checks exit codes rather than grepping saw a pass.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
