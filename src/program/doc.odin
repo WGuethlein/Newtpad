@@ -2257,7 +2257,10 @@ doc_set_line_ending :: proc(doc: ^Document, eol: base.Line_Ending) {
 	doc.cursor = clamp(doc.cursor, 0, doc.pt.length)
 	doc.anchor = doc.cursor
 	doc.nl_delta = 0
-	doc_index_stop(doc)
+	// No doc_index_stop here: doc_index_start does it first, and unlike
+	// doc_recover_from_fault/doc_detach_mapping there is nothing to unmap that the
+	// join has to be ordered against. Its own copy of the stop is what this
+	// procedure got wrong before -- see doc_index_start's comment.
 	doc.idx.content = doc.original
 	doc.idx.total = len(doc.original)
 	doc_index_start(doc)

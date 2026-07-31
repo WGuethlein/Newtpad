@@ -703,8 +703,18 @@ when NEWTPAD_TESTS {
 	li_part_memory :: proc(bad: ^int, path: string) {
 		fmt.println("-- checkpoint memory, real file --")
 		p := path
+		ours := false
 		if p == "" {
-			p, _ = filepath.join({os.get_env("TEMP", context.temp_allocator), "newtpad-lineidx-fixture.csv"})
+			tmp := os.get_env("TEMP", context.temp_allocator)
+			if tmp == "" {
+				// Without this the join is a bare filename and the 16 MB fixture
+				// lands in the repo working tree.
+				fmt.println("  (TEMP is unset -- skipping rather than writing 16 MB into the cwd)")
+				return
+			}
+			// temp_allocator: this is a per-run scratch path, and on
+			// context.allocator it was simply leaked.
+			p, _ = filepath.join({tmp, "newtpad-lineidx-fixture.csv"}, context.temp_allocator)
 			if !os.exists(p) {
 				body := li_fixture(16 * 1024 * 1024)
 				defer delete(body)
@@ -712,8 +722,15 @@ when NEWTPAD_TESTS {
 					fmt.printfln("  (could not write %s -- skipping)", p)
 					return
 				}
+				ours = true
 			}
 		}
+		// Deferred here, below every assignment to `p` and `ours`, so it cannot
+		// depend on when Odin evaluates a deferred statement's operands. Only a
+		// fixture THIS run created is removed: a path the caller passed, or one left
+		// by an earlier run, is not ours to delete. A mode that leaves 16 MB in
+		// %TEMP% behind is a mode people stop running.
+		defer if ours {os.remove(p)}
 		d, ok := doc_open(p)
 		if !ok {
 			fmt.printfln("  (could not open %s -- skipping)", p)
