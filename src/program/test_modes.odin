@@ -10947,6 +10947,45 @@ when NEWTPAD_TESTS {
 				chk(&bad, near(bg_s, b0, g0, r0, TOL), fmt.tprintf("row 0 is unbanded (reads Bg_Base) at (%d,%d): got bgr=(%d,%d,%d)", sx, y0, b0, g0, r0))
 				chk(&bad, near(zeb_s, b1, g1, r1, TOL), fmt.tprintf("row 1 is banded (reads Table_Zebra) at (%d,%d): got bgr=(%d,%d,%d)", sx, y1, b1, g1, r1))
 
+				// 3b. THE TABLE HAS A RIGHT EDGE (Wyatt, live use, v0.34.1: *"this
+				//     looks wrong... table doesn't end on the right"*). This fixture
+				//     is two 8-cell columns in a 1000px window, so roughly 730px of
+				//     the row is past the last column, and the bands used to be drawn
+				//     to table_right -- every pixel of that emptiness banded.
+				//
+				//     ON PIXELS, not on table_content_right's return value. The
+				//     producer agreeing with itself proves nothing here: the defect
+				//     was the DRAW passing the wrong number, so the check has to read
+				//     what the draw actually painted. Three samples on the banded row
+				//     -- just inside the edge, just outside it, and far out by the
+				//     scrollbar -- plus the header band, which had the same bug.
+				{
+					cols := table_cols_layout(&doc, char_w, f32(W))
+					cr := table_content_right(cols, f32(W))
+					x_in := int(cr) - 3
+					x_out := int(cr) + 5
+					x_far := W - int(SCROLLBAR_W) - 5
+					// The gap has to be real, or the three samples below are the
+					// same pixel and this passes on a table that fills the window.
+					chk(&bad, len(cols) == 2 && x_far-x_out > 400, fmt.tprintf("the fixture leaves %d px of window past the table's edge (%.1f)", x_far - x_out, cr))
+					ib, ig, ir := sample(buf, W, x_in, y1)
+					chk(&bad, near(zeb_s, ib, ig, ir, TOL), fmt.tprintf("the banded row still reads Table_Zebra just inside the edge at (%d,%d): got bgr=(%d,%d,%d)", x_in, y1, ib, ig, ir))
+					ob, og, or_ := sample(buf, W, x_out, y1)
+					chk(&bad, near(bg_s, ob, og, or_, TOL), fmt.tprintf("...and Bg_Base five pixels past it at (%d,%d): got bgr=(%d,%d,%d)", x_out, y1, ob, og, or_))
+					fb, fg, fr := sample(buf, W, x_far, y1)
+					chk(&bad, near(bg_s, fb, fg, fr, TOL), fmt.tprintf("...and out by the scrollbar at (%d,%d): got bgr=(%d,%d,%d)", x_far, y1, fb, fg, fr))
+					xb, xg, xr := sample(buf, W, x_far, hy)
+					chk(&bad, near(bg_s, xb, xg, xr, TOL), fmt.tprintf("the HEADER band ends there too at (%d,%d): got bgr=(%d,%d,%d)", x_far, hy, xb, xg, xr))
+					// ...and the header rule with it. It is one hairline high, so it
+					// is sampled by scanning the same band the thickness check uses.
+					rule_out := 0
+					for yy in scan_top ..< scan_bot {
+						b, g, r := sample(buf, W, x_far, yy)
+						if near(rule_s, b, g, r, TOL) {rule_out += 1}
+					}
+					chk(&bad, rule_out == 0, fmt.tprintf("...and so does the rule beneath it (%d px of Border_Strong at x=%d)", rule_out, x_far))
+				}
+
 				// 4. F9: a ZERO-LENGTH document draws nothing -- not a bare header
 				//    band over an empty page. table_header_fields(doc) returns nil
 				//    when doc.pt.length == 0, and that used to be checked AFTER
