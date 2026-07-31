@@ -1384,6 +1384,402 @@ when NEWTPAD_TESTS {
 		li_chk(bad, d.idx.total > 4 * 1024 * 1024, fmt.tprintf("...measured on a genuinely multi-MB file (%d bytes)", d.idx.total))
 	}
 
+	// --- `newtpad selalltest` -- Ctrl+A stops at the last content row ---
+	//
+	// Reported 2026-07-29: a Ctrl+A on a document with a run of blank rows at the
+	// end took those rows with it. The rule that came out of it is about POSITION,
+	// not blankness -- a blank line between two paragraphs is content -- and
+	// pt_content_end_cap owns it, with its own unit tests over in src/base
+	// (test_pt_content_end_cap_*, which cover the byte rule at the boundaries a
+	// document-level test cannot cheaply reach).
+	//
+	// What THIS mode owns is everything the byte rule does not:
+	//
+	//   - the second press, and what resets it. doc_select_all bypasses
+	//     set_cursor, so "already trimmed" is the part with real risk.
+	//   - the CONSUMERS. The fix moves a number that copy, cut, delete, paste,
+	//     Tab-over-selection, the status bar's byte count, the highlight rects
+	//     and the block drop all read, and a select-all that is right in
+	//     isolation and wrong through Cut is a data-loss bug.
+	//   - the two read-only views, which must not quietly acquire new behaviour.
+	//
+	// One-argument and non-zero on failure, per the keytest/resavetest incident:
+	// a mode nothing runs is worse than no mode.
+	@(private = "file")
+	select_all_test_run :: proc() {
+		bad := 0
+		sa_part_paragraph(&bad)
+		sa_part_shapes(&bad)
+		sa_part_second_press(&bad)
+		sa_part_reset(&bad)
+		sa_part_cap(&bad)
+		sa_part_consumers(&bad)
+		sa_part_rects(&bad)
+		sa_part_views(&bad)
+		fmt.printfln("selalltest: %d failures", bad)
+		if bad > 0 {os.exit(1)}
+	}
+
+	// A Document over `s`. doc_from_content takes ownership of what it is given
+	// and doc_close frees it, so the bytes have to be an allocation of their own
+	// rather than a slice of a string literal.
+	//
+	// Every part below closes its Document before making the next one: one live
+	// Document per frame, per development-loop.md §6's stack-overflow rule.
+	@(private = "file")
+	sa_doc :: proc(s: string) -> Document {
+		c := make([]u8, len(s))
+		copy(c, transmute([]u8)s)
+		return doc_from_content(c, "", .UTF8)
+	}
+
+	// `head` followed by `n` copies of `pad`, for the cap part's oversized tails.
+	@(private = "file")
+	sa_tail :: proc(head: string, pad: u8, n: int) -> Document {
+		c := make([]u8, len(head) + n)
+		copy(c, transmute([]u8)head)
+		for i in len(head) ..< len(c) {c[i] = pad}
+		return doc_from_content(c, "", .UTF8)
+	}
+
+	// THE case the bug report names, and the one a careless fix gets wrong. A
+	// forward scan that stops at the first blank row answers hi == 3 here and
+	// throws away the second paragraph; the assertion that the blank line at
+	// offset 4 is INSIDE the selection is what catches that.
+	@(private = "file")
+	sa_part_paragraph :: proc(bad: ^int) {
+		fmt.println("-- the paragraph case: a blank line BETWEEN paragraphs is content --")
+		d := sa_doc("one\n\ntwo\n\n\n")
+		defer doc_close(&d)
+		doc_select_all(&d)
+		lo, hi := doc_sel_range(&d)
+		li_chk(bad, hi == 9, fmt.tprintf("Ctrl+A on \"one\\n\\ntwo\\n\\n\\n\" ends at 9 (got %d, length %d)", hi, d.pt.length))
+		li_chk(bad, lo <= 4 && 4 < hi, fmt.tprintf("...and the interior blank line at 4 is inside [%d,%d)", lo, hi))
+		li_chk(bad, hi < d.pt.length, fmt.tprintf("...and something really was trimmed (%d of %d bytes)", d.pt.length - hi, d.pt.length))
+		got := doc_selected_text(&d, context.temp_allocator)
+		li_chk(bad, got == "one\n\ntwo\n", fmt.tprintf("...and the selected text is %q", got))
+	}
+
+	// One row per decision, checked as a whole document rather than as bytes: the
+	// same shapes src/base pins under pt_content_end_cap, run through the thing
+	// the user actually presses.
+	@(private = "file")
+	sa_part_shapes :: proc(bad: ^int) {
+		fmt.println("-- the shapes: terminators, whitespace rows, CRLF, all-blank --")
+		Case :: struct {
+			text: string,
+			want: int,
+			why:  string,
+		}
+		cases := []Case {
+			{"alpha\nbeta", 10, "no trailing newline: nothing to trim"},
+			{"alpha\nbeta\n", 11, "exactly one: the terminator is INCLUDED, so an ordinary file copies as it always did"},
+			{"alpha\nbeta\n\n", 11, "two: the second one goes"},
+			{"alpha\nbeta\n\n\n\n\n", 11, "five: four go"},
+			{"a\n   \n\t\n", 2, "whitespace-only trailing rows are blank (decision 2)"},
+			{"alpha\nbeta   ", 13, "trailing spaces ON a content row are content, not a trim"},
+			{"alpha\nbeta   \n\n", 14, "...and they stay inside the selection when the row IS terminated"},
+			{"a\r\n\r\n\r\n", 3, "CRLF: both bytes of the terminator (decision 4)"},
+			{"a\r\nb\r\n", 6, "an ordinary CRLF file is unchanged"},
+			{"\n\n\n", 3, "an all-blank document selects everything (decision 3)"},
+			{"   \n \t\n", 7, "...including one that is all spaces and tabs"},
+			{"", 0, "an empty document"},
+			{"alpha", 5, "one unterminated row"},
+		}
+		for c in cases {
+			d := sa_doc(c.text)
+			doc_select_all(&d)
+			lo, hi := doc_sel_range(&d)
+			li_chk(bad, lo == 0 && hi == c.want, fmt.tprintf("%q -> [%d,%d), want [0,%d): %s", c.text, lo, hi, c.want, c.why))
+			doc_close(&d)
+		}
+	}
+
+	// Decision 1. A second press extends to the whole buffer, so "select all,
+	// delete" is still reachable -- measured on this fixture, a trimming select-all
+	// on its own leaves the blank tail behind, which would be reported as its own
+	// bug if there were no way to get past it.
+	@(private = "file")
+	sa_part_second_press :: proc(bad: ^int) {
+		fmt.println("-- the second press extends to the whole buffer --")
+		d := sa_doc("alpha\n\n\n\n") // 9 bytes; the content row ends at 6
+		defer doc_close(&d)
+		doc_select_all(&d)
+		lo1, hi1 := doc_sel_range(&d)
+		li_chk(bad, lo1 == 0 && hi1 == 6, fmt.tprintf("press 1 trims to [%d,%d) (want [0,6))", lo1, hi1))
+		doc_select_all(&d)
+		lo2, hi2 := doc_sel_range(&d)
+		li_chk(bad, lo2 == 0 && hi2 == d.pt.length, fmt.tprintf("press 2 extends to [%d,%d) (want [0,%d))", lo2, hi2, d.pt.length))
+		// A third press trims again rather than latching on the whole buffer --
+		// the selection on screen is no longer the trim, so the derived state says
+		// "this is a first press", and that is the answer the screen supports.
+		doc_select_all(&d)
+		lo3, hi3 := doc_sel_range(&d)
+		li_chk(bad, lo3 == 0 && hi3 == 6, fmt.tprintf("press 3 trims again, so Ctrl+A toggles [%d,%d) (want [0,6))", lo3, hi3))
+		// And the point of the whole decision: select-all then delete empties the
+		// document, in two presses rather than one.
+		doc_select_all(&d) // back to the whole buffer
+		doc_backspace(&d)
+		li_chk(bad, d.pt.length == 0, fmt.tprintf("Ctrl+A Ctrl+A Delete empties the buffer (%d bytes left)", d.pt.length))
+	}
+
+	// The latch. There is no stored flag -- the "already trimmed" state is read
+	// off the selection itself -- and this is the part that proves the reset rule
+	// that buys, because a flag placed carelessly would extend on a press where
+	// the user expected a trim.
+	@(private = "file")
+	sa_part_reset :: proc(bad: ^int) {
+		fmt.println("-- what resets the second press --")
+		{
+			// A caret move.
+			d := sa_doc("alpha\n\n\n\n")
+			defer doc_close(&d)
+			doc_select_all(&d)
+			doc_cursor_left(&d, false)
+			doc_select_all(&d)
+			_, hi := doc_sel_range(&d)
+			li_chk(bad, hi == 6, fmt.tprintf("a caret move between presses -> the next press TRIMS (%d, want 6)", hi))
+		}
+		{
+			// An edit. The selection is replaced, so nothing about it still looks
+			// like a trim -- and the trimmed end has moved anyway.
+			d := sa_doc("alpha\n\n\n\n")
+			defer doc_close(&d)
+			doc_select_all(&d)
+			doc_insert_rune(&d, 'X') // replaces the selection
+			li_chk(bad, doc_debug_string(&d) == "X\n\n\n", fmt.tprintf("an edit over the trimmed selection leaves the blank tail (%q)", doc_debug_string(&d)))
+			doc_select_all(&d)
+			_, hi := doc_sel_range(&d)
+			// 2, not 1: the buffer is now "X\n\n\n" and the trim keeps the content
+			// row's own terminator.
+			li_chk(bad, hi == 2, fmt.tprintf("...and the next press TRIMS the new content (%d, want 2)", hi))
+		}
+		{
+			// Another document. A flag on the App, or a static, would leak across
+			// tabs; a flag on the Document would survive a switch away and back.
+			// Nothing here is stored at all, so both questions answer themselves.
+			a := sa_doc("alpha\n\n\n\n")
+			defer doc_close(&a)
+			b := sa_doc("beta\n\n\n")
+			defer doc_close(&b)
+			doc_select_all(&a)
+			doc_select_all(&b)
+			_, hib := doc_sel_range(&b)
+			li_chk(bad, hib == 5, fmt.tprintf("a trim in one document does not make the next document's first press extend (%d, want 5)", hib))
+			// ...and going back to the first one DOES extend, because its trimmed
+			// selection is still on screen. Stated as an assertion rather than left
+			// implicit: it is the one visible consequence of deriving the state
+			// instead of storing it, and it is the behaviour the screen supports.
+			doc_select_all(&a)
+			_, hia := doc_sel_range(&a)
+			li_chk(bad, hia == a.pt.length, fmt.tprintf("...while the document still SHOWING a trim extends on its next press (%d, want %d)", hia, a.pt.length))
+		}
+		{
+			// Undo restores the pre-edit cursor and anchor (apply_snapshot), which
+			// is the trimmed selection, so the press after an undo extends. Pinned
+			// because it is the least obvious case and someone will read it as a
+			// bug: the selection the undo puts back on screen IS the trim, so
+			// extending is again what the screen supports.
+			d := sa_doc("alpha\n\n\n\n")
+			defer doc_close(&d)
+			doc_select_all(&d)
+			doc_insert_rune(&d, 'X')
+			doc_undo(&d)
+			lo, hi := doc_sel_range(&d)
+			li_chk(bad, lo == 0 && hi == 6, fmt.tprintf("undo restores the trimmed selection [%d,%d) (want [0,6))", lo, hi))
+			doc_select_all(&d)
+			_, hi2 := doc_sel_range(&d)
+			li_chk(bad, hi2 == d.pt.length, fmt.tprintf("...so the press after it extends (%d, want %d)", hi2, d.pt.length))
+		}
+	}
+
+	// development-loop.md §4 Shape A. The scan runs backward from the buffer end
+	// and nothing but the cap stops it, so a multi-GB log with a blank tail would
+	// walk the whole file inside a keystroke. Past SELECT_ALL_TRIM_CAP it gives up
+	// and says so, and Ctrl+A falls back to what it always did.
+	@(private = "file")
+	sa_part_cap :: proc(bad: ^int) {
+		fmt.println("-- the cap, and that the cost is cap-bounded rather than file-bounded --")
+		small_ms, big_ms: f64
+		{
+			// A blank tail that FITS: trimmed, exactly as a small file is.
+			d := sa_tail("abc\n", '\n', SELECT_ALL_TRIM_CAP - 1000)
+			defer doc_close(&d)
+			t0 := time.tick_now()
+			doc_select_all(&d)
+			small_ms = time.duration_milliseconds(time.tick_since(t0))
+			_, hi := doc_sel_range(&d)
+			li_chk(bad, hi == 4, fmt.tprintf("a %d-byte blank tail is inside the cap and trims to %d (want 4)", SELECT_ALL_TRIM_CAP - 1000, hi))
+		}
+		{
+			// A blank tail that does NOT fit. The whole buffer, which is today's
+			// behaviour -- never a selection stopping at some arbitrary offset in
+			// the middle of the tail, which is what a bounded scan that cannot tell
+			// it was truncated would produce.
+			d := sa_tail("abc\n", '\n', 16 * 1024 * 1024)
+			defer doc_close(&d)
+			t0 := time.tick_now()
+			doc_select_all(&d)
+			big_ms = time.duration_milliseconds(time.tick_since(t0))
+			lo, hi := doc_sel_range(&d)
+			li_chk(bad, lo == 0 && hi == d.pt.length, fmt.tprintf("a 16 MB blank tail is past the cap, so Ctrl+A selects everything [%d,%d) of %d", lo, hi, d.pt.length))
+			// The scan is what makes this a Shape A candidate, so the boundedness
+			// gets a number and not a comment. Compared against the 1 MB case and
+			// not against a fixed threshold: the point is that a file SIXTEEN TIMES
+			// bigger costs the same, because both stop at the same cap.
+			li_chk(bad, big_ms <= small_ms * 4 + 5, fmt.tprintf("...and it costs %.3f ms against the 1 MB tail's %.3f ms -- bounded by the cap, not by the file", big_ms, small_ms))
+		}
+	}
+
+	// The consumers. Every one of these reads doc_sel_range, and the fix moves
+	// what doc_sel_range returns.
+	@(private = "file")
+	sa_part_consumers :: proc(bad: ^int) {
+		fmt.println("-- the consumers of the selection --")
+		// 14 bytes: "alpha\nbeta\n" is the content through its terminator (11),
+		// then three blank rows.
+		FIX :: "alpha\nbeta\n\n\n\n"
+		{
+			// Copy. The exact bytes Ctrl+A Ctrl+C puts on the clipboard.
+			d := sa_doc(FIX)
+			defer doc_close(&d)
+			doc_select_all(&d)
+			got := doc_selected_text(&d, context.temp_allocator)
+			li_chk(bad, got == "alpha\nbeta\n", fmt.tprintf("Copy takes %q", got))
+			// The status bar's "N selected" is literally hi - lo (main.odin).
+			lo, hi := doc_sel_range(&d)
+			li_chk(bad, hi - lo == 11, fmt.tprintf("the status bar reads \"%d selected\" of %d bytes", hi - lo, d.pt.length))
+		}
+		{
+			// Cut / Backspace. THE data-loss seam: a select-all that is right in
+			// isolation and wrong here would delete the wrong bytes.
+			d := sa_doc(FIX)
+			defer doc_close(&d)
+			doc_select_all(&d)
+			doc_backspace(&d)
+			li_chk(bad, doc_debug_string(&d) == "\n\n\n", fmt.tprintf("Ctrl+A Backspace leaves the blank tail %q", doc_debug_string(&d)))
+			li_chk(bad, d.cursor == 0 && !doc_has_sel(&d), fmt.tprintf("...with the caret at %d and no selection", d.cursor))
+		}
+		{
+			// Delete forward, the other half of the same seam.
+			d := sa_doc(FIX)
+			defer doc_close(&d)
+			doc_select_all(&d)
+			doc_delete_fwd(&d)
+			li_chk(bad, doc_debug_string(&d) == "\n\n\n", fmt.tprintf("Ctrl+A Delete leaves %q", doc_debug_string(&d)))
+		}
+		{
+			// Paste over the selection.
+			d := sa_doc(FIX)
+			defer doc_close(&d)
+			doc_select_all(&d)
+			doc_insert_text(&d, transmute([]u8)string("new\n"))
+			li_chk(bad, doc_debug_string(&d) == "new\n\n\n\n", fmt.tprintf("Ctrl+A Paste leaves %q", doc_debug_string(&d)))
+		}
+		{
+			// Tab over the selection: commands.odin's .Insert_Tab replaces it with
+			// one tab, exactly as typing any other character does.
+			d := sa_doc(FIX)
+			defer doc_close(&d)
+			doc_select_all(&d)
+			doc_insert_rune(&d, '\t')
+			li_chk(bad, doc_debug_string(&d) == "\t\n\n\n", fmt.tprintf("Ctrl+A Tab leaves %q", doc_debug_string(&d)))
+		}
+		{
+			// The column rectangle is dropped, the same as it always was --
+			// doc_select_all bypasses set_cursor, so this is explicit and has to
+			// survive the rewrite.
+			d := sa_doc(FIX)
+			defer doc_close(&d)
+			d.block = true
+			d.block_anchor_line_start = 0
+			d.block_anchor_cell = 1
+			d.block_cursor_line_start = 6
+			d.block_cursor_cell = 3
+			doc_select_all(&d)
+			li_chk(bad, !block_active(&d), "a live column rectangle is dropped by Ctrl+A")
+			li_chk(bad, d.block_anchor_cell == 0 && d.block_cursor_cell == 0, "...and its geometry is zeroed, not left stale")
+		}
+	}
+
+	// The highlight rects -- the seam between what is SELECTED and what is DRAWN
+	// as selected. Compared as counts against the whole-buffer press on the same
+	// document, so the check cannot pass by the two agreeing on nothing.
+	//
+	// A real device, per CLAUDE.md: the rect count comes out of the product's own
+	// visible-row walk and its real cell measurements, not out of arithmetic here.
+	@(private = "file")
+	sa_part_rects :: proc(bad: ^int) {
+		fmt.println("-- the highlight rects --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "selalltest") {
+			li_chk(bad, false, "an offscreen device came up, so the rects could be measured")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		// 7 bytes: rows "a", "b", "", "", "" and the empty row past the last
+		// newline. The content ends at 4, one past the 'b' row's terminator.
+		d := sa_doc("a\nb\n\n\n\n")
+		defer doc_close(&d)
+		px := f32(16)
+		cw := plat.text_char_width(&h.text, px, .Doc)
+		q: [64]plat.Quad
+		doc_select_all(&d)
+		_, hi := doc_sel_range(&d)
+		trimmed := doc_selection_rects(&d, &h.text, px, cw, 10, q[:])
+		li_chk(bad, hi == 4, fmt.tprintf("the trimming press selects [0,%d) (want 4)", hi))
+		li_chk(bad, trimmed == 2, fmt.tprintf("...and paints %d rows (want 2: \"a\" and \"b\")", trimmed))
+		doc_select_all(&d)
+		whole := doc_selection_rects(&d, &h.text, px, cw, 10, q[:])
+		li_chk(bad, whole > trimmed, fmt.tprintf("the extending press paints MORE rows (%d against %d)", whole, trimmed))
+		// The exact number, because "more" would pass on an off-by-one. Five, not
+		// six: doc_selection_rects skips the empty row past the final newline,
+		// which is the drawing the bug report was actually looking at.
+		li_chk(bad, whole == 5, fmt.tprintf("...%d of them (want 5; the row past the final newline is never painted)", whole))
+	}
+
+	// The two read-only views. Ctrl+A is not a mutating command, so it runs there
+	// as it always has -- what this pins is that it does the SAME thing it does in
+	// the text view and touches nothing belonging to the view.
+	@(private = "file")
+	sa_part_views :: proc(bad: ^int) {
+		fmt.println("-- the table grid and the markdown preview --")
+		if !require_scratch_session("selalltest") {
+			// Counted as a failure rather than skipped: a part that quietly does
+			// nothing when an environment variable is unset is a part nothing runs.
+			li_chk(bad, false, "NEWTPAD_SESSION_DIR is set, so the dispatch part could run")
+			return
+		}
+		app: App
+		defer app_destroy(&app)
+		d := new(Document)
+		d^ = sa_doc("a,b\nc,d\n\n\n") // 10 bytes; the content ends at 8
+		app_activate(&app, app_add(&app, d))
+		dummy: plat.Window
+		dtext: plat.Text
+		// Through the real command path, not by calling doc_select_all: the
+		// keystroke has to reach it.
+		command_dispatch(.Select_All, {}, &app, &dummy, &dtext, 10)
+		_, hi_text := doc_sel_range(d)
+		li_chk(bad, hi_text == 8, fmt.tprintf("Ctrl+A through command_dispatch trims in the text view (%d, want 8)", hi_text))
+
+		command_dispatch(.Toggle_Table, {}, &app, &dummy, &dtext, 10)
+		li_chk(bad, d.table, "the CSV opens in the grid")
+		d.cursor, d.anchor = 0, 0 // a fresh press, not the extend
+		command_dispatch(.Select_All, {}, &app, &dummy, &dtext, 10)
+		_, hi_grid := doc_sel_range(d)
+		li_chk(bad, hi_grid == hi_text, fmt.tprintf("...and Ctrl+A in the grid does exactly what it does in the text view (%d, want %d)", hi_grid, hi_text))
+		li_chk(bad, d.table && !d.table_editing, "...and touches nothing belonging to the grid")
+
+		command_dispatch(.Toggle_Table, {}, &app, &dummy, &dtext, 10) // back to text
+		d.md_mode = .Preview
+		d.cursor, d.anchor = 0, 0
+		command_dispatch(.Select_All, {}, &app, &dummy, &dtext, 10)
+		_, hi_md := doc_sel_range(d)
+		li_chk(bad, hi_md == hi_text, fmt.tprintf("...and so does Ctrl+A in the markdown preview (%d, want %d)", hi_md, hi_text))
+		li_chk(bad, d.md_mode == .Preview, "...leaving the preview open")
+	}
+
 	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the
 	// icontest mode's independent PNG decoder below. File-scope (not local to
 	// the icontest block) because Odin's nested proc declarations don't close
@@ -30203,6 +30599,13 @@ when NEWTPAD_TESTS {
 		// checker, which is what the mode was originally for.
 		if os.args[1] == "resavetest" {
 			resave_test_run(os.args[2] if len(os.args) > 2 else "")
+			return true
+		}
+
+		// `newtpad selalltest` -- one-argument, no path, sweepable. Ctrl+A's
+		// trailing-blank-row trim and everything downstream of it.
+		if os.args[1] == "selalltest" {
+			select_all_test_run()
 			return true
 		}
 
