@@ -57,6 +57,67 @@ when NEWTPAD_TESTS {
 	// Its own proc rather than a `case` body for the usual reason (§6,
 	// test_mode_dispatch's frame has hit STATUS_STACK_OVERFLOW twice) and because a
 	// summary line plus an exit code needs somewhere to live.
+	// The window must NOT be on screen until a frame has been presented into it.
+	//
+	// This is the guard for the "white box for a split second" report. Measured on
+	// real desktop pixels, `WS_VISIBLE` on the CreateWindowExW call put an empty
+	// window up 20 ms into startup and left it solid white until the first present
+	// at ~220 ms, because gfx_init alone is ~135 ms of that and hbrBackground is
+	// (correctly) unset, so nothing of ours chose what filled the gap.
+	//
+	// It asks the OS, not the source: `IsWindowVisible` after window_create, a real
+	// present, then `IsWindowVisible` after window_show. Re-adding WS_VISIBLE fails
+	// the first check no matter how the style is spelled.
+	//
+	// What it deliberately does NOT claim to cover: that main.odin still calls
+	// window_show AFTER render_frame rather than before. That is an ordering inside
+	// one procedure, and asserting it would mean matching source text -- the brittle
+	// shape HANDOFF §7 already flags on `tablegridtest`. The comment at `first_frame`
+	// in main.odin carries that half.
+	//
+	// Its own proc, and it holds no App at all: test_mode_dispatch's frame has hit
+	// STATUS_STACK_OVERFLOW twice (development-loop.md §6).
+	@(private = "file")
+	window_show_test_run :: proc() {
+		bad := 0
+		chk :: proc(bad: ^int, ok: bool, what: string) {
+			fmt.printfln("  %-52s %s", what, "OK" if ok else "FAIL")
+			if !ok {bad^ += 1}
+		}
+		fmt.println("--- windowshowtest: create hidden, present, then show ---")
+		window := plat.window_create("Newtpad windowshowtest", 640, 480)
+		chk(&bad, window != nil && window.hwnd != nil, "window_create returned a window")
+		if window == nil || window.hwnd == nil {
+			fmt.println("windowshowtest: 1 failures")
+			os.exit(1)
+		}
+		chk(&bad, !plat.window_is_visible(window), "NOT visible straight after window_create")
+
+		gfx, ok := plat.gfx_init(window)
+		if !ok {
+			fmt.eprintln("windowshowtest: gfx init failed")
+			fmt.println("windowshowtest: 1 failures")
+			os.exit(1)
+		}
+		// Still hidden after the whole graphics stack comes up -- this is the span
+		// the flash used to occupy.
+		chk(&bad, !plat.window_is_visible(window), "NOT visible after gfx_init (the ~135 ms the flash filled)")
+
+		plat.gfx_begin_frame(&gfx, 0.11, 0.12, 0.13)
+		st := plat.gfx_end_frame(&gfx, 0)
+		chk(&bad, st == .Ok, "a frame presents into the hidden window")
+		chk(&bad, !plat.window_is_visible(window), "still NOT visible after the present, before window_show")
+
+		plat.window_show(window)
+		chk(&bad, plat.window_is_visible(window), "visible after window_show")
+
+		plat.window_hide(window)
+		chk(&bad, !plat.window_is_visible(window), "hidden again after window_hide (the exit path)")
+
+		fmt.printfln("windowshowtest: %d failures", bad)
+		if bad > 0 {os.exit(1)}
+	}
+
 	@(private = "file")
 	keytest_run :: proc(path: string) {
 		if !require_scratch_session("keytest") {return}
@@ -3999,7 +4060,43 @@ when NEWTPAD_TESTS {
 			watch_publish_part(&bad, dir, WATCH_MAX + 8, WATCH_MAX + 7)
 			watch_publish_part(&bad, dir, 5, 2)
 
+			// watcher_stop must not wait out the poll interval.
+			//
+			// This is the shutdown half of the "no longer snappy" report. The worker
+			// used to spend the second between cycles as twenty 50 ms sleeps with a
+			// cancel check between them, so an exit landing mid-slice paid whatever
+			// was left of it: measured on the real exit path, a median of 18-27 ms
+			// and a worst case of 58 ms, purely waiting for a sleep to end. It is
+			// now one wait that watcher_stop posts, and the same measurement is
+			// 0.13 ms.
+			//
+			// The 150 ms settle is what gives this teeth: it parks the worker firmly
+			// INSIDE the wait rather than catching it between cycles, so a
+			// regression cannot pass on luck of timing. The bound is deliberately
+			// loose -- this is not a performance assertion, it is "did the post
+			// happen at all", and the two states it separates are 0.1 ms and up to
+			// 1000 ms, not 20 ms and 25 ms. Tightening it would only make it flaky
+			// on a loaded machine without rejecting anything more.
+			{
+				w: Watcher
+				watcher_start(&w)
+				time.sleep(150 * time.Millisecond) // let it finish a cycle and enter the wait
+				t0 := time.tick_now()
+				watcher_stop(&w)
+				ms := time.duration_milliseconds(time.tick_since(t0))
+				ok_join := ms < 25
+				fmt.printfln("  %-6s watcher_stop joins a waiting worker in %.2f ms (want < 25)", "ok" if ok_join else "FAIL", ms)
+				if !ok_join {bad += 1}
+			}
+
+			// Exit code, not just a printed FAIL. Every assertion above used to
+			// print into a sweep that greps stdout and exits 0 regardless -- the
+			// "printing FAIL to nobody" trap that development-loop.md §6 names, and
+			// which HANDOFF §7 already lists as owed for this mode among others.
+			// The join assertion added below it is a timing check, so it is exactly
+			// the kind that has to be able to fail a build rather than a reader.
 			fmt.printfln("watchtest: %d failures", bad)
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
@@ -30106,6 +30203,12 @@ when NEWTPAD_TESTS {
 		// checker, which is what the mode was originally for.
 		if os.args[1] == "resavetest" {
 			resave_test_run(os.args[2] if len(os.args) > 2 else "")
+			return true
+		}
+
+		// `newtpad windowshowtest` -- one-argument, no path, sweepable.
+		if os.args[1] == "windowshowtest" {
+			window_show_test_run()
 			return true
 		}
 
