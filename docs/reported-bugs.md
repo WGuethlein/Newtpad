@@ -11,6 +11,44 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
+## Startup and shutdown are no longer snappy, with a white flash
+
+**Reported 2026-07-31 by Wyatt**, on v0.34.1/0.34.2: *"when opening and closing the app it's no longer
+snappy... it'll show a white box for a split second, then close/open."*
+
+**"No longer" makes this a regression, and the prime suspects are ours.** Do not fix by inspection —
+**measure first**, because there are at least four plausible contributors and two were added today.
+
+### The white box is almost certainly window-show ordering, not slowness
+
+`window_create` calls `CreateWindowExW` (`platform/window.odin:379`) and there is **no `ShowWindow`
+anywhere near it**, so the window is created already visible and DWM composites it before D3D presents
+the first frame. `WNDCLASSEXW.hbrBackground` is never assigned either (`grep hbrBackground` returns
+nothing), so what fills that gap is not ours to choose.
+
+The standard fix is to create the window **without** `WS_VISIBLE`, render and present one frame, then
+`ShowWindow`. Modern alternative: `DWMWA_CLOAK` until the first present. Either way this is a
+correctness-of-ordering fix and is probably independent of the slowness — **verify that before
+bundling them**, since a white flash and a slow close may be two separate reports in one sentence.
+
+### For the slowness, measure these before touching anything
+
+- **`WATCH_MAX` went 32 → 64 today** (§6ax). `watcher_stop` does a `thread.join`, and `watch_worker`'s
+  own comment says a stat *"can block for many seconds on an unreachable share"*. Twice the files is
+  twice the stats per cycle and a longer worst-case join. **This is the most likely regression and it
+  is ours.**
+- **The line index** now allocates `len(content)/LINE_CKPT_STRIDE + 1` checkpoints on open and is
+  joined on close (`doc_index_stop`).
+- **Snapshots carry cloned checkpoint arrays** since the ckpt-repair work, and `UNDO_MAX` is 200. The
+  ckpt-repair report already flags ~100 MB at full undo depth on a 2 GB file; freeing that at close is
+  a real cost that did not exist yesterday.
+- **`session_save`** on the hot-exit path (`main.odin:1256`) writes unsaved buffers. Independent of
+  today's work but it is on the close path and should be timed rather than assumed innocent.
+
+**Time each phase separately** — process start → first present, and last input → process exit — rather
+than reporting one number for "startup". A fix aimed at the wrong phase will look like it worked
+because the other phase dominates.
+
 ## "The preview does not always respect spaces" — one defect fixed, needs Wyatt's confirmation
 
 **Reported 2026-07-29** with a side-by-side screenshot of the editor and the preview: *"it looks like it's
