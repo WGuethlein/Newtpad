@@ -44,6 +44,67 @@ Decisions that change the build:
 highlighting. A formatter over its token stream inherits the bounding and cannot disagree with the
 highlighter about what a token is. **Do not write a second JSON parser.**
 
+### Mermaid diagrams in the markdown preview
+
+**Requested 2026-07-31 by Wyatt**, with the reason attached: *"I will be using spec driven design
+heavily on new projects and this is a large piece of interacting with it."* He also asked the right
+question himself — built-in, or a V2 plugin?
+
+**Recommendation: first-party, and a named subset — not "full mermaid", and not a plugin.** Three
+separate judgements, because they have three different reasons.
+
+**Why not a plugin.** The plugin system does not exist and is V2, so "make it a plugin" resolves to
+"not until V2", which does not serve the stated need. Worse, the C-ABI is scoped to *"formatters +
+viewers"* on the assumption that a viewer returns **text or a bitmap**. A diagram that participates in
+the preview — scrolling with it, scaling with DPI, theming with the palette, selectable — needs
+either a rich drawing ABI or a quad-list-and-glyph-run ABI, and that is a much wider surface than the
+plugin row was scoped for. **Building it in-house first is how the viewer ABI gets designed from a
+real client instead of speculatively**, and it can be extracted to a plugin afterwards. This is the
+same shape as the JSON-formatter question above and should be answered the same way.
+
+**Why not "full mermaid".** Mermaid is not one format, it is ~15 (flowchart, sequence, class, state,
+ER, gantt, pie, journey, gitgraph, mindmap, timeline, quadrant, C4, sankey, requirement), each with
+its own grammar *and its own layout algorithm*. `mermaid.js` is larger than all of Newtpad. Newtpad is
+~11k lines of Odin total; committing to the whole spec is committing to more code than the product.
+**Name the subset and ship it, rather than shipping 40% of everything.**
+
+**The subset that matches the stated use.** Spec-driven design is overwhelmingly two diagram types:
+
+- **`flowchart` / `graph`** — boxes, edges, labels, subgraphs.
+- **`sequenceDiagram`** — participants, messages, activations, notes.
+
+Those two also happen to be the two with well-understood published layout algorithms. `stateDiagram`
+falls out of the flowchart engine nearly free (same layered layout, different node shapes). `classDiagram`
+and `erDiagram` are a later, separate decision.
+
+**The hard part is layout, not drawing.** This is the thing to be clear-eyed about before scheduling
+it: drawing is quads and glyphs, which this codebase already has from batch 17's preview shaper. The
+work is a **layered (Sugiyama/dagre-style) graph layout** — rank assignment, crossing minimisation,
+coordinate assignment, then edge routing — and that is on the order of 1,500–2,500 lines by itself,
+independent of any parsing. A naive layout produces diagrams so ugly they are worse than the fenced
+source, so this cannot be half-done and still be worth having. **Budget it as several batches, not
+one.**
+
+**What already exists to build on:** batch 17's preview shaper (proportional text, real fonts), the
+glyph atlas, `quads.odin`, and the markdown block model that already isolates fenced blocks. A
+mermaid block is *bounded* — one fence — so a whole-block layout does not violate the viewport-first
+rule the way a whole-document pass would. A file with fifty diagrams does need **lazy per-visible-block
+layout with a cache**, which is the same shape the preview already uses.
+
+**Two things it needs that do not exist yet:**
+
+- **A real scissor rect** (already listed in §5 as owed). Clipping is currently a cover strip painted
+  after the content, and a diagram pane that scrolls needs genuine clipping.
+- **Line/curve primitives.** Everything today is axis-aligned quads. Edges need diagonal strokes and
+  either bezier flattening or orthogonal routing. Decide which before starting — orthogonal routing is
+  much less code and arguably reads better for spec diagrams.
+
+**Open question worth settling early:** does a diagram render *in the preview only*, or also inline in
+the editor (Obsidian-style)? The preview-only answer is far cheaper and consistent with how every
+other markdown view here works; the inline answer collides with §9's concealment work, which is
+already flagged as needing its own batch because it makes the drawn column stop matching the byte
+column.
+
 ### Right-click a tab to open the folder the file is in
 
 **Requested 2026-07-31 by a user, relayed by Wyatt:** *"if you could right click the tabs to open the
