@@ -12,7 +12,7 @@ once and would be a reopening, not a new idea.
 
 ---
 
-## 1. Asked for directly by Wyatt, unscheduled
+## 1. Asked for directly, unscheduled
 
 ### JSON formatting — reformat minified JSON into readable JSON
 
@@ -43,6 +43,52 @@ Decisions that change the build:
 **Build on `src/base/lex_json.odin`** — a hand-rolled, viewport-bounded JSON lexer already driving the
 highlighting. A formatter over its token stream inherits the bounding and cannot disagree with the
 highlighter about what a token is. **Do not write a second JSON parser.**
+
+### Right-click a tab to open the folder the file is in
+
+**Requested 2026-07-31 by a user, relayed by Wyatt:** *"if you could right click the tabs to open the
+folder it's located in."* Documented, not scheduled.
+
+**The action already exists; the surface does not.** `plat.explorer_select_arg` is built and in use —
+`link_follow` reveals a non-text path in Explorer through it (`links.odin`), including the escaping
+care that path needs. So this is not "implement reveal-in-Explorer", it is "give the tab strip a
+right-click".
+
+**There is no tab context menu at all.** `grep` over `ui_tabs.odin`, `menu.odin` and `app.odin` finds
+no right-click handling on the strip, so this is a new surface rather than a new row in an existing
+menu — and that is the part worth scoping deliberately, because a tab context menu invites every
+other per-tab command (close others, close to the right, copy path, pin) and CLAUDE.md principle 3
+says fight options. Decide the menu's full contents once, when it is built, rather than growing it a
+row at a time.
+
+Related and already listed in §4: *directories opening as a tab* listing contents rather than
+revealing in Explorer. If that is ever built, this request's answer changes — "open the folder" would
+mean a Newtpad tab, not an Explorer window. Worth settling the direction before building either.
+
+### Tell the user where the themes folder is
+
+**Requested 2026-07-31 by a user, relayed by Wyatt:** *"i want to create a new .theme file but not
+sure where the themes folder is on my machine."*
+
+**The likely cause is more specific than "it is undiscoverable": for that user the folder probably
+does not exist.** `themes_dir()` (`theme.odin:525`) returns `%APPDATA%\Newtpad\themes`, but
+`theme.odin:511-524` records a deliberate decision not to create it at startup — a bare read of
+`settings.txt` was `mkdir`-ing a `themes/` folder for every user who had never touched a theme, so
+creation moved to `themes_dir_ensure` at the point of actual use. Correct decision, with the
+side effect that a user looking for the folder finds nothing there and cannot tell whether they have
+the wrong path or the right one.
+
+So the fix is not documentation. Candidates, cheapest first:
+
+- **An `Open Themes Folder` command** in the palette that calls `themes_dir_ensure` and reveals it.
+  Creates the folder as a side effect of asking for it, which is exactly when it should exist.
+- **A line in Settings** next to the theme picker showing the resolved path, clickable. Settings is
+  where someone changing themes already is.
+- Both. They are the same two lines of work behind one shared `themes_dir_ensure` call.
+
+Note this generalises: `keys.txt` and `rules.txt` live under the same `%APPDATA%\Newtpad` root and
+have the same discovery problem. Whatever answer is chosen should cover all three rather than
+being built once for themes.
 
 ---
 
@@ -115,6 +161,27 @@ From HANDOFF §6aa, which is the plan of record.
 - Landing page, download, and **publish the price early and hold it** (File Pilot precedent).
 - **Code signing** — pipeline is built signing-*ready*; blocked on Wyatt purchasing a certificate.
   Never handle a certificate or its password.
+- **A Defender false-positive submission to Microsoft** — Wyatt's to file, it needs his account:
+  <https://www.microsoft.com/en-us/wdsi/filesubmission>, as "Software developer".
+
+  **Evidence, 2026-07-31.** A GitHub download of v0.33.0 failed in the browser with
+  *"Failed - Virus detected"*, and VirusTotal on that exact binary returned **1 detection out of
+  ~40**: Microsoft `Trojan:Win32/Wacatac.B!ml`. The `!ml` suffix is Microsoft's own marker for a
+  machine-learning verdict rather than a signature match, and every other ML engine on the panel —
+  **SentinelOne (Static ML), CrowdStrike Falcon**, Palo Alto, Symantec, Fortinet, McAfee,
+  Malwarebytes — returned Undetected. Real malware is what the other ML engines agree on first;
+  being the sole ML dissenter is the signature of a false positive, and `Wacatac.B!ml` is the
+  specific bucket Defender uses for unsigned, low-prevalence, freshly-built executables.
+
+  Verified locally at the same time: nothing is vendored (every binary in `build/` is produced by
+  `build.bat` from our own sources), and `update.odin` does one HTTPS GET for a version string with
+  no `CreateProcess`, no `ShellExecute` of a downloaded file and no `MoveFileEx` self-replacement —
+  so Newtpad cannot download and run anything, which is the behaviour a dropper heuristic looks for.
+
+  **One of the two reputation signals is already gone:** the exe had *no version resource at all*
+  until 2026-07-31 (empty `FileVersion`, `CompanyName`, `ProductName`, `FileDescription`), now fixed.
+  Signing removes the other. The submission is what clears it for existing Defender installs in the
+  meantime, and it clears it for everyone, not just the reporter.
 
 **V1 (paid), after the beta**
 - **Trial**, **offline license key**, **storefront** — informed by beta feedback.
