@@ -4921,6 +4921,70 @@ someone rewrite a working process.
 - Confirm whether the `-define:NEWTPAD_TESTS` gap above is real, and if so make the bisectability sweep
   check the configuration that actually ships.
 
+## 6ba. The white flash was real and the regression was not (2026-07-31, v0.34.3, branch `fix/startup-shutdown`)
+
+Wyatt: *"when opening and closing the app it's no longer snappy... it'll show a white box for a split
+second, then close/open."* Two reports in one sentence, and they turned out to be **one real defect and
+one false alarm** — which is only knowable because this was measured before anything was changed.
+
+### There is no regression, and the suspicion was mine
+
+v0.32.0, v0.33.0, v0.34.0, v0.34.1 and v0.34.2 were each built from their tags and timed with the same
+harness against Wyatt's real session (6 tabs including a 1.05 GB file): **white flash 196 ms and
+WM_CLOSE→exit 89–157 ms in all five**, flat within noise. Nothing that shipped that day made it slower.
+The flash had been there all along and was noticed for the first time.
+
+**The prime suspect was wrong, and wrong in the interesting direction.** `WATCH_MAX` had gone 32 → 64
+that morning (§6ax) and the entry named it *"the most likely regression and it is ours"*. At 40 open
+tabs, where the values actually differ, `watcher_stop` measured **26.9 ms at 32** and **18.2 ms at
+64** — the old value was *slower*. Had this been fixed by inspection, the change would have been
+reverted, the symptom would have remained, and the revert would have looked like a fix that failed for
+some other reason. **This is the argument for the measure-first rule in one paragraph.**
+
+The other three suspects: line-index join **0.00 ms** (including the 1.05 GB tab, and including closing
+300 ms after launch mid-scan — `index_worker` polls cancel every 64 KB); snapshot checkpoint frees
+**0.00 ms** (a restored session has an empty undo stack); `session_save` **33 ms**, the largest thing
+left on the exit path and deliberately untouched, because it writes the backups that are the only copy
+of an unsaved buffer.
+
+### What was actually wrong
+
+**`CreateWindowExW` passed `WS_VISIBLE`**, so an empty window went up 20 ms into startup and DWM
+composited it long before D3D presented anything — solid `FFFFFF` on real desktop pixels by ~85 ms,
+still white at ~200 ms, first Newtpad frame at ~220 ms. What filled the gap was **`gfx_init` at 133 ms**
+of D3D11 device and swapchain creation: nothing wasteful in it, it simply must not be watched. The
+window is now created hidden, shown after the first present, and hidden again the instant the loop
+exits. **The non-obvious part: a hidden window is sent no `WM_PAINT`**, so the first loop iteration has
+to skip the idle wait or startup becomes 1220 ms.
+
+**And `watch_worker` slept its poll interval in twenty 50 ms naps**, so exit paid out whatever was left
+of one — 24 ms median, 58 ms worst. Now a posted `sync.Sema`: **0.13 ms**.
+
+| | before | after |
+|---|---|---|
+| white box on screen | **196 ms** | **0 ms** |
+| WM_CLOSE → exit | 129 ms | **77 ms** |
+| `watcher_stop` | 24.2 ms (4–58) | **0.13 ms** |
+| window starts vanishing | 40–105 ms | ~7 ms |
+
+**Wyatt signed off the trade** this makes: nothing on screen for ~220 ms and then a finished window,
+where before an empty white one appeared at 28 ms. Time to a *usable* window is unchanged either way.
+He also chose to keep `perf.odin` — an environment-gated (`NEWTPAD_PERF`) mark timeline, free when
+unset, added because a GUI-subsystem exe cannot print and this project keeps needing numbers it has no
+way to take.
+
+### Owed, and item 1 is a real risk
+
+- **Does the window still take focus on launch?** `WS_VISIBLE` at creation got activation from the
+  shell's launch rules for free; a window shown 220 ms later does not, so `window_show` calls
+  `SetForegroundWindow`. It measured identical to the old build here, but **this environment cannot
+  reproduce a real shell launch** — needs the shortcut and an Explorer double-click. One line to
+  reverse.
+- **High DPI is unverified**; everything was measured at 96 DPI.
+- **220 ms to first frame is 133 ms of `D3D11CreateDevice`.** Getting on screen sooner means painting a
+  themed placeholder before the GPU is ready — a design decision, not a bug fix, and Wyatt was offered
+  it and chose the blank.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
