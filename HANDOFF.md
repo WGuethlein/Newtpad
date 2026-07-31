@@ -4663,12 +4663,154 @@ to hold the same number." There were four; the page keys got the editor's count.
 - **The sort inherits two constraints nothing enforces:** keystrokes are dropped on a reorder (a UX
   decision worth making deliberately rather than inheriting), and `Sort_Lines` is still refused in table
   view by `doc_read_only_view && command_mutates_doc`, so enabling it means loosening that guard.
-- **`keytest` is now the only mode that exits non-zero.** Correct here, but the suite's failure signalling
-  is inconsistent; worth deciding once for all modes.
+- **`keytest`, `palettetest`, `lineidxtest` and `resavetest` exit non-zero; nothing else does** — notably
+  not `tablegridtest`, which asserts a hundred things about a data-loss seam and still only prints them.
+  Correct in each case that has one, but the suite's failure signalling is inconsistent and a sweep that
+  greps for `FAIL` case-insensitively matches "0 failures"; worth deciding once for all modes.
 - Two asymmetries left by the find-bar fix: `Alt+Shift+Left/Right` still extends a column rectangle from
   the find bar while `Alt+Shift+Up/Down` no longer does, and `Ctrl+C`/`Ctrl+A` still act on the document.
 - `find_paste` truncates silently at 1024 bytes — defensible for a one-row query field, but nobody was
   asked.
+
+## 6ax. The rest of the table view, and the index that three features were waiting on (2026-07-31, v0.34.0, branch `feat/batch-18-rest`)
+
+Batch 18 finished — §10 groups B and C — plus three of the four queued bugs and the exe's missing
+version resource. 34 commits. Plan:
+[2026-07-31-batch-18-rest.md](docs/superpowers/plans/2026-07-31-batch-18-rest.md). Wyatt's scope call
+kept §15's empty tab and §8's editor details owed.
+
+### The blocker nobody had named: there was no absolute row index
+
+Three separate §10 rules were unbuilt for the same reason, and `table.odin` said so in its own words —
+zebra parity rode the *visible* row index because *"a data row's absolute index is not knowable without
+counting newlines from byte 0, which is unbounded on a multi-GB CSV"*. Row numbers need it, the sort
+needs it to enumerate rows at all, and §6aw had already deferred parity to *"whatever group B decides
+for the row-number gutter's absolute index"*. `Line_Index` walked every newline on a worker thread and
+published **only a total**.
+
+So the first task was §14's owed sparse index, which `requested-features.md` had listed as two-thirds
+built: checkpoints every 64 KiB plus `doc_line_no_at(at) -> (line_no, exact)`, bounded by a binary
+search plus one stride of forward scanning.
+
+**The plan specified a 4096-*line* stride and was wrong.** A line stride makes the array's size
+unknowable up front, forcing a `[dynamic]` the worker grows — **which reallocates and frees the backing
+store under a reader mid-lookup**, and no amount of ordering the published count fixes a moved base
+pointer. A byte stride makes the size exact, so it is allocated once before the worker exists. Worth
+recording because the plan was reviewed and shipped that defect anyway; the implementer caught it.
+
+### The gutter blanked after every save, and that was not acceptable
+
+The first version gated on an `edit_floor` that only ever *falls*, and `doc_save` does not restart the
+index — so editing one cell near the top of a CSV blanked every row number below it and **saving did
+not bring them back**. Wyatt rejected it directly.
+
+The root cause is a coordinate-space split: checkpoints record `(offset, line_no)` in the **original
+file's** coordinates while `doc_line_no_at` is asked in **document** offsets, and those coincide only
+while the document is unedited. A save writes bytes to disk and reconciles nothing.
+
+The fix is a second mode. Before the worker is `done`, the old scheme byte-for-byte. After, the array
+moves into **document coordinates** and is repaired on every edit — shift the entries above, compact
+out the destroyed, leave `offset <= at` alone — found by binary search and bounded by an explicit
+`CKPT_SCAN_CAP`. Undo, redo and history-jump carry a cloned array on the `Snapshot`; every other
+tree-swapping path routes through `doc_index_start`, which clears the flag. **Ten such paths were
+enumerated by grep, not by memory**, because a missed one returns a confidently wrong line number
+rather than a blank. Cost: 4.99 ns/entry, ~5 µs per edit at 64 MB.
+
+### What group C got right, and the bug the enumeration found
+
+The sort is a permutation over row offsets landing in `table_row_start` **and nowhere else**. The draw
+no longer walks lines itself — it takes row 0 from the producer and steps with `table_row_next`, which
+*is* that producer's own step, so "what is drawn == what is clickable" is construction rather than two
+walks agreeing. `doc.top` stays a real byte offset in every mode, which is what leaves the edit anchor,
+view exit, session and find jumps working untouched.
+
+**Walking the consumer list found a real bug that no test had.** `table_abs_rows` built a *run* of
+consecutive line numbers from a single lookup — correct only while visible rows are consecutive lines.
+Under a sort the gutter would have printed 1 2 3 4 5 over lines 5 1 3 2 4, with the zebra parity
+following it. That is the whole argument for the enumeration being a required step and not a
+formality.
+
+### What this batch got wrong
+
+**The sort's ceiling was a round number pretending to be a measurement.** `TABLE_SORT_MAX` was
+1,000,000 and the comment claimed that was *"where a synchronous build stops being instant"*. Measured:
+**2,046 ms at `-o:speed`**. A two-second stall on a header click is not a slow feature, it is a hung
+window, and product principle 1 does not exempt a click on a column header. Now 100,000, which measures
+285 ms — **and the number is in the comment, so the next person to raise it has to argue with a
+measurement instead of a vibe.** The refusal test spelled the old ceiling out as a literal and went red
+on a change it should have had no opinion about; it now parses the number back out of the message and
+compares it to the constant, which is strictly stronger — a literal cannot tell "the ceiling changed"
+from "the message stopped naming a ceiling at all".
+
+**The row-number gutter shipped an eighth instance of Shape A and the whole-branch review caught it.**
+`table_abs_rows` asserted *"visible rows are consecutive lines by construction"*. False:
+`pt_line_end_cap` returns a synthetic break at `RENDER_LINE_CAP`, so a CSV row over 8 KB — a
+description or JSON column, not an exotic file — becomes several visible rows, and every row below it
+was numbered wrongly **with `exact = true`**, in the one procedure whose second result exists to
+prevent exactly that. `table_row_next` now reports whether the step was a real newline, and
+continuation rows land as `TABLE_ABS_NONE`. The same byte peek exposed a smaller pre-existing defect:
+the step returned `e + 1` at a synthetic break, swallowing one content byte per 8 KiB.
+
+**`Ctrl+T` off did not clear the sort, while a comment nearby said it did.** `leave_table_view` clears
+it with a written policy — *"the sort is a property of the VIEW"* — and `.Toggle_Table`'s own
+off-branch cleared the column widths, called `table_user_widths_clear`, and stopped. So the sort
+silently reappeared on the next toggle, and worse, `table_sort_shift` gates on `s.col` rather than on
+`doc.table`, so a document that had *once* been in the grid ran an O(rows) pass per keystroke **in the
+plain text editor**. The fix also found a third leave path the review had not named (`doc_view_apply`).
+
+**Roughly ten assertions across this branch could not fail**, most of them in freshly written test
+code, and three separate agents caught their *own* vacuous sabotages — one used a scope-scoped `defer`
+that ran before the mutation it was meant to sabotage; one asserted a substring that matched the
+original line inside the damaged one; one wrote a "no sort in the summary" check that stayed green
+because a stale refusal clause hid the stale sort. That is ten consecutive batches in which draft test
+code was wrong, and the shape has not changed: **an assertion whose fixture never reaches the condition
+it names.**
+
+### Also landed
+
+- **The exe had no version resource at all** — empty `FileVersion`, `CompanyName`, `ProductName`,
+  `FileDescription` on every build ever shipped. Generated from `NEWTPAD_VERSION` so a bump still
+  touches one file, with `version.odin` added to `res-stale.ps1`'s sources, and `release.ps1` now
+  refuses to tag when the built exe's `FileVersion` disagrees with the version it derived. Context in
+  §5: a GitHub download failed with "Virus detected" and VirusTotal returned **1 of ~40**, Microsoft's
+  `Wacatac.B!ml`, while every other ML engine on the panel returned clean.
+- **`command_named`** — palette/menu/status-bar/find-bar dispatch passes a zero `Key_Event`, so two
+  `Block_Extend` rows that gate on `ev.shift` were listed, matched, highlighted, run, and did nothing.
+  Fixed at the class: a modifier gate written to preserve a *bare chord* must not apply to an
+  invocation the user named.
+- **The watcher cap.** `MAX_TABS :: 32` was the watcher's budget and its own comment had to say so
+  because the name claimed otherwise. Now `WATCH_MAX :: 64` in `watch.odin`, and **the active document
+  is published first regardless of slot** — a cap has to fall somewhere but not on the buffer the user
+  is about to save over.
+- **Four modes given real exit codes** (`palettetest`, `lineidxtest`, `resavetest`, `tablegridtest`),
+  and `resavetest`/`watchtest` made one-argument. `palettetest` printed `FAIL` from four places and
+  exited 0 from all of them.
+
+### Owed
+
+- **A live pass on the mouse work.** `table_edge_at`, `table_col_resize`, `table_col_fit` and the
+  `Drag_Latches` entry are all tested directly, but the drag/double-click/cursor wiring in `main.odin`
+  is verified **by reading source only** — this environment cannot inject GUI input. Also worth a look:
+  a CSV whose first data row has a >8 KB field (the tail row should show no number, rows below should
+  read correctly), and edit → save → gutter.
+- **`Ctrl+A` trailing blank rows is investigated and decided but not built.** Measured: the rows are
+  real bytes. Wyatt's three decisions are in `docs/reported-bugs.md`, along with the two constraints
+  that will otherwise be missed — the rule is row-aware rather than a whitespace trim, and the backward
+  scan needs a cap or it freezes on a huge blank tail.
+- **The `renderer`/`ui` extraction got measurably harder.** `doc.odin` → `table.odin` went from **1 call
+  site to 8**, all pointing upward under the planned boundary; the sharpest is `pt_edit_replace` →
+  `table_sort_shift`, the buffer-write primitive now calling into a view module beside `ckpt_repair` and
+  `bookmarks_shift_replace`. This was the right call here — "hook the one procedure nothing can avoid"
+  is why the sort's lifetime is correct by construction — but **design the observer list before
+  extracting, not during.**
+- A growing log's tail loses its row numbers past `CKPT_SCAN_CAP`: `ckpt_repair` shifts and compacts but
+  never *adds* a checkpoint, so an append over 128 KiB outruns the scan. It refuses rather than guessing.
+- `Replace All` pays the checkpoint repair per match (~0.4 s for 10k matches on 512 MB, **estimated, not
+  measured** — the one number on the branch that is arithmetic).
+- `table_byte_at` is a **third** copy of the same three-line byte peek (`doc.odin`'s `byte_at`,
+  `block.odin`'s `block_byte_at`). Promote one to `base`.
+- HANDOFF §7's mode list is materially incomplete against the ~80 modes actually dispatched.
+- The zebra parity on a continuation row falls back to `r % 2`, so a split row can band oddly.
 
 ## 7. Build environment (Windows, this machine)
 
@@ -4692,10 +4834,11 @@ to hold the same number." There were four; the page keys got the editor's count.
     `linktest`, `tabreordertest`
   - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
     `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `tablereadonlytest`,
+    `tablegridtest`,
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
-    `quadsdftest`, `scrollgrabtest`, `tabseamtest`
-  - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest <file>`,
-    `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest <dir>`
+    `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`
+  - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
+    `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
   - Two are **falsifiers**, not regression tests — they measure a claim rather than guard a
     behaviour: `menuseam` (does resolving scroll twice in one frame diverge? yes, in every case

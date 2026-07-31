@@ -1092,7 +1092,41 @@ leave_table_view :: proc(doc: ^Document) {
 	if doc.table_editing {table_edit_commit(doc)}
 	doc.table = false
 	clear(&doc.table_widths)
+	// The sort is a property of the VIEW, not of the document: leaving the grid
+	// leaves the file's own order, and doc.top is already a real line offset (the
+	// invariant Table_Sort's block comment exists to hold), so the text view opens
+	// on whatever row was at the top of the sorted screen. Cleared AFTER the commit
+	// above, which needs the permutation to resolve its own row.
+	table_sort_clear(doc)
 }
+
+// Was this command invoked BY NAME -- a palette row, a menu row, a status-bar
+// cell, a find-bar button -- rather than by pressing its chord?
+//
+// The discriminator is Key.None, which is zero (platform/window.odin) and which
+// the keyboard can never deliver: the message pump translates the VK code first
+// and drops the event outright when vk_to_key returns .None, so nothing with a
+// .None key is ever queued. So main.odin's key drain and .Menu_Activate (which
+// forwards the Enter that activated the row) always carry a real key, while
+// every by-name route dispatches a zero Key_Event -- palette_execute
+// (palette.odin), and main.odin's menu hit-test, status-bar cell and find-bar
+// button/mode chip. That already made ev.key the thing telling the two routes
+// apart; this only gives it a name, so an arm can say which one it means.
+//
+// What it is FOR: an arm gated on a modifier in order to preserve what the BARE
+// chord does must not apply that gate to a named invocation. A bare Alt+Left has
+// to keep doing nothing, exactly as an unbound key does -- but a user who found
+// "Extend Column Selection Left" in the palette and pressed Enter on it has
+// already said what they want, and there is no bare chord to protect. Without
+// this the command was listed, matched, highlighted, run, and did nothing.
+//
+// NOT a general "was a modifier held" question. An arm that reads ev.shift as a
+// DIRECTION (.Bookmark_Cycle, .Tab_Next, .Find_Confirm, the cursor moves) is
+// already right without it -- unshifted means forward, and forward is what a
+// named invocation should do. Only an arm whose non-modifier path is EMPTY has
+// the shape this fixes; as of this writing that is .Block_Extend_Left and
+// .Block_Extend_Right and nothing else.
+command_named :: proc(ev: plat.Key_Event) -> bool {return ev.key == .None}
 
 command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^plat.Window, t: ^plat.Text, rows: int) {
 	if cmd != .None {diag_cmd(cmd)} // breadcrumb: what the user was doing
@@ -1384,9 +1418,15 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// Move_Line_Up above), and this binding used to not exist at all --
 		// so a bare Alt+Left must keep doing nothing, exactly as an unbound
 		// key does. Only Alt+Shift+Left may act.
-		if ev.shift {block_extend_dispatch(app, doc, t, 0, -1)}
+		//
+		// command_named is the escape hatch for the route that has no chord to
+		// protect: both of these are in the palette, and palette_execute
+		// dispatches a zero Key_Event, so on the shift test alone they were rows
+		// that ran and did nothing. Their Up/Down siblings below never needed the
+		// gate and so never grew the hole.
+		if ev.shift || command_named(ev) {block_extend_dispatch(app, doc, t, 0, -1)}
 	case .Block_Extend_Right:
-		if ev.shift {block_extend_dispatch(app, doc, t, 0, 1)}
+		if ev.shift || command_named(ev) {block_extend_dispatch(app, doc, t, 0, 1)}
 	case .Block_Extend_Up:
 		// Unreachable from the default keymap (Alt+Up already means
 		// Move_Line_Up, handled above) -- reachable only from the palette or
@@ -1493,6 +1533,19 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				table_compute_widths(doc, t) // fix the columns now, so they don't shift on scroll
 			} else {
 				clear(&doc.table_widths) // recompute on next open (content may have changed)
+				// Manual column widths last as long as the grid is open, no
+				// longer: the next open re-samples, and the column at index 3
+				// after an edit may not be the column the user narrowed.
+				table_user_widths_clear(doc)
+				// ...and so does the sort, by leave_table_view's written policy: it
+				// is a property of the VIEW, so leaving the grid leaves the file's
+				// own order. This is the PRIMARY way to leave and it was the one
+				// path that did not clear -- so the sort silently came back on the
+				// next Ctrl+T, accent arrow and summary text and all, with nothing
+				// having said it survived. It also left table_sort_shift running an
+				// O(rows) pass per keystroke in the plain text editor for any
+				// document that had been in the grid once.
+				table_sort_clear(doc)
 			}
 			// Learn the family default so the next tabular file opens the same way.
 			// Gated on remember_views: with it off the Settings value is a pin, not a

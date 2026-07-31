@@ -12,7 +12,7 @@ once and would be a reopening, not a new idea.
 
 ---
 
-## 1. Asked for directly by Wyatt, unscheduled
+## 1. Asked for directly, unscheduled
 
 ### JSON formatting — reformat minified JSON into readable JSON
 
@@ -43,6 +43,113 @@ Decisions that change the build:
 **Build on `src/base/lex_json.odin`** — a hand-rolled, viewport-bounded JSON lexer already driving the
 highlighting. A formatter over its token stream inherits the bounding and cannot disagree with the
 highlighter about what a token is. **Do not write a second JSON parser.**
+
+### Mermaid diagrams in the markdown preview
+
+**Requested 2026-07-31 by Wyatt**, with the reason attached: *"I will be using spec driven design
+heavily on new projects and this is a large piece of interacting with it."* He also asked the right
+question himself — built-in, or a V2 plugin?
+
+**Recommendation: first-party, and a named subset — not "full mermaid", and not a plugin.** Three
+separate judgements, because they have three different reasons.
+
+**Why not a plugin.** The plugin system does not exist and is V2, so "make it a plugin" resolves to
+"not until V2", which does not serve the stated need. Worse, the C-ABI is scoped to *"formatters +
+viewers"* on the assumption that a viewer returns **text or a bitmap**. A diagram that participates in
+the preview — scrolling with it, scaling with DPI, theming with the palette, selectable — needs
+either a rich drawing ABI or a quad-list-and-glyph-run ABI, and that is a much wider surface than the
+plugin row was scoped for. **Building it in-house first is how the viewer ABI gets designed from a
+real client instead of speculatively**, and it can be extracted to a plugin afterwards. This is the
+same shape as the JSON-formatter question above and should be answered the same way.
+
+**Why not "full mermaid".** Mermaid is not one format, it is ~15 (flowchart, sequence, class, state,
+ER, gantt, pie, journey, gitgraph, mindmap, timeline, quadrant, C4, sankey, requirement), each with
+its own grammar *and its own layout algorithm*. `mermaid.js` is larger than all of Newtpad. Newtpad is
+~11k lines of Odin total; committing to the whole spec is committing to more code than the product.
+**Name the subset and ship it, rather than shipping 40% of everything.**
+
+**The subset that matches the stated use.** Spec-driven design is overwhelmingly two diagram types:
+
+- **`flowchart` / `graph`** — boxes, edges, labels, subgraphs.
+- **`sequenceDiagram`** — participants, messages, activations, notes.
+
+Those two also happen to be the two with well-understood published layout algorithms. `stateDiagram`
+falls out of the flowchart engine nearly free (same layered layout, different node shapes). `classDiagram`
+and `erDiagram` are a later, separate decision.
+
+**The hard part is layout, not drawing.** This is the thing to be clear-eyed about before scheduling
+it: drawing is quads and glyphs, which this codebase already has from batch 17's preview shaper. The
+work is a **layered (Sugiyama/dagre-style) graph layout** — rank assignment, crossing minimisation,
+coordinate assignment, then edge routing — and that is on the order of 1,500–2,500 lines by itself,
+independent of any parsing. A naive layout produces diagrams so ugly they are worse than the fenced
+source, so this cannot be half-done and still be worth having. **Budget it as several batches, not
+one.**
+
+**What already exists to build on:** batch 17's preview shaper (proportional text, real fonts), the
+glyph atlas, `quads.odin`, and the markdown block model that already isolates fenced blocks. A
+mermaid block is *bounded* — one fence — so a whole-block layout does not violate the viewport-first
+rule the way a whole-document pass would. A file with fifty diagrams does need **lazy per-visible-block
+layout with a cache**, which is the same shape the preview already uses.
+
+**Two things it needs that do not exist yet:**
+
+- **A real scissor rect** (already listed in §5 as owed). Clipping is currently a cover strip painted
+  after the content, and a diagram pane that scrolls needs genuine clipping.
+- **Line/curve primitives.** Everything today is axis-aligned quads. Edges need diagonal strokes and
+  either bezier flattening or orthogonal routing. Decide which before starting — orthogonal routing is
+  much less code and arguably reads better for spec diagrams.
+
+**Open question worth settling early:** does a diagram render *in the preview only*, or also inline in
+the editor (Obsidian-style)? The preview-only answer is far cheaper and consistent with how every
+other markdown view here works; the inline answer collides with §9's concealment work, which is
+already flagged as needing its own batch because it makes the drawn column stop matching the byte
+column.
+
+### Right-click a tab to open the folder the file is in
+
+**Requested 2026-07-31 by a user, relayed by Wyatt:** *"if you could right click the tabs to open the
+folder it's located in."* Documented, not scheduled.
+
+**The action already exists; the surface does not.** `plat.explorer_select_arg` is built and in use —
+`link_follow` reveals a non-text path in Explorer through it (`links.odin`), including the escaping
+care that path needs. So this is not "implement reveal-in-Explorer", it is "give the tab strip a
+right-click".
+
+**There is no tab context menu at all.** `grep` over `ui_tabs.odin`, `menu.odin` and `app.odin` finds
+no right-click handling on the strip, so this is a new surface rather than a new row in an existing
+menu — and that is the part worth scoping deliberately, because a tab context menu invites every
+other per-tab command (close others, close to the right, copy path, pin) and CLAUDE.md principle 3
+says fight options. Decide the menu's full contents once, when it is built, rather than growing it a
+row at a time.
+
+Related and already listed in §4: *directories opening as a tab* listing contents rather than
+revealing in Explorer. If that is ever built, this request's answer changes — "open the folder" would
+mean a Newtpad tab, not an Explorer window. Worth settling the direction before building either.
+
+### Tell the user where the themes folder is
+
+**Requested 2026-07-31 by a user, relayed by Wyatt:** *"i want to create a new .theme file but not
+sure where the themes folder is on my machine."*
+
+**The likely cause is more specific than "it is undiscoverable": for that user the folder probably
+does not exist.** `themes_dir()` (`theme.odin:525`) returns `%APPDATA%\Newtpad\themes`, but
+`theme.odin:511-524` records a deliberate decision not to create it at startup — a bare read of
+`settings.txt` was `mkdir`-ing a `themes/` folder for every user who had never touched a theme, so
+creation moved to `themes_dir_ensure` at the point of actual use. Correct decision, with the
+side effect that a user looking for the folder finds nothing there and cannot tell whether they have
+the wrong path or the right one.
+
+So the fix is not documentation. Candidates, cheapest first:
+
+- **An `Open Themes Folder` command** in the palette that calls `themes_dir_ensure` and reveals it.
+  Creates the folder as a side effect of asking for it, which is exactly when it should exist.
+- **A line in Settings** next to the theme picker showing the resolved path, clickable. Settings is
+  where someone changing themes already is.
+- Both. They are the same two lines of work behind one shared `themes_dir_ensure` call.
+
+Note this generalises: `keys.txt` and `rules.txt` live under the same `%APPDATA%\Newtpad` root and
+have the same discovery problem. Whatever answer is chosen should cover all three rather than
+being built once for themes.
 
 ---
 
@@ -115,6 +222,27 @@ From HANDOFF §6aa, which is the plan of record.
 - Landing page, download, and **publish the price early and hold it** (File Pilot precedent).
 - **Code signing** — pipeline is built signing-*ready*; blocked on Wyatt purchasing a certificate.
   Never handle a certificate or its password.
+- **A Defender false-positive submission to Microsoft** — Wyatt's to file, it needs his account:
+  <https://www.microsoft.com/en-us/wdsi/filesubmission>, as "Software developer".
+
+  **Evidence, 2026-07-31.** A GitHub download of v0.33.0 failed in the browser with
+  *"Failed - Virus detected"*, and VirusTotal on that exact binary returned **1 detection out of
+  ~40**: Microsoft `Trojan:Win32/Wacatac.B!ml`. The `!ml` suffix is Microsoft's own marker for a
+  machine-learning verdict rather than a signature match, and every other ML engine on the panel —
+  **SentinelOne (Static ML), CrowdStrike Falcon**, Palo Alto, Symantec, Fortinet, McAfee,
+  Malwarebytes — returned Undetected. Real malware is what the other ML engines agree on first;
+  being the sole ML dissenter is the signature of a false positive, and `Wacatac.B!ml` is the
+  specific bucket Defender uses for unsigned, low-prevalence, freshly-built executables.
+
+  Verified locally at the same time: nothing is vendored (every binary in `build/` is produced by
+  `build.bat` from our own sources), and `update.odin` does one HTTPS GET for a version string with
+  no `CreateProcess`, no `ShellExecute` of a downloaded file and no `MoveFileEx` self-replacement —
+  so Newtpad cannot download and run anything, which is the behaviour a dropper heuristic looks for.
+
+  **One of the two reputation signals is already gone:** the exe had *no version resource at all*
+  until 2026-07-31 (empty `FileVersion`, `CompanyName`, `ProductName`, `FileDescription`), now fixed.
+  Signing removes the other. The submission is what clears it for existing Defender installs in the
+  meantime, and it clears it for everyone, not just the reporter.
 
 **V1 (paid), after the beta**
 - **Trial**, **offline license key**, **storefront** — informed by beta feedback.

@@ -198,6 +198,12 @@ main :: proc() {
 	hscrollbar_drag := false
 	md_preview_drag := false
 	divider_drag := false // dragging the Markdown Split divider (md_divider_rect)
+	// Dragging a table column's header edge (UI spec §10). -1 when idle. The
+	// grab is the pointer's offset from the edge at the press, so the edge does
+	// not jump to the cursor on the first frame of the drag -- the same thing
+	// hscroll_grab does for the horizontal thumb.
+	table_resize_col := -1
+	table_resize_grab := f32(0)
 	sel_dragging := false // a text-selection drag has begun (pointer moved since press)
 	press_x, press_y: i32 // client pos of the press that may become a drag
 	// Column-select drag (Alt+drag). Four inline latches until the
@@ -645,6 +651,53 @@ main :: proc() {
 			}
 		}
 
+		// Dragging a table column's header edge, and double-clicking it to fit
+		// (§10). Before the cell-edit branch below, which is gated on the whole
+		// content area including the header band -- an edge press has to be taken
+		// here or it falls through to a hit-test that refuses it and then to the
+		// read-only swallow, which is what "click does nothing" looks like.
+		//
+		// table_edge_at is the single producer of the grab zone, so the pixels that
+		// show the resize cursor further down are the pixels that start this drag.
+		if doc.table && doc.kind == .Text {
+			if window.mouse_pressed && !plat.key_ctrl_down() {
+				if c, on_edge := table_edge_at(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); on_edge {
+					if window.mouse_count >= 2 {
+						table_col_fit(doc, c) // double-click: back to the measured width
+					} else {
+						table_resize_col = c
+						for k in table_cols_layout(doc, char_w, f32(window.width), table_start_col(doc)) {
+							if k.c == c {table_resize_grab = f32(window.mouse_x) - (k.x + k.w);break}
+						}
+					}
+					window.mouse_pressed = false
+				} else if c, on_head := table_header_col_at(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); on_head {
+					// §10's "click to sort with an accent arrow". AFTER the edge test
+					// above, never before: within ±4px of a boundary the user is
+					// aiming at the divider, and reordering the whole file on a
+					// slightly-off resize grab is not a recoverable surprise.
+					//
+					// Not a Command_Id and not in the palette, deliberately. The sort
+					// is a per-column gesture with no argument the palette could
+					// carry, §10 names the header click as its affordance, and adding
+					// a palette row that needed a column would be the "dispatch that
+					// silently does nothing" shape this batch fixed once already.
+					// .Sort_Lines stays refused in table view: that one REWRITES the
+					// buffer, so command_mutates_doc names it correctly and the
+					// read-only guard needs no loosening for this.
+					table_sort_click(doc, c)
+					window.mouse_pressed = false
+				}
+			}
+			if table_resize_col >= 0 {
+				if window.mouse_down {
+					table_col_resize(doc, table_resize_col, f32(window.mouse_x) - table_resize_grab, char_w, f32(window.width))
+				} else {
+					table_resize_col = -1
+				}
+			}
+		}
+
 		// Plain click on a table cell starts editing it in place (commit any cell
 		// already being edited first). Before the read-only consume below, which
 		// swallows the press for the grid. Ctrl is the link modifier, handled above.
@@ -662,7 +715,7 @@ main :: proc() {
 		// (so the wheel still scrolls, and the bars still drag). After the scrollbars,
 		// so a press on either bar reaches it first.
 		if doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) {
-			drags := Drag_Latches{scrollbar_drag, hscrollbar_drag, md_preview_drag, divider_drag}
+			drags := Drag_Latches{scrollbar_drag, hscrollbar_drag, md_preview_drag, divider_drag, table_resize_col >= 0}
 			ro := ro_surface_swallows(doc.table, doc.md_mode, f32(window.mouse_x) >= ed_right, drags)
 			// 9.1's one surviving pixel -> content mapping, wired to the gesture it
 			// exists for: "click-to-sync-scroll, which only needs the nearest
@@ -748,6 +801,12 @@ main :: proc() {
 			cx, cy := plat.window_cursor_client(window)
 			dvr := md_divider_rect(doc, f32(window.width), f32(window.height), app.settings.split_frac)
 			if divider_drag || (dvr.size.x > 0 && f32(cx) >= dvr.pos.x && f32(cx) < dvr.pos.x + dvr.size.x && f32(cy) >= dvr.pos.y && f32(cy) < dvr.pos.y + dvr.size.y) {
+				want = .SizeWE
+			} else if doc.table && doc.kind == .Text && table_resize_col >= 0 {
+				want = .SizeWE // mid-drag: keep it even if the pointer runs off the edge
+			} else if doc.table && doc.kind == .Text && table_edge_at_cursor(doc, char_w, f32(window.width), f32(cx), f32(cy), px) {
+				// The SAME producer the press above hit-tests against, so the
+				// affordance appears exactly where the gesture works.
 				want = .SizeWE
 			} else if doc.find.active && find_action_at(doc, &text, f32(window.width), f32(cx), f32(cy)) != .None {
 				// Same geometry as the draw, the hover fill and the click. A
@@ -1065,6 +1124,12 @@ main :: proc() {
 		// on_resize the update phase (2). Neither is worth a data-safety guard's
 		// complexity for a one-frame cosmetic lag; if the guard ever has to CHOOSE
 		// a write target, both become real and must be fixed first.
+		// The sorted grid's scroll normalisation, immediately BEFORE the edit
+		// guard: it can move doc.top, and the guard's whole job is to compare the
+		// edited row's offset against where the view has finally settled. See
+		// table_sort_snap for which routes write doc.top without knowing a
+		// permutation exists.
+		if doc.table && doc.kind == .Text {table_sort_snap(doc, trows)}
 		if doc.table && doc.kind == .Text {table_edit_hold(doc, trows)}
 
 		// Window title = [*]filename - Newtpad, set only when it changes.
@@ -1266,7 +1331,7 @@ hscrollbar_geo :: proc(doc: ^Document, winw, winh: f32, m: Hscroll) -> (b: Hbar)
 // exclude all of them, and this struct exists so the list is one thing that can
 // be tested rather than four `&&` clauses nobody re-reads.
 Drag_Latches :: struct {
-	vscroll, hscroll, preview, divider: bool,
+	vscroll, hscroll, preview, divider, col_resize: bool,
 }
 
 // Should a read-only surface swallow this mouse event?
@@ -1285,8 +1350,15 @@ Drag_Latches :: struct {
 // and drag" (Wyatt, live use, v0.17.1). It went unnoticed because the bar was
 // dead in the grid until the fix immediately before it, and because in the
 // plain text view `ro` is false so nothing is swallowed at all.
+//
+// `col_resize` (§10's drag-a-header-edge, 2026-07-31) is the fifth, and it was
+// written without this list at first — the column moved on the press frame and
+// then froze, the identical symptom, in the identical surface. The struct did
+// its job: the bug was found by reading this comment, which is the argument for
+// keeping the incident attached to the rule. The count is now pinned by an
+// assertion in hscrolltest so a SIXTH latch cannot be added silently.
 ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool, d: Drag_Latches) -> bool {
-	if d.vscroll || d.hscroll || d.preview || d.divider {return false}
+	if d.vscroll || d.hscroll || d.preview || d.divider || d.col_resize {return false}
 	return table || md_mode == .Preview || (md_mode == .Split && in_preview_half)
 }
 
@@ -1419,6 +1491,19 @@ vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int, t: ^plat.Text,
 	// of the content it halted at 80%, which is what Wyatt measured by eye.
 	// doc_scroll_to_fraction (the inverse vbar_drag_to calls through) maps by
 	// the same doc_max_top, so the two stay exact inverses of each other.
+	// A sorted grid's bar is ROW-proportional in both halves, because under a
+	// permutation neither the position of doc.top in the file nor the byte span on
+	// screen says anything about where the reader is in the ORDER they are looking
+	// at. `bottom - doc.top` can even go negative there (the last visible row's line
+	// may sit before the first's), which the clamp would have quietly turned into a
+	// 24px thumb that never grew. table_sort_thumb is doc_scroll_to_fraction's exact
+	// inverse for the same reason the byte pair below are each other's.
+	if frac, size, ok := table_sort_thumb(doc, rows); ok {
+		b.thumb_h = clamp(size * b.track_h, sx(24), b.track_h)
+		b.thumb_y = clamp(b.track_y + frac * max(1, b.track_h - b.thumb_h), b.track_y, b.track_y + b.track_h - b.thumb_h)
+		b.shown = true
+		return
+	}
 	max_top := f32(max(1, doc_max_top(doc, t, rows)))
 	travel := max(1, b.track_h - b.thumb_h)
 	b.thumb_y = clamp(b.track_y + f32(doc.top) / max_top * travel, b.track_y, b.track_y + b.track_h - b.thumb_h)
@@ -1589,7 +1674,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		}
 	} else if doc.table && doc.kind == .Text {
 		// Read-only grid view (CSV/TSV) replaces the text pass entirely.
-		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, trows, f32(window.width))
+		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, trows, f32(window.width), f32(window.height))
 		// Underline links in the cells while Ctrl is held (or Show-links is on).
 		if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 			for tl in table_links(doc, text, px, char_w, trows, f32(window.width)) {
@@ -2203,6 +2288,7 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	TABLE_HEADER_H = dp(rc, TABLE_HEADER_H_96)
 	TABLE_ROW_H = dp(rc, TABLE_ROW_H_96)
 	TABLE_CELL_PAD_X = dp(rc, TABLE_CELL_PAD_X_96)
+	TABLE_GUTTER_W = dp(rc, TABLE_GUTTER_W_96)
 
 	// The non-client hit-test boundary is derived from the tab strip, so it is
 	// set here rather than at each call site — it was being scaled a second time

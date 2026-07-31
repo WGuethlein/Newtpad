@@ -37,6 +37,13 @@ doc_view_apply :: proc(doc: ^Document, v: Doc_View) {
 	doc.wrap = v.wrap
 	doc.md_mode = .Off
 	doc.table = false
+	// The third place the grid is left, after leave_table_view and .Toggle_Table's
+	// off-branch, and it clears the sort for the same reason they do: the sort is a
+	// property of the view and nothing here restores one (Doc_View does not carry
+	// it). Cleared unconditionally rather than only when the grid stays off -- a
+	// view being applied means the view it describes, and this one describes no
+	// sort.
+	table_sort_clear(doc)
 
 	if doc.kind == .Text && v.md_mode != .Off && doc_can_markdown(doc) {
 		doc.md_mode = v.md_mode
@@ -57,6 +64,10 @@ doc_view_apply :: proc(doc: ^Document, v: Doc_View) {
 		// (table.odin:183), so this needs no ^plat.Text and can run from
 		// session_restore and doc_reload, neither of which has one.
 		clear(&doc.table_widths)
+		// ...and the manual widths with them. A restored session re-samples the
+		// file from scratch, and a width the user dragged in a previous run would
+		// be applied to whatever column happens to sit at that index now.
+		table_user_widths_clear(doc)
 	}
 	// Both markdown views and the grid scroll by whole lines, so a top that
 	// landed mid-line would render a partial first row. The toggles re-anchor

@@ -116,11 +116,6 @@ app_swap_tabs :: proc(a: ^App, sa, sb: int) {
 	}
 }
 
-// Upper bound on watched files. Independent of the session's tab limit
-// (MAX_SESSION_TABS, session.odin, currently 64) — the watcher cap is its own
-// budget, not a mirror of it.
-MAX_TABS :: 32
-
 app_active :: proc(a: ^App) -> ^Document {
 	if a.active >= 0 && a.active < len(a.docs) {
 		return a.docs[a.active]

@@ -87,7 +87,13 @@ if not exist build\guarded.obj (
 	if errorlevel 1 exit /b 1
 )
 if not exist build\newtpad.res (
-	rc /nologo /I src\platform /fo build\newtpad.res src\platform\newtpad.rc
+	REM version.rh carries NEWTPAD_VERSION in rc's syntax for the VERSIONINFO
+	REM block. Generated rather than hand-written so a version bump touches only
+	REM version.odin -- see tools\gen-version-rh.ps1. /I build is what lets the
+	REM .rc's #include find it.
+	powershell -NoProfile -ExecutionPolicy Bypass -File tools\gen-version-rh.ps1
+	if errorlevel 1 exit /b 1
+	rc /nologo /I src\platform /I build /fo build\newtpad.res src\platform\newtpad.rc
 	if errorlevel 1 exit /b 1
 )
 exit /b 0

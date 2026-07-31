@@ -218,12 +218,20 @@ Each of these cost real time at least once.
   `src/program/test_modes.odin`.
 - **Set `NEWTPAD_SESSION_DIR` to a temp directory first.** Six modes used to write to the real store
   under `%APPDATA%\Newtpad`; they now refuse without it, but set it anyway.
-- Argument order is per-mode and unforgiving: `edittest`/`seltest` take the path **first**;
-  `watchtest` takes a directory. **`keytest` no longer needs one** (2026-07-30) — `newtpad keytest`
+- Argument order is per-mode and unforgiving: `edittest`/`seltest` take the path **first**.
+  **`keytest` no longer needs one** (2026-07-30) — `newtpad keytest`
   works, `newtpad <path> keytest` still works, and it belongs in every regression sweep from now on.
-  It was two-argument-only, so it was in no required list, nothing ran it, and a stale assertion that
-  the D1 keymap fix had invalidated sat in the tree printing `FAIL` to nobody. **A mode nothing runs is
-  worse than no mode.** When you add one, make it one-argument and put it in a list.
+  **`watchtest`'s directory is optional as of 2026-07-31** (it defaults under `%TEMP%`), and
+  `lineidxtest` is one-argument with an optional path; both belong in every sweep. **`tablegridtest`
+  is one-argument and was missing from HANDOFF §7's list entirely until 2026-07-31** — it existed,
+  it asserted a hundred things about a data-loss seam, and no required list named it. It is in §7
+  now. **`resavetest` is one-argument as of 2026-07-31 too** — `newtpad resavetest` builds its own
+  fixture under `%TEMP%`, asserts the bytes, the creation time and an alternate data stream, and
+  exits non-zero; `newtpad resavetest <file>` still saves over a file you name and leaves it there.
+  It belongs in every sweep. Bare, it used to fall through to the GUI and hang, so it was in no
+  required list, nothing ran it, and a stale assertion that the D1 keymap fix had invalidated sat in
+  the tree printing `FAIL` to nobody. **A mode nothing runs is worse than no mode.** When you add one,
+  make it one-argument and put it in a list.
 - **`drawcount` is safe to run as of batch 8** — `newtpad drawcount <file>` renders offscreen (no
   window, no message pump), prints its numbers and exits, and a bare `newtpad drawcount` prints
   usage. **The old rule here was right to forbid it but wrong about why**, and the difference is the

@@ -13,6 +13,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:time"
 import "core:unicode/utf8"
 import "core:unicode/utf16"
@@ -187,6 +188,1139 @@ when NEWTPAD_TESTS {
 		// notice. `os.exit` skips the deferred teardown above -- everything it would
 		// free is process-lifetime scratch, and the process is ending either way.
 		if bad > 0 {os.exit(1)}
+	}
+
+	// `newtpad resavetest [file]` -- a save must REPLACE the file's contents, not
+	// substitute a fresh file in its place.
+	//
+	// The atomic write used to rename a brand-new temp file over the target, which
+	// silently drops the original's attributes, ACLs, alternate data streams and
+	// creation time. atomic_write_commit uses ReplaceFileW for exactly that reason,
+	// and falls back to MoveFileExW -- the substituting kind -- when it fails, so
+	// the regression this guards against is a silent fall-back, not a failed save.
+	//
+	// Those properties are easiest to observe from OUTSIDE the process, which is
+	// why the mode originally took a path and did nothing but print: an external
+	// script looked at the file afterwards. That made it two-argument, and
+	// `newtpad resavetest` bare fell through to opening the real GUI and hung -- so
+	// no sweep could run it, so nothing ran it, so it asserted nothing for nine
+	// batches. development-loop.md §6: a mode nothing runs is worse than no mode.
+	//
+	// One-argument now. With no path it builds its own fixture under %TEMP%, stamps
+	// it with an alternate data stream, saves over it and checks in-process what an
+	// external script would have checked: the bytes, the creation time, and the
+	// stream. It exits non-zero when any of that is wrong. With a path it behaves
+	// as before AND runs the same checks, and leaves the file behind.
+	@(private = "file")
+	resave_test_run :: proc(arg: string) {
+		bad := 0
+		path := arg
+		ours := false
+		if path == "" {
+			tmp := os.get_env("TEMP", context.temp_allocator)
+			if tmp == "" {
+				fmt.println("resavetest: no file given and TEMP is unset")
+				os.exit(1)
+			}
+			dir, _ := filepath.join({tmp, "newtpad-resavetest"}, context.temp_allocator)
+			if !os.exists(dir) {
+				if derr := os.make_directory(dir); derr != nil {
+					fmt.printfln("resavetest: could not create %q: %v", dir, derr)
+					os.exit(1)
+				}
+			}
+			path, _ = filepath.join({dir, "resave.txt"}, context.temp_allocator)
+			if werr := os.write_entire_file(path, transmute([]u8)string("alpha\nbravo\ncharlie\n")); werr != nil {
+				fmt.printfln("resavetest: could not write %q: %v", path, werr)
+				os.exit(1)
+			}
+			ours = true
+		}
+
+		// An alternate data stream on the target. This is the property ReplaceFileW
+		// carries and a rename does not, and it is the one an ordinary
+		// bytes-and-size check cannot see at all. NTFS-only, so a failure to create
+		// it skips the check rather than failing it -- a %TEMP% on FAT32 or a
+		// network share is a reason to say nothing, not to cry wolf.
+		ads := fmt.tprintf("%s:newtpad", path)
+		STAMP :: "resavetest stream marker"
+		has_ads := os.write_entire_file(ads, transmute([]u8)string(STAMP)) == nil
+		if !has_ads {fmt.println("  (no alternate data stream on this volume -- skipping that check)")}
+
+		before, berr := os.stat(path, context.temp_allocator)
+		if berr != nil {li_chk(&bad, false, fmt.tprintf("could not stat %q before the save: %v", path, berr))}
+
+		doc, ok := doc_open(path)
+		if !ok {
+			fmt.eprintfln("resavetest: could not open %q", path)
+			os.exit(1)
+		}
+		doc.cursor = doc.pt.length
+		doc.anchor = doc.cursor
+		doc_insert_text(&doc, transmute([]u8)string("appended\n"))
+		want := base.pt_collect(&doc.pt)
+		defer delete(want)
+		err := doc_save_err(&doc, path)
+		fmt.printfln("resavetest: save err=%v size=%d path=%q", err, doc.pt.length, path)
+		li_chk(&bad, err == .None, fmt.tprintf("the save succeeded (%v)", err))
+		doc_close(&doc) // before reading back: releases any mapping on the target
+
+		// The bytes. Not an assertion about the atomic write so much as the floor
+		// under the other two -- a preserved creation time on a file with the wrong
+		// contents is not a pass.
+		got, rerr := os.read_entire_file(path, context.allocator)
+		defer delete(got)
+		li_chk(&bad, rerr == nil, fmt.tprintf("the file reads back (%d bytes, %v)", len(got), rerr))
+		li_chk(&bad, string(got) == string(want), fmt.tprintf("...and its bytes are the buffer's (%d on disk, %d in the buffer)", len(got), len(want)))
+
+		after, aerr := os.stat(path, context.temp_allocator)
+		if berr == nil && aerr == nil {
+			b := time.time_to_unix_nano(before.creation_time)
+			a := time.time_to_unix_nano(after.creation_time)
+			li_chk(&bad, a == b, fmt.tprintf("the creation time survived the save (%d -> %d)", b, a))
+		}
+
+		if has_ads {
+			s, serr := os.read_entire_file(ads, context.allocator)
+			defer delete(s)
+			li_chk(&bad, serr == nil && string(s) == STAMP, fmt.tprintf("the alternate data stream survived the save (read=%v, %q)", serr, string(s)))
+		}
+
+		if ours {os.remove(path)} // takes the stream with it; a path you named is yours
+		fmt.printfln("resavetest: %d failures", bad)
+		// Non-zero for the same reason keytest grew one: this mode spent nine
+		// batches printing to nobody, and a summary line a script has to remember to
+		// grep is what let that happen.
+		if bad > 0 {os.exit(1)}
+	}
+
+	@(private = "file")
+	li_chk :: proc(bad: ^int, ok: bool, label: string) {
+		if !ok {bad^ += 1}
+		fmt.printfln("  %-4s %s", "ok" if ok else "FAIL", label)
+	}
+
+	// Ground truth for doc_line_no_at, derived the dumb way over the raw bytes:
+	// the 0-based line number containing `at` is the number of newlines strictly
+	// before it. Deliberately shares no code with the thing it checks -- comparing
+	// two derivations of the same expression is what §4 warns about.
+	@(private = "file")
+	li_truth :: proc(c: []u8, at: int) -> (n: int) {
+		for i in 0 ..< at {if c[i] == '\n' {n += 1}}
+		return
+	}
+
+	// Deterministic fixture with RAGGED line lengths (1..200 bytes). Ragged on
+	// purpose: with fixed-width lines a checkpoint's line number is derivable from
+	// its offset by division, so an implementation that ignored the recorded
+	// line_no entirely could still pass every probe.
+	//
+	// `seed` matters more than it looks: the reuse part indexes one fixture and
+	// then swaps a SHORTER one under it, and with a shared seed the short one is a
+	// byte-for-byte prefix of the long one -- so every stale checkpoint would
+	// still be right and the test could not see a stale answer at all.
+	@(private = "file")
+	li_fixture :: proc(target: int, seed: u64 = 0x9E37_79B9_7F4A_7C15) -> []u8 {
+		b := make([dynamic]u8, 0, target + 256)
+		defer delete(b)
+		rng := seed
+		for len(b) < target {
+			rng = rng * 6364136223846793005 + 1442695040888963407
+			n := int((rng >> 33) % 200) + 1
+			for i in 0 ..< n {append(&b, u8('a') + u8(i % 26))}
+			append(&b, '\n')
+		}
+		out := make([]u8, len(b))
+		copy(out, b[:])
+		return out
+	}
+
+	// Every offset worth probing in a fixture of `n` bytes: both sides of every
+	// checkpoint boundary and the checkpoint itself, the two ends, and a spread of
+	// interior offsets. The boundary triples are the ones that matter -- a lookup
+	// that picks the checkpoint one slot off is correct at mid-stride offsets and
+	// wrong only within a byte of a multiple of LINE_CKPT_STRIDE.
+	@(private = "file")
+	li_probes :: proc(n: int) -> []int {
+		p := make([dynamic]int)
+		append(&p, 0, 1, max(0, n - 1), n)
+		// Every boundary at the shipped stride; a sampled 64 of them if the stride
+		// has been shrunk for an experiment. Without the cap, re-running this mode
+		// at a small stride is quadratic in the fixture (li_truth is O(at)) and
+		// takes long enough that nobody would run it -- which would make the
+		// "same answers at a different stride" check theoretical.
+		step := LINE_CKPT_STRIDE * max(1, (n / LINE_CKPT_STRIDE) / 64)
+		for at := 0; at <= n; at += step {
+			append(&p, max(0, at - 1), at, min(n, at + 1))
+		}
+		rng: u64 = 12345
+		for _ in 0 ..< 64 {
+			rng = rng * 6364136223846793005 + 1442695040888963407
+			append(&p, int((rng >> 33) % u64(n + 1)))
+		}
+		return p[:]
+	}
+
+	// `newtpad lineidxtest [path]` -- Line_Index's sparse checkpoints and
+	// doc_line_no_at. One-argument by construction (the optional path only picks a
+	// bigger real file for the memory figure), per the keytest incident: a
+	// two-argument mode is a mode nothing runs.
+	//
+	// Its own proc for the usual reason (test_mode_dispatch's frame has hit
+	// STATUS_STACK_OVERFLOW twice) and because a failure count needs somewhere to
+	// live. Each part is also its own proc so no two Documents are live in one
+	// frame at a time.
+	@(private = "file")
+	line_idx_test_run :: proc(path: string) {
+		bad := 0
+		li_part_full(&bad)
+		li_part_exact(&bad)
+		li_part_partial(&bad)
+		li_part_race(&bad)
+		li_part_concurrent(&bad)
+		li_part_edits(&bad)
+		li_part_saved(&bad)
+		li_part_destroyed(&bad)
+		li_part_bigpaste(&bad)
+		li_part_undo(&bad)
+		li_part_midscan_edits(&bad)
+		li_part_restart(&bad)
+		li_part_eolconv(&bad)
+		li_part_fault(&bad)
+		li_part_reuse(&bad)
+		li_part_cost(&bad)
+		li_part_memory(&bad, path)
+		fmt.printfln("lineidxtest: %d failures", bad)
+		if bad > 0 {os.exit(1)}
+	}
+
+	// The offset of the last live checkpoint at or below `at`, found by a LINEAR
+	// walk. Deliberately not the binary search doc_line_no_at uses: the point of
+	// the checks below is to decide independently which offsets the repaired array
+	// can answer for, and re-deriving that with the same code would only assert
+	// that the search agrees with itself.
+	@(private = "file")
+	li_near :: proc(d: ^Document, at: int) -> (off: int, ok: bool) {
+		cnt := intrinsics.atomic_load(&d.idx.ckpt_n)
+		for k in 0 ..< cnt {
+			if d.idx.ckpts[k].offset > at {break}
+			off, ok = d.idx.ckpts[k].offset, true
+		}
+		return
+	}
+
+	// The seam, for the repaired (document-coordinate) array: what doc_line_no_at
+	// ANSWERS, against what the checkpoints independently say it should be able to
+	// answer, against line numbers counted directly over the buffer's own bytes.
+	//
+	// `body` is the live buffer collected byte-for-byte, so li_truth over it shares
+	// nothing with the checkpoint arithmetic under test -- neither the stored
+	// line_no, nor the shift, nor the forward scan. That independence is what makes
+	// zeroing the repair's line delta a visible failure rather than a consistent
+	// pair of wrong answers.
+	//
+	// Three verdicts per probe rather than two. A probe further than CKPT_SCAN_CAP
+	// from the nearest checkpoint MUST refuse -- that is the bound existing, and a
+	// test that only demanded "exact everywhere" would fail honestly on a large
+	// paste and teach the next reader to widen the cap. A probe inside the cap MUST
+	// be exact AND right.
+	@(private = "file")
+	li_verify :: proc(bad: ^int, d: ^Document, body: []u8, label: string) -> (answered, refused: int) {
+		if !d.idx.ckpt_doc {
+			li_chk(bad, false, fmt.tprintf("%s: PRECONDITION -- the array is not in document coordinates", label))
+			return
+		}
+		p := make([dynamic]int, context.temp_allocator)
+		n := len(body)
+		append(&p, 0, 1, max(0, n - 1), n)
+		// Every live checkpoint and its two neighbours. These are the probes that
+		// matter: an entry shifted by the wrong amount still lands on the right LINE
+		// for most mid-stride offsets and is wrong only within a byte or two of the
+		// entry itself.
+		cnt := intrinsics.atomic_load(&d.idx.ckpt_n)
+		for k in 0 ..< cnt {
+			o := d.idx.ckpts[k].offset
+			append(&p, max(0, o - 1), o, min(n, o + 1))
+		}
+		rng: u64 = 0xABCD_1234_5678_9AB
+		for _ in 0 ..< 128 {
+			rng = rng * 6364136223846793005 + 1442695040888963407
+			append(&p, int((rng >> 33) % u64(n + 1)))
+		}
+		wrong, bad_refusal, bad_answer, first_bad := 0, 0, 0, -1
+		for at in p {
+			off, ok := li_near(d, at)
+			reachable := ok && at - off <= CKPT_SCAN_CAP && at <= n
+			got, exact := doc_line_no_at(d, at)
+			switch {
+			case exact && !reachable:
+				bad_answer += 1
+				if first_bad < 0 {first_bad = at}
+			case !exact && reachable:
+				bad_refusal += 1
+				if first_bad < 0 {first_bad = at}
+			case exact:
+				answered += 1
+				if got != li_truth(body, at) {
+					wrong += 1
+					if first_bad < 0 {first_bad = at}
+				}
+			case:
+				refused += 1
+			}
+		}
+		li_chk(bad, wrong == 0, fmt.tprintf("%s: every answer equals newlines counted over the buffer (%d wrong of %d, first at %d)", label, wrong, answered, first_bad))
+		li_chk(bad, bad_refusal == 0, fmt.tprintf("%s: nothing within CKPT_SCAN_CAP of a checkpoint was refused (%d, first at %d)", label, bad_refusal, first_bad))
+		li_chk(bad, bad_answer == 0, fmt.tprintf("%s: nothing beyond the cap was answered (%d, first at %d)", label, bad_answer, first_bad))
+		return
+	}
+
+	// A finished index over a fixture spanning eight checkpoint strides: every
+	// probe must be exact and must equal ground truth.
+	@(private = "file")
+	li_part_full :: proc(bad: ^int) {
+		fmt.println("-- finished index over 512 KB --")
+		// Sized in BYTES, not in strides. Sized in strides, shrinking the stride
+		// for the "same answers at a different stride" experiment shrinks the
+		// fixture with it -- at a stride of 1 the whole fixture would have been 8
+		// bytes and every assertion below would have been vacuous.
+		c := li_fixture(512 * 1024)
+		truth_len := len(c)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		want_n := (truth_len + LINE_CKPT_STRIDE - 1) / LINE_CKPT_STRIDE
+		got_n := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, got_n == want_n, fmt.tprintf("%d checkpoints published over %d bytes (want %d)", got_n, truth_len, want_n))
+		li_chk(bad, got_n >= 3, fmt.tprintf("...and the fixture really does cross several boundaries (%d)", got_n))
+
+		wrong, refused, first_bad := 0, 0, -1
+		probes := li_probes(truth_len)
+		for at in probes {
+			got, exact := doc_line_no_at(&d, at)
+			if !exact {
+				refused += 1
+				if first_bad < 0 {first_bad = at}
+				continue
+			}
+			if got != li_truth(d.original, at) {
+				wrong += 1
+				if first_bad < 0 {first_bad = at}
+			}
+		}
+		li_chk(bad, refused == 0, fmt.tprintf("no probe refused (%d of %d, first at %d)", refused, len(probes), first_bad))
+		li_chk(bad, wrong == 0, fmt.tprintf("no probe disagreed with ground truth (%d of %d, first at %d)", wrong, len(probes), first_bad))
+		// Named separately because they are the two that a mid-stride-only probe
+		// set would miss, and the report has to be able to point at them.
+		for at in ([]int{LINE_CKPT_STRIDE - 1, LINE_CKPT_STRIDE, LINE_CKPT_STRIDE + 1, 3 * LINE_CKPT_STRIDE, truth_len}) {
+			got, exact := doc_line_no_at(&d, at)
+			want := li_truth(d.original, at)
+			li_chk(bad, exact && got == want, fmt.tprintf("boundary at=%d -> line %d exact=%v (want %d, true)", at, got, exact, want))
+		}
+		delete(probes)
+	}
+
+	// A fixture whose length is an EXACT multiple of the stride -- the only shape
+	// that reaches doc_line_no_at's `k >= n && done -> k = n-1` clamp, and the only
+	// branch there that deliberately reads an entry `at` does not index into.
+	//
+	// No other part can reach it: li_fixture overshoots its target by 1..200 bytes,
+	// so `len/STRIDE` always lands one below `ckpt_n` and the clamp is skipped. A
+	// query at exactly len(content) on a file that ends on a boundary rounds up
+	// into a stride that holds no bytes and therefore never got a checkpoint of its
+	// own; the clamp is what answers it instead of refusing.
+	@(private = "file")
+	li_part_exact :: proc(bad: ^int) {
+		fmt.println("-- a length that is an exact multiple of the stride --")
+		raw := li_fixture(512 * 1024)
+		defer delete(raw)
+		// Copied rather than sliced: doc_from_content takes ownership and doc_close
+		// frees what it was given, which must be an allocation in its own right.
+		n := (len(raw) / LINE_CKPT_STRIDE) * LINE_CKPT_STRIDE
+		c := make([]u8, n)
+		copy(c, raw[:n])
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		want_n := n / LINE_CKPT_STRIDE
+		got_n := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, got_n == want_n, fmt.tprintf("%d checkpoints published over %d bytes (want %d)", got_n, n, want_n))
+		li_chk(bad, n % LINE_CKPT_STRIDE == 0 && got_n * LINE_CKPT_STRIDE == n, fmt.tprintf("...and the fixture really does end ON a boundary (%d)", n))
+		// at == len(content): k == ckpt_n, so this is the clamp or nothing.
+		got, exact := doc_line_no_at(&d, n)
+		want := li_truth(raw[:n], n)
+		li_chk(bad, exact && got == want, fmt.tprintf("boundary at=%d -> line %d exact=%v (want %d, true)", n, got, exact, want))
+		wrong, refused := 0, 0
+		probes := li_probes(n)
+		defer delete(probes)
+		for at in probes {
+			g, e := doc_line_no_at(&d, at)
+			if !e {refused += 1} else if g != li_truth(raw[:n], at) {wrong += 1}
+		}
+		li_chk(bad, refused == 0 && wrong == 0, fmt.tprintf("every probe over the truncated fixture is exact and right (%d refused, %d wrong of %d)", refused, wrong, len(probes)))
+	}
+
+	// The mid-scan state, built by hand rather than raced for. doc_line_no_at is a
+	// pure function of (ckpts, ckpt_n, done, edit_floor, content), so publishing a
+	// partial state directly pins its behaviour at the boundary EXACTLY, with no
+	// dependence on how fast the machine is. li_part_race below then checks a real
+	// worker agrees.
+	@(private = "file")
+	li_part_partial :: proc(bad: ^int) {
+		fmt.println("-- mid-scan (hand-published state, no worker) --")
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		M :: 3 // checkpoints "published" so far
+		d.idx.ckpts = make([]Line_Ckpt, len(c) / LINE_CKPT_STRIDE + 1)
+		for k in 0 ..< M {
+			at := k * LINE_CKPT_STRIDE
+			d.idx.ckpts[k] = Line_Ckpt {
+				offset  = at,
+				line_no = li_truth(c, at),
+			}
+		}
+		intrinsics.atomic_store(&d.idx.ckpt_n, M)
+		// Every entry from M up is WRITTEN but not PUBLISHED -- entry M is the state
+		// the worker is in for the instant between filling a slot and storing the
+		// new count, and everything above it is the state a reader must treat as
+		// absent. All of them are poisoned with a line number that could not be
+		// right so that trusting one is a VISIBLE wrong answer.
+		//
+		// Poisoning all of them rather than only M is the difference between an
+		// assertion and a decoration. A zeroed slot is refused by the bounds guard
+		// in doc_line_no_at whatever the count boundary does, so with the rest of
+		// the array left zeroed the two far probes below could not fail under any
+		// single-point sabotage -- they read as coverage of "an unpublished entry is
+		// never trusted" while actually testing the memset. Poisoned, they fail the
+		// moment the `k >= n` gate stops running at all, which is the one sabotage
+		// the adjacent probes do NOT catch.
+		for k in M ..< len(d.idx.ckpts) {
+			d.idx.ckpts[k] = Line_Ckpt {
+				offset  = k * LINE_CKPT_STRIDE,
+				line_no = 999_999,
+			}
+		}
+
+		lo := M * LINE_CKPT_STRIDE - 1
+		got, exact := doc_line_no_at(&d, lo)
+		li_chk(bad, exact && got == li_truth(c, lo), fmt.tprintf("last covered byte %d is exact (%d, want %d)", lo, got, li_truth(c, lo)))
+		for at in ([]int{M * LINE_CKPT_STRIDE, M * LINE_CKPT_STRIDE + 1, 5 * LINE_CKPT_STRIDE, len(c)}) {
+			_, e := doc_line_no_at(&d, at)
+			li_chk(bad, !e, fmt.tprintf("uncovered byte %d refuses (exact=%v)", at, e))
+		}
+		// `done` is the one thing that lets a lookup reach past the last published
+		// checkpoint. Lying about it here proves the scan is bounded LOCALLY: with
+		// only 3 of 8 strides recorded, the last checkpoint is ~320 KB below the
+		// end, and the local guard refuses rather than scanning that far.
+		intrinsics.atomic_store(&d.idx.done, true)
+		_, e := doc_line_no_at(&d, len(c))
+		li_chk(bad, !e, fmt.tprintf("done+truncated checkpoints still refuses a far offset (exact=%v)", e))
+		intrinsics.atomic_store(&d.idx.done, false)
+	}
+
+	// The same properties against a REAL worker, frozen partway by cancelling it
+	// as soon as it has published a few checkpoints. Asserts its own precondition:
+	// if the worker somehow finished first the fixture is vacuous and that is a
+	// failure, not a pass.
+	@(private = "file")
+	li_part_race :: proc(bad: ^int) {
+		fmt.println("-- mid-scan (real worker, cancelled partway) --")
+		c := li_fixture(64 * 1024 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		total := (len(c) + LINE_CKPT_STRIDE - 1) / LINE_CKPT_STRIDE
+		doc_index_start(&d)
+		for intrinsics.atomic_load(&d.idx.ckpt_n) < 4 && !doc_index_done(&d) {}
+		doc_index_stop(&d) // stores cancel, then joins: the state below is frozen
+		n := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, n > 0 && n < total, fmt.tprintf("caught the worker mid-scan: %d of %d checkpoints", n, total))
+		if n == 0 || n >= total {
+			fmt.println("  (skipping the rest of this part -- the fixture did not stay partial)")
+			return
+		}
+		// The worker is joined, so the tail of the array is this thread's to write.
+		// Same reason as li_part_partial: left zeroed, the two refusal assertions
+		// below are satisfied by the bounds guard no matter what the count boundary
+		// does, and neither could fail under any single-point sabotage.
+		for k in n ..< len(d.idx.ckpts) {
+			d.idx.ckpts[k] = Line_Ckpt {
+				offset  = k * LINE_CKPT_STRIDE,
+				line_no = 999_999,
+			}
+		}
+		lo := n * LINE_CKPT_STRIDE - 1
+		got, exact := doc_line_no_at(&d, lo)
+		li_chk(bad, exact && got == li_truth(c, lo), fmt.tprintf("last covered byte %d is exact (%d, want %d)", lo, got, li_truth(c, lo)))
+		hi := n * LINE_CKPT_STRIDE
+		_, e := doc_line_no_at(&d, hi)
+		li_chk(bad, !e, fmt.tprintf("first uncovered byte %d refuses (exact=%v)", hi, e))
+		_, e2 := doc_line_no_at(&d, len(c))
+		li_chk(bad, !e2, fmt.tprintf("end of an unfinished index refuses (exact=%v)", e2))
+	}
+
+	// A reader hammering doc_line_no_at on the main thread for the whole duration
+	// of a real scan -- which is how it will actually be used, since the point of
+	// the checkpoints is answering for the visible rows before the index finishes.
+	//
+	// Probes land exactly ON stride boundaries, so the forward scan is zero bytes
+	// and the answer IS the checkpoint's recorded line_no. That makes this the
+	// read that can see a half-written entry: a torn Line_Ckpt whose offset landed
+	// but whose line_no had not would come back as a confident zero. Every exact
+	// answer is checked against a table computed before the worker started.
+	@(private = "file")
+	li_part_concurrent :: proc(bad: ^int) {
+		fmt.println("-- concurrent reads during a live scan --")
+		c := li_fixture(64 * 1024 * 1024)
+		strides := len(c) / LINE_CKPT_STRIDE + 1
+		truth := make([]int, strides)
+		defer delete(truth)
+		n := 0
+		for i in 0 ..< len(c) {
+			if i % LINE_CKPT_STRIDE == 0 {truth[i / LINE_CKPT_STRIDE] = n}
+			if c[i] == '\n' {n += 1}
+		}
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		wrong, exacts, refusals, passes := 0, 0, 0, 0
+		for !doc_index_done(&d) {
+			passes += 1
+			for k in 0 ..< strides {
+				got, exact := doc_line_no_at(&d, k * LINE_CKPT_STRIDE)
+				if !exact {
+					refusals += 1
+					continue
+				}
+				exacts += 1
+				if got != truth[k] {wrong += 1}
+			}
+		}
+		li_chk(bad, refusals > 0, fmt.tprintf("the reader really did race the scan: %d refusals over %d passes", refusals, passes))
+		li_chk(bad, exacts > 0, fmt.tprintf("...and really did get answers while it ran (%d)", exacts))
+		li_chk(bad, wrong == 0, fmt.tprintf("every answer during the scan was correct (%d wrong of %d)", wrong, exacts))
+	}
+
+	// Edits against a FINISHED index. The array is main-thread-owned from that
+	// point, so every edit shifts it into the document's own coordinates instead of
+	// lowering a floor that only ever falls -- which is what used to blank every
+	// row number below an edited cell, permanently, because nothing (a save least
+	// of all) ever raised the floor again.
+	//
+	// Each edit is a different shape of the repair rule, and each is followed by a
+	// full re-verification rather than one probe: an insert that adds newlines, a
+	// delete that removes them, and a replace whose range straddles a live
+	// checkpoint. The edits are cumulative on purpose -- a repair that is only
+	// correct against a pristine array is not a repair.
+	@(private = "file")
+	li_part_edits :: proc(bad: ^int) {
+		fmt.println("-- edits against a finished index --")
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		before_n := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, !d.idx.ckpt_doc, "a freshly indexed buffer is NOT yet in document coordinates (nothing has edited it)")
+
+		check :: proc(bad: ^int, d: ^Document, label: string) {
+			body := base.pt_collect(&d.pt)
+			defer delete(body)
+			li_verify(bad, d, body, label)
+		}
+
+		// 1. An insert that ADDS newlines, in the middle. Every checkpoint above it
+		//    moves by 14 bytes and by 3 lines; get either delta wrong and the
+		//    ground-truth comparison sees it within a byte of each entry.
+		at1 := 2 * LINE_CKPT_STRIDE + 100
+		doc_replace_range(&d, at1, 0, transmute([]u8)string("one\ntwo\nthree\n"))
+		li_chk(bad, d.idx.ckpt_doc, "the first edit promotes the array into document coordinates")
+		check(bad, &d, "after an insert of 3 newlines")
+
+		// 2. A delete that REMOVES newlines. This is the direction that needs the
+		//    removed count taken BEFORE the mutation -- counted after, it counts the
+		//    replacement (here, nothing) and every entry above lands on the wrong
+		//    line.
+		at2 := 4 * LINE_CKPT_STRIDE + 50
+		doc_replace_range(&d, at2, 400, nil)
+		check(bad, &d, "after a 400-byte delete")
+
+		// 3. A replace whose range STRADDLES a live checkpoint: the entry it names
+		//    is inside the replaced text, so it is destroyed and compacted out while
+		//    everything above it shifts.
+		o := d.idx.ckpts[5].offset
+		was := intrinsics.atomic_load(&d.idx.ckpt_n)
+		doc_replace_range(&d, o - 40, 80, transmute([]u8)string("A\nB\n"))
+		now := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, now == was - 1, fmt.tprintf("a replace across a checkpoint destroys exactly that one entry (%d -> %d)", was, now))
+		check(bad, &d, "after a replace across a checkpoint")
+
+		// 4. An edit at offset 0 -- the case that used to poison the whole file,
+		//    because every later offset shifted and nothing shifted with it.
+		doc_replace_range(&d, 0, 0, transmute([]u8)string("x\n"))
+		check(bad, &d, "after an edit at offset 0")
+		li_chk(bad, intrinsics.atomic_load(&d.idx.ckpt_n) == before_n - 1, fmt.tprintf("...and the array is still %d entries, not rebuilt (%d)", before_n - 1, intrinsics.atomic_load(&d.idx.ckpt_n)))
+	}
+
+	// The case Wyatt reported, end to end: edit a cell near the top of a CSV, SAVE,
+	// and ask for the row numbers below the edit.
+	//
+	// This is the assertion the whole change exists for, and it is written through
+	// doc_save_err rather than around it because the old failure was specifically
+	// that a save reconciles NOTHING -- it writes the buffer to disk and leaves both
+	// the piece tree and the indexed original exactly as they were, so the floor an
+	// edit dropped stayed dropped and only closing and reopening the file brought
+	// the numbers back.
+	@(private = "file")
+	li_part_saved :: proc(bad: ^int) {
+		fmt.println("-- edit a cell, save, read the row numbers below it --")
+		tmp := os.get_env("TEMP", context.temp_allocator)
+		if tmp == "" {
+			fmt.println("  (TEMP is unset -- skipping rather than writing into the cwd)")
+			return
+		}
+		p, _ := filepath.join({tmp, "newtpad-ckpt-save.csv"}, context.temp_allocator)
+		defer os.remove(p)
+
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		// "A cell near the top": inside the third line, a few hundred bytes in, so
+		// that everything the table view would draw sits BELOW it.
+		at := 300
+		doc_replace_range(&d, at, 6, transmute([]u8)string("EDITED"))
+		li_chk(bad, d.idx.ckpt_doc, "the cell edit promoted the array")
+
+		err := doc_save_err(&d, p)
+		li_chk(bad, err == .None, fmt.tprintf("the save succeeded (%v)", err))
+		li_chk(bad, !d.modified, "...and the document is no longer modified")
+
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		answered, _ := li_verify(bad, &d, body, "after the save")
+		li_chk(bad, answered > 100, fmt.tprintf("...and it answered for real (%d probes, not a vacuous pass)", answered))
+		// Named on its own, in the exact shape the table view asks in: a row far
+		// below the edit, which is what went blank.
+		far := 6 * LINE_CKPT_STRIDE
+		got, exact := doc_line_no_at(&d, far)
+		want := li_truth(body, far)
+		li_chk(bad, exact && got == want, fmt.tprintf("a row %d bytes below the edited cell reads line %d, exact=%v (want %d)", far - at, got, exact, want))
+	}
+
+	// A delete that swallows more than one whole stride: the entries it spans name
+	// bytes that no longer exist, so they are DESTROYED rather than shifted. Left
+	// in place they would name whatever moved up into them -- a checkpoint quietly
+	// describing a different line, which every lookup above would then inherit.
+	@(private = "file")
+	li_part_destroyed :: proc(bad: ^int) {
+		fmt.println("-- a delete that destroys whole checkpoints --")
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		// One edit to take the promotion, well away from the delete below.
+		doc_replace_range(&d, 10, 0, transmute([]u8)string("z"))
+		was := intrinsics.atomic_load(&d.idx.ckpt_n)
+
+		lo := d.idx.ckpts[2].offset - 10
+		hi := d.idx.ckpts[4].offset + 10
+		li_chk(bad, hi - lo > 2 * LINE_CKPT_STRIDE, fmt.tprintf("the delete really does span more than one whole stride (%d bytes)", hi - lo))
+		doc_replace_range(&d, lo, hi - lo, nil)
+		now := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, now == was - 3, fmt.tprintf("the three entries inside the deleted range were compacted out (%d -> %d, want %d)", was, now, was - 3))
+		// Sortedness is what the binary search rests on, and compaction is the one
+		// rule that can break it by leaving a hole.
+		sorted := true
+		for k in 1 ..< now {
+			if d.idx.ckpts[k].offset <= d.idx.ckpts[k - 1].offset {sorted = false}
+		}
+		li_chk(bad, sorted, "...and the surviving entries are still strictly increasing")
+
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		li_verify(bad, &d, body, "after the multi-stride delete")
+	}
+
+	// A paste bigger than CKPT_SCAN_CAP. Two surviving checkpoints are now further
+	// apart than the lookup will scan, so the offsets between them are REFUSED --
+	// which is the bound being real. The rest of the file must be unaffected: the
+	// whole reason the cap exists is that a huge paste should cost the rows near it
+	// their numbers, not the file its numbering.
+	@(private = "file")
+	li_part_bigpaste :: proc(bad: ^int) {
+		fmt.println("-- a paste wider than the scan cap --")
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		doc_replace_range(&d, 10, 0, transmute([]u8)string("z")) // take the promotion
+
+		blob := li_fixture(3 * CKPT_SCAN_CAP, 0x1234_5678_9ABC_DEF)
+		defer delete(blob)
+		at := d.idx.ckpts[3].offset + 20
+		doc_replace_range(&d, at, 0, blob)
+
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		answered, refused := li_verify(bad, &d, body, "after a 384 KB paste")
+		li_chk(bad, refused > 0, fmt.tprintf("the cap really did refuse something (%d refused)", refused))
+		li_chk(bad, answered > 100, fmt.tprintf("...and the rest of the file still answers (%d)", answered))
+		// The refusal is local, stated as a place rather than a count: an offset a
+		// stride BELOW the paste is nowhere near it and must still be exact.
+		below := d.idx.ckpts[3].offset - LINE_CKPT_STRIDE / 2
+		got, exact := doc_line_no_at(&d, below)
+		li_chk(bad, exact && got == li_truth(body, below), fmt.tprintf("an offset below the paste is unaffected (%d, exact=%v, want %d)", got, exact, li_truth(body, below)))
+	}
+
+	// Undo and redo restore a whole piece tree through pt_restore and do NOT go
+	// through the edit path, so the repair never sees them. The checkpoints belong
+	// to the state, so they travel with it on the Snapshot.
+	//
+	// The assertion that matters is not "exact" -- it is exact AND equal to line
+	// numbers counted over the restored buffer. A stale array survives an
+	// exactness-only check perfectly: it answers confidently, off the previous
+	// buffer's offsets. Never wrong-and-exact is the contract; blank would have
+	// been acceptable, a wrong number never.
+	@(private = "file")
+	li_part_undo :: proc(bad: ^int) {
+		fmt.println("-- undo and redo --")
+		c := li_fixture(512 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		check :: proc(bad: ^int, d: ^Document, label: string) {
+			body := base.pt_collect(&d.pt)
+			defer delete(body)
+			li_verify(bad, d, body, label)
+		}
+
+		// Two edits of different shapes, so undo has to restore an array that
+		// differs from the current one both by a shift and by a destroyed entry.
+		doc_replace_range(&d, 3 * LINE_CKPT_STRIDE + 7, 0, transmute([]u8)string("aa\nbb\ncc\n"))
+		after_first := intrinsics.atomic_load(&d.idx.ckpt_n)
+		o := d.idx.ckpts[6].offset
+		doc_replace_range(&d, o - 50, 100, transmute([]u8)string("Q\n"))
+		after_second := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, after_second == after_first - 1, fmt.tprintf("precondition -- the second edit destroyed an entry (%d -> %d)", after_first, after_second))
+		check(bad, &d, "before any undo")
+
+		doc_undo(&d)
+		li_chk(bad, intrinsics.atomic_load(&d.idx.ckpt_n) == after_first, fmt.tprintf("undo brought the destroyed entry back (%d, want %d)", intrinsics.atomic_load(&d.idx.ckpt_n), after_first))
+		check(bad, &d, "after one undo")
+
+		doc_undo(&d)
+		check(bad, &d, "after undoing back to the opened state")
+
+		doc_redo(&d)
+		check(bad, &d, "after one redo")
+		doc_redo(&d)
+		li_chk(bad, intrinsics.atomic_load(&d.idx.ckpt_n) == after_second, fmt.tprintf("redo restored the compacted array (%d, want %d)", intrinsics.atomic_load(&d.idx.ckpt_n), after_second))
+		check(bad, &d, "after redoing back to the edited state")
+
+		// And the path where the array CANNOT be restored: a snapshot taken before
+		// the index was ever adopted carries no clone, so the restore must fall back
+		// to refusing rather than keep the live array. Reached here by undoing to
+		// the opened state and asking with the flag forced off -- the same state
+		// apply_snapshot lands in when a doc_index_start has run in between.
+		doc_undo(&d)
+		doc_undo(&d)
+		d.idx.ckpt_doc = false
+		wrong := 0
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		for at := 0; at <= len(body); at += LINE_CKPT_STRIDE / 4 {
+			got, exact := doc_line_no_at(&d, at)
+			if exact && got != li_truth(body, at) {wrong += 1}
+		}
+		li_chk(bad, wrong == 0, fmt.tprintf("with the array unusable, nothing is answered WRONG (%d)", wrong))
+	}
+
+	// The one case the repair genuinely cannot fix, kept as an explicit contract
+	// rather than left to be rediscovered: an edit made WHILE the worker is still
+	// scanning. The array is being written concurrently in the ORIGINAL's
+	// coordinates, so the main thread must not shift it, and nothing records what
+	// the shift would have been. The old edit_floor gate is the answer, and it is
+	// still exactly the old gate -- exact below the lowest edit, refusing at and
+	// above it.
+	@(private = "file")
+	li_part_midscan_edits :: proc(bad: ^int) {
+		fmt.println("-- an edit DURING the scan keeps the floor gate --")
+		c := li_fixture(64 * 1024 * 1024)
+		n := len(c)
+		snapshot := make([]u8, n) // c is handed to the document below
+		copy(snapshot, c)
+		defer delete(snapshot)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for intrinsics.atomic_load(&d.idx.ckpt_n) < 8 && !doc_index_done(&d) {}
+		mid := 5 * LINE_CKPT_STRIDE
+		doc_replace_range(&d, mid, 0, transmute([]u8)string("mid\n"))
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		li_chk(bad, !d.idx.ckpt_doc, "the array was never promoted (the edit raced the worker)")
+		li_chk(bad, d.idx.edit_floor == mid, fmt.tprintf("...and the floor records where they diverged (%d, want %d)", d.idx.edit_floor, mid))
+		below := mid - 9
+		bgot, bexact := doc_line_no_at(&d, below)
+		li_chk(bad, bexact && bgot == li_truth(snapshot, below), fmt.tprintf("offset %d below the edit is still exact (%d, want %d)", below, bgot, li_truth(snapshot, below)))
+		// Strictly INSIDE the indexed content, so this is the floor refusing and not
+		// the length check: a probe past the end is refused before the floor is ever
+		// consulted and would stay green with the gate deleted.
+		above := mid + 9
+		_, past := doc_line_no_at(&d, above)
+		li_chk(bad, !past, fmt.tprintf("offset %d above it refuses, and is inside the content (%d bytes) (exact=%v)", above, len(d.idx.content), past))
+
+		// A later edit, now that the worker HAS finished, must not promote: the
+		// array it would adopt was already invalidated by the edit above.
+		doc_replace_range(&d, 20 * LINE_CKPT_STRIDE, 0, transmute([]u8)string("late\n"))
+		li_chk(bad, !d.idx.ckpt_doc, "a later edit still does not promote a raced array")
+		_, still := doc_line_no_at(&d, above)
+		li_chk(bad, !still, fmt.tprintf("...and offset %d still refuses (exact=%v)", above, still))
+	}
+
+	// The index RESTARTS under a repaired array. doc_detach_mapping and
+	// doc_recover_from_fault both do this: they copy the mapped original into
+	// private memory and re-scan it, which produces checkpoints in `content`'s
+	// coordinates again. The repaired-mode flag has to go off with the array it
+	// described -- left on, the fresh grid is read as document offsets and every
+	// row below the edit comes back exact and wrong.
+	//
+	// edit_floor is what carries the divergence across the restart, which is why it
+	// is still maintained in the repaired mode where nothing reads it.
+	@(private = "file")
+	li_part_restart :: proc(bad: ^int) {
+		fmt.println("-- the index restarts under a repaired array --")
+		c := li_fixture(512 * 1024)
+		n := len(c)
+		snapshot := make([]u8, n) // c is handed to the document below
+		copy(snapshot, c)
+		defer delete(snapshot)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		mid := 5 * LINE_CKPT_STRIDE
+		doc_replace_range(&d, mid, 0, transmute([]u8)string("inserted\n"))
+		li_chk(bad, d.idx.ckpt_doc, "precondition -- the array was repaired before the restart")
+
+		doc_index_start(&d) // the shape doc_detach_mapping / doc_recover_from_fault have
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		li_chk(bad, !d.idx.ckpt_doc, "the restart put the array back into content coordinates")
+		li_chk(bad, d.idx.edit_floor == mid, fmt.tprintf("...and edit_floor still knows where they diverged (%d, want %d)", d.idx.edit_floor, mid))
+
+		below := mid - 100
+		bgot, bexact := doc_line_no_at(&d, below)
+		li_chk(bad, bexact && bgot == li_truth(snapshot, below), fmt.tprintf("below the edit is exact off the fresh scan (%d, want %d)", bgot, li_truth(snapshot, below)))
+		wrong, exacts := 0, 0
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		for at := 0; at <= len(body); at += LINE_CKPT_STRIDE / 8 {
+			got, exact := doc_line_no_at(&d, at)
+			if !exact {continue}
+			exacts += 1
+			if got != li_truth(body, at) {wrong += 1}
+		}
+		li_chk(bad, wrong == 0, fmt.tprintf("nothing above the floor is answered wrong after the restart (%d wrong of %d exact)", wrong, exacts))
+	}
+
+	// The same restart, through the product path that makes it worst: a line-ending
+	// conversion rewrites every terminator and then re-indexes the UNCONVERTED
+	// original, so document offsets are wrong by one byte per preceding line all
+	// the way down. Nothing here may be answered at all above offset 0, and
+	// certainly nothing wrongly.
+	@(private = "file")
+	li_part_eolconv :: proc(bad: ^int) {
+		fmt.println("-- a line-ending conversion re-indexes the old original --")
+		lf := li_fixture(256 * 1024)
+		defer delete(lf)
+		b := make([dynamic]u8, 0, 2 * len(lf))
+		for x in lf {
+			if x == '\n' {append(&b, '\r')}
+			append(&b, x)
+		}
+		c := make([]u8, len(b))
+		copy(c, b[:])
+		delete(b)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		d.eol = .CRLF
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		doc_replace_range(&d, 100, 0, transmute([]u8)string("z")) // adopt the array
+		li_chk(bad, d.idx.ckpt_doc, "precondition -- the array was repaired before the conversion")
+
+		doc_set_line_ending(&d, .LF)
+		li_chk(bad, d.eol == .LF, "the conversion ran")
+		li_chk(bad, !d.idx.ckpt_doc, "...and it put the array back into content coordinates")
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		body := base.pt_collect(&d.pt)
+		defer delete(body)
+		li_chk(bad, len(body) < len(d.idx.content), fmt.tprintf("the document really is shorter than what is indexed (%d vs %d)", len(body), len(d.idx.content)))
+		wrong, exacts := 0, 0
+		for at := 0; at <= len(body); at += LINE_CKPT_STRIDE / 8 {
+			got, exact := doc_line_no_at(&d, at)
+			if !exact {continue}
+			exacts += 1
+			if got != li_truth(body, at) {wrong += 1}
+		}
+		li_chk(bad, wrong == 0, fmt.tprintf("nothing is answered off the unconverted original (%d wrong of %d exact)", wrong, exacts))
+	}
+
+	// What the repair costs per edit, measured as a difference rather than
+	// asserted: typing at the FRONT of the buffer (every entry shifts) against
+	// typing at the END (ckpt_repair's early-out fires and nothing shifts).
+	//
+	// Both loops let the caret advance with the text instead of resetting it,
+	// because push_undo coalesces a typing run only while `cursor == last_edit_at`
+	// -- reset the caret and every keystroke takes a full Snapshot (a cloned piece
+	// tree AND a cloned checkpoint array), which is a real cost but not the one
+	// this part is named after. Measured with the reset in place the gap read
+	// 220.6 us/edit and was almost entirely pt_snapshot. Coalescing both loops
+	// leaves the piece-table insert, the bookmark pass and the newline accounting
+	// identical between them, so the gap is the repair loop and nothing else.
+	@(private = "file")
+	li_part_cost :: proc(bad: ^int) {
+		fmt.println("-- cost of the repair, per edit --")
+		c := li_fixture(64 * 1024 * 1024)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		entries := intrinsics.atomic_load(&d.idx.ckpt_n)
+		doc_replace_range(&d, d.pt.length, 0, transmute([]u8)string("z")) // promote
+		li_chk(bad, d.idx.ckpt_doc, "precondition -- the array is being repaired")
+
+		REP :: 20000
+		undo_before := len(d.undo)
+		d.cursor, d.anchor = d.pt.length, d.pt.length
+		t0 := time.tick_now()
+		for _ in 0 ..< REP {doc_insert_rune(&d, 'x')} // at the end: the early-out
+		tail := f64(time.duration_nanoseconds(time.tick_since(t0))) / REP
+		d.cursor, d.anchor = 0, 0
+		t1 := time.tick_now()
+		for _ in 0 ..< REP {doc_insert_rune(&d, 'x')} // at the front: every entry shifts
+		head := f64(time.duration_nanoseconds(time.tick_since(t1))) / REP
+		// The coalescing really did hold: two runs, two undo entries, not 40000.
+		// Without this the two numbers are dominated by snapshot cloning and the
+		// difference between them means nothing.
+		li_chk(bad, len(d.undo) - undo_before <= 2, fmt.tprintf("both runs coalesced into one undo entry each (%d added)", len(d.undo) - undo_before))
+		fmt.printfln(
+			"  %d checkpoints: %.0f ns/edit at the tail (early-out), %.0f ns/edit at the front, repair = %.0f ns (%.2f ns/entry) [debug build]",
+			entries,
+			tail,
+			head,
+			head - tail,
+			max(head - tail, 0) / f64(max(entries, 1)),
+		)
+		li_chk(bad, entries > 500, fmt.tprintf("...measured over a genuinely large array (%d entries)", entries))
+	}
+
+	// A read that faulted must not come back as `exact`.
+	//
+	// The forward scan goes through pt_read -> safe_copy, which on a mapped
+	// original that has been truncated underneath us ZERO-FILLS what it could not
+	// read, returns false, and sets pt.fault. Nothing in the returned count says
+	// so, so the honest-looking answer is a confidently TOO-LOW line number -- the
+	// bounded scan reporting a confident wrong answer that this signature's second
+	// result exists to prevent.
+	//
+	// safe_copy is a mutable global (base/piecetable.odin) exactly so a test can be
+	// the failing mapping. The fixture leaves the BYTES correct and only reports
+	// the copy as failed, so what is under test is the guard rather than garbage
+	// input -- and the answer it suppresses is a plausible one, not an obvious one.
+	@(private = "file")
+	li_part_fault :: proc(bad: ^int) {
+		fmt.println("-- a faulted read refuses --")
+		c := li_fixture(512 * 1024)
+		snapshot := make([]u8, len(c))
+		copy(snapshot, c)
+		defer delete(snapshot)
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		// Deliberately NOT on a stride boundary: a probe that lands on one counts
+		// zero bytes forward, reads nothing, and so could not fault however broken
+		// the mapping is. The bug needs a scan to hide in.
+		probe := 3 * LINE_CKPT_STRIDE + 4321
+		want := li_truth(snapshot, probe)
+		got, exact := doc_line_no_at(&d, probe)
+		li_chk(bad, exact && got == want, fmt.tprintf("clean read at %d is exact (%d, want %d)", probe, got, want))
+
+		faulting :: proc(dst, src: []u8) -> bool {
+			// Exactly what the SEH shim leaves behind for a page it could not read:
+			// the destination zeroed, and `false` returned. Zeros hold no newlines,
+			// so the count comes back genuinely too LOW rather than merely flagged --
+			// the assertion below is then about a confident WRONG ANSWER, which is
+			// the failure this guard exists to stop, not about a bookkeeping bit.
+			for i in 0 ..< len(dst) {dst[i] = 0}
+			return false
+		}
+		base.safe_copy = faulting
+		fgot, fexact := doc_line_no_at(&d, probe)
+		base.safe_copy = base.default_copy
+		li_chk(bad, !fexact, fmt.tprintf("...and refuses once that read faults (%d, exact=%v)", fgot, fexact))
+		// PEEKED, not taken. doc_fault_pending is what arms the recovery, and a
+		// reader that consumed the flag would refuse correctly and then leave the
+		// document attached to a mapping it can no longer read.
+		li_chk(bad, base.pt_take_fault(&d.pt), "...and the flag survives for doc_fault_pending to take")
+
+		// The index worker's own copy of the same event: it aborts mid-chunk, so
+		// the checkpoints it published describe bytes that have since changed.
+		intrinsics.atomic_store(&d.idx.fault, true)
+		_, wexact := doc_line_no_at(&d, probe)
+		intrinsics.atomic_store(&d.idx.fault, false)
+		li_chk(bad, !wexact, fmt.tprintf("a faulted index WORKER refuses too (exact=%v)", wexact))
+
+		// ...and the refusals really were the faults. Without this the two checks
+		// above pass for a procedure that has simply stopped answering.
+		rgot, rexact := doc_line_no_at(&d, probe)
+		li_chk(bad, rexact && rgot == want, fmt.tprintf("and it answers again once both flags clear (%d, want %d, exact=%v)", rgot, want, rexact))
+	}
+
+	// A Document whose indexed content is swapped underneath it -- the shape
+	// doc_detach_mapping and doc_recover_from_fault both have. Without a reset in
+	// doc_index_start the published count outlives the file it described, and the
+	// next lookup answers from the previous file's offsets.
+	@(private = "file")
+	li_part_reuse :: proc(bad: ^int) {
+		fmt.println("-- content swapped underneath the index --")
+		big := li_fixture(16 * 1024 * 1024)
+		d := doc_from_content(big, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+		was := intrinsics.atomic_load(&d.idx.ckpt_n)
+
+		// A different seed AND a smaller size, so a checkpoint left over from the
+		// first file is both present and wrong for the second.
+		small := li_fixture(4 * 1024 * 1024, 0xDEAD_BEEF_0123_4567)
+		strides := len(small) / LINE_CKPT_STRIDE + 1
+		truth := make([]int, strides)
+		defer delete(truth)
+		n := 0
+		for i in 0 ..< len(small) {
+			if i % LINE_CKPT_STRIDE == 0 {truth[i / LINE_CKPT_STRIDE] = n}
+			if small[i] == '\n' {n += 1}
+		}
+
+		doc_index_stop(&d)
+		base.pt_destroy(&d.pt)
+		delete(d.original)
+		d.original = small
+		d.pt = base.pt_init(small)
+		d.idx.content = small
+		d.idx.total = len(small)
+		doc_index_start(&d)
+		// Probed WHILE the new scan runs, which is the only window in which a
+		// stale checkpoint can be read: once the shorter file finishes, its own
+		// count has overwritten the longer one's and every entry below it has been
+		// rewritten. An answer here must be the new file's or none at all.
+		wrong, exacts, refusals := 0, 0, 0
+		for !doc_index_done(&d) {
+			for k in 0 ..< strides {
+				got, exact := doc_line_no_at(&d, k * LINE_CKPT_STRIDE)
+				if !exact {
+					refusals += 1
+					continue
+				}
+				exacts += 1
+				if got != truth[k] {wrong += 1}
+			}
+		}
+		li_chk(bad, refusals > 0, fmt.tprintf("the swap really was probed mid-scan (%d refusals)", refusals))
+		li_chk(bad, wrong == 0, fmt.tprintf("no answer came from the PREVIOUS file (%d wrong of %d exact)", wrong, exacts))
+
+		want := (len(small) + LINE_CKPT_STRIDE - 1) / LINE_CKPT_STRIDE
+		got_n := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, was > want, fmt.tprintf("the first file really was the bigger one (%d vs %d checkpoints)", was, want))
+		li_chk(bad, got_n == want, fmt.tprintf("published count follows the new content: %d (want %d, stale would be %d)", got_n, want, was))
+		li_chk(bad, len(d.idx.ckpts) == strides, fmt.tprintf("the array itself was resized: %d entries (want %d, stale would be %d)", len(d.idx.ckpts), strides, 16 * 1024 * 1024 / LINE_CKPT_STRIDE + 1))
+		wrong2 := 0
+		probes := li_probes(len(small))
+		for at in probes {
+			got, exact := doc_line_no_at(&d, at)
+			if !exact || got != li_truth(small, at) {wrong2 += 1}
+		}
+		delete(probes)
+		li_chk(bad, wrong2 == 0, fmt.tprintf("every probe answers from the NEW content (%d wrong)", wrong2))
+	}
+
+	// The memory figure, measured rather than computed: index a real file off
+	// disk and read back the array the index actually allocated.
+	@(private = "file")
+	li_part_memory :: proc(bad: ^int, path: string) {
+		fmt.println("-- checkpoint memory, real file --")
+		p := path
+		ours := false
+		if p == "" {
+			tmp := os.get_env("TEMP", context.temp_allocator)
+			if tmp == "" {
+				// Without this the join is a bare filename and the 16 MB fixture
+				// lands in the repo working tree.
+				fmt.println("  (TEMP is unset -- skipping rather than writing 16 MB into the cwd)")
+				return
+			}
+			// temp_allocator: this is a per-run scratch path, and on
+			// context.allocator it was simply leaked.
+			p, _ = filepath.join({tmp, "newtpad-lineidx-fixture.csv"}, context.temp_allocator)
+			if !os.exists(p) {
+				body := li_fixture(16 * 1024 * 1024)
+				defer delete(body)
+				if werr := os.write_entire_file(p, body); werr != nil {
+					fmt.printfln("  (could not write %s -- skipping)", p)
+					return
+				}
+				ours = true
+			}
+		}
+		// Deferred here, below every assignment to `p` and `ours`, so it cannot
+		// depend on when Odin evaluates a deferred statement's operands. Only a
+		// fixture THIS run created is removed: a path the caller passed, or one left
+		// by an earlier run, is not ours to delete. A mode that leaves 16 MB in
+		// %TEMP% behind is a mode people stop running.
+		defer if ours {os.remove(p)}
+		d, ok := doc_open(p)
+		if !ok {
+			fmt.printfln("  (could not open %s -- skipping)", p)
+			return
+		}
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) && !doc_index_faulted(&d) {time.sleep(time.Millisecond)}
+		if doc_index_faulted(&d) {
+			fmt.println("  (mapped read faulted -- skipping)")
+			return
+		}
+		bytes := len(d.idx.ckpts) * size_of(Line_Ckpt)
+		fmt.printfln(
+			"  %s: %.2f MB, %d lines, %d checkpoints (%d entries allocated) = %.1f KB, %.4f%% of the file",
+			filepath.base(p),
+			f64(d.idx.total) / (1024 * 1024),
+			doc_line_count(&d),
+			intrinsics.atomic_load(&d.idx.ckpt_n),
+			len(d.idx.ckpts),
+			f64(bytes) / 1024,
+			100 * f64(bytes) / f64(max(1, d.idx.total)),
+		)
+		// The last line is where the whole scheme would be caught wasting memory,
+		// so it gets an assertion rather than only a print.
+		li_chk(bad, bytes < d.idx.total / 100, "checkpoints cost under 1% of the file")
+		li_chk(bad, d.idx.total > 4 * 1024 * 1024, fmt.tprintf("...measured on a genuinely multi-MB file (%d bytes)", d.idx.total))
 	}
 
 	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the
@@ -2637,12 +3771,31 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
-		// `newtpad watchtest <dir>` — external-change detection and reconciliation.
+		// `newtpad watchtest [dir]` — external-change detection and reconciliation.
 		// This feature changes the document without the user asking, so the failure
 		// mode is data loss rather than a wrong pixel.
-		if os.args[1] == "watchtest" && len(os.args) > 2 {
+		//
+		// The directory is now OPTIONAL (it defaults under %TEMP%). It was required,
+		// which made this a two-argument mode, which is the keytest trap: a mode a
+		// bare sweep cannot run is a mode nothing runs, and `newtpad watchtest` with
+		// no directory fell through to opening the real GUI window and hanging.
+		if os.args[1] == "watchtest" {
 			bad := 0
-			dir := os.args[2]
+			dir := os.args[2] if len(os.args) > 2 else ""
+			if dir == "" {
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				if tmp == "" {
+					fmt.println("watchtest: no directory given and TEMP is unset")
+					return true
+				}
+				dir, _ = filepath.join({tmp, "newtpad-watchtest"}, context.temp_allocator)
+				if !os.exists(dir) {
+					if derr := os.make_directory(dir); derr != nil {
+						fmt.printfln("watchtest: could not create %q: %v", dir, derr)
+						return true
+					}
+				}
+			}
 			path := fmt.tprintf("%s\\watch.txt", dir)
 
 			plat.file_write_atomic(path, transmute([]u8)string("line one\nline two\n"))
@@ -2754,6 +3907,97 @@ when NEWTPAD_TESTS {
 			doc.had_bom = false
 			fmt.printfln("append refused for UTF-16=%v and BOM=%v  %s", u16_refused, bom_refused, "OK" if u16_refused && bom_refused else "FAIL")
 			if !(u16_refused && bom_refused) {bad += 1}
+
+			// --- watcher_publish: the ACTIVE document is watched whatever its slot ---
+			//
+			// WATCH_MAX bounds how many files the poller stats, and that poll is the
+			// whole of "never lock the user's file": a file outside it has no
+			// external-change detection at all, so the next save silently clobbers
+			// whatever another program wrote. A cap has to fall somewhere, but it
+			// must not fall on the buffer being looked at.
+			//
+			// Publishing in slot order alone put the cap wherever the tabs happened
+			// to sit, so with more than WATCH_MAX files open the active one dropped
+			// out as soon as it landed in a high slot -- silently, with no indicator.
+			// The first fixture is exactly that shape and no other: WATCH_MAX + 8
+			// documents with the active one LAST, which is the one position a
+			// slot-order walk can never reach.
+			//
+			// It is run a SECOND time under the cap, and that run is not decoration.
+			// The active document is published ahead of a loop that then skips it,
+			// and over the cap the skip cannot be observed at all -- the re-add is
+			// refused by `len(w.want) >= WATCH_MAX` anyway, so deleting the skip
+			// changes nothing and the "exactly once" assertion cannot fail. Under
+			// the cap the duplicate is real: a second entry for the same slot is a
+			// wasted stat every cycle and the same change reported twice to
+			// watcher_take. Same code, two fixtures, because one of them alone is
+			// the kind of assertion that reads as coverage and is not.
+			//
+			// Its own proc so test_mode_dispatch's frame never holds an App (§6's
+			// STATUS_STACK_OVERFLOW note), and because the assertions need a name.
+			watch_publish_part :: proc(bad: ^int, dir: string, N, active: int) {
+				fmt.printfln("--- watcher_publish: %d documents, active in slot %d (cap %d) ---", N, active, WATCH_MAX)
+				a: App
+				defer app_destroy(&a)
+				for i in 0 ..< N {
+					d := new(Document)
+					// Paths need not exist: watcher_publish only clones them, and the
+					// worker's file_stamp on a missing path is a fast miss.
+					d^ = doc_from_content(
+						transmute([]u8)strings.clone("x\n"),
+						fmt.tprintf("%s\\wp%03d.txt", dir, i),
+						.UTF8,
+					)
+					app_add(&a, d)
+				}
+				// Set directly rather than through app_activate: that would spawn an
+				// index thread and a lexer thread per tab, and none of this is about
+				// either.
+				a.active = active
+
+				w: Watcher
+				watcher_start(&w) // watcher_publish returns early while w.th is nil
+				defer watcher_stop(&w)
+				watcher_publish(&w, &a)
+
+				// The worker copies w.want under this same mutex.
+				sync.mutex_lock(&w.mu)
+				n := len(w.want)
+				first := -1
+				dupes := 0
+				for e, i in w.want {
+					if e.slot != a.active {continue}
+					dupes += 1
+					if first < 0 {first = i}
+				}
+				sync.mutex_unlock(&w.mu)
+
+				// Non-vacuity, and load-bearing twice over: over the cap it proves
+				// the fixture really does exceed it (otherwise "the active one is
+				// watched" is true of every arrangement); under the cap it is what
+				// catches a duplicate. Either way it proves the publish ran at all --
+				// forget watcher_start and w.want is empty, which would otherwise
+				// satisfy every "no wrong entry" phrasing of this test.
+				want_n := min(N, WATCH_MAX)
+				ok1 := n == want_n
+				fmt.printfln("  %-6s published %d of %d open documents (want %d)", "ok" if ok1 else "FAIL", n, N, want_n)
+				if !ok1 {bad^ += 1}
+
+				ok2 := first == 0
+				fmt.printfln("  %-6s the active document (slot %d) is published FIRST: index %d (want 0)", "ok" if ok2 else "FAIL", a.active, first)
+				if !ok2 {bad^ += 1}
+
+				// The second pass skips app.active; without that skip the active file
+				// is stat-ed twice a cycle and reported twice to watcher_take.
+				ok3 := dupes == 1
+				fmt.printfln("  %-6s ...exactly once, not twice (%d entries for slot %d)", "ok" if ok3 else "FAIL", dupes, a.active)
+				if !ok3 {bad^ += 1}
+			}
+			// Over the cap with the active document in the last slot -- the case the
+			// slot-order walk got wrong -- and under it, where the duplicate skip is
+			// observable.
+			watch_publish_part(&bad, dir, WATCH_MAX + 8, WATCH_MAX + 7)
+			watch_publish_part(&bad, dir, 5, 2)
 
 			fmt.printfln("watchtest: %d failures", bad)
 			return true
@@ -3149,14 +4393,23 @@ when NEWTPAD_TESTS {
 			fmt.println("--- tab width invalidates the cell caches ---")
 			{
 				// A literal tab in the MIDDLE of a field, so the measurement moves
-				// with the tab width: "a\tb" is 'a' + a tab from column 1 + 'b',
-				// which is 5 cells at width 4 and 9 at width 8. A LEADING tab
-				// would be one full width in both and could not tell them apart.
+				// with the tab width: "aaaaaaaaa\tb" is nine 'a's + a tab from
+				// column 9 + 'b', which is 13 cells at width 4 and 17 at width 8. A
+				// LEADING tab would be one full width in both and could not tell
+				// them apart.
+				//
+				// Nine 'a's rather than one, and that is not padding for its own
+				// sake: §10's floor moved TABLE_COL_MIN from 3 to 8 (see
+				// table.odin's reconciliation note), so the old "a\tb" fixture
+				// measured 5 at width 4 and was clamped straight up to 8. Both
+				// numbers have to sit ABOVE the floor or the width-4 reading is the
+				// clamp rather than the measurement, and the check would be
+				// asserting a constant.
 				cd := new(Document)
-				cd^ = doc_from_content(transmute([]u8)strings.clone("a\tb,c\nd,e\n"), "t.csv", .UTF8)
+				cd^ = doc_from_content(transmute([]u8)strings.clone("aaaaaaaaa\tb,c\nd,e\n"), "t.csv", .UTF8)
 				cd.table, cd.table_delim = true, ','
 				mdd := new(Document)
-				mdd^ = doc_from_content(transmute([]u8)strings.clone("| a\tb | c |\n|---|---|\n| d | e |\n"), "t.md", .UTF8)
+				mdd^ = doc_from_content(transmute([]u8)strings.clone("| aaaaaaaaa\tb | c |\n|---|---|\n| d | e |\n"), "t.md", .UTF8)
 				app_add(&az, cd)
 				app_add(&az, mdd)
 
@@ -3165,9 +4418,15 @@ when NEWTPAD_TESTS {
 				w4 := cd.table_widths[0] if len(cd.table_widths) > 0 else -1
 				m4 := -1
 				if c := md_table_ensure(mdd, &t2, 0); c != nil {m4 = c.widths[0]}
-				base4 := w4 == 5 && m4 == 5
-				fmt.printfln("  %-6s at width 4: grid col 0 = %d cells, md col 0 = %d (want 5, 5)", "ok" if base4 else "FAIL", w4, m4)
+				base4 := w4 == 13 && m4 == 13
+				fmt.printfln("  %-6s at width 4: grid col 0 = %d cells, md col 0 = %d (want 13, 13)", "ok" if base4 else "FAIL", w4, m4)
 				if !base4 {bad += 1}
+				// ...and the reading is a measurement, not TABLE_COL_MIN in
+				// disguise. Without this the pair above passes with every column
+				// pinned at the floor.
+				above := w4 > TABLE_COL_MIN
+				fmt.printfln("  %-6s ...and it is above TABLE_COL_MIN (%d > %d), so it is a measurement", "ok" if above else "FAIL", w4, TABLE_COL_MIN)
+				if !above {bad += 1}
 
 				for _ in 0 ..< 4 {settings_toggle_row(&rcz, 8, 1)} // 4 -> 8
 
@@ -3176,9 +4435,9 @@ when NEWTPAD_TESTS {
 				w8 := cd.table_widths[0] if len(cd.table_widths) > 0 else -1
 				m8 := -1
 				if c := md_table_ensure(mdd, &t2, 0); c != nil {m8 = c.widths[0]}
-				movd := w8 == 9 && m8 == 9
+				movd := w8 == 17 && m8 == 17
 				fmt.printfln(
-					"  %-6s at width 8: grid col 0 = %d cells, md col 0 = %d (want 9, 9; a stale cache reports 5)",
+					"  %-6s at width 8: grid col 0 = %d cells, md col 0 = %d (want 17, 17; a stale cache reports 13)",
 					"ok" if movd else "FAIL", w8, m8,
 				)
 				if !movd {bad += 1}
@@ -8711,6 +9970,7 @@ when NEWTPAD_TESTS {
 					TABLE_HEADER_H = sx(TABLE_HEADER_H_96)
 					TABLE_ROW_H = sx(TABLE_ROW_H_96)
 					TABLE_CELL_PAD_X = sx(TABLE_CELL_PAD_X_96)
+					TABLE_GUTTER_W = sx(TABLE_GUTTER_W_96)
 					TOP_INSET, FILTER_BANNER_H = 0, 0
 
 					px := f32(int(BASE_PX_96 * scale + 0.5))
@@ -8723,7 +9983,7 @@ when NEWTPAD_TESTS {
 					// named. The precondition below is what caught that, and this
 					// is what it caught.
 					W := f32(1000)
-					H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
 					clear(&doc.table_widths)
 					table_compute_widths(&doc, &t)
 					doc.table_cols = len(doc.table_widths)
@@ -8870,10 +10130,11 @@ when NEWTPAD_TESTS {
 				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
 				px := BASE_PX_96
 				cw := plat.text_char_width(&t, px, .Doc)
 				W := f32(1000)
-				H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
 				clear(&doc.table_widths)
 				table_compute_widths(&doc, &t)
 				doc.table_cols = len(doc.table_widths)
@@ -9017,6 +10278,83 @@ when NEWTPAD_TESTS {
 					chk(&bad, table_header_h(big) >= line_height(big), fmt.tprintf("...and so does the header (%.0f vs %.0f)", table_header_h(big), line_height(big)))
 					chk(&bad, table_row_h(BASE_PX_96) == TABLE_ROW_H, fmt.tprintf("at the default size the SPEC's number governs (%.0f)", table_row_h(BASE_PX_96)))
 				}
+
+				// 11. The row-number gutter's SEAM (§10, group B). The gutter is
+				//     56px taken from x = 0, and it is added inside
+				//     table_cols_layout -- the one x-axis producer -- so that the
+				//     draw, the cell hit-test, the link layout, the edit box and the
+				//     h-scrollbar all move by it together. The failure this guards
+				//     is not cosmetic: a draw offset by 56px over a hit-test that
+				//     was not resolves a click to the column LEFT of the one under
+				//     the pointer, and table_edit_commit writes that column's bytes.
+				//
+				//     So the probes are the two pixels either side of the boundary,
+				//     not a midpoint: what is DRAWN in the gutter must not be
+				//     CLICKABLE as a cell, and the first pixel past it must be
+				//     column 0's own.
+				{
+					gw := table_gutter_w()
+					chk(&bad, gw == TABLE_GUTTER_W_96, fmt.tprintf("the gutter is %.0fpx at 96 DPI (§10: 56)", gw))
+					chk(&bad, cols[0].x == gw, fmt.tprintf("the first cell starts AT the gutter's edge: x=%.1f (want %.1f)", cols[0].x, gw))
+					my := table_row_baseline_y(px, 0)
+					misses := 0
+					for probe in ([]f32{0, gw * 0.5, gw - 1, gw - 0.5}) {
+						if ok, _, _, _, _, _ := table_cell_at(&doc, probe, my, px, cw, trows, W); ok {
+							misses += 1
+							fmt.printfln("    x=%.1f inside the gutter resolved to a cell", probe)
+						}
+					}
+					chk(&bad, misses == 0, fmt.tprintf("no pixel of the gutter resolves to a cell (%d did)", misses))
+					okg, rg, cg, fsg, feg, _ := table_cell_at(&doc, gw + 1, my, px, cw, trows, W)
+					wg, _ := want_field(lines[:], 1, 0)
+					chk(
+						&bad,
+						okg && rg == 0 && cg == 0 && read_span(&doc, fsg, feg) == wg,
+						fmt.tprintf("...and the first pixel past it is row 0, column 0 (%q, want %q)", read_span(&doc, fsg, feg) if okg else "<no hit>", wg),
+					)
+					// Every OTHER consumer of the x axis moved with it. Enumerated
+					// rather than assumed: each of these derives its x from
+					// table_cols_layout, and this is what says so in a form that
+					// fails if one of them ever grows its own origin again.
+					//
+					//     The link probe needs a fixture with a URL in it, so it
+					//     gets its own document rather than a `len == 0` escape
+					//     hatch -- "no links were laid out" would satisfy any
+					//     assertion about where they start.
+					{
+						lsrc := "u,v\nhttps://example.com,x\nb,y\n"
+						lc := make([]u8, len(lsrc))
+						copy(lc, transmute([]u8)lsrc)
+						ld := doc_from_content(lc, "links.csv", .UTF8)
+						defer doc_close(&ld)
+						ld.table, ld.table_delim = true, ','
+						table_compute_widths(&ld, &t)
+						ld.table_cols = len(ld.table_widths)
+						tl := table_links(&ld, &t, px, cw, trows, W)
+						lmin := f32(1e9)
+						for l in tl {lmin = min(lmin, l.x)}
+						chk(&bad, len(tl) > 0, fmt.tprintf("the link fixture really does produce a link (%d)", len(tl)))
+						chk(&bad, len(tl) > 0 && lmin >= gw, fmt.tprintf("the link layout starts past the gutter (leftmost x=%.1f, gutter %.1f)", lmin, gw))
+					}
+					chk(&bad, table_cell_text_x(cols[0]) >= gw, fmt.tprintf("the cell TEXT x -- the edit box's and the draw's -- is past it too (%.1f)", table_cell_text_x(cols[0])))
+					// The h-scrollbar's span comes from the same layout, so the
+					// gutter eats real column room and the span must reflect it,
+					// to the pixel. Probed at the exact boundary: a column is laid
+					// out when its x is strictly left of table_right, so column 1
+					// appears at one pixel past `gutter + column 0 + scrollbar`
+					// and not before. Both probes use the NATURAL width, at a
+					// window too narrow for §10's leftover distribution to run, so
+					// this measures the origin rather than the distribution.
+					nat0 := f32(doc.table_widths[0]) * cw + TABLE_CELL_PAD_X * 2
+					edge := gw + nat0 + SCROLLBAR_W
+					n1 := table_cols_fitting(&doc, cw, edge, 0)
+					n2 := table_cols_fitting(&doc, cw, edge + 1, 0)
+					chk(
+						&bad,
+						n1 == 1 && n2 == 2,
+						fmt.tprintf("the h-scrollbar's span counts columns from the gutter: %d fit at %.1fpx, %d at one pixel more (want 1, 2)", n1, edge, n2),
+					)
+				}
 				return
 			}
 
@@ -9046,6 +10384,7 @@ when NEWTPAD_TESTS {
 				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
 				BASE_PX = BASE_PX_96
 				px := BASE_PX_96
 
@@ -9073,7 +10412,7 @@ when NEWTPAD_TESTS {
 				// fixture that also has to land on "the editor's count and the
 				// grid's genuinely differ", not a re-use of the same numbers.
 				PG_ROWS :: 8
-				H := table_rows_top(px) + f32(PG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(PG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
 				trows := table_visible_rows(d, H, px)
 				erows := doc_visible_rows(d, H, line_h)
 				pre := trows == PG_ROWS && trows < len(lines) - 1
@@ -9148,6 +10487,7 @@ when NEWTPAD_TESTS {
 				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
 				BASE_PX = BASE_PX_96
 				px := BASE_PX_96
 				ER :: 6 // the data row edited: on screen at the start, off it after a page
@@ -9194,7 +10534,7 @@ when NEWTPAD_TESTS {
 					d.table_cols = len(d.table_widths)
 
 					ROWS :: 12
-					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
 					trows := table_visible_rows(d, H, px)
 					if trows != ROWS || ER >= trows {
 						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
@@ -9331,6 +10671,7 @@ when NEWTPAD_TESTS {
 				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
 				BASE_PX = BASE_PX_96
 				px := BASE_PX_96
 				ER :: 11 // the row from the finding's own scenario
@@ -9377,7 +10718,7 @@ when NEWTPAD_TESTS {
 					d.table_cols = len(d.table_widths)
 
 					ROWS :: 14
-					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
 					trows := table_visible_rows(d, H, px)
 					if trows != ROWS || ER + 1 >= trows {
 						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
@@ -9495,6 +10836,7 @@ when NEWTPAD_TESTS {
 				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
 				BASE_PX = BASE_PX_96
 
 				// Four sentinel colours, maximally far apart in every channel, in
@@ -9536,7 +10878,7 @@ when NEWTPAD_TESTS {
 				rows := table_visible_rows(&doc, f32(H), px)
 
 				plat.gfx_begin_frame(&h.gfx, bg_s[0], bg_s[1], bg_s[2])
-				table_draw(&h.gfx, &h.quads, &h.text, &doc, px, char_w, rows, f32(W))
+				table_draw(&h.gfx, &h.quads, &h.text, &doc, px, char_w, rows, f32(W), f32(H))
 				buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				chk(&bad, ok, "the readback succeeded")
 				if !ok {return}
@@ -9591,7 +10933,7 @@ when NEWTPAD_TESTS {
 				edoc.table, edoc.table_delim = true, ','
 				erows := table_visible_rows(&edoc, f32(H), px)
 				plat.gfx_begin_frame(&h.gfx, bg_s[0], bg_s[1], bg_s[2])
-				table_draw(&h.gfx, &h.quads, &h.text, &edoc, px, char_w, erows, f32(W))
+				table_draw(&h.gfx, &h.quads, &h.text, &edoc, px, char_w, erows, f32(W), f32(H))
 				ebuf, eok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				chk(&bad, eok, "the empty-document readback succeeded")
 				if eok {
@@ -9601,12 +10943,1569 @@ when NEWTPAD_TESTS {
 				return
 			}
 
-			bad := tg()
+			// F4: the zebra's parity rides the row's ABSOLUTE index, so a band
+			// belongs to a LINE and not to a slot on screen. tg_appearance above
+			// pins which rows are banded at doc.top == 0, and every parity rule
+			// ever proposed agrees there -- `r % 2` and `abs % 2` are the same
+			// function when visible row r IS absolute row r. The divergence only
+			// exists after an ODD scroll, which is why this is a separate proc with
+			// a separate readback rather than another sample in tg_appearance: it
+			// draws the SAME file twice, one data row apart, and compares the two
+			// frames against each other rather than against a constant.
+			//
+			// Its own proc for the usual stack-frame reason, and because it needs a
+			// finished Line_Index -- table_abs_rows refuses without one, which is
+			// itself asserted below so that "the numbers were never available" can
+			// never be mistaken for "the parity is stable".
+			tg_parity :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				W, H :: 1000, 700
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, W, H, "tablegridtest/parity") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return 0
+				}
+				defer headless_gpu_destroy(&h)
+
+				saved_theme, saved_scale := g_theme, UI_SCALE
+				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
+				BASE_PX = BASE_PX_96
+
+				// Sentinels, for tg_appearance's reason: Table_Zebra is deliberately
+				// close to Bg_Base in every real theme, and this check is entirely
+				// about telling those two apart.
+				bg_s := [4]f32{0, 0, 0, 1}
+				zeb_s := [4]f32{0, 0, 1, 1}
+				g_theme[.Bg_Base] = bg_s
+				g_theme[.Bg_Raised] = [4]f32{1, 0, 0, 1}
+				g_theme[.Border_Strong] = [4]f32{0, 1, 0, 1}
+				g_theme[.Table_Zebra] = zeb_s
+
+				banded :: proc(buf: []u8, w, x, y: int) -> bool {
+					i := (y * w + x) * 4
+					// Blue channel is the zebra sentinel's only non-zero one, and
+					// Bg_Base is black: a solid quad fill, so this is exact short of
+					// rounding.
+					return buf[i] > 200
+				}
+
+				src := "h0,h1\n"
+				for i in 0 ..< 24 {src = fmt.tprintf("%s a%d,b%d\n", src, i, i)}
+				content := transmute([]u8)strings.clone(src)
+				doc := doc_from_content(content, "parity.csv", .UTF8)
+				defer doc_close(&doc)
+				doc.table, doc.table_delim = true, ','
+				doc_index_start(&doc)
+				for !doc_index_done(&doc) {time.sleep(time.Millisecond)}
+
+				px := BASE_PX_96
+				char_w := plat.text_char_width(&h.text, px, .Doc)
+				rows := table_visible_rows(&doc, f32(H), px)
+
+				// The precondition that stops everything below being vacuous: the
+				// absolute index must actually ANSWER. Without a finished index
+				// table_abs_rows refuses, table_draw falls back to `r % 2`, and the
+				// whole check would be measuring the fallback.
+				a0 := table_abs_rows(&doc, 1)[0]
+				chk(&bad, a0 == 0, fmt.tprintf("precondition -- the index answers: row 0 is absolute %d (want 0; %d is the refusal)", a0, TABLE_ABS_NONE))
+				// ...and there must be enough rows on screen for an odd scroll to be
+				// observable at all.
+				chk(&bad, rows >= 4, fmt.tprintf("precondition -- %d rows fit (want >= 4)", rows))
+				if a0 != 0 || rows < 4 {return}
+
+				sx := 2 // left of every glyph this draw emits, gutter number included
+				shot :: proc(h: ^Headless_Gpu, doc: ^Document, px, char_w: f32, rows: int, bg: [4]f32) -> ([]u8, bool) {
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					table_draw(&h.gfx, &h.quads, &h.text, doc, px, char_w, rows, f32(W), f32(H))
+					return plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				}
+
+				// Frame 1: the top of the file. Visible row r == absolute row r.
+				doc.top = 0
+				if s, sok := table_data_start(&doc); sok {doc.top = s}
+				buf1, ok1 := shot(&h, &doc, px, char_w, rows, bg_s)
+				chk(&bad, ok1, "frame 1 readback succeeded")
+				if !ok1 {return}
+
+				// Frame 2: scrolled by exactly ONE data row -- the odd scroll that
+				// makes visible parity and absolute parity disagree everywhere.
+				// Through table_row_start, so the scroll lands on a real line start
+				// rather than on an offset this test computed for itself.
+				s1, s1ok := table_row_start(&doc, 1)
+				chk(&bad, s1ok, "the fixture has a second data row to scroll to")
+				if !s1ok {return}
+				doc.top = s1
+				a0b := table_abs_rows(&doc, 1)[0]
+				chk(&bad, a0b == 1, fmt.tprintf("after the scroll, visible row 0 IS absolute row 1 (%d)", a0b))
+				buf2, ok2 := shot(&h, &doc, px, char_w, rows, bg_s)
+				chk(&bad, ok2, "frame 2 readback succeeded")
+				if !ok2 {return}
+
+				// The assertion. Absolute row (r+1) is drawn at visible row r+1 in
+				// frame 1 and at visible row r in frame 2; its band must be the same
+				// colour in both. Under `r % 2` the two disagree for EVERY r, so a
+				// single mismatch is not a rounding artefact.
+				mism, probed := 0, 0
+				for r in 0 ..< rows - 1 {
+					y1 := int(table_row_rect_y(px, r + 1) + table_row_h(px) * 0.3)
+					y2 := int(table_row_rect_y(px, r) + table_row_h(px) * 0.3)
+					if y1 >= H || y2 >= H {break}
+					probed += 1
+					b1 := banded(buf1, W, sx, y1)
+					b2 := banded(buf2, W, sx, y2)
+					if b1 != b2 {
+						mism += 1
+						if mism <= 4 {
+							fmt.printfln("    absolute row %d: banded=%v before the scroll, %v after", r + 1, b1, b2)
+						}
+					}
+				}
+				chk(&bad, probed >= 3, fmt.tprintf("enough rows were actually probed (%d)", probed))
+				chk(&bad, mism == 0, fmt.tprintf("a band belongs to its ABSOLUTE row across a one-row scroll (%d of %d rows changed colour)", mism, probed))
+
+				// And the bands are not simply all one colour, which would satisfy
+				// the compare above with the parity deleted entirely.
+				nband := 0
+				for r in 0 ..< rows {
+					y := int(table_row_rect_y(px, r) + table_row_h(px) * 0.3)
+					if y >= H {break}
+					if banded(buf1, W, sx, y) {nband += 1}
+				}
+				chk(&bad, nband > 0 && nband < probed + 1, fmt.tprintf("...and rows really do alternate (%d banded of %d probed)", nband, probed + 1))
+				return
+			}
+
+			// F5: table_abs_rows answers a WHOLE SCREEN for the price of one
+			// lookup, which is the only reason the gutter and the parity can ride
+			// on it at all. doc_line_no_at is bounded but expensive -- it counts
+			// newlines forward from the checkpoint at or below the offset, up to
+			// LINE_CKPT_STRIDE of them -- and a per-row producer measured 153.3 us
+			// PER ROW on this fixture, 6.1 ms for one 40-row repaint.
+			//
+			// Asserted RELATIVELY, never as a wall-clock budget: a millisecond
+			// threshold is a machine-speed assertion that flakes, where "a screen
+			// costs a fraction of what a per-row producer costs" is a statement
+			// about the SHAPE of the procedure and holds on any hardware.
+			//
+			// The per-row cost is MEASURED here rather than assumed, and that is a
+			// change: this used to compare 200 rows against 1 row with a 4x
+			// allowance, on the reasoning that a per-row implementation would make
+			// that ratio ~200. It no longer would. table_abs_rows walks the visible
+			// rows now (it has to -- a data row longer than RENDER_LINE_CAP is
+			// several visible rows, and the run it replaced numbered every row below
+			// one such line wrongly), so 200 rows genuinely cost ~200 bounded steps
+			// more than 1 row does: 477 us vs 157 us here, a ratio of 3.0 against an
+			// allowance of 4.3. That is 1.4x of headroom on a timing check, which is
+			// how a suite starts flaking. Comparing against 200 real doc_line_no_at
+			// calls instead pins the claim that actually matters -- the expensive
+			// term is asked ONCE per screen -- with 6x of headroom, and it cannot rot
+			// when either cost moves.
+			//
+			// Its own proc for the usual stack-frame reason; the fixture is a real
+			// 1.1 MB document because the cost being measured only exists at
+			// offsets far from a checkpoint.
+			tg_abs_cost :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				src := strings.builder_make()
+				strings.write_string(&src, "h0,h1,h2\n")
+				for i in 0 ..< 40000 {fmt.sbprintf(&src, "a%05d,bbbbbbbbbb,cccccccccc\n", i)}
+				content := transmute([]u8)strings.clone(strings.to_string(src))
+				strings.builder_destroy(&src)
+				d := doc_from_content(content, "abscost.csv", .UTF8)
+				defer doc_close(&d)
+				d.table, d.table_delim = true, ','
+				doc_index_start(&d)
+				for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+				// The precondition that stops this being vacuous: the first visible
+				// row must sit FAR from its checkpoint, or the lookup is cheap for
+				// the wrong reason and a per-row producer would pass too.
+				d.top = base.pt_line_start(&d.pt, 6 * LINE_CKPT_STRIDE - 40)
+				s, sok := table_data_start(&d)
+				gap := s %% LINE_CKPT_STRIDE
+				chk(&bad, sok && gap > LINE_CKPT_STRIDE / 2, fmt.tprintf("precondition -- the first visible row is %d bytes past its checkpoint (want > %d)", gap, LINE_CKPT_STRIDE / 2))
+				chk(&bad, table_abs_rows(&d, 1)[0] != TABLE_ABS_NONE, "precondition -- and the index actually answers there")
+
+				time_n :: proc(d: ^Document, n: int) -> f64 {
+					table_abs_rows(d, n) // warm the piece tree's path to these bytes
+					t0 := time.tick_now()
+					acc := 0
+					for v in table_abs_rows(d, n) {if v != TABLE_ABS_NONE {acc += v}}
+					el := time.duration_microseconds(time.tick_since(t0))
+					if acc < 0 {fmt.print("")} // keep the loop from being optimised away
+					return el
+				}
+				one := time_n(&d, 1)
+				many := time_n(&d, 200)
+				// The per-row producer's cost, taken in this same run: 200 lookups at
+				// the offset it would ask about. This is the implementation the
+				// batching exists to avoid, so measuring IT is what makes the bound
+				// below independent of the machine.
+				per_row := 0.0
+				{
+					acc := 0
+					t0 := time.tick_now()
+					for _ in 0 ..< 200 {
+						if ln, ex := doc_line_no_at(&d, s); ex {acc += ln}
+					}
+					per_row = time.duration_microseconds(time.tick_since(t0))
+					if acc < 0 {fmt.print("")}
+				}
+				chk(
+					&bad,
+					many * 10 <= per_row,
+					fmt.tprintf("a 200-row screen costs a tenth of a per-row producer: %.1f us vs %.1f us", many, per_row),
+				)
+				// ...and the walk that remains is the cheap term. Loose on purpose --
+				// it is the second-order check and the numbers above are the first --
+				// but not so loose it would miss a step growing a scan of its own.
+				chk(
+					&bad,
+					many <= one * 8 + 50,
+					fmt.tprintf("...and 200 bounded steps stay cheap next to 1: %.1f us vs %.1f us (want <= %.1f)", many, one, one * 8 + 50),
+				)
+				return
+			}
+
+			// F5b: A DATA ROW LONGER THAN RENDER_LINE_CAP, which the viewport splits
+			// into several visible rows. table_abs_rows used to answer the whole
+			// screen with a run -- ln - 1 + i, on a comment asserting that "visible
+			// rows are consecutive lines by construction" -- and the split makes that
+			// false, so every row below such a line was numbered one too high per
+			// split, with exact = true. development-loop.md §4 Shape A, in the
+			// procedure whose second result exists to prevent it, and nothing in this
+			// suite constructed a line past the cap before.
+			//
+			// 8 KiB is not an exotic CSV. One description, JSON or log column does it.
+			//
+			// Checked TWICE over, because a table of expected numbers can be wrong in
+			// the same direction as the walk that produced it: every row that gets a
+			// number also has that number re-derived from the ROW'S OWN byte offset
+			// through doc_line_no_at, which shares no code with the walk.
+			tg_abs_overcap :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				LONG :: 9000
+				#assert(LONG > RENDER_LINE_CAP) // or the row is not split and this proves nothing
+				b := strings.builder_make()
+				strings.write_string(&b, "a,b\n") // header, line 0
+				for _ in 0 ..< LONG {strings.write_byte(&b, 'x')} // data row 0, over the cap
+				strings.write_string(&b, ",y\np,2\nq,3\n") // data rows 1 and 2
+				content := transmute([]u8)strings.clone(strings.to_string(b))
+				strings.builder_destroy(&b)
+				d := doc_from_content(content, "overcap.csv", .UTF8)
+				defer doc_close(&d)
+				d.table, d.table_delim = true, ','
+				doc_index_start(&d)
+				for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+				// The preconditions that stop everything below being vacuous: the row
+				// really is split, and both halves really are the same logical line.
+				r0, ok0 := table_row_start(&d, 0)
+				r1, ok1 := table_row_start(&d, 1)
+				chk(&bad, ok0 && ok1 && r0 == 4 && r1 == 4 + RENDER_LINE_CAP, fmt.tprintf("precondition -- data row 0 is split at the cap: visible rows 0 and 1 start at %d and %d (want 4 and %d)", r0, r1, 4 + RENDER_LINE_CAP))
+				l0, e0 := doc_line_no_at(&d, r0)
+				l1, e1 := doc_line_no_at(&d, r1)
+				chk(&bad, e0 && e1 && l0 == 1 && l1 == 1, fmt.tprintf("...and both halves are logical line 1 (got %d and %d)", l0, l1))
+
+				// Visible row 1 is the TAIL of data row 0, so it draws no number at
+				// all; rows 2 and 3 are data rows 1 and 2 and must say so. Row 4 is
+				// the trailing empty line the grid already shows after a final
+				// newline -- pinned here only so a change to that is not silent.
+				absn := table_abs_rows(&d, 5)
+				want := [5]int{0, TABLE_ABS_NONE, 1, 2, 3}
+				for r in 0 ..< 5 {
+					chk(&bad, absn[r] == want[r], fmt.tprintf("visible row %d numbers as %d (want %d)", r, absn[r], want[r]))
+				}
+				for r in 0 ..< 5 {
+					if absn[r] == TABLE_ABS_NONE {continue}
+					p, pok := table_row_start(&d, r)
+					ln, ex := doc_line_no_at(&d, p)
+					chk(&bad, pok && ex && ln - 1 == absn[r], fmt.tprintf("...and visible row %d's number is its own line's: gutter says data row %d, offset %d is line %d", r, absn[r], p, ln))
+				}
+
+				// Scrolled INTO the long row. doc.top is then a synthetic mid-line
+				// offset -- next_row_start_capped leaves it there on any wheel tick
+				// through an over-long row -- so visible row 0 is itself a
+				// continuation and the walk may not assume its start is a line start.
+				d.top = r1
+				scr := table_abs_rows(&d, 3)
+				sw := [3]int{TABLE_ABS_NONE, 1, 2}
+				for r in 0 ..< 3 {
+					chk(&bad, scr[r] == sw[r], fmt.tprintf("scrolled into the long row, visible row %d numbers as %d (want %d)", r, scr[r], sw[r]))
+				}
+				return
+			}
+
+			// F6: the gutter's REFUSAL path, on pixels. The seam checks in tg()
+			// prove where the gutter is; nothing there can say whether a number was
+			// actually painted into it, and the one rule §10's gutter has that is
+			// not geometry is "a row the file's numbering cannot answer draws NO
+			// number" (development-loop.md §4, Shape A).
+			//
+			// A source count cannot see this and neither can the hit-test: the same
+			// code path runs either way and only the glyphs differ. So this draws
+			// the SAME fixture twice -- once with a finished Line_Index and once
+			// with none started -- and counts non-background pixels inside the
+			// gutter's 56px. Table_Zebra and Bg_Raised are set to the background so
+			// that the only thing that can light a pixel there is a glyph.
+			tg_gutter_pixels :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				W, H :: 1000, 700
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, W, H, "tablegridtest/gutter") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return 0
+				}
+				defer headless_gpu_destroy(&h)
+				saved_theme, saved_scale := g_theme, UI_SCALE
+				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
+				BASE_PX = BASE_PX_96
+
+				// Everything that is not a row-number glyph is black, so a lit
+				// pixel inside the gutter can only be the number.
+				black := [4]f32{0, 0, 0, 1}
+				g_theme[.Bg_Base] = black
+				g_theme[.Bg_Raised] = black
+				g_theme[.Border_Strong] = black
+				g_theme[.Table_Zebra] = black
+				g_theme[.Text_Muted] = {1, 1, 1, 1} // the row number
+				g_theme[.Text_Secondary] = {1, 1, 1, 1}
+
+				px := BASE_PX_96
+				char_w := plat.text_char_width(&h.text, px, .Doc)
+
+				lit :: proc(buf: []u8, w: int, x0, x1, y0, y1: int) -> (n: int) {
+					for y in y0 ..< y1 {
+						for x in x0 ..< x1 {
+							i := (y * w + x) * 4
+							if buf[i] > 60 || buf[i + 1] > 60 || buf[i + 2] > 60 {n += 1}
+						}
+					}
+					return
+				}
+				body :: proc() -> []u8 {
+					s := "h0,h1\n"
+					for i in 0 ..< 12 {s = fmt.tprintf("%sa%d,b%d\n", s, i, i)}
+					out := make([]u8, len(s))
+					copy(out, transmute([]u8)s)
+					return out
+				}
+
+				gw := int(table_gutter_w())
+				y0 := int(table_row_rect_y(px, 0))
+				y1 := int(table_row_rect_y(px, 3))
+
+				// 1. No index at all: doc_line_no_at has no checkpoints to answer
+				//    from, table_abs_rows refuses every row, and the gutter must be
+				//    empty. doc_from_content does not start the indexer, so this is
+				//    the state a fresh grid is in for its first frames -- not a
+				//    contrived one.
+				{
+					d := doc_from_content(body(), "noidx.csv", .UTF8)
+					defer doc_close(&d)
+					d.table, d.table_delim = true, ','
+					rows := table_visible_rows(&d, f32(H), px)
+					chk(&bad, table_abs_rows(&d, 1)[0] == TABLE_ABS_NONE, "precondition -- with no index started, the row number is refused")
+					plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+					table_draw(&h.gfx, &h.quads, &h.text, &d, px, char_w, rows, f32(W), f32(H))
+					if buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); ok {
+						n := lit(buf, W, 0, gw, y0, y1)
+						chk(&bad, n == 0, fmt.tprintf("a refused row draws NO number: %d lit pixels in the gutter (want 0)", n))
+					} else {
+						chk(&bad, false, "the un-indexed readback succeeded")
+					}
+				}
+
+				// 2. The same fixture with a finished index: the numbers are there.
+				//    Without this the check above is satisfied by a gutter that
+				//    never draws anything at all.
+				{
+					d := doc_from_content(body(), "idx.csv", .UTF8)
+					defer doc_close(&d)
+					d.table, d.table_delim = true, ','
+					doc_index_start(&d)
+					for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+					rows := table_visible_rows(&d, f32(H), px)
+					chk(&bad, table_abs_rows(&d, 1)[0] == 0, "precondition -- with the index finished, row 0 is absolute row 0")
+					plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+					table_draw(&h.gfx, &h.quads, &h.text, &d, px, char_w, rows, f32(W), f32(H))
+					if buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); ok {
+						n := lit(buf, W, 0, gw, y0, y1)
+						chk(&bad, n > 0, fmt.tprintf("an answerable row DOES draw one: %d lit pixels in the gutter (want > 0)", n))
+						// ...and it stays inside the gutter: the first cell's text
+						// begins at gutter + padding, and a number spilling into it
+						// would overprint real data.
+						spill := lit(buf, W, gw, gw + int(TABLE_CELL_PAD_X), y0, y1)
+						chk(&bad, spill == 0, fmt.tprintf("...and it stays left of the first cell's padding (%d lit pixels there, want 0)", spill))
+					} else {
+						chk(&bad, false, "the indexed readback succeeded")
+					}
+				}
+				return
+			}
+
+			// F7: §10's "numeric and date columns right-align", both halves --
+			// the CLASSIFICATION (which columns) and the GEOMETRY (where the
+			// glyphs land, and what truncation does to a right-aligned value).
+			//
+			// The vacuous case is first on purpose. "Every non-empty sampled cell
+			// parses as a number" is trivially true of a column with no non-empty
+			// cells at all, and a bounded sample that saw no evidence returning a
+			// confident answer is development-loop.md §4 Shape A exactly. It is
+			// also the case a happy-path test never reaches, so it goes at the top
+			// where it cannot be dropped for running long.
+			tg_align :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (alignment): no fonts loaded")
+					return 1
+				}
+				UI_SCALE = 1
+				BASE_PX = BASE_PX_96
+				TABLE_CELL_PAD_X, TABLE_GUTTER_W = TABLE_CELL_PAD_X_96, TABLE_GUTTER_W_96
+
+				// One fixture, one column per rule. The header row is deliberately
+				// all words: it must count toward the WIDTHS (a column has to show
+				// its own name) and not toward the TYPE, or no CSV ever written
+				// would have a numeric column.
+				src := strings.join(
+					[]string {
+						"num,sparse,when,stamp,mixed,blank,words,sci",
+						"1,10,2026-01-01,2026-01-01T09:30:00Z,3,,alpha,1.5e3",
+						"2,,2026-02-14,2026-02-14 23:00:01,x,,beta,-2E-4",
+						"-3.5,20,2026-03-31,2026-03-31T00:00:00,5,,gamma,7",
+					},
+					"\n",
+					context.temp_allocator,
+				)
+				content := make([]u8, len(src) + 1)
+				copy(content, transmute([]u8)src)
+				content[len(src)] = '\n'
+				d := doc_from_content(content, "align.csv", .UTF8)
+				defer doc_close(&d)
+				d.table, d.table_delim = true, ','
+				table_compute_widths(&d, &t)
+
+				Want :: struct {
+					c:     int,
+					align: Table_Align,
+					why:   string,
+				}
+				wants := []Want {
+					{0, .Right, "plain integers and a negative decimal"},
+					{1, .Right, "SPARSE numbers -- an empty cell does not disqualify"},
+					{2, .Right, "ISO dates"},
+					{3, .Right, "ISO timestamps, T- and space-separated"},
+					{4, .Left, "one non-numeric cell disqualifies the column"},
+					{5, .Left, "NO non-empty cell was sampled -- the vacuous all-true"},
+					{6, .Left, "words"},
+					{7, .Right, "exponent notation"},
+				}
+				chk(&bad, len(d.table_align) == len(d.table_widths), fmt.tprintf("one alignment per column (%d vs %d widths)", len(d.table_align), len(d.table_widths)))
+				for w in wants {
+					got := d.table_align[w.c] if w.c < len(d.table_align) else Table_Align.Left
+					chk(&bad, got == w.align, fmt.tprintf("column %d is %v -- %s (got %v)", w.c, w.align, w.why, got))
+				}
+
+				// The parsers themselves, where a comma is not a field separator.
+				Case :: struct {
+					s:   string,
+					num: bool,
+					dt:  bool,
+				}
+				cases := []Case {
+					{"1,234.50", true, false},
+					{"1,23,4", true, false}, // shape only: groups are not validated
+					{"+7", true, false},
+					{".5", true, false},
+					{"1.2.3", false, false},
+					{"1,234.5,6", false, false}, // a comma after the point
+					{"1e", false, false}, // an exponent with no digits
+					{"", false, false},
+					{"-", false, false},
+					{"12%", false, false}, // deliberately NOT a number
+					{"$12", false, false},
+					{"2026-01-01", false, true},
+					{"01/02/2026", false, true},
+					{"2026/01/02", false, true},
+					{"2026-01-01T10:00:00", false, true},
+					{"2026-01-01T", false, false}, // a tail with no clock in it
+					{"2026-1-1", false, false}, // not the mask's shape
+					{"2026-01-01 apples", false, false},
+				}
+				pbad := 0
+				for c in cases {
+					gn, gd := table_is_number(c.s), table_is_date(c.s)
+					if gn != c.num || gd != c.dt {
+						pbad += 1
+						fmt.printfln("    %q -> number=%v date=%v (want %v, %v)", c.s, gn, gd, c.num, c.dt)
+					}
+				}
+				chk(&bad, pbad == 0, fmt.tprintf("the number and date predicates agree on %d hand-written cases (%d wrong)", len(cases), pbad))
+
+				// The geometry. table_cell_align_dx is the one producer of the
+				// nudge, and the two properties that matter are that a LEFT column
+				// never moves and that TRUNCATION collapses the nudge to zero --
+				// which is what keeps a cut left-anchored, so 10432 shortens to
+				// 1043 and never to 0432.
+				px := BASE_PX_96
+				cw := plat.text_char_width(&t, px, .Doc)
+				cols := table_cols_layout(&d, cw, 1400, 0)
+				chk(&bad, len(cols) >= 8, fmt.tprintf("all 8 columns are laid out (%d)", len(cols)))
+				if len(cols) >= 8 {
+					lc, rc := cols[6], cols[0] // words (left), num (right)
+					chk(&bad, lc.align == .Left && rc.align == .Right, "the two probe columns are the ones expected")
+					chk(&bad, table_cell_align_dx(lc, 1, cw) == 0, "a left column never nudges")
+					chk(&bad, table_cell_align_dx(rc, 1, cw) > 0, fmt.tprintf("a short value in a right column does (%.1f)", table_cell_align_dx(rc, 1, cw)))
+					// A value exactly as wide as its cell, and one wider: both sit
+					// on the LEFT inner edge, which is where a truncated string has
+					// to start.
+					chk(&bad, table_cell_align_dx(rc, rc.cells, cw) == 0, "a value that fills its cell sits on the left inner edge")
+					chk(&bad, table_cell_align_dx(rc, rc.cells + 5, cw) == 0, "...and so does one too wide for it, so the cut stays left-anchored")
+					// The nudge is exactly the slack, so the value's right edge
+					// lands on the cell's right inner edge -- the thing §10 asks
+					// for, stated as the equation rather than as "greater than 0".
+					want_dx := rc.w - TABLE_CELL_PAD_X * 2 - 3 * cw
+					chk(&bad, table_cell_align_dx(rc, 3, cw) == want_dx, fmt.tprintf("a 3-cell value ends on the right inner edge (dx %.1f, want %.1f)", table_cell_align_dx(rc, 3, cw), want_dx))
+				}
+
+				// §10's "distribute leftover width proportionally" (3b). It lives
+				// in table_cols_layout rather than in the sample precisely so that
+				// it tracks the window, so both directions get probed: a window
+				// with room to spare must be FILLED, and one without must leave the
+				// sampled widths alone.
+				{
+					WIDE :: f32(2400)
+					wide := table_cols_layout(&d, cw, WIDE, 0)
+					avail := table_right(WIDE) - table_gutter_w()
+					total, shrunk, extra_of := f32(0), 0, make([]int, len(wide), context.temp_allocator)
+					for c, i in wide {
+						total += c.w
+						extra_of[i] = c.cells - d.table_widths[c.c]
+						if extra_of[i] < 0 {shrunk += 1}
+					}
+					chk(&bad, len(wide) == len(d.table_widths), fmt.tprintf("every column is on screen at %.0fpx (%d of %d)", WIDE, len(wide), len(d.table_widths)))
+					chk(&bad, shrunk == 0, fmt.tprintf("no column is ever SHRUNK -- the grid scrolls, it does not compress (%d were)", shrunk))
+					// Filled to within one cell: the integer remainder is handed
+					// out one cell at a time, so what is left over is less than a
+					// character, not a ragged strip on the right.
+					gap := avail - total
+					chk(&bad, gap >= 0 && gap < cw, fmt.tprintf("the leftover is distributed to within one cell (%.1fpx of %.1fpx spare, cell %.1f)", gap, avail, cw))
+					// Proportional, not equal: the widest sampled column takes more
+					// of the leftover than the narrowest. An even split would give
+					// them the same number and pass every check above.
+					wi, ni := 0, 0
+					for c, i in wide {
+						if d.table_widths[c.c] > d.table_widths[wide[wi].c] {wi = i}
+						if d.table_widths[c.c] < d.table_widths[wide[ni].c] {ni = i}
+					}
+					chk(
+						&bad,
+						d.table_widths[wide[wi].c] > d.table_widths[wide[ni].c],
+						fmt.tprintf("precondition -- the fixture has columns of different widths (%d vs %d)", d.table_widths[wide[wi].c], d.table_widths[wide[ni].c]),
+					)
+					chk(
+						&bad,
+						extra_of[wi] > extra_of[ni],
+						fmt.tprintf("the leftover goes out PROPORTIONALLY, not evenly (widest gained %d cells, narrowest %d)", extra_of[wi], extra_of[ni]),
+					)
+					// And a window with nothing spare leaves the sample untouched.
+					NARROW := table_gutter_w() + SCROLLBAR_W + 60
+					narrow := table_cols_layout(&d, cw, NARROW, 0)
+					chk(&bad, len(narrow) > 0 && narrow[0].cells == d.table_widths[0], fmt.tprintf("a full window distributes nothing (col 0 laid out at %d cells, sampled %d)", narrow[0].cells if len(narrow) > 0 else -1, d.table_widths[0]))
+				}
+				return
+			}
+
+			// F8: §10's "drag a header edge to resize; double-click to fit
+			// content" (3d).
+			//
+			// The non-obvious failure is not the drag, it is what OUTLIVES it.
+			// table_compute_widths reruns whenever the widths are cleared, and
+			// table_edit_commit clears them after every cell edit so the columns
+			// re-fit the new value -- so a width written only into table_widths is
+			// gone the next time the user edits any cell in the table, with nothing
+			// on screen to explain why. That is the case the plan singled out and
+			// it is asserted here through a REAL edit and a real refit, not by
+			// calling table_compute_widths directly and hoping that is what an edit
+			// does.
+			tg_resize :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (resize): no fonts loaded")
+					return 1
+				}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
+				TOP_INSET, FILTER_BANNER_H = 0, 0
+				BASE_PX = BASE_PX_96
+				px := BASE_PX_96
+				cw := plat.text_char_width(&t, px, .Doc)
+				W := f32(1000)
+
+				// Column widths deliberately DIFFERENT from each other and all
+				// above TABLE_COL_MIN: with the old short fixture every column
+				// clamped to 8 and the double-click check below compared 8 against
+				// 8, which any implementation satisfies.
+				src := "alphabetical,beta_col_xx,gam\noneoneoneoneone,twotwotwotwo,three\nfour,five,sixsixsixsixsix\nseven,eight,nine\n"
+				content := make([]u8, len(src))
+				copy(content, transmute([]u8)src)
+				d := doc_from_content(content, "resize.csv", .UTF8)
+				defer doc_close(&d)
+				d.table, d.table_delim = true, ','
+				table_compute_widths(&d, &t)
+				d.table_cols = len(d.table_widths)
+				H := table_rows_top(px) + 6 * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				rows := table_visible_rows(&d, H, px)
+
+				cols := table_cols_layout(&d, cw, W, 0)
+				chk(&bad, len(cols) == 3, fmt.tprintf("precondition -- 3 columns are laid out (%d)", len(cols)))
+				if len(cols) != 3 {return}
+				edge := cols[0].x + cols[0].w
+				hy := table_grid_top() + table_header_h(px) * 0.5
+				tol := sx(TABLE_RESIZE_HIT_96)
+
+				// 1. The grab zone: on the edge, just inside the tolerance, just
+				//    outside it, and -- the one that matters for the editing path --
+				//    the SAME x one row down, which must still be a cell and not an
+				//    edge.
+				c0, on0 := table_edge_at(&d, cw, W, edge, hy, px)
+				chk(&bad, on0 && c0 == 0, fmt.tprintf("column 0's right edge is a grab zone (on=%v, col=%d)", on0, c0))
+				_, oni := table_edge_at(&d, cw, W, edge - tol, hy, px)
+				chk(&bad, oni, fmt.tprintf("...%.0fpx to its left too (§10's +/-4)", tol))
+				_, ono := table_edge_at(&d, cw, W, edge - tol - 2, hy, px)
+				chk(&bad, !ono, "...and not beyond the tolerance")
+				_, onrow := table_edge_at(&d, cw, W, edge, table_row_baseline_y(px, 0), px)
+				chk(&bad, !onrow, "the same x in a DATA row is not an edge -- a cell click still lands there")
+
+				// 2. The drag itself, and both bounds. The edge is measured against
+				//    the LAID-OUT rectangle -- §10's leftover distribution
+				//    included, since that is the edge the user grabbed -- so five
+				//    cells of pointer travel is five cells of column, counted from
+				//    what was on screen and not from the sample.
+				nat0 := d.table_widths[0]
+				chk(&bad, cols[0].cells > nat0, fmt.tprintf("precondition -- column 0 is laid out wider than sampled (%d vs %d), so the two origins differ", cols[0].cells, nat0))
+				table_col_resize(&d, 0, edge + 5 * cw, cw, W)
+				chk(&bad, d.table_widths[0] == cols[0].cells + 5, fmt.tprintf("dragging the drawn edge right by 5 cells widens by 5 (%d -> %d)", cols[0].cells, d.table_widths[0]))
+				table_col_resize(&d, 0, edge - 4000 * cw, cw, W)
+				chk(&bad, d.table_widths[0] == TABLE_COL_MIN, fmt.tprintf("dragging far left clamps to TABLE_COL_MIN (%d, want %d)", d.table_widths[0], TABLE_COL_MIN))
+				// Past §10's automatic 40, deliberately: a manual drag overrides
+				// the bound that exists to stop ONE wide cell claiming the window,
+				// and the distribution already lays columns out past 40 anyway.
+				table_col_resize(&d, 0, edge + 60 * cw, cw, W)
+				chk(&bad, d.table_widths[0] > TABLE_COL_MAX, fmt.tprintf("a drag may pass §10's automatic 40 (%d)", d.table_widths[0]))
+				table_col_resize(&d, 0, edge + 4000 * cw, cw, W)
+				chk(&bad, d.table_widths[0] == TABLE_COL_DRAG_MAX, fmt.tprintf("...but not TABLE_COL_DRAG_MAX (%d, want %d)", d.table_widths[0], TABLE_COL_DRAG_MAX))
+
+				// 3. THE ONE. Resize, edit a cell for real, let the refit run, and
+				//    the width is still the user's. The edit goes through
+				//    table_cell_at -> table_edit_start -> table_edit_commit, which
+				//    is the path a click takes, so the clear() this defends against
+				//    is the real one and not a stand-in.
+				// Column 0 is still parked at TABLE_COL_DRAG_MAX from the bound
+				// check above, which would push every other column off screen and
+				// make the drag below a no-op. Hand it back to the sample first.
+				table_col_fit(&d, 0)
+				if len(d.table_widths) == 0 {table_compute_widths(&d, &t)}
+				cols = table_cols_layout(&d, cw, W, 0)
+				chk(&bad, len(cols) == 3, fmt.tprintf("precondition -- all 3 columns are back on screen (%d)", len(cols)))
+				if len(cols) != 3 {return}
+				nat1 := d.table_widths[1]
+				table_col_resize(&d, 1, cols[1].x + cols[1].w + 6 * cw, cw, W)
+				want := d.table_widths[1]
+				chk(&bad, want != nat1, fmt.tprintf("column 1 is now %d cells, not its sampled %d", want, nat1))
+				okc, rr, cc, fs, fe, val := table_cell_at(&d, table_cell_text_x(cols[0]), table_row_baseline_y(px, 0), px, cw, rows, W)
+				chk(&bad, okc && val == "oneoneoneoneone", fmt.tprintf("a real cell resolves for the edit (%v, %q)", okc, val))
+				if okc {
+					table_edit_start(&d, rr, cc, fs, fe, val)
+					table_edit_rune(&d, 'X')
+					table_edit_commit(&d)
+					chk(&bad, len(d.table_widths) == 0, "the commit really did clear the widths -- the refit is reached")
+					// table_draw's own line, so this is the refit the user gets.
+					if len(d.table_widths) == 0 {table_compute_widths(&d, &t)}
+					chk(&bad, len(d.table_widths) > 1 && d.table_widths[1] == want, fmt.tprintf("the user's width survives an edit's refit (%d, want %d)", d.table_widths[1] if len(d.table_widths) > 1 else -1, want))
+				}
+
+				// 4. Double-click to fit: the override goes and the column comes
+				//    back at the width the sample measured for IT -- captured above
+				//    before the drag, and different from both the dragged width and
+				//    from its neighbours', so no two numbers here coincide.
+				table_col_fit(&d, 1)
+				chk(&bad, len(d.table_widths) == 0, "a fit clears the widths so the sample runs again")
+				if len(d.table_widths) == 0 {table_compute_widths(&d, &t)}
+				chk(&bad, d.table_widths[1] == nat1, fmt.tprintf("...and column 1 is back to its own content width (%d, want %d)", d.table_widths[1], nat1))
+				chk(&bad, nat1 != d.table_widths[0] && nat1 != d.table_widths[2], fmt.tprintf("...which is distinct from its neighbours' (%d vs %d, %d)", nat1, d.table_widths[0], d.table_widths[2]))
+
+				// 5. A fixed column takes no share of §10's leftover: the user asked
+				//    for a width, not for a proportion of the window.
+				table_col_resize(&d, 0, cols[0].x + cols[0].w + 4 * cw, cw, W)
+				fixedw := d.table_widths[0]
+				wide := table_cols_layout(&d, cw, 2400, 0)
+				got, others := -1, 0
+				for c in wide {
+					if c.c == 0 {got = c.cells} else if c.cells > d.table_widths[c.c] {others += 1}
+				}
+				chk(&bad, got == fixedw, fmt.tprintf("a user-set column keeps its exact width in a wide window (%d, want %d)", got, fixedw))
+				chk(&bad, others > 0, fmt.tprintf("...while the others still absorb the leftover (%d of them grew)", others))
+				return
+			}
+
+			// F6: §10 group C's malformed-row mark -- "a row with the wrong field
+			// count gets a 2px warning bar on its left edge and stays in place.
+			// Silently dropping data in a data viewer is the worst possible failure."
+			//
+			// Two halves, and they are different kinds of check on purpose. The RULE
+			// is asserted as an implication over field counts derived by plain
+			// strings.split -- independent of csv_fields, of the draw and of
+			// table_row_malformed's own expression -- because the property that
+			// matters is not "this row is marked" but "no row can have a hole inside
+			// the header's columns and go unmarked". The BAR is asserted on pixels
+			// from a real device, because a rule nothing draws is worth nothing and
+			// §6aw's finding was precisely that this file's appearance was unasserted.
+			tg_malformed :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				// Line 0 is the header (3 fields). Row 2 is SHORT, row 4 is LONG, row 1
+				// has an EMPTY middle cell and is well-formed -- §10 makes empty and
+				// missing different things and the pair is here so the mark cannot
+				// quietly cover both.
+				lines := [?]string {
+					"h0,h1,h2",
+					"a0,b0,c0",
+					"a1,,c1", // empty middle: a real field, NOT malformed
+					"a2,b2", // short: malformed
+					"a3,b3,c3",
+					"a4,b4,c4,d4", // long: malformed
+					"a5,b5,c5",
+				}
+				ncols := len(strings.split(lines[0], ",", context.temp_allocator))
+				chk(&bad, ncols == 3, fmt.tprintf("the fixture's header declares %d columns", ncols))
+
+				// 1. The rule itself, on counts this test derived.
+				want_marked := [?]bool{false, false, false, true, false, true, false}
+				for i in 1 ..< len(lines) {
+					n := len(strings.split(lines[i], ",", context.temp_allocator))
+					got := table_row_malformed(n, ncols)
+					chk(&bad, got == want_marked[i], fmt.tprintf("line %d %q has %d fields -> marked=%v (want %v)", i, lines[i], n, got, want_marked[i]))
+				}
+				// 2. THE AGREEMENT, as an implication rather than as two rules that
+				//    happen to line up: a cell the draw would SKIP as missing
+				//    (col.c >= len(fields)) inside a column the header declares must
+				//    always be on a marked row. This is the property table.odin's
+				//    comment claims holds by construction; enumerated here so a change
+				//    to either side is caught rather than argued.
+				holes, unmarked := 0, 0
+				for i in 1 ..< len(lines) {
+					n := len(strings.split(lines[i], ",", context.temp_allocator))
+					for c in 0 ..< ncols {
+						if c < n {continue}
+						holes += 1
+						if !table_row_malformed(n, ncols) {unmarked += 1}
+					}
+				}
+				chk(&bad, holes > 0, fmt.tprintf("the fixture actually produces missing cells (%d) -- the implication is not vacuous", holes))
+				chk(&bad, unmarked == 0, fmt.tprintf("every missing cell inside the header's columns is on a marked row (%d unmarked)", unmarked))
+				// 3. ...and a header with no columns marks nothing. An empty document
+				//    would otherwise stripe every row on screen on no evidence.
+				chk(&bad, !table_row_malformed(0, 0) && !table_row_malformed(3, 0), "with no header, nothing is malformed")
+
+				// 4. The bar, on pixels.
+				W, H :: 1000, 700
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, W, H, "tablegridtest/malformed") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return
+				}
+				defer headless_gpu_destroy(&h)
+				saved_theme, saved_scale := g_theme, UI_SCALE
+				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
+				BASE_PX = BASE_PX_96
+				// Sentinels again, for tg_appearance's reason: Warning against the real
+				// Bg_Base is a colour comparison, and this wants an identity one.
+				bg_s := [4]f32{0, 0, 0, 1}
+				warn_s := [4]f32{1, 0, 1, 1}
+				zeb_s := [4]f32{0, 0, 0.5, 1}
+				g_theme[.Bg_Base] = bg_s
+				g_theme[.Warning] = warn_s
+				g_theme[.Table_Zebra] = zeb_s
+				sample :: proc(buf: []u8, w, x, y: int) -> (b, g, r: u8) {
+					i := (y * w + x) * 4
+					return buf[i], buf[i + 1], buf[i + 2]
+				}
+				near :: proc(c: [4]f32, b, g, r: u8, tol: int) -> bool {
+					want := [3]u8{u8(c[2] * 255 + 0.5), u8(c[1] * 255 + 0.5), u8(c[0] * 255 + 0.5)}
+					return abs(int(b) - int(want[0])) <= tol && abs(int(g) - int(want[1])) <= tol && abs(int(r) - int(want[2])) <= tol
+				}
+				TOL :: 2
+				total := 0
+				for l in lines {total += len(l) + 1}
+				content := make([]u8, total)
+				{
+					o := 0
+					for l in lines {
+						copy(content[o:], transmute([]u8)l)
+						content[o + len(l)] = '\n'
+						o += len(l) + 1
+					}
+				}
+				doc := doc_from_content(content, "malformed.csv", .UTF8)
+				defer doc_close(&doc)
+				doc.table, doc.table_delim = true, ','
+				px := BASE_PX_96
+				char_w := plat.text_char_width(&h.text, px, .Doc)
+				rows := table_visible_rows(&doc, f32(H), px)
+				plat.gfx_begin_frame(&h.gfx, bg_s[0], bg_s[1], bg_s[2])
+				table_draw(&h.gfx, &h.quads, &h.text, &doc, px, char_w, rows, f32(W), f32(H))
+				buf, rok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				chk(&bad, rok, "the readback succeeded")
+				if !rok {return}
+				// Visible row r is data row r here (doc.top == 0), so want_marked[r+1]
+				// is the expectation for the band at table_row_rect_y(px, r).
+				for r in 0 ..< len(lines) - 1 {
+					y := int(table_row_rect_y(px, r) + table_row_h(px) * 0.5)
+					b0, g0, r0 := sample(buf, W, 0, y)
+					got := near(warn_s, b0, g0, r0, TOL)
+					chk(&bad, got == want_marked[r + 1], fmt.tprintf("row %d (%q): warning bar drawn=%v (want %v) bgr=(%d,%d,%d)", r, lines[r + 1], got, want_marked[r + 1], b0, g0, r0))
+				}
+				// ...and it is §10's 2px, measured by walking right off the row's edge
+				// rather than by recomputing the constant.
+				{
+					y := int(table_row_rect_y(px, 2) + table_row_h(px) * 0.5) // the short row
+					w := 0
+					for x in 0 ..< 16 {
+						b0, g0, r0 := sample(buf, W, x, y)
+						if !near(warn_s, b0, g0, r0, TOL) {break}
+						w += 1
+					}
+					chk(&bad, w == int(sx(TABLE_WARN_W_96)), fmt.tprintf("the bar is %dpx wide at 100%% (§10: 2)", w))
+				}
+				// The mark is at the ROW's left edge, which is the gutter's origin --
+				// asserted so "left of the numbers" cannot silently become "between the
+				// gutter and the first cell" without this saying so.
+				{
+					y := int(table_row_rect_y(px, 2) + table_row_h(px) * 0.5)
+					gx := int(table_gutter_w()) + 1
+					b0, g0, r0 := sample(buf, W, gx, y)
+					chk(&bad, !near(warn_s, b0, g0, r0, TOL), fmt.tprintf("...at x=0, not at the gutter's right edge (x=%d reads bgr=(%d,%d,%d))", gx, b0, g0, r0))
+				}
+				return
+			}
+
+			// Shared by the sort cases below. `want_field` derives the expected text
+			// by plain strings.split -- no csv_fields, no field-range parser, no
+			// table_row_start -- which is what makes a comparison against it evidence
+			// rather than a restatement. Valid because no fixture field is quoted or
+			// holds a delimiter, so the raw span and the unquoted value are one string.
+			sort_want_field :: proc(lines: []string, line, col: int) -> string {
+				parts := strings.split(lines[line], ",", context.temp_allocator)
+				return parts[col] if col < len(parts) else ""
+			}
+			sort_read_span :: proc(doc: ^Document, fs, fe: int) -> string {
+				if fe < fs {return "<inverted>"}
+				b := make([]u8, fe - fs, context.temp_allocator)
+				base.pt_read(&doc.pt, fs, b)
+				return string(b)
+			}
+			// Byte offset of each fixture line, counted here rather than asked of the
+			// code under test.
+			sort_offsets :: proc(lines: []string, allocator := context.temp_allocator) -> []int {
+				out := make([]int, len(lines) + 1, allocator)
+				for l, i in lines {out[i + 1] = out[i] + len(l) + 1}
+				return out
+			}
+			sort_content :: proc(lines: []string) -> []u8 {
+				total := 0
+				for l in lines {total += len(l) + 1}
+				c := make([]u8, total) // doc_close owns it (owned_orig)
+				o := 0
+				for l in lines {
+					copy(c[o:], transmute([]u8)l)
+					c[o + len(l)] = '\n'
+					o += len(l) + 1
+				}
+				return c
+			}
+
+			// C1: the order the permutation produces, the pixel -> byte seam under it,
+			// and a real edit read back out of the document.
+			sort_order :: proc(t: ^plat.Text) -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				px := BASE_PX_96
+				W :: f32(1000)
+				// File order deliberately unlike sorted order in BOTH columns tested,
+				// and row 4 is MALFORMED -- the plan's "with a malformed row in the
+				// set", so the sort has to carry a short row through without dropping
+				// it (§10) and without it desynchronising the offsets after it.
+				lines := [?]string {
+					"id,name,qty",
+					"3,delta,10",
+					"1,alpha,200",
+					"5,echo,30",
+					"2,bravo", // malformed: 2 fields where the header has 3
+					"4,charlie,4",
+				}
+				off := sort_offsets(lines[:])
+				doc := doc_from_content(sort_content(lines[:]), "sort.csv", .UTF8)
+				defer doc_close(&doc)
+				d := &doc
+				d.table, d.table_delim = true, ','
+				doc_update_top_inset(d)
+				table_compute_widths(d, t)
+				d.table_cols = len(d.table_widths)
+				ROWS :: 5
+				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				trows := table_visible_rows(d, H, px)
+				cw := plat.text_char_width(t, px, .Doc)
+				if trows != ROWS {
+					chk(&bad, false, fmt.tprintf("precondition -- %d grid rows fit (want %d)", trows, ROWS))
+					return
+				}
+
+				// --- by NAME, ascending. alpha bravo charlie delta echo, which is
+				//     data rows 1, 3, 4, 0, 2 -- worked out from the fixture above.
+				table_sort_click(d, 1)
+				chk(&bad, table_sorted(d), "a header click puts a sort on the grid")
+				want := [ROWS]int{1, 3, 4, 0, 2}
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == off[want[r] + 1], fmt.tprintf("visible row %d resolves to line %d (%q): got offset %d, want %d", r, want[r] + 1, lines[want[r] + 1], p, off[want[r] + 1]))
+				}
+				// A permutation that did nothing would pass every check above at r
+				// where want[r] == r. It is 1,3,4,0,2, so no visible row keeps its
+				// file position -- stated rather than assumed.
+				fixed := 0
+				for r in 0 ..< ROWS {if want[r] == r {fixed += 1}}
+				chk(&bad, fixed == 0, fmt.tprintf("...and no row keeps its file position (%d do), so the identity permutation cannot pass", fixed))
+
+				// --- THE ROW NUMBERS follow the rows, not the slots. The gutter draws
+				//     table_abs_rows + 1, and that producer's run-of-consecutive-lines
+				//     shortcut is exactly wrong under a permutation: it would print
+				//     1 2 3 4 5 down a screen showing lines 2 4 5 1 3 -- a confident
+				//     number naming the wrong line, which is what TABLE_ABS_NONE
+				//     exists to refuse. Asserted before any index has run, so it is
+				//     also proof the sorted path needs no Line_Index at all.
+				chk(&bad, !doc_index_done(d), "precondition -- no line index has been started")
+				{
+					absn := table_abs_rows(d, ROWS)
+					for r in 0 ..< ROWS {
+						chk(&bad, absn[r] == want[r], fmt.tprintf("visible row %d numbers as data row %d (want %d, line %q)", r, absn[r], want[r], lines[want[r] + 1]))
+					}
+				}
+
+				// --- THE SEAM: a pixel at the FIRST and the LAST visible row, through
+				//     the same hit-test a mouse press uses, against text derived by
+				//     strings.split.
+				cols := table_cols_layout(d, cw, W, 0)
+				for r in ([]int{0, ROWS - 1}) {
+					mx := table_cell_text_x(cols[0]) + 1
+					my := table_row_rect_y(px, r) + table_row_h(px) * 0.5
+					hok, hr, hc, fs, fe, _ := table_cell_at(d, mx, my, px, cw, trows, W)
+					got := sort_read_span(d, fs, fe)
+					exp := sort_want_field(lines[:], want[r] + 1, 0)
+					chk(&bad, hok && hr == r && hc == 0, fmt.tprintf("a click in visible row %d resolves to (row %d, col %d)", r, hr, hc))
+					chk(&bad, got == exp, fmt.tprintf("...and the byte range under it is %q (want %q, from line %q)", got, exp, lines[want[r] + 1]))
+				}
+
+				// The malformed row is at visible position 1 and has no third field.
+				// The grid must refuse it rather than hand back some other row's bytes.
+				chk(&bad, lines[want[1] + 1] == "2,bravo", fmt.tprintf("the malformed row sorted to visible position 1 (%q)", lines[want[1] + 1]))
+				{
+					mok, _, _, _, _, _ := table_cell_at_index(d, 1, 2, trows)
+					chk(&bad, !mok, "a cell the malformed row does not have resolves to nothing")
+					eok, _, _, efs, efe, eval := table_cell_at_index(d, 1, 1, trows)
+					chk(&bad, eok && sort_read_span(d, efs, efe) == "bravo" && eval == "bravo", fmt.tprintf("...while the fields it DOES have still resolve (%q)", sort_read_span(d, efs, efe)))
+				}
+
+				// --- AN EDIT, READ BACK. Visible row 0 is line 2, "1,alpha,200"; type
+				//     a Z into its first field and look at the document's bytes.
+				before := doc_debug_string(d)
+				defer delete(before)
+				{
+					eok, r, c, fs, fe, val := table_cell_at_index(d, 0, 0, trows)
+					chk(&bad, eok && val == "1", fmt.tprintf("the cell at visible row 0 col 0 holds %q", val))
+					table_edit_start(d, r, c, fs, fe, val)
+					table_edit_rune(d, 'Z')
+					table_edit_commit(d)
+				}
+				after := doc_debug_string(d)
+				defer delete(after)
+				want_after, _ := strings.replace(before, "1,alpha,200", "1Z,alpha,200", 1, context.temp_allocator)
+				chk(&bad, after == want_after, fmt.tprintf("the edit landed on the line the pointer was over (%q)", after))
+				// The specific failure a permutation-blind table_row_start produces:
+				// visible row 0 would be line 1, "3,delta,10", and THAT is the line the
+				// splice destroys. Named directly so the failure output says which.
+				chk(&bad, strings.count(after, "3,delta,10") == 1, fmt.tprintf("...and the file's first data row is untouched (%q appears %d time(s))", "3,delta,10", strings.count(after, "3,delta,10")))
+
+				// --- and the permutation SURVIVED the edit, which is table_sort_shift's
+				//     whole job: the splice added one byte at line 2, so every offset
+				//     after it moved.
+				chk(&bad, table_sorted(d), "the sort survives a cell edit")
+				noff := sort_offsets(lines[:])
+				for k in 3 ..< len(noff) {noff[k] += 1}
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == noff[want[r] + 1], fmt.tprintf("after the edit, visible row %d is still line %d: got %d, want %d", r, want[r] + 1, p, noff[want[r] + 1]))
+				}
+
+				// --- KEYSTROKES ARE NOT DROPPED WHEN THE USER REORDERS. HANDOFF §6aw
+				//     left "keystrokes are dropped on a reorder" as an inherited
+				//     constraint nothing enforced; the decision taken here is that the
+				//     click COMMITS the open edit first, while the anchor is still
+				//     intact, so the value lands on the row it was typed into.
+				//     table_edit_commit's discard survives only as the fail-closed
+				//     guard for a reorder this code did not initiate.
+				{
+					eok, r, c, fs, fe, val := table_cell_at_index(d, 0, 1, trows)
+					chk(&bad, eok && val == "alpha", fmt.tprintf("an edit is open on %q...", val))
+					table_edit_start(d, r, c, fs, fe, val)
+					table_edit_rune(d, '!')
+					pre := doc_debug_string(d)
+					defer delete(pre)
+					table_sort_click(d, 0) // reorder, with the edit still open
+					post := doc_debug_string(d)
+					defer delete(post)
+					chk(&bad, !d.table_editing, "...clicking a header closes it")
+					chk(&bad, strings.contains(post, "alpha!") && !strings.contains(pre, "alpha!"), "...by COMMITTING it, not by throwing the keystrokes away")
+					chk(&bad, strings.count(post, "alpha!,200") == 1, fmt.tprintf("...onto its own field and nowhere else (%q)", post))
+					// Undo the typed character so the qty expectations below still
+					// describe the file. Through the same cell editor, not doc_undo,
+					// which the read-only view refuses.
+					uok, ur, uc, ufs, ufe, _ := table_cell_at_index(d, 0, 1, trows)
+					if uok && sort_read_span(d, ufs, ufe) == "alpha!" {
+						table_edit_start(d, ur, uc, ufs, ufe, "alpha")
+						table_edit_commit(d)
+					}
+					chk(&bad, strings.count(doc_debug_string(d), "alpha,200") == 1, "...and the fixture is back to what the checks below describe")
+				}
+
+				// --- by QTY: numeric, so 4 < 10 < 30 < 200 rather than "10" < "200" <
+				//     "30" < "4", and the row with no qty at all goes last in BOTH
+				//     directions. A byte sort passes none of this.
+				table_sort_click(d, 2)
+				qwant := [ROWS]int{4, 0, 2, 1, 3} // charlie(4) delta(10) echo(30) alpha(200) bravo(-)
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == noff[qwant[r] + 1], fmt.tprintf("numeric asc: visible row %d is line %d (%q)", r, qwant[r] + 1, lines[qwant[r] + 1]))
+				}
+				table_sort_click(d, 2) // second click on the same column: descending
+				chk(&bad, d.table_sort.desc, "a second click on the same header reverses it")
+				dwant := [ROWS]int{1, 2, 0, 4, 3} // alpha(200) echo(30) delta(10) charlie(4) bravo(-)
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == noff[dwant[r] + 1], fmt.tprintf("numeric desc: visible row %d is line %d (%q)", r, dwant[r] + 1, lines[dwant[r] + 1]))
+				}
+				chk(&bad, dwant[ROWS - 1] == 3, "...and the row with no value is last in BOTH directions, not flipped to the front")
+				table_sort_click(d, 2) // third click: back to the file's own order
+				chk(&bad, !table_sorted(d), "a third click clears the sort")
+				// Clearing keeps the view where it was -- doc.top is a real line
+				// offset in every mode, which is the invariant the whole design rests
+				// on, so the grid stays on whatever row the descending sort had at the
+				// top rather than jumping. Wound back here so the walk below starts at
+				// data row 0.
+				d.top = 0
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == noff[r + 1], fmt.tprintf("unsorted: visible row %d is line %d again", r, r + 1))
+				}
+				return
+			}
+
+			// C2: HANDOFF §6aw's fixture, sorted for real. Every data line the same
+			// byte length -- zero-padded ids, ISO dates, fixed status codes, which is
+			// what an export looks like -- so a table_row_start that ignored the
+			// permutation would return an offset that is a REAL row start, the edit
+			// anchor's offset compare would pass, and the commit would land on the
+			// wrong row with nothing anywhere saying so. Only reading the document's
+			// bytes back can tell.
+			sort_equal_len :: proc(t: ^plat.Text) -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				px := BASE_PX_96
+				W :: f32(1000)
+				lines := [?]string {
+					"id,date,status",
+					"00003,2026-01-03,ACTIVE",
+					"00001,2026-01-01,ACTIVE",
+					"00005,2026-01-05,ACTIVE",
+					"00002,2026-01-02,ACTIVE",
+					"00004,2026-01-04,ACTIVE",
+				}
+				equal := true
+				for i in 2 ..< len(lines) {if len(lines[i]) != len(lines[1]) {equal = false}}
+				chk(&bad, equal, fmt.tprintf("every data line is the same byte length (%d) -- the offset compare is blind here", len(lines[1])))
+				off := sort_offsets(lines[:])
+				doc := doc_from_content(sort_content(lines[:]), "equal.csv", .UTF8)
+				defer doc_close(&doc)
+				d := &doc
+				d.table, d.table_delim = true, ','
+				doc_update_top_inset(d)
+				table_compute_widths(d, t)
+				d.table_cols = len(d.table_widths)
+				ROWS :: 5
+				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				trows := table_visible_rows(d, H, px)
+				cw := plat.text_char_width(t, px, .Doc)
+				if trows != ROWS {
+					chk(&bad, false, fmt.tprintf("precondition -- %d grid rows fit (want %d)", trows, ROWS))
+					return
+				}
+				table_sort_click(d, 0) // by id, ascending: 1 2 3 4 5
+				want := [ROWS]int{1, 3, 0, 4, 2}
+				ER :: 2 // sorted position 2 is data row 0 -- NOT row 2
+				chk(&bad, want[ER] != ER, fmt.tprintf("visible row %d is data row %d, so ignoring the permutation is visibly wrong here", ER, want[ER]))
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == off[want[r] + 1], fmt.tprintf("visible row %d is line %d (%q)", r, want[r] + 1, lines[want[r] + 1]))
+				}
+				// The trap, stated: the offset the permutation-blind version would
+				// return is a real row start, so nothing about the OFFSET is wrong.
+				{
+					blind := off[ER + 1] // what a sequential walk from data row 0 gives
+					real, _ := table_row_start(d, ER)
+					chk(&bad, blind != real, fmt.tprintf("the blind answer (%d) and the right one (%d) are different rows...", blind, real))
+					chk(&bad, base.pt_line_end_cap(&d.pt, blind, RENDER_LINE_CAP) - blind == base.pt_line_end_cap(&d.pt, real, RENDER_LINE_CAP) - real, "...and the same length, which is why an offset or a length compare cannot tell them apart")
+				}
+				// The edit, on the STATUS column so the change is at the far end of the
+				// line and cannot be confused with the id the sort keyed on.
+				before := doc_debug_string(d)
+				defer delete(before)
+				{
+					eok, r, c, fs, fe, val := table_cell_at_index(d, ER, 2, trows)
+					chk(&bad, eok && val == "ACTIVE", fmt.tprintf("the cell at visible row %d col 2 holds %q", ER, val))
+					table_edit_start(d, r, c, fs, fe, val)
+					table_edit_rune(d, 'X')
+					table_edit_commit(d)
+				}
+				after := doc_debug_string(d)
+				defer delete(after)
+				home := lines[want[ER] + 1]
+				want_after, _ := strings.replace(before, home, fmt.tprintf("%sX", home), 1, context.temp_allocator)
+				chk(&bad, after == want_after, fmt.tprintf("the edit landed on %q and nowhere else", home))
+				// Every other line is intact, named one at a time so the output says
+				// WHICH row a regression wrote over. WITH ITS TERMINATOR: the edit
+				// appends, so a line that had been written over reads as the original
+				// followed by the typed byte, and a bare substring count would find the
+				// original inside the damaged line and call it survived. That is a
+				// vacuous assertion, and it passed under the permutation-blind
+				// sabotage while the compare above caught the same write.
+				for i in 1 ..< len(lines) {
+					if i == want[ER] + 1 {continue}
+					with_nl := fmt.tprintf("%s\n", lines[i])
+					chk(&bad, strings.count(after, with_nl) == 1, fmt.tprintf("...line %d %q survives intact, terminator and all", i, lines[i]))
+				}
+				return
+			}
+
+			// C3: §10's summary row -- and specifically that an unfinished index reads
+			// as APPROXIMATE. A settled-looking count that changes on the next frame is
+			// the failure this is here to prevent, and it is invisible without an
+			// exact-string comparison because both forms look like a row count.
+			sort_summary :: proc(t: ^plat.Text) -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				lines := [?]string{"k,v", "a,10", "b,200", "c,30", "d,", "e,4"}
+				doc := doc_from_content(sort_content(lines[:]), "summary.csv", .UTF8)
+				defer doc_close(&doc)
+				d := &doc
+				d.table, d.table_delim = true, ','
+				table_compute_widths(d, t)
+				d.table_cols = len(d.table_widths)
+
+				// 1. Unfinished index: the worker has published a partial count and
+				//    `done` is false. Five data rows exist; the count says 4.2M because
+				//    that is what the worker has reached, and the point is that the
+				//    reader can SEE it is not final.
+				intrinsics.atomic_store(&d.idx.line_count, 4_200_002)
+				intrinsics.atomic_store(&d.idx.done, false)
+				n, exact := table_row_count(d)
+				chk(&bad, !exact && n == 4_200_000, fmt.tprintf("a running index gives %d rows, exact=%v", n, exact))
+				got := table_summary_text(d)
+				chk(&bad, got == "~4.2M rows  ·  2 columns", fmt.tprintf("...and reads as approximate: %q", got))
+
+				// 1b. Nothing published yet -- the first frame of every large file, and
+				//     the moment this row is most looked at. "~0 rows" would be a
+				//     number, and a wrong one.
+				intrinsics.atomic_store(&d.idx.line_count, 0)
+				z := table_summary_text(d)
+				chk(&bad, z == "counting rows…  ·  2 columns", fmt.tprintf("an index that has published nothing names the state: %q", z))
+				intrinsics.atomic_store(&d.idx.line_count, 4_200_002)
+
+				// 2. Finished: the same number, settled, grouped, no tilde.
+				intrinsics.atomic_store(&d.idx.done, true)
+				n2, exact2 := table_row_count(d)
+				chk(&bad, exact2 && n2 == 4_200_000, fmt.tprintf("a finished index gives %d rows, exact=%v", n2, exact2))
+				got2 := table_summary_text(d)
+				chk(&bad, got2 == "4,200,000 rows  ·  2 columns", fmt.tprintf("...and reads as settled: %q", got2))
+				chk(&bad, got != got2, "the two forms are actually different strings")
+
+				// 3. The real count, off the real worker, so §10's number is the file's
+				//    and not this test's atomics.
+				doc_index_start(d)
+				for !doc_index_done(d) {}
+				n3, exact3 := table_row_count(d)
+				chk(&bad, exact3 && n3 == 5, fmt.tprintf("the file's own count is %d data rows (want 5, header and terminator excluded)", n3))
+
+				// 4. An active sort is named.
+				table_sort_click(d, 1)
+				// ...and, with a FINISHED index, the row numbers still follow the
+				// rows. This is the dangerous half of the same check sort_order makes:
+				// there the index had published nothing, so the consecutive-run
+				// shortcut refused and drew blanks; here it would answer, confidently,
+				// 1 2 3 4 5 over lines 5 1 3 2 4.
+				{
+					absn := table_abs_rows(d, 5)
+					want := [5]int{4, 0, 2, 1, 3} // e(4) a(10) c(30) b(200) d(empty, last)
+					for r in 0 ..< 5 {
+						chk(&bad, absn[r] == want[r], fmt.tprintf("with the index finished, visible row %d numbers as data row %d (want %d)", r, absn[r], want[r]))
+					}
+				}
+				s := table_summary_text(d)
+				chk(&bad, s == "5 rows  ·  2 columns  ·  sorted by v asc", fmt.tprintf("an active sort is in the summary: %q", s))
+				table_sort_click(d, 1)
+				s2 := table_summary_text(d)
+				chk(&bad, s2 == "5 rows  ·  2 columns  ·  sorted by v desc", fmt.tprintf("...and its direction: %q", s2))
+
+				// 5. The refusal, as TEXT. sort_ceiling proves a big file sets the flag;
+				//    this proves the flag is what the reader sees, which is the half
+				//    that makes a refused click something other than a dead header.
+				table_sort_clear(d)
+				d.table_sort.refused = true
+				s3 := table_summary_text(d)
+				// Checked in three parts rather than against one literal sentence.
+				// It WAS a literal ending "(over 1,000,000 rows)" and it went red the
+				// moment TABLE_SORT_MAX was lowered on a measurement -- a true failure
+				// about nothing, which is how a suite teaches people to edit
+				// expectations until they pass. Interpolating group_int instead was
+				// the obvious repair and is not available here (it is file-private to
+				// table.odin) -- which is the better outcome, because it would have
+				// asserted the message against the same procedure that built it.
+				//
+				// So: the sentence's shape and both separators are pinned by the
+				// prefix and suffix, and the number is pinned by PARSING it back and
+				// comparing to the constant. That is strictly stronger than the
+				// literal was -- the literal could not tell "the ceiling changed" from
+				// "the message stopped naming the ceiling at all" -- and it cannot rot
+				// when the constant moves again.
+				pre3 :: "5 rows  ·  2 columns  ·  too large to sort (over "
+				suf3 :: " rows)"
+				shape3 := strings.has_prefix(s3, pre3) && strings.has_suffix(s3, suf3)
+				num3 := 0
+				if shape3 {
+					mid := s3[len(pre3):len(s3) - len(suf3)]
+					// Strip the grouping separators without reimplementing how they
+					// are placed: this asserts WHICH number is shown, not how it is
+					// punctuated, which group_int's own tests are for.
+					bare, _ := strings.replace_all(mid, ",", "", context.temp_allocator)
+					num3, _ = strconv.parse_int(bare)
+				}
+				chk(&bad, shape3, fmt.tprintf("a refused sort says why: %q", s3))
+				chk(
+					&bad,
+					num3 == TABLE_SORT_MAX,
+					fmt.tprintf("...and names the real ceiling: message says %d, TABLE_SORT_MAX is %d", num3, TABLE_SORT_MAX),
+				)
+				return
+			}
+
+			// C4: the ceiling. Builds TABLE_SORT_MAX rows, MEASURES the sort, then
+			// builds one row more and asserts the refusal.
+			//
+			// A real file at the real constant, because the plan's instruction was to
+			// measure the cost rather than assert it from arithmetic, and because a
+			// refusal proved on a lowered constant proves nothing about the shipped one.
+			sort_ceiling :: proc(t: ^plat.Text) -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				build :: proc(rows: int) -> []u8 {
+					HEAD :: "id,date,status\n"
+					ROW :: 26 // "0000000,2026-01-01,ACTIVE\n" -- a realistic export row
+					out := make([]u8, len(HEAD) + rows * ROW)
+					copy(out[:], transmute([]u8)string(HEAD))
+					o := len(HEAD)
+					for i in 0 ..< rows {
+						// Scrambled ids -- 7919 is prime and coprime with the row
+						// count, so this is a bijection and the permutation is nowhere
+						// near the identity. A build that quietly produced file order
+						// would otherwise look right at both ends.
+						s := fmt.tprintf("%07d,2026-01-01,ACTIVE\n", (i * 7919) % rows)
+						assert(len(s) == ROW)
+						copy(out[o:], transmute([]u8)s)
+						o += ROW
+					}
+					return out
+				}
+				{
+					doc := doc_from_content(build(TABLE_SORT_MAX), "ceiling.csv", .UTF8)
+					defer doc_close(&doc)
+					d := &doc
+					d.table, d.table_delim = true, ','
+					table_compute_widths(d, t)
+					d.table_cols = len(d.table_widths)
+					t0 := time.tick_now()
+					ok := table_sort_build(d, 0)
+					ms := time.duration_milliseconds(time.tick_since(t0))
+					chk(&bad, ok && table_sort_rows(d) == TABLE_SORT_MAX, fmt.tprintf("exactly TABLE_SORT_MAX rows sort: %d rows in %.0f ms", table_sort_rows(d), ms))
+					// The order is right at both ends, checked against the ids this
+					// test generated rather than against the sort's own arrays.
+					lo, _ := table_sort_row_at(d, 0)
+					hi, _ := table_sort_row_at(d, TABLE_SORT_MAX - 1)
+					b: [8]u8
+					base.pt_read(&d.pt, lo, b[:7])
+					first := strings.clone(string(b[:7]), context.temp_allocator)
+					base.pt_read(&d.pt, hi, b[:7])
+					last := strings.clone(string(b[:7]), context.temp_allocator)
+					chk(&bad, first == "0000000", fmt.tprintf("...smallest id first (%q)", first))
+					chk(&bad, last == fmt.tprintf("%07d", TABLE_SORT_MAX - 1), fmt.tprintf("...largest id last (%q)", last))
+					fmt.printfln("         sort cost: %.0f ms for %d rows, %d bytes resident (offs+perm+rank)", ms, TABLE_SORT_MAX, TABLE_SORT_MAX * (size_of(int) + 2 * size_of(i32)))
+				}
+				{
+					doc := doc_from_content(build(TABLE_SORT_MAX + 1), "over.csv", .UTF8)
+					defer doc_close(&doc)
+					d := &doc
+					d.table, d.table_delim = true, ','
+					table_compute_widths(d, t)
+					d.table_cols = len(d.table_widths)
+					// No index running: the count is not exact, so the early refusal
+					// cannot fire and this exercises the SCANNING one -- the path that
+					// has to stop counting at the ceiling rather than after the file.
+					ok := table_sort_build(d, 0)
+					chk(&bad, !ok, "one row past TABLE_SORT_MAX is refused")
+					chk(&bad, !table_sorted(d), "...and nothing is left half-sorted")
+					chk(&bad, d.table_sort.refused, "...and the refusal is recorded for the summary row")
+					chk(&bad, strings.contains(table_summary_text(d), "too large to sort"), fmt.tprintf("...which says so: %q", table_summary_text(d)))
+					// ...and with the count SETTLED it refuses without scanning at all,
+					// which is what stops a header on a huge file freezing the app once
+					// per press for a refusal it could have known instantly.
+					doc_index_start(d)
+					for !doc_index_done(d) {}
+					n, exact := table_row_count(d)
+					chk(&bad, exact && n == TABLE_SORT_MAX + 1, fmt.tprintf("the index settles at %d data rows", n))
+					t0 := time.tick_now()
+					ok2 := table_sort_build(d, 0)
+					us := time.duration_microseconds(time.tick_since(t0))
+					chk(&bad, !ok2 && d.table_sort.refused, "a settled over-ceiling count refuses too")
+					chk(&bad, us < 1000, fmt.tprintf("...and does it without a pass over the file (%.0f us)", us))
+				}
+				return
+			}
+
+			// F7: §10 group C's VIEW-ONLY SORT. A DATA-LOSS TEST.
+			//
+			// table_cell_at maps a pixel through table_row_start to a field's byte
+			// range and table_edit_commit splices that range. Under a sort the r-th
+			// visible row is no longer the r-th line, so every assertion below either
+			// compares the RESOLVED BYTES against a field text this test derived by
+			// plain strings.split, or performs a real edit and reads the document back.
+			// Nothing here compares a resolved range against a computed one: that
+			// compares two derivations of the same expression and passes with the bug
+			// present.
+			tg_sort :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (sort): no fonts loaded")
+					bad += 1
+					return
+				}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
+				BASE_PX = BASE_PX_96
+				bad += sort_order(&t)
+				bad += sort_equal_len(&t)
+				bad += sort_summary(&t)
+				bad += sort_ceiling(&t)
+				return
+			}
+
+			// F8: LEAVING the grid leaves the sort behind, through Ctrl+T itself.
+			//
+			// leave_table_view states the policy -- "the sort is a property of the
+			// VIEW, not of the document" -- and .Toggle_Table's own off-branch, the
+			// primary way to leave, did not follow it. Two consequences, and the
+			// second is the one that cost something: the sort silently reappeared on
+			// the next Ctrl+T with its accent arrow and summary text, and
+			// table_sort_shift kept running an O(rows) pass on every keystroke in the
+			// plain text editor for any document that had been in the grid once.
+			//
+			// Driven through command_dispatch rather than by calling the helper: the
+			// bug WAS that the command did something different from the helper, so a
+			// test that called leave_table_view could never have seen it.
+			tg_sort_leaves :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (sort leaves): no fonts loaded")
+					bad += 1
+					return
+				}
+				make_doc :: proc(name: string) -> ^Document {
+					src := "id,name\n1,delta\n2,alpha\n3,charlie\n"
+					content := make([]u8, len(src)) // app_destroy -> doc_close owns it
+					copy(content, transmute([]u8)src)
+					d := new(Document)
+					d^ = doc_from_content(content, name, .UTF8)
+					return d
+				}
+				a: App
+				a.settings = settings_default()
+				// OFF deliberately: .Toggle_Table's tail calls settings_save when it is
+				// on, and a test has no business writing the real settings store.
+				a.settings.remember_views = false
+				dummy: plat.Window
+				defer app_destroy(&a)
+				d := make_doc("leave.csv")
+				app_activate(&a, app_add(&a, d))
+
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
+				chk(&bad, d.table, "Ctrl+T opens the grid")
+				table_sort_click(d, 1)
+				chk(&bad, table_sorted(d) && len(d.table_sort.offs) == 3, fmt.tprintf("...a header click sorts its 3 data rows (sorted=%v, %d offsets)", table_sorted(d), len(d.table_sort.offs)))
+				// A refusal recorded on the way out has to go too, or the next grid
+				// session opens saying the file is too large to sort. Set by hand
+				// rather than by building a TABLE_SORT_MAX-row file for one field.
+				d.table_sort.refused = true
+
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
+				chk(&bad, !d.table, "Ctrl+T closes it again")
+				s := &d.table_sort
+				chk(&bad, s.col == TABLE_SORT_NONE, fmt.tprintf("...and the sort goes with the view (col %d, want %d)", s.col, TABLE_SORT_NONE))
+				chk(&bad, len(s.offs) == 0 && len(s.perm) == 0 && len(s.rank) == 0, fmt.tprintf("...arrays and all (%d offs, %d perm, %d rank)", len(s.offs), len(s.perm), len(s.rank)))
+				chk(&bad, !s.refused, "...and the refusal with them")
+
+				// A keystroke in the TEXT view. This is the expensive half: with a sort
+				// left behind, every edit ran the shift pass over up to TABLE_SORT_MAX
+				// offsets; with it cleared, table_sort_shift's first line returns.
+				// Asserted on that line's own condition rather than on a stopwatch.
+				doc_replace_range(d, 0, 0, transmute([]u8)string("Z"))
+				chk(&bad, len(d.table_sort.offs) == 0, fmt.tprintf("a text-view edit finds no sort to shift (%d offsets)", len(d.table_sort.offs)))
+
+				// ...and the same edit on a document whose grid IS open really does
+				// move the offsets, so the check above is observing something.
+				d2 := make_doc("control.csv")
+				app_activate(&a, app_add(&a, d2))
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
+				table_sort_click(d2, 1)
+				before := make([]int, len(d2.table_sort.offs), context.temp_allocator)
+				copy(before, d2.table_sort.offs[:])
+				doc_replace_range(d2, 0, 0, transmute([]u8)string("Z"))
+				moved := len(before) > 0 && len(d2.table_sort.offs) == len(before)
+				if moved {for o, i in d2.table_sort.offs {if o != before[i] + 1 {moved = false}}}
+				chk(&bad, moved, "control -- with the grid open the same edit shifts every offset by one")
+
+				// And the visible half: turning the grid back on opens on the file's
+				// own order, with nothing in the summary claiming otherwise.
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10) // d2 off
+				app_activate(&a, 0)
+				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10) // d back on
+				chk(&bad, d.table && !table_sorted(d), fmt.tprintf("the next Ctrl+T opens unsorted (table=%v, sorted=%v)", d.table, table_sorted(d)))
+				// Both clauses, not just the sort's. table_summary_text tests `refused`
+				// FIRST, so a stale refusal hides a stale sort behind "too large to
+				// sort" -- and this assertion, written against "sorted by" alone,
+				// stayed green under the sabotage that removed the fix.
+				sum := table_summary_text(d)
+				chk(&bad, !strings.contains(sum, "sorted by") && !strings.contains(sum, "too large"), fmt.tprintf("...and the summary claims neither a sort nor a refusal: %q", sum))
+
+				// The third leave path, which no command reaches: a session restore or
+				// a reload re-applies a Doc_View, and Doc_View carries no sort. Driven
+				// with table = true, the case where the grid stays on and a surviving
+				// permutation would therefore still be read.
+				table_sort_click(d, 1)
+				chk(&bad, table_sorted(d), "precondition -- sorted again for the view-apply path")
+				doc_view_apply(d, Doc_View{table = true})
+				chk(&bad, d.table && !table_sorted(d), fmt.tprintf("doc_view_apply keeps the grid and drops the sort (table=%v, sorted=%v)", d.table, table_sorted(d)))
+				return
+			}
+
+			bad := tg_abs_cost()
+			bad += tg_abs_overcap()
+			bad += tg_sort_leaves()
+			bad += tg_gutter_pixels()
+			bad += tg_align()
+			bad += tg_resize()
+			bad += tg()
 			bad += tg_page()
 			bad += tg_edit_anchor()
 			bad += tg_edit_permute()
 			bad += tg_appearance()
+			bad += tg_parity()
+			bad += tg_malformed()
+			bad += tg_sort()
 			fmt.printfln("tablegridtest: %d failures", bad)
+			// Exit non-zero, like keytest / palettetest / lineidxtest / resavetest.
+			// HANDOFF §6aw listed this mode as the notable omission: it asserts a
+			// hundred things about a data-loss seam and used to only print them, so a
+			// sweep that greps case-insensitively for FAIL matched "0 failures" and
+			// saw nothing. Group C makes that worse -- the seam now decides which line
+			// a cell edit writes to -- so it is fixed here.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
@@ -15328,27 +18227,6 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
-		// `newtpad resavetest <file>` opens a file, edits it and saves, so an external
-		// checker can assert what the save preserved. The atomic write used to rename
-		// a brand-new temp file over the target, which substitutes a fresh file and
-		// silently drops the original's attributes, ACLs and alternate data streams --
-		// the properties are easiest to observe from outside, hence this mode.
-		if os.args[1] == "resavetest" && len(os.args) > 2 {
-			path := os.args[2]
-			doc, ok := doc_open(path)
-			if !ok {
-				fmt.eprintfln("resavetest: could not open %q", path)
-				return true
-			}
-			defer doc_close(&doc)
-			doc.cursor = doc.pt.length
-			doc.anchor = doc.cursor
-			doc_insert_text(&doc, transmute([]u8)string("appended\n"))
-			err := doc_save_err(&doc, path)
-			fmt.printfln("resavetest: save err=%v size=%d", err, doc.pt.length)
-			return true
-		}
-
 		// `newtpad colperftest <mb>` measures the status bar's caret column on a
 		// single-line file -- minified JSON, an unrotated log, a CSV with no newlines.
 		// doc_cursor_col called pt_line_start, an uncapped backward scan, and the
@@ -15849,8 +18727,15 @@ when NEWTPAD_TESTS {
 					{hscroll = true},
 					{preview = true},
 					{divider = true},
+					{col_resize = true},
 				}
-				names := []string{"vscroll", "hscroll", "preview", "divider"}
+				names := []string{"vscroll", "hscroll", "preview", "divider", "col_resize"}
+				// The list above is written by hand, so a latch added to the
+				// struct and not to it would go untested -- which is how `hscroll`
+				// went missing from the predicate itself. Every field is a bool, so
+				// the struct's size IS its field count: a sixth latch fails to
+				// compile here until it is enumerated above.
+				#assert(size_of(Drag_Latches) == 5)
 				for d, i in all {
 					// Grid: every latch must veto the swallow.
 					if ro_surface_swallows(true, .Off, false, d) {
@@ -16801,6 +19686,13 @@ when NEWTPAD_TESTS {
 
 		// `newtpad palettetest` exercises the command palette's fuzzy match + modes.
 		if os.args[1] == "palettetest" {
+			// One counter for the WHOLE mode, and a non-zero exit off it. This mode
+			// printed FAIL from four places and exited 0 from all of them, which is
+			// the keytest hole (development-loop.md 6aw) one mode over: a summary a
+			// sweep has to remember to grep is a summary that eventually is not
+			// grepped. The pseudo-tab block keeps its own local count and folds into
+			// this one, so its line still reads as its own section.
+			bad := 0
 			a: App
 			mk :: proc(a: ^App, name: string) {
 				c := make([]u8, 4);copy(c, transmute([]u8)string("data"))
@@ -16841,6 +19733,7 @@ when NEWTPAD_TESTS {
 			rr := palette_row_at(&a, l.x0 + l.w + sx(20), rowtop + l.rowh * 0.5, W, H) // right
 			rb := palette_row_at(&a, inx, rowtop + l.rowh * f32(l.nres + 3), W, H) // below
 			ok := r0 == 0 && rq == -1 && rl == -1 && rr == -1 && rb == -1
+			if !ok {bad += 1}
 			fmt.printfln("palette rows: first=%d query=%d L=%d R=%d below=%d  %s", r0, rq, rl, rr, rb, "OK" if ok else "FAIL")
 
 			// Clicking away closes; clicking a row selects without closing.
@@ -16853,6 +19746,7 @@ when NEWTPAD_TESTS {
 			rowtop = l.y0 + l.qh
 			chose, c2 := palette_click(&a, l.x0 + l.w * 0.5, rowtop + l.rowh * 0.5, W, H)
 			row_ok := chose && c2
+			if !(away_ok && row_ok) {bad += 1}
 			fmt.printfln("click away closes=%v, click row chooses=%v  %s", away_ok, row_ok, "OK" if away_ok && row_ok else "FAIL")
 			a.palette.active = false
 			app_destroy(&a)
@@ -16980,7 +19874,100 @@ when NEWTPAD_TESTS {
 				}
 
 				fmt.printfln("palette pseudo-tab gate: %d failures", pbad)
+				bad += pbad
 			}
+
+			// Extend Column Selection Left/Right, run the way the PALETTE runs them.
+			// Both arms are gated on ev.shift so that a bare Alt+Left keeps doing
+			// nothing (commands.odin), and palette_execute dispatches a ZERO
+			// Key_Event -- so on the shift test alone these two were palette rows
+			// that matched, highlighted, ran, and left the document exactly as it
+			// was, while their Up/Down siblings worked. command_named is what lets a
+			// named invocation past the gate, and this is the only check in the tree
+			// that can see it: keytest exercises the CHORDS, and blocktest calls
+			// command_dispatch with a synthesised Alt+Shift event, so neither one
+			// goes through palette_execute.
+			//
+			// Asserts on the RECTANGLE, not on a return value -- palette_execute
+			// returns nothing, and "did anything happen" is a fact about
+			// doc.block_cursor_cell. Its own proc holding one App, per
+			// development-loop.md 6 (test_mode_dispatch's frame has overflowed twice).
+			palette_block_case :: proc(cmd: Command_Id, want_cell: int) -> (bad: int) {
+				a: App
+				wv: plat.Window
+				bt: plat.Text
+				// Real faces. block_extend only measures when it has to SEED a
+				// rectangle (caret_line_start_cell -> line_cell_col ->
+				// plat.text_cells), which the seeded fixture below avoids -- but that
+				// is a property of today's control flow, not a contract, and a zero
+				// Text would turn a future change into a null deref inside a test
+				// rather than a red line.
+				if !plat.text_load_faces(&bt) {
+					fmt.println("  FAIL   no fonts loaded, so the column-extend cases prove nothing")
+					return 1
+				}
+				a.settings = settings_default()
+				app_new_scratch(&a)
+				defer app_destroy(&a)
+				d := app_active(&a)
+				doc_close(d)
+				d^ = doc_from_content(transmute([]u8)strings.clone("alpha beta\nsecond line\nthird line\n"), "", .UTF8)
+				d.wrap = false // block_extend refuses outright under wrap
+				// A live one-cell rectangle at column 2 of row 0, caret to match.
+				// SEEDED rather than started from nothing on purpose: with no
+				// rectangle block_extend seeds one as well as stepping it, so a bare
+				// block_active(d) afterwards would go green on the seeding alone and
+				// could not tell a step from a start. Here the anchor corner is
+				// pinned at cell 2 and only the cursor corner may move, so what the
+				// assertion below observes is this dispatch and nothing else.
+				d.cursor, d.anchor = 2, 2
+				d.block = true
+				d.block_anchor_line_start, d.block_anchor_cell = 0, 2
+				d.block_cursor_line_start, d.block_cursor_cell = 0, 2
+
+				palette_open(&a)
+				palette_input_rune(&a, '>')
+				for r in command_table[cmd].title {palette_input_rune(&a, r)}
+				// Find the row rather than trusting the ranking, and count a missing
+				// row as a failure -- same reason as palette_pseudo_case above. A
+				// command that quietly left the palette would otherwise take this
+				// case green with it while testing nothing at all.
+				row := -1
+				for res, i in a.palette.results {
+					if res.cmd == cmd {row = i}
+				}
+				if row < 0 {
+					fmt.printfln("  FAIL   %v is not in the palette at all, so this case proves nothing", cmd)
+					return 1
+				}
+				a.palette.selected = row
+				palette_execute(&a, &wv, &bt, 10)
+				ok :=
+					block_active(d) &&
+					d.block_cursor_cell == want_cell &&
+					d.block_anchor_cell == 2 &&
+					d.block_anchor_line_start == 0 &&
+					d.block_cursor_line_start == 0
+				fmt.printfln(
+					"  %-6s palette %-19v steps the rectangle: cursor_cell=%d (want %d) anchor_cell=%d (want 2) active=%v",
+					"ok" if ok else "FAIL",
+					cmd,
+					d.block_cursor_cell,
+					want_cell,
+					d.block_anchor_cell,
+					block_active(d),
+				)
+				if !ok {bad += 1}
+				return
+			}
+			fmt.println("-- column-extend rows run from the palette --")
+			bad += palette_block_case(.Block_Extend_Right, 3)
+			bad += palette_block_case(.Block_Extend_Left, 1)
+
+			fmt.printfln("palettetest: %d failures", bad)
+			// Non-zero exit, for the reason keytest grew one: a mode that only ever
+			// prints its verdict is a mode whose verdict a sweep can miss.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
@@ -26335,6 +29322,21 @@ when NEWTPAD_TESTS {
 		// it -- both reach keytest_run.
 		if os.args[1] == "keytest" {
 			keytest_run(os.args[2] if len(os.args) > 2 else "")
+			return true
+		}
+
+		// `newtpad lineidxtest` -- one-argument, so a sweep can run it. An optional
+		// path only substitutes a bigger real file for the memory measurement.
+		if os.args[1] == "lineidxtest" {
+			line_idx_test_run(os.args[2] if len(os.args) > 2 else "")
+			return true
+		}
+
+		// `newtpad resavetest` -- one-argument as of 2026-07-31. An optional path
+		// saves over a file of your choosing and leaves it there for an external
+		// checker, which is what the mode was originally for.
+		if os.args[1] == "resavetest" {
+			resave_test_run(os.args[2] if len(os.args) > 2 else "")
 			return true
 		}
 
