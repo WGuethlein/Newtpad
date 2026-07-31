@@ -11983,10 +11983,16 @@ when NEWTPAD_TESTS {
 				want_after, _ := strings.replace(before, home, fmt.tprintf("%sX", home), 1, context.temp_allocator)
 				chk(&bad, after == want_after, fmt.tprintf("the edit landed on %q and nowhere else", home))
 				// Every other line is intact, named one at a time so the output says
-				// WHICH row a regression wrote over.
+				// WHICH row a regression wrote over. WITH ITS TERMINATOR: the edit
+				// appends, so a line that had been written over reads as the original
+				// followed by the typed byte, and a bare substring count would find the
+				// original inside the damaged line and call it survived. That is a
+				// vacuous assertion, and it passed under the permutation-blind
+				// sabotage while the compare above caught the same write.
 				for i in 1 ..< len(lines) {
 					if i == want[ER] + 1 {continue}
-					chk(&bad, strings.count(after, lines[i]) == 1, fmt.tprintf("...line %d %q survives intact", i, lines[i]))
+					with_nl := fmt.tprintf("%s\n", lines[i])
+					chk(&bad, strings.count(after, with_nl) == 1, fmt.tprintf("...line %d %q survives intact, terminator and all", i, lines[i]))
 				}
 				return
 			}
@@ -12018,6 +12024,14 @@ when NEWTPAD_TESTS {
 				chk(&bad, !exact && n == 4_200_000, fmt.tprintf("a running index gives %d rows, exact=%v", n, exact))
 				got := table_summary_text(d)
 				chk(&bad, got == "~4.2M rows  ·  2 columns", fmt.tprintf("...and reads as approximate: %q", got))
+
+				// 1b. Nothing published yet -- the first frame of every large file, and
+				//     the moment this row is most looked at. "~0 rows" would be a
+				//     number, and a wrong one.
+				intrinsics.atomic_store(&d.idx.line_count, 0)
+				z := table_summary_text(d)
+				chk(&bad, z == "counting rows…  ·  2 columns", fmt.tprintf("an index that has published nothing names the state: %q", z))
+				intrinsics.atomic_store(&d.idx.line_count, 4_200_002)
 
 				// 2. Finished: the same number, settled, grouped, no tilde.
 				intrinsics.atomic_store(&d.idx.done, true)
@@ -12091,7 +12105,7 @@ when NEWTPAD_TESTS {
 					t0 := time.tick_now()
 					ok := table_sort_build(d, 0)
 					ms := time.duration_milliseconds(time.tick_since(t0))
-					chk(&bad, ok && table_sort_rows(d) == TABLE_SORT_MAX, fmt.tprintf("exactly TABLE_SORT_MAX rows sort: %d rows in %.0f ms (debug build)", table_sort_rows(d), ms))
+					chk(&bad, ok && table_sort_rows(d) == TABLE_SORT_MAX, fmt.tprintf("exactly TABLE_SORT_MAX rows sort: %d rows in %.0f ms", table_sort_rows(d), ms))
 					// The order is right at both ends, checked against the ids this
 					// test generated rather than against the sort's own arrays.
 					lo, _ := table_sort_row_at(d, 0)
@@ -12112,11 +12126,26 @@ when NEWTPAD_TESTS {
 					d.table, d.table_delim = true, ','
 					table_compute_widths(d, t)
 					d.table_cols = len(d.table_widths)
+					// No index running: the count is not exact, so the early refusal
+					// cannot fire and this exercises the SCANNING one -- the path that
+					// has to stop counting at the ceiling rather than after the file.
 					ok := table_sort_build(d, 0)
 					chk(&bad, !ok, "one row past TABLE_SORT_MAX is refused")
 					chk(&bad, !table_sorted(d), "...and nothing is left half-sorted")
 					chk(&bad, d.table_sort.refused, "...and the refusal is recorded for the summary row")
 					chk(&bad, strings.contains(table_summary_text(d), "too large to sort"), fmt.tprintf("...which says so: %q", table_summary_text(d)))
+					// ...and with the count SETTLED it refuses without scanning at all,
+					// which is what stops a header on a huge file freezing the app once
+					// per press for a refusal it could have known instantly.
+					doc_index_start(d)
+					for !doc_index_done(d) {}
+					n, exact := table_row_count(d)
+					chk(&bad, exact && n == TABLE_SORT_MAX + 1, fmt.tprintf("the index settles at %d data rows", n))
+					t0 := time.tick_now()
+					ok2 := table_sort_build(d, 0)
+					us := time.duration_microseconds(time.tick_since(t0))
+					chk(&bad, !ok2 && d.table_sort.refused, "a settled over-ceiling count refuses too")
+					chk(&bad, us < 1000, fmt.tprintf("...and does it without a pass over the file (%.0f us)", us))
 				}
 				return
 			}

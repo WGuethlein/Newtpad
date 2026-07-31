@@ -297,6 +297,12 @@ table_summary_text :: proc(doc: ^Document, allocator := context.temp_allocator) 
 	sb := strings.builder_make(allocator)
 	if exact {
 		fmt.sbprintf(&sb, "%s row%s", group_int(n, allocator), "" if n == 1 else "s")
+	} else if n <= 0 {
+		// The worker has published nothing yet, which is the FIRST frame of every
+		// large file -- exactly when this row is most looked at. "~0 rows" is a
+		// number, and a wrong one; naming the state instead is the only reading that
+		// is true at the moment it is drawn.
+		fmt.sbprint(&sb, "counting rows…")
 	} else if n >= 1_000_000 {
 		fmt.sbprintf(&sb, "~%.1fM rows", f64(n) / 1_000_000)
 	} else if n >= 1_000 {
@@ -757,6 +763,16 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 	if doc == nil || col < 0 {return false}
 	first, fok := table_first_data_row(doc)
 	if !fok {return false}
+	// Refuse before scanning when the row count is already SETTLED and over the
+	// ceiling. Without this every click on a 12M-row file pays for a full
+	// TABLE_SORT_MAX-row pass -- measured at ~3 s in a debug build -- to arrive at
+	// the same refusal, so the header would freeze the app once per press and never
+	// do anything. Only on an EXACT count: a partial one is smaller than the truth
+	// by construction, so refusing off it would refuse files that fit.
+	if n, exact := table_row_count(doc); exact && n > TABLE_SORT_MAX {
+		s.refused = true
+		return false
+	}
 	delim := doc.table_delim if doc.table_delim != 0 else ','
 
 	// The key bytes, and one item per row. Heap, with explicit frees, rather than
