@@ -12778,6 +12778,248 @@ when NEWTPAD_TESTS {
 				return
 			}
 
+			// The grid's PIXEL horizontal scroll, and the seam it moves.
+			//
+			// doc.table_hscroll_px was a column index (doc.table_col) until
+			// 2026-07-31, and changing its unit moves table_cols_layout -- the one
+			// x-axis producer -- under the draw, the cell hit-test, the header
+			// hit-test, the resize-edge hit-test, the link layout, the edit box and
+			// the scrollbar at once. table_cell_at resolves a pixel to a byte range
+			// that table_edit_commit WRITES, so a consumer left behind in the old
+			// unit does not draw wrong, it writes the user's typed value into the
+			// wrong column.
+			//
+			// So these are seam assertions, not arithmetic ones: the x the DRAW puts
+			// a cell's glyphs at is handed to the HIT-TEST, and the bytes that come
+			// back are compared against a field derived from the fixture by plain
+			// strings.split -- independent of csv_fields, table_row_start and every
+			// producer under test. Probed AT SCROLL OFFSETS THAT ARE NOT COLUMN
+			// BOUNDARIES, which is the whole point of pixel scrolling and the one
+			// state the old column model could not reach; a column-snapping layout
+			// passes every boundary-aligned probe there is.
+			//
+			// Its own proc for the frame-size reason tg_page records.
+			tg_hscroll :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				want_field :: proc(lines: []string, line, col: int) -> (string, bool) {
+					parts := strings.split(lines[line], ",", context.temp_allocator)
+					if col >= len(parts) {return "", false}
+					return parts[col], true
+				}
+				read_span :: proc(doc: ^Document, fs, fe: int) -> string {
+					if fe < fs {return "<inverted>"}
+					b := make([]u8, fe - fs, context.temp_allocator)
+					base.pt_read(&doc.pt, fs, b)
+					return string(b)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (h-scroll): no fonts loaded")
+					return 1
+				}
+				// DELIBERATELY UNEVEN COLUMNS -- 8, 12, 24, 8, 15 and 8 cells after
+				// §10's 8-40 clamp. That is what discriminates: with uniform columns a
+				// column index and a pixel offset are the same number scaled, so a
+				// snapping model and a pixel model agree everywhere and none of the
+				// assertions below could fail. Every field also carries its row's
+				// digit, so a hit that lands on the right column of the wrong row is
+				// caught rather than spelling the same string either way.
+				lines := [?]string {
+					"id,name,description,n,medium_col,z",
+					"1,aaaaaaaaaaa1,xxxxxxxxxxxxxxxxxxxxxxx1,1,mmmmmmmmmmmmmm1,z1",
+					"2,aaaaaaaaaaa2,xxxxxxxxxxxxxxxxxxxxxxx2,2,mmmmmmmmmmmmmm2,z2",
+					"3,aaaaaaaaaaa3,xxxxxxxxxxxxxxxxxxxxxxx3,3,mmmmmmmmmmmmmm3,z3",
+					"4,aaaaaaaaaaa4,xxxxxxxxxxxxxxxxxxxxxxx4,4,mmmmmmmmmmmmmm4,z4",
+					"5,aaaaaaaaaaa5,xxxxxxxxxxxxxxxxxxxxxxx5,5,mmmmmmmmmmmmmm5,z5",
+					"6,aaaaaaaaaaa6,xxxxxxxxxxxxxxxxxxxxxxx6,6,mmmmmmmmmmmmmm6,z6",
+					"7,aaaaaaaaaaa7,xxxxxxxxxxxxxxxxxxxxxxx7,7,mmmmmmmmmmmmmm7,z7",
+					"8,aaaaaaaaaaa8,xxxxxxxxxxxxxxxxxxxxxxx8,8,mmmmmmmmmmmmmm8,z8",
+				}
+				off: [len(lines) + 1]int
+				for l, i in lines {off[i + 1] = off[i] + len(l) + 1}
+				content := make([]u8, off[len(lines)]) // default allocator: doc_close owns it
+				for l, i in lines {copy(content[off[i]:], transmute([]u8)l);content[off[i] + len(l)] = '\n'}
+				doc := doc_from_content(content, "hs.csv", .UTF8)
+				defer doc_close(&doc)
+				doc.table, doc.table_delim = true, ','
+				ROWS :: 6
+
+				// Three scales: sx() rounds the gutter and the padding independently
+				// of char_w, so an axis that is exactly right at 100% can drift half a
+				// pixel per column at 125%.
+				for scale in ([]f32{1.0, 1.25, 1.5}) {
+					UI_SCALE = scale
+					TEXT_MARGIN_Y = sx(TEXT_MARGIN_Y_96)
+					TAB_STRIP_H = sx(TAB_STRIP_H_96)
+					MENU_BAR_H = sx(MENU_BAR_H_96)
+					CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+					CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+					STATUS_BAR_H = sx(STATUS_BAR_H_96)
+					SCROLLBAR_W = sx(SCROLLBAR_W_96)
+					TABLE_HEADER_H = sx(TABLE_HEADER_H_96)
+					TABLE_ROW_H = sx(TABLE_ROW_H_96)
+					TABLE_CELL_PAD_X = sx(TABLE_CELL_PAD_X_96)
+					TABLE_GUTTER_W = sx(TABLE_GUTTER_W_96)
+					TOP_INSET, FILTER_BANNER_H = 0, 0
+					BASE_PX = f32(int(BASE_PX_96 * scale + 0.5))
+					px := BASE_PX
+					cw := plat.text_char_width(&t, px, .Doc)
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
+					clear(&doc.table_widths)
+					clear(&doc.table_align)
+					table_compute_widths(&doc, &t)
+					doc.table_cols = len(doc.table_widths)
+					doc.top = 0
+					doc.table_hscroll_px = 0
+					trows := table_visible_rows(&doc, H, px)
+					gw := table_gutter_w()
+					total := table_content_w(&doc, cw)
+					pre := trows == ROWS && len(doc.table_widths) == 6 && trows < len(lines) - 1
+					chk(&bad, pre, fmt.tprintf("scale %.2f: precondition -- %d rows fit (want %d), %d columns (want 6)", scale, trows, ROWS, len(doc.table_widths)))
+					if !pre {continue}
+					// The uneven widths, asserted rather than assumed: if the sample
+					// ever clamps them all to one number this whole proc goes vacuous.
+					uneven := doc.table_widths[0] != doc.table_widths[1] && doc.table_widths[1] != doc.table_widths[2]
+					chk(&bad, uneven, fmt.tprintf("scale %.2f: the fixture's columns are genuinely uneven (%v cells)", scale, doc.table_widths[:]))
+
+					// Column boundaries as DISTANCES from the first column's left edge
+					// -- the same space table_hscroll_px is measured in -- so a probe
+					// can be placed deliberately between two of them.
+					bounds := make([dynamic]f32, 0, 8, context.temp_allocator)
+					{
+						bx := f32(0)
+						for wc in doc.table_widths {bx += table_col_w(wc, cw);append(&bounds, bx)}
+					}
+
+					// Three windows: the table overflowing badly, overflowing a little,
+					// and FITTING WITH ROOM TO SPARE -- the last is where the missing
+					// right edge lived, and it is also the boundary case for the
+					// scrollbar (max must be 0 and the bar must not appear).
+					for W in ([]f32{gw + SCROLLBAR_W + total * 0.35, gw + SCROLLBAR_W + total * 0.7, gw + SCROLLBAR_W + total + 200}) {
+						right := table_right(W)
+						maxs := table_max_scroll_x(&doc, cw, W)
+						wtag := fmt.tprintf("scale %.2f W=%.0f", scale, W)
+
+						// --- 1. the bands stop at the DATA, not at the window -------
+						{
+							doc.table_hscroll_px = 0
+							cols := table_cols_layout(&doc, cw, W)
+							cr := table_content_right(cols, W)
+							okr := len(cols) > 0 && cr <= right + 0.001 && abs(cr - min(cols[len(cols) - 1].x + cols[len(cols) - 1].w, right)) < 0.001
+							chk(&bad, okr, fmt.tprintf("%s: the band's right edge IS the last laid-out column's (%.1f)", wtag, cr))
+							if maxs == 0 {
+								// The whole table fits, so the band must stop where the
+								// data does and leave the rest of the window plain.
+								// This is Wyatt's v0.34.1 report as a number: with the
+								// bands drawn to table_right it is `right`, 200px
+								// further out, with nothing in between.
+								chk(
+									&bad,
+									abs(cr - (gw + total)) < 1 && cr < right - 100,
+									fmt.tprintf("%s: a table narrower than its window ends at %.1f, want %.1f (window edge %.1f)", wtag, cr, gw + total, right),
+								)
+							}
+						}
+
+						// --- 2. every probed scroll offset: draw x -> clicked bytes --
+						offs := make([dynamic]int, 0, 8, context.temp_allocator)
+						for s in ([]int{0, 1, int(bounds[0]) - 3, int(bounds[0]) + 5, int(bounds[1]) + 7, maxs / 2, maxs - 1, maxs}) {
+							append(&offs, clamp(s, 0, maxs))
+						}
+						// ...and at least one of them is genuinely MID-COLUMN. Without
+						// this the set could drift onto boundaries and the proc would
+						// quietly become a column-snap test again.
+						if maxs > 0 {
+							mid := 0
+							for s in offs {
+								on_edge := s == 0
+								for b in bounds {if abs(f32(s) - b) < 1 {on_edge = true}}
+								if !on_edge {mid += 1}
+							}
+							chk(&bad, mid > 0, fmt.tprintf("%s: at least one probe sits MID-COLUMN (%d of %d)", wtag, mid, len(offs)))
+						}
+
+						mism, gutter_hits, snap := 0, 0, 0
+						for s in offs {
+							doc.table_hscroll_px = s
+							cols := table_cols_layout(&doc, cw, W)
+							for col in cols {
+								// Two probes per column: its first visible pixel and its
+								// last. The first is clamped into the visible area
+								// because a partly-hidden column's own x is under the
+								// gutter -- the state pixel scrolling creates on almost
+								// every offset and column scrolling never did.
+								lo := max(col.x, gw) + 0.5
+								hi := min(col.x + col.w, right) - 0.5
+								for probe in ([]f32{lo, hi}) {
+									if probe < gw || probe >= right || probe < lo || probe > hi {continue}
+									for r in ([]int{0, trows - 1}) {
+										my := table_row_baseline_y(px, r)
+										ok, rr, cc, fs, fe, _ := table_cell_at(&doc, probe, my, px, cw, trows, W)
+										exp, has := want_field(lines[:], r + 1, col.c)
+										got := read_span(&doc, fs, fe) if ok else "<no hit>"
+										inside := ok && fs >= off[r + 1] && fe <= off[r + 1] + len(lines[r + 1])
+										if !ok || rr != r || cc != col.c || !has || got != exp || !inside {
+											mism += 1
+											if mism <= 4 {
+												fmt.printfln(
+													"    %s scroll=%d col %d row %d at x=%.1f: hit=(%v,r%d,c%d) %q want %q",
+													wtag, s, col.c, r, probe, ok, rr, cc, got, exp,
+												)
+											}
+										}
+									}
+								}
+							}
+							// The sticky gutter never resolves to a cell, even with a
+							// column scrolled under it. Without this a press on a row
+							// number starts -- and commits -- an edit on a value the
+							// gutter is painted over.
+							for probe in ([]f32{0, gw * 0.5, gw - 0.5}) {
+								my := table_row_baseline_y(px, 0)
+								if ok, _, _, _, _, _ := table_cell_at(&doc, probe, my, px, cw, trows, W); ok {gutter_hits += 1}
+							}
+							// ONE PIXEL OF SCROLL MOVES THE LAYOUT ONE PIXEL. This is
+							// the assertion a column-snapping model cannot pass: under
+							// it a +1 offset either moves nothing or moves a whole
+							// column, and that is the literal shape of the report.
+							if s < maxs {
+								doc.table_hscroll_px = s + 1
+								nxt := table_cols_layout(&doc, cw, W)
+								for a in cols {
+									for b in nxt {
+										if a.c != b.c {continue}
+										if abs((a.x - b.x) - 1) > 0.001 {snap += 1}
+									}
+								}
+							}
+						}
+						chk(&bad, mism == 0, fmt.tprintf("%s: %d scroll offsets x every visible column round-trip draw-x -> byte range -> fixture (%d wrong)", wtag, len(offs), mism))
+						chk(&bad, gutter_hits == 0, fmt.tprintf("%s: no pixel of the sticky gutter resolves to a cell at any scroll offset (%d did)", wtag, gutter_hits))
+						chk(&bad, snap == 0, fmt.tprintf("%s: one pixel of scroll moves every column exactly one pixel (%d snapped)", wtag, snap))
+
+						// --- 3. full scroll reaches the end, and stops there ---------
+						if maxs > 0 {
+							doc.table_hscroll_px = maxs
+							cols := table_cols_layout(&doc, cw, W)
+							cr := table_content_right(cols, W)
+							chk(&bad, abs(cr - right) <= 1, fmt.tprintf("%s: at full scroll the last column's right edge is the grid's (%.1f vs %.1f)", wtag, cr, right))
+							// ...and the clamp holds past it: an over-large value must
+							// not pan into empty space beyond the last column.
+							doc.table_hscroll_px = maxs + 5000
+							past := table_content_right(table_cols_layout(&doc, cw, W), W)
+							chk(&bad, abs(past - cr) < 0.001, fmt.tprintf("%s: ...and scrolling past the end is clamped to it (%.1f vs %.1f)", wtag, past, cr))
+						}
+						doc.table_hscroll_px = 0
+					}
+				}
+				UI_SCALE = 1
+				return
+			}
+
 			bad := tg_abs_cost()
 			bad += tg_live_pass()
 			bad += tg_abs_overcap()
@@ -12793,6 +13035,7 @@ when NEWTPAD_TESTS {
 			bad += tg_parity()
 			bad += tg_malformed()
 			bad += tg_sort()
+			bad += tg_hscroll()
 			fmt.printfln("tablegridtest: %d failures", bad)
 			// Exit non-zero, like keytest / palettetest / lineidxtest / resavetest.
 			// HANDOFF §6aw listed this mode as the notable omission: it asserts a
