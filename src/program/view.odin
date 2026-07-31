@@ -57,6 +57,10 @@ doc_view_apply :: proc(doc: ^Document, v: Doc_View) {
 		// (table.odin:183), so this needs no ^plat.Text and can run from
 		// session_restore and doc_reload, neither of which has one.
 		clear(&doc.table_widths)
+		// ...and the manual widths with them. A restored session re-samples the
+		// file from scratch, and a width the user dragged in a previous run would
+		// be applied to whatever column happens to sit at that index now.
+		table_user_widths_clear(doc)
 	}
 	// Both markdown views and the grid scroll by whole lines, so a top that
 	// landed mid-line would render a partial first row. The toggles re-anchor

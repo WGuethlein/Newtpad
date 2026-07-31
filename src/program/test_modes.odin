@@ -10879,9 +10879,152 @@ when NEWTPAD_TESTS {
 				return
 			}
 
+			// F8: §10's "drag a header edge to resize; double-click to fit
+			// content" (3d).
+			//
+			// The non-obvious failure is not the drag, it is what OUTLIVES it.
+			// table_compute_widths reruns whenever the widths are cleared, and
+			// table_edit_commit clears them after every cell edit so the columns
+			// re-fit the new value -- so a width written only into table_widths is
+			// gone the next time the user edits any cell in the table, with nothing
+			// on screen to explain why. That is the case the plan singled out and
+			// it is asserted here through a REAL edit and a real refit, not by
+			// calling table_compute_widths directly and hoping that is what an edit
+			// does.
+			tg_resize :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (resize): no fonts loaded")
+					return 1
+				}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
+				TOP_INSET, FILTER_BANNER_H = 0, 0
+				BASE_PX = BASE_PX_96
+				px := BASE_PX_96
+				cw := plat.text_char_width(&t, px, .Doc)
+				W := f32(1000)
+
+				// Column widths deliberately DIFFERENT from each other and all
+				// above TABLE_COL_MIN: with the old short fixture every column
+				// clamped to 8 and the double-click check below compared 8 against
+				// 8, which any implementation satisfies.
+				src := "alphabetical,beta_col_xx,gam\noneoneoneoneone,twotwotwotwo,three\nfour,five,sixsixsixsixsix\nseven,eight,nine\n"
+				content := make([]u8, len(src))
+				copy(content, transmute([]u8)src)
+				d := doc_from_content(content, "resize.csv", .UTF8)
+				defer doc_close(&d)
+				d.table, d.table_delim = true, ','
+				table_compute_widths(&d, &t)
+				d.table_cols = len(d.table_widths)
+				H := table_rows_top(px) + 6 * table_row_h(px) + STATUS_BAR_H + 1
+				rows := table_visible_rows(&d, H, px)
+
+				cols := table_cols_layout(&d, cw, W, 0)
+				chk(&bad, len(cols) == 3, fmt.tprintf("precondition -- 3 columns are laid out (%d)", len(cols)))
+				if len(cols) != 3 {return}
+				edge := cols[0].x + cols[0].w
+				hy := table_grid_top() + table_header_h(px) * 0.5
+				tol := sx(TABLE_RESIZE_HIT_96)
+
+				// 1. The grab zone: on the edge, just inside the tolerance, just
+				//    outside it, and -- the one that matters for the editing path --
+				//    the SAME x one row down, which must still be a cell and not an
+				//    edge.
+				c0, on0 := table_edge_at(&d, cw, W, edge, hy, px)
+				chk(&bad, on0 && c0 == 0, fmt.tprintf("column 0's right edge is a grab zone (on=%v, col=%d)", on0, c0))
+				_, oni := table_edge_at(&d, cw, W, edge - tol, hy, px)
+				chk(&bad, oni, fmt.tprintf("...%.0fpx to its left too (§10's +/-4)", tol))
+				_, ono := table_edge_at(&d, cw, W, edge - tol - 2, hy, px)
+				chk(&bad, !ono, "...and not beyond the tolerance")
+				_, onrow := table_edge_at(&d, cw, W, edge, table_row_baseline_y(px, 0), px)
+				chk(&bad, !onrow, "the same x in a DATA row is not an edge -- a cell click still lands there")
+
+				// 2. The drag itself, and both bounds. The edge is measured against
+				//    the LAID-OUT rectangle -- §10's leftover distribution
+				//    included, since that is the edge the user grabbed -- so five
+				//    cells of pointer travel is five cells of column, counted from
+				//    what was on screen and not from the sample.
+				nat0 := d.table_widths[0]
+				chk(&bad, cols[0].cells > nat0, fmt.tprintf("precondition -- column 0 is laid out wider than sampled (%d vs %d), so the two origins differ", cols[0].cells, nat0))
+				table_col_resize(&d, 0, edge + 5 * cw, cw, W)
+				chk(&bad, d.table_widths[0] == cols[0].cells + 5, fmt.tprintf("dragging the drawn edge right by 5 cells widens by 5 (%d -> %d)", cols[0].cells, d.table_widths[0]))
+				table_col_resize(&d, 0, edge - 4000 * cw, cw, W)
+				chk(&bad, d.table_widths[0] == TABLE_COL_MIN, fmt.tprintf("dragging far left clamps to TABLE_COL_MIN (%d, want %d)", d.table_widths[0], TABLE_COL_MIN))
+				// Past §10's automatic 40, deliberately: a manual drag overrides
+				// the bound that exists to stop ONE wide cell claiming the window,
+				// and the distribution already lays columns out past 40 anyway.
+				table_col_resize(&d, 0, edge + 60 * cw, cw, W)
+				chk(&bad, d.table_widths[0] > TABLE_COL_MAX, fmt.tprintf("a drag may pass §10's automatic 40 (%d)", d.table_widths[0]))
+				table_col_resize(&d, 0, edge + 4000 * cw, cw, W)
+				chk(&bad, d.table_widths[0] == TABLE_COL_DRAG_MAX, fmt.tprintf("...but not TABLE_COL_DRAG_MAX (%d, want %d)", d.table_widths[0], TABLE_COL_DRAG_MAX))
+
+				// 3. THE ONE. Resize, edit a cell for real, let the refit run, and
+				//    the width is still the user's. The edit goes through
+				//    table_cell_at -> table_edit_start -> table_edit_commit, which
+				//    is the path a click takes, so the clear() this defends against
+				//    is the real one and not a stand-in.
+				// Column 0 is still parked at TABLE_COL_DRAG_MAX from the bound
+				// check above, which would push every other column off screen and
+				// make the drag below a no-op. Hand it back to the sample first.
+				table_col_fit(&d, 0)
+				if len(d.table_widths) == 0 {table_compute_widths(&d, &t)}
+				cols = table_cols_layout(&d, cw, W, 0)
+				chk(&bad, len(cols) == 3, fmt.tprintf("precondition -- all 3 columns are back on screen (%d)", len(cols)))
+				if len(cols) != 3 {return}
+				nat1 := d.table_widths[1]
+				table_col_resize(&d, 1, cols[1].x + cols[1].w + 6 * cw, cw, W)
+				want := d.table_widths[1]
+				chk(&bad, want != nat1, fmt.tprintf("column 1 is now %d cells, not its sampled %d", want, nat1))
+				okc, rr, cc, fs, fe, val := table_cell_at(&d, table_cell_text_x(cols[0]), table_row_baseline_y(px, 0), px, cw, rows, W)
+				chk(&bad, okc && val == "oneoneoneoneone", fmt.tprintf("a real cell resolves for the edit (%v, %q)", okc, val))
+				if okc {
+					table_edit_start(&d, rr, cc, fs, fe, val)
+					table_edit_rune(&d, 'X')
+					table_edit_commit(&d)
+					chk(&bad, len(d.table_widths) == 0, "the commit really did clear the widths -- the refit is reached")
+					// table_draw's own line, so this is the refit the user gets.
+					if len(d.table_widths) == 0 {table_compute_widths(&d, &t)}
+					chk(&bad, len(d.table_widths) > 1 && d.table_widths[1] == want, fmt.tprintf("the user's width survives an edit's refit (%d, want %d)", d.table_widths[1] if len(d.table_widths) > 1 else -1, want))
+				}
+
+				// 4. Double-click to fit: the override goes and the column comes
+				//    back at the width the sample measured for IT -- captured above
+				//    before the drag, and different from both the dragged width and
+				//    from its neighbours', so no two numbers here coincide.
+				table_col_fit(&d, 1)
+				chk(&bad, len(d.table_widths) == 0, "a fit clears the widths so the sample runs again")
+				if len(d.table_widths) == 0 {table_compute_widths(&d, &t)}
+				chk(&bad, d.table_widths[1] == nat1, fmt.tprintf("...and column 1 is back to its own content width (%d, want %d)", d.table_widths[1], nat1))
+				chk(&bad, nat1 != d.table_widths[0] && nat1 != d.table_widths[2], fmt.tprintf("...which is distinct from its neighbours' (%d vs %d, %d)", nat1, d.table_widths[0], d.table_widths[2]))
+
+				// 5. A fixed column takes no share of §10's leftover: the user asked
+				//    for a width, not for a proportion of the window.
+				table_col_resize(&d, 0, cols[0].x + cols[0].w + 4 * cw, cw, W)
+				fixedw := d.table_widths[0]
+				wide := table_cols_layout(&d, cw, 2400, 0)
+				got, others := -1, 0
+				for c in wide {
+					if c.c == 0 {got = c.cells} else if c.cells > d.table_widths[c.c] {others += 1}
+				}
+				chk(&bad, got == fixedw, fmt.tprintf("a user-set column keeps its exact width in a wide window (%d, want %d)", got, fixedw))
+				chk(&bad, others > 0, fmt.tprintf("...while the others still absorb the leftover (%d of them grew)", others))
+				return
+			}
+
 			bad := tg_abs_cost()
 			bad += tg_gutter_pixels()
 			bad += tg_align()
+			bad += tg_resize()
 			bad += tg()
 			bad += tg_page()
 			bad += tg_edit_anchor()

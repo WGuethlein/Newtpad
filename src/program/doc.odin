@@ -1092,6 +1092,14 @@ Document :: struct {
 	// table_widths — table_compute_widths writes both and nothing else appends to
 	// either, which is what lets table_cols_layout index them together.
 	table_align:  [dynamic]Table_Align,
+	// Widths the USER set by dragging a header edge (UI spec §10), in cells; 0
+	// means "not set, use the sample". Separate from table_widths because that
+	// array is CLEARED to force a refit after every cell edit, so a manual width
+	// stored only there would snap back the next time any cell was edited.
+	// table_compute_widths reapplies these at the end of its pass, and
+	// table_col_fit (double-click) clears one entry to hand the column back to
+	// the sample. May be shorter than table_widths; index it defensively.
+	table_user_w: [dynamic]int,
 	// In-cell editing (table view). While editing, keystrokes go to table_edit_buf,
 	// not the document; on commit the source field range [s,e) is replaced.
 	table_editing:     bool,
@@ -1501,6 +1509,7 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.filter_line_nos)
 	delete(doc.table_widths)
 	delete(doc.table_align)
+	delete(doc.table_user_w)
 	delete(doc.table_edit_buf)
 	delete(doc.table_edit_snap)
 	// The markdown preview's per-block layout cache owns heap storage (a source

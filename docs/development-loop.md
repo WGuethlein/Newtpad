@@ -222,8 +222,10 @@ Each of these cost real time at least once.
   **`keytest` no longer needs one** (2026-07-30) — `newtpad keytest`
   works, `newtpad <path> keytest` still works, and it belongs in every regression sweep from now on.
   **`watchtest`'s directory is optional as of 2026-07-31** (it defaults under `%TEMP%`), and
-  `lineidxtest` is one-argument with an optional path; both belong in every sweep. `resavetest
-  <file>` is still two-argument and still falls through to the GUI when run bare.
+  `lineidxtest` is one-argument with an optional path; both belong in every sweep. **`tablegridtest`
+  is one-argument and was missing from HANDOFF §7's list entirely until 2026-07-31** — it existed,
+  it asserted a hundred things about a data-loss seam, and no required list named it. It is in §7
+  now. `resavetest <file>` is still two-argument and still falls through to the GUI when run bare.
   It was two-argument-only, so it was in no required list, nothing ran it, and a stale assertion that
   the D1 keymap fix had invalidated sat in the tree printing `FAIL` to nobody. **A mode nothing runs is
   worse than no mode.** When you add one, make it one-argument and put it in a list.

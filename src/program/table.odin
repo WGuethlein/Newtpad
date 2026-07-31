@@ -409,9 +409,16 @@ table_leftover_cells :: proc(doc: ^Document, char_w, width: f32, allocator := co
 	out := make([]int, len(colw), allocator)
 	if len(colw) == 0 || char_w <= 0 {return out}
 	avail := table_right(width) - table_gutter_w()
+	// A column the user dragged to a width is EXCLUDED from the distribution --
+	// it keeps neither a share of the leftover nor a vote in the weights. They
+	// asked for twelve cells; handing them nineteen because the window is wide
+	// would make the drag look like it had been ignored, which is worse than a
+	// strip of unused width on the right. It still counts toward `total`: the
+	// space it occupies is space there is no leftover of.
 	total, sum := f32(0), 0
-	for w in colw {
+	for w, i in colw {
 		total += f32(w) * char_w + TABLE_CELL_PAD_X * 2
+		if i < len(doc.table_user_w) && doc.table_user_w[i] > 0 {continue}
 		sum += w
 	}
 	if total >= avail || sum <= 0 {return out}
@@ -419,14 +426,136 @@ table_leftover_cells :: proc(doc: ^Document, char_w, width: f32, allocator := co
 	if leftover <= 0 {return out}
 	given := 0
 	for w, i in colw {
+		if i < len(doc.table_user_w) && doc.table_user_w[i] > 0 {continue}
 		out[i] = leftover * w / sum
 		given += out[i]
 	}
+	// The integer remainder, one cell at a time, skipping the fixed columns. The
+	// loop cannot spin: `sum > 0` means at least one column is free.
 	for i := 0; given < leftover; i = (i + 1) %% len(out) {
+		if i < len(doc.table_user_w) && doc.table_user_w[i] > 0 {continue}
 		out[i] += 1
 		given += 1
 	}
 	return out
+}
+
+// --- §10's "drag a header edge to resize; double-click to fit content" ------
+//
+// Half-width of the grab zone straddling a header edge, at 96 DPI. Through sx()
+// at each use rather than as a scaled global beside TABLE_GUTTER_W, and the
+// difference is the point: the gutter is LAYOUT -- every consumer of the x axis
+// has to agree on it to the pixel, so it lives with the other metrics and is set
+// once by metrics_recompute -- while this is a TOLERANCE on a hit-test, wanted
+// by one producer. A global for it would be six more places to forget to scale
+// for no shared reader.
+TABLE_RESIZE_HIT_96 :: f32(4)
+
+// Upper bound on a column width the user dragged to, in cells.
+//
+// NOT TABLE_COL_MAX, and the difference is a real defect rather than a
+// preference. §10's 40 bounds the AUTOMATIC sizing: it stops one 300-character
+// cell claiming the whole window before anybody has asked for it. §10's own
+// leftover distribution then routinely lays a column out WIDER than 40 on a wide
+// window, so clamping a drag at 40 means grabbing such an edge and nudging it
+// one pixel snaps the column twenty cells narrower -- the automatic bound
+// reaching back through a gesture whose entire purpose is to override it. What
+// is left here is a guard against absurdity, not a design opinion; the pointer
+// cannot leave the window, so a real drag never approaches it.
+TABLE_COL_DRAG_MAX :: 500
+
+// The header edge under a point, and the column that edge RESIZES (its left
+// neighbour, which is the one whose width the drag changes).
+//
+// THE producer for that zone. The press, the double-click and the resize cursor
+// all ask this one procedure, so the pixel that shows a resize cursor is exactly
+// the pixel that starts a drag -- a hover zone and a press zone derived
+// separately is CLAUDE.md's "one layout per widget" broken in its most annoying
+// form, where the affordance appears somewhere the gesture does not work.
+//
+// Gated to the header band, because that is where §10 puts the affordance and
+// because the same x inside the ROWS must keep starting a cell edit. Edges are
+// taken from table_cols_layout, so they move with the gutter and with §10's
+// leftover distribution without this knowing either exists.
+table_edge_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (c: int, ok: bool) {
+	if doc == nil || len(doc.table_widths) == 0 {return 0, false}
+	top := table_grid_top()
+	if my < top || my >= top + table_header_h(px) {return 0, false}
+	tol := sx(TABLE_RESIZE_HIT_96)
+	right := table_right(width)
+	for col in table_cols_layout(doc, char_w, width, table_start_col(doc)) {
+		e := col.x + col.w
+		if e > right {break} // an edge past the grid's right edge is not on screen
+		if mx >= e - tol && mx <= e + tol {return col.c, true}
+	}
+	return 0, false
+}
+
+// The boolean form, for the hover cursor -- which wants "is there an edge here"
+// and has no use for which column it is. Through table_edge_at rather than
+// beside it, so there is still exactly one definition of the zone.
+table_edge_at_cursor :: #force_inline proc(doc: ^Document, char_w, width, mx, my, px: f32) -> bool {
+	_, ok := table_edge_at(doc, char_w, width, mx, my, px)
+	return ok
+}
+
+// Set column `c`'s width from a dragged edge position, in the same cells the
+// layout speaks. The floor is §10's 8, the same one the sample obeys, so a
+// dragged column can never end up narrower than one table_compute_widths would
+// produce; the ceiling is TABLE_COL_DRAG_MAX rather than §10's 40, for the
+// reason recorded there.
+//
+// The edge is measured against the column's LAID-OUT rectangle, leftover
+// distribution included, because that rectangle is what the user grabbed. Drag
+// the visible edge five cells right and the column becomes five cells wider than
+// it looked -- which is the only reading under which the edge follows the
+// pointer.
+//
+// Recorded in table_user_w, NOT only in table_widths, and that is the whole
+// difficulty of this feature. table_compute_widths reruns whenever the widths
+// are cleared -- which table_edit_commit does after every cell edit, so that the
+// columns re-fit the new value -- and a width written only into table_widths is
+// gone the next time the user edits any cell in the table. table_user_w survives
+// that, and table_compute_widths reapplies it at the end of its own pass.
+table_col_resize :: proc(doc: ^Document, c: int, edge_x, char_w, width: f32) {
+	if doc == nil || c < 0 || c >= len(doc.table_widths) || char_w <= 0 {return}
+	col, found := Table_Col{}, false
+	for k in table_cols_layout(doc, char_w, width, table_start_col(doc)) {
+		if k.c == c {col, found = k, true;break}
+	}
+	if !found {return} // scrolled out from under the drag
+	cells := int((edge_x - col.x - TABLE_CELL_PAD_X * 2) / char_w + 0.5)
+	table_col_set_width(doc, c, clamp(cells, TABLE_COL_MIN, TABLE_COL_DRAG_MAX))
+}
+
+table_col_set_width :: proc(doc: ^Document, c, cells: int) {
+	if c < 0 || c >= len(doc.table_widths) {return}
+	for c >= len(doc.table_user_w) {append(&doc.table_user_w, 0)}
+	doc.table_user_w[c] = cells
+	doc.table_widths[c] = cells
+}
+
+// §10's "double-click to fit content": drop the user's width and go back to the
+// measured one.
+//
+// Clearing the override IS the fit, rather than a second measurement pass that
+// would have to re-derive what table_compute_widths already knows. Clearing the
+// widths makes table_draw re-sample on the next frame (its own "refit when
+// empty" line), and with the override gone this column comes back at its widest
+// sampled cell clamped to 8-40 -- which is the definition of fitting the
+// content, taken from the one procedure that defines it.
+table_col_fit :: proc(doc: ^Document, c: int) {
+	if doc == nil || c < 0 {return}
+	if c < len(doc.table_user_w) {doc.table_user_w[c] = 0}
+	clear(&doc.table_widths)
+	clear(&doc.table_align)
+}
+
+// Drop every manual width -- called where the grid re-samples from scratch (the
+// view being turned off, a session restore), so a column the user narrowed in
+// one file does not narrow a different column in the next.
+table_user_widths_clear :: proc(doc: ^Document) {
+	clear(&doc.table_user_w)
 }
 
 // Left x of a cell's TEXT -- the LEFT inner edge, whatever the column's
@@ -510,6 +639,17 @@ table_compute_widths :: proc(doc: ^Document, text: ^plat.Text) {
 		p = end + 1
 	}
 	for &w in doc.table_widths {w = clamp(w, TABLE_COL_MIN, TABLE_COL_MAX)}
+	// A column the user dragged keeps the width they dragged it to, and this is
+	// the line that makes drag-to-resize survive at all. This procedure reruns
+	// whenever the widths are cleared, and table_edit_commit clears them after
+	// every cell edit so the columns re-fit the new value -- so without this, a
+	// resized column snaps back to its sampled width the next time any cell in
+	// the table is edited. Applied AFTER the clamp because the override was
+	// already clamped when it was set (table_col_resize); clamping it again here
+	// would be a second opinion about the same bound.
+	for c in 0 ..< len(doc.table_widths) {
+		if c < len(doc.table_user_w) && doc.table_user_w[c] > 0 {doc.table_widths[c] = doc.table_user_w[c]}
+	}
 	// Same length as the widths, always: table_cols_layout indexes both by column
 	// and a short align array would silently left-align the tail.
 	for c in 0 ..< len(doc.table_widths) {

@@ -4692,6 +4692,7 @@ to hold the same number." There were four; the page keys got the editor's count.
     `linktest`, `tabreordertest`
   - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
     `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `tablereadonlytest`,
+    `tablegridtest`,
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
     `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest <file>`,

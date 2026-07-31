@@ -198,6 +198,12 @@ main :: proc() {
 	hscrollbar_drag := false
 	md_preview_drag := false
 	divider_drag := false // dragging the Markdown Split divider (md_divider_rect)
+	// Dragging a table column's header edge (UI spec §10). -1 when idle. The
+	// grab is the pointer's offset from the edge at the press, so the edge does
+	// not jump to the cursor on the first frame of the drag -- the same thing
+	// hscroll_grab does for the horizontal thumb.
+	table_resize_col := -1
+	table_resize_grab := f32(0)
 	sel_dragging := false // a text-selection drag has begun (pointer moved since press)
 	press_x, press_y: i32 // client pos of the press that may become a drag
 	// Column-select drag (Alt+drag). Four inline latches until the
@@ -645,6 +651,37 @@ main :: proc() {
 			}
 		}
 
+		// Dragging a table column's header edge, and double-clicking it to fit
+		// (§10). Before the cell-edit branch below, which is gated on the whole
+		// content area including the header band -- an edge press has to be taken
+		// here or it falls through to a hit-test that refuses it and then to the
+		// read-only swallow, which is what "click does nothing" looks like.
+		//
+		// table_edge_at is the single producer of the grab zone, so the pixels that
+		// show the resize cursor further down are the pixels that start this drag.
+		if doc.table && doc.kind == .Text {
+			if window.mouse_pressed && !plat.key_ctrl_down() {
+				if c, on_edge := table_edge_at(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); on_edge {
+					if window.mouse_count >= 2 {
+						table_col_fit(doc, c) // double-click: back to the measured width
+					} else {
+						table_resize_col = c
+						for k in table_cols_layout(doc, char_w, f32(window.width), table_start_col(doc)) {
+							if k.c == c {table_resize_grab = f32(window.mouse_x) - (k.x + k.w);break}
+						}
+					}
+					window.mouse_pressed = false
+				}
+			}
+			if table_resize_col >= 0 {
+				if window.mouse_down {
+					table_col_resize(doc, table_resize_col, f32(window.mouse_x) - table_resize_grab, char_w, f32(window.width))
+				} else {
+					table_resize_col = -1
+				}
+			}
+		}
+
 		// Plain click on a table cell starts editing it in place (commit any cell
 		// already being edited first). Before the read-only consume below, which
 		// swallows the press for the grid. Ctrl is the link modifier, handled above.
@@ -748,6 +785,12 @@ main :: proc() {
 			cx, cy := plat.window_cursor_client(window)
 			dvr := md_divider_rect(doc, f32(window.width), f32(window.height), app.settings.split_frac)
 			if divider_drag || (dvr.size.x > 0 && f32(cx) >= dvr.pos.x && f32(cx) < dvr.pos.x + dvr.size.x && f32(cy) >= dvr.pos.y && f32(cy) < dvr.pos.y + dvr.size.y) {
+				want = .SizeWE
+			} else if doc.table && doc.kind == .Text && table_resize_col >= 0 {
+				want = .SizeWE // mid-drag: keep it even if the pointer runs off the edge
+			} else if doc.table && doc.kind == .Text && table_edge_at_cursor(doc, char_w, f32(window.width), f32(cx), f32(cy), px) {
+				// The SAME producer the press above hit-tests against, so the
+				// affordance appears exactly where the gesture works.
 				want = .SizeWE
 			} else if doc.find.active && find_action_at(doc, &text, f32(window.width), f32(cx), f32(cy)) != .None {
 				// Same geometry as the draw, the hover fill and the click. A

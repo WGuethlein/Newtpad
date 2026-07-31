@@ -1527,6 +1527,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				table_compute_widths(doc, t) // fix the columns now, so they don't shift on scroll
 			} else {
 				clear(&doc.table_widths) // recompute on next open (content may have changed)
+				// Manual column widths last as long as the grid is open, no
+				// longer: the next open re-samples, and the column at index 3
+				// after an edit may not be the column the user narrowed.
+				table_user_widths_clear(doc)
 			}
 			// Learn the family default so the next tabular file opens the same way.
 			// Gated on remember_views: with it off the Settings value is a pin, not a
