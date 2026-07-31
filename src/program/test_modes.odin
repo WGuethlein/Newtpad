@@ -9983,7 +9983,7 @@ when NEWTPAD_TESTS {
 					// named. The precondition below is what caught that, and this
 					// is what it caught.
 					W := f32(1000)
-					H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
 					clear(&doc.table_widths)
 					table_compute_widths(&doc, &t)
 					doc.table_cols = len(doc.table_widths)
@@ -10134,7 +10134,7 @@ when NEWTPAD_TESTS {
 				px := BASE_PX_96
 				cw := plat.text_char_width(&t, px, .Doc)
 				W := f32(1000)
-				H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
 				clear(&doc.table_widths)
 				table_compute_widths(&doc, &t)
 				doc.table_cols = len(doc.table_widths)
@@ -10412,7 +10412,7 @@ when NEWTPAD_TESTS {
 				// fixture that also has to land on "the editor's count and the
 				// grid's genuinely differ", not a re-use of the same numbers.
 				PG_ROWS :: 8
-				H := table_rows_top(px) + f32(PG_ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(PG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
 				trows := table_visible_rows(d, H, px)
 				erows := doc_visible_rows(d, H, line_h)
 				pre := trows == PG_ROWS && trows < len(lines) - 1
@@ -10534,7 +10534,7 @@ when NEWTPAD_TESTS {
 					d.table_cols = len(d.table_widths)
 
 					ROWS :: 12
-					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
 					trows := table_visible_rows(d, H, px)
 					if trows != ROWS || ER >= trows {
 						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
@@ -10718,7 +10718,7 @@ when NEWTPAD_TESTS {
 					d.table_cols = len(d.table_widths)
 
 					ROWS :: 14
-					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
 					trows := table_visible_rows(d, H, px)
 					if trows != ROWS || ER + 1 >= trows {
 						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
@@ -10878,7 +10878,7 @@ when NEWTPAD_TESTS {
 				rows := table_visible_rows(&doc, f32(H), px)
 
 				plat.gfx_begin_frame(&h.gfx, bg_s[0], bg_s[1], bg_s[2])
-				table_draw(&h.gfx, &h.quads, &h.text, &doc, px, char_w, rows, f32(W))
+				table_draw(&h.gfx, &h.quads, &h.text, &doc, px, char_w, rows, f32(W), f32(H))
 				buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				chk(&bad, ok, "the readback succeeded")
 				if !ok {return}
@@ -10933,7 +10933,7 @@ when NEWTPAD_TESTS {
 				edoc.table, edoc.table_delim = true, ','
 				erows := table_visible_rows(&edoc, f32(H), px)
 				plat.gfx_begin_frame(&h.gfx, bg_s[0], bg_s[1], bg_s[2])
-				table_draw(&h.gfx, &h.quads, &h.text, &edoc, px, char_w, erows, f32(W))
+				table_draw(&h.gfx, &h.quads, &h.text, &edoc, px, char_w, erows, f32(W), f32(H))
 				ebuf, eok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				chk(&bad, eok, "the empty-document readback succeeded")
 				if eok {
@@ -11026,7 +11026,7 @@ when NEWTPAD_TESTS {
 				sx := 2 // left of every glyph this draw emits, gutter number included
 				shot :: proc(h: ^Headless_Gpu, doc: ^Document, px, char_w: f32, rows: int, bg: [4]f32) -> ([]u8, bool) {
 					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
-					table_draw(&h.gfx, &h.quads, &h.text, doc, px, char_w, rows, f32(W))
+					table_draw(&h.gfx, &h.quads, &h.text, doc, px, char_w, rows, f32(W), f32(H))
 					return plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
 				}
 
@@ -11227,7 +11227,7 @@ when NEWTPAD_TESTS {
 					rows := table_visible_rows(&d, f32(H), px)
 					chk(&bad, table_abs_rows(&d, 1)[0] == TABLE_ABS_NONE, "precondition -- with no index started, the row number is refused")
 					plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
-					table_draw(&h.gfx, &h.quads, &h.text, &d, px, char_w, rows, f32(W))
+					table_draw(&h.gfx, &h.quads, &h.text, &d, px, char_w, rows, f32(W), f32(H))
 					if buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); ok {
 						n := lit(buf, W, 0, gw, y0, y1)
 						chk(&bad, n == 0, fmt.tprintf("a refused row draws NO number: %d lit pixels in the gutter (want 0)", n))
@@ -11248,7 +11248,7 @@ when NEWTPAD_TESTS {
 					rows := table_visible_rows(&d, f32(H), px)
 					chk(&bad, table_abs_rows(&d, 1)[0] == 0, "precondition -- with the index finished, row 0 is absolute row 0")
 					plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
-					table_draw(&h.gfx, &h.quads, &h.text, &d, px, char_w, rows, f32(W))
+					table_draw(&h.gfx, &h.quads, &h.text, &d, px, char_w, rows, f32(W), f32(H))
 					if buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); ok {
 						n := lit(buf, W, 0, gw, y0, y1)
 						chk(&bad, n > 0, fmt.tprintf("an answerable row DOES draw one: %d lit pixels in the gutter (want > 0)", n))
@@ -11488,7 +11488,7 @@ when NEWTPAD_TESTS {
 				d.table, d.table_delim = true, ','
 				table_compute_widths(&d, &t)
 				d.table_cols = len(d.table_widths)
-				H := table_rows_top(px) + 6 * table_row_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + 6 * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
 				rows := table_visible_rows(&d, H, px)
 
 				cols := table_cols_layout(&d, cw, W, 0)

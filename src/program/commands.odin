@@ -1092,6 +1092,12 @@ leave_table_view :: proc(doc: ^Document) {
 	if doc.table_editing {table_edit_commit(doc)}
 	doc.table = false
 	clear(&doc.table_widths)
+	// The sort is a property of the VIEW, not of the document: leaving the grid
+	// leaves the file's own order, and doc.top is already a real line offset (the
+	// invariant Table_Sort's block comment exists to hold), so the text view opens
+	// on whatever row was at the top of the sorted screen. Cleared AFTER the commit
+	// above, which needs the permutation to resolve its own row.
+	table_sort_clear(doc)
 }
 
 // Was this command invoked BY NAME -- a palette row, a menu row, a status-bar

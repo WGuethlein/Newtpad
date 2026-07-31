@@ -671,6 +671,22 @@ main :: proc() {
 						}
 					}
 					window.mouse_pressed = false
+				} else if c, on_head := table_header_col_at(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); on_head {
+					// §10's "click to sort with an accent arrow". AFTER the edge test
+					// above, never before: within ±4px of a boundary the user is
+					// aiming at the divider, and reordering the whole file on a
+					// slightly-off resize grab is not a recoverable surprise.
+					//
+					// Not a Command_Id and not in the palette, deliberately. The sort
+					// is a per-column gesture with no argument the palette could
+					// carry, §10 names the header click as its affordance, and adding
+					// a palette row that needed a column would be the "dispatch that
+					// silently does nothing" shape this batch fixed once already.
+					// .Sort_Lines stays refused in table view: that one REWRITES the
+					// buffer, so command_mutates_doc names it correctly and the
+					// read-only guard needs no loosening for this.
+					table_sort_click(doc, c)
+					window.mouse_pressed = false
 				}
 			}
 			if table_resize_col >= 0 {
@@ -1108,6 +1124,12 @@ main :: proc() {
 		// on_resize the update phase (2). Neither is worth a data-safety guard's
 		// complexity for a one-frame cosmetic lag; if the guard ever has to CHOOSE
 		// a write target, both become real and must be fixed first.
+		// The sorted grid's scroll normalisation, immediately BEFORE the edit
+		// guard: it can move doc.top, and the guard's whole job is to compare the
+		// edited row's offset against where the view has finally settled. See
+		// table_sort_snap for which routes write doc.top without knowing a
+		// permutation exists.
+		if doc.table && doc.kind == .Text {table_sort_snap(doc, trows)}
 		if doc.table && doc.kind == .Text {table_edit_hold(doc, trows)}
 
 		// Window title = [*]filename - Newtpad, set only when it changes.
@@ -1469,6 +1491,19 @@ vscrollbar_geo :: proc(doc: ^Document, x, winh: f32, bottom: int, t: ^plat.Text,
 	// of the content it halted at 80%, which is what Wyatt measured by eye.
 	// doc_scroll_to_fraction (the inverse vbar_drag_to calls through) maps by
 	// the same doc_max_top, so the two stay exact inverses of each other.
+	// A sorted grid's bar is ROW-proportional in both halves, because under a
+	// permutation neither the position of doc.top in the file nor the byte span on
+	// screen says anything about where the reader is in the ORDER they are looking
+	// at. `bottom - doc.top` can even go negative there (the last visible row's line
+	// may sit before the first's), which the clamp would have quietly turned into a
+	// 24px thumb that never grew. table_sort_thumb is doc_scroll_to_fraction's exact
+	// inverse for the same reason the byte pair below are each other's.
+	if frac, size, ok := table_sort_thumb(doc, rows); ok {
+		b.thumb_h = clamp(size * b.track_h, sx(24), b.track_h)
+		b.thumb_y = clamp(b.track_y + frac * max(1, b.track_h - b.thumb_h), b.track_y, b.track_y + b.track_h - b.thumb_h)
+		b.shown = true
+		return
+	}
 	max_top := f32(max(1, doc_max_top(doc, t, rows)))
 	travel := max(1, b.track_h - b.thumb_h)
 	b.thumb_y = clamp(b.track_y + f32(doc.top) / max_top * travel, b.track_y, b.track_y + b.track_h - b.thumb_h)
@@ -1639,7 +1674,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		}
 	} else if doc.table && doc.kind == .Text {
 		// Read-only grid view (CSV/TSV) replaces the text pass entirely.
-		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, trows, f32(window.width))
+		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, trows, f32(window.width), f32(window.height))
 		// Underline links in the cells while Ctrl is held (or Show-links is on).
 		if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 			for tl in table_links(doc, text, px, char_w, trows, f32(window.width)) {

@@ -1226,6 +1226,14 @@ Document :: struct {
 	// offset compare alone reads a sort as "nothing moved" while [s,e) has come
 	// to span a different row's field. See table_edit_line_intact (table.odin).
 	table_edit_snap:   [dynamic]u8,
+	// §10's view-only sort (table.odin). A permutation over the data rows; the
+	// bytes never move and cell editing keeps working through it. Everything
+	// about its lifetime is in Table_Sort's own comment -- including the two
+	// places outside table.odin that must touch it (pt_edit_replace shifts its
+	// offsets across an edit, doc_index_start and apply_snapshot drop it when the
+	// buffer is replaced wholesale), because an offset table that outlives the
+	// bytes it describes is a write to the wrong row.
+	table_sort:        Table_Sort,
 	// Markdown view (see markdown.odin): Off / Preview (full) / Split (editor +
 	// live preview).
 	md_mode:     Md_Mode,
@@ -1575,6 +1583,13 @@ doc_index_start :: proc(doc: ^Document) {
 	// UNCONVERTED original, and with the flag left set every row number in the file
 	// would come back exact and wrong by one byte per preceding line.
 	doc.idx.ckpt_doc = false
+	// The table view's sort goes too. Every restart site here is a wholesale
+	// content change -- a reload, an encoding change, doc_set_line_ending, fault
+	// recovery, detaching a mapping -- after which the sort's line offsets describe
+	// a buffer that no longer exists. table_sort_shift can carry a permutation
+	// across an EDIT; nothing can carry it across a replacement, and a stale one
+	// resolves visible rows to whatever now occupies those bytes.
+	table_sort_clear(doc)
 	doc.idx.th = thread.create_and_start_with_data(&doc.idx, index_worker)
 }
 
@@ -1621,6 +1636,7 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.table_user_w)
 	delete(doc.table_edit_buf)
 	delete(doc.table_edit_snap)
+	table_sort_free(doc)
 	// The markdown preview's per-block layout cache owns heap storage (a source
 	// copy, a span text store, the shaper's glyph and line-box arrays, and the
 	// span boxes) for every filled slot. Freed here rather than left to the
@@ -2259,6 +2275,12 @@ pt_edit_replace :: proc(doc: ^Document, at, n: int, text: []u8) {
 	if n > 0 || len(text) > 0 {
 		ckpt_adopt(doc)
 		ckpt_repair(doc, at, n, text) // before the mutation: it counts the removed bytes
+		// ...and the table view's sort, for exactly the same reason and with the
+		// same before-the-mutation constraint: its permutation is a table of line
+		// OFFSETS, and an edit that shifts bytes under them makes visible row r
+		// resolve to a line the user is not looking at -- which the cell editor
+		// then writes to. See Table_Sort (table.odin) for the whole lifetime.
+		table_sort_shift(doc, at, n, text)
 		// Still maintained even when ckpt_doc makes nobody read it. Below `at` the
 		// document and the indexed original are byte-for-byte the same, and if
 		// doc_index_start ever throws the repaired array away and re-scans
@@ -2379,6 +2401,14 @@ snapshot_free :: proc(s: Snapshot) {
 apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 	find_invalidate(doc) // undo/redo don't go through push_undo
 	doc.revision += 1 // ...so neither does its bump; the buffer content still moved
+	// The table view's sort, for the same reason the checkpoints are handled below
+	// and with the same "no edit path ran" cause: pt_restore replaces the whole
+	// buffer, so table_sort_shift never saw the transition and every line offset in
+	// the permutation now names a byte in a different document. Dropped rather than
+	// snapshotted -- unlike the checkpoints there is nothing to preserve, since the
+	// sort is a view state the user re-applies with one click, and unlike the
+	// checkpoints a wrong entry here is a cell edit written to the wrong row.
+	table_sort_clear(doc)
 	base.pt_restore(&doc.pt, s.root, s.length) // takes ownership of s.root
 	doc.cursor = s.cursor
 	doc.anchor = s.anchor
@@ -3597,6 +3627,12 @@ doc_cursor_col :: proc(doc: ^Document, t: ^plat.Text) -> int {
 // denominator than the old pt.length) shifted which side of the byte the
 // truncation fell on.
 doc_scroll_to_fraction :: proc(doc: ^Document, t: ^plat.Text, frac: f32, rows: int) {
+	// The third of the three, and the one where the difference is not just
+	// correctness but meaning: under a permutation the bytes are in no order at
+	// all, so "half way through the file's bytes" names nothing a reader could aim
+	// at. The sorted bar is ROW-proportional, and table_sort_thumb is its exact
+	// inverse -- see vscrollbar_geo for what a mismatched pair costs.
+	if table_sort_scroll_frac(doc, clamp(frac, 0, 1), rows) {return}
 	max_top := doc_max_top(doc, t, rows)
 	target := int(clamp(frac, 0, 1) * f32(max_top) + 0.5)
 	doc.top = min(eff_row_start(doc, t, target, doc.view_cols), max_top)
@@ -3897,6 +3933,11 @@ prev_row_start_capped :: proc(doc: ^Document, pos: int) -> int {
 // The largest doc.top that still fills the viewport (keeps the last line at the
 // bottom row); 0 if the whole document fits. Bounds scrolling to real content.
 doc_max_top :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> int {
+	// A sorted grid's last screenful is the last `rows` SORTED positions, which are
+	// not the last `rows` lines of the file. Delegated rather than branched on here,
+	// so the permutation stays entirely inside table.odin; see that file's
+	// Table_Sort block for why doc.top is still a real byte offset on the way out.
+	if off, ok := table_sort_max_top(doc, rows); ok {return off}
 	p := eff_row_start(doc, t, doc.pt.length, doc.view_cols)
 	for _ in 0 ..< max(rows - 1, 0) {
 		if p == 0 {break}
@@ -3987,6 +4028,12 @@ doc_max_hscroll :: proc(doc: ^Document) -> int {
 // Scroll the viewport by `delta` visual rows (up when negative), clamped so the
 // last line can't scroll above the bottom row.
 doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta, rows: int) {
+	// A sorted grid steps by SORTED position: the next row down is not the next
+	// line in the file, so eff_next_row's walk would land the view somewhere
+	// arbitrary on every notch of the wheel. One of the three procedures
+	// doc_scroll_rows' comment names as having to hold the same number, and all
+	// three delegate to the same producer in table.odin.
+	if table_sort_scroll(doc, delta, rows) {return}
 	if delta > 0 {
 		for _ in 0 ..< delta {
 			nt, more := eff_next_row(doc, t, doc.top, doc.view_cols)
