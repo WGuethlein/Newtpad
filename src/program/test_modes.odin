@@ -12466,8 +12466,21 @@ when NEWTPAD_TESTS {
 				app_activate(&a, 0)
 				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10) // d back on
 				chk(&bad, d.table && !table_sorted(d), fmt.tprintf("the next Ctrl+T opens unsorted (table=%v, sorted=%v)", d.table, table_sorted(d)))
+				// Both clauses, not just the sort's. table_summary_text tests `refused`
+				// FIRST, so a stale refusal hides a stale sort behind "too large to
+				// sort" -- and this assertion, written against "sorted by" alone,
+				// stayed green under the sabotage that removed the fix.
 				sum := table_summary_text(d)
-				chk(&bad, !strings.contains(sum, "sorted by"), fmt.tprintf("...and the summary does not claim a sort: %q", sum))
+				chk(&bad, !strings.contains(sum, "sorted by") && !strings.contains(sum, "too large"), fmt.tprintf("...and the summary claims neither a sort nor a refusal: %q", sum))
+
+				// The third leave path, which no command reaches: a session restore or
+				// a reload re-applies a Doc_View, and Doc_View carries no sort. Driven
+				// with table = true, the case where the grid stays on and a surviving
+				// permutation would therefore still be read.
+				table_sort_click(d, 1)
+				chk(&bad, table_sorted(d), "precondition -- sorted again for the view-apply path")
+				doc_view_apply(d, Doc_View{table = true})
+				chk(&bad, d.table && !table_sorted(d), fmt.tprintf("doc_view_apply keeps the grid and drops the sort (table=%v, sorted=%v)", d.table, table_sorted(d)))
 				return
 			}
 
