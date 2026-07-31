@@ -449,6 +449,88 @@ pt_line_start_cap :: proc(pt: ^Piece_Table, pos, cap: int) -> (start: int, exact
 	return floor, floor == 0
 }
 
+// A byte that a row can consist entirely of and still be blank. ASCII only, and
+// deliberately: a NBSP (U+00A0) or an ideographic space is a character someone
+// typed, and a row of them is content by any reading a user would recognise --
+// "the row looks empty" is not the rule, "the row holds nothing but layout
+// whitespace" is. CR and LF are in the set because a blank row IS its terminator
+// and nothing else.
+@(private = "file")
+blank_byte :: proc(b: u8) -> bool {
+	return b == ' ' || b == '\t' || b == '\r' || b == '\n' || b == '\v' || b == '\f'
+}
+
+// The end of the last row that holds any non-blank byte, INCLUDING that row's
+// terminator -- i.e. where a select-all should stop if it is not to swallow a
+// run of trailing blank rows. Scans backward at most `cap` bytes from the buffer
+// end; `exact` is false when the cap was reached without finding content, and
+// `end` is then pt.length so an unguarded caller still gets today's
+// whole-buffer behaviour rather than a selection stopping mid-tail.
+//
+// THREE THINGS THIS IS NOT, each of which is a wrong implementation someone
+// reaches for first:
+//
+//  1. It is not a backward whitespace trim. The trailing spaces of
+//     "alpha\nbeta   " are content on a content row; trimming to the last
+//     non-whitespace BYTE drops three bytes the user typed. The last non-blank
+//     byte only identifies the ROW; the answer is that row's end.
+//  2. It is not a forward scan for the first blank row. "one\n\ntwo\n\n\n" has a
+//     blank row at offset 4 that sits BETWEEN two paragraphs and is content; a
+//     forward scan stops there and loses the second paragraph. The rule is about
+//     position relative to the last content, not about blankness.
+//  3. It does not stop at the last content byte. The terminator of the last
+//     content row is included -- both bytes of a CRLF -- so a copy of an
+//     ordinary newline-terminated file is byte-identical to what it was before
+//     this existed, and only a file with a RUN of trailing blanks changes at all.
+//
+// Bounded because the scan is backward from the end with nothing else to stop
+// it: a multi-GB log whose tail is blank would walk the whole buffer on the
+// input thread, inside a keystroke, with no way for the caller to tell it had
+// been truncated. That is development-loop.md §4's Shape A, the shape this
+// codebase has produced eight times, and `exact` is the confession that shape
+// always lacked.
+pt_content_end_cap :: proc(pt: ^Piece_Table, cap: int) -> (end: int, exact: bool) {
+	buf: [4096]u8
+	q := pt.length
+	floor := max(0, q - cap) // max(): a zero or negative cap must not go below 0
+	// Absolute offset of the nearest '\n' seen ABOVE the scan head, or -1. The
+	// scan runs strictly backward, so each newline it meets is at a lower offset
+	// than the last one it recorded -- which makes the most recent record the
+	// FIRST newline after wherever the head now is, and therefore the terminator
+	// of the content row the moment the head lands on content. Absolute, not an
+	// index into `buf`: the terminator and the content byte routinely land in
+	// different 4096-byte chunks (any blank tail longer than one chunk), and a
+	// chunk-relative index is re-based by every read.
+	nl := -1
+	for q > floor {
+		chunk := min(len(buf), q - floor)
+		s := q - chunk
+		pt_read(pt, s, buf[:chunk])
+		for k := chunk - 1; k >= 0; k -= 1 {
+			b := buf[k]
+			if b == '\n' {
+				nl = s + k
+				continue // a newline is blank too; the record above is the point
+			}
+			if !blank_byte(b) {
+				// Content at s+k. Its row ends at the first newline above it, or
+				// at the buffer end when the last content row is unterminated.
+				return nl + 1 if nl >= 0 else pt.length, true
+			}
+		}
+		q = s
+	}
+	// Nothing but blanks in everything scanned. Two very different reasons, and
+	// the whole point of `exact` is to keep them apart:
+	//   floor == 0 -- the scan saw the ENTIRE buffer, so the document really is
+	//     all blank, and the answer is the whole buffer (Wyatt's decision 3: a
+	//     select-all there must not visibly do nothing). That is a fact.
+	//   floor  > 0 -- the cap ran out first. The same value is returned, but it
+	//     is a fallback, not a finding, and a caller that wants to say "trimmed"
+	//     in the UI must not say it here.
+	return pt.length, floor == 0
+}
+
 pt_next_line_start :: proc(pt: ^Piece_Table, pos: int) -> int {
 	e := pt_line_end(pt, pos)
 	return e + 1 if e < pt.length else pt.length

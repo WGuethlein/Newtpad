@@ -231,7 +231,11 @@ Each of these cost real time at least once.
   It belongs in every sweep. Bare, it used to fall through to the GUI and hang, so it was in no
   required list, nothing ran it, and a stale assertion that the D1 keymap fix had invalidated sat in
   the tree printing `FAIL` to nobody. **A mode nothing runs is worse than no mode.** When you add one,
-  make it one-argument and put it in a list.
+  make it one-argument and put it in a list. **`selalltest` is the first one added under that rule
+  (2026-07-31)** — `newtpad selalltest`, no path, covers Ctrl+A's trailing-blank-row trim end to end
+  (the row rule, the second-press extend and what resets it, the 1 MiB scan cap, and the eight
+  consumers of the selection), exits non-zero, and counts a missing `NEWTPAD_SESSION_DIR` as a
+  failure rather than skipping the part that needs it. It belongs in every sweep.
 - **`drawcount` is safe to run as of batch 8** — `newtpad drawcount <file>` renders offscreen (no
   window, no message pump), prints its numbers and exits, and a bare `newtpad drawcount` prints
   usage. **The old rule here was right to forbid it but wrong about why**, and the difference is the
