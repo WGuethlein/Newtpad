@@ -4812,6 +4812,61 @@ it names.**
 - HANDOFF §7's mode list is materially incomplete against the ~80 modes actually dispatched.
 - The zebra parity on a continuation row falls back to `r % 2`, so a split row can band oddly.
 
+## 6ay. The first live pass on the table view (2026-07-31, v0.34.1, branch `fix/table-live-pass-0.34`)
+
+Wyatt found four defects within an hour of v0.34.0 installing. **Two of them were not what they looked
+like, and that is the useful part of this entry.**
+
+**The column stretching was §10 working exactly as written.** *"Distribute leftover width
+proportionally"* is implemented faithfully in `table_leftover_cells`, and on a wide window it hands the
+spare width to the columns — making a 10-character date column ~400px. Nothing was broken. **Wyatt
+overruled §10 on live evidence:** columns now default to their content width and the leftover is not
+distributed at all, with drag-to-resize and double-click-to-fit unchanged as the override. The
+deviation is recorded in the code in `TABLE_EMPTY_CELL`'s style so an audit does not restore it.
+`table_leftover_cells` was deleted rather than left uncalled — a dead procedure whose comments describe
+a rule the file no longer follows is worse than no procedure.
+
+**The sort reset already existed.** `table_sort_click` has always cycled ascending → descending → the
+file's own order. The defect was that nothing said so. Three affordances were proposed and Wyatt
+rejected all three with the question that actually matters: *"how will the person know what to click
+and where to reset."* **The generalisable answer: a bare 3-click cycle cannot be made discoverable,
+only labelled** — either the interface says the words, or the user must already know. So it split into
+the two questions a first-time user has: *"can I click this?"* is answered by a header hover state with
+a 45%-alpha ghost arrow in the slot the solid one will occupy, and *"how do I undo it?"* is answered by
+the summary row reading `sorted by Date desc · click to clear`, with those words as the hit target.
+
+The other two were ordinary: the summary row and the h-scrollbar shared a band and overlapped (fixed by
+making `table_bottom_band_h` reserve both as one number, rather than nudging a constant in the draw —
+the scrollbar's drag hit-test reads the same geometry and would have diverged), and the sort arrow drew
+underneath the header label. The arrow now has **one producer** consumed by both the hover and the
+sorted draw, and its slot is reserved *before* the label is truncated **and** feeds the right-alignment
+nudge — §10 right-aligns date columns into exactly the pixels the arrow occupies.
+
+### What this pass got wrong, or nearly did
+
+**A sabotage revealed that two of the new arrow-overlap assertions would have been vacuous on
+v0.34.0**: under the stretching layout no header ever filled its column, so an arrow could not overlap
+a label no matter what. The precondition is now asserted rather than assumed. That is the eleventh
+consecutive batch in which draft test code could not fail, and the shape has not changed.
+
+**The header now carries three behaviours on one rect** — sort click, resize drag, hover — in a surface
+whose hit-testing is a data-loss seam. Precedence is explicit (resize edge ±4px beats hover beats
+nothing) and swept every 3px across the header band at 100/125/150% asserting `hover == (!edge &&
+header_cell)`, 0 disagreements. At the bottom the h-scrollbar wins the shared pixel with the summary
+row, on the grounds that a drag lost mid-motion is unrecoverable while a missed click costs one click.
+
+### Owed
+
+- **None of the appearance has been rendered.** Geometry is asserted; this environment cannot inject
+  GUI input. Worth Wyatt's eyes: `Bg_Hover` against the header's `Bg_Raised` in **Light** (close
+  values), the ghost arrow's legibility, whether the ~2-cell arrow slot truncates a header he cares
+  about, and how much right-hand emptiness feels right on real files.
+- **The per-column dropdown supersedes the item-3 fix.** Wyatt asked for multi-column sort and
+  Excel-style column filtering in the same message; a labelled dropdown (Sort ascending / Sort
+  descending / Clear sort / Filter) is the real answer to discoverability rather than a patch. The
+  hover state survives it; the summary-row wording would become redundant. See `requested-features.md`,
+  which also flags that a distinct-value list is **the first UI here that cannot be viewport-bounded**.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
