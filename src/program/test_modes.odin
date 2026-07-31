@@ -1686,6 +1686,21 @@ when NEWTPAD_TESTS {
 			li_chk(bad, doc_debug_string(&d) == "\t\n\n\n", fmt.tprintf("Ctrl+A Tab leaves %q", doc_debug_string(&d)))
 		}
 		{
+			// Sort. Listed as "not affected" by the investigation because sort and
+			// dedupe already step back over one trailing newline of their own --
+			// and they do, but doc_sort_lines IS selection-scoped, so what Ctrl+A
+			// hands it changed and the result changed with it. Re-confirmed here
+			// rather than trusted: the trim is what stops the blank rows floating
+			// to the top of a sorted file, which is the behaviour a user would
+			// otherwise report as a second bug.
+			d := sa_doc("b\na\n\n\n")
+			defer doc_close(&d)
+			doc_select_all(&d)
+			r := doc_sort_lines(&d, .Ascending)
+			li_chk(bad, r == .Ok, fmt.tprintf("Ctrl+A then Sort runs (%v)", r))
+			li_chk(bad, doc_debug_string(&d) == "a\nb\n\n\n", fmt.tprintf("...and sorts the CONTENT rows only, leaving the blank tail where it is (%q)", doc_debug_string(&d)))
+		}
+		{
 			// The column rectangle is dropped, the same as it always was --
 			// doc_select_all bypasses set_cursor, so this is explicit and has to
 			// survive the rewrite.
