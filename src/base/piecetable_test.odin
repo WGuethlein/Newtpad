@@ -337,3 +337,232 @@ test_pt_crlf_at :: proc(t: ^testing.T) {
 	defer pt_destroy(&empty)
 	testing.expect(t, !pt_crlf_at(&empty, 0), "empty buffer")
 }
+
+// --- pt_content_end_cap: where a trimming Ctrl+A stops ---
+
+// Bigger than any fixture in this file, so a case that does not mean to exercise
+// the cap never accidentally does. Named rather than inlined because "the cap is
+// not what this case is about" is the point of it.
+@(private = "file")
+CE_BIG :: 1 << 30
+
+@(private = "file")
+ce :: proc(s: string, cap := CE_BIG) -> (end: int, exact: bool) {
+	pt := pt_init(transmute([]u8)s)
+	defer pt_destroy(&pt)
+	return pt_content_end_cap(&pt, cap)
+}
+
+@(private = "file")
+ce_bytes :: proc(b: []u8, cap := CE_BIG) -> (end: int, exact: bool) {
+	pt := pt_init(b)
+	defer pt_destroy(&pt)
+	return pt_content_end_cap(&pt, cap)
+}
+
+// A fixture of `head` followed by `n` copies of `pad`. Used for the tails that
+// have to cross pt_content_end_cap's 4096-byte read chunk, which is where an
+// implementation that tracks the pending newline in a chunk-relative index
+// instead of an absolute one goes wrong.
+@(private = "file")
+ce_fixture :: proc(head: string, pad: u8, n: int) -> []u8 {
+	out := make([]u8, len(head) + n)
+	copy(out, transmute([]u8)head)
+	for i in len(head) ..< len(out) {out[i] = pad}
+	return out
+}
+
+@(test)
+test_pt_content_end_cap_paragraph :: proc(t: ^testing.T) {
+	// THE case this whole proc exists for, and the one the bug report named: a
+	// blank line BETWEEN two paragraphs is content and must stay inside the
+	// selection; a RUN of blank lines after the last content is not.
+	//
+	//   0:o 1:n 2:e 3:\n 4:\n 5:t 6:w 7:o 8:\n 9:\n 10:\n
+	//
+	// The last non-blank byte is the 'o' at 7, so the answer is the end of ITS
+	// row -- 9, one past the '\n' at 8. A forward scan that stops at the first
+	// blank row answers 3 instead and eats the second paragraph; that is the
+	// wrong implementation this case is written to catch.
+	end, exact := ce("one\n\ntwo\n\n\n")
+	testing.expect_value(t, end, 9)
+	testing.expect(t, exact, "the whole buffer was scanned")
+	// Stated the way doc_sel_range's consumers see it: the interior blank line at
+	// offset 4 is inside [lo, hi).
+	lo := 0
+	testing.expect(t, lo <= 4 && 4 < end, "the interior blank line stays selected")
+}
+
+@(test)
+test_pt_content_end_cap_terminators :: proc(t: ^testing.T) {
+	// No trailing newline: the last content row has no terminator, so the answer
+	// is the buffer end and Ctrl+A is unchanged.
+	end, exact := ce("alpha\nbeta")
+	testing.expect_value(t, end, 10)
+	testing.expect(t, exact, "exact")
+
+	// Exactly one trailing newline -- an ordinary POSIX-tidy file. The row's
+	// terminator is INCLUDED (Wyatt's decision), which is what keeps a copy of a
+	// file like this byte-identical to what it was before the trim existed.
+	end, exact = ce("alpha\nbeta\n")
+	testing.expect_value(t, end, 11)
+	testing.expect(t, exact, "exact")
+
+	// Several: one terminator stays, the rest of the run goes.
+	end, _ = ce("alpha\nbeta\n\n\n\n")
+	testing.expect_value(t, end, 11)
+
+	// A single "\n" after content on offset 0.
+	end, _ = ce("a\n\n\n")
+	testing.expect_value(t, end, 2)
+
+	// One row, no newline at all, nothing to trim.
+	end, _ = ce("alpha")
+	testing.expect_value(t, end, 5)
+}
+
+@(test)
+test_pt_content_end_cap_whitespace_rows :: proc(t: ^testing.T) {
+	// Decision 2: a trailing row of spaces/tabs is trailing whitespace, so the
+	// scan tests for a non-WHITESPACE byte rather than merely a non-newline.
+	//   0:a 1:\n 2:' ' 3:' ' 4:' ' 5:\n 6:\t 7:\n
+	end, exact := ce("a\n   \n\t\n")
+	testing.expect_value(t, end, 2)
+	testing.expect(t, exact, "exact")
+
+	// ... and the constraint that makes this a ROW rule rather than a whitespace
+	// trim: the trailing spaces of "beta   " are content ON a content row, so
+	// nothing is trimmed at all. A backward whitespace scan that forgot to take
+	// the row's end would answer 10 and silently drop three of the user's bytes.
+	end, _ = ce("alpha\nbeta   ")
+	testing.expect_value(t, end, 13)
+
+	// The same, with a terminator after it: the row end is one past the '\n', so
+	// the trailing spaces are still inside the selection.
+	end, _ = ce("alpha\nbeta   \n\n\n")
+	testing.expect_value(t, end, 14)
+
+	// Vertical tab and form feed are whitespace too; they are what a stray
+	// control character in a log tail actually looks like.
+	end, _ = ce("a\n\v\n\f\n")
+	testing.expect_value(t, end, 2)
+}
+
+@(test)
+test_pt_content_end_cap_crlf :: proc(t: ^testing.T) {
+	// Decision 4 on a CRLF file: BOTH bytes of the last content row's terminator
+	// are inside the selection. Answering 2 here would leave a lone CR at the end
+	// of a copy, and a paste of it into anything CRLF-aware is a visible defect.
+	//   0:a 1:\r 2:\n 3:\r 4:\n 5:\r 6:\n
+	end, exact := ce("a\r\n\r\n\r\n")
+	testing.expect_value(t, end, 3)
+	testing.expect(t, exact, "exact")
+
+	// An ordinary CRLF file with one terminator is unchanged.
+	end, _ = ce("a\r\nb\r\n")
+	testing.expect_value(t, end, 6)
+
+	// A lone CR is whitespace like any other -- Newtpad does not open classic-Mac
+	// files as CR-terminated, so a bare CR run at the end is a blank tail either
+	// way and never content.
+	end, _ = ce("a\n\r\r")
+	testing.expect_value(t, end, 2)
+}
+
+@(test)
+test_pt_content_end_cap_all_blank :: proc(t: ^testing.T) {
+	// Decision 3: with no non-blank byte anywhere, fall back to the whole buffer
+	// so Ctrl+A never visibly does nothing and Cut/Copy stay live. `exact` is
+	// TRUE here -- the scan really did see everything -- which is what
+	// distinguishes this from the cap case below, where the same `end` is a
+	// confessed guess.
+	end, exact := ce("\n\n\n")
+	testing.expect_value(t, end, 3)
+	testing.expect(t, exact, "the whole buffer was scanned, so this answer is fact")
+
+	end, exact = ce("   \n \t \n")
+	testing.expect_value(t, end, 8)
+	testing.expect(t, exact, "exact")
+
+	// Empty buffer: 0, and not a special case in the caller.
+	end, exact = ce("")
+	testing.expect_value(t, end, 0)
+	testing.expect(t, exact, "exact")
+
+	// One byte of content and nothing else.
+	end, _ = ce("a")
+	testing.expect_value(t, end, 1)
+}
+
+@(test)
+test_pt_content_end_cap_chunk_boundary :: proc(t: ^testing.T) {
+	// A blank tail LONGER than the 4096-byte read chunk. The pending-newline
+	// index has to be absolute: a chunk-relative one is re-based on every chunk
+	// and lands somewhere in the middle of the tail.
+	big := ce_fixture("abc\n", '\n', 9000)
+	defer delete(big)
+	end, exact := ce_bytes(big)
+	testing.expect_value(t, end, 4)
+	testing.expect(t, exact, "exact")
+
+	// The same shape with the content byte sitting exactly on a chunk boundary,
+	// so the content byte and its terminator are read in different chunks.
+	edge := ce_fixture("x", '\n', 4096)
+	defer delete(edge)
+	end, _ = ce_bytes(edge)
+	testing.expect_value(t, end, 2)
+}
+
+@(test)
+test_pt_content_end_cap_bounded :: proc(t: ^testing.T) {
+	// development-loop.md §4 Shape A: the scan is backward and unbounded by
+	// nature, so on a multi-GB log with a huge blank tail it would freeze the
+	// input thread. It stops at `cap` and SAYS SO -- `exact` false -- rather than
+	// returning a confident wrong answer.
+	big := ce_fixture("abc\n", '\n', 9000)
+	defer delete(big)
+
+	end, exact := ce_bytes(big, 100)
+	testing.expect(t, !exact, "the cap was hit before any content byte")
+	// And what it returns when it gives up is today's whole-buffer answer, never
+	// a trimmed one: a caller that ignores `exact` still gets correct-if-untrimmed
+	// behaviour rather than a selection that stops in the middle of the tail.
+	testing.expect_value(t, end, len(big))
+
+	// The exact boundary, one byte either side of it. `big` is "abc\n" + 9000
+	// '\n' = 9004 bytes and its last content byte is the 'c' at 2, so a cap of
+	// 9002 puts the floor ON it and a cap of 9001 stops one byte above it. Off by
+	// one in the floor and one of these two flips.
+	end, exact = ce_bytes(big, 9001)
+	testing.expect(t, !exact, "a cap one byte short of the content is still a miss")
+	testing.expect_value(t, end, len(big))
+
+	end, exact = ce_bytes(big, 9002)
+	testing.expect(t, exact, "the cap reached the content")
+	testing.expect_value(t, end, 4)
+
+	// Cap == length: the floor is offset 0, which is a real buffer start, so an
+	// all-blank buffer scanned to its floor is exact (decision 3) rather than a
+	// cap miss.
+	blank := ce_fixture("", '\n', 5000)
+	defer delete(blank)
+	end, exact = ce_bytes(blank, len(blank))
+	testing.expect(t, exact, "reaching offset 0 is a real answer")
+	testing.expect_value(t, end, 5000)
+
+	// One byte short of the length, on the same all-blank buffer: the floor is
+	// offset 1, which is not a buffer start, so this is a cap miss.
+	end, exact = ce_bytes(blank, len(blank) - 1)
+	testing.expect(t, !exact, "stopping short of offset 0 is not")
+	testing.expect_value(t, end, 5000)
+
+	// A zero or negative cap can only ever be a miss on a non-empty buffer, and
+	// must not underflow into a negative floor.
+	end, exact = ce_bytes(big, 0)
+	testing.expect(t, !exact, "zero cap")
+	testing.expect_value(t, end, len(big))
+	end, exact = ce_bytes(big, -5)
+	testing.expect(t, !exact, "negative cap")
+	testing.expect_value(t, end, len(big))
+}
+

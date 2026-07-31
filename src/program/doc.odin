@@ -3753,12 +3753,71 @@ doc_delete_word_back :: proc(doc: ^Document) {
 	doc.last_edit_at = doc.cursor
 }
 
+// How far back Ctrl+A will look for the last content row before giving up and
+// selecting the whole buffer. 1 MiB, matching STATUS_COL_CAP: the same order as
+// the other per-keystroke backward scans in this file, and four hundred times
+// the largest trailing blank run anyone has ever reported. Past it the scan
+// reports exact=false and doc_select_all falls back to pt.length -- so the
+// failure mode of a pathological file is "Ctrl+A does what it always did", not
+// "Ctrl+A stalls the input thread" and not "Ctrl+A stops somewhere arbitrary in
+// the blank tail".
+SELECT_ALL_TRIM_CAP :: 1 * 1024 * 1024
+
+// Ctrl+A. Selects to the end of the last row that holds content, leaving a run
+// of trailing blank rows out (Wyatt, 2026-07-29: *"if you ctrl+A on a document
+// with a lot of blank rows at the end, it captures those rows... one failure
+// spot for this though is spaces between paragraphs, those should be
+// captured"*). A blank line BETWEEN paragraphs is content and stays selected;
+// pt_content_end_cap owns that distinction and its comment owns the reasoning.
+//
+// This is a deliberate divergence from VS Code, Notepad and Sublime, which all
+// select the entire buffer. Recorded as a decision rather than left to be
+// rediscovered: the annoyance is real and daily, and the second press below is
+// what keeps the whole buffer one keystroke away.
+//
+// THE SECOND PRESS IS DERIVED, NOT LATCHED. Pressing Ctrl+A again selects
+// everything including the trailing blanks -- which is how "select all, delete"
+// stays reachable -- and the obvious way to build that is a doc.select_all_trimmed
+// flag. It is not built that way on purpose. doc_select_all bypasses set_cursor
+// (see below), so a stored flag would have to be cleared by hand from every
+// path that moves the caret, edits, replaces the buffer, undoes, reloads, or
+// switches tabs; miss one and Ctrl+A extends on a press where the user expected
+// a trim, which is silent and only reproducible after some unrelated action.
+// So the state is READ OFF THE SELECTION ITSELF: if the selection is already
+// exactly what a trimming select-all leaves -- anchor at 0, cursor at the
+// trimmed end, in that orientation -- then this press is the second one.
+//
+// What that buys is that the reset rule is simply "anything that changes the
+// selection", with no list to keep in sync. A caret move, a click, a typed
+// character, an edit, an undo, a reload, a Find hit, a switch to another
+// document (which has its own anchor/cursor and its own trimmed end) all break
+// the equality on their own. Two consequences worth stating out loud:
+//
+//   - Switching tabs away and back does NOT reset it. The trimmed selection is
+//     still on screen, so extending is what the user is looking at; a flag would
+//     have had to pick an answer here and either one would surprise someone.
+//   - A third press trims again, so Ctrl+A toggles rather than latching on the
+//     whole buffer. Also what the screen says: after the second press the
+//     selection is the whole buffer, which is not the trim, so the next press
+//     trims.
+//
+// The one case this is wrong about is a user who hand-selects from offset 0 to
+// exactly the trimmed end and then presses Ctrl+A: they get the whole buffer
+// instead of a no-op. Selecting to that precise byte by hand and then asking for
+// select-all is not a gesture with a right answer to lose.
 doc_select_all :: proc(doc: ^Document) {
+	end, exact := base.pt_content_end_cap(&doc.pt, SELECT_ALL_TRIM_CAP)
+	// Not exact means the cap ran out before any content byte -- a blank tail
+	// bigger than 1 MiB. pt_content_end_cap already hands back pt.length in that
+	// case; this is the explicit statement that the fallback is deliberate and
+	// not an accident of the return value.
+	if !exact {end = doc.pt.length}
+	if doc.anchor == 0 && doc.cursor == end {end = doc.pt.length} // the second press
 	doc.anchor = 0
-	doc.cursor = doc.pt.length
+	doc.cursor = end
 	// Bypasses set_cursor, so a live rectangle must be dropped explicitly --
 	// otherwise Ctrl+A leaves a stale block describing a rectangle that no
-	// longer relates to the (now whole-document) selection.
+	// longer relates to the (now linear) selection.
 	if block_active(doc) {block_clear(doc)}
 }
 
