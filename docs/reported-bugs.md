@@ -11,55 +11,6 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
-## MEASURED AND FIXED 2026-07-31 — the white flash was real; the regression was not
-
-**Reported 2026-07-31 by Wyatt**, on v0.34.1/0.34.2: *"when opening and closing the app it's no longer
-snappy... it'll show a white box for a split second, then close/open."*
-
-**The white box measured 196 ms and is gone.** `CreateWindowExW` passed `WS_VISIBLE`, so an empty
-window went up 20 ms into startup and DWM composited it long before D3D presented anything: on real
-desktop pixels, solid `FFFFFF` by ~85 ms and still white at ~200 ms, with the first Newtpad frame at
-~220 ms. What filled that gap was `gfx_init` — **133 ms** of D3D11 device and swapchain creation,
-which has nothing wasteful in it and simply must not be watched. The window is now created hidden,
-shown after the first present, and hidden again the instant the loop exits.
-
-**"No longer" is not supported by the measurement.** v0.32.0, v0.33.0, v0.34.0, v0.34.1 and v0.34.2
-were each built from their tags and timed with the same harness on Wyatt's real session: white flash
-196 ms and WM_CLOSE-to-exit 89–157 ms in *all five*, flat within noise. Whatever changed that day, it
-was not the code — which makes the flash (present all along) the likely thing noticed for the first
-time.
-
-**All four suspects in the original entry were eliminated with numbers**, and the real shutdown cost
-was none of them:
-
-- **`WATCH_MAX` 32 → 64 is innocent.** At 40 open tabs — where the values actually differ —
-  `watcher_stop` measured **18.2 ms** at 64 and **26.9 ms** at 32. The cost was `watch_worker`
-  sleeping its poll interval in twenty 50 ms naps, so exit paid whatever was left of one: 24 ms
-  median, 58 ms worst. It is now a posted `sync.Sema` and measures **0.13 ms**. `WATCH_MAX` stays 64.
-- **The line index join is 0.00 ms**, including the 1.05 GB tab and including closing 300 ms after
-  launch with the scan still running — `index_worker` polls `cancel` every 64 KB.
-- **Snapshot checkpoint frees are 0.00 ms.** A restored session has an empty undo stack.
-- **`session_save` is 33 ms** and is the largest thing left on the exit path. Left alone: it is
-  writing the backups that are the only copy of an unsaved buffer.
-
-Shutdown went 129 ms → **77 ms**, and the window now starts vanishing ~7 ms after the click instead of
-after 40–105 ms of teardown. Full evidence, both instruments, the sabotage output and the before/after
-tables: `.superpowers/sdd/reports/startup-shutdown.md`.
-
-### Still open, and why this entry has not been deleted
-
-1. **Does the window still take focus on launch?** `WS_VISIBLE` at creation got activation from the
-   shell's launch rules for free; a window shown 220 ms later does not, so `window_show` calls
-   `SetForegroundWindow`. Measured identical to the old build in this environment, but the harness
-   cannot reproduce a real shell launch. **Launch from the shortcut and from an Explorer
-   double-click.**
-2. **One trade to sign off:** nothing is on screen for ~220 ms and then a finished window appears,
-   where before an empty white one appeared at 28 ms. Time to a *usable* window is unchanged. One
-   line to reverse if the wrong call.
-3. **High DPI is unverified** — everything measured at 96 DPI.
-4. **220 ms to first frame is 133 ms of `D3D11CreateDevice`.** Getting on screen sooner means painting
-   a themed placeholder before the GPU is ready, which is a design decision, not a bug fix.
-
 ## "The preview does not always respect spaces" — one defect fixed, needs Wyatt's confirmation
 
 **Reported 2026-07-29** with a side-by-side screenshot of the editor and the preview: *"it looks like it's
