@@ -4693,9 +4693,9 @@ to hold the same number." There were four; the page keys got the editor's count.
   - Document / editing: `vnavtest`, `wraptest`, `wraplongtest`, `colperftest <mb>`,
     `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `tablereadonlytest`,
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
-    `quadsdftest`, `scrollgrabtest`, `tabseamtest`
+    `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest <file>`,
-    `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest <dir>`
+    `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
   - Two are **falsifiers**, not regression tests — they measure a claim rather than guard a
     behaviour: `menuseam` (does resolving scroll twice in one frame diverge? yes, in every case

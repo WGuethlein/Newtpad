@@ -218,9 +218,12 @@ Each of these cost real time at least once.
   `src/program/test_modes.odin`.
 - **Set `NEWTPAD_SESSION_DIR` to a temp directory first.** Six modes used to write to the real store
   under `%APPDATA%\Newtpad`; they now refuse without it, but set it anyway.
-- Argument order is per-mode and unforgiving: `edittest`/`seltest` take the path **first**;
-  `watchtest` takes a directory. **`keytest` no longer needs one** (2026-07-30) — `newtpad keytest`
+- Argument order is per-mode and unforgiving: `edittest`/`seltest` take the path **first**.
+  **`keytest` no longer needs one** (2026-07-30) — `newtpad keytest`
   works, `newtpad <path> keytest` still works, and it belongs in every regression sweep from now on.
+  **`watchtest`'s directory is optional as of 2026-07-31** (it defaults under `%TEMP%`), and
+  `lineidxtest` is one-argument with an optional path; both belong in every sweep. `resavetest
+  <file>` is still two-argument and still falls through to the GUI when run bare.
   It was two-argument-only, so it was in no required list, nothing ran it, and a stale assertion that
   the D1 keymap fix had invalidated sat in the tree printing `FAIL` to nobody. **A mode nothing runs is
   worse than no mode.** When you add one, make it one-argument and put it in a list.
