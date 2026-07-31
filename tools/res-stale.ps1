@@ -14,7 +14,14 @@ param(
     [string[]]$Sources = @(
         'src\platform\newtpad.rc',
         'src\platform\newtpad.manifest',
-        'src\platform\newtpad.ico'
+        'src\platform\newtpad.ico',
+        # The VERSIONINFO block's numbers come from here via build\version.rh, so
+        # a version bump alone -- touching no .rc, no manifest, no icon -- must
+        # still rebuild the resource. Without this line the shipped exe would
+        # report the PREVIOUS version in its properties, which is worse than
+        # reporting none: release.ps1 tags from this same file, so the tag and
+        # the binary would disagree while looking like they agree.
+        'src\program\version.odin'
     )
 )
 
