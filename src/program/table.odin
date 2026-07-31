@@ -479,6 +479,25 @@ table_abs_rows :: proc(doc: ^Document, rows: int, allocator := context.temp_allo
 	if doc == nil || len(out) == 0 {return out}
 	s, sok := table_data_start(doc)
 	if !sok {return out}
+	// UNDER A SORT THE RUN BELOW IS WRONG, and it is wrong in the one way this
+	// procedure exists to prevent. The `ln - 1 + i` rests on visible rows being
+	// consecutive lines; a permutation breaks that, so the gutter would count
+	// 1, 2, 3 down a screen showing lines 4,113, 12 and 900 -- a confident number
+	// naming the wrong line, which is what TABLE_ABS_NONE is for.
+	//
+	// The sort already knows the answer exactly, and for nothing: perm[pos] IS the
+	// file-order data-row index of the row at sorted position pos. No line counting,
+	// no checkpoint, no refusal -- and no doc_line_no_at call at all, so the sorted
+	// path is cheaper than the unsorted one rather than costing the 153 us/row this
+	// procedure's batching exists to avoid.
+	if table_sorted(doc) {
+		pos, pok := table_sort_pos(doc, s)
+		if !pok {return out}
+		for i in 0 ..< len(out) {
+			if p, ok := table_sort_perm_row(doc, pos + i); ok {out[i] = p}
+		}
+		return out
+	}
 	ln, exact := doc_line_no_at(doc, s)
 	// ln == 0 would mean the first data row IS line 0, which table_data_start
 	// exists to make impossible; refuse rather than hand back -1 + r and have it
@@ -605,6 +624,16 @@ table_sorted :: #force_inline proc(doc: ^Document) -> bool {
 // Data rows the live sort covers.
 table_sort_rows :: #force_inline proc(doc: ^Document) -> int {
 	return len(doc.table_sort.perm) if table_sorted(doc) else 0
+}
+
+// The FILE-ORDER data-row index at sorted position `pos` -- what the row-number
+// gutter and the zebra's parity ride on (table_abs_rows). It is the permutation's
+// own entry, so under a sort the absolute row index costs nothing at all and needs
+// neither Line_Index nor a refusal path.
+table_sort_perm_row :: proc(doc: ^Document, pos: int) -> (j: int, ok: bool) {
+	s := &doc.table_sort
+	if pos < 0 || pos >= len(s.perm) {return 0, false}
+	return int(s.perm[pos]), true
 }
 
 // The line offset at sorted position `pos`. The lookup the draw and the hit-test

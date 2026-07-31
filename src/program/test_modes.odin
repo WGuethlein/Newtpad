@@ -11822,6 +11822,21 @@ when NEWTPAD_TESTS {
 				for r in 0 ..< ROWS {if want[r] == r {fixed += 1}}
 				chk(&bad, fixed == 0, fmt.tprintf("...and no row keeps its file position (%d do), so the identity permutation cannot pass", fixed))
 
+				// --- THE ROW NUMBERS follow the rows, not the slots. The gutter draws
+				//     table_abs_rows + 1, and that producer's run-of-consecutive-lines
+				//     shortcut is exactly wrong under a permutation: it would print
+				//     1 2 3 4 5 down a screen showing lines 2 4 5 1 3 -- a confident
+				//     number naming the wrong line, which is what TABLE_ABS_NONE
+				//     exists to refuse. Asserted before any index has run, so it is
+				//     also proof the sorted path needs no Line_Index at all.
+				chk(&bad, !doc_index_done(d), "precondition -- no line index has been started")
+				{
+					absn := table_abs_rows(d, ROWS)
+					for r in 0 ..< ROWS {
+						chk(&bad, absn[r] == want[r], fmt.tprintf("visible row %d numbers as data row %d (want %d, line %q)", r, absn[r], want[r], lines[want[r] + 1]))
+					}
+				}
+
 				// --- THE SEAM: a pixel at the FIRST and the LAST visible row, through
 				//     the same hit-test a mouse press uses, against text derived by
 				//     strings.split.
@@ -12050,6 +12065,18 @@ when NEWTPAD_TESTS {
 
 				// 4. An active sort is named.
 				table_sort_click(d, 1)
+				// ...and, with a FINISHED index, the row numbers still follow the
+				// rows. This is the dangerous half of the same check sort_order makes:
+				// there the index had published nothing, so the consecutive-run
+				// shortcut refused and drew blanks; here it would answer, confidently,
+				// 1 2 3 4 5 over lines 5 1 3 2 4.
+				{
+					absn := table_abs_rows(d, 5)
+					want := [5]int{4, 0, 2, 1, 3} // e(4) a(10) c(30) b(200) d(empty, last)
+					for r in 0 ..< 5 {
+						chk(&bad, absn[r] == want[r], fmt.tprintf("with the index finished, visible row %d numbers as data row %d (want %d)", r, absn[r], want[r]))
+					}
+				}
 				s := table_summary_text(d)
 				chk(&bad, s == "5 rows  ·  2 columns  ·  sorted by v asc", fmt.tprintf("an active sort is in the summary: %q", s))
 				table_sort_click(d, 1)
