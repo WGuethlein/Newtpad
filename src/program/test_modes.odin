@@ -11583,6 +11583,580 @@ when NEWTPAD_TESTS {
 				return
 			}
 
+			// F6: §10 group C's malformed-row mark -- "a row with the wrong field
+			// count gets a 2px warning bar on its left edge and stays in place.
+			// Silently dropping data in a data viewer is the worst possible failure."
+			//
+			// Two halves, and they are different kinds of check on purpose. The RULE
+			// is asserted as an implication over field counts derived by plain
+			// strings.split -- independent of csv_fields, of the draw and of
+			// table_row_malformed's own expression -- because the property that
+			// matters is not "this row is marked" but "no row can have a hole inside
+			// the header's columns and go unmarked". The BAR is asserted on pixels
+			// from a real device, because a rule nothing draws is worth nothing and
+			// §6aw's finding was precisely that this file's appearance was unasserted.
+			tg_malformed :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				// Line 0 is the header (3 fields). Row 2 is SHORT, row 4 is LONG, row 1
+				// has an EMPTY middle cell and is well-formed -- §10 makes empty and
+				// missing different things and the pair is here so the mark cannot
+				// quietly cover both.
+				lines := [?]string {
+					"h0,h1,h2",
+					"a0,b0,c0",
+					"a1,,c1", // empty middle: a real field, NOT malformed
+					"a2,b2", // short: malformed
+					"a3,b3,c3",
+					"a4,b4,c4,d4", // long: malformed
+					"a5,b5,c5",
+				}
+				ncols := len(strings.split(lines[0], ",", context.temp_allocator))
+				chk(&bad, ncols == 3, fmt.tprintf("the fixture's header declares %d columns", ncols))
+
+				// 1. The rule itself, on counts this test derived.
+				want_marked := [?]bool{false, false, false, true, false, true, false}
+				for i in 1 ..< len(lines) {
+					n := len(strings.split(lines[i], ",", context.temp_allocator))
+					got := table_row_malformed(n, ncols)
+					chk(&bad, got == want_marked[i], fmt.tprintf("line %d %q has %d fields -> marked=%v (want %v)", i, lines[i], n, got, want_marked[i]))
+				}
+				// 2. THE AGREEMENT, as an implication rather than as two rules that
+				//    happen to line up: a cell the draw would SKIP as missing
+				//    (col.c >= len(fields)) inside a column the header declares must
+				//    always be on a marked row. This is the property table.odin's
+				//    comment claims holds by construction; enumerated here so a change
+				//    to either side is caught rather than argued.
+				holes, unmarked := 0, 0
+				for i in 1 ..< len(lines) {
+					n := len(strings.split(lines[i], ",", context.temp_allocator))
+					for c in 0 ..< ncols {
+						if c < n {continue}
+						holes += 1
+						if !table_row_malformed(n, ncols) {unmarked += 1}
+					}
+				}
+				chk(&bad, holes > 0, fmt.tprintf("the fixture actually produces missing cells (%d) -- the implication is not vacuous", holes))
+				chk(&bad, unmarked == 0, fmt.tprintf("every missing cell inside the header's columns is on a marked row (%d unmarked)", unmarked))
+				// 3. ...and a header with no columns marks nothing. An empty document
+				//    would otherwise stripe every row on screen on no evidence.
+				chk(&bad, !table_row_malformed(0, 0) && !table_row_malformed(3, 0), "with no header, nothing is malformed")
+
+				// 4. The bar, on pixels.
+				W, H :: 1000, 700
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, W, H, "tablegridtest/malformed") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return
+				}
+				defer headless_gpu_destroy(&h)
+				saved_theme, saved_scale := g_theme, UI_SCALE
+				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
+				BASE_PX = BASE_PX_96
+				// Sentinels again, for tg_appearance's reason: Warning against the real
+				// Bg_Base is a colour comparison, and this wants an identity one.
+				bg_s := [4]f32{0, 0, 0, 1}
+				warn_s := [4]f32{1, 0, 1, 1}
+				zeb_s := [4]f32{0, 0, 0.5, 1}
+				g_theme[.Bg_Base] = bg_s
+				g_theme[.Warning] = warn_s
+				g_theme[.Table_Zebra] = zeb_s
+				sample :: proc(buf: []u8, w, x, y: int) -> (b, g, r: u8) {
+					i := (y * w + x) * 4
+					return buf[i], buf[i + 1], buf[i + 2]
+				}
+				near :: proc(c: [4]f32, b, g, r: u8, tol: int) -> bool {
+					want := [3]u8{u8(c[2] * 255 + 0.5), u8(c[1] * 255 + 0.5), u8(c[0] * 255 + 0.5)}
+					return abs(int(b) - int(want[0])) <= tol && abs(int(g) - int(want[1])) <= tol && abs(int(r) - int(want[2])) <= tol
+				}
+				TOL :: 2
+				total := 0
+				for l in lines {total += len(l) + 1}
+				content := make([]u8, total)
+				{
+					o := 0
+					for l in lines {
+						copy(content[o:], transmute([]u8)l)
+						content[o + len(l)] = '\n'
+						o += len(l) + 1
+					}
+				}
+				doc := doc_from_content(content, "malformed.csv", .UTF8)
+				defer doc_close(&doc)
+				doc.table, doc.table_delim = true, ','
+				px := BASE_PX_96
+				char_w := plat.text_char_width(&h.text, px, .Doc)
+				rows := table_visible_rows(&doc, f32(H), px)
+				plat.gfx_begin_frame(&h.gfx, bg_s[0], bg_s[1], bg_s[2])
+				table_draw(&h.gfx, &h.quads, &h.text, &doc, px, char_w, rows, f32(W), f32(H))
+				buf, rok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				chk(&bad, rok, "the readback succeeded")
+				if !rok {return}
+				// Visible row r is data row r here (doc.top == 0), so want_marked[r+1]
+				// is the expectation for the band at table_row_rect_y(px, r).
+				for r in 0 ..< len(lines) - 1 {
+					y := int(table_row_rect_y(px, r) + table_row_h(px) * 0.5)
+					b0, g0, r0 := sample(buf, W, 0, y)
+					got := near(warn_s, b0, g0, r0, TOL)
+					chk(&bad, got == want_marked[r + 1], fmt.tprintf("row %d (%q): warning bar drawn=%v (want %v) bgr=(%d,%d,%d)", r, lines[r + 1], got, want_marked[r + 1], b0, g0, r0))
+				}
+				// ...and it is §10's 2px, measured by walking right off the row's edge
+				// rather than by recomputing the constant.
+				{
+					y := int(table_row_rect_y(px, 2) + table_row_h(px) * 0.5) // the short row
+					w := 0
+					for x in 0 ..< 16 {
+						b0, g0, r0 := sample(buf, W, x, y)
+						if !near(warn_s, b0, g0, r0, TOL) {break}
+						w += 1
+					}
+					chk(&bad, w == int(sx(TABLE_WARN_W_96)), fmt.tprintf("the bar is %dpx wide at 100%% (§10: 2)", w))
+				}
+				// The mark is at the ROW's left edge, which is the gutter's origin --
+				// asserted so "left of the numbers" cannot silently become "between the
+				// gutter and the first cell" without this saying so.
+				{
+					y := int(table_row_rect_y(px, 2) + table_row_h(px) * 0.5)
+					gx := int(table_gutter_w()) + 1
+					b0, g0, r0 := sample(buf, W, gx, y)
+					chk(&bad, !near(warn_s, b0, g0, r0, TOL), fmt.tprintf("...at x=0, not at the gutter's right edge (x=%d reads bgr=(%d,%d,%d))", gx, b0, g0, r0))
+				}
+				return
+			}
+
+			// Shared by the sort cases below. `want_field` derives the expected text
+			// by plain strings.split -- no csv_fields, no field-range parser, no
+			// table_row_start -- which is what makes a comparison against it evidence
+			// rather than a restatement. Valid because no fixture field is quoted or
+			// holds a delimiter, so the raw span and the unquoted value are one string.
+			sort_want_field :: proc(lines: []string, line, col: int) -> string {
+				parts := strings.split(lines[line], ",", context.temp_allocator)
+				return parts[col] if col < len(parts) else ""
+			}
+			sort_read_span :: proc(doc: ^Document, fs, fe: int) -> string {
+				if fe < fs {return "<inverted>"}
+				b := make([]u8, fe - fs, context.temp_allocator)
+				base.pt_read(&doc.pt, fs, b)
+				return string(b)
+			}
+			// Byte offset of each fixture line, counted here rather than asked of the
+			// code under test.
+			sort_offsets :: proc(lines: []string, allocator := context.temp_allocator) -> []int {
+				out := make([]int, len(lines) + 1, allocator)
+				for l, i in lines {out[i + 1] = out[i] + len(l) + 1}
+				return out
+			}
+			sort_content :: proc(lines: []string) -> []u8 {
+				total := 0
+				for l in lines {total += len(l) + 1}
+				c := make([]u8, total) // doc_close owns it (owned_orig)
+				o := 0
+				for l in lines {
+					copy(c[o:], transmute([]u8)l)
+					c[o + len(l)] = '\n'
+					o += len(l) + 1
+				}
+				return c
+			}
+
+			// C1: the order the permutation produces, the pixel -> byte seam under it,
+			// and a real edit read back out of the document.
+			sort_order :: proc(t: ^plat.Text) -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				px := BASE_PX_96
+				W :: f32(1000)
+				// File order deliberately unlike sorted order in BOTH columns tested,
+				// and row 4 is MALFORMED -- the plan's "with a malformed row in the
+				// set", so the sort has to carry a short row through without dropping
+				// it (§10) and without it desynchronising the offsets after it.
+				lines := [?]string {
+					"id,name,qty",
+					"3,delta,10",
+					"1,alpha,200",
+					"5,echo,30",
+					"2,bravo", // malformed: 2 fields where the header has 3
+					"4,charlie,4",
+				}
+				off := sort_offsets(lines[:])
+				doc := doc_from_content(sort_content(lines[:]), "sort.csv", .UTF8)
+				defer doc_close(&doc)
+				d := &doc
+				d.table, d.table_delim = true, ','
+				doc_update_top_inset(d)
+				table_compute_widths(d, t)
+				d.table_cols = len(d.table_widths)
+				ROWS :: 5
+				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				trows := table_visible_rows(d, H, px)
+				cw := plat.text_char_width(t, px, .Doc)
+				if trows != ROWS {
+					chk(&bad, false, fmt.tprintf("precondition -- %d grid rows fit (want %d)", trows, ROWS))
+					return
+				}
+
+				// --- by NAME, ascending. alpha bravo charlie delta echo, which is
+				//     data rows 1, 3, 4, 0, 2 -- worked out from the fixture above.
+				table_sort_click(d, 1)
+				chk(&bad, table_sorted(d), "a header click puts a sort on the grid")
+				want := [ROWS]int{1, 3, 4, 0, 2}
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == off[want[r] + 1], fmt.tprintf("visible row %d resolves to line %d (%q): got offset %d, want %d", r, want[r] + 1, lines[want[r] + 1], p, off[want[r] + 1]))
+				}
+				// A permutation that did nothing would pass every check above at r
+				// where want[r] == r. It is 1,3,4,0,2, so no visible row keeps its
+				// file position -- stated rather than assumed.
+				fixed := 0
+				for r in 0 ..< ROWS {if want[r] == r {fixed += 1}}
+				chk(&bad, fixed == 0, fmt.tprintf("...and no row keeps its file position (%d do), so the identity permutation cannot pass", fixed))
+
+				// --- THE SEAM: a pixel at the FIRST and the LAST visible row, through
+				//     the same hit-test a mouse press uses, against text derived by
+				//     strings.split.
+				cols := table_cols_layout(d, cw, W, 0)
+				for r in ([]int{0, ROWS - 1}) {
+					mx := table_cell_text_x(cols[0]) + 1
+					my := table_row_rect_y(px, r) + table_row_h(px) * 0.5
+					hok, hr, hc, fs, fe, _ := table_cell_at(d, mx, my, px, cw, trows, W)
+					got := sort_read_span(d, fs, fe)
+					exp := sort_want_field(lines[:], want[r] + 1, 0)
+					chk(&bad, hok && hr == r && hc == 0, fmt.tprintf("a click in visible row %d resolves to (row %d, col %d)", r, hr, hc))
+					chk(&bad, got == exp, fmt.tprintf("...and the byte range under it is %q (want %q, from line %q)", got, exp, lines[want[r] + 1]))
+				}
+
+				// The malformed row is at visible position 1 and has no third field.
+				// The grid must refuse it rather than hand back some other row's bytes.
+				chk(&bad, lines[want[1] + 1] == "2,bravo", fmt.tprintf("the malformed row sorted to visible position 1 (%q)", lines[want[1] + 1]))
+				{
+					mok, _, _, _, _, _ := table_cell_at_index(d, 1, 2, trows)
+					chk(&bad, !mok, "a cell the malformed row does not have resolves to nothing")
+					eok, _, _, efs, efe, eval := table_cell_at_index(d, 1, 1, trows)
+					chk(&bad, eok && sort_read_span(d, efs, efe) == "bravo" && eval == "bravo", fmt.tprintf("...while the fields it DOES have still resolve (%q)", sort_read_span(d, efs, efe)))
+				}
+
+				// --- AN EDIT, READ BACK. Visible row 0 is line 2, "1,alpha,200"; type
+				//     a Z into its first field and look at the document's bytes.
+				before := doc_debug_string(d)
+				defer delete(before)
+				{
+					eok, r, c, fs, fe, val := table_cell_at_index(d, 0, 0, trows)
+					chk(&bad, eok && val == "1", fmt.tprintf("the cell at visible row 0 col 0 holds %q", val))
+					table_edit_start(d, r, c, fs, fe, val)
+					table_edit_rune(d, 'Z')
+					table_edit_commit(d)
+				}
+				after := doc_debug_string(d)
+				defer delete(after)
+				want_after, _ := strings.replace(before, "1,alpha,200", "1Z,alpha,200", 1, context.temp_allocator)
+				chk(&bad, after == want_after, fmt.tprintf("the edit landed on the line the pointer was over (%q)", after))
+				// The specific failure a permutation-blind table_row_start produces:
+				// visible row 0 would be line 1, "3,delta,10", and THAT is the line the
+				// splice destroys. Named directly so the failure output says which.
+				chk(&bad, strings.count(after, "3,delta,10") == 1, fmt.tprintf("...and the file's first data row is untouched (%q appears %d time(s))", "3,delta,10", strings.count(after, "3,delta,10")))
+
+				// --- and the permutation SURVIVED the edit, which is table_sort_shift's
+				//     whole job: the splice added one byte at line 2, so every offset
+				//     after it moved.
+				chk(&bad, table_sorted(d), "the sort survives a cell edit")
+				noff := sort_offsets(lines[:])
+				for k in 3 ..< len(noff) {noff[k] += 1}
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == noff[want[r] + 1], fmt.tprintf("after the edit, visible row %d is still line %d: got %d, want %d", r, want[r] + 1, p, noff[want[r] + 1]))
+				}
+
+				// --- by QTY: numeric, so 4 < 10 < 30 < 200 rather than "10" < "200" <
+				//     "30" < "4", and the row with no qty at all goes last in BOTH
+				//     directions. A byte sort passes none of this.
+				table_sort_click(d, 2)
+				qwant := [ROWS]int{4, 0, 2, 1, 3} // charlie(4) delta(10) echo(30) alpha(200) bravo(-)
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == noff[qwant[r] + 1], fmt.tprintf("numeric asc: visible row %d is line %d (%q)", r, qwant[r] + 1, lines[qwant[r] + 1]))
+				}
+				table_sort_click(d, 2) // second click on the same column: descending
+				chk(&bad, d.table_sort.desc, "a second click on the same header reverses it")
+				dwant := [ROWS]int{1, 2, 0, 4, 3} // alpha(200) echo(30) delta(10) charlie(4) bravo(-)
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == noff[dwant[r] + 1], fmt.tprintf("numeric desc: visible row %d is line %d (%q)", r, dwant[r] + 1, lines[dwant[r] + 1]))
+				}
+				chk(&bad, dwant[ROWS - 1] == 3, "...and the row with no value is last in BOTH directions, not flipped to the front")
+				table_sort_click(d, 2) // third click: back to the file's own order
+				chk(&bad, !table_sorted(d), "a third click clears the sort")
+				// Clearing keeps the view where it was -- doc.top is a real line
+				// offset in every mode, which is the invariant the whole design rests
+				// on, so the grid stays on whatever row the descending sort had at the
+				// top rather than jumping. Wound back here so the walk below starts at
+				// data row 0.
+				d.top = 0
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == noff[r + 1], fmt.tprintf("unsorted: visible row %d is line %d again", r, r + 1))
+				}
+				return
+			}
+
+			// C2: HANDOFF §6aw's fixture, sorted for real. Every data line the same
+			// byte length -- zero-padded ids, ISO dates, fixed status codes, which is
+			// what an export looks like -- so a table_row_start that ignored the
+			// permutation would return an offset that is a REAL row start, the edit
+			// anchor's offset compare would pass, and the commit would land on the
+			// wrong row with nothing anywhere saying so. Only reading the document's
+			// bytes back can tell.
+			sort_equal_len :: proc(t: ^plat.Text) -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				px := BASE_PX_96
+				W :: f32(1000)
+				lines := [?]string {
+					"id,date,status",
+					"00003,2026-01-03,ACTIVE",
+					"00001,2026-01-01,ACTIVE",
+					"00005,2026-01-05,ACTIVE",
+					"00002,2026-01-02,ACTIVE",
+					"00004,2026-01-04,ACTIVE",
+				}
+				equal := true
+				for i in 2 ..< len(lines) {if len(lines[i]) != len(lines[1]) {equal = false}}
+				chk(&bad, equal, fmt.tprintf("every data line is the same byte length (%d) -- the offset compare is blind here", len(lines[1])))
+				off := sort_offsets(lines[:])
+				doc := doc_from_content(sort_content(lines[:]), "equal.csv", .UTF8)
+				defer doc_close(&doc)
+				d := &doc
+				d.table, d.table_delim = true, ','
+				doc_update_top_inset(d)
+				table_compute_widths(d, t)
+				d.table_cols = len(d.table_widths)
+				ROWS :: 5
+				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				trows := table_visible_rows(d, H, px)
+				cw := plat.text_char_width(t, px, .Doc)
+				if trows != ROWS {
+					chk(&bad, false, fmt.tprintf("precondition -- %d grid rows fit (want %d)", trows, ROWS))
+					return
+				}
+				table_sort_click(d, 0) // by id, ascending: 1 2 3 4 5
+				want := [ROWS]int{1, 3, 0, 4, 2}
+				ER :: 2 // sorted position 2 is data row 0 -- NOT row 2
+				chk(&bad, want[ER] != ER, fmt.tprintf("visible row %d is data row %d, so ignoring the permutation is visibly wrong here", ER, want[ER]))
+				for r in 0 ..< ROWS {
+					p, pok := table_row_start(d, r)
+					chk(&bad, pok && p == off[want[r] + 1], fmt.tprintf("visible row %d is line %d (%q)", r, want[r] + 1, lines[want[r] + 1]))
+				}
+				// The trap, stated: the offset the permutation-blind version would
+				// return is a real row start, so nothing about the OFFSET is wrong.
+				{
+					blind := off[ER + 1] // what a sequential walk from data row 0 gives
+					real, _ := table_row_start(d, ER)
+					chk(&bad, blind != real, fmt.tprintf("the blind answer (%d) and the right one (%d) are different rows...", blind, real))
+					chk(&bad, base.pt_line_end_cap(&d.pt, blind, RENDER_LINE_CAP) - blind == base.pt_line_end_cap(&d.pt, real, RENDER_LINE_CAP) - real, "...and the same length, which is why an offset or a length compare cannot tell them apart")
+				}
+				// The edit, on the STATUS column so the change is at the far end of the
+				// line and cannot be confused with the id the sort keyed on.
+				before := doc_debug_string(d)
+				defer delete(before)
+				{
+					eok, r, c, fs, fe, val := table_cell_at_index(d, ER, 2, trows)
+					chk(&bad, eok && val == "ACTIVE", fmt.tprintf("the cell at visible row %d col 2 holds %q", ER, val))
+					table_edit_start(d, r, c, fs, fe, val)
+					table_edit_rune(d, 'X')
+					table_edit_commit(d)
+				}
+				after := doc_debug_string(d)
+				defer delete(after)
+				home := lines[want[ER] + 1]
+				want_after, _ := strings.replace(before, home, fmt.tprintf("%sX", home), 1, context.temp_allocator)
+				chk(&bad, after == want_after, fmt.tprintf("the edit landed on %q and nowhere else", home))
+				// Every other line is intact, named one at a time so the output says
+				// WHICH row a regression wrote over.
+				for i in 1 ..< len(lines) {
+					if i == want[ER] + 1 {continue}
+					chk(&bad, strings.count(after, lines[i]) == 1, fmt.tprintf("...line %d %q survives intact", i, lines[i]))
+				}
+				return
+			}
+
+			// C3: §10's summary row -- and specifically that an unfinished index reads
+			// as APPROXIMATE. A settled-looking count that changes on the next frame is
+			// the failure this is here to prevent, and it is invisible without an
+			// exact-string comparison because both forms look like a row count.
+			sort_summary :: proc(t: ^plat.Text) -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				lines := [?]string{"k,v", "a,10", "b,200", "c,30", "d,", "e,4"}
+				doc := doc_from_content(sort_content(lines[:]), "summary.csv", .UTF8)
+				defer doc_close(&doc)
+				d := &doc
+				d.table, d.table_delim = true, ','
+				table_compute_widths(d, t)
+				d.table_cols = len(d.table_widths)
+
+				// 1. Unfinished index: the worker has published a partial count and
+				//    `done` is false. Five data rows exist; the count says 4.2M because
+				//    that is what the worker has reached, and the point is that the
+				//    reader can SEE it is not final.
+				intrinsics.atomic_store(&d.idx.line_count, 4_200_002)
+				intrinsics.atomic_store(&d.idx.done, false)
+				n, exact := table_row_count(d)
+				chk(&bad, !exact && n == 4_200_000, fmt.tprintf("a running index gives %d rows, exact=%v", n, exact))
+				got := table_summary_text(d)
+				chk(&bad, got == "~4.2M rows  ·  2 columns", fmt.tprintf("...and reads as approximate: %q", got))
+
+				// 2. Finished: the same number, settled, grouped, no tilde.
+				intrinsics.atomic_store(&d.idx.done, true)
+				n2, exact2 := table_row_count(d)
+				chk(&bad, exact2 && n2 == 4_200_000, fmt.tprintf("a finished index gives %d rows, exact=%v", n2, exact2))
+				got2 := table_summary_text(d)
+				chk(&bad, got2 == "4,200,000 rows  ·  2 columns", fmt.tprintf("...and reads as settled: %q", got2))
+				chk(&bad, got != got2, "the two forms are actually different strings")
+
+				// 3. The real count, off the real worker, so §10's number is the file's
+				//    and not this test's atomics.
+				doc_index_start(d)
+				for !doc_index_done(d) {}
+				n3, exact3 := table_row_count(d)
+				chk(&bad, exact3 && n3 == 5, fmt.tprintf("the file's own count is %d data rows (want 5, header and terminator excluded)", n3))
+
+				// 4. An active sort is named.
+				table_sort_click(d, 1)
+				s := table_summary_text(d)
+				chk(&bad, s == "5 rows  ·  2 columns  ·  sorted by v asc", fmt.tprintf("an active sort is in the summary: %q", s))
+				table_sort_click(d, 1)
+				s2 := table_summary_text(d)
+				chk(&bad, s2 == "5 rows  ·  2 columns  ·  sorted by v desc", fmt.tprintf("...and its direction: %q", s2))
+
+				// 5. The refusal, as TEXT. sort_ceiling proves a big file sets the flag;
+				//    this proves the flag is what the reader sees, which is the half
+				//    that makes a refused click something other than a dead header.
+				table_sort_clear(d)
+				d.table_sort.refused = true
+				s3 := table_summary_text(d)
+				chk(&bad, s3 == "5 rows  ·  2 columns  ·  too large to sort (over 1,000,000 rows)", fmt.tprintf("a refused sort says why: %q", s3))
+				return
+			}
+
+			// C4: the ceiling. Builds TABLE_SORT_MAX rows, MEASURES the sort, then
+			// builds one row more and asserts the refusal.
+			//
+			// A real file at the real constant, because the plan's instruction was to
+			// measure the cost rather than assert it from arithmetic, and because a
+			// refusal proved on a lowered constant proves nothing about the shipped one.
+			sort_ceiling :: proc(t: ^plat.Text) -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				build :: proc(rows: int) -> []u8 {
+					HEAD :: "id,date,status\n"
+					ROW :: 26 // "0000000,2026-01-01,ACTIVE\n" -- a realistic export row
+					out := make([]u8, len(HEAD) + rows * ROW)
+					copy(out[:], transmute([]u8)string(HEAD))
+					o := len(HEAD)
+					for i in 0 ..< rows {
+						// Scrambled ids -- 7919 is prime and coprime with the row
+						// count, so this is a bijection and the permutation is nowhere
+						// near the identity. A build that quietly produced file order
+						// would otherwise look right at both ends.
+						s := fmt.tprintf("%07d,2026-01-01,ACTIVE\n", (i * 7919) % rows)
+						assert(len(s) == ROW)
+						copy(out[o:], transmute([]u8)s)
+						o += ROW
+					}
+					return out
+				}
+				{
+					doc := doc_from_content(build(TABLE_SORT_MAX), "ceiling.csv", .UTF8)
+					defer doc_close(&doc)
+					d := &doc
+					d.table, d.table_delim = true, ','
+					table_compute_widths(d, t)
+					d.table_cols = len(d.table_widths)
+					t0 := time.tick_now()
+					ok := table_sort_build(d, 0)
+					ms := time.duration_milliseconds(time.tick_since(t0))
+					chk(&bad, ok && table_sort_rows(d) == TABLE_SORT_MAX, fmt.tprintf("exactly TABLE_SORT_MAX rows sort: %d rows in %.0f ms (debug build)", table_sort_rows(d), ms))
+					// The order is right at both ends, checked against the ids this
+					// test generated rather than against the sort's own arrays.
+					lo, _ := table_sort_row_at(d, 0)
+					hi, _ := table_sort_row_at(d, TABLE_SORT_MAX - 1)
+					b: [8]u8
+					base.pt_read(&d.pt, lo, b[:7])
+					first := strings.clone(string(b[:7]), context.temp_allocator)
+					base.pt_read(&d.pt, hi, b[:7])
+					last := strings.clone(string(b[:7]), context.temp_allocator)
+					chk(&bad, first == "0000000", fmt.tprintf("...smallest id first (%q)", first))
+					chk(&bad, last == fmt.tprintf("%07d", TABLE_SORT_MAX - 1), fmt.tprintf("...largest id last (%q)", last))
+					fmt.printfln("         sort cost: %.0f ms for %d rows, %d bytes resident (offs+perm+rank)", ms, TABLE_SORT_MAX, TABLE_SORT_MAX * (size_of(int) + 2 * size_of(i32)))
+				}
+				{
+					doc := doc_from_content(build(TABLE_SORT_MAX + 1), "over.csv", .UTF8)
+					defer doc_close(&doc)
+					d := &doc
+					d.table, d.table_delim = true, ','
+					table_compute_widths(d, t)
+					d.table_cols = len(d.table_widths)
+					ok := table_sort_build(d, 0)
+					chk(&bad, !ok, "one row past TABLE_SORT_MAX is refused")
+					chk(&bad, !table_sorted(d), "...and nothing is left half-sorted")
+					chk(&bad, d.table_sort.refused, "...and the refusal is recorded for the summary row")
+					chk(&bad, strings.contains(table_summary_text(d), "too large to sort"), fmt.tprintf("...which says so: %q", table_summary_text(d)))
+				}
+				return
+			}
+
+			// F7: §10 group C's VIEW-ONLY SORT. A DATA-LOSS TEST.
+			//
+			// table_cell_at maps a pixel through table_row_start to a field's byte
+			// range and table_edit_commit splices that range. Under a sort the r-th
+			// visible row is no longer the r-th line, so every assertion below either
+			// compares the RESOLVED BYTES against a field text this test derived by
+			// plain strings.split, or performs a real edit and reads the document back.
+			// Nothing here compares a resolved range against a computed one: that
+			// compares two derivations of the same expression and passes with the bug
+			// present.
+			tg_sort :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (sort): no fonts loaded")
+					bad += 1
+					return
+				}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
+				BASE_PX = BASE_PX_96
+				bad += sort_order(&t)
+				bad += sort_equal_len(&t)
+				bad += sort_summary(&t)
+				bad += sort_ceiling(&t)
+				return
+			}
+
 			bad := tg_abs_cost()
 			bad += tg_gutter_pixels()
 			bad += tg_align()
@@ -11593,7 +12167,16 @@ when NEWTPAD_TESTS {
 			bad += tg_edit_permute()
 			bad += tg_appearance()
 			bad += tg_parity()
+			bad += tg_malformed()
+			bad += tg_sort()
 			fmt.printfln("tablegridtest: %d failures", bad)
+			// Exit non-zero, like keytest / palettetest / lineidxtest / resavetest.
+			// HANDOFF §6aw listed this mode as the notable omission: it asserts a
+			// hundred things about a data-loss seam and used to only print them, so a
+			// sweep that greps case-insensitively for FAIL matched "0 failures" and
+			// saw nothing. Group C makes that worse -- the seam now decides which line
+			// a cell edit writes to -- so it is fixed here.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
