@@ -845,7 +845,7 @@ sort_number :: proc(s: string, scratch: ^[64]u8) -> f64 {
 // ONE BOUNDED PASS over the data rows, on the main thread, because a sort the user
 // asked for by clicking has to be there when they look up. The bound is
 // TABLE_SORT_MAX rows, checked as the rows are counted rather than afterwards, so
-// a 12M-row file pays for one million rows of scanning and then stops -- not for
+// a 12M-row file pays for 100,000 rows of scanning and then stops -- not for
 // twelve million followed by a refusal.
 //
 // THE COLUMN'S TYPE IS DECIDED HERE, over the rows being sorted, and NOT read from
@@ -873,9 +873,10 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 	if !fok {return false}
 	// Refuse before scanning when the row count is already SETTLED and over the
 	// ceiling. Without this every click on a 12M-row file pays for a full
-	// TABLE_SORT_MAX-row pass -- measured at ~3 s in a debug build -- to arrive at
-	// the same refusal, so the header would freeze the app once per press and never
-	// do anything. Only on an EXACT count: a partial one is smaller than the truth
+	// TABLE_SORT_MAX-row pass -- 285 ms in a debug build, which tg_sort's C4 prints
+	// -- to arrive at the same refusal, so the header would cost a visible hitch on
+	// every press and never do anything. Only on an EXACT count: a partial one is
+	// smaller than the truth
 	// by construction, so refusing off it would refuse files that fit.
 	if n, exact := table_row_count(doc); exact && n > TABLE_SORT_MAX {
 		s.refused = true
