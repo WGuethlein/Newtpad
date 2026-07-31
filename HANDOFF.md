@@ -4985,6 +4985,86 @@ way to take.
   themed placeholder before the GPU is ready — a design decision, not a bug fix, and Wyatt was offered
   it and chose the blank.
 
+## 6bb. Ctrl+A stops selecting the blank tail (2026-07-31, v0.35.0, branch `feat/ctrl-a-trim`)
+
+Wyatt, 2026-07-29: *"if you ctrl+A on a document with a lot of blank rows at the end, it captures those
+rows in the Ctrl+A, I don't think it should do this. One failure spot for this though is spaces between
+paragraphs, those should be captured."*
+
+**A deliberate divergence from VS Code, Notepad and Sublime**, all of which select the entire buffer.
+Recorded as a decision rather than left to look like an accident, because someone will eventually ask
+why Newtpad differs.
+
+### The investigation that preceded it, kept because it settled the kind of bug this was
+
+Measured against a real build on nine fixtures with known trailing-newline counts: **the trailing rows
+are real bytes in the file.** `rows == newlines + 1` in every one — including the no-trailing-newline
+case that would have exposed a phantom row — and `Select_All` set `cursor == pt.length` every time.
+Sabotage-verified by reintroducing the historical `next_row_start_capped` phantom-row bug, which made
+the no-trailing-newline fixture emit phantom rows. **So this was a select-all policy question, not a
+rendering bug** — and that answer is what decided the whole shape of the fix. Two things found on the
+way: `doc_visible_rows` is pure viewport geometry rather than a content count (it returned 20 for every
+fixture including the empty one), and `doc_selection_rects` skips the final empty row, so N trailing
+newlines highlight N−1 blank rows — which is what the report described seeing, and is a faithful
+drawing of real bytes.
+
+### The rule, and Wyatt's four decisions
+
+**It is row-aware, not a whitespace trim.** `base.pt_content_end_cap` scans back to the last non-blank
+byte and then returns **that row's** end. A naive backward whitespace scan would eat the trailing spaces
+of `"alpha\nbeta   "`, which is content on a content line.
+
+1. **A second `Ctrl+A` extends to the whole buffer.** Measured first: a trimming select-all leaves 5
+   bytes and 6 blank rows on the five-newline fixture after Delete, so delete-all had to stay reachable
+   rather than being quietly lost.
+2. **Whitespace-only rows count as blank.**
+3. **An all-blank document selects everything** — so `Ctrl+A` never visibly does nothing and Cut/Copy
+   stay live.
+4. **The selection includes the last content line's terminator**, both bytes of a CRLF, so copying an
+   ordinary newline-terminated file stays byte-identical to before. Only files with a *run* of trailing
+   blanks change at all.
+
+### Two design calls worth reading
+
+**The second-press state is derived, not stored.** One line — `if doc.anchor == 0 && doc.cursor == end
+{end = doc.pt.length}`. A stored `select_all_trimmed` flag would need clearing from every caret move,
+edit, `apply_snapshot`, reload, EOL conversion and tab switch: the same maintenance shape as
+`command_mutates_doc`, which this file records being patched three times for three separate misses.
+Deriving it makes the reset rule *"anything that changes the selection"* with no list to forget. Three
+consequences, each asserted rather than left implicit: a third press trims again (Ctrl+A toggles); a tab
+switch away and back does **not** reset, because the trim is still what is on screen; and undo extends,
+because `apply_snapshot` restores the trimmed selection.
+
+**The backward scan is capped at 1 MiB** (`SELECT_ALL_TRIM_CAP`, matching `STATUS_COL_CAP`). An
+unbounded scan on the input thread is §4's Shape A, which this codebase has produced eight times, and a
+multi-GB log with a huge blank tail would have frozen `Ctrl+A` with no way to tell it had been
+truncated. `exact = false` means the cap ran out, and the fallback is today's `pt.length`. Reaching
+offset 0 is a *real* answer, so decision 3's whole-buffer result is a finding rather than a fallback.
+Measured: a 16 MB blank tail costs 2.522 ms against a 1 MB tail's 2.506 ms — and that comparison is the
+assertion, rather than a fixed threshold that would drift with the machine.
+
+### What this found on the way
+
+**`doc_sort_lines` IS selection-scoped**, correcting the investigation's own "not affected" list. So
+`Ctrl+A` then Sort changed behaviour: `"b\na\n\n\n"` now sorts to `"a\nb\n\n\n"` where it previously
+gave `"\n\na\nb\n"` with the blank rows floating to the top. An improvement, and now pinned by a test
+rather than left to be rediscovered.
+
+**A sabotage that looked like the fix holding.** One formulation put a bare `return` above live code;
+Odin rejected it, `build.bat` failed, and the *stale* exe ran and printed `0 failures`. Echoing the
+build's exit code is what caught it. Worth knowing generally: **a sabotage that fails to compile is
+indistinguishable from a sabotage that fails to break anything**, unless the build status is checked.
+
+Base tests 204 → **211**; `selalltest` is one-argument, exits non-zero, and is in §7 and
+development-loop §6.
+
+### Owed
+
+- **No live GUI pass.** Press `Ctrl+A` twice on a real blank-tailed file and confirm the first trims and
+  the second takes everything.
+- The 1 MiB cap is judgement matched to an existing constant, not a measurement of what users have.
+- Wrapped documents are not covered by the selection-rect and scroll assertions.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
