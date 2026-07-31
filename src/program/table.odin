@@ -16,9 +16,57 @@ import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
 
+// --- §10's column-width rule, reconciled with what this file already did ----
+//
+// §10: "measure the first 200 rows, clamp each column to 8-40 characters,
+// distribute leftover width proportionally." Three numbers, and the code
+// disagreed with the spec on all three. Settled deliberately, and recorded here
+// so the next audit does not "fix" the surviving divergence back:
+//
+//   sample    §10 says 200, this says 500 -- KEPT AT 500. §10's 200 is a budget,
+//             not a result: it is there to bound the work, and 500 bounded rows
+//             is the same bounded cost for strictly better information about a
+//             file whose first 200 rows happen to be short. Nothing about the
+//             rule changes at 500; only the sample's confidence does.
+//   min       §10 says 8, this said 3 -- MOVED TO 8, and this is the one that
+//             actually showed. A 3-cell column cannot hold its own header, so
+//             every short column drew a truncated heading over data that fit.
+//   leftover  §10 says distribute proportionally, this did not do it at all --
+//             IMPLEMENTED, in table_cols_layout (see there for why it belongs in
+//             the layout and not in the sample).
+//
+// NOT shared with markdown's md_table_fit_cells, and that is a considered answer
+// to "two implementations of one rule is the shape this project keeps getting
+// bitten by" rather than an oversight. The two surfaces want opposite things
+// from the same sentence. md_table_fit_cells SHRINKS natural widths into a fixed
+// measure and, under real pressure, drops columns -- correct for the markdown
+// preview, which has no horizontal scroll and would otherwise paint a table over
+// the scrollbar. The grid does have horizontal scroll (doc.table_col,
+// table_start_col, the h-scrollbar), so a column too wide for the window is
+// reached by scrolling, never by compression: shrinking a 40-cell column to 4
+// because a CSV has thirty of them would make the data unreadable and the
+// h-scrollbar pointless, and dropping one outright is the same instinct §10
+// forbids for malformed rows. What the grid needs from that sentence is the
+// EXPANSION case -- the one md_table_fit_cells returns early on ("if the clamped
+// widths plus the gutters already fit, use them"). They are also mechanically
+// incompatible: md_table_fit_cells is bounded to MD_TABLE_MAX_COLS (32) fixed
+// arrays where a CSV routinely has more, its MD_TABLE_PAD is two cells of gap
+// BETWEEN columns where the grid's padding is inside each cell in pixels, and
+// its soft floor is 4 rather than §10's 8. Recorded in the HANDOFF entry too,
+// not only here.
 TABLE_COL_MAX :: 40 // widest a column grows to (cells); longer fields truncate
-TABLE_COL_MIN :: 3
-TABLE_SAMPLE :: 500 // rows scanned once to fix the column widths
+TABLE_COL_MIN :: 8 // §10's floor: narrower than this and a column loses its header
+TABLE_SAMPLE :: 500 // rows scanned once to fix the column widths (§10 budgets 200)
+
+// Which edge a column's cells are drawn against. §10: "Numeric and date columns
+// right-align. Right-aligned numbers with tnum is the difference between a table
+// and a text dump." Set once by table_compute_widths from the same bounded
+// sample the widths come from, and carried on Table_Col so the draw and the link
+// layout read it from the geometry rather than looking it up separately.
+Table_Align :: enum u8 {
+	Left,
+	Right,
+}
 
 // An empty cell reads as broken parsing (UI spec §10: "in the screenshot the
 // blank first column reads as broken parsing; a dash says 'empty, and we know
@@ -264,11 +312,19 @@ table_header_fields :: proc(doc: ^Document, allocator := context.temp_allocator)
 
 // A visible column's cell rectangle. `x` is the LEFT EDGE of the cell (the band
 // the zebra and the edit highlight fill), `w` its full width including both
-// paddings; the text inside starts at x + TABLE_CELL_PAD_X and is clipped to
-// colw[c] cells.
+// paddings; the text inside starts at table_cell_text_x and is clipped to
+// `cells`.
 Table_Col :: struct {
-	c:    int, // column index into doc.table_widths
-	x, w: f32,
+	c:     int, // column index into doc.table_widths
+	x, w:  f32,
+	// The width the cell is LAID OUT at, in cells -- the sampled width plus this
+	// column's share of any leftover (§10's proportional distribution). It is
+	// what the text is truncated to, and it is carried here rather than read back
+	// out of doc.table_widths by each consumer: `w` and this are two views of one
+	// number, and a consumer truncating to the SAMPLED width inside a WIDENED
+	// rectangle would leave a gap it had no reason to leave.
+	cells: int,
+	align: Table_Align,
 }
 
 // Right edge of the grid: the window minus the vertical scrollbar.
@@ -310,29 +366,116 @@ table_cols_layout :: proc(doc: ^Document, char_w, width: f32, start_col: int, al
 	colw := doc.table_widths
 	if len(colw) == 0 {return out[:]}
 	right := table_right(width)
+	extra := table_leftover_cells(doc, char_w, width, allocator)
 	x := table_gutter_w()
 	for c := clamp(start_col, 0, max(0, len(colw) - 1)); c < len(colw); c += 1 {
 		if x >= right {break}
-		w := f32(colw[c]) * char_w + TABLE_CELL_PAD_X * 2
-		append(&out, Table_Col{c = c, x = x, w = w})
+		cells := colw[c] + (extra[c] if c < len(extra) else 0)
+		w := f32(cells) * char_w + TABLE_CELL_PAD_X * 2
+		al := doc.table_align[c] if c < len(doc.table_align) else Table_Align.Left
+		append(&out, Table_Col{c = c, x = x, w = w, cells = cells, align = al})
 		x += w
 	}
 	return out[:]
 }
 
-// Left x of a cell's TEXT, and the width available to it. Split out so the draw,
-// the link layout and the edit box cannot each apply the padding differently.
+// §10's "distribute leftover width proportionally", as extra CELLS per column.
+//
+// In the LAYOUT rather than in table_compute_widths, and that placement is the
+// whole of the design. The leftover depends on the window width, and
+// table_compute_widths runs when the grid opens and after an edit -- never on a
+// resize -- so a distribution baked into the sample would be stale from the
+// first drag of the window's edge, silently, with no route to notice. Computed
+// here it is correct on every frame by construction and costs one pass over the
+// column list.
+//
+// Applies ONLY when every column already fits. There is no leftover otherwise,
+// and the grid answers overflow by scrolling horizontally rather than by
+// shrinking (see the reconciliation note at TABLE_COL_MIN for why the grid must
+// not borrow md_table_fit_cells' compression). `start_col` is deliberately not a
+// parameter: the leftover belongs to the table, not to whatever part of it
+// happens to be scrolled into view, so a column keeps the same width whether or
+// not it is the first one on screen.
+//
+// Proportional to each column's own sampled width, with the integer remainder
+// handed out one cell at a time from the left so the widened columns sum to the
+// leftover EXACTLY -- md_table_fit_cells does the same for the same reason, and
+// the shape is worth mirroring even though the direction is opposite: rounding
+// drift left over at the right edge is a ragged column boundary that moves with
+// the window width.
+@(private = "file")
+table_leftover_cells :: proc(doc: ^Document, char_w, width: f32, allocator := context.temp_allocator) -> []int {
+	colw := doc.table_widths
+	out := make([]int, len(colw), allocator)
+	if len(colw) == 0 || char_w <= 0 {return out}
+	avail := table_right(width) - table_gutter_w()
+	total, sum := f32(0), 0
+	for w in colw {
+		total += f32(w) * char_w + TABLE_CELL_PAD_X * 2
+		sum += w
+	}
+	if total >= avail || sum <= 0 {return out}
+	leftover := int((avail - total) / char_w)
+	if leftover <= 0 {return out}
+	given := 0
+	for w, i in colw {
+		out[i] = leftover * w / sum
+		given += out[i]
+	}
+	for i := 0; given < leftover; i = (i + 1) %% len(out) {
+		out[i] += 1
+		given += 1
+	}
+	return out
+}
+
+// Left x of a cell's TEXT -- the LEFT inner edge, whatever the column's
+// alignment. Split out so the draw, the link layout and the edit box cannot each
+// apply the padding differently.
 table_cell_text_x :: #force_inline proc(col: Table_Col) -> f32 {return col.x + TABLE_CELL_PAD_X}
 
-// Compute the per-column widths from the first TABLE_SAMPLE rows (bounded), so
-// they stay fixed as the user scrolls. Recomputed when the view opens and after
-// an edit; cheap relative to a frame.
+// How far right a string of `cells` columns is nudged inside its cell by the
+// column's alignment (§10: "Numeric and date columns right-align").
+//
+// A NUDGE added to table_cell_text_x rather than a second x producer, and it is
+// zero for a left-aligned column -- so every consumer adds it unconditionally,
+// a left column is laid out exactly as it was before this existed, and there is
+// still only one procedure that decides where a cell's left inner edge is.
+//
+// Clamped at zero, which is what keeps TRUNCATION LEFT-ANCHORED. A field wider
+// than its column is cut from the RIGHT by the draw and then measures exactly
+// col.cells, so the nudge collapses to zero and the surviving text starts at the
+// left inner edge. Cutting a right-aligned number from the LEFT instead would
+// not shorten a label, it would change the value -- 10432 becoming 432 -- and no
+// ellipsis can rescue that.
+table_cell_align_dx :: #force_inline proc(col: Table_Col, cells: int, char_w: f32) -> f32 {
+	if col.align != .Right {return 0}
+	return max(0, col.w - TABLE_CELL_PAD_X * 2 - f32(cells) * char_w)
+}
+
+// Compute the per-column widths AND alignments from the first TABLE_SAMPLE rows
+// (bounded), so they stay fixed as the user scrolls. Recomputed when the view
+// opens and after an edit; cheap relative to a frame.
+//
+// One pass produces both, because they are answers about the same sampled cells
+// and two passes would be two chances to sample different rows.
 table_compute_widths :: proc(doc: ^Document, text: ^plat.Text) {
 	clear(&doc.table_widths)
+	clear(&doc.table_align)
 	delim := doc.table_delim if doc.table_delim != 0 else ','
+	// Per-column evidence for the type decision, grown alongside the widths.
+	// `nonempty` is what stops a vacuous all-true: a column whose sampled cells
+	// are ALL empty satisfies "every non-empty cell is a number" trivially, and
+	// calling it numeric on that basis is development-loop.md §4 Shape A wearing
+	// a different hat -- a bounded scan that saw no evidence reporting a
+	// confident answer. Empty cells alone do not disqualify a column, though: a
+	// sparse numeric column is still a numeric column.
+	nonempty := make([dynamic]int, 0, 16, context.temp_allocator)
+	num_all := make([dynamic]bool, 0, 16, context.temp_allocator)
+	date_all := make([dynamic]bool, 0, 16, context.temp_allocator)
 	buf: [RENDER_LINE_CAP]u8
 	p := 0
-	for _ in 0 ..< TABLE_SAMPLE {
+	for row in 0 ..< TABLE_SAMPLE {
 		if p > doc.pt.length {break}
 		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
 		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
@@ -345,13 +488,120 @@ table_compute_widths :: proc(doc: ^Document, text: ^plat.Text) {
 			// spec left open, settled this way because it is the only one where
 			// the measured width and the drawn width are the same number.
 			w := plat.text_cells(text, transmute([]u8)f, 0, .Doc)
-			for c >= len(doc.table_widths) {append(&doc.table_widths, 0)}
+			for c >= len(doc.table_widths) {
+				append(&doc.table_widths, 0)
+				append(&nonempty, 0)
+				append(&num_all, true)
+				append(&date_all, true)
+			}
 			if w > doc.table_widths[c] {doc.table_widths[c] = w}
+			// Row 0 is the HEADER. It counts toward the width -- a column has to
+			// be able to show its own name -- and not toward the type, or every
+			// numeric column in every CSV ever written would be disqualified by
+			// the word above it.
+			if row == 0 {continue}
+			t := strings.trim_space(f)
+			if len(t) == 0 {continue}
+			nonempty[c] += 1
+			if !table_is_number(t) {num_all[c] = false}
+			if !table_is_date(t) {date_all[c] = false}
 		}
 		if end >= doc.pt.length {break}
 		p = end + 1
 	}
 	for &w in doc.table_widths {w = clamp(w, TABLE_COL_MIN, TABLE_COL_MAX)}
+	// Same length as the widths, always: table_cols_layout indexes both by column
+	// and a short align array would silently left-align the tail.
+	for c in 0 ..< len(doc.table_widths) {
+		right := c < len(nonempty) && nonempty[c] > 0 && (num_all[c] || date_all[c])
+		append(&doc.table_align, Table_Align.Right if right else Table_Align.Left)
+	}
+}
+
+// Does this cell hold a number? Deliberately narrow, because the cost of a false
+// positive is a whole column of prose shoved to the right: an optional sign,
+// digits with optional ',' group separators in the integer part only, an
+// optional fraction, and an optional exponent. No currency symbols, no trailing
+// '%', no unit suffixes -- each of those is a column that is only sometimes a
+// number, and §10 asks for the columns that always are.
+table_is_number :: proc(s: string) -> bool {
+	if len(s) == 0 {return false}
+	i := 0
+	if s[i] == '+' || s[i] == '-' {i += 1}
+	digits, frac_digits, exp_digits := 0, 0, 0
+	dot, exp := false, false
+	for ; i < len(s); i += 1 {
+		c := s[i]
+		switch {
+		case c >= '0' && c <= '9':
+			if exp {exp_digits += 1} else if dot {frac_digits += 1} else {digits += 1}
+		case c == ',':
+			// A group separator, and only where one can appear: never after the
+			// decimal point, never inside an exponent, never leading.
+			if dot || exp || digits == 0 {return false}
+		case c == '.':
+			if dot || exp {return false}
+			dot = true
+		case c == 'e' || c == 'E':
+			if exp || (digits == 0 && frac_digits == 0) {return false}
+			exp = true
+			if i + 1 < len(s) && (s[i + 1] == '+' || s[i + 1] == '-') {i += 1}
+		case:
+			return false
+		}
+	}
+	if exp && exp_digits == 0 {return false}
+	return digits + frac_digits > 0
+}
+
+// Does this cell hold a date? Shape only -- 2026-13-45 passes, and that is the
+// right trade: this decides an ALIGNMENT, not a validation, and a column of
+// dates with one impossible day in it is still a column of dates. Calendar
+// validation would reject real data (some exports write 0000-00-00 for "no
+// date") and buy nothing the reader can see.
+//
+// An optional time tail is accepted after 'T' or a space so an ISO timestamp
+// column right-aligns with a plain date column; the tail is only checked for
+// looking like a clock, since the head has already proved the field is a date.
+table_is_date :: proc(s: string) -> bool {
+	MASKS :: [?]string{"dddd-dd-dd", "dddd/dd/dd", "dd/dd/dddd", "dd-dd-dddd", "dd.dd.dddd"}
+	head, tail := s, ""
+	// `sep` is tracked separately from `len(tail)`, because the two are different
+	// states and conflating them said yes to "2026-01-01T" -- a separator with
+	// nothing after it, which is a truncated field, not a timestamp.
+	sep := false
+	if i := strings.index_any(s, "T "); i >= 0 {
+		head, tail, sep = s[:i], s[i + 1:], true
+	}
+	matched := false
+	for m in MASKS {
+		if len(head) != len(m) {continue}
+		good := true
+		for k in 0 ..< len(m) {
+			if m[k] == 'd' {
+				if head[k] < '0' || head[k] > '9' {good = false;break}
+			} else if head[k] != m[k] {
+				good = false
+				break
+			}
+		}
+		if good {matched = true;break}
+	}
+	if !matched {return false}
+	if !sep {return true}
+	if len(tail) == 0 {return false}
+	colons := 0
+	for k in 0 ..< len(tail) {
+		c := tail[k]
+		switch {
+		case c == ':':
+			colons += 1
+		case c >= '0' && c <= '9', c == '.', c == '+', c == '-', c == 'Z', c == 'z':
+		case:
+			return false
+		}
+	}
+	return colons > 0
 }
 
 // Pick the delimiter when the table view is turned on: tab for .tsv, else
@@ -457,10 +707,23 @@ table_links :: proc(doc: ^Document, text: ^plat.Text, px, char_w: f32, rows: int
 		fields := csv_fields(string(buf[:n]), delim, allocator)
 		ry := table_row_baseline_y(px, r)
 		for col in cols {
-			tx := table_cell_text_x(col)
-			cellright := min(tx + f32(doc.table_widths[col.c]) * char_w, right)
 			if col.c >= len(fields) {continue}
 			field := strings.clone(fields[col.c], allocator)
+			// Both the cell's clip edge and the underline's origin come from
+			// col.cells, the width the LAYOUT gave this column -- not from
+			// doc.table_widths[col.c], which is the pre-distribution sample and is
+			// narrower whenever §10's leftover has been handed out. Reading the
+			// sample here would have left every link in a widened column clipped
+			// short of where the draw actually put its glyphs.
+			//
+			// ...and the same alignment nudge the draw applies, so an underline in
+			// a right-aligned column sits under its text rather than beside it.
+			// Measured on the FULL field for both, which is what the draw draws
+			// when the field fits; a field that does not fit is truncated by the
+			// draw and the nudge collapses to zero for it either way.
+			fcells := plat.text_cells(text, transmute([]u8)field, 0, .Doc)
+			tx := table_cell_text_x(col) + table_cell_align_dx(col, fcells, char_w)
+			cellright := min(table_cell_text_x(col) + f32(col.cells) * char_w, right)
 			for l in links_scan(field, allocator) {
 				// col0 = 0: `field` is the fragment, and `lcol` is used as an
 				// offset from the field's own text x just below.
@@ -640,7 +903,6 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	fg := g_theme[.Text_Primary]
 	dim := g_theme[.Text_Muted] // TABLE_EMPTY_CELL's comment records why not Text_Dim
 	for col in cols {
-		tx := table_cell_text_x(col)
 		for row, r in vis {
 			// A field this row does not have is MISSING, not empty -- a malformed
 			// row, which §10 marks with a warning bar on the row's left edge
@@ -649,18 +911,27 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			if col.c >= len(row.fields) {continue}
 			field := row.fields[col.c]
 			colour := fg
+			// Measured after any truncation, never before: the alignment nudge
+			// below is computed from what is actually DRAWN. Truncating first is
+			// also what keeps the cut LEFT-anchored in a right-aligned column --
+			// see table_cell_align_dx.
+			cells := 0
 			if len(field) == 0 {
 				field, colour = TABLE_EMPTY_CELL, dim
+				cells = plat.text_cells(text, transmute([]u8)field, 0, .Doc)
 			} else {
 				fb := transmute([]u8)field
 				// Both col0 = 0, and they must match each other: this is the
 				// measure/inverse pair for the same field, and a tab inside it
 				// would be cut at the wrong byte if the two disagreed.
-				if plat.text_cells(text, fb, 0, .Doc) > colw[col.c] { // truncate an over-wide field
-					cut := plat.text_bytes_for_cells(text, fb, colw[col.c], 0, .Doc)
+				cells = plat.text_cells(text, fb, 0, .Doc)
+				if cells > col.cells { // truncate an over-wide field
+					cut := plat.text_bytes_for_cells(text, fb, col.cells, 0, .Doc)
 					field = field[:cut]
+					cells = col.cells
 				}
 			}
+			tx := table_cell_text_x(col) + table_cell_align_dx(col, cells, char_w)
 			plat.text_draw(gfx, text, field, tx, table_row_baseline_y(px, r), px, colour, .Doc)
 		}
 	}
@@ -675,6 +946,12 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 				if col.c != ec {continue}
 				box := g_theme[.Selection_List]
 				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {col.x, table_row_rect_y(px, er)}, size = {min(col.w, right - col.x), row_h}, color = box}})
+				// LEFT-aligned even in a right-aligned column, and no
+				// table_cell_align_dx here on purpose: this is an input field, not
+				// a value. Right-aligning it would walk the whole buffer -- and the
+				// caret with it -- one cell left on every keystroke, which is the
+				// worst place in the grid to put motion. The committed value takes
+				// the column's alignment on the next frame.
 				tx := table_cell_text_x(col)
 				val := string(doc.table_edit_buf[:])
 				plat.text_draw(gfx, text, val, tx, table_row_baseline_y(px, er), px, g_theme[.Text_Bright], .Doc)
@@ -715,14 +992,20 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			field := head[col.c]
 			if len(field) == 0 {continue} // a nameless column: leave it blank, don't dash a header
 			fb := transmute([]u8)field
-			if plat.text_cells(text, fb, 0, .Doc) > colw[col.c] {
-				field = field[:plat.text_bytes_for_cells(text, fb, colw[col.c], 0, .Doc)]
+			hcells := plat.text_cells(text, fb, 0, .Doc)
+			if hcells > col.cells {
+				field = field[:plat.text_bytes_for_cells(text, fb, col.cells, 0, .Doc)]
+				hcells = col.cells
 			}
+			// The header takes its column's alignment, so a right-aligned numeric
+			// column reads as ONE column rather than as a left-aligned label with
+			// right-aligned numbers wandering away underneath it.
 			// Text_Bright, the role §1.1 gives to "active tab label, titles" --
 			// the header is now a real header (§10) and the previous draw made no
 			// distinction at all: both branches of its `hl` resolved to
 			// Text_Primary, so the "highlighted" header row was a no-op.
-			plat.text_draw(gfx, text, field, table_cell_text_x(col), hy, px, g_theme[.Text_Bright], .Doc)
+			hx := table_cell_text_x(col) + table_cell_align_dx(col, hcells, char_w)
+			plat.text_draw(gfx, text, field, hx, hy, px, g_theme[.Text_Bright], .Doc)
 		}
 	}
 	return

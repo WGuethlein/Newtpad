@@ -3831,14 +3831,23 @@ when NEWTPAD_TESTS {
 			fmt.println("--- tab width invalidates the cell caches ---")
 			{
 				// A literal tab in the MIDDLE of a field, so the measurement moves
-				// with the tab width: "a\tb" is 'a' + a tab from column 1 + 'b',
-				// which is 5 cells at width 4 and 9 at width 8. A LEADING tab
-				// would be one full width in both and could not tell them apart.
+				// with the tab width: "aaaaaaaaa\tb" is nine 'a's + a tab from
+				// column 9 + 'b', which is 13 cells at width 4 and 17 at width 8. A
+				// LEADING tab would be one full width in both and could not tell
+				// them apart.
+				//
+				// Nine 'a's rather than one, and that is not padding for its own
+				// sake: §10's floor moved TABLE_COL_MIN from 3 to 8 (see
+				// table.odin's reconciliation note), so the old "a\tb" fixture
+				// measured 5 at width 4 and was clamped straight up to 8. Both
+				// numbers have to sit ABOVE the floor or the width-4 reading is the
+				// clamp rather than the measurement, and the check would be
+				// asserting a constant.
 				cd := new(Document)
-				cd^ = doc_from_content(transmute([]u8)strings.clone("a\tb,c\nd,e\n"), "t.csv", .UTF8)
+				cd^ = doc_from_content(transmute([]u8)strings.clone("aaaaaaaaa\tb,c\nd,e\n"), "t.csv", .UTF8)
 				cd.table, cd.table_delim = true, ','
 				mdd := new(Document)
-				mdd^ = doc_from_content(transmute([]u8)strings.clone("| a\tb | c |\n|---|---|\n| d | e |\n"), "t.md", .UTF8)
+				mdd^ = doc_from_content(transmute([]u8)strings.clone("| aaaaaaaaa\tb | c |\n|---|---|\n| d | e |\n"), "t.md", .UTF8)
 				app_add(&az, cd)
 				app_add(&az, mdd)
 
@@ -3847,9 +3856,15 @@ when NEWTPAD_TESTS {
 				w4 := cd.table_widths[0] if len(cd.table_widths) > 0 else -1
 				m4 := -1
 				if c := md_table_ensure(mdd, &t2, 0); c != nil {m4 = c.widths[0]}
-				base4 := w4 == 5 && m4 == 5
-				fmt.printfln("  %-6s at width 4: grid col 0 = %d cells, md col 0 = %d (want 5, 5)", "ok" if base4 else "FAIL", w4, m4)
+				base4 := w4 == 13 && m4 == 13
+				fmt.printfln("  %-6s at width 4: grid col 0 = %d cells, md col 0 = %d (want 13, 13)", "ok" if base4 else "FAIL", w4, m4)
 				if !base4 {bad += 1}
+				// ...and the reading is a measurement, not TABLE_COL_MIN in
+				// disguise. Without this the pair above passes with every column
+				// pinned at the floor.
+				above := w4 > TABLE_COL_MIN
+				fmt.printfln("  %-6s ...and it is above TABLE_COL_MIN (%d > %d), so it is a measurement", "ok" if above else "FAIL", w4, TABLE_COL_MIN)
+				if !above {bad += 1}
 
 				for _ in 0 ..< 4 {settings_toggle_row(&rcz, 8, 1)} // 4 -> 8
 
@@ -3858,9 +3873,9 @@ when NEWTPAD_TESTS {
 				w8 := cd.table_widths[0] if len(cd.table_widths) > 0 else -1
 				m8 := -1
 				if c := md_table_ensure(mdd, &t2, 0); c != nil {m8 = c.widths[0]}
-				movd := w8 == 9 && m8 == 9
+				movd := w8 == 17 && m8 == 17
 				fmt.printfln(
-					"  %-6s at width 8: grid col 0 = %d cells, md col 0 = %d (want 9, 9; a stale cache reports 5)",
+					"  %-6s at width 8: grid col 0 = %d cells, md col 0 = %d (want 17, 17; a stale cache reports 13)",
 					"ok" if movd else "FAIL", w8, m8,
 				)
 				if !movd {bad += 1}
@@ -9761,12 +9776,22 @@ when NEWTPAD_TESTS {
 					}
 					chk(&bad, table_cell_text_x(cols[0]) >= gw, fmt.tprintf("the cell TEXT x -- the edit box's and the draw's -- is past it too (%.1f)", table_cell_text_x(cols[0])))
 					// The h-scrollbar's span comes from the same layout, so the
-					// gutter eats real column room and the span must reflect it.
-					// A window exactly one gutter wider fits exactly what the
-					// un-guttered one did, which is only true if both read the
-					// same origin.
-					narrow := table_cols_fitting(&doc, cw, gw + cols[0].w + 1, 0)
-					chk(&bad, narrow == 1, fmt.tprintf("the h-scrollbar's span counts columns from the gutter (%d fits in gutter+1 column, want 1)", narrow))
+					// gutter eats real column room and the span must reflect it,
+					// to the pixel. Probed at the exact boundary: a column is laid
+					// out when its x is strictly left of table_right, so column 1
+					// appears at one pixel past `gutter + column 0 + scrollbar`
+					// and not before. Both probes use the NATURAL width, at a
+					// window too narrow for §10's leftover distribution to run, so
+					// this measures the origin rather than the distribution.
+					nat0 := f32(doc.table_widths[0]) * cw + TABLE_CELL_PAD_X * 2
+					edge := gw + nat0 + SCROLLBAR_W
+					n1 := table_cols_fitting(&doc, cw, edge, 0)
+					n2 := table_cols_fitting(&doc, cw, edge + 1, 0)
+					chk(
+						&bad,
+						n1 == 1 && n2 == 2,
+						fmt.tprintf("the h-scrollbar's span counts columns from the gutter: %d fit at %.1fpx, %d at one pixel more (want 1, 2)", n1, edge, n2),
+					)
 				}
 				return
 			}
@@ -10677,8 +10702,186 @@ when NEWTPAD_TESTS {
 				return
 			}
 
+			// F7: §10's "numeric and date columns right-align", both halves --
+			// the CLASSIFICATION (which columns) and the GEOMETRY (where the
+			// glyphs land, and what truncation does to a right-aligned value).
+			//
+			// The vacuous case is first on purpose. "Every non-empty sampled cell
+			// parses as a number" is trivially true of a column with no non-empty
+			// cells at all, and a bounded sample that saw no evidence returning a
+			// confident answer is development-loop.md §4 Shape A exactly. It is
+			// also the case a happy-path test never reaches, so it goes at the top
+			// where it cannot be dropped for running long.
+			tg_align :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (alignment): no fonts loaded")
+					return 1
+				}
+				UI_SCALE = 1
+				BASE_PX = BASE_PX_96
+				TABLE_CELL_PAD_X, TABLE_GUTTER_W = TABLE_CELL_PAD_X_96, TABLE_GUTTER_W_96
+
+				// One fixture, one column per rule. The header row is deliberately
+				// all words: it must count toward the WIDTHS (a column has to show
+				// its own name) and not toward the TYPE, or no CSV ever written
+				// would have a numeric column.
+				src := strings.join(
+					[]string {
+						"num,sparse,when,stamp,mixed,blank,words,sci",
+						"1,10,2026-01-01,2026-01-01T09:30:00Z,3,,alpha,1.5e3",
+						"2,,2026-02-14,2026-02-14 23:00:01,x,,beta,-2E-4",
+						"-3.5,20,2026-03-31,2026-03-31T00:00:00,5,,gamma,7",
+					},
+					"\n",
+					context.temp_allocator,
+				)
+				content := make([]u8, len(src) + 1)
+				copy(content, transmute([]u8)src)
+				content[len(src)] = '\n'
+				d := doc_from_content(content, "align.csv", .UTF8)
+				defer doc_close(&d)
+				d.table, d.table_delim = true, ','
+				table_compute_widths(&d, &t)
+
+				Want :: struct {
+					c:     int,
+					align: Table_Align,
+					why:   string,
+				}
+				wants := []Want {
+					{0, .Right, "plain integers and a negative decimal"},
+					{1, .Right, "SPARSE numbers -- an empty cell does not disqualify"},
+					{2, .Right, "ISO dates"},
+					{3, .Right, "ISO timestamps, T- and space-separated"},
+					{4, .Left, "one non-numeric cell disqualifies the column"},
+					{5, .Left, "NO non-empty cell was sampled -- the vacuous all-true"},
+					{6, .Left, "words"},
+					{7, .Right, "exponent notation"},
+				}
+				chk(&bad, len(d.table_align) == len(d.table_widths), fmt.tprintf("one alignment per column (%d vs %d widths)", len(d.table_align), len(d.table_widths)))
+				for w in wants {
+					got := d.table_align[w.c] if w.c < len(d.table_align) else Table_Align.Left
+					chk(&bad, got == w.align, fmt.tprintf("column %d is %v -- %s (got %v)", w.c, w.align, w.why, got))
+				}
+
+				// The parsers themselves, where a comma is not a field separator.
+				Case :: struct {
+					s:   string,
+					num: bool,
+					dt:  bool,
+				}
+				cases := []Case {
+					{"1,234.50", true, false},
+					{"1,23,4", true, false}, // shape only: groups are not validated
+					{"+7", true, false},
+					{".5", true, false},
+					{"1.2.3", false, false},
+					{"1,234.5,6", false, false}, // a comma after the point
+					{"1e", false, false}, // an exponent with no digits
+					{"", false, false},
+					{"-", false, false},
+					{"12%", false, false}, // deliberately NOT a number
+					{"$12", false, false},
+					{"2026-01-01", false, true},
+					{"01/02/2026", false, true},
+					{"2026/01/02", false, true},
+					{"2026-01-01T10:00:00", false, true},
+					{"2026-01-01T", false, false}, // a tail with no clock in it
+					{"2026-1-1", false, false}, // not the mask's shape
+					{"2026-01-01 apples", false, false},
+				}
+				pbad := 0
+				for c in cases {
+					gn, gd := table_is_number(c.s), table_is_date(c.s)
+					if gn != c.num || gd != c.dt {
+						pbad += 1
+						fmt.printfln("    %q -> number=%v date=%v (want %v, %v)", c.s, gn, gd, c.num, c.dt)
+					}
+				}
+				chk(&bad, pbad == 0, fmt.tprintf("the number and date predicates agree on %d hand-written cases (%d wrong)", len(cases), pbad))
+
+				// The geometry. table_cell_align_dx is the one producer of the
+				// nudge, and the two properties that matter are that a LEFT column
+				// never moves and that TRUNCATION collapses the nudge to zero --
+				// which is what keeps a cut left-anchored, so 10432 shortens to
+				// 1043 and never to 0432.
+				px := BASE_PX_96
+				cw := plat.text_char_width(&t, px, .Doc)
+				cols := table_cols_layout(&d, cw, 1400, 0)
+				chk(&bad, len(cols) >= 8, fmt.tprintf("all 8 columns are laid out (%d)", len(cols)))
+				if len(cols) >= 8 {
+					lc, rc := cols[6], cols[0] // words (left), num (right)
+					chk(&bad, lc.align == .Left && rc.align == .Right, "the two probe columns are the ones expected")
+					chk(&bad, table_cell_align_dx(lc, 1, cw) == 0, "a left column never nudges")
+					chk(&bad, table_cell_align_dx(rc, 1, cw) > 0, fmt.tprintf("a short value in a right column does (%.1f)", table_cell_align_dx(rc, 1, cw)))
+					// A value exactly as wide as its cell, and one wider: both sit
+					// on the LEFT inner edge, which is where a truncated string has
+					// to start.
+					chk(&bad, table_cell_align_dx(rc, rc.cells, cw) == 0, "a value that fills its cell sits on the left inner edge")
+					chk(&bad, table_cell_align_dx(rc, rc.cells + 5, cw) == 0, "...and so does one too wide for it, so the cut stays left-anchored")
+					// The nudge is exactly the slack, so the value's right edge
+					// lands on the cell's right inner edge -- the thing §10 asks
+					// for, stated as the equation rather than as "greater than 0".
+					want_dx := rc.w - TABLE_CELL_PAD_X * 2 - 3 * cw
+					chk(&bad, table_cell_align_dx(rc, 3, cw) == want_dx, fmt.tprintf("a 3-cell value ends on the right inner edge (dx %.1f, want %.1f)", table_cell_align_dx(rc, 3, cw), want_dx))
+				}
+
+				// §10's "distribute leftover width proportionally" (3b). It lives
+				// in table_cols_layout rather than in the sample precisely so that
+				// it tracks the window, so both directions get probed: a window
+				// with room to spare must be FILLED, and one without must leave the
+				// sampled widths alone.
+				{
+					WIDE :: f32(2400)
+					wide := table_cols_layout(&d, cw, WIDE, 0)
+					avail := table_right(WIDE) - table_gutter_w()
+					total, shrunk, extra_of := f32(0), 0, make([]int, len(wide), context.temp_allocator)
+					for c, i in wide {
+						total += c.w
+						extra_of[i] = c.cells - d.table_widths[c.c]
+						if extra_of[i] < 0 {shrunk += 1}
+					}
+					chk(&bad, len(wide) == len(d.table_widths), fmt.tprintf("every column is on screen at %.0fpx (%d of %d)", WIDE, len(wide), len(d.table_widths)))
+					chk(&bad, shrunk == 0, fmt.tprintf("no column is ever SHRUNK -- the grid scrolls, it does not compress (%d were)", shrunk))
+					// Filled to within one cell: the integer remainder is handed
+					// out one cell at a time, so what is left over is less than a
+					// character, not a ragged strip on the right.
+					gap := avail - total
+					chk(&bad, gap >= 0 && gap < cw, fmt.tprintf("the leftover is distributed to within one cell (%.1fpx of %.1fpx spare, cell %.1f)", gap, avail, cw))
+					// Proportional, not equal: the widest sampled column takes more
+					// of the leftover than the narrowest. An even split would give
+					// them the same number and pass every check above.
+					wi, ni := 0, 0
+					for c, i in wide {
+						if d.table_widths[c.c] > d.table_widths[wide[wi].c] {wi = i}
+						if d.table_widths[c.c] < d.table_widths[wide[ni].c] {ni = i}
+					}
+					chk(
+						&bad,
+						d.table_widths[wide[wi].c] > d.table_widths[wide[ni].c],
+						fmt.tprintf("precondition -- the fixture has columns of different widths (%d vs %d)", d.table_widths[wide[wi].c], d.table_widths[wide[ni].c]),
+					)
+					chk(
+						&bad,
+						extra_of[wi] > extra_of[ni],
+						fmt.tprintf("the leftover goes out PROPORTIONALLY, not evenly (widest gained %d cells, narrowest %d)", extra_of[wi], extra_of[ni]),
+					)
+					// And a window with nothing spare leaves the sample untouched.
+					NARROW := table_gutter_w() + SCROLLBAR_W + 60
+					narrow := table_cols_layout(&d, cw, NARROW, 0)
+					chk(&bad, len(narrow) > 0 && narrow[0].cells == d.table_widths[0], fmt.tprintf("a full window distributes nothing (col 0 laid out at %d cells, sampled %d)", narrow[0].cells if len(narrow) > 0 else -1, d.table_widths[0]))
+				}
+				return
+			}
+
 			bad := tg_abs_cost()
 			bad += tg_gutter_pixels()
+			bad += tg_align()
 			bad += tg()
 			bad += tg_page()
 			bad += tg_edit_anchor()

@@ -1087,6 +1087,11 @@ Document :: struct {
 	table_widths: [dynamic]int, // per-column cell widths, computed once from a
 	// sample when the view opens — so columns don't shift as different rows scroll
 	// into view.
+	// Per-column alignment (UI spec §10: numeric and date columns right-align),
+	// decided from the SAME sample pass as the widths. Always the same length as
+	// table_widths — table_compute_widths writes both and nothing else appends to
+	// either, which is what lets table_cols_layout index them together.
+	table_align:  [dynamic]Table_Align,
 	// In-cell editing (table view). While editing, keystrokes go to table_edit_buf,
 	// not the document; on commit the source field range [s,e) is replaced.
 	table_editing:     bool,
@@ -1495,6 +1500,7 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.filter_lines)
 	delete(doc.filter_line_nos)
 	delete(doc.table_widths)
+	delete(doc.table_align)
 	delete(doc.table_edit_buf)
 	delete(doc.table_edit_snap)
 	// The markdown preview's per-block layout cache owns heap storage (a source
