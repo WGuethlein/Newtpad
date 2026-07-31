@@ -699,7 +699,7 @@ main :: proc() {
 		// (so the wheel still scrolls, and the bars still drag). After the scrollbars,
 		// so a press on either bar reaches it first.
 		if doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) {
-			drags := Drag_Latches{scrollbar_drag, hscrollbar_drag, md_preview_drag, divider_drag}
+			drags := Drag_Latches{scrollbar_drag, hscrollbar_drag, md_preview_drag, divider_drag, table_resize_col >= 0}
 			ro := ro_surface_swallows(doc.table, doc.md_mode, f32(window.mouse_x) >= ed_right, drags)
 			// 9.1's one surviving pixel -> content mapping, wired to the gesture it
 			// exists for: "click-to-sync-scroll, which only needs the nearest
@@ -1309,7 +1309,7 @@ hscrollbar_geo :: proc(doc: ^Document, winw, winh: f32, m: Hscroll) -> (b: Hbar)
 // exclude all of them, and this struct exists so the list is one thing that can
 // be tested rather than four `&&` clauses nobody re-reads.
 Drag_Latches :: struct {
-	vscroll, hscroll, preview, divider: bool,
+	vscroll, hscroll, preview, divider, col_resize: bool,
 }
 
 // Should a read-only surface swallow this mouse event?
@@ -1328,8 +1328,15 @@ Drag_Latches :: struct {
 // and drag" (Wyatt, live use, v0.17.1). It went unnoticed because the bar was
 // dead in the grid until the fix immediately before it, and because in the
 // plain text view `ro` is false so nothing is swallowed at all.
+//
+// `col_resize` (§10's drag-a-header-edge, 2026-07-31) is the fifth, and it was
+// written without this list at first — the column moved on the press frame and
+// then froze, the identical symptom, in the identical surface. The struct did
+// its job: the bug was found by reading this comment, which is the argument for
+// keeping the incident attached to the rule. The count is now pinned by an
+// assertion in hscrolltest so a SIXTH latch cannot be added silently.
 ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool, d: Drag_Latches) -> bool {
-	if d.vscroll || d.hscroll || d.preview || d.divider {return false}
+	if d.vscroll || d.hscroll || d.preview || d.divider || d.col_resize {return false}
 	return table || md_mode == .Preview || (md_mode == .Split && in_preview_half)
 }
 

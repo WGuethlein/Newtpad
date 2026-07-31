@@ -17274,8 +17274,15 @@ when NEWTPAD_TESTS {
 					{hscroll = true},
 					{preview = true},
 					{divider = true},
+					{col_resize = true},
 				}
-				names := []string{"vscroll", "hscroll", "preview", "divider"}
+				names := []string{"vscroll", "hscroll", "preview", "divider", "col_resize"}
+				// The list above is written by hand, so a latch added to the
+				// struct and not to it would go untested -- which is how `hscroll`
+				// went missing from the predicate itself. Every field is a bool, so
+				// the struct's size IS its field count: a sixth latch fails to
+				// compile here until it is enumerated above.
+				#assert(size_of(Drag_Latches) == 5)
 				for d, i in all {
 					// Grid: every latch must veto the swallow.
 					if ro_surface_swallows(true, .Off, false, d) {
