@@ -923,6 +923,34 @@ visible_next :: proc(it: ^Visible_Iter) -> (row, start, end, vis_end: int, line_
 	return
 }
 
+// Bytes between line-offset checkpoints, and the index worker's scan step.
+//
+// A BYTE stride, not the line stride the batch-18 plan sketched, and the swap is
+// the whole reason the lookup below can promise anything. A checkpoint every N
+// LINES bounds the lookup's scan in lines, which is not the unit the scan costs
+// anything in: 4096 lines of a 100-byte-per-row CSV is 400 KB of byte scanning
+// per call, and the first caller (the table view's row-number gutter) wants one
+// call per visible row. A byte stride bounds the thing that is actually spent.
+//
+// It also makes the checkpoint array's size known before the scan starts --
+// exactly len(content)/LINE_CKPT_STRIDE + 1 entries -- so it is allocated once on
+// the main thread and never grows. That is what keeps the publish race trivial:
+// a [dynamic] appended by the worker would reallocate and free the backing store
+// under a reader mid-lookup, which no amount of ordering the COUNT fixes.
+//
+// Equal to the worker's scan chunk so a checkpoint costs no extra scanning: the
+// worker already knows its running line total at each chunk boundary.
+LINE_CKPT_STRIDE :: 64 * 1024
+
+// One sparse offset->line checkpoint. `offset` is always k*LINE_CKPT_STRIDE for
+// entry k -- deliberately NOT a line start, which is what bounds the scan: a
+// checkpoint that had to land on a line start could not be placed at all inside a
+// single 500 MB line, and the lookup would fall back to walking from byte 0.
+Line_Ckpt :: struct {
+	offset:  int, // byte offset in `content` this checkpoint describes
+	line_no: int, // 0-based line number containing `offset` (= newlines before it)
+}
+
 // Background job that counts total lines over the immutable original bytes (no
 // race with edits, which only touch the add arena). The status bar shows this
 // plus nl_delta (net newlines from edits). Published via atomics.
@@ -936,6 +964,30 @@ Line_Index :: struct {
 	fault:      bool, // atomic: a read faulted (mapped file changed underneath)
 	guard:      bool, // scan through the SEH guard (content is mapped, not private)
 	th:         ^thread.Thread,
+
+	// Sparse offset->line checkpoints over `content`, for doc_line_no_at.
+	//
+	// Sized and allocated by doc_index_start BEFORE the worker exists, and never
+	// resized while it runs, so the base pointer is stable for the whole scan and
+	// a reader can index it without a lock. The worker owns entries [0, ckpt_n)
+	// exclusively while it writes them and publishes each one by storing the new
+	// count -- see index_worker for why that order is the correct one.
+	ckpts:      []Line_Ckpt,
+	ckpt_n:     int, // atomic: entries fully written; a reader must not look past this
+
+	// Lowest DOCUMENT offset any edit has touched since this index was built,
+	// max(int) for an untouched buffer. Main thread only (every writer and the
+	// only reader are on it), so no atomic.
+	//
+	// The index scans `original`; edits live in the add arena. Below this offset
+	// document bytes and original bytes are still the same bytes, so a line number
+	// derived from the index is exact; at or above it the two have diverged and
+	// doc_line_no_at refuses rather than answering off stale offsets. A floor
+	// rather than a plain "has been edited" bit because the case that matters --
+	// a log growing at its tail, or a table cell edited on screen -- moves only
+	// the end of the buffer, and blanking every row number for it would be a
+	// self-inflicted regression.
+	edit_floor: int,
 }
 
 // What produced an edit. Used to decide whether the next one continues it (so a
@@ -1263,6 +1315,7 @@ Find :: struct {
 doc_new :: proc() -> (doc: Document) {
 	doc.enc = .UTF8
 	doc.pt = base.pt_init(nil)
+	doc.idx.edit_floor = max(int)
 	return
 }
 
@@ -1329,6 +1382,9 @@ doc_open :: proc(path: string, force_enc: Maybe(base.Encoding) = nil) -> (doc: D
 
 	doc.idx.content = doc.original
 	doc.idx.total = len(doc.original)
+	// Nothing has been edited yet, so every document offset is an original offset.
+	// Set at construction rather than at doc_index_start: see that procedure.
+	doc.idx.edit_floor = max(int)
 	// Guard the scan only when content aliases the mapping (UTF-8, no transcode);
 	// a transcoded or copied original is private memory and can't fault.
 	doc.idx.guard = doc.fv.mapped && !doc.owned_orig
@@ -1352,6 +1408,9 @@ doc_from_content :: proc(content: []u8, path: string, enc: base.Encoding) -> (do
 	doc.modified = true
 	doc.idx.content = content
 	doc.idx.total = len(content)
+	// `modified` is about disk, not about this index: the restored bytes ARE the
+	// buffer, so line numbers over them are exact until the next edit.
+	doc.idx.edit_floor = max(int)
 	return
 }
 
@@ -1365,7 +1424,36 @@ doc_index_stop :: proc(doc: ^Document) {
 	doc.idx.th = nil
 }
 
+// Start, or restart, the background line index over whatever doc.idx.content
+// currently points at. The caller sets content/total/guard first; everything
+// else about the index's state is this procedure's job.
+//
+// The reset used to be copy-pasted at each restart site, and doc_set_line_ending
+// simply didn't have it -- so a rewrite of the line endings restarted the worker
+// with `done` still true from the previous run, and doc_line_count added nl_delta
+// to a count that was mid-rebuild. Centralising it also means the one thing that
+// MUST be re-done on every restart and is easy to miss -- resizing the checkpoint
+// array to the new content -- cannot be missed: a reused Document would otherwise
+// answer doc_line_no_at from the previous file's offsets.
 doc_index_start :: proc(doc: ^Document) {
+	doc_index_stop(doc) // no-op when there is no worker; never leave one on old content
+	delete(doc.idx.ckpts)
+	// Exactly the number of stride boundaries in `content`, so the worker never
+	// grows or moves this. +1 covers the boundary at offset 0 of an empty file.
+	doc.idx.ckpts = make([]Line_Ckpt, len(doc.idx.content) / LINE_CKPT_STRIDE + 1)
+	intrinsics.atomic_store(&doc.idx.ckpt_n, 0)
+	intrinsics.atomic_store(&doc.idx.line_count, 0)
+	intrinsics.atomic_store(&doc.idx.indexed, 0)
+	intrinsics.atomic_store(&doc.idx.done, false)
+	intrinsics.atomic_store(&doc.idx.fault, false)
+	intrinsics.atomic_store(&doc.idx.cancel, false)
+	// edit_floor is deliberately NOT reset here. A restart re-scans the same
+	// original bytes; it does not undo the edits that made the buffer differ from
+	// them. Resetting it would have made doc_set_line_ending -- which rewrites
+	// every line terminator and then re-indexes the UNCONVERTED original -- claim
+	// exact line numbers off offsets that are wrong by one byte per preceding
+	// line. The floor is established where a document is CONSTRUCTED and only ever
+	// falls from there.
 	doc.idx.th = thread.create_and_start_with_data(&doc.idx, index_worker)
 }
 
@@ -1374,7 +1462,12 @@ doc_close :: proc(doc: ^Document) {
 		intrinsics.atomic_store(&doc.idx.cancel, true)
 		thread.join(doc.idx.th)
 		thread.destroy(doc.idx.th)
+		doc.idx.th = nil
 	}
+	// After the join, never before: the worker writes into this array.
+	delete(doc.idx.ckpts)
+	doc.idx.ckpts = nil // same freed-but-live header hazard as lex_idx below
+	intrinsics.atomic_store(&doc.idx.ckpt_n, 0)
 	lex_index_stop(doc) // joins before the arrays below are freed
 	delete(doc.lex_idx.line_starts)
 	delete(doc.lex_idx.states)
@@ -1424,11 +1517,28 @@ doc_close :: proc(doc: ^Document) {
 index_worker :: proc(data: rawptr) {
 	idx := (^Line_Index)(data)
 	c := idx.content
-	CHUNK :: 64 * 1024
+	CHUNK :: LINE_CKPT_STRIDE
 	buf: [CHUNK]u8
-	line, i := 0, 0
+	line, i, k := 0, 0, 0
 	for i < len(c) {
 		if intrinsics.atomic_load(&idx.cancel) {return}
+		// Checkpoint the state at `i` BEFORE scanning the chunk that starts there:
+		// `line` is still the number of newlines strictly before `i`, which is what
+		// the entry means. Written first, counted second.
+		//
+		// The publish order is the whole correctness argument for the reader. The
+		// entry is a plain store into an array whose base pointer has not moved
+		// since before this thread existed; the count is a sequentially-consistent
+		// store that happens after it. A reader loads ckpt_n first and only ever
+		// touches entries below what it loaded, so it either does not see this
+		// entry at all or sees it complete -- there is no interleaving that shows
+		// half of one. Publishing the count first, or growing a [dynamic] here,
+		// both break that.
+		if k < len(idx.ckpts) {
+			idx.ckpts[k] = Line_Ckpt{offset = i, line_no = line}
+			intrinsics.atomic_store(&idx.ckpt_n, k + 1)
+			k += 1
+		}
 		end := min(i + CHUNK, len(c))
 		scan := c[i:end]
 		if idx.guard {
@@ -1482,12 +1592,7 @@ doc_recover_from_fault :: proc(doc: ^Document) {
 	doc.idx.content = priv
 	doc.idx.total = len(priv)
 	doc.idx.guard = false
-	intrinsics.atomic_store(&doc.idx.done, false)
-	intrinsics.atomic_store(&doc.idx.fault, false)
-	intrinsics.atomic_store(&doc.idx.cancel, false)
-	intrinsics.atomic_store(&doc.idx.indexed, 0)
-	intrinsics.atomic_store(&doc.idx.line_count, 0)
-	doc_index_start(doc)
+	doc_index_start(doc) // resets every published field and resizes the checkpoints
 }
 
 // True if a mapped read faulted on either the main thread or the index worker.
@@ -1581,6 +1686,68 @@ doc_line_count :: proc(doc: ^Document) -> int {
 	// nl_delta is only meaningful once the base count over the original is done.
 	return lc + doc.nl_delta if intrinsics.atomic_load(&doc.idx.done) else lc
 }
+
+// 0-based line number containing byte `at` (a DOCUMENT offset, the same space
+// doc.cursor and doc.top live in).
+//
+// Bounded, and that is the point of it. Checkpoints sit at fixed byte strides, so
+// the one at or before `at` is found by a division rather than a search, and the
+// forward newline count from it reads at most LINE_CKPT_STRIDE bytes. It never
+// walks from byte 0 -- which is what the table view's row-number gutter, the
+// zebra parity and the sort each needed and none of them could have.
+//
+// `exact = false` means "the index cannot answer this yet", and every caller must
+// draw NOTHING rather than a plausible number. This is development-loop.md §4
+// Shape A -- a bounded scan reporting a confident wrong answer -- and returning
+// the flag is the whole reason this signature has two results. The three ways to
+// get it:
+//
+//   - the worker has not reached `at` (no checkpoint covers it, or none exist);
+//   - `at` is past the end of the indexed content;
+//   - the buffer has been edited at or below `at`, so document offsets and the
+//     indexed original's offsets no longer describe the same bytes. Edits below
+//     an untouched prefix (a log growing at its tail, a table cell edited further
+//     down) leave that prefix exact -- see Line_Index.edit_floor.
+//
+// Note what it is NOT: it does not add nl_delta the way doc_line_count does. A
+// total can be corrected forward by a net newline count; a position cannot,
+// because which side of the edit `at` falls on decides whether the correction
+// applies at all. Refusing is the honest answer and the floor keeps the refusal
+// narrow.
+doc_line_no_at :: proc(doc: ^Document, at: int) -> (line_no: int, exact: bool) {
+	idx := &doc.idx
+	if at < 0 || at > len(idx.content) || at > idx.edit_floor {return 0, false}
+	// Loaded before the entry is touched: everything below index `n` is complete
+	// and will not be rewritten, so the plain reads that follow are ordered behind
+	// this load. See index_worker for the publishing side.
+	n := intrinsics.atomic_load(&idx.ckpt_n)
+	if n == 0 {return 0, false}
+	k := at / LINE_CKPT_STRIDE
+	if k >= n {
+		// `at` is past the last published checkpoint. One case is legitimate: a
+		// query at exactly len(content) on a finished index rounds up into a
+		// stride that holds no bytes and so never got a checkpoint of its own.
+		// Answer that from the last one -- still under a stride of scanning,
+		// since the final checkpoint is at most one stride below the end. Refuse
+		// everything else, which is the worker simply not being there yet.
+		if !intrinsics.atomic_load(&idx.done) {return 0, false}
+		k = n - 1
+	}
+	ck := idx.ckpts[k]
+	// What actually bounds the scan below, checked here rather than argued from
+	// the worker's invariants. It cannot trip while the index behaves (entry k
+	// sits at k*LINE_CKPT_STRIDE and `done` is published after every entry), but a
+	// bounded scan whose bound lives in another procedure is §4's Shape A waiting
+	// to happen -- the last four instances were all a scan that could not tell it
+	// had been handed the wrong floor.
+	if at < ck.offset || at - ck.offset > LINE_CKPT_STRIDE {return 0, false}
+	// Through the piece tree rather than idx.content directly: reads of a mapped
+	// original must go through the SEH shim, and pt_read is where that lives. It
+	// is also the read that matches `at`'s space -- exact against document offsets
+	// by the edit_floor gate above.
+	return ck.line_no + count_newlines(doc, ck.offset, at - ck.offset), true
+}
+
 doc_index_done :: proc(doc: ^Document) -> bool {return intrinsics.atomic_load(&doc.idx.done)}
 doc_index_faulted :: proc(doc: ^Document) -> bool {return intrinsics.atomic_load(&doc.idx.fault)}
 doc_index_progress :: proc(doc: ^Document) -> f32 {
@@ -1775,6 +1942,10 @@ bookmarks_shift_replace :: proc(doc: ^Document, at, n: int, text: []u8) {
 // can express it.
 @(private = "file")
 pt_edit_replace :: proc(doc: ^Document, at, n: int, text: []u8) {
+	// The one place every edit passes through, so the one place the line index's
+	// divergence floor can be maintained. Below `at` the document and the indexed
+	// original are still byte-for-byte the same; see Line_Index.edit_floor.
+	if n > 0 || len(text) > 0 {doc.idx.edit_floor = min(doc.idx.edit_floor, at)}
 	bookmarks_shift_replace(doc, at, n, text) // before the mutation: it reads byte_at(at-1)
 	if n > 0 {base.pt_delete(&doc.pt, at, n)}
 	if len(text) > 0 {base.pt_insert(&doc.pt, at, text)}
@@ -2090,12 +2261,7 @@ doc_detach_mapping :: proc(doc: ^Document) {
 	doc.idx.content = priv
 	doc.idx.total = len(priv)
 	doc.idx.guard = false
-	intrinsics.atomic_store(&doc.idx.done, false)
-	intrinsics.atomic_store(&doc.idx.fault, false)
-	intrinsics.atomic_store(&doc.idx.cancel, false)
-	intrinsics.atomic_store(&doc.idx.indexed, 0)
-	intrinsics.atomic_store(&doc.idx.line_count, 0)
-	doc_index_start(doc)
+	doc_index_start(doc) // resets every published field and resizes the checkpoints
 }
 
 // Bytes appended to the file since we last looked, pulled in without remapping.
