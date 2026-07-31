@@ -92,6 +92,18 @@ if (-not $DryRun) {
 $exe = 'build\newtpad.exe'
 if (-not $DryRun -and -not (Test-Path $exe)) { Write-Error "Release exe missing: $exe"; exit 1 }
 if (-not $DryRun) {
+    # The exe's VERSIONINFO is generated from version.odin (tools\gen-version-rh.ps1)
+    # and cached as build\newtpad.res. If that cache goes stale the exe reports the
+    # PREVIOUS version while the tag below carries the new one - they disagree while
+    # looking like they agree, which is the failure tools\res-stale.ps1 exists to
+    # prevent and this is the moment it would land in a published Release.
+    $fileVer = (Get-Item $exe).VersionInfo.FileVersion
+    if ($fileVer -ne $version) {
+        Write-Error "Built exe reports FileVersion '$fileVer' but version.odin says '$version'. The version resource is stale: delete build\newtpad.res and rebuild."
+        exit 1
+    }
+    Write-Host "  FileVersion $fileVer matches version.odin" -ForegroundColor Green
+
     $mb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
     Write-Host "  built $exe ($mb MB)" -ForegroundColor Green
     # Before the installer wraps it, so the copy that lands on disk is signed too.
