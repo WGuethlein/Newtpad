@@ -22,7 +22,25 @@ import "core:time"
 import plat "src:platform"
 
 WATCH_INTERVAL_MS :: 1000
-WATCH_MAX :: MAX_TABS
+
+// Upper bound on watched files, and it is the WATCHER's budget only -- tabs
+// themselves are unlimited (app_add caps nothing) and a session restores at most
+// MAX_SESSION_TABS. This used to be spelled `MAX_TABS` over in app.odin, whose
+// own comment had to say it was "independent of the session's tab limit"
+// precisely because the name claimed otherwise; it was referenced from this one
+// line and nowhere else, and it still got read as a tab limit. The name was the
+// bug, so the constant now lives where it is used and says what it bounds.
+//
+// 64 rather than 32 so a fully restored session is covered end to end -- a file
+// that was open last time is a file the user expects to be watched.
+//
+// The cap is NOT about CPU: a stat on a local file is microseconds, and the
+// worker sleeps a second between cycles. It is about the worst case in
+// watch_worker below -- a stat "can block for many seconds on an unreachable
+// share" -- so an unbounded list of dead UNC paths would stretch a cycle without
+// limit. Raising the number therefore trades a wider covered set against a worse
+// tail, which is why this is 64 and not "no cap".
+WATCH_MAX :: 64
 
 // One watched file. `gen` guards against a slot being reused by a different
 // document while the worker is mid-stat: the result is discarded unless the
@@ -69,9 +87,35 @@ watcher_publish :: proc(w: ^Watcher, app: ^App) {
 	defer sync.mutex_unlock(&w.mu)
 	for e in w.want {delete(e.path)}
 	clear(&w.want)
-	for d, slot in app.docs {
-		if d == nil || d.path == "" || len(w.want) >= WATCH_MAX {continue}
+
+	// One publisher for a slot, so the cap check and the clone cannot diverge
+	// between the two passes below.
+	add :: proc(w: ^Watcher, app: ^App, slot: int) {
+		if slot < 0 || slot >= len(app.docs) {return}
+		d := app.docs[slot]
+		if d == nil || d.path == "" || len(w.want) >= WATCH_MAX {return}
 		append(&w.want, Watch_Entry{slot = slot, gen = d.gen, path = strings.clone(d.path), stamp = d.disk_stamp})
+	}
+
+	// THE ACTIVE DOCUMENT FIRST, before the cap can be spent on anything else.
+	//
+	// This used to walk slots in order and take the first WATCH_MAX with a path,
+	// which meant the cap fell on whichever tabs happened to sit in high slots --
+	// silently, with no indicator and no reload prompt. "Never lock the user's
+	// file" (CLAUDE.md) is what makes timestamp polling the whole safety
+	// mechanism here, so a file dropping out of it is not cosmetic.
+	//
+	// A cap has to fall somewhere, but it must not fall on the file being looked
+	// at: an external change to the ACTIVE document is the case where missing it
+	// costs the most, because that is the buffer the user is about to save over.
+	// Publishing it first makes that impossible regardless of its slot. The rest
+	// still fill in slot order -- recency would be better still, but App keeps no
+	// MRU list today and inventing one for this would be a bigger change than the
+	// problem warrants.
+	add(w, app, app.active)
+	for _, slot in app.docs {
+		if slot == app.active {continue} // published above; a second entry would double-stat it
+		add(w, app, slot)
 	}
 }
 
