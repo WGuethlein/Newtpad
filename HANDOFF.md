@@ -4867,6 +4867,60 @@ row, on the grounds that a drag lost mid-motion is unrecoverable while a missed 
   hover state survives it; the summary-row wording would become redundant. See `requested-features.md`,
   which also flags that a distinct-value list is **the first UI here that cannot be viewport-bounded**.
 
+## 6az. The grid gets a right edge and a real horizontal scroll (2026-07-31, v0.34.2, branch `fix/table-hscroll`)
+
+Two more from Wyatt minutes after v0.34.1, and the first is **fallout from v0.34.1's own fix**.
+
+**The table had no right edge.** Bands were drawn to `table_right(width)` — the whole window — which
+was invisible while columns stretched to meet it. The moment columns became content-width, that became
+hundreds of pixels of banded emptiness and the table read as broken rather than narrow. New producer
+`table_content_right(cols, width)` takes the **layout slice** rather than re-summing widths, and the
+zebra, header band, header rule and hover lift all end there. `table_cols_layout`'s "a band starting
+24px in reads as a box" argument is now explicitly scoped to the *left* edge, with the opposite rule
+stated for the right, so the two no longer read as contradictory. The summary strip deliberately stays
+full width — it is chrome, and a one-column CSV's `click to clear` run would hang off a clipped band.
+
+**The horizontal scroll snapped in two units at once**, and Wyatt's read of it was literally correct:
+*"it's like it's trying to snap to two different things."* `doc.table_col` was a **column index** while
+the thumb's `span` came from `table_cols_fitting`, a **column count derived from a pixel measurement**.
+Those agree only when every column is the same width, so the thumb resized as it moved. He also called
+the fix: *"i'm not sure the horizontal scroll should snap at all, maybe just act like any other view."*
+
+`doc.table_col` → `doc.table_hscroll_px`; `table_start_col`, `table_max_col` and `table_cols_fitting`
+deleted rather than adapted; `table_cols_layout` **no longer takes a scroll parameter at all** — it
+reads it from the document, so no caller can lay out a different axis than the hit-test beside it. That
+is the seam defence, and it is stronger than the old signature was.
+
+Two side effects worth knowing: the old `max = table_cols - 1` gave *any* table with 2+ columns a
+scrollbar even when it fit — now shown only on real overflow. And session migration turned out to be a
+non-issue, **verified rather than assumed**: `table_col` was never persisted in any unit, and
+`doc_view_apply` zeroes the field on every restore.
+
+### What this pass got wrong
+
+**`hscrolltest` printed `FAIL` and exited 0** — the `keytest` shape for the fourth time this week,
+found only because a sabotage produced a failure line and a zero status. And its 40-column fixture had
+**uniform widths**, so a column-count span and a pixel span were the same number scaled: the thumb-size
+check was structurally incapable of failing, which is precisely why the bug it should have caught
+shipped. Both fixed.
+
+**A claim in the fixing agent's report did not survive checking.** It reported that
+`odin check src/program` exits 0 with undefined identifiers in the tree, and therefore that
+development-loop §5's per-commit bisectability sweep "may not be checking anything". **That is false**
+— tested directly with an undeclared call appended to `version.odin`, `odin check` reports
+`Error: Undeclared name` and exits 1. There may be a narrower real gap (the sweep passes no
+`-define:NEWTPAD_TESTS`, so it checks a third configuration that neither `build.bat` invocation does),
+but the sweep is not vacuous. Recorded because an unchallenged claim of that size would have had
+someone rewrite a working process.
+
+### Owed
+
+- **None of this has been rendered.** Chiefly: whether the narrow-table right edge now reads as
+  *narrow* rather than *broken*, the feel of `Shift+wheel` at four cells a notch, and the summary strip
+  staying full width while the bands above it stop short.
+- Confirm whether the `-define:NEWTPAD_TESTS` gap above is real, and if so make the bisectability sweep
+  check the configuration that actually ships.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
