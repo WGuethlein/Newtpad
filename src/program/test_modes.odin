@@ -269,6 +269,7 @@ when NEWTPAD_TESTS {
 	line_idx_test_run :: proc(path: string) {
 		bad := 0
 		li_part_full(&bad)
+		li_part_exact(&bad)
 		li_part_partial(&bad)
 		li_part_race(&bad)
 		li_part_concurrent(&bad)
@@ -327,6 +328,48 @@ when NEWTPAD_TESTS {
 		delete(probes)
 	}
 
+	// A fixture whose length is an EXACT multiple of the stride -- the only shape
+	// that reaches doc_line_no_at's `k >= n && done -> k = n-1` clamp, and the only
+	// branch there that deliberately reads an entry `at` does not index into.
+	//
+	// No other part can reach it: li_fixture overshoots its target by 1..200 bytes,
+	// so `len/STRIDE` always lands one below `ckpt_n` and the clamp is skipped. A
+	// query at exactly len(content) on a file that ends on a boundary rounds up
+	// into a stride that holds no bytes and therefore never got a checkpoint of its
+	// own; the clamp is what answers it instead of refusing.
+	@(private = "file")
+	li_part_exact :: proc(bad: ^int) {
+		fmt.println("-- a length that is an exact multiple of the stride --")
+		raw := li_fixture(512 * 1024)
+		defer delete(raw)
+		// Copied rather than sliced: doc_from_content takes ownership and doc_close
+		// frees what it was given, which must be an allocation in its own right.
+		n := (len(raw) / LINE_CKPT_STRIDE) * LINE_CKPT_STRIDE
+		c := make([]u8, n)
+		copy(c, raw[:n])
+		d := doc_from_content(c, "", .UTF8)
+		defer doc_close(&d)
+		doc_index_start(&d)
+		for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+		want_n := n / LINE_CKPT_STRIDE
+		got_n := intrinsics.atomic_load(&d.idx.ckpt_n)
+		li_chk(bad, got_n == want_n, fmt.tprintf("%d checkpoints published over %d bytes (want %d)", got_n, n, want_n))
+		li_chk(bad, n % LINE_CKPT_STRIDE == 0 && got_n * LINE_CKPT_STRIDE == n, fmt.tprintf("...and the fixture really does end ON a boundary (%d)", n))
+		// at == len(content): k == ckpt_n, so this is the clamp or nothing.
+		got, exact := doc_line_no_at(&d, n)
+		want := li_truth(raw[:n], n)
+		li_chk(bad, exact && got == want, fmt.tprintf("boundary at=%d -> line %d exact=%v (want %d, true)", n, got, exact, want))
+		wrong, refused := 0, 0
+		probes := li_probes(n)
+		defer delete(probes)
+		for at in probes {
+			g, e := doc_line_no_at(&d, at)
+			if !e {refused += 1} else if g != li_truth(raw[:n], at) {wrong += 1}
+		}
+		li_chk(bad, refused == 0 && wrong == 0, fmt.tprintf("every probe over the truncated fixture is exact and right (%d refused, %d wrong of %d)", refused, wrong, len(probes)))
+	}
+
 	// The mid-scan state, built by hand rather than raced for. doc_line_no_at is a
 	// pure function of (ckpts, ckpt_n, done, edit_floor, content), so publishing a
 	// partial state directly pins its behaviour at the boundary EXACTLY, with no
@@ -348,15 +391,25 @@ when NEWTPAD_TESTS {
 			}
 		}
 		intrinsics.atomic_store(&d.idx.ckpt_n, M)
-		// Entry M is WRITTEN but not PUBLISHED -- the state the worker is in for
-		// the instant between filling a slot and storing the new count, and the
-		// state a reader must treat as absent. Poisoned with a line number that
-		// could not be right so that trusting it is a visible wrong answer rather
-		// than a plausible one; a zeroed slot would be masked by the bounds guard
-		// in doc_line_no_at and this check could not fail.
-		d.idx.ckpts[M] = Line_Ckpt {
-			offset  = M * LINE_CKPT_STRIDE,
-			line_no = 999_999,
+		// Every entry from M up is WRITTEN but not PUBLISHED -- entry M is the state
+		// the worker is in for the instant between filling a slot and storing the
+		// new count, and everything above it is the state a reader must treat as
+		// absent. All of them are poisoned with a line number that could not be
+		// right so that trusting one is a VISIBLE wrong answer.
+		//
+		// Poisoning all of them rather than only M is the difference between an
+		// assertion and a decoration. A zeroed slot is refused by the bounds guard
+		// in doc_line_no_at whatever the count boundary does, so with the rest of
+		// the array left zeroed the two far probes below could not fail under any
+		// single-point sabotage -- they read as coverage of "an unpublished entry is
+		// never trusted" while actually testing the memset. Poisoned, they fail the
+		// moment the `k >= n` gate stops running at all, which is the one sabotage
+		// the adjacent probes do NOT catch.
+		for k in M ..< len(d.idx.ckpts) {
+			d.idx.ckpts[k] = Line_Ckpt {
+				offset  = k * LINE_CKPT_STRIDE,
+				line_no = 999_999,
+			}
 		}
 
 		lo := M * LINE_CKPT_STRIDE - 1
@@ -395,6 +448,16 @@ when NEWTPAD_TESTS {
 		if n == 0 || n >= total {
 			fmt.println("  (skipping the rest of this part -- the fixture did not stay partial)")
 			return
+		}
+		// The worker is joined, so the tail of the array is this thread's to write.
+		// Same reason as li_part_partial: left zeroed, the two refusal assertions
+		// below are satisfied by the bounds guard no matter what the count boundary
+		// does, and neither could fail under any single-point sabotage.
+		for k in n ..< len(d.idx.ckpts) {
+			d.idx.ckpts[k] = Line_Ckpt {
+				offset  = k * LINE_CKPT_STRIDE,
+				line_no = 999_999,
+			}
 		}
 		lo := n * LINE_CKPT_STRIDE - 1
 		got, exact := doc_line_no_at(&d, lo)
@@ -477,8 +540,22 @@ when NEWTPAD_TESTS {
 		probe := 2 * LINE_CKPT_STRIDE + 7
 		got, exact := doc_line_no_at(&d, probe)
 		li_chk(bad, exact && got == li_truth(snapshot, probe), fmt.tprintf("offset %d below the edit is still exact (%d, want %d)", probe, got, li_truth(snapshot, probe)))
-		_, past := doc_line_no_at(&d, n + 3)
-		li_chk(bad, !past, fmt.tprintf("offset %d past the edit refuses (exact=%v)", n + 3, past))
+
+		// An edit in the MIDDLE, and a probe strictly between the new floor and the
+		// end of the indexed content. That "strictly between" is the whole point:
+		// the obvious probe -- one past the end of the buffer -- is refused by
+		// doc_line_no_at's `at > len(idx.content)` clause before the floor is ever
+		// consulted, so it stays green with the floor gate deleted and proves
+		// nothing about it. This is the case the table view actually has (edit row
+		// 500, rows 501+ go blank) and the only one that fails when the gate goes.
+		d.cursor, d.anchor = 5 * LINE_CKPT_STRIDE, 5 * LINE_CKPT_STRIDE
+		doc_insert_text(&d, transmute([]u8)string("mid\n"))
+		below := 5 * LINE_CKPT_STRIDE - 9
+		bgot, bexact := doc_line_no_at(&d, below)
+		li_chk(bad, bexact && bgot == li_truth(snapshot, below), fmt.tprintf("offset %d below a MID-BUFFER edit is still exact (%d, want %d)", below, bgot, li_truth(snapshot, below)))
+		above := 5 * LINE_CKPT_STRIDE + 9
+		_, past := doc_line_no_at(&d, above)
+		li_chk(bad, !past, fmt.tprintf("offset %d above it refuses, and is inside the content (%d bytes) (exact=%v)", above, len(d.idx.content), past))
 
 		// ...and an edit at the front poisons everything, because every later
 		// offset shifted.
