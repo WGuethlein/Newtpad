@@ -52,7 +52,19 @@ app_consume_open_requests :: proc(a: ^App, paths: []string) {
 }
 
 main :: proc() {
+	// TEMPORARY (see perf.odin): NEWTPAD_PERF names a file to write the
+	// startup/shutdown timeline to. First defer, so LIFO runs it last -- after
+	// every teardown proc below.
+	//
+	// The shutdown marks below are registered as `defer` IMMEDIATELY AFTER the
+	// teardown defer they bound, because defers run LIFO: a mark registered
+	// after X runs just BEFORE X, so it timestamps the moment X's predecessor
+	// finished. Each such mark is therefore named for the phase that has just
+	// ENDED, not the one about to start.
+	perf_init()
+	defer perf_dump()
 	plat.seh_install() // arm the mapped-read fault guard before any file opens
+	perf_mark("start: seh_install")
 
 	if len(os.args) > 1 && (os.args[1] == "--version" || os.args[1] == "-v" || os.args[1] == "version") {
 		fmt.println("Newtpad", NEWTPAD_VERSION) // console builds only; the GUI shows it in Settings
@@ -67,6 +79,8 @@ main :: proc() {
 	diag_init()
 	context = diag_context() // the hook propagates down the whole frame loop from here
 	defer diag_shutdown()
+	defer perf_mark("exit: keymap_reset done")
+	perf_mark("start: diag_init")
 
 	// Open the file given on the command line; with no argument, start empty.
 	path := ""
@@ -82,28 +96,34 @@ main :: proc() {
 	if !primary && plat.instance_send_open(path) {
 		return
 	}
+	perf_mark("start: instance_claim")
 
 	window := plat.window_create("Newtpad", 1280, 720)
+	perf_mark("start: window_create")
 
 	gfx, ok := plat.gfx_init(window)
 	if !ok {
 		fmt.eprintln("Newtpad: failed to initialize graphics")
 		return
 	}
+	perf_mark("start: gfx_init")
 
 	text, tok := plat.text_init(&gfx)
 	if !tok {
 		fmt.eprintln("Newtpad: failed to initialize text pipeline")
 		return
 	}
+	perf_mark("start: text_init")
 
 	quad_pipe, qok := plat.quads_init(&gfx)
 	if !qok {
 		fmt.eprintln("Newtpad: failed to initialize quad pipeline")
 		return
 	}
+	perf_mark("start: quads_init")
 
 	session_sweep_tmp() // clear orphan atomic-write temp files from a prior crash
+	perf_mark("start: session_sweep_tmp")
 
 	// Restore the session FIRST, then open any file from the command line as an
 	// extra tab. Opening a file used to skip the restore entirely, and the exit
@@ -114,19 +134,24 @@ main :: proc() {
 	app: App
 	menu_init(&app.menu) // before any frame: the zero value means "File is open"
 	app.settings = settings_load()
+	perf_mark("start: settings_load")
 	// The user keymap overlay, before any frame can resolve a key. A missing or
 	// unreadable keys.txt leaves the defaults in force (keymap.odin).
 	keymap_load()
 	defer keymap_reset()
+	defer perf_mark("exit: rules_reset done")
 	// The colour rules, before any frame can draw a row. A missing or unreadable
 	// rules.txt leaves no rules active (rules.odin).
 	rules_load()
 	defer rules_reset()
+	defer perf_mark("exit: app_destroy done")
+	perf_mark("start: keymap+rules_load")
 	had_session := primary && session_exists()
 	// Restore is opt-out. Note the sweep guard below still protects the backups
 	// when it is off: they belong to tabs we chose not to adopt, so turning
 	// restore off hides the old session rather than destroying it.
 	restored := primary && app.settings.restore_session && session_restore(&app)
+	perf_mark("start: session_restore")
 	// A session we couldn't load still owns its backups; don't sweep them.
 	session_can_sweep := !had_session || restored
 	// The crash handler saves the user's work; give it the App and the same
@@ -141,6 +166,8 @@ main :: proc() {
 		app_new_scratch(&app) // never fail to a closed window
 	}
 	defer app_destroy(&app)
+	defer perf_mark("exit: watcher_stop done")
+	perf_mark("start: cmdline open + scratch")
 
 	// Load the saved theme choice. The zero-initialized Theme is transparent
 	// black, making every themed surface invisible without this assignment --
@@ -174,6 +201,7 @@ main :: proc() {
 		plat.text_load_family(&text, app.settings.ui_font_family, .Regular, .UI)
 	}
 	metrics_recompute(&rc)
+	perf_mark("start: theme+fonts+metrics")
 	window.on_resize = on_resize
 	window.resize_user = &rc
 	// Both callbacks take rc: a DPI change has to update the layout metrics and
@@ -188,6 +216,8 @@ main :: proc() {
 	watcher: Watcher
 	watcher_start(&watcher)
 	defer watcher_stop(&watcher)
+	defer perf_mark("exit: defers begin")
+	perf_mark("start: watcher_start")
 	disk_changes: [dynamic]Watch_Entry
 	defer delete(disk_changes)
 
@@ -1214,6 +1244,10 @@ main :: proc() {
 		}
 
 		render_frame(&rc)
+		if !perf_first_present {
+			perf_first_present = true
+			perf_mark("start: FIRST PRESENT")
+		}
 
 		// The GPU went away mid-frame (driver update, TDR, eGPU unplug, an RDP
 		// session change). Every D3D object is invalid now, so nothing can be drawn
@@ -1252,10 +1286,18 @@ main :: proc() {
 		free_all(context.temp_allocator)
 	}
 
+	perf_mark("exit: loop exited (WM_CLOSE)")
 	if primary {
 		session_save(&app, session_can_sweep) // hot-exit: persist tabs + unsaved buffers
 	}
+	perf_mark("exit: session_save")
 }
+
+// One-shot latch for the FIRST PRESENT mark. A package-level bool rather than a
+// local so the mark sits at the render call itself, not behind another flag the
+// frame loop has to carry.
+@(private = "file")
+perf_first_present: bool
 
 // Everything render_frame needs; built once in main and handed to the resize
 // callback via the window so a live resize can repaint.
