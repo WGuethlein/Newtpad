@@ -50,17 +50,60 @@ highlighter about what a token is. **Do not write a second JSON parser.**
 heavily on new projects and this is a large piece of interacting with it."* He also asked the right
 question himself — built-in, or a V2 plugin?
 
-**Recommendation: first-party, and a named subset — not "full mermaid", and not a plugin.** Three
-separate judgements, because they have three different reasons.
+**Clarified 2026-07-31.** Wyatt: *"I want to use it as a tool to work through spec driven design,
+that's why i mentioned v2 plugin/'dlc'."* So the plugin framing was not "defer this" — it was a
+**packaging** proposal: mermaid as a separately-shipped add-on rather than core Newtpad.
 
-**Why not a plugin.** The plugin system does not exist and is V2, so "make it a plugin" resolves to
-"not until V2", which does not serve the stated need. Worse, the C-ABI is scoped to *"formatters +
-viewers"* on the assumption that a viewer returns **text or a bitmap**. A diagram that participates in
-the preview — scrolling with it, scaling with DPI, theming with the palette, selectable — needs
-either a rich drawing ABI or a quad-list-and-glyph-run ABI, and that is a much wider surface than the
-plugin row was scoped for. **Building it in-house first is how the viewer ABI gets designed from a
-real client instead of speculatively**, and it can be extracted to a plugin afterwards. This is the
-same shape as the JSON-formatter question above and should be answered the same way.
+**DECIDED, same day, by Wyatt: this is not core Newtpad.** His words: *"it also is more of an ide
+feature rather than notepad."* That is the scope row's own test — CLAUDE.md rules out LSP, project
+trees and terminals on the grounds that Newtpad is a notepad and not an IDE, and **a graph layout
+engine is the same category of thing.** It is also the largest feature ever proposed here: more code
+than the product currently is. So it ships as an add-on or it does not ship, and principle 5 (*"small
+standalone exe — size reflects absence of complexity"*) is protected structurally rather than by
+willpower.
+
+**Do not re-propose this as a core feature.** If a later audit finds mermaid in this file and reads it
+as unscheduled work, the answer is that it was ruled out of core on 2026-07-31 and the reason has not
+changed.
+
+**What remains open is only WHEN and against what boundary.** The two words in the original request
+are separate decisions with different deadlines:
+
+- **"DLC" is a packaging decision and can be made late.** Selling it separately needs a build flag, a
+  licence tier, or a second binary — none of which require the C-ABI to exist. Do not let a pricing
+  question dictate the architecture.
+- **"Plugin" is an architecture decision**, and with mermaid ruled out of core it is the natural home:
+  a separate binary, separately licensed, loaded on demand, is exactly what an out-of-scope-for-core
+  feature that someone still wants should be. **This becomes the plugin system's motivating example**,
+  which is a better one than the JSON formatter because it is genuinely too big for core rather than
+  merely convenient to externalise.
+
+**The remaining tension is timing, and it is worth naming rather than discovering later.** Plugins are
+V2, and the stated need — spec work on new projects — is now. Two honest options, and this is Wyatt's
+call whenever he wants it:
+
+- **Wait for V2.** Cleanest. Mermaid becomes the first plugin, the ABI is designed for it, nothing
+  provisional ever ships. Costs him the tool for the whole interim.
+- **Build it in-tree behind the future plugin boundary, gated out of the shipped exe.** Same interface
+  the C-ABI will expose — in: the fenced block's text, theme, DPI; out: a quad list, glyph runs, hit
+  regions — so it never reaches into Newtpad's internals and becomes a recompile rather than a rewrite
+  when plugins land. Gets him the tool sooner at the cost of carrying an unshipped module.
+
+Either way, **design the boundary before the engine.** The plugin row scopes the ABI to *"formatters +
+viewers"* on the unexamined assumption that a viewer returns text or a bitmap; a diagram that scrolls
+with the preview, scales with DPI, themes with the palette and supports selection needs far more than
+that. That assumption should be corrected by a real client, not discovered during V2.
+
+**The question to settle before this is specced, because it is a day-one decision:** *"work through"*
+implies more than rendering. Three separable products, in increasing cost:
+
+1. **Static render in the preview.** The baseline.
+2. **Live preview as you type** — cheap once layout exists, given the existing per-block cache, but it
+   sets a latency budget that constrains the layout engine's design.
+3. **Click a node to jump to the section that describes it.** Genuinely excellent for spec-driven work
+   and the thing that would make this a *tool* rather than a viewer — but it requires the parser and
+   layout engine to **carry source byte offsets through to every node**. That is trivial if designed in
+   and painful to retrofit, so it must be decided before the first line, not after.
 
 **Why not "full mermaid".** Mermaid is not one format, it is ~15 (flowchart, sequence, class, state,
 ER, gantt, pie, journey, gitgraph, mindmap, timeline, quadrant, C4, sankey, requirement), each with
@@ -327,3 +370,8 @@ Recorded so an audit does not raise them again. From HANDOFF §6aa unless noted.
 - **Arenas on VirtualAlloc with grouped lifetimes** — the CLAUDE.md row was amended twice; build an arena
   only when a measurement asks, and amend the row again when you do.
 - **Beta expiry / DRM / online checks** — honour-system, per research.
+- **Mermaid diagrams in core Newtpad** — ruled out of the core product 2026-07-31 by Wyatt (*"it also
+  is more of an ide feature rather than notepad"*), on the same test CLAUDE.md's scope row applies to
+  LSP, project trees and terminals. **Not ruled out as an add-on** — it is the plugin system's best
+  motivating example. The full entry, including the subset worth building and the source-offset
+  decision that must be made on day one, is in §1 above.
