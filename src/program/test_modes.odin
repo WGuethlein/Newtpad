@@ -12120,7 +12120,39 @@ when NEWTPAD_TESTS {
 				table_sort_clear(d)
 				d.table_sort.refused = true
 				s3 := table_summary_text(d)
-				chk(&bad, s3 == "5 rows  ·  2 columns  ·  too large to sort (over 1,000,000 rows)", fmt.tprintf("a refused sort says why: %q", s3))
+				// Checked in three parts rather than against one literal sentence.
+				// It WAS a literal ending "(over 1,000,000 rows)" and it went red the
+				// moment TABLE_SORT_MAX was lowered on a measurement -- a true failure
+				// about nothing, which is how a suite teaches people to edit
+				// expectations until they pass. Interpolating group_int instead was
+				// the obvious repair and is not available here (it is file-private to
+				// table.odin) -- which is the better outcome, because it would have
+				// asserted the message against the same procedure that built it.
+				//
+				// So: the sentence's shape and both separators are pinned by the
+				// prefix and suffix, and the number is pinned by PARSING it back and
+				// comparing to the constant. That is strictly stronger than the
+				// literal was -- the literal could not tell "the ceiling changed" from
+				// "the message stopped naming the ceiling at all" -- and it cannot rot
+				// when the constant moves again.
+				pre3 :: "5 rows  ·  2 columns  ·  too large to sort (over "
+				suf3 :: " rows)"
+				shape3 := strings.has_prefix(s3, pre3) && strings.has_suffix(s3, suf3)
+				num3 := 0
+				if shape3 {
+					mid := s3[len(pre3):len(s3) - len(suf3)]
+					// Strip the grouping separators without reimplementing how they
+					// are placed: this asserts WHICH number is shown, not how it is
+					// punctuated, which group_int's own tests are for.
+					bare, _ := strings.replace_all(mid, ",", "", context.temp_allocator)
+					num3, _ = strconv.parse_int(bare)
+				}
+				chk(&bad, shape3, fmt.tprintf("a refused sort says why: %q", s3))
+				chk(
+					&bad,
+					num3 == TABLE_SORT_MAX,
+					fmt.tprintf("...and names the real ceiling: message says %d, TABLE_SORT_MAX is %d", num3, TABLE_SORT_MAX),
+				)
 				return
 			}
 

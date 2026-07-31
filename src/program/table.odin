@@ -589,11 +589,27 @@ TABLE_SORT_NONE :: -1
 // is partial: the rows are in order, so it looks right.
 //
 // The right long-term answer is a background sort index, which is queued rather
-// than built (the batch-18 plan's "out of scope"). One million rows is where a
-// synchronous build stops being instant, and it is a row count, not a file size:
-// the bound that matters is the memory the permutation costs and the time the
-// single pass takes, neither of which cares how wide the rows are.
-TABLE_SORT_MAX :: 1_000_000
+// than built (the batch-18 plan's "out of scope").
+//
+// THE NUMBER IS SET FROM A MEASUREMENT, not from a round figure. The build is a
+// single synchronous pass on the main thread, so the ceiling is a freeze budget:
+// at 1,000,000 rows it measured **2,046 ms at -o:speed** (3,075 ms debug), and a
+// two-second stall on a header click is not a slow feature, it is a hung window.
+// Product principle 1 is "speed everywhere -- clicking, tabs, find, open:
+// instant", and nothing about a click on a column header exempts it. The cost is
+// near-linear in rows, so 100,000 lands near 205 ms: still the slowest thing in
+// the app by a wide margin, but recoverable rather than alarming, and it is the
+// most rows that can be sorted without breaking the promise the product is sold
+// on. This was 1,000,000 for exactly as long as it took to measure it.
+//
+// It is a row count, not a file size: the bound that matters is the memory the
+// permutation costs and the time the single pass takes, neither of which cares
+// how wide the rows are.
+//
+// Raising it is a decision about how long a freeze is acceptable, so raise it
+// only with a fresh measurement -- and prefer building the background index,
+// which removes the trade rather than repricing it.
+TABLE_SORT_MAX :: 100_000
 #assert(TABLE_SORT_MAX < int(max(i32)))
 
 Table_Sort :: struct {
