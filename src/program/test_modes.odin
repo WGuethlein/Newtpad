@@ -11092,12 +11092,24 @@ when NEWTPAD_TESTS {
 			// LINE_CKPT_STRIDE of them -- and a per-row producer measured 153.3 us
 			// PER ROW on this fixture, 6.1 ms for one 40-row repaint.
 			//
-			// Asserted as a RATIO, not as a wall-clock budget: a millisecond
-			// threshold is a machine-speed assertion that flakes, where "200 rows
-			// must not cost meaningfully more than 1 row" is a statement about the
-			// SHAPE of the procedure and holds on any hardware. A per-row
-			// implementation makes that ratio ~200, so the 4x allowance below is
-			// two orders of magnitude of slack and still catches the regression.
+			// Asserted RELATIVELY, never as a wall-clock budget: a millisecond
+			// threshold is a machine-speed assertion that flakes, where "a screen
+			// costs a fraction of what a per-row producer costs" is a statement
+			// about the SHAPE of the procedure and holds on any hardware.
+			//
+			// The per-row cost is MEASURED here rather than assumed, and that is a
+			// change: this used to compare 200 rows against 1 row with a 4x
+			// allowance, on the reasoning that a per-row implementation would make
+			// that ratio ~200. It no longer would. table_abs_rows walks the visible
+			// rows now (it has to -- a data row longer than RENDER_LINE_CAP is
+			// several visible rows, and the run it replaced numbered every row below
+			// one such line wrongly), so 200 rows genuinely cost ~200 bounded steps
+			// more than 1 row does: 477 us vs 157 us here, a ratio of 3.0 against an
+			// allowance of 4.3. That is 1.4x of headroom on a timing check, which is
+			// how a suite starts flaking. Comparing against 200 real doc_line_no_at
+			// calls instead pins the claim that actually matters -- the expensive
+			// term is asked ONCE per screen -- with 6x of headroom, and it cannot rot
+			// when either cost moves.
 			//
 			// Its own proc for the usual stack-frame reason; the fixture is a real
 			// 1.1 MB document because the cost being measured only exists at
@@ -11138,11 +11150,105 @@ when NEWTPAD_TESTS {
 				}
 				one := time_n(&d, 1)
 				many := time_n(&d, 200)
+				// The per-row producer's cost, taken in this same run: 200 lookups at
+				// the offset it would ask about. This is the implementation the
+				// batching exists to avoid, so measuring IT is what makes the bound
+				// below independent of the machine.
+				per_row := 0.0
+				{
+					acc := 0
+					t0 := time.tick_now()
+					for _ in 0 ..< 200 {
+						if ln, ex := doc_line_no_at(&d, s); ex {acc += ln}
+					}
+					per_row = time.duration_microseconds(time.tick_since(t0))
+					if acc < 0 {fmt.print("")}
+				}
 				chk(
 					&bad,
-					many <= one * 4 + 50,
-					fmt.tprintf("200 rows cost about what 1 row costs: %.1f us vs %.1f us (want <= %.1f)", many, one, one * 4 + 50),
+					many * 10 <= per_row,
+					fmt.tprintf("a 200-row screen costs a tenth of a per-row producer: %.1f us vs %.1f us", many, per_row),
 				)
+				// ...and the walk that remains is the cheap term. Loose on purpose --
+				// it is the second-order check and the numbers above are the first --
+				// but not so loose it would miss a step growing a scan of its own.
+				chk(
+					&bad,
+					many <= one * 8 + 50,
+					fmt.tprintf("...and 200 bounded steps stay cheap next to 1: %.1f us vs %.1f us (want <= %.1f)", many, one, one * 8 + 50),
+				)
+				return
+			}
+
+			// F5b: A DATA ROW LONGER THAN RENDER_LINE_CAP, which the viewport splits
+			// into several visible rows. table_abs_rows used to answer the whole
+			// screen with a run -- ln - 1 + i, on a comment asserting that "visible
+			// rows are consecutive lines by construction" -- and the split makes that
+			// false, so every row below such a line was numbered one too high per
+			// split, with exact = true. development-loop.md §4 Shape A, in the
+			// procedure whose second result exists to prevent it, and nothing in this
+			// suite constructed a line past the cap before.
+			//
+			// 8 KiB is not an exotic CSV. One description, JSON or log column does it.
+			//
+			// Checked TWICE over, because a table of expected numbers can be wrong in
+			// the same direction as the walk that produced it: every row that gets a
+			// number also has that number re-derived from the ROW'S OWN byte offset
+			// through doc_line_no_at, which shares no code with the walk.
+			tg_abs_overcap :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				LONG :: 9000
+				#assert(LONG > RENDER_LINE_CAP) // or the row is not split and this proves nothing
+				b := strings.builder_make()
+				strings.write_string(&b, "a,b\n") // header, line 0
+				for _ in 0 ..< LONG {strings.write_byte(&b, 'x')} // data row 0, over the cap
+				strings.write_string(&b, ",y\np,2\nq,3\n") // data rows 1 and 2
+				content := transmute([]u8)strings.clone(strings.to_string(b))
+				strings.builder_destroy(&b)
+				d := doc_from_content(content, "overcap.csv", .UTF8)
+				defer doc_close(&d)
+				d.table, d.table_delim = true, ','
+				doc_index_start(&d)
+				for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+				// The preconditions that stop everything below being vacuous: the row
+				// really is split, and both halves really are the same logical line.
+				r0, ok0 := table_row_start(&d, 0)
+				r1, ok1 := table_row_start(&d, 1)
+				chk(&bad, ok0 && ok1 && r0 == 4 && r1 == 4 + RENDER_LINE_CAP, fmt.tprintf("precondition -- data row 0 is split at the cap: visible rows 0 and 1 start at %d and %d (want 4 and %d)", r0, r1, 4 + RENDER_LINE_CAP))
+				l0, e0 := doc_line_no_at(&d, r0)
+				l1, e1 := doc_line_no_at(&d, r1)
+				chk(&bad, e0 && e1 && l0 == 1 && l1 == 1, fmt.tprintf("...and both halves are logical line 1 (got %d and %d)", l0, l1))
+
+				// Visible row 1 is the TAIL of data row 0, so it draws no number at
+				// all; rows 2 and 3 are data rows 1 and 2 and must say so. Row 4 is
+				// the trailing empty line the grid already shows after a final
+				// newline -- pinned here only so a change to that is not silent.
+				absn := table_abs_rows(&d, 5)
+				want := [5]int{0, TABLE_ABS_NONE, 1, 2, 3}
+				for r in 0 ..< 5 {
+					chk(&bad, absn[r] == want[r], fmt.tprintf("visible row %d numbers as %d (want %d)", r, absn[r], want[r]))
+				}
+				for r in 0 ..< 5 {
+					if absn[r] == TABLE_ABS_NONE {continue}
+					p, pok := table_row_start(&d, r)
+					ln, ex := doc_line_no_at(&d, p)
+					chk(&bad, pok && ex && ln - 1 == absn[r], fmt.tprintf("...and visible row %d's number is its own line's: gutter says data row %d, offset %d is line %d", r, absn[r], p, ln))
+				}
+
+				// Scrolled INTO the long row. doc.top is then a synthetic mid-line
+				// offset -- next_row_start_capped leaves it there on any wheel tick
+				// through an over-long row -- so visible row 0 is itself a
+				// continuation and the walk may not assume its start is a line start.
+				d.top = r1
+				scr := table_abs_rows(&d, 3)
+				sw := [3]int{TABLE_ABS_NONE, 1, 2}
+				for r in 0 ..< 3 {
+					chk(&bad, scr[r] == sw[r], fmt.tprintf("scrolled into the long row, visible row %d numbers as %d (want %d)", r, scr[r], sw[r]))
+				}
 				return
 			}
 
@@ -12277,6 +12383,7 @@ when NEWTPAD_TESTS {
 			}
 
 			bad := tg_abs_cost()
+			bad += tg_abs_overcap()
 			bad += tg_gutter_pixels()
 			bad += tg_align()
 			bad += tg_resize()

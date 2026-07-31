@@ -394,7 +394,7 @@ table_row_start :: proc(doc: ^Document, r: int) -> (p: int, ok: bool) {
 	}
 	p = s
 	for i in 0 ..< r {
-		np, more := table_row_next(doc, p, i + 1)
+		np, more, _ := table_row_next(doc, p, i + 1)
 		if !more {return 0, false} // no such row
 		p = np
 	}
@@ -416,11 +416,39 @@ table_row_start :: proc(doc: ^Document, r: int) -> (p: int, ok: bool) {
 // each mode's answer is a function of the coordinate that mode actually has, and a
 // caller that passes both cannot silently be right in one mode and wrong in the
 // other.
-table_row_next :: proc(doc: ^Document, p, r: int) -> (np: int, ok: bool) {
-	if table_sorted(doc) {return table_row_start(doc, r)}
+//
+// `line_end` is the third result and it is the one table_abs_rows rests on: false
+// means the step landed on a SYNTHETIC cap break rather than on a real newline, so
+// the row starting at `np` is the SAME logical line continued. pt_line_end_cap
+// cannot say which of the two happened -- it returns min(length, p+cap) for both
+// -- and a data row longer than RENDER_LINE_CAP is split across several visible
+// rows for that reason. One byte read tells them apart exactly, the same
+// disambiguation next_row_start_capped (doc.odin) and block_step_lines
+// (block.odin) already make. Always true under a sort: every offset the
+// permutation hands back comes out of `offs`, which holds real line starts only.
+table_row_next :: proc(doc: ^Document, p, r: int) -> (np: int, ok: bool, line_end: bool) {
+	if table_sorted(doc) {
+		np, ok = table_row_start(doc, r)
+		return np, ok, true
+	}
 	e := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
-	if e >= doc.pt.length {return 0, false}
-	return e + 1, true
+	if e >= doc.pt.length {return 0, false, false}
+	// A real newline is stepped PAST; a synthetic break is content, so the next row
+	// starts ON it. This used to return e+1 either way, which dropped one byte per
+	// 8 KiB of an over-long row out of the grid and put this step half a byte away
+	// from next_row_start_capped -- the one doc_scroll writes doc.top with.
+	if table_byte_at(doc, e) == '\n' {return e + 1, true, true}
+	return e, true, false
+}
+
+// One byte, by absolute offset: an O(log n) tree lookup, not a scan. doc.odin's
+// byte_at and block.odin's block_byte_at are the same three lines, both file-
+// private; this is the third copy and they want one home in base.
+@(private = "file")
+table_byte_at :: proc(doc: ^Document, i: int) -> u8 {
+	one: [1]u8
+	base.pt_read(&doc.pt, i, one[:])
+	return one[0]
 }
 
 // Absolute data-row index of each visible row -- the row's position in the FILE
@@ -440,24 +468,39 @@ table_row_next :: proc(doc: ^Document, p, r: int) -> (np: int, ok: bool) {
 // information; see table_draw.
 //
 // The header is line 0 and is not a data row, so data row 0 is line 1 and the
-// answer is doc_line_no_at(<the first data row's byte>) - 1 + r. The lookup is
-// taken at table_data_start rather than at table_row_start(doc, r): visible rows
-// are consecutive lines by construction -- table_row_start's own walk is r
-// line-ends forward from exactly that offset -- so the two agree, and asking at
-// the fixed offset does not walk r lines to find a byte whose line number is
-// already implied.
+// answer is doc_line_no_at(<the first data row's byte>) - 1, WALKED forward one
+// real newline at a time from there. It used to be a run -- `- 1 + r`, on the
+// claim that "visible rows are consecutive lines by construction" -- and that
+// claim was false: table_row_next steps with pt_line_end_cap, so a data row
+// longer than RENDER_LINE_CAP (a description, JSON or log column: 8 KiB is not
+// exotic) becomes several visible rows, and the run then numbered every row below
+// it one too high per split, with exact = true. Shape A (development-loop.md §4)
+// in the procedure whose second result exists to prevent it.
 //
-// A RUN rather than one row at a time, and that is a MEASURED cost decision, not
-// a style one. doc_line_no_at is bounded but not cheap: it counts newlines
+// So the line number advances only where table_row_next reports a real line end,
+// and a CONTINUATION row lands as TABLE_ABS_NONE. Its head's number would be true
+// -- it is the same logical line -- but the gutter would then print the same
+// number on two adjacent rows, and a reader counting rows down the screen cannot
+// tell that from two data rows sharing an index. One number per data row, on the
+// row where that data row starts, nothing on its tail. Visible row 0 is itself a
+// continuation whenever doc.top sits mid-line, which is exactly where scrolling
+// through an over-long row leaves it (next_row_start_capped, doc.odin), so it is
+// tested the same way rather than assumed to be a line start.
+//
+// ONE doc_line_no_at CALL for the whole screen, and that is a MEASURED cost
+// decision, not a style one. It is bounded but not cheap: it counts newlines
 // forward from the checkpoint at or below the offset, up to LINE_CKPT_STRIDE
 // (64 KiB) of it. Measured on a 1.16 MB fixture whose first visible row sat
 // 65,482 bytes past its checkpoint -- the worst case at that stride -- one call
 // costs 153.3 us in a debug build, so a per-row producer spends 6.1 ms of a
-// full 40-row screen's repaint on it. Every one of those calls scans the SAME
-// bytes, because `at` is table_data_start for all of them and only the `+ r`
-// differs. Asking once and adding r is the same answer for a fortieth of the
-// work, and it leaves exactly one place that turns a line number into a row
-// index.
+// full 40-row screen's repaint on it. Every one of those calls would scan the
+// SAME bytes, because `at` is table_data_start for all of them.
+//
+// The walk that replaced the run does NOT undo that. It is `rows` bounded steps
+// -- the same pt_line_end_cap the draw's own pass already makes for every row it
+// draws -- and still exactly one line-number lookup, so what the walk added is
+// the cheap term and what the batching removed is the expensive one. tg_abs_cost
+// measures both halves.
 //
 // One call per frame rather than a memo, deliberately. A cache would have to key
 // on every input doc_line_no_at reads -- the offset, edit_floor, ckpt_doc, the
@@ -469,8 +512,11 @@ table_row_next :: proc(doc: ^Document, p, r: int) -> (np: int, ok: bool) {
 //
 // NOT bounded above, deliberately, exactly as table_row_at_y is not: the caller
 // owns its row budget (table_visible_rows) and a second opinion here about how
-// many rows exist would be a second producer. Entries past the end of the file
-// carry confident numbers, so read only the entries you have rows for.
+// many rows exist would be a second producer. The walk does stop at the last row
+// -- entries past the end of the file stay TABLE_ABS_NONE now, where the run used
+// to carry confident numbers off the end of the buffer -- but that is a side
+// effect of stepping, not a row count, and a caller must still read only the
+// entries it has rows for.
 TABLE_ABS_NONE :: -1
 
 table_abs_rows :: proc(doc: ^Document, rows: int, allocator := context.temp_allocator) -> []int {
@@ -479,9 +525,9 @@ table_abs_rows :: proc(doc: ^Document, rows: int, allocator := context.temp_allo
 	if doc == nil || len(out) == 0 {return out}
 	s, sok := table_data_start(doc)
 	if !sok {return out}
-	// UNDER A SORT THE RUN BELOW IS WRONG, and it is wrong in the one way this
-	// procedure exists to prevent. The `ln - 1 + i` rests on visible rows being
-	// consecutive lines; a permutation breaks that, so the gutter would count
+	// UNDER A SORT THE WALK BELOW IS WRONG, and it is wrong in the one way this
+	// procedure exists to prevent. Counting newlines forward rests on visible rows
+	// being successive lines; a permutation breaks that, so the gutter would count
 	// 1, 2, 3 down a screen showing lines 4,113, 12 and 900 -- a confident number
 	// naming the wrong line, which is what TABLE_ABS_NONE is for.
 	//
@@ -500,10 +546,23 @@ table_abs_rows :: proc(doc: ^Document, rows: int, allocator := context.temp_allo
 	}
 	ln, exact := doc_line_no_at(doc, s)
 	// ln == 0 would mean the first data row IS line 0, which table_data_start
-	// exists to make impossible; refuse rather than hand back -1 + r and have it
-	// read as the refusal sentinel by accident.
+	// exists to make impossible; refuse rather than hand back -1 and have it read
+	// as the refusal sentinel by accident.
 	if !exact || ln < 1 {return out}
-	for i in 0 ..< len(out) {out[i] = ln - 1 + i}
+	// `head` is "this visible row begins a logical line", which is the whole of
+	// what makes an entry a number rather than a refusal. It starts as a real test
+	// of the byte before s rather than as `true`: doc.top lands mid-line whenever
+	// the view has scrolled into a row longer than RENDER_LINE_CAP.
+	line := ln
+	head := s == 0 || table_byte_at(doc, s - 1) == '\n'
+	p := s
+	for i in 0 ..< len(out) {
+		if head {out[i] = line - 1}
+		np, more, line_end := table_row_next(doc, p, i + 1)
+		if !more {break} // ran out of document: the rest stay refused
+		p, head = np, line_end
+		if line_end {line += 1}
+	}
 	return out
 }
 
@@ -1787,7 +1846,7 @@ table_links :: proc(doc: ^Document, text: ^plat.Text, px, char_w: f32, rows: int
 		// The same step the draw and table_row_start take, for the same reason: an
 		// underline positioned by data-row index has to sit on the line that row
 		// index resolves to, under a sort as much as without one.
-		np, more := table_row_next(doc, p, r + 1)
+		np, more, _ := table_row_next(doc, p, r + 1)
 		if !more {break}
 		p = np
 	}
@@ -1863,7 +1922,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			// sort existed, since under a permutation the next visible row is not
 			// the next line. Now the draw and the producer step through one
 			// procedure and cannot disagree about it.
-			np, more := table_row_next(doc, p, r + 1)
+			np, more, _ := table_row_next(doc, p, r + 1)
 			if !more {break}
 			p = np
 		}
