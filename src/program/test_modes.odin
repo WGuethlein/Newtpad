@@ -13059,6 +13059,126 @@ when NEWTPAD_TESTS {
 				return
 			}
 
+			// THE STICKY GUTTER COVERS A SCROLLED CELL, on real pixels.
+			//
+			// With pixel scrolling the leftmost column slides under the row-number
+			// gutter, and there is no scissor rect in this renderer -- the gutter is
+			// drawn LAST, as a cover strip in the row's own band colour (table_draw's
+			// gutter pass). Draw it first, as it was until 2026-07-31, and a cell's
+			// glyphs are painted over the row numbers.
+			//
+			// Its own proc with its own offscreen device, like tg_appearance and
+			// tg_parity, because it needs a WIDE fixture: the appearance fixture is
+			// two 8-cell columns in a 1000px window, so table_max_scroll_x is 0 and
+			// there is nothing to scroll. That is not hypothetical -- this check was
+			// first written against that fixture, passed under a sabotage that
+			// removed the cover entirely, and the reason was that its scroll offset
+			// had been clamped to zero. The `scrolled` assertion below is what pins
+			// it now.
+			//
+			// Detected on the GREEN CHANNEL rather than by matching a colour: the
+			// sentinels give the cell text a channel neither the band nor the page
+			// has, so a partly-covered glyph edge counts too. x < 34 is left of where
+			// any 1-digit row number reaches (right-aligned to gutter - pad = 46,
+			// about 10px wide), so the numbers cannot trip it.
+			tg_gutter_cover :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				W, H :: 1000, 700
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, W, H, "tablegridtest/gutter-cover") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return 0
+				}
+				defer headless_gpu_destroy(&h)
+				saved_theme, saved_scale := g_theme, UI_SCALE
+				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
+				TOP_INSET, FILTER_BANNER_H = 0, 0
+				BASE_PX = BASE_PX_96
+
+				bg_s := [4]f32{0, 0, 0, 1} // Bg_Base -- green-free
+				zeb_s := [4]f32{0, 0, 1, 1} // Table_Zebra -- green-free
+				cell_s := [4]f32{0, 1, 1, 1} // Text_Primary -- the ONLY source of green
+				num_s := [4]f32{1, 0, 0, 1} // Text_Muted, the row numbers -- green-free
+				g_theme[.Bg_Base], g_theme[.Table_Zebra] = bg_s, zeb_s
+				g_theme[.Text_Primary], g_theme[.Text_Muted] = cell_s, num_s
+				g_theme[.Bg_Raised], g_theme[.Border_Strong] = [4]f32{1, 0, 0, 1}, [4]f32{1, 0, 0, 1}
+
+				sample :: proc(buf: []u8, w, x, y: int) -> (b, g, r: u8) {
+					i := (y * w + x) * 4
+					return buf[i], buf[i + 1], buf[i + 2]
+				}
+
+				// Twelve columns, so the table is far wider than the window and there
+				// is real scroll range. Default allocator: doc_close owns it.
+				sb := strings.builder_make()
+				for c in 0 ..< 12 {
+					if c > 0 {strings.write_byte(&sb, ',')}
+					fmt.sbprintf(&sb, "h%d", c)
+				}
+				strings.write_byte(&sb, '\n')
+				// EIGHT-character values, filling the 8-cell column exactly. A short
+				// value would sit entirely inside the gutter at the scroll offset
+				// below, or entirely outside it -- the cell has to STRADDLE the
+				// gutter's edge for both halves of the check to have something to
+				// look at, and that is the state pixel scrolling actually produces.
+				for r in 0 ..< 6 {
+					for c in 0 ..< 12 {
+						if c > 0 {strings.write_byte(&sb, ',')}
+						fmt.sbprintf(&sb, "vvvvvvv%d", r)
+					}
+					strings.write_byte(&sb, '\n')
+				}
+				doc := doc_from_content(sb.buf[:], "cover.csv", .UTF8)
+				defer doc_close(&doc)
+				doc.table, doc.table_delim = true, ','
+				px := BASE_PX_96
+				char_w := plat.text_char_width(&h.text, px, .Doc)
+				rows := table_visible_rows(&doc, f32(H), px)
+				table_compute_widths(&doc, &h.text)
+				doc.table_cols = len(doc.table_widths)
+
+				// Far enough that column 0's text (gutter + 10 = 66) lands at 26 --
+				// well inside the gutter's 56px and left of any row number.
+				doc.table_hscroll_px = 40
+				scrolled := table_scroll_x(&doc, char_w, f32(W))
+				chk(&bad, scrolled == 40, fmt.tprintf("the fixture really can scroll 40px (clamped to %.0f, max %d)", scrolled, table_max_scroll_x(&doc, char_w, f32(W))))
+
+				plat.gfx_begin_frame(&h.gfx, bg_s[0], bg_s[1], bg_s[2])
+				table_draw(&h.gfx, &h.quads, &h.text, &doc, px, char_w, rows, f32(W), f32(H))
+				buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				chk(&bad, ok, "the readback succeeded")
+				if !ok || scrolled != 40 {return}
+
+				ytop := int(table_row_rect_y(px, 1)) + 2
+				ybot := int(table_row_rect_y(px, 1) + table_row_h(px)) - 2
+				under, beside := 0, 0
+				for yy in ytop ..< ybot {
+					for xx in 0 ..< 34 {
+						_, g, _ := sample(buf, W, xx, yy)
+						if int(g) > 40 {under += 1}
+					}
+					for xx in int(TABLE_GUTTER_W) ..< int(TABLE_GUTTER_W) + 40 {
+						_, g, _ := sample(buf, W, xx, yy)
+						if int(g) > 40 {beside += 1}
+					}
+				}
+				// The precondition is what stops this passing on a frame that drew no
+				// cell text at all -- or that clamped the scroll away.
+				chk(&bad, beside > 0, fmt.tprintf("the scrolled cell really is drawing text just past the gutter (%d px)", beside))
+				chk(&bad, under == 0, fmt.tprintf("...and none of it reaches inside the sticky gutter (%d px of cell text at x<34)", under))
+				return
+			}
+
 			bad := tg_abs_cost()
 			bad += tg_live_pass()
 			bad += tg_abs_overcap()
@@ -13075,6 +13195,7 @@ when NEWTPAD_TESTS {
 			bad += tg_malformed()
 			bad += tg_sort()
 			bad += tg_hscroll()
+			bad += tg_gutter_cover()
 			fmt.printfln("tablegridtest: %d failures", bad)
 			// Exit non-zero, like keytest / palettetest / lineidxtest / resavetest.
 			// HANDOFF §6aw listed this mode as the notable omission: it asserts a
