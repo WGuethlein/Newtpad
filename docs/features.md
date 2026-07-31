@@ -148,6 +148,14 @@ Once a frame the main thread acts on what it saw:
 - Piece-tree buffer with full **undo (`Ctrl+Z`) / redo (`Ctrl+Y`)**. There is no `Ctrl+Shift+Z`.
 - **Selection**: `Shift`+any movement key, mouse drag, **double-click for a word**, **triple-click for
   a line**, `Ctrl+A` for all, `Esc` to clear.
+- **`Ctrl+A` skips the blank tail, and a second press takes everything.** A run of blank rows *after*
+  the last content is trailing whitespace and is left out; a blank line *between* two paragraphs is
+  content and stays selected. Whitespace-only rows count as blank, and a document that is entirely
+  blank selects in full so `Ctrl+A` never appears to do nothing. **This is a deliberate divergence** —
+  VS Code, Notepad and Sublime all select the whole buffer — which is why the second press exists:
+  select-all-then-delete is still one extra keystroke away. The backward scan is capped at 1 MiB and
+  falls back to selecting everything past it, so a multi-GB log with a huge blank tail cannot stall the
+  keystroke.
 - **Clipboard**: `Ctrl+C` / `Ctrl+X` / `Ctrl+V` via `CF_UNICODETEXT`. Pasted text is converted to the
   document's own line endings (the Windows clipboard is CRLF by convention); copied text is *not*
   rewritten on the way out.

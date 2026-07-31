@@ -3,7 +3,7 @@
 **A Windows-first, ultra-fast, ultra-small notepad replacement in the spirit of File Pilot.**
 Compiled 2026-07-18 from a 102-agent research workflow (20 sources fetched, 97 claims extracted, 25 adversarially verified: 23 confirmed / 2 refuted) plus the full BSC 2025 File Pilot engine talk transcript ([notes](filepilot-engine-talk-notes.md)).
 
-Constraints from Wyatt: shipped product; scope closer to Windows Notepad than Notepad++; fully handmade (own UI, own text pipeline, own lexers); narrow plugin support (formatters/viewers) after V1; Wyatt directs the work.
+Constraints from Wyatt: ~~shipped product~~; scope closer to Windows Notepad than Notepad++; fully handmade (own UI, own text pipeline, own lexers); narrow plugin support (formatters/viewers) after V1; Wyatt directs the work.
 
 ---
 
@@ -49,6 +49,10 @@ Skip OpenGL entirely (File Pilot's stated regret; verified). D3D11 over D3D12: w
 The triple-validated recipe (File Pilot + refterm/AtlasEngine + Zed): on glyph-cache miss, DirectWrite (IDWriteFontFace::GetGlyphRunOutline/rasterize via IDWriteGlyphRunAnalysis) renders the glyph into an alpha-only GPU atlas; frames then draw pure atlas quads in one instanced call. Cache shaping results per line; ClearType/grayscale AA per user setting. Proportional fonts are fine (Zed does it); monospace fast-path optional.
 
 ### Text buffer: **piece table over a memory-mapped original + append buffer**
+
+```cs
+	Console.Write("Hello World")
+```
 
 ⚠️ *Sourced but not adversarially verified this round — from fetched primary sources, flagged as an open question.*
 
@@ -141,3 +145,10 @@ Primary: BSC 2025 talk (full transcript), filepilot.handmade.network, filepilot.
 Secondary/community: HN File Pilot thread, coredumped.dev gap-buffer-vs-rope benchmarks, cdacamar editor-data-structures benchmarks, min-sized-rust, Notepad++ community forum, handmade.network D3D11 text-rendering forum.
 
 Refuted during verification (do not repeat): "File Pilot fits on a floppy" (0-3); "zigwin32 is complete, no hand-written declarations needed" (1-2).
+
+
+
+
+
+
+

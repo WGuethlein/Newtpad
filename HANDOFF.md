@@ -18,88 +18,84 @@ whole-branch review at the end, sabotage every test, then HANDOFF entry → vers
 `install.ps1`. It also carries the two bug *shapes* this codebase keeps producing and the
 operational traps that have each cost a session real time. Unlike `CLAUDE.md`, it is committed.
 
-### Where things stand — read this first (2026-07-26)
+### Where things stand — read this first (2026-07-31)
 
-**Batch 6 is merged; v0.16.0 tagged, released and installed.** `v0.13.0` through `v0.16.0` are all
-tagged with the exe attached. The installed binary is v0.16.0 — **1.01 MB, down from 1.43 MB**,
-because the headless harness no longer ships inside it (§6z).
+**v0.35.0 is merged, tagged, released and installed.** Newtpad is Wyatt's daily Notepad replacement and
+has been all along; the exe is **1.25 MB**. Everything below `§6` is a dated log of how it got here, and
+the last four sections (§6ax–§6bb) are today.
 
-**The road to V1 is sequenced in §6aa (2026-07-26), which supersedes §6u's batch table.** The V1
-feature list is *done* — five of research §G's six V1 decisions shipped and the sixth was deferred
-to V2 — so what remains is hard-rule debt, one batch of promises from CLAUDE.md's own principles,
-and distribution. The UI overhaul moved to V2; a free public beta precedes the paid V1.
+**The three live queues are the entry point for new work, not this file:**
 
-**Batch 7 is merged; v0.17.0.** Tab stops, `\\?\` long paths, CSS/SQL line comments, and the five
-findings batch 6 carried — see §6ab. Two of its five planned items turned out **not to be real**
-(glyph-atlas eviction was refuted by measurement, and tabs were already 4 cells, not 1), which is
-worth reading before trusting any other "X is missing" claim in this file.
+| File | Holds |
+|---|---|
+| [docs/reported-bugs.md](docs/reported-bugs.md) | bugs reported from daily use, not yet fixed |
+| [docs/requested-features.md](docs/requested-features.md) | everything owed or asked for, with the decisions already taken |
+| [docs/features.md](docs/features.md) | what already works — check here before believing "X is missing" |
 
-**The installed binary is still v0.16.0.** Batch 7 merged under Wyatt's overnight policy: merge, do
-not `install.ps1`. Run it after the live pass in §6ab's "Owed".
+They are **queues, not histories**: when an item ships it is deleted from them and recorded in a `§6`
+entry here. If one of them and this file disagree about what is owed, the queue is newer.
 
-**Live-pass checklist for everything since v0.16.0:
-[docs/live-pass-batches-7-11.md](docs/live-pass-batches-7-11.md).** Five batches, ~120 commits, none
-of it verified against real GUI input. Section 1 is the six that would be worst to ship broken.
+**What shipped on 2026-07-31 (v0.33.0 → v0.35.0, six releases in a day):**
 
-**Batch 11 is merged; v0.20.0 — ship-readiness, the last batch before the beta.** Check for Updates,
-a crash-report path, LICENSE (PolyForm Internal Use 1.0.0), and an Inno Setup installer. §6af ends
-with the **beta checklist**: what is buildable, and what is Wyatt's. Two items there block a beta —
-the license grants a hobbyist tester nothing, and the installer has never been compiled.
+- **Batch 18 finished** — §10's table view is complete: row numbers, click-to-sort, numeric/date
+  right-align, drag-to-resize and double-click-to-fit, malformed-row marking, a summary row. **The sort
+  is view-only and never rewrites the file**, and editing a cell while sorted still writes to that
+  cell's own line (§6ax).
+- **A sparse line index** (§14's owed piece) — `doc_line_no_at(byte) -> (line_no, exact)`, bounded, with
+  checkpoints repaired on every edit so row numbers survive editing *and* saving. Three table features
+  were blocked on this and nobody had named it (§6ax).
+- **Six live-use defects** across two passes (§6ay, §6az), including the grid's horizontal scroll, which
+  was panning by *column index* while its scrollbar thumb was sized in *pixels*.
+- **The window no longer flashes white on launch** — it was 196 ms of empty window in front of
+  `gfx_init`, present since long before it was noticed (§6ba).
+- **`Ctrl+A` no longer selects the trailing blank rows**, a deliberate divergence from VS Code, Notepad
+  and Sublime (§6bb).
+- **The exe finally has a version resource.** It shipped with empty `FileVersion`/`CompanyName`/
+  `ProductName` for its entire life, which is one half of why a GitHub download tripped Defender.
 
-**Batch 10 is merged; v0.19.0 — the last feature batch before the beta.** Sort lines, remove
-duplicate lines, and `rules.txt` keyword colouring. §6ae's "what it got wrong" is the useful half:
-a column rectangle silently escalated a sort to the whole file, and the colour rules' own seeded
-header promised something the precedence order does not deliver on `.log` files.
+**Verified by Wyatt on real pixels, 2026-07-31:** Ctrl+A, the launch change (focus is correct from the
+shortcut and from Explorer), and the table view. Those live-pass items are closed; do not re-raise them.
 
-**Batch 9 is merged; v0.18.0.** Keys and navigation — `keys.txt` rebinding, bookmarks, scrollbar
-match marks, filter click-to-jump, and filter's first paint. See §6ad, whose "what this batch got
-wrong" section is the useful half: six tests that could not fail, two correct functions composing
-wrongly, and two draw-order defects no per-task review could see.
+**The one thing outstanding that needs a person, not code:** a **Defender false-positive submission**,
+which needs Wyatt's account. VirusTotal on v0.33.0 returned **1 detection of ~40** — Microsoft
+`Trojan:Win32/Wacatac.B!ml`, the `!ml` suffix being their own marker for a machine-learning verdict —
+while every other ML engine on the panel returned clean. Nothing is vendored and the updater cannot
+download or execute anything; both were verified. Details in `requested-features.md` §3.
 
-**Batch 8 is specced and its scope halved** — `docs/superpowers/specs/2026-07-27-batch-8-design.md`.
-Build time turned out already resolved (measured: 5.1 s, §5) and the arena decision was settled in
-batch 7, leaving precompiled `.cso` shaders (which the 2026-07-25 audit downgraded itself) and
-**batching the text pipeline**, which is the only item that buys anything — it unblocks the
-always-on line-number gutter.
+**Where the roadmap stands.** §6aa is still the plan of record: the V1 feature list is done, the UI
+overhaul and the `renderer`/`ui` extraction are V2, and a free public beta precedes the paid V1. Two
+things still block a beta and both are Wyatt's: **code signing** (the pipeline is signing-*ready*;
+never handle a certificate or its password) and a licence that grants a tester something.
 
-**One batch-8 task is already merged: `drawcount` is now headless.** It renders a real frame
-offscreen, prints draw calls plus an instance-stream digest, and exits — so the batching work has an
-instrument for the first time, and a §6 trap is retired. **It is not yet sufficient to sign that work
-off**, and the four limits are listed at the mode itself in `test_modes.odin`; the sharpest is that
-the digest hashes UVs, which encode glyph first-use order, so a batching pass that regroups draws
-moves the digest with zero pixel change. Read them before batch 8b.
+**The `renderer`/`ui` extraction got measurably harder today and this is the moment to know it.**
+`doc.odin` → `table.odin` went from **1 call site to 8**, all pointing upward under the planned
+boundary; the sharpest is `pt_edit_replace` → `table_sort_shift`, the buffer-write primitive now calling
+into a view module beside `ckpt_repair` and `bookmarks_shift_replace`. That was the right call — "hook
+the one procedure nothing can avoid" is why the sort's lifetime is correct by construction rather than
+by seven remembered call sites — but **design the observer list before extracting, not during** (§6ax).
 
-**Both batch-8 questions answered by Wyatt, 2026-07-27:** (1) **yes to an always-on line-number
-gutter, but as a toggle** — off by default, so the text-pipeline batching that unblocks it stays
-justified and stays batch 8b; (2) grid horizontal scrolling should genuinely work rather than be
-hidden, which is now fixed (see below). The pixel-harness question is still open and is the one that
-decides whether 8b can be verified at all.
+**Two claims that were checked and found false, recorded so they are not re-derived:**
 
-**Superseded — the two questions at the end of the batch-8 spec** — whether the
-line-number gutter is actually wanted (it is batching's whole justification) and whether a pixel
-readback harness is worth building, or whether Wyatt's live pass is the intended verification for
-renderer work from here on.
+- `odin check src/program` **does** catch undeclared names and exit 1, so development-loop §5's
+  per-commit bisectability sweep is not vacuous. A fixing agent reported the opposite (§6az).
+- `WATCH_MAX` 32 → 64 was named as the likely cause of a startup/shutdown regression. Measured, the old
+  value was *slower*, and **there was no regression at all** — five tagged builds timed identically
+  (§6ba). Fixing that by inspection would have reverted a good change and left the symptom.
 
-**Three things Wyatt owes, all ranked in their own sections and none blocking:**
+**The recurring failure this project has not solved.** Eleven consecutive batches have shipped draft
+test code that **could not fail** — an assertion whose fixture never reaches the condition it names.
+Today alone: `palettetest`, `hscrolltest` and `tablegridtest` each printed `FAIL` and exited **0**, and
+several freshly written assertions were found vacuous by sabotage, including ones written minutes
+earlier by the agent that then caught them. **Sabotage discipline (development-loop.md §3) is the only
+thing that has ever caught these.** Do not skip it, and record the actual failure output — "I verified
+it fails" without the output has been wrong more than once.
 
-0. **§6z's live pass** on batch 6 — the `Encoding` menu on a real window, a reopen under a forced
-   encoding, a `.md` left in Split surviving a restart, and one Ctrl+Z after a held column edit.
+**Traps that cost real time today**, beyond those already in development-loop.md §6:
 
-1. **§6x's theme-tuning pass.** v0.14.0 added *View → Edit Current Theme...*, which writes the active
-   theme to a file, switches to it, and opens it as a tab — edit a colour, Ctrl+S, the window updates.
-   Dark's syntax colours were chosen by arithmetic and have been seen once. Sample files for it are at
-   `C:\Users\Wyatt\Newtpad-testfiles`.
-2. **The rest of §6y's column-editing gesture list.** Items 1-3 and 5 were passed and their findings
-   fixed in v0.15.1; items 4 and 6-8 are unconfirmed.
-
-**Decided, deliberately not built:** the column-edit region-splice fix (§5). At the shipped 300-row
-cap performance is fine (press 50 = 13.8 ms); what bites is the *limit*, and its failure mode is a
-refusal, not damage. Wyatt's call was that it is not needed yet. §5 carries the measurements so
-whoever picks it up does not re-derive them — **and does not re-diagnose it, which has now gone wrong
-twice.**
-
-**The `.superpowers/sdd/` ledger is complete through v0.15.1** and is scratch, not history — HANDOFF
-§6v-§6y is the record.
+- `Set-Content -Encoding UTF8` adds a **BOM** and corrupted two source files. Use the Write/Edit tools.
+- A sabotage that **fails to compile** is indistinguishable from a sabotage that breaks nothing — the
+  stale exe runs and prints `0 failures`. Check the build's exit code before believing a green run.
+- `build.bat` prints a harmless `'vswhere.exe' is not recognized` line. It is **not** a failure.
 
 ## 1. What Newtpad is
 
@@ -4857,10 +4853,11 @@ row, on the grounds that a drag lost mid-motion is unrecoverable while a missed 
 
 ### Owed
 
-- **None of the appearance has been rendered.** Geometry is asserted; this environment cannot inject
-  GUI input. Worth Wyatt's eyes: `Bg_Hover` against the header's `Bg_Raised` in **Light** (close
-  values), the ghost arrow's legibility, whether the ~2-cell arrow slot truncates a header he cares
-  about, and how much right-hand emptiness feels right on real files.
+- ~~**None of the appearance has been rendered.**~~ **CONFIRMED by Wyatt on real pixels, 2026-07-31:
+  *"table looks good"*.** Closed. The open sub-items it listed — `Bg_Hover` against `Bg_Raised` in
+  **Light**, the ghost arrow's legibility, and whether the ~2-cell arrow slot truncates a real header —
+  were not individually enumerated back, so treat them as passing in Dark at 96 DPI and no more than
+  that.
 - **The per-column dropdown supersedes the item-3 fix.** Wyatt asked for multi-column sort and
   Excel-style column filtering in the same message; a labelled dropdown (Sort ascending / Sort
   descending / Clear sort / Filter) is the real answer to discoverability rather than a patch. The
@@ -4915,9 +4912,8 @@ someone rewrite a working process.
 
 ### Owed
 
-- **None of this has been rendered.** Chiefly: whether the narrow-table right edge now reads as
-  *narrow* rather than *broken*, the feel of `Shift+wheel` at four cells a notch, and the summary strip
-  staying full width while the bands above it stop short.
+- ~~**None of this has been rendered.**~~ **CONFIRMED by Wyatt, 2026-07-31: *"table looks good"*.** The
+  narrow-table right edge reads correctly and the pixel h-scroll is accepted. Closed.
 - Confirm whether the `-define:NEWTPAD_TESTS` gap above is real, and if so make the bisectability sweep
   check the configuration that actually ships.
 
@@ -4973,12 +4969,13 @@ He also chose to keep `perf.odin` — an environment-gated (`NEWTPAD_PERF`) mark
 unset, added because a GUI-subsystem exe cannot print and this project keeps needing numbers it has no
 way to take.
 
-### Owed, and item 1 is a real risk
+### Owed
 
-- **Does the window still take focus on launch?** `WS_VISIBLE` at creation got activation from the
-  shell's launch rules for free; a window shown 220 ms later does not, so `window_show` calls
-  `SetForegroundWindow`. It measured identical to the old build here, but **this environment cannot
-  reproduce a real shell launch** — needs the shortcut and an Explorer double-click. One line to
+- ~~**Does the window still take focus on launch?**~~ **CONFIRMED by Wyatt, 2026-07-31: *"launch is
+  better"*.** This was the batch's one real risk — `WS_VISIBLE` at creation got activation from the
+  shell's launch rules for free, and a window shown 220 ms later does not, so `window_show` calls
+  `SetForegroundWindow` explicitly. Verified from a real shell launch, which this environment cannot
+  reproduce. Closed. Original note kept below for the mechanism: one line to
   reverse.
 - **High DPI is unverified**; everything was measured at 96 DPI.
 - **220 ms to first frame is 133 ms of `D3D11CreateDevice`.** Getting on screen sooner means painting a
@@ -5060,8 +5057,7 @@ development-loop §6.
 
 ### Owed
 
-- **No live GUI pass.** Press `Ctrl+A` twice on a real blank-tailed file and confirm the first trims and
-  the second takes everything.
+- ~~**No live GUI pass.**~~ **CONFIRMED by Wyatt, 2026-07-31: *"ctrl+a wworks"*.** Closed.
 - The 1 MiB cap is judgement matched to an existing constant, not a measurement of what users have.
 - Wrapped documents are not covered by the selection-rect and scroll assertions.
 
