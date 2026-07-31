@@ -53,10 +53,28 @@ TABLE_EMPTY_CELL :: "—"
 TABLE_HEADER_H_96 :: f32(30)
 TABLE_ROW_H_96 :: f32(26)
 TABLE_CELL_PAD_X_96 :: f32(10)
+TABLE_GUTTER_W_96 :: f32(56) // §10's row-number gutter, right-aligned, from x = 0
 
 TABLE_HEADER_H := TABLE_HEADER_H_96
 TABLE_ROW_H := TABLE_ROW_H_96
 TABLE_CELL_PAD_X := TABLE_CELL_PAD_X_96
+TABLE_GUTTER_W := TABLE_GUTTER_W_96
+
+// Width of the row-number gutter. A procedure, not the global read directly, for
+// the same reason table_row_h is one: it is an input to table_cols_layout -- the
+// grid's single x-axis producer -- and every consumer of the x axis therefore
+// picks it up without knowing it exists. A draw that offset by 56px while the
+// hit-test did not would write a cell edit into the wrong column, which is the
+// exact divergence table_cols_layout's block comment was written about.
+//
+// FIXED, not sized to the widest visible number. A content-sized gutter would
+// move every column sideways the moment the view scrolled from row 9,999 to row
+// 10,000, and "columns don't shift as you scroll" is the property
+// table_compute_widths' one-time sample exists to hold. The cost is that a row
+// number past ~5 digits does not fit inside 56px minus its padding; see the
+// gutter pass in table_draw for what happens then, which is emphatically not
+// truncation.
+table_gutter_w :: #force_inline proc() -> f32 {return TABLE_GUTTER_W}
 
 // --- the grid's vertical geometry: ONE producer ---------------------------
 //
@@ -270,10 +288,19 @@ table_start_col :: #force_inline proc(doc: ^Document) -> int {
 // `cx += (colw[c] + TABLE_COL_PAD) * char_w` from their own origin, which is
 // precisely the divergence that writes an edit into the wrong column.
 //
-// Cells tile from x = 0, not from TEXT_MARGIN_X. §10's "cell padding 0 10" is
-// the grid's own left inset, and the zebra band has to reach the window edge to
-// read as a row at all -- a band starting 24px in reads as a box. (§10's
-// row-number gutter, group B, takes that 56px from the same origin.)
+// Cells tile from table_gutter_w(), not from x = 0 and not from TEXT_MARGIN_X.
+// §10's "cell padding 0 10" is the grid's own left inset, and §10's row-number
+// gutter takes its 56px from the origin ahead of the first cell. The gutter is
+// added HERE, inside the one producer, precisely so that the draw, the cell
+// hit-test, the link layout, the in-cell edit box and the horizontal scrollbar
+// all move by it together -- four of those five once advanced their own copy of
+// this axis, and a gutter added to the draw alone would have re-created that
+// divergence in its worst form (a click resolving to the column to its left, and
+// an edit committing there).
+//
+// The zebra band and the header band still span from x = 0 and cover the gutter:
+// a band has to reach the window edge to read as a row at all -- one starting
+// 56px in reads as a box around the data.
 //
 // A column that STARTS before the right edge is included even if it runs past
 // it, so a partly-visible column is drawn and clickable rather than dead; the
@@ -283,7 +310,7 @@ table_cols_layout :: proc(doc: ^Document, char_w, width: f32, start_col: int, al
 	colw := doc.table_widths
 	if len(colw) == 0 {return out[:]}
 	right := table_right(width)
-	x := f32(0)
+	x := table_gutter_w()
 	for c := clamp(start_col, 0, max(0, len(colw) - 1)); c < len(colw); c += 1 {
 		if x >= right {break}
 		w := f32(colw[c]) * char_w + TABLE_CELL_PAD_X * 2
@@ -518,7 +545,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	// grid louder than the data"). One quad per banded row, spanning the full
 	// grid width so the band reads as a row rather than as a box around the text.
 	//
-	// Parity rides the row's ABSOLUTE position in the file (table_abs_row), not
+	// Parity rides the row's ABSOLUTE position in the file (table_abs_rows), not
 	// its visible index. It used to ride the visible index because the absolute
 	// one could not be had without counting newlines from byte 0 -- unbounded on a
 	// multi-GB CSV, and exactly what the viewport-first rule forbids. Line_Index's
@@ -541,6 +568,72 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 		band := absn[r] % 2 if absn[r] != TABLE_ABS_NONE else r % 2
 		if band == 0 {continue}
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_row_rect_y(px, r)}, size = {right, row_h}, color = zebra}})
+	}
+
+	// The row-number gutter (§10: "56px right-aligned gutter"). Over the bands,
+	// under nothing -- it occupies the 56px table_cols_layout already stepped the
+	// first cell past, so it cannot collide with any cell's text by construction
+	// rather than by two numbers agreeing.
+	//
+	// A REFUSED row draws NO NUMBER. table_abs_rows hands back TABLE_ABS_NONE
+	// when the file's numbering cannot be answered -- the background index has not
+	// reached the row, the buffer was edited at or below it, or a mapped read
+	// faulted -- and a plausible-looking wrong row number is worse than a blank,
+	// because the reader has no way to tell it apart from a right one. This is
+	// development-loop.md §4 Shape A, and blank is the honest answer.
+	//
+	// KNOWN, and accepted rather than papered over: nothing RAISES
+	// Line_Index.edit_floor once an edit has lowered it, and doc_save does not
+	// re-index, so after editing a cell the numbers at and below that row stay
+	// blank for the life of the tab -- including after a save, which is the moment
+	// a user would most expect them back. Guessing a number here would be exactly
+	// the Shape A the flag exists to prevent; the real fix is doc_save restarting
+	// the index over the saved bytes, which is a change to SAVE behaviour and
+	// Wyatt's call, not a drive-by in the gutter. See the batch-18 plan, §3a.
+	//
+	// Text_Muted, not the Text_Dim §10 literally names, and the reasoning is
+	// TABLE_EMPTY_CELL's applied to a second case. Text_Dim is theme.odin's
+	// disabled-only tier (2.9:1 Dark / 2.8:1 Light, below the AA floor); the
+	// exemption it rests on is that a disabled control's dimness is redundant with
+	// the control not responding. A row number is not redundant with anything --
+	// §10's own justification for the gutter is that "counting rows by hand is the
+	// gap", so the number IS the information, and a reader who cannot resolve it
+	// has lost the whole feature. themetest's Text_Dim allowlist already holds
+	// table.odin at zero for precisely this argument (it was raised as a review
+	// finding against the em dash and the dash was moved off Text_Dim), and the
+	// editor's own line-number gutter has always drawn in Text_Muted. Three
+	// precedents, one answer. Recorded here because the batch-18 plan recommended
+	// Text_Dim and this deviates from it deliberately.
+	//
+	// Text_Secondary on the current row is §10's, kept as written: that role
+	// clears AA in both themes, so it is a legitimate brightening rather than a
+	// second dim tier. "Current" is the row with an open cell edit -- the grid
+	// takes no caret, so that is the only row this surface ever calls current.
+	{
+		num_fg := g_theme[.Text_Muted]
+		cur_fg := g_theme[.Text_Secondary]
+		gw := table_gutter_w()
+		for _, r in vis {
+			if absn[r] == TABLE_ABS_NONE {continue}
+			// 1-based, because a reader counts from one. It coincides with the
+			// FILE's line number (data row 0 is line 1, the header being line 0),
+			// which is a convenience rather than a second meaning: both readings
+			// name the same row.
+			label := fmt.tprintf("%d", absn[r] + 1)
+			w := f32(plat.text_cells(text, transmute([]u8)label, 0, .Doc)) * char_w
+			// Right-aligned to the gutter's inner edge, and CLAMPED AT 0 rather
+			// than truncated. Cutting digits off a row number silently changes
+			// which row it names -- 10432 truncated to 1043 is not a shortened
+			// label, it is a different row -- so a number too wide for 56px runs
+			// left to the window edge and then keeps its full value, encroaching
+			// on the first cell's left padding instead. That is a cosmetic
+			// collision at six digits and up; a truncated number would be a lie at
+			// every zoom level.
+			gx := max(f32(0), gw - TABLE_CELL_PAD_X - w)
+			colour := num_fg
+			if doc.table_editing && doc.table_edit_row == r {colour = cur_fg}
+			plat.text_draw(gfx, text, label, gx, table_row_baseline_y(px, r), px, colour, .Doc)
+		}
 	}
 
 	// Pass 2: the cell text, column by column.

@@ -9393,6 +9393,7 @@ when NEWTPAD_TESTS {
 					TABLE_HEADER_H = sx(TABLE_HEADER_H_96)
 					TABLE_ROW_H = sx(TABLE_ROW_H_96)
 					TABLE_CELL_PAD_X = sx(TABLE_CELL_PAD_X_96)
+					TABLE_GUTTER_W = sx(TABLE_GUTTER_W_96)
 					TOP_INSET, FILTER_BANNER_H = 0, 0
 
 					px := f32(int(BASE_PX_96 * scale + 0.5))
@@ -9552,6 +9553,7 @@ when NEWTPAD_TESTS {
 				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
 				px := BASE_PX_96
 				cw := plat.text_char_width(&t, px, .Doc)
 				W := f32(1000)
@@ -9699,6 +9701,73 @@ when NEWTPAD_TESTS {
 					chk(&bad, table_header_h(big) >= line_height(big), fmt.tprintf("...and so does the header (%.0f vs %.0f)", table_header_h(big), line_height(big)))
 					chk(&bad, table_row_h(BASE_PX_96) == TABLE_ROW_H, fmt.tprintf("at the default size the SPEC's number governs (%.0f)", table_row_h(BASE_PX_96)))
 				}
+
+				// 11. The row-number gutter's SEAM (§10, group B). The gutter is
+				//     56px taken from x = 0, and it is added inside
+				//     table_cols_layout -- the one x-axis producer -- so that the
+				//     draw, the cell hit-test, the link layout, the edit box and the
+				//     h-scrollbar all move by it together. The failure this guards
+				//     is not cosmetic: a draw offset by 56px over a hit-test that
+				//     was not resolves a click to the column LEFT of the one under
+				//     the pointer, and table_edit_commit writes that column's bytes.
+				//
+				//     So the probes are the two pixels either side of the boundary,
+				//     not a midpoint: what is DRAWN in the gutter must not be
+				//     CLICKABLE as a cell, and the first pixel past it must be
+				//     column 0's own.
+				{
+					gw := table_gutter_w()
+					chk(&bad, gw == TABLE_GUTTER_W_96, fmt.tprintf("the gutter is %.0fpx at 96 DPI (§10: 56)", gw))
+					chk(&bad, cols[0].x == gw, fmt.tprintf("the first cell starts AT the gutter's edge: x=%.1f (want %.1f)", cols[0].x, gw))
+					my := table_row_baseline_y(px, 0)
+					misses := 0
+					for probe in ([]f32{0, gw * 0.5, gw - 1, gw - 0.5}) {
+						if ok, _, _, _, _, _ := table_cell_at(&doc, probe, my, px, cw, trows, W); ok {
+							misses += 1
+							fmt.printfln("    x=%.1f inside the gutter resolved to a cell", probe)
+						}
+					}
+					chk(&bad, misses == 0, fmt.tprintf("no pixel of the gutter resolves to a cell (%d did)", misses))
+					okg, rg, cg, fsg, feg, _ := table_cell_at(&doc, gw + 1, my, px, cw, trows, W)
+					wg, _ := want_field(lines[:], 1, 0)
+					chk(
+						&bad,
+						okg && rg == 0 && cg == 0 && read_span(&doc, fsg, feg) == wg,
+						fmt.tprintf("...and the first pixel past it is row 0, column 0 (%q, want %q)", read_span(&doc, fsg, feg) if okg else "<no hit>", wg),
+					)
+					// Every OTHER consumer of the x axis moved with it. Enumerated
+					// rather than assumed: each of these derives its x from
+					// table_cols_layout, and this is what says so in a form that
+					// fails if one of them ever grows its own origin again.
+					//
+					//     The link probe needs a fixture with a URL in it, so it
+					//     gets its own document rather than a `len == 0` escape
+					//     hatch -- "no links were laid out" would satisfy any
+					//     assertion about where they start.
+					{
+						lsrc := "u,v\nhttps://example.com,x\nb,y\n"
+						lc := make([]u8, len(lsrc))
+						copy(lc, transmute([]u8)lsrc)
+						ld := doc_from_content(lc, "links.csv", .UTF8)
+						defer doc_close(&ld)
+						ld.table, ld.table_delim = true, ','
+						table_compute_widths(&ld, &t)
+						ld.table_cols = len(ld.table_widths)
+						tl := table_links(&ld, &t, px, cw, trows, W)
+						lmin := f32(1e9)
+						for l in tl {lmin = min(lmin, l.x)}
+						chk(&bad, len(tl) > 0, fmt.tprintf("the link fixture really does produce a link (%d)", len(tl)))
+						chk(&bad, len(tl) > 0 && lmin >= gw, fmt.tprintf("the link layout starts past the gutter (leftmost x=%.1f, gutter %.1f)", lmin, gw))
+					}
+					chk(&bad, table_cell_text_x(cols[0]) >= gw, fmt.tprintf("the cell TEXT x -- the edit box's and the draw's -- is past it too (%.1f)", table_cell_text_x(cols[0])))
+					// The h-scrollbar's span comes from the same layout, so the
+					// gutter eats real column room and the span must reflect it.
+					// A window exactly one gutter wider fits exactly what the
+					// un-guttered one did, which is only true if both read the
+					// same origin.
+					narrow := table_cols_fitting(&doc, cw, gw + cols[0].w + 1, 0)
+					chk(&bad, narrow == 1, fmt.tprintf("the h-scrollbar's span counts columns from the gutter (%d fits in gutter+1 column, want 1)", narrow))
+				}
 				return
 			}
 
@@ -9728,6 +9797,7 @@ when NEWTPAD_TESTS {
 				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
 				BASE_PX = BASE_PX_96
 				px := BASE_PX_96
 
@@ -9830,6 +9900,7 @@ when NEWTPAD_TESTS {
 				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
 				BASE_PX = BASE_PX_96
 				px := BASE_PX_96
 				ER :: 6 // the data row edited: on screen at the start, off it after a page
@@ -10013,6 +10084,7 @@ when NEWTPAD_TESTS {
 				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
 				BASE_PX = BASE_PX_96
 				px := BASE_PX_96
 				ER :: 11 // the row from the finding's own scenario
@@ -10177,6 +10249,7 @@ when NEWTPAD_TESTS {
 				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
 				BASE_PX = BASE_PX_96
 
 				// Four sentinel colours, maximally far apart in every channel, in
@@ -10318,6 +10391,7 @@ when NEWTPAD_TESTS {
 				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
 				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
 				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
 				BASE_PX = BASE_PX_96
 
 				// Sentinels, for tg_appearance's reason: Table_Zebra is deliberately
@@ -10485,7 +10559,126 @@ when NEWTPAD_TESTS {
 				return
 			}
 
+			// F6: the gutter's REFUSAL path, on pixels. The seam checks in tg()
+			// prove where the gutter is; nothing there can say whether a number was
+			// actually painted into it, and the one rule §10's gutter has that is
+			// not geometry is "a row the file's numbering cannot answer draws NO
+			// number" (development-loop.md §4, Shape A).
+			//
+			// A source count cannot see this and neither can the hit-test: the same
+			// code path runs either way and only the glyphs differ. So this draws
+			// the SAME fixture twice -- once with a finished Line_Index and once
+			// with none started -- and counts non-background pixels inside the
+			// gutter's 56px. Table_Zebra and Bg_Raised are set to the background so
+			// that the only thing that can light a pixel there is a glyph.
+			tg_gutter_pixels :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				W, H :: 1000, 700
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, W, H, "tablegridtest/gutter") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return 0
+				}
+				defer headless_gpu_destroy(&h)
+				saved_theme, saved_scale := g_theme, UI_SCALE
+				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				TABLE_GUTTER_W = TABLE_GUTTER_W_96
+				BASE_PX = BASE_PX_96
+
+				// Everything that is not a row-number glyph is black, so a lit
+				// pixel inside the gutter can only be the number.
+				black := [4]f32{0, 0, 0, 1}
+				g_theme[.Bg_Base] = black
+				g_theme[.Bg_Raised] = black
+				g_theme[.Border_Strong] = black
+				g_theme[.Table_Zebra] = black
+				g_theme[.Text_Muted] = {1, 1, 1, 1} // the row number
+				g_theme[.Text_Secondary] = {1, 1, 1, 1}
+
+				px := BASE_PX_96
+				char_w := plat.text_char_width(&h.text, px, .Doc)
+
+				lit :: proc(buf: []u8, w: int, x0, x1, y0, y1: int) -> (n: int) {
+					for y in y0 ..< y1 {
+						for x in x0 ..< x1 {
+							i := (y * w + x) * 4
+							if buf[i] > 60 || buf[i + 1] > 60 || buf[i + 2] > 60 {n += 1}
+						}
+					}
+					return
+				}
+				body :: proc() -> []u8 {
+					s := "h0,h1\n"
+					for i in 0 ..< 12 {s = fmt.tprintf("%sa%d,b%d\n", s, i, i)}
+					out := make([]u8, len(s))
+					copy(out, transmute([]u8)s)
+					return out
+				}
+
+				gw := int(table_gutter_w())
+				y0 := int(table_row_rect_y(px, 0))
+				y1 := int(table_row_rect_y(px, 3))
+
+				// 1. No index at all: doc_line_no_at has no checkpoints to answer
+				//    from, table_abs_rows refuses every row, and the gutter must be
+				//    empty. doc_from_content does not start the indexer, so this is
+				//    the state a fresh grid is in for its first frames -- not a
+				//    contrived one.
+				{
+					d := doc_from_content(body(), "noidx.csv", .UTF8)
+					defer doc_close(&d)
+					d.table, d.table_delim = true, ','
+					rows := table_visible_rows(&d, f32(H), px)
+					chk(&bad, table_abs_rows(&d, 1)[0] == TABLE_ABS_NONE, "precondition -- with no index started, the row number is refused")
+					plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+					table_draw(&h.gfx, &h.quads, &h.text, &d, px, char_w, rows, f32(W))
+					if buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); ok {
+						n := lit(buf, W, 0, gw, y0, y1)
+						chk(&bad, n == 0, fmt.tprintf("a refused row draws NO number: %d lit pixels in the gutter (want 0)", n))
+					} else {
+						chk(&bad, false, "the un-indexed readback succeeded")
+					}
+				}
+
+				// 2. The same fixture with a finished index: the numbers are there.
+				//    Without this the check above is satisfied by a gutter that
+				//    never draws anything at all.
+				{
+					d := doc_from_content(body(), "idx.csv", .UTF8)
+					defer doc_close(&d)
+					d.table, d.table_delim = true, ','
+					doc_index_start(&d)
+					for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+					rows := table_visible_rows(&d, f32(H), px)
+					chk(&bad, table_abs_rows(&d, 1)[0] == 0, "precondition -- with the index finished, row 0 is absolute row 0")
+					plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+					table_draw(&h.gfx, &h.quads, &h.text, &d, px, char_w, rows, f32(W))
+					if buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator); ok {
+						n := lit(buf, W, 0, gw, y0, y1)
+						chk(&bad, n > 0, fmt.tprintf("an answerable row DOES draw one: %d lit pixels in the gutter (want > 0)", n))
+						// ...and it stays inside the gutter: the first cell's text
+						// begins at gutter + padding, and a number spilling into it
+						// would overprint real data.
+						spill := lit(buf, W, gw, gw + int(TABLE_CELL_PAD_X), y0, y1)
+						chk(&bad, spill == 0, fmt.tprintf("...and it stays left of the first cell's padding (%d lit pixels there, want 0)", spill))
+					} else {
+						chk(&bad, false, "the indexed readback succeeded")
+					}
+				}
+				return
+			}
+
 			bad := tg_abs_cost()
+			bad += tg_gutter_pixels()
 			bad += tg()
 			bad += tg_page()
 			bad += tg_edit_anchor()

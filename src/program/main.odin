@@ -2203,6 +2203,7 @@ metrics_recompute :: proc(rc: ^Render_Ctx) {
 	TABLE_HEADER_H = dp(rc, TABLE_HEADER_H_96)
 	TABLE_ROW_H = dp(rc, TABLE_ROW_H_96)
 	TABLE_CELL_PAD_X = dp(rc, TABLE_CELL_PAD_X_96)
+	TABLE_GUTTER_W = dp(rc, TABLE_GUTTER_W_96)
 
 	// The non-client hit-test boundary is derived from the tab strip, so it is
 	// set here rather than at each call site — it was being scaled a second time
