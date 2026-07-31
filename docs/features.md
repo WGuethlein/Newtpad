@@ -265,18 +265,33 @@ Ctrl+clickable.
 ### Table view (CSV/TSV) — `Ctrl+T`
 
 A grid over `.csv .tsv .tab .psv`, with a sticky header row, a delimiter chosen automatically on first
-open, and column widths fitted from a 500-row sample (clamped 3–40 characters). Only visible rows are
-parsed, so a multi-GB CSV opens and scrolls like any other file.
+open, and column widths fitted from a 500-row sample (clamped 8–40 characters, leftover width shared
+out proportionally). Only visible rows are parsed, so a multi-GB CSV opens and scrolls like any other
+file.
 
 - **Cells are editable in place.** Click a cell to start; `Enter` commits, `Esc` cancels, `Tab` commits
   and steps to the next cell on the row, and arrows/Home/End move inside the cell. The edit splices a
   single field back into the buffer, undoably.
+- **Click a header to sort**, again to reverse, again to clear, with an accent arrow. **The sort is a
+  view, and the file is never rewritten** — it is a permutation over row offsets, and editing a cell
+  while sorted still writes to that cell's own line. Files over 100,000 data rows refuse the sort and
+  the summary row says why; the ceiling is a freeze budget (100,000 rows sort in ~285 ms on the main
+  thread, and a million took two seconds, which is a hung window rather than a slow feature).
+- **A row-number gutter**, 56px and right-aligned, with the current row brighter. A row whose absolute
+  number cannot be known — one still being indexed, or the continuation of a line over 8 KB — draws no
+  number rather than a guess.
+- **Numeric and date columns right-align**, detected by sampling. **Drag a header edge to resize a
+  column, double-click it to fit the content**; a width you set survives the recompute an edit triggers.
+- **Malformed rows are marked, not hidden** — a row whose field count disagrees with the header keeps
+  its place and gets a 2px warning bar on its left edge.
+- **A summary row** at the bottom: row count, column count and the active sort. The row count reads as
+  approximate (`~4.2M rows`) while the background line index is still running, rather than showing a
+  settled number that later changes.
 - **`Shift+wheel` pans columns.** **Ctrl+click follows a link inside a cell.**
 - Empty cells draw an em dash so "parsed, and empty" is distinguishable from "missing".
 - Fields quoted with `"` (and `""` escaping) are parsed within a line.
-- *Limits:* **no click-to-sort**, no row numbers, no numeric/date right-alignment, no drag-to-resize
-  columns, no malformed-row marker, no summary row. A quoted field spanning a newline is not handled —
-  each visible line is one row. Every other buffer-mutating command is blocked while the grid is up.
+- *Limits:* a quoted field spanning a newline is not handled — each visible line is one row. Sorting is
+  not persisted across a session. Every other buffer-mutating command is blocked while the grid is up.
 
 ### Zoom — `Ctrl+=` / `Ctrl+-` / `Ctrl+0`
 
