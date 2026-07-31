@@ -12509,7 +12509,233 @@ when NEWTPAD_TESTS {
 				return
 			}
 
+			// The four defects Wyatt reported from the first live pass on v0.34.0,
+			// as SEAM checks: what is drawn against what is clickable, at more than
+			// one DPI scale. Every one of them was a second producer -- two bands
+			// laid out from the same edge, a label truncated to a width the arrow
+			// had already claimed, an affordance with no rect at all -- so each
+			// assertion below compares two consumers of one geometry rather than a
+			// coordinate against a coordinate.
+			tg_live_pass :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.eprintln("tablegridtest (live pass): no fonts loaded")
+					return 1
+				}
+				// Wide enough that a 40-cell name could not be truncated by the
+				// window, and enough columns that the h-scrollbar has something to
+				// pan -- otherwise hscrollbar_geo returns shown = false and the
+				// overlap check below would pass against a bar that is not there.
+				//
+				// `dateiso` is exactly as wide as its own column (7 cells clamps up
+				// to TABLE_COL_MIN = 8, and the dates below are 10), so there is a
+				// header that FILLS its cell -- which is the only case where the
+				// arrow could be drawn through the label, and the case Wyatt
+				// screenshotted. `quantity_measured` is the same at the other end:
+				// long enough to be truncated whatever happens.
+				src := strings.join(
+					[]string {
+						"name,dateiso,quantity_measured,note",
+						"alpha,2026-01-14,10,first",
+						"bravo,2026-02-15,200,second",
+						"charlie,2026-03-16,30,third",
+						"delta,2026-04-17,4000,fourth",
+						"echo,2026-05-18,5,fifth",
+					},
+					"\n",
+					context.temp_allocator,
+				)
+				content := make([]u8, len(src) + 1)
+				copy(content, transmute([]u8)src)
+				content[len(src)] = '\n'
+				d := doc_from_content(content, "live.csv", .UTF8)
+				defer doc_close(&d)
+				d.table, d.table_delim = true, ','
+
+				// Three scales. The bottom band is the sum of a line-height metric
+				// and an sx()-rounded one, and the arrow's slot is a whole-pixel
+				// width divided by a fractional cell -- both round independently, so
+				// a reservation that is exactly right at 100% can be a pixel short at
+				// 125% and the overlap comes back one DPI at a time.
+				for sc in ([]f32{1.0, 1.25, 1.5}) {
+					UI_SCALE = sc
+					TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = sx(TEXT_MARGIN_Y_96), sx(TAB_STRIP_H_96), sx(MENU_BAR_H_96)
+					CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+					CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+					STATUS_BAR_H, SCROLLBAR_W = sx(STATUS_BAR_H_96), sx(SCROLLBAR_W_96)
+					TABLE_HEADER_H, TABLE_ROW_H = sx(TABLE_HEADER_H_96), sx(TABLE_ROW_H_96)
+					TABLE_CELL_PAD_X, TABLE_GUTTER_W = sx(TABLE_CELL_PAD_X_96), sx(TABLE_GUTTER_W_96)
+					TOP_INSET, FILTER_BANNER_H = 0, 0
+					BASE_PX = sx(BASE_PX_96)
+					px := BASE_PX
+					cw := plat.text_char_width(&t, px, .Doc)
+					W := f32(1400)
+					clear(&d.table_widths)
+					clear(&d.table_align)
+					table_compute_widths(&d, &t)
+					d.table_cols = len(d.table_widths)
+					ROWS :: 4
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
+					rows := table_visible_rows(&d, H, px)
+					cols := table_cols_layout(&d, cw, W, 0)
+					tag := fmt.tprintf("scale %.2f", sc)
+					if len(cols) != 4 || rows != ROWS {
+						chk(&bad, false, fmt.tprintf("%s: precondition -- 4 columns and %d rows (got %d, %d)", tag, ROWS, len(cols), rows))
+						continue
+					}
+
+					// --- 1. The summary row and the h-scrollbar do not overlap ---
+					//
+					// Both rects from their OWN producers, not from one restated
+					// here: hscrollbar_geo is what the drag hit-tests against and
+					// table_summary_y is what the summary is painted at, so this is
+					// exactly the pair that disagreed.
+					hm := hscroll_model(&d, &t, W, cw)
+					hb := hscrollbar_geo(&d, W, H, hm)
+					sy := table_summary_y(&d, H, px)
+					sh := table_summary_h(px)
+					chk(&bad, hb.shown && hm.kind == .Columns, fmt.tprintf("%s: precondition -- the h-scrollbar is really shown (%v, %v)", tag, hb.shown, hm.kind))
+					chk(&bad, sy + sh <= hb.y, fmt.tprintf("%s: the summary row ENDS above the h-scrollbar (%.1f vs %.1f)", tag, sy + sh, hb.y))
+					chk(&bad, hb.y + hb.h <= H - doc_bottom_bar_h(&d), fmt.tprintf("%s: ...and the bar still ends on the status bar (%.1f vs %.1f)", tag, hb.y + hb.h, H - doc_bottom_bar_h(&d)))
+					// The row budget reserves BOTH, so the last drawn row's bottom
+					// clears the summary. This is the half that makes the fix a
+					// layout change rather than a nudge: trim the band in the draw
+					// alone and a click on the summary resolves to a data row.
+					last := table_row_rect_y(px, rows - 1) + table_row_h(px)
+					chk(&bad, last <= sy, fmt.tprintf("%s: the last data row's bottom clears the summary band (%.1f vs %.1f)", tag, last, sy))
+					// ...and neither strip hit-tests as a cell. A press in either one
+					// must not start an edit on a row underneath it -- that is the
+					// data-loss shape, and the two strips are now adjacent.
+					okc, _, _, _, _, _ := table_cell_at(&d, table_cell_text_x(cols[0]), sy + sh * 0.5, px, cw, rows, W)
+					chk(&bad, !okc, fmt.tprintf("%s: a press on the summary band starts no cell edit", tag))
+					okb, _, _, _, _, _ := table_cell_at(&d, table_cell_text_x(cols[0]), hb.y + hb.h * 0.5, px, cw, rows, W)
+					chk(&bad, !okb, fmt.tprintf("%s: ...nor one on the h-scrollbar's strip", tag))
+
+					// --- 4. The arrow's slot is reserved BEFORE the label ---------
+					//
+					// The seam: the rectangle the arrow is drawn into against the
+					// right edge of the header text as the draw would truncate and
+					// nudge it. Checked on EVERY column and in BOTH alignments --
+					// `dateiso` is right-aligned (its column is dates) and fills its
+					// cell exactly, which is the case that smeared.
+					{
+						head := table_header_fields(&d)
+						overlaps, gaps_ok := 0, 0
+						for col in cols {
+							if col.c >= len(head) {continue}
+							a := table_sort_arrow_rect(col, px, table_right(W))
+							lab := table_header_label_col(col, cw, px)
+							hcells := plat.text_cells(&t, transmute([]u8)head[col.c], 0, .Doc)
+							if hcells > lab.cells {hcells = lab.cells}
+							hx := table_cell_text_x(lab) + table_cell_align_dx(lab, hcells, cw)
+							right_edge := hx + f32(hcells) * cw
+							if right_edge > a.x {overlaps += 1}
+							if a.x - right_edge >= table_arrow_gap() {gaps_ok += 1}
+						}
+						chk(&bad, overlaps == 0, fmt.tprintf("%s: no header label reaches into the arrow's slot (%d of %d did)", tag, overlaps, len(cols)))
+						chk(&bad, gaps_ok == len(cols), fmt.tprintf("%s: ...and every one keeps the gap beside it (%d of %d)", tag, gaps_ok, len(cols)))
+						// The slot is inside its own cell and on screen, so the
+						// arrow cannot be drawn over the neighbouring column.
+						strays := 0
+						for col in cols {
+							a := table_sort_arrow_rect(col, px, table_right(W))
+							if a.x < col.x || a.x + a.w > col.x + col.w || a.x + a.w > table_right(W) {strays += 1}
+						}
+						chk(&bad, strays == 0, fmt.tprintf("%s: every arrow slot stays inside its own column (%d strayed)", tag, strays))
+						// A column that FILLS its header is present, or the checks
+						// above are vacuous -- an all-short fixture satisfies them
+						// however the label is truncated.
+						filled := 0
+						for col in cols {
+							if col.c >= len(head) {continue}
+							if plat.text_cells(&t, transmute([]u8)head[col.c], 0, .Doc) >= col.cells {filled += 1}
+						}
+						chk(&bad, filled > 0, fmt.tprintf("%s: precondition -- at least one header fills its column (%d)", tag, filled))
+					}
+
+					// --- 3a. The header's hover state, and its precedence ---------
+					//
+					// The resize edge zone WINS: inside +/-4px of a boundary there is
+					// no hover affordance, because that is where the press does not
+					// sort either. Asserted as the exclusive-or over the whole header
+					// band rather than at three hand-picked x's, so a tolerance that
+					// changed on one side only cannot slip through.
+					{
+						hy := table_grid_top() + table_header_h(px) * 0.5
+						edge := cols[0].x + cols[0].w
+						tol := sx(TABLE_RESIZE_HIT_96)
+						_, hov_on_edge := table_header_hover_col(&d, cw, W, edge, hy, px)
+						_, cell_on_edge := table_header_col_at(&d, cw, W, edge, hy, px)
+						chk(&bad, cell_on_edge && !hov_on_edge, fmt.tprintf("%s: the resize zone wins -- the header cell is there (%v) but the sort hover is not (%v)", tag, cell_on_edge, hov_on_edge))
+						hc, hov_off := table_header_hover_col(&d, cw, W, edge - tol - 2, hy, px)
+						chk(&bad, hov_off && hc == 0, fmt.tprintf("%s: ...and %.0fpx further in it lights column 0 (%v, %d)", tag, tol + 2, hov_off, hc))
+						// Never both, anywhere along the band, and never a hover the
+						// press would not honour: main.odin tests the edge first and
+						// then this same producer, so hover == "a press here sorts".
+						both, mismatched := 0, 0
+						for x := table_gutter_w(); x < table_right(W); x += 3 {
+							_, on_edge := table_edge_at(&d, cw, W, x, hy, px)
+							hcol, on_hov := table_header_hover_col(&d, cw, W, x, hy, px)
+							ccol, on_cell := table_header_col_at(&d, cw, W, x, hy, px)
+							if on_edge && on_hov {both += 1}
+							// What the main loop's press does, re-derived: edge
+							// first, header second. It must agree with the hover.
+							press_sorts := !on_edge && on_cell
+							if press_sorts != on_hov || (on_hov && hcol != ccol) {mismatched += 1}
+						}
+						chk(&bad, both == 0, fmt.tprintf("%s: no pixel is both a resize edge and a sort hover (%d were)", tag, both))
+						chk(&bad, mismatched == 0, fmt.tprintf("%s: the hover lights exactly the pixels whose press sorts, and the same column (%d disagreed)", tag, mismatched))
+						// A DATA row is untouched by all of it -- the same x one row
+						// down still starts a cell edit.
+						_, hov_row := table_header_hover_col(&d, cw, W, cols[1].x + cols[1].w * 0.5, table_row_baseline_y(px, 0), px)
+						chk(&bad, !hov_row, fmt.tprintf("%s: a data row never hovers as a header", tag))
+					}
+
+					// --- 3b. The summary row's `click to clear` run ---------------
+					{
+						table_sort_clear(&d)
+						cold := table_summary_layout(&d, &t, H, px, cw)
+						chk(&bad, !cold.clearable, fmt.tprintf("%s: with no sort there is no clickable run at all", tag))
+						chk(&bad, !table_summary_clear_hit(cold, cold.x + 4, cold.y + cold.h * 0.5), fmt.tprintf("%s: ...so a press on the summary text does nothing", tag))
+
+						table_sort_click(&d, 1)
+						chk(&bad, table_sorted(&d), fmt.tprintf("%s: precondition -- sorted by column 1", tag))
+						sm := table_summary_layout(&d, &t, H, px, cw)
+						chk(&bad, sm.clearable, fmt.tprintf("%s: a live sort makes the run clickable", tag))
+						chk(&bad, strings.contains(sm.clear_text, "click to clear"), fmt.tprintf("%s: ...and it says so in words: %q", tag, sm.clear_text))
+						// The x is DERIVED INDEPENDENTLY here -- the head is ASCII
+						// plus middle dots, so its cell count is its rune count --
+						// rather than read back out of the same layout that produced
+						// it. A layout that measured the head with the wrong face
+						// would still be self-consistent and would still put the
+						// bright run somewhere the click is not.
+						want_x := TABLE_CELL_PAD_X + f32(utf8.rune_count(sm.head)) * cw
+						chk(&bad, abs(sm.clear_x - want_x) < 0.5, fmt.tprintf("%s: the run starts where the words start (%.1f, want %.1f)", tag, sm.clear_x, want_x))
+						want_w := f32(utf8.rune_count(sm.clear_text)) * cw
+						chk(&bad, abs(sm.clear_w - want_w) < 0.5, fmt.tprintf("%s: ...and is as wide as them (%.1f, want %.1f)", tag, sm.clear_w, want_w))
+						// The hit region: on the words yes, on `N rows` no, and
+						// outside the band in either direction no. The last two are
+						// the boundary this fix created -- a data row above it and
+						// the h-scrollbar's strip below it.
+						midy := sm.y + sm.h * 0.5
+						chk(&bad, table_summary_clear_hit(sm, sm.clear_x + sm.clear_w * 0.5, midy), fmt.tprintf("%s: a press on the words clears", tag))
+						chk(&bad, !table_summary_clear_hit(sm, sm.x + 2, midy), fmt.tprintf("%s: ...one on `N rows` does not", tag))
+						chk(&bad, !table_summary_clear_hit(sm, sm.clear_x + 2, sm.y - 1), fmt.tprintf("%s: ...nor one a pixel above the band", tag))
+						chk(&bad, !table_summary_clear_hit(sm, sm.clear_x + 2, sm.y + sm.h), fmt.tprintf("%s: ...nor one in the h-scrollbar's strip below it", tag))
+						chk(&bad, sm.y + sm.h <= hb.y, fmt.tprintf("%s: ...which is exactly where the bar begins (%.1f vs %.1f)", tag, sm.y + sm.h, hb.y))
+						table_sort_clear(&d)
+					}
+				}
+				UI_SCALE = 1
+				return
+			}
+
 			bad := tg_abs_cost()
+			bad += tg_live_pass()
 			bad += tg_abs_overcap()
 			bad += tg_sort_leaves()
 			bad += tg_gutter_pixels()
