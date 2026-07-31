@@ -671,11 +671,18 @@ main :: proc() {
 						}
 					}
 					window.mouse_pressed = false
-				} else if c, on_head := table_header_col_at(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); on_head {
+				} else if c, on_head := table_header_hover_col(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); on_head {
 					// §10's "click to sort with an accent arrow". AFTER the edge test
 					// above, never before: within ±4px of a boundary the user is
 					// aiming at the divider, and reordering the whole file on a
 					// slightly-off resize grab is not a recoverable surprise.
+					//
+					// Through table_header_hover_col rather than table_header_col_at,
+					// which makes that precedence part of the PRODUCER instead of a
+					// property of this `else`: the hover affordance (the lift and the
+					// ghost arrow, table_draw) asks the same procedure, so the pixels
+					// that advertise a sort are exactly the pixels that perform one,
+					// and the edge zone is excluded from both by one expression.
 					//
 					// Not a Command_Id and not in the palette, deliberately. The sort
 					// is a per-column gesture with no argument the palette could
@@ -695,6 +702,32 @@ main :: proc() {
 				} else {
 					table_resize_col = -1
 				}
+			}
+		}
+
+		// The summary row's `sorted by ... · click to clear` run: clicking the words
+		// clears the sort. The second half of the answer to "there is no discoverable
+		// way to reset the sort" -- the header's hover state says a click sorts, and
+		// this says, in words, what undoes it.
+		//
+		// AFTER the h-scrollbar block above and reading window.mouse_pressed, which
+		// that block zeroes on a press it claims. The two regions no longer overlap
+		// (table_bottom_band_h reserves a strip for each) but they share a boundary,
+		// and this ordering is what decides the pixel on it: the bar wins. That is
+		// the right way round -- a drag is a gesture in progress and losing it to a
+		// sort reset would be unrecoverable mid-motion, while a missed click on the
+		// summary costs one more click.
+		//
+		// The open cell edit is committed first, exactly as table_sort_click does and
+		// for the same reason: the anchor is still intact at this instant, so the
+		// value lands on the row the user typed it into rather than being dropped by
+		// table_edit_commit's fail-closed guard once the order changes underneath it.
+		if doc.table && doc.kind == .Text && window.mouse_pressed && !plat.key_ctrl_down() {
+			sm := table_summary_layout(doc, &text, f32(window.height), px, char_w)
+			if table_summary_clear_hit(sm, f32(window.mouse_x), f32(window.mouse_y)) {
+				if doc.table_editing {table_edit_commit(doc)}
+				table_sort_clear(doc)
+				window.mouse_pressed = false
 			}
 		}
 
@@ -808,6 +841,12 @@ main :: proc() {
 				// The SAME producer the press above hit-tests against, so the
 				// affordance appears exactly where the gesture works.
 				want = .SizeWE
+			} else if doc.table && doc.kind == .Text && table_summary_clear_hit(table_summary_layout(doc, &text, f32(window.height), px, char_w), f32(cx), f32(cy)) {
+				// The summary's `click to clear` run. Same producer as the press
+				// above and as the draw, so the words that say it is clickable, the
+				// pixels that clear the sort and the pointer that agrees all come out
+				// of one rectangle.
+				want = .Hand
 			} else if doc.find.active && find_action_at(doc, &text, f32(window.width), f32(cx), f32(cy)) != .None {
 				// Same geometry as the draw, the hover fill and the click. A
 				// button that looks pressable, fills on hover and does not change
@@ -1302,12 +1341,27 @@ hscroll_set :: proc(doc: ^Document, m: Hscroll, pos: int) {
 	}
 }
 
+// The bar's own thickness, at 96 DPI, and the procedure every consumer asks.
+//
+// A procedure rather than the literal it used to be because the GRID has to
+// RESERVE this strip. In the text view the bar is an overlay -- it floats over
+// the bottom of the last row, which is a sliver of a line the reader can scroll
+// away from -- but §10's summary row is a permanent band pinned to the same
+// bottom edge, so the two occupied the same 8px and the summary was painted
+// under the bar (Wyatt, live use, v0.34.0). Neither is optional, so the summary
+// yields: table_bottom_band_h reserves both out of the grid's row budget and
+// takes this number from here rather than restating it. A second copy of `8`
+// would put the reservation and the bar half a pixel apart at 125% and the
+// overlap would come back one DPI scale at a time.
+HSCROLLBAR_H_96 :: f32(8)
+hscrollbar_h :: #force_inline proc() -> f32 {return sx(HSCROLLBAR_H_96)}
+
 hscrollbar_geo :: proc(doc: ^Document, winw, winh: f32, m: Hscroll) -> (b: Hbar) {
 	if doc == nil || m.kind == .None || m.max <= 0 {return}
 	b.track_x = TEXT_MARGIN_X
 	b.track_w = winw - SCROLLBAR_W - TEXT_MARGIN_X
 	if b.track_w <= sx(30) {return}
-	b.h = sx(8)
+	b.h = hscrollbar_h()
 	b.y = winh - doc_bottom_bar_h(doc) - b.h
 	total := f32(m.max + max(1, m.span)) // full extent in this kind's unit
 	b.thumb_w = max(sx(24), b.track_w * f32(m.span) / total)
@@ -1674,7 +1728,20 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		}
 	} else if doc.table && doc.kind == .Text {
 		// Read-only grid view (CSV/TSV) replaces the text pass entirely.
-		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, trows, f32(window.width), f32(window.height))
+		//
+		// The hovered header cell comes from the LIVE cursor position, not from
+		// window.mouse_x/y: WM_MOUSEMOVE only updates those while a button is held,
+		// so a hover state driven by them would appear on press and never on hover,
+		// which is the §6j mistake the divider's own cursor block records. Resolved
+		// here rather than inside table_draw because the frame loop asks the same
+		// producer for the pointer shape, and a repaint that arrives without going
+		// round the loop (a resize) must still light the header the pointer is over.
+		hov := TABLE_SORT_NONE
+		{
+			hx, hy := plat.window_cursor_client(window)
+			if c, ok := table_header_hover_col(doc, char_w, f32(window.width), f32(hx), f32(hy), px); ok {hov = c}
+		}
+		bottom = table_draw(gfx, quad_pipe, text, doc, px, char_w, trows, f32(window.width), f32(window.height), hov)
 		// Underline links in the cells while Ctrl is held (or Show-links is on).
 		if plat.key_ctrl_down() || rc.app.settings.link_style != .Hover {
 			for tl in table_links(doc, text, px, char_w, trows, f32(window.width)) {

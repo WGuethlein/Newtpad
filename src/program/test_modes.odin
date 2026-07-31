@@ -9983,7 +9983,7 @@ when NEWTPAD_TESTS {
 					// named. The precondition below is what caught that, and this
 					// is what it caught.
 					W := f32(1000)
-					H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 					clear(&doc.table_widths)
 					table_compute_widths(&doc, &t)
 					doc.table_cols = len(doc.table_widths)
@@ -10134,7 +10134,7 @@ when NEWTPAD_TESTS {
 				px := BASE_PX_96
 				cw := plat.text_char_width(&t, px, .Doc)
 				W := f32(1000)
-				H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(TG_ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 				clear(&doc.table_widths)
 				table_compute_widths(&doc, &t)
 				doc.table_cols = len(doc.table_widths)
@@ -10342,9 +10342,11 @@ when NEWTPAD_TESTS {
 					// to the pixel. Probed at the exact boundary: a column is laid
 					// out when its x is strictly left of table_right, so column 1
 					// appears at one pixel past `gutter + column 0 + scrollbar`
-					// and not before. Both probes use the NATURAL width, at a
-					// window too narrow for §10's leftover distribution to run, so
-					// this measures the origin rather than the distribution.
+					// and not before. Both probes use the NATURAL width, which is
+					// the laid-out width at every window size now that §10's
+					// leftover distribution is gone (2026-07-31); it was already
+					// true here, because the probe window is far too narrow for the
+					// distribution to have fired.
 					nat0 := f32(doc.table_widths[0]) * cw + TABLE_CELL_PAD_X * 2
 					edge := gw + nat0 + SCROLLBAR_W
 					n1 := table_cols_fitting(&doc, cw, edge, 0)
@@ -10412,7 +10414,7 @@ when NEWTPAD_TESTS {
 				// fixture that also has to land on "the editor's count and the
 				// grid's genuinely differ", not a re-use of the same numbers.
 				PG_ROWS :: 8
-				H := table_rows_top(px) + f32(PG_ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(PG_ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 				trows := table_visible_rows(d, H, px)
 				erows := doc_visible_rows(d, H, line_h)
 				pre := trows == PG_ROWS && trows < len(lines) - 1
@@ -10534,7 +10536,7 @@ when NEWTPAD_TESTS {
 					d.table_cols = len(d.table_widths)
 
 					ROWS :: 12
-					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 					trows := table_visible_rows(d, H, px)
 					if trows != ROWS || ER >= trows {
 						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
@@ -10718,7 +10720,7 @@ when NEWTPAD_TESTS {
 					d.table_cols = len(d.table_widths)
 
 					ROWS :: 14
-					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+					H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 					trows := table_visible_rows(d, H, px)
 					if trows != ROWS || ER + 1 >= trows {
 						chk(bad, false, fmt.tprintf("%v: precondition -- %d grid rows fit (want %d), edited row %d", route, trows, ROWS, ER))
@@ -11499,50 +11501,44 @@ when NEWTPAD_TESTS {
 					chk(&bad, table_cell_align_dx(rc, 3, cw) == want_dx, fmt.tprintf("a 3-cell value ends on the right inner edge (dx %.1f, want %.1f)", table_cell_align_dx(rc, 3, cw), want_dx))
 				}
 
-				// §10's "distribute leftover width proportionally" (3b). It lives
-				// in table_cols_layout rather than in the sample precisely so that
-				// it tracks the window, so both directions get probed: a window
-				// with room to spare must be FILLED, and one without must leave the
-				// sampled widths alone.
+				// §10's "distribute leftover width proportionally" IS DELIBERATELY
+				// NOT DONE (Wyatt, 2026-07-31, on live evidence: three narrow
+				// columns on a wide display gave a 10-character date column
+				// ~400px). A column is laid out at its CONTENT width and the spare
+				// width is left empty on the right.
+				//
+				// The check is the WINDOW-INDEPENDENCE of the layout, not "the
+				// numbers are equal at 2400px". A distribution that fires only past
+				// some threshold, or that hands out a single cell, would satisfy an
+				// equality at one width and still stretch the column Wyatt
+				// complained about -- so the assertion sweeps a range of widths from
+				// snug to enormous and demands the SAME layout out of all of them.
 				{
-					WIDE :: f32(2400)
-					wide := table_cols_layout(&d, cw, WIDE, 0)
-					avail := table_right(WIDE) - table_gutter_w()
-					total, shrunk, extra_of := f32(0), 0, make([]int, len(wide), context.temp_allocator)
-					for c, i in wide {
-						total += c.w
-						extra_of[i] = c.cells - d.table_widths[c.c]
-						if extra_of[i] < 0 {shrunk += 1}
+					WIDTHS :: [?]f32{800, 1200, 2400, 6000}
+					drifted, widest := 0, -1
+					for W in WIDTHS {
+						cs := table_cols_layout(&d, cw, W, 0)
+						for c in cs {
+							if c.cells != d.table_widths[c.c] {drifted += 1}
+							if c.cells > widest {widest = c.cells}
+						}
 					}
-					chk(&bad, len(wide) == len(d.table_widths), fmt.tprintf("every column is on screen at %.0fpx (%d of %d)", WIDE, len(wide), len(d.table_widths)))
-					chk(&bad, shrunk == 0, fmt.tprintf("no column is ever SHRUNK -- the grid scrolls, it does not compress (%d were)", shrunk))
-					// Filled to within one cell: the integer remainder is handed
-					// out one cell at a time, so what is left over is less than a
-					// character, not a ragged strip on the right.
-					gap := avail - total
-					chk(&bad, gap >= 0 && gap < cw, fmt.tprintf("the leftover is distributed to within one cell (%.1fpx of %.1fpx spare, cell %.1f)", gap, avail, cw))
-					// Proportional, not equal: the widest sampled column takes more
-					// of the leftover than the narrowest. An even split would give
-					// them the same number and pass every check above.
-					wi, ni := 0, 0
-					for c, i in wide {
-						if d.table_widths[c.c] > d.table_widths[wide[wi].c] {wi = i}
-						if d.table_widths[c.c] < d.table_widths[wide[ni].c] {ni = i}
-					}
-					chk(
-						&bad,
-						d.table_widths[wide[wi].c] > d.table_widths[wide[ni].c],
-						fmt.tprintf("precondition -- the fixture has columns of different widths (%d vs %d)", d.table_widths[wide[wi].c], d.table_widths[wide[ni].c]),
-					)
-					chk(
-						&bad,
-						extra_of[wi] > extra_of[ni],
-						fmt.tprintf("the leftover goes out PROPORTIONALLY, not evenly (widest gained %d cells, narrowest %d)", extra_of[wi], extra_of[ni]),
-					)
-					// And a window with nothing spare leaves the sample untouched.
+					chk(&bad, drifted == 0, fmt.tprintf("a column is laid out at its CONTENT width at every window size (%d of the laid-out columns differed from their sample)", drifted))
+					chk(&bad, widest <= TABLE_COL_MAX, fmt.tprintf("...so nothing is ever laid out past §10's automatic 40 (widest %d)", widest))
+					// The spare width is LEFT EMPTY, which is the visible half of
+					// the decision: on a very wide window the columns must stop well
+					// short of the right edge rather than filling it.
+					huge := table_cols_layout(&d, cw, 6000, 0)
+					total := f32(0)
+					for c in huge {total += c.w}
+					avail := table_right(6000) - table_gutter_w()
+					chk(&bad, len(huge) == len(d.table_widths), fmt.tprintf("every column is on screen at 6000px (%d of %d)", len(huge), len(d.table_widths)))
+					chk(&bad, avail - total > 40 * cw, fmt.tprintf("the spare width is left EMPTY on the right (%.0fpx of %.0fpx unused)", avail - total, avail))
+					// ...and nothing SHRINKS either: the grid answers overflow by
+					// scrolling horizontally, never by compression.
 					NARROW := table_gutter_w() + SCROLLBAR_W + 60
 					narrow := table_cols_layout(&d, cw, NARROW, 0)
-					chk(&bad, len(narrow) > 0 && narrow[0].cells == d.table_widths[0], fmt.tprintf("a full window distributes nothing (col 0 laid out at %d cells, sampled %d)", narrow[0].cells if len(narrow) > 0 else -1, d.table_widths[0]))
+					chk(&bad, len(narrow) > 0 && narrow[0].cells == d.table_widths[0], fmt.tprintf("a window with no room compresses nothing (col 0 laid out at %d cells, sampled %d)", narrow[0].cells if len(narrow) > 0 else -1, d.table_widths[0]))
 				}
 				return
 			}
@@ -11594,7 +11590,7 @@ when NEWTPAD_TESTS {
 				d.table, d.table_delim = true, ','
 				table_compute_widths(&d, &t)
 				d.table_cols = len(d.table_widths)
-				H := table_rows_top(px) + 6 * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + 6 * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 				rows := table_visible_rows(&d, H, px)
 
 				cols := table_cols_layout(&d, cw, W, 0)
@@ -11618,19 +11614,28 @@ when NEWTPAD_TESTS {
 				chk(&bad, !onrow, "the same x in a DATA row is not an edge -- a cell click still lands there")
 
 				// 2. The drag itself, and both bounds. The edge is measured against
-				//    the LAID-OUT rectangle -- §10's leftover distribution
-				//    included, since that is the edge the user grabbed -- so five
-				//    cells of pointer travel is five cells of column, counted from
-				//    what was on screen and not from the sample.
+				//    the LAID-OUT rectangle, since that is the edge the user
+				//    grabbed -- so five cells of pointer travel is five cells of
+				//    column.
+				//
+				//    The laid-out width and the sampled width are the SAME number
+				//    since §10's leftover distribution was removed (2026-07-31), so
+				//    this no longer distinguishes the two origins the way it did.
+				//    Asserted as an equality rather than deleted, because that
+				//    equality is now the property Wyatt asked for -- a wide window
+				//    must not stretch a column -- observed on the same layout the
+				//    drag below measures against.
 				nat0 := d.table_widths[0]
-				chk(&bad, cols[0].cells > nat0, fmt.tprintf("precondition -- column 0 is laid out wider than sampled (%d vs %d), so the two origins differ", cols[0].cells, nat0))
+				chk(&bad, cols[0].cells == nat0, fmt.tprintf("precondition -- column 0 is laid out at its content width, not stretched (%d vs sampled %d)", cols[0].cells, nat0))
 				table_col_resize(&d, 0, edge + 5 * cw, cw, W)
 				chk(&bad, d.table_widths[0] == cols[0].cells + 5, fmt.tprintf("dragging the drawn edge right by 5 cells widens by 5 (%d -> %d)", cols[0].cells, d.table_widths[0]))
 				table_col_resize(&d, 0, edge - 4000 * cw, cw, W)
 				chk(&bad, d.table_widths[0] == TABLE_COL_MIN, fmt.tprintf("dragging far left clamps to TABLE_COL_MIN (%d, want %d)", d.table_widths[0], TABLE_COL_MIN))
 				// Past §10's automatic 40, deliberately: a manual drag overrides
-				// the bound that exists to stop ONE wide cell claiming the window,
-				// and the distribution already lays columns out past 40 anyway.
+				// the bound that exists to stop ONE wide cell claiming the window
+				// before anybody asked. It is the only route past 40 now that the
+				// leftover distribution is gone, which makes it matter more, not
+				// less.
 				table_col_resize(&d, 0, edge + 60 * cw, cw, W)
 				chk(&bad, d.table_widths[0] > TABLE_COL_MAX, fmt.tprintf("a drag may pass §10's automatic 40 (%d)", d.table_widths[0]))
 				table_col_resize(&d, 0, edge + 4000 * cw, cw, W)
@@ -11675,17 +11680,22 @@ when NEWTPAD_TESTS {
 				chk(&bad, d.table_widths[1] == nat1, fmt.tprintf("...and column 1 is back to its own content width (%d, want %d)", d.table_widths[1], nat1))
 				chk(&bad, nat1 != d.table_widths[0] && nat1 != d.table_widths[2], fmt.tprintf("...which is distinct from its neighbours' (%d vs %d, %d)", nat1, d.table_widths[0], d.table_widths[2]))
 
-				// 5. A fixed column takes no share of §10's leftover: the user asked
-				//    for a width, not for a proportion of the window.
+				// 5. A WIDE WINDOW STRETCHES NOTHING -- the user's dragged column
+				//    and the automatic ones alike. This case used to assert the
+				//    opposite half ("the others still absorb the leftover"), which
+				//    is the behaviour Wyatt reported as a defect on 2026-07-31; it
+				//    now asserts the decision that replaced it, on the same fixture
+				//    and through the same drag, so the reversal is visible in the
+				//    test rather than only in a comment.
 				table_col_resize(&d, 0, cols[0].x + cols[0].w + 4 * cw, cw, W)
 				fixedw := d.table_widths[0]
 				wide := table_cols_layout(&d, cw, 2400, 0)
-				got, others := -1, 0
+				got, grew := -1, 0
 				for c in wide {
-					if c.c == 0 {got = c.cells} else if c.cells > d.table_widths[c.c] {others += 1}
+					if c.c == 0 {got = c.cells} else if c.cells != d.table_widths[c.c] {grew += 1}
 				}
 				chk(&bad, got == fixedw, fmt.tprintf("a user-set column keeps its exact width in a wide window (%d, want %d)", got, fixedw))
-				chk(&bad, others > 0, fmt.tprintf("...while the others still absorb the leftover (%d of them grew)", others))
+				chk(&bad, grew == 0, fmt.tprintf("...and so does every automatic one (%d of them changed)", grew))
 				return
 			}
 
@@ -11904,7 +11914,7 @@ when NEWTPAD_TESTS {
 				table_compute_widths(d, t)
 				d.table_cols = len(d.table_widths)
 				ROWS :: 5
-				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 				trows := table_visible_rows(d, H, px)
 				cw := plat.text_char_width(t, px, .Doc)
 				if trows != ROWS {
@@ -12095,7 +12105,7 @@ when NEWTPAD_TESTS {
 				table_compute_widths(d, t)
 				d.table_cols = len(d.table_widths)
 				ROWS :: 5
-				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_summary_h(px) + STATUS_BAR_H + 1
+				H := table_rows_top(px) + f32(ROWS) * table_row_h(px) + table_bottom_band_h(px) + STATUS_BAR_H + 1
 				trows := table_visible_rows(d, H, px)
 				cw := plat.text_char_width(t, px, .Doc)
 				if trows != ROWS {
@@ -12214,11 +12224,26 @@ when NEWTPAD_TESTS {
 						chk(&bad, absn[r] == want[r], fmt.tprintf("with the index finished, visible row %d numbers as data row %d (want %d)", r, absn[r], want[r]))
 					}
 				}
+				// The sort clause NAMES ITS OWN UNDO, in words. Wyatt rejected three
+				// affordances that added another unlabelled target -- "how will the
+				// person know what to click and where to reset" -- so the sentence
+				// itself is the answer, and it is asserted as a literal because the
+				// wording IS the feature.
 				s := table_summary_text(d)
-				chk(&bad, s == "5 rows  ·  2 columns  ·  sorted by v asc", fmt.tprintf("an active sort is in the summary: %q", s))
+				chk(&bad, s == "5 rows  ·  2 columns  ·  sorted by v asc  ·  click to clear", fmt.tprintf("an active sort is in the summary, with its undo in words: %q", s))
 				table_sort_click(d, 1)
 				s2 := table_summary_text(d)
-				chk(&bad, s2 == "5 rows  ·  2 columns  ·  sorted by v desc", fmt.tprintf("...and its direction: %q", s2))
+				chk(&bad, s2 == "5 rows  ·  2 columns  ·  sorted by v desc  ·  click to clear", fmt.tprintf("...and its direction: %q", s2))
+				// The clickable RUN, as a byte span, and the two properties that
+				// make it a control rather than a label: it starts on the first word
+				// that explains the action (not on the separator before it) and it
+				// reaches the end of the line.
+				{
+					full, cs, ce := table_summary_parts(d)
+					chk(&bad, cs > 0 && ce == len(full), fmt.tprintf("the clickable run reaches the end of the line ([%d,%d) of %d)", cs, ce, len(full)))
+					chk(&bad, full[cs:ce] == "sorted by v desc  ·  click to clear", fmt.tprintf("...and is exactly the sentence that offers the action: %q", full[cs:ce]))
+					chk(&bad, !strings.contains(full[:cs], "sorted"), fmt.tprintf("...with nothing of it left in the muted head: %q", full[:cs]))
+				}
 
 				// 5. The refusal, as TEXT. sort_ceiling proves a big file sets the flag;
 				//    this proves the flag is what the reader sees, which is the half
