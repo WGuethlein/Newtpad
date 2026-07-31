@@ -166,6 +166,67 @@ table_row_start :: proc(doc: ^Document, r: int) -> (p: int, ok: bool) {
 	return p, true
 }
 
+// Absolute data-row index of each visible row -- the row's position in the FILE
+// rather than in the viewport. THE producer for the grid's row numbering: §10's
+// row-number gutter draws it and the zebra's parity rides on it, and neither
+// derives it a second way.
+//
+// Entry r is TABLE_ABS_NONE when the file's numbering cannot answer for that row.
+// doc_line_no_at refuses when the background index has not reached the offset,
+// when the buffer has been edited at or below it, and after a faulted read of a
+// mapped original; all three arrive here as the same refusal. A caller draws
+// NOTHING for a refused row (development-loop.md §4, Shape A) -- not a zero, not
+// a guess. The zebra is the single exception and only because a band carries no
+// information; see table_draw.
+//
+// The header is line 0 and is not a data row, so data row 0 is line 1 and the
+// answer is doc_line_no_at(<the first data row's byte>) - 1 + r. The lookup is
+// taken at table_data_start rather than at table_row_start(doc, r): visible rows
+// are consecutive lines by construction -- table_row_start's own walk is r
+// line-ends forward from exactly that offset -- so the two agree, and asking at
+// the fixed offset does not walk r lines to find a byte whose line number is
+// already implied.
+//
+// A RUN rather than one row at a time, and that is a MEASURED cost decision, not
+// a style one. doc_line_no_at is bounded but not cheap: it counts newlines
+// forward from the checkpoint at or below the offset, up to LINE_CKPT_STRIDE
+// (64 KiB) of it. Measured on a 1.16 MB fixture whose first visible row sat
+// 65,482 bytes past its checkpoint -- the worst case at that stride -- one call
+// costs 153.3 us in a debug build, so a per-row producer spends 6.1 ms of a
+// full 40-row screen's repaint on it. Every one of those calls scans the SAME
+// bytes, because `at` is table_data_start for all of them and only the `+ r`
+// differs. Asking once and adding r is the same answer for a fortieth of the
+// work, and it leaves exactly one place that turns a line number into a row
+// index.
+//
+// One call per frame rather than a memo, deliberately. A cache would have to key
+// on every input doc_line_no_at reads -- the offset, edit_floor, ckpt_n, done,
+// pt.fault, idx.fault, and the identity of the ckpts array doc_index_start swaps
+// out from under it -- and a key that misses one of those is a stale row number
+// presented to the reader as fact. That is the failure this whole two-result
+// contract exists to prevent.
+//
+// NOT bounded above, deliberately, exactly as table_row_at_y is not: the caller
+// owns its row budget (table_visible_rows) and a second opinion here about how
+// many rows exist would be a second producer. Entries past the end of the file
+// carry confident numbers, so read only the entries you have rows for.
+TABLE_ABS_NONE :: -1
+
+table_abs_rows :: proc(doc: ^Document, rows: int, allocator := context.temp_allocator) -> []int {
+	out := make([]int, max(0, rows), allocator)
+	for i in 0 ..< len(out) {out[i] = TABLE_ABS_NONE}
+	if doc == nil || len(out) == 0 {return out}
+	s, sok := table_data_start(doc)
+	if !sok {return out}
+	ln, exact := doc_line_no_at(doc, s)
+	// ln == 0 would mean the first data row IS line 0, which table_data_start
+	// exists to make impossible; refuse rather than hand back -1 + r and have it
+	// read as the refusal sentinel by accident.
+	if !exact || ln < 1 {return out}
+	for i in 0 ..< len(out) {out[i] = ln - 1 + i}
+	return out
+}
+
 // The header's fields: line 0, always, whatever doc.top is. That last clause IS
 // the sticky-header rule, stated as a procedure so it can be asserted rather than
 // only looked at -- the band drew "the first line if it happens to be on screen"
@@ -426,6 +487,12 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	Row :: struct {
 		fields: []string,
 	}
+	// The absolute data-row index of each visible row, from the one producer, for
+	// the band's parity and (group B) the row-number gutter. Asked ONCE for the
+	// whole screen -- see table_abs_rows for the measurement that made a per-row
+	// call untenable. Indexed by visible row r, and len(absn) == rows >= len(vis)
+	// by construction, so every row the passes below draw has an entry.
+	absn := table_abs_rows(doc, rows)
 	vis := make([dynamic]Row, 0, rows, context.temp_allocator)
 	buf: [RENDER_LINE_CAP]u8
 	if p, pok := table_row_start(doc, 0); pok {
@@ -451,17 +518,28 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 	// grid louder than the data"). One quad per banded row, spanning the full
 	// grid width so the band reads as a row rather than as a box around the text.
 	//
-	// Parity is by VISIBLE row index, not by the row's absolute position in the
-	// file, and that is a constraint rather than a preference: a data row's
-	// absolute index is not knowable without counting newlines from byte 0, which
-	// is unbounded on a multi-GB CSV and is exactly what the viewport-first rule
-	// forbids. The visible cost is that the bands shift by one when the view
-	// scrolls by an odd number of rows. §10's row-number gutter (group B) needs
-	// the same absolute index and will have to answer the same question; when it
-	// does, move this parity onto its number.
+	// Parity rides the row's ABSOLUTE position in the file (table_abs_row), not
+	// its visible index. It used to ride the visible index because the absolute
+	// one could not be had without counting newlines from byte 0 -- unbounded on a
+	// multi-GB CSV, and exactly what the viewport-first rule forbids. Line_Index's
+	// sparse checkpoints removed that constraint, and the visible symptom they
+	// removed with it is the bands inverting whenever the view scrolled by an odd
+	// number of rows (HANDOFF §6aw, "Owed").
+	//
+	// The FALLBACK to `r % 2` is the one place in this draw allowed to guess at a
+	// refused row, and only because a band carries no information: a wrong band is
+	// a cosmetic hiccup, where a wrong row NUMBER is a lie about which line the
+	// reader is looking at. The gutter below therefore draws nothing on the same
+	// refusal this line papers over -- deliberately different answers to the same
+	// question, for two things with very different costs of being wrong.
+	//
+	// Either way the unbanded rows are the EVEN ones, so data row 0 -- directly
+	// under the header rule -- sits on the page, which is the parity §10's
+	// screenshot shows and the one tg_appearance pins.
 	zebra := g_theme[.Table_Zebra]
 	for _, r in vis {
-		if r % 2 == 0 {continue} // row 0 sits on the page, directly under the header rule
+		band := absn[r] % 2 if absn[r] != TABLE_ABS_NONE else r % 2
+		if band == 0 {continue}
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_row_rect_y(px, r)}, size = {right, row_h}, color = zebra}})
 	}
 

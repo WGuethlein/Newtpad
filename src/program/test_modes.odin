@@ -10283,11 +10283,215 @@ when NEWTPAD_TESTS {
 				return
 			}
 
-			bad := tg()
+			// F4: the zebra's parity rides the row's ABSOLUTE index, so a band
+			// belongs to a LINE and not to a slot on screen. tg_appearance above
+			// pins which rows are banded at doc.top == 0, and every parity rule
+			// ever proposed agrees there -- `r % 2` and `abs % 2` are the same
+			// function when visible row r IS absolute row r. The divergence only
+			// exists after an ODD scroll, which is why this is a separate proc with
+			// a separate readback rather than another sample in tg_appearance: it
+			// draws the SAME file twice, one data row apart, and compares the two
+			// frames against each other rather than against a constant.
+			//
+			// Its own proc for the usual stack-frame reason, and because it needs a
+			// finished Line_Index -- table_abs_rows refuses without one, which is
+			// itself asserted below so that "the numbers were never available" can
+			// never be mistaken for "the parity is stable".
+			tg_parity :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				W, H :: 1000, 700
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, W, H, "tablegridtest/parity") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return 0
+				}
+				defer headless_gpu_destroy(&h)
+
+				saved_theme, saved_scale := g_theme, UI_SCALE
+				defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+				UI_SCALE = 1
+				TEXT_MARGIN_Y, TAB_STRIP_H, MENU_BAR_H = TEXT_MARGIN_Y_96, TAB_STRIP_H_96, MENU_BAR_H_96
+				CHROME_TOP = TAB_STRIP_H + MENU_BAR_H
+				CONTENT_TOP = CHROME_TOP + TEXT_MARGIN_Y
+				STATUS_BAR_H, SCROLLBAR_W = STATUS_BAR_H_96, SCROLLBAR_W_96
+				TABLE_HEADER_H, TABLE_ROW_H, TABLE_CELL_PAD_X = TABLE_HEADER_H_96, TABLE_ROW_H_96, TABLE_CELL_PAD_X_96
+				BASE_PX = BASE_PX_96
+
+				// Sentinels, for tg_appearance's reason: Table_Zebra is deliberately
+				// close to Bg_Base in every real theme, and this check is entirely
+				// about telling those two apart.
+				bg_s := [4]f32{0, 0, 0, 1}
+				zeb_s := [4]f32{0, 0, 1, 1}
+				g_theme[.Bg_Base] = bg_s
+				g_theme[.Bg_Raised] = [4]f32{1, 0, 0, 1}
+				g_theme[.Border_Strong] = [4]f32{0, 1, 0, 1}
+				g_theme[.Table_Zebra] = zeb_s
+
+				banded :: proc(buf: []u8, w, x, y: int) -> bool {
+					i := (y * w + x) * 4
+					// Blue channel is the zebra sentinel's only non-zero one, and
+					// Bg_Base is black: a solid quad fill, so this is exact short of
+					// rounding.
+					return buf[i] > 200
+				}
+
+				src := "h0,h1\n"
+				for i in 0 ..< 24 {src = fmt.tprintf("%s a%d,b%d\n", src, i, i)}
+				content := transmute([]u8)strings.clone(src)
+				doc := doc_from_content(content, "parity.csv", .UTF8)
+				defer doc_close(&doc)
+				doc.table, doc.table_delim = true, ','
+				doc_index_start(&doc)
+				for !doc_index_done(&doc) {time.sleep(time.Millisecond)}
+
+				px := BASE_PX_96
+				char_w := plat.text_char_width(&h.text, px, .Doc)
+				rows := table_visible_rows(&doc, f32(H), px)
+
+				// The precondition that stops everything below being vacuous: the
+				// absolute index must actually ANSWER. Without a finished index
+				// table_abs_rows refuses, table_draw falls back to `r % 2`, and the
+				// whole check would be measuring the fallback.
+				a0 := table_abs_rows(&doc, 1)[0]
+				chk(&bad, a0 == 0, fmt.tprintf("precondition -- the index answers: row 0 is absolute %d (want 0; %d is the refusal)", a0, TABLE_ABS_NONE))
+				// ...and there must be enough rows on screen for an odd scroll to be
+				// observable at all.
+				chk(&bad, rows >= 4, fmt.tprintf("precondition -- %d rows fit (want >= 4)", rows))
+				if a0 != 0 || rows < 4 {return}
+
+				sx := 2 // left of every glyph this draw emits, gutter number included
+				shot :: proc(h: ^Headless_Gpu, doc: ^Document, px, char_w: f32, rows: int, bg: [4]f32) -> ([]u8, bool) {
+					plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+					table_draw(&h.gfx, &h.quads, &h.text, doc, px, char_w, rows, f32(W))
+					return plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				}
+
+				// Frame 1: the top of the file. Visible row r == absolute row r.
+				doc.top = 0
+				if s, sok := table_data_start(&doc); sok {doc.top = s}
+				buf1, ok1 := shot(&h, &doc, px, char_w, rows, bg_s)
+				chk(&bad, ok1, "frame 1 readback succeeded")
+				if !ok1 {return}
+
+				// Frame 2: scrolled by exactly ONE data row -- the odd scroll that
+				// makes visible parity and absolute parity disagree everywhere.
+				// Through table_row_start, so the scroll lands on a real line start
+				// rather than on an offset this test computed for itself.
+				s1, s1ok := table_row_start(&doc, 1)
+				chk(&bad, s1ok, "the fixture has a second data row to scroll to")
+				if !s1ok {return}
+				doc.top = s1
+				a0b := table_abs_rows(&doc, 1)[0]
+				chk(&bad, a0b == 1, fmt.tprintf("after the scroll, visible row 0 IS absolute row 1 (%d)", a0b))
+				buf2, ok2 := shot(&h, &doc, px, char_w, rows, bg_s)
+				chk(&bad, ok2, "frame 2 readback succeeded")
+				if !ok2 {return}
+
+				// The assertion. Absolute row (r+1) is drawn at visible row r+1 in
+				// frame 1 and at visible row r in frame 2; its band must be the same
+				// colour in both. Under `r % 2` the two disagree for EVERY r, so a
+				// single mismatch is not a rounding artefact.
+				mism, probed := 0, 0
+				for r in 0 ..< rows - 1 {
+					y1 := int(table_row_rect_y(px, r + 1) + table_row_h(px) * 0.3)
+					y2 := int(table_row_rect_y(px, r) + table_row_h(px) * 0.3)
+					if y1 >= H || y2 >= H {break}
+					probed += 1
+					b1 := banded(buf1, W, sx, y1)
+					b2 := banded(buf2, W, sx, y2)
+					if b1 != b2 {
+						mism += 1
+						if mism <= 4 {
+							fmt.printfln("    absolute row %d: banded=%v before the scroll, %v after", r + 1, b1, b2)
+						}
+					}
+				}
+				chk(&bad, probed >= 3, fmt.tprintf("enough rows were actually probed (%d)", probed))
+				chk(&bad, mism == 0, fmt.tprintf("a band belongs to its ABSOLUTE row across a one-row scroll (%d of %d rows changed colour)", mism, probed))
+
+				// And the bands are not simply all one colour, which would satisfy
+				// the compare above with the parity deleted entirely.
+				nband := 0
+				for r in 0 ..< rows {
+					y := int(table_row_rect_y(px, r) + table_row_h(px) * 0.3)
+					if y >= H {break}
+					if banded(buf1, W, sx, y) {nband += 1}
+				}
+				chk(&bad, nband > 0 && nband < probed + 1, fmt.tprintf("...and rows really do alternate (%d banded of %d probed)", nband, probed + 1))
+				return
+			}
+
+			// F5: table_abs_rows answers a WHOLE SCREEN for the price of one
+			// lookup, which is the only reason the gutter and the parity can ride
+			// on it at all. doc_line_no_at is bounded but expensive -- it counts
+			// newlines forward from the checkpoint at or below the offset, up to
+			// LINE_CKPT_STRIDE of them -- and a per-row producer measured 153.3 us
+			// PER ROW on this fixture, 6.1 ms for one 40-row repaint.
+			//
+			// Asserted as a RATIO, not as a wall-clock budget: a millisecond
+			// threshold is a machine-speed assertion that flakes, where "200 rows
+			// must not cost meaningfully more than 1 row" is a statement about the
+			// SHAPE of the procedure and holds on any hardware. A per-row
+			// implementation makes that ratio ~200, so the 4x allowance below is
+			// two orders of magnitude of slack and still catches the regression.
+			//
+			// Its own proc for the usual stack-frame reason; the fixture is a real
+			// 1.1 MB document because the cost being measured only exists at
+			// offsets far from a checkpoint.
+			tg_abs_cost :: proc() -> (bad: int) {
+				chk :: proc(bad: ^int, ok: bool, msg: string) {
+					if !ok {bad^ += 1}
+					fmt.printfln("  %-6s %s", "ok" if ok else "FAIL", msg)
+				}
+				src := strings.builder_make()
+				strings.write_string(&src, "h0,h1,h2\n")
+				for i in 0 ..< 40000 {fmt.sbprintf(&src, "a%05d,bbbbbbbbbb,cccccccccc\n", i)}
+				content := transmute([]u8)strings.clone(strings.to_string(src))
+				strings.builder_destroy(&src)
+				d := doc_from_content(content, "abscost.csv", .UTF8)
+				defer doc_close(&d)
+				d.table, d.table_delim = true, ','
+				doc_index_start(&d)
+				for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+
+				// The precondition that stops this being vacuous: the first visible
+				// row must sit FAR from its checkpoint, or the lookup is cheap for
+				// the wrong reason and a per-row producer would pass too.
+				d.top = base.pt_line_start(&d.pt, 6 * LINE_CKPT_STRIDE - 40)
+				s, sok := table_data_start(&d)
+				gap := s %% LINE_CKPT_STRIDE
+				chk(&bad, sok && gap > LINE_CKPT_STRIDE / 2, fmt.tprintf("precondition -- the first visible row is %d bytes past its checkpoint (want > %d)", gap, LINE_CKPT_STRIDE / 2))
+				chk(&bad, table_abs_rows(&d, 1)[0] != TABLE_ABS_NONE, "precondition -- and the index actually answers there")
+
+				time_n :: proc(d: ^Document, n: int) -> f64 {
+					table_abs_rows(d, n) // warm the piece tree's path to these bytes
+					t0 := time.tick_now()
+					acc := 0
+					for v in table_abs_rows(d, n) {if v != TABLE_ABS_NONE {acc += v}}
+					el := time.duration_microseconds(time.tick_since(t0))
+					if acc < 0 {fmt.print("")} // keep the loop from being optimised away
+					return el
+				}
+				one := time_n(&d, 1)
+				many := time_n(&d, 200)
+				chk(
+					&bad,
+					many <= one * 4 + 50,
+					fmt.tprintf("200 rows cost about what 1 row costs: %.1f us vs %.1f us (want <= %.1f)", many, one, one * 4 + 50),
+				)
+				return
+			}
+
+			bad := tg_abs_cost()
+			bad += tg()
 			bad += tg_page()
 			bad += tg_edit_anchor()
 			bad += tg_edit_permute()
 			bad += tg_appearance()
+			bad += tg_parity()
 			fmt.printfln("tablegridtest: %d failures", bad)
 			return true
 		}
