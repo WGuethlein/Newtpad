@@ -13,6 +13,7 @@ import "core:os"
 import "core:path/filepath"
 import "core:strconv"
 import "core:strings"
+import "core:sync"
 import "core:time"
 import "core:unicode/utf8"
 import "core:unicode/utf16"
@@ -3208,12 +3209,31 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
-		// `newtpad watchtest <dir>` — external-change detection and reconciliation.
+		// `newtpad watchtest [dir]` — external-change detection and reconciliation.
 		// This feature changes the document without the user asking, so the failure
 		// mode is data loss rather than a wrong pixel.
-		if os.args[1] == "watchtest" && len(os.args) > 2 {
+		//
+		// The directory is now OPTIONAL (it defaults under %TEMP%). It was required,
+		// which made this a two-argument mode, which is the keytest trap: a mode a
+		// bare sweep cannot run is a mode nothing runs, and `newtpad watchtest` with
+		// no directory fell through to opening the real GUI window and hanging.
+		if os.args[1] == "watchtest" {
 			bad := 0
-			dir := os.args[2]
+			dir := os.args[2] if len(os.args) > 2 else ""
+			if dir == "" {
+				tmp := os.get_env("TEMP", context.temp_allocator)
+				if tmp == "" {
+					fmt.println("watchtest: no directory given and TEMP is unset")
+					return true
+				}
+				dir, _ = filepath.join({tmp, "newtpad-watchtest"}, context.temp_allocator)
+				if !os.exists(dir) {
+					if derr := os.make_directory(dir); derr != nil {
+						fmt.printfln("watchtest: could not create %q: %v", dir, derr)
+						return true
+					}
+				}
+			}
 			path := fmt.tprintf("%s\\watch.txt", dir)
 
 			plat.file_write_atomic(path, transmute([]u8)string("line one\nline two\n"))
@@ -3325,6 +3345,97 @@ when NEWTPAD_TESTS {
 			doc.had_bom = false
 			fmt.printfln("append refused for UTF-16=%v and BOM=%v  %s", u16_refused, bom_refused, "OK" if u16_refused && bom_refused else "FAIL")
 			if !(u16_refused && bom_refused) {bad += 1}
+
+			// --- watcher_publish: the ACTIVE document is watched whatever its slot ---
+			//
+			// WATCH_MAX bounds how many files the poller stats, and that poll is the
+			// whole of "never lock the user's file": a file outside it has no
+			// external-change detection at all, so the next save silently clobbers
+			// whatever another program wrote. A cap has to fall somewhere, but it
+			// must not fall on the buffer being looked at.
+			//
+			// Publishing in slot order alone put the cap wherever the tabs happened
+			// to sit, so with more than WATCH_MAX files open the active one dropped
+			// out as soon as it landed in a high slot -- silently, with no indicator.
+			// The first fixture is exactly that shape and no other: WATCH_MAX + 8
+			// documents with the active one LAST, which is the one position a
+			// slot-order walk can never reach.
+			//
+			// It is run a SECOND time under the cap, and that run is not decoration.
+			// The active document is published ahead of a loop that then skips it,
+			// and over the cap the skip cannot be observed at all -- the re-add is
+			// refused by `len(w.want) >= WATCH_MAX` anyway, so deleting the skip
+			// changes nothing and the "exactly once" assertion cannot fail. Under
+			// the cap the duplicate is real: a second entry for the same slot is a
+			// wasted stat every cycle and the same change reported twice to
+			// watcher_take. Same code, two fixtures, because one of them alone is
+			// the kind of assertion that reads as coverage and is not.
+			//
+			// Its own proc so test_mode_dispatch's frame never holds an App (§6's
+			// STATUS_STACK_OVERFLOW note), and because the assertions need a name.
+			watch_publish_part :: proc(bad: ^int, dir: string, N, active: int) {
+				fmt.printfln("--- watcher_publish: %d documents, active in slot %d (cap %d) ---", N, active, WATCH_MAX)
+				a: App
+				defer app_destroy(&a)
+				for i in 0 ..< N {
+					d := new(Document)
+					// Paths need not exist: watcher_publish only clones them, and the
+					// worker's file_stamp on a missing path is a fast miss.
+					d^ = doc_from_content(
+						transmute([]u8)strings.clone("x\n"),
+						fmt.tprintf("%s\\wp%03d.txt", dir, i),
+						.UTF8,
+					)
+					app_add(&a, d)
+				}
+				// Set directly rather than through app_activate: that would spawn an
+				// index thread and a lexer thread per tab, and none of this is about
+				// either.
+				a.active = active
+
+				w: Watcher
+				watcher_start(&w) // watcher_publish returns early while w.th is nil
+				defer watcher_stop(&w)
+				watcher_publish(&w, &a)
+
+				// The worker copies w.want under this same mutex.
+				sync.mutex_lock(&w.mu)
+				n := len(w.want)
+				first := -1
+				dupes := 0
+				for e, i in w.want {
+					if e.slot != a.active {continue}
+					dupes += 1
+					if first < 0 {first = i}
+				}
+				sync.mutex_unlock(&w.mu)
+
+				// Non-vacuity, and load-bearing twice over: over the cap it proves
+				// the fixture really does exceed it (otherwise "the active one is
+				// watched" is true of every arrangement); under the cap it is what
+				// catches a duplicate. Either way it proves the publish ran at all --
+				// forget watcher_start and w.want is empty, which would otherwise
+				// satisfy every "no wrong entry" phrasing of this test.
+				want_n := min(N, WATCH_MAX)
+				ok1 := n == want_n
+				fmt.printfln("  %-6s published %d of %d open documents (want %d)", "ok" if ok1 else "FAIL", n, N, want_n)
+				if !ok1 {bad^ += 1}
+
+				ok2 := first == 0
+				fmt.printfln("  %-6s the active document (slot %d) is published FIRST: index %d (want 0)", "ok" if ok2 else "FAIL", a.active, first)
+				if !ok2 {bad^ += 1}
+
+				// The second pass skips app.active; without that skip the active file
+				// is stat-ed twice a cycle and reported twice to watcher_take.
+				ok3 := dupes == 1
+				fmt.printfln("  %-6s ...exactly once, not twice (%d entries for slot %d)", "ok" if ok3 else "FAIL", dupes, a.active)
+				if !ok3 {bad^ += 1}
+			}
+			// Over the cap with the active document in the last slot -- the case the
+			// slot-order walk got wrong -- and under it, where the duplicate skip is
+			// observable.
+			watch_publish_part(&bad, dir, WATCH_MAX + 8, WATCH_MAX + 7)
+			watch_publish_part(&bad, dir, 5, 2)
 
 			fmt.printfln("watchtest: %d failures", bad)
 			return true
