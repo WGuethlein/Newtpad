@@ -810,14 +810,17 @@ md_is_para_line :: proc(line: string) -> bool {
 // matter and is honest that it is unproven.
 //
 // Fence contract: md_is_para_line takes no `in_fence` parameter, unlike
-// md_classify underneath it. md_layout_build's `.Para` case is the only
-// production caller this feeds, and that switch runs on
-// `e.cls = md_classify(e.src, trimmed, in_fence)` (see md_layout_build) --
-// which returns `.Fence_Open`/`.Fence_Close`/`.Fence_Body` for every line while
-// `in_fence` is true, never `.Para`. So the `.Para` case, and everything it
-// calls, is structurally unreachable while inside a fence; there is no fence
-// state for a future caller to thread through because no caller can exist that
-// would need one.
+// md_classify underneath it. The intended production caller is
+// md_layout_build's `.Para` case -- there is no production caller yet at all;
+// today this is reached only through the md_para_bounds_for_test shim below.
+// That switch would run on `e.cls = md_classify(e.src, trimmed, in_fence)`
+// (see md_layout_build), and while `in_fence` is true, md_classify returns
+// `.Fence_Close` on a fence line and `.Fence_Body` on every other line, never
+// `.Para` (`.Fence_Open` is returned only when `in_fence` is FALSE, on the
+// line that opens one -- it cannot occur while already inside a fence). So the
+// `.Para` case, and everything it calls, is structurally unreachable while
+// inside a fence; there is no fence state for a future caller to thread
+// through because no caller can exist that would need one.
 //
 // The three traps are md_table_bounds', in the same order, and each shipped once:
 //   1. Both bounds measured from the ENTRY POINT `p`, never from the moving
