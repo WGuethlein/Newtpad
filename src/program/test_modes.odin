@@ -1845,6 +1845,225 @@ when NEWTPAD_TESTS {
 		li_chk(bad, d.md_mode == .Preview, "...leaving the preview open")
 	}
 
+	// --- `newtpad mdjointest` -- md_para_bounds, the single producer of a
+	// paragraph's extent -------------------------------------------------------
+
+	// A markdown Document over `src`. doc_from_content takes ownership of what it
+	// is given and doc_close frees it, so the bytes have to be an allocation of
+	// their own rather than a slice of a string literal -- the same reason
+	// ts_doc (tablesorttest's fixture builder, above) copies its source.
+	@(private = "file")
+	pj_doc :: proc(src: string) -> Document {
+		c := make([]u8, len(src))
+		copy(c, transmute([]u8)src)
+		return doc_from_content(c, "fixture.md", .UTF8)
+	}
+
+	// Every line offset in `d`, in order. Note the LAST entry is EOF, not a line
+	// start -- pj_line_starts records the byte right after every '\n', and the
+	// final '\n' in a fixture that ends with one puts that position at
+	// d.pt.length. Callers indexing "the last line" want len(starts)-2.
+	@(private = "file")
+	pj_line_starts :: proc(d: ^Document, allocator := context.allocator) -> []int {
+		out := make([dynamic]int, 0, 16, allocator)
+		append(&out, 0)
+		for i in 0 ..< d.pt.length {
+			b: [1]u8
+			base.pt_read(&d.pt, i, b[:])
+			if b[0] == '\n' && i + 1 <= d.pt.length {append(&out, i + 1)}
+		}
+		return out[:]
+	}
+
+	// The highest-value case in the batch: every byte offset inside the SAME
+	// paragraph must resolve to the SAME (start, end, capped). This is what
+	// catches all three of md_table_bounds' traps carried into md_para_bounds,
+	// because each trap's symptom is specifically that different entry points
+	// into one block disagree.
+	@(private = "file")
+	pj_case_entry_independent :: proc(bad: ^int) {
+		fmt.println("-- md_para_bounds gives one answer per paragraph, whatever byte you enter at --")
+		// Three paragraphs of three lines each, blank-separated. Every line of the
+		// middle paragraph must produce the SAME bounds.
+		d := pj_doc("a1\na2\na3\n\nb1\nb2\nb3\n\nc1\nc2\nc3\n")
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+		// Lines 4,5,6 (0-based) are b1,b2,b3.
+		want_start, want_end, want_capped, want_ok := md_para_bounds_for_test(&d, starts[4])
+		li_chk(bad, want_ok, "the paragraph's first line resolves")
+		li_chk(bad, !want_capped, "and is not capped")
+		for li in 4 ..= 6 {
+			s, e, c, o := md_para_bounds_for_test(&d, starts[li])
+			li_chk(
+				bad,
+				o && s == want_start && e == want_end && c == want_capped,
+				fmt.tprintf("entering at line %d gives (%d,%d,%v); line 4 gave (%d,%d,%v)", li, s, e, c, want_start, want_end, want_capped),
+			)
+		}
+		// And it must not have swallowed a neighbour.
+		li_chk(bad, want_start == starts[4], fmt.tprintf("the run starts at b1 (%d, want %d)", want_start, starts[4]))
+		li_chk(bad, want_end == starts[7] - 1, fmt.tprintf("the run ends at b3's newline (%d, want %d)", want_end, starts[7] - 1))
+	}
+
+	// The only case that tests `capped`, in two ways: a byte budget so small the
+	// backward scan cannot reach the run's true start, and a line-count cap so
+	// small the forward scan cannot reach its true end.
+	//
+	// A budget check that only ever fires the FORWARD guard (or the redundant
+	// final `(end-start) > budget` fallback, which fires regardless of which
+	// direction actually ran out of room) cannot tell "the backward guard works"
+	// from "it was deleted": both give capped=true on a fixture whose true block
+	// exceeds the budget either way. So the small-budget assertion below is split
+	// in two: entering at the run's FIRST line drives the forward guard, and
+	// entering at its LAST line drives the backward one -- and for the backward
+	// case, `start` is checked directly rather than only `capped`, because
+	// deleting the backward guard's break still leaves the redundant final check
+	// to report capped=true, but the run's true start (byte 0, since this fixture
+	// has no line before it) is walked all the way back to instead of stopping
+	// early. A guarded backward scan must stop with `start` still short of 0.
+	@(private = "file")
+	pj_case_budget_truncates :: proc(bad: ^int) {
+		fmt.println("-- the budget truncates instead of scanning to EOF --")
+		// 40 paragraph lines, no blank line anywhere: without a budget this is one
+		// 40-line run. Lower the budget so a small fixture drives the real guard --
+		// this drive-through is what actually tests truncation. Asserting `capped` on
+		// a fixture that never reaches the guard would pass with the guard deleted.
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+		last_line := starts[len(starts) - 2] // len(starts)-1 is EOF, not a line start
+
+		_, _, capped_full, _ := md_para_bounds_for_test(&d, 0)
+		li_chk(bad, !capped_full, "at the production budget the run is not capped")
+
+		old_budget, old_lines := md_para_budget, md_para_max_lines
+		defer {md_para_budget, md_para_max_lines = old_budget, old_lines}
+		md_para_budget = 64
+		_, _, capped_small, _ := md_para_bounds_for_test(&d, 0)
+		li_chk(bad, capped_small, "with a 64-byte budget, entering at the first line, the run reports capped")
+
+		start_tail, _, capped_tail, _ := md_para_bounds_for_test(&d, last_line)
+		li_chk(bad, capped_tail, "with a 64-byte budget, entering at the LAST line, the run reports capped too")
+		li_chk(
+			bad,
+			start_tail > 0,
+			fmt.tprintf("...and the backward scan itself stopped short of byte 0 (got start=%d)", start_tail),
+		)
+
+		md_para_budget = old_budget
+		md_para_max_lines = 4
+		_, _, capped_lines, _ := md_para_bounds_for_test(&d, 0)
+		li_chk(bad, capped_lines, "with a 4-line cap the same run reports capped")
+	}
+
+	// Everything md_classify already treats as ending a paragraph must keep
+	// ending it here, for free, because md_is_para_line asks md_classify rather
+	// than testing anything of its own. And a line that never was a paragraph
+	// line returns ok=false rather than a zero-length run.
+	@(private = "file")
+	pj_case_terminators :: proc(bad: ^int) {
+		fmt.println("-- everything that already ended a paragraph still ends it --")
+		cases := []struct{src, label: string}{
+			{"p1\np2\n\ntail\n", "a blank line"},
+			{"p1\np2\n# head\n", "a heading"},
+			{"p1\np2\n- item\n", "a list item"},
+			{"p1\np2\n> quote\n", "a blockquote"},
+			{"p1\np2\n```\n", "a fence"},
+			{"p1\np2\n| a | b |\n", "a table row"},
+		}
+		for c in cases {
+			d := pj_doc(c.src)
+			defer doc_close(&d)
+			s, e, _, ok := md_para_bounds_for_test(&d, 0)
+			// "p1\np2\n" -- the run is bytes 0..5, ending at p2's newline (offset 5).
+			li_chk(bad, ok && s == 0 && e == 5, fmt.tprintf("%s ends the run (got %d..%d)", c.label, s, e))
+		}
+		// A line that is not a paragraph line at all returns ok=false.
+		dh := pj_doc("# heading\nbody\n")
+		defer doc_close(&dh)
+		_, _, _, ok_head := md_para_bounds_for_test(&dh, 0)
+		li_chk(bad, !ok_head, "a heading line is not a paragraph run")
+	}
+
+	// A second, DIFFERENT catch for trap 2 (the forward guard measured from
+	// `start` instead of `p`) than pj_case_entry_independent's.
+	//
+	// pj_case_entry_independent's 3-paragraph fixture cannot see trap 2 at any
+	// budget: it is small enough (9 bytes for the whole middle paragraph) that
+	// `start` and `end` converge on the SAME true edges for every entry once both
+	// scans finish, sabotaged or not, and the redundant final check
+	// `(end - start) > md_para_budget` reports the identical `capped` either way
+	// -- confirmed by running the actual trap with md_para_budget lowered into
+	// that fixture's range: every entry still printed "ok". Entry independence
+	// of (start, end, capped) is a real, ships-every-run property, but it is only
+	// an invariant in the UNCAPPED regime (every entry sees the block's whole,
+	// true extent) -- once a run is genuinely larger than budget, DIFFERENT
+	// entries are SUPPOSED to see different budget-sized windows around
+	// themselves; that is what "budget" means, not a bug.
+	//
+	// What trap 2 actually breaks is inside the capped regime: an entry far from
+	// the run's true start inflates its OWN measurement (`start`, already moved
+	// back by the backward scan) before the forward scan has extended anything,
+	// so the very first forward check compares against a budget that is already
+	// spent -- "every paragraph collapses to its entry line," in the trap's own
+	// words above md_para_bounds. That is directly checkable without comparing
+	// against another entry at all: does a middle entry's forward scan absorb
+	// ANYTHING beyond its own line, given a budget that comfortably allows more?
+	// Confirmed against the live trap: entering at line 20 of this fixture with
+	// budget=500 collapsed to end=913, exactly the entry line's own newline and
+	// nothing past it, while line 0 (unaffected by the trap, since start == p
+	// there) correctly extended to end=517.
+	@(private = "file")
+	pj_case_no_collapse :: proc(bad: ^int) {
+		fmt.println("-- a middle entry's forward scan is not collapsed to its own line --")
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+
+		old_budget := md_para_budget
+		defer md_para_budget = old_budget
+		md_para_budget = 500 // well under the run's true ~1755-byte span, so still capped
+
+		own_line_end := starts[21] - 1 // line 20's own newline, with no forward join at all
+		s20, e20, capped20, ok20 := md_para_bounds_for_test(&d, starts[20])
+		li_chk(bad, ok20, "line 20 resolves as a paragraph line")
+		li_chk(bad, capped20, "and, at this budget, the run is (correctly) capped")
+		li_chk(
+			bad,
+			e20 > own_line_end,
+			fmt.tprintf("...but the forward scan still absorbs at least one more line (end=%d, own line end=%d)", e20, own_line_end),
+		)
+		li_chk(bad, s20 < starts[20], fmt.tprintf("...and the backward scan absorbs at least one line too (start=%d, entry=%d)", s20, starts[20]))
+	}
+
+	// One-argument and non-zero on failure, per the keytest/resavetest incident: a
+	// mode nothing runs is worse than no mode.
+	@(private = "file")
+	para_join_test_run :: proc() {
+		bad := 0
+		if !require_scratch_session("mdjointest") {
+			// Counted as a FAILURE rather than skipped: a mode that quietly does
+			// nothing when an environment variable is unset is a mode nothing runs.
+			li_chk(&bad, false, "NEWTPAD_SESSION_DIR is set, so the mode could run")
+		} else {
+			pj_case_entry_independent(&bad)
+			pj_case_no_collapse(&bad)
+			pj_case_budget_truncates(&bad)
+			pj_case_terminators(&bad)
+		}
+		fmt.printfln("mdjointest: %d failures", bad)
+		if bad > 0 {os.exit(1)}
+	}
+
 	// --- `newtpad tablesorttest` -- the multi-key sort build -------------------
 	//
 	// table_sort_build orders up to TABLE_SORT_MAX rows by up to TABLE_SORT_KEYS_MAX
@@ -32237,6 +32456,14 @@ when NEWTPAD_TESTS {
 		// trailing-blank-row trim and everything downstream of it.
 		if os.args[1] == "selalltest" {
 			select_all_test_run()
+			return true
+		}
+
+		// `newtpad mdjointest` -- one-argument, no path, sweepable. The preview's
+		// paragraph join: md_para_bounds, the joined text, hard breaks, lazy
+		// continuation and setext.
+		if os.args[1] == "mdjointest" {
+			para_join_test_run()
 			return true
 		}
 

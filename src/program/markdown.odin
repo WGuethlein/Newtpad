@@ -580,6 +580,29 @@ md_table_budget := MD_TABLE_BUDGET
 // normal-sized fixture instead of needing thousands of rows built and scanned.
 md_table_max_rows := MD_TABLE_MAX_ROWS
 
+// A paragraph's join budget, in bytes, and its line-count analogue. Mirrors
+// MD_TABLE_BUDGET/MD_TABLE_MAX_ROWS and exists for the same reason: joining
+// stops at the first blank or non-Para line, so a file with no blank line in it
+// would otherwise be walked to EOF on the UI thread by the first block.
+//
+// 256 KB rather than the table's 1 MB because a paragraph is prose: at ~100
+// columns a 256 KB run is ~2,600 source lines, which no document has, while a
+// CSV that is one enormous table is an ordinary file.
+MD_PARA_BUDGET :: 256 * 1024
+MD_PARA_MAX_LINES :: 4096
+
+// Required by the forward scan's guard, exactly as MD_TABLE_BUDGET's own assert
+// requires: without it the first check could trip on the entry line's length
+// alone, before a single neighbour line is examined, collapsing every paragraph
+// to one line and making the whole join invisible.
+#assert(MD_PARA_BUDGET > RENDER_LINE_CAP)
+
+// Runtime copies, mirroring md_table_budget/md_table_max_rows: production code
+// never changes them; mdjointest lowers them to drive the truncation path on a
+// small fixture instead of building a 256 KB one.
+md_para_budget := MD_PARA_BUDGET
+md_para_max_lines := MD_PARA_MAX_LINES
+
 // Four slots, not one: rows draw top-to-bottom, so with two table blocks on
 // screen a single slot ends every frame holding the lower block and misses on
 // the upper one the next frame — two full block measures per frame, in steady
@@ -754,6 +777,109 @@ md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, o
 	total_rows := back_rows + fwd_rows + 1
 	oversize = trunc_back || trunc_fwd || (end - start) > md_table_budget || total_rows > md_table_max_rows
 	return start, end, oversize, true
+}
+
+// Is this line a paragraph line -- the thing a join may absorb?
+//
+// Asks md_classify rather than testing anything itself, so there is exactly one
+// definition of what a paragraph line is. Everything that already terminates a
+// paragraph (blank, fence, rule, heading, quote, list, table row) keeps
+// terminating it for free, because md_classify tests all of them ahead of the
+// .Para fallthrough.
+//
+// `in_fence` is threaded through because inside a fence EVERY line is
+// .Fence_Body, so a join must never cross a fence -- and the caller knows the
+// fence state, this does not.
+@(private = "file")
+md_is_para_line :: proc(line: string, in_fence: bool) -> bool {
+	if in_fence {return false}
+	trimmed := strings.trim_left(line, " \t")
+	return md_classify(line, trimmed, false).kind == .Para
+}
+
+// The contiguous run of paragraph lines containing `p`. Scans backward to the
+// run's true start and forward to its end, both bounded by md_para_budget.
+//
+// THE SINGLE PRODUCER of a paragraph's extent. It exists because a joined
+// paragraph STARTS ABOVE ITS OWN LINE, which makes it the second construct with
+// that property (a collapsed blank run and front matter are the others) -- and
+// unlike those it occurs in every document. Two procedures ask where the block
+// containing byte B starts: md_layout_build walking forward, and
+// md_block_at_byte running MD_RUNUP_LINES back and walking forward. A fixed
+// line run-up cannot answer that for a construct of unbounded length; see
+// MD_RUNUP_LINES' own comment, which already records this failure for front
+// matter and is honest that it is unproven.
+//
+// The three traps are md_table_bounds', in the same order, and each shipped once:
+//   1. Both bounds measured from the ENTRY POINT `p`, never from the moving
+//      `start`. `start - q` is invariantly 0 if written the other way, so the
+//      guard is dead code and the backward walk runs to byte 0 on the UI thread.
+//   2. The forward guard measured from `p` too, or it is already past budget the
+//      moment the backward walk moved `start`, and every paragraph collapses to
+//      its entry line.
+//   3. `capped` derived ONCE, after both scans, from the window they produced --
+//      never "did a guard fire while scanning". Which guard fires depends on
+//      where within the run the entry landed, so an entry-dependent flag gives
+//      one paragraph three different answers depending on scroll position.
+@(private = "file")
+md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: bool) {
+	buf: [RENDER_LINE_CAP]u8
+	line, lend, entry_capped := md_line_at(doc, p, buf[:])
+	if !md_is_para_line(line, false) {return 0, 0, false, false}
+	start, end = p, lend
+
+	// A `p` that is not a real line start cannot establish the run's start, so
+	// `start = p` above is not trustworthy and the block is forced capped even if
+	// both scans complete within budget. markdown_draw walks a line longer than
+	// RENDER_LINE_CAP in capped segments, and doc.top can land mid-line.
+	entry_line_start, entry_line_start_exact := base.pt_line_start_cap(&doc.pt, p, RENDER_LINE_CAP)
+	entry_is_line_start := entry_line_start_exact && entry_line_start == p
+
+	trunc_back, trunc_fwd := !entry_is_line_start, entry_capped
+	q := p
+	back_lines := 0
+	for q > 0 {
+		if p - q > md_para_budget {trunc_back = true;break}
+		ps, exact := base.pt_line_start_cap(&doc.pt, q - 1, RENDER_LINE_CAP)
+		if !exact {trunc_back = true;break}
+		pl, _, pl_capped := md_line_at(doc, ps, buf[:])
+		if !md_is_para_line(pl, false) {break}
+		if pl_capped {trunc_back = true}
+		back_lines += 1
+		start = ps
+		q = ps
+		if back_lines > md_para_max_lines {trunc_back = true;break}
+	}
+
+	r := lend
+	fwd_lines := 0
+	for r < doc.pt.length {
+		if r - p > md_para_budget {trunc_fwd = true;break}
+		ns := r + 1
+		if ns > doc.pt.length {break}
+		nl, ne, ne_capped := md_line_at(doc, ns, buf[:])
+		if !md_is_para_line(nl, false) {break}
+		if ne_capped {trunc_fwd = true}
+		fwd_lines += 1
+		end = ne
+		r = ne
+		if fwd_lines > md_para_max_lines {trunc_fwd = true;break}
+	}
+
+	// The line-count analogue of trap 3: if neither direction's cap tripped, both
+	// scans reached the run's true edges, so back+fwd+1 IS the run's real line
+	// count and must be checked too. Without it a 6000-line run with a 4096 cap
+	// reports capped when entered near either edge and NOT when entered near the
+	// middle -- the identical flip, one level down.
+	total_lines := back_lines + fwd_lines + 1
+	capped = trunc_back || trunc_fwd || (end - start) > md_para_budget || total_lines > md_para_max_lines
+	return start, end, capped, true
+}
+
+// Package-visible so mdjointest can drive the bounds function directly. The
+// production callers all go through md_layout_build.
+md_para_bounds_for_test :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: bool) {
+	return md_para_bounds(doc, p)
 }
 
 // Per-column maxima across the whole block, plus the separator row's alignments.
