@@ -2438,16 +2438,23 @@ when NEWTPAD_TESTS {
 		li_chk(bad, lay.joined == "", fmt.tprintf("a single-line paragraph does not allocate joined (got %q)", lay.joined))
 	}
 
-	// The `capped` return is CONSUMED, by both of md_para_bounds' callers, and
-	// they refuse the same runs off the same flag.
+	// The `capped` return is CONSUMED -- by md_para_run, on behalf of both sites
+	// that ask where a block begins, so the layout and the snap refuse the same
+	// runs by construction.
 	//
-	// The failure that forces it: a document of consecutive prose lines longer
-	// than md_para_max_lines. The block at p=0 stops at the cap with capped=true,
-	// so a join that ignored the flag would take lines 0..cap and set `next` to the
-	// line after -- whose OWN backward scan runs the same cap and starts near line
-	// 1. The preview draws the paragraph and then repeats nearly all of it. The
-	// fallback is the unjoined single-line block: bounded, unable to duplicate, and
-	// exactly what shipped before the join.
+	// WHY THE REFUSAL EXISTS is that agreement, and nothing else. This comment used
+	// to say a capped run that joined would be re-drawn by the block after it; a
+	// 2026-08-01 review measured that with the `!capped` test removed and `ps == p`
+	// kept and found zero duplication -- block 1 spans 0..203 with next=204, block
+	// 2 spans 204..237 -- because `ps != p` refuses block 2 before its truncated
+	// bounds are ever used. Two guards, each individually sufficient against a
+	// re-draw, and each was being credited with the other's work.
+	//
+	// What a disagreement WOULD cost is what the rows below pin: the snap answering
+	// one byte and the layout starting the block at another, which is the shape of
+	// the regression md_block_start_at was added to remove. The fallback for a
+	// capped run is the unjoined single-line block -- bounded, and exactly what
+	// shipped before the join.
 	//
 	// Driven through the real guard by lowering md_para_max_lines rather than by
 	// building a 5000-line fixture, as pj_case_budget_truncates already does.
@@ -2490,12 +2497,25 @@ when NEWTPAD_TESTS {
 		li_chk(bad, lay.end == starts[1] - 1, fmt.tprintf("...the block is its own single line (end %d, want %d)", lay.end, starts[1] - 1))
 		li_chk(
 			bad, lay.next == starts[1],
-			fmt.tprintf("...so the block after it starts at the NEXT line and cannot re-draw this one (next %d, want %d)", lay.next, starts[1]),
+			fmt.tprintf("...and hands the walk the NEXT line, not a byte inside the run (next %d, want %d)", lay.next, starts[1]),
 		)
 		li_chk(
 			bad, md_block_start_at(&d, mid) == mid,
 			fmt.tprintf("the snap refuses the same capped run, so that line is its own block start (%d, want %d)", md_block_start_at(&d, mid), mid),
 		)
+		// The block AFTER the refused one, so the row above is not the only thing
+		// standing between this fixture and a re-draw. Under a sabotage that lets a
+		// capped run join (2026-08-01), block 1 becomes 0..203 next=204 and this
+		// block comes back 204..237 -- refused by `ps == p`, not by `!capped`, and
+		// duplicating nothing. That measurement is why the `!capped` refusal is
+		// justified by the snap/layout agreement and not by a re-draw it does not
+		// actually prevent.
+		{
+			b2 := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, lay.next, 600)
+			defer md_layout_free(&b2)
+			li_chk(bad, b2.start == lay.next, fmt.tprintf("the block after it starts where the walk was sent (%d, want %d)", b2.start, lay.next))
+			li_chk(bad, !b2.multiline, fmt.tprintf("...and does not itself join backwards over the refused run (multiline %v)", b2.multiline))
+		}
 	}
 
 	// md_block_start_at as a unit. mdtest's md_scroll_selftest section B3 asserts
@@ -2655,6 +2675,135 @@ when NEWTPAD_TESTS {
 	// Recorded for the whole-branch review, not asserted away with a test that
 	// cannot honestly fail.
 
+	// md_para_run's MEMO, checked against md_para_bounds itself.
+	//
+	// The memo answers from a byte WINDOW rather than from the entry byte, so a
+	// wrong window is a wrong answer for every byte in it, not just the one it was
+	// asked about -- and a stale window (surviving an edit) or a poisoned one (a
+	// verdict stored from an entry that was not a line start) both hand back a
+	// plausible triple rather than crashing. Every row compares the memo against
+	// the unmemoised producer on the same byte, so a divergence is visible rather
+	// than merely fast.
+	@(private = "file")
+	pj_case_memo_matches_producer :: proc(bad: ^int) {
+		fmt.println("-- the bounds memo answers exactly what the producer would --")
+		{
+			sb := strings.builder_make()
+			defer strings.builder_destroy(&sb)
+			for i in 0 ..< 40 {fmt.sbprintf(&sb, "run one line %02d of unbroken prose\n", i)}
+			strings.write_string(&sb, "\n")
+			for i in 0 ..< 40 {fmt.sbprintf(&sb, "run two line %02d of unbroken prose\n", i)}
+			d := pj_doc(strings.to_string(sb))
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+
+			// Walked from both ends inwards, alternating: MD_PARA_SLOTS is 4, so this
+			// order crosses the blank line -- and so switches runs -- on every step,
+			// which is the access pattern a memo keyed on the entry byte would miss on
+			// every time and one keyed on a wrong window would answer wrongly on.
+			diverged, first_at := 0, -1
+			n := len(starts) - 1 // the last entry is EOF, not a line start
+			for k in 0 ..< n {
+				li := k / 2 if k % 2 == 0 else n - 1 - k / 2
+				p := starts[li]
+				ws, we, wc, wok := md_para_bounds_for_test(&d, p)
+				gs, ge, gok := md_para_run_for_test(&d, p)
+				want := wok && !wc
+				if gok != want || (want && (gs != ws || ge != we)) {
+					if diverged == 0 {
+						first_at = p
+						fmt.printfln("    first divergence at byte %d: memo (%d,%d,ok=%v), producer (%d,%d,capped=%v,ok=%v)", p, gs, ge, gok, ws, we, wc, wok)
+					}
+					diverged += 1
+				}
+			}
+			li_chk(bad, diverged == 0, fmt.tprintf("the memo matches the producer at all %d line starts (%d diverged, first at %d)", n, diverged, first_at))
+
+			// Keyed on doc.revision, and this is what says so. The memo is warm on run
+			// two's whole extent; splitting that run with a blank line must retire it,
+			// or the answer stays the pre-edit end -- a byte now inside a DIFFERENT
+			// block, which is the shape of every stale-cache bug this file has hit.
+			two := starts[41]
+			ws, we, wok := md_para_run_for_test(&d, two)
+			li_chk(bad, wok && ws == two && we == d.pt.length - 1, fmt.tprintf("run two is one joinable run before the edit (%d..%d, ok=%v)", ws, we, wok))
+			split := starts[61]
+			doc_replace_range(&d, split, 0, transmute([]u8)string("\n"))
+			gs, ge, gok := md_para_run_for_test(&d, two)
+			li_chk(
+				bad, gok && gs == two && ge == split - 1,
+				fmt.tprintf("the edit retired the memo: run two now ends at the new blank line (%d..%d, ok=%v; want %d..%d)", gs, ge, gok, two, split - 1),
+			)
+		}
+		{
+			// THE POISONING TRAP. A mid-line entry is forced capped by md_para_bounds'
+			// own entry_is_line_start seed -- a verdict about the ENTRY, not about the
+			// run -- so storing it would answer "not joinable" for every line start in
+			// a run that joins perfectly well. Asked in that order deliberately: the
+			// mid-line question first, then the one it would have poisoned.
+			d := pj_doc("alpha\nbeta\ngamma\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			_, _, mid_ok := md_para_run_for_test(&d, starts[1] + 2)
+			li_chk(bad, !mid_ok, "a mid-line entry is not a joinable run")
+			s, e, ok := md_para_run_for_test(&d, 0)
+			li_chk(
+				bad, ok && s == 0 && e == d.pt.length - 1,
+				fmt.tprintf("...and it did not poison the run it sits in (%d..%d, ok=%v; want 0..%d)", s, e, ok, d.pt.length - 1),
+			)
+		}
+	}
+
+	// md_block_start_at's ONE stated exception: a byte inside a line longer than
+	// RENDER_LINE_CAP, where the capped line-start scan finds no line start at all
+	// and the procedure hands `p` itself back. That byte is a segment boundary of
+	// markdown_draw's capped walk, not a block start, so the invariant every other
+	// caller relies on does not hold there -- it is bounded and deliberate, and
+	// until now it was the one branch nothing exercised.
+	//
+	// What makes it safe is the second half: nothing JOINS across such a line, so
+	// no block built at that byte can claim to hold text from above it.
+	@(private = "file")
+	pj_case_overlong_line :: proc(bad: ^int) {
+		fmt.println("-- a line past RENDER_LINE_CAP: the snap's stated exception --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		// "s0\n" then one line of 3 x RENDER_LINE_CAP, then ordinary prose. The long
+		// line's true start is byte 3; byte 3 + RENDER_LINE_CAP is far enough past it
+		// that the backward scan's floor lands above the newline at byte 2.
+		long := strings.repeat("x", RENDER_LINE_CAP * 3)
+		defer delete(long)
+		d := pj_doc(strings.concatenate({"s0\n", long, "\ntail\n"}, context.temp_allocator))
+		defer doc_close(&d)
+
+		true_start, seg := 3, 3 + RENDER_LINE_CAP
+		ls, exact := base.pt_line_start_cap(&d.pt, seg, RENDER_LINE_CAP)
+		li_chk(bad, !exact, fmt.tprintf("byte %d has no line start within the scan cap (got %d, exact=%v)", seg, ls, exact))
+		li_chk(
+			bad, md_block_start_at(&d, seg) == seg,
+			fmt.tprintf("...so the snap hands that byte straight back (%d, want %d, NOT the line's real start %d)", md_block_start_at(&d, seg), seg, true_start),
+		)
+		li_chk(bad, md_block_start_at(&d, seg) == md_block_start_at(&d, md_block_start_at(&d, seg)), "...and the overshoot is still idempotent")
+		// The half that makes it safe. "s0" and the long line are both prose, so
+		// without the cap they would be one run; the long line forces capped from
+		// every entry, so nothing joins and no block holds text it did not start at.
+		li_chk(
+			bad, md_block_start_at(&d, true_start) == true_start,
+			fmt.tprintf("the long line does not join to the prose above it (%d, want %d)", md_block_start_at(&d, true_start), true_start),
+		)
+		lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, seg, 600)
+		defer md_layout_free(&lay)
+		li_chk(bad, !lay.multiline, fmt.tprintf("a block built at that byte is not joined (multiline %v)", lay.multiline))
+		li_chk(bad, lay.joined == "", fmt.tprintf("...and allocated no joined text (%q)", lay.joined[:min(len(lay.joined), 20)]))
+	}
+
 	// One-argument and non-zero on failure, per the keytest/resavetest incident: a
 	// mode nothing runs is worse than no mode.
 	@(private = "file")
@@ -2680,6 +2829,8 @@ when NEWTPAD_TESTS {
 			pj_case_blank_separates(&bad)
 			pj_case_capped_refuses(&bad)
 			pj_case_snap_is_the_entry(&bad)
+			pj_case_overlong_line(&bad)
+			pj_case_memo_matches_producer(&bad)
 			pj_case_cache_holds(&bad)
 		}
 		fmt.printfln("mdjointest: %d failures", bad)
@@ -4294,6 +4445,124 @@ when NEWTPAD_TESTS {
 	headless_gpu_destroy :: proc(h: ^Headless_Gpu) {
 		plat.keys_ignore_physical(false)
 		plat.gfx_destroy(&h.gfx)
+	}
+
+	// One mdperftest fixture, measured end to end: build the document from `src`,
+	// warm the caches, then time N steady-state scroll frames and print the five
+	// means. Returns the failure count.
+	//
+	// A shared PROCEDURE rather than the loop written once inline, because the
+	// mode's value depends on every fixture being measured identically -- and
+	// because for its whole life the mode measured exactly ONE document shape.
+	// That shape is blank-separated single-line paragraphs, so md_para_bounds
+	// scanned ~1 line per call and the paragraph join's cost was structurally
+	// invisible here: the mode reported "unchanged" across a change that a
+	// hard-wrapped fixture showed as 6.134 -> 13.431 ms. Adding a fixture is the
+	// fix for that; see the call site for the four now measured.
+	@(private = "file")
+	md_perf_measure :: proc(h: ^Headless_Gpu, name, src: string, nlines: int, W, H: i32) -> int {
+		content := make([]u8, len(src))
+		copy(content, src)
+		doc := doc_from_content(content, "perf.md", .UTF8)
+		defer doc_close(&doc)
+		doc.md_mode = .Preview
+		px_ := BASE_PX
+		winw, winh := f32(W), f32(H)
+		x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, winw, winh, 0.5)
+		if !box_ok {
+			fmt.printfln("mdperftest[%s]: FAIL no preview pane", name)
+			return 1
+		}
+		c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+		if !cok {
+			fmt.printfln("mdperftest[%s]: FAIL no scroll context", name)
+			return 1
+		}
+		notch := md_wheel_px(&c)
+		mid := doc.pt.length / 3
+		restart := md_anchor_from_top(&c, mid)
+
+		N :: 200
+		// Warm the layout cache and md_max_anchor, so what is measured is a
+		// STEADY-STATE scroll frame and not the first one after an open.
+		at := restart
+		for _ in 0 ..< 8 {
+			at = md_scroll_px(&c, at, notch)
+			doc.md_top = at
+			plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+			markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+			markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+			md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+			free_all(context.temp_allocator)
+		}
+
+		t_scroll, t_draw, t_links, t_frac, t_frame: time.Duration
+		at = restart
+		for _ in 0 ..< N {
+			f0 := time.tick_now()
+			s0 := time.tick_now()
+			nxt := md_scroll_px(&c, at, notch)
+			// The ceiling is reachable inside 200 notches, and a step that moves
+			// nothing is not a scroll frame. Wrap rather than measure a no-op.
+			at = restart if nxt == at else nxt
+			t_scroll += time.tick_since(s0)
+			doc.md_top = at
+
+			plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+			d0 := time.tick_now()
+			markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+			t_draw += time.tick_since(d0)
+			l0 := time.tick_now()
+			markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+			t_links += time.tick_since(l0)
+			r0 := time.tick_now()
+			md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+			t_frac += time.tick_since(r0)
+			t_frame += time.tick_since(f0)
+			free_all(context.temp_allocator)
+		}
+		ms :: proc(d: time.Duration, n: int) -> f64 {return time.duration_milliseconds(d) / f64(n)}
+		fmt.printfln("mdperftest[%s]: %d lines, %dx%d, S=%.0f, mean of %d frames", name, nlines, W, H, px_, N)
+		fmt.printfln("  md_scroll_px (one notch)   %.3f ms", ms(t_scroll, N))
+		fmt.printfln("  markdown_draw              %.3f ms", ms(t_draw, N))
+		fmt.printfln("  markdown_links             %.3f ms", ms(t_links, N))
+		fmt.printfln("  md_preview_frac            %.3f ms", ms(t_frac, N))
+		fmt.printfln("  whole scroll frame         %.3f ms", ms(t_frame, N))
+		// A threshold, so a regression here goes red instead of printing and
+		// passing regardless. Baseline is 2026-07-29's review measurement on the
+		// `mixed` fixture at -o:speed: markdown_draw 2.79 ms, whole scroll frame
+		// 5.05 ms. The gate is ~1.8x that -- generous enough that normal machine
+		// noise does not flake it, tight enough that a 2x regression (what
+		// actually shipped once, undetected by this mode) trips it before it
+		// fully doubles.
+		//
+		// The SAME numbers gate every fixture. They are not per-fixture budgets
+		// derived from what each one happens to cost -- a gate fitted to the
+		// measurement it is meant to catch is not a gate. A fixture that cannot
+		// meet them is either a bug to fix or an exception to argue in the
+		// comment at the call site, never a raised threshold.
+		//
+		// DEBUG_MULT exists for machine-to-machine noise, not for a
+		// debug/release gap: measured under -debug on the `mixed` fixture the
+		// numbers barely move (2.95 ms / 5.56 ms, ~1.1x), because the cost
+		// here is mostly DirectWrite and D3D11 calls outside Odin's own
+		// bounds checks, unlike a tight byte loop. Still generous, because a
+		// gate that flakes is one the next person learns to ignore.
+		DEBUG_MULT :: 1.3
+		dbg := f64(DEBUG_MULT) if ODIN_DEBUG else 1.0
+		draw_gate := 5.0 * dbg
+		frame_gate := 9.0 * dbg
+		perf_bad := 0
+		d_ms, f_ms := ms(t_draw, N), ms(t_frame, N)
+		if d_ms > draw_gate {
+			fmt.printfln("  FAIL: markdown_draw %.3f ms exceeds %.1f ms gate", d_ms, draw_gate)
+			perf_bad += 1
+		}
+		if f_ms > frame_gate {
+			fmt.printfln("  FAIL: whole scroll frame %.3f ms exceeds %.1f ms gate", f_ms, frame_gate)
+			perf_bad += 1
+		}
+		return perf_bad
 	}
 
 	// An allocator that WRAPS the one under test and reports on it, for
@@ -11436,9 +11705,12 @@ when NEWTPAD_TESTS {
 			// 200 consecutive prose lines are ONE block, which is section B3's subject
 			// and was these two sections' undoing. A blockquote is the nearest kind
 			// that still tiles one per line: same body face, same height, and its
-			// space-above of 16 collapses against a paragraph's space-below of 16 to
-			// the identical gap the old fixture had, so B's `vis` window and its
-			// builds-per-visible-block bounds stay calibrated where they were.
+			// space-above is 0.8 S exactly as a paragraph's space-below is, so the two
+			// collapse to the identical gap the old fixture had and B's `vis` window
+			// and its builds-per-visible-block bounds stay calibrated where they were.
+			// (0.8 S is 19 px at this section's px_ = 24, not the 16 an earlier
+			// version of this comment named -- md_scale(24, 0.80) = 19. The numbers
+			// being EQUAL is what the calibration rests on, not what they are.)
 			QUOTE_LINE :: "> para %03d xx\n"
 			QUOTE_STRIDE :: len("> para 000 xx\n")
 
@@ -12844,6 +13116,10 @@ when NEWTPAD_TESTS {
 			}
 
 			fmt.printfln("mdfencetest: %d failures", bad)
+			// Exits non-zero, the guard palettetest carries. Demonstrated rather than
+			// assumed: sabotaging md_fence_seed made this mode print "8 failures" and
+			// still exit 0 (2026-08-01).
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
@@ -22007,6 +22283,7 @@ when NEWTPAD_TESTS {
 			lk_bare_reveal(&bad)
 
 			fmt.printfln("linktest: %d failures", bad)
+			if bad > 0 {os.exit(1)} // see mdfencetest's guard
 			return true
 		}
 
@@ -22214,7 +22491,11 @@ when NEWTPAD_TESTS {
 		}
 
 		// `newtpad mdperftest` measures what one WHEEL FRAME of the markdown preview
-		// costs, broken down by the four procedures a scroll frame calls.
+		// costs, broken down by the four procedures a scroll frame calls, over FOUR
+		// document shapes (see the fixtures below). One shape is not a benchmark:
+		// the mode measured only `mixed` until 2026-08-01, and `mixed` has no
+		// paragraph longer than one line, so a change that doubled the cost of a
+		// hard-wrapped paragraph reported "unchanged" here.
 		//
 		// It exists because the 2026-07-29 review measured md_preview_frac at 1.954ms
 		// against markdown_draw's 1.616 -- the scrollbar's fraction costing more than
@@ -22241,118 +22522,80 @@ when NEWTPAD_TESTS {
 			g_theme, UI_SCALE = theme_dark(), 1
 			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
 
-			// ~1085 lines of mixed markdown: the review's fixture size, and mixed
-			// because a file of nothing but paragraphs understates the walk (a table
-			// and a blank run are the blocks whose layout keys on doc.revision).
-			b := strings.builder_make()
-			defer strings.builder_destroy(&b)
-			lines := 0
-			for lines < 1085 {
-				i := lines
-				fmt.sbprintf(&b, "## Section %03d\n\n", i)
-				fmt.sbprintf(&b, "A paragraph of body prose with `inline code` and a [link](https://e.test/p%03d) in it, long enough to wrap across the measure more than once so the shaper has real work to do.\n\n", i)
-				fmt.sbprintf(&b, "- first item %03d\n- second item with a little more text on it\n\n", i)
-				strings.write_string(&b, "| c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 | c9 | ca | cb |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n| one | two | three | four | five | six | seven | eight | nine | ten | eleven | twelve |\n| aaa | bbb | ccc | ddd | eee | fff | ggg | hhh | iii | jjj | kkk | lll |\n\n")
-				strings.write_string(&b, "```json\n{ \"key\": \"value\", \"n\": 12 }\n```\n\n")
-				lines += 14
-			}
-			src := strings.to_string(b)
-			content := make([]u8, len(src))
-			copy(content, src)
-			doc := doc_from_content(content, "perf.md", .UTF8)
-			defer doc_close(&doc)
-			doc.md_mode = .Preview
-			px_ := BASE_PX
-			winw, winh := f32(W), f32(H)
-			x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, winw, winh, 0.5)
-			if !box_ok {
-				fmt.println("mdperftest: FAIL no preview pane")
-				return true
-			}
-			c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
-			if !cok {
-				fmt.println("mdperftest: FAIL no scroll context")
-				return true
-			}
-			notch := md_wheel_px(&c)
-			mid := doc.pt.length / 3
-			restart := md_anchor_from_top(&c, mid)
-
-			N :: 200
-			// Warm the layout cache and md_max_anchor, so what is measured is a
-			// STEADY-STATE scroll frame and not the first one after an open.
-			at := restart
-			for _ in 0 ..< 8 {
-				at = md_scroll_px(&c, at, notch)
-				doc.md_top = at
-				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
-				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
-				markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
-				md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
-				free_all(context.temp_allocator)
-			}
-
-			t_scroll, t_draw, t_links, t_frac, t_frame: time.Duration
-			at = restart
-			for _ in 0 ..< N {
-				f0 := time.tick_now()
-				s0 := time.tick_now()
-				nxt := md_scroll_px(&c, at, notch)
-				// The ceiling is reachable inside 200 notches, and a step that moves
-				// nothing is not a scroll frame. Wrap rather than measure a no-op.
-				at = restart if nxt == at else nxt
-				t_scroll += time.tick_since(s0)
-				doc.md_top = at
-
-				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
-				d0 := time.tick_now()
-				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
-				t_draw += time.tick_since(d0)
-				l0 := time.tick_now()
-				markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
-				t_links += time.tick_since(l0)
-				r0 := time.tick_now()
-				md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
-				t_frac += time.tick_since(r0)
-				t_frame += time.tick_since(f0)
-				free_all(context.temp_allocator)
-			}
-			ms :: proc(d: time.Duration, n: int) -> f64 {return time.duration_milliseconds(d) / f64(n)}
-			fmt.printfln("mdperftest: %d lines, %dx%d, S=%.0f, mean of %d frames", 1085, W, H, px_, N)
-			fmt.printfln("  md_scroll_px (one notch)   %.3f ms", ms(t_scroll, N))
-			fmt.printfln("  markdown_draw              %.3f ms", ms(t_draw, N))
-			fmt.printfln("  markdown_links             %.3f ms", ms(t_links, N))
-			fmt.printfln("  md_preview_frac            %.3f ms", ms(t_frac, N))
-			fmt.printfln("  whole scroll frame         %.3f ms", ms(t_frame, N))
-			// A threshold, so a regression here goes red instead of printing and
-			// passing regardless. Baseline is 2026-07-29's review measurement on
-			// this exact fixture at -o:speed: markdown_draw 2.79 ms, whole scroll
-			// frame 5.05 ms. The gate is ~1.8x that -- generous enough that normal
-			// machine noise does not flake it, tight enough that a 2x regression
-			// (what actually shipped once, undetected by this mode) trips it
-			// before it fully doubles.
-			//
-			// DEBUG_MULT exists for machine-to-machine noise, not for a
-			// debug/release gap: measured under -debug on this same fixture the
-			// numbers barely move (2.95 ms / 5.56 ms, ~1.1x), because the cost
-			// here is mostly DirectWrite and D3D11 calls outside Odin's own
-			// bounds checks, unlike a tight byte loop. Still generous, because a
-			// gate that flakes is one the next person learns to ignore.
-			DEBUG_MULT :: 1.3
-			dbg := f64(DEBUG_MULT) if ODIN_DEBUG else 1.0
-			draw_gate := 5.0 * dbg
-			frame_gate := 9.0 * dbg
 			perf_bad := 0
-			d_ms, f_ms := ms(t_draw, N), ms(t_frame, N)
-			if d_ms > draw_gate {
-				fmt.printfln("  FAIL: markdown_draw %.3f ms exceeds %.1f ms gate", d_ms, draw_gate)
-				perf_bad += 1
+
+			// FIXTURE 1 -- ~1092 lines of mixed markdown: the review's fixture size,
+			// and mixed because a file of nothing but paragraphs understates the walk
+			// (a table and a blank run are the blocks whose layout keys on
+			// doc.revision).
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				lines := 0
+				for lines < 1085 {
+					i := lines
+					fmt.sbprintf(&b, "## Section %03d\n\n", i)
+					fmt.sbprintf(&b, "A paragraph of body prose with `inline code` and a [link](https://e.test/p%03d) in it, long enough to wrap across the measure more than once so the shaper has real work to do.\n\n", i)
+					fmt.sbprintf(&b, "- first item %03d\n- second item with a little more text on it\n\n", i)
+					strings.write_string(&b, "| c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 | c9 | ca | cb |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n| one | two | three | four | five | six | seven | eight | nine | ten | eleven | twelve |\n| aaa | bbb | ccc | ddd | eee | fff | ggg | hhh | iii | jjj | kkk | lll |\n\n")
+					strings.write_string(&b, "```json\n{ \"key\": \"value\", \"n\": 12 }\n```\n\n")
+					lines += 14
+				}
+				perf_bad += md_perf_measure(&h, "mixed", strings.to_string(b), lines, W, H)
 			}
-			if f_ms > frame_gate {
-				fmt.printfln("  FAIL: whole scroll frame %.3f ms exceeds %.1f ms gate", f_ms, frame_gate)
-				perf_bad += 1
+
+			// FIXTURES 2-4 -- HARD-WRAPPED PROSE, the shape fixture 1 cannot express.
+			//
+			// Every paragraph above is ONE line between blank lines, so md_para_bounds
+			// scans one line per call and the paragraph join costs nothing measurable
+			// here. Real prose that a wrapping editor produced has no blank line
+			// inside a paragraph at all, and there each md_para_bounds call walks the
+			// whole run -- every resolver call, before md_para_run memoised it.
+			//
+			// Whole scroll frame, debug build, this machine, 2026-08-01. The first
+			// two columns are the reviewer's on the same fixtures; the last two are
+			// this mode's own, measured with the memo disabled and enabled:
+			//
+			//   fixture           4f1a3b9  fb92ad3   memo off   memo on
+			//   20x100 lines      5.414 ms 6.117 ms   6.231 ms  5.193 ms
+			//   one 2000-line     6.134 ms 13.431 ms 13.849 ms  1.633 ms
+			//   one 4000-line     35.0  ms 39.3   ms 39.783 ms  1.615 ms
+			//
+			// The 4000-line row is the one worth reading twice: 1.615 ms is below the
+			// 1.73 ms that fixture cost at 6fd48d3, BEFORE the join existed. The cost
+			// the join added there was never the joining -- that run is capped and
+			// nothing joins in it -- it was asking md_para_bounds the same question
+			// once per block per frame.
+			//
+			// 4000 lines x 87 bytes is 348 KB, past MD_PARA_BUDGET's 256 KB, so that
+			// run is `capped` and NOTHING joins in it -- it measures the cost of
+			// asking, which every .Para block pays whether or not it joins.
+			PROSE :: "hard wrapped prose line %04d carrying enough words to look like real reflowed body text\n"
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for p in 0 ..< 20 {
+					for i in 0 ..< 100 {
+						fmt.sbprintf(&b, PROSE, p * 100 + i)
+					}
+					strings.write_string(&b, "\n")
+				}
+				perf_bad += md_perf_measure(&h, "hardwrap 20x100", strings.to_string(b), 2020, W, H)
 			}
+			// Literal names, not fmt.tprintf: md_perf_measure frees the frame arena
+			// 208 times before it prints, so a temp-allocated name comes back blank.
+			one_para_names := [2]string{"hardwrap 1x2000", "hardwrap 1x4000"}
+			for n, k in ([2]int{2000, 4000}) {
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< n {
+					fmt.sbprintf(&b, PROSE, i)
+				}
+				perf_bad += md_perf_measure(&h, one_para_names[k], strings.to_string(b), n, W, H)
+			}
+
 			fmt.printfln("mdperftest: %d failures", perf_bad)
+			if perf_bad > 0 {os.exit(1)}
 			return true
 		}
 
@@ -25682,6 +25925,7 @@ when NEWTPAD_TESTS {
 			if !eok {fail = true}
 			fmt.printfln("  %-6s empty leading cells kept (%d cells)", "ok" if eok else "FAIL", len(cells))
 			fmt.println("mdtabletest: FAILURES" if fail else "mdtabletest: all ok")
+			if fail {os.exit(1)} // see mdfencetest's guard
 			return true
 		}
 
@@ -26114,6 +26358,7 @@ when NEWTPAD_TESTS {
 			}
 
 			fmt.println("splittest: FAILURES" if fail else "splittest: all ok")
+			if fail {os.exit(1)} // see mdfencetest's guard
 			return true
 		}
 
@@ -27845,6 +28090,7 @@ when NEWTPAD_TESTS {
 			fmt.println("--- Alt+Z where it does not apply ---")
 			mv_wrap_refusal(&bad)
 			fmt.printfln("mdviewtest: %d failures", bad)
+			if bad > 0 {os.exit(1)} // see mdfencetest's guard
 			return true
 		}
 

@@ -1295,6 +1295,12 @@ Document :: struct {
 	// allocation, so nothing to free on doc close.
 	md_table:      [MD_TABLE_SLOTS]Md_Table_Cache,
 	md_table_next: int, // round-robin replacement cursor
+	// Remembered md_para_bounds answers, keyed by BYTE WINDOW (markdown.odin).
+	// Same shape and same reasoning as md_table above -- fixed array, no
+	// allocation, nothing to free on doc close -- and keyed on doc.revision for
+	// the same reason. See md_para_run for why a window rather than a byte.
+	md_para:      [MD_PARA_SLOTS]Md_Para_Cache,
+	md_para_next: int, // round-robin replacement cursor
 	// Per-block laid-out glyph positions (UI spec 9.1's layout cache). Keyed on
 	// the block's start byte and its own source text -- see MD_LAYOUT_SLOTS.
 	//

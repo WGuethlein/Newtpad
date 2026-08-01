@@ -802,20 +802,21 @@ md_is_para_line :: proc(line: string) -> bool {
 // THE SINGLE PRODUCER of a paragraph's extent. It exists because a joined
 // paragraph STARTS ABOVE ITS OWN LINE, which makes it the third construct with
 // that property (a collapsed blank run and front matter are the other two) --
-// and unlike those it occurs in every document. TWO production callers ask
-// where the block containing byte B starts, and they must never disagree:
+// and unlike those it occurs in every document. TWO production sites ask where
+// the block containing byte B starts, and they must never disagree:
 //
 //   * md_layout_build's `.Para` case, which joins the run this names into one
 //     block;
 //   * md_block_start_at, which snaps an arbitrary byte back to that same start
 //     before any resolver may hand it to a walk as a block key.
 //
-// Both read the same three returns from here -- `capped` included: a run this
-// cannot bound is joined by neither, so the snap and the join agree by reading
-// one flag from one producer rather than by two rules that have to match.
+// Neither reaches this procedure directly. Both go through md_para_run, which
+// memoises it and, more importantly, applies the `capped` refusal once on their
+// behalf -- so the snap and the join agree by construction rather than by two
+// readings of the same flag that have to be kept matching.
 //
 // Fence contract: md_is_para_line takes no `in_fence` parameter, unlike
-// md_classify underneath it, and the two callers reach here differently.
+// md_classify underneath it, and the two sites reach here differently.
 // md_layout_build's `.Para` case runs off `e.cls = md_classify(e.src, trimmed,
 // in_fence)`, and while `in_fence` is true md_classify returns `.Fence_Close`
 // on a fence line and `.Fence_Body` on every other line, never `.Para`
@@ -898,11 +899,111 @@ md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: 
 
 // Package-visible so mdjointest can drive the bounds function directly.
 // md_para_bounds is `private = "file"`, so this shim is the only way outside
-// this file to call it directly -- but it is not the only CALLER: both
-// md_layout_build's `.Para` case and md_block_start_at call it, so this shim
-// and those two production call sites all read the same single producer.
+// this file to call it directly -- but it is not the only CALLER: md_para_run
+// below memoises it for the two production call sites, so this shim and those
+// two all bottom out in the same single producer.
 md_para_bounds_for_test :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: bool) {
 	return md_para_bounds(doc, p)
+}
+
+// Four slots, mirroring MD_TABLE_SLOTS and for a related reason: a scroll frame
+// asks about several blocks, and one slot would be evicted by the next block and
+// missed on the one after. Four covers a viewport's worth of separate paragraphs
+// without making Document any bigger than the table cache already does.
+MD_PARA_SLOTS :: 4
+
+// One remembered md_para_bounds answer, keyed on a BYTE WINDOW rather than on the
+// entry byte. See md_para_run for why the window is sound.
+Md_Para_Cache :: struct {
+	valid:     bool,
+	revision:  u64, // the buffer this was measured against (doc.revision)
+	budget:    int, // md_para_budget / md_para_max_lines as they were at measure
+	max_lines: int, // time; mdjointest lowers both, so they are part of the key
+	lo, hi:    int, // the window this answer covers, inclusive at both ends
+	joinable:  bool, // lo/hi ARE the run's true bounds; false = capped, no bounds
+}
+
+// THE production question: is there a JOINABLE paragraph run containing `p`, and
+// where does it begin and end? Memoised over md_para_bounds.
+//
+// Two things happen here, and both are the point.
+//
+// 1. The `capped` decision is made ONCE, here, instead of at two call sites that
+//    have to keep agreeing. md_layout_build's `.Para` case and md_block_start_at
+//    both refuse a capped run -- the join because a truncated run's bounds are
+//    not the run's, the snap because it must land where the join will start --
+//    and a review found each of them justifying the rule by the other's failure.
+//    Folding it in here makes the agreement structural: there is no longer a
+//    `capped` flag at either call site to get out of step. md_para_bounds still
+//    returns it, for md_para_bounds_for_test and for mdjointest's trap rows.
+//
+// 2. The scans are skipped when a previous answer already covers `p`. Without
+//    this every resolver call walks the whole run. Measured on mdperftest's
+//    `hardwrap 1x2000` fixture, debug build, 2026-08-01: md_scroll_px 4.015 ms
+//    with this lookup disabled, 0.005 ms with it, and the whole scroll frame
+//    13.849 -> 1.633 ms. The 4000-line fixture, where the run is capped and
+//    NOTHING joins, went 39.783 -> 1.615 ms -- the join's cost there was never
+//    the joining, it was asking this question once per block per frame.
+//
+// WHY A WINDOW IS SOUND. For an entry that is a real line start, the answer is a
+// property of the RUN, not of the entry -- md_para_bounds' trap 3 and the
+// line-count check under it exist to make `capped` entry-independent, and
+// mdjointest asserts it directly ("one answer per paragraph, whatever byte you
+// enter at"). So:
+//
+//   * joinable: [lo, hi] are the run's true edges, every line start between them
+//     is a line of that run, and md_para_bounds would return the same triple from
+//     each of them.
+//   * not joinable: [lo, hi] is the truncated window the scans reached. It is a
+//     SUBSET of the same contiguous run, so every line start in it is in that run
+//     -- and the run is capped from every entry, so the answer is `false` for all
+//     of them. The truncated bounds themselves are entry-dependent and are
+//     deliberately NOT handed back; nothing needs them.
+//
+// THE TRAP, and why the line-start test guards both the lookup and the store: a
+// `p` that is not a line start is forced capped by md_para_bounds' own
+// `entry_is_line_start` check EVEN WHEN the run is small and joins fine from
+// every real line start in it. Caching that answer would poison the whole window
+// with a verdict that was about the entry and not about the run. So a mid-line
+// entry neither reads the cache nor writes it; it pays the scan and gets the
+// unmemoised answer, which is what it asked for.
+@(private = "file")
+md_para_run :: proc(doc: ^Document, p: int) -> (start, end: int, ok: bool) {
+	ls, exact := base.pt_line_start_cap(&doc.pt, p, RENDER_LINE_CAP)
+	line_start := exact && ls == p
+	if line_start {
+		for &e in doc.md_para {
+			if !e.valid || e.revision != doc.revision {continue}
+			if e.budget != md_para_budget || e.max_lines != md_para_max_lines {continue}
+			if p < e.lo || p > e.hi {continue}
+			if e.joinable {return e.lo, e.hi, true}
+			return 0, 0, false
+		}
+	}
+	s, en, capped, pok := md_para_bounds(doc, p)
+	if !pok {return 0, 0, false}
+	if line_start {
+		slot := &doc.md_para[doc.md_para_next]
+		doc.md_para_next = (doc.md_para_next + 1) % MD_PARA_SLOTS
+		slot^ = {
+			valid     = true,
+			revision  = doc.revision,
+			budget    = md_para_budget,
+			max_lines = md_para_max_lines,
+			lo        = s,
+			hi        = en,
+			joinable  = !capped,
+		}
+	}
+	if capped {return 0, 0, false}
+	return s, en, true
+}
+
+// Package-visible so mdjointest can assert on the MEMO -- that it answers the
+// same as md_para_bounds from every line start of a run, and that an edit
+// retires it -- rather than only on the producer underneath.
+md_para_run_for_test :: proc(doc: ^Document, p: int) -> (start, end: int, ok: bool) {
+	return md_para_run(doc, p)
 }
 
 // Per-column maxima across the whole block, plus the separator row's alignments.
@@ -2771,30 +2872,33 @@ md_layout_build :: proc(
 		// is also the fix for "the preview does not always respect spaces", since
 		// the space at the join is the one that was missing (there was no join).
 		//
-		// Bounds come from md_para_bounds and from nowhere else; see its comment
-		// for why a second producer here would be entry-dependent.
+		// Bounds come from md_para_run -- md_para_bounds behind a memo -- and from
+		// nowhere else; see md_para_bounds' comment for why a second producer here
+		// would be entry-dependent.
 		//
-		// `capped` is REFUSED, not discarded. A capped run's bounds are truncated
-		// at whichever guard fired, so the block AFTER it scans backward over lines
-		// this one already drew: on 5000 consecutive prose lines the block at p=0
-		// stops at md_para_max_lines and sets `next` to line 4097, whose own bounds
-		// then start near line 1 -- the preview shows the paragraph and then
-		// repeats most of it. Falling back to the unjoined single-line block is
-		// bounded, cannot duplicate, is exactly what shipped before the join, and a
-		// paragraph past 4096 lines or 256 KB is already pathological. The refusal
-		// is entry-independent because `capped` is (md_para_bounds' trap 3), so the
-		// same run is refused from every byte inside it -- which is the property the
-		// join exists to protect, not an exception to it. md_block_start_at refuses
-		// the same runs off the same flag, so the snap and the join agree.
+		// A CAPPED run is refused, and that refusal now lives inside md_para_run
+		// (`ok` is false for one) rather than as a `!capped` test here. It is there
+		// so that this case and md_block_start_at cannot get out of step about which
+		// runs join: the snap has to land on the byte this case will treat as the
+		// block's start, and two separate readings of the same flag are two things
+		// to keep matching. The cost of refusing is that a run past 4096 lines or
+		// 256 KB renders unjoined, one block per line, exactly as it did before the
+		// join existed -- and such a paragraph is already pathological.
 		//
-		// `ps == p` is defence in depth and NOT the fix. md_block_start_at is what
-		// guarantees this block was entered at the run's own first byte; if a future
-		// resolver forgets it, joining from `ps` anyway while `e.start` stays `p` is
-		// the regression this pair of procedures exists to remove -- the block claims
-		// to start in one place and holds text from another, and the preview drew
-		// from line 0 while the editor sat at line 100. Refusing is local, bounded,
-		// and visible to md_scroll_selftest's snap rows rather than silent.
-		if ps, pe, capped, pok := md_para_bounds(doc, p); pok && !capped && ps == p && pe > line_end {
+		// It is NOT refused to prevent a re-draw. That was this comment's claim
+		// until a 2026-08-01 review measured it with the `!capped` test removed and
+		// `ps == p` kept: block 1 spans 0..203 with next=204, block 2 spans 204..237
+		// -- zero duplication, because `ps != p` refuses block 2 before its bounds
+		// are ever used. The two guards are individually sufficient against a
+		// re-draw, and each was being credited here with the other's work.
+		//
+		// `ps == p` is therefore load-bearing in its own right, not only "defence in
+		// depth": it is what stops a block from claiming to start at `p` while
+		// holding text from `ps` -- the regression md_block_start_at exists to
+		// remove, in which the preview drew from line 0 while the editor sat at line
+		// 100. With the snap in place it never fires in production (mdtest is green
+		// with it removed); mdjointest's mid-run rows drive it directly.
+		if ps, pe, pok := md_para_run(doc, p); pok && ps == p && pe > line_end {
 			sb := strings.builder_make(context.temp_allocator)
 			q := ps
 			for q <= pe {
@@ -3721,13 +3825,22 @@ md_line_start_back :: proc(doc: ^Document, p, k: int) -> int {
 	return q
 }
 
-// The first byte of the block that CONTAINS `p`.
+// A byte at or before `p` that IS a block start, and from which a forward walk
+// reaches `p`.
 //
-// THE INVARIANT, and the reason this exists: any byte handed to md_walk -- and so
-// to md_layout_ensure, whose cache key is `e.start != p` -- as a block start must
-// actually BE a block start. Every resolver that turns a raw byte into a walk
-// entry goes through here (md_runup_start below), so a walk always enters a block
-// at its real beginning and a block never claims to start where it does not.
+// That is the invariant, and it is deliberately weaker than "the first byte of
+// the block containing `p`", which this used to claim and does not deliver in two
+// cases its own body describes below: inside a fence it can answer an earlier
+// fence-body line, and inside a collapsed blank run it answers a line that is not
+// the chunked block's start. Both are OVERSHOOTS -- a real block start, above
+// `p`, costing the walk a little extra distance -- which is all a walk needs and
+// all any caller here asks for.
+//
+// The reason it exists: any byte handed to md_walk -- and so to md_layout_ensure,
+// whose cache key is `e.start != p` -- as a block start must actually BE a block
+// start. Every resolver that turns a raw byte into a walk entry goes through here
+// (md_runup_start below), so a walk always enters a block at its real beginning
+// and a block never claims to start where it does not.
 //
 // This is the fix for the regression the paragraph join shipped. md_layout_build
 // is reached not only from a forward block walk, where the entry byte is always a
@@ -3743,10 +3856,11 @@ md_line_start_back :: proc(doc: ^Document, p, k: int) -> int {
 //
 // Three constructs start above their own first line. This handles two:
 //
-//   * a PARAGRAPH run. md_para_bounds produces it and nothing else does, and only
-//     when that run is UNCAPPED: md_layout_build's `.Para` case refuses a capped
-//     run for its own reasons, and the two must not disagree about where a block
-//     begins, so both refuse off the same flag from the same call.
+//   * a PARAGRAPH run. md_para_run produces it and nothing else does, and only
+//     when that run is JOINABLE -- a capped run comes back `ok = false` and this
+//     falls through to the line start. The refusal is not repeated here: it lives
+//     inside md_para_run precisely so this and md_layout_build's `.Para` case
+//     cannot get out of step about which runs are one block.
 //   * FRONT MATTER, which is always [0, md_front_matter_end) and so contains no
 //     other block start at all. MD_RUNUP_LINES is 24 and MD_FM_MAX_LINES is 64,
 //     so the run-up alone could never clear a card of 25-64 lines -- a divergence
@@ -3756,12 +3870,20 @@ md_line_start_back :: proc(doc: ^Document, p, k: int) -> int {
 //     oversight. Its block is chunked at MD_BLANK_RUN_MAX, so "the run's first
 //     blank line" is not in general the containing block's start, and answering
 //     properly means modelling the chunking. The MD_RUNUP_LINES run-up still
-//     covers runs up to 24 lines, which is every run in md/mdtest's fixtures;
+//     covers runs up to 24 lines, which is every run in mdtest's fixtures;
 //     nothing has yet measured a longer one misbehaving. Recorded as known.
 //
+// THE ONE STATED EXCEPTION to "returns a block start": a `p` inside a line longer
+// than RENDER_LINE_CAP. The line-start scan is capped, so there is no line start
+// to return, and the early exit hands `p` itself back -- a byte that is a segment
+// boundary of markdown_draw's capped walk, not a block start. It is deliberate
+// and bounded, and nothing joins across it (md_para_bounds forces `capped` on
+// such an entry, so md_para_run answers `ok = false`), which is what keeps the
+// answer usable. mdjointest's pj_case_overlong_line drives it directly.
+//
 // Cheap on the common path: md_front_matter_end reads exactly one line and
-// returns when the document does not open with `---`, and md_para_bounds is the
-// same scan md_layout_build pays for that block a moment later.
+// returns when the document does not open with `---`, and md_para_run's memo
+// usually answers without a scan at all.
 md_block_start_at :: proc(doc: ^Document, p: int) -> int {
 	if doc == nil {return 0}
 	q := clamp(p, 0, doc.pt.length)
@@ -3769,10 +3891,10 @@ md_block_start_at :: proc(doc: ^Document, p: int) -> int {
 	ls, exact := base.pt_line_start_cap(&doc.pt, q, RENDER_LINE_CAP)
 	// No line start inside the scan cap: `q` is within a line longer than
 	// RENDER_LINE_CAP, which markdown_draw walks in capped segments. Hand back what
-	// the caller had rather than a position that is not a line start either -- and
-	// md_para_bounds would force `capped` on such an entry anyway.
+	// the caller had rather than a position that is not a line start either -- see
+	// the stated exception above.
 	if !exact || ls > q {return q}
-	if ps, _, capped, ok := md_para_bounds(doc, ls); ok && !capped {return ps}
+	if ps, _, ok := md_para_run(doc, ls); ok {return ps}
 	return ls
 }
 
