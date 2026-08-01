@@ -127,9 +127,12 @@ command_in_palette :: proc(cmd: Command_Id) -> bool {
 	     // The same exclusion drops them from keys.txt's "commands with no
 	     // default editor key" listing, which loops over command_in_palette
 	     // (keymap.odin). That is the outcome we want, not a side effect worth
-	     // undoing: a user-bound chord has no menu behind it, so it would
-	     // dispatch against whatever column the last context menu happened to
-	     // leave in ctx_col.
+	     // undoing: a user-bound chord would have no menu behind it, so it
+	     // would dispatch against whatever column the last context menu
+	     // happened to leave in ctx_col -- which is why command_from_name
+	     // (keymap.odin) separately refuses to bind one of these six at all,
+	     // via command_needs_menu_target (commands.odin). Excluding them here
+	     // only keeps them off the listing; closing the route is that check's job.
 	     .Table_Sort_Asc, .Table_Sort_Desc, .Table_Sort_Then_Asc, .Table_Sort_Then_Desc,
 	     .Table_Sort_Remove, .Table_Sort_Clear:
 		return false

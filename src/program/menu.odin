@@ -385,7 +385,10 @@ menu_init :: proc(m: ^Menu_State) {
 // and item_disabled_reason only run while a dropdown holding those rows is open,
 // menu_open_ctx overwrites it on every open, menu_open_at clears it, and the six
 // commands are reachable from no other route -- no bar row carries them, the
-// palette excludes them (palette.odin) and none has a default chord.
+// palette excludes them (palette.odin), and a hand-written keymap chord cannot
+// reach them either: command_from_name (keymap.odin) refuses any name for which
+// command_needs_menu_target (commands.odin) holds. That is true by construction,
+// not by the accident of nothing having bound one yet.
 menu_close :: proc(app: ^App) {
 	app.menu.mode = false
 	app.menu.open = -1
