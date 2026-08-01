@@ -6460,10 +6460,15 @@ when NEWTPAD_TESTS {
 			//
 			// Every dropdown means the context menus too, not just the bar's:
 			// dropdown_w takes an item slice precisely so ctx_items sizes through
-			// the same rule, and table_header_menu_items is the one menu whose
-			// widest row is a REASON rather than a chord (none of its six has a
-			// chord at all), so it exercises the half of the budget the bar menus
-			// mostly do not.
+			// the same rule. table_header_menu_items is not the only menu whose
+			// widest row is a REASON rather than a chord -- the loop below prints
+			// the counter-example, View, whose widest row is Toggle_Preview's own
+			// "Markdown Preview / Split" (24) plus the disabled reason "Markdown
+			// files only" (19), 43 characters, not its "Ctrl+M" chord. What IS true
+			// of table_header_menu_items and no other menu here is that every one
+			// of its six rows is a reason rather than a chord, since none of the
+			// six has a chord at all, so it exercises the reason half of the
+			// budget on every row, not just the one row the bar menus happen to.
 			{
 				mt: plat.Text
 				plat.text_load_faces(&mt)
