@@ -1884,6 +1884,7 @@ when NEWTPAD_TESTS {
 			ts_case_refusal(&bad)
 			ts_case_key_ops(&bad)
 			ts_case_toggle_secondary_cycle(&bad)
+			ts_case_menu_items(&bad)
 		}
 		fmt.printfln("tablesorttest: %d failures", bad)
 		if bad > 0 {os.exit(1)}
@@ -2594,6 +2595,124 @@ when NEWTPAD_TESTS {
 		k0, k0ok := table_sort_key(&d, 0)
 		li_chk(bad, k0ok && k0 == 0 && s.keys[0].desc && table_sorted(&d), fmt.tprintf("...primary (col 0) survives at precedence 0, still descending (k %d, ok %v, desc %v)", k0, k0ok, s.keys[0].desc))
 		li_chk(bad, ts_order(&d) == "b,2|b,1|a,3|a,4", fmt.tprintf("...and the order follows the surviving primary alone, ties by file order now (%q)", ts_order(&d)))
+	}
+
+	// A single-tab App around one ts_doc fixture, for cases that need item_enabled
+	// (menu.odin) rather than the raw Table_Sort operations -- item_enabled takes
+	// an ^App because Menu_Item.enabled does, reading the target column off
+	// app.menu.ctx_col rather than a parameter. app_destroy owns the returned
+	// App's teardown (it frees the Document too, the same shape menutest already
+	// uses), so the caller's only obligation is `defer app_destroy(&a)`.
+	@(private = "file")
+	ts_menu_app :: proc(src: string, cols: int) -> App {
+		a: App
+		menu_init(&a.menu)
+		d := new(Document)
+		d^ = ts_doc(src, cols)
+		app_activate(&a, app_add(&a, d))
+		return a
+	}
+
+	// C13: table_header_menu_items -- every row of the brief's table, in each of
+	// the four states it names: unsorted; sorted by the column the menu targets;
+	// sorted by a DIFFERENT column with room left under the cap; and the vector AT
+	// the cap with the targeted column not among its keys.
+	//
+	// item_enabled is asserted DIRECTLY, not inferred from a simulated click --
+	// the brief's own instruction, because this menu is a discoverability surface
+	// (menu.odin's header comment): what a reader sees (grey or not) is the thing
+	// under test, not whether the command would have run.
+	//
+	// TABLE_SORT_KEYS_MAX+1 columns, not three or four written as literals: the
+	// smallest fixture that can fill the cap and still leave one column that is
+	// never a key, for the "vector full, this column not in it" state. The
+	// #assert matches ts_case_inverses' own guard and for the same reason -- a
+	// cap raised past what this fixture has columns for would silently start
+	// asking about a column that does not exist.
+	@(private = "file")
+	ts_case_menu_items :: proc(bad: ^int) {
+		fmt.println("-- table_header_menu_items: every row's enabled state across four sort states --")
+		#assert(TABLE_SORT_KEYS_MAX <= 3)
+		src := "w,x,y,z\n1,a,p,i\n2,b,q,j\n3,a,r,i\n1,c,s,j\n2,a,t,i\n"
+		COLS :: 4
+		target := TABLE_SORT_KEYS_MAX // one past every column the "full" state fills
+
+		find :: proc(items: []Menu_Item, cmd: Command_Id) -> Menu_Item {
+			for it in items {
+				if it.cmd == cmd {return it}
+			}
+			// A row this test names is missing from the table it is checking --
+			// a plan defect or a regression, not a case this proc can score.
+			panic("table_header_menu_items is missing a row this test names")
+		}
+
+		// One state's worth of assertions, run against whatever sort the caller
+		// already built on `a`'s active document. `want_then_by` covers both
+		// Then-by rows: the brief gives them the identical predicate.
+		check :: proc(bad: ^int, label: string, a: ^App, want_then_by, want_remove, want_clear: bool) {
+			items := table_header_menu_items
+			li_chk(bad, item_enabled(a, find(items, .Table_Sort_Asc)), fmt.tprintf("%s: Sort Ascending is enabled", label))
+			li_chk(bad, item_enabled(a, find(items, .Table_Sort_Desc)), fmt.tprintf("%s: Sort Descending is enabled", label))
+			got_ta := item_enabled(a, find(items, .Table_Sort_Then_Asc))
+			li_chk(bad, got_ta == want_then_by, fmt.tprintf("%s: Then by Ascending enabled == %v (got %v)", label, want_then_by, got_ta))
+			got_td := item_enabled(a, find(items, .Table_Sort_Then_Desc))
+			li_chk(bad, got_td == want_then_by, fmt.tprintf("%s: Then by Descending enabled == %v (got %v)", label, want_then_by, got_td))
+			got_rm := item_enabled(a, find(items, .Table_Sort_Remove))
+			li_chk(bad, got_rm == want_remove, fmt.tprintf("%s: Remove from Sort enabled == %v (got %v)", label, want_remove, got_rm))
+			got_cl := item_enabled(a, find(items, .Table_Sort_Clear))
+			li_chk(bad, got_cl == want_clear, fmt.tprintf("%s: Clear Sort enabled == %v (got %v)", label, want_clear, got_cl))
+		}
+
+		// -- unsorted: everything but the two plain Sort rows is dead --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			a.menu.ctx_col = target
+			check(bad, "unsorted", &a, false, false, false)
+		}
+
+		// -- sorted by the column the menu targets: every row lights up --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			table_sort_set(d, target, false)
+			a.menu.ctx_col = target
+			check(bad, "sorted by this column", &a, true, true, true)
+		}
+
+		// -- sorted by a DIFFERENT column, one key live, room left under the cap:
+		//    Then-by can still append this column as a tie-breaker; Remove has
+		//    nothing to remove, because this column isn't the key. --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			other := (target + 1) % COLS
+			table_sort_set(d, other, false)
+			a.menu.ctx_col = target
+			check(bad, "sorted by another column", &a, true, false, true)
+		}
+
+		// -- the vector at the cap, this column not among its keys: Then-by is
+		//    the one row this state disables that the OTHER "sorted by another
+		//    column" state above does not -- table_sort_can_add says no, because
+		//    there is no room left to compose this column onto. That is also the
+		//    one case with an item_disabled_reason (the brief's own instruction:
+		//    a full vector greyed out with no explanation reads as a broken row).
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			full: [TABLE_SORT_KEYS_MAX]Sort_Key
+			for i in 0 ..< TABLE_SORT_KEYS_MAX {full[i] = {col = i, desc = false}}
+			ok := table_sort_build(d, full[:])
+			li_chk(bad, ok, "precondition: the cap-filling build succeeds")
+			a.menu.ctx_col = target
+			check(bad, "vector full, this column not in it", &a, false, false, true)
+			why := item_disabled_reason(&a, find(table_header_menu_items, .Table_Sort_Then_Asc))
+			li_chk(bad, why != "", fmt.tprintf("...and the disabled Then-by row carries a reason rather than a bare grey-out (%q)", why))
+		}
 	}
 
 	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the

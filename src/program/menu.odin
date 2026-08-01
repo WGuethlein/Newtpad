@@ -10,6 +10,7 @@
 // shipped editor with a palette also keeps a menu.
 package main
 
+import "core:fmt"
 import plat "src:platform"
 
 MENU_BAR_H_96 :: f32(30) // UI spec 2.1 (was 26)
@@ -116,6 +117,30 @@ is_enc_cp1252 :: proc(app: ^App) -> bool {d := app_active(app);return d != nil &
 is_eol_lf :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.eol == .LF}
 @(private = "file")
 is_eol_crlf :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.eol == .CRLF}
+
+// The header context menu's predicates (Task 5). All four read the target
+// column off app.menu.ctx_col rather than taking a parameter -- Menu_Item.enabled
+// takes only the app -- which is why this menu's rows are checked against a
+// context column and the bar's never are.
+@(private = "file")
+has_live_sort :: proc(app: ^App) -> bool {return table_sorted(app_active(app))}
+
+@(private = "file")
+is_sort_key_col :: proc(app: ^App) -> bool {
+	_, ok := table_sort_key(app_active(app), app.menu.ctx_col)
+	return ok
+}
+
+// "Then by" needs a sort to add a tie-breaker TO, and then either this column
+// is already one of its keys (in which case table_sort_add flips its direction
+// in place, per its own comment) or there is still room to append a new one.
+@(private = "file")
+can_then_by :: proc(app: ^App) -> bool {
+	d := app_active(app)
+	if !table_sorted(d) {return false}
+	if _, ok := table_sort_key(d, app.menu.ctx_col); ok {return true}
+	return table_sort_can_add(d, app.menu.ctx_col)
+}
 
 @(private = "file")
 sep :: Menu_Item{}
@@ -256,6 +281,32 @@ menus := []Menu {
 		'h',
 		[]Menu_Item{{cmd = .Check_For_Updates}},
 	},
+}
+
+// The table header's context menu (right-click / chevron on a column header --
+// Task 6 wires the gesture; this is only its contents). menu_open_ctx is the
+// OTHER caller of the dropdown machinery `menus` above feeds, and its own
+// comment explains why this has to be a package-level slice rather than
+// something built per-open: a menu survives into the frame after the one that
+// opened it, and main.odin's free_all(context.temp_allocator) runs once every
+// frame, so a temp-allocated table would dangle by the time the next draw or
+// hit-test read it.
+//
+// Six rows, three pairs, matching table.odin's Table_Sort operations one for
+// one: table_sort_set (replace with a single key) for the first two,
+// table_sort_add (compose a tie-breaker, or flip an existing key's direction
+// in place) for "Then by", table_sort_drop for "Remove", table_sort_clear for
+// "Clear". Nothing here writes doc.table_sort itself -- every row calls one of
+// those four, which is the only thing allowed to.
+table_header_menu_items := []Menu_Item {
+	{cmd = .Table_Sort_Asc},
+	{cmd = .Table_Sort_Desc},
+	sep,
+	{cmd = .Table_Sort_Then_Asc, enabled = can_then_by},
+	{cmd = .Table_Sort_Then_Desc, enabled = can_then_by},
+	{cmd = .Table_Sort_Remove, enabled = is_sort_key_col},
+	sep,
+	{cmd = .Table_Sort_Clear, enabled = has_live_sort},
 }
 
 // Menu bar / dropdown state. `mode` is menu-bar keyboard mode with nothing open
@@ -457,6 +508,8 @@ command_disabled_hint :: proc(cmd: Command_Id) -> string {
 		return "Markdown files only"
 	case .Reopen_UTF8, .Reopen_UTF16LE, .Reopen_CP1252:
 		return "unsaved file"
+	case .Table_Sort_Then_Asc, .Table_Sort_Then_Desc:
+		return fmt.tprintf("%d-column sort limit", TABLE_SORT_KEYS_MAX)
 	}
 	return ""
 }
@@ -470,6 +523,17 @@ item_disabled_reason :: proc(app: ^App, it: Menu_Item) -> string {
 		if d != nil && d.kind == .Text && !doc_can_markdown(d) {return command_disabled_hint(it.cmd)}
 	case .Reopen_UTF8, .Reopen_UTF16LE, .Reopen_CP1252:
 		if d != nil && d.path == "" {return command_disabled_hint(it.cmd)}
+	case .Table_Sort_Then_Asc, .Table_Sort_Then_Desc:
+		// Only the AT-THE-CAP reason: a sort that isn't live yet needs no
+		// explanation for "there is nothing to add a tie-breaker to" -- the row
+		// being dead is its own explanation there. This is the one state that
+		// isn't, per the brief: two keys already live, neither of them this
+		// column, so the row reads as broken without saying why.
+		if table_sorted(d) {
+			if _, ok := table_sort_key(d, app.menu.ctx_col); !ok && !table_sort_can_add(d, app.menu.ctx_col) {
+				return command_disabled_hint(it.cmd)
+			}
+		}
 	}
 	return ""
 }

@@ -118,7 +118,13 @@ command_in_palette :: proc(cmd: Command_Id) -> bool {
 	     .History_Close, .History_Next, .History_Prev, .History_Jump,
 	     // Filter_Open supersedes it here: same key, but it opens find first
 	     // instead of silently toggling a mode with no visible UI.
-	     .Find_Toggle_Filter:
+	     .Find_Toggle_Filter,
+	     // The header menu's six sort rows act on app.menu.ctx_col, the column
+	     // the menu was opened on -- the palette has no column to name, so
+	     // none of these can mean anything run from here. A real cost, taken
+	     // knowingly: multi-sort is not reachable from Ctrl+P.
+	     .Table_Sort_Asc, .Table_Sort_Desc, .Table_Sort_Then_Asc, .Table_Sort_Then_Desc,
+	     .Table_Sort_Remove, .Table_Sort_Clear:
 		return false
 	}
 	return true
