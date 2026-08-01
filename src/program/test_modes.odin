@@ -6180,8 +6180,8 @@ when NEWTPAD_TESTS {
 				mt: plat.Text
 				plat.text_load_faces(&mt)
 				cw := plat.text_char_width(&mt, UI_PX)
-				for m, mi in menus {
-					w := dropdown_w(&mt, mi)
+				for m in menus {
+					w := dropdown_w(&mt, m.items)
 					worst := ""
 					need := f32(0)
 					for it in m.items {
