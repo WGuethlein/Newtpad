@@ -1883,6 +1883,7 @@ when NEWTPAD_TESTS {
 			ts_case_measure(&bad)
 			ts_case_refusal(&bad)
 			ts_case_key_ops(&bad)
+			ts_case_toggle_secondary_cycle(&bad)
 		}
 		fmt.printfln("tablesorttest: %d failures", bad)
 		if bad > 0 {os.exit(1)}
@@ -2461,6 +2462,17 @@ when NEWTPAD_TESTS {
 		li_chk(bad, ts_order(&d) == "a,3|a,4|b,1|b,2", fmt.tprintf("...order follows: col 0 asc primary, col 1 asc breaking ties (%q)", ts_order(&d)))
 
 		// -- table_sort_drop: removes only the named key, keeps the other live --
+		//
+		// d.top is poisoned first, deliberately to something the correct scroll can
+		// never land on by coincidence: row 0 of the order AFTER this drop is "a,3",
+		// the same physical row that was already at row 0 before it (dropping col 1
+		// does not move col 0's primary rows), so an assertion that just compared
+		// d.top to table_sort_row_at(&d, 0) afterwards would still pass with the
+		// scroll-to-top line deleted from table_sort_drop -- d.top would already be
+		// right, left over from the table_sort_add call above. Poisoning it first is
+		// what makes the check below fail when that line is missing, the way Finding
+		// 2's review proved a same-row coincidence was hiding this exact gap.
+		d.top = -1
 		table_sort_drop(&d, 1)
 		li_chk(bad, s.nkeys == 1, fmt.tprintf("dropping col 1 leaves exactly one key (nkeys %d)", s.nkeys))
 		_, k1ok = table_sort_key(&d, 1)
@@ -2468,6 +2480,7 @@ when NEWTPAD_TESTS {
 		k0, k0ok = table_sort_key(&d, 0)
 		li_chk(bad, k0ok && k0 == 0 && table_sorted(&d), "...col 0 is still live, still primary")
 		li_chk(bad, ts_order(&d) == "a,3|a,4|b,2|b,1", fmt.tprintf("...back to col 0's own single-key order, ties by file order now (%q)", ts_order(&d)))
+		if off, ok := table_sort_row_at(&d, 0); ok {li_chk(bad, d.top == off, fmt.tprintf("...and scrolled to the top of the reduced order (top %d, want %d)", d.top, off))}
 
 		// -- toggle on the LAST live key, descending -> removed: unsorts the doc,
 		//    and doc.top is left alone -- there is no permutation left for a
@@ -2482,8 +2495,9 @@ when NEWTPAD_TESTS {
 		// -- the plain click's standard three-state cycle, on a column that starts
 		//    OUTSIDE the (currently empty) live sort: not-a-key -> ascending ->
 		//    descending -> cleared. table_sort_cycle's own logic is unchanged from
-		//    table_sort_click except reading keys[k] instead of keys[0] (below);
-		//    this is the ordinary single-key path that change must not disturb.
+		//    its pre-Task-3 shape (then named table_sort_click, since renamed) except
+		//    reading keys[k] instead of keys[0] (below); this is the ordinary
+		//    single-key path that change must not disturb.
 		table_sort_cycle(&d, 1)
 		li_chk(bad, s.nkeys == 1 && s.keys[0].col == 1 && !s.keys[0].desc, fmt.tprintf("plain click 1 (not sorted -> ascending): nkeys %d keys %v", s.nkeys, s.keys))
 		table_sort_cycle(&d, 1)
@@ -2536,6 +2550,50 @@ when NEWTPAD_TESTS {
 		defer delete(post)
 		li_chk(bad, !d.table_editing, "a Ctrl+click closes the open edit")
 		li_chk(bad, strings.contains(post, "b,2!") && !strings.contains(pre, "b,2!"), fmt.tprintf("...by COMMITTING it onto the row it was opened on, not dropping the keystroke (%q)", post))
+	}
+
+	// Finding 4 (batch 19 Task 3 review): ts_case_key_ops exercises toggle's
+	// three-state removal (descending -> removed) only where removing the key
+	// leaves the document unsorted, and covers "the primary survives" only
+	// through a direct table_sort_drop call, not through table_sort_toggle
+	// itself. Neither proves the GESTURE -- Ctrl+click, Ctrl+click, Ctrl+click on
+	// the SECONDARY key -- leaves the primary's precedence and direction alone.
+	// This case is that composition, on its own Document per development-loop.md
+	// §6's one-Document-per-proc rule.
+	@(private = "file")
+	ts_case_toggle_secondary_cycle :: proc(bad: ^int) {
+		fmt.println("-- table_sort_toggle's three-state cycle on a SECONDARY key, primary left live --")
+		d := ts_doc("a,b\nb,2\na,3\nb,1\na,4\n", 2)
+		defer doc_close(&d)
+		s := &d.table_sort
+
+		// Primary: col 0 descending. Secondary: col 1 ascending, composed on top
+		// through table_sort_add rather than table_sort_set, matching how a real
+		// Ctrl+click on a second column arrives (table_sort_toggle's own
+		// not-a-key branch).
+		table_sort_set(&d, 0, true)
+		table_sort_add(&d, 1, false)
+		li_chk(bad, s.nkeys == 2 && s.keys[0].col == 0 && s.keys[0].desc && s.keys[1].col == 1 && !s.keys[1].desc, fmt.tprintf("precondition: col 0 desc primary, col 1 asc secondary (nkeys %d, keys %v)", s.nkeys, s.keys))
+		li_chk(bad, ts_order(&d) == "b,1|b,2|a,3|a,4", fmt.tprintf("...col 0 desc, col 1 asc breaking its ties (%q)", ts_order(&d)))
+
+		// Ctrl+click 1 on the secondary: already a key, ascending -> descending,
+		// IN PLACE -- the primary must not move or change direction.
+		table_sort_toggle(&d, 1)
+		k1, k1ok := table_sort_key(&d, 1)
+		li_chk(bad, s.nkeys == 2 && s.keys[0].col == 0 && s.keys[0].desc, fmt.tprintf("toggle 1 on the secondary: primary (col 0, desc) untouched (nkeys %d, keys %v)", s.nkeys, s.keys))
+		li_chk(bad, k1ok && k1 == 1 && s.keys[1].desc, fmt.tprintf("...secondary (col 1) flips to descending without moving off precedence 1 (k %d, desc %v)", k1, s.keys[1].desc))
+		li_chk(bad, ts_order(&d) == "b,2|b,1|a,4|a,3", fmt.tprintf("...order follows: col 0 desc primary, col 1 desc breaking its ties (%q)", ts_order(&d)))
+
+		// Ctrl+click 2 on the secondary: descending -> REMOVED. THE CASE THIS
+		// FINDING NAMES: table_sort_toggle itself, not a direct table_sort_drop
+		// call, must remove only col 1 and leave col 0 exactly where it was.
+		table_sort_toggle(&d, 1)
+		li_chk(bad, s.nkeys == 1, fmt.tprintf("toggle 2 on the secondary removes only that key (nkeys %d)", s.nkeys))
+		_, k1ok = table_sort_key(&d, 1)
+		li_chk(bad, !k1ok, "...col 1 is gone")
+		k0, k0ok := table_sort_key(&d, 0)
+		li_chk(bad, k0ok && k0 == 0 && s.keys[0].desc && table_sorted(&d), fmt.tprintf("...primary (col 0) survives at precedence 0, still descending (k %d, ok %v, desc %v)", k0, k0ok, s.keys[0].desc))
+		li_chk(bad, ts_order(&d) == "b,2|b,1|a,3|a,4", fmt.tprintf("...and the order follows the surviving primary alone, ties by file order now (%q)", ts_order(&d)))
 	}
 
 	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the

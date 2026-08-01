@@ -1342,6 +1342,35 @@ table_sort_can_add :: proc(doc: ^Document, col: int) -> bool {
 // before -- table_sort_cycle below, and Task 5's header-menu "Sort Ascending" /
 // "Sort Descending" rows, which name a single column and a single direction and
 // have no reason to inherit a tie-breaker the menu never mentioned.
+//
+// THE OPEN CELL EDIT IS COMMITTED FIRST, and this is HANDOFF §6aw's "keystrokes are
+// dropped on a reorder" turned from an inherited constraint into a decision.
+// Committing here happens while the anchor is still intact -- nothing has moved
+// yet, so table_edit_line_intact passes and the value lands on the row the user
+// typed it into. The drop path in table_edit_commit survives as the fail-closed
+// guard for a reorder this code did not initiate; it is no longer what happens when
+// a user types into a cell and then clicks a header, which was the case that made
+// the constraint worth deciding. table_sort_add, table_sort_drop and
+// table_sort_toggle below commit the same way, for the same reason: a Ctrl+click
+// that reorders while a cell edit is open would drop the keystrokes exactly as a
+// plain click would. table_sort_cycle below reaches this commit by delegating to
+// this procedure for its ascending/descending transitions; the commit call at the
+// top of table_sort_cycle itself is only needed for the branch that does NOT
+// delegate here (its own descending -> clear).
+//
+// The scroll goes to the TOP of the new order rather than trying to keep the row
+// that was under the pointer. Following a row through a re-sort sounds friendlier
+// and is not: the row the reader is looking for after sorting by Name is at the
+// name they are looking for, which is at the top or found by scrolling, while
+// "keep row 4,113 on screen" leaves them somewhere arbitrary in an order they have
+// not seen yet. It also guarantees doc.top is an offset the permutation contains,
+// which table_sort_pos then never has to be forgiving about. table_sort_add and
+// table_sort_drop below apply the same rule to every reorder they make, including
+// a drop that merely shortens the vector. An operation that CLEARS the sort
+// entirely -- table_sort_cycle's descending -> clear branch, and table_sort_drop's
+// last key -- does NOT touch doc.top: it is already a real byte offset in the
+// file's own order (the block comment opening this section), and once no
+// permutation exists there is nothing left for the scroll to be forgiving about.
 table_sort_set :: proc(doc: ^Document, col: int, desc: bool) {
 	if doc == nil || col < 0 {return}
 	if doc.table_editing {table_edit_commit(doc)}
@@ -1357,31 +1386,13 @@ table_sort_set :: proc(doc: ^Document, col: int, desc: bool) {
 // gesture that composes a tie-breaker onto an existing sort instead of replacing
 // it.
 //
-// THE OPEN CELL EDIT IS COMMITTED FIRST, and this is HANDOFF §6aw's "keystrokes are
-// dropped on a reorder" turned from an inherited constraint into a decision.
-// Committing here happens while the anchor is still intact -- nothing has moved
-// yet, so table_edit_line_intact passes and the value lands on the row the user
-// typed it into. The drop path in table_edit_commit survives as the fail-closed
-// guard for a reorder this code did not initiate; it is no longer what happens when
-// a user types into a cell and then clicks a header, which was the case that made
-// the constraint worth deciding. table_sort_set, table_sort_add, table_sort_drop
-// and table_sort_toggle below all commit the same way, for the same reason: a
-// Ctrl+click that reorders while a cell edit is open would drop the keystrokes
-// exactly as a plain click would.
-//
-// The scroll goes to the TOP of the new order rather than trying to keep the row
-// that was under the pointer. Following a row through a re-sort sounds friendlier
-// and is not: the row the reader is looking for after sorting by Name is at the
-// name they are looking for, which is at the top or found by scrolling, while
-// "keep row 4,113 on screen" leaves them somewhere arbitrary in an order they have
-// not seen yet. It also guarantees doc.top is an offset the permutation contains,
-// which table_sort_pos then never has to be forgiving about. table_sort_add and
-// table_sort_drop below apply the same rule to every reorder they make, including
-// a drop that merely shortens the vector. An operation that CLEARS the sort
-// entirely -- the branch just below, and table_sort_drop's last key -- does NOT
-// touch doc.top: it is already a real byte offset in the file's own order (the
-// block comment opening this section), and once no permutation exists there is
-// nothing left for the scroll to be forgiving about.
+// The ascending and descending transitions delegate to table_sort_set above,
+// whose own comment carries the argument for why the open cell edit is committed
+// first and why the scroll lands on the top of the new order rather than
+// following a row. The commit call directly below runs unconditionally -- ahead
+// of the branch below it -- because it is the only commit on the path that clears
+// the sort instead of delegating to table_sort_set; on the other path it is a
+// harmless repeat of the commit table_sort_set performs itself.
 table_sort_cycle :: proc(doc: ^Document, col: int) {
 	if doc == nil || col < 0 {return}
 	if doc.table_editing {table_edit_commit(doc)}
