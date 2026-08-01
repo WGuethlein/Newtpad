@@ -1882,6 +1882,7 @@ when NEWTPAD_TESTS {
 			ts_case_total_order(&bad)
 			ts_case_measure(&bad)
 			ts_case_refusal(&bad)
+			ts_case_key_ops(&bad)
 		}
 		fmt.printfln("tablesorttest: %d failures", bad)
 		if bad > 0 {os.exit(1)}
@@ -2375,6 +2376,166 @@ when NEWTPAD_TESTS {
 		us := time.duration_microseconds(time.tick_since(t0))
 		li_chk(bad, !ok2 && d.table_sort.refused, fmt.tprintf("a settled over-ceiling count refuses a %d-key sort too, AS THE CEILING (refused %v)", TABLE_SORT_KEYS_MAX, d.table_sort.refused))
 		li_chk(bad, us < 1000, fmt.tprintf("...without a pass over the file (%.0f us)", us))
+	}
+
+	// C8 (batch 19 Task 3): the key-vector operations -- table_sort_set,
+	// table_sort_add, table_sort_drop, table_sort_can_add and table_sort_toggle --
+	// plus table_sort_cycle generalised to a column that is not the primary key.
+	//
+	// C1-C7 above pin the BUILD given a vector; nothing before this task exercised
+	// how the vector gets COMPOSED before it ever reaches table_sort_build, which
+	// is the surface a Ctrl+click actually drives and the surface this task adds.
+	//
+	// Two columns whose single-key orders differ (same shape as C2's precedence
+	// fixture), so a wrong precedence or a wrong direction shows up in the order
+	// rather than accidentally matching by luck.
+	@(private = "file")
+	ts_case_key_ops :: proc(bad: ^int) {
+		fmt.println("-- table_sort_set / add / drop / can_add / toggle compose the key vector --")
+		perm_eq :: proc(a, b: []i32) -> bool {
+			if len(a) != len(b) {return false}
+			for v, i in a {if v != b[i] {return false}}
+			return true
+		}
+		d := ts_doc("a,b\nb,2\na,3\nb,1\na,4\n", 2)
+		defer doc_close(&d)
+		s := &d.table_sort
+
+		li_chk(bad, table_sort_can_add(&d, 0) && table_sort_can_add(&d, 1), "can_add is true for either column before any sort exists")
+
+		// -- toggle on col 0: not a key -> append ascending --
+		table_sort_toggle(&d, 0)
+		k0, k0ok := table_sort_key(&d, 0)
+		li_chk(bad, table_sorted(&d) && k0ok && k0 == 0 && !s.keys[0].desc, fmt.tprintf("toggle on an unsorted column appends it ascending at precedence 0 (sorted %v, k %d, desc %v)", table_sorted(&d), k0, s.keys[0].desc))
+		li_chk(bad, ts_order(&d) == "a,3|a,4|b,2|b,1", fmt.tprintf("...in the right order (%q)", ts_order(&d)))
+		if off, ok := table_sort_row_at(&d, 0); ok {li_chk(bad, d.top == off, "...and scrolled to the top of the new order")}
+
+		// -- toggle on col 0 again: ascending -> descending, IN PLACE --
+		table_sort_toggle(&d, 0)
+		k0, k0ok = table_sort_key(&d, 0)
+		li_chk(bad, k0ok && k0 == 0 && s.keys[0].desc, fmt.tprintf("a second toggle flips it to descending without moving its precedence (k %d, desc %v)", k0, s.keys[0].desc))
+		li_chk(bad, ts_order(&d) == "b,2|b,1|a,3|a,4", fmt.tprintf("...in the right order (%q)", ts_order(&d)))
+		if off, ok := table_sort_row_at(&d, 0); ok {li_chk(bad, d.top == off, "...and scrolled again")}
+
+		// -- toggle on col 1: not a key, room for it -> appended as the tie-breaker --
+		table_sort_toggle(&d, 1)
+		k1, k1ok := table_sort_key(&d, 1)
+		li_chk(bad, s.nkeys == 2 && k1ok && k1 == 1 && !s.keys[1].desc, fmt.tprintf("a third toggle on a different column appends it as the tie-breaker (nkeys %d, k %d, desc %v)", s.nkeys, k1, s.keys[1].desc))
+		li_chk(bad, s.keys[0].col == 0 && s.keys[0].desc, "...and col 0 is still the primary, still descending")
+		li_chk(bad, ts_order(&d) == "b,1|b,2|a,3|a,4", fmt.tprintf("...col 0 desc, col 1 asc breaking its ties (%q)", ts_order(&d)))
+
+		// -- THE CAP TRAP. Two keys are live, the cap. A toggle on a third column
+		//    must refuse WITHOUT touching the two keys already there -- not merely
+		//    return having done nothing observable by coincidence. Snapshotted and
+		//    compared field by field, plus the permutation itself, because
+		//    table_sort_build clears before it validates (its own comment), so a
+		//    cap check delegated to it would erase both live keys to discover it
+		//    should have refused instead -- the trap this task's brief named.
+		keys_before := s.keys
+		nkeys_before := s.nkeys
+		perm_before := make([]i32, len(s.perm), context.temp_allocator)
+		copy(perm_before, s.perm[:])
+		li_chk(bad, !table_sort_can_add(&d, 2), "can_add says no room for a third column at the cap")
+		table_sort_toggle(&d, 2)
+		li_chk(bad, s.nkeys == nkeys_before && s.keys == keys_before, fmt.tprintf("a toggle on a third column at the cap leaves both live keys exactly as they were (nkeys %d -> %d, keys %v -> %v)", nkeys_before, s.nkeys, keys_before, s.keys))
+		li_chk(bad, perm_eq(s.perm[:], perm_before), "...and the permutation is unchanged, not just the same length")
+		_, k2ok := table_sort_key(&d, 2)
+		li_chk(bad, !k2ok, "...column 2 was never added")
+
+		// -- table_sort_add called directly hits the SAME cap guard, independent of
+		//    table_sort_toggle's own table_sort_can_add pre-check. A sabotage that
+		//    only removed table_sort_add's internal guard, leaving toggle's
+		//    pre-check standing, would still pass every assertion above -- toggle
+		//    would simply never call add. This is what catches that one.
+		table_sort_add(&d, 2, false)
+		li_chk(bad, s.nkeys == nkeys_before && s.keys == keys_before, "table_sort_add itself refuses a third column at the cap, live sort untouched")
+		li_chk(bad, perm_eq(s.perm[:], perm_before), "...permutation still unchanged")
+
+		// -- table_sort_add direct: flips the PRIMARY key's direction in place,
+		//    with a second key still live -- exactly the shape remove-and-re-append
+		//    would get wrong (Task 2's review; table_sort_add's own comment).
+		table_sort_add(&d, 0, false) // descending -> ascending, same column
+		k0, k0ok = table_sort_key(&d, 0)
+		li_chk(bad, k0ok && k0 == 0 && !s.keys[0].desc, fmt.tprintf("table_sort_add flips col 0's direction without moving it off precedence 0 (k %d, desc %v)", k0, s.keys[0].desc))
+		li_chk(bad, s.keys[1].col == 1, "...and col 1 is untouched, still at precedence 1")
+		li_chk(bad, ts_order(&d) == "a,3|a,4|b,1|b,2", fmt.tprintf("...order follows: col 0 asc primary, col 1 asc breaking ties (%q)", ts_order(&d)))
+
+		// -- table_sort_drop: removes only the named key, keeps the other live --
+		table_sort_drop(&d, 1)
+		li_chk(bad, s.nkeys == 1, fmt.tprintf("dropping col 1 leaves exactly one key (nkeys %d)", s.nkeys))
+		_, k1ok = table_sort_key(&d, 1)
+		li_chk(bad, !k1ok, "...col 1 is gone")
+		k0, k0ok = table_sort_key(&d, 0)
+		li_chk(bad, k0ok && k0 == 0 && table_sorted(&d), "...col 0 is still live, still primary")
+		li_chk(bad, ts_order(&d) == "a,3|a,4|b,2|b,1", fmt.tprintf("...back to col 0's own single-key order, ties by file order now (%q)", ts_order(&d)))
+
+		// -- toggle on the LAST live key, descending -> removed: unsorts the doc,
+		//    and doc.top is left alone -- there is no permutation left for a
+		//    scroll to be an offset into (table_sort_cycle's own descending -> clear
+		//    branch makes the same call, and C-nothing pinned it before now).
+		table_sort_add(&d, 0, true) // ascending -> descending, so the next toggle removes it
+		top_before_clear := d.top
+		table_sort_toggle(&d, 0)
+		li_chk(bad, !table_sorted(&d) && s.nkeys == 0, fmt.tprintf("toggling the descending last key off unsorts the document (sorted %v, nkeys %d)", table_sorted(&d), s.nkeys))
+		li_chk(bad, d.top == top_before_clear, "...and doc.top is untouched by the clear")
+
+		// -- the plain click's standard three-state cycle, on a column that starts
+		//    OUTSIDE the (currently empty) live sort: not-a-key -> ascending ->
+		//    descending -> cleared. table_sort_cycle's own logic is unchanged from
+		//    table_sort_click except reading keys[k] instead of keys[0] (below);
+		//    this is the ordinary single-key path that change must not disturb.
+		table_sort_cycle(&d, 1)
+		li_chk(bad, s.nkeys == 1 && s.keys[0].col == 1 && !s.keys[0].desc, fmt.tprintf("plain click 1 (not sorted -> ascending): nkeys %d keys %v", s.nkeys, s.keys))
+		table_sort_cycle(&d, 1)
+		li_chk(bad, s.keys[0].col == 1 && s.keys[0].desc, "plain click 2 (ascending -> descending)")
+		top_before_i3 := d.top
+		table_sort_cycle(&d, 1)
+		li_chk(bad, !table_sorted(&d), "plain click 3 (descending -> the file's own order)")
+		li_chk(bad, d.top == top_before_i3, "...and doc.top is untouched by that clear too")
+
+		// -- table_sort_set: replaces the (now empty) vector with exactly one key,
+		//    regardless of what was live before --
+		table_sort_set(&d, 1, false)
+		li_chk(bad, table_sorted(&d) && s.nkeys == 1 && s.keys[0].col == 1 && !s.keys[0].desc, fmt.tprintf("table_sort_set(1, asc) is live with exactly col 1 ascending (nkeys %d, keys %v)", s.nkeys, s.keys))
+		table_sort_add(&d, 1, true) // col 1 descending, the sole (primary) key
+		li_chk(bad, s.keys[0].desc, "precondition: col 1 (primary) is descending")
+		table_sort_toggle(&d, 0) // col 0 not a key -> appended ascending, as the SECONDARY key
+		_, k1ok = table_sort_key(&d, 1)
+		k0, k0ok = table_sort_key(&d, 0)
+		li_chk(bad, s.nkeys == 2 && k1ok && k0ok && k0 == 1 && !s.keys[k0].desc, fmt.tprintf("precondition: col 0 is now the SECONDARY key, ascending, while the primary (col 1) is descending (nkeys %d, k0 %d, keys %v)", s.nkeys, k0, s.keys))
+
+		// -- table_sort_cycle on the SECONDARY key. THE BUG THIS CATCHES: reading
+		//    keys[0].desc instead of keys[k].desc would consult col 1's direction
+		//    (descending) to decide col 0's next state, taking the
+		//    clear-the-whole-sort branch instead of replacing it with col 0
+		//    descending -- the two are chosen to disagree here on purpose (col 1
+		//    descending, col 0 ascending) so a wrong read produces a DIFFERENT
+		//    observable outcome, not the same one by coincidence.
+		table_sort_cycle(&d, 0)
+		li_chk(bad, table_sorted(&d) && s.nkeys == 1 && s.keys[0].col == 0 && s.keys[0].desc, fmt.tprintf("a plain click on a live SECONDARY key reads ITS OWN direction, not keys[0]'s: replaces the vector with just col 0, descending (sorted %v, nkeys %d, keys %v)", table_sorted(&d), s.nkeys, s.keys))
+		_, k1ok = table_sort_key(&d, 1)
+		li_chk(bad, !k1ok, "...and col 1 is gone -- replaced, not composed onto")
+		table_sort_cycle(&d, 0) // col 0 is now primary, descending -> clear
+		li_chk(bad, !table_sorted(&d), "...and a second click on it clears, same as any primary key would")
+
+		// -- COMMIT-FIRST for table_sort_toggle, the Ctrl+click gesture: an open
+		//    cell edit lands on the row it was opened on rather than being
+		//    dropped. table_field_at/table_cell_at_index rather than table_cell_at,
+		//    which needs pixel geometry this font-free fixture does not load
+		//    (ts_doc's own comment). d.top is pinned to 0 first so visible row 0
+		//    resolves to file row 0 regardless of where a prior scroll left it.
+		d.top = 0
+		eok, _, _, efs, efe, eval := table_cell_at_index(&d, 0, 1, 4)
+		li_chk(bad, eok && eval == "2", fmt.tprintf("precondition: (row 0, col 1) is %q", eval))
+		table_edit_start(&d, 0, 1, efs, efe, eval)
+		table_edit_rune(&d, '!')
+		pre := doc_debug_string(&d)
+		defer delete(pre)
+		table_sort_toggle(&d, 0) // Ctrl+click a DIFFERENT column while the edit is open
+		post := doc_debug_string(&d)
+		defer delete(post)
+		li_chk(bad, !d.table_editing, "a Ctrl+click closes the open edit")
+		li_chk(bad, strings.contains(post, "b,2!") && !strings.contains(pre, "b,2!"), fmt.tprintf("...by COMMITTING it onto the row it was opened on, not dropping the keystroke (%q)", post))
 	}
 
 	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the
@@ -13075,7 +13236,7 @@ when NEWTPAD_TESTS {
 
 				// --- by NAME, ascending. alpha bravo charlie delta echo, which is
 				//     data rows 1, 3, 4, 0, 2 -- worked out from the fixture above.
-				table_sort_click(d, 1)
+				table_sort_cycle(d, 1)
 				chk(&bad, table_sorted(d), "a header click puts a sort on the grid")
 				want := [ROWS]int{1, 3, 4, 0, 2}
 				for r in 0 ..< ROWS {
@@ -13173,7 +13334,7 @@ when NEWTPAD_TESTS {
 					table_edit_rune(d, '!')
 					pre := doc_debug_string(d)
 					defer delete(pre)
-					table_sort_click(d, 0) // reorder, with the edit still open
+					table_sort_cycle(d, 0) // reorder, with the edit still open
 					post := doc_debug_string(d)
 					defer delete(post)
 					chk(&bad, !d.table_editing, "...clicking a header closes it")
@@ -13193,13 +13354,13 @@ when NEWTPAD_TESTS {
 				// --- by QTY: numeric, so 4 < 10 < 30 < 200 rather than "10" < "200" <
 				//     "30" < "4", and the row with no qty at all goes last in BOTH
 				//     directions. A byte sort passes none of this.
-				table_sort_click(d, 2)
+				table_sort_cycle(d, 2)
 				qwant := [ROWS]int{4, 0, 2, 1, 3} // charlie(4) delta(10) echo(30) alpha(200) bravo(-)
 				for r in 0 ..< ROWS {
 					p, pok := table_row_start(d, r)
 					chk(&bad, pok && p == noff[qwant[r] + 1], fmt.tprintf("numeric asc: visible row %d is line %d (%q)", r, qwant[r] + 1, lines[qwant[r] + 1]))
 				}
-				table_sort_click(d, 2) // second click on the same column: descending
+				table_sort_cycle(d, 2) // second click on the same column: descending
 				chk(&bad, d.table_sort.keys[0].desc, "a second click on the same header reverses it")
 				dwant := [ROWS]int{1, 2, 0, 4, 3} // alpha(200) echo(30) delta(10) charlie(4) bravo(-)
 				for r in 0 ..< ROWS {
@@ -13207,7 +13368,7 @@ when NEWTPAD_TESTS {
 					chk(&bad, pok && p == noff[dwant[r] + 1], fmt.tprintf("numeric desc: visible row %d is line %d (%q)", r, dwant[r] + 1, lines[dwant[r] + 1]))
 				}
 				chk(&bad, dwant[ROWS - 1] == 3, "...and the row with no value is last in BOTH directions, not flipped to the front")
-				table_sort_click(d, 2) // third click: back to the file's own order
+				table_sort_cycle(d, 2) // third click: back to the file's own order
 				chk(&bad, !table_sorted(d), "a third click clears the sort")
 				// Clearing keeps the view where it was -- doc.top is a real line
 				// offset in every mode, which is the invariant the whole design rests
@@ -13263,7 +13424,7 @@ when NEWTPAD_TESTS {
 					chk(&bad, false, fmt.tprintf("precondition -- %d grid rows fit (want %d)", trows, ROWS))
 					return
 				}
-				table_sort_click(d, 0) // by id, ascending: 1 2 3 4 5
+				table_sort_cycle(d, 0) // by id, ascending: 1 2 3 4 5
 				want := [ROWS]int{1, 3, 0, 4, 2}
 				ER :: 2 // sorted position 2 is data row 0 -- NOT row 2
 				chk(&bad, want[ER] != ER, fmt.tprintf("visible row %d is data row %d, so ignoring the permutation is visibly wrong here", ER, want[ER]))
@@ -13362,7 +13523,7 @@ when NEWTPAD_TESTS {
 				chk(&bad, exact3 && n3 == 5, fmt.tprintf("the file's own count is %d data rows (want 5, header and terminator excluded)", n3))
 
 				// 4. An active sort is named.
-				table_sort_click(d, 1)
+				table_sort_cycle(d, 1)
 				// ...and, with a FINISHED index, the row numbers still follow the
 				// rows. This is the dangerous half of the same check sort_order makes:
 				// there the index had published nothing, so the consecutive-run
@@ -13382,7 +13543,7 @@ when NEWTPAD_TESTS {
 				// wording IS the feature.
 				s := table_summary_text(d)
 				chk(&bad, s == "5 rows  ·  2 columns  ·  sorted by v asc  ·  click to clear", fmt.tprintf("an active sort is in the summary, with its undo in words: %q", s))
-				table_sort_click(d, 1)
+				table_sort_cycle(d, 1)
 				s2 := table_summary_text(d)
 				chk(&bad, s2 == "5 rows  ·  2 columns  ·  sorted by v desc  ·  click to clear", fmt.tprintf("...and its direction: %q", s2))
 				// The clickable RUN, as a byte span, and the two properties that
@@ -13604,7 +13765,7 @@ when NEWTPAD_TESTS {
 
 				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
 				chk(&bad, d.table, "Ctrl+T opens the grid")
-				table_sort_click(d, 1)
+				table_sort_cycle(d, 1)
 				chk(&bad, table_sorted(d) && len(d.table_sort.offs) == 3, fmt.tprintf("...a header click sorts its 3 data rows (sorted=%v, %d offsets)", table_sorted(d), len(d.table_sort.offs)))
 				// A refusal recorded on the way out has to go too, or the next grid
 				// session opens saying the file is too large to sort. Set by hand
@@ -13630,7 +13791,7 @@ when NEWTPAD_TESTS {
 				d2 := make_doc("control.csv")
 				app_activate(&a, app_add(&a, d2))
 				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
-				table_sort_click(d2, 1)
+				table_sort_cycle(d2, 1)
 				before := make([]int, len(d2.table_sort.offs), context.temp_allocator)
 				copy(before, d2.table_sort.offs[:])
 				doc_replace_range(d2, 0, 0, transmute([]u8)string("Z"))
@@ -13655,7 +13816,7 @@ when NEWTPAD_TESTS {
 				// a reload re-applies a Doc_View, and Doc_View carries no sort. Driven
 				// with table = true, the case where the grid stays on and a surviving
 				// permutation would therefore still be read.
-				table_sort_click(d, 1)
+				table_sort_cycle(d, 1)
 				chk(&bad, table_sorted(d), "precondition -- sorted again for the view-apply path")
 				doc_view_apply(d, Doc_View{table = true})
 				chk(&bad, d.table && !table_sorted(d), fmt.tprintf("doc_view_apply keeps the grid and drops the sort (table=%v, sorted=%v)", d.table, table_sorted(d)))
@@ -13877,7 +14038,7 @@ when NEWTPAD_TESTS {
 						chk(&bad, !cold.clearable, fmt.tprintf("%s: with no sort there is no clickable run at all", tag))
 						chk(&bad, !table_summary_clear_hit(cold, cold.x + 4, cold.y + cold.h * 0.5), fmt.tprintf("%s: ...so a press on the summary text does nothing", tag))
 
-						table_sort_click(&d, 1)
+						table_sort_cycle(&d, 1)
 						chk(&bad, table_sorted(&d), fmt.tprintf("%s: precondition -- sorted by column 1", tag))
 						sm := table_summary_layout(&d, &t, H, px, cw)
 						chk(&bad, sm.clearable, fmt.tprintf("%s: a live sort makes the run clickable", tag))

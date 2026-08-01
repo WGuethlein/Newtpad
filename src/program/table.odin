@@ -330,7 +330,7 @@ group_int :: proc(v: int, allocator := context.temp_allocator) -> string {
 // "12,438,201 rows - too large to sort" is a product decision the reader can see.
 // THE SORT CLAUSE SAYS THE UNDO IN WORDS, and that is the second half of the
 // answer to "there is no discoverable way to reset the sort" (Wyatt, live use,
-// v0.34.0). table_sort_click has cycled ascending -> descending -> the file's own
+// v0.34.0). table_sort_cycle has cycled ascending -> descending -> the file's own
 // order since the sort shipped; nothing anywhere said so, and Wyatt rejected three
 // proposals that added another unlabelled target with *"how will the person know
 // what to click and where to reset."* He is right, and the principle generalises:
@@ -1324,9 +1324,38 @@ table_sort_build :: proc(doc: ^Document, keys: []Sort_Key) -> bool {
 	return true
 }
 
+// Is there room for `col` in the live sort? Already-a-key columns are always
+// "yes" -- changing a key's direction costs no slot, only appending a NEW one
+// does -- so this is not simply `nkeys < TABLE_SORT_KEYS_MAX`. The one predicate
+// table_sort_add, table_sort_toggle and the header menu's enabled state (Task 5)
+// all branch on, so the cap has exactly one definition rather than three that
+// could drift apart.
+table_sort_can_add :: proc(doc: ^Document, col: int) -> bool {
+	if doc == nil {return false}
+	if _, ok := table_sort_key(doc, col); ok {return true}
+	return doc.table_sort.nkeys < TABLE_SORT_KEYS_MAX
+}
+
+// Replace the live sort with exactly this one key, discarding whatever else was
+// live. Where table_sort_add composes onto the existing vector, this is for a
+// caller that means "this column and only this column" regardless of what came
+// before -- table_sort_cycle below, and Task 5's header-menu "Sort Ascending" /
+// "Sort Descending" rows, which name a single column and a single direction and
+// have no reason to inherit a tie-breaker the menu never mentioned.
+table_sort_set :: proc(doc: ^Document, col: int, desc: bool) {
+	if doc == nil || col < 0 {return}
+	if doc.table_editing {table_edit_commit(doc)}
+	kv := [1]Sort_Key{{col = col, desc = desc}}
+	if !table_sort_build(doc, kv[:]) {return}
+	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off}
+}
+
 // A click on the sorted column's header. §10's cycle: ascending, then descending,
 // then back to the file's own order -- so the gesture that turned the sort on is
-// the gesture that turns it off, and there is no second control to find.
+// the gesture that turns it off, and there is no second control to find. Always a
+// SINGLE key, replacing whatever was live -- table_sort_toggle below is the
+// gesture that composes a tie-breaker onto an existing sort instead of replacing
+// it.
 //
 // THE OPEN CELL EDIT IS COMMITTED FIRST, and this is HANDOFF §6aw's "keystrokes are
 // dropped on a reorder" turned from an inherited constraint into a decision.
@@ -1335,7 +1364,10 @@ table_sort_build :: proc(doc: ^Document, keys: []Sort_Key) -> bool {
 // typed it into. The drop path in table_edit_commit survives as the fail-closed
 // guard for a reorder this code did not initiate; it is no longer what happens when
 // a user types into a cell and then clicks a header, which was the case that made
-// the constraint worth deciding.
+// the constraint worth deciding. table_sort_set, table_sort_add, table_sort_drop
+// and table_sort_toggle below all commit the same way, for the same reason: a
+// Ctrl+click that reorders while a cell edit is open would drop the keystrokes
+// exactly as a plain click would.
 //
 // The scroll goes to the TOP of the new order rather than trying to keep the row
 // that was under the pointer. Following a row through a re-sort sounds friendlier
@@ -1343,8 +1375,14 @@ table_sort_build :: proc(doc: ^Document, keys: []Sort_Key) -> bool {
 // name they are looking for, which is at the top or found by scrolling, while
 // "keep row 4,113 on screen" leaves them somewhere arbitrary in an order they have
 // not seen yet. It also guarantees doc.top is an offset the permutation contains,
-// which table_sort_pos then never has to be forgiving about.
-table_sort_click :: proc(doc: ^Document, col: int) {
+// which table_sort_pos then never has to be forgiving about. table_sort_add and
+// table_sort_drop below apply the same rule to every reorder they make, including
+// a drop that merely shortens the vector. An operation that CLEARS the sort
+// entirely -- the branch just below, and table_sort_drop's last key -- does NOT
+// touch doc.top: it is already a real byte offset in the file's own order (the
+// block comment opening this section), and once no permutation exists there is
+// nothing left for the scroll to be forgiving about.
+table_sort_cycle :: proc(doc: ^Document, col: int) {
 	if doc == nil || col < 0 {return}
 	if doc.table_editing {table_edit_commit(doc)}
 	// table_sort_key already stops at nkeys, so a zero-value Document (keys[0].col
@@ -1354,20 +1392,111 @@ table_sort_click :: proc(doc: ^Document, col: int) {
 	// other two terms, doc.table and len(perm) > 0, are not things table_sort_key
 	// checks, and this is the gesture that has to tell "sorted, click again" from
 	// "not sorted, first click" apart correctly for every one of them.
+	//
+	// Reads `s.keys[k].desc`, not `s.keys[0]`. A plain click can now land on a
+	// column that is a Ctrl+click tie-breaker rather than the primary -- Task 3 is
+	// what made a multi-key sort reachable at all -- and keys[0] would then read a
+	// DIFFERENT column's direction to decide this one's next state.
 	s := &doc.table_sort
-	_, is_key := table_sort_key(doc, col)
+	k, is_key := table_sort_key(doc, col)
 	live := table_sorted(doc) && is_key
-	if live && s.keys[0].desc {
+	if live && s.keys[k].desc {
 		table_sort_clear(doc) // descending -> the file's own order
 		return
 	}
-	// One key, which is all a plain click has ever produced; the key vector's other
-	// slots are reached by a different gesture (batch 19, Task 3). Built as a local
-	// array rather than by writing s.keys first, because table_sort_build settles
-	// `numeric` itself and clears s.keys before it reads anything.
-	kv := [1]Sort_Key{{col = col, desc = live}} // ascending -> descending; anything else -> ascending
-	if !table_sort_build(doc, kv[:]) {return}
+	table_sort_set(doc, col, live) // ascending -> descending; anything else -> ascending
+}
+
+// Append `col` to the live sort, or -- if it is already a key -- change ITS
+// direction and leave every key's precedence exactly where it was.
+//
+// REMOVE-AND-RE-APPEND WAS THE TRAP this task's brief carried in from Task 2's
+// review: precedence is array order, first-wins by construction
+// (TABLE_SORT_KEYS_MAX's comment), so popping an existing key out and pushing it
+// back on at the end would silently demote a primary key to a tie-breaker on
+// every direction flip, with nothing on screen saying it happened. Composing the
+// next vector with the key rewritten AT ITS OWN INDEX is what keeps precedence
+// where the user put it.
+//
+// THE CAP IS CHECKED HERE, before table_sort_build ever sees the vector -- not
+// delegated to it. table_sort_build clears the live sort before it validates
+// (documented on table_sort_build's own comment, and pinned there by Task 2's
+// tests), so handing it an oversized vector to learn that it refuses would erase
+// every key already live just to answer a question this procedure can answer for
+// free by comparing `col`'s membership and `nkeys` first.
+table_sort_add :: proc(doc: ^Document, col: int, desc: bool) {
+	if doc == nil || col < 0 {return}
+	if doc.table_editing {table_edit_commit(doc)}
+	s := &doc.table_sort
+	kv: [TABLE_SORT_KEYS_MAX]Sort_Key
+	nk := s.nkeys
+	for i in 0 ..< nk {kv[i] = s.keys[i]}
+	if k, ok := table_sort_key(doc, col); ok {
+		kv[k].desc = desc // in place -- k, its precedence, does not move
+	} else {
+		if nk >= TABLE_SORT_KEYS_MAX {return} // full: refused, live sort untouched
+		kv[nk] = {col = col, desc = desc}
+		nk += 1
+	}
+	if !table_sort_build(doc, kv[:nk]) {return}
 	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off}
+}
+
+// Remove `col`'s key and rebuild with what is left, preserving the relative
+// precedence of every other live key -- the loop below copies them in their
+// existing order, skipping only the dropped one.
+//
+// Removing the LAST key rebuilds from an empty slice, which is table_sort_build's
+// own "nothing to sort" refusal (`usable := nk > 0 ...` on its first lines) -- the
+// same clear-and-stay-unsorted outcome table_sort_clear performs, reached without
+// a separate branch for it here. That build call returns false, so the
+// scroll-to-top below does not run for it either, matching table_sort_cycle's own
+// descending-to-clear branch: doc.top is left alone because there is no
+// permutation left for it to be an offset into.
+table_sort_drop :: proc(doc: ^Document, col: int) {
+	if doc == nil || col < 0 {return}
+	if doc.table_editing {table_edit_commit(doc)}
+	s := &doc.table_sort
+	k, ok := table_sort_key(doc, col)
+	if !ok {return} // not a key -- nothing to drop
+	kv: [TABLE_SORT_KEYS_MAX]Sort_Key
+	nk := 0
+	for i in 0 ..< s.nkeys {
+		if i == k {continue}
+		kv[nk] = s.keys[i]
+		nk += 1
+	}
+	if !table_sort_build(doc, kv[:nk]) {return}
+	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off}
+}
+
+// Ctrl+click: the three-state cycle PER KEY that composes onto a live sort
+// instead of replacing it -- table_sort_cycle's job -- because "sort by
+// department, then by name" (TABLE_SORT_KEYS_MAX's comment) needs a gesture that
+// adds a tie-breaker without disturbing the key already there.
+//
+// NOT A KEY -> append ascending, through table_sort_add -- but only when
+// table_sort_can_add says there is room. At the cap this does nothing at all,
+// silently, and the two live keys and their order are exactly what they were:
+// the trap this task's brief named by name, delegating the cap check to
+// table_sort_build here would clear the live sort just to learn it should have
+// stayed clear. ASCENDING -> DESCENDING flips in place through table_sort_add,
+// which is what keeps a Ctrl+click on the primary key from demoting it
+// (table_sort_add's own comment carries that argument). DESCENDING -> REMOVED
+// drops just this key through table_sort_drop; removing the last live key leaves
+// the document unsorted.
+table_sort_toggle :: proc(doc: ^Document, col: int) {
+	if doc == nil || col < 0 {return}
+	if doc.table_editing {table_edit_commit(doc)}
+	k, is_key := table_sort_key(doc, col)
+	switch {
+	case !is_key:
+		if table_sort_can_add(doc, col) {table_sort_add(doc, col, false)}
+	case !doc.table_sort.keys[k].desc:
+		table_sort_add(doc, col, true)
+	case:
+		table_sort_drop(doc, col)
+	}
 }
 
 // Keep the offsets describing the bytes they were built from, across an edit of
@@ -2825,7 +2954,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 		// The sorted column wins where the two would coincide: hovering the column
 		// that is already sorted shows its real arrow at full strength rather than
 		// replacing it with a preview of itself. `up` is what the NEXT click
-		// produces on an unsorted column, which is ascending (table_sort_click), so
+		// produces on an unsorted column, which is ascending (table_sort_cycle), so
 		// the ghost is a prediction rather than a decoration.
 		//
 		// Drawn after the header text either way. It no longer overlaps it -- the

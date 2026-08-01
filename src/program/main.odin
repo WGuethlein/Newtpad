@@ -735,7 +735,21 @@ main :: proc() {
 					// .Sort_Lines stays refused in table view: that one REWRITES the
 					// buffer, so command_mutates_doc names it correctly and the
 					// read-only guard needs no loosening for this.
-					table_sort_click(doc, c)
+					table_sort_cycle(doc, c)
+					window.mouse_pressed = false
+				}
+			} else if window.mouse_pressed && plat.key_ctrl_down() {
+				// Ctrl+click on a header cell composes a tie-breaker onto the live sort
+				// (table_sort_toggle, batch 19 Task 3) instead of replacing it. Through
+				// table_header_hover_col, same as the plain-click branch above and for
+				// the same reason: it refuses inside the ±4px divider zone before this
+				// ever learns which column, so the edge test is still taken first even
+				// though Ctrl routes to a different sort gesture -- a Ctrl+click aimed
+				// at the divider must not reorder the file either. Resizing itself
+				// stays a plain-click gesture; a Ctrl-held grab on the edge does
+				// nothing here, same as before this branch existed.
+				if c, on_head := table_header_hover_col(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); on_head {
+					table_sort_toggle(doc, c)
 					window.mouse_pressed = false
 				}
 			}
@@ -761,7 +775,7 @@ main :: proc() {
 		// sort reset would be unrecoverable mid-motion, while a missed click on the
 		// summary costs one more click.
 		//
-		// The open cell edit is committed first, exactly as table_sort_click does and
+		// The open cell edit is committed first, exactly as table_sort_cycle does and
 		// for the same reason: the anchor is still intact at this instant, so the
 		// value lands on the row the user typed it into rather than being dropped by
 		// table_edit_commit's fail-closed guard once the order changes underneath it.
