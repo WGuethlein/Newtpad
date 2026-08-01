@@ -1828,6 +1828,433 @@ when NEWTPAD_TESTS {
 		li_chk(bad, d.md_mode == .Preview, "...leaving the preview open")
 	}
 
+	// --- `newtpad tablesorttest` -- the multi-key sort build -------------------
+	//
+	// table_sort_build orders up to TABLE_SORT_MAX rows by up to TABLE_SORT_KEYS_MAX
+	// columns, and every assertion below is about the ORDER rather than about the
+	// arrays that carry it. That is deliberate: table.odin's sort block opens by
+	// naming its own risk as data loss, not layout -- table_cell_at resolves a pixel
+	// through the permutation to a byte range and table_edit_commit splices it, so a
+	// permutation that is subtly wrong writes the user's value onto a row they never
+	// clicked, silently.
+	//
+	// So the fixtures are tiny and the expected orders are written out by hand as
+	// literals. Nothing here recomputes an expectation from the sort's own comparator
+	// or its own arrays: development-loop.md §4 warns that comparing two derivations
+	// of the same expression passes with the bug present, and the four sabotages this
+	// mode was written against (drop every key past the first; walk the keys in
+	// reverse precedence; take a column's type from doc.table_align; drop the
+	// empty-last rule on the secondary keys) all produce a *plausible* order. A
+	// literal is the only thing that can tell a plausible order from the right one.
+	//
+	// One-argument and non-zero on failure, per the keytest/resavetest incident: a
+	// mode nothing runs is worse than no mode.
+	@(private = "file")
+	table_sort_test_run :: proc() {
+		bad := 0
+		if !require_scratch_session("tablesorttest") {
+			// Counted as a FAILURE rather than skipped, and the guard is here even
+			// though the cases below build Documents rather than an App: a mode that
+			// quietly does nothing when an environment variable is unset is a mode
+			// nothing runs, and the day one of these cases grows an App is the day the
+			// missing guard silently overwrites the author's real session store.
+			li_chk(&bad, false, "NEWTPAD_SESSION_DIR is set, so the mode could run")
+		} else {
+			ts_case_inverses(&bad)
+			ts_case_clear_resets(&bad)
+			ts_case_precedence(&bad)
+			ts_case_numeric_past_sample(&bad)
+			ts_case_empty_last(&bad)
+			ts_case_empty_falls_through(&bad)
+			ts_case_total_order(&bad)
+			ts_case_measure(&bad)
+			ts_case_refusal(&bad)
+		}
+		fmt.printfln("tablesorttest: %d failures", bad)
+		if bad > 0 {os.exit(1)}
+	}
+
+	// A table Document over `src`. doc_from_content takes ownership of what it is
+	// given and doc_close frees it, so the bytes have to be an allocation of their
+	// own rather than a slice of a string literal.
+	//
+	// table_compute_widths is deliberately NOT called: it needs loaded fonts, and
+	// table_sort_build reads nothing it produces -- the build cuts its fields out of
+	// the raw line with the document's own delimiter. Keeping the fixtures font-free
+	// is what lets this mode run anywhere, and `table_cols` is set by hand because the
+	// only thing that reads it here is table_summary_text's column clause.
+	//
+	// Every case closes its Document before the next one is made: one live Document
+	// per frame, per development-loop.md §6's stack-overflow rule.
+	@(private = "file")
+	ts_doc :: proc(src: string, cols: int) -> Document {
+		c := make([]u8, len(src))
+		copy(c, transmute([]u8)src)
+		d := doc_from_content(c, "fixture.csv", .UTF8)
+		d.table, d.table_delim, d.table_cols = true, ',', cols
+		return d
+	}
+
+	// The sorted order as one string: the whole LINE at each sorted position, joined
+	// by '|', up to `limit` rows (0 = all).
+	//
+	// Read back through table_sort_row_at -- the lookup the draw and the hit-test both
+	// resolve through -- and compared against a hand-written literal, so this shares
+	// no arithmetic with the thing it checks.
+	@(private = "file")
+	ts_order :: proc(d: ^Document, limit := 0) -> string {
+		sb := strings.builder_make(context.temp_allocator)
+		n := table_sort_rows(d)
+		if limit > 0 {n = min(n, limit)}
+		for pos in 0 ..< n {
+			if pos > 0 {strings.write_byte(&sb, '|')}
+			off, ok := table_sort_row_at(d, pos)
+			if !ok {
+				strings.write_string(&sb, "<none>")
+				continue
+			}
+			buf: [256]u8
+			end := base.pt_line_end_cap(&d.pt, off, len(buf))
+			got := base.pt_read(&d.pt, off, buf[:min(end - off, len(buf))])
+			strings.write_string(&sb, strings.trim_space(string(buf[:got])))
+		}
+		return strings.to_string(sb)
+	}
+
+	// C1: perm and rank are exact inverses, offs is ascending file order, at 1, 2 and
+	// 3 keys.
+	//
+	// The INVERSE check is the one that cannot pass by accident. table_sort_pos is the
+	// only route from a byte offset back to a sorted position and it reads `rank`; a
+	// rank that is not perm's inverse puts every visible row one place off and commits
+	// a cell edit there. A build that dropped a row, wrote one twice, or left an array
+	// short leaves the two disagreeing, and comparing them against EACH OTHER (rather
+	// than against a recomputed permutation) is what makes that visible.
+	@(private = "file")
+	ts_case_inverses :: proc(bad: ^int) {
+		fmt.println("-- perm/rank are inverses and offs ascends, at 1, 2 and 3 keys --")
+		d := ts_doc("a,b,c\n3,z,q\n1,y,r\n2,z,p\n1,x,s\n2,y,t\n", 3)
+		defer doc_close(&d)
+		ROWS :: 5
+		all := [3]Sort_Key{{col = 0, desc = false}, {col = 1, desc = true}, {col = 2, desc = false}}
+		for nk in 1 ..= TABLE_SORT_KEYS_MAX {
+			ok := table_sort_build(&d, all[:nk])
+			s := &d.table_sort
+			li_chk(bad, ok && s.nkeys == nk, fmt.tprintf("a %d-key build succeeds and records %d keys (ok %v, nkeys %d)", nk, nk, ok, s.nkeys))
+			li_chk(
+				bad,
+				len(s.perm) == ROWS && len(s.rank) == ROWS && len(s.offs) == ROWS,
+				fmt.tprintf("...%d rows in all three arrays (perm %d, rank %d, offs %d)", ROWS, len(s.perm), len(s.rank), len(s.offs)),
+			)
+			inv := len(s.perm) == ROWS && len(s.rank) == ROWS
+			if inv {
+				for pos in 0 ..< ROWS {if int(s.rank[int(s.perm[pos])]) != pos {inv = false}}
+				for j in 0 ..< ROWS {if int(s.perm[int(s.rank[j])]) != j {inv = false}}
+			}
+			li_chk(bad, inv, fmt.tprintf("...perm and rank invert each other (perm %v, rank %v)", s.perm, s.rank))
+			asc := len(s.offs) == ROWS
+			for j in 1 ..< len(s.offs) {if s.offs[j] <= s.offs[j - 1] {asc = false}}
+			li_chk(bad, asc, fmt.tprintf("...offs stays strictly ascending file order (%v)", s.offs))
+			// The unused tail of the key vector must not read as "sorted by column 0".
+			tail := true
+			for i in nk ..< TABLE_SORT_KEYS_MAX {if s.keys[i].col != TABLE_SORT_NONE {tail = false}}
+			li_chk(bad, tail, fmt.tprintf("...and slots %d.. say TABLE_SORT_NONE (%v)", nk, s.keys))
+		}
+	}
+
+	// C1b: carried in from Task 1's review -- table_sort_clear's reset loop had no
+	// coverage anywhere in the tree.
+	//
+	// A zeroed Sort_Key.col is 0, a VALID column index, so a clear that only zeroed
+	// the struct would leave three slots claiming "sorted by column 0". Nothing reads
+	// past nkeys today, which is exactly why this needs a test rather than a reader:
+	// the loop is correct and invisible, and the first thing to read the array
+	// directly would inherit the lie.
+	@(private = "file")
+	ts_case_clear_resets :: proc(bad: ^int) {
+		fmt.println("-- table_sort_clear puts every key slot back to TABLE_SORT_NONE --")
+		d := ts_doc("a,b,c\n3,z,q\n1,y,r\n2,z,p\n", 3)
+		defer doc_close(&d)
+		all := [3]Sort_Key{{col = 2}, {col = 1, desc = true}, {col = 0}}
+		li_chk(bad, table_sort_build(&d, all[:]), "a 3-key sort is live before the clear")
+		table_sort_clear(&d)
+		s := &d.table_sort
+		reset := s.nkeys == 0 && !s.refused
+		for k in s.keys {if k.col != TABLE_SORT_NONE {reset = false}}
+		li_chk(bad, reset, fmt.tprintf("...and after it every slot says TABLE_SORT_NONE (nkeys %d, keys %v)", s.nkeys, s.keys))
+		li_chk(bad, !table_sorted(&d), "...and no sort is live")
+	}
+
+	// C2: PRECEDENCE. keys[0] decides; keys[1] only breaks its ties.
+	//
+	// The fixture is built so that column 0 alone and column 1 alone give DIFFERENT
+	// orders, and both single-key orders are asserted first -- otherwise a two-key
+	// expectation could be satisfied by a comparator that read only one of them. The
+	// b-group is where the work happens: b,2 comes before b,1 in file order, so a
+	// comparator that stopped after key 0 leaves them that way, and one that read the
+	// keys in reverse precedence would put the whole file in column 1's order.
+	@(private = "file")
+	ts_case_precedence :: proc(bad: ^int) {
+		fmt.println("-- precedence: keys[0] decides, keys[1] only breaks its ties --")
+		d := ts_doc("g,n\nb,2\na,3\nb,1\na,4\n", 2)
+		defer doc_close(&d)
+		k0 := [1]Sort_Key{{col = 0}}
+		li_chk(bad, table_sort_build(&d, k0[:]), "column 0 alone sorts")
+		by0 := ts_order(&d)
+		li_chk(bad, by0 == "a,3|a,4|b,2|b,1", fmt.tprintf("...into %q (want \"a,3|a,4|b,2|b,1\")", by0))
+		k1 := [1]Sort_Key{{col = 1}}
+		li_chk(bad, table_sort_build(&d, k1[:]), "column 1 alone sorts")
+		by1 := ts_order(&d)
+		li_chk(bad, by1 == "b,1|b,2|a,3|a,4", fmt.tprintf("...into %q (want \"b,1|b,2|a,3|a,4\")", by1))
+		li_chk(bad, by0 != by1, "...and the two single-key orders really do differ, so the fixture can tell them apart")
+		fwd := [2]Sort_Key{{col = 0}, {col = 1}}
+		li_chk(bad, table_sort_build(&d, fwd[:]), "0-then-1 sorts")
+		got := ts_order(&d)
+		li_chk(bad, got == "a,3|a,4|b,1|b,2", fmt.tprintf("...into %q (want \"a,3|a,4|b,1|b,2\": column 0's order, ties broken by column 1)", got))
+		li_chk(bad, got != by0, "...which is NOT what column 0 alone gave, so key 1 was read")
+		rev := [2]Sort_Key{{col = 1}, {col = 0}}
+		li_chk(bad, table_sort_build(&d, rev[:]), "1-then-0 sorts")
+		got2 := ts_order(&d)
+		li_chk(bad, got2 == "b,1|b,2|a,3|a,4", fmt.tprintf("...into %q (want \"b,1|b,2|a,3|a,4\")", got2))
+		li_chk(bad, got != got2, "...and swapping the two keys' precedence changes the order, so array order IS precedence")
+	}
+
+	// C3: a key's type is settled over every row the sort orders, per key, and the key
+	// under test is the SECONDARY one.
+	//
+	// table_compute_widths decides alignment from the first TABLE_SAMPLE (500) rows,
+	// which is right for a cosmetic right-align and wrong for a sort: a column whose
+	// first 500 cells are numbers and whose row 900 is "N/A" must sort as TEXT, or
+	// that row lands wherever 0.0 falls and the result is presented as sorted.
+	//
+	// Column 0 is constant, so key 0 ties on every pair and key 1 decides the whole
+	// order -- the decision under test is the one taken for a key that is not the
+	// primary. Column 1 is "0".."999", which reads differently as text ("0","1","10")
+	// than as numbers ("0","1","2"), so three rows are enough to tell which happened.
+	// The all-numeric probe is the CONTROL: without it, an implementation that sorted
+	// every column as text would pass the N/A probe for the wrong reason.
+	@(private = "file")
+	ts_case_numeric_past_sample :: proc(bad: ^int) {
+		fmt.println("-- a key's type is settled over every sorted row, not over the first 500 --")
+		ts_probe :: proc(bad: ^int, na_at: int, want, label: string) {
+			sb := strings.builder_make(context.temp_allocator)
+			strings.write_string(&sb, "g,n\n")
+			for i in 0 ..< 1000 {
+				if i == na_at {
+					strings.write_string(&sb, "same,N/A\n")
+				} else {
+					fmt.sbprintf(&sb, "same,%d\n", i)
+				}
+			}
+			d := ts_doc(strings.to_string(sb), 2)
+			defer doc_close(&d)
+			// What table_compute_widths would have recorded from its first
+			// TABLE_SAMPLE rows: column 1 looks numeric there in BOTH fixtures, since
+			// the N/A is at row 900. Filled in so that a build reading alignment
+			// instead of its own accumulator gets a confident wrong answer here rather
+			// than an empty array and an accidental `false`.
+			append(&d.table_align, Table_Align.Left, Table_Align.Right)
+			k := [2]Sort_Key{{col = 0}, {col = 1}}
+			li_chk(bad, table_sort_build(&d, k[:]), fmt.tprintf("%s: the 2-key build succeeds", label))
+			li_chk(
+				bad,
+				d.table_sort.nkeys == 2 && d.table_sort.keys[1].numeric == (na_at < 0),
+				fmt.tprintf("...key 1 settles numeric = %v (got %v)", na_at < 0, d.table_sort.keys[1].numeric),
+			)
+			got := ts_order(&d, 3)
+			li_chk(bad, got == want, fmt.tprintf("...and the first three rows are %q (want %q)", got, want))
+		}
+		ts_probe(bad, -1, "same,0|same,1|same,2", "all 1000 rows numeric")
+		ts_probe(bad, 900, "same,0|same,1|same,10", "one N/A at row 900, past the 500-row sample")
+	}
+
+	// C4: a blank sorts LAST on a secondary key, in BOTH directions.
+	//
+	// Both directions is the whole assertion. Ascending, "" is smaller than every
+	// letter; descending, it is larger -- so a comparator without the empty rule gives
+	// blank-first in one of the two, and a test that only checked one direction would
+	// pass with the rule missing. The blank is on key 1 rather than key 0 because the
+	// single-key case already has coverage in tablegridtest and the secondary keys are
+	// what is new here.
+	@(private = "file")
+	ts_case_empty_last :: proc(bad: ^int) {
+		fmt.println("-- a blank sorts LAST on a secondary key, in both directions --")
+		d := ts_doc("g,n\ng,m\ng,\ng,z\n", 2)
+		defer doc_close(&d)
+		asc := [2]Sort_Key{{col = 0}, {col = 1, desc = false}}
+		li_chk(bad, table_sort_build(&d, asc[:]), "key 1 ascending sorts")
+		a := ts_order(&d)
+		li_chk(bad, a == "g,m|g,z|g,", fmt.tprintf("...into %q (want \"g,m|g,z|g,\": blank last)", a))
+		desc := [2]Sort_Key{{col = 0}, {col = 1, desc = true}}
+		li_chk(bad, table_sort_build(&d, desc[:]), "key 1 descending sorts")
+		b := ts_order(&d)
+		li_chk(bad, b == "g,z|g,m|g,", fmt.tprintf("...into %q (want \"g,z|g,m|g,\": blank STILL last)", b))
+		li_chk(bad, a != b, "...and the arrow really did flip the rows that have values")
+	}
+
+	// C4b: two rows blank on key 1 fall THROUGH to key 2 rather than stopping there.
+	//
+	// "Both have no value here" says nothing about which row comes first, so the
+	// comparator continues instead of returning. If it returned, the two blank rows
+	// would drop straight to the file-order tie-break and come back 2-then-1 -- which
+	// is a plausible order, and wrong: the rows a tie-breaker exists to separate are
+	// exactly the rows that would never reach it.
+	@(private = "file")
+	ts_case_empty_falls_through :: proc(bad: ^int) {
+		fmt.println("-- two rows blank on key 1 are separated by key 2, not by file order --")
+		d := ts_doc("g,n,x\na,,2\na,,1\na,q,3\n", 3)
+		defer doc_close(&d)
+		k := [2]Sort_Key{{col = 1}, {col = 2}}
+		li_chk(bad, table_sort_build(&d, k[:]), "the 2-key build succeeds")
+		got := ts_order(&d)
+		li_chk(
+			bad,
+			got == "a,q,3|a,,1|a,,2",
+			fmt.tprintf("...order is %q (want \"a,q,3|a,,1|a,,2\": blanks last, and key 2 orders them 1 before 2)", got),
+		)
+	}
+
+	// C5: rows equal on all three keys come back in FILE order, under every direction
+	// combination.
+	//
+	// slice.sort_by_with_data is not stable, so file order here is not something the
+	// sort inherits -- it is the comparator's own final tie-break, and it must ignore
+	// direction or the "same" rows would reverse with the arrow. The tag column is not
+	// a key: it is there so three rows that tie on everything the sort reads are still
+	// distinguishable in the output.
+	@(private = "file")
+	ts_case_total_order :: proc(bad: ^int) {
+		fmt.println("-- rows equal on all three keys come back in file order, every direction --")
+		d := ts_doc("a,b,c,tag\nx,y,z,one\nx,y,z,two\nx,y,z,three\n", 4)
+		defer doc_close(&d)
+		WANT :: "x,y,z,one|x,y,z,two|x,y,z,three"
+		for m in 0 ..< 8 {
+			k := [3]Sort_Key{{col = 0, desc = m & 1 != 0}, {col = 1, desc = m & 2 != 0}, {col = 2, desc = m & 4 != 0}}
+			ok := table_sort_build(&d, k[:])
+			got := ts_order(&d)
+			li_chk(bad, ok && got == WANT, fmt.tprintf("desc %v/%v/%v -> %q", k[0].desc, k[1].desc, k[2].desc, got))
+		}
+	}
+
+	// C6: what three keys COST at the ceiling.
+	//
+	// TABLE_SORT_MAX is a freeze budget, not a memory bound (see its comment): the
+	// build is one synchronous pass on the main thread, so its cost is how long the
+	// window is unresponsive after a header click. The key count multiplies the field
+	// extraction and deepens the comparator, and if that turned the click into a
+	// visibly longer stall the answer is a lower TABLE_SORT_KEYS_MAX -- product
+	// principle 1 is "speed everywhere: clicking, tabs, find, open -- instant", and
+	// nothing about a header click exempts it.
+	//
+	// Asserted as a RATIO against the same file's single-key build rather than against
+	// a millisecond constant, because a constant drifts with the machine and this has
+	// to mean the same thing on Wyatt's desktop and in CI. The bound catches the
+	// failure that matters -- a build that re-scanned the file per key, or that
+	// dragged the comparator into something superlinear in k -- while tolerating the
+	// honest 2x of extracting three fields per row instead of one.
+	//
+	// The printed number is a DEBUG figure and says so: build.bat release is
+	// -subsystem:windows and cannot print from a headless mode at all.
+	@(private = "file")
+	ts_case_measure :: proc(bad: ^int) {
+		fmt.println("-- what three keys cost at TABLE_SORT_MAX rows --")
+		HEAD :: "id,date,status\n"
+		ROW :: 26 // "0000000,2026-01-01,ACTIVE\n" -- a realistic export row
+		src := make([]u8, len(HEAD) + TABLE_SORT_MAX * ROW)
+		copy(src[:], transmute([]u8)string(HEAD))
+		o := len(HEAD)
+		for i in 0 ..< TABLE_SORT_MAX {
+			// Scrambled ids -- 7919 is prime and coprime with the row count, so this is
+			// a bijection and the permutation is nowhere near the identity. The status
+			// column cycles so key 3 has real ties to break rather than being read once
+			// and never consulted.
+			id := (i * 7919) % TABLE_SORT_MAX
+			s := fmt.tprintf("%07d,2026-01-%02d,%s\n", id, 1 + id % 28, "ACTIVE" if id % 2 == 0 else "CLOSED")
+			assert(len(s) == ROW)
+			copy(src[o:], transmute([]u8)s)
+			o += ROW
+		}
+		d := ts_doc(string(src), 3)
+		delete(src)
+		defer doc_close(&d)
+		k1 := [1]Sort_Key{{col = 0}}
+		t1 := time.tick_now()
+		ok1 := table_sort_build(&d, k1[:])
+		ms1 := time.duration_milliseconds(time.tick_since(t1))
+		// Three keys in reverse column order, so the primary is the LAST column and the
+		// scrambled id column is only reached as the final tie-break: a build that
+		// quietly used key 0 for everything would come out in the wrong order below.
+		k3 := [3]Sort_Key{{col = 2}, {col = 1}, {col = 0}}
+		t3 := time.tick_now()
+		ok3 := table_sort_build(&d, k3[:])
+		ms3 := time.duration_milliseconds(time.tick_since(t3))
+		li_chk(bad, ok1 && ok3 && table_sort_rows(&d) == TABLE_SORT_MAX, fmt.tprintf("both builds order all %d rows (%v/%v)", TABLE_SORT_MAX, ok1, ok3))
+		// status ascending puts every ACTIVE (even id) first, then date, then id.
+		// Checked at the ends only: the whole order is 100,000 rows, and both ends
+		// pin the primary key, the secondary and the final tie-break at once.
+		first, last := ts_order(&d, 1), "<none>"
+		if off, ok := table_sort_row_at(&d, TABLE_SORT_MAX - 1); ok {
+			buf: [64]u8
+			end := base.pt_line_end_cap(&d.pt, off, len(buf))
+			got := base.pt_read(&d.pt, off, buf[:min(end - off, len(buf))])
+			last = strings.clone(strings.trim_space(string(buf[:got])), context.temp_allocator)
+		}
+		li_chk(bad, first == "0000000,2026-01-01,ACTIVE", fmt.tprintf("...smallest under status/date/id first: %q", first))
+		// The largest row under status/date/id: CLOSED (odd id), the largest date this
+		// fixture reaches (day 28, i.e. id % 28 == 27, which is odd for every k), and
+		// the largest such id below TABLE_SORT_MAX -- 28*3570 + 27 = 99987.
+		li_chk(bad, last == "0099987,2026-01-28,CLOSED", fmt.tprintf("...and largest last: %q", last))
+		fmt.printfln("         DEBUG build: 1 key %.0f ms, 3 keys %.0f ms (%.2fx) over %d rows", ms1, ms3, ms3 / max(ms1, 0.001), TABLE_SORT_MAX)
+		li_chk(bad, ms3 < 2.5 * ms1, fmt.tprintf("...and three keys cost under 2.5x one key (%.2fx)", ms3 / max(ms1, 0.001)))
+	}
+
+	// C7: the refusal still holds at three keys, on both of its paths.
+	//
+	// Two separate refusals, and they are not the same code. The IN-LOOP check stops
+	// an unsettled count at the ceiling while scanning, so a 12M-row file pays for
+	// 100,000 rows and stops; the SETTLED check refuses before scanning at all, so a
+	// header on a huge file does not cost a visible hitch per press for a refusal it
+	// could have known instantly. Both must leave the document unsorted rather than
+	// half-sorted, and the summary row has to SAY so -- a header that does nothing
+	// when pressed is indistinguishable from a broken one.
+	@(private = "file")
+	ts_case_refusal :: proc(bad: ^int) {
+		fmt.println("-- over the ceiling, a 3-key sort is refused on both paths --")
+		HEAD :: "id,date,status\n"
+		ROW :: 26
+		rows := TABLE_SORT_MAX + 1
+		src := make([]u8, len(HEAD) + rows * ROW)
+		copy(src[:], transmute([]u8)string(HEAD))
+		o := len(HEAD)
+		for i in 0 ..< rows {
+			s := fmt.tprintf("%07d,2026-01-01,ACTIVE\n", (i * 7919) % rows)
+			assert(len(s) == ROW)
+			copy(src[o:], transmute([]u8)s)
+			o += ROW
+		}
+		d := ts_doc(string(src), 3)
+		delete(src)
+		defer doc_close(&d)
+		k3 := [3]Sort_Key{{col = 0}, {col = 1}, {col = 2}}
+		// No index running yet: the count is not exact, so the early refusal cannot
+		// fire and this exercises the SCANNING one.
+		li_chk(bad, !table_sort_build(&d, k3[:]), "one row past TABLE_SORT_MAX refuses a 3-key sort mid-scan")
+		li_chk(bad, !table_sorted(&d), "...and nothing is left half-sorted")
+		li_chk(bad, d.table_sort.nkeys == 0 && len(d.table_sort.perm) == 0, fmt.tprintf("...with no keys and no permutation left behind (nkeys %d, perm %d)", d.table_sort.nkeys, len(d.table_sort.perm)))
+		li_chk(bad, d.table_sort.refused, "...and the refusal is recorded for the summary row")
+		summary := table_summary_text(&d)
+		li_chk(bad, strings.contains(summary, "too large to sort (over 100,000 rows)"), fmt.tprintf("...which says so: %q", summary))
+		doc_index_start(&d)
+		for !doc_index_done(&d) {}
+		n, exact := table_row_count(&d)
+		li_chk(bad, exact && n == rows, fmt.tprintf("the index settles at %d data rows (got %d, exact %v)", rows, n, exact))
+		t0 := time.tick_now()
+		ok2 := table_sort_build(&d, k3[:])
+		us := time.duration_microseconds(time.tick_since(t0))
+		li_chk(bad, !ok2 && d.table_sort.refused, "a settled over-ceiling count refuses a 3-key sort too")
+		li_chk(bad, us < 1000, fmt.tprintf("...without a pass over the file (%.0f us)", us))
+	}
+
 	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the
 	// icontest mode's independent PNG decoder below. File-scope (not local to
 	// the icontest block) because Odin's nested proc declarations don't close
@@ -12926,7 +13353,8 @@ when NEWTPAD_TESTS {
 					table_compute_widths(d, t)
 					d.table_cols = len(d.table_widths)
 					t0 := time.tick_now()
-					ok := table_sort_build(d, 0)
+					k1 := [1]Sort_Key{{col = 0}}
+					ok := table_sort_build(d, k1[:])
 					ms := time.duration_milliseconds(time.tick_since(t0))
 					chk(&bad, ok && table_sort_rows(d) == TABLE_SORT_MAX, fmt.tprintf("exactly TABLE_SORT_MAX rows sort: %d rows in %.0f ms", table_sort_rows(d), ms))
 					// The order is right at both ends, checked against the ids this
@@ -12952,7 +13380,8 @@ when NEWTPAD_TESTS {
 					// No index running: the count is not exact, so the early refusal
 					// cannot fire and this exercises the SCANNING one -- the path that
 					// has to stop counting at the ceiling rather than after the file.
-					ok := table_sort_build(d, 0)
+					k1 := [1]Sort_Key{{col = 0}}
+					ok := table_sort_build(d, k1[:])
 					chk(&bad, !ok, "one row past TABLE_SORT_MAX is refused")
 					chk(&bad, !table_sorted(d), "...and nothing is left half-sorted")
 					chk(&bad, d.table_sort.refused, "...and the refusal is recorded for the summary row")
@@ -12965,7 +13394,7 @@ when NEWTPAD_TESTS {
 					n, exact := table_row_count(d)
 					chk(&bad, exact && n == TABLE_SORT_MAX + 1, fmt.tprintf("the index settles at %d data rows", n))
 					t0 := time.tick_now()
-					ok2 := table_sort_build(d, 0)
+					ok2 := table_sort_build(d, k1[:])
 					us := time.duration_microseconds(time.tick_since(t0))
 					chk(&bad, !ok2 && d.table_sort.refused, "a settled over-ceiling count refuses too")
 					chk(&bad, us < 1000, fmt.tprintf("...and does it without a pass over the file (%.0f us)", us))
@@ -30654,6 +31083,13 @@ when NEWTPAD_TESTS {
 		// trailing-blank-row trim and everything downstream of it.
 		if os.args[1] == "selalltest" {
 			select_all_test_run()
+			return true
+		}
+
+		// `newtpad tablesorttest` -- one-argument, no path, sweepable. The multi-key
+		// sort build (table_sort_build) and its one comparator.
+		if os.args[1] == "tablesorttest" {
+			table_sort_test_run()
 			return true
 		}
 

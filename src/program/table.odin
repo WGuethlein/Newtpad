@@ -800,6 +800,12 @@ TABLE_SORT_NONE :: -1
 // most rows that can be sorted without breaking the promise the product is sold
 // on. This was 1,000,000 for exactly as long as it took to measure it.
 //
+// AT THREE KEYS the same 100,000 rows cost 1.78-1.80x the one-key build --
+// tablesorttest's C6 prints both, and TABLE_SORT_KEYS_MAX's comment carries the
+// numbers and what they do and do not settle. The ceiling is unchanged by it: the
+// bound is a row count for the reason the paragraph below gives, and the key count
+// multiplies the constant rather than the shape.
+//
 // It is a row count, not a file size: the bound that matters is the memory the
 // permutation costs and the time the single pass takes, neither of which cares
 // how wide the rows are.
@@ -815,19 +821,32 @@ TABLE_SORT_MAX :: 100_000
 // property of the data structure and not a rule anything has to enforce -- there is
 // no separate priority field to keep in step with it.
 //
-// Three is a SPEC-GIVEN cap, not a measured one -- unlike TABLE_SORT_MAX just above,
-// which has a real number behind it (205 ms at 100,000 rows, extrapolated from a
-// measured 2,046 ms at 1,000,000). No equivalent measurement exists for this
-// constant: the multi-key comparator it bounds does not exist yet (that build is
-// Task 2 of this batch), so nothing about its cost has been timed. Three was chosen
-// because Excel's classic sort dialog offered three, and because the summary row
-// (table_summary_parts) has to stay a sentence a reader takes in, not a list they
-// scan.
+// Three is a SPEC-GIVEN cap. It was chosen because Excel's classic sort dialog
+// offered three, and because the summary row (table_summary_parts) has to stay a
+// sentence a reader takes in, not a list they scan -- neither of which is a timing
+// argument, and the timing is now measured rather than assumed:
 //
-// It is reversible, but raising it takes two things, not one: a fresh measurement
-// of the multi-key build's cost at the higher count once the comparator exists, AND
-// a decision about how the summary row reads with more keys in it. Whoever raises
-// it should record both -- a cap raised on only one of them is exactly the
+//   100,000 rows, three keys vs one, same file, same run (tablesorttest's C6):
+//   1 key 382-395 ms, 3 keys 690-702 ms in a DEBUG build -- 1.78-1.80x.
+//
+// Debug because build.bat release is -subsystem:windows and a headless mode cannot
+// print from it at all. Converted with the ratio TABLE_SORT_MAX's own comment
+// already establishes (3,075 ms debug to 2,046 ms release at 1,000,000 rows, x0.665),
+// three keys land near 460 ms of release-build freeze against roughly 260 ms for one
+// key on the same fixture. That is a MEASURED RATIO on one machine and a CONVERTED
+// absolute, not a release measurement -- do not quote the 460 as though it were one.
+//
+// What the number settles: the cost is a constant factor on the pass, not a new
+// shape. The line is read once and the keys are cut from that one read, so k
+// multiplies the field extraction and the comparator's depth, and 3x the keys is
+// well under 3x the time. What it does NOT settle is whether ~460 ms is an
+// acceptable freeze; product principle 1 is "speed everywhere -- clicking, tabs,
+// find, open: instant", and if that answer is ever no, THIS constant is the variable
+// (spec §4) -- TABLE_SORT_MAX does not rise and a longer freeze is not accepted.
+//
+// Raising it takes two things, not one: a fresh measurement at the higher count, AND
+// a decision about how the summary row reads with more keys in it. Whoever raises it
+// should record both -- a cap raised on only one of them is exactly the
 // comment-outran-the-evidence shape this one used to be.
 TABLE_SORT_KEYS_MAX :: 3
 
@@ -889,7 +908,8 @@ table_sort_key :: proc(doc: ^Document, col: int) -> (k: int, ok: bool) {
 // `s.nkeys > 0` is REDUNDANT against `len(s.perm) > 0` in the code as it stands
 // today -- the two are in exact lockstep, because there are only two places `nkeys`
 // is ever written. table_sort_clear sets it to 0 in the same breath it clears
-// `perm`. table_sort_build sets it to 1 exactly once, at its last line, only after
+// `perm`. table_sort_build sets it to the key count it just built -- 1 to
+// TABLE_SORT_KEYS_MAX -- exactly once, at its last line, only after
 // `perm` has already been resized to a non-empty length on the success path above
 // it (every earlier return leaves `nkeys` untouched at whatever table_sort_clear
 // left it). Nothing else assigns `nkeys`, so there is no state the current code can
@@ -977,58 +997,77 @@ table_sort_free :: proc(doc: ^Document) {
 	delete(doc.table_sort.rank)
 }
 
-// One row's sort key, during the build only.
+// One row's value for ONE key, during the build only.
 //
 // `ks`/`kl` index the key arena rather than `key` being filled as the arena grows:
 // a [dynamic]u8 REALLOCATES, and a string captured before a growth points into
 // freed memory. Every key is spanned first and materialised in one pass once the
 // arena has stopped moving. That bug is silent -- the comparator reads plausible
-// garbage and produces a plausible order -- so the shape is worth stating.
+// garbage and produces a plausible ORDER -- and with three keys per row there are
+// three times as many chances to make it, so the shape is worth stating.
 @(private = "file")
-Sort_Item :: struct {
+Sort_Field :: struct {
 	key:    string,
 	num:    f64,
 	ks, kl: i32,
-	row:    i32,
+	// Empty cells sort LAST in both directions, which is why this is a field rather
+	// than falling out of an empty key or a zero value.
+	//
+	// "No value" is not the smallest value. In a text column an empty key would sort
+	// before every letter ascending and after every letter descending, so the blanks
+	// would move from one end to the other with the arrow; in a numeric column an
+	// unparsed empty would read as 0.0 and land in the middle of the real data, which
+	// is worse -- a blank presented as a zero is a wrong number, not a missing one.
+	// Last in both directions is the one rule under which a blank never claims a value
+	// it does not have.
 	empty:  bool,
 }
 
-// Empty cells sort LAST in both directions, which is why `empty` is a field rather
-// than falling out of an empty key or a zero value.
+// One row's sort keys, during the build only. `f[i]` belongs to key i, so the
+// comparator's precedence walk is an index walk and there is no second ordering to
+// keep in step with the key vector's.
+@(private = "file")
+Sort_Item :: struct {
+	f:   [TABLE_SORT_KEYS_MAX]Sort_Field,
+	row: i32,
+}
+
+// The key metadata the comparator needs, passed through slice.sort_by_with_data's
+// user_data rather than sitting at file scope. A global read by a comparator is
+// invisible state that outlives the call that set it, and this file already carries
+// one hard-won lesson (Sort_Field's arena, just above) about state that is valid
+// only inside one procedure.
+@(private = "file")
+Sort_Ctx :: struct {
+	keys:  [TABLE_SORT_KEYS_MAX]Sort_Key,
+	nkeys: int,
+}
+
+// Keys in PRECEDENCE order; the first that separates two rows decides.
 //
-// "No value" is not the smallest value. In a text column an empty key would sort
-// before every letter ascending and after every letter descending, so the blanks
-// would move from one end to the other with the arrow; in a numeric column an
-// unparsed empty would read as 0.0 and land in the middle of the real data, which
-// is worse -- a blank presented as a zero is a wrong number, not a missing one.
-// Last in both directions is the one rule under which a blank never claims a value
-// it does not have.
+// EMPTY LAST IS PER KEY AND IGNORES DIRECTION, at every key, for the reason
+// Sort_Field.empty gives. Two rows both blank on a key are not ordered by it at all
+// -- they fall through to the next key rather than returning, because "both have no
+// value here" says nothing about which comes first, and stopping there would leave
+// the remaining keys unread for exactly the rows a tie-breaker exists to separate.
 //
-// Ties break on the row's FILE position, in both directions, so the order is total
-// and the result does not depend on the sort algorithm's stability. slice.sort_by
-// is not stable; relying on it would be a property this file cannot see.
+// The final tie-break is the row's FILE position, ascending, in every direction, so
+// the order is total and does not depend on slice.sort_by_with_data's stability --
+// which this file cannot see.
 @(private = "file")
-sort_less_text_asc :: proc(a, b: Sort_Item) -> bool {
-	if a.empty != b.empty {return b.empty}
-	if a.key != b.key {return a.key < b.key}
-	return a.row < b.row
-}
-@(private = "file")
-sort_less_text_desc :: proc(a, b: Sort_Item) -> bool {
-	if a.empty != b.empty {return b.empty}
-	if a.key != b.key {return a.key > b.key}
-	return a.row < b.row
-}
-@(private = "file")
-sort_less_num_asc :: proc(a, b: Sort_Item) -> bool {
-	if a.empty != b.empty {return b.empty}
-	if a.num != b.num {return a.num < b.num}
-	return a.row < b.row
-}
-@(private = "file")
-sort_less_num_desc :: proc(a, b: Sort_Item) -> bool {
-	if a.empty != b.empty {return b.empty}
-	if a.num != b.num {return a.num > b.num}
+sort_less_keys :: proc(a, b: Sort_Item, user_data: rawptr) -> bool {
+	ctx := (^Sort_Ctx)(user_data)
+	for i in 0 ..< ctx.nkeys {
+		k := ctx.keys[i]
+		af, bf := a.f[i], b.f[i]
+		if af.empty != bf.empty {return bf.empty}
+		if af.empty {continue} // both empty on this key: fall through to the next
+		if k.numeric {
+			if af.num != bf.num {return af.num > bf.num if k.desc else af.num < bf.num}
+		} else {
+			if af.key != bf.key {return af.key > bf.key if k.desc else af.key < bf.key}
+		}
+	}
 	return a.row < b.row
 }
 
@@ -1049,17 +1088,24 @@ sort_number :: proc(s: string, scratch: ^[64]u8) -> f64 {
 	return v
 }
 
-// Build the permutation for `col`. Returns false and leaves the document unsorted
-// when it refuses; `refused` distinguishes "too large" from "there is nothing to
-// sort".
+// Build the permutation for `keys` -- 1..TABLE_SORT_KEYS_MAX columns in PRECEDENCE
+// order, keys[0] first. Returns false and leaves the document unsorted when it
+// refuses; `refused` distinguishes "too large" from "there is nothing to sort".
+//
+// Each key's `numeric` is IGNORED on the way in and SETTLED here, over the rows this
+// sort orders. A caller cannot know a column's type -- the only place that evidence
+// exists is the pass below -- so accepting the caller's guess would be an input this
+// procedure has to distrust anyway. The settled vector is what lands in s.keys.
 //
 // ONE BOUNDED PASS over the data rows, on the main thread, because a sort the user
-// asked for by clicking has to be there when they look up. The bound is
-// TABLE_SORT_MAX rows, checked as the rows are counted rather than afterwards, so
-// a 12M-row file pays for 100,000 rows of scanning and then stops -- not for
-// twelve million followed by a refusal.
+// asked for by clicking has to be there when they look up. Still one pass at three
+// keys: the line is read once and every key's field is cut from that one read, so
+// the row count -- not the key count -- is what the ceiling has to bound. The bound
+// is TABLE_SORT_MAX rows, checked as the rows are counted rather than afterwards, so
+// a 12M-row file pays for 100,000 rows of scanning and then stops -- not for twelve
+// million followed by a refusal.
 //
-// THE COLUMN'S TYPE IS DECIDED HERE, over the rows being sorted, and NOT read from
+// EACH COLUMN'S TYPE IS DECIDED HERE, over the rows being sorted, and NOT read from
 // doc.table_align. That is the difference between a bounded scan that knows its own
 // bound and one that does not. table_compute_widths decides alignment from the
 // first TABLE_SAMPLE (500) rows, which is the right scope for a cosmetic
@@ -1067,19 +1113,42 @@ sort_number :: proc(s: string, scratch: ^[64]u8) -> f64 {
 // column numerically because its first 500 cells were numbers, when row 900 holds
 // "N/A", would put that row wherever 0.0 happens to fall and present it as sorted.
 // The evidence for a NUMERIC sort has to cover every row the sort orders, so it is
-// gathered from every row the sort orders.
+// gathered from every row the sort orders -- and per key, because one key can be
+// numeric while another in the same sort is text.
 //
 // Dates deliberately sort as BYTES, not as a third key type. An ISO date sorts
 // correctly as text, which is most of what §10's date detection matches; the
 // d/m/Y masks do not sort correctly under any byte order, and parsing them would
 // need a calendar this file explicitly refuses to grow (see table_is_date). Text
 // is the honest answer for a shape whose ordering is not knowable from the shape.
-table_sort_build :: proc(doc: ^Document, col: int) -> bool {
+table_sort_build :: proc(doc: ^Document, keys: []Sort_Key) -> bool {
+	if doc == nil {return false}
+	// The caller's vector is copied out BEFORE table_sort_clear runs, and the order
+	// is load-bearing: `keys` is allowed to alias s.keys -- a caller cycling the live
+	// sort holds the current vector and hands back a modified one -- and the clear
+	// rewrites every `col` in that array to TABLE_SORT_NONE. Reading `keys` afterwards
+	// would read the reset, not the request.
+	//
+	// Trailing slots get TABLE_SORT_NONE rather than Odin's zero: 0 is a valid column
+	// index, and kv is written into s.keys wholesale on success, so a zeroed tail
+	// would undo exactly the reset table_sort_clear performs (see its comment).
+	kv: [TABLE_SORT_KEYS_MAX]Sort_Key
+	for &k in kv {k.col = TABLE_SORT_NONE}
+	nk := len(keys)
+	usable := nk > 0 && nk <= TABLE_SORT_KEYS_MAX
+	if usable {
+		for i in 0 ..< nk {
+			// `numeric` is dropped on the floor here, not copied: it is settled below.
+			if keys[i].col < 0 {usable = false;break}
+			kv[i] = {keys[i].col, keys[i].desc, false}
+		}
+	}
 	s := &doc.table_sort
-	desc := s.keys[0].desc
+	// Cleared before the first refusal rather than after the last, so that every
+	// `return false` below -- including the two the caller can provoke with a bad
+	// vector -- leaves the document genuinely unsorted rather than half-sorted.
 	table_sort_clear(doc)
-	s.keys[0].desc = desc
-	if doc == nil || col < 0 {return false}
+	if !usable {return false}
 	first, fok := table_first_data_row(doc)
 	if !fok {return false}
 	// Refuse before scanning when the row count is already SETTLED and over the
@@ -1110,10 +1179,22 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 	// ORDER -- development-loop.md §4 Shape A with the key rather than the scan
 	// truncated -- and a field cannot exceed the line, which RENDER_LINE_CAP already
 	// bounds. 16 KB on the stack of a procedure the input phase calls once per click.
+	//
+	// ONE key buffer, reused by every key, NOT one per key. A
+	// [TABLE_SORT_KEYS_MAX][RENDER_LINE_CAP]u8 would be 24 KB more on a stack frame
+	// that test_mode_dispatch already enters deep, and `blocktest` has hit a real
+	// STATUS_STACK_OVERFLOW twice in this tree from exactly that kind of growth. Reuse
+	// is safe because each field is appended to the arena immediately, before the next
+	// extraction overwrites the buffer.
 	buf: [RENDER_LINE_CAP]u8
 	key: [RENDER_LINE_CAP]u8
 	p := first
-	num_all, nonempty := true, 0
+	// Per key, because the numeric decision is per key. num_all[i] starts true and
+	// only ever falls: one non-numeric cell anywhere in the sorted rows settles that
+	// key as text.
+	num_all: [TABLE_SORT_KEYS_MAX]bool
+	nonempty: [TABLE_SORT_KEYS_MAX]int
+	for i in 0 ..< nk {num_all[i] = true}
 	for {
 		// The file's TERMINATOR is not a row. A file ending in '\n' leaves a
 		// zero-length line after the last real one, and the unsorted walk shows it as
@@ -1132,20 +1213,24 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
 		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
 		if n > 0 && buf[n - 1] == '\r' {n -= 1}
-		t := strings.trim_space(csv_field_into(string(buf[:n]), delim, col, key[:]))
+		// ONE line read, k fields cut from it -- the reason the key count does not
+		// multiply the pass. Each field is spanned into the arena and appended before
+		// the next extraction, because `key` is the same buffer every time round.
+		line := string(buf[:n])
 		it := Sort_Item {
-			ks    = i32(len(arena)),
-			kl    = i32(len(t)),
-			row   = i32(len(items)),
-			empty = len(t) == 0,
+			row = i32(len(items)),
 		}
-		append(&arena, ..transmute([]u8)t)
+		for i in 0 ..< nk {
+			t := strings.trim_space(csv_field_into(line, delim, kv[i].col, key[:]))
+			it.f[i] = {ks = i32(len(arena)), kl = i32(len(t)), empty = len(t) == 0}
+			append(&arena, ..transmute([]u8)t)
+			if !it.f[i].empty {
+				nonempty[i] += 1
+				if !table_is_number(t) {num_all[i] = false}
+			}
+		}
 		append(&items, it)
 		append(&s.offs, p)
-		if !it.empty {
-			nonempty += 1
-			if !table_is_number(t) {num_all = false}
-		}
 		if end >= doc.pt.length {break}
 		p = end + 1
 	}
@@ -1158,33 +1243,38 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 		table_sort_clear(doc)
 		return false
 	}
-	// The arena has stopped growing: materialise the keys now, never before.
-	for &it in items {it.key = string(arena[it.ks:it.ks + it.kl])}
-	numeric := nonempty > 0 && num_all
-	if numeric {
-		scratch: [64]u8
-		for &it in items {
-			if !it.empty {it.num = sort_number(it.key, &scratch)}
+	// The arena has stopped growing: materialise every key now, never before.
+	for &it in items {
+		for i in 0 ..< nk {it.f[i].key = string(arena[it.f[i].ks:it.f[i].ks + it.f[i].kl])}
+	}
+	// Each key's type settles against ITS OWN accumulators. A key that is numeric in
+	// this sort tells the next key nothing, which is why these are not one flag.
+	for i in 0 ..< nk {kv[i].numeric = nonempty[i] > 0 && num_all[i]}
+	scratch: [64]u8
+	for &it in items {
+		for i in 0 ..< nk {
+			if kv[i].numeric && !it.f[i].empty {it.f[i].num = sort_number(it.f[i].key, &scratch)}
 		}
 	}
-	switch {
-	case numeric && s.keys[0].desc:
-		slice.sort_by(items[:], sort_less_num_desc)
-	case numeric:
-		slice.sort_by(items[:], sort_less_num_asc)
-	case s.keys[0].desc:
-		slice.sort_by(items[:], sort_less_text_desc)
-	case:
-		slice.sort_by(items[:], sort_less_text_asc)
+	// One comparator for every direction and every key count: the four it replaced
+	// were four copies of the same empty-last and file-order rules, and a fifth would
+	// have been a fifth chance for them to drift apart.
+	ctx := Sort_Ctx {
+		keys  = kv,
+		nkeys = nk,
 	}
+	slice.sort_by_with_data(items[:], sort_less_keys, &ctx)
 	resize(&s.perm, len(items))
 	resize(&s.rank, len(items))
 	for it, pos in items {
 		s.perm[pos] = it.row
 		s.rank[it.row] = i32(pos)
 	}
-	s.keys[0] = {col, desc, numeric}
-	s.nkeys = 1
+	// The SETTLED vector lands, and only now -- after the last refusal, in the same
+	// place `s.keys[0]` used to be written -- so that `nkeys > 0` and a non-empty
+	// `perm` become true together and table_sorted cannot see a half-built sort.
+	s.keys = kv
+	s.nkeys = nk
 	return true
 }
 
@@ -1225,8 +1315,12 @@ table_sort_click :: proc(doc: ^Document, col: int) {
 		table_sort_clear(doc) // descending -> the file's own order
 		return
 	}
-	s.keys[0].desc = live // ascending -> descending; anything else -> ascending
-	if !table_sort_build(doc, col) {return}
+	// One key, which is all a plain click has ever produced; the key vector's other
+	// slots are reached by a different gesture (batch 19, Task 3). Built as a local
+	// array rather than by writing s.keys first, because table_sort_build settles
+	// `numeric` itself and clears s.keys before it reads anything.
+	kv := [1]Sort_Key{{col = col, desc = live}} // ascending -> descending; anything else -> ascending
+	if !table_sort_build(doc, kv[:]) {return}
 	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off}
 }
 
