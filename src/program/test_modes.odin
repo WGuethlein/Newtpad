@@ -3074,6 +3074,94 @@ when NEWTPAD_TESTS {
 		grow(bad, &h, &m, "> q\n", "cont\n", "q cont", "quote")
 	}
 
+	// Scrolling down into a joined paragraph and back up lands on the same anchor.
+	//
+	// This is the seam md_block_start_at was written for, asserted end to end
+	// through the real scroll gesture rather than through the bounds function.
+	// A joined paragraph starts ABOVE its own line, so every byte-to-block
+	// resolver has to agree about where it begins; when they did not, the preview
+	// drew from line 0 while the editor sat at line 100.
+	//
+	// The fixture's paragraphs are 40 source lines, and MD_RUNUP_LINES is 24. That
+	// inequality is the whole point: a run-up cannot clear a paragraph this long,
+	// so the anchor genuinely has to be resolved rather than found by walking back
+	// a fixed number of lines. On 10-line paragraphs this case passes with the snap
+	// deleted.
+	//
+	// The `moved` assertion is what stops the round trip being vacuous: a scroll
+	// that silently clamped at the top would return to the start trivially and
+	// prove nothing.
+	pj_case_scroll_round_trip :: proc(bad: ^int) {
+		fmt.println("-- scrolling into a joined paragraph and back lands on the same anchor --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so an anchor could be resolved")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for para in 0 ..< 3 {
+			for i in 0 ..< 40 {fmt.sbprintf(&sb, "paragraph %d line %02d of hard wrapped prose\n", para, i)}
+			strings.write_string(&sb, "\n")
+		}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		defer md_layout_reset(&d)
+		d.md_mode = .Preview
+
+		c, cok := md_scroll_ctx(&h.gfx, &h.text, &d, 16, 800, 600, 0.5)
+		if !cok {
+			li_chk(bad, false, "a scroll context came up")
+			return
+		}
+
+		start := md_anchor_from_top(&c, 0)
+		a := start
+		for _ in 0 ..< 60 {a = md_scroll_px(&c, a, 40)}
+		mid := a
+		// Moving is not enough, and the first draft of this case only asserted that
+		// -- 12 steps of 40 px stayed inside the FIRST block, where the snap is
+		// trivially the identity, and deleting md_block_start_at from md_runup_start
+		// left the whole mode green. The anchor has to reach a LATER block before
+		// any of this exercises the seam.
+		li_chk(
+			bad,
+			mid.block > start.block,
+			fmt.tprintf("scrolling down crossed into a later block (block %d px %.1f -> block %d px %.1f)", start.block, start.px, mid.block, mid.px),
+		)
+		for _ in 0 ..< 60 {a = md_scroll_px(&c, a, -40)}
+		li_chk(
+			bad,
+			a == start,
+			fmt.tprintf("...and coming back lands on the same anchor (block %d px %.1f, want block %d px %.1f)", a.block, a.px, start.block, start.px),
+		)
+		li_chk(
+			bad,
+			md_anchor_top_byte(&c, a) == md_anchor_top_byte(&c, start),
+			fmt.tprintf("...and the same top byte (%d, want %d)", md_anchor_top_byte(&c, a), md_anchor_top_byte(&c, start)),
+		)
+
+		// Every anchor the round trip passed through must name a real block start.
+		// A block that claims to start where it does not is the defect itself, and
+		// it is invisible to the round trip alone -- a consistently wrong answer
+		// still returns to where it began.
+		b := start
+		bad_starts := 0
+		seen_blocks := 0
+		last_block := -1
+		for _ in 0 ..< 60 {
+			if md_block_start_at(&d, b.block) != b.block {bad_starts += 1}
+			if b.block != last_block {seen_blocks += 1;last_block = b.block}
+			b = md_scroll_px(&c, b, 40)
+		}
+		// Without this the loop above can spend all 60 steps in one block and check
+		// the identity case sixty times, which is what the first draft did.
+		li_chk(bad, seen_blocks >= 3, fmt.tprintf("the descent visited several blocks (%d)", seen_blocks))
+		li_chk(bad, bad_starts == 0, fmt.tprintf("every anchor on the way down names a real block start (%d did not)", bad_starts))
+	}
+
 	pj_case_cache_holds :: proc(bad: ^int) {
 		fmt.println("-- a joined block is not rebuilt every frame --")
 		h: Headless_Gpu
@@ -3765,6 +3853,7 @@ when NEWTPAD_TESTS {
 			pj_case_memo_matches_producer(&bad)
 			pj_case_cache_holds(&bad)
 			pj_case_cache_sees_growth(&bad)
+			pj_case_scroll_round_trip(&bad)
 			pj_case_setext_bounds(&bad)
 			pj_case_setext_layout(&bad)
 		}
