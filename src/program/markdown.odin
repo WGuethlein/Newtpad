@@ -939,9 +939,22 @@ md_is_continuable :: proc(line: string) -> bool {
 // merely tolerated: inside a fence every line is its own block, so any line
 // start it returns IS a block start, and md_is_run_line is false for both
 // delimiters, so neither scan can cross out of the fence it started in (or into
-// one from below). The overshoot costs run-up, never correctness. A fence body
-// line reading `---` is now an underline rather than a rule to that scan, which
-// changes which line inside the fence it stops at and nothing else.
+// one from below). The overshoot costs run-up, never correctness.
+//
+// What DID move inside a fence, MEASURED against the parent commit with a
+// md_block_start_at probe rather than reasoned about (2026-08-01 review) -- this
+// comment's first draft named the wrong character and the wrong mechanism:
+//
+//	```\nTitle\n---\n```           the `---` (byte 10):  10 -> 4
+//	```\nTitle\n===\nafter\n```    the `===` (byte 10):   4 -> 4
+//	                              `after`  (byte 14):    4 -> 14
+//
+// The `---` row is NOT this scan changing its mind: md_is_para_line was already
+// false for a `.Rule`, so it stops at the same line as before. That move comes
+// from the new UNDERLINE ENTRY walking up out of the `---`. The character
+// md_is_run_line actually changes here is `=`, and its effect shows one row
+// down, on the line BELOW a fenced `===`. All three answers are real line starts
+// inside the fence, so the conclusion above holds for every one of them.
 //
 // The OWNER lookup below inherits that contract unchanged. Inside a fence a body
 // line reading `- x` classifies as `.List`, so this can name it the owner of the
@@ -1157,7 +1170,15 @@ md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, setext: int,
 	} else if setext == 0 && !trunc_fwd {
 		// `!trunc_fwd`: with the forward scan truncated, `end` is not the run's edge
 		// and the line after it is not the run's terminator, so there is nothing here
-		// to read. The answer is refused for being capped either way; this just keeps
+		// to read.
+		//
+		// NO TEST GUARDS THIS TERM, and none can: removing it leaves mdtest,
+		// mdjointest, mdviewtest, splittest and mdfencetest all at 0 failures
+		// (2026-08-01 review, verified by deletion). That is the comment's own
+		// reasoning holding -- the answer is refused for being capped either way --
+		// so this is honest defensive code rather than dead weight. Recorded so that
+		// whoever "simplifies" it later knows the green suite is not evidence.
+		// The answer is refused for being capped either way; this just keeps
 		// the promotion from being decided off a position that means nothing.
 		ns := end + 1
 		if ns <= doc.pt.length {
@@ -1192,7 +1213,7 @@ md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, setext: int,
 // below memoises it for the two production call sites, so this shim and those
 // two all bottom out in the same single producer.
 //
-// It DROPS the `setext` return rather than widening the thirty call sites that
+// It DROPS the `setext` return rather than widening the 34 call sites that
 // only ever wanted the extent. The level is asserted through
 // md_para_run_for_test, which is what production reads anyway; the extent -- the
 // half of the promotion this shim does carry -- covers the underline here exactly
@@ -2388,19 +2409,33 @@ md_block_admit :: proc(lay: ^Md_Layout, y, ybot: f32, forced: bool) -> (a: Md_Ad
 //	Block :: struct { kind, level, spans: []Span, indent }
 //	Span  :: struct { text, style_flags, colour_role }
 //
-// A block is still derived from ONE source line (a blank run, front matter and
-// a table's column measure are the exceptions, and each is bounded).
+// A block is derived from a RUN of source lines. It used to be one line, with a
+// blank run, front matter and a table's column measure as the bounded exceptions;
+// paragraph joining made the run the general case.
 //
-// PARAGRAPH JOINING -- treating a paragraph's hard line breaks as soft, per
-// 9.2 -- is still not done, and it is deliberately not part of the pixel
-// anchor either. Its original reason to wait is gone: a long joined block is
-// no longer unscrollable, because the anchor can now sit part way down one.
-// What it is now is a PARSER change, not a scroll change -- it alters which
+// PARAGRAPH JOINING -- treating a paragraph's hard line breaks as soft, per 9.2 --
+// IS DONE (2026-08-01). This comment said it was "still not done" through the
+// three commits that did it, which is why it is being rewritten rather than
+// deleted: it was right about what the change would cost, and that is worth
+// keeping.
+//
+// It predicted a PARSER change rather than a scroll change -- altering which
 // source lines form a block, which moves every block start byte, which is the
-// layout cache's key, the anchor's identity, 9.4's sync map and the fence
-// seed's input. Batching it with the scroll model would mean neither could be
-// bisected from the other. It is its own task, and the pixel anchor is what
-// unblocks it.
+// layout cache's key, the anchor's identity, 9.4's sync map and the fence seed's
+// input. All five moved, and each one cost something:
+//
+//   * the layout cache's key -- a block cached while single-line survived the
+//     append that should have joined it (see md_join_end)
+//   * the anchor's identity -- the run-up landed inside a joined paragraph and the
+//     preview drew from line 0 while the editor sat at line 100 (md_block_start_at)
+//   * 9.4's sync map -- sync is now per BLOCK over hard-wrapped prose, which is
+//     what 9.4 asks for, but coarser than what the one-line-per-block model gave
+//     by accident
+//
+// The prediction that it should not be batched with the scroll model was wrong in
+// one direction: the scroll model had to change WITH it (md_block_start_at), not
+// after it, because a construct that starts above its own line cannot be found by
+// a fixed line run-up.
 
 Md_Style :: enum u8 {
 	Bold,
