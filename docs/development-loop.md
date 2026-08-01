@@ -242,9 +242,11 @@ Each of these cost real time at least once.
   and the cost at the row ceiling. Same rules — one argument, exits non-zero, a missing
   `NEWTPAD_SESSION_DIR` is a failure. It belongs in every sweep.
 - **Two more modes were printing `FAIL` and exiting 0 until 2026-08-01: `menutest` and
-  `settingstest`.** Both are fixed. This is the same defect the bullet above was written about, found
-  again in two more places, so treat "does this mode actually exit non-zero?" as a thing to *check*
-  rather than assume — and note that **`menuseam` legitimately exits 0 whatever it finds**, because it
+  `settingstest`.** Both are fixed. **`mdtest` was the third, fixed the same day** — and it is the one
+  that cost something: it went from `0 failures` to `20 failures` between two commits on the
+  paragraph-join branch and the branch stayed green to every sweep that read exit codes. This is the
+  same defect the bullet above was written about, found again in three more places, so treat "does
+  this mode actually exit non-zero?" as a thing to *check* rather than assume — and note that **`menuseam` legitimately exits 0 whatever it finds**, because it
   is a falsifier rather than a pass/fail test. Its answer moved 14/14 → 12/12 under a sabotage with the
   exit code unchanged throughout, so sweep it by diffing its printed line, never by exit code.
 - **`drawcount` is safe to run as of batch 8** — `newtpad drawcount <file>` renders offscreen (no

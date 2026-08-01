@@ -2393,15 +2393,167 @@ when NEWTPAD_TESTS {
 		li_chk(bad, lay.next == 17, fmt.tprintf("next is %d (want 17, past gamma's newline)", lay.next))
 		li_chk(bad, len(lay.joined) > 0, fmt.tprintf("joined holds the owned clone (got %q)", lay.joined))
 
-		// The control: a blank line still separates, and a single-line paragraph
-		// is not marked multiline and does not allocate `joined`.
-		d2 := pj_doc("a\n\nb\n")
-		defer doc_close(&d2)
-		lay2 := md_layout_build_for_test(&h.gfx, &h.text, &d2, &m, 0, 600)
-		defer md_layout_free(&lay2)
-		li_chk(bad, lay2.cls.content == "a", fmt.tprintf("a blank line still separates (content %q, want \"a\")", lay2.cls.content))
-		li_chk(bad, !lay2.multiline, "a single-line paragraph is not multiline")
-		li_chk(bad, lay2.joined == "", fmt.tprintf("a single-line paragraph does not allocate joined (got %q)", lay2.joined))
+		// Entered MID-RUN, md_layout_build refuses to join at all. `e.start` is the
+		// key md_layout_ensure looks entries up by, so a block that joined from the
+		// run's true start while reporting `start = p` would claim to begin where it
+		// does not -- the regression that drew the preview from line 0 while the
+		// editor half sat at line 100. md_block_start_at is what makes this entry
+		// unreachable in production; this refusal is what keeps it harmless if some
+		// future resolver forgets to snap.
+		{
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			mid := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, starts[1], 600)
+			defer md_layout_free(&mid)
+			li_chk(bad, mid.start == starts[1], fmt.tprintf("a mid-run entry starts where it was entered (%d, want %d)", mid.start, starts[1]))
+			li_chk(bad, mid.cls.content == "beta", fmt.tprintf("...and holds ONLY its own line, unjoined (%q, want \"beta\")", mid.cls.content))
+			li_chk(bad, !mid.multiline, "...and is not marked multiline")
+		}
+	}
+
+	// The control for pj_case_joins_text: a blank line still separates, and a
+	// single-line paragraph is neither marked multiline nor allocating `joined`.
+	//
+	// Its own procedure rather than a second half of that one, per this file's
+	// standing rule: one Document and one Md_Layout live at a time. The joined
+	// case used to hold two of each at once through stacked `defer`s, and
+	// test_mode_dispatch's frame has hit a real STATUS_STACK_OVERFLOW twice.
+	@(private = "file")
+	pj_case_blank_separates :: proc(bad: ^int) {
+		fmt.println("-- a blank line still separates two paragraphs --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		d := pj_doc("a\n\nb\n")
+		defer doc_close(&d)
+		lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+		defer md_layout_free(&lay)
+		li_chk(bad, lay.cls.content == "a", fmt.tprintf("a blank line still separates (content %q, want \"a\")", lay.cls.content))
+		li_chk(bad, !lay.multiline, "a single-line paragraph is not multiline")
+		li_chk(bad, lay.joined == "", fmt.tprintf("a single-line paragraph does not allocate joined (got %q)", lay.joined))
+	}
+
+	// The `capped` return is CONSUMED, by both of md_para_bounds' callers, and
+	// they refuse the same runs off the same flag.
+	//
+	// The failure that forces it: a document of consecutive prose lines longer
+	// than md_para_max_lines. The block at p=0 stops at the cap with capped=true,
+	// so a join that ignored the flag would take lines 0..cap and set `next` to the
+	// line after -- whose OWN backward scan runs the same cap and starts near line
+	// 1. The preview draws the paragraph and then repeats nearly all of it. The
+	// fallback is the unjoined single-line block: bounded, unable to duplicate, and
+	// exactly what shipped before the join.
+	//
+	// Driven through the real guard by lowering md_para_max_lines rather than by
+	// building a 5000-line fixture, as pj_case_budget_truncates already does.
+	@(private = "file")
+	pj_case_capped_refuses :: proc(bad: ^int) {
+		fmt.println("-- a capped run is joined by neither the layout nor the snap --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %02d of one unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+		mid := starts[20]
+
+		// The control. Without it every row below is satisfied by a fixture that
+		// never joins at any cap.
+		{
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, lay.multiline, "at the production cap the 40-line run DOES join")
+			li_chk(bad, md_block_start_at(&d, mid) == 0, fmt.tprintf("...and a byte in its middle snaps back to byte 0 (%d)", md_block_start_at(&d, mid)))
+		}
+
+		old_lines := md_para_max_lines
+		defer md_para_max_lines = old_lines
+		md_para_max_lines = 4
+
+		lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+		defer md_layout_free(&lay)
+		li_chk(bad, !lay.multiline, fmt.tprintf("with a 4-line cap the same run is NOT joined (multiline %v)", lay.multiline))
+		li_chk(bad, lay.end == starts[1] - 1, fmt.tprintf("...the block is its own single line (end %d, want %d)", lay.end, starts[1] - 1))
+		li_chk(
+			bad, lay.next == starts[1],
+			fmt.tprintf("...so the block after it starts at the NEXT line and cannot re-draw this one (next %d, want %d)", lay.next, starts[1]),
+		)
+		li_chk(
+			bad, md_block_start_at(&d, mid) == mid,
+			fmt.tprintf("the snap refuses the same capped run, so that line is its own block start (%d, want %d)", md_block_start_at(&d, mid), mid),
+		)
+	}
+
+	// md_block_start_at as a unit. mdtest's md_scroll_selftest section B3 asserts
+	// the product-level consequence -- the Split anchor, through md_anchor_from_top
+	// and a real device -- and this asserts the three properties that make the
+	// procedure safe to put in front of every walk: it lands on the run's start
+	// from any byte, it is idempotent, and it does not walk out of a fence.
+	//
+	// The fence row is not decoration. Unlike md_layout_build's `.Para` case, this
+	// procedure holds no fence state, so md_is_para_line genuinely answers "yes" to
+	// a fence body line that reads as prose; md_para_bounds' fence contract claims
+	// that is safe, and this is what makes the claim testable.
+	@(private = "file")
+	pj_case_snap_is_the_entry :: proc(bad: ^int) {
+		fmt.println("-- a byte snaps back to the start of the block that contains it --")
+		{
+			d := pj_doc("alpha\nbeta\ngamma\n\ndelta\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			for li in 0 ..< 3 {
+				li_chk(bad, md_block_start_at(&d, starts[li]) == 0, fmt.tprintf("line %d of the run snaps to byte 0 (got %d)", li, md_block_start_at(&d, starts[li])))
+			}
+			li_chk(bad, md_block_start_at(&d, md_block_start_at(&d, starts[2])) == 0, "the snap is idempotent")
+			// A byte that is not a line start at all: md_scroll_to_fraction hands
+			// md_block_at_byte the raw `int(t)` off the scrollbar's scalar.
+			li_chk(
+				bad, md_block_start_at(&d, starts[1] + 2) == 0,
+				fmt.tprintf("a byte mid-line snaps as well (%d)", md_block_start_at(&d, starts[1] + 2)),
+			)
+			// ...and the run really ENDS, or every row above is satisfied by a
+			// procedure that always answers 0. starts[4] is "delta", after the blank.
+			li_chk(
+				bad, md_block_start_at(&d, starts[4]) == starts[4],
+				fmt.tprintf("the paragraph past the blank line is its own block start (%d, want %d)", md_block_start_at(&d, starts[4]), starts[4]),
+			)
+		}
+		{
+			// "x is one" and "y is two" are ordinary prose to md_classify with no
+			// fence state, so the backward scan from "y is two" walks over "x is
+			// one" and then meets ``` -- `.Fence_Open`, which md_is_para_line
+			// refuses. It stops there, and the byte it returns is a fence BODY line
+			// start, which inside a fence is a real block start. What it must never
+			// do is cross the delimiter and answer with "intro".
+			d := pj_doc("intro\n\n```\nx is one\ny is two\n```\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			fence_open, first_body, second_body := starts[2], starts[3], starts[4]
+			li_chk(
+				bad, md_block_start_at(&d, second_body) == first_body,
+				fmt.tprintf("inside a fence the snap stops at the opening delimiter (%d, want %d, not %d)", md_block_start_at(&d, second_body), first_body, fence_open),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, first_body) == first_body,
+				fmt.tprintf("...and a fence body line is its own block start (%d, want %d)", md_block_start_at(&d, first_body), first_body),
+			)
+		}
 	}
 
 	// The cache itself: build the same block twice at the same width and
@@ -2525,6 +2677,9 @@ when NEWTPAD_TESTS {
 			pj_case_neighbor_capped_forces_capped(&bad)
 			pj_case_terminators(&bad)
 			pj_case_joins_text(&bad)
+			pj_case_blank_separates(&bad)
+			pj_case_capped_refuses(&bad)
+			pj_case_snap_is_the_entry(&bad)
 			pj_case_cache_holds(&bad)
 		}
 		fmt.printfln("mdjointest: %d failures", bad)
@@ -10471,7 +10626,19 @@ when NEWTPAD_TESTS {
 			// count below would be two. Dropping the terminator makes the count
 			// say what it means; the first draft of this test did not, and read as
 			// a per-block cache failing when it was the extern-dep rule working.
-			src := "# One\nalpha alpha\nbravo bravo\ncharlie charlie plus a good deal more text so this block wraps once the pane narrows\ndelta delta\necho echo"
+			//
+			// ONE BLOCK PER LINE, and every kind different, because both of the
+			// obvious fixtures are now wrong. Six consecutive prose lines are ONE
+			// block since the paragraph join, so the "a cold pass builds every
+			// visible block (>= 6)" rows measured two; and separating them with
+			// BLANK lines instead would make five of the eleven blocks .Blank, which
+			// md_layout_extern_dep keys on doc.revision, so the "a one-byte edit
+			// rebuilds exactly ONE block" row -- the property this whole procedure
+			// exists for -- would have had to become six. Alternating the kinds keeps
+			// both assertions exact. No two adjacent lines are .Para, so nothing
+			// joins; "alpha alpha" sits between a heading and a quote and is a
+			// single-line paragraph still.
+			src := "# One\nalpha alpha\n> bravo bravo\n- charlie charlie plus a good deal more text so this block wraps once the pane narrows\n## delta delta\necho echo"
 			content := make([]u8, len(src))
 			copy(content, src)
 			doc := doc_from_content(content, "cache.md", .UTF8)
@@ -11110,7 +11277,21 @@ when NEWTPAD_TESTS {
 			ytop, ybot := f32(20), f32(1380)
 			m := md_metrics(&h.text, px_)
 			_, measure := md_content_span(&m, x0, x1)
-			PROBE :: "[q](http://probe.example) probe"
+			// A LIST ITEM, not a bare prose line, and that is forced. The probe used
+			// to be "[q](...) probe" -- a paragraph -- and after the paragraph join it
+			// merges into any paragraph directly above it, which is the base fixture
+			// for the "a paragraph" lead and every row under it. A blank line before
+			// the probe would separate the blocks but destroy what this procedure is
+			// FOR: a .Blank block resets md_walk's `prev_below` to 0, so the collapsed
+			// gap max(lead.below, K.above) becomes lead.below + K.above and the
+			// margin-collapse half of the table stops being tested at all.
+			//
+			// A list item is the one kind that terminates a paragraph run AND carries
+			// space-above 0, exactly as .Para does (md_layout_build sets `above` on
+			// neither), so the gap above the probe is max(prev.below, 0) either way and
+			// the cancellation the `want` formula below depends on is untouched. Its
+			// indent moves the rect in x, which nothing here reads.
+			PROBE :: "- [q](http://probe.example) probe"
 
 			// The probe's y in a document built from `parts`, or -1.
 			probe_y :: proc(h: ^Headless_Gpu, src: string, px_, x0, x1, ytop, ybot: f32) -> f32 {
@@ -11142,26 +11323,28 @@ when NEWTPAD_TESTS {
 				height: f32,
 				above:  f32,
 				below:  f32,
+				para:   bool, // is this block a bare prose line, which now JOINS?
 			}
 			rows := []Row {
-				{"paragraph", "block text", body_h, 0, m.para_below},
+				{"paragraph", "block text", body_h, 0, m.para_below, true},
 				// A list item and a quote lay out at the body face and do not wrap
 				// at this measure, so their block height is a paragraph's.
-				{"list item", "- block text", body_h, 0, m.list_gap},
-				{"blockquote", "> block text", body_h, m.quote_above, m.quote_below},
+				{"list item", "- block text", body_h, 0, m.list_gap, false},
+				{"blockquote", "> block text", body_h, m.quote_above, m.quote_below, false},
 				// h1 and h2 carry their rule INSIDE their own height (9.2 item 1).
-				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, line_height(m.head[1]), bold) + hairline(), m.head_above[1], m.head_below[1]},
-				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, line_height(m.head[2]), bold) + hairline(), m.head_above[2], m.head_below[2]},
-				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, line_height(m.head[3]), bold), m.head_above[3], m.head_below[3]},
-				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, line_height(m.head[4]), bold), m.head_above[4], m.head_below[4]},
-				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below},
-				{"thematic break", "***", hairline(), m.rule_gap, m.rule_gap},
+				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, line_height(m.head[1]), bold) + hairline(), m.head_above[1], m.head_below[1], false},
+				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, line_height(m.head[2]), bold) + hairline(), m.head_above[2], m.head_below[2], false},
+				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, line_height(m.head[3]), bold), m.head_above[3], m.head_below[3], false},
+				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, line_height(m.head[4]), bold), m.head_above[4], m.head_below[4], false},
+				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below, false},
+				{"thematic break", "***", hairline(), m.rule_gap, m.rule_gap, false},
 			}
 			leads := []struct {
 				what:  string,
 				src:   string,
 				below: f32,
-			}{{"a paragraph", "lead text", m.para_below}, {"a list item", "- lead text", m.list_gap}}
+				para:  bool,
+			}{{"a paragraph", "lead text", m.para_below, true}, {"a list item", "- lead text", m.list_gap, false}}
 
 			for ld in leads {
 				base_src := strings.concatenate({ld.src, "\n", PROBE, "\n"}, context.temp_allocator)
@@ -11181,6 +11364,19 @@ when NEWTPAD_TESTS {
 					// no space above, so the max is K.below itself).
 					want := max(ld.below, r.above) - ld.below + r.height + r.below
 					got := y - y_base
+					if ld.para && r.para {
+						// A prose line under a prose line is the SAME block since the
+						// paragraph join, so there is no gap here to measure and the
+						// row above would be asking the wrong question. What it asks
+						// instead is the join, from the spacing side: "lead text" and
+						// "block text" reflow onto one visual line at this measure, so
+						// the probe below them must not move at all.
+						gchk(
+							&bad, abs(got) <= 1,
+							fmt.tprintf("gap: [%s] a %s JOINS into it -- one block, so the probe does not move (got %.1f, want 0.0)", ld.what, r.what, got),
+						)
+						continue
+					}
 					gchk(
 						&bad, abs(got - want) <= 1,
 						fmt.tprintf("gap: [%s] a %s costs h=%.0f + above=%.0f + below=%.0f (got %.1f, want %.1f)", ld.what, r.what, r.height, r.above, r.below, got, want),
@@ -11233,6 +11429,18 @@ when NEWTPAD_TESTS {
 
 			px_ := f32(24)
 			winw, winh := f32(W), f32(H)
+
+			// Sections B and B2 want a long document of FIXED-WIDTH lines, one block
+			// each, so a byte offset divided by the stride is a block index. A bare
+			// prose line is no longer one block per line -- since the paragraph join,
+			// 200 consecutive prose lines are ONE block, which is section B3's subject
+			// and was these two sections' undoing. A blockquote is the nearest kind
+			// that still tiles one per line: same body face, same height, and its
+			// space-above of 16 collapses against a paragraph's space-below of 16 to
+			// the identical gap the old fixture had, so B's `vis` window and its
+			// builds-per-visible-block bounds stay calibrated where they were.
+			QUOTE_LINE :: "> para %03d xx\n"
+			QUOTE_STRIDE :: len("> para 000 xx\n")
 
 			render :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot: f32, at: Md_Anchor) -> (buf: []u8, ok: bool) {
 				bg := g_theme[.Bg_Base]
@@ -11335,9 +11543,10 @@ when NEWTPAD_TESTS {
 			{
 				b := strings.builder_make()
 				defer strings.builder_destroy(&b)
-				// Fixed-width lines, so a byte offset divided by 12 is a block
-				// index and `bottom` can be read as "how many blocks were visible".
-				for i in 0 ..< 200 {fmt.sbprintf(&b, "para %03d xx\n", i)}
+				// Fixed-width lines, so a byte offset divided by QUOTE_STRIDE is a
+				// block index and `bottom` can be read as "how many blocks were
+				// visible". See QUOTE_LINE for why they are quotes.
+				for i in 0 ..< 200 {fmt.sbprintf(&b, QUOTE_LINE, i)}
 				src := strings.to_string(b)
 				content := make([]u8, len(src))
 				copy(content, src)
@@ -11350,7 +11559,7 @@ when NEWTPAD_TESTS {
 				before := md_layout_builds
 				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 				builds := md_layout_builds - before
-				vis := bottom / 12 + 1
+				vis := bottom / QUOTE_STRIDE + 1
 				schk(&bad, vis >= 5 && vis <= 40, fmt.tprintf("budget: the pane holds several blocks, and the fixture is far longer (%d of 200)", vis))
 				schk(&bad, builds <= vis * 3, fmt.tprintf("budget: a pass lays out a bounded window, NOT the document (%d builds, %d visible, 200 blocks)", builds, vis))
 				schk(&bad, builds >= vis * 2 - 2, fmt.tprintf("budget: ...and it really does lay out the screen BELOW, not just the visible blocks (%d builds vs %d visible)", builds, vis))
@@ -11370,7 +11579,7 @@ when NEWTPAD_TESTS {
 			{
 				b := strings.builder_make()
 				defer strings.builder_destroy(&b)
-				for i in 0 ..< 200 {fmt.sbprintf(&b, "para %03d xx\n", i)}
+				for i in 0 ..< 200 {fmt.sbprintf(&b, QUOTE_LINE, i)}
 				src := strings.to_string(b)
 				content := make([]u8, len(src))
 				copy(content, src)
@@ -11383,15 +11592,18 @@ when NEWTPAD_TESTS {
 
 				// Block 100 of 200 -- resolved through the same mapping a Split
 				// click's sync uses (md_anchor_from_top), not hand-built, so the
-				// anchor is one the product can actually land on.
-				at := md_anchor_from_top(&c, 100 * 12)
-				schk(&bad, at.block == 100 * 12, fmt.tprintf("budget-mid: the anchor resolves to the block boundary it named (%d)", at.block))
+				// anchor is one the product can actually land on. Every line here IS
+				// a block start, so the snap (md_block_start_at) is the identity on
+				// this fixture and the byte comes back unchanged; the fixture that
+				// makes the snap MOVE is section B3's.
+				at := md_anchor_from_top(&c, 100 * QUOTE_STRIDE)
+				schk(&bad, at.block == 100 * QUOTE_STRIDE, fmt.tprintf("budget-mid: the anchor resolves to the block boundary it named (%d)", at.block))
 
 				md_layout_reset(&doc)
 				before := md_layout_builds
 				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
 				builds := md_layout_builds - before
-				vis := (bottom - at.block) / 12 + 1
+				vis := (bottom - at.block) / QUOTE_STRIDE + 1
 				schk(&bad, vis >= 3 && vis <= 40, fmt.tprintf("budget-mid: the pane holds several blocks from the anchor (%d)", vis))
 				// The honest bound: section B's pane-plus-a-screen-below budget,
 				// PLUS the fixed MD_RUNUP_LINES cost the origin case never pays.
@@ -11401,6 +11613,80 @@ when NEWTPAD_TESTS {
 				// this is the assertion that notices.
 				schk(&bad, builds <= vis * 3 + MD_RUNUP_LINES, fmt.tprintf("budget-mid: a mid-anchor pass lays out the pane, a screen below, and its OWN run-up -- not the document (%d builds, %d visible, +%d run-up allowance)", builds, vis, MD_RUNUP_LINES))
 				schk(&bad, builds >= vis * 2 - 2, fmt.tprintf("budget-mid: ...and it still lays out the screen BELOW too (%d builds vs %d visible)", builds, vis))
+			}
+
+			// --- B3. a byte resolves to the block that CONTAINS it -------------
+			//
+			// md_block_start_at's invariant: any byte handed to a walk as a block
+			// start must actually BE a block start. The fixture is the one that
+			// breaks it -- 200 hard-wrapped prose lines with no blank line anywhere,
+			// which CommonMark, and this preview since the paragraph join, reads as
+			// ONE paragraph.
+			//
+			// The defect this replaces: md_block_at_byte walked from
+			// md_line_start_back(1200, MD_RUNUP_LINES) = 912, which is INSIDE that
+			// paragraph, so md_layout_build produced a block that said it started at
+			// 912 while holding text joined from byte 0. md_anchor_from_top(1200) --
+			// the call main.odin makes every time the editor scrolls in Split --
+			// answered 912, and the preview pane drew the document from line 0 while
+			// the editor half sat at line 100. 1200 - 912 is exactly MD_RUNUP_LINES
+			// lines of 12 bytes, which is the signature of the defect.
+			//
+			// The right answer is 0, NOT 1200. Byte 1200 is inside the single
+			// paragraph this document has and that paragraph starts at 0; "the anchor
+			// is the byte you asked for" was only ever true because every line used to
+			// be its own block. What must hold is that it names the CONTAINING block,
+			// the same one from every byte inside it.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< 200 {fmt.sbprintf(&b, "para %03d xx\n", i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "snap.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				schk(&bad, cok, "snap: the scroll context comes from the same md_pane_box the draw does")
+
+				at := md_anchor_from_top(&c, 1200)
+				schk(
+					&bad, at.block == 0,
+					fmt.tprintf("snap: a byte inside a joined paragraph resolves to that paragraph's own start (%d, want 0; the run-up alone answered %d)", at.block, 1200 - MD_RUNUP_LINES * 12),
+				)
+
+				// Entry-independence, which is the property and not a nicety: a block
+				// that answered differently depending on which of its bytes was asked
+				// would render the paragraph differently depending on where the reader
+				// had scrolled in, and that is what the join exists to prevent.
+				same := 0
+				for k in 0 ..< 200 {
+					if md_anchor_from_top(&c, k * 12).block == 0 {same += 1}
+				}
+				schk(&bad, same == 200, fmt.tprintf("snap: ...and so does every one of the paragraph's 200 lines (%d of 200)", same))
+
+				// A FIXED POINT: what it answers with is a byte it would not move
+				// again. This is what md_layout_ensure's `e.start != p` key needs, and
+				// what a fixed line run-up cannot promise for a construct of unbounded
+				// length.
+				st, next, _ := md_block_at_byte(&c, 1200)
+				schk(&bad, md_block_start_at(&doc, st) == st, fmt.tprintf("snap: the byte it answers with is one it would not move again (%d)", st))
+				schk(&bad, st == 0 && next >= 2400, fmt.tprintf("snap: ...and that block really spans the whole 2400-byte run (%d..%d)", st, next))
+
+				// And the layout built there agrees with it, which is the other half
+				// of "a block claims to start where it does". Through
+				// md_layout_ensure, so this is the production cache path and not a
+				// second way of building the same block.
+				m := md_metrics(&h.text, px_)
+				lay := md_layout_ensure_for_test(&h.gfx, &h.text, &doc, &m, st, c.measure)
+				schk(&bad, lay.start == st, fmt.tprintf("snap: the layout entered at that byte starts at it (%d vs %d)", lay.start, st))
+				schk(&bad, lay.multiline && lay.end >= 2399, fmt.tprintf("snap: ...and it is the joined block, not one line of it (multiline %v, end %d)", lay.multiline, lay.end))
+
+				// The 9.4 map's own inverse, on the fixture that can tell a block from
+				// a line: every line of the paragraph maps to preview position 0, so
+				// mapping back must land on the paragraph's line and not on line 100.
+				schk(&bad, md_anchor_top_byte(&c, at) == 0, fmt.tprintf("snap: the reverse map returns the paragraph's own line (%d)", md_anchor_top_byte(&c, at)))
 			}
 
 			// --- C. the preview's own end of travel, and its scrollbar --------
@@ -11599,7 +11885,14 @@ when NEWTPAD_TESTS {
 				// "underlined implies openable" (link_gate_visible), so a fixture
 				// whose targets do not resolve places no rectangles at all -- which
 				// is what the first draft did, and it reported zero links.
-				for i in 0 ..< 40 {fmt.sbprintf(&b, "row [%03d](https://e.test/p%03d) here\n", i, i)}
+				// A BLANK LINE between the rows, which is what makes each of them
+				// its own block: since the paragraph join, 40 consecutive prose
+				// lines are one block and every hit's y searched back to byte 0 --
+				// 39 of 40 "wrong" against a search that was answering correctly.
+				// Blank-separated prose is also what a real markdown document looks
+				// like, so this keeps the pixel -> block search tested over actual
+				// paragraphs rather than over a kind picked to tile conveniently.
+				for i in 0 ..< 40 {fmt.sbprintf(&b, "row [%03d](https://e.test/p%03d) here\n\n", i, i)}
 				src := strings.to_string(b)
 				content := make([]u8, len(src))
 				copy(content, src)
@@ -11608,7 +11901,10 @@ when NEWTPAD_TESTS {
 				defer doc_close(&doc)
 				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
 				c, _ := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
-				line_len := len("row [000](https://e.test/p000) here\n")
+				// The stride is the row PLUS its blank line: row i starts at
+				// i * line_len, and the blank block between them starts one byte
+				// before the next row.
+				line_len := len("row [000](https://e.test/p000) here\n\n")
 
 				// Off the top by a fraction of a block, so the search is asked a
 				// question the anchor alone cannot answer.
@@ -12036,25 +12332,29 @@ when NEWTPAD_TESTS {
 			winw, winh := f32(W), f32(H)
 
 			Wheel_Fixture :: struct {
-				name:   string,
-				fm:     int, // lines of front-matter body, 0 for none
-				open:   string, // what the body opens with, before the paragraphs
-				blanks: bool, // a blank line between paragraphs
-				strict: bool, // is exact reversibility claimed at EVERY position?
+				name:       string,
+				fm:         int, // lines of front-matter body, 0 for none
+				open:       string, // what the body opens with, before the paragraphs
+				blanks:     bool, // a blank line between paragraphs
+				strict:     bool, // is exact reversibility claimed at EVERY position?
+				min_blocks: int, // how many blocks a 60-notch sweep must cross
 			}
 			// Long enough to wrap across three visual lines at the 72ch measure,
 			// which is what makes the FIRST block taller than two wheel notches --
 			// the precondition F1's region needs, and the reason a one-line fixture
 			// cannot see the defect at all.
 			PARA :: "para %02d carries enough words on it to wrap across three whole visual lines at the seventy two character measure the preview holds itself to, which is what gives the block a slot several notches tall\n"
+			// `min_blocks` is 1 for the no-blank fixture on purpose: since the
+			// paragraph join its 40 prose lines are ONE block, so a sweep that never
+			// leaves block 0 is the model working. It keeps its own exact row below.
 			fixtures := []Wheel_Fixture {
-				{"plain paragraphs", 0, "", true, true},
-				{"no blank lines", 0, "", false, true},
-				{"opens with a heading", 0, "# Title of the document\n\n", true, true},
-				{"opens with a fence", 0, "```odin\nx := 1\ny := 2\nz := 3\nw := 4\n```\n\n", true, true},
-				{"20 lines of front matter", 20, "", true, true},
-				{"30 lines of front matter", 30, "", true, false},
-				{"50 lines of front matter", 50, "", true, false},
+				{"plain paragraphs", 0, "", true, true, 3},
+				{"no blank lines", 0, "", false, true, 1},
+				{"opens with a heading", 0, "# Title of the document\n\n", true, true, 3},
+				{"opens with a fence", 0, "```odin\nx := 1\ny := 2\nz := 3\nw := 4\n```\n\n", true, true, 3},
+				{"20 lines of front matter", 20, "", true, true, 3},
+				{"30 lines of front matter", 30, "", true, true, 3},
+				{"50 lines of front matter", 50, "", true, true, 3},
 			}
 
 			// Accumulated across every fixture: the sweep is only meaningful if it
@@ -12091,11 +12391,25 @@ when NEWTPAD_TESTS {
 				// The sweep: one notch at a time from the top, recorded. A NOTCH,
 				// not 900px, because a notch is what the wheel sends and because
 				// the positions that matter are the ones INSIDE a block.
+				//
+				// The CEILING is excluded, and that is a precondition rather than a
+				// tolerance. md_scroll_clamp truncates the step that lands on
+				// md_max_anchor, so the last recorded position is less than a notch
+				// below the one before it -- and a full notch back up then
+				// legitimately overshoots it. Reversibility of a NOTCH says nothing
+				// about a step that was not one. (The joined fixture is what surfaced
+				// this: with its 40 prose lines re-flowed into one block it is short
+				// enough for a 60-notch sweep to reach its end, where the blank-
+				// separated fixtures' inter-paragraph gaps keep the ceiling out of
+				// reach.) The ceiling has its own rows in section C of
+				// md_scroll_selftest -- "scrolling down repeatedly stops exactly at
+				// the ceiling", and a step from it moves nothing.
+				mx := md_max_anchor(&c)
 				pos := make([dynamic]Md_Anchor, 0, 80)
 				append(&pos, Md_Anchor{})
 				for len(pos) < 60 {
 					nxt := md_scroll_px(&c, pos[len(pos) - 1], notch)
-					if nxt == pos[len(pos) - 1] {break}
+					if nxt == pos[len(pos) - 1] || nxt == mx {break}
 					append(&pos, nxt)
 				}
 
@@ -12105,7 +12419,15 @@ when NEWTPAD_TESTS {
 					if p.block == 0 && p.px > notch {saw_f1_region = true}
 					if p.block > 0 && p.px >= notch {saw_f2_region = true}
 				}
-				wchk(&bad, len(pos) >= 20 && blocks >= 3, fmt.tprintf("wheel[%s]: the sweep covers %d positions over %d blocks", fx.name, len(pos), blocks))
+				wchk(&bad, len(pos) >= 20 && blocks >= fx.min_blocks, fmt.tprintf("wheel[%s]: the sweep covers %d positions over %d blocks (want >= %d)", fx.name, len(pos), blocks, fx.min_blocks))
+				if !fx.blanks {
+					// Exact, not a floor: 40 prose lines with no blank between them
+					// are ONE paragraph, so a 60-notch sweep down a block that many
+					// visual lines tall must never reach a second block. A model that
+					// still made a block per source line would report 3 or more here
+					// and pass the row above under its own min_blocks of 1.
+					wchk(&bad, blocks == 1, fmt.tprintf("wheel[%s]: ...and all 40 of them are ONE joined block, which the sweep never leaves (%d)", fx.name, blocks))
+				}
 
 				// --- the invariant: px lives in [0, gap + h) --------------------
 				//
@@ -12221,7 +12543,13 @@ when NEWTPAD_TESTS {
 
 			b := strings.builder_make()
 			defer strings.builder_destroy(&b)
-			for i in 0 ..< 60 {fmt.sbprintf(&b, "para %03d text here\n", i)}
+			// Blank-separated, so each line is its own block. Without the blank the
+			// 60 prose lines are ONE paragraph since the join, every point in the
+			// pane names block 0, and row 2's positive control ("a double press
+			// moves doc.top off the start") is vacuously false -- which is how the
+			// single-press rows around it would have gone quietly green for the
+			// wrong reason.
+			for i in 0 ..< 60 {fmt.sbprintf(&b, "para %03d text here\n\n", i)}
 			src := strings.to_string(b)
 			content := make([]u8, len(src))
 			copy(content, src)
@@ -12314,6 +12642,14 @@ when NEWTPAD_TESTS {
 			bad += md_wheel_selftest()
 			bad += md_prop_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
+			// The same guard palettetest carries, and for the same reason
+			// (development-loop.md's "printing FAIL and exiting 0" bullet): without
+			// it this mode printed 20 FAILs and exited 0, so a sweep reading exit
+			// codes saw a green branch. That is exactly what happened here -- mdtest
+			// went from 0 failures to 20 between 6fd48d3 and 4f1a3b9 and nothing
+			// noticed. menutest and settingstest were closed the same way on
+			// 2026-08-01; this was the third.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
