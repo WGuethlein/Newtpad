@@ -889,11 +889,11 @@ md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: 
 	return start, end, capped, true
 }
 
-// Package-visible so mdjointest can drive the bounds function directly. There
-// is no production caller yet at all (md_para_bounds is `private = "file"`,
-// so this shim -- and the test cases that use it -- are its only callers,
-// grep-confirmed against src/); the intended future one is md_layout_build's
-// `.Para` case, per md_para_bounds' own doc comment above.
+// Package-visible so mdjointest can drive the bounds function directly.
+// md_para_bounds is `private = "file"`, so this shim is the only way outside
+// this file to call it directly -- but it is no longer the only CALLER: as of
+// this task, md_layout_build's `.Para` case calls md_para_bounds itself, so
+// this shim and that production call site both read the same single producer.
 md_para_bounds_for_test :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: bool) {
 	return md_para_bounds(doc, p)
 }
@@ -2418,6 +2418,16 @@ Md_Layout :: struct {
 	end:         int, // what the pass reports as `bottom` after this block
 	next:        int, // where the pass continues from
 	cls:         Md_Class, // .content / .bullet slice into `src`
+	// OWNED, .Para-family only: the joined text of a multi-line block, which
+	// `cls.content` then slices. A single-line block leaves this nil and
+	// `cls.content` slices `src` as it always did.
+	joined:      string,
+	// Did this block read bytes past its own first line? Set by every construct
+	// that joins (a paragraph run, a list/quote continuation, a setext underline).
+	// THIS, not the kind, is what makes a block externally dependent: a setext
+	// heading is a .Heading whose layout depends on the line below it, so a
+	// kind-based test would cache it against text that cannot witness the change.
+	multiline:   bool,
 	store:       string, // OWNED; every span's text and url slices into this
 	shape:       []plat.Shape_Span,
 	spans:       []Md_Span,
@@ -2450,17 +2460,22 @@ Md_Layout :: struct {
 	used:        u64, // the md_layout_pass that last read or built this entry
 }
 
-// Does this kind's layout depend on bytes outside its own `src`? Those take
+// Does this block's layout depend on bytes outside its own `src`? Those take
 // doc.revision as part of their key, since their own text cannot witness the
 // change. See MD_LAYOUT_SLOTS.
+//
+// Takes the LAYOUT, not the kind: `multiline` is set by any block that absorbed
+// lines below its first, and a setext heading is a .Heading that did exactly
+// that -- so the kind is no longer sufficient to answer this.
 @(private = "file")
-md_layout_extern_dep :: #force_inline proc(k: Md_Kind) -> bool {
-	return k == .Table || k == .Blank || k == .Front_Matter
+md_layout_extern_dep :: #force_inline proc(e: ^Md_Layout) -> bool {
+	return e.cls.kind == .Table || e.cls.kind == .Blank || e.cls.kind == .Front_Matter || e.multiline
 }
 
 md_layout_free :: proc(e: ^Md_Layout) {
 	if !e.valid {return}
 	delete(e.src)
+	delete(e.joined)
 	delete(e.store)
 	delete(e.shape)
 	delete(e.spans)
@@ -2728,6 +2743,28 @@ md_layout_build :: proc(
 		if e.cls.task_done {base_col, mute = md_task_prose_style(true)}
 	case .Para:
 		e.below = m.para_below
+		// Join the run. CommonMark's paragraph model: consecutive prose lines are
+		// ONE paragraph, re-flowed to the pane, with a space at each break -- which
+		// is also the fix for "the preview does not always respect spaces", since
+		// the space at the join is the one that was missing (there was no join).
+		//
+		// Bounds come from md_para_bounds and from nowhere else; see its comment
+		// for why a second producer here would be entry-dependent.
+		if ps, pe, _, pok := md_para_bounds(doc, p); pok && pe > line_end {
+			sb := strings.builder_make(context.temp_allocator)
+			q := ps
+			buf: [RENDER_LINE_CAP]u8
+			for q <= pe {
+				l, le, _ := md_line_at(doc, q, buf[:])
+				if strings.builder_len(sb) > 0 {strings.write_byte(&sb, ' ')}
+				strings.write_string(&sb, strings.trim_right(l, " \t"))
+				q = le + 1
+			}
+			e.joined = strings.clone(strings.to_string(sb))
+			e.cls.content = e.joined
+			e.end, e.next = pe, pe + 1
+			e.multiline = true
+		}
 	case .Front_Matter:
 	}
 
@@ -2922,6 +2959,16 @@ md_layout_build :: proc(
 	return
 }
 
+// Package-visible so mdjointest can assert on a built layout without a window.
+// md_layout_build is now the production caller md_para_bounds' own doc comment
+// named as intended; this shim exists only to give the test a `p` and a real
+// `line_end`/`line` without duplicating md_line_at's cap handling itself.
+md_layout_build_for_test :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, m: ^Md_Metrics, p: int, measure: f32) -> Md_Layout {
+	buf: [RENDER_LINE_CAP]u8
+	line, lend, _ := md_line_at(doc, p, buf[:])
+	return md_layout_build(gfx, t, doc, m, p, lend, line, false, nil, {}, measure)
+}
+
 // The cached layout for the block at `p`, building it if no slot holds one.
 // Round-robin replacement, like md_table_ensure's four slots and for the same
 // reason: a viewport walk touches its blocks top to bottom, so anything that
@@ -2947,7 +2994,7 @@ md_layout_ensure :: proc(
 		if !e.valid || e.start != p {continue}
 		if e.measure != measure || e.px != m.s || e.ui_scale != m.ui_scale || e.theme != m.theme || e.faces != m.faces {continue}
 		if e.in_fence != in_fence || e.fence_lex != fence_lex || e.fence_state != fence_state {continue}
-		if md_layout_extern_dep(e.cls.kind) {
+		if md_layout_extern_dep(&e) {
 			if e.revision != doc.revision {continue}
 		} else if e.src != line || e.end != line_end {
 			// `e.end != line_end` is NOT redundant with `e.src != line`: md_pass
@@ -2963,6 +3010,16 @@ md_layout_ensure :: proc(
 	slot^ = md_layout_build(gfx, t, doc, m, p, line_end, line, in_fence, fence_lex, fence_state, measure)
 	slot.used = md_layout_pass
 	return slot
+}
+
+// Package-visible so mdjointest can assert on md_layout_ensure's CACHE, not
+// just on what md_layout_build produces once. Same shape as
+// md_layout_build_for_test: derive `line`/`line_end` from `p` so the caller
+// only has to supply a byte offset.
+md_layout_ensure_for_test :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, m: ^Md_Metrics, p: int, measure: f32) -> ^Md_Layout {
+	buf: [RENDER_LINE_CAP]u8
+	line, lend, _ := md_line_at(doc, p, buf[:])
+	return md_layout_ensure(gfx, t, doc, m, p, lend, line, false, nil, {}, measure)
 }
 
 // The slot a new layout goes in: an empty one, else the LEAST RECENTLY USED

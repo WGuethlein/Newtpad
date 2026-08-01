@@ -2352,6 +2352,91 @@ when NEWTPAD_TESTS {
 		)
 	}
 
+	// The layout join itself, not just md_para_bounds' extent: consecutive
+	// prose lines become ONE block, with a space at each break, and the
+	// block's cached `content` must survive past the frame that built it.
+	//
+	// The build's own scratch (the join builder) lives on context.temp_allocator
+	// and md_layout_build_for_test returns before any frame boundary would free
+	// it -- so an assertion made immediately after the call would still pass
+	// even if `cls.content` pointed straight at that scratch instead of at the
+	// owned `joined` clone (the exact lifetime bug menu_open_ctx's comment
+	// warns about for a different structure). free_all(context.temp_allocator)
+	// here, simulating the frame boundary a real layout survives into, before
+	// reading anything back, is what makes this able to fail on that bug.
+	@(private = "file")
+	pj_case_joins_text :: proc(bad: ^int) {
+		fmt.println("-- two prose lines become one paragraph, with a space at the join --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		d := pj_doc("alpha\nbeta\ngamma\n")
+		defer doc_close(&d)
+		lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+		defer md_layout_free(&lay)
+		free_all(context.temp_allocator)
+		li_chk(
+			bad,
+			lay.cls.content == "alpha beta gamma",
+			fmt.tprintf("content is %q (want \"alpha beta gamma\"), read after the temp arena that built it was freed", lay.cls.content),
+		)
+		li_chk(bad, lay.multiline, "the block is marked multiline")
+		// "alpha\nbeta\ngamma\n" is 17 bytes; gamma's newline sits at offset 16, so
+		// `end` (pt_line_end_cap semantics: the last line's newline byte) is 16 and
+		// `next` is one past it.
+		li_chk(bad, lay.end == 16, fmt.tprintf("end is %d (want 16, gamma's newline byte)", lay.end))
+		li_chk(bad, lay.next == 17, fmt.tprintf("next is %d (want 17, past gamma's newline)", lay.next))
+		li_chk(bad, len(lay.joined) > 0, fmt.tprintf("joined holds the owned clone (got %q)", lay.joined))
+
+		// The control: a blank line still separates, and a single-line paragraph
+		// is not marked multiline and does not allocate `joined`.
+		d2 := pj_doc("a\n\nb\n")
+		defer doc_close(&d2)
+		lay2 := md_layout_build_for_test(&h.gfx, &h.text, &d2, &m, 0, 600)
+		defer md_layout_free(&lay2)
+		li_chk(bad, lay2.cls.content == "a", fmt.tprintf("a blank line still separates (content %q, want \"a\")", lay2.cls.content))
+		li_chk(bad, !lay2.multiline, "a single-line paragraph is not multiline")
+		li_chk(bad, lay2.joined == "", fmt.tprintf("a single-line paragraph does not allocate joined (got %q)", lay2.joined))
+	}
+
+	// The cache itself: build the same block twice at the same width and
+	// revision, through md_layout_ensure (not md_layout_build -- that is the
+	// path under test). Without .Para being extern-dep, md_layout_ensure's
+	// `e.end != line_end` test compares against the FIRST line's end while the
+	// joined entry's `e.end` is the whole paragraph's end, so a joined block
+	// misses on every lookup and rebuilds every frame -- md_layout_builds is the
+	// only honest way to see that, since a correct cache and no cache at all
+	// return identical glyphs.
+	@(private = "file")
+	pj_case_cache_holds :: proc(bad: ^int) {
+		fmt.println("-- a joined block is not rebuilt every frame --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		d := pj_doc("alpha\nbeta\ngamma\n")
+		defer doc_close(&d)
+		defer md_layout_reset(&d)
+		before := md_layout_builds
+		l1 := md_layout_ensure_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+		li_chk(bad, l1.multiline, "the first call built a joined, multiline block")
+		mid := md_layout_builds
+		li_chk(bad, mid == before + 1, fmt.tprintf("the first call built exactly one block (builds went %d -> %d)", before, mid))
+		l2 := md_layout_ensure_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+		after := md_layout_builds
+		li_chk(bad, l2.cls.content == "alpha beta gamma", fmt.tprintf("the second call still returns the joined content (%q)", l2.cls.content))
+		li_chk(bad, after == mid, fmt.tprintf("the second call was a cache HIT (builds stayed at %d, got %d)", mid, after))
+	}
+
 	// S12 (`if pl_capped {trunc_back = true}`) has NO case here -- still
 	// deliberate, but round 2's reason for that ("cannot currently be true when
 	// reached through a legitimate loop iteration") was WRONG and has been
@@ -2439,6 +2524,8 @@ when NEWTPAD_TESTS {
 			pj_case_line_cap_truncates_forward(&bad)
 			pj_case_neighbor_capped_forces_capped(&bad)
 			pj_case_terminators(&bad)
+			pj_case_joins_text(&bad)
+			pj_case_cache_holds(&bad)
 		}
 		fmt.printfln("mdjointest: %d failures", bad)
 		if bad > 0 {os.exit(1)}
@@ -32839,11 +32926,12 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
-		// `newtpad mdjointest` -- one-argument, no path, sweepable. Today this
-		// covers md_para_bounds only, the single producer of a paragraph's extent
-		// -- the preview's paragraph join itself (the joined text, hard breaks,
-		// lazy continuation, setext) is a later task in this batch and does not
-		// exist yet.
+		// `newtpad mdjointest` -- one-argument, no path, sweepable. Covers
+		// md_para_bounds (the single producer of a paragraph's extent) and, as of
+		// this task, the layout join itself: consecutive prose lines becoming one
+		// re-flowed block and the cache holding across repeated md_layout_ensure
+		// calls. Hard breaks, lazy continuation and setext are later tasks in this
+		// batch and do not exist yet.
 		if os.args[1] == "mdjointest" {
 			para_join_test_run()
 			return true
