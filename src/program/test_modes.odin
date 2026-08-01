@@ -1885,6 +1885,7 @@ when NEWTPAD_TESTS {
 			ts_case_key_ops(&bad)
 			ts_case_toggle_secondary_cycle(&bad)
 			ts_case_menu_items(&bad)
+			ts_case_menu_dispatch(&bad)
 		}
 		fmt.printfln("tablesorttest: %d failures", bad)
 		if bad > 0 {os.exit(1)}
@@ -2613,25 +2614,29 @@ when NEWTPAD_TESTS {
 		return a
 	}
 
-	// C13: table_header_menu_items -- every row of the brief's table, in each of
-	// the four states it names: unsorted; sorted by the column the menu targets;
-	// sorted by a DIFFERENT column with room left under the cap; and the vector AT
-	// the cap with the targeted column not among its keys.
+	// C13: table_header_menu_items -- every row of the table, in each of five
+	// states: unsorted; sorted by the column the menu targets; sorted by a
+	// DIFFERENT column with room left under the cap; the vector AT the cap with
+	// the targeted column not among its keys; and the document out of the grid
+	// entirely, which is the state that pins the rows against command_dispatch's
+	// own doc.table guard.
 	//
 	// item_enabled is asserted DIRECTLY, not inferred from a simulated click --
 	// the brief's own instruction, because this menu is a discoverability surface
 	// (menu.odin's header comment): what a reader sees (grey or not) is the thing
 	// under test, not whether the command would have run.
 	//
-	// TABLE_SORT_KEYS_MAX+1 columns, not three or four written as literals: the
-	// smallest fixture that can fill the cap and still leave one column that is
-	// never a key, for the "vector full, this column not in it" state. The
-	// #assert matches ts_case_inverses' own guard and for the same reason -- a
-	// cap raised past what this fixture has columns for would silently start
-	// asking about a column that does not exist.
+	// The fixture is four columns wide, and `target` is TABLE_SORT_KEYS_MAX --
+	// one past the last column the "vector full" state below fills, so the
+	// targeted column is guaranteed never to be one of the cap's keys rather
+	// than coincidentally not one. That only works while TABLE_SORT_KEYS_MAX is
+	// a valid index into four columns, which is what the #assert pins: raise the
+	// cap past 3 and this proc would start asking about a column the fixture
+	// does not have, silently. Same guard shape and same reason as
+	// ts_case_inverses'.
 	@(private = "file")
 	ts_case_menu_items :: proc(bad: ^int) {
-		fmt.println("-- table_header_menu_items: every row's enabled state across four sort states --")
+		fmt.println("-- table_header_menu_items: every row's enabled state across five view/sort states --")
 		#assert(TABLE_SORT_KEYS_MAX <= 3)
 		src := "w,x,y,z\n1,a,p,i\n2,b,q,j\n3,a,r,i\n1,c,s,j\n2,a,t,i\n"
 		COLS :: 4
@@ -2649,10 +2654,12 @@ when NEWTPAD_TESTS {
 		// One state's worth of assertions, run against whatever sort the caller
 		// already built on `a`'s active document. `want_then_by` covers both
 		// Then-by rows: the brief gives them the identical predicate.
-		check :: proc(bad: ^int, label: string, a: ^App, want_then_by, want_remove, want_clear: bool) {
+		check :: proc(bad: ^int, label: string, a: ^App, want_sort, want_then_by, want_remove, want_clear: bool) {
 			items := table_header_menu_items
-			li_chk(bad, item_enabled(a, find(items, .Table_Sort_Asc)), fmt.tprintf("%s: Sort Ascending is enabled", label))
-			li_chk(bad, item_enabled(a, find(items, .Table_Sort_Desc)), fmt.tprintf("%s: Sort Descending is enabled", label))
+			got_as := item_enabled(a, find(items, .Table_Sort_Asc))
+			li_chk(bad, got_as == want_sort, fmt.tprintf("%s: Sort Ascending enabled == %v (got %v)", label, want_sort, got_as))
+			got_ds := item_enabled(a, find(items, .Table_Sort_Desc))
+			li_chk(bad, got_ds == want_sort, fmt.tprintf("%s: Sort Descending enabled == %v (got %v)", label, want_sort, got_ds))
 			got_ta := item_enabled(a, find(items, .Table_Sort_Then_Asc))
 			li_chk(bad, got_ta == want_then_by, fmt.tprintf("%s: Then by Ascending enabled == %v (got %v)", label, want_then_by, got_ta))
 			got_td := item_enabled(a, find(items, .Table_Sort_Then_Desc))
@@ -2668,7 +2675,17 @@ when NEWTPAD_TESTS {
 			a := ts_menu_app(src, COLS)
 			defer app_destroy(&a)
 			a.menu.ctx_col = target
-			check(bad, "unsorted", &a, false, false, false)
+			check(bad, "unsorted", &a, true, false, false, false)
+			// The other half of the reason rule, and the half that has teeth:
+			// "Then by" is disabled HERE too, but for a different reason -- there
+			// is no sort to add a tie-breaker to -- and menu_draw puts whatever
+			// this returns in the accelerator column of any greyed row. Without
+			// this assertion an item_disabled_reason that ignored state entirely
+			// still passed every check in this proc, and the unsorted row would
+			// have explained itself as a sort-key-cap limit that is not why it is
+			// dead.
+			why := item_disabled_reason(&a, find(table_header_menu_items, .Table_Sort_Then_Asc))
+			li_chk(bad, why == "", fmt.tprintf("unsorted: the dead Then-by row offers NO cap reason, because the cap is not why (%q)", why))
 		}
 
 		// -- sorted by the column the menu targets: every row lights up --
@@ -2678,7 +2695,7 @@ when NEWTPAD_TESTS {
 			d := app_active(&a)
 			table_sort_set(d, target, false)
 			a.menu.ctx_col = target
-			check(bad, "sorted by this column", &a, true, true, true)
+			check(bad, "sorted by this column", &a, true, true, true, true)
 		}
 
 		// -- sorted by a DIFFERENT column, one key live, room left under the cap:
@@ -2691,7 +2708,7 @@ when NEWTPAD_TESTS {
 			other := (target + 1) % COLS
 			table_sort_set(d, other, false)
 			a.menu.ctx_col = target
-			check(bad, "sorted by another column", &a, true, false, true)
+			check(bad, "sorted by another column", &a, true, true, false, true)
 		}
 
 		// -- the vector at the cap, this column not among its keys: Then-by is
@@ -2709,9 +2726,137 @@ when NEWTPAD_TESTS {
 			ok := table_sort_build(d, full[:])
 			li_chk(bad, ok, "precondition: the cap-filling build succeeds")
 			a.menu.ctx_col = target
-			check(bad, "vector full, this column not in it", &a, false, false, true)
+			check(bad, "vector full, this column not in it", &a, true, false, false, true)
 			why := item_disabled_reason(&a, find(table_header_menu_items, .Table_Sort_Then_Asc))
 			li_chk(bad, why != "", fmt.tprintf("...and the disabled Then-by row carries a reason rather than a bare grey-out (%q)", why))
+		}
+
+		// -- the document is not in the grid at all: every row dead, including
+		//    the two plain Sort rows. This is the state where the row's own
+		//    predicate is the ONLY thing that can grey it: command_allowed_on
+		//    says yes (none of the six mutates the document), so without an
+		//    enabled predicate matching command_dispatch's `doc.table` guard,
+		//    Sort Ascending/Descending paint live and silently do nothing. --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			d.table = false
+			a.menu.ctx_col = target
+			check(bad, "not in table view", &a, false, false, false, false)
+		}
+	}
+
+	// C14: the six commands act on the column the menu was opened on, through
+	// the real dispatch path -- menu_open_ctx, then the menu_close that
+	// menu_hit_test performs BEFORE returning the picked command, then
+	// command_dispatch. The close is the point of the test: it is where ctx_col
+	// used to be zeroed, so every row acted on column 0 while item_enabled had
+	// already greyed it for column N.
+	//
+	// The target column is deliberately non-zero (TABLE_SORT_KEYS_MAX, index 2
+	// of a four-column fixture). A fixture that targeted column 0 cannot fail
+	// against that bug at all -- the wrong answer and the right one coincide.
+	@(private = "file")
+	ts_case_menu_dispatch :: proc(bad: ^int) {
+		fmt.println("-- the six sort commands land on the column the menu was opened on --")
+		#assert(TABLE_SORT_KEYS_MAX <= 3)
+		src := "w,x,y,z\n1,a,p,i\n2,b,q,j\n3,a,r,i\n1,c,s,j\n2,a,t,i\n"
+		COLS :: 4
+		target := TABLE_SORT_KEYS_MAX
+		other := (TABLE_SORT_KEYS_MAX + 1) % COLS
+		dirs := [2]bool{false, true}
+
+		// One pick, start to finish: open the header menu on `col`, close it the
+		// way menu_hit_test does, then dispatch. `t` and the nil window are
+		// untouched by these six commands, the same way menutest drives
+		// .Menu_Close.
+		pick :: proc(a: ^App, cmd: Command_Id, col: int) {
+			t: plat.Text
+			menu_open_ctx(a, table_header_menu_items, 0, 0, col)
+			menu_close(a)
+			command_dispatch(cmd, {}, a, nil, &t, 10)
+		}
+
+		// -- Sort Ascending / Descending: one key, on THIS column, in the named
+		//    direction. Asserted through table_sort_key (which answers "at what
+		//    precedence", not "is anything sorted"), so a sort built on column 0
+		//    fails rather than passing on nkeys alone. --
+		for desc in dirs {
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			pick(&a, .Table_Sort_Desc if desc else .Table_Sort_Asc, target)
+			k, ok := table_sort_key(d, target)
+			li_chk(bad, ok && k == 0, fmt.tprintf("Sort %v: col %d is the primary key (ok %v, precedence %d)", "Descending" if desc else "Ascending", target, ok, k))
+			li_chk(bad, d.table_sort.nkeys == 1, fmt.tprintf("...and it is the ONLY key (nkeys %d)", d.table_sort.nkeys))
+			li_chk(bad, ok && d.table_sort.keys[0].desc == desc, fmt.tprintf("...in the direction the row names (desc %v, want %v)", d.table_sort.keys[0].desc, desc))
+		}
+
+		// -- Then by Ascending / Descending: appended BEHIND an existing key on a
+		//    different column, so precedence 1 is what pins the column as well as
+		//    the ordering -- a dispatch aimed at column 0 would land on `other`
+		//    (which is 0 whenever the cap is 3) or on a column that is already a
+		//    key, and either way not at precedence 1 on `target`. --
+		for desc in dirs {
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			table_sort_set(d, other, false)
+			pick(&a, .Table_Sort_Then_Desc if desc else .Table_Sort_Then_Asc, target)
+			k, ok := table_sort_key(d, target)
+			li_chk(bad, ok && k == 1, fmt.tprintf("Then by %v: col %d is the tie-breaker behind col %d (ok %v, precedence %d)", "Descending" if desc else "Ascending", target, other, ok, k))
+			li_chk(bad, d.table_sort.nkeys == 2, fmt.tprintf("...and the primary survived (nkeys %d)", d.table_sort.nkeys))
+			li_chk(bad, ok && d.table_sort.keys[1].desc == desc, fmt.tprintf("...in the direction the row names (desc %v, want %v)", d.table_sort.keys[1].desc, desc))
+		}
+
+		// -- Remove from Sort: drops THIS column and leaves the other one. Both
+		//    halves matter: a dispatch on column 0 would drop `other` instead
+		//    (whenever `other` is 0) or drop nothing at all. --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			keys := [2]Sort_Key{{col = other, desc = false}, {col = target, desc = false}}
+			li_chk(bad, table_sort_build(d, keys[:]), "precondition: a two-key sort over other+target builds")
+			pick(&a, .Table_Sort_Remove, target)
+			_, gone := table_sort_key(d, target)
+			_, kept := table_sort_key(d, other)
+			li_chk(bad, !gone, fmt.tprintf("Remove from Sort: col %d is no longer a key", target))
+			li_chk(bad, kept && d.table_sort.nkeys == 1, fmt.tprintf("...and col %d survives alone (kept %v, nkeys %d)", other, kept, d.table_sort.nkeys))
+		}
+
+		// -- Clear Sort: the one row with no column of its own. Included anyway,
+		//    because it is dispatched through the identical path and a regression
+		//    there would look like the others. --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			table_sort_set(d, target, false)
+			li_chk(bad, table_sorted(d), "precondition: a sort is live before Clear")
+			pick(&a, .Table_Sort_Clear, target)
+			li_chk(bad, !table_sorted(d) && d.table_sort.nkeys == 0, fmt.tprintf("Clear Sort: nothing is left sorted (nkeys %d)", d.table_sort.nkeys))
+		}
+
+		// -- and the dispatch guard: on a document that has left the grid, the
+		//    same pick builds nothing. command_dispatch's `doc.table` term is the
+		//    only thing refusing here -- none of the four Table_Sort operations
+		//    checks it, and table_sort_build would happily permute a document the
+		//    text view is about to charge table_sort_shift for on every edit. --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			d.table = false
+			pick(&a, .Table_Sort_Asc, target)
+			li_chk(bad, d.table_sort.nkeys == 0, fmt.tprintf("out of the grid: Sort Ascending builds no sort (nkeys %d)", d.table_sort.nkeys))
+			asc := Menu_Item{}
+			for it in table_header_menu_items {
+				if it.cmd == .Table_Sort_Asc {asc = it}
+			}
+			li_chk(bad, asc.cmd == .Table_Sort_Asc, "precondition: the Sort Ascending row is in the table")
+			li_chk(bad, !item_enabled(&a, asc), "...and the row was greyed out saying so, rather than painting live and no-oping")
 		}
 	}
 
@@ -6298,11 +6443,25 @@ when NEWTPAD_TESTS {
 			// longer than it ("Markdown files only" vs "Ctrl+M"). Sizing budgeted
 			// only for the shortcut, so a reason would have been clipped by
 			// exactly the width the shortcut used to need.
+			//
+			// Every dropdown means the context menus too, not just the bar's:
+			// dropdown_w takes an item slice precisely so ctx_items sizes through
+			// the same rule, and table_header_menu_items is the one menu whose
+			// widest row is a REASON rather than a chord (none of its six has a
+			// chord at all), so it exercises the half of the budget the bar menus
+			// mostly do not.
 			{
 				mt: plat.Text
 				plat.text_load_faces(&mt)
 				cw := plat.text_char_width(&mt, UI_PX)
-				for m in menus {
+				Dropdown :: struct {
+					title: string,
+					items: []Menu_Item,
+				}
+				drops := make([dynamic]Dropdown, context.temp_allocator)
+				for m in menus {append(&drops, Dropdown{m.title, m.items})}
+				append(&drops, Dropdown{"Column header", table_header_menu_items})
+				for m in drops {
 					w := dropdown_w(&mt, m.items)
 					worst := ""
 					need := f32(0)
