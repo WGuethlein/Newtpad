@@ -3293,6 +3293,446 @@ when NEWTPAD_TESTS {
 		li_chk(bad, lay.joined == "", fmt.tprintf("...and allocated no joined text (%q)", lay.joined[:min(len(lay.joined), 20)]))
 	}
 
+	// The kinds of every block in `d`, walked exactly the way md_walk walks: enter
+	// at byte 0 and follow each block's own `next`.
+	//
+	// The loop bound is `p <= d.pt.length`, which is md_walk's, so a fixture ending
+	// in a newline yields a trailing `.Blank` for the empty last line. That is not
+	// an artefact of this helper -- md_walk produces it too -- so the expectations
+	// below carry it rather than trimming it away.
+	//
+	// It exists so the setext cases can assert on WHAT IS LEFT OVER, which is the
+	// only thing that catches an extent stopping short of the underline: a promoted
+	// block with the right kind, level and text still leaves the underline behind as
+	// a `.Rule` block if `next` did not clear it, and every per-block assertion
+	// about the heading itself passes while that happens.
+	//
+	// One Md_Layout live at a time, per this file's standing rule -- each is freed
+	// before the next is built, and only the kind is carried out.
+	@(private = "file")
+	pj_kinds :: proc(h: ^Headless_Gpu, m: ^Md_Metrics, d: ^Document, allocator := context.allocator) -> []Md_Kind {
+		out := make([dynamic]Md_Kind, 0, 8, allocator)
+		p := 0
+		for p <= d.pt.length && len(out) < 16 {
+			lay := md_layout_build_for_test(&h.gfx, &h.text, d, m, p, 600)
+			append(&out, lay.cls.kind)
+			nxt := lay.next
+			md_layout_free(&lay)
+			if nxt <= p {break}
+			p = nxt
+		}
+		return out[:]
+	}
+
+	// SETEXT HEADINGS at the BOUNDS layer: `Title` over `===` is an h1 and over
+	// `---` an h2, the underline is part of the heading's run, and every entry into
+	// that run -- including one landing ON the underline -- gives the same answer.
+	//
+	// WHY THE ENTRY-INDEPENDENCE ROWS ARE THE POINT. md_para_run answers for line
+	// starts it has never been asked about, on the premise that every byte in its
+	// window yields identical bounds; md_block_start_at is the only thing that turns
+	// a scrolled-to byte into a walk entry. If the underline resolved to itself while
+	// a walk from above produced a heading covering it, the preview would draw a
+	// heading or a rule depending on where the pane happened to be scrolled -- the
+	// same divergence class that broke Split-view scroll sync earlier in this batch.
+	//
+	// The `=` and `-` rows are NOT redundant, and this is where an assertion could
+	// silently stop failing: md_classify has no rule for `=`, so `===` already reads
+	// as a paragraph line and the run ALREADY reached past it before this task --
+	// the extent row is vacuous for `=` and only the level, the kind and the text
+	// discriminate. `---` is `.Rule`, so it is the character for which the extent
+	// row can actually fail. Both are checked for both.
+	@(private = "file")
+	pj_case_setext_bounds :: proc(bad: ^int) {
+		fmt.println("-- a line of `=` or `-` under prose is that prose's heading --")
+		{
+			// "Title\n---\n": starts 0 and 6, the underline's newline at 9, length 10.
+			d := pj_doc("Title\n---\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := d.pt.length - 1
+			s, e, c, ok := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok && !c, fmt.tprintf("the prose line resolves as a run (ok=%v capped=%v)", ok, c))
+			li_chk(
+				bad, s == 0 && e == want_end,
+				fmt.tprintf("...whose extent COVERS the `---` underline (%d..%d, want 0..%d)", s, e, want_end),
+			)
+			// Entered ON the underline: same run, scanned the other way.
+			us, ue, uc, uok := md_para_bounds_for_test(&d, starts[1])
+			li_chk(
+				bad, uok && !uc && us == s && ue == e,
+				fmt.tprintf("entering AT the underline gives the same run (%d..%d, capped=%v, ok=%v; want %d..%d)", us, ue, uc, uok, s, e),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, starts[1]) == 0,
+				fmt.tprintf("...so the underline byte snaps back to the paragraph start (%d, want 0)", md_block_start_at(&d, starts[1])),
+			)
+		}
+		{
+			// The same for `=`, where the extent row above cannot fail (see the header):
+			// what discriminates here is that the run STOPS at the underline instead of
+			// carrying on into the prose below it.
+			d := pj_doc("Title\n===\nafter\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := starts[2] - 1 // the `===` line's own newline
+			s, e, c, ok := md_para_bounds_for_test(&d, 0)
+			li_chk(
+				bad, ok && !c && s == 0 && e == want_end,
+				fmt.tprintf("`===` ends the run it underlines (%d..%d, capped=%v, ok=%v; want 0..%d)", s, e, c, ok, want_end),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, starts[2]) == starts[2],
+				fmt.tprintf("...and the prose below it is its own block (%d, want %d)", md_block_start_at(&d, starts[2]), starts[2]),
+			)
+			_, _, lvl, lok := md_para_setext_for_test(&d, 0)
+			li_chk(bad, lok && lvl == 1, fmt.tprintf("...and `=` reports h1, not h2 (level %d, ok=%v)", lvl, lok))
+		}
+		{
+			// THE CAPPED DECISION, and it is the same one every capped run gets: the
+			// promotion is refused along with the extent, because md_para_run refuses
+			// the whole answer. The paragraph then renders line by line and the
+			// underline renders as whatever md_classify calls it on its own -- and the
+			// SNAP and the BUILDER agree about that because neither of them sees a
+			// `capped` flag to interpret.
+			//
+			// Driven through the real guard by lowering md_para_max_lines, as
+			// pj_case_budget_truncates and pj_case_capped_refuses already do. The cap is
+			// 2 against a 3-line run (two prose lines plus the underline), so the run is
+			// capped by exactly one line -- and the `md_para_max_lines = 3` control
+			// directly below shows the same fixture promoting when it is not.
+			d := pj_doc("Title\ncont\n---\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			old := md_para_max_lines
+			defer md_para_max_lines = old
+
+			md_para_max_lines = 3
+			li_chk(bad, md_block_start_at(&d, starts[2]) == 0, fmt.tprintf("at a 3-line cap the run still promotes (%d, want 0)", md_block_start_at(&d, starts[2])))
+
+			md_para_max_lines = 2
+			_, _, lvl, ok := md_para_setext_for_test(&d, 0)
+			li_chk(bad, !ok && lvl == 0, fmt.tprintf("a capped run reports no run and no level (level %d, ok=%v)", lvl, ok))
+			li_chk(
+				bad, md_block_start_at(&d, 0) == 0 && md_block_start_at(&d, starts[1]) == starts[1],
+				fmt.tprintf("...so its prose lines are their own blocks (%d, %d; want 0, %d)", md_block_start_at(&d, 0), md_block_start_at(&d, starts[1]), starts[1]),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, starts[2]) == starts[2],
+				fmt.tprintf("...and the underline is its own block, which is what the builder will draw as a rule (%d, want %d)", md_block_start_at(&d, starts[2]), starts[2]),
+			)
+		}
+		{
+			// ENTRY INDEPENDENCE, five entry points into one two-line setext block:
+			// the first line's start, mid-first-line, the underline's start,
+			// mid-underline, and the block's last byte.
+			//
+			// Two different claims, because the two layers answer differently by
+			// design. md_para_bounds/md_para_run answer only for real LINE STARTS (a
+			// mid-line entry is forced capped, which md_para_run turns into a refusal),
+			// so the three line starts must agree exactly. md_block_start_at snaps to
+			// the line start first and so must answer the SAME block start from all
+			// five -- and that is the property production actually depends on, since
+			// every resolver goes through it.
+			d := pj_doc("Title\ncont\n---\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := d.pt.length - 1
+			line_starts := []int{starts[0], starts[1], starts[2]}
+			for p, i in line_starts {
+				s, e, c, ok := md_para_bounds_for_test(&d, p)
+				li_chk(
+					bad, ok && !c && s == 0 && e == want_end,
+					fmt.tprintf("line start %d (byte %d) gives (%d..%d, capped=%v, ok=%v); want 0..%d", i, p, s, e, c, ok, want_end),
+				)
+				// The LEVEL is entry-independent too, and it is a separate claim: the
+				// prose entry reads it off the line below the run and the underline
+				// entry off the line it was entered at, so a `1` from one and a `2`
+				// from the other would render one block as an h1 from above and an h2
+				// from below.
+				ls, le, lvl, lok := md_para_setext_for_test(&d, p)
+				li_chk(
+					bad, lok && lvl == 2 && ls == 0 && le == want_end,
+					fmt.tprintf("...and reports h2 through the memo (level %d, %d..%d, ok=%v; want 2, 0..%d)", lvl, ls, le, lok, want_end),
+				)
+			}
+			every := []int{starts[0], starts[0] + 2, starts[2], starts[2] + 1, d.pt.length - 1}
+			for p, i in every {
+				li_chk(
+					bad, md_block_start_at(&d, p) == 0,
+					fmt.tprintf("entry %d (byte %d) snaps to the heading's start (%d, want 0)", i, p, md_block_start_at(&d, p)),
+				)
+			}
+		}
+		{
+			// THE SAME SNAP, COLD, and it needs its own Document because the memo
+			// hides the bug otherwise. Measured: with the underline entry deleted from
+			// md_para_bounds, the loop above still passed every row -- md_para_run had
+			// already stored the window [0..14] from the FIRST line's entry, and the
+			// underline byte fell inside it, so the memo answered 0 for a byte the
+			// producer would have refused. That is the whole failure mode in one
+			// observation: what a scrolled-to byte resolves to would depend on whether
+			// something above it had been laid out first.
+			//
+			// So this asks the underline FIRST, on a Document nothing has touched.
+			for off in 0 ..= 2 {
+				d := pj_doc("Title\ncont\n---\n")
+				defer doc_close(&d)
+				starts := pj_line_starts(&d)
+				defer delete(starts)
+				p := starts[2] + off
+				li_chk(
+					bad, md_block_start_at(&d, p) == 0,
+					fmt.tprintf("COLD, the underline byte %d snaps to the heading's start (%d, want 0)", p, md_block_start_at(&d, p)),
+				)
+			}
+		}
+		{
+			// COLD AND WARM, both warming orders. The memo stores a window measured
+			// from ONE entry and then answers for line starts inside it that the
+			// producer never ran at, so the entry that warms it must not decide the
+			// answer. This warms from the UNDERLINE -- the entry that skips the forward
+			// scan entirely -- and then reads the first line out of that window.
+			d := pj_doc("Title\ncont\n---\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := d.pt.length - 1
+			ws, we, wlvl, wok := md_para_setext_for_test(&d, starts[2])
+			li_chk(bad, wok && ws == 0 && we == want_end && wlvl == 2, fmt.tprintf("warming the memo AT the underline gives the whole run (%d..%d, level %d, ok=%v; want 0..%d, level 2)", ws, we, wlvl, wok, want_end))
+			ms, me, mlvl, mok := md_para_setext_for_test(&d, 0)
+			li_chk(bad, mok && ms == 0 && me == want_end && mlvl == 2, fmt.tprintf("...and the first line reads the same out of that window (%d..%d, level %d, ok=%v)", ms, me, mlvl, mok))
+		}
+		{
+			// The opposite warming order, in its own Document so the memo really is
+			// cold at the first call.
+			d := pj_doc("Title\ncont\n---\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := d.pt.length - 1
+			ws, we, wlvl, wok := md_para_setext_for_test(&d, 0)
+			li_chk(bad, wok && ws == 0 && we == want_end && wlvl == 2, fmt.tprintf("warming at the FIRST line gives the whole run (%d..%d, level %d, ok=%v; want 0..%d, level 2)", ws, we, wlvl, wok, want_end))
+			ms, me, mlvl, mok := md_para_setext_for_test(&d, starts[2])
+			li_chk(bad, mok && ms == 0 && me == want_end && mlvl == 2, fmt.tprintf("...and the underline reads the same out of that window (%d..%d, level %d, ok=%v)", ms, me, mlvl, mok))
+		}
+		{
+			// THE DISAMBIGUATIONS. Each of these is a `-` or `=` line that must NOT be
+			// read as an underline, and each is a different reason. Without them the
+			// promotion is satisfied by "any `---` joins whatever is above it", which
+			// would eat every thematic break in every document.
+			cases := []struct {
+				src, label: string,
+				under_line: int, // index into pj_line_starts of the `---` line
+			} {
+				{"para\n\n---\n", "a blank line above it", 2},
+				{"- item\n---\n", "a list item above it", 1},
+				{"> quote\n---\n", "a blockquote above it", 1},
+				{"- item\ncont\n---\n", "a lazily continued list item above it", 2},
+				{"# atx\n---\n", "an ATX heading above it", 1},
+				{"***\n---\n", "another rule above it", 1},
+			}
+			for c in cases {
+				d := pj_doc(c.src)
+				defer doc_close(&d)
+				starts := pj_line_starts(&d)
+				defer delete(starts)
+				u := starts[c.under_line]
+				li_chk(
+					bad, md_block_start_at(&d, u) == u,
+					fmt.tprintf("`---` with %s is its own block (%d, want %d)", c.label, md_block_start_at(&d, u), u),
+				)
+			}
+		}
+		{
+			// A `---` at byte 0 with nothing above it at all.
+			d := pj_doc("---\npara\n")
+			defer doc_close(&d)
+			li_chk(bad, md_block_start_at(&d, 0) == 0, fmt.tprintf("a `---` on the first line is its own block (%d)", md_block_start_at(&d, 0)))
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			li_chk(bad, md_block_start_at(&d, starts[1]) == starts[1], fmt.tprintf("...and the prose under it is too (%d, want %d)", md_block_start_at(&d, starts[1]), starts[1]))
+		}
+		{
+			// FRONT MATTER, which is `---` over prose over `---` and must not be read
+			// as two setext headings. md_block_start_at answers 0 for every byte inside
+			// the card, ahead of any run question.
+			d := pj_doc("---\na: 1\nb: 2\n---\n\nBody\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			fm_end, fm_inner := md_front_matter_end(&d)
+			li_chk(bad, fm_inner == 2, fmt.tprintf("the front-matter card still counts 2 inner lines (%d)", fm_inner))
+			li_chk(bad, fm_end == starts[4], fmt.tprintf("...and ends past its closing fence (%d, want %d)", fm_end, starts[4]))
+			for li in 0 ..= 3 {
+				li_chk(
+					bad, md_block_start_at(&d, starts[li]) == 0,
+					fmt.tprintf("...so line %d of it resolves to the card, not to a heading (%d)", li, md_block_start_at(&d, starts[li])),
+				)
+			}
+			li_chk(bad, md_block_start_at(&d, starts[5]) == starts[5], fmt.tprintf("...and the body after it is its own block (%d, want %d)", md_block_start_at(&d, starts[5]), starts[5]))
+		}
+	}
+
+	// SETEXT HEADINGS at the LAYOUT layer: the promoted block is a `.Heading` of the
+	// right level, carrying the prose and NOT the underline, and consuming the
+	// underline's bytes so nothing is left to draw a rule with.
+	//
+	// pj_kinds is what makes that last clause testable. Every other row here is
+	// satisfied by a block that is a perfectly good heading and stops one line short.
+	@(private = "file")
+	pj_case_setext_layout :: proc(bad: ^int) {
+		fmt.println("-- a setext heading is one .Heading block, underline included --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		// The reference an h1 and an h2 must MEASURE like: the ATX heading of the same
+		// level, built by the same branch. A promotion that copied the heading branch
+		// instead of reaching it would drift from these.
+		//
+		// `h` and `above`, NOT `px`: Md_Layout.px is the metrics scale the block was
+		// baked at (part of the cache key), the same 16 for every kind here, so an
+		// assertion on it could not fail. The block's height is what the heading
+		// branch's type size, leading and h1/h2 rule actually land in.
+		atx1_above, atx1_h, atx2_h := f32(0), f32(0), f32(0)
+		{
+			d := pj_doc("# Title\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			atx1_above, atx1_h = lay.above, lay.h
+			li_chk(bad, lay.cls.kind == .Heading && lay.cls.level == 1, fmt.tprintf("the ATX reference is an h1 (%v, level %d)", lay.cls.kind, lay.cls.level))
+		}
+		{
+			d := pj_doc("## Title\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			atx2_h = lay.h
+			li_chk(bad, lay.cls.level == 2, fmt.tprintf("the ATX h2 reference is level 2 (%d)", lay.cls.level))
+		}
+		li_chk(bad, atx1_h != atx2_h, fmt.tprintf("an h1 and an h2 are different heights at all (%v vs %v), so the level rows below can fail", atx1_h, atx2_h))
+		{
+			d := pj_doc("Title\n===\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			free_all(context.temp_allocator)
+			li_chk(bad, lay.cls.kind == .Heading, fmt.tprintf("`===` promotes the paragraph to a heading (%v, want .Heading)", lay.cls.kind))
+			li_chk(bad, lay.cls.level == 1, fmt.tprintf("...an h1 (level %d)", lay.cls.level))
+			li_chk(bad, lay.cls.content == "Title", fmt.tprintf("...whose text is the prose and not the underline (%q, want \"Title\")", lay.cls.content))
+			li_chk(bad, lay.multiline, "...marked multiline, so the cache keys it on the revision")
+			li_chk(bad, lay.end == d.pt.length - 1, fmt.tprintf("...ending at the underline's newline (%d, want %d)", lay.end, d.pt.length - 1))
+			li_chk(bad, lay.next == d.pt.length, fmt.tprintf("...and continuing past it (next %d, want %d)", lay.next, d.pt.length))
+			// Reached the heading branch rather than a copy of it.
+			li_chk(bad, lay.above == atx1_above, fmt.tprintf("...with the h1 space above (%v, want %v)", lay.above, atx1_above))
+			li_chk(bad, lay.h == atx1_h, fmt.tprintf("...and the h1 height, rule included (%v, want %v)", lay.h, atx1_h))
+		}
+		{
+			d := pj_doc("Title\n---\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			free_all(context.temp_allocator)
+			li_chk(bad, lay.cls.kind == .Heading && lay.cls.level == 2, fmt.tprintf("`---` promotes to an h2 (%v, level %d)", lay.cls.kind, lay.cls.level))
+			li_chk(bad, lay.cls.content == "Title", fmt.tprintf("...whose text is the prose (%q)", lay.cls.content))
+			li_chk(bad, lay.h == atx2_h, fmt.tprintf("...and the h2's own height, not the h1's (%v, want %v)", lay.h, atx2_h))
+		}
+		{
+			// Several prose lines under one underline: the paragraph run joins first
+			// and the whole run is the heading.
+			d := pj_doc("one\ntwo\n===\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			free_all(context.temp_allocator)
+			li_chk(bad, lay.cls.content == "one two", fmt.tprintf("a multi-line setext heading joins its prose (%q, want \"one two\")", lay.cls.content))
+			li_chk(bad, lay.next == d.pt.length, fmt.tprintf("...and still clears the underline (next %d, want %d)", lay.next, d.pt.length))
+		}
+		{
+			// THE EXTENT, stated as what is left over. A promoted block whose `next`
+			// stopped at the paragraph's end leaves the underline behind and the walk
+			// draws a `.Rule` under the heading.
+			d := pj_doc("Title\n---\n")
+			defer doc_close(&d)
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 2 && kinds[0] == .Heading && kinds[1] == .Blank,
+				fmt.tprintf("the whole document is ONE heading block, with no rule left under it (%v, want [Heading Blank])", kinds),
+			)
+		}
+		{
+			// The control for that row: a `---` that really is a thematic break still
+			// produces one, so the row above is not satisfied by never emitting rules.
+			d := pj_doc("para\n\n---\n")
+			defer doc_close(&d)
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 4 && kinds[0] == .Para && kinds[1] == .Blank && kinds[2] == .Rule && kinds[3] == .Blank,
+				fmt.tprintf("a `---` after a blank line is still a rule (%v, want [Para Blank Rule Blank])", kinds),
+			)
+		}
+		{
+			// An ATX heading is never promoted: `# atx` over `===` is a heading and
+			// then a paragraph reading `===`, which is what CommonMark says.
+			d := pj_doc("# atx\n===\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 3 && kinds[0] == .Heading && kinds[1] == .Para && kinds[2] == .Blank,
+				fmt.tprintf("an ATX heading does not absorb the `===` below it (%v, want [Heading Para Blank])", kinds),
+			)
+		}
+		{
+			// A list item with a `---` under it: the item, then a rule.
+			d := pj_doc("- item\n---\n")
+			defer doc_close(&d)
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 3 && kinds[0] == .List && kinds[1] == .Rule && kinds[2] == .Blank,
+				fmt.tprintf("a `---` under a list item is a rule, not that item's heading (%v, want [List Rule Blank])", kinds),
+			)
+		}
+		{
+			// THE CAPPED DECISION at the layout layer, the other half of the row
+			// pj_case_setext_bounds makes about the snap. A capped run is not promoted,
+			// so the prose stays a `.Para` per line and the underline draws as the rule
+			// md_classify calls it in isolation -- and the two answers agree because
+			// both come from md_para_run's one refusal.
+			d := pj_doc("Title\ncont\n---\n")
+			defer doc_close(&d)
+			old := md_para_max_lines
+			defer md_para_max_lines = old
+			md_para_max_lines = 2
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 4 && kinds[0] == .Para && kinds[1] == .Para && kinds[2] == .Rule && kinds[3] == .Blank,
+				fmt.tprintf("a capped run is not promoted (%v, want [Para Para Rule Blank])", kinds),
+			)
+		}
+		{
+			// Front matter still draws as a card and the body after it is untouched.
+			d := pj_doc("---\na: 1\n---\nBody\n")
+			defer doc_close(&d)
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 3 && kinds[0] == .Front_Matter && kinds[1] == .Para && kinds[2] == .Blank,
+				fmt.tprintf("front matter is still a card followed by its body (%v, want [Front_Matter Para Blank])", kinds),
+			)
+		}
+	}
+
 	// One-argument and non-zero on failure, per the keytest/resavetest incident: a
 	// mode nothing runs is worse than no mode.
 	@(private = "file")
@@ -3325,6 +3765,8 @@ when NEWTPAD_TESTS {
 			pj_case_memo_matches_producer(&bad)
 			pj_case_cache_holds(&bad)
 			pj_case_cache_sees_growth(&bad)
+			pj_case_setext_bounds(&bad)
+			pj_case_setext_layout(&bad)
 		}
 		fmt.printfln("mdjointest: %d failures", bad)
 		if bad > 0 {os.exit(1)}
