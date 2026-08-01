@@ -3018,6 +3018,62 @@ when NEWTPAD_TESTS {
 	// only honest way to see that, since a correct cache and no cache at all
 	// return identical glyphs.
 	@(private = "file")
+	// A block that BECOMES multiline must not be served from the slot it filled
+	// while it was still single-line.
+	//
+	// This is the live-editing half of the cache question, and pj_case_cache_holds
+	// below cannot see it: that case never edits, so every lookup it makes is
+	// against a document whose bytes have not moved. Found by a 2026-08-01 review
+	// and reproduced through md_layout_ensure for all three joining kinds before
+	// the guard existed:
+	//
+	//   STALE[para]:  before multi=false "alpha" | after multi=false "alpha"
+	//   STALE[list]:  before multi=false "item"  | after multi=false "item"
+	//   STALE[quote]: before multi=false "q"     | after multi=false "q"
+	//
+	// The mechanism: a single-line block has multiline = false, so keying extern
+	// dependence on that flag left it keyed on `e.src != line || e.end != line_end`
+	// -- and appending a line BELOW the block changes neither. In Split view,
+	// typing a continuation under a bullet redrew the item unjoined and dropped the
+	// new line out as a stray .Para at indent 0, which is the exact defect lazy
+	// continuation exists to fix.
+	//
+	// Asserted per KIND rather than once, because md_kind_joins names three and a
+	// single-kind case would pass with two of them dropped from it.
+	pj_case_cache_sees_growth :: proc(bad: ^int) {
+		fmt.println("-- a block that becomes multiline is not served stale --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		grow :: proc(bad: ^int, h: ^Headless_Gpu, m: ^Md_Metrics, seed, tail, want: string, label: string) {
+			d := pj_doc(seed)
+			defer doc_close(&d)
+			defer md_layout_reset(&d)
+			// Fill the slot while the block is still single-line -- the whole point.
+			l1 := md_layout_ensure_for_test(&h.gfx, &h.text, &d, m, 0, 600)
+			li_chk(bad, !l1.multiline, fmt.tprintf("%s: the block starts single-line (multiline=%v)", label, l1.multiline))
+
+			// Append through the real edit path, so doc.revision moves the way a
+			// keystroke moves it rather than by being set here.
+			d.cursor = d.pt.length
+			d.anchor = d.cursor
+			doc_insert_text(&d, transmute([]u8)tail, .Type)
+
+			l2 := md_layout_ensure_for_test(&h.gfx, &h.text, &d, m, 0, 600)
+			li_chk(bad, l2.multiline, fmt.tprintf("%s: it is multiline after the append (got %v)", label, l2.multiline))
+			li_chk(bad, l2.cls.content == want, fmt.tprintf("%s: content is %q (want %q)", label, l2.cls.content, want))
+		}
+
+		grow(bad, &h, &m, "alpha\n", "beta\n", "alpha beta", "para")
+		grow(bad, &h, &m, "- item\n", "cont\n", "item cont", "list")
+		grow(bad, &h, &m, "> q\n", "cont\n", "q cont", "quote")
+	}
+
 	pj_case_cache_holds :: proc(bad: ^int) {
 		fmt.println("-- a joined block is not rebuilt every frame --")
 		h: Headless_Gpu
@@ -3268,6 +3324,7 @@ when NEWTPAD_TESTS {
 			pj_case_overlong_line(&bad)
 			pj_case_memo_matches_producer(&bad)
 			pj_case_cache_holds(&bad)
+			pj_case_cache_sees_growth(&bad)
 		}
 		fmt.printfln("mdjointest: %d failures", bad)
 		if bad > 0 {os.exit(1)}

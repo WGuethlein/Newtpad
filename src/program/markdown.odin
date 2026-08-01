@@ -2715,7 +2715,40 @@ Md_Layout :: struct {
 // which this signature was originally shaped for. See Md_Layout.multiline.
 @(private = "file")
 md_layout_extern_dep :: #force_inline proc(e: ^Md_Layout) -> bool {
-	return e.cls.kind == .Table || e.cls.kind == .Blank || e.cls.kind == .Front_Matter || e.multiline
+	return(
+		e.cls.kind == .Table ||
+		e.cls.kind == .Blank ||
+		e.cls.kind == .Front_Matter ||
+		e.multiline \
+	)
+}
+
+// The kinds whose EXTENT can depend on bytes below their own first line, whether
+// or not this particular block currently joins anything.
+//
+// `e.multiline` alone is not enough, and the difference is a live-editing bug
+// (2026-08-01 review). A block cached as single-line has multiline = false, so
+// keying on that flag leaves it keyed on `e.src != line || e.end != line_end` --
+// and NEITHER of those changes when a line is appended BELOW it. Typing a
+// continuation under a bullet in Split view therefore hit the stale slot: the
+// item redrew unjoined, and the new line came back as a stray .Para at indent 0,
+// which is the exact defect lazy continuation exists to fix. Reproduced through
+// md_layout_ensure for all three kinds before this guard existed.
+//
+// md_layout_reset runs only from doc_close and MD_LAYOUT_SLOTS is 256 under LRU,
+// so a stale entry survived until scrolling happened to evict it.
+//
+// `multiline` is still consulted above because a SETEXT heading is a .Heading --
+// a kind that does not join -- whose layout read the underline below it.
+//
+// These kinds are deliberately NOT made extern-dep by this predicate. Doing that
+// was the first fix for the stale-cache bug and it cost too much: an edit anywhere
+// invalidated every paragraph on screen, taking mdtest's "a one-byte edit rebuilds
+// exactly ONE block, not the document" from 1 to 4. The cache asks md_join_end for
+// the block's real extent instead.
+@(private = "file")
+md_kind_joins :: #force_inline proc(k: Md_Kind) -> bool {
+	return k == .Para || k == .List || k == .Quote
 }
 
 md_layout_free :: proc(e: ^Md_Layout) {
@@ -2861,10 +2894,37 @@ md_split_bare_links :: proc(out: ^[dynamic]Md_Draft_Span, d: Md_Draft_Span, text
 // the preview drew from line 0 while the editor sat at line 100. With the snap in
 // place it never fires in production (mdtest is green with it removed);
 // mdjointest's mid-run rows drive it directly.
+// The byte a block starting at `p` ends at, given the run below it -- `line_end`
+// when nothing joins, the run's end when something does.
+//
+// THE single answer to "does this block join, and how far", and it has two askers
+// for a reason. md_join_run asks it when it BUILDS the block; md_layout_ensure
+// asks it when it decides whether a cached block is still current. Those two must
+// agree, and before this existed they could not: the cache compared `e.end`
+// against `line_end`, which is the extent of the block's own line and says nothing
+// about the lines below it. A block cached while single-line therefore survived
+// the append that should have joined it -- typing a continuation under a bullet in
+// Split view redrew the item unjoined and dropped the new line out as a stray
+// .Para at indent 0 (2026-08-01 review).
+//
+// The first fix tried was making every joining kind revision-keyed. That is
+// correct and too coarse: mdtest's "a one-byte edit rebuilds exactly ONE block,
+// not the document" went from 1 to 4, because an edit anywhere invalidated every
+// paragraph on screen. Asking for the block's actual extent keeps that property --
+// only a block whose own run moved rebuilds -- and costs one md_para_run call,
+// which is memoised.
+@(private = "file")
+md_join_end :: proc(doc: ^Document, p, line_end: int) -> int {
+	ps, pe, pok := md_para_run(doc, p)
+	if !pok || ps != p || pe <= line_end {return line_end}
+	return pe
+}
+
 @(private = "file")
 md_join_run :: proc(doc: ^Document, e: ^Md_Layout, p, line_end: int, buf: []u8) {
-	ps, pe, pok := md_para_run(doc, p)
-	if !pok || ps != p || pe <= line_end {return}
+	pe := md_join_end(doc, p, line_end)
+	if pe == line_end {return}
+	ps := p
 	sb := strings.builder_make(context.temp_allocator)
 	q := ps
 	head := true
@@ -3352,11 +3412,17 @@ md_layout_ensure :: proc(
 		if e.in_fence != in_fence || e.fence_lex != fence_lex || e.fence_state != fence_state {continue}
 		if md_layout_extern_dep(&e) {
 			if e.revision != doc.revision {continue}
-		} else if e.src != line || e.end != line_end {
-			// `e.end != line_end` is NOT redundant with `e.src != line`: md_pass
+		} else {
+			// The extent this block would have RIGHT NOW. For the joining kinds
+			// that is a function of the lines BELOW it, which `line` cannot
+			// witness -- so asking md_join_end is what stops a block cached while
+			// single-line from surviving the append that should have joined it.
+			// Same producer md_join_run builds from; see its comment.
+			want_end := md_join_end(doc, p, line_end) if md_kind_joins(e.cls.kind) else line_end
+			// `e.end != want_end` is NOT redundant with `e.src != line`: md_pass
 			// strips the trailing \r, so a CRLF -> LF conversion leaves `src`
 			// identical and every extent one byte shorter. See MD_LAYOUT_SLOTS.
-			continue
+			if e.src != line || e.end != want_end {continue}
 		}
 		e.used = md_layout_pass
 		return &e
