@@ -503,6 +503,18 @@ menu_step :: proc(app: ^App, mi, from, dir: int) -> int {
 }
 
 menu_open_at :: proc(app: ^App, mi: int) {
+	// A bar dropdown and the context menu must never both be "open" at once:
+	// menu_items and menu_origin test `ctx` before `open`, so leaving ctx set
+	// here left open==0 && ctx==true reachable -- commands.odin's Ctx.Menu
+	// keyboard routing calls this with `open < 0` as its only test, which is
+	// true for a context menu too (ctx never touches `open`), so a stray key
+	// while a context menu was up silently swapped it for File's dropdown
+	// while still reading ctx_items for the draw and hit-test. Clearing
+	// ctx_items and ctx_col alongside ctx matches menu_close, so no stale
+	// slice or column survives into the bar menu.
+	app.menu.ctx = false
+	app.menu.ctx_items = nil
+	app.menu.ctx_col = 0
 	app.menu.mode = true
 	app.menu.open = clamp(mi, 0, len(menus) - 1)
 	app.menu.item = menu_step(app, app.menu.open, 0, 1)
@@ -512,11 +524,18 @@ menu_open_at :: proc(app: ^App, mi: int) {
 
 // Open a context menu at (x, y), the point the caller measured before
 // clamping — menu_dropdown_rect applies the window clamp when it draws, not
-// here. Not wired to any input path yet: Task 5 supplies the table header's
-// items and the right-click that calls this. `items` is not copied; the
-// caller owns it for at least as long as the menu stays open (Task 5's rows
-// are a package-level table like `menus`, not a per-frame temp allocation, so
-// this holds the same way app.menu.open holding an index into `menus` does).
+// here. Not wired to any input path yet: a later task supplies the table
+// header's items and the right-click that calls this.
+//
+// `items` is not copied, so the caller must pass a slice that outlives the
+// menu. main.odin's frame loop calls free_all(context.temp_allocator) once
+// per frame, and a menu by definition survives into the NEXT frame's draw
+// and hit-test -- so a slice built from context.temp_allocator and stored
+// here dangles the moment that free_all runs. The caller must pass a
+// package-level []Menu_Item (like `menus`) or one owned by App, never a
+// temp_allocator build. Menu_Item holds only a Command_Id and two procedure
+// pointers (no strings), so only the slice's backing store is at risk here,
+// not anything it points to.
 menu_open_ctx :: proc(app: ^App, items: []Menu_Item, x, y: f32, col: int) {
 	app.menu.mode = false
 	app.menu.open = -1
@@ -713,12 +732,19 @@ menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0,
 	ox, oy := menu_origin(t, app)
 	w = dropdown_w(t, items)
 	for it in items {h += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
-	// Clamped to the window: a client-space quad cannot leave it, and items drawn
-	// outside would be invisible but still clickable. When it doesn't fit, the
-	// dropdown scrolls rather than truncating (see menu.top). Applies to a
-	// context menu's ctx_x/ctx_y exactly as it does to the bar's anchor — a
-	// header menu raised near the right or bottom edge is the case this clamp
-	// exists for, since the bar's own anchor is never near the bottom.
+	// Clamped to the window, but the two axes are not the same kind of clamp.
+	// x0 REPOSITIONS: an anchor too close to the right edge slides the whole
+	// dropdown left so it still fits. h only CAPS height from the origin down
+	// — an anchor near the bottom does not flip the dropdown upward or scroll
+	// it into view, it just shrinks toward one row, which floors at
+	// MENU_ITEM_H and is drawn mostly off the bottom edge (not a click hazard:
+	// menu_item_at requires my < height, so the hidden part is not
+	// clickable — this is a visibility bug, not a safety one). A flip-up is
+	// owed if a context-menu anchor is ever near the bottom; it is not
+	// implemented. Column headers (the intended caller) sit at the top of the
+	// grid, so today's only caller of ctx_x/ctx_y does not reach this case —
+	// that is why leaving it uncapped-vertically is acceptable, not why it is
+	// fixed.
 	h = min(h, max(MENU_ITEM_H, height - oy - sx(4)))
 	x0 = min(ox, max(0, width - w))
 	return

@@ -1779,7 +1779,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 
 	case .Menu_Activate:
 		if app.menu.open >= 0 && app.menu.item >= 0 {
-			it := menus[app.menu.open].items[app.menu.item]
+			// Through menu_items(app), not menus[app.menu.open].items directly --
+			// one item source for the whole menu package, so a future context-menu
+			// row can never be read through the bar-menu index or vice versa.
+			it := menu_items(app)[app.menu.item]
 			menu_close(app) // close first: the item may open the palette
 			command_dispatch(it.cmd, ev, app, w, t, rows)
 		}
