@@ -84,8 +84,9 @@ Command_Id :: enum u8 {
 	Sort_Lines,
 	Sort_Lines_Desc,
 	Remove_Duplicate_Lines,
-	// The table header's context menu (Task 5/6). Dispatched against
-	// app.menu.ctx_col -- the column the menu was opened on -- because there is
+	// The table header's context menu (menu.odin's table_header_menu_items).
+	// Dispatched against app.menu.ctx_col -- the column the menu was opened on,
+	// which menu_close deliberately preserves past the row's pick -- because there is
 	// no persistent "current column" in the table view outside an open cell
 	// edit (table_edit_col). Excluded from the palette below for exactly that
 	// reason: the palette has no column to name.

@@ -118,15 +118,28 @@ is_eol_lf :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.
 @(private = "file")
 is_eol_crlf :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.eol == .CRLF}
 
-// The header context menu's predicates (Task 5). All four read the target
-// column off app.menu.ctx_col rather than taking a parameter -- Menu_Item.enabled
-// takes only the app -- which is why this menu's rows are checked against a
-// context column and the bar's never are.
+// The header context menu's predicates. All of them read the target column off
+// app.menu.ctx_col rather than taking a parameter -- Menu_Item.enabled takes
+// only the app -- which is why this menu's rows are checked against a context
+// column and the bar's never are.
+//
+// Every one of them has to agree with command_dispatch's own `doc != nil &&
+// doc.table` guard on the six commands, or a row paints live and no-ops: the
+// divergence between what is drawn and what runs that Menu_Item.enabled exists
+// to prevent. table_sorted already carries the doc.table term itself (table.odin
+// documents why), so has_live_sort and can_then_by inherit the agreement;
+// in_table_view is what the two plain Sort rows and is_sort_key_col need,
+// because table_sort_key answers about the key vector alone and would say yes
+// on a document that has left the grid with keys still set.
+@(private = "file")
+in_table_view :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.table}
+
 @(private = "file")
 has_live_sort :: proc(app: ^App) -> bool {return table_sorted(app_active(app))}
 
 @(private = "file")
 is_sort_key_col :: proc(app: ^App) -> bool {
+	if !in_table_view(app) {return false}
 	_, ok := table_sort_key(app_active(app), app.menu.ctx_col)
 	return ok
 }
@@ -283,9 +296,11 @@ menus := []Menu {
 	},
 }
 
-// The table header's context menu (right-click / chevron on a column header --
-// Task 6 wires the gesture; this is only its contents). menu_open_ctx is the
-// OTHER caller of the dropdown machinery `menus` above feeds, and its own
+// The table header's context menu: its contents only. Nothing here opens it --
+// the gesture that does must go through menu_open_ctx, which is the only writer
+// of ctx_col and therefore the only thing that can aim these rows at a column.
+// menu_open_ctx is the OTHER caller of the dropdown machinery `menus` above
+// feeds, and its own
 // comment explains why this has to be a package-level slice rather than
 // something built per-open: a menu survives into the frame after the one that
 // opened it, and main.odin's free_all(context.temp_allocator) runs once every
@@ -299,8 +314,8 @@ menus := []Menu {
 // "Clear". Nothing here writes doc.table_sort itself -- every row calls one of
 // those four, which is the only thing allowed to.
 table_header_menu_items := []Menu_Item {
-	{cmd = .Table_Sort_Asc},
-	{cmd = .Table_Sort_Desc},
+	{cmd = .Table_Sort_Asc, enabled = in_table_view},
+	{cmd = .Table_Sort_Desc, enabled = in_table_view},
 	sep,
 	{cmd = .Table_Sort_Then_Asc, enabled = can_then_by},
 	{cmd = .Table_Sort_Then_Desc, enabled = can_then_by},
@@ -331,7 +346,12 @@ Menu_State :: struct {
 	ctx_items: []Menu_Item,
 	ctx_x:     f32, // anchor, top-left, before menu_dropdown_rect's edge clamp
 	ctx_y:     f32,
-	ctx_col:   int, // table column this menu targets; read by Task 5, not here
+	// The table column the context menu targets. Written by exactly two procs --
+	// menu_open_ctx sets it, menu_open_at clears it -- and read by the six
+	// Table_Sort commands in command_dispatch, which run AFTER the menu that
+	// picked them has been closed. That ordering is why menu_close must not
+	// clear it; see menu_close.
+	ctx_col:   int,
 }
 
 // Must be called before the first frame: the zero value of `open` is 0, which
@@ -352,13 +372,26 @@ menu_init :: proc(m: ^Menu_State) {
 	m.ctx_col = 0
 }
 
+// Deliberately does NOT clear ctx_col, and this is the whole of why: both routes
+// from a picked row to its command close the menu FIRST and dispatch second --
+// menu_hit_test evaluates item_enabled, calls this, and returns the command for
+// main.odin to dispatch; .Menu_Activate does the same in commands.odin because
+// the item may open the palette. Clearing here therefore aimed every one of the
+// six Table_Sort commands at column 0 while item_enabled had already greyed the
+// row for column N, which is exactly the draw-disagrees-with-effect divergence
+// Menu_Item.enabled exists to prevent.
+//
+// Leaving it set is safe because nothing can read a stale value: the predicates
+// and item_disabled_reason only run while a dropdown holding those rows is open,
+// menu_open_ctx overwrites it on every open, menu_open_at clears it, and the six
+// commands are reachable from no other route -- no bar row carries them, the
+// palette excludes them (palette.odin) and none has a default chord.
 menu_close :: proc(app: ^App) {
 	app.menu.mode = false
 	app.menu.open = -1
 	app.menu.item = -1
 	app.menu.ctx = false
 	app.menu.ctx_items = nil
-	app.menu.ctx_col = 0
 }
 
 // Covers `ctx` as well as the bar: without it, a click outside a context menu
