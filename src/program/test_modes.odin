@@ -1841,11 +1841,18 @@ when NEWTPAD_TESTS {
 	// So the fixtures are tiny and the expected orders are written out by hand as
 	// literals. Nothing here recomputes an expectation from the sort's own comparator
 	// or its own arrays: development-loop.md §4 warns that comparing two derivations
-	// of the same expression passes with the bug present, and the four sabotages this
+	// of the same expression passes with the bug present, and the five sabotages this
 	// mode was written against (drop every key past the first; walk the keys in
 	// reverse precedence; take a column's type from doc.table_align; drop the
-	// empty-last rule on the secondary keys) all produce a *plausible* order. A
-	// literal is the only thing that can tell a plausible order from the right one.
+	// empty-last rule on the secondary keys; materialise the key strings inside the
+	// row loop instead of after the key arena stops growing) all produce a *plausible*
+	// order. A literal is the only thing that can tell a plausible order from the
+	// right one.
+	//
+	// THE FIXTURES ARE TINY, EXCEPT WHERE THEY CANNOT BE. The arena sabotage is
+	// invisible at five rows -- the arena is created with 64 KB of capacity and a small
+	// table never makes it move -- so the only case that can catch it is the
+	// 100,000-row one, which is why C6 pins an ORDER and not just a timing.
 	//
 	// A vector that means "the whole cap" is BUILT from TABLE_SORT_KEYS_MAX; a vector
 	// that means "two keys, because this rule is about a tie-breaker" is written as two.
@@ -1867,6 +1874,7 @@ when NEWTPAD_TESTS {
 		} else {
 			ts_case_inverses(&bad)
 			ts_case_clear_resets(&bad)
+			ts_case_bad_vector(&bad)
 			ts_case_precedence(&bad)
 			ts_case_numeric_past_sample(&bad)
 			ts_case_empty_last(&bad)
@@ -2001,6 +2009,49 @@ when NEWTPAD_TESTS {
 		for k in s.keys {if k.col != TABLE_SORT_NONE {reset = false}}
 		li_chk(bad, reset, fmt.tprintf("...and after it every slot says TABLE_SORT_NONE (nkeys %d, keys %v)", s.nkeys, s.keys))
 		li_chk(bad, !table_sorted(&d), "...and no sort is live")
+	}
+
+	// C1c: a MALFORMED key vector is refused, and it takes the live sort with it.
+	//
+	// That second half is the part worth pinning, because it is a decision and not an
+	// accident: table_sort_build clears before it validates, so a caller who passes a
+	// vector the build cannot use loses the sort that was on screen. The contract says
+	// so ("returns false and leaves the doc unsorted on refusal"), and the reason is
+	// that every `return false` in that procedure should mean the same thing -- a
+	// refusal that sometimes left the previous order standing would be a second state
+	// for the draw and the hit-test to think about. Neither bad-vector path had a test
+	// until now, which is how a deliberate behaviour turns into an accident nobody
+	// meant.
+	//
+	// `refused` is asserted FALSE on all three paths. It means one specific thing --
+	// "too large to sort", which the summary row prints -- and a bad vector setting it
+	// would put a wrong sentence under a grid that is merely unsorted. C7 leans on that
+	// distinction to prove its own ceiling assertion is about the ceiling.
+	@(private = "file")
+	ts_case_bad_vector :: proc(bad: ^int) {
+		fmt.println("-- a malformed key vector is refused, and clears the live sort --")
+		ts_bad :: proc(bad: ^int, keys: []Sort_Key, label: string) {
+			d := ts_doc("a,b,c\n3,z,q\n1,y,r\n2,z,p\n", 3)
+			defer doc_close(&d)
+			live := [1]Sort_Key{{col = 0}}
+			li_chk(bad, table_sort_build(&d, live[:]) && table_sorted(&d), fmt.tprintf("%s: a 1-key sort is live first", label))
+			li_chk(bad, !table_sort_build(&d, keys), "...and the bad vector is refused")
+			s := &d.table_sort
+			gone := !table_sorted(&d) && s.nkeys == 0 && len(s.perm) == 0 && len(s.offs) == 0
+			for k in s.keys {if k.col != TABLE_SORT_NONE {gone = false}}
+			li_chk(bad, gone, fmt.tprintf("...taking the live sort with it (nkeys %d, perm %d, keys %v)", s.nkeys, len(s.perm), s.keys))
+			li_chk(bad, !s.refused, fmt.tprintf("...without claiming the file is too large (refused %v)", s.refused))
+		}
+		// Zero-valued, so every `col` is 0 and a valid column: the only thing wrong with
+		// this vector is its LENGTH.
+		over: [TABLE_SORT_KEYS_MAX + 1]Sort_Key
+		ts_bad(bad, over[:], "one key past the cap")
+		// The negative column sits in the LAST slot, not the first, so the validation
+		// loop has to reach it rather than reject on its first iteration.
+		neg: [TABLE_SORT_KEYS_MAX]Sort_Key
+		neg[TABLE_SORT_KEYS_MAX - 1].col = TABLE_SORT_NONE
+		ts_bad(bad, neg[:], "a negative column in the last slot")
+		ts_bad(bad, nil, "an empty vector")
 	}
 
 	// C2: PRECEDENCE. keys[0] decides; keys[1] only breaks its ties.
@@ -2233,7 +2284,9 @@ when NEWTPAD_TESTS {
 		li_chk(bad, ok1 && ok3 && table_sort_rows(&d) == TABLE_SORT_MAX, fmt.tprintf("both builds order all %d rows (%v/%v)", TABLE_SORT_MAX, ok1, ok3))
 		// Checked at the ends only: the whole order is 100,000 rows, and both ends
 		// pin the primary key, every tie-breaker and the final file-order fallback at
-		// once.
+		// once. These two literals are also the only assertions in this mode that can
+		// see the key arena move -- see the sabotage note on table_sort_build's
+		// materialisation pass, which turns this case into an access violation.
 		first, last := ts_order(&d, 1), "<none>"
 		if off, ok := table_sort_row_at(&d, TABLE_SORT_MAX - 1); ok {
 			buf: [64]u8
@@ -2261,6 +2314,16 @@ when NEWTPAD_TESTS {
 	// could have known instantly. Both must leave the document unsorted rather than
 	// half-sorted, and the summary row has to SAY so -- a header that does nothing
 	// when pressed is indistinguishable from a broken one.
+	//
+	// THE REASON IS PINNED, NOT JUST THE `false`. `!table_sort_build(...)` on its own
+	// is satisfied by any refusal at all -- including a vector the build rejects as
+	// malformed before it looks at a single row -- so the assertion that NAMES the
+	// ceiling would pass in a build that had no ceiling in it. Both refusals are
+	// therefore asserted against `refused`, which the two paths set differently: the
+	// ceiling sets it true so the summary row can say why, and a bad vector leaves it
+	// false because table_sort_clear cleared it and nothing turned it back on. The bad
+	// vector runs on this same over-ceiling document immediately before the ceiling
+	// build, so the two runs differ in nothing but the vector.
 	@(private = "file")
 	ts_case_refusal :: proc(bad: ^int) {
 		fmt.printfln("-- over the ceiling, a %d-key sort is refused on both paths --", TABLE_SORT_KEYS_MAX)
@@ -2281,9 +2344,22 @@ when NEWTPAD_TESTS {
 		defer doc_close(&d)
 		kn: [TABLE_SORT_KEYS_MAX]Sort_Key
 		for i in 0 ..< TABLE_SORT_KEYS_MAX {kn[i] = {col = i}}
+		// The control. A vector one slot too long is refused by the same procedure and
+		// returns the same `false` -- on this same over-ceiling document -- but it never
+		// reaches the ceiling, so `refused` stays false. An assertion that cannot tell
+		// these two apart is not testing the ceiling.
+		over: [TABLE_SORT_KEYS_MAX + 1]Sort_Key
+		ok_over := table_sort_build(&d, over[:])
+		li_chk(bad, !ok_over, fmt.tprintf("a %d-key vector is refused for being one past the cap", TABLE_SORT_KEYS_MAX + 1))
+		li_chk(bad, !d.table_sort.refused, fmt.tprintf("...and does NOT set `refused`, which belongs to the ceiling (refused %v)", d.table_sort.refused))
 		// No index running yet: the count is not exact, so the early refusal cannot
 		// fire and this exercises the SCANNING one.
-		li_chk(bad, !table_sort_build(&d, kn[:]), fmt.tprintf("one row past TABLE_SORT_MAX refuses a %d-key sort mid-scan", TABLE_SORT_KEYS_MAX))
+		ok_mid := table_sort_build(&d, kn[:])
+		li_chk(
+			bad,
+			!ok_mid && d.table_sort.refused,
+			fmt.tprintf("one row past TABLE_SORT_MAX refuses a %d-key sort mid-scan, AS THE CEILING (ok %v, refused %v)", TABLE_SORT_KEYS_MAX, ok_mid, d.table_sort.refused),
+		)
 		li_chk(bad, !table_sorted(&d), "...and nothing is left half-sorted")
 		li_chk(bad, d.table_sort.nkeys == 0 && len(d.table_sort.perm) == 0, fmt.tprintf("...with no keys and no permutation left behind (nkeys %d, perm %d)", d.table_sort.nkeys, len(d.table_sort.perm)))
 		li_chk(bad, d.table_sort.refused, "...and the refusal is recorded for the summary row")
@@ -2296,7 +2372,7 @@ when NEWTPAD_TESTS {
 		t0 := time.tick_now()
 		ok2 := table_sort_build(&d, kn[:])
 		us := time.duration_microseconds(time.tick_since(t0))
-		li_chk(bad, !ok2 && d.table_sort.refused, fmt.tprintf("a settled over-ceiling count refuses a %d-key sort too", TABLE_SORT_KEYS_MAX))
+		li_chk(bad, !ok2 && d.table_sort.refused, fmt.tprintf("a settled over-ceiling count refuses a %d-key sort too, AS THE CEILING (refused %v)", TABLE_SORT_KEYS_MAX, d.table_sort.refused))
 		li_chk(bad, us < 1000, fmt.tprintf("...without a pass over the file (%.0f us)", us))
 	}
 

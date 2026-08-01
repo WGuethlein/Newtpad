@@ -1031,7 +1031,10 @@ table_sort_free :: proc(doc: ^Document) {
 // arena has stopped moving. That bug is silent -- the comparator reads plausible
 // garbage and produces a plausible ORDER -- and with TABLE_SORT_KEYS_MAX keys per
 // row there are that many times as many chances to make it, so the shape is worth
-// stating.
+// stating. It is also the one risk in this procedure that no small fixture can see
+// from the outside: the arena is created with 64 KB of capacity and a five-row table
+// never makes it move, so the sabotage that pins this rule has to run against the
+// 100,000-row one (tablesorttest's C6).
 @(private = "file")
 Sort_Field :: struct {
 	key:    string,
@@ -1275,6 +1278,15 @@ table_sort_build :: proc(doc: ^Document, keys: []Sort_Key) -> bool {
 		return false
 	}
 	// The arena has stopped growing: materialise every key now, never before.
+	//
+	// SABOTAGED AND WATCHED TO FAIL, because this rule's violation is invisible at any
+	// fixture small enough to read: moving these two lines up into the row loop took
+	// tablesorttest's 100,000-row case from a pinned order to an ACCESS VIOLATION
+	// (0xC0000005) mid-sort, and every case before it still passed unchanged. By then
+	// the arena has grown past its 64 KB capacity many times over, so most keys point
+	// into blocks that have been freed. At that size the heap gives the read back a
+	// fault; at a size where it does not, the same bug is a plausible wrong order that
+	// nothing in the output would flag.
 	for &it in items {
 		for i in 0 ..< nk {it.f[i].key = string(arena[it.f[i].ks:it.f[i].ks + it.f[i].kl])}
 	}
