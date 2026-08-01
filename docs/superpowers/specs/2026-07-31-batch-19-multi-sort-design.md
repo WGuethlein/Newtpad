@@ -298,6 +298,15 @@ at 3.
 
 The refusal wording (`too large to sort (over 100,000 rows)`) is unchanged.
 
+**The cap refusal gets the same treatment — decided 2026-07-31 after Task 3's review.** At
+`TABLE_SORT_KEYS_MAX` a Ctrl+click on a third column does nothing at all, and `table.odin` argues twice
+that *"a header that does nothing when clicked is indistinguishable from a broken build"* — which is
+exactly why the row-ceiling refusal surfaces here rather than staying silent. The cap had no equivalent.
+So when the vector is full, the summary row says so, in the same place and the same register. Wyatt's
+call; the alternatives considered were leaving it silent (the menu's greyed "Then by" rows already answer
+it for anyone who opens the menu), a sliding window that pushes out the oldest key, and feedback on the
+header itself — the last rejected because §10 deliberately keeps the header quiet.
+
 ---
 
 ## 8. Commands

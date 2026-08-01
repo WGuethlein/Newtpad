@@ -678,6 +678,19 @@ implement that decision** — do not leave it to be discovered. The cap is alrea
 reason (Task 2's measurement), so lowering it further is not the answer here; if the line does not fit,
 the answer is in the wording or the band, and it goes to Wyatt.
 
+- [ ] **Step 2b: Say the cap refusal (added 2026-07-31, Wyatt's decision on Task 3's review)**
+
+At `TABLE_SORT_KEYS_MAX` a Ctrl+click on a third column does nothing, silently. `table.odin` argues twice
+that *"a header that does nothing when clicked is indistinguishable from a broken build"* — the reason the
+row-ceiling refusal is in this row at all. Give the cap the same treatment: when the vector is full, the
+summary row says so.
+
+Follow the ceiling refusal's own shape (`table_summary_parts`'s `refused` branch) rather than inventing a
+second mechanism, and keep the wording a fact rather than an error — the user has a working two-key sort,
+they just cannot add a third. **Do not add a second flag to `Table_Sort` if `nkeys == TABLE_SORT_KEYS_MAX`
+already tells you** — a stored flag needs clearing from every path that changes the vector, which is the
+`command_mutates_doc` maintenance shape this project has now patched three times.
+
 - [ ] **Step 3: Per-key arrows with a precedence digit**
 
 Every sorted column draws its arrow, at its own key's direction. **The digit is drawn only when
