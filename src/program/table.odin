@@ -349,6 +349,36 @@ group_int :: proc(v: int, allocator := context.temp_allocator) -> string {
 // second procedure computing "where does the sort clause start" from the finished
 // string would be re-deriving what this one already knows -- and would silently
 // name the wrong bytes the first time the wording changed.
+//
+// THE LINE DOES NOT FIT A NARROW WINDOW, and that is recorded here as a decision
+// rather than left to be found. Measured by tablesorttest C16, which pins the
+// cell counts so a reworded line has to re-measure instead of drifting: the
+// longest realistic two-key line -- `120,000 rows  ·  8 columns  ·  sorted by
+// Department asc, Last Name desc  ·  click to clear  ·  2 keys max` -- is 105
+// cells, which at px 16 / char_w 8 drawn from TABLE_CELL_PAD_X ends at 850px,
+// and its CLICKABLE RUN ends at cell 90 (730px). The window's minimum TRACK
+// width is 318px at 96 DPI (plat.window_min_size), and the client area is
+// narrower again by the frame. No wording closes that: the sort clause and its
+// target alone are 59 cells (482px), still well past 318.
+//
+// THE OVERFLOW IS OLDER THAN THE KEY LIST. The same line with one key ends its
+// run at cell 74 (602px) -- measured in the same case -- so this row has never
+// fitted a minimum-width window. Printing every key moves the threshold from
+// 602px to 730px; it did not create it.
+//
+// IT IS NOT A CORRECTNESS BUG. The run's hit rectangle is measured from the same
+// x the glyphs are drawn at (table_summary_layout), so nothing invisible is
+// clickable and nothing clickable is invisible -- at a narrow window the target
+// is simply off screen along with the words that name it, and Clear Sort in the
+// header's own menu reaches the same outcome at any width.
+//
+// The fixes that WOULD make it fit are all structural -- eliding the row and
+// column facts to keep the control, putting the sort clause first, or giving the
+// band a scroll of its own -- and every one of them changes what a ONE-key line
+// looks like, on a condition that predates this batch. That is a product call,
+// not one to take inside a task about wording, so it is Wyatt's: raised in batch
+// 19 Task 7's report. Until it is decided the line overflows, and the counts
+// above are pinned by a test so the next change to this wording cannot be quiet.
 table_summary_parts :: proc(doc: ^Document, allocator := context.temp_allocator) -> (text: string, clear_s, clear_e: int) {
 	n, exact := table_row_count(doc)
 	sb := strings.builder_make(allocator)
@@ -379,8 +409,43 @@ table_summary_parts :: proc(doc: ^Document, allocator := context.temp_allocator)
 		// first word that explains it.
 		fmt.sbprint(&sb, "  ·  ")
 		clear_s = strings.builder_len(sb)
-		fmt.sbprintf(&sb, "sorted by %s %s  ·  click to clear", table_col_name(doc, doc.table_sort.keys[0].col, allocator), "desc" if doc.table_sort.keys[0].desc else "asc")
+		s := &doc.table_sort
+		fmt.sbprint(&sb, "sorted by ")
+		// EVERY key, in precedence order, because precedence is the one thing a
+		// two-key sort has that a one-key sort does not and the header's own marks
+		// can only say it in a digit. Comma-separated prose rather than a list of
+		// glyphs: the row is a sentence (the block comment above), and "sorted by
+		// Department asc, Last Name desc" is the sentence a reader can act on
+		// without having learned what a superscript 2 beside an arrow means.
+		for i in 0 ..< s.nkeys {
+			if i > 0 {fmt.sbprint(&sb, ", ")}
+			fmt.sbprintf(&sb, "%s %s", table_col_name(doc, s.keys[i].col, allocator), "desc" if s.keys[i].desc else "asc")
+		}
+		fmt.sbprint(&sb, "  ·  click to clear")
 		clear_e = strings.builder_len(sb)
+		// THE CAP REFUSAL, and it is outside [clear_s, clear_e) deliberately: the run
+		// is a control -- clicking it clears the sort -- and this is a fact about the
+		// sort, not part of the action being offered. Extending the target over it
+		// would make a click on the words "keys max" clear the sort.
+		//
+		// It is here for the same reason the ceiling refusal above is: at
+		// TABLE_SORT_KEYS_MAX a Ctrl+click on a third column does nothing at all, and
+		// this file argues twice that a header that does nothing when clicked is
+		// indistinguishable from a broken build. The menu's greyed "Then by" rows
+		// already answer it for anyone who opens the menu; this answers it for the
+		// gesture that has no menu in it.
+		//
+		// A FACT, NOT AN ERROR. The user has a working two-key sort and simply cannot
+		// add a third; wording it as a failure ("cannot add", "refused") would report
+		// a problem where there is only a limit.
+		//
+		// DERIVED FROM nkeys, NOT STORED. `s.nkeys == TABLE_SORT_KEYS_MAX` already is
+		// the condition, and a second flag on Table_Sort would need clearing from
+		// every path that changes the vector -- the maintenance shape
+		// command_mutates_doc has been patched for three times.
+		if s.nkeys >= TABLE_SORT_KEYS_MAX {
+			fmt.sbprintf(&sb, "  ·  %d keys max", TABLE_SORT_KEYS_MAX)
+		}
 	}
 	return strings.to_string(sb), clear_s, clear_e
 }
@@ -2241,21 +2306,103 @@ table_sort_arrow_rect :: proc(col: Table_Col, px, right: f32) -> Table_Arrow {
 	}
 }
 
+// Does this document's header show PRECEDENCE DIGITS beside its arrows?
+//
+// Only above one key: a lone "1" next to a single sort is noise, and the arrow
+// alone already says everything a one-key sort has to say (spec §6). ONE
+// definition, because three things branch on it -- the mark producer below, the
+// slot the label reserves, and the width at which table_header_layout suppresses
+// the chevron -- and a digit drawn in a slot the label did not reserve is the
+// "smear below Date" bug (Wyatt, live use, v0.34.0) with a different glyph in it.
+table_sort_digits_shown :: #force_inline proc(doc: ^Document) -> bool {
+	return table_sorted(doc) && doc.table_sort.nkeys > 1
+}
+
+// The digit's own slot, in pixels: one cell of the document face plus the gap
+// that separates it from the arrow, or nothing when no digit is drawn.
+//
+// ONE CELL, and that is not an estimate: the digit is drawn in the document face
+// on the same fixed cell grid every other measurement in this file uses, and
+// #assert below keeps it to a single character.
+table_sort_digit_w :: #force_inline proc(char_w: f32, digit: bool) -> f32 {
+	return char_w + table_mark_gap() if digit else 0
+}
+
 // The pixels the header's marks reserve at the right end of every cell:
-// gap, arrow, gap, chevron, ending at table_header_marks_right.
-table_header_marks_w :: #force_inline proc(px: f32) -> f32 {
-	return table_mark_gap() * 2 + table_arrow_w(px) + table_chev_w()
+// [digit, gap,] gap, arrow, gap, chevron, ending at table_header_marks_right.
+//
+// `digit` is a parameter rather than read from the document here because this is
+// a metric, and the two call sites that pass `true` both get it from
+// table_sort_digits_shown -- one predicate, passed down, rather than a second
+// place that decides when a digit exists.
+table_header_marks_w :: #force_inline proc(px, char_w: f32, digit: bool) -> f32 {
+	return table_mark_gap() * 2 + table_arrow_w(px) + table_chev_w() + table_sort_digit_w(char_w, digit)
 }
 
 // The cells that run takes out of a header cell, rounded UP to a whole cell
 // because the label is truncated in cells and half a cell of overlap is still
 // overlap.
-table_header_marks_cells :: proc(char_w, px: f32) -> int {
+table_header_marks_cells :: proc(char_w, px: f32, digit: bool) -> int {
 	if char_w <= 0 {return 0}
-	need := table_header_marks_w(px)
+	need := table_header_marks_w(px, char_w, digit)
 	n := int(need / char_w)
 	if f32(n) * char_w < need {n += 1}
 	return n
+}
+
+// --- the sort mark: ONE producer for the arrow AND its precedence digit -----
+//
+// What the header draws for a column's sort, decided in one place: whether there
+// is a mark at all, which way the arrow points, whether a digit goes beside it
+// and which digit, and where both land. The draw consumes this and computes no
+// coordinate and no direction of its own.
+//
+// PER KEY. `up` comes from THIS column's key, not from keys[0] -- with two keys
+// live the primary can be ascending while the tie-breaker is descending, and a
+// shared flag would draw both columns the same way while the summary row said
+// otherwise. That disagreement is the one failure a reader could not diagnose
+// from the screen, because both marks would look deliberate.
+//
+// THE ARROW DOES NOT MOVE when a second key appears: table_sort_arrow_rect's x is
+// unchanged and the digit takes the cell to its LEFT, out of the slot the label
+// already reserved (table_header_label_col). What does change is how much name a
+// full-width header keeps -- one cell less, and only while a second key is live.
+// That is a state the user reaches by Ctrl+clicking, which already re-sorts the
+// whole grid; it is not the header re-truncating under the pointer, which is what
+// the uniform-reservation rule above exists to prevent.
+Table_Sort_Mark :: struct {
+	arrow:            Table_Arrow,
+	digit_x, digit_w: f32, // the digit's cell; zero-width when rank == 0
+	rank:             int, // 1-based precedence, or 0 for "draw no digit"
+	up:               bool, // ascending -- this key's own direction
+	ghost:            bool, // the hover preview on an unsorted column, not a live sort
+}
+
+// The mark for one visible column, or ok=false when the column draws none.
+//
+// The sorted column WINS where the two would coincide: hovering a column that is
+// already sorted shows its real arrow at full strength rather than a preview of
+// itself. On an unsorted hovered column `up` is what the NEXT click produces,
+// which is ascending (table_sort_cycle), so the ghost is a prediction rather than
+// a decoration -- and it carries no digit, because a preview of a key that does
+// not exist yet has no precedence to name.
+table_sort_mark :: proc(doc: ^Document, col: Table_Col, char_w, px, right: f32, hover_col: int) -> (m: Table_Sort_Mark, ok: bool) {
+	if doc == nil {return {}, false}
+	s := &doc.table_sort
+	if k, is_key := table_sort_key(doc, col.c); is_key && table_sorted(doc) {
+		m.up = !s.keys[k].desc
+		if table_sort_digits_shown(doc) {m.rank = k + 1}
+	} else if col.c == hover_col {
+		m.ghost, m.up = true, true
+	} else {
+		return {}, false
+	}
+	m.arrow = table_sort_arrow_rect(col, px, right)
+	if m.rank > 0 {
+		m.digit_w = char_w
+		m.digit_x = m.arrow.x - table_mark_gap() - char_w
+	}
+	return m, true
 }
 
 // The header LABEL's own box: the column's cell with the MARKS' slot -- the arrow
@@ -2283,9 +2430,9 @@ table_header_marks_cells :: proc(char_w, px: f32) -> int {
 //
 // x is unchanged, so table_cell_text_x still answers for the label; only the
 // width narrows.
-table_header_label_col :: proc(col: Table_Col, char_w, px: f32) -> Table_Col {
+table_header_label_col :: proc(col: Table_Col, char_w, px: f32, digit: bool) -> Table_Col {
 	lab := col
-	n := min(table_header_marks_cells(char_w, px), max(0, col.cells - 1)) // never below one cell of name
+	n := min(table_header_marks_cells(char_w, px, digit), max(0, col.cells - 1)) // never below one cell of name
 	lab.cells = col.cells - n
 	lab.w = col.w - f32(n) * char_w
 	return lab
@@ -2373,6 +2520,10 @@ table_header_layout :: proc(
 	gw := table_gutter_w()
 	cw := table_chev_w()
 	ch := table_chev_h()
+	// The marks' run is a cell wider while precedence digits are live, so the width
+	// this refuses at moves with them -- asked once, outside the loop, because it is
+	// a property of the document's sort and not of any column.
+	dg := table_sort_digits_shown(doc)
 	for col in table_cols_layout(doc, char_w, width) {
 		x0 := max(col.x, gw)
 		x1 := min(col.x + col.w, right)
@@ -2381,7 +2532,7 @@ table_header_layout :: proc(
 			body = {x = x0, y = top, w = max(0, x1 - x0), h = hh},
 		}
 		chx := table_header_marks_right(col, right) - cw
-		fits := col.w - TABLE_CELL_PAD_X * 2 >= table_header_marks_w(px) + char_w
+		fits := col.w - TABLE_CELL_PAD_X * 2 >= table_header_marks_w(px, char_w, dg) + char_w
 		if col.c == hover_col && fits && chx >= gw {
 			hc.has_chev = true
 			hc.chevron = {x = chx, y = top + f32(int((hh - ch) * 0.5)), w = cw, h = ch}
@@ -3159,6 +3310,11 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			}
 		}
 		hy := table_header_baseline_y(px)
+		// Whether precedence digits are live, asked ONCE for the whole header pass:
+		// the label's reserved slot below and the mark producer further down have to
+		// agree about it column by column, and two calls could not disagree today but
+		// would be two places to change.
+		dgts := table_sort_digits_shown(doc)
 		for col in cols {
 			if col.c >= len(head) {continue}
 			field := head[col.c]
@@ -3169,7 +3325,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			// table_header_label_col -- the nudge below reads the same narrowed box,
 			// because a right-aligned header pushed to the cell's right inner edge
 			// would otherwise land under the arrow no matter how short it was.
-			lab := table_header_label_col(col, char_w, px)
+			lab := table_header_label_col(col, char_w, px, dgts)
 			fb := transmute([]u8)field
 			// fcells, not hcells: that name is already the layout slice above (the
 			// header's two hit regions), and this is an unrelated int -- the
@@ -3191,30 +3347,30 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			hx := table_cell_text_x(lab) + table_cell_align_dx(lab, fcells, char_w)
 			plat.text_draw(gfx, text, field, hx, hy, px, g_theme[.Text_Bright], .Doc)
 		}
-		// §10's "click to sort with an accent arrow", and the DIMMED preview of it on
-		// a hovered column. Both through table_sort_arrow_rect, so the ghost lands in
-		// exactly the slot the solid arrow will occupy -- an affordance that moved
-		// once the click landed would be worse than none.
+		// §10's "click to sort with an accent arrow", the precedence digit beside it,
+		// and the DIMMED preview of the arrow on a hovered column. EVERY sorted
+		// column draws its own arrow, at ITS OWN key's direction.
 		//
-		// The sorted column wins where the two would coincide: hovering the column
-		// that is already sorted shows its real arrow at full strength rather than
-		// replacing it with a preview of itself. `up` is what the NEXT click
-		// produces on an unsorted column, which is ascending (table_sort_cycle), so
-		// the ghost is a prediction rather than a decoration.
+		// All three come out of table_sort_mark, which is the producer: this loop
+		// decides nothing about which columns are marked, which way an arrow points,
+		// or where either mark lands. The ghost lands in exactly the slot the solid
+		// arrow will occupy because it IS the same rectangle -- an affordance that
+		// moved once the click landed would be worse than none.
 		//
-		// Drawn after the header text either way. It no longer overlaps it -- the
-		// slot above is reserved -- but the ordering is free and a header whose name
-		// somehow reached the slot would still lose to the mark rather than hide it.
+		// Drawn after the header text. It no longer overlaps it -- the slot above is
+		// reserved, digit included -- but the ordering is free and a header whose
+		// name somehow reached the slot would lose to the mark rather than hide it.
 		{
-			sorted_col := doc.table_sort.keys[0].col if table_sorted(doc) else TABLE_SORT_NONE
 			for col in cols {
-				dim := false
-				switch {
-				case col.c == sorted_col:
-				case col.c == hover_col:
-					dim = true
-				case:
-					continue
+				m, has := table_sort_mark(doc, col, char_w, px, right, hover_col)
+				if !has {continue}
+				colour := g_theme[.Accent]
+				if m.ghost {
+					// Straight alpha over whatever is behind it (quads.odin binds a
+					// SRC_ALPHA blend), so the ghost is the accent at reduced weight
+					// rather than a second colour role that would have to be added to
+					// every theme and kept in step with Accent by hand.
+					colour[3] *= TABLE_ARROW_GHOST_A
 				}
 				// Quads, not a glyph. The document face is the user's monospace font
 				// and nothing guarantees it has U+25B2/U+25BC -- a missing glyph is a
@@ -3222,19 +3378,23 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 				// sorted column indistinguishable from the others, which is the one
 				// thing this mark exists to prevent. Four stacked bars are a triangle
 				// at any font, any DPI and any theme.
-				a := table_sort_arrow_rect(col, px, right)
-				colour := g_theme[.Accent]
-				up := true
-				if dim {
-					// Straight alpha over whatever is behind it (quads.odin binds a
-					// SRC_ALPHA blend), so the ghost is the accent at reduced weight
-					// rather than a second colour role that would have to be added to
-					// every theme and kept in step with Accent by hand.
-					colour[3] *= TABLE_ARROW_GHOST_A
-				} else {
-					up = !doc.table_sort.keys[0].desc
-				}
-				table_sort_arrow(gfx, qp, a, up, colour)
+				table_sort_arrow(gfx, qp, m.arrow, m.up, colour)
+				if m.rank == 0 {continue}
+				// The DIGIT is a glyph where the arrow is quads, and the difference is
+				// the guarantee rather than a preference: '1' and '2' are ASCII, which
+				// every face able to render a CSV at all can draw, while U+25B2 is
+				// not. What the arrow's comment forbids is depending on a glyph
+				// nothing guarantees -- not drawing text.
+				//
+				// One byte, formatted by hand rather than through tprintf, because
+				// this runs once per sorted visible column per frame; the #assert is
+				// what keeps that shortcut honest if the cap ever moves.
+				#assert(TABLE_SORT_KEYS_MAX <= 9)
+				d := [1]u8{'0' + u8(m.rank)}
+				// Accent, the arrow's own colour, and the header's own baseline: the
+				// digit is part of the mark rather than a second annotation, and it
+				// sits on the line every other character in this band sits on.
+				plat.text_draw(gfx, text, string(d[:]), m.digit_x, hy, px, colour, .Doc)
 			}
 		}
 		// The menu chevron, on the hovered column only (table_header_layout decides

@@ -1901,6 +1901,7 @@ when NEWTPAD_TESTS {
 			ts_case_menu_items(&bad)
 			ts_case_menu_dispatch(&bad)
 			ts_case_header_seam(&bad)
+			ts_case_summary_marks(&bad)
 		}
 		fmt.printfln("tablesorttest: %d failures", bad)
 		if bad > 0 {os.exit(1)}
@@ -2927,7 +2928,7 @@ when NEWTPAD_TESTS {
 		li_chk(bad, table_header_h(px) == 30, fmt.tprintf("§10's header band is 30px at px 16 (%.0f)", table_header_h(px)))
 		li_chk(bad, table_right(W) == 786, fmt.tprintf("the grid's right edge is 800 - 14 (%.0f)", table_right(W)))
 		li_chk(bad, table_chev_w() == 10 && table_chev_h() == 6, fmt.tprintf("the chevron is 10x6 (%.0fx%.0f)", table_chev_w(), table_chev_h()))
-		li_chk(bad, table_header_marks_w(px) == 29, fmt.tprintf("the marks reserve 5+9+5+10 = 29px (%.0f)", table_header_marks_w(px)))
+		li_chk(bad, table_header_marks_w(px, cw, false) == 29, fmt.tprintf("the marks reserve 5+9+5+10 = 29px with no digit (%.0f)", table_header_marks_w(px, cw, false)))
 
 		top := table_grid_top()
 		mid := top + 15 // the middle of a 30px band
@@ -3128,6 +3129,211 @@ when NEWTPAD_TESTS {
 			app.history.open = false
 
 			li_chk(bad, !app_content_overlay_active(&app), "...and clearing both leaves the gate open again")
+		}
+	}
+
+	// A four-column table whose header names are the ones the summary row's
+	// worst case uses, with widths written in by hand for the same reason
+	// ts_seam_doc writes its own: table_compute_widths needs loaded fonts, and
+	// this case is about geometry, not about sampling. 12 cells at char_w 8 is
+	// wide enough to hold the marks' run WITH a digit plus a cell of name, so a
+	// suppressed chevron cannot be what makes an assertion below pass.
+	@(private = "file")
+	ts_marks_doc :: proc() -> Document {
+		d := ts_doc("Department,Last Name,Region,Amount\nSales,Young,East,3\nSales,Adams,West,1\nOps,Young,East,2\n", 4)
+		for _ in 0 ..< 4 {
+			append(&d.table_widths, 12)
+			append(&d.table_align, Table_Align.Left)
+		}
+		return d
+	}
+
+	// C16 (batch 19 Task 7): the summary row says the WHOLE sort, and every sorted
+	// column marks itself at its own key's direction.
+	//
+	// Three things this case has to be able to fail, because each has a plausible
+	// implementation that looks right on a one-key document:
+	//
+	//   1. A summary that prints keys[0] and stops. The two-key fixture's expected
+	//      run is written out whole, so a truncated list is a string mismatch.
+	//   2. `clear_s`/`clear_e` derived from the finished string by a second pass
+	//      instead of produced beside the sbprintf. The span is asserted against
+	//      the PRODUCED TEXT -- where "sorted by" actually begins and where "click
+	//      to clear" actually ends -- rather than against a hand-written offset, so
+	//      a span that names the wrong bytes fails even though both it and the
+	//      wording are self-consistent.
+	//   3. Arrows that read one shared flag. The fixture sorts key 1 ASCENDING and
+	//      key 2 DESCENDING, so `keys[0].desc` for both columns gives the wrong
+	//      answer on exactly one of them and no fixture with two keys in the same
+	//      direction could tell.
+	@(private = "file")
+	ts_case_summary_marks :: proc(bad: ^int) {
+		fmt.printfln("-- the summary row lists every key, and each column marks its own --")
+		cw, px, W := f32(8), f32(16), f32(800)
+		CLEAR :: "click to clear"
+		cap_note := fmt.tprintf("%d keys max", TABLE_SORT_KEYS_MAX)
+
+		// The span, checked against the string it indexes rather than against a
+		// literal offset. Used by both the one-key and the two-key case below.
+		span_ok :: proc(bad: ^int, text: string, cs, ce: int, label: string) {
+			CLEAR :: "click to clear"
+			want_s := strings.index(text, "sorted by")
+			want_e := strings.last_index(text, CLEAR)
+			if want_e >= 0 {want_e += len(CLEAR)}
+			li_chk(bad, cs == want_s && ce == want_e, fmt.tprintf("%s: [clear_s,clear_e) is exactly the run the words occupy (%d..%d, the string says %d..%d)", label, cs, ce, want_s, want_e))
+			li_chk(bad, cs >= 0 && ce > cs && ce <= len(text), fmt.tprintf("%s: ...and it is a real span inside the line (%d..%d of %d)", label, cs, ce, len(text)))
+		}
+
+		// -- ONE KEY: no comma, no digit, no cap note ---------------------------
+		{
+			d := ts_marks_doc()
+			defer doc_close(&d)
+			table_sort_set(&d, 0, false) // Department asc
+			li_chk(bad, table_sorted(&d) && d.table_sort.nkeys == 1, fmt.tprintf("precondition: one key is live (sorted %v, nkeys %d)", table_sorted(&d), d.table_sort.nkeys))
+			text, cs, ce := table_summary_parts(&d)
+			li_chk(bad, text[cs:ce] == "sorted by Department asc  ·  " + CLEAR, fmt.tprintf("one key reads `sorted by Department asc  ·  %s` (%q)", CLEAR, text[cs:ce]))
+			span_ok(bad, text, cs, ce, "one key")
+			li_chk(bad, ce == len(text), fmt.tprintf("...and nothing follows it below the cap (%q)", text[ce:]))
+			li_chk(bad, !strings.contains(text, cap_note), fmt.tprintf("...and the cap is NOT mentioned at one key (%q)", text))
+
+			// THE DIGIT IS ABSENT AT ONE KEY. A lone "1" is noise, so the predicate
+			// says no and the mark carries no rank -- both, because the predicate is
+			// also what the label's reserved slot reads.
+			li_chk(bad, !table_sort_digits_shown(&d), "no precedence digit is shown at one key")
+			cols := table_cols_layout(&d, cw, W)
+			li_chk(bad, len(cols) == 4, fmt.tprintf("precondition: four columns are laid out (%d)", len(cols)))
+			if len(cols) != 4 {return}
+			m0, ok0 := table_sort_mark(&d, cols[0], cw, px, table_right(W), TABLE_SORT_NONE)
+			li_chk(bad, ok0 && m0.rank == 0 && m0.up && !m0.ghost, fmt.tprintf("...and the sorted column's mark carries no rank (ok %v, rank %d, up %v, ghost %v)", ok0, m0.rank, m0.up, m0.ghost))
+			li_chk(bad, m0.digit_w == 0, fmt.tprintf("...and no digit cell at all (%.0f wide)", m0.digit_w))
+		}
+
+		// -- TWO KEYS, OPPOSITE DIRECTIONS -------------------------------------
+		{
+			d := ts_marks_doc()
+			defer doc_close(&d)
+			table_sort_set(&d, 0, false) // Department asc  -- key 1
+			table_sort_add(&d, 1, true) // Last Name desc  -- key 2
+			li_chk(bad, d.table_sort.nkeys == 2 && !d.table_sort.keys[0].desc && d.table_sort.keys[1].desc, fmt.tprintf("precondition: key 1 ascends and key 2 descends (nkeys %d, %v %v)", d.table_sort.nkeys, d.table_sort.keys[0].desc, d.table_sort.keys[1].desc))
+
+			text, cs, ce := table_summary_parts(&d)
+			li_chk(bad, text[cs:ce] == "sorted by Department asc, Last Name desc  ·  " + CLEAR, fmt.tprintf("two keys read `sorted by Department asc, Last Name desc  ·  %s` (%q)", CLEAR, text[cs:ce]))
+			span_ok(bad, text, cs, ce, "two keys")
+
+			// THE CAP REFUSAL: said, and said OUTSIDE the clickable run. A note
+			// inside the run would make a click on the words "keys max" clear the
+			// sort, which is the whole reason the separator is outside it too.
+			li_chk(bad, strings.contains(text, cap_note), fmt.tprintf("at the cap the row says so: %q (looking for %q)", text, cap_note))
+			li_chk(bad, !strings.contains(text[cs:ce], cap_note), fmt.tprintf("...and the note is NOT inside the clickable run (%q)", text[cs:ce]))
+			li_chk(bad, ce < len(text) && strings.has_suffix(text, cap_note), fmt.tprintf("...it follows the run, at the end of the line (%q)", text[ce:]))
+
+			// -- the marks, per key --------------------------------------------
+			li_chk(bad, table_sort_digits_shown(&d), "precedence digits appear above one key")
+			cols := table_cols_layout(&d, cw, W)
+			if len(cols) != 4 {
+				li_chk(bad, false, fmt.tprintf("precondition: four columns are laid out (%d)", len(cols)))
+				return
+			}
+			right := table_right(W)
+			m0, ok0 := table_sort_mark(&d, cols[0], cw, px, right, TABLE_SORT_NONE)
+			m1, ok1 := table_sort_mark(&d, cols[1], cw, px, right, TABLE_SORT_NONE)
+			// EACH COLUMN'S OWN DIRECTION. Both arrows reading keys[0].desc gives
+			// up == true here; both reading keys[1].desc gives up == false. Only
+			// per-key reads produce this pair.
+			li_chk(bad, ok0 && m0.up && m0.rank == 1, fmt.tprintf("key 1's column points UP and is numbered 1 (ok %v, up %v, rank %d)", ok0, m0.up, m0.rank))
+			li_chk(bad, ok1 && !m1.up && m1.rank == 2, fmt.tprintf("key 2's column points DOWN and is numbered 2 (ok %v, up %v, rank %d)", ok1, m1.up, m1.rank))
+
+			// An unsorted column draws nothing unless it is hovered, and the ghost
+			// is a preview of the NEXT click (ascending) with no rank -- a key that
+			// does not exist has no precedence.
+			_, ok2 := table_sort_mark(&d, cols[2], cw, px, right, TABLE_SORT_NONE)
+			li_chk(bad, !ok2, "an unsorted, unhovered column draws no mark at all")
+			g, okg := table_sort_mark(&d, cols[2], cw, px, right, 2)
+			li_chk(bad, okg && g.ghost && g.up && g.rank == 0, fmt.tprintf("hovering it previews an ascending arrow with no digit (ok %v, ghost %v, up %v, rank %d)", okg, g.ghost, g.up, g.rank))
+			// Hovering a column that IS sorted keeps its real mark, at its own
+			// direction -- not a preview of itself, and not the ghost's `up`.
+			hs, okh := table_sort_mark(&d, cols[1], cw, px, right, 1)
+			li_chk(bad, okh && !hs.ghost && !hs.up && hs.rank == 2, fmt.tprintf("hovering key 2's own column keeps its real descending mark (ghost %v, up %v, rank %d)", hs.ghost, hs.up, hs.rank))
+
+			// -- the digit's slot, against the label's and the arrow's ----------
+			//
+			// Hand-derived from §10's metrics, the way ts_case_header_seam derives
+			// its rectangles: column 0 is x 56..172 (gutter 56, 12 cells * 8 + 2 *
+			// 10), so marks_right is 162, the chevron takes 152..162, the arrow
+			// 138..147, and the digit is one cell ending a 5px gap before it: 125.
+			li_chk(bad, cols[0].x == 56 && cols[0].w == 116, fmt.tprintf("precondition: c0 spans 56..172 (%.0f..%.0f)", cols[0].x, cols[0].x + cols[0].w))
+			li_chk(bad, m0.arrow.x == 138, fmt.tprintf("c0's arrow is unmoved by the digit, at 138 (%.0f)", m0.arrow.x))
+			li_chk(bad, m0.digit_x == 125 && m0.digit_w == 8, fmt.tprintf("c0's digit is the cell at 125..133 (%.0f..%.0f)", m0.digit_x, m0.digit_x + m0.digit_w))
+			li_chk(bad, m0.digit_x + m0.digit_w + table_mark_gap() == m0.arrow.x, fmt.tprintf("...with the mark gap between the two (%.0f + %.0f vs %.0f)", m0.digit_x + m0.digit_w, table_mark_gap(), m0.arrow.x))
+
+			// WHAT IS DRAWN AGAINST WHAT IS DRAWN: the header label is truncated to
+			// a box that stops before the digit. Without the reserve the digit is
+			// painted through the last character of a full-width name -- the "smear
+			// below Date" bug with a different glyph in it. `Department` is 10 cells
+			// in a 12-cell column, so it is long enough to reach the slot.
+			lab := table_header_label_col(cols[0], cw, px, true)
+			label_right := table_cell_text_x(lab) + f32(lab.cells) * cw
+			li_chk(bad, lab.cells < 10, fmt.tprintf("`Department` (10 cells) really is truncated by the reserve (%d cells left)", lab.cells))
+			li_chk(bad, label_right <= m0.digit_x, fmt.tprintf("the label's box stops before the digit (%.0f vs %.0f)", label_right, m0.digit_x))
+			// ...and the reserve grows by exactly the digit's slot, so the two
+			// cannot drift: one predicate feeds both.
+			li_chk(bad, table_header_marks_w(px, cw, true) - table_header_marks_w(px, cw, false) == cw + table_mark_gap(), fmt.tprintf("the reserve grows by one cell plus a gap (%.0f vs %.0f)", table_header_marks_w(px, cw, true), table_header_marks_w(px, cw, false)))
+		}
+
+		// -- THE BAND: how wide a window the longest realistic 2-key line needs --
+		//
+		// `120,000 rows · 8 columns · sorted by Department asc, Last Name desc ·
+		// click to clear · 2 keys max` -- the line the design doc names, built from
+		// the real producer rather than typed out, with only the row clause
+		// substituted (a 120,000-row fixture would cost a full index scan and a
+		// full sort to prove nothing this case is about).
+		//
+		// The counts are PINNED. TABLE_SORT_KEYS_MAX's comment requires that moving
+		// the cap come with a decision about how this row reads; pinning the width
+		// is what makes a wording change announce itself here instead of being
+		// found at a narrow window.
+		{
+			d := ts_doc("Department,Last Name,Region,Amount,Status,Owner,Date,Note\nSales,Young,East,3,ok,a,1,x\nOps,Adams,West,1,ok,b,2,y\n", 8)
+			defer doc_close(&d)
+			table_sort_set(&d, 0, false)
+			table_sort_add(&d, 1, true)
+			text, _, ce := table_summary_parts(&d)
+			sep := strings.index(text, "  ·  ")
+			li_chk(bad, sep > 0, fmt.tprintf("precondition: the row clause ends at the first separator (%d, %q)", sep, text))
+			if sep <= 0 {return}
+			worst := strings.concatenate({"120,000 rows", text[sep:]}, context.temp_allocator)
+			li_chk(bad, strings.contains(worst, "  ·  8 columns  ·  sorted by Department asc, Last Name desc  ·  click to clear  ·  ") && strings.has_suffix(worst, cap_note), fmt.tprintf("the worst realistic line is %q", worst))
+			full := utf8.rune_count_in_string(worst)
+			// Cells up to the END of the clickable run: past this the control the
+			// row exists to offer is off the right edge of the window.
+			run := full - utf8.rune_count_in_string(text[ce:])
+			li_chk(bad, full == 105, fmt.tprintf("the whole line is 105 cells (%d)", full))
+			li_chk(bad, run == 90, fmt.tprintf("...and the `click to clear` run ends at cell 90 (%d)", run))
+			// THE SAME LINE AT ONE KEY, so table_summary_parts' claim that the
+			// overflow predates the key list is measured rather than argued:
+			// dropping key 2 is the only thing that changes here.
+			table_sort_drop(&d, 1)
+			t1, _, e1 := table_summary_parts(&d)
+			s1 := strings.index(t1, "  ·  ")
+			w1 := strings.concatenate({"120,000 rows", t1[s1:]}, context.temp_allocator)
+			run1 := utf8.rune_count_in_string(w1) - utf8.rune_count_in_string(t1[e1:])
+			li_chk(bad, d.table_sort.nkeys == 1, fmt.tprintf("precondition: dropping key 2 leaves one key (%d)", d.table_sort.nkeys))
+			li_chk(bad, run1 == 74, fmt.tprintf("...at ONE key the same run already ended at cell 74 (%d): the overflow is older than the key list", run1))
+			// At px 16 / char_w 8, drawn from TABLE_CELL_PAD_X. Printed rather than
+			// asserted against a window size: what a "supported" width is belongs to
+			// the product, not to this file. See table_summary_parts' comment for
+			// what was decided.
+			mw, _ := plat.window_min_size(96)
+			fmt.printfln(
+				"     summary band: whole line %d cells = %.0fpx, clear run ends at %d cells = %.0fpx (one key: %d cells = %.0fpx), window minimum %d px (96 dpi)",
+				full,
+				TABLE_CELL_PAD_X + f32(full) * cw,
+				run,
+				TABLE_CELL_PAD_X + f32(run) * cw,
+				run1,
+				TABLE_CELL_PAD_X + f32(run1) * cw,
+				mw,
+			)
 		}
 	}
 
@@ -14582,7 +14788,7 @@ when NEWTPAD_TESTS {
 						for col in cols {
 							if col.c >= len(head) {continue}
 							a := table_sort_arrow_rect(col, px, table_right(W))
-							lab := table_header_label_col(col, cw, px)
+							lab := table_header_label_col(col, cw, px, table_sort_digits_shown(&d))
 							hcells := plat.text_cells(&t, transmute([]u8)head[col.c], 0, .Doc)
 							if hcells > lab.cells {hcells = lab.cells}
 							hx := table_cell_text_x(lab) + table_cell_align_dx(lab, hcells, cw)
