@@ -1062,6 +1062,27 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	return false
 }
 
+// The header menu's six sort rows (menu.odin's table_header_menu_items): do
+// they take their target from the menu that opened them rather than from any
+// state of their own? All six read app.menu.ctx_col, the column the menu was
+// opened on, and there is no persistent "current column" in the table view to
+// fall back on -- table_edit_col exists, but only while a cell is being
+// edited, and none of the six consult it. A binding that fires outside that
+// menu therefore has no column to name.
+//
+// command_from_name (keymap.odin) consults this to refuse a hand-written
+// keymap line naming one of these six -- see its comment. A seventh command
+// with the same shape gets the same refusal by being added to this switch,
+// not by a second list somewhere else.
+command_needs_menu_target :: proc(cmd: Command_Id) -> bool {
+	#partial switch cmd {
+	case .Table_Sort_Asc, .Table_Sort_Desc, .Table_Sort_Then_Asc, .Table_Sort_Then_Desc,
+	     .Table_Sort_Remove, .Table_Sort_Clear:
+		return true
+	}
+	return false
+}
+
 // May `cmd` run against `doc`? The single answer to that question, and both
 // routes to a command consult it: the menu greys the row out (item_enabled,
 // menu.odin) and command_dispatch refuses outright.

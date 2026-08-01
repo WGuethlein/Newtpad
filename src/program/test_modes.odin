@@ -226,6 +226,20 @@ when NEWTPAD_TESTS {
 		for c in ([]Command_Id{.Find_Toggle_Filter, .Find_Toggle_Regex, .Filter_Open, .Goto_Line, .Save_As}) {
 			fmt.printfln("  %-24v in palette=%-5v chord=%q", c, command_in_palette(c), command_chord(c))
 		}
+		// command_from_name must refuse the six header-menu sort commands: they read
+		// app.menu.ctx_col, the column a context menu was opened on, and a
+		// hand-written keys.txt chord naming one would fire with no menu behind it
+		// and no column of its own to aim at -- see command_needs_menu_target
+		// (commands.odin) and command_from_name's own comment (keymap.odin). An
+		// ordinary command's name must still resolve, so the refusal is provably
+		// the six and not the whole lookup going dark.
+		_, sort_named := command_from_name("Table_Sort_Asc")
+		if sort_named {bad += 1}
+		fmt.printfln("%-22s -> named=%-5v %s", "Table_Sort_Asc by name", sort_named, "OK" if !sort_named else "FAIL want refused")
+		ordinary_cmd, ordinary_named := command_from_name("Toggle_Wrap")
+		ordinary_ok := ordinary_named && ordinary_cmd == .Toggle_Wrap
+		if !ordinary_ok {bad += 1}
+		fmt.printfln("%-22s -> cmd=%-16v named=%-5v %s", "Toggle_Wrap by name", ordinary_cmd, ordinary_named, "OK" if ordinary_ok else "FAIL")
 		// dispatch effects (dummy window/text; these commands don't touch them)
 		app_active(&app).cursor = 0
 		command_dispatch(resolve_key(.Right, false, false, .Editor), {.Right, false, false, false}, &app, &dummy, &dtext, 10)
