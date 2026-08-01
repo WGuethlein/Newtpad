@@ -839,9 +839,12 @@ TABLE_SORT_MAX :: 100_000
 // they scan. Neither of those is a timing argument, and the timing is now measured:
 //
 //   100,000 rows, same file, same run (tablesorttest's C6), DEBUG build:
-//   1 key 382-395 ms; 3 keys 690-702 ms, about 1.8x (1.78-1.86x observed over five
-//   runs on one machine -- three runs and two decimal places would be a range the
-//   evidence cannot carry, so read it as "about 1.8").
+//   1 key 382-395 ms; 3 keys 690-702 ms, about 1.8x. Three recorded runs gave
+//   1.78-1.80x and an independent run during review gave 1.86x. Read it as "about
+//   1.8": four runs on one machine cannot carry a range to two decimal places, and
+//   the reason this says so is that the same comment first claimed "five runs" with
+//   three written down -- which is the shape this file has now corrected three times
+//   in one batch.
 //
 // Debug because build.bat release is -subsystem:windows and a headless mode cannot
 // print from it at all. CONVERTED, NOT MEASURED, with the ratio TABLE_SORT_MAX's own

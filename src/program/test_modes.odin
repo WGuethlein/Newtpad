@@ -2233,7 +2233,8 @@ when NEWTPAD_TESTS {
 	// THE BOUND IS DERIVED FROM THE CAP, not picked: a build that re-scanned the file
 	// per key would cost about k times the single-key build, so k is the failure this
 	// catches, and the honest measured cost is well under it -- 1.47-1.52x over four
-	// runs at k=2, 1.78-1.86x at k=3, because the extraction is a fraction of a pass
+	// runs at k=2, and about 1.8x at k=3 (three recorded runs 1.78-1.80x, one
+	// independent run during review 1.86x), because the extraction is a fraction of a pass
 	// dominated by the line read and the n log n comparisons. The threshold sits at
 	// 0.9k: at today's cap that is 1.80x against a measured 1.49x, a fifth of headroom
 	// over the honest figure and a tenth of margin under the failure. The ratio is the
