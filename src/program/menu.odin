@@ -627,7 +627,11 @@ menu_open_at :: proc(app: ^App, mi: int) {
 // here. Two input paths reach it, both in main.odin's table block and both
 // carrying table_header_menu_items: a left click on the header's chevron
 // (table_header_at) and a right click anywhere in a header cell
-// (table_header_col_at).
+// (table_header_cell_at) -- NOT table_header_col_at, an older procedure that
+// answers a similar-sounding question but does not clip to the grid's right
+// edge, so a press past it resolves to the last column instead of to
+// nothing. The right-click path was written against table_header_cell_at
+// specifically to avoid that; see its own comment in table.odin.
 //
 // `items` is not copied, so the caller must pass a slice that outlives the
 // menu. main.odin's frame loop calls free_all(context.temp_allocator) once

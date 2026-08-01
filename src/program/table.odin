@@ -3171,10 +3171,15 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			// would otherwise land under the arrow no matter how short it was.
 			lab := table_header_label_col(col, char_w, px)
 			fb := transmute([]u8)field
-			hcells := plat.text_cells(text, fb, 0, .Doc)
-			if hcells > lab.cells {
+			// fcells, not hcells: that name is already the layout slice above (the
+			// header's two hit regions), and this is an unrelated int -- the
+			// field's own width in cells -- thirty lines inside its loop. Same name
+			// as table_draw's row pass (:2781), which counts a cell's field the
+			// same way.
+			fcells := plat.text_cells(text, fb, 0, .Doc)
+			if fcells > lab.cells {
 				field = field[:plat.text_bytes_for_cells(text, fb, lab.cells, 0, .Doc)]
-				hcells = lab.cells
+				fcells = lab.cells
 			}
 			// The header takes its column's alignment, so a right-aligned numeric
 			// column reads as ONE column rather than as a left-aligned label with
@@ -3183,7 +3188,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			// the header is now a real header (§10) and the previous draw made no
 			// distinction at all: both branches of its `hl` resolved to
 			// Text_Primary, so the "highlighted" header row was a no-op.
-			hx := table_cell_text_x(lab) + table_cell_align_dx(lab, hcells, char_w)
+			hx := table_cell_text_x(lab) + table_cell_align_dx(lab, fcells, char_w)
 			plat.text_draw(gfx, text, field, hx, hy, px, g_theme[.Text_Bright], .Doc)
 		}
 		// §10's "click to sort with an accent arrow", and the DIMMED preview of it on

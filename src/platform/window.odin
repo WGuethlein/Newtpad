@@ -967,13 +967,23 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		return 0
 	case win.WM_RBUTTONDOWN:
 		// Same shape as the middle button above: record where it happened and set
-		// the flag. Returning 0 rather than falling through also stops
-		// DefWindowProc synthesizing WM_CONTEXTMENU, which would otherwise hand the
-		// OS a second chance to open a menu of its own over ours.
+		// the flag. `return 0` here only accounts for WM_RBUTTONDOWN itself -- it
+		// does not stop WM_CONTEXTMENU, which Windows raises from the UP message
+		// (WM_RBUTTONUP, or WM_NCRBUTTONUP for a non-client click), not the down
+		// one. This file has no case for either UP message, so it falls through to
+		// DefWindowProcW unchanged and WM_CONTEXTMENU still fires. That is
+		// harmless to verify from here: this window is never given a menu (no
+		// SetMenu or CreateMenu call anywhere in this file), so DefWindowProc's
+		// default WM_CONTEXTMENU handling -- open the window's menu at the click
+		// point -- has no menu to open.
 		lp := u32(uintptr(lparam))
 		xi := int(lp & 0xFFFF);if xi >= 0x8000 {xi -= 0x10000}
 		yi := int(lp >> 16);if yi >= 0x8000 {yi -= 0x10000}
 		w.mouse_x = i32(xi);w.mouse_y = i32(yi)
+		// kbd_nav, same as WM_LBUTTONDOWN above: a right press is mouse input same
+		// as a left one, and the focus ring UI spec 18 gates on this is not
+		// supposed to survive ANY click.
+		w.kbd_nav = false
 		w.mouse_right_pressed = true
 		return 0
 	}

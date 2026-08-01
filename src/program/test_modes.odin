@@ -3091,6 +3091,44 @@ when NEWTPAD_TESTS {
 			hs1 := table_header_layout(&d, ecw, W, px, 1)
 			li_chk(bad, !hs1[1].has_chev, fmt.tprintf("a column exactly the marks' own width (inner 29.0) has no room left and loses it (%v)", hs1[1].has_chev))
 		}
+
+		// -- AN OVERLAY OWNS THE HEADER BAND -----------------------------------
+		//
+		// The palette (y0 44, height 34 + rows*26) and the history panel (rows
+		// from CONTENT_TOP + 28 in the right-hand strip) are both painted OVER
+		// the content, and CONTENT_TOP..+30 at 96 DPI is exactly the grid's
+		// header band -- so a right-click reaching the header while either is
+		// open would resolve a column from pixels the user was reading an
+		// overlay row in. main.odin's right-click gate (:794) reads
+		// app_content_overlay_active(&app); this checks that exact proc, not a
+		// copy of its logic, so the two cannot drift apart.
+		{
+			d := ts_seam_doc({8, 4, 5, 80})
+			defer doc_close(&d)
+			// The point is an ordinary header hit absent any overlay -- proof this
+			// is testing the GATE and not a point that was never clickable at all.
+			c, ok := table_header_cell_at(&d, cw, W, 125, mid, px)
+			li_chk(bad, ok && c == 0, fmt.tprintf("precondition: (125, +15) is an ordinary header hit with nothing open (%v, c%d)", ok, c))
+
+			app: App
+			// menu_init, not a bare App: Menu_State's zero value has open == 0,
+			// which reads as "the File dropdown is open" (menu_is_active, and see
+			// menutest's own "--- startup ---" case) -- exactly the trap
+			// zero-is-initialization warns about, so leaving it unset here would
+			// make this block's baseline already "blocked" for the wrong reason.
+			menu_init(&app.menu)
+			li_chk(bad, !app_content_overlay_active(&app), "precondition: a freshly-initialised App has no overlay open")
+
+			app.palette.active = true
+			li_chk(bad, app_content_overlay_active(&app), "the palette painted over the header band blocks the right-click gate")
+			app.palette.active = false
+
+			app.history.open = true
+			li_chk(bad, app_content_overlay_active(&app), "the history panel painted over the header band blocks the right-click gate")
+			app.history.open = false
+
+			li_chk(bad, !app_content_overlay_active(&app), "...and clearing both leaves the gate open again")
+		}
 	}
 
 	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the

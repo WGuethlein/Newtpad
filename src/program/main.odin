@@ -280,7 +280,7 @@ main :: proc() {
 		px, char_w, line_h := rc.px, rc.char_w, rc.line_h
 		window.dpi_changed = false
 
-		if window.char_count > 0 || window.key_count > 0 || window.mouse_pressed || window.mouse_middle_pressed {
+		if window.char_count > 0 || window.key_count > 0 || window.mouse_pressed || window.mouse_middle_pressed || window.mouse_right_pressed {
 			session_dirty = true
 			last_input = time.tick_now()
 		}
@@ -786,12 +786,16 @@ main :: proc() {
 			// Both still read table_header_layout, so "the cell" means the same
 			// rectangle to the right button, the left button and the draw.
 			//
-			// Not while a menu is already up: an open dropdown is painted OVER the
-			// header, so hit-testing this point against the header would read a
-			// coordinate in the wrong space -- resolving a column from pixels the user
-			// was looking at a menu row in. menu_hit_test already gives the left button
-			// the same treatment (any click while a dropdown is open is consumed).
-			if window.mouse_right_pressed && !menu_is_active(&app) {
+			// Not while a menu, the palette or the history panel is up: each is
+			// painted OVER the content, so hit-testing this point against the header
+			// would read a coordinate in the wrong space -- resolving a column from
+			// pixels the user was looking at a menu row, a palette row or a history
+			// row in. menu_hit_test, the palette block above (:509) and the history
+			// block above (:540) each already give the LEFT button this same
+			// treatment; app_content_overlay_active is that same three-flag check
+			// read from one place instead of copied here, so this gate and those
+			// three blocks cannot drift apart from each other.
+			if window.mouse_right_pressed && !app_content_overlay_active(&app) {
 				if c, on_head := table_header_cell_at(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); on_head {
 					menu_open_ctx(&app, table_header_menu_items, f32(window.mouse_x), f32(window.mouse_y), c)
 				}
