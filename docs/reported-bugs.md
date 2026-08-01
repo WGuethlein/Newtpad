@@ -49,3 +49,84 @@ line between them adds nothing (blank runs are zero height, margins collapse). C
 lines into one paragraph with a space at the break. That is a design question, not a bug — ask before
 changing it.
 
+**CONFIRMED 2026-08-01, and being fixed** on branch `fix/preview-paragraph-join`. It is the line-per-block
+model. See [the design](superpowers/specs/2026-08-01-preview-paragraph-join-design.md). Delete this entry
+when that merges.
+
+---
+
+## Reported 2026-08-01 — documented for a later pass, not investigated
+
+Wyatt's list, recorded verbatim at his direction: *"just document them for a further pass later."* Each
+entry separates **what he said** from **what the code says**, and the code notes below are from a few
+minutes of reading, not from a real investigation. Nothing here has been reproduced.
+
+### Dragging a tab off the tab row does not spawn a new instance with that tab
+
+*"dragging tabs off the tab row doesn't spawn a new instance with that tab"*
+
+**This looks like a missing feature rather than a broken one.** `tabs_drag_update` (`ui_tabs.odin:428`)
+reorders the dragged tab *along the strip* by adjacent swaps and nothing else — there is no tear-off,
+no detach, and no second-window path anywhere in the file. So the expected behaviour has never been
+built, and it should probably move to `requested-features.md` when someone confirms that.
+
+Worth deciding before building: Newtpad tear-off means a **new process** (a second window is not a
+thing today), which drags in what the torn tab does about unsaved state and about the session store —
+both windows would be writing the same `%APPDATA%\Newtpad` session. That is the actual design question,
+not the drag gesture.
+
+### Sorted table headers truncate their text without the column changing width
+
+*"when you sort the columns in table view the column headers seem to truncate and doesn't show the rest
+of the text until you expand the columns... but the column doesn't change horizontal size"*
+
+**Almost certainly the sort's own header decorations eating label width.** v0.36.0 added an arrow, a
+hover chevron and — new in that release — a **precedence digit**, all inside the header cell.
+`table_header_layout` is the one producer of header geometry (CLAUDE.md's one-layout rule), and HANDOFF
+§6bc records that header geometry now depends on document sort state via `table_sort_digits_shown` →
+`doc.table_sort.nkeys`, where before this branch it was a function of columns and DPI alone.
+
+So the label's available width shrinks when a sort is applied while the **column** width does not — which
+is exactly what he describes. Start at `table_header_layout` and check whether the label's measured width
+subtracts the decorations from the same rectangle the truncation is computed against.
+
+**This is a v0.36.0 regression by that reading**, and it is the kind of thing the live pass in
+[live-pass-v0.36.0.md](live-pass-v0.36.0.md) §2 is aimed at. Not verified.
+
+### Web links highlight on click but do not open the browser
+
+*"web links highlight on click but dont open the default broswer tab on click"*
+
+**The first thing to establish is whether an error dialog appears**, because that splits the search in
+two and neither half has been looked at:
+
+- `link_follow` (`links.odin:975`) is **loud on every failure path** — a failed reveal, a failed activate
+  and an unresolvable target each raise a `plat.message_error` box. So *"nothing happens at all"* would
+  mean the click never reached `link_follow`.
+- If it does reach it, `link_activate` → `plat.shell_open_url` (`file.odin:725`) → `ShellExecuteW`, and
+  there is a **scheme whitelist** that `shell_open_url` re-checks itself (HANDOFF §6l). A URL refused
+  there returns false, which would produce a dialog.
+
+**Also worth confirming with him: is he holding Ctrl?** The documented behaviour is **Ctrl+click**
+everywhere — document, table cells and preview (`features.md` §Links and paths) — while the *decoration*
+appears on Ctrl by default and can be set to *Always* in Settings. A plain click on an always-decorated
+link highlighting but not following would be working as designed, and would still read as broken. If
+that is what he hit, the fix is a discoverability question, not a bug.
+
+### Menu and Ctrl+F interactions feel awkward
+
+*"there are a lot of interactions in and out of menus like Ctrl+F that are awkward but it's hard to
+expalin these now."*
+
+**Deliberately left vague — he could not pin it down and said so.** Recorded so it is not lost, and
+because a vague report from daily use has been right before.
+
+Do not guess at a fix from this. What it needs is a session where he drives and narrates, or a
+focused live pass on focus transitions specifically: what has keyboard focus after opening and closing
+the find bar, after Esc, after a menu opens over the find bar, and what happens to the caret and to the
+selection at each of those. The find bar moved to the top in batch 12 and twelve call sites read its
+inset (HANDOFF §6aq), and CLAUDE.md's own event rule is only *partially* honoured — "input is drained
+from the platform queue but acted on at several points in the frame, and some widgets still resolve
+state during the draw" — so there is a plausible structural cause here, which is a reason to look
+properly rather than to patch a symptom.
+
