@@ -43,7 +43,18 @@ has the entry; four things from it matter before touching anything nearby:
 - **`mdtest` silently went 0 → 20 failures mid-batch** because it printed `FAIL` and exited 0. Six modes
   had that; 60 of 86 still do (see §5).
 
-**No live GUI pass has been done on v0.37.0.** How the re-flowed prose actually reads is unverified.
+**Two live passes are outstanding and both are Wyatt's** — this environment cannot inject GUI input, so
+everything about how these two releases *look* is an inference from source:
+
+| Checklist | Covers | Why it matters |
+|---|---|---|
+| [docs/live-pass-v0.37.0.md](docs/live-pass-v0.37.0.md) | the preview's paragraph model | it changed how **every** markdown document looks, and setext changes documents that already exist |
+| [docs/live-pass-v0.36.0.md](docs/live-pass-v0.36.0.md) | multi-column sort | §1 is the data-loss seam — edit a moved row while sorted, save, verify elsewhere |
+
+**Next batch is 20, Excel-style column filtering** — the other half of what Wyatt asked for on
+2026-07-31. Two decisions are already taken (it refuses past `TABLE_SORT_MAX`; it is exclusive with
+`Ctrl+L`), the header menu exists to hang a `Filter` row on, and `table_header_layout` is the one
+producer of header geometry. See `requested-features.md` §1.
 
 **Batch 19 shipped multi-column sort** — the table view sorts by up to two columns, first-selected-wins,
 through a header menu (hover chevron or right-click), Ctrl+click, and the plain click that already

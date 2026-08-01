@@ -279,6 +279,27 @@ file is never rewritten.** v0.36.0 added a second sort key on top of it (§6bc).
   window an uncapped wrap gives 200-character lines."*
 
 ### §9 Markdown
+
+**Paragraph joining is DONE (v0.37.0, HANDOFF §6bd)** — consecutive prose lines join and re-flow, hard
+breaks survive, lazy continuation works for list items and blockquotes, and setext headings render. It
+is noted here because §9.2 asks for it and a reader checking this list should find the answer rather
+than nothing. Two things it left behind, both new:
+
+- **A blockquote written with `>` on every line renders as N stacked blocks with a segmented bar** —
+  13px gaps between 26px segments, measured. Pre-existing, but v0.37.0 made it *inconsistent*: the
+  lazily-continued form (`> a` then unmarked lines) now renders as one clean bar, so the way nearly
+  everyone writes a blockquote looks worse than the unusual way. The fix is joining a run of *marked*
+  quote lines — the same `md_join_run` machinery, a different predicate. **Small and self-contained.**
+- **Split scroll sync over a long hard-wrapped paragraph is per BLOCK**, so the preview pins to the
+  paragraph's top rather than tracking the editor's line. This is `ui-spec` §9.4 (*"scroll sync by
+  block, not by line"*) being honoured for the first time — the finer old behaviour was an artefact of
+  every source line accidentally being its own block — so it is **not a regression against spec**.
+  Sub-block sync is achievable and two of three pieces exist: `Md_Anchor` already carries a
+  within-block pixel offset, and `lay.sh.line_boxes` already gives per-visual-line geometry. Missing is
+  a map from a source byte to an offset in `e.joined`. **The hard half is the inverse** —
+  `md_anchor_top_byte` must invert it exactly, and `md_scroll_scalar`'s own comment calls that property
+  hard-won. Scope any task here around the inverse, not the forward map.
+
 - **Concealment** — hide `#`/`**` on non-caret lines, Obsidian-style. **Wyatt chose this** and it is not
   built: it makes the drawn column stop matching the byte column, which is the seam §6j records sixteen
   bugs against. Needs its own batch.
