@@ -2019,20 +2019,33 @@ table_header_col_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (
 // PRECEDENCE, stated once here rather than left to each consumer:
 //
 //   the ±4px RESIZE EDGE ZONE WINS. Inside it this returns nothing -- no lift, no
-//   ghost arrow -- because that is exactly where the press does not sort either
-//   (main.odin tests table_edge_at first, and its own comment records why:
-//   reordering a whole file on a slightly-off resize grab is not a recoverable
-//   surprise). The cursor there is already .SizeWE. Showing a sort affordance over
-//   a pixel that resizes would be the "affordance appears where the gesture does
-//   not work" failure table_edge_at's comment was written about, with the added
-//   insult that the gesture it advertises is the destructive-looking one.
+//   ghost arrow, AND NO CHEVRON -- because that is exactly where the press does
+//   not sort either (main.odin tests table_edge_at first, and its own comment
+//   records why: reordering a whole file on a slightly-off resize grab is not a
+//   recoverable surprise). The cursor there is already .SizeWE. Showing a sort
+//   affordance over a pixel that resizes would be the "affordance appears where
+//   the gesture does not work" failure table_edge_at's comment was written about,
+//   with the added insult that the gesture it advertises is the destructive-looking
+//   one.
 //
-// THREE BEHAVIOURS ON ONE RECT -- sort click, resize drag, and now hover -- and
-// all three resolve through table_cols_layout and this file's two band gates, so
-// the ordering above is the whole of the interaction. Note the DATA rows are
-// unaffected in every case: table_edge_at and table_header_col_at both refuse
-// outside the header band, which is what keeps the same x one row down a cell
-// edit.
+//   The chevron inherits that refusal rather than restating it: it exists only on
+//   the column this returns (table_header_layout takes the answer as its
+//   hover_col) and is only ever hit-tested through table_header_at, which asks
+//   this first. So there is still ONE expression excluding the edge zone from
+//   every header affordance, and adding a second hit region did not add a second
+//   place to keep the tolerance in step. The edge keeps winning because it is the
+//   narrower target and the older gesture. The two rectangles do not in fact
+//   overlap at the shipped metrics -- the chevron stops a whole cell pad (10px at
+//   96 DPI) short of the cell's right edge and the zone reaches only 4px in -- but
+//   the ordering is asserted (tablesorttest C15) rather than left to that
+//   arithmetic, because nothing anywhere states that 4 must stay below 10.
+//
+// FOUR BEHAVIOURS ON ONE RECT -- sort click, resize drag, hover, and the menu
+// chevron -- and all four resolve through table_cols_layout and this file's two
+// band gates, so the ordering above is the whole of the interaction. Note the DATA
+// rows are unaffected in every case: table_edge_at and table_header_col_at both
+// refuse outside the header band, which is what keeps the same x one row down a
+// cell edit.
 table_header_hover_col :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (c: int, ok: bool) {
 	if _, on_edge := table_edge_at(doc, char_w, width, mx, my, px); on_edge {return 0, false}
 	return table_header_col_at(doc, char_w, width, mx, my, px)
@@ -2044,6 +2057,14 @@ table_header_hover_col :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -
 table_edge_at_cursor :: #force_inline proc(doc: ^Document, char_w, width, mx, my, px: f32) -> bool {
 	_, ok := table_edge_at(doc, char_w, width, mx, my, px)
 	return ok
+}
+
+// The same, for the chevron: the cursor wants "is the pointer on a menu chevron"
+// and has no use for the column. Through table_header_at for the reason above --
+// one definition of the rectangle, shared with the press and with the draw.
+table_chevron_at_cursor :: #force_inline proc(doc: ^Document, char_w, width, mx, my, px: f32) -> bool {
+	_, hit := table_header_at(doc, char_w, width, mx, my, px)
+	return hit == .Chevron
 }
 
 // Set column `c`'s width from a dragged edge position, in the same cells the
@@ -2152,40 +2173,95 @@ Table_Arrow :: struct {
 
 table_arrow_w :: #force_inline proc(px: f32) -> f32 {return f32(int(px * 0.6))}
 
-// The gap between the header label and the arrow, in pixels. Half a cell pad --
-// enough that the two read as separate marks, small enough that reserving it
-// costs a narrow column no more than one extra character of its name.
-table_arrow_gap :: #force_inline proc() -> f32 {return f32(int(TABLE_CELL_PAD_X * 0.5))}
+// The gap between two adjacent things in the header's right-hand run --
+// label | arrow | chevron -- in pixels. Half a cell pad: enough that they read as
+// separate marks, small enough that reserving it costs a narrow column no more
+// than one extra character of its name.
+//
+// Named for MARKS rather than for the arrow (it was table_arrow_gap until the
+// chevron arrived) because it is now the single spacing metric of that run and a
+// name that claims one of its three consumers would invite a second constant for
+// the others.
+table_mark_gap :: #force_inline proc() -> f32 {return f32(int(TABLE_CELL_PAD_X * 0.5))}
 
-// The arrow's rectangle inside a column's header cell: hard against the cell's
-// right inner edge, vertically centred in the header band, and clamped so it
-// stays on screen in a column that runs past the grid's right edge.
+// --- the header's menu chevron ---------------------------------------------
+//
+// The batch-19 design gives the header cell a context menu with two ways in: a
+// right-click anywhere in the cell, and this chevron on the HOVERED column. The
+// mark is built from quads for the reason table_sort_arrow records (the document
+// face is the user's and nothing guarantees it has a chevron glyph): a stack of
+// TABLE_CHEV_STEPS square bars descending from each end, meeting in the middle.
+//
+// DPI-SCALED (sx), where the arrow beside it is FONT-scaled (px * 0.6), and the
+// difference is not an oversight. The arrow labels the DATA -- it says which way
+// this column is ordered -- so it tracks the text it labels. The chevron is a
+// CONTROL, in the same family as §10's 30px header band and 10px cell padding,
+// and those are metrics of the chrome. A chevron that grew with the document font
+// would be a thumbnail at 200% zoom inside a band that barely moved.
+TABLE_CHEV_STEPS :: 3
+table_chev_th :: #force_inline proc() -> f32 {return max(hairline(), sx(2))}
+table_chev_w :: #force_inline proc() -> f32 {return table_chev_th() * f32(2 * TABLE_CHEV_STEPS - 1)}
+table_chev_h :: #force_inline proc() -> f32 {return table_chev_th() * f32(TABLE_CHEV_STEPS)}
+
+// The x every header mark is measured back from: the cell's right INNER edge,
+// clipped to the grid's right edge.
+//
+// ONE expression for that anchor, because the arrow and the chevron are laid out
+// end to end from it and have to agree on it to the pixel, and because the clip
+// and the padding used to be two separate opinions -- the arrow clamped to
+// `right - w`, hard against the scrollbar with no padding at all, while every
+// other column kept its 10px.
+//
+// `right` may be given as the grid's right edge or as table_content_right and the
+// answer does not change: columns tile left to right, so the last laid-out
+// column's own right edge is the largest col.x + col.w there is, and
+// min(col.x + col.w, right) is the same number under either clip.
+table_header_marks_right :: #force_inline proc(col: Table_Col, right: f32) -> f32 {
+	return min(col.x + col.w, right) - TABLE_CELL_PAD_X
+}
+
+// The arrow's rectangle inside a column's header cell: vertically centred in the
+// header band, and hard against the CHEVRON's slot rather than against the cell's
+// right inner edge, on every column, sorted or not, hovered or not.
+//
+// Reserving the chevron's slot here is what keeps the arrow STILL. The chevron
+// appears and disappears as the pointer crosses the header; an arrow that shuffled
+// left to make room for it would be a mark moving under the mouse on the one
+// surface whose whole problem is that a click on it does something surprising --
+// the same argument table_header_label_col makes for reserving the slot in the
+// label, applied to the mark next to it.
 table_sort_arrow_rect :: proc(col: Table_Col, px, right: f32) -> Table_Arrow {
 	w := table_arrow_w(px)
 	h := w * 0.5
 	return Table_Arrow {
-		x = min(col.x + col.w - TABLE_CELL_PAD_X - w, right - w),
+		x = table_header_marks_right(col, right) - table_chev_w() - table_mark_gap() - w,
 		y = table_grid_top() + f32(int((table_header_h(px) - h) * 0.5)),
 		w = w,
 		h = h,
 	}
 }
 
-// The cells the arrow's slot takes out of a header cell -- the arrow plus its gap,
-// rounded UP to a whole cell because the label is truncated in cells and half a
-// cell of overlap is still overlap.
-table_arrow_cells :: proc(char_w, px: f32) -> int {
+// The pixels the header's marks reserve at the right end of every cell:
+// gap, arrow, gap, chevron, ending at table_header_marks_right.
+table_header_marks_w :: #force_inline proc(px: f32) -> f32 {
+	return table_mark_gap() * 2 + table_arrow_w(px) + table_chev_w()
+}
+
+// The cells that run takes out of a header cell, rounded UP to a whole cell
+// because the label is truncated in cells and half a cell of overlap is still
+// overlap.
+table_header_marks_cells :: proc(char_w, px: f32) -> int {
 	if char_w <= 0 {return 0}
-	need := table_arrow_w(px) + table_arrow_gap()
+	need := table_header_marks_w(px)
 	n := int(need / char_w)
 	if f32(n) * char_w < need {n += 1}
 	return n
 }
 
-// The header LABEL's own box: the column's cell with the arrow's slot taken off
-// its right end. THE producer for where a header name is truncated AND for how
-// far a right-aligned one is nudged -- both, because doing only the first is the
-// bug this exists to fix in its other half.
+// The header LABEL's own box: the column's cell with the MARKS' slot -- the arrow
+// and the chevron together -- taken off its right end. THE producer for where a
+// header name is truncated AND for how far a right-aligned one is nudged -- both,
+// because doing only the first is the bug this exists to fix in its other half.
 //
 // The arrow used to be drawn after the header text and on top of it, with the
 // label truncated to the FULL cell width, so any name that filled its column had
@@ -2195,23 +2271,171 @@ table_arrow_cells :: proc(char_w, px: f32) -> int {
 // which §10 pushes hard against the cell's right inner edge, precisely where the
 // arrow lives -- would sit under the arrow however short it was.
 //
-// RESERVED ON EVERY COLUMN, sorted or not, hovered or not. The alternative is to
-// reserve it only where an arrow is actually drawn, and that makes the header
-// label re-truncate as the pointer crosses it: text that changes under the mouse,
-// on the surface whose whole problem is that a click on it does something
-// surprising. Every column is sortable, so every column is a column the arrow can
-// appear in; paying the slot once, uniformly, keeps the header row still. The
-// cost is at most one or two characters of a header name, and only for a name
-// that already filled its column.
+// RESERVED ON EVERY COLUMN, sorted or not, hovered or not, and that now covers
+// the chevron as well as the arrow. The alternative is to reserve each slot only
+// where its mark is actually drawn, and that makes the header label re-truncate as
+// the pointer crosses it: text that changes under the mouse, on the surface whose
+// whole problem is that a click on it does something surprising. Every column is
+// sortable and every column has a menu, so every column is one both marks can
+// appear in; paying the slot once, uniformly, keeps the header row still. The cost
+// is at most a few characters of a header name, and only for a name that already
+// filled its column.
 //
 // x is unchanged, so table_cell_text_x still answers for the label; only the
 // width narrows.
 table_header_label_col :: proc(col: Table_Col, char_w, px: f32) -> Table_Col {
 	lab := col
-	n := min(table_arrow_cells(char_w, px), max(0, col.cells - 1)) // never below one cell of name
+	n := min(table_header_marks_cells(char_w, px), max(0, col.cells - 1)) // never below one cell of name
 	lab.cells = col.cells - n
 	lab.w = col.w - f32(n) * char_w
 	return lab
+}
+
+// --- ONE layout for the header cell, and its two hit regions ---------------
+//
+// The header cell used to have exactly one hit region and one gesture. It now has
+// two -- the cell body sorts, and a chevron opens the column's menu -- and
+// development-loop.md §4 names that transition: Shape B, *a correct, tested
+// function fed the wrong input, or its result read in the wrong space*, which
+// accounted for sixteen bugs in one session. CLAUDE.md's countermeasure is one
+// layout per widget, and this procedure is it: the draw, the press, the hover lift
+// and the pointer shape all read these rectangles and NONE of them re-derives
+// "where is the chevron" from col.x + col.w.
+//
+// A shared shape rather than a third ad-hoc struct. table_sort_arrow_rect already
+// answers in Table_Arrow and the tab strip has its own Tab_Rect; a third private
+// quadruple here would have made "which x/y/w/h am I holding" a question a reader
+// has to answer per call site.
+Table_Rect :: struct {
+	x, y, w, h: f32,
+}
+
+// `body` is the WHOLE visible cell and `chevron` sits inside it, rather than the
+// body being the cell with the chevron's slot cut out of it. Two rectangles that
+// tile the cell would leave the 10px of cell padding to the chevron's right in
+// neither one -- a dead strip, per column, on pixels that sort today. So they
+// OVERLAP and the precedence is stated once, here, rather than left to each
+// consumer: the chevron wins, and table_header_at tests it first.
+//
+// `chevron` is the drawn mark's own rectangle, not a padded target around it. A
+// click region larger than the mark would be "clickable where nothing is drawn" --
+// the mirror of the failure table_edge_at's comment was written about -- and the
+// large target for this command already exists: a right-click anywhere in the
+// cell, which is also the route that survives has_chev = false.
+Table_Header_Cell :: struct {
+	c:        int,
+	body:     Table_Rect, // the cell, clipped to what the gutter and the grid's right edge leave visible
+	chevron:  Table_Rect, // zero-size when suppressed
+	has_chev: bool,
+}
+
+Table_Header_Hit :: enum {
+	None,
+	Body,
+	Chevron,
+}
+
+// Every visible header cell's geometry, left to right.
+//
+// `hover_col` is the column the pointer is on (table_header_hover_col) or
+// TABLE_SORT_NONE. THE CHEVRON EXISTS ONLY THERE: §10 deleted the per-column rules
+// because they made "the grid louder than the data", and a chevron painted on
+// every column is that same chrome coming back through a different door.
+//
+// Both refusals below are about pixels that are covered rather than about widths:
+//
+//   - the STICKY GUTTER covers the left 56px (table_draw's gutter pass), so a
+//     chevron that would land under it is suppressed rather than drawn where the
+//     user cannot see it, and the body starts at the gutter's edge so the pixels
+//     the gutter covers cannot sort the column hiding behind them.
+//   - a column too NARROW to hold the marks' run plus one cell of its own name
+//     suppresses the chevron, because a mark drawn over the label is the "smear
+//     below Date" bug (Wyatt, live use, v0.34.0) in its other half. Say plainly
+//     what this one is worth: with TABLE_COL_MIN at 8 cells, no width the sampler
+//     produces or a drag can reach falls below it at the shipped font sizes, so it
+//     is a guard against a width some later caller lays out by hand, not a state a
+//     user meets. The gutter clause above is the one that fires in ordinary use.
+//
+// Right-click does NOT consult has_chev (main.odin routes it through
+// table_header_cell_at, which reads `body` alone), so a suppressed chevron never
+// makes the menu unreachable.
+table_header_layout :: proc(
+	doc: ^Document,
+	char_w, width, px: f32,
+	hover_col: int,
+	allocator := context.temp_allocator,
+) -> []Table_Header_Cell {
+	out := make([dynamic]Table_Header_Cell, 0, 16, allocator)
+	if doc == nil {return out[:]}
+	top := table_grid_top()
+	hh := table_header_h(px)
+	right := table_right(width)
+	gw := table_gutter_w()
+	cw := table_chev_w()
+	ch := table_chev_h()
+	for col in table_cols_layout(doc, char_w, width) {
+		x0 := max(col.x, gw)
+		x1 := min(col.x + col.w, right)
+		hc := Table_Header_Cell {
+			c    = col.c,
+			body = {x = x0, y = top, w = max(0, x1 - x0), h = hh},
+		}
+		chx := table_header_marks_right(col, right) - cw
+		fits := col.w - TABLE_CELL_PAD_X * 2 >= table_header_marks_w(px) + char_w
+		if col.c == hover_col && fits && chx >= gw {
+			hc.has_chev = true
+			hc.chevron = {x = chx, y = top + f32(int((hh - ch) * 0.5)), w = cw, h = ch}
+		}
+		append(&out, hc)
+	}
+	return out[:]
+}
+
+table_rect_hit :: #force_inline proc(r: Table_Rect, mx, my: f32) -> bool {
+	return r.w > 0 && r.h > 0 && mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h
+}
+
+// The header cell under a point, from the LAYOUT's body rectangle -- the whole
+// cell, edge zone included, whether or not it has a chevron.
+//
+// THE producer for the right-click, which is the always-available route to a
+// column's menu, and it differs from table_header_col_at in exactly one way that
+// matters: it is clipped to the drawn band on both sides, so a press past the
+// grid's right edge (the vertical scrollbar's strip sits over the header band's y)
+// resolves to nothing rather than to the last column. `hover_col` is
+// TABLE_SORT_NONE because this question has nothing to do with the chevron; a
+// caller that passed a real column would get the same answer, since the chevron
+// never leaves its own body.
+table_header_cell_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (c: int, ok: bool) {
+	for hc in table_header_layout(doc, char_w, width, px, TABLE_SORT_NONE) {
+		if table_rect_hit(hc.body, mx, my) {return hc.c, true}
+	}
+	return 0, false
+}
+
+// The header cell under a point AND which of its two regions the point is in.
+//
+// THE producer for the left-button press and for the pointer shape, so the pixel
+// that shows a hand is the pixel that opens the menu, and the pixels that sort are
+// exactly the ones that lift. Both answers come out of table_header_layout above;
+// nothing here computes a coordinate of its own.
+//
+// Through table_header_hover_col, which is what makes the RESIZE EDGE win over
+// both regions: it refuses inside the ±4px zone, so this returns .None there and
+// the caller's edge branch has already claimed the press. The hovered column is
+// resolved from the point itself rather than passed in, because at a press the
+// column under the pointer IS the hovered one, and taking it as a parameter would
+// let a caller ask about a chevron on a column that has none.
+table_header_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (c: int, hit: Table_Header_Hit) {
+	col, ok := table_header_hover_col(doc, char_w, width, mx, my, px)
+	if !ok {return 0, .None}
+	for hc in table_header_layout(doc, char_w, width, px, col) {
+		if hc.c != col {continue}
+		if hc.has_chev && table_rect_hit(hc.chevron, mx, my) {return col, .Chevron}
+		if table_rect_hit(hc.body, mx, my) {return col, .Body}
+		break
+	}
+	return 0, .None
 }
 
 // Compute the per-column widths AND alignments from the first TABLE_SAMPLE rows
@@ -2916,16 +3140,21 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 		// To cright, not to `right`: the header band is a band like the zebra's and
 		// stops where the table does. See table_cols_layout.
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top()}, size = {cright, table_header_h(px)}, color = g_theme[.Bg_Raised]}})
+		// The header's two hit regions, from the one producer. Read here for the
+		// hover lift and again below for the chevron; the press and the pointer
+		// shape read the same procedure through table_header_at, which is what
+		// makes the drawn mark and the clickable one the same rectangle.
+		hcells := table_header_layout(doc, char_w, width, px, hover_col)
 		// The HOVER LIFT, over the band and under the rule, the text and the arrow.
 		// Bg_Hover is §1.1's role for exactly this ("hover fill for any tab, menu
 		// row, settings row or palette row"), so a hovered header reads as the same
 		// kind of thing as every other hoverable row in the app -- which is the
 		// whole point: the reader has met this signal elsewhere. The cell rect is
-		// the layout's, so the lift covers precisely the pixels that sort.
+		// the layout's `body`, so the lift covers precisely the pixels that sort.
 		if hover_col != TABLE_SORT_NONE {
-			for col in cols {
-				if col.c != hover_col {continue}
-				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {col.x, table_grid_top()}, size = {min(col.w, cright - col.x), table_header_h(px)}, color = g_theme[.Bg_Hover]}})
+			for hc in hcells {
+				if hc.c != hover_col {continue}
+				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {hc.body.x, hc.body.y}, size = {hc.body.w, hc.body.h}, color = g_theme[.Bg_Hover]}})
 				break
 			}
 		}
@@ -3002,6 +3231,20 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 				}
 				table_sort_arrow(gfx, qp, a, up, colour)
 			}
+		}
+		// The menu chevron, on the hovered column only (table_header_layout decides
+		// which that is, and whether it fits). Drawn from `hc.chevron` with no
+		// arithmetic of its own -- the whole point of this task is that the drawn
+		// rectangle and the clickable one are the same numbers.
+		//
+		// Text_Muted rather than Accent: Accent is spoken for by the sort arrow
+		// immediately to its left, and two accent marks side by side would say the
+		// column was doing two things. The chevron is chrome that answers "there is
+		// more here", so it takes the quiet text role and lets the arrow keep the
+		// colour that carries meaning.
+		for hc in hcells {
+			if !hc.has_chev {continue}
+			table_chevron(gfx, qp, hc.chevron, g_theme[.Text_Muted])
 		}
 		// The gutter's cover strip, in the header band -- the same clip the row pass
 		// applies, for the same reason. A column scrolled part-way under the gutter
@@ -3111,6 +3354,28 @@ table_sort_arrow :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, a: Table_Arrow
 		k := f32(i if up else TABLE_ARROW_STEPS - 1 - i)
 		bw := a.w * (k + 1) / TABLE_ARROW_STEPS
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {a.x + (a.w - bw) * 0.5, a.y + f32(i) * h}, size = {bw, h}, color = col}})
+	}
+}
+
+// The menu chevron: two stacks of square bars stepping inward from each end of
+// the rect and meeting at the bottom middle -- a hollow "v".
+//
+// HOLLOW, where the sort arrow is solid, and that is the one thing this mark has
+// to get right: it is drawn a few pixels from a solid triangle that means
+// "descending", and a filled chevron would be a second solid triangle saying
+// something else entirely. Quads only, for the reason table_sort_arrow records.
+//
+// Takes the RECT whole, like table_sort_arrow, and derives the bar size from it
+// rather than calling table_chev_th() again -- so a rect that came from anywhere
+// but table_header_layout would draw a visibly wrong mark instead of a correct one
+// in the wrong place.
+@(private = "file")
+table_chevron :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, r: Table_Rect, col: [4]f32) {
+	th := max(hairline(), f32(int(r.w / f32(2 * TABLE_CHEV_STEPS - 1))))
+	for i in 0 ..< TABLE_CHEV_STEPS {
+		y := r.y + f32(i) * th
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {r.x + f32(i) * th, y}, size = {th, th}, color = col}})
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {r.x + r.w - th - f32(i) * th, y}, size = {th, th}, color = col}})
 	}
 }
 

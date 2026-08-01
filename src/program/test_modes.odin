@@ -1900,6 +1900,7 @@ when NEWTPAD_TESTS {
 			ts_case_toggle_secondary_cycle(&bad)
 			ts_case_menu_items(&bad)
 			ts_case_menu_dispatch(&bad)
+			ts_case_header_seam(&bad)
 		}
 		fmt.printfln("tablesorttest: %d failures", bad)
 		if bad > 0 {os.exit(1)}
@@ -2871,6 +2872,224 @@ when NEWTPAD_TESTS {
 			}
 			li_chk(bad, asc.cmd == .Table_Sort_Asc, "precondition: the Sort Ascending row is in the table")
 			li_chk(bad, !item_enabled(&a, asc), "...and the row was greyed out saying so, rather than painting live and no-oping")
+		}
+	}
+
+	// A grid Document whose column widths are SET BY HAND rather than sampled.
+	//
+	// table_compute_widths needs loaded fonts and clamps every width to §10's
+	// 8-40, and both of those are in the way here: this case is about the
+	// boundaries of the header's layout, and the interesting boundary (a column
+	// too narrow to hold the marks' run and a name) is BELOW the clamp's floor.
+	// Writing the widths directly is the only way to reach it, and it is honest
+	// about what it proves -- the suppression is a guard against a width the
+	// sampler cannot produce, not an everyday state. See table_header_layout.
+	@(private = "file")
+	ts_seam_doc :: proc(widths: []int) -> Document {
+		d := ts_doc("alpha,b,gamma,delta\n1,2,3,4\n", len(widths))
+		for w in widths {
+			append(&d.table_widths, w)
+			append(&d.table_align, Table_Align.Left)
+		}
+		return d
+	}
+
+	// C15: the header's SEAM -- what is DRAWN against what is CLICKABLE.
+	//
+	// The header cell went from one hit region to two, which development-loop.md §4
+	// names as Shape B: a correct, tested function fed the wrong input, or its
+	// result read in the wrong space. So this case does NOT test table_header_layout
+	// against itself. Every rectangle it expects is written out by hand from §10's
+	// metrics -- gutter 56, cell padding 10, header band 30, and a column's width as
+	// cells * char_w + 2 * padding -- and every hit-test assertion is at an EXACT
+	// boundary pixel of the rectangle the draw uses. A layout and a hit-test that
+	// had drifted a single pixel apart still agree with each other everywhere except
+	// those pixels, which is why the interior of the chevron is not what is probed.
+	//
+	// The literals are only readable because the case pins its own inputs first: at
+	// UI_SCALE 1 and px 16 the marks' run is 5 + 9 + 5 + 10 = 29px and the chevron is
+	// 10x6. Those preconditions are asserted, not assumed -- if a metric moves, this
+	// case says which one rather than failing four rectangles at once.
+	//
+	// char_w is 8 in the main fixture and 7.25 in the exact-width one, and 7.25 is
+	// not a stylistic choice: it makes a 5-cell column's inner width land EXACTLY on
+	// the suppression threshold (5 * 7.25 == 29 + 7.25), and both sides of that
+	// comparison are exact in f32, so the ">=" boundary is tested rather than
+	// approached.
+	@(private = "file")
+	ts_case_header_seam :: proc(bad: ^int) {
+		fmt.println("-- the header's two hit regions: what is drawn is what is clickable --")
+		cw, px, W := f32(8), f32(16), f32(800)
+
+		// -- the metrics these literals are computed from --
+		li_chk(bad, UI_SCALE == 1, fmt.tprintf("UI_SCALE is 1, so sx() is the identity (%.2f)", UI_SCALE))
+		li_chk(bad, TABLE_CELL_PAD_X == 10 && table_gutter_w() == 56, fmt.tprintf("§10's padding is 10 and the gutter 56 (%.0f, %.0f)", TABLE_CELL_PAD_X, table_gutter_w()))
+		li_chk(bad, table_header_h(px) == 30, fmt.tprintf("§10's header band is 30px at px 16 (%.0f)", table_header_h(px)))
+		li_chk(bad, table_right(W) == 786, fmt.tprintf("the grid's right edge is 800 - 14 (%.0f)", table_right(W)))
+		li_chk(bad, table_chev_w() == 10 && table_chev_h() == 6, fmt.tprintf("the chevron is 10x6 (%.0fx%.0f)", table_chev_w(), table_chev_h()))
+		li_chk(bad, table_header_marks_w(px) == 29, fmt.tprintf("the marks reserve 5+9+5+10 = 29px (%.0f)", table_header_marks_w(px)))
+
+		top := table_grid_top()
+		mid := top + 15 // the middle of a 30px band
+
+		// -- the main fixture: four columns, laid out by hand ------------------
+		//
+		//   c0  8 cells -> w 84,  x  56 .. 140   wide, hovered below
+		//   c1  4 cells -> w 52,  x 140 .. 192   too narrow for a chevron
+		//   c2  5 cells -> w 60,  x 192 .. 252   the narrowest that still fits
+		//   c3 80 cells -> w 660, x 252 .. 912   runs past the grid's right edge
+		{
+			d := ts_seam_doc({8, 4, 5, 80})
+			defer doc_close(&d)
+			cols := table_cols_layout(&d, cw, W)
+			li_chk(bad, len(cols) == 4, fmt.tprintf("precondition: all four columns are laid out (%d)", len(cols)))
+			hs := table_header_layout(&d, cw, W, px, 0)
+			li_chk(bad, len(hs) == 4, fmt.tprintf("...and the header layout answers for all four (%d)", len(hs)))
+			if len(hs) != 4 || len(cols) != 4 {return}
+
+			// The bodies, against hand-written edges. c3's is CLIPPED at 786 --
+			// the pixels past the grid's right edge are the vertical scrollbar's
+			// lane, and the band is not drawn there.
+			want := [4][2]f32{{56, 140}, {140, 192}, {192, 252}, {252, 786}}
+			for h, i in hs {
+				ok := h.c == i && h.body.x == want[i][0] && h.body.x + h.body.w == want[i][1] && h.body.y == top && h.body.h == 30
+				li_chk(bad, ok, fmt.tprintf("c%d's body is x %.0f..%.0f (want %.0f..%.0f), y %.0f h %.0f", h.c, h.body.x, h.body.x + h.body.w, want[i][0], want[i][1], h.body.y - top, h.body.h))
+			}
+
+			// THE CHEVRON EXISTS ONLY ON THE HOVERED COLUMN. c0 is hovered here.
+			only := hs[0].has_chev && !hs[1].has_chev && !hs[2].has_chev && !hs[3].has_chev
+			li_chk(bad, only, fmt.tprintf("hovering c0 gives a chevron to c0 alone (%v %v %v %v)", hs[0].has_chev, hs[1].has_chev, hs[2].has_chev, hs[3].has_chev))
+			// ...and hovering nothing gives none at all.
+			none := 0
+			for h in table_header_layout(&d, cw, W, px, TABLE_SORT_NONE) {
+				if h.has_chev {none += 1}
+			}
+			li_chk(bad, none == 0, fmt.tprintf("with the pointer off the header there is no chevron anywhere (%d)", none))
+			// ...and hovering c2 moves it there rather than adding a second one.
+			h2 := table_header_layout(&d, cw, W, px, 2)
+			moved := !h2[0].has_chev && h2[2].has_chev
+			li_chk(bad, moved, fmt.tprintf("hovering c2 moves the chevron rather than adding one (c0 %v, c2 %v)", h2[0].has_chev, h2[2].has_chev))
+
+			// c0's chevron, by hand: hard against the cell's right INNER edge
+			// (140 - 10), so it spans 120..130, and centred in the band ((30-6)/2).
+			ch := hs[0].chevron
+			li_chk(bad, ch.x == 120 && ch.w == 10, fmt.tprintf("c0's chevron spans 120..130 (%.0f..%.0f)", ch.x, ch.x + ch.w))
+			li_chk(bad, ch.y == top + 12 && ch.h == 6, fmt.tprintf("...centred in the band, y +%.0f h %.0f (want +12, 6)", ch.y - top, ch.h))
+			// The sort arrow keeps clear of it, on the SAME column, so the two
+			// marks cannot be drawn over each other: 120 - 5 gap - 9 arrow = 106.
+			a := table_sort_arrow_rect(cols[0], px, table_right(W))
+			li_chk(bad, a.x == 106 && a.x + a.w + 5 == ch.x, fmt.tprintf("the arrow sits at 106..115 with the 5px gap before the chevron (%.0f..%.0f)", a.x, a.x + a.w))
+
+			// -- THE SEAM, at the chevron's exact edges --------------------------
+			//
+			// Inclusive on the left and top, exclusive on the right and bottom,
+			// which is what table_rect_hit means and what the draw fills. Each pair
+			// straddles one boundary pixel of the rectangle the draw uses, so a
+			// hit-test that read a rect one pixel from the drawn one fails here and
+			// passes everywhere else.
+			seam := [?]struct {
+				x, y:  f32,
+				c:     int,
+				hit:   Table_Header_Hit,
+				label: string,
+			} {
+				{125, mid, 0, .Chevron, "the middle of the chevron opens the menu"},
+				{120, mid, 0, .Chevron, "its LEFT edge is inside it"},
+				{119, mid, 0, .Body, "...and one pixel further left sorts"},
+				{129, mid, 0, .Chevron, "its last pixel is inside it"},
+				{130, mid, 0, .Body, "...and its right edge is already the body"},
+				{125, top + 12, 0, .Chevron, "its TOP edge is inside it"},
+				{125, top + 11, 0, .Body, "...and one pixel above sorts"},
+				{125, top + 17, 0, .Chevron, "its last row is inside it"},
+				{125, top + 18, 0, .Body, "...and its bottom edge is already the body"},
+				{135, mid, 0, .Body, "the cell padding to its right still sorts, rather than going dead"},
+				{60, mid, 0, .Body, "and so does the label end of the cell"},
+			}
+			for s in seam {
+				c, hit := table_header_at(&d, cw, W, s.x, s.y, px)
+				li_chk(bad, hit == s.hit && (hit == .None || c == s.c), fmt.tprintf("(%.0f, +%.0f) -> c%d %v: %s", s.x, s.y - top, c, hit, s.label))
+			}
+
+			// -- THE RESIZE EDGE WINS ------------------------------------------
+			//
+			// c0's right edge is 140 and the zone is ±4px, so 137 is inside it. It
+			// resolves to the EDGE and to neither header region -- not a menu, not a
+			// sort -- and 135 (two pixels outside the zone) still sorts, which is
+			// what stops this passing on a header hit-test that refused everywhere.
+			_, on_edge := table_edge_at(&d, cw, W, 137, mid, px)
+			ec, ehit := table_header_at(&d, cw, W, 137, mid, px)
+			li_chk(bad, on_edge, "137 is inside c0's ±4px resize zone (its edge is 140)")
+			li_chk(bad, ehit == .None, fmt.tprintf("...and the header answers nothing there: neither chevron nor sort (c%d %v)", ec, ehit))
+			_, off_edge := table_edge_at(&d, cw, W, 135, mid, px)
+			li_chk(bad, !off_edge, "...while 135 is outside the zone, so the pair above is about the zone and not about the header")
+
+			// -- A COLUMN TOO NARROW: no chevron, but the menu is still reachable --
+			//
+			// c1's inner width is 32px against the 29 + 8 the marks and one cell of
+			// name need. The right-click route does not consult has_chev, and this
+			// is the assertion that says the command never becomes unreachable.
+			n1 := table_header_layout(&d, cw, W, px, 1)
+			li_chk(bad, !n1[1].has_chev, fmt.tprintf("c1 (inner 32px, needs 37) suppresses its chevron (%v)", n1[1].has_chev))
+			nc, nhit := table_header_at(&d, cw, W, 172, mid, px)
+			li_chk(bad, nc == 1 && nhit == .Body, fmt.tprintf("...so the pixels a chevron would have taken sort instead (c%d %v)", nc, nhit))
+			rc, rok := table_header_cell_at(&d, cw, W, 166, mid, px)
+			li_chk(bad, rok && rc == 1, fmt.tprintf("...and a right-click anywhere in it still resolves to c1 (%v, c%d)", rok, rc))
+
+			// -- THE LAST COLUMN, against the grid's right edge -------------------
+			//
+			// c3 runs to 912 and the grid stops at 786, so its marks are measured
+			// back from the CLIP: 786 - 10 padding - 10 chevron = 766. A chevron
+			// pinned to the cell's own right edge would be 250px off screen.
+			h3 := table_header_layout(&d, cw, W, px, 3)
+			c3 := h3[3].chevron
+			li_chk(bad, h3[3].has_chev && c3.x == 766 && c3.x + c3.w == 776, fmt.tprintf("c3's chevron is clipped onto the grid at 766..776 (%v, %.0f..%.0f)", h3[3].has_chev, c3.x, c3.x + c3.w))
+			li_chk(bad, c3.x + c3.w <= table_content_right(cols, W), fmt.tprintf("...inside where the table ends (%.0f vs %.0f)", c3.x + c3.w, table_content_right(cols, W)))
+			lc, lhit := table_header_at(&d, cw, W, 770, mid, px)
+			li_chk(bad, lc == 3 && lhit == .Chevron, fmt.tprintf("...and it is clickable there (c%d %v)", lc, lhit))
+			ec2, ehit2 := table_header_at(&d, cw, W, 786, mid, px)
+			li_chk(bad, ehit2 == .None, fmt.tprintf("...while the scrollbar's lane past 786 is not the header at all (c%d %v)", ec2, ehit2))
+		}
+
+		// -- SCROLLED PART-WAY UNDER THE STICKY GUTTER -------------------------
+		//
+		// At 70px of pan c0 spans -14..70, so only 14px of it is out from under the
+		// 56px gutter and its chevron would land at 50 -- painted over by the
+		// gutter's cover strip. The gutter covers those pixels, so they must not
+		// open a menu for the column hiding behind them, and neither must they sort
+		// it: both routes refuse, and the 60..70 sliver that IS visible still works.
+		{
+			d := ts_seam_doc({8, 4, 5, 80})
+			defer doc_close(&d)
+			d.table_hscroll_px = 70
+			cols := table_cols_layout(&d, cw, W)
+			x0 := cols[0].x if len(cols) > 0 else 0
+			li_chk(bad, len(cols) == 4 && x0 == -14, fmt.tprintf("precondition: 70px of pan puts c0 at -14 (%d cols, x %.0f)", len(cols), x0))
+			hs := table_header_layout(&d, cw, W, px, 0)
+			li_chk(bad, !hs[0].has_chev, fmt.tprintf("c0's chevron would land at 50, under the gutter, so it is suppressed (%v)", hs[0].has_chev))
+			li_chk(bad, hs[0].body.x == 56 && hs[0].body.w == 14, fmt.tprintf("...and its body is only the 56..70 sliver the gutter leaves (%.0f..%.0f)", hs[0].body.x, hs[0].body.x + hs[0].body.w))
+			_, ghit := table_header_at(&d, cw, W, 50, mid, px)
+			li_chk(bad, ghit == .None, fmt.tprintf("a press at 50 -- where the chevron would be -- reaches nothing (%v)", ghit))
+			_, gok := table_header_cell_at(&d, cw, W, 50, mid, px)
+			li_chk(bad, !gok, fmt.tprintf("...and neither does a right-click (%v)", gok))
+			vc, vhit := table_header_at(&d, cw, W, 60, mid, px)
+			li_chk(bad, vc == 0 && vhit == .Body, fmt.tprintf("...while the visible sliver still sorts c0 (c%d %v)", vc, vhit))
+		}
+
+		// -- A COLUMN EXACTLY THE MARKS' WIDTH ---------------------------------
+		//
+		// The suppression threshold is "the marks' run plus one cell of name". At
+		// char_w 7.25 a 5-cell column's inner width is 36.25px and the threshold is
+		// 29 + 7.25 = 36.25 exactly, so this is the >= boundary itself rather than a
+		// value near it; a 4-cell column is exactly 29px -- the marks' run with no
+		// room for a single character -- and is refused.
+		{
+			ecw := f32(7.25)
+			d := ts_seam_doc({5, 4})
+			defer doc_close(&d)
+			hs := table_header_layout(&d, ecw, W, px, 0)
+			li_chk(bad, hs[0].has_chev, fmt.tprintf("a column exactly at the threshold (inner 36.25 == 29 + 7.25) keeps its chevron (%v)", hs[0].has_chev))
+			hs1 := table_header_layout(&d, ecw, W, px, 1)
+			li_chk(bad, !hs1[1].has_chev, fmt.tprintf("a column exactly the marks' own width (inner 29.0) has no room left and loses it (%v)", hs1[1].has_chev))
 		}
 	}
 
@@ -14331,7 +14550,7 @@ when NEWTPAD_TESTS {
 							hx := table_cell_text_x(lab) + table_cell_align_dx(lab, hcells, cw)
 							right_edge := hx + f32(hcells) * cw
 							if right_edge > a.x {overlaps += 1}
-							if a.x - right_edge >= table_arrow_gap() {gaps_ok += 1}
+							if a.x - right_edge >= table_mark_gap() {gaps_ok += 1}
 						}
 						chk(&bad, overlaps == 0, fmt.tprintf("%s: no header label reaches into the arrow's slot (%d of %d did)", tag, overlaps, len(cols)))
 						chk(&bad, gaps_ok == len(cols), fmt.tprintf("%s: ...and every one keeps the gap beside it (%d of %d)", tag, gaps_ok, len(cols)))
@@ -14372,7 +14591,12 @@ when NEWTPAD_TESTS {
 						chk(&bad, hov_off && hc == 0, fmt.tprintf("%s: ...and %.0fpx further in it lights column 0 (%v, %d)", tag, tol + 2, hov_off, hc))
 						// Never both, anywhere along the band, and never a hover the
 						// press would not honour: main.odin tests the edge first and
-						// then this same producer, so hover == "a press here sorts".
+						// then this same producer, so hover == "a press here acts on
+						// this column" -- a sort everywhere in the cell except the
+						// chevron's own rectangle, which opens that same column's
+						// menu (table_header_at). Both come out of
+						// table_header_layout, which takes this procedure's answer
+						// as its hover_col, so no pixel lifts and then does nothing.
 						both, mismatched := 0, 0
 						for x := table_gutter_w(); x < table_right(W); x += 3 {
 							_, on_edge := table_edge_at(&d, cw, W, x, hy, px)

@@ -624,8 +624,10 @@ menu_open_at :: proc(app: ^App, mi: int) {
 
 // Open a context menu at (x, y), the point the caller measured before
 // clamping — menu_dropdown_rect applies the window clamp when it draws, not
-// here. Not wired to any input path yet: a later task supplies the table
-// header's items and the right-click that calls this.
+// here. Two input paths reach it, both in main.odin's table block and both
+// carrying table_header_menu_items: a left click on the header's chevron
+// (table_header_at) and a right click anywhere in a header cell
+// (table_header_col_at).
 //
 // `items` is not copied, so the caller must pass a slice that outlives the
 // menu. main.odin's frame loop calls free_all(context.temp_allocator) once
