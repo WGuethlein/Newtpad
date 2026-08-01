@@ -226,6 +226,20 @@ when NEWTPAD_TESTS {
 		for c in ([]Command_Id{.Find_Toggle_Filter, .Find_Toggle_Regex, .Filter_Open, .Goto_Line, .Save_As}) {
 			fmt.printfln("  %-24v in palette=%-5v chord=%q", c, command_in_palette(c), command_chord(c))
 		}
+		// command_from_name must refuse the six header-menu sort commands: they read
+		// app.menu.ctx_col, the column a context menu was opened on, and a
+		// hand-written keys.txt chord naming one would fire with no menu behind it
+		// and no column of its own to aim at -- see command_needs_menu_target
+		// (commands.odin) and command_from_name's own comment (keymap.odin). An
+		// ordinary command's name must still resolve, so the refusal is provably
+		// the six and not the whole lookup going dark.
+		_, sort_named := command_from_name("Table_Sort_Asc")
+		if sort_named {bad += 1}
+		fmt.printfln("%-22s -> named=%-5v %s", "Table_Sort_Asc by name", sort_named, "OK" if !sort_named else "FAIL want refused")
+		ordinary_cmd, ordinary_named := command_from_name("Toggle_Wrap")
+		ordinary_ok := ordinary_named && ordinary_cmd == .Toggle_Wrap
+		if !ordinary_ok {bad += 1}
+		fmt.printfln("%-22s -> cmd=%-16v named=%-5v %s", "Toggle_Wrap by name", ordinary_cmd, ordinary_named, "OK" if ordinary_ok else "FAIL")
 		// dispatch effects (dummy window/text; these commands don't touch them)
 		app_active(&app).cursor = 0
 		command_dispatch(resolve_key(.Right, false, false, .Editor), {.Right, false, false, false}, &app, &dummy, &dtext, 10)
@@ -243,9 +257,12 @@ when NEWTPAD_TESTS {
 		fmt.printfln("Tab_Close         -> live tabs=%d", app_live_count(&app))
 		app_destroy(&app)
 		fmt.printfln("keytest: %d failures", bad)
-		// The only mode that exits non-zero, and it earns it: this one was invisible
-		// to every sweep for a year. A summary line a script has to remember to grep
-		// is what let the stale assertion sit here; an exit code is not optional to
+		// NOT the only mode that exits non-zero -- 18 `os.exit(1)` sites live in this
+		// file as of this count (`grep -c` on the literal), and this branch alone
+		// added three of them (menutest, settingstest, tablesorttest). This one earns
+		// its own copy on its own history, not on uniqueness: it was invisible to
+		// every sweep for a year. A summary line a script has to remember to grep is
+		// what let the stale assertion sit here; an exit code is not optional to
 		// notice. `os.exit` skips the deferred teardown above -- everything it would
 		// free is process-lifetime scratch, and the process is ending either way.
 		if bad > 0 {os.exit(1)}
@@ -1826,6 +1843,1505 @@ when NEWTPAD_TESTS {
 		_, hi_md := doc_sel_range(d)
 		li_chk(bad, hi_md == hi_text, fmt.tprintf("...and so does Ctrl+A in the markdown preview (%d, want %d)", hi_md, hi_text))
 		li_chk(bad, d.md_mode == .Preview, "...leaving the preview open")
+	}
+
+	// --- `newtpad tablesorttest` -- the multi-key sort build -------------------
+	//
+	// table_sort_build orders up to TABLE_SORT_MAX rows by up to TABLE_SORT_KEYS_MAX
+	// columns, and every assertion below is about the ORDER rather than about the
+	// arrays that carry it. That is deliberate: table.odin's sort block opens by
+	// naming its own risk as data loss, not layout -- table_cell_at resolves a pixel
+	// through the permutation to a byte range and table_edit_commit splices it, so a
+	// permutation that is subtly wrong writes the user's value onto a row they never
+	// clicked, silently.
+	//
+	// So the fixtures are tiny and the expected orders are written out by hand as
+	// literals. Nothing here recomputes an expectation from the sort's own comparator
+	// or its own arrays: development-loop.md §4 warns that comparing two derivations
+	// of the same expression passes with the bug present, and the five sabotages this
+	// mode was written against (drop every key past the first; walk the keys in
+	// reverse precedence; take a column's type from doc.table_align; drop the
+	// empty-last rule on the secondary keys; materialise the key strings inside the
+	// row loop instead of after the key arena stops growing) all produce a *plausible*
+	// order. A literal is the only thing that can tell a plausible order from the
+	// right one.
+	//
+	// THE FIXTURES ARE TINY, EXCEPT WHERE THEY CANNOT BE. The arena sabotage is
+	// invisible at five rows -- the arena is created with 64 KB of capacity and a small
+	// table never makes it move -- so the only case that can catch it is the
+	// 100,000-row one, which is why C6 pins an ORDER and not just a timing.
+	//
+	// A vector that means "the whole cap" is BUILT from TABLE_SORT_KEYS_MAX; a vector
+	// that means "two keys, because this rule is about a tie-breaker" is written as two.
+	// The distinction is not cosmetic: when the cap moved from 3 to 2, the k-key logic
+	// was clean at every count and only the hardcoded `[3]Sort_Key` literals failed.
+	//
+	// One-argument and non-zero on failure, per the keytest/resavetest incident: a
+	// mode nothing runs is worse than no mode.
+	@(private = "file")
+	table_sort_test_run :: proc() {
+		bad := 0
+		if !require_scratch_session("tablesorttest") {
+			// Counted as a FAILURE rather than skipped, and the guard is here even
+			// though the cases below build Documents rather than an App: a mode that
+			// quietly does nothing when an environment variable is unset is a mode
+			// nothing runs, and the day one of these cases grows an App is the day the
+			// missing guard silently overwrites the author's real session store.
+			li_chk(&bad, false, "NEWTPAD_SESSION_DIR is set, so the mode could run")
+		} else {
+			ts_case_inverses(&bad)
+			ts_case_clear_resets(&bad)
+			ts_case_bad_vector(&bad)
+			ts_case_precedence(&bad)
+			ts_case_numeric_past_sample(&bad)
+			ts_case_empty_last(&bad)
+			ts_case_empty_falls_through(&bad)
+			ts_case_total_order(&bad)
+			ts_case_measure(&bad)
+			ts_case_refusal(&bad)
+			ts_case_key_ops(&bad)
+			ts_case_toggle_secondary_cycle(&bad)
+			ts_case_menu_items(&bad)
+			ts_case_menu_dispatch(&bad)
+			ts_case_header_seam(&bad)
+			ts_case_summary_marks(&bad)
+		}
+		fmt.printfln("tablesorttest: %d failures", bad)
+		if bad > 0 {os.exit(1)}
+	}
+
+	// A table Document over `src`. doc_from_content takes ownership of what it is
+	// given and doc_close frees it, so the bytes have to be an allocation of their
+	// own rather than a slice of a string literal.
+	//
+	// table_compute_widths is deliberately NOT called: it needs loaded fonts, and
+	// table_sort_build reads nothing it produces -- the build cuts its fields out of
+	// the raw line with the document's own delimiter. Keeping the fixtures font-free
+	// is what lets this mode run anywhere, and `table_cols` is set by hand because the
+	// only thing that reads it here is table_summary_text's column clause.
+	//
+	// Every case closes its Document before the next one is made: one live Document
+	// per frame, per development-loop.md §6's stack-overflow rule.
+	@(private = "file")
+	ts_doc :: proc(src: string, cols: int) -> Document {
+		c := make([]u8, len(src))
+		copy(c, transmute([]u8)src)
+		d := doc_from_content(c, "fixture.csv", .UTF8)
+		d.table, d.table_delim, d.table_cols = true, ',', cols
+		return d
+	}
+
+	// The sorted order as one string: the whole LINE at each sorted position, joined
+	// by '|', up to `limit` rows (0 = all).
+	//
+	// Read back through table_sort_row_at -- the lookup the draw and the hit-test both
+	// resolve through -- and compared against a hand-written literal, so this shares
+	// no arithmetic with the thing it checks.
+	@(private = "file")
+	ts_order :: proc(d: ^Document, limit := 0) -> string {
+		sb := strings.builder_make(context.temp_allocator)
+		n := table_sort_rows(d)
+		if limit > 0 {n = min(n, limit)}
+		for pos in 0 ..< n {
+			if pos > 0 {strings.write_byte(&sb, '|')}
+			off, ok := table_sort_row_at(d, pos)
+			if !ok {
+				strings.write_string(&sb, "<none>")
+				continue
+			}
+			buf: [256]u8
+			end := base.pt_line_end_cap(&d.pt, off, len(buf))
+			got := base.pt_read(&d.pt, off, buf[:min(end - off, len(buf))])
+			strings.write_string(&sb, strings.trim_space(string(buf[:got])))
+		}
+		return strings.to_string(sb)
+	}
+
+	// C1: perm and rank are exact inverses, offs is ascending file order, at every key
+	// count from 1 to TABLE_SORT_KEYS_MAX.
+	//
+	// The INVERSE check is the one that cannot pass by accident. table_sort_pos is the
+	// only route from a byte offset back to a sorted position and it reads `rank`; a
+	// rank that is not perm's inverse puts every visible row one place off and commits
+	// a cell edit there. A build that dropped a row, wrote one twice, or left an array
+	// short leaves the two disagreeing, and comparing them against EACH OTHER (rather
+	// than against a recomputed permutation) is what makes that visible.
+	//
+	// THE KEY VECTOR IS BUILT FROM TABLE_SORT_KEYS_MAX, not written out as a literal,
+	// here and in every case below. When the cap came down from 3 to 2 the k-key logic
+	// needed nothing at all and every hand-written `[3]Sort_Key` in this mode failed --
+	// fifteen failures, none of them about the sort. A test that answers that by
+	// hardcoding the new number has only moved the same breakage to the next change.
+	@(private = "file")
+	ts_case_inverses :: proc(bad: ^int) {
+		fmt.printfln("-- perm/rank are inverses and offs ascends, at 1..%d keys --", TABLE_SORT_KEYS_MAX)
+		d := ts_doc("a,b,c\n3,z,q\n1,y,r\n2,z,p\n1,x,s\n2,y,t\n", 3)
+		defer doc_close(&d)
+		ROWS :: 5
+		// One key per column, alternating direction. The fixtures in this mode carry
+		// three columns, so they fill any cap up to 3; past that they would silently
+		// start asking for a column that is not there, hence the assert.
+		#assert(TABLE_SORT_KEYS_MAX <= 3)
+		all: [TABLE_SORT_KEYS_MAX]Sort_Key
+		for i in 0 ..< TABLE_SORT_KEYS_MAX {all[i] = {col = i, desc = i % 2 == 1}}
+		for nk in 1 ..= TABLE_SORT_KEYS_MAX {
+			ok := table_sort_build(&d, all[:nk])
+			s := &d.table_sort
+			li_chk(bad, ok && s.nkeys == nk, fmt.tprintf("a %d-key build succeeds and records %d keys (ok %v, nkeys %d)", nk, nk, ok, s.nkeys))
+			li_chk(
+				bad,
+				len(s.perm) == ROWS && len(s.rank) == ROWS && len(s.offs) == ROWS,
+				fmt.tprintf("...%d rows in all three arrays (perm %d, rank %d, offs %d)", ROWS, len(s.perm), len(s.rank), len(s.offs)),
+			)
+			inv := len(s.perm) == ROWS && len(s.rank) == ROWS
+			if inv {
+				for pos in 0 ..< ROWS {if int(s.rank[int(s.perm[pos])]) != pos {inv = false}}
+				for j in 0 ..< ROWS {if int(s.perm[int(s.rank[j])]) != j {inv = false}}
+			}
+			li_chk(bad, inv, fmt.tprintf("...perm and rank invert each other (perm %v, rank %v)", s.perm, s.rank))
+			asc := len(s.offs) == ROWS
+			for j in 1 ..< len(s.offs) {if s.offs[j] <= s.offs[j - 1] {asc = false}}
+			li_chk(bad, asc, fmt.tprintf("...offs stays strictly ascending file order (%v)", s.offs))
+			// The unused tail of the key vector must not read as "sorted by column 0".
+			tail := true
+			for i in nk ..< TABLE_SORT_KEYS_MAX {if s.keys[i].col != TABLE_SORT_NONE {tail = false}}
+			li_chk(bad, tail, fmt.tprintf("...and slots %d.. say TABLE_SORT_NONE (%v)", nk, s.keys))
+		}
+	}
+
+	// C1b: carried in from Task 1's review -- table_sort_clear's reset loop had no
+	// coverage anywhere in the tree.
+	//
+	// A zeroed Sort_Key.col is 0, a VALID column index, so a clear that only zeroed
+	// the struct would leave every slot claiming "sorted by column 0". Nothing reads
+	// past nkeys today, which is exactly why this needs a test rather than a reader:
+	// the loop is correct and invisible, and the first thing to read the array
+	// directly would inherit the lie.
+	@(private = "file")
+	ts_case_clear_resets :: proc(bad: ^int) {
+		fmt.println("-- table_sort_clear puts every key slot back to TABLE_SORT_NONE --")
+		d := ts_doc("a,b,c\n3,z,q\n1,y,r\n2,z,p\n", 3)
+		defer doc_close(&d)
+		// A full vector, in reverse column order so no slot holds its own index.
+		all: [TABLE_SORT_KEYS_MAX]Sort_Key
+		for i in 0 ..< TABLE_SORT_KEYS_MAX {all[i] = {col = TABLE_SORT_KEYS_MAX - 1 - i, desc = i % 2 == 1}}
+		li_chk(bad, table_sort_build(&d, all[:]), fmt.tprintf("a %d-key sort is live before the clear", TABLE_SORT_KEYS_MAX))
+		table_sort_clear(&d)
+		s := &d.table_sort
+		reset := s.nkeys == 0 && !s.refused
+		for k in s.keys {if k.col != TABLE_SORT_NONE {reset = false}}
+		li_chk(bad, reset, fmt.tprintf("...and after it every slot says TABLE_SORT_NONE (nkeys %d, keys %v)", s.nkeys, s.keys))
+		li_chk(bad, !table_sorted(&d), "...and no sort is live")
+	}
+
+	// C1c: a MALFORMED key vector is refused, and it takes the live sort with it.
+	//
+	// That second half is the part worth pinning, because it is a decision and not an
+	// accident: table_sort_build clears before it validates, so a caller who passes a
+	// vector the build cannot use loses the sort that was on screen. The contract says
+	// so ("returns false and leaves the doc unsorted on refusal"), and the reason is
+	// that every `return false` in that procedure should mean the same thing -- a
+	// refusal that sometimes left the previous order standing would be a second state
+	// for the draw and the hit-test to think about. Neither bad-vector path had a test
+	// until now, which is how a deliberate behaviour turns into an accident nobody
+	// meant.
+	//
+	// `refused` is asserted FALSE on all three paths. It means one specific thing --
+	// "too large to sort", which the summary row prints -- and a bad vector setting it
+	// would put a wrong sentence under a grid that is merely unsorted. C7 leans on that
+	// distinction to prove its own ceiling assertion is about the ceiling.
+	@(private = "file")
+	ts_case_bad_vector :: proc(bad: ^int) {
+		fmt.println("-- a malformed key vector is refused, and clears the live sort --")
+		ts_bad :: proc(bad: ^int, keys: []Sort_Key, label: string) {
+			d := ts_doc("a,b,c\n3,z,q\n1,y,r\n2,z,p\n", 3)
+			defer doc_close(&d)
+			live := [1]Sort_Key{{col = 0}}
+			li_chk(bad, table_sort_build(&d, live[:]) && table_sorted(&d), fmt.tprintf("%s: a 1-key sort is live first", label))
+			li_chk(bad, !table_sort_build(&d, keys), "...and the bad vector is refused")
+			s := &d.table_sort
+			gone := !table_sorted(&d) && s.nkeys == 0 && len(s.perm) == 0 && len(s.offs) == 0
+			for k in s.keys {if k.col != TABLE_SORT_NONE {gone = false}}
+			li_chk(bad, gone, fmt.tprintf("...taking the live sort with it (nkeys %d, perm %d, keys %v)", s.nkeys, len(s.perm), s.keys))
+			li_chk(bad, !s.refused, fmt.tprintf("...without claiming the file is too large (refused %v)", s.refused))
+		}
+		// Zero-valued, so every `col` is 0 and a valid column: the only thing wrong with
+		// this vector is its LENGTH.
+		over: [TABLE_SORT_KEYS_MAX + 1]Sort_Key
+		ts_bad(bad, over[:], "one key past the cap")
+		// The negative column sits in the LAST slot, not the first, so the validation
+		// loop has to reach it rather than reject on its first iteration.
+		neg: [TABLE_SORT_KEYS_MAX]Sort_Key
+		neg[TABLE_SORT_KEYS_MAX - 1].col = TABLE_SORT_NONE
+		ts_bad(bad, neg[:], "a negative column in the last slot")
+		ts_bad(bad, nil, "an empty vector")
+	}
+
+	// C2: PRECEDENCE. keys[0] decides; keys[1] only breaks its ties.
+	//
+	// The fixture is built so that column 0 alone and column 1 alone give DIFFERENT
+	// orders, and both single-key orders are asserted first -- otherwise a two-key
+	// expectation could be satisfied by a comparator that read only one of them. The
+	// b-group is where the work happens: b,2 comes before b,1 in file order, so a
+	// comparator that stopped after key 0 leaves them that way, and one that read the
+	// keys in reverse precedence would put the whole file in column 1's order.
+	@(private = "file")
+	ts_case_precedence :: proc(bad: ^int) {
+		fmt.println("-- precedence: keys[0] decides, keys[1] only breaks its ties --")
+		d := ts_doc("g,n\nb,2\na,3\nb,1\na,4\n", 2)
+		defer doc_close(&d)
+		k0 := [1]Sort_Key{{col = 0}}
+		li_chk(bad, table_sort_build(&d, k0[:]), "column 0 alone sorts")
+		by0 := ts_order(&d)
+		li_chk(bad, by0 == "a,3|a,4|b,2|b,1", fmt.tprintf("...into %q (want \"a,3|a,4|b,2|b,1\")", by0))
+		k1 := [1]Sort_Key{{col = 1}}
+		li_chk(bad, table_sort_build(&d, k1[:]), "column 1 alone sorts")
+		by1 := ts_order(&d)
+		li_chk(bad, by1 == "b,1|b,2|a,3|a,4", fmt.tprintf("...into %q (want \"b,1|b,2|a,3|a,4\")", by1))
+		li_chk(bad, by0 != by1, "...and the two single-key orders really do differ, so the fixture can tell them apart")
+		fwd := [2]Sort_Key{{col = 0}, {col = 1}}
+		li_chk(bad, table_sort_build(&d, fwd[:]), "0-then-1 sorts")
+		got := ts_order(&d)
+		li_chk(bad, got == "a,3|a,4|b,1|b,2", fmt.tprintf("...into %q (want \"a,3|a,4|b,1|b,2\": column 0's order, ties broken by column 1)", got))
+		li_chk(bad, got != by0, "...which is NOT what column 0 alone gave, so key 1 was read")
+		rev := [2]Sort_Key{{col = 1}, {col = 0}}
+		li_chk(bad, table_sort_build(&d, rev[:]), "1-then-0 sorts")
+		got2 := ts_order(&d)
+		li_chk(bad, got2 == "b,1|b,2|a,3|a,4", fmt.tprintf("...into %q (want \"b,1|b,2|a,3|a,4\")", got2))
+		li_chk(bad, got != got2, "...and swapping the two keys' precedence changes the order, so array order IS precedence")
+	}
+
+	// C3: a key's type is settled over every row the sort orders, per key, and the key
+	// under test is the SECONDARY one.
+	//
+	// table_compute_widths decides alignment from the first TABLE_SAMPLE (500) rows,
+	// which is right for a cosmetic right-align and wrong for a sort: a column whose
+	// first 500 cells are numbers and whose row 900 is "N/A" must sort as TEXT, or
+	// that row lands wherever 0.0 falls and the result is presented as sorted.
+	//
+	// Column 0 is constant, so key 0 ties on every pair and key 1 decides the whole
+	// order -- the decision under test is the one taken for a key that is not the
+	// primary. Column 1 is "0".."999", which reads differently as text ("0","1","10")
+	// than as numbers ("0","1","2"), so three rows are enough to tell which happened.
+	// The all-numeric probe is the CONTROL: without it, an implementation that sorted
+	// every column as text would pass the N/A probe for the wrong reason.
+	@(private = "file")
+	ts_case_numeric_past_sample :: proc(bad: ^int) {
+		fmt.println("-- a key's type is settled over every sorted row, not over the first 500 --")
+		ts_probe :: proc(bad: ^int, na_at: int, want, label: string) {
+			sb := strings.builder_make(context.temp_allocator)
+			strings.write_string(&sb, "g,n\n")
+			for i in 0 ..< 1000 {
+				if i == na_at {
+					strings.write_string(&sb, "same,N/A\n")
+				} else {
+					fmt.sbprintf(&sb, "same,%d\n", i)
+				}
+			}
+			d := ts_doc(strings.to_string(sb), 2)
+			defer doc_close(&d)
+			// What table_compute_widths would have recorded from its first
+			// TABLE_SAMPLE rows: column 1 looks numeric there in BOTH fixtures, since
+			// the N/A is at row 900. Filled in so that a build reading alignment
+			// instead of its own accumulator gets a confident wrong answer here rather
+			// than an empty array and an accidental `false`.
+			append(&d.table_align, Table_Align.Left, Table_Align.Right)
+			k := [2]Sort_Key{{col = 0}, {col = 1}}
+			li_chk(bad, table_sort_build(&d, k[:]), fmt.tprintf("%s: the 2-key build succeeds", label))
+			li_chk(
+				bad,
+				d.table_sort.nkeys == 2 && d.table_sort.keys[1].numeric == (na_at < 0),
+				fmt.tprintf("...key 1 settles numeric = %v (got %v)", na_at < 0, d.table_sort.keys[1].numeric),
+			)
+			got := ts_order(&d, 3)
+			li_chk(bad, got == want, fmt.tprintf("...and the first three rows are %q (want %q)", got, want))
+		}
+		ts_probe(bad, -1, "same,0|same,1|same,2", "all 1000 rows numeric")
+		ts_probe(bad, 900, "same,0|same,1|same,10", "one N/A at row 900, past the 500-row sample")
+	}
+
+	// C4: a blank sorts LAST on a secondary key, in BOTH directions.
+	//
+	// Both directions is the whole assertion. Ascending, "" is smaller than every
+	// letter; descending, it is larger -- so a comparator without the empty rule gives
+	// blank-first in one of the two, and a test that only checked one direction would
+	// pass with the rule missing. The blank is on key 1 rather than key 0 because the
+	// single-key case already has coverage in tablegridtest and the secondary keys are
+	// what is new here.
+	@(private = "file")
+	ts_case_empty_last :: proc(bad: ^int) {
+		fmt.println("-- a blank sorts LAST on a secondary key, in both directions --")
+		d := ts_doc("g,n\ng,m\ng,\ng,z\n", 2)
+		defer doc_close(&d)
+		asc := [2]Sort_Key{{col = 0}, {col = 1, desc = false}}
+		li_chk(bad, table_sort_build(&d, asc[:]), "key 1 ascending sorts")
+		a := ts_order(&d)
+		li_chk(bad, a == "g,m|g,z|g,", fmt.tprintf("...into %q (want \"g,m|g,z|g,\": blank last)", a))
+		desc := [2]Sort_Key{{col = 0}, {col = 1, desc = true}}
+		li_chk(bad, table_sort_build(&d, desc[:]), "key 1 descending sorts")
+		b := ts_order(&d)
+		li_chk(bad, b == "g,z|g,m|g,", fmt.tprintf("...into %q (want \"g,z|g,m|g,\": blank STILL last)", b))
+		li_chk(bad, a != b, "...and the arrow really did flip the rows that have values")
+	}
+
+	// C4b: two rows blank on key 1 fall THROUGH to key 2 rather than stopping there.
+	//
+	// "Both have no value here" says nothing about which row comes first, so the
+	// comparator continues instead of returning. If it returned, the two blank rows
+	// would drop straight to the file-order tie-break and come back 2-then-1 -- which
+	// is a plausible order, and wrong: the rows a tie-breaker exists to separate are
+	// exactly the rows that would never reach it.
+	@(private = "file")
+	ts_case_empty_falls_through :: proc(bad: ^int) {
+		fmt.println("-- two rows blank on key 1 are separated by key 2, not by file order --")
+		d := ts_doc("g,n,x\na,,2\na,,1\na,q,3\n", 3)
+		defer doc_close(&d)
+		k := [2]Sort_Key{{col = 1}, {col = 2}}
+		li_chk(bad, table_sort_build(&d, k[:]), "the 2-key build succeeds")
+		got := ts_order(&d)
+		li_chk(
+			bad,
+			got == "a,q,3|a,,1|a,,2",
+			fmt.tprintf("...order is %q (want \"a,q,3|a,,1|a,,2\": blanks last, and key 2 orders them 1 before 2)", got),
+		)
+	}
+
+	// C5: rows equal on EVERY key come back in FILE order, under every direction
+	// combination.
+	//
+	// slice.sort_by_with_data is not stable, so file order here is not something the
+	// sort inherits -- it is the comparator's own final tie-break, and it must ignore
+	// direction or the "same" rows would reverse with the arrow. The tag column is not
+	// a key: it is there so three rows that tie on everything the sort reads are still
+	// distinguishable in the output.
+	//
+	// EVERY combination, so the sweep is 2^TABLE_SORT_KEYS_MAX rather than a literal 8
+	// -- one key whose direction is never flipped is one place a direction-sensitive
+	// tie-break could hide.
+	@(private = "file")
+	ts_case_total_order :: proc(bad: ^int) {
+		fmt.printfln("-- rows equal on every key come back in file order, all %d direction combinations --", 1 << uint(TABLE_SORT_KEYS_MAX))
+		d := ts_doc("a,b,c,tag\nx,y,z,one\nx,y,z,two\nx,y,z,three\n", 4)
+		defer doc_close(&d)
+		WANT :: "x,y,z,one|x,y,z,two|x,y,z,three"
+		for m in 0 ..< 1 << uint(TABLE_SORT_KEYS_MAX) {
+			k: [TABLE_SORT_KEYS_MAX]Sort_Key
+			dirs: [TABLE_SORT_KEYS_MAX]bool
+			for i in 0 ..< TABLE_SORT_KEYS_MAX {
+				dirs[i] = m & (1 << uint(i)) != 0
+				k[i] = {col = i, desc = dirs[i]}
+			}
+			ok := table_sort_build(&d, k[:])
+			got := ts_order(&d)
+			li_chk(bad, ok && got == WANT, fmt.tprintf("desc %v -> %q", dirs, got))
+		}
+	}
+
+	// C6: what a full key vector COSTS at the ceiling.
+	//
+	// TABLE_SORT_MAX is a freeze budget, not a memory bound (see its comment): the
+	// build is one synchronous pass on the main thread, so its cost is how long the
+	// window is unresponsive after a header click. The key count multiplies the field
+	// extraction and deepens the comparator, and when this case first ran at a cap of
+	// three that is exactly what happened -- 696 ms debug against 387 ms for one key,
+	// ~460 ms against ~258 ms converted to release -- and the cap came down to two.
+	// TABLE_SORT_KEYS_MAX's comment carries the numbers and the decision.
+	//
+	// Asserted as a RATIO against the same file's single-key build rather than against
+	// a millisecond constant, because a constant drifts with the machine and this has
+	// to mean the same thing on Wyatt's desktop and in CI. Both builds run back to back
+	// over the same file in the same process, so machine noise is largely common-mode
+	// and the ratio is the stable quantity.
+	//
+	// THE BOUND IS DERIVED FROM THE CAP, not picked: a build that re-scanned the file
+	// per key would cost about k times the single-key build, so k is the failure this
+	// catches, and the honest measured cost is well under it -- 1.47-1.52x over four
+	// runs at k=2, and about 1.8x at k=3 (three recorded runs 1.78-1.80x, one
+	// independent run during review 1.86x), because the extraction is a fraction of a pass
+	// dominated by the line read and the n log n comparisons. The threshold sits at
+	// 0.9k: at today's cap that is 1.80x against a measured 1.49x, a fifth of headroom
+	// over the honest figure and a tenth of margin under the failure. The ratio is the
+	// stable quantity to hang that on -- the four runs spread by 0.05.
+	//
+	// The printed number is a DEBUG figure and says so: build.bat release is
+	// -subsystem:windows and cannot print from a headless mode at all.
+	@(private = "file")
+	ts_case_measure :: proc(bad: ^int) {
+		fmt.printfln("-- what %d keys cost at TABLE_SORT_MAX rows --", TABLE_SORT_KEYS_MAX)
+		HEAD :: "id,date,status\n"
+		ROW :: 26 // "0000000,2026-01-01,ACTIVE\n" -- a realistic export row
+		src := make([]u8, len(HEAD) + TABLE_SORT_MAX * ROW)
+		copy(src[:], transmute([]u8)string(HEAD))
+		o := len(HEAD)
+		for i in 0 ..< TABLE_SORT_MAX {
+			// Scrambled ids -- 7919 is prime and coprime with the row count, so this is
+			// a bijection and the permutation is nowhere near the identity. The status
+			// column cycles so key 3 has real ties to break rather than being read once
+			// and never consulted.
+			id := (i * 7919) % TABLE_SORT_MAX
+			s := fmt.tprintf("%07d,2026-01-%02d,%s\n", id, 1 + id % 28, "ACTIVE" if id % 2 == 0 else "CLOSED")
+			assert(len(s) == ROW)
+			copy(src[o:], transmute([]u8)s)
+			o += ROW
+		}
+		d := ts_doc(string(src), 3)
+		delete(src)
+		defer doc_close(&d)
+		k1 := [1]Sort_Key{{col = 0}}
+		t1 := time.tick_now()
+		ok1 := table_sort_build(&d, k1[:])
+		ms1 := time.duration_milliseconds(time.tick_since(t1))
+		// A full vector in REVERSE column order, so the primary is never column 0 and the
+		// scrambled id column is only reached as the final tie-break: a build that
+		// quietly used key 0 for everything would come out in the wrong order below.
+		//
+		// The two end literals hold at either cap, and not by luck -- at a cap of 3 the
+		// vector is status/date/id and at 2 it is date/id, and status is a FUNCTION of
+		// the id (even means ACTIVE), so dropping it as the primary cannot move either
+		// end. Day 1 forces id % 28 == 0, hence even, hence ACTIVE; day 28 forces
+		// id % 28 == 27, hence odd, hence CLOSED.
+		kn: [TABLE_SORT_KEYS_MAX]Sort_Key
+		for i in 0 ..< TABLE_SORT_KEYS_MAX {kn[i] = {col = TABLE_SORT_KEYS_MAX - 1 - i}}
+		t3 := time.tick_now()
+		ok3 := table_sort_build(&d, kn[:])
+		ms3 := time.duration_milliseconds(time.tick_since(t3))
+		li_chk(bad, ok1 && ok3 && table_sort_rows(&d) == TABLE_SORT_MAX, fmt.tprintf("both builds order all %d rows (%v/%v)", TABLE_SORT_MAX, ok1, ok3))
+		// Checked at the ends only: the whole order is 100,000 rows, and both ends
+		// pin the primary key, every tie-breaker and the final file-order fallback at
+		// once. These two literals are also the only assertions in this mode that can
+		// see the key arena move -- see the sabotage note on table_sort_build's
+		// materialisation pass, which turns this case into an access violation.
+		first, last := ts_order(&d, 1), "<none>"
+		if off, ok := table_sort_row_at(&d, TABLE_SORT_MAX - 1); ok {
+			buf: [64]u8
+			end := base.pt_line_end_cap(&d.pt, off, len(buf))
+			got := base.pt_read(&d.pt, off, buf[:min(end - off, len(buf))])
+			last = strings.clone(strings.trim_space(string(buf[:got])), context.temp_allocator)
+		}
+		li_chk(bad, first == "0000000,2026-01-01,ACTIVE", fmt.tprintf("...smallest under the full vector first: %q", first))
+		// The largest row: the largest date this fixture reaches (day 28, i.e.
+		// id % 28 == 27, which is odd for every k, hence CLOSED), and the largest such
+		// id below TABLE_SORT_MAX -- 28*3570 + 27 = 99987.
+		li_chk(bad, last == "0099987,2026-01-28,CLOSED", fmt.tprintf("...and largest last: %q", last))
+		ratio := ms3 / max(ms1, 0.001)
+		LIMIT :: 0.9 * f64(TABLE_SORT_KEYS_MAX)
+		fmt.printfln("         DEBUG build: 1 key %.0f ms, %d keys %.0f ms (%.2fx) over %d rows", ms1, TABLE_SORT_KEYS_MAX, ms3, ratio, TABLE_SORT_MAX)
+		li_chk(bad, ratio < LIMIT, fmt.tprintf("...and %d keys cost under %.2fx one key (%.2fx)", TABLE_SORT_KEYS_MAX, LIMIT, ratio))
+	}
+
+	// C7: the refusal still holds at a full key vector, on both of its paths.
+	//
+	// Two separate refusals, and they are not the same code. The IN-LOOP check stops
+	// an unsettled count at the ceiling while scanning, so a 12M-row file pays for
+	// 100,000 rows and stops; the SETTLED check refuses before scanning at all, so a
+	// header on a huge file does not cost a visible hitch per press for a refusal it
+	// could have known instantly. Both must leave the document unsorted rather than
+	// half-sorted, and the summary row has to SAY so -- a header that does nothing
+	// when pressed is indistinguishable from a broken one.
+	//
+	// THE REASON IS PINNED, NOT JUST THE `false`. `!table_sort_build(...)` on its own
+	// is satisfied by any refusal at all -- including a vector the build rejects as
+	// malformed before it looks at a single row -- so the assertion that NAMES the
+	// ceiling would pass in a build that had no ceiling in it. Both refusals are
+	// therefore asserted against `refused`, which the two paths set differently: the
+	// ceiling sets it true so the summary row can say why, and a bad vector leaves it
+	// false because table_sort_clear cleared it and nothing turned it back on. The bad
+	// vector runs on this same over-ceiling document immediately before the ceiling
+	// build, so the two runs differ in nothing but the vector.
+	@(private = "file")
+	ts_case_refusal :: proc(bad: ^int) {
+		fmt.printfln("-- over the ceiling, a %d-key sort is refused on both paths --", TABLE_SORT_KEYS_MAX)
+		HEAD :: "id,date,status\n"
+		ROW :: 26
+		rows := TABLE_SORT_MAX + 1
+		src := make([]u8, len(HEAD) + rows * ROW)
+		copy(src[:], transmute([]u8)string(HEAD))
+		o := len(HEAD)
+		for i in 0 ..< rows {
+			s := fmt.tprintf("%07d,2026-01-01,ACTIVE\n", (i * 7919) % rows)
+			assert(len(s) == ROW)
+			copy(src[o:], transmute([]u8)s)
+			o += ROW
+		}
+		d := ts_doc(string(src), 3)
+		delete(src)
+		defer doc_close(&d)
+		kn: [TABLE_SORT_KEYS_MAX]Sort_Key
+		for i in 0 ..< TABLE_SORT_KEYS_MAX {kn[i] = {col = i}}
+		// The control. A vector one slot too long is refused by the same procedure and
+		// returns the same `false` -- on this same over-ceiling document -- but it never
+		// reaches the ceiling, so `refused` stays false. An assertion that cannot tell
+		// these two apart is not testing the ceiling.
+		over: [TABLE_SORT_KEYS_MAX + 1]Sort_Key
+		ok_over := table_sort_build(&d, over[:])
+		li_chk(bad, !ok_over, fmt.tprintf("a %d-key vector is refused for being one past the cap", TABLE_SORT_KEYS_MAX + 1))
+		li_chk(bad, !d.table_sort.refused, fmt.tprintf("...and does NOT set `refused`, which belongs to the ceiling (refused %v)", d.table_sort.refused))
+		// No index running yet: the count is not exact, so the early refusal cannot
+		// fire and this exercises the SCANNING one.
+		ok_mid := table_sort_build(&d, kn[:])
+		li_chk(
+			bad,
+			!ok_mid && d.table_sort.refused,
+			fmt.tprintf("one row past TABLE_SORT_MAX refuses a %d-key sort mid-scan, AS THE CEILING (ok %v, refused %v)", TABLE_SORT_KEYS_MAX, ok_mid, d.table_sort.refused),
+		)
+		li_chk(bad, !table_sorted(&d), "...and nothing is left half-sorted")
+		li_chk(bad, d.table_sort.nkeys == 0 && len(d.table_sort.perm) == 0, fmt.tprintf("...with no keys and no permutation left behind (nkeys %d, perm %d)", d.table_sort.nkeys, len(d.table_sort.perm)))
+		li_chk(bad, d.table_sort.refused, "...and the refusal is recorded for the summary row")
+		summary := table_summary_text(&d)
+		li_chk(bad, strings.contains(summary, "too large to sort (over 100,000 rows)"), fmt.tprintf("...which says so: %q", summary))
+		doc_index_start(&d)
+		for !doc_index_done(&d) {}
+		n, exact := table_row_count(&d)
+		li_chk(bad, exact && n == rows, fmt.tprintf("the index settles at %d data rows (got %d, exact %v)", rows, n, exact))
+		t0 := time.tick_now()
+		ok2 := table_sort_build(&d, kn[:])
+		us := time.duration_microseconds(time.tick_since(t0))
+		li_chk(bad, !ok2 && d.table_sort.refused, fmt.tprintf("a settled over-ceiling count refuses a %d-key sort too, AS THE CEILING (refused %v)", TABLE_SORT_KEYS_MAX, d.table_sort.refused))
+		li_chk(bad, us < 1000, fmt.tprintf("...without a pass over the file (%.0f us)", us))
+	}
+
+	// C8 (batch 19 Task 3): the key-vector operations -- table_sort_set,
+	// table_sort_add, table_sort_drop, table_sort_can_add and table_sort_toggle --
+	// plus table_sort_cycle generalised to a column that is not the primary key.
+	//
+	// C1-C7 above pin the BUILD given a vector; nothing before this task exercised
+	// how the vector gets COMPOSED before it ever reaches table_sort_build, which
+	// is the surface a Ctrl+click actually drives and the surface this task adds.
+	//
+	// Two columns whose single-key orders differ (same shape as C2's precedence
+	// fixture), so a wrong precedence or a wrong direction shows up in the order
+	// rather than accidentally matching by luck.
+	@(private = "file")
+	ts_case_key_ops :: proc(bad: ^int) {
+		fmt.println("-- table_sort_set / add / drop / can_add / toggle compose the key vector --")
+		perm_eq :: proc(a, b: []i32) -> bool {
+			if len(a) != len(b) {return false}
+			for v, i in a {if v != b[i] {return false}}
+			return true
+		}
+		d := ts_doc("a,b\nb,2\na,3\nb,1\na,4\n", 2)
+		defer doc_close(&d)
+		s := &d.table_sort
+
+		li_chk(bad, table_sort_can_add(&d, 0) && table_sort_can_add(&d, 1), "can_add is true for either column before any sort exists")
+
+		// -- toggle on col 0: not a key -> append ascending --
+		table_sort_toggle(&d, 0)
+		k0, k0ok := table_sort_key(&d, 0)
+		li_chk(bad, table_sorted(&d) && k0ok && k0 == 0 && !s.keys[0].desc, fmt.tprintf("toggle on an unsorted column appends it ascending at precedence 0 (sorted %v, k %d, desc %v)", table_sorted(&d), k0, s.keys[0].desc))
+		li_chk(bad, ts_order(&d) == "a,3|a,4|b,2|b,1", fmt.tprintf("...in the right order (%q)", ts_order(&d)))
+		if off, ok := table_sort_row_at(&d, 0); ok {li_chk(bad, d.top == off, "...and scrolled to the top of the new order")}
+
+		// -- toggle on col 0 again: ascending -> descending, IN PLACE --
+		table_sort_toggle(&d, 0)
+		k0, k0ok = table_sort_key(&d, 0)
+		li_chk(bad, k0ok && k0 == 0 && s.keys[0].desc, fmt.tprintf("a second toggle flips it to descending without moving its precedence (k %d, desc %v)", k0, s.keys[0].desc))
+		li_chk(bad, ts_order(&d) == "b,2|b,1|a,3|a,4", fmt.tprintf("...in the right order (%q)", ts_order(&d)))
+		if off, ok := table_sort_row_at(&d, 0); ok {li_chk(bad, d.top == off, "...and scrolled again")}
+
+		// -- toggle on col 1: not a key, room for it -> appended as the tie-breaker --
+		table_sort_toggle(&d, 1)
+		k1, k1ok := table_sort_key(&d, 1)
+		li_chk(bad, s.nkeys == 2 && k1ok && k1 == 1 && !s.keys[1].desc, fmt.tprintf("a third toggle on a different column appends it as the tie-breaker (nkeys %d, k %d, desc %v)", s.nkeys, k1, s.keys[1].desc))
+		li_chk(bad, s.keys[0].col == 0 && s.keys[0].desc, "...and col 0 is still the primary, still descending")
+		li_chk(bad, ts_order(&d) == "b,1|b,2|a,3|a,4", fmt.tprintf("...col 0 desc, col 1 asc breaking its ties (%q)", ts_order(&d)))
+
+		// -- THE CAP TRAP. Two keys are live, the cap. A toggle on a third column
+		//    must refuse WITHOUT touching the two keys already there -- not merely
+		//    return having done nothing observable by coincidence. Snapshotted and
+		//    compared field by field, plus the permutation itself, because
+		//    table_sort_build clears before it validates (its own comment), so a
+		//    cap check delegated to it would erase both live keys to discover it
+		//    should have refused instead -- the trap this task's brief named.
+		keys_before := s.keys
+		nkeys_before := s.nkeys
+		perm_before := make([]i32, len(s.perm), context.temp_allocator)
+		copy(perm_before, s.perm[:])
+		li_chk(bad, !table_sort_can_add(&d, 2), "can_add says no room for a third column at the cap")
+		table_sort_toggle(&d, 2)
+		li_chk(bad, s.nkeys == nkeys_before && s.keys == keys_before, fmt.tprintf("a toggle on a third column at the cap leaves both live keys exactly as they were (nkeys %d -> %d, keys %v -> %v)", nkeys_before, s.nkeys, keys_before, s.keys))
+		li_chk(bad, perm_eq(s.perm[:], perm_before), "...and the permutation is unchanged, not just the same length")
+		_, k2ok := table_sort_key(&d, 2)
+		li_chk(bad, !k2ok, "...column 2 was never added")
+
+		// -- table_sort_add called directly hits the SAME cap guard, independent of
+		//    table_sort_toggle's own table_sort_can_add pre-check. A sabotage that
+		//    only removed table_sort_add's internal guard, leaving toggle's
+		//    pre-check standing, would still pass every assertion above -- toggle
+		//    would simply never call add. This is what catches that one.
+		table_sort_add(&d, 2, false)
+		li_chk(bad, s.nkeys == nkeys_before && s.keys == keys_before, "table_sort_add itself refuses a third column at the cap, live sort untouched")
+		li_chk(bad, perm_eq(s.perm[:], perm_before), "...permutation still unchanged")
+
+		// -- table_sort_add direct: flips the PRIMARY key's direction in place,
+		//    with a second key still live -- exactly the shape remove-and-re-append
+		//    would get wrong (Task 2's review; table_sort_add's own comment).
+		table_sort_add(&d, 0, false) // descending -> ascending, same column
+		k0, k0ok = table_sort_key(&d, 0)
+		li_chk(bad, k0ok && k0 == 0 && !s.keys[0].desc, fmt.tprintf("table_sort_add flips col 0's direction without moving it off precedence 0 (k %d, desc %v)", k0, s.keys[0].desc))
+		li_chk(bad, s.keys[1].col == 1, "...and col 1 is untouched, still at precedence 1")
+		li_chk(bad, ts_order(&d) == "a,3|a,4|b,1|b,2", fmt.tprintf("...order follows: col 0 asc primary, col 1 asc breaking ties (%q)", ts_order(&d)))
+
+		// -- table_sort_drop: removes only the named key, keeps the other live --
+		//
+		// d.top is poisoned first, deliberately to something the correct scroll can
+		// never land on by coincidence: row 0 of the order AFTER this drop is "a,3",
+		// the same physical row that was already at row 0 before it (dropping col 1
+		// does not move col 0's primary rows), so an assertion that just compared
+		// d.top to table_sort_row_at(&d, 0) afterwards would still pass with the
+		// scroll-to-top line deleted from table_sort_drop -- d.top would already be
+		// right, left over from the table_sort_add call above. Poisoning it first is
+		// what makes the check below fail when that line is missing, the way Finding
+		// 2's review proved a same-row coincidence was hiding this exact gap.
+		d.top = -1
+		table_sort_drop(&d, 1)
+		li_chk(bad, s.nkeys == 1, fmt.tprintf("dropping col 1 leaves exactly one key (nkeys %d)", s.nkeys))
+		_, k1ok = table_sort_key(&d, 1)
+		li_chk(bad, !k1ok, "...col 1 is gone")
+		k0, k0ok = table_sort_key(&d, 0)
+		li_chk(bad, k0ok && k0 == 0 && table_sorted(&d), "...col 0 is still live, still primary")
+		li_chk(bad, ts_order(&d) == "a,3|a,4|b,2|b,1", fmt.tprintf("...back to col 0's own single-key order, ties by file order now (%q)", ts_order(&d)))
+		if off, ok := table_sort_row_at(&d, 0); ok {li_chk(bad, d.top == off, fmt.tprintf("...and scrolled to the top of the reduced order (top %d, want %d)", d.top, off))}
+
+		// -- toggle on the LAST live key, descending -> removed: unsorts the doc,
+		//    and doc.top is left alone -- there is no permutation left for a
+		//    scroll to be an offset into (table_sort_cycle's own descending -> clear
+		//    branch makes the same call, and C-nothing pinned it before now).
+		table_sort_add(&d, 0, true) // ascending -> descending, so the next toggle removes it
+		top_before_clear := d.top
+		table_sort_toggle(&d, 0)
+		li_chk(bad, !table_sorted(&d) && s.nkeys == 0, fmt.tprintf("toggling the descending last key off unsorts the document (sorted %v, nkeys %d)", table_sorted(&d), s.nkeys))
+		li_chk(bad, d.top == top_before_clear, "...and doc.top is untouched by the clear")
+
+		// -- the plain click's standard three-state cycle, on a column that starts
+		//    OUTSIDE the (currently empty) live sort: not-a-key -> ascending ->
+		//    descending -> cleared. table_sort_cycle's own logic is unchanged from
+		//    its pre-Task-3 shape (then named table_sort_click, since renamed) except
+		//    reading keys[k] instead of keys[0] (below); this is the ordinary
+		//    single-key path that change must not disturb.
+		table_sort_cycle(&d, 1)
+		li_chk(bad, s.nkeys == 1 && s.keys[0].col == 1 && !s.keys[0].desc, fmt.tprintf("plain click 1 (not sorted -> ascending): nkeys %d keys %v", s.nkeys, s.keys))
+		table_sort_cycle(&d, 1)
+		li_chk(bad, s.keys[0].col == 1 && s.keys[0].desc, "plain click 2 (ascending -> descending)")
+		top_before_i3 := d.top
+		table_sort_cycle(&d, 1)
+		li_chk(bad, !table_sorted(&d), "plain click 3 (descending -> the file's own order)")
+		li_chk(bad, d.top == top_before_i3, "...and doc.top is untouched by that clear too")
+
+		// -- table_sort_set: replaces the (now empty) vector with exactly one key,
+		//    regardless of what was live before --
+		table_sort_set(&d, 1, false)
+		li_chk(bad, table_sorted(&d) && s.nkeys == 1 && s.keys[0].col == 1 && !s.keys[0].desc, fmt.tprintf("table_sort_set(1, asc) is live with exactly col 1 ascending (nkeys %d, keys %v)", s.nkeys, s.keys))
+		table_sort_add(&d, 1, true) // col 1 descending, the sole (primary) key
+		li_chk(bad, s.keys[0].desc, "precondition: col 1 (primary) is descending")
+		table_sort_toggle(&d, 0) // col 0 not a key -> appended ascending, as the SECONDARY key
+		_, k1ok = table_sort_key(&d, 1)
+		k0, k0ok = table_sort_key(&d, 0)
+		li_chk(bad, s.nkeys == 2 && k1ok && k0ok && k0 == 1 && !s.keys[k0].desc, fmt.tprintf("precondition: col 0 is now the SECONDARY key, ascending, while the primary (col 1) is descending (nkeys %d, k0 %d, keys %v)", s.nkeys, k0, s.keys))
+
+		// -- table_sort_cycle on the SECONDARY key. THE BUG THIS CATCHES: reading
+		//    keys[0].desc instead of keys[k].desc would consult col 1's direction
+		//    (descending) to decide col 0's next state, taking the
+		//    clear-the-whole-sort branch instead of replacing it with col 0
+		//    descending -- the two are chosen to disagree here on purpose (col 1
+		//    descending, col 0 ascending) so a wrong read produces a DIFFERENT
+		//    observable outcome, not the same one by coincidence.
+		table_sort_cycle(&d, 0)
+		li_chk(bad, table_sorted(&d) && s.nkeys == 1 && s.keys[0].col == 0 && s.keys[0].desc, fmt.tprintf("a plain click on a live SECONDARY key reads ITS OWN direction, not keys[0]'s: replaces the vector with just col 0, descending (sorted %v, nkeys %d, keys %v)", table_sorted(&d), s.nkeys, s.keys))
+		_, k1ok = table_sort_key(&d, 1)
+		li_chk(bad, !k1ok, "...and col 1 is gone -- replaced, not composed onto")
+		table_sort_cycle(&d, 0) // col 0 is now primary, descending -> clear
+		li_chk(bad, !table_sorted(&d), "...and a second click on it clears, same as any primary key would")
+
+		// -- COMMIT-FIRST for table_sort_toggle, the Ctrl+click gesture: an open
+		//    cell edit lands on the row it was opened on rather than being
+		//    dropped. table_field_at/table_cell_at_index rather than table_cell_at,
+		//    which needs pixel geometry this font-free fixture does not load
+		//    (ts_doc's own comment). d.top is pinned to 0 first so visible row 0
+		//    resolves to file row 0 regardless of where a prior scroll left it.
+		d.top = 0
+		eok, _, _, efs, efe, eval := table_cell_at_index(&d, 0, 1, 4)
+		li_chk(bad, eok && eval == "2", fmt.tprintf("precondition: (row 0, col 1) is %q", eval))
+		table_edit_start(&d, 0, 1, efs, efe, eval)
+		table_edit_rune(&d, '!')
+		pre := doc_debug_string(&d)
+		defer delete(pre)
+		table_sort_toggle(&d, 0) // Ctrl+click a DIFFERENT column while the edit is open
+		post := doc_debug_string(&d)
+		defer delete(post)
+		li_chk(bad, !d.table_editing, "a Ctrl+click closes the open edit")
+		li_chk(bad, strings.contains(post, "b,2!") && !strings.contains(pre, "b,2!"), fmt.tprintf("...by COMMITTING it onto the row it was opened on, not dropping the keystroke (%q)", post))
+	}
+
+	// Finding 4 (batch 19 Task 3 review): ts_case_key_ops exercises toggle's
+	// three-state removal (descending -> removed) only where removing the key
+	// leaves the document unsorted, and covers "the primary survives" only
+	// through a direct table_sort_drop call, not through table_sort_toggle
+	// itself. Neither proves the GESTURE -- Ctrl+click, Ctrl+click, Ctrl+click on
+	// the SECONDARY key -- leaves the primary's precedence and direction alone.
+	// This case is that composition, on its own Document per development-loop.md
+	// §6's one-Document-per-proc rule.
+	@(private = "file")
+	ts_case_toggle_secondary_cycle :: proc(bad: ^int) {
+		fmt.println("-- table_sort_toggle's three-state cycle on a SECONDARY key, primary left live --")
+		d := ts_doc("a,b\nb,2\na,3\nb,1\na,4\n", 2)
+		defer doc_close(&d)
+		s := &d.table_sort
+
+		// Primary: col 0 descending. Secondary: col 1 ascending, composed on top
+		// through table_sort_add rather than table_sort_set, matching how a real
+		// Ctrl+click on a second column arrives (table_sort_toggle's own
+		// not-a-key branch).
+		table_sort_set(&d, 0, true)
+		table_sort_add(&d, 1, false)
+		li_chk(bad, s.nkeys == 2 && s.keys[0].col == 0 && s.keys[0].desc && s.keys[1].col == 1 && !s.keys[1].desc, fmt.tprintf("precondition: col 0 desc primary, col 1 asc secondary (nkeys %d, keys %v)", s.nkeys, s.keys))
+		li_chk(bad, ts_order(&d) == "b,1|b,2|a,3|a,4", fmt.tprintf("...col 0 desc, col 1 asc breaking its ties (%q)", ts_order(&d)))
+
+		// Ctrl+click 1 on the secondary: already a key, ascending -> descending,
+		// IN PLACE -- the primary must not move or change direction.
+		table_sort_toggle(&d, 1)
+		k1, k1ok := table_sort_key(&d, 1)
+		li_chk(bad, s.nkeys == 2 && s.keys[0].col == 0 && s.keys[0].desc, fmt.tprintf("toggle 1 on the secondary: primary (col 0, desc) untouched (nkeys %d, keys %v)", s.nkeys, s.keys))
+		li_chk(bad, k1ok && k1 == 1 && s.keys[1].desc, fmt.tprintf("...secondary (col 1) flips to descending without moving off precedence 1 (k %d, desc %v)", k1, s.keys[1].desc))
+		li_chk(bad, ts_order(&d) == "b,2|b,1|a,4|a,3", fmt.tprintf("...order follows: col 0 desc primary, col 1 desc breaking its ties (%q)", ts_order(&d)))
+
+		// Ctrl+click 2 on the secondary: descending -> REMOVED. THE CASE THIS
+		// FINDING NAMES: table_sort_toggle itself, not a direct table_sort_drop
+		// call, must remove only col 1 and leave col 0 exactly where it was.
+		table_sort_toggle(&d, 1)
+		li_chk(bad, s.nkeys == 1, fmt.tprintf("toggle 2 on the secondary removes only that key (nkeys %d)", s.nkeys))
+		_, k1ok = table_sort_key(&d, 1)
+		li_chk(bad, !k1ok, "...col 1 is gone")
+		k0, k0ok := table_sort_key(&d, 0)
+		li_chk(bad, k0ok && k0 == 0 && s.keys[0].desc && table_sorted(&d), fmt.tprintf("...primary (col 0) survives at precedence 0, still descending (k %d, ok %v, desc %v)", k0, k0ok, s.keys[0].desc))
+		li_chk(bad, ts_order(&d) == "b,2|b,1|a,3|a,4", fmt.tprintf("...and the order follows the surviving primary alone, ties by file order now (%q)", ts_order(&d)))
+	}
+
+	// A single-tab App around one ts_doc fixture, for cases that need item_enabled
+	// (menu.odin) rather than the raw Table_Sort operations -- item_enabled takes
+	// an ^App because Menu_Item.enabled does, reading the target column off
+	// app.menu.ctx_col rather than a parameter. app_destroy owns the returned
+	// App's teardown (it frees the Document too, the same shape menutest already
+	// uses), so the caller's only obligation is `defer app_destroy(&a)`.
+	@(private = "file")
+	ts_menu_app :: proc(src: string, cols: int) -> App {
+		a: App
+		menu_init(&a.menu)
+		d := new(Document)
+		d^ = ts_doc(src, cols)
+		app_activate(&a, app_add(&a, d))
+		return a
+	}
+
+	// C13: table_header_menu_items -- every row of the table, in each of five
+	// states: unsorted; sorted by the column the menu targets; sorted by a
+	// DIFFERENT column with room left under the cap; the vector AT the cap with
+	// the targeted column not among its keys; and the document out of the grid
+	// entirely, which is the state that pins the rows against command_dispatch's
+	// own doc.table guard.
+	//
+	// item_enabled is asserted DIRECTLY, not inferred from a simulated click --
+	// the brief's own instruction, because this menu is a discoverability surface
+	// (menu.odin's header comment): what a reader sees (grey or not) is the thing
+	// under test, not whether the command would have run.
+	//
+	// The fixture is four columns wide, and `target` is TABLE_SORT_KEYS_MAX --
+	// one past the last column the "vector full" state below fills, so the
+	// targeted column is guaranteed never to be one of the cap's keys rather
+	// than coincidentally not one. That only works while TABLE_SORT_KEYS_MAX is
+	// a valid index into four columns, which is what the #assert pins: raise the
+	// cap past 3 and this proc would start asking about a column the fixture
+	// does not have, silently. Same guard shape and same reason as
+	// ts_case_inverses'.
+	@(private = "file")
+	ts_case_menu_items :: proc(bad: ^int) {
+		fmt.println("-- table_header_menu_items: every row's enabled state across five view/sort states --")
+		#assert(TABLE_SORT_KEYS_MAX <= 3)
+		src := "w,x,y,z\n1,a,p,i\n2,b,q,j\n3,a,r,i\n1,c,s,j\n2,a,t,i\n"
+		COLS :: 4
+		target := TABLE_SORT_KEYS_MAX // one past every column the "full" state fills
+
+		find :: proc(items: []Menu_Item, cmd: Command_Id) -> Menu_Item {
+			for it in items {
+				if it.cmd == cmd {return it}
+			}
+			// A row this test names is missing from the table it is checking --
+			// a plan defect or a regression, not a case this proc can score.
+			panic("table_header_menu_items is missing a row this test names")
+		}
+
+		// One state's worth of assertions, run against whatever sort the caller
+		// already built on `a`'s active document. `want_then_by` covers both
+		// Then-by rows: the brief gives them the identical predicate.
+		check :: proc(bad: ^int, label: string, a: ^App, want_sort, want_then_by, want_remove, want_clear: bool) {
+			items := table_header_menu_items
+			got_as := item_enabled(a, find(items, .Table_Sort_Asc))
+			li_chk(bad, got_as == want_sort, fmt.tprintf("%s: Sort Ascending enabled == %v (got %v)", label, want_sort, got_as))
+			got_ds := item_enabled(a, find(items, .Table_Sort_Desc))
+			li_chk(bad, got_ds == want_sort, fmt.tprintf("%s: Sort Descending enabled == %v (got %v)", label, want_sort, got_ds))
+			got_ta := item_enabled(a, find(items, .Table_Sort_Then_Asc))
+			li_chk(bad, got_ta == want_then_by, fmt.tprintf("%s: Then by Ascending enabled == %v (got %v)", label, want_then_by, got_ta))
+			got_td := item_enabled(a, find(items, .Table_Sort_Then_Desc))
+			li_chk(bad, got_td == want_then_by, fmt.tprintf("%s: Then by Descending enabled == %v (got %v)", label, want_then_by, got_td))
+			got_rm := item_enabled(a, find(items, .Table_Sort_Remove))
+			li_chk(bad, got_rm == want_remove, fmt.tprintf("%s: Remove from Sort enabled == %v (got %v)", label, want_remove, got_rm))
+			got_cl := item_enabled(a, find(items, .Table_Sort_Clear))
+			li_chk(bad, got_cl == want_clear, fmt.tprintf("%s: Clear Sort enabled == %v (got %v)", label, want_clear, got_cl))
+		}
+
+		// -- unsorted: everything but the two plain Sort rows is dead --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			a.menu.ctx_col = target
+			check(bad, "unsorted", &a, true, false, false, false)
+			// The other half of the reason rule, and the half that has teeth:
+			// "Then by" is disabled HERE too, but for a different reason -- there
+			// is no sort to add a tie-breaker to -- and menu_draw puts whatever
+			// this returns in the accelerator column of any greyed row. Without
+			// this assertion an item_disabled_reason that ignored state entirely
+			// still passed every check in this proc, and the unsorted row would
+			// have explained itself as a sort-key-cap limit that is not why it is
+			// dead.
+			why := item_disabled_reason(&a, find(table_header_menu_items, .Table_Sort_Then_Asc))
+			li_chk(bad, why == "", fmt.tprintf("unsorted: the dead Then-by row offers NO cap reason, because the cap is not why (%q)", why))
+		}
+
+		// -- sorted by the column the menu targets: every row lights up --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			table_sort_set(d, target, false)
+			a.menu.ctx_col = target
+			check(bad, "sorted by this column", &a, true, true, true, true)
+		}
+
+		// -- sorted by a DIFFERENT column, one key live, room left under the cap:
+		//    Then-by can still append this column as a tie-breaker; Remove has
+		//    nothing to remove, because this column isn't the key. --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			other := (target + 1) % COLS
+			table_sort_set(d, other, false)
+			a.menu.ctx_col = target
+			check(bad, "sorted by another column", &a, true, true, false, true)
+		}
+
+		// -- the vector at the cap, this column not among its keys: Then-by is
+		//    the one row this state disables that the OTHER "sorted by another
+		//    column" state above does not -- table_sort_can_add says no, because
+		//    there is no room left to compose this column onto. That is also the
+		//    one case with an item_disabled_reason (the brief's own instruction:
+		//    a full vector greyed out with no explanation reads as a broken row).
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			full: [TABLE_SORT_KEYS_MAX]Sort_Key
+			for i in 0 ..< TABLE_SORT_KEYS_MAX {full[i] = {col = i, desc = false}}
+			ok := table_sort_build(d, full[:])
+			li_chk(bad, ok, "precondition: the cap-filling build succeeds")
+			a.menu.ctx_col = target
+			check(bad, "vector full, this column not in it", &a, true, false, false, true)
+			why := item_disabled_reason(&a, find(table_header_menu_items, .Table_Sort_Then_Asc))
+			li_chk(bad, why != "", fmt.tprintf("...and the disabled Then-by row carries a reason rather than a bare grey-out (%q)", why))
+		}
+
+		// -- the document is not in the grid at all: every row dead, including
+		//    the two plain Sort rows. This is the state where the row's own
+		//    predicate is the ONLY thing that can grey it: command_allowed_on
+		//    says yes (none of the six mutates the document), so without an
+		//    enabled predicate matching command_dispatch's `doc.table` guard,
+		//    Sort Ascending/Descending paint live and silently do nothing. --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			d.table = false
+			a.menu.ctx_col = target
+			check(bad, "not in table view", &a, false, false, false, false)
+		}
+	}
+
+	// C14: the six commands act on the column the menu was opened on, through
+	// the real dispatch path -- menu_open_ctx, then the menu_close that
+	// menu_hit_test performs BEFORE returning the picked command, then
+	// command_dispatch. The close is the point of the test: it is where ctx_col
+	// used to be zeroed, so every row acted on column 0 while item_enabled had
+	// already greyed it for column N.
+	//
+	// The target column is deliberately non-zero (TABLE_SORT_KEYS_MAX, index 2
+	// of a four-column fixture). A fixture that targeted column 0 cannot fail
+	// against that bug at all -- the wrong answer and the right one coincide.
+	@(private = "file")
+	ts_case_menu_dispatch :: proc(bad: ^int) {
+		fmt.println("-- the six sort commands land on the column the menu was opened on --")
+		#assert(TABLE_SORT_KEYS_MAX <= 3)
+		src := "w,x,y,z\n1,a,p,i\n2,b,q,j\n3,a,r,i\n1,c,s,j\n2,a,t,i\n"
+		COLS :: 4
+		target := TABLE_SORT_KEYS_MAX
+		other := (TABLE_SORT_KEYS_MAX + 1) % COLS
+		dirs := [2]bool{false, true}
+
+		// One pick, start to finish: open the header menu on `col`, close it the
+		// way menu_hit_test does, then dispatch. `t` and the nil window are
+		// untouched by these six commands, the same way menutest drives
+		// .Menu_Close.
+		pick :: proc(a: ^App, cmd: Command_Id, col: int) {
+			t: plat.Text
+			menu_open_ctx(a, table_header_menu_items, 0, 0, col)
+			menu_close(a)
+			command_dispatch(cmd, {}, a, nil, &t, 10)
+		}
+
+		// -- Sort Ascending / Descending: one key, on THIS column, in the named
+		//    direction. Asserted through table_sort_key (which answers "at what
+		//    precedence", not "is anything sorted"), so a sort built on column 0
+		//    fails rather than passing on nkeys alone. --
+		for desc in dirs {
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			pick(&a, .Table_Sort_Desc if desc else .Table_Sort_Asc, target)
+			k, ok := table_sort_key(d, target)
+			li_chk(bad, ok && k == 0, fmt.tprintf("Sort %v: col %d is the primary key (ok %v, precedence %d)", "Descending" if desc else "Ascending", target, ok, k))
+			li_chk(bad, d.table_sort.nkeys == 1, fmt.tprintf("...and it is the ONLY key (nkeys %d)", d.table_sort.nkeys))
+			li_chk(bad, ok && d.table_sort.keys[0].desc == desc, fmt.tprintf("...in the direction the row names (desc %v, want %v)", d.table_sort.keys[0].desc, desc))
+		}
+
+		// -- Then by Ascending / Descending: appended BEHIND an existing key on a
+		//    different column, so precedence 1 is what pins the column as well as
+		//    the ordering -- a dispatch aimed at column 0 would land on `other`
+		//    (which is 0 whenever the cap is 3) or on a column that is already a
+		//    key, and either way not at precedence 1 on `target`. --
+		for desc in dirs {
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			table_sort_set(d, other, false)
+			pick(&a, .Table_Sort_Then_Desc if desc else .Table_Sort_Then_Asc, target)
+			k, ok := table_sort_key(d, target)
+			li_chk(bad, ok && k == 1, fmt.tprintf("Then by %v: col %d is the tie-breaker behind col %d (ok %v, precedence %d)", "Descending" if desc else "Ascending", target, other, ok, k))
+			li_chk(bad, d.table_sort.nkeys == 2, fmt.tprintf("...and the primary survived (nkeys %d)", d.table_sort.nkeys))
+			li_chk(bad, ok && d.table_sort.keys[1].desc == desc, fmt.tprintf("...in the direction the row names (desc %v, want %v)", d.table_sort.keys[1].desc, desc))
+		}
+
+		// -- Remove from Sort: drops THIS column and leaves the other one. Both
+		//    halves matter: a dispatch on column 0 would drop `other` instead
+		//    (whenever `other` is 0) or drop nothing at all. --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			keys := [2]Sort_Key{{col = other, desc = false}, {col = target, desc = false}}
+			li_chk(bad, table_sort_build(d, keys[:]), "precondition: a two-key sort over other+target builds")
+			pick(&a, .Table_Sort_Remove, target)
+			_, gone := table_sort_key(d, target)
+			_, kept := table_sort_key(d, other)
+			li_chk(bad, !gone, fmt.tprintf("Remove from Sort: col %d is no longer a key", target))
+			li_chk(bad, kept && d.table_sort.nkeys == 1, fmt.tprintf("...and col %d survives alone (kept %v, nkeys %d)", other, kept, d.table_sort.nkeys))
+		}
+
+		// -- Clear Sort: the one row with no column of its own. Included anyway,
+		//    because it is dispatched through the identical path and a regression
+		//    there would look like the others. --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			table_sort_set(d, target, false)
+			li_chk(bad, table_sorted(d), "precondition: a sort is live before Clear")
+			pick(&a, .Table_Sort_Clear, target)
+			li_chk(bad, !table_sorted(d) && d.table_sort.nkeys == 0, fmt.tprintf("Clear Sort: nothing is left sorted (nkeys %d)", d.table_sort.nkeys))
+		}
+
+		// -- and the dispatch guard: on a document that has left the grid, the
+		//    same pick builds nothing. command_dispatch's `doc.table` term is the
+		//    only thing refusing here -- none of the four Table_Sort operations
+		//    checks it, and table_sort_build would happily permute a document the
+		//    text view is about to charge table_sort_shift for on every edit. --
+		{
+			a := ts_menu_app(src, COLS)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			d.table = false
+			pick(&a, .Table_Sort_Asc, target)
+			li_chk(bad, d.table_sort.nkeys == 0, fmt.tprintf("out of the grid: Sort Ascending builds no sort (nkeys %d)", d.table_sort.nkeys))
+			asc := Menu_Item{}
+			for it in table_header_menu_items {
+				if it.cmd == .Table_Sort_Asc {asc = it}
+			}
+			li_chk(bad, asc.cmd == .Table_Sort_Asc, "precondition: the Sort Ascending row is in the table")
+			li_chk(bad, !item_enabled(&a, asc), "...and the row was greyed out saying so, rather than painting live and no-oping")
+		}
+	}
+
+	// A grid Document whose column widths are SET BY HAND rather than sampled.
+	//
+	// table_compute_widths needs loaded fonts and clamps every width to §10's
+	// 8-40, and both of those are in the way here: this case is about the
+	// boundaries of the header's layout, and the interesting boundary (a column
+	// too narrow to hold the marks' run and a name) is BELOW the clamp's floor.
+	// Writing the widths directly is the only way to reach it, and it is honest
+	// about what it proves -- the suppression is a guard against a width the
+	// sampler cannot produce, not an everyday state. See table_header_layout.
+	@(private = "file")
+	ts_seam_doc :: proc(widths: []int) -> Document {
+		d := ts_doc("alpha,b,gamma,delta\n1,2,3,4\n", len(widths))
+		for w in widths {
+			append(&d.table_widths, w)
+			append(&d.table_align, Table_Align.Left)
+		}
+		return d
+	}
+
+	// C15: the header's SEAM -- what is DRAWN against what is CLICKABLE.
+	//
+	// The header cell went from one hit region to two, which development-loop.md §4
+	// names as Shape B: a correct, tested function fed the wrong input, or its
+	// result read in the wrong space. So this case does NOT test table_header_layout
+	// against itself. Every rectangle it expects is written out by hand from §10's
+	// metrics -- gutter 56, cell padding 10, header band 30, and a column's width as
+	// cells * char_w + 2 * padding -- and every hit-test assertion is at an EXACT
+	// boundary pixel of the rectangle the draw uses. A layout and a hit-test that
+	// had drifted a single pixel apart still agree with each other everywhere except
+	// those pixels, which is why the interior of the chevron is not what is probed.
+	//
+	// The literals are only readable because the case pins its own inputs first: at
+	// UI_SCALE 1 and px 16 the marks' run is 5 + 9 + 5 + 10 = 29px and the chevron is
+	// 10x6. Those preconditions are asserted, not assumed -- if a metric moves, this
+	// case says which one rather than failing four rectangles at once.
+	//
+	// char_w is 8 in the main fixture and 7.25 in the exact-width one, and 7.25 is
+	// not a stylistic choice: it makes a 5-cell column's inner width land EXACTLY on
+	// the suppression threshold (5 * 7.25 == 29 + 7.25), and both sides of that
+	// comparison are exact in f32, so the ">=" boundary is tested rather than
+	// approached.
+	@(private = "file")
+	ts_case_header_seam :: proc(bad: ^int) {
+		fmt.println("-- the header's two hit regions: what is drawn is what is clickable --")
+		cw, px, W := f32(8), f32(16), f32(800)
+
+		// -- the metrics these literals are computed from --
+		li_chk(bad, UI_SCALE == 1, fmt.tprintf("UI_SCALE is 1, so sx() is the identity (%.2f)", UI_SCALE))
+		li_chk(bad, TABLE_CELL_PAD_X == 10 && table_gutter_w() == 56, fmt.tprintf("§10's padding is 10 and the gutter 56 (%.0f, %.0f)", TABLE_CELL_PAD_X, table_gutter_w()))
+		li_chk(bad, table_header_h(px) == 30, fmt.tprintf("§10's header band is 30px at px 16 (%.0f)", table_header_h(px)))
+		li_chk(bad, table_right(W) == 786, fmt.tprintf("the grid's right edge is 800 - 14 (%.0f)", table_right(W)))
+		li_chk(bad, table_chev_w() == 10 && table_chev_h() == 6, fmt.tprintf("the chevron is 10x6 (%.0fx%.0f)", table_chev_w(), table_chev_h()))
+		li_chk(bad, table_header_marks_w(px, cw, false) == 29, fmt.tprintf("the marks reserve 5+9+5+10 = 29px with no digit (%.0f)", table_header_marks_w(px, cw, false)))
+
+		top := table_grid_top()
+		mid := top + 15 // the middle of a 30px band
+
+		// -- the main fixture: four columns, laid out by hand ------------------
+		//
+		//   c0  8 cells -> w 84,  x  56 .. 140   wide, hovered below
+		//   c1  4 cells -> w 52,  x 140 .. 192   too narrow for a chevron
+		//   c2  5 cells -> w 60,  x 192 .. 252   the narrowest that still fits
+		//   c3 80 cells -> w 660, x 252 .. 912   runs past the grid's right edge
+		{
+			d := ts_seam_doc({8, 4, 5, 80})
+			defer doc_close(&d)
+			cols := table_cols_layout(&d, cw, W)
+			li_chk(bad, len(cols) == 4, fmt.tprintf("precondition: all four columns are laid out (%d)", len(cols)))
+			hs := table_header_layout(&d, cw, W, px, 0)
+			li_chk(bad, len(hs) == 4, fmt.tprintf("...and the header layout answers for all four (%d)", len(hs)))
+			if len(hs) != 4 || len(cols) != 4 {return}
+
+			// The bodies, against hand-written edges. c3's is CLIPPED at 786 --
+			// the pixels past the grid's right edge are the vertical scrollbar's
+			// lane, and the band is not drawn there.
+			want := [4][2]f32{{56, 140}, {140, 192}, {192, 252}, {252, 786}}
+			for h, i in hs {
+				ok := h.c == i && h.body.x == want[i][0] && h.body.x + h.body.w == want[i][1] && h.body.y == top && h.body.h == 30
+				li_chk(bad, ok, fmt.tprintf("c%d's body is x %.0f..%.0f (want %.0f..%.0f), y %.0f h %.0f", h.c, h.body.x, h.body.x + h.body.w, want[i][0], want[i][1], h.body.y - top, h.body.h))
+			}
+
+			// THE CHEVRON EXISTS ONLY ON THE HOVERED COLUMN. c0 is hovered here.
+			only := hs[0].has_chev && !hs[1].has_chev && !hs[2].has_chev && !hs[3].has_chev
+			li_chk(bad, only, fmt.tprintf("hovering c0 gives a chevron to c0 alone (%v %v %v %v)", hs[0].has_chev, hs[1].has_chev, hs[2].has_chev, hs[3].has_chev))
+			// ...and hovering nothing gives none at all.
+			none := 0
+			for h in table_header_layout(&d, cw, W, px, TABLE_SORT_NONE) {
+				if h.has_chev {none += 1}
+			}
+			li_chk(bad, none == 0, fmt.tprintf("with the pointer off the header there is no chevron anywhere (%d)", none))
+			// ...and hovering c2 moves it there rather than adding a second one.
+			h2 := table_header_layout(&d, cw, W, px, 2)
+			moved := !h2[0].has_chev && h2[2].has_chev
+			li_chk(bad, moved, fmt.tprintf("hovering c2 moves the chevron rather than adding one (c0 %v, c2 %v)", h2[0].has_chev, h2[2].has_chev))
+
+			// c0's chevron, by hand: hard against the cell's right INNER edge
+			// (140 - 10), so it spans 120..130, and centred in the band ((30-6)/2).
+			ch := hs[0].chevron
+			li_chk(bad, ch.x == 120 && ch.w == 10, fmt.tprintf("c0's chevron spans 120..130 (%.0f..%.0f)", ch.x, ch.x + ch.w))
+			li_chk(bad, ch.y == top + 12 && ch.h == 6, fmt.tprintf("...centred in the band, y +%.0f h %.0f (want +12, 6)", ch.y - top, ch.h))
+			// The sort arrow keeps clear of it, on the SAME column, so the two
+			// marks cannot be drawn over each other: 120 - 5 gap - 9 arrow = 106.
+			a := table_sort_arrow_rect(cols[0], px, table_right(W))
+			li_chk(bad, a.x == 106 && a.x + a.w + 5 == ch.x, fmt.tprintf("the arrow sits at 106..115 with the 5px gap before the chevron (%.0f..%.0f)", a.x, a.x + a.w))
+
+			// -- THE SEAM, at the chevron's exact edges --------------------------
+			//
+			// Inclusive on the left and top, exclusive on the right and bottom,
+			// which is what table_rect_hit means and what the draw fills. Each pair
+			// straddles one boundary pixel of the rectangle the draw uses, so a
+			// hit-test that read a rect one pixel from the drawn one fails here and
+			// passes everywhere else.
+			seam := [?]struct {
+				x, y:  f32,
+				c:     int,
+				hit:   Table_Header_Hit,
+				label: string,
+			} {
+				{125, mid, 0, .Chevron, "the middle of the chevron opens the menu"},
+				{120, mid, 0, .Chevron, "its LEFT edge is inside it"},
+				{119, mid, 0, .Body, "...and one pixel further left sorts"},
+				{129, mid, 0, .Chevron, "its last pixel is inside it"},
+				{130, mid, 0, .Body, "...and its right edge is already the body"},
+				{125, top + 12, 0, .Chevron, "its TOP edge is inside it"},
+				{125, top + 11, 0, .Body, "...and one pixel above sorts"},
+				{125, top + 17, 0, .Chevron, "its last row is inside it"},
+				{125, top + 18, 0, .Body, "...and its bottom edge is already the body"},
+				{135, mid, 0, .Body, "the cell padding to its right still sorts, rather than going dead"},
+				{60, mid, 0, .Body, "and so does the label end of the cell"},
+			}
+			for s in seam {
+				c, hit := table_header_at(&d, cw, W, s.x, s.y, px)
+				li_chk(bad, hit == s.hit && (hit == .None || c == s.c), fmt.tprintf("(%.0f, +%.0f) -> c%d %v: %s", s.x, s.y - top, c, hit, s.label))
+			}
+
+			// -- THE RESIZE EDGE WINS ------------------------------------------
+			//
+			// c0's right edge is 140 and the zone is ±4px, so 137 is inside it. It
+			// resolves to the EDGE and to neither header region -- not a menu, not a
+			// sort -- and 135 (two pixels outside the zone) still sorts, which is
+			// what stops this passing on a header hit-test that refused everywhere.
+			_, on_edge := table_edge_at(&d, cw, W, 137, mid, px)
+			ec, ehit := table_header_at(&d, cw, W, 137, mid, px)
+			li_chk(bad, on_edge, "137 is inside c0's ±4px resize zone (its edge is 140)")
+			li_chk(bad, ehit == .None, fmt.tprintf("...and the header answers nothing there: neither chevron nor sort (c%d %v)", ec, ehit))
+			_, off_edge := table_edge_at(&d, cw, W, 135, mid, px)
+			li_chk(bad, !off_edge, "...while 135 is outside the zone, so the pair above is about the zone and not about the header")
+
+			// -- A COLUMN TOO NARROW: no chevron, but the menu is still reachable --
+			//
+			// c1's inner width is 32px against the 29 + 8 the marks and one cell of
+			// name need. The right-click route does not consult has_chev, and this
+			// is the assertion that says the command never becomes unreachable.
+			n1 := table_header_layout(&d, cw, W, px, 1)
+			li_chk(bad, !n1[1].has_chev, fmt.tprintf("c1 (inner 32px, needs 37) suppresses its chevron (%v)", n1[1].has_chev))
+			nc, nhit := table_header_at(&d, cw, W, 172, mid, px)
+			li_chk(bad, nc == 1 && nhit == .Body, fmt.tprintf("...so the pixels a chevron would have taken sort instead (c%d %v)", nc, nhit))
+			rc, rok := table_header_cell_at(&d, cw, W, 166, mid, px)
+			li_chk(bad, rok && rc == 1, fmt.tprintf("...and a right-click anywhere in it still resolves to c1 (%v, c%d)", rok, rc))
+
+			// -- THE LAST COLUMN, against the grid's right edge -------------------
+			//
+			// c3 runs to 912 and the grid stops at 786, so its marks are measured
+			// back from the CLIP: 786 - 10 padding - 10 chevron = 766. A chevron
+			// pinned to the cell's own right edge would be 250px off screen.
+			h3 := table_header_layout(&d, cw, W, px, 3)
+			c3 := h3[3].chevron
+			li_chk(bad, h3[3].has_chev && c3.x == 766 && c3.x + c3.w == 776, fmt.tprintf("c3's chevron is clipped onto the grid at 766..776 (%v, %.0f..%.0f)", h3[3].has_chev, c3.x, c3.x + c3.w))
+			li_chk(bad, c3.x + c3.w <= table_content_right(cols, W), fmt.tprintf("...inside where the table ends (%.0f vs %.0f)", c3.x + c3.w, table_content_right(cols, W)))
+			lc, lhit := table_header_at(&d, cw, W, 770, mid, px)
+			li_chk(bad, lc == 3 && lhit == .Chevron, fmt.tprintf("...and it is clickable there (c%d %v)", lc, lhit))
+			ec2, ehit2 := table_header_at(&d, cw, W, 786, mid, px)
+			li_chk(bad, ehit2 == .None, fmt.tprintf("...while the scrollbar's lane past 786 is not the header at all (c%d %v)", ec2, ehit2))
+		}
+
+		// -- SCROLLED PART-WAY UNDER THE STICKY GUTTER -------------------------
+		//
+		// At 70px of pan c0 spans -14..70, so only 14px of it is out from under the
+		// 56px gutter and its chevron would land at 50 -- painted over by the
+		// gutter's cover strip. The gutter covers those pixels, so they must not
+		// open a menu for the column hiding behind them, and neither must they sort
+		// it: both routes refuse, and the 60..70 sliver that IS visible still works.
+		{
+			d := ts_seam_doc({8, 4, 5, 80})
+			defer doc_close(&d)
+			d.table_hscroll_px = 70
+			cols := table_cols_layout(&d, cw, W)
+			x0 := cols[0].x if len(cols) > 0 else 0
+			li_chk(bad, len(cols) == 4 && x0 == -14, fmt.tprintf("precondition: 70px of pan puts c0 at -14 (%d cols, x %.0f)", len(cols), x0))
+			hs := table_header_layout(&d, cw, W, px, 0)
+			li_chk(bad, !hs[0].has_chev, fmt.tprintf("c0's chevron would land at 50, under the gutter, so it is suppressed (%v)", hs[0].has_chev))
+			li_chk(bad, hs[0].body.x == 56 && hs[0].body.w == 14, fmt.tprintf("...and its body is only the 56..70 sliver the gutter leaves (%.0f..%.0f)", hs[0].body.x, hs[0].body.x + hs[0].body.w))
+			_, ghit := table_header_at(&d, cw, W, 50, mid, px)
+			li_chk(bad, ghit == .None, fmt.tprintf("a press at 50 -- where the chevron would be -- reaches nothing (%v)", ghit))
+			_, gok := table_header_cell_at(&d, cw, W, 50, mid, px)
+			li_chk(bad, !gok, fmt.tprintf("...and neither does a right-click (%v)", gok))
+			vc, vhit := table_header_at(&d, cw, W, 60, mid, px)
+			li_chk(bad, vc == 0 && vhit == .Body, fmt.tprintf("...while the visible sliver still sorts c0 (c%d %v)", vc, vhit))
+		}
+
+		// -- A COLUMN EXACTLY THE MARKS' WIDTH ---------------------------------
+		//
+		// The suppression threshold is "the marks' run plus one cell of name". At
+		// char_w 7.25 a 5-cell column's inner width is 36.25px and the threshold is
+		// 29 + 7.25 = 36.25 exactly, so this is the >= boundary itself rather than a
+		// value near it; a 4-cell column is exactly 29px -- the marks' run with no
+		// room for a single character -- and is refused.
+		{
+			ecw := f32(7.25)
+			d := ts_seam_doc({5, 4})
+			defer doc_close(&d)
+			hs := table_header_layout(&d, ecw, W, px, 0)
+			li_chk(bad, hs[0].has_chev, fmt.tprintf("a column exactly at the threshold (inner 36.25 == 29 + 7.25) keeps its chevron (%v)", hs[0].has_chev))
+			hs1 := table_header_layout(&d, ecw, W, px, 1)
+			li_chk(bad, !hs1[1].has_chev, fmt.tprintf("a column exactly the marks' own width (inner 29.0) has no room left and loses it (%v)", hs1[1].has_chev))
+		}
+
+		// -- AN OVERLAY OWNS THE HEADER BAND -----------------------------------
+		//
+		// The palette (y0 44, height 34 + rows*26) and the history panel (rows
+		// from CONTENT_TOP + 28 in the right-hand strip) are both painted OVER
+		// the content, and CONTENT_TOP..+30 at 96 DPI is exactly the grid's
+		// header band -- so a right-click reaching the header while either is
+		// open would resolve a column from pixels the user was reading an
+		// overlay row in. main.odin's right-click gate (:794) reads
+		// app_content_overlay_active(&app); this checks that exact proc, not a
+		// copy of its logic, so the two cannot drift apart.
+		{
+			d := ts_seam_doc({8, 4, 5, 80})
+			defer doc_close(&d)
+			// The point is an ordinary header hit absent any overlay -- proof this
+			// is testing the GATE and not a point that was never clickable at all.
+			c, ok := table_header_cell_at(&d, cw, W, 125, mid, px)
+			li_chk(bad, ok && c == 0, fmt.tprintf("precondition: (125, +15) is an ordinary header hit with nothing open (%v, c%d)", ok, c))
+
+			app: App
+			// menu_init, not a bare App: Menu_State's zero value has open == 0,
+			// which reads as "the File dropdown is open" (menu_is_active, and see
+			// menutest's own "--- startup ---" case) -- exactly the trap
+			// zero-is-initialization warns about, so leaving it unset here would
+			// make this block's baseline already "blocked" for the wrong reason.
+			menu_init(&app.menu)
+			li_chk(bad, !app_content_overlay_active(&app), "precondition: a freshly-initialised App has no overlay open")
+
+			app.palette.active = true
+			li_chk(bad, app_content_overlay_active(&app), "the palette painted over the header band blocks the right-click gate")
+			app.palette.active = false
+
+			app.history.open = true
+			li_chk(bad, app_content_overlay_active(&app), "the history panel painted over the header band blocks the right-click gate")
+			app.history.open = false
+
+			li_chk(bad, !app_content_overlay_active(&app), "...and clearing both leaves the gate open again")
+		}
+	}
+
+	// A four-column table whose header names are the ones the summary row's
+	// worst case uses, with widths written in by hand for the same reason
+	// ts_seam_doc writes its own: table_compute_widths needs loaded fonts, and
+	// this case is about geometry, not about sampling. 12 cells at char_w 8 is
+	// wide enough to hold the marks' run WITH a digit plus a cell of name, so a
+	// suppressed chevron cannot be what makes an assertion below pass.
+	@(private = "file")
+	ts_marks_doc :: proc() -> Document {
+		d := ts_doc("Department,Last Name,Region,Amount\nSales,Young,East,3\nSales,Adams,West,1\nOps,Young,East,2\n", 4)
+		for _ in 0 ..< 4 {
+			append(&d.table_widths, 12)
+			append(&d.table_align, Table_Align.Left)
+		}
+		return d
+	}
+
+	// C16 (batch 19 Task 7): the summary row says the WHOLE sort, and every sorted
+	// column marks itself at its own key's direction.
+	//
+	// Three things this case has to be able to fail, because each has a plausible
+	// implementation that looks right on a one-key document:
+	//
+	//   1. A summary that prints keys[0] and stops. The two-key fixture's expected
+	//      run is written out whole, so a truncated list is a string mismatch.
+	//   2. `clear_s`/`clear_e` derived from the finished string by a second pass
+	//      instead of produced beside the sbprintf. The span is asserted against
+	//      the PRODUCED TEXT -- where "sorted by" actually begins and where "click
+	//      to clear" actually ends -- rather than against a hand-written offset, so
+	//      a span that names the wrong bytes fails even though both it and the
+	//      wording are self-consistent.
+	//   3. Arrows that read one shared flag. The fixture sorts key 1 ASCENDING and
+	//      key 2 DESCENDING, so `keys[0].desc` for both columns gives the wrong
+	//      answer on exactly one of them and no fixture with two keys in the same
+	//      direction could tell.
+	@(private = "file")
+	ts_case_summary_marks :: proc(bad: ^int) {
+		fmt.printfln("-- the summary row lists every key, and each column marks its own --")
+		cw, px, W := f32(8), f32(16), f32(800)
+		CLEAR :: "click to clear"
+		cap_note := fmt.tprintf("%d keys max", TABLE_SORT_KEYS_MAX)
+
+		// The span, checked against the string it indexes rather than against a
+		// literal offset. Used by both the one-key and the two-key case below.
+		span_ok :: proc(bad: ^int, text: string, cs, ce: int, label: string) {
+			CLEAR :: "click to clear"
+			want_s := strings.index(text, "sorted by")
+			want_e := strings.last_index(text, CLEAR)
+			if want_e >= 0 {want_e += len(CLEAR)}
+			li_chk(bad, cs == want_s && ce == want_e, fmt.tprintf("%s: [clear_s,clear_e) is exactly the run the words occupy (%d..%d, the string says %d..%d)", label, cs, ce, want_s, want_e))
+			li_chk(bad, cs >= 0 && ce > cs && ce <= len(text), fmt.tprintf("%s: ...and it is a real span inside the line (%d..%d of %d)", label, cs, ce, len(text)))
+		}
+
+		// -- ONE KEY: no comma, no digit, no cap note ---------------------------
+		{
+			d := ts_marks_doc()
+			defer doc_close(&d)
+			table_sort_set(&d, 0, false) // Department asc
+			li_chk(bad, table_sorted(&d) && d.table_sort.nkeys == 1, fmt.tprintf("precondition: one key is live (sorted %v, nkeys %d)", table_sorted(&d), d.table_sort.nkeys))
+			text, cs, ce := table_summary_parts(&d)
+			li_chk(bad, text[cs:ce] == "sorted by Department asc  ·  " + CLEAR, fmt.tprintf("one key reads `sorted by Department asc  ·  %s` (%q)", CLEAR, text[cs:ce]))
+			span_ok(bad, text, cs, ce, "one key")
+			li_chk(bad, ce == len(text), fmt.tprintf("...and nothing follows it below the cap (%q)", text[ce:]))
+			li_chk(bad, !strings.contains(text, cap_note), fmt.tprintf("...and the cap is NOT mentioned at one key (%q)", text))
+
+			// THE DIGIT IS ABSENT AT ONE KEY. A lone "1" is noise, so the predicate
+			// says no and the mark carries no rank -- both, because the predicate is
+			// also what the label's reserved slot reads.
+			li_chk(bad, !table_sort_digits_shown(&d), "no precedence digit is shown at one key")
+			cols := table_cols_layout(&d, cw, W)
+			li_chk(bad, len(cols) == 4, fmt.tprintf("precondition: four columns are laid out (%d)", len(cols)))
+			if len(cols) != 4 {return}
+			m0, ok0 := table_sort_mark(&d, cols[0], cw, px, table_right(W), TABLE_SORT_NONE)
+			li_chk(bad, ok0 && m0.rank == 0 && m0.up && !m0.ghost, fmt.tprintf("...and the sorted column's mark carries no rank (ok %v, rank %d, up %v, ghost %v)", ok0, m0.rank, m0.up, m0.ghost))
+			li_chk(bad, m0.digit_w == 0, fmt.tprintf("...and no digit cell at all (%.0f wide)", m0.digit_w))
+		}
+
+		// -- TWO KEYS, OPPOSITE DIRECTIONS -------------------------------------
+		{
+			d := ts_marks_doc()
+			defer doc_close(&d)
+			table_sort_set(&d, 0, false) // Department asc  -- key 1
+			table_sort_add(&d, 1, true) // Last Name desc  -- key 2
+			li_chk(bad, d.table_sort.nkeys == 2 && !d.table_sort.keys[0].desc && d.table_sort.keys[1].desc, fmt.tprintf("precondition: key 1 ascends and key 2 descends (nkeys %d, %v %v)", d.table_sort.nkeys, d.table_sort.keys[0].desc, d.table_sort.keys[1].desc))
+
+			text, cs, ce := table_summary_parts(&d)
+			li_chk(bad, text[cs:ce] == "sorted by Department asc, Last Name desc  ·  " + CLEAR, fmt.tprintf("two keys read `sorted by Department asc, Last Name desc  ·  %s` (%q)", CLEAR, text[cs:ce]))
+			span_ok(bad, text, cs, ce, "two keys")
+
+			// THE CAP REFUSAL: said, and said OUTSIDE the clickable run. A note
+			// inside the run would make a click on the words "keys max" clear the
+			// sort, which is the whole reason the separator is outside it too.
+			li_chk(bad, strings.contains(text, cap_note), fmt.tprintf("at the cap the row says so: %q (looking for %q)", text, cap_note))
+			li_chk(bad, !strings.contains(text[cs:ce], cap_note), fmt.tprintf("...and the note is NOT inside the clickable run (%q)", text[cs:ce]))
+			li_chk(bad, ce < len(text) && strings.has_suffix(text, cap_note), fmt.tprintf("...it follows the run, at the end of the line (%q)", text[ce:]))
+
+			// -- the marks, per key --------------------------------------------
+			li_chk(bad, table_sort_digits_shown(&d), "precedence digits appear above one key")
+			cols := table_cols_layout(&d, cw, W)
+			if len(cols) != 4 {
+				li_chk(bad, false, fmt.tprintf("precondition: four columns are laid out (%d)", len(cols)))
+				return
+			}
+			right := table_right(W)
+			m0, ok0 := table_sort_mark(&d, cols[0], cw, px, right, TABLE_SORT_NONE)
+			m1, ok1 := table_sort_mark(&d, cols[1], cw, px, right, TABLE_SORT_NONE)
+			// EACH COLUMN'S OWN DIRECTION. Both arrows reading keys[0].desc gives
+			// up == true here; both reading keys[1].desc gives up == false. Only
+			// per-key reads produce this pair.
+			li_chk(bad, ok0 && m0.up && m0.rank == 1, fmt.tprintf("key 1's column points UP and is numbered 1 (ok %v, up %v, rank %d)", ok0, m0.up, m0.rank))
+			li_chk(bad, ok1 && !m1.up && m1.rank == 2, fmt.tprintf("key 2's column points DOWN and is numbered 2 (ok %v, up %v, rank %d)", ok1, m1.up, m1.rank))
+
+			// An unsorted column draws nothing unless it is hovered, and the ghost
+			// is a preview of the NEXT click (ascending) with no rank -- a key that
+			// does not exist has no precedence.
+			_, ok2 := table_sort_mark(&d, cols[2], cw, px, right, TABLE_SORT_NONE)
+			li_chk(bad, !ok2, "an unsorted, unhovered column draws no mark at all")
+			g, okg := table_sort_mark(&d, cols[2], cw, px, right, 2)
+			li_chk(bad, okg && g.ghost && g.up && g.rank == 0, fmt.tprintf("hovering it previews an ascending arrow with no digit (ok %v, ghost %v, up %v, rank %d)", okg, g.ghost, g.up, g.rank))
+			// Hovering a column that IS sorted keeps its real mark, at its own
+			// direction -- not a preview of itself, and not the ghost's `up`.
+			hs, okh := table_sort_mark(&d, cols[1], cw, px, right, 1)
+			li_chk(bad, okh && !hs.ghost && !hs.up && hs.rank == 2, fmt.tprintf("hovering key 2's own column keeps its real descending mark (ghost %v, up %v, rank %d)", hs.ghost, hs.up, hs.rank))
+
+			// -- the digit's slot, against the label's and the arrow's ----------
+			//
+			// Hand-derived from §10's metrics, the way ts_case_header_seam derives
+			// its rectangles: column 0 is x 56..172 (gutter 56, 12 cells * 8 + 2 *
+			// 10), so marks_right is 162, the chevron takes 152..162, the arrow
+			// 138..147, and the digit is one cell ending a 5px gap before it: 125.
+			li_chk(bad, cols[0].x == 56 && cols[0].w == 116, fmt.tprintf("precondition: c0 spans 56..172 (%.0f..%.0f)", cols[0].x, cols[0].x + cols[0].w))
+			li_chk(bad, m0.arrow.x == 138, fmt.tprintf("c0's arrow is unmoved by the digit, at 138 (%.0f)", m0.arrow.x))
+			li_chk(bad, m0.digit_x == 125 && m0.digit_w == 8, fmt.tprintf("c0's digit is the cell at 125..133 (%.0f..%.0f)", m0.digit_x, m0.digit_x + m0.digit_w))
+			// No third check restating "digit_x + digit_w + gap == arrow.x" here:
+			// table_sort_mark COMPUTES digit_x from arrow.x minus that same gap and
+			// char_w, so the equation holds by construction and cannot fail
+			// independently of the two hand-derived checks above it -- it would only
+			// ever catch a bug those two already catch first.
+
+			// WHAT IS DRAWN AGAINST WHAT IS DRAWN: the header label is truncated to
+			// a box that stops before the digit. Without the reserve the digit is
+			// painted through the last character of a full-width name -- the "smear
+			// below Date" bug with a different glyph in it. `Department` is 10 cells
+			// in a 12-cell column, so it is long enough to reach the slot.
+			lab := table_header_label_col(cols[0], cw, px, true)
+			label_right := table_cell_text_x(lab) + f32(lab.cells) * cw
+			li_chk(bad, lab.cells < 10, fmt.tprintf("`Department` (10 cells) really is truncated by the reserve (%d cells left)", lab.cells))
+			li_chk(bad, label_right <= m0.digit_x, fmt.tprintf("the label's box stops before the digit (%.0f vs %.0f)", label_right, m0.digit_x))
+			// ...and the reserve grows by exactly the digit's slot, so the two
+			// cannot drift: one predicate feeds both.
+			li_chk(bad, table_header_marks_w(px, cw, true) - table_header_marks_w(px, cw, false) == cw + table_mark_gap(), fmt.tprintf("the reserve grows by one cell plus a gap (%.0f vs %.0f)", table_header_marks_w(px, cw, true), table_header_marks_w(px, cw, false)))
+		}
+
+		// -- THE BAND: how wide a window the longest realistic 2-key line needs --
+		//
+		// `120,000 rows · 8 columns · sorted by Department asc, Last Name desc ·
+		// click to clear · 2 keys max` -- the line the design doc names, built from
+		// the real producer rather than typed out, with only the row clause
+		// substituted (a 120,000-row fixture would cost a full index scan and a
+		// full sort to prove nothing this case is about).
+		//
+		// The counts are PINNED. TABLE_SORT_KEYS_MAX's comment requires that moving
+		// the cap come with a decision about how this row reads; pinning the width
+		// is what makes a wording change announce itself here instead of being
+		// found at a narrow window.
+		{
+			d := ts_doc("Department,Last Name,Region,Amount,Status,Owner,Date,Note\nSales,Young,East,3,ok,a,1,x\nOps,Adams,West,1,ok,b,2,y\n", 8)
+			defer doc_close(&d)
+			table_sort_set(&d, 0, false)
+			table_sort_add(&d, 1, true)
+			text, _, ce := table_summary_parts(&d)
+			sep := strings.index(text, "  ·  ")
+			li_chk(bad, sep > 0, fmt.tprintf("precondition: the row clause ends at the first separator (%d, %q)", sep, text))
+			if sep <= 0 {return}
+			worst := strings.concatenate({"120,000 rows", text[sep:]}, context.temp_allocator)
+			li_chk(bad, strings.contains(worst, "  ·  8 columns  ·  sorted by Department asc, Last Name desc  ·  click to clear  ·  ") && strings.has_suffix(worst, cap_note), fmt.tprintf("the worst realistic line is %q", worst))
+			full := utf8.rune_count_in_string(worst)
+			// Cells up to the END of the clickable run: past this the control the
+			// row exists to offer is off the right edge of the window.
+			run := full - utf8.rune_count_in_string(text[ce:])
+			li_chk(bad, full == 105, fmt.tprintf("the whole line is 105 cells (%d)", full))
+			li_chk(bad, run == 90, fmt.tprintf("...and the `click to clear` run ends at cell 90 (%d)", run))
+			// THE SAME LINE AT ONE KEY, so table_summary_parts' claim that the
+			// overflow predates the key list is measured rather than argued:
+			// dropping key 2 is the only thing that changes here.
+			table_sort_drop(&d, 1)
+			t1, _, e1 := table_summary_parts(&d)
+			s1 := strings.index(t1, "  ·  ")
+			w1 := strings.concatenate({"120,000 rows", t1[s1:]}, context.temp_allocator)
+			run1 := utf8.rune_count_in_string(w1) - utf8.rune_count_in_string(t1[e1:])
+			li_chk(bad, d.table_sort.nkeys == 1, fmt.tprintf("precondition: dropping key 2 leaves one key (%d)", d.table_sort.nkeys))
+			li_chk(bad, run1 == 74, fmt.tprintf("...at ONE key the same run already ended at cell 74 (%d): the overflow is older than the key list", run1))
+			// At px 16 / char_w 8, drawn from TABLE_CELL_PAD_X. Printed rather than
+			// asserted against a window size: what a "supported" width is belongs to
+			// the product, not to this file. See table_summary_parts' comment for
+			// what was decided.
+			mw, _ := plat.window_min_size(96)
+			fmt.printfln(
+				"     summary band: whole line %d cells = %.0fpx, clear run ends at %d cells = %.0fpx (one key: %d cells = %.0fpx), window minimum %d px (96 dpi)",
+				full,
+				TABLE_CELL_PAD_X + f32(full) * cw,
+				run,
+				TABLE_CELL_PAD_X + f32(run) * cw,
+				run1,
+				TABLE_CELL_PAD_X + f32(run1) * cw,
+				mw,
+			)
+		}
 	}
 
 	// DEFLATE length/distance code tables (RFC 1951 3.2.5), used by the
@@ -5051,6 +6567,9 @@ when NEWTPAD_TESTS {
 			metrics_recompute(&rcz) // leave globals alone for later modes
 
 			fmt.printfln("settingstest: %d failures", bad)
+			// Non-zero exit, for the reason keytest grew one: a mode that only ever
+			// prints its verdict is a mode whose verdict a sweep can miss.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
@@ -5408,12 +6927,31 @@ when NEWTPAD_TESTS {
 			// longer than it ("Markdown files only" vs "Ctrl+M"). Sizing budgeted
 			// only for the shortcut, so a reason would have been clipped by
 			// exactly the width the shortcut used to need.
+			//
+			// Every dropdown means the context menus too, not just the bar's:
+			// dropdown_w takes an item slice precisely so ctx_items sizes through
+			// the same rule. table_header_menu_items is not the only menu whose
+			// widest row is a REASON rather than a chord -- the loop below prints
+			// the counter-example, View, whose widest row is Toggle_Preview's own
+			// "Markdown Preview / Split" (24) plus the disabled reason "Markdown
+			// files only" (19), 43 characters, not its "Ctrl+M" chord. What IS true
+			// of table_header_menu_items and no other menu here is that every one
+			// of its six rows is a reason rather than a chord, since none of the
+			// six has a chord at all, so it exercises the reason half of the
+			// budget on every row, not just the one row the bar menus happen to.
 			{
 				mt: plat.Text
 				plat.text_load_faces(&mt)
 				cw := plat.text_char_width(&mt, UI_PX)
-				for m, mi in menus {
-					w := dropdown_w(&mt, mi)
+				Dropdown :: struct {
+					title: string,
+					items: []Menu_Item,
+				}
+				drops := make([dynamic]Dropdown, context.temp_allocator)
+				for m in menus {append(&drops, Dropdown{m.title, m.items})}
+				append(&drops, Dropdown{"Column header", table_header_menu_items})
+				for m in drops {
+					w := dropdown_w(&mt, m.items)
 					worst := ""
 					need := f32(0)
 					for it in m.items {
@@ -5492,6 +7030,9 @@ when NEWTPAD_TESTS {
 			bad += ro_menu_case(false, .Preview, "Preview")
 
 			fmt.printfln("menutest: %d failures", bad)
+			// Non-zero exit, for the reason keytest grew one: a mode that only ever
+			// prints its verdict is a mode whose verdict a sweep can miss.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
@@ -12526,7 +14067,7 @@ when NEWTPAD_TESTS {
 
 				// --- by NAME, ascending. alpha bravo charlie delta echo, which is
 				//     data rows 1, 3, 4, 0, 2 -- worked out from the fixture above.
-				table_sort_click(d, 1)
+				table_sort_cycle(d, 1)
 				chk(&bad, table_sorted(d), "a header click puts a sort on the grid")
 				want := [ROWS]int{1, 3, 4, 0, 2}
 				for r in 0 ..< ROWS {
@@ -12624,7 +14165,7 @@ when NEWTPAD_TESTS {
 					table_edit_rune(d, '!')
 					pre := doc_debug_string(d)
 					defer delete(pre)
-					table_sort_click(d, 0) // reorder, with the edit still open
+					table_sort_cycle(d, 0) // reorder, with the edit still open
 					post := doc_debug_string(d)
 					defer delete(post)
 					chk(&bad, !d.table_editing, "...clicking a header closes it")
@@ -12644,21 +14185,21 @@ when NEWTPAD_TESTS {
 				// --- by QTY: numeric, so 4 < 10 < 30 < 200 rather than "10" < "200" <
 				//     "30" < "4", and the row with no qty at all goes last in BOTH
 				//     directions. A byte sort passes none of this.
-				table_sort_click(d, 2)
+				table_sort_cycle(d, 2)
 				qwant := [ROWS]int{4, 0, 2, 1, 3} // charlie(4) delta(10) echo(30) alpha(200) bravo(-)
 				for r in 0 ..< ROWS {
 					p, pok := table_row_start(d, r)
 					chk(&bad, pok && p == noff[qwant[r] + 1], fmt.tprintf("numeric asc: visible row %d is line %d (%q)", r, qwant[r] + 1, lines[qwant[r] + 1]))
 				}
-				table_sort_click(d, 2) // second click on the same column: descending
-				chk(&bad, d.table_sort.desc, "a second click on the same header reverses it")
+				table_sort_cycle(d, 2) // second click on the same column: descending
+				chk(&bad, d.table_sort.keys[0].desc, "a second click on the same header reverses it")
 				dwant := [ROWS]int{1, 2, 0, 4, 3} // alpha(200) echo(30) delta(10) charlie(4) bravo(-)
 				for r in 0 ..< ROWS {
 					p, pok := table_row_start(d, r)
 					chk(&bad, pok && p == noff[dwant[r] + 1], fmt.tprintf("numeric desc: visible row %d is line %d (%q)", r, dwant[r] + 1, lines[dwant[r] + 1]))
 				}
 				chk(&bad, dwant[ROWS - 1] == 3, "...and the row with no value is last in BOTH directions, not flipped to the front")
-				table_sort_click(d, 2) // third click: back to the file's own order
+				table_sort_cycle(d, 2) // third click: back to the file's own order
 				chk(&bad, !table_sorted(d), "a third click clears the sort")
 				// Clearing keeps the view where it was -- doc.top is a real line
 				// offset in every mode, which is the invariant the whole design rests
@@ -12714,7 +14255,7 @@ when NEWTPAD_TESTS {
 					chk(&bad, false, fmt.tprintf("precondition -- %d grid rows fit (want %d)", trows, ROWS))
 					return
 				}
-				table_sort_click(d, 0) // by id, ascending: 1 2 3 4 5
+				table_sort_cycle(d, 0) // by id, ascending: 1 2 3 4 5
 				want := [ROWS]int{1, 3, 0, 4, 2}
 				ER :: 2 // sorted position 2 is data row 0 -- NOT row 2
 				chk(&bad, want[ER] != ER, fmt.tprintf("visible row %d is data row %d, so ignoring the permutation is visibly wrong here", ER, want[ER]))
@@ -12813,7 +14354,7 @@ when NEWTPAD_TESTS {
 				chk(&bad, exact3 && n3 == 5, fmt.tprintf("the file's own count is %d data rows (want 5, header and terminator excluded)", n3))
 
 				// 4. An active sort is named.
-				table_sort_click(d, 1)
+				table_sort_cycle(d, 1)
 				// ...and, with a FINISHED index, the row numbers still follow the
 				// rows. This is the dangerous half of the same check sort_order makes:
 				// there the index had published nothing, so the consecutive-run
@@ -12833,7 +14374,7 @@ when NEWTPAD_TESTS {
 				// wording IS the feature.
 				s := table_summary_text(d)
 				chk(&bad, s == "5 rows  ·  2 columns  ·  sorted by v asc  ·  click to clear", fmt.tprintf("an active sort is in the summary, with its undo in words: %q", s))
-				table_sort_click(d, 1)
+				table_sort_cycle(d, 1)
 				s2 := table_summary_text(d)
 				chk(&bad, s2 == "5 rows  ·  2 columns  ·  sorted by v desc  ·  click to clear", fmt.tprintf("...and its direction: %q", s2))
 				// The clickable RUN, as a byte span, and the two properties that
@@ -12926,7 +14467,8 @@ when NEWTPAD_TESTS {
 					table_compute_widths(d, t)
 					d.table_cols = len(d.table_widths)
 					t0 := time.tick_now()
-					ok := table_sort_build(d, 0)
+					k1 := [1]Sort_Key{{col = 0}}
+					ok := table_sort_build(d, k1[:])
 					ms := time.duration_milliseconds(time.tick_since(t0))
 					chk(&bad, ok && table_sort_rows(d) == TABLE_SORT_MAX, fmt.tprintf("exactly TABLE_SORT_MAX rows sort: %d rows in %.0f ms", table_sort_rows(d), ms))
 					// The order is right at both ends, checked against the ids this
@@ -12952,7 +14494,8 @@ when NEWTPAD_TESTS {
 					// No index running: the count is not exact, so the early refusal
 					// cannot fire and this exercises the SCANNING one -- the path that
 					// has to stop counting at the ceiling rather than after the file.
-					ok := table_sort_build(d, 0)
+					k1 := [1]Sort_Key{{col = 0}}
+					ok := table_sort_build(d, k1[:])
 					chk(&bad, !ok, "one row past TABLE_SORT_MAX is refused")
 					chk(&bad, !table_sorted(d), "...and nothing is left half-sorted")
 					chk(&bad, d.table_sort.refused, "...and the refusal is recorded for the summary row")
@@ -12965,7 +14508,7 @@ when NEWTPAD_TESTS {
 					n, exact := table_row_count(d)
 					chk(&bad, exact && n == TABLE_SORT_MAX + 1, fmt.tprintf("the index settles at %d data rows", n))
 					t0 := time.tick_now()
-					ok2 := table_sort_build(d, 0)
+					ok2 := table_sort_build(d, k1[:])
 					us := time.duration_microseconds(time.tick_since(t0))
 					chk(&bad, !ok2 && d.table_sort.refused, "a settled over-ceiling count refuses too")
 					chk(&bad, us < 1000, fmt.tprintf("...and does it without a pass over the file (%.0f us)", us))
@@ -13053,7 +14596,7 @@ when NEWTPAD_TESTS {
 
 				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
 				chk(&bad, d.table, "Ctrl+T opens the grid")
-				table_sort_click(d, 1)
+				table_sort_cycle(d, 1)
 				chk(&bad, table_sorted(d) && len(d.table_sort.offs) == 3, fmt.tprintf("...a header click sorts its 3 data rows (sorted=%v, %d offsets)", table_sorted(d), len(d.table_sort.offs)))
 				// A refusal recorded on the way out has to go too, or the next grid
 				// session opens saying the file is too large to sort. Set by hand
@@ -13063,7 +14606,7 @@ when NEWTPAD_TESTS {
 				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
 				chk(&bad, !d.table, "Ctrl+T closes it again")
 				s := &d.table_sort
-				chk(&bad, s.col == TABLE_SORT_NONE, fmt.tprintf("...and the sort goes with the view (col %d, want %d)", s.col, TABLE_SORT_NONE))
+				chk(&bad, s.nkeys == 0, fmt.tprintf("...and the sort goes with the view (nkeys %d, want 0)", s.nkeys))
 				chk(&bad, len(s.offs) == 0 && len(s.perm) == 0 && len(s.rank) == 0, fmt.tprintf("...arrays and all (%d offs, %d perm, %d rank)", len(s.offs), len(s.perm), len(s.rank)))
 				chk(&bad, !s.refused, "...and the refusal with them")
 
@@ -13079,7 +14622,7 @@ when NEWTPAD_TESTS {
 				d2 := make_doc("control.csv")
 				app_activate(&a, app_add(&a, d2))
 				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
-				table_sort_click(d2, 1)
+				table_sort_cycle(d2, 1)
 				before := make([]int, len(d2.table_sort.offs), context.temp_allocator)
 				copy(before, d2.table_sort.offs[:])
 				doc_replace_range(d2, 0, 0, transmute([]u8)string("Z"))
@@ -13104,7 +14647,7 @@ when NEWTPAD_TESTS {
 				// a reload re-applies a Doc_View, and Doc_View carries no sort. Driven
 				// with table = true, the case where the grid stays on and a surviving
 				// permutation would therefore still be read.
-				table_sort_click(d, 1)
+				table_sort_cycle(d, 1)
 				chk(&bad, table_sorted(d), "precondition -- sorted again for the view-apply path")
 				doc_view_apply(d, Doc_View{table = true})
 				chk(&bad, d.table && !table_sorted(d), fmt.tprintf("doc_view_apply keeps the grid and drops the sort (table=%v, sorted=%v)", d.table, table_sorted(d)))
@@ -13190,6 +14733,23 @@ when NEWTPAD_TESTS {
 						continue
 					}
 
+					// A live two-key sort, rebuilt every iteration because section 3b
+					// below clears it at its own end -- so table_sort_digits_shown(&d)
+					// is true for THIS scale's checks rather than for whatever the
+					// PREVIOUS scale's section 3b happened to leave behind. Column 0
+					// then column 1 keeps `dateiso` -- the header that fills its cell,
+					// the case that smeared -- live as the tie-breaker. Before this,
+					// section 4 below passed `table_sort_digits_shown(&d)` to a
+					// document that was never sorted (nkeys == 0), so the digit's
+					// reservation was never actually exercised at any of the three
+					// scales this sweep tests.
+					dk: [TABLE_SORT_KEYS_MAX]Sort_Key
+					for i in 0 ..< TABLE_SORT_KEYS_MAX {dk[i] = {col = i, desc = i % 2 == 1}}
+					if !table_sort_build(&d, dk[:]) {
+						chk(&bad, false, fmt.tprintf("%s: precondition -- the two-key sort builds", tag))
+						continue
+					}
+
 					// --- 1. The summary row and the h-scrollbar do not overlap ---
 					//
 					// Both rects from their OWN producers, not from one restated
@@ -13249,19 +14809,32 @@ when NEWTPAD_TESTS {
 					{
 						head := table_header_fields(&d)
 						overlaps, gaps_ok := 0, 0
+						digit_overlaps, digit_gaps_ok := 0, 0
 						for col in cols {
 							if col.c >= len(head) {continue}
 							a := table_sort_arrow_rect(col, px, table_right(W))
-							lab := table_header_label_col(col, cw, px)
+							lab := table_header_label_col(col, cw, px, table_sort_digits_shown(&d))
 							hcells := plat.text_cells(&t, transmute([]u8)head[col.c], 0, .Doc)
 							if hcells > lab.cells {hcells = lab.cells}
 							hx := table_cell_text_x(lab) + table_cell_align_dx(lab, hcells, cw)
 							right_edge := hx + f32(hcells) * cw
 							if right_edge > a.x {overlaps += 1}
-							if a.x - right_edge >= table_arrow_gap() {gaps_ok += 1}
+							if a.x - right_edge >= table_mark_gap() {gaps_ok += 1}
+							// The DIGIT's own slot -- table_sort_mark's own formula
+							// (arrow.x - gap - char_w) reproduced here rather than read
+							// back from it, the same way `a` above is table_sort_arrow_rect
+							// rather than a mark. It sits entirely inside the arrow's
+							// slot from the label's point of view, so a reservation that
+							// forgot the digit's width can pass the arrow check above
+							// while still painting the digit through the label.
+							dx := a.x - table_mark_gap() - cw
+							if right_edge > dx {digit_overlaps += 1}
+							if dx - right_edge >= table_mark_gap() {digit_gaps_ok += 1}
 						}
 						chk(&bad, overlaps == 0, fmt.tprintf("%s: no header label reaches into the arrow's slot (%d of %d did)", tag, overlaps, len(cols)))
 						chk(&bad, gaps_ok == len(cols), fmt.tprintf("%s: ...and every one keeps the gap beside it (%d of %d)", tag, gaps_ok, len(cols)))
+						chk(&bad, digit_overlaps == 0, fmt.tprintf("%s: no header label reaches into the digit's slot either (%d of %d did)", tag, digit_overlaps, len(cols)))
+						chk(&bad, digit_gaps_ok == len(cols), fmt.tprintf("%s: ...and every one keeps the gap beside the digit too (%d of %d)", tag, digit_gaps_ok, len(cols)))
 						// The slot is inside its own cell and on screen, so the
 						// arrow cannot be drawn over the neighbouring column.
 						strays := 0
@@ -13279,6 +14852,11 @@ when NEWTPAD_TESTS {
 							if plat.text_cells(&t, transmute([]u8)head[col.c], 0, .Doc) >= col.cells {filled += 1}
 						}
 						chk(&bad, filled > 0, fmt.tprintf("%s: precondition -- at least one header fills its column (%d)", tag, filled))
+						// And the digit itself is genuinely live for this precondition,
+						// or the digit checks above are vacuous the same way -- this is
+						// the fact that was false at every scale before the sort above
+						// was added.
+						chk(&bad, table_sort_digits_shown(&d), fmt.tprintf("%s: precondition -- the precedence digit is live for this sweep", tag))
 					}
 
 					// --- 3a. The header's hover state, and its precedence ---------
@@ -13299,7 +14877,12 @@ when NEWTPAD_TESTS {
 						chk(&bad, hov_off && hc == 0, fmt.tprintf("%s: ...and %.0fpx further in it lights column 0 (%v, %d)", tag, tol + 2, hov_off, hc))
 						// Never both, anywhere along the band, and never a hover the
 						// press would not honour: main.odin tests the edge first and
-						// then this same producer, so hover == "a press here sorts".
+						// then this same producer, so hover == "a press here acts on
+						// this column" -- a sort everywhere in the cell except the
+						// chevron's own rectangle, which opens that same column's
+						// menu (table_header_at). Both come out of
+						// table_header_layout, which takes this procedure's answer
+						// as its hover_col, so no pixel lifts and then does nothing.
 						both, mismatched := 0, 0
 						for x := table_gutter_w(); x < table_right(W); x += 3 {
 							_, on_edge := table_edge_at(&d, cw, W, x, hy, px)
@@ -13326,7 +14909,7 @@ when NEWTPAD_TESTS {
 						chk(&bad, !cold.clearable, fmt.tprintf("%s: with no sort there is no clickable run at all", tag))
 						chk(&bad, !table_summary_clear_hit(cold, cold.x + 4, cold.y + cold.h * 0.5), fmt.tprintf("%s: ...so a press on the summary text does nothing", tag))
 
-						table_sort_click(&d, 1)
+						table_sort_cycle(&d, 1)
 						chk(&bad, table_sorted(&d), fmt.tprintf("%s: precondition -- sorted by column 1", tag))
 						sm := table_summary_layout(&d, &t, H, px, cw)
 						chk(&bad, sm.clearable, fmt.tprintf("%s: a live sort makes the run clickable", tag))
@@ -30654,6 +32237,13 @@ when NEWTPAD_TESTS {
 		// trailing-blank-row trim and everything downstream of it.
 		if os.args[1] == "selalltest" {
 			select_all_test_run()
+			return true
+		}
+
+		// `newtpad tablesorttest` -- one-argument, no path, sweepable. The multi-key
+		// sort build (table_sort_build) and its one comparator.
+		if os.args[1] == "tablesorttest" {
+			table_sort_test_run()
 			return true
 		}
 

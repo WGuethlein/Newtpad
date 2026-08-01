@@ -18,11 +18,27 @@ whole-branch review at the end, sabotage every test, then HANDOFF entry → vers
 `install.ps1`. It also carries the two bug *shapes* this codebase keeps producing and the
 operational traps that have each cost a session real time. Unlike `CLAUDE.md`, it is committed.
 
-### Where things stand — read this first (2026-07-31)
+### Where things stand — read this first (2026-08-01)
 
-**v0.35.0 is merged, tagged, released and installed.** Newtpad is Wyatt's daily Notepad replacement and
-has been all along; the exe is **1.25 MB**. Everything below `§6` is a dated log of how it got here, and
-the last four sections (§6ax–§6bb) are today.
+**v0.36.0 is merged, tagged, released and installed.** Newtpad is Wyatt's daily Notepad replacement and
+has been all along. Everything below `§6` is a dated log of how it got here; **§6bc is the newest** and
+§6ax–§6bb were the day before.
+
+**Batch 19 shipped multi-column sort** — the table view sorts by up to two columns, first-selected-wins,
+through a header menu (hover chevron or right-click), Ctrl+click, and the plain click that already
+existed. **Column filtering is batch 20 and is not built.** §6bc has the full entry; four things from it
+are worth knowing before touching anything nearby:
+
+- **The key cap is 2, and it is a measurement, not a preference.** Three keys at the 100,000-row ceiling
+  cost ~460 ms of release freeze against one key's ~258 ms. Changing it needs a fresh measurement *and* a
+  decision about the summary row's wording.
+- **`ctx_col` is valid only between a `menu_open_ctx` and the dispatch of the row it produced.** It
+  deliberately survives `menu_close`; that is what makes a menu row picked on column N act on column N.
+- **`menutest` and `settingstest` printed `FAIL` and exited 0** until this batch. **`menuseam` still
+  exits 0 whatever it finds and always will** — it is a falsifier, so sweep it by diffing its printed
+  line, never by exit code.
+- **Eleven comments in one batch claimed evidence they did not have**, every one caught by review and
+  none by a test. See §6bc — the pattern matters more than the instances.
 
 **The three live queues are the entry point for new work, not this file:**
 
@@ -5061,6 +5077,157 @@ development-loop §6.
 - The 1 MiB cap is judgement matched to an existing constant, not a measurement of what users have.
 - Wrapped documents are not covered by the selection-rect and scroll assertions.
 
+## 6bc. Multi-column sort (2026-08-01, v0.36.0, branch `feat/batch-19-multi-sort`)
+
+Wyatt, 2026-07-31: *"multiple sort of columns, first column selected to sort takes precedence. would
+also be nice to filter columns, and have a dropdown list of all items in the column to filter like
+powerbi/excel has."* **Split in two on his decision: this is the sort half. Column filtering is batch 20**
+— the sort is a key vector over machinery that already existed, while filtering changes the visible row
+*set*, which every consumer of the grid reads.
+
+Eight tasks, 28 commits, a fresh implementer and an independent reviewer per task.
+
+### What it does
+
+`Table_Sort.col`/`desc` became a key vector — `keys: [TABLE_SORT_KEYS_MAX]Sort_Key` + `nkeys`, where
+**array order IS precedence**, so "first column selected wins" is a property of the data structure rather
+than a rule anything enforces. Three gestures: a plain header click still cycles that column alone
+asc → desc → clear; **Ctrl+click** cycles one key asc → desc → removed; and a **header menu** — a hover
+chevron or a right-click — carries Sort ascending / descending / Then by ascending / descending / Remove
+from sort / Clear sort, with disabled states that tell the truth.
+
+**`offs`/`perm`/`rank` never changed meaning, `doc.top` is still a real byte offset in every mode, and
+both lifetime hooks are untouched.** Only *how `perm` is computed* changed. That was the design's central
+bet and it paid: the data-loss seam of the feature needed no new machinery.
+
+### The measurement moved the design, which is why it came before the cap
+
+The plan required timing k=3 at the 100,000-row ceiling **before** the cap was fixed, with the cap named
+as the variable — because the tempting response to a slow number is to keep the feature as designed and
+accept the stall. Measured at 100,000 rows, debug: **1 key 371–395 ms, 2 keys ~556 ms (1.50×), 3 keys
+690–702 ms (~1.8×)**. Converted at the tree's own ×0.665 ratio: roughly 258 / 370 / 460 ms of release
+freeze. `build.bat release` is `-subsystem:windows` and cannot print, so **every release figure here is
+converted, never measured**, and the constants say so.
+
+**Wyatt's call: two keys, not three.** Recorded with the honest caveat that the number does not make the
+choice obvious — the cost is a **constant factor** (3× the keys buys 1.8× the time), so the cap is a weak
+lever, and two keys still costs ~360 ms. The case for stopping at two is that "sort by department, then
+by name" is the query people actually have and nobody asked for a third key.
+
+**A pre-existing error the measurement exposed:** `TABLE_SORT_MAX`'s comment claimed 205 ms at 100,000
+rows, extrapolated *linearly* from a measured 2,046 ms at 1,000,000. Measured directly it is ~258 ms — the
+shipped single-key sort was already ~26% slower than its own comment said. The comment is fixed; the
+constant was right.
+
+### The bug that would have looked like someone else's fault
+
+`menu_close` zeroed `ctx_col` **before** the picked command read it, so all six commands would have acted
+on **column 0** whatever column opened the menu — while `item_enabled` was still evaluated *before* the
+close and so greyed correctly for the real column. **Draw and effect disagreeing**, which is the exact
+thing `Menu_Item.enabled`'s own comment and CLAUDE.md's one-layout rule exist to prevent.
+
+It was caught in task 5's review, in the task that *chose* the read, while nothing could yet reach it.
+Had it survived one more task it would have surfaced as "task 6's right-click is broken". **The fix — stop
+clearing `ctx_col` in `menu_close` — creates a constraint worth knowing: `ctx_col` is valid only between
+a `menu_open_ctx` and the dispatch of the row it produced.** `command_from_name` now refuses the six via
+`command_needs_menu_target`, so a hand-written `keys.txt` chord cannot reach them from outside a menu and
+sort whatever column was last touched.
+
+### What this batch got wrong
+
+**Eleven comments claimed evidence they did not have.** Not one was caught by a test; every one was
+caught by a reviewer. They were: a cap presented as measured before the comparator that would produce the
+measurement existed; a 205 ms figure left standing 37 lines from a directly-measured 258 ms for the same
+quantity; a ratio quoted "over five runs" with three written down; a lifetime rule stated as a fact about
+what an unwritten task *would* do; a Win32 claim that `DefWindowProc` synthesises `WM_CONTEXTMENU` from
+`WM_RBUTTONDOWN` (it is `WM_RBUTTONUP`); a comment naming `table_header_col_at` where the code calls
+`table_header_cell_at`; a "the one menu whose widest row is a reason" contradicted by output the same test
+prints two lines above; a claim that a predicate was the single definition of the key cap while a second
+definition sat 112 lines away with dead code attached; a "the only mode that exits non-zero" that was
+false before the batch started and more false after it; a `#assert` cited as "below" from ~900 lines away;
+and a `tg_sort's C4` pointer that now resolves to a real but wrong test case.
+
+**This is the same shape as the CLAUDE.md rows that had to be amended twice, and it is a review-only
+defect class.** The countermeasure that worked was naming it in every reviewer prompt with a running
+count. Worth carrying forward: **a comment asserting a number, an API's behaviour, or another
+procedure's name is a claim, and this codebase gets those wrong roughly once per task.**
+
+**Two test modes printed their failure counts and exited 0** — `menutest` and `settingstest`, the same
+defect §7 already recorded for three others. Any sweep run against those two before 2026-08-01 was
+non-diagnostic. Both now follow `palettetest`'s guard. Separately, **`menuseam` legitimately exits 0
+whatever it finds** — it is a falsifier, its answer moved 14/14 → 12/12 under a sabotage with the exit
+code unchanged, and it must be swept by diffing its printed line.
+
+**`odin check src/program -collection:src=src` was reported as exiting 0 with real errors for the second
+time**, by a second agent. Tested directly with three deliberate type errors: it reports all three and
+exits 1. §6az already recorded the first false claim. The likely cause is reading PowerShell's `$?`
+instead of `$LASTEXITCODE` after a native command. **The bisectability sweep is not vacuous** — all 28
+commits pass it.
+
+**Two brief-level defects made it into dispatches.** Task 6's brief specified a right-click step when
+**no right-button plumbing existed anywhere in the tree** — no `WM_RBUTTONDOWN`, no `mouse_right_pressed`
+— so the task had to add it to `src/platform/window.odin`, outside its stated file list. And task 7's
+brief simultaneously required the arrows to come out of `table_header_layout` and forbade changing what
+`table_header_layout` produces; the arrow was never in it. Both were reported rather than papered over,
+which is the behaviour the "a cited procedure that does not exist is a plan defect" rule was written for.
+
+### What the sabotage caught that review did not
+
+**The arena sabotage crashes the process.** Materialising a sort key's string inside the row loop instead
+of after the arena stops growing kills it with an access violation on the 100,000-row fixture. Strong
+evidence the rule is load-bearing — with a caveat worth keeping: the crash is incidental to heap layout,
+and the same bug on a smaller fixture would be **silent wrong-order corruption** instead.
+
+**Two assertions were vacuous in ways only sabotage could show.** `table_sort_drop`'s scroll-to-top had
+*zero* coverage — deleting the line left every mode green — and the naive fix would also have been
+vacuous, because the row at sorted position 0 is the same physical row before and after that particular
+drop, so `doc.top` was coincidentally correct either way. A poisoned sentinel is what made it real. And
+the DPI sweep for label/mark overlap was passing a sort-state predicate on a document with **no sort**,
+so it tested `false` at every scale.
+
+### The `renderer`/`ui` extraction got harder again, and here is the list
+
+§6ax recorded batch 18 taking `doc.odin` → `table.odin` from 1 call site to 8. This branch adds **16 more
+upward call sites**, concentrated in one file:
+
+- **`menu.odin` → `table.odin`: 0 → 9.** `table_sorted`, `table_sort_key`, `table_sort_can_add` and
+  `TABLE_SORT_KEYS_MAX`, plus **`table_header_menu_items`** — a table-specific menu table declared inside
+  the menu widget, naming six `Command_Id`s. **That slice is the hardest single item**: extracting `ui`
+  gives it no home that knows about both menus and tables.
+- **`commands.odin` → `app.menu.ctx_col`: 5 new reads.** Transient widget state is now the argument
+  channel for six commands, and by design it must outlive `menu_close`. Enforced by three comments and
+  `command_needs_menu_target` — nothing structural.
+- **Header geometry now depends on document sort state.** `table_header_layout` →
+  `table_sort_digits_shown` → `doc.table_sort.nkeys`. Before this branch the header's geometry was a
+  function of columns and DPI alone.
+- **`main.odin` → `menu_open_ctx`: 2 new sites** in the table input branch.
+- **Platform: no new upward pressure.** The right-button addition crosses upward as a plain `bool`, the
+  same shape as the existing `mouse_middle_pressed`.
+
+Same direction as batch 18, roughly double the volume. **Design the observer list before extracting.**
+
+### Owed
+
+- **No live GUI pass.** This environment cannot inject GUI input, so the chevron's hover, the right-click,
+  Ctrl+click, the menu's placement against a window edge and the `.Hand` cursor are all inferences from
+  source. Every task report says so plainly and none claimed otherwise.
+- **The summary row does not fit a minimum-width window (318px).** The 2-key line ends at 850px and its
+  clickable run at 730px — but **the one-key line already ended at 602px before this branch**, so the
+  threshold moved rather than being created. Not a correctness bug: the hit rect and the glyphs share one
+  x, and Clear Sort in the header menu works at any width. What to do about it is a product call and it
+  is Wyatt's.
+- **The cap note is the clause that gets cut** between 730 and 850px, deliberately — the control was
+  protected ahead of the explanation. Reversible in one line.
+- The precedence digit is drawn as a glyph rather than quads. The quads rule is about U+25B2/U+25BC not
+  being guaranteed in an arbitrary monospace face; a face that cannot draw `'1'` cannot draw the CSV
+  either.
+- **If the active tab changes while a context menu is open**, a row greyed for document A dispatches
+  against document B. Pre-existing for every menu in the app, not introduced here, and not fixed here.
+- Release timings are converted from debug, never measured.
+
+Base tests unchanged at 211. `tablesorttest` is new, one-argument, exits non-zero, and is in §7 and
+development-loop §6.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -5085,7 +5252,8 @@ development-loop §6.
     `scrollperftest <mb>`, `hscrolltest`, `csvtest`, `tablecellstest`, `tablereadonlytest`,
     `tablegridtest`,
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
-    `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`, `selalltest`
+    `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`, `selalltest`,
+    `tablesorttest`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`

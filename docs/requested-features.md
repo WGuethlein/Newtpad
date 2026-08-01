@@ -44,12 +44,28 @@ Decisions that change the build:
 highlighting. A formatter over its token stream inherits the bounding and cannot disagree with the
 highlighter about what a token is. **Do not write a second JSON parser.**
 
-### Multi-column sort, and Excel-style column filtering
+### Excel-style column filtering — batch 20 (the sort half shipped in v0.36.0)
 
 **Requested 2026-07-31 by Wyatt**, alongside the four table bugs: *"multiple sort of columns, first
 column selected to sort takes precedence. would also be nice to filter columns, and have a dropdown
 list of all items in the column to filter like powerbi/excel has."* He raised the scope question
 himself: *"maybe this is a csv/xslx expansion since it doesn't really match the stated goals so far."*
+
+**The multi-column sort half is DONE (v0.36.0, HANDOFF §6bc)** — two keys, first-selected-wins, via a
+header menu, Ctrl+click and the existing plain click. **What is left here is the filtering.** Two
+decisions were already taken with Wyatt when the work was split:
+
+- **Past `TABLE_SORT_MAX` (100,000 rows) the distinct-value list refuses**, the same answer the sort
+  gives, because it is the only one that cannot become a bounded scan reporting a confident wrong
+  answer. A labelled partial list still reads as complete once you are scrolling it.
+- **The column filter and `Ctrl+L` are exclusive** — opening one clears the other. `Ctrl+L` already has
+  its own render path, scroll model and banner; making a column predicate ride inside it means one row
+  set with two owners.
+
+**What the sort half leaves you to build on:** the header menu exists and a `Filter` row is an addition
+to it rather than a redesign; `menu_open_ctx` opens the shared dropdown at an arbitrary anchor; and
+`table_header_layout` is the one producer of the header's geometry, so a new hit region goes there and
+nowhere else.
 
 **That instinct deserves a real answer rather than a reflex, because the mermaid decision just showed
 how easy it is to reach for the wrong test.** The question is not "is this spreadsheet-like" — it is
@@ -63,21 +79,19 @@ Newtpad that cannot be viewport-bounded.** Listing every distinct value in a col
 every row — the same wall the sort hit, and the sort's answer (refuse past `TABLE_SORT_MAX`, say so)
 is available here too. Decide that before building, not after.
 
-**It also subsumes a shipped defect.** `reported-bugs.md` item 3 is that there is no discoverable way
-to reset the sort, and a labelled dropdown — Sort ascending / Sort descending / Clear sort / Filter —
-is the answer to it rather than a patch over it. If this gets built, the interim hover-state and
-summary-row wording become redundant; if it does not, they stand on their own.
+**It also subsumed a shipped defect, and that half is done.** "There is no discoverable way to reset the
+sort" is answered by the header menu's labelled `Clear sort` row, built in v0.36.0. The interim
+hover-state and summary-row wording were kept anyway — two labelled routes to one command, not two
+mechanisms.
 
 Design decisions that would change the build:
 
-- **Multi-sort precedence is stated as first-selected-wins**, which is the opposite of Excel (last
-  applied becomes primary) and matches PowerBI/Windows Explorer. Worth confirming, because it is the
-  one place users' muscle memory disagrees.
-- **The sort must stay view-only** — the same permutation model, extended to a key vector. It must not
-  become a reason to rewrite the file.
-- **Filter versus the existing line filter.** `Ctrl+L` filters lines document-wide; a column filter is
-  a different predicate over the same rows. Two filter mechanisms that do not compose is the kind of
-  option-leakage principle 3 warns about — decide whether they stack or are exclusive.
+- ~~**Multi-sort precedence**~~ — **settled: first-selected-wins**, matching PowerBI and Windows
+  Explorer and the opposite of Excel. Shipped that way; array order is precedence, so it is a property
+  of the data structure rather than a rule. Do not "fix" it toward Excel.
+- ~~**The sort must stay view-only**~~ — **held.** `offs`/`perm`/`rank` never changed meaning and the
+  file is still never rewritten.
+- ~~**Filter versus the existing line filter**~~ — **settled: exclusive**, see above.
 - **`.xlsx` is a separate product decision and is NOT implied by any of this.** It is a ZIP of XML with
   a shared string table, not a text format, and CLAUDE.md scopes Newtpad to text-ish files. If it is
   ever wanted it is its own entry, and reading it does not follow from having a good CSV grid.
@@ -249,15 +263,12 @@ being built once for themes.
 
 `docs/ui-spec/` is the corpus for UI work. Section by section, what is asked for and not built:
 
-### §10 Table view — 5 of 9 rules unbuilt (batch 18 is partial)
-- **Row numbers** — 56px right-aligned gutter, `text_secondary` on the current row.
-- **Click-to-sort with an accent arrow**, view-only, never rewriting the file. *The table view is already
-  an editing surface, so this is a data-safety seam* — see §5's guard notes.
-- **Numeric and date columns right-align**, detected from the first 200 rows.
-- **Column widths from a sample** — 200 rows, clamp 8–40 chars, distribute proportionally; drag a header
-  edge to resize, double-click to fit.
-- **Malformed rows marked with a 2px `warning` bar**, not hidden.
-- **Summary row** — row count, column count, active sort.
+### §10 Table view — DONE
+All nine rules are built: row numbers, click-to-sort with an accent arrow, numeric/date right-align,
+sampled column widths with drag-to-resize and double-click-to-fit, malformed rows marked rather than
+hidden, and the summary row (batch 18, HANDOFF §6ax–§6az). **The sort stayed view-only throughout — the
+file is never rewritten.** v0.36.0 added a second sort key on top of it (§6bc). This list was stale from
+2026-07-30 and is kept as a heading so a reader looking for §10 finds the answer rather than nothing.
 
 ### §8 Editor surface
 - **Caret blink** — 500ms, stopping while typing and for 500ms after. *No blink implementation exists.*

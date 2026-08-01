@@ -280,7 +280,7 @@ main :: proc() {
 		px, char_w, line_h := rc.px, rc.char_w, rc.line_h
 		window.dpi_changed = false
 
-		if window.char_count > 0 || window.key_count > 0 || window.mouse_pressed || window.mouse_middle_pressed {
+		if window.char_count > 0 || window.key_count > 0 || window.mouse_pressed || window.mouse_middle_pressed || window.mouse_right_pressed {
 			session_dirty = true
 			last_input = time.tick_now()
 		}
@@ -714,29 +714,90 @@ main :: proc() {
 						}
 					}
 					window.mouse_pressed = false
-				} else if c, on_head := table_header_hover_col(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); on_head {
-					// §10's "click to sort with an accent arrow". AFTER the edge test
-					// above, never before: within ±4px of a boundary the user is
-					// aiming at the divider, and reordering the whole file on a
-					// slightly-off resize grab is not a recoverable surprise.
+				} else if c, hit := table_header_at(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); hit != .None {
+					// §10's "click to sort with an accent arrow", and the chevron that
+					// opens the column's menu. AFTER the edge test above, never
+					// before: within ±4px of a boundary the user is aiming at the
+					// divider, and reordering the whole file on a slightly-off resize
+					// grab is not a recoverable surprise.
 					//
-					// Through table_header_hover_col rather than table_header_col_at,
-					// which makes that precedence part of the PRODUCER instead of a
-					// property of this `else`: the hover affordance (the lift and the
-					// ghost arrow, table_draw) asks the same procedure, so the pixels
-					// that advertise a sort are exactly the pixels that perform one,
-					// and the edge zone is excluded from both by one expression.
+					// Through table_header_at rather than a rectangle assembled here,
+					// which makes both that precedence and the body/chevron split part
+					// of the PRODUCER instead of properties of this `else`: the hover
+					// affordances (the lift, the ghost arrow and the chevron itself,
+					// table_draw) come out of the same table_header_layout, so the
+					// pixels that advertise a gesture are exactly the pixels that
+					// perform it, and the edge zone is excluded from all of them by one
+					// expression.
 					//
-					// Not a Command_Id and not in the palette, deliberately. The sort
-					// is a per-column gesture with no argument the palette could
-					// carry, §10 names the header click as its affordance, and adding
-					// a palette row that needed a column would be the "dispatch that
-					// silently does nothing" shape this batch fixed once already.
-					// .Sort_Lines stays refused in table view: that one REWRITES the
-					// buffer, so command_mutates_doc names it correctly and the
-					// read-only guard needs no loosening for this.
-					table_sort_click(doc, c)
+					// The sort is not a Command_Id and not in the palette,
+					// deliberately. It is a per-column gesture with no argument the
+					// palette could carry, §10 names the header click as its
+					// affordance, and adding a palette row that needed a column would
+					// be the "dispatch that silently does nothing" shape this batch
+					// fixed once already. .Sort_Lines stays refused in table view: that
+					// one REWRITES the buffer, so command_mutates_doc names it
+					// correctly and the read-only guard needs no loosening for this.
+					// The menu's six rows ARE commands, and they reach their column
+					// through menu_open_ctx alone -- see menu.odin's ctx_col.
+					switch hit {
+					case .Chevron:
+						menu_open_ctx(&app, table_header_menu_items, f32(window.mouse_x), f32(window.mouse_y), c)
+					case .Body:
+						table_sort_cycle(doc, c)
+					case .None:
+					}
 					window.mouse_pressed = false
+				}
+			} else if window.mouse_pressed && plat.key_ctrl_down() {
+				// Ctrl+click on a header cell composes a tie-breaker onto the live sort
+				// (table_sort_toggle, batch 19 Task 3) instead of replacing it. Through
+				// table_header_hover_col -- which is what table_header_at asks first in
+				// the plain-click branch above -- and for the same reason: it refuses
+				// inside the ±4px divider zone before this ever learns which column, so
+				// the edge test is still taken first even though Ctrl routes to a
+				// different sort gesture -- a Ctrl+click aimed at the divider must not
+				// reorder the file either. Resizing itself stays a plain-click gesture;
+				// a Ctrl-held grab on the edge does nothing here, same as before this
+				// branch existed.
+				//
+				// The WHOLE CELL toggles, chevron included: Ctrl is the compose
+				// modifier for the sort, and a Ctrl+click that opened a menu instead
+				// would make the chevron a hole in the gesture the modifier exists for.
+				// The menu is reachable from the same cell with a plain click on the
+				// chevron and with a right-click anywhere.
+				if c, on_head := table_header_hover_col(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); on_head {
+					table_sort_toggle(doc, c)
+					window.mouse_pressed = false
+				}
+			}
+			// Right-click anywhere in a header cell opens that column's menu. THE
+			// second route to it, and the one that is always available: the chevron
+			// above is suppressed on a column too narrow to hold it or scrolled under
+			// the sticky gutter, and this is why that suppression never makes the six
+			// sort commands unreachable.
+			//
+			// Through table_header_cell_at, NOT table_header_at, and the difference is
+			// the ±4px resize zone. That zone exists to protect a LEFT-button drag on
+			// a divider; the right button starts no drag, so refusing here would carve
+			// a dead strip out of "anywhere in the cell" to defend a gesture the button
+			// cannot make. has_chev is not consulted either, for the same reason -- a
+			// suppressed chevron is a mark that will not fit, not a column with no menu.
+			// Both still read table_header_layout, so "the cell" means the same
+			// rectangle to the right button, the left button and the draw.
+			//
+			// Not while a menu, the palette or the history panel is up: each is
+			// painted OVER the content, so hit-testing this point against the header
+			// would read a coordinate in the wrong space -- resolving a column from
+			// pixels the user was looking at a menu row, a palette row or a history
+			// row in. menu_hit_test, the palette block above (:509) and the history
+			// block above (:540) each already give the LEFT button this same
+			// treatment; app_content_overlay_active is that same three-flag check
+			// read from one place instead of copied here, so this gate and those
+			// three blocks cannot drift apart from each other.
+			if window.mouse_right_pressed && !app_content_overlay_active(&app) {
+				if c, on_head := table_header_cell_at(doc, char_w, f32(window.width), f32(window.mouse_x), f32(window.mouse_y), px); on_head {
+					menu_open_ctx(&app, table_header_menu_items, f32(window.mouse_x), f32(window.mouse_y), c)
 				}
 			}
 			if table_resize_col >= 0 {
@@ -747,6 +808,13 @@ main :: proc() {
 				}
 			}
 		}
+		// The right press is read at exactly one point per frame -- the header branch
+		// above -- and cleared here whether or not it was read. mouse_pressed can rely
+		// on its consumers to clear it because the caret path below claims every press
+		// that reaches it; a right press has no such terminal consumer, so one that
+		// landed on the canvas, or in a document that is not a grid at all, would still
+		// be pending on the next frame and open a menu nobody asked for.
+		window.mouse_right_pressed = false
 
 		// The summary row's `sorted by ... · click to clear` run: clicking the words
 		// clears the sort. The second half of the answer to "there is no discoverable
@@ -761,7 +829,7 @@ main :: proc() {
 		// sort reset would be unrecoverable mid-motion, while a missed click on the
 		// summary costs one more click.
 		//
-		// The open cell edit is committed first, exactly as table_sort_click does and
+		// The open cell edit is committed first, exactly as table_sort_cycle does and
 		// for the same reason: the anchor is still intact at this instant, so the
 		// value lands on the row the user typed it into rather than being dropped by
 		// table_edit_commit's fail-closed guard once the order changes underneath it.
@@ -884,6 +952,14 @@ main :: proc() {
 				// The SAME producer the press above hit-tests against, so the
 				// affordance appears exactly where the gesture works.
 				want = .SizeWE
+			} else if doc.table && doc.kind == .Text && table_chevron_at_cursor(doc, char_w, f32(window.width), f32(cx), f32(cy), px) {
+				// The header's menu chevron, through the same table_header_at the
+				// press resolves and out of the same table_header_layout the chevron
+				// is DRAWN from -- so the pointer changes over exactly the mark the
+				// user can see, and only there. AFTER the edge branch above, which is
+				// where that precedence becomes visible to the user: inside the ±4px
+				// divider zone the pointer stays .SizeWE even on a hovered column.
+				want = .Hand
 			} else if doc.table && doc.kind == .Text && table_summary_clear_hit(table_summary_layout(doc, &text, f32(window.height), px, char_w), f32(cx), f32(cy)) {
 				// The summary's `click to clear` run. Same producer as the press
 				// above and as the draw, so the words that say it is clickable, the

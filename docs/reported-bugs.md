@@ -11,7 +11,17 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
-## "The preview does not always respect spaces" — one defect fixed, needs Wyatt's confirmation
+## "The preview does not always respect spaces" — STILL REPRODUCES on v0.35.0
+
+**Wyatt, 2026-07-31, asked directly whether the fix closed it:** *"still see it but lets go over it after
+the table changes... it's like it's messing up the formatting of sentences, etc."* So the table-cell fit
+fix below was **not** what he was seeing, and "sentences" points away from tables entirely — which makes
+the line-per-block model at the bottom of this entry the leading candidate, not the fallback. **Scheduled
+for after the table batch**, at his direction. It needs a decision from him, not just a fix: joining
+adjacent prose lines into one paragraph is what CommonMark does and is a change to how every markdown
+document in the preview looks.
+
+### The earlier investigation, kept in full
 
 **Reported 2026-07-29** with a side-by-side screenshot of the editor and the preview: *"it looks like it's
 not respecting the spaces all the time."* **A defect matching that description was found and fixed**

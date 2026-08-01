@@ -84,6 +84,18 @@ Command_Id :: enum u8 {
 	Sort_Lines,
 	Sort_Lines_Desc,
 	Remove_Duplicate_Lines,
+	// The table header's context menu (menu.odin's table_header_menu_items).
+	// Dispatched against app.menu.ctx_col -- the column the menu was opened on,
+	// which menu_close deliberately preserves past the row's pick -- because there is
+	// no persistent "current column" in the table view outside an open cell
+	// edit (table_edit_col). Excluded from the palette below for exactly that
+	// reason: the palette has no column to name.
+	Table_Sort_Asc,
+	Table_Sort_Desc,
+	Table_Sort_Then_Asc,
+	Table_Sort_Then_Desc,
+	Table_Sort_Remove,
+	Table_Sort_Clear,
 	// command palette
 	Palette_Open,
 	Palette_Close,
@@ -241,6 +253,12 @@ command_table := [Command_Id]Command {
 	.Sort_Lines               = {"Sort Lines (selection, or whole file)", "Edit"},
 	.Sort_Lines_Desc          = {"Sort Lines Descending (selection, or whole file)", "Edit"},
 	.Remove_Duplicate_Lines   = {"Remove Duplicate Lines (exact match, keeps the first)", "Edit"},
+	.Table_Sort_Asc           = {"Sort Ascending", "Table"},
+	.Table_Sort_Desc          = {"Sort Descending", "Table"},
+	.Table_Sort_Then_Asc      = {"Then by Ascending", "Table"},
+	.Table_Sort_Then_Desc     = {"Then by Descending", "Table"},
+	.Table_Sort_Remove        = {"Remove from Sort", "Table"},
+	.Table_Sort_Clear         = {"Clear Sort", "Table"},
 	.Palette_Open             = {"Command Palette", "View"},
 	.Palette_Close            = {"Palette: Close", "View"},
 	.Palette_Confirm          = {"Palette: Confirm", "View"},
@@ -1044,6 +1062,27 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 	return false
 }
 
+// The header menu's six sort rows (menu.odin's table_header_menu_items): do
+// they take their target from the menu that opened them rather than from any
+// state of their own? All six read app.menu.ctx_col, the column the menu was
+// opened on, and there is no persistent "current column" in the table view to
+// fall back on -- table_edit_col exists, but only while a cell is being
+// edited, and none of the six consult it. A binding that fires outside that
+// menu therefore has no column to name.
+//
+// command_from_name (keymap.odin) consults this to refuse a hand-written
+// keymap line naming one of these six -- see its comment. A seventh command
+// with the same shape gets the same refusal by being added to this switch,
+// not by a second list somewhere else.
+command_needs_menu_target :: proc(cmd: Command_Id) -> bool {
+	#partial switch cmd {
+	case .Table_Sort_Asc, .Table_Sort_Desc, .Table_Sort_Then_Asc, .Table_Sort_Then_Desc,
+	     .Table_Sort_Remove, .Table_Sort_Clear:
+		return true
+	}
+	return false
+}
+
 // May `cmd` run against `doc`? The single answer to that question, and both
 // routes to a command consult it: the menu greys the row out (item_enabled,
 // menu.odin) and command_dispatch refuses outright.
@@ -1559,6 +1598,25 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				settings_save(app.settings)
 			}
 		}
+	// The header menu's six rows (menu.odin's table_header_menu_items), all
+	// aimed at app.menu.ctx_col -- the column the menu was opened on. Guarded
+	// on doc.table, not just doc != nil: none of the four operations below
+	// check it themselves (table.odin), and building a sort on a document that
+	// is not in the grid would leave it live for table_sort_shift to carry on
+	// every future edit -- the same O(rows)-per-keystroke cost .Toggle_Table's
+	// own off-branch clears the sort to avoid, a few cases above.
+	case .Table_Sort_Asc:
+		if doc != nil && doc.table {table_sort_set(doc, app.menu.ctx_col, false)}
+	case .Table_Sort_Desc:
+		if doc != nil && doc.table {table_sort_set(doc, app.menu.ctx_col, true)}
+	case .Table_Sort_Then_Asc:
+		if doc != nil && doc.table {table_sort_add(doc, app.menu.ctx_col, false)}
+	case .Table_Sort_Then_Desc:
+		if doc != nil && doc.table {table_sort_add(doc, app.menu.ctx_col, true)}
+	case .Table_Sort_Remove:
+		if doc != nil && doc.table {table_sort_drop(doc, app.menu.ctx_col)}
+	case .Table_Sort_Clear:
+		if doc != nil && doc.table {table_sort_clear(doc)}
 	case .Toggle_Preview:
 		// Cycle Off -> Preview -> Split -> Off. The preview scrolls in pixels from
 		// its own anchor (doc.md_top); re-anchoring doc.top to a line start here is
@@ -1779,7 +1837,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 
 	case .Menu_Activate:
 		if app.menu.open >= 0 && app.menu.item >= 0 {
-			it := menus[app.menu.open].items[app.menu.item]
+			// Through menu_items(app), not menus[app.menu.open].items directly --
+			// one item source for the whole menu package, so a future context-menu
+			// row can never be read through the bar-menu index or vice versa.
+			it := menu_items(app)[app.menu.item]
 			menu_close(app) // close first: the item may open the palette
 			command_dispatch(it.cmd, ev, app, w, t, rows)
 		}

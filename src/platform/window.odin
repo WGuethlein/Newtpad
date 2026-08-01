@@ -313,6 +313,13 @@ Window :: struct {
 	mouse_shift:   bool,
 	mouse_down:    bool, // button held (dragging)
 	mouse_middle_pressed: bool, // a middle-click happened this frame
+	// A right-click happened this frame. No mouse_down partner and no capture:
+	// nothing in the program drags with the right button, so this is a press
+	// event and not a gesture. The program clears it once per frame (main.odin)
+	// rather than relying on a consumer to claim it, which is what mouse_pressed
+	// does -- a right press that lands where nothing reads it has no terminal
+	// consumer to fall through to.
+	mouse_right_pressed:  bool,
 	// paths handed over by other instances this frame (see instance.odin);
 	// copied out of the WM_COPYDATA payload, which is only valid during the call
 	open_paths:    [OPEN_QUEUE][OPEN_PATH_MAX]u8,
@@ -957,6 +964,27 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		yi := int(lp >> 16);if yi >= 0x8000 {yi -= 0x10000}
 		w.mouse_x = i32(xi);w.mouse_y = i32(yi)
 		w.mouse_middle_pressed = true
+		return 0
+	case win.WM_RBUTTONDOWN:
+		// Same shape as the middle button above: record where it happened and set
+		// the flag. `return 0` here only accounts for WM_RBUTTONDOWN itself -- it
+		// does not stop WM_CONTEXTMENU, which Windows raises from the UP message
+		// (WM_RBUTTONUP, or WM_NCRBUTTONUP for a non-client click), not the down
+		// one. This file has no case for either UP message, so it falls through to
+		// DefWindowProcW unchanged and WM_CONTEXTMENU still fires. That is
+		// harmless to verify from here: this window is never given a menu (no
+		// SetMenu or CreateMenu call anywhere in this file), so DefWindowProc's
+		// default WM_CONTEXTMENU handling -- open the window's menu at the click
+		// point -- has no menu to open.
+		lp := u32(uintptr(lparam))
+		xi := int(lp & 0xFFFF);if xi >= 0x8000 {xi -= 0x10000}
+		yi := int(lp >> 16);if yi >= 0x8000 {yi -= 0x10000}
+		w.mouse_x = i32(xi);w.mouse_y = i32(yi)
+		// kbd_nav, same as WM_LBUTTONDOWN above: a right press is mouse input same
+		// as a left one, and the focus ring UI spec 18 gates on this is not
+		// supposed to survive ANY click.
+		w.kbd_nav = false
+		w.mouse_right_pressed = true
 		return 0
 	}
 	return win.DefWindowProcW(hwnd, msg, wparam, lparam)

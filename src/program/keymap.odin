@@ -266,10 +266,21 @@ keymap_lookup :: proc(key: plat.Key, ctrl, alt: bool, ctx: Ctx) -> (Command_Id, 
 // purpose: "unbind" is spelled by leaving the right-hand side EMPTY, and
 // accepting a second spelling for it would mean two ways to say one thing
 // (principle 3) and a name in the file that matches no row in the seeded list.
+//
+// command_needs_menu_target (commands.odin) is excluded for the same reason as
+// .None, one enum member at a time: those six commands read app.menu.ctx_col,
+// the column a context menu was opened on, and ctx_col deliberately survives
+// menu_close so the row a user picked dispatches against the right column
+// (menu.odin). A hand-written chord naming one of them would fire with no menu
+// behind it and no column of its own to aim at -- it would dispatch against
+// whatever column the last context menu happened to leave in ctx_col. Refused
+// here, the same as any other name this loop does not recognise, rather than
+// carved out by the caller: a name that matches no reachable command IS an
+// unknown command.
 command_from_name :: proc(s: string) -> (Command_Id, bool) {
 	if s == "" {return .None, false}
 	for cmd in Command_Id {
-		if cmd == .None {continue}
+		if cmd == .None || command_needs_menu_target(cmd) {continue}
 		if strings.equal_fold(fmt.tprintf("%v", cmd), s) {return cmd, true}
 	}
 	return .None, false

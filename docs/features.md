@@ -283,8 +283,15 @@ file.
 - **Click a header to sort**, again to reverse, again to clear, with an accent arrow. **The sort is a
   view, and the file is never rewritten** — it is a permutation over row offsets, and editing a cell
   while sorted still writes to that cell's own line. Files over 100,000 data rows refuse the sort and
-  the summary row says why; the ceiling is a freeze budget (100,000 rows sort in ~285 ms on the main
-  thread, and a million took two seconds, which is a hung window rather than a slow feature).
+  the summary row says why; the ceiling is a freeze budget (100,000 rows sort in ~258 ms of release
+  build on the main thread, and a million took two seconds, which is a hung window rather than a slow
+  feature).
+- **Sort by two columns**, first-selected-wins. **`Ctrl+click`** a second header adds it as the tie-break
+  and cycles that key asc → desc → removed; a plain click still means "this column alone". **A header
+  menu** — hover the header for a chevron, or right-click anywhere in it — carries Sort ascending /
+  descending, *Then by* ascending / descending, Remove from sort and Clear sort, with the rows that
+  cannot apply greyed rather than hidden. Each sorted column draws its own arrow, with a precedence
+  digit once there are two. The limit is two keys, and the summary row says so when you reach it.
 - **A row-number gutter**, 56px and right-aligned, with the current row brighter. A row whose absolute
   number cannot be known — one still being indexed, or the continuation of a line over 8 KB — draws no
   number rather than a guess.

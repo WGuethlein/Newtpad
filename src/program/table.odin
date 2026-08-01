@@ -330,7 +330,7 @@ group_int :: proc(v: int, allocator := context.temp_allocator) -> string {
 // "12,438,201 rows - too large to sort" is a product decision the reader can see.
 // THE SORT CLAUSE SAYS THE UNDO IN WORDS, and that is the second half of the
 // answer to "there is no discoverable way to reset the sort" (Wyatt, live use,
-// v0.34.0). table_sort_click has cycled ascending -> descending -> the file's own
+// v0.34.0). table_sort_cycle has cycled ascending -> descending -> the file's own
 // order since the sort shipped; nothing anywhere said so, and Wyatt rejected three
 // proposals that added another unlabelled target with *"how will the person know
 // what to click and where to reset."* He is right, and the principle generalises:
@@ -349,6 +349,36 @@ group_int :: proc(v: int, allocator := context.temp_allocator) -> string {
 // second procedure computing "where does the sort clause start" from the finished
 // string would be re-deriving what this one already knows -- and would silently
 // name the wrong bytes the first time the wording changed.
+//
+// THE LINE DOES NOT FIT A NARROW WINDOW, and that is recorded here as a decision
+// rather than left to be found. Measured by tablesorttest C16, which pins the
+// cell counts so a reworded line has to re-measure instead of drifting: the
+// longest realistic two-key line -- `120,000 rows  ·  8 columns  ·  sorted by
+// Department asc, Last Name desc  ·  click to clear  ·  2 keys max` -- is 105
+// cells, which at px 16 / char_w 8 drawn from TABLE_CELL_PAD_X ends at 850px,
+// and its CLICKABLE RUN ends at cell 90 (730px). The window's minimum TRACK
+// width is 318px at 96 DPI (plat.window_min_size), and the client area is
+// narrower again by the frame. No wording closes that: the sort clause and its
+// target alone are 59 cells (482px), still well past 318.
+//
+// THE OVERFLOW IS OLDER THAN THE KEY LIST. The same line with one key ends its
+// run at cell 74 (602px) -- measured in the same case -- so this row has never
+// fitted a minimum-width window. Printing every key moves the threshold from
+// 602px to 730px; it did not create it.
+//
+// IT IS NOT A CORRECTNESS BUG. The run's hit rectangle is measured from the same
+// x the glyphs are drawn at (table_summary_layout), so nothing invisible is
+// clickable and nothing clickable is invisible -- at a narrow window the target
+// is simply off screen along with the words that name it, and Clear Sort in the
+// header's own menu reaches the same outcome at any width.
+//
+// The fixes that WOULD make it fit are all structural -- eliding the row and
+// column facts to keep the control, putting the sort clause first, or giving the
+// band a scroll of its own -- and every one of them changes what a ONE-key line
+// looks like, on a condition that predates this batch. That is a product call,
+// not one to take inside a task about wording, so it is Wyatt's: raised in batch
+// 19 Task 7's report. Until it is decided the line overflows, and the counts
+// above are pinned by a test so the next change to this wording cannot be quiet.
 table_summary_parts :: proc(doc: ^Document, allocator := context.temp_allocator) -> (text: string, clear_s, clear_e: int) {
 	n, exact := table_row_count(doc)
 	sb := strings.builder_make(allocator)
@@ -379,8 +409,43 @@ table_summary_parts :: proc(doc: ^Document, allocator := context.temp_allocator)
 		// first word that explains it.
 		fmt.sbprint(&sb, "  ·  ")
 		clear_s = strings.builder_len(sb)
-		fmt.sbprintf(&sb, "sorted by %s %s  ·  click to clear", table_col_name(doc, doc.table_sort.col, allocator), "desc" if doc.table_sort.desc else "asc")
+		s := &doc.table_sort
+		fmt.sbprint(&sb, "sorted by ")
+		// EVERY key, in precedence order, because precedence is the one thing a
+		// two-key sort has that a one-key sort does not and the header's own marks
+		// can only say it in a digit. Comma-separated prose rather than a list of
+		// glyphs: the row is a sentence (the block comment above), and "sorted by
+		// Department asc, Last Name desc" is the sentence a reader can act on
+		// without having learned what a superscript 2 beside an arrow means.
+		for i in 0 ..< s.nkeys {
+			if i > 0 {fmt.sbprint(&sb, ", ")}
+			fmt.sbprintf(&sb, "%s %s", table_col_name(doc, s.keys[i].col, allocator), "desc" if s.keys[i].desc else "asc")
+		}
+		fmt.sbprint(&sb, "  ·  click to clear")
 		clear_e = strings.builder_len(sb)
+		// THE CAP REFUSAL, and it is outside [clear_s, clear_e) deliberately: the run
+		// is a control -- clicking it clears the sort -- and this is a fact about the
+		// sort, not part of the action being offered. Extending the target over it
+		// would make a click on the words "keys max" clear the sort.
+		//
+		// It is here for the same reason the ceiling refusal above is: at
+		// TABLE_SORT_KEYS_MAX a Ctrl+click on a third column does nothing at all, and
+		// this file argues twice that a header that does nothing when clicked is
+		// indistinguishable from a broken build. The menu's greyed "Then by" rows
+		// already answer it for anyone who opens the menu; this answers it for the
+		// gesture that has no menu in it.
+		//
+		// A FACT, NOT AN ERROR. The user has a working two-key sort and simply cannot
+		// add a third; wording it as a failure ("cannot add", "refused") would report
+		// a problem where there is only a limit.
+		//
+		// DERIVED FROM nkeys, NOT STORED. `s.nkeys == TABLE_SORT_KEYS_MAX` already is
+		// the condition, and a second flag on Table_Sort would need clearing from
+		// every path that changes the vector -- the maintenance shape
+		// command_mutates_doc has been patched for three times.
+		if s.nkeys >= TABLE_SORT_KEYS_MAX {
+			fmt.sbprintf(&sb, "  ·  %d keys max", TABLE_SORT_KEYS_MAX)
+		}
 	}
 	return strings.to_string(sb), clear_s, clear_e
 }
@@ -794,11 +859,29 @@ TABLE_SORT_NONE :: -1
 // at 1,000,000 rows it measured **2,046 ms at -o:speed** (3,075 ms debug), and a
 // two-second stall on a header click is not a slow feature, it is a hung window.
 // Product principle 1 is "speed everywhere -- clicking, tabs, find, open:
-// instant", and nothing about a click on a column header exempts it. The cost is
-// near-linear in rows, so 100,000 lands near 205 ms: still the slowest thing in
-// the app by a wide margin, but recoverable rather than alarming, and it is the
-// most rows that can be sorted without breaking the promise the product is sold
-// on. This was 1,000,000 for exactly as long as it took to measure it.
+// instant", and nothing about a click on a column header exempts it. 100,000 rows
+// is the most that can be sorted without breaking the promise the product is sold
+// on: still the slowest thing in the app by a wide margin, but recoverable rather
+// than alarming. This was 1,000,000 for exactly as long as it took to measure it.
+//
+// THIS PARAGRAPH USED TO END "the cost is near-linear in rows, so 100,000 lands
+// near 205 ms". That 205 was never measured -- it was the 2,046 ms release figure
+// above divided by ten. Batch 19 measured the same quantity DIRECTLY at 100,000
+// rows (tablesorttest's C6): 370-395 ms debug over seven runs, ~258 ms release
+// converted at the x0.665 ratio the two figures above establish (~246-263 ms across
+// the spread). So the single-key sort at the ceiling costs about a quarter more than
+// this comment claimed. Trust the 258: it is a direct measurement of this build,
+// where the 205 was an extrapolation across a factor of ten from a different
+// fixture. The ceiling does not move on it -- 258 ms is the same side of
+// "recoverable rather than alarming" as 205 was -- and neither does the argument.
+// What moved is the evidence. TABLE_SORT_KEYS_MAX's last paragraph below calls this
+// the comment-outran-the-evidence shape, and this is what it looks like.
+//
+// AT THE KEY CAP the same 100,000 rows cost more again -- TABLE_SORT_KEYS_MAX's
+// comment carries the numbers, what took the cap from three to two, and what the
+// measurement does and does not settle. The ceiling is unchanged by it: the bound
+// is a row count for the reason the paragraph below gives, and the key count
+// multiplies the constant rather than the shape.
 //
 // It is a row count, not a file size: the bound that matters is the memory the
 // permutation costs and the time the single pass takes, neither of which cares
@@ -810,9 +893,76 @@ TABLE_SORT_NONE :: -1
 TABLE_SORT_MAX :: 100_000
 #assert(TABLE_SORT_MAX < int(max(i32)))
 
-Table_Sort :: struct {
-	col:     int, // TABLE_SORT_NONE when unsorted
+// The most keys a sort can carry. Batch 19's "first column selected wins":
+// PRECEDENCE IS ARRAY ORDER, and array order is append order, so first-wins is a
+// property of the data structure and not a rule anything has to enforce -- there is
+// no separate priority field to keep in step with it.
+//
+// TWO, AND IT WAS THREE UNTIL IT WAS MEASURED. The original cap was a spec-given
+// three: Excel's classic sort dialog offers three, and the summary row
+// (table_summary_parts) has to stay a sentence a reader takes in rather than a list
+// they scan. Neither of those is a timing argument, and the timing is now measured:
+//
+//   100,000 rows, same file, same run (tablesorttest's C6), DEBUG build:
+//   1 key 382-395 ms; 3 keys 690-702 ms, about 1.8x. Three recorded runs gave
+//   1.78-1.80x and an independent run during review gave 1.86x. Read it as "about
+//   1.8": four runs on one machine cannot carry a range to two decimal places, and
+//   the reason this says so is that the same comment first claimed "five runs" with
+//   three written down -- which is the shape this file has now corrected three times
+//   in one batch.
+//
+// Debug because build.bat release is -subsystem:windows and a headless mode cannot
+// print from it at all. CONVERTED, NOT MEASURED, with the ratio TABLE_SORT_MAX's own
+// comment establishes (3,075 ms debug to 2,046 ms release at 1,000,000 rows, x0.665):
+// three keys land near 460 ms of release-build freeze against roughly 258 ms for one
+// key on the same fixture. A measured ratio on one machine and a converted absolute
+// -- do not quote the 460 as though it were a release measurement.
+//
+// Wyatt's decision, 2026-07-31: two. And the honest shape of that decision, because
+// the number does not make it obvious --
+//
+//   THE COST IS A CONSTANT FACTOR, NOT A NEW SHAPE. The line is read once and every
+//   key is cut from that one read, so k multiplies the field extraction and the
+//   comparator's depth, not the number of passes: 3x the keys buys 1.8x the time.
+//   That also makes the cap a WEAK LEVER, and the cap it landed on was measured too
+//   -- at two keys C6 reads 550-564 ms debug against 370-377 ms for one key over
+//   four runs, 1.47-1.52x, so about 370 ms of release freeze converted against about
+//   250 ms. Two keys is most of the way to three. Dropping the cap did not buy a
+//   fast sort; it declined to pay for a key nobody asked for. "Sort by department,
+//   then by name" is the query people actually have.
+//
+// What the measurement does NOT settle is whether even ~370 ms is an acceptable
+// freeze. Product principle 1 is "speed everywhere -- clicking, tabs, find, open:
+// instant". If that answer is ever no, THIS constant is the variable (spec §4) --
+// TABLE_SORT_MAX does not rise and a longer freeze is not accepted -- and past that,
+// the real answer is the background sort index TABLE_SORT_MAX's comment names, which
+// removes the trade rather than repricing it.
+//
+// CHANGING IT -- in either direction -- takes two things, not one: a fresh
+// measurement at the new count, AND a decision about how the summary row reads with
+// that many keys in it. Whoever changes it should record both. A cap moved on only
+// one of them is exactly the comment-outran-the-evidence shape this one used to be.
+TABLE_SORT_KEYS_MAX :: 2
+
+// One column's part of the sort. TABLE_SORT_NONE is what an unset key's `col` is --
+// Odin zero-inits `col` to 0, a valid column index, so a slot that has never been
+// written must be told to say TABLE_SORT_NONE rather than be trusted to.
+Sort_Key :: struct {
+	col:     int,
 	desc:    bool,
+	// Decided over every row the sort orders, same argument as table_sort_build's
+	// numeric detection below -- now per key because one key can be numeric while
+	// another in the same sort is text.
+	numeric: bool,
+}
+
+Table_Sort :: struct {
+	// keys[0] is the primary; every key after it is a tie-breaker, in the order it
+	// was added. nkeys is the count that's live -- entries at or past it are
+	// leftover from a previous sort and must not be read (table_sort_key stops at
+	// nkeys for exactly this reason).
+	keys:    [TABLE_SORT_KEYS_MAX]Sort_Key,
+	nkeys:   int, // 0 == unsorted
 	offs:    [dynamic]int,
 	perm:    [dynamic]i32,
 	rank:    [dynamic]i32,
@@ -822,6 +972,19 @@ Table_Sort :: struct {
 	// "palette dispatch that silently does nothing" shape this batch already fixed
 	// once. Cleared by the next click and by table_sort_clear.
 	refused: bool,
+}
+
+// Is `col` part of the live sort, and at what precedence? Linear over at most
+// TABLE_SORT_KEYS_MAX -- a binary search over that many entries would be slower AND
+// would imply the array is ordered by column, which it is not: it is ordered by
+// PRECEDENCE, which is the whole point (see TABLE_SORT_KEYS_MAX above).
+table_sort_key :: proc(doc: ^Document, col: int) -> (k: int, ok: bool) {
+	if doc == nil {return 0, false}
+	s := &doc.table_sort
+	for i in 0 ..< s.nkeys {
+		if s.keys[i].col == col {return i, true}
+	}
+	return 0, false
 }
 
 // Is a sort live on this document? The predicate every consumer branches on.
@@ -835,8 +998,25 @@ Table_Sort :: struct {
 // the only thing holding. All three leave paths clear now (leave_table_view,
 // .Toggle_Table, doc_view_apply) and it is a belt again, but it stays: the cost is
 // one field compare and what it guards is the text view's scroll model.
+//
+// `s.nkeys > 0` is REDUNDANT against `len(s.perm) > 0` in the code as it stands
+// today -- the two are in exact lockstep, because there are only two places `nkeys`
+// is ever written. table_sort_clear sets it to 0 in the same breath it clears
+// `perm`. table_sort_build sets it to the key count it just built -- 1 to
+// TABLE_SORT_KEYS_MAX -- exactly once, at its last line, only after
+// `perm` has already been resized to a non-empty length on the success path above
+// it (every earlier return leaves `nkeys` untouched at whatever table_sort_clear
+// left it). Nothing else assigns `nkeys`, so there is no state the current code can
+// construct where the two disagree. The term is kept anyway, not because it guards
+// a reachable state that `len(perm) > 0` misses, but because it names the actual
+// invariant this predicate is about -- "is a sort live" -- rather than a proxy for
+// it; `len(perm)` is a size that happens to correlate with liveness today, and
+// reading through it would be one more thing a future change to `perm`'s lifecycle
+// could quietly break without anything here saying so. Same spirit as the
+// `doc.table` belt above: cheap, and it names its own reason rather than someone
+// else's.
 table_sorted :: #force_inline proc(doc: ^Document) -> bool {
-	return doc != nil && doc.table && doc.table_sort.col != TABLE_SORT_NONE && len(doc.table_sort.perm) > 0
+	return doc != nil && doc.table && doc.table_sort.nkeys > 0 && len(doc.table_sort.perm) > 0
 }
 
 // Data rows the live sort covers.
@@ -892,7 +1072,13 @@ table_sort_pos :: proc(doc: ^Document, off: int) -> (pos: int, ok: bool) {
 table_sort_clear :: proc(doc: ^Document) {
 	if doc == nil {return}
 	s := &doc.table_sort
-	s.col, s.desc, s.refused = TABLE_SORT_NONE, false, false
+	s.nkeys, s.refused = 0, false
+	// A zeroed Sort_Key.col is 0, a valid column -- Odin's zero-is-init gives an
+	// UNSET key the same shape as "sorted by column 0". nkeys already stops every
+	// reader at the live prefix (table_sort_key, the build below), so this can't be
+	// read as live, but leaving `col` at 0 would still be a slot lying about what it
+	// is the moment anyone reads the array directly instead of through nkeys.
+	for &k in s.keys {k.col = TABLE_SORT_NONE}
 	clear(&s.offs)
 	clear(&s.perm)
 	clear(&s.rank)
@@ -905,58 +1091,81 @@ table_sort_free :: proc(doc: ^Document) {
 	delete(doc.table_sort.rank)
 }
 
-// One row's sort key, during the build only.
+// One row's value for ONE key, during the build only.
 //
 // `ks`/`kl` index the key arena rather than `key` being filled as the arena grows:
 // a [dynamic]u8 REALLOCATES, and a string captured before a growth points into
 // freed memory. Every key is spanned first and materialised in one pass once the
 // arena has stopped moving. That bug is silent -- the comparator reads plausible
-// garbage and produces a plausible order -- so the shape is worth stating.
+// garbage and produces a plausible ORDER -- and with TABLE_SORT_KEYS_MAX keys per
+// row there are that many times as many chances to make it, so the shape is worth
+// stating. It is also the one risk in this procedure that no small fixture can see
+// from the outside: the arena is created with 64 KB of capacity and a five-row table
+// never makes it move, so the sabotage that pins this rule has to run against the
+// 100,000-row one (tablesorttest's C6).
 @(private = "file")
-Sort_Item :: struct {
+Sort_Field :: struct {
 	key:    string,
 	num:    f64,
 	ks, kl: i32,
-	row:    i32,
+	// Empty cells sort LAST in both directions, which is why this is a field rather
+	// than falling out of an empty key or a zero value.
+	//
+	// "No value" is not the smallest value. In a text column an empty key would sort
+	// before every letter ascending and after every letter descending, so the blanks
+	// would move from one end to the other with the arrow; in a numeric column an
+	// unparsed empty would read as 0.0 and land in the middle of the real data, which
+	// is worse -- a blank presented as a zero is a wrong number, not a missing one.
+	// Last in both directions is the one rule under which a blank never claims a value
+	// it does not have.
 	empty:  bool,
 }
 
-// Empty cells sort LAST in both directions, which is why `empty` is a field rather
-// than falling out of an empty key or a zero value.
+// One row's sort keys, during the build only. `f[i]` belongs to key i, so the
+// comparator's precedence walk is an index walk and there is no second ordering to
+// keep in step with the key vector's.
+@(private = "file")
+Sort_Item :: struct {
+	f:   [TABLE_SORT_KEYS_MAX]Sort_Field,
+	row: i32,
+}
+
+// The key metadata the comparator needs, passed through slice.sort_by_with_data's
+// user_data rather than sitting at file scope. A global read by a comparator is
+// invisible state that outlives the call that set it, and this file already carries
+// one hard-won lesson (Sort_Field's arena, just above) about state that is valid
+// only inside one procedure.
+@(private = "file")
+Sort_Ctx :: struct {
+	keys:  [TABLE_SORT_KEYS_MAX]Sort_Key,
+	nkeys: int,
+}
+
+// Keys in PRECEDENCE order; the first that separates two rows decides.
 //
-// "No value" is not the smallest value. In a text column an empty key would sort
-// before every letter ascending and after every letter descending, so the blanks
-// would move from one end to the other with the arrow; in a numeric column an
-// unparsed empty would read as 0.0 and land in the middle of the real data, which
-// is worse -- a blank presented as a zero is a wrong number, not a missing one.
-// Last in both directions is the one rule under which a blank never claims a value
-// it does not have.
+// EMPTY LAST IS PER KEY AND IGNORES DIRECTION, at every key, for the reason
+// Sort_Field.empty gives. Two rows both blank on a key are not ordered by it at all
+// -- they fall through to the next key rather than returning, because "both have no
+// value here" says nothing about which comes first, and stopping there would leave
+// the remaining keys unread for exactly the rows a tie-breaker exists to separate.
 //
-// Ties break on the row's FILE position, in both directions, so the order is total
-// and the result does not depend on the sort algorithm's stability. slice.sort_by
-// is not stable; relying on it would be a property this file cannot see.
+// The final tie-break is the row's FILE position, ascending, in every direction, so
+// the order is total and does not depend on slice.sort_by_with_data's stability --
+// which this file cannot see.
 @(private = "file")
-sort_less_text_asc :: proc(a, b: Sort_Item) -> bool {
-	if a.empty != b.empty {return b.empty}
-	if a.key != b.key {return a.key < b.key}
-	return a.row < b.row
-}
-@(private = "file")
-sort_less_text_desc :: proc(a, b: Sort_Item) -> bool {
-	if a.empty != b.empty {return b.empty}
-	if a.key != b.key {return a.key > b.key}
-	return a.row < b.row
-}
-@(private = "file")
-sort_less_num_asc :: proc(a, b: Sort_Item) -> bool {
-	if a.empty != b.empty {return b.empty}
-	if a.num != b.num {return a.num < b.num}
-	return a.row < b.row
-}
-@(private = "file")
-sort_less_num_desc :: proc(a, b: Sort_Item) -> bool {
-	if a.empty != b.empty {return b.empty}
-	if a.num != b.num {return a.num > b.num}
+sort_less_keys :: proc(a, b: Sort_Item, user_data: rawptr) -> bool {
+	ctx := (^Sort_Ctx)(user_data)
+	for i in 0 ..< ctx.nkeys {
+		k := ctx.keys[i]
+		af, bf := a.f[i], b.f[i]
+		if af.empty != bf.empty {return bf.empty}
+		if af.empty {continue} // both empty on this key: fall through to the next
+		if k.numeric {
+			if af.num != bf.num {return af.num > bf.num if k.desc else af.num < bf.num}
+		} else {
+			if af.key != bf.key {return af.key > bf.key if k.desc else af.key < bf.key}
+		}
+	}
 	return a.row < b.row
 }
 
@@ -977,17 +1186,24 @@ sort_number :: proc(s: string, scratch: ^[64]u8) -> f64 {
 	return v
 }
 
-// Build the permutation for `col`. Returns false and leaves the document unsorted
-// when it refuses; `refused` distinguishes "too large" from "there is nothing to
-// sort".
+// Build the permutation for `keys` -- 1..TABLE_SORT_KEYS_MAX columns in PRECEDENCE
+// order, keys[0] first. Returns false and leaves the document unsorted when it
+// refuses; `refused` distinguishes "too large" from "there is nothing to sort".
+//
+// Each key's `numeric` is IGNORED on the way in and SETTLED here, over the rows this
+// sort orders. A caller cannot know a column's type -- the only place that evidence
+// exists is the pass below -- so accepting the caller's guess would be an input this
+// procedure has to distrust anyway. The settled vector is what lands in s.keys.
 //
 // ONE BOUNDED PASS over the data rows, on the main thread, because a sort the user
-// asked for by clicking has to be there when they look up. The bound is
-// TABLE_SORT_MAX rows, checked as the rows are counted rather than afterwards, so
-// a 12M-row file pays for 100,000 rows of scanning and then stops -- not for
-// twelve million followed by a refusal.
+// asked for by clicking has to be there when they look up. Still one pass at the key
+// cap: the line is read once and every key's field is cut from that one read, so
+// the row count -- not the key count -- is what the ceiling has to bound. The bound
+// is TABLE_SORT_MAX rows, checked as the rows are counted rather than afterwards, so
+// a 12M-row file pays for 100,000 rows of scanning and then stops -- not for twelve
+// million followed by a refusal.
 //
-// THE COLUMN'S TYPE IS DECIDED HERE, over the rows being sorted, and NOT read from
+// EACH COLUMN'S TYPE IS DECIDED HERE, over the rows being sorted, and NOT read from
 // doc.table_align. That is the difference between a bounded scan that knows its own
 // bound and one that does not. table_compute_widths decides alignment from the
 // first TABLE_SAMPLE (500) rows, which is the right scope for a cosmetic
@@ -995,27 +1211,51 @@ sort_number :: proc(s: string, scratch: ^[64]u8) -> f64 {
 // column numerically because its first 500 cells were numbers, when row 900 holds
 // "N/A", would put that row wherever 0.0 happens to fall and present it as sorted.
 // The evidence for a NUMERIC sort has to cover every row the sort orders, so it is
-// gathered from every row the sort orders.
+// gathered from every row the sort orders -- and per key, because one key can be
+// numeric while another in the same sort is text.
 //
 // Dates deliberately sort as BYTES, not as a third key type. An ISO date sorts
 // correctly as text, which is most of what §10's date detection matches; the
 // d/m/Y masks do not sort correctly under any byte order, and parsing them would
 // need a calendar this file explicitly refuses to grow (see table_is_date). Text
 // is the honest answer for a shape whose ordering is not knowable from the shape.
-table_sort_build :: proc(doc: ^Document, col: int) -> bool {
+table_sort_build :: proc(doc: ^Document, keys: []Sort_Key) -> bool {
+	if doc == nil {return false}
+	// The caller's vector is copied out BEFORE table_sort_clear runs, and the order
+	// is load-bearing: `keys` is allowed to alias s.keys -- a caller cycling the live
+	// sort holds the current vector and hands back a modified one -- and the clear
+	// rewrites every `col` in that array to TABLE_SORT_NONE. Reading `keys` afterwards
+	// would read the reset, not the request.
+	//
+	// Trailing slots get TABLE_SORT_NONE rather than Odin's zero: 0 is a valid column
+	// index, and kv is written into s.keys wholesale on success, so a zeroed tail
+	// would undo exactly the reset table_sort_clear performs (see its comment).
+	kv: [TABLE_SORT_KEYS_MAX]Sort_Key
+	for &k in kv {k.col = TABLE_SORT_NONE}
+	nk := len(keys)
+	usable := nk > 0 && nk <= TABLE_SORT_KEYS_MAX
+	if usable {
+		for i in 0 ..< nk {
+			// `numeric` is dropped on the floor here, not copied: it is settled below.
+			if keys[i].col < 0 {usable = false;break}
+			kv[i] = {keys[i].col, keys[i].desc, false}
+		}
+	}
 	s := &doc.table_sort
-	desc := s.desc
+	// Cleared before the first refusal rather than after the last, so that every
+	// `return false` below -- including the two the caller can provoke with a bad
+	// vector -- leaves the document genuinely unsorted rather than half-sorted.
 	table_sort_clear(doc)
-	s.desc = desc
-	if doc == nil || col < 0 {return false}
+	if !usable {return false}
 	first, fok := table_first_data_row(doc)
 	if !fok {return false}
 	// Refuse before scanning when the row count is already SETTLED and over the
 	// ceiling. Without this every click on a 12M-row file pays for a full
-	// TABLE_SORT_MAX-row pass -- 285 ms in a debug build, which tg_sort's C4 prints
-	// -- to arrive at the same refusal, so the header would cost a visible hitch on
-	// every press and never do anything. Only on an EXACT count: a partial one is
-	// smaller than the truth
+	// TABLE_SORT_MAX-row pass -- 285 ms in a debug build, which tablegridtest's
+	// sort_ceiling subcase prints ("sort cost: ... ms for ... rows") -- to arrive
+	// at the same refusal, so the header would cost a visible hitch on every press
+	// and never do anything. Only on an EXACT count: a partial one is smaller than
+	// the truth
 	// by construction, so refusing off it would refuse files that fit.
 	if n, exact := table_row_count(doc); exact && n > TABLE_SORT_MAX {
 		s.refused = true
@@ -1038,10 +1278,26 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 	// ORDER -- development-loop.md §4 Shape A with the key rather than the scan
 	// truncated -- and a field cannot exceed the line, which RENDER_LINE_CAP already
 	// bounds. 16 KB on the stack of a procedure the input phase calls once per click.
+	//
+	// ONE key buffer, reused by every key, NOT one per key. A
+	// [TABLE_SORT_KEYS_MAX][RENDER_LINE_CAP]u8 is 16 KB of its own at today's cap of 2,
+	// and it would REPLACE the 8 KB `key` below rather than sit beside it, so the extra
+	// cost is 8 KB and it grows by another RENDER_LINE_CAP (8 KB) per key the cap ever
+	// gains. This line used to say "24 KB more", which was the whole array at a cap of
+	// three rather than the difference it costs. On a stack frame
+	// that test_mode_dispatch already enters deep, and `blocktest` has hit a real
+	// STATUS_STACK_OVERFLOW twice in this tree from exactly that kind of growth. Reuse
+	// is safe because each field is appended to the arena immediately, before the next
+	// extraction overwrites the buffer.
 	buf: [RENDER_LINE_CAP]u8
 	key: [RENDER_LINE_CAP]u8
 	p := first
-	num_all, nonempty := true, 0
+	// Per key, because the numeric decision is per key. num_all[i] starts true and
+	// only ever falls: one non-numeric cell anywhere in the sorted rows settles that
+	// key as text.
+	num_all: [TABLE_SORT_KEYS_MAX]bool
+	nonempty: [TABLE_SORT_KEYS_MAX]int
+	for i in 0 ..< nk {num_all[i] = true}
 	for {
 		// The file's TERMINATOR is not a row. A file ending in '\n' leaves a
 		// zero-length line after the last real one, and the unsorted walk shows it as
@@ -1060,20 +1316,24 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
 		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
 		if n > 0 && buf[n - 1] == '\r' {n -= 1}
-		t := strings.trim_space(csv_field_into(string(buf[:n]), delim, col, key[:]))
+		// ONE line read, k fields cut from it -- the reason the key count does not
+		// multiply the pass. Each field is spanned into the arena and appended before
+		// the next extraction, because `key` is the same buffer every time round.
+		line := string(buf[:n])
 		it := Sort_Item {
-			ks    = i32(len(arena)),
-			kl    = i32(len(t)),
-			row   = i32(len(items)),
-			empty = len(t) == 0,
+			row = i32(len(items)),
 		}
-		append(&arena, ..transmute([]u8)t)
+		for i in 0 ..< nk {
+			t := strings.trim_space(csv_field_into(line, delim, kv[i].col, key[:]))
+			it.f[i] = {ks = i32(len(arena)), kl = i32(len(t)), empty = len(t) == 0}
+			append(&arena, ..transmute([]u8)t)
+			if !it.f[i].empty {
+				nonempty[i] += 1
+				if !table_is_number(t) {num_all[i] = false}
+			}
+		}
 		append(&items, it)
 		append(&s.offs, p)
-		if !it.empty {
-			nonempty += 1
-			if !table_is_number(t) {num_all = false}
-		}
 		if end >= doc.pt.length {break}
 		p = end + 1
 	}
@@ -1086,38 +1346,75 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 		table_sort_clear(doc)
 		return false
 	}
-	// The arena has stopped growing: materialise the keys now, never before.
-	for &it in items {it.key = string(arena[it.ks:it.ks + it.kl])}
-	numeric := nonempty > 0 && num_all
-	if numeric {
-		scratch: [64]u8
-		for &it in items {
-			if !it.empty {it.num = sort_number(it.key, &scratch)}
+	// The arena has stopped growing: materialise every key now, never before.
+	//
+	// SABOTAGED AND WATCHED TO FAIL, because this rule's violation is invisible at any
+	// fixture small enough to read: moving these two lines up into the row loop took
+	// tablesorttest's 100,000-row case from a pinned order to an ACCESS VIOLATION
+	// (0xC0000005) mid-sort, and every case before it still passed unchanged. By then
+	// the arena has grown past its 64 KB capacity many times over, so most keys point
+	// into blocks that have been freed. At that size the heap gives the read back a
+	// fault; at a size where it does not, the same bug is a plausible wrong order that
+	// nothing in the output would flag.
+	for &it in items {
+		for i in 0 ..< nk {it.f[i].key = string(arena[it.f[i].ks:it.f[i].ks + it.f[i].kl])}
+	}
+	// Each key's type settles against ITS OWN accumulators. A key that is numeric in
+	// this sort tells the next key nothing, which is why these are not one flag.
+	for i in 0 ..< nk {kv[i].numeric = nonempty[i] > 0 && num_all[i]}
+	scratch: [64]u8
+	for &it in items {
+		for i in 0 ..< nk {
+			if kv[i].numeric && !it.f[i].empty {it.f[i].num = sort_number(it.f[i].key, &scratch)}
 		}
 	}
-	switch {
-	case numeric && s.desc:
-		slice.sort_by(items[:], sort_less_num_desc)
-	case numeric:
-		slice.sort_by(items[:], sort_less_num_asc)
-	case s.desc:
-		slice.sort_by(items[:], sort_less_text_desc)
-	case:
-		slice.sort_by(items[:], sort_less_text_asc)
+	// One comparator for every direction and every key count: the four it replaced
+	// were four copies of the same empty-last and file-order rules, and a fifth would
+	// have been a fifth chance for them to drift apart.
+	ctx := Sort_Ctx {
+		keys  = kv,
+		nkeys = nk,
 	}
+	slice.sort_by_with_data(items[:], sort_less_keys, &ctx)
 	resize(&s.perm, len(items))
 	resize(&s.rank, len(items))
 	for it, pos in items {
 		s.perm[pos] = it.row
 		s.rank[it.row] = i32(pos)
 	}
-	s.col = col
+	// The SETTLED vector lands, and only now -- after the last refusal, in the same
+	// place `s.keys[0]` used to be written -- so that `nkeys > 0` and a non-empty
+	// `perm` become true together and table_sorted cannot see a half-built sort.
+	s.keys = kv
+	s.nkeys = nk
 	return true
 }
 
-// A click on the sorted column's header. §10's cycle: ascending, then descending,
-// then back to the file's own order -- so the gesture that turned the sort on is
-// the gesture that turns it off, and there is no second control to find.
+// Is there room for `col` in the live sort? Already-a-key columns are always
+// "yes" -- changing a key's direction costs no slot, only appending a NEW one
+// does -- so this is not simply `nkeys < TABLE_SORT_KEYS_MAX`. The one predicate
+// table_sort_add, table_sort_toggle and the header menu's enabled state (Task 5)
+// all branch on, so the cap has exactly one definition rather than three that
+// could drift apart.
+//
+// table_sort_toggle and the menu (menu.odin's can_then_by and its "Then by" row)
+// both pre-check membership with table_sort_key before ever calling this, so the
+// already-a-key branch below never fires from them. table_sort_add is the one
+// caller that calls this unconditionally, key or not -- its own direction-flip
+// path (col already live, only `desc` changing) is what keeps that branch
+// reachable and exercised by tablesorttest rather than untested dead code.
+table_sort_can_add :: proc(doc: ^Document, col: int) -> bool {
+	if doc == nil {return false}
+	if _, ok := table_sort_key(doc, col); ok {return true}
+	return doc.table_sort.nkeys < TABLE_SORT_KEYS_MAX
+}
+
+// Replace the live sort with exactly this one key, discarding whatever else was
+// live. Where table_sort_add composes onto the existing vector, this is for a
+// caller that means "this column and only this column" regardless of what came
+// before -- table_sort_cycle below, and Task 5's header-menu "Sort Ascending" /
+// "Sort Descending" rows, which name a single column and a single direction and
+// have no reason to inherit a tie-breaker the menu never mentioned.
 //
 // THE OPEN CELL EDIT IS COMMITTED FIRST, and this is HANDOFF §6aw's "keystrokes are
 // dropped on a reorder" turned from an inherited constraint into a decision.
@@ -1126,7 +1423,13 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 // typed it into. The drop path in table_edit_commit survives as the fail-closed
 // guard for a reorder this code did not initiate; it is no longer what happens when
 // a user types into a cell and then clicks a header, which was the case that made
-// the constraint worth deciding.
+// the constraint worth deciding. table_sort_add, table_sort_drop and
+// table_sort_toggle below commit the same way, for the same reason: a Ctrl+click
+// that reorders while a cell edit is open would drop the keystrokes exactly as a
+// plain click would. table_sort_cycle below reaches this commit by delegating to
+// this procedure for its ascending/descending transitions; the commit call at the
+// top of table_sort_cycle itself is only needed for the branch that does NOT
+// delegate here (its own descending -> clear).
 //
 // The scroll goes to the TOP of the new order rather than trying to keep the row
 // that was under the pointer. Following a row through a re-sort sounds friendlier
@@ -1134,26 +1437,153 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 // name they are looking for, which is at the top or found by scrolling, while
 // "keep row 4,113 on screen" leaves them somewhere arbitrary in an order they have
 // not seen yet. It also guarantees doc.top is an offset the permutation contains,
-// which table_sort_pos then never has to be forgiving about.
-table_sort_click :: proc(doc: ^Document, col: int) {
+// which table_sort_pos then never has to be forgiving about. table_sort_add and
+// table_sort_drop below apply the same rule to every reorder they make, including
+// a drop that merely shortens the vector. An operation that CLEARS the sort
+// entirely -- table_sort_cycle's descending -> clear branch, and table_sort_drop's
+// last key -- does NOT touch doc.top: it is already a real byte offset in the
+// file's own order (the block comment opening this section), and once no
+// permutation exists there is nothing left for the scroll to be forgiving about.
+table_sort_set :: proc(doc: ^Document, col: int, desc: bool) {
 	if doc == nil || col < 0 {return}
 	if doc.table_editing {table_edit_commit(doc)}
-	// Through table_sorted rather than `s.col == col`, and that is not a
-	// simplification. A zero-value Document has col == 0 (Odin's
-	// zero-is-initialization, which CLAUDE.md says not to fight), so the plain field
-	// compare would read the very first click on column 0 as "already ascending" and
-	// open descending. table_sorted is the predicate the whole file branches on and
-	// it is false at the zero value, which is what makes the states here the states
-	// that actually exist.
+	kv := [1]Sort_Key{{col = col, desc = desc}}
+	if !table_sort_build(doc, kv[:]) {return}
+	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off}
+}
+
+// A click on the sorted column's header. §10's cycle: ascending, then descending,
+// then back to the file's own order -- so the gesture that turned the sort on is
+// the gesture that turns it off, and there is no second control to find. Always a
+// SINGLE key, replacing whatever was live -- table_sort_toggle below is the
+// gesture that composes a tie-breaker onto an existing sort instead of replacing
+// it.
+//
+// The ascending and descending transitions delegate to table_sort_set above,
+// whose own comment carries the argument for why the open cell edit is committed
+// first and why the scroll lands on the top of the new order rather than
+// following a row. The commit call directly below runs unconditionally -- ahead
+// of the branch below it -- because it is the only commit on the path that clears
+// the sort instead of delegating to table_sort_set; on the other path it is a
+// harmless repeat of the commit table_sort_set performs itself.
+table_sort_cycle :: proc(doc: ^Document, col: int) {
+	if doc == nil || col < 0 {return}
+	if doc.table_editing {table_edit_commit(doc)}
+	// table_sort_key already stops at nkeys, so a zero-value Document (keys[0].col
+	// == 0, Odin's zero-is-initialization, which CLAUDE.md says not to fight)
+	// cannot read as "column 0 already sorted" the way a raw `s.keys[0].col == col`
+	// compare could. table_sorted is still composed in rather than dropped: its
+	// other two terms, doc.table and len(perm) > 0, are not things table_sort_key
+	// checks, and this is the gesture that has to tell "sorted, click again" from
+	// "not sorted, first click" apart correctly for every one of them.
+	//
+	// Reads `s.keys[k].desc`, not `s.keys[0]`. A plain click can now land on a
+	// column that is a Ctrl+click tie-breaker rather than the primary -- Task 3 is
+	// what made a multi-key sort reachable at all -- and keys[0] would then read a
+	// DIFFERENT column's direction to decide this one's next state.
 	s := &doc.table_sort
-	live := table_sorted(doc) && s.col == col
-	if live && s.desc {
+	k, is_key := table_sort_key(doc, col)
+	live := table_sorted(doc) && is_key
+	if live && s.keys[k].desc {
 		table_sort_clear(doc) // descending -> the file's own order
 		return
 	}
-	s.desc = live // ascending -> descending; anything else -> ascending
-	if !table_sort_build(doc, col) {return}
+	table_sort_set(doc, col, live) // ascending -> descending; anything else -> ascending
+}
+
+// Append `col` to the live sort, or -- if it is already a key -- change ITS
+// direction and leave every key's precedence exactly where it was.
+//
+// REMOVE-AND-RE-APPEND WAS THE TRAP this task's brief carried in from Task 2's
+// review: precedence is array order, first-wins by construction
+// (TABLE_SORT_KEYS_MAX's comment), so popping an existing key out and pushing it
+// back on at the end would silently demote a primary key to a tie-breaker on
+// every direction flip, with nothing on screen saying it happened. Composing the
+// next vector with the key rewritten AT ITS OWN INDEX is what keeps precedence
+// where the user put it.
+//
+// THE CAP IS CHECKED HERE, before table_sort_build ever sees the vector -- by
+// CALLING table_sort_can_add, not by re-deriving its answer inline. This
+// procedure used to compare `nk` to TABLE_SORT_KEYS_MAX itself, which gave the
+// cap two definitions rather than table_sort_can_add's one -- exactly the drift
+// its comment claimed could not happen. table_sort_build clears the live sort
+// before it validates (documented on table_sort_build's own comment, and pinned
+// there by Task 2's tests), so refusing here, before table_sort_build is ever
+// called, is what keeps an oversized request from erasing every key already live
+// just to learn it should have been refused.
+table_sort_add :: proc(doc: ^Document, col: int, desc: bool) {
+	if doc == nil || col < 0 {return}
+	if doc.table_editing {table_edit_commit(doc)}
+	if !table_sort_can_add(doc, col) {return} // full and not already a key: refused, live sort untouched
+	s := &doc.table_sort
+	kv: [TABLE_SORT_KEYS_MAX]Sort_Key
+	nk := s.nkeys
+	for i in 0 ..< nk {kv[i] = s.keys[i]}
+	if k, ok := table_sort_key(doc, col); ok {
+		kv[k].desc = desc // in place -- k, its precedence, does not move
+	} else {
+		kv[nk] = {col = col, desc = desc} // room guaranteed by table_sort_can_add above
+		nk += 1
+	}
+	if !table_sort_build(doc, kv[:nk]) {return}
 	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off}
+}
+
+// Remove `col`'s key and rebuild with what is left, preserving the relative
+// precedence of every other live key -- the loop below copies them in their
+// existing order, skipping only the dropped one.
+//
+// Removing the LAST key rebuilds from an empty slice, which is table_sort_build's
+// own "nothing to sort" refusal (`usable := nk > 0 ...` on its first lines) -- the
+// same clear-and-stay-unsorted outcome table_sort_clear performs, reached without
+// a separate branch for it here. That build call returns false, so the
+// scroll-to-top below does not run for it either, matching table_sort_cycle's own
+// descending-to-clear branch: doc.top is left alone because there is no
+// permutation left for it to be an offset into.
+table_sort_drop :: proc(doc: ^Document, col: int) {
+	if doc == nil || col < 0 {return}
+	if doc.table_editing {table_edit_commit(doc)}
+	s := &doc.table_sort
+	k, ok := table_sort_key(doc, col)
+	if !ok {return} // not a key -- nothing to drop
+	kv: [TABLE_SORT_KEYS_MAX]Sort_Key
+	nk := 0
+	for i in 0 ..< s.nkeys {
+		if i == k {continue}
+		kv[nk] = s.keys[i]
+		nk += 1
+	}
+	if !table_sort_build(doc, kv[:nk]) {return}
+	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off}
+}
+
+// Ctrl+click: the three-state cycle PER KEY that composes onto a live sort
+// instead of replacing it -- table_sort_cycle's job -- because "sort by
+// department, then by name" (TABLE_SORT_KEYS_MAX's comment) needs a gesture that
+// adds a tie-breaker without disturbing the key already there.
+//
+// NOT A KEY -> append ascending, through table_sort_add -- but only when
+// table_sort_can_add says there is room. At the cap this does nothing at all,
+// silently, and the two live keys and their order are exactly what they were:
+// the trap this task's brief named by name, delegating the cap check to
+// table_sort_build here would clear the live sort just to learn it should have
+// stayed clear. ASCENDING -> DESCENDING flips in place through table_sort_add,
+// which is what keeps a Ctrl+click on the primary key from demoting it
+// (table_sort_add's own comment carries that argument). DESCENDING -> REMOVED
+// drops just this key through table_sort_drop; removing the last live key leaves
+// the document unsorted.
+table_sort_toggle :: proc(doc: ^Document, col: int) {
+	if doc == nil || col < 0 {return}
+	if doc.table_editing {table_edit_commit(doc)}
+	k, is_key := table_sort_key(doc, col)
+	switch {
+	case !is_key:
+		if table_sort_can_add(doc, col) {table_sort_add(doc, col, false)}
+	case !doc.table_sort.keys[k].desc:
+		table_sort_add(doc, col, true)
+	case:
+		table_sort_drop(doc, col)
+	}
 }
 
 // Keep the offsets describing the bytes they were built from, across an edit of
@@ -1210,7 +1640,7 @@ sort_range_has_newline :: proc(doc: ^Document, at, n: int) -> bool {
 // there is nothing here to shift.
 table_sort_shift :: proc(doc: ^Document, at, n: int, text: []u8) {
 	s := &doc.table_sort
-	if s.col == TABLE_SORT_NONE || len(s.offs) == 0 {return}
+	if s.nkeys == 0 || len(s.offs) == 0 {return}
 	for b in text {
 		if b == '\n' {table_sort_clear(doc);return}
 	}
@@ -1665,20 +2095,33 @@ table_header_col_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (
 // PRECEDENCE, stated once here rather than left to each consumer:
 //
 //   the ±4px RESIZE EDGE ZONE WINS. Inside it this returns nothing -- no lift, no
-//   ghost arrow -- because that is exactly where the press does not sort either
-//   (main.odin tests table_edge_at first, and its own comment records why:
-//   reordering a whole file on a slightly-off resize grab is not a recoverable
-//   surprise). The cursor there is already .SizeWE. Showing a sort affordance over
-//   a pixel that resizes would be the "affordance appears where the gesture does
-//   not work" failure table_edge_at's comment was written about, with the added
-//   insult that the gesture it advertises is the destructive-looking one.
+//   ghost arrow, AND NO CHEVRON -- because that is exactly where the press does
+//   not sort either (main.odin tests table_edge_at first, and its own comment
+//   records why: reordering a whole file on a slightly-off resize grab is not a
+//   recoverable surprise). The cursor there is already .SizeWE. Showing a sort
+//   affordance over a pixel that resizes would be the "affordance appears where
+//   the gesture does not work" failure table_edge_at's comment was written about,
+//   with the added insult that the gesture it advertises is the destructive-looking
+//   one.
 //
-// THREE BEHAVIOURS ON ONE RECT -- sort click, resize drag, and now hover -- and
-// all three resolve through table_cols_layout and this file's two band gates, so
-// the ordering above is the whole of the interaction. Note the DATA rows are
-// unaffected in every case: table_edge_at and table_header_col_at both refuse
-// outside the header band, which is what keeps the same x one row down a cell
-// edit.
+//   The chevron inherits that refusal rather than restating it: it exists only on
+//   the column this returns (table_header_layout takes the answer as its
+//   hover_col) and is only ever hit-tested through table_header_at, which asks
+//   this first. So there is still ONE expression excluding the edge zone from
+//   every header affordance, and adding a second hit region did not add a second
+//   place to keep the tolerance in step. The edge keeps winning because it is the
+//   narrower target and the older gesture. The two rectangles do not in fact
+//   overlap at the shipped metrics -- the chevron stops a whole cell pad (10px at
+//   96 DPI) short of the cell's right edge and the zone reaches only 4px in -- but
+//   the ordering is asserted (tablesorttest C15) rather than left to that
+//   arithmetic, because nothing anywhere states that 4 must stay below 10.
+//
+// FOUR BEHAVIOURS ON ONE RECT -- sort click, resize drag, hover, and the menu
+// chevron -- and all four resolve through table_cols_layout and this file's two
+// band gates, so the ordering above is the whole of the interaction. Note the DATA
+// rows are unaffected in every case: table_edge_at and table_header_col_at both
+// refuse outside the header band, which is what keeps the same x one row down a
+// cell edit.
 table_header_hover_col :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (c: int, ok: bool) {
 	if _, on_edge := table_edge_at(doc, char_w, width, mx, my, px); on_edge {return 0, false}
 	return table_header_col_at(doc, char_w, width, mx, my, px)
@@ -1690,6 +2133,14 @@ table_header_hover_col :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -
 table_edge_at_cursor :: #force_inline proc(doc: ^Document, char_w, width, mx, my, px: f32) -> bool {
 	_, ok := table_edge_at(doc, char_w, width, mx, my, px)
 	return ok
+}
+
+// The same, for the chevron: the cursor wants "is the pointer on a menu chevron"
+// and has no use for the column. Through table_header_at for the reason above --
+// one definition of the rectangle, shared with the press and with the draw.
+table_chevron_at_cursor :: #force_inline proc(doc: ^Document, char_w, width, mx, my, px: f32) -> bool {
+	_, hit := table_header_at(doc, char_w, width, mx, my, px)
+	return hit == .Chevron
 }
 
 // Set column `c`'s width from a dragged edge position, in the same cells the
@@ -1798,40 +2249,219 @@ Table_Arrow :: struct {
 
 table_arrow_w :: #force_inline proc(px: f32) -> f32 {return f32(int(px * 0.6))}
 
-// The gap between the header label and the arrow, in pixels. Half a cell pad --
-// enough that the two read as separate marks, small enough that reserving it
-// costs a narrow column no more than one extra character of its name.
-table_arrow_gap :: #force_inline proc() -> f32 {return f32(int(TABLE_CELL_PAD_X * 0.5))}
+// The gap between two adjacent things in the header's right-hand run --
+// label | arrow | chevron -- in pixels. Half a cell pad: enough that they read as
+// separate marks, small enough that reserving it costs a narrow column no more
+// than one extra character of its name.
+//
+// Named for MARKS rather than for the arrow (it was table_arrow_gap until the
+// chevron arrived) because it is now the single spacing metric of that run and a
+// name that claims one of its three consumers would invite a second constant for
+// the others.
+table_mark_gap :: #force_inline proc() -> f32 {return f32(int(TABLE_CELL_PAD_X * 0.5))}
 
-// The arrow's rectangle inside a column's header cell: hard against the cell's
-// right inner edge, vertically centred in the header band, and clamped so it
-// stays on screen in a column that runs past the grid's right edge.
+// --- the header's menu chevron ---------------------------------------------
+//
+// The batch-19 design gives the header cell a context menu with two ways in: a
+// right-click anywhere in the cell, and this chevron on the HOVERED column. The
+// mark is built from quads for the reason table_sort_arrow records (the document
+// face is the user's and nothing guarantees it has a chevron glyph): a stack of
+// TABLE_CHEV_STEPS square bars descending from each end, meeting in the middle.
+//
+// DPI-SCALED (sx), where the arrow beside it is FONT-scaled (px * 0.6), and the
+// difference is not an oversight. The arrow labels the DATA -- it says which way
+// this column is ordered -- so it tracks the text it labels. The chevron is a
+// CONTROL, in the same family as §10's 30px header band and 10px cell padding,
+// and those are metrics of the chrome. A chevron that grew with the document font
+// would be a thumbnail at 200% zoom inside a band that barely moved.
+TABLE_CHEV_STEPS :: 3
+table_chev_th :: #force_inline proc() -> f32 {return max(hairline(), sx(2))}
+table_chev_w :: #force_inline proc() -> f32 {return table_chev_th() * f32(2 * TABLE_CHEV_STEPS - 1)}
+table_chev_h :: #force_inline proc() -> f32 {return table_chev_th() * f32(TABLE_CHEV_STEPS)}
+
+// The x every header mark is measured back from: the cell's right INNER edge,
+// clipped to the grid's right edge.
+//
+// ONE expression for that anchor, because the arrow and the chevron are laid out
+// end to end from it and have to agree on it to the pixel, and because the clip
+// and the padding used to be two separate opinions -- the arrow clamped to
+// `right - w`, hard against the scrollbar with no padding at all, while every
+// other column kept its 10px.
+//
+// `right` may be given as the grid's right edge or as table_content_right and the
+// answer does not change: columns tile left to right, so the last laid-out
+// column's own right edge is the largest col.x + col.w there is, and
+// min(col.x + col.w, right) is the same number under either clip.
+table_header_marks_right :: #force_inline proc(col: Table_Col, right: f32) -> f32 {
+	return min(col.x + col.w, right) - TABLE_CELL_PAD_X
+}
+
+// The arrow's rectangle inside a column's header cell: vertically centred in the
+// header band, and hard against the CHEVRON's slot rather than against the cell's
+// right inner edge, on every column, sorted or not, hovered or not.
+//
+// Reserving the chevron's slot here is what keeps the arrow STILL. The chevron
+// appears and disappears as the pointer crosses the header; an arrow that shuffled
+// left to make room for it would be a mark moving under the mouse on the one
+// surface whose whole problem is that a click on it does something surprising --
+// the same argument table_header_label_col makes for reserving the slot in the
+// label, applied to the mark next to it.
 table_sort_arrow_rect :: proc(col: Table_Col, px, right: f32) -> Table_Arrow {
 	w := table_arrow_w(px)
 	h := w * 0.5
 	return Table_Arrow {
-		x = min(col.x + col.w - TABLE_CELL_PAD_X - w, right - w),
+		x = table_header_marks_right(col, right) - table_chev_w() - table_mark_gap() - w,
 		y = table_grid_top() + f32(int((table_header_h(px) - h) * 0.5)),
 		w = w,
 		h = h,
 	}
 }
 
-// The cells the arrow's slot takes out of a header cell -- the arrow plus its gap,
-// rounded UP to a whole cell because the label is truncated in cells and half a
-// cell of overlap is still overlap.
-table_arrow_cells :: proc(char_w, px: f32) -> int {
+// Does this document's header show PRECEDENCE DIGITS beside its arrows?
+//
+// Only above one key: a lone "1" next to a single sort is noise, and the arrow
+// alone already says everything a one-key sort has to say (spec §6). ONE
+// definition, because three things branch on it -- the mark producer below, the
+// slot the label reserves, and the width at which table_header_layout suppresses
+// the chevron -- and a digit drawn in a slot the label did not reserve is the
+// "smear below Date" bug (Wyatt, live use, v0.34.0) with a different glyph in it.
+table_sort_digits_shown :: #force_inline proc(doc: ^Document) -> bool {
+	return table_sorted(doc) && doc.table_sort.nkeys > 1
+}
+
+// The digit's own slot, in pixels: one cell of the document face plus the gap
+// that separates it from the arrow, or nothing when no digit is drawn.
+//
+// ONE CELL, and that is not an estimate: the digit is drawn in the document face
+// on the same fixed cell grid every other measurement in this file uses, and
+// the #assert(TABLE_SORT_KEYS_MAX <= 9) beside the digit's draw in table_draw's
+// header pass -- some 900 lines from here, not "below" in any local sense --
+// keeps it to a single character.
+table_sort_digit_w :: #force_inline proc(char_w: f32, digit: bool) -> f32 {
+	return char_w + table_mark_gap() if digit else 0
+}
+
+// The pixels the header's marks reserve at the right end of every cell:
+// [digit, gap,] gap, arrow, gap, chevron, ending at table_header_marks_right.
+//
+// `digit` is a parameter rather than read from the document here because this is
+// a metric, and the two call sites that pass `true` both get it from
+// table_sort_digits_shown -- one predicate, passed down, rather than a second
+// place that decides when a digit exists.
+table_header_marks_w :: #force_inline proc(px, char_w: f32, digit: bool) -> f32 {
+	return table_mark_gap() * 2 + table_arrow_w(px) + table_chev_w() + table_sort_digit_w(char_w, digit)
+}
+
+// The cells that run takes out of a header cell, rounded UP to a whole cell
+// because the label is truncated in cells and half a cell of overlap is still
+// overlap.
+table_header_marks_cells :: proc(char_w, px: f32, digit: bool) -> int {
 	if char_w <= 0 {return 0}
-	need := table_arrow_w(px) + table_arrow_gap()
+	need := table_header_marks_w(px, char_w, digit)
 	n := int(need / char_w)
 	if f32(n) * char_w < need {n += 1}
 	return n
 }
 
-// The header LABEL's own box: the column's cell with the arrow's slot taken off
-// its right end. THE producer for where a header name is truncated AND for how
-// far a right-aligned one is nudged -- both, because doing only the first is the
-// bug this exists to fix in its other half.
+// Does this column have room for the marks' whole run -- table_header_marks_w,
+// plus one cell left over for the label -- or is it too narrow to hold what it
+// is being asked to reserve?
+//
+// THE test both the chevron's suppression (table_header_layout) and the
+// digit's (table_sort_mark) read, rather than two copies of the same
+// arithmetic drifting apart. table_header_label_col does not consult this: its
+// clamp at `col.cells - 1` is cells-rounded and always leaves the label
+// something, which is exactly why it can under-deliver relative to `need`
+// here without either of those two callers using this predicate first -- see
+// table_sort_mark's comment on the digit's own gate.
+table_header_marks_fit :: #force_inline proc(col: Table_Col, char_w, px: f32, digit: bool) -> bool {
+	return col.w - TABLE_CELL_PAD_X * 2 >= table_header_marks_w(px, char_w, digit) + char_w
+}
+
+// --- the sort mark: ONE producer for the arrow AND its precedence digit -----
+//
+// What the header draws for a column's sort, decided in one place: whether there
+// is a mark at all, which way the arrow points, whether a digit goes beside it
+// and which digit, and where both land. The draw consumes this and computes no
+// coordinate and no direction of its own.
+//
+// PER KEY. `up` comes from THIS column's key, not from keys[0] -- with two keys
+// live the primary can be ascending while the tie-breaker is descending, and a
+// shared flag would draw both columns the same way while the summary row said
+// otherwise. That disagreement is the one failure a reader could not diagnose
+// from the screen, because both marks would look deliberate.
+//
+// THE ARROW DOES NOT MOVE when a second key appears: table_sort_arrow_rect's x is
+// unchanged and the digit takes the cell to its LEFT, out of the slot the label
+// already reserved (table_header_label_col). What does change is how much name a
+// full-width header keeps -- one cell less, and only while a second key is live.
+// That is a state the user reaches by Ctrl+clicking, which already re-sorts the
+// whole grid; it is not the header re-truncating under the pointer, which is what
+// the uniform-reservation rule above exists to prevent.
+Table_Sort_Mark :: struct {
+	arrow:                     Table_Arrow,
+	digit_x, digit_y, digit_w: f32, // the digit's cell; zero-width when rank == 0
+	rank:                      int, // 1-based precedence, or 0 for "draw no digit"
+	up:                        bool, // ascending -- this key's own direction
+	ghost:                     bool, // the hover preview on an unsorted column, not a live sort
+}
+
+// The mark for one visible column, or ok=false when the column draws none.
+//
+// The sorted column WINS where the two would coincide: hovering a column that is
+// already sorted shows its real arrow at full strength rather than a preview of
+// itself. On an unsorted hovered column `up` is what the NEXT click produces,
+// which is ascending (table_sort_cycle), so the ghost is a prediction rather than
+// a decoration -- and it carries no digit, because a preview of a key that does
+// not exist yet has no precedence to name.
+//
+// The digit gets the SAME table_header_marks_fit gate the chevron gets
+// (table_header_layout's `fits`), for the same reason: table_header_label_col
+// clamps its reserve at `col.cells - 1`, so on a column where the marks' whole
+// run needs more cells than that, the reserve under-delivers and an
+// unconditional digit paints into the label -- the "smear below Date" bug
+// (Wyatt, live use, v0.34.0) in its digit-shaped form. The arrow keeps
+// drawing either way; it is what the clamped reserve does still cover, and
+// only the digit is narrow enough a hazard to need its own gate. Exactly how
+// narrow a column has to be to trip this is not stated here because it has
+// not been measured -- char_w comes from DirectWrite, not a fixed fraction of
+// px, so the crossing point is font- and DPI-dependent; the direction (a
+// narrower column is closer to losing the digit) is certain, the threshold is
+// not.
+table_sort_mark :: proc(doc: ^Document, col: Table_Col, char_w, px, right: f32, hover_col: int) -> (m: Table_Sort_Mark, ok: bool) {
+	if doc == nil {return {}, false}
+	s := &doc.table_sort
+	dg := table_sort_digits_shown(doc)
+	if k, is_key := table_sort_key(doc, col.c); is_key && table_sorted(doc) {
+		m.up = !s.keys[k].desc
+		if dg {m.rank = k + 1}
+	} else if col.c == hover_col {
+		m.ghost, m.up = true, true
+	} else {
+		return {}, false
+	}
+	m.arrow = table_sort_arrow_rect(col, px, right)
+	if m.rank > 0 && !table_header_marks_fit(col, char_w, px, dg) {
+		m.rank = 0
+	}
+	if m.rank > 0 {
+		m.digit_w = char_w
+		m.digit_x = m.arrow.x - table_mark_gap() - char_w
+		// The header's own text baseline, not a coordinate of the arrow's: the
+		// digit is text and sits where every other header label sits, not
+		// where the arrow's quads are vertically centred. Named here, on the
+		// mark, rather than left for the draw to supply, so the producer
+		// still names every one of the mark's coordinates and the draw still
+		// computes none of its own.
+		m.digit_y = table_header_baseline_y(px)
+	}
+	return m, true
+}
+
+// The header LABEL's own box: the column's cell with the MARKS' slot -- the arrow
+// and the chevron together -- taken off its right end. THE producer for where a
+// header name is truncated AND for how far a right-aligned one is nudged -- both,
+// because doing only the first is the bug this exists to fix in its other half.
 //
 // The arrow used to be drawn after the header text and on top of it, with the
 // label truncated to the FULL cell width, so any name that filled its column had
@@ -1841,23 +2471,175 @@ table_arrow_cells :: proc(char_w, px: f32) -> int {
 // which §10 pushes hard against the cell's right inner edge, precisely where the
 // arrow lives -- would sit under the arrow however short it was.
 //
-// RESERVED ON EVERY COLUMN, sorted or not, hovered or not. The alternative is to
-// reserve it only where an arrow is actually drawn, and that makes the header
-// label re-truncate as the pointer crosses it: text that changes under the mouse,
-// on the surface whose whole problem is that a click on it does something
-// surprising. Every column is sortable, so every column is a column the arrow can
-// appear in; paying the slot once, uniformly, keeps the header row still. The
-// cost is at most one or two characters of a header name, and only for a name
-// that already filled its column.
+// RESERVED ON EVERY COLUMN, sorted or not, hovered or not, and that now covers
+// the chevron as well as the arrow. The alternative is to reserve each slot only
+// where its mark is actually drawn, and that makes the header label re-truncate as
+// the pointer crosses it: text that changes under the mouse, on the surface whose
+// whole problem is that a click on it does something surprising. Every column is
+// sortable and every column has a menu, so every column is one both marks can
+// appear in; paying the slot once, uniformly, keeps the header row still. The cost
+// is at most a few characters of a header name, and only for a name that already
+// filled its column.
 //
 // x is unchanged, so table_cell_text_x still answers for the label; only the
 // width narrows.
-table_header_label_col :: proc(col: Table_Col, char_w, px: f32) -> Table_Col {
+table_header_label_col :: proc(col: Table_Col, char_w, px: f32, digit: bool) -> Table_Col {
 	lab := col
-	n := min(table_arrow_cells(char_w, px), max(0, col.cells - 1)) // never below one cell of name
+	n := min(table_header_marks_cells(char_w, px, digit), max(0, col.cells - 1)) // never below one cell of name
 	lab.cells = col.cells - n
 	lab.w = col.w - f32(n) * char_w
 	return lab
+}
+
+// --- ONE layout for the header cell, and its two hit regions ---------------
+//
+// The header cell used to have exactly one hit region and one gesture. It now has
+// two -- the cell body sorts, and a chevron opens the column's menu -- and
+// development-loop.md §4 names that transition: Shape B, *a correct, tested
+// function fed the wrong input, or its result read in the wrong space*, which
+// accounted for sixteen bugs in one session. CLAUDE.md's countermeasure is one
+// layout per widget, and this procedure is it: the draw, the press, the hover lift
+// and the pointer shape all read these rectangles and NONE of them re-derives
+// "where is the chevron" from col.x + col.w.
+//
+// A shared shape rather than a third ad-hoc struct. table_sort_arrow_rect already
+// answers in Table_Arrow and the tab strip has its own Tab_Rect; a third private
+// quadruple here would have made "which x/y/w/h am I holding" a question a reader
+// has to answer per call site.
+Table_Rect :: struct {
+	x, y, w, h: f32,
+}
+
+// `body` is the WHOLE visible cell and `chevron` sits inside it, rather than the
+// body being the cell with the chevron's slot cut out of it. Two rectangles that
+// tile the cell would leave the 10px of cell padding to the chevron's right in
+// neither one -- a dead strip, per column, on pixels that sort today. So they
+// OVERLAP and the precedence is stated once, here, rather than left to each
+// consumer: the chevron wins, and table_header_at tests it first.
+//
+// `chevron` is the drawn mark's own rectangle, not a padded target around it. A
+// click region larger than the mark would be "clickable where nothing is drawn" --
+// the mirror of the failure table_edge_at's comment was written about -- and the
+// large target for this command already exists: a right-click anywhere in the
+// cell, which is also the route that survives has_chev = false.
+Table_Header_Cell :: struct {
+	c:        int,
+	body:     Table_Rect, // the cell, clipped to what the gutter and the grid's right edge leave visible
+	chevron:  Table_Rect, // zero-size when suppressed
+	has_chev: bool,
+}
+
+Table_Header_Hit :: enum {
+	None,
+	Body,
+	Chevron,
+}
+
+// Every visible header cell's geometry, left to right.
+//
+// `hover_col` is the column the pointer is on (table_header_hover_col) or
+// TABLE_SORT_NONE. THE CHEVRON EXISTS ONLY THERE: §10 deleted the per-column rules
+// because they made "the grid louder than the data", and a chevron painted on
+// every column is that same chrome coming back through a different door.
+//
+// Both refusals below are about pixels that are covered rather than about widths:
+//
+//   - the STICKY GUTTER covers the left 56px (table_draw's gutter pass), so a
+//     chevron that would land under it is suppressed rather than drawn where the
+//     user cannot see it, and the body starts at the gutter's edge so the pixels
+//     the gutter covers cannot sort the column hiding behind them.
+//   - a column too NARROW to hold the marks' run plus one cell of its own name
+//     suppresses the chevron, because a mark drawn over the label is the "smear
+//     below Date" bug (Wyatt, live use, v0.34.0) in its other half. Say plainly
+//     what this one is worth: with TABLE_COL_MIN at 8 cells, no width the sampler
+//     produces or a drag can reach falls below it at the shipped font sizes, so it
+//     is a guard against a width some later caller lays out by hand, not a state a
+//     user meets. The gutter clause above is the one that fires in ordinary use.
+//
+// Right-click does NOT consult has_chev (main.odin routes it through
+// table_header_cell_at, which reads `body` alone), so a suppressed chevron never
+// makes the menu unreachable.
+table_header_layout :: proc(
+	doc: ^Document,
+	char_w, width, px: f32,
+	hover_col: int,
+	allocator := context.temp_allocator,
+) -> []Table_Header_Cell {
+	out := make([dynamic]Table_Header_Cell, 0, 16, allocator)
+	if doc == nil {return out[:]}
+	top := table_grid_top()
+	hh := table_header_h(px)
+	right := table_right(width)
+	gw := table_gutter_w()
+	cw := table_chev_w()
+	ch := table_chev_h()
+	// The marks' run is a cell wider while precedence digits are live, so the width
+	// this refuses at moves with them -- asked once, outside the loop, because it is
+	// a property of the document's sort and not of any column.
+	dg := table_sort_digits_shown(doc)
+	for col in table_cols_layout(doc, char_w, width) {
+		x0 := max(col.x, gw)
+		x1 := min(col.x + col.w, right)
+		hc := Table_Header_Cell {
+			c    = col.c,
+			body = {x = x0, y = top, w = max(0, x1 - x0), h = hh},
+		}
+		chx := table_header_marks_right(col, right) - cw
+		fits := table_header_marks_fit(col, char_w, px, dg)
+		if col.c == hover_col && fits && chx >= gw {
+			hc.has_chev = true
+			hc.chevron = {x = chx, y = top + f32(int((hh - ch) * 0.5)), w = cw, h = ch}
+		}
+		append(&out, hc)
+	}
+	return out[:]
+}
+
+table_rect_hit :: #force_inline proc(r: Table_Rect, mx, my: f32) -> bool {
+	return r.w > 0 && r.h > 0 && mx >= r.x && mx < r.x + r.w && my >= r.y && my < r.y + r.h
+}
+
+// The header cell under a point, from the LAYOUT's body rectangle -- the whole
+// cell, edge zone included, whether or not it has a chevron.
+//
+// THE producer for the right-click, which is the always-available route to a
+// column's menu, and it differs from table_header_col_at in exactly one way that
+// matters: it is clipped to the drawn band on both sides, so a press past the
+// grid's right edge (the vertical scrollbar's strip sits over the header band's y)
+// resolves to nothing rather than to the last column. `hover_col` is
+// TABLE_SORT_NONE because this question has nothing to do with the chevron; a
+// caller that passed a real column would get the same answer, since the chevron
+// never leaves its own body.
+table_header_cell_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (c: int, ok: bool) {
+	for hc in table_header_layout(doc, char_w, width, px, TABLE_SORT_NONE) {
+		if table_rect_hit(hc.body, mx, my) {return hc.c, true}
+	}
+	return 0, false
+}
+
+// The header cell under a point AND which of its two regions the point is in.
+//
+// THE producer for the left-button press and for the pointer shape, so the pixel
+// that shows a hand is the pixel that opens the menu, and the pixels that sort are
+// exactly the ones that lift. Both answers come out of table_header_layout above;
+// nothing here computes a coordinate of its own.
+//
+// Through table_header_hover_col, which is what makes the RESIZE EDGE win over
+// both regions: it refuses inside the ±4px zone, so this returns .None there and
+// the caller's edge branch has already claimed the press. The hovered column is
+// resolved from the point itself rather than passed in, because at a press the
+// column under the pointer IS the hovered one, and taking it as a parameter would
+// let a caller ask about a chevron on a column that has none.
+table_header_at :: proc(doc: ^Document, char_w, width, mx, my, px: f32) -> (c: int, hit: Table_Header_Hit) {
+	col, ok := table_header_hover_col(doc, char_w, width, mx, my, px)
+	if !ok {return 0, .None}
+	for hc in table_header_layout(doc, char_w, width, px, col) {
+		if hc.c != col {continue}
+		if hc.has_chev && table_rect_hit(hc.chevron, mx, my) {return col, .Chevron}
+		if table_rect_hit(hc.body, mx, my) {return col, .Body}
+		break
+	}
+	return 0, .None
 }
 
 // Compute the per-column widths AND alignments from the first TABLE_SAMPLE rows
@@ -2562,20 +3344,30 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 		// To cright, not to `right`: the header band is a band like the zebra's and
 		// stops where the table does. See table_cols_layout.
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {0, table_grid_top()}, size = {cright, table_header_h(px)}, color = g_theme[.Bg_Raised]}})
+		// The header's two hit regions, from the one producer. Read here for the
+		// hover lift and again below for the chevron; the press and the pointer
+		// shape read the same procedure through table_header_at, which is what
+		// makes the drawn mark and the clickable one the same rectangle.
+		hcells := table_header_layout(doc, char_w, width, px, hover_col)
 		// The HOVER LIFT, over the band and under the rule, the text and the arrow.
 		// Bg_Hover is §1.1's role for exactly this ("hover fill for any tab, menu
 		// row, settings row or palette row"), so a hovered header reads as the same
 		// kind of thing as every other hoverable row in the app -- which is the
 		// whole point: the reader has met this signal elsewhere. The cell rect is
-		// the layout's, so the lift covers precisely the pixels that sort.
+		// the layout's `body`, so the lift covers precisely the pixels that sort.
 		if hover_col != TABLE_SORT_NONE {
-			for col in cols {
-				if col.c != hover_col {continue}
-				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {col.x, table_grid_top()}, size = {min(col.w, cright - col.x), table_header_h(px)}, color = g_theme[.Bg_Hover]}})
+			for hc in hcells {
+				if hc.c != hover_col {continue}
+				plat.quads_draw(gfx, qp, []plat.Quad{{pos = {hc.body.x, hc.body.y}, size = {hc.body.w, hc.body.h}, color = g_theme[.Bg_Hover]}})
 				break
 			}
 		}
 		hy := table_header_baseline_y(px)
+		// Whether precedence digits are live, asked ONCE for the whole header pass:
+		// the label's reserved slot below and the mark producer further down have to
+		// agree about it column by column, and two calls could not disagree today but
+		// would be two places to change.
+		dgts := table_sort_digits_shown(doc)
 		for col in cols {
 			if col.c >= len(head) {continue}
 			field := head[col.c]
@@ -2586,12 +3378,17 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			// table_header_label_col -- the nudge below reads the same narrowed box,
 			// because a right-aligned header pushed to the cell's right inner edge
 			// would otherwise land under the arrow no matter how short it was.
-			lab := table_header_label_col(col, char_w, px)
+			lab := table_header_label_col(col, char_w, px, dgts)
 			fb := transmute([]u8)field
-			hcells := plat.text_cells(text, fb, 0, .Doc)
-			if hcells > lab.cells {
+			// fcells, not hcells: that name is already the layout slice above (the
+			// header's two hit regions), and this is an unrelated int -- the
+			// field's own width in cells -- thirty lines inside its loop. Same name
+			// as table_draw's row pass (:2781), which counts a cell's field the
+			// same way.
+			fcells := plat.text_cells(text, fb, 0, .Doc)
+			if fcells > lab.cells {
 				field = field[:plat.text_bytes_for_cells(text, fb, lab.cells, 0, .Doc)]
-				hcells = lab.cells
+				fcells = lab.cells
 			}
 			// The header takes its column's alignment, so a right-aligned numeric
 			// column reads as ONE column rather than as a left-aligned label with
@@ -2600,33 +3397,33 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			// the header is now a real header (§10) and the previous draw made no
 			// distinction at all: both branches of its `hl` resolved to
 			// Text_Primary, so the "highlighted" header row was a no-op.
-			hx := table_cell_text_x(lab) + table_cell_align_dx(lab, hcells, char_w)
+			hx := table_cell_text_x(lab) + table_cell_align_dx(lab, fcells, char_w)
 			plat.text_draw(gfx, text, field, hx, hy, px, g_theme[.Text_Bright], .Doc)
 		}
-		// §10's "click to sort with an accent arrow", and the DIMMED preview of it on
-		// a hovered column. Both through table_sort_arrow_rect, so the ghost lands in
-		// exactly the slot the solid arrow will occupy -- an affordance that moved
-		// once the click landed would be worse than none.
+		// §10's "click to sort with an accent arrow", the precedence digit beside it,
+		// and the DIMMED preview of the arrow on a hovered column. EVERY sorted
+		// column draws its own arrow, at ITS OWN key's direction.
 		//
-		// The sorted column wins where the two would coincide: hovering the column
-		// that is already sorted shows its real arrow at full strength rather than
-		// replacing it with a preview of itself. `up` is what the NEXT click
-		// produces on an unsorted column, which is ascending (table_sort_click), so
-		// the ghost is a prediction rather than a decoration.
+		// All three come out of table_sort_mark, which is the producer: this loop
+		// decides nothing about which columns are marked, which way an arrow points,
+		// or where either mark lands. The ghost lands in exactly the slot the solid
+		// arrow will occupy because it IS the same rectangle -- an affordance that
+		// moved once the click landed would be worse than none.
 		//
-		// Drawn after the header text either way. It no longer overlaps it -- the
-		// slot above is reserved -- but the ordering is free and a header whose name
-		// somehow reached the slot would still lose to the mark rather than hide it.
+		// Drawn after the header text. It no longer overlaps it -- the slot above is
+		// reserved, digit included -- but the ordering is free and a header whose
+		// name somehow reached the slot would lose to the mark rather than hide it.
 		{
-			sorted_col := doc.table_sort.col if table_sorted(doc) else TABLE_SORT_NONE
 			for col in cols {
-				dim := false
-				switch {
-				case col.c == sorted_col:
-				case col.c == hover_col:
-					dim = true
-				case:
-					continue
+				m, has := table_sort_mark(doc, col, char_w, px, right, hover_col)
+				if !has {continue}
+				colour := g_theme[.Accent]
+				if m.ghost {
+					// Straight alpha over whatever is behind it (quads.odin binds a
+					// SRC_ALPHA blend), so the ghost is the accent at reduced weight
+					// rather than a second colour role that would have to be added to
+					// every theme and kept in step with Accent by hand.
+					colour[3] *= TABLE_ARROW_GHOST_A
 				}
 				// Quads, not a glyph. The document face is the user's monospace font
 				// and nothing guarantees it has U+25B2/U+25BC -- a missing glyph is a
@@ -2634,20 +3431,40 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 				// sorted column indistinguishable from the others, which is the one
 				// thing this mark exists to prevent. Four stacked bars are a triangle
 				// at any font, any DPI and any theme.
-				a := table_sort_arrow_rect(col, px, right)
-				colour := g_theme[.Accent]
-				up := true
-				if dim {
-					// Straight alpha over whatever is behind it (quads.odin binds a
-					// SRC_ALPHA blend), so the ghost is the accent at reduced weight
-					// rather than a second colour role that would have to be added to
-					// every theme and kept in step with Accent by hand.
-					colour[3] *= TABLE_ARROW_GHOST_A
-				} else {
-					up = !doc.table_sort.desc
-				}
-				table_sort_arrow(gfx, qp, a, up, colour)
+				table_sort_arrow(gfx, qp, m.arrow, m.up, colour)
+				if m.rank == 0 {continue}
+				// The DIGIT is a glyph where the arrow is quads, and the difference is
+				// the guarantee rather than a preference: '1' and '2' are ASCII, which
+				// every face able to render a CSV at all can draw, while U+25B2 is
+				// not. What the arrow's comment forbids is depending on a glyph
+				// nothing guarantees -- not drawing text.
+				//
+				// One byte, formatted by hand rather than through tprintf, because
+				// this runs once per sorted visible column per frame; the #assert is
+				// what keeps that shortcut honest if the cap ever moves.
+				#assert(TABLE_SORT_KEYS_MAX <= 9)
+				d := [1]u8{'0' + u8(m.rank)}
+				// Accent, the arrow's own colour, and m.digit_y -- the header's own
+				// text baseline, named on the mark rather than read off `hy` here,
+				// so this draw computes no coordinate of its own either. The digit
+				// is part of the mark rather than a second annotation, and it sits
+				// on the line every other character in this band sits on.
+				plat.text_draw(gfx, text, string(d[:]), m.digit_x, m.digit_y, px, colour, .Doc)
 			}
+		}
+		// The menu chevron, on the hovered column only (table_header_layout decides
+		// which that is, and whether it fits). Drawn from `hc.chevron` with no
+		// arithmetic of its own -- the whole point of this task is that the drawn
+		// rectangle and the clickable one are the same numbers.
+		//
+		// Text_Muted rather than Accent: Accent is spoken for by the sort arrow
+		// immediately to its left, and two accent marks side by side would say the
+		// column was doing two things. The chevron is chrome that answers "there is
+		// more here", so it takes the quiet text role and lets the arrow keep the
+		// colour that carries meaning.
+		for hc in hcells {
+			if !hc.has_chev {continue}
+			table_chevron(gfx, qp, hc.chevron, g_theme[.Text_Muted])
 		}
 		// The gutter's cover strip, in the header band -- the same clip the row pass
 		// applies, for the same reason. A column scrolled part-way under the gutter
@@ -2757,6 +3574,28 @@ table_sort_arrow :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, a: Table_Arrow
 		k := f32(i if up else TABLE_ARROW_STEPS - 1 - i)
 		bw := a.w * (k + 1) / TABLE_ARROW_STEPS
 		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {a.x + (a.w - bw) * 0.5, a.y + f32(i) * h}, size = {bw, h}, color = col}})
+	}
+}
+
+// The menu chevron: two stacks of square bars stepping inward from each end of
+// the rect and meeting at the bottom middle -- a hollow "v".
+//
+// HOLLOW, where the sort arrow is solid, and that is the one thing this mark has
+// to get right: it is drawn a few pixels from a solid triangle that means
+// "descending", and a filled chevron would be a second solid triangle saying
+// something else entirely. Quads only, for the reason table_sort_arrow records.
+//
+// Takes the RECT whole, like table_sort_arrow, and derives the bar size from it
+// rather than calling table_chev_th() again -- so a rect that came from anywhere
+// but table_header_layout would draw a visibly wrong mark instead of a correct one
+// in the wrong place.
+@(private = "file")
+table_chevron :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, r: Table_Rect, col: [4]f32) {
+	th := max(hairline(), f32(int(r.w / f32(2 * TABLE_CHEV_STEPS - 1))))
+	for i in 0 ..< TABLE_CHEV_STEPS {
+		y := r.y + f32(i) * th
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {r.x + f32(i) * th, y}, size = {th, th}, color = col}})
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {r.x + r.w - th - f32(i) * th, y}, size = {th, th}, color = col}})
 	}
 }
 

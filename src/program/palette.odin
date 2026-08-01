@@ -118,7 +118,23 @@ command_in_palette :: proc(cmd: Command_Id) -> bool {
 	     .History_Close, .History_Next, .History_Prev, .History_Jump,
 	     // Filter_Open supersedes it here: same key, but it opens find first
 	     // instead of silently toggling a mode with no visible UI.
-	     .Find_Toggle_Filter:
+	     .Find_Toggle_Filter,
+	     // The header menu's six sort rows act on app.menu.ctx_col, the column
+	     // the menu was opened on -- the palette has no column to name, so
+	     // none of these can mean anything run from here. A real cost, taken
+	     // knowingly: multi-sort is not reachable from Ctrl+P.
+	     //
+	     // The same exclusion drops them from keys.txt's "commands with no
+	     // default editor key" listing, which loops over command_in_palette
+	     // (keymap.odin). That is the outcome we want, not a side effect worth
+	     // undoing: a user-bound chord would have no menu behind it, so it
+	     // would dispatch against whatever column the last context menu
+	     // happened to leave in ctx_col -- which is why command_from_name
+	     // (keymap.odin) separately refuses to bind one of these six at all,
+	     // via command_needs_menu_target (commands.odin). Excluding them here
+	     // only keeps them off the listing; closing the route is that check's job.
+	     .Table_Sort_Asc, .Table_Sort_Desc, .Table_Sort_Then_Asc, .Table_Sort_Then_Desc,
+	     .Table_Sort_Remove, .Table_Sort_Clear:
 		return false
 	}
 	return true

@@ -93,6 +93,22 @@ app_notice_active :: proc(a: ^App) -> bool {
 	return a.notice != "" && time.duration_seconds(time.tick_since(a.notice_started)) < NOTICE_SECONDS
 }
 
+// Whether the palette, the history panel or an open menu is painted OVER the
+// content this frame -- the same three flags main.odin's own click handling
+// already gates on, each in its own place: menu_hit_test claims the bar and
+// any dropdown, the palette block (:509) claims a click while app.palette.active,
+// the history block (:540) claims one while app.history.open. Anything else
+// that hit-tests content pixels -- the header's right-click gate is the first
+// -- needs the same refusal for the same reason: an overlay drawn over the
+// content means a coordinate in the content's space is being read from
+// underneath something else, not the content itself. One proc so a second
+// gate reads the definition rather than re-deriving it, and so a test can
+// assert against the exact predicate production uses instead of a copy that
+// can drift from it.
+app_content_overlay_active :: proc(a: ^App) -> bool {
+	return menu_is_active(a) || a.palette.active || a.history.open
+}
+
 // Swap the documents in two slots (tab reorder). Slot indices are referenced by
 // `active`, `mru` and the watcher (via each doc's gen), so those move with the
 // docs: active/mru are remapped here, and the watcher's gen check discards any

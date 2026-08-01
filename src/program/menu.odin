@@ -10,6 +10,7 @@
 // shipped editor with a palette also keeps a menu.
 package main
 
+import "core:fmt"
 import plat "src:platform"
 
 MENU_BAR_H_96 :: f32(30) // UI spec 2.1 (was 26)
@@ -116,6 +117,43 @@ is_enc_cp1252 :: proc(app: ^App) -> bool {d := app_active(app);return d != nil &
 is_eol_lf :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.eol == .LF}
 @(private = "file")
 is_eol_crlf :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.eol == .CRLF}
+
+// The header context menu's predicates. All of them read the target column off
+// app.menu.ctx_col rather than taking a parameter -- Menu_Item.enabled takes
+// only the app -- which is why this menu's rows are checked against a context
+// column and the bar's never are.
+//
+// Every one of them has to agree with command_dispatch's own `doc != nil &&
+// doc.table` guard on the six commands, or a row paints live and no-ops: the
+// divergence between what is drawn and what runs that Menu_Item.enabled exists
+// to prevent. table_sorted already carries the doc.table term itself (table.odin
+// documents why), so has_live_sort and can_then_by inherit the agreement;
+// in_table_view is what the two plain Sort rows and is_sort_key_col need,
+// because table_sort_key answers about the key vector alone and would say yes
+// on a document that has left the grid with keys still set.
+@(private = "file")
+in_table_view :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.table}
+
+@(private = "file")
+has_live_sort :: proc(app: ^App) -> bool {return table_sorted(app_active(app))}
+
+@(private = "file")
+is_sort_key_col :: proc(app: ^App) -> bool {
+	if !in_table_view(app) {return false}
+	_, ok := table_sort_key(app_active(app), app.menu.ctx_col)
+	return ok
+}
+
+// "Then by" needs a sort to add a tie-breaker TO, and then either this column
+// is already one of its keys (in which case table_sort_add flips its direction
+// in place, per its own comment) or there is still room to append a new one.
+@(private = "file")
+can_then_by :: proc(app: ^App) -> bool {
+	d := app_active(app)
+	if !table_sorted(d) {return false}
+	if _, ok := table_sort_key(d, app.menu.ctx_col); ok {return true}
+	return table_sort_can_add(d, app.menu.ctx_col)
+}
 
 @(private = "file")
 sep :: Menu_Item{}
@@ -258,6 +296,34 @@ menus := []Menu {
 	},
 }
 
+// The table header's context menu: its contents only. Nothing here opens it --
+// the gesture that does must go through menu_open_ctx, which is the only writer
+// of ctx_col and therefore the only thing that can aim these rows at a column.
+// menu_open_ctx is the OTHER caller of the dropdown machinery `menus` above
+// feeds, and its own
+// comment explains why this has to be a package-level slice rather than
+// something built per-open: a menu survives into the frame after the one that
+// opened it, and main.odin's free_all(context.temp_allocator) runs once every
+// frame, so a temp-allocated table would dangle by the time the next draw or
+// hit-test read it.
+//
+// Six rows, three pairs, matching table.odin's Table_Sort operations one for
+// one: table_sort_set (replace with a single key) for the first two,
+// table_sort_add (compose a tie-breaker, or flip an existing key's direction
+// in place) for "Then by", table_sort_drop for "Remove", table_sort_clear for
+// "Clear". Nothing here writes doc.table_sort itself -- every row calls one of
+// those four, which is the only thing allowed to.
+table_header_menu_items := []Menu_Item {
+	{cmd = .Table_Sort_Asc, enabled = in_table_view},
+	{cmd = .Table_Sort_Desc, enabled = in_table_view},
+	sep,
+	{cmd = .Table_Sort_Then_Asc, enabled = can_then_by},
+	{cmd = .Table_Sort_Then_Desc, enabled = can_then_by},
+	{cmd = .Table_Sort_Remove, enabled = is_sort_key_col},
+	sep,
+	{cmd = .Table_Sort_Clear, enabled = has_live_sort},
+}
+
 // Menu bar / dropdown state. `mode` is menu-bar keyboard mode with nothing open
 // (what a bare Alt tap gives you); `open` is the index of the open dropdown.
 Menu_State :: struct {
@@ -269,6 +335,23 @@ Menu_State :: struct {
 	// the last entries of the Edit menu could not be seen or selected at all.
 	top:  int,
 	rows: int, // rows drawn last frame; the hit-test must use the same count
+
+	// Context-menu mode: the same draw/hit-test/scroll machinery as the bar
+	// dropdown, anchored to a point instead of a bar title (a right-click on a
+	// table column header — Task 5). Kept as its own bool + slice rather than
+	// repurposing `open` as an index into ctx_items, because `open` also
+	// selects which bar title lights up in menu_draw, and a context menu has
+	// no bar title to light.
+	ctx:       bool,
+	ctx_items: []Menu_Item,
+	ctx_x:     f32, // anchor, top-left, before menu_dropdown_rect's edge clamp
+	ctx_y:     f32,
+	// The table column the context menu targets. Written by exactly two procs --
+	// menu_open_ctx sets it, menu_open_at clears it -- and read by the six
+	// Table_Sort commands in command_dispatch, which run AFTER the menu that
+	// picked them has been closed. That ordering is why menu_close must not
+	// clear it; see menu_close.
+	ctx_col:   int,
 }
 
 // Must be called before the first frame: the zero value of `open` is 0, which
@@ -280,15 +363,53 @@ menu_init :: proc(m: ^Menu_State) {
 	m.mode = false
 	m.top = 0
 	m.rows = 0
+	// Zero value (false/nil/0) is already "no context menu"; set explicitly so
+	// a reader doesn't have to re-derive that from Odin's zero-init rule.
+	m.ctx = false
+	m.ctx_items = nil
+	m.ctx_x = 0
+	m.ctx_y = 0
+	m.ctx_col = 0
 }
 
+// Deliberately does NOT clear ctx_col, and this is the whole of why: both routes
+// from a picked row to its command close the menu FIRST and dispatch second --
+// menu_hit_test evaluates item_enabled, calls this, and returns the command for
+// main.odin to dispatch; .Menu_Activate does the same in commands.odin because
+// the item may open the palette. Clearing here therefore aimed every one of the
+// six Table_Sort commands at column 0 while item_enabled had already greyed the
+// row for column N, which is exactly the draw-disagrees-with-effect divergence
+// Menu_Item.enabled exists to prevent.
+//
+// Leaving it set is safe because nothing can read a stale value: the predicates
+// and item_disabled_reason only run while a dropdown holding those rows is open,
+// menu_open_ctx overwrites it on every open, menu_open_at clears it, and the six
+// commands are reachable from no other route -- no bar row carries them, the
+// palette excludes them (palette.odin), and a hand-written keymap chord cannot
+// reach them either: command_from_name (keymap.odin) refuses any name for which
+// command_needs_menu_target (commands.odin) holds. That is true by construction,
+// not by the accident of nothing having bound one yet.
 menu_close :: proc(app: ^App) {
 	app.menu.mode = false
 	app.menu.open = -1
 	app.menu.item = -1
+	app.menu.ctx = false
+	app.menu.ctx_items = nil
 }
 
-menu_is_active :: proc(app: ^App) -> bool {return app.menu.mode || app.menu.open >= 0}
+// Covers `ctx` as well as the bar: without it, a click outside a context menu
+// would not be recognised as "dismiss", because the only other doorway to
+// dismissal (main.odin's alt_tapped toggle and the Ctx.Menu key-routing
+// branch) both gate on this proc, not on `open`.
+menu_is_active :: proc(app: ^App) -> bool {return app.menu.mode || app.menu.open >= 0 || app.menu.ctx}
+
+// Whether an open dropdown exists to draw or hit-test, bar or context.
+// Deliberately not the same question as menu_is_active: bare Alt-tap keyboard
+// mode (mode == true, open == -1, ctx == false) is "active" for key routing
+// but has no dropdown here, so reusing menu_is_active as this guard would
+// fall through to menus[-1] in menu_items.
+@(private = "file")
+menu_dropdown_active :: proc(app: ^App) -> bool {return app.menu.open >= 0 || app.menu.ctx}
 
 is_menu_cmd :: proc(c: Command_Id) -> bool {
 	#partial switch c {
@@ -333,10 +454,10 @@ menu_hover_update :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window) {
 // a position while a button is held (it exists for drag-select), so mouse_y is
 // wherever the last click landed and never moves during a plain hover.
 menu_hover_item :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window) {
-	if app.menu.open < 0 {return}
+	if !menu_dropdown_active(app) {return}
 	cx, cy := plat.window_cursor_client(win)
 	if r := menu_item_at(t, app, f32(cx), f32(cy), f32(win.width), f32(win.height)); r >= 0 {
-		if item_enabled(app, menus[app.menu.open].items[r]) {app.menu.item = r}
+		if item_enabled(app, menu_items(app)[r]) {app.menu.item = r}
 	}
 }
 
@@ -365,10 +486,10 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 		return .None, true
 	}
 
-	if app.menu.open >= 0 {
+	if menu_dropdown_active(app) {
 		picked := Command_Id.None
 		if idx := menu_item_at(t, app, mx, my, w, h); idx >= 0 {
-			it := menus[app.menu.open].items[idx]
+			it := menu_items(app)[idx]
 			if item_enabled(app, it) {picked = it.cmd}
 		}
 		// Any click while a dropdown is open is consumed, as native menus do —
@@ -423,6 +544,8 @@ command_disabled_hint :: proc(cmd: Command_Id) -> string {
 		return "Markdown files only"
 	case .Reopen_UTF8, .Reopen_UTF16LE, .Reopen_CP1252:
 		return "unsaved file"
+	case .Table_Sort_Then_Asc, .Table_Sort_Then_Desc:
+		return fmt.tprintf("%d-column sort limit", TABLE_SORT_KEYS_MAX)
 	}
 	return ""
 }
@@ -436,6 +559,17 @@ item_disabled_reason :: proc(app: ^App, it: Menu_Item) -> string {
 		if d != nil && d.kind == .Text && !doc_can_markdown(d) {return command_disabled_hint(it.cmd)}
 	case .Reopen_UTF8, .Reopen_UTF16LE, .Reopen_CP1252:
 		if d != nil && d.path == "" {return command_disabled_hint(it.cmd)}
+	case .Table_Sort_Then_Asc, .Table_Sort_Then_Desc:
+		// Only the AT-THE-CAP reason: a sort that isn't live yet needs no
+		// explanation for "there is nothing to add a tie-breaker to" -- the row
+		// being dead is its own explanation there. This is the one state that
+		// isn't, per the brief: two keys already live, neither of them this
+		// column, so the row reads as broken without saying why.
+		if table_sorted(d) {
+			if _, ok := table_sort_key(d, app.menu.ctx_col); !ok && !table_sort_can_add(d, app.menu.ctx_col) {
+				return command_disabled_hint(it.cmd)
+			}
+		}
 	}
 	return ""
 }
@@ -469,10 +603,64 @@ menu_step :: proc(app: ^App, mi, from, dir: int) -> int {
 }
 
 menu_open_at :: proc(app: ^App, mi: int) {
+	// A bar dropdown and the context menu must never both be "open" at once:
+	// menu_items and menu_origin test `ctx` before `open`, so leaving ctx set
+	// here left open==0 && ctx==true reachable -- commands.odin's Ctx.Menu
+	// keyboard routing calls this with `open < 0` as its only test, which is
+	// true for a context menu too (ctx never touches `open`), so a stray key
+	// while a context menu was up silently swapped it for File's dropdown
+	// while still reading ctx_items for the draw and hit-test. Clearing
+	// ctx_items and ctx_col alongside ctx matches menu_close, so no stale
+	// slice or column survives into the bar menu.
+	app.menu.ctx = false
+	app.menu.ctx_items = nil
+	app.menu.ctx_col = 0
 	app.menu.mode = true
 	app.menu.open = clamp(mi, 0, len(menus) - 1)
 	app.menu.item = menu_step(app, app.menu.open, 0, 1)
 	app.menu.top = 0 // the draw scrolls this to keep the highlight visible
+	app.menu.rows = 0
+}
+
+// Open a context menu at (x, y), the point the caller measured before
+// clamping — menu_dropdown_rect applies the window clamp when it draws, not
+// here. Two input paths reach it, both in main.odin's table block and both
+// carrying table_header_menu_items: a left click on the header's chevron
+// (table_header_at) and a right click anywhere in a header cell
+// (table_header_cell_at) -- NOT table_header_col_at, an older procedure that
+// answers a similar-sounding question but does not clip to the grid's right
+// edge, so a press past it resolves to the last column instead of to
+// nothing. The right-click path was written against table_header_cell_at
+// specifically to avoid that; see its own comment in table.odin.
+//
+// `items` is not copied, so the caller must pass a slice that outlives the
+// menu. main.odin's frame loop calls free_all(context.temp_allocator) once
+// per frame, and a menu by definition survives into the NEXT frame's draw
+// and hit-test -- so a slice built from context.temp_allocator and stored
+// here dangles the moment that free_all runs. The caller must pass a
+// package-level []Menu_Item (like `menus`) or one owned by App, never a
+// temp_allocator build. Menu_Item holds only a Command_Id and two procedure
+// pointers (no strings), so only the slice's backing store is at risk here,
+// not anything it points to.
+menu_open_ctx :: proc(app: ^App, items: []Menu_Item, x, y: f32, col: int) {
+	app.menu.mode = false
+	app.menu.open = -1
+	app.menu.ctx = true
+	app.menu.ctx_items = items
+	app.menu.ctx_x = x
+	app.menu.ctx_y = y
+	app.menu.ctx_col = col
+	// menu_step walks menus[mi].items by menu INDEX, which a context menu has
+	// none of — first-enabled found directly instead, same rule (skip
+	// separators and disabled rows) menu_step applies for the bar.
+	app.menu.item = -1
+	for it, i in items {
+		if item_enabled(app, it) {
+			app.menu.item = i
+			break
+		}
+	}
+	app.menu.top = 0
 	app.menu.rows = 0
 }
 
@@ -502,6 +690,30 @@ menu_title_at :: proc(t: ^plat.Text, mx: f32) -> int {
 		if mx >= x0 && mx < x1 {return i}
 	}
 	return -1
+}
+
+// The open dropdown's rows: a bar dropdown's own Menu.items, or ctx_items for
+// a context menu. Every draw/hit-test/scroll proc below reads through here
+// instead of indexing `menus` by the open index directly, so a context menu is
+// a second ANCHOR onto the same machinery rather than a second copy of it.
+// Callers must already know a dropdown is open (menu_dropdown_active) —
+// app.menu.open == -1 with ctx == false is not a valid index into `menus`.
+menu_items :: proc(app: ^App) -> []Menu_Item {
+	if app.menu.ctx {return app.menu.ctx_items}
+	return menus[app.menu.open].items
+}
+
+// Unclamped anchor of the open dropdown. A bar dropdown's x comes from its
+// title's rect (menu_title_rect, hence `t` — title width is glyph metrics,
+// not something this proc can know on its own); its y is always the row
+// below the bar. A context menu's anchor is whatever menu_open_ctx was given.
+// menu_dropdown_rect is what applies the window-edge clamp; this proc must
+// return the pre-clamp point, or a menu anchored near the edge would be
+// clamped once here and again there against a different reference width.
+menu_origin :: proc(t: ^plat.Text, app: ^App) -> (x0, y0: f32) {
+	if app.menu.ctx {return app.menu.ctx_x, app.menu.ctx_y}
+	x0, _ = menu_title_rect(t, app.menu.open)
+	return x0, TAB_STRIP_H + MENU_BAR_H
 }
 
 // --- drawing ---
@@ -543,16 +755,15 @@ menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^
 	if d := app_active(app); d != nil {on_settings = d.kind == .Settings}
 	plat.text_draw(gfx, t, "⚙", gx + (gw - gcw) * 0.5, base_y + sx(2), gpx, g_theme[.Success] if on_settings else g_theme[.Text_Primary])
 
-	if app.menu.open < 0 {return}
+	if !menu_dropdown_active(app) {return}
 	menu_draw_dropdown(gfx, qp, t, app, width, height)
 }
 
 @(private = "file")
 menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^App, width, height: f32) {
-	mi := app.menu.open
-	items := menus[mi].items
+	items := menu_items(app)
 	cw := plat.text_char_width(t, UI_PX)
-	y0 := TAB_STRIP_H + MENU_BAR_H
+	_, y0 := menu_origin(t, app)
 	// Same geometry the hit-test uses — see menu_dropdown_rect.
 	x0, dw, h := menu_dropdown_rect(t, app, width, height)
 
@@ -622,17 +833,26 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 // hit-test consume, so they cannot disagree — every seam bug found so far has
 // been a pair of expressions in two different procs.
 menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0, w, h: f32) {
-	if app.menu.open < 0 {return 0, 0, 0}
-	items := menus[app.menu.open].items
-	x0, _ = menu_title_rect(t, app.menu.open)
-	w = dropdown_w(t, app.menu.open)
-	y0 := TAB_STRIP_H + MENU_BAR_H
+	if !menu_dropdown_active(app) {return 0, 0, 0}
+	items := menu_items(app)
+	ox, oy := menu_origin(t, app)
+	w = dropdown_w(t, items)
 	for it in items {h += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
-	// Clamped to the window: a client-space quad cannot leave it, and items drawn
-	// outside would be invisible but still clickable. When it doesn't fit, the
-	// dropdown scrolls rather than truncating (see menu.top).
-	h = min(h, max(MENU_ITEM_H, height - y0 - sx(4)))
-	x0 = min(x0, max(0, width - w))
+	// Clamped to the window, but the two axes are not the same kind of clamp.
+	// x0 REPOSITIONS: an anchor too close to the right edge slides the whole
+	// dropdown left so it still fits. h only CAPS height from the origin down
+	// — an anchor near the bottom does not flip the dropdown upward or scroll
+	// it into view, it just shrinks toward one row, which floors at
+	// MENU_ITEM_H and is drawn mostly off the bottom edge (not a click hazard:
+	// menu_item_at requires my < height, so the hidden part is not
+	// clickable — this is a visibility bug, not a safety one). A flip-up is
+	// owed if a context-menu anchor is ever near the bottom; it is not
+	// implemented. Column headers (the intended caller) sit at the top of the
+	// grid, so today's only caller of ctx_x/ctx_y does not reach this case —
+	// that is why leaving it uncapped-vertically is acceptable, not why it is
+	// fixed.
+	h = min(h, max(MENU_ITEM_H, height - oy - sx(4)))
+	x0 = min(ox, max(0, width - w))
 	return
 }
 
@@ -646,9 +866,9 @@ item_h :: proc(it: Menu_Item) -> f32 {return MENU_ITEM_H if it.cmd != .None else
 // drawn against what is hit-testable — the pair disagreeing is the bug class
 // this codebase keeps producing.
 menu_visible_rows :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> int {
-	if app.menu.open < 0 {return 0}
+	if !menu_dropdown_active(app) {return 0}
 	_, _, h := menu_dropdown_rect(t, app, width, height)
-	return rows_fitting(menus[app.menu.open].items, app.menu.top, h)
+	return rows_fitting(menu_items(app), app.menu.top, h)
 }
 
 @(private = "file")
@@ -697,12 +917,13 @@ menu_scroll_to_item :: proc(app: ^App, items: []Menu_Item, h: f32) {
 // clicking into the document to dismiss a menu instead ran whatever command sat
 // at that height — Save, Reload or Exit among them.
 menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> int {
-	if app.menu.open < 0 {return -1}
+	if !menu_dropdown_active(app) {return -1}
 	x0, w, h := menu_dropdown_rect(t, app, width, height)
 	if mx < x0 || mx >= x0 + w {return -1}
-	y0 := TAB_STRIP_H + MENU_BAR_H + sx(1)
+	_, oy := menu_origin(t, app)
+	y0 := oy + sx(1)
 	if my < y0 || my >= y0 + h {return -1} // below a clipped dropdown is not a row
-	items := menus[app.menu.open].items
+	items := menu_items(app)
 	y := y0
 	// Starts at the scroll offset and stops at the same count the draw used, so
 	// a row is clickable exactly when it is visible.
@@ -719,20 +940,22 @@ menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> in
 
 // Not file-private: menutest asserts that every dropdown is wide enough for its
 // own widest row, which is the seam this sizing exists to hold.
-// Width of ONE menu's dropdown. UI spec 6: "widest label + check gutter + gap +
+// Width of ONE dropdown's rows. UI spec 6: "widest label + check gutter + gap +
 // widest accelerator + padding. Measure once on open; never a fixed width."
 //
-// Per menu, not across all of them. It used to take the widest row anywhere, so
-// every dropdown was as wide as the longest item in the whole menu bar -- File
-// inherited its width from View's longest row and looked padded for no reason.
+// Per dropdown, not across all of them. It used to take the widest row anywhere,
+// so every dropdown was as wide as the longest item in the whole menu bar --
+// File inherited its width from View's longest row and looked padded for no
+// reason. Takes the item slice rather than a menu index so a context menu's
+// ctx_items sizes the same way a bar menu's items do, through the one budget
+// rule below rather than a second one keyed off ctx.
 //
 // The trailing budget is the larger of the accelerator and the disabled reason,
 // because either can occupy that column.
-dropdown_w :: proc(t: ^plat.Text, mi: int) -> f32 {
+dropdown_w :: proc(t: ^plat.Text, items: []Menu_Item) -> f32 {
 	cw := plat.text_char_width(t, UI_PX)
 	widest := 0
-	if mi < 0 || mi >= len(menus) {return 0}
-	for it in menus[mi].items {
+	for it in items {
 		if it.cmd == .None {continue}
 		trailing := max(len(command_chord(it.cmd)), len(command_disabled_hint(it.cmd)))
 		if n := len(command_table[it.cmd].title) + trailing + 8; n > widest {widest = n}
