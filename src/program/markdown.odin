@@ -5,13 +5,16 @@
 // rendering walks source lines from a scroll offset and stops when the pane
 // fills, so a huge markdown file previews without parsing all of it.
 //
-// Line-based, deliberately: a block is classified from its own prefix and its
-// inline content is soft-wrapped to the pane. Consequences (v1): a paragraph's
-// hard line breaks show as breaks (adjacent lines are not joined), and a link
-// inside a TABLE cell is not clickable (see the .Table case in md_layout_build).
-// Emphasis, inline code and tables are no longer among them -- batch 17 loaded
-// real bold and italic body faces, put a rounded Md_Code_Bg box behind an inline
-// code span, and md_table_ensure aligns a table's columns across its rows.
+// Line-based CLASSIFICATION, deliberately: a block's kind comes from its own
+// prefix (md_classify is pure -- one line in, one class out, no lookback) and its
+// inline content is soft-wrapped to the pane. A block's EXTENT is not line-based:
+// md_para_bounds joins a run of prose lines into one CommonMark paragraph and
+// absorbs an unmarked line into the list item or blockquote above it. Two
+// consequences this header used to list are gone with it -- adjacent lines ARE
+// joined now, and a link inside a TABLE cell is clickable again since the cells
+// went through the shaper. Emphasis, inline code and tables went the same way in
+// batch 17: real bold and italic body faces, a rounded Md_Code_Bg box behind an
+// inline code span, and md_table_ensure aligning a table's columns across rows.
 package main
 
 import "core:fmt"
@@ -796,8 +799,35 @@ md_is_para_line :: proc(line: string) -> bool {
 	return md_classify(line, trimmed, false).kind == .Para
 }
 
-// The contiguous run of paragraph lines containing `p`. Scans backward to the
-// run's true start and forward to its end, both bounded by md_para_budget.
+// Is this a line a LAZY CONTINUATION may hang off -- a list item or a
+// blockquote?
+//
+// CommonMark's rule: an unmarked prose line directly below a list item or a
+// blockquote continues THAT block, inheriting its marker and its indent, rather
+// than opening a paragraph of its own. Nothing else on md_classify's list
+// continues that way -- a heading, a rule and a table row are each finished at
+// their own line's end -- so this is deliberately two kinds and not "everything
+// that is not .Para".
+//
+// Asks md_classify, for the same single-definition reason md_is_para_line does:
+// what counts as a list item is md_list's business and what counts as a quote is
+// md_quote_depth's, and neither is re-tested here. md_classify itself stays PURE
+// -- one line in, one class out -- which is why the predecessor dependency this
+// procedure serves lives in md_para_bounds, the layer that was already looking
+// backward, and not in the classifier.
+//
+// `in_fence` is false here for the same reason it is in md_is_para_line; see
+// md_para_bounds' fence contract, which covers this procedure too.
+@(private = "file")
+md_is_continuable :: proc(line: string) -> bool {
+	trimmed := strings.trim_left(line, " \t")
+	k := md_classify(line, trimmed, false).kind
+	return k == .List || k == .Quote
+}
+
+// The contiguous run of paragraph lines containing `p`, PLUS the list item or
+// blockquote it lazily continues, if there is one. Scans backward to the run's
+// true start and forward to its end, both bounded by md_para_budget.
 //
 // THE SINGLE PRODUCER of a paragraph's extent. It exists because a joined
 // paragraph STARTS ABOVE ITS OWN LINE, which makes it the third construct with
@@ -805,8 +835,8 @@ md_is_para_line :: proc(line: string) -> bool {
 // and unlike those it occurs in every document. TWO production sites ask where
 // the block containing byte B starts, and they must never disagree:
 //
-//   * md_layout_build's `.Para` case, which joins the run this names into one
-//     block;
+//   * md_join_run, called from md_layout_build's `.Para`, `.List` and `.Quote`
+//     cases, which joins the run this names into one block;
 //   * md_block_start_at, which snaps an arbitrary byte back to that same start
 //     before any resolver may hand it to a walk as a block key.
 //
@@ -817,12 +847,12 @@ md_is_para_line :: proc(line: string) -> bool {
 //
 // Fence contract: md_is_para_line takes no `in_fence` parameter, unlike
 // md_classify underneath it, and the two sites reach here differently.
-// md_layout_build's `.Para` case runs off `e.cls = md_classify(e.src, trimmed,
-// in_fence)`, and while `in_fence` is true md_classify returns `.Fence_Close`
-// on a fence line and `.Fence_Body` on every other line, never `.Para`
-// (`.Fence_Open` is returned only when `in_fence` is FALSE, on the line that
-// opens one -- it cannot occur while already inside a fence). So that caller is
-// structurally unreachable inside a fence.
+// md_join_run is only reached from a switch on `e.cls = md_classify(e.src,
+// trimmed, in_fence)`, and while `in_fence` is true md_classify returns
+// `.Fence_Close` on a fence line and `.Fence_Body` on every other line -- never
+// `.Para`, `.List` or `.Quote` (`.Fence_Open` is returned only when `in_fence` is
+// FALSE, on the line that opens one -- it cannot occur while already inside a
+// fence). So that caller is structurally unreachable inside a fence.
 //
 // md_block_start_at is NOT. It snaps a raw byte and holds no fence state, so it
 // does run this over fence-body lines that read as prose. That is safe, not
@@ -830,6 +860,43 @@ md_is_para_line :: proc(line: string) -> bool {
 // start it returns IS a block start, and md_is_para_line is false for both
 // delimiters, so the backward scan cannot cross out of the fence it started in
 // (or into one from below). The overshoot costs run-up, never correctness.
+//
+// The OWNER lookup below inherits that contract unchanged. Inside a fence a body
+// line reading `- x` classifies as `.List`, so this can name it the owner of the
+// prose line beneath it and answer that line's start -- still a fence body line
+// start, still a real block start inside a fence, still an overshoot bounded by
+// the delimiters md_is_para_line refuses. And the JOIN side cannot reach it at
+// all: md_layout_build's `.List` / `.Quote` cases are only entered when
+// md_classify returned those kinds, which it never does while `in_fence`.
+//
+// LAZY CONTINUATION, and why it is here rather than in md_classify. A wrapped
+// list item's second line carries no bullet and a wrapped blockquote's carries no
+// `>`, so md_classify -- one line in, one class out, no lookback, and it stays
+// that way -- calls both `.Para`. CommonMark says such a line continues the block
+// above it. That is the one place in this file where a block's KIND depends on its
+// predecessor, and it is expressed as an EXTENT here instead: the run absorbs the
+// owner's own line, so the block a walk builds at the resulting `start` is entered
+// on the marker line and md_classify gives it the right kind, level and bullet
+// with no inheritance step at all. Consequently nothing needs an `owner` return
+// value: md_block_start_at wants only `start`, and md_layout_build reads the kind
+// off the line it was entered at.
+//
+// TWO ENTRIES, ONE ANSWER. A continued block can be entered on the owner's line
+// or on any of its continuation lines, and both must produce the same triple or
+// md_para_run's window memo (which answers for line starts it has never been
+// asked about) serves a different block to different scroll positions:
+//
+//   * entered on a CONTINUATION line, the backward scan stops under the owner
+//     (md_is_para_line refuses it), and the lookup after the scans reads the line
+//     above the settled `start` -- a pure function of `start`, not of `p` -- and
+//     extends `start` over it when it is continuable;
+//   * entered on the OWNER's line, there is no backward scan (a marker line is a
+//     block start in its own right); the run is seeded with the prose line
+//     directly below and the forward scan continues from there.
+//
+// Both count the owner in `total_lines` and both include its bytes in
+// `end - start`, so the two final, entry-independent cap checks see the same
+// numbers from either entry.
 //
 // The three traps are md_table_bounds', in the same order, and each shipped once:
 //   1. Both bounds measured from the ENTRY POINT `p`, never from the moving
@@ -846,7 +913,6 @@ md_is_para_line :: proc(line: string) -> bool {
 md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: bool) {
 	buf: [RENDER_LINE_CAP]u8
 	line, lend, entry_capped := md_line_at(doc, p, buf[:])
-	if !md_is_para_line(line) {return 0, 0, false, false}
 	start, end = p, lend
 
 	// A `p` that is not a real line start cannot establish the run's start, so
@@ -857,8 +923,31 @@ md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: 
 	entry_is_line_start := entry_line_start_exact && entry_line_start == p
 
 	trunc_back, trunc_fwd := !entry_is_line_start, entry_capped
-	q := p
-	back_lines := 0
+	// 0 or 1: the owner line -- the list item or blockquote this run continues.
+	// Counted in `total_lines` and covered by `end - start` from BOTH entries, see
+	// "TWO ENTRIES, ONE ANSWER" above.
+	owner_lines := 0
+	back_lines, fwd_lines := 0, 0
+	q, r := p, lend
+
+	if !md_is_para_line(line) {
+		// THE OWNER ENTRY. A marker line is a run only when an unmarked prose line
+		// hangs off it; a list item that wraps nothing is an ordinary one-line block
+		// and must stay one, so this returns `ok = false` and md_layout_build's
+		// `.List` case joins nothing.
+		if !md_is_continuable(line) {return 0, 0, false, false}
+		ns := lend + 1
+		if ns > doc.pt.length {return 0, 0, false, false}
+		nl, ne, ne_capped := md_line_at(doc, ns, buf[:])
+		if !md_is_para_line(nl) {return 0, 0, false, false}
+		if ne_capped {trunc_fwd = true}
+		owner_lines = 1
+		end, r = ne, ne
+		// No backward scan from here: the marker line IS the block's start, and
+		// nothing above it can be part of this block.
+		q = 0
+	}
+
 	for q > 0 {
 		if p - q > md_para_budget {trunc_back = true;break}
 		ps, exact := base.pt_line_start_cap(&doc.pt, q - 1, RENDER_LINE_CAP)
@@ -872,8 +961,6 @@ md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: 
 		if back_lines > md_para_max_lines {trunc_back = true;break}
 	}
 
-	r := lend
-	fwd_lines := 0
 	for r < doc.pt.length {
 		if r - p > md_para_budget {trunc_fwd = true;break}
 		ns := r + 1
@@ -887,12 +974,41 @@ md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: 
 		if fwd_lines > md_para_max_lines {trunc_fwd = true;break}
 	}
 
+	// THE OWNER LOOKUP, for the continuation entry. Reads the line above the
+	// SETTLED `start`, never above `p` -- the same discipline as trap 1, and the
+	// reason this sits after the scans rather than inside the backward loop's
+	// break: it is then a pure function of the run's start, which every entry into
+	// the run agrees on, so every entry finds the same owner (or none).
+	//
+	// `ol_capped` is NOT redundant with the backward loop's own `pl_capped`. That
+	// check sits BELOW the loop's `!md_is_para_line` break, so the one line the loop
+	// never applies it to is precisely the line that stopped it -- this one. Without
+	// it, an owner longer than RENDER_LINE_CAP would be absorbed here uncapped while
+	// the same block entered on that owner reads back `entry_capped` and reports
+	// capped: two answers for one block, which is the whole failure this procedure
+	// is built to make impossible.
+	if owner_lines == 0 && start > 0 {
+		owner_ls, exact := base.pt_line_start_cap(&doc.pt, start - 1, RENDER_LINE_CAP)
+		if !exact {
+			// No line start within the scan cap, so whether an owner is up there
+			// cannot be established at all. Refuse rather than guess.
+			trunc_back = true
+		} else {
+			ol, _, ol_capped := md_line_at(doc, owner_ls, buf[:])
+			if md_is_continuable(ol) {
+				if ol_capped {trunc_back = true}
+				owner_lines = 1
+				start = owner_ls
+			}
+		}
+	}
+
 	// The line-count analogue of trap 3: if neither direction's cap tripped, both
-	// scans reached the run's true edges, so back+fwd+1 IS the run's real line
+	// scans reached the run's true edges, so back+fwd+owner+1 IS the run's real line
 	// count and must be checked too. Without it a 6000-line run with a 4096 cap
 	// reports capped when entered near either edge and NOT when entered near the
 	// middle -- the identical flip, one level down.
-	total_lines := back_lines + fwd_lines + 1
+	total_lines := back_lines + fwd_lines + owner_lines + 1
 	capped = trunc_back || trunc_fwd || (end - start) > md_para_budget || total_lines > md_para_max_lines
 	return start, end, capped, true
 }
@@ -931,13 +1047,14 @@ Md_Para_Cache :: struct {
 	joinable:  bool, // lo/hi ARE the run's true bounds; false = capped, no bounds
 }
 
-// THE production question: is there a JOINABLE paragraph run containing `p`, and
-// where does it begin and end? Memoised over md_para_bounds.
+// THE production question: is there a JOINABLE run containing `p` -- a paragraph
+// run, or one lazily continuing the list item or blockquote above it -- and where
+// does it begin and end? Memoised over md_para_bounds.
 //
 // Two things happen here, and both are the point.
 //
 // 1. The `capped` decision is made ONCE, here, instead of at two call sites that
-//    have to keep agreeing. md_layout_build's `.Para` case and md_block_start_at
+//    have to keep agreeing. md_join_run and md_block_start_at
 //    both refuse a capped run -- the join because a truncated run's bounds are
 //    not the run's, the snap because it must land where the join will start --
 //    and a review found each of them justifying the rule by the other's failure.
@@ -2534,13 +2651,15 @@ Md_Layout :: struct {
 	end:         int, // what the pass reports as `bottom` after this block
 	next:        int, // where the pass continues from
 	cls:         Md_Class, // .content / .bullet slice into `src`
-	// OWNED, .Para-family only: the joined text of a multi-line block, which
-	// `cls.content` then slices. A single-line block leaves this nil and
-	// `cls.content` slices `src` as it always did.
+	// OWNED: the joined text of a multi-line block, which `cls.content` then
+	// slices. Set by the three kinds md_join_run serves -- .Para, .List, .Quote --
+	// and by nothing else. A single-line block leaves this nil and `cls.content`
+	// slices `src` as it always did.
 	joined:      string,
-	// Did this block read bytes past its own first line? Today exactly one
-	// construct sets it: a joined paragraph run. A list/quote continuation and a
-	// setext underline are the same shape and are later tasks in this batch.
+	// Did this block read bytes past its own first line? Today one MECHANISM sets
+	// it -- md_join_run -- for a joined paragraph run and for a list item or
+	// blockquote continued lazily across an unmarked line. A setext underline is
+	// the same shape and is a later task in this batch.
 	//
 	// THIS, not the kind, is what makes a block externally dependent: the block's
 	// own first line cannot witness an edit to the lines it absorbed, so caching
@@ -2586,11 +2705,14 @@ Md_Layout :: struct {
 // doc.revision as part of their key, since their own text cannot witness the
 // change. See MD_LAYOUT_SLOTS.
 //
-// Takes the LAYOUT, not the kind: `multiline` is set by any block that absorbed
-// lines below its first, which today means a joined paragraph. The kind stops
-// being sufficient the moment a setext heading lands -- a `.Heading` that read
-// the line below it -- and that is the anticipated case this signature is shaped
-// for, not one the tree already has. See Md_Layout.multiline.
+// Takes the LAYOUT, not the kind, and lazy continuation is why that is no longer
+// only an anticipation: `multiline` is set by any block that absorbed lines below
+// its first, which today means a joined paragraph run OR a list item or
+// blockquote continued across an unmarked line. Those two are `.List` and
+// `.Quote` blocks that are extern-dep when they wrapped and are not when they did
+// not, so the KIND cannot answer for them at all -- and the same is true one step
+// further out for a setext heading, a `.Heading` that read the line below it,
+// which this signature was originally shaped for. See Md_Layout.multiline.
 @(private = "file")
 md_layout_extern_dep :: #force_inline proc(e: ^Md_Layout) -> bool {
 	return e.cls.kind == .Table || e.cls.kind == .Blank || e.cls.kind == .Front_Matter || e.multiline
@@ -2702,6 +2824,98 @@ md_split_bare_links :: proc(out: ^[dynamic]Md_Draft_Span, d: Md_Draft_Span, text
 	}
 }
 
+// Absorb the run beginning at this block's own line into `e`, if there is one.
+//
+// THE SINGLE JOIN. Three cases call it -- `.Para`, `.List` and `.Quote` -- and
+// none of them has a loop of its own, because "which lines are one block" and
+// "what text do they make" are the two halves of one answer and were never going
+// to survive being written three times. What differs between the three is only
+// what md_classify already put in `e.cls`: a paragraph's own line contributes the
+// whole line, a list item's contributes the text after its bullet, a quote's the
+// text after its `>`. `first` is that text, and it is the caller's `e.cls.content`
+// -- which for `.Para` IS the whole line, so this changed nothing about the
+// paragraph join when the two other kinds were added to it.
+//
+// Bounds come from md_para_run -- md_para_bounds behind a memo -- and from
+// nowhere else; see md_para_bounds' comment for why a second producer here would
+// be entry-dependent.
+//
+// A CAPPED run is refused, and that refusal lives inside md_para_run (`ok` is
+// false for one) rather than as a `!capped` test here. It is there so that this
+// and md_block_start_at cannot get out of step about which runs join: the snap has
+// to land on the byte this treats as the block's start, and two separate readings
+// of the same flag are two things to keep matching. The cost of refusing is that a
+// run past 4096 lines or 256 KB renders unjoined, one block per line, exactly as
+// it did before the join existed -- and such a paragraph is already pathological.
+//
+// It is NOT refused to prevent a re-draw. That was this comment's claim until a
+// 2026-08-01 review measured it with the `!capped` test removed and `ps == p`
+// kept: block 1 spans 0..203 with next=204, block 2 spans 204..237 -- zero
+// duplication, because `ps != p` refuses block 2 before its bounds are ever used.
+// The two guards are individually sufficient against a re-draw, and each was being
+// credited here with the other's work.
+//
+// `ps == p` is therefore load-bearing in its own right, not only "defence in
+// depth": it is what stops a block from claiming to start at `p` while holding
+// text from `ps` -- the regression md_block_start_at exists to remove, in which
+// the preview drew from line 0 while the editor sat at line 100. With the snap in
+// place it never fires in production (mdtest is green with it removed);
+// mdjointest's mid-run rows drive it directly.
+@(private = "file")
+md_join_run :: proc(doc: ^Document, e: ^Md_Layout, p, line_end: int, buf: []u8) {
+	ps, pe, pok := md_para_run(doc, p)
+	if !pok || ps != p || pe <= line_end {return}
+	sb := strings.builder_make(context.temp_allocator)
+	q := ps
+	head := true
+	// prev_hard: whether the line just written into sb ended with a hard-break
+	// marker. CommonMark: a line ending in two or more spaces, or in a backslash,
+	// ends with a hard break. The break belongs to the line that carries the
+	// marker, so it is written before the NEXT line's text -- never after the
+	// current line -- or the run's last line would gain a stray trailing break it
+	// never asked for.
+	prev_hard := false
+	for q <= pe {
+		l, le, _ := md_line_at(doc, q, buf)
+		// A hard break becomes a real newline instead of a space. The shaper already
+		// breaks on '\n' (platform/shape.odin:287) and handles two in a row
+		// (shape.odin:404-409), so this is the whole implementation. The marker is
+		// read off the RAW line even on the first iteration, where the TEXT comes
+		// from `first` instead: a list item's content has already had its bullet
+		// stripped, but the trailing spaces that make the break are still on the line
+		// as read.
+		//
+		// `has_suffix(l, "  ")` is TWO spaces, not one, and that is CommonMark, not a
+		// rounding of it: one trailing space is ordinary insignificant whitespace and
+		// must join as a space like any other line break. A tab does not count either
+		// -- the spec says spaces.
+		raw := strings.trim_right(l, " \t")
+		hard := strings.has_suffix(l, "  ") || strings.has_suffix(raw, "\\")
+		text := raw
+		if head {
+			text = strings.trim_right(e.cls.content, " \t")
+		} else {
+			// A continuation line's own leading indent is markup, not content: a
+			// wrapped list item is conventionally written indented under its bullet,
+			// and CommonMark strips that indent when the line is folded into the
+			// block above. Without this, "- item\n  more" joins as "item   more".
+			text = strings.trim_left(text, " \t")
+		}
+		if strings.has_suffix(text, "\\") {text = text[:len(text) - 1]}
+		if strings.builder_len(sb) > 0 {
+			strings.write_byte(&sb, '\n' if prev_hard else ' ')
+		}
+		strings.write_string(&sb, text)
+		prev_hard = hard
+		head = false
+		q = le + 1
+	}
+	e.joined = strings.clone(strings.to_string(sb))
+	e.cls.content = e.joined
+	e.end, e.next = pe, pe + 1
+	e.multiline = true
+}
+
 // Lay one block out: classify it, turn it into spans, shape them and produce
 // its height and its span boxes. Allocates into the ordinary allocator; the
 // cache owns the result.
@@ -2763,14 +2977,16 @@ md_layout_build :: proc(
 	// separator row -- which drafts no spans at all -- is one row of the TABLE face
 	// tall rather than one row of Georgia.
 	fallback_set := plat.Font_Set.Body
-	// ONE line scratch for the two cases that read lines below their own (.Blank's
-	// run collapse and .Para's join), rather than one apiece. Both used to declare
-	// their own [RENDER_LINE_CAP]u8 inside the switch -- 16 KB of frame on a
-	// procedure the walk calls once per block. Nothing here outlives the case that
-	// fills it: .Blank only measures, and .Para copies each line into the builder
-	// before reading the next, so there is no slice of this left alive to alias.
-	// (`line` and `e.src` are the caller's buffer and an owned clone of it; neither
-	// points here.)
+	// ONE line scratch for every case that reads lines below its own -- .Blank's run
+	// collapse, and the .Para / .List / .Quote join, which is handed this slice
+	// rather than declaring a buffer in its own frame. They used to declare their
+	// own [RENDER_LINE_CAP]u8 inside the switch -- 16 KB of frame on a procedure the
+	// walk calls once per block. Nothing here outlives the case that fills it:
+	// .Blank only measures, and md_join_run copies each line into the builder before
+	// reading the next, so there is no slice of this left alive to alias. (`line`
+	// and `e.src` are the caller's buffer and an owned clone of it; neither points
+	// here -- which is also why md_join_run may read `e.cls.content` while writing
+	// through this buffer.)
 	buf: [RENDER_LINE_CAP]u8
 
 	switch e.cls.kind {
@@ -2860,6 +3076,14 @@ md_layout_build :: proc(
 		base_col = g_theme[.Md_Quote]
 		e.indent = f32(e.cls.level) * m.quote_inset
 		e.above, e.below = m.quote_above, m.quote_below
+		// A lazily continued quote: the unmarked prose lines below this one carry
+		// no `>` and md_classify calls each of them `.Para`, but CommonMark says
+		// they are this quote. The kind, the level and so the INDENT and the bar
+		// count are this line's own, taken from md_classify above and untouched by
+		// the join -- which is the point of expressing the continuation as an
+		// EXTENT rather than as a kind a continuation line inherits. Nothing here
+		// re-derives them.
+		md_join_run(doc, &e, p, line_end, buf[:])
 	case .List:
 		e.indent = f32(e.cls.level) * m.list_indent
 		// The bullet / checkbox sits at the item's nesting depth; the PROSE is
@@ -2873,72 +3097,24 @@ md_layout_build :: proc(
 			e.indent += m.list_indent
 		}
 		if e.cls.task_done {base_col, mute = md_task_prose_style(true)}
+		// A lazily continued list item, on exactly the same terms as .Quote above:
+		// `indent`, `marker`, `bullet` and the task box are all this line's own and
+		// the join only lengthens the text they sit beside. This is what puts a
+		// wrapped item's second line under the first instead of at indent 0 as a
+		// stray paragraph.
+		//
+		// The task checkbox is unaffected by where this call sits: `cls.task` and
+		// `cls.task_done` were decided by md_classify, above the switch, off the
+		// marker line's own content. md_join_run rewrites `cls.content` and nothing
+		// else, so a `[x]` in a continuation line cannot become a checkbox.
+		md_join_run(doc, &e, p, line_end, buf[:])
 	case .Para:
 		e.below = m.para_below
 		// Join the run. CommonMark's paragraph model: consecutive prose lines are
 		// ONE paragraph, re-flowed to the pane, with a space at each break -- which
 		// is also the fix for "the preview does not always respect spaces", since
 		// the space at the join is the one that was missing (there was no join).
-		//
-		// Bounds come from md_para_run -- md_para_bounds behind a memo -- and from
-		// nowhere else; see md_para_bounds' comment for why a second producer here
-		// would be entry-dependent.
-		//
-		// A CAPPED run is refused, and that refusal now lives inside md_para_run
-		// (`ok` is false for one) rather than as a `!capped` test here. It is there
-		// so that this case and md_block_start_at cannot get out of step about which
-		// runs join: the snap has to land on the byte this case will treat as the
-		// block's start, and two separate readings of the same flag are two things
-		// to keep matching. The cost of refusing is that a run past 4096 lines or
-		// 256 KB renders unjoined, one block per line, exactly as it did before the
-		// join existed -- and such a paragraph is already pathological.
-		//
-		// It is NOT refused to prevent a re-draw. That was this comment's claim
-		// until a 2026-08-01 review measured it with the `!capped` test removed and
-		// `ps == p` kept: block 1 spans 0..203 with next=204, block 2 spans 204..237
-		// -- zero duplication, because `ps != p` refuses block 2 before its bounds
-		// are ever used. The two guards are individually sufficient against a
-		// re-draw, and each was being credited here with the other's work.
-		//
-		// `ps == p` is therefore load-bearing in its own right, not only "defence in
-		// depth": it is what stops a block from claiming to start at `p` while
-		// holding text from `ps` -- the regression md_block_start_at exists to
-		// remove, in which the preview drew from line 0 while the editor sat at line
-		// 100. With the snap in place it never fires in production (mdtest is green
-		// with it removed); mdjointest's mid-run rows drive it directly.
-		if ps, pe, pok := md_para_run(doc, p); pok && ps == p && pe > line_end {
-			sb := strings.builder_make(context.temp_allocator)
-			q := ps
-			// prev_hard: whether the line just written into sb ended with a
-			// hard-break marker. CommonMark: a line ending in two or more spaces,
-			// or in a backslash, ends with a hard break. The break belongs to the
-			// line that carries the marker, so it is written before the NEXT
-			// line's text -- never after the current line -- or the paragraph's
-			// last line would gain a stray trailing break it never asked for.
-			prev_hard := false
-			for q <= pe {
-				l, le, _ := md_line_at(doc, q, buf[:])
-				// A hard break becomes a real newline instead of a space. The shaper
-				// already breaks on '\n' (platform/shape.odin:287) and handles two
-				// in a row (shape.odin:404-409), so this is the whole implementation.
-				// Trailing whitespace is stripped either way -- it is markup, not
-				// content -- and a trailing backslash is stripped from the emitted
-				// text too.
-				raw := strings.trim_right(l, " \t")
-				hard := strings.has_suffix(l, "  ") || strings.has_suffix(raw, "\\")
-				if strings.has_suffix(raw, "\\") {raw = raw[:len(raw) - 1]}
-				if strings.builder_len(sb) > 0 {
-					strings.write_byte(&sb, '\n' if prev_hard else ' ')
-				}
-				strings.write_string(&sb, raw)
-				prev_hard = hard
-				q = le + 1
-			}
-			e.joined = strings.clone(strings.to_string(sb))
-			e.cls.content = e.joined
-			e.end, e.next = pe, pe + 1
-			e.multiline = true
-		}
+		md_join_run(doc, &e, p, line_end, buf[:])
 	case .Front_Matter:
 	}
 
@@ -3883,11 +4059,15 @@ md_line_start_back :: proc(doc: ^Document, p, k: int) -> int {
 //
 // Three constructs start above their own first line. This handles two:
 //
-//   * a PARAGRAPH run. md_para_run produces it and nothing else does, and only
-//     when that run is JOINABLE -- a capped run comes back `ok = false` and this
-//     falls through to the line start. The refusal is not repeated here: it lives
-//     inside md_para_run precisely so this and md_layout_build's `.Para` case
-//     cannot get out of step about which runs are one block.
+//   * a PARAGRAPH run, INCLUDING the list item or blockquote it lazily continues.
+//     md_para_run produces it and nothing else does, and only when that run is
+//     JOINABLE -- a capped run comes back `ok = false` and this falls through to
+//     the line start. The refusal is not repeated here: it lives inside
+//     md_para_run precisely so this and md_join_run cannot get out of step about
+//     which runs are one block. The continuation case is why the count in the line
+//     above is unchanged at three rather than four: a wrapped list item is the
+//     SAME construct as a wrapped paragraph, one produced by one procedure, and
+//     the only thing that changed is where its run is allowed to begin.
 //   * FRONT MATTER, which is always [0, md_front_matter_end) and so contains no
 //     other block start at all. MD_RUNUP_LINES is 24 and MD_FM_MAX_LINES is 64,
 //     so the run-up alone could never clear a card of 25-64 lines -- a divergence

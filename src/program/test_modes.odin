@@ -2473,6 +2473,36 @@ when NEWTPAD_TESTS {
 			li_chk(bad, len(lay.sh.line_boxes) == 1, fmt.tprintf("no marker: %d line boxes (want 1)", len(lay.sh.line_boxes)))
 		}
 
+		// THE NEAR MISS, and the reason it is here: a 2026-08-01 review found the
+		// shipped hard-break code correct but untested against the adjacent wrong
+		// rule. Relaxing the marker from `has_suffix(l, "  ")` to
+		// `has_suffix(l, " ")` -- ONE trailing space, a real CommonMark violation
+		// and an easy thing to write -- left mdjointest at 0 failures. Every case
+		// in this proc was satisfied by it: the control has no trailing space at
+		// all, and both positive cases carry markers a one-space rule still
+		// matches. A single trailing space is ordinary insignificant whitespace
+		// and must join as a space, so this fixture is the discriminator, and it
+		// is the ONLY row here that changes under that edit.
+		{
+			d := pj_doc("alpha \nbeta\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 1, fmt.tprintf("ONE trailing space is not a hard break: %d line boxes (want 1)", len(lay.sh.line_boxes)))
+		}
+
+		// The same gap for the other whitespace character. CommonMark says spaces;
+		// a trailing tab is not a hard break. `trim_right(l, " \t")` strips a tab
+		// from the emitted text, which is what makes "did the marker check also
+		// accept it" invisible in the joined string and visible only here.
+		{
+			d := pj_doc("alpha\t\nbeta\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 1, fmt.tprintf("a trailing tab is not a hard break: %d line boxes (want 1)", len(lay.sh.line_boxes)))
+		}
+
 		// Two trailing spaces on the first line.
 		{
 			d := pj_doc("alpha  \nbeta\n")
@@ -2518,6 +2548,326 @@ when NEWTPAD_TESTS {
 			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
 			defer md_layout_free(&lay)
 			li_chk(bad, len(lay.sh.line_boxes) == 3, fmt.tprintf("two consecutive hard breaks: %d line boxes (want 3)", len(lay.sh.line_boxes)))
+		}
+	}
+
+	// LAZY CONTINUATION, at the BOUNDS layer: the run a wrapped list item or
+	// blockquote makes, and the two entries into it agreeing.
+	//
+	// This is the only part of the design where a block's extent depends on its
+	// PREDECESSOR, so entry independence is not a nicety here -- md_para_run
+	// memoises by byte window and answers for line starts it has never been asked
+	// about, on the premise that every line start inside one run gives one answer.
+	// The two entries are structurally different code paths (the owner's line skips
+	// the backward scan and seeds the forward one; a continuation line runs the
+	// backward scan and then looks one line above where it settled), so "they agree"
+	// is a real claim about two implementations and not a tautology.
+	//
+	// What each group of rows rejects, verified by running the sabotage:
+	//   - the CONTINUATION-entry rows reject deleting the owner lookup after the
+	//     scans: the run then starts at the continuation line, so md_block_start_at
+	//     answers that line and the item's own text is a different block;
+	//   - the OWNER-entry rows reject deleting the `md_is_continuable` branch at the
+	//     top: md_para_bounds then refuses the marker line outright (`ok=false`) and
+	//     the join in md_layout_build's `.List` case never fires;
+	//   - the SOLO rows reject an owner branch that accepts any marker line: a list
+	//     item with nothing wrapped under it must stay a one-line block, or every
+	//     list in every document becomes a two-line one.
+	@(private = "file")
+	pj_case_lazy_bounds :: proc(bad: ^int) {
+		fmt.println("-- a wrapped list item and a wrapped quote are ONE run, from either end --")
+		{
+			// starts: 0 "- item text", 1 "  continues here", 2 "still going",
+			//         3 "" (blank), 4 "after"
+			d := pj_doc("- item text\n  continues here\nstill going\n\nafter\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := starts[3] - 1 // "still going"'s newline
+
+			s0, e0, c0, ok0 := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok0, "entering on the marker line resolves as a run")
+			li_chk(bad, !c0, "...and is not capped")
+			li_chk(bad, s0 == 0 && e0 == want_end, fmt.tprintf("...covering the item and both wrapped lines (%d..%d, want 0..%d)", s0, e0, want_end))
+
+			// Every entry, including the marker line's own, gives the identical
+			// triple -- and through the MEMO as well as through the producer, since
+			// the memo is what production reads.
+			for li in 0 ..= 2 {
+				s, e, c, o := md_para_bounds_for_test(&d, starts[li])
+				li_chk(
+					bad, o && s == s0 && e == e0 && c == c0,
+					fmt.tprintf("entering at line %d gives (%d,%d,%v); line 0 gave (%d,%d,%v)", li, s, e, c, s0, e0, c0),
+				)
+				ms, me, mo := md_para_run_for_test(&d, starts[li])
+				li_chk(
+					bad, mo && ms == s0 && me == e0,
+					fmt.tprintf("...and the memo agrees at line %d (%d,%d,ok=%v)", li, ms, me, mo),
+				)
+				li_chk(bad, md_block_start_at(&d, starts[li]) == 0, fmt.tprintf("...and line %d snaps to the marker line (got %d)", li, md_block_start_at(&d, starts[li])))
+			}
+
+			// The blank line still ends the item. Without this every row above is
+			// satisfied by bounds that simply swallow the rest of the document.
+			li_chk(
+				bad, md_block_start_at(&d, starts[4]) == starts[4],
+				fmt.tprintf("the paragraph past the blank line is its own block (%d, want %d)", md_block_start_at(&d, starts[4]), starts[4]),
+			)
+			sa, _, _, oka := md_para_bounds_for_test(&d, starts[4])
+			li_chk(bad, oka && sa == starts[4], fmt.tprintf("...and its run does not reach back over the blank (start %d, want %d)", sa, starts[4]))
+		}
+		{
+			// The memo warmed from the OTHER end. The loop above asks at the marker
+			// line first, so the window it stores was measured from the entry that
+			// skips the backward scan; this asks a continuation first and then the
+			// marker line, which is the entry that would be answered out of a window
+			// the producer never ran at. Same run, opposite warming order.
+			d := pj_doc("- item text\n  continues here\nstill going\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := d.pt.length - 1
+			ws, we, wok := md_para_run_for_test(&d, starts[2])
+			li_chk(bad, wok && ws == 0 && we == want_end, fmt.tprintf("warming at the LAST wrapped line gives the whole item (%d..%d, ok=%v; want 0..%d)", ws, we, wok, want_end))
+			ms, me, mok := md_para_run_for_test(&d, 0)
+			li_chk(bad, mok && ms == 0 && me == want_end, fmt.tprintf("...and the marker line reads the same out of that window (%d..%d, ok=%v)", ms, me, mok))
+		}
+		{
+			// The owner's line is COUNTED against md_para_max_lines. The block spans
+			// the marker line plus its continuations, so the cap has to see all of
+			// them -- and this fixture is chosen so that the owner is the line that
+			// tips it: three continuations under a 3-line cap is 4 lines with the
+			// owner counted and 3 without, so `capped` flips on that one increment.
+			d := pj_doc("- item\nc1\nc2\nc3\n")
+			defer doc_close(&d)
+			old := md_para_max_lines
+			defer md_para_max_lines = old
+			md_para_max_lines = 4
+			_, _, c4, ok4 := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok4 && !c4, fmt.tprintf("a 4-line item is not capped at a 4-line cap (capped=%v, ok=%v)", c4, ok4))
+			md_para_max_lines = 3
+			_, _, c3, ok3 := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok3 && c3, fmt.tprintf("...and IS at a 3-line cap, because the marker line counts (capped=%v, ok=%v)", c3, ok3))
+		}
+		{
+			// A list item with nothing wrapped under it is NOT a run, and neither is
+			// the item above another item.
+			d := pj_doc("- solo\n- second\ncontinues\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			_, _, _, ok_solo := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, !ok_solo, "a list item followed by another list item is not a run")
+			li_chk(bad, md_block_start_at(&d, 0) == 0, "...and stays its own block start")
+			s, e, _, ok2 := md_para_bounds_for_test(&d, starts[1])
+			li_chk(
+				bad, ok2 && s == starts[1] && e == d.pt.length - 1,
+				fmt.tprintf("the SECOND item, which does have a wrapped line, is a run (%d..%d, ok=%v; want %d..%d)", s, e, ok2, starts[1], d.pt.length - 1),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, starts[2]) == starts[1],
+				fmt.tprintf("...and its continuation snaps to it, not to the first item (%d, want %d)", md_block_start_at(&d, starts[2]), starts[1]),
+			)
+		}
+		{
+			// A blockquote continues the same way, and a heading does NOT: nothing
+			// lazily continues a heading, so md_is_continuable naming exactly two
+			// kinds is load-bearing rather than shorthand for "not .Para".
+			d := pj_doc("> quoted text\ncontinues here\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			s, e, c, ok := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok && !c && s == 0 && e == d.pt.length - 1, fmt.tprintf("a quote and its unmarked line are one run (%d..%d, capped=%v, ok=%v)", s, e, c, ok))
+			li_chk(bad, md_block_start_at(&d, starts[1]) == 0, fmt.tprintf("...and the unmarked line snaps to the `>` line (%d)", md_block_start_at(&d, starts[1])))
+		}
+		{
+			// AN OWNER LONGER THAN THE LINE-READ CAP, which is the one input that
+			// separates the owner lookup's `ol_capped` check from the backward loop's
+			// own `pl_capped`. The loop's check sits BELOW its `!md_is_para_line`
+			// break, so the single line it never applies to is the one that stopped
+			// it -- the owner.
+			//
+			// The fixture is a marker line of exactly RENDER_LINE_CAP bytes starting at
+			// byte 0. Going backward from the continuation, pt_line_start_cap reaches
+			// offset 0 within its own cap and reports a real line start; reading
+			// FORWARD from that same 0, md_line_at fills its whole RENDER_LINE_CAP
+			// buffer without meeting the newline and reports the line truncated. The
+			// two are independent quantities, which is what makes this constructible at
+			// all (the same asymmetry PROBE A and PROBE B document for S12 below).
+			//
+			// Entered on the marker line, `entry_capped` alone forces capped. Entered
+			// on the continuation, ONLY the owner lookup's check can -- the span is
+			// ~8 KB against a 256 KB budget and 2 lines against a 4096-line cap, so
+			// nothing else in the OR-chain fires. Drop that check and the two entries
+			// disagree: the continuation reports a joinable run starting at byte 0
+			// while the marker line refuses it, and md_block_start_at then hands a
+			// resolver a block start whose layout will not contain the byte it asked
+			// about.
+			long := strings.repeat("x", RENDER_LINE_CAP - 2)
+			defer delete(long)
+			d := pj_doc(strings.concatenate({"- ", long, "\ncontinues\n"}, context.temp_allocator))
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			li_chk(bad, starts[1] == RENDER_LINE_CAP + 1, fmt.tprintf("the marker line is exactly RENDER_LINE_CAP bytes (next line starts at %d, want %d)", starts[1], RENDER_LINE_CAP + 1))
+			_, _, c_owner, ok_owner := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok_owner && c_owner, fmt.tprintf("entering on the over-long marker line reports capped (capped=%v, ok=%v)", c_owner, ok_owner))
+			s_cont, _, c_cont, ok_cont := md_para_bounds_for_test(&d, starts[1])
+			li_chk(
+				bad, ok_cont && c_cont,
+				fmt.tprintf("...and so does entering on its continuation, or the two entries disagree (capped=%v, ok=%v, start=%d)", c_cont, ok_cont, s_cont),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, starts[1]) == starts[1],
+				fmt.tprintf("...so nothing joins across it and the continuation is its own block (%d, want %d)", md_block_start_at(&d, starts[1]), starts[1]),
+			)
+		}
+		{
+			d := pj_doc("# heading\nunmarked line\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			_, _, _, ok := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, !ok, "a heading is not continuable")
+			li_chk(
+				bad, md_block_start_at(&d, starts[1]) == starts[1],
+				fmt.tprintf("...so the line under it is its own block (%d, want %d)", md_block_start_at(&d, starts[1]), starts[1]),
+			)
+		}
+	}
+
+	// LAZY CONTINUATION, at the LAYOUT layer: the wrapped line renders as part of
+	// the item, with the item's indent and the item's bullet.
+	//
+	// THE ROWS THAT MATTER RESOLVE THE CONTINUATION'S OWN BYTE and assert on
+	// whatever block comes back, rather than asserting on the block at byte 0.
+	// That is the difference between a test that catches this bug and one that does
+	// not: with the fix removed, byte 0 still builds a perfectly good `.List` block
+	// with the right kind, indent and bullet -- it just does not contain the wrapped
+	// line, which lands in a `.Para` block of its own at indent 0. Asking "what is
+	// the block that holds `continues here`, and what are ITS indent and bullet" is
+	// the question the bug answers wrongly.
+	//
+	// Both the indent and the kind are asserted, and they are not the same
+	// assertion: zeroing `e.indent` in md_layout_build's `.List` case leaves every
+	// kind, bullet and content row below passing and fails only the indent rows.
+	@(private = "file")
+	pj_case_lazy_continuation :: proc(bad: ^int) {
+		fmt.println("-- a wrapped list item and a wrapped quote keep their block --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		// The reference: an item with nothing wrapped under it. Its indent and
+		// marker are what a continued item's must equal -- a separate number for a
+		// continued item would be a second producer of the same inset.
+		solo_indent, solo_marker := f32(0), f32(0)
+		{
+			d := pj_doc("- item text\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			solo_indent, solo_marker = lay.indent, lay.marker
+			li_chk(bad, lay.cls.kind == .List, fmt.tprintf("the reference item is a list block (%v)", lay.cls.kind))
+			li_chk(bad, !lay.multiline, "...and is not multiline")
+			li_chk(bad, solo_indent > 0, fmt.tprintf("...and a list block is inset at all (indent %v)", solo_indent))
+			li_chk(bad, solo_marker < solo_indent, fmt.tprintf("...with its bullet left of its prose (marker %v, indent %v)", solo_marker, solo_indent))
+		}
+		{
+			// COLD, and its own Document for that reason. md_walk enters a block from
+			// the block above it and never snaps, so the marker line is the first byte
+			// md_para_run is ever asked about here -- which is the path that exercises
+			// md_para_bounds' OWNER ENTRY. Calling md_block_start_at first, as the
+			// scope below does, warms the memo's window from the CONTINUATION entry
+			// and the marker line is then answered out of that window without the
+			// owner entry running at all: verified by sabotage, where deleting the
+			// owner-entry branch left every row in the warm scope passing and failed
+			// only here and at the bounds layer.
+			d := pj_doc("- item text\n  continues here\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			free_all(context.temp_allocator)
+			li_chk(
+				bad, lay.cls.content == "item text continues here",
+				fmt.tprintf("a forward walk into the marker line joins the wrapped line, its indent folded away (%q)", lay.cls.content),
+			)
+			li_chk(bad, lay.multiline, "...and the continued item is marked multiline")
+			li_chk(bad, lay.cls.kind == .List, fmt.tprintf("...still a list block (%v)", lay.cls.kind))
+			li_chk(bad, lay.next == d.pt.length, fmt.tprintf("...consuming the whole document, leaving no stray block after it (next %d, want %d)", lay.next, d.pt.length))
+		}
+		{
+			// The other production path: resolve the WRAPPED line's byte the way every
+			// resolver does, then lay out whatever block that names. This is the row
+			// that fails when the continuation renders as a stray paragraph -- the
+			// block it names is then that paragraph, at indent 0 with no bullet.
+			d := pj_doc("- item text\n  continues here\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			blk := md_block_start_at(&d, starts[1])
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, blk, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, lay.cls.kind == .List, fmt.tprintf("the block holding the wrapped line is a LIST block (%v, want .List)", lay.cls.kind))
+			li_chk(bad, lay.cls.bullet == "•", fmt.tprintf("...carrying the item's bullet (%q, want \"•\")", lay.cls.bullet))
+			li_chk(bad, lay.indent > 0, fmt.tprintf("...inset from the content origin at all, not sitting at 0 like a stray paragraph (indent %v)", lay.indent))
+			li_chk(bad, lay.indent == solo_indent, fmt.tprintf("...at the item's own indent (%v, want %v)", lay.indent, solo_indent))
+			li_chk(bad, lay.marker == solo_marker, fmt.tprintf("...and the item's own marker inset (%v, want %v)", lay.marker, solo_marker))
+			li_chk(
+				bad, lay.cls.content == "item text continues here",
+				fmt.tprintf("...and both lines' text (%q)", lay.cls.content),
+			)
+		}
+		{
+			// The control: a blank line still ends the item, so the paragraph after
+			// it is its own block and the item holds only its own text. Without
+			// this, everything above is satisfied by a join that never stops.
+			d := pj_doc("- item\n\nloose para\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, lay.cls.content == "item", fmt.tprintf("a blank line ends the item (%q, want \"item\")", lay.cls.content))
+			li_chk(bad, !lay.multiline, "...so it is not multiline")
+			li_chk(bad, lay.end == starts[1] - 1, fmt.tprintf("...and ends at its own newline (%d, want %d)", lay.end, starts[1] - 1))
+			li_chk(
+				bad, md_block_start_at(&d, starts[2]) == starts[2],
+				fmt.tprintf("...and the loose paragraph is its own block (%d, want %d)", md_block_start_at(&d, starts[2]), starts[2]),
+			)
+		}
+		{
+			// The same for a blockquote, whose marker is the bar md_block_draw paints
+			// from `indent` and `cls.level` -- both of which are the `>` line's, not
+			// the unmarked line's.
+			// Cold, for the reason the list's cold scope gives: entered at the `>`
+			// line with nothing having warmed the memo, which is what a forward walk
+			// does and what exercises the owner entry.
+			d := pj_doc("> quoted text\ncontinues here\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, lay.cls.kind == .Quote, fmt.tprintf("the continued quote is a QUOTE block (%v, want .Quote)", lay.cls.kind))
+			li_chk(bad, lay.cls.level == 1, fmt.tprintf("...at the `>` line's own depth (%d, want 1)", lay.cls.level))
+			li_chk(bad, lay.indent > 0, fmt.tprintf("...and inset by it (indent %v)", lay.indent))
+			li_chk(bad, lay.cls.content == "quoted text continues here", fmt.tprintf("...holding both lines' text (%q)", lay.cls.content))
+			li_chk(bad, lay.multiline, "the continued quote is marked multiline")
+		}
+		{
+			// A task item's checkbox is decided by md_classify off the MARKER line, so
+			// a `[x]` inside a continuation must not become one -- and the item's own
+			// one must survive the join.
+			d := pj_doc("- [ ] todo\n[x] not a checkbox\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, lay.cls.task && !lay.cls.task_done, fmt.tprintf("the item is still an unticked task (task=%v done=%v)", lay.cls.task, lay.cls.task_done))
+			li_chk(bad, lay.cls.content == "todo [x] not a checkbox", fmt.tprintf("...and the continuation is plain text (%q)", lay.cls.content))
 		}
 	}
 
@@ -2908,9 +3258,11 @@ when NEWTPAD_TESTS {
 			pj_case_line_cap_truncates_forward(&bad)
 			pj_case_neighbor_capped_forces_capped(&bad)
 			pj_case_terminators(&bad)
+			pj_case_lazy_bounds(&bad)
 			pj_case_joins_text(&bad)
 			pj_case_blank_separates(&bad)
 			pj_case_hard_breaks(&bad)
+			pj_case_lazy_continuation(&bad)
 			pj_case_capped_refuses(&bad)
 			pj_case_snap_is_the_entry(&bad)
 			pj_case_overlong_line(&bad)
@@ -11696,8 +12048,17 @@ when NEWTPAD_TESTS {
 				what:  string,
 				src:   string,
 				below: f32,
-				para:  bool,
-			}{{"a paragraph", "lead text", m.para_below, true}, {"a list item", "- lead text", m.list_gap, false}}
+				// Does a bare prose line written directly under this lead become
+				// part of IT rather than a block of its own? Both leads here do, by
+				// two different rules -- a paragraph by the CommonMark paragraph
+				// run, a list item by LAZY CONTINUATION -- so a row with `para` set
+				// has no gap to measure under either. It stays a per-lead field
+				// rather than becoming a constant because it is a property of the
+				// lead's KIND: a heading or a fence lead would absorb nothing, and
+				// the `want` formula below would be the right question for them
+				// again.
+				absorbs: bool,
+			}{{"a paragraph", "lead text", m.para_below, true}, {"a list item", "- lead text", m.list_gap, true}}
 
 			for ld in leads {
 				base_src := strings.concatenate({ld.src, "\n", PROBE, "\n"}, context.temp_allocator)
@@ -11717,10 +12078,11 @@ when NEWTPAD_TESTS {
 					// no space above, so the max is K.below itself).
 					want := max(ld.below, r.above) - ld.below + r.height + r.below
 					got := y - y_base
-					if ld.para && r.para {
-						// A prose line under a prose line is the SAME block since the
-						// paragraph join, so there is no gap here to measure and the
-						// row above would be asking the wrong question. What it asks
+					if ld.absorbs && r.para {
+						// A prose line under a lead that absorbs one is the SAME block
+						// -- a paragraph run under a paragraph, a lazy continuation
+						// under a list item -- so there is no gap here to measure and
+						// the row below would be asking the wrong question. What it asks
 						// instead is the join, from the spacing side: "lead text" and
 						// "block text" reflow onto one visual line at this measure, so
 						// the probe below them must not move at all.
