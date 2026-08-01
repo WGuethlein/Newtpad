@@ -906,10 +906,18 @@ md_para_bounds_for_test :: proc(doc: ^Document, p: int) -> (start, end: int, cap
 	return md_para_bounds(doc, p)
 }
 
-// Four slots, mirroring MD_TABLE_SLOTS and for a related reason: a scroll frame
-// asks about several blocks, and one slot would be evicted by the next block and
-// missed on the one after. Four covers a viewport's worth of separate paragraphs
-// without making Document any bigger than the table cache already does.
+// Four slots, mirroring MD_TABLE_SLOTS -- but note the difference, because the
+// two comments should not be read as making the same kind of claim.
+// MD_TABLE_SLOTS' count answers a MEASURED thrash. This one does not: rebuilt at
+// MD_PARA_SLOTS :: 1, every mdperftest fixture is unchanged within noise
+// (4.450 / 5.155 / 1.606 / 1.654 ms against 4.402 / 5.124 / 1.584 / 1.604) and
+// mdjointest stays green, so on every document that exists today one slot is
+// indistinguishable from four (2026-08-01 review).
+//
+// Four is kept anyway because the reasoning it was chosen for is sound and the
+// cost is four structs on Document: a scroll frame asks about several blocks, and
+// a single slot is evicted by the next block and missed on the one after. What is
+// NOT claimed is that anything has been observed to need it.
 MD_PARA_SLOTS :: 4
 
 // One remembered md_para_bounds answer, keyed on a BYTE WINDOW rather than on the

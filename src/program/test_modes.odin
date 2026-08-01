@@ -22561,15 +22561,28 @@ when NEWTPAD_TESTS {
 			//   one 2000-line     6.134 ms 13.431 ms 13.849 ms  1.633 ms
 			//   one 4000-line     35.0  ms 39.3   ms 39.783 ms  1.615 ms
 			//
-			// The 4000-line row is the one worth reading twice: 1.615 ms is below the
-			// 1.73 ms that fixture cost at 6fd48d3, BEFORE the join existed. The cost
-			// the join added there was never the joining -- that run is capped and
-			// nothing joins in it -- it was asking md_para_bounds the same question
+			// The 4000-line row is the one worth reading twice: the memo RESTORES that
+			// fixture to its pre-join cost. It measured 1.615 ms here against the
+			// 1.73 ms it cost at 6fd48d3, BEFORE the join existed -- and a review
+			// reconstructed that baseline directly (md_para_run returning immediately,
+			// no paragraph machinery at all) at 1.767 ms against 1.604 ms measured.
+			// A ~7% gap is inside run-to-run variance, so "restored to" is the
+			// defensible claim and "below" is not (2026-08-01 review).
+			//
+			// The cost the join added there was never the joining -- that run is capped
+			// and nothing joins in it -- it was asking md_para_bounds the same question
 			// once per block per frame.
 			//
-			// 4000 lines x 87 bytes is 348 KB, past MD_PARA_BUDGET's 256 KB, so that
+			// 4000 lines x 88 bytes is 344 KB, past MD_PARA_BUDGET's 256 KB, so that
 			// run is `capped` and NOTHING joins in it -- it measures the cost of
 			// asking, which every .Para block pays whether or not it joins.
+			//
+			// What gates this regression class is the two DEGENERATE fixtures. Under a
+			// disabled memo, `20x100` -- the shape a real hard-wrapped file has -- costs
+			// 6.159 ms against an 11.7 ms frame gate and does NOT trip, while `1x2000`
+			// (13.740) and `1x4000` (40.424) both do. So the class is caught, but the
+			// many-paragraph shape is protected more weakly than the shared gates
+			// suggest.
 			PROSE :: "hard wrapped prose line %04d carrying enough words to look like real reflowed body text\n"
 			{
 				b := strings.builder_make()
