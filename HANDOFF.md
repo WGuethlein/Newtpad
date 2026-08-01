@@ -20,9 +20,30 @@ operational traps that have each cost a session real time. Unlike `CLAUDE.md`, i
 
 ### Where things stand — read this first (2026-08-01)
 
-**v0.36.0 is merged, tagged, released and installed.** Newtpad is Wyatt's daily Notepad replacement and
-has been all along. Everything below `§6` is a dated log of how it got here; **§6bc is the newest** and
-§6ax–§6bb were the day before.
+**v0.37.0 is merged, tagged, released and installed.** Newtpad is Wyatt's daily Notepad replacement and
+has been all along. Everything below `§6` is a dated log of how it got here; **§6bd is the newest**,
+§6bc was earlier the same day, and §6ax–§6bb were the day before.
+
+**v0.37.0 made the markdown preview use CommonMark's paragraph model.** It had been rendering **one
+source line as one paragraph**, so every hard-wrapped document — HANDOFF.md, a README, a spec — read as
+a wall of one-line paragraphs while the blank line that actually separates two of them contributed
+nothing. That is the bug Wyatt reported twice. Consecutive prose lines now join and re-flow, hard breaks
+survive, an unmarked line after a bullet or a `>` continues that block, and setext headings work. §6bd
+has the entry; four things from it matter before touching anything nearby:
+
+- **A joined paragraph starts ABOVE its own line**, and the fixed 24-line run-up could not find its
+  start. That broke Split scroll sync — the preview drew from line 0 while the editor sat at line 100.
+  **`md_block_start_at` is the fix and every byte-to-block resolver goes through it.** It also cured the
+  front-matter run-up imprecision open since batch 17.
+- **`md_para_run` is a byte-WINDOW memo** — it answers for bytes it has never seen, on the premise that
+  `md_para_bounds` is entry-independent. That premise is heavily probed but not proved, and it is what
+  an 8× speedup is bought with (a 2000-line paragraph went 13.4 → 1.6 ms/frame).
+- **`md_classify` is still pure and must stay that way.** Both predecessor-dependent features — lazy
+  continuation and setext — live in the bounds layer, as *extent* decisions rather than kind decisions.
+- **`mdtest` silently went 0 → 20 failures mid-batch** because it printed `FAIL` and exited 0. Six modes
+  had that; 60 of 86 still do (see §5).
+
+**No live GUI pass has been done on v0.37.0.** How the re-flowed prose actually reads is unverified.
 
 **Batch 19 shipped multi-column sort** — the table view sorts by up to two columns, first-selected-wins,
 through a header menu (hover chevron or right-click), Ctrl+click, and the plain click that already
@@ -199,6 +220,23 @@ code); plugins post-V1 (narrow C-ABI). Refuted claims recorded in `research/`.
 **Status: P0 and P1 below are DONE** (see §6 items 1–2 for how, and §6k for a second, larger sweep
 on 2026-07-19). The list is kept because the reasoning is still the best statement of *why* these
 were the priorities. Read P2 as the live list, with these amendments:
+
+- **60 of 86 headless mode entry points print `FAIL` with no `os.exit` on any path** (static scan,
+  2026-08-01). Nine have been fixed in three rounds — `menutest`/`settingstest`, then `mdtest`, then
+  `linktest`/`mdviewtest`/`splittest`/`mdfencetest`/`mdtabletest`/`mdperftest` — and **each round was
+  found by looking, not by the previous fix generalising.** `mdtest` is what this costs: it went from
+  0 to 20 failures between two commits on the paragraph-join branch while every sweep that read exit
+  codes stayed green. Some of the 60 are measurement modes and **`menuseam` legitimately exits 0**
+  (it is a falsifier, swept by diffing its printed line), so this needs a mode-by-mode pass rather
+  than a blanket edit. **Nobody has done that pass.**
+- **`md_table_ensure`'s cache key omits `md_table_budget` / `md_table_max_rows`**, which `mdtabletest`
+  lowers at runtime — so a test can read a stale cache measured at the production budget. Found while
+  building `md_para_run`, whose key *does* include both. One procedure away from the code that was
+  fixed; not touched (2026-08-01).
+- **`md_table_bounds` has the same coverage gap `md_para_bounds` had.** Deleting
+  `if r - p > md_table_budget` leaves `mdtabletest` at exit 0. Verified by a reviewer on 2026-08-01
+  while confirming the paragraph copy's guards were individually testable. The copy was fixed; the
+  model was not.
 
 - ~~**Arenas on VirtualAlloc: still zero implementation.**~~ **RESOLVED by amendment, 2026-07-27.**
   This entry was stale: CLAUDE.md's Memory row no longer specifies arenas. It records that the arena
@@ -5228,6 +5266,159 @@ Same direction as batch 18, roughly double the volume. **Design the observer lis
 Base tests unchanged at 211. `tablesorttest` is new, one-argument, exits non-zero, and is in §7 and
 development-loop §6.
 
+## 6bd. The preview stops being a line-per-paragraph document (2026-08-01, v0.37.0, branch `fix/preview-paragraph-join`)
+
+Wyatt reported this twice — 2026-07-29 with a side-by-side screenshot (*"it looks like it's not
+respecting the spaces all the time"*), and again on v0.35.0 after a fix that turned out to be a
+different bug: *"still see it… it's like it's messing up the formatting of sentences, etc."*
+`reported-bugs.md` had already named the leading candidate and it was right.
+
+### The root cause, and why the earlier fix missed
+
+`md_classify` classified **one source line at a time**. `.Para`'s content was that whole line and every
+one got `e.below = m.para_below` (0.80 × S), while `.Blank` collapsed to **zero** height. So in any
+hard-wrapped document — HANDOFF.md, a README, a spec — every source line rendered as its own paragraph
+with a full paragraph gap under it, and the blank line that actually separates two paragraphs
+contributed nothing on top of that. A sentence spanning two source lines became two visible paragraphs.
+
+"Not respecting the spaces" is the same defect from the other side: CommonMark inserts a space when it
+joins two lines of a paragraph, and there was no join for a space to be inserted into.
+
+### What it does now
+
+CommonMark's paragraph model in the preview: consecutive prose lines join into one paragraph re-flowed
+to the pane width, blank lines are the real separator, and **hard breaks are honoured** (two or more
+trailing spaces, or a trailing backslash → `'\n'`, which the shaper already broke on). Wyatt also chose
+two additions: **lazy continuation** — an unmarked line after a list item or blockquote continues *that*
+block with its indent and marker instead of becoming a stray un-indented paragraph — and **setext
+headings**, `Title` over `===` or `---`.
+
+### The design bet, and where it was wrong
+
+The spec's bet was that this was small: a block could already span many visual lines and be taller than
+the pane (`Md_Anchor` carries a sub-block offset, `md_block_admit` admits per line), so joining should
+need no new scroll machinery. **Spans, wrapping, span boxes, links, admit and height did all follow with
+no change** — that half held.
+
+**What it missed is that a joined paragraph starts ABOVE its own line.** `md_layout_build` is reached
+not only from a forward walk, where the entry byte is always a real block start, but from
+`md_block_at_byte` and `md_anchor_walk`, whose entry is `MD_RUNUP_LINES` (24) of run-up back from an
+arbitrary byte. On a hard-wrapped document that lands *inside* the paragraph. Measured on
+`md_scroll_selftest`'s 200-line fixture: editor top at byte 1200, `md_anchor_from_top` answered block
+**912** — 1200 minus 24 lines of 12 bytes, exactly — and **the preview drew from line 0 while the editor
+half sat at line 100.** Split-view scroll sync, broken on any long prose document.
+
+That became an unplanned task on Wyatt's decision: `md_block_start_at` snaps every byte-to-block
+resolver to the containing block's true start, so a walk always enters a block at its real beginning.
+Two alternatives were refuted rather than deferred — setting `e.start = ps` breaks the cache lookup,
+which is keyed by the entry byte, and refusing to join on mid-run entry reintroduces exactly the
+scroll-dependent rendering the design exists to prevent.
+
+**It also cured something older.** `MD_RUNUP_LINES`' own comment had recorded since batch 17 that a
+run-up landing inside 25–65 lines of front matter misreads it, and was honest that a clean 30-line
+fixture was *"an absence of a demonstrated defect, not a proof the case is handled."* The snap closes
+it: `md_wheel_selftest`'s 30- and 50-line front-matter fixtures each went from a documented one-failure
+exception to strict, and removing only that branch reverts them byte-for-byte.
+
+**A sibling is still open:** a collapsed blank run longer than 24 lines is the same defect class. Its
+block is chunked at `MD_BLANK_RUN_MAX`, so "the run's first blank line" is not the containing block's
+start, and answering properly means modelling the chunking. Bounded, unmeasured, and named in
+`md_block_start_at`'s comment rather than left silent.
+
+### The performance regression, and the fixture that could not see it
+
+The snap asks `md_para_bounds` per resolver call. `mdperftest`'s fixture was blank-separated
+**single-line** paragraphs, so each scan covered ~1 line and the mode reported "unchanged". On
+hard-wrapped prose with no blank lines, measured in debug:
+
+| fixture | before the snap | after | after the memo |
+|---|---|---|---|
+| 20 × 100-line paragraphs | 5.414 ms | 6.117 ms | 5.193 ms |
+| one 2000-line paragraph | 6.134 ms | **13.431 ms** (over the 11.7 ms gate) | **1.633 ms** |
+| one 4000-line paragraph | 35.0 ms | 39.3 ms | **1.615 ms** |
+
+`md_para_run` — a four-slot **byte-window** memo keyed on `doc.revision` plus both runtime budgets —
+fixed it, and paid off the join's own debt as well as the snap's: the 4000-line case is back to what it
+cost before the join existed (1.73 ms, reconstructed directly). **The hard-wrapped fixtures are now in
+`mdperftest`**, which was the actual root cause — without them the regression is invisible to the next
+person who measures. All figures are **measured debug**; `build.bat release` is `-subsystem:windows` and
+cannot print, so no release number is claimed.
+
+**The memo's soundness rests on `md_para_bounds` being entry-independent** — it answers for bytes it has
+never seen. That is asserted by several `mdjointest` cases and was probed by a reviewer over ~15k byte
+positions × 10 call orders × 40 fixtures with zero divergences, but it is not *proved*. It is the
+assumption the 8× is bought with.
+
+### Two decisions worth not relitigating
+
+**Lazy continuation is an EXTENT problem, not a KIND problem.** The plan specified that `md_para_bounds`
+grow an `owner: Md_Class` return so a continuation line could inherit its predecessor's kind. The
+implementer refused, correctly: because the snap means `md_layout_build` is *always* entered on the
+marker line, `md_classify` already yields the right kind, level and bullet there. An `owner` return
+would have been a second producer of a block's kind with no consumer. **`md_classify` stays pure** — one
+line in, one class out — and the predecessor dependency lives entirely in the bounds layer.
+
+**The setext underline had to go into the bounds layer too**, for the same reason the snap exists: the
+underline byte belongs to the heading block, so an anchor landing on it must resolve to the paragraph's
+start or a walk renders a heading while an anchor renders a rule. The plan's recipe (extend `e.end` in
+`md_layout_build`) would have reintroduced the divergence.
+
+### What this batch got wrong
+
+**Comments claiming evidence they did not have, in six consecutive review rounds.** §6bc recorded eleven
+in one batch and named it a review-only defect class; it recurred here immediately, including in text
+written by a round whose explicit job was fixing a wrong comment. The worst was a commit message saying
+a probe had *confirmed* a branch unreachable — a later reviewer reached it with two probes. The source
+is corrected; the message stands, and is recorded here rather than rewritten.
+
+**Nine assertions that could not fail**, every one found by sabotage rather than by review-by-reading.
+Three hid the same way: they asserted a value that a **redundant code path also produced**, so deleting
+the guard they were named for left them green. Worth carrying forward as a named sub-pattern.
+
+**My own plan was wrong four times, and every subagent that caught it was right.** Both of Task 1's
+sabotage recipes were vacuous — they did not catch the bugs they named. One fix instruction said "fix
+the comment" when the comment was a symptom and the coverage gap was the defect, costing a whole round.
+Task 4's `owner` return and Task 5's promotion site were both refuted by their implementers. **A plan's
+sabotage steps need re-deriving by the implementer, exactly like its test code.**
+
+**And I shipped one myself.** The scroll round-trip test's first draft scrolled 480 px, which stayed
+inside the *first* block where the snap is the identity — deleting `md_block_start_at` from
+`md_runup_start` left the whole mode green. It now has to reach a later block and visit three of them.
+
+**`mdtest` went from 0 to 20 failures and nothing noticed**, because it printed `FAIL` and exited 0.
+Six modes had that defect and were fixed here (`mdtest`, `linktest`, `mdviewtest`, `splittest`,
+`mdfencetest`, `mdtabletest`, plus `mdperftest`). **60 of 86 mode entry points still do** — see §5.
+
+**`cmd.exe /c build.bat` can report exit 0 while the compile failed**, leaving a stale exe that prints
+`0 failures`. Hit for real twice, once by me. Build through PowerShell and check that
+`(Get-Item build\newtpad.exe).LastWriteTime` moved. This is a sharper form of the trap the "where things
+stand" section already records.
+
+### Owed
+
+- **No live GUI pass.** This environment cannot inject input, so how the re-flowed prose actually reads,
+  whether the paragraph gaps are now right, and whether a wrapped bullet looks correct are all
+  inferences from source. **A live pass is required before this is called done.**
+- **Split sync over a long hard-wrapped paragraph is now coarse** — the preview pins to the paragraph's
+  top. This is `docs/ui-spec` §9.4 (*"scroll sync by block, not by line"*) being honoured for the first
+  time; the finer old behaviour was an artefact of every line accidentally being its own block.
+  Sub-block sync is achievable — `Md_Anchor` already carries a within-block pixel offset and
+  `lay.sh.line_boxes` already gives per-visual-line geometry. The missing piece is a map from a source
+  byte to an offset in `e.joined`, and **the hard half is the inverse**, which `md_scroll_scalar`'s own
+  comment calls hard-won.
+- **A blockquote written with `>` on every line still renders as N stacked blocks with a segmented bar**
+  (13 px gaps between 26 px segments, measured). Pre-existing — but this batch makes it *inconsistent*,
+  because the lazily-continued form now renders as one clean bar. Joining a run of *marked* quote lines
+  is its own small task.
+- **Setext changes existing documents**: prose directly over `---` now renders as an h2 rather than a
+  paragraph plus a rule. No file in this repo is affected (the one hit is front matter at byte 0).
+- `md_para_bounds`' `!trunc_fwd` term on the setext promotion is unfalsifiable — removing it leaves five
+  modes green. Honest defensive code, documented as such so a later "simplification" knows the green
+  suite is not evidence.
+
+Base tests unchanged at 211. `mdjointest` is new, one-argument, exits non-zero, and is in §7 and
+development-loop §6. 46 headless modes clean; all 18 commits pass the bisectability sweep.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -5253,7 +5444,7 @@ development-loop §6.
     `tablegridtest`,
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
     `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`, `selalltest`,
-    `tablesorttest`
+    `tablesorttest`, `mdjointest`, `mdfencetest`, `mdperftest`, `mdtabletest`, `blocktest`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`

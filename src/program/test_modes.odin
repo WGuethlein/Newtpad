@@ -1845,6 +1845,2022 @@ when NEWTPAD_TESTS {
 		li_chk(bad, d.md_mode == .Preview, "...leaving the preview open")
 	}
 
+	// --- `newtpad mdjointest` -- md_para_bounds, the single producer of a
+	// paragraph's extent -------------------------------------------------------
+
+	// A markdown Document over `src`. doc_from_content takes ownership of what it
+	// is given and doc_close frees it, so the bytes have to be an allocation of
+	// their own rather than a slice of a string literal -- the same reason
+	// ts_doc (tablesorttest's fixture builder, below) copies its source.
+	@(private = "file")
+	pj_doc :: proc(src: string) -> Document {
+		c := make([]u8, len(src))
+		copy(c, transmute([]u8)src)
+		return doc_from_content(c, "fixture.md", .UTF8)
+	}
+
+	// Every line offset in `d`, in order. Note the LAST entry is EOF, not a line
+	// start -- pj_line_starts records the byte right after every '\n', and the
+	// final '\n' in a fixture that ends with one puts that position at
+	// d.pt.length. Callers indexing "the last line" want len(starts)-2.
+	@(private = "file")
+	pj_line_starts :: proc(d: ^Document, allocator := context.allocator) -> []int {
+		out := make([dynamic]int, 0, 16, allocator)
+		append(&out, 0)
+		for i in 0 ..< d.pt.length {
+			b: [1]u8
+			base.pt_read(&d.pt, i, b[:])
+			if b[0] == '\n' {append(&out, i + 1)}
+		}
+		return out[:]
+	}
+
+	// Every byte offset inside the SAME paragraph must resolve to the SAME
+	// (start, end, capped), and the run must not have swallowed a neighbour.
+	//
+	// This does NOT catch any of the three entry-dependence traps named above
+	// md_para_bounds (confirmed by running each trap's own sabotage against this
+	// case alone: all three printed "ok" -- see pj_case_no_collapse for trap 2's
+	// actual catch, which needed a different fixture). What it DOES catch,
+	// confirmed the same way:
+	//   - a broken or absent backward scan: disabling it here produced 2 real
+	//     FAILs (lines 5 and 6 disagreeing with line 4, since only line 4's own
+	//     entry happens to already sit at the run's true start);
+	//   - bounds that swallow a neighbour paragraph: disabling both directions'
+	//     `md_is_para_line` terminator checks produced 2 real FAILs, on the
+	//     "run starts at b1" / "run ends at b3's newline" checks below (the
+	//     whole three-paragraph fixture collapsed into one run).
+	@(private = "file")
+	pj_case_entry_independent :: proc(bad: ^int) {
+		fmt.println("-- md_para_bounds gives one answer per paragraph, whatever byte you enter at --")
+		// Three paragraphs of three lines each, blank-separated. Every line of the
+		// middle paragraph must produce the SAME bounds.
+		d := pj_doc("a1\na2\na3\n\nb1\nb2\nb3\n\nc1\nc2\nc3\n")
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+		// Lines 4,5,6 (0-based) are b1,b2,b3.
+		want_start, want_end, want_capped, want_ok := md_para_bounds_for_test(&d, starts[4])
+		li_chk(bad, want_ok, "the paragraph's first line resolves")
+		li_chk(bad, !want_capped, "and is not capped")
+		for li in 4 ..= 6 {
+			s, e, c, o := md_para_bounds_for_test(&d, starts[li])
+			li_chk(
+				bad,
+				o && s == want_start && e == want_end && c == want_capped,
+				fmt.tprintf("entering at line %d gives (%d,%d,%v); line 4 gave (%d,%d,%v)", li, s, e, c, want_start, want_end, want_capped),
+			)
+		}
+		// And it must not have swallowed a neighbour.
+		li_chk(bad, want_start == starts[4], fmt.tprintf("the run starts at b1 (%d, want %d)", want_start, starts[4]))
+		li_chk(bad, want_end == starts[7] - 1, fmt.tprintf("the run ends at b3's newline (%d, want %d)", want_end, starts[7] - 1))
+	}
+
+	// The only case that tests `capped`, in two ways: a byte budget so small the
+	// backward scan cannot reach the run's true start, and a line-count cap so
+	// small the forward scan cannot reach its true end.
+	//
+	// The small-budget assertion below enters at TWO points. Entering at the
+	// run's FIRST line (byte 0) checks `capped_small`, which is a sanity check
+	// only against that flag: the redundant final `(end-start) > budget`
+	// fallback reports capped=true on this fixture regardless of whether the
+	// forward byte guard (`if r - p > md_para_budget`) is present or deleted
+	// outright, since the true span (1749 bytes) exceeds the 64-byte budget
+	// either way -- confirmed by deleting that guard alone and rebuilding:
+	// `mdjointest: 0 failures`, unchanged (this was round 2's Finding, and round
+	// 2 only fixed the comment; round 3's Finding 1 is that the gap itself needed
+	// closing). What actually discriminates the forward BYTE guard is `end_small`,
+	// checked directly below, the same technique `start_tail` already uses for
+	// the backward guard: with the guard live, absorbing line 1 brings `r` to 85,
+	// which trips `r - p > 64` before line 2 can be absorbed, so `end` stops at
+	// line 1's own newline (`starts[2] - 1`); with the guard deleted, nothing
+	// stops the forward scan short of the document's true end (1749).
+	//
+	// Entering at the run's LAST line is a second, independent catch, for the
+	// BACKWARD guard: deleting it still leaves the redundant final check
+	// reporting capped=true (so `capped_tail` alone would also pass with the
+	// guard gone), but the run's true start (byte 0, since this fixture has no
+	// line before it) is then walked all the way back to instead of stopping
+	// early -- `start_tail` is checked directly rather than only `capped`
+	// precisely because a guarded backward scan must stop with `start` still
+	// short of 0 and an unguarded one does not.
+	@(private = "file")
+	pj_case_budget_truncates :: proc(bad: ^int) {
+		fmt.println("-- the budget truncates instead of scanning to EOF --")
+		// 40 paragraph lines, no blank line anywhere: without a budget this is one
+		// 40-line run. Lower the budget so a small fixture drives the real guard --
+		// this drive-through is what actually tests truncation. Asserting `capped` on
+		// a fixture that never reaches the guard would pass with the guard deleted.
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+		last_line := starts[len(starts) - 2] // len(starts)-1 is EOF, not a line start
+
+		_, _, capped_full, _ := md_para_bounds_for_test(&d, 0)
+		li_chk(bad, !capped_full, "at the production budget the run is not capped")
+
+		old_budget, old_lines := md_para_budget, md_para_max_lines
+		defer {md_para_budget, md_para_max_lines = old_budget, old_lines}
+		md_para_budget = 64
+		_, end_small, capped_small, _ := md_para_bounds_for_test(&d, 0)
+		li_chk(bad, capped_small, "with a 64-byte budget, entering at the first line, the run reports capped")
+		li_chk(
+			bad,
+			end_small == starts[2] - 1,
+			fmt.tprintf("...and the forward scan itself stopped at line 1's newline, short of the document's true end (got end=%d, want %d)", end_small, starts[2] - 1),
+		)
+
+		start_tail, _, capped_tail, _ := md_para_bounds_for_test(&d, last_line)
+		li_chk(bad, capped_tail, "with a 64-byte budget, entering at the LAST line, the run reports capped too")
+		li_chk(
+			bad,
+			start_tail > 0,
+			fmt.tprintf("...and the backward scan itself stopped short of byte 0 (got start=%d)", start_tail),
+		)
+
+		md_para_budget = old_budget
+		md_para_max_lines = 4
+		_, _, capped_lines, _ := md_para_bounds_for_test(&d, 0)
+		li_chk(bad, capped_lines, "with a 4-line cap the same run reports capped")
+	}
+
+	// Everything md_classify already treats as ending a paragraph must keep
+	// ending it here, for free, because md_is_para_line asks md_classify rather
+	// than testing anything of its own. And a line that never was a paragraph
+	// line returns ok=false rather than a zero-length run.
+	@(private = "file")
+	pj_case_terminators :: proc(bad: ^int) {
+		fmt.println("-- everything that already ended a paragraph still ends it --")
+		cases := []struct{src, label: string}{
+			{"p1\np2\n\ntail\n", "a blank line"},
+			{"p1\np2\n# head\n", "a heading"},
+			{"p1\np2\n- item\n", "a list item"},
+			{"p1\np2\n> quote\n", "a blockquote"},
+			{"p1\np2\n```\n", "a fence"},
+			{"p1\np2\n| a | b |\n", "a table row"},
+		}
+		for c in cases {
+			d := pj_doc(c.src)
+			defer doc_close(&d)
+			s, e, _, ok := md_para_bounds_for_test(&d, 0)
+			// "p1\np2\n" -- the run is bytes 0..5, ending at p2's newline (offset 5).
+			li_chk(bad, ok && s == 0 && e == 5, fmt.tprintf("%s ends the run (got %d..%d)", c.label, s, e))
+		}
+		// A line that is not a paragraph line at all returns ok=false.
+		dh := pj_doc("# heading\nbody\n")
+		defer doc_close(&dh)
+		_, _, _, ok_head := md_para_bounds_for_test(&dh, 0)
+		li_chk(bad, !ok_head, "a heading line is not a paragraph run")
+	}
+
+	// A second, DIFFERENT catch for trap 2 (the forward guard measured from
+	// `start` instead of `p`) than pj_case_entry_independent's.
+	//
+	// pj_case_entry_independent's 3-paragraph fixture cannot see trap 2 at any
+	// budget: it is small enough (9 bytes for the whole middle paragraph) that
+	// `start` and `end` converge on the SAME true edges for every entry once both
+	// scans finish, sabotaged or not, and the redundant final check
+	// `(end - start) > md_para_budget` reports the identical `capped` either way
+	// -- confirmed by running the actual trap with md_para_budget lowered into
+	// that fixture's range: every entry still printed "ok". Entry independence
+	// of (start, end, capped) is a real, ships-every-run property, but it is only
+	// an invariant in the UNCAPPED regime (every entry sees the block's whole,
+	// true extent) -- once a run is genuinely larger than budget, DIFFERENT
+	// entries are SUPPOSED to see different budget-sized windows around
+	// themselves; that is what "budget" means, not a bug.
+	//
+	// What trap 2 actually breaks is inside the capped regime: an entry far from
+	// the run's true start inflates its OWN measurement (`start`, already moved
+	// back by the backward scan) before the forward scan has extended anything,
+	// so the very first forward check compares against a budget that is already
+	// spent -- "every paragraph collapses to its entry line," in the trap's own
+	// words above md_para_bounds. That is directly checkable without comparing
+	// against another entry at all: does a middle entry's forward scan absorb
+	// ANYTHING beyond its own line, given a budget that comfortably allows more?
+	// Confirmed against the live trap: entering at line 20 of this fixture with
+	// budget=500 collapsed to end=913, exactly the entry line's own newline and
+	// nothing past it, while line 0 (unaffected by the trap, since start == p
+	// there) correctly extended to end=517.
+	@(private = "file")
+	pj_case_no_collapse :: proc(bad: ^int) {
+		fmt.println("-- a middle entry's forward scan is not collapsed to its own line --")
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+
+		old_budget := md_para_budget
+		defer md_para_budget = old_budget
+		md_para_budget = 500 // well under the run's true 1749-byte span, so still capped
+
+		own_line_end := starts[21] - 1 // line 20's own newline, with no forward join at all
+		// Round-2 review, Minor 5: the budget's whole job here is to sit strictly
+		// between one line's length and the run's true span -- above the line so
+		// there's room left to absorb a neighbour at all, below the span so the run
+		// stays capped and the trap's regime is actually exercised. Pin the band
+		// directly instead of trusting "500" and "~45-byte lines" to stay related.
+		own_line_len := own_line_end - starts[20]
+		span := d.pt.length - 1 // this fixture has no line before byte 0
+		li_chk(
+			bad,
+			md_para_budget > own_line_len && md_para_budget < span,
+			fmt.tprintf("the budget sits between one line's length and the run's true span (line=%d, budget=%d, span=%d)", own_line_len, md_para_budget, span),
+		)
+		s20, e20, capped20, ok20 := md_para_bounds_for_test(&d, starts[20])
+		li_chk(bad, ok20, "line 20 resolves as a paragraph line")
+		li_chk(bad, capped20, "and, at this budget, the run is (correctly) capped")
+		li_chk(
+			bad,
+			e20 > own_line_end,
+			fmt.tprintf("...but the forward scan still absorbs at least one more line (end=%d, own line end=%d)", e20, own_line_end),
+		)
+		li_chk(bad, s20 < starts[20], fmt.tprintf("...and the backward scan absorbs at least one line too (start=%d, entry=%d)", s20, starts[20]))
+	}
+
+	// Round-1 review, Important 2: `capped`'s final line --
+	// `capped = trunc_back || trunc_fwd || (end - start) > md_para_budget ||
+	// total_lines > md_para_max_lines` -- has two terms neither per-direction
+	// guard can set on its own: the redundant byte-window check and its
+	// line-count analogue. Deleting BOTH still left mdjointest at 0 failures,
+	// because every existing case either stays comfortably under budget or
+	// enters from a spot where one guard trips on its own. This case and
+	// pj_case_line_cap_entry_independent below are what actually needs them --
+	// direct paragraph analogues of mdtabletest's K < B <= 2K band
+	// (test_modes.odin, "entry-independent oversize") and its row-cap
+	// entry-independence case.
+	//
+	// Fixture: the same 40-line paragraph, whose true span (end-start) is 1749
+	// bytes (10 single-digit-numbered lines at 43 bytes + 30 double-digit-numbered
+	// lines at 44 bytes = 1750 total bytes, minus 1 for end-start excluding the
+	// position past the final newline). With md_para_budget = 1000 (K < span <=
+	// 2K), entering at byte 0 trips the forward guard (`r - p > md_para_budget`)
+	// once it has ABSORBED more than K bytes of neighbour lines -- not
+	// "immediately": `r - p` measures bytes absorbed so far, not span remaining,
+	// and with lines ~43-44 bytes each that takes roughly 23 lines, not 0.
+	// Entering mid-block leaves BOTH directions individually under 1000 bytes
+	// (each side absorbs roughly half the span) -- so with the redundant
+	// `(end - start) > budget` term gone, capped would flip to false there while
+	// byte 0 still reports true: the identical entry-dependent flip Important 1
+	// (the review that produced md_table_bounds' own three traps) already fixed
+	// once, one level up.
+	//
+	// Round-2 review, Minor 5: `mid` is derived from the fixture at runtime
+	// (`d.pt.length / 2`) rather than a literal, so if the fixture's wording ever
+	// changes, the K < span <= 2K band this case exists to test could silently
+	// drift out from under it and print "ok" while testing nothing. The band
+	// check below pins `mid > 0`, `mid <= K`, and `span > K` directly, so drift
+	// fails loudly instead of quietly.
+	@(private = "file")
+	pj_case_budget_band_entry_independent :: proc(bad: ^int) {
+		fmt.println("-- capped is entry-independent in the K < span <= 2K budget band --")
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+
+		old_budget := md_para_budget
+		defer md_para_budget = old_budget
+		md_para_budget = 1000 // K; fixture's true span (end-start) is 1749 bytes, so K < span <= 2K
+
+		mid := base.pt_line_start(&d.pt, d.pt.length / 2)
+		span := d.pt.length - 1 // this fixture has no line before byte 0, so start==0 always
+		li_chk(
+			bad,
+			mid > 0 && mid <= md_para_budget && span > md_para_budget,
+			fmt.tprintf("the fixture is still in the K < span <= 2K band (mid=%d, span=%d, K=%d)", mid, span, md_para_budget),
+		)
+
+		_, _, capped_edge, ok_edge := md_para_bounds_for_test(&d, 0)
+		_, _, capped_mid, ok_mid := md_para_bounds_for_test(&d, mid)
+		li_chk(bad, ok_edge && ok_mid, "both entries resolve as paragraph lines")
+		li_chk(
+			bad,
+			capped_edge && capped_mid,
+			fmt.tprintf("entering at byte 0 and mid-block (%d) both report capped (got %v, %v)", mid, capped_edge, capped_mid),
+		)
+	}
+
+	// Round-1 review, Important 2: the line-count analogue of the case above.
+	// R = 40 (the fixture's total line count); md_para_max_lines set between
+	// R/2 and R so that entering at line 0 trips the forward direction's OWN
+	// line count on its own (it must absorb all 39 remaining lines, past the
+	// cap), while entering mid-block lets BOTH directions finish under the cap
+	// individually (~20 lines each way) -- exactly the band where only the
+	// redundant `total_lines > md_para_max_lines` check catches it. Direct
+	// analogue of mdtabletest's row-cap entry-independence case.
+	@(private = "file")
+	pj_case_line_cap_entry_independent :: proc(bad: ^int) {
+		fmt.println("-- capped is entry-independent in the R/2 < lines <= R line-cap band --")
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+
+		old_lines := md_para_max_lines
+		defer md_para_max_lines = old_lines
+		md_para_max_lines = 25 // R/2 (20) < 25 < R (40 total lines)
+
+		// Round-2 review, Minor 5: same drift risk as pj_case_budget_band_entry_
+		// independent, in line counts instead of bytes. `R`, the back-count, and
+		// the forward-count are all recomputed from `starts` here rather than
+		// trusted to stay "20 back / 19 forward / 40 total" if the fixture's line
+		// count ever changes elsewhere in this file.
+		mid_line := 20
+		R := len(starts) - 1 // pj_line_starts' last entry is EOF, not a line start
+		back_count := mid_line
+		fwd_count := R - 1 - mid_line
+		li_chk(
+			bad,
+			back_count < md_para_max_lines && fwd_count < md_para_max_lines && R > md_para_max_lines,
+			fmt.tprintf("the fixture is still in the R/2 < lines <= R line-cap band (back=%d, fwd=%d, R=%d, cap=%d)", back_count, fwd_count, R, md_para_max_lines),
+		)
+
+		_, _, capped_edge, ok_edge := md_para_bounds_for_test(&d, 0)
+		_, _, capped_mid, ok_mid := md_para_bounds_for_test(&d, starts[mid_line])
+		li_chk(bad, ok_edge && ok_mid, "both entries resolve as paragraph lines")
+		li_chk(
+			bad,
+			capped_edge && capped_mid,
+			fmt.tprintf("entering at line 0 and line %d both report capped (got %v, %v)", mid_line, capped_edge, capped_mid),
+		)
+	}
+
+	// Round-1 review, Important 3: `trunc_back, trunc_fwd := !entry_is_line_start,
+	// entry_capped`'s FIRST term is never exercised -- every entry point in the
+	// rest of this suite is a real line start. The intended production caller
+	// (there is none yet -- see md_para_bounds' own doc comment) would feed a
+	// non-line-start `p` two ways: the second and later segments of a line
+	// longer than RENDER_LINE_CAP, and doc.top itself landing mid-line on an
+	// ORDINARY line after some scroll math. This case is the second shape, and
+	// it is the cleaner isolation of the two: the fixture never comes near
+	// md_para_budget or md_para_max_lines (pj_case_budget_truncates already
+	// shows this exact fixture reports capped=false at the production budget),
+	// so nothing else in `capped`'s OR-chain can explain a true result here
+	// except the seed itself.
+	@(private = "file")
+	pj_case_mid_line_forces_capped :: proc(bad: ^int) {
+		fmt.println("-- an entry that is not a real line start is forced capped --")
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+
+		mid_p := starts[5] + 3 // three bytes into an ordinary line, not its start
+		s, e, capped, ok := md_para_bounds_for_test(&d, mid_p)
+		li_chk(bad, ok, "a mid-line entry still resolves as a paragraph line")
+		li_chk(bad, capped, fmt.tprintf("...and is forced capped purely by not being a line start (start=%d end=%d)", s, e))
+	}
+
+	// Round-1 review, Important 3, SECOND term: `entry_capped` (the seed's other
+	// half) is equally unexercised. Isolating it needs an entry that IS a real
+	// line start (so the first term is false and cannot explain the result) but
+	// whose own line already overflowed RENDER_LINE_CAP when md_line_at read it.
+	// A single physical line just over the cap, entered at byte 0 with nothing
+	// before it in the document -- the backward loop's `for q > 0` never runs at
+	// all, so nothing there can set trunc_back either -- and a real span of only
+	// ~8.2 KB. It is ONE physical line with a single trailing newline, not two:
+	// md_line_at reads it in two RENDER_LINE_CAP-bounded segments (the cap
+	// truncation is what makes entry_capped true at all), but the document itself
+	// has no second newline. Nowhere near md_para_budget (256 KB) or
+	// md_para_max_lines (4096) either way. If this reports capped=true,
+	// entry_capped is the only thing in `capped`'s OR-chain that can have done it.
+	@(private = "file")
+	pj_case_entry_capped_forces_capped :: proc(bad: ^int) {
+		fmt.println("-- an entry whose own line already exceeds RENDER_LINE_CAP is forced capped --")
+		filler, _ := strings.repeat("x", RENDER_LINE_CAP + 50, context.temp_allocator)
+		src := fmt.tprintf("%s\n", filler)
+		d := pj_doc(src)
+		defer doc_close(&d)
+
+		s, e, capped, ok := md_para_bounds_for_test(&d, 0)
+		li_chk(bad, ok, "the oversized line resolves as a paragraph line")
+		li_chk(bad, capped, fmt.tprintf("...and is forced capped by its own RENDER_LINE_CAP overflow (start=%d end=%d)", s, e))
+	}
+
+	// Round-2 review, Important 2 (S10): `back_lines > md_para_max_lines` is the
+	// backward direction's OWN line-count guard -- distinct from the byte budget
+	// guard above it and from the redundant final `total_lines > md_para_max_lines`
+	// check, which reports capped=true regardless of whether THIS guard fired and
+	// so cannot tell "it fired" from "it was deleted" (exactly the shape of the
+	// backward BYTE guard's own masking that pj_case_budget_truncates' `start_tail`
+	// check exists to defeat, one level up). The same fix applies here: check
+	// `start` directly rather than only `capped`. With md_para_max_lines=5 and
+	// entry at line 20, this guard fires once back_lines exceeds 5 -- after
+	// absorbing lines 19,18,17,16,15,14 (six lines, back_lines=6) -- so `start`
+	// stops at line 14's start, six lines short of byte 0, not at it. Verified by
+	// hand-tracing the loop and confirmed against the live guard (deleting it
+	// widens the scan all the way to byte 0 instead).
+	@(private = "file")
+	pj_case_line_cap_truncates_backward :: proc(bad: ^int) {
+		fmt.println("-- the backward line-count guard truncates instead of scanning to byte 0 --")
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+
+		old_lines := md_para_max_lines
+		defer md_para_max_lines = old_lines
+		md_para_max_lines = 5
+
+		start, _, capped, ok := md_para_bounds_for_test(&d, starts[20])
+		li_chk(bad, ok, "line 20 resolves as a paragraph line")
+		li_chk(bad, capped, "and the run is (correctly) capped")
+		li_chk(
+			bad,
+			start == starts[14],
+			fmt.tprintf("...and the backward scan itself stopped at line 14, six lines short of byte 0 (got start=%d, want %d)", start, starts[14]),
+		)
+	}
+
+	// Round-2 review, Important 2 (S11): the forward direction's analogue of the
+	// case above, `fwd_lines > md_para_max_lines`. Entering at line 0 with
+	// md_para_max_lines=5, the guard fires once fwd_lines exceeds 5 -- after
+	// absorbing lines 1..6 (six lines, fwd_lines=6) -- so `end` stops at line 6's
+	// own newline, 33 lines short of the document's true end (line 39's), not at
+	// it. Checking `end` directly is what distinguishes "fired" from "deleted";
+	// `capped` alone cannot, for the same reason as S10 above.
+	@(private = "file")
+	pj_case_line_cap_truncates_forward :: proc(bad: ^int) {
+		fmt.println("-- the forward line-count guard truncates instead of scanning to EOF --")
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+
+		old_lines := md_para_max_lines
+		defer md_para_max_lines = old_lines
+		md_para_max_lines = 5
+
+		_, end, capped, ok := md_para_bounds_for_test(&d, 0)
+		li_chk(bad, ok, "line 0 resolves as a paragraph line")
+		li_chk(bad, capped, "and the run is (correctly) capped")
+		li_chk(
+			bad,
+			end == starts[7] - 1,
+			fmt.tprintf("...and the forward scan itself stopped at line 6's newline, short of the document's true end (got end=%d, want %d)", end, starts[7] - 1),
+		)
+	}
+
+	// Round-2 review, Important 2 (S13): `if ne_capped {trunc_fwd = true}` is the
+	// only thing that reports "a neighbour line I absorbed was itself
+	// RENDER_LINE_CAP-truncated" -- distinct from pj_case_entry_capped_forces_
+	// capped above, which tests the seed's `entry_capped` term on the ENTRY's own
+	// line and never reaches this line at all (its fixture has nothing before or
+	// after the one oversized line). Fixture here: a short entry line immediately
+	// followed by one oversized line (RENDER_LINE_CAP + 50 bytes, same size as
+	// that case's). Entering at the short line's start keeps both seed terms
+	// false (it IS a real line start, and its OWN line is short, so
+	// entry_capped=false) and keeps both the byte budget and the line-count cap
+	// far out of reach (true span ~8.2 KB vs a 256 KB budget, 2 lines vs a 4096
+	// cap) -- so `capped` being true at all can only be this propagation firing
+	// when the forward scan absorbs the oversized second line.
+	@(private = "file")
+	pj_case_neighbor_capped_forces_capped :: proc(bad: ^int) {
+		fmt.println("-- an absorbed neighbour line over RENDER_LINE_CAP forces capped too --")
+		filler, _ := strings.repeat("x", RENDER_LINE_CAP + 50, context.temp_allocator)
+		src := fmt.tprintf("p0\n%s\n", filler)
+		d := pj_doc(src)
+		defer doc_close(&d)
+
+		s, e, capped, ok := md_para_bounds_for_test(&d, 0)
+		li_chk(bad, ok, "the entry line resolves as a paragraph line")
+		li_chk(bad, s == 0, "and the backward scan (correctly) finds nothing before it")
+		li_chk(
+			bad,
+			capped,
+			fmt.tprintf("...and the run is forced capped by the absorbed line's RENDER_LINE_CAP overflow (start=%d end=%d)", s, e),
+		)
+	}
+
+	// The layout join itself, not just md_para_bounds' extent: consecutive
+	// prose lines become ONE block, with a space at each break, and the
+	// block's cached `content` must survive past the frame that built it.
+	//
+	// The build's own scratch (the join builder) lives on context.temp_allocator
+	// and md_layout_build_for_test returns before any frame boundary would free
+	// it -- so an assertion made immediately after the call would still pass
+	// even if `cls.content` pointed straight at that scratch instead of at the
+	// owned `joined` clone (the exact lifetime bug menu_open_ctx's comment
+	// warns about for a different structure). free_all(context.temp_allocator)
+	// here, simulating the frame boundary a real layout survives into, before
+	// reading anything back, is what makes this able to fail on that bug.
+	@(private = "file")
+	pj_case_joins_text :: proc(bad: ^int) {
+		fmt.println("-- two prose lines become one paragraph, with a space at the join --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		d := pj_doc("alpha\nbeta\ngamma\n")
+		defer doc_close(&d)
+		lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+		defer md_layout_free(&lay)
+		free_all(context.temp_allocator)
+		li_chk(
+			bad,
+			lay.cls.content == "alpha beta gamma",
+			fmt.tprintf("content is %q (want \"alpha beta gamma\"), read after the temp arena that built it was freed", lay.cls.content),
+		)
+		li_chk(bad, lay.multiline, "the block is marked multiline")
+		// "alpha\nbeta\ngamma\n" is 17 bytes; gamma's newline sits at offset 16, so
+		// `end` (pt_line_end_cap semantics: the last line's newline byte) is 16 and
+		// `next` is one past it.
+		li_chk(bad, lay.end == 16, fmt.tprintf("end is %d (want 16, gamma's newline byte)", lay.end))
+		li_chk(bad, lay.next == 17, fmt.tprintf("next is %d (want 17, past gamma's newline)", lay.next))
+		li_chk(bad, len(lay.joined) > 0, fmt.tprintf("joined holds the owned clone (got %q)", lay.joined))
+
+		// Entered MID-RUN, md_layout_build refuses to join at all. `e.start` is the
+		// key md_layout_ensure looks entries up by, so a block that joined from the
+		// run's true start while reporting `start = p` would claim to begin where it
+		// does not -- the regression that drew the preview from line 0 while the
+		// editor half sat at line 100. md_block_start_at is what makes this entry
+		// unreachable in production; this refusal is what keeps it harmless if some
+		// future resolver forgets to snap.
+		{
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			mid := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, starts[1], 600)
+			defer md_layout_free(&mid)
+			li_chk(bad, mid.start == starts[1], fmt.tprintf("a mid-run entry starts where it was entered (%d, want %d)", mid.start, starts[1]))
+			li_chk(bad, mid.cls.content == "beta", fmt.tprintf("...and holds ONLY its own line, unjoined (%q, want \"beta\")", mid.cls.content))
+			li_chk(bad, !mid.multiline, "...and is not marked multiline")
+		}
+	}
+
+	// The control for pj_case_joins_text: a blank line still separates, and a
+	// single-line paragraph is neither marked multiline nor allocating `joined`.
+	//
+	// Its own procedure rather than a second half of that one, per this file's
+	// standing rule: one Document and one Md_Layout live at a time. The joined
+	// case used to hold two of each at once through stacked `defer`s, and
+	// test_mode_dispatch's frame has hit a real STATUS_STACK_OVERFLOW twice.
+	@(private = "file")
+	pj_case_blank_separates :: proc(bad: ^int) {
+		fmt.println("-- a blank line still separates two paragraphs --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		d := pj_doc("a\n\nb\n")
+		defer doc_close(&d)
+		lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+		defer md_layout_free(&lay)
+		li_chk(bad, lay.cls.content == "a", fmt.tprintf("a blank line still separates (content %q, want \"a\")", lay.cls.content))
+		li_chk(bad, !lay.multiline, "a single-line paragraph is not multiline")
+		li_chk(bad, lay.joined == "", fmt.tprintf("a single-line paragraph does not allocate joined (got %q)", lay.joined))
+	}
+
+	// A hard break (CommonMark: two or more trailing spaces, or a trailing
+	// backslash) survives the join as a real newline instead of a space --
+	// otherwise the join would destroy a break the author asked for. Asserted
+	// on len(lay.sh.line_boxes), never on the joined text: once both a hard
+	// break and a soft join are just bytes in a string, the text cannot tell
+	// them apart, but the shaper renders them differently -- a '\n' always
+	// starts a new line box, a ' ' only does if the measure forces a wrap.
+	//
+	// The measure (600, same as pj_case_joins_text) has to be wide enough
+	// that "alpha", "beta" and "gamma" cannot soft-wrap on their own, or a
+	// case here would pass by accident: "2 line boxes" only means "a hard
+	// break" if the same fixture at the same measure gives exactly 1 without
+	// one. That control is the first case below.
+	@(private = "file")
+	pj_case_hard_breaks :: proc(bad: ^int) {
+		fmt.println("-- a hard break survives the join --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		// Control: no marker anywhere. This is what makes "2" meaningful below --
+		// without it, 2 line boxes on a joined 2-line fixture could just as well
+		// be the ordinary space-join wrapping at the measure.
+		{
+			d := pj_doc("alpha\nbeta\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 1, fmt.tprintf("no marker: %d line boxes (want 1)", len(lay.sh.line_boxes)))
+		}
+
+		// THE NEAR MISS, and the reason it is here: a 2026-08-01 review found the
+		// shipped hard-break code correct but untested against the adjacent wrong
+		// rule. Relaxing the marker from `has_suffix(l, "  ")` to
+		// `has_suffix(l, " ")` -- ONE trailing space, a real CommonMark violation
+		// and an easy thing to write -- left mdjointest at 0 failures. Every case
+		// in this proc was satisfied by it: the control has no trailing space at
+		// all, and both positive cases carry markers a one-space rule still
+		// matches. A single trailing space is ordinary insignificant whitespace
+		// and must join as a space, so this fixture is the discriminator, and it
+		// is the ONLY row here that changes under that edit.
+		{
+			d := pj_doc("alpha \nbeta\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 1, fmt.tprintf("ONE trailing space is not a hard break: %d line boxes (want 1)", len(lay.sh.line_boxes)))
+		}
+
+		// The same gap for the other whitespace character. CommonMark says spaces;
+		// a trailing tab is not a hard break. `trim_right(l, " \t")` strips a tab
+		// from the emitted text, which is what makes "did the marker check also
+		// accept it" invisible in the joined string and visible only here.
+		{
+			d := pj_doc("alpha\t\nbeta\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 1, fmt.tprintf("a trailing tab is not a hard break: %d line boxes (want 1)", len(lay.sh.line_boxes)))
+		}
+
+		// Two trailing spaces on the first line.
+		{
+			d := pj_doc("alpha  \nbeta\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 2, fmt.tprintf("two trailing spaces: %d line boxes (want 2)", len(lay.sh.line_boxes)))
+		}
+
+		// A trailing backslash instead.
+		{
+			d := pj_doc("alpha\\\nbeta\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 2, fmt.tprintf("trailing backslash: %d line boxes (want 2)", len(lay.sh.line_boxes)))
+		}
+
+		// The off-by-one guard. Two CONSECUTIVE hard-marked lines, then one
+		// plain line: alpha and beta both carry the marker, gamma does not, so
+		// the correct join is "alpha\nbeta\ngamma" -- 3 line boxes, one per
+		// line, since every break is hard.
+		//
+		// This targets one specific wrong implementation: deciding the
+		// separator that PRECEDES a line from that line's OWN `hard`, instead
+		// of the PREVIOUS line's (i.e. reading `hard` where this proc reads
+		// `prev_hard`). That mistake already fails the two single-marker
+		// cases above -- alpha's marker never gets consulted, because nothing
+		// precedes the first line to carry a separator -- so on its own this
+		// fixture would not add coverage; a run of just those two cases could
+		// look like "the marker was read but attributed one line off" just as
+		// easily as "the marker was never read at all," and the two are
+		// different bugs. Chaining a second marker onto a third, unmarked
+		// line tells them apart: under the `hard`-not-`prev_hard` mistake,
+		// beta's own marker (true) still splits alpha from beta -- so far
+		// indistinguishable from correct -- but the separator before gamma
+		// then reads gamma's `hard` (false) instead of beta's (true), so
+		// beta's break is silently dropped and the run caps at 2 line boxes
+		// where the correct join gives 3.
+		{
+			d := pj_doc("alpha  \nbeta  \ngamma\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 3, fmt.tprintf("two consecutive hard breaks: %d line boxes (want 3)", len(lay.sh.line_boxes)))
+		}
+	}
+
+	// LAZY CONTINUATION, at the BOUNDS layer: the run a wrapped list item or
+	// blockquote makes, and the two entries into it agreeing.
+	//
+	// This is the only part of the design where a block's extent depends on its
+	// PREDECESSOR, so entry independence is not a nicety here -- md_para_run
+	// memoises by byte window and answers for line starts it has never been asked
+	// about, on the premise that every line start inside one run gives one answer.
+	// The two entries are structurally different code paths (the owner's line skips
+	// the backward scan and seeds the forward one; a continuation line runs the
+	// backward scan and then looks one line above where it settled), so "they agree"
+	// is a real claim about two implementations and not a tautology.
+	//
+	// What each group of rows rejects, verified by running the sabotage:
+	//   - the CONTINUATION-entry rows reject deleting the owner lookup after the
+	//     scans: the run then starts at the continuation line, so md_block_start_at
+	//     answers that line and the item's own text is a different block;
+	//   - the OWNER-entry rows reject deleting the `md_is_continuable` branch at the
+	//     top: md_para_bounds then refuses the marker line outright (`ok=false`) and
+	//     the join in md_layout_build's `.List` case never fires;
+	//   - the SOLO rows reject an owner branch that accepts any marker line: a list
+	//     item with nothing wrapped under it must stay a one-line block, or every
+	//     list in every document becomes a two-line one.
+	@(private = "file")
+	pj_case_lazy_bounds :: proc(bad: ^int) {
+		fmt.println("-- a wrapped list item and a wrapped quote are ONE run, from either end --")
+		{
+			// starts: 0 "- item text", 1 "  continues here", 2 "still going",
+			//         3 "" (blank), 4 "after"
+			d := pj_doc("- item text\n  continues here\nstill going\n\nafter\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := starts[3] - 1 // "still going"'s newline
+
+			s0, e0, c0, ok0 := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok0, "entering on the marker line resolves as a run")
+			li_chk(bad, !c0, "...and is not capped")
+			li_chk(bad, s0 == 0 && e0 == want_end, fmt.tprintf("...covering the item and both wrapped lines (%d..%d, want 0..%d)", s0, e0, want_end))
+
+			// Every entry, including the marker line's own, gives the identical
+			// triple -- and through the MEMO as well as through the producer, since
+			// the memo is what production reads.
+			for li in 0 ..= 2 {
+				s, e, c, o := md_para_bounds_for_test(&d, starts[li])
+				li_chk(
+					bad, o && s == s0 && e == e0 && c == c0,
+					fmt.tprintf("entering at line %d gives (%d,%d,%v); line 0 gave (%d,%d,%v)", li, s, e, c, s0, e0, c0),
+				)
+				ms, me, mo := md_para_run_for_test(&d, starts[li])
+				li_chk(
+					bad, mo && ms == s0 && me == e0,
+					fmt.tprintf("...and the memo agrees at line %d (%d,%d,ok=%v)", li, ms, me, mo),
+				)
+				li_chk(bad, md_block_start_at(&d, starts[li]) == 0, fmt.tprintf("...and line %d snaps to the marker line (got %d)", li, md_block_start_at(&d, starts[li])))
+			}
+
+			// The blank line still ends the item. Without this every row above is
+			// satisfied by bounds that simply swallow the rest of the document.
+			li_chk(
+				bad, md_block_start_at(&d, starts[4]) == starts[4],
+				fmt.tprintf("the paragraph past the blank line is its own block (%d, want %d)", md_block_start_at(&d, starts[4]), starts[4]),
+			)
+			sa, _, _, oka := md_para_bounds_for_test(&d, starts[4])
+			li_chk(bad, oka && sa == starts[4], fmt.tprintf("...and its run does not reach back over the blank (start %d, want %d)", sa, starts[4]))
+		}
+		{
+			// The memo warmed from the OTHER end. The loop above asks at the marker
+			// line first, so the window it stores was measured from the entry that
+			// skips the backward scan; this asks a continuation first and then the
+			// marker line, which is the entry that would be answered out of a window
+			// the producer never ran at. Same run, opposite warming order.
+			d := pj_doc("- item text\n  continues here\nstill going\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := d.pt.length - 1
+			ws, we, wok := md_para_run_for_test(&d, starts[2])
+			li_chk(bad, wok && ws == 0 && we == want_end, fmt.tprintf("warming at the LAST wrapped line gives the whole item (%d..%d, ok=%v; want 0..%d)", ws, we, wok, want_end))
+			ms, me, mok := md_para_run_for_test(&d, 0)
+			li_chk(bad, mok && ms == 0 && me == want_end, fmt.tprintf("...and the marker line reads the same out of that window (%d..%d, ok=%v)", ms, me, mok))
+		}
+		{
+			// The owner's line is COUNTED against md_para_max_lines. The block spans
+			// the marker line plus its continuations, so the cap has to see all of
+			// them -- and this fixture is chosen so that the owner is the line that
+			// tips it: three continuations under a 3-line cap is 4 lines with the
+			// owner counted and 3 without, so `capped` flips on that one increment.
+			d := pj_doc("- item\nc1\nc2\nc3\n")
+			defer doc_close(&d)
+			old := md_para_max_lines
+			defer md_para_max_lines = old
+			md_para_max_lines = 4
+			_, _, c4, ok4 := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok4 && !c4, fmt.tprintf("a 4-line item is not capped at a 4-line cap (capped=%v, ok=%v)", c4, ok4))
+			md_para_max_lines = 3
+			_, _, c3, ok3 := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok3 && c3, fmt.tprintf("...and IS at a 3-line cap, because the marker line counts (capped=%v, ok=%v)", c3, ok3))
+		}
+		{
+			// A list item with nothing wrapped under it is NOT a run, and neither is
+			// the item above another item.
+			d := pj_doc("- solo\n- second\ncontinues\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			_, _, _, ok_solo := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, !ok_solo, "a list item followed by another list item is not a run")
+			li_chk(bad, md_block_start_at(&d, 0) == 0, "...and stays its own block start")
+			s, e, _, ok2 := md_para_bounds_for_test(&d, starts[1])
+			li_chk(
+				bad, ok2 && s == starts[1] && e == d.pt.length - 1,
+				fmt.tprintf("the SECOND item, which does have a wrapped line, is a run (%d..%d, ok=%v; want %d..%d)", s, e, ok2, starts[1], d.pt.length - 1),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, starts[2]) == starts[1],
+				fmt.tprintf("...and its continuation snaps to it, not to the first item (%d, want %d)", md_block_start_at(&d, starts[2]), starts[1]),
+			)
+		}
+		{
+			// A blockquote continues the same way, and a heading does NOT: nothing
+			// lazily continues a heading, so md_is_continuable naming exactly two
+			// kinds is load-bearing rather than shorthand for "not .Para".
+			d := pj_doc("> quoted text\ncontinues here\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			s, e, c, ok := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok && !c && s == 0 && e == d.pt.length - 1, fmt.tprintf("a quote and its unmarked line are one run (%d..%d, capped=%v, ok=%v)", s, e, c, ok))
+			li_chk(bad, md_block_start_at(&d, starts[1]) == 0, fmt.tprintf("...and the unmarked line snaps to the `>` line (%d)", md_block_start_at(&d, starts[1])))
+		}
+		{
+			// AN OWNER LONGER THAN THE LINE-READ CAP, which is the one input that
+			// separates the owner lookup's `ol_capped` check from the backward loop's
+			// own `pl_capped`. The loop's check sits BELOW its `!md_is_para_line`
+			// break, so the single line it never applies to is the one that stopped
+			// it -- the owner.
+			//
+			// The fixture is a marker line of exactly RENDER_LINE_CAP bytes starting at
+			// byte 0. Going backward from the continuation, pt_line_start_cap reaches
+			// offset 0 within its own cap and reports a real line start; reading
+			// FORWARD from that same 0, md_line_at fills its whole RENDER_LINE_CAP
+			// buffer without meeting the newline and reports the line truncated. The
+			// two are independent quantities, which is what makes this constructible at
+			// all (the same asymmetry PROBE A and PROBE B document for S12 below).
+			//
+			// Entered on the marker line, `entry_capped` alone forces capped. Entered
+			// on the continuation, ONLY the owner lookup's check can -- the span is
+			// ~8 KB against a 256 KB budget and 2 lines against a 4096-line cap, so
+			// nothing else in the OR-chain fires. Drop that check and the two entries
+			// disagree: the continuation reports a joinable run starting at byte 0
+			// while the marker line refuses it, and md_block_start_at then hands a
+			// resolver a block start whose layout will not contain the byte it asked
+			// about.
+			long := strings.repeat("x", RENDER_LINE_CAP - 2)
+			defer delete(long)
+			d := pj_doc(strings.concatenate({"- ", long, "\ncontinues\n"}, context.temp_allocator))
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			li_chk(bad, starts[1] == RENDER_LINE_CAP + 1, fmt.tprintf("the marker line is exactly RENDER_LINE_CAP bytes (next line starts at %d, want %d)", starts[1], RENDER_LINE_CAP + 1))
+			_, _, c_owner, ok_owner := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok_owner && c_owner, fmt.tprintf("entering on the over-long marker line reports capped (capped=%v, ok=%v)", c_owner, ok_owner))
+			s_cont, _, c_cont, ok_cont := md_para_bounds_for_test(&d, starts[1])
+			li_chk(
+				bad, ok_cont && c_cont,
+				fmt.tprintf("...and so does entering on its continuation, or the two entries disagree (capped=%v, ok=%v, start=%d)", c_cont, ok_cont, s_cont),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, starts[1]) == starts[1],
+				fmt.tprintf("...so nothing joins across it and the continuation is its own block (%d, want %d)", md_block_start_at(&d, starts[1]), starts[1]),
+			)
+		}
+		{
+			d := pj_doc("# heading\nunmarked line\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			_, _, _, ok := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, !ok, "a heading is not continuable")
+			li_chk(
+				bad, md_block_start_at(&d, starts[1]) == starts[1],
+				fmt.tprintf("...so the line under it is its own block (%d, want %d)", md_block_start_at(&d, starts[1]), starts[1]),
+			)
+		}
+	}
+
+	// LAZY CONTINUATION, at the LAYOUT layer: the wrapped line renders as part of
+	// the item, with the item's indent and the item's bullet.
+	//
+	// THE ROWS THAT MATTER RESOLVE THE CONTINUATION'S OWN BYTE and assert on
+	// whatever block comes back, rather than asserting on the block at byte 0.
+	// That is the difference between a test that catches this bug and one that does
+	// not: with the fix removed, byte 0 still builds a perfectly good `.List` block
+	// with the right kind, indent and bullet -- it just does not contain the wrapped
+	// line, which lands in a `.Para` block of its own at indent 0. Asking "what is
+	// the block that holds `continues here`, and what are ITS indent and bullet" is
+	// the question the bug answers wrongly.
+	//
+	// Both the indent and the kind are asserted, and they are not the same
+	// assertion: zeroing `e.indent` in md_layout_build's `.List` case leaves every
+	// kind, bullet and content row below passing and fails only the indent rows.
+	@(private = "file")
+	pj_case_lazy_continuation :: proc(bad: ^int) {
+		fmt.println("-- a wrapped list item and a wrapped quote keep their block --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		// The reference: an item with nothing wrapped under it. Its indent and
+		// marker are what a continued item's must equal -- a separate number for a
+		// continued item would be a second producer of the same inset.
+		solo_indent, solo_marker := f32(0), f32(0)
+		{
+			d := pj_doc("- item text\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			solo_indent, solo_marker = lay.indent, lay.marker
+			li_chk(bad, lay.cls.kind == .List, fmt.tprintf("the reference item is a list block (%v)", lay.cls.kind))
+			li_chk(bad, !lay.multiline, "...and is not multiline")
+			li_chk(bad, solo_indent > 0, fmt.tprintf("...and a list block is inset at all (indent %v)", solo_indent))
+			li_chk(bad, solo_marker < solo_indent, fmt.tprintf("...with its bullet left of its prose (marker %v, indent %v)", solo_marker, solo_indent))
+		}
+		{
+			// COLD, and its own Document for that reason. md_walk enters a block from
+			// the block above it and never snaps, so the marker line is the first byte
+			// md_para_run is ever asked about here -- which is the path that exercises
+			// md_para_bounds' OWNER ENTRY. Calling md_block_start_at first, as the
+			// scope below does, warms the memo's window from the CONTINUATION entry
+			// and the marker line is then answered out of that window without the
+			// owner entry running at all: verified by sabotage, where deleting the
+			// owner-entry branch left every row in the warm scope passing and failed
+			// only here and at the bounds layer.
+			d := pj_doc("- item text\n  continues here\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			free_all(context.temp_allocator)
+			li_chk(
+				bad, lay.cls.content == "item text continues here",
+				fmt.tprintf("a forward walk into the marker line joins the wrapped line, its indent folded away (%q)", lay.cls.content),
+			)
+			li_chk(bad, lay.multiline, "...and the continued item is marked multiline")
+			li_chk(bad, lay.cls.kind == .List, fmt.tprintf("...still a list block (%v)", lay.cls.kind))
+			li_chk(bad, lay.next == d.pt.length, fmt.tprintf("...consuming the whole document, leaving no stray block after it (next %d, want %d)", lay.next, d.pt.length))
+		}
+		{
+			// The other production path: resolve the WRAPPED line's byte the way every
+			// resolver does, then lay out whatever block that names. This is the row
+			// that fails when the continuation renders as a stray paragraph -- the
+			// block it names is then that paragraph, at indent 0 with no bullet.
+			d := pj_doc("- item text\n  continues here\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			blk := md_block_start_at(&d, starts[1])
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, blk, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, lay.cls.kind == .List, fmt.tprintf("the block holding the wrapped line is a LIST block (%v, want .List)", lay.cls.kind))
+			li_chk(bad, lay.cls.bullet == "•", fmt.tprintf("...carrying the item's bullet (%q, want \"•\")", lay.cls.bullet))
+			li_chk(bad, lay.indent > 0, fmt.tprintf("...inset from the content origin at all, not sitting at 0 like a stray paragraph (indent %v)", lay.indent))
+			li_chk(bad, lay.indent == solo_indent, fmt.tprintf("...at the item's own indent (%v, want %v)", lay.indent, solo_indent))
+			li_chk(bad, lay.marker == solo_marker, fmt.tprintf("...and the item's own marker inset (%v, want %v)", lay.marker, solo_marker))
+			li_chk(
+				bad, lay.cls.content == "item text continues here",
+				fmt.tprintf("...and both lines' text (%q)", lay.cls.content),
+			)
+		}
+		{
+			// The control: a blank line still ends the item, so the paragraph after
+			// it is its own block and the item holds only its own text. Without
+			// this, everything above is satisfied by a join that never stops.
+			d := pj_doc("- item\n\nloose para\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, lay.cls.content == "item", fmt.tprintf("a blank line ends the item (%q, want \"item\")", lay.cls.content))
+			li_chk(bad, !lay.multiline, "...so it is not multiline")
+			li_chk(bad, lay.end == starts[1] - 1, fmt.tprintf("...and ends at its own newline (%d, want %d)", lay.end, starts[1] - 1))
+			li_chk(
+				bad, md_block_start_at(&d, starts[2]) == starts[2],
+				fmt.tprintf("...and the loose paragraph is its own block (%d, want %d)", md_block_start_at(&d, starts[2]), starts[2]),
+			)
+		}
+		{
+			// The same for a blockquote, whose marker is the bar md_block_draw paints
+			// from `indent` and `cls.level` -- both of which are the `>` line's, not
+			// the unmarked line's.
+			// Cold, for the reason the list's cold scope gives: entered at the `>`
+			// line with nothing having warmed the memo, which is what a forward walk
+			// does and what exercises the owner entry.
+			d := pj_doc("> quoted text\ncontinues here\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, lay.cls.kind == .Quote, fmt.tprintf("the continued quote is a QUOTE block (%v, want .Quote)", lay.cls.kind))
+			li_chk(bad, lay.cls.level == 1, fmt.tprintf("...at the `>` line's own depth (%d, want 1)", lay.cls.level))
+			li_chk(bad, lay.indent > 0, fmt.tprintf("...and inset by it (indent %v)", lay.indent))
+			li_chk(bad, lay.cls.content == "quoted text continues here", fmt.tprintf("...holding both lines' text (%q)", lay.cls.content))
+			li_chk(bad, lay.multiline, "the continued quote is marked multiline")
+		}
+		{
+			// A task item's checkbox is decided by md_classify off the MARKER line, so
+			// a `[x]` inside a continuation must not become one -- and the item's own
+			// one must survive the join.
+			d := pj_doc("- [ ] todo\n[x] not a checkbox\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, lay.cls.task && !lay.cls.task_done, fmt.tprintf("the item is still an unticked task (task=%v done=%v)", lay.cls.task, lay.cls.task_done))
+			li_chk(bad, lay.cls.content == "todo [x] not a checkbox", fmt.tprintf("...and the continuation is plain text (%q)", lay.cls.content))
+		}
+	}
+
+	// The `capped` return is CONSUMED -- by md_para_run, on behalf of both sites
+	// that ask where a block begins, so the layout and the snap refuse the same
+	// runs by construction.
+	//
+	// WHY THE REFUSAL EXISTS is that agreement, and nothing else. This comment used
+	// to say a capped run that joined would be re-drawn by the block after it; a
+	// 2026-08-01 review measured that with the `!capped` test removed and `ps == p`
+	// kept and found zero duplication -- block 1 spans 0..203 with next=204, block
+	// 2 spans 204..237 -- because `ps != p` refuses block 2 before its truncated
+	// bounds are ever used. Two guards, each individually sufficient against a
+	// re-draw, and each was being credited with the other's work.
+	//
+	// What a disagreement WOULD cost is what the rows below pin: the snap answering
+	// one byte and the layout starting the block at another, which is the shape of
+	// the regression md_block_start_at was added to remove. The fallback for a
+	// capped run is the unjoined single-line block -- bounded, and exactly what
+	// shipped before the join.
+	//
+	// Driven through the real guard by lowering md_para_max_lines rather than by
+	// building a 5000-line fixture, as pj_case_budget_truncates already does.
+	@(private = "file")
+	pj_case_capped_refuses :: proc(bad: ^int) {
+		fmt.println("-- a capped run is joined by neither the layout nor the snap --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %02d of one unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+		mid := starts[20]
+
+		// The control. Without it every row below is satisfied by a fixture that
+		// never joins at any cap.
+		{
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, lay.multiline, "at the production cap the 40-line run DOES join")
+			li_chk(bad, md_block_start_at(&d, mid) == 0, fmt.tprintf("...and a byte in its middle snaps back to byte 0 (%d)", md_block_start_at(&d, mid)))
+		}
+
+		old_lines := md_para_max_lines
+		defer md_para_max_lines = old_lines
+		md_para_max_lines = 4
+
+		lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+		defer md_layout_free(&lay)
+		li_chk(bad, !lay.multiline, fmt.tprintf("with a 4-line cap the same run is NOT joined (multiline %v)", lay.multiline))
+		li_chk(bad, lay.end == starts[1] - 1, fmt.tprintf("...the block is its own single line (end %d, want %d)", lay.end, starts[1] - 1))
+		li_chk(
+			bad, lay.next == starts[1],
+			fmt.tprintf("...and hands the walk the NEXT line, not a byte inside the run (next %d, want %d)", lay.next, starts[1]),
+		)
+		li_chk(
+			bad, md_block_start_at(&d, mid) == mid,
+			fmt.tprintf("the snap refuses the same capped run, so that line is its own block start (%d, want %d)", md_block_start_at(&d, mid), mid),
+		)
+		// The block AFTER the refused one, so the row above is not the only thing
+		// standing between this fixture and a re-draw. Under a sabotage that lets a
+		// capped run join (2026-08-01), block 1 becomes 0..203 next=204 and this
+		// block comes back 204..237 -- refused by `ps == p`, not by `!capped`, and
+		// duplicating nothing. That measurement is why the `!capped` refusal is
+		// justified by the snap/layout agreement and not by a re-draw it does not
+		// actually prevent.
+		{
+			b2 := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, lay.next, 600)
+			defer md_layout_free(&b2)
+			li_chk(bad, b2.start == lay.next, fmt.tprintf("the block after it starts where the walk was sent (%d, want %d)", b2.start, lay.next))
+			li_chk(bad, !b2.multiline, fmt.tprintf("...and does not itself join backwards over the refused run (multiline %v)", b2.multiline))
+		}
+	}
+
+	// md_block_start_at as a unit. mdtest's md_scroll_selftest section B3 asserts
+	// the product-level consequence -- the Split anchor, through md_anchor_from_top
+	// and a real device -- and this asserts the three properties that make the
+	// procedure safe to put in front of every walk: it lands on the run's start
+	// from any byte, it is idempotent, and it does not walk out of a fence.
+	//
+	// The fence row is not decoration. Unlike md_layout_build's `.Para` case, this
+	// procedure holds no fence state, so md_is_para_line genuinely answers "yes" to
+	// a fence body line that reads as prose; md_para_bounds' fence contract claims
+	// that is safe, and this is what makes the claim testable.
+	@(private = "file")
+	pj_case_snap_is_the_entry :: proc(bad: ^int) {
+		fmt.println("-- a byte snaps back to the start of the block that contains it --")
+		{
+			d := pj_doc("alpha\nbeta\ngamma\n\ndelta\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			for li in 0 ..< 3 {
+				li_chk(bad, md_block_start_at(&d, starts[li]) == 0, fmt.tprintf("line %d of the run snaps to byte 0 (got %d)", li, md_block_start_at(&d, starts[li])))
+			}
+			li_chk(bad, md_block_start_at(&d, md_block_start_at(&d, starts[2])) == 0, "the snap is idempotent")
+			// A byte that is not a line start at all: md_scroll_to_fraction hands
+			// md_block_at_byte the raw `int(t)` off the scrollbar's scalar.
+			li_chk(
+				bad, md_block_start_at(&d, starts[1] + 2) == 0,
+				fmt.tprintf("a byte mid-line snaps as well (%d)", md_block_start_at(&d, starts[1] + 2)),
+			)
+			// ...and the run really ENDS, or every row above is satisfied by a
+			// procedure that always answers 0. starts[4] is "delta", after the blank.
+			li_chk(
+				bad, md_block_start_at(&d, starts[4]) == starts[4],
+				fmt.tprintf("the paragraph past the blank line is its own block start (%d, want %d)", md_block_start_at(&d, starts[4]), starts[4]),
+			)
+		}
+		{
+			// "x is one" and "y is two" are ordinary prose to md_classify with no
+			// fence state, so the backward scan from "y is two" walks over "x is
+			// one" and then meets ``` -- `.Fence_Open`, which md_is_para_line
+			// refuses. It stops there, and the byte it returns is a fence BODY line
+			// start, which inside a fence is a real block start. What it must never
+			// do is cross the delimiter and answer with "intro".
+			d := pj_doc("intro\n\n```\nx is one\ny is two\n```\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			fence_open, first_body, second_body := starts[2], starts[3], starts[4]
+			li_chk(
+				bad, md_block_start_at(&d, second_body) == first_body,
+				fmt.tprintf("inside a fence the snap stops at the opening delimiter (%d, want %d, not %d)", md_block_start_at(&d, second_body), first_body, fence_open),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, first_body) == first_body,
+				fmt.tprintf("...and a fence body line is its own block start (%d, want %d)", md_block_start_at(&d, first_body), first_body),
+			)
+		}
+	}
+
+	// The cache itself: build the same block twice at the same width and
+	// revision, through md_layout_ensure (not md_layout_build -- that is the
+	// path under test). Without .Para being extern-dep, md_layout_ensure's
+	// `e.end != line_end` test compares against the FIRST line's end while the
+	// joined entry's `e.end` is the whole paragraph's end, so a joined block
+	// misses on every lookup and rebuilds every frame -- md_layout_builds is the
+	// only honest way to see that, since a correct cache and no cache at all
+	// return identical glyphs.
+	@(private = "file")
+	// A block that BECOMES multiline must not be served from the slot it filled
+	// while it was still single-line.
+	//
+	// This is the live-editing half of the cache question, and pj_case_cache_holds
+	// below cannot see it: that case never edits, so every lookup it makes is
+	// against a document whose bytes have not moved. Found by a 2026-08-01 review
+	// and reproduced through md_layout_ensure for all three joining kinds before
+	// the guard existed:
+	//
+	//   STALE[para]:  before multi=false "alpha" | after multi=false "alpha"
+	//   STALE[list]:  before multi=false "item"  | after multi=false "item"
+	//   STALE[quote]: before multi=false "q"     | after multi=false "q"
+	//
+	// The mechanism: a single-line block has multiline = false, so keying extern
+	// dependence on that flag left it keyed on `e.src != line || e.end != line_end`
+	// -- and appending a line BELOW the block changes neither. In Split view,
+	// typing a continuation under a bullet redrew the item unjoined and dropped the
+	// new line out as a stray .Para at indent 0, which is the exact defect lazy
+	// continuation exists to fix.
+	//
+	// Asserted per KIND rather than once, because md_kind_joins names three and a
+	// single-kind case would pass with two of them dropped from it.
+	pj_case_cache_sees_growth :: proc(bad: ^int) {
+		fmt.println("-- a block that becomes multiline is not served stale --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		grow :: proc(bad: ^int, h: ^Headless_Gpu, m: ^Md_Metrics, seed, tail, want: string, label: string) {
+			d := pj_doc(seed)
+			defer doc_close(&d)
+			defer md_layout_reset(&d)
+			// Fill the slot while the block is still single-line -- the whole point.
+			l1 := md_layout_ensure_for_test(&h.gfx, &h.text, &d, m, 0, 600)
+			li_chk(bad, !l1.multiline, fmt.tprintf("%s: the block starts single-line (multiline=%v)", label, l1.multiline))
+
+			// Append through the real edit path, so doc.revision moves the way a
+			// keystroke moves it rather than by being set here.
+			d.cursor = d.pt.length
+			d.anchor = d.cursor
+			doc_insert_text(&d, transmute([]u8)tail, .Type)
+
+			l2 := md_layout_ensure_for_test(&h.gfx, &h.text, &d, m, 0, 600)
+			li_chk(bad, l2.multiline, fmt.tprintf("%s: it is multiline after the append (got %v)", label, l2.multiline))
+			li_chk(bad, l2.cls.content == want, fmt.tprintf("%s: content is %q (want %q)", label, l2.cls.content, want))
+		}
+
+		grow(bad, &h, &m, "alpha\n", "beta\n", "alpha beta", "para")
+		grow(bad, &h, &m, "- item\n", "cont\n", "item cont", "list")
+		grow(bad, &h, &m, "> q\n", "cont\n", "q cont", "quote")
+	}
+
+	// Scrolling down into a joined paragraph and back up lands on the same anchor.
+	//
+	// This is the seam md_block_start_at was written for, asserted end to end
+	// through the real scroll gesture rather than through the bounds function.
+	// A joined paragraph starts ABOVE its own line, so every byte-to-block
+	// resolver has to agree about where it begins; when they did not, the preview
+	// drew from line 0 while the editor sat at line 100.
+	//
+	// The fixture's paragraphs are 40 source lines, and MD_RUNUP_LINES is 24. That
+	// inequality is the whole point: a run-up cannot clear a paragraph this long,
+	// so the anchor genuinely has to be resolved rather than found by walking back
+	// a fixed number of lines. On 10-line paragraphs this case passes with the snap
+	// deleted.
+	//
+	// The `moved` assertion is what stops the round trip being vacuous: a scroll
+	// that silently clamped at the top would return to the start trivially and
+	// prove nothing.
+	pj_case_scroll_round_trip :: proc(bad: ^int) {
+		fmt.println("-- scrolling into a joined paragraph and back lands on the same anchor --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so an anchor could be resolved")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for para in 0 ..< 3 {
+			for i in 0 ..< 40 {fmt.sbprintf(&sb, "paragraph %d line %02d of hard wrapped prose\n", para, i)}
+			strings.write_string(&sb, "\n")
+		}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		defer md_layout_reset(&d)
+		d.md_mode = .Preview
+
+		c, cok := md_scroll_ctx(&h.gfx, &h.text, &d, 16, 800, 600, 0.5)
+		if !cok {
+			li_chk(bad, false, "a scroll context came up")
+			return
+		}
+
+		start := md_anchor_from_top(&c, 0)
+		a := start
+		for _ in 0 ..< 60 {a = md_scroll_px(&c, a, 40)}
+		mid := a
+		// Moving is not enough, and the first draft of this case only asserted that
+		// -- 12 steps of 40 px stayed inside the FIRST block, where the snap is
+		// trivially the identity, and deleting md_block_start_at from md_runup_start
+		// left the whole mode green. The anchor has to reach a LATER block before
+		// any of this exercises the seam.
+		li_chk(
+			bad,
+			mid.block > start.block,
+			fmt.tprintf("scrolling down crossed into a later block (block %d px %.1f -> block %d px %.1f)", start.block, start.px, mid.block, mid.px),
+		)
+		for _ in 0 ..< 60 {a = md_scroll_px(&c, a, -40)}
+		li_chk(
+			bad,
+			a == start,
+			fmt.tprintf("...and coming back lands on the same anchor (block %d px %.1f, want block %d px %.1f)", a.block, a.px, start.block, start.px),
+		)
+		li_chk(
+			bad,
+			md_anchor_top_byte(&c, a) == md_anchor_top_byte(&c, start),
+			fmt.tprintf("...and the same top byte (%d, want %d)", md_anchor_top_byte(&c, a), md_anchor_top_byte(&c, start)),
+		)
+
+		// Every anchor the round trip passed through must name a real block start.
+		// A block that claims to start where it does not is the defect itself, and
+		// it is invisible to the round trip alone -- a consistently wrong answer
+		// still returns to where it began.
+		b := start
+		bad_starts := 0
+		seen_blocks := 0
+		last_block := -1
+		for _ in 0 ..< 60 {
+			if md_block_start_at(&d, b.block) != b.block {bad_starts += 1}
+			if b.block != last_block {seen_blocks += 1;last_block = b.block}
+			b = md_scroll_px(&c, b, 40)
+		}
+		// Without this the loop above can spend all 60 steps in one block and check
+		// the identity case sixty times, which is what the first draft did.
+		li_chk(bad, seen_blocks >= 3, fmt.tprintf("the descent visited several blocks (%d)", seen_blocks))
+		li_chk(bad, bad_starts == 0, fmt.tprintf("every anchor on the way down names a real block start (%d did not)", bad_starts))
+	}
+
+	pj_case_cache_holds :: proc(bad: ^int) {
+		fmt.println("-- a joined block is not rebuilt every frame --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		d := pj_doc("alpha\nbeta\ngamma\n")
+		defer doc_close(&d)
+		defer md_layout_reset(&d)
+		before := md_layout_builds
+		l1 := md_layout_ensure_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+		li_chk(bad, l1.multiline, "the first call built a joined, multiline block")
+		mid := md_layout_builds
+		li_chk(bad, mid == before + 1, fmt.tprintf("the first call built exactly one block (builds went %d -> %d)", before, mid))
+		l2 := md_layout_ensure_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+		after := md_layout_builds
+		li_chk(bad, l2.cls.content == "alpha beta gamma", fmt.tprintf("the second call still returns the joined content (%q)", l2.cls.content))
+		li_chk(bad, after == mid, fmt.tprintf("the second call was a cache HIT (builds stayed at %d, got %d)", mid, after))
+	}
+
+	// S12 (`if pl_capped {trunc_back = true}`) has NO case here -- still
+	// deliberate, but round 2's reason for that ("cannot currently be true when
+	// reached through a legitimate loop iteration") was WRONG and has been
+	// replaced below after a round-3 review disproved it with two probes,
+	// independently reproduced before this comment was rewritten:
+	//
+	//   PROBE A: 24576 'x' + "\n", entered at p=RENDER_LINE_CAP (8192, the second
+	//   RENDER_LINE_CAP-bounded segment of that one oversized line). The backward
+	//   search's target position (p-1=8191) is within RENDER_LINE_CAP of byte 0,
+	//   so the scan reaches the document start (`floor == 0`) before finding any
+	//   newline and pt_line_start_cap's own "reaching offset 0 is a real line
+	//   start" rule reports exact=true, ps=0 -- a real line start, just not one
+	//   found BY finding a newline. Reading forward RENDER_LINE_CAP bytes from
+	//   that same ps=0 does not reach the line's real end (byte 24576), so the
+	//   line this ps names reads back oversized: pl_capped=true. Reproduced
+	//   independently: ps=0 exact=true pl_capped=true => start=0 end=24576
+	//   capped=true.
+	//
+	//   PROBE B: "s0\n" + 24576 'x' + "\n", entered at p=true_start+RENDER_LINE_CAP
+	//   (true_start=3, p=8195) -- mid-way through the SAME oversized line's second
+	//   segment, not a neighbour line. This is exactly the "second and later
+	//   segments" entry shape md_para_bounds' own doc comment says markdown_draw
+	//   produces. Here the backward search finds a REAL newline (the one ending
+	//   "s0\n") within RENDER_LINE_CAP of p-1, genuinely, not via the floor==0
+	//   shortcut -- ps=3 is authentically that oversized line's own true start.
+	//   Reading forward RENDER_LINE_CAP bytes from ps=3 again falls short of the
+	//   line's real end, so pl_capped=true a second, unrelated way. Reproduced
+	//   independently: ps=3 exact=true pl_capped=true => start=0 end=24579
+	//   capped=true (the reviewer's own probe reported end=24582 on a
+	//   differently-sized filler; the mechanism, not the exact byte count, is
+	//   what was being verified).
+	//
+	// Round 2's mistake: it treated "exact=true" as proof the found line, read
+	// forward from ps, must be SHORT -- reasoning that pt_line_start_cap and
+	// pt_line_end_cap share one constant, so "found within budget going
+	// backward from the search position" and "overflows budget going forward
+	// from the line start" looked mutually exclusive. That equivalence only
+	// holds when the backward search's start position sits near the FOUND
+	// line's own end. It does not have to: q-1 can be anywhere inside a long
+	// line, including precisely RENDER_LINE_CAP past that line's true start --
+	// which is exactly the entry point md_para_bounds' own doc comment says the
+	// intended production caller would produce for every segment after a long
+	// line's first (there is no such caller yet; PROBE B's fixture stands in
+	// for one). Backward distance from q-1 to ps and forward distance from ps
+	// to the line's real end are independent quantities; nothing forces them to
+	// trade off.
+	//
+	// So: S12 IS reachable, by construction, on realistic input -- not dead code.
+	// What survives from round 2's investigation is narrower and still true: in
+	// both probes above, `p` is not a real line start (0 and 3 are the only real
+	// line starts in each fixture; 8192 and 8195 are neither), so the seed
+	// (`!entry_is_line_start`) already forces trunc_back=true before this loop's
+	// first iteration runs, on both probes' own reported values, above. Every
+	// fixture built so far reaches S12 only through an entry point the seed
+	// already condemns, so S12's own, independent contribution to `capped` has
+	// not been observed to flip a result the seed did not already produce. That
+	// is a claim about every case found so far, not a proof no such case exists,
+	// and it does not make the line dead: dead code cannot change a return value
+	// under ANY input, and S12 can (it forces trunc_back=true where the naive
+	// backward walk, absent this check, would just have kept going past a
+	// too-long "previous line" as though it were an ordinary one). Whether a
+	// fixture exists where S12 fires and the seed does not is unresolved; not
+	// pursued further because md_para_bounds itself is out of this task's scope.
+	// Recorded for the whole-branch review, not asserted away with a test that
+	// cannot honestly fail.
+
+	// md_para_run's MEMO, checked against md_para_bounds itself.
+	//
+	// The memo answers from a byte WINDOW rather than from the entry byte, so a
+	// wrong window is a wrong answer for every byte in it, not just the one it was
+	// asked about -- and a stale window (surviving an edit) or a poisoned one (a
+	// verdict stored from an entry that was not a line start) both hand back a
+	// plausible triple rather than crashing. Every row compares the memo against
+	// the unmemoised producer on the same byte, so a divergence is visible rather
+	// than merely fast.
+	@(private = "file")
+	pj_case_memo_matches_producer :: proc(bad: ^int) {
+		fmt.println("-- the bounds memo answers exactly what the producer would --")
+		{
+			sb := strings.builder_make()
+			defer strings.builder_destroy(&sb)
+			for i in 0 ..< 40 {fmt.sbprintf(&sb, "run one line %02d of unbroken prose\n", i)}
+			strings.write_string(&sb, "\n")
+			for i in 0 ..< 40 {fmt.sbprintf(&sb, "run two line %02d of unbroken prose\n", i)}
+			d := pj_doc(strings.to_string(sb))
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+
+			// Walked from both ends inwards, alternating: MD_PARA_SLOTS is 4, so this
+			// order crosses the blank line -- and so switches runs -- on every step,
+			// which is the access pattern a memo keyed on the entry byte would miss on
+			// every time and one keyed on a wrong window would answer wrongly on.
+			diverged, first_at := 0, -1
+			n := len(starts) - 1 // the last entry is EOF, not a line start
+			for k in 0 ..< n {
+				li := k / 2 if k % 2 == 0 else n - 1 - k / 2
+				p := starts[li]
+				ws, we, wc, wok := md_para_bounds_for_test(&d, p)
+				gs, ge, gok := md_para_run_for_test(&d, p)
+				want := wok && !wc
+				if gok != want || (want && (gs != ws || ge != we)) {
+					if diverged == 0 {
+						first_at = p
+						fmt.printfln("    first divergence at byte %d: memo (%d,%d,ok=%v), producer (%d,%d,capped=%v,ok=%v)", p, gs, ge, gok, ws, we, wc, wok)
+					}
+					diverged += 1
+				}
+			}
+			li_chk(bad, diverged == 0, fmt.tprintf("the memo matches the producer at all %d line starts (%d diverged, first at %d)", n, diverged, first_at))
+
+			// Keyed on doc.revision, and this is what says so. The memo is warm on run
+			// two's whole extent; splitting that run with a blank line must retire it,
+			// or the answer stays the pre-edit end -- a byte now inside a DIFFERENT
+			// block, which is the shape of every stale-cache bug this file has hit.
+			two := starts[41]
+			ws, we, wok := md_para_run_for_test(&d, two)
+			li_chk(bad, wok && ws == two && we == d.pt.length - 1, fmt.tprintf("run two is one joinable run before the edit (%d..%d, ok=%v)", ws, we, wok))
+			split := starts[61]
+			doc_replace_range(&d, split, 0, transmute([]u8)string("\n"))
+			gs, ge, gok := md_para_run_for_test(&d, two)
+			li_chk(
+				bad, gok && gs == two && ge == split - 1,
+				fmt.tprintf("the edit retired the memo: run two now ends at the new blank line (%d..%d, ok=%v; want %d..%d)", gs, ge, gok, two, split - 1),
+			)
+		}
+		{
+			// THE POISONING TRAP. A mid-line entry is forced capped by md_para_bounds'
+			// own entry_is_line_start seed -- a verdict about the ENTRY, not about the
+			// run -- so storing it would answer "not joinable" for every line start in
+			// a run that joins perfectly well. Asked in that order deliberately: the
+			// mid-line question first, then the one it would have poisoned.
+			d := pj_doc("alpha\nbeta\ngamma\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			_, _, mid_ok := md_para_run_for_test(&d, starts[1] + 2)
+			li_chk(bad, !mid_ok, "a mid-line entry is not a joinable run")
+			s, e, ok := md_para_run_for_test(&d, 0)
+			li_chk(
+				bad, ok && s == 0 && e == d.pt.length - 1,
+				fmt.tprintf("...and it did not poison the run it sits in (%d..%d, ok=%v; want 0..%d)", s, e, ok, d.pt.length - 1),
+			)
+		}
+	}
+
+	// md_block_start_at's ONE stated exception: a byte inside a line longer than
+	// RENDER_LINE_CAP, where the capped line-start scan finds no line start at all
+	// and the procedure hands `p` itself back. That byte is a segment boundary of
+	// markdown_draw's capped walk, not a block start, so the invariant every other
+	// caller relies on does not hold there -- it is bounded and deliberate, and
+	// until now it was the one branch nothing exercised.
+	//
+	// What makes it safe is the second half: nothing JOINS across such a line, so
+	// no block built at that byte can claim to hold text from above it.
+	@(private = "file")
+	pj_case_overlong_line :: proc(bad: ^int) {
+		fmt.println("-- a line past RENDER_LINE_CAP: the snap's stated exception --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		// "s0\n" then one line of 3 x RENDER_LINE_CAP, then ordinary prose. The long
+		// line's true start is byte 3; byte 3 + RENDER_LINE_CAP is far enough past it
+		// that the backward scan's floor lands above the newline at byte 2.
+		long := strings.repeat("x", RENDER_LINE_CAP * 3)
+		defer delete(long)
+		d := pj_doc(strings.concatenate({"s0\n", long, "\ntail\n"}, context.temp_allocator))
+		defer doc_close(&d)
+
+		true_start, seg := 3, 3 + RENDER_LINE_CAP
+		ls, exact := base.pt_line_start_cap(&d.pt, seg, RENDER_LINE_CAP)
+		li_chk(bad, !exact, fmt.tprintf("byte %d has no line start within the scan cap (got %d, exact=%v)", seg, ls, exact))
+		li_chk(
+			bad, md_block_start_at(&d, seg) == seg,
+			fmt.tprintf("...so the snap hands that byte straight back (%d, want %d, NOT the line's real start %d)", md_block_start_at(&d, seg), seg, true_start),
+		)
+		li_chk(bad, md_block_start_at(&d, seg) == md_block_start_at(&d, md_block_start_at(&d, seg)), "...and the overshoot is still idempotent")
+		// The half that makes it safe. "s0" and the long line are both prose, so
+		// without the cap they would be one run; the long line forces capped from
+		// every entry, so nothing joins and no block holds text it did not start at.
+		li_chk(
+			bad, md_block_start_at(&d, true_start) == true_start,
+			fmt.tprintf("the long line does not join to the prose above it (%d, want %d)", md_block_start_at(&d, true_start), true_start),
+		)
+		lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, seg, 600)
+		defer md_layout_free(&lay)
+		li_chk(bad, !lay.multiline, fmt.tprintf("a block built at that byte is not joined (multiline %v)", lay.multiline))
+		li_chk(bad, lay.joined == "", fmt.tprintf("...and allocated no joined text (%q)", lay.joined[:min(len(lay.joined), 20)]))
+	}
+
+	// The kinds of every block in `d`, walked exactly the way md_walk walks: enter
+	// at byte 0 and follow each block's own `next`.
+	//
+	// The loop bound is `p <= d.pt.length`, which is md_walk's, so a fixture ending
+	// in a newline yields a trailing `.Blank` for the empty last line. That is not
+	// an artefact of this helper -- md_walk produces it too -- so the expectations
+	// below carry it rather than trimming it away.
+	//
+	// It exists so the setext cases can assert on WHAT IS LEFT OVER, which is the
+	// only thing that catches an extent stopping short of the underline: a promoted
+	// block with the right kind, level and text still leaves the underline behind as
+	// a `.Rule` block if `next` did not clear it, and every per-block assertion
+	// about the heading itself passes while that happens.
+	//
+	// One Md_Layout live at a time, per this file's standing rule -- each is freed
+	// before the next is built, and only the kind is carried out.
+	@(private = "file")
+	pj_kinds :: proc(h: ^Headless_Gpu, m: ^Md_Metrics, d: ^Document, allocator := context.allocator) -> []Md_Kind {
+		out := make([dynamic]Md_Kind, 0, 8, allocator)
+		p := 0
+		for p <= d.pt.length && len(out) < 16 {
+			lay := md_layout_build_for_test(&h.gfx, &h.text, d, m, p, 600)
+			append(&out, lay.cls.kind)
+			nxt := lay.next
+			md_layout_free(&lay)
+			if nxt <= p {break}
+			p = nxt
+		}
+		return out[:]
+	}
+
+	// SETEXT HEADINGS at the BOUNDS layer: `Title` over `===` is an h1 and over
+	// `---` an h2, the underline is part of the heading's run, and every entry into
+	// that run -- including one landing ON the underline -- gives the same answer.
+	//
+	// WHY THE ENTRY-INDEPENDENCE ROWS ARE THE POINT. md_para_run answers for line
+	// starts it has never been asked about, on the premise that every byte in its
+	// window yields identical bounds; md_block_start_at is the only thing that turns
+	// a scrolled-to byte into a walk entry. If the underline resolved to itself while
+	// a walk from above produced a heading covering it, the preview would draw a
+	// heading or a rule depending on where the pane happened to be scrolled -- the
+	// same divergence class that broke Split-view scroll sync earlier in this batch.
+	//
+	// The `=` and `-` rows are NOT redundant, and this is where an assertion could
+	// silently stop failing: md_classify has no rule for `=`, so `===` already reads
+	// as a paragraph line and the run ALREADY reached past it before this task --
+	// the extent row is vacuous for `=` and only the level, the kind and the text
+	// discriminate. `---` is `.Rule`, so it is the character for which the extent
+	// row can actually fail. Both are checked for both.
+	@(private = "file")
+	pj_case_setext_bounds :: proc(bad: ^int) {
+		fmt.println("-- a line of `=` or `-` under prose is that prose's heading --")
+		{
+			// "Title\n---\n": starts 0 and 6, the underline's newline at 9, length 10.
+			d := pj_doc("Title\n---\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := d.pt.length - 1
+			s, e, c, ok := md_para_bounds_for_test(&d, 0)
+			li_chk(bad, ok && !c, fmt.tprintf("the prose line resolves as a run (ok=%v capped=%v)", ok, c))
+			li_chk(
+				bad, s == 0 && e == want_end,
+				fmt.tprintf("...whose extent COVERS the `---` underline (%d..%d, want 0..%d)", s, e, want_end),
+			)
+			// Entered ON the underline: same run, scanned the other way.
+			us, ue, uc, uok := md_para_bounds_for_test(&d, starts[1])
+			li_chk(
+				bad, uok && !uc && us == s && ue == e,
+				fmt.tprintf("entering AT the underline gives the same run (%d..%d, capped=%v, ok=%v; want %d..%d)", us, ue, uc, uok, s, e),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, starts[1]) == 0,
+				fmt.tprintf("...so the underline byte snaps back to the paragraph start (%d, want 0)", md_block_start_at(&d, starts[1])),
+			)
+		}
+		{
+			// The same for `=`, where the extent row above cannot fail (see the header):
+			// what discriminates here is that the run STOPS at the underline instead of
+			// carrying on into the prose below it.
+			d := pj_doc("Title\n===\nafter\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := starts[2] - 1 // the `===` line's own newline
+			s, e, c, ok := md_para_bounds_for_test(&d, 0)
+			li_chk(
+				bad, ok && !c && s == 0 && e == want_end,
+				fmt.tprintf("`===` ends the run it underlines (%d..%d, capped=%v, ok=%v; want 0..%d)", s, e, c, ok, want_end),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, starts[2]) == starts[2],
+				fmt.tprintf("...and the prose below it is its own block (%d, want %d)", md_block_start_at(&d, starts[2]), starts[2]),
+			)
+			_, _, lvl, lok := md_para_setext_for_test(&d, 0)
+			li_chk(bad, lok && lvl == 1, fmt.tprintf("...and `=` reports h1, not h2 (level %d, ok=%v)", lvl, lok))
+		}
+		{
+			// THE CAPPED DECISION, and it is the same one every capped run gets: the
+			// promotion is refused along with the extent, because md_para_run refuses
+			// the whole answer. The paragraph then renders line by line and the
+			// underline renders as whatever md_classify calls it on its own -- and the
+			// SNAP and the BUILDER agree about that because neither of them sees a
+			// `capped` flag to interpret.
+			//
+			// Driven through the real guard by lowering md_para_max_lines, as
+			// pj_case_budget_truncates and pj_case_capped_refuses already do. The cap is
+			// 2 against a 3-line run (two prose lines plus the underline), so the run is
+			// capped by exactly one line -- and the `md_para_max_lines = 3` control
+			// directly below shows the same fixture promoting when it is not.
+			d := pj_doc("Title\ncont\n---\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			old := md_para_max_lines
+			defer md_para_max_lines = old
+
+			md_para_max_lines = 3
+			li_chk(bad, md_block_start_at(&d, starts[2]) == 0, fmt.tprintf("at a 3-line cap the run still promotes (%d, want 0)", md_block_start_at(&d, starts[2])))
+
+			md_para_max_lines = 2
+			_, _, lvl, ok := md_para_setext_for_test(&d, 0)
+			li_chk(bad, !ok && lvl == 0, fmt.tprintf("a capped run reports no run and no level (level %d, ok=%v)", lvl, ok))
+			li_chk(
+				bad, md_block_start_at(&d, 0) == 0 && md_block_start_at(&d, starts[1]) == starts[1],
+				fmt.tprintf("...so its prose lines are their own blocks (%d, %d; want 0, %d)", md_block_start_at(&d, 0), md_block_start_at(&d, starts[1]), starts[1]),
+			)
+			li_chk(
+				bad, md_block_start_at(&d, starts[2]) == starts[2],
+				fmt.tprintf("...and the underline is its own block, which is what the builder will draw as a rule (%d, want %d)", md_block_start_at(&d, starts[2]), starts[2]),
+			)
+		}
+		{
+			// ENTRY INDEPENDENCE, five entry points into one two-line setext block:
+			// the first line's start, mid-first-line, the underline's start,
+			// mid-underline, and the block's last byte.
+			//
+			// Two different claims, because the two layers answer differently by
+			// design. md_para_bounds/md_para_run answer only for real LINE STARTS (a
+			// mid-line entry is forced capped, which md_para_run turns into a refusal),
+			// so the three line starts must agree exactly. md_block_start_at snaps to
+			// the line start first and so must answer the SAME block start from all
+			// five -- and that is the property production actually depends on, since
+			// every resolver goes through it.
+			d := pj_doc("Title\ncont\n---\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := d.pt.length - 1
+			line_starts := []int{starts[0], starts[1], starts[2]}
+			for p, i in line_starts {
+				s, e, c, ok := md_para_bounds_for_test(&d, p)
+				li_chk(
+					bad, ok && !c && s == 0 && e == want_end,
+					fmt.tprintf("line start %d (byte %d) gives (%d..%d, capped=%v, ok=%v); want 0..%d", i, p, s, e, c, ok, want_end),
+				)
+				// The LEVEL is entry-independent too, and it is a separate claim: the
+				// prose entry reads it off the line below the run and the underline
+				// entry off the line it was entered at, so a `1` from one and a `2`
+				// from the other would render one block as an h1 from above and an h2
+				// from below.
+				ls, le, lvl, lok := md_para_setext_for_test(&d, p)
+				li_chk(
+					bad, lok && lvl == 2 && ls == 0 && le == want_end,
+					fmt.tprintf("...and reports h2 through the memo (level %d, %d..%d, ok=%v; want 2, 0..%d)", lvl, ls, le, lok, want_end),
+				)
+			}
+			every := []int{starts[0], starts[0] + 2, starts[2], starts[2] + 1, d.pt.length - 1}
+			for p, i in every {
+				li_chk(
+					bad, md_block_start_at(&d, p) == 0,
+					fmt.tprintf("entry %d (byte %d) snaps to the heading's start (%d, want 0)", i, p, md_block_start_at(&d, p)),
+				)
+			}
+		}
+		{
+			// THE SAME SNAP, COLD, and it needs its own Document because the memo
+			// hides the bug otherwise. Measured: with the underline entry deleted from
+			// md_para_bounds, the loop above still passed every row -- md_para_run had
+			// already stored the window [0..14] from the FIRST line's entry, and the
+			// underline byte fell inside it, so the memo answered 0 for a byte the
+			// producer would have refused. That is the whole failure mode in one
+			// observation: what a scrolled-to byte resolves to would depend on whether
+			// something above it had been laid out first.
+			//
+			// So this asks the underline FIRST, on a Document nothing has touched.
+			for off in 0 ..= 2 {
+				d := pj_doc("Title\ncont\n---\n")
+				defer doc_close(&d)
+				starts := pj_line_starts(&d)
+				defer delete(starts)
+				p := starts[2] + off
+				li_chk(
+					bad, md_block_start_at(&d, p) == 0,
+					fmt.tprintf("COLD, the underline byte %d snaps to the heading's start (%d, want 0)", p, md_block_start_at(&d, p)),
+				)
+			}
+		}
+		{
+			// COLD AND WARM, both warming orders. The memo stores a window measured
+			// from ONE entry and then answers for line starts inside it that the
+			// producer never ran at, so the entry that warms it must not decide the
+			// answer. This warms from the UNDERLINE -- the entry that skips the forward
+			// scan entirely -- and then reads the first line out of that window.
+			d := pj_doc("Title\ncont\n---\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := d.pt.length - 1
+			ws, we, wlvl, wok := md_para_setext_for_test(&d, starts[2])
+			li_chk(bad, wok && ws == 0 && we == want_end && wlvl == 2, fmt.tprintf("warming the memo AT the underline gives the whole run (%d..%d, level %d, ok=%v; want 0..%d, level 2)", ws, we, wlvl, wok, want_end))
+			ms, me, mlvl, mok := md_para_setext_for_test(&d, 0)
+			li_chk(bad, mok && ms == 0 && me == want_end && mlvl == 2, fmt.tprintf("...and the first line reads the same out of that window (%d..%d, level %d, ok=%v)", ms, me, mlvl, mok))
+		}
+		{
+			// The opposite warming order, in its own Document so the memo really is
+			// cold at the first call.
+			d := pj_doc("Title\ncont\n---\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			want_end := d.pt.length - 1
+			ws, we, wlvl, wok := md_para_setext_for_test(&d, 0)
+			li_chk(bad, wok && ws == 0 && we == want_end && wlvl == 2, fmt.tprintf("warming at the FIRST line gives the whole run (%d..%d, level %d, ok=%v; want 0..%d, level 2)", ws, we, wlvl, wok, want_end))
+			ms, me, mlvl, mok := md_para_setext_for_test(&d, starts[2])
+			li_chk(bad, mok && ms == 0 && me == want_end && mlvl == 2, fmt.tprintf("...and the underline reads the same out of that window (%d..%d, level %d, ok=%v)", ms, me, mlvl, mok))
+		}
+		{
+			// THE DISAMBIGUATIONS. Each of these is a `-` or `=` line that must NOT be
+			// read as an underline, and each is a different reason. Without them the
+			// promotion is satisfied by "any `---` joins whatever is above it", which
+			// would eat every thematic break in every document.
+			cases := []struct {
+				src, label: string,
+				under_line: int, // index into pj_line_starts of the `---` line
+			} {
+				{"para\n\n---\n", "a blank line above it", 2},
+				{"- item\n---\n", "a list item above it", 1},
+				{"> quote\n---\n", "a blockquote above it", 1},
+				{"- item\ncont\n---\n", "a lazily continued list item above it", 2},
+				{"# atx\n---\n", "an ATX heading above it", 1},
+				{"***\n---\n", "another rule above it", 1},
+			}
+			for c in cases {
+				d := pj_doc(c.src)
+				defer doc_close(&d)
+				starts := pj_line_starts(&d)
+				defer delete(starts)
+				u := starts[c.under_line]
+				li_chk(
+					bad, md_block_start_at(&d, u) == u,
+					fmt.tprintf("`---` with %s is its own block (%d, want %d)", c.label, md_block_start_at(&d, u), u),
+				)
+			}
+		}
+		{
+			// A `---` at byte 0 with nothing above it at all.
+			d := pj_doc("---\npara\n")
+			defer doc_close(&d)
+			li_chk(bad, md_block_start_at(&d, 0) == 0, fmt.tprintf("a `---` on the first line is its own block (%d)", md_block_start_at(&d, 0)))
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			li_chk(bad, md_block_start_at(&d, starts[1]) == starts[1], fmt.tprintf("...and the prose under it is too (%d, want %d)", md_block_start_at(&d, starts[1]), starts[1]))
+		}
+		{
+			// FRONT MATTER, which is `---` over prose over `---` and must not be read
+			// as two setext headings. md_block_start_at answers 0 for every byte inside
+			// the card, ahead of any run question.
+			d := pj_doc("---\na: 1\nb: 2\n---\n\nBody\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			fm_end, fm_inner := md_front_matter_end(&d)
+			li_chk(bad, fm_inner == 2, fmt.tprintf("the front-matter card still counts 2 inner lines (%d)", fm_inner))
+			li_chk(bad, fm_end == starts[4], fmt.tprintf("...and ends past its closing fence (%d, want %d)", fm_end, starts[4]))
+			for li in 0 ..= 3 {
+				li_chk(
+					bad, md_block_start_at(&d, starts[li]) == 0,
+					fmt.tprintf("...so line %d of it resolves to the card, not to a heading (%d)", li, md_block_start_at(&d, starts[li])),
+				)
+			}
+			li_chk(bad, md_block_start_at(&d, starts[5]) == starts[5], fmt.tprintf("...and the body after it is its own block (%d, want %d)", md_block_start_at(&d, starts[5]), starts[5]))
+		}
+	}
+
+	// SETEXT HEADINGS at the LAYOUT layer: the promoted block is a `.Heading` of the
+	// right level, carrying the prose and NOT the underline, and consuming the
+	// underline's bytes so nothing is left to draw a rule with.
+	//
+	// pj_kinds is what makes that last clause testable. Every other row here is
+	// satisfied by a block that is a perfectly good heading and stops one line short.
+	@(private = "file")
+	pj_case_setext_layout :: proc(bad: ^int) {
+		fmt.println("-- a setext heading is one .Heading block, underline included --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		// The reference an h1 and an h2 must MEASURE like: the ATX heading of the same
+		// level, built by the same branch. A promotion that copied the heading branch
+		// instead of reaching it would drift from these.
+		//
+		// `h` and `above`, NOT `px`: Md_Layout.px is the metrics scale the block was
+		// baked at (part of the cache key), the same 16 for every kind here, so an
+		// assertion on it could not fail. The block's height is what the heading
+		// branch's type size, leading and h1/h2 rule actually land in.
+		atx1_above, atx1_h, atx2_h := f32(0), f32(0), f32(0)
+		{
+			d := pj_doc("# Title\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			atx1_above, atx1_h = lay.above, lay.h
+			li_chk(bad, lay.cls.kind == .Heading && lay.cls.level == 1, fmt.tprintf("the ATX reference is an h1 (%v, level %d)", lay.cls.kind, lay.cls.level))
+		}
+		{
+			d := pj_doc("## Title\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			atx2_h = lay.h
+			li_chk(bad, lay.cls.level == 2, fmt.tprintf("the ATX h2 reference is level 2 (%d)", lay.cls.level))
+		}
+		li_chk(bad, atx1_h != atx2_h, fmt.tprintf("an h1 and an h2 are different heights at all (%v vs %v), so the level rows below can fail", atx1_h, atx2_h))
+		{
+			d := pj_doc("Title\n===\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			free_all(context.temp_allocator)
+			li_chk(bad, lay.cls.kind == .Heading, fmt.tprintf("`===` promotes the paragraph to a heading (%v, want .Heading)", lay.cls.kind))
+			li_chk(bad, lay.cls.level == 1, fmt.tprintf("...an h1 (level %d)", lay.cls.level))
+			li_chk(bad, lay.cls.content == "Title", fmt.tprintf("...whose text is the prose and not the underline (%q, want \"Title\")", lay.cls.content))
+			li_chk(bad, lay.multiline, "...marked multiline, so the cache keys it on the revision")
+			li_chk(bad, lay.end == d.pt.length - 1, fmt.tprintf("...ending at the underline's newline (%d, want %d)", lay.end, d.pt.length - 1))
+			li_chk(bad, lay.next == d.pt.length, fmt.tprintf("...and continuing past it (next %d, want %d)", lay.next, d.pt.length))
+			// Reached the heading branch rather than a copy of it.
+			li_chk(bad, lay.above == atx1_above, fmt.tprintf("...with the h1 space above (%v, want %v)", lay.above, atx1_above))
+			li_chk(bad, lay.h == atx1_h, fmt.tprintf("...and the h1 height, rule included (%v, want %v)", lay.h, atx1_h))
+		}
+		{
+			d := pj_doc("Title\n---\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			free_all(context.temp_allocator)
+			li_chk(bad, lay.cls.kind == .Heading && lay.cls.level == 2, fmt.tprintf("`---` promotes to an h2 (%v, level %d)", lay.cls.kind, lay.cls.level))
+			li_chk(bad, lay.cls.content == "Title", fmt.tprintf("...whose text is the prose (%q)", lay.cls.content))
+			li_chk(bad, lay.h == atx2_h, fmt.tprintf("...and the h2's own height, not the h1's (%v, want %v)", lay.h, atx2_h))
+		}
+		{
+			// Several prose lines under one underline: the paragraph run joins first
+			// and the whole run is the heading.
+			d := pj_doc("one\ntwo\n===\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			free_all(context.temp_allocator)
+			li_chk(bad, lay.cls.content == "one two", fmt.tprintf("a multi-line setext heading joins its prose (%q, want \"one two\")", lay.cls.content))
+			li_chk(bad, lay.next == d.pt.length, fmt.tprintf("...and still clears the underline (next %d, want %d)", lay.next, d.pt.length))
+		}
+		{
+			// THE EXTENT, stated as what is left over. A promoted block whose `next`
+			// stopped at the paragraph's end leaves the underline behind and the walk
+			// draws a `.Rule` under the heading.
+			d := pj_doc("Title\n---\n")
+			defer doc_close(&d)
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 2 && kinds[0] == .Heading && kinds[1] == .Blank,
+				fmt.tprintf("the whole document is ONE heading block, with no rule left under it (%v, want [Heading Blank])", kinds),
+			)
+		}
+		{
+			// The control for that row: a `---` that really is a thematic break still
+			// produces one, so the row above is not satisfied by never emitting rules.
+			d := pj_doc("para\n\n---\n")
+			defer doc_close(&d)
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 4 && kinds[0] == .Para && kinds[1] == .Blank && kinds[2] == .Rule && kinds[3] == .Blank,
+				fmt.tprintf("a `---` after a blank line is still a rule (%v, want [Para Blank Rule Blank])", kinds),
+			)
+		}
+		{
+			// An ATX heading is never promoted: `# atx` over `===` is a heading and
+			// then a paragraph reading `===`, which is what CommonMark says.
+			d := pj_doc("# atx\n===\n")
+			defer doc_close(&d)
+			starts := pj_line_starts(&d)
+			defer delete(starts)
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 3 && kinds[0] == .Heading && kinds[1] == .Para && kinds[2] == .Blank,
+				fmt.tprintf("an ATX heading does not absorb the `===` below it (%v, want [Heading Para Blank])", kinds),
+			)
+		}
+		{
+			// A list item with a `---` under it: the item, then a rule.
+			d := pj_doc("- item\n---\n")
+			defer doc_close(&d)
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 3 && kinds[0] == .List && kinds[1] == .Rule && kinds[2] == .Blank,
+				fmt.tprintf("a `---` under a list item is a rule, not that item's heading (%v, want [List Rule Blank])", kinds),
+			)
+		}
+		{
+			// THE CAPPED DECISION at the layout layer, the other half of the row
+			// pj_case_setext_bounds makes about the snap. A capped run is not promoted,
+			// so the prose stays a `.Para` per line and the underline draws as the rule
+			// md_classify calls it in isolation -- and the two answers agree because
+			// both come from md_para_run's one refusal.
+			d := pj_doc("Title\ncont\n---\n")
+			defer doc_close(&d)
+			old := md_para_max_lines
+			defer md_para_max_lines = old
+			md_para_max_lines = 2
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 4 && kinds[0] == .Para && kinds[1] == .Para && kinds[2] == .Rule && kinds[3] == .Blank,
+				fmt.tprintf("a capped run is not promoted (%v, want [Para Para Rule Blank])", kinds),
+			)
+		}
+		{
+			// Front matter still draws as a card and the body after it is untouched.
+			d := pj_doc("---\na: 1\n---\nBody\n")
+			defer doc_close(&d)
+			kinds := pj_kinds(&h, &m, &d, context.temp_allocator)
+			li_chk(
+				bad, len(kinds) == 3 && kinds[0] == .Front_Matter && kinds[1] == .Para && kinds[2] == .Blank,
+				fmt.tprintf("front matter is still a card followed by its body (%v, want [Front_Matter Para Blank])", kinds),
+			)
+		}
+	}
+
+	// One-argument and non-zero on failure, per the keytest/resavetest incident: a
+	// mode nothing runs is worse than no mode.
+	@(private = "file")
+	para_join_test_run :: proc() {
+		bad := 0
+		if !require_scratch_session("mdjointest") {
+			// Counted as a FAILURE rather than skipped: a mode that quietly does
+			// nothing when an environment variable is unset is a mode nothing runs.
+			li_chk(&bad, false, "NEWTPAD_SESSION_DIR is set, so the mode could run")
+		} else {
+			pj_case_entry_independent(&bad)
+			pj_case_no_collapse(&bad)
+			pj_case_budget_truncates(&bad)
+			pj_case_budget_band_entry_independent(&bad)
+			pj_case_line_cap_entry_independent(&bad)
+			pj_case_mid_line_forces_capped(&bad)
+			pj_case_entry_capped_forces_capped(&bad)
+			pj_case_line_cap_truncates_backward(&bad)
+			pj_case_line_cap_truncates_forward(&bad)
+			pj_case_neighbor_capped_forces_capped(&bad)
+			pj_case_terminators(&bad)
+			pj_case_lazy_bounds(&bad)
+			pj_case_joins_text(&bad)
+			pj_case_blank_separates(&bad)
+			pj_case_hard_breaks(&bad)
+			pj_case_lazy_continuation(&bad)
+			pj_case_capped_refuses(&bad)
+			pj_case_snap_is_the_entry(&bad)
+			pj_case_overlong_line(&bad)
+			pj_case_memo_matches_producer(&bad)
+			pj_case_cache_holds(&bad)
+			pj_case_cache_sees_growth(&bad)
+			pj_case_scroll_round_trip(&bad)
+			pj_case_setext_bounds(&bad)
+			pj_case_setext_layout(&bad)
+		}
+		fmt.printfln("mdjointest: %d failures", bad)
+		if bad > 0 {os.exit(1)}
+	}
+
 	// --- `newtpad tablesorttest` -- the multi-key sort build -------------------
 	//
 	// table_sort_build orders up to TABLE_SORT_MAX rows by up to TABLE_SORT_KEYS_MAX
@@ -3453,6 +5469,124 @@ when NEWTPAD_TESTS {
 	headless_gpu_destroy :: proc(h: ^Headless_Gpu) {
 		plat.keys_ignore_physical(false)
 		plat.gfx_destroy(&h.gfx)
+	}
+
+	// One mdperftest fixture, measured end to end: build the document from `src`,
+	// warm the caches, then time N steady-state scroll frames and print the five
+	// means. Returns the failure count.
+	//
+	// A shared PROCEDURE rather than the loop written once inline, because the
+	// mode's value depends on every fixture being measured identically -- and
+	// because for its whole life the mode measured exactly ONE document shape.
+	// That shape is blank-separated single-line paragraphs, so md_para_bounds
+	// scanned ~1 line per call and the paragraph join's cost was structurally
+	// invisible here: the mode reported "unchanged" across a change that a
+	// hard-wrapped fixture showed as 6.134 -> 13.431 ms. Adding a fixture is the
+	// fix for that; see the call site for the four now measured.
+	@(private = "file")
+	md_perf_measure :: proc(h: ^Headless_Gpu, name, src: string, nlines: int, W, H: i32) -> int {
+		content := make([]u8, len(src))
+		copy(content, src)
+		doc := doc_from_content(content, "perf.md", .UTF8)
+		defer doc_close(&doc)
+		doc.md_mode = .Preview
+		px_ := BASE_PX
+		winw, winh := f32(W), f32(H)
+		x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, winw, winh, 0.5)
+		if !box_ok {
+			fmt.printfln("mdperftest[%s]: FAIL no preview pane", name)
+			return 1
+		}
+		c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+		if !cok {
+			fmt.printfln("mdperftest[%s]: FAIL no scroll context", name)
+			return 1
+		}
+		notch := md_wheel_px(&c)
+		mid := doc.pt.length / 3
+		restart := md_anchor_from_top(&c, mid)
+
+		N :: 200
+		// Warm the layout cache and md_max_anchor, so what is measured is a
+		// STEADY-STATE scroll frame and not the first one after an open.
+		at := restart
+		for _ in 0 ..< 8 {
+			at = md_scroll_px(&c, at, notch)
+			doc.md_top = at
+			plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+			markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+			markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+			md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+			free_all(context.temp_allocator)
+		}
+
+		t_scroll, t_draw, t_links, t_frac, t_frame: time.Duration
+		at = restart
+		for _ in 0 ..< N {
+			f0 := time.tick_now()
+			s0 := time.tick_now()
+			nxt := md_scroll_px(&c, at, notch)
+			// The ceiling is reachable inside 200 notches, and a step that moves
+			// nothing is not a scroll frame. Wrap rather than measure a no-op.
+			at = restart if nxt == at else nxt
+			t_scroll += time.tick_since(s0)
+			doc.md_top = at
+
+			plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+			d0 := time.tick_now()
+			markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+			t_draw += time.tick_since(d0)
+			l0 := time.tick_now()
+			markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
+			t_links += time.tick_since(l0)
+			r0 := time.tick_now()
+			md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+			t_frac += time.tick_since(r0)
+			t_frame += time.tick_since(f0)
+			free_all(context.temp_allocator)
+		}
+		ms :: proc(d: time.Duration, n: int) -> f64 {return time.duration_milliseconds(d) / f64(n)}
+		fmt.printfln("mdperftest[%s]: %d lines, %dx%d, S=%.0f, mean of %d frames", name, nlines, W, H, px_, N)
+		fmt.printfln("  md_scroll_px (one notch)   %.3f ms", ms(t_scroll, N))
+		fmt.printfln("  markdown_draw              %.3f ms", ms(t_draw, N))
+		fmt.printfln("  markdown_links             %.3f ms", ms(t_links, N))
+		fmt.printfln("  md_preview_frac            %.3f ms", ms(t_frac, N))
+		fmt.printfln("  whole scroll frame         %.3f ms", ms(t_frame, N))
+		// A threshold, so a regression here goes red instead of printing and
+		// passing regardless. Baseline is 2026-07-29's review measurement on the
+		// `mixed` fixture at -o:speed: markdown_draw 2.79 ms, whole scroll frame
+		// 5.05 ms. The gate is ~1.8x that -- generous enough that normal machine
+		// noise does not flake it, tight enough that a 2x regression (what
+		// actually shipped once, undetected by this mode) trips it before it
+		// fully doubles.
+		//
+		// The SAME numbers gate every fixture. They are not per-fixture budgets
+		// derived from what each one happens to cost -- a gate fitted to the
+		// measurement it is meant to catch is not a gate. A fixture that cannot
+		// meet them is either a bug to fix or an exception to argue in the
+		// comment at the call site, never a raised threshold.
+		//
+		// DEBUG_MULT exists for machine-to-machine noise, not for a
+		// debug/release gap: measured under -debug on the `mixed` fixture the
+		// numbers barely move (2.95 ms / 5.56 ms, ~1.1x), because the cost
+		// here is mostly DirectWrite and D3D11 calls outside Odin's own
+		// bounds checks, unlike a tight byte loop. Still generous, because a
+		// gate that flakes is one the next person learns to ignore.
+		DEBUG_MULT :: 1.3
+		dbg := f64(DEBUG_MULT) if ODIN_DEBUG else 1.0
+		draw_gate := 5.0 * dbg
+		frame_gate := 9.0 * dbg
+		perf_bad := 0
+		d_ms, f_ms := ms(t_draw, N), ms(t_frame, N)
+		if d_ms > draw_gate {
+			fmt.printfln("  FAIL: markdown_draw %.3f ms exceeds %.1f ms gate", d_ms, draw_gate)
+			perf_bad += 1
+		}
+		if f_ms > frame_gate {
+			fmt.printfln("  FAIL: whole scroll frame %.3f ms exceeds %.1f ms gate", f_ms, frame_gate)
+			perf_bad += 1
+		}
+		return perf_bad
 	}
 
 	// An allocator that WRAPS the one under test and reports on it, for
@@ -9785,7 +11919,19 @@ when NEWTPAD_TESTS {
 			// count below would be two. Dropping the terminator makes the count
 			// say what it means; the first draft of this test did not, and read as
 			// a per-block cache failing when it was the extern-dep rule working.
-			src := "# One\nalpha alpha\nbravo bravo\ncharlie charlie plus a good deal more text so this block wraps once the pane narrows\ndelta delta\necho echo"
+			//
+			// ONE BLOCK PER LINE, and every kind different, because both of the
+			// obvious fixtures are now wrong. Six consecutive prose lines are ONE
+			// block since the paragraph join, so the "a cold pass builds every
+			// visible block (>= 6)" rows measured two; and separating them with
+			// BLANK lines instead would make five of the eleven blocks .Blank, which
+			// md_layout_extern_dep keys on doc.revision, so the "a one-byte edit
+			// rebuilds exactly ONE block" row -- the property this whole procedure
+			// exists for -- would have had to become six. Alternating the kinds keeps
+			// both assertions exact. No two adjacent lines are .Para, so nothing
+			// joins; "alpha alpha" sits between a heading and a quote and is a
+			// single-line paragraph still.
+			src := "# One\nalpha alpha\n> bravo bravo\n- charlie charlie plus a good deal more text so this block wraps once the pane narrows\n## delta delta\necho echo"
 			content := make([]u8, len(src))
 			copy(content, src)
 			doc := doc_from_content(content, "cache.md", .UTF8)
@@ -10424,7 +12570,21 @@ when NEWTPAD_TESTS {
 			ytop, ybot := f32(20), f32(1380)
 			m := md_metrics(&h.text, px_)
 			_, measure := md_content_span(&m, x0, x1)
-			PROBE :: "[q](http://probe.example) probe"
+			// A LIST ITEM, not a bare prose line, and that is forced. The probe used
+			// to be "[q](...) probe" -- a paragraph -- and after the paragraph join it
+			// merges into any paragraph directly above it, which is the base fixture
+			// for the "a paragraph" lead and every row under it. A blank line before
+			// the probe would separate the blocks but destroy what this procedure is
+			// FOR: a .Blank block resets md_walk's `prev_below` to 0, so the collapsed
+			// gap max(lead.below, K.above) becomes lead.below + K.above and the
+			// margin-collapse half of the table stops being tested at all.
+			//
+			// A list item is the one kind that terminates a paragraph run AND carries
+			// space-above 0, exactly as .Para does (md_layout_build sets `above` on
+			// neither), so the gap above the probe is max(prev.below, 0) either way and
+			// the cancellation the `want` formula below depends on is untouched. Its
+			// indent moves the rect in x, which nothing here reads.
+			PROBE :: "- [q](http://probe.example) probe"
 
 			// The probe's y in a document built from `parts`, or -1.
 			probe_y :: proc(h: ^Headless_Gpu, src: string, px_, x0, x1, ytop, ybot: f32) -> f32 {
@@ -10456,26 +12616,37 @@ when NEWTPAD_TESTS {
 				height: f32,
 				above:  f32,
 				below:  f32,
+				para:   bool, // is this block a bare prose line, which now JOINS?
 			}
 			rows := []Row {
-				{"paragraph", "block text", body_h, 0, m.para_below},
+				{"paragraph", "block text", body_h, 0, m.para_below, true},
 				// A list item and a quote lay out at the body face and do not wrap
 				// at this measure, so their block height is a paragraph's.
-				{"list item", "- block text", body_h, 0, m.list_gap},
-				{"blockquote", "> block text", body_h, m.quote_above, m.quote_below},
+				{"list item", "- block text", body_h, 0, m.list_gap, false},
+				{"blockquote", "> block text", body_h, m.quote_above, m.quote_below, false},
 				// h1 and h2 carry their rule INSIDE their own height (9.2 item 1).
-				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, line_height(m.head[1]), bold) + hairline(), m.head_above[1], m.head_below[1]},
-				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, line_height(m.head[2]), bold) + hairline(), m.head_above[2], m.head_below[2]},
-				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, line_height(m.head[3]), bold), m.head_above[3], m.head_below[3]},
-				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, line_height(m.head[4]), bold), m.head_above[4], m.head_below[4]},
-				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below},
-				{"thematic break", "***", hairline(), m.rule_gap, m.rule_gap},
+				{"h1", "# block text", one_line(&h, "block text", m.head[1], measure, line_height(m.head[1]), bold) + hairline(), m.head_above[1], m.head_below[1], false},
+				{"h2", "## block text", one_line(&h, "block text", m.head[2], measure, line_height(m.head[2]), bold) + hairline(), m.head_above[2], m.head_below[2], false},
+				{"h3", "### block text", one_line(&h, "block text", m.head[3], measure, line_height(m.head[3]), bold), m.head_above[3], m.head_below[3], false},
+				{"h4", "#### block text", one_line(&h, "block text", m.head[4], measure, line_height(m.head[4]), bold), m.head_above[4], m.head_below[4], false},
+				{"fenced code", "```\ncode\n```", fence_h, m.fence_above, m.fence_below, false},
+				{"thematic break", "***", hairline(), m.rule_gap, m.rule_gap, false},
 			}
 			leads := []struct {
 				what:  string,
 				src:   string,
 				below: f32,
-			}{{"a paragraph", "lead text", m.para_below}, {"a list item", "- lead text", m.list_gap}}
+				// Does a bare prose line written directly under this lead become
+				// part of IT rather than a block of its own? Both leads here do, by
+				// two different rules -- a paragraph by the CommonMark paragraph
+				// run, a list item by LAZY CONTINUATION -- so a row with `para` set
+				// has no gap to measure under either. It stays a per-lead field
+				// rather than becoming a constant because it is a property of the
+				// lead's KIND: a heading or a fence lead would absorb nothing, and
+				// the `want` formula below would be the right question for them
+				// again.
+				absorbs: bool,
+			}{{"a paragraph", "lead text", m.para_below, true}, {"a list item", "- lead text", m.list_gap, true}}
 
 			for ld in leads {
 				base_src := strings.concatenate({ld.src, "\n", PROBE, "\n"}, context.temp_allocator)
@@ -10495,6 +12666,20 @@ when NEWTPAD_TESTS {
 					// no space above, so the max is K.below itself).
 					want := max(ld.below, r.above) - ld.below + r.height + r.below
 					got := y - y_base
+					if ld.absorbs && r.para {
+						// A prose line under a lead that absorbs one is the SAME block
+						// -- a paragraph run under a paragraph, a lazy continuation
+						// under a list item -- so there is no gap here to measure and
+						// the row below would be asking the wrong question. What it asks
+						// instead is the join, from the spacing side: "lead text" and
+						// "block text" reflow onto one visual line at this measure, so
+						// the probe below them must not move at all.
+						gchk(
+							&bad, abs(got) <= 1,
+							fmt.tprintf("gap: [%s] a %s JOINS into it -- one block, so the probe does not move (got %.1f, want 0.0)", ld.what, r.what, got),
+						)
+						continue
+					}
 					gchk(
 						&bad, abs(got - want) <= 1,
 						fmt.tprintf("gap: [%s] a %s costs h=%.0f + above=%.0f + below=%.0f (got %.1f, want %.1f)", ld.what, r.what, r.height, r.above, r.below, got, want),
@@ -10547,6 +12732,21 @@ when NEWTPAD_TESTS {
 
 			px_ := f32(24)
 			winw, winh := f32(W), f32(H)
+
+			// Sections B and B2 want a long document of FIXED-WIDTH lines, one block
+			// each, so a byte offset divided by the stride is a block index. A bare
+			// prose line is no longer one block per line -- since the paragraph join,
+			// 200 consecutive prose lines are ONE block, which is section B3's subject
+			// and was these two sections' undoing. A blockquote is the nearest kind
+			// that still tiles one per line: same body face, same height, and its
+			// space-above is 0.8 S exactly as a paragraph's space-below is, so the two
+			// collapse to the identical gap the old fixture had and B's `vis` window
+			// and its builds-per-visible-block bounds stay calibrated where they were.
+			// (0.8 S is 19 px at this section's px_ = 24, not the 16 an earlier
+			// version of this comment named -- md_scale(24, 0.80) = 19. The numbers
+			// being EQUAL is what the calibration rests on, not what they are.)
+			QUOTE_LINE :: "> para %03d xx\n"
+			QUOTE_STRIDE :: len("> para 000 xx\n")
 
 			render :: proc(h: ^Headless_Gpu, doc: ^Document, px_, x0, x1, ytop, ybot: f32, at: Md_Anchor) -> (buf: []u8, ok: bool) {
 				bg := g_theme[.Bg_Base]
@@ -10649,9 +12849,10 @@ when NEWTPAD_TESTS {
 			{
 				b := strings.builder_make()
 				defer strings.builder_destroy(&b)
-				// Fixed-width lines, so a byte offset divided by 12 is a block
-				// index and `bottom` can be read as "how many blocks were visible".
-				for i in 0 ..< 200 {fmt.sbprintf(&b, "para %03d xx\n", i)}
+				// Fixed-width lines, so a byte offset divided by QUOTE_STRIDE is a
+				// block index and `bottom` can be read as "how many blocks were
+				// visible". See QUOTE_LINE for why they are quotes.
+				for i in 0 ..< 200 {fmt.sbprintf(&b, QUOTE_LINE, i)}
 				src := strings.to_string(b)
 				content := make([]u8, len(src))
 				copy(content, src)
@@ -10664,7 +12865,7 @@ when NEWTPAD_TESTS {
 				before := md_layout_builds
 				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 				builds := md_layout_builds - before
-				vis := bottom / 12 + 1
+				vis := bottom / QUOTE_STRIDE + 1
 				schk(&bad, vis >= 5 && vis <= 40, fmt.tprintf("budget: the pane holds several blocks, and the fixture is far longer (%d of 200)", vis))
 				schk(&bad, builds <= vis * 3, fmt.tprintf("budget: a pass lays out a bounded window, NOT the document (%d builds, %d visible, 200 blocks)", builds, vis))
 				schk(&bad, builds >= vis * 2 - 2, fmt.tprintf("budget: ...and it really does lay out the screen BELOW, not just the visible blocks (%d builds vs %d visible)", builds, vis))
@@ -10684,7 +12885,7 @@ when NEWTPAD_TESTS {
 			{
 				b := strings.builder_make()
 				defer strings.builder_destroy(&b)
-				for i in 0 ..< 200 {fmt.sbprintf(&b, "para %03d xx\n", i)}
+				for i in 0 ..< 200 {fmt.sbprintf(&b, QUOTE_LINE, i)}
 				src := strings.to_string(b)
 				content := make([]u8, len(src))
 				copy(content, src)
@@ -10697,15 +12898,18 @@ when NEWTPAD_TESTS {
 
 				// Block 100 of 200 -- resolved through the same mapping a Split
 				// click's sync uses (md_anchor_from_top), not hand-built, so the
-				// anchor is one the product can actually land on.
-				at := md_anchor_from_top(&c, 100 * 12)
-				schk(&bad, at.block == 100 * 12, fmt.tprintf("budget-mid: the anchor resolves to the block boundary it named (%d)", at.block))
+				// anchor is one the product can actually land on. Every line here IS
+				// a block start, so the snap (md_block_start_at) is the identity on
+				// this fixture and the byte comes back unchanged; the fixture that
+				// makes the snap MOVE is section B3's.
+				at := md_anchor_from_top(&c, 100 * QUOTE_STRIDE)
+				schk(&bad, at.block == 100 * QUOTE_STRIDE, fmt.tprintf("budget-mid: the anchor resolves to the block boundary it named (%d)", at.block))
 
 				md_layout_reset(&doc)
 				before := md_layout_builds
 				bottom := markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
 				builds := md_layout_builds - before
-				vis := (bottom - at.block) / 12 + 1
+				vis := (bottom - at.block) / QUOTE_STRIDE + 1
 				schk(&bad, vis >= 3 && vis <= 40, fmt.tprintf("budget-mid: the pane holds several blocks from the anchor (%d)", vis))
 				// The honest bound: section B's pane-plus-a-screen-below budget,
 				// PLUS the fixed MD_RUNUP_LINES cost the origin case never pays.
@@ -10715,6 +12919,80 @@ when NEWTPAD_TESTS {
 				// this is the assertion that notices.
 				schk(&bad, builds <= vis * 3 + MD_RUNUP_LINES, fmt.tprintf("budget-mid: a mid-anchor pass lays out the pane, a screen below, and its OWN run-up -- not the document (%d builds, %d visible, +%d run-up allowance)", builds, vis, MD_RUNUP_LINES))
 				schk(&bad, builds >= vis * 2 - 2, fmt.tprintf("budget-mid: ...and it still lays out the screen BELOW too (%d builds vs %d visible)", builds, vis))
+			}
+
+			// --- B3. a byte resolves to the block that CONTAINS it -------------
+			//
+			// md_block_start_at's invariant: any byte handed to a walk as a block
+			// start must actually BE a block start. The fixture is the one that
+			// breaks it -- 200 hard-wrapped prose lines with no blank line anywhere,
+			// which CommonMark, and this preview since the paragraph join, reads as
+			// ONE paragraph.
+			//
+			// The defect this replaces: md_block_at_byte walked from
+			// md_line_start_back(1200, MD_RUNUP_LINES) = 912, which is INSIDE that
+			// paragraph, so md_layout_build produced a block that said it started at
+			// 912 while holding text joined from byte 0. md_anchor_from_top(1200) --
+			// the call main.odin makes every time the editor scrolls in Split --
+			// answered 912, and the preview pane drew the document from line 0 while
+			// the editor half sat at line 100. 1200 - 912 is exactly MD_RUNUP_LINES
+			// lines of 12 bytes, which is the signature of the defect.
+			//
+			// The right answer is 0, NOT 1200. Byte 1200 is inside the single
+			// paragraph this document has and that paragraph starts at 0; "the anchor
+			// is the byte you asked for" was only ever true because every line used to
+			// be its own block. What must hold is that it names the CONTAINING block,
+			// the same one from every byte inside it.
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< 200 {fmt.sbprintf(&b, "para %03d xx\n", i)}
+				src := strings.to_string(b)
+				content := make([]u8, len(src))
+				copy(content, src)
+				doc := doc_from_content(content, "snap.md", .UTF8)
+				doc.md_mode = .Preview
+				defer doc_close(&doc)
+				c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
+				schk(&bad, cok, "snap: the scroll context comes from the same md_pane_box the draw does")
+
+				at := md_anchor_from_top(&c, 1200)
+				schk(
+					&bad, at.block == 0,
+					fmt.tprintf("snap: a byte inside a joined paragraph resolves to that paragraph's own start (%d, want 0; the run-up alone answered %d)", at.block, 1200 - MD_RUNUP_LINES * 12),
+				)
+
+				// Entry-independence, which is the property and not a nicety: a block
+				// that answered differently depending on which of its bytes was asked
+				// would render the paragraph differently depending on where the reader
+				// had scrolled in, and that is what the join exists to prevent.
+				same := 0
+				for k in 0 ..< 200 {
+					if md_anchor_from_top(&c, k * 12).block == 0 {same += 1}
+				}
+				schk(&bad, same == 200, fmt.tprintf("snap: ...and so does every one of the paragraph's 200 lines (%d of 200)", same))
+
+				// A FIXED POINT: what it answers with is a byte it would not move
+				// again. This is what md_layout_ensure's `e.start != p` key needs, and
+				// what a fixed line run-up cannot promise for a construct of unbounded
+				// length.
+				st, next, _ := md_block_at_byte(&c, 1200)
+				schk(&bad, md_block_start_at(&doc, st) == st, fmt.tprintf("snap: the byte it answers with is one it would not move again (%d)", st))
+				schk(&bad, st == 0 && next >= 2400, fmt.tprintf("snap: ...and that block really spans the whole 2400-byte run (%d..%d)", st, next))
+
+				// And the layout built there agrees with it, which is the other half
+				// of "a block claims to start where it does". Through
+				// md_layout_ensure, so this is the production cache path and not a
+				// second way of building the same block.
+				m := md_metrics(&h.text, px_)
+				lay := md_layout_ensure_for_test(&h.gfx, &h.text, &doc, &m, st, c.measure)
+				schk(&bad, lay.start == st, fmt.tprintf("snap: the layout entered at that byte starts at it (%d vs %d)", lay.start, st))
+				schk(&bad, lay.multiline && lay.end >= 2399, fmt.tprintf("snap: ...and it is the joined block, not one line of it (multiline %v, end %d)", lay.multiline, lay.end))
+
+				// The 9.4 map's own inverse, on the fixture that can tell a block from
+				// a line: every line of the paragraph maps to preview position 0, so
+				// mapping back must land on the paragraph's line and not on line 100.
+				schk(&bad, md_anchor_top_byte(&c, at) == 0, fmt.tprintf("snap: the reverse map returns the paragraph's own line (%d)", md_anchor_top_byte(&c, at)))
 			}
 
 			// --- C. the preview's own end of travel, and its scrollbar --------
@@ -10913,7 +13191,14 @@ when NEWTPAD_TESTS {
 				// "underlined implies openable" (link_gate_visible), so a fixture
 				// whose targets do not resolve places no rectangles at all -- which
 				// is what the first draft did, and it reported zero links.
-				for i in 0 ..< 40 {fmt.sbprintf(&b, "row [%03d](https://e.test/p%03d) here\n", i, i)}
+				// A BLANK LINE between the rows, which is what makes each of them
+				// its own block: since the paragraph join, 40 consecutive prose
+				// lines are one block and every hit's y searched back to byte 0 --
+				// 39 of 40 "wrong" against a search that was answering correctly.
+				// Blank-separated prose is also what a real markdown document looks
+				// like, so this keeps the pixel -> block search tested over actual
+				// paragraphs rather than over a kind picked to tile conveniently.
+				for i in 0 ..< 40 {fmt.sbprintf(&b, "row [%03d](https://e.test/p%03d) here\n\n", i, i)}
 				src := strings.to_string(b)
 				content := make([]u8, len(src))
 				copy(content, src)
@@ -10922,7 +13207,10 @@ when NEWTPAD_TESTS {
 				defer doc_close(&doc)
 				x0, x1, ytop, ybot, _ := md_pane_box(&doc, winw, winh, 0.5)
 				c, _ := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
-				line_len := len("row [000](https://e.test/p000) here\n")
+				// The stride is the row PLUS its blank line: row i starts at
+				// i * line_len, and the blank block between them starts one byte
+				// before the next row.
+				line_len := len("row [000](https://e.test/p000) here\n\n")
 
 				// Off the top by a fraction of a block, so the search is asked a
 				// question the anchor alone cannot answer.
@@ -11350,25 +13638,29 @@ when NEWTPAD_TESTS {
 			winw, winh := f32(W), f32(H)
 
 			Wheel_Fixture :: struct {
-				name:   string,
-				fm:     int, // lines of front-matter body, 0 for none
-				open:   string, // what the body opens with, before the paragraphs
-				blanks: bool, // a blank line between paragraphs
-				strict: bool, // is exact reversibility claimed at EVERY position?
+				name:       string,
+				fm:         int, // lines of front-matter body, 0 for none
+				open:       string, // what the body opens with, before the paragraphs
+				blanks:     bool, // a blank line between paragraphs
+				strict:     bool, // is exact reversibility claimed at EVERY position?
+				min_blocks: int, // how many blocks a 60-notch sweep must cross
 			}
 			// Long enough to wrap across three visual lines at the 72ch measure,
 			// which is what makes the FIRST block taller than two wheel notches --
 			// the precondition F1's region needs, and the reason a one-line fixture
 			// cannot see the defect at all.
 			PARA :: "para %02d carries enough words on it to wrap across three whole visual lines at the seventy two character measure the preview holds itself to, which is what gives the block a slot several notches tall\n"
+			// `min_blocks` is 1 for the no-blank fixture on purpose: since the
+			// paragraph join its 40 prose lines are ONE block, so a sweep that never
+			// leaves block 0 is the model working. It keeps its own exact row below.
 			fixtures := []Wheel_Fixture {
-				{"plain paragraphs", 0, "", true, true},
-				{"no blank lines", 0, "", false, true},
-				{"opens with a heading", 0, "# Title of the document\n\n", true, true},
-				{"opens with a fence", 0, "```odin\nx := 1\ny := 2\nz := 3\nw := 4\n```\n\n", true, true},
-				{"20 lines of front matter", 20, "", true, true},
-				{"30 lines of front matter", 30, "", true, false},
-				{"50 lines of front matter", 50, "", true, false},
+				{"plain paragraphs", 0, "", true, true, 3},
+				{"no blank lines", 0, "", false, true, 1},
+				{"opens with a heading", 0, "# Title of the document\n\n", true, true, 3},
+				{"opens with a fence", 0, "```odin\nx := 1\ny := 2\nz := 3\nw := 4\n```\n\n", true, true, 3},
+				{"20 lines of front matter", 20, "", true, true, 3},
+				{"30 lines of front matter", 30, "", true, true, 3},
+				{"50 lines of front matter", 50, "", true, true, 3},
 			}
 
 			// Accumulated across every fixture: the sweep is only meaningful if it
@@ -11405,11 +13697,25 @@ when NEWTPAD_TESTS {
 				// The sweep: one notch at a time from the top, recorded. A NOTCH,
 				// not 900px, because a notch is what the wheel sends and because
 				// the positions that matter are the ones INSIDE a block.
+				//
+				// The CEILING is excluded, and that is a precondition rather than a
+				// tolerance. md_scroll_clamp truncates the step that lands on
+				// md_max_anchor, so the last recorded position is less than a notch
+				// below the one before it -- and a full notch back up then
+				// legitimately overshoots it. Reversibility of a NOTCH says nothing
+				// about a step that was not one. (The joined fixture is what surfaced
+				// this: with its 40 prose lines re-flowed into one block it is short
+				// enough for a 60-notch sweep to reach its end, where the blank-
+				// separated fixtures' inter-paragraph gaps keep the ceiling out of
+				// reach.) The ceiling has its own rows in section C of
+				// md_scroll_selftest -- "scrolling down repeatedly stops exactly at
+				// the ceiling", and a step from it moves nothing.
+				mx := md_max_anchor(&c)
 				pos := make([dynamic]Md_Anchor, 0, 80)
 				append(&pos, Md_Anchor{})
 				for len(pos) < 60 {
 					nxt := md_scroll_px(&c, pos[len(pos) - 1], notch)
-					if nxt == pos[len(pos) - 1] {break}
+					if nxt == pos[len(pos) - 1] || nxt == mx {break}
 					append(&pos, nxt)
 				}
 
@@ -11419,7 +13725,15 @@ when NEWTPAD_TESTS {
 					if p.block == 0 && p.px > notch {saw_f1_region = true}
 					if p.block > 0 && p.px >= notch {saw_f2_region = true}
 				}
-				wchk(&bad, len(pos) >= 20 && blocks >= 3, fmt.tprintf("wheel[%s]: the sweep covers %d positions over %d blocks", fx.name, len(pos), blocks))
+				wchk(&bad, len(pos) >= 20 && blocks >= fx.min_blocks, fmt.tprintf("wheel[%s]: the sweep covers %d positions over %d blocks (want >= %d)", fx.name, len(pos), blocks, fx.min_blocks))
+				if !fx.blanks {
+					// Exact, not a floor: 40 prose lines with no blank between them
+					// are ONE paragraph, so a 60-notch sweep down a block that many
+					// visual lines tall must never reach a second block. A model that
+					// still made a block per source line would report 3 or more here
+					// and pass the row above under its own min_blocks of 1.
+					wchk(&bad, blocks == 1, fmt.tprintf("wheel[%s]: ...and all 40 of them are ONE joined block, which the sweep never leaves (%d)", fx.name, blocks))
+				}
 
 				// --- the invariant: px lives in [0, gap + h) --------------------
 				//
@@ -11535,7 +13849,13 @@ when NEWTPAD_TESTS {
 
 			b := strings.builder_make()
 			defer strings.builder_destroy(&b)
-			for i in 0 ..< 60 {fmt.sbprintf(&b, "para %03d text here\n", i)}
+			// Blank-separated, so each line is its own block. Without the blank the
+			// 60 prose lines are ONE paragraph since the join, every point in the
+			// pane names block 0, and row 2's positive control ("a double press
+			// moves doc.top off the start") is vacuously false -- which is how the
+			// single-press rows around it would have gone quietly green for the
+			// wrong reason.
+			for i in 0 ..< 60 {fmt.sbprintf(&b, "para %03d text here\n\n", i)}
 			src := strings.to_string(b)
 			content := make([]u8, len(src))
 			copy(content, src)
@@ -11628,6 +13948,14 @@ when NEWTPAD_TESTS {
 			bad += md_wheel_selftest()
 			bad += md_prop_selftest()
 			fmt.printfln("mdtest: %d failures", bad)
+			// The same guard palettetest carries, and for the same reason
+			// (development-loop.md's "printing FAIL and exiting 0" bullet): without
+			// it this mode printed 20 FAILs and exited 0, so a sweep reading exit
+			// codes saw a green branch. That is exactly what happened here -- mdtest
+			// went from 0 failures to 20 between 6fd48d3 and 4f1a3b9 and nothing
+			// noticed. menutest and settingstest were closed the same way on
+			// 2026-08-01; this was the third.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
@@ -11822,6 +14150,10 @@ when NEWTPAD_TESTS {
 			}
 
 			fmt.printfln("mdfencetest: %d failures", bad)
+			// Exits non-zero, the guard palettetest carries. Demonstrated rather than
+			// assumed: sabotaging md_fence_seed made this mode print "8 failures" and
+			// still exit 0 (2026-08-01).
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
@@ -20985,6 +23317,7 @@ when NEWTPAD_TESTS {
 			lk_bare_reveal(&bad)
 
 			fmt.printfln("linktest: %d failures", bad)
+			if bad > 0 {os.exit(1)} // see mdfencetest's guard
 			return true
 		}
 
@@ -21192,7 +23525,11 @@ when NEWTPAD_TESTS {
 		}
 
 		// `newtpad mdperftest` measures what one WHEEL FRAME of the markdown preview
-		// costs, broken down by the four procedures a scroll frame calls.
+		// costs, broken down by the four procedures a scroll frame calls, over FOUR
+		// document shapes (see the fixtures below). One shape is not a benchmark:
+		// the mode measured only `mixed` until 2026-08-01, and `mixed` has no
+		// paragraph longer than one line, so a change that doubled the cost of a
+		// hard-wrapped paragraph reported "unchanged" here.
 		//
 		// It exists because the 2026-07-29 review measured md_preview_frac at 1.954ms
 		// against markdown_draw's 1.616 -- the scrollbar's fraction costing more than
@@ -21219,118 +23556,93 @@ when NEWTPAD_TESTS {
 			g_theme, UI_SCALE = theme_dark(), 1
 			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
 
-			// ~1085 lines of mixed markdown: the review's fixture size, and mixed
-			// because a file of nothing but paragraphs understates the walk (a table
-			// and a blank run are the blocks whose layout keys on doc.revision).
-			b := strings.builder_make()
-			defer strings.builder_destroy(&b)
-			lines := 0
-			for lines < 1085 {
-				i := lines
-				fmt.sbprintf(&b, "## Section %03d\n\n", i)
-				fmt.sbprintf(&b, "A paragraph of body prose with `inline code` and a [link](https://e.test/p%03d) in it, long enough to wrap across the measure more than once so the shaper has real work to do.\n\n", i)
-				fmt.sbprintf(&b, "- first item %03d\n- second item with a little more text on it\n\n", i)
-				strings.write_string(&b, "| c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 | c9 | ca | cb |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n| one | two | three | four | five | six | seven | eight | nine | ten | eleven | twelve |\n| aaa | bbb | ccc | ddd | eee | fff | ggg | hhh | iii | jjj | kkk | lll |\n\n")
-				strings.write_string(&b, "```json\n{ \"key\": \"value\", \"n\": 12 }\n```\n\n")
-				lines += 14
-			}
-			src := strings.to_string(b)
-			content := make([]u8, len(src))
-			copy(content, src)
-			doc := doc_from_content(content, "perf.md", .UTF8)
-			defer doc_close(&doc)
-			doc.md_mode = .Preview
-			px_ := BASE_PX
-			winw, winh := f32(W), f32(H)
-			x0, x1, ytop, ybot, box_ok := md_pane_box(&doc, winw, winh, 0.5)
-			if !box_ok {
-				fmt.println("mdperftest: FAIL no preview pane")
-				return true
-			}
-			c, cok := md_scroll_ctx(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
-			if !cok {
-				fmt.println("mdperftest: FAIL no scroll context")
-				return true
-			}
-			notch := md_wheel_px(&c)
-			mid := doc.pt.length / 3
-			restart := md_anchor_from_top(&c, mid)
-
-			N :: 200
-			// Warm the layout cache and md_max_anchor, so what is measured is a
-			// STEADY-STATE scroll frame and not the first one after an open.
-			at := restart
-			for _ in 0 ..< 8 {
-				at = md_scroll_px(&c, at, notch)
-				doc.md_top = at
-				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
-				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
-				markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
-				md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
-				free_all(context.temp_allocator)
-			}
-
-			t_scroll, t_draw, t_links, t_frac, t_frame: time.Duration
-			at = restart
-			for _ in 0 ..< N {
-				f0 := time.tick_now()
-				s0 := time.tick_now()
-				nxt := md_scroll_px(&c, at, notch)
-				// The ceiling is reachable inside 200 notches, and a step that moves
-				// nothing is not a scroll frame. Wrap rather than measure a no-op.
-				at = restart if nxt == at else nxt
-				t_scroll += time.tick_since(s0)
-				doc.md_top = at
-
-				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
-				d0 := time.tick_now()
-				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
-				t_draw += time.tick_since(d0)
-				l0 := time.tick_now()
-				markdown_links(&h.gfx, &h.text, &doc, px_, x0, x1, ytop, ybot, at)
-				t_links += time.tick_since(l0)
-				r0 := time.tick_now()
-				md_preview_frac(&h.gfx, &h.text, &doc, px_, winw, winh, 0.5)
-				t_frac += time.tick_since(r0)
-				t_frame += time.tick_since(f0)
-				free_all(context.temp_allocator)
-			}
-			ms :: proc(d: time.Duration, n: int) -> f64 {return time.duration_milliseconds(d) / f64(n)}
-			fmt.printfln("mdperftest: %d lines, %dx%d, S=%.0f, mean of %d frames", 1085, W, H, px_, N)
-			fmt.printfln("  md_scroll_px (one notch)   %.3f ms", ms(t_scroll, N))
-			fmt.printfln("  markdown_draw              %.3f ms", ms(t_draw, N))
-			fmt.printfln("  markdown_links             %.3f ms", ms(t_links, N))
-			fmt.printfln("  md_preview_frac            %.3f ms", ms(t_frac, N))
-			fmt.printfln("  whole scroll frame         %.3f ms", ms(t_frame, N))
-			// A threshold, so a regression here goes red instead of printing and
-			// passing regardless. Baseline is 2026-07-29's review measurement on
-			// this exact fixture at -o:speed: markdown_draw 2.79 ms, whole scroll
-			// frame 5.05 ms. The gate is ~1.8x that -- generous enough that normal
-			// machine noise does not flake it, tight enough that a 2x regression
-			// (what actually shipped once, undetected by this mode) trips it
-			// before it fully doubles.
-			//
-			// DEBUG_MULT exists for machine-to-machine noise, not for a
-			// debug/release gap: measured under -debug on this same fixture the
-			// numbers barely move (2.95 ms / 5.56 ms, ~1.1x), because the cost
-			// here is mostly DirectWrite and D3D11 calls outside Odin's own
-			// bounds checks, unlike a tight byte loop. Still generous, because a
-			// gate that flakes is one the next person learns to ignore.
-			DEBUG_MULT :: 1.3
-			dbg := f64(DEBUG_MULT) if ODIN_DEBUG else 1.0
-			draw_gate := 5.0 * dbg
-			frame_gate := 9.0 * dbg
 			perf_bad := 0
-			d_ms, f_ms := ms(t_draw, N), ms(t_frame, N)
-			if d_ms > draw_gate {
-				fmt.printfln("  FAIL: markdown_draw %.3f ms exceeds %.1f ms gate", d_ms, draw_gate)
-				perf_bad += 1
+
+			// FIXTURE 1 -- ~1092 lines of mixed markdown: the review's fixture size,
+			// and mixed because a file of nothing but paragraphs understates the walk
+			// (a table and a blank run are the blocks whose layout keys on
+			// doc.revision).
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				lines := 0
+				for lines < 1085 {
+					i := lines
+					fmt.sbprintf(&b, "## Section %03d\n\n", i)
+					fmt.sbprintf(&b, "A paragraph of body prose with `inline code` and a [link](https://e.test/p%03d) in it, long enough to wrap across the measure more than once so the shaper has real work to do.\n\n", i)
+					fmt.sbprintf(&b, "- first item %03d\n- second item with a little more text on it\n\n", i)
+					strings.write_string(&b, "| c0 | c1 | c2 | c3 | c4 | c5 | c6 | c7 | c8 | c9 | ca | cb |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n| one | two | three | four | five | six | seven | eight | nine | ten | eleven | twelve |\n| aaa | bbb | ccc | ddd | eee | fff | ggg | hhh | iii | jjj | kkk | lll |\n\n")
+					strings.write_string(&b, "```json\n{ \"key\": \"value\", \"n\": 12 }\n```\n\n")
+					lines += 14
+				}
+				perf_bad += md_perf_measure(&h, "mixed", strings.to_string(b), lines, W, H)
 			}
-			if f_ms > frame_gate {
-				fmt.printfln("  FAIL: whole scroll frame %.3f ms exceeds %.1f ms gate", f_ms, frame_gate)
-				perf_bad += 1
+
+			// FIXTURES 2-4 -- HARD-WRAPPED PROSE, the shape fixture 1 cannot express.
+			//
+			// Every paragraph above is ONE line between blank lines, so md_para_bounds
+			// scans one line per call and the paragraph join costs nothing measurable
+			// here. Real prose that a wrapping editor produced has no blank line
+			// inside a paragraph at all, and there each md_para_bounds call walks the
+			// whole run -- every resolver call, before md_para_run memoised it.
+			//
+			// Whole scroll frame, debug build, this machine, 2026-08-01. The first
+			// two columns are the reviewer's on the same fixtures; the last two are
+			// this mode's own, measured with the memo disabled and enabled:
+			//
+			//   fixture           4f1a3b9  fb92ad3   memo off   memo on
+			//   20x100 lines      5.414 ms 6.117 ms   6.231 ms  5.193 ms
+			//   one 2000-line     6.134 ms 13.431 ms 13.849 ms  1.633 ms
+			//   one 4000-line     35.0  ms 39.3   ms 39.783 ms  1.615 ms
+			//
+			// The 4000-line row is the one worth reading twice: the memo RESTORES that
+			// fixture to its pre-join cost. It measured 1.615 ms here against the
+			// 1.73 ms it cost at 6fd48d3, BEFORE the join existed -- and a review
+			// reconstructed that baseline directly (md_para_run returning immediately,
+			// no paragraph machinery at all) at 1.767 ms against 1.604 ms measured.
+			// A ~7% gap is inside run-to-run variance, so "restored to" is the
+			// defensible claim and "below" is not (2026-08-01 review).
+			//
+			// The cost the join added there was never the joining -- that run is capped
+			// and nothing joins in it -- it was asking md_para_bounds the same question
+			// once per block per frame.
+			//
+			// 4000 lines x 88 bytes is 344 KB, past MD_PARA_BUDGET's 256 KB, so that
+			// run is `capped` and NOTHING joins in it -- it measures the cost of
+			// asking, which every .Para block pays whether or not it joins.
+			//
+			// What gates this regression class is the two DEGENERATE fixtures. Under a
+			// disabled memo, `20x100` -- the shape a real hard-wrapped file has -- costs
+			// 6.159 ms against an 11.7 ms frame gate and does NOT trip, while `1x2000`
+			// (13.740) and `1x4000` (40.424) both do. So the class is caught, but the
+			// many-paragraph shape is protected more weakly than the shared gates
+			// suggest.
+			PROSE :: "hard wrapped prose line %04d carrying enough words to look like real reflowed body text\n"
+			{
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for p in 0 ..< 20 {
+					for i in 0 ..< 100 {
+						fmt.sbprintf(&b, PROSE, p * 100 + i)
+					}
+					strings.write_string(&b, "\n")
+				}
+				perf_bad += md_perf_measure(&h, "hardwrap 20x100", strings.to_string(b), 2020, W, H)
 			}
+			// Literal names, not fmt.tprintf: md_perf_measure frees the frame arena
+			// 208 times before it prints, so a temp-allocated name comes back blank.
+			one_para_names := [2]string{"hardwrap 1x2000", "hardwrap 1x4000"}
+			for n, k in ([2]int{2000, 4000}) {
+				b := strings.builder_make()
+				defer strings.builder_destroy(&b)
+				for i in 0 ..< n {
+					fmt.sbprintf(&b, PROSE, i)
+				}
+				perf_bad += md_perf_measure(&h, one_para_names[k], strings.to_string(b), n, W, H)
+			}
+
 			fmt.printfln("mdperftest: %d failures", perf_bad)
+			if perf_bad > 0 {os.exit(1)}
 			return true
 		}
 
@@ -24660,6 +26972,7 @@ when NEWTPAD_TESTS {
 			if !eok {fail = true}
 			fmt.printfln("  %-6s empty leading cells kept (%d cells)", "ok" if eok else "FAIL", len(cells))
 			fmt.println("mdtabletest: FAILURES" if fail else "mdtabletest: all ok")
+			if fail {os.exit(1)} // see mdfencetest's guard
 			return true
 		}
 
@@ -25092,6 +27405,7 @@ when NEWTPAD_TESTS {
 			}
 
 			fmt.println("splittest: FAILURES" if fail else "splittest: all ok")
+			if fail {os.exit(1)} // see mdfencetest's guard
 			return true
 		}
 
@@ -26823,6 +29137,7 @@ when NEWTPAD_TESTS {
 			fmt.println("--- Alt+Z where it does not apply ---")
 			mv_wrap_refusal(&bad)
 			fmt.printfln("mdviewtest: %d failures", bad)
+			if bad > 0 {os.exit(1)} // see mdfencetest's guard
 			return true
 		}
 
@@ -32237,6 +34552,17 @@ when NEWTPAD_TESTS {
 		// trailing-blank-row trim and everything downstream of it.
 		if os.args[1] == "selalltest" {
 			select_all_test_run()
+			return true
+		}
+
+		// `newtpad mdjointest` -- one-argument, no path, sweepable. Covers
+		// md_para_bounds (the single producer of a paragraph's extent) and, as of
+		// this task, the layout join itself: consecutive prose lines becoming one
+		// re-flowed block and the cache holding across repeated md_layout_ensure
+		// calls. Hard breaks, lazy continuation and setext are later tasks in this
+		// batch and do not exist yet.
+		if os.args[1] == "mdjointest" {
+			para_join_test_run()
 			return true
 		}
 

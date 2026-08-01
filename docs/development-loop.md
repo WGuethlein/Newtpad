@@ -241,12 +241,33 @@ Each of these cost real time at least once.
   key, both click cycles, the header seam, the menu's disabled states, the summary row's clickable span
   and the cost at the row ceiling. Same rules — one argument, exits non-zero, a missing
   `NEWTPAD_SESSION_DIR` is a failure. It belongs in every sweep.
-- **Two more modes were printing `FAIL` and exiting 0 until 2026-08-01: `menutest` and
-  `settingstest`.** Both are fixed. This is the same defect the bullet above was written about, found
-  again in two more places, so treat "does this mode actually exit non-zero?" as a thing to *check*
-  rather than assume — and note that **`menuseam` legitimately exits 0 whatever it finds**, because it
-  is a falsifier rather than a pass/fail test. Its answer moved 14/14 → 12/12 under a sabotage with the
-  exit code unchanged throughout, so sweep it by diffing its printed line, never by exit code.
+  **`mdjointest` is the third (2026-08-01)** — `newtpad mdjointest`, no path, covers the preview's
+  CommonMark paragraph model: `md_para_bounds`' entry independence and each of its budget guards, the
+  byte-window memo checked against its own producer, the joined text, hard breaks, lazy continuation
+  for list items and blockquotes, setext headings, the layout cache across an edit that *grows* a
+  block, and a scroll round trip across a joined paragraph. Same rules, and it belongs in every sweep.
+- **`cmd.exe /c build.bat` can report exit 0 while the compile FAILED**, leaving the previous exe in
+  place — which then runs and prints `0 failures`. Hit for real twice on 2026-08-01, once while
+  verifying a sabotage, and it is the same hazard as the compile-failure note below with a different
+  cause: the shell, not the sabotage. Build through PowerShell (`.\build.bat`, then check
+  `$LASTEXITCODE`) and confirm `(Get-Item build\newtpad.exe).LastWriteTime` moved before believing any
+  test result.
+- **Nine modes have been caught printing `FAIL` and exiting 0, all on 2026-08-01**, in three rounds:
+  `menutest` and `settingstest`; then `mdtest`; then `linktest`, `mdviewtest`, `splittest`,
+  `mdfencetest`, `mdtabletest` and `mdperftest`. All nine are fixed. `mdtest` is the one that cost
+  something: it went from `0 failures` to `20 failures` between two commits on the paragraph-join
+  branch and the branch stayed green to every sweep that read exit codes.
+  **The sweep is NOT clean.** A static scan of `test_modes.odin` on 2026-08-01 counted 86 mode entry
+  points, 20 with an `os.exit` on a failing path (directly or via a `*_test_run` helper), and **60
+  that print `FAIL` somewhere with no `os.exit` on any path**. Each round of this was found by
+  looking, not by the previous round's fix generalising — so treat "does this mode actually exit
+  non-zero?" as a thing to *check* rather than assume, and check it the only way that works: sabotage
+  something the mode covers, rebuild (confirm the build's exit code — a sabotage that fails to
+  compile runs the stale exe and prints `0 failures`), run the mode, read its exit code.
+  Some of the 60 are measurement modes, and **`menuseam` legitimately exits 0 whatever it finds**,
+  because it is a falsifier rather than a pass/fail test. Its answer moved 14/14 → 12/12 under a
+  sabotage with the exit code unchanged throughout, so sweep it by diffing its printed line, never by
+  exit code. Check for that shape before adding a guard to a mode.
 - **`drawcount` is safe to run as of batch 8** — `newtpad drawcount <file>` renders offscreen (no
   window, no message pump), prints its numbers and exits, and a bare `newtpad drawcount` prints
   usage. **The old rule here was right to forbid it but wrong about why**, and the difference is the

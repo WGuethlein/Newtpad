@@ -11,41 +11,101 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
-## "The preview does not always respect spaces" — STILL REPRODUCES on v0.35.0
+## Reported 2026-08-01 — documented for a later pass, not investigated
 
-**Wyatt, 2026-07-31, asked directly whether the fix closed it:** *"still see it but lets go over it after
-the table changes... it's like it's messing up the formatting of sentences, etc."* So the table-cell fit
-fix below was **not** what he was seeing, and "sentences" points away from tables entirely — which makes
-the line-per-block model at the bottom of this entry the leading candidate, not the fallback. **Scheduled
-for after the table batch**, at his direction. It needs a decision from him, not just a fix: joining
-adjacent prose lines into one paragraph is what CommonMark does and is a change to how every markdown
-document in the preview looks.
+Wyatt's list, recorded verbatim at his direction: *"just document them for a further pass later."* Each
+entry separates **what he said** from **what the code says**, and the code notes below are from a few
+minutes of reading, not from a real investigation. Nothing here has been reproduced.
 
-### The earlier investigation, kept in full
+### Dragging a tab off the tab row does not spawn a new instance with that tab
 
-**Reported 2026-07-29** with a side-by-side screenshot of the editor and the preview: *"it looks like it's
-not respecting the spaces all the time."* **A defect matching that description was found and fixed**
-(table columns were fitted at `text_char_width`'s whole-pixel grid cell while the cells were shaped at
-the font's real advance, so at the default 16px size every table cell at its natural width broke at its
-last space and dropped the last word onto a second line — `md_table_char_w`, `md_table_fit_selftest`).
+*"dragging tabs off the tab row doesn't spawn a new instance with that tab"*
 
-**Left here because it is not certain that is what he saw.** What was ruled out, with evidence, in case
-the report survives the fix:
+**This looks like a missing feature rather than a broken one.** `tabs_drag_update` (`ui_tabs.odin:428`)
+reorders the dragged tab *along the strip* by adjacent swaps and nothing else — there is no tear-off,
+no detach, and no second-window path anywhere in the file. So the expected behaviour has never been
+built, and it should probably move to `requested-features.md` when someone confirms that.
 
-- **Runs of consecutive spaces do NOT collapse** — the preview draws every space with its own advance
-  (verified on rendered pixels: `AAAA    BBBB` keeps its four-space gap). It is *more* literal than
-  CommonMark here, not less.
-- **Leading indentation is preserved** — an indented paragraph line keeps its spaces, and nested list
-  items get their depth from the indent. It is drawn in proportional spaces, so it is visibly *narrower*
-  than the same indent in the monospace editor half, which may be what looked wrong.
-- **The shaper is not losing spaces** — every space in a block's classified content survives into the
-  spans and into the glyph stream (0 drops over the 144 blocks of `research/newtpad-research-report.md`
-  plus a 31-block fixture), and `shaped_draw` positions each glyph at the shaper's own `x`, so the draw
-  cannot collapse a run either.
+Worth deciding before building: Newtpad tear-off means a **new process** (a second window is not a
+thing today), which drags in what the torn tab does about unsaved state and about the session store —
+both windows would be writing the same `%APPDATA%\Newtpad` session. That is the actual design question,
+not the drag gesture.
 
-**If he still sees it, the remaining candidate is the line-per-block model:** every source line is its own
-`.Para` with a full `para_below` gap, so two adjacent prose lines look like two paragraphs and a blank
-line between them adds nothing (blank runs are zero height, margins collapse). CommonMark joins those
-lines into one paragraph with a space at the break. That is a design question, not a bug — ask before
-changing it.
+### Sorted table headers truncate their text without the column changing width
+
+*"when you sort the columns in table view the column headers seem to truncate and doesn't show the rest
+of the text until you expand the columns... but the column doesn't change horizontal size"*
+
+**Almost certainly the sort's own header decorations eating label width.** v0.36.0 added an arrow, a
+hover chevron and — new in that release — a **precedence digit**, all inside the header cell.
+`table_header_layout` is the one producer of header geometry (CLAUDE.md's one-layout rule), and HANDOFF
+§6bc records that header geometry now depends on document sort state via `table_sort_digits_shown` →
+`doc.table_sort.nkeys`, where before this branch it was a function of columns and DPI alone.
+
+So the label's available width shrinks when a sort is applied while the **column** width does not — which
+is exactly what he describes. Start at `table_header_layout` and check whether the label's measured width
+subtracts the decorations from the same rectangle the truncation is computed against.
+
+**This is a v0.36.0 regression by that reading**, and it is the kind of thing the live pass in
+[live-pass-v0.36.0.md](live-pass-v0.36.0.md) §2 is aimed at. Not verified.
+
+### Web links do not open from the CSV table view (they work in text and JSON)
+
+*"web links highlight on click but dont open the default broswer tab on click"* — then, corrected:
+*"i slightly lied on the links, i'd always tested it on the csv table view... it works in a regular
+text/json but not in table view."*
+
+**So this is specific to the grid, and the document path is fine.** That is a much sharper report and it
+kills most of the obvious candidates. Four things were checked in the code and are NOT the cause — written
+down so the next pass does not re-derive them:
+
+- **The path exists and is ordered correctly.** `main.odin:685` handles Ctrl+click on a link in a table
+  cell, and it runs *before* the column-resize, header-sort and read-only-consume branches, so none of
+  those swallows the press first.
+- **The sort permutation is handled.** `table_links` steps rows with `table_row_next` (`table.odin:3012`),
+  the same step the draw and `table_row_start` take, specifically so an underline positioned by data-row
+  index lands on the line that index resolves to under a sort. The comment at `table.odin:594` records
+  this being got wrong once already.
+- **The draw/hit-test geometry seam has already been fought.** `table_link_hit`'s own comment
+  (`table.odin:3019`) records a fixed bug of exactly that shape — `line_h` instead of `row_h` made the top
+  of the band right and the bottom short.
+- **`doc.kind == .Text` holds for a CSV**, or the header sort at `main.odin:705` would be dead too, and
+  sorting works.
+
+**The leading candidate is now resolution, and it is a real asymmetry between the two views.** The table
+path is **explicitly not resolution-gated** (`main.odin:687-690`): `table_links` decorates whatever
+`links_scan` finds in a cell, so a dead target in the grid *still underlines*, while the document view
+only decorates links that resolve — "an underline is a promise" (`features.md:365`) is true of the
+document and **not** of the grid. A cell link that fails to resolve therefore reaches `link_follow`,
+which is loud on every failure path (`links.odin:975`) and should raise a `Could not resolve` box.
+
+**So the one question that splits this cleanly, and it needs a person:** *does a dialog appear when you
+Ctrl+click a link in the grid?*
+
+- **A dialog** → the click is arriving and the failure is in `link_resolve` or in `plat.shell_open_url`'s
+  scheme whitelist (`file.odin:725`, HANDOFF §6l). Read the dialog text; it names which.
+- **Silently nothing** → the click never reached `link_follow`, which means `table_link_hit` returned
+  false at the pixel he clicked, and the suspect is the band `[l.y - px, l.y - px + row_h]` at
+  `table.odin:3025` against the underline the draw puts at `tl.y + sx(2)` (`main.odin:1906`) — the two
+  read the same `Table_Link.y` (a *baseline*) but derive different vertical extents from it.
+
+Worth a headless test either way: nothing currently compares what the grid *draws* as a link against what
+the grid treats as *clickable*, which is precisely the seam CLAUDE.md's one-layout rule is about.
+
+### Menu and Ctrl+F interactions feel awkward
+
+*"there are a lot of interactions in and out of menus like Ctrl+F that are awkward but it's hard to
+expalin these now."*
+
+**Deliberately left vague — he could not pin it down and said so.** Recorded so it is not lost, and
+because a vague report from daily use has been right before.
+
+Do not guess at a fix from this. What it needs is a session where he drives and narrates, or a
+focused live pass on focus transitions specifically: what has keyboard focus after opening and closing
+the find bar, after Esc, after a menu opens over the find bar, and what happens to the caret and to the
+selection at each of those. The find bar moved to the top in batch 12 and twelve call sites read its
+inset (HANDOFF §6aq), and CLAUDE.md's own event rule is only *partially* honoured — "input is drained
+from the platform queue but acted on at several points in the frame, and some widgets still resolve
+state during the draw" — so there is a plausible structural cause here, which is a reason to look
+properly rather than to patch a symptom.
 
