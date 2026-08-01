@@ -2323,7 +2323,9 @@ table_sort_digits_shown :: #force_inline proc(doc: ^Document) -> bool {
 //
 // ONE CELL, and that is not an estimate: the digit is drawn in the document face
 // on the same fixed cell grid every other measurement in this file uses, and
-// #assert below keeps it to a single character.
+// the #assert(TABLE_SORT_KEYS_MAX <= 9) beside the digit's draw in table_draw's
+// header pass -- some 900 lines from here, not "below" in any local sense --
+// keeps it to a single character.
 table_sort_digit_w :: #force_inline proc(char_w: f32, digit: bool) -> f32 {
 	return char_w + table_mark_gap() if digit else 0
 }
@@ -2350,6 +2352,21 @@ table_header_marks_cells :: proc(char_w, px: f32, digit: bool) -> int {
 	return n
 }
 
+// Does this column have room for the marks' whole run -- table_header_marks_w,
+// plus one cell left over for the label -- or is it too narrow to hold what it
+// is being asked to reserve?
+//
+// THE test both the chevron's suppression (table_header_layout) and the
+// digit's (table_sort_mark) read, rather than two copies of the same
+// arithmetic drifting apart. table_header_label_col does not consult this: its
+// clamp at `col.cells - 1` is cells-rounded and always leaves the label
+// something, which is exactly why it can under-deliver relative to `need`
+// here without either of those two callers using this predicate first -- see
+// table_sort_mark's comment on the digit's own gate.
+table_header_marks_fit :: #force_inline proc(col: Table_Col, char_w, px: f32, digit: bool) -> bool {
+	return col.w - TABLE_CELL_PAD_X * 2 >= table_header_marks_w(px, char_w, digit) + char_w
+}
+
 // --- the sort mark: ONE producer for the arrow AND its precedence digit -----
 //
 // What the header draws for a column's sort, decided in one place: whether there
@@ -2371,11 +2388,11 @@ table_header_marks_cells :: proc(char_w, px: f32, digit: bool) -> int {
 // whole grid; it is not the header re-truncating under the pointer, which is what
 // the uniform-reservation rule above exists to prevent.
 Table_Sort_Mark :: struct {
-	arrow:            Table_Arrow,
-	digit_x, digit_w: f32, // the digit's cell; zero-width when rank == 0
-	rank:             int, // 1-based precedence, or 0 for "draw no digit"
-	up:               bool, // ascending -- this key's own direction
-	ghost:            bool, // the hover preview on an unsorted column, not a live sort
+	arrow:                     Table_Arrow,
+	digit_x, digit_y, digit_w: f32, // the digit's cell; zero-width when rank == 0
+	rank:                      int, // 1-based precedence, or 0 for "draw no digit"
+	up:                        bool, // ascending -- this key's own direction
+	ghost:                     bool, // the hover preview on an unsorted column, not a live sort
 }
 
 // The mark for one visible column, or ok=false when the column draws none.
@@ -2386,21 +2403,46 @@ Table_Sort_Mark :: struct {
 // which is ascending (table_sort_cycle), so the ghost is a prediction rather than
 // a decoration -- and it carries no digit, because a preview of a key that does
 // not exist yet has no precedence to name.
+//
+// The digit gets the SAME table_header_marks_fit gate the chevron gets
+// (table_header_layout's `fits`), for the same reason: table_header_label_col
+// clamps its reserve at `col.cells - 1`, so on a column where the marks' whole
+// run needs more cells than that, the reserve under-delivers and an
+// unconditional digit paints into the label -- the "smear below Date" bug
+// (Wyatt, live use, v0.34.0) in its digit-shaped form. The arrow keeps
+// drawing either way; it is what the clamped reserve does still cover, and
+// only the digit is narrow enough a hazard to need its own gate. Exactly how
+// narrow a column has to be to trip this is not stated here because it has
+// not been measured -- char_w comes from DirectWrite, not a fixed fraction of
+// px, so the crossing point is font- and DPI-dependent; the direction (a
+// narrower column is closer to losing the digit) is certain, the threshold is
+// not.
 table_sort_mark :: proc(doc: ^Document, col: Table_Col, char_w, px, right: f32, hover_col: int) -> (m: Table_Sort_Mark, ok: bool) {
 	if doc == nil {return {}, false}
 	s := &doc.table_sort
+	dg := table_sort_digits_shown(doc)
 	if k, is_key := table_sort_key(doc, col.c); is_key && table_sorted(doc) {
 		m.up = !s.keys[k].desc
-		if table_sort_digits_shown(doc) {m.rank = k + 1}
+		if dg {m.rank = k + 1}
 	} else if col.c == hover_col {
 		m.ghost, m.up = true, true
 	} else {
 		return {}, false
 	}
 	m.arrow = table_sort_arrow_rect(col, px, right)
+	if m.rank > 0 && !table_header_marks_fit(col, char_w, px, dg) {
+		m.rank = 0
+	}
 	if m.rank > 0 {
 		m.digit_w = char_w
 		m.digit_x = m.arrow.x - table_mark_gap() - char_w
+		// The header's own text baseline, not a coordinate of the arrow's: the
+		// digit is text and sits where every other header label sits, not
+		// where the arrow's quads are vertically centred. Named here, on the
+		// mark, rather than left for the draw to supply, so the producer
+		// still names every one of the mark's coordinates and the draw still
+		// computes none of its own.
+		m.digit_y = table_header_baseline_y(px)
 	}
 	return m, true
 }
@@ -2532,7 +2574,7 @@ table_header_layout :: proc(
 			body = {x = x0, y = top, w = max(0, x1 - x0), h = hh},
 		}
 		chx := table_header_marks_right(col, right) - cw
-		fits := col.w - TABLE_CELL_PAD_X * 2 >= table_header_marks_w(px, char_w, dg) + char_w
+		fits := table_header_marks_fit(col, char_w, px, dg)
 		if col.c == hover_col && fits && chx >= gw {
 			hc.has_chev = true
 			hc.chevron = {x = chx, y = top + f32(int((hh - ch) * 0.5)), w = cw, h = ch}
@@ -3391,10 +3433,12 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 				// what keeps that shortcut honest if the cap ever moves.
 				#assert(TABLE_SORT_KEYS_MAX <= 9)
 				d := [1]u8{'0' + u8(m.rank)}
-				// Accent, the arrow's own colour, and the header's own baseline: the
-				// digit is part of the mark rather than a second annotation, and it
-				// sits on the line every other character in this band sits on.
-				plat.text_draw(gfx, text, string(d[:]), m.digit_x, hy, px, colour, .Doc)
+				// Accent, the arrow's own colour, and m.digit_y -- the header's own
+				// text baseline, named on the mark rather than read off `hy` here,
+				// so this draw computes no coordinate of its own either. The digit
+				// is part of the mark rather than a second annotation, and it sits
+				// on the line every other character in this band sits on.
+				plat.text_draw(gfx, text, string(d[:]), m.digit_x, m.digit_y, px, colour, .Doc)
 			}
 		}
 		// The menu chevron, on the hovered column only (table_header_layout decides

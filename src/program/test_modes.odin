@@ -3264,7 +3264,11 @@ when NEWTPAD_TESTS {
 			li_chk(bad, cols[0].x == 56 && cols[0].w == 116, fmt.tprintf("precondition: c0 spans 56..172 (%.0f..%.0f)", cols[0].x, cols[0].x + cols[0].w))
 			li_chk(bad, m0.arrow.x == 138, fmt.tprintf("c0's arrow is unmoved by the digit, at 138 (%.0f)", m0.arrow.x))
 			li_chk(bad, m0.digit_x == 125 && m0.digit_w == 8, fmt.tprintf("c0's digit is the cell at 125..133 (%.0f..%.0f)", m0.digit_x, m0.digit_x + m0.digit_w))
-			li_chk(bad, m0.digit_x + m0.digit_w + table_mark_gap() == m0.arrow.x, fmt.tprintf("...with the mark gap between the two (%.0f + %.0f vs %.0f)", m0.digit_x + m0.digit_w, table_mark_gap(), m0.arrow.x))
+			// No third check restating "digit_x + digit_w + gap == arrow.x" here:
+			// table_sort_mark COMPUTES digit_x from arrow.x minus that same gap and
+			// char_w, so the equation holds by construction and cannot fail
+			// independently of the two hand-derived checks above it -- it would only
+			// ever catch a bug those two already catch first.
 
 			// WHAT IS DRAWN AGAINST WHAT IS DRAWN: the header label is truncated to
 			// a box that stops before the digit. Without the reserve the digit is
@@ -14726,6 +14730,23 @@ when NEWTPAD_TESTS {
 						continue
 					}
 
+					// A live two-key sort, rebuilt every iteration because section 3b
+					// below clears it at its own end -- so table_sort_digits_shown(&d)
+					// is true for THIS scale's checks rather than for whatever the
+					// PREVIOUS scale's section 3b happened to leave behind. Column 0
+					// then column 1 keeps `dateiso` -- the header that fills its cell,
+					// the case that smeared -- live as the tie-breaker. Before this,
+					// section 4 below passed `table_sort_digits_shown(&d)` to a
+					// document that was never sorted (nkeys == 0), so the digit's
+					// reservation was never actually exercised at any of the three
+					// scales this sweep tests.
+					dk: [TABLE_SORT_KEYS_MAX]Sort_Key
+					for i in 0 ..< TABLE_SORT_KEYS_MAX {dk[i] = {col = i, desc = i % 2 == 1}}
+					if !table_sort_build(&d, dk[:]) {
+						chk(&bad, false, fmt.tprintf("%s: precondition -- the two-key sort builds", tag))
+						continue
+					}
+
 					// --- 1. The summary row and the h-scrollbar do not overlap ---
 					//
 					// Both rects from their OWN producers, not from one restated
@@ -14785,6 +14806,7 @@ when NEWTPAD_TESTS {
 					{
 						head := table_header_fields(&d)
 						overlaps, gaps_ok := 0, 0
+						digit_overlaps, digit_gaps_ok := 0, 0
 						for col in cols {
 							if col.c >= len(head) {continue}
 							a := table_sort_arrow_rect(col, px, table_right(W))
@@ -14795,9 +14817,21 @@ when NEWTPAD_TESTS {
 							right_edge := hx + f32(hcells) * cw
 							if right_edge > a.x {overlaps += 1}
 							if a.x - right_edge >= table_mark_gap() {gaps_ok += 1}
+							// The DIGIT's own slot -- table_sort_mark's own formula
+							// (arrow.x - gap - char_w) reproduced here rather than read
+							// back from it, the same way `a` above is table_sort_arrow_rect
+							// rather than a mark. It sits entirely inside the arrow's
+							// slot from the label's point of view, so a reservation that
+							// forgot the digit's width can pass the arrow check above
+							// while still painting the digit through the label.
+							dx := a.x - table_mark_gap() - cw
+							if right_edge > dx {digit_overlaps += 1}
+							if dx - right_edge >= table_mark_gap() {digit_gaps_ok += 1}
 						}
 						chk(&bad, overlaps == 0, fmt.tprintf("%s: no header label reaches into the arrow's slot (%d of %d did)", tag, overlaps, len(cols)))
 						chk(&bad, gaps_ok == len(cols), fmt.tprintf("%s: ...and every one keeps the gap beside it (%d of %d)", tag, gaps_ok, len(cols)))
+						chk(&bad, digit_overlaps == 0, fmt.tprintf("%s: no header label reaches into the digit's slot either (%d of %d did)", tag, digit_overlaps, len(cols)))
+						chk(&bad, digit_gaps_ok == len(cols), fmt.tprintf("%s: ...and every one keeps the gap beside the digit too (%d of %d)", tag, digit_gaps_ok, len(cols)))
 						// The slot is inside its own cell and on screen, so the
 						// arrow cannot be drawn over the neighbouring column.
 						strays := 0
@@ -14815,6 +14849,11 @@ when NEWTPAD_TESTS {
 							if plat.text_cells(&t, transmute([]u8)head[col.c], 0, .Doc) >= col.cells {filled += 1}
 						}
 						chk(&bad, filled > 0, fmt.tprintf("%s: precondition -- at least one header fills its column (%d)", tag, filled))
+						// And the digit itself is genuinely live for this precondition,
+						// or the digit checks above are vacuous the same way -- this is
+						// the fact that was false at every scale before the sort above
+						// was added.
+						chk(&bad, table_sort_digits_shown(&d), fmt.tprintf("%s: precondition -- the precedence digit is live for this sweep", tag))
 					}
 
 					// --- 3a. The header's hover state, and its precedence ---------
