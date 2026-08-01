@@ -721,6 +721,19 @@ $env:NEWTPAD_SESSION_DIR = "$env:TEMP\np-b19"; foreach ($m in @("tablesorttest",
 Expected: no `FAILED:` line. **`Select-String "FAIL"` is case-insensitive** — do not grep for it, check
 exit codes as above.
 
+**`menuseam` is NOT in that list and must not be, because an exit code cannot see it.** It is a falsifier
+with no pass/fail: it measures whether resolving scroll twice in one frame diverges, and it exits 0 no
+matter what it finds. Task 4's review watched its answer move from `14/14` to `12/12` under a sabotage
+while the exit code stayed 0 throughout. **Check its printed line instead**, and expect exactly:
+
+```
+14/14 scrolling cases diverge across one selection move; idempotent-for-fixed-item=true
+```
+
+Task 4 also fixed `menutest` and `settingstest`, both of which printed their failure count and then
+exited **0** — so any sweep run before that fix was non-diagnostic for those two. If a sweep in a later
+session finds a third mode with the same shape, the fix is `palettetest`'s pattern in the same file.
+
 - [ ] **Step 7: Commit**
 
 ```bash
