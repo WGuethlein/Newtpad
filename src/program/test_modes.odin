@@ -5819,6 +5819,9 @@ when NEWTPAD_TESTS {
 			metrics_recompute(&rcz) // leave globals alone for later modes
 
 			fmt.printfln("settingstest: %d failures", bad)
+			// Non-zero exit, for the reason keytest grew one: a mode that only ever
+			// prints its verdict is a mode whose verdict a sweep can miss.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
@@ -6260,6 +6263,9 @@ when NEWTPAD_TESTS {
 			bad += ro_menu_case(false, .Preview, "Preview")
 
 			fmt.printfln("menutest: %d failures", bad)
+			// Non-zero exit, for the reason keytest grew one: a mode that only ever
+			// prints its verdict is a mode whose verdict a sweep can miss.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 
