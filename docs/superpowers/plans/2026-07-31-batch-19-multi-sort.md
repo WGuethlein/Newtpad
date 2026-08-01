@@ -3,8 +3,13 @@
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development to implement
 > this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** The table view sorts by up to three columns, first-selected-wins, through a discoverable header
+**Goal:** The table view sorts by up to two columns, first-selected-wins, through a discoverable header
 menu — without changing the sort's data-safety machinery.
+
+**Amended 2026-07-31, after Task 2's measurement:** the cap was 3 when this plan was written. Three keys
+at the 100,000-row ceiling measured ~460 ms release against one key's ~258 ms, and Wyatt chose **two**.
+The spec's §3 and §4 carry the numbers and the honest caveat that the cap is a weak lever. Tasks below
+still read `TABLE_SORT_KEYS_MAX` symbolically, so only the constant, the test cases and the prose moved.
 
 **Architecture:** `Table_Sort.col`/`desc` become a fixed key vector (`keys[3]`, `nkeys`). `offs`/`perm`/
 `rank`, `doc.top`'s byte-offset invariant and both lifetime hooks are untouched — only *how `perm` is
@@ -22,7 +27,8 @@ spec wins and the plan is what gets fixed.
 ## Global constraints
 
 - **Odin, `package main` under `src/program`.** One package per directory; no new directories.
-- **`TABLE_SORT_KEYS_MAX = 3`.** `TABLE_SORT_MAX = 100_000` does **not** change.
+- **`TABLE_SORT_KEYS_MAX = 2`** (measured down from 3 — see the amendment above). `TABLE_SORT_MAX =
+  100_000` does **not** change.
 - **Never change the meaning of `offs` / `perm` / `rank`, or `doc.top`'s byte-offset invariant.**
 - **Never remove or weaken** `pt_edit_replace → table_sort_shift`, or `doc_index_start` /
   `apply_snapshot → table_sort_clear`.
@@ -86,7 +92,7 @@ can reject Task 2's ordering logic while approving this.
 **Interfaces produced:**
 
 ```odin
-TABLE_SORT_KEYS_MAX :: 3
+TABLE_SORT_KEYS_MAX :: 2
 
 Sort_Key :: struct {
     col:     int,
@@ -207,8 +213,8 @@ table_sort_build :: proc(doc: ^Document, keys: []Sort_Key) -> bool
 // [dynamic]u8 REALLOCATES, and a string captured before a growth points into freed
 // memory. Every key is spanned first and materialised in one pass once the arena
 // has stopped moving. That bug is silent -- the comparator reads plausible garbage
-// and produces a plausible ORDER -- and with three keys there are three times as
-// many chances to make it.
+// and produces a plausible ORDER -- and with two keys there are twice as many
+// chances to make it.
 @(private = "file")
 Sort_Field :: struct {
     key:    string,
@@ -301,7 +307,7 @@ It must count a missing `NEWTPAD_SESSION_DIR` as a **failure**, print `N failure
 
 Cases for this task (spec §10 items 1–5):
 
-1. `perm`/`rank` are exact inverses and `offs` is ascending, at `nkeys` = 1, 2 and 3.
+1. `perm`/`rank` are exact inverses and `offs` is ascending, at `nkeys` = 1 and 2.
 2. **Precedence** — a fixture where sorting by column 0 alone and by column 1 alone give *different*
    orders, asserted against the full expected row order. A comparator that reads keys in the wrong order
    cannot pass this.
@@ -309,9 +315,9 @@ Cases for this task (spec §10 items 1–5):
    whose row 900 is `N/A`, used as the **secondary** key, must sort as text.
 4. **Empty-last per key, both directions** — a blank in key 2 with key 1 tied, asserted at
    `desc = false` and `desc = true`, with the blank last in both.
-5. **Total order** — three rows equal on all three keys come back in file order, under every direction
+5. **Total order** — three rows equal on every key come back in file order, under every direction
    combination.
-6. **The refusal still holds at k keys** — a settled row count over `TABLE_SORT_MAX` refuses a 3-key
+6. **The refusal still holds at k keys** — a settled row count over `TABLE_SORT_MAX` refuses a 2-key
    sort before scanning, the in-loop `len(items) >= TABLE_SORT_MAX` check refuses an unsettled one,
    `refused` is recorded, and `table_summary_text` says `too large to sort (over 100,000 rows)`.
 
@@ -328,8 +334,16 @@ Expected before Steps 1–4 are complete: non-zero exit with named failures. Rec
 Time `table_sort_build` at **k=3 over 100,000 rows** in a `release` build. Record the number in the task
 report and in `TABLE_SORT_MAX`'s comment beside the existing 205 ms figure.
 
-**If it is not in the same neighbourhood, lower `TABLE_SORT_KEYS_MAX`. Do not raise `TABLE_SORT_MAX` and
-do not accept the longer freeze** — product principle 1, and the spec §4 says the cap is the variable.
+**RESOLVED 2026-07-31.** Measured: one key **387 ms debug / ~258 ms release**, three keys **696 ms debug
+/ ~460 ms release**. `TABLE_SORT_KEYS_MAX` came down to **2** on Wyatt's decision. `TABLE_SORT_MAX` did
+not move and the longer freeze was not accepted.
+
+Two things the measurement turned up that belong in the HANDOFF entry:
+- The cost is a **constant factor** (3× keys → 1.8× time), so the cap is a weak lever — 2 keys still
+  costs ~360 ms. The case for stopping at two is that nobody asked for a third.
+- **`TABLE_SORT_MAX`'s own comment is wrong**: it claims 205 ms at 100,000 rows, extrapolated linearly
+  from a measured 2,046 ms at 1,000,000. Measured directly it is ~258 ms. Fix the comment, not the
+  constant.
 
 Prefer a *comparison* to a fixed threshold in the assertion (as `selalltest` does): a millisecond constant
 drifts with the machine.
@@ -406,7 +420,8 @@ At `main.odin:717`, the header press currently calls `table_sort_click(doc, c)` 
 
 - [ ] **Step 6: `tablesorttest` case 6**
 
-Both cycles end to end: plain asc → desc → clear; Ctrl append order across three columns, direction flip
+Both cycles end to end: plain asc → desc → clear; Ctrl append order across two columns plus a third
+whose append is refused at the cap, direction flip
 **in place** (assert the precedence index is unchanged), third Ctrl+click removes only that key, removing
 the last leaves `table_sorted(doc) == false`, and an append at the cap is refused.
 
@@ -656,11 +671,12 @@ clause start" from the finished string would name the wrong bytes the first time
 
 - [ ] **Step 2: Check it against the band at a small window**
 
-Measure the longest 3-key line
-(`120,000 rows · 8 columns · sorted by Department asc, Last Name asc, Hire Date desc · click to clear`)
+Measure the longest 2-key line
+(`120,000 rows · 8 columns · sorted by Department asc, Last Name desc · click to clear`)
 against the summary band at the narrowest supported window. **Decide the behaviour if it does not fit and
-implement that decision** — do not leave it to be discovered. If it cannot be made to fit, that is the
-argument for lowering `TABLE_SORT_KEYS_MAX`, and it goes to Wyatt rather than being decided here.
+implement that decision** — do not leave it to be discovered. The cap is already at 2 for a separate
+reason (Task 2's measurement), so lowering it further is not the answer here; if the line does not fit,
+the answer is in the wording or the band, and it goes to Wyatt.
 
 - [ ] **Step 3: Per-key arrows with a precedence digit**
 
@@ -671,7 +687,7 @@ face has U+25B2).
 
 - [ ] **Step 4: `tablesorttest` case 10**
 
-The wording at 1, 2 and 3 keys; `clear_s`/`clear_e` naming exactly the drawn run (assert the byte span
+The wording at 1 and 2 keys; `clear_s`/`clear_e` naming exactly the drawn run (assert the byte span
 against the string, not against a literal); the digit absent at `nkeys == 1` and present at 2.
 
 - [ ] **Step 5: Sabotage**
@@ -768,6 +784,10 @@ Two gaps found on review and fixed above rather than left as notes: spec §10 it
 `TABLE_SORT_MAX` with k keys) had no test step and is now Task 2's case 6; and Task 6 named a `Rect` type
 this codebase does not have.
 
-**One thing this plan deliberately does not decide:** Task 7 Step 2 can conclude that a 3-key summary line
-does not fit the band at a small window. That outcome lowers `TABLE_SORT_KEYS_MAX`, which is a product
-decision — it goes to Wyatt, not to the implementer.
+**One thing this plan deliberately does not decide:** Task 7 Step 2 can conclude that a 2-key summary line
+does not fit the band at a small window. The answer would be in the wording or the band, and it is a
+product decision — it goes to Wyatt, not to the implementer.
+
+**Amendment log.** `TABLE_SORT_KEYS_MAX` 3 → 2 on 2026-07-31, after Task 2's measurement and Wyatt's
+decision. Task 2's commit message says "up to three keys" because it predates the change; the constant
+moves in Task 2's fix round.

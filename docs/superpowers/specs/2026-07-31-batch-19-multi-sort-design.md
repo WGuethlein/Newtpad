@@ -71,7 +71,7 @@ is unaffected by the key count.
 ## 3. Data model
 
 ```odin
-TABLE_SORT_KEYS_MAX :: 3
+TABLE_SORT_KEYS_MAX :: 2
 
 Sort_Key :: struct {
     col:     int,
@@ -93,13 +93,29 @@ Table_Sort :: struct {
 not a rule anything has to enforce — it is what the data structure already is. That is the point of
 storing keys in a fixed array rather than, say, a priority field per column.
 
-**Why the cap is 3.** Three is what Excel's classic sort dialog offered, it keeps §7's summary row a
-sentence a person reads rather than a list they scan, and the build pays per key. **It is reversible**,
-and its comment must say so in the same terms `TABLE_SORT_MAX`'s does: raising it needs a fresh
-measurement (§4) *and* a decision about the summary row's wording, and whoever raises it should record
-both. A cap that is silently raised is how the summary row starts overflowing its band.
+**Why the cap is 2 — and this row was 3 until it was measured.** The original argument was Excel's
+classic sort dialog (three keys) plus a readable summary row. **The measurement replaced it**, which is
+the whole reason §4 puts the measurement before the cap rather than after: at the 100,000-row ceiling,
+three keys cost **~460 ms** against one key's **~258 ms** (measured in debug at 696 ms and 387 ms,
+converted at the tree's own ×0.665 ratio). Wyatt's decision, 2026-07-31: **two keys.**
 
-**`numeric` moves onto the key.** Today it is a local in `table_sort_build`. With three keys, one column
+Recorded honestly, because the number does not make the choice obvious and a later reader deserves the
+real shape of it: the cost is a **constant factor** (3× the keys buys 1.8× the time), so the cap is a
+weak lever — two keys still costs ~360 ms, which is most of the way to three. The case for stopping at
+two is that "sort by department, then by name" is the query people actually have, and the third key was
+bought at a real price for a case nobody had asked for.
+
+**It is reversible in both directions**, and its comment must say so in the same terms `TABLE_SORT_MAX`'s
+does: changing it needs a fresh measurement *and* a decision about the summary row's wording, and whoever
+changes it should record both. A cap that is silently raised is how the summary row starts overflowing
+its band.
+
+**A pre-existing finding, surfaced by this measurement and not caused by it:** `TABLE_SORT_MAX`'s comment
+claims **205 ms** at 100,000 rows, extrapolated linearly from a measured 2,046 ms at 1,000,000. Measured
+directly at 100,000 it is **~258 ms** — the shipped single-key sort is ~26% slower than its own comment
+says. Fix the comment; do not fix it by changing the constant.
+
+**`numeric` moves onto the key.** Today it is a local in `table_sort_build`. With more than one key, one column
 may sort numerically while another sorts as text in the same order, so the flag belongs to the key. It is
 stored rather than recomputed because the comparator runs O(n log n) times and the detection is O(n).
 
@@ -118,7 +134,7 @@ arena discipline is unchanged and is the part most likely to be got wrong by som
 existing comment: **`ks`/`kl` are offsets into the arena, and every `key` string is materialised in one
 pass only after the arena has stopped growing.** A `[dynamic]u8` reallocates; a string captured before a
 growth points into freed memory, the comparator reads plausible garbage, and the result is a plausible
-wrong order. With three keys there are three times as many chances to make that mistake.
+wrong order. With two keys there are twice as many chances to make that mistake.
 
 **Type detection is per key, over every row the sort orders.** The existing comment's argument is
 load-bearing and applies identically to keys 2 and 3: `doc.table_align` decides alignment from the first
@@ -158,17 +174,19 @@ not depend on `slice.sort_by`'s stability, which this file cannot see.
 2,046 ms at 1,000,000 rows, chosen because "a two-second stall on a header click is not a slow feature, it
 is a hung window."
 
-**The plan must measure k=3 at 100,000 rows and record the number.** Multi-key adds two extra
-`csv_field_into` calls per row plus a comparator that may look at three keys instead of one — real cost on
-top of a budget that is already the slowest thing in the app.
+**Measured 2026-07-31, and it moved the cap.** At 100,000 rows: one key **387 ms debug / ~258 ms
+release**, three keys **696 ms debug / ~460 ms release**. `TABLE_SORT_KEYS_MAX` came down from 3 to **2**
+on Wyatt's decision (§3 carries the reasoning and the honest caveat that the cap is a weak lever).
 
-- If it lands near the single-key figure, the cap stays at 3 and the number goes in the comment.
-- If it does not, **`TABLE_SORT_KEYS_MAX` comes down; `TABLE_SORT_MAX` does not go up and the freeze is
-  not accepted.** Product principle 1 is "speed everywhere — clicking, tabs, find, open: instant", and
-  nothing about a header click exempts it.
+**`TABLE_SORT_MAX` did not go up and the freeze was not accepted.** Product principle 1 is "speed
+everywhere — clicking, tabs, find, open: instant", and nothing about a header click exempts it.
 
-This ordering is deliberate. The tempting response to a slow measurement is to keep three keys and accept
-a longer stall, because the feature was the thing that was asked for. The cap is the variable.
+This ordering was deliberate and it earned its keep: the tempting response to a slow measurement is to
+keep the feature as designed and accept the stall, because the feature is what was asked for. The cap was
+the variable, and it moved.
+
+**Re-measure if the build changes shape** — the number above is a constant-factor cost over one bounded
+pass, so anything that changes the pass (a background index, a different key extraction) invalidates it.
 
 ---
 
@@ -272,8 +290,8 @@ is worth restating: a second procedure computing "where does the sort clause sta
 string would re-derive what this one already knows and would name the wrong bytes the first time the
 wording changed.
 
-At the 3-key cap the longest realistic line is roughly
-`120,000 rows · 8 columns · sorted by Department asc, Last Name asc, Hire Date desc · click to clear`.
+At the 2-key cap the longest realistic line is roughly
+`120,000 rows · 8 columns · sorted by Department asc, Last Name desc · click to clear`.
 **The plan must check that against the band at a small window width** and decide the behaviour if it does
 not fit, rather than leaving it to be discovered. That check is also the argument that keeps the key cap
 at 3.
@@ -332,13 +350,14 @@ because *"a mode nothing runs is worse than no mode."*
 
 What it must cover:
 
-1. **The key vector** — build with 1, 2 and 3 keys; `perm`/`rank` are exact inverses; `offs` is ascending.
+1. **The key vector** — build with 1 and 2 keys; `perm`/`rank` are exact inverses; `offs` is ascending.
 2. **Precedence is first-selected-wins** — a fixture where key 1 alone and key 2 alone give *different*
    orders, so a comparator that reads them in the wrong order cannot pass.
 3. **Per-key numeric detection past the sample window** — a column whose first 500 rows are numeric and
    whose row 900 is `N/A` must sort as **text**, on the secondary key as well as the primary.
 4. **Empty-last per key, in both directions** — including a blank in key 2 with key 1 tied.
-5. **Total order** — equal on all three keys falls back to file position, ascending, in both directions.
+5. **Total order** — equal on every key falls back to file position, ascending, under every direction
+   combination.
 6. **Both cycles** — plain click asc → desc → clear; Ctrl+click asc → desc → removed, including append
    order, direction flip in place, and removing the last key.
 7. **The menu's disabled states** — every row of §5's table, including the full-vector refusal.
@@ -390,4 +409,5 @@ proves otherwise.
 - **No live GUI pass.** This environment cannot inject GUI keyboard or mouse input, so the chevron's hover
   behaviour, the right-click, Ctrl+click and the menu's placement against a window edge are all
   inferences from source until Wyatt uses them. A live pass is worth one.
-- The 3-key cap is judgement plus a measurement, not evidence about what users want.
+- The 2-key cap is a measurement plus a judgement call, not evidence about what users want. Nobody has
+  asked for a third key; if anyone does, §3 says what re-opening it costs.
