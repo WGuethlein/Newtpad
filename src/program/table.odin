@@ -813,11 +813,22 @@ TABLE_SORT_MAX :: 100_000
 // The most keys a sort can carry. Batch 19's "first column selected wins":
 // PRECEDENCE IS ARRAY ORDER, and array order is append order, so first-wins is a
 // property of the data structure and not a rule anything has to enforce -- there is
-// no separate priority field to keep in step with it. Three is the cap because
-// that's what raised the freeze budget (TABLE_SORT_MAX's build cost, above) by a
-// measured amount when it was set; raising TABLE_SORT_KEYS_MAX needs the same kind
-// of measurement TABLE_SORT_MAX did; a cap raised without one is how the summary
-// row (table_summary_parts) starts overflowing its band.
+// no separate priority field to keep in step with it.
+//
+// Three is a SPEC-GIVEN cap, not a measured one -- unlike TABLE_SORT_MAX just above,
+// which has a real number behind it (205 ms at 100,000 rows, extrapolated from a
+// measured 2,046 ms at 1,000,000). No equivalent measurement exists for this
+// constant: the multi-key comparator it bounds does not exist yet (that build is
+// Task 2 of this batch), so nothing about its cost has been timed. Three was chosen
+// because Excel's classic sort dialog offered three, and because the summary row
+// (table_summary_parts) has to stay a sentence a reader takes in, not a list they
+// scan.
+//
+// It is reversible, but raising it takes two things, not one: a fresh measurement
+// of the multi-key build's cost at the higher count once the comparator exists, AND
+// a decision about how the summary row reads with more keys in it. Whoever raises
+// it should record both -- a cap raised on only one of them is exactly the
+// comment-outran-the-evidence shape this one used to be.
 TABLE_SORT_KEYS_MAX :: 3
 
 // One column's part of the sort. TABLE_SORT_NONE is what an unset key's `col` is --
@@ -874,6 +885,22 @@ table_sort_key :: proc(doc: ^Document, col: int) -> (k: int, ok: bool) {
 // the only thing holding. All three leave paths clear now (leave_table_view,
 // .Toggle_Table, doc_view_apply) and it is a belt again, but it stays: the cost is
 // one field compare and what it guards is the text view's scroll model.
+//
+// `s.nkeys > 0` is REDUNDANT against `len(s.perm) > 0` in the code as it stands
+// today -- the two are in exact lockstep, because there are only two places `nkeys`
+// is ever written. table_sort_clear sets it to 0 in the same breath it clears
+// `perm`. table_sort_build sets it to 1 exactly once, at its last line, only after
+// `perm` has already been resized to a non-empty length on the success path above
+// it (every earlier return leaves `nkeys` untouched at whatever table_sort_clear
+// left it). Nothing else assigns `nkeys`, so there is no state the current code can
+// construct where the two disagree. The term is kept anyway, not because it guards
+// a reachable state that `len(perm) > 0` misses, but because it names the actual
+// invariant this predicate is about -- "is a sort live" -- rather than a proxy for
+// it; `len(perm)` is a size that happens to correlate with liveness today, and
+// reading through it would be one more thing a future change to `perm`'s lifecycle
+// could quietly break without anything here saying so. Same spirit as the
+// `doc.table` belt above: cheap, and it names its own reason rather than someone
+// else's.
 table_sorted :: #force_inline proc(doc: ^Document) -> bool {
 	return doc != nil && doc.table && doc.table_sort.nkeys > 0 && len(doc.table_sort.perm) > 0
 }
