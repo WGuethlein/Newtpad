@@ -241,6 +241,17 @@ Each of these cost real time at least once.
   key, both click cycles, the header seam, the menu's disabled states, the summary row's clickable span
   and the cost at the row ceiling. Same rules — one argument, exits non-zero, a missing
   `NEWTPAD_SESSION_DIR` is a failure. It belongs in every sweep.
+  **`mdjointest` is the third (2026-08-01)** — `newtpad mdjointest`, no path, covers the preview's
+  CommonMark paragraph model: `md_para_bounds`' entry independence and each of its budget guards, the
+  byte-window memo checked against its own producer, the joined text, hard breaks, lazy continuation
+  for list items and blockquotes, setext headings, the layout cache across an edit that *grows* a
+  block, and a scroll round trip across a joined paragraph. Same rules, and it belongs in every sweep.
+- **`cmd.exe /c build.bat` can report exit 0 while the compile FAILED**, leaving the previous exe in
+  place — which then runs and prints `0 failures`. Hit for real twice on 2026-08-01, once while
+  verifying a sabotage, and it is the same hazard as the compile-failure note below with a different
+  cause: the shell, not the sabotage. Build through PowerShell (`.\build.bat`, then check
+  `$LASTEXITCODE`) and confirm `(Get-Item build\newtpad.exe).LastWriteTime` moved before believing any
+  test result.
 - **Nine modes have been caught printing `FAIL` and exiting 0, all on 2026-08-01**, in three rounds:
   `menutest` and `settingstest`; then `mdtest`; then `linktest`, `mdviewtest`, `splittest`,
   `mdfencetest`, `mdtabletest` and `mdperftest`. All nine are fixed. `mdtest` is the one that cost

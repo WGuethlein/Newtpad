@@ -266,9 +266,19 @@ Ctrl+clickable.
   pass, so a huge markdown file previews without being parsed whole.
 - *Limits:* **the preview is read-only and cannot be selected or copied.** Markdown **concealment**
   (hiding `#` and `**` on non-caret lines) is not built. Only `[a](b)` links work — no autolinks, no
-  reference links — and a link inside a *table* cell is not clickable. Each source line is its own
-  paragraph, so adjacent prose lines are not joined the way CommonMark joins them. A table wider than
+  reference links — and a link inside a *table* cell is not clickable. A table wider than
   the pane is clipped with no way to reach the rest. Lists do not nest visually beyond their indent.
+- **Paragraphs follow CommonMark (v0.37.0).** Consecutive prose lines join into one paragraph re-flowed
+  to the pane width, so a hard-wrapped document reads as prose rather than as one paragraph per source
+  line; a blank line is the separator. **Hard breaks are honoured** — a line ending in two or more
+  spaces, or in a backslash, keeps its break. An unmarked line after a list item or a blockquote
+  **continues that block** with its indent and marker (CommonMark lazy continuation) instead of
+  becoming a stray un-indented paragraph. **Setext headings** work: prose over `===` is an h1, over
+  `---` an h2.
+- *Two consequences worth knowing:* Split's scroll sync over a long hard-wrapped paragraph is **per
+  block**, which is what `ui-spec` §9.4 asks for but coarser than the accidental per-line behaviour it
+  replaced; and a blockquote written with `>` on **every** line still renders as several stacked blocks
+  with a segmented bar, while the lazily-continued form renders as one.
 
 ### Table view (CSV/TSV) — `Ctrl+T`
 
