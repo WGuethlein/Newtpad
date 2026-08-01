@@ -1920,22 +1920,30 @@ when NEWTPAD_TESTS {
 	// backward scan cannot reach the run's true start, and a line-count cap so
 	// small the forward scan cannot reach its true end.
 	//
-	// The small-budget assertion below enters at TWO points, but they are not
-	// symmetric catches. Entering at the run's FIRST line (byte 0) is a sanity
-	// check only, not a guard-discriminator: the redundant final
-	// `(end-start) > budget` fallback reports capped=true on this fixture
-	// regardless of whether the forward byte guard (`if r - p > md_para_budget`)
-	// is present or deleted outright, since the true span (1749 bytes) exceeds
-	// the 64-byte budget either way -- confirmed by deleting that guard alone and
-	// rebuilding: `mdjointest: 0 failures`, unchanged. Entering at the run's LAST
-	// line is the one real catch here, and only because of the second check below
-	// it: deleting the BACKWARD guard's break still leaves the redundant final
-	// check reporting capped=true (so `capped_tail` alone would also pass with
-	// the guard gone), but the run's true start (byte 0, since this fixture has
-	// no line before it) is then walked all the way back to instead of stopping
-	// early -- `start` is checked directly rather than only `capped` precisely
-	// because a guarded backward scan must stop with `start` still short of 0 and
-	// an unguarded one does not.
+	// The small-budget assertion below enters at TWO points. Entering at the
+	// run's FIRST line (byte 0) checks `capped_small`, which is a sanity check
+	// only against that flag: the redundant final `(end-start) > budget`
+	// fallback reports capped=true on this fixture regardless of whether the
+	// forward byte guard (`if r - p > md_para_budget`) is present or deleted
+	// outright, since the true span (1749 bytes) exceeds the 64-byte budget
+	// either way -- confirmed by deleting that guard alone and rebuilding:
+	// `mdjointest: 0 failures`, unchanged (this was round 2's Finding, and round
+	// 2 only fixed the comment; round 3's Finding 1 is that the gap itself needed
+	// closing). What actually discriminates the forward BYTE guard is `end_small`,
+	// checked directly below, the same technique `start_tail` already uses for
+	// the backward guard: with the guard live, absorbing line 1 brings `r` to 85,
+	// which trips `r - p > 64` before line 2 can be absorbed, so `end` stops at
+	// line 1's own newline (`starts[2] - 1`); with the guard deleted, nothing
+	// stops the forward scan short of the document's true end (1749).
+	//
+	// Entering at the run's LAST line is a second, independent catch, for the
+	// BACKWARD guard: deleting it still leaves the redundant final check
+	// reporting capped=true (so `capped_tail` alone would also pass with the
+	// guard gone), but the run's true start (byte 0, since this fixture has no
+	// line before it) is then walked all the way back to instead of stopping
+	// early -- `start_tail` is checked directly rather than only `capped`
+	// precisely because a guarded backward scan must stop with `start` still
+	// short of 0 and an unguarded one does not.
 	@(private = "file")
 	pj_case_budget_truncates :: proc(bad: ^int) {
 		fmt.println("-- the budget truncates instead of scanning to EOF --")
@@ -1958,8 +1966,13 @@ when NEWTPAD_TESTS {
 		old_budget, old_lines := md_para_budget, md_para_max_lines
 		defer {md_para_budget, md_para_max_lines = old_budget, old_lines}
 		md_para_budget = 64
-		_, _, capped_small, _ := md_para_bounds_for_test(&d, 0)
+		_, end_small, capped_small, _ := md_para_bounds_for_test(&d, 0)
 		li_chk(bad, capped_small, "with a 64-byte budget, entering at the first line, the run reports capped")
+		li_chk(
+			bad,
+			end_small == starts[2] - 1,
+			fmt.tprintf("...and the forward scan itself stopped at line 1's newline, short of the document's true end (got end=%d, want %d)", end_small, starts[2] - 1),
+		)
 
 		start_tail, _, capped_tail, _ := md_para_bounds_for_test(&d, last_line)
 		li_chk(bad, capped_tail, "with a 64-byte budget, entering at the LAST line, the run reports capped too")
@@ -2185,15 +2198,16 @@ when NEWTPAD_TESTS {
 
 	// Round-1 review, Important 3: `trunc_back, trunc_fwd := !entry_is_line_start,
 	// entry_capped`'s FIRST term is never exercised -- every entry point in the
-	// rest of this suite is a real line start. Production feeds a non-line-start
-	// `p` two ways (see the doc comment above md_para_bounds): the second and
-	// later segments of a line longer than RENDER_LINE_CAP, and doc.top itself
-	// landing mid-line on an ORDINARY line after some scroll math. This case is
-	// the second shape, and it is the cleaner isolation of the two: the fixture
-	// never comes near md_para_budget or md_para_max_lines (pj_case_budget_
-	// truncates already shows this exact fixture reports capped=false at the
-	// production budget), so nothing else in `capped`'s OR-chain can explain a
-	// true result here except the seed itself.
+	// rest of this suite is a real line start. The intended production caller
+	// (there is none yet -- see md_para_bounds' own doc comment) would feed a
+	// non-line-start `p` two ways: the second and later segments of a line
+	// longer than RENDER_LINE_CAP, and doc.top itself landing mid-line on an
+	// ORDINARY line after some scroll math. This case is the second shape, and
+	// it is the cleaner isolation of the two: the fixture never comes near
+	// md_para_budget or md_para_max_lines (pj_case_budget_truncates already
+	// shows this exact fixture reports capped=false at the production budget),
+	// so nothing else in `capped`'s OR-chain can explain a true result here
+	// except the seed itself.
 	@(private = "file")
 	pj_case_mid_line_forces_capped :: proc(bad: ^int) {
 		fmt.println("-- an entry that is not a real line start is forced capped --")
@@ -2338,36 +2352,71 @@ when NEWTPAD_TESTS {
 		)
 	}
 
-	// S12 (`if pl_capped {trunc_back = true}`, the backward loop's own analogue of
-	// S13 above) has NO case here, deliberately -- not an oversight. Every
-	// candidate fixture was tried and each one masks it a different way:
-	//   - an oversized line immediately before the entry: the backward search for
-	//     THAT line's start (`pt_line_start_cap(q - 1, RENDER_LINE_CAP)`, looking
-	//     for the newline before it) cannot succeed, because succeeding requires
-	//     walking back fewer than RENDER_LINE_CAP bytes to find it, and an
-	//     oversized line is by definition longer than that -- so `exact` comes
-	//     back false and the guard one line above (`if !exact {trunc_back = true;
-	//     break}`) fires first, every time. Confirmed empirically: a fixture of
-	//     "s0\n" + an (RENDER_LINE_CAP+50)-byte filler line + "s2\n", entered at
-	//     "s2", reports start=8246 (==p, i.e. the backward loop never advanced at
-	//     all) and capped=true under the LIVE guard; deleting S12 changes NEITHER
-	//     value -- proof the deleted line was never reached for this shape.
-	//   - entering AT the oversized line's own true start reads it through
-	//     `entry_capped` (the SEED's other half, already covered above by
-	//     pj_case_entry_capped_forces_capped), not through this loop at all.
-	//   - forward has no such guard to race against (`ns := r + 1` is a known
-	//     position, not something `pt_line_start_cap` has to search for within a
-	//     cap), which is exactly why S13's forward case works and this doesn't --
-	//     the asymmetry is in the code, not in test coverage.
-	// pt_line_end_cap and pt_line_start_cap are called with the SAME
-	// RENDER_LINE_CAP in both directions, so "found within budget" (backward) and
-	// "itself over budget" (forward-read-from-that-point) are mutually exclusive
-	// by construction for the same line -- meaning `pl_capped` on line 856 cannot
-	// currently be true when reached through a legitimate loop iteration. Whether
-	// that makes it truly dead code is a question about md_para_bounds itself,
-	// out of this task's scope (the function is not changing here); recorded for
-	// the whole-branch review rather than asserted away with a test that cannot
-	// honestly fail.
+	// S12 (`if pl_capped {trunc_back = true}`) has NO case here -- still
+	// deliberate, but round 2's reason for that ("cannot currently be true when
+	// reached through a legitimate loop iteration") was WRONG and has been
+	// replaced below after a round-3 review disproved it with two probes,
+	// independently reproduced before this comment was rewritten:
+	//
+	//   PROBE A: 24576 'x' + "\n", entered at p=RENDER_LINE_CAP (8192, the second
+	//   RENDER_LINE_CAP-bounded segment of that one oversized line). The backward
+	//   search's target position (p-1=8191) is within RENDER_LINE_CAP of byte 0,
+	//   so the scan reaches the document start (`floor == 0`) before finding any
+	//   newline and pt_line_start_cap's own "reaching offset 0 is a real line
+	//   start" rule reports exact=true, ps=0 -- a real line start, just not one
+	//   found BY finding a newline. Reading forward RENDER_LINE_CAP bytes from
+	//   that same ps=0 does not reach the line's real end (byte 24576), so the
+	//   line this ps names reads back oversized: pl_capped=true. Reproduced
+	//   independently: ps=0 exact=true pl_capped=true => start=0 end=24576
+	//   capped=true.
+	//
+	//   PROBE B: "s0\n" + 24576 'x' + "\n", entered at p=true_start+RENDER_LINE_CAP
+	//   (true_start=3, p=8195) -- mid-way through the SAME oversized line's second
+	//   segment, not a neighbour line. This is exactly the "second and later
+	//   segments" entry shape md_para_bounds' own doc comment says markdown_draw
+	//   produces. Here the backward search finds a REAL newline (the one ending
+	//   "s0\n") within RENDER_LINE_CAP of p-1, genuinely, not via the floor==0
+	//   shortcut -- ps=3 is authentically that oversized line's own true start.
+	//   Reading forward RENDER_LINE_CAP bytes from ps=3 again falls short of the
+	//   line's real end, so pl_capped=true a second, unrelated way. Reproduced
+	//   independently: ps=3 exact=true pl_capped=true => start=0 end=24579
+	//   capped=true (the reviewer's own probe reported end=24582 on a
+	//   differently-sized filler; the mechanism, not the exact byte count, is
+	//   what was being verified).
+	//
+	// Round 2's mistake: it treated "exact=true" as proof the found line, read
+	// forward from ps, must be SHORT -- reasoning that pt_line_start_cap and
+	// pt_line_end_cap share one constant, so "found within budget going
+	// backward from the search position" and "overflows budget going forward
+	// from the line start" looked mutually exclusive. That equivalence only
+	// holds when the backward search's start position sits near the FOUND
+	// line's own end. It does not have to: q-1 can be anywhere inside a long
+	// line, including precisely RENDER_LINE_CAP past that line's true start --
+	// which is exactly the entry point md_para_bounds' own doc comment says the
+	// intended production caller would produce for every segment after a long
+	// line's first (there is no such caller yet; PROBE B's fixture stands in
+	// for one). Backward distance from q-1 to ps and forward distance from ps
+	// to the line's real end are independent quantities; nothing forces them to
+	// trade off.
+	//
+	// So: S12 IS reachable, by construction, on realistic input -- not dead code.
+	// What survives from round 2's investigation is narrower and still true: in
+	// both probes above, `p` is not a real line start (0 and 3 are the only real
+	// line starts in each fixture; 8192 and 8195 are neither), so the seed
+	// (`!entry_is_line_start`) already forces trunc_back=true before this loop's
+	// first iteration runs, on both probes' own reported values, above. Every
+	// fixture built so far reaches S12 only through an entry point the seed
+	// already condemns, so S12's own, independent contribution to `capped` has
+	// not been observed to flip a result the seed did not already produce. That
+	// is a claim about every case found so far, not a proof no such case exists,
+	// and it does not make the line dead: dead code cannot change a return value
+	// under ANY input, and S12 can (it forces trunc_back=true where the naive
+	// backward walk, absent this check, would just have kept going past a
+	// too-long "previous line" as though it were an ordinary one). Whether a
+	// fixture exists where S12 fires and the seed does not is unresolved; not
+	// pursued further because md_para_bounds itself is out of this task's scope.
+	// Recorded for the whole-branch review, not asserted away with a test that
+	// cannot honestly fail.
 
 	// One-argument and non-zero on failure, per the keytest/resavetest incident: a
 	// mode nothing runs is worse than no mode.

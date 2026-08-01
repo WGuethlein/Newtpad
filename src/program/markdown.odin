@@ -788,8 +788,9 @@ md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, o
 // .Para fallthrough.
 //
 // No `in_fence` parameter, unlike md_classify itself: see md_para_bounds' doc
-// comment for why the one production caller structurally cannot be inside a
-// fence, so there is no fence state for a future caller to thread through.
+// comment for why the intended production caller structurally cannot be
+// inside a fence, so there is no fence state for a future caller to thread
+// through.
 @(private = "file")
 md_is_para_line :: proc(line: string) -> bool {
 	trimmed := strings.trim_left(line, " \t")
@@ -888,8 +889,11 @@ md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: 
 	return start, end, capped, true
 }
 
-// Package-visible so mdjointest can drive the bounds function directly. The
-// production callers all go through md_layout_build.
+// Package-visible so mdjointest can drive the bounds function directly. There
+// is no production caller yet at all (md_para_bounds is `private = "file"`,
+// so this shim -- and the test cases that use it -- are its only callers,
+// grep-confirmed against src/); the intended future one is md_layout_build's
+// `.Para` case, per md_para_bounds' own doc comment above.
 md_para_bounds_for_test :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: bool) {
 	return md_para_bounds(doc, p)
 }
