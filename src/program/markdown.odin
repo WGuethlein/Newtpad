@@ -787,12 +787,11 @@ md_table_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, oversize, o
 // terminating it for free, because md_classify tests all of them ahead of the
 // .Para fallthrough.
 //
-// `in_fence` is threaded through because inside a fence EVERY line is
-// .Fence_Body, so a join must never cross a fence -- and the caller knows the
-// fence state, this does not.
+// No `in_fence` parameter, unlike md_classify itself: see md_para_bounds' doc
+// comment for why the one production caller structurally cannot be inside a
+// fence, so there is no fence state for a future caller to thread through.
 @(private = "file")
-md_is_para_line :: proc(line: string, in_fence: bool) -> bool {
-	if in_fence {return false}
+md_is_para_line :: proc(line: string) -> bool {
 	trimmed := strings.trim_left(line, " \t")
 	return md_classify(line, trimmed, false).kind == .Para
 }
@@ -801,14 +800,24 @@ md_is_para_line :: proc(line: string, in_fence: bool) -> bool {
 // run's true start and forward to its end, both bounded by md_para_budget.
 //
 // THE SINGLE PRODUCER of a paragraph's extent. It exists because a joined
-// paragraph STARTS ABOVE ITS OWN LINE, which makes it the second construct with
-// that property (a collapsed blank run and front matter are the others) -- and
-// unlike those it occurs in every document. Two procedures ask where the block
-// containing byte B starts: md_layout_build walking forward, and
+// paragraph STARTS ABOVE ITS OWN LINE, which makes it the third construct with
+// that property (a collapsed blank run and front matter are the other two) --
+// and unlike those it occurs in every document. Two procedures ask where the
+// block containing byte B starts: md_layout_build walking forward, and
 // md_block_at_byte running MD_RUNUP_LINES back and walking forward. A fixed
 // line run-up cannot answer that for a construct of unbounded length; see
 // MD_RUNUP_LINES' own comment, which already records this failure for front
 // matter and is honest that it is unproven.
+//
+// Fence contract: md_is_para_line takes no `in_fence` parameter, unlike
+// md_classify underneath it. md_layout_build's `.Para` case is the only
+// production caller this feeds, and that switch runs on
+// `e.cls = md_classify(e.src, trimmed, in_fence)` (see md_layout_build) --
+// which returns `.Fence_Open`/`.Fence_Close`/`.Fence_Body` for every line while
+// `in_fence` is true, never `.Para`. So the `.Para` case, and everything it
+// calls, is structurally unreachable while inside a fence; there is no fence
+// state for a future caller to thread through because no caller can exist that
+// would need one.
 //
 // The three traps are md_table_bounds', in the same order, and each shipped once:
 //   1. Both bounds measured from the ENTRY POINT `p`, never from the moving
@@ -825,7 +834,7 @@ md_is_para_line :: proc(line: string, in_fence: bool) -> bool {
 md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: bool) {
 	buf: [RENDER_LINE_CAP]u8
 	line, lend, entry_capped := md_line_at(doc, p, buf[:])
-	if !md_is_para_line(line, false) {return 0, 0, false, false}
+	if !md_is_para_line(line) {return 0, 0, false, false}
 	start, end = p, lend
 
 	// A `p` that is not a real line start cannot establish the run's start, so
@@ -843,7 +852,7 @@ md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: 
 		ps, exact := base.pt_line_start_cap(&doc.pt, q - 1, RENDER_LINE_CAP)
 		if !exact {trunc_back = true;break}
 		pl, _, pl_capped := md_line_at(doc, ps, buf[:])
-		if !md_is_para_line(pl, false) {break}
+		if !md_is_para_line(pl) {break}
 		if pl_capped {trunc_back = true}
 		back_lines += 1
 		start = ps
@@ -858,7 +867,7 @@ md_para_bounds :: proc(doc: ^Document, p: int) -> (start, end: int, capped, ok: 
 		ns := r + 1
 		if ns > doc.pt.length {break}
 		nl, ne, ne_capped := md_line_at(doc, ns, buf[:])
-		if !md_is_para_line(nl, false) {break}
+		if !md_is_para_line(nl) {break}
 		if ne_capped {trunc_fwd = true}
 		fwd_lines += 1
 		end = ne

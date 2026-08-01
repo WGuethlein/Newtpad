@@ -1851,7 +1851,7 @@ when NEWTPAD_TESTS {
 	// A markdown Document over `src`. doc_from_content takes ownership of what it
 	// is given and doc_close frees it, so the bytes have to be an allocation of
 	// their own rather than a slice of a string literal -- the same reason
-	// ts_doc (tablesorttest's fixture builder, above) copies its source.
+	// ts_doc (tablesorttest's fixture builder, below) copies its source.
 	@(private = "file")
 	pj_doc :: proc(src: string) -> Document {
 		c := make([]u8, len(src))
@@ -1870,16 +1870,26 @@ when NEWTPAD_TESTS {
 		for i in 0 ..< d.pt.length {
 			b: [1]u8
 			base.pt_read(&d.pt, i, b[:])
-			if b[0] == '\n' && i + 1 <= d.pt.length {append(&out, i + 1)}
+			if b[0] == '\n' {append(&out, i + 1)}
 		}
 		return out[:]
 	}
 
-	// The highest-value case in the batch: every byte offset inside the SAME
-	// paragraph must resolve to the SAME (start, end, capped). This is what
-	// catches all three of md_table_bounds' traps carried into md_para_bounds,
-	// because each trap's symptom is specifically that different entry points
-	// into one block disagree.
+	// Every byte offset inside the SAME paragraph must resolve to the SAME
+	// (start, end, capped), and the run must not have swallowed a neighbour.
+	//
+	// This does NOT catch any of the three entry-dependence traps named above
+	// md_para_bounds (confirmed by running each trap's own sabotage against this
+	// case alone: all three printed "ok" -- see pj_case_no_collapse for trap 2's
+	// actual catch, which needed a different fixture). What it DOES catch,
+	// confirmed the same way:
+	//   - a broken or absent backward scan: disabling it here produced 2 real
+	//     FAILs (lines 5 and 6 disagreeing with line 4, since only line 4's own
+	//     entry happens to already sit at the run's true start);
+	//   - bounds that swallow a neighbour paragraph: disabling both directions'
+	//     `md_is_para_line` terminator checks produced 2 real FAILs, on the
+	//     "run starts at b1" / "run ends at b3's newline" checks below (the
+	//     whole three-paragraph fixture collapsed into one run).
 	@(private = "file")
 	pj_case_entry_independent :: proc(bad: ^int) {
 		fmt.println("-- md_para_bounds gives one answer per paragraph, whatever byte you enter at --")
@@ -2045,6 +2055,135 @@ when NEWTPAD_TESTS {
 		li_chk(bad, s20 < starts[20], fmt.tprintf("...and the backward scan absorbs at least one line too (start=%d, entry=%d)", s20, starts[20]))
 	}
 
+	// Round-1 review, Important 2: `capped`'s final line --
+	// `capped = trunc_back || trunc_fwd || (end - start) > md_para_budget ||
+	// total_lines > md_para_max_lines` -- has two terms neither per-direction
+	// guard can set on its own: the redundant byte-window check and its
+	// line-count analogue. Deleting BOTH still left mdjointest at 0 failures,
+	// because every existing case either stays comfortably under budget or
+	// enters from a spot where one guard trips on its own. This case and
+	// pj_case_line_cap_entry_independent below are what actually needs them --
+	// direct paragraph analogues of mdtabletest's K < B <= 2K band
+	// (test_modes.odin, "entry-independent oversize") and its row-cap
+	// entry-independence case.
+	//
+	// Fixture: the same 40-line, ~1755-byte unbroken paragraph. With
+	// md_para_budget = 1000 (K < the true span <= 2K), entering at byte 0 trips
+	// the forward guard directly (the whole remaining span already exceeds K
+	// before any neighbour line is absorbed). Entering mid-block leaves BOTH
+	// directions individually under 1000 bytes (each side absorbs roughly half
+	// the span) -- so with the redundant `(end - start) > budget` term gone,
+	// capped would flip to false there while byte 0 still reports true: the
+	// identical entry-dependent flip Important 1 (the review that produced
+	// md_table_bounds' own three traps) already fixed once, one level up.
+	@(private = "file")
+	pj_case_budget_band_entry_independent :: proc(bad: ^int) {
+		fmt.println("-- capped is entry-independent in the K < span <= 2K budget band --")
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+
+		old_budget := md_para_budget
+		defer md_para_budget = old_budget
+		md_para_budget = 1000 // K; fixture's true span is ~1755 bytes, so K < span <= 2K
+
+		mid := base.pt_line_start(&d.pt, d.pt.length / 2)
+		_, _, capped_edge, ok_edge := md_para_bounds_for_test(&d, 0)
+		_, _, capped_mid, ok_mid := md_para_bounds_for_test(&d, mid)
+		li_chk(bad, ok_edge && ok_mid, "both entries resolve as paragraph lines")
+		li_chk(
+			bad,
+			capped_edge && capped_mid,
+			fmt.tprintf("entering at byte 0 and mid-block (%d) both report capped (got %v, %v)", mid, capped_edge, capped_mid),
+		)
+	}
+
+	// Round-1 review, Important 2: the line-count analogue of the case above.
+	// R = 40 (the fixture's total line count); md_para_max_lines set between
+	// R/2 and R so that entering at line 0 trips the forward direction's OWN
+	// line count on its own (it must absorb all 39 remaining lines, past the
+	// cap), while entering mid-block lets BOTH directions finish under the cap
+	// individually (~20 lines each way) -- exactly the band where only the
+	// redundant `total_lines > md_para_max_lines` check catches it. Direct
+	// analogue of mdtabletest's row-cap entry-independence case.
+	@(private = "file")
+	pj_case_line_cap_entry_independent :: proc(bad: ^int) {
+		fmt.println("-- capped is entry-independent in the R/2 < lines <= R line-cap band --")
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+
+		old_lines := md_para_max_lines
+		defer md_para_max_lines = old_lines
+		md_para_max_lines = 25 // R/2 (20) < 25 < R (40 total lines)
+
+		_, _, capped_edge, ok_edge := md_para_bounds_for_test(&d, 0)
+		_, _, capped_mid, ok_mid := md_para_bounds_for_test(&d, starts[20])
+		li_chk(bad, ok_edge && ok_mid, "both entries resolve as paragraph lines")
+		li_chk(
+			bad,
+			capped_edge && capped_mid,
+			fmt.tprintf("entering at line 0 and line 20 both report capped (got %v, %v)", capped_edge, capped_mid),
+		)
+	}
+
+	// Round-1 review, Important 3: `trunc_back, trunc_fwd := !entry_is_line_start,
+	// entry_capped`'s FIRST term is never exercised -- every entry point in the
+	// rest of this suite is a real line start. Production feeds a non-line-start
+	// `p` two ways (see the doc comment above md_para_bounds): the second and
+	// later segments of a line longer than RENDER_LINE_CAP, and doc.top itself
+	// landing mid-line on an ORDINARY line after some scroll math. This case is
+	// the second shape, and it is the cleaner isolation of the two: the fixture
+	// never comes near md_para_budget or md_para_max_lines (pj_case_budget_
+	// truncates already shows this exact fixture reports capped=false at the
+	// production budget), so nothing else in `capped`'s OR-chain can explain a
+	// true result here except the seed itself.
+	@(private = "file")
+	pj_case_mid_line_forces_capped :: proc(bad: ^int) {
+		fmt.println("-- an entry that is not a real line start is forced capped --")
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		for i in 0 ..< 40 {fmt.sbprintf(&sb, "line %d of one very long unbroken paragraph\n", i)}
+		d := pj_doc(strings.to_string(sb))
+		defer doc_close(&d)
+		starts := pj_line_starts(&d)
+		defer delete(starts)
+
+		mid_p := starts[5] + 3 // three bytes into an ordinary line, not its start
+		s, e, capped, ok := md_para_bounds_for_test(&d, mid_p)
+		li_chk(bad, ok, "a mid-line entry still resolves as a paragraph line")
+		li_chk(bad, capped, fmt.tprintf("...and is forced capped purely by not being a line start (start=%d end=%d)", s, e))
+	}
+
+	// Round-1 review, Important 3, SECOND term: `entry_capped` (the seed's other
+	// half) is equally unexercised. Isolating it needs an entry that IS a real
+	// line start (so the first term is false and cannot explain the result) but
+	// whose own line already overflowed RENDER_LINE_CAP when md_line_at read it.
+	// A single physical line just over the cap, entered at byte 0 with nothing
+	// before it in the document -- the backward loop's `for q > 0` never runs at
+	// all, so nothing there can set trunc_back either -- and a real span of only
+	// ~8.2 KB / two logical lines, nowhere near md_para_budget (256 KB) or
+	// md_para_max_lines (4096). If this reports capped=true, entry_capped is the
+	// only thing in `capped`'s OR-chain that can have done it.
+	@(private = "file")
+	pj_case_entry_capped_forces_capped :: proc(bad: ^int) {
+		fmt.println("-- an entry whose own line already exceeds RENDER_LINE_CAP is forced capped --")
+		filler, _ := strings.repeat("x", RENDER_LINE_CAP + 50, context.temp_allocator)
+		src := fmt.tprintf("%s\n", filler)
+		d := pj_doc(src)
+		defer doc_close(&d)
+
+		s, e, capped, ok := md_para_bounds_for_test(&d, 0)
+		li_chk(bad, ok, "the oversized line resolves as a paragraph line")
+		li_chk(bad, capped, fmt.tprintf("...and is forced capped by its own RENDER_LINE_CAP overflow (start=%d end=%d)", s, e))
+	}
+
 	// One-argument and non-zero on failure, per the keytest/resavetest incident: a
 	// mode nothing runs is worse than no mode.
 	@(private = "file")
@@ -2058,6 +2197,10 @@ when NEWTPAD_TESTS {
 			pj_case_entry_independent(&bad)
 			pj_case_no_collapse(&bad)
 			pj_case_budget_truncates(&bad)
+			pj_case_budget_band_entry_independent(&bad)
+			pj_case_line_cap_entry_independent(&bad)
+			pj_case_mid_line_forces_capped(&bad)
+			pj_case_entry_capped_forces_capped(&bad)
 			pj_case_terminators(&bad)
 		}
 		fmt.printfln("mdjointest: %d failures", bad)
@@ -32459,9 +32602,11 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
-		// `newtpad mdjointest` -- one-argument, no path, sweepable. The preview's
-		// paragraph join: md_para_bounds, the joined text, hard breaks, lazy
-		// continuation and setext.
+		// `newtpad mdjointest` -- one-argument, no path, sweepable. Today this
+		// covers md_para_bounds only, the single producer of a paragraph's extent
+		// -- the preview's paragraph join itself (the joined text, hard breaks,
+		// lazy continuation, setext) is a later task in this batch and does not
+		// exist yet.
 		if os.args[1] == "mdjointest" {
 			para_join_test_run()
 			return true
