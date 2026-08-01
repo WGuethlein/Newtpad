@@ -715,7 +715,7 @@ odin test src\base -collection:src=src
 ```
 
 ```
-$env:NEWTPAD_SESSION_DIR = "$env:TEMP\np-b19"; foreach ($m in @("tablesorttest","tablegridtest","tablecellstest","tablereadonlytest","csvtest","menutest","menuseam","selalltest","keytest","resavetest","lineidxtest","watchtest","hscrolltest","palettetest","settingstest")) { build\newtpad.exe $m; if ($LASTEXITCODE -ne 0) { echo "FAILED: $m" } }
+$env:NEWTPAD_SESSION_DIR = "$env:TEMP\np-b19"; foreach ($m in @("tablesorttest","tablegridtest","tablecellstest","tablereadonlytest","csvtest","menutest","selalltest","keytest","resavetest","lineidxtest","watchtest","hscrolltest","palettetest","settingstest","historytest")) { .\build\newtpad.exe $m; if ($LASTEXITCODE -ne 0) { echo "FAILED: $m" } }
 ```
 
 Expected: no `FAILED:` line. **`Select-String "FAIL"` is case-insensitive** — do not grep for it, check
