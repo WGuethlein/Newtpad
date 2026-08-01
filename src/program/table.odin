@@ -379,7 +379,7 @@ table_summary_parts :: proc(doc: ^Document, allocator := context.temp_allocator)
 		// first word that explains it.
 		fmt.sbprint(&sb, "  ·  ")
 		clear_s = strings.builder_len(sb)
-		fmt.sbprintf(&sb, "sorted by %s %s  ·  click to clear", table_col_name(doc, doc.table_sort.col, allocator), "desc" if doc.table_sort.desc else "asc")
+		fmt.sbprintf(&sb, "sorted by %s %s  ·  click to clear", table_col_name(doc, doc.table_sort.keys[0].col, allocator), "desc" if doc.table_sort.keys[0].desc else "asc")
 		clear_e = strings.builder_len(sb)
 	}
 	return strings.to_string(sb), clear_s, clear_e
@@ -810,9 +810,35 @@ TABLE_SORT_NONE :: -1
 TABLE_SORT_MAX :: 100_000
 #assert(TABLE_SORT_MAX < int(max(i32)))
 
-Table_Sort :: struct {
-	col:     int, // TABLE_SORT_NONE when unsorted
+// The most keys a sort can carry. Batch 19's "first column selected wins":
+// PRECEDENCE IS ARRAY ORDER, and array order is append order, so first-wins is a
+// property of the data structure and not a rule anything has to enforce -- there is
+// no separate priority field to keep in step with it. Three is the cap because
+// that's what raised the freeze budget (TABLE_SORT_MAX's build cost, above) by a
+// measured amount when it was set; raising TABLE_SORT_KEYS_MAX needs the same kind
+// of measurement TABLE_SORT_MAX did; a cap raised without one is how the summary
+// row (table_summary_parts) starts overflowing its band.
+TABLE_SORT_KEYS_MAX :: 3
+
+// One column's part of the sort. TABLE_SORT_NONE is what an unset key's `col` is --
+// Odin zero-inits `col` to 0, a valid column index, so a slot that has never been
+// written must be told to say TABLE_SORT_NONE rather than be trusted to.
+Sort_Key :: struct {
+	col:     int,
 	desc:    bool,
+	// Decided over every row the sort orders, same argument as table_sort_build's
+	// numeric detection below -- now per key because one key can be numeric while
+	// another in the same sort is text.
+	numeric: bool,
+}
+
+Table_Sort :: struct {
+	// keys[0] is the primary; keys[1], keys[2] are tie-breakers in the order they
+	// were added. nkeys is the count that's live -- entries at or past it are
+	// leftover from a previous sort and must not be read (table_sort_key stops at
+	// nkeys for exactly this reason).
+	keys:    [TABLE_SORT_KEYS_MAX]Sort_Key,
+	nkeys:   int, // 0 == unsorted
 	offs:    [dynamic]int,
 	perm:    [dynamic]i32,
 	rank:    [dynamic]i32,
@@ -822,6 +848,19 @@ Table_Sort :: struct {
 	// "palette dispatch that silently does nothing" shape this batch already fixed
 	// once. Cleared by the next click and by table_sort_clear.
 	refused: bool,
+}
+
+// Is `col` part of the live sort, and at what precedence? Linear over at most
+// TABLE_SORT_KEYS_MAX -- a binary search over three entries would be slower AND
+// would imply the array is ordered by column, which it is not: it is ordered by
+// PRECEDENCE, which is the whole point (see TABLE_SORT_KEYS_MAX above).
+table_sort_key :: proc(doc: ^Document, col: int) -> (k: int, ok: bool) {
+	if doc == nil {return 0, false}
+	s := &doc.table_sort
+	for i in 0 ..< s.nkeys {
+		if s.keys[i].col == col {return i, true}
+	}
+	return 0, false
 }
 
 // Is a sort live on this document? The predicate every consumer branches on.
@@ -836,7 +875,7 @@ Table_Sort :: struct {
 // .Toggle_Table, doc_view_apply) and it is a belt again, but it stays: the cost is
 // one field compare and what it guards is the text view's scroll model.
 table_sorted :: #force_inline proc(doc: ^Document) -> bool {
-	return doc != nil && doc.table && doc.table_sort.col != TABLE_SORT_NONE && len(doc.table_sort.perm) > 0
+	return doc != nil && doc.table && doc.table_sort.nkeys > 0 && len(doc.table_sort.perm) > 0
 }
 
 // Data rows the live sort covers.
@@ -892,7 +931,13 @@ table_sort_pos :: proc(doc: ^Document, off: int) -> (pos: int, ok: bool) {
 table_sort_clear :: proc(doc: ^Document) {
 	if doc == nil {return}
 	s := &doc.table_sort
-	s.col, s.desc, s.refused = TABLE_SORT_NONE, false, false
+	s.nkeys, s.refused = 0, false
+	// A zeroed Sort_Key.col is 0, a valid column -- Odin's zero-is-init gives an
+	// UNSET key the same shape as "sorted by column 0". nkeys already stops every
+	// reader at the live prefix (table_sort_key, the build below), so this can't be
+	// read as live, but leaving `col` at 0 would still be a slot lying about what it
+	// is the moment anyone reads the array directly instead of through nkeys.
+	for &k in s.keys {k.col = TABLE_SORT_NONE}
 	clear(&s.offs)
 	clear(&s.perm)
 	clear(&s.rank)
@@ -1004,9 +1049,9 @@ sort_number :: proc(s: string, scratch: ^[64]u8) -> f64 {
 // is the honest answer for a shape whose ordering is not knowable from the shape.
 table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 	s := &doc.table_sort
-	desc := s.desc
+	desc := s.keys[0].desc
 	table_sort_clear(doc)
-	s.desc = desc
+	s.keys[0].desc = desc
 	if doc == nil || col < 0 {return false}
 	first, fok := table_first_data_row(doc)
 	if !fok {return false}
@@ -1096,11 +1141,11 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 		}
 	}
 	switch {
-	case numeric && s.desc:
+	case numeric && s.keys[0].desc:
 		slice.sort_by(items[:], sort_less_num_desc)
 	case numeric:
 		slice.sort_by(items[:], sort_less_num_asc)
-	case s.desc:
+	case s.keys[0].desc:
 		slice.sort_by(items[:], sort_less_text_desc)
 	case:
 		slice.sort_by(items[:], sort_less_text_asc)
@@ -1111,7 +1156,8 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 		s.perm[pos] = it.row
 		s.rank[it.row] = i32(pos)
 	}
-	s.col = col
+	s.keys[0] = {col, desc, numeric}
+	s.nkeys = 1
 	return true
 }
 
@@ -1138,20 +1184,21 @@ table_sort_build :: proc(doc: ^Document, col: int) -> bool {
 table_sort_click :: proc(doc: ^Document, col: int) {
 	if doc == nil || col < 0 {return}
 	if doc.table_editing {table_edit_commit(doc)}
-	// Through table_sorted rather than `s.col == col`, and that is not a
-	// simplification. A zero-value Document has col == 0 (Odin's
-	// zero-is-initialization, which CLAUDE.md says not to fight), so the plain field
-	// compare would read the very first click on column 0 as "already ascending" and
-	// open descending. table_sorted is the predicate the whole file branches on and
-	// it is false at the zero value, which is what makes the states here the states
-	// that actually exist.
+	// table_sort_key already stops at nkeys, so a zero-value Document (keys[0].col
+	// == 0, Odin's zero-is-initialization, which CLAUDE.md says not to fight)
+	// cannot read as "column 0 already sorted" the way a raw `s.keys[0].col == col`
+	// compare could. table_sorted is still composed in rather than dropped: its
+	// other two terms, doc.table and len(perm) > 0, are not things table_sort_key
+	// checks, and this is the gesture that has to tell "sorted, click again" from
+	// "not sorted, first click" apart correctly for every one of them.
 	s := &doc.table_sort
-	live := table_sorted(doc) && s.col == col
-	if live && s.desc {
+	_, is_key := table_sort_key(doc, col)
+	live := table_sorted(doc) && is_key
+	if live && s.keys[0].desc {
 		table_sort_clear(doc) // descending -> the file's own order
 		return
 	}
-	s.desc = live // ascending -> descending; anything else -> ascending
+	s.keys[0].desc = live // ascending -> descending; anything else -> ascending
 	if !table_sort_build(doc, col) {return}
 	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off}
 }
@@ -1210,7 +1257,7 @@ sort_range_has_newline :: proc(doc: ^Document, at, n: int) -> bool {
 // there is nothing here to shift.
 table_sort_shift :: proc(doc: ^Document, at, n: int, text: []u8) {
 	s := &doc.table_sort
-	if s.col == TABLE_SORT_NONE || len(s.offs) == 0 {return}
+	if s.nkeys == 0 || len(s.offs) == 0 {return}
 	for b in text {
 		if b == '\n' {table_sort_clear(doc);return}
 	}
@@ -2618,7 +2665,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 		// slot above is reserved -- but the ordering is free and a header whose name
 		// somehow reached the slot would still lose to the mark rather than hide it.
 		{
-			sorted_col := doc.table_sort.col if table_sorted(doc) else TABLE_SORT_NONE
+			sorted_col := doc.table_sort.keys[0].col if table_sorted(doc) else TABLE_SORT_NONE
 			for col in cols {
 				dim := false
 				switch {
@@ -2644,7 +2691,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 					// every theme and kept in step with Accent by hand.
 					colour[3] *= TABLE_ARROW_GHOST_A
 				} else {
-					up = !doc.table_sort.desc
+					up = !doc.table_sort.keys[0].desc
 				}
 				table_sort_arrow(gfx, qp, a, up, colour)
 			}

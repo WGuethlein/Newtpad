@@ -12651,7 +12651,7 @@ when NEWTPAD_TESTS {
 					chk(&bad, pok && p == noff[qwant[r] + 1], fmt.tprintf("numeric asc: visible row %d is line %d (%q)", r, qwant[r] + 1, lines[qwant[r] + 1]))
 				}
 				table_sort_click(d, 2) // second click on the same column: descending
-				chk(&bad, d.table_sort.desc, "a second click on the same header reverses it")
+				chk(&bad, d.table_sort.keys[0].desc, "a second click on the same header reverses it")
 				dwant := [ROWS]int{1, 2, 0, 4, 3} // alpha(200) echo(30) delta(10) charlie(4) bravo(-)
 				for r in 0 ..< ROWS {
 					p, pok := table_row_start(d, r)
@@ -13063,7 +13063,7 @@ when NEWTPAD_TESTS {
 				command_dispatch(.Toggle_Table, {}, &a, &dummy, &t, 10)
 				chk(&bad, !d.table, "Ctrl+T closes it again")
 				s := &d.table_sort
-				chk(&bad, s.col == TABLE_SORT_NONE, fmt.tprintf("...and the sort goes with the view (col %d, want %d)", s.col, TABLE_SORT_NONE))
+				chk(&bad, s.nkeys == 0, fmt.tprintf("...and the sort goes with the view (nkeys %d, want 0)", s.nkeys))
 				chk(&bad, len(s.offs) == 0 && len(s.perm) == 0 && len(s.rank) == 0, fmt.tprintf("...arrays and all (%d offs, %d perm, %d rank)", len(s.offs), len(s.perm), len(s.rank)))
 				chk(&bad, !s.refused, "...and the refusal with them")
 
