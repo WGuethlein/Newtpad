@@ -2909,10 +2909,29 @@ md_layout_build :: proc(
 		if ps, pe, pok := md_para_run(doc, p); pok && ps == p && pe > line_end {
 			sb := strings.builder_make(context.temp_allocator)
 			q := ps
+			// prev_hard: whether the line just written into sb ended with a
+			// hard-break marker. CommonMark: a line ending in two or more spaces,
+			// or in a backslash, ends with a hard break. The break belongs to the
+			// line that carries the marker, so it is written before the NEXT
+			// line's text -- never after the current line -- or the paragraph's
+			// last line would gain a stray trailing break it never asked for.
+			prev_hard := false
 			for q <= pe {
 				l, le, _ := md_line_at(doc, q, buf[:])
-				if strings.builder_len(sb) > 0 {strings.write_byte(&sb, ' ')}
-				strings.write_string(&sb, strings.trim_right(l, " \t"))
+				// A hard break becomes a real newline instead of a space. The shaper
+				// already breaks on '\n' (platform/shape.odin:287) and handles two
+				// in a row (shape.odin:404-409), so this is the whole implementation.
+				// Trailing whitespace is stripped either way -- it is markup, not
+				// content -- and a trailing backslash is stripped from the emitted
+				// text too.
+				raw := strings.trim_right(l, " \t")
+				hard := strings.has_suffix(l, "  ") || strings.has_suffix(raw, "\\")
+				if strings.has_suffix(raw, "\\") {raw = raw[:len(raw) - 1]}
+				if strings.builder_len(sb) > 0 {
+					strings.write_byte(&sb, '\n' if prev_hard else ' ')
+				}
+				strings.write_string(&sb, raw)
+				prev_hard = hard
 				q = le + 1
 			}
 			e.joined = strings.clone(strings.to_string(sb))

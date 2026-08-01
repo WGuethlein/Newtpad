@@ -2438,6 +2438,89 @@ when NEWTPAD_TESTS {
 		li_chk(bad, lay.joined == "", fmt.tprintf("a single-line paragraph does not allocate joined (got %q)", lay.joined))
 	}
 
+	// A hard break (CommonMark: two or more trailing spaces, or a trailing
+	// backslash) survives the join as a real newline instead of a space --
+	// otherwise the join would destroy a break the author asked for. Asserted
+	// on len(lay.sh.line_boxes), never on the joined text: once both a hard
+	// break and a soft join are just bytes in a string, the text cannot tell
+	// them apart, but the shaper renders them differently -- a '\n' always
+	// starts a new line box, a ' ' only does if the measure forces a wrap.
+	//
+	// The measure (600, same as pj_case_joins_text) has to be wide enough
+	// that "alpha", "beta" and "gamma" cannot soft-wrap on their own, or a
+	// case here would pass by accident: "2 line boxes" only means "a hard
+	// break" if the same fixture at the same measure gives exactly 1 without
+	// one. That control is the first case below.
+	@(private = "file")
+	pj_case_hard_breaks :: proc(bad: ^int) {
+		fmt.println("-- a hard break survives the join --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjointest") {
+			li_chk(bad, false, "an offscreen device came up, so a layout could be built")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		// Control: no marker anywhere. This is what makes "2" meaningful below --
+		// without it, 2 line boxes on a joined 2-line fixture could just as well
+		// be the ordinary space-join wrapping at the measure.
+		{
+			d := pj_doc("alpha\nbeta\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 1, fmt.tprintf("no marker: %d line boxes (want 1)", len(lay.sh.line_boxes)))
+		}
+
+		// Two trailing spaces on the first line.
+		{
+			d := pj_doc("alpha  \nbeta\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 2, fmt.tprintf("two trailing spaces: %d line boxes (want 2)", len(lay.sh.line_boxes)))
+		}
+
+		// A trailing backslash instead.
+		{
+			d := pj_doc("alpha\\\nbeta\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 2, fmt.tprintf("trailing backslash: %d line boxes (want 2)", len(lay.sh.line_boxes)))
+		}
+
+		// The off-by-one guard. Two CONSECUTIVE hard-marked lines, then one
+		// plain line: alpha and beta both carry the marker, gamma does not, so
+		// the correct join is "alpha\nbeta\ngamma" -- 3 line boxes, one per
+		// line, since every break is hard.
+		//
+		// This targets one specific wrong implementation: deciding the
+		// separator that PRECEDES a line from that line's OWN `hard`, instead
+		// of the PREVIOUS line's (i.e. reading `hard` where this proc reads
+		// `prev_hard`). That mistake already fails the two single-marker
+		// cases above -- alpha's marker never gets consulted, because nothing
+		// precedes the first line to carry a separator -- so on its own this
+		// fixture would not add coverage; a run of just those two cases could
+		// look like "the marker was read but attributed one line off" just as
+		// easily as "the marker was never read at all," and the two are
+		// different bugs. Chaining a second marker onto a third, unmarked
+		// line tells them apart: under the `hard`-not-`prev_hard` mistake,
+		// beta's own marker (true) still splits alpha from beta -- so far
+		// indistinguishable from correct -- but the separator before gamma
+		// then reads gamma's `hard` (false) instead of beta's (true), so
+		// beta's break is silently dropped and the run caps at 2 line boxes
+		// where the correct join gives 3.
+		{
+			d := pj_doc("alpha  \nbeta  \ngamma\n")
+			defer doc_close(&d)
+			lay := md_layout_build_for_test(&h.gfx, &h.text, &d, &m, 0, 600)
+			defer md_layout_free(&lay)
+			li_chk(bad, len(lay.sh.line_boxes) == 3, fmt.tprintf("two consecutive hard breaks: %d line boxes (want 3)", len(lay.sh.line_boxes)))
+		}
+	}
+
 	// The `capped` return is CONSUMED -- by md_para_run, on behalf of both sites
 	// that ask where a block begins, so the layout and the snap refuse the same
 	// runs by construction.
@@ -2827,6 +2910,7 @@ when NEWTPAD_TESTS {
 			pj_case_terminators(&bad)
 			pj_case_joins_text(&bad)
 			pj_case_blank_separates(&bad)
+			pj_case_hard_breaks(&bad)
 			pj_case_capped_refuses(&bad)
 			pj_case_snap_is_the_entry(&bad)
 			pj_case_overlong_line(&bad)
