@@ -236,6 +236,17 @@ Each of these cost real time at least once.
   (the row rule, the second-press extend and what resets it, the 1 MiB scan cap, and the eight
   consumers of the selection), exits non-zero, and counts a missing `NEWTPAD_SESSION_DIR` as a
   failure rather than skipping the part that needs it. It belongs in every sweep.
+  **`tablesorttest` is the second (2026-08-01)** — `newtpad tablesorttest`, no path, ~16 cases over
+  multi-column sort: the key vector, precedence, per-key numeric detection, empty-last on a secondary
+  key, both click cycles, the header seam, the menu's disabled states, the summary row's clickable span
+  and the cost at the row ceiling. Same rules — one argument, exits non-zero, a missing
+  `NEWTPAD_SESSION_DIR` is a failure. It belongs in every sweep.
+- **Two more modes were printing `FAIL` and exiting 0 until 2026-08-01: `menutest` and
+  `settingstest`.** Both are fixed. This is the same defect the bullet above was written about, found
+  again in two more places, so treat "does this mode actually exit non-zero?" as a thing to *check*
+  rather than assume — and note that **`menuseam` legitimately exits 0 whatever it finds**, because it
+  is a falsifier rather than a pass/fail test. Its answer moved 14/14 → 12/12 under a sabotage with the
+  exit code unchanged throughout, so sweep it by diffing its printed line, never by exit code.
 - **`drawcount` is safe to run as of batch 8** — `newtpad drawcount <file>` renders offscreen (no
   window, no message pump), prints its numbers and exits, and a bare `newtpad drawcount` prints
   usage. **The old rule here was right to forbid it but wrong about why**, and the difference is the

@@ -145,7 +145,8 @@ gathered in the same pass, and each key's `numeric` is settled before the compar
 
 **One comparator, via `slice.sort_by_with_data`.** `core/slice/sort.odin:151` provides
 `sort_by_with_data(data, less: proc(i, j: E, user_data: rawptr) -> bool, user_data)`. The key metadata
-(the `[3]Sort_Key` and `nkeys`) rides in `user_data`. **This is why there is no file-scope global**, which
+(the `[TABLE_SORT_KEYS_MAX]Sort_Key` and `nkeys`) rides in `user_data`. **This is why there is no
+file-scope global**, which
 was the obvious shape and the wrong one: a global read by a comparator is invisible state that outlives
 the call that set it, and this file already carries one hard-won lesson (`Sort_Item.key`) about state that
 is only valid inside one procedure.
@@ -292,9 +293,14 @@ wording changed.
 
 At the 2-key cap the longest realistic line is roughly
 `120,000 rows · 8 columns · sorted by Department asc, Last Name desc · click to clear`.
-**The plan must check that against the band at a small window width** and decide the behaviour if it does
-not fit, rather than leaving it to be discovered. That check is also the argument that keeps the key cap
-at 3.
+**Checked, 2026-08-01, and it does not fit — but it never did.** The 2-key line is 105 cells = 850px and
+its clickable run ends at 730px, against a 318px minimum window. **The one-key line already ended at
+602px before this batch**, so the key list moved the threshold rather than creating it. Accepted and
+recorded rather than papered over: it is not a correctness bug (the hit rect and the glyphs share one x,
+and Clear Sort in the header menu works at any width), and every option that would make it fit — eliding
+the row/column facts, putting the sort clause first, scrolling the band — changes what a *one-key* line
+looks like, which is a product decision on a pre-existing condition. **The cap is not the lever here**; it
+is already at 2 for the timing reason in §4.
 
 The refusal wording (`too large to sort (over 100,000 rows)`) is unchanged.
 
