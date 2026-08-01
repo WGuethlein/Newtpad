@@ -794,16 +794,28 @@ TABLE_SORT_NONE :: -1
 // at 1,000,000 rows it measured **2,046 ms at -o:speed** (3,075 ms debug), and a
 // two-second stall on a header click is not a slow feature, it is a hung window.
 // Product principle 1 is "speed everywhere -- clicking, tabs, find, open:
-// instant", and nothing about a click on a column header exempts it. The cost is
-// near-linear in rows, so 100,000 lands near 205 ms: still the slowest thing in
-// the app by a wide margin, but recoverable rather than alarming, and it is the
-// most rows that can be sorted without breaking the promise the product is sold
-// on. This was 1,000,000 for exactly as long as it took to measure it.
+// instant", and nothing about a click on a column header exempts it. 100,000 rows
+// is the most that can be sorted without breaking the promise the product is sold
+// on: still the slowest thing in the app by a wide margin, but recoverable rather
+// than alarming. This was 1,000,000 for exactly as long as it took to measure it.
 //
-// AT THREE KEYS the same 100,000 rows cost 1.78-1.80x the one-key build --
-// tablesorttest's C6 prints both, and TABLE_SORT_KEYS_MAX's comment carries the
-// numbers and what they do and do not settle. The ceiling is unchanged by it: the
-// bound is a row count for the reason the paragraph below gives, and the key count
+// THIS PARAGRAPH USED TO END "the cost is near-linear in rows, so 100,000 lands
+// near 205 ms". That 205 was never measured -- it was the 2,046 ms release figure
+// above divided by ten. Batch 19 measured the same quantity DIRECTLY at 100,000
+// rows (tablesorttest's C6): 370-395 ms debug over seven runs, ~258 ms release
+// converted at the x0.665 ratio the two figures above establish (~246-263 ms across
+// the spread). So the single-key sort at the ceiling costs about a quarter more than
+// this comment claimed. Trust the 258: it is a direct measurement of this build,
+// where the 205 was an extrapolation across a factor of ten from a different
+// fixture. The ceiling does not move on it -- 258 ms is the same side of
+// "recoverable rather than alarming" as 205 was -- and neither does the argument.
+// What moved is the evidence. TABLE_SORT_KEYS_MAX's last paragraph below calls this
+// the comment-outran-the-evidence shape, and this is what it looks like.
+//
+// AT THE KEY CAP the same 100,000 rows cost more again -- TABLE_SORT_KEYS_MAX's
+// comment carries the numbers, what took the cap from three to two, and what the
+// measurement does and does not settle. The ceiling is unchanged by it: the bound
+// is a row count for the reason the paragraph below gives, and the key count
 // multiplies the constant rather than the shape.
 //
 // It is a row count, not a file size: the bound that matters is the memory the
@@ -821,34 +833,48 @@ TABLE_SORT_MAX :: 100_000
 // property of the data structure and not a rule anything has to enforce -- there is
 // no separate priority field to keep in step with it.
 //
-// Three is a SPEC-GIVEN cap. It was chosen because Excel's classic sort dialog
-// offered three, and because the summary row (table_summary_parts) has to stay a
-// sentence a reader takes in, not a list they scan -- neither of which is a timing
-// argument, and the timing is now measured rather than assumed:
+// TWO, AND IT WAS THREE UNTIL IT WAS MEASURED. The original cap was a spec-given
+// three: Excel's classic sort dialog offers three, and the summary row
+// (table_summary_parts) has to stay a sentence a reader takes in rather than a list
+// they scan. Neither of those is a timing argument, and the timing is now measured:
 //
-//   100,000 rows, three keys vs one, same file, same run (tablesorttest's C6):
-//   1 key 382-395 ms, 3 keys 690-702 ms in a DEBUG build -- 1.78-1.80x.
+//   100,000 rows, same file, same run (tablesorttest's C6), DEBUG build:
+//   1 key 382-395 ms; 3 keys 690-702 ms, about 1.8x (1.78-1.86x observed over five
+//   runs on one machine -- three runs and two decimal places would be a range the
+//   evidence cannot carry, so read it as "about 1.8").
 //
 // Debug because build.bat release is -subsystem:windows and a headless mode cannot
-// print from it at all. Converted with the ratio TABLE_SORT_MAX's own comment
-// already establishes (3,075 ms debug to 2,046 ms release at 1,000,000 rows, x0.665),
-// three keys land near 460 ms of release-build freeze against roughly 260 ms for one
-// key on the same fixture. That is a MEASURED RATIO on one machine and a CONVERTED
-// absolute, not a release measurement -- do not quote the 460 as though it were one.
+// print from it at all. CONVERTED, NOT MEASURED, with the ratio TABLE_SORT_MAX's own
+// comment establishes (3,075 ms debug to 2,046 ms release at 1,000,000 rows, x0.665):
+// three keys land near 460 ms of release-build freeze against roughly 258 ms for one
+// key on the same fixture. A measured ratio on one machine and a converted absolute
+// -- do not quote the 460 as though it were a release measurement.
 //
-// What the number settles: the cost is a constant factor on the pass, not a new
-// shape. The line is read once and the keys are cut from that one read, so k
-// multiplies the field extraction and the comparator's depth, and 3x the keys is
-// well under 3x the time. What it does NOT settle is whether ~460 ms is an
-// acceptable freeze; product principle 1 is "speed everywhere -- clicking, tabs,
-// find, open: instant", and if that answer is ever no, THIS constant is the variable
-// (spec §4) -- TABLE_SORT_MAX does not rise and a longer freeze is not accepted.
+// Wyatt's decision, 2026-07-31: two. And the honest shape of that decision, because
+// the number does not make it obvious --
 //
-// Raising it takes two things, not one: a fresh measurement at the higher count, AND
-// a decision about how the summary row reads with more keys in it. Whoever raises it
-// should record both -- a cap raised on only one of them is exactly the
-// comment-outran-the-evidence shape this one used to be.
-TABLE_SORT_KEYS_MAX :: 3
+//   THE COST IS A CONSTANT FACTOR, NOT A NEW SHAPE. The line is read once and every
+//   key is cut from that one read, so k multiplies the field extraction and the
+//   comparator's depth, not the number of passes: 3x the keys buys 1.8x the time.
+//   That also makes the cap a WEAK LEVER, and the cap it landed on was measured too
+//   -- at two keys C6 reads 550-564 ms debug against 370-377 ms for one key over
+//   four runs, 1.47-1.52x, so about 370 ms of release freeze converted against about
+//   250 ms. Two keys is most of the way to three. Dropping the cap did not buy a
+//   fast sort; it declined to pay for a key nobody asked for. "Sort by department,
+//   then by name" is the query people actually have.
+//
+// What the measurement does NOT settle is whether even ~370 ms is an acceptable
+// freeze. Product principle 1 is "speed everywhere -- clicking, tabs, find, open:
+// instant". If that answer is ever no, THIS constant is the variable (spec §4) --
+// TABLE_SORT_MAX does not rise and a longer freeze is not accepted -- and past that,
+// the real answer is the background sort index TABLE_SORT_MAX's comment names, which
+// removes the trade rather than repricing it.
+//
+// CHANGING IT -- in either direction -- takes two things, not one: a fresh
+// measurement at the new count, AND a decision about how the summary row reads with
+// that many keys in it. Whoever changes it should record both. A cap moved on only
+// one of them is exactly the comment-outran-the-evidence shape this one used to be.
+TABLE_SORT_KEYS_MAX :: 2
 
 // One column's part of the sort. TABLE_SORT_NONE is what an unset key's `col` is --
 // Odin zero-inits `col` to 0, a valid column index, so a slot that has never been
@@ -863,8 +889,8 @@ Sort_Key :: struct {
 }
 
 Table_Sort :: struct {
-	// keys[0] is the primary; keys[1], keys[2] are tie-breakers in the order they
-	// were added. nkeys is the count that's live -- entries at or past it are
+	// keys[0] is the primary; every key after it is a tie-breaker, in the order it
+	// was added. nkeys is the count that's live -- entries at or past it are
 	// leftover from a previous sort and must not be read (table_sort_key stops at
 	// nkeys for exactly this reason).
 	keys:    [TABLE_SORT_KEYS_MAX]Sort_Key,
@@ -881,7 +907,7 @@ Table_Sort :: struct {
 }
 
 // Is `col` part of the live sort, and at what precedence? Linear over at most
-// TABLE_SORT_KEYS_MAX -- a binary search over three entries would be slower AND
+// TABLE_SORT_KEYS_MAX -- a binary search over that many entries would be slower AND
 // would imply the array is ordered by column, which it is not: it is ordered by
 // PRECEDENCE, which is the whole point (see TABLE_SORT_KEYS_MAX above).
 table_sort_key :: proc(doc: ^Document, col: int) -> (k: int, ok: bool) {
@@ -1003,8 +1029,9 @@ table_sort_free :: proc(doc: ^Document) {
 // a [dynamic]u8 REALLOCATES, and a string captured before a growth points into
 // freed memory. Every key is spanned first and materialised in one pass once the
 // arena has stopped moving. That bug is silent -- the comparator reads plausible
-// garbage and produces a plausible ORDER -- and with three keys per row there are
-// three times as many chances to make it, so the shape is worth stating.
+// garbage and produces a plausible ORDER -- and with TABLE_SORT_KEYS_MAX keys per
+// row there are that many times as many chances to make it, so the shape is worth
+// stating.
 @(private = "file")
 Sort_Field :: struct {
 	key:    string,
@@ -1098,8 +1125,8 @@ sort_number :: proc(s: string, scratch: ^[64]u8) -> f64 {
 // procedure has to distrust anyway. The settled vector is what lands in s.keys.
 //
 // ONE BOUNDED PASS over the data rows, on the main thread, because a sort the user
-// asked for by clicking has to be there when they look up. Still one pass at three
-// keys: the line is read once and every key's field is cut from that one read, so
+// asked for by clicking has to be there when they look up. Still one pass at the key
+// cap: the line is read once and every key's field is cut from that one read, so
 // the row count -- not the key count -- is what the ceiling has to bound. The bound
 // is TABLE_SORT_MAX rows, checked as the rows are counted rather than afterwards, so
 // a 12M-row file pays for 100,000 rows of scanning and then stops -- not for twelve
@@ -1181,7 +1208,11 @@ table_sort_build :: proc(doc: ^Document, keys: []Sort_Key) -> bool {
 	// bounds. 16 KB on the stack of a procedure the input phase calls once per click.
 	//
 	// ONE key buffer, reused by every key, NOT one per key. A
-	// [TABLE_SORT_KEYS_MAX][RENDER_LINE_CAP]u8 would be 24 KB more on a stack frame
+	// [TABLE_SORT_KEYS_MAX][RENDER_LINE_CAP]u8 is 16 KB of its own at today's cap of 2,
+	// and it would REPLACE the 8 KB `key` below rather than sit beside it, so the extra
+	// cost is 8 KB and it grows by another RENDER_LINE_CAP (8 KB) per key the cap ever
+	// gains. This line used to say "24 KB more", which was the whole array at a cap of
+	// three rather than the difference it costs. On a stack frame
 	// that test_mode_dispatch already enters deep, and `blocktest` has hit a real
 	// STATUS_STACK_OVERFLOW twice in this tree from exactly that kind of growth. Reuse
 	// is safe because each field is appended to the arena immediately, before the next

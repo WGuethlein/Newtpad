@@ -1847,6 +1847,11 @@ when NEWTPAD_TESTS {
 	// empty-last rule on the secondary keys) all produce a *plausible* order. A
 	// literal is the only thing that can tell a plausible order from the right one.
 	//
+	// A vector that means "the whole cap" is BUILT from TABLE_SORT_KEYS_MAX; a vector
+	// that means "two keys, because this rule is about a tie-breaker" is written as two.
+	// The distinction is not cosmetic: when the cap moved from 3 to 2, the k-key logic
+	// was clean at every count and only the hardcoded `[3]Sort_Key` literals failed.
+	//
 	// One-argument and non-zero on failure, per the keytest/resavetest incident: a
 	// mode nothing runs is worse than no mode.
 	@(private = "file")
@@ -1921,8 +1926,8 @@ when NEWTPAD_TESTS {
 		return strings.to_string(sb)
 	}
 
-	// C1: perm and rank are exact inverses, offs is ascending file order, at 1, 2 and
-	// 3 keys.
+	// C1: perm and rank are exact inverses, offs is ascending file order, at every key
+	// count from 1 to TABLE_SORT_KEYS_MAX.
 	//
 	// The INVERSE check is the one that cannot pass by accident. table_sort_pos is the
 	// only route from a byte offset back to a sorted position and it reads `rank`; a
@@ -1930,13 +1935,24 @@ when NEWTPAD_TESTS {
 	// a cell edit there. A build that dropped a row, wrote one twice, or left an array
 	// short leaves the two disagreeing, and comparing them against EACH OTHER (rather
 	// than against a recomputed permutation) is what makes that visible.
+	//
+	// THE KEY VECTOR IS BUILT FROM TABLE_SORT_KEYS_MAX, not written out as a literal,
+	// here and in every case below. When the cap came down from 3 to 2 the k-key logic
+	// needed nothing at all and every hand-written `[3]Sort_Key` in this mode failed --
+	// fifteen failures, none of them about the sort. A test that answers that by
+	// hardcoding the new number has only moved the same breakage to the next change.
 	@(private = "file")
 	ts_case_inverses :: proc(bad: ^int) {
-		fmt.println("-- perm/rank are inverses and offs ascends, at 1, 2 and 3 keys --")
+		fmt.printfln("-- perm/rank are inverses and offs ascends, at 1..%d keys --", TABLE_SORT_KEYS_MAX)
 		d := ts_doc("a,b,c\n3,z,q\n1,y,r\n2,z,p\n1,x,s\n2,y,t\n", 3)
 		defer doc_close(&d)
 		ROWS :: 5
-		all := [3]Sort_Key{{col = 0, desc = false}, {col = 1, desc = true}, {col = 2, desc = false}}
+		// One key per column, alternating direction. The fixtures in this mode carry
+		// three columns, so they fill any cap up to 3; past that they would silently
+		// start asking for a column that is not there, hence the assert.
+		#assert(TABLE_SORT_KEYS_MAX <= 3)
+		all: [TABLE_SORT_KEYS_MAX]Sort_Key
+		for i in 0 ..< TABLE_SORT_KEYS_MAX {all[i] = {col = i, desc = i % 2 == 1}}
 		for nk in 1 ..= TABLE_SORT_KEYS_MAX {
 			ok := table_sort_build(&d, all[:nk])
 			s := &d.table_sort
@@ -1966,7 +1982,7 @@ when NEWTPAD_TESTS {
 	// coverage anywhere in the tree.
 	//
 	// A zeroed Sort_Key.col is 0, a VALID column index, so a clear that only zeroed
-	// the struct would leave three slots claiming "sorted by column 0". Nothing reads
+	// the struct would leave every slot claiming "sorted by column 0". Nothing reads
 	// past nkeys today, which is exactly why this needs a test rather than a reader:
 	// the loop is correct and invisible, and the first thing to read the array
 	// directly would inherit the lie.
@@ -1975,8 +1991,10 @@ when NEWTPAD_TESTS {
 		fmt.println("-- table_sort_clear puts every key slot back to TABLE_SORT_NONE --")
 		d := ts_doc("a,b,c\n3,z,q\n1,y,r\n2,z,p\n", 3)
 		defer doc_close(&d)
-		all := [3]Sort_Key{{col = 2}, {col = 1, desc = true}, {col = 0}}
-		li_chk(bad, table_sort_build(&d, all[:]), "a 3-key sort is live before the clear")
+		// A full vector, in reverse column order so no slot holds its own index.
+		all: [TABLE_SORT_KEYS_MAX]Sort_Key
+		for i in 0 ..< TABLE_SORT_KEYS_MAX {all[i] = {col = TABLE_SORT_KEYS_MAX - 1 - i, desc = i % 2 == 1}}
+		li_chk(bad, table_sort_build(&d, all[:]), fmt.tprintf("a %d-key sort is live before the clear", TABLE_SORT_KEYS_MAX))
 		table_sort_clear(&d)
 		s := &d.table_sort
 		reset := s.nkeys == 0 && !s.refused
@@ -2114,7 +2132,7 @@ when NEWTPAD_TESTS {
 		)
 	}
 
-	// C5: rows equal on all three keys come back in FILE order, under every direction
+	// C5: rows equal on EVERY key come back in FILE order, under every direction
 	// combination.
 	//
 	// slice.sort_by_with_data is not stable, so file order here is not something the
@@ -2122,42 +2140,59 @@ when NEWTPAD_TESTS {
 	// direction or the "same" rows would reverse with the arrow. The tag column is not
 	// a key: it is there so three rows that tie on everything the sort reads are still
 	// distinguishable in the output.
+	//
+	// EVERY combination, so the sweep is 2^TABLE_SORT_KEYS_MAX rather than a literal 8
+	// -- one key whose direction is never flipped is one place a direction-sensitive
+	// tie-break could hide.
 	@(private = "file")
 	ts_case_total_order :: proc(bad: ^int) {
-		fmt.println("-- rows equal on all three keys come back in file order, every direction --")
+		fmt.printfln("-- rows equal on every key come back in file order, all %d direction combinations --", 1 << uint(TABLE_SORT_KEYS_MAX))
 		d := ts_doc("a,b,c,tag\nx,y,z,one\nx,y,z,two\nx,y,z,three\n", 4)
 		defer doc_close(&d)
 		WANT :: "x,y,z,one|x,y,z,two|x,y,z,three"
-		for m in 0 ..< 8 {
-			k := [3]Sort_Key{{col = 0, desc = m & 1 != 0}, {col = 1, desc = m & 2 != 0}, {col = 2, desc = m & 4 != 0}}
+		for m in 0 ..< 1 << uint(TABLE_SORT_KEYS_MAX) {
+			k: [TABLE_SORT_KEYS_MAX]Sort_Key
+			dirs: [TABLE_SORT_KEYS_MAX]bool
+			for i in 0 ..< TABLE_SORT_KEYS_MAX {
+				dirs[i] = m & (1 << uint(i)) != 0
+				k[i] = {col = i, desc = dirs[i]}
+			}
 			ok := table_sort_build(&d, k[:])
 			got := ts_order(&d)
-			li_chk(bad, ok && got == WANT, fmt.tprintf("desc %v/%v/%v -> %q", k[0].desc, k[1].desc, k[2].desc, got))
+			li_chk(bad, ok && got == WANT, fmt.tprintf("desc %v -> %q", dirs, got))
 		}
 	}
 
-	// C6: what three keys COST at the ceiling.
+	// C6: what a full key vector COSTS at the ceiling.
 	//
 	// TABLE_SORT_MAX is a freeze budget, not a memory bound (see its comment): the
 	// build is one synchronous pass on the main thread, so its cost is how long the
 	// window is unresponsive after a header click. The key count multiplies the field
-	// extraction and deepens the comparator, and if that turned the click into a
-	// visibly longer stall the answer is a lower TABLE_SORT_KEYS_MAX -- product
-	// principle 1 is "speed everywhere: clicking, tabs, find, open -- instant", and
-	// nothing about a header click exempts it.
+	// extraction and deepens the comparator, and when this case first ran at a cap of
+	// three that is exactly what happened -- 696 ms debug against 387 ms for one key,
+	// ~460 ms against ~258 ms converted to release -- and the cap came down to two.
+	// TABLE_SORT_KEYS_MAX's comment carries the numbers and the decision.
 	//
 	// Asserted as a RATIO against the same file's single-key build rather than against
 	// a millisecond constant, because a constant drifts with the machine and this has
-	// to mean the same thing on Wyatt's desktop and in CI. The bound catches the
-	// failure that matters -- a build that re-scanned the file per key, or that
-	// dragged the comparator into something superlinear in k -- while tolerating the
-	// honest 2x of extracting three fields per row instead of one.
+	// to mean the same thing on Wyatt's desktop and in CI. Both builds run back to back
+	// over the same file in the same process, so machine noise is largely common-mode
+	// and the ratio is the stable quantity.
+	//
+	// THE BOUND IS DERIVED FROM THE CAP, not picked: a build that re-scanned the file
+	// per key would cost about k times the single-key build, so k is the failure this
+	// catches, and the honest measured cost is well under it -- 1.47-1.52x over four
+	// runs at k=2, 1.78-1.86x at k=3, because the extraction is a fraction of a pass
+	// dominated by the line read and the n log n comparisons. The threshold sits at
+	// 0.9k: at today's cap that is 1.80x against a measured 1.49x, a fifth of headroom
+	// over the honest figure and a tenth of margin under the failure. The ratio is the
+	// stable quantity to hang that on -- the four runs spread by 0.05.
 	//
 	// The printed number is a DEBUG figure and says so: build.bat release is
 	// -subsystem:windows and cannot print from a headless mode at all.
 	@(private = "file")
 	ts_case_measure :: proc(bad: ^int) {
-		fmt.println("-- what three keys cost at TABLE_SORT_MAX rows --")
+		fmt.printfln("-- what %d keys cost at TABLE_SORT_MAX rows --", TABLE_SORT_KEYS_MAX)
 		HEAD :: "id,date,status\n"
 		ROW :: 26 // "0000000,2026-01-01,ACTIVE\n" -- a realistic export row
 		src := make([]u8, len(HEAD) + TABLE_SORT_MAX * ROW)
@@ -2181,17 +2216,24 @@ when NEWTPAD_TESTS {
 		t1 := time.tick_now()
 		ok1 := table_sort_build(&d, k1[:])
 		ms1 := time.duration_milliseconds(time.tick_since(t1))
-		// Three keys in reverse column order, so the primary is the LAST column and the
+		// A full vector in REVERSE column order, so the primary is never column 0 and the
 		// scrambled id column is only reached as the final tie-break: a build that
 		// quietly used key 0 for everything would come out in the wrong order below.
-		k3 := [3]Sort_Key{{col = 2}, {col = 1}, {col = 0}}
+		//
+		// The two end literals hold at either cap, and not by luck -- at a cap of 3 the
+		// vector is status/date/id and at 2 it is date/id, and status is a FUNCTION of
+		// the id (even means ACTIVE), so dropping it as the primary cannot move either
+		// end. Day 1 forces id % 28 == 0, hence even, hence ACTIVE; day 28 forces
+		// id % 28 == 27, hence odd, hence CLOSED.
+		kn: [TABLE_SORT_KEYS_MAX]Sort_Key
+		for i in 0 ..< TABLE_SORT_KEYS_MAX {kn[i] = {col = TABLE_SORT_KEYS_MAX - 1 - i}}
 		t3 := time.tick_now()
-		ok3 := table_sort_build(&d, k3[:])
+		ok3 := table_sort_build(&d, kn[:])
 		ms3 := time.duration_milliseconds(time.tick_since(t3))
 		li_chk(bad, ok1 && ok3 && table_sort_rows(&d) == TABLE_SORT_MAX, fmt.tprintf("both builds order all %d rows (%v/%v)", TABLE_SORT_MAX, ok1, ok3))
-		// status ascending puts every ACTIVE (even id) first, then date, then id.
 		// Checked at the ends only: the whole order is 100,000 rows, and both ends
-		// pin the primary key, the secondary and the final tie-break at once.
+		// pin the primary key, every tie-breaker and the final file-order fallback at
+		// once.
 		first, last := ts_order(&d, 1), "<none>"
 		if off, ok := table_sort_row_at(&d, TABLE_SORT_MAX - 1); ok {
 			buf: [64]u8
@@ -2199,16 +2241,18 @@ when NEWTPAD_TESTS {
 			got := base.pt_read(&d.pt, off, buf[:min(end - off, len(buf))])
 			last = strings.clone(strings.trim_space(string(buf[:got])), context.temp_allocator)
 		}
-		li_chk(bad, first == "0000000,2026-01-01,ACTIVE", fmt.tprintf("...smallest under status/date/id first: %q", first))
-		// The largest row under status/date/id: CLOSED (odd id), the largest date this
-		// fixture reaches (day 28, i.e. id % 28 == 27, which is odd for every k), and
-		// the largest such id below TABLE_SORT_MAX -- 28*3570 + 27 = 99987.
+		li_chk(bad, first == "0000000,2026-01-01,ACTIVE", fmt.tprintf("...smallest under the full vector first: %q", first))
+		// The largest row: the largest date this fixture reaches (day 28, i.e.
+		// id % 28 == 27, which is odd for every k, hence CLOSED), and the largest such
+		// id below TABLE_SORT_MAX -- 28*3570 + 27 = 99987.
 		li_chk(bad, last == "0099987,2026-01-28,CLOSED", fmt.tprintf("...and largest last: %q", last))
-		fmt.printfln("         DEBUG build: 1 key %.0f ms, 3 keys %.0f ms (%.2fx) over %d rows", ms1, ms3, ms3 / max(ms1, 0.001), TABLE_SORT_MAX)
-		li_chk(bad, ms3 < 2.5 * ms1, fmt.tprintf("...and three keys cost under 2.5x one key (%.2fx)", ms3 / max(ms1, 0.001)))
+		ratio := ms3 / max(ms1, 0.001)
+		LIMIT :: 0.9 * f64(TABLE_SORT_KEYS_MAX)
+		fmt.printfln("         DEBUG build: 1 key %.0f ms, %d keys %.0f ms (%.2fx) over %d rows", ms1, TABLE_SORT_KEYS_MAX, ms3, ratio, TABLE_SORT_MAX)
+		li_chk(bad, ratio < LIMIT, fmt.tprintf("...and %d keys cost under %.2fx one key (%.2fx)", TABLE_SORT_KEYS_MAX, LIMIT, ratio))
 	}
 
-	// C7: the refusal still holds at three keys, on both of its paths.
+	// C7: the refusal still holds at a full key vector, on both of its paths.
 	//
 	// Two separate refusals, and they are not the same code. The IN-LOOP check stops
 	// an unsettled count at the ceiling while scanning, so a 12M-row file pays for
@@ -2219,7 +2263,7 @@ when NEWTPAD_TESTS {
 	// when pressed is indistinguishable from a broken one.
 	@(private = "file")
 	ts_case_refusal :: proc(bad: ^int) {
-		fmt.println("-- over the ceiling, a 3-key sort is refused on both paths --")
+		fmt.printfln("-- over the ceiling, a %d-key sort is refused on both paths --", TABLE_SORT_KEYS_MAX)
 		HEAD :: "id,date,status\n"
 		ROW :: 26
 		rows := TABLE_SORT_MAX + 1
@@ -2235,10 +2279,11 @@ when NEWTPAD_TESTS {
 		d := ts_doc(string(src), 3)
 		delete(src)
 		defer doc_close(&d)
-		k3 := [3]Sort_Key{{col = 0}, {col = 1}, {col = 2}}
+		kn: [TABLE_SORT_KEYS_MAX]Sort_Key
+		for i in 0 ..< TABLE_SORT_KEYS_MAX {kn[i] = {col = i}}
 		// No index running yet: the count is not exact, so the early refusal cannot
 		// fire and this exercises the SCANNING one.
-		li_chk(bad, !table_sort_build(&d, k3[:]), "one row past TABLE_SORT_MAX refuses a 3-key sort mid-scan")
+		li_chk(bad, !table_sort_build(&d, kn[:]), fmt.tprintf("one row past TABLE_SORT_MAX refuses a %d-key sort mid-scan", TABLE_SORT_KEYS_MAX))
 		li_chk(bad, !table_sorted(&d), "...and nothing is left half-sorted")
 		li_chk(bad, d.table_sort.nkeys == 0 && len(d.table_sort.perm) == 0, fmt.tprintf("...with no keys and no permutation left behind (nkeys %d, perm %d)", d.table_sort.nkeys, len(d.table_sort.perm)))
 		li_chk(bad, d.table_sort.refused, "...and the refusal is recorded for the summary row")
@@ -2249,9 +2294,9 @@ when NEWTPAD_TESTS {
 		n, exact := table_row_count(&d)
 		li_chk(bad, exact && n == rows, fmt.tprintf("the index settles at %d data rows (got %d, exact %v)", rows, n, exact))
 		t0 := time.tick_now()
-		ok2 := table_sort_build(&d, k3[:])
+		ok2 := table_sort_build(&d, kn[:])
 		us := time.duration_microseconds(time.tick_since(t0))
-		li_chk(bad, !ok2 && d.table_sort.refused, "a settled over-ceiling count refuses a 3-key sort too")
+		li_chk(bad, !ok2 && d.table_sort.refused, fmt.tprintf("a settled over-ceiling count refuses a %d-key sort too", TABLE_SORT_KEYS_MAX))
 		li_chk(bad, us < 1000, fmt.tprintf("...without a pass over the file (%.0f us)", us))
 	}
 
