@@ -257,9 +257,12 @@ when NEWTPAD_TESTS {
 		fmt.printfln("Tab_Close         -> live tabs=%d", app_live_count(&app))
 		app_destroy(&app)
 		fmt.printfln("keytest: %d failures", bad)
-		// The only mode that exits non-zero, and it earns it: this one was invisible
-		// to every sweep for a year. A summary line a script has to remember to grep
-		// is what let the stale assertion sit here; an exit code is not optional to
+		// NOT the only mode that exits non-zero -- 18 `os.exit(1)` sites live in this
+		// file as of this count (`grep -c` on the literal), and this branch alone
+		// added three of them (menutest, settingstest, tablesorttest). This one earns
+		// its own copy on its own history, not on uniqueness: it was invisible to
+		// every sweep for a year. A summary line a script has to remember to grep is
+		// what let the stale assertion sit here; an exit code is not optional to
 		// notice. `os.exit` skips the deferred teardown above -- everything it would
 		// free is process-lifetime scratch, and the process is ending either way.
 		if bad > 0 {os.exit(1)}

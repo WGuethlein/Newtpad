@@ -1251,10 +1251,11 @@ table_sort_build :: proc(doc: ^Document, keys: []Sort_Key) -> bool {
 	if !fok {return false}
 	// Refuse before scanning when the row count is already SETTLED and over the
 	// ceiling. Without this every click on a 12M-row file pays for a full
-	// TABLE_SORT_MAX-row pass -- 285 ms in a debug build, which tg_sort's C4 prints
-	// -- to arrive at the same refusal, so the header would cost a visible hitch on
-	// every press and never do anything. Only on an EXACT count: a partial one is
-	// smaller than the truth
+	// TABLE_SORT_MAX-row pass -- 285 ms in a debug build, which tablegridtest's
+	// sort_ceiling subcase prints ("sort cost: ... ms for ... rows") -- to arrive
+	// at the same refusal, so the header would cost a visible hitch on every press
+	// and never do anything. Only on an EXACT count: a partial one is smaller than
+	// the truth
 	// by construction, so refusing off it would refuse files that fit.
 	if n, exact := table_row_count(doc); exact && n > TABLE_SORT_MAX {
 		s.refused = true
@@ -1395,6 +1396,13 @@ table_sort_build :: proc(doc: ^Document, keys: []Sort_Key) -> bool {
 // table_sort_add, table_sort_toggle and the header menu's enabled state (Task 5)
 // all branch on, so the cap has exactly one definition rather than three that
 // could drift apart.
+//
+// table_sort_toggle and the menu (menu.odin's can_then_by and its "Then by" row)
+// both pre-check membership with table_sort_key before ever calling this, so the
+// already-a-key branch below never fires from them. table_sort_add is the one
+// caller that calls this unconditionally, key or not -- its own direction-flip
+// path (col already live, only `desc` changing) is what keeps that branch
+// reachable and exercised by tablesorttest rather than untested dead code.
 table_sort_can_add :: proc(doc: ^Document, col: int) -> bool {
 	if doc == nil {return false}
 	if _, ok := table_sort_key(doc, col); ok {return true}
@@ -1494,15 +1502,19 @@ table_sort_cycle :: proc(doc: ^Document, col: int) {
 // next vector with the key rewritten AT ITS OWN INDEX is what keeps precedence
 // where the user put it.
 //
-// THE CAP IS CHECKED HERE, before table_sort_build ever sees the vector -- not
-// delegated to it. table_sort_build clears the live sort before it validates
-// (documented on table_sort_build's own comment, and pinned there by Task 2's
-// tests), so handing it an oversized vector to learn that it refuses would erase
-// every key already live just to answer a question this procedure can answer for
-// free by comparing `col`'s membership and `nkeys` first.
+// THE CAP IS CHECKED HERE, before table_sort_build ever sees the vector -- by
+// CALLING table_sort_can_add, not by re-deriving its answer inline. This
+// procedure used to compare `nk` to TABLE_SORT_KEYS_MAX itself, which gave the
+// cap two definitions rather than table_sort_can_add's one -- exactly the drift
+// its comment claimed could not happen. table_sort_build clears the live sort
+// before it validates (documented on table_sort_build's own comment, and pinned
+// there by Task 2's tests), so refusing here, before table_sort_build is ever
+// called, is what keeps an oversized request from erasing every key already live
+// just to learn it should have been refused.
 table_sort_add :: proc(doc: ^Document, col: int, desc: bool) {
 	if doc == nil || col < 0 {return}
 	if doc.table_editing {table_edit_commit(doc)}
+	if !table_sort_can_add(doc, col) {return} // full and not already a key: refused, live sort untouched
 	s := &doc.table_sort
 	kv: [TABLE_SORT_KEYS_MAX]Sort_Key
 	nk := s.nkeys
@@ -1510,8 +1522,7 @@ table_sort_add :: proc(doc: ^Document, col: int, desc: bool) {
 	if k, ok := table_sort_key(doc, col); ok {
 		kv[k].desc = desc // in place -- k, its precedence, does not move
 	} else {
-		if nk >= TABLE_SORT_KEYS_MAX {return} // full: refused, live sort untouched
-		kv[nk] = {col = col, desc = desc}
+		kv[nk] = {col = col, desc = desc} // room guaranteed by table_sort_can_add above
 		nk += 1
 	}
 	if !table_sort_build(doc, kv[:nk]) {return}
