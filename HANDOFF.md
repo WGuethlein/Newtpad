@@ -6595,6 +6595,75 @@ end it: Escape mid-drag would otherwise leave it set with no dropdown under it.
 - The `▲`/`▼` arrows still hit-test to the row behind them, unchanged from §6br and for the same
   reason.
 
+## 6bt. The draw owned `top`, so the drag did nothing (2026-08-02, v0.53.0)
+
+> *"the scrollbar still does not work on that modal"* (Wyatt, live use of v0.52.0)
+
+**§6bs shipped broken with every one of its assertions green.** That is the whole value of this
+entry, and the failure is not the scrollbar — it is what the tests were allowed to skip.
+
+### What was actually wrong
+
+`menu_draw_dropdown` calls `menu_scroll_to_item` on **every frame**, which pulls `top` to wherever it
+must be for `menu.item` to stay visible. `menu_open_ctx` sets `item` to the first enabled row —
+`(Select All)`, index 1. So a drag to row 51 was reverted to 1 before the frame reached the screen,
+every frame, forever.
+
+**The wheel escaped it by luck, which is why the bug looked like it was about the scrollbar.**
+Wheeling holds the pointer over a row, and `menu_hover_item` retargets `item` to that row each frame,
+so the pull is a no-op against a highlight that is visible by construction. Dragging holds the pointer
+on the scrollbar's *lane* — which §6br had just taught `menu_item_at` to refuse — so `item` stayed
+stale and the pull was not a no-op. **§6br's fix is what exposed §6bs's bug**, and neither is wrong on
+its own.
+
+### The rule that was already written down
+
+CLAUDE.md: *"scroll resolution must not happen inside the draw."* It was, and had been since the
+dropdown first outgrew a short window. Nothing noticed while the only thing that moved `top` was the
+highlight itself — the draw and the input phase agreed because there was only one writer. The moment
+a second writer existed, the draw won every argument.
+
+`menu_scroll_to_item` is now **edge-triggered**: it fires when the highlight *moves*, not on every
+frame it is drawn. "Keep the highlighted row visible" is a rule about a transition; applied every
+frame it silently becomes "the highlight must be visible at all times", and those are different rules
+with the same name. `item_scrolled` records what `top` was last resolved against, with `-2` as the
+never-resolved sentinel at each of the five places that reset the highlight.
+
+### Why the tests passed, and what they now do
+
+Every assertion in §6bs drove `menu_scroll_mouse` and **never drew**. The drag worked perfectly in a
+world with no draw. Three things came out of fixing that:
+
+1. The regression test calls `menu_scroll_to_item` — what the draw calls — not `menu_resolve_top`.
+   The pure resolver still answers *"pull it back to 1"*, correctly; the question was never what it
+   returns, it was whether the draw is entitled to ask. A test that could only reach the resolver
+   could not see the bug at all, so the procedure lost its `@(private = "file")`.
+2. The test has to **model a frame having already drawn** before the drag. Without that it opens and
+   drags before anything rendered, which no user can do, and it fails on the legitimately-owed first
+   resolve rather than on the bug.
+3. It asserts **both directions**. "The draw leaves a dragged list alone" is satisfied just as well by
+   deleting the feature, which would break arrow-key navigation through any list taller than its box —
+   so it also asserts that moving the highlight still scrolls it into view.
+
+Sabotaged back to level-triggered: `top 1, dragged to 51`.
+
+### What this batch got wrong
+
+- **Shipping §6bs at all.** The gap between "menu_scroll_mouse sets `top`" and "the list moves on
+  screen" is a whole frame's worth of code, and nothing in the suite crossed it. I told Wyatt the
+  untested case was main.odin's *ordering*; it was the draw, one layer further on.
+- **The pattern to take from this:** when a change adds a second writer to a piece of state, the test
+  that matters is not "does my writer write" — it is "who else writes this, and who wins". `top` had
+  exactly one other writer and it ran later every frame.
+
+### Owed
+
+- **`menu_scroll_to_item` still runs inside the draw.** Edge-triggering removes the bug, not the
+  CLAUDE.md violation. The real fix is calling it from the places that move the highlight — `menu_step`
+  and the keyboard handlers — which need the dropdown height, hence the rect, hence `t` and the window
+  dimensions. Worth doing with the renderer/ui extraction rather than alone.
+- `menu_scroll_last`'s cost, unchanged from §6bs.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

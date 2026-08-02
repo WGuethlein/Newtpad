@@ -330,6 +330,7 @@ menu_filter_requery :: proc(app: ^App) {
 	items := menu_filter_items(app)
 	app.menu.ctx_items = items
 	app.menu.top = 0
+	app.menu.item_scrolled = -2 // the row set changed under it: let the draw resolve once
 	app.menu.item = -1
 	for it, i in items {
 		if item_enabled(app, it) {
@@ -713,6 +714,16 @@ Menu_State :: struct {
 	// the pointer instead of teleporting its top there. Zero for a press on the
 	// bare track, which is what makes such a press a jump -- see vbar_grab_at.
 	scroll_grab: f32,
+	// The highlight that `top` was last resolved against, so menu_scroll_to_item
+	// can fire when the HIGHLIGHT MOVES rather than on every frame that happens to
+	// draw. -2 is the "not yet resolved" sentinel; `item` is only ever -1 or a real
+	// index, so it can never collide.
+	//
+	// Without this, keeping the highlight visible is a LEVEL-triggered rule that
+	// re-asserts itself forever, and any scroll the highlight did not cause is
+	// undone on the next frame. That is what made the v0.52.0 scrollbar drag
+	// visibly do nothing while every headless assertion about it passed.
+	item_scrolled: int,
 }
 
 // Must be called before the first frame: the zero value of `open` is 0, which
@@ -724,6 +735,7 @@ menu_init :: proc(m: ^Menu_State) {
 	m.mode = false
 	m.top = 0
 	m.rows = 0
+	m.item_scrolled = -2 // never resolved yet; see menu_scroll_to_item
 	// Zero value (false/nil/0) is already "no context menu"; set explicitly so
 	// a reader doesn't have to re-derive that from Odin's zero-init rule.
 	m.ctx = false
@@ -1023,7 +1035,8 @@ menu_open_at :: proc(app: ^App, mi: int) {
 	app.menu.mode = true
 	app.menu.open = clamp(mi, 0, len(menus) - 1)
 	app.menu.item = menu_step(app, app.menu.open, 0, 1)
-	app.menu.top = 0 // the draw scrolls this to keep the highlight visible
+	app.menu.top = 0 // the draw scrolls this ONCE, to bring the highlight into view
+	app.menu.item_scrolled = -2
 	app.menu.rows = 0
 }
 
@@ -1068,6 +1081,7 @@ menu_open_ctx :: proc(app: ^App, items: []Menu_Item, x, y: f32, col: int) {
 		}
 	}
 	app.menu.top = 0
+	app.menu.item_scrolled = -2
 	app.menu.rows = 0
 }
 
@@ -1097,6 +1111,7 @@ menu_open_tab_ctx :: proc(app: ^App, x: f32, slot: int) {
 	// every path-dependent row read as disabled. Re-run it now the target is set,
 	// or a right-click on a saved tab would open with Close highlighted.
 	app.menu.item = -1
+	app.menu.item_scrolled = -2 // the highlight is being re-picked; resolve against the new one
 	for it, i in tab_menu_items {
 		if item_enabled(app, it) {
 			app.menu.item = i
@@ -1601,9 +1616,35 @@ menu_scroll_to :: proc(app: ^App, b: Vbar, my: f32) {
 // Scroll the dropdown the minimum needed to bring `app.menu.item` into view.
 // Called from the draw, so the hit-test one frame later agrees with what is on
 // screen.
-@(private = "file")
+// EDGE-TRIGGERED on the highlight moving, not level-triggered on being drawn.
+//
+// "Keep the highlighted row visible" is a rule about a TRANSITION -- the arrow
+// keys moved the selection, so bring it into view. Applied unconditionally every
+// frame it becomes a rule about steady state -- the selection must be visible at
+// all times -- and those are not the same rule. The second one silently owns
+// `top`, so any scroll the highlight did not cause is reverted before the next
+// frame reaches the screen.
+//
+// That is exactly what shipped in v0.52.0: the scrollbar drag set `top` and the
+// draw put it back, every frame, and the bar visibly did nothing. The wheel
+// escaped only by luck -- wheeling holds the pointer over a row, and
+// menu_hover_item retargets `item` to it each frame, so the pull happened to be a
+// no-op. Dragging holds the pointer on the scrollbar's lane, which menu_item_at
+// refuses by design, so `item` stayed on (Select All) and the pull was not.
+//
+// This still resolves scroll INSIDE THE DRAW, which CLAUDE.md forbids outright
+// ("scroll resolution must not happen inside the draw"). Making it edge-triggered
+// removes the bug, not the violation -- see HANDOFF §6bt's Owed for the move to
+// the keyboard handlers that would.
+//
+// Not file-private: tablesorttest drives it directly, because the bug it pins is
+// precisely that the DRAW disagreed with the input phase about who owns `top`,
+// and a test that can only reach the pure resolver cannot see that disagreement
+// -- menu_resolve_top still says "pull it back", correctly. The gate is here.
 menu_scroll_to_item :: proc(app: ^App, items: []Menu_Item, h: f32) {
 	m := &app.menu
+	if m.item == m.item_scrolled {return}
+	m.item_scrolled = m.item
 	m.top = menu_resolve_top(m.top, m.item, items, h)
 }
 

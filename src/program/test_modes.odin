@@ -6428,6 +6428,58 @@ when NEWTPAD_TESTS {
 			li_chk(bad, a.menu.top > 0, fmt.tprintf("a press on the track below the thumb jumps the list to it (top %d)", a.menu.top))
 			li_chk(bad, a.menu.top < bottom_top, fmt.tprintf("...to the MIDDLE, not to the end (top %d, bottom %d)", a.menu.top, bottom_top))
 
+			// THE DRAW MUST NOT UNDO THE DRAG. This is the whole reason the drag
+			// shipped broken in v0.52.0 with every assertion above it green: those
+			// drive menu_scroll_mouse and never draw, and menu_draw_dropdown calls
+			// menu_scroll_to_item on EVERY frame, which pulls `top` back to wherever
+			// it must be for menu.item to stay visible. menu_open_ctx sets item to the
+			// first enabled row -- (Select All), index 1 -- so a drag to row 51 was
+			// snapped back to 1 before it could be seen.
+			//
+			// The wheel escaped it because wheeling puts the pointer over a ROW, and
+			// menu_hover_item retargets item to that row every frame, so the pull is a
+			// no-op. A drag puts the pointer on the lane, where menu_item_at returns
+			// -1 by design, so item stays stale and the pull is not.
+			{
+				_, _, _, dh := menu_dropdown_rect(&mt, &a, W, H)
+				a.menu.top = 0
+				// THE MENU HAS ALREADY BEEN ON SCREEN. Without this the sequence is
+				// "open, then drag before a single frame drew", which no user can
+				// perform and which leaves item_scrolled on its open sentinel -- so the
+				// first resolve is legitimately owed and the assertion below fails for
+				// a reason that has nothing to do with the bug.
+				menu_scroll_to_item(&a, menu_items(&a), dh)
+				li_chk(bad, a.menu.top == 0, fmt.tprintf("precondition: the highlight is visible, so drawing has not moved the list (top %d)", a.menu.top))
+				dd: plat.Window
+				dd.mouse_pressed, dd.mouse_down = true, true
+				vb, _ := menu_vbar_at(&mt, &a, W, H)
+				dd.mouse_x, dd.mouse_y = i32(vb.x + 1), i32(vb.track_y + vb.track_h + 500)
+				menu_scroll_mouse(&a, &mt, &dd, W, H)
+				dragged := a.menu.top
+				li_chk(bad, dragged > 0, fmt.tprintf("precondition: the drag moved the list (top %d)", dragged))
+				li_chk(bad, a.menu.item < dragged, fmt.tprintf("precondition: the highlight is now off-screen above (item %d, top %d)", a.menu.item, dragged))
+				// EXACTLY what the draw does. Not menu_resolve_top -- that is the pure
+				// resolver and it still answers "pull it back to 1", correctly; the
+				// question is whether the draw is entitled to ask.
+				menu_scroll_to_item(&a, menu_items(&a), dh)
+				li_chk(bad, a.menu.top == dragged, fmt.tprintf("the draw leaves a dragged list where the drag put it (top %d, dragged to %d, highlight %d)", a.menu.top, dragged, a.menu.item))
+				menu_scroll_to_item(&a, menu_items(&a), dh)
+				li_chk(bad, a.menu.top == dragged, "...on every frame after, not just the first")
+
+				// AND THE FEATURE IT GATES STILL WORKS. Without this the fix could be
+				// "never scroll to the highlight", which passes everything above and
+				// breaks arrow-key navigation through a list taller than the box.
+				// Row 3 -- the first value row, far ABOVE a view parked at the bottom.
+				// Not the last row: the drag ended at the bottom, so the last row is
+				// already visible and asking for it would prove nothing.
+				a.menu.item = 3
+				menu_scroll_to_item(&a, menu_items(&a), dh)
+				li_chk(bad, a.menu.top == 3, fmt.tprintf("...but MOVING the highlight still scrolls it into view (top %d, was %d, highlight 3)", a.menu.top, dragged))
+
+				dd.mouse_down = false
+				menu_scroll_mouse(&a, &mt, &dd, W, H)
+			}
+
 			// And a drag cannot outlive the menu.
 			menu_close(&a)
 			li_chk(bad, !a.menu.scroll_drag, "closing the menu ends any drag with it")
