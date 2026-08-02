@@ -66,7 +66,15 @@ filter stopped being applied below a certain row."
 
 - the point is outside the dropdown, and
 - the point is inside the dropdown but on a row with `cmd == .None` — the separator at index 2 and
-  the search-box label at index 0 — or on the scrollbar strip.
+  the search-box label at index 0.
+
+> **Corrected during implementation.** This list originally also named the scrollbar strip, which was
+> an unverified aside carried in from investigation. It is the opposite: the strip is drawn at
+> `x0 + w - bw`, *inside* the dropdown's width, and `menu_item_at` bounded x by the full `w` — so a
+> click on the strip resolved to the row behind it and **ticked a value**. That is a separate, worse
+> defect than the one this section describes, it is aggravated by removing the value cap (a 536-value
+> list always has a scrollbar; a 512-capped one often did not), and it is fixed in this batch via a
+> shared `scrollbar_w` producer. See HANDOFF §6br.
 
 `menu_hit_test` receives one `-1` and cannot tell them apart, so it takes the "clicked away" branch
 and calls `menu_close`.
