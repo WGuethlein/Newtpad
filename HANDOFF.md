@@ -6320,6 +6320,80 @@ means "clear the sort" — one target cannot mean two things.
   the cap are **kept**, never hidden — hiding rows on the strength of a list that stopped early would
   remove data the user was never shown a checkbox for.
 
+## 6bq. The filter dropdown, made usable (2026-08-02, v0.50.0)
+
+Four complaints against v0.49.0, all about the dropdown rather than the filtering under it:
+
+> *"on the filter, there's no scroll bar, it shouldn't be the full vertical height of the window...
+> something reasonable"* — *"when you click it the menu goes away and it doesn't look like it actually
+> filters anything"* — *"there should also be a search bar of sorts in this menu of the column
+> choices... it's annoying to scroll to find the one you need"*
+
+### The click bug was a reopen bug
+
+`.Table_Filter_Open` re-scanned the column and re-ticked every value **on every invocation**, and the
+command that ticks a row reopens the dropdown. So a tick was applied and then immediately erased by
+the reopen — the grid really did filter, for less than a frame. It now early-returns when the same
+column already has a live filter, and only the dropdown is reopened.
+
+The other half was `menu_hit_test` closing the menu on any pick. `command_keeps_menu_open` names the
+two commands that must not (`.Table_Filter_Toggle`, `.Table_Filter_All`) — a checkbox list you have to
+reopen after every tick is not a checkbox list.
+
+### The row cap applies to generated lists only, and menutest is why
+
+`MENU_MAX_ROWS` (12) shipped unconditional in the first build of this fix. The **Edit** menu is twelve
+commands and five separators — fourteen rows' worth — so Font became an unreachable row again, which
+is the precise bug the `more_above`/`more_below` arrows were added for. `menutest`'s hover probe caught
+it within the same sweep.
+
+The cap now applies only when `menu_is_filter_dropdown` holds. A hand-written menu cannot run away —
+a person typed every row of it — and only the window-height clamp has ever applied there. Both halves
+are pinned: `menutest` asserts every bar menu gets its full height on a tall window, `tablesorttest`
+asserts a sixty-value list is capped at twelve rows on a 2000px one. Reapplying the cap
+unconditionally fails the first; removing it fails the second.
+
+With a cap there is finally something to scroll, so the dropdown grew a proportional scrollbar
+(drawn, not draggable — the wheel and arrows are how you move) and `menu_wheel`, which is the mouse
+route into `menu.top` that the scroll state had lacked since the day it was written.
+
+### The search box is an ITEM, not a band
+
+`Menu_Item.text` makes a `.None` row a **label** instead of a rule. That one field is the whole
+mechanism: `item_enabled` already refuses `.None`, `menu_item_at` already returns −1 for it, and
+`menu_step` already walks past it — so the search box is un-pickable, un-highlightable and correctly
+clipped without a line of new machinery.
+
+A band above the rows was the alternative and would have threaded its height through
+`menu_dropdown_rect`, the draw, the hit-test, `rows_fitting`, `menu_wheel` and `menu_scroll_to_item`.
+Six consumers of one coordinate is the shape of every seam bug in this file. `item_h` is the only
+procedure that learned anything, and sabotaging it back to separator height fails four assertions —
+including *a click on the first value row hit-tests to it (4, want 3)*, which is a tick landing on the
+wrong value.
+
+**The payload is the true value index, never the row's position.** A search that hides rows therefore
+cannot make a click tick the wrong value. Sabotaged to a running position, five assertions fail.
+
+Typing routes through `menu_filter_query_rune`, checked **first** in main.odin's character drain — the
+dropdown is on top of everything and, unlike a bar menu, has a field. Backspace needs its own
+`.Menu_Search_Back` command rather than a `.Menu`-context binding of `.Backspace`: main.odin closes the
+menu on any non-menu chord, so binding the editor's Backspace here would dismiss the dropdown *and*
+delete a character from the document behind it. Both refuse when there is nothing to take, so an open
+menu never silently eats an edit.
+
+`(Select All)` is deliberately **not** filtered by the query — "type three letters, Select All" means
+all of the matches, which is the operation the search exists to make possible. The query is cleared on
+every open and close; a stale one would silently pre-filter the next column with a word that has
+nothing to do with it, and `tablesorttest` fails on one leftover byte.
+
+### Owed
+
+- The search row scrolls off the top like any other row. Pinning it would mean the draw emitting a row
+  the hit-test computes differently, which is the trade this design exists to refuse. Revisit only if
+  a long list makes it actually annoying.
+- The match is ASCII case folding, hand-rolled. A Unicode fold is a table this layer has no business
+  carrying; the values are the column's own text.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

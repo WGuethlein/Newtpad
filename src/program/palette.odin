@@ -109,7 +109,7 @@ command_in_palette :: proc(cmd: Command_Id) -> bool {
 	     .Find_Close, .Find_Backspace, .Find_Paste, .Find_Confirm, .Find_Field_Toggle,
 	     .Find_Filter_Page_Up, .Find_Filter_Page_Down,
 	     // Menu navigation verbs are plumbing, not commands a user runs.
-	     .Menu_Close, .Menu_Next, .Menu_Prev, .Menu_Item_Next, .Menu_Item_Prev, .Menu_Activate,
+	     .Menu_Close, .Menu_Next, .Menu_Prev, .Menu_Item_Next, .Menu_Item_Prev, .Menu_Activate, .Menu_Search_Back,
 	     // Settings navigation likewise. Settings_Open stays — a real destination.
 	     .Settings_Close, .Settings_Next, .Settings_Prev, .Settings_Toggle, .Settings_Inc, .Settings_Dec,
 	     // Font page navigation; Font_Open stays listed.

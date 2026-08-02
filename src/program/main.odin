@@ -505,6 +505,14 @@ main :: proc() {
 		// Drain input once per frame: typed characters route to the find field or
 		// the document; key chords resolve to a command in the active context.
 		for i in 0 ..< window.char_count {
+			// A FILTER DROPDOWN TAKES TYPING FIRST. *"there should also be a search
+			// bar of sorts in this menu of the column choices... it's annoying to
+			// scroll to find the one you need"* (Wyatt, v0.49.0). It is checked
+			// ahead of every other consumer because the dropdown is on top of all of
+			// them and, unlike a bar menu, it has a field to type into.
+			if menu_filter_query_rune(&app, window.chars[i]) {
+				continue
+			}
 			if doc.kind != .Text {
 				// the settings page has no text fields; swallow typing
 			} else if app.palette.active {
@@ -1297,6 +1305,12 @@ main :: proc() {
 		// The wheel scrolls even with Ctrl held: Ctrl is the link-highlight modifier,
 		// so Ctrl+wheel is how you scroll through a document while its links are lit.
 		// Zoom lives on the keyboard instead (Ctrl+= / Ctrl+- / Ctrl+0) and Settings.
+		// An open dropdown takes the wheel before the document does -- it is on top
+		// of the content and the pointer is over it. Without this the list under the
+		// cursor sat still while the file behind it scrolled.
+		if window.scroll_delta != 0 && menu_wheel(&app, &text, int(window.scroll_delta), f32(window.width), f32(window.height)) {
+			window.scroll_delta = 0
+		}
 		if window.scroll_delta != 0 {
 			// The preview pane scrolls in PIXELS (9.1 item 4). Dispatch is by PANE,
 			// not by mode -- md_pane_owns, the same producer the link hit-test uses

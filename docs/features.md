@@ -302,6 +302,16 @@ file.
   descending, *Then by* ascending / descending, Remove from sort and Clear sort, with the rows that
   cannot apply greyed rather than hidden. Each sorted column draws its own arrow, with a precedence
   digit once there are two. The limit is two keys, and the summary row says so when you reach it.
+- **Filter a column by its values.** The same header menu carries *Filter by this column*, which opens a
+  checkbox list of the column's distinct values, Excel-style: untick a value to hide its rows, `(Select
+  All)` toggles everything (and, when everything is showing, hides everything — which is what you press
+  before picking two values out of two hundred). **Type to search the list** rather than scrolling it;
+  Backspace edits the search, and `(Select All)` then means all of the matches. The dropdown is capped
+  at twelve rows with a scrollbar and the wheel scrolls it. Filtering composes with the sort, an edit
+  resolves to the row you can see rather than the one underneath it, and the summary row says how many
+  rows are **hidden** beside the file's own count. Past 100,000 rows it refuses, on the sort's limit and
+  for the sort's reason; a column with more than 512 distinct values stops listing them and hides
+  nothing it did not show you a checkbox for.
 - **A row-number gutter**, 56px and right-aligned, with the current row brighter. A row whose absolute
   number cannot be known — one still being indexed, or the continuation of a line over 8 KB — draws no
   number rather than a guess.

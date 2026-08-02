@@ -6009,27 +6009,30 @@ when NEWTPAD_TESTS {
 		li_chk(bad, table_filtered(d), "the Filter row opens a filter on the column the menu was on")
 		li_chk(bad, a.menu.ctx, "...and reopens the dropdown as the value list")
 
-		// One row per distinct value plus (Select All) and a separator.
+		// One row per distinct value plus the search box, (Select All) and a
+		// separator.
 		items := menu_filter_items(&a)
-		li_chk(bad, len(items) == 5, fmt.tprintf("the dropdown has (Select All), a separator and three values (%d rows)", len(items)))
-		li_chk(bad, items[0].cmd == .Table_Filter_All, "...with (Select All) first")
+		li_chk(bad, len(items) == 6, fmt.tprintf("the dropdown has a search box, (Select All), a separator and three values (%d rows)", len(items)))
+		li_chk(bad, items[0].cmd == .None && items[0].text != "", fmt.tprintf("...with the search box first, and un-pickable (%q)", items[0].text))
+		li_chk(bad, !item_enabled(&a, items[0]), "...so no click and no keyboard step can land on it")
+		li_chk(bad, items[1].cmd == .Table_Filter_All, "...and (Select All) above the values")
 		// EACH VALUE ROW KNOWS WHICH VALUE IT IS, through payload -- the whole
 		// reason Menu_Item grew that field.
-		li_chk(bad, items[2].payload == 0 && items[3].payload == 1 && items[4].payload == 2, fmt.tprintf("...and each value row carries its own index (%d, %d, %d)", items[2].payload, items[3].payload, items[4].payload))
-		li_chk(bad, menu_item_label(&a, items[2]) == "b", fmt.tprintf("...whose label is the value, not the command's title (%q)", menu_item_label(&a, items[2])))
+		li_chk(bad, items[3].payload == 0 && items[4].payload == 1 && items[5].payload == 2, fmt.tprintf("...and each value row carries its own index (%d, %d, %d)", items[3].payload, items[4].payload, items[5].payload))
+		li_chk(bad, menu_item_label(&a, items[3]) == "b", fmt.tprintf("...whose label is the value, not the command's title (%q)", menu_item_label(&a, items[3])))
 		all_ticked := true
 		for it in items {
 			if it.cmd == .Table_Filter_Toggle && !it.checked(&a, it) {all_ticked = false}
 		}
 		li_chk(bad, all_ticked, "every value starts ticked")
-		li_chk(bad, items[0].checked(&a, items[0]), "...so (Select All) is ticked too")
+		li_chk(bad, items[1].checked(&a, items[1]), "...so (Select All) is ticked too")
 
 		// Toggling one row hides its rows. The payload travels through the menu the
 		// way ctx_col does, so this drives it the same way a click would.
 		a.menu.ctx_payload = 0 // the value "b"
 		command_dispatch(.Table_Filter_Toggle, {}, &a, nil, &t, 10)
 		li_chk(bad, table_sort_rows(d) == 2, fmt.tprintf("unticking a value hides its rows (%d left)", table_sort_rows(d)))
-		li_chk(bad, !items[0].checked(&a, items[0]), "...and (Select All) is no longer ticked")
+		li_chk(bad, !items[1].checked(&a, items[1]), "...and (Select All) is no longer ticked")
 
 		// (Select All) is a three-way control: ticked means everything shows, so
 		// pressing it while ticked hides everything. Pressing it here -- with one
@@ -6051,9 +6054,127 @@ when NEWTPAD_TESTS {
 		li_chk(bad, strings.contains(text, "2 hidden"), fmt.tprintf("...and how many rows it is not showing (%q)", text))
 		li_chk(bad, strings.contains(text, "4 rows"), "...beside the file's own count, so the two reconcile")
 
+		// -- THE CLICK ITSELF, through menu_hit_test ---------------------------
+		//
+		// Everything above drives command_dispatch directly, which proves the
+		// commands work and says NOTHING about whether clicking a row reaches them.
+		// Wyatt: *"when you click it the menu goes away and it doesn't look like it
+		// actually filters anything"* -- so this drives the real hit-test at the
+		// real row coordinates and asserts both halves: the command AND the payload.
+		{
+			ht: plat.Text
+			if plat.text_load_faces(&ht) {
+				command_dispatch(.Table_Filter_Clear, {}, &a, nil, &t, 10)
+				// Anchored where a real header cell is -- BELOW the menu bar's band.
+				// menu_hit_test claims that band for the bar before it looks at any
+				// dropdown (the v0.43.0 tab-menu bug), so an anchor of 0,0 here would
+				// reproduce that instead of whatever is actually wrong.
+				menu_open_ctx(&a, table_header_menu_items, 20, TAB_STRIP_H + MENU_BAR_H + 40, 0)
+				menu_close(&a)
+				command_dispatch(.Table_Filter_Open, {}, &a, nil, &ht, 10)
+				W, H := f32(1200), f32(900)
+				rows := menu_items(&a)
+				li_chk(bad, len(rows) == 6, fmt.tprintf("precondition: the value dropdown is open (%d rows)", len(rows)))
+				x0, y0, w, _ := menu_dropdown_rect(&ht, &a, W, H)
+				// Row 3 is the first VALUE row (search box, (Select All), separator,
+				// then values). The offsets come from item_h's own rule, so a change
+				// to the search row's height fails here rather than silently clicking
+				// a different row -- which is the divergence this block exists for.
+				ry := y0 + sx(1) + MENU_ITEM_H * 2 + MENU_ITEM_H * 0.4 + MENU_ITEM_H * 0.5
+				win: plat.Window
+				win.mouse_pressed = true
+				win.mouse_x, win.mouse_y = i32(x0 + w * 0.5), i32(ry)
+				idx := menu_item_at(&ht, &a, f32(win.mouse_x), f32(win.mouse_y), W, H)
+				li_chk(bad, idx == 3, fmt.tprintf("a click on the first value row hit-tests to it (%d, want 3)", idx))
+				cmd, consumed := menu_hit_test(&a, &ht, &win, W, H)
+				li_chk(bad, consumed && cmd == .Table_Filter_Toggle, fmt.tprintf("...and the click yields the toggle command (%v, consumed %v)", cmd, consumed))
+				li_chk(bad, a.menu.ctx_payload == 0, fmt.tprintf("...carrying that row's own value index (%d)", a.menu.ctx_payload))
+				command_dispatch(cmd, {}, &a, nil, &ht, 10)
+				li_chk(bad, table_sort_rows(d) == 2, fmt.tprintf("...and the grid really loses the rows (%d of 4)", table_sort_rows(d)))
+
+				// A CLICK ON THE SEARCH BOX ITSELF does nothing -- it is a field, not a
+				// row. Without item_h giving it a full row this coordinate lands on
+				// (Select All) instead, which would hide every row in the file on a
+				// click meant to focus a text box.
+				sy := y0 + sx(1) + MENU_ITEM_H * 0.5
+				li_chk(bad, menu_item_at(&ht, &a, f32(win.mouse_x), sy, W, H) == -1, "a click on the search box picks nothing")
+			}
+		}
+
+		// -- TYPING IN THE SEARCH BOX -----------------------------------------
+		//
+		// *"there should also be a search bar of sorts in this menu of the column
+		// choices... it's annoying to scroll to find the one you need"* (Wyatt,
+		// v0.49.0). Driven through menu_filter_query_rune, which is the same entry
+		// point main.odin's character drain uses.
+		{
+			st: plat.Text
+			command_dispatch(.Table_Filter_Clear, {}, &a, nil, &st, 10)
+			menu_open_ctx(&a, table_header_menu_items, 20, TAB_STRIP_H + MENU_BAR_H + 40, 0)
+			menu_close(&a)
+			command_dispatch(.Table_Filter_Open, {}, &a, nil, &st, 10)
+			li_chk(bad, menu_is_filter_dropdown(&a), "precondition: the value dropdown is open")
+
+			taken := menu_filter_query_rune(&a, 'C') // upper case, against a lower-case value
+			shown := menu_items(&a)
+			li_chk(bad, taken, "a typed character goes to the search box, not the document")
+			li_chk(bad, len(shown) == 4, fmt.tprintf("typing narrows the list to the matches (%d rows: box, All, sep, c)", len(shown)))
+			li_chk(bad, len(shown) == 4 && menu_item_label(&a, shown[3]) == "c", fmt.tprintf("...case-insensitively (%q)", menu_item_label(&a, shown[3])))
+			li_chk(bad, len(shown) == 4 && shown[3].payload == 2, fmt.tprintf("...and the surviving row keeps its TRUE value index, not its new position (%d, want 2)", shown[3].payload))
+			li_chk(bad, strings.contains(shown[0].text, "C"), fmt.tprintf("...with the query on screen (%q)", shown[0].text))
+
+			// The narrowed row still toggles the right value. This is what the payload
+			// separation buys: position 3 is value 2, and a filter that read position
+			// would hide "b" instead.
+			a.menu.ctx_payload = shown[3].payload
+			command_dispatch(.Table_Filter_Toggle, {}, &a, nil, &st, 10)
+			li_chk(bad, table_sort_rows(d) == 3, fmt.tprintf("ticking a searched row hides ITS rows (%d of 4)", table_sort_rows(d)))
+			li_chk(bad, ts_order(d) == "b,1|a,2|b,3", fmt.tprintf("...which are c's, not whatever sits at that position unfiltered (%q)", ts_order(d)))
+
+			// Backspace empties the box and everything comes back.
+			li_chk(bad, menu_filter_query_back(&a), "Backspace edits the search box")
+			li_chk(bad, len(menu_items(&a)) == 6, fmt.tprintf("...and clearing it restores every row (%d)", len(menu_items(&a))))
+			li_chk(bad, !menu_filter_query_back(&a), "...and an empty box refuses it, so Backspace still means Backspace")
+			li_chk(bad, table_sort_rows(d) == 3, "the search never touched the TICKS -- clearing it does not un-hide rows")
+
+			// The query is per-open: a stale one would silently pre-filter the next
+			// column's values with a word that has nothing to do with them.
+			menu_filter_query_rune(&a, 'b')
+			menu_close(&a)
+			li_chk(bad, a.menu.query_len == 0, fmt.tprintf("closing the menu empties the search box (%d bytes left)", a.menu.query_len))
+			command_dispatch(.Table_Filter_Clear, {}, &a, nil, &st, 10)
+		}
+
 		command_dispatch(.Table_Filter_Clear, {}, &a, nil, &t, 10)
 		li_chk(bad, !table_filtered(d), "Clear Filter turns it off")
 		li_chk(bad, !strings.contains(table_summary_text(d), "filtered"), "...and the summary stops claiming it")
+
+		// -- AND THE CAP, which is what the generated list has that a hand-written
+		//    menu does not: *"it shouldn't be the full vertical height of the
+		//    window... something reasonable"* (Wyatt, v0.49.0). menutest owns the
+		//    other half -- that a bar menu is NOT capped.
+		{
+			ct: plat.Text
+			if plat.text_load_faces(&ct) {
+				sb := strings.builder_make()
+				defer strings.builder_destroy(&sb)
+				fmt.sbprint(&sb, "k,v\n")
+				for i in 0 ..< 60 {fmt.sbprintf(&sb, "val%02d,%d\n", i, i)}
+				b := ts_menu_app(strings.to_string(sb), 2)
+				defer app_destroy(&b)
+				bd := app_active(&b)
+				doc_index_start(bd)
+				for !doc_index_done(bd) {}
+				menu_open_ctx(&b, table_header_menu_items, 20, TAB_STRIP_H + MENU_BAR_H + 40, 0)
+				menu_close(&b)
+				command_dispatch(.Table_Filter_Open, {}, &b, nil, &ct, 10)
+				H := f32(2000) // a window with room for all sixty, so only the cap can shorten it
+				_, _, _, h := menu_dropdown_rect(&ct, &b, 1280, H)
+				li_chk(bad, len(menu_items(&b)) == 63, fmt.tprintf("precondition: sixty values in the dropdown (%d rows)", len(menu_items(&b))))
+				li_chk(bad, h <= MENU_MAX_ROWS * MENU_ITEM_H, fmt.tprintf("a generated list is capped in rows, not by the window (%.0f, cap %.0f)", h, MENU_MAX_ROWS * MENU_ITEM_H))
+				li_chk(bad, menu_visible_rows(&ct, &b, 1280, H) < len(menu_items(&b)), "...so there is something to scroll, which is what the scrollbar draws")
+			}
+		}
 	}
 
 	// THE DATA-LOSS SEAM. table_row_start is what the cell editor resolves a byte
@@ -10197,6 +10318,29 @@ when NEWTPAD_TESTS {
 			}
 			fmt.printfln("  draw/hit agree at every height: %v %s", dh_bad == 0, "OK" if dh_bad == 0 else "FAIL")
 			bad += dh_bad
+
+			// THE ROW CAP IS FOR GENERATED LISTS ONLY, and this is what pins that.
+			// MENU_MAX_ROWS shipped unconditional for one build and clipped Edit
+			// (twelve commands and five separators = fourteen rows' worth) on a window
+			// with room to spare -- the same "Font is unreachable" bug the scroll
+			// arrows exist for, reintroduced by a constant meant for something else.
+			fmt.println("--- a hand-written menu is never capped by MENU_MAX_ROWS ---")
+			cap_bad := 0
+			for mi in 0 ..< len(menus) {
+				content := f32(0)
+				for it in menus[mi].items {content += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
+				menu_open_at(&a, mi)
+				// A window with room for the whole menu twice over: whatever is short
+				// here is short because of a cap, not because of the window.
+				_, _, _, hh := menu_dropdown_rect(&t, &a, 1280, TAB_STRIP_H + MENU_BAR_H + content * 2 + sx(40))
+				if hh < content {
+					cap_bad += 1
+					fmt.printfln("  %-5s needs %.0f, got %.0f  FAIL", menus[mi].title, content, hh)
+				}
+				menu_close(&a)
+			}
+			fmt.printfln("  every bar menu gets its full height on a tall window: %v %s", cap_bad == 0, "OK" if cap_bad == 0 else "FAIL")
+			bad += cap_bad
 
 			// --- the flip-up, on a context menu anchored near the bottom -------
 			//
