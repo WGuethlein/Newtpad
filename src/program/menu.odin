@@ -763,9 +763,10 @@ menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^
 menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^App, width, height: f32) {
 	items := menu_items(app)
 	cw := plat.text_char_width(t, UI_PX)
-	_, y0 := menu_origin(t, app)
-	// Same geometry the hit-test uses — see menu_dropdown_rect.
-	x0, dw, h := menu_dropdown_rect(t, app, width, height)
+	// Same geometry the hit-test uses, y included — see menu_dropdown_rect. This
+	// used to take y from menu_origin and only x/w/h from the rect, which is what
+	// made a flip-up impossible to add safely.
+	x0, y0, dw, h := menu_dropdown_rect(t, app, width, height)
 
 	plat.quads_draw(gfx, qp, []plat.Quad {
 			{pos = {x0 - sx(1), y0}, size = {dw + sx(2), h + sx(2)}, color = g_theme[.Border_Strong]},
@@ -832,26 +833,54 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 // Geometry of the open dropdown. The single source both the draw and the
 // hit-test consume, so they cannot disagree — every seam bug found so far has
 // been a pair of expressions in two different procs.
-menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0, w, h: f32) {
-	if !menu_dropdown_active(app) {return 0, 0, 0}
+// RETURNS y0 AS WELL AS x0, and that is the whole of the flip-up fix rather than
+// a convenience. The draw and the hit-test used to each call menu_origin for
+// their own y and only ask this proc for x/w/h, so a flip computed in one of them
+// would be a menu drawn in one place and clickable in another — CLAUDE.md's one
+// layout per widget, in the exact shape (draw and hit-test deriving the same
+// coordinate separately) that this file's own comments say every seam bug here
+// has taken. Both consumers read y0 from here now.
+menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0, y0, w, h: f32) {
+	if !menu_dropdown_active(app) {return 0, 0, 0, 0}
 	items := menu_items(app)
 	ox, oy := menu_origin(t, app)
 	w = dropdown_w(t, items)
-	for it in items {h += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
-	// Clamped to the window, but the two axes are not the same kind of clamp.
-	// x0 REPOSITIONS: an anchor too close to the right edge slides the whole
-	// dropdown left so it still fits. h only CAPS height from the origin down
-	// — an anchor near the bottom does not flip the dropdown upward or scroll
-	// it into view, it just shrinks toward one row, which floors at
-	// MENU_ITEM_H and is drawn mostly off the bottom edge (not a click hazard:
-	// menu_item_at requires my < height, so the hidden part is not
-	// clickable — this is a visibility bug, not a safety one). A flip-up is
-	// owed if a context-menu anchor is ever near the bottom; it is not
-	// implemented. Column headers (the intended caller) sit at the top of the
-	// grid, so today's only caller of ctx_x/ctx_y does not reach this case —
-	// that is why leaving it uncapped-vertically is acceptable, not why it is
-	// fixed.
-	h = min(h, max(MENU_ITEM_H, height - oy - sx(4)))
+	full := f32(0)
+	for it in items {full += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
+
+	// Clamped to the window, and the two axes still are not the same kind of
+	// clamp. x0 REPOSITIONS: an anchor too close to the right edge slides the
+	// whole dropdown left so it still fits. y0 FLIPS: when the room below the
+	// anchor cannot hold the menu and there is more room above it, the menu's
+	// BOTTOM edge goes at the anchor instead of its top.
+	//
+	// This used to cap downward only, and the comment here said a flip-up was
+	// owed "if a context-menu anchor is ever near the bottom", then argued the
+	// case was unreachable because column headers sit at the top of the grid.
+	// The header does sit at the top of the grid; on a short enough window the
+	// top of the grid IS near the bottom of the window, which is exactly how it
+	// was reached — "it does not scroll, there is no scroll bar in this instance,
+	// and the menu is behind the bottom of window menu items" (Wyatt, live use,
+	// v0.36.0). What was reachable was never about the anchor being unusual.
+	//
+	// `above > below` is what keeps a BAR dropdown from flipping over the menu
+	// bar that opened it: its anchor is TAB_STRIP_H + MENU_BAR_H from the top, so
+	// there is almost never more room above than below, and no special case on
+	// `ctx` is needed to say so. A window short enough to fail that test has no
+	// good answer available in either direction.
+	//
+	// The downward cap still floors at MENU_ITEM_H, and the rows past the cap are
+	// still not clickable (menu_item_at requires my < height), so the residual
+	// case is a visibility one and not a safety one — as before.
+	below := max(0, height - oy - sx(4))
+	above := max(0, oy - sx(4))
+	if full > below && above > below {
+		h = min(full, max(MENU_ITEM_H, above))
+		y0 = max(0, oy - h)
+	} else {
+		h = min(full, max(MENU_ITEM_H, below))
+		y0 = oy
+	}
 	x0 = min(ox, max(0, width - w))
 	return
 }
@@ -867,7 +896,7 @@ item_h :: proc(it: Menu_Item) -> f32 {return MENU_ITEM_H if it.cmd != .None else
 // this codebase keeps producing.
 menu_visible_rows :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> int {
 	if !menu_dropdown_active(app) {return 0}
-	_, _, h := menu_dropdown_rect(t, app, width, height)
+	_, _, _, h := menu_dropdown_rect(t, app, width, height)
 	return rows_fitting(menu_items(app), app.menu.top, h)
 }
 
@@ -918,9 +947,11 @@ menu_scroll_to_item :: proc(app: ^App, items: []Menu_Item, h: f32) {
 // at that height — Save, Reload or Exit among them.
 menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> int {
 	if !menu_dropdown_active(app) {return -1}
-	x0, w, h := menu_dropdown_rect(t, app, width, height)
+	x0, oy, w, h := menu_dropdown_rect(t, app, width, height)
 	if mx < x0 || mx >= x0 + w {return -1}
-	_, oy := menu_origin(t, app)
+	// The rect's own y, not menu_origin's: under a flip-up the two differ by the
+	// whole height of the menu, and this is the half that would still have been
+	// hit-testing the un-flipped box.
 	y0 := oy + sx(1)
 	if my < y0 || my >= y0 + h {return -1} // below a clipped dropdown is not a row
 	items := menu_items(app)

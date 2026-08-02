@@ -5430,6 +5430,90 @@ stand" section already records.
 Base tests unchanged at 211. `mdjointest` is new, one-argument, exits non-zero, and is in §7 and
 development-loop §6. 46 headless modes clean; all 18 commits pass the bisectability sweep.
 
+## 6be. What the two live passes actually found (2026-08-01, v0.38.0, branch `live-pass-fixes-v0.38`)
+
+v0.36.0 (multi-column sort) and v0.37.0 (the preview's paragraph model) both shipped with **no live
+GUI pass at all** — this environment cannot inject input — so both went out with a checklist attached.
+Wyatt drove both end to end on 2026-08-01. This entry is the table half of what came back; the
+preview half is queued, not built.
+
+**The single most useful outcome is not a fix.** §2's Ctrl+click cycle — the core of v0.36.0, three
+gestures no test can observe — was left unchecked with no note, which read as a failure and was
+scoped as one. It was "I missed that section but they all worked." A blank checkbox is not a report,
+and asking cost one question where guessing would have cost a batch.
+
+### The four table defects, and what each one really was
+
+**A. A second sort key truncated every header in the grid.** `table_draw`'s header pass asked
+`table_sort_digits_shown` — a *document-wide* predicate — once outside its loop and handed that one
+answer to `table_header_label_col` for every column. The precedence digit is drawn on at most two
+columns; the reserve was paid by all of them, so a second key cost every header name **two cells**
+(measured: 8 → 6). Wyatt reported it as "the column headers truncate and don't show the rest of the
+text until you expand the columns, but the column doesn't change horizontal size" — and the column
+genuinely does not, which is what made it confusing. `table_sort_digit_col` answers per column now.
+
+The interesting part is *why the uniform rule was right and still is, for the chevron*. Reserving a
+mark's slot only where it is drawn makes the label re-truncate as the pointer crosses the header —
+text moving under the mouse. That argument is sound for the chevron, which follows hover, and vacuous
+for the digit, which changes only when its own column becomes a key. **One comment covering two marks
+let the weaker case inherit the stronger case's justification.** Worth watching for elsewhere.
+
+**B. The header menu was unreachable on a short window.** `menu_dropdown_rect` capped height downward
+only. Its own comment said a flip-up was owed *"if a context-menu anchor is ever near the bottom"* and
+then argued the case was unreachable because column headers sit at the top of the grid. They do. On a
+short enough window the top of the grid **is** near the bottom of the window. The unreachability
+argument was about the anchor being unusual; what made it reachable was the window being small.
+
+The fix is small and the seam is not: the draw and the hit-test each called `menu_origin` for their
+own y and asked the rect only for x/w/h, so a flip in either alone paints the menu in one place and
+accepts clicks in another. `menu_dropdown_rect` returns `y0` now and both consumers read it.
+Sabotaging exactly that — leaving `menu_item_at` on `menu_origin` — makes all six selectable rows
+hit-test as `-1`, and **the pre-existing drawn-rows-equal-clickable-rows case does not catch it**,
+because nothing in it ever flips. A seam test only covers the states it visits.
+
+**C. Clearing a sort dropped the reader at an arbitrary row.** Every transition except the two that
+*clear* set `doc.top` to the top of the new order. The clear paths deliberately did not, reasoning
+that `doc.top` was "already a real byte offset in the file's own order". It is — the offset of
+whichever row happened to be on top **in sorted order**, which in file order is nowhere in
+particular. Hence "sometimes the bottom, sometimes the middle". *Being valid was never the property
+that mattered; being predictable was.* All four in-grid clear routes go through one producer,
+`table_sort_scroll_top`; the three that clear because the grid is being **left** keep their place,
+which is what the text view wants.
+
+**D. Blanks now follow the arrow** — first ascending, last descending (Wyatt's call). The old comment
+argued "no value is not the smallest value" at length. Half of that argument was always the real one
+and survives: the flag keeps an empty cell out of the *comparison*, which is what stops a numeric key
+parsing it as `0.0` and dropping a blank into the middle of the data. Only which end has changed.
+
+### Two things this batch got wrong
+
+- **A and C share a commit.** Both are `table.odin` and both land against `tablesorttest`; splitting
+  them needed hunk surgery that risked a non-building intermediate, which §5.3 forbids outright. The
+  commit says so. If this recurs, do the two fixes in two passes over the file rather than one.
+- **The header-seam sweep in `tablegridtest` mirrored bug A rather than catching it.** It passed
+  `table_sort_digits_shown(&d)` to `table_header_label_col` for every column — the same document-wide
+  answer the draw used — so it measured the unsorted columns against a label a cell *narrower* than
+  the draw gave them, and the reserve those columns were wrongly paying was invisible to it. **A test
+  that reproduces the production expression cannot falsify it.** It now asks the per-column predicate
+  and counts how many columns the digit checks actually covered, so a predicate that never reserves
+  fails the precondition instead of passing everything.
+
+### Owed
+
+- **E — a sorted cell should re-sort on commit** (Wyatt's call, same pass). Deliberately not in this
+  batch: it touches `table_edit_commit`, the data-loss seam §1 of the live pass exists to cover, and
+  it gets its own spec and its own review.
+- **F — a headerless CSV is still assumed to have a header.** Reported in the same pass. Needs a
+  heuristic and probably a toggle; it is a task, not a fix.
+- **The preview half of the v0.37.0 pass**: a Tab inside a fenced code block draws `.notdef`;
+  dragging the scrollbar ghosts the Split sync while the wheel is clean; a blank line may no longer
+  visibly end a list item. All three are in `docs/reported-bugs.md`.
+- Two items were **answered, not fixed**: trailing-two-spaces for a hard break, and setext turning
+  prose over `---` into a heading. Both are CommonMark and both are what v0.37.0 intended.
+
+Sabotage run on all four fixes, output recorded in the commit messages. 46 headless modes clean; all
+five commits pass the bisectability sweep.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

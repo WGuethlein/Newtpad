@@ -1616,7 +1616,11 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Table_Sort_Remove:
 		if doc != nil && doc.table {table_sort_drop(doc, app.menu.ctx_col)}
 	case .Table_Sort_Clear:
-		if doc != nil && doc.table {table_sort_clear(doc)}
+		// Clears and lands on the file's first row, like the third header click and
+		// like the summary row's own clear (main.odin). Unlike the three paths that
+		// clear because the grid is being LEFT, which keep their place for the text
+		// view -- see table_sort_scroll_top.
+		if doc != nil && doc.table {table_sort_clear(doc);table_sort_scroll_top(doc)}
 	case .Toggle_Preview:
 		// Cycle Off -> Preview -> Split -> Off. The preview scrolls in pixels from
 		// its own anchor (doc.md_top); re-anchoring doc.top to a line start here is
