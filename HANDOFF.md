@@ -6664,6 +6664,59 @@ Sabotaged back to level-triggered: `top 1, dragged to 51`.
   dimensions. Worth doing with the renderer/ui extraction rather than alone.
 - `menu_scroll_last`'s cost, unchanged from §6bs.
 
+## 6bu. The grid ate the drag, and the arrows sat on the bar (2026-08-02, v0.54.0)
+
+> *"clicking the bar works not but not hold and drag, also it looks liek the arrows are underneath
+> it?"* (Wyatt, live use of v0.53.0)
+
+### The drag: a latch that lived outside the struct built to catch it
+
+`ro_surface_swallows` zeroes `window.mouse_down` on every press over a read-only surface, and
+**the grid is one**. `Drag_Latches` exists precisely so a cross-frame drag can veto that — its
+comment records the v0.17.1 bug where `hscroll` was missing from the list and the grid's horizontal
+bar *"moved on click and froze on drag"*. That is verbatim this report, one latch later.
+
+`app.menu.scroll_drag` was never a field of `Drag_Latches`. The press frame worked (the scrollbar runs
+before the swallow), and the swallow killed `mouse_down` before the next frame, so the drag ended
+after exactly one frame. **The filter dropdown only ever opens over the grid, so this was not an edge
+case for it — it was the only path**, which is why the feature looked completely dead rather than
+flaky.
+
+**The guard that should have caught this is real and did not fire, and that is the lesson.**
+`hscrolltest` enumerates every latch and is protected by `#assert(size_of(Drag_Latches) == 5)`, so a
+new *field* cannot go untested. But the assert only fires when the struct changes, and v0.52.0 added
+the latch as `app.menu.scroll_drag` and never touched the struct. **The invariant enforced is "every
+field is tested"; the one needed is "every cross-frame drag latch is a field."** The assert (now 6)
+and the enumeration say so in as many words now. Sabotaged by dropping `menu_scroll` from the
+predicate: `hscrolltest` fails 3/3 and exits 1.
+
+I also swept the wrong list. `hscrolltest` is named in §7's required modes and was not in the
+ten-mode list I had been running from the batch's own plan — so the one mode that covers this exact
+seam went unrun for two releases. The sweep for this batch was the full §7 list, 48 modes.
+
+### The arrows are gone, and that is subtraction rather than relocation
+
+They were drawn at `dw - sx(16)` while the bar's lane starts at `dw - sx(12)`: a muted glyph sitting
+across the thumb's travel, exactly as Wyatt saw. Moving them left would have put them back over row
+text, which is where they already hit-tested to the row behind them (§6br's Owed).
+
+Removing them costs nothing, and that is **checkable rather than a matter of taste**: an arrow drew
+when `top > 0` or `top + rows < len(items)`, and either makes `len(items) > rows` true, which is
+exactly when the scrollbar draws. The arrow set was a strict subset of the bar's, so the bar says
+everything they said and adds how much and where — and now it can be grabbed. They existed because
+for one release there was nothing else to say it.
+
+### What this batch got wrong
+
+- **Three releases to fix one feature**, and each fix exposed the next layer: the row hit-test
+  (§6br) → the draw owning `top` (§6bt) → the frame owning `mouse_down` (here). Each was a different
+  procedure claiming the state the drag needed. A dropdown scrollbar touches the hit-test, the draw
+  and the input phase, and I tested it against one of the three at a time.
+- **The pattern, stated once more because it keeps recurring in this feature:** every one of these
+  was another owner of shared state — `menu.item` vs `top`, the draw vs the input phase, the grid vs
+  the drag. The question that would have found all three on the first pass is *"what else writes
+  this, and who runs last?"*
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

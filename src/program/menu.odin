@@ -1232,8 +1232,6 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	// Keep the highlighted item visible, then draw from the scroll offset.
 	menu_scroll_to_item(app, items, h)
 	app.menu.rows = rows_fitting(items, app.menu.top, h)
-	more_above := app.menu.top > 0
-	more_below := app.menu.top + app.menu.rows < len(items)
 
 	// Items begin one pixel down, inside the border. The bottom bound must be
 	// measured from THAT origin, not from y0: measuring from y0 gave the items
@@ -1291,18 +1289,22 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 		y += MENU_ITEM_H
 	}
 
-	// Say that there is more. Silently truncating is what hid Edit > Font on a
-	// short window.
-	if more_above {
-		plat.text_draw(gfx, t, "▲", x0 + dw - sx(16), y0 + sx(12), UI_SMALL_PX, g_theme[.Text_Muted])
-	}
-	if more_below {
-		plat.text_draw(gfx, t, "▼", x0 + dw - sx(16), y0 + h - sx(4), UI_SMALL_PX, g_theme[.Text_Muted])
-	}
-	// A SCROLLBAR, when there is more than fits. The two arrows above say "there is
-	// more" and say nothing about how much or where you are -- which is fine for a
-	// menu clipped by one row and useless for a generated list of two hundred
-	// values. Proportional thumb, same shape as the document's.
+	// THE ▲/▼ ARROWS ARE GONE, and the scrollbar below is their replacement rather
+	// than their companion. *"it looks like the arrows are underneath it?"* (Wyatt,
+	// v0.53.0) -- they were, literally: drawn at `dw - sx(16)` while the bar's lane
+	// starts at `dw - sx(12)`, so a muted glyph sat across the thumb's travel.
+	//
+	// Moving them left would have put them back over row text, which is where they
+	// already hit-tested to the row behind them (§6br's Owed). Removing them costs
+	// NOTHING, and that is checkable rather than a matter of taste: they appeared
+	// exactly when `top > 0` or `top + rows < len(items)`, and either of those makes
+	// `len(items) > rows` true, which is precisely when the scrollbar draws. The
+	// arrow set was a subset of the bar's, so the bar says everything they said and
+	// adds how much and where. They existed because for one release there was
+	// nothing else to say it -- see menu_wheel's comment on that gap.
+	//
+	// A SCROLLBAR, when there is more than fits. Proportional thumb, same shape as
+	// the document's, and draggable through the same Vbar.
 	//
 	// Drawn, not draggable. The wheel and the arrow keys move the list; a drag
 	// would need its own hit-test inside a surface whose every other pixel already
