@@ -266,6 +266,14 @@ Each of these cost real time at least once.
   falsifiers and measurements rather than pass/fail tests. `menuseam`'s answer moved 14/14 → 12/12
   under a sabotage with the exit code unchanged throughout, so sweep those three by diffing their
   printed line. Check for that shape before adding a guard to a mode.
+- **Read the mode's OUTPUT, not just its exit code — a sabotage judged on the exit code alone can
+  invent debt that does not exist.** On 2026-08-01 a reviewer deleted a real guard in
+  `md_table_bounds`, read `mdtabletest`'s exit code, saw 0, and recorded "this guard is not covered"
+  in HANDOFF §5 as *verified*. The assertion covering it had existed since 2026-07-25 and **was
+  printing `FAIL` the whole time** — the mode simply had no `os.exit` yet. Reproduced in a worktree
+  at that commit (§6bw). The false item then sat in the debt register for two days. Exit codes work
+  now, but the habit is the durable part: a sabotage is confirmed by the FAIL line you can read, not
+  by an integer.
 - **An exit code cannot fail on an assertion nobody counted, and that is a separate bug from a
   missing exit code** — they look identical from outside the process. The 2026-08-01 scan counted
   modes with no `os.exit` and so found 60; the pass that fixed them found **four more where the

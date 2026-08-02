@@ -28932,7 +28932,10 @@ when NEWTPAD_TESTS {
 				saved := md_table_budget
 				md_table_budget = 200 // well under this ~8KB fixture, well over one row
 				assert(md_table_budget > max_row_len, "md_table_budget must clear the fixture's longest row or the forward guard's own-length precondition doesn't hold")
-				doc.md_table = {}
+				// No manual cache clear: md_table_ensure keys on md_table_budget /
+				// md_table_max_rows now, so lowering either MISSES the entries measured
+				// at the production bounds. This line used to be that guarantee, in
+				// seven copies. Reintroduce the omission in the key and this case fails.
 				mid := base.pt_line_start(&doc.pt, doc.pt.length / 2)
 				entry_end := base.pt_line_end_cap(&doc.pt, mid, RENDER_LINE_CAP)
 				c := md_table_ensure(&doc, &t, mid)
@@ -28977,7 +28980,10 @@ when NEWTPAD_TESTS {
 				saved := md_table_budget
 				md_table_budget = 6000 // K; fixture is ~9.3 KB, so K < B <= 2K
 				assert(md_table_budget > max_row_len, "md_table_budget must clear the fixture's longest row or the forward guard's own-length precondition doesn't hold")
-				doc.md_table = {}
+				// No manual cache clear: md_table_ensure keys on md_table_budget /
+				// md_table_max_rows now, so lowering either MISSES the entries measured
+				// at the production bounds. This line used to be that guarantee, in
+				// seven copies. Reintroduce the omission in the key and this case fails.
 				c0 := md_table_ensure(&doc, &t, offs[0])
 				// c0 points INTO doc.md_table -- copy it out (nil-checked) before the
 				// next reset zeroes the slot it points to, or c0v below would read
@@ -29034,7 +29040,10 @@ when NEWTPAD_TESTS {
 			{
 				saved := md_table_max_rows
 				md_table_max_rows = 50
-				doc.md_table = {}
+				// No manual cache clear: md_table_ensure keys on md_table_budget /
+				// md_table_max_rows now, so lowering either MISSES the entries measured
+				// at the production bounds. This line used to be that guarantee, in
+				// seven copies. Reintroduce the omission in the key and this case fails.
 				c := md_table_ensure(&doc, &t, offs[0])
 				md_table_max_rows = saved
 				ok := c != nil && c.oversize && (c.end - c.start) < len(content) / 2
@@ -29065,7 +29074,10 @@ when NEWTPAD_TESTS {
 			{
 				saved := md_table_max_rows
 				md_table_max_rows = 120
-				doc.md_table = {}
+				// No manual cache clear: md_table_ensure keys on md_table_budget /
+				// md_table_max_rows now, so lowering either MISSES the entries measured
+				// at the production bounds. This line used to be that guarantee, in
+				// seven copies. Reintroduce the omission in the key and this case fails.
 				edge := md_table_ensure(&doc, &t, offs[0])
 				edge_ov := edge != nil && edge.oversize
 				doc.md_table = {}

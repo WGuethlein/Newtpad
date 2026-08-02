@@ -641,6 +641,11 @@ Md_Table_Cache :: struct {
 	start:    int, // byte offset of the block's first row
 	end:      int, // offset of the last row's newline (pt_line_end_cap semantics)
 	revision: u64,
+	// The bounds this entry was MEASURED under, and part of its key -- see
+	// md_table_ensure. Md_Para_Cache carries the same two fields for the same
+	// reason; this struct did not, and the difference was a live defect.
+	budget:   int,
+	max_rows: int,
 	oversize: bool, // block exceeded MD_TABLE_BUDGET: fixed columns
 	ncols:    int,
 	widths:   [MD_TABLE_MAX_COLS]int, // cells, excluding padding
@@ -1368,6 +1373,8 @@ md_table_measure :: proc(doc: ^Document, t: ^plat.Text, start, end: int, oversiz
 		start    = start,
 		end      = end,
 		revision = doc.revision,
+		budget   = md_table_budget,
+		max_rows = md_table_max_rows,
 		oversize = oversize,
 	}
 	// Past the budget: fixed columns, and NO SCAN AT ALL. Every column is the same
@@ -1424,9 +1431,26 @@ md_table_measure :: proc(doc: ^Document, t: ^plat.Text, start, end: int, oversiz
 // The per-frame cost is the containment test over MD_TABLE_SLOTS entries; a scan
 // happens only when the viewport enters a block none of the slots cover, or the
 // buffer changed.
+// `md_table_budget` and `md_table_max_rows` are part of the key, not just inputs
+// to the scan. They are runtime variables so a test can drive md_table_bounds
+// into the oversize path on a small fixture, and without them here a lowered
+// budget reads back an entry measured at the production one: same revision, same
+// containing range, wrong bounds. Measured -- dropping this check returns
+// `oversize=false, window=9313` where the lowered budget's answer is a bounded
+// ~4.9 KB window, so an oversize assertion passes on a block that was never
+// measured as oversize.
+//
+// mdtabletest used to defend against this by hand, clearing `doc.md_table`
+// before every budget change. That worked and could not scale: the guarantee
+// lived in seven copies at the call sites instead of in the cache, so a future
+// case that forgot one would silently assert against stale numbers. Md_Para_Cache
+// keyed on its own budget from the start (md_para_run); this is that fix, one
+// cache later.
 md_table_ensure :: proc(doc: ^Document, t: ^plat.Text, p: int) -> ^Md_Table_Cache {
 	for &c in doc.md_table {
-		if c.valid && c.revision == doc.revision && p >= c.start && p < c.end {
+		if !c.valid || c.revision != doc.revision {continue}
+		if c.budget != md_table_budget || c.max_rows != md_table_max_rows {continue}
+		if p >= c.start && p < c.end {
 			return &c
 		}
 	}
