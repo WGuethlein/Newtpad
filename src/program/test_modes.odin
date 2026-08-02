@@ -4087,7 +4087,15 @@ when NEWTPAD_TESTS {
 			chk(&bad, !json_format_too_large(0), "an empty buffer is never refused for size")
 		}
 
-		fmt.println("-- the menu row is gated on the file type --")
+		fmt.println("-- who is offered the command, and the keybind --")
+		{
+			// Ctrl+Alt+F resolves to it, and Ctrl+F still means Find. VS Code's
+			// Shift+Alt+F cannot be expressed here (Binding has no shift field, the
+			// same reason Save As is Ctrl+Alt+S), so this is the nearest neighbour --
+			// and a chord that silently shadowed Find would be the worst outcome.
+			chk(&bad, resolve_key(.F, true, true, .Editor) == .Format_Json, fmt.tprintf("Ctrl+Alt+F formats (%v)", resolve_key(.F, true, true, .Editor)))
+			chk(&bad, resolve_key(.F, true, false, .Editor) == .Find_Open, fmt.tprintf("...and Ctrl+F is still Find (%v)", resolve_key(.F, true, false, .Editor)))
+		}
 		{
 			// Plain zero-value Documents with a borrowed path. NOT doc_from_content
 			// with the path reassigned afterwards: that sets path_owned, and doc_close
@@ -4097,10 +4105,14 @@ when NEWTPAD_TESTS {
 			d.kind = .Text
 			d.path = "C:\\x.json"
 			chk(&bad, doc_can_json(&d), "a .json is offered the command")
+			// ANY TEXT DOCUMENT, whatever the extension. This used to be `.json`
+			// only, which excluded the .log file the request was illustrated with --
+			// see doc_can_json. Pressing it on something that is not JSON is not a
+			// failure: it says so and puts the caret on the first byte that is not.
+			d.path = "C:\\one-huge-line.log"
+			chk(&bad, doc_can_json(&d), "...so is the .log file this feature was asked for")
 			d.path = "C:\\x.txt"
-			chk(&bad, !doc_can_json(&d), "...a .txt is not")
-			d.path = "C:\\x.jsonc"
-			chk(&bad, !doc_can_json(&d), "...and neither is .jsonc, which permits comments the formatter refuses")
+			chk(&bad, doc_can_json(&d), "...and a .txt, which is where pasted JSON usually lands")
 			// An UNTITLED buffer is offered it, and that is deliberate rather than a
 			// leak: path_has_ext answers true for an empty path on the stated rule
 			// that "a new/untitled buffer is allowed into any view -- you don't know

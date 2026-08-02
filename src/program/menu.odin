@@ -231,10 +231,10 @@ menus := []Menu {
 			{cmd = .Find_Replace_All, enabled = has_doc},
 			{cmd = .Goto_Line, enabled = has_doc},
 			sep,
-			// Greyed on anything that is not a .json, with the reason shown in the
-			// accelerator column -- the same treatment Table View and Preview get
-			// for the same reason: a row that is dead with no explanation is
-			// indistinguishable from a broken one.
+			// Live on any text document, not just a .json: the request was
+			// illustrated with a .log file, and an extension gate excluded it. See
+			// doc_can_json. Pressing it on something that is not JSON says so and
+			// puts the caret on the first byte that is not.
 			{cmd = .Format_Json, enabled = can_json},
 			sep,
 			{cmd = .Font_Open},
@@ -634,8 +634,6 @@ command_disabled_hint :: proc(cmd: Command_Id) -> string {
 		return "CSV and TSV only"
 	case .Toggle_Preview:
 		return "Markdown files only"
-	case .Format_Json:
-		return ".json files only"
 	case .Reopen_UTF8, .Reopen_UTF16LE, .Reopen_CP1252:
 		return "unsaved file"
 	case .Table_Sort_Then_Asc, .Table_Sort_Then_Desc:
@@ -657,8 +655,6 @@ item_disabled_reason :: proc(app: ^App, it: Menu_Item) -> string {
 		if d != nil && d.kind == .Text && !doc_can_table(d) {return command_disabled_hint(it.cmd)}
 	case .Toggle_Preview:
 		if d != nil && d.kind == .Text && !doc_can_markdown(d) {return command_disabled_hint(it.cmd)}
-	case .Format_Json:
-		if d != nil && !doc_can_json(d) {return command_disabled_hint(it.cmd)}
 	case .Reopen_UTF8, .Reopen_UTF16LE, .Reopen_CP1252:
 		if d != nil && d.path == "" {return command_disabled_hint(it.cmd)}
 	case .Tab_Reveal, .Tab_Copy_Path:

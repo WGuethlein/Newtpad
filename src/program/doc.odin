@@ -415,8 +415,24 @@ JSON_FORMAT_MAX :: 256 * 1024 * 1024
 // three quarters of a gigabyte of transient allocation per run.
 json_format_too_large :: proc(n: int) -> bool {return n > JSON_FORMAT_MAX}
 
+// Documents Format JSON will act on: ANY text document, whatever its extension.
+//
+// It was `.json` only, and that was wrong for the reason the request itself gives.
+// Wyatt asked for this on 2026-07-30 illustrating it with **a `.log` file that is
+// one enormous unreadable line** -- so the extension gate excluded the motivating
+// example. An extension is a good gate for a VIEW, where entering the wrong one
+// wastes a keystroke and nothing else; it is the wrong gate for a command whose
+// failure is already informative. JSON turns up in `.log`, in `.txt`, in a scratch
+// buffer pasted from a terminal, and in files with no extension at all.
+//
+// The cost of being permissive is one live menu row on a file that is not JSON --
+// and pressing it says "not valid JSON" and puts the caret on the first byte that
+// is not, which is an answer rather than a failure. The cost of the gate was that
+// the feature did not work on the file it was built for.
+//
+// Pseudo-tabs (Settings, Font) are still excluded: they are not documents.
 doc_can_json :: proc(doc: ^Document) -> bool {
-	return doc != nil && doc.kind == .Text && path_has_ext(doc.path, {".json"})
+	return doc != nil && doc.kind == .Text
 }
 
 doc_can_table :: proc(doc: ^Document) -> bool {

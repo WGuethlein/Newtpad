@@ -391,6 +391,11 @@ default_bindings := []Binding {
 	{.L, true, false, .Editor, .Filter_Open}, // Ctrl+L opens find with the filter armed
 	{.G, true, false, .Editor, .Goto_Line}, // Ctrl+G
 	{.S, true, true, .Editor, .Save_As}, // Ctrl+Alt+S (Ctrl+Shift+S can't be expressed: shift isn't part of a chord)
+	// Ctrl+Alt+F. VS Code's Format Document is Shift+Alt+F and that cannot be
+	// expressed here -- Binding has no `shift` field, the same reason Save As is
+	// Ctrl+Alt+S rather than Ctrl+Shift+S -- so this is its nearest expressible
+	// neighbour, and it keeps the F. Ctrl+F is Find and stays that way.
+	{.F, true, true, .Editor, .Format_Json},
 	// The two replace verbs, declared in .Editor and NOT in .Find, deliberately.
 	// resolve_key falls the Find context back to the editor keymap for modified
 	// chords (see its comment), so one row here binds the chord in both places --

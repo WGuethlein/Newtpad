@@ -6113,6 +6113,35 @@ piping through `Out-Null`, once building from Bash with output discarded — and
 conclusion drawn from the stale binary was wrong. The rule is not about the shell; it is that a
 sabotage result is only evidence if the binary is known to be new.
 
+## 6bm. Format JSON gets a chord, and stops being gated on `.json` (2026-08-02, v0.46.0)
+
+*"json formatting worked, it needs a keybind though"* — **Ctrl+Alt+F**.
+
+VS Code's Format Document is Shift+Alt+F and **that cannot be expressed here**: `Binding` has no
+`shift` field, which is the same reason Save As is Ctrl+Alt+S rather than Ctrl+Shift+S. Ctrl+Alt+F is
+its nearest expressible neighbour and keeps the F. Only Ctrl+Alt+Enter and Ctrl+Alt+S were taken.
+
+### The extension gate was wrong, and the request said so
+
+Adding the chord surfaced it: the command was gated on `doc_can_json`, which meant `.json` only — and
+Wyatt's original request was illustrated with **a `.log` file that is one enormous unreadable line**.
+The gate excluded the motivating example.
+
+An extension is a good gate for a **view**, where entering the wrong one wastes a keystroke and
+nothing else. It is the wrong gate for a command whose failure is already informative: pressing this
+on something that is not JSON says so and puts the caret on the first byte that is not. JSON turns up
+in `.log`, in `.txt`, in a scratch buffer pasted from a terminal, and in files with no extension.
+`doc_can_json` is now "any text document", the `.jsonc` carve-out is gone with it, and the disabled
+reason it carried is deleted rather than left saying something untrue.
+
+### A latent hazard noticed while sabotaging
+
+Binding Format to Ctrl+F (to check the test could fail) did **not** shadow Find — `resolve_key`
+returns the FIRST match and Find_Open is declared earlier, so the duplicate was simply dead. That is
+a silent outcome either way: a hand-written keymap that duplicates an existing chord gets no
+diagnostic, it just does nothing. Not fixed, and worth knowing before someone debugs a binding that
+"does not work".
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
