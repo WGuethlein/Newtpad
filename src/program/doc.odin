@@ -407,13 +407,75 @@ doc_is_markdownish :: proc(doc: ^Document) -> bool {
 //
 // Refusing loudly rather than freezing is the house style: table_sort_build
 // refuses past 100,000 rows and the summary row says so.
-JSON_FORMAT_MAX :: 256 * 1024 * 1024
+FORMAT_MAX :: 256 * 1024 * 1024
 
 // Is `n` bytes too much to format? Split out so the boundary is testable without
 // allocating a quarter-gigabyte fixture on every sweep -- which is what the test
 // that drove the command end to end had to do, and at 256 MB that is roughly
 // three quarters of a gigabyte of transient allocation per run.
-json_format_too_large :: proc(n: int) -> bool {return n > JSON_FORMAT_MAX}
+format_too_large :: proc(n: int) -> bool {return n > FORMAT_MAX}
+
+// Which formatter Format Document will run.
+Format_Kind :: enum {
+	None,
+	Json,
+	Css,
+	Xml,
+}
+
+// Pick the formatter for `doc`: the EXTENSION first, then the first non-space
+// byte of the buffer.
+//
+// The sniff is not a nicety, it is the original request. Wyatt asked for this with
+// **a `.log` file that is one enormous unreadable line** -- there is no extension
+// to go on, and a command that only worked on `.json` excluded the file it was
+// built for. It also covers a scratch buffer pasted from a terminal, which has no
+// path at all.
+//
+// Extension WINS over content, so a `.json` whose first byte is junk still gets
+// the JSON formatter and therefore the JSON error message, pointing at the byte
+// that is wrong. Sniffing it as "unknown" would answer a broken file with "I don't
+// know what this is", which is the less useful of the two true statements.
+//
+// CSS has no distinctive first character -- a stylesheet can begin with a letter,
+// a dot, a hash, an `@` or a comment, none of which are exclusive to it -- so it
+// is reached by extension only. Guessing CSS from content would mean claiming
+// every file that is not JSON or XML, which is how a formatter comes to rewrite
+// somebody's prose.
+format_kind_for :: proc(doc: ^Document) -> Format_Kind {
+	if doc == nil || doc.kind != .Text {return .None}
+	if path_has_ext_strict(doc.path, {".json"}) {return .Json}
+	if path_has_ext_strict(doc.path, {".css", ".scss", ".sass"}) {return .Css}
+	if path_has_ext_strict(doc.path, {".xml", ".svg", ".xaml", ".xsd", ".xsl", ".xslt", ".plist", ".csproj", ".props", ".targets", ".resx"}) {return .Xml}
+
+	// Content, from the first non-space byte. A bounded read: the answer is one
+	// character and a multi-GB file must not be walked to find it.
+	buf: [64]u8
+	n := base.pt_read(&doc.pt, 0, buf[:min(len(buf), doc.pt.length)])
+	for i in 0 ..< n {
+		switch buf[i] {
+		case ' ', '\t', '\r', '\n':
+			continue
+		case '{', '[':
+			return .Json
+		case '<':
+			return .Xml
+		case:
+			return .None
+		}
+	}
+	return .None
+}
+
+// path_has_ext answers TRUE for an empty path -- "a new buffer is allowed into any
+// view, you don't know what it will become" -- which is right for a view gate and
+// wrong for picking a formatter: an untitled buffer would match the first list
+// asked and be formatted as JSON whatever it holds. This is the strict form, and
+// an untitled buffer falls through to the content sniff instead.
+@(private = "file")
+path_has_ext_strict :: proc(path: string, exts: []string) -> bool {
+	return path != "" && path_has_ext(path, exts)
+}
 
 // Documents Format JSON will act on: ANY text document, whatever its extension.
 //

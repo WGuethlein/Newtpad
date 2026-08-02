@@ -235,7 +235,7 @@ menus := []Menu {
 			// illustrated with a .log file, and an extension gate excluded it. See
 			// doc_can_json. Pressing it on something that is not JSON says so and
 			// puts the caret on the first byte that is not.
-			{cmd = .Format_Json, enabled = can_json},
+			{cmd = .Format_Document, enabled = can_json},
 			sep,
 			{cmd = .Font_Open},
 		},

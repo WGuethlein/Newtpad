@@ -6142,6 +6142,70 @@ a silent outcome either way: a hand-written keymap that duplicates an existing c
 diagnostic, it just does nothing. Not fixed, and worth knowing before someone debugs a binding that
 "does not work".
 
+## 6bn. Format Document: CSS, SCSS and XML join JSON (2026-08-02, v0.47.0)
+
+*"go ahead and all css/scss and xml... add js for later future request"*.
+
+**One command, three formatters.** `Format_Json` became `Format_Document`, still on Ctrl+Alt+F, and
+`format_kind_for` picks: extension first, then the first non-space byte of the buffer. The sniff is
+the original request — the `.log` file that motivated JSON has no extension to go on — and it also
+covers a scratch buffer pasted from a terminal. **Extension wins over content**, so a broken `.json`
+still gets the JSON error pointing at the byte that is wrong, rather than "I don't know what this is".
+
+**CSS is guessed from content only by its extension, never by sniffing.** A stylesheet can begin with
+a letter, a dot, a hash, an `@` or a comment, none exclusive to it — claiming every file that is not
+JSON or XML is how a formatter comes to rewrite somebody's prose.
+
+### CSS/SCSS: one lookahead, and SCSS comes free
+
+Whitespace is never significant in CSS, so the same token-re-emitter shape as JSON works. SCSS is not
+a second mode: nesting is more `{}`, `$vars` and `&` are ordinary tokens, and the only real addition
+is the `//` comment.
+
+**The one hard part is that `:` and `,` each do two jobs.** `a:hover` must not become `a: hover`,
+while `color:red` must. The rule is a bounded forward scan at paren depth 0: a declaration ends at
+`;` or `}`, a selector ends at `{`, and whichever comes first decides. SCSS sharpens it, because
+there a selector and a declaration live in the same block. Similarly `,` breaks a selector list onto
+separate lines but must stay inline inside `rgba(0, 0, 0, .5)` — paren depth answers that one.
+
+**Only comments read the source's newlines.** Everything else is deliberately reflowed, but a
+comment's placement is authorship: a licence header sits on its own line because someone put it
+there, and `color: /* was blue */ red` is inline for the same reason.
+
+### XML: the rule is narrower on purpose
+
+This is the one where whitespace **can** be significant, and no attribute has to say so. The rule
+Wyatt chose: an element whose own content is only elements/comments/whitespace is laid out; an element
+with any non-whitespace text in **its own content** is copied byte for byte, whole subtree.
+
+**Immediate level, not the whole subtree** — and the first version got that wrong. Asking about the
+entire subtree meant one `<name>Ada</name>` anywhere made the whole document verbatim: perfectly safe
+and completely useless. Laying an element out inserts whitespace *into that element's content and
+nowhere else*, so only text directly inside it can be harmed; text three levels down is protected by
+the same question being asked about its own parent.
+
+The rejected alternatives are recorded in the file: honouring `xml:space="preserve"` amounts to
+rewriting significant whitespace in the ~all documents that never set it, and a hardcoded
+`pre`/`textarea` list works for HTML and guesses wrong on every other vocabulary.
+
+### A use-after-free I introduced two versions earlier
+
+The "already formatted" check compared `out` against `src` **after** `delete(src)` — added in v0.45.0
+when the source was freed early to cut the peak. Freed memory usually still holds its bytes, so the
+test could not see it. The comparison is computed before the free now.
+
+### Not built, and it is not about effort: JavaScript
+
+Recorded in `requested-features.md` with the reasoning. ASI, the regex-versus-division ambiguity and
+nested template literals each make a token-level rewrite **unsafe rather than imperfect** — the
+failure mode is silently changing what the code does, on a command that edits the buffer. It needs a
+real parser and a differential test that re-parses to prove the AST is unchanged. It is now the
+plugin system's best motivating example, which is what §6aa wanted a formatter for in the first place.
+
+229 base tests (up from 218): the three formatters are unit-tested there, including idempotence for
+each — pressing the command twice must equal pressing it once, and for XML that is where a naive
+implementation drifts, because the newlines it just wrote look like text on the second pass.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

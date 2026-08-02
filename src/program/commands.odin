@@ -84,7 +84,7 @@ Command_Id :: enum u8 {
 	Sort_Lines,
 	Sort_Lines_Desc,
 	Remove_Duplicate_Lines,
-	Format_Json,
+	Format_Document,
 	// The table header's context menu (menu.odin's table_header_menu_items).
 	// Dispatched against app.menu.ctx_col -- the column the menu was opened on,
 	// which menu_close deliberately preserves past the row's pick -- because there is
@@ -261,7 +261,7 @@ command_table := [Command_Id]Command {
 	.Sort_Lines               = {"Sort Lines (selection, or whole file)", "Edit"},
 	.Sort_Lines_Desc          = {"Sort Lines Descending (selection, or whole file)", "Edit"},
 	.Remove_Duplicate_Lines   = {"Remove Duplicate Lines (exact match, keeps the first)", "Edit"},
-	.Format_Json              = {"Format JSON", "Edit"},
+	.Format_Document          = {"Format Document", "Edit"},
 	.Table_Sort_Asc           = {"Sort Ascending", "Table"},
 	.Table_Sort_Desc          = {"Sort Descending", "Table"},
 	.Table_Sort_Then_Asc      = {"Then by Ascending", "Table"},
@@ -395,7 +395,7 @@ default_bindings := []Binding {
 	// expressed here -- Binding has no `shift` field, the same reason Save As is
 	// Ctrl+Alt+S rather than Ctrl+Shift+S -- so this is its nearest expressible
 	// neighbour, and it keeps the F. Ctrl+F is Find and stays that way.
-	{.F, true, true, .Editor, .Format_Json},
+	{.F, true, true, .Editor, .Format_Document},
 	// The two replace verbs, declared in .Editor and NOT in .Find, deliberately.
 	// resolve_key falls the Find context back to the editor keymap for modified
 	// chords (see its comment), so one row here binds the chord in both places --
@@ -1529,25 +1529,24 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		sort_lines_dispatch(app, doc, .Descending)
 	case .Remove_Duplicate_Lines:
 		sort_lines_dispatch(app, doc, .Dedupe)
-	case .Format_Json:
-		// VS Code's Format Document, for JSON. Wyatt asked for it 2026-07-30 with a
-		// .log file that is one unreadable line and a tasks.json showing the wanted
-		// result. It EDITS the buffer -- undoable, like any other edit -- rather
-		// than rendering a view, which is what "format this file" means everywhere
-		// else and what he chose.
-		if doc == nil {break}
-		// A CEILING, and it is the price of editing rather than viewing. This is a
-		// full read, a full format and a full splice on the main thread, so peak
-		// memory is a small multiple of the file and the time is linear in it.
-		// BACKUP_MAX (128 MB) guards the same shape for a different reason; this is
-		// lower because the output is LARGER than the input -- indentation is what
-		// the command adds -- so the input is not the number that matters.
+	case .Format_Document:
+		// VS Code's Format Document. Wyatt asked for it 2026-07-30 with a .log file
+		// that is one unreadable line and a tasks.json showing the wanted result,
+		// then for CSS/SCSS and XML on 2026-08-02. It EDITS the buffer -- undoable,
+		// like any other edit -- rather than rendering a view, which is what "format
+		// this file" means everywhere else and what he chose.
 		//
-		// Refusing loudly is the house style: the sort refuses past 100,000 rows and
-		// says so, and a formatter that instead froze for a minute on a 2 GB minified
-		// log would be the worse failure.
-		if json_format_too_large(doc.pt.length) {
-			app_note(app, fmt.tprintf("[TOO LARGE TO FORMAT -- %d MB LIMIT]", JSON_FORMAT_MAX / (1024 * 1024)))
+		// ONE command for three languages, dispatching on format_kind_for: one
+		// chord, one menu row, and the note says which formatter ran so it is never
+		// a mystery. JavaScript is deliberately not among them -- see
+		// requested-features.md; it needs a parser, not a token re-emitter.
+		if doc == nil {break}
+		// A CEILING, and it is the price of editing rather than viewing -- measured,
+		// see FORMAT_MAX. Refusing loudly is the house style: the sort refuses past
+		// 100,000 rows and says so, and a formatter that instead froze for a minute
+		// on a 2 GB minified log would be the worse failure.
+		if format_too_large(doc.pt.length) {
+			app_note(app, fmt.tprintf("[TOO LARGE TO FORMAT -- %d MB LIMIT]", FORMAT_MAX / (1024 * 1024)))
 			break
 		}
 		// THE HEAP, with explicit frees -- not the frame's temp allocator. Both of
@@ -1558,10 +1557,38 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// this reason, and it is also what a sabotage pass found here -- with the
 		// ceiling removed, the failure was not the size guard but the temp arena
 		// refusing the allocation, which then surfaced as "not valid JSON".
+		kind := format_kind_for(doc)
+		if kind == .None {
+			app_note(app, "[NOTHING TO FORMAT -- EXPECTED JSON, CSS OR XML]")
+			break
+		}
 		src := base.pt_collect(&doc.pt, context.allocator)
 		// The tab width, in spaces. Wyatt's call: the output matches how the editor
-		// is already set up rather than hard-coding two.
-		out, jerr, at := base.json_format(src, plat.text_tab_width(t), context.allocator)
+		// is already set up rather than hard-coding two. All three formatters take
+		// it, so the file type does not change how the result is indented.
+		tabw := plat.text_tab_width(t)
+		out: []u8
+		at, what, why := 0, "", ""
+		switch kind {
+		case .Json:
+			e: base.Json_Error
+			out, e, at = base.json_format(src, tabw, context.allocator)
+			what, why = "JSON", base.json_error_text(e)
+		case .Css:
+			e: base.Css_Error
+			out, e, at = base.css_format(src, tabw, context.allocator)
+			what, why = "CSS", base.css_error_text(e)
+		case .Xml:
+			e: base.Xml_Error
+			out, e, at = base.xml_format(src, tabw, context.allocator)
+			what, why = "XML", base.xml_error_text(e)
+		case .None:
+		}
+		// COMPUTED BEFORE `src` IS FREED. This compared against `src` after the
+		// delete below for one commit -- a use-after-free that the "already
+		// formatted" test could not see, because freed memory usually still holds
+		// the bytes that were in it.
+		unchanged := out != nil && len(out) == len(src) && string(out) == string(src)
 		// FREED IMMEDIATELY, not deferred. `out` is about twice `src` on real
 		// minified JSON (measured: 128 MB in, 264 MB out), and doc_replace_range
 		// below makes the piece tree's own copy of it -- so holding the source
@@ -1569,22 +1596,23 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// peak from 657 MB to 529 MB on that same file, for one moved line.
 		delete(src)
 		defer delete(out)
-		if jerr != .None {
+		if out == nil {
 			// MARKED, NOT SILENTLY REFUSED -- the rule §10 applies to malformed CSV
 			// rows. The caret goes to the offending byte so the reader is looking at
-			// the problem rather than hunting for it, and the note names what is
-			// wrong there.
+			// the problem rather than hunting for it, and the note names both what it
+			// was read AS and what is wrong there -- the first matters now that three
+			// formatters share one command.
 			doc.cursor = clamp(at, 0, doc.pt.length)
 			doc.anchor = doc.cursor
 			// doc.top is left to the frame's own caret-follow
 			// (doc_ensure_cursor_visible), which runs with the row counts this layer
 			// does not have. Moving the caret is the whole request; scrolling to it
 			// is what that pass already does for every other caret move.
-			app_note(app, fmt.tprintf("[NOT VALID JSON -- %s]", base.json_error_text(jerr)))
+			app_note(app, fmt.tprintf("[NOT VALID %s -- %s]", what, why))
 			break
 		}
 		// Nothing to do, and saying so beats an undo entry that changes no bytes.
-		if len(out) == len(src) && string(out) == string(src) {
+		if unchanged {
 			app_note(app, "[ALREADY FORMATTED]")
 			break
 		}

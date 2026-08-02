@@ -14,6 +14,39 @@ once and would be a reopening, not a new idea.
 
 ## 1. Asked for directly, unscheduled
 
+### Format minified JavaScript — asked for 2026-08-02, deliberately NOT built
+
+Wyatt, after JSON/CSS/XML shipped: *"add js for later future request"*. Recorded here rather than
+attempted, and the reason is not effort — it is that **the technique the other three use cannot be
+made safe for JavaScript.**
+
+JSON, CSS and XML are token re-emitters with no parser, and they are ~200 lines each **because
+whitespace is never significant in JSON or CSS, and in XML the one place it is can be detected
+locally**. None of that holds here:
+
+- **Automatic Semicolon Insertion.** Where a newline may go depends on where a statement ends, and
+  that cannot be known without parsing. `return\n  x` returns `undefined`. A formatter that guesses
+  wrong does not produce ugly output — it produces *different code*.
+- **`/` is ambiguous.** `/foo/g` is a regex literal; `a / b` is division. Telling them apart needs
+  parse context, not lexer context. Guess wrong and everything to the next `/` is swallowed as a
+  regex.
+- **Template literals** nest arbitrary expressions inside `${}`, recursively, each of which can
+  contain more template literals.
+
+So a JS formatter is a real parser plus a printer — Prettier is on the order of 100k lines — and a
+partial one is **worse than none**, because this command edits the buffer and the failure mode is
+silently changing what the code does rather than refusing.
+
+**This is the plugin system's motivating example.** §6aa held first-party reformat as the V2 plugin
+proof and JSON was taken out of that in v0.44.0; JS is a better proof anyway, because it is the case
+where the work genuinely does not belong in a 11k-line notepad. If it is ever built first-party it
+needs its own spec, a real parser, and a differential test that reformats and re-parses to prove the
+AST is unchanged — nothing less is honest for a command that rewrites source.
+
+Cheap and NOT blocked, if the appetite is there: **HTML** is XML-shaped and could reuse
+`xml_format`'s structure-only rule, with the caveat that its whitespace significance is broader
+(inline elements, not just `<pre>`).
+
 ### Excel-style column filtering — batch 20 (the sort half shipped in v0.36.0)
 
 **Requested 2026-07-31 by Wyatt**, alongside the four table bugs: *"multiple sort of columns, first

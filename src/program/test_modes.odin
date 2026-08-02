@@ -4029,7 +4029,7 @@ when NEWTPAD_TESTS {
 			a, d := run(`{"b":1,"a":[2,3]}`)
 			defer app_destroy(&a)
 			before := body(d)
-			command_dispatch(.Format_Json, {}, &a, nil, &t, 10)
+			command_dispatch(.Format_Document, {}, &a, nil, &t, 10)
 			after := body(d)
 			chk(&bad, after != before, "the buffer changed")
 			chk(&bad, strings.contains(after, "\n"), "...into something with newlines in it")
@@ -4048,7 +4048,7 @@ when NEWTPAD_TESTS {
 			defer app_destroy(&a)
 			before := body(d)
 			d.cursor, d.anchor = 0, 0
-			command_dispatch(.Format_Json, {}, &a, nil, &t, 10)
+			command_dispatch(.Format_Document, {}, &a, nil, &t, 10)
 			chk(&bad, body(d) == before, "the buffer is UNTOUCHED -- a partial rewrite would be worse than refusing")
 			// The caret lands on the fault, which is the difference between "marked"
 			// and "refused": the reader is looking at the problem rather than hunting.
@@ -4065,10 +4065,10 @@ when NEWTPAD_TESTS {
 			// twice is also exactly what a person does.
 			a, d := run(`{"a":1,"b":[2]}`)
 			defer app_destroy(&a)
-			command_dispatch(.Format_Json, {}, &a, nil, &t, 10)
+			command_dispatch(.Format_Document, {}, &a, nil, &t, 10)
 			once := body(d)
 			undos := len(d.undo)
-			command_dispatch(.Format_Json, {}, &a, nil, &t, 10)
+			command_dispatch(.Format_Document, {}, &a, nil, &t, 10)
 			chk(&bad, body(d) == once, fmt.tprintf("a second press leaves the bytes identical (%q)", body(d)))
 			chk(&bad, len(d.undo) == undos, "...and pushes no undo entry, because nothing was written")
 		}
@@ -4082,9 +4082,88 @@ when NEWTPAD_TESTS {
 			// quarters of a gigabyte of transient allocation on every sweep. The
 			// end-to-end link is kept by the command calling THIS, and by the note
 			// assertion below.
-			chk(&bad, !json_format_too_large(JSON_FORMAT_MAX), "a file exactly at the ceiling is formatted")
-			chk(&bad, json_format_too_large(JSON_FORMAT_MAX + 1), "...and one byte more is refused")
-			chk(&bad, !json_format_too_large(0), "an empty buffer is never refused for size")
+			chk(&bad, !format_too_large(FORMAT_MAX), "a file exactly at the ceiling is formatted")
+			chk(&bad, format_too_large(FORMAT_MAX + 1), "...and one byte more is refused")
+			chk(&bad, !format_too_large(0), "an empty buffer is never refused for size")
+		}
+
+		fmt.println("-- one command, three formatters --")
+		{
+			// DISPATCH BY EXTENSION, then by the first non-space byte. The sniff is
+			// the original request: a .log file that is one enormous JSON line has no
+			// extension to go on.
+			d: Document
+			d.kind = .Text
+			d.path = "C:\\x.json";chk(&bad, format_kind_for(&d) == .Json, "a .json reads as JSON")
+			d.path = "C:\\x.css";chk(&bad, format_kind_for(&d) == .Css, "a .css reads as CSS")
+			d.path = "C:\\x.scss";chk(&bad, format_kind_for(&d) == .Css, "...and a .scss, which is the same formatter")
+			d.path = "C:\\x.xml";chk(&bad, format_kind_for(&d) == .Xml, "an .xml reads as XML")
+			d.path = "C:\\x.svg";chk(&bad, format_kind_for(&d) == .Xml, "...and an .svg, which is XML")
+
+			// Content, where the extension says nothing. Untitled buffers, so the
+			// sniff is what answers -- built directly rather than through `run`,
+			// which hands out a .json path.
+			sniff :: proc(bad: ^int, src: string, want: Format_Kind, label: string) {
+				sd := new(Document)
+				defer free(sd)
+				sd^ = doc_from_content(transmute([]u8)strings.clone(src), "", .UTF8)
+				defer doc_close(sd)
+				got := format_kind_for(sd)
+				if got != want {bad^ += 1}
+				fmt.printfln("  %-4s %s (%v)", "ok" if got == want else "FAIL", label, got)
+			}
+			sniff(&bad, `{"a":1}`, .Json, "an untitled buffer starting with { reads as JSON")
+			sniff(&bad, "  \n [1,2]", .Json, "...leading whitespace is skipped to find it")
+			sniff(&bad, `<a><b/></a>`, .Xml, "...one starting with < reads as XML")
+			sniff(&bad, "just some prose\n", .None, "...and prose reads as nothing, rather than being rewritten")
+		}
+
+		fmt.println("-- CSS and XML through the command --")
+		{
+			a: App
+			d := new(Document)
+			d^ = doc_from_content(transmute([]u8)strings.clone(`a{color:red}`), "C:\\x.css", .UTF8)
+			app_add(&a, d);app_activate(&a, 0)
+			defer app_destroy(&a)
+			command_dispatch(.Format_Document, {}, &a, nil, &t, 10)
+			got := body(d)
+			chk(&bad, strings.contains(got, "a {\n") && strings.contains(got, "color: red"), fmt.tprintf("a .css is formatted as CSS (%q)", got))
+			chk(&bad, strings.contains(a.notice, "FORMATTED"), fmt.tprintf("...and says so (%q)", a.notice))
+		}
+		{
+			a: App
+			d := new(Document)
+			d^ = doc_from_content(transmute([]u8)strings.clone(`<a><b/></a>`), "C:\\x.xml", .UTF8)
+			app_add(&a, d);app_activate(&a, 0)
+			defer app_destroy(&a)
+			command_dispatch(.Format_Document, {}, &a, nil, &t, 10)
+			got := body(d)
+			chk(&bad, got == "<a>\n    <b/>\n</a>\n", fmt.tprintf("an .xml is formatted as XML at the tab width (%q)", got))
+		}
+		{
+			// THE ERROR NAMES THE FORMATTER. With three sharing one command, "not
+			// valid" on its own leaves the reader guessing which language it was read
+			// as -- which matters most exactly when the dispatch guessed wrong.
+			a: App
+			d := new(Document)
+			d^ = doc_from_content(transmute([]u8)strings.clone(`a{color:red`), "C:\\x.css", .UTF8)
+			app_add(&a, d);app_activate(&a, 0)
+			defer app_destroy(&a)
+			before := body(d)
+			command_dispatch(.Format_Document, {}, &a, nil, &t, 10)
+			chk(&bad, body(d) == before, "a broken .css leaves the buffer untouched")
+			chk(&bad, strings.contains(a.notice, "CSS"), fmt.tprintf("...and the note says it was read as CSS (%q)", a.notice))
+		}
+		{
+			a: App
+			d := new(Document)
+			d^ = doc_from_content(transmute([]u8)strings.clone("just prose\n"), "C:\\x.txt", .UTF8)
+			app_add(&a, d);app_activate(&a, 0)
+			defer app_destroy(&a)
+			before := body(d)
+			command_dispatch(.Format_Document, {}, &a, nil, &t, 10)
+			chk(&bad, body(d) == before, "prose is left alone entirely")
+			chk(&bad, strings.contains(a.notice, "NOTHING TO FORMAT"), fmt.tprintf("...and says it did not recognise it (%q)", a.notice))
 		}
 
 		fmt.println("-- who is offered the command, and the keybind --")
@@ -4093,7 +4172,7 @@ when NEWTPAD_TESTS {
 			// Shift+Alt+F cannot be expressed here (Binding has no shift field, the
 			// same reason Save As is Ctrl+Alt+S), so this is the nearest neighbour --
 			// and a chord that silently shadowed Find would be the worst outcome.
-			chk(&bad, resolve_key(.F, true, true, .Editor) == .Format_Json, fmt.tprintf("Ctrl+Alt+F formats (%v)", resolve_key(.F, true, true, .Editor)))
+			chk(&bad, resolve_key(.F, true, true, .Editor) == .Format_Document, fmt.tprintf("Ctrl+Alt+F formats (%v)", resolve_key(.F, true, true, .Editor)))
 			chk(&bad, resolve_key(.F, true, false, .Editor) == .Find_Open, fmt.tprintf("...and Ctrl+F is still Find (%v)", resolve_key(.F, true, false, .Editor)))
 		}
 		{
@@ -35853,7 +35932,7 @@ when NEWTPAD_TESTS {
 		// `menuseam` and `drawcount` are falsifiers rather than pass/fail modes
 		// (development-loop §6 says to sweep those by diffing their printed line).
 		//
-		// It exists because JSON_FORMAT_MAX was picked by reasoning and Wyatt then
+		// It exists because FORMAT_MAX was picked by reasoning and Wyatt then
 		// said the reasoning was wrong for his files: *"how realistic is the 64MB
 		// limit... i feel like we often have double that size as average"*. A
 		// ceiling argued from first principles is worth exactly what the numbers
@@ -35886,7 +35965,7 @@ when NEWTPAD_TESTS {
 			// has to be argued against this number, not against the file size.
 			peak := len(raw) + 2 * len(out)
 			fmt.printfln("  peak (src+2*out): %.1f MB", f64(peak) / (1024 * 1024))
-			fmt.printfln("  current ceiling : %.0f MB", f64(JSON_FORMAT_MAX) / (1024 * 1024))
+			fmt.printfln("  current ceiling : %.0f MB", f64(FORMAT_MAX) / (1024 * 1024))
 			return true
 		}
 
