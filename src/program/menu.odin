@@ -228,17 +228,36 @@ menu_filter_items :: proc(app: ^App) -> []Menu_Item {
 	// "type three letters, Select All" means all of THE MATCHES -- which is the
 	// operation the search exists to make possible. table_filter_apply reads the
 	// ticks, not the rows, so this is a property of the row set alone.
-	label := "Type to search…"
-	if q != "" {label = fmt.bprintf(app.menu.query_label[:], "Search: %s_", q)}
-	append(&app.filter_items, Menu_Item{text = label})
+	// A PLACEHOLDER, filled in at the bottom of this procedure. The label reports
+	// how many values the loop below kept, and computing that up front would mean a
+	// second menu_contains_fold pass over every distinct value on every keystroke --
+	// affordable at the old 512-value cap and not at a list that is now allowed to
+	// run to TABLE_SORT_MAX. Index 0 is fixed by these three appends, so the write
+	// at the end cannot land on the wrong row.
+	append(&app.filter_items, Menu_Item{})
 	append(&app.filter_items, Menu_Item{cmd = .Table_Filter_All, checked = filter_all_on})
 	append(&app.filter_items, sep)
+	shown := 0
 	for v, i in f.values {
 		// THE PAYLOAD IS THE TRUE VALUE INDEX, not the row's position, so a search
 		// that hides rows cannot make a click tick the wrong value. That separation
 		// is the whole reason the filter survives being typed into.
 		if q != "" && !menu_contains_fold(v, q) {continue}
 		append(&app.filter_items, Menu_Item{cmd = .Table_Filter_Toggle, checked = filter_value_on, payload = i})
+		shown += 1
+	}
+	// HOW MANY VALUES THERE ARE, in the row that already exists. The distinct list
+	// lost its cap in this batch (see table_filter_open), so a column can now put
+	// tens of thousands of checkboxes behind a scrollbar whose thumb is one pixel
+	// tall -- and a list that large should say so rather than let the reader infer
+	// it from the thumb. Folded into the search box rather than given a row of its
+	// own: a new row is a new index, and Menu_Item.payload, menu_item_at and the
+	// keyboard highlight all read indices into this slice, so a row costs four
+	// seams to buy a number.
+	if q == "" {
+		app.filter_items[0].text = fmt.bprintf(app.menu.query_label[:], "Type to search… (%d values)", len(f.values))
+	} else {
+		app.filter_items[0].text = fmt.bprintf(app.menu.query_label[:], "Search: %s_ (%d of %d)", q, shown, len(f.values))
 	}
 	return app.filter_items[:]
 }
@@ -661,7 +680,13 @@ Menu_State :: struct {
 	// is a borrowed string that has to outlive the frame, and the obvious way to
 	// write it -- format into the temp allocator -- dangles at the next free_all,
 	// which is the trap menu_open_ctx's comment already describes for the slice.
-	query_label: [160]u8,
+	//
+	// 224, not 160: the label now carries the distinct-value count as well as the
+	// query, and "Search: " + a full 128-byte query + "_ (99999 of 99999)" is 154
+	// bytes. bprintf TRUNCATES rather than overflowing, so at 160 the failure would
+	// have been the count silently disappearing off the end of a long query -- a
+	// missing number rather than a crash, which is the kind nobody reports.
+	query_label: [224]u8,
 }
 
 // Must be called before the first frame: the zero value of `open` is 0, which
@@ -799,6 +824,7 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 
 	if menu_dropdown_active(app) {
 		picked := Command_Id.None
+		inside := menu_dropdown_hit(t, app, mx, my, w, h)
 		if idx := menu_item_at(t, app, mx, my, w, h); idx >= 0 {
 			it := menu_items(app)[idx]
 			if item_enabled(app, it) {picked = it.cmd;app.menu.ctx_payload = it.payload}
@@ -806,12 +832,29 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 		// Any click while a dropdown is open is consumed, as native menus do —
 		// clicking away closes it rather than also moving the caret.
 		//
-		// EXCEPT a row that ticks a checkbox. A menu closing on every click is
-		// right for a command and wrong for a multi-select: ticking one value,
-		// having the list vanish, and reopening it to tick a second is not a
-		// gesture anyone would design, and it is what shipped in v0.49.0.
-		// command_keeps_menu_open names the rows that stay.
-		if !command_keeps_menu_open(picked) {menu_close(app)}
+		// THREE outcomes, not two, and the third is the one that was missing:
+		//
+		//   - a row that ticks a checkbox   -> run it, STAY OPEN. A menu closing on
+		//     every click is right for a command and wrong for a multi-select:
+		//     ticking one value, having the list vanish, and reopening it to tick a
+		//     second is not a gesture anyone would design, and it is what shipped in
+		//     v0.49.0. command_keeps_menu_open names the rows that stay.
+		//   - dead space INSIDE the box     -> do nothing, STAY OPEN. The separator,
+		//     the search-box label, the scrollbar strip and a disabled row all reach
+		//     here with picked == .None, and every one of them used to dismiss the
+		//     menu (Wyatt, v0.50.0). Native menus swallow these; so does this now.
+		//   - anything else                 -> close.
+		//
+		// `inside` has to come from menu_dropdown_hit rather than from
+		// `menu_item_at(...) < 0`, because that is precisely the conflation that
+		// caused the bug -- see menu_dropdown_hit's comment.
+		close := true
+		if command_keeps_menu_open(picked) {
+			close = false
+		} else if inside && picked == .None {
+			close = false
+		}
+		if close {menu_close(app)}
 		consume_click(win)
 		return picked, true
 	}
@@ -1281,9 +1324,10 @@ menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0,
 	// still not clickable (menu_item_at requires my < height), so the residual
 	// case is a visibility one and not a safety one — as before.
 	// A CEILING IN ROWS, not just in window height. A hand-written menu is a dozen
-	// rows and never reaches it; the column filter GENERATES its rows -- up to
-	// TABLE_FILTER_VALUES_MAX of them -- and without this the dropdown is as tall
-	// as the window, which is not a menu, it is a wall. *"there's no scroll bar, it
+	// rows and never reaches it; the column filter GENERATES its rows -- one per
+	// distinct value in the column, with no cap of its own since 2026-08-02, so up
+	// to TABLE_SORT_MAX of them -- and without this the dropdown is as tall as the
+	// window, which is not a menu, it is a wall. *"there's no scroll bar, it
 	// shouldn't be the full vertical height of the window... something reasonable"*
 	// (Wyatt, v0.49.0).
 	//
@@ -1384,7 +1428,14 @@ menu_wheel :: proc(app: ^App, t: ^plat.Text, delta: int, w, h: f32) -> bool {
 		if rows_fitting(items, last, dh) >= len(items) - last {break}
 		last += 1
 	}
-	app.menu.top = clamp(app.menu.top - delta, 0, last)
+	// PLUS delta, not minus. plat.Window.scroll_delta is documented "+down / -up"
+	// and every other consumer in the tree ADDS it -- doc.filter_top, doc.h_scroll,
+	// doc.table_hscroll_px and doc_scroll's row step. This was the one subtractor,
+	// so the dropdown was the one list in the app that scrolled backwards under the
+	// wheel (Wyatt, live use, v0.50.0: "scrollbar direction in the filter menu is
+	// wrong"). The thumb was never wrong -- it tracks `top` faithfully, and `top`
+	// was what ran the wrong way.
+	app.menu.top = clamp(app.menu.top + delta, 0, last)
 	return true
 }
 
@@ -1424,6 +1475,32 @@ menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> in
 		y += ih
 	}
 	return -1
+}
+
+// Is (mx, my) anywhere inside the open dropdown's box?
+//
+// THE QUESTION menu_item_at CANNOT ANSWER, and the gap between the two is what
+// shipped as *"in the filter menu if you click in between options it closes the
+// modal"* (Wyatt, live use, v0.50.0). menu_item_at returns -1 for two unrelated
+// situations -- the point is outside the menu, and the point is on a row that
+// cannot be picked (a separator, the search-box label, the scrollbar strip) --
+// and menu_hit_test had only that one sentinel to read, so it took a click on the
+// separator for a click on the document and dismissed the menu. Textbook
+// development-loop.md §4 Shape B: a correct, tested procedure whose result is
+// read in the wrong space by its consumer.
+//
+// A second CONSUMER of menu_dropdown_rect rather than a second copy of the rect,
+// which is CLAUDE.md's "one layout per widget" applied to the case it is most
+// often skipped for: the new question is about the same geometry, so it has to
+// come from the same producer or the two will disagree at exactly the boundary
+// pixel where it matters. `y0` is derived here the way menu_item_at derives it --
+// from the rect's own y plus the border inset, never from menu_origin, which
+// differs by the whole height of the menu under a flip-up.
+menu_dropdown_hit :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> bool {
+	if !menu_dropdown_active(app) {return false}
+	x0, oy, w, h := menu_dropdown_rect(t, app, width, height)
+	y0 := oy + sx(1)
+	return mx >= x0 && mx < x0 + w && my >= y0 && my < y0 + h
 }
 
 // Not file-private: menutest asserts that every dropdown is wide enough for its
