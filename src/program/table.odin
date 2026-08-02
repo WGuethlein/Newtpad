@@ -286,7 +286,10 @@ table_visible_rows :: proc(doc: ^Document, height, px: f32) -> int {
 //     pass already excludes it; the count agrees with the sort.
 table_row_count :: proc(doc: ^Document) -> (n: int, exact: bool) {
 	if doc == nil || doc.pt.length == 0 {return 0, true}
-	n = doc_line_count(doc) - 1
+	// The -1 is the HEADER, so a headerless document does not pay it: its line 0 is
+	// a data row and the summary row must say so, or the count under the grid
+	// disagrees with the row numbers beside it by one.
+	n = doc_line_count(doc) if doc.table_headerless else doc_line_count(doc) - 1
 	last: [1]u8
 	if got := base.pt_read(&doc.pt, doc.pt.length - 1, last[:]); got == 1 && last[0] == '\n' {n -= 1}
 	exact = doc_index_done(doc) && !doc_index_faulted(doc) && !base.pt_faulted(&doc.pt)
@@ -419,7 +422,7 @@ table_summary_parts :: proc(doc: ^Document, allocator := context.temp_allocator)
 		// without having learned what a superscript 2 beside an arrow means.
 		for i in 0 ..< s.nkeys {
 			if i > 0 {fmt.sbprint(&sb, ", ")}
-			fmt.sbprintf(&sb, "%s %s", table_col_name(doc, s.keys[i].col, allocator), "desc" if s.keys[i].desc else "asc")
+			fmt.sbprintf(&sb, "%s %s", table_col_label(doc, s.keys[i].col, allocator), "desc" if s.keys[i].desc else "asc")
 		}
 		fmt.sbprint(&sb, "  ·  click to clear")
 		clear_e = strings.builder_len(sb)
@@ -507,14 +510,47 @@ table_summary_clear_hit :: proc(sm: Table_Summary, mx, my: f32) -> bool {
 	return my >= sm.y && my < sm.y + sm.h && mx >= sm.clear_x && mx < sm.clear_x + sm.clear_w
 }
 
-// A column's name for the summary: its header cell, or a positional fallback when
-// the header cell is blank. 1-based in the fallback, because the summary is prose
-// for a reader and the row-number gutter counts from one for the same reason.
-@(private = "file")
-table_col_name :: proc(doc: ^Document, c: int, allocator := context.temp_allocator) -> string {
-	head := table_header_fields(doc, allocator)
-	if c >= 0 && c < len(head) && len(strings.trim_space(head[c])) > 0 {return head[c]}
-	return fmt.tprintf("column %d", c + 1)
+// A column's POSITIONAL name: A, B, ... Z, AA, AB, ... Spreadsheet convention, and
+// chosen over the `column %d` this used to produce for two reasons.
+//
+// It has to fit the 30px header band on an 8-cell column, which "column 12" does
+// not. And a bare NUMBER in that band would collide with the PRECEDENCE DIGITS
+// v0.36.0 draws there: a column labelled `1` beside a sort arrow is ambiguous with
+// the mark that means "this is the first sort key", and they can appear on the
+// same cell at the same time.
+//
+// Base-26 with no zero, which is why the loop subtracts one each time round --
+// A..Z then AA, not A..Z then BA.
+table_col_pos_name :: proc(c: int, allocator := context.temp_allocator) -> string {
+	if c < 0 {return ""}
+	buf: [8]u8 // 8 letters is 26^8 columns; TABLE_COL_MAX_COUNT is far below it
+	n := 0
+	v := c
+	for n < len(buf) {
+		buf[n] = 'A' + u8(v % 26)
+		n += 1
+		v = v / 26 - 1
+		if v < 0 {break}
+	}
+	out := make([]u8, n, allocator)
+	for i in 0 ..< n {out[i] = buf[n - 1 - i]} // written least-significant first
+	return string(out)
+}
+
+// A column's name, for the summary row's prose AND for a headerless header band.
+// ONE producer, so "sorted by C asc" and the `C` drawn above that column are the
+// same string rather than two conventions for the same job.
+//
+// Does NOT consult table_header_fields when the document is headerless, and that is
+// load-bearing rather than an optimisation: table_header_fields builds its labels by
+// calling THIS, so consulting it back would be unbounded recursion. The headerless
+// branch is the base case.
+table_col_label :: proc(doc: ^Document, c: int, allocator := context.temp_allocator) -> string {
+	if doc != nil && !doc.table_headerless {
+		head := table_header_fields(doc, allocator)
+		if c >= 0 && c < len(head) && len(strings.trim_space(head[c])) > 0 {return head[c]}
+	}
+	return table_col_pos_name(c, allocator)
 }
 
 // --- the grid's row set: ONE producer ------------------------------------
@@ -544,9 +580,135 @@ table_data_start :: proc(doc: ^Document) -> (start: int, ok: bool) {
 // row 0, and every offset in the permutation would be one row out.
 table_first_data_row :: proc(doc: ^Document) -> (start: int, ok: bool) {
 	if doc == nil || doc.pt.length == 0 {return 0, false}
+	// No header: line 0 IS the first data row, and a single-line file therefore has
+	// one row rather than none. The "nothing below it" refusal below is about a
+	// header with no data under it, which is not a state this branch can be in.
+	if doc.table_headerless {return 0, true}
 	e0 := base.pt_line_end_cap(&doc.pt, 0, RENDER_LINE_CAP)
 	if e0 >= doc.pt.length {return 0, false} // header only: nothing below it
 	return e0 + 1, true
+}
+
+// --- does line 0 hold column titles, or data? ------------------------------
+//
+// Three-valued, and it has to be: `Auto` is not a third answer about the file, it
+// is the absence of an answer FROM A PERSON. A plain bool could not tell "this
+// user said the file has a header" from "nobody has said anything and the guess
+// came out that way", and those two must persist differently -- the first is worth
+// remembering and teaching a default from, the second is worth re-deciding when
+// the file changes.
+Table_Header_Mode :: enum u8 {
+	Auto   = 0, // nobody has said; table_detect_headerless decides
+	Header = 1, // a person said line 0 is column titles
+	Data   = 2, // a person said line 0 is data
+}
+
+// Does line 0 look like DATA rather than column titles?
+//
+// CONSERVATIVE BY CONSTRUCTION: it answers "yes" only on positive evidence and
+// says "no" whenever it cannot tell, so an ordinary CSV with text titles is never
+// touched and the failure mode is the behaviour that shipped for a year.
+//
+// THE EVIDENCE IS A TYPE DISAGREEMENT, per column, and nothing else. A column is
+// numeric-consistent when every non-empty cell BELOW line 0 parses as a number and
+// there is at least one such cell -- the same `nonempty > 0 && all` shape
+// table_compute_widths uses, and for the same reason its comment gives: a column of
+// entirely empty cells satisfies "every non-empty cell is a number" vacuously, and
+// treating that as evidence is a bounded scan reporting an answer it did not see.
+// If ANY numeric-consistent column also has a NUMBER on line 0, line 0 is data: a
+// header cell is a name, and a name is not a number.
+//
+// WHAT IT DELIBERATELY CANNOT DO is recognise an all-text headerless file --
+// `alice,london` over `bob,paris` has no signal in the bytes distinguishing a title
+// row from another data row, and any rule that claimed otherwise would be guessing
+// about the majority of real CSVs to serve a minority. That case is what the
+// override exists for, which is why there is an override.
+//
+// Bounded by TABLE_SAMPLE, the budget the width pass already runs on, so turning
+// the grid on costs one more pass over 500 rows and not a walk to EOF.
+table_detect_headerless :: proc(doc: ^Document) -> bool {
+	if doc == nil || doc.pt.length == 0 {return false}
+	delim := doc.table_delim if doc.table_delim != 0 else ','
+	buf: [RENDER_LINE_CAP]u8
+
+	// Line 0's own cells, copied out: `buf` is reused by every row below.
+	e0 := base.pt_line_end_cap(&doc.pt, 0, RENDER_LINE_CAP)
+	n0 := base.pt_read(&doc.pt, 0, buf[:min(e0, len(buf))])
+	if n0 > 0 && buf[n0 - 1] == '\r' {n0 -= 1}
+	first := csv_fields(strings.clone(string(buf[:n0]), context.temp_allocator), delim, context.temp_allocator)
+	if len(first) == 0 {return false}
+	if e0 >= doc.pt.length {return false} // one line only: nothing to compare it against
+
+	nonempty := make([]int, len(first), context.temp_allocator)
+	num_all := make([]bool, len(first), context.temp_allocator)
+	for i in 0 ..< len(num_all) {num_all[i] = true}
+
+	p := e0 + 1
+	rows := 0
+	for rows < TABLE_SAMPLE {
+		if p > doc.pt.length {break}
+		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
+		if n > 0 && buf[n - 1] == '\r' {n -= 1}
+		if len(strings.trim_space(string(buf[:n]))) > 0 {
+			rows += 1
+			for f, c in csv_fields(string(buf[:n]), delim) {
+				if c >= len(first) {break} // a stray delimiter: no line-0 cell to compare
+				t := strings.trim_space(f)
+				if len(t) == 0 {continue}
+				nonempty[c] += 1
+				if !table_is_number(t) {num_all[c] = false}
+			}
+		}
+		if end >= doc.pt.length {break}
+		p = end + 1
+	}
+	if rows == 0 {return false}
+
+	for c in 0 ..< len(first) {
+		if nonempty[c] == 0 || !num_all[c] {continue} // not numeric-consistent: says nothing
+		t := strings.trim_space(first[c])
+		if len(t) > 0 && table_is_number(t) {return true}
+	}
+	return false
+}
+
+// Settle `doc.table_headerless` from the user's answer, then the family default,
+// then the file itself -- in that order, because a person's answer outranks a
+// default and a default outranks a guess.
+//
+// `family` is app.settings.table_header_mode, passed in rather than reached for:
+// table.odin knows nothing about App and this is the only place the grid needs a
+// setting, so threading it through one parameter is cheaper than the dependency.
+//
+// Callers must clear the sort themselves when this CHANGES the answer. It is not
+// done here because two of the three callers are opening the view, where there is
+// no sort to clear, and a clear buried in a resolver is the kind of side effect
+// the one that matters -- the menu toggle -- should state at its own call site.
+table_headerless_resolve :: proc(doc: ^Document, family: Table_Header_Mode) {
+	if doc == nil {return}
+	// THE FAMILY DEFAULT IS ADOPTED, not merely consulted: a document with no
+	// answer of its own takes the family's and now HAS one. That is what makes the
+	// answer survive a session round trip without doc_view_apply needing to know
+	// about App -- the mode it restores is already the folded answer, so it can
+	// resolve with no family at all.
+	//
+	// The cost, stated: a document that adopted a default is afterwards
+	// indistinguishable from one the user answered directly, so changing the
+	// family default does not retroactively change tabs that already adopted it.
+	// That is the same behaviour table_default has and the same one a person would
+	// expect -- a default applies when a thing is opened, not backwards.
+	if doc.table_header_mode == .Auto && family != .Auto {
+		doc.table_header_mode = family
+	}
+	switch doc.table_header_mode {
+	case .Header:
+		doc.table_headerless = false
+	case .Data:
+		doc.table_headerless = true
+	case .Auto:
+		doc.table_headerless = table_detect_headerless(doc)
+	}
 }
 
 // Byte offset of the start of visible data row r. The row-index -> byte half of
@@ -1950,6 +2112,14 @@ table_sort_thumb :: proc(doc: ^Document, rows: int) -> (frac, size: f32, ok: boo
 // until the view is scrolled.
 table_header_fields :: proc(doc: ^Document, allocator := context.temp_allocator) -> []string {
 	if doc == nil || doc.pt.length == 0 {return nil}
+	// No header row: the band still exists -- it carries the sort, the resize edges
+	// and the column menu -- but it is labelled positionally rather than from a line
+	// of the file, because that line is data and is being drawn as row 1.
+	if doc.table_headerless {
+		out := make([]string, max(0, doc.table_cols), allocator)
+		for i in 0 ..< len(out) {out[i] = table_col_label(doc, i, allocator)}
+		return out
+	}
 	delim := doc.table_delim if doc.table_delim != 0 else ','
 	buf: [RENDER_LINE_CAP]u8
 	e0 := base.pt_line_end_cap(&doc.pt, 0, RENDER_LINE_CAP)
@@ -2928,7 +3098,12 @@ table_compute_widths :: proc(doc: ^Document, text: ^plat.Text) {
 			// be able to show its own name -- and not toward the type, or every
 			// numeric column in every CSV ever written would be disqualified by
 			// the word above it.
-			if row == 0 {continue}
+			//
+			// Unless there is no header, in which case line 0 is an ordinary data
+			// row and excluding it would decide a column's alignment from every
+			// row but the first. table_headerless is resolved before this runs
+			// (table_headerless_resolve, called at every point the grid opens).
+			if row == 0 && !doc.table_headerless {continue}
 			t := strings.trim_space(f)
 			if len(t) == 0 {continue}
 			nonempty[c] += 1

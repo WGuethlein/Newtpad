@@ -3969,6 +3969,7 @@ when NEWTPAD_TESTS {
 			ts_case_clear_resets(&bad)
 			ts_case_clear_scrolls_top(&bad)
 			ts_case_resort_on_commit(&bad)
+			ts_case_headerless(&bad)
 			ts_case_bad_vector(&bad)
 			ts_case_precedence(&bad)
 			ts_case_numeric_past_sample(&bad)
@@ -5054,6 +5055,159 @@ when NEWTPAD_TESTS {
 			// Byte order over "10", "2", "N/A".
 			li_chk(bad, ts_order(&d) == "b,10|a,2|c,N/A", fmt.tprintf("...and the order is the text one (%q, want \"b,10|a,2|c,N/A\")", ts_order(&d)))
 			perm_sound(bad, &d, "after the fallback rebuild")
+		}
+	}
+
+	// A CSV with no header row (Wyatt, live pass v0.36.0, "OTHER BUGS": "csv's with
+	// no header are automatically assumed to have a header... not sure how we'd
+	// differentiate this").
+	//
+	// Line 0 was unconditionally the header, so a headerless file showed its first
+	// row of REAL DATA in the sticky band, where it could not be edited, sorted,
+	// found or counted -- §10's "silently dropping data in a data viewer is the
+	// worst possible failure", happening to exactly one row.
+	//
+	// THE HEURISTIC IS TESTED IN BOTH DIRECTIONS, and the negatives are the half
+	// that matters: a detector that answered "headerless" a little too eagerly
+	// would take the titles off every ordinary CSV in the world, which is a far
+	// worse failure than the one being fixed. Three of the five cases below exist
+	// to pin that it stays quiet.
+	ts_case_headerless :: proc(bad: ^int) {
+		fmt.println("-- a CSV with no header row is detected, labelled and counted --")
+
+		// -- the heuristic --------------------------------------------------
+		det :: proc(bad: ^int, src: string, cols: int, want: bool, why: string) {
+			d := ts_doc(src, cols)
+			defer doc_close(&d)
+			got := table_detect_headerless(&d)
+			li_chk(bad, got == want, fmt.tprintf("%s (got %v, want %v)", why, got, want))
+		}
+		// Column 1 is numeric-consistent below line 0, and line 0's cell there is
+		// also a number. A title is a name; a name is not a number.
+		det(bad, "alpha,1\nbravo,2\ncharlie,3\n", 2, true, "a numeric column whose line 0 is also numeric reads as DATA")
+		// The same file with a real title row: line 0's cell in that column is a
+		// word, so the disagreement is exactly the evidence for a header.
+		det(bad, "name,qty\nbravo,2\ncharlie,3\n", 2, false, "...and with a title row over it, as a HEADER")
+		// No numeric column anywhere: nothing to disagree about. Stays a header,
+		// which is the conservative direction and the documented limitation.
+		det(bad, "alice,london\nbob,paris\ncarol,rome\n", 2, false, "an all-text file stays a header -- there is no signal to find")
+		// Nothing to compare line 0 against.
+		det(bad, "alpha,1\n", 2, false, "a one-line file stays a header")
+		// THE VACUOUS-EVIDENCE GUARD. Column 1 is empty on every row BELOW line 0,
+		// so "every non-empty cell in it is a number" is true having seen nothing --
+		// and line 0's cell there IS a number, so without the `nonempty > 0` term
+		// this file would read as headerless off a column that contains no data at
+		// all. Column 0 cannot rescue it: its body is text. This is the one case
+		// that fails if that term is dropped.
+		det(bad, "a,7\nb,\nc,\n", 2, false, "a column with no data below line 0 is not evidence, however numeric line 0 looks")
+
+		// -- what changes when it fires -------------------------------------
+		{
+			src := "alpha,1\nbravo,2\ncharlie,3\n"
+			d := ts_doc(src, 2)
+			defer doc_close(&d)
+			table_headerless_resolve(&d, .Auto)
+			li_chk(bad, d.table_headerless, "the resolver adopts the heuristic's answer when nobody has said otherwise")
+
+			// Line 0 IS row 0 now, and that is the whole bug: it used to be
+			// unreachable in the band.
+			f, fok := table_first_data_row(&d)
+			li_chk(bad, fok && f == 0, fmt.tprintf("the first data row is byte 0, not the line after it (%d, ok %v)", f, fok))
+			// table_row_count reads the line INDEX, which a bare fixture has not
+			// built -- so it is driven off the real worker here rather than asserted
+			// against an unbuilt one, the same way tablegridtest's own count case
+			// does it.
+			doc_index_start(&d)
+			for !doc_index_done(&d) {}
+			n, exact := table_row_count(&d)
+			li_chk(bad, exact && n == 3, fmt.tprintf("all three lines count as rows (%d, exact %v)", n, exact))
+
+			// ...and the band is labelled positionally instead of from a line of
+			// the file. `A`, not `1`: a bare digit there is ambiguous with the
+			// precedence digits v0.36.0 draws in the same cell.
+			head := table_header_fields(&d)
+			li_chk(bad, len(head) == 2 && head[0] == "A" && head[1] == "B", fmt.tprintf("the band reads A, B (%v)", head))
+			li_chk(bad, table_col_label(&d, 1) == "B", fmt.tprintf("...and the summary row names the same column the same way (%q)", table_col_label(&d, 1)))
+
+			// The sort covers line 0 too, which is the reachability the report was
+			// really about: sorting descending on the numeric column must be able
+			// to put the file's FIRST line anywhere.
+			table_sort_set(&d, 1, true)
+			li_chk(bad, ts_order(&d) == "charlie,3|bravo,2|alpha,1", fmt.tprintf("line 0 sorts like any other row (%q)", ts_order(&d)))
+		}
+
+		// -- and with a header, nothing moved --------------------------------
+		{
+			d := ts_doc("name,qty\nbravo,2\ncharlie,3\n", 2)
+			defer doc_close(&d)
+			table_headerless_resolve(&d, .Auto)
+			li_chk(bad, !d.table_headerless, "a file with titles resolves to HAVING a header")
+			f, fok := table_first_data_row(&d)
+			li_chk(bad, fok && f == len("name,qty") + 1, fmt.tprintf("...its data still starts on line 1 (%d)", f))
+			doc_index_start(&d)
+			for !doc_index_done(&d) {}
+			n, exact := table_row_count(&d)
+			li_chk(bad, exact && n == 2, fmt.tprintf("...and the header is not counted as a row (%d, exact %v)", n, exact))
+			head := table_header_fields(&d)
+			li_chk(bad, len(head) == 2 && head[0] == "name", fmt.tprintf("...and the band still reads the file's own titles (%v)", head))
+		}
+
+		// -- the answer outranks the guess, and the family outranks nothing ---
+		{
+			d := ts_doc("alpha,1\nbravo,2\ncharlie,3\n", 2)
+			defer doc_close(&d)
+			d.table_header_mode = .Header // a person disagreed with the heuristic
+			table_headerless_resolve(&d, .Auto)
+			li_chk(bad, !d.table_headerless, "a person's answer beats the heuristic")
+
+			d2 := ts_doc("name,qty\nbravo,2\n", 2)
+			defer doc_close(&d2)
+			table_headerless_resolve(&d2, .Data) // family default says headerless
+			li_chk(bad, d2.table_headerless, "a family default beats the heuristic")
+			li_chk(bad, d2.table_header_mode == .Data, "...and is ADOPTED, so it survives a session round trip without the family")
+
+			d3 := ts_doc("name,qty\nbravo,2\n", 2)
+			defer doc_close(&d3)
+			d3.table_header_mode = .Header
+			table_headerless_resolve(&d3, .Data)
+			li_chk(bad, !d3.table_headerless && d3.table_header_mode == .Header, "...but it does not overwrite an answer the document already had")
+		}
+
+		// -- THE DATA-LOSS SEAM: flipping the flag must take the sort with it --
+		//
+		// A permutation built when line 0 was a header holds one offset per row of
+		// THAT row set. Add a row at the front and every visible row resolves to
+		// the line beside the one drawn -- which is what the cell editor splices
+		// through. Same shape as table_sort_shift dropping a sort when a newline
+		// moves, reached by a different route.
+		{
+			a := ts_menu_app("alpha,1\nbravo,2\ncharlie,3\n", 2)
+			defer app_destroy(&a)
+			d := app_active(&a)
+			doc_index_start(d)
+			for !doc_index_done(d) {}
+			table_sort_set(d, 1, false)
+			li_chk(bad, table_sorted(d), "precondition: a sort is live before the flag is flipped")
+			rows_before, rb_exact := table_row_count(d)
+			li_chk(bad, rb_exact && rows_before == 2, fmt.tprintf("precondition: two data rows under a header (%d, exact %v)", rows_before, rb_exact))
+
+			t: plat.Text
+			command_dispatch(.Table_First_Row_Is_Data, {}, &a, nil, &t, 10)
+
+			li_chk(bad, d.table_headerless, "the command flips the flag")
+			li_chk(bad, d.table_header_mode == .Data, "...and records that a person answered, so the heuristic stops being asked")
+			li_chk(bad, !table_sorted(d), "...and CLEARS THE SORT, because the row set just changed")
+			rows_after, _ := table_row_count(d)
+			li_chk(bad, rows_after == rows_before + 1, fmt.tprintf("...and the grid gained the row that was in the band (%d -> %d)", rows_before, rows_after))
+			li_chk(bad, len(d.table_widths) > 0, "...and the columns were re-fitted rather than left describing the old row set")
+
+			// Back again, and the state really is the other one rather than merely
+			// different -- a toggle that got stuck on would satisfy the checks above
+			// on its first press.
+			command_dispatch(.Table_First_Row_Is_Data, {}, &a, nil, &t, 10)
+			li_chk(bad, !d.table_headerless && d.table_header_mode == .Header, "pressing it again puts the header back")
+			back, _ := table_row_count(d)
+			li_chk(bad, back == rows_before, fmt.tprintf("...and the row count with it (%d, want %d)", back, rows_before))
 		}
 	}
 
@@ -32390,7 +32544,12 @@ when NEWTPAD_TESTS {
 					session_save(&a)
 				}
 				body, _ := os.read_entire_file(sp, context.temp_allocator)
-				bm_chk(bad, strings.contains(string(body), "newtpad-session 5") && strings.contains(string(body), " 6,20 "), fmt.tprintf("the line carries the set as one token: %q", strings.trim_space(string(body))))
+				// Format 6 as of 2026-08-01 (the header answer, appended after the
+				// bookmarks and ahead of the path). The version is asserted rather
+				// than ignored on purpose: this check is about the bookmark set
+				// being ONE TOKEN, and a field appended in the wrong place is
+				// exactly what would break that silently.
+				bm_chk(bad, strings.contains(string(body), "newtpad-session 6") && strings.contains(string(body), " 6,20 "), fmt.tprintf("the line carries the set as one token: %q", strings.trim_space(string(body))))
 				{
 					b: App
 					defer app_destroy(&b)
@@ -32537,6 +32696,13 @@ when NEWTPAD_TESTS {
 			bm_session(&bad, BM_FIX, bm_set)
 
 			fmt.printfln("bookmarktest: %d failures", bad)
+			// Exits non-zero, added 2026-08-01. It printed FAIL and returned 0 for
+			// its whole life, so a sweep that read exit codes -- which is every
+			// sweep -- called it green while it was red. development-loop.md §6 has
+			// counted nine of these in one day; this is the tenth, and it was found
+			// the same way all nine were, by looking rather than by the last fix
+			// generalising.
+			if bad > 0 {os.exit(1)}
 			return true
 		}
 

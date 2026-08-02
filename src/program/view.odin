@@ -16,6 +16,13 @@ Doc_View :: struct {
 	md_mode:     Md_Mode,
 	table:       bool,
 	table_delim: u8, // 0 = never chosen; doc_view_apply picks one
+	// The user's answer about line 0, already folded with the family default by
+	// whoever built this view (table_headerless_resolve adopts the family, so the
+	// mode carried here is the settled one). Riding in Doc_View rather than being
+	// restored beside it is what keeps session restore and a fresh open on one
+	// path -- both build a Doc_View and neither has to know that the grid has a
+	// second piece of state.
+	table_header_mode: Table_Header_Mode,
 }
 
 doc_view_capture :: proc(doc: ^Document) -> Doc_View {
@@ -24,6 +31,7 @@ doc_view_capture :: proc(doc: ^Document) -> Doc_View {
 		md_mode = doc.md_mode,
 		table = doc.table,
 		table_delim = doc.table_delim,
+		table_header_mode = doc.table_header_mode,
 	}
 }
 
@@ -65,6 +73,18 @@ doc_view_apply :: proc(doc: ^Document, v: Doc_View) {
 		// is no stored column index anywhere on disk that could be read back as a
 		// pixel offset, because the field was never written to disk in either unit.
 		doc.table_hscroll_px = 0
+		// The header answer, then the resolution, BEFORE the widths are cleared
+		// below -- whoever recomputes them (table_draw, one frame later) reads
+		// doc.table_headerless to decide whether line 0 counts toward a column's
+		// type, so it has to be settled by then.
+		//
+		// Resolved with NO family default, and that is not an omission: `v`'s mode
+		// is already the folded answer (table_headerless_resolve adopts the
+		// family), so consulting it again here would be applying a default to a
+		// document that has one. It is also what lets this proc stay ignorant of
+		// App, which is what session_restore and doc_reload need.
+		doc.table_header_mode = v.table_header_mode
+		table_headerless_resolve(doc, .Auto)
 		// Left empty on purpose: table_draw recomputes when the widths are empty
 		// (table.odin:183), so this needs no ^plat.Text and can run from
 		// session_restore and doc_reload, neither of which has one.

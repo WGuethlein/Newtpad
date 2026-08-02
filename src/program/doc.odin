@@ -1181,6 +1181,33 @@ Document :: struct {
 	// Read-only table view of a CSV/TSV (see table.odin), toggled per document.
 	table:       bool,
 	table_delim: u8, // ',' or '\t'; chosen when the view is turned on
+	// The first line is DATA, not column titles.
+	//
+	// Zero-is-init means false -- "there is a header" -- which is what every CSV
+	// this app has ever opened was assumed to be, and is right for most of them.
+	// It is the exception that had no way to be expressed: a headerless file showed
+	// its first row of real data in the sticky band, where it could not be edited,
+	// sorted, found or counted, which is §10's "silently dropping data in a data
+	// viewer is the worst possible failure" happening to exactly one row.
+	//
+	// Three producers branch on it and NOTHING else may: table_first_data_row (where
+	// the data starts), table_header_fields (what the band says) and table_row_count
+	// (how many rows there are). Every other consumer in the grid already resolves
+	// through one of those three, which is the property that made this a small change
+	// rather than a sweep -- see their comments.
+	//
+	// Set from the session, then a family default, then table_detect_headerless, in
+	// that order (table_headerless_resolve). Changing it CHANGES THE ROW SET, so
+	// every caller that writes it must clear the sort: a permutation built when line
+	// 0 was a header resolves every visible row to the line above the one now drawn,
+	// and the cell editor writes through that resolution.
+	table_headerless: bool,
+	// The person's answer, or Auto when nobody has given one. Distinct from the
+	// resolved bool above for the reason Table_Header_Mode's own comment gives: the
+	// answer is what persists and teaches a default, the bool is what the grid
+	// reads every frame. table_headerless_resolve is the only thing that turns one
+	// into the other.
+	table_header_mode: Table_Header_Mode,
 	// The grid's horizontal scroll, in PIXELS from the left edge of the first
 	// column -- the same kind of number doc.h_scroll is for the text view, which
 	// is why the name says its unit out loud.

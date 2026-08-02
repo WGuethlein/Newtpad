@@ -201,7 +201,7 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 
 		fmt.sbprintf(
 			&tb,
-			"%d %d %d %d %d %d %d %d %d %d %d %d %s %s\n",
+			"%d %d %d %d %d %d %d %d %d %d %d %d %s %d %s\n",
 			d.cursor,
 			d.anchor,
 			d.top,
@@ -215,12 +215,18 @@ session_save :: proc(a: ^App, sweep_backups := true) -> bool {
 			int(d.md_mode),
 			1 if d.table else 0,
 			bm_field,
+			// The user's ANSWER, not the resolved bool. Persisting the resolution
+			// would freeze a guess into a decision: a file whose heuristic answer
+			// was "headerless" would come back as though a person had said so, and
+			// would then teach the family default and never be re-judged when its
+			// contents changed. Auto restores as Auto and is decided again.
+			int(d.table_header_mode),
 			d.path,
 		)
 		ti += 1
 	}
 
-	body := fmt.tprintf("newtpad-session 5\nactive %d\n%s", active_idx, strings.to_string(tb))
+	body := fmt.tprintf("newtpad-session 6\nactive %d\n%s", active_idx, strings.to_string(tb))
 	sp := pjoin({dir, "session.txt"})
 	if !plat.file_write_atomic(sp, transmute([]u8)body) {
 		return false
@@ -333,7 +339,9 @@ session_restore :: proc(a: ^App) -> bool {
 		// path is last and may contain spaces, so the split count is the field count
 		nf := 7
 		switch {
-		case ver >= 5:
+		case ver >= 6:
+			nf = 15
+		case ver == 5:
 			nf = 14
 		case ver == 4:
 			nf = 13
@@ -356,6 +364,7 @@ session_restore :: proc(a: ^App) -> bool {
 		have_eol := false
 		md_mode := Md_Mode.Off
 		table := false
+		header_mode := Table_Header_Mode.Auto
 		bm_field := ""
 		path := ""
 		if ver >= 2 {
@@ -383,7 +392,23 @@ session_restore :: proc(a: ^App) -> bool {
 					}
 					if ver >= 5 {
 						if len(parts) >= 13 {bm_field = parts[12]}
-						path = parts[13] if len(parts) == 14 else ""
+						if ver >= 6 {
+							// Format 6: the user's answer about line 0, appended
+							// after the bookmarks and ahead of the path, which is
+							// where every added field goes. Range-checked like
+							// md_mode above -- an out-of-range integer off disk
+							// would make an invalid enum and every switch on it
+							// would fall through.
+							if len(parts) >= 14 {
+								m := pint(parts[13])
+								if m >= int(Table_Header_Mode.Auto) && m <= int(max(Table_Header_Mode)) {
+									header_mode = Table_Header_Mode(m)
+								}
+							}
+							path = parts[14] if len(parts) == 15 else ""
+						} else {
+							path = parts[13] if len(parts) == 14 else ""
+						}
 					} else {
 						path = parts[12] if len(parts) == 13 else ""
 					}
@@ -425,7 +450,7 @@ session_restore :: proc(a: ^App) -> bool {
 			d.top = clamp(top, 0, L)
 			// After the position clamps, not before: doc_view_apply re-anchors
 			// doc.top to a line start when a line-scrolled view is on.
-			doc_view_apply(d, Doc_View{wrap = wrap, md_mode = md_mode, table = table})
+			doc_view_apply(d, Doc_View{wrap = wrap, md_mode = md_mode, table = table, table_header_mode = header_mode})
 			// A buffer rebuilt from a backup has never been stat'd (doc_from_content
 			// sets no stamp), while doc_open already stamped the clean-tab case. Adopt
 			// what the session recorded so an unchanged file stays quiet -- and a file
