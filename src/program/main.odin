@@ -1036,7 +1036,14 @@ main :: proc() {
 		// (so the wheel still scrolls, and the bars still drag). After the scrollbars,
 		// so a press on either bar reaches it first.
 		if doc.kind == .Text && window.mouse_y >= i32(CHROME_TOP) {
-			drags := Drag_Latches{scrollbar_drag, hscrollbar_drag, md_preview_drag, divider_drag, table_resize_col >= 0}
+			// app.menu.scroll_drag belongs here for the reason this struct exists at
+			// all, and it was missed in v0.52.0: the GRID is a read-only surface, so
+			// `ro` is true for every press in it, so mouse_down was zeroed on the frame
+			// after a dropdown scrollbar was grabbed. The press landed and the drag
+			// died one frame later -- *"clicking the bar works but not hold and drag"*
+			// (Wyatt, v0.53.0). The filter dropdown only ever opens over the grid, so
+			// this path was not an edge case for it, it was the only path.
+			drags := Drag_Latches{scrollbar_drag, hscrollbar_drag, md_preview_drag, divider_drag, table_resize_col >= 0, app.menu.scroll_drag}
 			ro := ro_surface_swallows(doc.table, doc.md_mode, f32(window.mouse_x) >= ed_right, drags)
 			// 9.1's one surviving pixel -> content mapping, wired to the gesture it
 			// exists for: "click-to-sync-scroll, which only needs the nearest
@@ -1747,7 +1754,7 @@ hscrollbar_geo :: proc(doc: ^Document, winw, winh: f32, m: Hscroll) -> (b: Hbar)
 // exclude all of them, and this struct exists so the list is one thing that can
 // be tested rather than four `&&` clauses nobody re-reads.
 Drag_Latches :: struct {
-	vscroll, hscroll, preview, divider, col_resize: bool,
+	vscroll, hscroll, preview, divider, col_resize, menu_scroll: bool,
 }
 
 // Should a read-only surface swallow this mouse event?
@@ -1774,7 +1781,7 @@ Drag_Latches :: struct {
 // keeping the incident attached to the rule. The count is now pinned by an
 // assertion in hscrolltest so a SIXTH latch cannot be added silently.
 ro_surface_swallows :: proc(table: bool, md_mode: Md_Mode, in_preview_half: bool, d: Drag_Latches) -> bool {
-	if d.vscroll || d.hscroll || d.preview || d.divider || d.col_resize {return false}
+	if d.vscroll || d.hscroll || d.preview || d.divider || d.col_resize || d.menu_scroll {return false}
 	return table || md_mode == .Preview || (md_mode == .Split && in_preview_half)
 }
 

@@ -6480,6 +6480,13 @@ when NEWTPAD_TESTS {
 				menu_scroll_mouse(&a, &mt, &dd, W, H)
 			}
 
+			// (That the GRID must not swallow this drag -- ro_surface_swallows zeroing
+			// mouse_down one frame after the grab, which is what *"clicking the bar
+			// works but not hold and drag"* was -- is asserted by HSCROLLTEST's ro-swallow
+			// block, which already enumerates every latch and is guarded by an #assert
+			// on the struct's size. A second, weaker copy here would be worse than the
+			// pointer.)
+
 			// And a drag cannot outlive the menu.
 			menu_close(&a)
 			li_chk(bad, !a.menu.scroll_drag, "closing the menu ends any drag with it")
@@ -25918,14 +25925,23 @@ when NEWTPAD_TESTS {
 					{preview = true},
 					{divider = true},
 					{col_resize = true},
+					{menu_scroll = true},
 				}
-				names := []string{"vscroll", "hscroll", "preview", "divider", "col_resize"}
+				names := []string{"vscroll", "hscroll", "preview", "divider", "col_resize", "menu_scroll"}
 				// The list above is written by hand, so a latch added to the
 				// struct and not to it would go untested -- which is how `hscroll`
 				// went missing from the predicate itself. Every field is a bool, so
-				// the struct's size IS its field count: a sixth latch fails to
+				// the struct's size IS its field count: a seventh latch fails to
 				// compile here until it is enumerated above.
-				#assert(size_of(Drag_Latches) == 5)
+				//
+				// `menu_scroll` is the sixth, and the way it arrived is worth knowing:
+				// it existed for a whole release as app.menu.scroll_drag WITHOUT being
+				// a field here, so this assert never fired and the dropdown scrollbar
+				// died on its first drag frame over the grid (v0.52.0). The guard
+				// enforces "every field of this struct is tested"; nothing enforces
+				// "every cross-frame drag latch in the app is a field of this struct".
+				// If you add a latch that survives a frame, it belongs here.
+				#assert(size_of(Drag_Latches) == 6)
 				for d, i in all {
 					// Grid: every latch must veto the swallow.
 					if ro_surface_swallows(true, .Off, false, d) {
