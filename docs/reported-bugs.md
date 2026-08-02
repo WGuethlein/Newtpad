@@ -11,6 +11,46 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
+## From the v0.37.0 live pass (2026-08-01) — the preview half, not yet investigated
+
+The table half of that pass shipped as v0.38.0 (HANDOFF §6be). These three are what the preview
+pass turned up, recorded from Wyatt's own notes on
+[live-pass-v0.37.0.md](live-pass-v0.37.0.md) and not yet reproduced.
+
+### A Tab inside a fenced code block draws an empty rectangle
+
+*"This works, though a Tab character puts an empty rectangle in the code block in it's stead"* (§7).
+
+Reads as `.notdef` — the preview's code-block path handing a raw `\t` to the shaper instead of
+expanding it first. The document view does not do this, so the two paths disagree about tabs and the
+document one is the reference. Contained, and the likeliest quick win of the three.
+
+### Dragging the scrollbar ghosts the Split-view sync; the wheel is clean
+
+*"grabbing the vertical scrollbar seems to have a ghosting type of thing on scrolling that way, with
+the scroll wheel it looks fine"* (§5, and the same again for the preview half).
+
+Both halves scroll to roughly the right place, so the sync itself is fine — it is specifically the
+**drag** path. Drag and wheel reach the sync separately; only one of them is repainting both panes.
+Worth checking whether the drag updates the anchor without marking the other half dirty.
+
+### A blank line may no longer visibly end a list item
+
+*"It does not look like this is the case, there isn't a slightly larger gap like the top of the
+list"* (§3).
+
+The one v0.37.0 item that could mean the paragraph join is over-eager, which would be a correctness
+bug rather than a spacing one. **Reproduce before believing it**: it may be that the item ends
+correctly and only the gap under it is too small, which is a different fix in a different place.
+
+### Also from that pass, deliberately not queued
+
+Two items Wyatt flagged are **CommonMark working as v0.37.0 intended**, not defects: a soft line
+break inside a paragraph renders as a space unless the line ends in two spaces or a backslash (so
+address blocks and blockquote continuations need them), and `---` directly under a line of prose is a
+setext underline that makes it a heading. If the first one keeps costing him in real notes, the
+answer is a setting — "treat single newlines as breaks", GitHub-comment style — not a parser change.
+
 ## Reported 2026-08-01 — documented for a later pass, not investigated
 
 Wyatt's list, recorded verbatim at his direction: *"just document them for a further pass later."* Each
@@ -30,24 +70,6 @@ Worth deciding before building: Newtpad tear-off means a **new process** (a seco
 thing today), which drags in what the torn tab does about unsaved state and about the session store —
 both windows would be writing the same `%APPDATA%\Newtpad` session. That is the actual design question,
 not the drag gesture.
-
-### Sorted table headers truncate their text without the column changing width
-
-*"when you sort the columns in table view the column headers seem to truncate and doesn't show the rest
-of the text until you expand the columns... but the column doesn't change horizontal size"*
-
-**Almost certainly the sort's own header decorations eating label width.** v0.36.0 added an arrow, a
-hover chevron and — new in that release — a **precedence digit**, all inside the header cell.
-`table_header_layout` is the one producer of header geometry (CLAUDE.md's one-layout rule), and HANDOFF
-§6bc records that header geometry now depends on document sort state via `table_sort_digits_shown` →
-`doc.table_sort.nkeys`, where before this branch it was a function of columns and DPI alone.
-
-So the label's available width shrinks when a sort is applied while the **column** width does not — which
-is exactly what he describes. Start at `table_header_layout` and check whether the label's measured width
-subtracts the decorations from the same rectangle the truncation is computed against.
-
-**This is a v0.36.0 regression by that reading**, and it is the kind of thing the live pass in
-[live-pass-v0.36.0.md](live-pass-v0.36.0.md) §2 is aimed at. Not verified.
 
 ### Web links do not open from the CSV table view (they work in text and JSON)
 
