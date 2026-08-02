@@ -26,10 +26,24 @@ MENU_PAD_96 :: f32(12) // horizontal padding around a top-level title
 // of it, so it cannot run away. Only the window-height clamp applies there, as it
 // always did. See menu_dropdown_rect.
 MENU_MAX_ROWS :: f32(12)
-// Width of the dropdown's scrollbar, drawn only when there is something to
-// scroll. Thin: it is an indicator that there is more, not a control -- the wheel
-// and the arrow keys are how you move, exactly as in the document.
-MENU_SCROLLBAR_W_96 :: f32(4)
+// The dropdown's scrollbar: the bar that is DRAWN, and the LANE that grabs it.
+//
+// Two numbers for the same reason doc.odin splits SCROLLBAR_W_96 (14) from
+// SCROLLBAR_TRACK_W_96 (8): a bar you can see and a band you can hit are not the
+// same width, and collapsing them means choosing between an ugly bar and an
+// unhittable one. The bar is drawn at the lane's left edge, so lane - track falls
+// out as an inset from the panel's border rather than a bar jammed against it.
+//
+// It used to be 4 wide and drawn only, on the argument that it "is an indicator
+// that there is more, not a control -- the wheel and the arrow keys are how you
+// move". Wyatt, live use of v0.51.0: *"scroll wheel works, scrollbar doesn't in
+// that modal"*. The argument had a second half -- that a draggable thumb "would
+// need its own hit-test inside a surface whose every other pixel already means
+// 'pick this row'" -- and that half stopped being true in v0.51.0, when the strip
+// was excluded from the row hit-test to stop it ticking checkboxes. The objection
+// removed itself; this is the control it was blocking.
+MENU_SCROLLBAR_W_96 :: f32(8)
+MENU_SCROLLBAR_LANE_96 :: f32(12)
 GEAR_W_96 :: f32(34) // settings gear hit box (wider than the glyph, so it's clickable)
 MENU_BAR_H := MENU_BAR_H_96
 MENU_ITEM_H := MENU_ITEM_H_96
@@ -687,6 +701,18 @@ Menu_State :: struct {
 	// have been the count silently disappearing off the end of a long query -- a
 	// missing number rather than a crash, which is the kind nobody reports.
 	query_label: [224]u8,
+
+	// The dropdown scrollbar's drag, latched across frames -- a drag is by
+	// definition longer than the press that starts it. On Menu_State rather than
+	// as a main.odin local like scrollbar_drag/hscrollbar_drag because menu_close
+	// has to be able to end it: a menu dismissed by Escape mid-drag would
+	// otherwise leave the latch set, and the next press anywhere would resume
+	// scrolling a dropdown that is no longer open.
+	scroll_drag: bool,
+	// Where inside the thumb the press landed, so the thumb keeps its offset under
+	// the pointer instead of teleporting its top there. Zero for a press on the
+	// bare track, which is what makes such a press a jump -- see vbar_grab_at.
+	scroll_grab: f32,
 }
 
 // Must be called before the first frame: the zero value of `open` is 0, which
@@ -731,6 +757,11 @@ menu_close :: proc(app: ^App) {
 	app.menu.ctx = false
 	app.menu.ctx_items = nil
 	app.menu.query_len = 0
+	// A drag cannot outlive the list it scrolls. Escape mid-drag would otherwise
+	// leave the latch set with no dropdown under it, and the next press anywhere
+	// on screen would resume scrolling nothing.
+	app.menu.scroll_drag = false
+	app.menu.scroll_grab = 0
 }
 
 // Covers `ctx` as well as the bar: without it, a click outside a context menu
@@ -1261,24 +1292,20 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	// Drawn, not draggable. The wheel and the arrow keys move the list; a drag
 	// would need its own hit-test inside a surface whose every other pixel already
 	// means "pick this row", and the wheel is what a person reaches for anyway.
-	// Through the same producer menu_item_at excludes the strip with, so the pixels
-	// painted here and the pixels the hit-test refuses are one decision rather than
-	// two expressions that agree today.
-	if bw := scrollbar_w(items, app.menu.top, h); bw > 0 {
-		total := len(items)
-		bx := x0 + dw - bw
-		frac := f32(app.menu.rows) / f32(total)
-		th := max(h * frac, MENU_ITEM_H * 0.5)
-		// Positioned off the FIRST VISIBLE ROW over the rows that can be first, so
-		// the thumb reaches the bottom exactly when the last row is on screen.
-		span := max(1, total - app.menu.rows)
-		ty := y0 + (h - th) * f32(min(app.menu.top, span)) / f32(span)
+	// Through the same producer menu_item_at excludes the lane with and
+	// menu_scroll_press starts a drag from, so what is painted, what refuses a row
+	// and what can be grabbed are one decision rather than three expressions that
+	// agree today. The thumb's position in particular used to be derived here off
+	// `total - app.menu.rows`, which is not the range a drag can reach -- rows are
+	// not all one height, so the two disagreed wherever a separator was in play.
+	if b, _ := menu_vbar(app, items, x0, y0, dw, h); b.shown {
+		track := max(sx(MENU_SCROLLBAR_W_96), 2)
 		plat.quads_draw(
 			gfx,
 			qp,
 			[]plat.Quad {
-				{pos = {bx, y0}, size = {bw, h}, color = g_theme[.Bg_Raised]},
-				{pos = {bx, ty}, size = {bw, th}, color = g_theme[.Scrollbar_Thumb]},
+				{pos = {b.x, b.track_y}, size = {track, b.track_h}, color = g_theme[.Bg_Raised]},
+				{pos = {b.x, b.thumb_y}, size = {track, b.thumb_h}, color = g_theme[.Scrollbar_Thumb]},
 			},
 		)
 	}
@@ -1378,24 +1405,79 @@ menu_visible_rows :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> int {
 	return rows_fitting(menu_items(app), app.menu.top, h)
 }
 
-// The scrollbar strip's width, or 0 when there is nothing to scroll.
+// The largest `top` the list can settle on -- the first row after which
+// everything remaining fits.
 //
-// ONE PRODUCER, consumed by the draw that paints the strip and by the hit-test
-// that must not resolve a click on it to the row underneath. The strip is drawn
-// at `x0 + w - bw` -- INSIDE the dropdown's own width, not beside it -- so
-// without this it was live menu surface, and a click aimed at the thumb ticked
-// whatever value happened to sit at that height. On the column filter that is a
-// mis-click that silently changes which rows the grid shows.
-//
-// It went unnoticed because it is only reachable on a list long enough to need
-// scrolling, which the value list rarely was while it was capped at 512 and
-// always is now. Same shape as the doc_close leak this batch also fixed: latent,
-// bounded by the cap, and unbounded the moment the cap came off.
+// ONE definition, because three things need it and they must agree exactly:
+// menu_wheel clamps to it, menu_vbar positions the thumb against it, and
+// menu_scroll_to maps a drag's fraction onto it. `len(items) - rows` is the
+// obvious approximation and it is WRONG here, because rows are not all the same
+// height -- a separator is 0.4 of one -- so the count that fits depends on where
+// you start. The thumb reaching the bottom exactly when the last row is on screen
+// is a property of the two ends using this same number, not of the arithmetic
+// happening to line up.
 @(private = "file")
-scrollbar_w :: proc(items: []Menu_Item, top: int, h: f32) -> f32 {
-	rows := rows_fitting(items, top, h)
-	if rows <= 0 || len(items) <= rows {return 0}
-	return max(sx(MENU_SCROLLBAR_W_96), 2)
+menu_scroll_last :: proc(items: []Menu_Item, h: f32) -> int {
+	last := 0
+	for last < len(items) {
+		if rows_fitting(items, last, h) >= len(items) - last {break}
+		last += 1
+	}
+	return last
+}
+
+// The dropdown's scrollbar as a Vbar, plus the width of the lane that grabs it.
+// Zero value (`shown == false`, `lane == 0`) when there is nothing to scroll.
+//
+// ONE PRODUCER for a bar with four consumers: the draw that paints it,
+// menu_item_at which must not resolve a click on it to the row behind,
+// menu_scroll_press which starts a drag on it, and menu_scroll_to which
+// continues one. That is CLAUDE.md's one-layout-per-widget rule, and this strip
+// is the reason the rule is written the way it is -- it shipped as pixels the
+// draw invented and the hit-test knew nothing about, and the result was a click
+// on the thumb ticking a checkbox.
+//
+// A Vbar rather than four loose floats SO THAT vbar_grab_at and vbar_frac_at can
+// be reused verbatim. Their exact-inverse property -- press the thumb, hold
+// perfectly still, and nothing moves -- was paid for once on the document's bar
+// after an earlier version disagreed with its own inverse by
+// track_h / (track_h - thumb_h). Re-deriving it here in row units would be
+// re-buying it. main.odin's comment on vbar_frac_at asks for exactly this: the
+// bars map onto different models, and the only thing keeping them honest is that
+// the pointer-to-fraction half is identical.
+//
+// PURE, taking the rect rather than computing it: menu_dropdown_rect walks every
+// item through dropdown_w to size itself, and the hit-test has already paid for
+// that by the time it needs the lane. See menu_vbar_at for the callers that
+// genuinely have nothing yet.
+@(private = "file")
+menu_vbar :: proc(app: ^App, items: []Menu_Item, x0, oy, w, h: f32) -> (b: Vbar, lane: f32) {
+	total := len(items)
+	rows := rows_fitting(items, app.menu.top, h)
+	if rows <= 0 || total <= rows {return}
+	lane = max(sx(MENU_SCROLLBAR_LANE_96), 3)
+	b.shown = true
+	b.x = x0 + w - lane
+	// The track starts where the ITEMS start, not at the rect's own y. The panel
+	// fill and every row are inset one pixel inside the border; the bar used to be
+	// drawn at the raw y and so sat a pixel above the row it pointed at.
+	b.track_y, b.track_h = oy + sx(1), h
+	b.thumb_h = max(h * f32(rows) / f32(total), MENU_ITEM_H * 0.5)
+	span := max(1, menu_scroll_last(items, h))
+	b.thumb_y = b.track_y + (b.track_h - b.thumb_h) * f32(clamp(app.menu.top, 0, span)) / f32(span)
+	return
+}
+
+// menu_vbar for the mouse handlers, which start with a pointer and nothing else.
+//
+// Not file-private, for the same reason menu_visible_rows and dropdown_w are not:
+// the seam this widget keeps failing at is "what is drawn versus what responds",
+// and a test cannot compare the two without being able to ask where the thumb is.
+// tablesorttest presses exactly on it.
+menu_vbar_at :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (b: Vbar, lane: f32) {
+	if !menu_dropdown_active(app) {return}
+	x0, oy, w, h := menu_dropdown_rect(t, app, width, height)
+	return menu_vbar(app, menu_items(app), x0, oy, w, h)
 }
 
 @(private = "file")
@@ -1446,11 +1528,7 @@ menu_wheel :: proc(app: ^App, t: ^plat.Text, delta: int, w, h: f32) -> bool {
 	if vis >= len(items) && app.menu.top == 0 {return true} // nothing to scroll, still ours
 	// Clamped so the last row can reach the bottom and no further: scrolling into
 	// empty space below a list is the thing that makes a list feel broken.
-	last := 0
-	for last < len(items) {
-		if rows_fitting(items, last, dh) >= len(items) - last {break}
-		last += 1
-	}
+	last := menu_scroll_last(items, dh)
 	// PLUS delta, not minus. plat.Window.scroll_delta is documented "+down / -up"
 	// and every other consumer in the tree ADDS it -- doc.filter_top, doc.h_scroll,
 	// doc.table_hscroll_px and doc_scroll's row step. This was the one subtractor,
@@ -1460,6 +1538,64 @@ menu_wheel :: proc(app: ^App, t: ^plat.Text, delta: int, w, h: f32) -> bool {
 	// was what ran the wrong way.
 	app.menu.top = clamp(app.menu.top + delta, 0, last)
 	return true
+}
+
+// The dropdown scrollbar's mouse, and the only entry point main.odin needs.
+// Returns true when it took the event, so the caller does not go on to the row
+// hit-test with a pointer that is on the bar.
+//
+// WHY THIS RUNS BEFORE menu_hit_test: a press in the lane must start a drag
+// rather than be swallowed as "dead space inside the dropdown", which is what
+// menu_hit_test would now correctly do with it.
+//
+// IT CLEARS mouse_pressed AND NEVER mouse_down. That distinction is the whole of
+// why the grid's horizontal bar once moved on the press and then froze -- see
+// Drag_Latches in main.odin. `mouse_down` is persistent platform state, set on
+// WM_LBUTTONDOWN and cleared on WM_LBUTTONUP; zeroing it mid-gesture kills the
+// drag twice over, because this latch sees `!mouse_down` on the next frame and
+// clears itself, and WM_MOUSEMOVE only updates the pointer while the button is
+// held, so the coordinate stops moving too.
+menu_scroll_mouse :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) -> bool {
+	m := &app.menu
+	if m.scroll_drag {
+		if !win.mouse_down {m.scroll_drag = false;return false}
+		b, _ := menu_vbar_at(t, app, w, h)
+		// The list can stop being scrollable underneath a live drag -- typing in the
+		// filter's search box narrows it to three rows while the button is held.
+		if !b.shown {m.scroll_drag = false;return false}
+		menu_scroll_to(app, b, f32(win.mouse_y))
+		win.mouse_pressed = false
+		return true
+	}
+	if !menu_dropdown_active(app) || !win.mouse_pressed {return false}
+	b, lane := menu_vbar_at(t, app, w, h)
+	if !b.shown {return false}
+	mx, my := f32(win.mouse_x), f32(win.mouse_y)
+	if mx < b.x || mx >= b.x + lane {return false}
+	if my < b.track_y || my >= b.track_y + b.track_h {return false}
+	m.scroll_drag = true
+	// A press OFF the thumb grabs at zero, which vbar_frac_at reads as "put the
+	// thumb's top here" -- the list jumps to that position and the drag carries on
+	// from it, rather than paging. That is what the document's scrollbar does
+	// through this same pair of procedures, and Wyatt asked for this one to "act
+	// like the regular vertical scrollbar".
+	m.scroll_grab = vbar_grab_at(b, my)
+	menu_scroll_to(app, b, my)
+	win.mouse_pressed = false
+	return true
+}
+
+// A pointer position on the track -> menu.top. The one place the bar's
+// continuous model meets the list's discrete one.
+@(private = "file")
+menu_scroll_to :: proc(app: ^App, b: Vbar, my: f32) {
+	items := menu_items(app)
+	last := menu_scroll_last(items, b.track_h)
+	f := vbar_frac_at(b, my, app.menu.scroll_grab)
+	// Rounded, not truncated: with truncation the last row is only reachable when
+	// the fraction hits exactly 1.0, so the final row of a long list needs the
+	// pointer on one specific pixel.
+	app.menu.top = clamp(int(f * f32(last) + 0.5), 0, last)
 }
 
 // Scroll the dropdown the minimum needed to bring `app.menu.item` into view.
@@ -1481,11 +1617,14 @@ menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> in
 	x0, oy, w, h := menu_dropdown_rect(t, app, width, height)
 	items := menu_items(app)
 	// The SCROLLBAR is not a row. It is drawn inside `w` rather than beside it, so
-	// its strip used to hit-test to whatever row sat at that height -- see
-	// scrollbar_w. Excluded here, in the hit-test, rather than by narrowing `w`:
-	// the rect is what the draw fills and the border surrounds, and shrinking it
-	// would move the strip rather than make it inert.
-	if mx < x0 || mx >= x0 + w - scrollbar_w(items, app.menu.top, h) {return -1}
+	// its lane used to hit-test to whatever row sat at that height -- see
+	// menu_vbar. Excluded here, in the hit-test, rather than by narrowing `w`: the
+	// rect is what the draw fills and the border surrounds, and shrinking it would
+	// move the bar rather than make it inert. The LANE is excluded, not the drawn
+	// track, so the pixels that refuse a row and the pixels that start a drag are
+	// the same pixels.
+	_, lane := menu_vbar(app, items, x0, oy, w, h)
+	if mx < x0 || mx >= x0 + w - lane {return -1}
 	// The rect's own y, not menu_origin's: under a flip-up the two differ by the
 	// whole height of the menu, and this is the half that would still have been
 	// hit-testing the un-flipped box.

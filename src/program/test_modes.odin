@@ -6375,6 +6375,66 @@ when NEWTPAD_TESTS {
 		cmd, consumed = menu_hit_test(&a, &mt, &win, W, H)
 		li_chk(bad, consumed && cmd == .None && menu_is_filter_dropdown(&a), fmt.tprintf("a click on the search box likewise leaves it open (%v, open %v)", cmd, menu_is_filter_dropdown(&a)))
 
+		// -- DRAGGING THE SCROLLBAR ---------------------------------------------
+		//
+		// *"scroll wheel works, scrollbar doesn't in that modal"* (Wyatt, v0.51.0).
+		// Driven through menu_scroll_mouse, which is the entry point main.odin calls.
+		{
+			a.menu.top = 0
+			b, lane := menu_vbar_at(&mt, &a, W, H)
+			li_chk(bad, b.shown && lane > 0, fmt.tprintf("the dropdown has a scrollbar to drag (shown %v, lane %.0f)", b.shown, lane))
+			li_chk(bad, b.x >= x0 && b.x + lane <= x0 + w + 1, fmt.tprintf("...whose lane is inside the dropdown (x %.0f, lane %.0f, box %.0f..%.0f)", b.x, lane, x0, x0 + w))
+
+			// THE EXACT-INVERSE PROPERTY, which is the whole reason this reuses the
+			// document's vbar_grab_at/vbar_frac_at rather than deriving its own map:
+			// press the thumb, hold perfectly still, and the list must not move. An
+			// earlier version of the document's bar failed exactly here, drifting by
+			// track_h/(track_h - thumb_h) per frame.
+			d2: plat.Window
+			d2.mouse_pressed, d2.mouse_down = true, true
+			mid := b.thumb_y + b.thumb_h * 0.5
+			d2.mouse_x, d2.mouse_y = i32(b.x + 1), i32(mid)
+			li_chk(bad, menu_scroll_mouse(&a, &mt, &d2, W, H), "a press in the lane is taken by the scrollbar, not by the row behind it")
+			li_chk(bad, a.menu.scroll_drag, "...and latches a drag")
+			li_chk(bad, a.menu.top == 0, fmt.tprintf("...pressing the thumb and holding still does not move the list (top %d, want 0)", a.menu.top))
+			li_chk(bad, !d2.mouse_pressed && d2.mouse_down, "...consuming the press but NOT mouse_down, which is what would kill the drag")
+
+			// Drag to the bottom of the track: the last row reaches the bottom, and
+			// no further.
+			d2.mouse_y = i32(b.track_y + b.track_h + 500) // past the end on purpose
+			menu_scroll_mouse(&a, &mt, &d2, W, H)
+			want := menu_visible_rows(&mt, &a, W, H)
+			li_chk(bad, a.menu.top + want == len(menu_items(&a)), fmt.tprintf("dragging to the bottom lands on the last row exactly (top %d + %d visible, %d rows)", a.menu.top, want, len(menu_items(&a))))
+			bottom_top := a.menu.top
+
+			// ...and back to the top.
+			d2.mouse_y = i32(b.track_y - 500)
+			menu_scroll_mouse(&a, &mt, &d2, W, H)
+			li_chk(bad, a.menu.top == 0, fmt.tprintf("dragging back above the track lands on the first row (top %d)", a.menu.top))
+			li_chk(bad, bottom_top > 0, "precondition: the two ends of the drag are actually different positions")
+
+			// The button comes up: the latch clears and the pointer stops steering.
+			d2.mouse_down = false
+			menu_scroll_mouse(&a, &mt, &d2, W, H)
+			li_chk(bad, !a.menu.scroll_drag, "releasing the button ends the drag")
+
+			// A PRESS ON THE BARE TRACK JUMPS THERE rather than paging -- what the
+			// document's scrollbar does, which is what Wyatt asked this one to match.
+			a.menu.top = 0
+			b, _ = menu_vbar_at(&mt, &a, W, H)
+			d2.mouse_pressed, d2.mouse_down = true, true
+			d2.mouse_x, d2.mouse_y = i32(b.x + 1), i32(b.track_y + b.track_h * 0.5)
+			menu_scroll_mouse(&a, &mt, &d2, W, H)
+			li_chk(bad, a.menu.top > 0, fmt.tprintf("a press on the track below the thumb jumps the list to it (top %d)", a.menu.top))
+			li_chk(bad, a.menu.top < bottom_top, fmt.tprintf("...to the MIDDLE, not to the end (top %d, bottom %d)", a.menu.top, bottom_top))
+
+			// And a drag cannot outlive the menu.
+			menu_close(&a)
+			li_chk(bad, !a.menu.scroll_drag, "closing the menu ends any drag with it")
+			command_dispatch(.Table_Filter_Open, {}, &a, nil, &mt, 10)
+			a.menu.top = 0
+		}
+
 		// AND CLICKING AWAY STILL CLOSES IT. Without this the fix would be "the menu
 		// never goes away", which is worse than what it replaced. Outside on x, and
 		// still below the menu bar's own band so this tests the dropdown's branch
