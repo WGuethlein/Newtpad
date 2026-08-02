@@ -8892,10 +8892,14 @@ when NEWTPAD_TESTS {
 			fmt.println("--- hover row hit-test ---")
 			menu_open_at(&a, 1) // Edit: has separators
 			W, H := f32(1280), f32(720)
-			dx, dw, _ := menu_dropdown_rect(&t, &a, W, H)
+			dx, dy, dw, _ := menu_dropdown_rect(&t, &a, W, H)
 			inx := dx + dw * 0.5 // a point inside the dropdown horizontally
 			rows_ok, seps_seen := true, 0
-			y := TAB_STRIP_H + MENU_BAR_H + sx(1)
+			// From the rect's own y, not from TAB_STRIP_H + MENU_BAR_H + sx(1)
+			// restated here: since the flip-up landed, the box's top is no longer a
+			// constant, and a probe walking down from the anchor would be walking
+			// down from the wrong edge on any window short enough to flip.
+			y := dy + sx(1)
 			for it, i in menus[1].items {
 				ih := MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4
 				got := menu_item_at(&t, &a, inx, y + ih * 0.5, W, H)
@@ -8939,10 +8943,11 @@ when NEWTPAD_TESTS {
 					HH := TAB_STRIP_H + MENU_BAR_H + sx(1) + content + sx(4) + extra
 					menu_open_at(&a, mi)
 					drawn := menu_visible_rows(&t, &a, 1280, HH)
-					dx2, dw2, hh := menu_dropdown_rect(&t, &a, 1280, HH)
-					// Last hit-testable index, probing every row's midpoint.
+					dx2, dy2, dw2, hh := menu_dropdown_rect(&t, &a, 1280, HH)
+					// Last hit-testable index, probing every row's midpoint, from the
+					// rect's own top edge (see the hover probe above).
 					last_hit := -1
-					y := TAB_STRIP_H + MENU_BAR_H + sx(1)
+					y := dy2 + sx(1)
 					for i := a.menu.top; i < len(items); i += 1 {
 						ih := MENU_ITEM_H if items[i].cmd != .None else MENU_ITEM_H * 0.4
 						if menu_item_at(&t, &a, dx2 + dw2 * 0.5, y + ih * 0.5, 1280, HH) >= 0 {last_hit = i}
@@ -8959,6 +8964,81 @@ when NEWTPAD_TESTS {
 			}
 			fmt.printfln("  draw/hit agree at every height: %v %s", dh_bad == 0, "OK" if dh_bad == 0 else "FAIL")
 			bad += dh_bad
+
+			// --- the flip-up, on a context menu anchored near the bottom -------
+			//
+			// "It does not scroll, there is no scroll bar in this instance, and the
+			// menu is behind the bottom of window menu items" (Wyatt, live use,
+			// v0.36.0, shrinking the window until the header menu had no room). The
+			// rect used to cap height downward only and menu_dropdown_rect's comment
+			// argued the case was unreachable because column headers sit at the top
+			// of the grid -- true, and on a short enough window the top of the grid
+			// is near the bottom of the WINDOW.
+			//
+			// Probed through menu_item_at at each drawn row's midpoint, so this is
+			// the draw/hit-test seam and not the rect talking to itself: a flip
+			// applied in menu_dropdown_rect but not read by the hit-test paints the
+			// menu in one place and accepts clicks in another, which is the one
+			// failure this whole file is organised around.
+			fmt.println("--- a context menu near the bottom flips up ---")
+			{
+				items := table_header_menu_items
+				full := f32(0)
+				for it in items {full += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
+				// Short enough that the anchor leaves room for ONE row below it,
+				// and tall enough that the whole menu fits above.
+				SH := TAB_STRIP_H + MENU_BAR_H + full + MENU_ITEM_H * 2
+				anchor_y := SH - MENU_ITEM_H
+				menu_open_ctx(&a, items, 400, anchor_y, 0)
+				fx, fy, fw, fh := menu_dropdown_rect(&t, &a, 1280, SH)
+
+				flipped := fy < anchor_y
+				fits := fy >= 0 && fy + fh <= SH
+				whole := fh >= full
+				fmt.printfln("  anchor y=%.0f  box y=%.0f h=%.0f (window %.0f, menu %.0f)  flipped=%v fits=%v whole=%v", anchor_y, fy, fh, SH, full, flipped, fits, whole)
+				if !flipped {bad += 1;fmt.println("  FAIL the menu did not flip above the anchor")}
+				if !fits {bad += 1;fmt.println("  FAIL the flipped menu is not entirely on screen")}
+				if !whole {bad += 1;fmt.println("  FAIL the flipped menu did not keep every row")}
+				// Its bottom edge sits at the anchor, which is what "flip" means --
+				// a menu merely shoved up until it fit would satisfy the three
+				// checks above while landing nowhere near what was clicked.
+				if abs(fy + fh - anchor_y) > 1 {
+					bad += 1
+					fmt.printfln("  FAIL the flipped menu's bottom is not at the anchor (%.0f vs %.0f)", fy + fh, anchor_y)
+				}
+
+				// THE SEAM. Every row the draw emits is hit-testable at its own
+				// midpoint, and returns ITS OWN index.
+				drawn := menu_visible_rows(&t, &a, 1280, SH)
+				seam_bad := 0
+				y := fy + sx(1)
+				for i in 0 ..< drawn {
+					ih := MENU_ITEM_H if items[i].cmd != .None else MENU_ITEM_H * 0.4
+					got := menu_item_at(&t, &a, fx + fw * 0.5, y + ih * 0.5, 1280, SH)
+					want := i if items[i].cmd != .None else -1
+					if got != want {
+						seam_bad += 1
+						fmt.printfln("  FAIL row %d hit-tests as %d (want %d) at y=%.0f", i, got, want, y + ih * 0.5)
+					}
+					y += ih
+				}
+				if drawn != len(items) {
+					seam_bad += 1
+					fmt.printfln("  FAIL the flipped menu drew %d of %d rows", drawn, len(items))
+				}
+				fmt.printfln("  every flipped row is clickable where it is drawn: %v %s", seam_bad == 0, "OK" if seam_bad == 0 else "FAIL")
+				bad += seam_bad
+
+				// CONTROL: the same menu on a tall window does NOT flip. Without
+				// this, a rect that always flipped would pass everything above.
+				menu_close(&a)
+				menu_open_ctx(&a, items, 400, TAB_STRIP_H + MENU_BAR_H, 0)
+				_, ty, _, _ := menu_dropdown_rect(&t, &a, 1280, 720)
+				down := ty == TAB_STRIP_H + MENU_BAR_H
+				fmt.printfln("  ...and with room below it opens downward from the anchor: %v %s", down, "OK" if down else "FAIL")
+				if !down {bad += 1}
+				menu_close(&a)
+			}
 
 			fmt.println("--- global chords survive menu mode ---")
 			for k in ([]plat.Key{.S, .P, .N, .Z}) {
@@ -9312,7 +9392,7 @@ when NEWTPAD_TESTS {
 					a.menu.open = mi
 					a.menu.item = -1
 					a.menu.top = 0
-					_, _, h := menu_dropdown_rect(&t, &a, W, H)
+					_, _, _, h := menu_dropdown_rect(&t, &a, W, H)
 					n0 := menu_visible_rows(&t, &a, W, H) // rows fitting from top=0
 					fits := n0 >= len(items)
 					if fits || n0 == 0 {
@@ -9353,7 +9433,7 @@ when NEWTPAD_TESTS {
 				for m, mi in menus {
 					a.menu.open = mi
 					a.menu.top = 0
-					_, _, h := menu_dropdown_rect(&t, &a, W, H)
+					_, _, _, h := menu_dropdown_rect(&t, &a, W, H)
 					for k in 0 ..< len(m.items) {
 						once := menu_resolve_top(0, k, m.items, h)
 						twice := menu_resolve_top(once, k, m.items, h)
