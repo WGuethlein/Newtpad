@@ -399,7 +399,7 @@ main :: proc() {
 			// update_running is in here so a finished check is picked up within
 			// 200 ms rather than sitting until the next keypress -- the app is
 			// idle by definition while the user waits for the answer.
-			polling := session_dirty || !doc_index_done(d0) || search_running(d0) || scrollbar_drag || hscrollbar_drag || update_running(&app.update)
+			polling := session_dirty || !doc_index_done(d0) || search_running(d0) || scrollbar_drag || hscrollbar_drag || app.menu.scroll_drag || update_running(&app.update)
 			idle := 200 if polling else 1000
 			// The caret blink is the ONE timer in this app (UI spec §10), so it
 			// shortens this sleep to the next phase change and to nothing else --
@@ -683,12 +683,19 @@ main :: proc() {
 		menu_hover_item(&app, &text, window)
 		history_hover_update(&app, window, f32(window.width))
 
+		// The dropdown's OWN scrollbar, ahead of its rows: a press in the bar's lane
+		// has to start a drag rather than be swallowed as dead space inside the
+		// dropdown, which is what menu_hit_test would otherwise correctly do with
+		// it. It also owns the pointer for as long as the button is held, which is
+		// why it is a latch and not a per-frame hit-test.
 		// The menu claims clicks first: its bar sits above the scrollbar gutter's
 		// top edge, and an open dropdown overlaps the content.
-		if mcmd, consumed := menu_hit_test(&app, &text, window, f32(window.width), f32(window.height)); consumed {
-			if mcmd != .None {
-				command_dispatch(mcmd, {}, &app, window, &text, srows)
-				doc = app_active(&app)
+		if !menu_scroll_mouse(&app, &text, window, f32(window.width), f32(window.height)) {
+			if mcmd, consumed := menu_hit_test(&app, &text, window, f32(window.width), f32(window.height)); consumed {
+				if mcmd != .None {
+					command_dispatch(mcmd, {}, &app, window, &text, srows)
+					doc = app_active(&app)
+				}
 			}
 		}
 
@@ -1232,7 +1239,12 @@ main :: proc() {
 			press_x, press_y = window.mouse_x, window.mouse_y
 			sel_dragging = false // arm; a drag begins only once the pointer moves
 			window.mouse_pressed = false
-		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag && !divider_drag && !md_preview_drag {
+		} else if window.mouse_down && window.mouse_count == 1 && !scrollbar_drag && !hscrollbar_drag && !app.tab_drag && !divider_drag && !md_preview_drag && !app.menu.scroll_drag {
+			// app.menu.scroll_drag is here for the same reason, and is the one latch
+			// that could not simply consume the press instead: menu_scroll_mouse
+			// deliberately leaves window.mouse_down set, because clearing it is what
+			// kills a drag (see Drag_Latches). So the dropdown's scrollbar has to be
+			// excluded HERE or a drag on it also drag-selects the document behind it.
 			// md_preview_drag belongs in this exclusion list exactly like the other
 			// three drag latches beside it: window.mouse_down stays true for its
 			// whole gesture (real OS state, not something any of these consumers
