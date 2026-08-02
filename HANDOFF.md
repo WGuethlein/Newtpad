@@ -5971,6 +5971,82 @@ spawns a second window and leaves an empty scratch behind (the refusal asks abou
 never about the strip). They interact: making the viewport a detach region without fixing the
 single-tab count makes the second far easier to hit.
 
+## 6bk. Format JSON (2026-08-02, v0.44.0)
+
+Third in Wyatt's order. Requested 2026-07-30 with a `.log` file that is one unreadable line and a
+`tasks.json` showing the wanted result: **VS Code's Format Document, for JSON.**
+
+### It reopens a locked decision, deliberately
+
+HANDOFF §6aa put first-party JSON/CSV/XML reformat **out** of V1 and held it as the V2 plugin proof —
+the thing that demonstrates the C-ABI formatter boundary works. Wyatt's call, asked directly:
+**build it into V1.** The plugin system can prove itself on a viewer, or on a formatter for a
+language Newtpad has no lexer for. A feature he wants beats a demo that does not exist yet.
+
+### A rewrite, not a parse
+
+There is no AST, no map, no value type. The input is walked token by token and re-emitted with
+newlines and indentation between them, and that is the **requirement** rather than a shortcut: key
+order must be preserved, and parse-to-map-and-re-emit loses it. It also means a number is re-emitted
+as the bytes the file had, so `1.50` and `1e3` survive as written instead of round-tripping through a
+float, and a string is emitted verbatim rather than re-escaped — `\uXXXX`, lone surrogates and
+everything above ASCII are decisions that can change what the file means, and the formatter's job is
+whitespace.
+
+**It shares the lexer's scanners.** `lj_scan_string`, `lj_scan_number` and `lj_scan_keyword` went
+package-visible for this and nothing else. The highlighter and the formatter must agree byte for byte
+about where a string ends — an escape rule differing by one byte is enough to colour one span and
+rewrite another. That is what makes *"do not write a second JSON parser"* true rather than
+aspirational, and the test that pins it is `{"a":"{\"b\":1}"}`: structure inside a string is text.
+
+**Unlike the lexer, it validates.** `lex_json`'s header says it *"colours, it does not validate"* —
+an unterminated string colours to the line's end, an unbalanced brace is just punctuation. Right for
+colouring, wrong when the output replaces the user's file.
+
+**Four positions, not a bool.** The state is `Value | Key | Colon | Sep`, because an object has four
+and a bool cannot tell a key from a value — with a bool, `{"a" 1}` reads as two values in a row and
+formats happily into something that is not JSON. That was caught by a test, not by reading.
+
+### Edit, with a ceiling
+
+Wyatt's call again: format the buffer, not a view. **64 MB**, not `BACKUP_MAX`'s 128, because the
+output is *larger* than the input by exactly what the command adds, and the peak holds the source, the
+output and the piece tree's copy at once. Refusing loudly is the house style — `table_sort_build`
+refuses past 100,000 rows and the summary row says so.
+
+Invalid JSON is **marked, not silently refused** (§10's rule for malformed CSV rows): the buffer is
+untouched, the caret moves to the offending byte, and the note names what is wrong there.
+
+### Two things a sabotage pass found, and neither was the thing being sabotaged
+
+- **The format buffers were on the frame's temp allocator.** Removing the ceiling to check the test
+  could fail revealed the refusal coming back as *"unexpected character"* rather than a size refusal —
+  the temp arena could not serve the allocation. Both buffers are on the heap with explicit frees now,
+  which is the argument `table_sort_build`'s comment already makes: the temp arena is freed but never
+  **shrunk**, so one format of a 60 MB file would leave a ~190 MB high-water mark for the process's
+  life.
+- **The ceiling test was vacuous**, twice over. "The buffer is untouched" is satisfied by *any*
+  refusal, so it passed with the ceiling deleted; it now asserts the **note**, which says which guard
+  fired. And its fixture was built on the temp allocator, so it was over the ceiling by length while
+  being malformed by content — over-the-ceiling for the wrong reason. Built on the heap now, and with
+  the ceiling removed all three of its assertions fail.
+
+Also caught, and worth repeating because it is in development-loop §6 and I did it anyway: piping
+`build.bat` through `Out-Null` without checking `$LASTEXITCODE` ran a **stale exe** and made a
+sabotage look uncaught.
+
+### `jsontest` is new
+
+One argument, exits non-zero, in §7's list. The **formatter** is unit-tested in `src/base` (shapes,
+key order, escapes, idempotence, every refusal, the depth bound, error offsets) — 218 base tests now.
+`jsontest` covers only what those cannot see: that the command writes the buffer, that it undoes, that
+an invalid file survives with the caret on the fault, and that the ceiling refuses.
+
+One behaviour worth knowing: an **untitled** buffer is offered the command. `path_has_ext` answers
+true for an empty path on the stated rule that a new buffer *"is allowed into any view — you don't
+know what it will become"*, and JSON pasted into a scratch tab is exactly when someone reaches for
+this. `.jsonc` is deliberately excluded: it permits comments the formatter refuses.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -5997,7 +6073,7 @@ single-tab count makes the second far easier to hit.
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
     `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`, `selalltest`,
     `tablesorttest`, `mdjointest`, `mdfencetest`, `mdperftest`, `mdtabletest`, `blocktest`,
-    `teartest`, `surfacetest`
+    `teartest`, `surfacetest`, `jsontest`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`,
     `bookmarktest`

@@ -3989,6 +3989,147 @@ when NEWTPAD_TESTS {
 		if bad > 0 {os.exit(1)}
 	}
 
+	// --- `newtpad jsontest` -- the Format JSON COMMAND -------------------------
+	//
+	// One argument, exits non-zero, in HANDOFF §7's list.
+	//
+	// The FORMATTER is covered by unit tests in src/base (shapes, key order,
+	// escapes, idempotence, every refusal, the depth bound). What lives here is the
+	// wiring the unit tests cannot see: does the command write the buffer, is it
+	// undoable, does an invalid file survive untouched with the caret on the fault,
+	// and does the ceiling refuse rather than freeze.
+	@(private = "file")
+	json_test_run :: proc() {
+		bad := 0
+		chk :: proc(bad: ^int, ok: bool, msg: string) {
+			fmt.printfln("  %-4s %s", "ok" if ok else "FAIL", msg)
+			if !ok {bad^ += 1}
+		}
+		// A .json document with `src` in it, run through the real dispatch.
+		run :: proc(src: string) -> (a: App, d: ^Document) {
+			d = new(Document)
+			d^ = doc_from_content(transmute([]u8)strings.clone(src), "C:\\x.json", .UTF8)
+			app_add(&a, d)
+			app_activate(&a, 0)
+			return
+		}
+		body :: proc(d: ^Document) -> string {
+			return string(base.pt_collect(&d.pt, context.temp_allocator))
+		}
+
+		t: plat.Text
+		if !plat.text_load_faces(&t) {
+			chk(&bad, false, "text_load_faces")
+			fmt.printfln("jsontest: %d failures", bad)
+			os.exit(1)
+		}
+
+		fmt.println("-- the command rewrites the buffer, and it undoes --")
+		{
+			a, d := run(`{"b":1,"a":[2,3]}`)
+			defer app_destroy(&a)
+			before := body(d)
+			command_dispatch(.Format_Json, {}, &a, nil, &t, 10)
+			after := body(d)
+			chk(&bad, after != before, "the buffer changed")
+			chk(&bad, strings.contains(after, "\n"), "...into something with newlines in it")
+			// KEY ORDER, end to end. The unit tests pin it in the formatter; this
+			// pins that the command did not route through something else on the way.
+			chk(&bad, strings.index(after, "\"b\"") < strings.index(after, "\"a\""), "...with the file's own key order, not sorted")
+			// Undoable, like any other edit. A whole-buffer rewrite that could not be
+			// undone would be the most dangerous command in the app.
+			doc_undo(d)
+			chk(&bad, body(d) == before, fmt.tprintf("Ctrl+Z puts the file back exactly (%q)", body(d)))
+		}
+
+		fmt.println("-- invalid JSON is marked, not silently refused --")
+		{
+			a, d := run(`{"a":1,"b":}`)
+			defer app_destroy(&a)
+			before := body(d)
+			d.cursor, d.anchor = 0, 0
+			command_dispatch(.Format_Json, {}, &a, nil, &t, 10)
+			chk(&bad, body(d) == before, "the buffer is UNTOUCHED -- a partial rewrite would be worse than refusing")
+			// The caret lands on the fault, which is the difference between "marked"
+			// and "refused": the reader is looking at the problem rather than hunting.
+			chk(&bad, d.cursor == 11, fmt.tprintf("the caret is on the offending byte (%d, want 11)", d.cursor))
+			chk(&bad, d.anchor == d.cursor, "...with nothing selected")
+			chk(&bad, len(d.undo) == 0, "...and no undo entry, because nothing was written")
+		}
+
+		fmt.println("-- formatting an already-formatted file changes nothing --")
+		{
+			// Formatted BY THE COMMAND first, rather than by a hand-written literal:
+			// the indent follows the tab-width setting, so a literal fixture asserts
+			// against whatever that setting happened to be. Pressing the command
+			// twice is also exactly what a person does.
+			a, d := run(`{"a":1,"b":[2]}`)
+			defer app_destroy(&a)
+			command_dispatch(.Format_Json, {}, &a, nil, &t, 10)
+			once := body(d)
+			undos := len(d.undo)
+			command_dispatch(.Format_Json, {}, &a, nil, &t, 10)
+			chk(&bad, body(d) == once, fmt.tprintf("a second press leaves the bytes identical (%q)", body(d)))
+			chk(&bad, len(d.undo) == undos, "...and pushes no undo entry, because nothing was written")
+		}
+
+		fmt.println("-- the ceiling refuses rather than freezing --")
+		{
+			// Just over JSON_FORMAT_MAX, built as valid JSON so the ONLY thing that
+			// can refuse it is the size guard -- a fixture of junk bytes would be
+			// refused by the parser and prove nothing about the ceiling.
+			// Built on the HEAP. The temp allocator is a frame arena and a 64 MB
+			// request into it comes back short or not at all, which produced a
+			// fixture that was over the ceiling by LENGTH but malformed by content --
+			// so the command refused it as invalid JSON and the ceiling assertion
+			// passed for entirely the wrong reason.
+			pad := strings.repeat("a", JSON_FORMAT_MAX, context.allocator)
+			defer delete(pad)
+			src := strings.concatenate({"{\"k\":\"", pad, "\"}"}, context.allocator)
+			defer delete(src)
+			a, d := run(src)
+			defer app_destroy(&a)
+			chk(&bad, d.pt.length > JSON_FORMAT_MAX, fmt.tprintf("precondition: the fixture is over the ceiling (%d > %d)", d.pt.length, JSON_FORMAT_MAX))
+			before_len := d.pt.length
+			command_dispatch(.Format_Json, {}, &a, nil, &t, 10)
+			chk(&bad, d.pt.length == before_len, "the buffer is untouched")
+			chk(&bad, len(d.undo) == 0, "...and nothing was written")
+			// THE REASON, not just the outcome. "Untouched" is satisfied by any
+			// refusal at all -- including one from the parser or a failed
+			// allocation -- so on its own it passes with the ceiling deleted, which
+			// is exactly what a sabotage pass showed. The note is what says the SIZE
+			// guard is the thing that fired.
+			chk(&bad, strings.contains(a.notice, "TOO LARGE"), fmt.tprintf("...because of the SIZE, which the note says (%q)", a.notice))
+		}
+
+		fmt.println("-- the menu row is gated on the file type --")
+		{
+			// Plain zero-value Documents with a borrowed path. NOT doc_from_content
+			// with the path reassigned afterwards: that sets path_owned, and doc_close
+			// then frees a string literal -- which is an access violation, and is how
+			// this fixture was first written.
+			d: Document
+			d.kind = .Text
+			d.path = "C:\\x.json"
+			chk(&bad, doc_can_json(&d), "a .json is offered the command")
+			d.path = "C:\\x.txt"
+			chk(&bad, !doc_can_json(&d), "...a .txt is not")
+			d.path = "C:\\x.jsonc"
+			chk(&bad, !doc_can_json(&d), "...and neither is .jsonc, which permits comments the formatter refuses")
+			// An UNTITLED buffer is offered it, and that is deliberate rather than a
+			// leak: path_has_ext answers true for an empty path on the stated rule
+			// that "a new/untitled buffer is allowed into any view -- you don't know
+			// what it will become", and JSON pasted into a scratch tab is exactly
+			// when someone reaches for this. If it turns out not to be JSON the
+			// command refuses and puts the caret on the fault, which costs nothing.
+			d.path = ""
+			chk(&bad, doc_can_json(&d), "...while an untitled buffer IS offered it, like every other view gate")
+		}
+
+		fmt.printfln("jsontest: %d failures", bad)
+		if bad > 0 {os.exit(1)}
+	}
+
 	// --- `newtpad surfacetest` -- UI spec §8, the editor surface --------------
 	//
 	// One argument, exits non-zero, in HANDOFF §7's list. The §8 behaviours that
@@ -35688,6 +35829,13 @@ when NEWTPAD_TESTS {
 		// editor surface: the caret blink and the current-line tint.
 		if os.args[1] == "surfacetest" {
 			surface_test_run()
+			return true
+		}
+
+		// `newtpad jsontest` -- one-argument, no path, sweepable. The Format JSON
+		// command's wiring; the formatter itself is unit-tested in src/base.
+		if os.args[1] == "jsontest" {
+			json_test_run()
 			return true
 		}
 

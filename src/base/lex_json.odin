@@ -32,7 +32,11 @@ lj_is_ident :: #force_inline proc(b: u8) -> bool {
 // caller colours that whole remainder as String rather than treating it as
 // no match at all (see header comment). `\"` (and any other `\x` escape)
 // does not end the string, mirroring lex_log's lg_scan_string.
-@(private = "file")
+// PACKAGE-visible, not file-private: json_format.odin walks the same tokens this
+// lexer colours, and it has to agree with the highlighter about where a string
+// ends -- an escape rule that differed by one byte between the two would colour
+// one span and rewrite another. Sharing the scanner is what makes "do not write
+// a second JSON parser" true rather than aspirational.
 lj_scan_string :: proc(line: []u8, i: int) -> int {
 	j := i + 1
 	for j < len(line) {
@@ -63,7 +67,6 @@ lj_scan_string :: proc(line: []u8, i: int) -> int {
 // Every successful branch consumes at least one digit beyond any leading
 // '-'/'.' , so a non-zero return always advances the caller — no
 // zero-progress success that could stall the main loop.
-@(private = "file")
 lj_scan_number :: proc(line: []u8, i: int) -> int {
 	j := i
 	if j < len(line) && line[j] == '-' {j += 1}
@@ -104,7 +107,6 @@ JSON_KEYWORDS :: []string{"true", "false", "null"}
 // Whole-word match of a JSON literal keyword at line[i], or 0. Boundary
 // checks on both sides so "truest" or "xtrue" don't match "true" and strand
 // an orphan suffix/prefix, mirroring lex_log's lg_scan_level.
-@(private = "file")
 lj_scan_keyword :: proc(line: []u8, i: int) -> int {
 	if i > 0 && lj_is_ident(line[i - 1]) {return 0}
 	for w in JSON_KEYWORDS {

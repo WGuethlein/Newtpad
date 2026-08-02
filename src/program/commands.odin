@@ -84,6 +84,7 @@ Command_Id :: enum u8 {
 	Sort_Lines,
 	Sort_Lines_Desc,
 	Remove_Duplicate_Lines,
+	Format_Json,
 	// The table header's context menu (menu.odin's table_header_menu_items).
 	// Dispatched against app.menu.ctx_col -- the column the menu was opened on,
 	// which menu_close deliberately preserves past the row's pick -- because there is
@@ -260,6 +261,7 @@ command_table := [Command_Id]Command {
 	.Sort_Lines               = {"Sort Lines (selection, or whole file)", "Edit"},
 	.Sort_Lines_Desc          = {"Sort Lines Descending (selection, or whole file)", "Edit"},
 	.Remove_Duplicate_Lines   = {"Remove Duplicate Lines (exact match, keeps the first)", "Edit"},
+	.Format_Json              = {"Format JSON", "Edit"},
 	.Table_Sort_Asc           = {"Sort Ascending", "Table"},
 	.Table_Sort_Desc          = {"Sort Descending", "Table"},
 	.Table_Sort_Then_Asc      = {"Then by Ascending", "Table"},
@@ -1522,6 +1524,64 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		sort_lines_dispatch(app, doc, .Descending)
 	case .Remove_Duplicate_Lines:
 		sort_lines_dispatch(app, doc, .Dedupe)
+	case .Format_Json:
+		// VS Code's Format Document, for JSON. Wyatt asked for it 2026-07-30 with a
+		// .log file that is one unreadable line and a tasks.json showing the wanted
+		// result. It EDITS the buffer -- undoable, like any other edit -- rather
+		// than rendering a view, which is what "format this file" means everywhere
+		// else and what he chose.
+		if doc == nil {break}
+		// A CEILING, and it is the price of editing rather than viewing. This is a
+		// full read, a full format and a full splice on the main thread, so peak
+		// memory is a small multiple of the file and the time is linear in it.
+		// BACKUP_MAX (128 MB) guards the same shape for a different reason; this is
+		// lower because the output is LARGER than the input -- indentation is what
+		// the command adds -- so the input is not the number that matters.
+		//
+		// Refusing loudly is the house style: the sort refuses past 100,000 rows and
+		// says so, and a formatter that instead froze for a minute on a 2 GB minified
+		// log would be the worse failure.
+		if doc.pt.length > JSON_FORMAT_MAX {
+			app_note(app, fmt.tprintf("[TOO LARGE TO FORMAT -- %d MB LIMIT]", JSON_FORMAT_MAX / (1024 * 1024)))
+			break
+		}
+		// THE HEAP, with explicit frees -- not the frame's temp allocator. Both of
+		// these are file-sized (the output is the larger of the two, since indent is
+		// what this adds), and the temp arena is freed but never SHRUNK: one format
+		// of a 60 MB file would leave a ~190 MB high-water mark for the rest of the
+		// process's life. table_sort_build makes exactly this argument for exactly
+		// this reason, and it is also what a sabotage pass found here -- with the
+		// ceiling removed, the failure was not the size guard but the temp arena
+		// refusing the allocation, which then surfaced as "not valid JSON".
+		src := base.pt_collect(&doc.pt, context.allocator)
+		defer delete(src)
+		// The tab width, in spaces. Wyatt's call: the output matches how the editor
+		// is already set up rather than hard-coding two.
+		out, jerr, at := base.json_format(src, plat.text_tab_width(t), context.allocator)
+		defer delete(out)
+		if jerr != .None {
+			// MARKED, NOT SILENTLY REFUSED -- the rule §10 applies to malformed CSV
+			// rows. The caret goes to the offending byte so the reader is looking at
+			// the problem rather than hunting for it, and the note names what is
+			// wrong there.
+			doc.cursor = clamp(at, 0, doc.pt.length)
+			doc.anchor = doc.cursor
+			// doc.top is left to the frame's own caret-follow
+			// (doc_ensure_cursor_visible), which runs with the row counts this layer
+			// does not have. Moving the caret is the whole request; scrolling to it
+			// is what that pass already does for every other caret move.
+			app_note(app, fmt.tprintf("[NOT VALID JSON -- %s]", base.json_error_text(jerr)))
+			break
+		}
+		// Nothing to do, and saying so beats an undo entry that changes no bytes.
+		if len(out) == len(src) && string(out) == string(src) {
+			app_note(app, "[ALREADY FORMATTED]")
+			break
+		}
+		if block_active(doc) {block_clear(doc)} // a rectangle cannot survive a whole-buffer rewrite
+		doc_replace_range(doc, 0, doc.pt.length, out)
+		doc.cursor, doc.anchor, doc.top = 0, 0, 0
+		app_note(app, "[FORMATTED]")
 	case .Toggle_Wrap:
 		// Refuse, with a reason, in the views that lay the document out
 		// themselves and therefore ignore this flag entirely.

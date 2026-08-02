@@ -14,36 +14,6 @@ once and would be a reopening, not a new idea.
 
 ## 1. Asked for directly, unscheduled
 
-### JSON formatting — reformat minified JSON into readable JSON
-
-**Requested 2026-07-30**, illustrated with a `.log` file that is one enormous unreadable line, and a
-`tasks.json` showing the wanted result. Wyatt, clarifying: *"if a json comes in not following the typical
-formatting schema, I want to give an option to format it so that it no longer looks like the log file, but
-the tasks.json… vscode has a similar feature."* So: **VS Code's Format Document, for JSON.** The log was
-the illustration of unreadable input, not a separate feature.
-
-**This reopens a locked decision.** HANDOFF §6aa records first-party JSON/CSV/XML reformat as decided
-**out** of V1 and held to the V2 plugin proofs, and CLAUDE.md scopes the plugin C-ABI to *"formatters +
-viewers"* precisely so a formatter proves that boundary works. Wyatt has now asked for it, so the open
-question is **whether it moves into V1 as a built-in or stays the V2 plugin proof** — building it
-first-party spends the plugin system's motivating example.
-
-Decisions that change the build:
-- **Edit the buffer, or a view?** Every other editor means *edit*. But Newtpad has three view modes
-  already (table, preview, split), all `doc_read_only_view`, and a view leaves the bytes alone. **A view
-  is also the only answer that survives the size constraint** — Newtpad opens multi-GB files,
-  viewport-first forbids a whole-document main-thread pass, and a 2 GB minified JSON is a realistic input.
-- **Whole file, selection, or line?** Whole file is the ask; a selection or line variant also covers
-  JSON embedded in a log line.
-- **Key order must be preserved**, which rules out parse-to-map-and-re-emit.
-- **Invalid JSON must be marked, not silently refused** — the same reasoning §10 applies to malformed CSV
-  rows.
-- Indent width, and whether it follows the existing tab-width setting.
-
-**Build on `src/base/lex_json.odin`** — a hand-rolled, viewport-bounded JSON lexer already driving the
-highlighting. A formatter over its token stream inherits the bounding and cannot disagree with the
-highlighter about what a token is. **Do not write a second JSON parser.**
-
 ### Excel-style column filtering — batch 20 (the sort half shipped in v0.36.0)
 
 **Requested 2026-07-31 by Wyatt**, alongside the four table bugs: *"multiple sort of columns, first

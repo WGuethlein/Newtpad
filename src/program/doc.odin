@@ -377,6 +377,28 @@ doc_is_markdownish :: proc(doc: ^Document) -> bool {
 
 // May the active document enter (or leave) each view? Already being in the view
 // keeps it toggleable so you can always get back out.
+// Files Format JSON will act on. Extension-based, like doc_is_tabular above and
+// for the same reason: it decides whether a MENU ROW is live, and a row whose
+// availability depended on sniffing the buffer would flicker as the file was
+// edited. `.jsonc` is deliberately absent -- it permits comments, which
+// base.json_format refuses, so offering the row there would promise a reformat
+// that then refuses with "unexpected character" pointing at a legal comment.
+// Largest buffer Format JSON will act on.
+//
+// 64 MB, not BACKUP_MAX's 128: this is a full read plus a full FORMAT plus a full
+// splice on the main thread, and the output is LARGER than the input by exactly
+// what the command adds -- so the input size is not the number that bounds the
+// work. A minified 64 MB file can format to well over 100 MB, and the peak holds
+// the source, the output and the piece tree's copy at once.
+//
+// Refusing loudly rather than freezing is the house style here: table_sort_build
+// refuses past 100,000 rows and the summary row says so.
+JSON_FORMAT_MAX :: 64 * 1024 * 1024
+
+doc_can_json :: proc(doc: ^Document) -> bool {
+	return doc != nil && doc.kind == .Text && path_has_ext(doc.path, {".json"})
+}
+
 doc_can_table :: proc(doc: ^Document) -> bool {
 	return doc != nil && doc.kind == .Text && (doc.table || doc_is_tabular(doc))
 }
