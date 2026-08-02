@@ -6353,6 +6353,21 @@ when NEWTPAD_TESTS {
 		li_chk(bad, consumed && cmd == .None, fmt.tprintf("a click on the separator runs nothing and is swallowed (%v, consumed %v)", cmd, consumed))
 		li_chk(bad, menu_is_filter_dropdown(&a), "...AND THE MENU STAYS OPEN, which is the bug")
 
+		// THE SCROLLBAR STRIP is the third un-pickable region, and it was the one
+		// that did not merely close the menu -- it resolved to the ROW BEHIND IT, so
+		// a click aimed at the thumb ticked a value and changed which rows the grid
+		// showed. Aimed one pixel inside the dropdown's right edge, over a real value
+		// row, so with the strip live this picks .Table_Filter_Toggle.
+		x_bar := f32(x0 + w) - 1
+		row_y := y0 + sx(1) + MENU_ITEM_H * 2 + MENU_ITEM_H * 0.4 + MENU_ITEM_H * 0.5
+		li_chk(bad, menu_dropdown_hit(&mt, &a, x_bar, row_y, W, H), "precondition: the scrollbar strip is inside the dropdown")
+		li_chk(bad, menu_item_at(&mt, &a, x_bar, row_y, W, H) == -1, "the scrollbar strip picks no row, though a value row spans that height")
+		win.mouse_pressed = true
+		win.mouse_x, win.mouse_y = i32(x_bar), i32(row_y)
+		cmd, consumed = menu_hit_test(&a, &mt, &win, W, H)
+		li_chk(bad, consumed && cmd == .None, fmt.tprintf("...so clicking it toggles nothing (%v)", cmd))
+		li_chk(bad, menu_is_filter_dropdown(&a), "...and leaves the menu open, like any other dead space inside it")
+
 		// The search box is the other un-pickable row inside the box, and it is a
 		// field people will click at deliberately.
 		win.mouse_pressed = true

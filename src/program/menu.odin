@@ -1261,8 +1261,11 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	// Drawn, not draggable. The wheel and the arrow keys move the list; a drag
 	// would need its own hit-test inside a surface whose every other pixel already
 	// means "pick this row", and the wheel is what a person reaches for anyway.
-	if total := len(items); total > app.menu.rows && app.menu.rows > 0 {
-		bw := max(sx(MENU_SCROLLBAR_W_96), 2)
+	// Through the same producer menu_item_at excludes the strip with, so the pixels
+	// painted here and the pixels the hit-test refuses are one decision rather than
+	// two expressions that agree today.
+	if bw := scrollbar_w(items, app.menu.top, h); bw > 0 {
+		total := len(items)
 		bx := x0 + dw - bw
 		frac := f32(app.menu.rows) / f32(total)
 		th := max(h * frac, MENU_ITEM_H * 0.5)
@@ -1375,6 +1378,26 @@ menu_visible_rows :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> int {
 	return rows_fitting(menu_items(app), app.menu.top, h)
 }
 
+// The scrollbar strip's width, or 0 when there is nothing to scroll.
+//
+// ONE PRODUCER, consumed by the draw that paints the strip and by the hit-test
+// that must not resolve a click on it to the row underneath. The strip is drawn
+// at `x0 + w - bw` -- INSIDE the dropdown's own width, not beside it -- so
+// without this it was live menu surface, and a click aimed at the thumb ticked
+// whatever value happened to sit at that height. On the column filter that is a
+// mis-click that silently changes which rows the grid shows.
+//
+// It went unnoticed because it is only reachable on a list long enough to need
+// scrolling, which the value list rarely was while it was capped at 512 and
+// always is now. Same shape as the doc_close leak this batch also fixed: latent,
+// bounded by the cap, and unbounded the moment the cap came off.
+@(private = "file")
+scrollbar_w :: proc(items: []Menu_Item, top: int, h: f32) -> f32 {
+	rows := rows_fitting(items, top, h)
+	if rows <= 0 || len(items) <= rows {return 0}
+	return max(sx(MENU_SCROLLBAR_W_96), 2)
+}
+
 @(private = "file")
 rows_fitting :: proc(items: []Menu_Item, from: int, h: f32) -> (count: int) {
 	used := f32(0)
@@ -1456,13 +1479,18 @@ menu_scroll_to_item :: proc(app: ^App, items: []Menu_Item, h: f32) {
 menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> int {
 	if !menu_dropdown_active(app) {return -1}
 	x0, oy, w, h := menu_dropdown_rect(t, app, width, height)
-	if mx < x0 || mx >= x0 + w {return -1}
+	items := menu_items(app)
+	// The SCROLLBAR is not a row. It is drawn inside `w` rather than beside it, so
+	// its strip used to hit-test to whatever row sat at that height -- see
+	// scrollbar_w. Excluded here, in the hit-test, rather than by narrowing `w`:
+	// the rect is what the draw fills and the border surrounds, and shrinking it
+	// would move the strip rather than make it inert.
+	if mx < x0 || mx >= x0 + w - scrollbar_w(items, app.menu.top, h) {return -1}
 	// The rect's own y, not menu_origin's: under a flip-up the two differ by the
 	// whole height of the menu, and this is the half that would still have been
 	// hit-testing the un-flipped box.
 	y0 := oy + sx(1)
 	if my < y0 || my >= y0 + h {return -1} // below a clipped dropdown is not a row
-	items := menu_items(app)
 	y := y0
 	// Starts at the scroll offset and stops at the same count the draw used, so
 	// a row is clickable exactly when it is visible.
@@ -1483,9 +1511,10 @@ menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> in
 // shipped as *"in the filter menu if you click in between options it closes the
 // modal"* (Wyatt, live use, v0.50.0). menu_item_at returns -1 for two unrelated
 // situations -- the point is outside the menu, and the point is on a row that
-// cannot be picked (a separator, the search-box label, the scrollbar strip) --
-// and menu_hit_test had only that one sentinel to read, so it took a click on the
-// separator for a click on the document and dismissed the menu. Textbook
+// cannot be picked (a separator, the search-box label, the scrollbar strip once
+// scrollbar_w excludes it) -- and menu_hit_test had only that one sentinel to
+// read, so it took a click on the separator for a click on the document and
+// dismissed the menu. Textbook
 // development-loop.md §4 Shape B: a correct, tested procedure whose result is
 // read in the wrong space by its consumer.
 //
