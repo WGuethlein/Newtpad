@@ -247,14 +247,28 @@ were the priorities. Read P2 as the live list, with these amendments:
   needle), which is the *other* half of the disease this entry only named half of: an exit code
   cannot fail on an assertion that was never counted. `menuseam`, `drawcount` and `jsonperf` stay at
   exit 0 by name and with a stated reason.
-- **`md_table_ensure`'s cache key omits `md_table_budget` / `md_table_max_rows`**, which `mdtabletest`
-  lowers at runtime — so a test can read a stale cache measured at the production budget. Found while
-  building `md_para_run`, whose key *does* include both. One procedure away from the code that was
-  fixed; not touched (2026-08-01).
-- **`md_table_bounds` has the same coverage gap `md_para_bounds` had.** Deleting
-  `if r - p > md_table_budget` leaves `mdtabletest` at exit 0. Verified by a reviewer on 2026-08-01
-  while confirming the paragraph copy's guards were individually testable. The copy was fixed; the
-  model was not.
+- ~~**`md_table_ensure`'s cache key omits `md_table_budget` / `md_table_max_rows`.**~~ **FIXED
+  2026-08-02 (§6bw).** Real, reachable and measured: without the key a lowered budget read back the
+  production-budget entry — `oversize=false, window=9313` where the correct answer is a bounded
+  ~4.9 KB window. `mdtabletest` had been defending against it by hand, clearing `doc.md_table` before
+  every budget change; the guarantee lived in seven copies at the call sites instead of in the cache.
+  The key now carries it and four of those clears are gone, so removing the key check fails
+  `mdtabletest` in three places.
+- ~~**`md_table_bounds` has the same coverage gap `md_para_bounds` had.**~~ **WITHDRAWN 2026-08-02 —
+  the claim was false, and how it got here matters more than the claim.** The covering assertion
+  (*"bounds() trips oversize with a bounded window"*) has existed since **2026-07-25**, six days
+  before this entry said it was missing. Deleting `if r - p > md_table_budget` today fails
+  `mdtabletest` on exactly that assertion.
+  **The entry is an artefact of the bug §6bv fixed.** On 2026-08-01 `mdtabletest` ended
+  `fmt.println("mdtabletest: FAILURES" …)` / `return true` — no exit code. Reproduced at that commit
+  in a worktree: with the guard deleted the assertion **fired and printed FAIL, and the process
+  exited 0**. A reviewer sabotaging the guard and reading the exit code saw 0 and concluded "not
+  covered". The method was broken, not the coverage, and the conclusion was recorded here as
+  *verified*.
+  **The generalisation, which is the reason to keep this text rather than delete the entry: any
+  "X is not covered, confirmed by sabotage" reached before 2026-08-02 was reached with an instrument
+  that could not read.** Re-verify such a claim before scheduling work off it — the whole cost of
+  this one was two days of a debt register carrying an item that never existed.
 - **Scroll resolution still happens inside the draw**, against CLAUDE.md's hard rule ("a widget's
   geometry is produced by exactly one `*_layout()` procedure… scroll resolution must not happen
   inside the draw"). `menu_draw_dropdown` calls `menu_scroll_to_item`, which writes `menu.top`.
@@ -6825,6 +6839,61 @@ exits 1 there, which is the check on the check.
   are switch cases rather than `os.args[1]` arms. They are outside the invariant today.
 - **Nothing was fixed in the product.** The sweep was green before and after; this batch changed only
   what the harness is able to notice.
+
+## 6bw. One of the two md_table debts was real (2026-08-02, v0.56.0, branch `fix/md-table-test-gaps`)
+
+Both §5 items were reproduced before either was fixed. **One was real; the other never existed**, and
+the second is the more useful finding.
+
+### `md_table_ensure`'s cache key — real, and the fix moves a guarantee out of the call sites
+
+`md_table_budget` and `md_table_max_rows` are runtime variables so a test can drive
+`md_table_bounds` into the oversize path on a 9 KB fixture instead of a >1 MB one. They were inputs
+to the scan and **not part of the cache key**, so a lowered budget read back an entry measured at the
+production one — same revision, same containing range, wrong bounds. Measured by deleting one
+`doc.md_table = {}`: `md_table_ensure` returned **`oversize=false, start=0, window=9313`** where the
+lowered budget's answer is a bounded ~4.9 KB window.
+
+**`mdtabletest` was already defending against this, by hand, in seven places.** Every budget change
+was paired with a manual cache clear. That worked, and it could not scale — the guarantee lived in
+seven copies at the call sites rather than in the cache, so the first case that forgot one would
+assert against stale numbers and pass. `Md_Para_Cache` keyed on its own budget from the start
+(`md_para_run`); this is the same fix one cache later, which is where §5 found it.
+
+Four of the seven clears are now gone — the ones that existed only for staleness. **Three stay and
+are not redundant**: they force a *cold re-measure from a different entry offset*, which is the
+entry-independence property, and the budget is identical across those calls so the key cannot help.
+Sabotaged by dropping the key check: `mdtabletest` fails in **three** places, one per removed clear.
+
+### `md_table_bounds`' "coverage gap" — the claim was false, and the instrument was the reason
+
+§5 said deleting `if r - p > md_table_budget` left `mdtabletest` at exit 0, *verified by a reviewer*.
+It does not: it fails on the assertion *"bounds() trips oversize with a bounded window"*, which
+`git log -S` dates to **2026-07-25**, six days before the entry claimed the coverage was missing.
+
+**The entry is an artefact of the bug §6bv fixed the day before.** On 2026-08-01 `mdtabletest` ended
+with `fmt.println("mdtabletest: FAILURES" …)` and `return true`. Checked out that commit in a
+worktree, deleted the same guard, built and ran it: **the assertion fired and printed FAIL, and the
+process exited 0.** A reviewer who sabotaged and read the exit code saw exactly what the entry
+records, and drew the only conclusion that reading was consistent with.
+
+So a broken instrument did not merely hide defects — **it manufactured one**, and the false item then
+sat in the debt register for two days with "verified" attached to it, which is the thing that makes
+it expensive rather than merely wrong. §5 now carries the generalisation: **any "not covered,
+confirmed by sabotage" conclusion reached before 2026-08-02 was reached with an instrument that could
+not read.** Re-verify before scheduling work off one.
+
+**What this says about the method, and it is not "sabotage is unreliable":** sabotage is still the
+only way to know a test can fail. The lesson is narrower and sharper — **read the mode's output, not
+just its exit code**, which is what §7 has always said about the falsifiers and what this batch had
+to learn about everything else. The assertion was printing `FAIL` the whole time. Nobody looked.
+
+### What this batch did not do
+
+Nothing in the product changed. `md_table_budget` is constant in the shipped exe, so the stale-key
+read was unreachable outside the harness — this is a **test-integrity** fix, and the sweep was green
+before and after. It is the second batch in a row aimed at whether verification works rather than at
+what Newtpad does, and that is now finished; the next batch is product work.
 
 ## 7. Build environment (Windows, this machine)
 
