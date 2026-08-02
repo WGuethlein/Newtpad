@@ -253,21 +253,24 @@ session_adopt_orphans :: proc(a: ^App) -> int {
 	for name in names {
 		d := pjoin({wdir, name})
 		if !plat.lock_try(pjoin({d, "lock"})) {continue} // still open in a live window
-		if session_restore(a, d) {
-			adopted += 1
-			plat.dir_remove_all(d) // adopted once, not every launch
-			continue
-		}
-		// THE RESTORE FAILED, AND THAT IS NOT A LICENCE TO DELETE. A store whose
-		// session.txt could not be read may still hold backups -- the unsaved work
-		// of the window that died -- and removing it would destroy exactly what
-		// this whole mechanism exists to preserve, on a transient read error.
+		if session_restore(a, d) {adopted += 1}
+		// REMOVED WHEN ITS session.txt WAS READABLE, adopted tabs or not.
 		//
-		// A store with no session.txt at all is different: session_save writes the
-		// backups BEFORE the file that references them (this file's own header), so
-		// a crash between the two leaves backups nothing can name. Those are not
-		// recoverable by anyone and are swept, or they accumulate forever.
-		if ex, _ := plat.path_exists(pjoin({d, "session.txt"})); !ex {
+		// The distinction that matters is "could we read it", NOT "did it give us
+		// anything". A store whose file cannot be read may still hold backups -- the
+		// unsaved work of the window that died -- and deleting it on a transient
+		// read error would destroy exactly what this mechanism exists to preserve.
+		// But a store that reads fine and simply holds no tabs is finished business,
+		// and leaving it means retrying it on every launch forever: a real one of
+		// those was found in %APPDATA%\Newtpad\windows on 2026-08-02, header intact,
+		// zero tabs, no backups, immortal.
+		//
+		// A store with no session.txt at all goes too. session_save writes the
+		// backups BEFORE the file that names them (this file's header), so a crash
+		// between the two leaves backups nothing can ever name.
+		if readable, _ := plat.file_read_all(pjoin({d, "session.txt"}), context.temp_allocator); readable != nil {
+			plat.dir_remove_all(d)
+		} else if ex, _ := plat.path_exists(pjoin({d, "session.txt"})); !ex {
 			plat.dir_remove_all(d)
 		}
 	}

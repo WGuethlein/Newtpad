@@ -6206,6 +6206,48 @@ plugin system's best motivating example, which is what §6aa wanted a formatter 
 each — pressing the command twice must equal pressing it once, and for XML that is where a naive
 implementation drifts, because the newlines it just wrote look like text on the second pass.
 
+## 6bo. Both tear-off defects (2026-08-02, v0.48.0)
+
+The two reported against v0.41.0 and documented at Wyatt's direction. They interacted, and were fixed
+together for that reason.
+
+### Dropping into the viewport now detaches
+
+The gesture was "the pointer left the window", chosen at scoping over "drag below the strip by a
+clear margin". In use it is the wrong one: dragging a tab down into the document is what every
+browser treats as a tear-off, and **on a maximised window there is barely anywhere to go that IS
+outside**. Both rules are live now — the window one still catches a drag onto another monitor.
+
+The threshold is one tab's height below the strip: far enough that a sloppy reorder cannot reach it,
+near enough that dragging into the document obviously qualifies. `teartest` brackets it on both sides,
+because the rule this has to stay out of the way of is the ordinary reorder.
+
+### The only tab goes nowhere
+
+Tearing off the last tab spawned a second window holding the document and then closed the only tab
+here — which, because a window never fails to a closed state, left a **fresh empty scratch** behind.
+Two windows where there was one, and the original blank.
+
+The count is asked in `tab_detach` rather than in `tab_can_detach`, because it is a question about the
+**strip** and not about the document, and it is asked before the spawn so the "spawn before you close"
+ordering is undisturbed.
+
+**The sabotage for this one spawned a real window and hung the test run** — the detached child
+inherits stdout, so the pipe never closed. That is worth knowing before someone sabotages it again:
+the hang IS the evidence. The stray window and the store it left behind were cleaned up by hand.
+
+### A third thing, found while cleaning up after that
+
+`%APPDATA%\Newtpad\windows` held an **immortal orphan**: a torn-off window's store with a valid
+header, zero tabs and no backups. `session_adopt_orphans` removed a store only when the restore
+*succeeded* or when `session.txt` was *absent*, so a readable-but-empty one was retried on every
+launch forever.
+
+The distinction that matters is **"could we read it"**, not "did it give us anything". A store whose
+file cannot be read may still hold the unsaved work of a window that died, and deleting it on a
+transient read error would destroy exactly what the mechanism exists to preserve. A store that reads
+fine and holds nothing is finished business. Both cases are now explicit.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

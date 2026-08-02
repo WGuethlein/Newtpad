@@ -4465,12 +4465,25 @@ when NEWTPAD_TESTS {
 		// -- the gesture --
 		fmt.println("-- the pointer leaving the window --")
 		W, H :: i32(1280), i32(720)
-		chk(&bad, !tabs_pointer_outside(0, 0, W, H), "the top-left pixel is inside")
-		chk(&bad, !tabs_pointer_outside(W - 1, H - 1, W, H), "the bottom-right pixel is inside")
-		chk(&bad, tabs_pointer_outside(W, H - 1, W, H), "the pixel AT the width is outside -- half-open, like every other hit-test here")
-		chk(&bad, tabs_pointer_outside(W - 1, H, W, H), "...and the pixel at the height")
-		chk(&bad, tabs_pointer_outside(-1, 10, W, H), "a negative x is outside, which is what capture reports past the left edge")
-		chk(&bad, tabs_pointer_outside(10, -1, W, H), "...and a negative y, which is what a drag up over the title bar reports")
+		// Leaving the WINDOW still detaches -- that catches a drag onto another
+		// monitor, which the strip rule below cannot see.
+		chk(&bad, tabs_pointer_detaches(W, 10, W, H), "the pixel AT the width detaches -- half-open, like every other hit-test here")
+		chk(&bad, tabs_pointer_detaches(-1, 10, W, H), "a negative x detaches, which is what capture reports past the left edge")
+		chk(&bad, tabs_pointer_detaches(10, -1, W, H), "...and a negative y, which is what a drag up over the title bar reports")
+
+		// AND SO DOES DROPPING INTO THE DOCUMENT, which is the rule added after
+		// v0.43.0: "if you drag the tab into the viewport it doesn't open a new tab".
+		// On a maximised window there is barely anywhere outside to go.
+		strip := i32(TAB_STRIP_H)
+		drop := i32(TAB_STRIP_H + sx(TAB_TEAR_DROP_96))
+		chk(&bad, tabs_pointer_detaches(200, drop + 1, W, H), "a drop well below the strip detaches")
+		chk(&bad, tabs_pointer_detaches(200, H - 1, W, H), "...as does one at the bottom of the document")
+		// ...but a REORDER must not. These three are the gesture the rule has to
+		// stay out of the way of, and they bracket the threshold.
+		chk(&bad, !tabs_pointer_detaches(200, 5, W, H), "a drag along the strip does NOT detach")
+		chk(&bad, !tabs_pointer_detaches(200, strip - 1, W, H), "...nor one at the strip's last pixel")
+		chk(&bad, !tabs_pointer_detaches(200, drop, W, H), "...nor one exactly at the threshold, which is still slop")
+		chk(&bad, drop > strip, fmt.tprintf("precondition: the threshold is BELOW the strip, or the rule would eat every reorder (%d vs %d)", drop, strip))
 
 		// -- who may be torn off --
 		//
@@ -4525,6 +4538,34 @@ when NEWTPAD_TESTS {
 			chk(&bad, !got, "tab_detach says no for it")
 			chk(&bad, after == before, fmt.tprintf("...and the tab is still open (%d -> %d)", before, after))
 			chk(&bad, a.docs[slot] != nil, "...in its own slot")
+		}
+
+		// -- THE ONLY TAB GOES NOWHERE ------------------------------------------
+		//
+		// "when you also only have one tab open and you drag it it spawns a new
+		// instance... this shouldn't be the case" (Wyatt, v0.41.0). Tearing the last
+		// tab off spawned a second window and left an empty scratch behind, because
+		// the refusal asked about the DOCUMENT and never about the strip.
+		//
+		// The fixture is a SAVED, unmodified tab -- one that tab_can_detach accepts
+		// -- so the only thing that can refuse it is the count. A fixture the
+		// document rule already rejects would pass this whatever the count did, and
+		// would also be at risk of actually spawning a window if the fix regressed.
+		fmt.println("-- the only tab is not torn off --")
+		{
+			a: App
+			defer app_destroy(&a)
+			d := new(Document)
+			d^ = doc_from_content(transmute([]u8)strings.clone("on disk\n"), "C:\\solo.txt", .UTF8)
+			d.modified = false
+			slot := app_add(&a, d)
+			app_activate(&a, slot)
+			a.tab_drag_slot = slot
+			chk(&bad, tab_can_detach(d), "precondition: the DOCUMENT rule would allow this tab out")
+			chk(&bad, app_live_count(&a) == 1, "precondition: it is the only tab")
+			win: plat.Window
+			chk(&bad, !tab_detach(&a, &win), "...and it is still refused, on the count alone")
+			chk(&bad, app_live_count(&a) == 1 && a.docs[slot] != nil, "...leaving the one tab exactly where it was")
 		}
 
 		// -- the handover file: what actually crosses the process boundary --

@@ -500,15 +500,21 @@ tabs_drag_update :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) {
 
 // --- tearing a tab off into its own window ---------------------------------
 //
-// Is the pointer outside this window's client area? The gesture Wyatt chose:
-// dragging a tab anywhere out of the window and RELEASING there opens it in a
-// window of its own.
+// Does releasing here tear the tab off? Two ways, and the second was added after
+// live use.
+//
+// v0.41.0 shipped with ONLY "the pointer left the window", which was the option
+// chosen at scoping over "drag below the strip by a clear margin". In use it is
+// the wrong one: *"if you drag the tab into the viewport it doesn't open a new
+// tab"* (Wyatt, v0.43.0). Dragging a tab down into the document is what every
+// browser treats as a tear-off, and on a maximised window there is barely anywhere
+// to go that IS outside. Both rules are live now -- the window one still catches a
+// drag onto another monitor.
 //
 // On release rather than live, and that is a real difference from Chrome: a
 // window cannot be created and dragged mid-gesture here, so the tab stays in the
-// strip until the button comes up. Dropping it back inside the window is
-// therefore an ordinary reorder, which is also the whole of the "changed my mind"
-// story.
+// strip until the button comes up. Dropping it back on the strip is therefore an
+// ordinary reorder, which is the whole of the "changed my mind" story.
 //
 // The client-coordinate test survives mouse CAPTURE, which is what makes it work
 // at all: SetCapture on mouse-down (platform/window.odin) keeps WM_MOUSEMOVE
@@ -516,17 +522,24 @@ tabs_drag_update :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) {
 // past the edge. Both are caught here.
 tabs_drag_outside :: proc(win: ^plat.Window) -> bool {
 	if win == nil || win.hwnd == nil {return false} // headless: no window to leave
-	return tabs_pointer_outside(win.mouse_x, win.mouse_y, win.width, win.height)
+	return tabs_pointer_detaches(win.mouse_x, win.mouse_y, win.width, win.height)
 }
 
-// The geometry half, split out so a test can reach it: tabs_drag_outside needs a
-// real hwnd (a headless Window has no client area to leave and must never report
-// that the pointer left it), and the arithmetic is the part worth pinning.
+// How far below the strip the pointer must go before a drag means "tear off"
+// rather than "reorder". One tab's height: far enough that an ordinary sloppy
+// reorder cannot reach it -- the strip is 40px and a drag wanders a few pixels --
+// and near enough that dragging into the document obviously qualifies.
+TAB_TEAR_DROP_96 :: TAB_H_96
+
+// The geometry, split out so a test can reach it: tabs_drag_outside needs a real
+// hwnd (a headless Window has no client area to leave and must never report that
+// the pointer left it), and the arithmetic is the part worth pinning.
 //
-// Half-open on both axes, matching every other hit-test in the tree: the pixel at
-// `width` is the first one outside.
-tabs_pointer_outside :: proc(mx, my, w, h: i32) -> bool {
-	return mx < 0 || my < 0 || mx >= w || my >= h
+// Half-open on the window edges, matching every other hit-test in the tree: the
+// pixel at `width` is the first one outside.
+tabs_pointer_detaches :: proc(mx, my, w, h: i32) -> bool {
+	if mx < 0 || my < 0 || mx >= w || my >= h {return true} // left the window
+	return f32(my) > TAB_STRIP_H + sx(TAB_TEAR_DROP_96) // dropped into the document
 }
 
 // May this tab be torn off? ANY TAB, dirty or untitled, with one exception.
@@ -569,6 +582,19 @@ tab_detach :: proc(app: ^App, win: ^plat.Window) -> bool {
 	if slot < 0 || slot >= len(app.docs) {return false}
 	doc := app.docs[slot]
 	if !tab_can_detach(doc) {return false}
+	// THE ONLY TAB GOES NOWHERE. Tearing it off spawns a second window holding
+	// this document and then closes the only tab here -- which, because a window
+	// never fails to a closed state, leaves a fresh empty scratch behind. Two
+	// windows where there was one, and the original now blank: *"when you also only
+	// have one tab open and you drag it it spawns a new instance... this shouldn't
+	// be the case"* (Wyatt, v0.41.0). Every browser treats dragging a window's only
+	// tab as moving the window, which is to say as nothing.
+	//
+	// Asked here rather than in tab_can_detach because it is a question about the
+	// STRIP, not about the document -- and it has to be asked BEFORE the spawn,
+	// alongside the other refusals, so the "spawn before you close" ordering is
+	// undisturbed.
+	if app_live_count(app) <= 1 {return false}
 
 	// At the pointer, sized like the window it came from -- so the new window
 	// appears where the tab was dropped rather than wherever the shell would have

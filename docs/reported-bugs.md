@@ -75,51 +75,6 @@ address blocks and blockquote continuations need them), and `---` directly under
 setext underline that makes it a heading. If the first one keeps costing him in real notes, the
 answer is a setting — "treat single newlines as breaks", GitHub-comment style — not a parser change.
 
-## Reported 2026-08-01 (v0.41.0) — the tab tear-off, from live use
-
-Both from Wyatt within minutes of the feature shipping. **Documented at his direction, not fixed.**
-Root-cause notes are from reading the code I had just written, so they are firmer than the usual
-few-minutes-of-reading note — but neither has been reproduced under a debugger.
-
-### Dragging a tab into the viewport does nothing
-
-*"if you drag the tab into the viewport it doesn't open a new tab"*
-
-**Working as built, and the gesture was chosen wrong.** `tabs_drag_outside` (`ui_tabs.odin`) detaches
-only when the pointer leaves the **window's client area** — that was the option picked when the
-tear-off was scoped, over "drag below the tab strip by a clear margin". In use it is the wrong one:
-dragging a tab down into the document area is what every browser treats as a tear-off, and on a
-maximised window there is barely anywhere to go that *is* outside.
-
-The fix is the rejected option, and it is small: detach when the pointer leaves the strip vertically
-by more than about a tab's height, in addition to leaving the window. `tabs_pointer_outside` is
-already the one place the test lives and `teartest` already covers it at the boundaries, so this is a
-predicate change plus its cases — **genuinely** small, unlike the blockquote estimate this file has
-just been corrected about.
-
-Worth deciding at the same time: **what a drop back inside the strip means.** Today it is an ordinary
-reorder, which is the "changed my mind" story; that stays true whichever threshold is used.
-
-### Dragging the ONLY tab spawns a second window instead of doing nothing
-
-*"when you also only have one tab open and you drag it it spawns a new instance... this shouldn't be
-the case"*
-
-**A real bug.** `tab_detach` refuses on `tab_can_detach` alone, which asks about the *document* — is
-it the empty scratch, is it too large to hand over — and never about the **strip**. With one tab open
-the sequence is: spawn a second process holding that document, then `app_close` the only tab, which
-(*never fail to a closed window*) leaves an empty scratch behind. Two windows where there was one, and
-the original is now blank.
-
-Every browser treats dragging a window's only tab as moving the window, i.e. as nothing. The fix is a
-live-tab count in the refusal — `app_live_count(app) > 1` — and a `teartest` case for it. Note the
-count must be taken **before** the spawn, alongside the other refusals, so the "spawn before you
-close" ordering is not disturbed.
-
-**These two interact.** Making the viewport a detach region without fixing the single-tab case makes
-the second bug far easier to hit, since the viewport is where the pointer naturally goes. Fix them
-together or fix the count first.
-
 ## Reported 2026-08-01 — documented for a later pass, not investigated
 
 Wyatt's list, recorded verbatim at his direction: *"just document them for a further pass later."* Each
