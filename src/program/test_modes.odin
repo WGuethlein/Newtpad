@@ -3673,6 +3673,65 @@ when NEWTPAD_TESTS {
 	// pj_kinds is what makes that last clause testable. Every other row here is
 	// satisfied by a block that is a perfectly good heading and stops one line short.
 	@(private = "file")
+	// A list ENDS with a paragraph's worth of air under it, not an item's.
+	//
+	// "It does not look like this is the case, there isn't a slightly larger gap
+	// like the top of the list" (Wyatt, live use, v0.37.0 §3). He reported it under
+	// "a blank line still ends a list item", and the first half of that turned out
+	// to be fine -- the prose after a list really is its own .Para block and was
+	// never swallowed into the item. What was wrong was only the SPACE: §9.3 gives
+	// a list item "0.25 S between items", and the layout spent it below every item
+	// including the last, so leaving a list was four pixels where entering one was
+	// thirteen.
+	//
+	// MEASURED THROUGH md_place_at, the same producer the preview scrolls and draws
+	// through, rather than by asking the metrics what they contain. The quantity
+	// that matters is the distance between two blocks on screen, and that is a sum
+	// over the walk (a blank line contributes a gap and no height), so a check that
+	// reads m.para_below back out of Md_Metrics would pass with the walk broken.
+	pj_case_list_exit_gap :: proc(bad: ^int) {
+		fmt.println("-- a list ends with a paragraph's gap under it, not an item's --")
+		h: Headless_Gpu
+		if !headless_gpu_init(&h, 800, 600, "mdjoin/listgap") {
+			li_chk(bad, false, "an offscreen device came up")
+			return
+		}
+		defer headless_gpu_destroy(&h)
+		m := md_metrics(&h.text, 16)
+
+		src := "intro para\n\n- one\n- two\n\nafter the list\n\nnext para\n"
+		d := pj_doc(src)
+		defer doc_close(&d)
+		g := md_block_gaps_for_test(&h.gfx, &h.text, &d, &m, context.temp_allocator)
+		if len(g) < 7 {
+			li_chk(bad, false, fmt.tprintf("precondition: the fixture walks to at least 7 blocks (%d)", len(g)))
+			return
+		}
+		// 0 Para "intro para" | 1 Blank | 2 List "one" | 3 List "two" |
+		// 4 Blank | 5 Para "after the list" | 6 Blank | 7 Para "next para"
+		li_chk(bad, g[2].kind == .List && g[3].kind == .List, fmt.tprintf("precondition: two list items (%v, %v)", g[2].kind, g[3].kind))
+		li_chk(bad, g[5].kind == .Para && g[5].content == "after the list", fmt.tprintf("precondition: the prose after the list is its OWN paragraph block, not swallowed into the item (%v %q)", g[5].kind, g[5].content))
+
+		// A tight list keeps its 0.25 S between items.
+		li_chk(bad, abs(g[3].gap - m.list_gap) < 0.01, fmt.tprintf("two adjacent items are still %0.f apart, the item gap (%.2f)", m.list_gap, g[3].gap))
+
+		// The distance from the last bullet to the prose under it: every gap and
+		// height strictly between them, which over a zero-height blank is just the
+		// blank's gap plus the paragraph's.
+		exit := g[4].gap + g[4].h + g[5].gap
+		para_break := g[6].gap + g[6].h + g[7].gap
+		li_chk(bad, abs(exit - m.para_below) < 0.01, fmt.tprintf("a list ends with a paragraph's gap under it (%.2f, want %.2f)", exit, m.para_below))
+		li_chk(bad, abs(exit - para_break) < 0.01, fmt.tprintf("...which is the SAME air as between two paragraphs (%.2f vs %.2f)", exit, para_break))
+		// ...and that is bigger than an item gap, or the two checks above would be
+		// satisfied by a metric that made everything 0.25 S.
+		li_chk(bad, exit > m.list_gap + 0.01, fmt.tprintf("...and genuinely larger than the gap between two items (%.2f vs %.2f)", exit, m.list_gap))
+
+		// Entering the list is unchanged, which is the end Wyatt was comparing
+		// against: it was already a paragraph gap and must stay one.
+		enter := g[1].gap + g[1].h + g[2].gap
+		li_chk(bad, abs(enter - m.para_below) < 0.01, fmt.tprintf("entering a list still takes a paragraph's gap (%.2f, want %.2f)", enter, m.para_below))
+	}
+
 	pj_case_setext_layout :: proc(bad: ^int) {
 		fmt.println("-- a setext heading is one .Heading block, underline included --")
 		h: Headless_Gpu
@@ -3856,6 +3915,7 @@ when NEWTPAD_TESTS {
 			pj_case_scroll_round_trip(&bad)
 			pj_case_setext_bounds(&bad)
 			pj_case_setext_layout(&bad)
+			pj_case_list_exit_gap(&bad)
 		}
 		fmt.printfln("mdjointest: %d failures", bad)
 		if bad > 0 {os.exit(1)}
@@ -19625,10 +19685,88 @@ when NEWTPAD_TESTS {
 				}
 			}
 
+			// A TAB EMITS NO GLYPH BUT KEEPS ITS ADVANCE.
+			//
+			// "A Tab character puts an empty rectangle in the code block in it's
+			// stead" (Wyatt, live use, v0.37.0 §7). No font has a glyph for U+0009,
+			// so queueing one resolves through rune_face to index 0 and rasterizes
+			// .notdef -- a hollow box. text_advance always had the width right; the
+			// shaper appended the glyph anyway.
+			//
+			// Checked BOTH ways, because either half alone passes under a plausible
+			// wrong fix: dropping the tab's advance as well as its glyph would
+			// satisfy "no ink" while silently collapsing indented code, and skipping
+			// it only at emit would satisfy the pixels while leaving a .notdef in
+			// every other consumer of Shaped.glyphs.
+			sh_tab :: proc(bad: ^int) {
+				t: plat.Text
+				if !plat.text_load_faces(&t) {
+					fmt.println("  FAIL: text_load_faces")
+					bad^ += 1
+					return
+				}
+				px := f32(20)
+				// The structural half, headless: no glyph for the tab, and the glyph
+				// AFTER it still sits where the tab's advance put it.
+				s := plat.shape_run(nil, &t, "a\tb", px, 100000, 0, .Body, context.temp_allocator)
+				tabs := 0
+				for g in s.glyphs {if g.r == '\t' {tabs += 1}}
+				sh_chk(bad, tabs == 0, fmt.tprintf("a tab queues no glyph (%d found)", tabs))
+				sh_chk(bad, len(s.glyphs) == 2, fmt.tprintf("...and the other two runes still do (%d glyphs)", len(s.glyphs)))
+				want := plat.text_advance(nil, &t, 'a', px, .Body) + plat.text_advance(nil, &t, '\t', px, .Body)
+				bx := f32(-1)
+				for g in s.glyphs {if g.r == 'b' {bx = g.x}}
+				sh_chk(bad, abs(bx - want) < 0.001, fmt.tprintf("...and `b` still starts past the tab's full advance (%.3f, want %.3f)", bx, want))
+				// The advance is not zero, or the check above is satisfied by a tab
+				// that simply vanished.
+				sh_chk(bad, plat.text_advance(nil, &t, '\t', px, .Body) > 0, "...which is a real width, not nothing")
+			}
+
+			// The same claim at the device, because it is a claim about what reaches
+			// the GPU: a run of nothing but tabs must put no ink on the surface.
+			sh_tab_draw :: proc(bad: ^int) {
+				h: Headless_Gpu
+				if !headless_gpu_init(&h, 200, 120, "shapetest/tab") {
+					fmt.println("  (skipped: offscreen device init failed)")
+					return
+				}
+				defer headless_gpu_destroy(&h)
+				ink :: proc(pix: []u8, W, H: int) -> bool {
+					for i := 0; i + 3 < len(pix); i += 4 {
+						if pix[i] > 8 || pix[i + 1] > 8 || pix[i + 2] > 8 {return true}
+					}
+					return false
+				}
+				W, H := int(h.window.width), int(h.window.height)
+				px := f32(20)
+				white := [4]f32{1, 1, 1, 1}
+
+				spans := [1]plat.Shape_Span{{"\t\t\t", px, .Body}}
+				s := plat.shape_spans(&h.gfx, &h.text, spans[:], 100000, 0, context.temp_allocator)
+				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+				plat.shaped_draw(&h.gfx, &h.text, &s, spans[:], 10, 30, white)
+				pix, pok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				sh_chk(bad, pok, "tab draw: the readback resolves")
+				if pok {sh_chk(bad, !ink(pix, W, H), "three tabs put NO ink on the surface")}
+
+				// The control, and it is the one that makes the check above mean
+				// something: the identical path with a visible rune DOES ink. Without
+				// it, a readback that silently returned an empty surface would pass.
+				cspans := [1]plat.Shape_Span{{"X", px, .Body}}
+				cs := plat.shape_spans(&h.gfx, &h.text, cspans[:], 100000, 0, context.temp_allocator)
+				plat.gfx_begin_frame(&h.gfx, 0, 0, 0)
+				plat.shaped_draw(&h.gfx, &h.text, &cs, cspans[:], 10, 30, white)
+				cpix, cok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				sh_chk(bad, cok, "tab draw: the control readback resolves")
+				if cok {sh_chk(bad, ink(cpix, W, H), "...while an `X` through the same path does ink")}
+			}
+
 			bad := 0
 			sh_run(&bad)
 			sh_spans(&bad)
 			sh_draw(&bad)
+			sh_tab(&bad)
+			sh_tab_draw(&bad)
 			fmt.printfln("shapetest: %d failures", bad)
 			return true
 		}

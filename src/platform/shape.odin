@@ -365,7 +365,26 @@ shape_spans :: proc(
 				}
 			}
 
-			append(&ga, Shaped_Glyph{x = pen, off = i32(off), line = line, span = i32(si), r = r})
+			// A TAB TAKES ITS ADVANCE AND EMITS NO GLYPH. No font has one for
+			// U+0009, so rune_face resolves it to index 0 and the draw rasterizes
+			// .notdef -- a hollow rectangle, which is exactly what a Tab inside a
+			// fenced code block looked like (Wyatt, live use, v0.37.0 §7).
+			// text_cell_width_at's own comment says this in as many words for the
+			// grid ("a tab must never reach the glyph-metrics path"); the shaper
+			// had the advance right and then queued the glyph anyway.
+			//
+			// Dropped HERE rather than skipped at emit so there is one answer
+			// instead of one per draw path, and it is the same thing the zero-width
+			// branch above does. The difference is that a tab keeps its advance, so
+			// the pen -- and every glyph after it on the line -- does not move.
+			//
+			// Only the tab. Other control characters keep their .notdef, and that is
+			// deliberate: a box is the honest rendering of a byte that has no
+			// business being there, while a tab is ordinary whitespace whose width
+			// already says everything it has to say.
+			if r != '\t' {
+				append(&ga, Shaped_Glyph{x = pen, off = i32(off), line = line, span = i32(si), r = r})
+			}
 			pen += adv
 			if space {
 				if !in_spaces {
