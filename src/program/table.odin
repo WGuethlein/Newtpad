@@ -1492,7 +1492,7 @@ table_sort_scroll_top :: proc(doc: ^Document) {
 
 table_sort_set :: proc(doc: ^Document, col: int, desc: bool) {
 	if doc == nil || col < 0 {return}
-	if doc.table_editing {table_edit_commit(doc)}
+	if doc.table_editing {table_edit_commit(doc, resort = false)}
 	kv := [1]Sort_Key{{col = col, desc = desc}}
 	if !table_sort_build(doc, kv[:]) {return}
 	table_sort_scroll_top(doc)
@@ -1514,7 +1514,7 @@ table_sort_set :: proc(doc: ^Document, col: int, desc: bool) {
 // harmless repeat of the commit table_sort_set performs itself.
 table_sort_cycle :: proc(doc: ^Document, col: int) {
 	if doc == nil || col < 0 {return}
-	if doc.table_editing {table_edit_commit(doc)}
+	if doc.table_editing {table_edit_commit(doc, resort = false)}
 	// table_sort_key already stops at nkeys, so a zero-value Document (keys[0].col
 	// == 0, Odin's zero-is-initialization, which CLAUDE.md says not to fight)
 	// cannot read as "column 0 already sorted" the way a raw `s.keys[0].col == col`
@@ -1560,7 +1560,7 @@ table_sort_cycle :: proc(doc: ^Document, col: int) {
 // just to learn it should have been refused.
 table_sort_add :: proc(doc: ^Document, col: int, desc: bool) {
 	if doc == nil || col < 0 {return}
-	if doc.table_editing {table_edit_commit(doc)}
+	if doc.table_editing {table_edit_commit(doc, resort = false)}
 	if !table_sort_can_add(doc, col) {return} // full and not already a key: refused, live sort untouched
 	s := &doc.table_sort
 	kv: [TABLE_SORT_KEYS_MAX]Sort_Key
@@ -1589,7 +1589,7 @@ table_sort_add :: proc(doc: ^Document, col: int, desc: bool) {
 // permutation left for it to be an offset into.
 table_sort_drop :: proc(doc: ^Document, col: int) {
 	if doc == nil || col < 0 {return}
-	if doc.table_editing {table_edit_commit(doc)}
+	if doc.table_editing {table_edit_commit(doc, resort = false)}
 	s := &doc.table_sort
 	k, ok := table_sort_key(doc, col)
 	if !ok {return} // not a key -- nothing to drop
@@ -1627,7 +1627,7 @@ table_sort_drop :: proc(doc: ^Document, col: int) {
 // the document unsorted.
 table_sort_toggle :: proc(doc: ^Document, col: int) {
 	if doc == nil || col < 0 {return}
-	if doc.table_editing {table_edit_commit(doc)}
+	if doc.table_editing {table_edit_commit(doc, resort = false)}
 	k, is_key := table_sort_key(doc, col)
 	switch {
 	case !is_key:
@@ -1637,6 +1637,159 @@ table_sort_toggle :: proc(doc: ^Document, col: int) {
 	case:
 		table_sort_drop(doc, col)
 	}
+}
+
+// --- keeping the ORDER true across a cell edit -----------------------------
+//
+// table_sort_shift, below, keeps the permutation's OFFSETS describing the bytes
+// they were built from. It cannot keep the ORDER true, and nothing did until
+// 2026-08-01: a commit changes a cell's value, and a row's position in the sort is
+// a function of that value, so editing a sorted column left the row sitting where
+// its OLD value had put it -- "I'm sorting alphabetically, I swap G to F, it
+// doesn't update the sort so that the row is moved up" (Wyatt, live pass v0.36.0
+// §1).
+//
+// ONE ROW MOVES; THE FILE IS NOT RE-SCANNED. table_sort_build costs a full pass
+// over every sorted row -- ~250 ms at the 100,000-row ceiling, ~360 ms with two
+// keys (live pass §5) -- and paying that on every Enter would make editing a large
+// sorted CSV unusable. Repositioning one row is a binary search over the
+// permutation, about seventeen line reads at that ceiling, plus two array moves.
+//
+// THE COMPARATOR IS NOT RESTATED HERE. The search calls sort_less_keys -- the same
+// procedure slice.sort_by_with_data calls -- with a Sort_Ctx built from the live
+// key vector, so "where does this row go now" is answered by the thing that
+// decided where every other row went. A comparison written out again in this
+// section would be the fifth copy of the empty-and-direction rules that
+// sort_less_keys' own comment exists to prevent.
+
+// One row's sort fields, read from the LIVE buffer at `off`.
+//
+// KEY STRINGS COME FROM THE FRAME'S TEMP ALLOCATOR rather than from a growing
+// arena, and that is not a convenience. table_sort_build materialises every key
+// only after its arena has stopped growing, because a [dynamic]u8 that reallocs
+// leaves every earlier key pointing into a freed block -- moving those two lines
+// up into its row loop turned the 100,000-row case into an ACCESS VIOLATION while
+// every smaller fixture still passed. A binary search reads one row at a time and
+// compares it immediately, so a shared arena would meet that hazard on every
+// probe. Temp allocations do not move, and a whole search is a few dozen short
+// strings inside one frame.
+//
+// `numeric` is READ from the live key vector, never re-decided. Whether a column
+// sorts as numbers was settled over every sorted row when the sort was built
+// (table_sort_build's own comment on why that scope is the only honest one), and
+// one row cannot re-settle it. table_sort_reposition refuses the edit that would
+// invalidate that decision rather than quietly sorting against a stale one.
+@(private = "file")
+sort_item_read :: proc(doc: ^Document, off: int, row: i32, keys: []Sort_Key, delim: u8, buf, key: []u8) -> (it: Sort_Item, ok: bool) {
+	if off < 0 || off >= doc.pt.length {return {}, false}
+	end := base.pt_line_end_cap(&doc.pt, off, RENDER_LINE_CAP)
+	n := base.pt_read(&doc.pt, off, buf[:min(end - off, len(buf))])
+	if n < 0 {return {}, false}
+	if n > 0 && buf[n - 1] == '\r' {n -= 1}
+	line := string(buf[:n])
+	it.row = row
+	scratch: [64]u8
+	for k, i in keys {
+		t := strings.trim_space(csv_field_into(line, delim, k.col, key))
+		it.f[i].empty = len(t) == 0
+		// Cloned out before the next field's extraction overwrites `key`, which is
+		// one buffer reused by every key exactly as the build reuses its own.
+		it.f[i].key = strings.clone(t, context.temp_allocator)
+		if k.numeric && !it.f[i].empty {it.f[i].num = sort_number(it.f[i].key, &scratch)}
+	}
+	return it, true
+}
+
+// Move the row whose line starts at `off` to the position its CURRENT value gives
+// it. Returns false when it will not do that safely, and the caller is expected to
+// fall back to a full rebuild rather than to leave the order stale.
+//
+// It refuses in three cases, and only the third is interesting:
+//
+//   - no live sort, or the three parallel arrays disagree about their length.
+//   - `off` is not a row start, or a line read fails. Both mean this procedure was
+//     handed something that is not the row the caller thinks it edited.
+//   - THE EDIT INVALIDATED THE KEY'S TYPE. A numeric key whose new value is
+//     neither empty nor a number cannot be placed: sort_number would give it 0.0
+//     and drop it into the middle of the real data, presenting a typo as a number,
+//     which is exactly the failure Sort_Field.empty exists to prevent for blanks.
+//     The column is no longer numeric and only a rebuild can decide that, because
+//     the decision is over every sorted row and this procedure reads one.
+//
+// The reverse -- a text column whose last non-number was just edited away, which
+// would make it numeric -- is NOT detected, and cannot be by reading one row. The
+// order stays valid under the type it was built with; the next explicit sort
+// re-decides it. Said plainly here because the asymmetry is deliberate: getting it
+// wrong in that direction costs a text sort of numbers, and getting it wrong in
+// the other direction costs a wrong number.
+table_sort_reposition :: proc(doc: ^Document, off: int) -> bool {
+	if !table_sorted(doc) {return false}
+	s := &doc.table_sort
+	if len(s.perm) != len(s.offs) || len(s.rank) != len(s.offs) {return false}
+
+	// The edited row's own data-row index, from its line start. `offs` is ascending
+	// and a commit cannot move the line it wrote into (table_sort_shift leaves an
+	// offset EQUAL to the edit's start alone, and a field's start is never before
+	// its line's), so this is an EXACT lookup rather than table_sort_pos' forgiving
+	// one: an offset that is not a row start is a caller error, not a scroll.
+	j := -1
+	{
+		lo, hi := 0, len(s.offs)
+		for lo < hi {
+			mid := (lo + hi) / 2
+			if s.offs[mid] < off {lo = mid + 1} else {hi = mid}
+		}
+		if lo < len(s.offs) && s.offs[lo] == off {j = lo}
+	}
+	if j < 0 {return false}
+
+	delim := doc.table_delim if doc.table_delim != 0 else ','
+	keys := s.keys[:s.nkeys]
+	// One pair of line-sized scratch buffers for the whole search, from temp rather
+	// than the stack: two RENDER_LINE_CAP arrays is 16 KB, and this runs from the
+	// input phase on a frame whose callers are already deep. Reused by every probe,
+	// which is safe precisely because sort_item_read clones its keys out.
+	buf := make([]u8, RENDER_LINE_CAP, context.temp_allocator)
+	key := make([]u8, RENDER_LINE_CAP, context.temp_allocator)
+
+	edited, eok := sort_item_read(doc, off, i32(j), keys, delim, buf, key)
+	if !eok {return false}
+	for k, i in keys {
+		if k.numeric && !edited.f[i].empty && !table_is_number(edited.f[i].key) {return false}
+	}
+
+	old := int(s.rank[j])
+	if old < 0 || old >= len(s.perm) || int(s.perm[old]) != j {return false}
+	ordered_remove(&s.perm, old)
+
+	// LOWER BOUND over what is left: the first position whose row does not sort
+	// BEFORE the edited one. sort_less_keys ends on a file-order tie-break over
+	// distinct row indices, so the order it defines is total and this bound is a
+	// single exact position rather than a range.
+	ctx := Sort_Ctx {
+		keys  = s.keys,
+		nkeys = s.nkeys,
+	}
+	lo, hi := 0, len(s.perm)
+	for lo < hi {
+		mid := (lo + hi) / 2
+		r := int(s.perm[mid])
+		probe, pok := sort_item_read(doc, s.offs[r], i32(r), keys, delim, buf, key)
+		if !pok {
+			inject_at(&s.perm, old, i32(j)) // put it back exactly where it was
+			return false
+		}
+		if sort_less_keys(probe, edited, &ctx) {lo = mid + 1} else {hi = mid}
+	}
+	inject_at(&s.perm, lo, i32(j))
+
+	// `rank` is rebuilt whole rather than over the moved span. Every position
+	// between the two ends shifted by one, so the span is O(n) in the worst case
+	// anyway, and a full pass cannot leave one stale entry the way an off-by-one on
+	// the bounds could -- and a stale rank is what table_sort_pos reads to decide
+	// which row the scroll is on.
+	for r, pos in s.perm {s.rank[int(r)] = i32(pos)}
+	return true
 }
 
 // Keep the offsets describing the bytes they were built from, across an edit of
@@ -4001,7 +4154,15 @@ table_edit_end :: proc(doc: ^Document) {doc.table_edit_caret = len(doc.table_edi
 
 // Write the edited value back into the source field and stop editing. Goes
 // through the document's undo, and clears the width cache so the columns re-fit.
-table_edit_commit :: proc(doc: ^Document) {
+// `resort` is false for the callers that are ABOUT TO REORDER THE GRID THEMSELVES
+// -- the five sort operations, which each commit first and then build, and the two
+// paths that clear the sort outright -- so the row is not placed twice, and for
+// Tab, which is a decision rather than an optimisation. Tab means "the next cell in
+// this row", and a row that jumped on every Tab would slide out from under the key
+// the user is holding down; it commits, stays put, and the reorder happens when the
+// row is left for good by Enter or by a click elsewhere. Everything else gets the
+// default: Enter, clicking away, the wheel's commit, leaving the view.
+table_edit_commit :: proc(doc: ^Document, resort := true) {
 	if !doc.table_editing {return}
 	doc.table_editing = false
 	// GUARD THE WRITE, NOT THE ROUTES TO IT. If the bytes under [s,e) are no
@@ -4037,8 +4198,55 @@ table_edit_commit :: proc(doc: ^Document) {
 	if block_active(doc) {block_clear(doc)}
 	delim := doc.table_delim if doc.table_delim != 0 else ','
 	ser := csv_serialize(string(doc.table_edit_buf[:]), delim)
-	doc_replace_range(doc, doc.table_edit_s, doc.table_edit_e - doc.table_edit_s, transmute([]u8)ser)
+	at, n := doc.table_edit_s, doc.table_edit_e - doc.table_edit_s
+	doc_replace_range(doc, at, n, transmute([]u8)ser)
 	clear(&doc.table_widths) // re-fit columns next frame
+
+	// THE SCROLL IS AN OFFSET AND THE SPLICE MOVED BYTES UNDER IT. Same rule
+	// table_sort_shift applies to every row start, applied to doc.top for the same
+	// reason: an offset strictly after the edit moves by the delta, an offset equal
+	// to it does not (an insert at a line's first byte pushes that line's old bytes
+	// right and the line still begins where it began).
+	//
+	// Found while building the re-sort below, and it is older than that. It is
+	// barely reachable in the TEXT view -- an edit happens at the caret, and a caret
+	// off the top of the screen has already scrolled doc.top to itself -- but the
+	// grid reaches it constantly once a sort is live, because sorted order is not
+	// file order: editing any visible cell whose row sits ABOVE the top-of-screen
+	// row IN THE FILE left doc.top pointing one byte short of a line start, and
+	// table_sort_pos, which is deliberately forgiving about an offset mid-line,
+	// resolved it to the row before. The grid slid up by one row on an edit that had
+	// nothing to do with the scroll.
+	if delta := len(ser) - n; delta != 0 && doc.top > at {
+		doc.top = clamp(doc.top + delta, 0, doc.pt.length)
+	}
+
+	// THE ROW MOVES TO WHERE ITS NEW VALUE BELONGS. Last, after the splice, because
+	// the value being sorted on is the one now in the buffer -- table_sort_shift has
+	// already run inside doc_replace_range and left `offs` describing it.
+	//
+	// doc.table_edit_line is still this row's start: the splice begins at the
+	// FIELD's offset, which is never before its line's, and table_sort_shift leaves
+	// an offset equal to the edit's start where it is.
+	//
+	// The view is deliberately not moved with the row. doc.top is a byte offset, so
+	// whatever row was at the top of the screen is still the row at the top of the
+	// screen after the reorder -- including, when it happens to be this one, the
+	// edited row itself. Chasing the row from here would scroll the grid on every
+	// commit, which is the behaviour table_sort_set's comment argues against for
+	// re-sorts generally.
+	if resort && table_sorted(doc) {
+		if !table_sort_reposition(doc, doc.table_edit_line) {
+			// Refused -- the commonest reason being an edit that just made a
+			// numeric key non-numeric, which only a full pass can re-decide. Costly
+			// and rare, and leaving the order stale instead would be the bug this
+			// whole path exists to fix. table_sort_build is called directly rather
+			// than through table_sort_set so the scroll is left alone: this is not
+			// a sort gesture, it is an edit.
+			kv, nk := doc.table_sort.keys, doc.table_sort.nkeys
+			table_sort_build(doc, kv[:nk])
+		}
+	}
 }
 
 table_edit_cancel :: proc(doc: ^Document) {

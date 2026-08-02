@@ -456,8 +456,16 @@ main :: proc() {
 					table_edit_commit(doc)
 					continue
 				case .Tab:
+					// COMMITS WITHOUT REORDERING, and `next_row` is why as much as
+					// the feel is: it is a VISIBLE row index, captured here and
+					// consumed after the commit, so a commit that re-sorted would
+					// leave it naming a different row entirely -- an index read in
+					// an order it was not taken in, which is the shape
+					// development-loop §4 calls Shape B. Tab means "the next cell in
+					// this row"; the row moves when it is left for good, by Enter or
+					// by a click elsewhere.
 					next_row, next_col := doc.table_edit_row, doc.table_edit_col + 1
-					table_edit_commit(doc)
+					table_edit_commit(doc, resort = false)
 					if ok, r, col, fs, fe, val := table_cell_at_index(doc, next_row, next_col, trows); ok {
 						table_edit_start(doc, r, col, fs, fe, val)
 					}
@@ -836,7 +844,9 @@ main :: proc() {
 		if doc.table && doc.kind == .Text && window.mouse_pressed && !plat.key_ctrl_down() {
 			sm := table_summary_layout(doc, &text, f32(window.height), px, char_w)
 			if table_summary_clear_hit(sm, f32(window.mouse_x), f32(window.mouse_y)) {
-				if doc.table_editing {table_edit_commit(doc)}
+				// No reorder on this commit: the sort it would place the row in is
+				// about to stop existing, one line below.
+				if doc.table_editing {table_edit_commit(doc, resort = false)}
 				table_sort_clear(doc)
 				// The same landing every other in-grid sort transition makes. The
 				// three call sites that clear because the GRID IS BEING LEFT

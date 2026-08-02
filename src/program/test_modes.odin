@@ -3908,6 +3908,7 @@ when NEWTPAD_TESTS {
 			ts_case_inverses(&bad)
 			ts_case_clear_resets(&bad)
 			ts_case_clear_scrolls_top(&bad)
+			ts_case_resort_on_commit(&bad)
 			ts_case_bad_vector(&bad)
 			ts_case_precedence(&bad)
 			ts_case_numeric_past_sample(&bad)
@@ -4862,6 +4863,137 @@ when NEWTPAD_TESTS {
 			li_chk(bad, d.top != first, fmt.tprintf("...which here is not the file's first row, so the two rules are distinguishable (top %d, first %d)", d.top, first))
 		} else {
 			li_chk(bad, false, "precondition: the surviving one-key sort has a row 0")
+		}
+	}
+
+	// Live pass v0.36.0 §1: "The edit works, but it doesn't resort after the change,
+	// e.g. I'm sorting alphabetically, I swap G to F, it doesn't update the sort so
+	// that the row is moved up."
+	//
+	// table_sort_shift kept the permutation's OFFSETS true across a commit; nothing
+	// kept its ORDER true, so the row stayed where its old value had put it. The
+	// commit now repositions that one row (table_sort_reposition) rather than
+	// rebuilding, which at the 100,000-row ceiling is the difference between a
+	// binary search and a ~250 ms freeze on every Enter.
+	//
+	// THE PERMUTATION'S INTEGRITY IS CHECKED AFTER EVERY STEP, not just the visible
+	// order. This procedure removes an entry from `perm`, re-inserts it somewhere
+	// else and rewrites `rank`; an off-by-one there produces a perm that still LOOKS
+	// like a plausible order while `rank` disagrees with it, and `rank` is what
+	// table_sort_pos reads to decide which row the scroll -- and the cell editor's
+	// anchor -- is on. That is a data-loss shape, so it gets a structural check and
+	// not an eyeball on the row order.
+	ts_case_resort_on_commit :: proc(bad: ^int) {
+		fmt.println("-- committing a cell edit moves its row to where the new value belongs --")
+
+		// perm is a permutation of 0..<n AND rank is its exact inverse.
+		perm_sound :: proc(bad: ^int, d: ^Document, label: string) {
+			s := &d.table_sort
+			n := len(s.perm)
+			ok := n == len(s.offs) && len(s.rank) == n
+			if ok {
+				seen := make([]bool, n, context.temp_allocator)
+				for r, pos in s.perm {
+					j := int(r)
+					if j < 0 || j >= n || seen[j] {ok = false;break}
+					seen[j] = true
+					if int(s.rank[j]) != pos {ok = false;break}
+				}
+			}
+			li_chk(bad, ok, fmt.tprintf("%s: perm is a permutation of every row and rank is its exact inverse (n=%d)", label, n))
+		}
+
+		// Replace the open edit's whole value with `to`.
+		retype :: proc(d: ^Document, to: string) {
+			table_edit_end(d)
+			for len(d.table_edit_buf) > 0 {table_edit_backspace(d)}
+			for r in to {table_edit_rune(d, r)}
+		}
+
+		ROWS :: 8 // more than the fixture has: table_cell_at_index only bounds-checks
+
+		// -- the report, literally: sorted alphabetically, a value moves up --
+		{
+			d := ts_doc("k,v\nb,1\nc,2\na,3\n", 2)
+			defer doc_close(&d)
+			table_sort_set(&d, 0, false)
+			li_chk(bad, ts_order(&d) == "a,3|b,1|c,2", fmt.tprintf("precondition: ascending by k (%q)", ts_order(&d)))
+			perm_sound(bad, &d, "before the edit")
+
+			// Visible row 2 is `c,2`, the last in the sorted order. Renaming it to
+			// `aa` must move it to position 1 -- between `a` and `b`, which is a
+			// MIDDLE insertion rather than either end, so an off-by-one in the
+			// lower bound cannot hide at a boundary.
+			eok, r, c, fs, fe, val := table_cell_at_index(&d, 2, 0, ROWS)
+			li_chk(bad, eok && val == "c", fmt.tprintf("precondition: visible row 2 col 0 holds %q (ok %v)", val, eok))
+			table_edit_start(&d, r, c, fs, fe, val)
+			retype(&d, "aa")
+			table_edit_commit(&d)
+
+			li_chk(bad, ts_order(&d) == "a,3|aa,2|b,1", fmt.tprintf("the edited row moved to its new place (%q, want \"a,3|aa,2|b,1\")", ts_order(&d)))
+			perm_sound(bad, &d, "after the edit")
+			// THE BYTES, not just the order: the value landed on its own row and no
+			// other row changed. An order that looks right over a file the splice
+			// corrupted is the failure worth catching here.
+			doc_str := doc_debug_string(&d)
+			defer delete(doc_str)
+			li_chk(bad, strings.count(doc_str, "aa,2") == 1 && strings.count(doc_str, "b,1") == 1 && strings.count(doc_str, "a,3") == 1, fmt.tprintf("...and every row's bytes are intact (%q)", doc_str))
+			li_chk(bad, !strings.contains(doc_str, "c,2"), "...with the old value gone")
+			li_chk(bad, len(d.table_sort.offs) == 3, fmt.tprintf("...and the row SET did not change (%d offsets)", len(d.table_sort.offs)))
+
+			// Moving to the FRONT, the other boundary: `aa` -> `A` sorts before `a`
+			// by byte order.
+			eok2, r2, c2, fs2, fe2, val2 := table_cell_at_index(&d, 1, 0, ROWS)
+			li_chk(bad, eok2 && val2 == "aa", fmt.tprintf("precondition: the moved row is now at visible row 1 (%q)", val2))
+			table_edit_start(&d, r2, c2, fs2, fe2, val2)
+			retype(&d, "A")
+			table_edit_commit(&d)
+			li_chk(bad, ts_order(&d) == "A,2|a,3|b,1", fmt.tprintf("an edit that sorts to the FRONT lands there (%q)", ts_order(&d)))
+			perm_sound(bad, &d, "after the front insertion")
+		}
+
+		// -- TAB COMMITS WITHOUT REORDERING (Wyatt's call). Tab captures a VISIBLE
+		//    row index before the commit and uses it after, so a reorder here would
+		//    open the next cell on a different row entirely. --
+		{
+			d := ts_doc("k,v\nb,1\nc,2\na,3\n", 2)
+			defer doc_close(&d)
+			table_sort_set(&d, 0, false)
+			eok, r, c, fs, fe, val := table_cell_at_index(&d, 2, 0, ROWS)
+			li_chk(bad, eok && val == "c", fmt.tprintf("precondition: visible row 2 holds %q", val))
+			table_edit_start(&d, r, c, fs, fe, val)
+			retype(&d, "aa")
+			table_edit_commit(&d, resort = false)
+			li_chk(bad, ts_order(&d) == "a,3|b,1|aa,2", fmt.tprintf("a resort=false commit writes the value and leaves the row where it is (%q, want \"a,3|b,1|aa,2\")", ts_order(&d)))
+			perm_sound(bad, &d, "after a resort=false commit")
+			ds := doc_debug_string(&d)
+			defer delete(ds)
+			li_chk(bad, strings.count(ds, "aa,2") == 1, fmt.tprintf("...and the value really was written (%q)", ds))
+		}
+
+		// -- THE NUMERIC KEY THAT STOPS BEING NUMERIC. table_sort_reposition refuses
+		//    rather than handing a non-number to sort_number, which would read as 0.0
+		//    and drop a typo into the middle of the real data as though it were a
+		//    value. The commit falls back to a full rebuild, which is the only thing
+		//    that can re-decide the column's type, and the column becomes text. --
+		{
+			d := ts_doc("k,v\na,2\nb,10\nc,30\n", 2)
+			defer doc_close(&d)
+			table_sort_set(&d, 1, false)
+			li_chk(bad, d.table_sort.keys[0].numeric, "precondition: column v is decided NUMERIC over every row")
+			li_chk(bad, ts_order(&d) == "a,2|b,10|c,30", fmt.tprintf("precondition: 2 < 10 < 30 numerically (%q)", ts_order(&d)))
+
+			eok, r, c, fs, fe, val := table_cell_at_index(&d, 2, 1, ROWS)
+			li_chk(bad, eok && val == "30", fmt.tprintf("precondition: visible row 2 col 1 holds %q", val))
+			table_edit_start(&d, r, c, fs, fe, val)
+			retype(&d, "N/A")
+			table_edit_commit(&d)
+
+			li_chk(bad, table_sorted(&d) && d.table_sort.nkeys == 1, fmt.tprintf("the sort survives an edit that invalidates the key's type (sorted %v, nkeys %d)", table_sorted(&d), d.table_sort.nkeys))
+			li_chk(bad, !d.table_sort.keys[0].numeric, "...the rebuild re-decided the column as TEXT")
+			// Byte order over "10", "2", "N/A".
+			li_chk(bad, ts_order(&d) == "b,10|a,2|c,N/A", fmt.tprintf("...and the order is the text one (%q, want \"b,10|a,2|c,N/A\")", ts_order(&d)))
+			perm_sound(bad, &d, "after the fallback rebuild")
 		}
 	}
 
