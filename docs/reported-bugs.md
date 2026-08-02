@@ -149,8 +149,37 @@ only decorates links that resolve — "an underline is a promise" (`features.md:
 document and **not** of the grid. A cell link that fails to resolve therefore reaches `link_follow`,
 which is loud on every failure path (`links.odin:975`) and should raise a `Could not resolve` box.
 
-**So the one question that splits this cleanly, and it needs a person:** *does a dialog appear when you
-Ctrl+click a link in the grid?*
+**UPDATE 2026-08-02 — the owed test now exists (`gridlinktest`) and it is GREEN, which eliminates the
+geometry hypothesis entirely.** This was the "worth a headless test either way" item below; it is
+built, and it compares what the grid *draws* as a link against what the grid treats as *clickable*.
+Every one of these passes on a 3-link fixture:
+
+- **5 points along every drawn underline hit-test**, and **3 points through every link's glyph box** —
+  so `table_link_hit` does *not* return false at the pixels a person clicks. The suspected band
+  mismatch (`[l.y - px, l.y - px + row_h]` against the underline at `tl.y + sx(2)`) is real in the
+  sense that the band is offset down by the row's centring pad, but it still **covers** both the rule
+  and the glyphs.
+- **No link is clickable from another row's middle**, so the offset does not bleed into a neighbour.
+- **`tl.text` is still a valid http(s) URL after `table_links` returns** — it is `strings.clone`d into
+  the frame allocator, so the dangling-stack-slice theory is dead too.
+- **All three links `link_resolve` successfully, to `is_url` http targets**, and **none is mistaken by
+  `link_bare_reveal_target` for a bare path to reveal in Explorer.**
+
+Also checked by reading and NOT the cause: `trows` is assigned at `main.odin:481`, before the click
+site at 855, so the click and the draw size the grid identically; nothing between the frame's first
+press handler and 855 consumes `mouse_pressed` outside the palette, history panel, scrollbars and
+divider; `ro_surface_swallows` runs at 1047, *after* the link branch; and the document view's own link
+click requires `key_ctrl_down()` too, so there is no Ctrl-vs-Show-links asymmetry between the two
+views.
+
+**Everything from the pixel to `plat.shell_open_url` is therefore verified correct.** What cannot be
+exercised here is the real click arriving and `shell_open_url` itself — and the document view already
+uses that same function successfully on the same schemes.
+
+**So the question below is now the ONLY thing left, and it is sharper than when it was written:**
+`link_follow` is loud on *every* failure path — three separate `message_error` calls — so if the click
+reaches it at all, a dialog is guaranteed. *Does a dialog appear when you Ctrl+click a link in the
+grid?*
 
 - **A dialog** → the click is arriving and the failure is in `link_resolve` or in `plat.shell_open_url`'s
   scheme whitelist (`file.odin:725`, HANDOFF §6l). Read the dialog text; it names which.

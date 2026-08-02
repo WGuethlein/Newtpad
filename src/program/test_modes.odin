@@ -36958,6 +36958,134 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad gridlinktest` -- what the grid DRAWS as a link against what the
+		// grid treats as CLICKABLE.
+		//
+		// Wyatt, 2026-08-01: *"web links highlight on click but dont open the default
+		// broswer tab on click"*, then corrected -- *"it works in a regular text/json
+		// but not in table view"*. reported-bugs.md names this exact comparison as
+		// owed and says nothing performs it, which is why the report has sat
+		// unresolved: the underline is drawn by render_frame and the hit-test lives
+		// in table.odin, and no test had ever put the two side by side.
+		if os.args[1] == "gridlinktest" {
+			bad := 0
+			gl :: proc(bad: ^int, cond: bool, label: string) {
+				if !cond {bad^ += 1}
+				fmt.printfln("  %-4s %s", "ok" if cond else "FAIL", label)
+			}
+			t: plat.Text
+			if !plat.text_load_faces(&t) {
+				fmt.eprintln("gridlinktest: no fonts loaded")
+				return true
+			}
+			src := "name,url,note\nalpha,https://example.com/a,first\nbeta,https://example.com/b,second\ngamma,http://example.com/c,third\n"
+			doc := doc_from_content(transmute([]u8)strings.clone(src), "links.csv", .UTF8)
+			defer doc_close(&doc)
+			doc.table = true
+			doc.table_delim = ','
+			table_compute_widths(&doc, &t)
+			px := f32(16)
+			cw := plat.text_char_width(&t, px)
+			W := f32(1200)
+			ROWS :: 6
+			links := table_links(&doc, &t, px, cw, ROWS, W)
+
+			fmt.println("-- the grid produces link rects at all --")
+			gl(&bad, len(links) > 0, fmt.tprintf("%d link rects over 3 data rows", len(links)))
+			if len(links) == 0 {return mode_done("gridlinktest", bad)}
+
+			fmt.println("-- THE SEAM: every pixel the underline is DRAWN on must hit-test --")
+			// render_frame draws the underline at {tl.x, tl.y + sx(2)} with width
+			// tl.w (main.odin). If a pixel on that quad does not satisfy
+			// table_link_hit, the user is clicking a line that is not clickable --
+			// which is exactly what "highlights but does not open" looks like.
+			row_h := table_row_h(px)
+			miss_draw := 0
+			for l in links {
+				uy := l.y + sx(2) // the underline's own row of pixels
+				for f in ([]f32{0.02, 0.25, 0.5, 0.75, 0.98}) {
+					mx := l.x + l.w * f
+					if _, ok := table_link_hit(links, mx, uy, px, row_h); !ok {miss_draw += 1}
+				}
+			}
+			gl(&bad, miss_draw == 0, fmt.tprintf("5 points along every drawn underline hit-test (%d misses)", miss_draw))
+
+			fmt.println("-- and the GLYPHS above it, which is where a person actually clicks --")
+			// Nobody aims at the 1px underline. The text sits on the baseline, so
+			// the band has to cover the glyph box, not just the rule under it.
+			lh := line_height(px)
+			miss_text := 0
+			for l in links {
+				mx := l.x + l.w * 0.5
+				for _, i in ([]int{0, 1, 2}) {
+					// baseline - most of the ascent, the middle, and just above the rule
+					my := l.y - lh * 0.6 + f32(i) * (lh * 0.3)
+					if _, ok := table_link_hit(links, mx, my, px, row_h); !ok {miss_text += 1}
+				}
+			}
+			gl(&bad, miss_text == 0, fmt.tprintf("3 points through every link's glyph box hit-test (%d misses)", miss_text))
+
+			fmt.println("-- the band belongs to its OWN row, not the one below --")
+			// table_row_baseline_y is rect_y + px + pad, and the hit band is
+			// [y - px, y - px + row_h) = [rect_y + pad, rect_y + pad + row_h). The
+			// centring pad shifts the band DOWN off the row's true rect, so the
+			// bottom `pad` pixels of the band belong to the next row. Checked rather
+			// than assumed: a link must not be clickable from the row beneath it.
+			bleed := 0
+			for l in links {
+				mx := l.x + l.w * 0.5
+				for r in 0 ..< ROWS {
+					top := table_row_rect_y(px, r)
+					if l.y > top && l.y < top + row_h {continue} // this link's own row
+					// The vertical middle of every OTHER row must not hit this link.
+					if hit, ok := table_link_hit(links, mx, top + row_h * 0.5, px, row_h); ok {
+						if hit.y == l.y {bleed += 1}
+					}
+				}
+			}
+			gl(&bad, bleed == 0, fmt.tprintf("no link is clickable from another row's middle (%d bleeds)", bleed))
+
+			fmt.println("-- the text a click resolves against is the cell's, and survives the call --")
+			// tl.text is strings.clone'd into the frame allocator inside
+			// table_links; if it were a slice of that proc's stack buffer it would
+			// be dangling by now and the URL would resolve to garbage. Read it back
+			// AFTER table_links returned, which is when link_follow reads it.
+			text_ok := 0
+			for l in links {
+				if l.link.start >= 0 && l.link.start + l.link.len <= len(l.text) {
+					seg := l.text[l.link.start:l.link.start + l.link.len]
+					if strings.has_prefix(seg, "http://") || strings.has_prefix(seg, "https://") {text_ok += 1}
+				}
+			}
+			gl(&bad, text_ok == len(links), fmt.tprintf("%d of %d link rects still name a http(s) URL after the producer returned", text_ok, len(links)))
+
+			fmt.println("-- and RESOLVING one gets a URL, which is what link_follow acts on --")
+			// The other half of the reported bug's decision tree. link_follow calls
+			// link_resolve and, on failure, raises "Could not resolve" -- so if this
+			// resolves, every step from the pixel to plat.shell_open_url is correct
+			// and the remaining suspect is shell_open_url itself, which the document
+			// view already exercises successfully on the same schemes.
+			res_ok, url_ok := 0, 0
+			for l in links {
+				if tgt, ok := link_resolve(&doc, l.text, l.link); ok {
+					res_ok += 1
+					if tgt.is_url && strings.has_prefix(tgt.url, "http") {url_ok += 1}
+				}
+			}
+			gl(&bad, res_ok == len(links), fmt.tprintf("%d of %d resolve (a failure here is the 'Could not resolve' box)", res_ok, len(links)))
+			gl(&bad, url_ok == len(links), fmt.tprintf("%d of %d resolve to an http(s) URL target, not a path", url_ok, len(links)))
+			// link_follow's FIRST branch. If this claimed a web URL, the click would
+			// go to shell_reveal (Explorer) instead of the browser -- a different
+			// wrong behaviour than the one reported, and worth excluding by name.
+			bare := 0
+			for l in links {
+				if _, want := link_bare_reveal_target(&doc, l.text, l.link); want {bare += 1}
+			}
+			gl(&bad, bare == 0, fmt.tprintf("no web link is mistaken for a bare path to reveal in Explorer (%d)", bare))
+
+			return mode_done("gridlinktest", bad)
+		}
+
 		// `newtpad gutterseamtest` -- the line-number gutter, tested at the SEAM
 		// rather than at the unit.
 		//

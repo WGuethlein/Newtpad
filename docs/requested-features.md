@@ -14,7 +14,12 @@ once and would be a reopening, not a new idea.
 
 ## 1. Asked for directly, unscheduled
 
-### Newtpad as Explorer's text preview handler — asked for 2026-08-02
+### Newtpad as Explorer's text preview handler — asked for 2026-08-02, DEFERRED TO V2+
+
+**DECIDED 2026-08-02 by Wyatt: *"drop … Explorer preview for v2+"*, the same day he asked for it**, and
+with his own framing on the request: *"it's just a thought doesn't need to be now."* Kept here in full
+rather than cut down, because the packaging question below is the thing to answer before anyone
+schedules it, and it does not get easier by being rediscovered later.
 
 Wyatt: *"i want to be able to use newtpad as the text previewer in explorer"* — i.e. select a `.txt`,
 `.log`, `.json`, `.csv` in Explorer and have **Newtpad render the Preview Pane**, rather than the
@@ -96,6 +101,15 @@ that rejection is about XML, where the significant-whitespace elements cannot be
 the one vocabulary where they can.
 
 ### Mermaid diagrams in the markdown preview
+
+**DECIDED 2026-08-02 by Wyatt: *"drop mermaid … for v2+"*.** This closes the timing question that had
+been open since 2026-07-31 — the choice was "wait for V2" versus "build it in-tree behind the future
+plugin boundary now", and **he chose to wait.** So the in-tree option is off the table, mermaid is the
+plugin system's motivating example, and the consequence accepted on 2026-07-31 stands and lengthens:
+**the markdown preview shows raw mermaid source until V2.** The three sub-decisions below (static vs
+live vs click-to-jump) are still unanswered and are still day-one decisions whenever it starts —
+particularly the third, which needs source byte offsets carried through every node and is painful to
+retrofit.
 
 **Requested 2026-07-31 by Wyatt**, with the reason attached: *"I will be using spec driven design
 heavily on new projects and this is a large piece of interacting with it."* He also asked the right
@@ -336,6 +350,11 @@ From HANDOFF §6aa, which is the plan of record.
   user overlay is missing.
 
 **V2**
+- **Mermaid, as the first plugin** — Wyatt's decision 2026-08-02; see §1 for the cost argument, the
+  three sub-decisions still open, and what the ABI has to carry that "formatters + viewers" does not.
+- **An Explorer preview handler (`IPreviewHandler`), and a thumbnail handler with it** — Wyatt's
+  decision 2026-08-02; see §1. Blocked on a product question, not a technical one: it needs a DLL and
+  a registration step, which is the first thing here that cannot work without an installer.
 - **The UI overhaul and the `renderer`/`ui` extraction.** §6aa moved these to V2 as its *first* item, on
   File Pilot's own advice: budget exactly one UI rewrite and do it after real use. `src/renderer` and
   `src/ui` are still empty stubs, and recent batches made the extraction measurably harder in ~10 named
