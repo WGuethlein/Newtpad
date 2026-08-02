@@ -1433,10 +1433,28 @@ Table_Filter :: struct {
 	// and cannot be got wrong.
 	active:  bool,
 	col:     int,
-	// Distinct values in FIRST-SEEN order, not sorted: the list is a picture of
-	// the column, and sorting it hides whether the data is grouped. Owned.
+	// Distinct values in ASCENDING order -- see filter_sort_values, which is the
+	// only thing that ever orders them. Owned.
+	//
+	// This used to be FIRST-SEEN order, on the argument that "the list is a picture
+	// of the column, and sorting it hides whether the data is grouped". Wyatt
+	// overruled it from live use (2026-08-02): a picture of the column is not what
+	// anyone is doing with a 536-row checkbox list, they are looking for one name in
+	// it. The argument was not wrong about what first-seen order shows; it was wrong
+	// about what the list is for.
 	values:  [dynamic]string,
 	on:      [dynamic]bool, // parallel to `values`
+	// value -> its slot in `values`/`on`. The keys BORROW the clones `values` owns,
+	// so this holds no memory of its own and must be cleared before they are freed.
+	//
+	// It is what paid for removing the value cap. BOTH scans over `values` were
+	// linear: the distinct collection in table_filter_open, which is O(rows x
+	// values), and -- worse, because it runs on every checkbox click rather than
+	// once per open -- keep() in table_filter_apply. At the old 512-value ceiling
+	// both were 512-deep and invisible; without a ceiling they are quadratic against
+	// TABLE_SORT_MAX and are exactly what would have made the removal untenable. The
+	// cap was never buying headroom, it was buying an escape from these two loops.
+	index:   map[string]int,
 	view:    [dynamic]i32, // data-row indices, display order
 	vrank:   [dynamic]i32, // data row -> display position, -1 when hidden
 	// The column had more rows than TABLE_SORT_MAX, so the distinct list was
@@ -1469,11 +1487,38 @@ table_filter_clear :: proc(doc: ^Document) {
 	if doc == nil {return}
 	f := &doc.table_filter
 	f.active, f.col, f.refused = false, TABLE_SORT_NONE, false
+	// The map FIRST: its keys point into the clones the next line frees, so any
+	// order that leaves entries alive past the delete leaves the map holding
+	// dangling keys. Nothing reads it in between today; the ordering is written
+	// down so that stays true by construction rather than by luck.
+	clear(&f.index)
 	for v in f.values {delete(v)}
 	clear(&f.values)
 	clear(&f.on)
 	clear(&f.view)
 	clear(&f.vrank)
+}
+
+// Release everything the filter OWNS, for doc_close.
+//
+// The counterpart table_sort_free sat beside without one. `offs`, `perm` and
+// `rank` were freed when a document closed and the filter's clones, ticks, view,
+// rank and map were not -- a leak bounded at 512 small strings per closed table
+// document while the value cap existed, and bounded only by TABLE_SORT_MAX once it
+// did not. Found while removing the cap, which is why it is fixed here rather than
+// filed: this batch is what made it matter.
+//
+// delete(), not clear(): doc_close is the end of the document's life, so the
+// backing storage goes too. table_filter_clear is the one that has to leave the
+// arrays reusable.
+table_filter_free :: proc(doc: ^Document) {
+	f := &doc.table_filter
+	for v in f.values {delete(v)}
+	delete(f.values)
+	delete(f.on)
+	delete(f.view)
+	delete(f.vrank)
+	delete(f.index)
 }
 
 // Collect the DISTINCT values of `col`, in first-seen order, and start with all of
@@ -1522,16 +1567,19 @@ table_filter_open :: proc(doc: ^Document, col: int) -> bool {
 		if n > 0 && buf[n - 1] == '\r' {n -= 1}
 		append(&doc.table_sort.offs, p)
 		t := strings.trim_space(csv_field_into(string(buf[:n]), delim, col, key[:]))
-		// Linear over the distinct set. A column with thousands of distinct values
-		// makes this quadratic, which is why TABLE_FILTER_VALUES_MAX exists: past
-		// that the list is not something a person can pick from anyway, and the
-		// scan stops adding rather than slowing down without end.
-		seen := false
-		for v in f.values {
-			if v == t {seen = true;break}
-		}
-		if !seen && len(f.values) < TABLE_FILTER_VALUES_MAX {
-			append(&f.values, strings.clone(t))
+		// One map probe, where this used to be a linear walk of the distinct set
+		// under a 512-value cap that existed to bound the resulting quadratic. Every
+		// distinct value in a filterable file now gets a checkbox -- see the batch
+		// note below for why there is no ceiling of its own left.
+		if _, seen := f.index[t]; !seen {
+			// THE CLONE IS THE KEY, never `t`. `t` spans `key`, the stack buffer this
+			// loop overwrites on the very next row, so a map keyed on it would be
+			// keyed on bytes that mean something else one iteration later -- and the
+			// symptom is not a crash but a distinct list with phantom duplicates and
+			// misses, which reads as the filter simply not working.
+			v := strings.clone(t)
+			f.index[v] = len(f.values)
+			append(&f.values, v)
 			append(&f.on, true) // everything ticked: you untick what you don't want
 		}
 		if end >= doc.pt.length {break}
@@ -1541,16 +1589,34 @@ table_filter_open :: proc(doc: ^Document, col: int) -> bool {
 		table_filter_clear(doc)
 		return false
 	}
+	// BEFORE `active`, and that ordering is load-bearing -- see filter_sort_values.
+	filter_sort_values(f)
 	f.col, f.active = col, true
 	table_filter_apply(doc)
 	return true
 }
 
-// More distinct values than a dropdown is worth. Past this the list stops growing
-// -- a column of 5,000 unique ids is not something anyone picks from with
-// checkboxes, and the alternative is a scan that degrades quadratically for a UI
-// nobody can use.
-TABLE_FILTER_VALUES_MAX :: 512
+// THERE IS NO CAP ON THE DISTINCT SET, and `TABLE_FILTER_VALUES_MAX` (512) is gone
+// rather than raised. Wyatt, live use on a 1,000-row CSV, 2026-08-02: *"when you
+// filter, and deselect all it shows rows still"*. Its First Name column holds 536
+// distinct values; collection stopped at 512, and keep() below deliberately KEPT
+// every value the list never saw -- so the 27 rows carrying the 513th value onward
+// could not be hidden by any combination of checkboxes, including none of them.
+// Because values are collected in first-seen order the survivors were always the
+// file's tail (rows 925-1000 in his file), which is why it read as the grid
+// failing to filter below a certain row rather than as a membership bug.
+//
+// The ceiling that remains is the one that was always doing the real work:
+// TABLE_SORT_MAX refuses to filter a file over 100,000 rows at all, and a file of
+// 100,000 rows has at most 100,000 distinct values. There is no unbounded case to
+// defend against, and the search box is what makes a long list usable -- a
+// deliberate choice against PowerBI's "load more" paging, which would have
+// reintroduced this exact defect (a value with no checkbox) as a design feature
+// and made (Select All) ambiguous about which values it meant. See
+// docs/superpowers/specs/2026-08-02-filter-dropdown-fixes-design.md §2.
+//
+// Both linear scans this removal exposed are now map probes; `Table_Filter.index`
+// carries that argument in full.
 
 // Rebuild `view` and `vrank` from the current selection.
 //
@@ -1571,12 +1637,19 @@ table_filter_apply :: proc(doc: ^Document) {
 	buf: [RENDER_LINE_CAP]u8
 	key: [RENDER_LINE_CAP]u8
 	keep :: proc(f: ^Table_Filter, val: string) -> bool {
-		for v, i in f.values {
-			if v == val {return f.on[i]}
-		}
-		// A value the list never saw -- past TABLE_FILTER_VALUES_MAX -- is KEPT.
-		// Hiding rows on the strength of a list that stopped early would remove
-		// data the user was never shown a checkbox for.
+		if i, ok := f.index[val]; ok {return f.on[i]}
+		// A VALUE THE LIST NEVER SAW is kept. This branch used to be the value
+		// cap's escape hatch and reached on ordinary files, which is what made
+		// rows past the 512th distinct value unhideable; with the cap gone the
+		// distinct set covers every row the scan saw, so getting here now means
+		// the document's BYTES CHANGED between the open and this apply.
+		//
+		// It still fails OPEN, and for a sharper reason than before: showing a row
+		// nobody ticked is a visible surprise the user can clear, and hiding one
+		// nobody was offered a checkbox for is data disappearing with no control
+		// that brings it back. This procedure feeds `view`, which table_row_start
+		// resolves visible rows through and the cell editor writes through -- the
+		// direction that errs toward showing too much is the only safe one here.
 		return true
 	}
 	add :: proc(doc: ^Document, f: ^Table_Filter, row: int, delim: u8, buf, key: []u8) {
@@ -1594,6 +1667,93 @@ table_filter_apply :: proc(doc: ^Document) {
 		for r in s.perm {add(doc, f, int(r), delim, buf[:], key[:])}
 	} else {
 		for r in 0 ..< len(s.offs) {add(doc, f, r, delim, buf[:], key[:])}
+	}
+}
+
+// Put the distinct values in ASCENDING order, and rebuild `index` and `on` over
+// the new positions. *"i think the names/numbers in the modal should be
+// alphabetical/numerical ascending"* (Wyatt, live use, 2026-08-02).
+//
+// TYPE-AWARE, FROM THE SORT'S OWN EVIDENCE. A column is numeric iff every
+// non-empty distinct value satisfies table_is_number -- the same predicate
+// table_sort_build settles each of its keys with, deliberately, so the filter and
+// the sort cannot come to disagree about which column is a number column. Byte
+// order would put `10` before `2`, which in a column of numbers is not a different
+// opinion about ordering, it is wrong.
+//
+// BLANKS LAST, unconditionally. An empty cell is the ABSENCE of a value rather
+// than a small one, so it belongs at neither end of the data's own range; Excel
+// puts it last and so does this. Note this is deliberately NOT the sort's
+// empty-follows-the-arrow rule (see Sort_Field) -- that rule exists because a sort
+// has a direction to follow, and this list has none to follow.
+//
+// CALLED EXACTLY ONCE, from table_filter_open, BEFORE `f.active` is set and
+// therefore before any tick can exist. That ordering is the whole of why
+// reordering these arrays is safe: Menu_Item.payload is an index into
+// `values`/`on`, so a reorder performed after a tick existed would silently
+// re-point every checkbox in the dropdown at a different value -- ticking `Alvin`
+// and hiding `Andrew`. The other half of the same guarantee lives in commands.odin:
+// reopening a column that is already filtered deliberately does NOT rescan, so a
+// live selection never reaches this procedure. Either of those two facts changing
+// alone breaks the other, which is why both are written down in both places.
+@(private = "file")
+filter_sort_values :: proc(f: ^Table_Filter) {
+	// Numeric only if EVERY non-empty value is a number: one "N/A" among the
+	// distinct values makes the column text, exactly as one non-numeric cell
+	// settles a sort key as text. The empty string is excluded from the evidence
+	// because it is pinned last either way and would otherwise veto every numeric
+	// column that has a blank cell in it.
+	numeric, nonempty := true, 0
+	for v in f.values {
+		if v == "" {continue}
+		nonempty += 1
+		if !table_is_number(v) {numeric = false;break}
+	}
+	numeric = numeric && nonempty > 0
+
+	// rawptr, not ^bool: slice.sort_by_with_data's comparator takes the payload
+	// untyped, the same shape sort_less_keys above already uses for its Sort_Ctx.
+	less :: proc(a, b: string, user_data: rawptr) -> bool {
+		numeric := (^bool)(user_data)
+		// Blanks last, settled before anything else looks at the bytes. Both blank
+		// yields false in each direction, which is what keeps the order TOTAL.
+		if a == "" || b == "" {return b == "" && a != ""}
+		if numeric^ {
+			sa, sb: [64]u8
+			na, nb := sort_number(a, &sa), sort_number(b, &sb)
+			if na != nb {return na < nb}
+			// Equal as numbers, distinct as text -- `1.0` against `1.00`, or `1,000`
+			// against `1000`. They are separate checkbox rows and must still have an
+			// order, so this falls through to the byte compare rather than declaring
+			// them equal and leaving their positions to the partitioning.
+		}
+		// Case-insensitive, with a case-SENSITIVE tiebreak. Without the tiebreak
+		// "ABC" and "abc" are mutually not-less, their relative order is whatever
+		// slice.sort_by_with_data's partitioning happens to produce, and the list
+		// reshuffles between two opens of the same column for no reason the reader
+		// can see.
+		lower :: proc(c: u8) -> u8 {return c + 32 if c >= 'A' && c <= 'Z' else c}
+		n := min(len(a), len(b))
+		for i in 0 ..< n {
+			ca, cb := lower(a[i]), lower(b[i])
+			if ca != cb {return ca < cb}
+		}
+		if len(a) != len(b) {return len(a) < len(b)}
+		return a < b
+	}
+	slice.sort_by_with_data(f.values[:], less, &numeric)
+
+	// `index` and `on` are REBUILT over the new positions rather than permuted
+	// alongside the sort. Every value is ticked at this point -- table_filter_open
+	// appends `true` with each one and nothing has had a chance to change that yet
+	// -- so re-establishing that invariant here is both correct and cheaper than
+	// carrying a permutation, and it means this procedure states the postcondition
+	// instead of depending on a caller to have maintained it.
+	clear(&f.index)
+	resize(&f.on, len(f.values))
+	for v, i in f.values {
+		f.index[v] = i
+		f.on[i] = true
 	}
 }
 

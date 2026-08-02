@@ -1850,6 +1850,11 @@ doc_close :: proc(doc: ^Document) {
 	delete(doc.table_edit_buf)
 	delete(doc.table_edit_snap)
 	table_sort_free(doc)
+	// The filter owns a clone per distinct value, three arrays and a map, and none
+	// of it was freed here -- table_sort_free sat alone on this line for the whole
+	// life of the feature. Bounded while the distinct list was capped at 512;
+	// unbounded to TABLE_SORT_MAX once that cap came off (2026-08-02).
+	table_filter_free(doc)
 	// The markdown preview's per-block layout cache owns heap storage (a source
 	// copy, a span text store, the shaper's glyph and line-box arrays, and the
 	// span boxes) for every filled slot. Freed here rather than left to the
