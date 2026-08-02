@@ -5901,6 +5901,76 @@ states that on its own.
 The blink cases were briefly written into `teartest`, which is named for the tear-off; they were moved
 rather than left there.
 
+## 6bj. The two user-reported gaps (2026-08-01, v0.43.0)
+
+Second item in Wyatt's order. Both were relayed from a user on 2026-07-31 and both turned out to be
+*surfaces missing for actions that already existed*, which is why they are one small batch.
+
+### Open Themes Folder
+
+*"i want to create a new .theme file but not sure where the themes folder is on my machine."*
+
+The cause was sharper than "undiscoverable": **for that user the folder did not exist.** `theme.odin`
+deliberately does not create `%APPDATA%\Newtpad\themes` at startup — a bare read of `settings.txt` was
+`mkdir`-ing it for everyone who had never touched a theme — so someone following the Settings row's
+advice found nothing there and could not tell a wrong path from an empty right one.
+
+So the fix is `themes_dir_**ensure**`, not `themes_dir`: asking for the folder is exactly the moment
+it should come into existence, which is the distinction those two procedures were split over. This is
+their first caller that is a user action rather than a write. Modelled on `Open_Logs_Folder`, which
+exists for the same reason — the 2026-07-25 audit found logging on by default with no way to reach it.
+
+Placed next to `Theme_Edit` in the View menu rather than at the end: someone who has just edited a
+theme is the person who needs to know where theme files live.
+
+### The tab strip's context menu
+
+*"if you could right click the tabs to open the folder it's located in."* The action already existed —
+`plat.shell_reveal` is what a non-text link resolves to — and there was **no right-click on the strip
+at all**.
+
+**Four rows, decided once with Wyatt before building**, because `requested-features.md` warned that a
+tab menu invites every other per-tab command and principle 3 says fight options: Reveal in Explorer,
+Copy Full Path, Close Tab, Close Other Tabs. Pin and Close to the Right were considered and left out —
+pin is real state with its own ordering rules, not another row.
+
+**The target is the whole design.** A right-click does **not** activate the tab it opens on, so every
+row and every command resolves through `app.menu.ctx_tab` and never through the active document. A
+menu that read the active document would explain, grey out and act on the wrong file whenever the two
+differ — and closing the wrong tab is the version of that mistake that costs something. `ctx_tab` is a
+**slot**, not a display index, because two of the four rows close tabs and a display index does not
+survive that.
+
+`Tab_Close_This` is deliberately a separate command from `Tab_Close` (Ctrl+W): the same words mean
+different tabs. Both are in `command_needs_menu_target`, so a keymap line naming one is refused for
+having no target — the same rule the six sort commands follow.
+
+The file rows are **greyed with a reason** rather than hidden. A menu that changes shape per tab
+defeats muscle memory, and the disabled-reason column already existed for exactly this.
+
+### A latent crash found by the test, not by the feature
+
+`request_close_tab` dereferenced `w.hwnd` with no nil guard, while its neighbours in the same file
+(the lossy-encoding confirm, the reopen confirm) all use `w.hwnd if w != nil else nil`. Every
+production caller passes a window so it was unreachable in the product — and driving it from a test
+mode with a dirty tab is an **access violation**, which is how it surfaced. Fixed to match its
+neighbours.
+
+Two fixture lessons came with it, both recorded because they will recur: a test that closes tabs must
+**activate** them first (`app_close` picks the next tab off the MRU and opens a fresh scratch when
+that list empties, so a fixture where only one tab was activated grows a third tab on the first
+close), and a test that closes tabs must use **clean** documents unless it means to answer a discard
+dialog — `doc_from_content` marks every buffer it builds as modified.
+
+### Owed, and reported during this batch
+
+Two tear-off defects from live use, in `reported-bugs.md` and **not fixed at Wyatt's direction**:
+dragging a tab into the viewport does nothing (the detach gesture only fires outside the *window*,
+which was the option chosen at scoping and is the wrong one in use), and dragging the **only** tab
+spawns a second window and leaves an empty scratch behind (the refusal asks about the document and
+never about the strip). They interact: making the viewport a detach region without fixing the
+single-tab count makes the second far easier to hit.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

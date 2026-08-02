@@ -97,6 +97,11 @@ Command_Id :: enum u8 {
 	Table_Sort_Remove,
 	Table_Sort_Clear,
 	Table_First_Row_Is_Data,
+	// tab strip context menu
+	Tab_Reveal,
+	Tab_Copy_Path,
+	Tab_Close_This,
+	Tab_Close_Others,
 	// command palette
 	Palette_Open,
 	Palette_Close,
@@ -140,6 +145,7 @@ Command_Id :: enum u8 {
 	Keys_Edit,
 	Rules_Edit,
 	Open_Logs_Folder,
+	Open_Themes_Folder,
 	// help
 	Check_For_Updates,
 	// font page (Edit > Font)
@@ -261,6 +267,10 @@ command_table := [Command_Id]Command {
 	.Table_Sort_Remove        = {"Remove from Sort", "Table"},
 	.Table_Sort_Clear         = {"Clear Sort", "Table"},
 	.Table_First_Row_Is_Data  = {"First Row Is Data", "Table"},
+	.Tab_Reveal               = {"Reveal in Explorer", "Tab"},
+	.Tab_Copy_Path            = {"Copy Full Path", "Tab"},
+	.Tab_Close_This           = {"Close Tab", "Tab"},
+	.Tab_Close_Others         = {"Close Other Tabs", "Tab"},
 	.Palette_Open             = {"Command Palette", "View"},
 	.Palette_Close            = {"Palette: Close", "View"},
 	.Palette_Confirm          = {"Palette: Confirm", "View"},
@@ -299,6 +309,7 @@ command_table := [Command_Id]Command {
 	.Keys_Edit                = {"Edit Keybindings...", "View"},
 	.Rules_Edit               = {"Edit Colour Rules...", "View"},
 	.Open_Logs_Folder         = {"Open Logs Folder", "View"},
+	.Open_Themes_Folder       = {"Open Themes Folder", "View"},
 	// The only command in the product that touches the network, and the title
 	// says so. The user should not have to guess which row leaves the machine,
 	// and the menu row and the palette entry both read from this one string.
@@ -708,7 +719,12 @@ request_close_tab :: proc(app: ^App, slot: int, w: ^plat.Window) {
 	}
 	d := app.docs[slot]
 	if d.modified {
-		switch plat.confirm_discard(w.hwnd, doc_display_name(d)) {
+		// `w.hwnd if w != nil` -- the pattern its neighbours in this file already
+		// use (the lossy-encoding confirm, the reopen confirm). This one dereferenced
+		// `w` directly, which every production caller satisfies and no test mode
+		// does: driving it with a nil window and a dirty tab is an access violation,
+		// which is how it was found.
+		switch plat.confirm_discard(w.hwnd if w != nil else nil, doc_display_name(d)) {
 		case .Cancel:
 			return
 		case .Save:
@@ -1080,6 +1096,10 @@ command_needs_menu_target :: proc(cmd: Command_Id) -> bool {
 	#partial switch cmd {
 	case .Table_Sort_Asc, .Table_Sort_Desc, .Table_Sort_Then_Asc, .Table_Sort_Then_Desc,
 	     .Table_Sort_Remove, .Table_Sort_Clear:
+		return true
+	// The tab menu's four act on app.menu.ctx_tab, which only a menu sets, so a
+	// keymap line naming one of them has no target and must be refused the same way.
+	case .Tab_Reveal, .Tab_Copy_Path, .Tab_Close_This, .Tab_Close_Others:
 		return true
 	}
 	return false
@@ -1855,6 +1875,64 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			}
 		} else {
 			app_note(app, "[COULD NOT OPEN THE LOGS FOLDER]")
+		}
+	// --- the tab strip's context menu ---
+	//
+	// All four resolve the tab through menu_ctx_tab_doc, the same producer the
+	// menu's own enabled predicates read, so a row cannot paint live and then act
+	// on a different tab -- or on none.
+	case .Tab_Reveal:
+		if d := menu_ctx_tab_doc(app); d != nil && d.path != "" {
+			// Reveal, not open: the user asked to see where the file is, and
+			// nothing we did executed it. Same call a non-text link resolves to.
+			if !plat.shell_reveal(d.path) {
+				app_note(app, "[COULD NOT REVEAL THE FILE]")
+			}
+		}
+	case .Tab_Copy_Path:
+		if d := menu_ctx_tab_doc(app); d != nil && d.path != "" {
+			plat.clipboard_set_text(w.hwnd if w != nil else nil, d.path)
+			app_note(app, "[PATH COPIED]")
+		}
+	case .Tab_Close_This:
+		// Distinct from .Tab_Close, which is Ctrl+W and closes the ACTIVE tab. This
+		// one closes the tab the menu was opened on, which is frequently not the
+		// active one -- a right-click does not activate here.
+		//
+		// Through request_close_tab, so an unsaved tab still asks. The menu is a
+		// second route to closing, not a second policy about unsaved work.
+		if app.menu.ctx_tab >= 0 {request_close_tab(app, app.menu.ctx_tab, w)}
+	case .Tab_Close_Others:
+		// Backwards over the slots, and that is load-bearing: request_close_tab may
+		// remove a slot, and walking forward while the array shrinks under the index
+		// skips whatever moved into the gap. It may also be CANCELLED -- an unsaved
+		// tab whose dialog the user dismisses stays open -- so this cannot assume it
+		// ends with exactly one tab left.
+		if app.menu.ctx_tab >= 0 && app.menu.ctx_tab < len(app.docs) {
+			keep := app.docs[app.menu.ctx_tab]
+			for i := len(app.docs) - 1; i >= 0; i -= 1 {
+				if app.docs[i] == nil || app.docs[i] == keep {continue}
+				request_close_tab(app, i, w)
+			}
+		}
+	case .Open_Themes_Folder:
+		// A user could not find where to put a .theme file, and the cause was more
+		// specific than "it is undiscoverable": for them the folder did not EXIST.
+		// theme.odin deliberately does not create it at startup -- a bare read of
+		// settings.txt was mkdir-ing a themes/ folder for every user who had never
+		// touched a theme -- so someone following the Settings row's advice found
+		// nothing there and could not tell a wrong path from an empty right one.
+		//
+		// themes_dir_ENSURE, not themes_dir: asking for the folder is exactly the
+		// moment it should come into existence, which is the distinction those two
+		// procedures were split over. This is the first caller that is a user
+		// action rather than a write.
+		if dir, ok := themes_dir_ensure(); ok {
+			if !plat.shell_open_folder(dir) {
+				app_note(app, "[COULD NOT OPEN THE THEMES FOLDER]")
+			}
+		} else {
+			app_note(app, "[COULD NOT OPEN THE THEMES FOLDER]")
 		}
 
 	// --- help ---

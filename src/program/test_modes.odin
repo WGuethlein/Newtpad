@@ -4086,6 +4086,94 @@ when NEWTPAD_TESTS {
 			}
 		}
 
+		// -- the tab strip's context menu ---------------------------------------
+		//
+		// Requested by a user: *"if you could right click the tabs to open the
+		// folder it's located in."* Four rows, decided once with Wyatt rather than
+		// grown a row at a time.
+		//
+		// THE TARGET IS THE POINT. Every row and every command resolves the tab
+		// through app.menu.ctx_tab, never through the active document, because a
+		// right-click deliberately does not activate the tab it opens on -- so a
+		// menu that read the active document would explain, grey out and act on the
+		// wrong file whenever the two differ. The fixture below makes them differ
+		// on purpose: the ACTIVE tab is saved and the TARGET is untitled.
+		fmt.println("-- the tab context menu --")
+		{
+			a: App
+			defer app_destroy(&a)
+			menu_init(&a.menu)
+			saved := new(Document)
+			saved^ = doc_from_content(transmute([]u8)strings.clone("on disk\n"), "C:\\notes.txt", .UTF8)
+			untitled := new(Document)
+			untitled^ = doc_from_content(transmute([]u8)strings.clone("scratch\n"), "", .UTF8)
+			// CLEAN, both of them. doc_from_content marks a rebuilt buffer modified,
+			// and a dirty tab makes request_close_tab raise the discard dialog --
+			// which this case is not about, and which cannot be answered from a test.
+			// (Driving it anyway is what found request_close_tab dereferencing a nil
+			// window; that is fixed, and this fixture still has no business asking.)
+			saved.modified, untitled.modified = false, false
+			s_saved := app_add(&a, saved)
+			s_untitled := app_add(&a, untitled)
+			// BOTH activated, then the saved one left in front. app_close picks the
+			// next tab off the MRU and falls back to opening a fresh scratch when
+			// that list empties, so a fixture where only one tab was ever activated
+			// grows a third tab on the first close -- an artefact of the fixture, not
+			// of the menu. Every real tab has been activated by the path that opened
+			// it.
+			app_activate(&a, s_untitled)
+			app_activate(&a, s_saved) // the SAVED tab is in front
+
+			menu_open_tab_ctx(&a, 10, 30, s_untitled) // ...the menu opens on the other one
+			chk(&bad, a.menu.ctx && a.menu.ctx_tab == s_untitled, fmt.tprintf("the menu records the tab it was opened on (%d, want %d)", a.menu.ctx_tab, s_untitled))
+			chk(&bad, app_active(&a) == saved, "...and does NOT activate it -- a right-click is a question, not a switch")
+			chk(&bad, menu_ctx_tab_doc(&a) == untitled, "...and the target resolves to that tab's document, not the active one")
+
+			// The file rows are dead FOR THE TARGET, which is the assertion that
+			// fails if any of them reads app_active instead.
+			reveal := Menu_Item{cmd = .Tab_Reveal, enabled = nil}
+			for it in tab_menu_items {if it.cmd == .Tab_Reveal {reveal = it}}
+			copyp := Menu_Item{cmd = .Tab_Copy_Path}
+			for it in tab_menu_items {if it.cmd == .Tab_Copy_Path {copyp = it}}
+			chk(&bad, reveal.enabled != nil && !reveal.enabled(&a), "Reveal is greyed for an untitled TARGET, though the active tab is saved")
+			chk(&bad, item_disabled_reason(&a, reveal) == "unsaved file", fmt.tprintf("...and says why (%q)", item_disabled_reason(&a, reveal)))
+			chk(&bad, copyp.enabled != nil && !copyp.enabled(&a), "Copy Full Path is greyed for the same reason")
+
+			// ...and live when the target IS saved.
+			menu_open_tab_ctx(&a, 10, 30, s_saved)
+			chk(&bad, reveal.enabled(&a), "Reveal is live when the target has a file on disk")
+			chk(&bad, item_disabled_reason(&a, reveal) == "", "...with no reason shown, so the accelerator column is free")
+
+			// Close Others is dead on a single tab and says so. Checked through the
+			// same predicate the row carries.
+			others := Menu_Item{cmd = .Tab_Close_Others}
+			for it in tab_menu_items {if it.cmd == .Tab_Close_Others {others = it}}
+			chk(&bad, others.enabled != nil && others.enabled(&a), "Close Other Tabs is live with two tabs open")
+
+			// CLOSING ACTS ON THE TARGET, not the active tab -- the row that would
+			// silently close the wrong file.
+			menu_open_tab_ctx(&a, 10, 30, s_untitled)
+			t: plat.Text
+			command_dispatch(.Tab_Close_Others, {}, &a, nil, &t, 10)
+			live := 0
+			for d in a.docs {if d != nil {live += 1}}
+			chk(&bad, live == 1, fmt.tprintf("Close Other Tabs leaves one tab (%d)", live))
+			chk(&bad, a.docs[s_untitled] != nil && a.docs[s_saved] == nil, "...and it is the TARGET that survives, not the tab that was active")
+			chk(&bad, !others.enabled(&a), "...after which Close Other Tabs goes dead")
+			chk(&bad, item_disabled_reason(&a, others) == "only tab", fmt.tprintf("...and says why (%q)", item_disabled_reason(&a, others)))
+		}
+
+		// The four are menu-target commands: a keymap line naming one has no tab to
+		// act on, and must be refused the same way the sort commands are.
+		{
+			needs := 0
+			for c in ([]Command_Id{.Tab_Reveal, .Tab_Copy_Path, .Tab_Close_This, .Tab_Close_Others}) {
+				if command_needs_menu_target(c) {needs += 1}
+			}
+			chk(&bad, needs == 4, fmt.tprintf("all four tab commands require a menu target (%d of 4)", needs))
+			chk(&bad, !command_needs_menu_target(.Tab_Close), "...while Ctrl+W's own Close Tab does not, since it acts on the active tab")
+		}
+
 		fmt.printfln("surfacetest: %d failures", bad)
 		if bad > 0 {os.exit(1)}
 	}

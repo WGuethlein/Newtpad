@@ -372,9 +372,35 @@ tabs_right :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text, width: f32) -> f
 // Handle a click on the title bar during the input phase. Returns true (and
 // consumes the click) if it landed on the menu / a tab / the + button.
 tabs_hit_test :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) -> bool {
-	if !(win.mouse_pressed || win.mouse_middle_pressed) {return false}
+	if !(win.mouse_pressed || win.mouse_middle_pressed || win.mouse_right_pressed) {return false}
 	if f32(win.mouse_y) >= TAB_STRIP_H {return false}
 	mx := f32(win.mouse_x)
+
+	// RIGHT-CLICK: the tab's own context menu, handled before everything below so
+	// a right press can never fall through to activate, close or start a drag.
+	//
+	// It does NOT activate the tab it opens on. A right-click is a question about
+	// a tab, not a request to switch to it, and the four commands all resolve
+	// through app.menu.ctx_tab rather than through the active document -- which is
+	// exactly why they can act on a tab that is not in front.
+	if win.mouse_right_pressed {
+		win.mouse_right_pressed = false
+		if f32(win.mouse_y) < TAB_STRIP_H && mx >= MENU_W {
+			L := tabs_layout(app, win, t, f32(win.width))
+			for r in L.tabs {
+				if !r.drawn {continue}
+				if mx >= r.x && mx < r.x + r.w {
+					// Anchored at the tab's BOTTOM-left, so the menu hangs below the
+					// strip rather than over the tab it describes.
+					menu_open_tab_ctx(app, r.x, TAB_STRIP_H, r.slot)
+					return true
+				}
+			}
+		}
+		// Empty strip, the menu button, or past the last tab: nothing to target.
+		// Consumed anyway, so a right press up here never reaches the document.
+		return true
+	}
 
 	consumed := true
 	// The SAME layout tabs_draw consumes -- that is the point of it existing.

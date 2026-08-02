@@ -259,6 +259,10 @@ menus := []Menu {
 			{cmd = .Theme_Edit},
 			{cmd = .Keys_Edit},
 			{cmd = .Rules_Edit},
+			// Beside Theme_Edit rather than at the end: someone who has just edited
+			// a theme is the person who needs to know where theme files live, and
+			// this row is the only thing in the app that says.
+			{cmd = .Open_Themes_Folder},
 			{cmd = .Open_Logs_Folder},
 		},
 	},
@@ -344,6 +348,57 @@ first_row_is_data :: proc(app: ^App) -> bool {
 	return d != nil && d.table && d.table_headerless
 }
 
+// --- the tab strip's context menu ------------------------------------------
+//
+// Requested by a user, relayed by Wyatt: *"if you could right click the tabs to
+// open the folder it's located in."* The action already existed --
+// `plat.shell_reveal` is what a non-text link resolves to -- and the surface did
+// not: there was no right-click on the strip at all.
+//
+// FOUR ROWS, DECIDED ONCE. `requested-features.md` warned that a tab menu invites
+// every other per-tab command (close others, close to the right, copy path, pin)
+// and that principle 3 says fight options, so the contents were settled with
+// Wyatt before it was built rather than grown a row at a time. Reveal answers the
+// request; Copy Path is the other thing anyone actually wants from a tab; the two
+// closes are what every editor's tab menu has. Pin and Close to the Right were
+// considered and left out -- pin is real state with its own ordering rules, not
+// another row.
+//
+// The two file rows are GREYED with a reason on a tab that has no file on disk,
+// rather than hidden: a menu that changes shape per tab defeats muscle memory,
+// and the disabled-reason column already exists for exactly this (it is what the
+// table's sort menu uses to explain a dead row).
+@(private = "file")
+tab_has_path :: proc(app: ^App) -> bool {
+	d := menu_ctx_tab_doc(app)
+	return d != nil && d.path != ""
+}
+
+// More than one tab open? Close Others is dead on a single tab -- there are no
+// others -- and saying so is better than a row that appears to do nothing.
+@(private = "file")
+tab_has_others :: proc(app: ^App) -> bool {
+	return app != nil && app_live_count(app) > 1
+}
+
+// The document the tab menu targets, or nil. One producer, so the enabled
+// predicates, the disabled reasons and the four commands cannot disagree about
+// which tab is being acted on.
+menu_ctx_tab_doc :: proc(app: ^App) -> ^Document {
+	if app == nil {return nil}
+	s := app.menu.ctx_tab
+	if s < 0 || s >= len(app.docs) {return nil}
+	return app.docs[s]
+}
+
+tab_menu_items := []Menu_Item {
+	{cmd = .Tab_Reveal, enabled = tab_has_path},
+	{cmd = .Tab_Copy_Path, enabled = tab_has_path},
+	sep,
+	{cmd = .Tab_Close_This},
+	{cmd = .Tab_Close_Others, enabled = tab_has_others},
+}
+
 // Menu bar / dropdown state. `mode` is menu-bar keyboard mode with nothing open
 // (what a bare Alt tap gives you); `open` is the index of the open dropdown.
 Menu_State :: struct {
@@ -372,6 +427,15 @@ Menu_State :: struct {
 	// picked them has been closed. That ordering is why menu_close must not
 	// clear it; see menu_close.
 	ctx_col:   int,
+	// The TAB SLOT a tab context menu targets, on exactly the same terms as
+	// ctx_col above and for the same reason: the four Tab_* commands run after the
+	// menu that picked them has closed, so the target has to outlive the menu.
+	//
+	// A slot, not a display index. Display order is the order of live entries in
+	// app.docs and a slot survives another tab being closed in between, which a
+	// display index does not -- and the commands on this menu include two that
+	// close tabs.
+	ctx_tab:   int,
 }
 
 // Must be called before the first frame: the zero value of `open` is 0, which
@@ -566,6 +630,12 @@ command_disabled_hint :: proc(cmd: Command_Id) -> string {
 		return "unsaved file"
 	case .Table_Sort_Then_Asc, .Table_Sort_Then_Desc:
 		return fmt.tprintf("%d-column sort limit", TABLE_SORT_KEYS_MAX)
+	case .Tab_Reveal, .Tab_Copy_Path:
+		// Both are dead for the same reason and it is one the user can act on:
+		// save the tab and they light up.
+		return "unsaved file"
+	case .Tab_Close_Others:
+		return "only tab"
 	}
 	return ""
 }
@@ -579,6 +649,13 @@ item_disabled_reason :: proc(app: ^App, it: Menu_Item) -> string {
 		if d != nil && d.kind == .Text && !doc_can_markdown(d) {return command_disabled_hint(it.cmd)}
 	case .Reopen_UTF8, .Reopen_UTF16LE, .Reopen_CP1252:
 		if d != nil && d.path == "" {return command_disabled_hint(it.cmd)}
+	case .Tab_Reveal, .Tab_Copy_Path:
+		// The TARGET tab, not the active one: the menu may be open on a tab that
+		// is not in front, and explaining the active tab's state there would be a
+		// reason for the wrong file.
+		if t := menu_ctx_tab_doc(app); t != nil && t.path == "" {return command_disabled_hint(it.cmd)}
+	case .Tab_Close_Others:
+		if app_live_count(app) <= 1 {return command_disabled_hint(it.cmd)}
 	case .Table_Sort_Then_Asc, .Table_Sort_Then_Desc:
 		// Only the AT-THE-CAP reason: a sort that isn't live yet needs no
 		// explanation for "there is nothing to add a tie-breaker to" -- the row
@@ -670,6 +747,7 @@ menu_open_ctx :: proc(app: ^App, items: []Menu_Item, x, y: f32, col: int) {
 	app.menu.ctx_x = x
 	app.menu.ctx_y = y
 	app.menu.ctx_col = col
+	app.menu.ctx_tab = -1 // a header menu targets a column, never a tab
 	// menu_step walks menus[mi].items by menu INDEX, which a context menu has
 	// none of — first-enabled found directly instead, same rule (skip
 	// separators and disabled rows) menu_step applies for the bar.
@@ -682,6 +760,29 @@ menu_open_ctx :: proc(app: ^App, items: []Menu_Item, x, y: f32, col: int) {
 	}
 	app.menu.top = 0
 	app.menu.rows = 0
+}
+
+// Open the TAB context menu on `slot`, at the point the caller measured.
+//
+// Its own entry point rather than a `kind` parameter on menu_open_ctx, because
+// the two menus target different things and the targets must not be settable at
+// once: a stale ctx_col read by a Tab_ command, or a stale ctx_tab read by a
+// Table_Sort one, is the "captured index consumed in the wrong space" shape this
+// codebase keeps producing. Each opener sets its own target and clears the other.
+menu_open_tab_ctx :: proc(app: ^App, x, y: f32, slot: int) {
+	menu_open_ctx(app, tab_menu_items, x, y, 0)
+	app.menu.ctx_col = 0
+	app.menu.ctx_tab = slot
+	// The first-enabled highlight was chosen against ctx_tab == -1 above, when
+	// every path-dependent row read as disabled. Re-run it now the target is set,
+	// or a right-click on a saved tab would open with Close highlighted.
+	app.menu.item = -1
+	for it, i in tab_menu_items {
+		if item_enabled(app, it) {
+			app.menu.item = i
+			break
+		}
+	}
 }
 
 // --- layout ---

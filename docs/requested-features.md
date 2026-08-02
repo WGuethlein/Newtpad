@@ -211,58 +211,6 @@ other markdown view here works; the inline answer collides with §9's concealmen
 already flagged as needing its own batch because it makes the drawn column stop matching the byte
 column.
 
-### Right-click a tab to open the folder the file is in
-
-**Requested 2026-07-31 by a user, relayed by Wyatt:** *"if you could right click the tabs to open the
-folder it's located in."* Documented, not scheduled.
-
-**The action already exists; the surface does not.** `plat.explorer_select_arg` is built and in use —
-`link_follow` reveals a non-text path in Explorer through it (`links.odin`), including the escaping
-care that path needs. So this is not "implement reveal-in-Explorer", it is "give the tab strip a
-right-click".
-
-**There is no tab context menu at all.** `grep` over `ui_tabs.odin`, `menu.odin` and `app.odin` finds
-no right-click handling on the strip, so this is a new surface rather than a new row in an existing
-menu — and that is the part worth scoping deliberately, because a tab context menu invites every
-other per-tab command (close others, close to the right, copy path, pin) and CLAUDE.md principle 3
-says fight options. Decide the menu's full contents once, when it is built, rather than growing it a
-row at a time.
-
-Related and already listed in §4: *directories opening as a tab* listing contents rather than
-revealing in Explorer. If that is ever built, this request's answer changes — "open the folder" would
-mean a Newtpad tab, not an Explorer window. Worth settling the direction before building either.
-
-### Tell the user where the themes folder is
-
-**Requested 2026-07-31 by a user, relayed by Wyatt:** *"i want to create a new .theme file but not
-sure where the themes folder is on my machine."*
-
-**The likely cause is more specific than "it is undiscoverable": for that user the folder probably
-does not exist.** `themes_dir()` (`theme.odin:525`) returns `%APPDATA%\Newtpad\themes`, but
-`theme.odin:511-524` records a deliberate decision not to create it at startup — a bare read of
-`settings.txt` was `mkdir`-ing a `themes/` folder for every user who had never touched a theme, so
-creation moved to `themes_dir_ensure` at the point of actual use. Correct decision, with the
-side effect that a user looking for the folder finds nothing there and cannot tell whether they have
-the wrong path or the right one.
-
-So the fix is not documentation. Candidates, cheapest first:
-
-- **An `Open Themes Folder` command** in the palette that calls `themes_dir_ensure` and reveals it.
-  Creates the folder as a side effect of asking for it, which is exactly when it should exist.
-- **A line in Settings** next to the theme picker showing the resolved path, clickable. Settings is
-  where someone changing themes already is.
-- Both. They are the same two lines of work behind one shared `themes_dir_ensure` call.
-
-Note this generalises: `keys.txt` and `rules.txt` live under the same `%APPDATA%\Newtpad` root and
-have the same discovery problem. Whatever answer is chosen should cover all three rather than
-being built once for themes.
-
----
-
-## 2. The UI spec still owes these
-
-`docs/ui-spec/` is the corpus for UI work. Section by section, what is asked for and not built:
-
 ### §10 Table view — DONE
 All nine rules are built: row numbers, click-to-sort with an accent arrow, numeric/date right-align,
 sampled column widths with drag-to-resize and double-click-to-fit, malformed rows marked rather than
