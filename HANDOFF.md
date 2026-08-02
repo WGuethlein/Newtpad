@@ -5514,6 +5514,129 @@ parsing it as `0.0` and dropping a blank into the middle of the data. Only which
 Sabotage run on all four fixes, output recorded in the commit messages. 46 headless modes clean; all
 five commits pass the bisectability sweep.
 
+## 6bf. The edit re-sorts, and two preview defects (2026-08-01, v0.39.0, branch `feat/resort-on-commit`)
+
+The rest of the two live passes. v0.38.0 (§6be) took the four table defects; this takes the decision
+that was held back from it and two of the three preview reports.
+
+### E — an edited row moves to where its new value belongs
+
+`table_sort_shift` kept the permutation's **offsets** true across a commit. Nothing kept its **order**
+true, so a cell edit left its row sitting where the old value had put it.
+
+**One row moves; the file is not re-scanned.** `table_sort_build` is a full pass over every sorted row
+— ~250 ms at the 100,000-row ceiling, ~360 ms with two keys — and paying that on every Enter would
+make editing a large sorted CSV unusable. `table_sort_reposition` pulls the row out of the
+permutation, binary-searches its slot and reinserts: about seventeen line reads at that ceiling.
+
+Three things about it are worth carrying forward:
+
+- **The comparator is not restated.** The search calls `sort_less_keys`, the same procedure the sort
+  itself calls. A second comparison written out for the search would have been the fifth copy of the
+  empty-and-direction rules.
+- **Probe keys come from the temp allocator, not a shared arena.** `table_sort_build` materialises its
+  keys only after its arena stops growing, because a realloc leaves earlier keys pointing into freed
+  blocks — the ACCESS VIOLATION recorded in its own comment. A binary search compares each probe
+  immediately, so it would meet that hazard on *every* probe.
+- **It refuses the edit that makes a numeric key non-numeric**, and falls back to a full rebuild —
+  the only thing that can re-decide a column's type. Sabotaging that refusal is not subtle: `N/A`
+  reaches `sort_number`, reads as `0.0`, and sorts ahead of `2` and `10`. A typo presented as a
+  number, which is what `Sort_Field.empty` exists to prevent for blanks.
+
+**Tab commits without reordering** (Wyatt's call), and it is a decision twice over. Tab means "the
+next cell in this row", and a row that jumped on every Tab would slide out from under a held key — but
+it also captures a **visible row index** before the commit and consumes it after, so a reorder there
+would open the next cell on a different row entirely. Shape B, in a gesture nobody would think to test.
+
+**And a fourth sabotage caught something the other three could not.** Rebuilding `rank` off by one
+leaves `perm` looking like a perfectly plausible order; no assertion about row order can see it. It
+was caught only by the structural check — perm is a permutation of every row *and* rank is its exact
+inverse — which is the shape worth copying whenever a procedure rewrites two arrays that mean the
+same thing twice.
+
+### A bug found while building it: `doc.top` was not carried across a cell splice
+
+Older than E, and not in any report. An edit that inserts or removes bytes moves every offset after
+it; `table_sort_shift` fixes the permutation's, and nothing fixed the scroll's.
+
+Barely reachable in the **text** view — an edit happens at a caret, and a caret off the top of the
+screen has already scrolled `doc.top` to itself. Constant in the **grid** once a sort is live, because
+sorted order is not file order: editing any visible cell whose row sits *above* the top-of-screen row
+**in the file** left `doc.top` one byte short of a line start, and `table_sort_pos` — deliberately
+forgiving about a mid-line offset — resolved it to the row before. The grid slid up by one row on an
+edit that had nothing to do with the scroll.
+
+Found because a test asserted where a row was *after* two commits rather than one. The single-commit
+version of the same test passes with the bug present.
+
+### A tab in a fenced code block drew `.notdef`
+
+No font has a glyph for U+0009. `text_cell_width_at`'s comment says exactly this for the grid — *"a
+tab must never reach the glyph-metrics path"* — and the shaper computed the advance correctly
+(`text_advance`) and then queued the glyph anyway, so `rune_face` resolved it to index 0 and the draw
+rasterized a hollow rectangle.
+
+Dropped in the shaper rather than skipped at the draw: one answer instead of one per draw path, and it
+is what the zero-width branch beside it already does. **Only the tab** — other control characters keep
+their box, which is the honest rendering of a byte with no business being there.
+
+Verified on a real device, because the claim is about what reaches the GPU: three tabs put no ink on
+an offscreen surface that an `X` through the identical path does ink.
+
+### A list ended with an item's gap instead of a paragraph's
+
+§9.3 gives a list item *"0.25 S **between items**"*. The layout spent it as the `below` of every item
+including the last, so leaving a list was 4 px where entering one was 13 px — measured, before
+anything was touched, with a throwaway probe over `md_walk`.
+
+Wyatt reported this as *"a blank line still ends a list item"* failing. **The first half of that was
+fine**: the prose after a list really is its own `.Para` block and was never swallowed into the item.
+Only the space was wrong. Worth recording because the report named a correctness bug and the defect
+was cosmetic — the probe is what told them apart, and guessing from the report would have sent the fix
+into the join.
+
+The override is a **look back** in `md_walk`, not a look ahead: a block cannot know whether its list
+has ended, but the walk knows what it just passed. It fires on **prose and blanks only**. Every other
+kind carries its own space-above from §9.3 and is already at least a paragraph's worth — except an
+**h1, whose space-above is 0 on purpose**, and raising that would be this fix second-guessing the spec
+on a case nobody reported. `mdtest`'s list-then-h1 pair caught exactly that, which is why the rule is
+narrow rather than "any block after a list".
+
+A **loose** list — items separated by blank lines — now takes a paragraph gap between its items too.
+That is what CommonMark means by loose and what a browser renders. Tight lists are untouched.
+
+### Not fixed: the scrollbar drag "ghosts" the Split sync
+
+*"Grabbing the vertical scrollbar seems to have a ghosting type of thing on scrolling that way, with
+the scroll wheel it looks fine"* — reported for both halves.
+
+**Investigated and deliberately not fixed, because nothing was proven.** Two hypotheses were checked
+and both died:
+
+- *The sync lags a frame behind the drag.* It does not. The 9.4 sync resolves at one point per frame
+  (`main.odin`), after every path that could move either side and before the draw reads them, and the
+  drag handlers run well above it.
+- *`g_vbar_preview` is never written in Split, so the drag maps through stale geometry.* It is
+  written — there is a second draw site for the Split case (`main.odin:2095`) that maintains it.
+
+What remains is a **cost** hypothesis with real evidence behind it but no proof of the symptom:
+`md_preview_frac` is measured at **3.322 ms** per call (markdown.odin's own note), and a drag pays
+that every frame while a wheel notch pays it once. That would read as stutter under a continuous
+gesture and be invisible under a discrete one, which matches the report exactly — and would equally be
+explained by half a dozen other things. **This environment cannot inject GUI input**, so "ghosting" is
+a word nothing here can observe.
+
+**What it needs is one observation**: does the *content* trail the thumb, or does the thumb itself
+stutter under the cursor? The first points at the sync, the second at the frame cost, and they are
+different fixes. Do not guess at this one — the scroll model is where this project has been burned
+most.
+
+Sabotage run on all four fixes (six sabotages: no reposition, no numeric refusal, rank off by one,
+`doc.top` unshifted, tab requeued, gap override removed). 46 headless modes clean; `shapetest` and
+`mdjointest` grow cases, and `md_block_gaps_for_test` exposes the walk's gaps as a plain shape so
+spacing can be asserted as a sum over blocks rather than read back out of `Md_Metrics` — which would
+pass with the walk broken.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

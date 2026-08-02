@@ -1128,7 +1128,9 @@ command_allowed_on :: proc(cmd: Command_Id, doc: ^Document) -> bool {
 @(private = "file")
 leave_table_view :: proc(doc: ^Document) {
 	if !doc.table {return}
-	if doc.table_editing {table_edit_commit(doc)}
+	// No reorder: the sort is cleared a few lines below, and reordering a grid the
+	// user is in the act of leaving would be work nobody ever sees.
+	if doc.table_editing {table_edit_commit(doc, resort = false)}
 	doc.table = false
 	clear(&doc.table_widths)
 	// The sort is a property of the VIEW, not of the document: leaving the grid
@@ -1539,7 +1541,9 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// Read-only grid view of a CSV/TSV. Re-anchor the top to a line start so a
 		// row lands where the caret was, and pick the delimiter on first turn-on.
 		if doc.kind == .Text && doc_can_table(doc) {
-			if doc.table_editing {table_edit_commit(doc)} // don't leave an edit dangling
+			// Don't leave an edit dangling -- and don't reorder for it either: the
+			// off-branch below clears the sort, and the on-branch has none yet.
+			if doc.table_editing {table_edit_commit(doc, resort = false)}
 			// A rectangle cannot survive the toggle in either direction, the
 			// same reason .Toggle_Wrap clears one. Table view is a grid of
 			// cells with their own widths -- a (line start, cell) pair means

@@ -3665,6 +3665,33 @@ md_layout_build :: proc(
 // and md_block_at_byte do. Handed a mid-paragraph byte, this builds the block
 // md_layout_build builds for that entry -- which, by the `ps == p` refusal in the
 // `.Para` case, is the unjoined single line.
+// One entry per block the walk emits, flattened for a test: the gap ABOVE it and
+// its own height, which together are the only two numbers the vertical rhythm is
+// made of. Exposed because Md_Walk_Block and md_walk are file-private and should
+// stay that way -- this hands back a plain shape rather than opening the walk's
+// own type up to the program layer.
+//
+// The distance between two blocks on screen is a SUM over this slice (a blank
+// line contributes a gap and no height), so a test that wants to assert about
+// spacing has to walk it rather than read a metric back out of Md_Metrics.
+Md_Block_Gap :: struct {
+	kind:    Md_Kind,
+	gap:     f32, // collapsed space above this block
+	h:       f32,
+	content: string, // joined text, for naming a block without counting indices
+}
+
+md_block_gaps_for_test :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, m: ^Md_Metrics, allocator := context.temp_allocator) -> []Md_Block_Gap {
+	blocks := make([]Md_Walk_Block, 64, context.temp_allocator)
+	n, _, _ := md_walk(gfx, t, doc, m, m.measure, 0, max(int), 0, max(f32), blocks)
+	out := make([]Md_Block_Gap, n, allocator)
+	for i in 0 ..< n {
+		b := blocks[i]
+		out[i] = {kind = b.lay.cls.kind, gap = b.gap, h = b.h, content = b.lay.cls.content}
+	}
+	return out
+}
+
 md_layout_build_for_test :: proc(gfx: ^plat.Gfx, t: ^plat.Text, doc: ^Document, m: ^Md_Metrics, p: int, measure: f32) -> Md_Layout {
 	buf: [RENDER_LINE_CAP]u8
 	line, lend, _ := md_line_at(doc, p, buf[:])
@@ -3994,6 +4021,11 @@ md_walk :: proc(
 	// browsers do and what 9.3's own numbers assume (a paragraph's 0.8 S and an
 	// h2's 1.6 S are not meant to sum). `prev_below` carries the upper half.
 	prev_below := f32(0)
+	// The walk has just passed a list item and has not yet seen what ends the run.
+	// See the gap override below; this is the only piece of BETWEEN-block state the
+	// walk keeps besides prev_below, and both exist for the same reason -- a gap is
+	// a property of a pair, not of a block.
+	after_list := false
 	empties := 0
 	reached = p > doc.pt.length || p >= stop_at
 	for p <= doc.pt.length && p < stop_at && n < len(out) && empties < MD_MAX_EMPTY_BLOCKS {
@@ -4003,6 +4035,56 @@ md_walk :: proc(
 		if nb > 0 && buf[nb - 1] == '\r' {nb -= 1}
 		lay := md_layout_ensure(gfx, text, doc, m, p, end, string(buf[:nb]), in_fence, fence_lex, fence_state, measure)
 		gap := max(prev_below, lay.above)
+		// THE GAP AFTER A LIST RUN IS A PARAGRAPH'S, NOT AN ITEM'S. §9.3 gives a
+		// list item "0.25 S between items" -- between ITEMS -- and the layout
+		// applied it as the `below` of every item including the last, so the prose
+		// after a list sat as close to it as one bullet sits to the next. Entering
+		// a list already gets the full 0.8 S (the preceding paragraph's own below),
+		// so the asymmetry was visible in one screenful: "it does not look like
+		// this is the case, there isn't a slightly larger gap like the top of the
+		// list" (Wyatt, live use, v0.37.0 §3).
+		//
+		// A LOOK BACK, not a look ahead, which is why it lives here and not in
+		// md_layout_ensure: a block cannot know whether the list it belongs to has
+		// ended, but the walk knows what it has just passed. `last_kind` skips
+		// .Blank so a LOOSE list -- items separated by blank lines -- still reads
+		// as one list at 0.25 S rather than being pulled apart by its own blanks.
+		//
+		// max(), so this only ever RAISES the gap to at least a paragraph's worth.
+		// Every block with a bigger space-above of its own keeps it: an h2's 1.6 S,
+		// a fence's 1.0 S, a rule's 24px are all untouched by this.
+		//
+		// It fires on the FIRST non-list block, blank or not, and clears there --
+		// which is what makes the total come out at exactly one paragraph gap
+		// rather than the item's 0.25 S plus a paragraph's 0.8 S stacked. A blank
+		// line has no height of its own, so the space between the last bullet and
+		// the prose under it is this one number.
+		//
+		// CONSEQUENCE, stated because it is a real change and not a side effect
+		// worth hiding: a LOOSE list -- items separated by blank lines -- now has a
+		// paragraph gap between its items rather than 0.25 S, because that blank is
+		// the first non-list block after an item. That is what CommonMark means by
+		// loose and what every browser renders (a loose item's content is wrapped
+		// in <p> and takes paragraph margins), and the source asked for it by
+		// leaving the line blank. A TIGHT list is untouched: the next item follows
+		// immediately, so nothing fires.
+		//
+		// PROSE AND BLANKS ONLY, not every block that can follow a list. Every
+		// other kind carries its own space-above from §9.3 -- an h2's 1.6 S, a
+		// fence's 1.0 S, a quote's 0.8 S -- and those are already at least a
+		// paragraph's worth, so raising them would change nothing. The one
+		// exception is an h1, whose §9.3 space-above is 0 ON PURPOSE (it is the
+		// document's opening element), and overriding that would be this fix
+		// second-guessing the spec on a case nobody reported. A paragraph's
+		// space-above is 0 for the same stated reason and is exactly the case that
+		// WAS reported, which is why the gap has to come from the list's side.
+		if after_list && lay.cls.kind != .List {
+			if lay.cls.kind == .Para || lay.cls.kind == .Blank {
+				gap = max(gap, m.para_below)
+			}
+			after_list = false
+		}
+		if lay.cls.kind == .List {after_list = true}
 		out[n] = {start = p, end = lay.end, next = lay.next, slot_top = total, gap = gap, h = lay.h, lay = lay}
 		n += 1
 		total += gap + lay.h

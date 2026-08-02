@@ -11,19 +11,11 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
-## From the v0.37.0 live pass (2026-08-01) — the preview half, not yet investigated
+## From the v0.37.0 live pass (2026-08-01) — the preview half
 
-The table half of that pass shipped as v0.38.0 (HANDOFF §6be). These three are what the preview
-pass turned up, recorded from Wyatt's own notes on
-[live-pass-v0.37.0.md](live-pass-v0.37.0.md) and not yet reproduced.
-
-### A Tab inside a fenced code block draws an empty rectangle
-
-*"This works, though a Tab character puts an empty rectangle in the code block in it's stead"* (§7).
-
-Reads as `.notdef` — the preview's code-block path handing a raw `\t` to the shaper instead of
-expanding it first. The document view does not do this, so the two paths disagree about tabs and the
-document one is the reference. Contained, and the likeliest quick win of the three.
+The table half of that pass shipped as v0.38.0 (HANDOFF §6be); two of the three below shipped as
+v0.39.0 (§6bf). **The tab glyph and the list-exit gap are fixed and deleted from this file.** The
+scrollbar drag is what is left, and it is the one nothing here can observe.
 
 ### Dragging the scrollbar ghosts the Split-view sync; the wheel is clean
 
@@ -31,17 +23,36 @@ document one is the reference. Contained, and the likeliest quick win of the thr
 the scroll wheel it looks fine"* (§5, and the same again for the preview half).
 
 Both halves scroll to roughly the right place, so the sync itself is fine — it is specifically the
-**drag** path. Drag and wheel reach the sync separately; only one of them is repainting both panes.
-Worth checking whether the drag updates the anchor without marking the other half dirty.
+**drag** path.
 
-### A blank line may no longer visibly end a list item
+**Two hypotheses were investigated in v0.39.0 and both died**, written down so the next pass does not
+re-derive them:
 
-*"It does not look like this is the case, there isn't a slightly larger gap like the top of the
-list"* (§3).
+- **The sync does not lag a frame behind the drag.** It resolves at one point per frame
+  (`main.odin`), after every path that could have moved either side and before the draw reads them,
+  and the drag handlers run well above it.
+- **`g_vbar_preview` is not stale in Split.** There is a second draw site for exactly that case
+  (`main.odin:2095`) which maintains the latch.
 
-The one v0.37.0 item that could mean the paragraph join is over-eager, which would be a correctness
-bug rather than a spacing one. **Reproduce before believing it**: it may be that the item ends
-correctly and only the gap under it is too small, which is a different fix in a different place.
+What is left is a **cost** hypothesis with real evidence behind it but no proof of the symptom:
+`md_preview_frac` is measured at **3.322 ms** per call (markdown.odin's own note), and a drag pays
+that on every frame where a wheel notch pays it once. That would read as stutter under a continuous
+gesture and be invisible under a discrete one, which matches the report — and so would several other
+things.
+
+**One observation splits it, and only a person can make it:** does the *content* trail the thumb, or
+does the *thumb itself* stutter under the cursor? The first points at the sync, the second at frame
+cost, and they are different fixes. **Do not guess at this one** — the scroll model is where this
+project has been burned most.
+
+### FIXED in v0.39.0 — a blank line does end a list item; only the gap was wrong
+
+Kept as a note rather than deleted, because the *report* and the *defect* were different things and
+that is worth remembering. Wyatt filed it under "a blank line still ends a list item" failing. The
+list ending was fine — the prose after a list really is its own block and was never swallowed. What
+was wrong was that §9.3's "0.25 S **between items**" was being spent below the *last* item too, so
+leaving a list was 4px where entering one was 13px. A probe over `md_walk` is what told the two apart;
+reading the report at face value would have sent the fix into the paragraph join. See HANDOFF §6bf.
 
 ### Also from that pass, deliberately not queued
 
