@@ -14,35 +14,6 @@ once and would be a reopening, not a new idea.
 
 ## 1. Asked for directly, unscheduled
 
-### A sorted cell re-sorts on commit — DECIDED 2026-08-01, not built
-
-From the v0.36.0 live pass §1: *"The edit works, but it doesn't resort after the change, e.g. I'm
-sorting alphabetically, I swap G to F, it doesn't update the sort so that the row is moved up."*
-Wyatt's decision, asked and answered in the same session: **the row moves when the edit is committed**
-(Enter, or leaving the cell), not live per keystroke, and the view does *not* chase it.
-
-Deliberately held out of v0.38.0, which fixed the rest of that pass. It touches `table_edit_commit`,
-the seam §1 of the live pass exists to cover, and the failure mode is a value landing on the wrong
-row rather than a cosmetic one — so it gets its own spec, its own subagent and its own review rather
-than riding along with four geometry fixes.
-
-What has to be decided before building it: the commit already runs *before* every reorder
-(`table_sort_set` and friends each commit first, HANDOFF §6bc), so this is the reverse dependency —
-a reorder triggered *by* a commit — and the anchor `table_edit_line_intact` validates against is the
-thing being invalidated. Whether the caret survives the move, and to which cell, is the second
-question.
-
-### A CSV with no header row is still treated as having one
-
-From the same pass: *"csv's with no header are automatically assumed to have a header... not sure how
-we'd differentiate this."* His own note names the hard part correctly — there is no reliable signal,
-which is why every spreadsheet ships a toggle for it.
-
-Likely shape: a cheap heuristic on open (does row 1 differ in *type* from the rows under it — all
-text over mostly-numeric columns), plus a way to override it, which is the header menu's natural
-home. Principle 3 says fight options; this is one of the few that earns its place, because being
-wrong silently costs the user a whole row of data hidden in the header band.
-
 ### JSON formatting — reformat minified JSON into readable JSON
 
 **Requested 2026-07-30**, illustrated with a `.log` file that is one enormous unreadable line, and a

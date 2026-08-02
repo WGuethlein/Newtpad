@@ -3989,6 +3989,115 @@ when NEWTPAD_TESTS {
 		if bad > 0 {os.exit(1)}
 	}
 
+	// --- `newtpad teartest` -- dragging a tab out into its own window ---------
+	//
+	// One argument, exits non-zero, and in HANDOFF §7's list: development-loop.md
+	// §6's rule for every mode added since the day nine of them were found printing
+	// FAIL and exiting 0.
+	//
+	// WHAT IT DELIBERATELY DOES NOT TEST is the success path. Detaching for real
+	// spawns a second Newtpad process and puts a window on the user's desktop, and
+	// a test suite that does that on every sweep is a test suite nobody runs. What
+	// is covered is everything up to the spawn -- the gesture geometry, the refusal
+	// rules and the command line the child is launched with -- which is where the
+	// logic is. The spawn itself is one CreateProcessW call whose failure the
+	// caller already treats as "the tab stays put".
+	@(private = "file")
+	tear_test_run :: proc() {
+		bad := 0
+		chk :: proc(bad: ^int, ok: bool, msg: string) {
+			fmt.printfln("  %-4s %s", "ok" if ok else "FAIL", msg)
+			if !ok {bad^ += 1}
+		}
+
+		// -- the command line the child gets, and the malformed one it might --
+		fmt.println("-- parse_args --")
+		{
+			p, d, x, y, w, h := parse_args([]string{"newtpad.exe"})
+			chk(&bad, p == "" && !d && w == 1280 && h == 720, fmt.tprintf("no arguments: empty path, no detach, default size (%q %v %dx%d)", p, d, w, h))
+			chk(&bad, x == plat.WINDOW_POS_DEFAULT && y == plat.WINDOW_POS_DEFAULT, "...and Windows chooses the position")
+		}
+		{
+			p, d, _, _, _, _ := parse_args([]string{"newtpad.exe", "C:\\a b\\notes.txt"})
+			chk(&bad, p == "C:\\a b\\notes.txt" && !d, fmt.tprintf("a plain path opens normally, spaces and all (%q, detach %v)", p, d))
+		}
+		{
+			p, d, x, y, w, h := parse_args([]string{"newtpad.exe", "--detach", "100", "-50", "800", "600", "C:\\x.csv"})
+			chk(&bad, d && p == "C:\\x.csv", fmt.tprintf("--detach takes the path from the LAST argument (%q, detach %v)", p, d))
+			chk(&bad, x == 100 && y == -50 && w == 800 && h == 600, fmt.tprintf("...and the geometry from the four before it (%d,%d %dx%d)", x, y, w, h))
+			// A NEGATIVE y is the case worth naming: a second monitor above or left
+			// of the primary has negative desktop coordinates, and a parser that
+			// refused them would send every tab torn off up there to the default
+			// position instead.
+			chk(&bad, y == -50, "...including a negative coordinate, which is a real second-monitor position")
+		}
+		{
+			// Too few arguments must NOT fall through to "open a file called
+			// --detach": that would put a file-not-found box on screen instead of
+			// saying nothing, and it is the shape a spawner bug would take.
+			p, d, _, _, _, _ := parse_args([]string{"newtpad.exe", "--detach", "100"})
+			chk(&bad, p == "" && !d, fmt.tprintf("a malformed --detach opens nothing, rather than a file named --detach (%q, detach %v)", p, d))
+		}
+		{
+			p, d, x, _, w, _ := parse_args([]string{"newtpad.exe", "--detach", "nope", "0", "", "600", "C:\\x.csv"})
+			chk(&bad, d && p == "C:\\x.csv", "a detach with unparsable numbers still opens the file")
+			chk(&bad, x == plat.WINDOW_POS_DEFAULT && w == 1280, fmt.tprintf("...and falls back to the defaults for the numbers it could not read (%d, %d)", x, w))
+		}
+
+		// -- the gesture --
+		fmt.println("-- the pointer leaving the window --")
+		W, H :: i32(1280), i32(720)
+		chk(&bad, !tabs_pointer_outside(0, 0, W, H), "the top-left pixel is inside")
+		chk(&bad, !tabs_pointer_outside(W - 1, H - 1, W, H), "the bottom-right pixel is inside")
+		chk(&bad, tabs_pointer_outside(W, H - 1, W, H), "the pixel AT the width is outside -- half-open, like every other hit-test here")
+		chk(&bad, tabs_pointer_outside(W - 1, H, W, H), "...and the pixel at the height")
+		chk(&bad, tabs_pointer_outside(-1, 10, W, H), "a negative x is outside, which is what capture reports past the left edge")
+		chk(&bad, tabs_pointer_outside(10, -1, W, H), "...and a negative y, which is what a drag up over the title bar reports")
+
+		// -- who may be torn off --
+		fmt.println("-- only a saved, unmodified tab --")
+		{
+			d: Document
+			defer doc_close(&d)
+			chk(&bad, !tab_can_detach(nil), "a nil tab cannot be detached")
+			chk(&bad, !tab_can_detach(&d), "an untitled buffer cannot: there is no path to hand over")
+			d.path = "C:\\notes.txt"
+			d.modified = true
+			chk(&bad, !tab_can_detach(&d), "a MODIFIED tab cannot: the new window is not the primary instance and does not back it up")
+			d.modified = false
+			chk(&bad, tab_can_detach(&d), "a saved, unmodified tab can")
+		}
+
+		// -- and the refusal is enforced where it matters, not just advertised --
+		//
+		// tab_detach must return false and leave the tab in place for a tab that
+		// cannot be detached. Checked through the real entry point rather than by
+		// re-asking tab_can_detach, because the bug worth catching is the two
+		// disagreeing: a detach that spawned before checking would have closed the
+		// tab by the time anything noticed.
+		fmt.println("-- tab_detach refuses without touching the strip --")
+		{
+			a: App
+			defer app_destroy(&a)
+			d := new(Document)
+			d^ = doc_from_content(nil, "", .UTF8) // untitled: cannot be detached
+			slot := app_add(&a, d)
+			a.tab_drag_slot = slot
+			before := 0
+			for t in a.docs {if t != nil {before += 1}}
+			win: plat.Window // no hwnd: nothing here reaches the platform anyway
+			got := tab_detach(&a, &win)
+			after := 0
+			for t in a.docs {if t != nil {after += 1}}
+			chk(&bad, !got, "tab_detach says no for an untitled tab")
+			chk(&bad, after == before, fmt.tprintf("...and the tab is still open (%d -> %d)", before, after))
+			chk(&bad, a.docs[slot] != nil, "...in its own slot")
+		}
+
+		fmt.printfln("teartest: %d failures", bad)
+		if bad > 0 {os.exit(1)}
+	}
+
 	// A table Document over `src`. doc_from_content takes ownership of what it is
 	// given and doc_close frees it, so the bytes have to be an allocation of their
 	// own rather than a slice of a string literal.
@@ -35226,6 +35335,13 @@ when NEWTPAD_TESTS {
 		// sort build (table_sort_build) and its one comparator.
 		if os.args[1] == "tablesorttest" {
 			table_sort_test_run()
+			return true
+		}
+
+		// `newtpad teartest` -- one-argument, no path, sweepable. The tab tear-off's
+		// gesture, its refusal rules and the command line it spawns with.
+		if os.args[1] == "teartest" {
+			tear_test_run()
 			return true
 		}
 

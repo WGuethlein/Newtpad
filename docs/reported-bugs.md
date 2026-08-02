@@ -68,19 +68,18 @@ Wyatt's list, recorded verbatim at his direction: *"just document them for a fur
 entry separates **what he said** from **what the code says**, and the code notes below are from a few
 minutes of reading, not from a real investigation. Nothing here has been reproduced.
 
-### Dragging a tab off the tab row does not spawn a new instance with that tab
+### BUILT in v0.40.0 — tab tear-off, and what this entry got wrong
 
-*"dragging tabs off the tab row doesn't spawn a new instance with that tab"*
+Kept as a note because the entry's own reasoning was the expensive part. It said the design question
+was that *"both windows would be writing the same `%APPDATA%\Newtpad` session."* **That was already
+solved** and the entry had not checked: `main.odin`'s `primary` flag gates restore, autosave,
+hot-exit save and crash binding, so a second process already ran a full editor that never touched the
+session store. The real missing pieces were three small ones, and the largest was that a spawned
+`newtpad.exe <path>` handed its path straight back to the primary — which is why `--detach` exists.
 
-**This looks like a missing feature rather than a broken one.** `tabs_drag_update` (`ui_tabs.odin:428`)
-reorders the dragged tab *along the strip* by adjacent swaps and nothing else — there is no tear-off,
-no detach, and no second-window path anywhere in the file. So the expected behaviour has never been
-built, and it should probably move to `requested-features.md` when someone confirms that.
-
-Worth deciding before building: Newtpad tear-off means a **new process** (a second window is not a
-thing today), which drags in what the torn tab does about unsaved state and about the session store —
-both windows would be writing the same `%APPDATA%\Newtpad` session. That is the actual design question,
-not the drag gesture.
+**The lesson for this file:** an entry written from a few minutes of reading names a plausible risk,
+not a verified one. Check whether the code already handles it before scoping the work off the note.
+See HANDOFF §6bg.
 
 ### Web links do not open from the CSV table view (they work in text and JSON)
 

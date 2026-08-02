@@ -5637,6 +5637,90 @@ Sabotage run on all four fixes (six sabotages: no reposition, no numeric refusal
 spacing can be asserted as a sum over blocks rather than read back out of `Md_Metrics` — which would
 pass with the walk broken.
 
+## 6bg. Headerless CSVs, and tearing a tab into its own window (2026-08-01, v0.40.0, branch `feat/headerless-csv`)
+
+The last two items from Wyatt's reported-bugs list. One turned out smaller than its entry claimed and
+one turned out much smaller, for the same reason: **the entry was written from a few minutes of
+reading and both guessed at the hard part.** Worth remembering before scoping off that file again.
+
+### A CSV with no header row
+
+Line 0 was unconditionally the header, so a headerless file showed its first row of **real data** in
+the sticky band — where it could not be edited, sorted, found or counted. §10's *"silently dropping
+data in a data viewer is the worst possible failure"*, happening to exactly one row.
+
+**Three producers branch on `doc.table_headerless` and nothing else may**: `table_first_data_row`,
+`table_header_fields`, `table_row_count`. Every other consumer in the grid already resolves through
+one of those three, which is what made this a small change rather than a sweep — and is the payoff
+from the one-producer discipline the sort work has been paying into.
+
+**The heuristic answers only on positive evidence.** A column is numeric-consistent when every
+non-empty cell *below* line 0 parses as a number and there is at least one; if any such column also
+has a number on line 0, line 0 is data, because a title is a name and a name is not a number. It
+cannot recognise an all-text headerless file and says so rather than guessing. **Three of its five
+test cases exist to pin that it stays quiet** — a detector that fired too eagerly would take the
+titles off every ordinary CSV, which is far worse than the bug being fixed.
+
+Columns are labelled `A`, `B`, `C` when there is no header — **not `1`, `2`, `3`**, because a bare
+digit in that band is ambiguous with the precedence digits v0.36.0 draws in the same cell, and the two
+can appear together. One producer (`table_col_label`) so the summary row's prose and the band agree by
+construction.
+
+**Three-valued mode, not a bool.** `Auto` is not a third answer about the file, it is the absence of
+an answer *from a person*, and the two persist differently: an answer is worth remembering and
+teaching a family default from, a guess is worth re-deciding. The family default is **adopted** rather
+than consulted, which is what lets `doc_view_apply` resolve without knowing about `App`.
+
+Flipping the flag **clears the sort** — the row set gains or loses a row at the front, so every offset
+in the permutation is one row out and a visible row would resolve to the line beside the one drawn,
+which the cell editor writes through.
+
+### Tearing a tab off — much closer to supported than its entry assumed
+
+`reported-bugs.md` recorded the design question as *"tear-off means a new process… both windows would
+be writing the same `%APPDATA%\Newtpad` session."* **That is already solved.** `main.odin`'s `primary`
+flag gates every session interaction there is — restore, autosave, hot-exit save, crash binding — so a
+non-primary process already runs a complete editor that does not touch the session store. The entry
+had identified the right risk and not checked whether the code already handled it.
+
+What was actually missing was three small things: the drag never detached, there was no process-spawn
+helper, and a spawned `newtpad.exe <path>` would have handed its path **straight back** to the primary
+via `instance_send_open` and exited — the single-instance hand-off doing exactly its job at the one
+moment it is not wanted. Hence `--detach`, whose only effect is to skip that hand-off.
+
+Decisions taken with Wyatt: **saved, unmodified tabs only** (a torn-off window has no crash
+protection, so handing it unsaved work would remove protection at the moment the user is moving
+something they care about); **release outside the window** as the gesture; **at the pointer, sized
+like the source**.
+
+`tab_detach` **spawns before it closes**. A close-then-spawn loses the tab outright whenever
+`CreateProcessW` fails, and the tab is the only record of where the user was in that file.
+
+**Verified end to end for real, not just headlessly**: launching `--detach 300 200 700 500 <path>`
+with another Newtpad already running produced a window at exactly `300,200 700x500` with the file
+loaded and the process still alive — i.e. it did not hand off. The gesture itself is the only part no
+test here can reach.
+
+### `teartest` is new, and `bookmarktest` was lying
+
+`teartest` — one argument, exits non-zero, in §7's list. It deliberately does **not** test the success
+path: detaching for real puts a window on the desktop, and a suite that does that on every sweep is a
+suite nobody runs. Everything up to the spawn is covered.
+
+**`bookmarktest` printed `FAIL` and exited 0 for its whole life.** It pinned session format 5, which
+this batch bumped to 6, and the sweep called it green because the sweep reads exit codes. That is the
+**tenth** mode caught this way in one day (development-loop §6 counted nine). It was found by widening
+the sweep to grep for the `FAIL` *string* as well as the exit code — which is now the only honest way
+to run one, and the earlier sweeps in this session were weaker for not doing it.
+
+### Owed
+
+- The **scrollbar-drag ghosting** from §6bf is still open and still needs one observation from Wyatt.
+- The **menu/Ctrl+F focus complaint** is untouched. It needs a driven session or a focus-transition
+  audit, not a guess.
+- A torn-off window's tabs are outside hot-exit. Acceptable today because only saved files can be torn
+  off; if that restriction is ever lifted, this is the thing that has to be solved first.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -5662,9 +5746,15 @@ pass with the walk broken.
     `tablegridtest`,
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
     `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`, `selalltest`,
-    `tablesorttest`, `mdjointest`, `mdfencetest`, `mdperftest`, `mdtabletest`, `blocktest`
+    `tablesorttest`, `mdjointest`, `mdfencetest`, `mdperftest`, `mdtabletest`, `blocktest`,
+    `teartest`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
-    `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`
+    `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`,
+    `bookmarktest`
+  - **Sweep by grepping for the `FAIL` string, not by exit code alone.** `bookmarktest` printed FAIL
+    and exited 0 for its whole life and every sweep called it green (2026-08-01, §6bg). It exits
+    non-zero now, but the sweep is what has to be right — 60 modes still have no `os.exit` on a
+    failing path.
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
   - Two are **falsifiers**, not regression tests — they measure a claim rather than guard a
     behaviour: `menuseam` (does resolving scroll twice in one frame diverge? yes, in every case
