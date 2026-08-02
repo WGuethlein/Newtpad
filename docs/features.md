@@ -308,9 +308,10 @@ file.
   before picking two values out of two hundred). The values are listed **ascending** — numerically in a
   column of numbers, so `10` follows `2` — with blanks last. **Type to search the list** rather than
   scrolling it; Backspace edits the search, `(Select All)` then means all of the matches, and the search
-  row says how many values there are. The dropdown is capped at twelve rows with a scrollbar and the
-  wheel scrolls it; clicking anywhere inside it that is not a value — the separator, the search row, the
-  scrollbar — leaves it open, and clicking outside closes it. Filtering composes with the sort, an edit
+  row says how many values there are. The dropdown is capped at twelve rows, and its scrollbar takes
+  the wheel **and drags** — grab the thumb, or press the track to jump there, exactly as the document's
+  bar behaves. Clicking anywhere inside the dropdown that is not a value — the separator, the search
+  row — leaves it open, and clicking outside closes it. Filtering composes with the sort, an edit
   resolves to the row you can see rather than the one underneath it, and the summary row says how many
   rows are **hidden** beside the file's own count. **Every distinct value gets a checkbox**, so
   unticking everything hides every row. Past 100,000 rows it refuses, on the sort's limit and for the

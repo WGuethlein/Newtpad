@@ -6525,6 +6525,76 @@ for asserting more than one point on a scroll range.
   measurement. Not measured under load yet, and the fix if it bites is a width memoised on
   `menu.ctx_items` (the only two places it changes are `menu_open_ctx` and `menu_filter_requery`).
 
+## 6bs. The dropdown's scrollbar becomes a control (2026-08-02, v0.52.0)
+
+> *"scroll wheel works, scrollbar doesn't in that modal"* (Wyatt, live use of v0.51.0)
+
+### §6br removed the objection that was blocking this
+
+The bar shipped in v0.50.0 as **drawn, not draggable**, and its comment gave the reason: a drag
+*"would need its own hit-test inside a surface whose every other pixel already means 'pick this
+row'"*. That was true when it was written and stopped being true one release later — §6br excluded
+the strip from the row hit-test to stop it ticking checkboxes, which is precisely the "own hit-test"
+the objection said was missing. **The blocker had already been removed as a side effect of fixing
+something else, and nobody noticed until Wyatt tried to drag it.** Worth watching for: a
+*"deliberately not done"* comment can be invalidated by an unrelated change, and nothing re-reads it.
+
+### It reuses the document's bar rather than deriving a second one
+
+`vbar_grab_at` and `vbar_frac_at` are used verbatim on a `Vbar` built by `menu_vbar`. Their
+exact-inverse property — press the thumb, hold perfectly still, the list does not move — was paid for
+once on the editor's bar after an earlier version disagreed with its own inverse by
+`track_h / (track_h - thumb_h)`. Re-deriving it here in row units would have been re-buying it, and
+main.odin's comment on `vbar_frac_at` asks for exactly this: the bars map onto different models, and
+the only thing keeping them honest is that the pointer-to-fraction half is identical. Sabotaged
+(`scroll_grab = 0`), pressing the thumb jumps the list six rows.
+
+A press on the bare track **jumps** rather than paging, because that is what `vbar_grab_at` returning
+0 already means for the document's bar — Wyatt asked for it to *"act like the regular vertical
+scrollbar"*, and one bar in the app behaving differently is worse than either rule.
+
+### `menu_vbar` is now the one producer, and it fixed a latent disagreement
+
+Four consumers: the draw, `menu_item_at`'s lane exclusion, the drag's press, and the drag's step.
+Building it exposed that the thumb's position was derived in the draw from `total - app.menu.rows`,
+which is **not** the range a drag can reach — rows are not all one height (a separator is 0.4 of one),
+so the reachable last-top depends on where you start. `menu_scroll_last` is now the single definition
+that `menu_wheel`, the thumb's position and the drag's mapping all use, so "the thumb hits the bottom
+exactly when the last row is on screen" is a property rather than an arithmetic coincidence.
+
+The bar is 8 wide in a 12 lane (`MENU_SCROLLBAR_W_96` / `MENU_SCROLLBAR_LANE_96`), the same
+drawn-versus-grabbable split `SCROLLBAR_W_96` (14) and `SCROLLBAR_TRACK_W_96` (8) make for the
+document. 4px was unhittable; collapsing the two numbers means choosing between an ugly bar and an
+unhittable one.
+
+### The one trap, and it is documented in the file it came from
+
+`menu_scroll_mouse` clears `window.mouse_pressed` and **never** `window.mouse_down`. `mouse_down` is
+persistent platform state, and zeroing it mid-gesture kills the drag twice over: the latch sees
+`!mouse_down` next frame and clears itself, and `WM_MOUSEMOVE` only updates the pointer while the
+button is held, so the coordinate stops moving too. That is verbatim the bug `Drag_Latches`' comment
+records for the grid's horizontal bar (v0.17.1). Sabotaged by adding the clear, the drag moves on the
+press frame and then freezes — `top 0 + 12 visible` after dragging to the bottom — which is exactly
+how Wyatt described that older bug.
+
+The consequence is that `app.menu.scroll_drag` has to be excluded **at** main.odin's caret branch
+rather than by consuming the event, joining the four latches already listed there. It also joins the
+`polling` set, or the list only moves when some other event happens to wake the frame loop.
+
+The latch lives on `Menu_State`, not as a main.odin local like `scrollbar_drag`, so `menu_close` can
+end it: Escape mid-drag would otherwise leave it set with no dropdown under it.
+
+### Owed
+
+- **`menu_scroll_last` is O(n · rows) and is now called several times a frame** (the draw, the
+  hit-test, and each drag step), joining `dropdown_w`'s existing per-frame walk. At Wyatt's 536-value
+  list that is ~28k operations a frame — nothing. At the 100,000-value ceiling the filter now permits
+  it is several milliseconds, and it would be the first thing to fix if a huge column ever feels
+  sticky. Both are the same fix: memoise on `menu.ctx_items`, which changes in exactly two places
+  (`menu_open_ctx` and `menu_filter_requery`). Not done now because nothing has measured it.
+- The `▲`/`▼` arrows still hit-test to the row behind them, unchanged from §6br and for the same
+  reason.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
