@@ -1541,7 +1541,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// Refusing loudly is the house style: the sort refuses past 100,000 rows and
 		// says so, and a formatter that instead froze for a minute on a 2 GB minified
 		// log would be the worse failure.
-		if doc.pt.length > JSON_FORMAT_MAX {
+		if json_format_too_large(doc.pt.length) {
 			app_note(app, fmt.tprintf("[TOO LARGE TO FORMAT -- %d MB LIMIT]", JSON_FORMAT_MAX / (1024 * 1024)))
 			break
 		}
@@ -1554,10 +1554,15 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// ceiling removed, the failure was not the size guard but the temp arena
 		// refusing the allocation, which then surfaced as "not valid JSON".
 		src := base.pt_collect(&doc.pt, context.allocator)
-		defer delete(src)
 		// The tab width, in spaces. Wyatt's call: the output matches how the editor
 		// is already set up rather than hard-coding two.
 		out, jerr, at := base.json_format(src, plat.text_tab_width(t), context.allocator)
+		// FREED IMMEDIATELY, not deferred. `out` is about twice `src` on real
+		// minified JSON (measured: 128 MB in, 264 MB out), and doc_replace_range
+		// below makes the piece tree's own copy of it -- so holding the source
+		// across that call puts src + 2*out live at once. Dropping it here takes the
+		// peak from 657 MB to 529 MB on that same file, for one moved line.
+		delete(src)
 		defer delete(out)
 		if jerr != .None {
 			// MARKED, NOT SILENTLY REFUSED -- the rule §10 applies to malformed CSV

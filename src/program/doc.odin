@@ -385,15 +385,35 @@ doc_is_markdownish :: proc(doc: ^Document) -> bool {
 // that then refuses with "unexpected character" pointing at a legal comment.
 // Largest buffer Format JSON will act on.
 //
-// 64 MB, not BACKUP_MAX's 128: this is a full read plus a full FORMAT plus a full
-// splice on the main thread, and the output is LARGER than the input by exactly
-// what the command adds -- so the input size is not the number that bounds the
-// work. A minified 64 MB file can format to well over 100 MB, and the peak holds
-// the source, the output and the piece tree's copy at once.
+// 256 MB, and this number is MEASURED rather than argued. It was 64 MB, picked by
+// reasoning about allocation, and Wyatt said the reasoning was wrong for his
+// files: *"how realistic is the 64MB limit... i feel like we often have double
+// that size as average"*. `newtpad jsonperf <file>` exists to answer that, and on
+// a realistic 128 MB minified export it reports:
 //
-// Refusing loudly rather than freezing is the house style here: table_sort_build
+//     input 128.0 MB -> output 264.5 MB (2.07x), format 2126 ms, peak 529 MB
+//
+// So a 128 MB file -- his stated average -- costs about two seconds and half a
+// gigabyte. That is a real pause and an acceptable one for a deliberate action on
+// a file that size; it is not a reason to refuse. 256 MB gives that average 2x
+// headroom and puts the worst case at roughly four seconds and a gigabyte, which
+// a 64-bit machine takes without drama.
+//
+// THE CEILING IS ABOUT THE PEAK, NOT THE FILE. Output is ~2x input on minified
+// JSON (indentation is what this adds), and the piece tree makes its own copy of
+// the output, so the live bytes are src + 2*out until the source is freed -- which
+// is why command_dispatch frees it the instant the format returns rather than
+// deferring. Re-measure with jsonperf before moving this number again.
+//
+// Refusing loudly rather than freezing is the house style: table_sort_build
 // refuses past 100,000 rows and the summary row says so.
-JSON_FORMAT_MAX :: 64 * 1024 * 1024
+JSON_FORMAT_MAX :: 256 * 1024 * 1024
+
+// Is `n` bytes too much to format? Split out so the boundary is testable without
+// allocating a quarter-gigabyte fixture on every sweep -- which is what the test
+// that drove the command end to end had to do, and at 256 MB that is roughly
+// three quarters of a gigabyte of transient allocation per run.
+json_format_too_large :: proc(n: int) -> bool {return n > JSON_FORMAT_MAX}
 
 doc_can_json :: proc(doc: ^Document) -> bool {
 	return doc != nil && doc.kind == .Text && path_has_ext(doc.path, {".json"})

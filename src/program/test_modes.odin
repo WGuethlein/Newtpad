@@ -4073,33 +4073,18 @@ when NEWTPAD_TESTS {
 			chk(&bad, len(d.undo) == undos, "...and pushes no undo entry, because nothing was written")
 		}
 
-		fmt.println("-- the ceiling refuses rather than freezing --")
+		fmt.println("-- the ceiling --")
 		{
-			// Just over JSON_FORMAT_MAX, built as valid JSON so the ONLY thing that
-			// can refuse it is the size guard -- a fixture of junk bytes would be
-			// refused by the parser and prove nothing about the ceiling.
-			// Built on the HEAP. The temp allocator is a frame arena and a 64 MB
-			// request into it comes back short or not at all, which produced a
-			// fixture that was over the ceiling by LENGTH but malformed by content --
-			// so the command refused it as invalid JSON and the ceiling assertion
-			// passed for entirely the wrong reason.
-			pad := strings.repeat("a", JSON_FORMAT_MAX, context.allocator)
-			defer delete(pad)
-			src := strings.concatenate({"{\"k\":\"", pad, "\"}"}, context.allocator)
-			defer delete(src)
-			a, d := run(src)
-			defer app_destroy(&a)
-			chk(&bad, d.pt.length > JSON_FORMAT_MAX, fmt.tprintf("precondition: the fixture is over the ceiling (%d > %d)", d.pt.length, JSON_FORMAT_MAX))
-			before_len := d.pt.length
-			command_dispatch(.Format_Json, {}, &a, nil, &t, 10)
-			chk(&bad, d.pt.length == before_len, "the buffer is untouched")
-			chk(&bad, len(d.undo) == 0, "...and nothing was written")
-			// THE REASON, not just the outcome. "Untouched" is satisfied by any
-			// refusal at all -- including one from the parser or a failed
-			// allocation -- so on its own it passes with the ceiling deleted, which
-			// is exactly what a sabotage pass showed. The note is what says the SIZE
-			// guard is the thing that fired.
-			chk(&bad, strings.contains(a.notice, "TOO LARGE"), fmt.tprintf("...because of the SIZE, which the note says (%q)", a.notice))
+			// THE BOUNDARY, on the predicate the command calls. It used to be driven
+			// end to end through a fixture built just over the limit, which was
+			// honest at 64 MB and is not at 256: that fixture allocates the padding,
+			// the concatenation and the document's own copy, so roughly three
+			// quarters of a gigabyte of transient allocation on every sweep. The
+			// end-to-end link is kept by the command calling THIS, and by the note
+			// assertion below.
+			chk(&bad, !json_format_too_large(JSON_FORMAT_MAX), "a file exactly at the ceiling is formatted")
+			chk(&bad, json_format_too_large(JSON_FORMAT_MAX + 1), "...and one byte more is refused")
+			chk(&bad, !json_format_too_large(0), "an empty buffer is never refused for size")
 		}
 
 		fmt.println("-- the menu row is gated on the file type --")
@@ -4265,10 +4250,22 @@ when NEWTPAD_TESTS {
 			app_activate(&a, s_untitled)
 			app_activate(&a, s_saved) // the SAVED tab is in front
 
-			menu_open_tab_ctx(&a, 10, 30, s_untitled) // ...the menu opens on the other one
+			menu_open_tab_ctx(&a, 10, s_untitled) // ...the menu opens on the other one
 			chk(&bad, a.menu.ctx && a.menu.ctx_tab == s_untitled, fmt.tprintf("the menu records the tab it was opened on (%d, want %d)", a.menu.ctx_tab, s_untitled))
-			chk(&bad, app_active(&a) == saved, "...and does NOT activate it -- a right-click is a question, not a switch")
 			chk(&bad, menu_ctx_tab_doc(&a) == untitled, "...and the target resolves to that tab's document, not the active one")
+			// The right-click gesture ALSO activates the tab (tabs_hit_test, Wyatt's
+			// request), which this cannot drive -- no mouse input here. What it can
+			// pin is that the rows are correct with the two DISAGREEING, which is the
+			// state that exists for the frame before activation lands and the reason
+			// the targeting is not redundant with it.
+			chk(&bad, app_active(&a) == saved, "precondition: the active tab and the target are different here")
+
+			// THE ANCHOR. The menu bar's band is claimed by menu_hit_test before any
+			// dropdown is consulted, so a menu whose first row falls inside it has a
+			// dead first row -- which is exactly what shipped in v0.43.0 ("the right
+			// click on tab does not open explorer to the path"). The rule lives in
+			// menu_open_tab_ctx now, not at the call site, so this can assert it.
+			chk(&bad, a.menu.ctx_y >= TAB_STRIP_H + MENU_BAR_H, fmt.tprintf("the menu is anchored clear of the menu bar's band (%.0f, needs >= %.0f)", a.menu.ctx_y, TAB_STRIP_H + MENU_BAR_H))
 
 			// The file rows are dead FOR THE TARGET, which is the assertion that
 			// fails if any of them reads app_active instead.
@@ -4281,7 +4278,7 @@ when NEWTPAD_TESTS {
 			chk(&bad, copyp.enabled != nil && !copyp.enabled(&a), "Copy Full Path is greyed for the same reason")
 
 			// ...and live when the target IS saved.
-			menu_open_tab_ctx(&a, 10, 30, s_saved)
+			menu_open_tab_ctx(&a, 10, s_saved)
 			chk(&bad, reveal.enabled(&a), "Reveal is live when the target has a file on disk")
 			chk(&bad, item_disabled_reason(&a, reveal) == "", "...with no reason shown, so the accelerator column is free")
 
@@ -4293,7 +4290,7 @@ when NEWTPAD_TESTS {
 
 			// CLOSING ACTS ON THE TARGET, not the active tab -- the row that would
 			// silently close the wrong file.
-			menu_open_tab_ctx(&a, 10, 30, s_untitled)
+			menu_open_tab_ctx(&a, 10, s_untitled)
 			t: plat.Text
 			command_dispatch(.Tab_Close_Others, {}, &a, nil, &t, 10)
 			live := 0
@@ -35836,6 +35833,48 @@ when NEWTPAD_TESTS {
 		// command's wiring; the formatter itself is unit-tested in src/base.
 		if os.args[1] == "jsontest" {
 			json_test_run()
+			return true
+		}
+
+		// `newtpad jsonperf <file>` -- a MEASUREMENT, not a regression test. It
+		// prints what a format of that file costs and always exits 0, the same way
+		// `menuseam` and `drawcount` are falsifiers rather than pass/fail modes
+		// (development-loop §6 says to sweep those by diffing their printed line).
+		//
+		// It exists because JSON_FORMAT_MAX was picked by reasoning and Wyatt then
+		// said the reasoning was wrong for his files: *"how realistic is the 64MB
+		// limit... i feel like we often have double that size as average"*. A
+		// ceiling argued from first principles is worth exactly what the numbers
+		// say it is.
+		if os.args[1] == "jsonperf" {
+			if len(os.args) < 3 {
+				fmt.println("usage: newtpad jsonperf <file.json>")
+				return true
+			}
+			raw, rok := plat.file_read_all(os.args[2], context.allocator)
+			if !rok {
+				fmt.printfln("jsonperf: could not read %q", os.args[2])
+				return true
+			}
+			defer delete(raw)
+			fmt.printfln("jsonperf: %s", os.args[2])
+			fmt.printfln("  input           : %.1f MB", f64(len(raw)) / (1024 * 1024))
+			t0 := time.tick_now()
+			out, jerr, at := base.json_format(raw, 4, context.allocator)
+			ms := time.duration_milliseconds(time.tick_since(t0))
+			if jerr != .None {
+				fmt.printfln("  REFUSED         : %v at byte %d (%.0f ms)", jerr, at, ms)
+				return true
+			}
+			defer delete(out)
+			fmt.printfln("  output          : %.1f MB  (%.2fx)", f64(len(out)) / (1024 * 1024), f64(len(out)) / f64(max(1, len(raw))))
+			fmt.printfln("  format          : %.0f ms", ms)
+			// What the COMMAND holds at once: the collected source, the formatted
+			// output, and then the piece tree's own copy of the output. The ceiling
+			// has to be argued against this number, not against the file size.
+			peak := len(raw) + 2 * len(out)
+			fmt.printfln("  peak (src+2*out): %.1f MB", f64(peak) / (1024 * 1024))
+			fmt.printfln("  current ceiling : %.0f MB", f64(JSON_FORMAT_MAX) / (1024 * 1024))
 			return true
 		}
 

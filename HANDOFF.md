@@ -6047,6 +6047,72 @@ true for an empty path on the stated rule that a new buffer *"is allowed into an
 know what it will become"*, and JSON pasted into a scratch tab is exactly when someone reaches for
 this. `.jsonc` is deliberately excluded: it permits comments the formatter refuses.
 
+## 6bl. The JSON ceiling was argued, not measured — and the tab menu's dead first row (2026-08-02, v0.45.0)
+
+Both from Wyatt within minutes of v0.44.0.
+
+### *"how realistic is the 64MB limit... i feel like we often have double that size as average"*
+
+He is right, and the failure is a process one worth naming: **`JSON_FORMAT_MAX` was picked by
+reasoning about allocation and never measured.** The reasoning was coherent — the output is bigger
+than the input, the piece tree copies it, so be conservative — and it produced a number that refuses
+his *typical* file.
+
+`newtpad jsonperf <file>` now answers the question instead. On a realistic 128 MB minified export:
+
+```
+input 128.0 MB  ->  output 264.5 MB (2.07x),  format 2126 ms,  peak 529 MB
+```
+
+So his average file costs about **two seconds and half a gigabyte**. That is a real pause and an
+acceptable one for a deliberate action on a file that size; it is not a reason to refuse. The ceiling
+is **256 MB**, giving that average 2x headroom and putting the worst case near four seconds and a
+gigabyte.
+
+**The peak dropped by 128 MB for one moved line.** `src` was freed by `defer`, so it stayed live
+across `doc_replace_range` — which makes the piece tree's own copy of the output — putting
+`src + 2*out` in memory at once. Freeing it the instant the format returns takes the 128 MB case from
+657 MB to 529 MB.
+
+**The ceiling test had to change shape.** It drove the command end to end through a fixture built just
+over the limit, which was honest at 64 MB and is not at 256: padding, concatenation and the
+document's copy come to roughly three quarters of a gigabyte of transient allocation *on every
+sweep*. The boundary is now asserted on `json_format_too_large`, the predicate the command itself
+calls, at exactly the limit and one byte past it.
+
+### The tab context menu's first row was dead
+
+*"the right click on tab does not open explorer to the path"*
+
+**`menu_hit_test` claims the whole band `[TAB_STRIP_H, TAB_STRIP_H + MENU_BAR_H)` for the menu BAR
+before it looks at any open dropdown.** The tab menu was anchored at `TAB_STRIP_H`, so its first row
+sat inside that band: clicking it read as "empty bar area", closed the menu and ran nothing. It was
+always the first row, whichever row that was — Reveal happened to be first.
+
+The anchor moved to `TAB_STRIP_H + MENU_BAR_H`, and — the part that matters for next time — **the y
+is now `menu_open_tab_ctx`'s, not the caller's.** It was a constant at a call site no test could
+reach; it is a property of the menu, and `surfacetest` asserts it. Sabotaging it back to
+`TAB_STRIP_H` fails that assertion with `40, needs >= 70`.
+
+### Right-click now activates the tab
+
+*"if you right click a different, non-active tab i think it should swap to that tab as a visual
+queue"* — which reverses §6bj's decision that "a right-click is a question, not a switch". He is
+right: a menu whose rows say *Close Tab* and *Reveal in Explorer* while a **different** tab is
+highlighted gives the reader nothing to bind those words to.
+
+**The `ctx_tab` targeting stays and is not now redundant.** It is what makes the rows correct in the
+frame before the activation lands, and it keeps the four commands honest about which tab they act on
+rather than depending on a side effect of opening the menu.
+
+### The recurring process failure, twice in one batch
+
+`development-loop.md` §6 says to build through PowerShell and check `$LASTEXITCODE`, because a piped
+build can leave a stale exe and make a sabotage look uncaught. **It happened twice here** — once
+piping through `Out-Null`, once building from Bash with output discarded — and both times the
+conclusion drawn from the stale binary was wrong. The rule is not about the shell; it is that a
+sabotage result is only evidence if the binary is known to be new.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -6082,6 +6148,10 @@ this. `.jsonc` is deliberately excluded: it permits comments the formatter refus
     non-zero now, but the sweep is what has to be right — 60 modes still have no `os.exit` on a
     failing path.
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
+  - `jsonperf <file.json>` is a **measurement**, not a test: it prints input/output size, format
+    time and peak bytes for one file and always exits 0. It exists because `JSON_FORMAT_MAX` was
+    first picked by reasoning and the reasoning was wrong (§6bl). Re-measure with it before moving
+    that constant.
   - Two are **falsifiers**, not regression tests — they measure a claim rather than guard a
     behaviour: `menuseam` (does resolving scroll twice in one frame diverge? yes, in every case
     where the dropdown does not fit) and `drawcount` (what does a frame actually cost? 26 rows,

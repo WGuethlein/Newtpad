@@ -781,8 +781,19 @@ menu_open_ctx :: proc(app: ^App, items: []Menu_Item, x, y: f32, col: int) {
 // once: a stale ctx_col read by a Tab_ command, or a stale ctx_tab read by a
 // Table_Sort one, is the "captured index consumed in the wrong space" shape this
 // codebase keeps producing. Each opener sets its own target and clears the other.
-menu_open_tab_ctx :: proc(app: ^App, x, y: f32, slot: int) {
-	menu_open_ctx(app, tab_menu_items, x, y, 0)
+// THE Y IS THIS PROCEDURE'S, not the caller's, and that is where the bug was.
+//
+// menu_hit_test claims every click in the band [TAB_STRIP_H, TAB_STRIP_H +
+// MENU_BAR_H) for the menu BAR before it looks at any open dropdown. A tab menu
+// anchored at TAB_STRIP_H therefore puts its FIRST ROW inside that band, and
+// clicking that row reads as "empty bar area": the menu closes and nothing runs.
+// That shipped in v0.43.0 as "the right click on tab does not open explorer to
+// the path" -- and it was always the first row, whichever row that was.
+//
+// The caller passed the y before. Now it cannot, so the rule cannot be got wrong
+// at a second call site, and menutest can assert it.
+menu_open_tab_ctx :: proc(app: ^App, x: f32, slot: int) {
+	menu_open_ctx(app, tab_menu_items, x, TAB_STRIP_H + MENU_BAR_H, 0)
 	app.menu.ctx_col = 0
 	app.menu.ctx_tab = slot
 	// The first-enabled highlight was chosen against ctx_tab == -1 above, when

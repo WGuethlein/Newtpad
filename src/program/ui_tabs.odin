@@ -379,10 +379,17 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) -> bool {
 	// RIGHT-CLICK: the tab's own context menu, handled before everything below so
 	// a right press can never fall through to activate, close or start a drag.
 	//
-	// It does NOT activate the tab it opens on. A right-click is a question about
-	// a tab, not a request to switch to it, and the four commands all resolve
-	// through app.menu.ctx_tab rather than through the active document -- which is
-	// exactly why they can act on a tab that is not in front.
+	// IT ACTIVATES THE TAB IT OPENS ON. That reverses the original decision, at
+	// Wyatt's request after using it: *"if you right click a different, non-active
+	// tab i think it should swap to that tab as a visual queue"*. He is right --
+	// a menu whose rows say "Close Tab" and "Reveal in Explorer" while a DIFFERENT
+	// tab is highlighted gives the reader nothing to bind those words to, and the
+	// most likely reading is the wrong one.
+	//
+	// The ctx_tab targeting stays exactly as it was and is NOT now redundant: it is
+	// what makes the rows correct even in the frame before the activation lands,
+	// and it keeps the four commands honest about which tab they act on rather than
+	// making them depend on a side effect of opening the menu.
 	if win.mouse_right_pressed {
 		win.mouse_right_pressed = false
 		if f32(win.mouse_y) < TAB_STRIP_H && mx >= MENU_W {
@@ -390,9 +397,21 @@ tabs_hit_test :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) -> bool {
 			for r in L.tabs {
 				if !r.drawn {continue}
 				if mx >= r.x && mx < r.x + r.w {
-					// Anchored at the tab's BOTTOM-left, so the menu hangs below the
-					// strip rather than over the tab it describes.
-					menu_open_tab_ctx(app, r.x, TAB_STRIP_H, r.slot)
+					// BELOW THE MENU BAR, not just below the tab strip, and that is a
+					// correctness requirement rather than taste. menu_hit_test claims
+					// every click in the band [TAB_STRIP_H, TAB_STRIP_H + MENU_BAR_H)
+					// for the menu BAR before it looks at any open dropdown -- so a
+					// menu anchored at TAB_STRIP_H puts its first row inside that band,
+					// and clicking that row reads as "empty bar area", closes the menu
+					// and runs nothing. That is exactly what shipped: "the right click
+					// on tab does not open explorer to the path" (Wyatt, v0.43.0), and
+					// it was always the FIRST row that was dead.
+					//
+					// A right-click also ACTIVATES the tab (below), so the menu is
+					// visually anchored to the tab by its x and by the tab now being
+					// the highlighted one.
+					app_activate(app, r.slot)
+					menu_open_tab_ctx(app, r.x, r.slot)
 					return true
 				}
 			}
