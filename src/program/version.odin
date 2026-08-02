@@ -4,4 +4,4 @@
 // changes a release covers; SemVer-ish (0.x while pre-1.0).
 package main
 
-NEWTPAD_VERSION :: "0.58.0"
+NEWTPAD_VERSION :: "0.59.0"

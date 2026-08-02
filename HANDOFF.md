@@ -7086,8 +7086,12 @@ that got blamed for them.
   session modes write to, and reset, the real store under `%APPDATA%\Newtpad`:
   - The harness itself: `modeguardtest [path]` — run it first; it is the check that the rest of
     this list can fail at all.
+  - Grid:  — what the grid draws as a link against what it treats as clickable.
   - Editor surface: `gutterseamtest` — the line-number gutter, tested where the draw and the
     hit-test meet rather than at the width formula.
+  - Grid: `gridlinktest` — what the grid *draws* as a link against what it treats as *clickable*,
+    plus whether those links resolve. Written for the still-open "links do not open in table view"
+    report; green, which is what eliminated the geometry hypothesis (see `reported-bugs.md`).
   - Rendering / platform: `sehtest`, `dpitest`, `atlastest`, `atlasgrowtest`, `devicelosttest`,
     `celltest`, `blurtest`, `drawcount <file>`
   - Logging / crash: `logtest`, `crashtest <null|panic|assert|oob>` (triggers a real fault; set
