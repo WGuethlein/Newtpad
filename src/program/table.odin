@@ -1108,16 +1108,27 @@ Sort_Field :: struct {
 	key:    string,
 	num:    f64,
 	ks, kl: i32,
-	// Empty cells sort LAST in both directions, which is why this is a field rather
-	// than falling out of an empty key or a zero value.
+	// Empty cells sort FIRST ascending and LAST descending -- they follow the
+	// arrow, like a value -- which is why this is a field rather than falling out
+	// of an empty key or a zero value.
 	//
-	// "No value" is not the smallest value. In a text column an empty key would sort
-	// before every letter ascending and after every letter descending, so the blanks
-	// would move from one end to the other with the arrow; in a numeric column an
-	// unparsed empty would read as 0.0 and land in the middle of the real data, which
-	// is worse -- a blank presented as a zero is a wrong number, not a missing one.
-	// Last in both directions is the one rule under which a blank never claims a value
-	// it does not have.
+	// AMENDED 2026-08-01, Wyatt's decision from the v0.36.0 live pass: "it should be
+	// at the top if sorting ascending". This comment used to argue for last in BOTH
+	// directions, on the grounds that "no value" is not the smallest value and a
+	// blank should never claim a position among real data. That argument answers a
+	// question nobody asks of a spreadsheet: a reader who sorts ascending and finds
+	// the blanks at the bottom reads it as the sort being wrong, not as the blanks
+	// being principled. Following the direction is what every tool they have used
+	// does, and it costs nothing this file needs.
+	//
+	// WHAT THE FLAG IS STILL FOR, and it is the half of the old argument that was
+	// always the real one: an empty cell must not be COMPARED as a value. A text
+	// key would sort "" before every letter by byte order, which happens to agree
+	// with the new rule ascending and disagrees with nothing anyone would notice --
+	// but a NUMERIC key would parse an empty cell as 0.0 and drop it into the middle
+	// of the real data, presenting a blank as a zero, which is a wrong number rather
+	// than a missing one. The flag keeps blanks out of both comparisons and puts
+	// them at one end by fiat; only which end has changed.
 	empty:  bool,
 }
 
@@ -1143,11 +1154,16 @@ Sort_Ctx :: struct {
 
 // Keys in PRECEDENCE order; the first that separates two rows decides.
 //
-// EMPTY LAST IS PER KEY AND IGNORES DIRECTION, at every key, for the reason
-// Sort_Field.empty gives. Two rows both blank on a key are not ordered by it at all
-// -- they fall through to the next key rather than returning, because "both have no
-// value here" says nothing about which comes first, and stopping there would leave
-// the remaining keys unread for exactly the rows a tie-breaker exists to separate.
+// EMPTY IS PER KEY AND FOLLOWS THAT KEY'S OWN DIRECTION -- first ascending, last
+// descending -- for the reason Sort_Field.empty gives. Per key means per key: with
+// a descending primary and an ascending tie-breaker, the primary's blanks go last
+// and the tie-breaker's blanks go first, because each key is answering about its
+// own column and its own arrow.
+//
+// Two rows both blank on a key are still not ordered by it at all -- they fall
+// through to the next key rather than returning, because "both have no value here"
+// says nothing about which comes first, and stopping there would leave the
+// remaining keys unread for exactly the rows a tie-breaker exists to separate.
 //
 // The final tie-break is the row's FILE position, ascending, in every direction, so
 // the order is total and does not depend on slice.sort_by_with_data's stability --
@@ -1158,7 +1174,11 @@ sort_less_keys :: proc(a, b: Sort_Item, user_data: rawptr) -> bool {
 	for i in 0 ..< ctx.nkeys {
 		k := ctx.keys[i]
 		af, bf := a.f[i], b.f[i]
-		if af.empty != bf.empty {return bf.empty}
+		// The blank goes to whichever end this key's arrow points away from: `a`
+		// wins when it is the blank one and the key ascends, loses when it is the
+		// blank one and the key descends. Reads off k.desc rather than off the
+		// value comparison below, because there is no value to compare.
+		if af.empty != bf.empty {return af.empty != k.desc}
 		if af.empty {continue} // both empty on this key: fall through to the next
 		if k.numeric {
 			if af.num != bf.num {return af.num > bf.num if k.desc else af.num < bf.num}

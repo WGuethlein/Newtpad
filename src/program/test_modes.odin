@@ -4187,18 +4187,28 @@ when NEWTPAD_TESTS {
 	// what is new here.
 	@(private = "file")
 	ts_case_empty_last :: proc(bad: ^int) {
-		fmt.println("-- a blank sorts LAST on a secondary key, in both directions --")
+		fmt.println("-- a blank follows its own key's arrow: first ascending, last descending --")
 		d := ts_doc("g,n\ng,m\ng,\ng,z\n", 2)
 		defer doc_close(&d)
 		asc := [2]Sort_Key{{col = 0}, {col = 1, desc = false}}
 		li_chk(bad, table_sort_build(&d, asc[:]), "key 1 ascending sorts")
 		a := ts_order(&d)
-		li_chk(bad, a == "g,m|g,z|g,", fmt.tprintf("...into %q (want \"g,m|g,z|g,\": blank last)", a))
+		li_chk(bad, a == "g,|g,m|g,z", fmt.tprintf("...into %q (want \"g,|g,m|g,z\": blank FIRST)", a))
 		desc := [2]Sort_Key{{col = 0}, {col = 1, desc = true}}
 		li_chk(bad, table_sort_build(&d, desc[:]), "key 1 descending sorts")
 		b := ts_order(&d)
-		li_chk(bad, b == "g,z|g,m|g,", fmt.tprintf("...into %q (want \"g,z|g,m|g,\": blank STILL last)", b))
+		li_chk(bad, b == "g,z|g,m|g,", fmt.tprintf("...into %q (want \"g,z|g,m|g,\": blank LAST)", b))
 		li_chk(bad, a != b, "...and the arrow really did flip the rows that have values")
+
+		// PER KEY, not per sort: the two keys point in opposite directions here, so
+		// a comparator reading keys[0].desc for every key's blanks -- or reading one
+		// shared direction -- puts this column's blank at the wrong end. Column 0 is
+		// `g` on every row, so the primary decides nothing and the secondary's own
+		// arrow is the only thing that can place the blank.
+		mixed := [2]Sort_Key{{col = 0, desc = true}, {col = 1, desc = false}}
+		li_chk(bad, table_sort_build(&d, mixed[:]), "a descending primary with an ascending tie-breaker sorts")
+		m := ts_order(&d)
+		li_chk(bad, m == "g,|g,m|g,z", fmt.tprintf("...and the blank follows the TIE-BREAKER's arrow, not the primary's (%q, want \"g,|g,m|g,z\")", m))
 	}
 
 	// C4b: two rows blank on key 1 fall THROUGH to key 2 rather than stopping there.
@@ -4218,8 +4228,8 @@ when NEWTPAD_TESTS {
 		got := ts_order(&d)
 		li_chk(
 			bad,
-			got == "a,q,3|a,,1|a,,2",
-			fmt.tprintf("...order is %q (want \"a,q,3|a,,1|a,,2\": blanks last, and key 2 orders them 1 before 2)", got),
+			got == "a,,1|a,,2|a,q,3",
+			fmt.tprintf("...order is %q (want \"a,,1|a,,2|a,q,3\": blanks FIRST ascending, and key 2 orders them 1 before 2)", got),
 		)
 	}
 
@@ -16702,10 +16712,11 @@ when NEWTPAD_TESTS {
 				}
 
 				// --- by QTY: numeric, so 4 < 10 < 30 < 200 rather than "10" < "200" <
-				//     "30" < "4", and the row with no qty at all goes last in BOTH
-				//     directions. A byte sort passes none of this.
+				//     "30" < "4", and the row with no qty at all follows the arrow --
+				//     first ascending, last descending (Sort_Field.empty, amended
+				//     2026-08-01). A byte sort passes none of this.
 				table_sort_cycle(d, 2)
-				qwant := [ROWS]int{4, 0, 2, 1, 3} // charlie(4) delta(10) echo(30) alpha(200) bravo(-)
+				qwant := [ROWS]int{3, 4, 0, 2, 1} // bravo(-) charlie(4) delta(10) echo(30) alpha(200)
 				for r in 0 ..< ROWS {
 					p, pok := table_row_start(d, r)
 					chk(&bad, pok && p == noff[qwant[r] + 1], fmt.tprintf("numeric asc: visible row %d is line %d (%q)", r, qwant[r] + 1, lines[qwant[r] + 1]))
@@ -16717,14 +16728,20 @@ when NEWTPAD_TESTS {
 					p, pok := table_row_start(d, r)
 					chk(&bad, pok && p == noff[dwant[r] + 1], fmt.tprintf("numeric desc: visible row %d is line %d (%q)", r, dwant[r] + 1, lines[dwant[r] + 1]))
 				}
-				chk(&bad, dwant[ROWS - 1] == 3, "...and the row with no value is last in BOTH directions, not flipped to the front")
+				// The blank moved from one end to the other with the arrow, and it is
+				// at BOTH ends across the two directions rather than at neither --
+				// asserted against the two orders just checked, so a comparator that
+				// dropped the blank in the middle of the numbers (an unparsed empty
+				// reading as 0.0, which is what Sort_Field.empty exists to prevent)
+				// fails here as well as above.
+				chk(&bad, qwant[0] == 3 && dwant[ROWS - 1] == 3, "...and the row with no value is FIRST ascending and LAST descending")
 				table_sort_cycle(d, 2) // third click: back to the file's own order
 				chk(&bad, !table_sorted(d), "a third click clears the sort")
-				// Clearing keeps the view where it was -- doc.top is a real line
-				// offset in every mode, which is the invariant the whole design rests
-				// on, so the grid stays on whatever row the descending sort had at the
-				// top rather than jumping. Wound back here so the walk below starts at
-				// data row 0.
+				// Clearing now lands on the file's first data row (table_sort_scroll_top,
+				// 2026-08-01); this used to leave doc.top wherever the descending sort
+				// had it. Either way the walk below wants the view wound back to the
+				// very top of the file, header included, so it is set explicitly rather
+				// than inherited from whatever the clear decided.
 				d.top = 0
 				for r in 0 ..< ROWS {
 					p, pok := table_row_start(d, r)
@@ -16881,7 +16898,7 @@ when NEWTPAD_TESTS {
 				// 1 2 3 4 5 over lines 5 1 3 2 4.
 				{
 					absn := table_abs_rows(d, 5)
-					want := [5]int{4, 0, 2, 1, 3} // e(4) a(10) c(30) b(200) d(empty, last)
+					want := [5]int{3, 4, 0, 2, 1} // d(empty, first ascending) e(4) a(10) c(30) b(200)
 					for r in 0 ..< 5 {
 						chk(&bad, absn[r] == want[r], fmt.tprintf("with the index finished, visible row %d numbers as data row %d (want %d)", r, absn[r], want[r]))
 					}
