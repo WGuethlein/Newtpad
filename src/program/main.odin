@@ -36,6 +36,28 @@ parse_args :: proc(args: []string) -> (path: string, detach: bool, x, y, w, h: i
 	return args[1], false, x, y, w, h
 }
 
+// Is a blinking caret on screen right now?
+//
+// ONE predicate, asked by the frame loop's sleep AND by the draw, because a sleep
+// that does not wake for a blink the draw performs gives a caret that changes
+// phase only when something else happens to wake the app -- and the reverse gives
+// a process that wakes twice a second to draw a caret that never moves. The two
+// have to agree, so they ask the same question.
+//
+// A document with no caret (the grid, a full Preview) is the common case that
+// keeps this cheap: doc_takes_caret is the same test the draw uses to decide
+// whether to place one at all.
+@(private = "file")
+caret_blinking :: proc(app: ^App, win: ^plat.Window) -> bool {
+	if app == nil || !app.settings.caret_blink {return false}
+	if win != nil && !win.active {return false} // inactive: solid, and no timer
+	d := app_active(app)
+	// doc_read_only_view is the existing producer of "this view draws no caret" --
+	// its own comment says so in as many words -- so the blink asks it rather than
+	// restating which views have one.
+	return d != nil && !doc_read_only_view(d)
+}
+
 // One integer from the command line, or `fallback` when it is not one.
 //
 // Falls back rather than refusing the whole launch: these four numbers are only a
@@ -287,7 +309,7 @@ main :: proc() {
 
 	// The renderer is reusable so the WM_SIZE handler can repaint live during a
 	// window resize (the OS runs a modal loop that otherwise freezes this one).
-	rc := Render_Ctx{&gfx, &text, &quad_pipe, &app, window, 0, 0, 0}
+	rc := Render_Ctx{&gfx, &text, &quad_pipe, &app, window, 0, 0, 0, true}
 	active_render_ctx = &rc
 	BASE_PX = f32(clamp(app.settings.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX))
 	// Before the first frame: text_load_faces left the platform default (4) in
@@ -378,7 +400,17 @@ main :: proc() {
 			// 200 ms rather than sitting until the next keypress -- the app is
 			// idle by definition while the user waits for the answer.
 			polling := session_dirty || !doc_index_done(d0) || search_running(d0) || scrollbar_drag || hscrollbar_drag || update_running(&app.update)
-			plat.window_wait_message(window, 200 if polling else 1000)
+			idle := 200 if polling else 1000
+			// The caret blink is the ONE timer in this app (UI spec §10), so it
+			// shortens this sleep to the next phase change and to nothing else --
+			// wake, flip the caret, sleep again. Only while a caret is actually
+			// drawn: the grid and a full Preview have none, an inactive window
+			// draws a solid one, and the setting turns it off. Each of those means
+			// this wait is exactly what it was before the blink existed.
+			if caret_blinking(&app, window) {
+				idle = caret_blink_wait_ms(time.duration_milliseconds(time.tick_since(last_input)), true, idle)
+			}
+			plat.window_wait_message(window, u32(max(1, idle)))
 		}
 		plat.window_pump_events(window)
 
@@ -1455,6 +1487,11 @@ main :: proc() {
 		// It runs in Preview as well as Split, and that is what makes a restored
 		// session, Ctrl+Home/End and the page keys all still move the preview
 		// without any of them knowing it exists.
+		// The blink phase for this frame, settled BEFORE the draw and from the same
+		// clock reading the sleep above used, so the two cannot disagree about
+		// which phase the frame is in.
+		rc.caret_on = caret_blink_visible(time.duration_milliseconds(time.tick_since(last_input)), caret_blinking(&app, window))
+
 		if doc.kind == .Text && doc.md_mode != .Off && doc.top != doc.md_sync_top {
 			if c, ok := md_scroll_ctx(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac); ok {
 				doc.md_top = md_anchor_from_top(&c, doc.top)
@@ -1529,6 +1566,13 @@ Render_Ctx :: struct {
 	app:                ^App,
 	window:             ^plat.Window,
 	px, char_w, line_h: f32,
+	// The caret's blink phase for THIS frame, computed once in the loop and read
+	// by the draw. Not recomputed down there, deliberately: the loop shortens its
+	// own sleep to the next phase change, and if the two derived the phase
+	// separately from a clock they would be sampling it at different instants --
+	// the loop deciding to wake for a change the draw had already drawn, or the
+	// reverse. One value, produced once, consumed twice.
+	caret_on:           bool,
 }
 
 // Horizontal scrollbar geometry (pixels). One producer, consumed by the draw in
@@ -2041,6 +2085,21 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			}
 		}
 	} else {
+		// Under everything else on the row: the current line's tint (UI spec §8,
+		// off by default). First so a find match and a selection both read ON TOP
+		// of it -- at 3% it would otherwise wash the brighter marks it sits over,
+		// and those two are the ones the reader is looking for.
+		//
+		// Not in the filter view: its rows are matches from all over the file, so
+		// "the current line" is a row of a list rather than a line of the document.
+		if !doc.filter && rc.app.settings.current_line {
+			// Out to the editor pane's right edge, which in Markdown Split is the
+			// divider and not the window -- doc_editor_right is the one producer of
+			// that number, the same one the scrollbar and the divider read.
+			if q, ok := doc_current_line_rect(doc, text, px, doc_editor_right(doc, f32(window.width), rc.app.settings.split_frac), drawn); ok {
+				plat.quads_draw(gfx, quad_pipe, []plat.Quad{q})
+			}
+		}
 		// Behind the text: find-match highlights (dim), then the selection (bright).
 		if !doc.filter {
 			findq: [80]plat.Quad
@@ -2170,7 +2229,10 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		}
 		bars[nb] = {pos = {er - SCROLLBAR_W, ty}, size = {SCROLLBAR_TRACK_W, th}, color = g_theme[.Scrollbar_Thumb]};nb += 1
 	}
-	if caret {
+	// `rc.caret_on` is the blink phase the frame loop settled before calling here.
+	// A document that draws no caret at all short-circuits on `caret` first, so a
+	// hidden blink phase and a caret-less view are still two different things.
+	if caret && rc.caret_on {
 		bars[nb] = {pos = {cx, cy - px}, size = {sx(2), line_h}, color = g_theme[.Caret]};nb += 1
 	}
 	if nb > 0 {
@@ -2192,7 +2254,11 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// md_divider_rect so the drawn line always sits exactly where a drag grabs it.
 		dr := md_divider_rect(doc, w, h, rc.app.settings.split_frac)
 		line_w := hairline()
-		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {dr.pos.x + dr.size.x * 0.5 - line_w * 0.5, dr.pos.y}, size = {line_w, dr.size.y}, color = g_theme[.Border_Strong]}})
+		// Border_Subtle, not Border_Strong: UI spec §9.4 names it, and the divider
+		// is a seam between two halves of one document rather than an edge between
+		// two surfaces. Border_Strong is what the table header's rule and the menu
+		// borders use, and at that weight the split reads as two windows.
+		plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {dr.pos.x + dr.size.x * 0.5 - line_w * 0.5, dr.pos.y}, size = {line_w, dr.size.y}, color = g_theme[.Border_Subtle]}})
 		// The preview draws from its OWN pixel anchor (doc.md_top), which the
 		// frame's sync has already mapped onto doc.top by block. Pane box from
 		// md_pane_box, the producer the link pass reads too.

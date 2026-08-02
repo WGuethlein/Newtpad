@@ -17,7 +17,20 @@ The table half of that pass shipped as v0.38.0 (HANDOFF §6be); two of the three
 v0.39.0 (§6bf). **The tab glyph and the list-exit gap are fixed and deleted from this file.** The
 scrollbar drag is what is left, and it is the one nothing here can observe.
 
-### Dragging the scrollbar ghosts the Split-view sync; the wheel is clean
+### RESOLVED, cause unknown — dragging the scrollbar ghosted the Split-view sync
+
+**Wyatt, 2026-08-01, on v0.41.0: *"scroll bar drag ghosting is gone now, looks normal."*** Kept rather
+than deleted, because **nothing shipped between the report and the fix was aimed at it** and that is
+worth knowing if it comes back.
+
+The most likely explanation is not a fix at all: when he reported it he was running **v0.37.0**. The
+v0.38.0 install was skipped that round because Newtpad was open, so the first build he actually ran
+after reporting was two releases later. Which of the changes in between mattered — or whether the
+original observation was of a build with something else wrong with it — is not established.
+
+**If it returns, the investigation below is still the right one and its two dead ends still hold.**
+
+
 
 *"grabbing the vertical scrollbar seems to have a ghosting type of thing on scrolling that way, with
 the scroll wheel it looks fine"* (§5, and the same again for the preview half).

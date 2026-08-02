@@ -8,6 +8,7 @@ package main
 
 import "base:intrinsics"
 import "core:fmt"
+import "core:math"
 import "core:slice"
 import "core:strings"
 import "core:thread"
@@ -268,8 +269,36 @@ doc_view_cols :: #force_inline proc(width, char_w: f32) -> int {
 // caller passes its own copy rather than this reading an App/Settings pointer,
 // since every call site already has one in scope.
 doc_editor_right :: proc(doc: ^Document, winw, split_frac: f32) -> f32 {
-	if doc != nil && doc.kind == .Text && doc.md_mode == .Split {return f32(int(winw * split_frac))}
+	if doc != nil && doc.kind == .Text && doc.md_mode == .Split {
+		return f32(int(split_clamp_px(winw * split_frac, winw)))
+	}
 	return winw
+}
+
+// UI spec §9.4's **320px minimum pane**, applied to the split BOUNDARY in pixels.
+//
+// It has to be pixels and it has to be here. SPLIT_MIN/SPLIT_MAX are fractions
+// (0.15/0.85) and a fraction cannot express "320px": on a 3440px monitor 0.15 is
+// 516px and the minimum never bites, while on a 900px window it is 135px and the
+// preview is a column two words wide. The fraction clamp stays where it is as a
+// sanity bound on a value read off disk -- settings_load has no window to measure
+// against -- and this is the rule that actually governs the geometry.
+//
+// ONE producer, called by doc_editor_right, which every pane boundary in the app
+// already resolves through (md_pane_box, md_pane_owns, md_divider_rect, the
+// scrollbar's hit x). So the minimum is enforced for the draw, the hit-test, the
+// wrap width and the drag at once rather than at four call sites.
+//
+// A window too narrow for two minimum panes splits down the middle instead. That
+// is the only answer that keeps both halves the same size as each other, and at
+// that width neither is usable anyway -- refusing to split at all would be worse,
+// because the user asked for a split and would get no visible response.
+MD_PANE_MIN_96 :: f32(320)
+
+split_clamp_px :: proc(x, winw: f32) -> f32 {
+	m := sx(MD_PANE_MIN_96)
+	if winw < m * 2 {return f32(int(winw * 0.5))}
+	return clamp(x, m, winw - m)
 }
 
 // The draggable divider between the editor and the preview. Produced here and
@@ -309,7 +338,11 @@ editor_scrollbar_hit_x :: proc(doc: ^Document, ed_right: f32) -> (lo, hi: f32) {
 // code (see the report on this finding). max(1, winw) matches main.odin's own
 // guard against a zero-width window.
 split_frac_at :: proc(mx, winw: f32) -> f32 {
-	return clamp(mx / max(1, winw), SPLIT_MIN, SPLIT_MAX)
+	// Clamped in PIXELS first, through the same producer the geometry uses, then
+	// converted. Clamping only the fraction would let a drag store a value the
+	// draw then ignores -- the divider stopping while the number behind it kept
+	// moving, so releasing and re-grabbing would jump.
+	return clamp(split_clamp_px(mx, winw) / max(1, winw), SPLIT_MIN, SPLIT_MAX)
 }
 
 // A new/untitled buffer (no path yet) is allowed into any view -- you don't know
@@ -3964,6 +3997,46 @@ doc_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows
 	return n
 }
 
+// The current line's tint (UI spec §8: *"Current-line tint off by default; 3% when
+// on"*), or ok=false when there is nothing to tint.
+//
+// THE CARET'S VISUAL ROW, not its logical line. §8's own warning -- *"more turns a
+// wrapped paragraph into a stripe"* -- is about the opacity, but the same argument
+// settles the extent: tinting every row of a wrapped paragraph paints a block
+// wherever the caret happens to be inside a long line, which is the stripe it
+// warns about arriving by a different route. One row is also what the caret itself
+// occupies, so the two marks agree about where "here" is.
+//
+// Walked with visible_begin/visible_next -- the same iterator the draw, the
+// selection and the bookmark marks use -- so a tint can only land on a row the
+// document actually drew.
+//
+// Text_Primary at 3% rather than a theme role of its own. A role would have to be
+// authored in every theme file that exists, for a surface whose whole definition
+// is "the text colour, nearly invisible"; deriving it means it follows the theme's
+// own foreground into Light, where a white-ish tint would be invisible and a
+// dark one is correct.
+CURRENT_LINE_ALPHA :: f32(0.03)
+
+doc_current_line_rect :: proc(doc: ^Document, t: ^plat.Text, px, width: f32, rows: int) -> (q: plat.Quad, ok: bool) {
+	if doc == nil {return {}, false}
+	col := g_theme[.Text_Primary]
+	col.a = CURRENT_LINE_ALPHA
+	lh := line_height(px)
+	it := visible_begin(doc, t, rows)
+	for {
+		row, start, end, _, _, _, more := visible_next(&it)
+		if !more {break}
+		// `end` is inclusive of the row's last byte, so a caret sitting exactly at
+		// a row end belongs to that row -- which is what puts the tint on the row
+		// the caret is drawn on rather than the one after it.
+		if doc.cursor >= start && doc.cursor <= end {
+			return plat.Quad{pos = {0, row_rect_y(px, row)}, size = {max(0, width), lh}, color = col}, true
+		}
+	}
+	return {}, false
+}
+
 // Bookmark mark geometry, in the LEFT MARGIN. Two numbers, used only here.
 //
 // The margin and not the gutter, deliberately: GUTTER_W is nonzero only in the
@@ -4163,6 +4236,51 @@ doc_scroll :: proc(doc: ^Document, t: ^plat.Text, delta, rows: int) {
 		}
 	}
 	doc.top = min(doc.top, doc_max_top(doc, t, rows))
+}
+
+// --- the caret blink -------------------------------------------------------
+//
+// UI spec §8: *"Caret 2px, `caret` role, 500ms blink. Stop blinking while typing
+// and for 500ms after."* There was no blink of any kind before 2026-08-01 -- the
+// caret was simply always drawn.
+//
+// TWO PURE PROCEDURES, and the second is what makes the first affordable. The
+// frame loop does not spin: it blocks on the message queue (main.odin) and wakes
+// on input, so a blinking caret is the one thing in the app that needs a frame
+// with no message behind it. §10 of the spec names that exact cost -- *"the caret
+// blink is the one timer -- its own 500ms tick, redraw only on phase change"* --
+// so the loop asks caret_blink_wait_ms how long it may sleep and wakes for the
+// phase change and nothing else. A fixed 500ms poll would wake twice per phase and
+// a naive redraw-every-frame would undo "idle cost zero" entirely.
+//
+// `elapsed` is milliseconds since the last input, which is where "stop while
+// typing" comes from for free: every keystroke resets it, so the caret is solid
+// through a burst of typing and for CARET_BLINK_MS after the last one.
+CARET_BLINK_MS :: 500.0
+
+// Is the caret drawn this frame?
+//
+// `blink` false -- the setting off, or an inactive window -- means SOLID, never
+// hidden. A caret that is invisible at the moment someone turns blinking off would
+// be the setting appearing to break the caret.
+caret_blink_visible :: proc(elapsed_ms: f64, blink: bool) -> bool {
+	if !blink || elapsed_ms < CARET_BLINK_MS {return true}
+	// Phase 0 is the first OFF: the solid stretch above already covered the first
+	// ON, so the cycle after it starts hidden.
+	n := int((elapsed_ms - CARET_BLINK_MS) / CARET_BLINK_MS)
+	return n % 2 == 1
+}
+
+// Milliseconds until caret_blink_visible would answer differently, for the frame
+// loop's sleep. Returns `idle` -- the caller's own no-caret timeout -- when
+// nothing is blinking, so a document with no caret, an inactive window or the
+// setting turned off all cost exactly what they did before this existed.
+caret_blink_wait_ms :: proc(elapsed_ms: f64, blink: bool, idle: int) -> int {
+	if !blink {return idle}
+	remain := CARET_BLINK_MS - elapsed_ms if elapsed_ms < CARET_BLINK_MS else CARET_BLINK_MS - math.mod(elapsed_ms - CARET_BLINK_MS, CARET_BLINK_MS)
+	// At least 1: a 0 timeout is a spin, and the caller passes this straight to a
+	// wait that treats 0 as "do not block".
+	return clamp(int(remain + 0.5), 1, idle)
 }
 
 // Keep the caret on screen: scroll so its visual row is within [top, top+drawn).

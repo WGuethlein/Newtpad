@@ -3989,6 +3989,107 @@ when NEWTPAD_TESTS {
 		if bad > 0 {os.exit(1)}
 	}
 
+	// --- `newtpad surfacetest` -- UI spec §8, the editor surface --------------
+	//
+	// One argument, exits non-zero, in HANDOFF §7's list. The §8 behaviours that
+	// are pure enough to assert without a window: the caret's blink phase and the
+	// current line's tint rect.
+	@(private = "file")
+	surface_test_run :: proc() {
+		bad := 0
+		chk :: proc(bad: ^int, ok: bool, msg: string) {
+			fmt.printfln("  %-4s %s", "ok" if ok else "FAIL", msg)
+			if !ok {bad^ += 1}
+		}
+
+		// -- the caret blink (UI spec §8: 500ms, solid while typing) -------------
+		//
+		// Pure arithmetic over "milliseconds since the last input", so the whole
+		// behaviour is testable without a clock, a window or a frame.
+		//
+		// THE WAIT IS TESTED ALONGSIDE THE PHASE, and that pairing is the point: the
+		// frame loop blocks on the message queue and only wakes for this, so a phase
+		// that changes at a time the loop never wakes for is a caret that blinks
+		// only when something else happens to nudge the app. They are two halves of
+		// one behaviour and neither is meaningful alone.
+		fmt.println("-- the caret blink --")
+		B :: CARET_BLINK_MS
+		chk(&bad, caret_blink_visible(0, true), "at the instant of a keystroke the caret is solid")
+		chk(&bad, caret_blink_visible(B - 1, true), "...and stays solid for the whole 500ms after it")
+		chk(&bad, !caret_blink_visible(B, true), "...then goes out")
+		chk(&bad, !caret_blink_visible(B * 2 - 1, true), "...for one full phase")
+		chk(&bad, caret_blink_visible(B * 2, true), "...and comes back")
+		chk(&bad, !caret_blink_visible(B * 3, true), "...alternating from there")
+		chk(&bad, caret_blink_visible(B * 4, true), "...and again")
+		// Blinking OFF is solid, never hidden -- a caret that vanished at the moment
+		// the setting was turned off would look like the setting broke the caret.
+		off_solid := true
+		for e in ([]f64{0, B, B * 1.5, B * 2, B * 7.3}) {
+			if !caret_blink_visible(e, false) {off_solid = false}
+		}
+		chk(&bad, off_solid, "with blinking off the caret is solid at every phase, never hidden")
+
+		IDLE :: 1000
+		chk(&bad, caret_blink_wait_ms(0, true, IDLE) == int(B), fmt.tprintf("straight after a keystroke it sleeps until the first blink (%d)", caret_blink_wait_ms(0, true, IDLE)))
+		chk(&bad, caret_blink_wait_ms(B - 100, true, IDLE) == 100, fmt.tprintf("...and only for what is left of that stretch (%d)", caret_blink_wait_ms(B - 100, true, IDLE)))
+		chk(&bad, caret_blink_wait_ms(B, true, IDLE) == int(B), fmt.tprintf("at a phase boundary it sleeps a whole phase (%d)", caret_blink_wait_ms(B, true, IDLE)))
+		chk(&bad, caret_blink_wait_ms(B * 3.5, true, IDLE) == int(B / 2), fmt.tprintf("mid-phase it sleeps the remainder (%d)", caret_blink_wait_ms(B * 3.5, true, IDLE)))
+		chk(&bad, caret_blink_wait_ms(B * 9.99, true, IDLE) >= 1, "the wait is never 0 -- a 0 timeout is a spin, not a sleep")
+		chk(&bad, caret_blink_wait_ms(123, false, IDLE) == IDLE, "with blinking off the loop sleeps exactly as long as it did before the blink existed")
+
+		// AND THE TWO AGREE. Walked across several phases: at every point the wait
+		// claims to reach, the phase really has flipped -- the property the loop
+		// depends on and which neither assertion above states on its own.
+		agree := true
+		for step in 0 ..< 12 {
+			e := f64(step) * B + 7 // deliberately off the boundaries
+			w := caret_blink_wait_ms(e, true, IDLE)
+			if caret_blink_visible(e, true) == caret_blink_visible(e + f64(w), true) {agree = false}
+		}
+		chk(&bad, agree, "the phase has always changed by the time the loop wakes")
+
+		// -- the current line's tint (UI spec §8: 3%, off by default) ------------
+		fmt.println("-- the current-line tint --")
+		{
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, 800, 600, "surfacetest/tint") {
+				chk(&bad, false, "an offscreen device came up")
+			} else {
+				defer headless_gpu_destroy(&h)
+				px := BASE_PX_96
+				d := doc_from_content(transmute([]u8)strings.clone("alpha\nbeta\ngamma\ndelta\n"), "", .UTF8)
+				defer doc_close(&d)
+				W :: f32(800)
+
+				// On the caret's OWN row, and that is the assertion: a tint that
+				// used doc.top, or the first row, or the logical line's first row
+				// would be right for a caret on line 0 and wrong everywhere else.
+				// Line 2 ("gamma") starts at byte 11.
+				d.cursor = 12
+				q, ok := doc_current_line_rect(&d, &h.text, px, W, 10)
+				chk(&bad, ok, "there is a tint for a caret on a visible row")
+				want_y := row_rect_y(px, 2)
+				chk(&bad, ok && q.pos.y == want_y, fmt.tprintf("...on the caret's own row, row 2 (y %.0f, want %.0f)", q.pos.y, want_y))
+				chk(&bad, ok && q.pos.x == 0 && q.size.x == W, fmt.tprintf("...spanning the pane, edge to edge (%.0f..%.0f)", q.pos.x, q.pos.x + q.size.x))
+				chk(&bad, ok && q.size.y == line_height(px), fmt.tprintf("...one row tall, not the whole wrapped line (%.0f)", q.size.y))
+				chk(&bad, ok && abs(q.color.a - CURRENT_LINE_ALPHA) < 0.0001, fmt.tprintf("...at 3%% (%.3f)", q.color.a))
+				// It follows the caret rather than sitting where it was.
+				d.cursor = 0
+				q0, ok0 := doc_current_line_rect(&d, &h.text, px, W, 10)
+				chk(&bad, ok0 && q0.pos.y == row_rect_y(px, 0), fmt.tprintf("moving the caret moves the tint (y %.0f)", q0.pos.y))
+				// A caret scrolled off the top has no visible row to tint, and the
+				// answer is "none" rather than row 0.
+				d.top = 11
+				d.cursor = 0
+				_, ok_off := doc_current_line_rect(&d, &h.text, px, W, 10)
+				chk(&bad, !ok_off, "a caret scrolled off the top tints nothing, rather than tinting row 0")
+			}
+		}
+
+		fmt.printfln("surfacetest: %d failures", bad)
+		if bad > 0 {os.exit(1)}
+	}
+
 	// --- `newtpad teartest` -- dragging a tab out into its own window ---------
 	//
 	// One argument, exits non-zero, and in HANDOFF §7's list: development-loop.md
@@ -6485,7 +6586,7 @@ when NEWTPAD_TESTS {
 			return
 		}
 
-		rc := Render_Ctx{&h.gfx, &h.text, &h.quads, &app, &h.window, 0, 0, 0}
+		rc := Render_Ctx{&h.gfx, &h.text, &h.quads, &app, &h.window, 0, 0, 0, true}
 		active_render_ctx = &rc
 		defer active_render_ctx = nil
 		BASE_PX = f32(clamp(app.settings.font_size, FONT_SIZE_MIN, FONT_SIZE_MAX))
@@ -28254,11 +28355,24 @@ when NEWTPAD_TESTS {
 			// split_frac_at is the exact proc main.odin's drag handler calls -- not
 			// a second copy of clamp(mx/winw, SPLIT_MIN, SPLIT_MAX), which would
 			// test Odin's clamp builtin rather than this code (report finding 6).
+			// UI spec §9.4's 320px MINIMUM PANE, not the old 0.15/0.85 fraction. The
+			// assertions are written in pixels for the reason the rule is: a
+			// fraction cannot express "320px", and at 1000px wide 0.15 would leave a
+			// 150px preview -- a column two words across. SPLIT_MIN/MAX survive as a
+			// sanity bound on a value read off disk, which the case below covers.
 			winw := f32(1000)
-			lo := split_frac_at(10, winw) // drag to x=10 (0.01), below SPLIT_MIN
-			hi := split_frac_at(990, winw) // drag to x=990 (0.99), above SPLIT_MAX
-			chk(fmt.tprintf("drag to 0.01 clamps to SPLIT_MIN (%.2f -> %.3f)", SPLIT_MIN, lo), lo == SPLIT_MIN, &fail)
-			chk(fmt.tprintf("drag to 0.99 clamps to SPLIT_MAX (%.2f -> %.3f)", SPLIT_MAX, hi), hi == SPLIT_MAX, &fail)
+			pmin := sx(MD_PANE_MIN_96)
+			lo := split_frac_at(10, winw) // dragged almost to the left edge
+			hi := split_frac_at(990, winw) // ...and almost to the right
+			chk(fmt.tprintf("a drag to the left edge leaves the editor %0.fpx (%.0fpx)", pmin, lo * winw), abs(lo * winw - pmin) < 1, &fail)
+			chk(fmt.tprintf("a drag to the right edge leaves the PREVIEW %0.fpx (%.0fpx)", pmin, winw - hi * winw), abs((winw - hi * winw) - pmin) < 1, &fail)
+			// A window too narrow for two minimum panes splits down the middle
+			// rather than refusing to split -- the user asked for a split and must
+			// see one. Half of 400 is 200, which is BELOW the minimum, so this case
+			// cannot pass under a rule that only ever clamps to 320.
+			narrow := f32(400)
+			mid := split_frac_at(10, narrow)
+			chk(fmt.tprintf("a window too narrow for two panes splits in the middle (%.0fpx of %.0f)", mid * narrow, narrow), abs(mid * narrow - narrow * 0.5) < 1, &fail)
 			// Panes never invert. Deliberately NOT lo/hi above: both clamp to the
 			// SPLIT_MIN/SPLIT_MAX constants, so comparing doc_editor_right at those
 			// two only proves SPLIT_MIN < SPLIT_MAX -- true regardless of whether
@@ -35479,6 +35593,13 @@ when NEWTPAD_TESTS {
 		// sort build (table_sort_build) and its one comparator.
 		if os.args[1] == "tablesorttest" {
 			table_sort_test_run()
+			return true
+		}
+
+		// `newtpad surfacetest` -- one-argument, no path, sweepable. UI spec §8's
+		// editor surface: the caret blink and the current-line tint.
+		if os.args[1] == "surfacetest" {
+			surface_test_run()
 			return true
 		}
 

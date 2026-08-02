@@ -261,6 +261,16 @@ Window :: struct {
 	// makes the app unusable without one. Latched at the platform seam because
 	// this is the only place that sees both event kinds arrive.
 	kbd_nav:      bool,
+	// Is this window the ACTIVE one? Distinct from `focus_lost`, which is a
+	// one-shot edge the program consumes to close a menu; this is the standing
+	// state.
+	//
+	// It exists for the caret blink and it is not decoration: the blink is a timer,
+	// and a timer that keeps running while the app is in the background wakes the
+	// process twice a second forever to redraw a window nobody is looking at --
+	// which is the opposite of the spec's "idle cost zero". A caret in an inactive
+	// window is drawn solid, the way every other Windows app draws one.
+	active:       bool,
 	resized:      bool,
 	maximized:    bool,
 	// custom title bar geometry (set by the program each frame, read by the NC
@@ -340,6 +350,11 @@ window_create :: proc(title: string, width, height: i32, x: i32 = win.CW_USEDEFA
 	w := new(Window)
 	w.width = width
 	w.height = height
+	// Active until Windows says otherwise. A window that never receives
+	// WM_ACTIVATE -- the headless render path has no message pump at all -- must
+	// still behave as the foreground one rather than as a background window whose
+	// caret never blinks.
+	w.active = true
 
 	hinstance := win.HINSTANCE(win.GetModuleHandleW(nil))
 
@@ -915,7 +930,8 @@ wnd_proc :: proc "system" (hwnd: win.HWND, msg: win.UINT, wparam: win.WPARAM, lp
 		// Losing activation must close any open menu. Without this, Alt+Tabbing
 		// away leaves the dropdown drawn and the app in menu mode, tracking a
 		// cursor that is now driving a different window.
-		if (wparam & 0xFFFF) == 0 {
+		w.active = (wparam & 0xFFFF) != 0
+		if !w.active {
 			w.focus_lost = true
 			w.alt_down, w.alt_used, w.alt_tapped = false, false, false
 			w.mouse_down = false // a drag cannot continue into another window

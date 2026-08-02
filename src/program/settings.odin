@@ -80,6 +80,16 @@ Settings :: struct {
 	// When on, toggling a view updates the defaults above; off turns them into a
 	// pin instead of a running average of what you last did.
 	remember_views:  bool,
+	// Does the caret blink? UI spec §8 asks for a 500ms blink and this ships it on,
+	// but it gets a setting rather than being unconditional: a steady caret is a
+	// real accessibility need, and §12's own Reduce-motion row already names the
+	// caret as a thing that stops moving when motion is reduced. One of the few
+	// options that earns its place against principle 3.
+	caret_blink:     bool,
+	// The current line's background tint (UI spec §8: "3% when on"). OFF by
+	// default, which is the spec's own choice and principle 1's -- content owns the
+	// screen, and a tint on every line the caret visits is chrome that follows you.
+	current_line:    bool,
 	// "Dark", "Light", or a custom *.theme file's stem (see theme_resolve).
 	// Stored as-is on load, the same as font_family above -- NOT validated
 	// against theme_available_names. That was tried and reverted: available
@@ -130,6 +140,8 @@ settings_default :: proc() -> Settings {
 		table_default = false,
 		table_header_mode = .Auto, // judge each file on its own bytes until told otherwise
 		remember_views = true, // remembering is on by default; the toggle pins it
+		caret_blink = true, // spec §8's 500ms blink; the setting exists to turn it OFF
+		current_line = false, // spec §8: "off by default"
 		theme_name = "Dark",
 	}
 }
@@ -228,6 +240,10 @@ settings_load :: proc() -> Settings {
 			if n, pok := strconv.parse_int(parts[1]); pok && n >= 0 && n <= int(max(Table_Header_Mode)) {
 				s.table_header_mode = Table_Header_Mode(n)
 			}
+		case "caret_blink":
+			s.caret_blink = parts[1] == "1"
+		case "current_line":
+			s.current_line = parts[1] == "1"
 		case "remember_views":
 			s.remember_views = parts[1] == "1"
 		case "split_frac":
@@ -265,7 +281,7 @@ settings_save :: proc(s: Settings) -> bool {
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ntheme_name %s\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ncaret_blink %d\ncurrent_line %d\ntheme_name %s\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
@@ -280,6 +296,8 @@ settings_save :: proc(s: Settings) -> bool {
 		1 if s.table_default else 0,
 		int(s.table_header_mode),
 		1 if s.remember_views else 0,
+		1 if s.caret_blink else 0,
+		1 if s.current_line else 0,
 		s.theme_name if s.theme_name != "" else "Dark",
 	)
 	return plat.file_write_atomic(path, transmute([]u8)body)

@@ -5802,6 +5802,105 @@ over the existing `WM_COPYDATA` channel — the primary already receives message
 maybe 30 lines. It was left out to stop this batch growing further; it is the first thing to do if
 tear-off gets used in anger.
 
+## 6bi. The first UI-spec debt batch (2026-08-01, v0.42.0)
+
+Wyatt's order for what remains: **UI debt, then the small user-reported gaps, then JSON formatting,
+then column filtering.** This is the first of those. Scoped as "daily-visible polish": small,
+self-contained, and things he looks at every day. Five of six shipped; the sixth is scoped and
+deliberately not built, below.
+
+### The caret blinks (§8), and it is the app's only timer
+
+There was no blink of any kind — the caret was simply always drawn. §8 asks for 500ms, *"stop blinking
+while typing and for 500ms after"*, and §10 constrains **how**: *"the caret blink is the one timer —
+its own 500ms tick, redraw only on phase change."*
+
+That constraint is the whole design. This frame loop does not spin; it blocks on the message queue and
+wakes on input. So the loop asks `caret_blink_wait_ms` how long it may sleep, wakes for the phase
+change and nothing else. `elapsed` is milliseconds since the last input, which is where "solid while
+typing" falls out for free.
+
+**Two things gate the timer off**, and both matter for the "idle cost zero" claim: a view that draws no
+caret (asked through `doc_read_only_view`, whose own comment already says the grid and Preview have
+none), and an **inactive window** — which needed a new `Window.active`, because a blink that keeps
+running in the background wakes the process twice a second forever to redraw a window nobody is
+looking at.
+
+The phase is computed **once per frame into `Render_Ctx`** and read by both the sleep and the draw. If
+each sampled the clock itself they would sample it at different instants — the loop waking for a
+change the draw had already made.
+
+On by default with a setting to turn it off (Wyatt's call). §12's Reduce-motion row already names the
+caret as a thing that stops moving when motion is reduced, so this is one of the few options that
+earns its place against principle 3.
+
+### Current-line tint (§8), off by default
+
+`Text_Primary` at 3% rather than a new theme role: a role would have to be authored into every theme
+file for a surface whose entire definition is "the text colour, nearly invisible", and deriving it
+follows the theme into Light automatically.
+
+**The caret's visual row, not its logical line.** §8's warning — *"more turns a wrapped paragraph into
+a stripe"* — is about opacity, but the same argument settles the extent: tinting every row of a
+wrapped paragraph paints a block, which is that stripe arriving by another route.
+
+Drawn **first**, under the find-match and selection quads: at 3% it would otherwise wash the brighter
+marks it sits over, and those are the ones the reader is looking for.
+
+### The split divider (§9.4): `Border_Subtle`, and a real 320px minimum
+
+The colour was `Border_Strong`, which is what the table header's rule and the menu borders use — at
+that weight the split reads as two windows rather than two halves of one document.
+
+**The 320px minimum pane could not be a fraction, and that is the interesting half.** `SPLIT_MIN`/
+`SPLIT_MAX` are 0.15/0.85, and on a 3440px monitor 0.15 is 516px so the minimum never bites, while on
+a 900px window it is 135px — a preview two words wide. The rule is now pixels, enforced in
+`doc_editor_right`, which every pane boundary in the app already resolves through (`md_pane_box`,
+`md_pane_owns`, `md_divider_rect`, the scrollbar's hit x). One producer, so the draw, the hit-test, the
+wrap width and the drag all get it at once. The fraction clamp survives as a sanity bound on a value
+read off disk, where there is no window to measure against.
+
+A window too narrow for two minimum panes splits down the middle rather than refusing — the user asked
+for a split and must see one.
+
+### h6 is caps (§9.3)
+
+The one heading level with no size of its own: §9.3 gives h5 and h6 the same 1.00 S and weight, so
+without this an h6 was indistinguishable from an h5. Uppercased on the block's **text**, not at the
+draw — the shaper measures what it is given, and a draw-time transform would size every line against
+lower-case metrics and paint wider glyphs into the box, which is §6j's seam in its narrowest form.
+
+§9.3 also asks for **tracking** on h6 and this does not add it: the shaper has no letter-spacing
+parameter. Recorded rather than quietly dropped.
+
+### NOT built: joining a `>`-marked blockquote — and the estimate in the queue was wrong
+
+`requested-features.md` called this *"the same `md_join_run` machinery, a different predicate. **Small
+and self-contained.**"* **It is not**, and the next person should not start it believing that.
+
+Both scans in `md_para_bounds` continue a run on `md_is_run_line`, which is `.Para` only. Accepting a
+`>`-marked line means the predicate depends on **the run's kind**, and the kind is established by the
+entry line — while the whole contract of `md_para_bounds` is that its answer is **entry-independent**
+(any byte in the run yields the same bounds, which is what `md_block_start_at`'s snap and the layout
+memo both rest on). It also has to compose with the existing lazy continuation, because `> a` / `b` /
+`> c` is one quote in CommonMark, so the rule is "marked lines at the same depth **plus** lazily
+continued unmarked ones" — a change to the run model, interacting with the budget guards, the memo key
+and the setext promotion.
+
+It is worth doing and it needs its own spec, a fixture set covering mixed marked/unmarked runs, and
+the entry-independence property asserted from several bytes of the same run. **Do not treat it as a
+predicate tweak.**
+
+### `surfacetest` is new
+
+One argument, exits non-zero, in §7's list. The blink's phase **and its wait** are asserted together
+and then walked across twelve phases to prove they agree — a phase that changes at a time the loop
+never wakes for is a caret that blinks only when something else nudges the app, and neither assertion
+states that on its own.
+
+The blink cases were briefly written into `teartest`, which is named for the tear-off; they were moved
+rather than left there.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -5828,7 +5927,7 @@ tear-off gets used in anger.
     `mdtest`, `mdviewtest`, `splittest`, `replacetest`, `findtest`, `regextest <mb>`, `metricstest`,
     `quadsdftest`, `scrollgrabtest`, `tabseamtest`, `lineidxtest [file]`, `selalltest`,
     `tablesorttest`, `mdjointest`, `mdfencetest`, `mdperftest`, `mdtabletest`, `blocktest`,
-    `teartest`
+    `teartest`, `surfacetest`
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`,
     `bookmarktest`

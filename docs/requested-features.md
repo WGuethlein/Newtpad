@@ -271,9 +271,10 @@ file is never rewritten.** v0.36.0 added a second sort key on top of it (§6bc).
 2026-07-30 and is kept as a heading so a reader looking for §10 finds the answer rather than nothing.
 
 ### §8 Editor surface
-- **Caret blink** — 500ms, stopping while typing and for 500ms after. *No blink implementation exists.*
+**Caret blink and the current-line tint are DONE (v0.42.0, HANDOFF §6bi)** — the blink is the app's
+only timer, gated off for a caret-less view and an inactive window, on by default with a setting; the
+tint is Text_Primary at 3%, the caret's visual row, off by default.
 - **Gutter** — 44px right-aligned + 12px gap, off by default, current line `text_primary`.
-- **Current-line tint** — off by default, 3% when on.
 - **Wrap indent** — a wrapped line continues at the original indent + 2 columns.
 - **Wrap column cap** — cap the text column at 100 characters in wrap mode. §8: *"On a maximised 1440p
   window an uncapped wrap gives 200-character lines."*
@@ -289,7 +290,13 @@ than nothing. Two things it left behind, both new:
   13px gaps between 26px segments, measured. Pre-existing, but v0.37.0 made it *inconsistent*: the
   lazily-continued form (`> a` then unmarked lines) now renders as one clean bar, so the way nearly
   everyone writes a blockquote looks worse than the unusual way. The fix is joining a run of *marked*
-  quote lines — the same `md_join_run` machinery, a different predicate. **Small and self-contained.**
+  quote lines. **It is NOT the small predicate change this entry used to claim** — investigated
+  2026-08-01 and corrected (HANDOFF §6bi). Both scans in `md_para_bounds` continue a run on
+  `md_is_run_line`, which is `.Para` only, so accepting a `>` line makes the predicate depend on the
+  run's KIND — while that procedure's whole contract is that its answer is **entry-independent**, which
+  `md_block_start_at`'s snap and the layout memo both rest on. It must also compose with lazy
+  continuation, since `> a` / `b` / `> c` is one quote in CommonMark. **Needs its own spec and a
+  fixture set that asserts entry-independence from several bytes of one run.**
 - **Split scroll sync over a long hard-wrapped paragraph is per BLOCK**, so the preview pins to the
   paragraph's top rather than tracking the editor's line. This is `ui-spec` §9.4 (*"scroll sync by
   block, not by line"*) being honoured for the first time — the finer old behaviour was an artefact of
@@ -304,13 +311,13 @@ than nothing. Two things it left behind, both new:
   built: it makes the drawn column stop matching the byte column, which is the seam §6j records sixteen
   bugs against. Needs its own batch.
 - **Autolinks and reference links** — only `[a](b)` works.
-- **h6 caps and tracking** (§9.3) — h6 is currently identical to h5.
+- **h6 tracking** (§9.3) — caps shipped in v0.42.0; the shaper has no letter-spacing parameter, so
+  tracking is still owed and needs one threaded through `shape_spans`.
 - **A *Preview font* setting** (§9.3), defaulting to the shipped serif with the editor font as an option.
 - **The caption/meta row** (§9.3, 0.88 S) — computed and unread.
 - **Zebra rows in the preview table** (§9.2 item 6) — the preview doubled down on per-column rules.
 - **Preview selection and copy** (§9.4) — a silent omission, never a recorded deferral.
 - **The heading tick-mark rail** (§9.4) — an 8px mini-map of `md_heading` ticks.
-- **Divider `border_subtle` + 320px minimum pane** (§9.4) — currently `Border_Strong` and 0.15/0.85.
 - **Lists do not nest visually** beyond their indent — no per-level bullet cycling.
 - **A screen *above* the viewport** is laid out only on the scroll-up gesture, not per pass (§9.1).
 

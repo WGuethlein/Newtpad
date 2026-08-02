@@ -3538,6 +3538,23 @@ md_layout_build :: proc(
 		if cut < len(e.src) {emit(&sb, &draft, e.src[cut:], base_col, px)}
 	} else {
 		content := e.cls.content
+		// UI spec §9.3: h6 is CAPS. It is the one level with no size of its own --
+		// §9.3 gives h5 and h6 the same 1.00 S and the same weight -- so without
+		// this an h6 is indistinguishable from an h5, which is what shipped.
+		//
+		// Uppercased HERE, on the block's text, rather than at the draw: the
+		// shaper measures what it is given, and a draw-time transform would size
+		// every line against lower-case metrics and then paint wider glyphs into
+		// the box. That is the drawn-column-versus-byte-column seam §6j records
+		// sixteen bugs against, in its narrowest form.
+		//
+		// §9.3 also asks for tracking on h6 and this does NOT add it: the shaper
+		// has no letter-spacing parameter, and threading one through shape_spans
+		// for a single heading level is its own task. Recorded rather than quietly
+		// dropped.
+		if e.cls.kind == .Heading && e.cls.level == 6 {
+			content = strings.to_upper(content, context.temp_allocator)
+		}
 		for run in md_inline(content) {
 			if len(run.text) == 0 {continue}
 			st := md_run_styles(run)
