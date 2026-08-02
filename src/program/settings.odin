@@ -97,6 +97,15 @@ Settings :: struct {
 	// this file. That is owed work, not a precedent worth copying: a default-off
 	// option nobody can turn on has not shipped.
 	gutter:          bool,
+	// The markdown preview's proportional body face (UI spec §9.3). Empty means
+	// "no preference" -- text_load_body_face then walks its curated order, which
+	// is what every install did before this existed, so an old settings.txt and a
+	// fresh one behave the same. May also name the EDITOR's mono family: §9.3 asks
+	// for that option explicitly, "for people who want the preview to match the
+	// source", and platform/text.odin's find_family already allows a mono family
+	// into the .Body chain (never the reverse, which would put proportional
+	// glyphs on the editor's cell grid).
+	preview_font:    string,
 	// "Dark", "Light", or a custom *.theme file's stem (see theme_resolve).
 	// Stored as-is on load, the same as font_family above -- NOT validated
 	// against theme_available_names. That was tried and reverted: available
@@ -122,6 +131,54 @@ font_choices_refresh :: proc() {
 		if plat.font_family_available(f) {append(&font_choices, f.name)}
 	}
 	if len(font_choices) == 0 {append(&font_choices, "Consolas")}
+}
+
+// What the Preview font row offers: every INSTALLED proportional face, then the
+// editor's own family last.
+//
+// Built fresh rather than cached like font_choices, because it is short (four
+// entries at most) and is only walked when the row is stepped -- a cache would
+// be a second thing to invalidate for no measurable gain.
+//
+// The editor's family is offered because §9.3 asks for it in as many words --
+// "for people who want the preview to match the source" -- and it is LAST
+// because it is the deliberate-departure option, not the default.
+preview_font_choices :: proc(allocator := context.allocator) -> []string {
+	out := make([dynamic]string, 0, 8, allocator)
+	for f in plat.BODY_FAMILIES {
+		if plat.font_family_available(f) {append(&out, f.name)}
+	}
+	// The mono family the document is using, whatever it is right now -- not a
+	// hardcoded "Consolas", or picking it would silently change the preview when
+	// the editor font changed.
+	append(&out, g_editor_font_name)
+	return out[:]
+}
+
+// The editor's current document family, for the Preview font row above. Mirrored
+// here on every settings_apply so the row does not have to reach into a
+// Render_Ctx it is not given.
+@(private = "file")
+g_editor_font_name := "Consolas"
+
+// Load the chosen preview face. Its own proc because the Body chain has to be
+// reloaded (four faces) and the atlas reset, which is exactly what
+// settings_apply_font does for the document face -- and for the same reason it
+// must not run mid-layout.
+settings_apply_preview_font :: proc(rc: ^Render_Ctx) {
+	s := rc.app.settings
+	// "Editor font" is stored as the family's own name, so an unknown name here
+	// is a settings file from a machine with a font this one lacks --
+	// text_load_body_face falls through to the curated order rather than failing,
+	// which is the same degradation find_family already documents.
+	rc.text.body_pref = s.preview_font
+	plat.text_load_body_face(rc.text)
+	plat.text_reset_atlas(rc.text) // px-sized glyphs from the OLD face are wrong now
+	// No explicit preview invalidation: the layout cache keys on
+	// plat.text_face_gen (markdown.odin), which text_load_family bumps whenever a
+	// chain is replaced -- so every cached advance measured against the previous
+	// face misses on the next frame by construction. Calling something here as
+	// well would be a second mechanism for one invariant.
 }
 
 font_choice_index :: proc(name: string) -> int {
@@ -150,6 +207,7 @@ settings_default :: proc() -> Settings {
 		caret_blink = true, // spec §8's 500ms blink; the setting exists to turn it OFF
 		current_line = false, // spec §8: "off by default"
 		gutter = false, // spec §8: "off by default"
+		preview_font = "", // no preference: the curated serif order decides
 		theme_name = "Dark",
 	}
 }
@@ -254,6 +312,8 @@ settings_load :: proc() -> Settings {
 			s.current_line = parts[1] == "1"
 		case "gutter":
 			s.gutter = parts[1] == "1"
+		case "preview_font":
+			s.preview_font = strings.clone(parts[1])
 		case "remember_views":
 			s.remember_views = parts[1] == "1"
 		case "split_frac":
@@ -291,7 +351,7 @@ settings_save :: proc(s: Settings) -> bool {
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ncaret_blink %d\ncurrent_line %d\ngutter %d\ntheme_name %s\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ncaret_blink %d\ncurrent_line %d\ngutter %d\npreview_font %s\ntheme_name %s\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
@@ -309,6 +369,7 @@ settings_save :: proc(s: Settings) -> bool {
 		1 if s.caret_blink else 0,
 		1 if s.current_line else 0,
 		1 if s.gutter else 0,
+		s.preview_font,
 		s.theme_name if s.theme_name != "" else "Dark",
 	)
 	return plat.file_write_atomic(path, transmute([]u8)body)
@@ -339,6 +400,13 @@ SETTINGS_ROWS := []Setting_Row {
 	{"Interface font", "Tabs, menus, settings and the status bar; the document keeps its own font"},
 	// Appended, per the rule above. Ctrl+Shift+L toggles it too.
 	{"Line numbers", "A gutter down the left; the current line's number stands out"},
+	// Both shipped in v0.42.0 with NO UI at all -- no row, no menu item, no
+	// command -- so they were settable only by hand-editing settings.txt. A
+	// default-off option nobody can turn on has not shipped. Appended, per the
+	// rule above.
+	{"Blink the caret", "A steady caret is easier on some eyes; the blink is 500ms"},
+	{"Highlight the current line", "A 3% tint on the line the caret is on"},
+	{"Preview font", "The markdown preview's body face; Editor font makes it match the source"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
@@ -539,6 +607,25 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		}
 	case 10:
 		s.gutter = !s.gutter
+	case 11:
+		s.caret_blink = !s.caret_blink
+	case 12:
+		s.current_line = !s.current_line
+	case 13:
+		// Cycles the installed proportional faces, then the editor's own family.
+		// "" is not offered as a choice -- it is the pre-setting state, and a user
+		// who has opened this row has expressed a preference, so landing back on
+		// "no preference" would read as a font that never appears in the list.
+		names := preview_font_choices(context.temp_allocator)
+		if len(names) > 0 {
+			cur := 0
+			for n, i in names {
+				if n == s.preview_font {cur = i;break}
+			}
+			step := dir if dir != 0 else 1
+			s.preview_font = strings.clone(names[(cur + step + len(names)) % len(names)])
+			settings_apply_preview_font(rc)
+		}
 	}
 	settings_apply(rc)
 	settings_save(s^)
@@ -554,6 +641,11 @@ settings_apply_font :: proc(rc: ^Render_Ctx) {
 		// Keep the previous face rather than leaving nothing to draw with.
 		return
 	}
+	// The Preview font row offers "the editor's family" as a choice, so it has to
+	// know what that is right now rather than assuming Consolas -- otherwise
+	// changing the document font would silently leave the preview naming a family
+	// nobody is using.
+	g_editor_font_name = s.font_family
 	metrics_recompute(rc)
 }
 
@@ -628,6 +720,12 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			val = app.settings.ui_font_family
 		case 10:
 			val = "On" if app.settings.gutter else "Off"
+		case 11:
+			val = "On" if app.settings.caret_blink else "Off"
+		case 12:
+			val = "On" if app.settings.current_line else "Off"
+		case 13:
+			val = app.settings.preview_font if app.settings.preview_font != "" else "Auto"
 		}
 		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Muted]
 		// The selected row's value brightens, per UI spec 11 -- the row you are

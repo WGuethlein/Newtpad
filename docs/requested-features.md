@@ -236,11 +236,15 @@ file is never rewritten.** v0.36.0 added a second sort key on top of it (§6bc).
 only timer, gated off for a caret-less view and an inactive window, on by default with a setting; the
 tint is Text_Primary at 3%, the caret's visual row, off by default.
 **The gutter and the wrap column cap are DONE (v0.57.0, HANDOFF §6bx).**
-- **Wrap indent** — a wrapped line continues at the original indent + 2 columns. The last §8 item owed.
-- **OWED, found while building the gutter:** `caret_blink` and `current_line` have **no UI at all** —
-  no settings row, no menu item, no command — so they are reachable only by hand-editing
-  `settings.txt`. A default-off option nobody can turn on has not really shipped. The gutter got a row
-  and a toggle instead of copying that; these two want the same.
+- **Wrap indent** — a wrapped line continues at the original indent + 2 columns. **RE-SCOPED
+  2026-08-02: this is NOT a small feature and was mis-sized on this list.** `wrap_row_end` takes a
+  uniform `cols` across 7 call sites; a hanging indent means continuation rows have FEWER usable
+  columns, so the wrap decision stops being per-row-independent — and the draw origin, caret x,
+  `col_at_x` hit-testing and the selection rects all need the per-row indent too. That is the
+  drawn-column-vs-byte-column seam §6j records sixteen bugs against, in a milder form than
+  concealment but the same shape. Needs its own batch and its own spec.
+- ~~**`caret_blink` and `current_line` have no UI at all**~~ **DONE (v0.61.0, HANDOFF §6ca)** — both
+  now have settings rows, so the gap opened in v0.42.0 is closed.
 
 ### §9 Markdown
 
@@ -286,9 +290,19 @@ than nothing. Two things it left behind, both new:
 - **Autolinks and reference links** — only `[a](b)` works.
 - **h6 tracking** (§9.3) — caps shipped in v0.42.0; the shaper has no letter-spacing parameter, so
   tracking is still owed and needs one threaded through `shape_spans`.
-- **A *Preview font* setting** (§9.3), defaulting to the shipped serif with the editor font as an option.
+- ~~**A *Preview font* setting** (§9.3)~~ **DONE (v0.61.0, HANDOFF §6ca)** — cycles every installed
+  BODY_FAMILIES face, then the editor's own family last, per §9.3's "for people who want the preview
+  to match the source".
 - **The caption/meta row** (§9.3, 0.88 S) — computed and unread.
 - **Zebra rows in the preview table** (§9.2 item 6) — the preview doubled down on per-column rules.
+  **Investigated 2026-08-02 and deferred with a finding worth keeping:** a zebra band needs the row's
+  PARITY within its table block, and the preview lays out and caches **one row per `Md_Layout`
+  entry**, keyed on that row's own line. So parity cannot be baked into the cached entry — inserting
+  a row at the top of a table flips every following row's parity while those entries stay valid, and
+  the table kinds are not in `md_layout_extern_dep`. **Parity is a property of the draw WALK, not of
+  the block**, so the fix is a running counter in the walk, reset when the table block changes
+  (`md_table_ensure`'s `.start` identifies it). Modest, but not a one-liner, and it touches the
+  partial-admit path.
 - **Preview selection and copy** (§9.4) — a silent omission, never a recorded deferral.
 - **The heading tick-mark rail** (§9.4) — an 8px mini-map of `md_heading` ticks.
 - **Lists do not nest visually** beyond their indent — no per-level bullet cycling.

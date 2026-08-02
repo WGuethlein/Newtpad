@@ -259,6 +259,17 @@ Text_Instance :: struct {
 }
 
 Text :: struct {
+	// The preferred .Body family (the Preview font setting, §9.3). Empty means
+	// "no preference": text_load_body_face then walks BODY_FAMILIES in its
+	// curated order exactly as it always has. Held here rather than passed to
+	// text_load_body_face because text_load_faces is the single door every Text
+	// goes through -- product and headless test alike -- and threading it as a
+	// parameter would mean every caller of that door choosing a value.
+	//
+	// A NAME, not a path, for the same reason Settings.font_family is: paths
+	// differ per machine. Not owned -- it points at the settings string, which
+	// outlives any load.
+	body_pref:  string,
 	// DirectWrite fonts: [0] primary, [1..] fallbacks
 	factory:    ^IFactory,
 	// Two independent face chains. The chrome must not change typeface when the
@@ -449,6 +460,18 @@ text_load_body_face :: proc(t: ^Text) -> (family: string, ok: bool) {
 			d := FONT_SETS[s]
 			if d.base != .Body || d.style == .Regular {continue}
 			text_load_family(t, name, d.style, s)
+		}
+	}
+	// A named preference first (the Preview font setting, §9.3). Empty means "no
+	// preference", which falls through to the curated order below -- so a fresh
+	// install and a settings.txt written before this existed behave identically.
+	// A name that is not installed also falls through rather than failing: a
+	// settings file copied from another machine is the ordinary case here, the
+	// same reasoning find_family already applies.
+	if t.body_pref != "" {
+		if text_load_family(t, t.body_pref, .Regular, .Body) {
+			styles(t, t.body_pref)
+			return t.body_pref, true
 		}
 	}
 	for f in BODY_FAMILIES {
