@@ -31,17 +31,33 @@ mtok_eq :: proc(t: ^testing.T, got: Token, want_start, want_len: int, want_kind:
 	)
 }
 
-// A heading line: the whole "# text" run is one Keyword token.
+// A heading line: the '#' run is Punct (UI spec §9.2's "marks dimmed") and the
+// text after it is the Keyword. It used to be ONE token over the whole line,
+// which drew the hashes in the heading's own colour and made them the loudest
+// thing on it.
 @(test)
 test_lex_markdown_heading :: proc(t: ^testing.T) {
 	line := `## Section Title`
 	bytes := transmute([]u8)line
 	out: [8]Token
 	n, state := lex_markdown(bytes, .Normal, out[:])
-	testing.expectf(t, n == 1, "want 1 token, got %d", n)
+	testing.expectf(t, n == 2, "want 2 tokens (marks + text), got %d", n)
 	testing.expectf(t, state == .Normal, "heading doesn't change state, got %v", state)
+	if n != 2 {return}
+	mtok_eq(t, out[0], 0, 2, .Punct, "'##' marks")
+	mtok_eq(t, out[1], 2, len(line) - 2, .Keyword, "heading text")
+}
+
+// A heading with no text emits the marks alone, not a zero-length second span.
+@(test)
+test_lex_markdown_heading_marks_only :: proc(t: ^testing.T) {
+	line := `###`
+	bytes := transmute([]u8)line
+	out: [8]Token
+	n, _ := lex_markdown(bytes, .Normal, out[:])
+	testing.expectf(t, n == 1, "want 1 token (marks only), got %d", n)
 	if n != 1 {return}
-	mtok_eq(t, out[0], 0, len(line), .Keyword, "whole heading line")
+	mtok_eq(t, out[0], 0, 3, .Punct, "'###' marks")
 }
 
 // A '#' not followed by a space (or immediately at line end) is NOT a
@@ -63,11 +79,13 @@ test_lex_markdown_blockquote_with_inline_bold :: proc(t: ^testing.T) {
 	bytes := transmute([]u8)line
 	out: [8]Token
 	n, _ := lex_markdown(bytes, .Normal, out[:])
-	testing.expectf(t, n == 2, "want 2 tokens, got %d", n)
-	if n != 2 {return}
+	testing.expectf(t, n == 4, "want 4 tokens ('>' + open mark + text + close mark), got %d", n)
+	if n != 4 {return}
 	mtok_eq(t, out[0], 0, 1, .Comment, "'>' marker")
 	bold_start := strings.index(line, "**important**")
-	mtok_eq(t, out[1], bold_start, len("**important**"), .Keyword, "bold span")
+	mtok_eq(t, out[1], bold_start, 2, .Punct, "opening '**'")
+	mtok_eq(t, out[2], bold_start + 2, len("important"), .Keyword, "bold text")
+	mtok_eq(t, out[3], bold_start + 2 + len("important"), 2, .Punct, "closing '**'")
 }
 
 // EVERY '>' in a nested blockquote prefix takes the same kind.
@@ -118,12 +136,14 @@ test_lex_markdown_nested_blockquote_keeps_inline_content :: proc(t: ^testing.T) 
 	bytes := transmute([]u8)line
 	out: [16]Token
 	n, _ := lex_markdown(bytes, .Normal, out[:])
-	testing.expectf(t, n == 3, "want 3 tokens (two markers + bold), got %d", n)
-	if n != 3 {return}
+	testing.expectf(t, n == 5, "want 5 tokens (two markers + open + text + close), got %d", n)
+	if n != 5 {return}
 	mtok_eq(t, out[0], 0, 1, .Comment, "first '>' marker")
 	mtok_eq(t, out[1], 1, 1, .Comment, "second '>' marker")
 	bold_start := strings.index(line, "**important**")
-	mtok_eq(t, out[2], bold_start, len("**important**"), .Keyword, "bold span")
+	mtok_eq(t, out[2], bold_start, 2, .Punct, "opening '**'")
+	mtok_eq(t, out[3], bold_start + 2, len("important"), .Keyword, "bold text")
+	mtok_eq(t, out[4], bold_start + 2 + len("important"), 2, .Punct, "closing '**'")
 }
 
 // A list marker ("- ") colours just the bullet as Punct.
@@ -195,11 +215,15 @@ test_lex_markdown_bold_vs_italic :: proc(t: ^testing.T) {
 	bytes := transmute([]u8)line
 	out: [8]Token
 	n, _ := lex_markdown(bytes, .Normal, out[:])
-	testing.expectf(t, n == 2, "want 2 tokens, got %d", n)
-	if n != 2 {return}
-	mtok_eq(t, out[0], 0, len("**bold**"), .Keyword, "bold")
+	testing.expectf(t, n == 6, "want 6 tokens (3 per span), got %d", n)
+	if n != 6 {return}
+	mtok_eq(t, out[0], 0, 2, .Punct, "bold opening '**'")
+	mtok_eq(t, out[1], 2, len("bold"), .Keyword, "bold text")
+	mtok_eq(t, out[2], 2 + len("bold"), 2, .Punct, "bold closing '**'")
 	it_start := strings.index(line, "*italic*")
-	mtok_eq(t, out[1], it_start, len("*italic*"), .Type, "italic")
+	mtok_eq(t, out[3], it_start, 1, .Punct, "italic opening '*'")
+	mtok_eq(t, out[4], it_start + 1, len("italic"), .Type, "italic text")
+	mtok_eq(t, out[5], it_start + 1 + len("italic"), 1, .Punct, "italic closing '*'")
 }
 
 // Underscore-delimited bold/italic work the same way as asterisk-delimited.
@@ -209,11 +233,15 @@ test_lex_markdown_underscore_emphasis :: proc(t: ^testing.T) {
 	bytes := transmute([]u8)line
 	out: [8]Token
 	n, _ := lex_markdown(bytes, .Normal, out[:])
-	testing.expectf(t, n == 2, "want 2 tokens, got %d", n)
-	if n != 2 {return}
-	mtok_eq(t, out[0], 0, len("__bold__"), .Keyword, "bold")
+	testing.expectf(t, n == 6, "want 6 tokens (3 per span), got %d", n)
+	if n != 6 {return}
+	mtok_eq(t, out[0], 0, 2, .Punct, "bold opening '__'")
+	mtok_eq(t, out[1], 2, len("bold"), .Keyword, "bold text")
+	mtok_eq(t, out[2], 2 + len("bold"), 2, .Punct, "bold closing '__'")
 	it_start := strings.index(line, "_italic_")
-	mtok_eq(t, out[1], it_start, len("_italic_"), .Type, "italic")
+	mtok_eq(t, out[3], it_start, 1, .Punct, "italic opening '_'")
+	mtok_eq(t, out[4], it_start + 1, len("italic"), .Type, "italic text")
+	mtok_eq(t, out[5], it_start + 1 + len("italic"), 1, .Punct, "italic closing '_'")
 }
 
 // An unterminated emphasis marker is left plain -- same "leave it plain"

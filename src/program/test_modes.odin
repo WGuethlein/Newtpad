@@ -32038,6 +32038,38 @@ when NEWTPAD_TESTS {
 				return true
 			}
 
+			// --- markdown marks draw DIMMER than what they mark (UI spec §9.2) ---
+			//
+			// The lexer's token shape is unit-tested (lex_markdown_test.odin); this
+			// is the seam below it: a token kind only matters if it reaches the draw
+			// as a different COLOUR, which is the whole of the user-visible claim.
+			// Asserted through highlight_row_spans -- the procedure the draw calls --
+			// rather than by re-reading TOKEN_KIND_ROLE, so the test cannot pass by
+			// agreeing with a mapping the draw does not use.
+			{
+				md :: proc(bad: ^bool, src, label: string, mark_len: int) {
+					d := doc_from_content(transmute([]u8)strings.clone(src), "x.md", .UTF8)
+					defer doc_close(&d)
+					out: [64]plat.Text_Span
+					n, _ := highlight_row_spans(&d, transmute([]u8)src, .Normal, out[:])
+					if n < 2 {
+						bad^ = true
+						fmt.printfln("  %-6s %s: got %d spans, want at least 2 (mark + content)", "FAIL", label, n)
+						return
+					}
+					mark, content := out[0], out[1]
+					ok := mark.len == mark_len && mark.color != content.color
+					if !ok {bad^ = true}
+					fmt.printfln(
+						"  %-6s %s: mark len %d (want %d), mark colour %v content %v",
+						"ok" if ok else "FAIL", label, mark.len, mark_len, mark.color != content.color, content.len,
+					)
+				}
+				md(&fail, "## Section Title", "'##' is dimmer than the heading text", 2)
+				md(&fail, "**bold**", "'**' is dimmer than the bold text", 2)
+				md(&fail, "*it*", "'*' is dimmer than the italic text", 1)
+			}
+
 			// One repeating log line carrying all four patterns lex_log recognizes,
 			// so every row does real (not trivially-empty) lexing work.
 			line := "2026-07-25T10:23:45Z ERROR failed to open \"C:\\log.txt\" after 42 retries\n"
