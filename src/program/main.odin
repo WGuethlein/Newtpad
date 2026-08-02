@@ -838,6 +838,12 @@ main :: proc() {
 			if table_summary_clear_hit(sm, f32(window.mouse_x), f32(window.mouse_y)) {
 				if doc.table_editing {table_edit_commit(doc)}
 				table_sort_clear(doc)
+				// The same landing every other in-grid sort transition makes. The
+				// three call sites that clear because the GRID IS BEING LEFT
+				// (leave_table_view, .Toggle_Table's off-branch, doc_view_apply)
+				// deliberately do not: there the reader is moving to the text view
+				// and keeping their place in it is the point.
+				table_sort_scroll_top(doc)
 				window.mouse_pressed = false
 			}
 		}

@@ -1439,17 +1439,43 @@ table_sort_can_add :: proc(doc: ^Document, col: int) -> bool {
 // not seen yet. It also guarantees doc.top is an offset the permutation contains,
 // which table_sort_pos then never has to be forgiving about. table_sort_add and
 // table_sort_drop below apply the same rule to every reorder they make, including
-// a drop that merely shortens the vector. An operation that CLEARS the sort
-// entirely -- table_sort_cycle's descending -> clear branch, and table_sort_drop's
-// last key -- does NOT touch doc.top: it is already a real byte offset in the
-// file's own order (the block comment opening this section), and once no
-// permutation exists there is nothing left for the scroll to be forgiving about.
+// a drop that merely shortens the vector.
+//
+// AND SO DOES CLEARING, as of 2026-08-01 (live pass §6, table_sort_first_row
+// below). This comment used to argue the opposite -- that the two paths which
+// clear the sort entirely, table_sort_cycle's descending -> clear branch and
+// table_sort_drop's last key, should leave doc.top alone because it "is already a
+// real byte offset in the file's own order". It is a real offset. It is the offset
+// of whichever row happened to be sitting at the TOP OF THE SORTED ORDER at the
+// moment of the clear, and in the file's own order that row is nowhere in
+// particular: "on cycling through sorts, it will take you to the bottom of the
+// table on reset sometimes, others it'll be the middle" (Wyatt, live use,
+// v0.36.0). Being a valid offset was never the property that mattered; being a
+// PREDICTABLE one is. Every transition in this section now lands on the first data
+// row of the order it just produced, and for a clear that order is the file's.
+// Put the view on the first data row of whatever order is live RIGHT NOW -- the
+// permutation's row 0 under a sort, the file's own first data row without one.
+//
+// ONE producer for "scroll to the top", asked after the sort state has already
+// been written, so no caller has to know which of the two it just produced. That
+// is what the clear paths got wrong: they were the only transitions with no call
+// like this, on the reasoning that an unsorted document has no permutation to be
+// an offset into -- true, and not the question. The question is which row the
+// reader ends up looking at, and every other transition answers it the same way.
+table_sort_scroll_top :: proc(doc: ^Document) {
+	if doc == nil {return}
+	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off;return}
+	if off, ok := table_first_data_row(doc); ok {doc.top = off}
+	// A header-only file has no data row to land on; doc.top stays where it is,
+	// which for such a file is already the only place it can be.
+}
+
 table_sort_set :: proc(doc: ^Document, col: int, desc: bool) {
 	if doc == nil || col < 0 {return}
 	if doc.table_editing {table_edit_commit(doc)}
 	kv := [1]Sort_Key{{col = col, desc = desc}}
 	if !table_sort_build(doc, kv[:]) {return}
-	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off}
+	table_sort_scroll_top(doc)
 }
 
 // A click on the sorted column's header. §10's cycle: ascending, then descending,
@@ -1486,6 +1512,7 @@ table_sort_cycle :: proc(doc: ^Document, col: int) {
 	live := table_sorted(doc) && is_key
 	if live && s.keys[k].desc {
 		table_sort_clear(doc) // descending -> the file's own order
+		table_sort_scroll_top(doc) // ...and its first row, like every other transition
 		return
 	}
 	table_sort_set(doc, col, live) // ascending -> descending; anything else -> ascending
@@ -1526,7 +1553,7 @@ table_sort_add :: proc(doc: ^Document, col: int, desc: bool) {
 		nk += 1
 	}
 	if !table_sort_build(doc, kv[:nk]) {return}
-	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off}
+	table_sort_scroll_top(doc)
 }
 
 // Remove `col`'s key and rebuild with what is left, preserving the relative
@@ -1553,8 +1580,14 @@ table_sort_drop :: proc(doc: ^Document, col: int) {
 		kv[nk] = s.keys[i]
 		nk += 1
 	}
-	if !table_sort_build(doc, kv[:nk]) {return}
-	if off, ok := table_sort_row_at(doc, 0); ok {doc.top = off}
+	// The build's result is deliberately not branched on. nk == 0 -- the last key
+	// was just dropped -- is table_sort_build's own "nothing to sort" refusal, and
+	// the row-cap refusal reaches here too; both leave the document UNSORTED rather
+	// than unchanged, because the build clears before it validates. So all three
+	// outcomes have the same answer for the scroll, and table_sort_scroll_top reads
+	// the state that was actually produced rather than being told which one it was.
+	table_sort_build(doc, kv[:nk])
+	table_sort_scroll_top(doc)
 }
 
 // Ctrl+click: the three-state cycle PER KEY that composes onto a live sort
@@ -2329,6 +2362,33 @@ table_sort_digits_shown :: #force_inline proc(doc: ^Document) -> bool {
 	return table_sorted(doc) && doc.table_sort.nkeys > 1
 }
 
+// Does THIS column show a precedence digit -- and therefore reserve its slot?
+//
+// PER COLUMN, and that is the whole point. The digit is drawn on the live keys
+// alone (table_sort_mark gives rank > 0 only where table_sort_key says so), at
+// most TABLE_SORT_KEYS_MAX of them, but the reserve used to be paid by every
+// column in the header: table_draw asked table_sort_digits_shown once outside its
+// loop and handed that one document-wide answer to table_header_label_col for all
+// of them. So adding a second key took a cell off EVERY header name that filled
+// its column, for a digit those columns would never draw -- "the column headers
+// truncate and don't show the rest of the text until you expand the columns, but
+// the column doesn't change horizontal size" (Wyatt, live use, v0.36.0). The
+// column really does not change width; the label's box inside it does.
+//
+// The chevron's half of the reserve stays uniform and this does not touch it.
+// The two marks differ in what moves them: the chevron follows the POINTER, so
+// reserving it only where it is drawn would re-truncate a header as the mouse
+// crossed it -- text moving under the cursor, which is the argument
+// table_header_label_col's comment makes and it is still right. A digit appears
+// on a column only when that column becomes a KEY, which is a deliberate gesture
+// on that column that already re-sorts the whole grid. Nothing about hovering can
+// change this answer, so a per-column reserve costs no stillness at all.
+table_sort_digit_col :: proc(doc: ^Document, col: int) -> bool {
+	if !table_sort_digits_shown(doc) {return false}
+	_, is_key := table_sort_key(doc, col)
+	return is_key
+}
+
 // The digit's own slot, in pixels: one cell of the document face plus the gap
 // that separates it from the arrow, or nothing when no digit is drawn.
 //
@@ -2431,7 +2491,11 @@ Table_Sort_Mark :: struct {
 table_sort_mark :: proc(doc: ^Document, col: Table_Col, char_w, px, right: f32, hover_col: int) -> (m: Table_Sort_Mark, ok: bool) {
 	if doc == nil {return {}, false}
 	s := &doc.table_sort
-	dg := table_sort_digits_shown(doc)
+	// This column's own answer, not the document's -- the same predicate the label
+	// reserve reads, so the digit cannot be drawn in a slot the label did not give
+	// up (that pairing is what table_sort_digits_shown's comment is about; it is
+	// now table_sort_digit_col that both sides ask).
+	dg := table_sort_digit_col(doc, col.c)
 	if k, is_key := table_sort_key(doc, col.c); is_key && table_sorted(doc) {
 		m.up = !s.keys[k].desc
 		if dg {m.rank = k + 1}
@@ -2573,11 +2637,14 @@ table_header_layout :: proc(
 	gw := table_gutter_w()
 	cw := table_chev_w()
 	ch := table_chev_h()
-	// The marks' run is a cell wider while precedence digits are live, so the width
-	// this refuses at moves with them -- asked once, outside the loop, because it is
-	// a property of the document's sort and not of any column.
-	dg := table_sort_digits_shown(doc)
+	// The marks' run is a cell wider on a column that carries a precedence digit, so
+	// the width this refuses at moves with it -- asked PER COLUMN, inside the loop,
+	// because since table_sort_digit_col it is a property of the column's own key
+	// and not of the document's sort. A key column can suppress its chevron at a
+	// width an unsorted neighbour still fits in, which is right: the neighbour is
+	// not reserving the digit's cell.
 	for col in table_cols_layout(doc, char_w, width) {
+		dg := table_sort_digit_col(doc, col.c)
 		x0 := max(col.x, gw)
 		x1 := min(col.x + col.w, right)
 		hc := Table_Header_Cell {
@@ -3363,11 +3430,14 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			}
 		}
 		hy := table_header_baseline_y(px)
-		// Whether precedence digits are live, asked ONCE for the whole header pass:
-		// the label's reserved slot below and the mark producer further down have to
-		// agree about it column by column, and two calls could not disagree today but
-		// would be two places to change.
-		dgts := table_sort_digits_shown(doc)
+		// Whether a precedence digit is live is asked PER COLUMN, below, inside the
+		// loop. It used to be asked once for the whole pass, from
+		// table_sort_digits_shown -- one document-wide answer handed to every
+		// column's label reserve -- and that is what took a cell off every header
+		// name in the grid the moment a second key appeared. table_sort_digit_col
+		// carries the argument. The label's reserve and the mark producer further
+		// down still read the SAME predicate, which is what keeps the digit out of
+		// the label's own cells; they just read it per column now.
 		for col in cols {
 			if col.c >= len(head) {continue}
 			field := head[col.c]
@@ -3378,7 +3448,7 @@ table_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, do
 			// table_header_label_col -- the nudge below reads the same narrowed box,
 			// because a right-aligned header pushed to the cell's right inner edge
 			// would otherwise land under the arrow no matter how short it was.
-			lab := table_header_label_col(col, char_w, px, dgts)
+			lab := table_header_label_col(col, char_w, px, table_sort_digit_col(doc, col.c))
 			fb := transmute([]u8)field
 			// fcells, not hcells: that name is already the layout slice above (the
 			// header's two hit regions), and this is an unrelated int -- the

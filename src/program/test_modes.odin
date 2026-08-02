@@ -3907,6 +3907,7 @@ when NEWTPAD_TESTS {
 		} else {
 			ts_case_inverses(&bad)
 			ts_case_clear_resets(&bad)
+			ts_case_clear_scrolls_top(&bad)
 			ts_case_bad_vector(&bad)
 			ts_case_precedence(&bad)
 			ts_case_numeric_past_sample(&bad)
@@ -4520,14 +4521,16 @@ when NEWTPAD_TESTS {
 		if off, ok := table_sort_row_at(&d, 0); ok {li_chk(bad, d.top == off, fmt.tprintf("...and scrolled to the top of the reduced order (top %d, want %d)", d.top, off))}
 
 		// -- toggle on the LAST live key, descending -> removed: unsorts the doc,
-		//    and doc.top is left alone -- there is no permutation left for a
-		//    scroll to be an offset into (table_sort_cycle's own descending -> clear
-		//    branch makes the same call, and C-nothing pinned it before now).
+		//    and the scroll lands on the file's first data row. This used to assert
+		//    that doc.top was left ALONE, on the reasoning that an unsorted document
+		//    has no permutation for the scroll to be an offset into -- see
+		//    table_sort_scroll_top for why that was the wrong question and
+		//    ts_case_clear_scrolls_top for the fixture that can actually fail this.
 		table_sort_add(&d, 0, true) // ascending -> descending, so the next toggle removes it
-		top_before_clear := d.top
+		first, fok := table_first_data_row(&d)
 		table_sort_toggle(&d, 0)
 		li_chk(bad, !table_sorted(&d) && s.nkeys == 0, fmt.tprintf("toggling the descending last key off unsorts the document (sorted %v, nkeys %d)", table_sorted(&d), s.nkeys))
-		li_chk(bad, d.top == top_before_clear, "...and doc.top is untouched by the clear")
+		li_chk(bad, fok && d.top == first, fmt.tprintf("...and the scroll lands on the file's first data row (top %d, want %d)", d.top, first))
 
 		// -- the plain click's standard three-state cycle, on a column that starts
 		//    OUTSIDE the (currently empty) live sort: not-a-key -> ascending ->
@@ -4539,10 +4542,9 @@ when NEWTPAD_TESTS {
 		li_chk(bad, s.nkeys == 1 && s.keys[0].col == 1 && !s.keys[0].desc, fmt.tprintf("plain click 1 (not sorted -> ascending): nkeys %d keys %v", s.nkeys, s.keys))
 		table_sort_cycle(&d, 1)
 		li_chk(bad, s.keys[0].col == 1 && s.keys[0].desc, "plain click 2 (ascending -> descending)")
-		top_before_i3 := d.top
 		table_sort_cycle(&d, 1)
 		li_chk(bad, !table_sorted(&d), "plain click 3 (descending -> the file's own order)")
-		li_chk(bad, d.top == top_before_i3, "...and doc.top is untouched by that clear too")
+		li_chk(bad, fok && d.top == first, fmt.tprintf("...and that clear lands on the first data row too (top %d, want %d)", d.top, first))
 
 		// -- table_sort_set: replaces the (now empty) vector with exactly one key,
 		//    regardless of what was live before --
@@ -4793,6 +4795,66 @@ when NEWTPAD_TESTS {
 	// of a four-column fixture). A fixture that targeted column 0 cannot fail
 	// against that bug at all -- the wrong answer and the right one coincide.
 	@(private = "file")
+	// Live pass v0.36.0 §6: "on cycling through sorts, it will take you to the
+	// bottom of the table on reset sometimes, others it'll be the middle".
+	//
+	// Every sort transition lands the view on the first row of the order it just
+	// produced. The two that CLEAR used to be the exceptions -- they left doc.top
+	// alone on the reasoning that it was already a valid file offset, which it is:
+	// it is the offset of whichever row was on top IN SORTED ORDER, and in file
+	// order that is nowhere in particular. Hence "sometimes the bottom, sometimes
+	// the middle" -- it depends entirely on which row the reader had left up there.
+	//
+	// THE FIXTURE IS BUILT SO NEITHER DIRECTION PARKS ON ROW 1. Column 0 holds
+	// b, c, a in file order: ascending puts `a` (the last line) on top, descending
+	// puts `c` (the middle line) on top, and the first data row `b` is the top of
+	// neither. Without that, a clear that did nothing at all would still leave
+	// doc.top on the right byte and every assertion below would pass.
+	ts_case_clear_scrolls_top :: proc(bad: ^int) {
+		fmt.println("-- clearing a sort lands on the file's first data row --")
+		d := ts_doc("k,v\nb,1\nc,2\na,3\n", 2)
+		defer doc_close(&d)
+		first, fok := table_first_data_row(&d)
+		li_chk(bad, fok, "precondition: the fixture has a data row under its header")
+
+		// -- the third click: ascending -> descending -> cleared --
+		table_sort_cycle(&d, 0)
+		asc_top := d.top
+		li_chk(bad, ts_order(&d) == "a,3|b,1|c,2", fmt.tprintf("precondition: one click sorts ascending (%q)", ts_order(&d)))
+		li_chk(bad, asc_top != first, fmt.tprintf("precondition: ascending is NOT parked on the first data row (top %d, first %d)", asc_top, first))
+		table_sort_cycle(&d, 0)
+		desc_top := d.top
+		li_chk(bad, ts_order(&d) == "c,2|b,1|a,3", fmt.tprintf("precondition: a second click sorts descending (%q)", ts_order(&d)))
+		li_chk(bad, desc_top != first && desc_top != asc_top, fmt.tprintf("precondition: descending parks somewhere else again, still not row 1 (top %d, asc %d, first %d)", desc_top, asc_top, first))
+		table_sort_cycle(&d, 0)
+		li_chk(bad, !table_sorted(&d), fmt.tprintf("a third click clears the sort (nkeys %d)", d.table_sort.nkeys))
+		li_chk(bad, d.top == first, fmt.tprintf("...and lands on the file's first data row, not on wherever the old top row lives (top %d, want %d)", d.top, first))
+
+		// -- and the other clear path: dropping the LAST key. table_sort_drop
+		//    reaches it through table_sort_build's own "nothing to sort" refusal
+		//    rather than through table_sort_clear, so it is a genuinely separate
+		//    route to the same state and a fix applied only to the cycle would
+		//    leave it behind. --
+		table_sort_set(&d, 0, true) // descending again: top row is `c`, not row 1
+		li_chk(bad, table_sorted(&d) && d.top != first, fmt.tprintf("precondition: a live sort is parked off row 1 again (sorted %v, top %d)", table_sorted(&d), d.top))
+		table_sort_drop(&d, 0)
+		li_chk(bad, !table_sorted(&d) && d.table_sort.nkeys == 0, fmt.tprintf("dropping the last key leaves the document unsorted (nkeys %d)", d.table_sort.nkeys))
+		li_chk(bad, d.top == first, fmt.tprintf("...and it lands on the first data row too (top %d, want %d)", d.top, first))
+
+		// -- dropping a key when another SURVIVES still lands on the new order's
+		//    own top row, which is the rule this whole case is about rather than a
+		//    special case for clearing. --
+		keys := [2]Sort_Key{{col = 1, desc = true}, {col = 0, desc = false}}
+		li_chk(bad, table_sort_build(&d, keys[:]), "precondition: a two-key sort builds")
+		table_sort_drop(&d, 1) // col 0 ascending survives -> `a` on top
+		if off, ok := table_sort_row_at(&d, 0); ok {
+			li_chk(bad, table_sorted(&d) && d.top == off, fmt.tprintf("dropping one of two keys lands on the SURVIVING order's first row (top %d, want %d)", d.top, off))
+			li_chk(bad, d.top != first, fmt.tprintf("...which here is not the file's first row, so the two rules are distinguishable (top %d, first %d)", d.top, first))
+		} else {
+			li_chk(bad, false, "precondition: the surviving one-key sort has a row 0")
+		}
+	}
+
 	ts_case_menu_dispatch :: proc(bad: ^int) {
 		fmt.println("-- the six sort commands land on the column the menu was opened on --")
 		#assert(TABLE_SORT_KEYS_MAX <= 3)
@@ -4868,10 +4930,18 @@ when NEWTPAD_TESTS {
 			a := ts_menu_app(src, COLS)
 			defer app_destroy(&a)
 			d := app_active(&a)
-			table_sort_set(d, target, false)
+			// DESCENDING, deliberately: column `target` holds p,q,r,s,t, already in
+			// file order, so an ASCENDING sort leaves row 0 at the first data row
+			// and the scroll check below could not fail however the clear behaved.
+			// Descending puts the LAST line on top, which is the state that makes
+			// "where does clearing land" a real question.
+			table_sort_set(d, target, true)
 			li_chk(bad, table_sorted(d), "precondition: a sort is live before Clear")
+			first, fok := table_first_data_row(d)
+			li_chk(bad, fok && d.top != first, fmt.tprintf("precondition: the descending sort is NOT parked on the file's first row (top %d, first %d)", d.top, first))
 			pick(&a, .Table_Sort_Clear, target)
 			li_chk(bad, !table_sorted(d) && d.table_sort.nkeys == 0, fmt.tprintf("Clear Sort: nothing is left sorted (nkeys %d)", d.table_sort.nkeys))
+			li_chk(bad, d.top == first, fmt.tprintf("...and the view lands on the file's first data row, not on wherever the old top row lives (top %d, want %d)", d.top, first))
 		}
 
 		// -- and the dispatch guard: on a document that has left the grid, the
@@ -5301,6 +5371,43 @@ when NEWTPAD_TESTS {
 			// ...and the reserve grows by exactly the digit's slot, so the two
 			// cannot drift: one predicate feeds both.
 			li_chk(bad, table_header_marks_w(px, cw, true) - table_header_marks_w(px, cw, false) == cw + table_mark_gap(), fmt.tprintf("the reserve grows by one cell plus a gap (%.0f vs %.0f)", table_header_marks_w(px, cw, true), table_header_marks_w(px, cw, false)))
+
+			// -- WHO PAYS FOR THE DIGIT (v0.36.0 regression, live pass §2) -----
+			//
+			// "The column headers truncate and don't show the rest of the text
+			// until you expand the columns, but the column doesn't change
+			// horizontal size" (Wyatt). The draw asked table_sort_digits_shown --
+			// a DOCUMENT-wide predicate -- once outside its loop and handed that
+			// one answer to every column's label reserve, so a second key took a
+			// cell plus a gap off every header name in the grid, including the
+			// columns that draw no digit at all.
+			//
+			// Measured against the SAME columns on a ONE-key document, where no
+			// digit exists anywhere and the reserve is therefore the unsorted one.
+			// Both halves are asserted, and the second is what stops the first
+			// from passing under a predicate that simply never reserves: the KEY
+			// column must still lose the cell, because it really does draw a digit
+			// there and `label_right <= m0.digit_x` above depends on it.
+			{
+				d1 := ts_marks_doc()
+				defer doc_close(&d1)
+				table_sort_set(&d1, 0, false) // one key -- no digits anywhere
+				c1 := table_cols_layout(&d1, cw, W)
+				if len(c1) != 4 {
+					li_chk(bad, false, fmt.tprintf("precondition: the one-key document lays out four columns (%d)", len(c1)))
+				} else {
+					li_chk(bad, !table_sort_digits_shown(&d1) && table_sort_digits_shown(&d), "precondition: one key shows no digit, two keys do")
+					// Region (cols[2]) is not a key under either sort.
+					li_chk(bad, !table_sort_digit_col(&d, 2) && !table_sort_digit_col(&d1, 2), "precondition: Region is a key on neither document")
+					un1 := table_header_label_col(c1[2], cw, px, table_sort_digit_col(&d1, 2))
+					un2 := table_header_label_col(cols[2], cw, px, table_sort_digit_col(&d, 2))
+					li_chk(bad, un2.cells == un1.cells && un2.w == un1.w, fmt.tprintf("a second key elsewhere does NOT narrow an unsorted column's label (%d cells / %.0fpx vs %d / %.0f)", un2.cells, un2.w, un1.cells, un1.w))
+					// ...and the column that DOES carry the digit pays for it.
+					ky1 := table_header_label_col(c1[0], cw, px, table_sort_digit_col(&d1, 0))
+					ky2 := table_header_label_col(cols[0], cw, px, table_sort_digit_col(&d, 0))
+					li_chk(bad, ky2.cells < ky1.cells, fmt.tprintf("...while the key column's own label does give the digit its cell (%d cells vs %d)", ky2.cells, ky1.cells))
+				}
+			}
 		}
 
 		// -- THE BAND: how wide a window the longest realistic 2-key line needs --
@@ -17141,11 +17248,19 @@ when NEWTPAD_TESTS {
 					{
 						head := table_header_fields(&d)
 						overlaps, gaps_ok := 0, 0
-						digit_overlaps, digit_gaps_ok := 0, 0
+						digit_cols, digit_overlaps, digit_gaps_ok := 0, 0, 0
 						for col in cols {
 							if col.c >= len(head) {continue}
 							a := table_sort_arrow_rect(col, px, table_right(W))
-							lab := table_header_label_col(col, cw, px, table_sort_digits_shown(&d))
+							// PER COLUMN, through the same predicate the draw reads.
+							// This used to pass table_sort_digits_shown(&d) -- the
+							// document-wide answer -- for every column, which mirrored
+							// the bug rather than catching it: the test measured cols 2
+							// and 3 against a label a cell NARROWER than the draw gives
+							// them, so the reserve those columns were wrongly paying was
+							// invisible here.
+							dg := table_sort_digit_col(&d, col.c)
+							lab := table_header_label_col(col, cw, px, dg)
 							hcells := plat.text_cells(&t, transmute([]u8)head[col.c], 0, .Doc)
 							if hcells > lab.cells {hcells = lab.cells}
 							hx := table_cell_text_x(lab) + table_cell_align_dx(lab, hcells, cw)
@@ -17159,14 +17274,22 @@ when NEWTPAD_TESTS {
 							// slot from the label's point of view, so a reservation that
 							// forgot the digit's width can pass the arrow check above
 							// while still painting the digit through the label.
+							//
+							// Only on the columns that DRAW one. An unsorted column has
+							// no digit to be painted through its name, so requiring it to
+							// keep that slot clear is requiring the reserve this batch
+							// removed.
+							if !dg {continue}
+							digit_cols += 1
 							dx := a.x - table_mark_gap() - cw
 							if right_edge > dx {digit_overlaps += 1}
 							if dx - right_edge >= table_mark_gap() {digit_gaps_ok += 1}
 						}
 						chk(&bad, overlaps == 0, fmt.tprintf("%s: no header label reaches into the arrow's slot (%d of %d did)", tag, overlaps, len(cols)))
 						chk(&bad, gaps_ok == len(cols), fmt.tprintf("%s: ...and every one keeps the gap beside it (%d of %d)", tag, gaps_ok, len(cols)))
-						chk(&bad, digit_overlaps == 0, fmt.tprintf("%s: no header label reaches into the digit's slot either (%d of %d did)", tag, digit_overlaps, len(cols)))
-						chk(&bad, digit_gaps_ok == len(cols), fmt.tprintf("%s: ...and every one keeps the gap beside the digit too (%d of %d)", tag, digit_gaps_ok, len(cols)))
+						chk(&bad, digit_cols == TABLE_SORT_KEYS_MAX, fmt.tprintf("%s: precondition -- the digit's checks below cover the %d key columns (%d)", tag, TABLE_SORT_KEYS_MAX, digit_cols))
+						chk(&bad, digit_overlaps == 0, fmt.tprintf("%s: no KEY column's label reaches into the digit's slot either (%d of %d did)", tag, digit_overlaps, digit_cols))
+						chk(&bad, digit_gaps_ok == digit_cols, fmt.tprintf("%s: ...and every one keeps the gap beside the digit too (%d of %d)", tag, digit_gaps_ok, digit_cols))
 						// The slot is inside its own cell and on screen, so the
 						// arrow cannot be drawn over the neighbouring column.
 						strays := 0
