@@ -7130,6 +7130,59 @@ Concealment proper is **not** cancelled — it is now correctly described as an 
 a real cost, waiting on Wyatt having seen the dimming. If he still wants it, it needs its own spec
 enumerating the seam decisions before any code.
 
+## 6ca. Three settings rows, and two features that were mis-sized (2026-08-02, v0.61.0, branch `feat/smalls-batch`)
+
+A four-item "smalls" batch. **Three shipped; two of the four turned out not to be small**, and the
+evidence for that is the useful part of this entry.
+
+### What shipped
+
+- **Settings rows for `caret_blink` and `current_line`.** Both shipped in v0.42.0 with **no UI at all**
+  — no row, no menu item, no command — so they were settable only by hand-editing `settings.txt`. A
+  default-off option nobody can turn on has not really shipped. Found while looking for the pattern to
+  copy for the gutter row (§6bx); closed now.
+- **A Preview font setting (§9.3).** Cycles every installed `BODY_FAMILIES` face, then **the editor's
+  own family last**, which §9.3 asks for in as many words — "for people who want the preview to match
+  the source". The platform layer had already anticipated it: `find_family`'s comment cites that line
+  and already allows a mono family into the `.Body` chain while forbidding the reverse (proportional
+  glyphs on the editor's cell grid). `Text.body_pref` carries the preference so `text_load_faces`
+  stays the single door every `Text` goes through.
+  Applied at **startup as well as from the row** — `text_init` runs before `settings_load`, so the
+  saved preference had never been seen, the same gap the `tab_width` comment beside it records.
+  No preview cache invalidation is needed: the layout cache keys on `plat.text_face_gen`, which
+  `text_load_family` bumps, so every advance measured against the old face misses by construction.
+
+### Wrap indent is not small, and this list said it was
+
+§8's *"a wrapped line continues at the original indent + 2 columns"* reads like a draw offset. It is
+not. `wrap_row_end` takes a uniform `cols` and has **7 call sites**; a hanging indent means
+continuation rows have **fewer usable columns**, so the wrap decision stops being
+per-row-independent — and the draw origin, the caret x, `col_at_x`'s hit-test and the selection rects
+all need the per-row indent too. That is the drawn-column-vs-byte-column seam §6j records sixteen bugs
+against, milder than concealment but the same shape. **Pulled from the batch rather than half-built**,
+and `requested-features.md` now says so where it used to say "small".
+
+### Zebra rows: the finding is why it is not a one-liner
+
+A zebra band needs the row's **parity within its table block**. The preview lays out and caches **one
+row per `Md_Layout` entry**, keyed on that row's own line — so parity cannot be baked into the entry:
+inserting a row at the top of a table flips every following row's parity while those entries stay
+valid, and the table kinds are not in `md_layout_extern_dep`. **Parity belongs to the draw WALK, not
+to the block.** The fix is a running counter in the walk, reset when the block changes
+(`md_table_ensure`'s `.start` identifies it), and it has to compose with the partial-admit path.
+Deferred with that written down rather than discovered later.
+
+### The sabotage found a coverage gap the every-row check could not
+
+`settingstest`'s "every row answers Enter and the arrows" (§6by) covers the two new boolean rows for
+free — which is the argument for testing every index rather than the one just added. It does **not**
+cover the Preview font row's *choice list*: removing the editor's family from
+`preview_font_choices` left **every settings assertion green**, because the row still cycles the
+serifs perfectly well without it. §9.3's requirement is about what is offered, not about the row
+responding, so it needed its own assertion — now three: the list has more than one entry, the last
+entry is the editor's mono family, and every other entry is a real `BODY_FAMILIES` face. Re-sabotaged
+after adding them: it fails naming `"Segoe UI"` as the last choice.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

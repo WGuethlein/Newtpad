@@ -10615,6 +10615,48 @@ when NEWTPAD_TESTS {
 				}
 			}
 
+			// UI spec §9.3 asks for the Preview font row to offer the editor's own
+			// face "for people who want the preview to match the source". That is a
+			// requirement about the CHOICE LIST, not about the row responding, so
+			// the every-row check above cannot see it -- the row still cycles the
+			// serifs perfectly well with the editor entry missing. Found by
+			// sabotage: removing that entry left every settings assertion green.
+			fmt.println("--- the Preview font row offers the editor's face (§9.3) ---")
+			{
+				names := preview_font_choices(context.temp_allocator)
+				pf_ok := len(names) >= 2
+				fmt.printfln("  %-4s %d choices offered", "ok" if pf_ok else "FAIL", len(names))
+				if !pf_ok {bad += 1}
+				// The editor's family is LAST -- it is the deliberate-departure
+				// option, not the default -- and it is whatever the document font is
+				// now, never a hardcoded name, or changing the editor font would
+				// leave this row naming a family nobody is using.
+				last_is_mono := false
+				if len(names) > 0 {
+					for f in plat.FONT_FAMILIES {
+						if f.name == names[len(names) - 1] {last_is_mono = true;break}
+					}
+				}
+				if !last_is_mono {bad += 1}
+				fmt.printfln(
+					"  %-4s the last choice is the editor's mono family (%q)",
+					"ok" if last_is_mono else "FAIL", names[len(names) - 1] if len(names) > 0 else "",
+				)
+				// And every other entry is a proportional body face, not a second
+				// mono one -- a serif list that quietly filled with mono families
+				// would satisfy the count check above.
+				serif_ok := true
+				for i in 0 ..< max(0, len(names) - 1) {
+					found := false
+					for f in plat.BODY_FAMILIES {
+						if f.name == names[i] {found = true;break}
+					}
+					if !found {serif_ok = false}
+				}
+				if !serif_ok {bad += 1}
+				fmt.printfln("  %-4s every other choice is a BODY_FAMILIES face", "ok" if serif_ok else "FAIL")
+			}
+
 			fmt.println("--- zoom ---")
 			t2: plat.Text
 			plat.text_load_faces(&t2)

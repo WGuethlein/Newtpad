@@ -330,6 +330,16 @@ main :: proc() {
 	if app.settings.ui_font_family != "" && app.settings.ui_font_family != "Consolas" {
 		plat.text_load_family(&text, app.settings.ui_font_family, .Regular, .UI)
 	}
+	// The preview's body face (§9.3). Same shape and same failure rule as the two
+	// above, and needed here for the same reason the comment at tab_width gives:
+	// text_load_faces ran back at text_init, BEFORE settings were read, so the
+	// saved preference has never been seen. settings_apply_preview_font only runs
+	// when the row is changed. An empty preference, or a family that is no longer
+	// installed, leaves text_load_body_face's curated order in place.
+	if app.settings.preview_font != "" {
+		text.body_pref = app.settings.preview_font
+		plat.text_load_body_face(&text)
+	}
 	metrics_recompute(&rc)
 	perf_mark("start: theme+fonts+metrics")
 	window.on_resize = on_resize
