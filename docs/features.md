@@ -402,6 +402,11 @@ top of the file, so it is instant at any size.
 | Delimited | `.csv .tsv` |
 | Logs | `.log` (levels: `ERROR WARNING WARN INFO DEBUG TRACE`) |
 
+**Markdown source shows its marks dimmed.** In a `.md` file the `#` of a heading and the `**`/`_` around
+emphasis draw in the muted punctuation colour while the text they mark keeps its own, so the marks stay
+readable without being the loudest thing on the line. They are still real characters -- nothing is
+hidden and every column is where it looks.
+
 **`.txt` is deliberately plain** — there is no grammar to find. **`.py` has no lexer** and is a known
 gap, left plain rather than forced through a lexer that would only get comments right.
 

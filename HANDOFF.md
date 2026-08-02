@@ -7070,6 +7070,66 @@ caught either row is a check that drives the dispatch. The generalisable form: *
 behaviour by index, test every index, not the one just added.* Both defects here predate the batch
 that got blamed for them.
 
+## 6bz. Markdown marks draw dimmer — and "concealment" is not what §9 asks for (2026-08-02, v0.60.0, branch `feat/md-mark-dimming`)
+
+Wyatt picked "concealment" off the feature list, and reading the spec before scoping it turned up
+that **the spec does not ask for concealment at all.**
+
+### The word was doing two jobs
+
+`requested-features.md` §9 carried *"Concealment — hide `#`/`**` on non-caret lines, Obsidian-style.
+**Wyatt chose this**"*, and §5's debt register treated it as spec'd work. **`docs/ui-spec` contains no
+occurrence of the word.** What §9.2's support table actually says, per pane:
+
+| # | Feature | Editor pane | Preview pane |
+|---|---|---|---|
+| 1 | ATX headings | `md_heading`, bold, **marks dimmed** | size scale §9.3 |
+| 2 | bold / italic | `md_bold` weight, `md_italic` slant | real faces, **marks hidden** |
+
+**"Marks hidden" is the PREVIEW column.** The editor column says *dimmed*. Hiding marks in the editor
+is an Obsidian-style feature on top of the spec, and it is the expensive one — it breaks the identity
+between the drawn column and the byte column, which is the seam §6j records sixteen bugs against, so
+caret placement, selection rects, find highlights, link underlines, click hit-testing, h-scroll extent,
+wrap width and Home/End all have to learn about hidden runs, and a line's geometry becomes
+caret-dependent, which nothing in the editor currently is.
+
+**Neither was built.** `# Heading` was emitted as ONE `.Keyword` token over the whole line and
+`**bold**` as one over the whole span, so the marks drew in the *heading's own colour* — the loudest
+thing on the line, which is the opposite of the spec. Presented to Wyatt as a fork; he took the
+dimming.
+
+### The fix is a lexer change and nothing else
+
+Each construct now emits mark tokens around its content: `#` run as `.Punct` + text as `.Keyword`;
+`**` / `__` as `.Punct` + text as `.Keyword` + `.Punct`; the same for one-byte italic delimiters.
+**`Syn_Punct` needed no new theme role** — it is #888176 at 4.2:1 and is documented as "braces, pipes,
+commas", and a markdown mark *is* punctuation. No theme-file format change, and `TOKEN_KIND_ROLE` is a
+total enumerated array so the mapping is compile-enforced.
+
+**Zero geometry change.** Same bytes, same columns, same caret arithmetic — which is the entire reason
+this was worth doing first, and the entire reason it is not concealment.
+
+Deliberately **not** included: inline-code backticks and `~~strikethrough~~`. §9.2 names marks only for
+rows 1 and 2, and extending it further is a judgment call rather than the spec's, so it is left for
+Wyatt to ask for rather than smuggled in.
+
+### Tested at both layers, sabotaged at both
+
+The token shape is unit-tested (`lex_markdown_test.odin`, five existing tests updated because they
+encoded the one-token shape, plus a new marks-only case for a bare `###`). The **colour** claim is
+tested in `highlighttest` through `highlight_row_spans` — the procedure the draw actually calls —
+rather than by re-reading `TOKEN_KIND_ROLE`, so it cannot pass by agreeing with a mapping the draw
+does not use.
+
+Sabotaged by restoring the single heading token: `highlighttest` fails the heading case and 2 unit
+tests fail with it.
+
+### What is still owed
+
+Concealment proper is **not** cancelled — it is now correctly described as an extra-spec feature with
+a real cost, waiting on Wyatt having seen the dimming. If he still wants it, it needs its own spec
+enumerating the seam decisions before any code.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

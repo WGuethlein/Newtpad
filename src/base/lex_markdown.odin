@@ -253,9 +253,24 @@ lex_markdown :: proc(line: []u8, state_in: Lex_State, out: []Token) -> (n: int, 
 		return
 	}
 
+	// TWO tokens, not one: the `#` run is punctuation and the text is the
+	// heading. UI spec §9.2 row 1 asks the editor pane for "md_heading, bold,
+	// marks DIMMED" -- and this emitted one token over the whole line, so the
+	// hashes drew in the heading's own colour and were the loudest thing on it.
+	// (`marks hidden` in that table is the PREVIEW column, and is a different
+	// feature -- see HANDOFF §6bz.)
+	//
+	// The run only; the space after it is left with the text, where it costs
+	// nothing because a space has no glyph to colour.
 	if l := mk_match_heading(line, lead); l > 0 {
 		if n < len(out) {
-			out[n] = Token{lead, len(line) - lead, .Keyword}
+			out[n] = Token{lead, l, .Punct}
+			n += 1
+		}
+		// A bare `###` with no text has nothing left to emit, and a zero-length
+		// token would be a span the draw has to skip rather than never see.
+		if lead + l < len(line) && n < len(out) {
+			out[n] = Token{lead + l, len(line) - lead - l, .Keyword}
 			n += 1
 		}
 		return
@@ -317,9 +332,21 @@ lex_markdown :: proc(line: []u8, state_in: Lex_State, out: []Token) -> (n: int, 
 		}
 
 		if (b == '*' || b == '_') && i + 1 < len(line) && line[i + 1] == b {
+			// Three tokens: open mark, content, close mark. Same rule as the
+			// heading above -- the delimiters are punctuation and only the text
+			// between them is bold. `****` (empty content) emits the two marks and
+			// no middle, rather than a zero-length span.
 			if l := mk_scan_bold(line, i, b); l > 0 {
 				if n < len(out) {
-					out[n] = Token{i, l, .Keyword}
+					out[n] = Token{i, 2, .Punct}
+					n += 1
+				}
+				if l > 4 && n < len(out) {
+					out[n] = Token{i + 2, l - 4, .Keyword}
+					n += 1
+				}
+				if n < len(out) {
+					out[n] = Token{i + l - 2, 2, .Punct}
 					n += 1
 				}
 				i += l
@@ -330,9 +357,18 @@ lex_markdown :: proc(line: []u8, state_in: Lex_State, out: []Token) -> (n: int, 
 		}
 
 		if b == '*' || b == '_' {
+			// One-byte delimiters, otherwise identical to the bold case above.
 			if l := mk_scan_italic(line, i, b); l > 0 {
 				if n < len(out) {
-					out[n] = Token{i, l, .Type}
+					out[n] = Token{i, 1, .Punct}
+					n += 1
+				}
+				if l > 2 && n < len(out) {
+					out[n] = Token{i + 1, l - 2, .Type}
+					n += 1
+				}
+				if n < len(out) {
+					out[n] = Token{i + l - 1, 1, .Punct}
 					n += 1
 				}
 				i += l

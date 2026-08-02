@@ -270,9 +270,19 @@ than nothing. Two things it left behind, both new:
   `md_anchor_top_byte` must invert it exactly, and `md_scroll_scalar`'s own comment calls that property
   hard-won. Scope any task here around the inverse, not the forward map.
 
-- **Concealment** — hide `#`/`**` on non-caret lines, Obsidian-style. **Wyatt chose this** and it is not
-  built: it makes the drawn column stop matching the byte column, which is the seam §6j records sixteen
-  bugs against. Needs its own batch.
+- **Marks dimmed in the editor pane — DONE (v0.60.0, HANDOFF §6bz).** `#`, `**`/`__` and `*`/`_` now
+  emit their own `.Punct` tokens, so they draw in `Syn_Punct` while the text they mark keeps its
+  colour. This is what §9.2 rows 1–2 ask the EDITOR for. Inline-code backticks and `~~strikethrough~~`
+  are deliberately not included — §9.2 names marks only for those two rows.
+- **Concealment** — hide `#`/`**` on non-caret lines, Obsidian-style. **NOT in the UI spec**, which was
+  discovered while scoping it (§6bz): §9.2's "marks hidden" is the **preview** column, and the editor
+  column says "marks *dimmed*", which is the item above. So this is an **extra-spec feature**, not owed
+  work — recorded because Wyatt asked for it, not because §9 does.
+  It remains expensive for the original reason: it makes the drawn column stop matching the byte
+  column, so caret placement, selection rects, find highlights, link underlines, click hit-testing,
+  h-scroll extent, wrap width and Home/End all have to learn about hidden runs — and a line's geometry
+  becomes caret-dependent, which nothing in the editor currently is. **Needs its own spec enumerating
+  those seam decisions before any code**, and is worth re-deciding now that the dimming has shipped.
 - **Autolinks and reference links** — only `[a](b)` works.
 - **h6 tracking** (§9.3) — caps shipped in v0.42.0; the shaper has no letter-spacing parameter, so
   tracking is still owed and needs one threaded through `shape_spans`.
