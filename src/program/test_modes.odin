@@ -3970,6 +3970,9 @@ when NEWTPAD_TESTS {
 			ts_case_clear_scrolls_top(&bad)
 			ts_case_resort_on_commit(&bad)
 			ts_case_headerless(&bad)
+			ts_case_filter(&bad)
+			ts_case_filter_ui(&bad)
+			ts_case_filter_edit_seam(&bad)
 			ts_case_bad_vector(&bad)
 			ts_case_precedence(&bad)
 			ts_case_numeric_past_sample(&bad)
@@ -5921,6 +5924,168 @@ when NEWTPAD_TESTS {
 			back, _ := table_row_count(d)
 			li_chk(bad, back == rows_before, fmt.tprintf("...and the row count with it (%d, want %d)", back, rows_before))
 		}
+	}
+
+	// The column filter (batch 20). *"would also be nice to filter columns, and have
+	// a dropdown list of all items in the column to filter like powerbi/excel has."*
+	//
+	// `view` is what these cases are really about: the sort's `perm` with the hidden
+	// rows removed, so the filter composes with the sort instead of being a second
+	// row model beside it.
+	ts_case_filter :: proc(bad: ^int) {
+		fmt.println("-- the column filter: distinct values, and the row set --")
+		// Column 0 has three distinct values, one of them twice, and NOT in
+		// alphabetical order -- so a list that came back sorted, or deduplicated
+		// wrongly, is visible in the assertion.
+		src := "k,v\nb,1\na,2\nb,3\nc,4\n"
+		{
+			d := ts_doc(src, 2)
+			defer doc_close(&d)
+			li_chk(bad, table_filter_open(&d, 0), "a filter opens on column 0")
+			f := &d.table_filter
+			li_chk(bad, len(f.values) == 3, fmt.tprintf("...with three distinct values (%d)", len(f.values)))
+			// FIRST-SEEN ORDER, not sorted: the list is a picture of the column, and
+			// sorting it hides whether the data is grouped.
+			li_chk(bad, len(f.values) == 3 && f.values[0] == "b" && f.values[1] == "a" && f.values[2] == "c", fmt.tprintf("...in first-seen order, not sorted (%v)", f.values))
+			all_on := true
+			for on in f.on {if !on {all_on = false}}
+			li_chk(bad, all_on, "...all ticked, so the grid is unchanged until you untick something")
+			li_chk(bad, table_filtered(&d), "the filter is live")
+			li_chk(bad, table_sort_rows(&d) == 4, fmt.tprintf("...and every row still shows (%d of 4)", table_sort_rows(&d)))
+
+			// Untick "b" -- the value that appears twice, so two rows go at once.
+			f.on[0] = false
+			table_filter_apply(&d)
+			li_chk(bad, table_sort_rows(&d) == 2, fmt.tprintf("unticking `b` hides both its rows (%d left)", table_sort_rows(&d)))
+			li_chk(bad, ts_order(&d) == "a,2|c,4", fmt.tprintf("...leaving the others in file order (%q)", ts_order(&d)))
+		}
+
+		// COMPOSE WITH A SORT: the filter decides WHICH rows, the sort their order.
+		{
+			d := ts_doc(src, 2)
+			defer doc_close(&d)
+			table_sort_set(&d, 1, true) // by v, descending: 4,3,2,1
+			li_chk(bad, ts_order(&d) == "c,4|b,3|a,2|b,1", fmt.tprintf("precondition: sorted by v desc (%q)", ts_order(&d)))
+			li_chk(bad, table_filter_open(&d, 0), "a filter opens on top of the sort")
+			f := &d.table_filter
+			for v, i in f.values {if v == "b" {f.on[i] = false}}
+			table_filter_apply(&d)
+			// The SORT's order, the FILTER's membership. Neither re-derived.
+			li_chk(bad, ts_order(&d) == "c,4|a,2", fmt.tprintf("the survivors keep the sort's order (%q, want \"c,4|a,2\")", ts_order(&d)))
+			li_chk(bad, table_sorted(&d) && table_filtered(&d), "...and both are still live")
+		}
+
+		// Clearing puts every row back.
+		{
+			d := ts_doc(src, 2)
+			defer doc_close(&d)
+			table_filter_open(&d, 0)
+			d.table_filter.on[0] = false
+			table_filter_apply(&d)
+			li_chk(bad, table_sort_rows(&d) == 2, "precondition: two rows hidden")
+			table_filter_clear(&d)
+			li_chk(bad, !table_filtered(&d), "clearing turns the filter off")
+			li_chk(bad, !table_indexed(&d), "...and with no sort either, the grid is back to walking lines")
+		}
+	}
+
+	// The dropdown, the (Select All) row and the summary line -- everything between
+	// the row set and the user.
+	ts_case_filter_ui :: proc(bad: ^int) {
+		fmt.println("-- the filter's dropdown, and what the summary says --")
+		a := ts_menu_app("k,v\nb,1\na,2\nb,3\nc,4\n", 2)
+		defer app_destroy(&a)
+		d := app_active(&a)
+		t: plat.Text
+		// The index FIRST, as it is on a real open: doc_index_start invalidates the
+		// row index the filter is built on, and therefore clears the filter. Doing
+		// it afterwards -- which this case did at first -- leaves a live filter over
+		// an empty index, which is the state that found that dependency.
+		doc_index_start(d)
+		for !doc_index_done(d) {}
+		menu_open_ctx(&a, table_header_menu_items, 0, 0, 0) // the header menu, on column 0
+		menu_close(&a)
+		command_dispatch(.Table_Filter_Open, {}, &a, nil, &t, 10)
+		li_chk(bad, table_filtered(d), "the Filter row opens a filter on the column the menu was on")
+		li_chk(bad, a.menu.ctx, "...and reopens the dropdown as the value list")
+
+		// One row per distinct value plus (Select All) and a separator.
+		items := menu_filter_items(&a)
+		li_chk(bad, len(items) == 5, fmt.tprintf("the dropdown has (Select All), a separator and three values (%d rows)", len(items)))
+		li_chk(bad, items[0].cmd == .Table_Filter_All, "...with (Select All) first")
+		// EACH VALUE ROW KNOWS WHICH VALUE IT IS, through payload -- the whole
+		// reason Menu_Item grew that field.
+		li_chk(bad, items[2].payload == 0 && items[3].payload == 1 && items[4].payload == 2, fmt.tprintf("...and each value row carries its own index (%d, %d, %d)", items[2].payload, items[3].payload, items[4].payload))
+		li_chk(bad, menu_item_label(&a, items[2]) == "b", fmt.tprintf("...whose label is the value, not the command's title (%q)", menu_item_label(&a, items[2])))
+		all_ticked := true
+		for it in items {
+			if it.cmd == .Table_Filter_Toggle && !it.checked(&a, it) {all_ticked = false}
+		}
+		li_chk(bad, all_ticked, "every value starts ticked")
+		li_chk(bad, items[0].checked(&a, items[0]), "...so (Select All) is ticked too")
+
+		// Toggling one row hides its rows. The payload travels through the menu the
+		// way ctx_col does, so this drives it the same way a click would.
+		a.menu.ctx_payload = 0 // the value "b"
+		command_dispatch(.Table_Filter_Toggle, {}, &a, nil, &t, 10)
+		li_chk(bad, table_sort_rows(d) == 2, fmt.tprintf("unticking a value hides its rows (%d left)", table_sort_rows(d)))
+		li_chk(bad, !items[0].checked(&a, items[0]), "...and (Select All) is no longer ticked")
+
+		// (Select All) is a three-way control: ticked means everything shows, so
+		// pressing it while ticked hides everything. Pressing it here -- with one
+		// value off -- turns everything back on.
+		command_dispatch(.Table_Filter_All, {}, &a, nil, &t, 10)
+		li_chk(bad, table_sort_rows(d) == 4, fmt.tprintf("(Select All) with something unticked shows everything (%d)", table_sort_rows(d)))
+		command_dispatch(.Table_Filter_All, {}, &a, nil, &t, 10)
+		li_chk(bad, table_sort_rows(d) == 0, fmt.tprintf("...and pressing it again hides everything, which is what makes it worth having (%d)", table_sort_rows(d)))
+
+		// THE SUMMARY MUST RECONCILE WITH THE GRID. The row count is the FILE's --
+		// table_row_count walks lines and knows nothing about a filter -- so the
+		// line has to say how many are hidden or it reports a different file.
+		a.menu.ctx_payload = 0
+		command_dispatch(.Table_Filter_All, {}, &a, nil, &t, 10) // everything back on
+		command_dispatch(.Table_Filter_Toggle, {}, &a, nil, &t, 10) // ...minus "b"
+		text := table_summary_text(d)
+		li_chk(bad, table_sort_rows(d) == 2, fmt.tprintf("precondition: two rows visible, %d indexed, %d in view", len(d.table_sort.offs), len(d.table_filter.view)))
+		li_chk(bad, strings.contains(text, "filtered by"), fmt.tprintf("the summary says the grid is filtered (%q)", text))
+		li_chk(bad, strings.contains(text, "2 hidden"), fmt.tprintf("...and how many rows it is not showing (%q)", text))
+		li_chk(bad, strings.contains(text, "4 rows"), "...beside the file's own count, so the two reconcile")
+
+		command_dispatch(.Table_Filter_Clear, {}, &a, nil, &t, 10)
+		li_chk(bad, !table_filtered(d), "Clear Filter turns it off")
+		li_chk(bad, !strings.contains(table_summary_text(d), "filtered"), "...and the summary stops claiming it")
+	}
+
+	// THE DATA-LOSS SEAM. table_row_start is what the cell editor resolves a byte
+	// range through, and a filter changes which data row a visible row index means.
+	// This is the case the whole feature is judged on.
+	ts_case_filter_edit_seam :: proc(bad: ^int) {
+		fmt.println("-- an edit resolves through the FILTER, not around it --")
+		d := ts_doc("k,v\nb,1\na,2\nb,3\nc,4\n", 2)
+		defer doc_close(&d)
+		table_filter_open(&d, 0)
+		for v, i in d.table_filter.values {if v == "b" {d.table_filter.on[i] = false}}
+		table_filter_apply(&d)
+		li_chk(bad, ts_order(&d) == "a,2|c,4", fmt.tprintf("precondition: only the two non-b rows show (%q)", ts_order(&d)))
+
+		// Visible row 1 is `c,4`. In FILE order that is data row 3 -- so anything
+		// that resolved the row index without the filter would land on `b,3`.
+		eok, r, c, fs, fe, val := table_cell_at_index(&d, 1, 1, 8)
+		li_chk(bad, eok && val == "4", fmt.tprintf("visible row 1 col 1 holds %q -- the FILTERED row, not the file's (ok %v)", val, eok))
+		table_edit_start(&d, r, c, fs, fe, val)
+		table_edit_end(&d)
+		table_edit_backspace(&d)
+		table_edit_rune(&d, '9')
+		table_edit_commit(&d)
+
+		body := doc_debug_string(&d)
+		defer delete(body)
+		// THE BYTES. The edit landed on c's row and nowhere else -- `b,3` in
+		// particular is untouched, which is the row a filter-blind resolve would
+		// have written to.
+		li_chk(bad, strings.contains(body, "c,9"), fmt.tprintf("the edit landed on the row that was on screen (%q)", body))
+		li_chk(bad, strings.contains(body, "b,3"), "...and the hidden row it would otherwise have hit is untouched")
+		li_chk(bad, strings.count(body, "b,1") == 1 && strings.count(body, "a,2") == 1, "...as is every other row")
 	}
 
 	ts_case_menu_dispatch :: proc(bad: ^int) {
@@ -10256,7 +10421,7 @@ when NEWTPAD_TESTS {
 					for it in m.items {
 						if it.cmd != cmd || it.checked == nil {continue}
 						found = true
-						if it.checked(app) {checked = true}
+						if it.checked(app, it) {checked = true}
 					}
 				}
 				return
@@ -10340,7 +10505,11 @@ when NEWTPAD_TESTS {
 				for m in menus {append(&drops, Dropdown{m.title, m.items})}
 				append(&drops, Dropdown{"Column header", table_header_menu_items})
 				for m in drops {
-					w := dropdown_w(&mt, m.items)
+					// dropdown_w takes the App since the column filter's rows carry their
+				// label in a payload rather than in the command table. An empty App is
+				// enough here: none of the menus under test has a generated row.
+				wa: App
+				w := dropdown_w(&wa, &mt, m.items)
 					worst := ""
 					need := f32(0)
 					for it in m.items {

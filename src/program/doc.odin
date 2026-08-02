@@ -1355,6 +1355,10 @@ Document :: struct {
 	// 0 was a header resolves every visible row to the line above the one now drawn,
 	// and the cell editor writes through that resolution.
 	table_headerless: bool,
+	// The column filter (see Table_Filter). Beside the sort rather than inside it
+	// because the two compose: the filter decides WHICH rows, the sort decides
+	// their order, and one row set has one owner for each question.
+	table_filter: Table_Filter,
 	// The person's answer, or Auto when nobody has given one. Distinct from the
 	// resolved bool above for the reason Table_Header_Mode's own comment gives: the
 	// answer is what persists and teaches a default, the bool is what the grid
@@ -1794,7 +1798,7 @@ doc_index_start :: proc(doc: ^Document) {
 	// a buffer that no longer exists. table_sort_shift can carry a permutation
 	// across an EDIT; nothing can carry it across a replacement, and a stale one
 	// resolves visible rows to whatever now occupies those bytes.
-	table_sort_clear(doc)
+	table_sort_clear(doc);table_filter_clear(doc)
 	doc.idx.th = thread.create_and_start_with_data(&doc.idx, index_worker)
 }
 
@@ -2618,7 +2622,7 @@ apply_snapshot :: proc(doc: ^Document, s: Snapshot) {
 	// snapshotted -- unlike the checkpoints there is nothing to preserve, since the
 	// sort is a view state the user re-applies with one click, and unlike the
 	// checkpoints a wrong entry here is a cell edit written to the wrong row.
-	table_sort_clear(doc)
+	table_sort_clear(doc);table_filter_clear(doc)
 	base.pt_restore(&doc.pt, s.root, s.length) // takes ownership of s.root
 	doc.cursor = s.cursor
 	doc.anchor = s.anchor

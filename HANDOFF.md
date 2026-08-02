@@ -6248,6 +6248,78 @@ file cannot be read may still hold the unsaved work of a window that died, and d
 transient read error would destroy exactly what the mechanism exists to preserve. A store that reads
 fine and holds nothing is finished business. Both cases are now explicit.
 
+## 6bp. Column filtering — batch 20 (2026-08-02, v0.49.0)
+
+*"would also be nice to filter columns, and have a dropdown list of all items in the column to filter
+like powerbi/excel has."* The sort half shipped in v0.36.0; this is the rest, and it closes §10's
+table work.
+
+Decisions with Wyatt: **checkboxes with Select All**, **refuse past `TABLE_SORT_MAX`** (the sort's
+answer and the sort's limit), **filter and sort compose**, **exclusive with `Ctrl+L`**.
+
+### `view` is the whole design
+
+`Table_Filter.view` is the sort's `perm` **with the hidden rows removed** — data-row indices in
+display order. So the filter composes with the sort rather than being a second row model beside it,
+and every consumer that already resolved a visible row through `table_sort_row_at` keeps working by
+reading one more indirection. With no sort it is the same array built from file order, which is what
+lets a filter exist without one.
+
+Three producers changed and nothing else: `table_sort_rows`, `table_sort_perm_row`, `table_sort_pos`.
+`table_row_start` gained one new predicate — `table_indexed` (sorted **or** filtered) — because a
+filter also resolves rows through the index, and leaving it walking lines would resolve a visible row
+to a **hidden** one. That is the cell editor writing to a row the user cannot see, and it is what the
+seam test drives.
+
+**The sabotage is the proof:** point `table_row_start` back at `table_sorted` and an edit to visible
+row 1 lands on `a,2` instead of `c,4` — a value written to the wrong row, exactly the shape
+`table_edit_line_intact` exists to catch.
+
+### Three real bugs the tests found, none of them the feature itself
+
+- **Zero-is-init, again.** `Table_Filter.col` started at 0, which is **a valid column**, so every
+  fresh document read as "filtered by column 0", built a view over every row, and sent every row-set
+  consumer down the filter path. `Sort_Key.col` records this exact trap and pays for it with an
+  explicit `TABLE_SORT_NONE` reset; the filter uses an explicit `active` bool, which cannot be got
+  wrong.
+- **The filter outlived its own index.** `doc_index_start` clears the sort — which empties `offs` —
+  and `view` indexes into `offs`. A live filter over an empty index is every row resolving to nothing.
+  Every site that invalidates the row index now clears the filter with it: the two share `offs`, so
+  they share a lifetime.
+- **A re-sort left a stale view.** `perm` is rebuilt and `offs` with it, so a live filter is
+  re-applied at the one place `perm` is produced — not in each of `table_sort_set/add/drop/cycle`,
+  which is four chances to miss the fifth.
+
+### The dropdown is the context menu, not a new widget
+
+`Menu_Item` gained a `payload`, and `checked` now takes the item — so a **generated** row set can say
+which value each row is. The filter's dropdown is then the same draw, hit-test, scroll, keyboard and
+edge clamp the header and tab menus already use, instead of a second scrolling list with its own bugs.
+
+The rows live in an **App-owned** buffer, not the frame's temp allocator: `menu_open_ctx` keeps the
+slice and a menu survives into the next frame, which its own comment names as the trap for exactly
+this kind of caller.
+
+`(Select All)` is a **three-way** control: ticked means everything shows, so pressing it while ticked
+hides everything — which is what you press before picking two values out of two hundred.
+
+### The summary row says how many are HIDDEN
+
+Not a filtered count, because `table_row_count` walks lines and knows nothing about a filter. A grid
+showing 12 rows under a line reading "4,000 rows" reports a different file; "4,000 rows · filtered by
+status (3,988 hidden)" is two facts that reconcile. It sits outside the clickable run, which already
+means "clear the sort" — one target cannot mean two things.
+
+### Owed
+
+- The filter is **not persisted** in the session. The sort is not either, and for the same reason
+  (`Doc_View` carries neither), so this is consistent rather than an oversight — but a filter is more
+  expensive to rebuild by hand than a sort.
+- A value list is capped at `TABLE_FILTER_VALUES_MAX` (512) and the scan is linear over the distinct
+  set, so a column with thousands of unique values stops adding rather than degrading. Values past
+  the cap are **kept**, never hidden — hiding rows on the strength of a list that stopped early would
+  remove data the user was never shown a checkbox for.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

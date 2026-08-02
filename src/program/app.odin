@@ -19,6 +19,12 @@ App :: struct {
 	mru:        [dynamic]int, // live slots, most-recently-active first
 	tab_scroll: f32, // horizontal scroll of the tab strip (overflow)
 	menu:       Menu_State,
+	// The column filter's generated dropdown rows (menu_filter_items). App-owned
+	// because menu_open_ctx keeps the slice and a menu survives into the NEXT
+	// frame's draw and hit-test -- a slice built on the frame's temp allocator
+	// would dangle at that frame's free_all, which menu_open_ctx's own comment
+	// spells out as the trap for exactly this shape of caller.
+	filter_items: [dynamic]Menu_Item,
 	settings:      Settings,
 	// Settings and Font are tabs (Document.kind), not overlays; only their
 	// cursor position lives here.

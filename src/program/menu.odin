@@ -26,11 +26,20 @@ Menu_Item :: struct {
 	cmd:     Command_Id,
 	// Non-nil only for toggles; draws a check mark. Takes the app because state
 	// lives on the active document, which may be nil.
-	checked: proc(app: ^App) -> bool,
+	// Takes the ITEM as well as the app, so a row can answer about itself. Every
+	// bar toggle ignores it; the column filter's value rows are the reason it
+	// exists -- each is one distinct value and the tick has to come from `payload`,
+	// not from anything reachable via the app alone.
+	checked: proc(app: ^App, it: Menu_Item) -> bool,
 	// Non-nil when the item can be unavailable. Greyed out and unclickable —
 	// several commands silently no-op (Copy with no selection, Undo with no
 	// history), and a menu that offers them anyway is lying about what it does.
 	enabled: proc(app: ^App) -> bool,
+	// Which of a generated row set this row is. Zero and unread on every hand-
+	// written menu; the column filter builds its rows at runtime, one per distinct
+	// value, and this is how a row says which value it is to both the tick and the
+	// command.
+	payload: int,
 }
 
 Menu :: struct {
@@ -68,25 +77,25 @@ can_redo :: proc(app: ^App) -> bool {
 }
 
 @(private = "file")
-is_wrapped :: proc(app: ^App) -> bool {
+is_wrapped :: proc(app: ^App, _: Menu_Item) -> bool {
 	d := app_active(app)
 	return d != nil && d.wrap
 }
 
 @(private = "file")
-is_filtered :: proc(app: ^App) -> bool {
+is_filtered :: proc(app: ^App, _: Menu_Item) -> bool {
 	d := app_active(app)
 	return d != nil && d.filter
 }
 
 @(private = "file")
-is_table :: proc(app: ^App) -> bool {
+is_table :: proc(app: ^App, _: Menu_Item) -> bool {
 	d := app_active(app)
 	return d != nil && d.table
 }
 
 @(private = "file")
-is_md_view :: proc(app: ^App) -> bool {
+is_md_view :: proc(app: ^App, _: Menu_Item) -> bool {
 	d := app_active(app)
 	return d != nil && d.md_mode != .Off
 }
@@ -101,7 +110,7 @@ can_md_view :: proc(app: ^App) -> bool {return doc_can_markdown(app_active(app))
 can_json :: proc(app: ^App) -> bool {return doc_can_json(app_active(app))}
 
 @(private = "file")
-is_regex :: proc(app: ^App) -> bool {
+is_regex :: proc(app: ^App, _: Menu_Item) -> bool {
 	d := app_active(app)
 	return d != nil && d.find.regex
 }
@@ -110,15 +119,15 @@ is_regex :: proc(app: ^App) -> bool {
 // rather than a bool, so each gets its own predicate rather than one proc with
 // a parameter -- Menu_Item.checked takes only the app.
 @(private = "file")
-is_enc_utf8 :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.enc == .UTF8}
+is_enc_utf8 :: proc(app: ^App, _: Menu_Item) -> bool {d := app_active(app);return d != nil && d.enc == .UTF8}
 @(private = "file")
-is_enc_utf16le :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.enc == .UTF16LE}
+is_enc_utf16le :: proc(app: ^App, _: Menu_Item) -> bool {d := app_active(app);return d != nil && d.enc == .UTF16LE}
 @(private = "file")
-is_enc_cp1252 :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.enc == .CP1252}
+is_enc_cp1252 :: proc(app: ^App, _: Menu_Item) -> bool {d := app_active(app);return d != nil && d.enc == .CP1252}
 @(private = "file")
-is_eol_lf :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.eol == .LF}
+is_eol_lf :: proc(app: ^App, _: Menu_Item) -> bool {d := app_active(app);return d != nil && d.eol == .LF}
 @(private = "file")
-is_eol_crlf :: proc(app: ^App) -> bool {d := app_active(app);return d != nil && d.eol == .CRLF}
+is_eol_crlf :: proc(app: ^App, _: Menu_Item) -> bool {d := app_active(app);return d != nil && d.eol == .CRLF}
 
 // The header context menu's predicates. All of them read the target column off
 // app.menu.ctx_col rather than taking a parameter -- Menu_Item.enabled takes
@@ -155,6 +164,71 @@ can_then_by :: proc(app: ^App) -> bool {
 	if !table_sorted(d) {return false}
 	if _, ok := table_sort_key(d, app.menu.ctx_col); ok {return true}
 	return table_sort_can_add(d, app.menu.ctx_col)
+}
+
+@(private = "file")
+has_live_filter :: proc(app: ^App) -> bool {return table_filtered(app_active(app))}
+
+// --- the column filter's generated dropdown --------------------------------
+//
+// One row per distinct value, each a checkbox, plus (Select All) -- Excel and
+// PowerBI, which is what Wyatt asked for. It reuses the CONTEXT MENU wholesale:
+// the same draw, hit-test, scroll, keyboard and edge clamp the header menu and the
+// tab menu already go through. That is what `Menu_Item.payload` bought -- a
+// generated row set instead of a second widget with its own scrolling list, its
+// own hit-test and its own bugs.
+//
+// The rows are built into an App-owned buffer, NOT the frame's temp allocator:
+// menu_open_ctx stores the slice and a menu by definition survives into the next
+// frame's draw, so a temp-built slice would dangle at the first free_all. Its own
+// comment says exactly this and it is the trap this generator would have walked
+// straight into.
+menu_filter_items :: proc(app: ^App) -> []Menu_Item {
+	d := app_active(app)
+	clear(&app.filter_items)
+	if d == nil {return app.filter_items[:]}
+	f := &d.table_filter
+	append(&app.filter_items, Menu_Item{cmd = .Table_Filter_All, checked = filter_all_on})
+	append(&app.filter_items, sep)
+	for _, i in f.values {
+		append(&app.filter_items, Menu_Item{cmd = .Table_Filter_Toggle, checked = filter_value_on, payload = i})
+	}
+	return app.filter_items[:]
+}
+
+// Every value ticked? The (Select All) row's own state, and what makes it a
+// three-way control rather than a button: ticked means "everything is showing",
+// and clicking it when it is ticked hides everything instead.
+@(private = "file")
+filter_all_on :: proc(app: ^App, _: Menu_Item) -> bool {
+	d := app_active(app)
+	if d == nil {return false}
+	for on in d.table_filter.on {if !on {return false}}
+	return len(d.table_filter.on) > 0
+}
+
+@(private = "file")
+filter_value_on :: proc(app: ^App, it: Menu_Item) -> bool {
+	d := app_active(app)
+	if d == nil {return false}
+	f := &d.table_filter
+	return it.payload >= 0 && it.payload < len(f.on) && f.on[it.payload]
+}
+
+// A filter row's LABEL is the value it stands for, not the command's title. The
+// draw asks this for every row and gets "" for an ordinary one, which is what
+// keeps the generated rows inside the same draw rather than beside it.
+menu_item_label :: proc(app: ^App, it: Menu_Item) -> string {
+	if it.cmd != .Table_Filter_Toggle {return ""}
+	d := app_active(app)
+	if d == nil {return ""}
+	f := &d.table_filter
+	if it.payload < 0 || it.payload >= len(f.values) {return ""}
+	v := f.values[it.payload]
+	// An EMPTY cell needs a name, or its row is a checkbox with nothing beside it
+	// and no way to tell what it would hide. The grid draws an em dash for the same
+	// reason (TABLE_EMPTY_CELL).
+	return "(blank)" if v == "" else v
 }
 
 @(private = "file")
@@ -335,6 +409,9 @@ table_header_menu_items := []Menu_Item {
 	sep,
 	{cmd = .Table_Sort_Clear, enabled = has_live_sort},
 	sep,
+	{cmd = .Table_Filter_Open, enabled = in_table_view},
+	{cmd = .Table_Filter_Clear, enabled = has_live_filter},
+	sep,
 	// Not a sort row, which is why it is behind its own separator. It is here
 	// rather than in a top-level menu because it is a property of THIS TABLE and
 	// this menu is already the per-table surface; a View-menu entry would be a
@@ -351,7 +428,7 @@ table_header_menu_items := []Menu_Item {
 // mode, so the tick reflects what is on screen whether the answer came from the
 // user, from the family default or from table_detect_headerless.
 @(private = "file")
-first_row_is_data :: proc(app: ^App) -> bool {
+first_row_is_data :: proc(app: ^App, _: Menu_Item) -> bool {
 	d := app_active(app)
 	return d != nil && d.table && d.table_headerless
 }
@@ -444,6 +521,10 @@ Menu_State :: struct {
 	// display index does not -- and the commands on this menu include two that
 	// close tabs.
 	ctx_tab:   int,
+	// The picked row's Menu_Item.payload, left here by menu_hit_test for the same
+	// reason ctx_col is: the command runs after the menu has closed, so anything it
+	// needs from the row has to outlive the menu.
+	ctx_payload: int,
 }
 
 // Must be called before the first frame: the zero value of `open` is 0, which
@@ -582,7 +663,7 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 		picked := Command_Id.None
 		if idx := menu_item_at(t, app, mx, my, w, h); idx >= 0 {
 			it := menu_items(app)[idx]
-			if item_enabled(app, it) {picked = it.cmd}
+			if item_enabled(app, it) {picked = it.cmd;app.menu.ctx_payload = it.payload}
 		}
 		// Any click while a dropdown is open is consumed, as native menus do —
 		// clicking away closes it rather than also moving the caret.
@@ -944,10 +1025,15 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y}, size = {dw, MENU_ITEM_H}, color = g_theme[.Selection_List]}})
 		}
 		ty := y + MENU_ITEM_H - sx(7)
-		if it.checked != nil && it.checked(app) {
+		if it.checked != nil && it.checked(app, it) {
 			plat.text_draw(gfx, t, "✓", x0 + sx(8), ty, UI_PX, g_theme[.Success])
 		}
-		plat.text_draw(gfx, t, command_table[it.cmd].title, x0 + sx(28), ty, UI_PX, g_theme[.Text_Primary] if on else g_theme[.Text_Muted])
+		// A generated row shows its VALUE; every other row shows its command's
+		// title. One lookup, so the width budget below and the draw cannot disagree
+		// about how long a row is.
+		label := menu_item_label(app, it)
+		if label == "" {label = command_table[it.cmd].title}
+		plat.text_draw(gfx, t, label, x0 + sx(28), ty, UI_PX, g_theme[.Text_Primary] if on else g_theme[.Text_Muted])
 		// The accelerator, or -- when the row is greyed out for a reason worth
 		// giving -- that reason in its place.
 		trailing := command_chord(it.cmd)
@@ -984,7 +1070,7 @@ menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0,
 	if !menu_dropdown_active(app) {return 0, 0, 0, 0}
 	items := menu_items(app)
 	ox, oy := menu_origin(t, app)
-	w = dropdown_w(t, items)
+	w = dropdown_w(app, t, items)
 	full := f32(0)
 	for it in items {full += MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
 
@@ -1123,13 +1209,15 @@ menu_item_at :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) -> in
 //
 // The trailing budget is the larger of the accelerator and the disabled reason,
 // because either can occupy that column.
-dropdown_w :: proc(t: ^plat.Text, items: []Menu_Item) -> f32 {
+dropdown_w :: proc(app: ^App, t: ^plat.Text, items: []Menu_Item) -> f32 {
 	cw := plat.text_char_width(t, UI_PX)
 	widest := 0
 	for it in items {
 		if it.cmd == .None {continue}
 		trailing := max(len(command_chord(it.cmd)), len(command_disabled_hint(it.cmd)))
-		if n := len(command_table[it.cmd].title) + trailing + 8; n > widest {widest = n}
+		title := menu_item_label(app, it)
+		if title == "" {title = command_table[it.cmd].title}
+		if n := len(title) + trailing + 8; n > widest {widest = n}
 	}
 	return f32(widest) * cw
 }

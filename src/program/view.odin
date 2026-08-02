@@ -51,7 +51,7 @@ doc_view_apply :: proc(doc: ^Document, v: Doc_View) {
 	// it). Cleared unconditionally rather than only when the grid stays off -- a
 	// view being applied means the view it describes, and this one describes no
 	// sort.
-	table_sort_clear(doc)
+	table_sort_clear(doc);table_filter_clear(doc)
 
 	if doc.kind == .Text && v.md_mode != .Off && doc_can_markdown(doc) {
 		doc.md_mode = v.md_mode

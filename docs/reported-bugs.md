@@ -75,6 +75,31 @@ address blocks and blockquote continuations need them), and `---` directly under
 setext underline that makes it a heading. If the first one keeps costing him in real notes, the
 answer is a setting — "treat single newlines as breaks", GitHub-comment style — not a parser change.
 
+## Reported 2026-08-02 — closing the last tab of one window among several
+
+*"if an A instance only has one tab and another B instance is open... it should close A instance
+instead of creating the unititled file"*
+
+**Not yet investigated; recorded during the filtering batch.** `app_close` ends with *"last tab closed
+-> fresh scratch"* (`app.odin`), which is right for the only window — a window that fails to a closed
+state is worse than an empty one — and wrong once a second window exists, where the empty scratch is
+just a window nobody wanted.
+
+Two things to settle before building it, because they are not the same question:
+
+- **Which windows count.** A second Newtpad is a separate process (§6bg), so "is another window open"
+  means asking the OS, not the App. `plat.instance_claim`'s mutex says whether *any* other instance
+  exists; enumerating them by window class is the other option and is what a "close me if I am not the
+  last" rule actually needs.
+- **What closing the window does to unsaved work.** Closing a window here is a **hot exit**, not a
+  prompt (§6bh) — so "close A" must still write A's store, or the rule turns closing the last tab into
+  the way to lose a buffer. A torn-off window's store is adopted by the next primary; a *primary* that
+  closes itself is a different case and needs checking.
+
+Related and already fixed, so do not re-derive it: dragging the only tab of a window is refused
+outright (§6bo). If this rule lands, that refusal may want revisiting for the two-window case — they
+are the same question asked from opposite ends.
+
 ## Reported 2026-08-01 — documented for a later pass, not investigated
 
 Wyatt's list, recorded verbatim at his direction: *"just document them for a further pass later."* Each

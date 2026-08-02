@@ -98,6 +98,10 @@ Command_Id :: enum u8 {
 	Table_Sort_Remove,
 	Table_Sort_Clear,
 	Table_First_Row_Is_Data,
+	Table_Filter_Open,
+	Table_Filter_Toggle,
+	Table_Filter_All,
+	Table_Filter_Clear,
 	// tab strip context menu
 	Tab_Reveal,
 	Tab_Copy_Path,
@@ -269,6 +273,10 @@ command_table := [Command_Id]Command {
 	.Table_Sort_Remove        = {"Remove from Sort", "Table"},
 	.Table_Sort_Clear         = {"Clear Sort", "Table"},
 	.Table_First_Row_Is_Data  = {"First Row Is Data", "Table"},
+	.Table_Filter_Open        = {"Filter…", "Table"},
+	.Table_Filter_Toggle      = {"Filter: Toggle Value", "Table"},
+	.Table_Filter_All         = {"(Select All)", "Table"},
+	.Table_Filter_Clear       = {"Clear Filter", "Table"},
 	.Tab_Reveal               = {"Reveal in Explorer", "Tab"},
 	.Tab_Copy_Path            = {"Copy Full Path", "Tab"},
 	.Tab_Close_This           = {"Close Tab", "Tab"},
@@ -1108,6 +1116,10 @@ command_needs_menu_target :: proc(cmd: Command_Id) -> bool {
 	// keymap line naming one of them has no target and must be refused the same way.
 	case .Tab_Reveal, .Tab_Copy_Path, .Tab_Close_This, .Tab_Close_Others:
 		return true
+	// The filter's rows act on app.menu.ctx_col and on a row payload, neither of
+	// which a keymap chord can supply.
+	case .Table_Filter_Open, .Table_Filter_Toggle, .Table_Filter_All, .Table_Filter_Clear:
+		return true
 	}
 	return false
 }
@@ -1167,7 +1179,7 @@ leave_table_view :: proc(doc: ^Document) {
 	// invariant Table_Sort's block comment exists to hold), so the text view opens
 	// on whatever row was at the top of the sorted screen. Cleared AFTER the commit
 	// above, which needs the permutation to resolve its own row.
-	table_sort_clear(doc)
+	table_sort_clear(doc);table_filter_clear(doc)
 }
 
 // Was this command invoked BY NAME -- a palette row, a menu row, a status-bar
@@ -1712,7 +1724,7 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				// having said it survived. It also left table_sort_shift running an
 				// O(rows) pass per keystroke in the plain text editor for any
 				// document that had been in the grid once.
-				table_sort_clear(doc)
+				table_sort_clear(doc);table_filter_clear(doc)
 			}
 			// Learn the family default so the next tabular file opens the same way.
 			// Gated on remember_views: with it off the Settings value is a pin, not a
@@ -1749,6 +1761,49 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// clear because the grid is being LEFT, which keep their place for the text
 		// view -- see table_sort_scroll_top.
 		if doc != nil && doc.table {table_sort_clear(doc);table_sort_scroll_top(doc)}
+	// --- the column filter ---
+	case .Table_Filter_Open:
+		if doc == nil || !doc.table {break}
+		// Ctrl+L and the column filter are EXCLUSIVE, settled when this batch was
+		// split off: Ctrl+L has its own render path, scroll model and banner, so a
+		// column predicate riding inside it would mean one row set with two owners.
+		if doc.filter {doc.filter = false}
+		if !table_filter_open(doc, app.menu.ctx_col) {
+			if doc.table_filter.refused {
+				app_note(app, fmt.tprintf("[TOO LARGE TO FILTER -- OVER %d ROWS]", TABLE_SORT_MAX))
+			}
+			break
+		}
+		// Reopened as a dropdown of values, anchored where the header menu was, so
+		// the two read as one gesture rather than as a menu that vanished.
+		menu_open_ctx(app, menu_filter_items(app), app.menu.ctx_x, app.menu.ctx_y, app.menu.ctx_col)
+	case .Table_Filter_Toggle:
+		if doc == nil || !doc.table {break}
+		f := &doc.table_filter
+		// The row's payload, left on the menu by the pick -- the same shape ctx_col
+		// and ctx_tab use, and for the same reason: the command runs after the menu
+		// that chose it has closed.
+		i := app.menu.ctx_payload
+		if i >= 0 && i < len(f.on) {
+			f.on[i] = !f.on[i]
+			table_filter_apply(doc)
+			table_sort_scroll_top(doc)
+		}
+	case .Table_Filter_All:
+		if doc == nil || !doc.table {break}
+		f := &doc.table_filter
+		// A three-way control, not a button: ticked means everything is showing, so
+		// clicking it then hides everything. Untick-all is what you press before
+		// picking two values out of two hundred, and without it that is 198 clicks.
+		all := true
+		for on in f.on {if !on {all = false}}
+		for i in 0 ..< len(f.on) {f.on[i] = !all}
+		table_filter_apply(doc)
+		table_sort_scroll_top(doc)
+	case .Table_Filter_Clear:
+		if doc == nil || !doc.table {break}
+		table_filter_clear(doc)
+		table_sort_scroll_top(doc)
 	case .Table_First_Row_Is_Data:
 		// Unlike the six rows above it this names no column, so it is NOT in
 		// command_needs_menu_target and can be run from the palette as well as from

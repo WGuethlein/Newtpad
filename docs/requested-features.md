@@ -47,58 +47,6 @@ Cheap and NOT blocked, if the appetite is there: **HTML** is XML-shaped and coul
 `xml_format`'s structure-only rule, with the caveat that its whitespace significance is broader
 (inline elements, not just `<pre>`).
 
-### Excel-style column filtering — batch 20 (the sort half shipped in v0.36.0)
-
-**Requested 2026-07-31 by Wyatt**, alongside the four table bugs: *"multiple sort of columns, first
-column selected to sort takes precedence. would also be nice to filter columns, and have a dropdown
-list of all items in the column to filter like powerbi/excel has."* He raised the scope question
-himself: *"maybe this is a csv/xslx expansion since it doesn't really match the stated goals so far."*
-
-**The multi-column sort half is DONE (v0.36.0, HANDOFF §6bc)** — two keys, first-selected-wins, via a
-header menu, Ctrl+click and the existing plain click. **What is left here is the filtering.** Two
-decisions were already taken with Wyatt when the work was split:
-
-- **Past `TABLE_SORT_MAX` (100,000 rows) the distinct-value list refuses**, the same answer the sort
-  gives, because it is the only one that cannot become a bounded scan reporting a confident wrong
-  answer. A labelled partial list still reads as complete once you are scrolling it.
-- **The column filter and `Ctrl+L` are exclusive** — opening one clears the other. `Ctrl+L` already has
-  its own render path, scroll model and banner; making a column predicate ride inside it means one row
-  set with two owners.
-
-**What the sort half leaves you to build on:** the header menu exists and a `Filter` row is an addition
-to it rather than a redesign; `menu_open_ctx` opens the shared dropdown at an arbitrary anchor; and
-`table_header_layout` is the one producer of the header's geometry, so a new hit region goes there and
-nowhere else.
-
-**That instinct deserves a real answer rather than a reflex, because the mermaid decision just showed
-how easy it is to reach for the wrong test.** The question is not "is this spreadsheet-like" — it is
-*whether a CSV viewer that cannot answer "which rows say ACTIVE" is finished*. Newtpad already has a
-table view with a sort, and §10 committed to it. Filtering is the second question anyone has of a CSV,
-and the app already has a **filter-as-you-type over lines** (`Ctrl+L`) — so the capability exists, just
-not per-column. That makes this much closer to "finish the table view" than to "become Excel".
-
-Where the caution IS warranted: **a per-column dropdown with a distinct-value list is the first UI in
-Newtpad that cannot be viewport-bounded.** Listing every distinct value in a column requires reading
-every row — the same wall the sort hit, and the sort's answer (refuse past `TABLE_SORT_MAX`, say so)
-is available here too. Decide that before building, not after.
-
-**It also subsumed a shipped defect, and that half is done.** "There is no discoverable way to reset the
-sort" is answered by the header menu's labelled `Clear sort` row, built in v0.36.0. The interim
-hover-state and summary-row wording were kept anyway — two labelled routes to one command, not two
-mechanisms.
-
-Design decisions that would change the build:
-
-- ~~**Multi-sort precedence**~~ — **settled: first-selected-wins**, matching PowerBI and Windows
-  Explorer and the opposite of Excel. Shipped that way; array order is precedence, so it is a property
-  of the data structure rather than a rule. Do not "fix" it toward Excel.
-- ~~**The sort must stay view-only**~~ — **held.** `offs`/`perm`/`rank` never changed meaning and the
-  file is still never rewritten.
-- ~~**Filter versus the existing line filter**~~ — **settled: exclusive**, see above.
-- **`.xlsx` is a separate product decision and is NOT implied by any of this.** It is a ZIP of XML with
-  a shared string table, not a text format, and CLAUDE.md scopes Newtpad to text-ish files. If it is
-  ever wanted it is its own entry, and reading it does not follow from having a good CSV grid.
-
 ### Mermaid diagrams in the markdown preview
 
 **Requested 2026-07-31 by Wyatt**, with the reason attached: *"I will be using spec driven design

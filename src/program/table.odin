@@ -450,6 +450,28 @@ table_summary_parts :: proc(doc: ^Document, allocator := context.temp_allocator)
 			fmt.sbprintf(&sb, "  ·  %d keys max", TABLE_SORT_KEYS_MAX)
 		}
 	}
+	// THE FILTER, after the sort and outside the clickable run.
+	//
+	// It says how many rows are HIDDEN rather than restating the count, because the
+	// count above is the FILE's -- table_row_count walks lines and knows nothing
+	// about a filter. A grid showing 12 of 4,000 rows under a line that says "4,000
+	// rows" and nothing else is the worst state this row can be in: it reports a
+	// different file from the one on screen. "4,000 rows · filtered by status
+	// (3,988 hidden)" is two true facts that reconcile.
+	//
+	// Outside [clear_s, clear_e) because that run already means "clear the sort",
+	// and one target cannot mean two things. Clearing the filter is the header
+	// menu's `Clear Filter` row, which is where the filter was turned on.
+	if doc.table_filter.refused {
+		fmt.sbprintf(&sb, "  ·  too large to filter (over %s rows)", group_int(TABLE_SORT_MAX, allocator))
+	} else if table_filtered(doc) {
+		hidden := len(doc.table_sort.offs) - len(doc.table_filter.view)
+		if hidden > 0 {
+			fmt.sbprintf(&sb, "  ·  filtered by %s (%s hidden)", table_col_label(doc, doc.table_filter.col, allocator), group_int(hidden, allocator))
+		} else {
+			fmt.sbprintf(&sb, "  ·  filtered by %s", table_col_label(doc, doc.table_filter.col, allocator))
+		}
+	}
 	return strings.to_string(sb), clear_s, clear_e
 }
 
@@ -735,7 +757,11 @@ table_row_start :: proc(doc: ^Document, r: int) -> (p: int, ok: bool) {
 	// Sorted: one binary search for where the top row sits in the sorted order,
 	// then a lookup. O(log n) and no line walking at all, which is why the draw can
 	// afford to ask per row in this mode.
-	if table_sorted(doc) {
+	// table_indexed, not table_sorted: a FILTER also resolves visible rows through
+	// the index, and leaving this walking lines while a filter was live would
+	// resolve a visible row to a hidden one -- the cell editor writing to a row the
+	// user cannot see, which is the whole risk this feature carries.
+	if table_indexed(doc) {
 		pos, pok := table_sort_pos(doc, s)
 		if !pok {return 0, false}
 		return table_sort_row_at(doc, pos + r)
@@ -775,7 +801,7 @@ table_row_start :: proc(doc: ^Document, r: int) -> (p: int, ok: bool) {
 // (block.odin) already make. Always true under a sort: every offset the
 // permutation hands back comes out of `offs`, which holds real line starts only.
 table_row_next :: proc(doc: ^Document, p, r: int) -> (np: int, ok: bool, line_end: bool) {
-	if table_sorted(doc) {
+	if table_indexed(doc) {
 		np, ok = table_row_start(doc, r)
 		return np, ok, true
 	}
@@ -884,7 +910,7 @@ table_abs_rows :: proc(doc: ^Document, rows: int, allocator := context.temp_allo
 	// no checkpoint, no refusal -- and no doc_line_no_at call at all, so the sorted
 	// path is cheaper than the unsorted one rather than costing the 153 us/row this
 	// procedure's batching exists to avoid.
-	if table_sorted(doc) {
+	if table_indexed(doc) {
 		pos, pok := table_sort_pos(doc, s)
 		if !pok {return out}
 		for i in 0 ..< len(out) {
@@ -1181,8 +1207,14 @@ table_sorted :: #force_inline proc(doc: ^Document) -> bool {
 	return doc != nil && doc.table && doc.table_sort.nkeys > 0 && len(doc.table_sort.perm) > 0
 }
 
-// Data rows the live sort covers.
+// Data rows the live VIEW covers -- the filter's row set when one is on, the
+// sort's otherwise.
+//
+// The filter is asked first because it is the narrower answer: with both live,
+// `view` is `perm` with the hidden rows removed, so it is the sort's order and the
+// filter's membership at once.
 table_sort_rows :: #force_inline proc(doc: ^Document) -> int {
+	if table_filtered(doc) {return len(doc.table_filter.view)}
 	return len(doc.table_sort.perm) if table_sorted(doc) else 0
 }
 
@@ -1191,6 +1223,11 @@ table_sort_rows :: #force_inline proc(doc: ^Document) -> int {
 // own entry, so under a sort the absolute row index costs nothing at all and needs
 // neither Line_Index nor a refusal path.
 table_sort_perm_row :: proc(doc: ^Document, pos: int) -> (j: int, ok: bool) {
+	if table_filtered(doc) {
+		v := &doc.table_filter.view
+		if pos < 0 || pos >= len(v) {return 0, false}
+		return int(v[pos]), true
+	}
 	s := &doc.table_sort
 	if pos < 0 || pos >= len(s.perm) {return 0, false}
 	return int(s.perm[pos]), true
@@ -1200,8 +1237,10 @@ table_sort_perm_row :: proc(doc: ^Document, pos: int) -> (j: int, ok: bool) {
 // both resolve through table_row_start to reach.
 table_sort_row_at :: proc(doc: ^Document, pos: int) -> (off: int, ok: bool) {
 	s := &doc.table_sort
-	if pos < 0 || pos >= len(s.perm) {return 0, false}
-	j := int(s.perm[pos])
+	// One indirection more when a filter is on, and nothing else changes: `view`
+	// holds the same data-row indices `perm` does, minus the hidden ones.
+	j, jok := table_sort_perm_row(doc, pos)
+	if !jok {return 0, false}
 	if j < 0 || j >= len(s.offs) {return 0, false}
 	return s.offs[j], true
 }
@@ -1217,7 +1256,9 @@ table_sort_row_at :: proc(doc: ^Document, pos: int) -> (off: int, ok: bool) {
 // leave doc.top mid-line, and refusing there would blank the whole grid.
 table_sort_pos :: proc(doc: ^Document, off: int) -> (pos: int, ok: bool) {
 	s := &doc.table_sort
-	if len(s.offs) == 0 || len(s.rank) != len(s.offs) {return 0, false}
+	filtered := table_filtered(doc)
+	if len(s.offs) == 0 {return 0, false}
+	if !filtered && len(s.rank) != len(s.offs) {return 0, false}
 	lo, hi := 0, len(s.offs)
 	for lo < hi {
 		mid := (lo + hi) / 2
@@ -1225,7 +1266,20 @@ table_sort_pos :: proc(doc: ^Document, off: int) -> (pos: int, ok: bool) {
 	}
 	j := lo - 1
 	if j < 0 {return 0, false}
-	return int(s.rank[j]), true
+	if !filtered {return int(s.rank[j]), true}
+	// FILTERED: the row containing `off` may be HIDDEN, which the sort never had to
+	// answer for. Walk forward to the next visible row rather than refusing -- the
+	// same forgiveness this proc already extends to an offset landing mid-line, and
+	// for the same reason: doc.top is written by six routes (a find jump, a session
+	// restore, a clamp) and refusing here would blank the whole grid.
+	f := &doc.table_filter
+	if j < len(f.vrank) && f.vrank[j] >= 0 {return int(f.vrank[j]), true}
+	for k := j + 1; k < len(f.vrank); k += 1 {
+		if f.vrank[k] >= 0 {return int(f.vrank[k]), true}
+	}
+	// Everything from here down is hidden: park on the last visible row.
+	if len(f.view) > 0 {return len(f.view) - 1, true}
+	return 0, false
 }
 
 // Drop the sort. Idempotent, and safe on a zero-value Table_Sort (Odin's dynamic
@@ -1349,6 +1403,204 @@ sort_less_keys :: proc(a, b: Sort_Item, user_data: rawptr) -> bool {
 		}
 	}
 	return a.row < b.row
+}
+
+// --- the column filter -----------------------------------------------------
+//
+// *"would also be nice to filter columns, and have a dropdown list of all items
+// in the column to filter like powerbi/excel has."* (Wyatt, 2026-07-31). The
+// multi-column sort half of that request shipped as v0.36.0; this is the rest.
+//
+// `view` IS THE WHOLE TRICK. It is the sort's `perm` with the hidden rows removed
+// -- data-row indices in DISPLAY order -- so every consumer that already resolves
+// a visible row through table_sort_row_at keeps working by reading one more
+// indirection, and the filter composes with the sort for free rather than being a
+// second row model beside it. With no sort it is the same array built from file
+// order, which is what lets a filter exist without one.
+//
+// THE RISK THIS CARRIES is the one the sort carried: table_row_start is what the
+// cell editor resolves a byte range through, and a filter changes which data row a
+// visible row index means. table_edit_line_intact -- which compares the edited
+// line's own BYTES, captured at edit start -- is the backstop, and the test that
+// drives an edit across a filter change is the one that matters in this file.
+Table_Filter :: struct {
+	// IS A FILTER LIVE. An explicit flag rather than a sentinel in `col`, because
+	// Odin's zero value for an int is 0 and 0 IS A VALID COLUMN -- so a fresh
+	// document read as "filtered by column 0", built a view over every row, and
+	// every consumer of the row set then went through the filter's path instead of
+	// the sort's. Sort_Key.col records this exact trap for the exact same reason
+	// and pays for it with an explicit TABLE_SORT_NONE reset; a bool costs nothing
+	// and cannot be got wrong.
+	active:  bool,
+	col:     int,
+	// Distinct values in FIRST-SEEN order, not sorted: the list is a picture of
+	// the column, and sorting it hides whether the data is grouped. Owned.
+	values:  [dynamic]string,
+	on:      [dynamic]bool, // parallel to `values`
+	view:    [dynamic]i32, // data-row indices, display order
+	vrank:   [dynamic]i32, // data row -> display position, -1 when hidden
+	// The column had more rows than TABLE_SORT_MAX, so the distinct list was
+	// refused. Kept so the summary row can say so -- the same reason
+	// Table_Sort.refused exists, and the same limit, because a partial list of
+	// distinct values reads as complete once you are scrolling it.
+	refused: bool,
+}
+
+// Is a filter live on this document? Same shape as table_sorted, including the
+// doc.table term and for the same reason: a filter left behind by a view that has
+// been switched off must not steer the text view's row model.
+table_filtered :: #force_inline proc(doc: ^Document) -> bool {
+	return doc != nil && doc.table && doc.table_filter.active
+}
+
+// Does this document resolve visible rows through an INDEX (offs + view/perm)
+// rather than by walking lines? True for a sort, a filter, or both.
+//
+// One predicate, because table_row_start branches on it and so does every producer
+// below -- and a filter that narrowed the row set while table_row_start still
+// walked lines would resolve a visible row to a hidden one, which is the cell
+// editor writing to a row the user cannot see.
+table_indexed :: #force_inline proc(doc: ^Document) -> bool {
+	return table_sorted(doc) || table_filtered(doc)
+}
+
+// Drop the filter. Idempotent, and safe on a zero value.
+table_filter_clear :: proc(doc: ^Document) {
+	if doc == nil {return}
+	f := &doc.table_filter
+	f.active, f.col, f.refused = false, TABLE_SORT_NONE, false
+	for v in f.values {delete(v)}
+	clear(&f.values)
+	clear(&f.on)
+	clear(&f.view)
+	clear(&f.vrank)
+}
+
+// Collect the DISTINCT values of `col`, in first-seen order, and start with all of
+// them selected.
+//
+// BOUNDED AND REFUSING, exactly as table_sort_build is and at the same limit. A
+// distinct list is a whole-file scan by definition -- there is no viewport-bounded
+// version of "what values does this column contain" -- so it hits the same wall
+// the sort hit, and gives the same answer: past TABLE_SORT_MAX rows it refuses and
+// says so. A truncated list is worse than none, because it reads as complete the
+// moment you start scrolling it.
+//
+// It also rebuilds `offs`, because a filter needs the row index whether or not a
+// sort exists -- table_sort_build is the only other thing that fills it, and a
+// filter on an unsorted document would otherwise have no row index at all.
+table_filter_open :: proc(doc: ^Document, col: int) -> bool {
+	if doc == nil || col < 0 {return false}
+	if doc.table_editing {table_edit_commit(doc, resort = false)}
+	table_filter_clear(doc)
+	f := &doc.table_filter
+
+	if n, exact := table_row_count(doc); exact && n > TABLE_SORT_MAX {
+		f.col, f.refused = col, true
+		return false
+	}
+	first, fok := table_first_data_row(doc)
+	if !fok {return false}
+	delim := doc.table_delim if doc.table_delim != 0 else ','
+
+	// offs is rebuilt here rather than reused: a sort may not exist, and one that
+	// does was built against the same bytes, so re-walking costs one pass and
+	// removes a "was it built?" question from every caller.
+	clear(&doc.table_sort.offs)
+	buf: [RENDER_LINE_CAP]u8
+	key: [RENDER_LINE_CAP]u8
+	p := first
+	for {
+		if p >= doc.pt.length {break}
+		if len(doc.table_sort.offs) >= TABLE_SORT_MAX {
+			table_filter_clear(doc)
+			f.col, f.refused = col, true
+			return false
+		}
+		end := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+		n := base.pt_read(&doc.pt, p, buf[:min(end - p, len(buf))])
+		if n > 0 && buf[n - 1] == '\r' {n -= 1}
+		append(&doc.table_sort.offs, p)
+		t := strings.trim_space(csv_field_into(string(buf[:n]), delim, col, key[:]))
+		// Linear over the distinct set. A column with thousands of distinct values
+		// makes this quadratic, which is why TABLE_FILTER_VALUES_MAX exists: past
+		// that the list is not something a person can pick from anyway, and the
+		// scan stops adding rather than slowing down without end.
+		seen := false
+		for v in f.values {
+			if v == t {seen = true;break}
+		}
+		if !seen && len(f.values) < TABLE_FILTER_VALUES_MAX {
+			append(&f.values, strings.clone(t))
+			append(&f.on, true) // everything ticked: you untick what you don't want
+		}
+		if end >= doc.pt.length {break}
+		p = end + 1
+	}
+	if base.pt_faulted(&doc.pt) || len(doc.table_sort.offs) == 0 {
+		table_filter_clear(doc)
+		return false
+	}
+	f.col, f.active = col, true
+	table_filter_apply(doc)
+	return true
+}
+
+// More distinct values than a dropdown is worth. Past this the list stops growing
+// -- a column of 5,000 unique ids is not something anyone picks from with
+// checkboxes, and the alternative is a scan that degrades quadratically for a UI
+// nobody can use.
+TABLE_FILTER_VALUES_MAX :: 512
+
+// Rebuild `view` and `vrank` from the current selection.
+//
+// DISPLAY ORDER COMES FROM THE SORT when there is one: the filter walks `perm` and
+// keeps what passes, so composition is "narrow the sorted list" rather than a
+// second ordering. Without a sort it walks file order. That is the whole of
+// "filter then sort", and it is why there is no third row model.
+table_filter_apply :: proc(doc: ^Document) {
+	if doc == nil {return}
+	f := &doc.table_filter
+	s := &doc.table_sort
+	clear(&f.view)
+	resize(&f.vrank, len(s.offs))
+	for i in 0 ..< len(f.vrank) {f.vrank[i] = -1}
+	if !f.active {return}
+
+	delim := doc.table_delim if doc.table_delim != 0 else ','
+	buf: [RENDER_LINE_CAP]u8
+	key: [RENDER_LINE_CAP]u8
+	keep :: proc(f: ^Table_Filter, val: string) -> bool {
+		for v, i in f.values {
+			if v == val {return f.on[i]}
+		}
+		// A value the list never saw -- past TABLE_FILTER_VALUES_MAX -- is KEPT.
+		// Hiding rows on the strength of a list that stopped early would remove
+		// data the user was never shown a checkbox for.
+		return true
+	}
+	add :: proc(doc: ^Document, f: ^Table_Filter, row: int, delim: u8, buf, key: []u8) {
+		off := f_off(doc, row)
+		if off < 0 {return}
+		end := base.pt_line_end_cap(&doc.pt, off, RENDER_LINE_CAP)
+		n := base.pt_read(&doc.pt, off, buf[:min(end - off, len(buf))])
+		if n > 0 && buf[n - 1] == '\r' {n -= 1}
+		t := strings.trim_space(csv_field_into(string(buf[:n]), delim, f.col, key))
+		if !keep(f, t) {return}
+		f.vrank[row] = i32(len(f.view))
+		append(&f.view, i32(row))
+	}
+	if table_sorted(doc) {
+		for r in s.perm {add(doc, f, int(r), delim, buf[:], key[:])}
+	} else {
+		for r in 0 ..< len(s.offs) {add(doc, f, r, delim, buf[:], key[:])}
+	}
+}
+
+@(private = "file")
+f_off :: proc(doc: ^Document, row: int) -> int {
+	if row < 0 || row >= len(doc.table_sort.offs) {return -1}
+	return doc.table_sort.offs[row]
 }
 
 // Parse a cell that table_is_number has already accepted. Group separators are
@@ -1569,6 +1821,15 @@ table_sort_build :: proc(doc: ^Document, keys: []Sort_Key) -> bool {
 	// `perm` become true together and table_sorted cannot see a half-built sort.
 	s.keys = kv
 	s.nkeys = nk
+	// A LIVE FILTER IS RE-APPLIED against the order just built. `view` is `perm`
+	// with the hidden rows removed, so a re-sort that left it alone would leave the
+	// grid showing the right rows in the OLD order -- and `offs` was rebuilt above,
+	// so `vrank` would be indexing a different array than the one it was made for.
+	//
+	// Here rather than in each of table_sort_set/add/drop/cycle: this is the one
+	// place `perm` is produced, and four call sites is four chances to miss the
+	// fifth -- the argument this file has already made twice.
+	if doc.table_filter.active {table_filter_apply(doc)}
 	return true
 }
 
@@ -2010,9 +2271,9 @@ table_sort_shift :: proc(doc: ^Document, at, n: int, text: []u8) {
 	s := &doc.table_sort
 	if s.nkeys == 0 || len(s.offs) == 0 {return}
 	for b in text {
-		if b == '\n' {table_sort_clear(doc);return}
+		if b == '\n' {table_sort_clear(doc);table_filter_clear(doc);return}
 	}
-	if n > 0 && sort_range_has_newline(doc, at, n) {table_sort_clear(doc);return}
+	if n > 0 && sort_range_has_newline(doc, at, n) {table_sort_clear(doc);table_filter_clear(doc);return}
 	d := len(text) - n
 	if d == 0 {return}
 	// The everyday case first, for the same reason ckpt_repair takes it first: an
@@ -2061,7 +2322,7 @@ sort_max_pos :: #force_inline proc(doc: ^Document, rows: int) -> int {
 // last row happens to have gone. It is clamped into range here and it is a known
 // gap, recorded rather than papered over.
 table_sort_snap :: proc(doc: ^Document, rows: int) {
-	if !table_sorted(doc) {return}
+	if !table_indexed(doc) {return}
 	pos, ok := table_sort_pos(doc, doc.top)
 	if !ok {pos = 0}
 	if off, ok2 := table_sort_row_at(doc, clamp(pos, 0, sort_max_pos(doc, rows))); ok2 {doc.top = off}
@@ -2069,7 +2330,7 @@ table_sort_snap :: proc(doc: ^Document, rows: int) {
 
 // The wheel and the page keys: move by `delta` SORTED rows.
 table_sort_scroll :: proc(doc: ^Document, delta, rows: int) -> bool {
-	if !table_sorted(doc) {return false}
+	if !table_indexed(doc) {return false}
 	pos, pok := table_sort_pos(doc, doc.top)
 	if !pok {pos = 0}
 	if off, ok := table_sort_row_at(doc, clamp(pos + delta, 0, sort_max_pos(doc, rows))); ok {doc.top = off}
@@ -2078,7 +2339,7 @@ table_sort_scroll :: proc(doc: ^Document, delta, rows: int) -> bool {
 
 // Ctrl+End, and the clamp every other scroll ends with.
 table_sort_max_top :: proc(doc: ^Document, rows: int) -> (off: int, ok: bool) {
-	if !table_sorted(doc) {return 0, false}
+	if !table_indexed(doc) {return 0, false}
 	return table_sort_row_at(doc, sort_max_pos(doc, rows))
 }
 
@@ -2086,7 +2347,7 @@ table_sort_max_top :: proc(doc: ^Document, rows: int) -> (off: int, ok: bool) {
 // byte-proportional, and that is not a compromise: under a permutation the bytes
 // are in no order at all, so a byte fraction names nothing a reader could aim at.
 table_sort_scroll_frac :: proc(doc: ^Document, frac: f32, rows: int) -> bool {
-	if !table_sorted(doc) {return false}
+	if !table_indexed(doc) {return false}
 	mx := sort_max_pos(doc, rows)
 	if off, ok := table_sort_row_at(doc, clamp(int(frac * f32(mx) + 0.5), 0, mx)); ok {doc.top = off}
 	return true
@@ -2097,7 +2358,7 @@ table_sort_scroll_frac :: proc(doc: ^Document, frac: f32, rows: int) -> bool {
 // -- vscrollbar_geo's comment records what a mismatched pair costs (the document
 // creeping while the thumb is held perfectly still).
 table_sort_thumb :: proc(doc: ^Document, rows: int) -> (frac, size: f32, ok: bool) {
-	if !table_sorted(doc) {return 0, 0, false}
+	if !table_indexed(doc) {return 0, 0, false}
 	n := table_sort_rows(doc)
 	mx := sort_max_pos(doc, rows)
 	pos, pok := table_sort_pos(doc, doc.top)
