@@ -7012,6 +7012,64 @@ direction. A test asserts `xml_format` is unchanged by the new predicate.
   array says so; worth knowing before the next row.
 - §8's **wrap indent** is now the last item owed from that section.
 
+## 6by. The settings arrows never worked (2026-08-02, v0.58.0, branch `fix/settings-row-keys`)
+
+> *"i can't change the line number setting"* … *"it's not responding to the left/right arrow on the
+> settings menu at all"* … *"it just stays off"* (Wyatt, on v0.57.0)
+
+Reported against the row added an hour earlier, and **the row was not the bug.** Every boolean row on
+the settings page had ignored Left/Right since the page was written; the new one is merely what made
+someone try.
+
+### The root cause, and why the first look missed it
+
+Left and Right *are* bound in the `.Settings` context (`.Right → Settings_Inc`, `.Left →
+Settings_Dec`), and both reach `settings_toggle_row(rc, row, ±1)`. Every boolean row was written
+`if dir == 0 {x = !x}` — **Enter only** — so an arrow key arrived, matched the case, and did nothing.
+`features.md` has always advertised both: *"`Enter` activates · `←`/`→` step a value"*.
+
+Five rows were affected: Restore session, Word wrap, Table default view, Remember last view, and Line
+numbers. A two-valued setting lands on the other value whichever way it is stepped, so `dir` carries
+no information here and is ignored rather than being turned into an Off-is-left rule nothing else in
+the page follows.
+
+**The first diagnostic pass got it wrong in an instructive way.** It drove every row with Enter and
+*fell back* to Right only when Enter did nothing — and reported all rows OK, including the one being
+reported as broken. A fallback collapses two assertions into one and passes a row that answers Enter
+and ignores the arrows, which is the exact defect. The check now tests the two affordances
+**separately**, and that is what the report was really about: Wyatt was pressing arrows, and the first
+version of the test agreed with the bug.
+
+### It found a second dead row nobody had reported
+
+**"Interface font" answered nothing at all — not Enter, not the arrows — on a fresh Settings page.**
+`font_choices` is built by `font_choices_refresh`, which ran only when the **Font page** opened.
+`fontpage.odin` fills it lazily (`if len(font_choices) == 0 {font_choices_refresh()}`); the Settings
+page's case 9 was guarded on `len(font_choices) > 0` with no refresh, so opening Settings without ever
+visiting Font left it cycling an empty slice. The guard read as "no fonts installed" when it meant
+"nobody has looked yet". Fixed with the same lazy call `fontpage.odin` already had.
+
+Two rows out of eleven were dead in different ways, and **neither was covered by anything** —
+`settingstest` checked the save/load round trip and never once pressed a key at the page.
+
+### What was owed and is now paid
+
+`settingstest` drives the real `settings_toggle_row` over **every** row and asserts Enter and
+Left/Right independently. Two rows legitimately *reset* rather than cycle (Zoom, Tab width), so Enter
+is a correct no-op when the value is already the default — the fixture moves both off it first rather
+than failing them for behaving correctly, which the first version did.
+
+Sabotaged both ways in one build: restoring `if dir == 0` on Line numbers and deleting the lazy
+refresh fails rows 10 and 09 respectively, each naming itself.
+
+### The lesson, which is not "test the new row"
+
+A row that draws a label and a value but answers no key **looks identical to a working one in a
+screenshot**, and this environment cannot press a key at it — so the only thing that could ever have
+caught either row is a check that drives the dispatch. The generalisable form: *when a table drives
+behaviour by index, test every index, not the one just added.* Both defects here predate the batch
+that got blamed for them.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

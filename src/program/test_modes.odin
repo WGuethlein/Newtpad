@@ -10558,6 +10558,63 @@ when NEWTPAD_TESTS {
 
 			// Zoom must land on the steps, clamp at both ends, and compose with the
 			// font size rather than replacing it.
+			// EVERY row must do something, and nothing tested that until a shipped
+			// row turned out not to (2026-08-02). A row that draws a label and a
+			// value but answers no key is indistinguishable from a working one in a
+			// screenshot, which is why this drives the real dispatch -- Enter, then
+			// Right -- over the whole table rather than spot-checking the new row.
+			// EVERY row must answer BOTH affordances the page advertises. features.md
+			// documents them as "Enter activates, Left/Right step a value", and
+			// nothing tested either until two shipped rows turned out to answer
+			// neither (2026-08-02, Wyatt: "i can't change the line number setting",
+			// "it just stays off").
+			//
+			// Enter and Left/Right are checked SEPARATELY and that is the whole
+			// point. A first version of this tried Enter, then fell back to Right
+			// only if Enter did nothing -- which passes a row that answers Enter and
+			// ignores the arrows, i.e. exactly the bug being reported. A fallback
+			// turns two assertions into one and hides whichever half is broken.
+			fmt.println("--- every settings row answers Enter, and Left/Right ---")
+			{
+				tr: plat.Text
+				plat.text_load_faces(&tr)
+				wr: plat.Window
+				wr.dpi = 96
+				ar: App
+				ar.settings = settings_default()
+				rcr := Render_Ctx{window = &wr, text = &tr, app = &ar}
+				// The Interface font row steps a list built by font_choices_refresh,
+				// which the Font PAGE fills lazily and the Settings page did not --
+				// so this deliberately does NOT pre-populate it. Opening Settings
+				// without ever opening Font is the user's path, and it is the one
+				// that was dead.
+				for row in 0 ..< settings_row_count() {
+					// Enter. Two rows RESET to a default rather than cycling (Zoom and
+					// Tab width), so Enter is a legitimate no-op when the value is
+					// already the default -- move both off it first, or the check
+					// fails them for behaving correctly.
+					ar.settings.tab_width = plat.TAB_WIDTH_DEFAULT + 1
+					ar.settings.zoom_pct = ZOOM_STEPS[len(ZOOM_STEPS) - 1]
+					before := ar.settings
+					settings_toggle_row(&rcr, row, 0)
+					ent := ar.settings != before
+					// Left/Right, from a fresh snapshot so the two are independent.
+					before2 := ar.settings
+					settings_toggle_row(&rcr, row, 1)
+					step := ar.settings != before2
+					if !step {
+						settings_toggle_row(&rcr, row, -1)
+						step = ar.settings != before2
+					}
+					if !ent {bad += 1}
+					if !step {bad += 1}
+					fmt.printfln(
+						"  %-4s row %2d %-28s enter=%v arrows=%v",
+						"ok" if ent && step else "FAIL", row, SETTINGS_ROWS[row].label, ent, step,
+					)
+				}
+			}
+
 			fmt.println("--- zoom ---")
 			t2: plat.Text
 			plat.text_load_faces(&t2)

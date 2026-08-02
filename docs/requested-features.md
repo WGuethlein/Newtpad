@@ -14,6 +14,49 @@ once and would be a reopening, not a new idea.
 
 ## 1. Asked for directly, unscheduled
 
+### Newtpad as Explorer's text preview handler — asked for 2026-08-02
+
+Wyatt: *"i want to be able to use newtpad as the text previewer in explorer"* — i.e. select a `.txt`,
+`.log`, `.json`, `.csv` in Explorer and have **Newtpad render the Preview Pane**, rather than the
+built-in handler (which is Notepad-grade and refuses most extensions outright).
+
+**Recorded, not scoped.** Everything below is from reading, not from having built one, and the API
+details want checking against Microsoft's docs before anyone plans work off them.
+
+**What Explorer actually requires is an `IPreviewHandler` COM server, and that is the whole problem.**
+It is registered per extension under the preview-handler shell-extension CLSID
+(`{8895b1c6-b41f-4c1c-a562-0d564250836f}` — verify), instantiated by Explorer, and hosted **inside
+`prevhost.exe`**, a surrogate process. Consequences, in the order they bite:
+
+- **It must be a DLL, not our exe.** Newtpad is one standalone executable, and CLAUDE.md's scope row
+  makes that a product property ("size reflects absence of complexity. No install required"). A
+  preview handler means a **second shipped artifact** and a **registration step**, which is the first
+  thing in this product that genuinely cannot work without an installer. That is the decision to take
+  first, and it is Wyatt's: is the Explorer integration worth ending "no install required"?
+- **Our renderer would be running in someone else's process, in a window we do not own.** The handler
+  is handed a parent `HWND` and a rect and must draw inside it, resize with it, and honour
+  `IPreviewHandlerVisuals` for background and font. D3D11 + DXGI flip-model in a host-supplied child
+  window inside a restricted surrogate is plausible but unproven here, and `prevhost.exe` runs at
+  reduced integrity — worth checking early whether device creation even succeeds there.
+- **A preview handler is not an editor.** It is read-only by contract: no caret, no typing, no menus.
+  So this is not "run Newtpad in a pane" — it is a **new front end over the existing viewer** (piece
+  tree, lexer, table view, markdown preview), which is the honest way to scope it and also the reason
+  it is not absurd: the read-only half of Newtpad is most of what makes the preview worth having.
+- **It must never lock the file.** CLAUDE.md's hard rule already says so, and it matters more here:
+  Explorer previews whatever the user clicks, and a handler holding a handle blocks renames and
+  deletes from the very window the user is standing in. `IInitializeWithFile` vs
+  `IInitializeWithStream` is a real decision — the stream form is what Microsoft recommends and it
+  interacts with our mmap path.
+
+**What it buys, and why it is a good fit despite the above:** the built-in preview refuses most of the
+extensions Newtpad exists to open, and this is the one integration that puts the product in front of
+the user without them launching it. It is also the natural companion to a **thumbnail handler**
+(`IThumbnailProvider`), a separate interface with the same packaging problem — decide them together or
+the DLL gets built twice.
+
+**Not blocked on anything technical; blocked on the packaging decision.** Do not start it as a
+"small feature".
+
 ### Format minified JavaScript — asked for 2026-08-02, deliberately NOT built
 
 Wyatt, after JSON/CSS/XML shipped: *"add js for later future request"*. Recorded here rather than

@@ -460,11 +460,21 @@ zoom_adjust :: proc(rc: ^Render_Ctx, dir: int) {
 
 settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 	s := &rc.app.settings
+	// A BOOLEAN ROW FLIPS ON ENTER *AND* ON LEFT/RIGHT. It used to answer only
+	// Enter (`if dir == 0`), while the page advertises both -- features.md says
+	// "Enter activates, Left/Right step a value" -- so pressing an arrow on
+	// "Line numbers" did nothing at all and the setting stayed Off. Reported by
+	// Wyatt on the newest row, but it was true of all five booleans since the
+	// page was written; the new row is only what made someone try.
+	//
+	// Stepping a two-valued setting in either direction lands on the other value,
+	// so direction carries no information here and is deliberately ignored rather
+	// than being turned into an Off-is-left/On-is-right rule nothing else follows.
 	switch row {
 	case 0:
-		if dir == 0 {s.restore_session = !s.restore_session}
+		s.restore_session = !s.restore_session
 	case 1:
-		if dir == 0 {s.wrap_default = !s.wrap_default}
+		s.wrap_default = !s.wrap_default
 	case 2:
 		zoom_adjust(rc, dir if dir != 0 else 0) // Enter on this row resets
 		return // zoom_adjust already applied and saved
@@ -477,9 +487,9 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		step := dir if dir != 0 else 1 // Enter cycles forward; Left/Right step
 		s.md_default = Md_Mode((int(s.md_default) + step + n) % n)
 	case 5:
-		if dir == 0 {s.table_default = !s.table_default}
+		s.table_default = !s.table_default
 	case 6:
-		if dir == 0 {s.remember_views = !s.remember_views}
+		s.remember_views = !s.remember_views
 	case 7:
 		names := theme_available_names(context.temp_allocator)
 		cur := 0
@@ -498,6 +508,14 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		// offers, so the chrome can never land on a family that is not there.
 		// The document's font stays on Edit > Font: it is reached while working,
 		// where this is set once.
+		//
+		// FILLED LAZILY HERE, exactly as fontpage.odin does. The list is built by
+		// font_choices_refresh, which only ran when the Font PAGE opened -- so
+		// opening Settings without ever visiting Font left this row cycling an
+		// empty slice and doing nothing, silently, for both Enter and the arrows.
+		// The guard below then read as "no fonts installed" when it really meant
+		// "nobody has looked yet". Found by the every-row check in settingstest.
+		if len(font_choices) == 0 {font_choices_refresh()}
 		if len(font_choices) > 0 {
 			cur := 0
 			for n, i in font_choices {
@@ -520,7 +538,7 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 			s.tab_width = clamp(s.tab_width + dir, plat.TAB_WIDTH_MIN, plat.TAB_WIDTH_MAX)
 		}
 	case 10:
-		if dir == 0 {s.gutter = !s.gutter}
+		s.gutter = !s.gutter
 	}
 	settings_apply(rc)
 	settings_save(s^)
