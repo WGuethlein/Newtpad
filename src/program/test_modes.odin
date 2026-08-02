@@ -3972,6 +3972,9 @@ when NEWTPAD_TESTS {
 			ts_case_headerless(&bad)
 			ts_case_filter(&bad)
 			ts_case_filter_ui(&bad)
+			ts_case_filter_uncapped(&bad)
+			ts_case_filter_order(&bad)
+			ts_case_filter_mouse(&bad)
 			ts_case_filter_edit_seam(&bad)
 			ts_case_bad_vector(&bad)
 			ts_case_precedence(&bad)
@@ -5944,9 +5947,12 @@ when NEWTPAD_TESTS {
 			li_chk(bad, table_filter_open(&d, 0), "a filter opens on column 0")
 			f := &d.table_filter
 			li_chk(bad, len(f.values) == 3, fmt.tprintf("...with three distinct values (%d)", len(f.values)))
-			// FIRST-SEEN ORDER, not sorted: the list is a picture of the column, and
-			// sorting it hides whether the data is grouped.
-			li_chk(bad, len(f.values) == 3 && f.values[0] == "b" && f.values[1] == "a" && f.values[2] == "c", fmt.tprintf("...in first-seen order, not sorted (%v)", f.values))
+			// ASCENDING, not first-seen. The fixture's column 0 is `b, a, b, c`, so
+			// first-seen order is `b, a, c` and this assertion fails against it --
+			// which is the point: it used to assert exactly that, on the argument that
+			// the list should be "a picture of the column". Wyatt overruled it from
+			// live use (2026-08-02).
+			li_chk(bad, len(f.values) == 3 && f.values[0] == "a" && f.values[1] == "b" && f.values[2] == "c", fmt.tprintf("...in ascending order, not first-seen (%v)", f.values))
 			all_on := true
 			for on in f.on {if !on {all_on = false}}
 			li_chk(bad, all_on, "...all ticked, so the grid is unchanged until you untick something")
@@ -5954,7 +5960,9 @@ when NEWTPAD_TESTS {
 			li_chk(bad, table_sort_rows(&d) == 4, fmt.tprintf("...and every row still shows (%d of 4)", table_sort_rows(&d)))
 
 			// Untick "b" -- the value that appears twice, so two rows go at once.
-			f.on[0] = false
+			// Index 1 under the ascending order (a, b, c); it was index 0 when the
+			// list came back first-seen.
+			f.on[1] = false
 			table_filter_apply(&d)
 			li_chk(bad, table_sort_rows(&d) == 2, fmt.tprintf("unticking `b` hides both its rows (%d left)", table_sort_rows(&d)))
 			li_chk(bad, ts_order(&d) == "a,2|c,4", fmt.tprintf("...leaving the others in file order (%q)", ts_order(&d)))
@@ -5980,7 +5988,7 @@ when NEWTPAD_TESTS {
 			d := ts_doc(src, 2)
 			defer doc_close(&d)
 			table_filter_open(&d, 0)
-			d.table_filter.on[0] = false
+			d.table_filter.on[1] = false // "b", twice over -- index 1 in ascending order
 			table_filter_apply(&d)
 			li_chk(bad, table_sort_rows(&d) == 2, "precondition: two rows hidden")
 			table_filter_clear(&d)
@@ -6019,7 +6027,10 @@ when NEWTPAD_TESTS {
 		// EACH VALUE ROW KNOWS WHICH VALUE IT IS, through payload -- the whole
 		// reason Menu_Item grew that field.
 		li_chk(bad, items[3].payload == 0 && items[4].payload == 1 && items[5].payload == 2, fmt.tprintf("...and each value row carries its own index (%d, %d, %d)", items[3].payload, items[4].payload, items[5].payload))
-		li_chk(bad, menu_item_label(&a, items[3]) == "b", fmt.tprintf("...whose label is the value, not the command's title (%q)", menu_item_label(&a, items[3])))
+		li_chk(bad, menu_item_label(&a, items[3]) == "a", fmt.tprintf("...whose label is the value, not the command's title (%q)", menu_item_label(&a, items[3])))
+		// The first value row is "a" because the list ASCENDS. Under the old
+		// first-seen order it was "b".
+		li_chk(bad, menu_item_label(&a, items[5]) == "c", fmt.tprintf("...and the rows run a, b, c down the dropdown (%q at the end)", menu_item_label(&a, items[5])))
 		all_ticked := true
 		for it in items {
 			if it.cmd == .Table_Filter_Toggle && !it.checked(&a, it) {all_ticked = false}
@@ -6029,7 +6040,7 @@ when NEWTPAD_TESTS {
 
 		// Toggling one row hides its rows. The payload travels through the menu the
 		// way ctx_col does, so this drives it the same way a click would.
-		a.menu.ctx_payload = 0 // the value "b"
+		a.menu.ctx_payload = 1 // the value "b", index 1 of the ascending list
 		command_dispatch(.Table_Filter_Toggle, {}, &a, nil, &t, 10)
 		li_chk(bad, table_sort_rows(d) == 2, fmt.tprintf("unticking a value hides its rows (%d left)", table_sort_rows(d)))
 		li_chk(bad, !items[1].checked(&a, items[1]), "...and (Select All) is no longer ticked")
@@ -6045,7 +6056,7 @@ when NEWTPAD_TESTS {
 		// THE SUMMARY MUST RECONCILE WITH THE GRID. The row count is the FILE's --
 		// table_row_count walks lines and knows nothing about a filter -- so the
 		// line has to say how many are hidden or it reports a different file.
-		a.menu.ctx_payload = 0
+		a.menu.ctx_payload = 1 // "b" again -- the only value with two rows
 		command_dispatch(.Table_Filter_All, {}, &a, nil, &t, 10) // everything back on
 		command_dispatch(.Table_Filter_Toggle, {}, &a, nil, &t, 10) // ...minus "b"
 		text := table_summary_text(d)
@@ -6090,7 +6101,9 @@ when NEWTPAD_TESTS {
 				li_chk(bad, consumed && cmd == .Table_Filter_Toggle, fmt.tprintf("...and the click yields the toggle command (%v, consumed %v)", cmd, consumed))
 				li_chk(bad, a.menu.ctx_payload == 0, fmt.tprintf("...carrying that row's own value index (%d)", a.menu.ctx_payload))
 				command_dispatch(cmd, {}, &a, nil, &ht, 10)
-				li_chk(bad, table_sort_rows(d) == 2, fmt.tprintf("...and the grid really loses the rows (%d of 4)", table_sort_rows(d)))
+				// Value index 0 is "a" under the ascending order, and "a" has ONE row.
+				// It was "b" (two rows) while the list came back first-seen.
+				li_chk(bad, table_sort_rows(d) == 3, fmt.tprintf("...and the grid really loses the row (%d of 4)", table_sort_rows(d)))
 
 				// A CLICK ON THE SEARCH BOX ITSELF does nothing -- it is a field, not a
 				// row. Without item_h giving it a full row this coordinate lands on
@@ -6175,6 +6188,203 @@ when NEWTPAD_TESTS {
 				li_chk(bad, menu_visible_rows(&ct, &b, 1280, H) < len(menu_items(&b)), "...so there is something to scroll, which is what the scrollbar draws")
 			}
 		}
+	}
+
+	// EVERY DISTINCT VALUE GETS A CHECKBOX -- the defect Wyatt hit on a 1,000-row
+	// CSV, 2026-08-02: *"when you filter, and deselect all it shows rows still"*.
+	//
+	// TABLE_FILTER_VALUES_MAX capped the distinct list at 512, and keep() KEPT any
+	// value the list never saw, so rows carrying the 513th distinct value onward
+	// could not be hidden by any combination of ticks -- including none of them. His
+	// First Name column had 536 distinct values and 27 unhideable rows.
+	//
+	// THE FIXTURE HAS TO EXCEED THE OLD CAP or this case cannot fail: at 512 values
+	// or fewer every value is listed and the bug is invisible. 600 is comfortably
+	// past it, and the assertion is table_sort_rows == 0 with nothing ticked, which
+	// the bug makes 88 (600 - 512) rather than merely a different number.
+	ts_case_filter_uncapped :: proc(bad: ^int) {
+		fmt.println("-- no value cap: every distinct value is controllable --")
+		N :: 600
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		fmt.sbprint(&sb, "k,v\n")
+		for i in 0 ..< N {fmt.sbprintf(&sb, "val%03d,%d\n", i, i)}
+		d := ts_doc(strings.to_string(sb), 2)
+		defer doc_close(&d)
+
+		li_chk(bad, table_filter_open(&d, 0), "a filter opens on a column of 600 distinct values")
+		f := &d.table_filter
+		li_chk(bad, len(f.values) == N, fmt.tprintf("...and lists every one of them (%d of %d)", len(f.values), N))
+		li_chk(bad, len(f.on) == N, fmt.tprintf("...with a tick per value (%d)", len(f.on)))
+		// The map and the array are two views of one thing, and a drift between them
+		// is a checkbox pointing at the wrong value. Round-trip every entry.
+		li_chk(bad, len(f.index) == N, fmt.tprintf("...and an index entry per value (%d)", len(f.index)))
+		round_trip := true
+		for v, i in f.values {
+			if j, ok := f.index[v]; !ok || j != i {round_trip = false;break}
+		}
+		li_chk(bad, round_trip, "...where index[values[i]] == i for every value, so no checkbox aims at the wrong row")
+
+		li_chk(bad, table_sort_rows(&d) == N, fmt.tprintf("precondition: everything ticked shows every row (%d)", table_sort_rows(&d)))
+		for i in 0 ..< len(f.on) {f.on[i] = false}
+		table_filter_apply(&d)
+		// THE ASSERTION THIS CASE EXISTS FOR. With the cap present this is 88.
+		li_chk(bad, table_sort_rows(&d) == 0, fmt.tprintf("unticking everything hides EVERY row, past the old 512 cap and all (%d left, want 0)", table_sort_rows(&d)))
+
+		// And one value back on shows exactly its own rows -- a value that only
+		// existed past the old cap, so it is one the bug could never have controlled.
+		//
+		// GUARDED, because the sabotage that proves this case is worth having is
+		// exactly what puts N-1 out of range: with the cap restored len(f.on) is 512
+		// and this indexed a 600th entry, so the run died on an array-bounds fault
+		// (0xC000008C) instead of printing the four FAIL lines above it. A test whose
+		// failure mode is a crash reports less than one whose failure mode is a
+		// message, even though both are technically "not green".
+		if len(f.on) == N {
+			f.on[N - 1] = true
+			table_filter_apply(&d)
+			li_chk(bad, table_sort_rows(&d) == 1, fmt.tprintf("...and re-ticking a value past the old cap shows exactly its rows (%d, want 1)", table_sort_rows(&d)))
+		}
+	}
+
+	// THE ORDER OF THE VALUE LIST. *"i think the names/numbers in the modal should
+	// be alphabetical/numerical ascending"* (Wyatt, 2026-08-02).
+	ts_case_filter_order :: proc(bad: ^int) {
+		fmt.println("-- the value list ascends, and knows a number from a word --")
+		vals :: proc(d: ^Document) -> string {
+			return strings.join(d.table_filter.values[:], "|", context.temp_allocator)
+		}
+		// NUMERIC. Byte order gives "1|10|2", which is the wrong answer this case
+		// exists to catch -- so the fixture's values have to differ in digit COUNT or
+		// text and numeric order agree and the assertion proves nothing.
+		{
+			d := ts_doc("k,v\n2,a\n10,b\n1,c\n", 2)
+			defer doc_close(&d)
+			table_filter_open(&d, 0)
+			li_chk(bad, vals(&d) == "1|2|10", fmt.tprintf("a numeric column sorts numerically, not as bytes (%q, want \"1|2|10\")", vals(&d)))
+		}
+		// One non-number anywhere makes the whole column text, the same rule a sort
+		// key settles by -- and then byte order IS the right answer.
+		{
+			d := ts_doc("k,v\n2,a\n10,b\nN/A,c\n", 2)
+			defer doc_close(&d)
+			table_filter_open(&d, 0)
+			li_chk(bad, vals(&d) == "10|2|N/A", fmt.tprintf("one non-number settles the column as text (%q, want \"10|2|N/A\")", vals(&d)))
+		}
+		// BLANKS LAST, never sorted in among the data as an empty string would be.
+		{
+			d := ts_doc("k,v\nb,1\n,2\na,3\n", 2)
+			defer doc_close(&d)
+			table_filter_open(&d, 0)
+			li_chk(bad, vals(&d) == "a|b|", fmt.tprintf("a blank cell sorts last, not first (%q, want \"a|b|\")", vals(&d)))
+		}
+		// CASE-INSENSITIVE, with a case-sensitive tiebreak so the order is total and
+		// the list does not reshuffle between two opens of the same column.
+		{
+			d := ts_doc("k,v\nB,1\na,2\nb,3\n", 2)
+			defer doc_close(&d)
+			table_filter_open(&d, 0)
+			li_chk(bad, vals(&d) == "a|B|b", fmt.tprintf("case-insensitive, upper before lower on a tie (%q, want \"a|B|b\")", vals(&d)))
+		}
+	}
+
+	// THE DROPDOWN'S MOUSE, both halves of it: which way the wheel moves the list,
+	// and what a click that lands on nothing does. Its own proc with ONE App, per
+	// the stack-frame rule in development-loop.md §6.
+	ts_case_filter_mouse :: proc(bad: ^int) {
+		fmt.println("-- the wheel's direction, and a click that picks nothing --")
+		mt: plat.Text
+		if !plat.text_load_faces(&mt) {
+			fmt.println("   (no fonts: skipped)")
+			return
+		}
+		sb := strings.builder_make()
+		defer strings.builder_destroy(&sb)
+		fmt.sbprint(&sb, "k,v\n")
+		for i in 0 ..< 60 {fmt.sbprintf(&sb, "val%02d,%d\n", i, i)}
+		a := ts_menu_app(strings.to_string(sb), 2)
+		defer app_destroy(&a)
+		d := app_active(&a)
+		doc_index_start(d)
+		for !doc_index_done(d) {}
+		menu_open_ctx(&a, table_header_menu_items, 20, TAB_STRIP_H + MENU_BAR_H + 40, 0)
+		menu_close(&a)
+		command_dispatch(.Table_Filter_Open, {}, &a, nil, &mt, 10)
+		W, H := f32(1200), f32(900)
+		li_chk(bad, menu_is_filter_dropdown(&a), "precondition: the value dropdown is open")
+		li_chk(bad, menu_visible_rows(&mt, &a, W, H) < len(menu_items(&a)), "precondition: there is more list than fits, so the wheel has somewhere to go")
+
+		// -- THE WHEEL -----------------------------------------------------------
+		//
+		// plat.Window.scroll_delta is "+down / -up". SIGN, not just movement: this
+		// used to subtract, so a test asserting only "top changed" would have passed
+		// against the bug it exists to catch.
+		a.menu.top = 0
+		li_chk(bad, menu_wheel(&a, &mt, 1, W, H), "the wheel over an open dropdown is consumed by it")
+		li_chk(bad, a.menu.top == 1, fmt.tprintf("wheel DOWN (+1) moves the list down, toward the end (top %d, want 1)", a.menu.top))
+		menu_wheel(&a, &mt, 3, W, H)
+		li_chk(bad, a.menu.top == 4, fmt.tprintf("...and keeps going with the notch size (top %d, want 4)", a.menu.top))
+		menu_wheel(&a, &mt, -2, W, H)
+		li_chk(bad, a.menu.top == 2, fmt.tprintf("wheel UP (-2) moves it back toward the start (top %d, want 2)", a.menu.top))
+		menu_wheel(&a, &mt, -99, W, H)
+		li_chk(bad, a.menu.top == 0, fmt.tprintf("...and stops at the first row rather than going negative (top %d)", a.menu.top))
+		menu_wheel(&a, &mt, 9999, W, H)
+		li_chk(bad, a.menu.top > 0 && a.menu.top + menu_visible_rows(&mt, &a, W, H) == len(menu_items(&a)), fmt.tprintf("...and at the other end the LAST row reaches the bottom exactly (top %d, %d visible, %d rows)", a.menu.top, menu_visible_rows(&mt, &a, W, H), len(menu_items(&a))))
+		a.menu.top = 0
+
+		// -- A CLICK THAT PICKS NOTHING -------------------------------------------
+		//
+		// *"in the filter menu if you click in between options it closes the modal"*
+		// (Wyatt, 2026-08-02). menu_item_at returns -1 both for the separator and for
+		// a point outside the menu, and menu_hit_test read the first as the second.
+		x0, y0, w, _ := menu_dropdown_rect(&mt, &a, W, H)
+		cx := i32(x0 + w * 0.5)
+		// The separator is row 2, so its band starts one search box and one
+		// (Select All) below the top inset. Derived from item_h's rule rather than
+		// written as a number, so a change to either row's height fails HERE instead
+		// of silently moving this click onto a real row.
+		sepy := y0 + sx(1) + MENU_ITEM_H * 2 + MENU_ITEM_H * 0.4 * 0.5
+		li_chk(bad, menu_item_at(&mt, &a, f32(cx), sepy, W, H) == -1, "precondition: the separator hit-tests to no row")
+		li_chk(bad, menu_dropdown_hit(&mt, &a, f32(cx), sepy, W, H), "...but IS inside the dropdown, which is the distinction that was missing")
+		win: plat.Window
+		win.mouse_pressed = true
+		win.mouse_x, win.mouse_y = cx, i32(sepy)
+		cmd, consumed := menu_hit_test(&a, &mt, &win, W, H)
+		li_chk(bad, consumed && cmd == .None, fmt.tprintf("a click on the separator runs nothing and is swallowed (%v, consumed %v)", cmd, consumed))
+		li_chk(bad, menu_is_filter_dropdown(&a), "...AND THE MENU STAYS OPEN, which is the bug")
+
+		// THE SCROLLBAR STRIP is the third un-pickable region, and it was the one
+		// that did not merely close the menu -- it resolved to the ROW BEHIND IT, so
+		// a click aimed at the thumb ticked a value and changed which rows the grid
+		// showed. Aimed one pixel inside the dropdown's right edge, over a real value
+		// row, so with the strip live this picks .Table_Filter_Toggle.
+		x_bar := f32(x0 + w) - 1
+		row_y := y0 + sx(1) + MENU_ITEM_H * 2 + MENU_ITEM_H * 0.4 + MENU_ITEM_H * 0.5
+		li_chk(bad, menu_dropdown_hit(&mt, &a, x_bar, row_y, W, H), "precondition: the scrollbar strip is inside the dropdown")
+		li_chk(bad, menu_item_at(&mt, &a, x_bar, row_y, W, H) == -1, "the scrollbar strip picks no row, though a value row spans that height")
+		win.mouse_pressed = true
+		win.mouse_x, win.mouse_y = i32(x_bar), i32(row_y)
+		cmd, consumed = menu_hit_test(&a, &mt, &win, W, H)
+		li_chk(bad, consumed && cmd == .None, fmt.tprintf("...so clicking it toggles nothing (%v)", cmd))
+		li_chk(bad, menu_is_filter_dropdown(&a), "...and leaves the menu open, like any other dead space inside it")
+
+		// The search box is the other un-pickable row inside the box, and it is a
+		// field people will click at deliberately.
+		win.mouse_pressed = true
+		win.mouse_x, win.mouse_y = cx, i32(y0 + sx(1) + MENU_ITEM_H * 0.5)
+		cmd, consumed = menu_hit_test(&a, &mt, &win, W, H)
+		li_chk(bad, consumed && cmd == .None && menu_is_filter_dropdown(&a), fmt.tprintf("a click on the search box likewise leaves it open (%v, open %v)", cmd, menu_is_filter_dropdown(&a)))
+
+		// AND CLICKING AWAY STILL CLOSES IT. Without this the fix would be "the menu
+		// never goes away", which is worse than what it replaced. Outside on x, and
+		// still below the menu bar's own band so this tests the dropdown's branch
+		// rather than the bar's.
+		win.mouse_pressed = true
+		win.mouse_x, win.mouse_y = i32(x0 + w + 50), i32(sepy)
+		li_chk(bad, !menu_dropdown_hit(&mt, &a, f32(win.mouse_x), f32(win.mouse_y), W, H), "precondition: that point is outside the dropdown")
+		cmd, consumed = menu_hit_test(&a, &mt, &win, W, H)
+		li_chk(bad, consumed && cmd == .None, "a click outside is still swallowed rather than reaching the document")
+		li_chk(bad, !menu_is_filter_dropdown(&a), "...and DOES close the menu")
 	}
 
 	// THE DATA-LOSS SEAM. table_row_start is what the cell editor resolves a byte

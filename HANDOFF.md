@@ -6315,10 +6315,13 @@ means "clear the sort" — one target cannot mean two things.
 - The filter is **not persisted** in the session. The sort is not either, and for the same reason
   (`Doc_View` carries neither), so this is consistent rather than an oversight — but a filter is more
   expensive to rebuild by hand than a sort.
-- A value list is capped at `TABLE_FILTER_VALUES_MAX` (512) and the scan is linear over the distinct
+- ~~A value list is capped at `TABLE_FILTER_VALUES_MAX` (512) and the scan is linear over the distinct
   set, so a column with thousands of unique values stops adding rather than degrading. Values past
   the cap are **kept**, never hidden — hiding rows on the strength of a list that stopped early would
-  remove data the user was never shown a checkbox for.
+  remove data the user was never shown a checkbox for.~~ **Paid off in §6br, one day later, after it
+  turned out to be reachable on a 1,000-row CSV.** This entry is the reason the bug survived review:
+  it reads as a bounded, deliberate trade, and the number that makes it a *defect* rather than a
+  trade — how many rows a truncated list leaves uncontrollable — is not in it.
 
 ## 6bq. The filter dropdown, made usable (2026-08-02, v0.50.0)
 
@@ -6393,6 +6396,134 @@ nothing to do with it, and `tablesorttest` fails on one leftover byte.
   a long list makes it actually annoying.
 - The match is ASCII case folding, hand-rolled. A Unicode fold is a table this layer has no business
   carrying; the values are the column's own text.
+
+## 6br. Five filter-dropdown defects, and the one that was two (2026-08-02, v0.51.0)
+
+v0.50.0 shipped that morning. Wyatt drove it on `customers-1000.csv` and came back with five
+complaints:
+
+> *"scrollbar direction in the filter menu is wrong. when you filter, and deselect all it shows rows
+> still, it should hide anything other than the filter. when you select something it does go to the
+> top but there are the other unfiltered rows below there. in the filter menu if you click in between
+> options it closes the modal. i think the names/numbers in the modal should be alphabetical/numerical
+> ascending"*
+
+### Two of the five were one bug, and the arithmetic identified it before any code was read
+
+`TABLE_FILTER_VALUES_MAX` stopped the distinct list at 512; `keep()` deliberately **kept** any value
+the list never saw. Together: on a column with more than 512 distinct values, rows carrying the 513th
+onward are visible under **every** selection, including none of it.
+
+```
+customers-1000.csv, column "First Name":  536 distinct
+listed distinct:              512
+rows with an unlisted value:   27
+first such row: 925    last: 1000
+```
+
+His screenshot read `1,000 rows · 12 columns · filtered by First Name (973 hidden)` over 27 rows
+numbered 925 → 1000. Not a near match — the arithmetic. "Deselect all still shows rows" and "the other
+unfiltered rows below there" are the same defect seen twice: values are collected in first-seen order,
+so the cap is hit partway through the file and every unlisted value lives in its **tail**. That is why
+it read as the grid giving up below a certain row rather than as a membership bug, and it is the most
+useful thing in this entry — *where* the survivors clustered was the evidence that named the cause.
+
+### The cap is gone, not raised, and the reason is that it never bought what it claimed
+
+Its comment said it existed because the distinct scan is quadratic. True, and it bounded a **second**
+scan nobody had noticed: `keep()` was also linear over `values`, and `keep()` runs on every checkbox
+click rather than once per open. One `map[string]int` deletes both, and with it the cap's entire
+justification. The remaining ceiling is the one already doing the work — `TABLE_SORT_MAX` refuses to
+filter past 100,000 rows, and a 100,000-row file has at most 100,000 distinct values, so there is no
+unbounded case to defend.
+
+Wyatt proposed PowerBI's "5k then Load more" and was talked out of it, which is worth recording
+because the argument generalises: **load-more would have reintroduced this exact defect as a design
+feature.** A partial load is a value with no checkbox, and `(Select All)` becomes ambiguous about
+whether it means the loaded 5,000 or all 40,000. PowerBI needs paging because its list is a remote
+query over a dataset it does not hold; ours is a local scan of a file already mapped, so the pattern
+would have been imported without the constraint that produced it.
+
+### The list ascends now, which overrules a comment that argued the other way
+
+`Table_Filter.values` said first-seen order was deliberate — "the list is a picture of the column, and
+sorting it hides whether the data is grouped" — and `ts_case_filter` asserted it. Both were amended
+rather than worked around. The old argument was not wrong about what first-seen order *shows*; it was
+wrong about what the list is *for*. Nobody reads a 536-row checkbox list as a picture of a column;
+they look for one name in it.
+
+Numeric columns compare numerically, decided by `table_is_number` over every non-empty value — the
+same predicate `table_sort_build` settles each sort key with, deliberately, so the two features cannot
+come to disagree about which column is a number column. Text folds case with a case-sensitive
+tiebreak, because without it `"ABC"` and `"abc"` are mutually not-less and the list reshuffles between
+two opens for no visible reason. Blanks last, which is **not** the sort's empty-follows-the-arrow rule:
+that exists because a sort has a direction, and this list has none.
+
+It happens once, at the end of `table_filter_open`, **before `f.active` is set**. That ordering is
+load-bearing and is written down in both places that depend on it: `Menu_Item.payload` indexes
+`values`/`on`, so a reorder after a tick existed would re-point every checkbox — tick `Alvin`, hide
+`Andrew`. The other half of the guarantee is in commands.odin, where reopening an already-filtered
+column deliberately does not rescan. Either fact changing alone breaks the other.
+
+### Two seam bugs, both the same shape, and the second was found reviewing the first
+
+`menu_item_at` returns −1 for two unrelated situations — outside the menu, and on a row that cannot be
+picked. `menu_hit_test` had only that one sentinel, so a click on the separator was read as a click on
+the document and dismissed the menu. `menu_dropdown_hit` answers the second question from the same
+`menu_dropdown_rect`, and the dropdown branch became three outcomes instead of two.
+
+Writing that comment produced the claim that the **scrollbar strip** was one of the regions reaching
+the dead-space path. Checking it before shipping the sentence showed the opposite: the strip is drawn
+at `x0 + w - bw`, *inside* the dropdown's width, and `menu_item_at` bounded x by the full `w` — so a
+click aimed at the thumb resolved to the row behind it and **ticked a value**. Sabotaged, that click
+returns `.Table_Filter_Toggle` instead of `.None`.
+
+Latent because it needs a list long enough to scroll, which the value list rarely was at 512 and
+always is now — the same shape as the `doc_close` leak below. `scrollbar_w` is now one producer for
+"is there a strip and how wide", consumed by the draw that paints it and the hit-test that refuses it.
+
+**The lesson is not about scrollbars.** A comment asserting something about a *sibling* region of the
+widget it documents is a claim, and checking it cost two minutes and found a real defect. Both bugs in
+this section are development-loop.md §4 Shape B.
+
+### `doc_close` never freed the filter
+
+`table_sort_free` sat alone on that line for the whole life of the feature: `offs`, `perm` and `rank`
+were released, and the filter's clone-per-distinct-value, three arrays and map were not. Bounded at
+512 small strings while the cap existed; unbounded to `TABLE_SORT_MAX` the moment it came off. Fixed
+in this batch rather than filed, because this batch is what made it matter.
+
+### The wheel
+
+`plat.Window.scroll_delta` is `+down / −up`, and every other consumer in the tree adds it —
+`doc.filter_top`, `doc.h_scroll`, `doc.table_hscroll_px`, `doc_scroll`'s row step. `menu_wheel` was the
+one subtractor. The thumb was never wrong; it tracks `menu.top` faithfully, and `menu.top` ran
+backwards. The test asserts the **sign**, because one asserting only "top changed" passes against the
+bug — and under the sabotage one of its four assertions did pass by coincidence, which is the argument
+for asserting more than one point on a scroll range.
+
+### What this batch got wrong
+
+- **The design doc shipped a claim about the scrollbar that was false**, and it was only caught because
+  writing the same claim into a code comment prompted a check. The doc is corrected, but the lesson is
+  that a spec written from investigation carries investigation's unverified asides into the code.
+- **The uncapped-values test crashed rather than failed under its own sabotage.** With the cap
+  restored, `f.on[599]` on a 512-entry array faults with `0xC000008C` — so the four FAIL lines printed
+  and then the run died before the rest of the suite. Now guarded. A test whose failure mode is a
+  bounds fault reports less than one whose failure mode is a message, even though neither is green.
+
+### Owed
+
+- **The `▲`/`▼` arrows have the scrollbar's old problem and keep it deliberately.** They are drawn at
+  `x0 + dw - sx(16)`, left of the strip and over row text, so clicking one ticks the row behind it.
+  Left alone because they are muted `UI_SMALL_PX` glyphs with no button affordance — a click there
+  reads as aimed at the row — and excluding them would carve a dead notch out of the middle-right of
+  two rows, which is worse than what it fixes. Revisit only if they ever become clickable controls.
+- **The filter is still not persisted in the session**, unchanged from §6bq.
+- `dropdown_w` and `menu_dropdown_rect` walk every item to find the widest row, and are called several
+  times a frame. At the old 512 cap that was invisible; at 100,000 values it is ~1 ms/frame of pure
+  measurement. Not measured under load yet, and the fix if it bites is a width memoised on
+  `menu.ctx_items` (the only two places it changes are `menu_open_ctx` and `menu_filter_requery`).
 
 ## 7. Build environment (Windows, this machine)
 
