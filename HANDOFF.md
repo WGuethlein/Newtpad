@@ -236,14 +236,17 @@ code); plugins post-V1 (narrow C-ABI). Refuted claims recorded in `research/`.
 on 2026-07-19). The list is kept because the reasoning is still the best statement of *why* these
 were the priorities. Read P2 as the live list, with these amendments:
 
-- **60 of 86 headless mode entry points print `FAIL` with no `os.exit` on any path** (static scan,
-  2026-08-01). Nine have been fixed in three rounds — `menutest`/`settingstest`, then `mdtest`, then
-  `linktest`/`mdviewtest`/`splittest`/`mdfencetest`/`mdtabletest`/`mdperftest` — and **each round was
-  found by looking, not by the previous fix generalising.** `mdtest` is what this costs: it went from
-  0 to 20 failures between two commits on the paragraph-join branch while every sweep that read exit
-  codes stayed green. Some of the 60 are measurement modes and **`menuseam` legitimately exits 0**
-  (it is a falsifier, swept by diffing its printed line), so this needs a mode-by-mode pass rather
-  than a blanket edit. **Nobody has done that pass.**
+- ~~**60 of 86 headless mode entry points print `FAIL` with no `os.exit` on any path.**~~ **DONE
+  2026-08-02 (§6bv), and the pass was smaller than this entry made it sound.** The scan was right
+  about the count and wrong about the shape: **396 of the 403 `FAIL` lines were correctness
+  assertions and only 7 were wall-clock gates**, and **55 of the 60 modes already kept a counter and
+  printed the verdict** — they computed the answer and threw it away. Every mode now ends at a shared
+  `mode_done`, and **`modeguardtest` fails the build's sweep if a new one does not.** Four modes were
+  found asserting nothing at all (`sehtest` printed whether the SEH guard caught a page fault and
+  never checked it; `vnavtest`'s seven assertions; `dpitest`'s linearity check; `regextest`'s planted
+  needle), which is the *other* half of the disease this entry only named half of: an exit code
+  cannot fail on an assertion that was never counted. `menuseam`, `drawcount` and `jsonperf` stay at
+  exit 0 by name and with a stated reason.
 - **`md_table_ensure`'s cache key omits `md_table_budget` / `md_table_max_rows`**, which `mdtabletest`
   lowers at runtime — so a test can read a stale cache measured at the production budget. Found while
   building `md_para_run`, whose key *does* include both. One procedure away from the code that was
@@ -6731,6 +6734,98 @@ for one release there was nothing else to say it.
   the drag. The question that would have found all three on the first pass is *"what else writes
   this, and who runs last?"*
 
+## 6bv. The headless modes can fail now (2026-08-02, v0.55.0, branch `fix/test-mode-exit-codes`)
+
+§5 had carried this for two days as *"60 of 86 modes print `FAIL` with no `os.exit`… **nobody has
+done that pass**"*. This is that pass. It is the first batch in a while aimed at the harness rather
+than the product, and the reason to do it before anything else was that **every other verification
+in this project rests on it.**
+
+### The entry overstated the work and understated the problem
+
+Both halves are worth recording, because the entry is what deterred anyone from starting.
+
+**Overstated:** it read as 60 bespoke judgment calls. A scan of the actual `FAIL` sites says
+otherwise — **396 of the 403 were correctness assertions and 7 were wall-clock gates**, and **55 of
+the 60 modes already kept a `bad` counter or a `fail` flag and already printed the verdict.** Two
+idioms covered nearly everything (`"csvtest: 0 failures"` and `"themetest: all ok"`), so for most
+modes the missing piece was one line. The pass was mechanical for 53 of them.
+
+**Understated, and this is the part that mattered:** an exit code cannot fail on an assertion nobody
+counted, and **four modes were asserting into the void.**
+
+- **`sehtest` printed whether the SEH guard caught a real page fault and never checked the bool.**
+  That guard is what stands between a mapped-file page fault and a hard crash. The worst thing this
+  mode could possibly discover, it would have reported at exit 0.
+- **`vnavtest`'s `chk` printed and did not count** — all seven caret-edge assertions were decorative,
+  the identical shape to `key_chk`, which had a live FAIL sitting in the tree for a year.
+- **`dpitest`'s column-grid linearity check** printed `FAIL` and never touched `bad`.
+- **`regextest` never counted its planted needle at all** — neither "found" nor "re-found after
+  editing mid-search", the second of which is the use-after-free guard.
+
+So the static scan that produced "60" was measuring the symptom. **A mode with no exit code and a
+mode with an uncounted assertion look identical from outside and need different fixes**, and only
+one of them was written down.
+
+### The fix is a shared exit, not 60 tails
+
+Every mode now ends at `mode_done(name, bad)` or `mode_done_flag(name, fail)`, which prints the
+summary and exits 1. The point of routing it through one procedure is that the exit is part of the
+single statement that ends the mode — `return mode_done(...)` — rather than a line underneath it
+that the next mode's author has to remember. The 20 modes that were *already* correct were converted
+too, so the invariant is "every mode ends here" rather than "most do".
+
+**`modeguardtest` is what makes that true of the next mode rather than only of today's.** It reads
+`test_modes.odin` and fails if a dispatch arm returns without routing through the shared exit, if a
+name handed to `mode_done` matches no arm (a typo silently unguards the mode it meant to name), or if
+an exemption has gone stale. Exemptions are a struct with a mandatory reason, because an exemption
+list is how a rule quietly stops applying.
+
+**It is a source-text check, which §7 rightly flags as brittle** (`tablegridtest` is the cautionary
+tale). The difference is that the thing being guarded *is* source text — "no arm returns without the
+shared exit" is a property of how the file is written — and Odin's `#assert` takes constants, so
+there is no compile-time form. It also does **not** claim `mode_done` is on every *path* through a
+mode, only that each mode names itself to it. That is the shape of the regression that produced the
+60.
+
+**The guard found two things on its first run**, which is the argument for it existing:
+`mdtabletest` and `splittest` used `if fail {os.exit(1)}` and so were behaviourally correct but
+outside the invariant, and `raw`/`live` had been put in the exemption list by hand — except they are
+two-argument modes (`newtpad <file> raw`) that no `os.args[1]` arm dispatches, so the entries read as
+coverage and were not. The stale-exemption check caught the exemption list I had just written.
+
+### Timing gates stay out of the exit code, and that is a decision
+
+Wyatt's call, and the reason is the same one this batch exists to serve: a bare millisecond
+threshold on a debug build reddens when the machine is busy, and **a sweep that cries wolf is one
+people learn to ignore** — which is precisely how 60 modes drifted. `colperftest`, `scrollperftest`
+and `regextest` now print `WARN` and do not fail. **`mdperftest` and `rulestest` keep theirs**, and
+the distinction is not taste: both carry a *measured* debug multiplier (`DEBUG_MULT`, and rulestest's
+8.5× debug-vs-release figure) rather than a bare number, and both exist to be that gate — demoting
+them would leave a mode named "perf" incapable of failing, recreating the disease.
+
+Grep `FAIL` for correctness, `WARN` for timing. §7 says so now.
+
+### Verification
+
+87 modes swept green, 229 `odin test` cases pass, and **seven sabotages were applied in one build
+and every one produced exit 1**: the SEH guard forced to report it did not catch, a wrong expectation
+in `vnavtest`, a non-linear column grid in `dpitest`, `regextest`'s needle forced missing, an
+injected count in `csvtest`, a forced flag in `crlftest`, and `blurtest` reverted to a bare
+`return true` — which `modeguardtest` named by mode. `sessionlosstest` needed no fixture at all: it
+ships its own sabotage switch (`sessionlosstest <file> old` reproduces the data loss), and it now
+exits 1 there, which is the check on the check.
+
+### What this batch did not do
+
+- **`celltest` prints a cell/byte round trip it never asserts on.** It is exempt *by name with the
+  reason written as owed work*, not because it earned an exemption. Giving it a real assertion is a
+  different job from wiring up exit codes and was not smuggled into this one.
+- **`modeguardtest` cannot see the two-argument modes** (`<file> count|filtertest|repltest|…`), which
+  are switch cases rather than `os.args[1]` arms. They are outside the invariant today.
+- **Nothing was fixed in the product.** The sweep was green before and after; this batch changed only
+  what the harness is able to notice.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -6745,6 +6840,8 @@ for one release there was nothing else to say it.
   lossy-encoding detection).
 - **Headless test modes** (debug exe). **Set `NEWTPAD_SESSION_DIR` to a temp dir first** or the
   session modes write to, and reset, the real store under `%APPDATA%\Newtpad`:
+  - The harness itself: `modeguardtest [path]` — run it first; it is the check that the rest of
+    this list can fail at all.
   - Rendering / platform: `sehtest`, `dpitest`, `atlastest`, `atlasgrowtest`, `devicelosttest`,
     `celltest`, `blurtest`, `drawcount <file>`
   - Logging / crash: `logtest`, `crashtest <null|panic|assert|oob>` (triggers a real fault; set
@@ -6761,10 +6858,19 @@ for one release there was nothing else to say it.
   - Files / session: `savepathtest <dir>`, `savestreamtest`, `savefailtest <dir>`, `resavetest [file]`,
     `diskstamptest`, `sessiontest`, `sessionlosstest <file> [old]`, `watchtest [dir]`,
     `bookmarktest`
-  - **Sweep by grepping for the `FAIL` string, not by exit code alone.** `bookmarktest` printed FAIL
-    and exited 0 for its whole life and every sweep called it green (2026-08-01, §6bg). It exits
-    non-zero now, but the sweep is what has to be right — 60 modes still have no `os.exit` on a
-    failing path.
+  - **Exit codes are now load-bearing (2026-08-02, §6bv).** Every mode that reports a verdict ends at
+    `mode_done` / `mode_done_flag`, which prints the summary and exits 1 on any failure, so
+    `newtpad <mode>; echo $LASTEXITCODE` is a real check. **Run `modeguardtest` in every sweep** — it
+    reads `src/program/test_modes.odin` and fails if a mode returns without routing through the
+    shared exit, if a name handed to `mode_done` matches no dispatch arm, or if an exemption has gone
+    stale. It needs the repo root as the working directory, or a path argument.
+  - **Grepping `FAIL` is still correct and still worth doing**, because the three exempt modes report
+    nothing to an exit code: `menuseam` and `drawcount` are falsifiers and `jsonperf` is a
+    measurement. **`WARN` is the other string to grep** — it marks the wall-clock gates that are
+    deliberately outside the exit code (`colperftest`, `scrollperftest`, `regextest`), because a
+    bare ms threshold on a debug build reddens on machine load and a sweep that cries wolf is one
+    people stop reading. `mdperftest` and `rulestest` keep their gates in the exit code: both carry
+    a *measured* debug multiplier rather than a bare number, and both exist to be that gate.
   - File-argument modes: `<file> count|keytest|findtest|filtertest|repltest|edittest|seltest|savetest`
   - `jsonperf <file.json>` is a **measurement**, not a test: it prints input/output size, format
     time and peak bytes for one file and always exits 0. It exists because `JSON_FORMAT_MAX` was
