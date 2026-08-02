@@ -90,6 +90,13 @@ Settings :: struct {
 	// default, which is the spec's own choice and principle 1's -- content owns the
 	// screen, and a tint on every line the caret visits is chrome that follows you.
 	current_line:    bool,
+	// The line-number gutter (UI spec §8: "44px right-aligned + 12px gap, off by
+	// default"). Off by default per the spec, and REACHABLE -- it has a settings
+	// row and a command, unlike caret_blink and current_line above, which shipped
+	// in v0.42.0 with no UI at all and are therefore settable only by hand-editing
+	// this file. That is owed work, not a precedent worth copying: a default-off
+	// option nobody can turn on has not shipped.
+	gutter:          bool,
 	// "Dark", "Light", or a custom *.theme file's stem (see theme_resolve).
 	// Stored as-is on load, the same as font_family above -- NOT validated
 	// against theme_available_names. That was tried and reverted: available
@@ -142,6 +149,7 @@ settings_default :: proc() -> Settings {
 		remember_views = true, // remembering is on by default; the toggle pins it
 		caret_blink = true, // spec §8's 500ms blink; the setting exists to turn it OFF
 		current_line = false, // spec §8: "off by default"
+		gutter = false, // spec §8: "off by default"
 		theme_name = "Dark",
 	}
 }
@@ -244,6 +252,8 @@ settings_load :: proc() -> Settings {
 			s.caret_blink = parts[1] == "1"
 		case "current_line":
 			s.current_line = parts[1] == "1"
+		case "gutter":
+			s.gutter = parts[1] == "1"
 		case "remember_views":
 			s.remember_views = parts[1] == "1"
 		case "split_frac":
@@ -281,7 +291,7 @@ settings_save :: proc(s: Settings) -> bool {
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ncaret_blink %d\ncurrent_line %d\ntheme_name %s\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ncaret_blink %d\ncurrent_line %d\ngutter %d\ntheme_name %s\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
@@ -298,6 +308,7 @@ settings_save :: proc(s: Settings) -> bool {
 		1 if s.remember_views else 0,
 		1 if s.caret_blink else 0,
 		1 if s.current_line else 0,
+		1 if s.gutter else 0,
 		s.theme_name if s.theme_name != "" else "Dark",
 	)
 	return plat.file_write_atomic(path, transmute([]u8)body)
@@ -326,6 +337,8 @@ SETTINGS_ROWS := []Setting_Row {
 	{"Theme", "Dark, Light, or a custom .theme file placed in the themes folder"},
 	{"Tab width", "Columns a Tab advances to; Left/Right adjust, Enter resets to 4"},
 	{"Interface font", "Tabs, menus, settings and the status bar; the document keeps its own font"},
+	// Appended, per the rule above. Ctrl+Shift+L toggles it too.
+	{"Line numbers", "A gutter down the left; the current line's number stands out"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
@@ -506,6 +519,8 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		} else {
 			s.tab_width = clamp(s.tab_width + dir, plat.TAB_WIDTH_MIN, plat.TAB_WIDTH_MAX)
 		}
+	case 10:
+		if dir == 0 {s.gutter = !s.gutter}
 	}
 	settings_apply(rc)
 	settings_save(s^)
@@ -593,6 +608,8 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 			val = fmt.tprintf("%d", app.settings.tab_width)
 		case 9:
 			val = app.settings.ui_font_family
+		case 10:
+			val = "On" if app.settings.gutter else "Off"
 		}
 		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Muted]
 		// The selected row's value brightens, per UI spec 11 -- the row you are

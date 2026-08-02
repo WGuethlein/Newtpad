@@ -4297,6 +4297,79 @@ when NEWTPAD_TESTS {
 			sniff(&bad, "  \n [1,2]", .Json, "...leading whitespace is skipped to find it")
 			sniff(&bad, `<a><b/></a>`, .Xml, "...one starting with < reads as XML")
 			sniff(&bad, "just some prose\n", .None, "...and prose reads as nothing, rather than being rewritten")
+
+			// HTML is by extension ONLY, and the .Xml fallback for an unextensioned
+			// '<' blob is the deliberate direction: xml_format is the conservative
+			// one of the pair for anything that is not really XML.
+			d.path = "C:\\x.html";chk(&bad, format_kind_for(&d) == .Html, "a .html reads as HTML")
+			d.path = "C:\\x.htm";chk(&bad, format_kind_for(&d) == .Html, "...and a .htm")
+			d.path = "C:\\x.xhtml";chk(&bad, format_kind_for(&d) == .Html, "...and .xhtml, where whitespace still renders")
+			sniff(&bad, `<div><span>a</span></div>`, .Xml, "...an untitled tag blob stays XML: '<' cannot tell the two apart")
+		}
+
+		fmt.println("-- html_format will not change what a page renders --")
+		{
+			hchk :: proc(bad: ^int, src, want, label: string) {
+				out, e, at := base.html_format(transmute([]u8)src, 2, context.temp_allocator)
+				got := string(out) if out != nil else fmt.tprintf("<err %v at %d>", e, at)
+				ok := got == want
+				if !ok {bad^ += 1}
+				fmt.printfln("  %-4s %s", "ok" if ok else "FAIL", label)
+				if !ok {fmt.printfln("        got  %q\n        want %q", got, want)}
+			}
+			// THE case this formatter exists for. xml_format lays this out, because
+			// the div's own content is elements only -- and the newline it inserts
+			// between the spans renders as a space, turning "ab" into "a b".
+			hchk(
+				&bad,
+				`<div><span>a</span><span>b</span></div>`,
+				"<div><span>a</span><span>b</span></div>\n",
+				"a div of spans is left verbatim (a break there would render as a space)",
+			)
+			// Structure of block elements is still laid out -- otherwise this
+			// formatter does nothing at all and is worse than not shipping.
+			hchk(
+				&bad,
+				`<div><div>a</div><div>b</div></div>`,
+				"<div>\n  <div>a</div>\n  <div>b</div>\n</div>\n",
+				"...but a div of divs still gets indented",
+			)
+			hchk(
+				&bad,
+				`<UL><LI>x</LI></UL>`,
+				"<UL>\n  <LI>x</LI>\n</UL>\n",
+				"...and the element test is case-insensitive without lowercasing the output",
+			)
+			// A self-closing inline child never reaches the .Open branch, so it
+			// needs its own case in the extent scan; without it this reflows.
+			hchk(
+				&bad,
+				`<div><img src="a"/><img src="b"/></div>`,
+				"<div><img src=\"a\"/><img src=\"b\"/></div>\n",
+				"a self-closing inline child is a break site too",
+			)
+			// pre is in the table for its INNER whitespace, not its surroundings.
+			hchk(
+				&bad,
+				`<pre>  keep
+   this</pre>`,
+				"<pre>  keep\n   this</pre>\n",
+				"pre survives byte for byte",
+			)
+			// The rule xml_format already had, still holding here.
+			hchk(
+				&bad,
+				`<p>Hello <b>x</b>!</p>`,
+				"<p>Hello <b>x</b>!</p>\n",
+				"mixed content is verbatim, as it already was in XML",
+			)
+			// And the same input through xml_format must still lay out -- proof the
+			// new predicate is gated on `html` and did not change XML's behaviour.
+			xsrc := `<div><span>a</span><span>b</span></div>`
+			xo, _, _ := base.xml_format(transmute([]u8)xsrc, 2, context.temp_allocator)
+			xml_still_lays_out := xo != nil && strings.contains(string(xo), "\n  <span>")
+			if !xml_still_lays_out {bad += 1}
+			fmt.printfln("  %-4s %s", "ok" if xml_still_lays_out else "FAIL", "xml_format is unchanged by the HTML rule")
 		}
 
 		fmt.println("-- CSS and XML through the command --")
@@ -36826,6 +36899,112 @@ when NEWTPAD_TESTS {
 		if os.args[1] == "windowshowtest" {
 			window_show_test_run()
 			return true
+		}
+
+		// `newtpad gutterseamtest` -- the line-number gutter, tested at the SEAM
+		// rather than at the unit.
+		//
+		// CLAUDE.md's one-layout rule exists because of the sixteen bugs in §6j, and
+		// every one of them was a correct function fed the wrong input or read in the
+		// wrong space. GUTTER_W is exactly that hazard: col_x (what is DRAWN) and
+		// col_at_x (what is CLICKED) both add it, and nothing but agreement between
+		// those two keeps the caret under the cursor. So this compares the draw's
+		// column geometry against the hit-test's, with a gutter present, rather than
+		// checking that a width formula returns a number.
+		if os.args[1] == "gutterseamtest" {
+			bad := 0
+			gs :: proc(bad: ^int, cond: bool, label: string) {
+				if !cond {bad^ += 1}
+				fmt.printfln("  %-4s %s", "ok" if cond else "FAIL", label)
+			}
+			saved_g, saved_hs := GUTTER_W, H_SCROLL
+			defer {GUTTER_W, H_SCROLL = saved_g, saved_hs}
+			H_SCROLL = 0
+
+			// ~1200 lines, so the line count needs four digits and one more push
+			// takes it to five -- both sides of the 44px minimum.
+			b := strings.builder_make(context.temp_allocator)
+			for i in 0 ..< 1200 {fmt.sbprintf(&b, "line %d\n", i)}
+			content := transmute([]u8)strings.clone(strings.to_string(b))
+			d := doc_from_content(content, "C:\\gut.txt", .UTF8)
+			defer doc_close(&d)
+			doc_index_start(&d)
+			for !doc_index_done(&d) {time.sleep(time.Millisecond)}
+			cw := f32(8)
+
+			fmt.println("-- the setting gates it, and the two rendered views never get one --")
+			doc_update_gutter(&d, cw, false)
+			gs(&bad, GUTTER_W == 0, "off by default: no gutter, no reserved width")
+			doc_update_gutter(&d, cw, true)
+			on_w := GUTTER_W
+			gs(&bad, on_w > 0, fmt.tprintf("on: the gutter reserves %.1f px", on_w))
+
+			fmt.println("-- 44px minimum, growing only when the digits need it (spec §8 + §14) --")
+			box := gutter_box_w(&d, cw)
+			gs(&bad, box == max(sx(GUTTER_MIN_W), 4 * cw), fmt.tprintf("1200 lines -> 4 digits, box is the 44px floor (%.1f)", box))
+			gs(&bad, on_w == box + sx(GUTTER_GAP), "GUTTER_W is the box plus §8's 12px gap, exactly")
+			// A 10 GB log is §14's own case: nine digits do not fit in 44px, and a
+			// truncated line number is worse than a wider gutter.
+			huge := doc_from_content(transmute([]u8)strings.clone("x\n"), "C:\\h.txt", .UTF8)
+			defer doc_close(&huge)
+			intrinsics.atomic_store(&huge.idx.line_count, 123_456_789)
+			intrinsics.atomic_store(&huge.idx.done, true)
+			hbox := gutter_box_w(&huge, cw)
+			gs(&bad, hbox == 9 * cw, fmt.tprintf("123,456,789 lines -> 9 digits wide (%.1f), not clipped to 44px", hbox))
+			gs(&bad, hbox > sx(GUTTER_MIN_W), "...and that really is wider than the floor, so the branch was taken")
+
+			fmt.println("-- THE SEAM: what is drawn and what is clicked use one origin --")
+			doc_update_gutter(&d, cw, true)
+			round_trip := 0
+			for col in 0 ..< 400 {
+				// col_x is the draw's answer; col_at_x is the hit-test's. A click in
+				// the middle of a cell must resolve to the cell that was drawn there.
+				x := col_x(cw, col) + cw * 0.25
+				if col_at_x(cw, x) != col {round_trip += 1}
+			}
+			gs(&bad, round_trip == 0, fmt.tprintf("400 columns round-trip draw->click with a gutter (%d wrong)", round_trip))
+			// The failure this catches is a hit-test that forgot GUTTER_W: every
+			// click would land a fixed number of cells right of the glyph.
+			gs(&bad, cell_at_x(cw, col_x(cw, 0)) == 0, "a click on the first glyph is column 0, not a gutter-width offset")
+			gs(&bad, col_at_x(cw, TEXT_MARGIN_X) == 0, "a click INSIDE the gutter clamps to column 0 rather than going negative")
+
+			fmt.println("-- the width cannot depend on where the viewport is --")
+			// A gutter sized from the visible rows would change while scrolling, and
+			// since col_x adds it, the whole text column would slide under the caret.
+			d.top = 0
+			doc_update_gutter(&d, cw, true)
+			w_top := GUTTER_W
+			d.top = base.pt_line_start(&d.pt, d.pt.length - 3)
+			doc_update_gutter(&d, cw, true)
+			gs(&bad, GUTTER_W == w_top, "scrolled to the end, the gutter is the same width as at the top")
+			d.top = 0
+
+			fmt.println("-- it narrows the text, and both frames must agree that it does --")
+			doc_update_gutter(&d, cw, true)
+			cols_on := doc_view_cols(1000, cw)
+			doc_update_gutter(&d, cw, false)
+			cols_off := doc_view_cols(1000, cw)
+			gs(&bad, cols_off > cols_on, fmt.tprintf("wrap width shrinks when the gutter is on (%d -> %d cells)", cols_off, cols_on))
+			gs(&bad, f32(cols_off - cols_on) * cw >= on_w - cw, "...by the gutter's own width, not by some other amount")
+
+			fmt.println("-- §8's wrap column cap --")
+			// 3000px of measure at 8px/cell is ~370 columns; the cap is what stops a
+			// maximised 1440p window handing back 200-character lines.
+			doc_update_gutter(&d, cw, false)
+			gs(&bad, doc_view_cols(3000, cw, true) == WRAP_COL_CAP, fmt.tprintf("a wide window wraps at the %d-column cap", WRAP_COL_CAP))
+			gs(&bad, doc_view_cols(3000, cw, false) > WRAP_COL_CAP, "...and an UNWRAPPED view still reports the real width, which h-scroll reads")
+			gs(&bad, doc_view_cols(200, cw, true) < WRAP_COL_CAP, "a narrow window is unaffected by the cap")
+
+			fmt.println("-- the filter view keeps its own gutter, and the setting does not govern it --")
+			// Its numbers are the point of the view, not a preference.
+			append(&d.filter_lines, 0)
+			append(&d.filter_line_nos, 900)
+			d.filter = true
+			doc_update_gutter(&d, cw, false)
+			gs(&bad, GUTTER_W > 0, "filtering with the setting OFF still has a gutter")
+			d.filter = false
+
+			return mode_done("gutterseamtest", bad)
 		}
 
 		// `newtpad modeguardtest [path]` -- the guard on the guards.

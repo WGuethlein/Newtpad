@@ -240,26 +240,90 @@ doc_update_hscroll :: proc(doc: ^Document) {
 	H_SCROLL = doc.h_scroll if (doc != nil && !doc_wraps(doc) && !doc.filter && !doc_read_only_view(doc)) else 0
 }
 
-// Recompute the gutter for the active document. Only the filter view has one:
-// its whole purpose is showing lines out of context, which is meaningless
-// without saying which lines they are.
-doc_update_gutter :: proc(doc: ^Document, char_w: f32) {
-	GUTTER_W = 0
-	if doc == nil || !doc_filtering(doc) || len(doc.filter_line_nos) == 0 {return}
-	biggest := doc.filter_line_nos[len(doc.filter_line_nos) - 1]
-	digits := 1
-	for v := biggest; v >= 10; v /= 10 {digits += 1}
-	GUTTER_W = f32(digits + 2) * char_w
+// The editing gutter's number box, UI spec §8: "44px right-aligned + 12px gap".
+// The 44 is a MINIMUM rather than the width, because §14 opens 10 GB logs and a
+// 100-million-line file needs nine digits where 44px at 96 DPI holds about four.
+// Truncating the number, or letting it run under the text, are both worse than a
+// wider gutter on the one file that needs it.
+GUTTER_MIN_W :: 44
+GUTTER_GAP :: 12
+
+// Digits needed to write `n` (at least 1, so an empty document still reserves a
+// column rather than collapsing the gutter to the gap alone).
+@(private = "file")
+gutter_digits :: proc(n: int) -> int {
+	d := 1
+	for v := n; v >= 10; v /= 10 {d += 1}
+	return d
 }
+
+// Recompute the gutter for the active document. Two rules, deliberately:
+//
+//   - The FILTER view has always had one, and keeps its own character-based
+//     width. Its whole purpose is showing lines out of context, which is
+//     meaningless without saying which lines they are, so it is not optional and
+//     not governed by the setting.
+//   - Normal editing gets §8's gutter when `settings.gutter` is on. It is sized
+//     from doc_line_count, NOT from the largest number currently on screen: a
+//     width that tracked the viewport would change as you scrolled, and since
+//     col_x adds GUTTER_W, the whole text column would shift under the caret
+//     while the wheel turned.
+//
+// It widens once while a huge file finishes indexing (doc_line_count grows until
+// idx.done), then settles. That is one reflow on open rather than one per scroll.
+//
+// Call before doc_view_cols -- wrap breaks at a width this narrows.
+doc_update_gutter :: proc(doc: ^Document, char_w: f32, gutter_on := false) {
+	GUTTER_W = 0
+	if doc == nil {return}
+	if doc_filtering(doc) {
+		if len(doc.filter_line_nos) == 0 {return}
+		biggest := doc.filter_line_nos[len(doc.filter_line_nos) - 1]
+		GUTTER_W = f32(gutter_digits(biggest) + 2) * char_w
+		return
+	}
+	// The two rendered views replace the text pass entirely and lay out to their
+	// own measure (the grid pans table_hscroll_px; Preview fits the pane), so a
+	// gutter there would reserve width nothing draws into -- the same shape as the
+	// H_SCROLL bug doc_update_hscroll's comment records.
+	if !gutter_on || doc.kind != .Text || doc_read_only_view(doc) {return}
+	GUTTER_W = gutter_box_w(doc, char_w) + sx(GUTTER_GAP)
+}
+
+// Width of the number box alone, without the gap -- where the right-aligned
+// digits end. The draw needs this and so does any hit-test that wants to know
+// whether a click landed on the gutter rather than the text, so it is derived
+// once here rather than recomputed from GUTTER_W minus a gap at each site.
+gutter_box_w :: proc(doc: ^Document, char_w: f32) -> f32 {
+	return max(sx(GUTTER_MIN_W), f32(gutter_digits(doc_line_count(doc))) * char_w)
+}
+
+// UI spec §8: "in wrap mode cap the text column at 100 characters and left-align.
+// On a maximised 1440p window an uncapped wrap gives 200-character lines." The
+// left-align half needs no code -- the column already starts at the left margin,
+// so capping the width alone leaves the text where it was and shortens the line.
+//
+// Not a setting. Principle 3 fights options, and a measure this is a readability
+// constant rather than a preference: the number comes from the spec, not taste.
+WRAP_COL_CAP :: 100
 
 // Usable content width in cells -- what word wrap breaks at. One definition,
 // like col_x/col_at_x above: the main loop subtracted GUTTER_W and the resize
 // repaint in render_frame did not, so the two frames wrapped to different
-// widths. Latent only because the gutter is filter-view-only today; it goes
-// live the moment the gutter generalizes to normal editing.
+// widths.
+//
+// The cap lives HERE rather than at the two assignment sites for exactly that
+// reason -- a rule applied at one call site and not the other is the bug that
+// comment records, and there are still two call sites.
+//
+// `wrapping` gates it because the cap is §8's *wrap* rule. In a non-wrapped
+// document view_cols is the usable width, which the horizontal scroll and the
+// h-scroll extent read; clamping that to 100 would tell them the window is
+// narrower than it is.
 // Call after doc_update_gutter -- it reads GUTTER_W.
-doc_view_cols :: #force_inline proc(width, char_w: f32) -> int {
-	return max(1, int((width - TEXT_MARGIN_X - GUTTER_W - SCROLLBAR_W) / char_w))
+doc_view_cols :: #force_inline proc(width, char_w: f32, wrapping := false) -> int {
+	n := max(1, int((width - TEXT_MARGIN_X - GUTTER_W - SCROLLBAR_W) / char_w))
+	return min(n, WRAP_COL_CAP) if wrapping else n
 }
 
 // Right edge of the editor's content area. The full window normally; the split
@@ -421,6 +485,7 @@ Format_Kind :: enum {
 	Json,
 	Css,
 	Xml,
+	Html,
 }
 
 // Pick the formatter for `doc`: the EXTENSION first, then the first non-space
@@ -447,6 +512,13 @@ format_kind_for :: proc(doc: ^Document) -> Format_Kind {
 	if path_has_ext_strict(doc.path, {".json"}) {return .Json}
 	if path_has_ext_strict(doc.path, {".css", ".scss", ".sass"}) {return .Css}
 	if path_has_ext_strict(doc.path, {".xml", ".svg", ".xaml", ".xsd", ".xsl", ".xslt", ".plist", ".csproj", ".props", ".targets", ".resx"}) {return .Xml}
+	// Before the content sniff, and by extension ONLY. HTML and XML both begin
+	// with '<', so the sniff below cannot tell them apart -- and guessing wrong
+	// toward .Xml is the dangerous direction, since xml_format will happily lay
+	// out a `<div>` full of `<span>`s and change what the page renders. An
+	// unextensioned blob of tags therefore gets the XML rules, which are correct
+	// for XML and merely conservative for anything else.
+	if path_has_ext_strict(doc.path, {".html", ".htm", ".xhtml", ".vue", ".svelte"}) {return .Html}
 
 	// Content, from the first non-space byte. A bounded read: the answer is one
 	// character and a multi-GB file must not be walked to find it.
@@ -4741,13 +4813,74 @@ doc_draw :: proc(
 	// document byte range whose preceding state is otherwise unknown.
 	hl_state: base.Lex_State
 	hl_state_ready := false
+	// --- line-number gutter state (UI spec §8) ---
+	//
+	// ONE doc_line_no_at call for the whole screen, seeded on the first visible
+	// row and then walked. That is table_abs_rows' shape and it is copied for its
+	// measured reason, not for symmetry: that procedure's comment puts the call at
+	// 153.3 us in a debug build, so a per-row producer would spend 6.1 ms of a
+	// 40-row repaint re-counting the same bytes.
+	//
+	// `gut_head` is "this visible row begins a logical line" -- the whole of what
+	// makes a row get a number. It starts as a real test of the byte before the
+	// first row's start rather than as `true`, because doc.top lands mid-line
+	// whenever the view has scrolled into a row longer than RENDER_LINE_CAP.
+	gut_line := 0
+	gut_ok := false
+	gut_head := false
+	gut_box := f32(0)
+	// The caret's logical line start, so its number can be Text_Primary while the
+	// rest are Text_Muted (§8: "that alone shows position without a line
+	// highlight"). Resolved once, not per row.
+	gut_caret_start := -1
 	it := visible_begin(doc, t, rows)
 	for {
 		row, start, end, vis_end, line_end, wrapped, ok := visible_next(&it)
 		if !ok {break}
+		if row == 0 && GUTTER_W > 0 && !doc_filtering(doc) {
+			gut_box = gutter_box_w(doc, char_w)
+			// Refusing is the honest answer while the background index is still
+			// climbing: a confident wrong number beside every row is worse than no
+			// number, and doc_line_no_at's own comment makes that call for the same
+			// reason. The gutter's WIDTH is already reserved, so nothing shifts when
+			// the numbers appear a moment later.
+			if ln, exact := doc_line_no_at(doc, start); exact && ln >= 1 {
+				gut_line, gut_ok = ln, true
+				gut_head = start == 0 || byte_at(doc, start - 1) == '\n'
+			}
+			if gut_ok {
+				if cs, cok := base.pt_line_start_cap(&doc.pt, doc.cursor, RENDER_LINE_CAP); cok {
+					gut_caret_start = cs
+				}
+			}
+		}
 		bottom = end
 		row_y := row_baseline_y(px, row)
 		rhs := 0 if wrapped else H_SCROLL // a wrapped row ignores the horizontal pan
+
+		// The line-number gutter (spec §8), drawn BEFORE the `if n > 0` block
+		// below, and that placement is the whole point: a blank line is still a
+		// line and still needs its number, while that block is skipped entirely
+		// for a row with no bytes. The filter view's own gutter draw sits inside
+		// it and has always had this gap -- invisible there only because a
+		// filtered row matched something and so had content.
+		if gut_ok && gut_head {
+			num := fmt.tprintf("%d", gut_line)
+			// Right-aligned against the number box's right edge, where the box ends
+			// and the 12px gap begins. col_x starts the text at
+			// TEXT_MARGIN_X + GUTTER_W, and GUTTER_W is box + gap, so the gap is
+			// exactly what separates the two.
+			nx := TEXT_MARGIN_X + gut_box - f32(len(num)) * char_w
+			nc := g_theme[.Text_Muted]
+			if gut_caret_start >= 0 && start == gut_caret_start {nc = g_theme[.Text_Primary]}
+			// .Doc, EXPLICITLY. text_draw defaults to the UI font, but `nx` above is
+			// computed from char_w -- the DOCUMENT's cell width -- so drawing these
+			// digits in the UI face right-aligns them against a measure they are not
+			// drawn in, and they creep as soon as the two families differ (which is
+			// the default: Cascadia Mono UI, Consolas doc). The numbers also want to
+			// sit on the same grid as the text rows they label.
+			plat.text_draw(gfx, t, num, nx, row_y, px, nc, .Doc)
+		}
 
 		draw_len := min(vis_end - start, len(line_buf))
 		n := base.pt_read(&doc.pt, start, line_buf[:draw_len])
@@ -4774,8 +4907,14 @@ doc_draw :: proc(
 				if fi < len(doc.filter_line_nos) {
 					num := fmt.tprintf("%d", doc.filter_line_nos[fi])
 					// Right-aligned against the gutter's text edge.
+					// .Doc for the same reason the editing gutter above passes it:
+					// `nx` is derived from char_w, the document's cell width, so the
+					// UI face text_draw otherwise defaults to right-aligns these
+					// against a measure they are not drawn in. Pre-existing and
+					// invisible only while both families happened to be the same
+					// width; a user-chosen document font is what exposes it.
 					nx := TEXT_MARGIN_X + GUTTER_W - f32(len(num) + 1) * char_w
-					plat.text_draw(gfx, t, num, nx, row_y, px, g_theme[.Text_Muted])
+					plat.text_draw(gfx, t, num, nx, row_y, px, g_theme[.Text_Muted], .Doc)
 				}
 			}
 			// Links on this row, if Ctrl is held. Colour comes from the same
@@ -4874,6 +5013,17 @@ doc_draw :: proc(
 			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix], 0, .Doc), rhs)
 			cy = row_y
 			caret = true
+		}
+		// Advance the gutter's walk for the NEXT row. A new logical line begins
+		// only where this one ended, so a wrapped continuation gets no number --
+		// which is what stops a wrapped paragraph reading as N separate lines.
+		//
+		// An explicit tail rather than a `defer`: this loop body has no `continue`
+		// of its own (the only one belongs to the nested link scan), so the tail is
+		// reached every iteration and says plainly where the walk moves.
+		if gut_ok {
+			gut_head = line_end
+			if line_end {gut_line += 1}
 		}
 	}
 	return

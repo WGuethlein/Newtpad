@@ -1623,6 +1623,12 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 			e: base.Xml_Error
 			out, e, at = base.xml_format(src, tabw, context.allocator)
 			what, why = "XML", base.xml_error_text(e)
+		case .Html:
+			// Same errors and the same `at`, so it shares xml_error_text -- it is
+			// xml_format with one more rule, not a second formatter.
+			e: base.Xml_Error
+			out, e, at = base.html_format(src, tabw, context.allocator)
+			what, why = "HTML", base.xml_error_text(e)
 		case .None:
 		}
 		// COMPUTED BEFORE `src` IS FREED. This compared against `src` after the
