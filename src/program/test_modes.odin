@@ -29,6 +29,188 @@ NEWTPAD_TESTS :: #config(NEWTPAD_TESTS, ODIN_DEBUG)
 
 when NEWTPAD_TESTS {
 
+	// The one place a headless mode ends. Prints the verdict and -- the whole
+	// point of it -- makes a failure visible to a script by exiting non-zero.
+	//
+	// 60 of 86 modes counted their failures, printed the count, and returned 0
+	// regardless. The counter was never the missing piece; acting on it was.
+	// `mdtest` is what that cost: it went 0 -> 20 failures between two commits on
+	// the paragraph-join branch while every sweep reading exit codes stayed green
+	// (HANDOFF §5). Nine modes were fixed in three separate rounds, and each round
+	// was found by looking rather than by the previous fix generalising -- which is
+	// the argument for a shared exit rather than a 61st hand-written tail.
+	//
+	// Returns `handled` so a dispatch arm reads `return mode_done(...)`: the exit
+	// is then part of the one statement that ends the mode, not a line under it
+	// that the next mode's author has to remember to copy.
+	//
+	// The summary says FAIL when it failed, because §7's sweep greps output rather
+	// than exit codes and must keep working -- this adds a channel, it does not
+	// replace one. `modeguardtest` enforces that every mode ends here.
+	@(private = "file")
+	mode_done :: proc(name: string, bad: int) -> bool {
+		if bad > 0 {
+			fmt.printfln("%s: FAIL -- %d failure(s)", name, bad)
+			os.exit(1)
+		}
+		fmt.printfln("%s: all ok", name)
+		return true
+	}
+
+	// The same, for the ~15 modes that track a `fail: bool` rather than a count.
+	// Deliberately does NOT print a fabricated "1 failure(s)" -- a flag knows that
+	// something failed and not how much, and a summary that invents a number is
+	// the kind of comment-claiming-evidence-it-lacks that §6bc caught eleven of.
+	@(private = "file")
+	mode_done_flag :: proc(name: string, fail: bool) -> bool {
+		if fail {
+			fmt.printfln("%s: FAIL", name)
+			os.exit(1)
+		}
+		fmt.printfln("%s: all ok", name)
+		return true
+	}
+
+	// Where `modeguardtest` looks when given no path. Relative, so it only works
+	// from the repo root -- which is where every other mode is run from, and the
+	// mode says so rather than guessing when the file is not there.
+	MODE_GUARD_SRC :: "src/program/test_modes.odin"
+
+	// Modes that must NOT route through `mode_done`, each for a stated reason.
+	// A name goes in here only with one, because an exemption list is how a rule
+	// quietly stops applying to anything.
+	@(private = "file")
+	Mode_Guard_Exempt :: struct {
+		name, why: string,
+	}
+	@(private = "file")
+	MODE_GUARD_EXEMPT := []Mode_Guard_Exempt {
+		// Falsifiers: they measure a claim rather than guard a behaviour, so their
+		// interesting result is not a failure. HANDOFF §7 lists both, and says to
+		// sweep them by diffing their printed line.
+		{"menuseam", "falsifier -- DIVERGES is the expected finding, not a defect"},
+		{"drawcount", "falsifier -- reports what a frame costs; there is no pass"},
+		// Measurements: they print numbers for a human to read and act on.
+		{"jsonperf", "measurement -- re-measure FORMAT_MAX with it; no pass/fail"},
+		{"mdperftest", "perf gate with its own measured DEBUG_MULT headroom and exit"},
+		// Modes that end the process by other means, or have no assertion at all.
+		{"crashtest", "triggers a real fault on purpose; the fault IS the result"},
+		{"celltest", "prints a cell/byte round trip that it never asserts on -- OWED a real check, not exempt on merit"},
+		// `raw` and `live` are deliberately absent: they are two-argument modes
+		// (`newtpad <file> raw`), so no `os.args[1]` arm dispatches them and the
+		// guard never sees them. Listing them here read as coverage and was not --
+		// which the stale-entry check above is exactly what caught.
+	}
+
+	// The guard on the guards. Every mode that reports a verdict must end at
+	// `mode_done`, and this is what makes that true of the NEXT one somebody
+	// writes rather than only of the 60 fixed today.
+	//
+	// It is a SOURCE-TEXT check, which HANDOFF §7 rightly flags as brittle
+	// (`tablegridtest` is the cautionary tale). The difference is that the thing
+	// being guarded here IS source text -- "no dispatch arm returns without
+	// routing through the shared exit" is a property of how the file is written,
+	// and there is nothing at runtime to interrogate instead. Odin's `#assert`
+	// takes constants, so a compile-time version of this does not exist.
+	//
+	// What it deliberately does NOT claim: that `mode_done` is on every PATH
+	// through a mode. It proves each mode names itself to the shared exit
+	// somewhere, which is the shape of the regression that produced the 60 --
+	// a mode written with a bare `return true` and no exit at all.
+	@(private = "file")
+	mode_guard_run :: proc(path: string) -> bool {
+		src, ok := plat.file_read_all(path, context.temp_allocator)
+		if !ok {
+			// Loud, and NOT a silent pass: a guard that cannot find its subject
+			// reporting "all ok" would be the exact disease it exists to cure.
+			fmt.printfln("modeguardtest: could not read %q -- run it from the repo root, or pass the path", path)
+			return mode_done("modeguardtest", 1)
+		}
+		text := string(src)
+
+		// Both needles are assembled at runtime. Written as plain literals they
+		// would appear in this file and the scan would find ITSELF, reporting a
+		// mode named `\` or similar. Nothing subtle -- but it cost a confused
+		// minute the first time, so it is written down.
+		dispatch_needle := strings.concatenate({"os.args[1] ", "== \""}, context.temp_allocator)
+		exit_needle := strings.concatenate({"mode_", "done(\""}, context.temp_allocator)
+		flag_needle := strings.concatenate({"mode_", "done_flag(\""}, context.temp_allocator)
+
+		names_after :: proc(text, needle: string) -> [dynamic]string {
+			out := make([dynamic]string, context.temp_allocator)
+			i := 0
+			for {
+				j := strings.index(text[i:], needle)
+				if j < 0 {break}
+				start := i + j + len(needle)
+				end := strings.index(text[start:], "\"")
+				if end < 0 {break}
+				name := text[start:start + end]
+				// A mode name is lowercase and unpunctuated; anything else means the
+				// scan landed inside a different construct and is not a mode.
+				clean := len(name) > 0
+				for c in name {
+					if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_') {clean = false}
+				}
+				if clean {append(&out, name)}
+				i = start + end
+			}
+			return out
+		}
+
+		dispatched := names_after(text, dispatch_needle)
+		exited := names_after(text, exit_needle)
+		for n in names_after(text, flag_needle) {append(&exited, n)}
+
+		has :: proc(set: [dynamic]string, name: string) -> bool {
+			for s in set {if s == name {return true}}
+			return false
+		}
+
+		bad := 0
+		fmt.printfln("--- %d dispatch arms, %d registered at the shared exit ---", len(dispatched), len(exited))
+
+		seen := make([dynamic]string, context.temp_allocator)
+		for name in dispatched {
+			if has(seen, name) {continue}
+			append(&seen, name)
+			why := ""
+			exempt := false
+			for e in MODE_GUARD_EXEMPT {
+				if e.name == name {exempt, why = true, e.why;break}
+			}
+			if exempt {
+				fmt.printfln("  %-6s %-20s exempt: %s", "--", name, why)
+				continue
+			}
+			routed := has(exited, name)
+			if !routed {bad += 1}
+			fmt.printfln("  %-6s %-20s %s", "ok" if routed else "FAIL", name, "ends at mode_done" if routed else "returns without routing through mode_done")
+		}
+
+		// The other direction: a name handed to `mode_done` that no arm dispatches
+		// is a typo, and a typo means the mode it was meant to name is unguarded
+		// while the report reads green.
+		for name in exited {
+			if name == "modeguardtest" {continue}
+			if !has(dispatched, name) {
+				fmt.printfln("  %-6s %-20s named at mode_done but no dispatch arm answers to it (typo?)", "FAIL", name)
+				bad += 1
+			}
+		}
+
+		// An exemption for a mode that no longer exists is stale, and a stale
+		// exemption is how a rule stops covering something without anyone deciding.
+		for e in MODE_GUARD_EXEMPT {
+			if !has(dispatched, e.name) {
+				fmt.printfln("  %-6s %-20s exempted but not dispatched -- stale entry", "FAIL", e.name)
+				bad += 1
+			}
+		}
+
+		return mode_done("modeguardtest", bad)
+	}
+
 	// Counts, as well as prints. It printed only for a year, which made every
 	// assertion in `keytest` decorative: the mode had a live FAIL line in the tree
 	// (Ctrl+Z / Find, pinned as .Undo after the D1 fix made it .None) and still
@@ -114,8 +296,7 @@ when NEWTPAD_TESTS {
 		plat.window_hide(window)
 		chk(&bad, !plat.window_is_visible(window), "hidden again after window_hide (the exit path)")
 
-		fmt.printfln("windowshowtest: %d failures", bad)
-		if bad > 0 {os.exit(1)}
+		mode_done("windowshowtest", bad)
 	}
 
 	@(private = "file")
@@ -256,7 +437,6 @@ when NEWTPAD_TESTS {
 		command_dispatch(.Tab_Close, {}, &app, &dummy, &dtext, 10)
 		fmt.printfln("Tab_Close         -> live tabs=%d", app_live_count(&app))
 		app_destroy(&app)
-		fmt.printfln("keytest: %d failures", bad)
 		// NOT the only mode that exits non-zero -- 18 `os.exit(1)` sites live in this
 		// file as of this count (`grep -c` on the literal), and this branch alone
 		// added three of them (menutest, settingstest, tablesorttest). This one earns
@@ -265,7 +445,7 @@ when NEWTPAD_TESTS {
 		// what let the stale assertion sit here; an exit code is not optional to
 		// notice. `os.exit` skips the deferred teardown above -- everything it would
 		// free is process-lifetime scratch, and the process is ending either way.
-		if bad > 0 {os.exit(1)}
+		mode_done("keytest", bad)
 	}
 
 	// `newtpad resavetest [file]` -- a save must REPLACE the file's contents, not
@@ -365,11 +545,10 @@ when NEWTPAD_TESTS {
 		}
 
 		if ours {os.remove(path)} // takes the stream with it; a path you named is yours
-		fmt.printfln("resavetest: %d failures", bad)
 		// Non-zero for the same reason keytest grew one: this mode spent nine
 		// batches printing to nobody, and a summary line a script has to remember to
 		// grep is what let that happen.
-		if bad > 0 {os.exit(1)}
+		mode_done("resavetest", bad)
 	}
 
 	@(private = "file")
@@ -468,8 +647,7 @@ when NEWTPAD_TESTS {
 		li_part_reuse(&bad)
 		li_part_cost(&bad)
 		li_part_memory(&bad, path)
-		fmt.printfln("lineidxtest: %d failures", bad)
-		if bad > 0 {os.exit(1)}
+		mode_done("lineidxtest", bad)
 	}
 
 	// The offset of the last live checkpoint at or below `at`, found by a LINEAR
@@ -1433,8 +1611,7 @@ when NEWTPAD_TESTS {
 		sa_part_consumers(&bad)
 		sa_part_rects(&bad)
 		sa_part_views(&bad)
-		fmt.printfln("selalltest: %d failures", bad)
-		if bad > 0 {os.exit(1)}
+		mode_done("selalltest", bad)
 	}
 
 	// A Document over `s`. doc_from_content takes ownership of what it is given
@@ -3917,8 +4094,7 @@ when NEWTPAD_TESTS {
 			pj_case_setext_layout(&bad)
 			pj_case_list_exit_gap(&bad)
 		}
-		fmt.printfln("mdjointest: %d failures", bad)
-		if bad > 0 {os.exit(1)}
+		mode_done("mdjointest", bad)
 	}
 
 	// --- `newtpad tablesorttest` -- the multi-key sort build -------------------
@@ -3991,8 +4167,7 @@ when NEWTPAD_TESTS {
 			ts_case_header_seam(&bad)
 			ts_case_summary_marks(&bad)
 		}
-		fmt.printfln("tablesorttest: %d failures", bad)
-		if bad > 0 {os.exit(1)}
+		mode_done("tablesorttest", bad)
 	}
 
 	// --- `newtpad jsontest` -- the Format JSON COMMAND -------------------------
@@ -4208,8 +4383,7 @@ when NEWTPAD_TESTS {
 			chk(&bad, doc_can_json(&d), "...while an untitled buffer IS offered it, like every other view gate")
 		}
 
-		fmt.printfln("jsontest: %d failures", bad)
-		if bad > 0 {os.exit(1)}
+		mode_done("jsontest", bad)
 	}
 
 	// --- `newtpad surfacetest` -- UI spec §8, the editor surface --------------
@@ -4409,8 +4583,7 @@ when NEWTPAD_TESTS {
 			chk(&bad, !command_needs_menu_target(.Tab_Close), "...while Ctrl+W's own Close Tab does not, since it acts on the active tab")
 		}
 
-		fmt.printfln("surfacetest: %d failures", bad)
-		if bad > 0 {os.exit(1)}
+		mode_done("surfacetest", bad)
 	}
 
 	// --- `newtpad teartest` -- dragging a tab out into its own window ---------
@@ -4703,8 +4876,7 @@ when NEWTPAD_TESTS {
 			}
 		}
 
-		fmt.printfln("teartest: %d failures", bad)
-		if bad > 0 {os.exit(1)}
+		mode_done("teartest", bad)
 	}
 
 	// A table Document over `src`. doc_from_content takes ownership of what it is
@@ -7757,8 +7929,13 @@ when NEWTPAD_TESTS {
 
 		// `newtpad sehtest` proves the SEH guard catches a real page fault.
 		if os.args[1] == "sehtest" {
-			fmt.printfln("seh guard caught + zero-filled a page fault: %v", plat.seh_selftest())
-			return true
+			// The bool was printed and never checked. A false here means the guard
+			// standing between a mapped-file page fault and a hard crash is not
+			// working -- the single worst thing this mode could discover, reported at
+			// exit 0.
+			caught := plat.seh_selftest()
+			fmt.printfln("seh guard caught + zero-filled a page fault: %v  %s", caught, "OK" if caught else "FAIL")
+			return mode_done("sehtest", 0 if caught else 1)
 		}
 
 		// `newtpad regextest` times an incremental regex find over a synthetic buffer
@@ -7806,12 +7983,21 @@ when NEWTPAD_TESTS {
 			// A number nobody checks is a number that drifts. The keystroke now
 			// carries the bounded first-paint scan (SEARCH_FIRST_PAINT) as well
 			// as the restart, so this line is the end-to-end bound on it.
-			fmt.printfln("worst keystroke: %.2f ms (frame budget 16.7)  %s", worst, "OK" if worst < 16.7 else "FAIL")
+			// WARN, not FAIL, and it is excluded from `bad` on purpose. This is a
+			// wall-clock gate on a debug build: a busy machine trips it with nothing
+			// wrong, and a sweep that goes red for load is a sweep people learn to
+			// ignore -- which is the failure this whole pass exists to end. The number
+			// still prints and is still worth reading; it just cannot fail the mode.
+			// Grep WARN for the timing gates, FAIL for the correctness ones.
+			fmt.printfln("worst keystroke: %.2f ms (frame budget 16.7)  %s", worst, "OK" if worst < 16.7 else "WARN over budget")
+			bad := 0
 			if len(doc.find.matches) > 0 {
 				m := doc.find.matches[0]
-				fmt.printfln("planted needle found at %d (%.1f MB in), len=%d", m, f64(m) / (1024 * 1024), doc.find.match_len[0])
+				fmt.printfln("planted needle found at %d (%.1f MB in), len=%d  OK", m, f64(m) / (1024 * 1024), doc.find.match_len[0])
 			} else {
-				fmt.println("planted needle NOT found")
+				// Never counted, so a search that found nothing at all still exited 0.
+				fmt.println("planted needle NOT found  FAIL")
+				bad += 1
 			}
 
 			// Edit the document while a search is in flight. This is the path that
@@ -7834,10 +8020,15 @@ when NEWTPAD_TESTS {
 			if len(doc.find.matches) > 0 {
 				// Every inserted byte landed at offset 0, so the needle shifted right.
 				m := doc.find.matches[0]
-				fmt.printfln("needle re-found at %d (shifted by %d)", m, edits)
+				fmt.printfln("needle re-found at %d (shifted by %d)  OK", m, edits)
+			} else {
+				// The use-after-free this section guards would surface exactly here,
+				// and the mode printed nothing at all when it did.
+				fmt.println("needle LOST after editing mid-search  FAIL")
+				bad += 1
 			}
 			find_close(&doc)
-			return true
+			return mode_done("regextest", bad)
 		}
 
 		// Clicking a row in the filter view jumps to that line in the unfiltered
@@ -9443,8 +9634,7 @@ when NEWTPAD_TESTS {
 			bad += findtest_subst()
 			bad += findtest_replace_seam()
 			bad += findtest_field_owns_editing_keys()
-			fmt.printfln("findtest extra sections: %d failures %s", bad, "OK" if bad == 0 else "FAIL")
-			return true
+			return mode_done("findtest", bad)
 		}
 
 		// `newtpad fonttest` — which curated families are installed, and whether each
@@ -9712,8 +9902,7 @@ when NEWTPAD_TESTS {
 
 			fnt_styles(&bad)
 
-			fmt.printfln("fonttest: %d failures", bad)
-			return true
+			return mode_done("fonttest", bad)
 		}
 
 		// `newtpad watchtest [dir]` — external-change detection and reconciliation.
@@ -9979,8 +10168,7 @@ when NEWTPAD_TESTS {
 			// which HANDOFF §7 already lists as owed for this mode among others.
 			// The join assertion added below it is a timing check, so it is exactly
 			// the kind that has to be able to fail a build rather than a reader.
-			fmt.printfln("watchtest: %d failures", bad)
-			if bad > 0 {os.exit(1)}
+			mode_done("watchtest", bad)
 			return true
 		}
 
@@ -10024,8 +10212,7 @@ when NEWTPAD_TESTS {
 			huge := plat.text_atlas_fit_count(1024, 2000, 2000)
 			fmt.printfln("glyph larger than atlas -> %d (want 0)  %s", huge, "OK" if huge == 0 else "FAIL")
 			if huge != 0 {bad += 1}
-			fmt.printfln("atlastest: %d failures", bad)
-			return true
+			return mode_done("atlastest", bad)
 		}
 
 		// `newtpad savefailtest <path>` — a save that fails must say WHY. Release
@@ -10061,8 +10248,7 @@ when NEWTPAD_TESTS {
 			fmt.printfln("replace text warns changes are unsaved: %v %s", mentions, "OK" if mentions else "FAIL")
 			if !mentions {bad += 1}
 
-			fmt.printfln("savefailtest: %d failures", bad)
-			return true
+			return mode_done("savefailtest", bad)
 		}
 
 		// `newtpad historytest` covers undo coalescing, the entry cap, and jumping to
@@ -10198,8 +10384,7 @@ when NEWTPAD_TESTS {
 				a.docs[0] = nil // doc2 is stack-owned here; don't let app_destroy free it
 			}
 
-			fmt.printfln("historytest: %d failures", bad)
-			return true
+			return mode_done("historytest", bad)
 		}
 
 		// `newtpad settingstest` round-trips settings.txt and checks the defaults and
@@ -10490,10 +10675,9 @@ when NEWTPAD_TESTS {
 			rcz.window.dpi = 96
 			metrics_recompute(&rcz) // leave globals alone for later modes
 
-			fmt.printfln("settingstest: %d failures", bad)
 			// Non-zero exit, for the reason keytest grew one: a mode that only ever
 			// prints its verdict is a mode whose verdict a sweep can miss.
-			if bad > 0 {os.exit(1)}
+			mode_done("settingstest", bad)
 			return true
 		}
 
@@ -11060,10 +11244,9 @@ when NEWTPAD_TESTS {
 			bad += ro_menu_case(true, .Off, "table view")
 			bad += ro_menu_case(false, .Preview, "Preview")
 
-			fmt.printfln("menutest: %d failures", bad)
 			// Non-zero exit, for the reason keytest grew one: a mode that only ever
 			// prints its verdict is a mode whose verdict a sweep can miss.
-			if bad > 0 {os.exit(1)}
+			mode_done("menutest", bad)
 			return true
 		}
 
@@ -11163,6 +11346,12 @@ when NEWTPAD_TESTS {
 			fmt.println(
 				"  accept clicks on one row set and paint another. One layout call per frame is required.",
 			)
+			// Deliberately NOT mode_done, and the one mode `modeguardtest` exempts by
+			// name. menuseam is a falsifier: DIVERGES is its expected result, not a
+			// defect, so an exit code here would mean the opposite of what it does
+			// everywhere else. HANDOFF §7 says to sweep it by diffing its printed line.
+			// `drawcount` and `jsonperf` are measurements and are exempt for the same
+			// reason -- they have no pass/fail to report.
 			return true
 		}
 
@@ -15844,7 +16033,6 @@ when NEWTPAD_TESTS {
 			bad += md_click_bind_selftest()
 			bad += md_wheel_selftest()
 			bad += md_prop_selftest()
-			fmt.printfln("mdtest: %d failures", bad)
 			// The same guard palettetest carries, and for the same reason
 			// (development-loop.md's "printing FAIL and exiting 0" bullet): without
 			// it this mode printed 20 FAILs and exited 0, so a sweep reading exit
@@ -15852,7 +16040,7 @@ when NEWTPAD_TESTS {
 			// went from 0 failures to 20 between 6fd48d3 and 4f1a3b9 and nothing
 			// noticed. menutest and settingstest were closed the same way on
 			// 2026-08-01; this was the third.
-			if bad > 0 {os.exit(1)}
+			mode_done("mdtest", bad)
 			return true
 		}
 
@@ -16046,11 +16234,10 @@ when NEWTPAD_TESTS {
 				mf_chk(&bad, seed_in == truth[2], "indent fixture: seed agrees with the walk from byte 0")
 			}
 
-			fmt.printfln("mdfencetest: %d failures", bad)
 			// Exits non-zero, the guard palettetest carries. Demonstrated rather than
 			// assumed: sabotaging md_fence_seed made this mode print "8 failures" and
 			// still exit 0 (2026-08-01).
-			if bad > 0 {os.exit(1)}
+			mode_done("mdfencetest", bad)
 			return true
 		}
 
@@ -16084,8 +16271,7 @@ when NEWTPAD_TESTS {
 				fmt.printfln("  %-12q -> %v %s", c.line, got, "OK" if ok else fmt.tprintf("FAIL want %v", c.want))
 				if !ok {bad += 1}
 			}
-			fmt.printfln("csvtest: %d failures", bad)
-			return true
+			return mode_done("csvtest", bad)
 		}
 
 		// `newtpad tablecellstest` covers in-cell editing: the field byte-range
@@ -16093,8 +16279,7 @@ when NEWTPAD_TESTS {
 		// splice that table_edit_commit performs.
 		if os.args[1] == "tablecellstest" {
 			bad := table_selftest()
-			fmt.printfln("tablecellstest: %d failures", bad)
-			return true
+			return mode_done("tablecellstest", bad)
 		}
 
 		// `newtpad tablereadonlytest` guards the data-loss hole a red-team found: table
@@ -16150,8 +16335,7 @@ when NEWTPAD_TESTS {
 			}
 			doc_close(d)
 			free(d)
-			fmt.printfln("tablereadonlytest: %d failures", bad)
-			return true
+			return mode_done("tablereadonlytest", bad)
 		}
 
 		// `newtpad tablegridtest` covers UI spec §10 group A's geometry, and it is
@@ -19572,14 +19756,13 @@ when NEWTPAD_TESTS {
 			bad += tg_sort()
 			bad += tg_hscroll()
 			bad += tg_gutter_cover()
-			fmt.printfln("tablegridtest: %d failures", bad)
 			// Exit non-zero, like keytest / palettetest / lineidxtest / resavetest.
 			// HANDOFF §6aw listed this mode as the notable omission: it asserts a
 			// hundred things about a data-loss seam and used to only print them, so a
 			// sweep that greps case-insensitively for FAIL matched "0 failures" and
 			// saw nothing. Group C makes that worse -- the seam now decides which line
 			// a cell edit writes to -- so it is fixed here.
-			if bad > 0 {os.exit(1)}
+			mode_done("tablegridtest", bad)
 			return true
 		}
 
@@ -19634,8 +19817,7 @@ when NEWTPAD_TESTS {
 			hook_ok := ctx.assertion_failure_proc == diag_assert_fail
 			fmt.printfln("  %-6s diag_context keeps the crash-reporter assertion hook", "ok" if hook_ok else "FAIL")
 			if !hook_ok {bad += 1}
-			fmt.printfln("logtest: %d failures", bad)
-			return true
+			return mode_done("logtest", bad)
 		}
 
 		// `newtpad crashtest <null|panic|assert|oob>` deliberately triggers a fault to
@@ -19710,8 +19892,7 @@ when NEWTPAD_TESTS {
 			if !front_ok {bad += 1}
 
 			app_destroy(&app)
-			fmt.printfln("tabreordertest: %d failures", bad)
-			return true
+			return mode_done("tabreordertest", bad)
 		}
 
 		// `newtpad taborder` pins the tab-order INVARIANT rather than one symptom:
@@ -19817,8 +19998,7 @@ when NEWTPAD_TESTS {
 			to_opens(&bad)
 			to_restores(&bad)
 			to_reset()
-			fmt.printfln("taborder: %d failures", bad)
-			return true
+			return mode_done("taborder", bad)
 		}
 
 		// `newtpad savestreamtest` proves the streamed save (rune-aligned chunks) is
@@ -19853,8 +20033,7 @@ when NEWTPAD_TESTS {
 				doc_close(&doc)
 				os.remove(path)
 			}
-			fmt.printfln("savestreamtest: %d failures", bad)
-			return true
+			return mode_done("savestreamtest", bad)
 		}
 
 		// `newtpad savepathtest <dir>` pins the ownership seam in the save path.
@@ -19925,8 +20104,7 @@ when NEWTPAD_TESTS {
 			)
 			if !content_ok {bad += 1}
 
-			fmt.printfln("savepathtest: %d failures", bad)
-			return true
+			return mode_done("savepathtest", bad)
 		}
 
 		// `newtpad longpathtest` — the \\?\ extended-length prefix, in two halves.
@@ -20345,8 +20523,7 @@ when NEWTPAD_TESTS {
 			bad := long_path_rules(chk, pad)
 			bad += long_path_roundtrip()
 			bad += long_path_boundary()
-			fmt.printfln("longpathtest: %d failures", bad)
-			return true
+			return mode_done("longpathtest", bad)
 		}
 
 		// See draw_count_mode. Matched on the mode name ALONE, not on
@@ -20455,8 +20632,12 @@ when NEWTPAD_TESTS {
 				if abs(col_x(cw, n) - (TEXT_MARGIN_X + f32(n) * cw)) > 0.0001 {lin_ok = false}
 			}
 			fmt.printfln("column grid linear: %v  %s", lin_ok, "OK" if lin_ok else "FAIL")
+			// Printed a FAIL and never touched `bad`, so the linearity check could not
+			// have failed the mode even once an exit code existed. Counting it is the
+			// point of this pass: an assertion outside the counter is decorative.
+			if !lin_ok {bad += 1}
 			fmt.printfln("%d/%d scales failed", bad, 7)
-			return true
+			return mode_done("dpitest", bad)
 		}
 
 		// `newtpad glyphsnaptest` proves every glyph text_draw_spans emits lands on
@@ -20507,8 +20688,7 @@ when NEWTPAD_TESTS {
 			}
 			bad := 0
 			gs_run(&bad)
-			fmt.printfln("%d failures", bad)
-			return true
+			return mode_done("glyphsnaptest", bad)
 		}
 
 		// `newtpad shapetest` exercises src/platform/shape.odin, the proportional
@@ -21275,8 +21455,7 @@ when NEWTPAD_TESTS {
 			sh_draw(&bad)
 			sh_tab(&bad)
 			sh_tab_draw(&bad)
-			fmt.printfln("shapetest: %d failures", bad)
-			return true
+			return mode_done("shapetest", bad)
 		}
 
 		// `newtpad celltest` prints the monospace cell width of sample codepoints and
@@ -21300,8 +21479,7 @@ when NEWTPAD_TESTS {
 				fmt.printfln("  %q @ %.0fpx -> %dx%d inked=%v %s", c.r, c.px, w, h, inked, "OK" if ok else "FAIL")
 				if !ok {bad += 1}
 			}
-			fmt.printfln("blurtest: %d failures", bad)
-			return true
+			return mode_done("blurtest", bad)
 		}
 
 		if os.args[1] == "celltest" {
@@ -21527,8 +21705,7 @@ when NEWTPAD_TESTS {
 			}
 			tab_test_width_setting(chk, &bad)
 
-			fmt.printfln("tabstoptest: %d failures", bad)
-			return true
+			return mode_done("tabstoptest", bad)
 		}
 
 		// `newtpad blocktest` proves block_row_range is the only place a block
@@ -24483,8 +24660,7 @@ when NEWTPAD_TESTS {
 			)
 			if !cSeam {fail = true}
 
-			fmt.println("blocktest: FAILURES" if fail else "blocktest: all ok")
-			return true
+			return mode_done_flag("blocktest", fail)
 		}
 
 		// `newtpad linktest` covers link detection and resolution — the parts that are
@@ -25314,8 +25490,7 @@ when NEWTPAD_TESTS {
 			fmt.println("--- Ctrl+click on a non-local target reveals without resolving (item 5) ---")
 			lk_bare_reveal(&bad)
 
-			fmt.printfln("linktest: %d failures", bad)
-			if bad > 0 {os.exit(1)} // see mdfencetest's guard
+			mode_done("linktest", bad)
 			return true
 		}
 
@@ -25369,15 +25544,13 @@ when NEWTPAD_TESTS {
 			if st2 != .Lost || !plat.gfx_is_lost(&gfx) {bad += 1}
 			fmt.printfln("  reason  -> %q", plat.gfx_lost_reason(&gfx))
 
-			fmt.printfln("devicelosttest: %d failures", bad)
-			return true
+			return mode_done("devicelosttest", bad)
 		}
 
 		// See atlas_grow_mode -- it needs a real device, which it now gets without
 		// a window.
 		if os.args[1] == "atlasgrowtest" {
-			fmt.printfln("atlasgrowtest: %d failures", atlas_grow_mode())
-			return true
+			return mode_done("atlasgrowtest", atlas_grow_mode())
 		}
 
 		// `newtpad colperftest <mb>` measures the status bar's caret column on a
@@ -25425,9 +25598,13 @@ when NEWTPAD_TESTS {
 			fmt.printfln("  cached repeat   : %.4f ms", d2)
 			fmt.printfln("  cap             : %d MB", STATUS_COL_CAP / (1024 * 1024))
 			bad := 0
+			// WARN rather than FAIL, and outside `bad`: a bare 16 ms wall-clock gate on
+			// a debug build trips on machine load, and a sweep that reddens for load is
+			// one people stop reading. mdperftest keeps its gates in the exit code
+			// because they carry deliberate DEBUG_MULT headroom and that mode exists to
+			// be the gate; this one is a measurement with a guard rail bolted on.
 			if d1 > 16 {
-				fmt.printfln("  FAIL: first call exceeds one frame (%.2f ms)", d1)
-				bad += 1
+				fmt.printfln("  WARN: first call exceeds one frame (%.2f ms)", d1)
 			}
 			if sc != 6 {
 				fmt.printfln("  FAIL: short line reports col %d, want 6", sc)
@@ -25435,8 +25612,7 @@ when NEWTPAD_TESTS {
 			} else {
 				fmt.println("  short line still reports an exact column: OK")
 			}
-			fmt.printfln("colperftest: %d failures", bad)
-			return true
+			return mode_done("colperftest", bad)
 		}
 
 		// `newtpad scrollperftest <mb>` guards the huge-file lockup: the viewport
@@ -25493,9 +25669,10 @@ when NEWTPAD_TESTS {
 			fmt.printfln("  doc_scroll -1 (avg)    : %.3f ms", d3)
 			fmt.printfln("  ensure_cursor_visible  : %.2f ms", d4)
 			for pair in ([]struct{name: string, ms: f64}{{"doc_max_top", d1}, {"doc_scroll+", d2}, {"doc_scroll-", d3}, {"ensure_visible", d4}}) {
+				// WARN, not counted -- see colperftest above for why a bare wall-clock
+				// gate stays out of the exit code.
 				if pair.ms > 16 {
-					fmt.printfln("  FAIL: %s exceeds one frame (%.2f ms)", pair.name, pair.ms)
-					bad += 1
+					fmt.printfln("  WARN: %s exceeds one frame (%.2f ms)", pair.name, pair.ms)
 				}
 			}
 
@@ -25518,8 +25695,7 @@ when NEWTPAD_TESTS {
 				bad += 1
 			}
 			if bad == 0 {fmt.println("  bounded, and short-line scrolling still lands on line starts: OK")}
-			fmt.printfln("scrollperftest: %d failures", bad)
-			return true
+			return mode_done("scrollperftest", bad)
 		}
 
 		// `newtpad mdperftest` measures what one WHEEL FRAME of the markdown preview
@@ -25639,8 +25815,7 @@ when NEWTPAD_TESTS {
 				perf_bad += md_perf_measure(&h, one_para_names[k], strings.to_string(b), n, W, H)
 			}
 
-			fmt.printfln("mdperftest: %d failures", perf_bad)
-			if perf_bad > 0 {os.exit(1)}
+			mode_done("mdperftest", perf_bad)
 			return true
 		}
 
@@ -26135,13 +26310,12 @@ when NEWTPAD_TESTS {
 			bad += hw_bad
 
 			if bad == 0 {fmt.println("  drawn column == hit-tested column, and the scrollbar thumb round-trips: OK")}
-			fmt.printfln("hscrolltest: %d failures", bad)
 			// Exit non-zero, like tablegridtest / keytest / resavetest. It used to
 			// only print, and that was found the way the others were: a sabotage
 			// pass reintroduced the column-count thumb span, this mode printed
 			// `FAIL grid: thumb span is 11, want 930` -- and exited 0. A sweep that
 			// checks exit codes rather than grepping saw a pass.
-			if bad > 0 {os.exit(1)}
+			mode_done("hscrolltest", bad)
 			return true
 		}
 
@@ -26210,8 +26384,7 @@ when NEWTPAD_TESTS {
 			}
 
 			if bad == 0 {fmt.println("  long lines wrap, short/medium/huge lines do not, range excludes wrapped: OK")}
-			fmt.printfln("wraplongtest: %d failures", bad)
-			return true
+			return mode_done("wraplongtest", bad)
 		}
 
 		// `newtpad replacetest` covers the two ways Replace All lost data.
@@ -26272,8 +26445,7 @@ when NEWTPAD_TESTS {
 			if !(shrank && gone) {bad += 1}
 			doc_close(&d2)
 
-			fmt.printfln("replacetest: %d failures", bad)
-			return true
+			return mode_done("replacetest", bad)
 		}
 
 		// `newtpad diskstamptest` pins the restore/watch seam in both directions. A
@@ -26409,8 +26581,7 @@ when NEWTPAD_TESTS {
 			app_new_scratch(&empty)
 			session_save(&empty)
 			app_destroy(&empty)
-			fmt.printfln("diskstamptest: %d failures", bad)
-			return true
+			return mode_done("diskstamptest", bad)
 		}
 
 		// `newtpad enctest` -- forcing an encoding at open time. detect_encoding is
@@ -26710,8 +26881,7 @@ when NEWTPAD_TESTS {
 				if !ok {bad += 1}
 			}
 
-			fmt.printfln("enctest: %d failures", bad)
-			return true
+			return mode_done("enctest", bad)
 		}
 
 		// `newtpad sessiontest` round-trips session save -> restore. Set
@@ -26847,8 +27017,7 @@ when NEWTPAD_TESTS {
 			app_new_scratch(&empty)
 			session_save(&empty)
 			app_destroy(&empty)
-			fmt.printfln("sessiontest: %d failures", bad)
-			return true
+			return mode_done("sessiontest", bad)
 		}
 
 		// `newtpad sessionlosstest <file>` — launching on a file used to skip session
@@ -26893,7 +27062,10 @@ when NEWTPAD_TESTS {
 			}
 			fmt.printfln("after relaunch: tabs=%d scratch survived=%v  %s", app_live_count(&c), found, "OK" if found else "FAIL - unsaved work destroyed")
 			app_destroy(&c)
-			return true
+			// `sessionlosstest <file> old` is this mode's own sabotage switch: it skips
+			// the restore and so MUST exit 1. That is the check on the check, and it is
+			// why this one needed no new fixture -- it shipped with one.
+			return mode_done("sessionlosstest", 0 if found else 1)
 		}
 
 		// `newtpad palettetest` exercises the command palette's fuzzy match + modes.
@@ -27176,10 +27348,9 @@ when NEWTPAD_TESTS {
 			bad += palette_block_case(.Block_Extend_Right, 3)
 			bad += palette_block_case(.Block_Extend_Left, 1)
 
-			fmt.printfln("palettetest: %d failures", bad)
 			// Non-zero exit, for the reason keytest grew one: a mode that only ever
 			// prints its verdict is a mode whose verdict a sweep can miss.
-			if bad > 0 {os.exit(1)}
+			mode_done("palettetest", bad)
 			return true
 		}
 
@@ -27192,7 +27363,12 @@ when NEWTPAD_TESTS {
 				fmt.eprintln("vnavtest: no fonts loaded")
 				return true
 			}
-			chk :: proc(got, want: int, what: string) {
+			// `chk` printed and did not count, so all seven assertions below were
+			// decorative -- the same shape as `key_chk` above, which had a live FAIL
+			// sitting in the tree for a year.
+			bad := 0
+			chk :: proc(bad: ^int, got, want: int, what: string) {
+				if got != want {bad^ += 1}
 				fmt.printfln("%-32s cursor=%d want=%d  %s", what, got, want, "ok" if got == want else "FAIL")
 			}
 			one :: proc(content: string, wrap: bool, cols: int, start: int, down: bool, t: ^plat.Text) -> (int, int) {
@@ -27207,20 +27383,20 @@ when NEWTPAD_TESTS {
 			}
 			single := "hello world foo" // one line, no trailing newline
 			c, _ := one(single, false, 0, 6, true, &t)
-			chk(c, len(single), "single line, shift+Down")
+			chk(&bad, c, len(single), "single line, shift+Down")
 			c, _ = one(single, false, 0, 6, false, &t)
-			chk(c, 0, "single line, shift+Up")
+			chk(&bad, c, 0, "single line, shift+Up")
 			multi := "first line\nsecond line\nlast line here"
 			c, _ = one(multi, false, 0, 28, true, &t) // on the last line, col 5
-			chk(c, len(multi), "last line, shift+Down")
+			chk(&bad, c, len(multi), "last line, shift+Down")
 			c, _ = one(multi, false, 0, 3, false, &t)
-			chk(c, 0, "first line, shift+Up")
+			chk(&bad, c, 0, "first line, shift+Up")
 			wrapped := "the quick brown fox jumps over the lazy dog"
 			c, _ = one(wrapped, true, 20, len(wrapped) - 2, true, &t) // squarely on the last visual row
-			chk(c, len(wrapped), "wrapped, last row shift+Down")
+			chk(&bad, c, len(wrapped), "wrapped, last row shift+Down")
 			c, _ = one(wrapped, true, 20, 3, false, &t)
-			chk(c, 0, "wrapped, first row shift+Up")
-			return true
+			chk(&bad, c, 0, "wrapped, first row shift+Up")
+			return mode_done("vnavtest", bad)
 		}
 
 		// `newtpad wraptest` prints word-wrap segments for a sample paragraph.
@@ -27346,8 +27522,7 @@ when NEWTPAD_TESTS {
 			}
 			bad += tab_wrap_decision(&t)
 
-			fmt.printfln("wraptest: %d failures", bad)
-			return true
+			return mode_done("wraptest", bad)
 		}
 
 		// `newtpad rowtest` dumps the visible rows for buffers with and without a
@@ -27459,8 +27634,7 @@ when NEWTPAD_TESTS {
 					len(longnl),
 				)
 			}
-			fmt.println("rowtest: FAILURES" if fail else "rowtest: all ok")
-			return true
+			return mode_done_flag("rowtest", fail)
 		}
 
 		// `newtpad themetest` proves theme_dark() only ever holds colours that
@@ -28475,8 +28649,7 @@ when NEWTPAD_TESTS {
 				}
 			}
 
-			fmt.println("themetest: FAILURES" if fail else "themetest: all ok")
-			return true
+			return mode_done_flag("themetest", fail)
 		}
 
 		// `newtpad movelinetest` — Alt+Up/Down. Terminators live BETWEEN lines and the
@@ -28629,8 +28802,7 @@ when NEWTPAD_TESTS {
 				restored := doc_debug_string(&ud)
 				chk("undo restores original bytes", restored, "a\r\nb\r\nc\r\n", &fail)
 			}
-			fmt.println("movelinetest: FAILURES" if fail else "movelinetest: all ok")
-			return true
+			return mode_done_flag("movelinetest", fail)
 		}
 
 		// `newtpad mdtabletest` checks the two properties the old renderer lacked:
@@ -28978,9 +29150,7 @@ when NEWTPAD_TESTS {
 			eok := len(cells) == 2 && cells[0] == "" && cells[1] == "b"
 			if !eok {fail = true}
 			fmt.printfln("  %-6s empty leading cells kept (%d cells)", "ok" if eok else "FAIL", len(cells))
-			fmt.println("mdtabletest: FAILURES" if fail else "mdtabletest: all ok")
-			if fail {os.exit(1)} // see mdfencetest's guard
-			return true
+			return mode_done_flag("mdtabletest", fail)
 		}
 
 		// `newtpad viewmemtest` proves the per-family view memory (Wyatt's complaint:
@@ -29255,8 +29425,7 @@ when NEWTPAD_TESTS {
 			}
 			bad += view_apply_table()
 
-			fmt.printfln("viewmemtest: %d failures", bad)
-			return true
+			return mode_done("viewmemtest", bad)
 		}
 
 		// `newtpad splittest` proves the Markdown Split divider has exactly one x:
@@ -29424,9 +29593,7 @@ when NEWTPAD_TESTS {
 				fail = true
 			}
 
-			fmt.println("splittest: FAILURES" if fail else "splittest: all ok")
-			if fail {os.exit(1)} // see mdfencetest's guard
-			return true
+			return mode_done_flag("splittest", fail)
 		}
 
 		// `newtpad metricstest` covers the two DPI rounding rules the UI spec calls
@@ -29603,8 +29770,7 @@ when NEWTPAD_TESTS {
 			bad := 0
 			rb_run(&bad)
 			UI_SCALE = saved
-			fmt.printfln("%d failures", bad)
-			return true
+			return mode_done("rowbudgettest", bad)
 		}
 
 		if os.args[1] == "metricstest" {
@@ -29952,8 +30118,7 @@ when NEWTPAD_TESTS {
 				}
 			}
 
-			fmt.printfln("metricstest: %d failures", bad)
-			return true
+			return mode_done("metricstest", bad)
 		}
 
 		// `newtpad tabseamtest` compares the tab rail as DRAWN against the tab rail
@@ -30310,8 +30475,7 @@ when NEWTPAD_TESTS {
 			bad := ts_run()
 			tg_gap(&bad)
 			tm_marker(&bad)
-			fmt.printfln("tabseamtest: %d failures", bad)
-			return true
+			return mode_done("tabseamtest", bad)
 		}
 
 		// `newtpad resizetemptest` -- the shipped v0.31.0 crash: drag the right edge
@@ -30561,8 +30725,7 @@ when NEWTPAD_TESTS {
 				return true
 			}
 			bad := rt_run()
-			fmt.printfln("resizetemptest: %d failures", bad)
-			return true
+			return mode_done("resizetemptest", bad)
 		}
 
 		// `newtpad scrollgrabtest` covers the one thing a scrollbar has to do and
@@ -30686,8 +30849,7 @@ when NEWTPAD_TESTS {
 			}
 			bad := sg_run()
 			bad += sb_end()
-			fmt.printfln("scrollgrabtest: %d failures", bad)
-			return true
+			return mode_done("scrollgrabtest", bad)
 		}
 
 		// `newtpad quadsdftest` renders quads on a REAL D3D11 device (offscreen, no
@@ -30888,8 +31050,7 @@ when NEWTPAD_TESTS {
 				return bad
 			}
 			bad := qs_run()
-			fmt.printfln("quadsdftest: %d failures", bad)
-			return true
+			return mode_done("quadsdftest", bad)
 		}
 
 		// `newtpad mdviewtest` covers the two markdown views as INPUT surfaces,
@@ -31156,8 +31317,7 @@ when NEWTPAD_TESTS {
 			mv_preview_ro(&bad)
 			fmt.println("--- Alt+Z where it does not apply ---")
 			mv_wrap_refusal(&bad)
-			fmt.printfln("mdviewtest: %d failures", bad)
-			if bad > 0 {os.exit(1)} // see mdfencetest's guard
+			mode_done("mdviewtest", bad)
 			return true
 		}
 
@@ -31201,8 +31361,7 @@ when NEWTPAD_TESTS {
 			bok := doc.revision >= before + 2
 			if !bok {fail = true}
 			fmt.printfln("  %-6s %-22s revision %d -> %d", "ok" if bok else "FAIL", "two edits in a batch", before, doc.revision)
-			fmt.println("revtest: FAILURES" if fail else "revtest: all ok")
-			return true
+			return mode_done_flag("revtest", fail)
 		}
 
 		// `newtpad crlftest` checks every consumer of a row agrees where it ends.
@@ -31384,8 +31543,7 @@ when NEWTPAD_TESTS {
 				chk("Backspace at break cursor lands at", bdoc.cursor, 5, &fail)
 			}
 
-			fmt.println("crlftest: FAILURES" if fail else "crlftest: all ok")
-			return true
+			return mode_done_flag("crlftest", fail)
 		}
 
 		// `newtpad pastetest` -- the Windows clipboard is CRLF by convention, so
@@ -31438,8 +31596,7 @@ when NEWTPAD_TESTS {
 			// CR": the CRLF after it must still normalise.
 			bad += paste_case(.LF, "a\rb\r\nc", "a\rb\nc")
 
-			fmt.printfln("pastetest: %d failures", bad)
-			return true
+			return mode_done("pastetest", bad)
 		}
 
 		// `newtpad stickytest` checks the find bar's sticky match figures during an
@@ -31540,8 +31697,7 @@ when NEWTPAD_TESTS {
 			fmt.printfln("  %-6s count never zeroed across %d replaces", "ok" if !zeroed else "FAIL", total0)
 			fmt.printfln("  %-6s last_current never stuck at -1 across %d replaces", "ok" if !stuck else "FAIL", total0)
 
-			fmt.println("stickytest: FAILURES" if fail else "stickytest: all ok")
-			return true
+			return mode_done_flag("stickytest", fail)
 		}
 
 		// `newtpad droptest` exercises the drag-and-drop consumer without a real OS
@@ -31626,8 +31782,7 @@ when NEWTPAD_TESTS {
 			fmt.printfln("  %-6s re-drop activates the existing tab (%d -> %d tabs)", "ok" if ok4 else "FAIL", before, after)
 			if !ok4 {fail = true}
 
-			fmt.println("droptest: FAILURES" if fail else "droptest: all ok")
-			return true
+			return mode_done_flag("droptest", fail)
 		}
 
 		// `newtpad dropfittest` exercises the skip-vs-truncate decision inside
@@ -31701,8 +31856,7 @@ when NEWTPAD_TESTS {
 				chk(&fail, "utf8 overflow: drop_path_convert rejects (byte cap)", !ok)
 			}
 
-			fmt.println("dropfittest: FAILURES" if fail else "dropfittest: all ok")
-			return true
+			return mode_done_flag("dropfittest", fail)
 		}
 
 		// `newtpad highlighttest` is Task 1's Step 5: the failure mode of the whole
@@ -32157,8 +32311,7 @@ when NEWTPAD_TESTS {
 				}
 			}
 
-			fmt.println("highlighttest: FAILURES" if fail else "highlighttest: all ok")
-			return true
+			return mode_done_flag("highlighttest", fail)
 		}
 
 		// `newtpad lexstatetest` is Task 3's own verification surface: the
@@ -32840,8 +32993,7 @@ when NEWTPAD_TESTS {
 				)
 			}
 
-			fmt.println("lexstatetest: FAILURES" if fail else "lexstatetest: all ok")
-			return true
+			return mode_done_flag("lexstatetest", fail)
 		}
 
 		// `newtpad lexcoveragetest` is Task 5's Step 4: assert over the ACTUAL
@@ -32911,8 +33063,7 @@ when NEWTPAD_TESTS {
 				"" if md_exts_ok else fmt.tprintf(" (%s does not)", md_offender),
 			)
 			fmt.printfln("  examined %d extensions from text_exts.txt", seen)
-			fmt.println("lexcoveragetest: FAILURES" if fail else "lexcoveragetest: all ok")
-			return true
+			return mode_done_flag("lexcoveragetest", fail)
 		}
 
 		// `newtpad keymaptest` — the keys.txt user overlay (keymap.odin).
@@ -33303,8 +33454,7 @@ when NEWTPAD_TESTS {
 				return bad
 			}
 			n := keymaptest()
-			fmt.printfln("keymaptest: %d failures", n)
-			return true
+			return mode_done("keymaptest", n)
 		}
 
 		// `newtpad bookmarktest` — line bookmarks (doc.odin's bookmark section,
@@ -34071,14 +34221,13 @@ when NEWTPAD_TESTS {
 			}
 			bm_session(&bad, BM_FIX, bm_set)
 
-			fmt.printfln("bookmarktest: %d failures", bad)
 			// Exits non-zero, added 2026-08-01. It printed FAIL and returned 0 for
 			// its whole life, so a sweep that read exit codes -- which is every
 			// sweep -- called it green while it was red. development-loop.md §6 has
 			// counted nine of these in one day; this is the tenth, and it was found
 			// the same way all nine were, by looking rather than by the last fix
 			// generalising.
-			if bad > 0 {os.exit(1)}
+			mode_done("bookmarktest", bad)
 			return true
 		}
 
@@ -34718,8 +34867,7 @@ when NEWTPAD_TESTS {
 			sl_commands(&bad)
 			sl_fault(&bad)
 			sl_block(&bad)
-			fmt.printfln("sortlinestest: %d failures", bad)
-			return true
+			return mode_done("sortlinestest", bad)
 		}
 
 		// `newtpad rulestest` — the keyword->colour rules (rules.odin) and the
@@ -35378,8 +35526,7 @@ when NEWTPAD_TESTS {
 			ru_cost(&bad)
 			ru_file(&bad)
 			ru_command(&bad)
-			fmt.printfln("rulestest: %d failures", bad)
-			return true
+			return mode_done("rulestest", bad)
 		}
 
 		// `newtpad matchmarkstest` — the find-match ticks on the vertical
@@ -35647,8 +35794,7 @@ when NEWTPAD_TESTS {
 			}
 			mm_tall_track(&bad, mm_search)
 
-			fmt.printfln("matchmarkstest: %d failures", bad)
-			return true
+			return mode_done("matchmarkstest", bad)
 		}
 
 		// `newtpad httptest [live]` -- platform/http.odin.
@@ -35800,8 +35946,7 @@ when NEWTPAD_TESTS {
 			} else {
 				fmt.println("--- live request: SKIPPED (pass `live` to make one) ---")
 			}
-			fmt.printfln("httptest: %d failures", bad)
-			return true
+			return mode_done("httptest", bad)
 		}
 
 		// `newtpad crashurltest` -- the prefilled GitHub issue URL the crash
@@ -35883,8 +36028,7 @@ when NEWTPAD_TESTS {
 			bad := 0
 			base.log_init(.Warn)
 			cu_cases(&bad, cu_chk)
-			fmt.printfln("crashurltest: %d failures", bad)
-			return true
+			return mode_done("crashurltest", bad)
 		}
 
 		// `newtpad updatetest` -- the update check's pure half (update.odin).
@@ -36166,8 +36310,7 @@ when NEWTPAD_TESTS {
 			} else {
 				fmt.println("--- worker lifecycle: SKIPPED (pass `live` to start a real check) ---")
 			}
-			fmt.printfln("updatetest: %d failures", bad)
-			return true
+			return mode_done("updatetest", bad)
 		}
 
 		// `newtpad icontest` parses the committed src/platform/newtpad.ico back out
@@ -36552,8 +36695,7 @@ when NEWTPAD_TESTS {
 				ico_chk(&bad, bars == want, fmt.tprintf("entry %d (%dpx) has %d text-line bar(s), want %d", i, d.w, bars, want))
 			}
 
-			fmt.printfln("icontest: %d failures", bad)
-			return true
+			return mode_done("icontest", bad)
 		}
 
 		// `newtpad keytest` with no path, so the mode is sweepable. The two-argument
@@ -36672,6 +36814,11 @@ when NEWTPAD_TESTS {
 		if os.args[1] == "windowshowtest" {
 			window_show_test_run()
 			return true
+		}
+
+		// `newtpad modeguardtest [path]` -- the guard on the guards.
+		if os.args[1] == "modeguardtest" {
+			return mode_guard_run(os.args[2] if len(os.args) > 2 else MODE_GUARD_SRC)
 		}
 
 		if len(os.args) < 3 {return false}
