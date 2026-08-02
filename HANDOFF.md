@@ -172,14 +172,18 @@ A genuinely usable editor, built end-to-end:
 - **Multilingual**: per-codepoint font fallback (Consolas + Microsoft YaHei CJK + Segoe UI
   Symbol + Segoe UI). Latin/Cyrillic/Greek/CJK/accents/symbols render.
 
-**Note:** §2 describes the first day. Much more has shipped since — tabs, session restore, command
-palette, menu bar, settings, font selection, undo history, zoom, word wrap, external-change
-detection, per-monitor DPI, single-instance, an installer. §6b onward is the accurate record, and
-§6k is the most recent state.
+**Note:** §2 describes the first day and is kept as a snapshot of it, not as current state. Much more
+has shipped since — tabs, session restore, command palette, menu bar, settings, font selection, undo
+history, zoom, word wrap, external-change detection, per-monitor DPI, single-instance, an installer,
+multi-column sort, column filtering. **§6b onward is the accurate record; read the LAST `§6<letter>`
+section for the most recent state** rather than a section named here, which is a pointer that goes
+stale every batch and has done so repeatedly.
 
-Verified: **20 `odin test` cases** (encoding, line-nav, piece tree, lossy-encoding detection) plus
-~28 headless test modes — see §7 for the full list. Wyatt daily-drives the editor, which is now the
-main source of bugs, because this environment cannot inject GUI input.
+Verified: **229 `odin test` cases** in `src/base` (encoding, line-nav, piece tree, lossy-encoding
+detection) plus the headless modes in `test_modes.odin` — see §7 for the list that a sweep must
+cover, and read it rather than a shorter one carried in a batch plan: `hscrolltest` was dropped from
+one such list and the seam it owns went unrun for two releases (§6bu). Wyatt daily-drives the editor,
+which is now the main source of bugs, because this environment cannot inject GUI input.
 
 ## 3. Architecture as-built
 
@@ -248,6 +252,16 @@ were the priorities. Read P2 as the live list, with these amendments:
   `if r - p > md_table_budget` leaves `mdtabletest` at exit 0. Verified by a reviewer on 2026-08-01
   while confirming the paragraph copy's guards were individually testable. The copy was fixed; the
   model was not.
+- **Scroll resolution still happens inside the draw**, against CLAUDE.md's hard rule ("a widget's
+  geometry is produced by exactly one `*_layout()` procedure… scroll resolution must not happen
+  inside the draw"). `menu_draw_dropdown` calls `menu_scroll_to_item`, which writes `menu.top`.
+  Made edge-triggered in §6bt after it silently reverted every scrollbar drag — **that removed the
+  bug, not the violation**, and the violation is what let a second writer of `top` go unnoticed for
+  as long as there was only one. The fix is to call it from the places that MOVE the highlight
+  (`menu_step`, the keyboard handlers), which need the dropdown height and therefore the rect;
+  worth doing with the `renderer`/`ui` extraction rather than alone. This entry exists because the
+  same shape cost three consecutive releases (§6br → §6bt → §6bu), each one a different procedure
+  claiming state the drag needed.
 
 - ~~**Arenas on VirtualAlloc: still zero implementation.**~~ **RESOLVED by amendment, 2026-07-27.**
   This entry was stale: CLAUDE.md's Memory row no longer specifies arenas. It records that the arena

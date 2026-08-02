@@ -471,9 +471,10 @@ the accent colour. Rows are clickable and hoverable; clicking outside dismisses.
 
 `File · Edit · View · Encoding · Help`, opened by clicking, by tapping `Alt` (keyboard mode), or by
 `Alt+F` / `Alt+E` / `Alt+V` / `Alt+N` / `Alt+H`. Arrows and `Enter` walk it; `Esc` unwinds one level.
-Rows show their shortcut, carry a check mark for the toggles, and scroll (with ▲/▼ markers) when the
-window is too short for the dropdown. A row that does not apply is greyed out and — where there is a
-reason worth giving — replaces its shortcut with that reason.
+Rows show their shortcut, carry a check mark for the toggles, and scroll when the window is too short
+for the dropdown — by wheel, by arrow key, or by dragging the scrollbar that appears down the right
+edge whenever there is more list than box. A row that does not apply is greyed out and — where there
+is a reason worth giving — replaces its shortcut with that reason.
 
 ### Rebindable keys — `View ▸ Edit Keybindings...`
 

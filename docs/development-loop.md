@@ -293,6 +293,17 @@ Each of these cost real time at least once.
   comment convention — but it is still a ceiling, not an excuse to stop watching frame size.
 - **`Select-String "FAIL"` is case-insensitive** and happily matches "0 failures" in a passing
   summary. Use `-CaseSensitive`.
+- **Sweep HANDOFF §7's list, not the shorter one your batch plan wrote down.** A plan naturally names
+  the modes it expects to touch; the sweep has to cover the modes the *change* can reach, and those
+  are not the same set. `hscrolltest` owns the `ro_surface_swallows` latch enumeration — the exact
+  seam that broke the dropdown scrollbar drag — and it was not in the ten-mode list carried through
+  the v0.51–v0.53 batch, so it went unrun for two releases while every sweep reported clean
+  (2026-08-02, §6bu). It was in §7 the whole time.
+- **A `#assert` guards the invariant it names, which may not be the invariant you need.**
+  `hscrolltest` has `#assert(size_of(Drag_Latches) == N)` so a new *field* cannot go untested — and
+  it did not fire when a new drag latch was added as `app.menu.scroll_drag` **outside** the struct.
+  "Every field is tested" is not "every cross-frame drag latch is a field." When a guard does not
+  fire for a bug in its own subject area, ask which of the two invariants it actually encodes.
 
 **Shell**
 

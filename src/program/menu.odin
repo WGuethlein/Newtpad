@@ -1306,9 +1306,6 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	// A SCROLLBAR, when there is more than fits. Proportional thumb, same shape as
 	// the document's, and draggable through the same Vbar.
 	//
-	// Drawn, not draggable. The wheel and the arrow keys move the list; a drag
-	// would need its own hit-test inside a surface whose every other pixel already
-	// means "pick this row", and the wheel is what a person reaches for anyway.
 	// Through the same producer menu_item_at excludes the lane with and
 	// menu_scroll_press starts a drag from, so what is painted, what refuses a row
 	// and what can be grabbed are one decision rather than three expressions that
@@ -1379,12 +1376,13 @@ menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0,
 	// (Wyatt, v0.49.0).
 	//
 	// The scroll machinery to go under it already existed (menu.top, rows_fitting,
-	// the more_above/more_below arrows); what it never had was a reason to trigger
-	// or a way to drive it with the mouse. Both arrived with this.
+	// and ▲/▼ arrows that no longer exist -- v0.54.0 removed them as a strict subset
+	// of what the scrollbar says); what it never had was a reason to trigger or a
+	// way to drive it with the mouse. Both arrived with this.
 	// ...AND ONLY ON A GENERATED ROW SET. This first shipped unconditional, and the
 	// Edit menu is 12 command rows and 5 separators -- fourteen rows' worth, past a
 	// cap of twelve -- so Font became unreachable again, which is the exact bug the
-	// more_above/more_below arrows were added for in the first place. menutest
+	// ▲/▼ arrows (since removed, v0.54.0) were added for in the first place. menutest
 	// caught it; the constant's own comment ("enough that no hand-written menu is
 	// ever clipped") was simply wrong, and a menu nobody generated has never needed
 	// this because a person typed every row of it.
