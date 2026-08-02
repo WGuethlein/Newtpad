@@ -96,6 +96,7 @@ Command_Id :: enum u8 {
 	Table_Sort_Then_Desc,
 	Table_Sort_Remove,
 	Table_Sort_Clear,
+	Table_First_Row_Is_Data,
 	// command palette
 	Palette_Open,
 	Palette_Close,
@@ -259,6 +260,7 @@ command_table := [Command_Id]Command {
 	.Table_Sort_Then_Desc     = {"Then by Descending", "Table"},
 	.Table_Sort_Remove        = {"Remove from Sort", "Table"},
 	.Table_Sort_Clear         = {"Clear Sort", "Table"},
+	.Table_First_Row_Is_Data  = {"First Row Is Data", "Table"},
 	.Palette_Open             = {"Command Palette", "View"},
 	.Palette_Close            = {"Palette: Close", "View"},
 	.Palette_Confirm          = {"Palette: Confirm", "View"},
@@ -1573,6 +1575,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				doc.table_delim = table_choose_delim(doc)
 				doc.top = base.pt_line_start(&doc.pt, doc.top)
 				doc.table_hscroll_px = 0 // the grid always opens at its left edge
+				// BEFORE the widths, not after: table_compute_widths excludes line 0
+				// from its type decision only when line 0 is a header, so it has to
+				// know which this file is before it samples.
+				table_headerless_resolve(doc, app.settings.table_header_mode)
 				table_compute_widths(doc, t) // fix the columns now, so they don't shift on scroll
 			} else {
 				clear(&doc.table_widths) // recompute on next open (content may have changed)
@@ -1625,6 +1631,37 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// clear because the grid is being LEFT, which keep their place for the text
 		// view -- see table_sort_scroll_top.
 		if doc != nil && doc.table {table_sort_clear(doc);table_sort_scroll_top(doc)}
+	case .Table_First_Row_Is_Data:
+		// Unlike the six rows above it this names no column, so it is NOT in
+		// command_needs_menu_target and can be run from the palette as well as from
+		// the header menu.
+		if doc != nil && doc.table {
+			// The person has now answered, so the mode stops being Auto and the
+			// heuristic stops being consulted for this document.
+			doc.table_header_mode = .Header if doc.table_headerless else .Data
+			table_headerless_resolve(doc, app.settings.table_header_mode)
+			// THE ROW SET JUST CHANGED, so the sort has to go. Every offset in the
+			// permutation was built when the row set had one more (or one fewer) row
+			// at the front, and a visible row would resolve to the line beside the
+			// one drawn -- which the cell editor then writes through. Same reason
+			// table_sort_shift drops a sort when a newline moves, reached by a
+			// different route.
+			table_sort_clear(doc)
+			table_sort_scroll_top(doc)
+			// ...and the columns re-fit: line 0 has moved between the band and the
+			// data, so it now counts toward a different one of the two.
+			clear(&doc.table_widths)
+			table_compute_widths(doc, t)
+			// Learn the family default on exactly the terms .Toggle_Table learns
+			// its own: only while remembering is on, and only from a file with a
+			// path (doc_is_tabular short-circuits true for an untitled buffer, so
+			// without that an untitled scratch tab would teach a default from a
+			// buffer that was never a real table).
+			if app.settings.remember_views && doc.path != "" {
+				app.settings.table_header_mode = doc.table_header_mode
+				settings_save(app.settings)
+			}
+		}
 	case .Toggle_Preview:
 		// Cycle Off -> Preview -> Split -> Off. The preview scrolls in pixels from
 		// its own anchor (doc.md_top); re-anchoring doc.top to a line start here is

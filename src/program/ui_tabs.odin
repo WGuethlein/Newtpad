@@ -453,6 +453,92 @@ tabs_drag_update :: proc(app: ^App, win: ^plat.Window, t: ^plat.Text) {
 	}
 }
 
+// --- tearing a tab off into its own window ---------------------------------
+//
+// Is the pointer outside this window's client area? The gesture Wyatt chose:
+// dragging a tab anywhere out of the window and RELEASING there opens it in a
+// window of its own.
+//
+// On release rather than live, and that is a real difference from Chrome: a
+// window cannot be created and dragged mid-gesture here, so the tab stays in the
+// strip until the button comes up. Dropping it back inside the window is
+// therefore an ordinary reorder, which is also the whole of the "changed my mind"
+// story.
+//
+// The client-coordinate test survives mouse CAPTURE, which is what makes it work
+// at all: SetCapture on mouse-down (platform/window.odin) keeps WM_MOUSEMOVE
+// arriving after the pointer leaves, and a point outside reads as negative or as
+// past the edge. Both are caught here.
+tabs_drag_outside :: proc(win: ^plat.Window) -> bool {
+	if win == nil || win.hwnd == nil {return false} // headless: no window to leave
+	return tabs_pointer_outside(win.mouse_x, win.mouse_y, win.width, win.height)
+}
+
+// The geometry half, split out so a test can reach it: tabs_drag_outside needs a
+// real hwnd (a headless Window has no client area to leave and must never report
+// that the pointer left it), and the arithmetic is the part worth pinning.
+//
+// Half-open on both axes, matching every other hit-test in the tree: the pixel at
+// `width` is the first one outside.
+tabs_pointer_outside :: proc(mx, my, w, h: i32) -> bool {
+	return mx < 0 || my < 0 || mx >= w || my >= h
+}
+
+// May this tab be torn off? SAVED AND UNMODIFIED ONLY, and that is the decision
+// the whole feature rests on rather than a limitation of it.
+//
+// A torn-off window is a second PROCESS, and a second process is not the primary
+// instance (main.odin), so it does not own the session store: its tabs are outside
+// hot-exit and outside crash recovery. Handing an unsaved buffer to a window with
+// no crash protection would be taking protection away at the exact moment the user
+// is moving something they care about. A file that exists on disk loses nothing
+// but its caret position.
+//
+// An untitled buffer is refused for the same reason and one more: there is no path
+// to hand over, and the only alternatives are serialising the buffer across a
+// process boundary or writing a temp file the user never asked for.
+tab_can_detach :: proc(doc: ^Document) -> bool {
+	return doc != nil && doc.path != "" && !doc.modified
+}
+
+// Open the dragged tab in a window of its own and close it here.
+//
+// ORDER IS LOAD-BEARING: the process is spawned FIRST and the tab is closed only
+// if that succeeded. A close-then-spawn would lose the tab outright whenever
+// CreateProcessW failed -- a locked exe, a policy block, an exhausted desktop heap
+// -- and the tab is the only record of where the user was in that file.
+//
+// Returns false when nothing happened, so the caller can leave the drag alone.
+tab_detach :: proc(app: ^App, win: ^plat.Window) -> bool {
+	if app == nil || win == nil {return false}
+	slot := app.tab_drag_slot
+	if slot < 0 || slot >= len(app.docs) {return false}
+	doc := app.docs[slot]
+	if !tab_can_detach(doc) {return false}
+
+	// At the pointer, sized like the window it came from -- so the new window
+	// appears where the tab was dropped rather than wherever the shell would have
+	// put it. Screen pixels, from the cursor directly: by now the point is outside
+	// this window, where its own client-space answer is a negative number.
+	sx, sy := plat.cursor_screen()
+	exe := plat.exe_path()
+	if exe == "" {return false}
+	args := []string {
+		"--detach",
+		fmt.tprintf("%d", sx),
+		fmt.tprintf("%d", sy),
+		fmt.tprintf("%d", win.width),
+		fmt.tprintf("%d", win.height),
+		doc.path,
+	}
+	if !plat.process_spawn(exe, args) {return false}
+	// Closed directly rather than through request_close_tab: that path exists to
+	// ASK about unsaved work, and tab_can_detach has already established there is
+	// none. Going through it would put a dialog in the middle of a drag.
+	app_close(app, slot)
+	return true
+}
+
 @(private = "file")
 Caption_Kind :: enum {
 	Minimise,

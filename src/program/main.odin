@@ -7,9 +7,46 @@ import "base:runtime"
 import "core:fmt"
 import "core:mem"
 import "core:os"
+import "core:strconv"
 import "core:time"
 import base "src:base"
 import plat "src:platform"
+
+// The command line, resolved: which file to open, whether this is a torn-off
+// window, and where to put it.
+//
+// Its own procedure so it can be tested -- `main` cannot be, and this is parsing
+// with a real edge in it (a `--detach` with too few arguments must not consume
+// the switch as a filename and try to open a file called "--detach").
+//
+// Every number falls back rather than refusing the launch: these four are a
+// window's position and size, and a torn-off tab arriving at the default place is
+// a far better outcome than one that does not arrive.
+parse_args :: proc(args: []string) -> (path: string, detach: bool, x, y, w, h: i32) {
+	x, y = plat.WINDOW_POS_DEFAULT, plat.WINDOW_POS_DEFAULT
+	w, h = 1280, 720
+	if len(args) <= 1 {return}
+	if args[1] == "--detach" {
+		// Too few arguments is NOT a fallback to "open a file named --detach": a
+		// malformed detach is a bug in the spawner, and opening the switch as a
+		// path would put a file-not-found box on screen instead of saying so.
+		if len(args) < 7 {return "", false, x, y, w, h}
+		return args[6], true, arg_i32(args[2], x), arg_i32(args[3], y), arg_i32(args[4], w), arg_i32(args[5], h)
+	}
+	return args[1], false, x, y, w, h
+}
+
+// One integer from the command line, or `fallback` when it is not one.
+//
+// Falls back rather than refusing the whole launch: these four numbers are only a
+// window's position and size, and a torn-off tab arriving at the default place is
+// a far better outcome than a torn-off tab that does not arrive.
+@(private = "file")
+arg_i32 :: proc(s: string, fallback: i32) -> i32 {
+	n, ok := strconv.parse_int(s)
+	if !ok {return fallback}
+	return i32(n)
+}
 
 // Drain a batch of paths handed over by another instance or dropped onto the
 // window: open each as a tab (app_open_path activates an existing tab if the
@@ -83,22 +120,37 @@ main :: proc() {
 	perf_mark("start: diag_init")
 
 	// Open the file given on the command line; with no argument, start empty.
-	path := ""
-	if len(os.args) > 1 {
-		path = os.args[1]
-	}
+	//
+	// `--detach <x> <y> <w> <h> <path>` is the tab tear-off's own launch, and the
+	// ONLY thing it changes is that this process does not hand its file to the
+	// running instance below. Without it a torn-off tab would be sent straight back
+	// to the window it was just dragged out of -- the single-instance hand-off
+	// doing exactly its job, at the one moment it is not wanted.
+	//
+	// Not a general "new window" switch, and deliberately undocumented in --help:
+	// a second instance does not own the session store (see `primary` below), so
+	// its tabs are outside hot-exit and crash recovery. The tear-off is allowed to
+	// produce one only because it refuses to tear off anything unsaved.
+	path, detach, dx, dy, dw, dh := parse_args(os.args)
 
 	// One instance per user: a second launch hands its file to the running window
 	// and exits, so only one process owns the session file and backups. If the
 	// hand-off fails (owner starting up or shutting down) we run normally rather
 	// than lose the file — see the primary check on session save below.
-	primary := plat.instance_claim()
-	if !primary && plat.instance_send_open(path) {
+	//
+	// A DETACHED WINDOW IS NEVER PRIMARY, stated here rather than left to fall out
+	// of the mutex. In practice the process that spawned it still holds the mutex
+	// so the claim fails anyway; the `&& !detach` covers the case where it does
+	// not -- a parent that died between spawning us and our claim -- where a torn
+	// -off tab would otherwise restore the whole previous session into itself and
+	// then start writing it back.
+	primary := plat.instance_claim() && !detach
+	if !primary && !detach && plat.instance_send_open(path) {
 		return
 	}
 	perf_mark("start: instance_claim")
 
-	window := plat.window_create("Newtpad", 1280, 720)
+	window := plat.window_create("Newtpad", dw, dh, dx, dy)
 	perf_mark("start: window_create")
 
 	gfx, ok := plat.gfx_init(window)
@@ -566,6 +618,12 @@ main :: proc() {
 			if window.mouse_down {
 				tabs_drag_update(&app, window, &text)
 			} else {
+				// Released OUTSIDE the window: tear the tab off into one of its
+				// own. Checked here, on the release, rather than inside
+				// tabs_drag_update -- the drag itself must keep reordering right up
+				// to the moment the button comes up, so that dropping the tab back
+				// inside is an ordinary reorder and the way to change your mind.
+				if tabs_drag_outside(window) {tab_detach(&app, window)}
 				app.tab_drag = false
 			}
 		}

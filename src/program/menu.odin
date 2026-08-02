@@ -322,6 +322,26 @@ table_header_menu_items := []Menu_Item {
 	{cmd = .Table_Sort_Remove, enabled = is_sort_key_col},
 	sep,
 	{cmd = .Table_Sort_Clear, enabled = has_live_sort},
+	sep,
+	// Not a sort row, which is why it is behind its own separator. It is here
+	// rather than in a top-level menu because it is a property of THIS TABLE and
+	// this menu is already the per-table surface; a View-menu entry would be a
+	// document-wide-looking control for a per-document answer.
+	//
+	// Checkable rather than a pair of rows: it is one yes/no about one file, and
+	// the tick says which way it is currently answered -- including when the answer
+	// came from the heuristic and the user has said nothing, which is the state
+	// they most need to be able to see and disagree with.
+	{cmd = .Table_First_Row_Is_Data, enabled = in_table_view, checked = first_row_is_data},
+}
+
+// Is line 0 currently being treated as data? Reads the RESOLVED flag, not the
+// mode, so the tick reflects what is on screen whether the answer came from the
+// user, from the family default or from table_detect_headerless.
+@(private = "file")
+first_row_is_data :: proc(app: ^App) -> bool {
+	d := app_active(app)
+	return d != nil && d.table && d.table_headerless
 }
 
 // Menu bar / dropdown state. `mode` is menu-bar keyboard mode with nothing open

@@ -848,3 +848,71 @@ file_close :: proc(fv: ^File_View) {
 	}
 	fv^ = {}
 }
+
+// --- spawning another copy of ourselves ------------------------------------
+//
+// Used by the tab tear-off (ui_tabs.odin): dragging a tab out of the window opens
+// it in a window of its own, and a window of its own means a second PROCESS,
+// because Newtpad has exactly one window per process by construction (one Gfx,
+// one swapchain, one message loop, one set of DPI-scaled globals).
+//
+// That is cheaper than it sounds and the reason is already in main.odin: the
+// single-instance mutex makes the FIRST process the primary, and `primary` gates
+// every session interaction there is -- restore, autosave, hot-exit save, crash
+// binding. A second process therefore already runs a complete editor that simply
+// does not touch the session store, which is the property that would otherwise
+// have made two windows a data-loss problem.
+
+// This executable's own path. The tear-off spawns THIS binary rather than looking
+// one up by name: an installed copy, a build directory copy and a portable copy on
+// a USB stick are all plausibly on the machine at once, and a torn-off tab must
+// open in the same build the user is looking at.
+exe_path :: proc(allocator := context.temp_allocator) -> string {
+	buf: [win.MAX_PATH_WIDE]u16
+	n := win.GetModuleFileNameW(nil, &buf[0], u32(len(buf)))
+	if n == 0 || int(n) >= len(buf) {return ""}
+	s, err := win.wstring_to_utf8(win.wstring(&buf[0]), int(n), allocator)
+	if err != nil {return ""}
+	return s
+}
+
+// Start `exe` with `args`, detached: we do not wait for it and we do not keep its
+// handles. Returns false if it could not be started at all, which the caller must
+// treat as "the tab stays where it is" rather than closing it first and hoping.
+//
+// The command line is built with each argument QUOTED and internal quotes
+// escaped, because the one argument that matters here is a file path and paths
+// contain spaces. Windows has no argv: the child re-parses this string, so the
+// quoting is the interface.
+process_spawn :: proc(exe: string, args: []string) -> bool {
+	if exe == "" {return false}
+	sb := strings.builder_make(context.temp_allocator)
+	// argv[0] is the exe, quoted like the rest.
+	quote :: proc(sb: ^strings.Builder, s: string) {
+		strings.write_byte(sb, '"')
+		for i in 0 ..< len(s) {
+			if s[i] == '"' {strings.write_byte(sb, '\\')}
+			strings.write_byte(sb, s[i])
+		}
+		strings.write_byte(sb, '"')
+	}
+	quote(&sb, exe)
+	for a in args {
+		strings.write_byte(&sb, ' ')
+		quote(&sb, a)
+	}
+	si: win.STARTUPINFOW
+	si.cb = size_of(si)
+	pi: win.PROCESS_INFORMATION
+	// The command line buffer must be WRITABLE -- CreateProcessW is documented to
+	// be able to modify it in place -- so it is a wstring built here and owned by
+	// the frame, never a literal.
+	cmd := win.utf8_to_wstring(strings.to_string(sb), context.temp_allocator)
+	ok := win.CreateProcessW(nil, cmd, nil, nil, win.BOOL(false), 0, nil, nil, &si, &pi)
+	if !ok {return false}
+	// Neither handle is wanted: this is a sibling, not a child we supervise, and
+	// leaking them would keep a zombie process object alive after it exits.
+	win.CloseHandle(pi.hProcess)
+	win.CloseHandle(pi.hThread)
+	return true
+}

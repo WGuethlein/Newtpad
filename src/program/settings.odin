@@ -70,6 +70,13 @@ Settings :: struct {
 	// restore carries its own per-tab state and must never be overridden by this.
 	md_default:      Md_Mode,
 	table_default:   bool,
+	// Whether tabular files tend to have a header row, learned the same way and on
+	// the same terms as table_default above: written only while remember_views is
+	// on, and only from a file with a path. `Auto` -- the default -- means nothing
+	// has been learned and each file is judged on its own bytes
+	// (table_detect_headerless). A user whose exports are all headerless answers
+	// once instead of once per file.
+	table_header_mode: Table_Header_Mode,
 	// When on, toggling a view updates the defaults above; off turns them into a
 	// pin instead of a running average of what you last did.
 	remember_views:  bool,
@@ -121,6 +128,7 @@ settings_default :: proc() -> Settings {
 		split_frac = SPLIT_DEFAULT,
 		md_default = .Off,
 		table_default = false,
+		table_header_mode = .Auto, // judge each file on its own bytes until told otherwise
 		remember_views = true, // remembering is on by default; the toggle pins it
 		theme_name = "Dark",
 	}
@@ -213,6 +221,13 @@ settings_load :: proc() -> Settings {
 			}
 		case "table_default":
 			s.table_default = parts[1] == "1"
+		case "table_header_mode":
+			// Range-checked for the same reason md_default above is: a value from a
+			// hand-edited or newer file degrades to Auto rather than becoming an
+			// invalid enum every switch on it would have to defend against.
+			if n, pok := strconv.parse_int(parts[1]); pok && n >= 0 && n <= int(max(Table_Header_Mode)) {
+				s.table_header_mode = Table_Header_Mode(n)
+			}
 		case "remember_views":
 			s.remember_views = parts[1] == "1"
 		case "split_frac":
@@ -250,7 +265,7 @@ settings_save :: proc(s: Settings) -> bool {
 	if s.split_frac == 0 {s.split_frac = SPLIT_DEFAULT}
 	s.split_frac = clamp(s.split_frac, SPLIT_MIN, SPLIT_MAX)
 	body := fmt.tprintf(
-		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\nremember_views %d\ntheme_name %s\n",
+		"newtpad-settings 1\nrestore_session %d\nwrap_default %d\nfont_size %d\nzoom_pct %d\ntab_width %d\nfont_family %s\nfont_style %d\nui_font_family %s\nlink_style %d\nsplit_frac %.4f\nmd_default %d\ntable_default %d\ntable_header_mode %d\nremember_views %d\ntheme_name %s\n",
 		1 if s.restore_session else 0,
 		1 if s.wrap_default else 0,
 		s.font_size,
@@ -263,6 +278,7 @@ settings_save :: proc(s: Settings) -> bool {
 		s.split_frac,
 		int(s.md_default),
 		1 if s.table_default else 0,
+		int(s.table_header_mode),
 		1 if s.remember_views else 0,
 		s.theme_name if s.theme_name != "" else "Dark",
 	)

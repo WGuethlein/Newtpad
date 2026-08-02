@@ -262,7 +262,19 @@ app_open_special :: proc(a: ^App, kind: Tab_Kind) {
 // never did -- a defaulted grid used to fall back to ',' with nothing recorded.
 app_apply_view_defaults :: proc(a: ^App, doc: ^Document) {
 	if doc == nil || doc.kind != .Text {return}
-	doc_view_apply(doc, Doc_View{wrap = doc.wrap, md_mode = a.settings.md_default, table = a.settings.table_default})
+	// table_header_mode is the FAMILY default here, on the same terms as
+	// table_default beside it: a fresh open adopts what was learned, and
+	// table_headerless_resolve turns Auto into the file's own answer when nothing
+	// has been learned yet.
+	doc_view_apply(
+		doc,
+		Doc_View {
+			wrap = doc.wrap,
+			md_mode = a.settings.md_default,
+			table = a.settings.table_default,
+			table_header_mode = a.settings.table_header_mode,
+		},
+	)
 }
 
 // Open `path` into a new tab and activate it. Returns false if the file couldn't

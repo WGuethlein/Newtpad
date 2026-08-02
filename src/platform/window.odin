@@ -332,7 +332,11 @@ Window :: struct {
 	click_count:   int,
 }
 
-window_create :: proc(title: string, width, height: i32) -> ^Window {
+// `x`/`y` place the window's top-left in SCREEN pixels. CW_USEDEFAULT (the
+// default) lets Windows choose, which is what a normal launch wants; the tab
+// tear-off passes a real point so the new window appears where the tab was
+// dropped rather than wherever the shell would have put it.
+window_create :: proc(title: string, width, height: i32, x: i32 = win.CW_USEDEFAULT, y: i32 = win.CW_USEDEFAULT) -> ^Window {
 	w := new(Window)
 	w.width = width
 	w.height = height
@@ -400,8 +404,8 @@ window_create :: proc(title: string, width, height: i32) -> ^Window {
 		class_name,
 		title_w,
 		win.WS_OVERLAPPEDWINDOW,
-		win.CW_USEDEFAULT,
-		win.CW_USEDEFAULT,
+		x,
+		y,
 		width,
 		height,
 		nil,
@@ -564,6 +568,21 @@ window_cursor_client :: proc(w: ^Window) -> (x, y: i32) {
 	pt: win.POINT
 	win.GetCursorPos(&pt)
 	win.ScreenToClient(w.hwnd, &pt)
+	return pt.x, pt.y
+}
+
+// The pointer in SCREEN pixels, independent of any window. The tear-off needs it
+// to place the new window where the tab was dropped, and by then the point is
+// outside the source window's client area, where window_mouse's ScreenToClient
+// answer is a negative number rather than a position on the desktop.
+// "Let Windows choose", for window_create's x/y. Exposed so the program layer can
+// name the default without importing core:sys/windows, which the layer rules keep
+// on this side of the seam.
+WINDOW_POS_DEFAULT :: i32(win.CW_USEDEFAULT)
+
+cursor_screen :: proc() -> (x, y: i32) {
+	pt: win.POINT
+	win.GetCursorPos(&pt)
 	return pt.x, pt.y
 }
 
