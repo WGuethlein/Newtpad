@@ -138,6 +138,7 @@ Command_Id :: enum u8 {
 	Menu_Item_Next,
 	Menu_Item_Prev,
 	Menu_Activate,
+	Menu_Search_Back,
 	// settings page
 	Settings_Open,
 	Settings_Close,
@@ -308,6 +309,7 @@ command_table := [Command_Id]Command {
 	.Menu_Item_Next           = {"Menu: Next Item", "View"},
 	.Menu_Item_Prev           = {"Menu: Previous Item", "View"},
 	.Menu_Activate            = {"Menu: Activate Item", "View"},
+	.Menu_Search_Back         = {"Menu: Search Delete Backward", "View"},
 	.Settings_Open            = {"Settings", "View"},
 	.Settings_Close           = {"Settings: Close", "View"},
 	.Settings_Next            = {"Settings: Next", "View"},
@@ -471,6 +473,13 @@ default_bindings := []Binding {
 	{.Down, false, false, .Menu, .Menu_Item_Next},
 	{.Up, false, false, .Menu, .Menu_Item_Prev},
 	{.Enter, false, false, .Menu, .Menu_Activate},
+	// Backspace edits the filter dropdown's search box, and does nothing at all on
+	// every other menu. It is a MENU command rather than a .Menu-context binding of
+	// .Backspace because main.odin closes the menu on any non-menu chord -- binding
+	// the editor's Backspace here would dismiss the dropdown and delete a character
+	// from the document behind it, which is the shape of bug this whole context
+	// system exists to prevent.
+	{.Backspace, false, false, .Menu, .Menu_Search_Back},
 	// --- find context ---
 	{.Escape, false, false, .Find, .Find_Close},
 	{.F, true, false, .Find, .Find_Open}, // switch to search view (leaves filter); Escape closes
@@ -1107,6 +1116,26 @@ command_mutates_doc :: proc(cmd: Command_Id) -> bool {
 // keymap line naming one of these six -- see its comment. A seventh command
 // with the same shape gets the same refusal by being added to this switch,
 // not by a second list somewhere else.
+// Rows whose click does NOT dismiss the dropdown they were clicked in.
+//
+// A menu closing on every click is right for a command and wrong for a
+// multi-select: the column filter's rows are checkboxes, and ticking one, having
+// the list vanish and reopening it to tick a second is not a gesture anyone would
+// design. Escape and a click outside still close it, which is how every
+// multi-select popup behaves.
+//
+// Deliberately a short, named list rather than a flag on Menu_Item: staying open
+// is a property of what the command DOES, and a row that stayed open by accident
+// -- a flag someone copied onto a new item -- would be a menu that will not go
+// away.
+command_keeps_menu_open :: proc(cmd: Command_Id) -> bool {
+	#partial switch cmd {
+	case .Table_Filter_Toggle, .Table_Filter_All:
+		return true
+	}
+	return false
+}
+
 command_needs_menu_target :: proc(cmd: Command_Id) -> bool {
 	#partial switch cmd {
 	case .Table_Sort_Asc, .Table_Sort_Desc, .Table_Sort_Then_Asc, .Table_Sort_Then_Desc,
@@ -1768,6 +1797,21 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		// split off: Ctrl+L has its own render path, scroll model and banner, so a
 		// column predicate riding inside it would mean one row set with two owners.
 		if doc.filter {doc.filter = false}
+		// BEFORE menu_filter_items, not after. menu_open_ctx clears the search box on
+		// every open, and the row set below is built as an argument to it -- so
+		// leaving the clear to menu_open_ctx would build the rows through the old
+		// query and then hide the box that explains why half of them are missing.
+		app.menu.query_len = 0
+		// REOPENING THE SAME COLUMN KEEPS THE SELECTION. table_filter_open rescans
+		// and re-ticks everything, so without this every reopen silently undid the
+		// filtering that was just done -- and since the dropdown closes on a click,
+		// reopening is exactly what you do to untick a second value. That is what
+		// "it doesn't look like it actually filters anything" was (Wyatt, v0.49.0):
+		// the filter worked and was thrown away a moment later.
+		if table_filtered(doc) && doc.table_filter.col == app.menu.ctx_col {
+			menu_open_ctx(app, menu_filter_items(app), app.menu.ctx_x, app.menu.ctx_y, app.menu.ctx_col)
+			break
+		}
 		if !table_filter_open(doc, app.menu.ctx_col) {
 			if doc.table_filter.refused {
 				app_note(app, fmt.tprintf("[TOO LARGE TO FILTER -- OVER %d ROWS]", TABLE_SORT_MAX))
@@ -1962,6 +2006,10 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 		} else {
 			menu_open_at(app, 0 if d > 0 else len(menus) - 1)
 		}
+	case .Menu_Search_Back:
+		// Returns false on every menu that has no search box, and on an empty one.
+		// Nothing else happens either way: a Backspace over a menu is not an edit.
+		menu_filter_query_back(app)
 	case .Menu_Item_Next, .Menu_Item_Prev:
 		d := 1 if cmd == .Menu_Item_Next else -1
 		if app.menu.open < 0 {

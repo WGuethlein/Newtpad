@@ -11,11 +11,25 @@
 package main
 
 import "core:fmt"
+import "core:unicode/utf8"
 import plat "src:platform"
 
 MENU_BAR_H_96 :: f32(30) // UI spec 2.1 (was 26)
 MENU_ITEM_H_96 :: f32(28) // dropdown row height, UI spec 2.2 (was 24)
 MENU_PAD_96 :: f32(12) // horizontal padding around a top-level title
+// Tallest a GENERATED dropdown gets, in rows. Twelve is about a third of a 1080p
+// window: small enough that a list of two hundred column values reads as a list
+// you scroll rather than as a panel that swallowed the screen.
+//
+// It does NOT apply to the hand-written menus. Edit is fourteen rows' worth and
+// would be clipped by this, and it needs no cap anyway -- a person typed every row
+// of it, so it cannot run away. Only the window-height clamp applies there, as it
+// always did. See menu_dropdown_rect.
+MENU_MAX_ROWS :: f32(12)
+// Width of the dropdown's scrollbar, drawn only when there is something to
+// scroll. Thin: it is an indicator that there is more, not a control -- the wheel
+// and the arrow keys are how you move, exactly as in the document.
+MENU_SCROLLBAR_W_96 :: f32(4)
 GEAR_W_96 :: f32(34) // settings gear hit box (wider than the glyph, so it's clickable)
 MENU_BAR_H := MENU_BAR_H_96
 MENU_ITEM_H := MENU_ITEM_H_96
@@ -40,6 +54,22 @@ Menu_Item :: struct {
 	// value, and this is how a row says which value it is to both the tick and the
 	// command.
 	payload: int,
+	// A row that is TEXT AND NOTHING ELSE: cmd stays .None, so it is un-pickable and
+	// un-highlightable through the machinery that already makes separators both --
+	// item_enabled refuses .None, menu_item_at returns -1 for it, menu_step walks
+	// past it. Only the height and the draw need to know it is a label rather than a
+	// rule.
+	//
+	// The filter's search box is the only user, and this is why it is a synthetic
+	// ITEM rather than a band above the rows: a band would need its own height
+	// threaded through menu_dropdown_rect, the draw, the hit-test, rows_fitting,
+	// menu_wheel and menu_scroll_to_item, and six consumers of one coordinate is the
+	// exact shape of every seam bug in this file. As an item it costs nothing --
+	// scrolling, clipping and hit-testing already handle it, correctly, today.
+	//
+	// The string must outlive the frame (menu_open_ctx's rule); the search row's
+	// points into App-owned Menu_State.query.
+	text:    string,
 }
 
 Menu :: struct {
@@ -188,12 +218,103 @@ menu_filter_items :: proc(app: ^App) -> []Menu_Item {
 	clear(&app.filter_items)
 	if d == nil {return app.filter_items[:]}
 	f := &d.table_filter
+	q := string(app.menu.query[:app.menu.query_len])
+	// The search box first, then (Select All), then the values. *"there should also
+	// be a search bar of sorts in this menu of the column choices... it's annoying
+	// to scroll to find the one you need"* (Wyatt, v0.49.0). It is the first row
+	// because a search box below the thing it searches reads as a footer.
+	//
+	// (Select All) is NOT filtered out by the query and stays above the values, so
+	// "type three letters, Select All" means all of THE MATCHES -- which is the
+	// operation the search exists to make possible. table_filter_apply reads the
+	// ticks, not the rows, so this is a property of the row set alone.
+	label := "Type to search…"
+	if q != "" {label = fmt.bprintf(app.menu.query_label[:], "Search: %s_", q)}
+	append(&app.filter_items, Menu_Item{text = label})
 	append(&app.filter_items, Menu_Item{cmd = .Table_Filter_All, checked = filter_all_on})
 	append(&app.filter_items, sep)
-	for _, i in f.values {
+	for v, i in f.values {
+		// THE PAYLOAD IS THE TRUE VALUE INDEX, not the row's position, so a search
+		// that hides rows cannot make a click tick the wrong value. That separation
+		// is the whole reason the filter survives being typed into.
+		if q != "" && !menu_contains_fold(v, q) {continue}
 		append(&app.filter_items, Menu_Item{cmd = .Table_Filter_Toggle, checked = filter_value_on, payload = i})
 	}
 	return app.filter_items[:]
+}
+
+// Is `q` in `s`, ignoring ASCII case? Hand-rolled and ASCII-only on purpose: a
+// full Unicode case fold is a table this layer has no business carrying, and the
+// values being searched are the column's own text, where matching `active`
+// against `ACTIVE` is the whole of what anyone wants.
+@(private = "file")
+menu_contains_fold :: proc(s, q: string) -> bool {
+	if len(q) > len(s) {return false}
+	lower :: proc(b: u8) -> u8 {return b + 32 if b >= 'A' && b <= 'Z' else b}
+	for i in 0 ..= len(s) - len(q) {
+		ok := true
+		for j in 0 ..< len(q) {
+			if lower(s[i + j]) != lower(q[j]) {ok = false;break}
+		}
+		if ok {return true}
+	}
+	return false
+}
+
+// Feed one typed character to the filter dropdown's search box. Returns true when
+// it was taken, so the caller stops looking for another consumer.
+//
+// Only while the dropdown carrying the FILTER's rows is open -- typing over a bar
+// menu still means whatever it meant before, and a document keystroke must never
+// be swallowed by a menu that happens to be up.
+menu_filter_query_rune :: proc(app: ^App, r: rune) -> bool {
+	if !menu_dropdown_active(app) || !menu_is_filter_dropdown(app) {return false}
+	if r < 32 || r == 127 {return false} // control characters are not a query
+	b, n := utf8.encode_rune(r)
+	if app.menu.query_len + n > len(app.menu.query) {return true} // full: swallow, don't wrap
+	copy(app.menu.query[app.menu.query_len:], b[:n])
+	app.menu.query_len += n
+	menu_filter_requery(app)
+	return true
+}
+
+// Backspace in the search box. Same contract as above.
+menu_filter_query_back :: proc(app: ^App) -> bool {
+	if !menu_dropdown_active(app) || !menu_is_filter_dropdown(app) {return false}
+	if app.menu.query_len == 0 {return false} // nothing to delete: let Backspace mean what it means
+	p := app.menu.query_len - 1
+	for p > 0 && (app.menu.query[p] & 0xC0) == 0x80 {p -= 1}
+	app.menu.query_len = p
+	menu_filter_requery(app)
+	return true
+}
+
+// Rebuild the visible rows and put the highlight somewhere real. The row set just
+// changed under `menu.item`, and an index into the old list points at a different
+// value -- or past the end -- in the new one.
+@(private = "file")
+menu_filter_requery :: proc(app: ^App) {
+	items := menu_filter_items(app)
+	app.menu.ctx_items = items
+	app.menu.top = 0
+	app.menu.item = -1
+	for it, i in items {
+		if item_enabled(app, it) {
+			app.menu.item = i
+			break
+		}
+	}
+}
+
+// Is the open dropdown the column filter's? The query only applies to that one,
+// and asking by CONTENT rather than by a flag means a dropdown cannot claim to be
+// the filter's while holding somebody else's rows.
+menu_is_filter_dropdown :: proc(app: ^App) -> bool {
+	if !app.menu.ctx {return false}
+	for it in app.menu.ctx_items {
+		if it.cmd == .Table_Filter_All || it.cmd == .Table_Filter_Toggle {return true}
+	}
+	return false
 }
 
 // Every value ticked? The (Select All) row's own state, and what makes it a
@@ -525,6 +646,22 @@ Menu_State :: struct {
 	// reason ctx_col is: the command runs after the menu has closed, so anything it
 	// needs from the row has to outlive the menu.
 	ctx_payload: int,
+
+	// The column filter dropdown's search box. A fixed buffer, not a [dynamic]u8:
+	// it lives on the App for the life of the process and this is a filter over a
+	// list of column values, where a query past a line's worth of text has already
+	// stopped narrowing anything.
+	//
+	// UNLIKE ctx_col and ctx_payload, this IS cleared on close -- it is read only
+	// while the dropdown is open (menu_filter_items), so a stale query would
+	// silently pre-filter the next column's values.
+	query:       [128]u8,
+	query_len:   int,
+	// Where the search row's label is BUILT. Its own buffer because Menu_Item.text
+	// is a borrowed string that has to outlive the frame, and the obvious way to
+	// write it -- format into the temp allocator -- dangles at the next free_all,
+	// which is the trap menu_open_ctx's comment already describes for the slice.
+	query_label: [160]u8,
 }
 
 // Must be called before the first frame: the zero value of `open` is 0, which
@@ -568,6 +705,7 @@ menu_close :: proc(app: ^App) {
 	app.menu.item = -1
 	app.menu.ctx = false
 	app.menu.ctx_items = nil
+	app.menu.query_len = 0
 }
 
 // Covers `ctx` as well as the bar: without it, a click outside a context menu
@@ -586,7 +724,7 @@ menu_dropdown_active :: proc(app: ^App) -> bool {return app.menu.open >= 0 || ap
 
 is_menu_cmd :: proc(c: Command_Id) -> bool {
 	#partial switch c {
-	case .Menu_Close, .Menu_Next, .Menu_Prev, .Menu_Item_Next, .Menu_Item_Prev, .Menu_Activate:
+	case .Menu_Close, .Menu_Next, .Menu_Prev, .Menu_Item_Next, .Menu_Item_Prev, .Menu_Activate, .Menu_Search_Back:
 		return true
 	}
 	return false
@@ -667,7 +805,13 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 		}
 		// Any click while a dropdown is open is consumed, as native menus do —
 		// clicking away closes it rather than also moving the caret.
-		menu_close(app)
+		//
+		// EXCEPT a row that ticks a checkbox. A menu closing on every click is
+		// right for a command and wrong for a multi-select: ticking one value,
+		// having the list vanish, and reopening it to tick a second is not a
+		// gesture anyone would design, and it is what shipped in v0.49.0.
+		// command_keeps_menu_open names the rows that stay.
+		if !command_keeps_menu_open(picked) {menu_close(app)}
 		consume_click(win)
 		return picked, true
 	}
@@ -801,6 +945,7 @@ menu_open_at :: proc(app: ^App, mi: int) {
 	app.menu.ctx = false
 	app.menu.ctx_items = nil
 	app.menu.ctx_col = 0
+	app.menu.query_len = 0
 	app.menu.mode = true
 	app.menu.open = clamp(mi, 0, len(menus) - 1)
 	app.menu.item = menu_step(app, app.menu.open, 0, 1)
@@ -831,6 +976,7 @@ menu_open_at :: proc(app: ^App, mi: int) {
 menu_open_ctx :: proc(app: ^App, items: []Menu_Item, x, y: f32, col: int) {
 	app.menu.mode = false
 	app.menu.open = -1
+	app.menu.query_len = 0 // a search box starts empty on every open, per column
 	app.menu.ctx = true
 	app.menu.ctx_items = items
 	app.menu.ctx_x = x
@@ -1014,6 +1160,16 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	last := app.menu.top + app.menu.rows
 	for i := app.menu.top; i < min(last, len(items)); i += 1 {
 		it := items[i]
+		if it.cmd == .None && it.text != "" { // a label row: the filter's search box
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + sx(4), y + sx(3)}, size = {dw - sx(8), MENU_ITEM_H - sx(6)}, color = g_theme[.Bg_Raised]}})
+			// Muted when it is showing the prompt, primary when it is showing what
+			// was typed -- the same distinction the find bar draws, so an empty box
+			// cannot be read as a query that matches nothing.
+			typed := app.menu.query_len > 0
+			plat.text_draw(gfx, t, it.text, x0 + sx(12), y + MENU_ITEM_H - sx(9), UI_PX, g_theme[.Text_Primary] if typed else g_theme[.Text_Muted])
+			y += MENU_ITEM_H
+			continue
+		}
 		if it.cmd == .None { // separator
 			sh := MENU_ITEM_H * 0.4
 			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + sx(8), y + sh * 0.5}, size = {dw - sx(16), sx(1)}, color = g_theme[.Border_Strong]}})
@@ -1053,6 +1209,32 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	}
 	if more_below {
 		plat.text_draw(gfx, t, "▼", x0 + dw - sx(16), y0 + h - sx(4), UI_SMALL_PX, g_theme[.Text_Muted])
+	}
+	// A SCROLLBAR, when there is more than fits. The two arrows above say "there is
+	// more" and say nothing about how much or where you are -- which is fine for a
+	// menu clipped by one row and useless for a generated list of two hundred
+	// values. Proportional thumb, same shape as the document's.
+	//
+	// Drawn, not draggable. The wheel and the arrow keys move the list; a drag
+	// would need its own hit-test inside a surface whose every other pixel already
+	// means "pick this row", and the wheel is what a person reaches for anyway.
+	if total := len(items); total > app.menu.rows && app.menu.rows > 0 {
+		bw := max(sx(MENU_SCROLLBAR_W_96), 2)
+		bx := x0 + dw - bw
+		frac := f32(app.menu.rows) / f32(total)
+		th := max(h * frac, MENU_ITEM_H * 0.5)
+		// Positioned off the FIRST VISIBLE ROW over the rows that can be first, so
+		// the thumb reaches the bottom exactly when the last row is on screen.
+		span := max(1, total - app.menu.rows)
+		ty := y0 + (h - th) * f32(min(app.menu.top, span)) / f32(span)
+		plat.quads_draw(
+			gfx,
+			qp,
+			[]plat.Quad {
+				{pos = {bx, y0}, size = {bw, h}, color = g_theme[.Bg_Raised]},
+				{pos = {bx, ty}, size = {bw, th}, color = g_theme[.Scrollbar_Thumb]},
+			},
+		)
 	}
 }
 
@@ -1098,6 +1280,24 @@ menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0,
 	// The downward cap still floors at MENU_ITEM_H, and the rows past the cap are
 	// still not clickable (menu_item_at requires my < height), so the residual
 	// case is a visibility one and not a safety one — as before.
+	// A CEILING IN ROWS, not just in window height. A hand-written menu is a dozen
+	// rows and never reaches it; the column filter GENERATES its rows -- up to
+	// TABLE_FILTER_VALUES_MAX of them -- and without this the dropdown is as tall
+	// as the window, which is not a menu, it is a wall. *"there's no scroll bar, it
+	// shouldn't be the full vertical height of the window... something reasonable"*
+	// (Wyatt, v0.49.0).
+	//
+	// The scroll machinery to go under it already existed (menu.top, rows_fitting,
+	// the more_above/more_below arrows); what it never had was a reason to trigger
+	// or a way to drive it with the mouse. Both arrived with this.
+	// ...AND ONLY ON A GENERATED ROW SET. This first shipped unconditional, and the
+	// Edit menu is 12 command rows and 5 separators -- fourteen rows' worth, past a
+	// cap of twelve -- so Font became unreachable again, which is the exact bug the
+	// more_above/more_below arrows were added for in the first place. menutest
+	// caught it; the constant's own comment ("enough that no hand-written menu is
+	// ever clipped") was simply wrong, and a menu nobody generated has never needed
+	// this because a person typed every row of it.
+	if menu_is_filter_dropdown(app) {full = min(full, MENU_MAX_ROWS * MENU_ITEM_H)}
 	below := max(0, height - oy - sx(4))
 	above := max(0, oy - sx(4))
 	if full > below && above > below {
@@ -1111,9 +1311,14 @@ menu_dropdown_rect :: proc(t: ^plat.Text, app: ^App, width, height: f32) -> (x0,
 	return
 }
 
-// Item height, separators included.
+// Item height, separators included. A .None row carrying text is a label, not a
+// rule, and gets a full row -- one expression, so the draw and the hit-test cannot
+// disagree about how tall the search box is.
 @(private = "file")
-item_h :: proc(it: Menu_Item) -> f32 {return MENU_ITEM_H if it.cmd != .None else MENU_ITEM_H * 0.4}
+item_h :: proc(it: Menu_Item) -> f32 {
+	if it.cmd != .None || it.text != "" {return MENU_ITEM_H}
+	return MENU_ITEM_H * 0.4
+}
 
 // Rows that fit in `h` starting at item `from`, and whether everything from
 // `from` onward fits. One walk, used by both the draw and the hit-test.
@@ -1155,6 +1360,32 @@ menu_resolve_top :: proc(top, item: int, items: []Menu_Item, h: f32) -> int {
 		t += 1
 	}
 	return clamp(t, 0, max(0, len(items) - 1))
+}
+
+// The wheel over an open dropdown. Returns true when it consumed the notch, so
+// the document behind it does not scroll too.
+//
+// The dropdown had scroll STATE (menu.top) and a scroll RESOLVER
+// (menu_resolve_top) since the day a menu first outgrew a short window, and no way
+// at all to drive either with the mouse -- the keyboard highlight was the only
+// thing that ever moved it. That was survivable while every menu was a dozen
+// hand-written rows and stopped being survivable the moment the column filter
+// generated two hundred.
+menu_wheel :: proc(app: ^App, t: ^plat.Text, delta: int, w, h: f32) -> bool {
+	if !menu_dropdown_active(app) || delta == 0 {return false}
+	items := menu_items(app)
+	_, _, _, dh := menu_dropdown_rect(t, app, w, h)
+	vis := rows_fitting(items, app.menu.top, dh)
+	if vis >= len(items) && app.menu.top == 0 {return true} // nothing to scroll, still ours
+	// Clamped so the last row can reach the bottom and no further: scrolling into
+	// empty space below a list is the thing that makes a list feel broken.
+	last := 0
+	for last < len(items) {
+		if rows_fitting(items, last, dh) >= len(items) - last {break}
+		last += 1
+	}
+	app.menu.top = clamp(app.menu.top - delta, 0, last)
+	return true
 }
 
 // Scroll the dropdown the minimum needed to bring `app.menu.item` into view.
@@ -1213,6 +1444,13 @@ dropdown_w :: proc(app: ^App, t: ^plat.Text, items: []Menu_Item) -> f32 {
 	cw := plat.text_char_width(t, UI_PX)
 	widest := 0
 	for it in items {
+		// A label row has no command and no accelerator, and still has to fit: the
+		// search box showing "abcdefgh" in a dropdown sized for "(Select All)" would
+		// print past its own border.
+		if it.cmd == .None && it.text != "" {
+			if n := len(it.text) + 8; n > widest {widest = n}
+			continue
+		}
 		if it.cmd == .None {continue}
 		trailing := max(len(command_chord(it.cmd)), len(command_disabled_hint(it.cmd)))
 		title := menu_item_label(app, it)
