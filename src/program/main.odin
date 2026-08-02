@@ -485,8 +485,8 @@ main :: proc() {
 		// scrollbar, its drag and the wheel cannot be allowed to differ.
 		srows := doc_scroll_rows(doc, f32(window.height), line_h, px)
 		// Usable content width in cells (word wrap breaks here).
-		doc_update_gutter(doc, char_w) // before view_cols: the gutter narrows the text
-		doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), app.settings.split_frac), char_w)
+		doc_update_gutter(doc, char_w, app.settings.gutter) // before view_cols: the gutter narrows the text
+		doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), app.settings.split_frac), char_w, doc_wraps(doc))
 		doc.view_rows = rows
 		// Horizontal scroll: clamp to real content, then mirror into H_SCROLL for
 		// this frame so the whole frame's column geometry agrees. This is the
@@ -2061,10 +2061,16 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	// hit-test thinks it is.
 	trows := table_visible_rows(doc, f32(window.height), px)
 	srows := doc_scroll_rows(doc, f32(window.height), line_h, px) // the bar's count; see doc_scroll_rows
-	doc_update_gutter(doc, char_w) // resize repaints come through here too
+	// Same setting as the main loop's call above, deliberately. doc_view_cols's own
+	// comment records the bug where these two disagreed: the main loop subtracted
+	// GUTTER_W and this repaint did not, so a resize wrapped to a different width
+	// than the frame before it. Passing the flag at one site and not the other is
+	// that bug again, in a form the compiler cannot catch (the parameter defaults
+	// to false). gutterseamtest asserts the two agree.
+	doc_update_gutter(doc, char_w, rc.app.settings.gutter) // resize repaints come through here too
 	// Recompute the wrap width here (not just in the main loop) so word wrap
 	// re-flows live during a resize, which repaints through this path.
-	doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), rc.app.settings.split_frac), char_w)
+	doc.view_cols = doc_view_cols(doc_editor_right(doc, f32(window.width), rc.app.settings.split_frac), char_w, doc_wraps(doc))
 	doc_update_hscroll(doc) // mirror the (already-clamped) horizontal offset
 
 	plat.text_frame_begin(gfx, text) // resets the recycle guard and grows the atlas if owed
@@ -2178,6 +2184,45 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		}
 
 		cx, cy, caret, bottom = doc_draw(gfx, text, doc, px, char_w, drawn, links)
+
+		// UI spec §15: three hints, bottom-left, text_dim -- "they vanish on the
+		// first keystroke; never fade, never animate". So the condition is simply
+		// that the buffer is empty: that IS "before the first keystroke", it needs
+		// no separate flag to go stale, and typing then deleting everything
+		// correctly brings them back.
+		//
+		// Bottom-left rather than centred, per the spec's own reason: it "keeps them
+		// clear of the first thing typed", which starts top-left at the caret.
+		//
+		// Deliberately NOT gated on `doc.path == ""`. An empty file opened from
+		// disk is just as blank and the hints are just as true; §15 describes the
+		// state, not the provenance. No logo, no welcome, no recent-files grid --
+		// the rest of §15 is a list of things not to draw.
+		if doc != nil && doc.kind == .Text && doc.pt.length == 0 && !doc_read_only_view(doc) && !doc.filter {
+			HINTS := [?]string{"Ctrl+O   open a file", "Ctrl+P   commands", "drop     a file anywhere in this window"}
+			lh := UI_PX * 1.6
+			// Sits above the status bar, growing upward, so the last hint clears the
+			// bar rather than the first one deciding where the block starts.
+			by := f32(window.height) - doc_bottom_bar_h(doc) - sx(14)
+			// Text_MUTED, where §15 says text_dim -- a deliberate divergence, and the
+			// one place this batch does not follow the spec to the letter.
+			//
+			// Text_Dim is 2.9:1 and the theme file marks it DISABLED ONLY; themetest
+			// enforces zero uses of it in this file and fails the build otherwise.
+			// The exemption WCAG grants is for controls that are dim BECAUSE they are
+			// disabled, and table.odin's em-dash was REVERTED out of that allowlist
+			// (batch 18 review, F5) on the grounds that live information is not
+			// chrome. These hints are the same shape: they are instructions the user
+			// is meant to read, not a control that will not respond. Text_Muted
+			// clears AA and is what the dash was moved to.
+			//
+			// So §15 and §18 disagree here, and §18 is the later and more carefully
+			// argued of the two. Worth Wyatt's ruling if he wants them dimmer.
+			for i := len(HINTS) - 1; i >= 0; i -= 1 {
+				plat.text_draw(gfx, text, HINTS[i], TEXT_MARGIN_X, by, UI_PX, g_theme[.Text_Muted])
+				by -= lh
+			}
+		}
 	}
 
 	// Horizontal scroll draws each line shifted left, so glyphs left of the first

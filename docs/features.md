@@ -193,6 +193,34 @@ to whole lines, or on the whole document when there is no selection.
 - **Sort Lines Descending (selection, or whole file)**
 - **Remove Duplicate Lines (exact match, keeps the first)** — all duplicates, not just adjacent ones.
 
+### Format Document — `Ctrl+Alt+F`
+
+One command for four languages, picked from the extension first and then from the first non-space
+byte of the buffer — so a `.log` that is one enormous JSON line reformats, and so does a scratch
+buffer pasted from a terminal.
+
+| Reads as | From |
+|---|---|
+| **JSON** | `.json`, or a buffer starting `{` / `[` |
+| **CSS** | `.css .scss .sass` — by extension only; a stylesheet has no distinctive first byte |
+| **XML** | `.xml .svg .xaml .xsd .xsl .xslt .plist .csproj .props .targets .resx`, or a buffer starting `<` |
+| **HTML** | `.html .htm .xhtml .vue .svelte` — **by extension only** |
+
+**XML and HTML never rewrite content, only structure.** An element containing any text of its own is
+copied byte for byte, so `<name>Ada Lovelace</name>` and `<p>Hello <b>x</b>!</p>` come back untouched;
+only elements whose content is purely other elements get laid out. **HTML adds one more rule**: an
+element is laid out only when every element directly inside it is block-level, because a line break
+beside an inline element (`<span>`, `<a>`, `<img>`, `<br>`) renders as a *space* —
+`<div><span>a</span><span>b</span></div>` would become "a b". `<pre>` and `<textarea>` survive
+verbatim.
+
+An unextensioned blob of tags reads as **XML**, deliberately: `<` cannot distinguish the two, and XML's
+rules are the conservative pair.
+
+The consequence, stated plainly: a document that is mostly prose comes back barely changed. A document
+that is mostly *structure* — which is what you are staring at when you reach for this — becomes
+readable. Minified JavaScript is **not** supported and will not be; see `requested-features.md` §1.
+
 *Limits:* the sort folds ASCII case only (`Ä`/`ä` do not fold; non-ASCII compares by UTF-8 byte order).
 Dedupe is exact — `Foo` and `foo` are two different lines even though the sort compares them
 case-insensitively. The region must be under **16 MB and 1,000,000 lines**; beyond that the command
@@ -246,6 +274,25 @@ Each is per-document, toggles both ways, and leaves the bytes alone.
 On/off per tab, with a default for new documents in Settings. Refuses (with a reason naming the key
 that gets you out) in table view and Markdown Preview, which ignore the flag; Markdown Split always
 wraps.
+
+**Wrapped text is capped at 100 columns** even on a wide window — an uncapped wrap on a maximised
+1440p display gives 200-character lines, which is past what anyone reads comfortably. The text stays
+left-aligned; the cap shortens the line rather than centring it. Not a setting. An **unwrapped**
+document is unaffected: horizontal scrolling still reports the window's real width.
+
+### Line numbers — Settings ▸ Line numbers
+
+A gutter down the left, **off by default**. The current line's number is bright and the rest are
+muted, which shows your position without tinting the whole line. A wrapped line is numbered once, on
+its first visual row, so a wrapped paragraph does not read as several lines.
+
+The gutter is 44px wide and **widens only when the line count needs more digits**, so a multi-GB log
+gets nine digits rather than a clipped number. Numbers appear once the background line index reaches
+the top of the view — until then the gutter is blank rather than showing a confident wrong number. Its
+width is reserved from the start, so nothing shifts when they arrive.
+
+The filter view (`Ctrl+L`) has always had its own gutter and still does regardless of this setting:
+showing lines out of context is meaningless without saying which lines they are.
 
 ### Markdown preview / split — `Ctrl+M`
 
@@ -404,6 +451,12 @@ is viewport-scoped — only visible lines, capped at 4096 bytes per line.
 
 ## Appearance
 
+- **An empty tab shows three hints, bottom-left**: `Ctrl+O` open a file, `Ctrl+P` commands, and that
+  you can drop a file anywhere in the window. They **vanish on the first keystroke** — never fading,
+  never animating — and come back if you delete everything again. There is no logo, no welcome screen
+  and no recent-files grid: Newtpad opens in under a second and you type. Dropping a file already
+  works; the drag-over ring the spec asks for does not exist yet (it needs a drop-target the current
+  Win32 path does not provide).
 - **Themes**: *Dark* (default) and *Light* are compiled in. Any `*.theme` file dropped in
   `%APPDATA%\Newtpad\themes\` appears as a choice in Settings by its filename stem.
 - **`View ▸ Edit Current Theme...`** exports the active theme to a `.theme` file, opens it as a tab, and

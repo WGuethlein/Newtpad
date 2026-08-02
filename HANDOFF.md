@@ -6895,6 +6895,123 @@ read was unreachable outside the harness — this is a **test-integrity** fix, a
 before and after. It is the second batch in a row aimed at whether verification works rather than at
 what Newtpad does, and that is now finished; the next batch is product work.
 
+## 6bx. Four small features (2026-08-02, v0.57.0, branch `feat/small-features-batch`)
+
+The first user-visible batch since v0.54.0 — two before it were both aimed at the harness. Four items
+from `requested-features.md`, chosen for being cheap and unblocked: **§8's line-number gutter**, **§8's
+100-column wrap cap**, **§15's three empty-tab hints**, and **HTML in Format Document**.
+
+Reading the spec and the code first changed the batch's shape three times, which is the argument for
+doing that before scoping rather than after.
+
+### The gutter was mostly already there, and the code said so
+
+`GUTTER_W` has existed for the filter view and is already single-sourced through `col_x`, `col_at_x`
+and `doc_view_cols`. `doc.odin`'s own comment predicted this batch: *"Latent only because the gutter is
+filter-view-only today; it goes live the moment the gutter generalizes to normal editing."* So the work
+was a setting, a width rule, and a draw — not a geometry change.
+
+**Width: 44px minimum, growing past four digits.** §8 says "44px right-aligned + 12px gap"; §14 opens
+10 GB logs, where a hundred-million-line file needs nine digits. Wyatt's call: honour the spec at normal
+sizes, widen only when the digits demand it. Sized from `doc_line_count` and **not** from the largest
+number on screen — a width that tracked the viewport would change while scrolling, and since `col_x`
+adds it, the whole text column would slide under the caret as the wheel turned.
+
+**One `doc_line_no_at` call per screen, not per row.** Copied from `table_abs_rows`, and for its
+measured reason rather than for symmetry: that procedure's comment puts the call at 153.3 µs in a debug
+build, so a per-row producer would spend 6.1 ms of a 40-row repaint re-counting the same bytes.
+
+Three things the draw had to get right that the queue entry did not mention:
+
+- **It draws OUTSIDE the `if n > 0` block.** A blank line produces no bytes and skips that block
+  entirely — a gutter inside it would silently skip every empty line. The filter view's own gutter *is*
+  inside it and has always had this gap, invisible only because a filtered row matched something.
+- **`.Doc`, explicitly.** `plat.text_draw` defaults to the **UI** font, but the right-alignment is
+  computed from `char_w`, the *document's* cell width. Drawing digits in the UI face right-aligns them
+  against a measure they are not drawn in, and they creep as soon as the two families differ — which is
+  the default (Cascadia Mono UI, Consolas doc). **The existing filter gutter had this bug**; fixed in
+  passing.
+- **A wrapped line is numbered once**, on its first visual row, or a wrapped paragraph reads as N lines.
+
+### The seam is what got tested
+
+`GUTTER_W` is read by both `col_x` (what is **drawn**) and `col_at_x` (what is **clicked**), which is
+precisely the hazard CLAUDE.md's one-layout rule exists for — §6j's sixteen bugs were all a correct
+function fed the wrong input or read in the wrong space. `gutterseamtest` therefore compares the draw's
+column geometry against the hit-test's over 400 columns with a gutter present, rather than checking that
+a width formula returns a number. It also pins scroll-invariance, the digit growth, and the wrap cap.
+
+**Sabotaged three ways in one build.** Dropping `GUTTER_W` from `col_at_x` fails **all 400 columns** —
+the "every click lands a fixed offset right of the glyph" bug. Removing the cap and flattening the digit
+growth each fail their own assertions.
+
+### The two call sites that must agree
+
+`doc_update_gutter` is called from the main loop **and** from `render_frame`'s resize repaint, and
+`doc_view_cols`'s comment records the bug where those two disagreed: one subtracted `GUTTER_W` and the
+other did not, so a resize wrapped to a different width than the frame before it. The new flag defaults
+to `false`, so passing it at one site and not the other would be that bug again **in a form the compiler
+cannot catch**. Both sites pass it; the comment at each says why.
+
+The wrap cap lives inside `doc_view_cols` for the same reason — a rule applied at one call site and not
+the other is that bug — and is gated on `wrapping`, because in an unwrapped document `view_cols` is the
+usable width that horizontal scrolling reads, and clamping it to 100 would tell h-scroll the window is
+narrower than it is.
+
+### `themetest` caught the hints, and was right to
+
+§15 specifies `text_dim` for the three hints. `Text_Dim` is 2.9:1, the theme file marks it **DISABLED
+ONLY**, and `themetest` enforces zero uses in `main.odin`. It failed the build.
+
+**The spec contradicts itself here and §18 wins.** The exemption WCAG grants is for controls that are
+dim *because they are disabled*; `table.odin`'s em-dash was **reverted** out of that allowlist in batch
+18 on the grounds that live information is not chrome. These hints are instructions meant to be read, so
+they are the same shape. They draw in `Text_Muted`, which clears AA and is where the dash went.
+**Recorded rather than silently diverged, and Wyatt's to overrule.**
+
+### HTML: the caveat was the whole job
+
+`requested-features.md` called HTML "cheap and NOT blocked ... with the caveat that its whitespace
+significance is broader". The caveat is the feature. `xml_format`'s existing rule — any element with
+text of its own goes out byte for byte — already protects `<p>Hello <b>x</b>!</p>`. It does **not**
+protect element-only content made of inline elements:
+
+    <div><span>a</span><span>b</span></div>
+
+The div has no text of its own, so `xml_format` lays it out, and the newline between the spans collapses
+to a rendered **space**: "ab" becomes "a b". Silently changing what a document says is exactly why a
+JavaScript formatter was refused outright, so shipping the plain reuse would have contradicted the
+standard the JS entry set.
+
+`html_format` adds one rule — lay an element out only when every element directly inside it is
+block-level — sharing `xml_format`'s tokeniser through one `html` flag rather than forking it. Self-
+closing inline children (`<br/>`, `<img/>`) need their own case; they never reach the `.Open` branch.
+
+**The inline table IS the "hardcoded list of text-ish element names" `xml_format`'s header rejects, and
+that is not a reversal.** That rejection is about XML, where the elements whose whitespace matters have
+names nobody can enumerate, so a list guesses wrong on every vocabulary but one. HTML is that one
+vocabulary. The list is wrong for XML for precisely the reason it is right here.
+
+HTML is **extension-only**. `<` cannot distinguish it from XML, and guessing toward `.Xml` is the safe
+direction. A test asserts `xml_format` is unchanged by the new predicate.
+
+### What this batch did not do, and one thing it found
+
+- **The §15 drop ring is not built, and it is not small.** Newtpad uses `DragAcceptFiles` +
+  `WM_DROPFILES`, which delivers the drop and gives **no drag-over notification at all** — there is no
+  event to draw a ring from. It needs OLE `IDropTarget`: `OleInitialize`, `RegisterDragDrop`, and a
+  hand-rolled COM vtable in the platform layer, changing how dropped files arrive. Deferred to its own
+  batch with Wyatt's agreement, not overlooked.
+- **`caret_blink` and `current_line` (v0.42.0) have no UI whatsoever** — no settings row, no menu item,
+  no command — so they are settable only by hand-editing `settings.txt`. Found while looking for the
+  precedent to copy. **A default-off option nobody can turn on has not shipped**, so the gutter got a
+  settings row and `Ctrl+Shift+L` instead of copying it. The other two are now owed work in
+  `requested-features.md` §8.
+- **`SETTINGS_ROWS` must be appended to, never inserted into** — `settings_draw`'s value switch is
+  index-based against that array, so an insert shifts every later row's value onto the wrong label. The
+  array says so; worth knowing before the next row.
+- §8's **wrap indent** is now the last item owed from that section.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
@@ -6911,6 +7028,8 @@ what Newtpad does, and that is now finished; the next batch is product work.
   session modes write to, and reset, the real store under `%APPDATA%\Newtpad`:
   - The harness itself: `modeguardtest [path]` — run it first; it is the check that the rest of
     this list can fail at all.
+  - Editor surface: `gutterseamtest` — the line-number gutter, tested where the draw and the
+    hit-test meet rather than at the width formula.
   - Rendering / platform: `sehtest`, `dpitest`, `atlastest`, `atlasgrowtest`, `devicelosttest`,
     `celltest`, `blurtest`, `drawcount <file>`
   - Logging / crash: `logtest`, `crashtest <null|panic|assert|oob>` (triggers a real fault; set

@@ -43,9 +43,14 @@ where the work genuinely does not belong in a 11k-line notepad. If it is ever bu
 needs its own spec, a real parser, and a differential test that reformats and re-parses to prove the
 AST is unchanged — nothing less is honest for a command that rewrites source.
 
-Cheap and NOT blocked, if the appetite is there: **HTML** is XML-shaped and could reuse
-`xml_format`'s structure-only rule, with the caveat that its whitespace significance is broader
-(inline elements, not just `<pre>`).
+**HTML is DONE (v0.57.0, HANDOFF §6bx)** — and the caveat this paragraph flagged turned out to be the
+whole of the work. `xml_format`'s structure-only rule was *not* sufficient on its own: it already
+protects mixed content, but `<div><span>a</span><span>b</span></div>` is element-only content, so it
+would lay the div out and the inserted newline renders as a space. `html_format` adds one rule — lay
+an element out only when every element directly inside it is block-level — and the inline table is
+the "hardcoded list of text-ish element names" `xml_format`'s header rejects, which is not a reversal:
+that rejection is about XML, where the significant-whitespace elements cannot be enumerated. HTML is
+the one vocabulary where they can.
 
 ### Mermaid diagrams in the markdown preview
 
@@ -173,10 +178,12 @@ file is never rewritten.** v0.36.0 added a second sort key on top of it (§6bc).
 **Caret blink and the current-line tint are DONE (v0.42.0, HANDOFF §6bi)** — the blink is the app's
 only timer, gated off for a caret-less view and an inactive window, on by default with a setting; the
 tint is Text_Primary at 3%, the caret's visual row, off by default.
-- **Gutter** — 44px right-aligned + 12px gap, off by default, current line `text_primary`.
-- **Wrap indent** — a wrapped line continues at the original indent + 2 columns.
-- **Wrap column cap** — cap the text column at 100 characters in wrap mode. §8: *"On a maximised 1440p
-  window an uncapped wrap gives 200-character lines."*
+**The gutter and the wrap column cap are DONE (v0.57.0, HANDOFF §6bx).**
+- **Wrap indent** — a wrapped line continues at the original indent + 2 columns. The last §8 item owed.
+- **OWED, found while building the gutter:** `caret_blink` and `current_line` have **no UI at all** —
+  no settings row, no menu item, no command — so they are reachable only by hand-editing
+  `settings.txt`. A default-off option nobody can turn on has not really shipped. The gutter got a row
+  and a toggle instead of copying that; these two want the same.
 
 ### §9 Markdown
 
@@ -224,8 +231,14 @@ than nothing. Two things it left behind, both new:
 - **Progress hairline and the sparse index** — two-thirds built.
 
 ### §15 The empty tab
-- The caret already there and blinking; **three hints bottom-left** (`Ctrl+O`, `Ctrl+P`, `drop`) that
-  vanish on the first keystroke; **a 2px accent inset drop ring** on the editor area only.
+**The three hints are DONE (v0.57.0, HANDOFF §6bx)**, in Text_Muted rather than §15's `text_dim` —
+`themetest` forbids Text_Dim outside a disabled control, and these are instructions meant to be read.
+Worth Wyatt's ruling if he wants them dimmer.
+- **The 2px accent inset drop ring is NOT built, and it is not a small job.** Newtpad uses
+  `DragAcceptFiles` + `WM_DROPFILES`, which delivers the drop and gives **no drag-over notification at
+  all**, so there is no event to draw a ring from. It needs OLE `IDropTarget` — `OleInitialize`,
+  `RegisterDragDrop`, and a hand-rolled COM vtable in the platform layer — and it changes how dropped
+  files arrive. Its own batch, deliberately deferred 2026-08-02.
 
 ### §16 Icon
 - **A document icon per associated extension** (same shape, extension label in the corner).

@@ -146,11 +146,19 @@ is_ws_only :: proc(s: string) -> bool {
 // siblings, so laying the `<p>` out would move "Hello" onto its own line and
 // change what the document says. That is caught here, at `<p>`, and the whole
 // subtree goes out verbatim.
+// `has_text` is really "must go out verbatim". In HTML mode it also becomes true
+// when an element directly inside this one is INLINE, because laying this element
+// out would insert a line break beside that child and HTML renders it as a space.
+// See html_format.odin for why the two cases share one answer.
 @(private = "file")
-xml_elem_extent :: proc(src: []u8, i: int) -> (end: int, has_text: bool, err: Xml_Error) {
+xml_elem_extent :: proc(src: []u8, i: int, html := false) -> (end: int, has_text: bool, err: Xml_Error) {
 	kind, e, name, tok_ok := xml_token(src, i)
 	if !tok_ok {return i, false, .Unterminated}
 	if kind != .Open {return e, false, .None}
+	// An element that is ITSELF inline (or is `pre`/`textarea`) is verbatim
+	// whatever it contains -- the break would land beside it, or inside something
+	// whose own whitespace is significant.
+	if html && html_is_inline(name) {has_text = true}
 	depth := 1
 	p := e
 	for p < len(src) {
@@ -158,7 +166,12 @@ xml_elem_extent :: proc(src: []u8, i: int) -> (end: int, has_text: bool, err: Xm
 		if !k_ok {return p, has_text, .Unterminated}
 		#partial switch k {
 		case .Open:
+			if html && depth == 1 && html_is_inline(nm) {has_text = true}
 			depth += 1
+		case .Self:
+			// A self-closing inline child (`<br/>`, `<img/>`) is just as much a
+			// break site as a paired one; the .Open case above never sees it.
+			if html && depth == 1 && html_is_inline(nm) {has_text = true}
 		case .Close:
 			depth -= 1
 			if depth == 0 {
@@ -176,6 +189,13 @@ xml_elem_extent :: proc(src: []u8, i: int) -> (end: int, has_text: bool, err: Xm
 }
 
 xml_format :: proc(src: []u8, indent: int, allocator := context.allocator) -> (out: []u8, err: Xml_Error, at: int) {
+	return xml_format_impl(src, indent, false, allocator)
+}
+
+// The shared body. `html` adds the inline rule and changes nothing else -- one
+// formatter with one extra predicate, rather than a second copy of the tokeniser
+// that would drift from this one.
+xml_format_impl :: proc(src: []u8, indent: int, html: bool, allocator := context.allocator) -> (out: []u8, err: Xml_Error, at: int) {
 	buf := make([dynamic]u8, 0, len(src) + len(src) / 3 + 64, allocator)
 	depth := 0
 	wrote := false
@@ -226,7 +246,7 @@ xml_format :: proc(src: []u8, indent: int, allocator := context.allocator) -> (o
 				delete(buf)
 				return nil, .Too_Deep, i
 			}
-			ee, has_text, eerr := xml_elem_extent(src, i)
+			ee, has_text, eerr := xml_elem_extent(src, i, html)
 			if eerr != .None {
 				// The reason comes FROM the scan rather than being guessed from how
 				// far it got -- an unclosed element and a mismatched close tag are
