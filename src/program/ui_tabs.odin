@@ -484,21 +484,30 @@ tabs_pointer_outside :: proc(mx, my, w, h: i32) -> bool {
 	return mx < 0 || my < 0 || mx >= w || my >= h
 }
 
-// May this tab be torn off? SAVED AND UNMODIFIED ONLY, and that is the decision
-// the whole feature rests on rather than a limitation of it.
+// May this tab be torn off? ANY TAB, dirty or untitled, with one exception.
 //
-// A torn-off window is a second PROCESS, and a second process is not the primary
-// instance (main.odin), so it does not own the session store: its tabs are outside
-// hot-exit and outside crash recovery. Handing an unsaved buffer to a window with
-// no crash protection would be taking protection away at the exact moment the user
-// is moving something they care about. A file that exists on disk loses nothing
-// but its caret position.
+// It was saved-and-unmodified-only when the tear-off shipped in v0.40.0, on the
+// reasoning that a torn-off window is a second process and therefore not the
+// primary instance, so handing it unsaved work would move that work somewhere with
+// no crash protection. Wyatt, from live use: *"i can only drag tabs that don't have
+// edits, you should be able to drag all tabs."* He is right, and the restriction
+// was solving the problem the wrong way round -- the answer is to give the new
+// window a backup store of its own (session_dir), not to refuse the gesture.
+// Unsaved bytes now travel with the tab (handover_write).
 //
-// An untitled buffer is refused for the same reason and one more: there is no path
-// to hand over, and the only alternatives are serialising the buffer across a
-// process boundary or writing a temp file the user never asked for.
+// THE ONE EXCEPTION is a dirty buffer past BACKUP_MAX. The handover is a full
+// in-memory copy plus a full write on the main thread, which is the same operation
+// session_save already refuses at that size for a measured reason: at multi-GB it
+// is a multi-second freeze and a real OOM risk. Such a buffer is already excluded
+// from crash backups and the status bar already says so; this is the same limit
+// reached by the same argument, not a new one.
 tab_can_detach :: proc(doc: ^Document) -> bool {
-	return doc != nil && doc.path != "" && !doc.modified
+	if doc == nil {return false}
+	// An empty untitled scratch is not a document anybody means to move, and
+	// session_save skips it for the same reason.
+	if doc.path == "" && !doc.modified && doc.pt.length == 0 {return false}
+	if doc.modified && doc.pt.length > BACKUP_MAX {return false}
+	return true
 }
 
 // Open the dragged tab in a window of its own and close it here.
@@ -523,15 +532,28 @@ tab_detach :: proc(app: ^App, win: ^plat.Window) -> bool {
 	sx, sy := plat.cursor_screen()
 	exe := plat.exe_path()
 	if exe == "" {return false}
+
+	// THE WHOLE DOCUMENT TRAVELS, not just its path: the tab may be dirty, or
+	// untitled and have no path at all. Written before the spawn so a failure here
+	// leaves the tab untouched -- same ordering argument as the spawn itself.
+	hpath := handover_path()
+	if hpath == "" || !handover_write(doc, hpath) {return false}
+
 	args := []string {
 		"--detach",
 		fmt.tprintf("%d", sx),
 		fmt.tprintf("%d", sy),
 		fmt.tprintf("%d", win.width),
 		fmt.tprintf("%d", win.height),
-		doc.path,
+		hpath,
 	}
-	if !plat.process_spawn(exe, args) {return false}
+	if !plat.process_spawn(exe, args) {
+		// The child never started, so nothing will ever read the handover. Delete
+		// it rather than leaving a full copy of the buffer lying in the session
+		// directory for a reader that does not exist.
+		plat.file_delete(hpath)
+		return false
+	}
 	// Closed directly rather than through request_close_tab: that path exists to
 	// ASK about unsaved work, and tab_can_detach has already established there is
 	// none. Going through it would put a dialog in the middle of a drag.

@@ -63,6 +63,130 @@ doc_backup_skipped :: proc(d: ^Document) -> bool {
 	return d != nil && d.modified && d.pt.length > BACKUP_MAX
 }
 
+// --- handing one tab to another window -------------------------------------
+//
+// The tab tear-off (ui_tabs.odin) moves a document to a NEW PROCESS, and a
+// process boundary means the buffer has to be written down. A path alone is not
+// enough: the tab may be dirty, or untitled and have no path at all, and losing
+// the edits in the move would make the gesture a data-loss bug rather than a
+// convenience.
+//
+// One FILE rather than a longer command line, and that is a decision. Everything
+// needed to rebuild the document -- encoding, BOM, line ending, caret, scroll,
+// path, bytes -- travels together, so argv stays five numbers and a filename and
+// cannot silently lose a field to quoting. It is also the same shape session.txt
+// already uses (a version line, a metadata line, then the payload), which means
+// one reader idiom in this file rather than two.
+//
+//   newtpad-handover 1
+//   <enc> <bom> <eol> <cursor> <top> <modified> <path...>
+//   <raw buffer bytes, EMPTY for a clean tab that has a path>
+//
+// The path is last on its line for the reason it is last in a session line: it
+// may contain spaces, so it has to be "the rest".
+//
+// A CLEAN TAB CARRIES NO BYTES. It has a file on disk that says the same thing,
+// and the receiving window reopens from it -- which also gets the mmap path back
+// for a large file. Copying them would mean a multi-GB collect-and-write to move a
+// tab whose contents are already sitting on the disk, and BACKUP_MAX only guards
+// the DIRTY case (a clean buffer is never backed up because it never needs to be).
+// So the size ceiling and the byte payload answer the same question from two
+// directions, and neither is redundant.
+HANDOVER_VERSION :: "newtpad-handover 1"
+
+Handover :: struct {
+	path:     string,
+	content:  []u8, // empty when `modified` is false and `path` is set
+	enc:      base.Encoding,
+	had_bom:  bool,
+	eol:      base.Line_Ending,
+	cursor:   int,
+	top:      int,
+	modified: bool,
+}
+
+// A fresh path for one handover, under the session directory.
+//
+// Named by a counter rather than by a timestamp or a random number: two tabs torn
+// off in the same millisecond must not collide, and this process is the only
+// writer of its own store. It lives in the SESSION directory rather than %TEMP%
+// so that a handover left behind by a spawn that never completed is swept by the
+// same machinery that sweeps everything else here (session_sweep_tmp), instead of
+// sitting in a system folder that nothing owns.
+@(private = "file")
+handover_seq: int
+
+handover_path :: proc() -> string {
+	dir, ok := session_dir()
+	if !ok {return ""}
+	handover_seq += 1
+	return fmt.tprintf("%s%chandover-%d-%d", dir, filepath.SEPARATOR, plat.process_id(), handover_seq)
+}
+
+// Write `d` to `path` so another process can rebuild it. False if the buffer
+// could not be collected or the write failed -- and the caller must then leave
+// the tab exactly where it is.
+handover_write :: proc(d: ^Document, path: string) -> bool {
+	if d == nil {return false}
+	// The same ceiling session_save applies to a backup, for the same measured
+	// reason: this is a full in-memory copy plus a full write on the main thread,
+	// and at multi-GB that is a multi-second freeze and a real OOM risk. A tab
+	// that cannot be backed up cannot be handed over either, and tab_can_detach
+	// refuses it before this is ever called.
+	carries := d.modified || d.path == ""
+	if carries && d.pt.length > BACKUP_MAX {return false}
+	content: []u8
+	if carries {content = base.pt_collect(&d.pt, context.temp_allocator)}
+	head := fmt.tprintf(
+		"%s\n%d %d %d %d %d %d %s\n",
+		HANDOVER_VERSION,
+		int(d.enc),
+		1 if d.had_bom else 0,
+		int(d.eol),
+		d.cursor,
+		d.top,
+		1 if d.modified else 0,
+		d.path,
+	)
+	body := make([]u8, len(head) + len(content), context.temp_allocator)
+	copy(body, transmute([]u8)head)
+	copy(body[len(head):], content)
+	return plat.file_write_atomic(path, body)
+}
+
+// Read a handover file back. The file is DELETED whether or not it parsed: it is
+// a one-shot transfer, and a malformed one left on disk would be picked up by
+// nothing and cleaned by nothing.
+handover_read :: proc(path: string, allocator := context.allocator) -> (h: Handover, ok: bool) {
+	raw, rok := plat.file_read_all(path, context.temp_allocator)
+	plat.file_delete(path)
+	if !rok {return {}, false}
+	// Two newlines, then the rest is bytes. Found by scanning rather than by
+	// splitting the whole thing into lines: the payload is arbitrary data and may
+	// contain any number of newlines, so it must never be treated as lines.
+	nl1 := strings.index_byte(string(raw), '\n')
+	if nl1 < 0 {return {}, false}
+	if string(raw[:nl1]) != HANDOVER_VERSION {return {}, false}
+	rest := raw[nl1 + 1:]
+	nl2 := strings.index_byte(string(rest), '\n')
+	if nl2 < 0 {return {}, false}
+	meta := strings.split_n(string(rest[:nl2]), " ", 7, context.temp_allocator)
+	if len(meta) < 6 {return {}, false}
+	h.enc = base.Encoding(pint(meta[0]))
+	h.had_bom = meta[1] == "1"
+	h.eol = base.Line_Ending(pint(meta[2]))
+	h.cursor = pint(meta[3])
+	h.top = pint(meta[4])
+	h.modified = meta[5] == "1"
+	h.path = strings.clone(meta[6], allocator) if len(meta) == 7 else ""
+	// Cloned out of the temp buffer: doc_from_content takes ownership of what it
+	// is given and the document outlives this frame.
+	payload := rest[nl2 + 1:]
+	h.content = make([]u8, len(payload), allocator)
+	copy(h.content, payload)
+	return h, true
+}
+
 @(private = "file")
 pjoin :: proc(elems: []string) -> string {
 	s, _ := filepath.join(elems, context.temp_allocator)
@@ -82,7 +206,101 @@ pint :: proc(s: string) -> int {
 // — these tests write backups and reset the session, which is destructive to a
 // daily driver's unsaved tabs.
 // Also used by settings.odin, which stores settings.txt alongside session.txt.
+// A TORN-OFF WINDOW GETS ITS OWN STORE, under `windows\<pid>` of whichever
+// directory would otherwise have been used. Set once, at startup, by a process
+// launched with --detach.
+//
+// The alternative was the restriction this replaced: refuse to tear off anything
+// unsaved, because a second process is not the primary instance and therefore had
+// nowhere to put a backup. Wyatt asked for every tab to be draggable, so the
+// second process needs a store rather than the gesture needing a rule. Its tabs
+// are then backed up exactly like anyone else's; what makes them recoverable is
+// session_adopt_orphans, which the next primary runs over any store whose window
+// died without cleaning up.
+@(private = "file")
+session_dir_override: string
+
+session_use_window_store :: proc() {
+	base_dir, ok := session_root()
+	if !ok {return}
+	dir := pjoin({base_dir, "windows", fmt.tprintf("%d", plat.process_id())})
+	plat.dir_create(pjoin({base_dir, "windows"}))
+	plat.dir_create(dir)
+	session_dir_override = strings.clone(dir)
+	// Held open for the life of the process. It is what tells a later launch
+	// whether this window is still alive: the pid in the directory name cannot,
+	// because pids are reused, and a store adopted from a LIVE window would move
+	// its tabs out from under it.
+	plat.lock_hold(pjoin({dir, "lock"}))
+}
+
+// The directory a torn-off window uses is removed on a clean exit, so anything
+// left under `windows\` is the store of a window that crashed. Called by the
+// PRIMARY at startup, after its own restore, and it appends.
+//
+// Liveness is decided by the lock file rather than by the pid: pids are reused,
+// and adopting a live window's store would take its tabs away while it is using
+// them. lock_try takes the lock only if nobody holds it, which on Windows is
+// exactly "the owning process is gone" -- the handle dies with the process even
+// on a hard kill, which is the case this exists for.
+session_adopt_orphans :: proc(a: ^App) -> int {
+	root, ok := session_root()
+	if !ok {return 0}
+	wdir := pjoin({root, "windows"})
+	names, nok := plat.dir_entries(wdir, context.temp_allocator)
+	if !nok {return 0}
+	adopted := 0
+	for name in names {
+		d := pjoin({wdir, name})
+		if !plat.lock_try(pjoin({d, "lock"})) {continue} // still open in a live window
+		if session_restore(a, d) {
+			adopted += 1
+			plat.dir_remove_all(d) // adopted once, not every launch
+			continue
+		}
+		// THE RESTORE FAILED, AND THAT IS NOT A LICENCE TO DELETE. A store whose
+		// session.txt could not be read may still hold backups -- the unsaved work
+		// of the window that died -- and removing it would destroy exactly what
+		// this whole mechanism exists to preserve, on a transient read error.
+		//
+		// A store with no session.txt at all is different: session_save writes the
+		// backups BEFORE the file that references them (this file's own header), so
+		// a crash between the two leaves backups nothing can name. Those are not
+		// recoverable by anyone and are swept, or they accumulate forever.
+		if ex, _ := plat.path_exists(pjoin({d, "session.txt"})); !ex {
+			plat.dir_remove_all(d)
+		}
+	}
+	return adopted
+}
+
+// Release this window's store at exit -- the LOCK only. The directory stays.
+//
+// It is tempting to delete it on a clean exit so that "a store exists" means "a
+// window crashed", and that would be wrong, because closing a window here is a
+// HOT EXIT and not a prompt: session_save has just written the unsaved buffers
+// into it precisely so they are not lost. Deleting them would make closing a
+// torn-off window the one way to destroy work in this editor.
+//
+// So a store outlives its window either way, and the lock -- not the presence of
+// the directory -- is what says whether anyone is still using it. The next
+// primary adopts it and deletes it then.
+session_release_window_store :: proc() {
+	if session_dir_override == "" {return}
+	plat.lock_release()
+}
+
+// The store this process actually uses -- the per-window one when it has been
+// claimed, the shared one otherwise.
 session_dir :: proc() -> (dir: string, ok: bool) {
+	if session_dir_override != "" {return session_dir_override, true}
+	return session_root()
+}
+
+// The shared store, ignoring any per-window override. Split out because
+// session_use_window_store and session_adopt_orphans both need the ROOT while
+// session_dir may already be answering with a window's own subdirectory.
+session_root :: proc() -> (dir: string, ok: bool) {
 	if over := os.get_env("NEWTPAD_SESSION_DIR", context.temp_allocator); over != "" {
 		plat.dir_create(over)
 		return over, true
@@ -307,8 +525,13 @@ session_restore_bookmarks :: proc(d: ^Document, field: string, stamp: plat.File_
 	}
 }
 
-session_restore :: proc(a: ^App) -> bool {
-	dir, ok := session_dir()
+// `from` overrides the store to read, and exists for exactly one caller:
+// session_adopt_orphans, which restores the tabs of a torn-off window whose
+// process died. Everything else passes nothing and gets this process's own store.
+// Appends, so adopting orphans on top of an already-restored session keeps both.
+session_restore :: proc(a: ^App, from := "") -> bool {
+	dir, ok := from, true
+	if from == "" {dir, ok = session_dir()}
 	if !ok {
 		return false
 	}

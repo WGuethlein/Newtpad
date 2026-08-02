@@ -148,6 +148,10 @@ main :: proc() {
 	if !primary && !detach && plat.instance_send_open(path) {
 		return
 	}
+	// A torn-off window keeps its own session store, so the unsaved work that was
+	// just dragged into it is backed up exactly like anyone else's. Claimed before
+	// anything reads session_dir() -- the sweep and the restore both do.
+	if detach {session_use_window_store()}
 	perf_mark("start: instance_claim")
 
 	window := plat.window_create("Newtpad", dw, dh, dx, dy)
@@ -204,12 +208,64 @@ main :: proc() {
 	// restore off hides the old session rather than destroying it.
 	restored := primary && app.settings.restore_session && session_restore(&app)
 	perf_mark("start: session_restore")
+	// Tabs from torn-off windows that died without cleaning up. Only the primary
+	// does this, and only after its own restore, so the adopted tabs land after
+	// the ones that were already there. Independent of restore_session: those tabs
+	// are unsaved work whose window is gone, and the only other place they exist is
+	// a directory this launch is about to delete.
+	if primary {
+		if n := session_adopt_orphans(&app); n > 0 {
+			restored = true // ...so the backup sweep below does not delete what we just adopted
+			perf_mark("start: adopted orphaned windows")
+		}
+	}
 	// A session we couldn't load still owns its backups; don't sweep them.
 	session_can_sweep := !had_session || restored
 	// The crash handler saves the user's work; give it the App and the same
 	// sweep policy the exit save uses (but it always saves with sweep off).
-	diag_bind_app(&app, primary, session_can_sweep)
-	if path != "" {
+	// `owns_store` rather than `primary`: a torn-off window is not the primary
+	// instance -- it must never touch the shared session -- but it does own a store
+	// of its own (session_use_window_store), and the unsaved work that was just
+	// dragged into it has to be backed up like anyone else's.
+	owns_store := primary || detach
+	diag_bind_app(&app, owns_store, session_can_sweep)
+	if detach {
+		// A torn-off tab: the whole document arrived in a file, because it may be
+		// dirty or untitled and a path alone could not carry it. `path` is the
+		// HANDOVER's path here, not the document's -- the document's own path is
+		// inside it, and is empty for an untitled buffer.
+		//
+		// Failure is silent on purpose. There is nothing useful to say: the tab is
+		// already gone from the window that sent it, and an error box on an empty
+		// new window would be the first thing the user saw. It cannot happen
+		// without the sending process having written the file and the spawn having
+		// succeeded, so it is a disk fault, not a state a user reaches.
+		if h, hok := handover_read(path); hok {
+			d := new(Document)
+			built := false
+			if !h.modified && h.path != "" {
+				// Clean tab: no bytes travelled, so reopen from the file. This is
+				// also what puts a large file back on the mmap path rather than
+				// leaving it as one heap copy carried across the boundary.
+				d^, built = doc_open(h.path)
+			}
+			if !built {
+				// Dirty, untitled, or a clean file that has since gone missing. The
+				// last of those is why this is a fallback and not an else: the bytes
+				// are in the handover for a dirty tab, and for a clean one whose
+				// file vanished between the drag and the spawn there are none, which
+				// leaves an empty buffer carrying the path -- still better than no
+				// tab at all.
+				d^ = doc_from_content(h.content, h.path, h.enc) // marks it modified
+				d.had_bom, d.eol = h.had_bom, h.eol
+				if h.path != "" {d.disk_stamp = plat.file_stamp(h.path)}
+			}
+			L := d.pt.length
+			d.cursor, d.anchor, d.top = clamp(h.cursor, 0, L), clamp(h.cursor, 0, L), clamp(h.top, 0, L)
+			app_apply_view_defaults(&app, d)
+			app_activate(&app, app_add(&app, d))
+		}
+	} else if path != "" {
 		if !app_open_path(&app, path) {
 			fmt.eprintfln("Newtpad: could not open %q", path)
 		}
@@ -1444,7 +1500,7 @@ main :: proc() {
 		}
 
 		// Autosave the session once input has settled (primary instance only).
-		if primary && session_dirty && time.duration_seconds(time.tick_since(last_input)) > 2 {
+		if owns_store && session_dirty && time.duration_seconds(time.tick_since(last_input)) > 2 {
 			session_save(&app, session_can_sweep)
 			session_dirty = false
 		}
@@ -1454,9 +1510,13 @@ main :: proc() {
 	perf_mark("exit: loop exited (WM_CLOSE)")
 	// Off screen first, then do the teardown. See window_hide.
 	plat.window_hide(window)
-	if primary {
+	if owns_store {
 		session_save(&app, session_can_sweep) // hot-exit: persist tabs + unsaved buffers
 	}
+	// The store itself stays on disk -- the save above is what makes closing a
+	// torn-off window safe -- and only the lock is dropped, which is what tells the
+	// next primary it may adopt these tabs. See session_release_window_store.
+	session_release_window_store()
 	perf_mark("exit: session_save")
 }
 

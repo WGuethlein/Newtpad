@@ -5721,6 +5721,87 @@ to run one, and the earlier sweeps in this session were weaker for not doing it.
 - A torn-off window's tabs are outside hot-exit. Acceptable today because only saved files can be torn
   off; if that restriction is ever lifted, this is the thing that has to be solved first.
 
+## 6bh. Any tab can be torn off now (2026-08-01, v0.41.0, branch `feat/headerless-csv`)
+
+Wyatt, from live use of v0.40.0: *"i can only drag tabs that don't have edits, you should be able to
+drag all tabs."* He is right, and the restriction was **solving the problem the wrong way round**.
+
+The reasoning behind saved-only was sound as far as it went: a torn-off window is a second process,
+a second process is not the primary instance, so it has nowhere to put a crash backup — therefore
+don't let unsaved work go there. The mistake was treating "it has nowhere to put a backup" as a fact
+about the architecture rather than as the thing to fix. **Give the new window a store of its own and
+the restriction evaporates.**
+
+### What travels, and what does not
+
+A path could not carry a dirty or untitled tab, so the whole document does: `handover_write` puts
+encoding, BOM, line ending, caret, scroll, path and bytes into one file under the session directory
+and the child rebuilds from it. One file rather than a longer command line, so argv stays five numbers
+and a filename and cannot lose a field to quoting — and it is the same shape `session.txt` already
+uses, so there is one reader idiom in that file rather than two.
+
+**A clean tab carries no bytes.** It has a file on disk that says the same thing, and the receiving
+window reopens from it — which also puts a large file back on the mmap path. This matters more than it
+sounds: `BACKUP_MAX` guards the *dirty* case only (a clean buffer is never backed up because it never
+needs to be), so without this a clean multi-GB file would have been collected into memory and written
+out to move its tab. The size ceiling and the byte payload answer the same question from two
+directions and neither is redundant.
+
+The one refusal left is a **dirty** buffer past `BACKUP_MAX`, for the measured reason `session_save`
+already refuses it: a full in-memory copy plus a full write on the main thread is a multi-second
+freeze and a real OOM risk at multi-GB.
+
+### The store, and who picks it up
+
+A `--detach` process claims `windows\<pid>` under the session root and owns it exactly as the primary
+owns the shared one — same `session_save`, same autosave timer, same backups. `primary` was doing two
+jobs and has been split: `owns_store` (may write *a* store) is what the session paths gate on now,
+while `primary` still means "owns the *shared* session" and is still what keeps a torn-off window out
+of it.
+
+**Liveness is a lock file, not a pid.** Pids are reused, and adopting a live window's store would take
+its tabs out from under it. The lock handle is held open for the process's life and Windows closes it
+on death *by any means* — so "can this file be opened exclusively" is an exact test for "the owning
+window is gone", including a hard kill, which is the case the whole thing exists for.
+
+**The store survives a clean exit on purpose.** It is tempting to delete it so that "a store exists"
+means "a window crashed" — and that would be wrong, because closing a window here is a **hot exit and
+not a prompt**: `session_save` has just written the unsaved buffers into it precisely so they are not
+lost. Deleting them would make closing a torn-off window the one way to destroy work in this editor.
+
+### Two things this batch got wrong, both caught by looking
+
+- **A test started launching a real window.** `teartest`'s refusal case used an untitled buffer with
+  content — refused when it was written, and detachable the moment dirty tabs were allowed out. So the
+  suite silently began spawning a second Newtpad on every run, and the sweep hung. The fixture is now
+  the empty scratch, which is refused for a structural reason that will not drift, and the case says
+  so. **A test whose fixture depends on the rule under test will rot when the rule changes.**
+- **The adopter deleted a store whose restore had failed.** A store that could not be read may still
+  hold backups — the unsaved work of the window that died — and removing it on a transient read error
+  would destroy exactly what the mechanism exists to preserve. It now deletes only on a successful
+  adoption, or when there is no `session.txt` at all (backups written before the file that names them,
+  recoverable by nobody). Found while cleaning up after a manual probe, not by a test.
+
+And one piece of vacuous coverage caught by sabotage: the first version of the adoption test asserted
+`lock_try` directly, which proves the lock is held and **nothing about whether the adopter consults
+it** — removing the liveness check left it green. It now drives `session_adopt_orphans` against a
+store that is still open and asserts nothing is taken.
+
+### Verified by hand, since no test can drag
+
+A hand-written handover launched through `--detach` produced a window titled `*untitled` — dirty, no
+path — with the handover file consumed. The gesture itself is still the only part nothing here can
+reach.
+
+### Owed
+
+**A torn-off window's tabs come back at the next primary *startup*, not immediately.** Close a
+torn-off window with unsaved edits while the main window is still running and that work is safe on
+disk but invisible until Newtpad is restarted, which will read as lost. The fix is a live hand-back
+over the existing `WM_COPYDATA` channel — the primary already receives messages on it — and it is
+maybe 30 lines. It was left out to stop this batch growing further; it is the first thing to do if
+tear-off gets used in anger.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

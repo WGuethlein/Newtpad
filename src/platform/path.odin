@@ -32,6 +32,7 @@
 // own trap. If it ever bites, this comment is the place it was weighed.
 package platform
 
+import "core:fmt"
 import "core:strings"
 import win "core:sys/windows"
 
@@ -206,6 +207,102 @@ dir_remove :: proc(path: string) -> bool {
 
 file_delete :: proc(path: string) -> bool {
 	return bool(win.DeleteFileW(wide_path(path)))
+}
+
+// The names (not paths) directly inside `path`, excluding "." and "..". Used by
+// the torn-off-window store sweep, which has to enumerate a directory whose
+// contents nothing else knows about.
+dir_entries :: proc(path: string, allocator := context.temp_allocator) -> ([]string, bool) {
+	fd: win.WIN32_FIND_DATAW
+	pat := wide_path(fmt.tprintf("%s\\*", path))
+	h := win.FindFirstFileW(pat, &fd)
+	if h == win.INVALID_HANDLE_VALUE {return nil, false}
+	defer win.FindClose(h)
+	out := make([dynamic]string, 0, 8, allocator)
+	for {
+		name, err := win.wstring_to_utf8(win.wstring(&fd.cFileName[0]), -1, allocator)
+		if err == nil && name != "." && name != ".." {append(&out, name)}
+		if !win.FindNextFileW(h, &fd) {break}
+	}
+	return out[:], true
+}
+
+// Delete `path` and everything directly inside it. ONE level deep plus the
+// well-known `backups` subdirectory, which is the whole shape of a session store
+// -- deliberately not a general recursive delete, because a general recursive
+// delete pointed at the wrong string is the most destructive procedure a program
+// can contain and nothing here needs one.
+dir_remove_all :: proc(path: string) -> bool {
+	if subs, ok := dir_entries(pjoin_two(path, "backups"), context.temp_allocator); ok {
+		for s in subs {file_delete(pjoin_two(pjoin_two(path, "backups"), s))}
+		dir_remove(pjoin_two(path, "backups"))
+	}
+	if names, ok := dir_entries(path, context.temp_allocator); ok {
+		for n in names {file_delete(pjoin_two(path, n))}
+	}
+	return dir_remove(path)
+}
+
+@(private = "file")
+pjoin_two :: proc(a, b: string) -> string {
+	return fmt.tprintf("%s\\%s", a, b)
+}
+
+// --- a lock this process holds for as long as it runs ----------------------
+//
+// One per process, which is all that is needed: the only holder is a torn-off
+// window keeping its own session store, and a process has exactly one of those.
+//
+// The handle is deliberately never closed except by lock_release. That is the
+// mechanism, not an oversight: Windows closes it when the process dies BY ANY
+// MEANS, including a hard kill or a crash, and "can this file be opened
+// exclusively" is therefore an exact test for "is the owning process gone". A pid
+// cannot answer that -- pids are reused.
+@(private = "file")
+lock_handle: win.HANDLE = win.INVALID_HANDLE_VALUE
+
+// This process's id. Used to name a torn-off window's own session store, where it
+// is a convenient unique name and NOT a liveness test -- pids are reused, which is
+// what the lock above is for.
+process_id :: proc() -> u32 {
+	return u32(win.GetCurrentProcessId())
+}
+
+lock_hold :: proc(path: string) -> bool {
+	if lock_handle != win.INVALID_HANDLE_VALUE {return true}
+	h := win.CreateFileW(
+		wide_path(path),
+		win.GENERIC_WRITE,
+		0, // no sharing: this is the whole point
+		nil,
+		win.CREATE_ALWAYS,
+		win.FILE_ATTRIBUTE_NORMAL,
+		nil,
+	)
+	if h == win.INVALID_HANDLE_VALUE {return false}
+	lock_handle = h
+	return true
+}
+
+lock_release :: proc() {
+	if lock_handle == win.INVALID_HANDLE_VALUE {return}
+	win.CloseHandle(lock_handle)
+	lock_handle = win.INVALID_HANDLE_VALUE
+}
+
+// Can this lock be taken? True means nobody holds it -- the owning process is
+// gone -- and the handle is closed again immediately, because the caller wants
+// the ANSWER and not the lock.
+//
+// A missing lock file also reads as free: a store written by a build before locks
+// existed, or one whose lock never got created, must still be adoptable rather
+// than stranded forever.
+lock_try :: proc(path: string) -> bool {
+	if ex, _ := path_exists(path); !ex {return true}
+	h := win.CreateFileW(wide_path(path), win.GENERIC_WRITE, 0, nil, win.OPEN_EXISTING, win.FILE_ATTRIBUTE_NORMAL, nil)
+	if h == win.INVALID_HANDLE_VALUE {return false}
+	win.CloseHandle(h)
+	return true
 }
 
 // The last Win32 error, for a caller that wants to report *why* an operation

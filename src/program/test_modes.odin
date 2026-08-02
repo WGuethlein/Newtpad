@@ -4055,43 +4055,187 @@ when NEWTPAD_TESTS {
 		chk(&bad, tabs_pointer_outside(10, -1, W, H), "...and a negative y, which is what a drag up over the title bar reports")
 
 		// -- who may be torn off --
-		fmt.println("-- only a saved, unmodified tab --")
+		//
+		// EVERY tab, as of the change Wyatt asked for after v0.40.0 -- *"i can only
+		// drag tabs that don't have edits, you should be able to drag all tabs"* --
+		// with two exceptions that are not about the gesture at all.
+		fmt.println("-- any tab, with two exceptions --")
 		{
 			d: Document
 			defer doc_close(&d)
 			chk(&bad, !tab_can_detach(nil), "a nil tab cannot be detached")
-			chk(&bad, !tab_can_detach(&d), "an untitled buffer cannot: there is no path to hand over")
+			// The empty untitled scratch: session_save skips it for the same reason,
+			// it is not a document anybody means to move.
+			chk(&bad, !tab_can_detach(&d), "the empty untitled scratch cannot -- there is nothing to move")
 			d.path = "C:\\notes.txt"
-			d.modified = true
-			chk(&bad, !tab_can_detach(&d), "a MODIFIED tab cannot: the new window is not the primary instance and does not back it up")
-			d.modified = false
 			chk(&bad, tab_can_detach(&d), "a saved, unmodified tab can")
+			d.modified = true
+			chk(&bad, tab_can_detach(&d), "...and so can a MODIFIED one: its bytes travel with it now")
+			d.path = ""
+			chk(&bad, tab_can_detach(&d), "...and an untitled one with edits in it, which has no path to travel by")
 		}
 
-		// -- and the refusal is enforced where it matters, not just advertised --
+		// -- the refusal is enforced where it matters, not just advertised --
 		//
 		// tab_detach must return false and leave the tab in place for a tab that
 		// cannot be detached. Checked through the real entry point rather than by
 		// re-asking tab_can_detach, because the bug worth catching is the two
 		// disagreeing: a detach that spawned before checking would have closed the
 		// tab by the time anything noticed.
+		//
+		// THE FIXTURE MUST BE ONE THAT IS REFUSED, and that is a property of this
+		// test rather than a detail of it: tab_detach's success path spawns a real
+		// second Newtpad and puts a window on the desktop. An earlier version of
+		// this case used an untitled buffer WITH content, which was refused when it
+		// was written and became detachable the moment dirty tabs were allowed out
+		// -- so the suite silently started launching a window on every run. The
+		// empty scratch is refused for a structural reason that will not drift.
 		fmt.println("-- tab_detach refuses without touching the strip --")
 		{
 			a: App
 			defer app_destroy(&a)
-			d := new(Document)
-			d^ = doc_from_content(nil, "", .UTF8) // untitled: cannot be detached
+			d := new(Document) // zero value: no path, not modified, no content
 			slot := app_add(&a, d)
 			a.tab_drag_slot = slot
+			chk(&bad, !tab_can_detach(d), "precondition: the fixture is a tab that CANNOT be detached, so nothing is spawned")
 			before := 0
 			for t in a.docs {if t != nil {before += 1}}
 			win: plat.Window // no hwnd: nothing here reaches the platform anyway
 			got := tab_detach(&a, &win)
 			after := 0
 			for t in a.docs {if t != nil {after += 1}}
-			chk(&bad, !got, "tab_detach says no for an untitled tab")
+			chk(&bad, !got, "tab_detach says no for it")
 			chk(&bad, after == before, fmt.tprintf("...and the tab is still open (%d -> %d)", before, after))
 			chk(&bad, a.docs[slot] != nil, "...in its own slot")
+		}
+
+		// -- the handover file: what actually crosses the process boundary --
+		//
+		// The whole point of allowing a dirty tab out. Round-tripped through the
+		// real writer and the real reader rather than asserted against a literal, so
+		// a field added to one and not the other fails here.
+		fmt.println("-- the handover round trip --")
+		{
+			dir, dok := session_dir()
+			chk(&bad, dok, "precondition: there is a session directory to write into")
+			if dok {
+				hp := fmt.tprintf("%s\\handover-test", dir)
+				src := "alpha\nbeta\ngamma\n"
+				d := new(Document)
+				defer free(d)
+				d^ = doc_from_content(transmute([]u8)strings.clone(src), "C:\\a b\\notes.txt", .UTF8)
+				defer doc_close(d)
+				d.cursor, d.top = 7, 6
+				d.eol = .CRLF
+				d.had_bom = true
+				chk(&bad, d.modified, "precondition: doc_from_content marks a rebuilt buffer modified")
+				chk(&bad, handover_write(d, hp), "a dirty tab writes a handover")
+
+				h, hok := handover_read(hp)
+				chk(&bad, hok, "...which reads back")
+				if hok {
+					chk(&bad, string(h.content) == src, fmt.tprintf("...with the BYTES intact, which is the whole point (%q)", string(h.content)))
+					chk(&bad, h.path == "C:\\a b\\notes.txt", fmt.tprintf("...the path, spaces and all (%q)", h.path))
+					chk(&bad, h.modified, "...the dirty flag, so the new window does not present it as saved")
+					chk(&bad, h.cursor == 7 && h.top == 6, fmt.tprintf("...the caret and scroll (%d, %d)", h.cursor, h.top))
+					chk(&bad, h.eol == .CRLF && h.had_bom, fmt.tprintf("...and the line ending and BOM, which a re-save would otherwise change (%v, %v)", h.eol, h.had_bom))
+				}
+				// One-shot: the file is gone, whether or not it parsed. A handover
+				// left behind is a full copy of a buffer that nothing will ever read.
+				ex, _ := plat.path_exists(hp)
+				chk(&bad, !ex, "...and the file is deleted by the read, being a one-shot transfer")
+				_, again := handover_read(hp)
+				chk(&bad, !again, "...so a second read finds nothing")
+			}
+		}
+
+		// -- a CLEAN tab carries no bytes --
+		//
+		// It has a file on disk that says the same thing, and copying a multi-GB
+		// clean buffer to move its tab would be paying the backup ceiling's cost in
+		// the one case the ceiling does not cover.
+		{
+			dir, dok := session_dir()
+			if dok {
+				hp := fmt.tprintf("%s\\handover-clean", dir)
+				d := new(Document)
+				defer free(d)
+				d^ = doc_from_content(transmute([]u8)strings.clone("on disk\n"), "C:\\clean.txt", .UTF8)
+				defer doc_close(d)
+				d.modified = false // as a tab opened from disk and left alone
+				chk(&bad, handover_write(d, hp), "a clean tab writes a handover too")
+				h, hok := handover_read(hp)
+				chk(&bad, hok && len(h.content) == 0, fmt.tprintf("...carrying NO bytes (%d)", len(h.content)))
+				chk(&bad, hok && !h.modified && h.path == "C:\\clean.txt", "...just the path and the state, for the new window to reopen from disk")
+			}
+		}
+
+		// -- THE CRASH-RECOVERY HALF: a torn-off window's store is adopted --------
+		//
+		// A torn-off window is a second process and does not own the shared session,
+		// so it keeps a store of its own under `windows\<pid>`. That is what lets an
+		// unsaved tab be dragged out at all -- the alternative was refusing the
+		// gesture, which is what Wyatt objected to. The store is only worth anything
+		// if somebody picks it up again, and that is this.
+		//
+		// Driven through the REAL writer, the real lock and the real adopter rather
+		// than a hand-written session.txt: a test that writes the format itself
+		// stops testing the format the moment the two drift, which is exactly the
+		// failure this file has recorded elsewhere.
+		//
+		// LAST in the mode, deliberately: claiming a window store redirects
+		// session_dir() for the rest of the process, and nothing after this should
+		// inherit that.
+		fmt.println("-- an orphaned window store is adopted --")
+		{
+			root, rok := session_root()
+			chk(&bad, rok, "precondition: there is a session root")
+			if rok {
+				// A window with one unsaved, untitled tab -- the case that has
+				// nowhere else to exist.
+				session_use_window_store()
+				store, sok := session_dir()
+				chk(&bad, sok && store != root, fmt.tprintf("a torn-off window gets its own store, not the shared one (%q)", store))
+				{
+					a: App
+					defer app_destroy(&a)
+					d := new(Document)
+					d^ = doc_from_content(transmute([]u8)strings.clone("work nobody saved\n"), "", .UTF8)
+					app_add(&a, d)
+					chk(&bad, session_save(&a), "...and saves its unsaved tab into it, like any other window")
+				}
+				// WHILE THE WINDOW IS STILL OPEN, a primary launching must leave the
+				// store alone -- adopting a live window's tabs would take them out
+				// from under it. Asserted through session_adopt_orphans itself and
+				// not through lock_try, because the lock being held proves nothing
+				// about whether the adopter consults it: dropping that check leaves
+				// a lock_try assertion perfectly green.
+				{
+					live: App
+					defer app_destroy(&live)
+					n := session_adopt_orphans(&live)
+					chk(&bad, n == 0, fmt.tprintf("a store whose window is STILL OPEN is not adopted (%d)", n))
+					chk(&bad, app_live_count(&live) == 0, "...and no tab is taken from it")
+					ex, _ := plat.path_exists(store)
+					chk(&bad, ex, "...and it is still there afterwards")
+				}
+
+				// The window exits -- cleanly or by dying; the lock goes either way.
+				session_release_window_store()
+				chk(&bad, plat.lock_try(fmt.tprintf("%s\\lock", store)), "...and once it is gone the lock is free")
+
+				b: App
+				defer app_destroy(&b)
+				n := session_adopt_orphans(&b)
+				chk(&bad, n == 1, fmt.tprintf("the next primary adopts it (%d stores)", n))
+				found := ""
+				for t in b.docs {
+					if t != nil {found = string(base.pt_collect(&t.pt, context.temp_allocator))}
+				}
+				chk(&bad, found == "work nobody saved\n", fmt.tprintf("...WITH the unsaved bytes, which is the whole point (%q)", found))
+				ex, _ := plat.path_exists(store)
+				chk(&bad, !ex, "...and the store is removed, so it is adopted once and not every launch")
+			}
 		}
 
 		fmt.printfln("teartest: %d failures", bad)
