@@ -289,15 +289,9 @@ than nothing. Two things it left behind, both new:
   BODY_FAMILIES face, then the editor's own family last, per §9.3's "for people who want the preview
   to match the source".
 - **The caption/meta row** (§9.3, 0.88 S) — computed and unread.
-- **Zebra rows in the preview table** (§9.2 item 6) — the preview doubled down on per-column rules.
-  **Investigated 2026-08-02 and deferred with a finding worth keeping:** a zebra band needs the row's
-  PARITY within its table block, and the preview lays out and caches **one row per `Md_Layout`
-  entry**, keyed on that row's own line. So parity cannot be baked into the cached entry — inserting
-  a row at the top of a table flips every following row's parity while those entries stay valid, and
-  the table kinds are not in `md_layout_extern_dep`. **Parity is a property of the draw WALK, not of
-  the block**, so the fix is a running counter in the walk, reset when the table block changes
-  (`md_table_ensure`'s `.start` identifies it). Modest, but not a one-liner, and it touches the
-  partial-admit path.
+- ~~**Zebra rows in the preview table**~~ **DONE (v0.64.0, HANDOFF §6cd)** — alternate data rows carry
+  a `Table_Zebra` band, header and separator never. Parity is counted from the table's own start, so
+  the stripe does not flip as the table scrolls.
 - ~~**Preview selection and copy** (§9.4)~~ **DONE (v0.62.0, HANDOFF §6cb)** — drag to select, Ctrl+A,
   Ctrl+C. Copy yields the rendered text in Obsidian's plain-text shape: bullets kept, table cells
   tab-separated, links as their label.

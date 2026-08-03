@@ -7310,6 +7310,52 @@ columns 1/3/7 must be +1/+3/+7 so the test is not satisfied by everything collap
 `rowtest`, `splittest`, `tabstoptest` — because none of them asserts anything about the indent. Green
 neighbours are not coverage.
 
+## 6cd. Zebra rows in the preview's tables (2026-08-02, v0.64.0, branch `feat/preview-zebra`)
+
+§9.2 item 6 asks the preview for *"real table, md_rule borders, zebra"*. The borders shipped in batch
+17; the zebra did not, and §6ca is where the reason it is not a one-liner was worked out.
+
+### Parity belongs to the walk, not to the cached block
+
+The preview lays out and caches **one row per `Md_Layout` entry**, keyed on that row's own line. So a
+row's stripe cannot be baked into its entry: **inserting a row at the top of a table flips every
+following row's parity** while those entries stay valid, and the table kinds are not in
+`md_layout_extern_dep`. Parity is a property of position within the table, which only the walk knows.
+
+### And the walk alone is not enough either
+
+`md_placer` begins at the **anchor**, so rows above the viewport are never visited. Counting parity
+from the first *visible* row would make the stripes flip as the table scrolled — the exact defect this
+feature would be reported for. So the first visible row's index is counted from the **table's own
+start** (`md_table_row_index`, one bounded newline scan over the cache's window, once per table per
+frame) and every row after it increments.
+
+`Table_Zebra` already existed for §10's grid, so no new theme role and no `.theme` format change.
+
+### Layering, and one bound
+
+The band goes **under the selection**, which goes under everything else: at 1.05:1 against `Bg_Base` it
+would otherwise wash out a highlight sitting on it. It uses **`ad.h`**, not `lay.h` — a row whose
+second wrapped line the pane refused must not have its band painted below the glyphs that were
+admitted, the same bound the fence body's background and the quote bar already take.
+
+Header and separator never stripe, and data rows alternate **starting with the second**, so the first
+data row reads against the page and the band is what separates it from the next.
+
+### The sabotage that mattered was the one the first test missed
+
+Two rounds, and the second is the point:
+
+- Removing the band is caught by a **differential pixel test** on a real offscreen render — an 8-row
+  table paints 9,216 `Table_Zebra` pixels and a **one-row** table paints **0**, so "found some
+  zebra-coloured pixels" cannot pass by accident.
+- **Counting parity from the first visible row instead of the table's start was NOT caught**, because
+  the test rendered at anchor 0, where those two are the same number. The scroll-invariance property —
+  the entire reason for the design — was untested by a test written to check it.
+
+Fixed by rendering **anchored at a striped row** and sampling the top of the pane: correct code stripes
+it (12 px), the sabotage leaves it bare (0 px). A property about scrolling needs a test that scrolls.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
