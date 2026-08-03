@@ -7258,6 +7258,58 @@ attribute**, and the failure surfaces at a distant call site as "Undeclared name
 `Md_Pos` became file-private and `Md_Walk_Block` silently lost its marker. Check what an insertion
 point is attached to before inserting above it.
 
+## 6cc. Wrap indent, the last §8 item (2026-08-02, v0.63.0, branch `feat/wrap-indent`)
+
+§8: *"a wrapped line continues at the original indent + 2 columns, so wrapped prose stays visually
+distinct from a new line."* Pulled from the smalls batch (§6ca) once it turned out not to be small;
+this is it done properly, and **§8 is now complete**.
+
+### Why it was never a draw offset
+
+A hanging indent makes a continuation row **narrower**, so the wrap decision stops being
+per-row-independent: `wrap_row_end` took a uniform `cols` and had seven call sites, none of which knew
+whether the row they were measuring was a first row or a continuation. Threading the LOGICAL line's
+start through them is what makes the question answerable — and every one of those walkers already had
+it in hand (`ls`, `pls`, `base.pt_line_start`), so it cost a parameter rather than a redesign. The
+visible iterator gained `line_st` because its existing `fresh` flag says whether the NEXT row starts a
+line, which is one row too late.
+
+### One producer, because this is the §6j seam
+
+`row_indent_cells(doc, t, row_start, cols)` answers from a row start alone, and **the draw, the caret
+and the click hit-test all call it**. A continuation row broken at one width and painted at another,
+or painted at one origin and clicked in another, is exactly the drawn-column-vs-byte-column shape that
+§6j records sixteen bugs against — so the offset exists in one place and is added by the draw and
+subtracted by the hit-test.
+
+### The guard rail §8 does not give
+
+A 90-column indent at a 100-column measure leaves eight usable columns, which is worse than no indent.
+`WRAP_INDENT_MAX_FRAC` clamps the hang to **a quarter of the measure**, so a continuation row always
+keeps three quarters of the width. **Chosen, not measured**, and the constant says so.
+
+### A comment that the feature made false
+
+`wrap_row_end`'s tab-stop note justified its continuation-row deviation with *"leading indentation
+lives on the first visual row, where the origin is right"*. This makes that untrue — a continuation
+row now starts at a non-zero x. The reason was deleted rather than left standing as a claim the code
+no longer supports; the convention itself is unchanged.
+
+### Tested at the seam, sabotaged two ways
+
+`wrapindenttest` drives **`doc_pos_at`, the real hit-test**, rather than re-deriving a formula that
+would agree with itself: a click at a continuation row's text start must be that row's first byte, and
+columns 1/3/7 must be +1/+3/+7 so the test is not satisfied by everything collapsing to the row start.
+
+- Dropping the indent from the hit-test fails all four click assertions, each landing **exactly 10
+  characters** (the hang) too far in.
+- Dropping it from the wrap decision fails the width assertion: a continuation row plus its hang no
+  longer fits the measure (39 + 10 > 40), which is text overrunning the right edge.
+
+**Every wrap-sensitive mode passed BEFORE the test existed** — `wraptest`, `wraplongtest`, `vnavtest`,
+`rowtest`, `splittest`, `tabstoptest` — because none of them asserts anything about the indent. Green
+neighbours are not coverage.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

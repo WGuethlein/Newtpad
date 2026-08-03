@@ -37048,6 +37048,98 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad wrapindenttest` -- §8's hanging indent, tested at the seam.
+		//
+		// "A wrapped line continues at the original indent + 2 columns." That moves
+		// a continuation row's glyphs right, which means the wrap decision, the
+		// draw and the CLICK all have to agree about the same offset -- the
+		// drawn-column-vs-byte-column seam §6j records sixteen bugs against. So
+		// this drives doc_pos_at, the real hit-test, rather than re-deriving a
+		// formula that would agree with itself.
+		if os.args[1] == "wrapindenttest" {
+			bad := 0
+			wi :: proc(bad: ^int, cond: bool, label: string) {
+				if !cond {bad^ += 1}
+				fmt.printfln("  %-4s %s", "ok" if cond else "FAIL", label)
+			}
+			t: plat.Text
+			if !plat.text_load_faces(&t) {
+				fmt.eprintln("wrapindenttest: no fonts loaded")
+				return true
+			}
+			saved_hs := H_SCROLL
+			defer H_SCROLL = saved_hs
+			H_SCROLL = 0
+			// An indented line long enough to wrap several times, and a flush one.
+			indented := "        alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau\n"
+			flush := "aaa bbb ccc ddd eee fff ggg hhh iii jjj kkk lll mmm nnn ooo ppp qqq rrr sss ttt uuu vvv www\n"
+			src := strings.concatenate({indented, flush}, context.temp_allocator)
+			doc := doc_from_content(transmute([]u8)strings.clone(src), "w.txt", .UTF8)
+			defer doc_close(&doc)
+			doc.wrap = true
+			doc.view_cols = 40
+			cw := plat.text_char_width(&t, 16)
+
+			fmt.println("-- the indent is the line's own, plus 2 (spec §8) --")
+			ind := wrap_indent_cells(&doc, &t, 0, doc.view_cols)
+			// 8 spaces + 2 = 10, and 10 is under the quarter-of-measure cap at 40.
+			wi(&bad, ind == 10, fmt.tprintf("8 spaces of indent -> %d cells of hang (want 10)", ind))
+			flush_start := strings.index(src, "aaa")
+			wi(&bad, wrap_indent_cells(&doc, &t, flush_start, doc.view_cols) == WRAP_INDENT_EXTRA, "an unindented line still hangs by the +2")
+
+			fmt.println("-- a pathological indent cannot eat the measure --")
+			// 90 spaces at a 40-cell measure would leave nothing to read.
+			deep := strings.concatenate({strings.repeat(" ", 90, context.temp_allocator), "x\n"}, context.temp_allocator)
+			ddoc := doc_from_content(transmute([]u8)strings.clone(deep), "d.txt", .UTF8)
+			defer doc_close(&ddoc)
+			ddoc.wrap = true
+			ddoc.view_cols = 40
+			dind := wrap_indent_cells(&ddoc, &t, 0, 40)
+			wi(&bad, dind == 40 / WRAP_INDENT_MAX_FRAC, fmt.tprintf("a 90-cell indent clamps to %d (a quarter of the measure)", dind))
+			wi(&bad, dind < 90, "...rather than leaving a continuation row unreadably narrow")
+
+			fmt.println("-- a continuation row breaks EARLIER, because it is narrower --")
+			// The first row gets the whole measure; the second gets it minus the
+			// hang. If the wrap decision ignored the indent the two would hold the
+			// same number of cells and the text would overrun the right edge.
+			e0, le0 := wrap_row_end(&doc, &t, 0, doc.view_cols, 0)
+			wi(&bad, !le0, "the indented line really does wrap")
+			e1, _ := wrap_row_end(&doc, &t, e0, doc.view_cols, 0)
+			first_cells := plat.text_cells(&t, transmute([]u8)src[0:e0], 0, .Doc)
+			cont_cells := plat.text_cells(&t, transmute([]u8)src[e0:e1], 0, .Doc)
+			wi(&bad, cont_cells + ind <= doc.view_cols, fmt.tprintf("a continuation row plus its hang fits the measure (%d + %d <= %d)", cont_cells, ind, doc.view_cols))
+			wi(&bad, first_cells <= doc.view_cols, fmt.tprintf("...and so does the first row (%d)", first_cells))
+
+			fmt.println("-- THE SEAM: what is drawn and what is clicked share one origin --")
+			// doc_pos_at is the real hit-test. A click at the row's own text start
+			// -- TEXT_MARGIN_X plus the hang -- must land on that row's FIRST
+			// character. A hit-test that ignored the indent would report `ind`
+			// characters further in.
+			doc.top = 0
+			ROWS :: 6
+			row1 := e0 // the second visual row's start
+			px := f32(16)
+			// y of visual row 1, sampled inside its band.
+			my := i32(row_baseline_y(px, 1))
+			x_text := i32(TEXT_MARGIN_X + f32(ind) * cw + cw * 0.25)
+			got := doc_pos_at(&doc, &t, x_text, my, px, cw, ROWS)
+			wi(&bad, got == row1, fmt.tprintf("a click at the continuation row's text start is its first byte (%d, want %d)", got, row1))
+			// And a click in the blank hang itself clamps to that same first
+			// character rather than running off the front of the row.
+			x_hang := i32(TEXT_MARGIN_X + cw * 0.5)
+			got_h := doc_pos_at(&doc, &t, x_hang, my, px, cw, ROWS)
+			wi(&bad, got_h == row1, fmt.tprintf("a click inside the blank hang clamps to the same byte (%d, want %d)", got_h, row1))
+			// Several columns in, so the test is not satisfied by everything
+			// collapsing to the row start.
+			for c in ([]int{1, 3, 7}) {
+				x := i32(TEXT_MARGIN_X + f32(ind + c) * cw + cw * 0.25)
+				g := doc_pos_at(&doc, &t, x, my, px, cw, ROWS)
+				wi(&bad, g == row1 + c, fmt.tprintf("...and column %d of that row is byte +%d (%d, want %d)", c, c, g, row1 + c))
+			}
+
+			return mode_done("wrapindenttest", bad)
+		}
+
 		// `newtpad mdseltest` -- the preview's selection and copy (UI spec §9.4).
 		//
 		// The seam is that a selection has THREE producers which must agree: the

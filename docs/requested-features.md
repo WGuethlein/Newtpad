@@ -236,13 +236,8 @@ file is never rewritten.** v0.36.0 added a second sort key on top of it (§6bc).
 only timer, gated off for a caret-less view and an inactive window, on by default with a setting; the
 tint is Text_Primary at 3%, the caret's visual row, off by default.
 **The gutter and the wrap column cap are DONE (v0.57.0, HANDOFF §6bx).**
-- **Wrap indent** — a wrapped line continues at the original indent + 2 columns. **RE-SCOPED
-  2026-08-02: this is NOT a small feature and was mis-sized on this list.** `wrap_row_end` takes a
-  uniform `cols` across 7 call sites; a hanging indent means continuation rows have FEWER usable
-  columns, so the wrap decision stops being per-row-independent — and the draw origin, caret x,
-  `col_at_x` hit-testing and the selection rects all need the per-row indent too. That is the
-  drawn-column-vs-byte-column seam §6j records sixteen bugs against, in a milder form than
-  concealment but the same shape. Needs its own batch and its own spec.
+- ~~**Wrap indent**~~ **DONE (v0.63.0, HANDOFF §6cc)** — a wrapped line continues at its original
+  indent + 2 columns. The §8 section is now complete.
 - ~~**`caret_blink` and `current_line` have no UI at all**~~ **DONE (v0.61.0, HANDOFF §6ca)** — both
   now have settings rows, so the gap opened in v0.42.0 is closed.
 
