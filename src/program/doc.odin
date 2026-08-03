@@ -1528,6 +1528,18 @@ Document :: struct {
 	// comment: a session records doc.top, and the preview is derived from it on
 	// restore, so there is no format change and no saved position to lose.
 	md_top:      Md_Anchor,
+	// The preview's selection (UI spec §9.4). Separate from `cursor`/`anchor`
+	// because the preview has neither: it is a read-only rendered view, and its
+	// positions name rendered spans rather than source bytes (see Md_Pos).
+	//
+	// Only ONE of the two selections in the window is ever live -- taking a
+	// preview selection clears the editor's and vice versa (Wyatt's call,
+	// 2026-08-02). That is why this can be plain state rather than needing a
+	// focus model: whichever one is on is the one Ctrl+C copies.
+	md_sel_a:    Md_Pos,
+	md_sel_b:    Md_Pos,
+	md_sel_on:   bool,
+	md_sel_drag: bool, // a press is down and extending md_sel_b
 	md_sync_top: int,
 	// md_max_anchor's answer and the key it was computed under. See Md_Max_Key:
 	// a scroll moves no term of the key, which is the case that has to be free.

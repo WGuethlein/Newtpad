@@ -7183,6 +7183,81 @@ responding, so it needed its own assertion — now three: the list has more than
 entry is the editor's mono family, and every other entry is a real `BODY_FAMILIES` face. Re-sabotaged
 after adding them: it fails naming `"Segoe UI"` as the last choice.
 
+## 6cb. The preview is selectable and copyable (2026-08-02, v0.62.0, branch `feat/preview-selection`)
+
+UI spec §9.4: *"Preview is selectable and copyable. Read-only does not mean inert."* A silent
+omission — never a recorded deferral — and the last big §9 item that was not a judgment call.
+
+### The model, and why it is not a byte offset
+
+An endpoint is **`Md_Pos{block, span, off}`**: the block's start byte, the index of one of the block's
+SHAPE spans, and a byte offset inside that span's text. That triple is exactly what
+`plat.Shaped_Glyph` already records for every glyph the shaper places, so the hit-test reads the glyph
+the draw emitted rather than re-deriving a position from advances.
+
+**Not a source byte offset**, deliberately: the rendered text is not the source (`# Heading` renders as
+`Heading`), so a source offset cannot name a position in what the reader is looking at — which is the
+thing being selected. Keying on the block's start byte also means an edit that moves a block moves its
+selection with it, exactly as it moves the scroll anchor, rather than needing its own repair.
+
+### Three producers that had to agree
+
+The hit-test, the highlight and the copy are three answers to "what is selected", and all three read
+`lay.sh.glyphs` / `lay.shape`. The hit-test and the highlight ride **`md_pass`** — the single walk the
+draw, the links and the scroll already share — for the reason `md_preview_link_at`'s header gives: a
+second walk is a second chance to place a block somewhere the draw did not.
+
+The **copy** cannot use `md_pass`, because a selection reaches past the pane. It uses `md_walk`, the
+same primitive underneath, from `md_runup_start` — which is what carries **fence state** forward. A
+hand-rolled "classify each line from the first block" would not, so a selection starting inside a
+fenced block would disagree with the screen about what the lines after it even are.
+
+Highlights are **one quad per visual line**, not per glyph — §8's "Selection is a run of rects".
+
+### Copy format: Wyatt asked for "like Obsidian"
+
+Obsidian's reading view is HTML, so a **plain-text** copy out of it keeps list bullets, tab-separates
+table cells (which is what makes a pasted table land in a spreadsheet's columns) and copies a link as
+its label. That is what this produces. The list bullet needed explicit handling: it is drawn from
+`cls.bullet` at an offset rather than being one of the shaped spans, so a copy that only walked spans
+would have lost it and a bulleted list would paste as a run of fragments.
+
+**Not done, and named rather than left to be discovered:** Obsidian also puts a **rich-text** flavour
+on the clipboard, which is why pasting into Word keeps bold and headings. That is `CF_HTML` — a second
+clipboard format and a second serializer.
+
+`MD_COPY_MAX` (4 MB of source) bounds it and refuses loudly, the `JSON_FORMAT_MAX` / `TABLE_SORT_MAX`
+idiom rather than a new one. The number is a starting point, not a measurement, and says so.
+
+### Two behaviours changed, both worth Wyatt's eye
+
+- **Ctrl+A in full Preview now selects the RENDERED text, not the document.** `selalltest` pinned the
+  old meaning and failed — correctly. That assertion was right while the preview had no selection of
+  its own; there was nothing else Ctrl+A could mean there. **The cost is real: Ctrl+A then Ctrl+C in
+  Preview used to copy the markdown SOURCE and now copies the rendered text.** Ctrl+M out of Preview
+  is how you copy the source. Flagged for the live pass.
+- **One selection in the window at a time** (Wyatt's call). Taking a preview selection clears the
+  editor's and an editor press clears the preview's, so Ctrl+C is never ambiguous about which of two
+  highlights it meant.
+
+**Double-click-to-select-a-word is NOT offered**, and that is a conflict rather than an omission: the
+second press of a cluster is already Split's click-to-sync-scroll gesture. One input cannot mean two
+things, and that gesture shipped first.
+
+### What the sabotage caught that the tests did not
+
+Dropping the tab between table cells failed immediately. **Dropping the START trim did not** — the
+partial-selection assertions ("shorter than everything", "does not reach the next block") were both
+still true when a mid-paragraph copy silently began at the span's start. The range is now pinned
+exactly (`"irst "`), and re-sabotaging fails naming `"First "`.
+
+### The trap this batch paid for
+
+Inserting a declaration immediately before an existing one **steals its `@(private = "file")`
+attribute**, and the failure surfaces at a distant call site as "Undeclared name" in a different file —
+`Md_Pos` became file-private and `Md_Walk_Block` silently lost its marker. Check what an insertion
+point is attached to before inserting above it.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

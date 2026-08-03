@@ -2018,7 +2018,23 @@ when NEWTPAD_TESTS {
 		d.cursor, d.anchor = 0, 0
 		command_dispatch(.Select_All, {}, &app, &dummy, &dtext, 10)
 		_, hi_md := doc_sel_range(d)
-		li_chk(bad, hi_md == hi_text, fmt.tprintf("...and so does Ctrl+A in the markdown preview (%d, want %d)", hi_md, hi_text))
+		// CHANGED 2026-08-02 (v0.62.0), and deliberately: Ctrl+A in the PREVIEW now
+		// selects the preview's rendered text, not the document's source.
+		//
+		// This assertion used to say the two were identical, and that was right
+		// while the preview had no selection of its own -- there was nothing else
+		// Ctrl+A could mean there. Now there is, and "select all" in a pane the
+		// reader is looking at has to mean the thing they can see; the alternative
+		// is Ctrl+A highlighting nothing visible and Ctrl+C yielding markdown the
+		// pane is not showing.
+		//
+		// The cost is real and worth naming: Ctrl+A then Ctrl+C in full Preview
+		// used to copy the SOURCE and now copies the rendered text. Toggling out of
+		// Preview (Ctrl+M) is how you copy the source.
+		li_chk(bad, hi_md == 0, fmt.tprintf("Ctrl+A in the preview leaves the EDITOR selection empty (%d, want 0)", hi_md))
+		li_chk(bad, d.md_sel_on, "...because it took the PREVIEW's selection instead")
+		_, _, md_rng := md_sel_range(d)
+		li_chk(bad, md_rng, "...and that selection is a real, non-empty range")
 		li_chk(bad, d.md_mode == .Preview, "...leaving the preview open")
 	}
 
@@ -37030,6 +37046,94 @@ when NEWTPAD_TESTS {
 		if os.args[1] == "windowshowtest" {
 			window_show_test_run()
 			return true
+		}
+
+		// `newtpad mdseltest` -- the preview's selection and copy (UI spec §9.4).
+		//
+		// The seam is that a selection has THREE producers which must agree: the
+		// hit-test that turns a pixel into an Md_Pos, the draw that highlights
+		// glyphs inside the range, and the copy that emits text for it. All three
+		// read `lay.sh.glyphs` / `lay.shape`, and this asserts they agree rather
+		// than that each is individually plausible.
+		if os.args[1] == "mdseltest" {
+			bad := 0
+			ms :: proc(bad: ^int, cond: bool, label: string) {
+				if !cond {bad^ += 1}
+				fmt.printfln("  %-4s %s", "ok" if cond else "FAIL", label)
+			}
+			t: plat.Text
+			if !plat.text_load_faces(&t) {
+				fmt.eprintln("mdseltest: no fonts loaded")
+				return true
+			}
+			src := "# Title\n\nFirst paragraph here.\n\nSecond one.\n\n- alpha\n- beta\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n"
+			doc := doc_from_content(transmute([]u8)strings.clone(src), "sel.md", .UTF8)
+			defer doc_close(&doc)
+			doc.md_mode = .Preview
+			px := f32(16)
+			MEAS :: f32(600)
+
+			fmt.println("-- ordering is document order, and a bare click selects nothing --")
+			a := Md_Pos{block = 10, span = 0, off = 0}
+			b := Md_Pos{block = 10, span = 0, off = 3}
+			ms(&bad, md_pos_less(a, b), "same block/span: a lower offset sorts first")
+			ms(&bad, md_pos_less(Md_Pos{block = 2}, Md_Pos{block = 9}), "a lower block sorts first")
+			ms(&bad, !md_pos_less(b, a), "...and the order is strict, not merely non-equal")
+			doc.md_sel_on = true
+			doc.md_sel_a, doc.md_sel_b = a, a
+			_, _, r0 := md_sel_range(&doc)
+			ms(&bad, !r0, "an empty range (a bare click) selects nothing")
+			// Backwards drags are the common case -- selecting right-to-left -- and
+			// every consumer wants the pair ordered rather than knowing which end
+			// the gesture started at.
+			doc.md_sel_a, doc.md_sel_b = b, a
+			lo, hi, r1 := md_sel_range(&doc)
+			ms(&bad, r1 && md_pos_eq(lo, a) && md_pos_eq(hi, b), "a backwards drag still yields lo < hi")
+
+			fmt.println("-- copy yields the RENDERED text, not the markdown (§9.4) --")
+			// The whole document, which is what Ctrl+A asks for.
+			md_preview_select_all(&doc)
+			got, cok := md_preview_sel_text_for_test(&doc, &t, px, MEAS)
+			ms(&bad, cok, "select-all copies")
+			ms(&bad, !strings.contains(got, "#"), fmt.tprintf("no '#' survives -- a heading copies as its text (%q)", got[:min(24, len(got))]))
+			ms(&bad, strings.contains(got, "Title"), "...and the heading's TEXT does survive")
+			ms(&bad, !strings.contains(got, "---"), "the table's separator row contributes no dashes")
+			ms(&bad, strings.contains(got, "First paragraph here."), "a whole paragraph copies")
+			ms(&bad, strings.contains(got, "Second one."), "...and so does the one after it, so blocks join")
+
+			fmt.println("-- Obsidian's plain-text shape: bullets kept, cells tab-separated --")
+			ms(&bad, strings.contains(got, "alpha") && strings.contains(got, "beta"), "list items copy")
+			// A bulleted list pasted without its bullets reads as a run of fragments,
+			// which is why Obsidian keeps them and why this is asserted rather than
+			// left to whatever the span walk happened to produce.
+			bullet_kept := strings.contains(got, "•") || strings.contains(got, "- alpha")
+			ms(&bad, bullet_kept, "...with their bullet, not as bare fragments")
+			// The tab is what makes a pasted table land in a spreadsheet's columns.
+			ms(&bad, strings.contains(got, "\t"), "table cells are TAB-separated")
+
+			fmt.println("-- a partial selection is trimmed at BOTH ends --")
+			// Two positions inside the same paragraph: the copy must be a strict
+			// substring of the whole-document copy, and shorter than it.
+			doc.md_sel_a = Md_Pos{block = strings.index(src, "First"), span = 0, off = 1}
+			doc.md_sel_b = Md_Pos{block = strings.index(src, "First"), span = 0, off = 6}
+			doc.md_sel_on = true
+			part, pok := md_preview_sel_text_for_test(&doc, &t, px, MEAS)
+			ms(&bad, pok && len(part) < len(got), fmt.tprintf("a mid-paragraph range copies less than everything (%q)", part))
+			ms(&bad, !strings.contains(part, "Second"), "...and does not reach the following block")
+			// BOTH ends, pinned exactly. "shorter than everything" and "does not
+			// reach the next block" are both still true when the START trim is
+			// dropped, which sabotage proved -- so neither of them tests it. The
+			// range is offsets [1,6) of "First paragraph here.", so the copy is
+			// "irst " and specifically does NOT begin at the span's own start.
+			ms(&bad, part == "irst ", fmt.tprintf("the range is trimmed at both ends, exactly: %q (want %q)", part, "irst "))
+			ms(&bad, !strings.has_prefix(part, "First"), "...so it does not silently start at the span's beginning")
+
+			fmt.println("-- clearing --")
+			md_sel_clear(&doc)
+			_, _, r2 := md_sel_range(&doc)
+			ms(&bad, !r2, "md_sel_clear leaves no range")
+
+			return mode_done("mdseltest", bad)
 		}
 
 		// `newtpad gridlinktest` -- what the grid DRAWS as a link against what the

@@ -294,6 +294,22 @@ width is reserved from the start, so nothing shifts when they arrive.
 The filter view (`Ctrl+L`) has always had its own gutter and still does regardless of this setting:
 showing lines out of context is meaningless without saying which lines they are.
 
+### Selecting and copying from the preview
+
+**Drag to select** in the markdown preview, **`Ctrl+A`** to select all of it, **`Ctrl+C`** to copy.
+What you get is the **rendered text, not the markdown** — `# Heading` copies as `Heading`. List items
+keep their bullet, table cells are separated by tabs so a copied table pastes into a spreadsheet's
+columns, and a link copies as its label.
+
+Only one selection is live in the window at a time: selecting in the preview clears the editor's
+selection and clicking in the editor clears the preview's, so `Ctrl+C` is never ambiguous.
+
+*Limits:* copying pastes **plain text only** — pasting into Word will not keep bold or headings.
+Double-click does not select a word in the preview, because the second click is already Split's
+click-to-sync-scroll gesture. **`Ctrl+A` in full Preview copies the rendered text, not the source** —
+press `Ctrl+M` to leave Preview if you want the markdown itself. A selection over more than 4 MB of
+source refuses and says so.
+
 ### Markdown preview / split — `Ctrl+M`
 
 Cycles **Off → Preview → Split → Off** on `.md .markdown .mkd .mdown .mdwn .mdtext .mdx .mtext`.
