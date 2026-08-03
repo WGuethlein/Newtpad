@@ -303,7 +303,14 @@ than nothing. Two things it left behind, both new:
   the block**, so the fix is a running counter in the walk, reset when the table block changes
   (`md_table_ensure`'s `.start` identifies it). Modest, but not a one-liner, and it touches the
   partial-admit path.
-- **Preview selection and copy** (§9.4) — a silent omission, never a recorded deferral.
+- ~~**Preview selection and copy** (§9.4)~~ **DONE (v0.62.0, HANDOFF §6cb)** — drag to select, Ctrl+A,
+  Ctrl+C. Copy yields the rendered text in Obsidian's plain-text shape: bullets kept, table cells
+  tab-separated, links as their label.
+  **Owed follow-ups, both named rather than discovered later:** Obsidian also puts a RICH-TEXT flavour
+  on the clipboard (`CF_HTML`), which is why pasting into Word keeps bold and headings — that is a
+  second clipboard format and a second serializer, not built. And **double-click-to-select-a-word is
+  not offered**, because the second press of a cluster is already Split's click-to-sync-scroll gesture
+  (§6ao); one input cannot mean two things, and the gesture shipped first.
 - **The heading tick-mark rail** (§9.4) — an 8px mini-map of `md_heading` ticks.
 - **Lists do not nest visually** beyond their indent — no per-level bullet cycling.
 - **A screen *above* the viewport** is laid out only on the scroll-up gesture, not per pass (§9.1).

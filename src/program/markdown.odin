@@ -19,6 +19,7 @@ package main
 
 import "core:fmt"
 import "core:strings"
+import "core:unicode/utf8"
 import base "src:base"
 import plat "src:platform"
 
@@ -3975,6 +3976,62 @@ Md_Slot_Key :: struct {
 // bound (`n < len(out)` in md_walk) and can take no further slot, so the stale
 // pointer it hands back is never written through. Bounded and, short of
 // raising one constant without the other, unreachable in practice.
+// One end of a preview selection (UI spec §9.4: "Preview is selectable and
+// copyable. Read-only does not mean inert").
+//
+// `block` is the block's START BYTE in the source, which is what every other
+// preview coordinate is keyed on (Md_Anchor, the layout cache, md_table_ensure)
+// -- so an edit that moves a block moves its selection with it exactly as it
+// moves the scroll anchor, rather than needing its own repair.
+//
+// `span` indexes the block's SHAPE spans (`lay.shape`), and `off` is a byte
+// offset inside that span's text -- which is precisely what plat.Shaped_Glyph
+// already records for every glyph it places. The hit-test therefore reads the
+// glyph the draw emitted rather than re-deriving a position from advances, which
+// is the one-producer rule applied to this seam.
+//
+// NOT a source byte offset: the rendered text is not the source (`# Heading`
+// renders as `Heading`), so a source offset could not name a position in what the
+// reader is looking at, which is the thing being selected.
+Md_Pos :: struct {
+	block: int,
+	span:  int,
+	off:   int,
+}
+
+// Document order. Blocks sort by start byte, then spans within a block, then
+// bytes within a span -- the same order md_pass walks and md_sel_text emits, so
+// "is this glyph inside the selection" is one comparison and not a special case
+// per block.
+md_pos_less :: proc(a, b: Md_Pos) -> bool {
+	if a.block != b.block {return a.block < b.block}
+	if a.span != b.span {return a.span < b.span}
+	return a.off < b.off
+}
+
+md_pos_eq :: proc(a, b: Md_Pos) -> bool {
+	return a.block == b.block && a.span == b.span && a.off == b.off
+}
+
+// The selection's two ends in document order. The ANCHOR is where the drag
+// started and the CURSOR is where it is now, so either may be the earlier one --
+// every consumer wants them ordered and none of them wants to know which was
+// which.
+md_sel_range :: proc(doc: ^Document) -> (lo, hi: Md_Pos, ok: bool) {
+	if doc == nil || !doc.md_sel_on {return {}, {}, false}
+	a, b := doc.md_sel_a, doc.md_sel_b
+	if md_pos_eq(a, b) {return {}, {}, false} // a bare click selects nothing
+	if md_pos_less(b, a) {a, b = b, a}
+	return a, b, true
+}
+
+md_sel_clear :: proc(doc: ^Document) {
+	if doc == nil {return}
+	doc.md_sel_on = false
+	doc.md_sel_drag = false
+	doc.md_sel_a, doc.md_sel_b = {}, {}
+}
+
 @(private = "file")
 Md_Walk_Block :: struct {
 	start:    int,
@@ -4263,6 +4320,11 @@ md_pass :: proc(
 	x0, x1, ytop, ybot: f32,
 	at: Md_Anchor,
 	links: ^[dynamic]Md_Link_Hit,
+	// Optional hit-test: when non-nil, the point to resolve into an Md_Pos and
+	// where to put the answer. Rides this walk rather than getting its own for the
+	// reason md_preview_link_at's header gives about links -- a second walk is a
+	// second chance to place a block somewhere the draw did not.
+	sel_at: ^Md_Sel_Probe = nil,
 ) -> (
 	bottom: int,
 	shown:  int,
@@ -4306,8 +4368,21 @@ md_pass :: proc(
 			shown = p.blk.end
 			continue
 		}
-		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, p.blk.lay, cx, x1, p.y, p.admit)}
+		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, p.blk.lay, cx, x1, p.y, p.admit, p.blk.start)}
 		if links != nil {md_block_links(doc, p.blk.lay, cx, p.y, p.admit, links)}
+		if sel_at != nil && !sel_at.ok {
+			// First block whose admitted band contains the point wins. `>= p.y` and
+			// the admitted height, not the layout height, so a point over the part of
+			// a block the pane refused resolves in the NEXT block instead of one the
+			// reader cannot see -- the same bound md_block_links applies.
+			if sel_at.y >= p.y && sel_at.y < p.y + p.admit.h {
+				sel_at.pos, sel_at.ok = md_block_pos_at(p.blk, cx, p.y, p.admit, sel_at.x, sel_at.y)
+			}
+			// Remember the last block the walk admitted, so a point BELOW every block
+			// (the empty pane under a short document) can still clamp to the end of
+			// the text rather than selecting nothing.
+			if p.admit.h > 0 {sel_at.last, sel_at.last_y, sel_at.last_ad, sel_at.cx = p.blk, p.y, p.admit, cx}
+		}
 		// `bottom` advances only past a block that is FINISHED. A partially drawn
 		// block reports its own start (i.e. leaves `bottom` where the previous block
 		// left it), because lines of it the reader has never seen are not behind
@@ -4424,6 +4499,304 @@ md_preview_links :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, w
 // ytop as well as ybot: the pane owes a cover strip at BOTH ends (markdown_draw)
 // because a partially-scrolled anchor block draws above ytop, and rects go up
 // there for the same reason they go down past ybot.
+// A pixel→position query riding md_pass. `last*` carry the final admitted block
+// so a point below every block clamps to the end of the document's text instead
+// of resolving to nothing -- dragging past the last paragraph is how people
+// select to the end.
+@(private = "file")
+Md_Sel_Probe :: struct {
+	x, y:    f32,
+	pos:     Md_Pos,
+	ok:      bool,
+	last:    Md_Walk_Block,
+	last_y:  f32,
+	last_ad: Md_Admit,
+	// The content origin this pass laid the blocks against. Recorded by the walk
+	// rather than re-derived by the caller: md_block_pos_at reads glyph x's
+	// relative to it, and a second derivation is a second chance to disagree with
+	// where the draw actually put them.
+	cx:      f32,
+}
+
+// How much of the document a preview copy will lay out, in bytes of SOURCE.
+//
+// Copying needs each block's rendered spans, which means laying each block out --
+// shaping included. That is cheap per block and unbounded over a document, and
+// Ctrl+A on a large markdown file is exactly the case that would discover it. So
+// it refuses past this and says so, the same shape as JSON_FORMAT_MAX and
+// TABLE_SORT_MAX rather than a new idea.
+//
+// 4 MB is far past any hand-written document and well inside what one frame can
+// absorb; the number is a starting point rather than a measurement, which is
+// stated because §6bl records a ceiling that was argued rather than measured.
+MD_COPY_MAX :: 4 * 1024 * 1024
+
+// The rendered text of the current preview selection, in document order.
+//
+// "Copy yields the rendered text, not the markdown" (UI spec §9.4), and Wyatt's
+// call for the details was "like Obsidian" -- whose reading view is HTML, so a
+// PLAIN-TEXT copy out of it keeps list bullets, tab-separates table cells (which
+// is what makes a pasted table land in a spreadsheet's columns) and copies a link
+// as its label. That is what this produces.
+//
+// What it deliberately does NOT do, and Obsidian does: put a RICH-TEXT flavour on
+// the clipboard as well, so pasting into Word keeps the bold and the headings.
+// That is a second clipboard format (CF_HTML) and a second serializer; recorded
+// in requested-features.md rather than half-done here.
+md_sel_text :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, measure: f32, allocator := context.temp_allocator) -> (out: string, ok: bool) {
+	lo, hi, on := md_sel_range(doc)
+	if !on {return "", false}
+	if hi.block - lo.block > MD_COPY_MAX {return "", false}
+	m := md_metrics(text, px)
+	// The SAME walk the draw uses (md_walk), not a second block enumeration. It
+	// is what carries fence state forward -- a selection that starts inside a
+	// fenced code block has to see the blocks after it as fence bodies, and a
+	// hand-rolled "classify each line from lo.block" would not, so the copy would
+	// disagree with what is on screen about what those lines even are.
+	//
+	// The run-up is md_runup_start's, exactly as md_anchor_walk takes it, because
+	// that is what makes the first block's own state right.
+	blocks := make([]Md_Walk_Block, MD_WALK_BLOCKS, context.temp_allocator)
+	from := md_runup_start(doc, lo.block, MD_RUNUP_LINES)
+	sb := strings.builder_make(allocator)
+	first := true
+	for from <= doc.pt.length {
+		n, _, _ := md_walk(gfx, text, doc, &m, measure, from, max(int), lo.block, 1e30, blocks)
+		if n == 0 {break}
+		done := false
+		for bi in 0 ..< n {
+			blk := blocks[bi]
+			if blk.start < lo.block {continue} // still in the run-up
+			if blk.start > hi.block {done = true;break}
+			md_sel_block_text(&sb, blk.lay, blk.start, lo, hi, &first)
+		}
+		if done {break}
+		nxt := blocks[n - 1].next
+		if nxt <= from {break} // a walk that does not advance would spin
+		from = nxt
+	}
+	return strings.to_string(sb), true
+}
+
+// The preview selection's text for the CURRENT pane, or ok=false when there is
+// no selection or no pane. The clipboard's one call.
+//
+// Takes the pane box from md_pane_box, like every other preview consumer, so the
+// measure a copy re-lays-out against is the measure the reader is looking at --
+// a different measure would wrap differently and, for a table, fit a different
+// number of columns.
+md_preview_sel_text :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac: f32, allocator := context.temp_allocator) -> (string, bool) {
+	if doc == nil || !doc.md_sel_on {return "", false}
+	x0, x1, _, _, ok := md_pane_box(doc, winw, winh, split_frac)
+	if !ok {return "", false}
+	m := md_metrics(text, px)
+	_, measure := md_content_span(&m, x0, x1)
+	return md_sel_text(gfx, text, doc, px, measure, allocator)
+}
+
+// Package-visible so mdseltest can drive the copy without a window: the pane box
+// is the only thing md_preview_sel_text needs one for, and a test that supplied a
+// fake window would be asserting against a measure the product never uses. Takes
+// the measure directly instead, which is what md_pane_box would have produced.
+md_preview_sel_text_for_test :: proc(doc: ^Document, text: ^plat.Text, px, measure: f32, allocator := context.temp_allocator) -> (string, bool) {
+	return md_sel_text(nil, text, doc, px, measure, allocator)
+}
+
+// Select the whole rendered document (Ctrl+A in the preview). The end position
+// is deliberately "past the last block", which md_sel_text clamps per block --
+// naming a real final span would mean laying the last block out here, and the
+// walk is going to do that anyway.
+md_preview_select_all :: proc(doc: ^Document) {
+	if doc == nil {return}
+	doc.md_sel_a = Md_Pos{block = 0, span = 0, off = 0}
+	doc.md_sel_b = Md_Pos{block = max(0, doc.pt.length), span = max(int), off = max(int)}
+	doc.md_sel_on = true
+	doc.md_sel_drag = false
+}
+
+// One block's contribution to a copy. Split out so the walk above reads as a
+// walk and the Obsidian-shaped formatting decisions live in one place.
+@(private = "file")
+md_sel_block_text :: proc(sb: ^strings.Builder, lay: ^Md_Layout, p: int, lo, hi: Md_Pos, first: ^bool) {
+	if lay == nil {return}
+	// A blank line renders nothing and contributes no text, but it DOES end a
+	// paragraph -- the newline BETWEEN blocks is what carries that, which is why it
+	// is written before the block rather than after (no trailing newline on a copy).
+	if !first^ {strings.write_byte(sb, '\n')}
+	first^ = false
+	// The list marker is drawn from cls.bullet at an offset rather than being one
+	// of the shaped spans, so a copy that only walked spans would lose it. Obsidian
+	// keeps it, and a bulleted list pasted without its bullets reads as a paragraph
+	// of fragments.
+	if lay.cls.kind == .List && len(lay.cls.bullet) > 0 {
+		strings.write_string(sb, lay.cls.bullet)
+		strings.write_byte(sb, ' ')
+	}
+	for sp, i in lay.shape {
+		// Trim the two END blocks to the selection; every block between them
+		// contributes whole.
+		s := sp.text
+		if p == lo.block && i < lo.span {continue}
+		if p == hi.block && i > hi.span {break}
+		a := lo.off if (p == lo.block && i == lo.span) else 0
+		b := hi.off if (p == hi.block && i == hi.span) else len(s)
+		a = clamp(a, 0, len(s))
+		b = clamp(b, a, len(s))
+		strings.write_string(sb, s[a:b])
+		// A table row's cells are separate spans, and a TAB between them is what
+		// makes the paste land in a spreadsheet's columns -- which is exactly what
+		// copying a table out of Obsidian's reading view does.
+		if lay.cls.kind == .Table && !lay.cls.is_sep && i + 1 < len(lay.shape) {
+			strings.write_byte(sb, '\t')
+		}
+	}
+}
+
+
+// Is this glyph inside the selection? `pos` is the glyph's own position and the
+// range is half-open [lo, hi) -- the same convention the editor's selection uses,
+// so the character under the drag's end is not included until the drag passes it.
+@(private = "file")
+md_glyph_selected :: proc(blk_start: int, g: plat.Shaped_Glyph, lo, hi: Md_Pos) -> bool {
+	p := Md_Pos{block = blk_start, span = int(g.span), off = int(g.off)}
+	return !md_pos_less(p, lo) && md_pos_less(p, hi)
+}
+
+// Selection bands for one block: one quad per visual line, spanning from the
+// first selected glyph on that line to the right edge of the last.
+//
+// Reads the SAME glyph list the draw is about to paint, so a highlighted
+// character and a drawn character cannot be different characters -- this is the
+// draw/selection seam and it has exactly one producer.
+@(private = "file")
+md_draw_selection :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, ad: Md_Admit, blk_start: int) {
+	lo, hi, ok := md_sel_range(doc)
+	if !ok || lay == nil || len(lay.sh.glyphs) == 0 {return}
+	// Whole blocks outside the range contribute nothing, and this is the cheap
+	// test that keeps a long selection from costing per-glyph work on every block
+	// on screen.
+	if blk_start < lo.block || blk_start > hi.block {return}
+	x := md_block_origin(lay, cx)
+	nlines := len(lay.sh.line_boxes)
+	if ad.lines > 0 {nlines = min(nlines, ad.lines)}
+	for line in 0 ..< nlines {
+		l0, l1 := f32(1e9), f32(-1e9)
+		for g, i in lay.sh.glyphs {
+			if int(g.line) != line {continue}
+			if !md_glyph_selected(blk_start, g, lo, hi) {continue}
+			gx := x + g.x
+			adv := f32(0)
+			if i + 1 < len(lay.sh.glyphs) && int(lay.sh.glyphs[i + 1].line) == line {
+				adv = lay.sh.glyphs[i + 1].x - g.x
+			} else {
+				adv = max(0, lay.sh.line_boxes[line].width - g.x)
+			}
+			l0 = min(l0, gx)
+			l1 = max(l1, gx + adv)
+		}
+		if l1 <= l0 {continue}
+		lb := lay.sh.line_boxes[line]
+		plat.quads_draw(
+			gfx,
+			qp,
+			[]plat.Quad{{pos = {l0, ytop + lb.top}, size = {l1 - l0, lb.h}, color = g_theme[.Selection_Doc]}},
+		)
+	}
+}
+
+// The rendered position under a point inside one laid-out block.
+//
+// Reads `lay.sh.glyphs` -- the glyphs the draw placed -- so the character the
+// caller selects is the character the reader sees at that pixel. Nothing here
+// re-measures anything.
+//
+// Two deliberate roundings, both of which are what a text selection is expected
+// to do rather than what a strict point-in-rect would do:
+//   - past the last glyph on a line, the position is the END of that line's last
+//     glyph, so dragging into the ragged right margin selects to end-of-line
+//     rather than stopping at the final character;
+//   - within a glyph, the nearer EDGE wins, so clicking the left half of a
+//     character puts the boundary before it. A caret-less view still has a
+//     boundary; it is just drawn as the edge of a highlight.
+@(private = "file")
+md_block_pos_at :: proc(blk: Md_Walk_Block, cx, ytop: f32, ad: Md_Admit, mx, my: f32) -> (Md_Pos, bool) {
+	lay := blk.lay
+	if lay == nil || len(lay.sh.glyphs) == 0 {return {}, false}
+	// Which visual line the point is on, bounded to the lines this block was
+	// ADMITTED -- a line the pane refused was never drawn, so a point cannot be
+	// on it even though the layout has geometry for it.
+	line := -1
+	for lb, i in lay.sh.line_boxes {
+		if ad.lines > 0 && i >= ad.lines {break}
+		top := ytop + lb.top
+		if my >= top && my < top + lb.h {line = i;break}
+	}
+	if line < 0 {
+		// Above the first admitted line or below the last: clamp to the block's
+		// nearer end so a drag that runs off the block still resolves inside it.
+		last := max(0, min(len(lay.sh.line_boxes), ad.lines if ad.lines > 0 else len(lay.sh.line_boxes)) - 1)
+		line = 0 if my < ytop else last
+	}
+	best := -1
+	best_after := false
+	for g, i in lay.sh.glyphs {
+		if int(g.line) != line {continue}
+		gx := cx + g.x
+		if best < 0 {best = i}
+		if mx >= gx {
+			best = i
+			// Past this glyph's midpoint means the boundary is after it. The
+			// advance is the next glyph's x on the same line, or the line's own
+			// width for the last one.
+			adv := f32(0)
+			if i + 1 < len(lay.sh.glyphs) && int(lay.sh.glyphs[i + 1].line) == line {
+				adv = lay.sh.glyphs[i + 1].x - g.x
+			} else {
+				adv = max(0, lay.sh.line_boxes[line].width - g.x)
+			}
+			best_after = mx >= gx + adv * 0.5
+		}
+	}
+	if best < 0 {return {}, false}
+	g := lay.sh.glyphs[best]
+	off := int(g.off)
+	if best_after {
+		// One rune past this glyph, inside its own span. utf8 because `off` is a
+		// BYTE offset into the span's text and a multi-byte rune must not be split
+		// -- a boundary inside a rune would slice the string at copy time.
+		if int(g.span) < len(lay.shape) {
+			s := lay.shape[g.span].text
+			_, sz := utf8.decode_rune_in_string(s[min(off, len(s)):])
+			off = min(off + max(1, sz), len(s))
+		}
+	}
+	return Md_Pos{block = blk.start, span = int(g.span), off = off}, true
+}
+
+// The rendered position under a client-space point in the preview pane, or
+// ok=false when the point is not in the pane at all.
+//
+// THE hit-test for selection, and the only place the pane's bounds are applied
+// to one -- same contract, same reason, as md_preview_link_at directly below.
+md_preview_pos_at :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac, mx, my: f32) -> (Md_Pos, bool) {
+	x0, x1, ytop, ybot, ok := md_pane_box(doc, winw, winh, split_frac)
+	if !ok {return {}, false}
+	if my < ytop || my >= ybot || mx < x0 || mx >= x1 {return {}, false}
+	pr := Md_Sel_Probe {
+		x = mx,
+		y = my,
+	}
+	md_pass(gfx, nil, text, doc, px, x0, x1, ytop, ybot, doc.md_top, nil, &pr)
+	if pr.ok {return pr.pos, true}
+	// Below every admitted block: clamp to the end of the last one. A drag into
+	// the empty space under a short document should select to the end, which is
+	// what every other text view does.
+	if pr.last.lay != nil {
+		return md_block_pos_at(pr.last, pr.cx, pr.last_y, pr.last_ad, 1e9, pr.last_y + pr.last_ad.h - 1)
+	}
+	return {}, false
+}
+
 md_preview_link_at :: proc(gfx: ^plat.Gfx, text: ^plat.Text, doc: ^Document, px, winw, winh, split_frac, mx, my: f32) -> (Md_Link_Hit, bool) {
 	x0, x1, ytop, ybot, ok := md_pane_box(doc, winw, winh, split_frac)
 	if !ok {return {}, false}
@@ -5054,8 +5427,20 @@ md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, ad: Md_Ad
 // glyphs and for every rectangle in lay.boxes. A band drawn to lay.h under a
 // partial admit is exactly the overhang the admit test exists to prevent.
 @(private = "file")
-md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32, ad: Md_Admit) {
+md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32, ad: Md_Admit, blk_start := -1) {
 	x := md_block_origin(lay, cx)
+	// The selection, UNDER everything this block draws (UI spec §9.4: "Selection
+	// uses selection_doc"). First so the glyphs, the rules and the quote bars all
+	// read on top of it, the same ordering the current-line tint uses in the
+	// editor and for the same reason.
+	//
+	// ONE QUAD PER VISUAL LINE, not per glyph -- §8's "Selection is a run of
+	// rects, not per-glyph. One instance per visual line, so only visible lines
+	// cost anything." The run is [first selected glyph's left, last selected
+	// glyph's right] on each line, which for a full line is the whole line.
+	if qp != nil && blk_start >= 0 {
+		md_draw_selection(gfx, qp, doc, lay, cx, ytop, ad, blk_start)
+	}
 	// PAIRING GUARD (2026-07-29 review, F4). The kinds that `return` inside the
 	// switch below must be EXACTLY the kinds md_kind_lines calls indivisible, and
 	// the kinds that fall through to shaped_draw (below the switch) must be

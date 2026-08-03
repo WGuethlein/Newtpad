@@ -1069,6 +1069,33 @@ main :: proc() {
 					md_split_click_sync(doc, &text, &c, ro, window.mouse_count, ed_right, f32(window.mouse_x), f32(window.mouse_y), rows)
 				}
 			}
+			// Preview selection (UI spec §9.4), read on the way past for the same
+			// reason the sync gesture above is: the swallow below zeroes both
+			// mouse_pressed AND mouse_down every frame over a read-only surface, so
+			// a drag has to be started and extended here or it dies the frame after
+			// the press -- which is precisely the §6bu bug, one surface over.
+			//
+			// A SINGLE press only. The second press of a cluster is already the
+			// click-to-sync-scroll gesture above, so double-click-selects-a-word
+			// would be the same input meaning two things; word select is therefore
+			// not offered rather than made to fight the gesture that shipped first.
+			if ro && f32(window.mouse_x) >= (ed_right if doc.md_mode == .Split else 0) {
+				if window.mouse_pressed && !plat.key_ctrl_down() && window.mouse_count < 2 {
+					if pos, pok := md_preview_pos_at(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y)); pok {
+						doc.md_sel_a, doc.md_sel_b = pos, pos
+						doc.md_sel_on, doc.md_sel_drag = true, true
+						// One live selection in the window (Wyatt, 2026-08-02): taking
+						// one here drops the editor's, so Ctrl+C is never ambiguous
+						// about which of two highlights it means.
+						doc.anchor = doc.cursor
+					}
+				} else if doc.md_sel_drag && window.mouse_down {
+					if pos, pok := md_preview_pos_at(&gfx, &text, doc, px, f32(window.width), f32(window.height), app.settings.split_frac, f32(window.mouse_x), f32(window.mouse_y)); pok {
+						doc.md_sel_b = pos
+					}
+				}
+			}
+			if !window.mouse_down {doc.md_sel_drag = false}
 			if ro && (window.mouse_pressed || window.mouse_down) {
 				window.mouse_pressed = false
 				window.mouse_middle_pressed = false
@@ -1235,6 +1262,12 @@ main :: proc() {
 
 		// Mouse: press places/extends the caret (double=word, triple=line); drag extends.
 		if window.mouse_pressed {
+			// The other half of the one-selection rule (§9.4 selection, Wyatt's call
+			// 2026-08-02): a press that places the editor's caret drops the
+			// preview's highlight, exactly as taking a preview selection drops the
+			// editor's. Whichever one is on is the one Ctrl+C copies, so two live
+			// highlights must never be possible.
+			md_sel_clear(doc)
 			mp := doc_pos_at(doc, &text, window.mouse_x, window.mouse_y, px, char_w, drawn)
 			switch window.mouse_count {
 			case 2:

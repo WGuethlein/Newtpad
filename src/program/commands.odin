@@ -1388,8 +1388,32 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 	case .Redo:
 		doc_redo(doc)
 	case .Select_All:
-		doc_select_all(doc)
+		// The preview owns Ctrl+A whenever it is the pane being read. Only one
+		// selection is ever live (doc.md_sel_on), so this is a check rather than a
+		// contest between two highlights.
+		if doc != nil && doc.kind == .Text && doc.md_mode == .Preview {
+			md_preview_select_all(doc)
+			doc.anchor = doc.cursor // drop the editor's, per the one-selection rule
+		} else {
+			doc_select_all(doc)
+		}
 	case .Copy:
+		// A live PREVIEW selection takes priority, and can only be live when the
+		// editor's is not -- taking either one clears the other, so there is never
+		// a question of which highlight Ctrl+C meant (Wyatt, 2026-08-02).
+		if doc != nil && doc.md_sel_on {
+			if rc := active_render_ctx; rc != nil && rc.window != nil {
+				if s, sok := md_preview_sel_text(rc.gfx, t, doc, rc.px, f32(rc.window.width), f32(rc.window.height), app.settings.split_frac); sok && s != "" {
+					plat.clipboard_set_text(w.hwnd, s)
+				} else {
+					// Loud rather than a silent no-op: the only way this fails is
+					// the MD_COPY_MAX refusal, and a Ctrl+C that quietly does
+					// nothing reads as a broken clipboard.
+					app_note(app, "[SELECTION TOO LARGE TO COPY]")
+				}
+			}
+			return
+		}
 		// A live rectangle takes priority over the linear selection: the two
 		// are mutually exclusive in practice, but block_active is the flag
 		// that means "the user is column-selecting", the same predicate
