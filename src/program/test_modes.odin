@@ -37272,6 +37272,60 @@ when NEWTPAD_TESTS {
 				wi(&bad, g == row1 + c, fmt.tprintf("...and column %d of that row is byte +%d (%d, want %d)", c, c, g, row1 + c))
 			}
 
+			fmt.println("-- everything else positioned per row moves with the text --")
+			// The indent was added to the text draw and the caret first, and FOUR
+			// other per-row producers were missed: the second text_draw branch (a
+			// row with no spans), the selection rects, the find highlights and the
+			// link underline + its hit-test. Each is asserted against the same
+			// origin the glyphs use, because "the highlight is where the text is"
+			// is the whole claim.
+			{
+				// Select the first three characters of the continuation row.
+				doc.anchor, doc.cursor = row1, row1 + 3
+				rects: [16]plat.Quad
+				nr := doc_selection_rects(&doc, &t, px, cw, ROWS, rects[:])
+				found := false
+				want_x := TEXT_MARGIN_X + f32(ind) * cw
+				for i in 0 ..< nr {
+					if abs(rects[i].pos.x - want_x) < 1 {found = true}
+				}
+				wi(&bad, nr > 0, fmt.tprintf("a selection on the continuation row produces rects (%d)", nr))
+				wi(&bad, found, fmt.tprintf("...starting at the hanging indent (want x=%.1f)", want_x))
+				doc.anchor, doc.cursor = 0, 0
+			}
+			{
+				// A find match on the continuation row highlights where the glyphs
+				// are, not at the margin.
+				find_open(&doc, false)
+				// A word clearly INSIDE the continuation row. Two fixtures were
+				// wrong before this one and both are worth knowing: "gamma" sits in
+				// the first 39 cells, so it tested nothing about the indent; "zeta"
+				// begins at byte 39, which is BOTH row 0's break offset and row 1's
+				// start, and find_match_rects attributes a match at that boundary to
+				// the earlier row (pre-existing, unrelated to the indent).
+				for r in "lambda" {find_input_rune(&doc, r)}
+				find_wait(&doc)
+				marks: [16]plat.Quad
+				nm := find_match_rects(&doc, &t, px, cw, ROWS, marks[:])
+				// PINNED, not ">= the indent": a match far enough along the row
+				// clears that bound even with the indent dropped, which is how the
+				// first version of this assertion passed under sabotage. The
+				// expected x is derived from the match's own column plus the hang.
+				m0 := doc.find.matches[0] if len(doc.find.matches) > 0 else -1
+				exact := false
+				if m0 >= row1 {
+					mcol := line_cell_col(&doc, &t, row1, m0)
+					want := col_x(cw, mcol, 0) + f32(ind) * cw
+					for i in 0 ..< nm {
+						if abs(marks[i].pos.x - want) < 1 {exact = true}
+					}
+				}
+				wi(&bad, nm > 0, fmt.tprintf("the match is found and has rects (%d)", nm))
+				wi(&bad, m0 >= row1, fmt.tprintf("...and the match really is on the continuation row (%d >= %d)", m0, row1))
+				wi(&bad, exact, "...at exactly its column plus the hanging indent")
+				find_close(&doc)
+			}
+
 			return mode_done("wrapindenttest", bad)
 		}
 
