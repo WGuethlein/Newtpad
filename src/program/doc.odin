@@ -4288,8 +4288,12 @@ doc_selection_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows
 			rhs := 0 if wrapped else H_SCROLL
 			startcol := min(line_cell_col(doc, t, start, max(start, lo)), VISIBLE_COLS)
 			endcol := min(line_cell_col(doc, t, start, min(vis_end, hi)), VISIBLE_COLS)
-			sx := col_x(char_w, startcol, rhs)
-			ex := col_x(char_w, endcol, rhs)
+			// The hanging indent (§8) shifts a continuation row's glyphs right, so
+			// its highlight has to move with them -- row_indent_cells is the same
+			// producer the draw and the click hit-test read.
+			ind := f32(row_indent_cells(doc, t, start, doc.view_cols)) * char_w
+			sx := col_x(char_w, startcol, rhs) + ind
+			ex := col_x(char_w, endcol, rhs) + ind
 			if hi > vis_end {ex += char_w * 0.4} // continues past EOL: hint the newline
 			out[n] = {pos = {sx, row_rect_y(px, row)}, size = {max(ex - sx, 2), lh}, color = col}
 			n += 1
@@ -5103,7 +5107,11 @@ doc_draw :: proc(
 			if spans != nil {
 				plat.text_draw_spans(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs) + ind_x, row_y, px, fg, spans, .Doc)
 			} else {
-				plat.text_draw(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs), row_y, px, fg, .Doc)
+				// + ind_x, exactly as the spans branch above. A row with no syntax,
+				// link or rule spans takes this path, so missing it here meant plain
+				// prose -- the common case -- drew at the wrong origin on a
+				// continuation row while highlighted text drew at the right one.
+				plat.text_draw(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs) + ind_x, row_y, px, fg, .Doc)
 			}
 		}
 

@@ -601,6 +601,13 @@ Link_Hit :: struct {
 	span_start: int,
 	span_len:   int,
 	wrapped:    bool, // on a force-wrapped row, which ignores the horizontal pan
+	// The row's hanging indent in CELLS (§8): a continuation row's glyphs start
+	// that far right of the margin. Carried on the hit rather than recomputed by
+	// the consumers, because links_layout is the only one of them that walks rows
+	// and so the only one that knows this row's start -- and because the underline
+	// and the Ctrl+click must read the same number or the decoration and the
+	// clickable band come apart, which is the seam the one-layout rule is about.
+	indent:     int,
 	// The line the link was found on and the whole link within it, so a click on
 	// any per-row segment resolves the entire target. For a wrapped link this is
 	// the logical line (all its rows share it); for an unwrapped row it is the row.
@@ -699,7 +706,7 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 				// `wrapped` still comes from the iterator, not from which branch
 				// took the row: it is what tells links_hit whether the
 				// horizontal pan applies (a wrapped row ignores it).
-				append(&out, Link_Hit{row = row, col = col, cells = cells, span_start = l.start, span_len = l.len, wrapped = wrapped, text = text, link = l})
+				append(&out, Link_Hit{row = row, col = col, cells = cells, span_start = l.start, span_len = l.len, wrapped = wrapped, indent = row_indent_cells(doc, t, start, doc.view_cols), text = text, link = l})
 			}
 			continue
 		}
@@ -737,7 +744,7 @@ links_layout :: proc(doc: ^Document, t: ^plat.Text, rows: int, allocator := cont
 			// logical line's column would be the wrong origin here, not the
 			// more precise one.
 			col, cells := plat.text_span_cells(t, row_text, ss, hi - lo, 0, .Doc)
-			append(&out, Link_Hit{row = row, col = col, cells = cells, span_start = ss, span_len = hi - lo, wrapped = true, text = cur_line, link = l})
+			append(&out, Link_Hit{row = row, col = col, cells = cells, span_start = ss, span_len = hi - lo, wrapped = true, indent = row_indent_cells(doc, t, start, doc.view_cols), text = cur_line, link = l})
 		}
 	}
 	return out[:]
@@ -751,7 +758,9 @@ links_hit :: proc(hits: []Link_Hit, px, char_w, mx, my: f32) -> (Link_Hit, bool)
 	for h in hits {
 		if h.row != r {continue}
 		// inside-the-cell, not nearest-caret-boundary; a wrapped row ignores the pan.
-		c := cell_at_x(char_w, mx, 0 if h.wrapped else H_SCROLL)
+		// Shift the click LEFT by the row's hanging indent before reading it as a
+		// cell, exactly as the underline below is shifted right by it.
+		c := cell_at_x(char_w, mx - f32(h.indent) * char_w, 0 if h.wrapped else H_SCROLL)
 		if c >= h.col && c < h.col + h.cells {
 			return h, true
 		}

@@ -2216,7 +2216,10 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 						quad_pipe,
 						[]plat.Quad {
 							{
-								pos = {col_x(char_w, h.col, 0 if h.wrapped else H_SCROLL), row_baseline_y(px, h.row) + sx(2)},
+								// + the row's hanging indent (§8), the same number links_hit
+								// subtracts from a click -- so what is underlined and what is
+								// clickable stay the same pixels on a continuation row.
+								pos = {col_x(char_w, h.col, 0 if h.wrapped else H_SCROLL) + f32(h.indent) * char_w, row_baseline_y(px, h.row) + sx(2)},
 								size = {f32(h.cells) * char_w, hairline()},
 								color = g_theme[.Link],
 							},

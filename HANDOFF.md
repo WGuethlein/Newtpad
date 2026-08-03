@@ -7356,6 +7356,49 @@ Two rounds, and the second is the point:
 Fixed by rendering **anchored at a striped row** and sampling the top of the pane: correct code stripes
 it (12 px), the sabotage leaves it bare (0 px). A property about scrolling needs a test that scrolls.
 
+## 6ce. Four things the wrap indent moved and did not take with it (2026-08-02, v0.65.0, branch `fix/wrap-indent-misses`)
+
+§6cc added the hanging indent to the **text draw** and the **caret** and called the seam covered. It
+was not. Four other producers position content per row, and every one of them was still drawing at the
+old origin — so on a continuation row the glyphs moved right and these stayed at the margin.
+
+Found by asking the question the batch should have asked itself: **grep every `col_x` call site**, not
+just the ones the feature's own test touched.
+
+| Site | What was wrong |
+|---|---|
+| `doc.odin` — the **second `text_draw` branch** | a row with **no** syntax/link/rule spans takes the other path, so **plain prose** drew at the wrong origin while highlighted text drew at the right one. In the very procedure §6cc edited. |
+| `doc_selection_rects` | the highlight sat to the left of the text it was highlighting |
+| `find_match_rects` | same, for find hits |
+| `links_layout` / `links_hit` / the underline quad | the underline **and** the clickable band both at the margin — the decoration and the hit-test agreed with each other and disagreed with the glyphs |
+
+`Link_Hit` gained an `indent` field rather than the consumers recomputing it: `links_layout` is the
+only one of the three that walks rows, so it is the only one that knows a row's start. The underline
+adds it and `links_hit` subtracts it, which is what keeps what is underlined and what is clickable the
+same pixels.
+
+**`block.odin`'s rects were checked and are correct as they stand** — `block_blocked_by_view` refuses a
+column rectangle under wrap, so those rows never have an indent. The current-line tint spans the full
+width and bookmark marks sit left of `col_x(char_w, 0)`; neither needs it.
+
+### The lesson is about the test, not the code
+
+§6cc's test drove `doc_pos_at` and was genuinely good — it caught two real sabotages. It just never
+asked whether anything **other than the caret and the glyphs** knew about the indent. **A seam test
+that covers one pair of producers is not a seam test for the feature**, and "I added the offset where
+I was already editing" is exactly how the other four got missed.
+
+Two fixture bugs while writing the new assertions, both worth keeping:
+
+- `"gamma"` sits inside the first 39 cells, so searching for it tested nothing about the indent.
+- `"zeta"` begins at byte 39, which is **both** row 0's break offset and row 1's start, and
+  `find_match_rects` attributes a match at that exact boundary to the **earlier** row. Pre-existing and
+  unrelated to the indent, but it made a correct implementation look broken.
+
+And the assertion that had to be tightened: `x >= margin + indent` passes without the indent whenever
+the match is far enough along the row. Pinned to the match's own column plus the hang; sabotage then
+fails it.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

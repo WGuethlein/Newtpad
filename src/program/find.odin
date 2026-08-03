@@ -1662,8 +1662,12 @@ find_match_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: i
 			m := f.matches[mi]
 			startcol := min(line_cell_col(doc, t, start, max(m, start)), VISIBLE_COLS)
 			endcol := min(line_cell_col(doc, t, start, min(m + f.match_len[mi], vis_end)), VISIBLE_COLS)
-			sx := col_x(char_w, startcol, rhs)
-			ex := col_x(char_w, endcol, rhs)
+			// The row's hanging indent (§8), from the same producer the draw and
+			// the click read -- a match highlight that ignored it would sit to the
+			// left of the text it is supposed to be marking on a continuation row.
+			ind := f32(row_indent_cells(doc, t, start, doc.view_cols)) * char_w
+			sx := col_x(char_w, startcol, rhs) + ind
+			ex := col_x(char_w, endcol, rhs) + ind
 			out[n] = {pos = {sx, ry}, size = {max(ex - sx, 2), lh}, color = col}
 			n += 1
 			mi += 1
