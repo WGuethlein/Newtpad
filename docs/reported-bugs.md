@@ -75,6 +75,26 @@ address blocks and blockquote continuations need them), and `---` directly under
 setext underline that makes it a heading. If the first one keeps costing him in real notes, the
 answer is a setting — "treat single newlines as breaks", GitHub-comment style — not a parser change.
 
+## Found 2026-08-02 while testing the wrap indent — a find match ON a wrap point highlights the wrong row
+
+**Not reported from use; found by a fixture that happened to land on the boundary** (HANDOFF §6ce), and
+recorded here rather than left in a test comment.
+
+With word wrap on, `find_match_rects` walks visible rows and takes a match into a row when
+`f.matches[mi] <= end`, where `end` is that row's **break offset**. A match starting at exactly that
+byte therefore attributes to the **earlier** row — but the character at that byte is *drawn* on the
+next one, because the break offset is also the following row's start. The highlight lands at the far
+right of the row above the text it marks.
+
+**Narrow, and pre-existing:** it needs a match to begin at the precise wrap point, and nothing about
+the hanging indent caused it (it was found with the indent working correctly). The equivalent
+selection code (`doc_selection_rects`) uses `lo <= end && hi > start`, so a *range* spanning the
+boundary matches both rows and draws on both — visibly fine.
+
+**The fix is a bound, not a redesign:** attribute a match to the row where its first byte is *drawn*,
+i.e. `< end` rather than `<= end` for a wrapped row that is not a line end. Worth checking what else
+reads a row's `end` inclusively while the row's own text stops before it.
+
 ## Reported 2026-08-02 — closing the last tab of one window among several
 
 *"if an A instance only has one tab and another B instance is open... it should close A instance
