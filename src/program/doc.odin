@@ -718,8 +718,77 @@ eff_wrap_at :: proc(doc: ^Document, t: ^plat.Text, off: int) -> (wrap: bool, ls:
 // Returns the break offset and whether it's the logical line end. Breaks after
 // the last word boundary that fits; a single word wider than the row char-breaks.
 // When wrap is off, callers use pt_line_end_cap instead.
-wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (end: int, line_end: bool) {
+// UI spec §8: "a wrapped line continues at the original indent + 2 columns, so
+// wrapped prose stays visually distinct from a new line."
+WRAP_INDENT_EXTRA :: 2
+
+// How much of the measure a hanging indent may take. A deeply indented line --
+// a nested list, a pasted stack trace -- would otherwise leave a continuation row
+// almost no width: at a 100-column measure (WRAP_COL_CAP) a 90-column indent
+// leaves 8 usable columns, which is worse than not indenting at all.
+//
+// A quarter, so a continuation row always keeps at least three quarters of the
+// text width. Chosen rather than measured, and said so; §8 gives the rule but not
+// the guard rail, and the guard rail is what a real file needs.
+WRAP_INDENT_MAX_FRAC :: 4
+
+// The hanging indent for CONTINUATION rows of the logical line starting at
+// `line_start`, in cells.
+//
+// ONE PRODUCER, and that is the whole point of it being a named procedure: the
+// wrap decision (wrap_row_end), the draw's row origin, the caret's x and the
+// click hit-test all read this. A continuation row broken at one width and
+// painted at another is the drawn-column-vs-byte-column seam §6j records sixteen
+// bugs against, which is exactly the shape this feature has.
+//
+// Measured in CELLS with real tab expansion, from the line's own start, so a
+// tab-indented line hangs at the tab stop it actually occupies rather than at one
+// character per tab.
+wrap_indent_cells :: proc(doc: ^Document, t: ^plat.Text, line_start, cols: int) -> int {
+	if doc == nil || t == nil || line_start < 0 || line_start >= doc.pt.length {return 0}
+	// Bounded: only the leading whitespace can contribute, and a line that is
+	// ALL whitespace past this is not indented prose, it is padding.
+	buf: [128]u8
+	n := base.pt_read(&doc.pt, line_start, buf[:min(len(buf), doc.pt.length - line_start)])
+	col := 0
+	for i in 0 ..< n {
+		b := buf[i]
+		if b != ' ' && b != '\t' {break}
+		col += plat.text_cell_width_at(t, rune(b), col, .Doc)
+	}
+	return min(col + WRAP_INDENT_EXTRA, max(0, cols / WRAP_INDENT_MAX_FRAC))
+}
+
+// The hanging indent for the visual row starting at `row_start`, in cells, or 0
+// when it is a first row (or the document is not wrapping).
+//
+// THE producer the draw and the hit-test share. Both know a row's start and
+// neither wants to track which logical line it belongs to, so this answers from
+// the row alone -- and because both ask the same procedure the same question, the
+// column a glyph is painted in and the column a click resolves to cannot drift.
+// That is the §6j seam, and it is the whole risk in this feature.
+row_indent_cells :: proc(doc: ^Document, t: ^plat.Text, row_start, cols: int) -> int {
+	if doc == nil || t == nil || !doc_wraps(doc) {return 0}
+	// CAPPED, like every other backward scan on this path: an unbounded
+	// pt_line_start on a multi-megabyte single line is the perf bug
+	// eff_prev_row's comment already records.
+	ls, exact := base.pt_line_start_cap(&doc.pt, row_start, RENDER_LINE_CAP)
+	if !exact || ls >= row_start {return 0} // a first row hangs at nothing
+	return wrap_indent_cells(doc, t, ls, cols)
+}
+
+// `line_start` is the LOGICAL line's start, so this can tell a continuation row
+// from a first one and shorten the budget by the hanging indent. -1 means "the
+// caller does not know", which is the pre-indent behaviour and is what every
+// non-wrapping consumer wants.
+wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int, line_start := -1) -> (end: int, line_end: bool) {
 	c := max(cols, 1)
+	// A continuation row starts at the hanging indent, so it has that many fewer
+	// cells to break in. Taken here rather than by the caller because the break
+	// decision and the indent must come from one number -- see wrap_indent_cells.
+	if line_start >= 0 && p > line_start {
+		c = max(1, c - wrap_indent_cells(doc, t, line_start, cols))
+	}
 	L := doc.pt.length
 	buf: [512]u8
 	pos := p
@@ -744,10 +813,16 @@ wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (end: int, 
 			// permits -- a visual row is its logical line, so it is exactly
 			// right. With wrap on, a tab on a continuation row aligns to that
 			// row rather than to the logical line; that is a deliberate,
-			// bounded deviation (leading indentation lives on the first visual
-			// row, where the origin is right), and what matters more is that
-			// the draw and the hit-test share this convention, which they do
-			// because both measure from the row start. Guarded by wraptest's
+			// bounded deviation, and what matters more is that the draw and the
+			// hit-test share this convention, which they do because both measure
+			// from the row start.
+			//
+			// The old wording here said the deviation was safe because "leading
+			// indentation lives on the first visual row, where the origin is
+			// right". The hanging indent (§8) made that false -- a continuation
+			// row now starts at a non-zero x -- so the reason has been dropped
+			// rather than left standing as a claim the code no longer supports.
+			// The convention itself is unchanged and still shared. Guarded by wraptest's
 			// continuation-row case, which is the ONLY check in the tree that
 			// can see this choice -- every other tab fixture sits on a first
 			// visual row, where the two origins are the same number.
@@ -770,8 +845,8 @@ wrap_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (end: int, 
 // row was the last one: an end at EOF has no successor, while a real newline
 // leaves a row after it — possibly the empty final one. Same distinction
 // next_row_start_capped draws, and for the same reason.
-next_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (start: int, ok: bool) {
-	e, le := wrap_row_end(doc, t, p, cols)
+next_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int, line_start := -1) -> (start: int, ok: bool) {
+	e, le := wrap_row_end(doc, t, p, cols, line_start)
 	if le {
 		if e >= doc.pt.length {return doc.pt.length, false}
 		return e + 1, true
@@ -781,9 +856,10 @@ next_visual_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> (start: 
 
 // Start of the visual row containing byte `off`.
 visual_row_start :: proc(doc: ^Document, t: ^plat.Text, off, cols: int) -> int {
-	s := base.pt_line_start(&doc.pt, off)
+	ls := base.pt_line_start(&doc.pt, off)
+	s := ls
 	for {
-		e, le := wrap_row_end(doc, t, s, cols)
+		e, le := wrap_row_end(doc, t, s, cols, ls)
 		if le || off < e {return s}
 		s = e
 	}
@@ -832,7 +908,7 @@ eff_row_start :: proc(doc: ^Document, t: ^plat.Text, off, cols: int) -> int {
 	if !wrap {return row_start_capped(doc, off)}
 	s := ls
 	for {
-		e, le := wrap_row_end(doc, t, s, cols)
+		e, le := wrap_row_end(doc, t, s, cols, ls)
 		if le || off < e {return s}
 		s = e
 	}
@@ -848,7 +924,7 @@ eff_prev_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 		if wrap, ls := eff_wrap_at(doc, t, p); wrap {
 			s := ls
 			for {
-				ns, _ := next_visual_row(doc, t, s, cols)
+				ns, _ := next_visual_row(doc, t, s, cols, ls)
 				if ns >= p {return s}
 				s = ns
 			}
@@ -860,7 +936,7 @@ eff_prev_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 	if !wrapPrev {return prev_row_start_capped(doc, p)}
 	s := pls
 	for {
-		e, le := wrap_row_end(doc, t, s, cols)
+		e, le := wrap_row_end(doc, t, s, cols, pls)
 		if le {return s}
 		s = e
 	}
@@ -870,8 +946,8 @@ eff_prev_row :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
 // feeds line_offset_at_cell through up/down navigation, so it must land where
 // the caret is actually allowed to sit, not one phantom cell past it.
 eff_row_end :: proc(doc: ^Document, t: ^plat.Text, p, cols: int) -> int {
-	if wrap, _ := eff_wrap_at(doc, t, p); wrap {
-		e, le := wrap_row_end(doc, t, p, cols)
+	if wrap, ls := eff_wrap_at(doc, t, p); wrap {
+		e, le := wrap_row_end(doc, t, p, cols, ls)
 		return base.pt_row_vis_end(&doc.pt, p, e, le)
 	}
 	e := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
@@ -897,6 +973,11 @@ Visible_Iter :: struct {
 	// real line boundaries, not per capped segment of a huge line).
 	cur_wrap: bool,
 	fresh:    bool,
+	// The LOGICAL line the current row belongs to. Tracked because the hanging
+	// indent (§8) makes a continuation row narrower than a first row, so the wrap
+	// decision needs to know which it is -- `fresh` says whether the NEXT row
+	// starts a line, which is one row too late to answer it.
+	line_st:  int,
 }
 
 visible_begin :: proc(doc: ^Document, t: ^plat.Text, rows: int) -> Visible_Iter {
@@ -1114,13 +1195,14 @@ visible_next :: proc(it: ^Visible_Iter) -> (row, start, end, vis_end: int, line_
 		// only when a fresh logical line begins, so a huge line's many capped rows
 		// don't each re-scan.
 		if it.r == 0 {
-			it.cur_wrap, _ = eff_wrap_at(d, it.t, start)
+			it.cur_wrap, it.line_st = eff_wrap_at(d, it.t, start)
 		} else if it.fresh {
 			it.cur_wrap = line_wrap_decision(d, it.t, start)
+			it.line_st = start // a fresh row IS its logical line's start
 		}
 		wrapped = it.cur_wrap
 		if it.cur_wrap {
-			end, line_end = wrap_row_end(d, it.t, start, d.view_cols)
+			end, line_end = wrap_row_end(d, it.t, start, d.view_cols, it.line_st)
 			if line_end {
 				it.fresh = true
 				if end >= d.pt.length {it.done = true} else {it.pos = end + 1}
@@ -4176,11 +4258,17 @@ doc_pos_at :: proc(doc: ^Document, t: ^plat.Text, mx, my: i32, px, char_w: f32, 
 		if !ok {break}
 		last_start, last_vis_end, last_wrap = start, vis_end, wrapped
 		if row == target {
-			col := col_at_x(char_w, f32(mx), 0 if wrapped else H_SCROLL)
+			// The hanging indent shifts a continuation row's glyphs right, so the
+			// click has to be shifted LEFT by the same number of cells before it is
+			// read as a column -- row_indent_cells is the one producer both this
+			// and the draw ask.
+			ind := f32(row_indent_cells(doc, t, start, doc.view_cols)) * char_w
+			col := col_at_x(char_w, f32(mx) - ind, 0 if wrapped else H_SCROLL)
 			return line_offset_at_cell(doc, t, start, vis_end, col)
 		}
 	}
-	col := col_at_x(char_w, f32(mx), 0 if last_wrap else H_SCROLL)
+	ind := f32(row_indent_cells(doc, t, last_start, doc.view_cols)) * char_w
+	col := col_at_x(char_w, f32(mx) - ind, 0 if last_wrap else H_SCROLL)
 	return line_offset_at_cell(doc, t, last_start, last_vis_end, col) // click below last row
 }
 
@@ -4869,6 +4957,12 @@ doc_draw :: proc(
 		bottom = end
 		row_y := row_baseline_y(px, row)
 		rhs := 0 if wrapped else H_SCROLL // a wrapped row ignores the horizontal pan
+		// §8's hanging indent: a continuation row starts at the original indent + 2
+		// columns so wrapped prose stays visually distinct from a new line. Zero on
+		// a first row and with wrap off. The SAME producer the click hit-test reads
+		// (row_indent_cells), which is what keeps the glyph and the click in one
+		// column space.
+		ind_x := f32(row_indent_cells(doc, t, start, doc.view_cols)) * char_w
 
 		// The line-number gutter (spec §8), drawn BEFORE the `if n > 0` block
 		// below, and that placement is the whole point: a blank line is still a
@@ -5007,7 +5101,7 @@ doc_draw :: proc(
 				spans = merged[:highlight_merge_row(link_spans[:], hl_buf[:hl_n], rules_buf[:rules_n], merged)]
 			}
 			if spans != nil {
-				plat.text_draw_spans(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs), row_y, px, fg, spans, .Doc)
+				plat.text_draw_spans(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs) + ind_x, row_y, px, fg, spans, .Doc)
 			} else {
 				plat.text_draw(gfx, t, string(line_buf[:n]), col_x(char_w, 0, rhs), row_y, px, fg, .Doc)
 			}
@@ -5022,7 +5116,10 @@ doc_draw :: proc(
 			// the same buffer -- so the caret is measured in exactly the space
 			// the text was drawn in. This is the draw/caret seam; the two must
 			// keep the same origin or the caret drifts along a tabbed line.
-			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix], 0, .Doc), rhs)
+			// + ind_x for the same reason the glyphs take it: the caret is measured
+			// in exactly the space the text was drawn in, and on a continuation row
+			// that space now begins at the hanging indent.
+			cx = col_x(char_w, plat.text_cells(t, line_buf[:cprefix], 0, .Doc), rhs) + ind_x
 			cy = row_y
 			caret = true
 		}

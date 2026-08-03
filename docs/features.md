@@ -275,6 +275,11 @@ On/off per tab, with a default for new documents in Settings. Refuses (with a re
 that gets you out) in table view and Markdown Preview, which ignore the flag; Markdown Split always
 wraps.
 
+**A wrapped line keeps its indent.** Continuation rows start at the original line's indentation plus
+two columns, so wrapped prose stays visually distinct from a new line — an indented list item or a
+pasted stack trace still reads as one block. A deeply indented line clamps the hang to a quarter of the
+text width, so it can never squeeze the text into a narrow ribbon.
+
 **Wrapped text is capped at 100 columns** even on a wide window — an uncapped wrap on a maximised
 1440p display gives 200-character lines, which is past what anyone reads comfortably. The text stays
 left-aligned; the cap shortens the line rather than centring it. Not a setting. An **unwrapped**
