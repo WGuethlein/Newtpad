@@ -21670,6 +21670,71 @@ when NEWTPAD_TESTS {
 			return mode_done("blurtest", bad)
 		}
 
+		// `newtpad emojitest` -- basic (monochrome) emoji: do they resolve to a real
+		// glyph, do they get ink, and does the cell grid reserve the right width?
+		//
+		// Wyatt's call 2026-08-02: "basic ones supported", monochrome, correct
+		// width. NOT a colour-glyph path -- COLR/CPAL layer compositing is a
+		// separate renderer feature and is explicitly out.
+		if os.args[1] == "emojitest" {
+			bad := 0
+			ec :: proc(bad: ^int, cond: bool, label: string) {
+				if !cond {bad^ += 1}
+				fmt.printfln("  %-4s %s", "ok" if cond else "FAIL", label)
+			}
+			t: plat.Text
+			if !plat.text_load_faces(&t) {
+				fmt.eprintln("emojitest: no fonts loaded")
+				return true
+			}
+			fmt.println("-- an emoji resolves to a real glyph, not .notdef --")
+			// Astral-plane emoji (U+1F300+). Segoe UI Symbol covers the older
+			// BMP dingbats; the modern block lives only in Segoe UI Emoji, which
+			// is why the fallback chain needs it.
+			for r in ([]rune{'\U0001F600', '\U0001F44D', '\U0001F525', '❤'}) {
+				w, h, inked, _ := plat.text_glyph_coverage_probe(&t, r, 24)
+				ok := w > 0 && h > 0 && inked
+				if !ok {bad += 1}
+				fmt.printfln("  %-4s U+%04X -> %dx%d inked=%v", "ok" if ok else "FAIL", u32(r), w, h, inked)
+			}
+			fmt.println("-- and the grid reserves the width it actually draws --")
+			// An emoji is full-width, so the grid must give it two cells or the
+			// glyph overlaps its neighbour and every column after it on the row is
+			// off by one -- which is the caret/selection misalignment recorded in
+			// requested-features.md §4.
+			for r in ([]rune{'\U0001F600', '\U0001F44D'}) {
+				cells := plat.text_cell_width_at(&t, r, 0, .Doc)
+				ec(&bad, cells == 2, fmt.tprintf("U+%04X occupies %d cells (want 2, full-width)", u32(r), cells))
+			}
+			// A plain ASCII neighbour must be unaffected -- the width rule is
+			// per-glyph, not a mode the emoji switches on.
+			ec(&bad, plat.text_cell_width_at(&t, 'A', 0, .Doc) == 1, "an ASCII letter is still one cell")
+			fmt.println("-- a string measures as the sum, so the caret lands after it --")
+			// text_cells is what every caret/selection/hit-test column comes from,
+			// so this is the seam: "A<emoji>B" must measure 1 + 2 + 1.
+			s := "A\U0001F600B"
+			n := plat.text_cells(&t, transmute([]u8)s, 0, .Doc)
+			ec(&bad, n == 4, fmt.tprintf("%q measures %d cells (want 4 = 1 + 2 + 1)", s, n))
+			// And the byte offset for a given cell column round-trips, which is
+			// what puts the caret on the far side of the emoji rather than inside
+			// its surrogate pair.
+			b := plat.text_bytes_for_cells(&t, transmute([]u8)s, 3, 0)
+			ec(&bad, b == 5, fmt.tprintf("cell 3 is byte %d (want 5, just past the 4-byte emoji)", b))
+
+			// NOT ASSERTED, and written down so it is not "fixed" later: a glyph's
+			// BITMAP is routinely wider than its ADVANCE -- side bearings and the
+			// rasterizer's antialiasing padding both add to the ink box, and 'A' at
+			// 24px measures 15px of bitmap against a 13px advance in the shipped mono
+			// face. Comparing ink width to reserved cells therefore fails on plain
+			// ASCII and proves nothing about emoji. What actually matters is that the
+			// draw advances by cells * cell_w (text_walk_glyphs) using the SAME
+			// text_cell_width_at the caret, the selection and the hit-test read -- so
+			// the cell assertions above are the seam, and there is no second origin
+			// for them to disagree with.
+
+			return mode_done("emojitest", bad)
+		}
+
 		if os.args[1] == "celltest" {
 			t: plat.Text
 			if !plat.text_load_faces(&t) {
