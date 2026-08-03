@@ -37048,6 +37048,141 @@ when NEWTPAD_TESTS {
 			return true
 		}
 
+		// `newtpad mdzebratest` -- zebra rows in the preview's tables (§9.2 item 6).
+		if os.args[1] == "mdzebratest" {
+			bad := 0
+			zc :: proc(bad: ^int, cond: bool, label: string) {
+				if !cond {bad^ += 1}
+				fmt.printfln("  %-4s %s", "ok" if cond else "FAIL", label)
+			}
+			hdr :: "| a | b |\n| --- | --- |\n"
+			mk :: proc(rows: int) -> string {
+				sb := strings.builder_make(context.temp_allocator)
+				strings.write_string(&sb, hdr)
+				for i in 0 ..< rows {fmt.sbprintf(&sb, "| r%d | v%d |\n", i, i)}
+				return strings.to_string(sb)
+			}
+
+			fmt.println("-- the stripe pattern: header and separator never, data alternates --")
+			// Index 0 is the header, 1 the separator, 2 the first data row. The
+			// first data row reads against the page and the band is what separates
+			// it from the NEXT one, which is §10's rule for the grid.
+			zc(&bad, !md_zebra_row_for_test(0), "row 0 (header) is not striped")
+			zc(&bad, !md_zebra_row_for_test(1), "row 1 (separator) is not striped")
+			zc(&bad, !md_zebra_row_for_test(2), "row 2 (first data row) is not striped")
+			zc(&bad, md_zebra_row_for_test(3), "row 3 IS striped")
+			zc(&bad, !md_zebra_row_for_test(4), "row 4 is not")
+			zc(&bad, md_zebra_row_for_test(5), "row 5 is")
+
+			fmt.println("-- the index is counted from the TABLE's start, not the viewport's --")
+			// This is what makes the stripe survive scrolling: md_placer begins at
+			// the anchor, so rows above it are never walked, and a parity counted
+			// from the first VISIBLE row would flip as the table scrolled.
+			src := mk(8)
+			doc := doc_from_content(transmute([]u8)strings.clone(src), "z.md", .UTF8)
+			defer doc_close(&doc)
+			// Walk the real line starts and check each one's index.
+			p, idx := 0, 0
+			mismatch := 0
+			for p < doc.pt.length {
+				got := md_table_row_index_for_test(&doc, 0, p)
+				if got != idx {mismatch += 1}
+				e := base.pt_line_end_cap(&doc.pt, p, RENDER_LINE_CAP)
+				if e >= doc.pt.length {break}
+				p = e + 1
+				idx += 1
+			}
+			zc(&bad, mismatch == 0, fmt.tprintf("every row's index matches its position in the table (%d wrong of %d)", mismatch, idx + 1))
+			// The property stated directly: asking about a row deep in the table
+			// gives the same answer whatever is on screen, because the question
+			// never mentions the screen.
+			deep := strings.index(src, "| r6 |")
+			zc(&bad, md_table_row_index_for_test(&doc, 0, deep) == 8, fmt.tprintf("the 7th data row is index 8 (%d)", md_table_row_index_for_test(&doc, 0, deep)))
+
+			fmt.println("-- and a band really is painted, differentially --")
+			// Two renders: a table with enough data rows to stripe, and one with a
+			// single data row (index 2), which must have NO band at all. Comparing
+			// the two avoids guessing any row's y, and the second is what stops
+			// "found some zebra-coloured pixels" passing by accident.
+			W, H :: 900, 600
+			h: Headless_Gpu
+			if !headless_gpu_init(&h, W, H, "mdzebratest") {
+				fmt.println("  (skipped: offscreen device init failed)")
+				return mode_done("mdzebratest", bad)
+			}
+			defer headless_gpu_destroy(&h)
+			saved_theme, saved_scale := g_theme, UI_SCALE
+			g_theme, UI_SCALE = theme_dark(), 1
+			defer {g_theme, UI_SCALE = saved_theme, saved_scale}
+			zebra_px :: proc(h: ^Headless_Gpu, rows: int) -> int {
+				s := "| a | b |\n| --- | --- |\n"
+				sb := strings.builder_make(context.temp_allocator)
+				strings.write_string(&sb, s)
+				for i in 0 ..< rows {fmt.sbprintf(&sb, "| r%d | v%d |\n", i, i)}
+				d := doc_from_content(transmute([]u8)strings.clone(strings.to_string(sb)), "z.md", .UTF8)
+				defer doc_close(&d)
+				d.md_mode = .Preview
+				bg := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg[0], bg[1], bg[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &d, 24, 40, 860, 60, 560, Md_Anchor{})
+				buf, ok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				if !ok {return -1}
+				want := [3]u8 {
+					u8(g_theme[.Table_Zebra][2] * 255 + 0.5),
+					u8(g_theme[.Table_Zebra][1] * 255 + 0.5),
+					u8(g_theme[.Table_Zebra][0] * 255 + 0.5),
+				}
+				n := 0
+				for i := 0; i + 3 < len(buf); i += 4 {
+					if buf[i] == want[0] && buf[i + 1] == want[1] && buf[i + 2] == want[2] {n += 1}
+				}
+				return n
+			}
+			// SCROLLED, which is the case the whole design exists for. Anchored at
+			// the row whose true index is 3 -- the first striped one -- the topmost
+			// visible row must still be striped. A parity counted from the first
+			// VISIBLE row would restart at 0 here and leave it bare, which is the
+			// stripe flipping as you scroll.
+			{
+				zsrc := mk(8)
+				zd := doc_from_content(transmute([]u8)strings.clone(zsrc), "zs.md", .UTF8)
+				defer doc_close(&zd)
+				zd.md_mode = .Preview
+				row3 := strings.index(zsrc, "| r1 |") // header, sep, r0, r1 -> index 3
+				bg2 := g_theme[.Bg_Base]
+				plat.gfx_begin_frame(&h.gfx, bg2[0], bg2[1], bg2[2])
+				markdown_draw(&h.gfx, &h.quads, &h.text, &zd, 24, 40, 860, 60, 560, Md_Anchor{row3, 0})
+				sbuf, sok := plat.gfx_readback_bgra(&h.gfx, context.temp_allocator)
+				if sok {
+					wz := [3]u8 {
+						u8(g_theme[.Table_Zebra][2] * 255 + 0.5),
+						u8(g_theme[.Table_Zebra][1] * 255 + 0.5),
+						u8(g_theme[.Table_Zebra][0] * 255 + 0.5),
+					}
+					// A short column of pixels just inside the pane's top, at an x
+					// inside the table's extent. Several rows of it so an exact
+					// one-pixel boundary guess cannot decide the result.
+					hit := 0
+					for yy in 62 ..< 74 {
+						i := (yy * W + 60) * 4
+						if i + 3 < len(sbuf) && sbuf[i] == wz[0] && sbuf[i + 1] == wz[1] && sbuf[i + 2] == wz[2] {hit += 1}
+					}
+					zc(&bad, hit > 0, fmt.tprintf("anchored AT a striped row, the top of the pane is striped (%d px)", hit))
+				}
+			}
+
+			many := zebra_px(&h, 8)
+			one := zebra_px(&h, 1)
+			if many < 0 || one < 0 {
+				fmt.println("  (skipped: offscreen draw unavailable)")
+			} else {
+				zc(&bad, many > 0, fmt.tprintf("an 8-row table paints Table_Zebra pixels (%d)", many))
+				zc(&bad, one == 0, fmt.tprintf("...and a ONE-row table paints none (%d), so this is not a stray colour match", one))
+			}
+
+			return mode_done("mdzebratest", bad)
+		}
+
 		// `newtpad wrapindenttest` -- §8's hanging indent, tested at the seam.
 		//
 		// "A wrapped line continues at the original indent + 2 columns." That moves

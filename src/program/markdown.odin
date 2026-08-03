@@ -4360,6 +4360,10 @@ md_pass :: proc(
 	// run-up, and they exist only so the anchor's gap is right. What is admitted
 	// is md_place_next's answer and nothing else -- see its header.
 	pl := md_placer(blocks, idx, n, y0, ytop, ybot)
+	// See the zebra note in the loop: the table block currently being counted
+	// within, and the row index inside it.
+	zebra_tbl := -1
+	zebra_row := 0
 	for {
 		p, ok := md_place_next(&pl)
 		if !ok {break}
@@ -4368,7 +4372,34 @@ md_pass :: proc(
 			shown = p.blk.end
 			continue
 		}
-		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, p.blk.lay, cx, x1, p.y, p.admit, p.blk.start)}
+		// Zebra parity for a table row (§9.2 item 6). Tracked by the WALK, not
+		// baked into the block's cached layout: the preview caches one row per
+		// Md_Layout entry keyed on that row's own line, so an insert at the top of
+		// a table flips every following row's parity while those entries stay
+		// valid. Parity is a property of position within the table, which only the
+		// walk knows.
+		//
+		// The first visible row's parity is counted from the TABLE'S OWN START,
+		// which is usually off screen -- md_placer begins at the anchor, so the
+		// rows above it are never walked. Counting only from the first visible row
+		// would make the stripes flip as the table scrolled. That count is one
+		// bounded scan per table per frame (the cache window), and every row after
+		// it just increments.
+		trow := -1
+		if p.blk.lay != nil && p.blk.lay.cls.kind == .Table {
+			if tc := md_table_ensure(doc, text, p.blk.start); tc != nil {
+				if tc.start != zebra_tbl {
+					zebra_tbl = tc.start
+					zebra_row = md_table_row_index(doc, tc.start, p.blk.start)
+				} else {
+					zebra_row += 1
+				}
+				trow = zebra_row
+			}
+		} else {
+			zebra_tbl = -1 // a non-table block ends the run
+		}
+		if qp != nil {md_block_draw(gfx, qp, text, doc, &m, p.blk.lay, cx, x1, p.y, p.admit, p.blk.start, trow)}
 		if links != nil {md_block_links(doc, p.blk.lay, cx, p.y, p.admit, links)}
 		if sel_at != nil && !sel_at.ok {
 			// First block whose admitted band contains the point wins. `>= p.y` and
@@ -4703,6 +4734,53 @@ md_draw_selection :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, doc: ^Documen
 		)
 	}
 }
+
+// Which row of its table the block starting at `row` is: 0 for the header, 1 for
+// the separator, 2 upward for data rows.
+//
+// A newline count over [table_start, row), which is bounded by the table cache's
+// own window (md_table_budget) because `table_start` came from that cache -- so
+// this cannot walk a document, only a block. Called ONCE per table per frame; the
+// walk increments from there.
+@(private = "file")
+md_table_row_index :: proc(doc: ^Document, table_start, row: int) -> int {
+	if doc == nil || row <= table_start {return 0}
+	buf: [512]u8
+	n := 0
+	p := table_start
+	for p < row {
+		got := base.pt_read(&doc.pt, p, buf[:min(len(buf), row - p)])
+		if got == 0 {break}
+		for i in 0 ..< got {
+			if buf[i] == '\n' {n += 1}
+		}
+		p += got
+	}
+	return n
+}
+
+// Does this table row get a zebra band? Header and separator never do, and data
+// rows alternate starting with the SECOND one -- so the first row of data reads
+// against the page and the band is what separates it from the next, rather than
+// the whole table sitting on a tint.
+//
+// §10 made the same call for the grid ("column rules are gone, table_zebra
+// carries the eye instead") and this is that rule in the preview, which is what
+// §9.2 item 6 asks for.
+@(private = "file")
+md_zebra_row :: proc(trow: int) -> bool {
+	if trow < 2 {return false} // 0 header, 1 separator
+	return (trow - 2) % 2 == 1
+}
+
+// Package-visible for mdzebratest. These two are what make the stripe
+// scroll-invariant -- the index is counted from the table's own start rather than
+// from the first visible row -- so they are worth asserting directly, not only
+// through pixels.
+md_table_row_index_for_test :: proc(doc: ^Document, table_start, row: int) -> int {
+	return md_table_row_index(doc, table_start, row)
+}
+md_zebra_row_for_test :: proc(trow: int) -> bool {return md_zebra_row(trow)}
 
 // The rendered position under a point inside one laid-out block.
 //
@@ -5427,7 +5505,7 @@ md_block_links :: proc(doc: ^Document, lay: ^Md_Layout, cx, ytop: f32, ad: Md_Ad
 // glyphs and for every rectangle in lay.boxes. A band drawn to lay.h under a
 // partial admit is exactly the overhang the admit test exists to prevent.
 @(private = "file")
-md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32, ad: Md_Admit, blk_start := -1) {
+md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text, doc: ^Document, m: ^Md_Metrics, lay: ^Md_Layout, cx, x1, ytop: f32, ad: Md_Admit, blk_start := -1, trow := -1) {
 	x := md_block_origin(lay, cx)
 	// The selection, UNDER everything this block draws (UI spec §9.4: "Selection
 	// uses selection_doc"). First so the glyphs, the rules and the quote bars all
@@ -5438,6 +5516,20 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 	// rects, not per-glyph. One instance per visual line, so only visible lines
 	// cost anything." The run is [first selected glyph's left, last selected
 	// glyph's right] on each line, which for a full line is the whole line.
+	// The zebra band goes UNDER the selection, which goes under everything else:
+	// a selected cell has to read as selected, and at 1.05:1 against Bg_Base the
+	// band would otherwise wash out the highlight sitting on it. Same layering
+	// argument the editor's current-line tint makes for going first.
+	//
+	// ad.h, not lay.h -- a row whose second wrapped line the pane refused must not
+	// have its band painted below the glyphs that were admitted, the same bound
+	// the fence body's background and the quote bar take.
+	if qp != nil && md_zebra_row(trow) && ad.h > 0 {
+		w := min(md_table_extent(lay.tcols), x1 - x)
+		if w > 0 {
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x, ytop}, size = {w, ad.h}, color = g_theme[.Table_Zebra]}})
+		}
+	}
 	if qp != nil && blk_start >= 0 {
 		md_draw_selection(gfx, qp, doc, lay, cx, ytop, ad, blk_start)
 	}
