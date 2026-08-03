@@ -7399,6 +7399,49 @@ And the assertion that had to be tightened: `x >= margin + indent` passes withou
 the match is far enough along the row. Pinned to the match's own column plus the hang; sabotage then
 fails it.
 
+## 6cf. Basic emoji already worked, and the entry saying otherwise was wrong (2026-08-02, v0.66.0, branch `feat/emoji-basic`)
+
+Wyatt asked for complex-script shaping — *"it should be able to handle any language"* — and, once the
+architectural conflict was put to him, deferred it: *"spec this tomorrow, skip it for now."* He also
+scoped emoji: *"don't put color emoji only the basic ones supported"*, and chose **monochrome glyphs
+with correct width**.
+
+### The emoji work turned out to be a measurement, not a change
+
+`requested-features.md` §4 said *"the caret/hit-test/selection/find rects assume a monospace column, so
+they misalign on CJK and emoji"*. **They do not**, and `emojitest` is the evidence:
+
+- U+1F600, U+1F44D, U+1F525 and U+2764 all resolve to real inked glyphs through **`seguisym.ttf`** —
+  the fallback chain has no emoji font and does not need one for these. They render monochrome, which
+  is exactly what was asked for.
+- Each occupies **2 cells**, an ASCII letter still occupies 1, and `"A😀B"` measures 4.
+- `text_bytes_for_cells` puts cell 3 at byte 5 — past the whole 4-byte emoji, so the caret lands on the
+  far side of it rather than inside the surrogate pair.
+
+**The reason there is no misalignment is structural**: the draw advances by `cells * cell_w`
+(`text_walk_glyphs`) using the *same* `text_cell_width_at` the caret, the selection and the hit-test
+read. One origin, no second arithmetic. §4 has been corrected rather than left to send someone at a
+problem that does not exist — the second stale entry caught today (§6bw was the first).
+
+### An assertion I wrote and then deleted
+
+The obvious-looking check — "no glyph paints wider than its reserved cells" — **fails on plain ASCII**:
+`A` at 24px rasterizes to a 15px bitmap against a 13px advance, because side bearings and the
+rasterizer's antialiasing padding both widen the ink box. A glyph's bitmap exceeding its advance is
+ordinary typography, not overflow. The comment in `emojitest` says so, so it is not "fixed" back in.
+
+Sabotaged by disabling the wide classification (`adv_em > 1.5 * char_em`): four assertions fail,
+including the cell↔byte round trip landing at byte 6 instead of 5.
+
+### What the shaping spec has to answer tomorrow
+
+Recorded in §4 in full, but the short version: **CJK, Latin and monochrome emoji already work.** Arabic
+contextual forms, RTL and Indic reordering **cannot** work on a fixed cell grid, and the grid is a
+locked decision (CLAUDE.md; `ui-spec` §9.1's *"the editor pane keeps the grid untouched"*). Bidi also
+makes a logically contiguous selection visually discontiguous and makes column editing meaningless in
+an RTL run. **The preview is the cheap half and is not blocked** — it already has a grid-free
+proportional shaper whose own header names `IDWriteTextAnalyzer` as the missing piece.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

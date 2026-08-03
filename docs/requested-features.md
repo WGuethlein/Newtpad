@@ -402,9 +402,34 @@ value-per-cost for this audience:
 *Research §E explicitly marks go-to-line syntax and drag-drop as **not** demanded.*
 
 Also never decided, from HANDOFF §6:
-- **Complex-script shaping** (Arabic/Indic/ligatures via `IDWriteTextAnalyzer`) — the chosen follow-up to
-  per-codepoint fallback. Related: the caret/hit-test/selection/find rects assume a monospace column, so
-  they misalign on CJK and emoji; the real fix needs per-glyph x positions, which comes with shaping.
+- **Complex-script shaping** (Arabic/Indic/bidi via `IDWriteTextAnalyzer`). **Wyatt asked for this
+  2026-08-02 — "it should be able to handle any language" — and then deferred it the same day: "spec
+  this tomorrow, skip it for now."** So it is SPEC-FIRST, not scheduled work, and the spec has to
+  answer an architectural question before a line is written.
+
+  **What already works, verified 2026-08-02 (`emojitest`), because the old text here was wrong:**
+  Latin/Greek/Cyrillic, **CJK** (`text_cell_width_at` gives full-width glyphs 2 cells and combining
+  marks 0 — the terminal model), and **basic monochrome emoji**, which resolve through
+  `seguisym.ttf`, rasterize with ink, occupy 2 cells, and round-trip cell↔byte so the caret lands past
+  the surrogate pair. This entry used to claim "the caret/hit-test/selection/find rects assume a
+  monospace column, so they misalign on CJK and emoji". **They do not.** The draw advances by
+  `cells * cell_w` (`text_walk_glyphs`) using the same `text_cell_width_at` the caret, the selection
+  and the hit-test read — one origin, no second arithmetic to disagree with.
+
+  **What genuinely cannot work, and why it is architectural:** Arabic/Persian/Urdu need contextual
+  forms and lam-alef ligatures; Hebrew and Arabic need **RTL**; Devanagari and friends **reorder**
+  matras before their consonant. None of that is expressible on a fixed cell grid, and the grid is a
+  LOCKED decision (CLAUDE.md: it exists so caret arithmetic, column selection and hit-testing are
+  O(1); `ui-spec` §9.1: *"the editor pane keeps the grid untouched"*). Bidi also makes a logically
+  contiguous selection **visually discontiguous**, needs bidi-aware arrow keys, and makes column/block
+  editing meaningless inside an RTL run.
+
+  **The preview is the cheap half and is not blocked:** it already has a real proportional shaper with
+  fractional advances and no grid, and `shape.odin`'s own header names `IDWriteTextAnalyzer` as the
+  missing piece. Shaping there touches no locked decision.
+
+  **Colour emoji stay ruled out** — Wyatt, 2026-08-02: "don't put color emoji only the basic ones
+  supported". Monochrome outlines only; no COLR/CPAL layer compositing.
 - **Colour emoji** — needs a colour-glyph path.
 - **A container/archive tree viewer** — parked, edges toward scope creep.
 - **Directories opening as a tab** listing contents rather than revealing in Explorer.
