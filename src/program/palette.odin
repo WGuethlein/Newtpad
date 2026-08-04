@@ -265,7 +265,17 @@ palette_layout :: proc(app: ^App, width, height: f32) -> Palette_Layout {
 	// a half pixel -- which every glyph in the panel is then drawn from. See
 	// snap()'s own comment for what that looks like on screen.
 	l.x0 = snap((width - l.w) / 2)
-	l.y0 = sx(44)
+	// UI spec 7: "top edge 88px below the window top". Not arbitrary and not a
+	// taste call -- CHROME_TOP is TAB_STRIP_H (40) + MENU_BAR_H (30) = 70, so 88
+	// clears the chrome by 18. At the old 44 the palette's top edge was INSIDE the
+	// menu bar and drew over it.
+	//
+	// The WIDTH is deliberately left at 720 against the same line's 560. The 560 was
+	// unreachable while three command titles ran to 37-53 characters; those came
+	// down on 2026-08-04, but a palette row carries a label PLUS a category column
+	// PLUS an accelerator column, and nobody has measured the new worst case. Do
+	// that before narrowing it -- a clipped palette is worse than a wide one.
+	l.y0 = sx(88)
 	l.qh = sx(34)
 	l.rowh = sx(26)
 	l.nres = min(len(p.results), PALETTE_MAX_ROWS)

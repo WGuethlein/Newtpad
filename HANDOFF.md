@@ -7549,6 +7549,83 @@ argues the wedge is *not* large files (EmEditor Free and klogg give that away at
 configs. It contradicts the existing corpus in four places, most usefully: the handmade/small-exe
 story is the entire *distribution* ticket and buys **zero** price tolerance.
 
+## 6ch. Menu finish, batch 1 (2026-08-04, v0.68.0, branch `feat/menu-finish`)
+
+First batch of the UI rework that §6aa fork 1 now gates V1 on. Deliberately the *finish* half of
+`ui-spec` §6 plus the one state bug the menus share with the palette — **not** the `renderer`/`ui`
+extraction. Scoped from [ui-spec-gaps/2026-08-04-menus.md](../docs/ui-spec-gaps/2026-08-04-menus.md)
+and [-palette.md](../docs/ui-spec-gaps/2026-08-04-palette.md), which enumerate §6 and §7 line by line
+(14 and 13 requirements).
+
+**Landed, each sabotage-verified against a printed `FAIL` line rather than an exit code:**
+
+- **The text operations have menu rows.** Sort Lines, Sort Lines Descending, Remove Duplicate Lines
+  and Open Link Under Cursor were palette-only, against §7's *"every command in it is also in a menu
+  — the palette is a faster route, never the only route"*, and **nothing in the product surfaced
+  them**: someone who did not already know the names could not find them.
+- **Their titles lost the parentheticals** (37–53 chars → 10–22), and the scope is stated *live*
+  instead. `menu_item_label` appends `(Selection)` when there is one. `sortlinestest` was defending
+  those parentheticals and was right to — the palette showed the title and nothing else, and there
+  was no other route — so the assertion **moved rather than weakened**: it now reads what the user
+  sees, in *both* states, which the old one could not. A static title saying "selection, or whole
+  file" never told you which of the two you were about to get.
+- **The panel has §6's geometry.** The width budget was `+8 character cells` for the gutter, the gap
+  and both content edges while the draw hardcoded a 28px label origin and a 12px right inset — two
+  procedures owning one measurement, landing close enough at the default font and drifting with any
+  other. Both read named constants now, and the gutter comes from `menu_gutter`, one producer.
+- **The check gutter is conditional and 26px**, per §6.1. File, Edit and Help had been paying an
+  indent for a column nothing could draw into.
+- **The row highlight is inset 5px a side** — §6 calls a highlight that runs edge to edge *"the
+  single biggest reason the menus read as unfinished in the screenshots"*, and the filter dropdown's
+  search row two lines above it had always inset itself while the item highlight never did.
+- **Dropdowns open 2px below the bar**, and width measurement goes through `text_cells` rather than
+  `len()` (a byte count is a cell count only for ASCII, and the filter's rows are arbitrary CSV
+  values, so a wide CJK value budgeted half the width it drew).
+- **The pointer can no longer move the palette's keyboard cursor.** `palette_hover` runs every frame
+  off the *live* cursor and wrote `palette.selected`, so a pointer resting anywhere over the list
+  overwrote the arrow keys before the next frame drew them — the keys read as inert and **Enter ran
+  whatever the mouse was lying on.** Split into `selected` (keyboard, authoritative, what Enter
+  reads) and `hover` (pointer, visual only). That split is also §6's *"two selection colours"*, so
+  the palette now draws the accent fill for the keyboard cursor and `bg_hover` for the pointer.
+- **The palette's top edge is 88**, per §7. `CHROME_TOP` is 70, so 88 clears it by 18; at the old 44
+  the palette's top edge was **inside the menu bar and drew over it**. A bug wearing a preference's
+  clothes.
+
+### What this batch got wrong, and one thing the gap list got wrong
+
+**`ui-spec-gaps` M5 ("no horizontal flip") was never a gap.** `menu_dropdown_rect` already ends
+`x0 = min(ox, max(0, width - w))`, which clamps the panel inside the window. The gap list was built
+by searching for the spec's vocabulary, and a correct implementation using different vocabulary read
+as absent. **Grep for the behaviour, not the word.** Corrected in place rather than deleted, because
+the failure mode is the durable part.
+
+**Two assertions had to be checked for vacuity, and one nearly was.** `menutest`'s "every dropdown
+fits its widest row" passed *unchanged* after the width formula was rewritten end to end, which is
+the shape §6bv warns about — sabotaging `dropdown_w` to 0.6× failed it in all five menus, so it is
+real. The new gutter assertion carries its own coverage guard (`3 menus with, 3 without`) precisely
+so it cannot go vacuous if every menu ever grows a checkable row.
+
+### Deliberately not done
+
+- **The MENU half of the selection split.** `menu_hover_item` writes `menu.item`, which the keyboard
+  also owns — the identical disease — but the menu's **click path resolves through the same field**,
+  so re-routing it is a bigger change than the palette's. **Top of the next batch.**
+- **The palette's 560px width.** The titles that made it unreachable are gone, but a row carries
+  label + category + accelerator and nobody has measured the new worst case. A clipped palette is
+  worse than a wide one.
+- **§6.2's four-row cap assertion**, and the View menu's five-row customisation group with it. The
+  assertion is the part that matters; without it this regresses a third time.
+- **Live values for Zoom / Tab width.** The hook exists now and the text operations use it.
+- **Motion (§6's 50ms opacity)**, with the reduce-motion setting it depends on. An animation with no
+  way to disable it is a regression against a position that is already "ships with no screen-reader
+  support".
+
+### Still owed from the morning
+
+The five fixes in §6cg — the `Ctrl+C` crash, the `Cut` data loss, the middle-click latch and the two
+find defects — **still have no failing tests.** Wyatt chose this batch ahead of that debt. It has now
+been carried across two batches and should not slip a third time.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
