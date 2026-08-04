@@ -120,6 +120,14 @@ key_names := [plat.Key]string {
 	.Enter     = "Enter",
 	.Tab       = "Tab",
 	.Escape    = "Esc",
+	// STAYS "+", and the UI spec's "Ctrl+=" is applied at the DISPLAY layer only
+	// (command_chord's fmt_chord). This array is the keys.txt grammar as well as
+	// the display name, and keymap_parse splits a line on its FIRST '=' -- so
+	// naming this key "=" would make `ctrl+= = Zoom_In` parse as the chord
+	// "ctrl+" with no key at all, i.e. the new spelling would be unwritable in
+	// the very file that exists to spell chords. Renaming it would also stop
+	// resolving every keys.txt already written with "+", silently: an unmatched
+	// key token makes the chord malformed, and a malformed chord is skipped.
 	.Plus      = "+",
 	.Minus     = "-",
 	.F1        = "F1",

@@ -33858,6 +33858,22 @@ when NEWTPAD_TESTS {
 				load("   CTRL+K   =   move_line_up   \n")
 				chk(&bad, resolve_key(.K, true, false, .Editor) == .Move_Line_Up, "case and padding are ignored")
 
+				// --- Zoom In shows "Ctrl+=" but keys.txt still spells it "+" ------
+				// The UI spec's §6 mockup renders Zoom In as Ctrl+=, and that is a
+				// DISPLAY substitution in command_chord, not a rename of the key.
+				// Both halves are asserted here because the tempting change -- name
+				// the key "=" in key_names -- breaks two things at once and neither
+				// is loud: keymap_parse splits on the FIRST '=', so `ctrl+= = Zoom_In`
+				// would parse as the chord "ctrl+" with no key, and every keys.txt
+				// already written with "+" would stop resolving with nothing logged,
+				// because an unmatched key token makes the chord malformed and a
+				// malformed chord is skipped rather than reported.
+				fmt.println("--- Ctrl+= is a display name, + is the grammar ---")
+				chk(&bad, command_chord(.Zoom_In) == "Ctrl+=", fmt.tprintf("Zoom In displays as %q (want \"Ctrl+=\")", command_chord(.Zoom_In)))
+				k = load("ctrl++ = Move_Line_Up\n")
+				chk(&bad, len(k.entries) == 1 && keymap_reject_total(k) == 0, fmt.tprintf("keys.txt still binds `ctrl++` (1 entry, 0 refusals; got %d / %d)", len(k.entries), keymap_reject_total(k)))
+				chk(&bad, resolve_key(.Plus, true, false, .Editor) == .Move_Line_Up, fmt.tprintf("ctrl++ -> %v (want Move_Line_Up)", resolve_key(.Plus, true, false, .Editor)))
+
 				// --- an unknown command name is ignored ---------------------------
 				fmt.println("--- unknown command name ---")
 				k = load("ctrl+k = Frobnicate\n")
