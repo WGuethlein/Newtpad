@@ -10089,6 +10089,48 @@ when NEWTPAD_TESTS {
 
 			fnt_styles(&bad)
 
+			// THE PREVIEW'S CODE SAMPLE IS ACTUALLY COLOURED.
+			//
+			// UI spec 11.1's preview is a pangram, a glyph line AND a syntax-coloured
+			// code sample -- a pangram tells you what the letters look like and
+			// nothing about punctuation density, which is what you actually stare at.
+			//
+			// The sample is coloured by the REAL json lexer through the REAL
+			// Token_Kind -> Color_Role map, so it cannot drift from what the editor
+			// would draw for the same bytes. The failure this guards is silent: if the
+			// lexer stops claiming these bytes the sample still renders, just flat, and
+			// nothing about the page looks broken. So assert the token kinds by name
+			// rather than merely counting them.
+			{
+				// Reads FONT_PREVIEW_SAMPLE -- the bytes the page draws -- not a second
+				// copy of the same literal. A test with its own copy passes happily
+				// while the page shows something else.
+				nt, seen_key, seen_str := 0, false, false
+				for line in FONT_PREVIEW_SAMPLE {
+					toks: [64]base.Token
+					n := base.lex_json(transmute([]u8)line, toks[:])
+					nt += n
+					for k in 0 ..< n {
+						if toks[k].kind == .Json_Key {seen_key = true}
+						if toks[k].kind == .String {seen_str = true}
+						// Every span the page will draw has to be inside its line, or
+						// the slice in font_page_draw would trap.
+						if toks[k].start + toks[k].len > len(line) {
+							bad += 1
+							fmt.printfln("  FAIL   sample token %d runs past the line (%d+%d > %d)", k, toks[k].start, toks[k].len, len(line))
+						}
+					}
+				}
+				okc := nt > 0 && seen_key && seen_str
+				if !okc {bad += 1}
+				fmt.printfln("  %-6s the font preview's code sample lexes coloured: %d tokens, json_key=%v string=%v", "ok" if okc else "FAIL", nt, seen_key, seen_str)
+				// And the roles it maps to are real syntax roles, not the punctuation
+				// fallback -- which is what a silently-flat sample would look like.
+				okr := token_kind_role(.Json_Key) == .Syn_Json_Key && token_kind_role(.String) == .Syn_String
+				if !okr {bad += 1}
+				fmt.printfln("  %-6s ...through the same kind->role map the editor uses", "ok" if okr else "FAIL")
+			}
+
 			return mode_done("fonttest", bad)
 		}
 
