@@ -7452,6 +7452,11 @@ proportional shaper whose own header names `IDWriteTextAnalyzer` as the missing 
 - Sizes as of 2026-07-19: **debug ~1.3 MB, release 0.90 MB** (target 2-3 MB). Release grew from
   0.69 MB when the headless harness expanded — `test_modes.odin` is `package main`, so every test
   mode ships inside the customer's binary. Tracked in §5.
+  **Re-measured 2026-08-04 at v0.66.0: debug 6,614,016 bytes (6.31 MB), release 1,445,376 bytes
+  (1.38 MB).** Release is up 54% on the 0.90 MB figure above and still comfortably inside the 2-3 MB
+  target, so this is drift worth knowing rather than a problem. The §5 entry that explains it is
+  resolved — `NEWTPAD_TESTS` gates the harness out of release — so the growth since is real product
+  code (markdown, tables, sort/filter), not the harness coming back.
 - Tests: `odin test src\base -collection:src=src` (20 cases: encoding, line-nav, piece tree,
   lossy-encoding detection).
 - **Headless test modes** (debug exe). **Set `NEWTPAD_SESSION_DIR` to a temp dir first** or the
