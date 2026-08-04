@@ -11498,6 +11498,68 @@ when NEWTPAD_TESTS {
 					if !okb {bad += 1}
 					fmt.printfln("  %-6s both gutter branches are covered: %d menus with, %d without", "ok" if okb else "FAIL", nwith, nwithout)
 				}
+				// HOVER AND THE KEYBOARD CURSOR ARE TWO FIELDS (UI spec 6's "two
+				// selection colours, two states, two weights").
+				//
+				// menu_hover_item runs every frame off the LIVE cursor -- it has to,
+				// since WM_MOUSEMOVE only records a position while a button is held --
+				// and it used to write `item`, so a pointer resting anywhere over a
+				// dropdown decided what Enter would run. Same defect the palette had.
+				//
+				// Asserted on the fields rather than through menu_hover_item, which
+				// needs a real window to read the cursor: what it does now is assign
+				// to `hover`, and the property worth pinning is that nothing
+				// downstream of `hover` reaches `item`. The CLICK path is separately
+				// safe and stays that way -- menu_hit_test resolves through
+				// menu_item_at directly and never reads either field.
+				{
+					var: App
+					var.settings = settings_default()
+					app_new_scratch(&var)
+					defer app_destroy(&var)
+					menu_open_at(&var, 2) // View, opened from the keyboard
+					kb := var.menu.item
+					okp := kb >= 0
+					if !okp {bad += 1}
+					fmt.printfln("  %-6s a keyboard-opened menu arms a keyboard cursor (item=%d)", "ok" if okp else "FAIL", kb)
+					okh0 := var.menu.hover == -1
+					if !okh0 {bad += 1}
+					fmt.printfln("  %-6s ...and no row is hovered before the pointer has been anywhere (hover=%d)", "ok" if okh0 else "FAIL", var.menu.hover)
+					// The pointer lands somewhere else. The keyboard cursor must not move.
+					var.menu.hover = kb + 1
+					okk := var.menu.item == kb
+					if !okk {bad += 1}
+					fmt.printfln("  %-6s the pointer does not move the keyboard cursor (item=%d, want %d, hover=%d)", "ok" if okk else "FAIL", var.menu.item, kb, var.menu.hover)
+					// And closing drops both, so neither survives into the next open.
+					menu_close(&var)
+					okc := var.menu.item == -1 && var.menu.hover == -1
+					if !okc {bad += 1}
+					fmt.printfln("  %-6s closing clears both (item=%d hover=%d)", "ok" if okc else "FAIL", var.menu.item, var.menu.hover)
+				}
+				// NO RUN BETWEEN DIVIDERS IS LONGER THAN FOUR ROWS (UI spec 6.2).
+				//
+				// This is an assertion rather than a comment because the comment lost.
+				// The View menu was split into groups of four with a note above the
+				// last group quoting this very rule -- and then Open_Themes_Folder was
+				// added directly underneath that note, taking the group to five. Prose
+				// does not defend itself.
+				//
+				// Bar menus only: the column filter GENERATES its rows, one per
+				// distinct value, and a rhythm rule about hand-written groups does not
+				// apply to a list that is as long as the data.
+				{
+					for m in menus {
+						run, worst := 0, 0
+						for it in m.items {
+							if it.cmd == .None {run = 0;continue}
+							run += 1
+							if run > worst {worst = run}
+						}
+						okr := worst <= 4
+						if !okr {bad += 1}
+						fmt.printfln("  %-6s %s's longest run between dividers is %d rows (max 4)", "ok" if okr else "FAIL", m.title, worst)
+					}
+				}
 				// And the reasons are actually reachable: a .md file cannot enter
 				// table view, so that row must be disabled AND say why.
 				a: App
@@ -27470,6 +27532,45 @@ when NEWTPAD_TESTS {
 			mk(&a, "notes.txt")
 			mk(&a, "config.json")
 			mk(&a, "readme.md")
+
+			// THE PALETTE IS WIDE ENOUGH FOR ITS OWN WIDEST ROW.
+			//
+			// The seam menutest holds for dropdowns, held here. A Commands row is
+			// three columns -- label at +16, then the category and the accelerator
+			// right-aligned into fixed columns sized from the WIDEST value in the
+			// table -- and nothing checked that they fit the box together.
+			//
+			// It also answers the open question from the ui-spec gap list: 7 asks for
+			// 560 and the code has 720, and until the three sentence-length command
+			// titles came down on 2026-08-04 nobody could say which was right. This
+			// prints the number, so the next person does not have to guess either.
+			{
+				pt: plat.Text
+				if plat.text_load_faces(&pt) {
+					cwp := plat.text_char_width(&pt, UI_PX)
+					cws := plat.text_char_width(&pt, UI_SMALL_PX)
+					widest_label := 0
+					for c in Command_Id {
+						if !command_in_palette(c) {continue}
+						if n := len(command_table[c].title); n > widest_label {widest_label = n}
+					}
+					need :=
+						sx(16) +
+						f32(widest_label) * cwp +
+						sx(16) +
+						f32(palette_widest_category()) * cws +
+						sx(16) +
+						f32(palette_widest_chord()) * cws +
+						sx(16)
+					l := palette_layout(&a, 1920, 1080)
+					okw := l.w >= need
+					if !okw {bad += 1}
+					fmt.printfln(
+						"  %-6s the palette fits its widest row: %.0f wide, needs %.0f (label %d chars, category %d, chord %d)",
+						"ok" if okw else "FAIL", l.w, need, widest_label, palette_widest_category(), palette_widest_chord(),
+					)
+				}
+			}
 
 			// THE POINTER CANNOT MOVE THE KEYBOARD CURSOR.
 			//

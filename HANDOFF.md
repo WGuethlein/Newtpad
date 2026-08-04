@@ -7682,6 +7682,59 @@ report. That is still a read of the fix (a clean run versus an access violation)
 case in the tree where the evidence is the exit code rather than a line of output. The comment says
 so, because a silent crash must not be read as a passing run.
 
+## 6cj. `ui-spec` §6 is done except motion (2026-08-04, v0.70.0, branch `feat/menu-finish-2`)
+
+Second and last menu-finish batch. **§6's 14 requirements are now all met but one**, and §7's
+geometry line with them. What is left of §6 is M6 (the 50ms opacity fade), deliberately held with the
+reduce-motion setting it depends on.
+
+- **The menu's selection split**, the half §6ch deferred. `menu_hover_item` runs every frame off the
+  live cursor — it must, since `WM_MOUSEMOVE` only records a position while a button is held — and it
+  wrote `menu.item`, so a pointer resting over a dropdown decided what Enter would run. It writes
+  `menu.hover` now, and the draw gives them §6's two weights: accent fill with `bg_base` text for the
+  keyboard cursor, `bg_hover` for the pointer, hover skipped on the keyboard row so the weaker fill
+  never paints over the stronger.
+- **Live values** (§6's last list item): `Reset Zoom (125%)`, `Font (tab width 4)`.
+- **The four-row cap is an assertion**, and §7's palette width is **measured**.
+
+### The deferral in §6ch was more cautious than it needed to be
+
+§6ch called the menu split "a bigger change than the palette's" because "its click path resolves
+through the same field". **That was wrong, and checking took one grep.** `menu_hit_test` resolves a
+click through `menu_item_at` *directly* and reads neither field — only the keyboard cursor and the
+draw ever depended on `item`. The second worry (an accent fill appearing on a menu opened by mouse)
+was also already handled: **only the keyboard-open path arms `item`**, so a mouse-opened menu has
+`item == -1` until an arrow key moves it.
+
+Worth recording because the caution was not free — it split one small change across two batches. The
+lesson is not "be less careful", it is **"check the specific claim before scheduling around it"**:
+the claim was about one procedure and was answerable in a minute.
+
+### Two things the assertions caught that comments had not
+
+- **`menutest`'s new four-row check failed on its first run** — `View's longest run between dividers
+  is 5 rows (max 4)`. That group had a comment directly above it quoting the rule, and
+  `Open_Themes_Folder` had been added underneath the comment anyway. **Prose does not defend
+  itself.** The fix cuts by kind (three rows that edit a config file, two that open a folder), which
+  makes View six groups where §6.2 says five — taken deliberately, since §6.2's complaint was
+  *"eighteen items, three dividers, one rhythm"*; group-by-kind and the cap are the durable rules and
+  five was a description of the item set it was written against.
+- **`palettetest` now measures the palette instead of arguing about it.** §6ch left the width at 720
+  against §7's 560 because nobody had measured the worst case. Measured: **514 needed, so 560 fits
+  with 46px spare** — reachable only because the three sentence-length command titles came down in
+  §6ch (at 53 characters the floor was near 700, which is where 720 came from). The assertion means a
+  future long title fails a test rather than clipping a row silently.
+
+### Owed
+
+Everything remaining is §7, not §6, and lives in
+[ui-spec-gaps/2026-08-04-palette.md](../docs/ui-spec-gaps/2026-08-04-palette.md): the palette does not
+scroll (`PALETTE_MAX_ROWS` truncates — also the audit's HIGH "selection walks past the drawn rows"),
+bare text does not search commands, there is no dimmed prefix hint, the rail glyph is a hamburger
+rather than `>_`, there is no menu-bar *Commands* item, and two items are **decisions rather than
+gaps**: whether `Ctrl+Tab` should keep cycling in strip order or open the palette MRU-filtered, and
+whether a command may be palette-only.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
