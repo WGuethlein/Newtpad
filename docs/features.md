@@ -12,6 +12,14 @@ Nothing here is aspirational. Every entry was checked against the source at **v0
 feature has a real limit, the limit is stated in the same breath. Anything in the UI spec that is not
 built is in `requested-features.md`, not here.
 
+**Caveat on that date: the whole file has not been re-verified since v0.33.0, and it is now v0.66.0.**
+Sections added since then are current, but three entries were found stale on 2026-08-04 by an audit
+pass — the exe size, a "the preview cannot be selected or copied" limit that the same file contradicts
+two sections earlier, and a claim that the caret misaligns on CJK and emoji that v0.66.0 had already
+measured as false. **A limit line is the part that goes stale**, because a feature that ships gets its
+own new section while the old limit sits untouched somewhere else. Re-read the limits, not the
+features, when you next verify this file.
+
 The command table (`src/program/commands.odin`) is the authority for what is invocable — CLAUDE.md
 requires every command be declared exactly once — so the [keyboard reference](#keyboard-reference) at
 the end is complete by construction.
@@ -46,7 +54,7 @@ the end is complete by construction.
   already-running window rather than starting a second process — the file lands as a new tab and the
   existing window is focused. `newtpad --version` prints the version and exits.
 - **A bare launch** gives you an empty scratch buffer (or your restored session).
-- **One portable exe, 1.21 MB** (1,271,808 bytes, measured at v0.33.0 from a clean `build.bat release`).
+- **One portable exe, 1.38 MB** (1,445,376 bytes, measured at v0.66.0 from a clean `build.bat release`).
   No install required and nothing to ship beside it — the only runtime dependencies are DLLs Windows
   already has. Well inside the ~2–3 MB the product principles set. An optional Inno Setup installer
   exists (`installer/newtpad.iss`) — per-user, HKCU and `%LOCALAPPDATA%` only, no elevation.
@@ -332,7 +340,8 @@ Ctrl+clickable.
   preview scrolls the editor to it**.
 - The preview scrolls in pixels and has its own scrollbar. It is bounded like every other viewport
   pass, so a huge markdown file previews without being parsed whole.
-- *Limits:* **the preview is read-only and cannot be selected or copied.** Markdown **concealment**
+- *Limits:* **the preview is read-only as an input surface** — you cannot type into it, though you
+  can select and copy from it (see above; that shipped in v0.62.0). Markdown **concealment**
   (hiding `#` and `**` on non-caret lines) is not built. Only `[a](b)` links work — no autolinks, no
   reference links — and a link inside a *table* cell is not clickable. A table wider than
   the pane is clipped with no way to reach the rest. Lists do not nest visually beyond their indent.
@@ -504,8 +513,14 @@ is viewport-scoped — only visible lines, capped at 4096 bytes per line.
   never make the menus unreadable. Defaults to Cascadia Mono.
 - **Multilingual text** renders via per-codepoint font fallback (Consolas → Microsoft YaHei for CJK →
   Segoe UI Symbol → Segoe UI): Latin, Cyrillic, Greek, CJK, accents and symbols all draw.
-  *Limit:* no complex-script shaping (Arabic, Indic, ligatures), and the caret / hit-test / selection /
-  find rectangles assume a monospace column, so they misalign on CJK and emoji. No colour emoji.
+  Wide characters occupy two cells, and the caret, hit-test, selection and find rectangles all agree
+  with the draw on them: `emojitest` (v0.66.0) measures `A<emoji>B` as four cells and puts cell 3 at
+  byte 5 — past the whole four-byte emoji — so the caret lands on the far side of a surrogate pair
+  rather than inside it. The draw advances by `cells * cell_w` using the same `text_cell_width_at`
+  that the caret, the selection and the hit-test read, so there is no second opinion to diverge.
+  *Limit:* no complex-script shaping (Arabic contextual forms, RTL, Indic reordering, ligatures) —
+  that is a locked consequence of the fixed cell grid, not a to-do. Emoji render monochrome, which was
+  the choice, not a gap.
 - **Per-monitor DPI v2.** Drag the window between a 4K and a 1080p monitor and everything rescales;
   DPI is clamped to 96–960 (100%–1000%).
 
