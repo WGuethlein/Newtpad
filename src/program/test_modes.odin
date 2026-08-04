@@ -37652,6 +37652,43 @@ when NEWTPAD_TESTS {
 				wi(&bad, exact, "...at exactly its column plus the hanging indent")
 				find_close(&doc)
 			}
+			{
+				// A MATCH SPANNING TWO VISUAL ROWS IS HIGHLIGHTED ON BOTH (v0.67.0).
+				//
+				// find_match_rects took a match into a row when `matches[mi] <= end`,
+				// emitted ONE rect clipped to the row, and advanced `mi` -- so a match
+				// running past the wrap point got no rect on the row it continued
+				// onto. doc_selection_rects walks the identical iterator with a range
+				// test and drew the same bytes correctly, so selecting a match and
+				// searching for it disagreed on screen about the same characters.
+				//
+				// Distinct from the recorded wrap-boundary entry, which is about which
+				// row a match starting exactly ON the break attributes to.
+				//
+				// The fixture's row 0 breaks at byte 39, so "epsilon zeta" (bytes
+				// 31..42) starts on row 0 and ends on row 1.
+				find_open(&doc, false)
+				clear(&doc.find.query) // find_open keeps the previous query by design
+				for r in "epsilon zeta" {find_input_rune(&doc, r)}
+				find_wait(&doc)
+				marks: [16]plat.Quad
+				nm := find_match_rects(&doc, &t, px, cw, ROWS, marks[:])
+				m0 := doc.find.matches[0] if len(doc.find.matches) > 0 else -1
+				mlen := doc.find.match_len[0] if len(doc.find.match_len) > 0 else 0
+				// The precondition IS the test: if the fixture stops straddling, the
+				// rect count below means nothing.
+				wi(&bad, m0 >= 0 && m0 < row1 && m0 + mlen > row1, fmt.tprintf("fixture: the match straddles the wrap at %d (starts %d, ends %d)", row1, m0, m0 + mlen))
+				wi(&bad, nm >= 2, fmt.tprintf("a match spanning two visual rows is highlighted on BOTH (%d rects, want >= 2)", nm))
+				// The two rects are on different rows, not two on one.
+				distinct_y := false
+				for i in 0 ..< nm {
+					for j in i + 1 ..< nm {
+						if abs(marks[i].pos.y - marks[j].pos.y) > 1 {distinct_y = true}
+					}
+				}
+				wi(&bad, distinct_y, "...and they are on two different rows")
+				find_close(&doc)
+			}
 
 			return mode_done("wrapindenttest", bad)
 		}
