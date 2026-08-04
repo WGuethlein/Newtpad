@@ -30730,13 +30730,19 @@ when NEWTPAD_TESTS {
 				UI_SCALE = 1
 				W, H := f32(1280), f32(900)
 				cw := f32(7)
+				// status_cells reads the LEFT group's width to decide which cells
+				// drop, and status_left_text needs a real Text for the cursor column
+				// and the atlas warning. A zero Text would measure the left group at
+				// the wrong width and silently change which cells this block sees.
+				mt: plat.Text
+				plat.text_load_faces(&mt)
 				sbuf: [4]Status_Cell
-				cs := status_cells(&sd, W, cw, sbuf[:])
+				cs := status_cells(&sd, &mt, W, cw, sbuf[:])
 				mt_chk(&bad, len(cs) == 2, fmt.tprintf("the right group has %d cells", len(cs)))
 				by := H - doc_bottom_bar_h(&sd) + doc_bottom_bar_h(&sd) * 0.5
 				hits := 0
 				for c in cs {
-					if status_cell_at(&sd, W, H, cw, c.x + c.w * 0.5, by) == c.cmd {hits += 1}
+					if status_cell_at(&sd, &mt, W, H, cw, c.x + c.w * 0.5, by) == c.cmd {hits += 1}
 				}
 				mt_chk(&bad, hits == len(cs), fmt.tprintf("every cell hit-tests to its own command (%d/%d)", hits, len(cs)))
 				// Cells must not overlap, or one swallows the other's clicks.
@@ -30744,13 +30750,13 @@ when NEWTPAD_TESTS {
 					mt_chk(&bad, cs[1].x + cs[1].w <= cs[0].x, fmt.tprintf("cells do not overlap (%.0f <= %.0f)", cs[1].x + cs[1].w, cs[0].x))
 				}
 				// Above the bar is not a cell -- the editor owns that pixel.
-				mt_chk(&bad, status_cell_at(&sd, W, H, cw, cs[0].x + 2, H - doc_bottom_bar_h(&sd) - 4) == .None, "a click above the bar is not a cell")
+				mt_chk(&bad, status_cell_at(&sd, &mt, W, H, cw, cs[0].x + 2, H - doc_bottom_bar_h(&sd) - 4) == .None, "a click above the bar is not a cell")
 				// The line-ending cell toggles TO the other value, so clicking it
 				// twice returns where it started rather than sticking.
 				sd.eol = .LF
-				c1 := status_cells(&sd, W, cw, sbuf[:])[0].cmd
+				c1 := status_cells(&sd, &mt, W, cw, sbuf[:])[0].cmd
 				sd.eol = .CRLF
-				c2 := status_cells(&sd, W, cw, sbuf[:])[0].cmd
+				c2 := status_cells(&sd, &mt, W, cw, sbuf[:])[0].cmd
 				mt_chk(&bad, c1 != c2, fmt.tprintf("the line-ending cell offers the OTHER value (%v then %v)", c1, c2))
 
 				// Cells never collide with the left group, at any width. The
@@ -30763,7 +30769,7 @@ when NEWTPAD_TESTS {
 					worst := f32(-1)
 					for wpx := 320; wpx <= 1600; wpx += 7 {
 						W2 := f32(wpx)
-						cc := status_cells(&sd, W2, cw, sbuf[:])
+						cc := status_cells(&sd, &mt, W2, cw, sbuf[:])
 						need := sx(12) + left_w + sx(24)
 						for len(cc) > 0 && cc[len(cc) - 1].x < need {cc = cc[:len(cc) - 1]}
 						// Whatever survives must start clear of the left group.
@@ -30774,9 +30780,57 @@ when NEWTPAD_TESTS {
 					mt_chk(&bad, worst < 0, fmt.tprintf("no window width lets a cell collide with the left group (worst %.0f)", worst))
 					// And the order is right-to-left: at a width that drops one,
 					// the one dropped is the LEFTMOST of the group.
-					narrow := status_cells(&sd, 420, cw, sbuf[:])
-					wide := status_cells(&sd, 1600, cw, sbuf[:])
-					mt_chk(&bad, len(narrow) == len(wide), "status_cells itself does not drop -- the caller does, so the geometry stays one thing")
+					// THE DROP IS PART OF THE GEOMETRY, AND THE CLICK AGREES WITH IT.
+					//
+					// The assertion that used to sit here read "status_cells itself
+					// does not drop -- the caller does, so the geometry stays one
+					// thing", and it had it exactly backwards: the caller dropping is
+					// what made the geometry TWO things. The draw dropped cells and
+					// status_cell_at did not, so a dropped cell was invisible and
+					// still clickable, and a click where the LF cell had been fired
+					// `.Eol_CRLF` -- a whole-buffer rewrite from a click on blank
+					// space. It also passed vacuously: on a clean empty document the
+					// left group is short enough that nothing drops at 420 either.
+					//
+					// So: a fixture whose left group is genuinely long. `recovered`
+					// adds a ~55-character warning, which is the realistic case --
+					// the bar is widest exactly when something has gone wrong.
+					sd.recovered = true
+					defer sd.recovered = false
+					narrow := status_cells(&sd, &mt, 420, cw, sbuf[:])
+					wide := status_cells(&sd, &mt, 1600, cw, sbuf[:])
+					mt_chk(&bad, len(wide) > len(narrow), fmt.tprintf("a narrow window drops cells the wide one keeps (%d narrow vs %d wide)", len(narrow), len(wide)))
+					// The precondition, or everything below is about an empty list.
+					mt_chk(&bad, len(wide) > 0, fmt.tprintf("the wide window has cells at all (%d)", len(wide)))
+					// THE SEAM: every cell the wide window drops must be unclickable
+					// at the narrow width, at the exact x it occupied when it existed.
+					leaked := Command_Id.None
+					leak_x := f32(0)
+					for c in wide {
+						still := false
+						for k in narrow {
+							if k.cmd == c.cmd {still = true}
+						}
+						if still {continue}
+						by2 := H - doc_bottom_bar_h(&sd) * 0.5
+						if got := status_cell_at(&sd, &mt, 420, H, cw, c.x + c.w * 0.5, by2); got != .None {
+							leaked, leak_x = got, c.x
+						}
+					}
+					mt_chk(&bad, leaked == .None, fmt.tprintf("a dropped cell is not clickable where it used to be (x=%.0f dispatched %v)", leak_x, leaked))
+					// WHAT THIS PAIR CAN AND CANNOT CATCH, since the difference decides
+					// whether the next reader trusts it too far.
+					//
+					// The first assertion is the load-bearing one: delete the drop from
+					// status_cells and it fails (2 narrow vs 2 wide), which is what pins
+					// the drop inside the shared producer rather than in a caller.
+					//
+					// The leak assertion goes VACUOUS under that same sabotage -- with
+					// nothing dropped there is nothing to leak -- so it is a guard on the
+					// current design, not an independent check. And neither can see the
+					// DRAW: if someone re-adds a post-filter in main.odin the geometry is
+					// two things again and both of these still pass. Catching that needs
+					// the draw to report what it drew, drawcount-style. Owed.
 				}
 			}
 

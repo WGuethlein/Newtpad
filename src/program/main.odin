@@ -1118,7 +1118,7 @@ main :: proc() {
 		// the press. UI spec 13: "Every cell is clickable."
 		if window.mouse_pressed {
 			scw := plat.text_char_width(&text, UI_SMALL_PX)
-			if c := status_cell_at(doc, f32(window.width), f32(window.height), scw, f32(window.mouse_x), f32(window.mouse_y)); c != .None {
+			if c := status_cell_at(doc, &text, f32(window.width), f32(window.height), scw, f32(window.mouse_x), f32(window.mouse_y)); c != .None {
 				command_dispatch(c, {}, &app, window, &text, srows)
 			}
 		}
@@ -2680,7 +2680,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 			count = fmt.tprintf("%d selected", hi - lo)
 			selected = true
 		}
-		left := fmt.tprintf("%s    %s%s%s%s%s%s%s", lncol, count, " *" if doc.modified else "", recovered, disk, indexing, atlas, nobackup)
+		left := status_left_text(doc, text)
 		// `mode` is not a cell: it names the VIEW, which the menus own, and there
 		// is no single obvious action for a click on it.
 		right := mode // reassigned by the drop order below
@@ -2708,18 +2708,18 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		//
 		// Measured against what the LEFT group actually needs, not against a
 		// hardcoded breakpoint, so it holds at any DPI and any font.
+		// Already dropped: status_cells owns the order now, so this list IS what
+		// status_cell_at will hit-test. The drop used to run here, which made the
+		// draw and the hit-test two owners of one geometry -- a dropped cell stayed
+		// clickable and a click on empty space could fire `.Eol_CRLF`.
 		cbuf: [4]Status_Cell
-		cells := status_cells(doc, w, cw, cbuf[:])
+		cells := status_cells(doc, text, w, cw, cbuf[:])
 		{
 			need := sx(12) + f32(len(left)) * cw + sx(24)
-			// Drop from the left end of the right-hand group, which is the
-			// rightmost cell in reading order -- status_cells places them right
-			// to left, so the LAST entry is the leftmost on screen.
-			for len(cells) > 0 && cells[len(cells) - 1].x < need {
-				cells = cells[:len(cells) - 1]
-			}
-			// The view name goes before any cell does: it is the least useful of
-			// the three and the widest.
+			// The view name still drops HERE, and that is not an oversight: it is
+			// not a cell and not clickable, so it cannot dispatch anything and
+			// cannot disagree with a hit-test that never looks at it. It goes
+			// before any cell does -- the least useful of the three and the widest.
 			if len(cells) < 2 || (len(cells) > 0 && cells[len(cells) - 1].x - sx(24) - f32(len(right)) * cw < need) {
 				right = ""
 			}

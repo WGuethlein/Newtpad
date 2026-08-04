@@ -1026,7 +1026,49 @@ Status_Cell :: struct {
 }
 
 // Fills `out` and returns the used prefix. `cw` is the status font's advance.
-status_cells :: proc(doc: ^Document, winw, cw: f32, out: []Status_Cell) -> []Status_Cell {
+// The status bar's LEFT group, as one string. UI spec 13: facts about position,
+// plus everything transient, because that is the half already changing as you work.
+//
+// Extracted from the draw 2026-08-04. It is not cosmetic that this has one home:
+// the right-hand cells DROP when they would collide with this group, so its width
+// decides which cells exist -- and while the draw owned the string, the hit-test
+// could not know the width and so could not know which cells had dropped. It
+// walked all of them, and a click where a dropped cell used to be dispatched that
+// cell's command. On the LF cell that is `.Eol_CRLF`: a whole-buffer rewrite from
+// a click on empty space.
+//
+// Takes `text` only for the glyph-atlas warning, which is a property of the
+// renderer rather than the document.
+status_left_text :: proc(doc: ^Document, text: ^plat.Text) -> string {
+	ln := doc_cursor_line(doc)
+	cl := doc_cursor_col(doc, text)
+	lncol: string
+	switch {
+	case ln > 0 && cl > 0:
+		lncol = fmt.tprintf("Ln %d, Col %d", ln, cl)
+	case cl > 0:
+		lncol = fmt.tprintf("Col %d", cl)
+	case ln > 0:
+		lncol = fmt.tprintf("Ln %d", ln)
+	case:
+		lncol = "Ln -, Col -"
+	}
+	count := fmt.tprintf("%d lines", doc_line_count(doc))
+	if lo, hi := doc_sel_range(doc); hi > lo {count = fmt.tprintf("%d selected", hi - lo)}
+	recovered := "  [RECOVERED COPY - file changed on disk, not the original]" if doc.recovered else ""
+	disk := ""
+	if doc.disk_gone {
+		disk = "  [FILE DELETED ON DISK - your text is still here; Save to write it back]"
+	} else if doc.disk_changed {
+		disk = "  [CHANGED ON DISK - you have unsaved edits. File > Reload to discard yours]"
+	}
+	indexing := "" if doc_index_done(doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(doc) * 100)
+	atlas := "  [GLYPH CACHE FULL - some text may not draw; reduce zoom or font size]" if plat.text_atlas_full(text) else ""
+	nobackup := "  [LARGE FILE - unsaved edits are NOT auto-backed up; Save to keep them]" if doc_backup_skipped(doc) else ""
+	return fmt.tprintf("%s    %s%s%s%s%s%s%s", lncol, count, " *" if doc.modified else "", recovered, disk, indexing, atlas, nobackup)
+}
+
+status_cells :: proc(doc: ^Document, text: ^plat.Text, winw, cw: f32, out: []Status_Cell) -> []Status_Cell {
 	if doc == nil || doc.kind != .Text || len(out) < 2 {return out[:0]}
 	n := 0
 	// Right to left, because they are right-aligned: each cell's x depends on
@@ -1043,14 +1085,31 @@ status_cells :: proc(doc: ^Document, winw, cw: f32, out: []Status_Cell) -> []Sta
 	// reverse of the order they are placed.
 	add(out, &n, &x, cw, base.line_ending_name(doc.eol), .Eol_CRLF if doc.eol == .LF else .Eol_LF)
 	add(out, &n, &x, cw, enc_name(doc.enc), .Enc_UTF8 if doc.enc != .UTF8 else .Enc_UTF16LE)
+
+	// THE DROP LIVES HERE, not in the draw. UI spec 5's order, measured against
+	// what the left group actually needs rather than a hardcoded breakpoint, so it
+	// holds at any DPI and any font.
+	//
+	// It used to run in main.odin AFTER this returned, which meant the draw and
+	// status_cell_at disagreed about which cells existed: a dropped cell was
+	// invisible and still clickable, and clicking where the LF cell had been fired
+	// `.Eol_CRLF` and rewrote the buffer. One producer now -- whatever this returns
+	// is what is drawn AND what is hit-tested, and there is no third place to add a
+	// second opinion.
+	//
+	// Cells are placed right to left, so the LAST entry is the leftmost on screen
+	// and is therefore the first to go.
+	need := sx(12) + f32(len(status_left_text(doc, text))) * cw + sx(24)
+	for n > 0 && out[n - 1].x < need {n -= 1}
 	return out[:n]
 }
 
 // The cell a click landed on, or .None.
-status_cell_at :: proc(doc: ^Document, winw, winh, cw, mx, my: f32) -> Command_Id {
+status_cell_at :: proc(doc: ^Document, text: ^plat.Text, winw, winh, cw, mx, my: f32) -> Command_Id {
 	if my < winh - doc_bottom_bar_h(doc) {return .None}
 	buf: [4]Status_Cell
-	for c in status_cells(doc, winw, cw, buf[:]) {
+	// Reads exactly what the draw drew, drop included -- see status_cells.
+	for c in status_cells(doc, text, winw, cw, buf[:]) {
 		if mx >= c.x && mx < c.x + c.w {return c.cmd}
 	}
 	return .None
