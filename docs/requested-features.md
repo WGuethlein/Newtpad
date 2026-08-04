@@ -236,6 +236,13 @@ documents had been carrying: CLAUDE.md ranked the UI overhaul and the `renderer`
 priority 2, while HANDOFF §6aa had moved them to V2 as V2's first item. **CLAUDE.md's ranking is the
 live one. The UI rework is a V1 gate, not a V2 opener.**
 
+**The menu gap is now enumerated: [ui-spec-gaps/2026-08-04-menus.md](ui-spec-gaps/2026-08-04-menus.md)**
+— all 14 of §6's requirements checked against `menu.odin` line by line. **5 built, 3 partial, 6
+missing**, with a suggested order. The shape of it: the *content* rules are largely done and the
+*finish* rules are largely not, which is why the menus behave correctly and still read as unfinished.
+The single highest-value item is one expression — the row highlight spans the full panel width, and
+§6 names that as *"the single biggest reason the menus read as unfinished"*.
+
 Menus specifically carry both a spec gap and defects — see the 2026-08-04 audit
 ([06-ui-shell.md](audits/2026-08-04/06-ui-shell.md)): context menus and the column-filter dropdown
 swap themselves for the File menu on any arrow key and ignore `Enter`, and `menu_draw_dropdown` still
@@ -419,6 +426,14 @@ value-per-cost for this audience:
 The three that remain are the ones the "second window" wedge argues *for* rather than against.
 
 ### The open plugin question — what a plugin IS (2026-08-04)
+
+**DECIDED 2026-08-04 by Wyatt: PARKED until after the free public beta.** Plugins are not cancelled
+and the ambition below is not withdrawn — the *timing* is settled and nothing else is. Two reasons it
+is the right park rather than a stall: the beta produces real users, and real users name their own
+extension points (which is exactly what this entry says is missing — a use case chosen before the
+interface); and it keeps the single-exe and antivirus story clean through the 2–8 week SmartScreen
+reputation window the launch plan depends on. **Re-open this entry when the beta has feedback, not
+before, and read the whole of it when you do — the fork below is still the fork.**
 
 **Plugins are staying. What they are is not settled**, and the two readings differ enough that they
 are separate products.
