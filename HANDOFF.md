@@ -7442,6 +7442,103 @@ makes a logically contiguous selection visually discontiguous and makes column e
 an RTL run. **The preview is the cheap half and is not blocked** — it already has a grid-free
 proportional shaper whose own header names `IDWriteTextAnalyzer` as the missing piece.
 
+## 6cg. The full-repo audit (2026-08-04, v0.67.0, branch `chore/audit-2026-08-04`)
+
+Wyatt asked for a whole-tree bug / efficiency / quality pass, an inventory of everything unbuilt, and
+market research. Six read-only subsystem audits ran in parallel — buffer, doc/session, find/lex,
+markdown/table, platform, UI shell — plus a feature inventory and a market pass. **77 findings: 8
+critical, 22 high, 23 medium, 24 low.** Full reports are in `docs/audits/2026-08-04/`;
+`reported-bugs.md` carries the triage index.
+
+**The most useful single fact is a negative one.** The headless sweep was green before the audit and
+green after — 95 modes, zero `FAIL` — and `odin test src/base` is 230/230. Every one of the 77
+findings is in territory no test observes. That is *why* they survived, and it is the argument for
+the rule that each fix needs its own failing test before anyone believes it. A green sweep here
+measures the tests, not the code.
+
+**Five landed:**
+
+- **`Ctrl+C` crashed the process.** `win.utf8_to_wstring` routes through `utf8_to_utf16_alloc`, which
+  passes `MB_ERR_INVALID_CHARS` — so it returns nil on *any* invalid UTF-8 byte, and
+  `clipboard.odin:14` dereferenced that nil on the next line. Reachable in ordinary use: encoding
+  detection sniffs only the head of the file, so a document whose first window is clean UTF-8 but
+  which carries a stray high byte further down is held as `.UTF8` with the raw bytes intact.
+- **`Cut` deleted the selection even when the clipboard write failed** — the text then existed in
+  neither place. `clipboard_set_text` was `void` and silent on all four of its failure paths;
+  it returns `ok` now, and two leaked `HGLOBAL`s went with it (abandoned on a failed `GlobalLock`,
+  and on a `SetClipboardData` whose result was never checked, so ownership was assumed to transfer
+  when it had not).
+- **A middle-click in the document body latched `mouse_middle_pressed` forever.** All five clears
+  were region-conditional and none covered the document body. `main.odin:433` counts the flag as
+  input, so `last_input` refreshed every frame for the rest of the session: **the 2 s debounced
+  session autosave never ran again**, the caret stopped blinking, the app never idled, and the next
+  `Ctrl+P` was born already "clicked" at the stale coordinate. One line, at the same point the right
+  button is cleared — whose comment had already worked out the reasoning.
+- **Whole-word search accepted `cat` inside `cats` at every 256 KB block edge.** The block overlap
+  was `len(q)-1`: enough for the last candidate in a block to be *found*, one byte short of what
+  whole-word needs to *judge* it, so `after` defaulted to 0 and read as a word boundary. The existing
+  whole-word fixture is 39 bytes, where the first block is also the last and `after == 0` genuinely
+  means end-of-file — which is exactly why it passed.
+- **A find match spanning two visual rows was highlighted on the first row only.**
+  `find_match_rects` emitted one rect per match and advanced; `doc_selection_rects` walks the
+  identical iterator with a range test and drew the same bytes correctly, so the two disagreed on
+  screen for the same match. Now the range rule, and the initial skip no longer drops matches that
+  *start* above the viewport and run into it.
+
+### What this batch got wrong
+
+**None of the five has a failing test.** They were verified by reading, by a 64-mode regression
+sweep that stayed green, and by a clean build — which is the standard this project has explicitly
+recorded as insufficient ("the glyph atlas grew only in the commit message"). They are landed
+because three of them are crashes or data loss in a daily driver and the fixes are small and local,
+not because they are proven. **The sabotage cases are owed and should lead the next batch.**
+
+The second thing: the sweep script wrote here reported "PROBLEMS 64" on a completely clean run,
+because `Start-Process -PassThru` left `ExitCode` null and `$null -ne 0`. The `FAIL`-line grep was
+the signal that actually worked, which is the same lesson §6bv already recorded from the other
+direction — read the output, not the integer.
+
+### Three items are worse than already recorded
+
+1. **`base`'s own scanners drop `pt_read`'s return and never check `pt.fault`**
+   (`piecetable.odin:341,440,508`). §6af/§6ba record this shape as swept and confirmed *for
+   `doc.odin`* — **the sweep never reached `base`.** On a faulting mapped read `safe_copy` zero-fills
+   and still returns a full count, so `pt_line_start` walks back to offset 0 and
+   `pt_content_end_cap` stops at the first NUL claiming `exact=true`.
+2. **`html_format` refuses every real HTML page** — void elements (`<meta>`, `<br>`, `<img>`) parse
+   as unclosed — while `features.md` documents HTML reformat as working.
+3. **The `\\?\` long-path debt has regrown** into `keymap.odin`, `rules.odin` and `perf.odin`. §5
+   still says only `diag.odin`'s append handle remains.
+
+### Docs corrected, and one left for Wyatt
+
+`features.md` carried three stale limits, all the same shape — a feature shipped, got its own new
+section, and the old limit line elsewhere went untouched: the exe size (1.21 → 1.38 MB), "the
+preview cannot be selected or copied" (contradicted two sections earlier in the same file since
+v0.62.0), and the CJK/emoji misalignment claim (measured false at v0.66.0, corrected in
+`requested-features.md` §4 but not here). §7's binary sizes were 33 minor versions stale.
+
+**Left uncorrected deliberately: CLAUDE.md says `\\?\` long paths are "unimplemented — there is not
+one `\\?\` in the tree".** They are implemented (`platform/path.odin`, `wide_path`, used throughout
+`file.odin`). That file is Wyatt's, so it is flagged rather than edited. `requested-features.md` is
+also **missing its `## 2` heading**, so ~100 lines of UI-spec debt currently read as though they sit
+under "asked for directly by Wyatt".
+
+### The inventory and the market pass
+
+`docs/audits/2026-08-04/07-feature-inventory.md` groups every unbuilt item A–H (9 asked-for, 27
+ui-spec, 32 engineering debt, 12 ship-readiness, 10 deferred, 13 decided-against, 6 fell-through-
+the-cracks, 8 already-built-docs-stale). Group H is the one to read first: **rebindable keys are
+fully built and shipped** while `requested-features.md` §3 still lists them as a V1 gap, and
+`WaitMessage` is implemented while the queue still carries it as owed — refuted 2026-07-25 and
+re-copied back in on 2026-07-30.
+
+`08-market-research.md` recommends **$39 launch → $49, perpetual with a 12-month update window**, and
+argues the wedge is *not* large files (EmEditor Free and klogg give that away at $0) but the
+**"second window"** for the sysadmin who has an IDE open and needs somewhere else for logs, CSVs and
+configs. It contradicts the existing corpus in four places, most usefully: the handmade/small-exe
+story is the entire *distribution* ticket and buys **zero** price tolerance.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
