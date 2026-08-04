@@ -27373,6 +27373,46 @@ when NEWTPAD_TESTS {
 			mk(&a, "config.json")
 			mk(&a, "readme.md")
 
+			// THE POINTER CANNOT MOVE THE KEYBOARD CURSOR.
+			//
+			// palette_hover runs EVERY FRAME off the live cursor, and it used to
+			// write `selected` directly -- so a pointer resting anywhere over the
+			// list overwrote the arrow keys before the next frame drew them, and
+			// Enter ran whatever the mouse was lying on rather than what the user
+			// had stepped to. Split into `selected` (keyboard, authoritative) and
+			// `hover` (pointer, visual only) on 2026-08-04.
+			//
+			// Asserted on the FIELDS rather than through palette_hover, which needs a
+			// real window to read the live cursor: what palette_hover does now is
+			// assign to `hover`, and the property that matters is that nothing
+			// downstream of `hover` can reach `selected`.
+			{
+				palette_open(&a)
+				for r in ">" {palette_input_rune(&a, r)}
+				if len(a.palette.results) >= 3 {
+					palette_move(&a, 2) // keyboard: step to row 2
+					want := a.palette.selected
+					a.palette.hover = 0 // pointer lands on row 0, repeatedly
+					a.palette.hover = 0
+					okk := a.palette.selected == want && want == 2
+					if !okk {bad += 1}
+					fmt.printfln("  %-6s hover does not move the keyboard cursor: selected=%d (want %d), hover=%d", "ok" if okk else "FAIL", a.palette.selected, want, a.palette.hover)
+					// And what Enter would run is the KEYBOARD row, not the hovered one.
+					oke := a.palette.results[a.palette.selected].cmd != a.palette.results[a.palette.hover].cmd
+					if !oke {bad += 1}
+					fmt.printfln("  %-6s Enter targets the keyboard row (%v), not the hovered one (%v)", "ok" if oke else "FAIL", a.palette.results[a.palette.selected].cmd, a.palette.results[a.palette.hover].cmd)
+					// A query change drops the stale hover: the row set changes under it.
+					palette_input_rune(&a, 'z')
+					okh := a.palette.hover == -1
+					if !okh {bad += 1}
+					fmt.printfln("  %-6s a query change clears the stale hover: hover=%d", "ok" if okh else "FAIL", a.palette.hover)
+				} else {
+					bad += 1
+					fmt.println("  FAIL   fewer than 3 command results, so the hover/selection case proves nothing")
+				}
+				palette_close(&a)
+			}
+
 			palette_open(&a)
 			for r in "conf" {palette_input_rune(&a, r)}
 			top := a.palette.results[0].slot if len(a.palette.results) > 0 else -1

@@ -42,7 +42,17 @@ Palette :: struct {
 	mode:     Palette_Mode,
 	query:    [dynamic]u8,
 	results:  [dynamic]Palette_Result,
+	// THE KEYBOARD CURSOR. What Enter runs, and the only thing that does. Moves on
+	// a key, on a click, and on a query change -- never on mouse movement.
 	selected: int,
+	// WHERE THE POINTER IS, and nothing else: purely visual, -1 when the pointer is
+	// off the list. Split from `selected` on 2026-08-04 because palette_hover runs
+	// every frame off the LIVE cursor and used to write `selected` directly, so a
+	// pointer resting anywhere over the list overwrote the keyboard cursor before
+	// the next frame could draw it -- arrow keys did nothing at all, and Enter ran
+	// whatever the mouse was lying on. UI spec 6's "two selection colours, two
+	// states, two weights" is the same split, stated as appearance.
+	hover:    int,
 }
 
 // Case-insensitive subsequence match with fzf-style bonuses (consecutive run,
@@ -188,6 +198,11 @@ palette_recompute :: proc(app: ^App) {
 	p := &app.palette
 	clear(&p.results)
 	p.selected = 0
+	// The row set is about to change under it, so an index into the OLD list points
+	// at a different row now. palette_hover re-establishes it next frame if the
+	// pointer is still over the list; leaving it stale draws a hover on a row the
+	// pointer is not on. (menu_set_items has the same rule for menu.item.)
+	p.hover = -1
 	q := string(p.query[:])
 	pat := q
 	p.mode = .Tabs
@@ -287,9 +302,9 @@ palette_row_at :: proc(app: ^App, mx, my, width, height: f32) -> int {
 palette_hover :: proc(app: ^App, win: ^plat.Window, width, height: f32) {
 	if !app.palette.active {return}
 	cx, cy := plat.window_cursor_client(win)
-	if r := palette_row_at(app, f32(cx), f32(cy), width, height); r >= 0 {
-		app.palette.selected = r
-	}
+	// Writes `hover` ONLY. It used to write `selected`, which is why arrow keys
+	// were inert: this runs every frame from the live cursor.
+	app.palette.hover = palette_row_at(app, f32(cx), f32(cy), width, height)
 }
 
 // Click inside the palette. Returns whether the click was consumed and whether
@@ -407,11 +422,17 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 
 	for i in 0 ..< nres {
 		ry := y0 + qh + f32(i) * rowh
+		// Two states, two weights (UI spec 6). The keyboard cursor is the strong
+		// one because it is the thing Enter will run; hover is a hint that a click
+		// would move it there. Hover is skipped on the selected row so the weaker
+		// fill can never paint over the stronger one.
 		if i == p.selected {
-			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x0, ry}, size = {PW, rowh}, color = g_theme[.Selection_List]}})
+			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x0, ry}, size = {PW, rowh}, color = g_theme[.Accent]}})
+		} else if i == p.hover {
+			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x0, ry}, size = {PW, rowh}, color = g_theme[.Bg_Hover]}})
 		}
 		r := p.results[i]
-		fg := g_theme[.Text_Primary] if i == p.selected else g_theme[.Text_Secondary]
+		fg := g_theme[.Bg_Base] if i == p.selected else g_theme[.Text_Secondary]
 		if p.mode == .Commands {
 			// The label, with the matched characters in the accent. UI spec 7:
 			// "Matched characters carry the accent -- that is the whole ranking
