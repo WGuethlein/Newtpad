@@ -2652,6 +2652,16 @@ misread the state.
    advice: budget exactly one UI rewrite and do it *after* V1, once real use cases exist. The
    research wins — shipping is what produces the use cases the rewrite is supposed to be informed
    by. It is also the difference between V1 being four batches away and ten.
+
+   **REVERSED 2026-08-04 by Wyatt (§6cg).** *"RE the UI, it's gotten better but it still hasn't
+   matched the ui spec given by Claude design especially in menus, i think this needs to be reworked
+   before a v1 release."* **The UI rework is a V1 gate again, and CLAUDE.md's priority-2 ranking is
+   the live one.** The reversal is not a contradiction of File Pilot's advice so much as a different
+   reading of where we are in it: the advice is "budget exactly one rewrite and do it after real
+   use", and eleven months of Wyatt driving this daily *is* the real use — the use cases the rewrite
+   was meant to wait for already exist, and the spec written from them is sitting in `docs/ui-spec/`
+   unmatched. Menus are the named gap. Note this also un-defers fork 4 (accessibility rode with the
+   UI refresh); **that has NOT been re-decided** — do not read an accessibility commitment into this.
 2. **A free public beta precedes the paid V1.** "V1" is therefore two milestones, and the commerce
    work (trial, offline license key, storefront) sits *after* the beta rather than before it.
 3. **Rebindable keys are in V1.** Named in CLAUDE.md principle 4; the hard half — the data-declared

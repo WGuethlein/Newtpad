@@ -224,6 +224,25 @@ other markdown view here works; the inline answer collides with §9's concealmen
 already flagged as needing its own batch because it makes the drawn column stop matching the byte
 column.
 
+## 2. Owed to the UI spec
+
+Everything below is a `docs/ui-spec/` obligation, **not** something Wyatt asked for — the distinction
+this heading exists to restore. It was missing until 2026-08-04, so sections ran 1, 3, 4, 5, 6 and
+these hundred-odd lines read as though they sat under "asked for directly".
+
+**Wyatt, 2026-08-04: the UI "still hasn't matched the ui spec given by Claude design, especially in
+menus — this needs to be reworked before a V1 release."** That settles a contradiction the two
+documents had been carrying: CLAUDE.md ranked the UI overhaul and the `renderer`/`ui` extraction
+priority 2, while HANDOFF §6aa had moved them to V2 as V2's first item. **CLAUDE.md's ranking is the
+live one. The UI rework is a V1 gate, not a V2 opener.**
+
+Menus specifically carry both a spec gap and defects — see the 2026-08-04 audit
+([06-ui-shell.md](audits/2026-08-04/06-ui-shell.md)): context menus and the column-filter dropdown
+swap themselves for the File menu on any arrow key and ignore `Enter`, and `menu_draw_dropdown` still
+resolves scroll inside the draw (HANDOFF §5), a violation whose shape cost three consecutive
+releases. **Fix the defects as part of the rework, not before it** — the one-layout rule is what the
+rework is for, and patching the draw again would be a fourth iteration of the same mistake.
+
 ### §10 Table view — DONE
 All nine rules are built: row numbers, click-to-sort with an accent arrow, numeric/date right-align,
 sampled column widths with drag-to-resize and double-click-to-fit, malformed rows marked rather than
@@ -393,11 +412,57 @@ value-per-cost for this audience:
 | Feature | Why it matters here | Cost |
 |---|---|---|
 | **Global hotkey / always-on-top quick capture** | *"a whole product category"*, fits the scratchpad positioning | Medium |
-| **Code folding** | expected in the "power notepad" tier | Medium |
 | **Macros / record-replay** | overlaps regex find/replace | Medium |
-| **File compare / diff** | 4 of 5 competitors have it; the #1 Notepad++ plugin | Stretches scope |
 | **Print / print preview** | requested; arguably outside "fast viewer" | Medium |
-| **Spellcheck** | table-stakes creep for prose; conflicts with "fight options" | Medium |
+
+**Code folding, file compare/diff and spellcheck were cut from this table 2026-08-04** — see §6.
+The three that remain are the ones the "second window" wedge argues *for* rather than against.
+
+### The open plugin question — what a plugin IS (2026-08-04)
+
+**Plugins are staying. What they are is not settled**, and the two readings differ enough that they
+are separate products.
+
+Wyatt, 2026-08-04: *"i still want plugins, i think being able to customize everything should be a
+feature, i don't want to limit people, i also think this leads to a healthier community... maybe this
+is the wrong way forward since we aren't going to make the source code public."*
+
+**The closed-source worry is unfounded and should not drive this.** Closed source and a healthy plugin
+ecosystem are orthogonal: **Obsidian** is the near-exact analogue — closed source, commercial, a
+notes/text tool, one of the largest plugin communities in software. **Sublime Text** (closed, Package
+Control) and **IDA Pro** are the same story. A community needs a stable documented extension point and
+a way to share, not the ability to read the renderer.
+
+**The real conflict is with the locked decision, not with licensing.** CLAUDE.md locks plugins as a
+*"narrow C-ABI (formatters + viewers), worker threads, timeouts, **never generic scripting**"*.
+"Customize everything" and "don't limit people" describe a scripting runtime, which is the clause that
+row rules out. **Choosing the broad reading is an amendment to a locked decision and should be
+recorded as one**, not arrived at by drift.
+
+What the audit established, and what still stands whichever way this goes: **the ABI has lost both its
+motivating examples.** Formatters shipped first-party (JSON/CSS/XML/HTML, v0.44.0–v0.57.0), and of the
+two named viewer cases, the archive tree is now cut (§6) and mermaid is deferred on cost — and E2's own
+note says the ABI *"is scoped on the unexamined assumption that a viewer returns text or a bitmap;
+mermaid needs far more."* So the one surviving example does not fit the interface designed for it.
+**Whatever is built needs a use case chosen before the interface**, or it will be an interface with
+nothing behind it.
+
+Three costs that are specific to this product rather than to plugins generally:
+
+1. **Native DLLs end the single-exe story** — the same objection that ruled out the Explorer preview
+   handler in §6. A plugin folder is an install.
+2. **AV reputation.** v0.33.0 already drew a `Trojan:Win32/Wacatac.B!ml` false positive (VirusTotal
+   1/40, sole ML dissenter). An unsigned binary that loads arbitrary native code from a user directory
+   is materially worse for heuristics — while 2–8 weeks of SmartScreen reputation is being built.
+3. **Crash attribution.** Every plugin fault arrives as a Newtpad minidump with Newtpad breadcrumbs and
+   a prefilled Newtpad issue, and gets triaged as one.
+
+**The cheap middle, stated so it is a real option rather than a strawman:** Newtpad already ships an
+unusually deep declarative surface — `theme.theme`, `keys.txt` and `rules.txt` are live-reloading text
+files that apply on save with no restart. Extending *that* (user-defined lexers, user-defined commands)
+buys much of "customize everything" with no code-execution boundary, no DLL and no AV surface.
+**It does genuinely limit people**, which is the thing Wyatt said he did not want, so it is a trade and
+not a free win.
 
 *Research §E explicitly marks go-to-line syntax and drag-drop as **not** demanded.*
 
@@ -466,6 +531,45 @@ Not user-facing features, but not bugs either — each changes what the product 
 ## 6. Explicitly ruled out — do not resurface
 
 Recorded so an audit does not raise them again. From HANDOFF §6aa unless noted.
+
+### Cut 2026-08-04 by Wyatt, after the market research
+
+Five items, cut in one pass once the research put a buyer behind the scope rule. The wedge it argues
+for is the **"second window"** — the sysadmin or support engineer who already has an IDE open and
+needs somewhere else for logs, CSVs and configs. That gives a sharper test than "is this an IDE
+feature": *would they use Newtpad for this, or Alt-Tab to the IDE that is already open?*
+
+- **Container / archive tree viewer (JAR/ZIP/tar/.docx → tree of entries).** Was E8, parked in
+  HANDOFF §6. Two reasons: it introduces Newtpad's **first side panel**, against Principle #2
+  ("content owns the screen"), and browsing archives is **File Pilot's job** — the product Newtpad is
+  modelled on. Duplicating the file manager sitting next to it is not scope, it is competition with
+  your own other tool.
+- **Embedding Monaspace Neon + Argon.** Was ui-spec §2.5/§20 step 3. It needs hand-written
+  `IDWriteFontFileLoader`/`IDWriteFontFileStream` vtables **and a rewrite of
+  `THIRD-PARTY-NOTICES.txt`'s "bundles and redistributes no third-party components" claim** — and the
+  research finds that self-contained/handmade story is *the entire distribution ticket* (gHacks led
+  with "a mere 1.8 MB" on File Pilot). L-sized work that weakens the best press hook. The curated
+  installed-font list already satisfies Principle #4.
+- **Code folding, file compare/diff, spellcheck.** The IDE half of §4's "never decided either way",
+  now decided. Diff is a separate paid product category (Beyond Compare, WinMerge); folding is an IDE
+  affordance; spellcheck serves a prose writer, not this buyer. **Macros/record-replay and
+  global-hotkey quick capture stay in §4** — repetitive text-munging over logs is squarely the wedge,
+  and the "second window" *is* a scratchpad.
+- **Theme contrast warnings** (six pairs, status bar, dismissible, once per save). Was ui-spec §17.
+  A theme-*authoring* tool for a product whose theme authors number roughly one. Options fighting,
+  per Principle #3. `Follow Windows` and high contrast are **not** cut with it — those are user
+  choices, not authoring aids.
+- **Explorer preview handler (`IPreviewHandler`) + thumbnail handler.** Was E4, deferred to V2+ on
+  2026-08-02. **Promoted from deferred to ruled out**, because the blocker is a principle rather than
+  a schedule: it needs a DLL and a registration step, which is the first thing in the queue that
+  cannot work without an installer — ending "no install required" (Principle #5), a line that is in
+  the marketing copy. Reopening it means accepting that Newtpad becomes a thing you install.
+
+**Plugins were NOT cut** — see §4's new plugin entry. The audit's argument for cutting them was that
+formatters shipped first-party and the two named viewer use cases (mermaid, the archive tree) were
+both going away, leaving the ABI with no motivating example. Wyatt's answer, 2026-08-04:
+*"i still want plugins, i think being able to customize everything should be a feature, i don't want
+to limit people, i also think this leads to a healthier community."*
 
 - **Code folding, macros, file compare, print/preview, spellcheck, global-hotkey quick capture** — all
   from research §C, *none ever ruled in*. (They appear in §4 above because they were never ruled **out**
