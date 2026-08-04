@@ -375,6 +375,73 @@ highlight_lexer_for :: proc(path: string) -> (lexer: Lexer_Proc, stateful: bool,
 	return
 }
 
+// The language name for the status bar's cell (UI spec 13: the right group reads
+// `Markdown · UTF-8 · LF · Tab 4`).
+//
+// DERIVED from the extension with a small override table, rather than a `name`
+// column on EXT_LEXERS. Two reasons. The obvious one is that a column would be
+// ~40 more strings, most of which are just the extension in capitals. The one
+// that decided it is that the cell has to answer for extensions EXT_LEXERS does
+// not carry at all -- .txt, .env, .toml, a file with no extension -- and a column
+// on a table keyed by "has a lexer" cannot. This is a property of the FILE, not
+// of whether Newtpad happens to colour it, and those two sets are deliberately
+// different (see EXT_LEXERS's .py comment: listed, no lexer).
+//
+// The fallback is the extension uppercased, which is right far more often than it
+// is wrong -- TOML, YAML, INI, CSS, SQL, XML all land correctly with no entry.
+@(private = "file")
+LANG_NAMES := [?]struct {
+	ext, name: string,
+}{
+	{".md", "Markdown"},
+	{".markdown", "Markdown"},
+	{".mkd", "Markdown"},
+	{".mdown", "Markdown"},
+	{".mdwn", "Markdown"},
+	{".mdtext", "Markdown"},
+	{".mdx", "Markdown"},
+	{".mtext", "Markdown"},
+	{".txt", "Plain Text"},
+	{".text", "Plain Text"},
+	{".log", "Log"},
+	{".h", "C"},
+	{".hpp", "C++"},
+	{".cpp", "C++"},
+	{".cc", "C++"},
+	{".cs", "C#"},
+	{".js", "JavaScript"},
+	{".ts", "TypeScript"},
+	{".py", "Python"},
+	{".rs", "Rust"},
+	{".go", "Go"},
+	{".odin", "Odin"},
+	{".java", "Java"},
+	{".html", "HTML"},
+	{".htm", "HTML"},
+	{".yml", "YAML"},
+	{".ps1", "PowerShell"},
+	{".sh", "Shell"},
+	{".bat", "Batch"},
+	{".cmd", "Batch"},
+	{".env", "Env"},
+	{".theme", "Theme"},
+}
+
+highlight_language_name :: proc(path: string, allocator := context.temp_allocator) -> string {
+	if path == "" {return "Plain Text"}
+	name := path
+	if s := strings.last_index_any(path, "\\/"); s >= 0 {name = path[s + 1:]}
+	dot := strings.last_index_byte(name, '.')
+	// A dotfile (".gitignore") is a NAME, not an extension -- `dot == 0` would
+	// otherwise slice to ".gitignore" and print "GITIGNORE" as if it were one.
+	if dot <= 0 || dot == len(name) - 1 {return "Plain Text"}
+	ext := name[dot:]
+	for l in LANG_NAMES {
+		if strings.equal_fold(ext, l.ext) {return l.name}
+	}
+	return strings.to_upper(ext[1:], allocator)
+}
+
 // Token_Kind -> Color_Role. Data, not branching logic: every kind a lexer can
 // produce maps to exactly one of the nine Syn_* roles theme.odin declared for
 // this batch. A total enumerated array, not a #partial switch: Odin rejects

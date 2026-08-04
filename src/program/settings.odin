@@ -660,7 +660,14 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 	x := sx(28)
 	y := CHROME_TOP + sx(40)
 	plat.text_draw(gfx, t, "Settings", x, y, UI_PX * 1.4, g_theme[.Text_Primary])
-	plat.text_draw(gfx, t, "Esc closes    Up/Down choose    Enter toggles", x, y + sx(22), UI_SMALL_PX, g_theme[.Text_Muted])
+	// "Left/Right adjust" is the fourth hint the 11 mockup carries and this line
+	// was missing: Theme, Zoom, Tab width and every other stepped row respond to
+	// Left/Right, and nothing on the page said so. Spelled out rather than drawn
+	// as the mockup's arrow glyphs, to match the font page's own hint line one
+	// screen away ("Esc goes back  Up/Down choose  Left/Right change") -- two
+	// screens disagreeing about how to name the same keys is worse than either
+	// spelling.
+	plat.text_draw(gfx, t, "Esc closes    Up/Down choose    Enter toggles    Left/Right adjust", x, y + sx(22), UI_SMALL_PX, g_theme[.Text_Muted])
 
 	rowh := sx(46)
 	y0, avail_h := settings_list_bounds(height)

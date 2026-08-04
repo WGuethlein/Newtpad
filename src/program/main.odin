@@ -2712,8 +2712,8 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 		// status_cell_at will hit-test. The drop used to run here, which made the
 		// draw and the hit-test two owners of one geometry -- a dropped cell stayed
 		// clickable and a click on empty space could fire `.Eol_CRLF`.
-		cbuf: [4]Status_Cell
-		cells := status_cells(doc, text, w, cw, cbuf[:])
+		cbuf: [STATUS_CELL_MAX]Status_Cell
+		cells := status_cells(doc, text, w, cw, &cbuf)
 		{
 			need := sx(12) + f32(len(left)) * cw + sx(24)
 			// The view name still drops HERE, and that is not an oversight: it is

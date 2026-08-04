@@ -11667,6 +11667,54 @@ when NEWTPAD_TESTS {
 			bad += ro_menu_case(true, .Off, "table view")
 			bad += ro_menu_case(false, .Preview, "Preview")
 
+			// --- the bar's Commands item: drawn box == clickable box ------------
+			// THE SEAM, not the unit. menu_bar_command is the only producer of this
+			// box; the draw fills it, menu_bar_command_at answers the click, and
+			// this compares the two at boundary widths. The gear it replaced could
+			// hold its box in two places safely because GEAR_W_96 was a constant --
+			// this item is measured, so the moment the draw or the hit-test grows
+			// its own arithmetic they diverge and a click lands on nothing.
+			//
+			// The narrow widths matter more than the wide ones: the item must be
+			// DROPPED whole rather than clipped or slid under the Help menu.
+			{
+				fmt.println("--- the bar's Commands item: one geometry ---")
+				bar_chk :: proc(bad: ^int, cond: bool, msg: string) {
+					fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+					if !cond {bad^ += 1}
+				}
+				_, last_title := menu_title_rect(&t, len(menus) - 1)
+				for W in ([]f32{1920, 1280, 900, 700, 560, 460, 360, 318}) {
+					c, ok := menu_bar_command(&t, W)
+					if !ok {
+						// Dropped: nothing anywhere on the row may answer for it.
+						hits := 0
+						for x := f32(0); x < W; x += 4 {
+							if menu_bar_command_at(&t, W, x) != .None {hits += 1}
+						}
+						bar_chk(&bad, hits == 0, fmt.tprintf("w=%4.0f dropped, and no x on the row is clickable (got %d)", W, hits))
+						continue
+					}
+					// Every edge of the drawn box, against the hit-test.
+					inside_l := menu_bar_command_at(&t, W, c.x) == .Palette_Open
+					inside_r := menu_bar_command_at(&t, W, c.x + c.w - 1) == .Palette_Open
+					outside_l := menu_bar_command_at(&t, W, c.x - 1) == .None
+					outside_r := menu_bar_command_at(&t, W, c.x + c.w) == .None
+					bar_chk(&bad, inside_l && inside_r, fmt.tprintf("w=%4.0f both drawn edges are clickable (l=%v r=%v)", W, inside_l, inside_r))
+					bar_chk(&bad, outside_l && outside_r, fmt.tprintf("w=%4.0f neither pixel outside it is (l=%v r=%v)", W, outside_l, outside_r))
+					// The label and chord must sit inside the box that was filled,
+					// or the hover highlights one thing and the text is another.
+					bar_chk(&bad, c.tx >= c.x && c.cx + f32(len(c.chord)) * plat.text_char_width(&t, UI_SMALL_PX) <= c.x + c.w, fmt.tprintf("w=%4.0f label and chord are inside the box", W))
+					// Clear of the titles, separator lane included.
+					bar_chk(&bad, c.sep_x > last_title, fmt.tprintf("w=%4.0f clear of the last title (sep=%.0f > %.0f)", W, c.sep_x, last_title))
+				}
+				// It must actually drop somewhere in that range, or the loop above
+				// proved nothing about the narrow case.
+				_, wide_ok := menu_bar_command(&t, 1920)
+				_, narrow_ok := menu_bar_command(&t, 318)
+				bar_chk(&bad, wide_ok && !narrow_ok, fmt.tprintf("present at 1920 and dropped at 318 (%v / %v) -- else the drop case is untested", wide_ok, narrow_ok))
+			}
+
 			// Non-zero exit, for the reason keytest grew one: a mode that only ever
 			// prints its verdict is a mode whose verdict a sweep can miss.
 			mode_done("menutest", bad)
@@ -30736,28 +30784,78 @@ when NEWTPAD_TESTS {
 				// the wrong width and silently change which cells this block sees.
 				mt: plat.Text
 				plat.text_load_faces(&mt)
-				sbuf: [4]Status_Cell
-				cs := status_cells(&sd, &mt, W, cw, sbuf[:])
-				mt_chk(&bad, len(cs) == 2, fmt.tprintf("the right group has %d cells", len(cs)))
+				sbuf: [STATUS_CELL_MAX]Status_Cell
+				cs := status_cells(&sd, &mt, W, cw, &sbuf)
+				// Four now, UI spec 13's `Markdown · UTF-8 · LF · Tab 4`. Cells come
+				// back right-to-left, so cs[0] is the RIGHTMOST -- which is why the
+				// two assertions below identify cells by COMMAND rather than by
+				// index. They used to read cs[0] as the line-ending cell, which was
+				// true with two cells and silently became `Tab 4` with four; an
+				// index into a list whose length is the thing under test is a
+				// stale assertion waiting to happen.
+				mt_chk(&bad, len(cs) == 4, fmt.tprintf("the right group has %d cells (want 4)", len(cs)))
+				eol_cell :: proc(cs: []Status_Cell) -> (Status_Cell, bool) {
+					for c in cs {
+						if c.cmd == .Eol_LF || c.cmd == .Eol_CRLF {return c, true}
+					}
+					return {}, false
+				}
 				by := H - doc_bottom_bar_h(&sd) + doc_bottom_bar_h(&sd) * 0.5
 				hits := 0
 				for c in cs {
 					if status_cell_at(&sd, &mt, W, H, cw, c.x + c.w * 0.5, by) == c.cmd {hits += 1}
 				}
 				mt_chk(&bad, hits == len(cs), fmt.tprintf("every cell hit-tests to its own command (%d/%d)", hits, len(cs)))
-				// Cells must not overlap, or one swallows the other's clicks.
-				if len(cs) == 2 {
-					mt_chk(&bad, cs[1].x + cs[1].w <= cs[0].x, fmt.tprintf("cells do not overlap (%.0f <= %.0f)", cs[1].x + cs[1].w, cs[0].x))
+				// Cells must not overlap, or one swallows the other's clicks. Every
+				// adjacent pair, not just the first two.
+				{
+					laps := 0
+					for i in 1 ..< len(cs) {
+						if cs[i].x + cs[i].w > cs[i - 1].x {laps += 1}
+					}
+					mt_chk(&bad, laps == 0, fmt.tprintf("no two cells overlap (%d overlapping pair(s))", laps))
 				}
 				// Above the bar is not a cell -- the editor owns that pixel.
 				mt_chk(&bad, status_cell_at(&sd, &mt, W, H, cw, cs[0].x + 2, H - doc_bottom_bar_h(&sd) - 4) == .None, "a click above the bar is not a cell")
 				// The line-ending cell toggles TO the other value, so clicking it
 				// twice returns where it started rather than sticking.
 				sd.eol = .LF
-				c1 := status_cells(&sd, &mt, W, cw, sbuf[:])[0].cmd
+				e1, ok1 := eol_cell(status_cells(&sd, &mt, W, cw, &sbuf))
 				sd.eol = .CRLF
-				c2 := status_cells(&sd, &mt, W, cw, sbuf[:])[0].cmd
-				mt_chk(&bad, c1 != c2, fmt.tprintf("the line-ending cell offers the OTHER value (%v then %v)", c1, c2))
+				e2, ok2 := eol_cell(status_cells(&sd, &mt, W, cw, &sbuf))
+				mt_chk(&bad, ok1 && ok2 && e1.cmd != e2.cmd, fmt.tprintf("the line-ending cell offers the OTHER value (%v then %v)", e1.cmd, e2.cmd))
+				mt_chk(&bad, ok1 && e1.label == "LF" && ok2 && e2.label == "CRLF", fmt.tprintf("...and says which it currently is (%q then %q)", e1.label, e2.label))
+
+				// UI spec 5's drop ORDER, which this rewrite corrects: "Tab width ->
+				// LF -> UTF-8 -> language". The old code dropped the LEFTMOST cell
+				// first, i.e. the language, which is exactly backwards -- §5's own
+				// 700px mockup keeps `Markdown · UTF-8`. Pinned as a sequence of
+				// surviving sets rather than one width, because the widths at which
+				// each drop happens depend on the font and the left group.
+				{
+					sd.eol = .LF
+					seen: [dynamic]string
+					defer delete(seen)
+					last := -1
+					for wpx := 1600; wpx >= 320; wpx -= 4 {
+						cc := status_cells(&sd, &mt, f32(wpx), cw, &sbuf)
+						if len(cc) == last {continue}
+						last = len(cc)
+						// cs is right-to-left; the leftmost survivor is cc[len-1].
+						append(&seen, cc[len(cc) - 1].label if len(cc) > 0 else "-")
+					}
+					// However many steps it takes, the leftmost survivor is always
+					// the language cell until nothing is left at all.
+					lang := highlight_language_name(sd.path)
+					good := true
+					for s in seen {
+						if s != lang && s != "-" {good = false}
+					}
+					mt_chk(&bad, good, fmt.tprintf("the language cell is the last to go as the window narrows (leftmost seen: %v, language=%q)", seen[:], lang))
+					// And the rightmost cell -- Tab width -- is the first to go.
+					wide := status_cells(&sd, &mt, 1600, cw, &sbuf)
+					mt_chk(&bad, len(wide) == 4 && wide[0].cmd == .Settings_Open && wide[0].label[:3] == "Tab", fmt.tprintf("Tab width is the rightmost cell, so it drops first (%q)", wide[0].label if len(wide) > 0 else ""))
+				}
 
 				// Cells never collide with the left group, at any width. The
 				// window has a floor, but between the floor and a comfortable
@@ -30769,7 +30867,7 @@ when NEWTPAD_TESTS {
 					worst := f32(-1)
 					for wpx := 320; wpx <= 1600; wpx += 7 {
 						W2 := f32(wpx)
-						cc := status_cells(&sd, &mt, W2, cw, sbuf[:])
+						cc := status_cells(&sd, &mt, W2, cw, &sbuf)
 						need := sx(12) + left_w + sx(24)
 						for len(cc) > 0 && cc[len(cc) - 1].x < need {cc = cc[:len(cc) - 1]}
 						// Whatever survives must start clear of the left group.
@@ -30797,8 +30895,8 @@ when NEWTPAD_TESTS {
 					// the bar is widest exactly when something has gone wrong.
 					sd.recovered = true
 					defer sd.recovered = false
-					narrow := status_cells(&sd, &mt, 420, cw, sbuf[:])
-					wide := status_cells(&sd, &mt, 1600, cw, sbuf[:])
+					narrow := status_cells(&sd, &mt, 420, cw, &sbuf)
+					wide := status_cells(&sd, &mt, 1600, cw, &sbuf)
 					mt_chk(&bad, len(wide) > len(narrow), fmt.tprintf("a narrow window drops cells the wide one keeps (%d narrow vs %d wide)", len(narrow), len(wide)))
 					// The precondition, or everything below is about an empty list.
 					mt_chk(&bad, len(wide) > 0, fmt.tprintf("the wide window has cells at all (%d)", len(wide)))
@@ -33857,6 +33955,22 @@ when NEWTPAD_TESTS {
 				// Case and whitespace are not part of the format.
 				load("   CTRL+K   =   move_line_up   \n")
 				chk(&bad, resolve_key(.K, true, false, .Editor) == .Move_Line_Up, "case and padding are ignored")
+
+				// --- Zoom In shows "Ctrl+=" but keys.txt still spells it "+" ------
+				// The UI spec's §6 mockup renders Zoom In as Ctrl+=, and that is a
+				// DISPLAY substitution in command_chord, not a rename of the key.
+				// Both halves are asserted here because the tempting change -- name
+				// the key "=" in key_names -- breaks two things at once and neither
+				// is loud: keymap_parse splits on the FIRST '=', so `ctrl+= = Zoom_In`
+				// would parse as the chord "ctrl+" with no key, and every keys.txt
+				// already written with "+" would stop resolving with nothing logged,
+				// because an unmatched key token makes the chord malformed and a
+				// malformed chord is skipped rather than reported.
+				fmt.println("--- Ctrl+= is a display name, + is the grammar ---")
+				chk(&bad, command_chord(.Zoom_In) == "Ctrl+=", fmt.tprintf("Zoom In displays as %q (want \"Ctrl+=\")", command_chord(.Zoom_In)))
+				k = load("ctrl++ = Move_Line_Up\n")
+				chk(&bad, len(k.entries) == 1 && keymap_reject_total(k) == 0, fmt.tprintf("keys.txt still binds `ctrl++` (1 entry, 0 refusals; got %d / %d)", len(k.entries), keymap_reject_total(k)))
+				chk(&bad, resolve_key(.Plus, true, false, .Editor) == .Move_Line_Up, fmt.tprintf("ctrl++ -> %v (want Move_Line_Up)", resolve_key(.Plus, true, false, .Editor)))
 
 				// --- an unknown command name is ignored ---------------------------
 				fmt.println("--- unknown command name ---")

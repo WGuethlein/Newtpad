@@ -237,11 +237,11 @@ command_table := [Command_Id]Command {
 	.Cut                      = {"Cut", "Edit"},
 	.Paste                    = {"Paste", "Edit"},
 	.Save                     = {"Save", "File"},
-	.Save_As                  = {"Save As...", "File"},
+	.Save_As                  = {"Save As…", "File"},
 	.Find_Open                = {"Find", "Search"},
 	.Replace_Open             = {"Replace", "Search"},
 	.Filter_Open              = {"Filter to Matching Lines", "Search"},
-	.Goto_Line                = {"Go to Line...", "Cursor"},
+	.Goto_Line                = {"Go to Line…", "Cursor"},
 	.Open_Link                = {"Open Link Under Cursor", "File"},
 	.Clear_Selection          = {"Clear Selection", "Cursor"},
 	.Move_Line_Up             = {"Move Line Up", "Edit"},
@@ -300,7 +300,7 @@ command_table := [Command_Id]Command {
 	.Palette_Prev             = {"Palette: Previous", "View"},
 	.Palette_Backspace        = {"Palette: Delete Backward", "View"},
 	.Tab_New                  = {"New Tab", "Tabs"},
-	.Tab_Open                 = {"Open File...", "Tabs"},
+	.Tab_Open                 = {"Open File…", "Tabs"},
 	.Tab_Close                = {"Close Tab", "Tabs"},
 	.Tab_Next                 = {"Next Tab", "Tabs"},
 	.Tab_Prev                 = {"Previous Tab", "Tabs"},
@@ -328,9 +328,9 @@ command_table := [Command_Id]Command {
 	.Settings_Toggle          = {"Settings: Toggle", "View"},
 	.Settings_Inc             = {"Settings: Increase", "View"},
 	.Settings_Dec             = {"Settings: Decrease", "View"},
-	.Theme_Edit               = {"Edit Current Theme...", "View"},
-	.Keys_Edit                = {"Edit Keybindings...", "View"},
-	.Rules_Edit               = {"Edit Colour Rules...", "View"},
+	.Theme_Edit               = {"Edit Current Theme…", "View"},
+	.Keys_Edit                = {"Edit Keybindings…", "View"},
+	.Rules_Edit               = {"Edit Colour Rules…", "View"},
 	.Open_Logs_Folder         = {"Open Logs Folder", "View"},
 	.Open_Themes_Folder       = {"Open Themes Folder", "View"},
 	// The only command in the product that touches the network, and the title
@@ -356,7 +356,7 @@ command_table := [Command_Id]Command {
 	.Find_Paste               = {"Find: Paste", "Search"},
 	.Find_Confirm             = {"Find: Confirm", "Search"},
 	.Find_Field_Toggle        = {"Find: Toggle Field", "Search"},
-	.Find_Toggle_Regex        = {"Find: Regular Expression", "Search"},
+	.Find_Toggle_Regex        = {"Find: Regex", "Search"},
 	.Find_Toggle_Case         = {"Find: Match Case", "Search"},
 	.Find_Toggle_Word         = {"Find: Whole Word", "Search"},
 	.Find_Toggle_Filter       = {"Find: Toggle Filter View", "Search"},
@@ -562,6 +562,13 @@ command_chord :: proc(cmd: Command_Id, allocator := context.temp_allocator) -> s
 		if b.ctrl {parts[n] = "Ctrl+";n += 1}
 		if b.alt {parts[n] = "Alt+";n += 1}
 		parts[n] = key_name(b.key)
+		// DISPLAY ONLY, and it has to happen here rather than in key_names: the
+		// key is unshifted on a US layout, so "Ctrl+=" is what the user actually
+		// presses and what the UI spec's §6 mockup shows -- but key_names is also
+		// the keys.txt grammar, and keymap_parse splits a line on its first '='.
+		// Renaming the key there would make `ctrl+= = Zoom_In` unparseable and
+		// would silently break every keys.txt already spelling it "+".
+		if b.key == .Plus {parts[n] = "="}
 		n += 1
 		return strings.concatenate(parts[:n], allocator)
 	}

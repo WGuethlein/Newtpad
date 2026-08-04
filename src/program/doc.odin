@@ -1025,6 +1025,22 @@ Status_Cell :: struct {
 	cmd:   Command_Id,
 }
 
+// Every cell the right group can hold at once, and the reason the buffer is a
+// FIXED ARRAY POINTER in status_cells' signature rather than a slice.
+//
+// It used to take `out: []Status_Cell` and every call site passed `[4]`. That is
+// fine while there are two cells and silently wrong the moment there are more:
+// status_cells fills up to len(out) and returns the prefix, so a fifth cell would
+// not overflow, not warn, and not appear -- it would simply never exist, in the
+// draw AND in the hit-test, identically, which is the one bug shape that leaves
+// no evidence. The four call sites (here, main.odin's draw, and two in
+// test_modes) would each have needed finding by hand.
+//
+// `^[STATUS_CELL_MAX]Status_Cell` makes an undersized buffer a COMPILE error at
+// every call site instead, which is the same argument key_names' total enumerated
+// array makes: the compiler is the only thing that reliably finds all four.
+STATUS_CELL_MAX :: 4
+
 // Fills `out` and returns the used prefix. `cw` is the status font's advance.
 // The status bar's LEFT group, as one string. UI spec 13: facts about position,
 // plus everything transient, because that is the half already changing as you work.
@@ -1055,6 +1071,27 @@ status_left_text :: proc(doc: ^Document, text: ^plat.Text) -> string {
 	}
 	count := fmt.tprintf("%d lines", doc_line_count(doc))
 	if lo, hi := doc_sel_range(doc); hi > lo {count = fmt.tprintf("%d selected", hi - lo)}
+	// The size cell UI spec 13 puts third in the left group (`42.1 KB`). Measured
+	// off the piece table, so it tracks unsaved edits rather than what is on disk
+	// -- the number beside "778 lines" has to describe the same buffer that line
+	// count does, or the two disagree the moment you type.
+	//
+	// Dropped, not truncated, on an empty buffer: "0 B" beside "1 lines" on a fresh
+	// scratch tab is noise, and the left group is the one thing §5 never drops, so
+	// anything added here is on screen forever.
+	size := ""
+	if L := doc.pt.length; L > 0 {
+		switch {
+		case L >= 1024 * 1024 * 1024:
+			size = fmt.tprintf("    %.1f GB", f64(L) / (1024 * 1024 * 1024))
+		case L >= 1024 * 1024:
+			size = fmt.tprintf("    %.1f MB", f64(L) / (1024 * 1024))
+		case L >= 1024:
+			size = fmt.tprintf("    %.1f KB", f64(L) / 1024)
+		case:
+			size = fmt.tprintf("    %d B", L)
+		}
+	}
 	recovered := "  [RECOVERED COPY - file changed on disk, not the original]" if doc.recovered else ""
 	disk := ""
 	if doc.disk_gone {
@@ -1065,30 +1102,52 @@ status_left_text :: proc(doc: ^Document, text: ^plat.Text) -> string {
 	indexing := "" if doc_index_done(doc) else fmt.tprintf("  (indexing %.0f%%)", doc_index_progress(doc) * 100)
 	atlas := "  [GLYPH CACHE FULL - some text may not draw; reduce zoom or font size]" if plat.text_atlas_full(text) else ""
 	nobackup := "  [LARGE FILE - unsaved edits are NOT auto-backed up; Save to keep them]" if doc_backup_skipped(doc) else ""
-	return fmt.tprintf("%s    %s%s%s%s%s%s%s", lncol, count, " *" if doc.modified else "", recovered, disk, indexing, atlas, nobackup)
+	return fmt.tprintf("%s    %s%s%s%s%s%s%s%s", lncol, count, " *" if doc.modified else "", size, recovered, disk, indexing, atlas, nobackup)
 }
 
-status_cells :: proc(doc: ^Document, text: ^plat.Text, winw, cw: f32, out: []Status_Cell) -> []Status_Cell {
-	if doc == nil || doc.kind != .Text || len(out) < 2 {return out[:0]}
-	n := 0
-	// Right to left, because they are right-aligned: each cell's x depends on
-	// the width of everything after it.
-	x := winw - sx(12)
-	add :: proc(out: []Status_Cell, n: ^int, x: ^f32, cw: f32, label: string, cmd: Command_Id) {
-		w := f32(len(label)) * cw
-		x^ -= w
-		out[n^] = {label = label, x = x^, w = w, cmd = cmd}
-		n^ += 1
-		x^ -= sx(24) // the gap a divider sits in the middle of
-	}
-	// Line endings, then encoding: the order they read left-to-right is the
-	// reverse of the order they are placed.
-	add(out, &n, &x, cw, base.line_ending_name(doc.eol), .Eol_CRLF if doc.eol == .LF else .Eol_LF)
-	add(out, &n, &x, cw, enc_name(doc.enc), .Enc_UTF8 if doc.enc != .UTF8 else .Enc_UTF16LE)
+status_cells :: proc(doc: ^Document, text: ^plat.Text, winw, cw: f32, out: ^[STATUS_CELL_MAX]Status_Cell) -> []Status_Cell {
+	if doc == nil || doc.kind != .Text {return out[:0]}
 
-	// THE DROP LIVES HERE, not in the draw. UI spec 5's order, measured against
-	// what the left group actually needs rather than a hardcoded breakpoint, so it
-	// holds at any DPI and any font.
+	// The candidates, LEFT TO RIGHT as the mockup reads them:
+	// `Markdown · UTF-8 · LF · Tab 4`.
+	//
+	// Built in reading order and dropped from the END, which is the correction
+	// this rewrite exists for. The old code placed cells right-to-left and dropped
+	// `out[n-1]` -- the LEFTMOST -- so with the two cells it had, encoding went
+	// before line endings. UI spec 5 states the opposite: "Status cells drop
+	// right-to-left: Tab width -> LF -> UTF-8 -> language", and §5's own 700px
+	// mockup shows the survivors as `Markdown · UTF-8`, i.e. the language is the
+	// LAST thing to go, not the first. With two cells that was one wrong cell; with
+	// four it would have kept `Tab 4` on a narrow window and dropped the language.
+	//
+	// Dropping the rightmost still relieves the collision, because the group is
+	// right-aligned: removing any cell moves the group's LEFT edge right by that
+	// cell's width. So placement has to happen after the drop, not before it --
+	// hence two passes rather than the old single right-to-left walk.
+	Cand :: struct {
+		label: string,
+		cmd:   Command_Id,
+	}
+	cands: [STATUS_CELL_MAX]Cand
+	nc := 0
+	push :: proc(c: ^[STATUS_CELL_MAX]Cand, n: ^int, label: string, cmd: Command_Id) {
+		if n^ >= STATUS_CELL_MAX {return}
+		c[n^] = {label, cmd}
+		n^ += 1
+	}
+	// Both new cells dispatch .Settings_Open: neither language nor tab width is a
+	// two-state toggle the way encoding and line endings are, so there is nothing
+	// honest for a click to cycle. UI spec 13 asks that every cell be clickable,
+	// and a cell that takes you to where the setting lives satisfies that without
+	// inventing a hidden cycle through 40 languages.
+	push(&cands, &nc, highlight_language_name(doc.path), .Settings_Open)
+	push(&cands, &nc, enc_name(doc.enc), .Enc_UTF8 if doc.enc != .UTF8 else .Enc_UTF16LE)
+	push(&cands, &nc, base.line_ending_name(doc.eol), .Eol_CRLF if doc.eol == .LF else .Eol_LF)
+	push(&cands, &nc, fmt.tprintf("Tab %d", plat.text_tab_width(text)), .Settings_Open)
+
+	// THE DROP LIVES HERE, not in the draw. Measured against what the left group
+	// actually needs rather than a hardcoded breakpoint, so it holds at any DPI and
+	// any font.
 	//
 	// It used to run in main.odin AFTER this returned, which meant the draw and
 	// status_cell_at disagreed about which cells existed: a dropped cell was
@@ -1096,20 +1155,37 @@ status_cells :: proc(doc: ^Document, text: ^plat.Text, winw, cw: f32, out: []Sta
 	// `.Eol_CRLF` and rewrote the buffer. One producer now -- whatever this returns
 	// is what is drawn AND what is hit-tested, and there is no third place to add a
 	// second opinion.
-	//
-	// Cells are placed right to left, so the LAST entry is the leftmost on screen
-	// and is therefore the first to go.
 	need := sx(12) + f32(len(status_left_text(doc, text))) * cw + sx(24)
-	for n > 0 && out[n - 1].x < need {n -= 1}
+	group_w :: proc(c: []Cand, cw: f32) -> f32 {
+		w := f32(0)
+		for e, i in c {
+			w += f32(len(e.label)) * cw
+			if i > 0 {w += sx(24)} // the gap a divider sits in the middle of
+		}
+		return w
+	}
+	for nc > 0 && winw - sx(12) - group_w(cands[:nc], cw) < need {nc -= 1}
+
+	// Now place the survivors right to left, so the group stays flush right and no
+	// gap is left where a dropped cell used to be.
+	n := 0
+	x := winw - sx(12)
+	for i := nc - 1; i >= 0; i -= 1 {
+		w := f32(len(cands[i].label)) * cw
+		x -= w
+		out[n] = {label = cands[i].label, x = x, w = w, cmd = cands[i].cmd}
+		n += 1
+		x -= sx(24)
+	}
 	return out[:n]
 }
 
 // The cell a click landed on, or .None.
 status_cell_at :: proc(doc: ^Document, text: ^plat.Text, winw, winh, cw, mx, my: f32) -> Command_Id {
 	if my < winh - doc_bottom_bar_h(doc) {return .None}
-	buf: [4]Status_Cell
+	buf: [STATUS_CELL_MAX]Status_Cell
 	// Reads exactly what the draw drew, drop included -- see status_cells.
-	for c in status_cells(doc, text, winw, cw, buf[:]) {
+	for c in status_cells(doc, text, winw, cw, &buf) {
 		if mx >= c.x && mx < c.x + c.w {return c.cmd}
 	}
 	return .None
