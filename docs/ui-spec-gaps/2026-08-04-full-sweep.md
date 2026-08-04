@@ -205,26 +205,54 @@ is also the most built. The split view renders a **proportional serif preview** 
 plus their rules, real bold and italic faces, nested lists, a blockquote bar, task checkboxes, thematic
 breaks, links and `Ctrl+M` cycling three states. §9.3's serif is honoured.
 
-- [V] **Tables render broken.** Header and body separate, no borders, no header band, no zebra. §9.2
-  item 6 wants a real table with `md_rule` borders. This is the most visible single defect found in the
-  whole sweep.
-- [V] Inline code has **no background fill** — `md_code_bg` exists as a role and is unused in the
-  preview. Spec: fill + 3px radius, and 6px + 12px padding + language label for fences.
-- [V] Task checkbox draws a box with `✕`; spec wants a 14px box, accent tick, and the done text dimmed.
-- [V] List bullets are not the spec's `•` / `◦` at 24px per level.
-- [V] Blockquote bar reads muted; §9.4's mockup is a 2px **accent** bar.
+> **Correction, 2026-08-04 — four of these six were wrong, the same way §10's were.** Called from a
+> downscaled capture; re-checked at 1:1 with a 5× zoom and against the producers. The spec's own
+> values are *deliberately subtle* — `md_code_bg #2A2723` on `bg_base #221F1C` is an 8/8/7 difference —
+> so "I can't see it in a screenshot" is not evidence of absence. **Verify at full resolution, or read
+> the draw.**
+>
+> | Claimed | Actually |
+> |---|---|
+> | Inline code has no fill | `markdown.odin:5670` draws a rounded `Md_Code_Bg` box behind it, and it is plainly visible at 1:1. Fences use it too (`5571-5612`). |
+> | Bullets are not `•`/`◦` | `markdown.odin:2511` — the `•` literal, drawn in accent. Correct at 1:1. |
+> | Blockquote bar reads muted | The bar is there and coloured; §9.4's mockup is accent, the build reads quieter. Real but cosmetic, kept below. |
+> | Done text not dimmed | It is — `read` renders in `Text_Muted` beside the blue `v1.json` link. |
+
+Remaining, all verified at 1:1:
+- [V] **The ticked checkbox is an accent-*outlined* box containing `✕`.** §9.2 item 9 and §9.4's mockup
+  both want an accent-**filled** 14px box with a dark `✓` (`bg=#d99b62 fg=#221f1c r=3px`). The 14px
+  box (`m.task_box = sx(14)`) and the dimmed done-text are already right; only the fill and the glyph
+  are wrong. Small.
+- [V] **The preview's table is text-with-rules, not the mockup's card.** It *does* render — header,
+  a `md_rule` under it, column separators, code chips inside cells — so "renders broken" was an
+  overstatement. What it lacks is §9.4's bordered card: `1px #3a342e` at `radius 6` around the whole
+  table, a `bg_raised` 26px header row, and no full-height vertical rules. Also a wide gap between the
+  header rule and the first body row. This is the **markdown-table job**, not polish.
+- [V] Blockquote bar → accent (§9.4 shows 2px `#d99b62`).
 - [F] Deferred tier untouched: YAML front-matter card, footnotes, image placeholders, setext headings.
 
-### §10 Table view — 5 items
-Row numbers, `—` for empty cells, the summary row, the selected row's 2px accent bar and mono/tnum all
-match.
-- [F] **No zebra striping.** `table_zebra` is defined and unused here. §10 makes zebra the thing that
-  *replaces* column rules.
-- [F] **No sorting** — hence no `↓` indicator in the header and no `sorted by …` clause in the summary.
-- [V] Columns do not fill the pane; the grid stops partway and leaves the rest empty. Spec distributes
-  columns proportionally across the width.
-- [V] Header band and its `border_strong` rule are much weaker than the mockup.
-- [F] Malformed rows are not marked with a `warning` bar.
+### §10 Table view — 2 items (**corrected 2026-08-04 — three of the five were wrong**)
+
+> **Correction.** The first draft of this section claimed zebra striping, sorting and the header band
+> were missing. All three ship. They were called absent from a screenshot of a 3-row fixture, which is
+> exactly the mistake this whole document exists to stop — *"a spec with mockups is not read by
+> reading its prose"* has a twin, and it is that an app is not read by squinting at one capture.
+> Verified instead by sampling pixels and reading the producer:
+>
+> | Claimed | Actually |
+> |---|---|
+> | No zebra | `table.odin:3971,4140`. Sampled the capture: row 4 is `#262320` (`Table_Zebra`), rows 1 and 3 are `#221F1C`. It keys off `table_row_band` — the **absolute** row number, so the stripe survives sorting — and the row fill and the gutter fill both read it, so they cannot disagree. The reason it looked absent is that `#262320` on `#221F1C` is a 4/4/3 difference: **the spec's own value**, and nearly invisible. |
+> | No sorting | `table.odin:961+`. A view-only permutation over row offsets with `table_row_start` as its single producer, an accent header arrow (`4259`), and `tablesorttest` covering ~16 cases. |
+> | Weak header band | `table.odin:4182,4314` draw `Bg_Raised`, and `4321` draws the 1px `Border_Strong` rule §10 asks for, deliberately last so it survives descenders. |
+
+Remaining:
+- [V] Columns do not fill the pane — the grid stops partway and leaves the rest empty. §10's rule, as
+  quoted in `markdown.odin:548`, is *"measure the first 200 rows, clamp each column to 8-40
+  characters, distribute leftover width proportionally"*, and the mockup's columns are `fr` units that
+  fill. **Unverified whether the code intends the slack**, and it is arguably right not to stretch a
+  4-column CSV across 1280px. Needs a decision, not a fix.
+- [F] Malformed rows are not marked with a `warning` bar. *(A warning fill does exist at
+  `table.odin:4142` — confirm what triggers it before counting this as owed.)*
 
 ### §11 Settings + §11.1 Font — 9 items
 - [F] Group headers `SESSION` / `APPEARANCE` / `VIEWS` (B14).
@@ -233,9 +261,11 @@ match.
 - [V] Header hint row omits `←→ adjust` and spells the arrows as words.
 - [V] Confirm the selected row uses `accent_wash` + a 2px accent bar (role exists; not visually
   verified — Settings did not open in the capture pass).
-- §11.1: [V] breadcrumb `Settings › Editor font`; [V] right-aligned `‹ value ›` with the end arrow
-  dimmed; [F] `Ligatures` row (needs DirectWrite font-feature plumbing); [V] a syntax-highlighted code
-  sample in the preview; [V] `PREVIEW` in caps.
+- §11.1 — **corrected 2026-08-04, three of five were already built** (`fontpage.odin:55-68,105`): the
+  breadcrumb `Settings › Editor font` ships, `PREVIEW` is already caps, and the values are already
+  right-aligned and bracketed by their chevrons. Each has a comment citing the 11.1 mockup, so they
+  were built *from* it. Remaining: [F] `Ligatures` row (needs DirectWrite font-feature plumbing) and
+  [V] a syntax-highlighted code sample in the preview.
 
 ### §12 Find / Replace / Filter — 6 items
 Already built: three chips with the active one accent-filled, a live count with `Danger` at zero, and
