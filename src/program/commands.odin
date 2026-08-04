@@ -1453,8 +1453,16 @@ command_dispatch :: proc(cmd: Command_Id, ev: plat.Key_Event, app: ^App, w: ^pla
 				app_note(app, fmt.tprintf("[COLUMN CUT REFUSED - a row could not be read, or the rectangle spans more than %d rows]", BLOCK_EDIT_MAX_LINES))
 			}
 		} else if s := doc_selected_text(doc, context.temp_allocator); s != "" {
-			plat.clipboard_set_text(w.hwnd, s)
-			doc_backspace(doc) // deletes the selection
+			// Delete ONLY if the copy actually landed. A Cut whose clipboard write
+			// failed used to delete the selection anyway, so the text existed in
+			// neither place -- data loss on a path as ordinary as another app
+			// holding the clipboard for a moment, or a stray high byte making the
+			// UTF-16 conversion refuse.
+			if plat.clipboard_set_text(w.hwnd, s) {
+				doc_backspace(doc) // deletes the selection
+			} else {
+				app_note(app, "[CUT FAILED - the clipboard could not be written; nothing was deleted]")
+			}
 		}
 	case .Paste:
 		if s, ok := plat.clipboard_get_text(w.hwnd, context.temp_allocator); ok {
