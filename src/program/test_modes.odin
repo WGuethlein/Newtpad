@@ -437,6 +437,41 @@ when NEWTPAD_TESTS {
 		command_dispatch(.Tab_Close, {}, &app, &dummy, &dtext, 10)
 		fmt.printfln("Tab_Close         -> live tabs=%d", app_live_count(&app))
 		app_destroy(&app)
+
+		// THE ONE-SHOT PRESSES DO NOT SURVIVE A FRAME (v0.67.0 fix).
+		//
+		// A middle click in the document body used to latch mouse_middle_pressed
+		// true for the rest of the session: all five of its clears were REGION-
+		// conditional (the palette, the tab strip, a read-only surface, the bottom
+		// bar, the top chrome) and none covered an ordinary editable document. The
+		// main loop counts the flag as input, so last_input refreshed every frame
+		// forever and the 2 s debounced session autosave never ran again -- unsaved
+		// work stopped being backed up, silently, after one middle click.
+		//
+		// The clear became window_clear_oneshot_presses so the invariant has a name
+		// and this can call it; testing it through the frame loop is not possible
+		// here, since the environment cannot inject GUI input (HANDOFF 7).
+		//
+		// The LEFT button is deliberately not in it and is asserted to be left alone:
+		// the caret path claims every left press that reaches it, so it has a
+		// terminal consumer, and clearing it here would eat clicks.
+		{
+			ow: plat.Window
+			ow.mouse_right_pressed = true
+			ow.mouse_middle_pressed = true
+			ow.mouse_pressed = true
+			plat.window_clear_oneshot_presses(&ow)
+			okm := !ow.mouse_middle_pressed
+			okr := !ow.mouse_right_pressed
+			okl := ow.mouse_pressed
+			if !okm {bad += 1}
+			if !okr {bad += 1}
+			if !okl {bad += 1}
+			fmt.printfln("  %-6s the middle press does not survive a frame (middle=%v)", "ok" if okm else "FAIL", ow.mouse_middle_pressed)
+			fmt.printfln("  %-6s the right press does not survive a frame (right=%v)", "ok" if okr else "FAIL", ow.mouse_right_pressed)
+			fmt.printfln("  %-6s the LEFT press is left alone, it has a terminal consumer (left=%v)", "ok" if okl else "FAIL", ow.mouse_pressed)
+		}
+
 		// NOT the only mode that exits non-zero -- 18 `os.exit(1)` sites live in this
 		// file as of this count (`grep -c` on the literal), and this branch alone
 		// added three of them (menutest, settingstest, tablesorttest). This one earns
@@ -9357,6 +9392,69 @@ when NEWTPAD_TESTS {
 			wv: plat.Window
 			t: plat.Text
 			plat.text_load_faces(&t)
+
+			// --- THE CLIPBOARD REFUSES RATHER THAN CRASHING, AND CUT HONOURS IT ---
+			//
+			// Two v0.67.0 fixes on one path, neither of which shipped with a test.
+			//
+			// win.utf8_to_wstring goes through utf8_to_utf16_alloc, which passes
+			// MB_ERR_INVALID_CHARS -- so MultiByteToWideChar returns 0, and the
+			// wstring nil, on ANY invalid UTF-8 byte. clipboard_set_text dereferenced
+			// that nil on the next line and took the process down. It is reachable in
+			// ordinary use: encoding detection sniffs only the head of the file, so a
+			// document whose first window is clean UTF-8 but which carries a stray
+			// high byte further down is held as .UTF8 with the raw bytes intact.
+			//
+			// Then Cut called it (void, silent on every failure path) and deleted the
+			// selection anyway, so the text existed in neither place.
+			//
+			// NOTE ON WHAT A SABOTAGE LOOKS LIKE HERE: removing the nil guard does not
+			// print FAIL, it FAULTS -- the mode dies before it can report. That is
+			// still a read of the fix (a clean run versus an access violation), but it
+			// is the one case in this file where the evidence is the exit code rather
+			// than a line of output, and it is worth knowing before someone reads a
+			// silent crash as a passing run.
+			{
+				// Valid ASCII either side of a lone 0xFF, which is not a legal UTF-8
+				// lead byte in any position.
+				bad_utf8 := "keep\xffme"
+				okc := plat.clipboard_set_text(nil, bad_utf8)
+				fk_chk(&bad, !okc, fmt.tprintf("clipboard_set_text refuses invalid UTF-8 and returns false (got %v, and reaching this line at all is the no-crash half)", okc))
+				// AND IT LEFT THE CLIPBOARD ALONE. This is the assertion that found a
+				// second bug: the proc used to Open and Empty the clipboard before
+				// attempting the conversion, so a copy it could not perform destroyed
+				// what the user already had. "PASTED" was set above and a later case
+				// in this mode depends on it -- which is precisely the damage a user
+				// would see.
+				//
+				// GUARDED ON ITS OWN PRECONDITION, and this is not defensive padding.
+				// The assertion reads the REAL Windows clipboard, and the sentinel is
+				// put there by the very operation whose failure mode this file is
+				// about -- any clipboard manager or RDP session can hold the clipboard
+				// for a moment and make the sentinel set fail. Observed flaking once
+				// during development. Without the guard the case reports a product bug
+				// when what actually happened is that the environment was busy.
+				survived, hs := plat.clipboard_get_text(nil, context.temp_allocator)
+				if !hs || survived != "PASTED" && survived != "" {
+					fmt.printfln("  --    clipboard sentinel unavailable (%q); skipping the survives-a-refusal check", survived)
+				} else {
+					fk_chk(&bad, hs && survived == "PASTED", fmt.tprintf("a refused copy leaves the existing clipboard intact: %q (want \"PASTED\")", survived))
+				}
+
+				// And Cut leaves the document alone when that refusal happens.
+				a2: App
+				defer app_destroy(&a2)
+				d2 := new(Document)
+				d2^ = doc_from_content(transmute([]u8)strings.clone(bad_utf8), "raw.txt", .UTF8)
+				app_add(&a2, d2)
+				app_activate(&a2, 0)
+				doc_select_all(d2)
+				before := d2.pt.length
+				// The precondition, or the assertion below passes on an empty selection.
+				fk_chk(&bad, before > 0 && d2.anchor != d2.cursor, fmt.tprintf("fixture: %d bytes selected %d..%d", before, d2.anchor, d2.cursor))
+				command_dispatch(.Cut, {}, &a2, &wv, &t, 10)
+				fk_chk(&bad, d2.pt.length == before, fmt.tprintf("a Cut whose clipboard write failed deletes nothing: %d bytes (want %d)", d2.pt.length, before))
+			}
 
 			// A real undo stack, a real REDO stack and a real selection, so Ctrl+Z,
 			// Ctrl+Y and Ctrl+X below each have something to destroy. Without them
@@ -30279,6 +30377,64 @@ when NEWTPAD_TESTS {
 				// would let through, and _ is a word character in every editor.
 				mt_chk(&bad, whole == 3, fmt.tprintf("whole word finds exactly the 3 standalone cats (%d)", whole))
 
+				// WHOLE WORD AT A SCAN-BLOCK BOUNDARY (v0.67.0 fix).
+				//
+				// The block read overlapped forward by len(q)-1: enough for the last
+				// candidate in a block to be FOUND (it ends on the block's final
+				// overlapped byte) and one byte short of what whole-word needs to
+				// JUDGE it. The byte after that match sat at index `got`, which was
+				// never read, so `after` stayed 0, is_word_byte(0) is false, and `cat`
+				// inside `cats` was accepted as a standalone word.
+				//
+				// The fixture above cannot see this: at 39 bytes the first block is
+				// also the LAST, where after == 0 genuinely means end-of-file. It
+				// needs a document long enough to have a non-final block, with the
+				// straddler placed so the match ends on the boundary byte -- the same
+				// shape findtest already plants at SEARCH_FIRST_PAINT - 4 for the
+				// ordinary literal-overlap case.
+				{
+					// THE OFFSET IS THE WHOLE TEST, and it is easy to get wrong -- the
+					// first version of this used SEARCH_FIRST_PAINT - 3 and passed
+					// with the bug reintroduced, i.e. proved nothing.
+					//
+					// The defect needs the guard `k + len(q) < got` to be exactly
+					// false, so the match must start at k where k + len(q) == got.
+					// With the bug, got == bs + len(q) - 1 and bs == SEARCH_FIRST_PAINT
+					// on the first pass, so k == SEARCH_FIRST_PAINT - 1. One byte
+					// either side and the byte after the match IS read, the guard
+					// holds, and the case is vacuous.
+					//
+					// AND THE DOCUMENT MUST EXCEED SEARCH_SYNC_MAX. The second wrong
+					// version of this test used a 64 KB fixture, which scans INLINE as
+					// a single block -- and that block is the LAST one, where after == 0
+					// genuinely does mean end-of-file and the guard is correct. Past
+					// SEARCH_SYNC_MAX the scan takes the bounded first-paint pass, whose
+					// block is not the last, which is the only place the defect lives.
+					//
+					// AND THE BYTE BEFORE MUST NOT BE A WORD BYTE. The third wrong
+					// version padded with 'x' all the way up to the match, so
+					// whole-word rejected it on the BEFORE test and never reached the
+					// after test this is about -- passing, again, for the wrong reason.
+					// A space goes immediately before the straddler.
+					pad := SEARCH_FIRST_PAINT - 1
+					b := make([dynamic]u8, context.temp_allocator)
+					for _ in 0 ..< pad - 1 {append(&b, 'x')}
+					append(&b, ' ') // the non-word byte before the match
+					append(&b, ..transmute([]u8)string("cats and more text after it\n"))
+					for len(b) < SEARCH_SYNC_MAX + (64 << 10) {append(&b, 'y')}
+					src := make([]u8, len(b))
+					copy(src, b[:])
+					bdoc := doc_from_content(src, "boundary.txt", .UTF8)
+					defer doc_close(&bdoc)
+					n := count(&bdoc, "cat", false, true)
+					mt_chk(&bad, n == 0, fmt.tprintf("whole word rejects `cat` inside `cats` straddling the block edge at %d (%d matches, want 0)", pad, n))
+					// The straddler is really where we think it is, or the case is
+					// vacuous: without whole-word the same query must find it.
+					any2 := count(&bdoc, "cat", false, false)
+					mt_chk(&bad, any2 == 1, fmt.tprintf("...and the straddler is genuinely there: %d plain matches (want 1)", any2))
+					find_close(&bdoc)
+				}
+
 				both := count(&fdoc, "cat", true, true)
 				mt_chk(&bad, both <= whole && both < exact, fmt.tprintf("the two modes compose (%d <= %d and < %d)", both, whole, exact))
 				find_close(&fdoc)
@@ -37494,6 +37650,43 @@ when NEWTPAD_TESTS {
 				wi(&bad, nm > 0, fmt.tprintf("the match is found and has rects (%d)", nm))
 				wi(&bad, m0 >= row1, fmt.tprintf("...and the match really is on the continuation row (%d >= %d)", m0, row1))
 				wi(&bad, exact, "...at exactly its column plus the hanging indent")
+				find_close(&doc)
+			}
+			{
+				// A MATCH SPANNING TWO VISUAL ROWS IS HIGHLIGHTED ON BOTH (v0.67.0).
+				//
+				// find_match_rects took a match into a row when `matches[mi] <= end`,
+				// emitted ONE rect clipped to the row, and advanced `mi` -- so a match
+				// running past the wrap point got no rect on the row it continued
+				// onto. doc_selection_rects walks the identical iterator with a range
+				// test and drew the same bytes correctly, so selecting a match and
+				// searching for it disagreed on screen about the same characters.
+				//
+				// Distinct from the recorded wrap-boundary entry, which is about which
+				// row a match starting exactly ON the break attributes to.
+				//
+				// The fixture's row 0 breaks at byte 39, so "epsilon zeta" (bytes
+				// 31..42) starts on row 0 and ends on row 1.
+				find_open(&doc, false)
+				clear(&doc.find.query) // find_open keeps the previous query by design
+				for r in "epsilon zeta" {find_input_rune(&doc, r)}
+				find_wait(&doc)
+				marks: [16]plat.Quad
+				nm := find_match_rects(&doc, &t, px, cw, ROWS, marks[:])
+				m0 := doc.find.matches[0] if len(doc.find.matches) > 0 else -1
+				mlen := doc.find.match_len[0] if len(doc.find.match_len) > 0 else 0
+				// The precondition IS the test: if the fixture stops straddling, the
+				// rect count below means nothing.
+				wi(&bad, m0 >= 0 && m0 < row1 && m0 + mlen > row1, fmt.tprintf("fixture: the match straddles the wrap at %d (starts %d, ends %d)", row1, m0, m0 + mlen))
+				wi(&bad, nm >= 2, fmt.tprintf("a match spanning two visual rows is highlighted on BOTH (%d rects, want >= 2)", nm))
+				// The two rects are on different rows, not two on one.
+				distinct_y := false
+				for i in 0 ..< nm {
+					for j in i + 1 ..< nm {
+						if abs(marks[i].pos.y - marks[j].pos.y) > 1 {distinct_y = true}
+					}
+				}
+				wi(&bad, distinct_y, "...and they are on two different rows")
 				find_close(&doc)
 			}
 

@@ -7626,6 +7626,62 @@ The five fixes in §6cg — the `Ctrl+C` crash, the `Cut` data loss, the middle-
 find defects — **still have no failing tests.** Wyatt chose this batch ahead of that debt. It has now
 been carried across two batches and should not slip a third time.
 
+## 6ci. The five fixes get their tests (2026-08-04, v0.69.0, branch `test/v0670-fix-coverage`)
+
+§6cg shipped five fixes with no failing test and said so; §6ch carried the debt a second time. This
+pays it. **All five now have a test that fails without the fix**, each sabotage-verified against a
+printed `FAIL` line — and writing them found a sixth defect.
+
+### The new defect the tests found
+
+**A refused copy used to wipe the clipboard.** `clipboard_set_text` opened the clipboard and called
+`EmptyClipboard()` *before* attempting the UTF-16 conversion, so a copy it could not perform had
+already destroyed whatever the user had before discovering it had nothing to replace it with. And
+"could not perform" is reachable in ordinary use — that is exactly what §6cg's nil-conversion fix is
+about. Everything that can fail now happens before the clipboard is opened: convert, allocate, fill,
+then Open/Empty/Set.
+
+It was found the way a user would find it: the new test wiped a sentinel a later case in the same
+mode depended on, and the sabotage run shows the damage as `Ctrl+V landed in the query` failing two
+assertions downstream of the wipe.
+
+### The whole-word fixture took four attempts, and the first three passed
+
+Worth reading before sizing a fixture in `find.odin`'s scan, because each wrong version *passed*:
+
+1. **The offset must be exactly `SEARCH_FIRST_PAINT - 1`.** The defect needs `k + len(q) < got` to be
+   precisely false, so the match must start where `k + len(q) == got`. One byte either side and the
+   byte after the match *is* read, the guard holds, and the case is vacuous. The first version used
+   `- 3`.
+2. **The document must exceed `SEARCH_SYNC_MAX`.** A 64 KB fixture scans inline as a single block —
+   and that block is the *last*, where `after == 0` genuinely means end-of-file and the guard is
+   correct. Only the bounded first-paint pass over a larger buffer produces a non-final block.
+3. **The byte before the match must not be a word byte.** Padding with `'x'` meant whole-word rejected
+   the match on the *before* test and never reached the *after* test the case is about.
+
+**Three plausible fixtures, three green runs, nothing tested.** This is the clearest instance yet of
+why the sabotage step is not optional.
+
+### Two other things worth keeping
+
+- **`window_clear_oneshot_presses`** now names the invariant that the right and middle presses have no
+  terminal consumer and must be cleared whether or not anything read them. It is a proc rather than
+  two inline lines specifically so a test can call it — the environment cannot inject GUI input (§7),
+  so driving the real frame loop was never an option. The **left** button is deliberately excluded and
+  the test asserts that too: the caret path claims every left press, so clearing it would eat clicks.
+- **One test reads global OS state and is guarded on its own precondition.** The clipboard-survival
+  check needs a sentinel placed by the very operation whose failure mode it is testing, so any
+  clipboard manager or RDP session holding the clipboard briefly makes it flake. It flaked once during
+  development; unguarded it reports a product bug when the environment was merely busy. **A test that
+  reads the real clipboard, registry or filesystem needs this shape.**
+
+### One honest limit
+
+**Sabotaging the clipboard nil guard does not print `FAIL`, it faults** — the mode dies before it can
+report. That is still a read of the fix (a clean run versus an access violation), but it is the one
+case in the tree where the evidence is the exit code rather than a line of output. The comment says
+so, because a silent crash must not be read as a passing run.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

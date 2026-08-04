@@ -993,22 +993,11 @@ main :: proc() {
 		// that reaches it; a right press has no such terminal consumer, so one that
 		// landed on the canvas, or in a document that is not a grid at all, would still
 		// be pending on the next frame and open a menu nobody asked for.
-		window.mouse_right_pressed = false
-
-		// The middle press needs the identical treatment, and for the identical
-		// reason. Its five clears are all REGION-conditional -- the palette, the tab
-		// strip, a read-only surface, the bottom bar, the top chrome -- and none of
-		// them covers the document body of an ordinary editable file, so a middle
-		// click there latched the flag true for the rest of the session. Everything
-		// downstream that reads it only suppresses it, so there is no consumer past
-		// this point to starve by clearing here.
-		//
-		// What that latch cost is out of proportion to the one line: line 433 treats
-		// the flag as input, so `last_input` was refreshed every frame forever -- the
-		// 2 s debounced session autosave never ran again, the caret stopped blinking,
-		// the app never idled, and the next Ctrl+P was born already "clicked" at the
-		// stale coordinate.
-		window.mouse_middle_pressed = false
+		// Both one-shot presses, cleared whether or not anything read them. The
+		// reasoning lives on the proc, which is also what a test can call --
+		// nothing downstream consumes either one; the later sites only suppress
+		// them, so there is no consumer past this point to starve.
+		plat.window_clear_oneshot_presses(window)
 
 		// The summary row's `sorted by ... · click to clear` run: clicking the words
 		// clears the sort. The second half of the answer to "there is no discoverable

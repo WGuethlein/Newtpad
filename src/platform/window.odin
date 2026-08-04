@@ -571,6 +571,30 @@ monitor_work_area :: proc(hwnd: win.HWND) -> (win.RECT, bool) {
 
 // Cursor position in this window's client coordinates (for title-bar button
 // hover, since the buttons are non-client and don't get WM_MOUSEMOVE).
+// Clear the one-shot button presses -- the ones a frame either consumes or
+// discards, never carries forward.
+//
+// `mouse_pressed` (left) is NOT among them: the caret path claims every left
+// press that reaches it, so it has a terminal consumer and clears itself. The
+// right and middle buttons have none. A right press that landed on the canvas, or
+// in a document that is not a grid, would otherwise still be pending next frame
+// and open a menu nobody asked for; a middle press in the document body used to
+// latch true for the REST OF THE SESSION, because all five of its clears were
+// region-conditional (the palette, the tab strip, a read-only surface, the bottom
+// bar, the top chrome) and none covered an ordinary editable document.
+//
+// What that latch cost was out of proportion to the flag: the main loop counts it
+// as input, so `last_input` refreshed every frame forever -- the 2 s debounced
+// session autosave never ran again, the caret stopped blinking, the app never
+// idled, and the next Ctrl+P opened already "clicked" at the stale coordinate.
+//
+// It is a proc rather than two lines inline so the invariant has a name and a
+// test can call it. Add a button here when you add one to Window.
+window_clear_oneshot_presses :: proc(w: ^Window) {
+	w.mouse_right_pressed = false
+	w.mouse_middle_pressed = false
+}
+
 window_cursor_client :: proc(w: ^Window) -> (x, y: i32) {
 	// A windowless Window (the headless render path: no hwnd, just a size) has
 	// no client space to map into. ScreenToClient(nil) FAILS SILENTLY and leaves
