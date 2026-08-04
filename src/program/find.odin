@@ -767,8 +767,12 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 	defer delete(ql)
 	for i in 0 ..< len(q) {ql[i] = q[i] if s.case_sens else lower(q[i])}
 
-	// Overlap by len(q)-1 so a match spanning a block boundary is still found.
-	buf := make([]u8, SEARCH_BLOCK + len(q) - 1)
+	// Overlap by len(q) so a match spanning a block boundary is still found AND
+	// whole-word can still judge it. len(q)-1 is enough to FIND the last candidate
+	// in a block (it ends on the block's final overlapped byte) but leaves the byte
+	// AFTER it unread, and `after` defaulting to 0 reads as a word boundary -- so
+	// `cat` inside `cats` was accepted as a whole word at every block edge.
+	buf := make([]u8, SEARCH_BLOCK + len(q))
 	defer delete(buf)
 
 	// Resume where the last pass stopped. nlines counts newlines passed, so the
@@ -789,7 +793,7 @@ scan_literal :: proc(s: ^Search, pt: ^base.Piece_Table, upto: int) {
 		// budget that isn't a multiple of SEARCH_BLOCK is the budget and not the
 		// next multiple up.
 		bs := min(SEARCH_BLOCK, upto - pos)
-		got := base.pt_read(pt, pos, buf[:min(bs + len(q) - 1, L - pos)])
+		got := base.pt_read(pt, pos, buf[:min(bs + len(q), L - pos)])
 		if got == 0 {
 			ended = true
 			break scan
@@ -1649,7 +1653,9 @@ find_match_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: i
 	lh := line_height(px)
 
 	mi := 0
-	for mi < len(f.matches) && f.matches[mi] < doc.top {mi += 1}
+	// Skip only matches that END above the viewport -- one that STARTS above it and
+	// runs into view still has to be drawn on the rows it reaches.
+	for mi < len(f.matches) && f.matches[mi] + f.match_len[mi] <= doc.top {mi += 1}
 
 	it := visible_begin(doc, t, rows)
 	n := 0
@@ -1660,16 +1666,27 @@ find_match_rects :: proc(doc: ^Document, t: ^plat.Text, px, char_w: f32, rows: i
 		rhs := 0 if wrapped else H_SCROLL
 		for mi < len(f.matches) && f.matches[mi] <= end && n < len(out) {
 			m := f.matches[mi]
-			startcol := min(line_cell_col(doc, t, start, max(m, start)), VISIBLE_COLS)
-			endcol := min(line_cell_col(doc, t, start, min(m + f.match_len[mi], vis_end)), VISIBLE_COLS)
-			// The row's hanging indent (§8), from the same producer the draw and
-			// the click read -- a match highlight that ignored it would sit to the
-			// left of the text it is supposed to be marking on a continuation row.
-			ind := f32(row_indent_cells(doc, t, start, doc.view_cols)) * char_w
-			sx := col_x(char_w, startcol, rhs) + ind
-			ex := col_x(char_w, endcol, rhs) + ind
-			out[n] = {pos = {sx, ry}, size = {max(ex - sx, 2), lh}, color = col}
-			n += 1
+			mend := m + f.match_len[mi]
+			// A match can span visual rows -- word wrap, or a logical line past
+			// RENDER_LINE_CAP. Emit a clipped rect on EVERY row it touches and only
+			// advance `mi` once the row it ends on has been drawn. Emitting one rect
+			// per match and advancing left the tail of a wrapped match unhighlighted,
+			// while doc_selection_rects (same iterator, same producers) drew the same
+			// bytes correctly -- so the two disagreed on screen. This is that file's
+			// range rule, not a second geometry.
+			if mend > start {
+				startcol := min(line_cell_col(doc, t, start, max(m, start)), VISIBLE_COLS)
+				endcol := min(line_cell_col(doc, t, start, min(mend, vis_end)), VISIBLE_COLS)
+				// The row's hanging indent (§8), from the same producer the draw and
+				// the click read -- a match highlight that ignored it would sit to the
+				// left of the text it is supposed to be marking on a continuation row.
+				ind := f32(row_indent_cells(doc, t, start, doc.view_cols)) * char_w
+				sx := col_x(char_w, startcol, rhs) + ind
+				ex := col_x(char_w, endcol, rhs) + ind
+				out[n] = {pos = {sx, ry}, size = {max(ex - sx, 2), lh}, color = col}
+				n += 1
+			}
+			if mend > end {break} // continues onto the next row; keep `mi` on it
 			mi += 1
 		}
 	}

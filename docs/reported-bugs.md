@@ -11,6 +11,109 @@ and record it in the HANDOFF entry instead — this file is a queue, not a histo
 
 ---
 
+## The 2026-08-04 full-repo audit
+
+Six parallel read-only passes over the whole tree, one per subsystem. Full reports with mechanism,
+failure scenario and fix sketch for every item are in **[audits/2026-08-04/](audits/2026-08-04/)** —
+this section is the triage index, not the evidence. **Read the report before scheduling any item**;
+each entry there states whether it was CONFIRMED (the path was traced end to end) or PLAUSIBLE, and
+the ones below are all CONFIRMED unless marked.
+
+**77 findings: 8 CRITICAL, 22 HIGH, 23 MEDIUM, 24 LOW.** Five are already fixed (below). Every
+finding was cross-checked against this file, `requested-features.md` and HANDOFF §5/§6 first, so
+nothing here is a re-report — but **three are worse than what was already recorded** and say so.
+
+**Standing caveat on all of it:** these came from reading, not from running. The headless sweep was
+green before the audit and green after (95 modes, zero FAIL), which is exactly the point — every
+item below is in territory no test observes. That cuts both ways: it is why they survived, and it is
+why each one needs its own failing test before anyone believes the fix.
+
+### Fixed in this pass (2026-08-04)
+
+| Was | Where | Now |
+|---|---|---|
+| **CRITICAL** — `Ctrl+C` crashes the process on any document holding a stray high byte | `platform/clipboard.odin:13` | `utf8_to_wstring` returns nil on invalid UTF-8 (it passes `MB_ERR_INVALID_CHARS`); the next line dereferenced it. Guarded, and the proc now returns `ok` |
+| **CRITICAL** — `Cut` deletes the selection even when the clipboard write failed | `program/commands.odin:1456` | Deletes only on a successful copy, and says so when it refuses. Also fixes a leaked `HGLOBAL` on two paths |
+| **CRITICAL** — a middle-click in the document body latches `mouse_middle_pressed` forever, so **session autosave never runs again** | `program/main.odin:996` | Cleared unconditionally once per frame, like the right button. All five existing clears were region-conditional and none covered the document body |
+| **HIGH** — whole-word search accepts `cat` inside `cats` at every 256 KB block edge | `program/find.odin:771,792` | Block overlap was `len(q)-1` — enough to *find* the last candidate, one byte short of *judging* it, so `after` defaulted to 0 and read as a word boundary |
+| **HIGH** — a find match spanning two visual rows is highlighted on the first row only | `program/find.odin:1661` | Emitted one rect per match and advanced; now emits per row the match touches, which is the range rule `doc_selection_rects` already uses on the same iterator |
+
+**Owed on all five: a test that fails without the fix.** None of them is observed by any existing
+mode — that is how they got here — so per CLAUDE.md they are fixed-but-unproven until each has a
+sabotage-verified case. Do not let that sit; "the glyph atlas grew only in the commit message" is
+the entry in this project's history that this rule exists because of.
+
+### CRITICAL, still open
+
+| # | Item | Where |
+|---|---|---|
+| 1 | A mapped original that **faults mid-save writes zero-filled pages into the user's file** and commits them atomically. `doc_sort_lines` guards this exact hazard; the save does not | `doc.odin:2158` |
+| 2 | **`Ctrl+S` never re-stats the target or consults `disk_changed`** — an externally rewritten file is silently overwritten, and the save then clears the only warning that existed | `commands.odin:1469` → `doc.odin:2144` |
+| 3 | `doc_detach_mapping` does an **uncapped whole-file private copy on the input thread**; a failed allocation repoints `pt.original` at an empty slice → out-of-range slice in `piece_src` | `doc.odin:3054` |
+| 4 | **`css_format` silently corrupts any stylesheet with an unquoted `url(...)`** — `//` takes the SCSS comment branch and eats the closing `)`, so every later rule is mangled | `css_format.odin:13` |
+| 5 | **A column filter with no sort disables `table_sort_shift`** (`nkeys == 0`), so one length-changing cell edit desyncs every row offset below it and a later edit splices at the wrong bytes | `table.odin:2432` |
+
+Items 1–3 are the data-loss set and should lead the next batch. Item 5 is a one-predicate fix.
+
+### HIGH, still open — 20 items
+
+Summarised by area; the reports carry each one.
+
+- **Save / session** (6) — unbounded `doc_absorb_append` read; a silent backup-write failure that
+  loses unsaved edits at restore; BOM-less UTF-16 gaining a BOM on save; orphan-store deletion
+  taking its backups with it. See [02-doc-session.md](audits/2026-08-04/02-doc-session.md).
+- **UI shell** (5) — the status bar drops right-hand cells from the *draw* but `status_cell_at`
+  still walks them, so a click on a narrow window fires `.Eol_CRLF`, a whole-buffer rewrite;
+  `command_in_palette` excludes six commands where `command_needs_menu_target` names fourteen, so
+  palette "Close Tab" closes the wrong tab; palette keyboard selection walks past the drawn rows;
+  `palette_hover` overwrites keyboard selection every frame, making arrow keys inert. See
+  [06-ui-shell.md](audits/2026-08-04/06-ui-shell.md).
+- **Markdown / table** (4) — preview selection hit-test drops `lay.indent`, so clicking a list item
+  selects ~3 characters to the right; `html_format` refuses every real HTML page (void elements
+  parse as unclosed) **and is documented DONE, so this is worse than recorded**; preview table copy
+  emits a tab per *span* not per *column*. See [04-markdown-table.md](audits/2026-08-04/04-markdown-table.md).
+- **Platform** (3) — the crash filter allocates and takes a non-recursive lock *before* saving work,
+  so a fault inside the logger or the allocator self-deadlocks it; the release exe is
+  `-subsystem:windows`, so every graphics-init failure path prints to nowhere and a machine with no
+  D3D11 hardware device launches and vanishes silently. See [05-platform.md](audits/2026-08-04/05-platform.md).
+- **Buffer** (1) — `pt_word_left`/`pt_word_right` are uncapped one-byte-`pt_read`-per-byte scans on
+  the input thread; a 4 MB base64 line is one token, so one `Ctrl+→` freezes the UI for ~0.2–0.4 s
+  and the key auto-repeats. Missed by the `*_cap` sweep. See [01-buffer-core.md](audits/2026-08-04/01-buffer-core.md).
+- **Find / lex** (1) — one keystroke permanently invalidates the lex-state index and it is never
+  rebuilt; for Markdown/YAML/Rust/Odin the fallback resync's validator *always* rejects, so
+  everything past 64 KiB lexes as `.Normal`. The header comment claiming the fallback is "correct at
+  any revision" is false. See [03-find-lex.md](audits/2026-08-04/03-find-lex.md).
+
+### Worse than already recorded
+
+Three items where an existing entry understates the problem. These matter more than new findings,
+because something already said "handled".
+
+1. **`base`'s own scanners drop `pt_read`'s return and never check `pt.fault`**
+   (`piecetable.odin:341,440,508`). HANDOFF §6af/§6ba records this shape as *swept and confirmed*
+   for `doc.odin` — **the sweep never reached `base`.** On a faulting mapped read `safe_copy`
+   zero-fills and still returns a full count, so `pt_line_start` walks back to offset 0 and
+   `pt_content_end_cap` stops at the first NUL claiming `exact=true`.
+2. **`html_format` refuses every real HTML page** — void elements (`<meta>`, `<br>`, `<img>`) parse
+   as unclosed. `features.md` documents HTML reformat as working.
+3. **The `\\?\` long-path debt has regrown** into `keymap.odin`, `rules.odin` and `perf.odin` while
+   HANDOFF §5 still says only `diag.odin`'s append handle remains.
+
+### Stale docs found while auditing (all fixed 2026-08-04)
+
+- `features.md` claimed the exe was 1.21 MB (it is 1.38 MB), that the preview "cannot be selected or
+  copied" (it has been selectable since v0.62.0, documented two sections earlier in the same file),
+  and that the caret misaligns on CJK and emoji (v0.66.0 measured that as false and corrected
+  `requested-features.md` §4, but not this file).
+- HANDOFF §7's binary sizes were from 2026-07-19, 33 minor versions stale.
+- **CLAUDE.md says `\\?\` long paths are "unimplemented — there is not one `\\?\` in the tree".**
+  They are implemented (`platform/path.odin:189`, `wide_path`, used throughout `file.odin`). Not yet
+  corrected, because CLAUDE.md is Wyatt's file — flagged for him rather than edited.
+- `requested-features.md` is **missing its `## 2` heading**, so ~100 lines of UI-spec debt currently
+  read as though they sit under "Asked for directly by Wyatt".
+
+---
+
 ## From the v0.37.0 live pass (2026-08-01) — the preview half
 
 The table half of that pass shipped as v0.38.0 (HANDOFF §6be); two of the three below shipped as
