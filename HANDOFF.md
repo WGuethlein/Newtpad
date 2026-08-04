@@ -7852,6 +7852,45 @@ All three are now decided, by him:
    `Alt` revealing the bar and `☰` opening the same menus. Real chrome-layout work, since
    `CHROME_TOP` changes when the bar is hidden and every y below it reads that.
 
+## 6cm. The status-bar seam (2026-08-04, v0.73.0, branch `feat/status-seam`)
+
+First half of Wyatt's "fix the mismatch first, then add the cells". **The data-loss path is closed.**
+
+The bar dropped right-hand cells that would collide with the left group, and did it *after*
+`status_cells` returned, in `main.odin`. `status_cell_at` called the same `status_cells` and walked
+everything it got — so on a narrow window a cell was **invisible and still clickable**, and a click
+where the `LF` cell had been dispatched `.Eol_CRLF`: a whole-buffer rewrite from a click on blank
+space. The drop is inside `status_cells` now, so what it returns is what is drawn *and* what is
+hit-tested.
+
+**The plan in `2026-08-04-status-bar-plan.md` assumed worse than reality.** It called for measuring
+the left group once per frame and threading it through App state, because the draw built that string
+inline from state the hit-test lacks. Extracting `status_left_text` showed it needs only `doc` and
+`text` — both of which the hit-test's caller already holds. No frame-loop state. Worth remembering
+that a plan written from a read is a hypothesis: check its premise before paying its price.
+
+### A test that encoded the bug as intent
+
+The assertion this replaced read: *"status_cells itself does not drop — the caller does, so the
+geometry stays one thing."* Backwards — the caller dropping is precisely what made the geometry two
+things. **And it passed vacuously**, because on a clean empty document the left group is short enough
+that nothing drops at 420 either. A test can name a defect as a design goal and stay green for
+months; this one did.
+
+The replacement uses a long left group (`recovered` adds a 55-character warning — the realistic case,
+since the bar is widest exactly when something is wrong) and asserts that every cell a wide window
+drops is unclickable at the narrow width, at the x it used to occupy.
+
+**What it cannot catch, stated in the code:** the leak assertion goes vacuous under the same sabotage
+that fails the primary one, and neither can see the *draw* — re-add a post-filter in `main.odin` and
+both still pass. That wants the draw reporting what it drew, `drawcount`-style. **Owed.**
+
+### Still owed on this surface
+
+The mockup's three cells — `42.1 KB`, the language cell, `Tab 4` — are **not** added yet. Note before
+starting: `status_cells` takes a `[4]Status_Cell` buffer at every call site, and three more cells
+overflow it. Grow it and check every caller, or the new cells vanish silently.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
