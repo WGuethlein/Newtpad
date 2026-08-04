@@ -1,6 +1,14 @@
 // Layer: program — the menu bar: a row below the tab strip holding File / Edit /
-// View and a right-aligned settings gear, matching Windows 11 Notepad's chrome
-// (which also has no Format or Help menu — Word Wrap lives in View).
+// View, ending in a right-aligned `│ Commands  Ctrl+P`.
+//
+// That right-hand slot held a settings gear until 2026-08-04, on the argument
+// that it matched Windows 11 Notepad's chrome. UI spec §4's mockup puts the
+// palette entry point there instead and shows no gear anywhere, and Wyatt chose
+// the mockup — Settings is still one row down in View, and the palette is the
+// thing worth a permanent, labelled affordance. Recorded because it reverses a
+// deliberate decision rather than fixing an oversight.
+//
+// Newtpad has no Format or Help menu either — Word Wrap lives in View.
 //
 // It is a discoverability surface, not a second command system: every item names
 // a Command_Id and dispatches through command_dispatch, so behaviour lives in one
@@ -62,7 +70,6 @@ MENU_MAX_ROWS :: f32(12)
 // removed itself; this is the control it was blocking.
 MENU_SCROLLBAR_W_96 :: f32(8)
 MENU_SCROLLBAR_LANE_96 :: f32(12)
-GEAR_W_96 :: f32(34) // settings gear hit box (wider than the glyph, so it's clickable)
 MENU_BAR_H := MENU_BAR_H_96
 MENU_ITEM_H := MENU_ITEM_H_96
 MENU_PAD := MENU_PAD_96
@@ -956,13 +963,10 @@ menu_hit_test :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window, w, h: f32) ->
 	mx, my := f32(win.mouse_x), f32(win.mouse_y)
 
 	if my >= TAB_STRIP_H && my < TAB_STRIP_H + MENU_BAR_H {
-		gx := w - SCROLLBAR_W - sx(GEAR_W_96)
-		if mx >= gx && mx < gx + sx(GEAR_W_96) {
+		if cmd := menu_bar_command_at(t, w, mx); cmd != .None {
 			menu_close(app)
 			consume_click(win)
-			// Always "open": it activates the existing Settings tab if there is
-			// one, so the gear is a destination, not a toggle.
-			return .Settings_Open, true
+			return cmd, true
 		}
 		if i := menu_title_at(t, mx); i >= 0 {
 			if app.menu.open == i {menu_close(app)} else {menu_open_at(app, i)}
@@ -1259,6 +1263,62 @@ menu_title_at :: proc(t: ^plat.Text, mx: f32) -> int {
 	return -1
 }
 
+// The bar's right-hand `Commands  Ctrl+P` item, as a box with its label and its
+// chord already placed. UI spec §4's mockup ends the bar with
+// `File Edit View Encoding Help │ Commands Ctrl+P`; this replaces the settings
+// gear that used to sit in that spot.
+//
+// ONE geometry, consumed by the draw, the hit-test AND the hover fill. The gear
+// got away with computing its box in two places -- menu_hit_test and menu_draw
+// held the same `width - SCROLLBAR_W - sx(GEAR_W_96)` arithmetic -- purely
+// because its width was a CONSTANT, so the two copies could not drift. This
+// item's width comes from a measured label plus a chord read out of the keymap,
+// which means two sites would become two answers the first time either changes,
+// and a click would land on a box the user cannot see. That is HANDOFF §6j's
+// bug class, and CLAUDE.md's one-layout-per-widget rule is the countermeasure.
+//
+// ok=false when the bar is too narrow to hold the item clear of the last title:
+// DROPPED, not clipped and not overlapped. Same call find_actions makes on the
+// replace row, for the same reason -- a control sitting half under the Help
+// menu is one the user can see and cannot press.
+Menu_Bar_Command :: struct {
+	x, y, w, h: f32, // the box: hover fill and hit-test both read exactly this
+	sep_x:      f32, // the 1px separator standing in the gap to its left
+	tx, ty:     f32, // label origin; ty is the baseline, shared with the chord
+	cx:         f32, // chord origin
+	label:      string,
+	chord:      string,
+}
+
+menu_bar_command :: proc(t: ^plat.Text, width: f32) -> (out: Menu_Bar_Command, ok: bool) {
+	out.label = "Commands"
+	out.chord = command_chord(.Palette_Open)
+	lw := f32(len(out.label)) * plat.text_char_width(t, UI_PX)
+	chw := f32(len(out.chord)) * plat.text_char_width(t, UI_SMALL_PX)
+	pad := sx(10) // UI spec 2: menu item padding 0 10
+	gap := sx(8)
+	out.w = pad + lw + gap + chw + pad
+	out.h = sx(22) // UI spec 2: menu item 22 tall
+	out.x = width - SCROLLBAR_W - out.w
+	out.y = TAB_STRIP_H + (MENU_BAR_H - out.h) * 0.5
+	out.tx = out.x + pad
+	out.ty = TAB_STRIP_H + MENU_BAR_H - sx(8) // the bar's shared baseline
+	out.cx = out.tx + lw + gap
+	out.sep_x = out.x - sx(7)
+	_, last_title_right := menu_title_rect(t, len(menus) - 1)
+	if out.sep_x <= last_title_right + sx(6) {return {}, false}
+	return out, true
+}
+
+// The box a click at mx landed on, as a command. Reads menu_bar_command -- it
+// does not re-derive the box.
+menu_bar_command_at :: proc(t: ^plat.Text, width, mx: f32) -> Command_Id {
+	c, ok := menu_bar_command(t, width)
+	if !ok {return .None}
+	if mx >= c.x && mx < c.x + c.w {return .Palette_Open}
+	return .None
+}
+
 // The open dropdown's rows: a bar dropdown's own Menu.items, or ctx_items for
 // a context menu. Every draw/hit-test/scroll proc below reads through here
 // instead of indexing `menus` by the open index directly, so a context menu is
@@ -1310,19 +1370,18 @@ menu_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, app: ^
 		}
 	}
 
-	// Settings gear, right-aligned and clear of the scrollbar gutter. Drawn
-	// larger than the menu text: at UI_PX the glyph reads as a speck rather than
-	// a button, and it is the only icon-only control in the bar.
-	gw := sx(GEAR_W_96)
-	gx := width - SCROLLBAR_W - gw
-	if in_bar && f32(cx) >= gx && f32(cx) < gx + gw {
-		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {gx, TAB_STRIP_H}, size = {gw, MENU_BAR_H}, color = g_theme[.Bg_Hover]}})
+	// The right-hand `│ Commands  Ctrl+P`, UI spec §4. Every coordinate below
+	// comes out of menu_bar_command -- the box, the separator, the label origin,
+	// the chord origin -- and menu_bar_command_at answers the click against the
+	// same call. Nothing here computes a coordinate of its own.
+	if c, ok := menu_bar_command(t, width); ok {
+		if in_bar && f32(cx) >= c.x && f32(cx) < c.x + c.w {
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {c.x, c.y}, size = {c.w, c.h}, color = g_theme[.Bg_Hover], radius = {RADIUS_MENU_BAR_ITEM, RADIUS_MENU_BAR_ITEM, RADIUS_MENU_BAR_ITEM, RADIUS_MENU_BAR_ITEM}}})
+		}
+		plat.quads_draw(gfx, qp, []plat.Quad{{pos = {c.sep_x, TAB_STRIP_H + (MENU_BAR_H - sx(16)) * 0.5}, size = {hairline(), sx(16)}, color = g_theme[.Border_Subtle]}})
+		plat.text_draw(gfx, t, c.label, c.tx, c.ty, UI_PX, g_theme[.Text_Secondary])
+		plat.text_draw(gfx, t, c.chord, c.cx, c.ty, UI_SMALL_PX, g_theme[.Text_Muted])
 	}
-	gpx := UI_PX * 1.35
-	gcw := plat.text_char_width(t, gpx)
-	on_settings := false
-	if d := app_active(app); d != nil {on_settings = d.kind == .Settings}
-	plat.text_draw(gfx, t, "⚙", gx + (gw - gcw) * 0.5, base_y + sx(2), gpx, g_theme[.Success] if on_settings else g_theme[.Text_Primary])
 
 	if !menu_dropdown_active(app) {return}
 	menu_draw_dropdown(gfx, qp, t, app, width, height)

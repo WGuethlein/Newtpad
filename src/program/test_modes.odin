@@ -11667,6 +11667,54 @@ when NEWTPAD_TESTS {
 			bad += ro_menu_case(true, .Off, "table view")
 			bad += ro_menu_case(false, .Preview, "Preview")
 
+			// --- the bar's Commands item: drawn box == clickable box ------------
+			// THE SEAM, not the unit. menu_bar_command is the only producer of this
+			// box; the draw fills it, menu_bar_command_at answers the click, and
+			// this compares the two at boundary widths. The gear it replaced could
+			// hold its box in two places safely because GEAR_W_96 was a constant --
+			// this item is measured, so the moment the draw or the hit-test grows
+			// its own arithmetic they diverge and a click lands on nothing.
+			//
+			// The narrow widths matter more than the wide ones: the item must be
+			// DROPPED whole rather than clipped or slid under the Help menu.
+			{
+				fmt.println("--- the bar's Commands item: one geometry ---")
+				bar_chk :: proc(bad: ^int, cond: bool, msg: string) {
+					fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+					if !cond {bad^ += 1}
+				}
+				_, last_title := menu_title_rect(&t, len(menus) - 1)
+				for W in ([]f32{1920, 1280, 900, 700, 560, 460, 360, 318}) {
+					c, ok := menu_bar_command(&t, W)
+					if !ok {
+						// Dropped: nothing anywhere on the row may answer for it.
+						hits := 0
+						for x := f32(0); x < W; x += 4 {
+							if menu_bar_command_at(&t, W, x) != .None {hits += 1}
+						}
+						bar_chk(&bad, hits == 0, fmt.tprintf("w=%4.0f dropped, and no x on the row is clickable (got %d)", W, hits))
+						continue
+					}
+					// Every edge of the drawn box, against the hit-test.
+					inside_l := menu_bar_command_at(&t, W, c.x) == .Palette_Open
+					inside_r := menu_bar_command_at(&t, W, c.x + c.w - 1) == .Palette_Open
+					outside_l := menu_bar_command_at(&t, W, c.x - 1) == .None
+					outside_r := menu_bar_command_at(&t, W, c.x + c.w) == .None
+					bar_chk(&bad, inside_l && inside_r, fmt.tprintf("w=%4.0f both drawn edges are clickable (l=%v r=%v)", W, inside_l, inside_r))
+					bar_chk(&bad, outside_l && outside_r, fmt.tprintf("w=%4.0f neither pixel outside it is (l=%v r=%v)", W, outside_l, outside_r))
+					// The label and chord must sit inside the box that was filled,
+					// or the hover highlights one thing and the text is another.
+					bar_chk(&bad, c.tx >= c.x && c.cx + f32(len(c.chord)) * plat.text_char_width(&t, UI_SMALL_PX) <= c.x + c.w, fmt.tprintf("w=%4.0f label and chord are inside the box", W))
+					// Clear of the titles, separator lane included.
+					bar_chk(&bad, c.sep_x > last_title, fmt.tprintf("w=%4.0f clear of the last title (sep=%.0f > %.0f)", W, c.sep_x, last_title))
+				}
+				// It must actually drop somewhere in that range, or the loop above
+				// proved nothing about the narrow case.
+				_, wide_ok := menu_bar_command(&t, 1920)
+				_, narrow_ok := menu_bar_command(&t, 318)
+				bar_chk(&bad, wide_ok && !narrow_ok, fmt.tprintf("present at 1920 and dropped at 318 (%v / %v) -- else the drop case is untested", wide_ok, narrow_ok))
+			}
+
 			// Non-zero exit, for the reason keytest grew one: a mode that only ever
 			// prints its verdict is a mode whose verdict a sweep can miss.
 			mode_done("menutest", bad)
