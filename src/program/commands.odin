@@ -263,9 +263,20 @@ command_table := [Command_Id]Command {
 	// file) and, for dedupe, that the match is exact -- `Foo` and `foo` are two
 	// different lines, even though the SORT compares case-insensitively. The
 	// palette shows the title and nothing else, so anything not in it is not said.
-	.Sort_Lines               = {"Sort Lines (selection, or whole file)", "Edit"},
-	.Sort_Lines_Desc          = {"Sort Lines Descending (selection, or whole file)", "Edit"},
-	.Remove_Duplicate_Lines   = {"Remove Duplicate Lines (exact match, keeps the first)", "Edit"},
+	// The parenthetical qualifiers these three used to carry -- "(selection, or
+	// whole file)" twice and "(exact match, keeps the first)" -- were affordable
+	// while the palette was their only route. They are not affordable as MENU rows:
+	// dropdown_w sizes a panel from its widest label, and 53 characters of
+	// "Remove Duplicate Lines (exact match, keeps the first)" made the Edit menu
+	// wider than the whole menu bar. They also set the palette's width floor at
+	// ~700px, which is why it is 720 against ui-spec 7's 560.
+	//
+	// The behaviour they described is not lost: it is in features.md, and the case
+	// that actually needs saying at the moment of choosing -- the 16 MB / 1,000,000
+	// line refusal -- is what command_disabled_hint puts in the accelerator column.
+	.Sort_Lines               = {"Sort Lines", "Edit"},
+	.Sort_Lines_Desc          = {"Sort Lines Descending", "Edit"},
+	.Remove_Duplicate_Lines   = {"Remove Duplicate Lines", "Edit"},
 	.Format_Document          = {"Format Document", "Edit"},
 	.Table_Sort_Asc           = {"Sort Ascending", "Table"},
 	.Table_Sort_Desc          = {"Sort Descending", "Table"},
@@ -971,12 +982,16 @@ block_edit_note :: proc(app: ^App) {
 // written out because BLOCK_EDIT_MAX_LINES has already moved once and a literal
 // would have gone stale silently.
 //
-// The .Unchanged note is not decoration. All three commands are palette-only, so
-// the user has just typed a name and pressed Enter; with nothing to do and
-// nothing said, the command reads as broken -- the same argument
+// The .Unchanged note is not decoration. The user has just picked these by name
+// -- from the palette, or from Edit's text-operations group -- so with nothing to
+// do and nothing said, the command reads as broken; the same argument
 // .Bookmark_Cycle's "[NO BOOKMARKS]" makes. And .Unchanged specifically means NO
 // undo entry was pushed (doc_sort_lines returns before doc_batch_begin), so
 // there is not even a history row to notice.
+//
+// (This note used to say "all three commands are palette-only". They stopped
+// being palette-only when they got menu rows, per ui-spec 7's "every command in
+// it is also in a menu" -- the argument survives the change, the premise did not.)
 @(private = "file")
 sort_lines_dispatch :: proc(app: ^App, doc: ^Document, mode: Sort_Mode) {
 	// Name the command the user actually ran. A single shared "[SORT ...]" told

@@ -11367,6 +11367,39 @@ when NEWTPAD_TESTS {
 					if !ok {bad += 1}
 					fmt.printfln("  %-6s %s dropdown %.0f fits its widest row (%q needs %.0f)", "ok" if ok else "FAIL", m.title, w, worst, need)
 				}
+				// THE CHECK GUTTER IS CONDITIONAL. UI spec 6.1: 26px "reserved on
+				// every row of a menu that contains any checkable item, and none on
+				// menus that do not". The draw used to indent every row of every menu
+				// by a hardcoded 28px, so File and Help -- which have no checkable row
+				// between them -- paid for a column nothing could ever draw into.
+				//
+				// Asserted through menu_gutter because that is the ONE producer the
+				// width budget and the draw both read; checking a literal here would
+				// be a third opinion about the same number.
+				{
+					want := sx(MENU_CHECK_GUTTER_96)
+					for m in drops {
+						any_check := false
+						for it in m.items {
+							if it.checked != nil {any_check = true;break}
+						}
+						g := menu_gutter(m.items)
+						exp := want if any_check else f32(0)
+						okg := g == exp
+						if !okg {bad += 1}
+						fmt.printfln("  %-6s %s reserves %.0f of check gutter (want %.0f; has a checkable row: %v)", "ok" if okg else "FAIL", m.title, g, exp, any_check)
+					}
+					// The precondition, or the loop above proves nothing: the menu bar
+					// has to contain at least one of each kind for the two branches to
+					// both be exercised.
+					nwith, nwithout := 0, 0
+					for m in drops {
+						if menu_gutter(m.items) > 0 {nwith += 1} else {nwithout += 1}
+					}
+					okb := nwith > 0 && nwithout > 0
+					if !okb {bad += 1}
+					fmt.printfln("  %-6s both gutter branches are covered: %d menus with, %d without", "ok" if okb else "FAIL", nwith, nwithout)
+				}
 				// And the reasons are actually reachable: a .md file cannot enter
 				// table view, so that row must be disabled AND say why.
 				a: App
@@ -27340,6 +27373,46 @@ when NEWTPAD_TESTS {
 			mk(&a, "config.json")
 			mk(&a, "readme.md")
 
+			// THE POINTER CANNOT MOVE THE KEYBOARD CURSOR.
+			//
+			// palette_hover runs EVERY FRAME off the live cursor, and it used to
+			// write `selected` directly -- so a pointer resting anywhere over the
+			// list overwrote the arrow keys before the next frame drew them, and
+			// Enter ran whatever the mouse was lying on rather than what the user
+			// had stepped to. Split into `selected` (keyboard, authoritative) and
+			// `hover` (pointer, visual only) on 2026-08-04.
+			//
+			// Asserted on the FIELDS rather than through palette_hover, which needs a
+			// real window to read the live cursor: what palette_hover does now is
+			// assign to `hover`, and the property that matters is that nothing
+			// downstream of `hover` can reach `selected`.
+			{
+				palette_open(&a)
+				for r in ">" {palette_input_rune(&a, r)}
+				if len(a.palette.results) >= 3 {
+					palette_move(&a, 2) // keyboard: step to row 2
+					want := a.palette.selected
+					a.palette.hover = 0 // pointer lands on row 0, repeatedly
+					a.palette.hover = 0
+					okk := a.palette.selected == want && want == 2
+					if !okk {bad += 1}
+					fmt.printfln("  %-6s hover does not move the keyboard cursor: selected=%d (want %d), hover=%d", "ok" if okk else "FAIL", a.palette.selected, want, a.palette.hover)
+					// And what Enter would run is the KEYBOARD row, not the hovered one.
+					oke := a.palette.results[a.palette.selected].cmd != a.palette.results[a.palette.hover].cmd
+					if !oke {bad += 1}
+					fmt.printfln("  %-6s Enter targets the keyboard row (%v), not the hovered one (%v)", "ok" if oke else "FAIL", a.palette.results[a.palette.selected].cmd, a.palette.results[a.palette.hover].cmd)
+					// A query change drops the stale hover: the row set changes under it.
+					palette_input_rune(&a, 'z')
+					okh := a.palette.hover == -1
+					if !okh {bad += 1}
+					fmt.printfln("  %-6s a query change clears the stale hover: hover=%d", "ok" if okh else "FAIL", a.palette.hover)
+				} else {
+					bad += 1
+					fmt.println("  FAIL   fewer than 3 command results, so the hover/selection case proves nothing")
+				}
+				palette_close(&a)
+			}
+
 			palette_open(&a)
 			for r in "conf" {palette_input_rune(&a, r)}
 			top := a.palette.results[0].slot if len(a.palette.results) > 0 else -1
@@ -35045,10 +35118,43 @@ when NEWTPAD_TESTS {
 					sl_chk(bad, command_chord(cmd) == "", fmt.tprintf("%v has no default chord: %q", cmd, command_chord(cmd)))
 					sl_chk(bad, command_table[cmd].title != "" && command_table[cmd].category == "Edit", fmt.tprintf("%v is titled and filed under Edit: %q", cmd, command_table[cmd].title))
 				}
-				// The palette shows the title and nothing else, so the two things a
-				// user cannot otherwise know have to be in it.
-				sl_chk(bad, strings.contains(command_table[.Sort_Lines].title, "selection"), fmt.tprintf("the sort title states its scope: %q", command_table[.Sort_Lines].title))
-				sl_chk(bad, strings.contains(command_table[.Remove_Duplicate_Lines].title, "exact"), fmt.tprintf("the dedupe title states that the match is exact: %q", command_table[.Remove_Duplicate_Lines].title))
+				// SCOPE IS STILL STATED -- dynamically now, not in the static title.
+				//
+				// This check used to require the words "selection" and "exact" inside
+				// the titles themselves, and it was right to: the palette showed the
+				// title and nothing else, and these three had no other route. Both
+				// premises changed on 2026-08-04 -- they have menu rows now (ui-spec 7,
+				// "every command in it is also in a menu"), and the menu row's label is
+				// generated by menu_item_label, which appends "(Selection)" when there
+				// is one. The static titles came down from 37-53 characters to 10-22,
+				// which is what let the palette meet ui-spec 7's 560px width at all.
+				//
+				// So the assertion moved rather than weakened: it now checks the thing
+				// the user actually reads, and it checks BOTH states, which the old
+				// one could not -- a static title saying "selection, or whole file"
+				// never told you which of the two you were about to get.
+				{
+					// Built through app_add/app_activate rather than by assigning
+					// a.docs[0] directly: the direct form skips what app_add sets up
+					// and the first menu_item_label call traps on a bounds check.
+					// Heap-boxed for the reason every Document in this file is --
+					// test_mode_dispatch's frame is already large.
+					sd := new(Document)
+					sd^ = doc_from_content(transmute([]u8)strings.clone("b\na\nb\n"), "scope.txt", .UTF8)
+					sa: App
+					app_add(&sa, sd)
+					app_activate(&sa, 0)
+					defer {doc_close(sd);free(sd)}
+					for cmd in ([]Command_Id{.Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines}) {
+						it := Menu_Item{cmd = cmd}
+						sd.anchor, sd.cursor = 0, 0 // no selection
+						whole := menu_item_label(&sa, it)
+						sl_chk(bad, whole == "", fmt.tprintf("%v with no selection shows its plain title: %q", cmd, whole))
+						sd.anchor, sd.cursor = 0, 3 // a selection
+						sel := menu_item_label(&sa, it)
+						sl_chk(bad, strings.contains(sel, "Selection"), fmt.tprintf("%v with a selection says so: %q", cmd, sel))
+					}
+				}
 			}
 			// --- a faulted region read is refused, never written back ------------------
 			//
