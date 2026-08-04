@@ -236,6 +236,11 @@ documents had been carrying: CLAUDE.md ranked the UI overhaul and the `renderer`
 priority 2, while HANDOFF §6aa had moved them to V2 as V2's first item. **CLAUDE.md's ranking is the
 live one. The UI rework is a V1 gate, not a V2 opener.**
 
+**START AT [ui-spec-gaps/README.md](ui-spec-gaps/README.md)** — state per surface as of v0.73.0, the
+reading order, and the next action. The rest of this section predates the discovery that the spec's
+*mockups* live in `newtpad-ui-spec-v1.html` and had never been read; treat any "done" claim below as
+meaning "the prose rules are met", which is a smaller thing.
+
 **The menu gap is now enumerated: [ui-spec-gaps/2026-08-04-menus.md](ui-spec-gaps/2026-08-04-menus.md)**
 — all 14 of §6's requirements checked against `menu.odin` line by line. **5 built, 3 partial, 6
 missing**, with a suggested order. The shape of it: the *content* rules are largely done and the

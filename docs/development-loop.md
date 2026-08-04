@@ -375,6 +375,13 @@ Each of these cost real time at least once.
 
 ## 7. Where to look first in a new session
 
+**As of 2026-08-04 the live work is the UI rework, which is now a V1 gate. Start at
+[docs/ui-spec-gaps/README.md](ui-spec-gaps/README.md)** — it carries the state per surface, the
+reading order for the four analysis files, the next action, and the three traps this work has already
+hit. Then HANDOFF §6cg–§6cm for how it got there.
+
+Then the standing list:
+
 1. [HANDOFF.md](../HANDOFF.md) §6u — the batch plan and the decisions taken with Wyatt.
 2. HANDOFF.md's last `§6<letter>` — what shipped most recently and what it owes.
 3. HANDOFF.md §5 — the live debt register.

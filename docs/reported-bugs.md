@@ -64,8 +64,10 @@ Summarised by area; the reports carry each one.
 - **Save / session** (6) — unbounded `doc_absorb_append` read; a silent backup-write failure that
   loses unsaved edits at restore; BOM-less UTF-16 gaining a BOM on save; orphan-store deletion
   taking its backups with it. See [02-doc-session.md](audits/2026-08-04/02-doc-session.md).
-- **UI shell** (5) — the status bar drops right-hand cells from the *draw* but `status_cell_at`
-  still walks them, so a click on a narrow window fires `.Eol_CRLF`, a whole-buffer rewrite;
+- **UI shell** (5) — ~~the status bar drops right-hand cells from the *draw* but `status_cell_at`
+  still walks them, so a click on a narrow window fires `.Eol_CRLF`, a whole-buffer rewrite~~
+  **FIXED 2026-08-04, v0.73.0 (HANDOFF §6cm)** — the drop moved into `status_cells`, so drawn and
+  clickable are one geometry;
   `command_in_palette` excludes six commands where `command_needs_menu_target` names fourteen, so
   palette "Close Tab" closes the wrong tab; palette keyboard selection walks past the drawn rows;
   `palette_hover` overwrites keyboard selection every frame, making arrow keys inert. See

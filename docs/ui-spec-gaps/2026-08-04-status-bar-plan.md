@@ -1,7 +1,26 @@
 # The status-bar seam — diagnosis and the fix that follows
 
-Written 2026-08-04. **Diagnosed, not fixed.** Wyatt chose "fix the mismatch first, then add the
-mockup's cells"; this is the first half, worked out far enough to execute without re-deriving it.
+> ## ⚠ HALF DONE, AND THIS PLAN'S PREMISE WAS WRONG
+>
+> **The seam is FIXED (v0.73.0, HANDOFF §6cm).** The drop lives in `status_cells`, so what is drawn
+> and what is hit-tested are one geometry. The data-loss path is closed.
+>
+> **The "Why the obvious fix does not work" section below is wrong**, and it is left standing because
+> the mistake is the useful part. It argued the drop could not move into `status_cells` because the
+> left group's width came from state the hit-test lacks, and concluded the fix needed a per-frame
+> measurement threaded through `App`. Extracting `status_left_text` showed it needs only `doc` and
+> `text` — **both of which the hit-test's caller already holds.** No frame-loop state, no new App
+> field, about a third of the work this plan budgeted.
+>
+> **A plan written from reading is a hypothesis. Check its premise before paying its price.**
+>
+> What is still owed from this file: **"Only then, the mockup's cells"** at the bottom — that part
+> stands, including the `[4]Status_Cell` buffer warning. The test section is done and its assertions
+> shipped; note the recorded limit that neither can see the *draw*, so re-adding a post-filter in
+> `main.odin` would pass both.
+
+Written 2026-08-04. Wyatt chose "fix the mismatch first, then add the mockup's cells"; this was the
+first half, worked out far enough to execute without re-deriving it.
 
 ## The bug, exactly
 
