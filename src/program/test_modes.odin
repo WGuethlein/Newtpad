@@ -30784,28 +30784,78 @@ when NEWTPAD_TESTS {
 				// the wrong width and silently change which cells this block sees.
 				mt: plat.Text
 				plat.text_load_faces(&mt)
-				sbuf: [4]Status_Cell
-				cs := status_cells(&sd, &mt, W, cw, sbuf[:])
-				mt_chk(&bad, len(cs) == 2, fmt.tprintf("the right group has %d cells", len(cs)))
+				sbuf: [STATUS_CELL_MAX]Status_Cell
+				cs := status_cells(&sd, &mt, W, cw, &sbuf)
+				// Four now, UI spec 13's `Markdown · UTF-8 · LF · Tab 4`. Cells come
+				// back right-to-left, so cs[0] is the RIGHTMOST -- which is why the
+				// two assertions below identify cells by COMMAND rather than by
+				// index. They used to read cs[0] as the line-ending cell, which was
+				// true with two cells and silently became `Tab 4` with four; an
+				// index into a list whose length is the thing under test is a
+				// stale assertion waiting to happen.
+				mt_chk(&bad, len(cs) == 4, fmt.tprintf("the right group has %d cells (want 4)", len(cs)))
+				eol_cell :: proc(cs: []Status_Cell) -> (Status_Cell, bool) {
+					for c in cs {
+						if c.cmd == .Eol_LF || c.cmd == .Eol_CRLF {return c, true}
+					}
+					return {}, false
+				}
 				by := H - doc_bottom_bar_h(&sd) + doc_bottom_bar_h(&sd) * 0.5
 				hits := 0
 				for c in cs {
 					if status_cell_at(&sd, &mt, W, H, cw, c.x + c.w * 0.5, by) == c.cmd {hits += 1}
 				}
 				mt_chk(&bad, hits == len(cs), fmt.tprintf("every cell hit-tests to its own command (%d/%d)", hits, len(cs)))
-				// Cells must not overlap, or one swallows the other's clicks.
-				if len(cs) == 2 {
-					mt_chk(&bad, cs[1].x + cs[1].w <= cs[0].x, fmt.tprintf("cells do not overlap (%.0f <= %.0f)", cs[1].x + cs[1].w, cs[0].x))
+				// Cells must not overlap, or one swallows the other's clicks. Every
+				// adjacent pair, not just the first two.
+				{
+					laps := 0
+					for i in 1 ..< len(cs) {
+						if cs[i].x + cs[i].w > cs[i - 1].x {laps += 1}
+					}
+					mt_chk(&bad, laps == 0, fmt.tprintf("no two cells overlap (%d overlapping pair(s))", laps))
 				}
 				// Above the bar is not a cell -- the editor owns that pixel.
 				mt_chk(&bad, status_cell_at(&sd, &mt, W, H, cw, cs[0].x + 2, H - doc_bottom_bar_h(&sd) - 4) == .None, "a click above the bar is not a cell")
 				// The line-ending cell toggles TO the other value, so clicking it
 				// twice returns where it started rather than sticking.
 				sd.eol = .LF
-				c1 := status_cells(&sd, &mt, W, cw, sbuf[:])[0].cmd
+				e1, ok1 := eol_cell(status_cells(&sd, &mt, W, cw, &sbuf))
 				sd.eol = .CRLF
-				c2 := status_cells(&sd, &mt, W, cw, sbuf[:])[0].cmd
-				mt_chk(&bad, c1 != c2, fmt.tprintf("the line-ending cell offers the OTHER value (%v then %v)", c1, c2))
+				e2, ok2 := eol_cell(status_cells(&sd, &mt, W, cw, &sbuf))
+				mt_chk(&bad, ok1 && ok2 && e1.cmd != e2.cmd, fmt.tprintf("the line-ending cell offers the OTHER value (%v then %v)", e1.cmd, e2.cmd))
+				mt_chk(&bad, ok1 && e1.label == "LF" && ok2 && e2.label == "CRLF", fmt.tprintf("...and says which it currently is (%q then %q)", e1.label, e2.label))
+
+				// UI spec 5's drop ORDER, which this rewrite corrects: "Tab width ->
+				// LF -> UTF-8 -> language". The old code dropped the LEFTMOST cell
+				// first, i.e. the language, which is exactly backwards -- §5's own
+				// 700px mockup keeps `Markdown · UTF-8`. Pinned as a sequence of
+				// surviving sets rather than one width, because the widths at which
+				// each drop happens depend on the font and the left group.
+				{
+					sd.eol = .LF
+					seen: [dynamic]string
+					defer delete(seen)
+					last := -1
+					for wpx := 1600; wpx >= 320; wpx -= 4 {
+						cc := status_cells(&sd, &mt, f32(wpx), cw, &sbuf)
+						if len(cc) == last {continue}
+						last = len(cc)
+						// cs is right-to-left; the leftmost survivor is cc[len-1].
+						append(&seen, cc[len(cc) - 1].label if len(cc) > 0 else "-")
+					}
+					// However many steps it takes, the leftmost survivor is always
+					// the language cell until nothing is left at all.
+					lang := highlight_language_name(sd.path)
+					good := true
+					for s in seen {
+						if s != lang && s != "-" {good = false}
+					}
+					mt_chk(&bad, good, fmt.tprintf("the language cell is the last to go as the window narrows (leftmost seen: %v, language=%q)", seen[:], lang))
+					// And the rightmost cell -- Tab width -- is the first to go.
+					wide := status_cells(&sd, &mt, 1600, cw, &sbuf)
+					mt_chk(&bad, len(wide) == 4 && wide[0].cmd == .Settings_Open && wide[0].label[:3] == "Tab", fmt.tprintf("Tab width is the rightmost cell, so it drops first (%q)", wide[0].label if len(wide) > 0 else ""))
+				}
 
 				// Cells never collide with the left group, at any width. The
 				// window has a floor, but between the floor and a comfortable
@@ -30817,7 +30867,7 @@ when NEWTPAD_TESTS {
 					worst := f32(-1)
 					for wpx := 320; wpx <= 1600; wpx += 7 {
 						W2 := f32(wpx)
-						cc := status_cells(&sd, &mt, W2, cw, sbuf[:])
+						cc := status_cells(&sd, &mt, W2, cw, &sbuf)
 						need := sx(12) + left_w + sx(24)
 						for len(cc) > 0 && cc[len(cc) - 1].x < need {cc = cc[:len(cc) - 1]}
 						// Whatever survives must start clear of the left group.
@@ -30845,8 +30895,8 @@ when NEWTPAD_TESTS {
 					// the bar is widest exactly when something has gone wrong.
 					sd.recovered = true
 					defer sd.recovered = false
-					narrow := status_cells(&sd, &mt, 420, cw, sbuf[:])
-					wide := status_cells(&sd, &mt, 1600, cw, sbuf[:])
+					narrow := status_cells(&sd, &mt, 420, cw, &sbuf)
+					wide := status_cells(&sd, &mt, 1600, cw, &sbuf)
 					mt_chk(&bad, len(wide) > len(narrow), fmt.tprintf("a narrow window drops cells the wide one keeps (%d narrow vs %d wide)", len(narrow), len(wide)))
 					// The precondition, or everything below is about an empty list.
 					mt_chk(&bad, len(wide) > 0, fmt.tprintf("the wide window has cells at all (%d)", len(wide)))
