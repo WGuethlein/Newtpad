@@ -7801,6 +7801,57 @@ hit-test and the hover before any of it is drawn, or it will reproduce the class
 Then the status bar (above), the font screen (breadcrumb, bracketed right-aligned values, a
 `Ligatures` row, a syntax-highlighted preview sample), and the menu's missing `Show Menu Bar` row.
 
+## 6cl. The font screen, and three decisions taken properly (2026-08-04, v0.72.0, branch `feat/visual-spec-2`)
+
+Second pass under the mockup-wins rule (§6ck). **The font screen now matches §11.1**: a
+`Settings › Editor font` breadcrumb instead of a bare title (with `Esc goes back` to match the trail
+it now promises), values right-aligned and bracketed by their chevrons instead of floating mid-row
+with the arrows stranded 260px away, `PREVIEW`, and the mockup's syntax-coloured code sample.
+
+The sample is coloured by the **real** json lexer through the **real** `Token_Kind → Color_Role`
+map, so it cannot drift from what the editor draws for the same bytes. That map was file-private in
+`highlight.odin` and is now reachable through `token_kind_role`; the table itself stays private, so
+it keeps one definition.
+
+### A test that would have gone on passing
+
+The sample's first test carried **its own copy of the sample string**. Two copies of one literal,
+free to drift, and the test would have kept passing while the page drew something else — found only
+because the sabotage failed to fail. The sample is `FONT_PREVIEW_SAMPLE` at package scope now and the
+test reads the bytes the page draws.
+
+The assertion checks token **kinds by name**, not a token count, because the failure it guards is
+silent: if the lexer stops claiming these bytes the sample still renders, just flat, and nothing
+looks broken. The sabotage proves the point — stripping the quotes gives `5 tokens, json_key=false
+string=false`, which a count-based check would have passed.
+
+**No seam test, deliberately:** the font page is keyboard-only and has no hit-test, so there is no
+draw-versus-click divergence to hold. If it ever gains mouse rows it needs a `*_layout()` producer
+first — the draw computes its coordinates inline today.
+
+### Process: blockers are questions, not prose
+
+**Wyatt, 2026-08-04: *"if it has a blocker, ask me the question, don't keep it hidden in prose."***
+
+§6ck wrote three blockers into `visual-gaps.md` and moved on, and he had to ask why three of four
+surfaces were unbuilt. A blocker written into a doc is a blocker he finds later or never; it looks
+like diligence and functions as a decision made silently on his behalf. **Ask first, record the
+answer second — the doc entry is the minutes, not the mechanism.**
+
+All three are now decided, by him:
+
+1. **Status bar — fix the draw/hit-test mismatch FIRST, then add the mockup's cells.** The bar drops
+   right-hand cells from the draw on a narrow window while `status_cell_at` walks all of them, so a
+   click can fire `.Eol_CRLF` and rewrite the buffer. The drop order becomes one producer read by
+   both, with a seam test at narrow widths, before `42.1 KB` / language / `Tab 4` are added.
+2. **Find bar — build the button primitive properly first.** Spec, then one `*_layout()` producer
+   feeding draw + hit-test + hover, with seam tests, then the find bar on top. It is the foundation
+   the find bar, the status cells and every future control sit on, and the piece that stops §6j's
+   seam-bug class repeating.
+3. **`Show Menu Bar` — build the feature**, not just the row: a Settings toggle plus hide/reveal, with
+   `Alt` revealing the bar and `☰` opening the same menus. Real chrome-layout work, since
+   `CHROME_TOP` changes when the bar is hidden and every y below it reads that.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the

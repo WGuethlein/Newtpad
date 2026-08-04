@@ -385,6 +385,12 @@ highlight_lexer_for :: proc(path: string) -> (lexer: Lexer_Proc, stateful: bool,
 // because the array is total over the whole enum, but it never actually
 // reaches g_theme[...] — highlight_row_spans filters `.None` out before this
 // map is consulted — so its value here is unreachable, not meaningful.
+// The mapping, for callers outside this file. The table stays file-private so it
+// keeps exactly one definition -- the font page draws a syntax-coloured sample and
+// needs the same answer the editor gives, and a second copy of nine rows is a
+// second thing to forget when a Token_Kind is added.
+token_kind_role :: proc(k: base.Token_Kind) -> Color_Role {return TOKEN_KIND_ROLE[k]}
+
 @(private = "file")
 TOKEN_KIND_ROLE := [base.Token_Kind]Color_Role {
 	.None     = .Syn_Punct, // unreachable -- see comment above
