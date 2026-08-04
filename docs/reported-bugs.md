@@ -38,10 +38,12 @@ why each one needs its own failing test before anyone believes the fix.
 | **HIGH** — whole-word search accepts `cat` inside `cats` at every 256 KB block edge | `program/find.odin:771,792` | Block overlap was `len(q)-1` — enough to *find* the last candidate, one byte short of *judging* it, so `after` defaulted to 0 and read as a word boundary |
 | **HIGH** — a find match spanning two visual rows is highlighted on the first row only | `program/find.odin:1661` | Emitted one rect per match and advanced; now emits per row the match touches, which is the range rule `doc_selection_rects` already uses on the same iterator |
 
-**Owed on all five: a test that fails without the fix.** None of them is observed by any existing
-mode — that is how they got here — so per CLAUDE.md they are fixed-but-unproven until each has a
-sabotage-verified case. Do not let that sit; "the glyph atlas grew only in the commit message" is
-the entry in this project's history that this rule exists because of.
+~~**Owed on all five: a test that fails without the fix.**~~ **PAID 2026-08-04 (v0.69.0, HANDOFF
+§6ci).** All five now have a sabotage-verified case. Writing them found a **sixth defect on the same
+path**: `clipboard_set_text` called `EmptyClipboard()` before attempting the conversion, so a copy it
+could not perform destroyed what the user already had. Also worth knowing — the whole-word fixture
+took **four attempts and the first three passed while proving nothing**; §6ci records all three
+mistakes, because each is easy to repeat.
 
 ### CRITICAL, still open
 
