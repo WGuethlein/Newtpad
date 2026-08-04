@@ -374,6 +374,23 @@ filter_value_on :: proc(app: ^App, it: Menu_Item) -> bool {
 // draw asks this for every row and gets "" for an ordinary one, which is what
 // keeps the generated rows inside the same draw rather than beside it.
 menu_item_label :: proc(app: ^App, it: Menu_Item) -> string {
+	// The three text operations say WHICH LINES they will act on, live. They act
+	// on the selection expanded to whole lines, or on the whole document when
+	// there is no selection -- and a user cannot know which from a bare verb.
+	//
+	// This replaces stating the scope in the static title ("Sort Lines (selection,
+	// or whole file)"), which sortlinestest rightly required while the palette was
+	// the only route and the title was the only text. Those titles were 37-53
+	// characters, which set the palette's width floor at ~700px against ui-spec 7's
+	// 560 and would have made this menu wider than the whole menu bar. Saying it
+	// dynamically is strictly more informative than saying it statically -- the row
+	// now names the case you are actually in rather than listing both.
+	#partial switch it.cmd {
+	case .Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines:
+		d := app_active(app)
+		if d == nil || !doc_has_sel(d) {return ""} // whole document: the plain title
+		return fmt.tprintf("%s (Selection)", command_table[it.cmd].title)
+	}
 	if it.cmd != .Table_Filter_Toggle {return ""}
 	d := app_active(app)
 	if d == nil {return ""}
@@ -396,6 +413,12 @@ menus := []Menu {
 		[]Menu_Item {
 			{cmd = .Tab_New},
 			{cmd = .Tab_Open},
+			// Palette-only until 2026-08-04, for the reason the text operations in
+			// Edit were (ui-spec 7). It belongs here rather than with them because
+			// it is not a text operation -- it does not touch the buffer; it opens
+			// what the caret's line points at, which is this menu's subject and its
+			// declared category. Sits with Open File for the same reason.
+			{cmd = .Open_Link, enabled = has_doc},
 			sep,
 			// Both are dead on the Settings and Font pseudo-tabs, but not from
 			// here: `enabled` says only "there is a document". The kind rule is
@@ -460,6 +483,29 @@ menus := []Menu {
 			{cmd = .Find_Replace_All, enabled = has_doc},
 			{cmd = .Goto_Line, enabled = has_doc},
 			sep,
+			// Text operations. These three were palette-only until 2026-08-04,
+			// against ui-spec 7's "every command in it is also in a menu -- the
+			// palette is a faster route, never the only route", and nothing in the
+			// product surfaced them: someone who did not already know the names
+			// could not find them at all.
+			//
+			// They join Format Document rather than forming a group of their own,
+			// which is what makes this exactly FOUR rows and keeps ui-spec 6's
+			// "nothing longer than four rows". The grouping is honest as well as
+			// convenient -- all four rewrite the whole document (or the selection
+			// expanded to whole lines) in one undoable batch, which is the property
+			// that separates them from the editing rows above.
+			//
+			// Deliberately NOT a submenu. Menu_Item has no `sub` field and nothing
+			// here opens a second dropdown from a row, so Edit > Text would have
+			// been Newtpad's first nested widget -- child placement, its own flip,
+			// its own hit-test, hover-to-open and arrow traversal, every one a new
+			// producer of a coordinate in the file whose own comments call six
+			// consumers of one coordinate the shape of every seam bug here. A flat
+			// group satisfies the spec line for one line of data.
+			{cmd = .Sort_Lines, enabled = has_doc},
+			{cmd = .Sort_Lines_Desc, enabled = has_doc},
+			{cmd = .Remove_Duplicate_Lines, enabled = has_doc},
 			// Live on any text document, not just a .json: the request was
 			// illustrated with a .log file, and an extension gate excluded it. See
 			// doc_can_json. Pressing it on something that is not JSON says so and
