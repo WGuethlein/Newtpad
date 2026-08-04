@@ -350,6 +350,7 @@ menu_filter_requery :: proc(app: ^App) {
 	app.menu.top = 0
 	app.menu.item_scrolled = -2 // the row set changed under it: let the draw resolve once
 	app.menu.item = -1
+	app.menu.hover = -1 // an index into the OLD row set points at a different row now
 	for it, i in items {
 		if item_enabled(app, it) {
 			app.menu.item = i
@@ -403,6 +404,14 @@ menu_item_label :: proc(app: ^App, it: Menu_Item) -> string {
 	// 560 and would have made this menu wider than the whole menu bar. Saying it
 	// dynamically is strictly more informative than saying it statically -- the row
 	// now names the case you are actually in rather than listing both.
+	// UI spec 6: "Live values in labels: Reset Zoom (125%), Tab Width (4) -- state
+	// without opening Settings."
+	#partial switch it.cmd {
+	case .Zoom_Reset:
+		return fmt.tprintf("%s (%d%%)", command_table[it.cmd].title, app.settings.zoom_pct)
+	case .Font_Open:
+		return fmt.tprintf("%s (tab width %d)", command_table[it.cmd].title, app.settings.tab_width)
+	}
 	#partial switch it.cmd {
 	case .Sort_Lines, .Sort_Lines_Desc, .Remove_Duplicate_Lines:
 		d := app_active(app)
@@ -560,9 +569,25 @@ menus := []Menu {
 			{cmd = .Theme_Edit},
 			{cmd = .Keys_Edit},
 			{cmd = .Rules_Edit},
-			// Beside Theme_Edit rather than at the end: someone who has just edited
-			// a theme is the person who needs to know where theme files live, and
-			// this row is the only thing in the app that says.
+			sep,
+			// SPLIT 2026-08-04, and the reason is worth more than the split. These
+			// five were one group with a note above it quoting ui-spec 6.2's
+			// "nothing longer than four rows" -- and Open_Themes_Folder was then
+			// added directly underneath that note, taking it to five. menutest
+			// asserts the rule now, because the comment lost.
+			//
+			// The cut is by KIND rather than by count: the three above edit a config
+			// file, these two open a folder. Open_Themes_Folder still sits beside
+			// Theme_Edit's group for the reason it always did -- someone who has just
+			// edited a theme is who needs to know where theme files live, and this
+			// row is the only thing in the app that says -- and Open_Logs_Folder
+			// keeps its place next to the three it diagnoses.
+			//
+			// That makes View six groups where 6.2 says five. Taken deliberately:
+			// 6.2's numbered complaint was "eighteen items, THREE dividers, one
+			// rhythm", so the durable rules are group-by-kind and the four-row cap,
+			// and the count of five was a description of the item set it was written
+			// against. The menu has gained rows since. The cap is the one with a test.
 			{cmd = .Open_Themes_Folder},
 			{cmd = .Open_Logs_Folder},
 		},
@@ -708,7 +733,20 @@ tab_menu_items := []Menu_Item {
 Menu_State :: struct {
 	mode: bool,
 	open: int, // -1 = no dropdown
-	item: int, // highlighted item within the open dropdown
+	// THE KEYBOARD CURSOR within the open dropdown, and what Enter runs. -1 when
+	// there is none, which is the normal state of a MOUSE-opened menu -- only the
+	// keyboard-open path (menu_open_at, `mode = true`) pre-arms it, so an accent
+	// row never appears on a menu you opened by clicking.
+	item: int,
+	// WHERE THE POINTER IS, and nothing else: purely visual, -1 when off the rows.
+	// Split from `item` on 2026-08-04. menu_hover_item runs every frame off the
+	// live cursor and used to write `item` directly, which conflated "the mouse is
+	// over this" with "Enter will run this" -- the same defect the palette had, and
+	// UI spec 6 asks for them to be two colours precisely because they are two
+	// states. **Not zero-initialised to a valid row**: every place that sets
+	// `item = -1` sets this too, or row 0 draws as hovered before the pointer has
+	// been anywhere near it.
+	hover: int,
 	// First visible row when the dropdown is taller than the window. Without
 	// scrolling, items past the clip were simply unreachable — on a short window
 	// the last entries of the Edit menu could not be seen or selected at all.
@@ -830,6 +868,7 @@ menu_close :: proc(app: ^App) {
 	app.menu.mode = false
 	app.menu.open = -1
 	app.menu.item = -1
+	app.menu.hover = -1
 	app.menu.ctx = false
 	app.menu.ctx_items = nil
 	app.menu.query_len = 0
@@ -899,8 +938,13 @@ menu_hover_update :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window) {
 menu_hover_item :: proc(app: ^App, t: ^plat.Text, win: ^plat.Window) {
 	if !menu_dropdown_active(app) {return}
 	cx, cy := plat.window_cursor_client(win)
+	// Writes `hover` ONLY. It used to write `item`, the keyboard cursor, which
+	// meant a pointer resting over the dropdown decided what Enter would run.
+	// A disabled row is not hovered -- it cannot be picked, so highlighting it
+	// would promise a click that does nothing.
+	app.menu.hover = -1
 	if r := menu_item_at(t, app, f32(cx), f32(cy), f32(win.width), f32(win.height)); r >= 0 {
-		if item_enabled(app, menu_items(app)[r]) {app.menu.item = r}
+		if item_enabled(app, menu_items(app)[r]) {app.menu.hover = r}
 	}
 }
 
@@ -1099,6 +1143,7 @@ menu_open_at :: proc(app: ^App, mi: int) {
 	app.menu.mode = true
 	app.menu.open = clamp(mi, 0, len(menus) - 1)
 	app.menu.item = menu_step(app, app.menu.open, 0, 1)
+	app.menu.hover = -1
 	app.menu.top = 0 // the draw scrolls this ONCE, to bring the highlight into view
 	app.menu.item_scrolled = -2
 	app.menu.rows = 0
@@ -1138,6 +1183,7 @@ menu_open_ctx :: proc(app: ^App, items: []Menu_Item, x, y: f32, col: int) {
 	// none of — first-enabled found directly instead, same rule (skip
 	// separators and disabled rows) menu_step applies for the bar.
 	app.menu.item = -1
+	app.menu.hover = -1
 	for it, i in items {
 		if item_enabled(app, it) {
 			app.menu.item = i
@@ -1175,6 +1221,7 @@ menu_open_tab_ctx :: proc(app: ^App, x: f32, slot: int) {
 	// every path-dependent row read as disabled. Re-run it now the target is set,
 	// or a right-click on a saved tab would open with Close highlighted.
 	app.menu.item = -1
+	app.menu.hover = -1
 	app.menu.item_scrolled = -2 // the highlight is being re-picked; resolve against the new one
 	for it, i in tab_menu_items {
 		if item_enabled(app, it) {
@@ -1336,13 +1383,19 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 			continue
 		}
 		on := item_enabled(app, it)
-		if i == app.menu.item && on {
-			// Inset from the panel edge on both sides. UI spec 6 names a highlight
-			// that runs edge to edge as "the single biggest reason the menus read
-			// as unfinished in the screenshots"; the filter dropdown's search row
-			// below has always inset itself and the item highlight never did.
+		// Two states, two weights (UI spec 6): the keyboard cursor takes the accent
+		// fill because it is what Enter will run; the pointer takes bg_hover because
+		// it only promises what a click WOULD do. Hover is skipped on the keyboard
+		// row so the weaker fill never paints over the stronger one.
+		//
+		// Inset from the panel edge on both sides. UI spec 6 names a highlight that
+		// runs edge to edge as "the single biggest reason the menus read as
+		// unfinished in the screenshots"; the filter dropdown's search row below has
+		// always inset itself and the item highlight never did.
+		if on && (i == app.menu.item || i == app.menu.hover) {
 			hp := sx(MENU_PANEL_PAD_96)
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + hp, y}, size = {dw - 2 * hp, MENU_ITEM_H}, color = g_theme[.Selection_List]}})
+			fill := g_theme[.Accent] if i == app.menu.item else g_theme[.Bg_Hover]
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + hp, y}, size = {dw - 2 * hp, MENU_ITEM_H}, color = fill}})
 		}
 		ty := y + MENU_ITEM_H - sx(7)
 		if it.checked != nil && it.checked(app, it) {
@@ -1356,7 +1409,11 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 		// about how long a row is.
 		label := menu_item_label(app, it)
 		if label == "" {label = command_table[it.cmd].title}
-		plat.text_draw(gfx, t, label, x0 + pad + gutter, ty, UI_PX, g_theme[.Text_Primary] if on else g_theme[.Text_Muted])
+		// bg_base ON the accent fill, per UI spec 6 -- text_primary over the accent
+		// is the pair with no contrast guarantee anywhere in the theme model.
+		lab_col := g_theme[.Text_Primary] if on else g_theme[.Text_Muted]
+		if on && i == app.menu.item {lab_col = g_theme[.Bg_Base]}
+		plat.text_draw(gfx, t, label, x0 + pad + gutter, ty, UI_PX, lab_col)
 		// The accelerator, or -- when the row is greyed out for a reason worth
 		// giving -- that reason in its place.
 		trailing := command_chord(it.cmd)
