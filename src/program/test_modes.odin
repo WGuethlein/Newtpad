@@ -437,6 +437,41 @@ when NEWTPAD_TESTS {
 		command_dispatch(.Tab_Close, {}, &app, &dummy, &dtext, 10)
 		fmt.printfln("Tab_Close         -> live tabs=%d", app_live_count(&app))
 		app_destroy(&app)
+
+		// THE ONE-SHOT PRESSES DO NOT SURVIVE A FRAME (v0.67.0 fix).
+		//
+		// A middle click in the document body used to latch mouse_middle_pressed
+		// true for the rest of the session: all five of its clears were REGION-
+		// conditional (the palette, the tab strip, a read-only surface, the bottom
+		// bar, the top chrome) and none covered an ordinary editable document. The
+		// main loop counts the flag as input, so last_input refreshed every frame
+		// forever and the 2 s debounced session autosave never ran again -- unsaved
+		// work stopped being backed up, silently, after one middle click.
+		//
+		// The clear became window_clear_oneshot_presses so the invariant has a name
+		// and this can call it; testing it through the frame loop is not possible
+		// here, since the environment cannot inject GUI input (HANDOFF 7).
+		//
+		// The LEFT button is deliberately not in it and is asserted to be left alone:
+		// the caret path claims every left press that reaches it, so it has a
+		// terminal consumer, and clearing it here would eat clicks.
+		{
+			ow: plat.Window
+			ow.mouse_right_pressed = true
+			ow.mouse_middle_pressed = true
+			ow.mouse_pressed = true
+			plat.window_clear_oneshot_presses(&ow)
+			okm := !ow.mouse_middle_pressed
+			okr := !ow.mouse_right_pressed
+			okl := ow.mouse_pressed
+			if !okm {bad += 1}
+			if !okr {bad += 1}
+			if !okl {bad += 1}
+			fmt.printfln("  %-6s the middle press does not survive a frame (middle=%v)", "ok" if okm else "FAIL", ow.mouse_middle_pressed)
+			fmt.printfln("  %-6s the right press does not survive a frame (right=%v)", "ok" if okr else "FAIL", ow.mouse_right_pressed)
+			fmt.printfln("  %-6s the LEFT press is left alone, it has a terminal consumer (left=%v)", "ok" if okl else "FAIL", ow.mouse_pressed)
+		}
+
 		// NOT the only mode that exits non-zero -- 18 `os.exit(1)` sites live in this
 		// file as of this count (`grep -c` on the literal), and this branch alone
 		// added three of them (menutest, settingstest, tablesorttest). This one earns
