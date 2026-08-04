@@ -7887,9 +7887,107 @@ both still pass. That wants the draw reporting what it drew, `drawcount`-style. 
 
 ### Still owed on this surface
 
-The mockup's three cells — `42.1 KB`, the language cell, `Tab 4` — are **not** added yet. Note before
-starting: `status_cells` takes a `[4]Status_Cell` buffer at every call site, and three more cells
-overflow it. Grow it and check every caller, or the new cells vanish silently.
+~~The mockup's three cells — `42.1 KB`, the language cell, `Tab 4` — are **not** added yet.~~
+**Done in §6cn.** The buffer warning below turned out to understate the problem — see there.
+
+## 6cn. The whole spec swept, and the first batch off it (2026-08-04, v0.74.0, branch `ui-polish-batch`)
+
+Every earlier gap list came from five surfaces Wyatt happened to screenshot. This opened **all 19
+sections' mockups** in a live browser, extracted each one's DOM with its inline styles (exact labels,
+hex values, px metrics, font per element), and put the running binary beside it. Written up in
+[docs/ui-spec-gaps/2026-08-04-full-sweep.md](docs/ui-spec-gaps/2026-08-04-full-sweep.md), which is now
+the live document; the README points at it.
+
+### The sweep's number moved by a third, downward
+
+59 → **~42**. Three struck by Wyatt's decision, eight struck because they were **already built**, six
+shipped here. That direction matters more than the number: a gap list that overstates is a plan that
+buys work nobody needed.
+
+### What the earlier lists had wrong, and why
+
+Four corrections, each load-bearing for the queue:
+
+1. **`find.odin` has had a button primitive since 2026-07-28** (`cf6d711`). `Find_Action` is a
+   labelled box with its chord, one producer feeding draw, hover, cursor and hit-test, seam-tested,
+   and it drops rather than clips when narrow. Both README and the gap doc said *"nothing in Newtpad
+   has ever drawn a button"*. The find bar is therefore a promotion job, not greenfield.
+2. **The find bar's chips and live count already ship**, styled and danger-coloured at zero.
+3. **§9 markdown is nearly done**, not the large hole it was billed as.
+4. **`scrollbar_thumb`'s deviation was already decided** in `theme.odin` on a measurement (the spec's
+   `#3E3833` claims 3.0:1 and computes 1.42:1). It is now **C3**, beside C1 and C2.
+
+**The mechanism behind the eight false positives is the durable lesson.** They were called absent from
+downscaled screenshots. The spec's values are deliberately quiet — `md_code_bg` is eight units off
+`bg_base`, `table_zebra` four — so at half scale they genuinely vanish. Zebra, view-only sorting, the
+`Bg_Raised` header band and its `Border_Strong` rule, the rounded `Md_Code_Bg` box behind inline code,
+the bullet glyphs, the dimmed done-text, the font page's breadcrumb and its caps `PREVIEW` all ship,
+several with comments citing the very mockup they were said to be missing from. **Verify at 1:1 or
+read the producer. A capture is evidence of presence, never of absence.**
+
+### And one where I inverted a falsifier
+
+`menuseam` printing 17 `DIVERGES` was escalated to Wyatt as a live correctness bug outranking the
+whole queue. It is not one. `menu_scroll_to_item` runs exactly once, inside the draw, and
+`menu_item_at` reads the `top` the previous draw cached — one frame stale on purpose, self-consistent.
+The mode's own header says `TODAY'S CODE DOES NOT HAVE THIS BUG`; it measures whether a **proposed**
+two-layout-pass frame would be stable, and "no" is why the frame is not shaped that way.
+`development-loop.md` §6 names this trap two lines after the sentence quoted while making the mistake.
+**A falsifier's output is a design answer, not a verdict.**
+
+### What shipped
+
+- **Menu labels** — `Find: Regex`, six `...` → `…`, `Zoom In` reads `Ctrl+=`.
+- **`Commands  Ctrl+P` replaces the settings gear** at the menu bar's right end (§4). This reverses a
+  deliberate choice — `menu.odin`'s header argued the gear matched Windows 11 Notepad — so the header
+  now records the reversal rather than describing a control that is gone.
+- **The status bar's four cells** — `Markdown │ UTF-8 │ LF │ Tab 4`, plus a size in the left group.
+- **Settings** names its fourth key: `Left/Right adjust`.
+
+### Three bugs found while adding those
+
+**`Ctrl+=` cannot be done in `key_names`.** That array is the `keys.txt` grammar as well as the menu
+string, and `keymap_parse` splits a line on its **first** `=` — so naming the key `"="` makes
+`ctrl+= = Zoom_In` parse as the chord `ctrl+` with no key, and stops resolving every `keys.txt` already
+spelling it `"+"`, silently, since a malformed chord is skipped rather than reported. It is a display
+substitution in `fmt_chord` instead. Applying the wrong fix deliberately fails **five** `keymaptest`
+assertions including the seeded file Newtpad writes for itself, which drops 49 bindings → 48 with one
+refusal: the app would ship a keymap it cannot parse.
+
+**The status cells' drop order was backwards.** Cells were placed right-to-left and the loop dropped
+`out[n-1]`, the *leftmost*, so encoding went before line endings. §5 says `Tab width → LF → UTF-8 →
+language` and its 700px mockup keeps `Markdown · UTF-8` — the language is the last to go. With two
+cells that was one wrong cell; with four it would have kept `Tab 4` and dropped the language. Dropping
+now precedes placement, so the group also stays flush right instead of leaving a hole.
+
+**The `[4]Status_Cell` warning understated it.** §6cm said extra cells would "vanish silently", which
+is right but not the worst of it: `status_cells` took a *slice* and returned a prefix, so a fifth cell
+would have been missing from the draw **and** the hit-test identically — no misclick, no artifact,
+nothing to notice. It takes `^[STATUS_CELL_MAX]Status_Cell` now; an undersized buffer is a compile
+error naming the call site. Verified by shrinking one to `[2]`.
+
+### Two things this batch got wrong
+
+**The sweep shipped with eight false positives and I quoted its total as a plan before checking any of
+them.** The corrections came only because Phase 3 read the code before editing it. Had it started
+editing, it would have "fixed" already-correct code and the diff would have looked like progress.
+
+**`menuseam` was escalated without reading the mode's own header.** It cost a spawned task chip and a
+recommendation that the queue be reordered around a non-bug.
+
+### Owed
+
+- The ticked checkbox outlines its box and draws an `✕`; §9.4 fills it and draws `✓`. Not done because
+  `md_tick_quads` is deliberately a hand-built stepped X (quads, not a glyph — "a glyph is one font
+  substitution away from being a box") with a centring assertion in `mdtest`. Both the fill and the
+  glyph must change together or the tick goes invisible.
+- The preview's table is text-with-rules, not §9.4's bordered card.
+- Phase 4, **font enumeration**: off-thread, excluding symbol charsets, merged with the curated table
+  so known families keep their exact style files. Not started. `text.odin:164`'s comment argues
+  against enumeration on three grounds; two are answerable, and the third — localized family names —
+  is unsolved and must be named rather than dropped.
+- The left group is still one text run, not §13's three bordered cells. It carries five variable-length
+  warning banners, which is why; the mockup has nowhere to put those.
 
 ## 7. Build environment (Windows, this machine)
 
