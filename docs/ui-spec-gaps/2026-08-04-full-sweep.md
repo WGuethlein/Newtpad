@@ -323,11 +323,20 @@ No icon work exists. §16 names **16a "Caret on paper"** as recommended and give
 
 ## The total
 
+**Revised 2026-08-04 after the §9 / §10 / §11.1 corrections and the first work batch.** The first
+figure was 59; C4 struck 3 (Argon, embedding, the type scale) and the corrections struck 8 more that
+were already built. Six shipped in the polish batch. **Roughly 42 remain.** The number moved by a
+third in one session, in the direction of *less work than claimed*, which is worth knowing before
+quoting any of it as a plan.
+
 | | Count |
 |---|---|
-| Visual divergences in things that exist **[V]** | **28** |
-| Absent features **[F]** | **31** |
-| **Total mockup-sweep items** | **59** |
+| Visual divergences in things that exist **[V]** | ~21 |
+| Absent features **[F]** | ~21 |
+| **Total remaining** | **~42** |
+| Struck as already built (verified at 1:1 or in the producer) | 8 |
+| Struck by decision C4 (Argon) | 3 |
+| Shipped 2026-08-04 (polish batch) | 6 |
 | Already-decided, leave alone **[D]** | 3 (C1, C2, and new C3) |
 | Verification tasks not run this pass (§3 DPI ×8, §14, gutter, settings row fill) | 11 |
 | Sections needing no work | 2 (§15, §19) |
