@@ -7735,6 +7735,72 @@ rather than `>_`, there is no menu-bar *Commands* item, and two items are **deci
 gaps**: whether `Ctrl+Tab` should keep cycling in strip order or open the palette MRU-filtered, and
 whether a command may be palette-only.
 
+## 6ck. The mockups were never read (2026-08-04, v0.71.0, branch `feat/visual-spec-1`)
+
+**Read this before trusting any "matches the spec" claim in §6ch or §6cj.**
+
+Wyatt put screenshots of the running app beside the spec's mockups: *"it still doesn't look anything
+like the spec... it looks completely different in some parts."* He was right, and the cause is a
+method failure, not a missed item.
+
+**`docs/ui-spec/` holds two files.** The gap lists in §6ch/§6cj were built from
+`newtpad-ui-spec-v1.md` — the prose, 57 KB. `newtpad-ui-spec-v1.html` is **185 KB with 493 mockup
+elements**, and it is where the visual target lives. "§6 is done except motion" was true of §6's
+fourteen *prose rules* and was read as *matches the spec*, which it is not and was never measured.
+**CLAUDE.md said to read `docs/ui-spec/` — the directory, not one file in it.**
+
+Content in the HTML and nowhere in the markdown: `Toggle Word Wrap`, `Show Menu Bar`,
+`go to line · type a number`, `All 349`, `249 of 778`, `4 of 62`, `sqlReaderQuery`. Two rows in the
+palette mockup (`Unwrap Selected Lines`, `Reflow Paragraph at Wrap Column`) are commands the product
+does not have at all — so the mockups are not a rendering of the current product either.
+
+The real list is [ui-spec-gaps/2026-08-04-visual-gaps.md](../docs/ui-spec-gaps/2026-08-04-visual-gaps.md).
+§6ch/§6cj's status lines are kept under a correction header rather than edited away, so the overclaim
+stays visible.
+
+### The tiebreak rule, and two named exceptions
+
+**Wyatt, 2026-08-04: *"mockup generally wins"*.** Where mockup and prose disagree, build the mockup.
+
+Two exceptions, both decided individually and both landing on the prose — and they share a shape
+worth noticing: **the prose states a reason, the mockup only shows a result.**
+
+1. **The `Toggle` verb** — *"keep toggle off"*. `Word Wrap`, not `Toggle Word Wrap`, against a mockup
+   that shows the verb on all three toggles.
+2. **The disabled row** — a greyed row shows *why* (`CSV and TSV only`), not its accelerator, against
+   a mockup that keeps `Ctrl+T` and explains nothing. A both-columns variant was offered and rejected
+   on width: `dropdown_w` sizes a panel from its widest row.
+
+### What landed
+
+Only the palette, and it opens by **undoing a regression from §6ch**: v0.68.0 gave the palette's
+selected row the accent fill with `bg_base` text, which is §6's rule for **menus** applied to a
+surface §7 never asks it of. The §7 mockup shows a raised fill; the §6 mockup *does* show the accent
+(its `Settings` row). Right rule, wrong surface. A full-strength accent bar sweeping down a list on
+every keystroke is a different thing from a menu's one deliberate highlight.
+
+Then the structure: the input row is a `>` prompt and the query, per the mockup, instead of a caption
+that was not what an input field is for and that vanished the moment you typed. The prefix legend is
+a permanent dimmed footer — visible when you need it rather than only before you start. The count
+reads `4 of 62`; the denominator is what makes the numerator mean anything.
+
+### Sequencing note that cost nothing to record and would have cost real time to discover
+
+**The status bar is blocked, not merely pending.** Its mockup wants three cells the product does not
+have (`42.1 KB`, the language cell, `Tab 4`) — and the audit found the bar already **drops
+right-hand cells from the draw while `status_cell_at` still walks them**, so a click on a narrow
+window fires `.Eol_CRLF` and rewrites the buffer. Every cell added widens that blast radius. **Fix
+the mismatch first.**
+
+### What is still unbuilt, in rough order of visual impact
+
+The **find bar** is the largest: its mockup is a bordered input with a live `3 / 349`, `↑ ↓`
+buttons, a `✕`, and real `Replace` / `All 349` **buttons** — and **nothing in Newtpad has ever drawn
+a button.** That is a new primitive, and it needs one `*_layout()` producer feeding the draw, the
+hit-test and the hover before any of it is drawn, or it will reproduce the class §6j is named after.
+Then the status bar (above), the font screen (breadcrumb, bracketed right-aligned values, a
+`Ligatures` row, a syntax-highlighted preview sample), and the menu's missing `Show Menu Bar` row.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
