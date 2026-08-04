@@ -27533,6 +27533,31 @@ when NEWTPAD_TESTS {
 			mk(&a, "config.json")
 			mk(&a, "readme.md")
 
+			// THE PREFIX-LEGEND FOOTER IS NOT CLICKABLE.
+			//
+			// The 7 mockup puts the legend along the bottom of the box rather than
+			// inside the input, so the box grew a strip that looks like the list and
+			// is not part of it. Both the draw and palette_row_at read `nres` from
+			// palette_layout, so the seam holds by construction -- asserted anyway,
+			// because "by construction" is what every seam bug in this tree was until
+			// someone added a second producer.
+			{
+				palette_open(&a)
+				for r in ">wrap" {palette_input_rune(&a, r)}
+				l := palette_layout(&a, 1920, 1080)
+				oklast := palette_row_at(&a, l.x0 + 20, l.y0 + l.qh + f32(l.nres) * l.rowh - 2, 1920, 1080) == l.nres - 1
+				okfoot := palette_row_at(&a, l.x0 + 20, l.y0 + l.h - 4, 1920, 1080) == -1
+				okgrew := l.h > l.qh + f32(l.nres) * l.rowh
+                                if l.nres <= 0 {bad += 1;fmt.println("  FAIL   no results, so the footer seam proves nothing")}
+				if !oklast {bad += 1}
+				if !okfoot {bad += 1}
+				if !okgrew {bad += 1}
+				fmt.printfln("  %-6s the last drawn row is clickable to its bottom edge (nres=%d)", "ok" if oklast else "FAIL", l.nres)
+				fmt.printfln("  %-6s a click on the legend footer hits no row", "ok" if okfoot else "FAIL")
+				fmt.printfln("  %-6s the box reserves the footer (h=%.0f > rows=%.0f)", "ok" if okgrew else "FAIL", l.h, l.qh + f32(l.nres) * l.rowh)
+				palette_close(&a)
+			}
+
 			// THE PALETTE IS WIDE ENOUGH FOR ITS OWN WIDEST ROW.
 			//
 			// The seam menutest holds for dropdowns, held here. A Commands row is

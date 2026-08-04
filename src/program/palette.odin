@@ -254,6 +254,7 @@ PALETTE_MAX_ROWS :: 12
 Palette_Layout :: struct {
 	x0, y0, w, h: f32,
 	qh, rowh:     f32, // query field height, row height
+	hint:         f32, // the dimmed prefix-legend footer
 	nres:         int, // result rows actually drawn
 }
 
@@ -298,7 +299,12 @@ palette_layout :: proc(app: ^App, width, height: f32) -> Palette_Layout {
 		body_rows = f32(len(PALETTE_HELP))
 	case .Tabs, .Commands:
 	}
-	l.h = l.qh + body_rows * l.rowh
+	// The prefix legend is a dimmed FOOTER row, per the 7 mockup, not a caption
+	// inside the input. The mockup shows it while a query is being typed, so it is
+	// permanent rather than an empty-state placeholder -- which is also what makes
+	// it discoverable, since the caption it replaces vanished the moment you typed.
+	l.hint = l.rowh
+	l.h = l.qh + body_rows * l.rowh + l.hint
 	return l
 }
 
@@ -352,6 +358,24 @@ palette_click :: proc(app: ^App, mx, my, width, height: f32) -> (chose: bool, co
 // compile-time constant, so this can never go stale.
 @(private = "file")
 g_cat_cells, g_chord_cells: int
+
+// The denominator of the mockup's "4 of 62": how many candidates the CURRENT mode
+// could offer before the query narrowed them. Commands counts what the palette is
+// willing to show (command_in_palette, not the whole table -- offering a number
+// that includes rows you can never reach would be a lie); Tabs counts live tabs.
+palette_total :: proc(app: ^App) -> int {
+	n := 0
+	switch app.palette.mode {
+	case .Commands:
+		for c in Command_Id {
+			if command_in_palette(c) {n += 1}
+		}
+	case .Tabs:
+		n = app_live_count(app)
+	case .Goto, .Help:
+	}
+	return n
+}
 
 palette_widest_category :: proc() -> int {
 	if g_cat_cells == 0 {
@@ -410,22 +434,31 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 			{pos = {x0, y0}, size = {PW, qh}, color = g_theme[.Bg_Panel]}, // query field
 		})
 
-	qs := string(p.query[:])
-	qcol := g_theme[.Text_Primary]
-	if len(qs) == 0 {
-		qs = "Search tabs    ( >  command    :  go to line    ?  help )"
-		qcol = g_theme[.Text_Muted]
-	}
-	plat.text_draw(gfx, text, qs, x0 + sx(12), y0 + sx(22), UI_PX, qcol)
+	// THE PROMPT, then the query. The 7 mockup's input row is `> wrap |` -- a
+	// prompt glyph in the accent and the query beside it. It used to hold a caption
+	// ("Search tabs ( > command : go to line ? help )") which is not what an input
+	// field is for and which vanished the moment you typed; the legend is a footer
+	// row now, so it is there when you need it rather than only before you start.
+	cwq := plat.text_char_width(text, UI_PX)
+	plat.text_draw(gfx, text, ">", x0 + sx(12), y0 + sx(22), UI_PX, g_theme[.Accent])
+	plat.text_draw(gfx, text, string(p.query[:]), x0 + sx(12) + 2 * cwq, y0 + sx(22), UI_PX, g_theme[.Text_Primary])
 	// The result count, in the input row. UI spec 7: "it is feedback on what was
 	// just typed and belongs next to the caret", not 700 pixels away in the
-	// status bar. Only while something has been typed -- a count of everything
-	// is not information.
+	// status bar.
+	//
+	// "N of M", not a bare N -- the mockup reads `4 of 62`, and the denominator is
+	// what makes the numerator mean anything: 4 of 62 says the filter is working,
+	// 4 alone could be the whole product.
 	if len(p.query) > 0 && (p.mode == .Commands || p.mode == .Tabs) {
-		n := fmt.tprintf("%d", len(p.results))
+		n := fmt.tprintf("%d of %d", len(p.results), palette_total(app))
 		cw := plat.text_char_width(text, UI_SMALL_PX)
 		col := g_theme[.Text_Muted] if len(p.results) > 0 else g_theme[.Danger]
 		plat.text_draw(gfx, text, n, x0 + PW - sx(16) - f32(len(n)) * cw, y0 + sx(22), UI_SMALL_PX, col)
+	}
+	// The dimmed prefix legend, along the bottom.
+	{
+		hint := ">  command   ·   :  go to line   ·   ?  help"
+		plat.text_draw(gfx, text, hint, x0 + sx(12), y0 + boxh - sx(9), UI_SMALL_PX, g_theme[.Text_Muted])
 	}
 
 	if p.mode == .Goto {
@@ -441,17 +474,24 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 
 	for i in 0 ..< nres {
 		ry := y0 + qh + f32(i) * rowh
-		// Two states, two weights (UI spec 6). The keyboard cursor is the strong
-		// one because it is the thing Enter will run; hover is a hint that a click
-		// would move it there. Hover is skipped on the selected row so the weaker
-		// fill can never paint over the stronger one.
+		// Two states, two weights -- but NOT the menu's two weights.
+		//
+		// v0.68.0 gave this row the accent fill with bg_base text, which is UI spec
+		// 6's rule for MENUS applied to a surface 7 never asks it of. The 7 mockup
+		// shows the selected row as a subtle RAISED fill; the 6 mockup does show the
+		// accent (its `Settings` row), so the rule is right where it came from and
+		// was wrong where it was taken. Reverted 2026-08-04.
+		//
+		// The palette is a list you are reading while typing, and a full-strength
+		// accent bar sweeping down it on every keystroke is a different thing from a
+		// menu's one deliberate highlight.
 		if i == p.selected {
-			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x0, ry}, size = {PW, rowh}, color = g_theme[.Accent]}})
+			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x0, ry}, size = {PW, rowh}, color = g_theme[.Bg_Raised]}})
 		} else if i == p.hover {
 			plat.quads_draw(gfx, quad_pipe, []plat.Quad{{pos = {x0, ry}, size = {PW, rowh}, color = g_theme[.Bg_Hover]}})
 		}
 		r := p.results[i]
-		fg := g_theme[.Bg_Base] if i == p.selected else g_theme[.Text_Secondary]
+		fg := g_theme[.Text_Primary] if i == p.selected else g_theme[.Text_Secondary]
 		if p.mode == .Commands {
 			// The label, with the matched characters in the accent. UI spec 7:
 			// "Matched characters carry the accent -- that is the whole ranking

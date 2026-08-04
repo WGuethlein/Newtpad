@@ -27,12 +27,27 @@ Proof, by content that exists in the HTML and nowhere in the markdown: `Toggle W
 
 ---
 
-## Two places the mockup and the prose contradict each other
+## THE TIEBREAK RULE (Wyatt, 2026-08-04)
 
-**These need Wyatt, not a fix.** Both were implemented per the prose, and the mockup shows the
-opposite.
+> **"mockup generally wins"**
 
-### C1. The `Toggle` verb
+So: **where the mockup and the prose disagree, build the mockup** — it is the picture the product is
+being compared against. The two exceptions below are named exceptions, decided individually, not
+precedent for reopening the rule.
+
+Both exceptions have the same shape, which is worth seeing: the prose states a *reason* and the
+mockup only shows a *result*. Where the prose is arguing rather than describing, it can still win —
+but that is a judgement per case, not a second rule.
+
+## Two places the mockup and the prose contradict each other — BOTH DECIDED
+
+**Both were implemented per the prose, the mockup shows the opposite, and Wyatt chose the prose in
+both. No code change; they are recorded so nobody "fixes" them toward the mockup later.**
+
+### C1. The `Toggle` verb — DECIDED: prose. Keep the verb dropped.
+
+Wyatt, 2026-08-04: *"keep toggle off"*. `Word Wrap`, not `Toggle Word Wrap`. Built state is correct.
+
 
 - **Prose §6.3:** *"'Toggle' ×3 is noise… Drop the verb."*
 - **Mockup:** rows read `Toggle Word Wrap`, `Toggle Table View (CSV/TSV)`, `Toggle Markdown Preview`.
@@ -41,7 +56,14 @@ opposite.
 The mockup is not simply the "before" picture — it also contains `Reset Zoom (125%)` and a
 `Show Menu Bar NEW` row, both target-state.
 
-### C2. The disabled row's reason
+### C2. The disabled row's reason — DECIDED: prose. Keep showing the reason.
+
+Wyatt, 2026-08-04, choosing it against the mockup and against a both-columns variant: a greyed row
+shows **why**, not its shortcut — `Table View (CSV/TSV)    CSV and TSV only`. Built state is
+correct, and `menutest` already covers it. The "both" option was rejected on width: `dropdown_w`
+sizes a panel from its widest row, so carrying reason *and* accelerator widens every dropdown that
+has a disabled row.
+
 
 - **Prose §6.4:** *"Disabled items give no reason… Show the reason in `text_muted` where the
   accelerator would be."*
@@ -88,7 +110,17 @@ raised fill.**
 | Replace | **`Replace` and `All 349` as buttons** | keyboard hints as text |
 | Filter banner | `FILTER context 249 of 778 lines` + right-hand hint `Ctrl+L shows the whole file · ↑↓ moves · Enter jumps there`, then numbered rows with the match highlighted | banner exists; needs checking against this form |
 
-### Status bar
+### Status bar — BLOCKED on an open HIGH, do not start with this
+
+Adding the mockup's missing cells (`42.1 KB`, the language cell, `Tab 4`) means adding rows to a
+group whose **draw and hit-test already disagree**: the 2026-08-04 audit found that the bar drops
+right-hand cells from the *draw* on a narrow window while `status_cell_at` still walks all of them,
+so a click lands on a cell that is not there and fires `.Eol_CRLF` — a whole-buffer rewrite
+([06-ui-shell.md](../audits/2026-08-04/06-ui-shell.md)).
+
+**Every cell added widens the blast radius of that bug.** Fix the drop/hit-test mismatch first, then
+add cells. Sequencing recorded here so this is not discovered halfway through.
+
 
 | | Mockup | Built |
 |---|---|---|
