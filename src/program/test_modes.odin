@@ -30279,6 +30279,64 @@ when NEWTPAD_TESTS {
 				// would let through, and _ is a word character in every editor.
 				mt_chk(&bad, whole == 3, fmt.tprintf("whole word finds exactly the 3 standalone cats (%d)", whole))
 
+				// WHOLE WORD AT A SCAN-BLOCK BOUNDARY (v0.67.0 fix).
+				//
+				// The block read overlapped forward by len(q)-1: enough for the last
+				// candidate in a block to be FOUND (it ends on the block's final
+				// overlapped byte) and one byte short of what whole-word needs to
+				// JUDGE it. The byte after that match sat at index `got`, which was
+				// never read, so `after` stayed 0, is_word_byte(0) is false, and `cat`
+				// inside `cats` was accepted as a standalone word.
+				//
+				// The fixture above cannot see this: at 39 bytes the first block is
+				// also the LAST, where after == 0 genuinely means end-of-file. It
+				// needs a document long enough to have a non-final block, with the
+				// straddler placed so the match ends on the boundary byte -- the same
+				// shape findtest already plants at SEARCH_FIRST_PAINT - 4 for the
+				// ordinary literal-overlap case.
+				{
+					// THE OFFSET IS THE WHOLE TEST, and it is easy to get wrong -- the
+					// first version of this used SEARCH_FIRST_PAINT - 3 and passed
+					// with the bug reintroduced, i.e. proved nothing.
+					//
+					// The defect needs the guard `k + len(q) < got` to be exactly
+					// false, so the match must start at k where k + len(q) == got.
+					// With the bug, got == bs + len(q) - 1 and bs == SEARCH_FIRST_PAINT
+					// on the first pass, so k == SEARCH_FIRST_PAINT - 1. One byte
+					// either side and the byte after the match IS read, the guard
+					// holds, and the case is vacuous.
+					//
+					// AND THE DOCUMENT MUST EXCEED SEARCH_SYNC_MAX. The second wrong
+					// version of this test used a 64 KB fixture, which scans INLINE as
+					// a single block -- and that block is the LAST one, where after == 0
+					// genuinely does mean end-of-file and the guard is correct. Past
+					// SEARCH_SYNC_MAX the scan takes the bounded first-paint pass, whose
+					// block is not the last, which is the only place the defect lives.
+					//
+					// AND THE BYTE BEFORE MUST NOT BE A WORD BYTE. The third wrong
+					// version padded with 'x' all the way up to the match, so
+					// whole-word rejected it on the BEFORE test and never reached the
+					// after test this is about -- passing, again, for the wrong reason.
+					// A space goes immediately before the straddler.
+					pad := SEARCH_FIRST_PAINT - 1
+					b := make([dynamic]u8, context.temp_allocator)
+					for _ in 0 ..< pad - 1 {append(&b, 'x')}
+					append(&b, ' ') // the non-word byte before the match
+					append(&b, ..transmute([]u8)string("cats and more text after it\n"))
+					for len(b) < SEARCH_SYNC_MAX + (64 << 10) {append(&b, 'y')}
+					src := make([]u8, len(b))
+					copy(src, b[:])
+					bdoc := doc_from_content(src, "boundary.txt", .UTF8)
+					defer doc_close(&bdoc)
+					n := count(&bdoc, "cat", false, true)
+					mt_chk(&bad, n == 0, fmt.tprintf("whole word rejects `cat` inside `cats` straddling the block edge at %d (%d matches, want 0)", pad, n))
+					// The straddler is really where we think it is, or the case is
+					// vacuous: without whole-word the same query must find it.
+					any2 := count(&bdoc, "cat", false, false)
+					mt_chk(&bad, any2 == 1, fmt.tprintf("...and the straddler is genuinely there: %d plain matches (want 1)", any2))
+					find_close(&bdoc)
+				}
+
 				both := count(&fdoc, "cat", true, true)
 				mt_chk(&bad, both <= whole && both < exact, fmt.tprintf("the two modes compose (%d <= %d and < %d)", both, whole, exact))
 				find_close(&fdoc)
