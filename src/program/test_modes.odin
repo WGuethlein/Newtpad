@@ -9358,6 +9358,69 @@ when NEWTPAD_TESTS {
 			t: plat.Text
 			plat.text_load_faces(&t)
 
+			// --- THE CLIPBOARD REFUSES RATHER THAN CRASHING, AND CUT HONOURS IT ---
+			//
+			// Two v0.67.0 fixes on one path, neither of which shipped with a test.
+			//
+			// win.utf8_to_wstring goes through utf8_to_utf16_alloc, which passes
+			// MB_ERR_INVALID_CHARS -- so MultiByteToWideChar returns 0, and the
+			// wstring nil, on ANY invalid UTF-8 byte. clipboard_set_text dereferenced
+			// that nil on the next line and took the process down. It is reachable in
+			// ordinary use: encoding detection sniffs only the head of the file, so a
+			// document whose first window is clean UTF-8 but which carries a stray
+			// high byte further down is held as .UTF8 with the raw bytes intact.
+			//
+			// Then Cut called it (void, silent on every failure path) and deleted the
+			// selection anyway, so the text existed in neither place.
+			//
+			// NOTE ON WHAT A SABOTAGE LOOKS LIKE HERE: removing the nil guard does not
+			// print FAIL, it FAULTS -- the mode dies before it can report. That is
+			// still a read of the fix (a clean run versus an access violation), but it
+			// is the one case in this file where the evidence is the exit code rather
+			// than a line of output, and it is worth knowing before someone reads a
+			// silent crash as a passing run.
+			{
+				// Valid ASCII either side of a lone 0xFF, which is not a legal UTF-8
+				// lead byte in any position.
+				bad_utf8 := "keep\xffme"
+				okc := plat.clipboard_set_text(nil, bad_utf8)
+				fk_chk(&bad, !okc, fmt.tprintf("clipboard_set_text refuses invalid UTF-8 and returns false (got %v, and reaching this line at all is the no-crash half)", okc))
+				// AND IT LEFT THE CLIPBOARD ALONE. This is the assertion that found a
+				// second bug: the proc used to Open and Empty the clipboard before
+				// attempting the conversion, so a copy it could not perform destroyed
+				// what the user already had. "PASTED" was set above and a later case
+				// in this mode depends on it -- which is precisely the damage a user
+				// would see.
+				//
+				// GUARDED ON ITS OWN PRECONDITION, and this is not defensive padding.
+				// The assertion reads the REAL Windows clipboard, and the sentinel is
+				// put there by the very operation whose failure mode this file is
+				// about -- any clipboard manager or RDP session can hold the clipboard
+				// for a moment and make the sentinel set fail. Observed flaking once
+				// during development. Without the guard the case reports a product bug
+				// when what actually happened is that the environment was busy.
+				survived, hs := plat.clipboard_get_text(nil, context.temp_allocator)
+				if !hs || survived != "PASTED" && survived != "" {
+					fmt.printfln("  --    clipboard sentinel unavailable (%q); skipping the survives-a-refusal check", survived)
+				} else {
+					fk_chk(&bad, hs && survived == "PASTED", fmt.tprintf("a refused copy leaves the existing clipboard intact: %q (want \"PASTED\")", survived))
+				}
+
+				// And Cut leaves the document alone when that refusal happens.
+				a2: App
+				defer app_destroy(&a2)
+				d2 := new(Document)
+				d2^ = doc_from_content(transmute([]u8)strings.clone(bad_utf8), "raw.txt", .UTF8)
+				app_add(&a2, d2)
+				app_activate(&a2, 0)
+				doc_select_all(d2)
+				before := d2.pt.length
+				// The precondition, or the assertion below passes on an empty selection.
+				fk_chk(&bad, before > 0 && d2.anchor != d2.cursor, fmt.tprintf("fixture: %d bytes selected %d..%d", before, d2.anchor, d2.cursor))
+				command_dispatch(.Cut, {}, &a2, &wv, &t, 10)
+				fk_chk(&bad, d2.pt.length == before, fmt.tprintf("a Cut whose clipboard write failed deletes nothing: %d bytes (want %d)", d2.pt.length, before))
+			}
+
 			// A real undo stack, a real REDO stack and a real selection, so Ctrl+Z,
 			// Ctrl+Y and Ctrl+X below each have something to destroy. Without them
 			// all three would be no-ops and the "document unwritten" assertions
