@@ -17,6 +17,24 @@ import plat "src:platform"
 MENU_BAR_H_96 :: f32(30) // UI spec 2.1 (was 26)
 MENU_ITEM_H_96 :: f32(28) // dropdown row height, UI spec 2.2 (was 24)
 MENU_PAD_96 :: f32(12) // horizontal padding around a top-level title
+
+// UI spec 6's panel budget, as named constants rather than literals scattered
+// through the draw and the width. The spec states it as one sum: "widest label +
+// 26 check gutter + 24 gap + widest accelerator + 20 padding", where the 20 is
+// the two content edges (10 a side).
+//
+// These exist so dropdown_w and menu_draw_dropdown cannot disagree. They used to:
+// the draw hardcoded a 28px label origin and a 12px right inset while the width
+// budgeted "+8 character cells" for the lot, which happened to land close enough
+// at the default interface font and drifted with any other one.
+MENU_CHECK_GUTTER_96 :: f32(26) // reserved ONLY on menus that have a checkable row
+MENU_ACCEL_GAP_96 :: f32(24) // label to accelerator, minimum
+MENU_CONTENT_PAD_96 :: f32(10) // each content edge; 2 * this is the spec's "20 padding"
+// The highlight is inset from the panel edge by this much on each side. UI spec 6
+// calls a highlight that touches the edge "the single biggest reason the menus
+// read as unfinished in the screenshots".
+MENU_PANEL_PAD_96 :: f32(5)
+MENU_BAR_GAP_96 :: f32(2) // gap between the menu bar and a dropdown's top edge
 // Tallest a GENERATED dropdown gets, in rows. Twelve is about a third of a 1080p
 // window: small enough that a list of two hundred column values reads as a list
 // you scroll rather than as a panel that swallowed the screen.
@@ -1215,7 +1233,9 @@ menu_items :: proc(app: ^App) -> []Menu_Item {
 menu_origin :: proc(t: ^plat.Text, app: ^App) -> (x0, y0: f32) {
 	if app.menu.ctx {return app.menu.ctx_x, app.menu.ctx_y}
 	x0, _ = menu_title_rect(t, app.menu.open)
-	return x0, TAB_STRIP_H + MENU_BAR_H
+	// UI spec 6: "2px gap below the bar." The dropdown used to start flush against
+	// the menu bar, so the panel border and the bar's bottom edge were one line.
+	return x0, TAB_STRIP_H + MENU_BAR_H + sx(MENU_BAR_GAP_96)
 }
 
 // --- drawing ---
@@ -1290,6 +1310,12 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 	// stayed clickable, which is how Edit > Font became an invisible live strip.
 	items_y0 := y0 + sx(1)
 	y := items_y0
+	// Read from the same producers dropdown_w read, not re-derived here. The
+	// label origin used to be a literal sx(28) while the width budgeted a
+	// character-cell approximation; that is two procedures owning one coordinate,
+	// which is the shape this file's comments say every seam bug here has taken.
+	gutter := menu_gutter(items)
+	pad := sx(MENU_CONTENT_PAD_96)
 	last := app.menu.top + app.menu.rows
 	for i := app.menu.top; i < min(last, len(items)); i += 1 {
 		it := items[i]
@@ -1311,18 +1337,26 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 		}
 		on := item_enabled(app, it)
 		if i == app.menu.item && on {
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0, y}, size = {dw, MENU_ITEM_H}, color = g_theme[.Selection_List]}})
+			// Inset from the panel edge on both sides. UI spec 6 names a highlight
+			// that runs edge to edge as "the single biggest reason the menus read
+			// as unfinished in the screenshots"; the filter dropdown's search row
+			// below has always inset itself and the item highlight never did.
+			hp := sx(MENU_PANEL_PAD_96)
+			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x0 + hp, y}, size = {dw - 2 * hp, MENU_ITEM_H}, color = g_theme[.Selection_List]}})
 		}
 		ty := y + MENU_ITEM_H - sx(7)
 		if it.checked != nil && it.checked(app, it) {
-			plat.text_draw(gfx, t, "✓", x0 + sx(8), ty, UI_PX, g_theme[.Success])
+			// Centred in the gutter menu_gutter reserved -- the same producer the
+			// width budget read, so a menu with no checkable row reserves nothing
+			// and this branch cannot run on one.
+			plat.text_draw(gfx, t, "✓", x0 + pad + (gutter - plat.text_char_width(t, UI_PX)) * 0.5, ty, UI_PX, g_theme[.Success])
 		}
 		// A generated row shows its VALUE; every other row shows its command's
 		// title. One lookup, so the width budget below and the draw cannot disagree
 		// about how long a row is.
 		label := menu_item_label(app, it)
 		if label == "" {label = command_table[it.cmd].title}
-		plat.text_draw(gfx, t, label, x0 + sx(28), ty, UI_PX, g_theme[.Text_Primary] if on else g_theme[.Text_Muted])
+		plat.text_draw(gfx, t, label, x0 + pad + gutter, ty, UI_PX, g_theme[.Text_Primary] if on else g_theme[.Text_Muted])
 		// The accelerator, or -- when the row is greyed out for a reason worth
 		// giving -- that reason in its place.
 		trailing := command_chord(it.cmd)
@@ -1330,7 +1364,7 @@ menu_draw_dropdown :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Tex
 			if why := item_disabled_reason(app, it); why != "" {trailing = why}
 		}
 		if trailing != "" {
-			plat.text_draw(gfx, t, trailing, x0 + dw - sx(12) - f32(len(trailing)) * cw, ty, UI_PX, g_theme[.Text_Muted])
+			plat.text_draw(gfx, t, trailing, x0 + dw - pad - menu_text_w(t, trailing, UI_PX), ty, UI_PX, g_theme[.Text_Muted])
 		}
 		y += MENU_ITEM_H
 	}
@@ -1772,22 +1806,51 @@ menu_dropdown_hit :: proc(t: ^plat.Text, app: ^App, mx, my, width, height: f32) 
 //
 // The trailing budget is the larger of the accelerator and the disabled reason,
 // because either can occupy that column.
+// The check gutter this item set needs, in pixels: UI spec 6 reserves it "on every
+// row of a menu that contains any checkable item, and none on menus that do not".
+//
+// ONE producer, read by dropdown_w and by menu_draw_dropdown. The draw used to
+// hardcode a 28px label origin for every menu, so File and Help -- which have no
+// checkable row between them -- paid an indent the spec says they should not, and
+// the width budget knew nothing about it either way.
+menu_gutter :: proc(items: []Menu_Item) -> f32 {
+	for it in items {
+		if it.checked != nil {return sx(MENU_CHECK_GUTTER_96)}
+	}
+	return 0
+}
+
+// Text width in pixels, through text_cells rather than len(): a byte count is a
+// cell count only for ASCII, and the column filter's rows are arbitrary CSV field
+// values. A wide CJK value used to budget half the width it drew.
+@(private = "file")
+menu_text_w :: proc(t: ^plat.Text, s: string, px: f32) -> f32 {
+	return f32(plat.text_cells(t, transmute([]u8)s, 0)) * plat.text_char_width(t, px)
+}
+
 dropdown_w :: proc(app: ^App, t: ^plat.Text, items: []Menu_Item) -> f32 {
-	cw := plat.text_char_width(t, UI_PX)
-	widest := 0
+	gutter := menu_gutter(items)
+	pad := sx(MENU_CONTENT_PAD_96)
+	gap := sx(MENU_ACCEL_GAP_96)
+	widest := f32(0)
 	for it in items {
 		// A label row has no command and no accelerator, and still has to fit: the
 		// search box showing "abcdefgh" in a dropdown sized for "(Select All)" would
 		// print past its own border.
 		if it.cmd == .None && it.text != "" {
-			if n := len(it.text) + 8; n > widest {widest = n}
+			widest = max(widest, menu_text_w(t, it.text, UI_PX))
 			continue
 		}
 		if it.cmd == .None {continue}
-		trailing := max(len(command_chord(it.cmd)), len(command_disabled_hint(it.cmd)))
+		// Either the accelerator or the disabled reason can occupy that column.
+		trailing := max(menu_text_w(t, command_chord(it.cmd), UI_PX), menu_text_w(t, command_disabled_hint(it.cmd), UI_PX))
 		title := menu_item_label(app, it)
 		if title == "" {title = command_table[it.cmd].title}
-		if n := len(title) + trailing + 8; n > widest {widest = n}
+		row := menu_text_w(t, title, UI_PX)
+		if trailing > 0 {row += gap + trailing}
+		widest = max(widest, row)
 	}
-	return f32(widest) * cw
+	// UI spec 6, stated as the spec states it: content edges + the check gutter +
+	// the widest row (which already carries its own label-to-accelerator gap).
+	return 2 * pad + gutter + widest
 }

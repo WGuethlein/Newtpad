@@ -11367,6 +11367,39 @@ when NEWTPAD_TESTS {
 					if !ok {bad += 1}
 					fmt.printfln("  %-6s %s dropdown %.0f fits its widest row (%q needs %.0f)", "ok" if ok else "FAIL", m.title, w, worst, need)
 				}
+				// THE CHECK GUTTER IS CONDITIONAL. UI spec 6.1: 26px "reserved on
+				// every row of a menu that contains any checkable item, and none on
+				// menus that do not". The draw used to indent every row of every menu
+				// by a hardcoded 28px, so File and Help -- which have no checkable row
+				// between them -- paid for a column nothing could ever draw into.
+				//
+				// Asserted through menu_gutter because that is the ONE producer the
+				// width budget and the draw both read; checking a literal here would
+				// be a third opinion about the same number.
+				{
+					want := sx(MENU_CHECK_GUTTER_96)
+					for m in drops {
+						any_check := false
+						for it in m.items {
+							if it.checked != nil {any_check = true;break}
+						}
+						g := menu_gutter(m.items)
+						exp := want if any_check else f32(0)
+						okg := g == exp
+						if !okg {bad += 1}
+						fmt.printfln("  %-6s %s reserves %.0f of check gutter (want %.0f; has a checkable row: %v)", "ok" if okg else "FAIL", m.title, g, exp, any_check)
+					}
+					// The precondition, or the loop above proves nothing: the menu bar
+					// has to contain at least one of each kind for the two branches to
+					// both be exercised.
+					nwith, nwithout := 0, 0
+					for m in drops {
+						if menu_gutter(m.items) > 0 {nwith += 1} else {nwithout += 1}
+					}
+					okb := nwith > 0 && nwithout > 0
+					if !okb {bad += 1}
+					fmt.printfln("  %-6s both gutter branches are covered: %d menus with, %d without", "ok" if okb else "FAIL", nwith, nwithout)
+				}
 				// And the reasons are actually reachable: a .md file cannot enter
 				// table view, so that row must be disabled AND say why.
 				a: App
