@@ -27533,6 +27533,45 @@ when NEWTPAD_TESTS {
 			mk(&a, "config.json")
 			mk(&a, "readme.md")
 
+			// THE PALETTE IS WIDE ENOUGH FOR ITS OWN WIDEST ROW.
+			//
+			// The seam menutest holds for dropdowns, held here. A Commands row is
+			// three columns -- label at +16, then the category and the accelerator
+			// right-aligned into fixed columns sized from the WIDEST value in the
+			// table -- and nothing checked that they fit the box together.
+			//
+			// It also answers the open question from the ui-spec gap list: 7 asks for
+			// 560 and the code has 720, and until the three sentence-length command
+			// titles came down on 2026-08-04 nobody could say which was right. This
+			// prints the number, so the next person does not have to guess either.
+			{
+				pt: plat.Text
+				if plat.text_load_faces(&pt) {
+					cwp := plat.text_char_width(&pt, UI_PX)
+					cws := plat.text_char_width(&pt, UI_SMALL_PX)
+					widest_label := 0
+					for c in Command_Id {
+						if !command_in_palette(c) {continue}
+						if n := len(command_table[c].title); n > widest_label {widest_label = n}
+					}
+					need :=
+						sx(16) +
+						f32(widest_label) * cwp +
+						sx(16) +
+						f32(palette_widest_category()) * cws +
+						sx(16) +
+						f32(palette_widest_chord()) * cws +
+						sx(16)
+					l := palette_layout(&a, 1920, 1080)
+					okw := l.w >= need
+					if !okw {bad += 1}
+					fmt.printfln(
+						"  %-6s the palette fits its widest row: %.0f wide, needs %.0f (label %d chars, category %d, chord %d)",
+						"ok" if okw else "FAIL", l.w, need, widest_label, palette_widest_category(), palette_widest_chord(),
+					)
+				}
+			}
+
 			// THE POINTER CANNOT MOVE THE KEYBOARD CURSOR.
 			//
 			// palette_hover runs EVERY FRAME off the live cursor, and it used to

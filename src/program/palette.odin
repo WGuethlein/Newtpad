@@ -260,7 +260,16 @@ Palette_Layout :: struct {
 palette_layout :: proc(app: ^App, width, height: f32) -> Palette_Layout {
 	p := &app.palette
 	l: Palette_Layout
-	l.w = min(sx(720), width - sx(80))
+	// UI spec 7: "560 wide". Reached 2026-08-04, and only reachable at all because
+	// the three sentence-length command titles came down the same day -- at 53
+	// characters "Remove Duplicate Lines (exact match, keeps the first)" put the
+	// floor near 700, which is where the old 720 came from.
+	//
+	// MEASURED, not assumed: palettetest computes the widest Commands row from the
+	// command table and asserts the box fits it. 514 needed against 560 at the time
+	// of writing, so there is 46px of headroom -- and if a future title eats it the
+	// assertion fails rather than the row clipping silently.
+	l.w = min(sx(560), width - sx(80))
 	// snap: a centred origin is a division by two, and half of an odd number is
 	// a half pixel -- which every glyph in the panel is then drawn from. See
 	// snap()'s own comment for what that looks like on screen.
