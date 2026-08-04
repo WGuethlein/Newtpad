@@ -334,6 +334,16 @@ Each of these cost real time at least once.
 - **PowerShell 5.1 re-parses quotes when passing arguments to a native command**, so a `"` inside a
   here-string reaches `git commit -m` as an argument break — the tail of the message then arrives as
   a pathspec and the commit fails. Write the message to a file and use `git commit -F`.
+- **`install.ps1` cannot complete after a version bump — use `install.ps1 -SkipBuild`.** Hit on
+  2026-08-04. `build.bat release` enters `:msvc_artifacts`, whose `vswhere` line prints a *harmless*
+  `'vswhere.exe' is not recognized` to stderr (build.bat's own comment at line 74 explains why: the
+  sub-shell re-parses the `(x86)` in the path, and `VSPATH` still resolves). `install.ps1` sets
+  `$ErrorActionPreference = 'Stop'`, PowerShell 5.1 wraps that stderr line in an ErrorRecord, and the
+  install dies at "Building release..." having installed nothing. **The build itself succeeded every
+  time.** Run `.\build.bat release` yourself, confirm the exe's `LastWriteTime` moved, then
+  `.\install.ps1 -SkipBuild`. Same family as the `release.ps1` trap below, and the same tell: a
+  native command's stderr is not a failure. **Do not "fix" it by reaching for `-Force`** — that flag
+  hard-kills a running Newtpad and skips the hot-exit session write.
 - **Never pipe `.\release.ps1` (or any script that runs `git push`) through `2>&1`.** PowerShell 5.1
   wraps each stderr line from a native command in an ErrorRecord, and `git push` writes its progress
   there — so with the script's `$ErrorActionPreference = 'Stop'` the push "fails" and the script
