@@ -8265,6 +8265,48 @@ quietly filtered.
 - `font_scan` reads every font file in both directories to get its name. Fine here (22 families, no
   perceptible delay off-thread) and worth measuring on a machine with hundreds before assuming.
 
+## 6ct. Two bugs §6cs shipped (2026-08-05, v0.80.0, branch `fix/scan-memory-and-stuck-reveal`)
+
+### 431 MB of temp memory, off-thread where nothing would notice
+
+`font_scan` reads every font file whole to get its name, into `context.temp_allocator`, and never freed
+it. `%SystemRoot%\Fonts` is **671 files and 431 MB** on this machine, so the worker's arena grew to the
+total size of every installed font.
+
+**Measured, not reasoned:** peak working set **443.8 MB** without a per-file `free_all`, **55.2 MB**
+with. A 1.4 MB program briefly holding 400+ MB. It shipped in v0.79.0 because the mode it is tested by
+asserts *what the scan found*, and a memory figure is invisible to that.
+
+CLAUDE.md pairs the heap with one `free_all` per **frame**; a worker has no frame, so the loop iteration
+is the unit. The glob's path list had to move off temp memory first, since it outlives the reset — which
+is the trap in any per-iteration reset and worth expecting rather than discovering.
+
+### An Alt reveal that stuck for the session
+
+`.Font` and `.Settings` outrank `.Menu` in main.odin's context priority. So on those pages an Alt tap
+set `revealed = true` and **no later key was ever routed to `.Menu`** to reach `menu_close`. The bar
+stayed down for the rest of the session, holding content 30px lower, on a page where Alt reaches
+nothing. Focus loss was the only recovery.
+
+Fixed where the existing "a global chord taken while the menu is open should close it first" rule already
+lives: any key routed outside the menus ends a reveal. Written as *that* rather than "not on the settings
+page", because naming the two contexts that outrank `.Menu` today would go stale on the third.
+
+**§6cp claimed this could not happen** — "every dismissal path already funnels through `menu_close`". That
+was true of the paths I looked at and false of the one I did not, and the reason is structural: the
+reveal's exit lives in the menu subsystem while the thing that decides whether the menu subsystem sees a
+key at all lives in the frame loop.
+
+### The limit of the test, recorded in the test
+
+It drives `menu_close` directly, so it pins that the exit clears both flags and that `MENU_BAR_SHOWN`
+follows. **It does not prove the frame loop reaches that exit — and reaching it was the bug.** The
+context selection is inline in `main.odin` and cannot be called from a mode; deleting the guard leaves
+the test green. Verified live instead (Alt on the Settings page reveals; one Down puts it back).
+
+Extracting that context choice into a proc is what would make it testable, and is the smallest real
+improvement available to the next session on this surface.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
