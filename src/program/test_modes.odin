@@ -28074,6 +28074,73 @@ when NEWTPAD_TESTS {
 			bad += palette_block_case(.Block_Extend_Right, 3)
 			bad += palette_block_case(.Block_Extend_Left, 1)
 
+			// --- the selection can never leave the drawn window (the audit's HIGH) ---
+			//
+			// palette_move clamped `selected` to len(results)-1 while the draw
+			// emitted at most PALETTE_MAX_ROWS rows and started at result 0. With 62
+			// commands the twelfth Down put the highlight on a row nobody could see,
+			// AND Enter still ran it -- running an unseen command is the defect; the
+			// vanished highlight was the symptom.
+			//
+			// Asserted against the LAYOUT, not against palette_resolve_top alone: the
+			// pure resolver could be perfect while the draw ignored it, which is the
+			// shape this whole file exists to catch.
+			{
+				fmt.println("-- the selection stays inside the drawn rows --")
+				pa: App
+				pw: plat.Window
+				pt2: plat.Text
+				plat.text_load_faces(&pt2)
+				app_new_scratch(&pa)
+				defer app_destroy(&pa)
+				palette_open(&pa)
+				palette_input_rune(&pa, '>') // every command, so the list overflows
+				n := len(pa.palette.results)
+				ps_chk :: proc(bad: ^int, cond: bool, msg: string) {
+					fmt.printfln("  %-4s %s", "OK" if cond else "FAIL", msg)
+					if !cond {bad^ += 1}
+				}
+				ps_chk(&bad, n > PALETTE_MAX_ROWS, fmt.tprintf("precondition: %d results overflow the %d drawn rows", n, PALETTE_MAX_ROWS))
+
+				// FIRST stray, and stop there. Recording the last one and calling it
+				// the first is how a failure message misleads the person reading it:
+				// under the sabotage this said "step 77" when the selection had in
+				// fact been off-screen since step 12.
+				worst := -1
+				for step in 0 ..< n + 4 {
+					l := palette_layout(&pa, 1280, 900)
+					sel := pa.palette.selected
+					// The window the draw actually emits.
+					if sel < l.top || sel >= l.top + l.nres {worst = step;break}
+					palette_move(&pa, 1)
+				}
+				ps_chk(&bad, worst < 0, fmt.tprintf("walking Down through all %d results keeps the selection drawn (first stray at step %d)", n, worst))
+
+				// And back up again -- a top that only ever grew would strand the
+				// list scrolled past the selection on the way back.
+				worst_up := -1
+				for step in 0 ..< n + 4 {
+					l := palette_layout(&pa, 1280, 900)
+					sel := pa.palette.selected
+					if sel < l.top || sel >= l.top + l.nres {worst_up = step;break}
+					palette_move(&pa, -1)
+				}
+				ps_chk(&bad, worst_up < 0, fmt.tprintf("...and walking back up does too (first stray at step %d)", worst_up))
+
+				// A click on the first visible row must pick the result that is
+				// THERE, not result 0.
+				palette_move(&pa, 40)
+				l := palette_layout(&pa, 1280, 900)
+				row_y := l.y0 + l.qh + l.rowh * 0.5
+				hit := palette_row_at(&pa, l.x0 + l.w * 0.5, row_y, 1280, 900)
+				ps_chk(&bad, hit == l.top, fmt.tprintf("a click on the top drawn row picks result %d, not 0 (got %d)", l.top, hit))
+
+				// Narrowing the query must not leave the list scrolled off its end.
+				palette_input_rune(&pa, 'z')
+				l2 := palette_layout(&pa, 1280, 900)
+				ps_chk(&bad, l2.top == 0, fmt.tprintf("a narrowed result set scrolls back to the top (top=%d)", l2.top))
+			}
+
 			// Non-zero exit, for the reason keytest grew one: a mode that only ever
 			// prints its verdict is a mode whose verdict a sweep can miss.
 			mode_done("palettetest", bad)

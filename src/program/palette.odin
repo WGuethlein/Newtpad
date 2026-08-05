@@ -45,6 +45,11 @@ Palette :: struct {
 	// THE KEYBOARD CURSOR. What Enter runs, and the only thing that does. Moves on
 	// a key, on a click, and on a query change -- never on mouse movement.
 	selected: int,
+	// First result drawn, so a selection past the twelfth row scrolls into view
+	// instead of disappearing. Resolved by palette_resolve_top through the layout,
+	// which is the only place that decides it -- the draw and the hit-test read
+	// l.top and never compute their own.
+	top:      int,
 	// WHERE THE POINTER IS, and nothing else: purely visual, -1 when the pointer is
 	// off the list. Split from `selected` on 2026-08-04 because palette_hover runs
 	// every frame off the LIVE cursor and used to write `selected` directly, so a
@@ -178,9 +183,16 @@ palette_backspace :: proc(app: ^App) {
 }
 
 palette_move :: proc(app: ^App, delta: int) {
-	n := len(app.palette.results)
+	p := &app.palette
+	n := len(p.results)
 	if n == 0 {return}
-	app.palette.selected = clamp(app.palette.selected + delta, 0, n - 1)
+	p.selected = clamp(p.selected + delta, 0, n - 1)
+	// Scroll follows the selection HERE, in the input phase, so the draw only ever
+	// reads a settled offset. This is the fix for the audit's open HIGH: selected
+	// clamped to n-1 while the draw emitted at most PALETTE_MAX_ROWS rows, so with
+	// 62 commands the twelfth Down put the highlight on a row nobody could see --
+	// and Enter still ran it.
+	p.top = palette_resolve_top(p.top, p.selected, n, PALETTE_MAX_ROWS)
 }
 
 @(private = "file")
@@ -198,6 +210,9 @@ palette_recompute :: proc(app: ^App) {
 	p := &app.palette
 	clear(&p.results)
 	p.selected = 0
+	// Back to the top with it. A `top` left from a longer result set would strand
+	// the narrowed list scrolled past its own end.
+	p.top = 0
 	// The row set is about to change under it, so an index into the OLD list points
 	// at a different row now. palette_hover re-establishes it next frame if the
 	// pointer is still over the list; leaving it stale draws a hover on a row the
@@ -256,6 +271,28 @@ Palette_Layout :: struct {
 	qh, rowh:     f32, // query field height, row height
 	hint:         f32, // the dimmed prefix-legend footer
 	nres:         int, // result rows actually drawn
+	// First result drawn. The list SCROLLS: nres caps how many rows fit, and
+	// without a first-row offset the selection could move past the last drawn row
+	// and vanish -- palette_move clamps to len(results)-1, the draw emitted
+	// min(len(results), PALETTE_MAX_ROWS), and with 62 commands pressing Down
+	// twelve times put the highlight on a row nobody could see while Enter still
+	// ran it. Running an unseen command is the failure; the missing highlight was
+	// only the symptom.
+	top:          int,
+}
+
+// Scroll the minimum needed to keep `sel` inside a window of `max_rows`.
+//
+// PURE, and separate from the layout, so palettetest can drive it without a
+// device -- the same split settings_resolve_top and menu_resolve_top already use.
+// Clamped both ways: a `top` left over from a longer result set must not strand
+// the list past its own end when the query narrows.
+palette_resolve_top :: proc(top, sel, n, max_rows: int) -> int {
+	if n <= max_rows {return 0}
+	t := clamp(top, 0, n - max_rows)
+	if sel < t {t = sel}
+	if sel >= t + max_rows {t = sel - max_rows + 1}
+	return clamp(t, 0, n - max_rows)
 }
 
 palette_layout :: proc(app: ^App, width, height: f32) -> Palette_Layout {
@@ -289,6 +326,11 @@ palette_layout :: proc(app: ^App, width, height: f32) -> Palette_Layout {
 	l.qh = sx(34)
 	l.rowh = sx(26)
 	l.nres = min(len(p.results), PALETTE_MAX_ROWS)
+	// READ, not resolved: p.top is settled in the input phase (palette_move,
+	// palette_recompute). Resolving it here would be scroll resolution inside
+	// the draw, which CLAUDE.md forbids outright -- and menu_scroll_to_item is
+	// already carrying that violation with a HANDOFF note owed against it.
+	l.top = clamp(p.top, 0, max(0, len(p.results) - PALETTE_MAX_ROWS))
 	// Every mode contributes its own height. Help draws a fixed list and produces
 	// no results, so sizing purely off nres left its text outside the box.
 	body_rows := f32(l.nres)
@@ -319,7 +361,10 @@ palette_row_at :: proc(app: ^App, mx, my, width, height: f32) -> int {
 	if my < top {return -1} // the query field, not a row
 	i := int((my - top) / l.rowh)
 	if i < 0 || i >= l.nres {return -1}
-	return i
+	// SCREEN row + scroll offset = RESULT index. Returning `i` alone meant a
+	// click on the first visible row always picked result 0, whatever was
+	// scrolled to -- the same divergence in the other direction.
+	return l.top + i
 }
 
 // Highlight the row under the pointer. Live cursor, not win.mouse_y, which only
@@ -407,15 +452,31 @@ palette_draw_match :: proc(gfx: ^plat.Gfx, text: ^plat.Text, label, query: strin
 		plat.text_draw(gfx, text, label, x, y, UI_PX, fg)
 		return
 	}
+	// RUNES, not bytes. This walked `0 ..< len(label)` and drew `label[i:i+1]`,
+	// which is one BYTE -- so a multi-byte rune became several invalid one-byte
+	// draws and rendered as that many replacement boxes. It went unnoticed while
+	// every command title was ASCII, and appeared the moment six of them took a
+	// real ellipsis in v0.74.0: "Save As…" drew as "Save As???" in the palette
+	// while the menus, which draw the label in one call, were fine.
+	//
+	// The MATCH stays byte-wise over ASCII, which is correct rather than a
+	// shortcut: `query` is ascii_lower'd, so only an ASCII rune can ever match,
+	// and a multi-byte rune simply never lights up.
 	cw := plat.text_char_width(text, UI_PX)
 	qi := 0
-	for i in 0 ..< len(label) {
+	col := 0
+	for r, bi in label {
 		hit := false
-		if qi < len(query) && ascii_lower(label[i]) == ascii_lower(query[qi]) {
+		if r < 0x80 && qi < len(query) && ascii_lower(u8(r)) == ascii_lower(query[qi]) {
 			hit = true
 			qi += 1
 		}
-		plat.text_draw(gfx, text, label[i:i + 1], x + f32(i) * cw, y, UI_PX, g_theme[.Accent] if hit else fg)
+		n := utf8.rune_size(r)
+		plat.text_draw(gfx, text, label[bi:bi + n], x + f32(col) * cw, y, UI_PX, g_theme[.Accent] if hit else fg)
+		// Cells, not runes: a full-width codepoint occupies two. Chrome labels are
+		// Latin today, but the advance has to come from the same place the editor's
+		// does or a CJK command name would overlap its own next glyph.
+		col += plat.text_cell_width_at(text, r, col, .UI)
 	}
 }
 
@@ -472,8 +533,11 @@ palette_draw :: proc(gfx: ^plat.Gfx, quad_pipe: ^plat.Quad_Pipeline, text: ^plat
 		return
 	}
 
-	for i in 0 ..< nres {
-		ry := y0 + qh + f32(i) * rowh
+	for vis in 0 ..< nres {
+		// `vis` is the row on screen; `i` is which result it is.
+		i := l.top + vis
+		if i >= len(p.results) {break}
+		ry := y0 + qh + f32(vis) * rowh
 		// Two states, two weights -- but NOT the menu's two weights.
 		//
 		// v0.68.0 gave this row the accent fill with bg_base text, which is UI spec
