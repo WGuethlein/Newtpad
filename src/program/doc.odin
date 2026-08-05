@@ -317,14 +317,20 @@ gutter_box_w :: proc(doc: ^Document, char_w: f32) -> f32 {
 	return max(sx(GUTTER_MIN_W), f32(gutter_digits(doc_line_count(doc))) * char_w)
 }
 
-// UI spec §8: "in wrap mode cap the text column at 100 characters and left-align.
-// On a maximised 1440p window an uncapped wrap gives 200-character lines." The
-// left-align half needs no code -- the column already starts at the left margin,
-// so capping the width alone leaves the text where it was and shortens the line.
+// REMOVED (Wyatt, live use 2026-08-05): wrap follows the window width.
 //
-// Not a setting. Principle 3 fights options, and a measure this is a readability
-// constant rather than a preference: the number comes from the spec, not taste.
-WRAP_COL_CAP :: 100
+// This was §8's rule -- "in wrap mode cap the text column at 100 characters and
+// left-align. On a maximised 1440p window an uncapped wrap gives 200-character
+// lines" -- and the reasoning is sound in the abstract. What it looked like in
+// practice was a bug: "word wrap doesn't wrap on every width, it wraps to an
+// extent then stops, it should be reflective of the width". On a split-pane
+// window of ~120 columns the text stopped at 100 and left a band of dead space
+// that reads as broken layout, not as a typographic choice.
+//
+// The spec is a target state, not scripture, and Wyatt decides. Kept as a named
+// constant with this note rather than deleted, so the next person to read §8 and
+// wonder why the code disagrees finds the answer here instead of reinstating it.
+WRAP_COL_CAP :: 100 // not applied; see above
 
 // Usable content width in cells -- what word wrap breaks at. One definition,
 // like col_x/col_at_x above: the main loop subtracted GUTTER_W and the resize
@@ -342,7 +348,10 @@ WRAP_COL_CAP :: 100
 // Call after doc_update_gutter -- it reads GUTTER_W.
 doc_view_cols :: #force_inline proc(width, char_w: f32, wrapping := false) -> int {
 	n := max(1, int((width - TEXT_MARGIN_X - GUTTER_W - SCROLLBAR_W) / char_w))
-	return min(n, WRAP_COL_CAP) if wrapping else n
+	// No cap: `wrapping` no longer changes the answer. Kept as a parameter because
+	// the non-wrapped path's callers (horizontal scroll, h-scroll extent) read this
+	// too, and a signature change would touch every one of them to say nothing.
+	return n
 }
 
 // Right edge of the editor's content area. The full window normally; the split
