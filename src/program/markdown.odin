@@ -2048,35 +2048,55 @@ MD_TICK_STEPS :: 32
 // -- the md_row_fits precedent.
 md_tick_quads :: proc(bx, by, bs: f32, col: [4]f32, out: []plat.Quad) -> (n: int) {
 	st := max(1, hairline())
-	// Half the box, so the tick clears the 1-2px border on every side instead
-	// of touching it. Clamped to bs itself (Finding 5, 2026-07 review): at a
-	// small enough box (bs < 4*st) the unclamped `bs*0.5` still loses to
-	// `st*2`, so arm could exceed bs and the tick's origin (`bx + (bs-arm)*0.5`)
-	// went negative -- the tick escaped the box it is supposed to sit inside.
+	// Half the box, so the tick clears the border on every side instead of
+	// touching it. Clamped to bs itself (Finding 5, 2026-07 review): at a small
+	// enough box (bs < 4*st) the unclamped `bs*0.5` still loses to `st*2`, so arm
+	// could exceed bs and the origin went negative -- the tick escaped the box it
+	// is supposed to sit inside.
 	arm := min(bs, max(st * 2, bs * 0.5))
-	x0 := bx + (bs - arm) * 0.5
-	y0 := by + (bs - arm) * 0.5
-	span := max(0, arm - st)
-	// `+2`, not `+1` (Finding 4, 2026-07 review): steps-1 must be >= span/st or
-	// consecutive st-sized squares leave a gap along the diagonal (measured:
-	// `clamp(int(arm),...)` gave 5 steps for the mdtest fixture, spacing
-	// span/(steps-1) = 1.15px against a 1px square -- a ~0.15px break, the one
-	// ui_tabs.odin's `.Close` case avoids by stepping exactly 1px). `int()`
-	// truncates, so `int(span/st)+1` is only ever <= the true minimum step
-	// count (floor(x)+1 can equal ceil(x), never exceed it) and can still leave
-	// a gap; `+2` is strictly more steps than `span/st` requires, which is what
-	// guarantees spacing < st -- overlap or an exact touch, never a break. The
-	// endpoints stay EXACT regardless of the step count: `f` below always runs
-	// 0 to span inclusive, which is what keeps the centring assertions valid to
-	// 0.05px.
-	steps := clamp(int(span / st) + 2, 2, MD_TICK_STEPS)
-	for i in 0 ..< steps {
-		if n + 2 > len(out) {break}
-		f := span * f32(i) / f32(steps - 1)
-		out[n] = {pos = {x0 + f, y0 + f}, size = {st, st}, color = col}
-		out[n + 1] = {pos = {x0 + span - f, y0 + f}, size = {st, st}, color = col}
-		n += 2
+
+	// A CHECK, not an X. UI spec 9.2 item 9 and §9.4's mockup both show an
+	// accent-FILLED box with a dark tick; this drew an accent-outlined box with an
+	// X in it, which reads as "rejected" rather than "done".
+	//
+	// Still quads rather than a glyph, for the reason the X was: batch 12 moved the
+	// chrome onto one font, so a glyph is one substitution away from being a box.
+	//
+	// The bounding box is EXACTLY w x h by construction -- the first stroke starts
+	// at the left edge, the second ends at the right, the vertex touches the bottom
+	// and the second stroke's end touches the top -- and that box is centred in the
+	// checkbox. That is what keeps mdtest's 0.05px centring assertion meaningful: a
+	// check leans, so its ink is not symmetric, but the SPAN it occupies still is,
+	// and centring the span is the claim that assertion was making about the X.
+	w := arm
+	h := max(st, arm * 0.72)
+	x0 := bx + (bs - w) * 0.5
+	y0 := by + (bs - h) * 0.5
+	// The USABLE span is (w - st, h - st), not (w, h): every quad is st square
+	// and drawn from its origin, so an endpoint at w would put ink at w + st and
+	// the tick would escape the box. Caught by mdtest's degenerate case (bs <
+	// 4*st), where h - st is small enough that a fraction of h overshoots it --
+	// the same class as Finding 5, which is why that case is in the suite.
+	uw := max(0, w - st)
+	uh := max(0, h - st)
+	vx := x0 + uw * 0.38 // where the short stroke meets the long one
+
+	seg :: proc(ax, ay, bx2, by2, st: f32, col: [4]f32, out: []plat.Quad, n: ^int) {
+		dx, dy := bx2 - ax, by2 - ay
+		span := max(abs(dx), abs(dy))
+		// `+2` for the same reason the diagonals used it: strictly more steps than
+		// span/st requires, so consecutive st-sized squares overlap or touch and
+		// never leave a gap along the stroke. Endpoints stay exact at any count.
+		steps := clamp(int(span / st) + 2, 2, MD_TICK_STEPS)
+		for i in 0 ..< steps {
+			if n^ >= len(out) {return}
+			f := f32(i) / f32(steps - 1)
+			out[n^] = {pos = {ax + dx * f, ay + dy * f}, size = {st, st}, color = col}
+			n^ += 1
+		}
 	}
+	seg(x0, y0 + uh * 0.42, vx, y0 + uh, st, col, out, &n)
+	seg(vx, y0 + uh, x0 + uw, y0, st, col, out, &n)
 	return
 }
 
@@ -5631,14 +5651,23 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 			asc, _, _ := plat.text_vmetrics(text, m.body, .Body)
 			by := ytop + max(0, asc - bs)
 			edge := hairline()
-			bc := g_theme[.Accent] if lay.cls.task_done else g_theme[.Text_Muted]
 			bq: [4 + MD_TICK_STEPS * 2]plat.Quad
-			bq[0] = {pos = {lx, by}, size = {bs, edge}, color = bc}
-			bq[1] = {pos = {lx, by + bs - edge}, size = {bs, edge}, color = bc}
-			bq[2] = {pos = {lx, by}, size = {edge, bs}, color = bc}
-			bq[3] = {pos = {lx + bs - edge, by}, size = {edge, bs}, color = bc}
-			nq := 4
-			if lay.cls.task_done {nq += md_tick_quads(lx, by, bs, g_theme[.Accent], bq[4:])}
+			nq := 0
+			if lay.cls.task_done {
+				// FILLED, with the tick knocked out in the page colour -- §9.4's mockup
+				// is `bg=#d99b62 fg=#221f1c r=3px`. A done item should read as done from
+				// across the pane; an outline reads as a control nobody has touched.
+				r := edge * 3
+				bq[0] = {pos = {lx, by}, size = {bs, bs}, color = g_theme[.Accent], radius = {r, r, r, r}}
+				nq = 1 + md_tick_quads(lx, by, bs, g_theme[.Bg_Base], bq[1:])
+			} else {
+				bc := g_theme[.Text_Muted]
+				bq[0] = {pos = {lx, by}, size = {bs, edge}, color = bc}
+				bq[1] = {pos = {lx, by + bs - edge}, size = {bs, edge}, color = bc}
+				bq[2] = {pos = {lx, by}, size = {edge, bs}, color = bc}
+				bq[3] = {pos = {lx + bs - edge, by}, size = {edge, bs}, color = bc}
+				nq = 4
+			}
 			plat.quads_draw(gfx, qp, bq[:nq])
 		} else if len(lay.cls.bullet) > 0 {
 			asc, _, _ := plat.text_vmetrics(text, m.body, .Body)

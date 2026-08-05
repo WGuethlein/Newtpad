@@ -576,7 +576,7 @@ main :: proc() {
 		}
 		// The tap above can have just revealed the bar, and every hit-test below
 		// this point reads CHROME_TOP. Apply before them, not after.
-		menu_bar_apply(&app)
+		menu_bar_apply(&app, f32(window.width))
 		// Alt+<char> mnemonics, matched on the layout-translated character.
 		// Explicit Alt bindings (Alt+Z) already consumed their press via the key
 		// path, so this only sees letters no binding claimed.
@@ -2105,7 +2105,7 @@ render_frame :: proc(rc: ^Render_Ctx, vsync := true) {
 	doc := app_active(rc.app)
 	// Before ANY geometry below reads CHROME_TOP. A resize repaints through this
 	// path without going round the frame loop, so the loop's call is not enough.
-	menu_bar_apply(rc.app)
+	menu_bar_apply(rc.app, f32(window.width))
 	doc_update_top_inset(doc) // filter banner inset; must match the main loop's value
 	// The same split the frame loop makes (see its comment): `rows` is what
 	// fits wholly and feeds the scroll/scrollbar geometry, `drawn` adds the
