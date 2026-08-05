@@ -2532,6 +2532,18 @@ Md_Class :: struct {
 	task:      bool,
 	task_done: bool,
 	is_sep:    bool, // a table separator row draws as a rule, not as cells
+	// Is this row the FIRST or LAST of its table? §9.4 draws a table as one
+	// bordered card, but a table reaches the draw as one block PER ROW, each
+	// admitted independently by the viewport -- so the card's top edge, bottom
+	// edge and rounded corners have to be attributed to a row, and only the
+	// layout knows which row it is looking at.
+	//
+	// Decided here rather than in the draw because md_table_ensure is already
+	// called here and carries the table's byte range; asking again from the draw
+	// would be a second producer of "where does this table begin", and a frame
+	// where the two disagreed would draw a card with two tops or none.
+	tbl_first: bool,
+	tbl_last:  bool,
 }
 
 md_classify :: proc(line, trimmed: string, in_fence: bool) -> (c: Md_Class) {
@@ -3434,6 +3446,12 @@ md_layout_build :: proc(
 		fallback_set = .Doc
 		tcache = md_table_ensure(doc, t, p)
 		e.tcols = md_table_cols(tcache, measure, md_table_char_w(gfx, t, m))
+		if tcache != nil {
+			e.cls.tbl_first = p <= tcache.start
+			// `end` is the last row's newline (pt_line_end_cap semantics), so a row
+			// whose own line end reaches it is the last one.
+			e.cls.tbl_last = line_end >= tcache.end
+		}
 		// md_table_bounds refuses an entry point that is not a real line start (a
 		// physical row longer than RENDER_LINE_CAP, drawn in segments), and a refusal
 		// is nil here. The row still has to draw: one column, the whole measure.
@@ -3706,7 +3724,21 @@ md_layout_build :: proc(
 	// persisted fields (e.store, e.shape, e.spans, e.boxes above) are all built on
 	// context.allocator and md_layout_free deletes them through the same, so this
 	// is clean today -- but it is an invariant nothing enforces, only audits.
-	if e.h <= 0 {e.h = plat.shape_run(gfx, t, " ", px, measure, lead, fallback_set, context.temp_allocator).line_h}
+	// A TABLE SEPARATOR ROW COLLAPSES TO A HAIRLINE.
+	//
+	// It drafts no text, so it fell to the empty-block fallback and took a whole
+	// mono line -- an empty band between the header and the body wide enough to
+	// read as a missing row. §9.4's card has no separator row at all: the body
+	// starts directly under the header band, and the band's own colour change is
+	// the boundary.
+	//
+	// A hairline rather than 0: this height feeds the scroll/admit arithmetic, and
+	// a zero-height block is a shape nothing else in the pass produces. One pixel
+	// is invisible and keeps every "how far did this block advance" answer > 0.
+	if e.cls.kind == .Table && e.cls.is_sep {
+		e.h = hairline()
+	}
+		if e.h <= 0 {e.h = plat.shape_run(gfx, t, " ", px, measure, lead, fallback_set, context.temp_allocator).line_h}
 	// h1 and h2 carry a rule (9.2 item 1). It is part of the block's OWN height,
 	// not decoration painted after it: a rule drawn at the block's bottom edge
 	// while the height stopped above it is a row of pixels the admit decision
@@ -5605,15 +5637,54 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		// admitted -- a rule or a column rule painted to lay.h under a partial
 		// admit is the overhang the admit test exists to prevent (same reason as
 		// Fence_Body's band).
+		// §9.4's CARD: a 1px Md_Rule border at radius 6 around the whole table,
+		// with the header row on Bg_Raised. Built per row, because a table arrives
+		// as one block per row -- left and right edges on every row, the top edge
+		// and its corners only on the first, the bottom only on the last.
+		//
+		// ad.h, never lay.h, for every quad here. A partially admitted last row
+		// must not paint a bottom edge below the glyphs the pane accepted, which is
+		// the same overhang rule Fence_Body's band follows -- and on a card it is
+		// worse than an overhang, because a bottom edge drawn mid-table says "the
+		// table ends here" about a table that does not.
+		{
+			tw := min(md_table_extent(lay.tcols), x1 - x)
+			if tw > 0 {
+				edge := hairline()
+				r := m.fence_radius
+				rule := g_theme[.Md_Rule]
+				// The header is the row ABOVE the separator, which is the first row
+				// of any well-formed table -- and `tbl_first` is how the card knows
+				// its top anyway, so the fill needs no separate notion of "header".
+				if lay.cls.tbl_first {
+					plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x, ytop}, size = {tw, ad.h}, color = g_theme[.Bg_Raised], radius = {r, r, 0, 0}}})
+				}
+				// Side edges, every row.
+				plat.quads_draw(
+					gfx,
+					qp,
+					[]plat.Quad {
+						{pos = {x, ytop}, size = {edge, ad.h}, color = rule},
+						{pos = {x + tw - edge, ytop}, size = {edge, ad.h}, color = rule},
+					},
+				)
+				if lay.cls.tbl_first {
+					plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x, ytop}, size = {tw, edge}, color = rule, radius = {r, r, 0, 0}}})
+				}
+				if lay.cls.tbl_last {
+					plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x, ytop + ad.h - edge}, size = {tw, edge}, color = rule, radius = {0, 0, r, r}}})
+				}
+			}
+		}
 		if lay.cls.is_sep {
-			// The separator row becomes a rule (9.2 item 6: "md_rule borders"),
-			// vertically centred in its own row, and exactly as wide as the columns
-			// it sits under -- md_table_extent, not a re-summed cell count.
-			// `x` is md_block_origin -- the same origin the cells' glyphs are placed
-			// at, which for a table is cx (indent 0). Not `cx`: two names for one
-			// origin is how a decoration and its text drift apart.
-			w := min(md_table_extent(lay.tcols), x1 - x)
-			plat.quads_draw(gfx, qp, []plat.Quad{{pos = {x, ytop + ad.h * 0.5}, size = {max(0, w), hairline()}, color = g_theme[.Md_Rule]}})
+			// NOTHING. The separator used to draw its own md_rule, centred in a
+			// full-height row -- which was right when the table had no card around
+			// it. §9.4 draws the header on bg_raised with the body plain beneath and
+			// NO line between them: the band's colour change is the boundary, and a
+			// rule on top of it is a second answer to the same question.
+			//
+			// The row is a hairline tall now (see md_layout_build), so there is also
+			// nowhere left to centre anything in.
 		} else {
 			// One rule per column boundary, down the middle of the gutter between
 			// two fitted columns, spanning the row's admitted height. A quad and not
