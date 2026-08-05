@@ -8371,6 +8371,60 @@ better, not worse.
 - Extracting the frame loop's context selection into a proc, so the Alt-reveal wiring (§6ct) becomes
   testable.
 
+## 6cv. The markdown table becomes a card (2026-08-05, v0.82.0, branch `feat/md-table-card`)
+
+§9.4's bordered table card — the largest single visual item the sweep had left. 1px `Md_Rule` border at
+radius 6, header row on `Bg_Raised`, and the separator row gone.
+
+### Built per row, because a table IS per row
+
+A table reaches the draw as **one block per row**, each admitted independently by the viewport. So the
+card is assembled from row fragments: side edges on every row, the top edge and its corners only on the
+first, the bottom only on the last. Every quad reads `ad.h`, never `lay.h` — a partly admitted last row
+must not paint a bottom edge, and on a card that is worse than an overhang, because a bottom edge
+mid-table asserts "the table ends here" about a table that does not.
+
+`md_layout_build` attributes `tbl_first` / `tbl_last`, since it already calls `md_table_ensure` and that
+cache carries the table's byte range. Asking again from the draw would be a second producer of "where
+does this table begin", and a frame where the two disagreed would draw a card with two tops or none.
+
+### The separator row
+
+Collapsed to a hairline, drawing nothing. It used to take a full mono line from the empty-block fallback
+— a band between header and body wide enough to read as a missing row — and to draw its own `md_rule`,
+which was correct before the card and is now a second answer to a boundary the header band's colour
+change already makes. §9.4 has no separator row at all.
+
+**A named exception:** the column rules **stay**, against the mockup (Wyatt's call). Unlike §10's grid,
+the preview has no zebra to carry structure in their place. Rows also stay variable rather than the
+mockup's 26px, because wrapping was Wyatt's 2026-07-29 decision and the mockup was drawn against a
+two-column table where nothing needed to wrap.
+
+### Three bad probes, all caught by sabotage
+
+Every one of them was in the test, and every one would have passed a review:
+
+1. Sampled the row's vertical **middle** — where the glyphs are — so it compared header ink against body
+   ink and stayed green with the band deleted.
+2. Moved to a top strip that turned out to be `Bg_Base`, so it compared noise.
+3. Compared `row1_y - hdr_y` against `trow * 1.5` with `hdr_y := row1_y - trow` — which reduces to
+   `trow <= trow * 1.5` and is **true for every input**. A tautology dressed as a measurement.
+
+The band is now located by **scanning for `Bg_Raised`** rather than computing where it ought to be. A
+probe derived from data cannot be off by a row, and this is the third time this session that a
+placement computed from arithmetic measured the wrong thing.
+
+### One claim I could not establish, and did not dress up
+
+The band-to-row1 measurement **does not move** when the separator collapse is reverted, and I could not
+work out why within that fixture. Rather than tune the bound until it looked like a guard, the test says
+so. What actually catches the revert is a front-matter rule-position assertion further down the same
+mode, because every block below the table shifts — **real coverage, but incidental, and incidental
+coverage is one refactor from vanishing.**
+
+**Owed: a fixture that measures a table's own height directly.** That is the assertion this task should
+have produced and did not.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
