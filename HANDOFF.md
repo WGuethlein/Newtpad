@@ -8202,6 +8202,69 @@ answerable and the third — localized family names — is unsolved and must be 
 Also still open: the preview's markdown table is text-with-rules rather than §9.4's bordered card, and
 `menu_bar_command` / the find bar's replace row still carry their own geometry rather than `ui`'s.
 
+## 6cs. Font enumeration — the near queue is empty (2026-08-05, v0.79.0, branch `feat/font-enumeration`)
+
+Phase 4 of the polish batch, and the last item on the UI near queue. **22 monospaced families on this
+machine against the curated 14**, including the CJK mono faces (MS Gothic, SimSun, NSimSun, the
+MingLiU-ExtB set) the grid has been able to render since `text_cell_width_at` learned width 2.
+
+### The design call: no `IDWriteFontCollection`
+
+The obvious route is the system font collection. Getting from a family back to the file it lives in
+needs `IDWriteFontFace → GetFiles → IDWriteFontFile → GetLoader → QueryInterface →
+IDWriteLocalFontFileLoader → GetFilePathFromKey`, plus the collection/family/font/localized-strings
+chain for the name — **eight interfaces to hand-bind**, in a `dwrite.odin` that binds four and leaves
+every unused vtable slot as `rawptr`. A hand-written vtable is not compiler-checked: miscount the slots
+and you call a different method with the wrong arguments, which is a crash if you are lucky.
+
+Instead: walk the two font directories, and read each file's own `name` table
+([`base/sfnt.odin`](src/base/sfnt.odin)). No new COM, and **pure**, so it is testable with `odin test` —
+which the COM route never could be. en-US only, because the chosen family goes into `settings.txt` as a
+plain string and has to mean the same thing on a machine with a different display language.
+
+The monospace test is a **measurement, not a flag**. `IsMonospacedFont` is a ninth interface and reports
+the font's claim about itself; measuring six advances is cheaper to reach *and stricter*, because it
+tests the property the cell grid actually depends on. It doubles as the symbol filter — Marlett,
+Wingdings, Webdings and Symbol fail it twice over (varying advances **and** missing glyphs).
+
+**Per-user fonts load now.** "Install for me only" is the Windows installer's default and puts nothing
+in `%SystemRoot%\Fonts`, which is where most developer fonts land. `add_face` took a bare filename and
+could not reach them at all.
+
+### Two bugs found by making one assertion stronger
+
+**`font_family_known` had to be added because nothing else discriminated.** `text_load_family` returns
+`true` for an unknown name — it loads the Consolas fallback, which *is* a face — so the bool cannot tell
+"found it" from "fell back". The first version of the check compared cell widths instead, and **both
+measured 18.00**, because a stroke font and Consolas genuinely share an advance ratio. It passed while
+proving nothing, and it printed a comparison that read like evidence.
+
+**With that in place, `NSimSun` resolved and would not load.** It lives in `simsun.ttc`, and
+`text_load_family` passed `.TRUETYPE` with face index 0 for everything. *Every* `.ttc` family was
+affected — resolving, loading face 0, erroring nothing, and quietly giving you a different font than the
+one you picked. The container kind comes from the extension now, and `Font_Family` carries a face index
+per style slot.
+
+`fontscantest` deliberately **prefers a `.ttc` family**, because picking any non-curated one exercised a
+`.ttf` and missed this. That is the generalisable bit: a test that picks an arbitrary member of a set
+tests an arbitrary member of a set. Pick the case that broke.
+
+### `text.odin`'s comment against enumeration
+
+Rewritten rather than deleted, with what happened to each of its three grounds: the main-thread cost is
+answered by moving it off-thread and starting it lazily; the "CJK faces would wreck the grid" half was
+simply **wrong**, and excluding them would have been the bug; and the COM count was the real objection
+and an **undercount**. AutoCAD's TrueType technical fonts (`ISOCT*`, `Monotxt`) do pass and are offered —
+they genuinely are monospaced text faces, however odd a choice — and that is stated rather than
+quietly filtered.
+
+### Owed
+
+- The preview's markdown table is still text-with-rules, not §9.4's bordered card.
+- `menu_bar_command` and the find bar's replace row still carry their own geometry rather than `ui`'s.
+- `font_scan` reads every font file in both directories to get its name. Fine here (22 families, no
+  perceptible delay off-thread) and worth measuring on a machine with hundreds before assuming.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
