@@ -30948,6 +30948,36 @@ when NEWTPAD_TESTS {
 					a2.settings.show_menu_bar = false
 					menu_bar_apply(&a2, 900)
 					mt_chk(&bad, !MENU_BAR_SHOWN, "a wide window still honours the setting")
+					
+					// An Alt reveal must not survive a key that went somewhere else.
+					//
+					// .Font and .Settings outrank .Menu in main.odin's context
+					// priority, so on those pages an Alt tap revealed the bar and no
+					// later key was ever routed to .Menu to clear it -- the bar stayed
+					// down for the rest of the session, holding content 30px lower, on
+					// a page where Alt reaches nothing. Only focus loss recovered it.
+					//
+					// WHAT THIS DOES AND DOES NOT COVER, because the difference is the
+					// bug itself. It drives menu_close directly, so it pins that the exit
+					// CLEARS both flags and that MENU_BAR_SHOWN follows. It does NOT prove
+					// the frame loop REACHES that exit -- the context selection is inline
+					// in main.odin and cannot be called from here, and reaching it was
+					// precisely what was broken. Deleting the frame-loop guard leaves this
+					// green; the wiring is covered by a live pass instead. Recorded rather
+					// than left implied, because a green test here reads like more than it
+					// is -- and extracting that context choice into a proc is what would
+					// make it testable.
+					a2.menu.revealed = true
+					a2.menu.mode = true
+					menu_bar_apply(&a2, 900)
+					mt_chk(&bad, MENU_BAR_SHOWN, "precondition: Alt reveals the bar while the setting hides it")
+					// Exactly what the frame loop now does for any key whose context
+					// is not .Menu.
+					if a2.menu.revealed {menu_close(&a2)}
+					menu_bar_apply(&a2, 900)
+					mt_chk(&bad, !a2.menu.revealed, "a key routed outside the menus ends the reveal")
+					mt_chk(&bad, !MENU_BAR_SHOWN, "...and the bar goes back down with it")
+					mt_chk(&bad, !a2.menu.mode, "...and keyboard menu mode ends too, so mnemonics stop being underlined")
 					a2.settings.show_menu_bar = true
 				}
 

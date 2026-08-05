@@ -662,6 +662,22 @@ main :: proc() {
 			if ctx == .Menu && cmd != .None && !is_menu_cmd(cmd) {
 				menu_close(&app)
 			}
+			// ...and a key that routed SOMEWHERE ELSE ENTIRELY ends an Alt reveal.
+			//
+			// The reveal is cleared by menu_close, and every dismissal used to reach it
+			// -- but .Font and .Settings outrank .Menu in the priority above, so on
+			// those pages an Alt tap revealed the bar and then NO later key was ever
+			// routed to .Menu to close it. The bar stayed down for the rest of the
+			// session, holding the content 30px lower, on a page where Alt has nothing
+			// to reach. Focus loss was the only way out.
+			//
+			// Written as "any key not going to the menus" rather than "not on the
+			// settings page": the bug was one instance of a class, and naming the two
+			// contexts that outrank .Menu today would go stale the moment a third
+			// full-page surface is added.
+			if ctx != .Menu && app.menu.revealed {
+				menu_close(&app)
+			}
 			// srows, not rows: .Page_Up/.Page_Down (commands.odin) scroll by
 			// `rows - 1` and clamp against doc_max_top(rows) -- the vertical
 			// SCROLL MODEL's count, which is the grid's own budget in a grid and
