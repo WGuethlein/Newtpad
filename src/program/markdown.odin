@@ -542,6 +542,32 @@ MD_TABLE_BUDGET :: 1 * 1024 * 1024
 MD_TABLE_MAX_COLS :: 32
 MD_TABLE_FIXED_CELLS :: 16 // fixed column width past the budget
 MD_TABLE_PAD :: 2 // cells of gap between columns
+// Cells of breathing room INSIDE the card, at each end of a row.
+//
+// MD_TABLE_PAD is the gap BETWEEN columns, with the rule down its middle -- so it
+// already keeps text off the rules. It does nothing at the two ends, because
+// column 0 started at x=0 and the last column's right edge WAS the card's border:
+// the first and last cells in every row sat flush against it. Wyatt, live use
+// 2026-08-05: "we need a little in each direction just to make it a little
+// readable and separate from the edges".
+//
+// One cell, not §9.4's 10px: the measure is denominated in cells here and a pixel
+// constant would stop being one cell at another zoom or font size.
+MD_TABLE_INSET :: 1
+
+// Extra leading on a table row, so a cell's text is not flush against the card's
+// top and bottom borders. Wyatt asked for "a little in each direction"; this is
+// the vertical half, and MD_TABLE_INSET is the horizontal one.
+MD_TABLE_LEAD_96 :: f32(4)
+
+// A table row's line height, leading included. ONE PRODUCER: the layout shapes
+// rows to this and mdtest's probes compare against it. They used to both spell
+// `line_height(m.table)` independently, so adding the leading made the layout and
+// every probe disagree by exactly the leading -- two expressions for one number,
+// which is the shape of every seam bug in this codebase.
+md_table_lead :: proc(m: ^Md_Metrics) -> f32 {
+	return line_height(m.table) + sx(MD_TABLE_LEAD_96)
+}
 
 // The clamps md_table_fit_cells fits a table's natural columns to the measure
 // with. UI spec §10 gives the TABLE VIEW's rule -- "measure the first 200 rows,
@@ -1624,7 +1650,10 @@ md_table_char_w :: proc(gfx: ^plat.Gfx, t: ^plat.Text, m: ^Md_Metrics) -> f32 {
 md_table_cols :: proc(c: ^Md_Table_Cache, measure, char_w: f32, allocator := context.allocator) -> []Md_Table_Col {
 	if c == nil || c.ncols <= 0 || char_w <= 0 {return nil}
 	cells: [MD_TABLE_MAX_COLS]int
-	avail := int(measure / char_w)
+	// Both insets come out of the budget FIRST. Without that the fit spends the
+	// whole measure on columns and the inset pushes the last one past the card's
+	// right border -- which is where the fit was supposed to stop it.
+	avail := max(1, int(measure / char_w) - 2 * MD_TABLE_INSET)
 	n := 0
 	if c.oversize {
 		// Past the budget the columns are FIXED and nothing was scanned, so
@@ -1643,7 +1672,7 @@ md_table_cols :: proc(c: ^Md_Table_Cache, measure, char_w: f32, allocator := con
 	}
 	if n <= 0 {return nil}
 	out := make([]Md_Table_Col, n, allocator)
-	at := 0
+	at := MD_TABLE_INSET
 	for i in 0 ..< n {
 		out[i] = {x = f32(at) * char_w, w = f32(cells[i]) * char_w}
 		at += cells[i] + MD_TABLE_PAD
@@ -1655,10 +1684,15 @@ md_table_cols :: proc(c: ^Md_Table_Cache, measure, char_w: f32, allocator := con
 // stored geometry, so the separator row's rule cannot be a different width from
 // the columns it sits under.
 @(private = "file")
-md_table_extent :: proc(cols: []Md_Table_Col) -> f32 {
+md_table_extent :: proc(cols: []Md_Table_Col, char_w: f32 = 0) -> f32 {
 	if len(cols) == 0 {return 0}
 	last := cols[len(cols) - 1]
-	return last.x + last.w
+	// `char_w` is optional so the callers that only want the columns' own span --
+	// the fit assertions -- keep asking the question they were asking. The CARD
+	// passes it, because its right border has to clear the last cell's text by the
+	// same inset the first cell gets on the left, or the table is visibly
+	// lopsided.
+	return last.x + last.w + f32(MD_TABLE_INSET) * char_w
 }
 
 // One styled run of a line's inline content.
@@ -2934,6 +2968,20 @@ Md_Layout :: struct {
 	fence_lex:   Lexer_Proc,
 	fence_state: base.Lex_State,
 	measure:     f32,
+	// The measure this block was actually SHAPED to, which is no longer the same
+	// number as `measure`.
+	//
+	// `measure` is the layout CACHE KEY and has to be the pane width, or a table's
+	// layout would not invalidate when the pane grew past the prose cap. But §9.3's
+	// 72ch applies to PROSE only, so a paragraph is shaped to min(pane, m.measure)
+	// while a table gets the whole pane. Anything reasoning about how wide THIS
+	// block's content was allowed to be wants this field; anything asking "has the
+	// pane changed" wants `measure`.
+	//
+	// Split out because collapsing them silently widened every consumer: the
+	// indent-overflow check in mdtest read `e.measure - e.indent` as a prose
+	// block's limit and started comparing against the pane.
+	wrap_w:      f32,
 	px:          f32,
 	ui_scale:    f32, // sx()'s scale: `indent` is baked from it
 	theme:       u64, // md_theme_gen: the palette every span colour was baked from
@@ -3303,7 +3351,7 @@ md_layout_build :: proc(
 	in_fence: bool,
 	fence_lex: Lexer_Proc,
 	fence_state: base.Lex_State,
-	measure: f32,
+	pane: f32,
 ) -> (
 	e: Md_Layout,
 ) {
@@ -3312,12 +3360,23 @@ md_layout_build :: proc(
 	e.start, e.end, e.next = p, line_end, line_end + 1
 	e.src = strings.clone(line)
 	e.in_fence, e.fence_lex, e.fence_state = in_fence, fence_lex, fence_state
-	e.measure, e.px, e.revision = measure, m.s, doc.revision
+	e.measure, e.px, e.revision = pane, m.s, doc.revision
 	e.ui_scale, e.theme, e.faces = m.ui_scale, m.theme, m.faces
 	e.out_fence, e.out_lex, e.out_state = in_fence, fence_lex, fence_state
 
 	trimmed := strings.trim_left(e.src, " \t")
 	e.cls = md_classify(e.src, trimmed, in_fence)
+	// §9.3's "measure 72ch max" is a PROSE rule, applied here because this is the
+	// first point that knows what kind of block it is. Tables and fenced code get
+	// the whole pane: neither is continuous prose, and a table punished for extra
+	// columns is what sent this here (see md_content_span).
+	measure := pane
+	#partial switch e.cls.kind {
+		case .Table, .Fence_Body, .Fence_Open, .Fence_Close, .Rule:
+		case:
+			measure = max(1, min(pane, m.measure))
+	}
+	e.wrap_w = measure
 
 	// Front matter is a BLOCK, not a pre-loop special case. Its height comes
 	// from md_fm_height and from nowhere else, which is what removed its
@@ -3442,7 +3501,7 @@ md_layout_build :: proc(
 		// shaper places the cells, the second producer is gone -- md_span_boxes reads
 		// the same Shaped the glyphs were drawn from, so a table cell's link rect
 		// comes from the identical seam every other block's does.
-		px, lead = m.table, line_height(m.table)
+		px, lead = m.table, md_table_lead(m)
 		fallback_set = .Doc
 		tcache = md_table_ensure(doc, t, p)
 		e.tcols = md_table_cols(tcache, measure, md_table_char_w(gfx, t, m))
@@ -3936,9 +3995,24 @@ md_pane_owns :: proc(doc: ^Document, winw, winh, split_frac, mx: f32) -> bool {
 // measured from the PANE's own left edge, which is x0 - TEXT_MARGIN_X (both
 // call sites hand this the margin already added), so the preview gets its 40px
 // without either of them having to know that.
-md_content_span :: proc(m: ^Md_Metrics, x0, x1: f32) -> (cx, measure: f32) {
+// Returns the PANE's usable width, not §9.3's 72ch measure.
+//
+// The 72ch cap moved into md_layout_build, where the block's KIND is known,
+// because it is a PROSE rule and does not transfer to everything. Wyatt, live use
+// 2026-08-05, with a four-column table as the evidence: squeezing more columns
+// into a fixed 72ch makes each one narrower, so every cell wraps more -- his
+// screenshot broke `docs/01-specification.md` across two lines mid-filename. A
+// measure exists so the eye can find the next line of continuous prose; a table
+// cell is a short independent phrase and the eye never travels the row. Capping
+// it produced more eye travel, not less, which is the opposite of the rule's
+// purpose.
+//
+// This also has to be the LAYOUT CACHE KEY, which is the other reason the cap
+// cannot live here: keyed on the capped value, a table's layout would not
+// invalidate when the pane grew from 100ch to 140ch, because the key never moved.
+md_content_span :: proc(m: ^Md_Metrics, x0, x1: f32) -> (cx, pane: f32) {
 	cx = max(x0, x0 - TEXT_MARGIN_X + m.pad_left)
-	return cx, max(1, min(x1 - cx, m.measure))
+	return cx, max(1, x1 - cx)
 }
 
 // UI spec 9.1 item 4: "a scroll offset in PIXELS, not lines".
@@ -5648,7 +5722,7 @@ md_block_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, text: ^plat.Text,
 		// worse than an overhang, because a bottom edge drawn mid-table says "the
 		// table ends here" about a table that does not.
 		{
-			tw := min(md_table_extent(lay.tcols), x1 - x)
+			tw := min(md_table_extent(lay.tcols, md_table_char_w(gfx, text, m)), x1 - x)
 			if tw > 0 {
 				edge := hairline()
 				r := m.fence_radius

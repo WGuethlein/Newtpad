@@ -13538,7 +13538,7 @@ when NEWTPAD_TESTS {
 					if strings.has_suffix(hit.url, "/r1") {r1_y = min(r1_y, hit.rect.pos.y)}
 					if strings.has_suffix(hit.url, "/r2") {r2_y = min(r2_y, hit.rect.pos.y)}
 				}
-				trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, line_height(m.table), .Doc, context.temp_allocator).line_h
+				trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, md_table_lead(&m), .Doc, context.temp_allocator).line_h
 				located := r1_y < 1e9 && r2_y < 1e9 && r2_y > r1_y && trow > 0
 				fchk(&bad, located, fmt.tprintf("fit: both rows' links locate them (%.1f, %.1f; row %.1f)", r1_y, r2_y, trow))
 				if located {
@@ -13581,7 +13581,7 @@ when NEWTPAD_TESTS {
 					if strings.has_suffix(hit.url, "/c1") {c1_y = min(c1_y, hit.rect.pos.y)}
 					if strings.has_suffix(hit.url, "/c2") {c2_y = min(c2_y, hit.rect.pos.y)}
 				}
-				trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, line_height(m.table), .Doc, context.temp_allocator).line_h
+				trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, md_table_lead(&m), .Doc, context.temp_allocator).line_h
 				located := c1_y < 1e9 && c2_y < 1e9 && c2_y > c1_y && trow > 0
 				fchk(&bad, located, fmt.tprintf("fit: both rows of the long fixture locate them (%.1f, %.1f)", c1_y, c2_y))
 				if located {
@@ -13762,8 +13762,12 @@ when NEWTPAD_TESTS {
 			// One table row's line height, from the same shaper the layout uses at the
 			// same face and size. A probe, not a second producer: if the layout stopped
 			// going through the shaper this would stop agreeing with it.
-			trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, line_height(m.table), .Doc, context.temp_allocator).line_h
-			tchk(&bad, measure < x1 - cx - 100, fmt.tprintf("pane: the 72ch measure binds well inside the pane (measure %.0f, pane %.0f)", measure, x1 - cx))
+			trow := plat.shape_run(&h.gfx, &h.text, "x", m.table, 1e6, md_table_lead(&m), .Doc, context.temp_allocator).line_h
+			// The span IS the pane now (§9.3's cap is per-kind, in md_layout_build), and
+			// the pane must still exceed the prose cap or the table cases below would not
+			// be exercising a table that gets MORE room than a paragraph would.
+			tchk(&bad, abs(measure - (x1 - cx)) < 1.5, fmt.tprintf("pane: md_content_span returns the pane (measure %.0f, pane %.0f)", measure, x1 - cx))
+			tchk(&bad, x1 - cx > m.measure + 100, fmt.tprintf("pane: ...and the pane exceeds the 72ch prose cap, so a table gains by it (%.0f vs %.0f)", x1 - cx, m.measure))
 			tchk(&bad, char_w > 0 && trow > 0, fmt.tprintf("pane: the table face resolves (char_w %.2f, row %.1f)", char_w, trow))
 
 			mkdoc :: proc(src, name: string) -> Document {
@@ -14810,9 +14814,13 @@ when NEWTPAD_TESTS {
 				&bad, x1 - cx > m.measure * 1.25,
 				fmt.tprintf("measure: the fixture pane is genuinely wider than 72ch (%.0fpx of room against a %.0fpx measure)", x1 - cx, m.measure),
 			)
+			// md_content_span returns the PANE. §9.3's 72ch is a PROSE rule and now
+			// lives in md_layout_build, where the kind is known -- a table gets the
+			// whole pane, because capping one made its columns narrower and its cells
+			// wrap MORE, which is the opposite of what a measure is for.
 			kchk(
-				&bad, meas == m.measure,
-				fmt.tprintf("measure: ...so md_content_span returns the 72ch CAP and not the pane (%.0f, pane %.0f)", meas, x1 - cx),
+				&bad, abs(meas - (x1 - cx)) < 1.5,
+				fmt.tprintf("measure: ...so md_content_span returns the pane, not the 72ch cap (%.0f, pane %.0f)", meas, x1 - cx),
 			)
 			// ...and the cap is 72 of the BODY face's '0', CSS's own definition of
 			// `ch` -- not 72 of the editor's monospace cell, which is what a preview
@@ -14911,7 +14919,15 @@ when NEWTPAD_TESTS {
 				UI_SCALE = 1
 				// The isolation, stated: if the measure moved too, this would be a
 				// test of the measure term and would pass with ui_scale absent.
-				kchk(&bad, meas1 == meas2, fmt.tprintf("ui scale: the 72ch cap binds at BOTH scales, so the measure is unchanged (%.0f, %.0f)", meas1, meas2))
+				// This was "the cap binds at both scales, so the measure is unchanged",
+				// a PRECONDITION that isolated the list indent as the only variable.
+				// md_content_span returns the pane now, and the pane differs between
+				// scales because pad_left scales -- so the measure is no longer
+				// scale-invariant and that isolation is gone. What still holds, and
+				// still serves the assertions below, is that the prose cap binds at
+				// both scales: a paragraph is capped either way, so the indent really
+				// is what moves.
+				kchk(&bad, meas1 > m1.measure && meas2 > m2.measure, fmt.tprintf("ui scale: the prose cap binds at BOTH scales (pane %.0f vs %.0f, %.0f vs %.0f)", meas1, m1.measure, meas2, m2.measure))
 				kchk(&bad, m2.list_indent > m1.list_indent, fmt.tprintf("ui scale: ...while the list indent really does move (%.0f -> %.0f)", m1.list_indent, m2.list_indent))
 				xa, oka := first_x(h1, "http://ui.example")
 				xb, okb := first_x(h2, "http://ui.example")
@@ -16114,7 +16130,12 @@ when NEWTPAD_TESTS {
 				cx, meas := md_content_span(&m, x0, x1)
 				// The cap must BIND, or every bound below is the pane's and the
 				// property is untestable on this fixture.
-				pchk(&bad, meas == m.measure && x1 - cx > m.measure + sx(100), fmt.tprintf("indent: the 72ch cap binds with room to spare (%.0f of %.0fpx)", meas, x1 - cx))
+				// md_content_span returns the PANE now; §9.3's 72ch moved into
+				// md_layout_build, where the block kind is known. Both halves are pinned:
+				// the span is the pane, AND the pane is wide enough for the prose cap to
+				// bind on the blocks below, or their limits would be untestable here.
+				pchk(&bad, abs(meas - (x1 - cx)) < 1.5, fmt.tprintf("indent: md_content_span returns the pane (%.0f of %.0fpx)", meas, x1 - cx))
+				pchk(&bad, x1 - cx > m.measure + sx(100), fmt.tprintf("indent: ...and the pane is wide enough that the prose cap still binds (%.0f vs %.0f)", x1 - cx, m.measure))
 
 				markdown_draw(&h.gfx, &h.quads, &h.text, &doc, px_, x0, x1, ytop, ybot, Md_Anchor{})
 				over, filled, kinds := 0, 0, 0
@@ -16123,7 +16144,10 @@ when NEWTPAD_TESTS {
 				for &e in doc.md_layout {
 					if !e.valid || e.indent <= 0 || e.sh.lines == 0 {continue}
 					kinds += 1
-					limit := e.measure - e.indent
+					// wrap_w, not measure: `measure` is the cache key and is the PANE now, so
+					// reading it here compared a prose block's width against the whole pane and
+					// the limit silently grew. wrap_w is what this block was shaped to.
+					limit := e.wrap_w - e.indent
 					if e.sh.width > limit + 0.5 {
 						over += 1
 						if len(worst) == 0 {worst = fmt.tprintf("%v indent %.0f wrapped to %.1f of %.1f", e.cls.kind, e.indent, e.sh.width, limit)}

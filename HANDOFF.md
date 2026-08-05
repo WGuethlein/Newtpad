@@ -8425,6 +8425,63 @@ coverage is one refactor from vanishing.**
 **Owed: a fixture that measures a table's own height directly.** That is the assertion this task should
 have produced and did not.
 
+## 6cw. Two spec rules overruled by live use (2026-08-05, v0.83.0, branch `fix/wrap-width-and-table-padding`)
+
+Both from Wyatt using v0.82.0 on his own README.
+
+### Table cell padding
+
+`MD_TABLE_PAD` is the gap *between* columns with the rule down its middle, so it kept text off the
+rules — and did nothing at the two ends. Column 0 started at `x=0` and the last column's right edge
+**was** the card's border, so the first and last cell of every row sat flush against it.
+`MD_TABLE_INSET` is one cell at each end, taken out of the fit's budget **first** so the inset cannot
+push the last column past the border the fit exists to keep it inside. `md_table_lead` adds 4px of
+leading for the vertical half.
+
+### Wrap follows the width — two spec caps removed
+
+Wyatt: *"word wrap doesn't wrap on every width, it wraps to an extent then stops, it should be
+reflective of the width, same with markdown preview."*
+
+Two deliberate spec rules were doing it: the editor's 100-character `WRAP_COL_CAP` (§8, *"on a maximised
+1440p window an uncapped wrap gives 200-character lines"*) and the preview's 72ch measure (§9.3). Both
+arguments are sound in the abstract. On a ~120-column pane both left a band of dead space that reads as
+**broken layout, not as a typographic choice**.
+
+The editor's cap is gone outright. The preview's is now **per kind**: prose keeps 72ch, tables and
+fenced code get the whole pane.
+
+**The reasoning, because it is the transferable part.** A measure exists so the eye can find the next
+line of *continuous prose*. A table cell is a short independent phrase and the eye never travels the
+row — so the rule does not apply, and applying it backfires: squeeze the same columns into 72ch and each
+gets narrower, so each cell wraps *more*. Wyatt's four-column screenshot broke
+`docs/01-specification.md` across two lines **mid-filename**. That is more eye travel, not less. **The
+cap made the table less readable in exactly the way it was meant to prevent.**
+
+Moving the cap out of `md_content_span` had to happen regardless: keyed on the capped value, a table's
+layout would not invalidate when the pane grew from 100ch to 140ch, because the key never moved.
+
+### `Md_Layout.wrap_w`
+
+`measure` is the cache key and is now the pane, so it stopped meaning "the width this block was shaped
+to" — and the two meanings had silently diverged. `mdtest`'s indent-overflow check read
+`e.measure - e.indent` as a prose block's limit and began comparing against the whole pane. `wrap_w`
+records the effective measure; `measure` answers "has the pane changed".
+
+### Seven assertions rewritten, none relaxed
+
+- **Four** existed to prove "the 72ch cap binds" — a premise now deliberately false. They pin the new
+  rule instead: the span is the pane, and the pane is wide enough that the *prose* cap still binds.
+- **Two** computed a table row's height as `line_height(m.table)` while the layout had grown leading —
+  two expressions for one number. `md_table_lead` is now the single producer and the probes read it.
+- **One** (ui scale) lost its precondition: the measure is no longer scale-invariant, because the pane
+  differs with scaled padding. It pins what still holds and still serves the assertions beneath it.
+
+Recorded because the distinction matters: **a failing assertion whose premise a decision made false is
+not a regression, and is not licence to loosen a bound.** Relaxing until green is how a test stops
+rejecting the bug it was written for — which this file has already recorded happening once, to the
+checkbox centring tolerance.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
