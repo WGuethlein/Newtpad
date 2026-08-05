@@ -13,6 +13,8 @@ import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
+import "base:intrinsics"
+import "core:thread"
 import plat "src:platform"
 
 FONT_SIZE_MIN :: 8
@@ -130,12 +132,104 @@ Settings :: struct {
 // checks, but none of them are needed to draw the first frame.
 font_choices: [dynamic]string
 
+// Whether font_choices already includes the scan. Without it, the two call
+// sites above would rebuild the list every frame once the worker landed --
+// cheap, but it would also reset the list while someone is stepping it.
+font_choices_scanned: bool
+
+// The system scan, off the main thread.
+//
+// Wyatt chose: the curated list shows immediately and the scanned families join
+// it when the worker lands (2026-08-04). So this is deliberately NOT waited on
+// anywhere -- font_choices_refresh reports whatever is ready, and the list grows
+// once. Nothing blocks, and the first open of the font page is as fast as it was
+// before enumeration existed.
+//
+// `done` is the only cross-thread state and has a single writer, matching the
+// pattern find.odin's search worker already uses (see its comment on why an
+// atomic bool needs no lock here). `results` is written BEFORE done is set and
+// read only after, so the store-release/load-acquire pair orders it.
+@(private = "file")
+Font_Scan :: struct {
+	th:      ^thread.Thread,
+	results: []plat.Scanned_Family,
+	done:    bool,
+	started: bool,
+}
+@(private = "file")
+g_font_scan: Font_Scan
+
+@(private = "file")
+font_scan_worker :: proc() {
+	g_font_scan.results = plat.font_scan(context.allocator)
+	intrinsics.atomic_store(&g_font_scan.done, true)
+}
+
+// Start the scan if it has not run. Called from the surfaces that offer a font
+// list, so a session that never opens one never pays for it.
+font_scan_kick :: proc() {
+	if g_font_scan.started {return}
+	g_font_scan.started = true
+	g_font_scan.th = thread.create_and_start(font_scan_worker)
+}
+
+// Has the list grown since the last refresh? The font page polls this so it can
+// rebuild once rather than every frame.
+font_scan_landed :: proc() -> bool {
+	return intrinsics.atomic_load(&g_font_scan.done)
+}
+
 font_choices_refresh :: proc() {
 	clear(&font_choices)
+	font_choices_scanned = font_scan_landed()
 	for f in plat.FONT_FAMILIES {
 		if plat.font_family_available(f) {append(&font_choices, f.name)}
 	}
+	// Then anything the scan found that the curated table does not already name.
+	// CURATED FIRST AND CURATED WINS: those entries carry exact bold/italic/
+	// bolditalic files, which is what lets text_load_family use a real face
+	// instead of synthesising emphasis. A scanned duplicate would offer the same
+	// family with whatever the name table happened to say -- the same choice, with
+	// less behind it.
+	if font_scan_landed() {
+		// Hand the results to platform on THIS thread, so find_family can turn a
+		// scanned name into files when one is picked. Without it the name appears
+		// in the list and loading it silently falls back to Consolas.
+		plat.font_scan_publish(g_font_scan.results)
+		for sf in g_font_scan.results {
+			dup := false
+			for existing in font_choices {
+				if strings.equal_fold(existing, sf.name) {dup = true;break}
+			}
+			if !dup {append(&font_choices, sf.name)}
+		}
+	}
 	if len(font_choices) == 0 {append(&font_choices, "Consolas")}
+}
+
+// The Font_Family a name resolves to, curated entry preferred. Returns ok=false
+// for a name from neither source, which is how an unresolvable settings.txt value
+// degrades -- text_load_family's own find_family fallback then applies.
+font_family_for :: proc(name: string) -> (plat.Font_Family, bool) {
+	for f in plat.FONT_FAMILIES {
+		if strings.equal_fold(f.name, name) {return f, true}
+	}
+	if font_scan_landed() {
+		for sf in g_font_scan.results {
+			if strings.equal_fold(sf.name, name) {
+				return plat.Font_Family {
+						name = sf.name,
+						regular = sf.regular,
+						bold = sf.bold,
+						italic = sf.italic,
+						bolditalic = sf.bolditalic,
+						idx = sf.idx,
+					},
+					true
+			}
+		}
+	}
+	return {}, false
 }
 
 // What the Preview font row offers: every INSTALLED proportional face, then the
@@ -660,7 +754,10 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		// empty slice and doing nothing, silently, for both Enter and the arrows.
 		// The guard below then read as "no fonts installed" when it really meant
 		// "nobody has looked yet". Found by the every-row check in settingstest.
-		if len(font_choices) == 0 {font_choices_refresh()}
+		// Start the system scan the first time a font list is shown, and rebuild
+		// once when it lands. `scan_merged` is what stops that being every frame.
+		font_scan_kick()
+		if len(font_choices) == 0 || (font_scan_landed() && !font_choices_scanned) {font_choices_refresh()}
 		if len(font_choices) > 0 {
 			cur := 0
 			for n, i in font_choices {
