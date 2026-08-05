@@ -117,9 +117,24 @@ font_scan :: proc(allocator := context.allocator) -> []Scanned_Family {
 
 	scan_dir :: proc(factory: ^IFactory, dir: string, found: ^map[string]Scanned_Family, allocator: mem.Allocator) {
 		if dir == "" {return}
-		fis, err := filepath.glob(strings.concatenate({dir, "*"}, context.temp_allocator), context.temp_allocator)
+		// The path list outlives the per-file temp reset below, so it CANNOT live in
+		// temp memory itself.
+		fis, err := filepath.glob(strings.concatenate({dir, "*"}, context.temp_allocator), context.allocator)
 		if err != nil {return}
+		defer {
+			for f in fis {delete(f)}
+			delete(fis)
+		}
 		for path in fis {
+			// PER FILE, not per scan. Every font on the machine is read whole to get
+			// its name, and %SystemRoot%\Fonts is 431 MB across 671 files on the
+			// machine this was written on. Without this the worker's temp arena grows
+			// to the total size of every font installed -- a 1.4 MB program briefly
+			// holding 400+ MB, off-thread where nothing would notice.
+			//
+			// CLAUDE.md pairs the heap with one free_all per FRAME; a worker has no
+			// frame, so the loop iteration is the unit.
+			defer free_all(context.temp_allocator)
 			ext := strings.to_lower(filepath.ext(path), context.temp_allocator)
 			if ext != ".ttf" && ext != ".otf" && ext != ".ttc" {continue}
 			data, rerr := os.read_entire_file_from_path(path, context.temp_allocator)
