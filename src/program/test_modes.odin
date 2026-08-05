@@ -36734,7 +36734,7 @@ when NEWTPAD_TESTS {
 				os.remove(path)
 				rules_reset()
 
-				fmt.println("--- Edit Colour Rules... ---")
+				fmt.println("--- Edit Colour Rules… ---")
 				{
 					app_t: App
 					menu_init(&app_t.menu)
@@ -36790,7 +36790,7 @@ when NEWTPAD_TESTS {
 			ru_command :: proc(bad: ^int) {
 				fmt.println("--- the command ---")
 				ru_chk(bad, command_in_palette(.Rules_Edit), "Rules_Edit is offered in the palette")
-				ru_chk(bad, command_table[.Rules_Edit].title == "Edit Colour Rules..." && command_table[.Rules_Edit].category == "View", fmt.tprintf("titled and filed under View: %q / %q", command_table[.Rules_Edit].title, command_table[.Rules_Edit].category))
+				ru_chk(bad, command_table[.Rules_Edit].title == "Edit Colour Rules…" && command_table[.Rules_Edit].category == "View", fmt.tprintf("titled and filed under View: %q / %q", command_table[.Rules_Edit].title, command_table[.Rules_Edit].category))
 				ru_chk(bad, !command_mutates_doc(.Rules_Edit), "it is not a document mutation")
 				// In the View menu, beside the two rows it mirrors. The palette
 				// is not enough on its own: §6x and §6ad both shipped their file
