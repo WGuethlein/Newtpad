@@ -8153,6 +8153,55 @@ pinned through the new path.
 - `menu_bar_command` and the find bar's replace row still carry their own geometry; both are
   single-producer and seam-tested, so that is tidying rather than a fix.
 
+## 6cr. Settings group headers, and the index coupling that blocked them (2026-08-04, v0.78.0, branch `feat/ui-followups`)
+
+B14, closed. SESSION / APPEARANCE / EDITOR / VIEWS, with the rows regrouped under them. The mockup has
+no EDITOR because it does not carry Newtpad's editor rows.
+
+### The reason this was never a small job
+
+`settings_draw` and `settings_toggle_row` both switched on the row's **index**, which is why
+`SETTINGS_ROWS` carried a comment forbidding insertion — appending was safe, inserting silently gave
+every later row someone else's value and someone else's toggle. Grouping requires *reordering*, so the
+headers were blocked behind converting **30 cases across two procs** onto a `Setting_Id`.
+
+Worth it beyond the headers: a row's behaviour now follows it wherever it moves, and the compiler
+checks both switches are total. Verified by swapping two rows and watching nothing change.
+
+`settings_row_h` is the single producer of a row's full height, header included, consumed by the
+fitting walk, the scroll resolver and the draw. A header taking space in one and not the others would
+place rows a header's worth off from where the selection thought they were.
+
+### Two test gaps the change opened, and what they teach
+
+**An assertion that passed by coincidence.** `settingstest` asserted "row 8 is Tab width" and then
+drove index 8. After the regrouping Tab width *still* landed at 8, so it went on passing while
+testing nothing about the thing it named. It looks the row up by id now.
+
+**A check that only asked whether something changed.** The every-row loop asserted a row changed
+*some* setting — enough while position was identity, and not enough once it isn't. It diffs the
+serialized settings now (`settings_serialize`, split out of `settings_save`) and asserts each row moves
+**the key its id names**, plus that no two rows share an id. The duplicate case is the copy-paste
+failure and is completely silent: both rows toggle the same setting and both "correctly" report moving
+it. Confirmed by duplicating one — and the first version of that guard was accidentally inserted into
+`regextest` instead, where it ran and passed and proved nothing, which is its own small lesson about
+anchoring an edit on a variable name that appears in more than one mode.
+
+**What it deliberately does not check**, stated in the test so nobody reads more into it: the
+**label→id** link. Swapping two ids so "Line numbers" toggles the caret blink passes everything —
+tried it. Pinning that means pinning copy, so a wording change would fail the suite for no defect. It
+is left to review, where `{.Gutter, "", "Line numbers"}` is right or wrong on sight.
+
+### Owed
+
+**Font enumeration (Phase 4)** is the last thing on the near queue, and untouched. DirectWrite COM on a
+worker thread, symbol charsets excluded, merged with the curated table so known families keep their
+exact style files. `text.odin:164`'s comment argues against enumeration on three grounds; two are
+answerable and the third — localized family names — is unsolved and must be named rather than dropped.
+
+Also still open: the preview's markdown table is text-with-rules rather than §9.4's bordered card, and
+`menu_bar_command` / the find bar's replace row still carry their own geometry rather than `ui`'s.
+
 ## 7. Build environment (Windows, this machine)
 
 - **`build.bat` is the one build script.** `build.bat` = debug, **console subsystem** so the
