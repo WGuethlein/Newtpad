@@ -340,11 +340,12 @@ settings_load :: proc() -> Settings {
 	return s
 }
 
-settings_save :: proc(s: Settings) -> bool {
-	path, ok := settings_path()
-	if !ok {
-		return false
-	}
+// The on-disk form, without the disk. Split out of settings_save so a test can
+// ask WHICH key a row changed rather than only whether something did -- see
+// settingstest's per-row identity check, which exists because an id-keyed switch
+// makes reordering safe and therefore makes a mistyped id the new way to get a
+// row wrong.
+settings_serialize :: proc(s: Settings, allocator := context.temp_allocator) -> string {
 	// Normalise on the way out as well as in. A zero-valued field reaching disk
 	// would come back clamped to the minimum, which is a silent setting change
 	// rather than the default it was meant to be.
@@ -381,12 +382,54 @@ settings_save :: proc(s: Settings) -> bool {
 		s.preview_font,
 		s.theme_name if s.theme_name != "" else "Dark",
 	)
+	return strings.clone(body, allocator)
+}
+
+settings_save :: proc(s: Settings) -> bool {
+	path, ok := settings_path()
+	if !ok {
+		return false
+	}
+	body := settings_serialize(s)
+
 	return plat.file_write_atomic(path, transmute([]u8)body)
 }
 
 // --- the page ---
 
+// A row's STABLE identity, independent of where it sits in the list.
+//
+// settings_draw and settings_toggle_row both used to switch on the row's INDEX,
+// which is why SETTINGS_ROWS carried a comment forbidding insertion -- appending
+// was safe, inserting silently gave every later row someone else's value and
+// someone else's toggle. That made the list un-groupable: UI spec 11 wants rows
+// under SESSION / APPEARANCE / EDITOR / VIEWS, and grouping means reordering.
+//
+// Switching on this instead makes the order free. A row can move anywhere and
+// its behaviour follows it, and the compiler now checks the switches are total.
+Setting_Id :: enum u8 {
+	Restore_Session,
+	Wrap_Default,
+	Zoom,
+	Show_Links,
+	Md_Default,
+	Table_Default,
+	Remember_Views,
+	Theme,
+	Tab_Width,
+	Ui_Font,
+	Gutter,
+	Caret_Blink,
+	Current_Line,
+	Preview_Font,
+	Show_Menu_Bar,
+}
+
 Setting_Row :: struct {
+	id:    Setting_Id,
+	// The group header drawn ABOVE this row, or "" to continue the group above.
+	// UI spec 11: 11.5px, uppercase, 0.1em tracking, text_muted.
+	group: string,
 	label: string,
 	help:  string,
 }
@@ -394,33 +437,42 @@ Setting_Row :: struct {
 // Font lives under Edit > Font, not here: it is something you reach for while
 // working, not a preference you set once. These are the set-and-forget ones.
 SETTINGS_ROWS := []Setting_Row {
-	{"Restore session on launch", "Reopen the tabs you had open, including unsaved ones"},
-	{"Word wrap new documents", "Long lines fold to the window width instead of running off"},
-	{"Zoom", "Ctrl+= / Ctrl+- / Ctrl+0 anywhere"},
-	{"Show links", "When URLs and paths are highlighted (Ctrl+click always opens)"},
-	// Appended, not inserted -- settings_draw's value switch below is index-based
-	// against this array, so inserting here would shift every later row's value
-	// to the wrong label.
-	{"Markdown default view", "Applied when a .md/.markdown file opens fresh (Ctrl+M cycles)"},
-	{"Table default view", "Applied when a .csv/.tsv file opens fresh (Ctrl+T toggles)"},
-	{"Remember last view used", "Toggling a view updates the two defaults above; off pins them"},
-	{"Theme", "Dark, Light, or a custom .theme file placed in the themes folder"},
-	{"Tab width", "Columns a Tab advances to; Left/Right adjust, Enter resets to 4"},
-	{"Interface font", "Tabs, menus, settings and the status bar; the document keeps its own font"},
-	// Appended, per the rule above. Ctrl+Shift+L toggles it too.
-	{"Line numbers", "A gutter down the left; the current line's number stands out"},
-	// Both shipped in v0.42.0 with NO UI at all -- no row, no menu item, no
-	// command -- so they were settable only by hand-editing settings.txt. A
-	// default-off option nobody can turn on has not shipped. Appended, per the
-	// rule above.
-	{"Blink the caret", "A steady caret is easier on some eyes; the blink is 500ms"},
-	{"Highlight the current line", "A 3% tint on the line the caret is on"},
-	{"Preview font", "The markdown preview's body face; Editor font makes it match the source"},
-	// Appended, per the rule above.
-	{"Show menu bar", "When off, Alt reveals it and the rail's button opens the same menus"},
+	// GROUPED, not appended. Reordering was impossible while the switches keyed on
+	// the index -- see Setting_Id. The groups are UI spec 11's, plus EDITOR, which
+	// the mockup does not have because it does not carry Newtpad's editor rows.
+	{.Restore_Session, "Session", "Restore session on launch", "Reopen the tabs you had open, including unsaved ones"},
+	{.Remember_Views, "", "Remember last view used", "Toggling a view updates the two defaults below; off pins them"},
+
+	{.Theme, "Appearance", "Theme", "Dark, Light, or a custom .theme file placed in the themes folder"},
+	{.Ui_Font, "", "Interface font", "Tabs, menus, settings and the status bar; the document keeps its own font"},
+	{.Preview_Font, "", "Preview font", "The markdown preview's body face; Editor font makes it match the source"},
+	{.Zoom, "", "Zoom", "Ctrl+= / Ctrl+- / Ctrl+0 anywhere"},
+	{.Show_Menu_Bar, "", "Show menu bar", "When off, Alt reveals it and the rail's button opens the same menus"},
+
+	{.Wrap_Default, "Editor", "Word wrap new documents", "Long lines fold to the window width instead of running off"},
+	{.Tab_Width, "", "Tab width", "Columns a Tab advances to; Left/Right adjust, Enter resets to 4"},
+	{.Gutter, "", "Line numbers", "A gutter down the left; the current line's number stands out"},
+	{.Caret_Blink, "", "Blink the caret", "A steady caret is easier on some eyes; the blink is 500ms"},
+	{.Current_Line, "", "Highlight the current line", "A 3% tint on the line the caret is on"},
+	{.Show_Links, "", "Show links", "When URLs and paths are highlighted (Ctrl+click always opens)"},
+
+	{.Md_Default, "Views", "Markdown default view", "Applied when a .md/.markdown file opens fresh (Ctrl+M cycles)"},
+	{.Table_Default, "", "Table default view", "Applied when a .csv/.tsv file opens fresh (Ctrl+T toggles)"},
 }
 
 settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
+
+// Where a row currently sits. For callers that need to DRIVE a specific row --
+// tests, and any future command that jumps to one -- so they name the row they
+// mean instead of its position. settingstest used to assert "row 8 is Tab
+// width" and then drive index 8; after the regrouping that stayed true by
+// coincidence, which is the least useful way for an assertion to pass.
+settings_row_index :: proc(id: Setting_Id) -> int {
+	for r, i in SETTINGS_ROWS {
+		if r.id == id {return i}
+	}
+	return -1
+}
 
 // Rows that fit in height `h` starting at row `from`, given the fixed row
 // height `rowh` -- the settings-page analogue of menu.odin's rows_fitting.
@@ -430,11 +482,25 @@ settings_row_count :: proc() -> int {return len(SETTINGS_ROWS)}
 // as the dropdown's version means a future row of different height costs
 // nothing extra here, and settings_draw and this proc can never disagree
 // about what fits because there is only the one computation.
+// The header strip above a row that opens a group, or 0. UI spec 11's
+// `padding 2px 28px 6px` plus the cap-height line itself.
+SETTINGS_GROUP_H_96 :: f32(26)
+
+// A row's FULL height, its group header included. ONE producer -- the fitting
+// walk, the scroll resolver and the draw all ask it, so a header cannot take
+// space in one and not the others. Without that, a scrolled list would place its
+// rows a header's worth off from where the selection thought they were.
+settings_row_h :: proc(i: int, rowh: f32) -> f32 {
+	if i < 0 || i >= len(SETTINGS_ROWS) {return rowh}
+	return rowh + (sx(SETTINGS_GROUP_H_96) if SETTINGS_ROWS[i].group != "" else 0)
+}
+
 settings_rows_fitting :: proc(from: int, h, rowh: f32) -> (count: int) {
 	used := f32(0)
 	for i := from; i < settings_row_count(); i += 1 {
-		if used + rowh > h {return}
-		used += rowh
+		rh := settings_row_h(i, rowh)
+		if used + rh > h {return}
+		used += rh
 		count += 1
 	}
 	return
@@ -549,27 +615,27 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 	// Stepping a two-valued setting in either direction lands on the other value,
 	// so direction carries no information here and is deliberately ignored rather
 	// than being turned into an Off-is-left/On-is-right rule nothing else follows.
-	switch row {
-	case 0:
+	switch SETTINGS_ROWS[row].id {
+	case .Restore_Session:
 		s.restore_session = !s.restore_session
-	case 1:
+	case .Wrap_Default:
 		s.wrap_default = !s.wrap_default
-	case 2:
+	case .Zoom:
 		zoom_adjust(rc, dir if dir != 0 else 0) // Enter on this row resets
 		return // zoom_adjust already applied and saved
-	case 3:
+	case .Show_Links:
 		n := int(max(Link_Style)) + 1
 		step := dir if dir != 0 else 1 // Enter cycles forward; Left/Right step
 		s.link_style = Link_Style((int(s.link_style) + step + n) % n)
-	case 4:
+	case .Md_Default:
 		n := int(max(Md_Mode)) + 1
 		step := dir if dir != 0 else 1 // Enter cycles forward; Left/Right step
 		s.md_default = Md_Mode((int(s.md_default) + step + n) % n)
-	case 5:
+	case .Table_Default:
 		s.table_default = !s.table_default
-	case 6:
+	case .Remember_Views:
 		s.remember_views = !s.remember_views
-	case 7:
+	case .Theme:
 		names := theme_available_names(context.temp_allocator)
 		cur := 0
 		for n, i in names {
@@ -582,7 +648,7 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		nn := len(names)
 		s.theme_name = strings.clone(names[((cur + step) % nn + nn) % nn])
 		g_theme = theme_resolve(s.theme_name)
-	case 9:
+	case .Ui_Font:
 		// Cycled through the same curated, installed-only list the Font screen
 		// offers, so the chrome can never land on a family that is not there.
 		// The document's font stays on Edit > Font: it is reached while working,
@@ -606,7 +672,7 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 			step := dir if dir != 0 else 1
 			s.ui_font_family = font_choices[(cur + step + len(font_choices)) % len(font_choices)]
 		}
-	case 8:
+	case .Tab_Width:
 		// Stepped, not cycled: 16 values is too many to reach by pressing Enter,
 		// and the useful ones (2, 4, 8) are all within a few Rights of each
 		// other. Enter resets to the default instead -- the same affordance the
@@ -616,15 +682,15 @@ settings_toggle_row :: proc(rc: ^Render_Ctx, row, dir: int) {
 		} else {
 			s.tab_width = clamp(s.tab_width + dir, plat.TAB_WIDTH_MIN, plat.TAB_WIDTH_MAX)
 		}
-	case 10:
+	case .Gutter:
 		s.gutter = !s.gutter
-	case 11:
+	case .Caret_Blink:
 		s.caret_blink = !s.caret_blink
-	case 14:
+	case .Show_Menu_Bar:
 		s.show_menu_bar = !s.show_menu_bar
-	case 12:
+	case .Current_Line:
 		s.current_line = !s.current_line
-	case 13:
+	case .Preview_Font:
 		// Cycles the installed proportional faces, then the editor's own family.
 		// "" is not offered as a choice -- it is the pre-setting state, and a user
 		// who has opened this row has expressed a preference, so landing back on
@@ -695,6 +761,14 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 	y = y0
 	for i := app.settings_top; i < last; i += 1 {
 		r := SETTINGS_ROWS[i]
+		// The group header, in the strip settings_row_h reserved above this row.
+		// Drawn even when the row is the first one VISIBLE after scrolling: a
+		// header that vanished mid-scroll would leave the rows below it looking
+		// like they belonged to whatever group happened to be off-screen.
+		if r.group != "" {
+			plat.text_draw(gfx, t, strings.to_upper(r.group, context.temp_allocator), x, y + sx(4), UI_SMALL_PX, g_theme[.Text_Muted])
+			y += sx(SETTINGS_GROUP_H_96)
+		}
 		sel := i == app.settings_row
 		if sel {
 			// A wash PLUS a 2px accent bar, not a full-width band. UI spec 11:
@@ -717,36 +791,36 @@ settings_draw :: proc(gfx: ^plat.Gfx, qp: ^plat.Quad_Pipeline, t: ^plat.Text, ap
 		plat.text_draw(gfx, t, r.help, x, y + sx(16), UI_SMALL_PX, g_theme[.Text_Muted])
 
 		val: string
-		switch i {
-		case 0:
+		switch r.id {
+		case .Restore_Session:
 			val = "On" if app.settings.restore_session else "Off"
-		case 1:
+		case .Wrap_Default:
 			val = "On" if app.settings.wrap_default else "Off"
-		case 2:
+		case .Zoom:
 			val = fmt.tprintf("%d%%", app.settings.zoom_pct)
-		case 3:
+		case .Show_Links:
 			val = link_style_name(app.settings.link_style)
-		case 4:
+		case .Md_Default:
 			val = md_mode_name(app.settings.md_default)
-		case 5:
+		case .Table_Default:
 			val = "Table" if app.settings.table_default else "Off"
-		case 6:
+		case .Remember_Views:
 			val = "On" if app.settings.remember_views else "Off"
-		case 7:
+		case .Theme:
 			val = app.settings.theme_name
-		case 8:
+		case .Tab_Width:
 			val = fmt.tprintf("%d", app.settings.tab_width)
-		case 9:
+		case .Ui_Font:
 			val = app.settings.ui_font_family
-		case 10:
+		case .Gutter:
 			val = "On" if app.settings.gutter else "Off"
-		case 11:
+		case .Caret_Blink:
 			val = "On" if app.settings.caret_blink else "Off"
-		case 12:
+		case .Current_Line:
 			val = "On" if app.settings.current_line else "Off"
-		case 13:
+		case .Preview_Font:
 			val = app.settings.preview_font if app.settings.preview_font != "" else "Auto"
-		case 14:
+		case .Show_Menu_Bar:
 			val = "On" if app.settings.show_menu_bar else "Off"
 		}
 		vc := g_theme[.Success] if val != "Off" else g_theme[.Text_Muted]

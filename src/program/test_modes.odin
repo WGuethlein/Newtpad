@@ -10771,6 +10771,106 @@ when NEWTPAD_TESTS {
 				}
 			}
 
+			// --- and each row changes the setting its ID NAMES ------------------
+			//
+			// The check above only asks whether a row changed SOMETHING. That was
+			// enough while the switches keyed on the row's index, because a row's
+			// position WAS its identity and the two could not disagree. Keying on
+			// Setting_Id made reordering safe -- which is the point -- and in doing
+			// so made a DUPLICATED id the new way to get a row wrong: copy a row,
+			// forget to change its id, and two rows now share one behaviour while
+			// every assertion above stays green. That is checked below.
+			//
+			// WHAT THIS CANNOT CHECK, stated so nobody reads more into it: the link
+			// between a row's LABEL and its id. Swapping `.Gutter` and `.Caret_Blink`
+			// between two rows so "Line numbers" toggles the caret blink passes
+			// everything here -- tried it. Pinning that would mean pinning copy, so a
+			// wording change would fail the suite for no defect. It is left to review:
+			// `{.Gutter, "", "Line numbers"}` is right or wrong on sight.
+			//
+			// Diffs the serialized settings, so it asks WHICH key moved rather than
+			// mirroring the production switch in the test.
+			{
+				fmt.println("--- each row moves the key its id names ---")
+				// Two rows sharing an id is the copy-paste failure, and it is silent:
+				// both would toggle the same setting and the per-row check below would
+				// pass BOTH, because each moved the key its (shared) id names.
+				{
+					seen: [Setting_Id]int
+					for r in SETTINGS_ROWS {seen[r.id] += 1}
+					dupes := 0
+					for n in seen {
+						if n > 1 {dupes += 1}
+					}
+					if dupes != 0 {bad += 1}
+					fmt.printfln("  %-4s every row has its own id (%d duplicated)", "ok" if dupes == 0 else "FAIL", dupes)
+				}
+				key_for :: proc(id: Setting_Id) -> string {
+					switch id {
+					case .Restore_Session:
+						return "restore_session"
+					case .Wrap_Default:
+						return "wrap_default"
+					case .Zoom:
+						return "zoom_pct"
+					case .Show_Links:
+						return "link_style"
+					case .Md_Default:
+						return "md_default"
+					case .Table_Default:
+						return "table_default"
+					case .Remember_Views:
+						return "remember_views"
+					case .Theme:
+						return "theme_name"
+					case .Tab_Width:
+						return "tab_width"
+					case .Ui_Font:
+						return "ui_font_family"
+					case .Gutter:
+						return "gutter"
+					case .Caret_Blink:
+						return "caret_blink"
+					case .Current_Line:
+						return "current_line"
+					case .Preview_Font:
+						return "preview_font"
+					case .Show_Menu_Bar:
+						return "show_menu_bar"
+					}
+					return ""
+				}
+				changed_key :: proc(before, after: string) -> (key: string, n: int) {
+					bl := strings.split_lines(before, context.temp_allocator)
+					al := strings.split_lines(after, context.temp_allocator)
+					for i in 0 ..< min(len(bl), len(al)) {
+						if bl[i] == al[i] {continue}
+						n += 1
+						sp := strings.index_byte(al[i], ' ')
+						key = al[i][:sp] if sp > 0 else al[i]
+					}
+					return
+				}
+				a2: App
+				w2: plat.Window
+				t2: plat.Text
+				rc2 := Render_Ctx{window = &w2, text = &t2, app = &a2}
+				for row in 0 ..< settings_row_count() {
+					id := SETTINGS_ROWS[row].id
+					// A fresh default each row, so one row's change cannot be read as the
+					// next row's.
+					a2.settings = settings_default()
+					before := strings.clone(settings_serialize(a2.settings), context.temp_allocator)
+					settings_toggle_row(&rc2, row, 1)
+					after := settings_serialize(a2.settings)
+					key, nkeys := changed_key(before, after)
+					want := key_for(id)
+					ok2 := nkeys == 1 && key == want
+					if !ok2 {bad += 1}
+					fmt.printfln("  %-4s %-28s -> %s (want %s, %d key(s) moved)", "ok" if ok2 else "FAIL", SETTINGS_ROWS[row].label, key, want, nkeys)
+				}
+			}
+
 			// UI spec §9.3 asks for the Preview font row to offer the editor's own
 			// face "for people who want the preview to match the source". That is a
 			// requirement about the CHOICE LIST, not about the row responding, so
@@ -10852,20 +10952,21 @@ when NEWTPAD_TESTS {
 			// switch and the toggle switch, so an inserted row silently moves
 			// this to a different setting.
 			fmt.println("--- tab width ---")
-			trok := len(SETTINGS_ROWS) > 8 && SETTINGS_ROWS[8].label == "Tab width"
-			fmt.printfln("  row 8 is %q  %s", SETTINGS_ROWS[8].label if len(SETTINGS_ROWS) > 8 else "", "OK" if trok else "FAIL")
+			tabrow := settings_row_index(.Tab_Width)
+			trok := tabrow >= 0 && SETTINGS_ROWS[tabrow].label == "Tab width"
+			fmt.printfln("  the Tab width row is found by id, at %d  %s", tabrow, "OK" if trok else "FAIL")
 			if !trok {bad += 1}
 			az.settings.tab_width = 4
-			settings_toggle_row(&rcz, 8, 1)
-			settings_toggle_row(&rcz, 8, 1)
+			settings_toggle_row(&rcz, tabrow, 1)
+			settings_toggle_row(&rcz, tabrow, 1)
 			up := az.settings.tab_width == 6 && plat.text_tab_width(&t2) == 6
 			fmt.printfln("  two Rights -> setting %d, text layer %d (want 6, 6)  %s", az.settings.tab_width, plat.text_tab_width(&t2), "OK" if up else "FAIL")
 			if !up {bad += 1}
-			for _ in 0 ..< 40 {settings_toggle_row(&rcz, 8, -1)}
+			for _ in 0 ..< 40 {settings_toggle_row(&rcz, tabrow, -1)}
 			downc := az.settings.tab_width == plat.TAB_WIDTH_MIN && plat.text_tab_width(&t2) == plat.TAB_WIDTH_MIN
 			fmt.printfln("  40 Lefts clamp at %d (text layer %d)  %s", az.settings.tab_width, plat.text_tab_width(&t2), "OK" if downc else "FAIL")
 			if !downc {bad += 1}
-			settings_toggle_row(&rcz, 8, 0) // Enter resets
+			settings_toggle_row(&rcz, tabrow, 0) // Enter resets
 			rstw := az.settings.tab_width == plat.TAB_WIDTH_DEFAULT && plat.text_tab_width(&t2) == plat.TAB_WIDTH_DEFAULT
 			fmt.printfln("  Enter resets to %d (text layer %d)  %s", az.settings.tab_width, plat.text_tab_width(&t2), "OK" if rstw else "FAIL")
 			if !rstw {bad += 1}
@@ -10907,7 +11008,7 @@ when NEWTPAD_TESTS {
 				app_add(&az, cd)
 				app_add(&az, mdd)
 
-				settings_toggle_row(&rcz, 8, 0) // Enter: start from the default 4
+				settings_toggle_row(&rcz, tabrow, 0) // Enter: start from the default 4
 				table_compute_widths(cd, &t2)
 				w4 := cd.table_widths[0] if len(cd.table_widths) > 0 else -1
 				m4 := -1
@@ -10922,7 +11023,7 @@ when NEWTPAD_TESTS {
 				fmt.printfln("  %-6s ...and it is above TABLE_COL_MIN (%d > %d), so it is a measurement", "ok" if above else "FAIL", w4, TABLE_COL_MIN)
 				if !above {bad += 1}
 
-				for _ in 0 ..< 4 {settings_toggle_row(&rcz, 8, 1)} // 4 -> 8
+				for _ in 0 ..< 4 {settings_toggle_row(&rcz, tabrow, 1)} // 4 -> 8
 
 				// table_draw's own line: refit only when the widths were cleared.
 				if len(cd.table_widths) == 0 {table_compute_widths(cd, &t2)}
